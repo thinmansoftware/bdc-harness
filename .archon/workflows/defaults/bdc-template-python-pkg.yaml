@@ -1,4 +1,4 @@
- TEMPLATE: bdc-template-python-pkg
+# TEMPLATE: bdc-template-python-pkg
 # Scenario: Python package WO -- no bash test nodes (container has no pip/pytest).
 #            Tests run via full Claude Code agent in the implement loop (self-verify).
 # Usage: Copy this file, rename to bdc-<prefix>-<wo-slug>.yaml, fill in [PLACEHOLDERS].

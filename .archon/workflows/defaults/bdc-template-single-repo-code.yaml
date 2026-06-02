@@ -1,4 +1,4 @@
- TEMPLATE: bdc-template-single-repo-code
+# TEMPLATE: bdc-template-single-repo-code
 # Scenario: Single-repo TypeScript/React/Node WO with bun test runner and Vercel deploy.
 # Targets: lspro-react, shopops-storefront, shopops-api (MINUS Rule 19 docker-cp pattern -- see shopops-api template)
 # Usage: Copy, rename to bdc-<prefix>-<wo-slug>.yaml, fill [PLACEHOLDERS].

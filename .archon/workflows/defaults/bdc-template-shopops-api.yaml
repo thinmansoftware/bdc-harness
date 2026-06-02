@@ -1,4 +1,4 @@
- TEMPLATE: bdc-template-shopops-api
+# TEMPLATE: bdc-template-shopops-api
 # Scenario: shopops-api WO -- Node.js Express routes, Docker runtime verification (Rule 19).
 #
 # Rule 19 CRITICAL: shopops-api uses COPY . /app at image build time (no source mount).
@@ -143,8 +143,8 @@ nodes:
             --title "feat(shopops-api): ${WO_ID} -- [short description]" \
             --body "Implements ${WO_ID}. Spec: bdc-xo docs/work-orders/${WO_ID}.md
 
-NOTE: shopops-api requires docker rebuild+restart after merge (Rule 19).
-Runtime verification: docker exec shopops-api grep -n '...' /app/..." 2>&1); then
+      NOTE: shopops-api requires docker rebuild+restart after merge (Rule 19).
+      Runtime verification: docker exec shopops-api grep -n '...' /app/..." 2>&1); then
           echo "PR_URL=$URL"; exit 0
         fi
         sleep $((attempt * 5))
