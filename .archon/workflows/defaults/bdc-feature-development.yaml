@@ -596,6 +596,7 @@ nodes:
 
   - id: diff-review
     provider: codex
+    model: gpt-5.5
     agent: codex-adversarial-reviewer
     depends_on: [capture-diff]
     task_class: medium_work
@@ -764,6 +765,7 @@ nodes:
 
   - id: diff-review-final
     provider: codex
+    model: gpt-5.5
     agent: codex-adversarial-reviewer
     depends_on: [capture-diff-final]
     trigger_rule: all_done
