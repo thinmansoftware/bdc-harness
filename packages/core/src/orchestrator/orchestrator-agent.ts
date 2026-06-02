@@ -102,7 +102,7 @@ export interface ProjectRegistration {
 
 interface BoundCodebaseResult {
   codebase: Codebase;
-  source: 'flag' | 'prefix' | 'fallback';
+  source: 'flag' | 'target_repo' | 'prefix' | 'fallback';
   userMessage: string;
 }
 
@@ -1608,10 +1608,12 @@ export function resolveBoundCodebase({
   workflowName,
   userMessage,
   codebases,
+  targetRepo,
 }: {
   workflowName: string;
   userMessage: string;
   codebases: readonly Codebase[];
+  targetRepo?: string;
 }): BoundCodebaseResult {
   if (codebases.length === 0) {
     throw new Error('No codebases registered');
@@ -1625,6 +1627,22 @@ export function resolveBoundCodebase({
     }
     getLog().warn({ workflowName, projectName }, 'workflow_codebase_project_not_found');
     return { codebase: codebases[0], source: 'fallback', userMessage: strippedMessage };
+  }
+
+  // A workflow's own declared `target_repo` is authoritative over the name-prefix
+  // heuristic. The Rule 28 guard (executor.ts) fails the run if the bound worktree's
+  // origin disagrees with target_repo, so binding must honor target_repo up front --
+  // otherwise a name-prefix collision (e.g. `bdc-storefront-*` declaring
+  // target_repo: thinman-freight) binds the wrong repo and the run dies at the guard.
+  // An explicit `--project` flag (handled above) still wins as the operator override.
+  if (targetRepo) {
+    const codebase = codebases.find(c => matchesCodebaseName(c, targetRepo));
+    if (codebase) {
+      return { codebase, source: 'target_repo', userMessage: strippedMessage };
+    }
+    // Not registered: fall through to prefix/fallback (do NOT hard-fail here; the
+    // Rule 28 guard remains the backstop and emits an actionable mismatch event).
+    getLog().warn({ workflowName, targetRepo }, 'workflow_target_repo_not_registered');
   }
 
   const prefixMatch = WORKFLOW_CODEBASE_PREFIXES.find(({ prefix }) =>
@@ -1736,7 +1754,12 @@ async function handleWorkflowRunSlashCommand(
     const globalWorkflows = globalDiscovery.workflows.map(w => w.workflow);
     const globalWorkflow = resolveWorkflowByName(workflowName, globalWorkflows);
     if (globalWorkflow) {
-      const binding = resolveBoundCodebase({ workflowName, userMessage, codebases });
+      const binding = resolveBoundCodebase({
+        workflowName,
+        userMessage,
+        codebases,
+        targetRepo: globalWorkflow.target_repo,
+      });
       const { codebase } = binding;
       getLog().info(
         { workflowName, boundCodebase: codebase.name, source: binding.source },
@@ -1781,6 +1804,7 @@ async function handleWorkflowRunSlashCommand(
       workflowName: workflow.name,
       userMessage,
       codebases: matches.map(match => match.codebase),
+      targetRepo: workflow.target_repo,
     });
     const { codebase } = binding;
     getLog().info(
@@ -1805,6 +1829,7 @@ async function handleWorkflowRunSlashCommand(
       workflowName,
       userMessage,
       codebases: matches.map(match => match.codebase),
+      targetRepo: matches[0].workflow.target_repo,
     });
     if (binding.source !== 'fallback') {
       const match = matches.find(candidate => candidate.codebase.id === binding.codebase.id);
@@ -1913,7 +1938,12 @@ async function handleWorkflowRunCommand(
 
   if (codebases.length === 1) {
     // Auto-select the only project
-    const binding = resolveBoundCodebase({ workflowName: workflow.name, userMessage, codebases });
+    const binding = resolveBoundCodebase({
+      workflowName: workflow.name,
+      userMessage,
+      codebases,
+      targetRepo: workflow.target_repo,
+    });
     const { codebase } = binding;
     getLog().info(
       { workflowName: workflow.name, boundCodebase: codebase.name, source: binding.source },
@@ -1982,7 +2012,12 @@ async function handleWorkflowRunCommand(
     return;
   }
 
-  const binding = resolveBoundCodebase({ workflowName: workflow.name, userMessage, codebases });
+  const binding = resolveBoundCodebase({
+    workflowName: workflow.name,
+    userMessage,
+    codebases,
+    targetRepo: workflow.target_repo,
+  });
   if (binding.source !== 'fallback') {
     getLog().info(
       { workflowName: workflow.name, boundCodebase: binding.codebase.name, source: binding.source },
