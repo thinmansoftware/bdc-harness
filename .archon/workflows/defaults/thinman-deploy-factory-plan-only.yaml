@@ -1,7 +1,7 @@
 name: bdc-thinman-deploy-factory-plan-only
 description: Thinman Freight deployment factory plan-only lane. Validates request, preflights runtime and targets, prepares ignored tfvars, runs Terraform plan, writes evidence, and stops before any apply or deploy.
 provider: codex
-model: gpt-5.3-codex
+model: gpt-5.5
 interactive: true
 target_repo: bluedevilcollectibles/thinman-freight
 worktree:
