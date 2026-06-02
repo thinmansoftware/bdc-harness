@@ -1,0 +1,167 @@
+ TEMPLATE: bdc-template-python-pkg
+# Scenario: Python package WO -- no bash test nodes (container has no pip/pytest).
+#            Tests run via full Claude Code agent in the implement loop (self-verify).
+# Usage: Copy this file, rename to bdc-<prefix>-<wo-slug>.yaml, fill in [PLACEHOLDERS].
+#        Deploy via: bash BDC_XO/scripts/archon-bridge/sync-workflows.sh <filename>
+#
+# 13 Hard Rules compliance (2026-05-22):
+#   Rule 1: model: sonnet
+#   Rule 2: $WORKFLOW_ID not used inside bash (use date +%s for uniqueness)
+#   Rule 3: implement loop has fresh_context: true
+#   Rule 4: all paths relative to repo root
+#   Rule 5: read-spec uses glob fallback
+#   Rule 6: policyFile: harness/policies/agent-behavior.md
+#   Rule 7: flip-notion final node
+#   Rule 8: codebase must be registered before firing
+#   Rule 9: YAML lives in .archon/workflows/defaults/
+#   Rule 10: loop has prompt + until + max_iterations + fresh_context
+#   Rule 11: no n8n webhook calls in bash nodes
+#   Rule 12: deploy via sync-workflows.sh
+#   Rule 13: file written with Edit tool (not PowerShell Set-Content)
+#
+# Container runtime note (2026-05-12 anchor):
+#   Archon container = bun-only. No node, no npm, no npx, no pip, no pytest.
+#   Python package tests CANNOT run in bash nodes. The implement loop uses
+#   a full Claude Code agent environment -- run `python3 -m pytest` there.
+#   bash nodes are limited to: git, gh, curl, jq, bun, python3 (stdlib only).
+
+name: bdc-[PREFIX]-[WO-SLUG]  # FILL IN: e.g. bdc-model-tier-advisor-something
+description: |
+  Use when: Executing [WO-ID] -- [one-line description].
+  Input: WO_ID = [WO-ID].
+  Does:
+    - Reads spec from bdc-xo docs/work-orders/.
+    - Implements [what] in the [PACKAGE_NAME] Python package.
+    - Self-verifies with python3 -m pytest inside the implement loop.
+    - Commits, pushes, opens PR, flips Notion to REVIEW.
+  Repo: bluedevilcollectibles/[TARGET_REPO].
+  parallel_ok: true.
+
+policyFile: harness/policies/agent-behavior.md
+model: sonnet
+
+inputs:
+  WO_ID:
+    default: "[WO-ID]"  # FILL IN: e.g. WO-MODEL-TIER-ADVISOR-SOMETHING-01
+
+nodes:
+
+  - id: preflight-github-auth
+    load_bearing: true
+    bash: |
+      set -euo pipefail
+      if ! git push --dry-run origin "HEAD:refs/heads/preflight-auth-probe-$(date +%s)" 2>&1; then
+        echo "ERROR: GITHUB auth check failed -- container cannot push to origin." >&2
+        exit 1
+      fi
+      echo "preflight-github-auth PASS"
+
+  - id: read-spec
+    depends_on: [preflight-github-auth]
+    bash: |
+      set -euo pipefail
+      WO_ID="${WO_ID:-[WO-ID]}"
+      SPEC_CONTENT=$(gh api \
+        "repos/bluedevilcollectibles/bdc-xo/contents/docs/work-orders/${WO_ID}.md?ref=main" \
+        --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
+      if [ -z "$SPEC_CONTENT" ]; then
+        GLOB_PATH=$(gh api \
+          "repos/bluedevilcollectibles/bdc-xo/contents/docs/superpowers/specs?ref=main" \
+          --template '{{range .}}{{.path}}{{"\n"}}{{end}}' 2>/dev/null \
+          | grep "${WO_ID}.md$" | head -1 || true)
+        if [ -n "$GLOB_PATH" ]; then
+          SPEC_CONTENT=$(gh api \
+            "repos/bluedevilcollectibles/bdc-xo/contents/${GLOB_PATH}?ref=main" \
+            --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
+        fi
+      fi
+      if [ -z "$SPEC_CONTENT" ]; then
+        ISSUE_NUM=$(gh issue list --repo bluedevilcollectibles/bdc-xo \
+          --search "${WO_ID} in:title" --json number --jq '.[0].number' 2>/dev/null || true)
+        if [ -n "$ISSUE_NUM" ] && [ "$ISSUE_NUM" != "null" ]; then
+          SPEC_CONTENT=$(gh issue view "$ISSUE_NUM" --repo bluedevilcollectibles/bdc-xo \
+            --json body --jq .body 2>/dev/null || true)
+        fi
+      fi
+      if [ -z "$SPEC_CONTENT" ]; then
+        echo "Spec not found for ${WO_ID} (tried docs/work-orders/, specs/ glob, issues)" >&2
+        exit 1
+      fi
+      printf 'WO_ID=%s\n\n--- SPEC ---\n%s\n' "$WO_ID" "$SPEC_CONTENT"
+
+  - id: implement
+    depends_on: [read-spec]
+    loop:
+      fresh_context: true
+      until: COMPLETE
+      max_iterations: 5
+      prompt: |
+        Implement [WO-ID] in the [PACKAGE_NAME] Python package.
+        CWD = [TARGET_REPO] repo root.
+
+        ## Spec
+        $read-spec.output
+
+        ## Execution rules
+        1. Read the spec stop conditions carefully. Implement only what is in scope.
+        2. Do NOT add features not mentioned in the spec.
+        3. After writing code, run: python3 -m pytest [PACKAGE_NAME]/tests/ -v
+           Confirm all tests pass. Fix failures before emitting COMPLETE.
+        4. Verify no sensitive data (API keys, tokens) appears in logs or output.
+        5. Commit with message format: feat([package]): [WO-ID] -- [short description]
+           git -c user.name="John Ranson" -c user.email="admin@bluedevilcollectibles.com" commit
+        6. Push to feature branch: wo/[wo-slug]-run-$(date +%Y%m%d%H%M%S)
+           git push -u origin <branch>
+        7. Do NOT open the PR here. The open-pr node handles that.
+
+        Output COMPLETE on its own line when implementation + tests + push are done.
+
+  - id: open-pr
+    depends_on: [implement]
+    bash: |
+      set -euo pipefail
+      WO_ID="${WO_ID:-[WO-ID]}"
+      REPO="bluedevilcollectibles/[TARGET_REPO]"
+      BRANCH="$(git rev-parse --abbrev-ref HEAD)"
+      EXIST=$(gh pr list --repo "$REPO" --head "$BRANCH" --state open \
+        --json url --jq '.[0].url // empty' 2>/dev/null || true)
+      if [ -n "$EXIST" ]; then echo "PR_URL=$EXIST"; exit 0; fi
+      for attempt in 1 2 3; do
+        if URL=$(gh pr create --repo "$REPO" --base main --head "$BRANCH" \
+            --title "feat: ${WO_ID} -- [short description]" \
+            --body "Implements ${WO_ID}. See spec in bdc-xo docs/work-orders/${WO_ID}.md" 2>&1); then
+          echo "PR_URL=$URL"; exit 0
+        fi
+        sleep $((attempt * 5))
+      done
+      echo "ERROR: gh pr create failed after 3 attempts" >&2; exit 1
+
+  - id: flip-notion
+    depends_on: [open-pr]
+    task_class: clerical
+    prompt: |
+      Flip Notion WO [WO-ID] to REVIEW.
+      Manifest goes in Notes property (NOT comment).
+
+      WO: [WO-ID]
+      Builder: Devils Cauldron (Archon bdc-[PREFIX]-[WO-SLUG])
+      Files modified: [from implement output]
+      Files created: [from implement output]
+      Tests: python3 -m pytest [PACKAGE_NAME]/tests/ -- all passing
+      PRs: $open-pr.output
+      Merge ancestors: [TARGET_REPO] main HEAD, behind_by: 0
+      Grep assertions: [key assertions from implement output]
+      Runtime verification: N/A (library, no deploy)
+      Vercel deployment: N/A
+      VALIDATION: PASS
+
+      Update:
+       - Claude Status -> REVIEW
+       - Status -> Review
+       - Notes -> manifest above verbatim
+
+      Implement output:
+      $implement.output
+
+      PR:
+      $open-pr.output

@@ -1,0 +1,180 @@
+ TEMPLATE: bdc-template-shopops-api
+# Scenario: shopops-api WO -- Node.js Express routes, Docker runtime verification (Rule 19).
+#
+# Rule 19 CRITICAL: shopops-api uses COPY . /app at image build time (no source mount).
+#   Source changes need a rebuild + restart. Every WO MUST include:
+#   docker exec shopops-api grep -n '<line from fix>' /app/<path>
+#   in the manifest to prove the running container has the new code.
+#
+# Container is on Hetzner. Read-only SSH is NOT hookify-blocked.
+# Destructive SSH (restart, docker cp to production) requires John's approval.
+# Rule 20: shopops is a staging-gate repo -- PR targets staging, not main.
+
+name: bdc-[PREFIX]-[WO-SLUG]
+description: |
+  Use when: Executing [WO-ID] -- [one-line description].
+  Input: WO_ID = [WO-ID].
+  Does:
+    - Reads spec from bdc-xo docs/work-orders/.
+    - Implements in shopops-api (routes, middleware, or service layer).
+    - Verifies: node tests/run_all.js passes.
+    - Commits, pushes, opens PR to staging.
+    - Provides docker exec grep evidence per Rule 19.
+    - Flips Notion to REVIEW.
+  Repo: bluedevilcollectibles/shopops.
+  parallel_ok: false.  # shopops-api routes: serialize to prevent merge conflicts
+
+policyFile: harness/policies/agent-behavior.md
+model: sonnet
+
+inputs:
+  WO_ID:
+    default: "[WO-ID]"
+
+nodes:
+
+  - id: preflight-github-auth
+    load_bearing: true
+    bash: |
+      set -euo pipefail
+      if ! git push --dry-run origin "HEAD:refs/heads/preflight-auth-probe-$(date +%s)" 2>&1; then
+        echo "ERROR: GITHUB auth check failed." >&2; exit 1
+      fi
+      echo "preflight-github-auth PASS"
+
+  - id: read-spec
+    depends_on: [preflight-github-auth]
+    bash: |
+      set -euo pipefail
+      WO_ID="${WO_ID:-[WO-ID]}"
+      SPEC_CONTENT=$(gh api \
+        "repos/bluedevilcollectibles/bdc-xo/contents/docs/work-orders/${WO_ID}.md?ref=main" \
+        --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
+      if [ -z "$SPEC_CONTENT" ]; then
+        GLOB_PATH=$(gh api \
+          "repos/bluedevilcollectibles/bdc-xo/contents/docs/superpowers/specs?ref=main" \
+          --template '{{range .}}{{.path}}{{"\n"}}{{end}}' 2>/dev/null \
+          | grep "${WO_ID}.md$" | head -1 || true)
+        if [ -n "$GLOB_PATH" ]; then
+          SPEC_CONTENT=$(gh api \
+            "repos/bluedevilcollectibles/bdc-xo/contents/${GLOB_PATH}?ref=main" \
+            --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
+        fi
+      fi
+      if [ -z "$SPEC_CONTENT" ]; then
+        echo "Spec not found for ${WO_ID}" >&2; exit 1
+      fi
+      printf 'WO_ID=%s\n\n--- SPEC ---\n%s\n' "$WO_ID" "$SPEC_CONTENT"
+
+  - id: fresh-branch
+    depends_on: [read-spec]
+    bash: |
+      set -euo pipefail
+      git fetch origin staging --depth=50 || true
+      git checkout staging 2>/dev/null || echo "staging branch held; staying"
+      git reset --hard origin/staging 2>/dev/null || true
+      BRANCH="wo/[wo-slug]-run-$(date +%Y%m%d%H%M%S)"
+      git checkout -b "$BRANCH"
+      echo "BRANCH=${BRANCH}"
+
+  - id: implement
+    depends_on: [fresh-branch]
+    loop:
+      fresh_context: true
+      until: COMPLETE
+      max_iterations: 5
+      prompt: |
+        Implement [WO-ID] in shopops-api. CWD = shopops repo root.
+
+        ## Spec
+        $read-spec.output
+
+        ## Branch
+        $fresh-branch.output
+
+        ## Execution rules
+        1. No new routes in server.js (Rule 13). New API routes go in routes/ or middleware/.
+        2. New routes must send X-Shopops-Tenant header from apiFetch.
+        3. After writing code, run: node tests/run_all.js
+           All tests must pass. Fix failures before emitting COMPLETE.
+        4. Rule 19 -- shopops-api rebuild required: Note the exact file + line number
+           of your key change. The runtime-verify node will grep for it via docker exec.
+        5. Commit + push:
+           git -c user.name="John Ranson" -c user.email="admin@bluedevilcollectibles.com" \
+             commit -m "feat(shopops-api): [WO-ID] -- [short description]"
+           git push -u origin <branch>
+        6. Output: RULE19_FILE=<relative/path/to/changed/file>
+                   RULE19_GREP=<exact string to grep for proof>
+           Then output COMPLETE on its own line.
+
+  - id: verify-tests
+    depends_on: [implement]
+    bash: |
+      set -euo pipefail
+      node tests/run_all.js
+      echo "tests PASS"
+
+  - id: commit-and-push
+    depends_on: [verify-tests]
+    bash: |
+      set -euo pipefail
+      BRANCH="$(git rev-parse --abbrev-ref HEAD)"
+      git add -A
+      if ! git diff --cached --quiet; then
+        git -c user.name="John Ranson" -c user.email="admin@bluedevilcollectibles.com" \
+          commit -m "chore: backstop commit [WO-ID]"
+      fi
+      git push -u origin "$BRANCH"
+      echo "SHA=$(git rev-parse HEAD)"
+      echo "BRANCH=${BRANCH}"
+
+  - id: open-pr
+    depends_on: [commit-and-push]
+    bash: |
+      set -euo pipefail
+      WO_ID="${WO_ID:-[WO-ID]}"
+      REPO="bluedevilcollectibles/shopops"
+      BRANCH="$(git rev-parse --abbrev-ref HEAD)"
+      EXIST=$(gh pr list --repo "$REPO" --head "$BRANCH" --state open \
+        --json url --jq '.[0].url // empty' 2>/dev/null || true)
+      if [ -n "$EXIST" ]; then echo "PR_URL=$EXIST"; exit 0; fi
+      for attempt in 1 2 3; do
+        if URL=$(gh pr create --repo "$REPO" --base staging --head "$BRANCH" \
+            --title "feat(shopops-api): ${WO_ID} -- [short description]" \
+            --body "Implements ${WO_ID}. Spec: bdc-xo docs/work-orders/${WO_ID}.md
+
+NOTE: shopops-api requires docker rebuild+restart after merge (Rule 19).
+Runtime verification: docker exec shopops-api grep -n '...' /app/..." 2>&1); then
+          echo "PR_URL=$URL"; exit 0
+        fi
+        sleep $((attempt * 5))
+      done
+      echo "ERROR: gh pr create failed after 3 attempts" >&2; exit 1
+
+  - id: flip-notion
+    depends_on: [open-pr]
+    task_class: clerical
+    prompt: |
+      Flip Notion [WO-ID] to REVIEW. Manifest in Notes (NOT comment).
+
+      WO: [WO-ID]
+      Builder: Devils Cauldron (Archon bdc-[PREFIX]-[WO-SLUG])
+      Files modified: [from implement output]
+      Files created: [from implement output]
+      Tests: node tests/run_all.js -- all passing
+      PRs: $open-pr.output
+      Merge ancestors: shopops staging HEAD, behind_by: 0
+      Grep assertions: [from spec stop conditions]
+      Runtime verification: PENDING -- docker rebuild+restart required after merge.
+        After deploy: docker exec shopops-api grep -n '[RULE19_GREP]' /app/[RULE19_FILE]
+        Expected: line containing the fix must appear. (Rule 19 -- shopops-api uses COPY . /app)
+      Vercel deployment: N/A (shopops-api is Docker on Hetzner, not Vercel)
+      VALIDATION: PASS (runtime verify pending post-deploy)
+
+      Update:
+       - Claude Status -> REVIEW
+       - Status -> Review
+       - Notes -> manifest above verbatim
+
+      Implement: $implement.output
+      PR: $open-pr.output

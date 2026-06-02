@@ -17,7 +17,7 @@
 #   2. WO spec committed + pushed to bdc-xo main BEFORE fire (read-spec fetches via
 #      gh api ...?ref=main). Spec lives at docs/work-orders/WO-HARNESS-CAULDRON-HOTRELOAD-REGISTRATION-01.md
 #      The local working copy must be on origin/main, not just on disk.
-#   3. NOTION_PAGE_ID below is a PLACEHOLDER. Create the Notion WO row, paste its page id,
+#   3. NOTION_PAGE_ID below is pre-filled with 371ef4c9-ce00-8164-acaf-d93c2ff9e34d. Verify this matches the Notion WO row before fire.
 #      then fire. flip-notion needs it to write the manifest into Notes.
 #   4. bdc-xo default branch is main (NOT master; master retired 2026-05-31). open-pr uses --base main.
 #
@@ -52,7 +52,7 @@ inputs:
   WO_ID:
     default: "WO-HARNESS-CAULDRON-HOTRELOAD-REGISTRATION-01"
   NOTION_PAGE_ID:
-    default: "REPLACE_WITH_NOTION_PAGE_ID"
+    default: "371ef4c9-ce00-8164-acaf-d93c2ff9e34d"
 
 nodes:
 
