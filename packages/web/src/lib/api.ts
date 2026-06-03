@@ -266,12 +266,32 @@ export async function listWorkflows(cwd?: string): Promise<WorkflowListEntry[]> 
 export async function runWorkflow(
   name: string,
   conversationId: string,
-  message: string
+  message: string,
+  /**
+   * Optional per-run model override forwarded as a `model` body field.
+   *
+   * WO-MC-NEGAN-DIAGNOSTIC-GRAPH-01 — the Mission Control "Replay with
+   * alt model" affordance needs to carry the operator-chosen model
+   * through the dispatch (not just embed it as a `[model:<name>]`
+   * marker in the message body, which is opaque to the orchestrator).
+   * Including the field on the wire lets server-side handlers consume
+   * it directly when they grow that support; until then it appears in
+   * the request payload (visible to network audit / logs) instead of
+   * being silently discarded by the client.
+   */
+  model?: string
 ): Promise<{ accepted: boolean; status: string }> {
+  const body: { conversationId: string; message: string; model?: string } = {
+    conversationId,
+    message,
+  };
+  if (model !== undefined && model.length > 0) {
+    body.model = model;
+  }
   return fetchJSON(`/api/workflows/${encodeURIComponent(name)}/run`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ conversationId, message }),
+    body: JSON.stringify(body),
   });
 }
 

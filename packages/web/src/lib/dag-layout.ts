@@ -242,7 +242,14 @@ export function routeLoopArcsAsSideRail(
       id: arc.id,
       source: arc.source,
       target: arc.target,
-      type: 'smoothstep',
+      // Custom edge type that reads `data.sideRailX` / `data.sideRailOffset`
+      // and routes the SVG path through the right gutter. The previous
+      // implementation used `smoothstep`, which IGNORES `data.sideRailX`,
+      // so the routing claim was false and back-edges could cross the
+      // forward spine. The new `loopSideRail` edge component (registered
+      // in WorkflowDagViewer.edgeTypes) actually consumes the side-rail
+      // metadata and produces a clean right-gutter path.
+      type: 'loopSideRail',
       animated: false,
       style: {
         stroke: 'var(--warning)',

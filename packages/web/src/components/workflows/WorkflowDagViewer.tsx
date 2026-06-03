@@ -7,7 +7,7 @@ import {
   Controls,
   MiniMap,
 } from '@xyflow/react';
-import type { Edge, NodeTypes } from '@xyflow/react';
+import type { Edge, EdgeTypes, NodeTypes } from '@xyflow/react';
 import type { DagNodeState, WorkflowRunStatus, WorkflowStepStatus } from '@/lib/types';
 import type { DagNode } from '@/lib/api';
 import { dagNodesToReactFlow, resolveNodeDisplay, routeLoopArcsAsSideRail } from '@/lib/dag-layout';
@@ -21,11 +21,18 @@ import {
 } from './ExecutionDagNode';
 import { CycleBanner } from './CycleBanner';
 import { FleetStrip } from './FleetStrip';
+import { loopSideRailEdge } from './LoopSideRailEdge';
 
 import '@xyflow/react/dist/style.css';
 
 // Defined at module scope — prevents ReactFlow from remounting nodes on every render
 const nodeTypes: NodeTypes = { executionNode: executionDagNode };
+// Custom edge type for loop back-arcs. Reads `data.sideRailX` /
+// `data.sideRailOffset` (set by `routeLoopArcsAsSideRail`) and routes the
+// SVG path through the right gutter so back-edges never cross the forward
+// spine. Without this registration ReactFlow would fall back to the default
+// edge renderer and the side-rail metadata would have no effect.
+const edgeTypes: EdgeTypes = { loopSideRail: loopSideRailEdge };
 
 const STATUS_MINIMAP_COLORS: Partial<Record<WorkflowStepStatus, string>> = {
   completed: 'var(--success)',
@@ -211,6 +218,7 @@ export function WorkflowDagViewer({
             nodes={nodes}
             edges={edges}
             nodeTypes={nodeTypes}
+            edgeTypes={edgeTypes}
             nodesDraggable={false}
             nodesConnectable={false}
             elementsSelectable={true}

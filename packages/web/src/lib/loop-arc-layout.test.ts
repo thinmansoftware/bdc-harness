@@ -61,6 +61,13 @@ describe('routeLoopArcsAsSideRail (Scenario 3)', () => {
     // Style sanity: dashed warning stroke, label with iteration count.
     expect(back.label).toBe('x2');
     expect((back.style as { strokeDasharray?: string }).strokeDasharray).toBe('6 4');
+
+    // Contract: back-edges must use the custom `loopSideRail` edge type so the
+    // gutter routing actually fires. Storing `sideRailX` in `data` without a
+    // consumer would make the side-rail claim false (the default smoothstep
+    // edge ignores `data` entirely). Asserting the type pins the contract
+    // between `routeLoopArcsAsSideRail` and `LoopSideRailEdge`.
+    expect(back.type).toBe('loopSideRail');
   });
 
   it('returns base edges unchanged when there are no loop arcs', () => {

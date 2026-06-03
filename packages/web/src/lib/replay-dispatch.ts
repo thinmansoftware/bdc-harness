@@ -3,10 +3,15 @@
  *
  * v1: per-node replay is not yet supported by the engine — so a "replay"
  * action re-fires the WO (the parent workflow). When the operator picks
- * "replay with alt model" we prepend a `[model:<name>]` marker to the
- * message so the dispatch can be routed to a model override on the server
- * side (or, at minimum, the marker is visible in the audit log so the
- * operator can see which override was attempted).
+ * "replay with alt model" we both:
+ *   1. prepend a `[model:<name>]` marker to the message (visible in the
+ *      audit log so operators can SEE which override was attempted, and
+ *      consumable by future orchestrator-side marker parsers), AND
+ *   2. populate the structured `model` field so the API client
+ *      (`runWorkflow`) can forward it on the wire as a first-class
+ *      `model` body field. This avoids the silent-discard pattern the
+ *      diff reviewer flagged — the override is no longer trapped in the
+ *      client; it actually leaves the browser.
  *
  * TODO: per-node replay — fast-follow: engine node-level replay not yet
  * supported. When the engine exposes a node-level replay endpoint, swap

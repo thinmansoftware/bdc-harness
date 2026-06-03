@@ -42,7 +42,14 @@ export function ReplayNode({
         originalMessage,
         mode === 'alt' ? altModel : undefined
       );
-      await runWorkflow(workflowName, parentConversationId, req.message);
+      // Forward both the (marker-prefixed) message AND the structured
+      // `model` field. Earlier revisions only sent the message, which
+      // meant the alt-model override was silently dropped on the wire
+      // (the marker is opaque to the orchestrator until it grows a
+      // parser for it). Sending `req.model` honors the operator's
+      // selection and lets server-side handlers consume it once they
+      // grow that support.
+      await runWorkflow(workflowName, parentConversationId, req.message, req.model);
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Replay failed');
     } finally {
