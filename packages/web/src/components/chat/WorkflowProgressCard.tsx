@@ -1,14 +1,20 @@
 import { useState, useEffect, useRef } from 'react';
 import { useNavigate } from 'react-router';
 import { useMutation, useQuery } from '@tanstack/react-query';
-import { CheckCircle, ChevronRight, Loader2, Pause, XCircle } from 'lucide-react';
+import { Ban, CheckCircle, ChevronRight, Loader2, Pause, XCircle } from 'lucide-react';
 import { cn } from '@/lib/utils';
-import { approveWorkflowRun, getWorkflowRunByWorker, rejectWorkflowRun } from '@/lib/api';
+import {
+  approveWorkflowRun,
+  cancelWorkflowRun,
+  getWorkflowRunByWorker,
+  rejectWorkflowRun,
+} from '@/lib/api';
 import { useWorkflowStore } from '@/stores/workflow-store';
 import { ConfirmRunActionDialog } from '@/components/dashboard/ConfirmRunActionDialog';
 import { StatusIcon } from '@/components/workflows/StatusIcon';
 import { formatDurationMs } from '@/lib/format';
 import { isTerminalStatus } from '@/lib/workflow-utils';
+import { deriveLucilleHint } from '@/lib/negan-utils';
 import type { DagNodeState } from '@/lib/types';
 
 interface WorkflowProgressCardProps {
@@ -90,7 +96,27 @@ export function WorkflowProgressCard({
   const rejectMutation = useMutation({
     mutationFn: (reason?: string) => rejectWorkflowRun(runId ?? '', reason),
   });
-  const mutationError = approveMutation.error ?? rejectMutation.error;
+  // WO-MC-NEGAN-DIAGNOSTIC-GRAPH-01: Kill — the real /cancel control,
+  // distinct from Reject. Reject loops the workflow into its on_reject
+  // re-draft chain (memory: reference_cauldron-reject-loops-use-cancel-to-kill).
+  // Kill is the headshot.
+  const cancelMutation = useMutation({
+    mutationFn: () => cancelWorkflowRun(runId ?? ''),
+  });
+  const mutationError = approveMutation.error ?? rejectMutation.error ?? cancelMutation.error;
+
+  // WO-MC-NEGAN-DIAGNOSTIC-GRAPH-01: derive the Lucille consequence hint from
+  // run.metadata.approval — what the YAML declared, not what the live SSE
+  // store has. metadata.approval lives on the run record (Record<string,unknown>
+  // cast) and contains onRejectPrompt + onRejectMaxAttempts when the gate
+  // defines an on_reject block.
+  const approvalMeta = runData?.run?.metadata?.approval as
+    | { onRejectPrompt?: string; onRejectMaxAttempts?: number }
+    | undefined;
+  const lucilleHint = deriveLucilleHint(
+    approvalMeta?.onRejectPrompt,
+    approvalMeta?.onRejectMaxAttempts
+  );
 
   // Completed duration from live state
   const completedAt = liveState?.completedAt;
@@ -210,12 +236,34 @@ export function WorkflowProgressCard({
                   {approval?.message ?? 'Waiting for approval'}
                 </p>
               </div>
+              {/* WO-MC-NEGAN-DIAGNOSTIC-GRAPH-01: LucilleHint — state the
+                  consequence of each choice BEFORE the operator clicks.
+                  Reject loops into on_reject when defined; only Kill (/cancel)
+                  is the real headshot. */}
+              <div className="space-y-0.5" data-testid="lucille-hint">
+                <p className="text-[10px] text-text-tertiary">
+                  <span className="text-success/80">{lucilleHint.approve}</span>
+                </p>
+                <p className="text-[10px] text-text-tertiary">
+                  <span className="text-error/80">{lucilleHint.reject}</span>
+                </p>
+                <p className="text-[10px] text-text-tertiary">
+                  <span className="text-text-secondary">
+                    Kill (/cancel) -&gt; stops the run immediately
+                  </span>
+                </p>
+              </div>
               <div className="flex items-center gap-2">
                 <button
                   onClick={() => {
                     approveMutation.mutate();
                   }}
-                  disabled={!runId || approveMutation.isPending || rejectMutation.isPending}
+                  disabled={
+                    !runId ||
+                    approveMutation.isPending ||
+                    rejectMutation.isPending ||
+                    cancelMutation.isPending
+                  }
                   className="flex items-center gap-1 rounded-md px-2 py-1 text-xs text-success/80 hover:bg-success/10 hover:text-success transition-colors disabled:opacity-50"
                 >
                   <CheckCircle className="h-3.5 w-3.5" />
@@ -224,7 +272,12 @@ export function WorkflowProgressCard({
                 <ConfirmRunActionDialog
                   trigger={
                     <button
-                      disabled={!runId || approveMutation.isPending || rejectMutation.isPending}
+                      disabled={
+                        !runId ||
+                        approveMutation.isPending ||
+                        rejectMutation.isPending ||
+                        cancelMutation.isPending
+                      }
                       className="flex items-center gap-1 rounded-md px-2 py-1 text-xs text-error/80 hover:bg-error/10 hover:text-error transition-colors disabled:opacity-50"
                     >
                       <XCircle className="h-3.5 w-3.5" />
@@ -248,8 +301,40 @@ export function WorkflowProgressCard({
                     rejectMutation.mutate(reason);
                   }}
                 />
+                {/* WO-MC-NEGAN-DIAGNOSTIC-GRAPH-01: KillButton — the real
+                    /cancel control. Distinct from Reject so the operator can
+                    actually STOP a run instead of looping it via on_reject. */}
+                <ConfirmRunActionDialog
+                  trigger={
+                    <button
+                      disabled={
+                        !runId ||
+                        approveMutation.isPending ||
+                        rejectMutation.isPending ||
+                        cancelMutation.isPending
+                      }
+                      className="flex items-center gap-1 rounded-md px-2 py-1 text-xs text-text-secondary border border-border hover:bg-surface-elevated hover:text-text-primary transition-colors disabled:opacity-50"
+                      data-testid="kill-button"
+                    >
+                      <Ban className="h-3.5 w-3.5" />
+                      Kill (/cancel)
+                    </button>
+                  }
+                  title="Cancel workflow?"
+                  description={
+                    <>
+                      Cancel the workflow <strong>{workflowName}</strong>. The run will be marked
+                      cancelled immediately — this is the headshot, distinct from{' '}
+                      <code>Reject</code> which may loop into <code>on_reject</code>.
+                    </>
+                  }
+                  confirmLabel="Kill"
+                  onConfirm={(): void => {
+                    cancelMutation.mutate();
+                  }}
+                />
               </div>
-              {(approveMutation.isError || rejectMutation.isError) && (
+              {(approveMutation.isError || rejectMutation.isError || cancelMutation.isError) && (
                 <p className="text-xs text-error">
                   {mutationError instanceof Error
                     ? mutationError.message

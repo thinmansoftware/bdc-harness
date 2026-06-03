@@ -20,6 +20,14 @@ export type { LoopArc, CycleState, ApprovalContext } from '@/lib/dag-self-repair
 export const NODE_WIDTH = 180;
 export const NODE_HEIGHT = 80;
 
+/**
+ * WO-MC-NEGAN-DIAGNOSTIC-GRAPH-01: lateral gap between the rightmost forward
+ * node and the side-rail gutter where loop-back arcs route. 60px is wide
+ * enough that a back-edge never crosses a forward node's bounding box; small
+ * enough that the gutter does not steal viewport real-estate.
+ */
+export const SIDE_RAIL_GUTTER_PX = 60;
+
 export function layoutWithDagre(
   nodes: DagFlowNode[],
   edges: Edge[]
@@ -133,6 +141,12 @@ export function dagNodesToReactFlow(dagNodes: readonly DagNode[]): {
  * Coordinates with #74 DAG-VIZ-RETRY-RESILIENCE: every new field is defensively
  * guarded so a partial event payload cannot reintroduce the "Cannot read
  * properties of undefined" crash.
+ *
+ * @deprecated WO-MC-NEGAN-DIAGNOSTIC-GRAPH-01 — use routeLoopArcsAsSideRail
+ *   for proper right-gutter side-rail rendering. This helper scattered loop
+ *   arcs across the forward spine because smoothstep would route through the
+ *   shortest path, crossing forward nodes. Kept for backward compatibility
+ *   with any caller (and tests) that still depend on the merge-only behavior.
  */
 export function mergeLoopArcsIntoEdges(
   baseNodes: readonly DagFlowNode[],
@@ -170,6 +184,85 @@ export function mergeLoopArcsIntoEdges(
       labelBgPadding: [4, 2],
       labelBgBorderRadius: 4,
       data: { loopArcType: arc.type, count: arc.count, isSelf },
+    });
+  }
+  return merged;
+}
+
+/**
+ * WO-MC-NEGAN-DIAGNOSTIC-GRAPH-01: route self-repair loop arcs as a clean
+ * RIGHT-GUTTER SIDE-RAIL instead of letting smoothstep scatter them across
+ * the forward spine.
+ *
+ * Layout strategy:
+ *   1. Dagre has already laid out baseNodes against the forward
+ *      depends_on edge set (cycle-free by construction). Loop arcs are NOT
+ *      fed to dagre — that would either reposition the spine or crash.
+ *   2. Compute gutterX = (max rightmost node edge X) + SIDE_RAIL_GUTTER_PX.
+ *      All loop arcs share the same gutter so they read as a single side-rail.
+ *   3. For each LoopArc, emit one ReactFlow edge typed 'loopArcEdge' (custom
+ *      edge component LoopArcEdge.tsx draws the right-gutter bezier). Edge id
+ *      keeps the existing `__loop_` prefix so the recoloring skip in
+ *      WorkflowDagViewer (which detects loop overlays by id prefix) catches
+ *      it unchanged.
+ *
+ * Geometric invariant (asserted by the negan-diagnostics suite):
+ *   gutterX > (forwardNode.position.x + NODE_WIDTH) for EVERY forward node.
+ *   No loop-back path can cross a forward node's bounding box, because the
+ *   bezier routes [source.right -> gutterX -> down -> target.right].
+ *
+ * Falls back to the original mergeLoopArcsIntoEdges behavior when baseNodes
+ * is empty (defensive: dagre may not have laid anything out yet).
+ */
+export function routeLoopArcsAsSideRail(
+  baseNodes: readonly DagFlowNode[],
+  baseEdges: readonly Edge[],
+  loopArcs: readonly LoopArc[]
+): Edge[] {
+  if (loopArcs.length === 0) return baseEdges.slice();
+  if (baseNodes.length === 0) {
+    // No positions yet — fall back to overlay merge so the renderer does not
+    // throw and the arcs are at least present (will re-route on next render).
+    return mergeLoopArcsIntoEdges(baseNodes, baseEdges, loopArcs);
+  }
+
+  const baseIds = new Set<string>();
+  for (const n of baseNodes) baseIds.add(n.id);
+
+  // Compute the right edge of the rightmost forward node.
+  let maxRightEdge = -Infinity;
+  for (const n of baseNodes) {
+    const right = n.position.x + NODE_WIDTH;
+    if (right > maxRightEdge) maxRightEdge = right;
+  }
+  const gutterX = maxRightEdge + SIDE_RAIL_GUTTER_PX;
+
+  const merged: Edge[] = baseEdges.slice();
+  const seen = new Set<string>(merged.map(e => e.id));
+
+  for (const arc of loopArcs) {
+    if (!arc || typeof arc.source !== 'string' || typeof arc.target !== 'string') continue;
+    if (!baseIds.has(arc.source) || !baseIds.has(arc.target)) continue;
+    // Preserve the existing `__loop_` id prefix convention so the
+    // WorkflowDagViewer edge-recoloring skip at lines 135-147 catches these
+    // edges without modification (FLAG-5 in the approved plan).
+    const id = arc.id.startsWith('__loop_') ? arc.id : `__loop_arc__:${arc.id}`;
+    if (seen.has(id)) continue;
+    seen.add(id);
+    const label = arc.count > 0 ? String(arc.count) : '';
+    merged.push({
+      id,
+      source: arc.source,
+      target: arc.target,
+      type: 'loopArcEdge',
+      animated: false,
+      data: {
+        gutterX,
+        count: arc.count,
+        label,
+        loopArcType: arc.type,
+        isSelf: arc.source === arc.target,
+      },
     });
   }
   return merged;
