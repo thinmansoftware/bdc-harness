@@ -639,6 +639,61 @@ const listWorkflowRunsRoute = createRoute({
   },
 });
 
+/**
+ * Compute a derived Max-20x quota-window summary from the fetched runs.
+ *
+ * `windowTokens` is derived from the current page of runs ONLY (default 50, max
+ * 200) — runs beyond the page are not counted. This is an intentional v1
+ * simplification; a full-window DB aggregation would belong in @archon/core if
+ * a future WO needs it. Any UI rendering MUST label this value as estimated.
+ *
+ * `MAX20X_WINDOW_TOKENS` and `MAX20X_WINDOW_HOURS` are read from process.env at
+ * call time (NOT at module load) so test overrides via
+ * `process.env['MAX20X_...'] = '...'` take effect without `mock.module()` or
+ * a module reload. Default window length: 5 hours (a rough proxy for the
+ * Max-20x rolling rate-limit window, NOT a billed quota). `windowBudget` is
+ * `null` when `MAX20X_WINDOW_TOKENS` is unset — the runs API still surfaces
+ * `windowTokens` in that case (raw-first fallback).
+ */
+interface QuotaWindowRun {
+  metadata: Record<string, unknown>;
+  last_activity_at: Date | string | null;
+  started_at: Date | string;
+}
+
+function computeQuotaWindow(runs: QuotaWindowRun[]): {
+  windowTokens: number;
+  windowBudget: number | null;
+  windowResetAt: string;
+} {
+  const rawBudget = process.env.MAX20X_WINDOW_TOKENS;
+  const windowBudget =
+    rawBudget !== undefined && rawBudget !== '' && !Number.isNaN(Number(rawBudget))
+      ? Number(rawBudget)
+      : null;
+  const rawHours = process.env.MAX20X_WINDOW_HOURS;
+  const windowHours =
+    rawHours !== undefined && rawHours !== '' && !Number.isNaN(Number(rawHours))
+      ? Number(rawHours)
+      : 5;
+  const now = Date.now();
+  const windowMs = windowHours * 60 * 60 * 1000;
+  const windowStart = now - windowMs;
+  // Rolling window: the reset point is when content entering the window right
+  // now would age out (now + windowHours). This is an estimate; the real
+  // Max-20x boundary is not exposed to us.
+  const windowResetAt = new Date(now + windowMs).toISOString();
+  let windowTokens = 0;
+  for (const run of runs) {
+    const activityTs = run.last_activity_at ?? run.started_at;
+    if (activityTs && new Date(activityTs).getTime() >= windowStart) {
+      const t = run.metadata.total_tokens;
+      if (typeof t === 'number') windowTokens += t;
+    }
+  }
+  return { windowTokens, windowBudget, windowResetAt };
+}
+
 const cancelWorkflowRunRoute = createRoute({
   method: 'post',
   path: '/api/workflows/runs/{runId}/cancel',
@@ -2882,7 +2937,8 @@ export function registerApiRoutes(
         limit,
         codebaseId,
       });
-      return c.json({ runs });
+      const quotaWindow = computeQuotaWindow(runs);
+      return c.json({ runs, quotaWindow });
     } catch (error) {
       getLog().error({ err: error }, 'list_workflow_runs_failed');
       return apiError(c, 500, 'Failed to list workflow runs');

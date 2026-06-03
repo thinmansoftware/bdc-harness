@@ -1015,6 +1015,95 @@ describe('GET /api/workflows/runs', () => {
     const body = (await response.json()) as { error: string };
     expect(body.error).toContain('Failed to list workflow runs');
   });
+
+  // -------------------------------------------------------------------------
+  // WO-HARNESS-TOKEN-ATTRIBUTION-01 -- Scenario 5: quota window summary
+  // -------------------------------------------------------------------------
+  // computeQuotaWindow reads process.env at CALL time (not at module load),
+  // so these tests set/unset MAX20X_WINDOW_TOKENS inline within each case and
+  // rely on that design for the override to take effect without mock.module()
+  // or a separate process. Runs use a recent last_activity_at so they fall
+  // inside the window.
+
+  test('Scenario 5A -- quotaWindow includes windowTokens + windowBudget when MAX20X_WINDOW_TOKENS configured', async () => {
+    const recent = new Date().toISOString();
+    const runWithTokens: MockWorkflowRun = {
+      ...MOCK_COMPLETED_RUN,
+      id: 'run-tok-a-1',
+      metadata: { total_tokens: 1000 },
+      last_activity_at: recent,
+      started_at: recent,
+    };
+    const runWithTokens2: MockWorkflowRun = {
+      ...MOCK_COMPLETED_RUN,
+      id: 'run-tok-a-2',
+      metadata: { total_tokens: 1000 },
+      last_activity_at: recent,
+      started_at: recent,
+    };
+    mockListWorkflowRuns.mockImplementationOnce(async () => [runWithTokens, runWithTokens2]);
+
+    process.env['MAX20X_WINDOW_TOKENS'] = '40000';
+    try {
+      const { app } = makeApp();
+      const response = await app.request('/api/workflows/runs');
+      expect(response.status).toBe(200);
+
+      const body = (await response.json()) as {
+        runs: Array<{ id: string }>;
+        quotaWindow: {
+          windowTokens: number;
+          windowBudget: number | null;
+          windowResetAt: string;
+        };
+      };
+      expect(body.runs.length).toBe(2);
+      expect(body.quotaWindow.windowTokens).toBe(2000);
+      expect(body.quotaWindow.windowBudget).toBe(40000);
+      // windowResetAt must be a valid ISO-8601 timestamp
+      expect(typeof body.quotaWindow.windowResetAt).toBe('string');
+      expect(Number.isNaN(new Date(body.quotaWindow.windowResetAt).getTime())).toBe(false);
+    } finally {
+      delete process.env['MAX20X_WINDOW_TOKENS'];
+    }
+  });
+
+  test('Scenario 5B -- quotaWindow.windowBudget is null when MAX20X_WINDOW_TOKENS unset (raw-first fallback)', async () => {
+    const recent = new Date().toISOString();
+    const runWithTokens: MockWorkflowRun = {
+      ...MOCK_COMPLETED_RUN,
+      id: 'run-tok-b-1',
+      metadata: { total_tokens: 1000 },
+      last_activity_at: recent,
+      started_at: recent,
+    };
+    const runWithTokens2: MockWorkflowRun = {
+      ...MOCK_COMPLETED_RUN,
+      id: 'run-tok-b-2',
+      metadata: { total_tokens: 1000 },
+      last_activity_at: recent,
+      started_at: recent,
+    };
+    mockListWorkflowRuns.mockImplementationOnce(async () => [runWithTokens, runWithTokens2]);
+
+    // Ensure unset for this case
+    delete process.env['MAX20X_WINDOW_TOKENS'];
+
+    const { app } = makeApp();
+    const response = await app.request('/api/workflows/runs');
+    expect(response.status).toBe(200);
+
+    const body = (await response.json()) as {
+      quotaWindow: {
+        windowTokens: number;
+        windowBudget: number | null;
+        windowResetAt: string;
+      };
+    };
+    expect(body.quotaWindow.windowBudget).toBeNull();
+    // Raw windowTokens still surfaced even without a budget.
+    expect(body.quotaWindow.windowTokens).toBe(2000);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -1050,6 +1139,58 @@ describe('GET /api/workflows/runs/:runId', () => {
     expect(body.events.length).toBe(3);
     expect(body.events[0]?.event_type).toBe('step_started');
     expect(body.events[2]?.event_type).toBe('tool_called');
+  });
+
+  // ------------------------------------------------------------------------
+  // WO-HARNESS-TOKEN-ATTRIBUTION-01 -- Scenario 4: API exposes tokens
+  // ------------------------------------------------------------------------
+  // Proves the runs/events detail API surfaces:
+  //   * data.tokens on a node_completed event (per-node persistence)
+  //   * metadata.total_tokens on the run (per-run aggregate)
+  // without stripping the JSONB keys persisted by the dag-executor.
+  test('Scenario 4 -- API exposes tokens: data.tokens per event + metadata.total_tokens per run', async () => {
+    const runWithTokens: MockWorkflowRun = {
+      ...MOCK_COMPLETED_RUN,
+      id: 'run-tok-detail-1',
+      metadata: { total_tokens: 2300, total_cost_usd: 0.005 },
+    };
+    const eventWithTokens: MockWorkflowEvent = {
+      id: 'evt-tok-1',
+      workflow_run_id: 'run-tok-detail-1',
+      event_type: 'node_completed',
+      step_index: 0,
+      step_name: 'step',
+      data: {
+        duration_ms: 1234,
+        node_output: 'done',
+        cost_usd: 0.005,
+        tokens: { input: 1000, output: 500, total: 1500 },
+      },
+      created_at: NOW,
+    };
+
+    mockGetWorkflowRun.mockImplementationOnce(async () => runWithTokens);
+    mockListWorkflowEvents.mockImplementationOnce(async () => [eventWithTokens]);
+    mockGetConversationById.mockImplementationOnce(async () => ({
+      id: 'conv-uuid-1',
+      platform_conversation_id: 'web-conv-abc',
+    }));
+
+    const { app } = makeApp();
+    const response = await app.request('/api/workflows/runs/run-tok-detail-1');
+    expect(response.status).toBe(200);
+
+    const body = (await response.json()) as {
+      run: { metadata: { total_tokens?: number; total_cost_usd?: number } };
+      events: Array<{
+        event_type: string;
+        data: { tokens?: { input: number; output: number; total: number } };
+      }>;
+    };
+    expect(body.run.metadata.total_tokens).toBe(2300);
+    expect(body.run.metadata.total_cost_usd).toBe(0.005);
+    expect(body.events.length).toBe(1);
+    expect(body.events[0]?.data.tokens).toEqual({ input: 1000, output: 500, total: 1500 });
   });
 
   test('returns 404 when run not found', async () => {

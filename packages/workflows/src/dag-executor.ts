@@ -181,8 +181,8 @@ interface WorkflowLevelOptions {
   sandbox?: SandboxSettings;
 }
 
-/** Internal node execution result — extends NodeOutput with cost data for aggregation. */
-type NodeExecutionResult = NodeOutput & { costUsd?: number };
+/** Internal node execution result — extends NodeOutput with cost + token data for aggregation. */
+type NodeExecutionResult = NodeOutput & { costUsd?: number; tokens?: TokenUsage };
 
 /** Throttle state for cancel checks (reads — no write contention in WAL mode) */
 const lastNodeCancelCheck = new Map<string, number>();
@@ -1227,6 +1227,7 @@ async function executeNodeInternal(
           ...(nodeStopReason ? { stop_reason: nodeStopReason } : {}),
           ...(nodeNumTurns !== undefined ? { num_turns: nodeNumTurns } : {}),
           ...(nodeModelUsage ? { model_usage: nodeModelUsage } : {}),
+          ...(nodeTokens ? { tokens: nodeTokens } : {}),
         },
       })
       .catch((err: Error) => {
@@ -1256,6 +1257,7 @@ async function executeNodeInternal(
       output: nodeOutputText,
       sessionId: newSessionId,
       costUsd: nodeCostUsd,
+      ...(nodeTokens ? { tokens: nodeTokens } : {}),
     };
   } catch (error) {
     const err = error as Error;
@@ -1272,6 +1274,7 @@ async function executeNodeInternal(
         output: nodeOutputText,
         error: 'Cancelled by user',
         costUsd: nodeCostUsd,
+        ...(nodeTokens ? { tokens: nodeTokens } : {}),
       };
     }
 
@@ -1300,7 +1303,13 @@ async function executeNodeInternal(
       error: err.message,
     });
 
-    return { state: 'failed', output: '', error: err.message, costUsd: nodeCostUsd };
+    return {
+      state: 'failed',
+      output: '',
+      error: err.message,
+      costUsd: nodeCostUsd,
+      ...(nodeTokens ? { tokens: nodeTokens } : {}),
+    };
   }
 }
 
@@ -1960,6 +1969,7 @@ async function executeLoopNode(
 
   let lastIterationOutput = '';
   let loopTotalCostUsd: number | undefined;
+  let loopTotalTokens: TokenUsage | undefined;
   let loopFinalStopReason: string | undefined;
   let loopTotalNumTurns: number | undefined;
   const resolvedOptions = buildLoopNodeOptions(
@@ -2135,6 +2145,15 @@ async function executeLoopNode(
           if (msg.cost !== undefined) {
             loopTotalCostUsd = (loopTotalCostUsd ?? 0) + msg.cost;
           }
+          if (msg.tokens) {
+            const t = msg.tokens;
+            if (!loopTotalTokens) loopTotalTokens = { input: 0, output: 0 };
+            loopTotalTokens.input += t.input;
+            loopTotalTokens.output += t.output;
+            if (t.total !== undefined) {
+              loopTotalTokens.total = (loopTotalTokens.total ?? 0) + t.total;
+            }
+          }
           if (msg.stopReason !== undefined) loopFinalStopReason = msg.stopReason;
           if (msg.numTurns !== undefined) {
             loopTotalNumTurns = (loopTotalNumTurns ?? 0) + msg.numTurns;
@@ -2259,6 +2278,7 @@ async function executeLoopNode(
         output: '',
         error: `Loop iteration ${i} failed: ${err.message}`,
         costUsd: loopTotalCostUsd,
+        ...(loopTotalTokens ? { tokens: loopTotalTokens } : {}),
       };
     }
 
@@ -2315,6 +2335,7 @@ async function executeLoopNode(
         output: '',
         error: `Loop iteration ${i} failed: ${emptyError}`,
         costUsd: loopTotalCostUsd,
+        ...(loopTotalTokens ? { tokens: loopTotalTokens } : {}),
       };
     }
 
@@ -2421,6 +2442,7 @@ async function executeLoopNode(
             ...(loopTotalCostUsd !== undefined ? { cost_usd: loopTotalCostUsd } : {}),
             ...(loopFinalStopReason ? { stop_reason: loopFinalStopReason } : {}),
             ...(loopTotalNumTurns !== undefined ? { num_turns: loopTotalNumTurns } : {}),
+            ...(loopTotalTokens ? { tokens: loopTotalTokens } : {}),
           },
         })
         .catch((err: Error) => {
@@ -2444,6 +2466,7 @@ async function executeLoopNode(
         output: lastIterationOutput,
         sessionId: currentSessionId,
         costUsd: loopTotalCostUsd,
+        ...(loopTotalTokens ? { tokens: loopTotalTokens } : {}),
       };
     }
 
@@ -2499,7 +2522,12 @@ async function executeLoopNode(
       // This mirrors the approval-node pattern, preventing false "DAG nodes failed" warnings
       // in multi-node workflows. Resume correctness relies on the 'paused' DB status, not
       // on the node's output state.
-      return { state: 'completed', output: lastIterationOutput, costUsd: loopTotalCostUsd };
+      return {
+        state: 'completed',
+        output: lastIterationOutput,
+        costUsd: loopTotalCostUsd,
+        ...(loopTotalTokens ? { tokens: loopTotalTokens } : {}),
+      };
     }
   }
 
@@ -2515,6 +2543,7 @@ async function executeLoopNode(
     output: lastIterationOutput,
     error: errorMsg,
     costUsd: loopTotalCostUsd,
+    ...(loopTotalTokens ? { tokens: loopTotalTokens } : {}),
   };
 }
 
@@ -2774,7 +2803,9 @@ export async function executeDagWorkflow(
   let lastSequentialSessionId: string | undefined;
   // Note: accumulates cost for this invocation only. If this is a resume, nodes skipped
   // from the prior run are not included — total_cost_usd will reflect resumed-portion cost only.
+  // The same resumed-portion semantics apply to totalTokens.
   let totalCostUsd = 0;
+  let totalTokens = 0;
 
   for (let layerIdx = 0; layerIdx < layers.length; layerIdx++) {
     const layer = layers[layerIdx];
@@ -3220,6 +3251,9 @@ export async function executeDagWorkflow(
       if (result.status === 'fulfilled') {
         const { nodeId, output } = result.value;
         if (output.costUsd !== undefined) totalCostUsd += output.costUsd;
+        if (output.tokens) {
+          totalTokens += output.tokens.total ?? output.tokens.input + output.tokens.output;
+        }
         nodeOutputs.set(nodeId, output);
         if (output.state === 'completed' && !isParallelLayer && output.sessionId !== undefined) {
           lastSequentialSessionId = output.sessionId;
@@ -3383,6 +3417,8 @@ export async function executeDagWorkflow(
       node_counts: nodeCounts,
       // totalCostUsd starts at 0; only write metadata when at least one node reported cost
       ...(totalCostUsd > 0 ? { total_cost_usd: totalCostUsd } : {}),
+      // totalTokens starts at 0; only write metadata when at least one node reported tokens
+      ...(totalTokens > 0 ? { total_tokens: totalTokens } : {}),
     });
   } catch (dbErr) {
     getLog().error(
