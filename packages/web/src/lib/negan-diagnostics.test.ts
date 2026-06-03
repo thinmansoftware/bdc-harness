@@ -407,21 +407,71 @@ describe('Scenario 6: computeCostBurnRate', () => {
 });
 
 // ===========================================================================
-// Scenario 7: Replay function identity.
+// Scenario 7: Kill action drives the /cancel endpoint — integration assertion.
+//
+// FLAG-3: packages/web has no @testing-library/react, so we cannot mount
+// components and click buttons. Instead we exercise the API layer directly:
+// mock globalThis.fetch to capture the network call, invoke cancelWorkflowRun,
+// and assert it POSTs to the /cancel endpoint with the correct runId. This is
+// the same call path the Kill button takes (cancelMutation.mutate(runId) →
+// cancelWorkflowRun(runId) → fetch(POST /api/workflows/runs/:id/cancel)).
 // ===========================================================================
-describe('Scenario 7: replay surface uses resumeWorkflowRun (no faked alt-model)', () => {
-  it('resumeWorkflowRun is a callable function imported from api.ts', () => {
-    expect(typeof resumeWorkflowRun).toBe('function');
-    // Calling with an empty runId returns a Promise (basic callable check —
-    // we do NOT await the network call; we only assert the contract shape).
-    const maybePromise = resumeWorkflowRun('').catch(() => undefined);
-    expect(maybePromise).toBeInstanceOf(Promise);
+describe('Scenario 7: kill action POSTs to /cancel endpoint with the runId', () => {
+  it('cancelWorkflowRun POSTs to /api/workflows/runs/:runId/cancel', async () => {
+    // Capture fetch requests without actually hitting the network.
+    const captured: { url: string; method: string }[] = [];
+    const savedFetch = globalThis.fetch;
+    globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+      captured.push({
+        url: typeof input === 'string' ? input : input.toString(),
+        method: init?.method ?? 'GET',
+      });
+      return new Response(JSON.stringify({ success: true, message: 'Workflow run cancelled' }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    };
+
+    try {
+      const result = await cancelWorkflowRun('run-abc-123');
+      // Assert the network call hit the correct endpoint.
+      expect(captured.length).toBe(1);
+      expect(captured[0].method).toBe('POST');
+      expect(captured[0].url).toContain('/api/workflows/runs/');
+      expect(captured[0].url).toContain('run-abc-123');
+      expect(captured[0].url).toContain('/cancel');
+      // Assert the response shape that the Kill button mutation reads.
+      expect(result.success).toBe(true);
+      expect(typeof result.message).toBe('string');
+    } finally {
+      globalThis.fetch = savedFetch;
+    }
   });
 
-  it('cancelWorkflowRun is the kill function (distinct from reject)', () => {
-    expect(typeof cancelWorkflowRun).toBe('function');
-    const maybePromise = cancelWorkflowRun('').catch(() => undefined);
-    expect(maybePromise).toBeInstanceOf(Promise);
+  it('resumeWorkflowRun POSTs to /api/workflows/runs/:runId/resume (replay path)', async () => {
+    // ReplayNode calls resumeWorkflowRun(runId) — same fetch-capture pattern.
+    const captured: { url: string; method: string }[] = [];
+    const savedFetch = globalThis.fetch;
+    globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+      captured.push({
+        url: typeof input === 'string' ? input : input.toString(),
+        method: init?.method ?? 'GET',
+      });
+      return new Response(
+        JSON.stringify({ id: 'run-abc-123', workflow_name: 'test', status: 'running' }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } }
+      );
+    };
+
+    try {
+      await resumeWorkflowRun('run-abc-123');
+      expect(captured.length).toBe(1);
+      expect(captured[0].method).toBe('POST');
+      expect(captured[0].url).toContain('run-abc-123');
+      expect(captured[0].url).toContain('/resume');
+    } finally {
+      globalThis.fetch = savedFetch;
+    }
   });
 
   // alt-model replay: fast-follow (requires server-side model override endpoint).
