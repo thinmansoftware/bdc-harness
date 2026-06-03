@@ -70,6 +70,13 @@ async function getCodex(configCodexBinaryPath?: string): Promise<Codex> {
  * it is silently dropped — Codex authenticates via its own account and resolves
  * the model internally.  Non-Anthropic models (gpt-5-codex, o3, etc.) are passed through.
  */
+// The live, API-supported Codex frontier model. Used as the explicit default when
+// no model is resolved from the node/config, so the Codex SDK never falls back to its
+// own stale account default (gpt-5.3-codex), which the ChatGPT-account API rejects (400).
+// Verified live against the container's models_cache.json 2026-06-02 (slug "gpt-5.5",
+// supported_in_api: true). Update this one constant if the account's frontier model changes.
+const CODEX_DEFAULT_MODEL = 'gpt-5.5';
+
 const ANTHROPIC_MODEL_ALIASES: ReadonlySet<string> = new Set([
   'sonnet',
   'opus',
@@ -103,8 +110,17 @@ function buildThreadOptions(
   // codex node could still receive an Anthropic model from node.model or
   // assistantConfig.model even though resolveAgentPersona returned undefined.
   const candidateModel = model ?? config.model;
-  const resolvedModel =
+  const candidateAfterAliasDrop =
     candidateModel !== undefined && isAnthropicAlias(candidateModel) ? undefined : candidateModel;
+  // When no usable model is resolved (no pin, or an Anthropic alias was dropped),
+  // pin a known-good live Codex model EXPLICITLY rather than letting the Codex SDK
+  // fall back to its own account default -- that default is the stale `gpt-5.3-codex`,
+  // which the ChatGPT-account API now rejects with HTTP 400 ("model is not supported").
+  // CODEX_DEFAULT_MODEL is the live, API-supported frontier model (verified against the
+  // container's models_cache.json 2026-06-02). This is the single chokepoint every
+  // codex call flows through, so fixing it here fixes every workflow lane at once --
+  // no per-node/per-YAML model pin required.
+  const resolvedModel = candidateAfterAliasDrop ?? CODEX_DEFAULT_MODEL;
   return {
     workingDirectory: cwd,
     skipGitRepoCheck: true,
@@ -126,8 +142,12 @@ function buildCodexEnv(requestEnv: Record<string, string>): Record<string, strin
   return { ...baseEnv, ...requestEnv };
 }
 
+// Maps stale/dead model slugs to the live default for the human-readable
+// "model not available" help message. Both gpt-5.3-codex and gpt-5.2-codex are
+// dead (not in the account's models_cache.json); point them at the live default.
 const CODEX_MODEL_FALLBACKS: Record<string, string> = {
-  'gpt-5.3-codex': 'gpt-5.2-codex',
+  'gpt-5.3-codex': CODEX_DEFAULT_MODEL,
+  'gpt-5.2-codex': CODEX_DEFAULT_MODEL,
 };
 
 function isModelAccessError(errorMessage: string): boolean {
