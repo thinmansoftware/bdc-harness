@@ -935,6 +935,78 @@ export async function listWorkflowRuns(options?: {
 }
 
 /**
+ * Sum metadata.total_tokens across runs whose activity timestamp falls inside
+ * the given window (sinceMs .. now).
+ *
+ * Activity timestamp = COALESCE(last_activity_at, started_at) — matches the
+ * fallback used by the runs API quota-window summary.
+ *
+ * This is a DEDICATED full-window aggregation; it is NOT bounded by the
+ * runs-list pagination LIMIT. Callers (currently `computeQuotaWindow` in the
+ * server runs API) use this for the derived Max-20x quota summary so the
+ * `windowTokens` figure reflects ALL in-window runs, not just the current
+ * page (which under-reports whenever in-window runs spill past the page).
+ *
+ * Returns 0 when no run in the window has a `metadata.total_tokens` value.
+ */
+export async function sumWorkflowTokensInWindow(options: {
+  sinceMs: number;
+  codebaseId?: string;
+}): Promise<number> {
+  const isPostgres = getDatabaseType() === 'postgresql';
+  const values: unknown[] = [];
+
+  // Serialize as ISO so bun:sqlite accepts it (no Date bindings).
+  const sinceIso = new Date(options.sinceMs).toISOString();
+  values.push(sinceIso);
+  const sinceParam = `$${String(values.length)}`;
+
+  // Activity comparison. SQLite stores timestamps as TEXT in
+  // "YYYY-MM-DD HH:MM:SS" format; lexical comparison vs an ISO "T"-separated
+  // string is wrong (see `findActiveWorkflowRunByPath` for the same gotcha).
+  // Wrap both sides in datetime() for SQLite; cast to timestamptz for PG.
+  const activityExpr = isPostgres
+    ? 'COALESCE(last_activity_at, started_at)'
+    : 'datetime(COALESCE(last_activity_at, started_at))';
+  const sinceExpr = isPostgres ? `${sinceParam}::timestamptz` : `datetime(${sinceParam})`;
+
+  // total_tokens JSONB extraction (mirrors jsonIntExtract; widened to BIGINT
+  // on PG so large sums do not overflow INT4).
+  const tokenExpr = isPostgres
+    ? "(metadata->>'total_tokens')::BIGINT"
+    : "CAST(json_extract(metadata, '$.total_tokens') AS INTEGER)";
+
+  const whereClauses: string[] = [
+    `${activityExpr} >= ${sinceExpr}`,
+    'archived_at IS NULL',
+    `${tokenExpr} IS NOT NULL`,
+  ];
+  if (options.codebaseId) {
+    values.push(options.codebaseId);
+    whereClauses.push(
+      `conversation_id IN (SELECT id FROM remote_agent_conversations WHERE codebase_id = $${String(values.length)})`
+    );
+  }
+
+  try {
+    const result = await pool.query<{ sum_tokens: string | number | null }>(
+      `SELECT COALESCE(SUM(${tokenExpr}), 0) AS sum_tokens
+       FROM remote_agent_workflow_runs
+       WHERE ${whereClauses.join(' AND ')}`,
+      values
+    );
+    const raw = result.rows[0]?.sum_tokens;
+    if (raw === null || raw === undefined) return 0;
+    const n = typeof raw === 'number' ? raw : Number(raw);
+    return Number.isFinite(n) ? n : 0;
+  } catch (error) {
+    const err = error as Error;
+    getLog().error({ err }, 'db.workflow_token_window_sum_failed');
+    throw new Error(`Failed to sum workflow tokens in window: ${err.message}`);
+  }
+}
+
+/**
  * Update parent_conversation_id on a workflow run.
  * Non-critical — logs error but does not throw.
  */

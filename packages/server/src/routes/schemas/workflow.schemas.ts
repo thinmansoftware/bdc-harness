@@ -147,9 +147,28 @@ export const workflowRunSchema = z
   })
   .openapi('WorkflowRun');
 
+/**
+ * Derived Max-20x quota-window summary returned by GET /api/workflows/runs.
+ *
+ * `windowTokens` is an ESTIMATE computed from the current page of runs
+ * (not a full-window DB aggregation), and is NOT a billed quota — it is a
+ * rough rate-limit indicator for the Max-20x subscription window.
+ * `windowBudget` is `null` when MAX20X_WINDOW_TOKENS env var is unset.
+ */
+export const quotaWindowSchema = z
+  .object({
+    windowTokens: z.number(),
+    windowBudget: z.number().nullable(),
+    windowResetAt: z.string(),
+  })
+  .openapi('QuotaWindow');
+
 /** GET /api/workflows/runs response. */
 export const workflowRunListResponseSchema = z
-  .object({ runs: z.array(workflowRunSchema) })
+  .object({
+    runs: z.array(workflowRunSchema),
+    quotaWindow: quotaWindowSchema,
+  })
   .openapi('WorkflowRunListResponse');
 
 /** A workflow event record. */
