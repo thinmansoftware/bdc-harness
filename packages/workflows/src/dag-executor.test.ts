@@ -6715,6 +6715,224 @@ describe('executeDagWorkflow -- token tracking', () => {
     expect(completeCalls[0][1]).not.toHaveProperty('total_tokens');
     expect(completeCalls[0][1]).toMatchObject({ total_cost_usd: 0.005 });
   });
+
+  // -------------------------------------------------------------------------
+  // WO-HARNESS-TOKEN-ATTRIBUTION-01 -- Codex repair: failure-path token persist
+  // -------------------------------------------------------------------------
+  // The SDK can yield tokens BEFORE signalling msg.isError. The original patch
+  // surfaced tokens on completed and on the result tuple, but the persisted
+  // node_failed / loop_iteration_failed events still omitted data.tokens —
+  // losing per-node token attribution exactly for the failure cases that the
+  // diagnostic graph needs most. These tests pin the fix.
+
+  it('Scenario 9 -- node_failed event persists data.tokens when SDK yielded tokens before erroring', async () => {
+    // Mirrors the existing "fails node when SDK returns error_during_execution"
+    // test but the result now also carries tokens — the failed event MUST
+    // surface them.
+    mockSendQueryDag.mockImplementation(function* () {
+      yield {
+        type: 'result',
+        isError: true,
+        errorSubtype: 'error_during_execution',
+        errors: ['Tool call failed: permission denied'],
+        sessionId: 'sid-err-tok',
+        tokens: { input: 700, output: 300, total: 1000 },
+      };
+    });
+
+    const store = createMockStore();
+    const mockDeps = createMockDeps(store);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun();
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-dag',
+      testDir,
+      { name: 'dag-failed-tok', nodes: [{ id: 'step', command: 'my-cmd' }] },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    const eventCalls = (
+      store.createWorkflowEvent as Mock<
+        (arg: { event_type: string; data: Record<string, unknown> }) => Promise<void>
+      >
+    ).mock.calls;
+    const failedEvents = eventCalls.filter(c => c[0].event_type === 'node_failed');
+    expect(failedEvents.length).toBeGreaterThan(0);
+    const failedData = failedEvents[0][0].data;
+    expect(failedData.tokens).toEqual({ input: 700, output: 300, total: 1000 });
+    // Still carries the error string.
+    expect(typeof failedData.error).toBe('string');
+  });
+
+  it('Scenario 10 -- node_failed event omits tokens when SDK never reported any (omit-when-absent)', async () => {
+    mockSendQueryDag.mockImplementation(function* () {
+      yield {
+        type: 'result',
+        isError: true,
+        errorSubtype: 'error_during_execution',
+        errors: ['no usage emitted'],
+        sessionId: 'sid-err-no-tok',
+      };
+    });
+
+    const store = createMockStore();
+    const mockDeps = createMockDeps(store);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun();
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-dag',
+      testDir,
+      { name: 'dag-failed-no-tok', nodes: [{ id: 'step', command: 'my-cmd' }] },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    const eventCalls = (
+      store.createWorkflowEvent as Mock<
+        (arg: { event_type: string; data: Record<string, unknown> }) => Promise<void>
+      >
+    ).mock.calls;
+    const failedEvents = eventCalls.filter(c => c[0].event_type === 'node_failed');
+    expect(failedEvents.length).toBeGreaterThan(0);
+    // Per the omit-when-absent invariant: not 0, not {}, just absent.
+    expect(failedEvents[0][0].data).not.toHaveProperty('tokens');
+  });
+
+  it('Scenario 11a -- loop_iteration_failed (SDK error) persists aggregated loop tokens', async () => {
+    // SDK error path: result yields tokens AND isError; tokens are
+    // accumulated into loopTotalTokens BEFORE the throw, and the persisted
+    // loop_iteration_failed event MUST carry them.
+    mockSendQueryDag.mockImplementation(function* () {
+      yield { type: 'assistant', content: 'partial' };
+      yield {
+        type: 'result',
+        isError: true,
+        errorSubtype: 'error_during_execution',
+        errors: ['Tool call failed'],
+        sessionId: 'loop-sdkerr-sid',
+        tokens: { input: 1500, output: 600, total: 2100 },
+      };
+    });
+
+    const store = createMockStore();
+    const mockDeps = createMockDeps(store);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun();
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-dag',
+      testDir,
+      {
+        name: 'dag-loop-sdkerr',
+        nodes: [
+          {
+            id: 'loopy',
+            loop: { prompt: 'Work.', until: 'COMPLETE', max_iterations: 5 },
+          },
+        ],
+      },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    const eventCalls = (
+      store.createWorkflowEvent as Mock<
+        (arg: { event_type: string; data: Record<string, unknown> }) => Promise<void>
+      >
+    ).mock.calls;
+    const failedIters = eventCalls.filter(c => c[0].event_type === 'loop_iteration_failed');
+    expect(failedIters.length).toBeGreaterThan(0);
+    const lastFailed = failedIters[failedIters.length - 1][0].data;
+    expect(lastFailed.tokens).toEqual({ input: 1500, output: 600, total: 2100 });
+  });
+
+  it('Scenario 11 -- loop_iteration_failed (empty output) persists aggregated loop tokens', async () => {
+    // Iteration 1 yields tokens, iteration 2 yields empty assistant output
+    // (no content) — the loop fails. The persisted loop_iteration_failed
+    // event MUST include the accumulated loopTotalTokens from iteration 1.
+    let callCount = 0;
+    mockSendQueryDag.mockImplementation(function* () {
+      callCount++;
+      if (callCount === 1) {
+        yield { type: 'assistant', content: 'iteration 1 output' };
+        yield {
+          type: 'result',
+          sessionId: 'loop-fail-sid-1',
+          tokens: { input: 800, output: 400, total: 1200 },
+        };
+      } else {
+        // Empty assistant output — triggers the empty-output failure branch.
+        yield { type: 'result', sessionId: 'loop-fail-sid-2' };
+      }
+    });
+
+    const store = createMockStore();
+    const mockDeps = createMockDeps(store);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun();
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-dag',
+      testDir,
+      {
+        name: 'dag-loop-empty-fail',
+        nodes: [
+          {
+            id: 'loopy',
+            loop: { prompt: 'Work.', until: 'COMPLETE', max_iterations: 5 },
+          },
+        ],
+      },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    const eventCalls = (
+      store.createWorkflowEvent as Mock<
+        (arg: { event_type: string; data: Record<string, unknown> }) => Promise<void>
+      >
+    ).mock.calls;
+    const failedIters = eventCalls.filter(c => c[0].event_type === 'loop_iteration_failed');
+    expect(failedIters.length).toBeGreaterThan(0);
+    // The last loop_iteration_failed event must carry the aggregated tokens.
+    const lastFailed = failedIters[failedIters.length - 1][0].data;
+    expect(lastFailed.tokens).toEqual({ input: 800, output: 400, total: 1200 });
+  });
 });
 
 describe('executeDagWorkflow -- script nodes', () => {

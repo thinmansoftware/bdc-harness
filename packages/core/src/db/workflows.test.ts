@@ -27,6 +27,7 @@ import {
   resumeWorkflowRun,
   failOrphanedRuns,
   listWorkflowRuns,
+  sumWorkflowTokensInWindow,
   deleteOldWorkflowRuns,
   deleteWorkflowRun,
 } from './workflows';
@@ -677,6 +678,72 @@ describe('workflows database', () => {
       const result = await listWorkflowRuns();
 
       expect(result).toEqual([mockWorkflowRun]);
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // WO-HARNESS-TOKEN-ATTRIBUTION-01 -- Codex repair: full-window aggregation
+  // -------------------------------------------------------------------------
+  // The runs API's quota-window summary needs a sum across ALL runs whose
+  // activity is in the window — not just the page-of-runs. These tests pin
+  // the SQL shape that makes that possible (COALESCE on activity, JSONB
+  // extraction, NULL guard on the extracted total_tokens).
+  describe('sumWorkflowTokensInWindow', () => {
+    test('issues a SUM query bounded by the activity window and excluding archived rows', async () => {
+      mockQuery.mockResolvedValueOnce(createQueryResult([{ sum_tokens: 12345 }]));
+
+      const since = Date.now() - 60 * 60 * 1000;
+      const result = await sumWorkflowTokensInWindow({ sinceMs: since });
+
+      expect(result).toBe(12345);
+      const [query, params] = mockQuery.mock.calls[0] as [string, unknown[]];
+      // Aggregation, not row-listing.
+      expect(query).toContain('SUM(');
+      // Activity window uses COALESCE(last_activity_at, started_at).
+      expect(query).toContain('COALESCE(last_activity_at, started_at)');
+      // Archived rows are excluded.
+      expect(query).toContain('archived_at IS NULL');
+      // NULL guard so SUM does not coerce missing totals to 0 rows.
+      expect(query).toContain('total_tokens');
+      expect(query).toContain('IS NOT NULL');
+      // First param is the ISO-formatted since cutoff.
+      expect(typeof params[0]).toBe('string');
+      expect(new Date(params[0] as string).getTime()).toBe(new Date(since).getTime());
+    });
+
+    test('returns 0 when no in-window run has tokens (COALESCE SUM)', async () => {
+      mockQuery.mockResolvedValueOnce(createQueryResult([{ sum_tokens: 0 }]));
+
+      const result = await sumWorkflowTokensInWindow({ sinceMs: Date.now() - 1000 });
+
+      expect(result).toBe(0);
+    });
+
+    test('coerces string SUM results (pg numeric → string) to number', async () => {
+      // PostgreSQL returns SUM() over BIGINT as a string to avoid JS precision loss.
+      mockQuery.mockResolvedValueOnce(createQueryResult([{ sum_tokens: '987654321' }]));
+
+      const result = await sumWorkflowTokensInWindow({ sinceMs: Date.now() - 1000 });
+
+      expect(result).toBe(987654321);
+    });
+
+    test('filters by codebaseId when provided', async () => {
+      mockQuery.mockResolvedValueOnce(createQueryResult([{ sum_tokens: 100 }]));
+
+      await sumWorkflowTokensInWindow({ sinceMs: Date.now() - 1000, codebaseId: 'cb-1' });
+
+      const [query, params] = mockQuery.mock.calls[0] as [string, unknown[]];
+      expect(query).toContain('codebase_id =');
+      expect(params).toContain('cb-1');
+    });
+
+    test('throws on database error', async () => {
+      mockQuery.mockRejectedValueOnce(new Error('Connection lost'));
+
+      await expect(sumWorkflowTokensInWindow({ sinceMs: Date.now() - 1000 })).rejects.toThrow(
+        'Failed to sum workflow tokens in window: Connection lost'
+      );
     });
   });
 

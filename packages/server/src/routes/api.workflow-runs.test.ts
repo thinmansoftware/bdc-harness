@@ -15,6 +15,9 @@ import {
 const mockGetWorkflowRun = mock(async (_id: string) => null as null | MockWorkflowRun);
 const mockCancelWorkflowRun = mock(async (_id: string) => {});
 const mockListWorkflowRuns = mock(async () => [] as MockWorkflowRun[]);
+const mockSumWorkflowTokensInWindow = mock(
+  async (_opts: { sinceMs: number; codebaseId?: string }) => 0
+);
 const mockListDashboardRuns = mock(async () => ({
   runs: [] as MockWorkflowRun[],
   total: 0,
@@ -196,6 +199,7 @@ mock.module('@archon/core/db/workflows', () => ({
   deleteWorkflowRun: mockDeleteWorkflowRun,
   updateWorkflowRun: mockUpdateWorkflowRun,
   getWorkflowRunByWorkerPlatformId: mockGetWorkflowRunByWorkerPlatformId,
+  sumWorkflowTokensInWindow: mockSumWorkflowTokensInWindow,
 }));
 
 const mockCreateWorkflowEvent = mock(async (_event: unknown) => {});
@@ -1022,8 +1026,9 @@ describe('GET /api/workflows/runs', () => {
   // computeQuotaWindow reads process.env at CALL time (not at module load),
   // so these tests set/unset MAX20X_WINDOW_TOKENS inline within each case and
   // rely on that design for the override to take effect without mock.module()
-  // or a separate process. Runs use a recent last_activity_at so they fall
-  // inside the window.
+  // or a separate process. windowTokens comes from a SEPARATE DB call
+  // (sumWorkflowTokensInWindow) — independent of the runs-page LIMIT — so
+  // these tests stub that mock rather than computing from the listed runs.
 
   test('Scenario 5A -- quotaWindow includes windowTokens + windowBudget when MAX20X_WINDOW_TOKENS configured', async () => {
     const recent = new Date().toISOString();
@@ -1042,6 +1047,9 @@ describe('GET /api/workflows/runs', () => {
       started_at: recent,
     };
     mockListWorkflowRuns.mockImplementationOnce(async () => [runWithTokens, runWithTokens2]);
+    // Authoritative quota sum comes from the DB aggregation — independent of
+    // the page-of-runs.
+    mockSumWorkflowTokensInWindow.mockImplementationOnce(async () => 2000);
 
     process.env['MAX20X_WINDOW_TOKENS'] = '40000';
     try {
@@ -1085,6 +1093,7 @@ describe('GET /api/workflows/runs', () => {
       started_at: recent,
     };
     mockListWorkflowRuns.mockImplementationOnce(async () => [runWithTokens, runWithTokens2]);
+    mockSumWorkflowTokensInWindow.mockImplementationOnce(async () => 2000);
 
     // Ensure unset for this case
     delete process.env['MAX20X_WINDOW_TOKENS'];
@@ -1103,6 +1112,75 @@ describe('GET /api/workflows/runs', () => {
     expect(body.quotaWindow.windowBudget).toBeNull();
     // Raw windowTokens still surfaced even without a budget.
     expect(body.quotaWindow.windowTokens).toBe(2000);
+  });
+
+  // Scenario 5C addresses the Codex-finding: windowTokens MUST aggregate the
+  // full window via the dedicated DB function, NOT just the listed page. The
+  // page returns 1 run worth 50 tokens; the DB aggregation correctly returns
+  // 5000 (covering 100 in-window runs that spill past the page LIMIT).
+  test('Scenario 5C -- quotaWindow.windowTokens is full-window DB aggregation, NOT just the page-of-runs', async () => {
+    const recent = new Date().toISOString();
+    const pageRun: MockWorkflowRun = {
+      ...MOCK_COMPLETED_RUN,
+      id: 'run-tok-c-page',
+      metadata: { total_tokens: 50 },
+      last_activity_at: recent,
+      started_at: recent,
+    };
+    mockListWorkflowRuns.mockImplementationOnce(async () => [pageRun]);
+    // The DB aggregation knows about runs outside the page — it returns the
+    // authoritative full-window total.
+    mockSumWorkflowTokensInWindow.mockImplementationOnce(async () => 5000);
+
+    const { app } = makeApp();
+    const response = await app.request('/api/workflows/runs');
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as {
+      runs: Array<{ id: string }>;
+      quotaWindow: { windowTokens: number };
+    };
+    expect(body.runs.length).toBe(1);
+    // CRITICAL: if windowTokens were summed from the page (50), this would
+    // fail. The fix routes through sumWorkflowTokensInWindow (5000).
+    expect(body.quotaWindow.windowTokens).toBe(5000);
+
+    // And confirm the DB function was called with a sinceMs cutoff that lies
+    // within the past 24h (sanity-check the window math without binding to a
+    // specific MAX20X_WINDOW_HOURS default).
+    const lastCall =
+      mockSumWorkflowTokensInWindow.mock.calls[mockSumWorkflowTokensInWindow.mock.calls.length - 1];
+    expect(lastCall).toBeDefined();
+    const sinceMs = lastCall?.[0]?.sinceMs;
+    expect(typeof sinceMs).toBe('number');
+    const now = Date.now();
+    expect(sinceMs).toBeLessThan(now);
+    expect(sinceMs).toBeGreaterThan(now - 24 * 60 * 60 * 1000);
+  });
+
+  test('Scenario 5D -- quotaWindow degrades to 0 windowTokens when DB aggregation throws (raw-first fallback)', async () => {
+    const recent = new Date().toISOString();
+    const pageRun: MockWorkflowRun = {
+      ...MOCK_COMPLETED_RUN,
+      id: 'run-tok-d-page',
+      metadata: { total_tokens: 99 },
+      last_activity_at: recent,
+      started_at: recent,
+    };
+    mockListWorkflowRuns.mockImplementationOnce(async () => [pageRun]);
+    mockSumWorkflowTokensInWindow.mockImplementationOnce(async () => {
+      throw new Error('boom');
+    });
+
+    const { app } = makeApp();
+    const response = await app.request('/api/workflows/runs');
+    // The runs list must still succeed — the quota line is auxiliary.
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as {
+      runs: Array<{ id: string }>;
+      quotaWindow: { windowTokens: number; windowBudget: number | null };
+    };
+    expect(body.runs.length).toBe(1);
+    expect(body.quotaWindow.windowTokens).toBe(0);
   });
 });
 

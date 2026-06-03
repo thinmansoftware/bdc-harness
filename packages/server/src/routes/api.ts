@@ -640,12 +640,15 @@ const listWorkflowRunsRoute = createRoute({
 });
 
 /**
- * Compute a derived Max-20x quota-window summary from the fetched runs.
+ * Compute the derived Max-20x quota-window summary returned alongside the
+ * paginated runs list.
  *
- * `windowTokens` is derived from the current page of runs ONLY (default 50, max
- * 200) — runs beyond the page are not counted. This is an intentional v1
- * simplification; a full-window DB aggregation would belong in @archon/core if
- * a future WO needs it. Any UI rendering MUST label this value as estimated.
+ * `windowTokens` is a FULL-WINDOW aggregation (NOT limited to the current
+ * page of runs). It is sourced from `workflowDb.sumWorkflowTokensInWindow`,
+ * which sums `metadata.total_tokens` across every non-archived run whose
+ * activity timestamp (`COALESCE(last_activity_at, started_at)`) falls inside
+ * the rolling window. This prevents under-reporting when in-window runs spill
+ * past the runs-list pagination LIMIT (default 50, max 200).
  *
  * `MAX20X_WINDOW_TOKENS` and `MAX20X_WINDOW_HOURS` are read from process.env at
  * call time (NOT at module load) so test overrides via
@@ -653,17 +656,12 @@ const listWorkflowRunsRoute = createRoute({
  * a module reload. Default window length: 5 hours (a rough proxy for the
  * Max-20x rolling rate-limit window, NOT a billed quota). `windowBudget` is
  * `null` when `MAX20X_WINDOW_TOKENS` is unset — the runs API still surfaces
- * `windowTokens` in that case (raw-first fallback).
+ * `windowTokens` in that case (raw-first fallback). Any UI rendering MUST
+ * label these values as estimated.
  */
-interface QuotaWindowRun {
-  metadata: Record<string, unknown>;
-  last_activity_at: Date | string | null;
-  started_at: Date | string;
-}
-
-function computeQuotaWindow(runs: QuotaWindowRun[]): {
-  windowTokens: number;
+function getQuotaWindowParams(): {
   windowBudget: number | null;
+  windowStartMs: number;
   windowResetAt: string;
 } {
   const rawBudget = process.env.MAX20X_WINDOW_TOKENS;
@@ -678,18 +676,34 @@ function computeQuotaWindow(runs: QuotaWindowRun[]): {
       : 5;
   const now = Date.now();
   const windowMs = windowHours * 60 * 60 * 1000;
-  const windowStart = now - windowMs;
   // Rolling window: the reset point is when content entering the window right
   // now would age out (now + windowHours). This is an estimate; the real
   // Max-20x boundary is not exposed to us.
-  const windowResetAt = new Date(now + windowMs).toISOString();
+  return {
+    windowBudget,
+    windowStartMs: now - windowMs,
+    windowResetAt: new Date(now + windowMs).toISOString(),
+  };
+}
+
+async function computeQuotaWindow(codebaseId?: string): Promise<{
+  windowTokens: number;
+  windowBudget: number | null;
+  windowResetAt: string;
+}> {
+  const { windowBudget, windowStartMs, windowResetAt } = getQuotaWindowParams();
   let windowTokens = 0;
-  for (const run of runs) {
-    const activityTs = run.last_activity_at ?? run.started_at;
-    if (activityTs && new Date(activityTs).getTime() >= windowStart) {
-      const t = run.metadata.total_tokens;
-      if (typeof t === 'number') windowTokens += t;
-    }
+  try {
+    windowTokens = await workflowDb.sumWorkflowTokensInWindow({
+      sinceMs: windowStartMs,
+      codebaseId,
+    });
+  } catch (err) {
+    // Raw-first fallback: a failure to aggregate must NOT take down the runs
+    // list (the quota summary is auxiliary). Surface 0 + log; the page-of-runs
+    // response itself is still useful without the quota line.
+    getLog().error({ err }, 'quota_window_sum_failed');
+    windowTokens = 0;
   }
   return { windowTokens, windowBudget, windowResetAt };
 }
@@ -2937,7 +2951,9 @@ export function registerApiRoutes(
         limit,
         codebaseId,
       });
-      const quotaWindow = computeQuotaWindow(runs);
+      // computeQuotaWindow queries the DB independently of the runs page so
+      // windowTokens reflects ALL in-window runs, not just this page.
+      const quotaWindow = await computeQuotaWindow(codebaseId);
       return c.json({ runs, quotaWindow });
     } catch (error) {
       getLog().error({ err: error }, 'list_workflow_runs_failed');

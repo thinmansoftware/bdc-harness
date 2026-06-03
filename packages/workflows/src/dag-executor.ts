@@ -1286,7 +1286,14 @@ async function executeNodeInternal(
         workflow_run_id: workflowRun.id,
         event_type: 'node_failed',
         step_name: node.id,
-        data: { error: err.message },
+        // If the SDK emitted a result (tokens) BEFORE throwing on msg.isError,
+        // persist that partial usage so per-node token attribution survives the
+        // failure path. Omit-when-absent (never 0, never {}) mirrors the
+        // node_completed contract.
+        data: {
+          error: err.message,
+          ...(nodeTokens ? { tokens: nodeTokens } : {}),
+        },
       })
       .catch((err: Error) => {
         getLog().error(
@@ -2268,7 +2275,16 @@ async function executeLoopNode(
           workflow_run_id: workflowRun.id,
           event_type: 'loop_iteration_failed',
           step_name: node.id,
-          data: { iteration: i, error: err.message, duration, nodeId: node.id },
+          // Persist aggregate tokens accumulated across iterations BEFORE the
+          // failure so per-node token attribution survives loop SDK errors.
+          // Mirrors the omit-when-absent contract used on loop completion.
+          data: {
+            iteration: i,
+            error: err.message,
+            duration,
+            nodeId: node.id,
+            ...(loopTotalTokens ? { tokens: loopTotalTokens } : {}),
+          },
         })
         .catch((evtErr: Error) => {
           logEventStoreError(evtErr, i);
@@ -2320,11 +2336,14 @@ async function executeLoopNode(
           workflow_run_id: workflowRun.id,
           event_type: 'loop_iteration_failed',
           step_name: node.id,
+          // Same token-persistence rationale as the SDK-error branch above:
+          // empty-output failures still carry accumulated loopTotalTokens.
           data: {
             iteration: i,
             error: emptyError,
             duration: iterationDuration,
             nodeId: node.id,
+            ...(loopTotalTokens ? { tokens: loopTotalTokens } : {}),
           },
         })
         .catch((evtErr: Error) => {
