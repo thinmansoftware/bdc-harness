@@ -22,6 +22,29 @@ export interface ExecutionNodeData extends DagNodeData {
   warningPatterns?: string[];
   /** WO-170: true if triggered by load_bearing opt-in, false if always-dangerous pattern. */
   warningLoadBearing?: boolean;
+  /**
+   * WO-MC-NEGAN-DIAGNOSTIC-GRAPH-01 — FailureReason: short class label
+   * ("codex 400: model not supported"). Rendered on the node face when
+   * status === 'failed'; replaces the raw error.slice(0,60) line.
+   */
+  failureClass?: string;
+  /** WO-MC-NEGAN-DIAGNOSTIC-GRAPH-01 — full original error string for hover. */
+  failureDetail?: string;
+  /**
+   * WO-MC-NEGAN-DIAGNOSTIC-GRAPH-01 — HealthTell: this node is part of the
+   * self-repair ladder (opus-repair / pause-gate / ...). When `selfRepairEngaged`
+   * is false, greyed-out is the "brain intact" signal; when true, a small
+   * "self-repair engaged" badge lights up.
+   */
+  isRepairNode?: boolean;
+  /** WO-MC-NEGAN-DIAGNOSTIC-GRAPH-01 — self-repair lane has activated. */
+  selfRepairEngaged?: boolean;
+  /**
+   * WO-MC-NEGAN-DIAGNOSTIC-GRAPH-01 — LaneSourceBadge: workflow + codebase
+   * (+ optional short commit) text for the run header. Empty for regular
+   * nodes; set only on a synthetic header node by the parent component.
+   */
+  laneSource?: string;
 }
 
 export type ExecutionFlowNode = Node<ExecutionNodeData>;
@@ -118,8 +141,41 @@ function ExecutionDagNodeRender({ data }: NodeProps<ExecutionFlowNode>): React.R
           ?
         </span>
       </div>
-      {data.error && (
+      {/* WO-MC-NEGAN-DIAGNOSTIC-GRAPH-01 — FailureReason: prefer the
+          classified label on the node face when available, fall back to
+          the raw error.slice(0,60). Full original is in the tooltip. */}
+      {data.status === 'failed' && data.failureClass && (
+        <div className="text-[10px] text-error mt-1 truncate font-mono" data-testid="failure-class">
+          {data.failureClass}
+        </div>
+      )}
+      {data.status !== 'failed' && data.error && (
         <div className="text-[10px] text-error mt-1 truncate">{data.error.slice(0, 60)}</div>
+      )}
+      {data.status === 'failed' && !data.failureClass && data.error && (
+        <div className="text-[10px] text-error mt-1 truncate">{data.error.slice(0, 60)}</div>
+      )}
+      {/* WO-MC-NEGAN-DIAGNOSTIC-GRAPH-01 — HealthTell: light a small badge
+          on a repair-ladder node when self-repair has engaged. Greyed-out
+          (no badge) is the inverse signal: "brain intact". */}
+      {data.isRepairNode && data.selfRepairEngaged && (
+        <div
+          className="text-[10px] text-warning mt-1 truncate font-mono"
+          data-testid="self-repair-engaged"
+          title="Self-repair lane engaged — review or approval gate has fired"
+        >
+          self-repair engaged
+        </div>
+      )}
+      {/* WO-MC-NEGAN-DIAGNOSTIC-GRAPH-01 — LaneSourceBadge: workflow + codebase
+          (+ optional commit) on a header / source node. */}
+      {data.laneSource && (
+        <div
+          className="text-[10px] text-text-tertiary mt-1 truncate font-mono"
+          data-testid="lane-source"
+        >
+          {data.laneSource}
+        </div>
       )}
       {isWarning && data.warningPatterns && data.warningPatterns.length > 0 && (
         <div className="text-[10px] text-warning mt-1 truncate">
@@ -142,6 +198,15 @@ function ExecutionDagNodeRender({ data }: NodeProps<ExecutionFlowNode>): React.R
         {isWarning && data.warningStatusLine && (
           <p className="mt-2 border-t border-border pt-2 text-[10px] leading-4 text-warning">
             Silent failure detected: {data.warningStatusLine}
+          </p>
+        )}
+        {/* WO-MC-NEGAN-DIAGNOSTIC-GRAPH-01 — full failure detail in tooltip. */}
+        {data.status === 'failed' && (data.failureDetail || data.error) && (
+          <p
+            className="mt-2 border-t border-border pt-2 text-[10px] leading-4 text-error whitespace-pre-wrap break-words"
+            data-testid="failure-detail"
+          >
+            {data.failureDetail || data.error}
           </p>
         )}
       </div>

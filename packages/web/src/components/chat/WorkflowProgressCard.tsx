@@ -7,18 +7,26 @@ import { approveWorkflowRun, getWorkflowRunByWorker, rejectWorkflowRun } from '@
 import { useWorkflowStore } from '@/stores/workflow-store';
 import { ConfirmRunActionDialog } from '@/components/dashboard/ConfirmRunActionDialog';
 import { StatusIcon } from '@/components/workflows/StatusIcon';
+import { LucilleHint } from '@/components/workflows/LucilleHint';
+import { KillButton } from '@/components/workflows/KillButton';
 import { formatDurationMs } from '@/lib/format';
 import { isTerminalStatus } from '@/lib/workflow-utils';
+import type { DagNode } from '@/lib/api';
 import type { DagNodeState } from '@/lib/types';
 
 interface WorkflowProgressCardProps {
   workflowName: string;
   workerConversationId: string;
+  /** WO-MC-NEGAN-DIAGNOSTIC-GRAPH-01 — resolved approval config for the
+   *  currently-paused gate, used by LucilleHint to show on_reject
+   *  consequences. Optional; non-updated callers still work. */
+  approvalNodeDef?: { approval?: DagNode['approval'] };
 }
 
 export function WorkflowProgressCard({
   workflowName,
   workerConversationId,
+  approvalNodeDef,
 }: WorkflowProgressCardProps): React.ReactElement {
   const navigate = useNavigate();
 
@@ -210,7 +218,11 @@ export function WorkflowProgressCard({
                   {approval?.message ?? 'Waiting for approval'}
                 </p>
               </div>
-              <div className="flex items-center gap-2">
+              {/* WO-MC-NEGAN-DIAGNOSTIC-GRAPH-01 — LucilleHint: consequence
+                  text from on_reject.max_attempts. Helps the operator see
+                  whether reject will loop or halt before they click. */}
+              <LucilleHint approval={approvalNodeDef?.approval ?? null} />
+              <div className="flex items-center gap-2 flex-wrap">
                 <button
                   onClick={() => {
                     approveMutation.mutate();
@@ -248,6 +260,9 @@ export function WorkflowProgressCard({
                     rejectMutation.mutate(reason);
                   }}
                 />
+                {/* WO-MC-NEGAN-DIAGNOSTIC-GRAPH-01 — KillButton: the
+                    headshot, distinct from the reject-loop path. */}
+                {runId && <KillButton runId={runId} />}
               </div>
               {(approveMutation.isError || rejectMutation.isError) && (
                 <p className="text-xs text-error">

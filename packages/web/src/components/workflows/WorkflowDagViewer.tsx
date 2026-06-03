@@ -10,8 +10,9 @@ import {
 import type { Edge, NodeTypes } from '@xyflow/react';
 import type { DagNodeState, WorkflowRunStatus, WorkflowStepStatus } from '@/lib/types';
 import type { DagNode } from '@/lib/api';
-import { dagNodesToReactFlow, mergeLoopArcsIntoEdges, resolveNodeDisplay } from '@/lib/dag-layout';
-import type { CycleState, LoopArc } from '@/lib/dag-self-repair-loop';
+import { dagNodesToReactFlow, resolveNodeDisplay, routeLoopArcsAsSideRail } from '@/lib/dag-layout';
+import { isRepairNodeId, type CycleState, type LoopArc } from '@/lib/dag-self-repair-loop';
+import { classifyFailure } from '@/lib/failure-reason';
 import { formatDurationMs } from '@/lib/format';
 import {
   executionDagNode,
@@ -19,6 +20,7 @@ import {
   type ExecutionNodeData,
 } from './ExecutionDagNode';
 import { CycleBanner } from './CycleBanner';
+import { FleetStrip } from './FleetStrip';
 
 import '@xyflow/react/dist/style.css';
 
@@ -60,6 +62,9 @@ interface WorkflowDagViewerProps {
   /** Run-level status; used by the banner to choose tone (paused vs running
    *  vs resolved). */
   runStatus?: WorkflowRunStatus;
+  /** WO-MC-NEGAN-DIAGNOSTIC-GRAPH-01 — codebase name for LaneSourceBadge on
+   *  the source node. Optional; omitted means no LaneSourceBadge text. */
+  codebaseName?: string | null;
 }
 
 export function WorkflowDagViewer({
@@ -71,6 +76,7 @@ export function WorkflowDagViewer({
   onNodeClick,
   loopArcs,
   cycleState,
+  codebaseName,
 }: WorkflowDagViewerProps): React.ReactElement {
   // Compute topology layout ONCE from the workflow definition.
   // Only re-layout when the definition changes (node/edge count), not on status updates.
@@ -79,11 +85,12 @@ export function WorkflowDagViewer({
     return { baseNodes: nodes, edges };
   }, [dagNodes]);
 
-  // WO-MC-SELF-REPAIR-LOOP-VIZ-01 (Gap A): merge dashed loop-back arcs into
-  // the depends_on edge set. Dagre is NOT re-run on the merged set — back
-  // edges would either crash or move nodes. Arcs are visual overlays only.
+  // WO-MC-NEGAN-DIAGNOSTIC-GRAPH-01 — route loop-back arcs as a clean
+  // right-gutter side-rail (vs the older overlay path) so they never
+  // cross the forward spine. dagre is already done; this only appends
+  // back-edges with sideRail metadata.
   const edgesWithLoopArcs = useMemo(
-    () => mergeLoopArcsIntoEdges(baseNodes, layoutedEdges, loopArcs ?? []),
+    () => routeLoopArcsAsSideRail(baseNodes, layoutedEdges, loopArcs ?? []),
     [baseNodes, layoutedEdges, loopArcs]
   );
 
@@ -96,6 +103,21 @@ export function WorkflowDagViewer({
     return map;
   }, [liveStatus]);
 
+  // WO-MC-NEGAN-DIAGNOSTIC-GRAPH-01 — identify the source / entry node so
+  // LaneSourceBadge renders only there (not on every node).
+  const sourceNodeId = useMemo<string | null>(() => {
+    // The first dagNode with no depends_on is the entry. Multiple entries
+    // are possible (parallel branches); we pick the first deterministically.
+    for (const dn of dagNodes) {
+      if (!dn.depends_on || dn.depends_on.length === 0) return dn.id;
+    }
+    return null;
+  }, [dagNodes]);
+
+  // WO-MC-NEGAN-DIAGNOSTIC-GRAPH-01 — self-repair tell: light HealthTell
+  // on repair nodes when the cycle is engaged.
+  const selfRepairEngaged = cycleState?.hasLoopActivity ?? false;
+
   // Overlay live status onto the topology nodes.
   // Creates new node objects only for nodes whose status changed (React.memo handles the rest).
   const nodes: ExecutionFlowNode[] = useMemo(() => {
@@ -104,6 +126,12 @@ export function WorkflowDagViewer({
       // baseNodes is derived from dagNodes, so this find should always succeed
       const dagNode = dagNodes.find(dn => dn.id === node.id);
       const display = dagNode ? resolveNodeDisplay(dagNode) : node.data;
+      const isRepair = isRepairNodeId(node.id);
+      const failure = live?.status === 'failed' && live?.error ? classifyFailure(live.error) : null;
+      const laneSource =
+        node.id === sourceNodeId && codebaseName
+          ? `${dagNode?.id ?? node.id} @ ${codebaseName}`
+          : undefined;
       return {
         ...node,
         type: 'executionNode',
@@ -122,10 +150,24 @@ export function WorkflowDagViewer({
           warningStatusLine: live?.warningStatusLine,
           warningPatterns: live?.warningPatterns,
           warningLoadBearing: live?.warningLoadBearing,
+          // WO-MC-NEGAN-DIAGNOSTIC-GRAPH-01 — diagnostic surface fields.
+          failureClass: failure?.label,
+          failureDetail: failure?.detail,
+          isRepairNode: isRepair,
+          selfRepairEngaged: isRepair && selfRepairEngaged,
+          laneSource,
         },
       } as ExecutionFlowNode;
     });
-  }, [baseNodes, statusMap, dagNodes, selectedNodeId]);
+  }, [
+    baseNodes,
+    statusMap,
+    dagNodes,
+    selectedNodeId,
+    sourceNodeId,
+    codebaseName,
+    selfRepairEngaged,
+  ]);
 
   // Color edges based on target node status.
   // Loop-arc overlays carry their own dashed style + warning color; do not
@@ -147,51 +189,57 @@ export function WorkflowDagViewer({
   }, [edgesWithLoopArcs, statusMap]);
 
   return (
-    <div className="h-full w-full relative">
-      {cycleState && <CycleBanner cycleState={cycleState} />}
-      {isRunning && currentlyExecuting && (
-        <div className="absolute top-3 right-3 z-10 flex items-center gap-2 rounded-md bg-surface/90 backdrop-blur-sm border border-border px-3 py-1.5 text-xs">
-          <span className="inline-block w-2 h-2 rounded-full bg-accent-bright animate-pulse" />
-          <span className="text-text-secondary">Executing:</span>
-          <span className="font-medium text-text-primary">{currentlyExecuting.nodeName}</span>
-          <span className="text-text-tertiary">
-            {formatDurationMs(Date.now() - currentlyExecuting.startedAt)}
-          </span>
-        </div>
-      )}
-      <ReactFlowProvider>
-        <ReactFlow
-          nodes={nodes}
-          edges={edges}
-          nodeTypes={nodeTypes}
-          nodesDraggable={false}
-          nodesConnectable={false}
-          elementsSelectable={true}
-          onNodeClick={
-            onNodeClick
-              ? (_event, node): void => {
-                  onNodeClick(node.id);
-                }
-              : undefined
-          }
-          fitView
-          fitViewOptions={{ padding: 0.15 }}
-          panOnDrag
-          zoomOnScroll
-          className="bg-background"
-        >
-          <Background variant={BackgroundVariant.Dots} gap={16} size={1} color="var(--border)" />
-          <Controls showInteractive={false} className="!bg-surface !border-border" />
-          <MiniMap
-            nodeColor={(node): string => {
-              const data = node.data as ExecutionNodeData;
-              return (data.status && STATUS_MINIMAP_COLORS[data.status]) ?? DEFAULT_MINIMAP_COLOR;
-            }}
-            className="!bg-surface !border-border"
-            maskColor="rgba(0, 0, 0, 0.6)"
-          />
-        </ReactFlow>
-      </ReactFlowProvider>
+    <div className="h-full w-full relative flex flex-col">
+      {/* WO-MC-NEGAN-DIAGNOSTIC-GRAPH-01 — FleetStrip: live runs + co-fire
+          alarm + cost meter, mounted above the canvas. Auto-hides when no
+          live runs exist. */}
+      <FleetStrip />
+      <div className="flex-1 relative">
+        {cycleState && <CycleBanner cycleState={cycleState} />}
+        {isRunning && currentlyExecuting && (
+          <div className="absolute top-3 right-3 z-10 flex items-center gap-2 rounded-md bg-surface/90 backdrop-blur-sm border border-border px-3 py-1.5 text-xs">
+            <span className="inline-block w-2 h-2 rounded-full bg-accent-bright animate-pulse" />
+            <span className="text-text-secondary">Executing:</span>
+            <span className="font-medium text-text-primary">{currentlyExecuting.nodeName}</span>
+            <span className="text-text-tertiary">
+              {formatDurationMs(Date.now() - currentlyExecuting.startedAt)}
+            </span>
+          </div>
+        )}
+        <ReactFlowProvider>
+          <ReactFlow
+            nodes={nodes}
+            edges={edges}
+            nodeTypes={nodeTypes}
+            nodesDraggable={false}
+            nodesConnectable={false}
+            elementsSelectable={true}
+            onNodeClick={
+              onNodeClick
+                ? (_event, node): void => {
+                    onNodeClick(node.id);
+                  }
+                : undefined
+            }
+            fitView
+            fitViewOptions={{ padding: 0.15 }}
+            panOnDrag
+            zoomOnScroll
+            className="bg-background"
+          >
+            <Background variant={BackgroundVariant.Dots} gap={16} size={1} color="var(--border)" />
+            <Controls showInteractive={false} className="!bg-surface !border-border" />
+            <MiniMap
+              nodeColor={(node): string => {
+                const data = node.data as ExecutionNodeData;
+                return (data.status && STATUS_MINIMAP_COLORS[data.status]) ?? DEFAULT_MINIMAP_COLOR;
+              }}
+              className="!bg-surface !border-border"
+              maskColor="rgba(0, 0, 0, 0.6)"
+            />
+          </ReactFlow>
+        </ReactFlowProvider>
+      </div>
     </div>
   );
 }

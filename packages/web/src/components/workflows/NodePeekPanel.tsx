@@ -18,9 +18,14 @@ import { X, CheckCircle, XCircle, Pause } from 'lucide-react';
 import type { DagNode, WorkflowEventResponse } from '@/lib/api';
 import { approveWorkflowRun, getNodeEvents, rejectWorkflowRun } from '@/lib/api';
 import { resolveNodeDisplay } from '@/lib/dag-layout';
+import { classifyFailure } from '@/lib/failure-reason';
+import { selectPeekData } from '@/lib/node-peek-data';
 import { ensureUtc } from '@/lib/format';
 import type { WorkflowRunStatus, WorkflowStepStatus } from '@/lib/types';
 import { useClickOutside } from '@/hooks/useClickOutside';
+import { LucilleHint } from './LucilleHint';
+import { KillButton } from './KillButton';
+import { ReplayNode } from './ReplayNode';
 
 const MAX_BODY_CHARS = 2000;
 const EVENT_POLL_MS = 5000;
@@ -40,6 +45,10 @@ interface NodePeekPanelProps {
    *  by extractApprovalContext, or set by SSE. The buttons render only when
    *  approval.nodeId === this panel's nodeId AND runStatus === 'paused'. */
   approval?: { nodeId: string; message: string };
+  /** WO-MC-NEGAN-DIAGNOSTIC-GRAPH-01 — for ReplayNode dispatch. */
+  workflowName?: string;
+  parentConversationId?: string | null;
+  originalMessage?: string;
 }
 
 /** Truncate a string to MAX_BODY_CHARS with a "show more" affordance. */
@@ -85,6 +94,9 @@ export function NodePeekPanel({
   onClose,
   runStatus,
   approval,
+  workflowName,
+  parentConversationId,
+  originalMessage,
 }: NodePeekPanelProps): React.ReactElement {
   const panelRef = useRef<HTMLDivElement>(null);
   useClickOutside(panelRef, onClose);
@@ -147,7 +159,12 @@ export function NodePeekPanel({
   const nodeType = display?.nodeType ?? null;
 
   const eventList = events ?? [];
-  const latestOutput = extractLatestOutput(eventList);
+  // WO-MC-NEGAN-DIAGNOSTIC-GRAPH-01 — pull the four diagnostic fields from
+  // a single pass over events; the old extractLatestOutput is preserved as
+  // a fallback in case the new fields aren't yet emitted on a run.
+  const peekData = useMemo(() => selectPeekData(eventList), [eventList]);
+  const latestOutput = peekData.output ?? extractLatestOutput(eventList);
+  const failure = nodeStatus === 'failed' ? classifyFailure(peekData.error) : null;
   const hasNotStarted = nodeStatus === undefined || nodeStatus === 'pending';
 
   // Section ordering (top to bottom): header, prompt/command, output/response, events list.
@@ -198,7 +215,13 @@ export function NodePeekPanel({
                 {approval.message}
               </p>
             )}
-            <div className="flex items-center gap-2">
+            {/* WO-MC-NEGAN-DIAGNOSTIC-GRAPH-01 — LucilleHint: state the
+                consequences of each choice so the operator never has to
+                guess whether reject loops or halts. */}
+            <div className="mb-2">
+              <LucilleHint approval={nodeDef?.approval ?? null} />
+            </div>
+            <div className="flex items-center gap-2 flex-wrap">
               <button
                 type="button"
                 onClick={(): void => {
@@ -223,6 +246,14 @@ export function NodePeekPanel({
                 <XCircle className="h-3.5 w-3.5" />
                 {gateBusy === 'rejecting' ? 'Rejecting...' : 'Reject'}
               </button>
+              {/* WO-MC-NEGAN-DIAGNOSTIC-GRAPH-01 — KillButton: the headshot,
+                  distinct from reject's loop. */}
+              <KillButton
+                runId={runId}
+                onKilled={(): void => {
+                  void queryClient.invalidateQueries({ queryKey: ['workflowRun', runId] });
+                }}
+              />
             </div>
             {gateError !== null && <p className="mt-1 text-[10px] text-error">{gateError}</p>}
           </section>
@@ -264,6 +295,34 @@ export function NodePeekPanel({
             <p className="text-xs text-text-tertiary italic">No output recorded.</p>
           )}
         </section>
+
+        {/* WO-MC-NEGAN-DIAGNOSTIC-GRAPH-01 — Failure section: classified error
+            + ReplayNode (re-fire WO, plus optional alt-model). Shown only on
+            a failed node. */}
+        {nodeStatus === 'failed' && (
+          <section
+            className="px-3 py-2 border-b border-border bg-error/5"
+            data-testid="node-peek-failure"
+          >
+            <h3 className="text-[10px] uppercase tracking-wide text-error mb-1">Failure</h3>
+            {failure && failure.label !== 'unknown' && (
+              <p className="text-xs text-error font-mono mb-1" data-testid="failure-class-peek">
+                {failure.label}
+              </p>
+            )}
+            {peekData.error && <ExpandableBlock text={peekData.error} />}
+            {!peekData.error && (
+              <p className="text-xs text-text-tertiary italic mb-1">No error message recorded.</p>
+            )}
+            <div className="mt-2">
+              <ReplayNode
+                workflowName={workflowName ?? ''}
+                parentConversationId={parentConversationId ?? null}
+                originalMessage={originalMessage ?? ''}
+              />
+            </div>
+          </section>
+        )}
 
         {/* Last events */}
         <section className="px-3 py-2">

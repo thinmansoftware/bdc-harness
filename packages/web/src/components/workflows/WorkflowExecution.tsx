@@ -57,6 +57,8 @@ interface WorkflowRunQueryData {
   conversationPlatformId: string | null;
   codebaseId: string | null;
   events: WorkflowEventResponse[];
+  /** WO-MC-NEGAN-DIAGNOSTIC-GRAPH-01 — original user message for ReplayNode. */
+  userMessage: string;
 }
 
 interface WorkflowExecutionProps {
@@ -309,6 +311,7 @@ export function WorkflowExecution({ runId }: WorkflowExecutionProps): React.Reac
         conversationPlatformId: data.run.conversation_platform_id ?? null,
         codebaseId: data.run.codebase_id ?? null,
         events: data.events,
+        userMessage: data.run.user_message ?? '',
       };
     },
     refetchInterval: (query): number | false => {
@@ -756,6 +759,7 @@ export function WorkflowExecution({ runId }: WorkflowExecutionProps): React.Reac
                   loopArcs={loopArcs}
                   cycleState={cycleState}
                   runStatus={workflow.status}
+                  codebaseName={codebaseName}
                 />
               ) : (
                 <div className="flex items-center justify-center h-full text-text-secondary">
@@ -772,6 +776,9 @@ export function WorkflowExecution({ runId }: WorkflowExecutionProps): React.Reac
                   isRunning={isRunning}
                   runStatus={workflow.status}
                   approval={workflow.approval}
+                  workflowName={workflow.workflowName}
+                  parentConversationId={parentPlatformId}
+                  originalMessage={queryData?.userMessage ?? ''}
                   onClose={(): void => {
                     setPeekOpen(false);
                   }}

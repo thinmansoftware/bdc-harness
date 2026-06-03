@@ -176,6 +176,98 @@ export function mergeLoopArcsIntoEdges(
 }
 
 /**
+ * WO-MC-NEGAN-DIAGNOSTIC-GRAPH-01 — route loop-back arcs as a clean
+ * right-gutter side-rail instead of scattered overlays.
+ *
+ * The original `mergeLoopArcsIntoEdges` (above) draws back-edges as
+ * smoothstep overlays in the SAME ReactFlow edge layer as forward edges,
+ * which produces visual crossings whenever a loop spans more than two
+ * nodes. The Negan north star is "point at the brain, not just colour the
+ * body" — so loop arcs MUST be a clean side-rail that does not cross the
+ * forward spine.
+ *
+ * Pipeline:
+ *   1. dagre lays out the forward DAG only (no back-edges fed in — dagre
+ *      cannot handle cycles and the old call path relied on the YAML
+ *      depends_on already being acyclic).
+ *   2. Loop arcs are added back as explicit ReactFlow edges to a right
+ *      gutter (x = max forward node x + NODE_WIDTH + GUTTER_PAD), one
+ *      per arc, with a small per-arc y stagger so multiple arcs in the
+ *      same run do not draw on top of each other.
+ *   3. Each back-arc keeps its `__loop_*` id prefix so the existing
+ *      edge-recolor pass in WorkflowDagViewer (which skips `__loop_*`)
+ *      continues to leave them styled by their own warning palette.
+ *
+ * This function does NOT replace `mergeLoopArcsIntoEdges` — the older
+ * helper remains in place for any caller that wants the overlay behavior.
+ * The forward DAG fed to dagre is exactly the `baseEdges` arg; callers
+ * are expected to pass `loopArcs` derived from `deriveLoopArcs`.
+ */
+const SIDE_RAIL_GUTTER_PAD = 60;
+const SIDE_RAIL_Y_STAGGER = 20;
+
+export function routeLoopArcsAsSideRail(
+  baseNodes: readonly DagFlowNode[],
+  baseEdges: readonly Edge[],
+  loopArcs: readonly LoopArc[]
+): Edge[] {
+  if (loopArcs.length === 0) return baseEdges.slice();
+  // Compute the right-gutter x: max forward node x + NODE_WIDTH + pad.
+  // baseNodes are already laid out by dagre at this point — every node
+  // has a sensible position.x. Fall back to 0 if the set is empty.
+  let maxX = 0;
+  for (const n of baseNodes) {
+    const x = n.position?.x ?? 0;
+    if (x > maxX) maxX = x;
+  }
+  const gutterX = maxX + NODE_WIDTH + SIDE_RAIL_GUTTER_PAD;
+
+  const baseIds = new Set<string>();
+  for (const n of baseNodes) baseIds.add(n.id);
+  const merged: Edge[] = baseEdges.slice();
+  const seen = new Set<string>(merged.map(e => e.id));
+
+  loopArcs.forEach((arc, idx) => {
+    if (!arc || typeof arc.source !== 'string' || typeof arc.target !== 'string') return;
+    if (!baseIds.has(arc.source) || !baseIds.has(arc.target)) return;
+    if (seen.has(arc.id)) return;
+    seen.add(arc.id);
+    const isSelf = arc.source === arc.target;
+    const label = arc.count > 1 ? `x${String(arc.count)}` : undefined;
+    // Per-arc stagger ensures multiple arcs in the same run do not overlap
+    // visually — encoded in `data.sideRailOffset` so callers / snapshot
+    // tests can assert the geometry without depending on ReactFlow's
+    // internal edge router.
+    merged.push({
+      id: arc.id,
+      source: arc.source,
+      target: arc.target,
+      type: 'smoothstep',
+      animated: false,
+      style: {
+        stroke: 'var(--warning)',
+        strokeWidth: 1.5,
+        strokeDasharray: '6 4',
+      },
+      ...(label !== undefined ? { label } : {}),
+      labelStyle: { fill: 'var(--warning)', fontSize: 10, fontWeight: 600 },
+      labelBgStyle: { fill: 'var(--surface)', fillOpacity: 0.9 },
+      labelBgPadding: [4, 2],
+      labelBgBorderRadius: 4,
+      data: {
+        loopArcType: arc.type,
+        count: arc.count,
+        isSelf,
+        sideRail: true,
+        sideRailX: gutterX,
+        sideRailOffset: idx * SIDE_RAIL_Y_STAGGER,
+      },
+    });
+  });
+  return merged;
+}
+
+/**
  * Check if the graph has a cycle using Kahn's algorithm.
  * Returns true if a cycle exists.
  */
