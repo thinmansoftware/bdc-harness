@@ -230,7 +230,8 @@ describe('resolveBoundCodebase', () => {
   const lspro = makeCodebase('bluedevilcollectibles/lspro-react', 'lspro-id');
   const storefront = makeCodebase('bluedevilcollectibles/shopops-storefront', 'storefront-id');
   const bdcXo = makeCodebase('bluedevilcollectibles/bdc-xo', 'bdc-xo-id');
-  const codebases = [bdcHarness, shopops, lspro, storefront, bdcXo];
+  const thinman = makeCodebase('bluedevilcollectibles/thinman-freight', 'thinman-id');
+  const codebases = [bdcHarness, shopops, lspro, storefront, bdcXo, thinman];
 
   beforeEach(() => {
     mockLogger.warn.mockClear();
@@ -304,6 +305,65 @@ describe('resolveBoundCodebase', () => {
         projectName: 'missing-project',
       }),
       'workflow_codebase_project_not_found'
+    );
+  });
+
+  // target_repo authoritative over name-prefix (anchor: 2026-06-02 deploy-factory
+  // double-cancel — bdc-storefront-* name-prefix bound shopops-storefront while the
+  // YAML declared target_repo: thinman-freight, so the Rule 28 guard killed the run).
+  test('binds target_repo over a colliding name-prefix', () => {
+    const result = resolveBoundCodebase({
+      workflowName: 'bdc-storefront-deploy-factory-plan-only',
+      userMessage: 'execute',
+      codebases,
+      targetRepo: 'bluedevilcollectibles/thinman-freight',
+    });
+
+    expect(result.codebase.id).toBe(thinman.id);
+    expect(result.source).toBe('target_repo');
+  });
+
+  test('binds target_repo when no name-prefix matches', () => {
+    const result = resolveBoundCodebase({
+      workflowName: 'bdc-thinman-deploy-factory-poc',
+      userMessage: 'execute',
+      codebases,
+      targetRepo: 'bluedevilcollectibles/thinman-freight',
+    });
+
+    expect(result.codebase.id).toBe(thinman.id);
+    expect(result.source).toBe('target_repo');
+  });
+
+  test('explicit --project flag still wins over target_repo', () => {
+    const result = resolveBoundCodebase({
+      workflowName: 'bdc-storefront-deploy-factory-plan-only',
+      userMessage: 'execute --project shopops-storefront',
+      codebases,
+      targetRepo: 'bluedevilcollectibles/thinman-freight',
+    });
+
+    expect(result.codebase.id).toBe(storefront.id);
+    expect(result.source).toBe('flag');
+    expect(result.userMessage).toBe('execute');
+  });
+
+  test('unregistered target_repo falls through to name-prefix and warns', () => {
+    const result = resolveBoundCodebase({
+      workflowName: 'bdc-storefront-deploy-factory-plan-only',
+      userMessage: 'execute',
+      codebases,
+      targetRepo: 'bluedevilcollectibles/not-registered',
+    });
+
+    expect(result.codebase.id).toBe(storefront.id);
+    expect(result.source).toBe('prefix');
+    expect(mockLogger.warn).toHaveBeenCalledWith(
+      expect.objectContaining({
+        workflowName: 'bdc-storefront-deploy-factory-plan-only',
+        targetRepo: 'bluedevilcollectibles/not-registered',
+      }),
+      'workflow_target_repo_not_registered'
     );
   });
 });
