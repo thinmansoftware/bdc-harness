@@ -22,6 +22,16 @@ export interface ExecutionNodeData extends DagNodeData {
   warningPatterns?: string[];
   /** WO-170: true if triggered by load_bearing opt-in, false if always-dangerous pattern. */
   warningLoadBearing?: boolean;
+  /** WO-MC-NEGAN-DIAGNOSTIC-GRAPH-01: classified error class for the node face
+   *  (e.g. "codex 400: model not supported"). Computed by WorkflowDagViewer
+   *  via classifyNodeError(data.error); rendered on the face when status is
+   *  'failed'. The full raw error stays in the existing tooltip. */
+  failureClass?: string;
+  /** WO-MC-NEGAN-DIAGNOSTIC-GRAPH-01: true when this node is a self-repair
+   *  ladder rung or approval gate (isLadderNodeId match). Drives the
+   *  HealthTell affordance: greyed/skipped = "brain intact"; running / failed
+   *  / awaiting_approval = "self-repair engaged". */
+  isRepairOrGate?: boolean;
 }
 
 export type ExecutionFlowNode = Node<ExecutionNodeData>;
@@ -68,6 +78,13 @@ function ExecutionDagNodeRender({ data }: NodeProps<ExecutionFlowNode>): React.R
   // title attribute is sufficient for v1 — keeps the change minimal and
   // accessible to keyboard / screen-reader users.
   const isWarning = data.status === 'completed_with_warning';
+  // WO-MC-NEGAN-DIAGNOSTIC-GRAPH-01: HealthTell — the greyed pause-gate / repair
+  // node on a healthy run is itself the "brain intact" signal; when it lights
+  // (running, failed, or awaiting_approval), the self-repair lane is engaged.
+  const healthTellEngaged =
+    data.isRepairOrGate === true &&
+    (data.status === 'running' || data.status === 'failed' || data.status === 'awaiting_approval');
+  const healthTellIntact = data.isRepairOrGate === true && data.status === 'skipped';
   return (
     <div
       className={`group relative rounded-lg border border-border px-3 py-2 min-w-[140px] transition-all duration-300 ${style}${data.selected ? ' ring-2 ring-accent-bright' : ''}`}
@@ -118,8 +135,32 @@ function ExecutionDagNodeRender({ data }: NodeProps<ExecutionFlowNode>): React.R
           ?
         </span>
       </div>
+      {/* WO-MC-NEGAN-DIAGNOSTIC-GRAPH-01: FailureReason — classified error CLASS
+          shown on the face when a node failed. Not a bare red box: the operator
+          and the agent can scan the failure mode at a glance. Full raw error
+          remains in the hover tooltip and in NodePeekPanel. */}
+      {data.status === 'failed' && data.failureClass !== undefined && (
+        <div
+          className="text-[10px] text-error mt-1 truncate font-medium"
+          data-testid="failure-reason-class"
+        >
+          {data.failureClass}
+        </div>
+      )}
       {data.error && (
         <div className="text-[10px] text-error mt-1 truncate">{data.error.slice(0, 60)}</div>
+      )}
+      {/* WO-MC-NEGAN-DIAGNOSTIC-GRAPH-01: HealthTell engaged — small amber dot
+          when a self-repair rung or pause-gate has lit up. The "brain intact"
+          tell is the absence of this dot (greyed/skipped repair nodes); we
+          render the engaged signal explicitly so it is hard to miss. */}
+      {healthTellEngaged && (
+        <div
+          className="absolute right-1 top-1 h-1.5 w-1.5 rounded-full bg-warning shadow-[0_0_4px_var(--warning)]"
+          title="self-repair engaged"
+          data-testid="health-tell-engaged"
+          aria-label="self-repair engaged"
+        />
       )}
       {isWarning && data.warningPatterns && data.warningPatterns.length > 0 && (
         <div className="text-[10px] text-warning mt-1 truncate">
@@ -142,6 +183,28 @@ function ExecutionDagNodeRender({ data }: NodeProps<ExecutionFlowNode>): React.R
         {isWarning && data.warningStatusLine && (
           <p className="mt-2 border-t border-border pt-2 text-[10px] leading-4 text-warning">
             Silent failure detected: {data.warningStatusLine}
+          </p>
+        )}
+        {/* WO-MC-NEGAN-DIAGNOSTIC-GRAPH-01: HealthTell — explicit "brain intact"
+            micro-label on a skipped repair / gate node (the deliberate health
+            signal preserved from the proof-fire baseline). */}
+        {healthTellIntact && (
+          <p
+            className="mt-2 border-t border-border pt-2 text-[10px] leading-4 text-success"
+            data-testid="health-tell-intact"
+          >
+            brain intact (self-repair lane not needed)
+          </p>
+        )}
+        {/* WO-MC-NEGAN-DIAGNOSTIC-GRAPH-01: full raw error in the tooltip for
+            failed nodes — the FailureReason class on the face is the brain;
+            this is the body. */}
+        {data.status === 'failed' && data.error && (
+          <p
+            className="mt-2 border-t border-border pt-2 text-[10px] leading-4 text-error whitespace-pre-wrap break-words"
+            data-testid="failure-reason-raw"
+          >
+            {data.error}
           </p>
         )}
       </div>

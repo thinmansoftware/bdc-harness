@@ -12,15 +12,18 @@
  *    (last 5 events, newest first). Re-fetches every 5s while the run is live.
  */
 import { useMemo, useRef, useState } from 'react';
-import { useQuery, useQueryClient } from '@tanstack/react-query';
-import { X, CheckCircle, XCircle, Pause } from 'lucide-react';
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { Ban, CheckCircle, Pause, X, XCircle } from 'lucide-react';
 
 import type { DagNode, WorkflowEventResponse } from '@/lib/api';
-import { approveWorkflowRun, getNodeEvents, rejectWorkflowRun } from '@/lib/api';
+import { approveWorkflowRun, cancelWorkflowRun, getNodeEvents, rejectWorkflowRun } from '@/lib/api';
 import { resolveNodeDisplay } from '@/lib/dag-layout';
 import { ensureUtc } from '@/lib/format';
+import { classifyNodeError, deriveLucilleHint } from '@/lib/negan-utils';
 import type { WorkflowRunStatus, WorkflowStepStatus } from '@/lib/types';
 import { useClickOutside } from '@/hooks/useClickOutside';
+import { ReplayNode } from './ReplayNode';
+import { RunHistorySparkline } from './RunHistorySparkline';
 
 const MAX_BODY_CHARS = 2000;
 const EVENT_POLL_MS = 5000;
@@ -40,6 +43,16 @@ interface NodePeekPanelProps {
    *  by extractApprovalContext, or set by SSE. The buttons render only when
    *  approval.nodeId === this panel's nodeId AND runStatus === 'paused'. */
   approval?: { nodeId: string; message: string };
+  /** WO-MC-NEGAN-DIAGNOSTIC-GRAPH-01: workflow name, used by
+   *  RunHistorySparkline to look up recent runs of the same workflow. */
+  workflowName?: string;
+  /** WO-MC-NEGAN-DIAGNOSTIC-GRAPH-01: from run.metadata.approval — declared
+   *  on_reject prompt; absence means reject halts immediately. Surfaced via
+   *  LucilleHint. */
+  onRejectPrompt?: string;
+  /** WO-MC-NEGAN-DIAGNOSTIC-GRAPH-01: from run.metadata.approval — bounded
+   *  re-draft count for the on_reject loop. Surfaced via LucilleHint. */
+  onRejectMaxAttempts?: number;
 }
 
 /** Truncate a string to MAX_BODY_CHARS with a "show more" affordance. */
@@ -85,12 +98,32 @@ export function NodePeekPanel({
   onClose,
   runStatus,
   approval,
+  workflowName,
+  onRejectPrompt,
+  onRejectMaxAttempts,
 }: NodePeekPanelProps): React.ReactElement {
   const panelRef = useRef<HTMLDivElement>(null);
   useClickOutside(panelRef, onClose);
   const queryClient = useQueryClient();
   const [gateBusy, setGateBusy] = useState<null | 'approving' | 'rejecting'>(null);
   const [gateError, setGateError] = useState<string | null>(null);
+  // WO-MC-NEGAN-DIAGNOSTIC-GRAPH-01: Kill — the real /cancel control distinct
+  // from Reject. Reject auto-resumes into on_reject when defined; Kill always
+  // takes the run to status=cancelled.
+  const cancelMutation = useMutation({
+    mutationFn: () => cancelWorkflowRun(runId),
+    onSuccess: async () => {
+      setGateError(null);
+      await queryClient.invalidateQueries({ queryKey: ['workflowRun', runId] });
+    },
+    onError: (err: unknown) => {
+      setGateError(err instanceof Error ? err.message : 'Cancel failed');
+    },
+  });
+  const lucilleHint = useMemo(
+    () => deriveLucilleHint(onRejectPrompt, onRejectMaxAttempts),
+    [onRejectPrompt, onRejectMaxAttempts]
+  );
 
   // WO-MC-SELF-REPAIR-LOOP-VIZ-01 (Gap C): inline gate affordance is shown
   // ONLY when this panel's node IS the unresolved approval-gate node on a
@@ -150,6 +183,19 @@ export function NodePeekPanel({
   const latestOutput = extractLatestOutput(eventList);
   const hasNotStarted = nodeStatus === undefined || nodeStatus === 'pending';
 
+  // WO-MC-NEGAN-DIAGNOSTIC-GRAPH-01: extract the first node_failed event's
+  // error so the panel can show the classified FailureReason (matches the
+  // failed node face). Newest-first order — take the most recent failure.
+  const failedEventError = useMemo((): string | undefined => {
+    for (const ev of eventList) {
+      if (ev.event_type !== 'node_failed') continue;
+      const raw = ev.data.error;
+      if (typeof raw === 'string' && raw.length > 0) return raw;
+    }
+    return undefined;
+  }, [eventList]);
+  const failureClass = classifyNodeError(failedEventError);
+
   // Section ordering (top to bottom): header, prompt/command, output/response, events list.
   return (
     <div
@@ -198,13 +244,24 @@ export function NodePeekPanel({
                 {approval.message}
               </p>
             )}
-            <div className="flex items-center gap-2">
+            {/* WO-MC-NEGAN-DIAGNOSTIC-GRAPH-01: LucilleHint — state the
+                consequence of each choice before the operator clicks.
+                Reject loops the workflow into its on_reject chain;
+                Kill (/cancel) is the actual stop. */}
+            <div className="mb-2 space-y-0.5" data-testid="lucille-hint">
+              <p className="text-[10px] text-success/80">{lucilleHint.approve}</p>
+              <p className="text-[10px] text-error/80">{lucilleHint.reject}</p>
+              <p className="text-[10px] text-text-secondary">
+                Kill (/cancel) -&gt; stops the run immediately
+              </p>
+            </div>
+            <div className="flex items-center gap-2 flex-wrap">
               <button
                 type="button"
                 onClick={(): void => {
                   void onApprove();
                 }}
-                disabled={gateBusy !== null}
+                disabled={gateBusy !== null || cancelMutation.isPending}
                 className="flex items-center gap-1 rounded-md px-2 py-1 text-xs text-success/90 border border-success/30 hover:bg-success/10 hover:text-success disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
                 data-testid="inline-approve-button"
               >
@@ -216,15 +273,48 @@ export function NodePeekPanel({
                 onClick={(): void => {
                   void onReject();
                 }}
-                disabled={gateBusy !== null}
+                disabled={gateBusy !== null || cancelMutation.isPending}
                 className="flex items-center gap-1 rounded-md px-2 py-1 text-xs text-error/90 border border-error/30 hover:bg-error/10 hover:text-error disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
                 data-testid="inline-reject-button"
               >
                 <XCircle className="h-3.5 w-3.5" />
                 {gateBusy === 'rejecting' ? 'Rejecting...' : 'Reject'}
               </button>
+              {/* WO-MC-NEGAN-DIAGNOSTIC-GRAPH-01: KillButton — distinct from
+                  Reject. Direct /cancel; bypasses the on_reject loop. */}
+              <button
+                type="button"
+                onClick={(): void => {
+                  cancelMutation.mutate();
+                }}
+                disabled={gateBusy !== null || cancelMutation.isPending}
+                className="flex items-center gap-1 rounded-md px-2 py-1 text-xs text-text-secondary border border-border hover:bg-surface-elevated hover:text-text-primary disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                data-testid="inline-kill-button"
+              >
+                <Ban className="h-3.5 w-3.5" />
+                {cancelMutation.isPending ? 'Killing...' : 'Kill (/cancel)'}
+              </button>
             </div>
             {gateError !== null && <p className="mt-1 text-[10px] text-error">{gateError}</p>}
+          </section>
+        )}
+        {/* WO-MC-NEGAN-DIAGNOSTIC-GRAPH-01: FailureReason — classified failure
+            class on the panel for failed nodes; the raw error follows in the
+            block below. Anchor: codex 400 was a bare red box in v0. */}
+        {nodeStatus === 'failed' && failureClass !== undefined && (
+          <section
+            className="px-3 py-2 border-b border-border bg-error/5"
+            data-testid="peek-failure-reason"
+          >
+            <h3 className="text-[10px] uppercase tracking-wide text-text-tertiary mb-1">
+              Failure class
+            </h3>
+            <p className="text-xs text-error font-medium">{failureClass}</p>
+            {failedEventError !== undefined && (
+              <p className="mt-1 text-[10px] text-error/80 whitespace-pre-wrap break-words">
+                {failedEventError}
+              </p>
+            )}
           </section>
         )}
         {/* Prompt / Command / Shell */}
@@ -264,6 +354,17 @@ export function NodePeekPanel({
             <p className="text-xs text-text-tertiary italic">No output recorded.</p>
           )}
         </section>
+
+        {/* WO-MC-NEGAN-DIAGNOSTIC-GRAPH-01: ReplayNode — "Resume from failed"
+            on a failed run. v1 calls /api/workflows/runs/:runId/resume which
+            re-runs from failed nodes, skipping completed ones. Alt-model
+            replay is fast-follow (requires a server-side model override). */}
+        {runStatus === 'failed' && <ReplayNode runId={runId} />}
+
+        {/* WO-MC-NEGAN-DIAGNOSTIC-GRAPH-01: RunHistorySparkline — recent
+            outcomes for THIS workflow (not this node). Anchor: "fired 5x,
+            died HERE 5x" trend signal. Returns null when fewer than 2 runs. */}
+        {workflowName && <RunHistorySparkline workflowName={workflowName} />}
 
         {/* Last events */}
         <section className="px-3 py-2">

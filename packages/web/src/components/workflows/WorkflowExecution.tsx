@@ -57,6 +57,11 @@ interface WorkflowRunQueryData {
   conversationPlatformId: string | null;
   codebaseId: string | null;
   events: WorkflowEventResponse[];
+  /** WO-MC-NEGAN-DIAGNOSTIC-GRAPH-01: surface metadata.approval (Lucille
+   *  consequence hint inputs) to the JSX layer without re-querying the run.
+   *  Field exists on WorkflowRunResponse.metadata at server side; we just
+   *  carry it through here. */
+  runMetadataApproval: { onRejectPrompt?: string; onRejectMaxAttempts?: number } | null;
 }
 
 interface WorkflowExecutionProps {
@@ -309,6 +314,25 @@ export function WorkflowExecution({ runId }: WorkflowExecutionProps): React.Reac
         conversationPlatformId: data.run.conversation_platform_id ?? null,
         codebaseId: data.run.codebase_id ?? null,
         events: data.events,
+        // WO-MC-NEGAN-DIAGNOSTIC-GRAPH-01: cast metadata.approval once at the
+        // query boundary. metadata is Record<string, unknown> at the type
+        // level; the cast pattern matches WorkflowRunCard.tsx L229.
+        runMetadataApproval: ((): {
+          onRejectPrompt?: string;
+          onRejectMaxAttempts?: number;
+        } | null => {
+          const raw = data.run.metadata?.approval;
+          if (raw === undefined || raw === null || typeof raw !== 'object') return null;
+          const obj = raw as { onRejectPrompt?: unknown; onRejectMaxAttempts?: unknown };
+          return {
+            onRejectPrompt: typeof obj.onRejectPrompt === 'string' ? obj.onRejectPrompt : undefined,
+            onRejectMaxAttempts:
+              typeof obj.onRejectMaxAttempts === 'number' &&
+              Number.isFinite(obj.onRejectMaxAttempts)
+                ? obj.onRejectMaxAttempts
+                : undefined,
+          };
+        })(),
       };
     },
     refetchInterval: (query): number | false => {
@@ -756,6 +780,8 @@ export function WorkflowExecution({ runId }: WorkflowExecutionProps): React.Reac
                   loopArcs={loopArcs}
                   cycleState={cycleState}
                   runStatus={workflow.status}
+                  runId={runId}
+                  workflowName={workflow.workflowName}
                 />
               ) : (
                 <div className="flex items-center justify-center h-full text-text-secondary">
@@ -772,6 +798,9 @@ export function WorkflowExecution({ runId }: WorkflowExecutionProps): React.Reac
                   isRunning={isRunning}
                   runStatus={workflow.status}
                   approval={workflow.approval}
+                  workflowName={workflow.workflowName}
+                  onRejectPrompt={queryData?.runMetadataApproval?.onRejectPrompt}
+                  onRejectMaxAttempts={queryData?.runMetadataApproval?.onRejectMaxAttempts}
                   onClose={(): void => {
                     setPeekOpen(false);
                   }}
