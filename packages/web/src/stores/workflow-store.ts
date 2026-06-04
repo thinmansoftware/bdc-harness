@@ -277,13 +277,13 @@ export const useWorkflowStore = create<WorkflowStoreState>()(
       },
 
       handleLoopIteration: (event: LoopIterationEvent): void => {
-        if (!event.nodeId) return; // Non-DAG loops have no nodeId — skip
+        if (!event.nodeId) return; // Non-DAG loops have no nodeId -- skip
         set(
           state =>
             updateWorkflow(state, event.runId, wf => {
               const dagNodes = [...wf.dagNodes];
               const existingIdx = dagNodes.findIndex(n => n.nodeId === event.nodeId);
-              if (existingIdx < 0) return wf; // Node not yet in store — loop iteration may arrive before dag_node event in SSE ordering. Intentional silent drop.
+              if (existingIdx < 0) return wf; // Node not yet in store -- loop iteration may arrive before dag_node event in SSE ordering. Intentional silent drop.
 
               const existing = dagNodes[existingIdx];
               const iterations: LoopIterationInfo[] = [...(existing.iterations ?? [])];
@@ -361,7 +361,7 @@ export function selectActiveWorkflow(state: WorkflowStoreState): WorkflowState |
   return state.workflows.get(state.activeWorkflowId) ?? null;
 }
 
-// Stable SSE handler object — actions are defined once in create(), so references never change.
+// Stable SSE handler object -- actions are defined once in create(), so references never change.
 // Shared by ChatInterface and WorkflowLogs instead of per-component useShallow selectors.
 const {
   handleWorkflowStatus,
@@ -385,7 +385,7 @@ export function cleanupWorkflowStore(): void {
   pollInFlight.clear();
   pollingSubscription?.();
   pollingSubscription = null;
-  // Merge instead of replace — preserves action function references
+  // Merge instead of replace -- preserves action function references
   // so the module-level workflowSSEHandlers const stays valid.
   useWorkflowStore.setState({ workflows: new Map(), activeWorkflowId: null });
   registerPollingSubscription();

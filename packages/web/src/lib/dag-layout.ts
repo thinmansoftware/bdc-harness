@@ -128,7 +128,7 @@ export function dagNodesToReactFlow(dagNodes: readonly DagNode[]): {
 /**
  * Merge self-repair loop arcs (WO-MC-SELF-REPAIR-LOOP-VIZ-01, Gap A) into the
  * already-laid-out depends_on edge set as VISUAL OVERLAYS only. Dagre is NOT
- * re-run on the merged set — back-edges would either crash or produce wrong
+ * re-run on the merged set -- back-edges would either crash or produce wrong
  * positions. The depends_on graph still dictates node layout; loop arcs are
  * extra edges that ReactFlow renders as dashed/curved overlays.
  *
@@ -142,7 +142,7 @@ export function dagNodesToReactFlow(dagNodes: readonly DagNode[]): {
  * guarded so a partial event payload cannot reintroduce the "Cannot read
  * properties of undefined" crash.
  *
- * @deprecated WO-MC-NEGAN-DIAGNOSTIC-GRAPH-01 — use routeLoopArcsAsSideRail
+ * @deprecated WO-MC-NEGAN-DIAGNOSTIC-GRAPH-01 -- use routeLoopArcsAsSideRail
  *   for proper right-gutter side-rail rendering. This helper scattered loop
  *   arcs across the forward spine because smoothstep would route through the
  *   shortest path, crossing forward nodes. Kept for backward compatibility
@@ -197,7 +197,7 @@ export function mergeLoopArcsIntoEdges(
  * Layout strategy:
  *   1. Dagre has already laid out baseNodes against the forward
  *      depends_on edge set (cycle-free by construction). Loop arcs are NOT
- *      fed to dagre — that would either reposition the spine or crash.
+ *      fed to dagre -- that would either reposition the spine or crash.
  *   2. Compute gutterX = (max rightmost node edge X) + SIDE_RAIL_GUTTER_PX.
  *      All loop arcs share the same gutter so they read as a single side-rail.
  *   3. For each LoopArc, emit one ReactFlow edge typed 'loopArcEdge' (custom
@@ -221,7 +221,7 @@ export function routeLoopArcsAsSideRail(
 ): Edge[] {
   if (loopArcs.length === 0) return baseEdges.slice();
   if (baseNodes.length === 0) {
-    // No positions yet — fall back to overlay merge so the renderer does not
+    // No positions yet -- fall back to overlay merge so the renderer does not
     // throw and the arcs are at least present (will re-route on next render).
     return mergeLoopArcsIntoEdges(baseNodes, baseEdges, loopArcs);
   }

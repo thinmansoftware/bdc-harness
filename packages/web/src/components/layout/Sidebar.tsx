@@ -287,7 +287,7 @@ export function Sidebar(): React.ReactElement {
           </div>
         )}
         {isErrorCodebases && (
-          <p className="px-2 text-[10px] text-error mt-1">Failed to load projects — retrying</p>
+          <p className="px-2 text-[10px] text-error mt-1">Failed to load projects -- retrying</p>
         )}
       </div>
 

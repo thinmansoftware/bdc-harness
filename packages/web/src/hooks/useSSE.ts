@@ -194,7 +194,7 @@ export function useSSE(
             break;
           case 'workflow_dispatch':
             // Flush buffered text before dispatch events to ensure the dispatch
-            // message (🚀) is committed as an assistant message before
+            // message (rocket prefix) is committed as an assistant message before
             // onWorkflowDispatch attaches metadata to the "last assistant message".
             if (textBufferRef.current) {
               if (flushTimerRef.current) {

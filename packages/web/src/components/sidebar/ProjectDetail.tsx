@@ -129,7 +129,7 @@ export function ProjectDetail({
         </span>
         <div className="mt-1 flex flex-col gap-0.5">
           {isErrorConversations ? (
-            <span className="px-1 text-xs text-error">Failed to load — retrying</span>
+            <span className="px-1 text-xs text-error">Failed to load -- retrying</span>
           ) : filteredConversations && filteredConversations.length > 0 ? (
             filteredConversations.map(conv => (
               <ConversationItem
@@ -151,7 +151,7 @@ export function ProjectDetail({
         </span>
         <div className="mt-1 flex flex-col gap-0.5">
           {isErrorRuns ? (
-            <span className="px-1 text-xs text-error">Failed to load — retrying</span>
+            <span className="px-1 text-xs text-error">Failed to load -- retrying</span>
           ) : sortedRuns && sortedRuns.length > 0 ? (
             sortedRuns.map(run => (
               <button
@@ -182,7 +182,7 @@ export function ProjectDetail({
           </span>
           <div className="mt-1 flex flex-col gap-0.5">
             {isErrorEnvironments ? (
-              <span className="px-1 text-xs text-error">Failed to load — retrying</span>
+              <span className="px-1 text-xs text-error">Failed to load -- retrying</span>
             ) : (
               activeEnvironments.map((env: IsolationEnvironment) => (
                 <div

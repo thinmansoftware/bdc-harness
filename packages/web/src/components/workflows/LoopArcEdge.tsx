@@ -54,7 +54,7 @@ function LoopArcEdgeRender(props: EdgeProps): React.ReactElement {
   // gutter, then left to (targetX, endY).
   // Use cubic beziers for smooth corners; the geometric invariant
   // (gutterX > max forward node right edge) is what guarantees no spine
-  // crossing — the bezier curvature is purely cosmetic.
+  // crossing -- the bezier curvature is purely cosmetic.
   const cornerRadius = 16;
   const enterX = gutterX;
   const exitX = gutterX;

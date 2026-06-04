@@ -28,10 +28,10 @@ function makeToolCall(id = 'tc1'): ToolCallDisplay {
 }
 
 // ---------------------------------------------------------------------------
-// Rule 4 — tool-call boundary (the new guard added by PR #1054)
+// Rule 4 -- tool-call boundary (the new guard added by PR #1054)
 // ---------------------------------------------------------------------------
 
-describe('applyOnText — tool-call boundary (Rule 4)', () => {
+describe('applyOnText -- tool-call boundary (Rule 4)', () => {
   test('starts a new segment when last streaming message has tool calls', () => {
     const prev: ChatMessage[] = [makeAssistant({ toolCalls: [makeToolCall()] })];
     const result = applyOnText(prev, 'Post-tool text', makeId, NOW);
@@ -60,7 +60,7 @@ describe('applyOnText — tool-call boundary (Rule 4)', () => {
     expect(result[0].content).toBe('xy');
   });
 
-  test('handles multiple tool calls — still splits on any non-empty toolCalls', () => {
+  test('handles multiple tool calls -- still splits on any non-empty toolCalls', () => {
     const prev: ChatMessage[] = [
       makeAssistant({ toolCalls: [makeToolCall('tc1'), makeToolCall('tc2')] }),
     ];
@@ -73,10 +73,10 @@ describe('applyOnText — tool-call boundary (Rule 4)', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Rule 5 — append to existing streaming message
+// Rule 5 -- append to existing streaming message
 // ---------------------------------------------------------------------------
 
-describe('applyOnText — append (Rule 5)', () => {
+describe('applyOnText -- append (Rule 5)', () => {
   test('appends to the current streaming message when no boundary condition fires', () => {
     const prev: ChatMessage[] = [makeAssistant({ content: 'hello ' })];
     const result = applyOnText(prev, 'world', makeId, NOW);
@@ -88,10 +88,10 @@ describe('applyOnText — append (Rule 5)', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Rule 6 — new assistant message when none is streaming
+// Rule 6 -- new assistant message when none is streaming
 // ---------------------------------------------------------------------------
 
-describe('applyOnText — new message (Rule 6)', () => {
+describe('applyOnText -- new message (Rule 6)', () => {
   test('creates a new streaming message when prev is empty', () => {
     const result = applyOnText([], 'hello', makeId, NOW);
 
@@ -122,22 +122,22 @@ describe('applyOnText — new message (Rule 6)', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Rules 2 & 3 — workflow-status boundary
+// Rules 2 & 3 -- workflow-status boundary
 // ---------------------------------------------------------------------------
 
-describe('applyOnText — workflow-status boundary (Rules 2 & 3)', () => {
+describe('applyOnText -- workflow-status boundary (Rules 2 & 3)', () => {
   test('starts a new segment when incoming is workflow-status and current has content', () => {
     const prev: ChatMessage[] = [makeAssistant({ content: 'some existing text' })];
-    const result = applyOnText(prev, '🚀 Workflow started', makeId, NOW);
+    const result = applyOnText(prev, '\u{1F680} Workflow started', makeId, NOW);
 
     expect(result).toHaveLength(2);
     expect(result[0].isStreaming).toBe(false);
-    expect(result[1].content).toBe('🚀 Workflow started');
+    expect(result[1].content).toBe('\u{1F680} Workflow started');
     expect(result[1].isStreaming).toBe(true);
   });
 
   test('starts a new segment when current is workflow-status and incoming is regular text', () => {
-    const prev: ChatMessage[] = [makeAssistant({ content: '✅ Workflow done' })];
+    const prev: ChatMessage[] = [makeAssistant({ content: '\u{2705} Workflow done' })];
     const result = applyOnText(prev, 'Regular text now', makeId, NOW);
 
     expect(result).toHaveLength(2);
@@ -148,19 +148,19 @@ describe('applyOnText — workflow-status boundary (Rules 2 & 3)', () => {
   test('does not start new segment when incoming is workflow-status and current is empty', () => {
     // Empty content: the status emoji goes into the empty placeholder
     const prev: ChatMessage[] = [makeAssistant({ content: '' })];
-    const result = applyOnText(prev, '🚀 Starting', makeId, NOW);
+    const result = applyOnText(prev, '\u{1F680} Starting', makeId, NOW);
 
     // isWorkflowStatus && last.content evaluates to false because last.content === ''
     expect(result).toHaveLength(1);
-    expect(result[0].content).toBe('🚀 Starting');
+    expect(result[0].content).toBe('\u{1F680} Starting');
   });
 });
 
 // ---------------------------------------------------------------------------
-// Rule 1 — workflow-result
+// Rule 1 -- workflow-result
 // ---------------------------------------------------------------------------
 
-describe('applyOnText — workflow-result (Rule 1)', () => {
+describe('applyOnText -- workflow-result (Rule 1)', () => {
   const wfResult = { workflowName: 'plan', runId: 'run-1' };
 
   test('creates a non-streaming message for a workflow result', () => {
@@ -187,7 +187,7 @@ describe('applyOnText — workflow-result (Rule 1)', () => {
     ];
     const result = applyOnText(prev, 'Plan complete', makeId, NOW, wfResult);
 
-    // Same runId already in state — no new message added
+    // Same runId already in state -- no new message added
     expect(result).toHaveLength(1);
     expect(result).toBe(prev); // reference equality: same array returned
   });

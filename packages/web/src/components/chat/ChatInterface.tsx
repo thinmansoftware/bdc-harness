@@ -133,7 +133,7 @@ export function ChatInterface({ conversationId }: ChatInterfaceProps): React.Rea
     refetchInterval: 30_000,
     refetchOnWindowFocus: true,
   });
-  // Default to true (hide button) until server confirms non-Docker — prevents broken vscode:// links
+  // Default to true (hide button) until server confirms non-Docker -- prevents broken vscode:// links
   const isDocker = health?.is_docker ?? true;
 
   // Sync messages to cache for persistence across navigation
@@ -155,7 +155,7 @@ export function ChatInterface({ conversationId }: ChatInterfaceProps): React.Rea
         const hydrated: ChatMessage[] = rows.map(mapMessageRow);
         // REST is the source of truth for all completed messages.
         // Keep actively streaming messages that have content (AI is generating).
-        // Discard empty thinking placeholders ONLY if we're not currently sending —
+        // Discard empty thinking placeholders ONLY if we're not currently sending --
         // a send in progress means the placeholder was just created for the current
         // request and should be preserved until the first SSE text event arrives.
         // Uses a module-level flag (isSendInFlight) rather than a component ref
@@ -228,7 +228,7 @@ export function ChatInterface({ conversationId }: ChatInterfaceProps): React.Rea
   );
 
   // Hydrate workflow status from message metadata when SSE events were missed.
-  // workflowDispatch metadata is persisted in DB messages — scan for it after
+  // workflowDispatch metadata is persisted in DB messages -- scan for it after
   // loading history and fetch the workflow run status via REST.
   useEffect(() => {
     if (isNewChat || !workflowDispatchIds) return;
@@ -286,7 +286,7 @@ export function ChatInterface({ conversationId }: ChatInterfaceProps): React.Rea
 
   const onText = useCallback(
     (content: string, workflowResult?: { workflowName: string; runId: string }): void => {
-      // First AI text received — the thinking placeholder is about to gain content,
+      // First AI text received -- the thinking placeholder is about to gain content,
       // so the hydration merge no longer needs the sendInFlight guard.
       setSendInFlight(false);
       setMessages(prev => applyOnText(prev, content, undefined, undefined, workflowResult));
@@ -321,7 +321,7 @@ export function ChatInterface({ conversationId }: ChatInterfaceProps): React.Rea
           ];
         }
         // No assistant message to attach to (e.g. REST hydration replaced state with only
-        // user messages before this SSE event arrived). Create a synthetic one — mirrors
+        // user messages before this SSE event arrived). Create a synthetic one -- mirrors
         // the WorkflowLogs.tsx pattern (lines 354-371).
         const newTool: ToolCallDisplay = {
           id: toolCallId ?? `msg-${String(now)}-tool-0`,
@@ -349,7 +349,7 @@ export function ChatInterface({ conversationId }: ChatInterfaceProps): React.Rea
   const onToolResult = useCallback(
     (name: string, output: string, duration: number, toolCallId?: string): void => {
       setMessages(prev => {
-        // Search all messages (not just last) — tool_result may arrive after a text message
+        // Search all messages (not just last) -- tool_result may arrive after a text message
         let targetIdx = -1;
         for (let i = prev.length - 1; i >= 0; i--) {
           if (prev[i].role === 'assistant' && prev[i].toolCalls?.length) {
@@ -406,14 +406,14 @@ export function ChatInterface({ conversationId }: ChatInterfaceProps): React.Rea
     setQueuePosition(position);
     if (!isLocked) {
       const now = Date.now();
-      // AI processing is done (lock released) — always clear the sendInFlight guard.
+      // AI processing is done (lock released) -- always clear the sendInFlight guard.
       // This must be unconditional: if it's only cleared inside hasStuckPlaceholder,
       // the flag stays true after workflow dispatches (where the placeholder is replaced
       // by status text), causing ghost streaming messages on the second send.
       setSendInFlight(false);
       // Mark streaming messages with content as complete and fix running tools.
       // Empty thinking placeholders (isStreaming: true, content: '') are intentionally
-      // skipped — they indicate the AI hasn't started streaming yet. On the first message
+      // skipped -- they indicate the AI hasn't started streaming yet. On the first message
       // of a new conversation, navigate() causes a component remount and a fresh SSE
       // connection; if text events were emitted before the connection established, only
       // the lock-release event is received. We detect this race and re-fetch via REST.
@@ -462,13 +462,13 @@ export function ChatInterface({ conversationId }: ChatInterfaceProps): React.Rea
           })
           .catch((err: unknown) => {
             console.error(
-              '[Chat] Re-fetch after SSE reconnect failed — clearing stuck placeholder',
+              '[Chat] Re-fetch after SSE reconnect failed -- clearing stuck placeholder',
               {
                 conversationId: conversationIdRef.current,
                 error: err instanceof Error ? err.message : err,
               }
             );
-            // Re-fetch failed — clear stuck placeholder so user can retry
+            // Re-fetch failed -- clear stuck placeholder so user can retry
             setMessages(prev =>
               prev.map(m => (m.isStreaming && !m.content ? { ...m, isStreaming: false } : m))
             );
@@ -618,7 +618,7 @@ export function ChatInterface({ conversationId }: ChatInterfaceProps): React.Rea
           );
           targetConversationId = newId;
           // Cache messages under the new ID so the remounted ChatInterface picks them up
-          // (navigate changes the key prop, causing unmount/remount — state is lost otherwise)
+          // (navigate changes the key prop, causing unmount/remount -- state is lost otherwise)
           setCachedMessages(newId, [userMsg, thinkingMsg]);
           navigate(`/chat/${newId}`, { replace: true });
           // Trigger title + workflow refreshes after AI generates a proper title
@@ -673,7 +673,7 @@ export function ChatInterface({ conversationId }: ChatInterfaceProps): React.Rea
           suggestedActions: ['Retry'],
         });
       } finally {
-        // Only clear sending UI state here. Do NOT clear setSendInFlight —
+        // Only clear sending UI state here. Do NOT clear setSendInFlight --
         // it must stay true until onText fires (first SSE text) or the
         // hasStuckPlaceholder recovery runs on lock release. Clearing it
         // here causes a race: the new mount's REST hydration may run after

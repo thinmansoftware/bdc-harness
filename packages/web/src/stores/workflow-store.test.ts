@@ -158,7 +158,7 @@ describe('handleWorkflowArtifact', () => {
   });
 });
 
-describe('handleWorkflowStatus — approval field', () => {
+describe('handleWorkflowStatus -- approval field', () => {
   test('stores approval on new paused entry', () => {
     useWorkflowStore.getState().handleWorkflowStatus(
       statusEvent({
@@ -200,7 +200,7 @@ describe('handleWorkflowStatus — approval field', () => {
   });
 });
 
-describe('handleWorkflowStatus — terminal guard', () => {
+describe('handleWorkflowStatus -- terminal guard', () => {
   test('does not allow running SSE event to resurrect a completed workflow', () => {
     useWorkflowStore
       .getState()
@@ -318,7 +318,7 @@ describe('selectActiveWorkflow / activeWorkflowId', () => {
     useWorkflowStore.getState().handleWorkflowStatus(statusEvent({ runId: 'b', timestamp: 2000 }));
     expect(useWorkflowStore.getState().activeWorkflowId).toBe('b');
 
-    // b completes — a is now the active running workflow
+    // b completes -- a is now the active running workflow
     useWorkflowStore
       .getState()
       .handleWorkflowStatus(statusEvent({ runId: 'b', status: 'completed', timestamp: 3000 }));
@@ -350,7 +350,7 @@ describe('handleLoopIteration', () => {
       .handleLoopIteration(
         loopIterationEvent({ runId: 'run-li0', iteration: 1, nodeId: undefined })
       );
-    // Map reference must not change — no mutation
+    // Map reference must not change -- no mutation
     expect(useWorkflowStore.getState().workflows).toBe(before);
   });
 
@@ -361,7 +361,7 @@ describe('handleLoopIteration', () => {
       .handleLoopIteration(
         loopIterationEvent({ runId: 'run-li1', iteration: 1, nodeId: 'ghost-node' })
       );
-    // Node was not registered — dagNodes must remain empty
+    // Node was not registered -- dagNodes must remain empty
     const wf = useWorkflowStore.getState().workflows.get('run-li1')!;
     expect(wf.dagNodes).toHaveLength(0);
   });
@@ -489,7 +489,7 @@ describe('handleLoopIteration', () => {
         status: 'completed',
       })
     );
-    // Simulate the loop node completing — handleDagNode must preserve the iteration data
+    // Simulate the loop node completing -- handleDagNode must preserve the iteration data
     useWorkflowStore.getState().handleDagNode(
       dagNodeEvent({
         runId: 'run-li6',

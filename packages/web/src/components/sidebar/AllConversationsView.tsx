@@ -30,7 +30,7 @@ export function AllConversationsView({
 
   const conversationStatusMap = useMemo((): Map<string, 'running' | 'failed'> => {
     const map = new Map<string, 'running' | 'failed'>();
-    if (!runs || isErrorRuns) return map; // skip silently on error — status badges are secondary UI
+    if (!runs || isErrorRuns) return map; // skip silently on error -- status badges are secondary UI
     for (const run of runs) {
       // For web runs, parent_conversation_id is the visible conversation in the sidebar.
       // For CLI runs, conversation_id is the only conversation (no parent/worker split).
@@ -76,7 +76,7 @@ export function AllConversationsView({
         </span>
         <div className="mt-1 flex flex-col gap-0.5">
           {isErrorConversations ? (
-            <span className="px-1 text-xs text-error">Failed to load — retrying</span>
+            <span className="px-1 text-xs text-error">Failed to load -- retrying</span>
           ) : filtered && filtered.length > 0 ? (
             filtered.map(conv => (
               <ConversationItem
@@ -90,7 +90,7 @@ export function AllConversationsView({
             <span className="px-1 text-xs text-text-tertiary">
               {conversations && conversations.length > 0
                 ? 'No matching conversations'
-                : 'No conversations yet — start a new chat!'}
+                : 'No conversations yet -- start a new chat!'}
             </span>
           )}
         </div>

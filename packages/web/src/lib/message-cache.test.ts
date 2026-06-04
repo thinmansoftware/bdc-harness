@@ -24,7 +24,7 @@ function makeMsg(id: string, content = 'hello'): ChatMessage {
  * persist for the lifetime of the Bun process.  We reset them by:
  *   - Overwriting every known key with an empty array then deleting it
  *     (getCachedMessages returns [] when missing, so we don't need a real
- *      "clear" method — we just ensure tests start from known state by
+ *      "clear" method -- we just ensure tests start from known state by
  *      re-writing what they need rather than relying on prior calls).
  *   - Forcing sendInFlight back to false.
  *
@@ -39,7 +39,7 @@ beforeEach(() => {
   // tests.  Any ID-specific state is handled inline per test.
 });
 
-// ─── getCachedMessages ────────────────────────────────────────────────────────
+// --- getCachedMessages --------------------------------------------------------
 
 describe('getCachedMessages', () => {
   test('returns empty array for an unknown conversation id', () => {
@@ -64,8 +64,8 @@ describe('getCachedMessages', () => {
 
   test('moves the accessed entry to the most-recently-used position', () => {
     // Populate three entries: A, B, C (in insertion order).
-    // Access A → A should move to the end (MRU position).
-    // Then fill the cache to 20 — the first eviction target should be B, not A.
+    // Access A -> A should move to the end (MRU position).
+    // Then fill the cache to 20 -- the first eviction target should be B, not A.
     const baseId = 'lru-' + Math.random() + '-';
     const idA = baseId + 'A';
     const idB = baseId + 'B';
@@ -74,7 +74,7 @@ describe('getCachedMessages', () => {
     setCachedMessages(idA, [msgA]);
     setCachedMessages(idB, [makeMsg('b1')]);
 
-    // Access A — moves it to MRU position, so B becomes LRU.
+    // Access A -- moves it to MRU position, so B becomes LRU.
     getCachedMessages(idA);
 
     // Fill cache to exactly 20 (MAX_CACHED_CONVERSATIONS).
@@ -106,7 +106,7 @@ describe('getCachedMessages', () => {
   });
 });
 
-// ─── setCachedMessages ────────────────────────────────────────────────────────
+// --- setCachedMessages --------------------------------------------------------
 
 describe('setCachedMessages', () => {
   test('stores messages and makes them retrievable', () => {
@@ -138,7 +138,7 @@ describe('setCachedMessages', () => {
       setCachedMessages(prefix + String(i), [makeMsg('m' + String(i))]);
     }
 
-    // Insert 21st entry — should evict the very first one (prefix + '0').
+    // Insert 21st entry -- should evict the very first one (prefix + '0').
     const msg20 = makeMsg('m20');
     setCachedMessages(prefix + '20', [msg20]);
 
@@ -149,7 +149,7 @@ describe('setCachedMessages', () => {
   test('does not evict when size is exactly MAX_CACHED_CONVERSATIONS (20)', () => {
     const prefix = 'no-evict-' + Math.random() + '-';
 
-    // Insert exactly 20 entries — capture boundary messages for assertion.
+    // Insert exactly 20 entries -- capture boundary messages for assertion.
     const msgs: Record<string, ChatMessage[]> = {};
     for (let i = 0; i < 20; i++) {
       const m = [makeMsg('n' + String(i))];
@@ -165,14 +165,14 @@ describe('setCachedMessages', () => {
   test('re-inserting an existing id does not increase size and does not evict another entry', () => {
     const prefix = 'reinsert-' + Math.random() + '-';
 
-    // Fill to 20 — capture first entry for assertion.
+    // Fill to 20 -- capture first entry for assertion.
     const msg0 = makeMsg('r0');
     setCachedMessages(prefix + '0', [msg0]);
     for (let i = 1; i < 20; i++) {
       setCachedMessages(prefix + String(i), [makeMsg('r' + String(i))]);
     }
 
-    // Re-insert an existing id — size stays at 20, nothing should be evicted.
+    // Re-insert an existing id -- size stays at 20, nothing should be evicted.
     const msgUpdated = makeMsg('updated');
     setCachedMessages(prefix + '5', [msgUpdated]);
 
@@ -183,7 +183,7 @@ describe('setCachedMessages', () => {
   });
 });
 
-// ─── setSendInFlight / isSendInFlight ─────────────────────────────────────────
+// --- setSendInFlight / isSendInFlight -----------------------------------------
 
 describe('setSendInFlight / isSendInFlight', () => {
   test('defaults to false at the start of each test (reset in beforeEach)', () => {

@@ -1,11 +1,11 @@
 /**
- * WO-MC-NEGAN-DIAGNOSTIC-GRAPH-01: ReplayNode — the "resume from failed"
+ * WO-MC-NEGAN-DIAGNOSTIC-GRAPH-01: ReplayNode -- the "resume from failed"
  * affordance attached to a failed node's peek panel.
  *
  * v1 SCOPE (FLAG-1 in approved plan): the engine's existing
  * /api/workflows/runs/:runId/resume endpoint re-runs from failed nodes,
  * skipping completed ones. We expose THAT endpoint here. The spec's "replay
- * with alt model" variant is honest fast-follow work — it requires a
+ * with alt model" variant is honest fast-follow work -- it requires a
  * server-side per-node model-override endpoint that does not exist yet.
  * Rather than fake it with a button that does nothing, we omit it
  * (anti-pattern: "kill the brain not the body" applies to the build too).

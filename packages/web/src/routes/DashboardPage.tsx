@@ -56,7 +56,7 @@ export function DashboardPage(): React.ReactElement {
   const queryClient = useQueryClient();
   const [searchParams, setSearchParams] = useSearchParams();
 
-  // Connect to multiplexed dashboard SSE stream (all workflow events → Zustand store)
+  // Connect to multiplexed dashboard SSE stream (all workflow events -> Zustand store)
   useDashboardSSE();
 
   const hydrateWorkflow = useWorkflowStore(state => state.hydrateWorkflow);
@@ -230,7 +230,7 @@ export function DashboardPage(): React.ReactElement {
     refetchInterval: 30_000,
   });
 
-  // Poll global Claude throttle state — surfaces auto-engaged throttles in the
+  // Poll global Claude throttle state -- surfaces auto-engaged throttles in the
   // StatusSummaryBar so operators see the gate state without checking logs.
   const { data: throttleState } = useQuery({
     queryKey: ['adminThrottle'],
@@ -369,7 +369,7 @@ export function DashboardPage(): React.ReactElement {
   }
   // Reject differs from the rest of the lifecycle actions because it takes a
   // second argument (the optional reason). Inline it rather than squeezing
-  // through `runAction`'s `(id) => Promise` signature with a closure — keeps
+  // through `runAction`'s `(id) => Promise` signature with a closure -- keeps
   // `runAction` usefully narrow for the single-arg actions above.
   async function handleReject(runId: string, reason?: string): Promise<void> {
     try {
@@ -403,7 +403,7 @@ export function DashboardPage(): React.ReactElement {
           </div>
         </div>
 
-        {/* Status Summary Bar — receives real server counts */}
+        {/* Status Summary Bar -- receives real server counts */}
         <StatusSummaryBar
           counts={counts}
           activeFilter={statusFilter}

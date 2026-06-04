@@ -1,7 +1,7 @@
 /**
  * WO-MC-NEGAN-DIAGNOSTIC-GRAPH-01: per-workflow recent-outcome strip.
  *
- * "Fired 5x, died HERE 5x" anchor — when a WO has been re-fired and keeps
+ * "Fired 5x, died HERE 5x" anchor -- when a WO has been re-fired and keeps
  * landing in the same red box, the operator should see the trend without
  * digging through the dashboard. Mounted in NodePeekPanel so it appears
  * alongside the in-context node detail (the node face is already crowded

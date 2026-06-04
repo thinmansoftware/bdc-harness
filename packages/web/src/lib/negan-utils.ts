@@ -1,11 +1,11 @@
 /**
- * WO-MC-NEGAN-DIAGNOSTIC-GRAPH-01 — pure utilities for the diagnostic Mission
+ * WO-MC-NEGAN-DIAGNOSTIC-GRAPH-01 -- pure utilities for the diagnostic Mission
  * Control surfaces (FailureReason, LucilleHint, FleetStrip co-fire detection,
  * CostBurnMeter math, live-status discriminator).
  *
  * No React deps. No SDK deps. Every input here is data the runs/events API
- * already surfaces — the spec's "read the resolver before adding surfaces"
- * rule applied to this WO too. See WO §7 for verified field availability:
+ * already surfaces -- the spec's "read the resolver before adding surfaces"
+ * rule applied to this WO too. See WO Section 7 for verified field availability:
  *   - DashboardRunResponse.codebase_name (already returned by listDashboardRuns)
  *   - WorkflowRunResponse.metadata.total_cost_usd (already populated by
  *     WO-HARNESS-TOKEN-ATTRIBUTION-01)
@@ -20,7 +20,7 @@ import { ensureUtc } from '@/lib/format';
 /**
  * Classify a raw node error string into a short, scannable label rendered on
  * the failed node face. The full raw error remains accessible in the existing
- * tooltip and in NodePeekPanel — this is the "point at the brain" label, not
+ * tooltip and in NodePeekPanel -- this is the "point at the brain" label, not
  * a replacement for the body of the message.
  *
  * Order of checks is significant: provider/model 400s ("not supported",
@@ -78,13 +78,13 @@ export function classifyNodeError(error: string | undefined | null): string | un
  * approval node's `on_reject` block, captured server-side in the run's
  * `metadata.approval` object:
  *   - With on_reject + maxAttempts: reject re-drafts up to N times, then
- *     cancels. ("the headshot is /cancel, not Reject" — Reject loops.)
+ *     cancels. ("the headshot is /cancel, not Reject" -- Reject loops.)
  *   - With on_reject, no maxAttempts: reject re-drafts until cancelled.
  *   - Without on_reject: reject halts immediately (cancels the run).
  *
  * Approve always resumes the gate, regardless of reject config.
  *
- * The KillButton (separate UI element) is the real headshot — this hint only
+ * The KillButton (separate UI element) is the real headshot -- this hint only
  * STATES the consequence; the action lives on the Kill button.
  */
 export function deriveLucilleHint(
@@ -123,7 +123,7 @@ export function isLiveStatus(status: WorkflowRunStatus | undefined): boolean {
  *
  * Co-fire detection rule (FleetStrip): any map entry whose array length >= 2
  * AND whose key is not the synthetic "(no codebase)" placeholder is a
- * co-fire. Two unattributed runs are not a co-fire alarm — the spec anchor
+ * co-fire. Two unattributed runs are not a co-fire alarm -- the spec anchor
  * (2026-06-02 zombie+keeper) was about two runs hammering the same real repo.
  */
 export const NO_CODEBASE_KEY = '(no codebase)';
@@ -145,15 +145,15 @@ export function groupRunsByRepo(
  * Compute the running cost burn rate for the FleetStrip CostBurnMeter.
  *
  * totalCostUsd = sum of `metadata.total_cost_usd` across all live runs
- *   (guarded by typeof check — metadata is Record<string, unknown> at the
+ *   (guarded by typeof check -- metadata is Record<string, unknown> at the
  *    client; WorkflowRunCard.tsx uses the same guard pattern at L229).
  *
  * ratePerMin = totalCostUsd / elapsedMinutes, where elapsedMinutes is computed
  *   from the EARLIEST started_at across all live runs (the "session" extent).
- *   Returns null when no run has a started_at or when elapsed is zero — never
+ *   Returns null when no run has a started_at or when elapsed is zero -- never
  *   divide-by-zero, never NaN.
  *
- * The anchor wound: "$4.83 for 21min — what happened?" with no live cost view.
+ * The anchor wound: "$4.83 for 21min -- what happened?" with no live cost view.
  * The meter has to be readable WITHOUT recomputing in the user's head.
  */
 export function computeCostBurnRate(

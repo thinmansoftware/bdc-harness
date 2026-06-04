@@ -80,7 +80,7 @@ export function BuilderToolbar({
             className="rounded-md border border-border bg-surface px-1.5 py-1 text-xs text-text-secondary focus:outline-none focus:ring-1 focus:ring-accent w-[72px] shrink-0"
             title={
               workflowsError
-                ? 'Failed to load workflows — check server connection'
+                ? 'Failed to load workflows -- check server connection'
                 : 'Load workflow'
             }
           >

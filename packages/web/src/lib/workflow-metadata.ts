@@ -13,7 +13,7 @@ export interface ParsedDescription {
  * Recognizes: "Use when:", "Triggers:", "Does:", "NOT for:" / "Constraints:",
  * and less common variants like "Handles:", "Capability:", "Input:".
  *
- * Falls back gracefully — unparsed descriptions return empty sections with the
+ * Falls back gracefully -- unparsed descriptions return empty sections with the
  * full text in `raw`.
  */
 export function parseWorkflowDescription(description: string): ParsedDescription {
@@ -47,7 +47,7 @@ export function parseWorkflowDescription(description: string): ParsedDescription
     }
   }
 
-  // Extract "Triggers:" section — parse quoted strings, fall back to comma-split
+  // Extract "Triggers:" section -- parse quoted strings, fall back to comma-split
   const triggersRe = /Triggers:\s*(.+?)(?=\n\s*(?:Does:|NOT for:|Constraints:|\n\n)|$)/s;
   const triggersMatch = triggersRe.exec(text);
   if (triggersMatch) {
@@ -129,12 +129,12 @@ export function getWorkflowCategory(name: string, description: string): Workflow
     return 'Code Review';
   }
 
-  // CI/CD — validation, testing (word-boundary for short tokens)
+  // CI/CD -- validation, testing (word-boundary for short tokens)
   if (lower.includes('validate') || lower.includes('test-loop') || /\bci\b/.test(lower)) {
     return 'CI/CD';
   }
 
-  // Automation — issue creation, conflict resolution, refactoring
+  // Automation -- issue creation, conflict resolution, refactoring
   if (
     lower.includes('create-issue') ||
     lower.includes('resolve-conflict') ||
@@ -145,7 +145,7 @@ export function getWorkflowCategory(name: string, description: string): Workflow
     return 'Automation';
   }
 
-  // Development — feature, implement, plan, architect, assist
+  // Development -- feature, implement, plan, architect, assist
   if (
     lower.includes('feature') ||
     lower.includes('implement') ||

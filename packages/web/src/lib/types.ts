@@ -90,7 +90,7 @@ export interface HeartbeatEvent extends BaseSSEEvent {
   type: 'heartbeat';
 }
 
-/** SSE events only carry active run statuses — 'pending' is excluded because
+/** SSE events only carry active run statuses -- 'pending' is excluded because
  *  the server never emits a status event for a run that hasn't started yet. */
 export type ActiveWorkflowRunStatus = Exclude<WorkflowRunStatus, 'pending'>;
 
@@ -188,7 +188,7 @@ export interface SystemStatusEvent extends BaseSSEEvent {
 
 /**
  * Discriminated union of all SSE event types emitted by the Web adapter.
- * Parsed from JSON with no runtime validation — the server is trusted.
+ * Parsed from JSON with no runtime validation -- the server is trusted.
  */
 export type SSEEvent =
   | TextEvent

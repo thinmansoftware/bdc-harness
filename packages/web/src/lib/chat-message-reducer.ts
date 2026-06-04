@@ -8,7 +8,7 @@
 
 import type { ChatMessage } from './types';
 
-/** Regex that identifies workflow-status messages (🚀 / ✅ prefix). */
+/** Regex that identifies workflow-status messages (U+1F680 rocket / U+2705 check prefix). */
 const WORKFLOW_STATUS_RE = /^[\u{1F680}\u{2705}]/u;
 
 /**
@@ -39,12 +39,12 @@ function makeStreamingMessage(
  * This mirrors (and is called by) the `setMessages` updater inside the
  * `onText` callback of `ChatInterface.tsx`.  Segmentation rules:
  *
- * 1. Workflow-result text → always a new, non-streaming message (deduped by runId).
- * 2. Incoming workflow-status when current has content → close current, open new.
- * 3. Current is workflow-status and incoming is regular text → close current, open new.
- * 4. Current message has tool calls → close current, open new (mirrors persistence.ts:72).
- * 5. Otherwise → append to the current streaming message.
- * 6. No streaming assistant message → create a new one.
+ * 1. Workflow-result text -> always a new, non-streaming message (deduped by runId).
+ * 2. Incoming workflow-status when current has content -> close current, open new.
+ * 3. Current is workflow-status and incoming is regular text -> close current, open new.
+ * 4. Current message has tool calls -> close current, open new (mirrors persistence.ts:72).
+ * 5. Otherwise -> append to the current streaming message.
+ * 6. No streaming assistant message -> create a new one.
  *
  * @param prev        Current message list (treated as immutable).
  * @param content     Text to apply.
@@ -101,6 +101,6 @@ export function applyOnText(
     return [...prev.slice(0, -1), { ...last, content: last.content + content }];
   }
 
-  // Rule 6: no active streaming assistant message → create a new one.
+  // Rule 6: no active streaming assistant message -> create a new one.
   return [...prev, makeStreamingMessage(makeId(), content, now, true)];
 }

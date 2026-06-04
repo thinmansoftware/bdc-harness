@@ -33,7 +33,7 @@ export function useDashboardSSE(): void {
         case 'workflow_step':
           workflowSSEHandlers.onLoopIteration(event as LoopIterationEvent);
           break;
-        // heartbeat — ignore
+        // heartbeat -- ignore
       }
     };
 
@@ -44,5 +44,5 @@ export function useDashboardSSE(): void {
     return (): void => {
       es.close();
     };
-  }, []); // mount once — stable handlers from Zustand module level
+  }, []); // mount once -- stable handlers from Zustand module level
 }

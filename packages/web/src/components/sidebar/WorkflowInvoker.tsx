@@ -26,7 +26,7 @@ export function WorkflowInvoker({ codebaseId }: WorkflowInvokerProps): React.Rea
   });
 
   if (isErrorWorkflows) {
-    return <p className="mx-1 text-[10px] text-error">Failed to load workflows — retrying</p>;
+    return <p className="mx-1 text-[10px] text-error">Failed to load workflows -- retrying</p>;
   }
 
   if (!workflows || workflows.length === 0) return null;

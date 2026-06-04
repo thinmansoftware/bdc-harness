@@ -116,7 +116,7 @@ export function ArtifactViewerModal({
           <DialogTitle>{basename}</DialogTitle>
         </DialogHeader>
         <div className="flex-1 overflow-auto min-h-0">
-          {loading && <p className="text-sm text-text-secondary animate-pulse">Loading…</p>}
+          {loading && <p className="text-sm text-text-secondary animate-pulse">Loading...</p>}
           {error && <p className="text-sm text-error">{error}</p>}
           {content !== null &&
             (isMarkdown ? (

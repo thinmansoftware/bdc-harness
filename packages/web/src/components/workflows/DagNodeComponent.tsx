@@ -13,7 +13,7 @@ export interface DagNodeData extends DagNode {
   bashTimeout?: number;
   /** Agent persona name resolved from the node's `agent:` field, if present. */
   agentPersona?: string;
-  /** Required by React Flow's Node<T> constraint — do not rely on this for typed access. */
+  /** Required by React Flow's Node<T> constraint -- do not rely on this for typed access. */
   [key: string]: unknown;
 }
 
@@ -99,7 +99,7 @@ function DagNodeRender({ data, selected }: NodeProps<DagFlowNode>): React.ReactE
           <span className="text-xs font-medium text-text-primary truncate">{data.label}</span>
           {data.agentPersona && (
             <>
-              <span className="text-[10px] text-text-tertiary shrink-0">·</span>
+              <span className="text-[10px] text-text-tertiary shrink-0">|</span>
               <span className="text-[10px] text-text-tertiary italic truncate">
                 {data.agentPersona}
               </span>
