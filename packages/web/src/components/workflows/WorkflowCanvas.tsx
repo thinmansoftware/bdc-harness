@@ -226,7 +226,7 @@ export function WorkflowCanvas({
     };
   }, []);
 
-  // Manual double-click detection — ReactFlow v12 has no onPaneDoubleClick prop.
+  // Manual double-click detection -- ReactFlow v12 has no onPaneDoubleClick prop.
   const DOUBLE_CLICK_MS = 300;
   const clickTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const lastClickRef = useRef<{ time: number; x: number; y: number }>({ time: 0, x: 0, y: 0 });

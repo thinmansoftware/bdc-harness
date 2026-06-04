@@ -26,13 +26,13 @@ interface Props {
   trigger: ReactNode;
   /** Dialog title (e.g. "Abandon workflow?"). */
   title: string;
-  /** Body text — supports rich children (e.g. wrapping the workflow name in <strong>). */
+  /** Body text -- supports rich children (e.g. wrapping the workflow name in <strong>). */
   description: ReactNode;
   /** Confirm-button label (e.g. "Abandon", "Delete"). */
   confirmLabel: string;
   /**
    * When provided, renders a textarea below the description. The trimmed
-   * value is passed to `onConfirm` — empty after trim becomes `undefined`
+   * value is passed to `onConfirm` -- empty after trim becomes `undefined`
    * so callers can distinguish "no reason given" from "empty string given".
    */
   reasonInput?: ReasonInputConfig;

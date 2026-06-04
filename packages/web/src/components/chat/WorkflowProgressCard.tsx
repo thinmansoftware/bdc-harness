@@ -96,7 +96,7 @@ export function WorkflowProgressCard({
   const rejectMutation = useMutation({
     mutationFn: (reason?: string) => rejectWorkflowRun(runId ?? '', reason),
   });
-  // WO-MC-NEGAN-DIAGNOSTIC-GRAPH-01: Kill — the real /cancel control,
+  // WO-MC-NEGAN-DIAGNOSTIC-GRAPH-01: Kill -- the real /cancel control,
   // distinct from Reject. Reject loops the workflow into its on_reject
   // re-draft chain (memory: reference_cauldron-reject-loops-use-cancel-to-kill).
   // Kill is the headshot.
@@ -106,7 +106,7 @@ export function WorkflowProgressCard({
   const mutationError = approveMutation.error ?? rejectMutation.error ?? cancelMutation.error;
 
   // WO-MC-NEGAN-DIAGNOSTIC-GRAPH-01: derive the Lucille consequence hint from
-  // run.metadata.approval — what the YAML declared, not what the live SSE
+  // run.metadata.approval -- what the YAML declared, not what the live SSE
   // store has. metadata.approval lives on the run record (Record<string,unknown>
   // cast) and contains onRejectPrompt + onRejectMaxAttempts when the gate
   // defines an on_reject block.
@@ -236,7 +236,7 @@ export function WorkflowProgressCard({
                   {approval?.message ?? 'Waiting for approval'}
                 </p>
               </div>
-              {/* WO-MC-NEGAN-DIAGNOSTIC-GRAPH-01: LucilleHint — state the
+              {/* WO-MC-NEGAN-DIAGNOSTIC-GRAPH-01: LucilleHint -- state the
                   consequence of each choice BEFORE the operator clicks.
                   Reject loops into on_reject when defined; only Kill (/cancel)
                   is the real headshot. */}
@@ -301,7 +301,7 @@ export function WorkflowProgressCard({
                     rejectMutation.mutate(reason);
                   }}
                 />
-                {/* WO-MC-NEGAN-DIAGNOSTIC-GRAPH-01: KillButton — the real
+                {/* WO-MC-NEGAN-DIAGNOSTIC-GRAPH-01: KillButton -- the real
                     /cancel control. Distinct from Reject so the operator can
                     actually STOP a run instead of looping it via on_reject. */}
                 <ConfirmRunActionDialog
@@ -324,7 +324,7 @@ export function WorkflowProgressCard({
                   description={
                     <>
                       Cancel the workflow <strong>{workflowName}</strong>. The run will be marked
-                      cancelled immediately — this is the headshot, distinct from{' '}
+                      cancelled immediately -- this is the headshot, distinct from{' '}
                       <code>Reject</code> which may loop into <code>on_reject</code>.
                     </>
                   }
@@ -338,7 +338,7 @@ export function WorkflowProgressCard({
                 <p className="text-xs text-error">
                   {mutationError instanceof Error
                     ? mutationError.message
-                    : 'Action failed — please try again'}
+                    : 'Action failed -- please try again'}
                 </p>
               )}
             </div>

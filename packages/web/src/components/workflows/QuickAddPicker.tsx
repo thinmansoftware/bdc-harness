@@ -94,7 +94,7 @@ export function QuickAddPicker({
             }}
             className="text-text-tertiary hover:text-text-primary text-xs"
           >
-            ←
+            {'<-'}
           </button>
           <span className="text-xs font-medium text-text-secondary">
             {isSkill ? 'Add Skill Node' : 'Add MCP Node'}

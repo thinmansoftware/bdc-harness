@@ -169,7 +169,7 @@ export async function sendMessage(
   for (const file of files) {
     form.append('files', file, file.name);
   }
-  // No Content-Type header — browser sets multipart/form-data with boundary automatically
+  // No Content-Type header -- browser sets multipart/form-data with boundary automatically
   return fetchJSON(url, { method: 'POST', body: form });
 }
 
@@ -529,7 +529,7 @@ export async function getWorkflowRunByWorker(
   try {
     return await fetchJSON(`/api/workflows/runs/by-worker/${encodeURIComponent(workerPlatformId)}`);
   } catch (e: unknown) {
-    // 404 means no run exists yet — expected during dispatch
+    // 404 means no run exists yet -- expected during dispatch
     if ((e as Error & { status?: number }).status === 404) {
       return null;
     }

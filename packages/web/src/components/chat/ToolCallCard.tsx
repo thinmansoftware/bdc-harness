@@ -12,7 +12,7 @@ export function ToolCallCard({ tool }: ToolCallCardProps): React.ReactElement {
   const [showAllOutput, setShowAllOutput] = useState(false);
   const isRunning = tool.output === undefined && tool.duration === undefined;
 
-  // Live elapsed counter — ticks every second while tool is running
+  // Live elapsed counter -- ticks every second while tool is running
   const [elapsed, setElapsed] = useState(0);
   useEffect(() => {
     if (!isRunning || !tool.startedAt) return;

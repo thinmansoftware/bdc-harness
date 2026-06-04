@@ -6,7 +6,7 @@ interface YamlCodeViewProps {
   mode: 'split' | 'full';
 }
 
-/** Serialize a single value — handles strings with newlines, objects, arrays. */
+/** Serialize a single value -- handles strings with newlines, objects, arrays. */
 function serializeValue(value: unknown, currentIndent: number): string {
   if (value === null || value === undefined) {
     return 'null';
@@ -59,7 +59,7 @@ function serializeValue(value: unknown, currentIndent: number): string {
         .join('\n')
     );
   }
-  // Fallback for unexpected types — should not be reached after all type guards above
+  // Fallback for unexpected types -- should not be reached after all type guards above
   return JSON.stringify(value);
 }
 

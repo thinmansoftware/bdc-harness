@@ -12,7 +12,7 @@ const tabs = [
 ] as const;
 
 export function TopNav(): React.ReactElement {
-  // We only need `counts.running` — a server-side aggregate independent of
+  // We only need `counts.running` -- a server-side aggregate independent of
   // the `runs` array. `limit: 1` minimises the `runs` payload that the API
   // returns alongside the counts (we discard it).
   const { data: dashboardRuns } = useQuery({

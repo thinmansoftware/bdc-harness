@@ -15,7 +15,7 @@ interface WorkflowLogsProps {
   isRunning?: boolean;
   currentlyExecuting?: { nodeName: string; startedAt: number } | null;
   toolEvents?: ToolEvent[];
-  /** Timestamp of the selected node's start — used to scroll the message list. */
+  /** Timestamp of the selected node's start -- used to scroll the message list. */
   scrollToNodeTimestamp?: number | null;
   /** Incremented on every user node click to trigger scroll. */
   nodeScrollTrigger?: number;
@@ -73,7 +73,7 @@ function hydrateMessages(
   // persistence.ts flush). Tool events from workflow_events cover the same tool calls
   // but with different IDs (UUIDs vs msgId-tool-N) and different duration measurements.
   // To avoid duplicates, we match tool events against metadata tool calls by name and
-  // timestamp proximity — if a metadata tool call with the same name exists within 60s
+  // timestamp proximity -- if a metadata tool call with the same name exists within 60s
   // of the tool event, we consider them the same and skip the event.
   //
   // During active execution before flush, no messages have metadata tool calls, so all
@@ -136,7 +136,7 @@ function hydrateMessages(
           });
         }
       } else {
-        // No assistant message to attach to — collect for synthetic message
+        // No assistant message to attach to -- collect for synthetic message
         unattached.push({
           id: te.id,
           name: te.name,
@@ -150,7 +150,7 @@ function hydrateMessages(
 
     // Create a synthetic assistant message for unattached tool events.
     // This handles the case where the persistence buffer hasn't flushed yet
-    // during active workflow execution — tool events exist in the DB but
+    // during active workflow execution -- tool events exist in the DB but
     // the assistant messages containing them haven't been persisted.
     if (unattached.length > 0) {
       const earliestTs = Math.min(...unattached.map(tc => tc.startedAt));
@@ -201,7 +201,7 @@ export function WorkflowLogs({
     };
   }, [isRunning, currentlyExecuting]);
 
-  // Poll for messages from DB — 3s while running (or during grace period), disabled when terminal.
+  // Poll for messages from DB -- 3s while running (or during grace period), disabled when terminal.
   // staleTime: 0 ensures post-completion navigation always fetches fresh data on mount.
   const { data: queryMessages } = useQuery({
     queryKey: ['workflowMessages', conversationId],
@@ -213,7 +213,7 @@ export function WorkflowLogs({
     staleTime: 0,
   });
 
-  // When workflow transitions from running → terminal, keep polling for 6 more seconds
+  // When workflow transitions from running -> terminal, keep polling for 6 more seconds
   // (2 extra cycles) to catch late DB flushes, then do a final invalidation.
   // Also force-scroll to bottom so the user sees the final output.
   useEffect(() => {
@@ -263,17 +263,17 @@ export function WorkflowLogs({
       const result: ChatMessage[] = [];
       for (const m of prev) {
         if (m.isStreaming) {
-          // Actively streaming text — keep as-is (DB doesn't have this yet)
+          // Actively streaming text -- keep as-is (DB doesn't have this yet)
           result.push(m);
           continue;
         }
         const hasActiveTool = m.toolCalls?.some(tc => tc.duration === undefined && !tc.output);
         if (!hasActiveTool) {
-          // All tools complete, not streaming — DB has this, drop it
+          // All tools complete, not streaming -- DB has this, drop it
           changed = true;
           continue;
         }
-        // Has at least one in-progress tool — keep only the active tools,
+        // Has at least one in-progress tool -- keep only the active tools,
         // strip completed ones that are already in DB via persistence flush.
         const activeTools = (m.toolCalls ?? []).filter(
           tc => tc.duration === undefined && !tc.output
@@ -298,18 +298,18 @@ export function WorkflowLogs({
   const messages = useMemo((): ChatMessage[] => {
     const dbMessages = queryMessages ?? [];
 
-    // After workflow completes, use DB only — clean, no duplicates.
+    // After workflow completes, use DB only -- clean, no duplicates.
     if (!isRunning && !gracePolling) return dbMessages;
 
     // While running with no SSE data yet, show DB messages.
     if (sseMessages.length === 0) return dbMessages;
 
-    // No DB messages yet — show SSE only.
+    // No DB messages yet -- show SSE only.
     if (dbMessages.length === 0) return sseMessages;
 
     // Collect DB tool calls for dedup against SSE tools.
     // SSE and DB compute durations independently (client vs server Date.now()),
-    // so durations can differ by a few ms. We match by name + duration ±500ms.
+    // so durations can differ by a few ms. We match by name + duration +/-500ms.
     const dbTools: { name: string; duration: number }[] = [];
     for (const dm of dbMessages) {
       for (const tc of dm.toolCalls ?? []) {
@@ -337,7 +337,7 @@ export function WorkflowLogs({
     // Handle in-flight DB tool calls to prevent duplicates and ordering glitches.
     // When a tool is in-flight, workflow_events has a tool_called row (no duration yet),
     // which hydrateMessages surfaces into queryMessages. Without handling, that DB
-    // entry and the SSE entry both appear — the race condition described in issue #744.
+    // entry and the SSE entry both appear -- the race condition described in issue #744.
     //
     // Two strategies applied:
     // 1. SUPPRESS in-flight DB tools that SSE is actively tracking (cardinality-aware)
@@ -349,11 +349,11 @@ export function WorkflowLogs({
     if (sseInFlightCounts.size > 0 || isRunning) {
       const dbSuppressedCounts = new Map<string, number>();
       const mapped = dbMessages.map(m => {
-        if (!m.toolCalls?.length) return m; // No tool calls to filter — return as-is
+        if (!m.toolCalls?.length) return m; // No tool calls to filter -- return as-is
         let messageChanged = false;
         const filteredTools = m.toolCalls.filter(tc => {
           if (tc.duration !== undefined || !!tc.output) return true;
-          // In-flight DB tool — suppress if SSE is actively tracking one with this name
+          // In-flight DB tool -- suppress if SSE is actively tracking one with this name
           if (sseInFlightCounts.size > 0) {
             const limit = sseInFlightCounts.get(tc.name) ?? 0;
             const suppressed = dbSuppressedCounts.get(tc.name) ?? 0;
@@ -362,7 +362,7 @@ export function WorkflowLogs({
               return false; // SSE owns this tool's live display
             }
           }
-          // In-flight DB tool NOT tracked by SSE — keep it visible but flag for
+          // In-flight DB tool NOT tracked by SSE -- keep it visible but flag for
           // timestamp bump so it sorts at the end instead of jumping above completed tools
           messageChanged = true;
           return true;
@@ -375,7 +375,7 @@ export function WorkflowLogs({
           // in-flight ones, bump timestamp so they sort at the end (REPOSITION).
           return { ...m, toolCalls: filteredTools, ...(messageChanged ? { timestamp: now } : {}) };
         }
-        // No tools suppressed — if this message has in-flight tools, bump its
+        // No tools suppressed -- if this message has in-flight tools, bump its
         // timestamp so it sorts at the end (matching where SSE would place it)
         if (messageChanged) {
           return { ...m, timestamp: now };
@@ -389,7 +389,7 @@ export function WorkflowLogs({
     }
 
     // Collect DB text content for dedup against SSE text messages.
-    // During live execution, the same text (e.g., "🚀 Starting workflow...") can appear
+    // During live execution, the same text (e.g., "<rocket> Starting workflow...") can appear
     // in both DB (from REST fetch on mount) and SSE (from event buffer replay).
     // Without dedup, the text shows up twice in the message list.
     const dbTextContents = new Set<string>();
@@ -436,7 +436,7 @@ export function WorkflowLogs({
   const onText = useCallback((content: string): void => {
     setSseMessages(prev => {
       const last = prev[prev.length - 1];
-      // Workflow status messages (🚀 start, ✅ complete) should be their own message,
+      // Workflow status messages (rocket start, check complete) should be their own message,
       // matching ChatInterface's behavior and persistence segmentation. Without this,
       // all text concatenates into one giant streaming message, breaking text dedup
       // against DB messages (which are stored as separate segments).

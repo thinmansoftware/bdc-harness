@@ -304,7 +304,7 @@ export function ChatPage(): React.ReactElement {
                 >
                   {conversations && conversations.length > 0
                     ? 'No matching conversations'
-                    : 'No conversations yet — start a new chat!'}
+                    : 'No conversations yet -- start a new chat!'}
                 </span>
               </div>
             )}

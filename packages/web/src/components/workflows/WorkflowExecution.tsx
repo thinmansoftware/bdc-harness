@@ -90,7 +90,7 @@ function StatusBadge({
     failed: 'bg-error/20 text-error',
     cancelled: 'bg-surface text-text-secondary',
   };
-  // WO-170: workflow-level rollup — a "completed" workflow with any
+  // WO-170: workflow-level rollup -- a "completed" workflow with any
   // completed_with_warning node renders yellow.
   const effectiveStatus = status === 'completed' && hasWarning ? 'completed_with_warning' : status;
   const className =
@@ -194,7 +194,7 @@ export function WorkflowExecution({ runId }: WorkflowExecutionProps): React.Reac
               const nodeId = e.step_name ?? '';
               if (!nodeId) continue;
               const existing = nodeMap.get(nodeId);
-              if (!existing) continue; // No node_started event yet — skip (events ordered in DB)
+              if (!existing) continue; // No node_started event yet -- skip (events ordered in DB)
 
               const iteration = e.data.iteration as number | undefined;
               const maxIter = e.data.maxIterations as number | undefined;
@@ -411,7 +411,7 @@ export function WorkflowExecution({ runId }: WorkflowExecutionProps): React.Reac
   }, [codebaseId]);
 
   // Fetch workflow definition for DAG topology (depends_on edges).
-  // Only gated on workflowName — codebaseCwd is optional; when absent the server tries the
+  // Only gated on workflowName -- codebaseCwd is optional; when absent the server tries the
   // first registered codebase before falling back to bundled defaults (handles CLI runs and
   // "No project" web runs).
   const { data: workflowDef } = useQuery({
@@ -426,7 +426,7 @@ export function WorkflowExecution({ runId }: WorkflowExecutionProps): React.Reac
 
   // WO-MC-SELF-REPAIR-LOOP-VIZ-01: compute the self-repair loop overlays
   // (loop-back arcs + cycle state) from the YAML topology and the events
-  // stream. Pure derivation — re-runs cheaply on every poll tick.
+  // stream. Pure derivation -- re-runs cheaply on every poll tick.
   const events = queryData?.events ?? null;
   const loopArcs = useMemo(() => {
     if (!dagDefinitionNodes || !events) return [];
@@ -466,7 +466,7 @@ export function WorkflowExecution({ runId }: WorkflowExecutionProps): React.Reac
         }
       })
       .catch((err: unknown) => {
-        // Non-critical — "View Run" link just won't appear
+        // Non-critical -- "View Run" link just won't appear
         console.warn('[WorkflowExecution] Failed to look up worker run', {
           workerPlatformId,
           error: err instanceof Error ? err.message : err,
@@ -478,7 +478,7 @@ export function WorkflowExecution({ runId }: WorkflowExecutionProps): React.Reac
   // REST provides structural data (steps, startedAt, artifacts) from DB.
   // SSE provides live status updates (status, completedAt, error).
   // When a `running` SSE event is missed (no buffering), the first SSE event
-  // seen is `completed` — which creates liveWorkflow with steps:[] and
+  // seen is `completed` -- which creates liveWorkflow with steps:[] and
   // startedAt=completionTime. We must preserve initialData's structure in that case.
   const workflow = ((): WorkflowState | null => {
     if (!liveWorkflow) return initialData;
@@ -494,7 +494,7 @@ export function WorkflowExecution({ runId }: WorkflowExecutionProps): React.Reac
     // Merge: use liveWorkflow's dynamic status but preserve initialData's
     // structural data when liveWorkflow is sparse (missed earlier events).
     // WO-MC-SELF-REPAIR-LOOP-VIZ-01 (Gap C): preserve the REST-hydrated
-    // approval object (recovered from events) when SSE has none — the SSE
+    // approval object (recovered from events) when SSE has none -- the SSE
     // store sets approval=undefined whenever status !== 'paused', which
     // would erase the context on a transient 'failed' status during the
     // approval auto-resume window.
@@ -504,7 +504,7 @@ export function WorkflowExecution({ runId }: WorkflowExecutionProps): React.Reac
       status: liveWorkflow.status,
       completedAt: liveWorkflow.completedAt ?? initialData.completedAt,
       error: liveWorkflow.error ?? initialData.error,
-      // SSE accumulates dagNodes/artifacts incrementally — prefer them when populated,
+      // SSE accumulates dagNodes/artifacts incrementally -- prefer them when populated,
       // otherwise fall back to the REST snapshot.
       dagNodes: liveWorkflow.dagNodes.length > 0 ? liveWorkflow.dagNodes : initialData.dagNodes,
       artifacts: liveWorkflow.artifacts.length > 0 ? liveWorkflow.artifacts : initialData.artifacts,
@@ -641,7 +641,7 @@ export function WorkflowExecution({ runId }: WorkflowExecutionProps): React.Reac
           // WO-170: surface the matched STATUS line in the per-step log so
           // John can see what failed silently without opening the tooltip.
           const sl = e.data.statusLine as string | undefined;
-          const slStr = sl ? ` — ${sl.split('\n')[0]}` : '';
+          const slStr = sl ? ` -- ${sl.split('\n')[0]}` : '';
           return `[${ts}] Node completed with warning: ${e.step_name ?? 'node'}${slStr}`;
         }
         case 'node_failed':
@@ -724,7 +724,7 @@ export function WorkflowExecution({ runId }: WorkflowExecutionProps): React.Reac
   // Pick the platform ID for logs: worker takes precedence over conversation.
   const logsPlatformId = workerPlatformId ?? conversationPlatformId;
 
-  // Logs panel — detect whether the selected node has any DB events so we can show an empty-state
+  // Logs panel -- detect whether the selected node has any DB events so we can show an empty-state
   const logsPanel = (
     <div className="flex-1 flex flex-col overflow-hidden min-h-0 h-full">
       <div className="flex-1 flex flex-col overflow-hidden min-h-0">
@@ -879,7 +879,7 @@ export function WorkflowExecution({ runId }: WorkflowExecutionProps): React.Reac
         </div>
       </div>
 
-      {/* View tabs — only for DAG workflows */}
+      {/* View tabs -- only for DAG workflows */}
       {isDag && (
         <div className="flex items-center px-4 py-1.5 border-b border-border">
           <Tabs
@@ -902,7 +902,7 @@ export function WorkflowExecution({ runId }: WorkflowExecutionProps): React.Reac
         </div>
       )}
 
-      {/* Body — content depends on activeView for DAG, or default layout for sequential */}
+      {/* Body -- content depends on activeView for DAG, or default layout for sequential */}
       {renderBody()}
     </div>
   );

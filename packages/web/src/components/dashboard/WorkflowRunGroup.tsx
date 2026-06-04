@@ -36,7 +36,7 @@ export function WorkflowRunGroup({
 
   return (
     <div className="space-y-2">
-      {/* Group header — only shown when there's a shared parent */}
+      {/* Group header -- only shown when there's a shared parent */}
       {parentPlatformId && (
         <div className="flex items-center gap-2 px-1">
           <div className="h-px flex-1 bg-border" />

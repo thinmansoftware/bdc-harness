@@ -1,5 +1,5 @@
 /**
- * WO-MC-SELF-REPAIR-LOOP-VIZ-01 — tests for self-repair loop derivation.
+ * WO-MC-SELF-REPAIR-LOOP-VIZ-01 -- tests for self-repair loop derivation.
  *
  * Asserts real behavior (not "did not throw") against fixture events shaped
  * exactly like remote_agent_workflow_events: id, workflow_run_id,
@@ -42,7 +42,7 @@ function makeEvent(
 
 /**
  * The real bdc-feature-development ladder (abridged to the rungs the
- * visualization cares about). Provider/agent fields stripped — only the
+ * visualization cares about). Provider/agent fields stripped -- only the
  * topology and `loop:` / `approval:` markers matter for derivation.
  */
 function ladderNodes(): DagNode[] {
@@ -86,7 +86,7 @@ function ladderNodes(): DagNode[] {
       depends_on: ['block-reclassify'],
       when: "$block-reclassify.output.status == 'BLOCKED'",
       approval: {
-        message: 'BLOCKED — review and approve or reject',
+        message: 'BLOCKED -- review and approve or reject',
       },
     },
   ];
@@ -106,12 +106,12 @@ describe('node-class detectors', () => {
   });
 });
 
-describe('Test 1 — looped run (success case)', () => {
+describe('Test 1 -- looped run (success case)', () => {
   it('derives at least one back-edge with traversal count for a real cycle', () => {
     eventSeq = 0;
     const nodes = ladderNodes();
     const events: WorkflowEventResponse[] = [
-      // First review pass FAILED — this is the cycle signal
+      // First review pass FAILED -- this is the cycle signal
       makeEvent({ event_type: 'node_started', step_name: 'diff-review' }),
       makeEvent({
         event_type: 'node_failed',
@@ -141,7 +141,7 @@ describe('Test 1 — looped run (success case)', () => {
         data: { iteration: 2 },
       }),
       makeEvent({ event_type: 'node_completed', step_name: 'diff-repair' }),
-      // Final review passed — completes the cycle
+      // Final review passed -- completes the cycle
       makeEvent({ event_type: 'node_started', step_name: 'diff-review-final' }),
       makeEvent({ event_type: 'node_completed', step_name: 'diff-review-final' }),
     ];
@@ -191,7 +191,7 @@ describe('Test 1 — looped run (success case)', () => {
     const { nodes: rfNodes, edges: rfEdges } = dagNodesToReactFlow(nodes);
     const merged = mergeLoopArcsIntoEdges(rfNodes, rfEdges, arcs);
 
-    // Loop arcs must be added — at least one with a `x<n>` label.
+    // Loop arcs must be added -- at least one with a `x<n>` label.
     const loopArcEdges = merged.filter(e => e.id.startsWith('__loop_'));
     expect(loopArcEdges.length).toBeGreaterThan(0);
 
@@ -213,7 +213,7 @@ describe('Test 1 — looped run (success case)', () => {
   });
 });
 
-describe('Test 2 — paused run with approval gate', () => {
+describe('Test 2 -- paused run with approval gate', () => {
   it('flags pause-gate as paused with the recovered message + currentCycle reflects pause', () => {
     eventSeq = 0;
     const nodes = ladderNodes();
@@ -230,7 +230,7 @@ describe('Test 2 — paused run with approval gate', () => {
         event_type: 'approval_requested',
         step_name: 'pause-gate',
         data: {
-          message: 'BLOCKED — please review and approve or reject',
+          message: 'BLOCKED -- please review and approve or reject',
           nodeId: 'pause-gate',
         },
       }),
@@ -239,14 +239,14 @@ describe('Test 2 — paused run with approval gate', () => {
     const state = deriveCycleState(nodes, events, 'paused');
     expect(state.paused).toBe(true);
     expect(state.pausedNodeId).toBe('pause-gate');
-    expect(state.approvalMessage).toBe('BLOCKED — please review and approve or reject');
+    expect(state.approvalMessage).toBe('BLOCKED -- please review and approve or reject');
     expect(state.currentRung).toBe('pause-gate');
 
     // extractApprovalContext should agree (it must be standalone, not need yamlNodes).
     const ctx = extractApprovalContext(events, 'paused');
     expect(ctx).toBeDefined();
     expect(ctx?.nodeId).toBe('pause-gate');
-    expect(ctx?.message).toBe('BLOCKED — please review and approve or reject');
+    expect(ctx?.message).toBe('BLOCKED -- please review and approve or reject');
 
     // run.status !== 'paused' must NOT yield an approval context (so the
     // inline gate does not render after auto-resume).
@@ -290,7 +290,7 @@ describe('Test 2 — paused run with approval gate', () => {
   });
 });
 
-describe('Test 3 — no-loop run renders clean (no false positives)', () => {
+describe('Test 3 -- no-loop run renders clean (no false positives)', () => {
   it('returns empty arcs + null banner state when zero loop traversals occurred', () => {
     eventSeq = 0;
     const nodes = ladderNodes();
@@ -321,7 +321,7 @@ describe('Test 3 — no-loop run renders clean (no false positives)', () => {
   });
 });
 
-describe('Test 4 — failed-rung inline error', () => {
+describe('Test 4 -- failed-rung inline error', () => {
   it('preserves the node_failed data.error so ExecutionDagNode can render it inline', () => {
     eventSeq = 0;
     const nodes = ladderNodes();
@@ -335,13 +335,13 @@ describe('Test 4 — failed-rung inline error', () => {
       }),
     ];
 
-    // The derivation does not throw away the error — it is available on the
+    // The derivation does not throw away the error -- it is available on the
     // events stream for the existing per-node REST hydrate to surface.
     const failed = events.find(e => e.event_type === 'node_failed');
     expect(failed).toBeDefined();
     expect((failed?.data as { error?: string }).error).toBe(errorMessage);
 
-    // Single failure is still a cycle signal — but only if a downstream
+    // Single failure is still a cycle signal -- but only if a downstream
     // revisit review node exists in the YAML, which it does (diff-review-final).
     const arcs = deriveLoopArcs(nodes, events);
     const reviewRepairArc = arcs.find(a => a.type === 'review-repair');
@@ -350,7 +350,7 @@ describe('Test 4 — failed-rung inline error', () => {
   });
 });
 
-describe('Test 5 — post-approval gate-resume arc', () => {
+describe('Test 5 -- post-approval gate-resume arc', () => {
   it('approval_received(approved) emits a gate-resume back-arc to the prior classify node', () => {
     eventSeq = 0;
     const nodes = ladderNodes();
@@ -374,13 +374,13 @@ describe('Test 5 — post-approval gate-resume arc', () => {
     const gateArc = arcs.find(a => a.type === 'gate-resume');
     expect(gateArc).toBeDefined();
     expect(gateArc?.source).toBe('pause-gate');
-    // Should point back to the nearest upstream classify-class node — block-reclassify.
+    // Should point back to the nearest upstream classify-class node -- block-reclassify.
     expect(gateArc?.target).toBe('block-reclassify');
     expect(gateArc?.count).toBe(1);
 
     // After approval, deriveCycleState should NOT report `paused` even if
     // run.status is transiently 'failed' during auto-resume (a runtime quirk
-    // — invariant 6e: this must not render as an error/terminal state).
+    // -- invariant 6e: this must not render as an error/terminal state).
     const transientFailed = deriveCycleState(nodes, events, 'failed');
     expect(transientFailed.paused).toBe(false);
     // The cycle counter increments for the approve traversal.

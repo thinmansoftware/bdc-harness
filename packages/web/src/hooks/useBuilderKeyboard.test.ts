@@ -83,7 +83,7 @@ describe('isInputTarget', () => {
   });
 });
 
-describe('handleBuilderKeydown — delete invariant', () => {
+describe('handleBuilderKeydown -- delete invariant', () => {
   let actions: ReturnType<typeof makeActions>;
 
   beforeEach(() => {

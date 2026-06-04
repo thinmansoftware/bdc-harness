@@ -1,10 +1,10 @@
 /**
- * CycleBanner — top-left overlay on WorkflowDagViewer that surfaces the
+ * CycleBanner -- top-left overlay on WorkflowDagViewer that surfaces the
  * self-repair loop's aggregate state (WO-MC-SELF-REPAIR-LOOP-VIZ-01, Gap B).
  *
  * Renders ONLY when the lane has actually looped at least once
  * (cycleState.hasLoopActivity) OR is currently paused awaiting a human.
- * A clean linear run (no loop traversals) shows NOTHING — no false
+ * A clean linear run (no loop traversals) shows NOTHING -- no false
  * positives, no phantom banner.
  *
  * Mirror of the existing top-right `currentlyExecuting` badge in
@@ -30,7 +30,7 @@ export function CycleBanner({ cycleState }: CycleBannerProps): React.ReactElemen
 
   if (paused) {
     icon = <Pause className="h-3.5 w-3.5 text-warning" />;
-    label = `cycle ${String(currentCycle)} — PAUSED — awaiting human`;
+    label = `cycle ${String(currentCycle)} -- PAUSED -- awaiting human`;
     tone = 'paused';
   } else if (resolved) {
     icon = <CheckCircle2 className="h-3.5 w-3.5 text-success" />;
@@ -39,7 +39,7 @@ export function CycleBanner({ cycleState }: CycleBannerProps): React.ReactElemen
   } else {
     icon = <RefreshCw className="h-3.5 w-3.5 text-accent-bright animate-spin" />;
     const rungLabel = currentRung ?? 'in-flight';
-    label = `self-repair cycle ${String(currentCycle)} — current rung: ${rungLabel}`;
+    label = `self-repair cycle ${String(currentCycle)} -- current rung: ${rungLabel}`;
     tone = 'running';
   }
 

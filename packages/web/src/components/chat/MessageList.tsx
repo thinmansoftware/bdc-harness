@@ -108,7 +108,7 @@ function WorkflowResultCard({
     filename: string;
   } | null>(null);
 
-  // setArtifactViewer is a stable React state setter — empty dep array is intentional
+  // setArtifactViewer is a stable React state setter -- empty dep array is intentional
   const mdComponents = useMemo(
     () =>
       makeResultMarkdownComponents((aRunId, filename) => {
@@ -120,7 +120,7 @@ function WorkflowResultCard({
   // Zustand live state (populated if user had the page open during execution)
   const liveState = useWorkflowStore(state => state.workflows.get(runId));
 
-  // One-time API fetch: staleTime: Infinity because a terminal run record is immutable —
+  // One-time API fetch: staleTime: Infinity because a terminal run record is immutable --
   // status, timestamps, and events do not change once completed/failed/cancelled.
   const { data: runData, isError } = useQuery({
     queryKey: ['workflowRun', runId],
@@ -140,7 +140,7 @@ function WorkflowResultCard({
     (runData?.run.completed_at ? new Date(ensureUtc(runData.run.completed_at)).getTime() : null);
   const duration = startedAt != null && completedAt != null ? completedAt - startedAt : null;
 
-  // Node counts: prefer live dagNodes (exact), fall back to events (approximation —
+  // Node counts: prefer live dagNodes (exact), fall back to events (approximation --
   // totalCount is nodes that reached a terminal state, not the workflow's full node count).
   let completedCount: number;
   let totalCount: number;

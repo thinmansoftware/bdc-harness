@@ -83,7 +83,7 @@ function NodeLibraryPanel({
         try {
           localStorage.setItem(NODE_LIBRARY_WIDTH_KEY, String(prev));
         } catch {
-          // Storage unavailable or quota exceeded — width persists in memory only
+          // Storage unavailable or quota exceeded -- width persists in memory only
         }
         return prev;
       });
@@ -356,7 +356,7 @@ function WorkflowBuilderInner(): React.ReactElement {
     return [...serverIssues, ...validationIssues];
   }, [validationErrors, validationIssues]);
 
-  // Keyboard shortcuts — stabilize actions object to avoid re-registering handler on every render
+  // Keyboard shortcuts -- stabilize actions object to avoid re-registering handler on every render
   const keyboardActions = useMemo(
     () => ({
       onSave: (): void => void handleSave(),

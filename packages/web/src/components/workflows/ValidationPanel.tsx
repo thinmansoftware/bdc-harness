@@ -13,11 +13,11 @@ interface ValidationPanelProps {
 function severityIcon(severity: ValidationIssue['severity']): React.ReactElement {
   switch (severity) {
     case 'error':
-      return <span className="text-error text-xs leading-none">●</span>;
+      return <span className="text-error text-xs leading-none font-bold">x</span>;
     case 'warning':
-      return <span className="text-warning text-xs leading-none">▲</span>;
+      return <span className="text-warning text-xs leading-none font-bold">!</span>;
     case 'info':
-      return <span className="text-[oklch(0.62_0.18_250)] text-xs leading-none">ℹ</span>;
+      return <span className="text-[oklch(0.62_0.18_250)] text-xs leading-none font-bold">i</span>;
   }
 }
 

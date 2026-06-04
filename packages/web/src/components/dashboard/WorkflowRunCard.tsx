@@ -155,7 +155,7 @@ export function WorkflowRunCard({
   const navigate = useNavigate();
   const [elapsed, setElapsed] = useState(() => formatDuration(run.started_at, run.completed_at));
 
-  // Live SSE state from Zustand store — overrides REST-polled data when present
+  // Live SSE state from Zustand store -- overrides REST-polled data when present
   const liveState = useWorkflowStore(state => state.workflows.get(run.id));
 
   useEffect(() => {
@@ -174,7 +174,7 @@ export function WorkflowRunCard({
   const displayMessage = run.user_message
     ? messageExpanded || !longMessage
       ? run.user_message
-      : run.user_message.slice(0, 80) + '…'
+      : run.user_message.slice(0, 80) + '...'
     : null;
 
   const isArchived = run.archived_at != null;
@@ -254,7 +254,7 @@ export function WorkflowRunCard({
         )}
       </div>
 
-      {/* User message — expandable */}
+      {/* User message -- expandable */}
       {displayMessage && (
         <div className="space-y-0.5">
           <p className={cn('text-xs text-text-tertiary italic', !messageExpanded && 'truncate')}>

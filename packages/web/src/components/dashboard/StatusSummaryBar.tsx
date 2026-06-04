@@ -20,7 +20,7 @@ interface StatusSummaryBarProps {
   onShowArchivedChange: (v: boolean) => void;
   /** Global Claude throttle state (auto-engaged or operator-engaged). */
   isThrottled?: boolean;
-  /** Who engaged the throttle — surfaces operator vs auto in the chip. */
+  /** Who engaged the throttle -- surfaces operator vs auto in the chip. */
   throttleEngagedBy?: 'operator' | 'auto';
   /** Click handler for the throttle chip (typically releases the throttle). */
   onThrottleClick?: () => void;
@@ -91,7 +91,7 @@ export function StatusSummaryBar({
             </button>
           );
         })}
-        {/* Throttle indicator — appears in Row 1 only when the global Claude
+        {/* Throttle indicator -- appears in Row 1 only when the global Claude
             throttle is engaged. Clickable to release; the label tells the
             operator whether auto-engage or manual engage fired the gate. */}
         {isThrottled && (

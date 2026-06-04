@@ -26,7 +26,7 @@ import { loopArcEdgeComponent } from './LoopArcEdge';
 
 import '@xyflow/react/dist/style.css';
 
-// Defined at module scope — prevents ReactFlow from remounting nodes on every render
+// Defined at module scope -- prevents ReactFlow from remounting nodes on every render
 const nodeTypes: NodeTypes = { executionNode: executionDagNode };
 // WO-MC-NEGAN-DIAGNOSTIC-GRAPH-01: register the side-rail edge type so
 // routeLoopArcsAsSideRail can emit edges with type:'loopArcEdge' that
@@ -145,12 +145,12 @@ export function WorkflowDagViewer({
           warningLoadBearing: live?.warningLoadBearing,
           // WO-MC-NEGAN-DIAGNOSTIC-GRAPH-01: classify the error string into a
           // scannable label rendered on a failed node's face. Pure derivation
-          // — the raw error string still flows through `error` so the existing
+          // -- the raw error string still flows through `error` so the existing
           // tooltip + log paths are unchanged.
           failureClass: classifyNodeError(live?.error),
           // WO-MC-NEGAN-DIAGNOSTIC-GRAPH-01: HealthTell drives the explicit
           // "brain intact" / "self-repair engaged" affordance for ladder
-          // rungs and approval gates. Pure function of node id — re-uses the
+          // rungs and approval gates. Pure function of node id -- re-uses the
           // SELF-REPAIR-LOOP-VIZ-01 detector to stay consistent with the
           // loop-arc derivation.
           isRepairOrGate: isLadderNodeId(node.id),
@@ -172,7 +172,7 @@ export function WorkflowDagViewer({
       return {
         ...edge,
         animated: targetStatus === 'running',
-        // ReactFlow SVG edges require inline style for stroke — className cannot target SVG stroke.
+        // ReactFlow SVG edges require inline style for stroke -- className cannot target SVG stroke.
         style: { stroke, strokeWidth: 1.5 },
       };
     });
@@ -184,7 +184,7 @@ export function WorkflowDagViewer({
           so co-fire alarms and CostBurnMeter are visible regardless of which
           node the operator is peeking at. */}
       <FleetStrip currentRunId={runId} />
-      {/* WO-MC-NEGAN-DIAGNOSTIC-GRAPH-01: LaneSourceBadge — surface which
+      {/* WO-MC-NEGAN-DIAGNOSTIC-GRAPH-01: LaneSourceBadge -- surface which
           workflow this run is bound to. v1 is workflow_name only (codebase
           name lives on DashboardRunResponse, not WorkflowRunResponse; a
           server-side flow-through is a fast-follow). */}

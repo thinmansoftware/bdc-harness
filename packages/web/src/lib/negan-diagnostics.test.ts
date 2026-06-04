@@ -1,12 +1,12 @@
 /**
- * WO-MC-NEGAN-DIAGNOSTIC-GRAPH-01 — pure-logic scenario tests.
+ * WO-MC-NEGAN-DIAGNOSTIC-GRAPH-01 -- pure-logic scenario tests.
  *
- * 8 scenarios from the WO §11 stop conditions. Pure bun:test, no DOM
+ * 8 scenarios from the WO Section 11 stop conditions. Pure bun:test, no DOM
  * renderer (per FLAG-3: packages/web has no @testing-library/react), so
  * every assertion targets the negan-utils pure helpers + the
  * routeLoopArcsAsSideRail layout geometry.
  *
- * Asserts REAL behavior — not "did not throw". Each test fails if the
+ * Asserts REAL behavior -- not "did not throw". Each test fails if the
  * surface it covers regresses.
  */
 
@@ -133,7 +133,7 @@ function layoutFixture(nodes: DagNode[]): DagFlowNode[] {
 }
 
 // ===========================================================================
-// Scenario 1: Co-fire alarm — 2 live runs same codebase -> RED detection.
+// Scenario 1: Co-fire alarm -- 2 live runs same codebase -> RED detection.
 // ===========================================================================
 describe('Scenario 1: co-fire alarm', () => {
   it('flags 2+ live runs sharing the same codebase_name', () => {
@@ -163,7 +163,7 @@ describe('Scenario 1: co-fire alarm', () => {
     ];
     const groups = groupRunsByRepo(runs);
     expect(groups.get(NO_CODEBASE_KEY)?.length).toBe(2);
-    // FleetStrip skips NO_CODEBASE_KEY in its co-fire detection — two
+    // FleetStrip skips NO_CODEBASE_KEY in its co-fire detection -- two
     // unattributed runs are NOT a real co-fire.
   });
 });
@@ -214,7 +214,7 @@ describe('Scenario 2: classifyNodeError', () => {
 });
 
 // ===========================================================================
-// Scenario 3: Loop arcs are side-rails — geometric assertion.
+// Scenario 3: Loop arcs are side-rails -- geometric assertion.
 // ===========================================================================
 describe('Scenario 3: routeLoopArcsAsSideRail geometric invariant', () => {
   it('routes loop arcs through a gutter strictly RIGHT of every forward node', () => {
@@ -280,7 +280,7 @@ describe('Scenario 3: routeLoopArcsAsSideRail geometric invariant', () => {
     ];
     const merged = routeLoopArcsAsSideRail([], [], loopArcs);
     // mergeLoopArcsIntoEdges drops arcs whose source/target is not in
-    // baseNodes — so an empty baseNodes yields an empty edge list. The
+    // baseNodes -- so an empty baseNodes yields an empty edge list. The
     // important assertion is no throw.
     expect(Array.isArray(merged)).toBe(true);
   });
@@ -353,7 +353,7 @@ describe('Scenario 5: node_completed event output extraction', () => {
 // ===========================================================================
 describe('Scenario 6: computeCostBurnRate', () => {
   it('sums total_cost_usd across live runs and divides by elapsed minutes', () => {
-    // $4.83 over 21 minutes => ~0.23/min — the anchor wound math.
+    // $4.83 over 21 minutes => ~0.23/min -- the anchor wound math.
     const startedAt = new Date(Date.now() - 21 * 60_000).toISOString();
     const runs = [
       makeRun({
@@ -407,21 +407,21 @@ describe('Scenario 6: computeCostBurnRate', () => {
 });
 
 // ===========================================================================
-// Scenario 7: Kill action drives the /cancel endpoint — integration assertion.
+// Scenario 7: Kill action drives the /cancel endpoint -- integration assertion.
 //
 // FLAG-3: packages/web has no @testing-library/react, so we cannot mount
 // components and click buttons. Instead we exercise the API layer directly:
 // mock globalThis.fetch to capture the network call, invoke cancelWorkflowRun,
 // and assert it POSTs to the /cancel endpoint with the correct runId. This is
-// the same call path the Kill button takes (cancelMutation.mutate(runId) →
-// cancelWorkflowRun(runId) → fetch(POST /api/workflows/runs/:id/cancel)).
+// the same call path the Kill button takes (cancelMutation.mutate(runId) ->
+// cancelWorkflowRun(runId) -> fetch(POST /api/workflows/runs/:id/cancel)).
 // ===========================================================================
 describe('Scenario 7: kill action POSTs to /cancel endpoint with the runId', () => {
   it('cancelWorkflowRun POSTs to /api/workflows/runs/:runId/cancel', async () => {
     // Capture fetch requests without actually hitting the network.
     const captured: { url: string; method: string }[] = [];
     const savedFetch = globalThis.fetch;
-    globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
       captured.push({
         url: typeof input === 'string' ? input : input.toString(),
         method: init?.method ?? 'GET',
@@ -430,7 +430,7 @@ describe('Scenario 7: kill action POSTs to /cancel endpoint with the runId', () 
         status: 200,
         headers: { 'Content-Type': 'application/json' },
       });
-    };
+    }) as typeof fetch;
 
     try {
       const result = await cancelWorkflowRun('run-abc-123');
@@ -449,10 +449,10 @@ describe('Scenario 7: kill action POSTs to /cancel endpoint with the runId', () 
   });
 
   it('resumeWorkflowRun POSTs to /api/workflows/runs/:runId/resume (replay path)', async () => {
-    // ReplayNode calls resumeWorkflowRun(runId) — same fetch-capture pattern.
+    // ReplayNode calls resumeWorkflowRun(runId) -- same fetch-capture pattern.
     const captured: { url: string; method: string }[] = [];
     const savedFetch = globalThis.fetch;
-    globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
       captured.push({
         url: typeof input === 'string' ? input : input.toString(),
         method: init?.method ?? 'GET',
@@ -461,7 +461,7 @@ describe('Scenario 7: kill action POSTs to /cancel endpoint with the runId', () 
         JSON.stringify({ id: 'run-abc-123', workflow_name: 'test', status: 'running' }),
         { status: 200, headers: { 'Content-Type': 'application/json' } }
       );
-    };
+    }) as typeof fetch;
 
     try {
       await resumeWorkflowRun('run-abc-123');
@@ -478,7 +478,7 @@ describe('Scenario 7: kill action POSTs to /cancel endpoint with the runId', () 
 });
 
 // ===========================================================================
-// Scenario 8: No regression — loop visualization utilities still export and
+// Scenario 8: No regression -- loop visualization utilities still export and
 // still work on the canonical ladder fixture.
 // ===========================================================================
 describe('Scenario 8: no regression on loop-viz utilities', () => {

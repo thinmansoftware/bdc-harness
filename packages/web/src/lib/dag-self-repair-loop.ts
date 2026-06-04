@@ -4,19 +4,19 @@
  * Pure read-render: composes the existing workflow_events stream + the YAML
  * topology into three derived artifacts that the run-detail graph uses:
  *
- *   1. LoopArc[] — back-edges that the YAML's `depends_on` chain does not
+ *   1. LoopArc[] -- back-edges that the YAML's `depends_on` chain does not
  *      express (review->repair revisit, gate->resume, internal `loop:`
  *      iterations). Rendered as dashed overlay edges by WorkflowDagViewer;
  *      dagre is NOT re-run on these so it cannot crash on a cycle.
- *   2. CycleState — the small aggregate the CycleBanner needs: which
+ *   2. CycleState -- the small aggregate the CycleBanner needs: which
  *      ladder rung is active, how many cycles deep the lane has gone,
  *      whether it is paused waiting for a human, whether it resolved.
- *   3. Approval-context recovery — pulls the latest unresolved
+ *   3. Approval-context recovery -- pulls the latest unresolved
  *      approval_requested event's data so the REST hydrate (which does
  *      not see SSE) can still surface the gate message and node id to
  *      the inline Approve/Reject affordance.
  *
- * No new instrumentation, no schema change, no backend mutation — every
+ * No new instrumentation, no schema change, no backend mutation -- every
  * input here is read-only data already in remote_agent_workflow_events
  * or the workflow YAML.
  */
@@ -170,11 +170,11 @@ function findUpstreamMatching(
 }
 
 /**
- * deriveLoopArcs — Gap A in the WO spec.
+ * deriveLoopArcs -- Gap A in the WO spec.
  *
  * Returns the back-edges the depends_on topology does not express. Empty
  * array for non-looped runs (no false positives). The arcs are visual
- * overlays only — they are NOT fed to dagre (see WorkflowDagViewer).
+ * overlays only -- they are NOT fed to dagre (see WorkflowDagViewer).
  */
 export function deriveLoopArcs(
   yamlNodes: readonly DagNode[],
@@ -248,7 +248,7 @@ export function deriveLoopArcs(
 }
 
 /**
- * deriveCycleState — Gap B in the WO spec.
+ * deriveCycleState -- Gap B in the WO spec.
  *
  * Aggregates the cycle banner inputs from the event stream. Pure function of
  * events + run.status + yamlNodes; safe to call on every poll tick.
@@ -321,7 +321,7 @@ export function deriveCycleState(
   let pausedNodeId: string | null = null;
   let approvalMessage: string | undefined;
   // Approval-gate pause requires BOTH run.status === 'paused' AND an
-  // unresolved approval_requested. The status alone is insufficient — an
+  // unresolved approval_requested. The status alone is insufficient -- an
   // operator-triggered run_paused also sets run.status to 'paused' but does
   // not have an approval_requested event.
   if (runStatus === 'paused' && activeApprovals.size > 0) {
@@ -393,7 +393,7 @@ export function deriveCycleState(
  * Extract the unresolved approval context (node id + message) from events.
  *
  * The REST hydrate in WorkflowExecution does NOT populate
- * WorkflowState.approval — that field is set only on the SSE path
+ * WorkflowState.approval -- that field is set only on the SSE path
  * (workflow-store.ts:196-209). On a page refresh of a paused run the SSE
  * stream may not have replayed, so we recover the context from the events
  * table here so the inline Approve/Reject affordance still has something to
@@ -401,7 +401,7 @@ export function deriveCycleState(
  *
  * The presence of an unresolved approval_requested event is itself the
  * discriminator for an approval-gate pause vs an operator pause (operator
- * pauses never emit approval_requested) — so this helper does NOT need the
+ * pauses never emit approval_requested) -- so this helper does NOT need the
  * workflow definition.
  */
 export function extractApprovalContext(

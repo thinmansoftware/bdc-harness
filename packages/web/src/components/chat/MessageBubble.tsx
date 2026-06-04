@@ -143,7 +143,7 @@ function MessageBubbleRaw({ message }: MessageBubbleProps): React.ReactElement {
   const [artifactViewer, setArtifactViewer] = useState<{ runId: string; filename: string } | null>(
     null
   );
-  // setArtifactViewer is a stable React state setter — empty dep array is intentional
+  // setArtifactViewer is a stable React state setter -- empty dep array is intentional
   const markdownComponents = useMemo(
     () =>
       makeMarkdownComponents((runId, filename) => {

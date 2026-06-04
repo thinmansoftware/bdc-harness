@@ -1,16 +1,16 @@
 /**
- * WO-MC-NEGAN-DIAGNOSTIC-GRAPH-01: FleetStrip — the fleet-wide live-run bar
+ * WO-MC-NEGAN-DIAGNOSTIC-GRAPH-01: FleetStrip -- the fleet-wide live-run bar
  * rendered above the Mission Control DAG canvas.
  *
  * Surfaces:
  *   - RunChip per LIVE run (running / pending / paused). Shows workflow name,
  *     bound codebase, elapsed time, per-run cost. Highlighted when its run
  *     id matches the current run.
- *   - CoFireBadge — RED alarm when 2+ live runs share the same codebase. The
+ *   - CoFireBadge -- RED alarm when 2+ live runs share the same codebase. The
  *     anchor wound (2026-06-02): a zombie+keeper co-fire ran for an hour
  *     before John spotted "running 2x".
- *   - CostBurnMeter — running $/min across all live runs plus session total.
- *     Anchor: "$4.83 for 21min — what happened?" with no live cost view.
+ *   - CostBurnMeter -- running $/min across all live runs plus session total.
+ *     Anchor: "$4.83 for 21min -- what happened?" with no live cost view.
  *
  * Returns null when there are zero live runs (no chrome on a quiet system).
  */
@@ -89,7 +89,7 @@ function RunChip({
       <span className="font-medium truncate max-w-[120px]">{run.workflow_name}</span>
       {run.codebase_name && (
         <>
-          <span className="text-text-tertiary">·</span>
+          <span className="text-text-tertiary">|</span>
           <span className="truncate max-w-[100px] text-text-tertiary">{run.codebase_name}</span>
         </>
       )}
@@ -130,7 +130,7 @@ function CostBurnMeter({
 }: {
   liveRuns: readonly DashboardRunResponse[];
 }): React.ReactElement | null {
-  // Re-compute on every render — cheap (linear in live run count) and Date.now()
+  // Re-compute on every render -- cheap (linear in live run count) and Date.now()
   // changes between renders. The parent useQuery refetchInterval drives the
   // re-render cadence; useMemo prevents downstream cost-color flicker when
   // liveRuns identity is stable across renders.
@@ -147,7 +147,7 @@ function CostBurnMeter({
       </span>
       {ratePerMin !== null && (
         <>
-          <span className="text-text-tertiary">·</span>
+          <span className="text-text-tertiary">|</span>
           <span className="tabular-nums text-text-secondary">{formatCostUsd(ratePerMin)}/min</span>
         </>
       )}
