@@ -19,15 +19,22 @@ source: BDC_XO/memory/project_universal-agent-behavior-policy.md
 - Tests must assert real behavior (Rule 10)
 - Builder cannot self-approve (Rule 3)
 
-## Environment Awareness (v1.1 — 2026-05-24)
+## Code Standards (Rule 13 -- ASCII-only source; v1.2 -- 2026-06-04)
 
-- **Do not hunt for tools that are not in your environment.** Cauldron builders run in a **Linux container**. Before reaching for a runtime, assume only what a Linux build image provides (bash, node, bun, python, git, gh). If a tool is absent, do NOT spend turns/tokens searching for it, installing it, or working around its absence — STOP and note the gap in your output for the operator.
-- **PowerShell (`.ps1`) is operator-side tooling and is NOT available in the builder.** Files like `consume-inbox.ps1`, `publish-wo-spec.ps1`, `fire-wo.ps1`, `Test-CauldronYaml.ps1`, `register-yaml.ps1` run on the operator's Windows machine to DRIVE Cauldron from outside — they are never executed inside a build. If your WO has you AUTHOR a `.ps1`, write it and rely on **static review + operator-side testing** (per the WO's stop conditions); do NOT attempt to run it, do NOT look for `pwsh`/`powershell`, and do NOT treat its absence as a blocker. Note "PS deliverable authored; operator-side test required" and continue.
+- **ASCII ONLY in all source/code files.** Every `.js .jsx .ts .tsx .mjs .cjs .html .sh .bash .gs .yaml .yml` file you write or edit MUST contain only ASCII bytes (0x00-0x7F). NO emojis and NO non-ASCII punctuation: em-dash, en-dash, smart quotes, ellipsis, middot, non-breaking space, Unicode minus.
+- **Use the ASCII equivalents.** em-dash / en-dash -> `--`, smart quotes -> `'` and `"`, ellipsis -> `...`, middot -> `|` or `-`, non-breaking space -> regular space, Unicode minus -> `-`.
+- **Why:** non-ASCII bytes break Windows PowerShell 5.1 parsing and silently corrupt tooling on the operator side. Claude/Opus habitually emits em-dashes and smart quotes even when told not to, so this is enforced MECHANICALLY by the `ascii-gate` node in the build workflows: it is `load_bearing` and FAILS the build (exit 1) if any changed source file contains a non-ASCII byte. The prose rule here is what that gate enforces -- keep them in sync.
+- **Scope:** Markdown and other prose files are not gate-enforced, but prefer ASCII there too for consistency.
+
+## Environment Awareness (v1.1 -- 2026-05-24)
+
+- **Do not hunt for tools that are not in your environment.** Cauldron builders run in a **Linux container**. Before reaching for a runtime, assume only what a Linux build image provides (bash, node, bun, python, git, gh). If a tool is absent, do NOT spend turns/tokens searching for it, installing it, or working around its absence -- STOP and note the gap in your output for the operator.
+- **PowerShell (`.ps1`) is operator-side tooling and is NOT available in the builder.** Files like `consume-inbox.ps1`, `publish-wo-spec.ps1`, `fire-wo.ps1`, `Test-CauldronYaml.ps1`, `register-yaml.ps1` run on the operator's Windows machine to DRIVE Cauldron from outside -- they are never executed inside a build. If your WO has you AUTHOR a `.ps1`, write it and rely on **static review + operator-side testing** (per the WO's stop conditions); do NOT attempt to run it, do NOT look for `pwsh`/`powershell`, and do NOT treat its absence as a blocker. Note "PS deliverable authored; operator-side test required" and continue.
 - **General rule:** a missing tool that the WO never asked you to execute is not a failure. Adapt (static-check instead of run) and proceed; surface the limitation rather than burning the build chasing it.
 
 ## Canonical Placement
 
-`BDC_XO/harness/policies/agent-behavior.md` — single source of truth. Every runtime vendors/symlinks/adapts it:
+`BDC_XO/harness/policies/agent-behavior.md` -- single source of truth. Every runtime vendors/symlinks/adapts it:
 
 | Runtime | Inclusion path |
 |---------|----------------|
