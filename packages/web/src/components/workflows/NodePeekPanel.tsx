@@ -1,13 +1,13 @@
 /**
- * NodePeekPanel — side-panel drawer that surfaces per-node activity for a
+ * NodePeekPanel -- side-panel drawer that surfaces per-node activity for a
  * workflow run. Eliminates the need to SSH and tail the JSONL log to know
  * whether a node is making progress or stuck.
  *
  * Sources of data:
  *  - Prompt / command / shell script come from the workflow definition
- *    (workflowDef.workflow.nodes) — the events table does not persist prompts.
+ *    (workflowDef.workflow.nodes) -- the events table does not persist prompts.
  *  - Output comes from the most recent node_completed event in the events list
- *    — partial / streaming output is SSE-only and never persisted.
+ *    -- partial / streaming output is SSE-only and never persisted.
  *  - Event list comes from GET /api/workflows/runs/:runId/nodes/:nodeId/events
  *    (last 5 events, newest first). Re-fetches every 5s while the run is live.
  */
@@ -37,7 +37,7 @@ interface NodePeekPanelProps {
   onClose: () => void;
   /** WO-MC-SELF-REPAIR-LOOP-VIZ-01 (Gap C): run-level status. Used together
    *  with `approval` to decide whether to render the inline Approve/Reject
-   *  affordance — ONLY when run is paused on the selected approval gate. */
+   *  affordance -- ONLY when run is paused on the selected approval gate. */
   runStatus?: WorkflowRunStatus;
   /** Unresolved approval context (node id + message) recovered from events
    *  by extractApprovalContext, or set by SSE. The buttons render only when
@@ -46,11 +46,11 @@ interface NodePeekPanelProps {
   /** WO-MC-NEGAN-DIAGNOSTIC-GRAPH-01: workflow name, used by
    *  RunHistorySparkline to look up recent runs of the same workflow. */
   workflowName?: string;
-  /** WO-MC-NEGAN-DIAGNOSTIC-GRAPH-01: from run.metadata.approval — declared
+  /** WO-MC-NEGAN-DIAGNOSTIC-GRAPH-01: from run.metadata.approval -- declared
    *  on_reject prompt; absence means reject halts immediately. Surfaced via
    *  LucilleHint. */
   onRejectPrompt?: string;
-  /** WO-MC-NEGAN-DIAGNOSTIC-GRAPH-01: from run.metadata.approval — bounded
+  /** WO-MC-NEGAN-DIAGNOSTIC-GRAPH-01: from run.metadata.approval -- bounded
    *  re-draft count for the on_reject loop. Surfaced via LucilleHint. */
   onRejectMaxAttempts?: number;
 }
@@ -107,7 +107,7 @@ export function NodePeekPanel({
   const queryClient = useQueryClient();
   const [gateBusy, setGateBusy] = useState<null | 'approving' | 'rejecting'>(null);
   const [gateError, setGateError] = useState<string | null>(null);
-  // WO-MC-NEGAN-DIAGNOSTIC-GRAPH-01: Kill — the real /cancel control distinct
+  // WO-MC-NEGAN-DIAGNOSTIC-GRAPH-01: Kill -- the real /cancel control distinct
   // from Reject. Reject auto-resumes into on_reject when defined; Kill always
   // takes the run to status=cancelled.
   const cancelMutation = useMutation({
@@ -166,7 +166,7 @@ export function NodePeekPanel({
   };
 
   // Live poll while the workflow run as a whole is still running.
-  // Stops polling for terminal runs — react-query refetches still happen on focus.
+  // Stops polling for terminal runs -- react-query refetches still happen on focus.
   const { data: events, isLoading } = useQuery({
     queryKey: ['nodeEvents', runId, nodeId],
     queryFn: () => getNodeEvents(runId, nodeId, 5),
@@ -185,7 +185,7 @@ export function NodePeekPanel({
 
   // WO-MC-NEGAN-DIAGNOSTIC-GRAPH-01: extract the first node_failed event's
   // error so the panel can show the classified FailureReason (matches the
-  // failed node face). Newest-first order — take the most recent failure.
+  // failed node face). Newest-first order -- take the most recent failure.
   const failedEventError = useMemo((): string | undefined => {
     for (const ev of eventList) {
       if (ev.event_type !== 'node_failed') continue;
@@ -244,7 +244,7 @@ export function NodePeekPanel({
                 {approval.message}
               </p>
             )}
-            {/* WO-MC-NEGAN-DIAGNOSTIC-GRAPH-01: LucilleHint — state the
+            {/* WO-MC-NEGAN-DIAGNOSTIC-GRAPH-01: LucilleHint -- state the
                 consequence of each choice before the operator clicks.
                 Reject loops the workflow into its on_reject chain;
                 Kill (/cancel) is the actual stop. */}
@@ -280,7 +280,7 @@ export function NodePeekPanel({
                 <XCircle className="h-3.5 w-3.5" />
                 {gateBusy === 'rejecting' ? 'Rejecting...' : 'Reject'}
               </button>
-              {/* WO-MC-NEGAN-DIAGNOSTIC-GRAPH-01: KillButton — distinct from
+              {/* WO-MC-NEGAN-DIAGNOSTIC-GRAPH-01: KillButton -- distinct from
                   Reject. Direct /cancel; bypasses the on_reject loop. */}
               <button
                 type="button"
@@ -298,7 +298,7 @@ export function NodePeekPanel({
             {gateError !== null && <p className="mt-1 text-[10px] text-error">{gateError}</p>}
           </section>
         )}
-        {/* WO-MC-NEGAN-DIAGNOSTIC-GRAPH-01: FailureReason — classified failure
+        {/* WO-MC-NEGAN-DIAGNOSTIC-GRAPH-01: FailureReason -- classified failure
             class on the panel for failed nodes; the raw error follows in the
             block below. Anchor: codex 400 was a bare red box in v0. */}
         {nodeStatus === 'failed' && failureClass !== undefined && (
@@ -355,13 +355,14 @@ export function NodePeekPanel({
           )}
         </section>
 
-        {/* WO-MC-NEGAN-DIAGNOSTIC-GRAPH-01: ReplayNode — "Resume from failed"
-            on a failed run. v1 calls /api/workflows/runs/:runId/resume which
-            re-runs from failed nodes, skipping completed ones. Alt-model
+        {/* WO-MC-NEGAN-DIAGNOSTIC-GRAPH-01: ReplayNode -- "Resume from failed"
+            on a failed run. v1 calls /api/workflows/runs/:runId/resume, which
+            marks the failed run ready to resume; the next invocation on the
+            same path auto-resumes from completed nodes (skipping them). Alt-model
             replay is fast-follow (requires a server-side model override). */}
         {runStatus === 'failed' && <ReplayNode runId={runId} />}
 
-        {/* WO-MC-NEGAN-DIAGNOSTIC-GRAPH-01: RunHistorySparkline — recent
+        {/* WO-MC-NEGAN-DIAGNOSTIC-GRAPH-01: RunHistorySparkline -- recent
             outcomes for THIS workflow (not this node). Anchor: "fired 5x,
             died HERE 5x" trend signal. Returns null when fewer than 2 runs. */}
         {workflowName && <RunHistorySparkline workflowName={workflowName} />}
