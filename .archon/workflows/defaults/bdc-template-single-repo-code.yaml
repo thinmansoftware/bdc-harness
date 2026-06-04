@@ -112,8 +112,72 @@ nodes:
 
         Output COMPLETE on its own line when done.
 
-  - id: verify-tsc
+  # ascii-gate (Rule 13 mechanical enforcement -- WO-HARNESS-CAULDRON-ASCII-ENFORCEMENT).
+  # Fails the build (load_bearing, exit 1) if any source file changed by this run contains
+  # a non-ASCII byte. The ASCII-only-source rule is carried in the policyFile every node
+  # loads, but Claude/Opus leaks non-ASCII even when told not to, so enforce it mechanically
+  # AFTER implement and BEFORE commit/PR. Scope = source files changed since the branch base.
+  - id: ascii-gate
     depends_on: [implement]
+    load_bearing: true
+    bash: |
+      set -uo pipefail
+      WT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
+      cd "$WT"
+      BASE_REF="origin/${BASE_BRANCH:-main}"
+      BASE=$(git merge-base HEAD "$BASE_REF" 2>/dev/null || git rev-parse HEAD~1 2>/dev/null || echo "")
+      SRC_RE='\.(js|jsx|ts|tsx|mjs|cjs|html|sh|bash|gs|yaml|yml)$'
+      if [ -n "$BASE" ] && git rev-parse --verify "$BASE" >/dev/null 2>&1; then
+        CHANGED=$( { git diff --name-only "$BASE"..HEAD 2>/dev/null; git diff --name-only HEAD 2>/dev/null; git ls-files --others --exclude-standard 2>/dev/null; } | sort -u | grep -E "$SRC_RE" || true )
+      else
+        CHANGED=$( { git diff --name-only HEAD 2>/dev/null; git ls-files --others --exclude-standard 2>/dev/null; } | sort -u | grep -E "$SRC_RE" || true )
+      fi
+      if [ -z "$CHANGED" ]; then
+        echo "ascii-gate PASS (no changed source files to scan)"
+        exit 0
+      fi
+      GREP_P_OK=0
+      if printf 'a\xe2\x80\x94b\n' | grep -qP "[^\x00-\x7F]" 2>/dev/null; then GREP_P_OK=1; fi
+      detect() {
+        f="$1"
+        if [ "$GREP_P_OK" = "1" ]; then
+          grep -lP "[^\x00-\x7F]" "$f" >/dev/null 2>&1 && return 1
+        elif command -v perl >/dev/null 2>&1; then
+          perl -ne 'exit 1 if /[^\x00-\x7F]/' "$f" || return 1
+        else
+          LC_ALL=C grep -lP "[^\x00-\x7F]" "$f" >/dev/null 2>&1 && return 1
+        fi
+        return 0
+      }
+      HITFILE=$(mktemp)
+      printf '%s\n' "$CHANGED" | while IFS= read -r f; do
+        [ -z "$f" ] && continue
+        [ -f "$f" ] || continue
+        if ! detect "$f"; then printf '%s\n' "$f" >> "$HITFILE"; fi
+      done
+      if [ -s "$HITFILE" ]; then
+        echo "ASCII GATE FAILED -- non-ASCII bytes in changed source file(s):" >&2
+        cat "$HITFILE" >&2
+        echo "--- offending lines (first 5 per file) ---" >&2
+        while IFS= read -r f; do
+          [ -z "$f" ] && continue
+          if [ "$GREP_P_OK" = "1" ]; then
+            grep -nP "[^\x00-\x7F]" "$f" 2>/dev/null | head -5 | sed "s|^|${f}:|" >&2
+          elif command -v perl >/dev/null 2>&1; then
+            perl -ne 'print "'"$f"':$.: $_" if /[^\x00-\x7F]/' "$f" 2>/dev/null | head -5 >&2
+          fi
+        done < "$HITFILE"
+        echo "Fix: em-dash/en-dash -> --, smart quotes -> ' and \", ellipsis -> ..., middot -> | or -, nbsp -> space, Unicode minus -> -. No emojis in source." >&2
+        echo "See harness/policies/agent-behavior.md (Code Standards / Rule 13). This gate is load_bearing: the build fails until every changed source file is pure ASCII." >&2
+        rm -f "$HITFILE"
+        exit 1
+      fi
+      rm -f "$HITFILE"
+      echo "ascii-gate PASS (scanned $(printf '%s\n' "$CHANGED" | grep -c .) changed source file(s), all ASCII)"
+      exit 0
+
+  - id: verify-tsc
+    depends_on: [ascii-gate]
     bash: |
       set -euo pipefail
       bunx tsc --noEmit
