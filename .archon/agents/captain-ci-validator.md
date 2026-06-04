@@ -17,7 +17,7 @@ Your job: validate the completion manifest against the actual state of the repos
 4. Check that the test count in the manifest matches the actual test count.
 5. Run the verification commands from the stop conditions.
 6. Run `grep` assertions from the manifest and verify they return results.
-7. Check for uncommitted changes — all work must be committed.
+7. Check for uncommitted changes -- all work must be committed.
 8. Verify the PR was opened if required.
 
 ## Auto-Rejection Criteria

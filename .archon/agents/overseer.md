@@ -16,13 +16,13 @@ I am invoked when either of the following is true:
 - A Cauldron run status flips to `failed` AND the `node_failed` event's `error` field matches one of my known failure class regexes below.
 - An operator manually invokes me with a failed run ID (paste this file into Claude with the run ID and error output).
 
-I do NOT activate on genuine no-work outcomes (zero commits found anywhere — see Escalation Criteria).
+I do NOT activate on genuine no-work outcomes (zero commits found anywhere -- see Escalation Criteria).
 
 ## Failure Classes
 
 Each class has an exact error string regex and the root cause. Match against the full `error` or `stderr` field from the failed `commit-and-push` node.
 
-### Class A — No-changed-files after force-checkout
+### Class A -- No-changed-files after force-checkout
 
 **Regex:**
 ```
@@ -33,7 +33,7 @@ Switched to a new branch '.*'\nNo changed files AND remote branch missing/behind
 
 **Frequency (2026-05-17 sortie):** 5 of 8 failures.
 
-### Class B — Branch already used by worktree
+### Class B -- Branch already used by worktree
 
 **Regex:**
 ```
@@ -44,7 +44,7 @@ fatal: '<[^']+>' is already used by worktree at '/.archon/workspaces/
 
 **Frequency (2026-05-17 sortie):** 2 of 8 failures.
 
-### Class C — Decide-push-target empty output
+### Class C -- Decide-push-target empty output
 
 **Regex:**
 ```
@@ -55,9 +55,9 @@ No feature branch target found in decide-push-target output
 
 **Frequency (2026-05-17 sortie):** 1 of 8 failures.
 
-### Class D — Source-worktree commit variant
+### Class D -- Source-worktree commit variant
 
-**Regex:** (no dedicated error string — presents as Class A or Class B above)
+**Regex:** (no dedicated error string -- presents as Class A or Class B above)
 
 **Root cause:** Agent crossed from `worktrees/archon/thread-*/` into `/.archon/workspaces/<repo>/source/` and committed there. The `source/` worktree is shared across concurrent runs and is NOT what `decide-push-target` inspects. Commits appear in `source/` git log but not in the thread worktree.
 
@@ -68,10 +68,10 @@ No feature branch target found in decide-push-target output
 ## Salvage Playbook
 
 Run these commands inside the `archon-app-1` container unless stated otherwise. Replace placeholders:
-- `<repo>` — e.g., `shopops`, `shopops-storefront`
-- `<thread-id>` — e.g., `thread-5ba45348`
-- `<branch-name>` — the feature branch the WO targeted (check commit message or WO spec)
-- `<owner>` — `bluedevilcollectibles`
+- `<repo>` -- e.g., `shopops`, `shopops-storefront`
+- `<thread-id>` -- e.g., `thread-5ba45348`
+- `<branch-name>` -- the feature branch the WO targeted (check commit message or WO spec)
+- `<owner>` -- `bluedevilcollectibles`
 
 ### Class A Salvage
 
@@ -88,10 +88,10 @@ git log --oneline -5
 # 4. Push the branch directly (HEAD contains the actual work)
 git push origin HEAD:refs/heads/<branch-name>
 
-# 5. Open a PR against master (or main — check repo default)
+# 5. Open a PR against master (or main -- check repo default)
 gh pr create --repo <owner>/<repo> --head <branch-name> --base master \
   --title "<WO-ID> (salvaged from backstop false-negative)" \
-  --body "Backstop false-negative recovery. Real work shipped — see commits. Original Cauldron run failed at commit-and-push despite commits existing in worktree."
+  --body "Backstop false-negative recovery. Real work shipped -- see commits. Original Cauldron run failed at commit-and-push despite commits existing in worktree."
 ```
 
 ### Class B Salvage
@@ -111,7 +111,7 @@ git push origin HEAD:refs/heads/<branch-name>-salvage
 
 # 4. Open PR from the -salvage branch
 gh pr create --repo <owner>/<repo> --head <branch-name>-salvage --base master \
-  --title "<WO-ID> (salvaged — branch collision, pushed from source/)" \
+  --title "<WO-ID> (salvaged -- branch collision, pushed from source/)" \
   --body "Backstop false-negative recovery. Commits were in source/ worktree due to agent cross-worktree drift. Pushed via -salvage suffix branch."
 ```
 
@@ -132,7 +132,7 @@ git push origin HEAD:refs/heads/<branch-name>
 
 # 3. Open PR
 gh pr create --repo <owner>/<repo> --head <branch-name> --base master \
-  --title "<WO-ID> (salvaged — commits in sibling worktree)" \
+  --title "<WO-ID> (salvaged -- commits in sibling worktree)" \
   --body "Backstop false-negative recovery. Commits were in a sibling thread worktree, not the run's own worktree. decide-push-target saw empty output."
 ```
 
@@ -144,13 +144,13 @@ Same as Class B: enter `source/`, verify commits, push with `-salvage` suffix, o
 
 Stop salvaging and notify the operator (post to builder monitor with `action: "escalate_operator"`) when any of the following is true:
 
-1. **Zero commits found anywhere** — after scanning the thread worktree, `source/`, and all sibling thread worktrees for the repo, no unpushed commits matching the WO ID are found. This is a genuine no-work outcome.
+1. **Zero commits found anywhere** -- after scanning the thread worktree, `source/`, and all sibling thread worktrees for the repo, no unpushed commits matching the WO ID are found. This is a genuine no-work outcome.
 
-2. **Push fails with a non-collision error** — e.g., GitHub auth failure, network timeout, remote rejected for reasons other than "branch in use." Do not retry more than once.
+2. **Push fails with a non-collision error** -- e.g., GitHub auth failure, network timeout, remote rejected for reasons other than "branch in use." Do not retry more than once.
 
-3. **PR creation fails for a non-trivial reason** — e.g., merge conflict (base diverged), missing base branch, GitHub API error. Surface the error verbatim.
+3. **PR creation fails for a non-trivial reason** -- e.g., merge conflict (base diverged), missing base branch, GitHub API error. Surface the error verbatim.
 
-4. **Same failure class repeats 3+ times in a single sortie** — this indicates an engine bug, not a transient failure. Escalate with the list of affected run IDs and error strings.
+4. **Same failure class repeats 3+ times in a single sortie** -- this indicates an engine bug, not a transient failure. Escalate with the list of affected run IDs and error strings.
 
 ## Verification
 
