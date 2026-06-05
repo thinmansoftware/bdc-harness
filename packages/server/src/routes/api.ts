@@ -1109,6 +1109,57 @@ const getHealthRoute = createRoute({
   },
 });
 
+// Per-resource metric shapes. The collector (separate WO
+// WO-INFRA-HOST-METRICS-COLLECTOR-01 in bdc-xo) writes this JSON file.
+// Numeric fields are null when the collector cannot read that resource
+// (e.g. cpu sample failed but disk + mem succeeded); the whole field is
+// null when the resource section is missing from the file entirely.
+const diskMetricSchema = z
+  .object({
+    used_gb: z.number(),
+    total_gb: z.number(),
+    pct: z.number(),
+  })
+  .nullable();
+const cpuMetricSchema = z
+  .object({
+    pct: z.number(),
+  })
+  .nullable();
+const memMetricSchema = z
+  .object({
+    used_gb: z.number(),
+    total_gb: z.number(),
+    pct: z.number(),
+  })
+  .nullable();
+
+const getHostMetricsRoute = createRoute({
+  method: 'get',
+  path: '/api/host-metrics',
+  tags: ['System'],
+  summary: 'Host disk/cpu/mem snapshot written by the host collector',
+  responses: {
+    200: {
+      content: {
+        'application/json': {
+          schema: z
+            .object({
+              status: z.enum(['ok', 'stale', 'no-data']),
+              disk: diskMetricSchema,
+              cpu: cpuMetricSchema,
+              mem: memMetricSchema,
+              collectedAt: z.string().nullable(),
+              stale: z.boolean(),
+            })
+            .openapi('HostMetricsResponse'),
+        },
+      },
+      description: 'Host metrics snapshot, stale flag, or no-data placeholder',
+    },
+  },
+});
+
 const getUpdateCheckRoute = createRoute({
   method: 'get',
   path: '/api/update-check',
@@ -1209,6 +1260,43 @@ export function registerApiRoutes(
   function publicTimestamp(value: Date | string | null): string | null {
     if (value === null) return null;
     return value instanceof Date ? value.toISOString() : value;
+  }
+
+  /**
+   * Convert a duration shortcut (e.g. "14d", "7d", "12h", "30m") OR an ISO
+   * timestamp into an ISO cutoff string suitable for direct binding into
+   * `started_at < $1`. Returns null when the input is neither a recognized
+   * shortcut nor a parseable ISO timestamp (the caller should surface 400).
+   *
+   * Why this lives in the API handler layer (Option A from the parent WO):
+   * bulkDeleteArchivedFailedRuns binds the cutoff directly into Postgres with
+   * no parsing of its own. Without this guard a caller passing "14d" would
+   * cause a Postgres cast error. Keeping it in the API layer lets callers stay
+   * human-readable without touching the DB function.
+   */
+  function parseDurationToIso(value: string): string | null {
+    const trimmed = value.trim();
+    if (!trimmed) return null;
+    // ISO timestamp passthrough: anything Date.parse can read AND that does
+    // NOT match the duration-shortcut shape we know about.
+    const shortcutMatch = /^(\d+)([smhd])$/i.exec(trimmed);
+    if (shortcutMatch?.[1] && shortcutMatch[2]) {
+      const amount = Number(shortcutMatch[1]);
+      const unit = shortcutMatch[2].toLowerCase();
+      if (!Number.isFinite(amount) || amount < 0) return null;
+      const unitMs: Record<string, number> = {
+        s: 1000,
+        m: 60 * 1000,
+        h: 60 * 60 * 1000,
+        d: 24 * 60 * 60 * 1000,
+      };
+      const ms = unitMs[unit];
+      if (ms === undefined) return null;
+      return new Date(Date.now() - amount * ms).toISOString();
+    }
+    const ts = Date.parse(trimmed);
+    if (Number.isNaN(ts)) return null;
+    return new Date(ts).toISOString();
   }
 
   type PublicWorkflowNodeStatus = 'pending' | 'running' | 'completed' | 'failed' | 'skipped';
@@ -2882,7 +2970,25 @@ export function registerApiRoutes(
   registerOpenApiRoute(bulkDeleteFailedRunsRoute, async c => {
     try {
       const dryRun = c.req.query('dryRun') === 'true';
-      const olderThan = c.req.query('olderThan') ?? undefined;
+      const olderThanRaw = c.req.query('olderThan') ?? undefined;
+      // bulkDeleteArchivedFailedRuns binds the cutoff directly into
+      // started_at < $1 with no duration parsing. Human-readable shortcuts
+      // (e.g. "14d", "30d", "1h") are accepted here and converted to an ISO
+      // cutoff before being forwarded to the DB layer. ISO timestamps pass
+      // through unchanged. Invalid values fail with a 400 instead of crashing
+      // Postgres on a bad cast.
+      let olderThan: string | undefined;
+      if (olderThanRaw !== undefined) {
+        const iso = parseDurationToIso(olderThanRaw);
+        if (iso === null) {
+          return apiError(
+            c,
+            400,
+            `Invalid olderThan value: '${olderThanRaw}'. Use ISO timestamp (e.g. 2026-01-01T00:00:00Z) or duration shortcut (e.g. 14d, 7d, 1h).`
+          );
+        }
+        olderThan = iso;
+      }
       const result = await workflowDb.bulkDeleteArchivedFailedRuns({ dryRun, olderThan });
       return c.json({ ...result, dryRun });
     } catch (error) {
@@ -3553,6 +3659,62 @@ export function registerApiRoutes(
       is_docker: isDocker(),
       activePlatforms: activePlatforms ? [...activePlatforms] : ['Web'],
     });
+  });
+
+  // GET /api/host-metrics - Read /host-artifacts/host-metrics.json written by
+  // the host-side collector (separate WO in bdc-xo). Returns the parsed JSON
+  // plus a stale flag if collectedAt is older than 10 minutes. Returns a
+  // documented 'no-data' shape (NOT a 500) when the file is absent so the
+  // dashboard can render "awaiting collector" cleanly before the collector
+  // is deployed.
+  registerOpenApiRoute(getHostMetricsRoute, async c => {
+    const noData = {
+      status: 'no-data' as const,
+      disk: null,
+      cpu: null,
+      mem: null,
+      collectedAt: null,
+      stale: false,
+    };
+    try {
+      const raw = await readFile('/host-artifacts/host-metrics.json', 'utf8');
+      const parsed = JSON.parse(raw) as {
+        disk?: { used_gb: number; total_gb: number; pct: number } | null;
+        cpu?: { pct: number } | null;
+        mem?: { used_gb: number; total_gb: number; pct: number } | null;
+        collectedAt?: string | null;
+      };
+      const collectedAt = parsed.collectedAt ?? null;
+      // Stale = collectedAt older than 10 minutes. If collectedAt is missing
+      // or unparseable we treat the data as stale (we can still show the
+      // last values, but flag them).
+      let stale = true;
+      if (collectedAt) {
+        const ts = Date.parse(collectedAt);
+        if (!Number.isNaN(ts)) {
+          stale = Date.now() - ts > 10 * 60 * 1000;
+        }
+      }
+      return c.json({
+        status: stale ? ('stale' as const) : ('ok' as const),
+        disk: parsed.disk ?? null,
+        cpu: parsed.cpu ?? null,
+        mem: parsed.mem ?? null,
+        collectedAt,
+        stale,
+      });
+    } catch (error) {
+      const err = error as NodeJS.ErrnoException;
+      if (err.code === 'ENOENT') {
+        // Collector has not yet written the file. Surface a clear placeholder
+        // shape to the panel, not a 500.
+        return c.json(noData);
+      }
+      getLog().error({ err: error }, 'api.host_metrics_read_failed');
+      // Unexpected error (bad JSON, permissions, etc.) -- still return the
+      // no-data shape so the panel does not crash; the failure is logged.
+      return c.json(noData);
+    }
   });
 
   registerOpenApiRoute(getUpdateCheckRoute, async c => {
