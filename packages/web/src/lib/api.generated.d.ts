@@ -1701,6 +1701,15 @@ export interface paths {
             'application/json': components['schemas']['BulkDeleteFailedResponse'];
           };
         };
+        /** @description Invalid olderThan duration or timestamp */
+        400: {
+          headers: {
+            [name: string]: unknown;
+          };
+          content: {
+            'application/json': components['schemas']['Error'];
+          };
+        };
         /** @description Server error */
         500: {
           headers: {
@@ -3288,17 +3297,17 @@ export interface components {
       /** @enum {string} */
       status: 'ok' | 'stale' | 'no-data';
       disk: {
-        used_gb: number;
-        total_gb: number;
-        pct: number;
+        used_gb: number | null;
+        total_gb: number | null;
+        pct: number | null;
       } | null;
       cpu: {
-        pct: number;
+        pct: number | null;
       } | null;
       mem: {
-        used_gb: number;
-        total_gb: number;
-        pct: number;
+        used_gb: number | null;
+        total_gb: number | null;
+        pct: number | null;
       } | null;
       collectedAt: string | null;
       stale: boolean;

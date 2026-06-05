@@ -1006,6 +1006,7 @@ const bulkDeleteFailedRunsRoute = createRoute({
       content: { 'application/json': { schema: bulkDeleteFailedResponseSchema } },
       description: 'Bulk deleted (or dry run preview)',
     },
+    400: jsonError('Invalid olderThan duration or timestamp'),
     500: jsonError('Server error'),
   },
 });
@@ -1111,28 +1112,45 @@ const getHealthRoute = createRoute({
 
 // Per-resource metric shapes. The collector (separate WO
 // WO-INFRA-HOST-METRICS-COLLECTOR-01 in bdc-xo) writes this JSON file.
-// Numeric fields are null when the collector cannot read that resource
-// (e.g. cpu sample failed but disk + mem succeeded); the whole field is
-// null when the resource section is missing from the file entirely.
+// Per-field numeric values are nullable when the collector reads the
+// section but cannot sample a specific value (e.g. df returned but the
+// "used" column was unreadable); the whole field is null when the
+// resource section is missing from the file entirely. The schema MUST
+// express both states so the generated API contract matches what the
+// collector can actually emit -- and the handler validates parsed JSON
+// against this schema before returning it.
 const diskMetricSchema = z
   .object({
-    used_gb: z.number(),
-    total_gb: z.number(),
-    pct: z.number(),
+    used_gb: z.number().nullable(),
+    total_gb: z.number().nullable(),
+    pct: z.number().nullable(),
   })
   .nullable();
 const cpuMetricSchema = z
   .object({
-    pct: z.number(),
+    pct: z.number().nullable(),
   })
   .nullable();
 const memMetricSchema = z
   .object({
-    used_gb: z.number(),
-    total_gb: z.number(),
-    pct: z.number(),
+    used_gb: z.number().nullable(),
+    total_gb: z.number().nullable(),
+    pct: z.number().nullable(),
   })
   .nullable();
+
+// Body schema reused for handler-side validation of parsed collector JSON.
+// Kept separate from the route response wrapper so we can `.safeParse()`
+// the raw file contents and fall back to the no-data shape if the
+// collector emits something outside the contract.
+const hostMetricsBodySchema = z.object({
+  status: z.enum(['ok', 'stale', 'no-data']),
+  disk: diskMetricSchema,
+  cpu: cpuMetricSchema,
+  mem: memMetricSchema,
+  collectedAt: z.string().nullable(),
+  stale: z.boolean(),
+});
 
 const getHostMetricsRoute = createRoute({
   method: 'get',
@@ -1143,16 +1161,7 @@ const getHostMetricsRoute = createRoute({
     200: {
       content: {
         'application/json': {
-          schema: z
-            .object({
-              status: z.enum(['ok', 'stale', 'no-data']),
-              disk: diskMetricSchema,
-              cpu: cpuMetricSchema,
-              mem: memMetricSchema,
-              collectedAt: z.string().nullable(),
-              stale: z.boolean(),
-            })
-            .openapi('HostMetricsResponse'),
+          schema: hostMetricsBodySchema.openapi('HostMetricsResponse'),
         },
       },
       description: 'Host metrics snapshot, stale flag, or no-data placeholder',
@@ -3678,13 +3687,13 @@ export function registerApiRoutes(
     };
     try {
       const raw = await readFile('/host-artifacts/host-metrics.json', 'utf8');
-      const parsed = JSON.parse(raw) as {
-        disk?: { used_gb: number; total_gb: number; pct: number } | null;
-        cpu?: { pct: number } | null;
-        mem?: { used_gb: number; total_gb: number; pct: number } | null;
-        collectedAt?: string | null;
-      };
-      const collectedAt = parsed.collectedAt ?? null;
+      const parsedJson: unknown = JSON.parse(raw);
+      const parsedObj =
+        typeof parsedJson === 'object' && parsedJson !== null
+          ? (parsedJson as Record<string, unknown>)
+          : {};
+      const collectedAtRaw = parsedObj.collectedAt;
+      const collectedAt = typeof collectedAtRaw === 'string' ? collectedAtRaw : null;
       // Stale = collectedAt older than 10 minutes. If collectedAt is missing
       // or unparseable we treat the data as stale (we can still show the
       // last values, but flag them).
@@ -3695,14 +3704,24 @@ export function registerApiRoutes(
           stale = Date.now() - ts > 10 * 60 * 1000;
         }
       }
-      return c.json({
+      // Validate the parsed collector output against the response schema so
+      // malformed numeric fields (e.g. unexpected strings) cannot leak past
+      // the OpenAPI contract. On schema mismatch, log and fall back to the
+      // no-data shape rather than serving an off-contract payload.
+      const candidate = {
         status: stale ? ('stale' as const) : ('ok' as const),
-        disk: parsed.disk ?? null,
-        cpu: parsed.cpu ?? null,
-        mem: parsed.mem ?? null,
+        disk: parsedObj.disk ?? null,
+        cpu: parsedObj.cpu ?? null,
+        mem: parsedObj.mem ?? null,
         collectedAt,
         stale,
-      });
+      };
+      const validation = hostMetricsBodySchema.safeParse(candidate);
+      if (!validation.success) {
+        getLog().warn({ issues: validation.error.issues }, 'api.host_metrics_contract_violation');
+        return c.json(noData);
+      }
+      return c.json(validation.data);
     } catch (error) {
       const err = error as NodeJS.ErrnoException;
       if (err.code === 'ENOENT') {

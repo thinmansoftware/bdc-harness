@@ -8,6 +8,17 @@ import {
   makeCommandValidationMock,
 } from '../test/workflow-mock-factories';
 
+// The operator-token gate in registerApiRoutes() activates whenever
+// ARCHON_OPERATOR_TOKEN is set in the environment. Sibling test files
+// (api.workflow-runs.test.ts, api.workflows.test.ts) assume the token is
+// unset by default and only set it per-test to exercise the gate. Match
+// that contract so this file passes deterministically regardless of the
+// surrounding container environment (the Cauldron build image exports
+// ARCHON_OPERATOR_TOKEN, which would otherwise 401 every request).
+delete process.env.ARCHON_OPERATOR_TOKEN;
+delete process.env.ARCHON_OPERATOR_ACCESS_HOSTS;
+delete process.env.ARCHON_OPERATOR_EMAILS;
+
 // ---------------------------------------------------------------------------
 // Mock setup -- must be before dynamic imports
 //
@@ -277,6 +288,72 @@ describe('GET /api/host-metrics', () => {
     expect(body.collectedAt).toBe(collectedAt);
     // Last-known values still surface even when stale
     expect(body.disk?.pct).toBe(20);
+  });
+
+  test('accepts partial-null per-field numerics on documented contract', async () => {
+    // The collector documents that individual numeric fields can be null
+    // when the resource section was read but a specific value could not
+    // be sampled (e.g. df returned a row but "used" was unreadable).
+    // The schema MUST permit this so the dashboard sees the partial data
+    // instead of a no-data fallback, and the handler must NOT crash or
+    // discard the row as a contract violation.
+    const collectedAt = new Date().toISOString();
+    mockReadFile.mockImplementationOnce(async () =>
+      JSON.stringify({
+        disk: { used_gb: null, total_gb: 500, pct: null },
+        cpu: { pct: 15.5 },
+        mem: { used_gb: 8, total_gb: 32, pct: 25 },
+        collectedAt,
+      })
+    );
+
+    const app = makeApp();
+    const response = await app.request('/api/host-metrics');
+    expect(response.status).toBe(200);
+
+    const body = (await response.json()) as {
+      status: string;
+      disk: { used_gb: number | null; total_gb: number | null; pct: number | null } | null;
+    };
+    expect(body.status).toBe('ok');
+    expect(body.disk).not.toBeNull();
+    expect(body.disk?.used_gb).toBeNull();
+    expect(body.disk?.total_gb).toBe(500);
+    expect(body.disk?.pct).toBeNull();
+  });
+
+  test('falls back to no-data when collector emits an off-contract type', async () => {
+    // Strings in numeric fields are NOT in the contract (only numbers or
+    // null). The handler must validate parsed JSON against the schema
+    // and fall back to the no-data shape so malformed collector output
+    // cannot reach the generated client.
+    mockReadFile.mockImplementationOnce(async () =>
+      JSON.stringify({
+        disk: { used_gb: 'not-a-number', total_gb: 500, pct: 20 },
+        cpu: { pct: 15.5 },
+        mem: { used_gb: 8, total_gb: 32, pct: 25 },
+        collectedAt: new Date().toISOString(),
+      })
+    );
+
+    const app = makeApp();
+    const response = await app.request('/api/host-metrics');
+    expect(response.status).toBe(200);
+
+    const body = (await response.json()) as {
+      status: string;
+      disk: unknown;
+      cpu: unknown;
+      mem: unknown;
+      collectedAt: unknown;
+      stale: boolean;
+    };
+    expect(body.status).toBe('no-data');
+    expect(body.disk).toBeNull();
+    expect(body.cpu).toBeNull();
+    expect(body.mem).toBeNull();
+    expect(body.collectedAt).toBeNull();
+    expect(body.stale).toBe(false);
   });
 
   test('returns no-data shape (NOT 500) when collector file is missing', async () => {

@@ -93,9 +93,22 @@ function Meter({
   );
 }
 
+/**
+ * Render "<used> / <total> GB" when both numeric fields are present,
+ * fall back to a single value or undefined when partial-null. The
+ * collector can document per-field nulls (e.g. df reported a total but
+ * the used column was unreadable); we must never call .toFixed() on
+ * one of those nulls or the dashboard crashes.
+ */
+function formatUsedTotalGb(used: number | null, total: number | null): string | undefined {
+  if (used === null && total === null) return undefined;
+  const u = used !== null ? used.toFixed(1) : '?';
+  const t = total !== null ? total.toFixed(1) : '?';
+  return `${u} / ${t} GB`;
+}
+
 function DiskMeter({ disk }: { disk: DiskMetric | null }): React.ReactElement {
-  const detail =
-    disk !== null ? `${disk.used_gb.toFixed(1)} / ${disk.total_gb.toFixed(1)} GB` : undefined;
+  const detail = disk !== null ? formatUsedTotalGb(disk.used_gb, disk.total_gb) : undefined;
   return <Meter label="Disk" pct={disk?.pct ?? null} detail={detail} />;
 }
 
@@ -104,7 +117,6 @@ function CpuMeter({ cpu }: { cpu: CpuMetric | null }): React.ReactElement {
 }
 
 function MemMeter({ mem }: { mem: MemMetric | null }): React.ReactElement {
-  const detail =
-    mem !== null ? `${mem.used_gb.toFixed(1)} / ${mem.total_gb.toFixed(1)} GB` : undefined;
+  const detail = mem !== null ? formatUsedTotalGb(mem.used_gb, mem.total_gb) : undefined;
   return <Meter label="Memory" pct={mem?.pct ?? null} detail={detail} />;
 }
