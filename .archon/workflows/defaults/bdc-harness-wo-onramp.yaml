@@ -265,6 +265,12 @@ nodes:
         fi
 
         ERRORS=0
+        NORM_OUT=$normalize-spec.output
+        BUSINESS_RISK_INVARIANT=$(printf '%s\n' "$NORM_OUT" | sed -n 's/^BUSINESS_RISK_INVARIANT=//p' | head -n 1)
+        if [ -z "$BUSINESS_RISK_INVARIANT" ]; then
+          echo "FAIL: BUSINESS_RISK_INVARIANT missing from normalize-spec output" >> "$FEEDBACK"
+          ERRORS=$((ERRORS+1))
+        fi
 
         # Rule 1: model: sonnet at root
         grep -Eq '^model:[[:space:]]*sonnet$' "$DRAFT" || { echo "FAIL Rule 1: missing 'model: sonnet' at root" >> "$FEEDBACK"; ERRORS=$((ERRORS+1)); }
@@ -297,13 +303,16 @@ nodes:
           if ! awk '/id: business-risk-gate/{f=1} f && /load_bearing: true/{print; f=0}' "$DRAFT" | grep -q '.'; then
             echo "FAIL: business-risk-gate missing load_bearing: true" >> "$FEEDBACK"; ERRORS=$((ERRORS+1));
           fi
+          if [ -n "$BUSINESS_RISK_INVARIANT" ] && ! grep -Fq "$BUSINESS_RISK_INVARIANT" "$DRAFT"; then
+            echo "FAIL: business-risk-gate does not include BUSINESS_RISK_INVARIANT verbatim: $BUSINESS_RISK_INVARIANT" >> "$FEEDBACK"; ERRORS=$((ERRORS+1));
+          fi
         fi
 
         # Rule 11: no n8n webhook calls
         if grep -E 'n8n\.bluedevilcollectibles\.com' "$DRAFT" | grep -qv '#'; then echo "FAIL Rule 11: n8n webhook call found (hangs in executor subprocess)" >> "$FEEDBACK"; ERRORS=$((ERRORS+1)); fi
 
         # Placeholder text checks
-        for BAD in "placeholder" "TODO" "<BUSINESS_RISK" "invariant here" "one sentence" "BUSINESS_RISK_INVARIANT from normalize"; do
+        for BAD in "placeholder" "TODO" "FIXME" "TBD" "template" "sample text" "lorem" "REPLACE_ME" "{{" "}}" "<BUSINESS_RISK" "invariant here" "one sentence" "BUSINESS_RISK_INVARIANT from normalize"; do
           if grep -qi "$BAD" "$DRAFT" 2>/dev/null; then echo "FAIL: child YAML contains placeholder text: $BAD" >> "$FEEDBACK"; ERRORS=$((ERRORS+1)); break; fi
         done
 
@@ -377,7 +386,19 @@ nodes:
         - paths repo-root-relative (no BDC_XO/ prefix)
         - no n8n webhook calls
         - flip-notion final node; business-risk-gate present and load_bearing: true
+        - business-risk-gate includes BUSINESS_RISK_INVARIANT verbatim
         - no placeholder text anywhere
+        - zero template tokens remain: TODO, FIXME, TBD, template, sample text, lorem,
+          REPLACE_ME, double curly braces, angle-bracket invariant placeholders
+
+        ## Required self-check before emitting the sentinel
+        Before you emit YAML_READY, inspect the draft yourself and confirm:
+        - id: business-risk-gate is present
+        - load_bearing: true is present in that node
+        - the exact BUSINESS_RISK_INVARIANT line from normalize-spec appears verbatim
+        - no placeholder or template token from the hard-rule list appears anywhere
+        If any check fails, fix the draft in this same iteration. Do not emit
+        YAML_READY for an unchecked or known-bad draft.
 
         ## Output
         1. WRITE the file <slug>.yaml.draft to disk (you have write tools -- use them).
@@ -554,59 +575,105 @@ nodes:
   # Node 6: prefire-plan
   # Assembles the pre-fire packet shown to the operator at approval-gate.
   - id: prefire-plan
-    agent: xo
-    context: fresh
     depends_on: [adversarial-review]
-    prompt: |
-      Assemble the pre-fire packet for operator approval. This is exactly what
-      the operator sees before deciding to fire the child workflow.
+    bash: |
+      set -euo pipefail
+      NORM_OUT=$normalize-spec.output
+      AUTHOR_OUT=$yaml-author.output
+      ASSERT_OUT=$assert-yaml-ready.output
+      ADV_OUT=$adversarial-review.output
 
-      ## Inputs
-      Normalized spec: $normalize-spec.output
-      yaml-author output: $yaml-author.output
-      assert-yaml-ready output: $assert-yaml-ready.output
-      Adversarial review: $adversarial-review.output
+      WO_ID=$(printf '%s\n' "$NORM_OUT" | sed -n 's/^WO_ID=//p' | head -n 1)
+      TARGET_REPO=$(printf '%s\n' "$NORM_OUT" | sed -n 's/^TARGET_REPO=//p' | head -n 1)
+      TARGET_REPO_FULL=$(printf '%s\n' "$NORM_OUT" | sed -n 's/^TARGET_REPO_FULL=//p' | head -n 1)
+      RULE20_STAGING_GATE=$(printf '%s\n' "$NORM_OUT" | sed -n 's/^RULE20_STAGING_GATE=//p' | head -n 1)
+      WO_CLASS=$(printf '%s\n' "$NORM_OUT" | sed -n 's/^WO_CLASS=//p' | head -n 1)
+      BUSINESS_RISK_INVARIANT=$(printf '%s\n' "$NORM_OUT" | sed -n 's/^BUSINESS_RISK_INVARIANT=//p' | head -n 1)
+      WO_SLUG=$(printf '%s\n' "$AUTHOR_OUT" | sed -n 's/^WO_SLUG=//p' | head -n 1)
+      YAML_FILENAME=$(printf '%s\n' "$ASSERT_OUT" | sed -n 's/^YAML_FILENAME=//p' | head -n 1)
+      ADV_PASS=$(printf '%s\n' "$ADV_OUT" | sed -n 's/^ADV_PASS=//p' | head -n 1)
+      RISK=$(printf '%s\n' "$ADV_OUT" | sed -n 's/^RISK=//p' | head -n 1)
 
-      ## Step 1 - Duplicate-run check
-      Call:
-        curl -fsS --max-time 15 "https://archon.bluedevilcollectibles.com/api/workflows/runs?limit=30"
-      Parse the response to find any run whose initial_message or message contains the WO_ID
-      AND whose status is running, pending, or queued.
-      If found, emit `DUPLICATE_RUN_DETECTED: <run_id>|<status>`.
-      If not found or API unreachable, emit `DUPLICATE_CHECK=clean` or `DUPLICATE_CHECK=skipped`.
+      API_BASE="${ARCHON_API_BASE:-https://archon.bluedevilcollectibles.com}"
+      HARNESS_REPO="bluedevilcollectibles/bdc-harness"
+      ARCHON_HEADERS=(-H "x-archon-operator-token: ${ARCHON_OPERATOR_TOKEN}")
+      if [ -n "${CF_ACCESS_CLIENT_ID:-}" ] && [ -n "${CF_ACCESS_CLIENT_SECRET:-}" ]; then
+        ARCHON_HEADERS+=(-H "CF-Access-Client-Id: ${CF_ACCESS_CLIENT_ID}")
+        ARCHON_HEADERS+=(-H "CF-Access-Client-Secret: ${CF_ACCESS_CLIENT_SECRET}")
+      fi
 
-      ## Step 2 - Assemble packet
+      DUPLICATE_CHECK="clean"
+      RUNS_JSON=$(curl -fsS --max-time 15 "${ARCHON_HEADERS[@]}" \
+        "${API_BASE}/api/workflows/runs?limit=30" 2>/dev/null || true)
+      if [ -n "$RUNS_JSON" ]; then
+        API_DUP=$(printf '%s\n' "$RUNS_JSON" | WO_ID="$WO_ID" python3 -c "
+        import json, os, sys
+        wo_id = os.environ.get('WO_ID', '')
+        try:
+            data = json.load(sys.stdin)
+        except Exception:
+            sys.exit(0)
+        runs = data if isinstance(data, list) else data.get('runs', [])
+        for run in runs:
+            status = str(run.get('status', '')).lower()
+            msg = str(run.get('initial_message', '') or run.get('message', ''))
+            if wo_id and wo_id in msg and status in {'running', 'pending', 'queued'}:
+                print(str(run.get('id', 'unknown')) + '|' + status)
+                break
+        " 2>/dev/null || true)
+        if [ -n "$API_DUP" ]; then
+          DUPLICATE_CHECK="DUPLICATE_RUN_DETECTED: ${API_DUP}"
+        fi
+      else
+        DUPLICATE_CHECK="UNVERIFIED(api-unreachable)"
+      fi
 
-      Emit the following block (no markdown fences):
+      if ! printf '%s\n' "$DUPLICATE_CHECK" | grep -q 'DUPLICATE_RUN_DETECTED'; then
+        SAFE_SLUG=$(printf '%s\n' "$WO_ID" | tr '[:upper:]' '[:lower:]' | sed 's/^wo-/bdc-/; s/[^a-z0-9._-]/-/g')
+        PR_DUP=$(gh pr list --repo "$HARNESS_REPO" --state open --search "$WO_ID in:title,body" --json number,headRefName,title \
+          --jq '.[] | select((.headRefName | contains("'"$SAFE_SLUG"'")) or (.title | contains("'"$WO_ID"'"))) | "#"+(.number|tostring)+"|"+.headRefName' 2>/dev/null | head -n 1 || true)
+        BRANCH_DUP=""
+        for BRANCH_NAME in $(gh api "repos/${HARNESS_REPO}/branches" --paginate --jq '.[].name' 2>/dev/null | grep -F "$SAFE_SLUG" || true); do
+          BRANCH_DATE=$(gh api "repos/${HARNESS_REPO}/commits/${BRANCH_NAME}" --jq .commit.committer.date 2>/dev/null || echo "")
+          if [ -n "$BRANCH_DATE" ] && BRANCH_DATE="$BRANCH_DATE" python3 -c "import datetime, os, sys; d=datetime.datetime.fromisoformat(os.environ['BRANCH_DATE'].replace('Z','+00:00')); sys.exit(0 if datetime.datetime.now(datetime.timezone.utc)-d <= datetime.timedelta(days=7) else 1)"; then
+            BRANCH_DUP="$BRANCH_NAME"
+            break
+          fi
+        done
+        if [ -n "$PR_DUP" ]; then
+          DUPLICATE_CHECK="DUPLICATE_RUN_DETECTED: git-pr|${PR_DUP}"
+        elif [ -n "$BRANCH_DUP" ]; then
+          DUPLICATE_CHECK="DUPLICATE_RUN_DETECTED: git-branch|${BRANCH_DUP}"
+        elif printf '%s\n' "$DUPLICATE_CHECK" | grep -q '^UNVERIFIED'; then
+          DUPLICATE_CHECK="${DUPLICATE_CHECK}; git-fallback-clean"
+        fi
+      fi
 
-      ```
+      cat <<PACKET
       === PRE-FIRE PACKET ===
-      WO_ID=<from normalize-spec>
-      TARGET_REPO=<from normalize-spec>
-      TARGET_REPO_FULL=<from normalize-spec>
-      WO_SLUG=<from generate-yaml>
-      YAML_FILENAME=<from generate-yaml>
-      RULE20_STAGING_GATE=<from normalize-spec>
-      WO_CLASS=<from normalize-spec>
-      BUSINESS_RISK_INVARIANT=<from normalize-spec>
-      ADV_PASS=<from adversarial-review>
-      RISK=<from adversarial-review>
-      DUPLICATE_CHECK=<clean|skipped|DUPLICATE_RUN_DETECTED: ...>
+      WO_ID=${WO_ID}
+      TARGET_REPO=${TARGET_REPO}
+      TARGET_REPO_FULL=${TARGET_REPO_FULL}
+      WO_SLUG=${WO_SLUG}
+      YAML_FILENAME=${YAML_FILENAME}
+      RULE20_STAGING_GATE=${RULE20_STAGING_GATE}
+      WO_CLASS=${WO_CLASS}
+      BUSINESS_RISK_INVARIANT=${BUSINESS_RISK_INVARIANT}
+      ADV_PASS=${ADV_PASS}
+      RISK=${RISK}
+      DUPLICATE_CHECK=${DUPLICATE_CHECK}
 
       What approval authorizes (two side effects):
-        1. Register <YAML_FILENAME> to .archon/workflows/defaults/ via gh api PUT
-           (commits to bdc-harness dev branch, rebuilds Archon container)
-        2. POST /api/conversations to fire <WO_SLUG> against <TARGET_REPO_FULL>
+        1. Register ${YAML_FILENAME} to .archon/workflows/defaults/ on bdc-harness dev,
+           hot-reload it with PUT /api/workflows/${WO_SLUG}, then verify GET /api/workflows
+        2. POST /api/conversations to fire ${WO_SLUG} against ${TARGET_REPO_FULL}
 
       Adversarial review summary:
-      <paste SCORES block from adversarial-review output>
+      ${ADV_OUT}
+      PACKET
 
-      UNRESOLVED CONCERNS:
-      <paste from adversarial-review>
-      ```
-
-      ## Foot note for operator
-      If ADV_PASS=false, the approval-gate message will show "ADV_PASS=false - type 'override adv' to proceed anyway."
+      echo ""
+      echo "If ADV_PASS=false, the approval-gate message will show \"ADV_PASS=false - type 'override adv' to proceed anyway.\""
 
   # Node 7: approval-gate
   # Operator reviews the pre-fire packet and approves or rejects.
@@ -617,7 +684,7 @@ nodes:
         Review the pre-fire packet above.
 
         Two side effects will be authorized:
-          1. Register the child YAML to bdc-harness .archon/workflows/defaults/ via gh api PUT
+          1. Persist the child YAML to bdc-harness dev, then hot-reload it with PUT /api/workflows/:name
           2. Fire the child workflow against the target codebase via POST /api/conversations
 
         If ADV_PASS=false is shown in the packet, type "override adv" to proceed anyway.
@@ -686,11 +753,33 @@ nodes:
       YAML_CONTENT=$(base64 < "$YAML_FILENAME" | tr -d '\n')
       COMMIT_MSG="feat(on-ramp): register ${WO_SLUG} child workflow via bdc-harness-wo-onramp"
       HARNESS_REPO="bluedevilcollectibles/bdc-harness"
+      API_BASE="${ARCHON_API_BASE:-https://archon.bluedevilcollectibles.com}"
+      ARCHON_HEADERS=(-H "x-archon-operator-token: ${ARCHON_OPERATOR_TOKEN}")
+      CF_ACCESS_ENABLED=false
+      if [ -n "${CF_ACCESS_CLIENT_ID:-}" ] && [ -n "${CF_ACCESS_CLIENT_SECRET:-}" ]; then
+        ARCHON_HEADERS+=(-H "CF-Access-Client-Id: ${CF_ACCESS_CLIENT_ID}")
+        ARCHON_HEADERS+=(-H "CF-Access-Client-Secret: ${CF_ACCESS_CLIENT_SECRET}")
+        CF_ACCESS_ENABLED=true
+      fi
+      case "$API_BASE" in
+        http://localhost:*|http://127.0.0.1:*|http://archon-app:*|http://app:*) API_IS_LOCAL=true ;;
+        *) API_IS_LOCAL=false ;;
+      esac
+
+      require_hot_reload_auth() {
+        if [ "$API_IS_LOCAL" = "true" ] || [ "$CF_ACCESS_ENABLED" = "true" ]; then
+          return 0
+        fi
+        echo "ERROR: hot-reload PUT requires CF Access service-token env vars from outside the container." >&2
+        echo "Set CF_ACCESS_CLIENT_ID and CF_ACCESS_CLIENT_SECRET, or set ARCHON_API_BASE to a localhost/container URL reachable from this executor." >&2
+        exit 1
+      }
+      require_hot_reload_auth
 
       echo "=== register-yaml: Step 1 - GET /api/codebases to resolve default_cwd ==="
       CODEBASES=$(curl -fsS --max-time 15 \
-        "https://archon.bluedevilcollectibles.com/api/codebases" \
-        -H "x-archon-operator-token: ${ARCHON_OPERATOR_TOKEN}" 2>/dev/null || echo '{}')
+        "${ARCHON_HEADERS[@]}" \
+        "${API_BASE}/api/codebases" 2>/dev/null || echo '{}')
       DEFAULT_CWD=$(printf '%s\n' "$CODEBASES" \
         | python3 -c "import sys,json; data=json.load(sys.stdin); cbs=data if isinstance(data,list) else data.get('codebases',[]); [print(cb.get('default_cwd',cb.get('cwd',''))) for cb in cbs if 'bdc-harness' in (cb.get('name','') or '') or (cb.get('name','') or '')==('bluedevilcollectibles/bdc-harness')]" \
         2>/dev/null || echo "")
@@ -718,7 +807,7 @@ nodes:
         FALLBACK_BRANCH="on-ramp/register-${WO_SLUG}-$(date +%Y%m%d%H%M%S)"
 
         # Create branch off dev
-        DEV_SHA=$(gh api "repos/${HARNESS_REPO}/git/refs/heads/dev" --jq .object.sha 2>/dev/null || "")
+        DEV_SHA=$(gh api "repos/${HARNESS_REPO}/git/refs/heads/dev" --jq .object.sha 2>/dev/null || echo "")
         if [ -z "$DEV_SHA" ]; then
           echo "ERROR: cannot resolve dev branch SHA in ${HARNESS_REPO}" >&2
           exit 1
@@ -742,31 +831,78 @@ nodes:
           --title "$COMMIT_MSG" \
           --body "Auto-generated by bdc-harness-wo-onramp register-yaml fallback path. WO: ${WO_ID}" \
           --json number --jq .number 2>/dev/null || echo "")
-        if [ -n "$PR_NUM" ]; then
-          gh pr merge "$PR_NUM" --repo "$HARNESS_REPO" --squash --auto 2>/dev/null || \
-          gh api -X PUT "repos/${HARNESS_REPO}/pulls/${PR_NUM}/merge" \
-            -f merge_method=squash 2>/dev/null || true
-          echo "Fallback PR #${PR_NUM} merged"
-        else
-          echo "WARN: fallback PR create failed - file is committed on ${FALLBACK_BRANCH}" >&2
+        if [ -z "$PR_NUM" ]; then
+          echo "ERROR: fallback PR create failed; deleting ${FALLBACK_BRANCH} to avoid a dangling branch" >&2
+          gh api -X DELETE "repos/${HARNESS_REPO}/git/refs/heads/${FALLBACK_BRANCH}" >/dev/null 2>&1 || true
+          exit 1
         fi
+
+        MERGE_OK=false
+        if gh pr merge "$PR_NUM" --repo "$HARNESS_REPO" --squash --delete-branch 2>/dev/null; then
+          MERGE_OK=true
+        elif gh api -X PUT "repos/${HARNESS_REPO}/pulls/${PR_NUM}/merge" \
+            -f merge_method=squash >/dev/null 2>&1; then
+          MERGE_OK=true
+          gh api -X DELETE "repos/${HARNESS_REPO}/git/refs/heads/${FALLBACK_BRANCH}" >/dev/null 2>&1 || true
+        fi
+
+        if [ "$MERGE_OK" != "true" ]; then
+          echo "ERROR: fallback PR #${PR_NUM} could not be squash-merged to dev; closing PR and deleting ${FALLBACK_BRANCH}" >&2
+          gh pr close "$PR_NUM" --repo "$HARNESS_REPO" --delete-branch >/dev/null 2>&1 || true
+          gh api -X DELETE "repos/${HARNESS_REPO}/git/refs/heads/${FALLBACK_BRANCH}" >/dev/null 2>&1 || true
+          exit 1
+        fi
+
+        echo "Fallback PR #${PR_NUM} squash-merged to dev and branch deleted"
       fi
+
+      DEV_FILE_SHA=$(gh api "repos/${HARNESS_REPO}/contents/${DEST_PATH}?ref=dev" --jq .sha 2>/dev/null || echo "")
+      if [ -z "$DEV_FILE_SHA" ]; then
+        echo "ERROR: ${DEST_PATH} is not present on dev after register commit path; refusing hot-reload" >&2
+        exit 1
+      fi
+      echo "Dev branch contains ${DEST_PATH}: ${DEV_FILE_SHA}"
 
       echo "=== register-yaml: Step 4 - PUT /api/workflows/<name> ==="
       CWD_PARAM=""
-      [ -n "$DEFAULT_CWD" ] && CWD_PARAM="?cwd=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote('$DEFAULT_CWD'))")"
-      curl -fsS -X PUT \
-        "https://archon.bluedevilcollectibles.com/api/workflows/${WO_SLUG}${CWD_PARAM}" \
+      [ -n "$DEFAULT_CWD" ] && CWD_PARAM="?cwd=$(DEFAULT_CWD="$DEFAULT_CWD" python3 -c "import os,urllib.parse; print(urllib.parse.quote(os.environ['DEFAULT_CWD'], safe=''))")"
+
+      BODY_FILE=$(mktemp)
+      if ! YAML_PATH="$YAML_FILENAME" bun -e "const fs=require('fs'); const data=Bun.YAML.parse(fs.readFileSync(process.env.YAML_PATH,'utf8')); process.stdout.write(JSON.stringify({definition:data}));" > "$BODY_FILE" 2>/tmp/on-ramp-hot-register-bun.err; then
+        echo "ERROR: failed to build hot-register PUT body from ${YAML_FILENAME}" >&2
+        sed 's/^/    /' /tmp/on-ramp-hot-register-bun.err >&2 || true
+        rm -f "$BODY_FILE" /tmp/on-ramp-hot-register-bun.err
+        exit 1
+      fi
+      rm -f /tmp/on-ramp-hot-register-bun.err
+
+      RESP_FILE=$(mktemp)
+      set +e
+      HTTP_CODE=$(curl -sS -o "$RESP_FILE" -w "%{http_code}" --max-time 30 \
+        -X PUT \
+        "${ARCHON_HEADERS[@]}" \
         -H "Content-Type: application/json" \
-        -H "x-archon-operator-token: ${ARCHON_OPERATOR_TOKEN}" \
-        -d "{\"reload\":true}" 2>/dev/null || echo "WARN: PUT /api/workflows reload returned non-200 (non-fatal)"
+        --data-binary "@${BODY_FILE}" \
+        "${API_BASE}/api/workflows/${WO_SLUG}${CWD_PARAM}" 2>/dev/null)
+      CURL_EXIT=$?
+      set -e
+      rm -f "$BODY_FILE"
+
+      if [ "$CURL_EXIT" -ne 0 ] || [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
+        echo "ERROR: hot-reload PUT /api/workflows/${WO_SLUG} failed with HTTP ${HTTP_CODE}" >&2
+        sed 's/^/    /' "$RESP_FILE" >&2 || true
+        rm -f "$RESP_FILE"
+        exit 1
+      fi
+      rm -f "$RESP_FILE"
+      echo "Hot-reload PUT accepted for ${WO_SLUG} (HTTP ${HTTP_CODE})"
 
       echo "=== register-yaml: Step 5 - poll GET /api/workflows until registered (60s max) ==="
       REGISTERED=false
       for i in $(seq 1 12); do
         FOUND=$(curl -fsS --max-time 10 \
-          "https://archon.bluedevilcollectibles.com/api/workflows" \
-          -H "x-archon-operator-token: ${ARCHON_OPERATOR_TOKEN}" 2>/dev/null \
+          "${ARCHON_HEADERS[@]}" \
+          "${API_BASE}/api/workflows" 2>/dev/null \
           | python3 -c "import sys,json; data=json.load(sys.stdin); ws=data if isinstance(data,list) else data.get('workflows',[]); [print('found') for w in ws if (w.get('workflow',w)).get('name','')==('${WO_SLUG}')] " \
           2>/dev/null || echo "")
         if [ "$FOUND" = "found" ]; then
@@ -780,8 +916,8 @@ nodes:
 
       if [ "$REGISTERED" = "false" ]; then
         echo "ERROR: ${WO_SLUG} did not appear in /api/workflows after 60s" >&2
-        echo "The YAML was committed but Archon may need a container rebuild." >&2
-        echo "Run: BDC_XO/scripts/archon-bridge/sync-workflows.sh ${WO_SLUG}.yaml" >&2
+        echo "The YAML is on dev and the hot-reload PUT returned success, but GET /api/workflows did not show it." >&2
+        echo "Investigate loader validation errors before firing the child workflow." >&2
         exit 1
       fi
 
