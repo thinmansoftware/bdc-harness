@@ -25,6 +25,8 @@ import {
 import type { WorkflowRunStatus } from '@/lib/types';
 import { ensureUtc } from '@/lib/format';
 import { StatusSummaryBar } from '@/components/dashboard/StatusSummaryBar';
+import { HostHealthPanel } from '@/components/dashboard/HostHealthPanel';
+import { useHostMetrics } from '@/hooks/useHostMetrics';
 import { WorkflowRunGroup } from '@/components/dashboard/WorkflowRunGroup';
 import { WorkflowRunCard } from '@/components/dashboard/WorkflowRunCard';
 import { WorkflowHistoryTable } from '@/components/dashboard/WorkflowHistoryTable';
@@ -230,6 +232,12 @@ export function DashboardPage(): React.ReactElement {
     refetchInterval: 30_000,
   });
 
+  // Host disk/cpu/mem snapshot from the host-side collector. The hook handles
+  // the 30s poll cadence; the panel renders an "awaiting collector"
+  // placeholder when data is undefined or the file is absent (collector not
+  // yet deployed). This is the bdc-harness half of the parent host-health WO.
+  const { data: hostMetrics } = useHostMetrics();
+
   // Poll global Claude throttle state -- surfaces auto-engaged throttles in the
   // StatusSummaryBar so operators see the gate state without checking logs.
   const { data: throttleState } = useQuery({
@@ -424,6 +432,10 @@ export function DashboardPage(): React.ReactElement {
             void handleToggleThrottle();
           }}
         />
+
+        {/* Host disk/cpu/mem snapshot -- rendered immediately after the
+            status summary so it sits in the same dashboard header band. */}
+        <HostHealthPanel data={hostMetrics} />
 
         {archiveNotice && (
           <div className="rounded-md border border-border bg-surface-elevated px-4 py-3 text-sm text-text-secondary">

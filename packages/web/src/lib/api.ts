@@ -651,6 +651,41 @@ export async function getHealth(): Promise<HealthResponse> {
   return fetchJSON<HealthResponse>('/api/health');
 }
 
+/** Per-resource shapes for host metrics. The outer field is null when the
+ * collector could not sample that resource (or the file section is
+ * missing). Individual numeric values are nullable when the collector
+ * read the section but could not sample a specific value -- the
+ * dashboard panel must handle a present-but-null field gracefully. */
+export interface DiskMetric {
+  used_gb: number | null;
+  total_gb: number | null;
+  pct: number | null;
+}
+export interface CpuMetric {
+  pct: number | null;
+}
+export interface MemMetric {
+  used_gb: number | null;
+  total_gb: number | null;
+  pct: number | null;
+}
+
+/** Response shape for GET /api/host-metrics. Mirrors the server's
+ * HostMetricsResponse Zod schema. Status 'no-data' is the documented shape
+ * returned when the collector file does not yet exist. */
+export interface HostMetricsResponse {
+  status: 'ok' | 'stale' | 'no-data';
+  disk: DiskMetric | null;
+  cpu: CpuMetric | null;
+  mem: MemMetric | null;
+  collectedAt: string | null;
+  stale: boolean;
+}
+
+export async function getHostMetrics(): Promise<HostMetricsResponse> {
+  return fetchJSON<HostMetricsResponse>('/api/host-metrics');
+}
+
 export type UpdateCheckResult = components['schemas']['UpdateCheckResponse'];
 
 export async function getUpdateCheck(): Promise<UpdateCheckResult> {

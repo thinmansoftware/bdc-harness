@@ -1040,6 +1040,180 @@ export interface paths {
     patch?: never;
     trace?: never;
   };
+  '/api/workflows/runs/{runId}/pause': {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    get?: never;
+    put?: never;
+    /** Pause a running workflow run (operator-triggered) */
+    post: {
+      parameters: {
+        query?: never;
+        header?: never;
+        path: {
+          runId: string;
+        };
+        cookie?: never;
+      };
+      requestBody?: {
+        content: {
+          'application/json': components['schemas']['PauseWorkflowRunBody'];
+        };
+      };
+      responses: {
+        /** @description Paused */
+        200: {
+          headers: {
+            [name: string]: unknown;
+          };
+          content: {
+            'application/json': components['schemas']['PauseWorkflowRunResponse'];
+          };
+        };
+        /** @description Bad request */
+        400: {
+          headers: {
+            [name: string]: unknown;
+          };
+          content: {
+            'application/json': components['schemas']['Error'];
+          };
+        };
+        /** @description Not found */
+        404: {
+          headers: {
+            [name: string]: unknown;
+          };
+          content: {
+            'application/json': components['schemas']['Error'];
+          };
+        };
+        /** @description Already paused */
+        409: {
+          headers: {
+            [name: string]: unknown;
+          };
+          content: {
+            'application/json': components['schemas']['Error'];
+          };
+        };
+        /** @description Cannot pause a terminal run */
+        422: {
+          headers: {
+            [name: string]: unknown;
+          };
+          content: {
+            'application/json': components['schemas']['Error'];
+          };
+        };
+        /** @description Server error */
+        500: {
+          headers: {
+            [name: string]: unknown;
+          };
+          content: {
+            'application/json': components['schemas']['Error'];
+          };
+        };
+      };
+    };
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
+  '/api/admin/throttle': {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    /** Read the current global Claude provider throttle state */
+    get: {
+      parameters: {
+        query?: never;
+        header?: never;
+        path?: never;
+        cookie?: never;
+      };
+      requestBody?: never;
+      responses: {
+        /** @description Current throttle state */
+        200: {
+          headers: {
+            [name: string]: unknown;
+          };
+          content: {
+            'application/json': components['schemas']['AdminThrottleResponse'];
+          };
+        };
+        /** @description Server error */
+        500: {
+          headers: {
+            [name: string]: unknown;
+          };
+          content: {
+            'application/json': components['schemas']['Error'];
+          };
+        };
+      };
+    };
+    put?: never;
+    /** Engage or release the global Claude provider throttle gate */
+    post: {
+      parameters: {
+        query?: never;
+        header?: never;
+        path?: never;
+        cookie?: never;
+      };
+      requestBody?: {
+        content: {
+          'application/json': components['schemas']['AdminThrottleBody'];
+        };
+      };
+      responses: {
+        /** @description Throttle state updated */
+        200: {
+          headers: {
+            [name: string]: unknown;
+          };
+          content: {
+            'application/json': components['schemas']['AdminThrottleResponse'];
+          };
+        };
+        /** @description Bad request */
+        400: {
+          headers: {
+            [name: string]: unknown;
+          };
+          content: {
+            'application/json': components['schemas']['Error'];
+          };
+        };
+        /** @description Server error */
+        500: {
+          headers: {
+            [name: string]: unknown;
+          };
+          content: {
+            'application/json': components['schemas']['Error'];
+          };
+        };
+      };
+    };
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
   '/api/workflows/runs/{runId}/resume': {
     parameters: {
       query?: never;
@@ -1525,6 +1699,15 @@ export interface paths {
           };
           content: {
             'application/json': components['schemas']['BulkDeleteFailedResponse'];
+          };
+        };
+        /** @description Invalid olderThan duration or timestamp */
+        400: {
+          headers: {
+            [name: string]: unknown;
+          };
+          content: {
+            'application/json': components['schemas']['Error'];
           };
         };
         /** @description Server error */
@@ -2322,6 +2505,42 @@ export interface paths {
     patch?: never;
     trace?: never;
   };
+  '/api/host-metrics': {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    /** Host disk/cpu/mem snapshot written by the host collector */
+    get: {
+      parameters: {
+        query?: never;
+        header?: never;
+        path?: never;
+        cookie?: never;
+      };
+      requestBody?: never;
+      responses: {
+        /** @description Host metrics snapshot, stale flag, or no-data placeholder */
+        200: {
+          headers: {
+            [name: string]: unknown;
+          };
+          content: {
+            'application/json': components['schemas']['HostMetricsResponse'];
+          };
+        };
+      };
+    };
+    put?: never;
+    post?: never;
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
   '/api/update-check': {
     parameters: {
       query?: never;
@@ -2630,7 +2849,7 @@ export interface components {
         };
       };
       /** @enum {string} */
-      effort?: 'low' | 'medium' | 'high' | 'max';
+      effort?: 'low' | 'medium' | 'high' | 'max' | 'xhigh';
       thinking?:
         | {
             /** @enum {string} */
@@ -2721,7 +2940,7 @@ export interface components {
       additionalDirectories?: string[];
       interactive?: boolean;
       /** @enum {string} */
-      effort?: 'low' | 'medium' | 'high' | 'max';
+      effort?: 'low' | 'medium' | 'high' | 'max' | 'xhigh';
       thinking?:
         | {
             /** @enum {string} */
@@ -2881,6 +3100,24 @@ export interface components {
     CancelWorkflowRunBody: {
       reason?: string;
     };
+    PauseWorkflowRunResponse: {
+      success: boolean;
+      message: string;
+      run: components['schemas']['WorkflowRun'];
+    };
+    PauseWorkflowRunBody: {
+      reason?: string;
+    };
+    AdminThrottleResponse: {
+      success: boolean;
+      paused: boolean;
+      message: string;
+      /** @enum {string} */
+      engagedBy?: 'operator' | 'auto';
+    };
+    AdminThrottleBody: {
+      paused: boolean;
+    };
     WorkflowRunActionResponse: {
       success: boolean;
       message: string;
@@ -2909,8 +3146,14 @@ export interface components {
       runIds: string[];
       dryRun: boolean;
     };
+    QuotaWindow: {
+      windowTokens: number;
+      windowBudget: number | null;
+      windowResetAt: string;
+    };
     WorkflowRunListResponse: {
       runs: components['schemas']['WorkflowRun'][];
+      quotaWindow: components['schemas']['QuotaWindow'];
     };
     WorkflowRunByWorkerResponse: {
       run: components['schemas']['WorkflowRun'];
@@ -3049,6 +3292,25 @@ export interface components {
       version?: string;
       is_docker: boolean;
       activePlatforms?: string[];
+    };
+    HostMetricsResponse: {
+      /** @enum {string} */
+      status: 'ok' | 'stale' | 'no-data';
+      disk: {
+        used_gb: number | null;
+        total_gb: number | null;
+        pct: number | null;
+      } | null;
+      cpu: {
+        pct: number | null;
+      } | null;
+      mem: {
+        used_gb: number | null;
+        total_gb: number | null;
+        pct: number | null;
+      } | null;
+      collectedAt: string | null;
+      stale: boolean;
     };
     UpdateCheckResponse: {
       updateAvailable: boolean;

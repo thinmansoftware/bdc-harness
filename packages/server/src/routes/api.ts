@@ -159,7 +159,7 @@ if (BUNDLED_IS_BINARY) {
 type WorkflowSource = 'project' | 'bundled' | 'global';
 
 // =========================================================================
-// OpenAPI route configs (module-scope — pure config, no runtime dependencies)
+// OpenAPI route configs (module-scope -- pure config, no runtime dependencies)
 // =========================================================================
 
 /** Helper to build a JSON error response entry for createRoute configs. */
@@ -655,7 +655,7 @@ const listWorkflowRunsRoute = createRoute({
  * `process.env['MAX20X_...'] = '...'` take effect without `mock.module()` or
  * a module reload. Default window length: 5 hours (a rough proxy for the
  * Max-20x rolling rate-limit window, NOT a billed quota). `windowBudget` is
- * `null` when `MAX20X_WINDOW_TOKENS` is unset — the runs API still surfaces
+ * `null` when `MAX20X_WINDOW_TOKENS` is unset -- the runs API still surfaces
  * `windowTokens` in that case (raw-first fallback). Any UI rendering MUST
  * label these values as estimated.
  */
@@ -930,7 +930,7 @@ const getNodeEventsRoute = createRoute({
   },
 });
 
-// Archive/unarchive/bulk-archive/bulk-delete routes — registered before {runId} routes
+// Archive/unarchive/bulk-archive/bulk-delete routes -- registered before {runId} routes
 // to prevent literal paths from matching as runId param values.
 
 const archiveWorkflowRunRoute = createRoute({
@@ -1006,6 +1006,7 @@ const bulkDeleteFailedRunsRoute = createRoute({
       content: { 'application/json': { schema: bulkDeleteFailedResponseSchema } },
       description: 'Bulk deleted (or dry run preview)',
     },
+    400: jsonError('Invalid olderThan duration or timestamp'),
     500: jsonError('Server error'),
   },
 });
@@ -1109,6 +1110,65 @@ const getHealthRoute = createRoute({
   },
 });
 
+// Per-resource metric shapes. The collector (separate WO
+// WO-INFRA-HOST-METRICS-COLLECTOR-01 in bdc-xo) writes this JSON file.
+// Per-field numeric values are nullable when the collector reads the
+// section but cannot sample a specific value (e.g. df returned but the
+// "used" column was unreadable); the whole field is null when the
+// resource section is missing from the file entirely. The schema MUST
+// express both states so the generated API contract matches what the
+// collector can actually emit -- and the handler validates parsed JSON
+// against this schema before returning it.
+const diskMetricSchema = z
+  .object({
+    used_gb: z.number().nullable(),
+    total_gb: z.number().nullable(),
+    pct: z.number().nullable(),
+  })
+  .nullable();
+const cpuMetricSchema = z
+  .object({
+    pct: z.number().nullable(),
+  })
+  .nullable();
+const memMetricSchema = z
+  .object({
+    used_gb: z.number().nullable(),
+    total_gb: z.number().nullable(),
+    pct: z.number().nullable(),
+  })
+  .nullable();
+
+// Body schema reused for handler-side validation of parsed collector JSON.
+// Kept separate from the route response wrapper so we can `.safeParse()`
+// the raw file contents and fall back to the no-data shape if the
+// collector emits something outside the contract.
+const hostMetricsBodySchema = z.object({
+  status: z.enum(['ok', 'stale', 'no-data']),
+  disk: diskMetricSchema,
+  cpu: cpuMetricSchema,
+  mem: memMetricSchema,
+  collectedAt: z.string().nullable(),
+  stale: z.boolean(),
+});
+
+const getHostMetricsRoute = createRoute({
+  method: 'get',
+  path: '/api/host-metrics',
+  tags: ['System'],
+  summary: 'Host disk/cpu/mem snapshot written by the host collector',
+  responses: {
+    200: {
+      content: {
+        'application/json': {
+          schema: hostMetricsBodySchema.openapi('HostMetricsResponse'),
+        },
+      },
+      description: 'Host metrics snapshot, stale flag, or no-data placeholder',
+    },
+  },
+});
+
 const getUpdateCheckRoute = createRoute({
   method: 'get',
   path: '/api/update-check',
@@ -1146,7 +1206,7 @@ export function registerApiRoutes(
 
   /**
    * Validate that a caller-supplied `cwd` is rooted at a registered codebase path.
-   * This prevents path traversal — callers cannot read/write outside known project roots.
+   * This prevents path traversal -- callers cannot read/write outside known project roots.
    */
   async function validateCwd(cwd: string): Promise<boolean> {
     const codebases = await codebaseDb.listCodebases();
@@ -1157,7 +1217,7 @@ export function registerApiRoutes(
     });
   }
 
-  // CORS for Web UI — allow-all is fine for a single-developer tool.
+  // CORS for Web UI -- allow-all is fine for a single-developer tool.
   // Override with WEB_UI_ORIGIN env var to restrict if exposing publicly.
   function operatorAuthDisabled(): boolean {
     return process.env.ARCHON_OPERATOR_AUTH_DISABLED === 'true';
@@ -1209,6 +1269,43 @@ export function registerApiRoutes(
   function publicTimestamp(value: Date | string | null): string | null {
     if (value === null) return null;
     return value instanceof Date ? value.toISOString() : value;
+  }
+
+  /**
+   * Convert a duration shortcut (e.g. "14d", "7d", "12h", "30m") OR an ISO
+   * timestamp into an ISO cutoff string suitable for direct binding into
+   * `started_at < $1`. Returns null when the input is neither a recognized
+   * shortcut nor a parseable ISO timestamp (the caller should surface 400).
+   *
+   * Why this lives in the API handler layer (Option A from the parent WO):
+   * bulkDeleteArchivedFailedRuns binds the cutoff directly into Postgres with
+   * no parsing of its own. Without this guard a caller passing "14d" would
+   * cause a Postgres cast error. Keeping it in the API layer lets callers stay
+   * human-readable without touching the DB function.
+   */
+  function parseDurationToIso(value: string): string | null {
+    const trimmed = value.trim();
+    if (!trimmed) return null;
+    // ISO timestamp passthrough: anything Date.parse can read AND that does
+    // NOT match the duration-shortcut shape we know about.
+    const shortcutMatch = /^(\d+)([smhd])$/i.exec(trimmed);
+    if (shortcutMatch?.[1] && shortcutMatch[2]) {
+      const amount = Number(shortcutMatch[1]);
+      const unit = shortcutMatch[2].toLowerCase();
+      if (!Number.isFinite(amount) || amount < 0) return null;
+      const unitMs: Record<string, number> = {
+        s: 1000,
+        m: 60 * 1000,
+        h: 60 * 60 * 1000,
+        d: 24 * 60 * 60 * 1000,
+      };
+      const ms = unitMs[unit];
+      if (ms === undefined) return null;
+      return new Date(Date.now() - amount * ms).toISOString();
+    }
+    const ts = Date.parse(trimmed);
+    if (Number.isNaN(ts)) return null;
+    return new Date(ts).toISOString();
   }
 
   type PublicWorkflowNodeStatus = 'pending' | 'running' | 'completed' | 'failed' | 'skipped';
@@ -1411,7 +1508,7 @@ export function registerApiRoutes(
     // All text/* types are acceptable (covers .md, .py, .rs, .go, .sh, .yaml, etc.)
     if (mimeType.startsWith('text/')) return true;
     if (ALLOWED_UPLOAD_BINARY_MIME_TYPES.has(mimeType)) return true;
-    // Browsers assign empty MIME types to many code/config extensions — fall back to extension
+    // Browsers assign empty MIME types to many code/config extensions -- fall back to extension
     if (!mimeType) {
       const dotIndex = fileName.lastIndexOf('.');
       if (dotIndex !== -1) {
@@ -1429,7 +1526,7 @@ export function registerApiRoutes(
   ): Promise<{ accepted: boolean; status: string }> {
     const result = await lockManager.acquireLock(conversationId, async () => {
       // Emit lock:true at handler start so the UI knows processing has begun.
-      // Fire-and-forget — if no SSE stream is connected yet, the event is buffered.
+      // Fire-and-forget -- if no SSE stream is connected yet, the event is buffered.
       webAdapter.emitLockEvent(conversationId, true);
       try {
         await handleMessage(webAdapter, conversationId, message, {
@@ -1484,7 +1581,7 @@ export function registerApiRoutes(
       // optimistically so the UI shows a queued state immediately. It is not awaited
       // because we want the HTTP response to return before the SSE write completes.
       // The lock-release signal (locked: false) IS awaited inside the task callback
-      // above to guarantee ordering — all tool results and flush must precede the
+      // above to guarantee ordering -- all tool results and flush must precede the
       // release event on the SSE stream.
       webAdapter.emitLockEvent(conversationId, true);
     }
@@ -1511,7 +1608,7 @@ export function registerApiRoutes(
    * **Cross-adapter guard**: only web-sourced parents qualify.
    * `dispatchToOrchestrator` is wired to the web adapter + its lock manager,
    * so a Slack / Telegram / GitHub / Discord run being approved from the
-   * dashboard must not route through it — the Slack thread would never see
+   * dashboard must not route through it -- the Slack thread would never see
    * the resumed output. Non-web parents skip auto-resume and the originating
    * platform's own re-run flow applies.
    */
@@ -1521,7 +1618,7 @@ export function registerApiRoutes(
   ): Promise<boolean> {
     if (!run.parent_conversation_id) return false;
     if (!run.conversation_id || !run.working_path) return false;
-    // Literal event names per action — greppable for ops tooling. Keeping the
+    // Literal event names per action -- greppable for ops tooling. Keeping the
     // branch explicit rather than templating avoids the earlier 3-segment
     // `api.workflow_*.dispatched` shape that broke `{domain}.{action}_{state}`.
     const events =
@@ -1554,7 +1651,7 @@ export function registerApiRoutes(
       const platformConvId = parentConv?.platform_conversation_id;
       if (!platformConvId) {
         // parentConv === null is a data-integrity signal (the parent
-        // conversation was deleted while the run was paused) — worth
+        // conversation was deleted while the run was paused) -- worth
         // surfacing at info level so operators notice. Missing
         // platform_conversation_id on an existing row shouldn't happen and
         // stays at debug.
@@ -1718,7 +1815,7 @@ export function registerApiRoutes(
         try {
           await messageDb.addMessage(conversation.id, 'user', message);
         } catch (e: unknown) {
-          // Log only (no SSE warning) — the SSE stream isn't connected yet for new conversations.
+          // Log only (no SSE warning) -- the SSE stream isn't connected yet for new conversations.
           // The existing /message endpoint emits a warning because the stream is guaranteed to be active.
           getLog().error({ err: e, conversationId: conversation.id }, 'message_persistence_failed');
         }
@@ -1880,7 +1977,7 @@ export function registerApiRoutes(
         const displayName = basename(entry.name).replace(/[^a-zA-Z0-9._-]/g, '_');
         // Server-side MIME type allowlist (client-side accept= is not a security boundary;
         // entry.type is the Content-Type supplied by the client and is not verified against
-        // actual file contents — suitable for a single-developer self-hosted tool)
+        // actual file contents -- suitable for a single-developer self-hosted tool)
         if (!isAllowedUploadType(entry.type, entry.name)) {
           return c.json(
             { error: `File "${displayName}" has an unsupported type: ${entry.type}` },
@@ -1950,7 +2047,7 @@ export function registerApiRoutes(
 
     // Persist user message and pass DB ID to adapter for assistant message persistence
     if (conv) {
-      // Omit path from persisted metadata — the on-disk file is ephemeral and will be
+      // Omit path from persisted metadata -- the on-disk file is ephemeral and will be
       // deleted after the AI processes it; storing stale paths would confuse future readers.
       const meta =
         savedFiles.length > 0
@@ -1977,7 +2074,7 @@ export function registerApiRoutes(
     }
 
     // Pass savedFiles to dispatchToOrchestrator so cleanup happens inside the lock handler,
-    // AFTER handleMessage completes — not in the HTTP handler's finally block where the
+    // AFTER handleMessage completes -- not in the HTTP handler's finally block where the
     // fire-and-forget lock callback may still be running and the AI has not yet read the files.
     let extraContext: Omit<HandleMessageContext, 'isolationHints'> | undefined;
     let filesToCleanup: { files: AttachedFile[]; uploadDir: string } | undefined;
@@ -1994,7 +2091,7 @@ export function registerApiRoutes(
     return c.json(result);
   });
 
-  // GET /api/stream/__dashboard__ — multiplexed dashboard SSE (all workflow events)
+  // GET /api/stream/__dashboard__ -- multiplexed dashboard SSE (all workflow events)
   // IMPORTANT: Must be registered before /api/stream/:conversationId to avoid param capture.
   app.get('/api/stream/__dashboard__', async c => {
     return streamSSE(c, async stream => {
@@ -2060,7 +2157,7 @@ export function registerApiRoutes(
           }
         }
       } catch (e: unknown) {
-        // stream.sleep() throws when client disconnects — expected behavior.
+        // stream.sleep() throws when client disconnects -- expected behavior.
         // Log unexpected errors for debugging.
         const msg = (e as Error).message ?? '';
         if (!msg.includes('aborted') && !msg.includes('closed') && !msg.includes('cancel')) {
@@ -2182,7 +2279,7 @@ export function registerApiRoutes(
           await removeWorktree(toRepoPath(codebase.default_cwd), toWorktreePath(env.working_path));
           getLog().info({ path: env.working_path }, 'worktree_removed');
         } catch (wtErr) {
-          // Worktree may already be gone — log but continue
+          // Worktree may already be gone -- log but continue
           getLog().warn({ err: wtErr, path: env.working_path }, 'worktree_remove_failed');
         }
         await isolationEnvDb.updateStatus(env.id, 'destroyed');
@@ -2191,7 +2288,7 @@ export function registerApiRoutes(
       // Delete from database (unlinks conversations and sessions)
       await codebaseDb.deleteCodebase(id);
 
-      // Remove workspace directory from disk — only for Archon-managed repos
+      // Remove workspace directory from disk -- only for Archon-managed repos
       const workspacesRoot = normalize(getArchonWorkspacesPath());
       const normalizedCwd = normalize(codebase.default_cwd);
       if (
@@ -2202,7 +2299,7 @@ export function registerApiRoutes(
           await rm(normalizedCwd, { recursive: true, force: true });
           getLog().info({ path: normalizedCwd }, 'workspace_removed');
         } catch (rmErr) {
-          // Directory may not exist — log but don't fail
+          // Directory may not exist -- log but don't fail
           getLog().warn({ err: rmErr, path: codebase.default_cwd }, 'workspace_remove_failed');
         }
       } else {
@@ -2263,7 +2360,7 @@ export function registerApiRoutes(
   /**
    * Register a route with OpenAPI spec generation and input validation.
    * Zod validates inputs (query, params, body) at runtime via defaultHook.
-   * Response schemas are used for OpenAPI spec generation only — output is not
+   * Response schemas are used for OpenAPI spec generation only -- output is not
    * validated at runtime. The `as never` cast bypasses TypedResponse constraints.
    */
   function registerOpenApiRoute(
@@ -2336,7 +2433,7 @@ export function registerApiRoutes(
         validation_errors: { count: loaderErrors.length, endpoint: '/api/workflows/errors' },
       });
     } catch (error) {
-      // Workflow discovery can fail if cwd is stale or deleted — return empty with warning
+      // Workflow discovery can fail if cwd is stale or deleted -- return empty with warning
       const err = error instanceof Error ? error : new Error(String(error));
       getLog().error({ err }, 'workflow_discovery_failed');
       return apiError(c, 500, `Workflow discovery failed: ${err.message}`);
@@ -2533,7 +2630,7 @@ export function registerApiRoutes(
   // Distinct from approval-gate pause (Rule of Three doctrine): no
   // ApprovalContext is required; the run flips to 'paused' and the global
   // Claude throttle blocks the next SDK call. Current iteration completes
-  // naturally — the DAG executor between-iteration check does not stop
+  // naturally -- the DAG executor between-iteration check does not stop
   // running concurrent nodes (approval-gate semantics are preserved).
   registerOpenApiRoute(pauseWorkflowRunRoute, async c => {
     try {
@@ -2613,9 +2710,9 @@ export function registerApiRoutes(
       const message = body.paused
         ? wasThrottled
           ? 'Throttle was already engaged; engagement context refreshed'
-          : 'Throttle engaged — Claude SDK calls will queue'
+          : 'Throttle engaged -- Claude SDK calls will queue'
         : wasThrottled
-          ? 'Throttle released — queued Claude SDK calls drained'
+          ? 'Throttle released -- queued Claude SDK calls drained'
           : 'Throttle was already released';
       return c.json({
         success: true,
@@ -2632,10 +2729,10 @@ export function registerApiRoutes(
   // POST /api/workflows/runs/:runId/resume - Resume a workflow run
   //
   // Two modes share this route:
-  //   1. Failed run     → next invocation on the same path auto-resumes (legacy behavior)
-  //   2. Operator pause → flip status back to 'running'; the DAG executor's
+  //   1. Failed run     -> next invocation on the same path auto-resumes (legacy behavior)
+  //   2. Operator pause -> flip status back to 'running'; the DAG executor's
   //                        between-iteration check sees 'running' and continues.
-  //                        Approval-gate paused runs are NOT touched here — use
+  //                        Approval-gate paused runs are NOT touched here -- use
   //                        /approve or /reject for those.
   registerOpenApiRoute(resumeWorkflowRunRoute, async c => {
     const runId = c.req.param('runId') ?? '';
@@ -2665,7 +2762,7 @@ export function registerApiRoutes(
         });
       }
 
-      // Failed run path (or approval-gate paused — leave as-is, /approve handles it):
+      // Failed run path (or approval-gate paused -- leave as-is, /approve handles it):
       // the next invocation on the same path auto-resumes from completed nodes.
       const pathInfo = run.working_path ? ` at \`${run.working_path}\`` : '';
       return c.json({
@@ -2714,7 +2811,7 @@ export function registerApiRoutes(
       if (!approval?.nodeId) {
         return apiError(c, 400, 'Workflow run is paused but missing approval context');
       }
-      // For interactive loops, do NOT write node_completed — the executor writes it when
+      // For interactive loops, do NOT write node_completed -- the executor writes it when
       // the AI emits the completion signal (actual loop exit). Writing it here would cause
       // the resume to skip the loop node entirely via priorCompletedNodes.
       if (approval.type !== 'interactive_loop') {
@@ -2747,7 +2844,7 @@ export function registerApiRoutes(
       // without requiring the user to re-run the workflow command. Mirrors
       // what `workflowApproveCommand` does in the CLI. Requires
       // `parent_conversation_id` on the run (set by orchestrator-agent for any
-      // web-dispatched workflow — foreground, interactive, and background via
+      // web-dispatched workflow -- foreground, interactive, and background via
       // the pre-created run) and a web-platform parent (guarded in the helper).
       const autoResumed = await tryAutoResumeAfterGate(run, 'approve');
 
@@ -2803,7 +2900,7 @@ export function registerApiRoutes(
         // Auto-resume: dispatch to the orchestrator so the on_reject prompt runs
         // without requiring the user to re-run the workflow command. Mirrors
         // what `workflowRejectCommand` does in the CLI. Same cross-adapter
-        // guard as approve — only web parents auto-resume.
+        // guard as approve -- only web parents auto-resume.
         const autoResumed = await tryAutoResumeAfterGate(run, 'reject');
 
         return c.json({
@@ -2863,7 +2960,7 @@ export function registerApiRoutes(
     }
   });
 
-  // POST /api/workflows/runs/bulk-archive — MUST be before /{runId} routes
+  // POST /api/workflows/runs/bulk-archive -- MUST be before /{runId} routes
   registerOpenApiRoute(bulkArchiveWorkflowRunsRoute, async c => {
     try {
       const body = getValidatedBody(c, bulkArchiveBodySchema);
@@ -2878,11 +2975,29 @@ export function registerApiRoutes(
     }
   });
 
-  // DELETE /api/workflows/runs/bulk-failed — MUST be before /{runId} routes
+  // DELETE /api/workflows/runs/bulk-failed -- MUST be before /{runId} routes
   registerOpenApiRoute(bulkDeleteFailedRunsRoute, async c => {
     try {
       const dryRun = c.req.query('dryRun') === 'true';
-      const olderThan = c.req.query('olderThan') ?? undefined;
+      const olderThanRaw = c.req.query('olderThan') ?? undefined;
+      // bulkDeleteArchivedFailedRuns binds the cutoff directly into
+      // started_at < $1 with no duration parsing. Human-readable shortcuts
+      // (e.g. "14d", "30d", "1h") are accepted here and converted to an ISO
+      // cutoff before being forwarded to the DB layer. ISO timestamps pass
+      // through unchanged. Invalid values fail with a 400 instead of crashing
+      // Postgres on a bad cast.
+      let olderThan: string | undefined;
+      if (olderThanRaw !== undefined) {
+        const iso = parseDurationToIso(olderThanRaw);
+        if (iso === null) {
+          return apiError(
+            c,
+            400,
+            `Invalid olderThan value: '${olderThanRaw}'. Use ISO timestamp (e.g. 2026-01-01T00:00:00Z) or duration shortcut (e.g. 14d, 7d, 1h).`
+          );
+        }
+        olderThan = iso;
+      }
       const result = await workflowDb.bulkDeleteArchivedFailedRuns({ dryRun, olderThan });
       return c.json({ ...result, dryRun });
     } catch (error) {
@@ -2904,7 +3019,7 @@ export function registerApiRoutes(
         return apiError(
           c,
           400,
-          `Cannot delete workflow in '${run.status}' status — cancel it first`
+          `Cannot delete workflow in '${run.status}' status -- cancel it first`
         );
       }
       await workflowDb.deleteWorkflowRun(runId, force);
@@ -2988,8 +3103,8 @@ export function registerApiRoutes(
       const events = await workflowEventDb.listWorkflowEvents(runId);
 
       // Look up the run's conversation platform ID.
-      // For web runs (parent_conversation_id set): conversation_id is the worker conversation → set worker_platform_id
-      // For CLI runs (no parent): conversation_id is the single conversation → set conversation_platform_id only
+      // For web runs (parent_conversation_id set): conversation_id is the worker conversation -> set worker_platform_id
+      // For CLI runs (no parent): conversation_id is the single conversation -> set conversation_platform_id only
       let workerPlatformId: string | undefined;
       let conversationPlatformId: string | undefined;
       if (run.conversation_id) {
@@ -3290,7 +3405,7 @@ export function registerApiRoutes(
       }
 
       // maxDepth: 1 matches the executor's resolver (resolveCommand /
-      // loadCommandPrompt) — without this cap, the UI palette would surface
+      // loadCommandPrompt) -- without this cap, the UI palette would surface
       // commands buried in deep subfolders that the executor silently can't
       // resolve at runtime.
       const COMMAND_LIST_DEPTH = { maxDepth: 1 };
@@ -3307,7 +3422,7 @@ export function registerApiRoutes(
           if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
             getLog().error({ err }, 'commands.list_defaults_failed');
           }
-          // ENOENT: defaults path missing — not an error
+          // ENOENT: defaults path missing -- not an error
         }
       }
 
@@ -3322,7 +3437,7 @@ export function registerApiRoutes(
         if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
           getLog().error({ err }, 'commands.list_home_failed');
         }
-        // ENOENT: home commands dir not created yet — not an error
+        // ENOENT: home commands dir not created yet -- not an error
       }
 
       // 4. Project-defined commands override bundled AND global
@@ -3339,7 +3454,7 @@ export function registerApiRoutes(
             if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
               getLog().error({ err, dirPath }, 'commands.list_project_failed');
             }
-            // ENOENT: folder doesn't exist — skip
+            // ENOENT: folder doesn't exist -- skip
           }
         }
       }
@@ -3361,7 +3476,7 @@ export function registerApiRoutes(
   //  2. Response is raw text/markdown, not JSON
   app.get('/api/artifacts/:runId/*', async c => {
     const runId = c.req.param('runId');
-    // Hono wildcards match but don't capture — extract filename from the URL path.
+    // Hono wildcards match but don't capture -- extract filename from the URL path.
     // c.req.path is NOT percent-decoded, so we decode it manually.
     const prefix = `/api/artifacts/${runId}/`;
     const rawEncoded = c.req.path.startsWith(prefix) ? c.req.path.slice(prefix.length) : '';
@@ -3444,7 +3559,7 @@ export function registerApiRoutes(
     });
   });
 
-  // GET /api/config - Read-only configuration (safe subset only — no filesystem paths)
+  // GET /api/config - Read-only configuration (safe subset only -- no filesystem paths)
   registerOpenApiRoute(getConfigRoute, async c => {
     try {
       const config = await loadConfig();
@@ -3553,6 +3668,72 @@ export function registerApiRoutes(
       is_docker: isDocker(),
       activePlatforms: activePlatforms ? [...activePlatforms] : ['Web'],
     });
+  });
+
+  // GET /api/host-metrics - Read /host-artifacts/host-metrics.json written by
+  // the host-side collector (separate WO in bdc-xo). Returns the parsed JSON
+  // plus a stale flag if collectedAt is older than 10 minutes. Returns a
+  // documented 'no-data' shape (NOT a 500) when the file is absent so the
+  // dashboard can render "awaiting collector" cleanly before the collector
+  // is deployed.
+  registerOpenApiRoute(getHostMetricsRoute, async c => {
+    const noData = {
+      status: 'no-data' as const,
+      disk: null,
+      cpu: null,
+      mem: null,
+      collectedAt: null,
+      stale: false,
+    };
+    try {
+      const raw = await readFile('/host-artifacts/host-metrics.json', 'utf8');
+      const parsedJson: unknown = JSON.parse(raw);
+      const parsedObj =
+        typeof parsedJson === 'object' && parsedJson !== null
+          ? (parsedJson as Record<string, unknown>)
+          : {};
+      const collectedAtRaw = parsedObj.collectedAt;
+      const collectedAt = typeof collectedAtRaw === 'string' ? collectedAtRaw : null;
+      // Stale = collectedAt older than 10 minutes. If collectedAt is missing
+      // or unparseable we treat the data as stale (we can still show the
+      // last values, but flag them).
+      let stale = true;
+      if (collectedAt) {
+        const ts = Date.parse(collectedAt);
+        if (!Number.isNaN(ts)) {
+          stale = Date.now() - ts > 10 * 60 * 1000;
+        }
+      }
+      // Validate the parsed collector output against the response schema so
+      // malformed numeric fields (e.g. unexpected strings) cannot leak past
+      // the OpenAPI contract. On schema mismatch, log and fall back to the
+      // no-data shape rather than serving an off-contract payload.
+      const candidate = {
+        status: stale ? ('stale' as const) : ('ok' as const),
+        disk: parsedObj.disk ?? null,
+        cpu: parsedObj.cpu ?? null,
+        mem: parsedObj.mem ?? null,
+        collectedAt,
+        stale,
+      };
+      const validation = hostMetricsBodySchema.safeParse(candidate);
+      if (!validation.success) {
+        getLog().warn({ issues: validation.error.issues }, 'api.host_metrics_contract_violation');
+        return c.json(noData);
+      }
+      return c.json(validation.data);
+    } catch (error) {
+      const err = error as NodeJS.ErrnoException;
+      if (err.code === 'ENOENT') {
+        // Collector has not yet written the file. Surface a clear placeholder
+        // shape to the panel, not a 500.
+        return c.json(noData);
+      }
+      getLog().error({ err: error }, 'api.host_metrics_read_failed');
+      // Unexpected error (bad JSON, permissions, etc.) -- still return the
+      // no-data shape so the panel does not crash; the failure is logged.
+      return c.json(noData);
+    }
   });
 
   registerOpenApiRoute(getUpdateCheckRoute, async c => {
