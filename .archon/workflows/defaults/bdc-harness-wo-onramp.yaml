@@ -311,14 +311,54 @@ nodes:
         # Rule 11: no n8n webhook calls
         if grep -E 'n8n\.bluedevilcollectibles\.com' "$DRAFT" | grep -qv '#'; then echo "FAIL Rule 11: n8n webhook call found (hangs in executor subprocess)" >> "$FEEDBACK"; ERRORS=$((ERRORS+1)); fi
 
-        # Placeholder text checks
-        for BAD in "placeholder" "TODO" "FIXME" "TBD" "template" "sample text" "lorem" "REPLACE_ME" "{{" "}}" "<BUSINESS_RISK" "invariant here" "one sentence" "BUSINESS_RISK_INVARIANT from normalize"; do
-          if grep -qi "$BAD" "$DRAFT" 2>/dev/null; then echo "FAIL: child YAML contains placeholder text: $BAD" >> "$FEEDBACK"; ERRORS=$((ERRORS+1)); break; fi
+        # Conservative dev-error substring bans (defense-in-depth, loop-only).
+        # These tokens never legitimately appear in a healthy child YAML (verified
+        # against the canonical base patterns), so banning them as substrings is safe
+        # and catches sloppiness early. We deliberately do NOT ban "{{", "}}",
+        # "template", or "one sentence" here -- those appear legitimately in base-pattern
+        # prompt: bodies (e.g. gh api --template '{{.content}}', <one sentence John can
+        # answer>). Placeholder detection for THOSE is structural (the bun check below),
+        # not substring. See WO-CAULDRON-ONRAMP-ATOM-DEFECTS-6-7 + war-council verdict
+        # 2026-06-07: a substring scan has a hard false-positive ceiling against the
+        # canonical patterns; structural-position validation is the only sound design.
+        for BAD in "TODO" "FIXME" "TBD" "REPLACE_ME" "lorem ipsum"; do
+          if grep -qi "$BAD" "$DRAFT" 2>/dev/null; then echo "FAIL: child YAML contains dev-error token: $BAD" >> "$FEEDBACK"; ERRORS=$((ERRORS+1)); break; fi
         done
 
-        # bun YAML parse (container has bun, not python-yaml)
-        if ! bun -e "Bun.YAML.parse(require('fs').readFileSync('$DRAFT','utf8'))" 2>>"$FEEDBACK"; then
-          echo "FAIL: bun YAML parse failed -- YAML is not valid (see parse error above)" >> "$FEEDBACK"; ERRORS=$((ERRORS+1));
+        # Structural placeholder + YAML-parse check (single bun invocation).
+        # Parses the draft and validates the FILLED STRUCTURAL POSITIONS the author was
+        # told to substitute -- NOT rendered text. Checks ONLY root scalars + inputs.WO_ID.default;
+        # never traverses nodes[] or prompt: bodies (where legit <...> instruction tokens live).
+        STRUCT_ERR=$(DRAFT="$DRAFT" bun -e '
+          const fs = require("fs");
+          let obj;
+          try { obj = Bun.YAML.parse(fs.readFileSync(process.env.DRAFT, "utf8")); }
+          catch (e) { console.log("YAML parse failed: " + e.message); process.exit(0); }
+          if (obj === null || typeof obj !== "object") { console.log("draft is not a YAML mapping"); process.exit(0); }
+          const fails = [];
+          // (a) root model must be a real Claude model (ROOT ONLY -- node-level codex models are legitimate)
+          const model = obj.model;
+          if (!model || !/^(sonnet|opus|haiku|claude-[A-Za-z0-9._-]+)$/.test(String(model))) {
+            fails.push("root model: is missing or not a real model (got: " + String(model) + ")");
+          }
+          // (b) inputs.WO_ID.default must be a real WO_ID -- no angle bracket, no template phrase
+          const wid = obj && obj.inputs && obj.inputs.WO_ID ? obj.inputs.WO_ID.default : undefined;
+          if (wid === undefined || wid === null) { fails.push("inputs.WO_ID.default is missing"); }
+          else if (String(wid).includes("<") || String(wid).includes("normalize-spec")) { fails.push("inputs.WO_ID.default is an unfilled stub: " + String(wid)); }
+          // (c) root name must be a real slug -- no angle bracket
+          const nm = obj.name;
+          if (nm === undefined || nm === null) { fails.push("root name: is missing"); }
+          else if (String(nm).includes("<")) { fails.push("root name: is an unfilled stub: " + String(nm)); }
+          // (e) exact-match the atom-own author-facing stub strings against top-level scalar values ONLY
+          const stubs = ["<WO_ID from normalize-spec>","<bdc-slug>","<bluedevilcollectibles/repo>","<one sentence, verbatim from spec>","<slug>","<WO_ID>","<true|false>"];
+          for (const [k, v] of Object.entries(obj)) {
+            if (v === null || typeof v === "object") continue;
+            if (stubs.includes(String(v))) { fails.push("top-level field " + k + " is an unfilled stub: " + String(v)); }
+          }
+          if (fails.length) { console.log(fails.join("; ")); }
+        ' 2>&1 || true)
+        if [ -n "$STRUCT_ERR" ]; then
+          echo "FAIL: structural validation: $STRUCT_ERR" >> "$FEEDBACK"; ERRORS=$((ERRORS+1));
         fi
 
         if [ "$ERRORS" -gt 0 ]; then
@@ -329,8 +369,17 @@ nodes:
           exit 1
         fi
 
+        # Defect 6b skew-detection: record the exact draft this gate validated (name + sha256)
+        # so assert-yaml-ready can confirm it scans the SAME content. If the agent rewrites
+        # the file after this gate passes, assert-yaml-ready will surface the drift.
+        DRAFT_SHA=$(sha256sum "$DRAFT" 2>/dev/null | awk '{print $1}' || echo "unknown")
+        {
+          echo "DRAFT_FILE=$DRAFT"
+          echo "DRAFT_SHA=$DRAFT_SHA"
+        } > "$ARTIFACTS_DIR/yaml-author-validated.txt"
+
         echo "ARTIFACTS_DIR=$ARTIFACTS_DIR" >> "$FEEDBACK"
-        echo "YAML_READY=true (draft: $DRAFT)"
+        echo "YAML_READY=true (draft: $DRAFT sha: $DRAFT_SHA)"
         exit 0
       prompt: |
         You are major-build. Author a tailored child workflow YAML for the Work
@@ -380,36 +429,52 @@ nodes:
            replace underscores with hyphens. Write to <slug>.yaml.draft in CWD.
 
         ## Hard rules the child YAML MUST satisfy (validated by until_bash after you finish)
-        - model: sonnet at root
+        - model: sonnet at root (a real model string -- the structural gate checks root model:)
         - policyFile: harness/policies/agent-behavior.md at root
         - every loop: has prompt + until + max_iterations + fresh_context
         - paths repo-root-relative (no BDC_XO/ prefix)
         - no n8n webhook calls
         - flip-notion final node; business-risk-gate present and load_bearing: true
         - business-risk-gate includes BUSINESS_RISK_INVARIANT verbatim
-        - no placeholder text anywhere
-        - zero template tokens remain: TODO, FIXME, TBD, template, sample text, lorem,
-          REPLACE_ME, double curly braces, angle-bracket invariant placeholders
+        - root name: is the real child slug (NOT "<slug>" / "<bdc-slug>")
+        - inputs.WO_ID.default is the real WO_ID (NOT "<WO_ID>" / "<WO_ID from normalize-spec>")
+        - no dev-error tokens: TODO, FIXME, TBD, REPLACE_ME, lorem ipsum
+        - SUBSTITUTE every author-facing field: never leave one of the atom's OWN template
+          stubs as a literal top-level value -- "<one sentence, verbatim from spec>",
+          "<bdc-slug>", "<bluedevilcollectibles/repo>", "<WO_ID from normalize-spec>",
+          "<slug>", "<WO_ID>", "<true|false>" must be replaced with the real value.
+
+        ## What is NOT a placeholder (do NOT strip these)
+        Angle-bracket output-format instructions INSIDE prompt: node bodies are legitimate
+        and REQUIRED -- the canonical base pattern uses them (e.g. "<one sentence John can
+        answer>", "<true|false>", "<file:line>" inside a node's prompt telling its agent
+        what shape to output). Go-template tokens in bash nodes ("--template '{{.content}}'")
+        are also legitimate. The gate is STRUCTURAL: it only rejects unfilled values in the
+        root scalars + inputs.WO_ID.default. It does NOT scan prompt: bodies. So copy the
+        base pattern's prompt instructions faithfully -- do not mangle them to dodge a
+        substring. Just make sure the child's OWN identifying fields are real.
 
         ## Required self-check before emitting the sentinel
         Before you emit YAML_READY, inspect the draft yourself and confirm:
-        - id: business-risk-gate is present
-        - load_bearing: true is present in that node
+        - id: business-risk-gate is present and load_bearing: true is in that node
         - the exact BUSINESS_RISK_INVARIANT line from normalize-spec appears verbatim
-        - no placeholder or template token from the hard-rule list appears anywhere
+        - root model:, root name:, and inputs.WO_ID.default are all REAL values (no angle brackets)
+        - none of the atom's own template stubs (listed above) survive as literal top-level values
         If any check fails, fix the draft in this same iteration. Do not emit
         YAML_READY for an unchecked or known-bad draft.
 
         ## Output
         1. WRITE the file <slug>.yaml.draft to disk (you have write tools -- use them).
-        2. Emit this footer:
+        2. Emit this footer, substituting EVERY field with the REAL value (never leave
+           an angle-bracket instruction as the literal value -- the structural gate
+           rejects an unfilled field):
            === YAML-AUTHOR RESULT ===
-           YAML_FILENAME=<slug>.yaml.draft
-           WO_SLUG=<bdc-slug>
-           WO_ID=<WO_ID>
-           TARGET_REPO_FULL=<bluedevilcollectibles/repo>
-           RULE20_STAGING_GATE=<true|false>
-           BUSINESS_RISK_INVARIANT=<one sentence, verbatim from spec>
+           YAML_FILENAME=the.slug.yaml.draft
+           WO_SLUG=the-bdc-slug
+           WO_ID=the real WO_ID from normalize-spec
+           TARGET_REPO_FULL=bluedevilcollectibles/the-repo
+           RULE20_STAGING_GATE=true or false
+           BUSINESS_RISK_INVARIANT=paste the exact invariant text from normalize-spec output, verbatim
         3. Emit the sentinel YAML_READY on its own line.
 
         The until_bash gate validates your draft after this iteration. If it fails,
@@ -425,6 +490,7 @@ nodes:
     bash: |
       set -euo pipefail
       AUTHOR_OUT=$yaml-author.output
+      NORM_OUT=$normalize-spec.output
 
       YAML_FILENAME=$(printf '%s\n' "$AUTHOR_OUT" | sed -n 's/^YAML_FILENAME=//p' | head -n 1)
       WO_SLUG=$(printf '%s\n' "$AUTHOR_OUT" | sed -n 's/^WO_SLUG=//p' | head -n 1)
@@ -439,13 +505,65 @@ nodes:
         exit 1
       fi
 
-      # Hard re-check: parse + structural musts
-      bun -e "Bun.YAML.parse(require('fs').readFileSync('$YAML_FILENAME','utf8'))" 2>/dev/null || { echo "ERROR: draft does not parse as YAML" >&2; exit 1; }
+      # Defect 6b skew-detection: confirm we are scanning the SAME draft the loop validated.
+      # The loop wrote name+sha to yaml-author-validated.txt on its passing iteration. If the
+      # current file differs, the agent rewrote it after the loop gate -- surface it as a WARNING
+      # (do NOT skip: this node is defense-in-depth and must still scan the current content).
+      VALIDATED_FILE="$ARTIFACTS_DIR/yaml-author-validated.txt"
+      if [ -f "$VALIDATED_FILE" ]; then
+        PREV_SHA=$(sed -n 's/^DRAFT_SHA=//p' "$VALIDATED_FILE" | head -n 1)
+        CUR_SHA=$(sha256sum "$YAML_FILENAME" 2>/dev/null | awk '{print $1}' || echo "unknown")
+        if [ -n "$PREV_SHA" ] && [ "$PREV_SHA" != "unknown" ] && [ "$CUR_SHA" != "$PREV_SHA" ]; then
+          echo "WARNING: draft changed after the loop gate passed (loop sha=$PREV_SHA current sha=$CUR_SHA) -- re-validating current content" >&2
+        fi
+      fi
+
+      # Hard re-check: node-presence musts (key-name presence -- reliable substring check)
       grep -q 'id: business-risk-gate' "$YAML_FILENAME" || { echo "ERROR: business-risk-gate missing" >&2; exit 1; }
       grep -q 'id: flip-notion' "$YAML_FILENAME" || { echo "ERROR: flip-notion missing" >&2; exit 1; }
-      for BAD in "placeholder" "<BUSINESS_RISK" "invariant here" "one sentence"; do
-        if grep -qi "$BAD" "$YAML_FILENAME"; then echo "ERROR: placeholder text remains: $BAD" >&2; exit 1; fi
-      done
+
+      # Structural placeholder + YAML-parse check -- SAME logic as the loop until_bash (Finding-A parity).
+      # Parses the draft and validates FILLED STRUCTURAL POSITIONS (root scalars + inputs.WO_ID.default).
+      # Never scans nodes[] or prompt: bodies -- legit <...> instruction tokens live there.
+      # Substring scanning has a hard false-positive ceiling against the canonical base patterns
+      # (which contain {{ }}, "template", and bare <one sentence>); structural validation is the
+      # only sound design. See WO-CAULDRON-ONRAMP-ATOM-DEFECTS-6-7 + war-council verdict 2026-06-07.
+      STRUCT_ERR=$(YAML_FILENAME="$YAML_FILENAME" bun -e '
+        const fs = require("fs");
+        let obj;
+        try { obj = Bun.YAML.parse(fs.readFileSync(process.env.YAML_FILENAME, "utf8")); }
+        catch (e) { console.log("draft does not parse as YAML: " + e.message); process.exit(0); }
+        if (obj === null || typeof obj !== "object") { console.log("draft is not a YAML mapping"); process.exit(0); }
+        const fails = [];
+        const model = obj.model;
+        if (!model || !/^(sonnet|opus|haiku|claude-[A-Za-z0-9._-]+)$/.test(String(model))) {
+          fails.push("root model: missing or not a real model (got: " + String(model) + ")");
+        }
+        const wid = obj && obj.inputs && obj.inputs.WO_ID ? obj.inputs.WO_ID.default : undefined;
+        if (wid === undefined || wid === null) { fails.push("inputs.WO_ID.default missing"); }
+        else if (String(wid).includes("<") || String(wid).includes("normalize-spec")) { fails.push("inputs.WO_ID.default unfilled stub: " + String(wid)); }
+        const nm = obj.name;
+        if (nm === undefined || nm === null) { fails.push("root name: missing"); }
+        else if (String(nm).includes("<")) { fails.push("root name: unfilled stub: " + String(nm)); }
+        const stubs = ["<WO_ID from normalize-spec>","<bdc-slug>","<bluedevilcollectibles/repo>","<one sentence, verbatim from spec>","<slug>","<WO_ID>","<true|false>"];
+        for (const [k, v] of Object.entries(obj)) {
+          if (v === null || typeof v === "object") continue;
+          if (stubs.includes(String(v))) { fails.push("top-level field " + k + " unfilled stub: " + String(v)); }
+        }
+        if (fails.length) { console.log(fails.join("; ")); }
+      ' 2>&1 || true)
+      if [ -n "$STRUCT_ERR" ]; then
+        echo "ERROR: structural validation failed: $STRUCT_ERR" >&2
+        exit 1
+      fi
+
+      # (d) business-risk-gate must contain the BUSINESS_RISK_INVARIANT verbatim (the one check
+      # the old gate got right -- kept in both gates per war-council verdict).
+      BRI=$(printf '%s\n' "$NORM_OUT" | sed -n 's/^BUSINESS_RISK_INVARIANT=//p' | head -n 1)
+      if [ -n "$BRI" ] && ! grep -Fq "$BRI" "$YAML_FILENAME"; then
+        echo "ERROR: child YAML does not include BUSINESS_RISK_INVARIANT verbatim: $BRI" >&2
+        exit 1
+      fi
 
       echo "YAML_VALID=true"
       echo "YAML_FILENAME=$YAML_FILENAME"
@@ -1127,7 +1245,13 @@ nodes:
   - id: flip-notion
     agent: xo
     depends_on: [build-manifest]
-    when: "BINDING_OK=true"
+    # Defect 7 fix: this was bash-syntax ("BINDING_OK=true"), which the DAG engine cannot
+    # parse -> the node fail-closed and SKIPPED -> flip-notion never ran -> the WO's DoD
+    # ("reaches flip-notion") could never pass even on a fully-clean run. The engine requires
+    # expression syntax: $node.output =~ 'regex' or $node.output == 'VALUE'. verify-binding
+    # emits the literal line "BINDING_OK=true" on its success path only (failure paths emit
+    # BINDING_OK=false), so a regex match on verify-binding output is the correct gate.
+    when: "$verify-binding.output =~ 'BINDING_OK=true'"
     prompt: |
       ## GUARD: Only flip if run succeeded end-to-end
       Check build-manifest output for VALIDATION: PASS.
