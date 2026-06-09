@@ -999,6 +999,64 @@ nodes:
         printf '{"status":"BLOCKED","note":"opus-could-not-resolve"}\n'
       fi
 
+  # findings-consolidate: decompose every review finding into a structured ledger row so the
+  # human approval gate can show resolution + a concrete suggested fix per UNRESOLVED finding.
+  # AI node (not bash): plan-review emits unstructured prose; diff-review/-final + opus-repair
+  # emit sentinels. Only an AI pass normalizes all of them into the per-row JSON ledger.
+  - id: findings-consolidate
+    persona: xo
+    depends_on: [block-reclassify]
+    trigger_rule: all_done
+    task_class: clerical
+    prompt: |
+      Build the human-facing findings ledger for the approval gate. Read every review output
+      below and emit ONE JSON object. Do not invent findings; only consolidate what the reviews
+      and the repair tier already reported.
+
+      ## Inputs
+      plan-review findings (unstructured prose between sentinels):
+      $plan-review.output
+
+      diff-review verdict + findings:
+      $diff-review.output
+
+      diff-review-final verdict + UNRESOLVED list:
+      $diff-review-final.output
+
+      block-classify / block-reclassify status:
+      $block-reclassify.output
+
+      opus-repair result (REASON= names any fix the self-repair tier deferred):
+      $opus-repair.output
+
+      ## Output: STRICT JSON only. No prose. No code fences.
+      {
+        "summary": "<one line: N findings, M unresolved>",
+        "findings": [
+          {
+            "id": "<stable-kebab-id, e.g. locg-migration>",
+            "source": "plan-review | diff-review | diff-review-final | opus-repair",
+            "severity": "LOW | MEDIUM | HIGH",
+            "title": "<one line>",
+            "resolution": "FIXED-BY-LOOP | UNRESOLVED",
+            "suggested_fix": {
+              "diagnosis": "<the loop's own diagnosis, verbatim where available>",
+              "proposed_action": "<concrete, e.g. add migration 20260609_identity_connector_accounts_add_locg.sql ALTERing the connector CHECK constraint to include lunar/locg/prh>",
+              "fix_class": "CODE-EDIT | NEW-SCHEMA-MIGRATION | CONFIG | OTHER",
+              "boundary_flag": true
+            }
+          }
+        ]
+      }
+
+      Rules:
+      - Include EVERY finding: FIXED-BY-LOOP (for transparency) AND UNRESOLVED.
+      - Emit "suggested_fix" ONLY for UNRESOLVED rows; omit it on FIXED-BY-LOOP rows.
+      - Set boundary_flag=true exactly when fix_class == "NEW-SCHEMA-MIGRATION" (the loop will
+        NOT write that itself; it requires APPROVE-WITH-FIX).
+      - If there are zero unresolved findings, "findings" still lists the fixed ones and
+        "summary" says "0 unresolved".
+
   # pause-gate: the ONLY human touch, and ONLY when still BLOCKED after Opus. This PAUSES
   # the run (status=paused, resumable via /workflow approve|reject) -- it does NOT fail.
   - id: pause-gate
