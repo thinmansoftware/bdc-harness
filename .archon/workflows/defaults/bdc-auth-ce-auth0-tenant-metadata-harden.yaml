@@ -19,10 +19,10 @@
 # Deploy: BDC_XO/scripts/archon-bridge/sync-workflows.sh \
 #           bdc-auth-ce-auth0-tenant-metadata-harden.yaml
 #
-# Fire after deploy:
-#   curl -X POST https://archon.bluedevilcollectibles.com/api/workflows/bdc-auth-ce-auth0-tenant-metadata-harden/runs \
+# Fire after deploy (path is /run SINGULAR; /runs plural 404s):
+#   curl -X POST https://archon.bluedevilcollectibles.com/api/workflows/bdc-auth-ce-auth0-tenant-metadata-harden/run \
 #     -H "Content-Type: application/json" \
-#     -d '{"inputs":{"WO_ID":"WO-AUTH-CE-AUTH0-TENANT-METADATA-HARDEN-01"}}'
+#     -d '{"conversationId":"harden-WO-AUTH-CE-AUTH0-TENANT-METADATA-HARDEN-01","message":"Execute WO-AUTH-CE-AUTH0-TENANT-METADATA-HARDEN-01 --project lspro-react"}'
 
 name: bdc-auth-ce-auth0-tenant-metadata-harden
 description: |
