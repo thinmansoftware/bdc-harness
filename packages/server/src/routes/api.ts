@@ -2800,9 +2800,38 @@ export function registerApiRoutes(
     try {
       const run = await workflowDb.getWorkflowRun(runId);
       if (!run) {
+        // WO-MC-APPROVE-GATE-RELIABILITY-01: log early-returns. The 2026-06-09
+        // onramp incident left an 8-minute gap with no server-side trace of the
+        // first click. Logging here turns "did the click arrive?" from a guess
+        // into a fact in the archon logs.
+        getLog().info({ runId }, 'api.workflow_run_approve_not_found');
         return apiError(c, 404, 'Workflow run not found');
       }
+      // WO-MC-APPROVE-GATE-RELIABILITY-01: idempotency. Users re-click Approve
+      // when the UI looks stuck. Once the gate is approved the route flips the
+      // run to the 'failed' auto-resume sentinel and sets
+      // metadata.approval_response='approved'. A second click then hit the
+      // status!=='paused' guard and got a confusing 400 -- indistinguishable
+      // from a real failure. Recognize the already-approved state and report
+      // success without writing a duplicate approval_received or re-mutating
+      // the run. Only standard approvals carry approval_response; interactive
+      // loops do not, so they fall through to the normal paused-only path.
+      const priorResponse = run.metadata.approval_response as string | undefined;
       if (run.status !== 'paused') {
+        if (priorResponse === 'approved') {
+          getLog().info(
+            { runId, status: run.status },
+            'api.workflow_run_approve_idempotent_already_approved'
+          );
+          return c.json({
+            success: true,
+            message: `Workflow already approved: ${run.workflow_name}.`,
+          });
+        }
+        getLog().info(
+          { runId, status: run.status },
+          'api.workflow_run_approve_rejected_bad_status'
+        );
         return apiError(c, 400, `Cannot approve workflow in '${run.status}' status`);
       }
       // Validate via the route schema so an invalid decision_verb is rejected with
@@ -2815,6 +2844,7 @@ export function registerApiRoutes(
       const authorizedFixIds = body.authorized_fix_ids ?? [];
       const approval = run.metadata.approval as ApprovalContext | undefined;
       if (!approval?.nodeId) {
+        getLog().warn({ runId }, 'api.workflow_run_approve_missing_context');
         return apiError(c, 400, 'Workflow run is paused but missing approval context');
       }
       // For interactive loops, do NOT write node_completed -- the executor writes it when
@@ -2883,9 +2913,26 @@ export function registerApiRoutes(
     try {
       const run = await workflowDb.getWorkflowRun(runId);
       if (!run) {
+        getLog().info({ runId }, 'api.workflow_run_reject_not_found');
         return apiError(c, 404, 'Workflow run not found');
       }
+      // WO-MC-APPROVE-GATE-RELIABILITY-01: idempotency + observability, mirror
+      // of the approve route. A reject on a paused gate either cancels the run
+      // (no on_reject) or flips it to the 'failed' on_reject sentinel. If the
+      // user re-clicks Reject after the run already went terminal-cancelled,
+      // report success rather than a confusing 400.
       if (run.status !== 'paused') {
+        if (run.status === 'cancelled') {
+          getLog().info(
+            { runId, status: run.status },
+            'api.workflow_run_reject_idempotent_already_cancelled'
+          );
+          return c.json({
+            success: true,
+            message: `Workflow already rejected: ${run.workflow_name}.`,
+          });
+        }
+        getLog().info({ runId, status: run.status }, 'api.workflow_run_reject_rejected_bad_status');
         return apiError(c, 400, `Cannot reject workflow in '${run.status}' status`);
       }
       const body = (await c.req.json().catch(() => ({}))) as { reason?: string };

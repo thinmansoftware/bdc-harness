@@ -16,7 +16,13 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Ban, CheckCircle, Pause, X, XCircle } from 'lucide-react';
 
 import type { DagNode, WorkflowEventResponse } from '@/lib/api';
-import { approveWorkflowRun, cancelWorkflowRun, getNodeEvents, rejectWorkflowRun } from '@/lib/api';
+import {
+  approveWorkflowRun,
+  cancelWorkflowRun,
+  getNodeEvents,
+  getWorkflowRun,
+  rejectWorkflowRun,
+} from '@/lib/api';
 
 /** The graded choice verbs exposed by the approve gate UI. */
 export type GradedVerb = 'approve_as_is' | 'approve_with_fix' | 'reject';
@@ -216,26 +222,80 @@ export function NodePeekPanel({
   const unresolved = useMemo(() => unresolvedFindings(findings), [findings]);
   const approveWithFixDisabled = isApproveWithFixDisabled(findings);
 
-  const onApprove = async (): Promise<void> => {
+  // WO-MC-APPROVE-GATE-RELIABILITY-01: confirm-and-retry submit.
+  //
+  // The 2026-06-09 onramp incident (run 032da37): the user clicked Approve, the
+  // gate decision was never recorded server-side, the run stayed paused for
+  // ~8 minutes, and a second click was needed. A single fire-and-forget POST
+  // gives no feedback when the click is lost (dropped fetch, transient network,
+  // status lag). This wraps the submit so a single user click reliably results
+  // in EITHER a recorded decision OR a loud, visible failure -- never a silent
+  // no-op the user has to guess at.
+  //
+  // Strategy: POST -> re-fetch the run -> if it's still paused on THIS gate,
+  // the decision did not land, so retry the POST once -> re-fetch again. If it
+  // is still paused after the retry, surface an explicit error. The approve/
+  // reject routes are idempotent server-side, so a retry that races a
+  // first-attempt success is harmless (returns "already approved").
+  const submitGate = async (
+    label: 'approving' | 'rejecting',
+    fire: () => Promise<{ success: boolean; message: string }>
+  ): Promise<void> => {
     if (gateBusy !== null) return;
-    setGateBusy('approving');
+    setGateBusy(label);
     setGateError(null);
+    const verb = label === 'approving' ? 'Approve' : 'Reject';
+    // Re-check whether this gate is still the unresolved pause. A run that has
+    // moved past 'paused' (auto-resume sets a transient 'failed', then running/
+    // completed) means the decision landed -- success. Still paused on a
+    // DIFFERENT node = a later gate; this one is done.
+    const gateStillPaused = async (): Promise<boolean> => {
+      try {
+        const { run } = await getWorkflowRun(runId);
+        if (run.status !== 'paused') return false;
+        const ctx = run.metadata?.approval as { nodeId?: string } | undefined;
+        return ctx?.nodeId === nodeId;
+      } catch {
+        // Unreadable run = cannot confirm -> conservative: assume still paused
+        // so we retry rather than falsely report success.
+        return true;
+      }
+    };
     try {
-      // Legacy binary path: send the ORIGINAL wire body (no decision_verb).
-      // The backend schema applies the approve_as_is default itself, so behavior
-      // is identical and the legacy wire shape is preserved unchanged.
-      await approveWorkflowRun(runId);
-      // Trigger a re-fetch so the run status + events refresh promptly.
-      // A transient run.status === 'failed' is expected during auto-resume
-      // (api.ts:2672) and must NOT be treated as an error here.
+      await fire();
       await queryClient.invalidateQueries({ queryKey: ['workflowRun', runId] });
+
+      if (await gateStillPaused()) {
+        // First attempt did not land. Retry once (idempotent server-side).
+        await fire();
+        await queryClient.invalidateQueries({ queryKey: ['workflowRun', runId] });
+        if (await gateStillPaused()) {
+          setGateError(
+            `${verb} did not register -- the run is still paused. Try again, or use Kill (/cancel) to stop the run.`
+          );
+          return;
+        }
+      }
+      // Confirmed: gate resolved. Refresh node events too.
+      await queryClient.invalidateQueries({ queryKey: ['nodeEvents', runId, nodeId] });
     } catch (err) {
-      setGateError(err instanceof Error ? err.message : 'Approve failed');
+      setGateError(err instanceof Error ? err.message : `${verb} failed`);
     } finally {
       setGateBusy(null);
     }
   };
 
+  // Binary (legacy) Approve / Reject buttons use the confirm-and-retry wrapper
+  // (WO-MC-APPROVE-GATE-RELIABILITY-01) so a single click reliably lands a
+  // decision or surfaces a loud failure. onReject is also the graded-mode
+  // Reject path (the graded Confirm button routes 'reject' here).
+  const onApprove = (): Promise<void> => submitGate('approving', () => approveWorkflowRun(runId));
+
+  const onReject = (): Promise<void> => submitGate('rejecting', () => rejectWorkflowRun(runId));
+
+  // Graded-mode Confirm routes (WO-CAULDRON-APPROVE-GATE-FINDINGS-AND-FIX-01):
+  // approve-as-is and approve-with-fix carry the decision_verb (and authorized
+  // fix ids) the binary path does not. Reject reuses onReject above.
   const onApproveAsIs = async (): Promise<void> => {
     if (gateBusy !== null) return;
     setGateBusy('approving');
@@ -262,20 +322,6 @@ export function NodePeekPanel({
       await queryClient.invalidateQueries({ queryKey: ['workflowRun', runId] });
     } catch (err) {
       setGateError(err instanceof Error ? err.message : 'Approve-with-fix failed');
-    } finally {
-      setGateBusy(null);
-    }
-  };
-
-  const onReject = async (): Promise<void> => {
-    if (gateBusy !== null) return;
-    setGateBusy('rejecting');
-    setGateError(null);
-    try {
-      await rejectWorkflowRun(runId);
-      await queryClient.invalidateQueries({ queryKey: ['workflowRun', runId] });
-    } catch (err) {
-      setGateError(err instanceof Error ? err.message : 'Reject failed');
     } finally {
       setGateBusy(null);
     }
