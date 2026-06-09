@@ -59,6 +59,19 @@ export function parseFindingsFromMessage(message: string): GateFinding[] {
   }
 }
 
+/** Filter a findings ledger to only the unresolved rows (eligible for fix). */
+export function unresolvedFindings(findings: GateFinding[]): GateFinding[] {
+  return findings.filter(f => !f.resolved);
+}
+
+/**
+ * The disabled predicate for the "Approve with fix" control: there is nothing
+ * to fix when no unresolved findings remain (empty ledger OR all resolved).
+ */
+export function isApproveWithFixDisabled(findings: GateFinding[]): boolean {
+  return unresolvedFindings(findings).length === 0;
+}
+
 /**
  * Cast nodeDef.approval to the extended shape that includes the optional
  * choices field (present in the Zod schema but not yet in api.generated.d.ts).
@@ -200,16 +213,18 @@ export function NodePeekPanel({
     () => (approval?.message ? parseFindingsFromMessage(approval.message) : []),
     [approval?.message]
   );
-  const unresolvedFindings = useMemo(() => findings.filter(f => !f.resolved), [findings]);
+  const unresolved = useMemo(() => unresolvedFindings(findings), [findings]);
+  const approveWithFixDisabled = isApproveWithFixDisabled(findings);
 
   const onApprove = async (): Promise<void> => {
     if (gateBusy !== null) return;
     setGateBusy('approving');
     setGateError(null);
     try {
-      await approveWorkflowRun(runId, undefined, {
-        decision_verb: 'approve_as_is',
-      });
+      // Legacy binary path: send the ORIGINAL wire body (no decision_verb).
+      // The backend schema applies the approve_as_is default itself, so behavior
+      // is identical and the legacy wire shape is preserved unchanged.
+      await approveWorkflowRun(runId);
       // Trigger a re-fetch so the run status + events refresh promptly.
       // A transient run.status === 'failed' is expected during auto-resume
       // (api.ts:2672) and must NOT be treated as an error here.
@@ -395,9 +410,7 @@ export function NodePeekPanel({
                         setCheckedFixIds(new Set());
                       }}
                       disabled={
-                        gateBusy !== null ||
-                        cancelMutation.isPending ||
-                        unresolvedFindings.length === 0
+                        gateBusy !== null || cancelMutation.isPending || approveWithFixDisabled
                       }
                       className={`flex items-center gap-1 rounded-md px-2 py-1 text-xs border transition-colors disabled:opacity-50 disabled:cursor-not-allowed ${
                         gradedVerb === 'approve_with_fix'
@@ -431,12 +444,12 @@ export function NodePeekPanel({
                 </div>
 
                 {/* Per-finding checkboxes for approve-with-fix */}
-                {gradedVerb === 'approve_with_fix' && unresolvedFindings.length > 0 && (
+                {gradedVerb === 'approve_with_fix' && unresolved.length > 0 && (
                   <div className="mb-2 space-y-1" data-testid="fix-findings-list">
                     <p className="text-[10px] text-text-tertiary uppercase tracking-wide mb-1">
                       Authorize fixes for:
                     </p>
-                    {unresolvedFindings.map(f => (
+                    {unresolved.map(f => (
                       <label
                         key={f.id}
                         className="flex items-center gap-2 text-xs text-text-secondary cursor-pointer"
