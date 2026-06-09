@@ -314,7 +314,7 @@ describe('GET /api/workflows/:name', () => {
     const app = createTestApp();
     registerApiRoutes(app, {} as WebAdapter, {} as ConversationLockManager);
 
-    // No cwd → no readFile attempt → checks BUNDLED_WORKFLOWS → not there → 404
+    // No cwd -> no readFile attempt -> checks BUNDLED_WORKFLOWS -> not there -> 404
     mockListCodebases.mockImplementationOnce(async () => []);
 
     const response = await app.request('/api/workflows/nonexistent-workflow');
@@ -327,7 +327,7 @@ describe('GET /api/workflows/:name', () => {
     const app = createTestApp();
     registerApiRoutes(app, {} as WebAdapter, {} as ConversationLockManager);
 
-    // No cwd → no readFile attempt → checks BUNDLED_WORKFLOWS → archon-assist found
+    // No cwd -> no readFile attempt -> checks BUNDLED_WORKFLOWS -> archon-assist found
     mockListCodebases.mockImplementationOnce(async () => []);
 
     const response = await app.request('/api/workflows/archon-assist');
@@ -537,7 +537,7 @@ describe('DELETE /api/workflows/:name', () => {
     const app = createTestApp();
     registerApiRoutes(app, {} as WebAdapter, {} as ConversationLockManager);
 
-    // Uses real unlink on a path that definitely does not exist → natural ENOENT → 404
+    // Uses real unlink on a path that definitely does not exist -> natural ENOENT -> 404
     const response = await app.request('/api/workflows/test-nonexistent-workflow-xyz', {
       method: 'DELETE',
     });
