@@ -652,6 +652,7 @@ nodes:
       AUTO_APPROVE=$(printf '%s\n' "$PREVIEW" | sed -n 's/^auto_approve=//p' | head -n 1)
       WO_ID=$(printf '%s\n' "$PREVIEW" | sed -n 's/^wo_id=//p' | head -n 1)
       TARGET_REPO=$(printf '%s\n' "$PREVIEW" | sed -n 's/^target_repo=//p' | head -n 1)
+      FIRE_WORKFLOW=$(printf '%s\n' "$PREVIEW" | sed -n 's/^fire_workflow=//p' | head -n 1)
       DUP_LINE=$(printf '%s\n' "$PREVIEW" | grep -E '^(DUPLICATE_RUN_DETECTED|duplicate_check)' | head -n 1 || true)
 
       # Guard 1: mode must be --fire (when: should have skipped us if not)
@@ -681,6 +682,10 @@ nodes:
         echo "ERROR: missing WO_ID or TARGET_REPO from preview" >&2
         exit 1
       fi
+      if [ -z "$FIRE_WORKFLOW" ]; then
+        echo "ERROR: missing fire_workflow slug from preview" >&2
+        exit 1
+      fi
 
       # Guard 4: ARCHON_OPERATOR_TOKEN must be in executor env (Ambiguity #4).
       if [ -z "${ARCHON_OPERATOR_TOKEN:-}" ]; then
@@ -690,21 +695,23 @@ nodes:
         exit 1
       fi
 
-      # POST to Cauldron conversations endpoint with the execution message.
-      # This pattern matches bdc-doctrine-update post-completed n8n call style
-      # for content-type + auth header.
+      # POST to the Cauldron workflow-run endpoint to fire the child workflow.
+      # The slug goes in the URL path; body is exactly {conversationId, message}.
+      # /api/conversations (.strict() schema: {codebaseId?, message?}) does NOT
+      # fire a named workflow and rejects extra keys with HTTP 400 (-> curl exit 22).
+      CONV_ID="wo-author-${WO_ID}-$(date +%s)"
       RESPONSE=$(curl -fsS -X POST \
-        "https://archon.bluedevilcollectibles.com/api/conversations" \
+        "https://archon.bluedevilcollectibles.com/api/workflows/${FIRE_WORKFLOW}/run" \
         -H "Content-Type: application/json" \
         -H "x-archon-operator-token: ${ARCHON_OPERATOR_TOKEN}" \
         --max-time 30 \
-        -d "{\"message\": \"Execute ${WO_ID} --project ${TARGET_REPO}\"}" \
+        -d "{\"conversationId\": \"${CONV_ID}\", \"message\": \"Execute ${WO_ID} --project ${TARGET_REPO}\"}" \
         2>&1)
 
-      # jq extracts whichever id field the API returned (id, conversation_id, run_id);
-      # falls back to "parse_failed" if the body is not JSON or has none of those keys.
+      # jq extracts whichever id field the API returned (runId from /run, or
+      # id/conversation_id/run_id); falls back to "parse_failed" otherwise.
       RUN_ID=$(printf '%s\n' "$RESPONSE" \
-        | jq -r '.id // .conversation_id // .run_id // "unknown"' 2>/dev/null \
+        | jq -r '.runId // .id // .conversation_id // .run_id // "unknown"' 2>/dev/null \
         || echo "parse_failed")
 
       echo "FIRE_OK=true"

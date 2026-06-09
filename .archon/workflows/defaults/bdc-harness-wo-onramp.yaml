@@ -784,7 +784,7 @@ nodes:
       What approval authorizes (two side effects):
         1. Register ${YAML_FILENAME} to .archon/workflows/defaults/ on bdc-harness dev,
            hot-reload it with PUT /api/workflows/${WO_SLUG}, then verify GET /api/workflows
-        2. POST /api/conversations to fire ${WO_SLUG} against ${TARGET_REPO_FULL}
+        2. POST /api/workflows/${WO_SLUG}/run to fire ${WO_SLUG} against ${TARGET_REPO_FULL}
 
       Adversarial review summary:
       ${ADV_OUT}
@@ -803,7 +803,7 @@ nodes:
 
         Two side effects will be authorized:
           1. Persist the child YAML to bdc-harness dev, then hot-reload it with PUT /api/workflows/:name
-          2. Fire the child workflow against the target codebase via POST /api/conversations
+          2. Fire the child workflow against the target codebase via POST /api/workflows/<slug>/run
 
         If ADV_PASS=false is shown in the packet, type "override adv" to proceed anyway.
         If DUPLICATE_RUN_DETECTED is shown, type "fire anyway" to override.
@@ -1057,7 +1057,7 @@ nodes:
       echo "DEST_PATH=${DEST_PATH}"
 
   # Node 9: fire-child
-  # POSTs /api/conversations with workflowName to fire the registered child workflow.
+  # POSTs /api/workflows/<slug>/run with a synthesized conversationId to fire the registered child workflow.
   - id: fire-child
     load_bearing: true
     depends_on: [register-yaml]
@@ -1089,21 +1089,21 @@ nodes:
       fi
 
       FIRE_MESSAGE="Execute ${WO_ID} --project ${TARGET_REPO}"
-      echo "Firing: workflowName=${WO_SLUG} message='${FIRE_MESSAGE}' repo=${TARGET_REPO_FULL}"
+      CONV_ID="onramp-${WO_ID}-$(date +%s)"
+      echo "Firing: workflowSlug=${WO_SLUG} conversationId=${CONV_ID} message='${FIRE_MESSAGE}' repo=${TARGET_REPO_FULL}"
 
       RESPONSE=$(curl -fsS -X POST \
-        "https://archon.bluedevilcollectibles.com/api/conversations" \
+        "https://archon.bluedevilcollectibles.com/api/workflows/${WO_SLUG}/run" \
         -H "Content-Type: application/json" \
         -H "x-archon-operator-token: ${ARCHON_OPERATOR_TOKEN}" \
         --max-time 30 \
         -d "{
-          \"workflowName\": \"${WO_SLUG}\",
-          \"message\": \"${FIRE_MESSAGE}\",
-          \"inputs\": {\"WO_ID\": \"${WO_ID}\"}
+          \"conversationId\": \"${CONV_ID}\",
+          \"message\": \"${FIRE_MESSAGE}\"
         }" 2>&1)
 
       RUN_ID=$(printf '%s\n' "$RESPONSE" \
-        | python3 -c "import sys, json; d=json.load(sys.stdin); print(d.get('id') or d.get('conversation_id') or d.get('run_id') or 'unknown')" \
+        | python3 -c "import sys, json; d=json.load(sys.stdin); print(d.get('runId') or d.get('id') or d.get('conversation_id') or d.get('run_id') or 'unknown')" \
         2>/dev/null || echo "parse_failed")
 
       if [ "$RUN_ID" = "parse_failed" ] || [ "$RUN_ID" = "unknown" ]; then
