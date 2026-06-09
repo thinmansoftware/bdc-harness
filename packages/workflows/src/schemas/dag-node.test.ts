@@ -144,4 +144,12 @@ describe('approval choices (additive)', () => {
     const parsed = approvalNodeSchema.parse({ id: 'gate', approval: { message: 'hi' } });
     expect(parsed.approval.choices).toBeUndefined();
   });
+
+  it('rejects an unknown choice value', () => {
+    const result = approvalNodeSchema.safeParse({
+      id: 'gate',
+      approval: { message: 'hi', choices: ['approve_as_is', 'bad_value'] },
+    });
+    expect(result.success).toBe(false);
+  });
 });
