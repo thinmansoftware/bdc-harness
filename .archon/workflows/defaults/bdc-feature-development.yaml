@@ -1088,6 +1088,65 @@ nodes:
           Output: OPERATOR_REJECTED: <reason from approval response>
         max_attempts: 2
 
+  # apply-suggested-fix: runs ONLY when the operator chose APPROVE-WITH-FIX at the gate.
+  # Authorizes overseer-opus to apply the named suggested fix(es) -- including writing a NEW
+  # schema migration the self-repair loop deferred -- but ONLY for the authorized_fix_ids.
+  # trigger_rule all_done so an APPROVE-AS-IS run (which skips this) does not hang the DAG.
+  - id: apply-suggested-fix
+    agent: overseer-opus
+    effort: xhigh
+    context: fresh
+    depends_on: [pause-gate]
+    trigger_rule: all_done
+    when: "$pause-gate.output.decision_verb == 'approve_with_fix'"
+    prompt: |
+      The operator authorized specific fixes at the approval gate. Apply ONLY the fixes whose
+      ids appear in authorized_fix_ids. Do NOT apply any other finding.
+
+      ## The full ledger (each finding has an id + suggested_fix)
+      $findings-consolidate.output
+
+      ## Operator decision (AUTHORITATIVE -- authorized_fix_ids lives here)
+      $pause-gate.output
+
+      ## Rules
+      - Apply ONLY fixes whose id is in the operator's authorized_fix_ids. If authorized_fix_ids
+        is empty or missing, make NO changes and emit APPLY_SUGGESTED_FIX=nothing-authorized.
+      - For a NEW-SCHEMA-MIGRATION fix: create the migration file named in proposed_action.
+        Check it does not already exist before writing (idempotent create).
+      - Make the minimal change. Do NOT reformat unrelated code (agent-behavior policy).
+      - Work only in the assigned worktree.
+
+      ## Output (last lines)
+        APPLY_SUGGESTED_FIX=<applied|nothing-authorized>
+        FILES_CHANGED:
+        - <path>   (repeat; or "(none)")
+
+  # apply-diff-review-final: re-review the fix(es) apply-suggested-fix wrote, BEFORE any commit.
+  # Distinct id (diff-review-final already ran upstream). Only meaningful on the APPROVE-WITH-FIX path.
+  - id: apply-diff-review-final
+    provider: codex
+    model: gpt-5.5
+    agent: codex-adversarial-reviewer
+    depends_on: [apply-suggested-fix]
+    trigger_rule: all_done
+    when: "$pause-gate.output.decision_verb == 'approve_with_fix'"
+    prompt: |
+      Re-review ONLY the changes apply-suggested-fix just made (especially any new schema
+      migration). Read-only. Verify the fix matches the operator-authorized proposed_action and
+      introduces no regression or unsafe behavior.
+
+      ## What was applied
+      $apply-suggested-fix.output
+
+      ## The authorized ledger
+      $findings-consolidate.output
+
+      ## Output (STDOUT only)
+        APPLY_DIFF_REVIEW_FINAL=<satisfied|needs_revision>
+        UNRESOLVED:
+        - <finding still open>   (or "(none)")
+
   - id: decide-push-target
     persona: major-build
     depends_on: [block-reclassify]

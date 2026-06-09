@@ -8030,3 +8030,36 @@ describe('agent persona dispatch', () => {
     expect(nodeConfig.allowed_tools).toBeUndefined();
   });
 });
+
+// T3: approve_with_fix routing tests
+// These tests verify the condition-evaluator correctly routes the APPROVE-WITH-FIX branch.
+// They use the real evaluator (not mocked) so they prove the actual DAG routing logic.
+import { evaluateCondition } from './condition-evaluator';
+
+it('approve_with_fix routes into apply-suggested-fix; approve_as_is does not', () => {
+  const withFix = new Map<string, NodeOutput>([
+    [
+      'pause-gate',
+      {
+        state: 'completed',
+        output: JSON.stringify({
+          decision_verb: 'approve_with_fix',
+          authorized_fix_ids: ['locg-migration'],
+        }),
+      },
+    ],
+  ]);
+  expect(
+    evaluateCondition("$pause-gate.output.decision_verb == 'approve_with_fix'", withFix).result
+  ).toBe(true);
+
+  const asIs = new Map<string, NodeOutput>([
+    [
+      'pause-gate',
+      { state: 'completed', output: JSON.stringify({ decision_verb: 'approve_as_is' }) },
+    ],
+  ]);
+  expect(
+    evaluateCondition("$pause-gate.output.decision_verb == 'approve_with_fix'", asIs).result
+  ).toBe(false);
+});
