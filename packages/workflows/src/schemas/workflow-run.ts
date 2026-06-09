@@ -126,7 +126,7 @@ export interface ApprovalContext {
   onRejectPrompt?: string;
   /** Max rejection attempts before cancellation (default 3). */
   onRejectMaxAttempts?: number;
-  /** The graded decision the operator chose at the gate (approve_with_fix / approve_as_is). Absent => legacy binary approve. */
+  /** The graded decision the operator chose at the gate (approve_as_is / approve_with_fix). Absent => legacy binary approve. */
   decisionVerb?: 'approve_as_is' | 'approve_with_fix';
   /** Finding ids the operator authorized the loop to fix (only meaningful when decisionVerb === 'approve_with_fix'). */
   authorizedFixIds?: string[];
