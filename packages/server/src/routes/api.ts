@@ -2805,13 +2805,13 @@ export function registerApiRoutes(
       if (run.status !== 'paused') {
         return apiError(c, 400, `Cannot approve workflow in '${run.status}' status`);
       }
-      const body = (await c.req.json().catch(() => ({}))) as {
-        comment?: string;
-        decision_verb?: 'approve_as_is' | 'approve_with_fix';
-        authorized_fix_ids?: string[];
-      };
+      // Validate via the route schema so an invalid decision_verb is rejected with
+      // 400 BEFORE anything is persisted. The OpenAPI defaultHook (validationErrorHook)
+      // returns 400 on a Zod failure before this handler runs; Zod also applies the
+      // .default('approve_as_is') so decision_verb is always a valid enum value here.
+      const body = getValidatedBody(c, approveWorkflowRunBodySchema);
       const comment = body.comment ?? 'Approved';
-      const decisionVerb = body.decision_verb ?? 'approve_as_is';
+      const decisionVerb = body.decision_verb; // schema default already applied
       const authorizedFixIds = body.authorized_fix_ids ?? [];
       const approval = run.metadata.approval as ApprovalContext | undefined;
       if (!approval?.nodeId) {

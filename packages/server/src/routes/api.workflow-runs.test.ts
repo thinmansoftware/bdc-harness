@@ -1962,6 +1962,36 @@ describe('POST /api/workflows/runs/:runId/approve', () => {
     const parsed = JSON.parse(rawData?.node_output as string) as Record<string, unknown>;
     expect(parsed.decision_verb).toBe('approve_as_is');
   });
+
+  // Guard: decision_verb drives DAG routing into the DB, so an invalid enum value
+  // MUST be rejected with 400 by schema validation and nothing may be persisted.
+  test('rejects an invalid decision_verb with 400', async () => {
+    mockGetWorkflowRun.mockResolvedValueOnce({
+      ...MOCK_PAUSED_RUN,
+      id: 'run-verb-bogus',
+      metadata: {
+        approval: {
+          type: 'approval',
+          nodeId: 'review-gate',
+          message: 'Review the plan',
+          captureResponse: true,
+        },
+      },
+    });
+    const { app } = makeApp();
+    const response = await app.request('/api/workflows/runs/run-verb-bogus/approve', {
+      method: 'POST',
+      body: JSON.stringify({ comment: 'LGTM', decision_verb: 'bogus' }),
+      headers: { 'Content-Type': 'application/json' },
+    });
+    expect(response.status).toBe(400);
+    // Nothing may be persisted when validation fails.
+    const nodeCompletedCall = mockCreateWorkflowEvent.mock.calls.find(
+      (c: unknown[]) => (c[0] as Record<string, unknown>).event_type === 'node_completed'
+    );
+    expect(nodeCompletedCall).toBeUndefined();
+    expect(mockCreateWorkflowEvent).not.toHaveBeenCalled();
+  });
 });
 
 // ---------------------------------------------------------------------------
