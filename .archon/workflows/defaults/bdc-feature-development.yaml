@@ -1112,8 +1112,11 @@ nodes:
       ## Rules
       - Apply ONLY fixes whose id is in the operator's authorized_fix_ids. If authorized_fix_ids
         is empty or missing, make NO changes and emit APPLY_SUGGESTED_FIX=nothing-authorized.
-      - For a NEW-SCHEMA-MIGRATION fix: create the migration file named in proposed_action.
-        Check it does not already exist before writing (idempotent create).
+      - For an AUTHORIZED NEW-SCHEMA-MIGRATION fix (its id is in authorized_fix_ids): create the
+        migration file named in proposed_action. Check it does not already exist before writing
+        (idempotent create). NEVER write a migration for a finding whose id is not in
+        authorized_fix_ids -- that is the loop boundary; only an explicit operator authorization
+        may cross it.
       - Make the minimal change. Do NOT reformat unrelated code (agent-behavior policy).
       - Work only in the assigned worktree.
 
