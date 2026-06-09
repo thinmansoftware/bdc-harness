@@ -358,4 +358,57 @@ describe('evaluateCondition', () => {
     expect(res.result).toBe(true);
     expect(res.parsed).toBe(true);
   });
+
+  // --- Regression: bdc-harness-wo-onramp flip-notion gate (Defect 7, 2026-06-09) ---
+  // The on-ramp flip-notion node never fired because its when: used =~ (regex), which this
+  // evaluator does not support, and even == compared against verify-binding's chatty
+  // multi-line output. The fix routes verify-binding through a binding-gate classifier node
+  // whose entire stdout is one JSON line, gated with the supported $node.output.field == form.
+  describe('bdc-harness-wo-onramp flip-notion regression', () => {
+    it('=~ regex operator is unsupported and fails closed (the original bug)', () => {
+      const outputs = new Map([
+        ['verify-binding', makeOutput('echo line\nBINDING_OK=true\nRUN_ID=abc')],
+      ]);
+      const res = evaluateCondition(
+        "$verify-binding.output =~ 'BINDING_OK=(true|unverified)'",
+        outputs
+      );
+      expect(res.parsed).toBe(false); // unparseable
+      expect(res.result).toBe(false); // fail-closed = node skipped (the bug)
+    });
+
+    it('== against chatty multi-line output never matches (a sentinel line alone is not enough)', () => {
+      const outputs = new Map([
+        ['verify-binding', makeOutput('echo line\nBINDING_OK=true\nRUN_ID=abc')],
+      ]);
+      const res = evaluateCondition("$verify-binding.output == 'BINDING_OK=true'", outputs);
+      expect(res.result).toBe(false); // whole-output compare, so it never equals the sentinel
+    });
+
+    it('the fix: gate on binding-gate JSON .gate field -- proceed runs flip-notion', () => {
+      const outputs = new Map([
+        ['binding-gate', makeOutput('{"gate":"proceed","binding_ok":"true"}')],
+      ]);
+      const res = evaluateCondition("$binding-gate.output.gate == 'proceed'", outputs);
+      expect(res.parsed).toBe(true);
+      expect(res.result).toBe(true);
+    });
+
+    it('the fix: unverified soft-miss also produces gate=proceed (flip-notion still runs)', () => {
+      const outputs = new Map([
+        ['binding-gate', makeOutput('{"gate":"proceed","binding_ok":"unverified"}')],
+      ]);
+      const res = evaluateCondition("$binding-gate.output.gate == 'proceed'", outputs);
+      expect(res.result).toBe(true);
+    });
+
+    it('the fix: a halt gate value skips flip-notion (fail-closed on a non-success binding)', () => {
+      const outputs = new Map([
+        ['binding-gate', makeOutput('{"gate":"halt","binding_ok":"false"}')],
+      ]);
+      const res = evaluateCondition("$binding-gate.output.gate == 'proceed'", outputs);
+      expect(res.parsed).toBe(true);
+      expect(res.result).toBe(false);
+    });
+  });
 });
