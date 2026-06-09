@@ -1285,6 +1285,33 @@ nodes:
       echo "WO_ID=${WO_ID}"
       echo "RUN_STATUS=${RUN_STATUS}"
 
+  # Node 10b: binding-gate (when-expression classifier)
+  # The condition-evaluator (packages/workflows/src/condition-evaluator.ts) supports ONLY
+  # == != < <= > >= and compound && || -- NOT =~ (regex). It also compares against the
+  # WHOLE node output, OR (with .field) against JSON.parse(wholeOutput)[field]. verify-binding
+  # emits many chatty lines, so neither "$verify-binding.output == 'BINDING_OK=true'" nor a
+  # regex can ever match. The proven house pattern (block-classify in bdc-feature-development)
+  # is a tiny classifier whose ENTIRE stdout is ONE JSON line, gated downstream with
+  # $node.output.field == 'VALUE'. This node IS that classifier for the flip-notion gate.
+  # verify-binding has 3 settled states: BINDING_OK=true (matched_ok), BINDING_OK=unverified
+  # (soft-miss after a successful fire), and exit 1 (confirmed wrong-repo mismatch -- which
+  # fails the node, so this gate never evaluates). Both true and unverified are on-ramp
+  # success states, so gate=proceed for either; anything else => halt.
+  - id: binding-gate
+    depends_on: [verify-binding]
+    trigger_rule: all_done
+    bash: |
+      set -uo pipefail
+      VB_OUT=$verify-binding.output
+      BINDING=$(printf '%s\n' "$VB_OUT" | grep -oE 'BINDING_OK=(true|unverified|false)' | tail -n 1 | sed 's/^BINDING_OK=//')
+      if [ "$BINDING" = "true" ] || [ "$BINDING" = "unverified" ]; then
+        GATE=proceed
+      else
+        GATE=halt
+      fi
+      # single JSON line = the entire stdout, so $binding-gate.output.gate parses
+      printf '{"gate":"%s","binding_ok":"%s"}\n' "$GATE" "${BINDING:-none}"
+
   # Node 11: build-manifest
   # Builds v2 Captain CI manifest for WO-CAULDRON-ONRAMP-ATOM-01.
   # trigger_rule: all_done so skipped/failed optional nodes do not block manifest.
@@ -1349,17 +1376,20 @@ nodes:
   # Does NOT flip the child product WO (child run's flip-notion handles that).
   - id: flip-notion
     agent: xo
-    depends_on: [build-manifest]
-    # Defect 7 fix: this was bash-syntax ("BINDING_OK=true"), which the DAG engine cannot
-    # parse -> the node fail-closed and SKIPPED -> flip-notion never ran -> the WO's DoD
-    # ("reaches flip-notion") could never pass even on a fully-clean run. The engine requires
-    # expression syntax: $node.output =~ 'regex' or $node.output == 'VALUE'.
-    # 2026-06-09 best-effort fix: verify-binding now emits BINDING_OK=true on a confirmed
-    # binding AND BINDING_OK=unverified on a soft-miss (run-not-found after a successful fire).
-    # Both are success states for the on-ramp -- the only failure is a confirmed wrong-repo
-    # mismatch, which exits 1 (node fails, this gate never evaluates). So the gate must fire
-    # on EITHER true OR unverified. build-manifest's own VALIDATION guard still gates the flip.
-    when: "$verify-binding.output =~ 'BINDING_OK=(true|unverified)'"
+    depends_on: [build-manifest, binding-gate]
+    # Defect 7 fix (2026-06-09): the when: expression used =~ (regex) AND compared against
+    # verify-binding's whole multi-line output -- the condition-evaluator supports NEITHER.
+    # It supports only == != < <= > >= (+ compound && ||) and matches the WHOLE output, or
+    # (with .field) JSON.parse(wholeOutput)[field]. So both "=~ 'BINDING_OK=(true|unverified)'"
+    # and "== 'BINDING_OK=true'" can never match a chatty bash node, and the node fail-closed
+    # and was SKIPPED on every run (confirmed run 032da37fea6317754175b8a7642ccdee).
+    # Fix: gate on the binding-gate classifier node, whose ENTIRE stdout is one JSON line
+    # {"gate":"proceed"|"halt"}, using the proven house pattern $node.output.field == 'VALUE'.
+    # binding-gate emits gate=proceed for BOTH BINDING_OK=true (matched) AND BINDING_OK=unverified
+    # (soft-miss after a successful fire) -- both are on-ramp success states. A confirmed
+    # wrong-repo mismatch makes verify-binding exit 1 (node fails; this gate never evaluates).
+    # build-manifest's own VALIDATION guard still independently gates the actual flip.
+    when: "$binding-gate.output.gate == 'proceed'"
     prompt: |
       ## GUARD: Only flip if run succeeded end-to-end
       Check build-manifest output for VALIDATION: PASS.
