@@ -2714,7 +2714,20 @@ async function executeApprovalNode(
     // Fall through to re-pause at the approval gate
   }
 
-  // Standard approval gate — send message and pause.
+  // Interactive-mode gate (CAULDRON_INTERACTIVE). Default false so CI and orchestrator
+  // child runs do not hang at the human gate -- they auto-proceed. Only operator-driven
+  // Mission Control sessions (flag true) actually pause and present the message.
+  const interactive = process.env.CAULDRON_INTERACTIVE === 'true';
+  if (!interactive) {
+    getLog().info(
+      { workflowRunId: workflowRun.id, nodeId: node.id },
+      'approval.gate_bypassed_non_interactive'
+    );
+    // Non-interactive: treat as auto-approved-as-is. Do not pause, do not capture.
+    return { state: 'completed' as const, output: '' };
+  }
+
+  // Standard approval gate -- send message and pause.
   // Resolve $nodeId.output[.field] references so the human sees concrete values
   // (parity with prompt/bash/loop/cancel nodes, which all run the same substitution).
   const renderedMessage = substituteNodeOutputRefs(node.approval.message, nodeOutputs);

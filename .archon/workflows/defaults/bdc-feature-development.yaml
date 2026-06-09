@@ -999,29 +999,88 @@ nodes:
         printf '{"status":"BLOCKED","note":"opus-could-not-resolve"}\n'
       fi
 
-  # pause-gate: the ONLY human touch, and ONLY when still BLOCKED after Opus. This PAUSES
-  # the run (status=paused, resumable via /workflow approve|reject) -- it does NOT fail.
-  - id: pause-gate
+  # findings-consolidate: decompose every review finding into a structured ledger row so the
+  # human approval gate can show resolution + a concrete suggested fix per UNRESOLVED finding.
+  # AI node (not bash): plan-review emits unstructured prose; diff-review/-final + opus-repair
+  # emit sentinels. Only an AI pass normalizes all of them into the per-row JSON ledger.
+  - id: findings-consolidate
+    persona: xo
     depends_on: [block-reclassify]
-    when: "$block-reclassify.output.status == 'BLOCKED'"
+    trigger_rule: all_done
+    task_class: clerical
+    prompt: |
+      Build the human-facing findings ledger for the approval gate. Read every review output
+      below and emit ONE JSON object. Do not invent findings; only consolidate what the reviews
+      and the repair tier already reported.
+
+      ## Inputs
+      plan-review findings (unstructured prose between sentinels):
+      $plan-review.output
+
+      diff-review verdict + findings:
+      $diff-review.output
+
+      diff-review-final verdict + UNRESOLVED list:
+      $diff-review-final.output
+
+      block-classify / block-reclassify status:
+      $block-reclassify.output
+
+      opus-repair result (REASON= names any fix the self-repair tier deferred):
+      $opus-repair.output
+
+      ## Output: STRICT JSON only. No prose. No code fences.
+      {
+        "summary": "<one line: N findings, M unresolved>",
+        "findings": [
+          {
+            "id": "<stable-kebab-id, e.g. locg-migration>",
+            "source": "plan-review | diff-review | diff-review-final | opus-repair",
+            "severity": "LOW | MEDIUM | HIGH",
+            "title": "<one line>",
+            "resolution": "FIXED-BY-LOOP | UNRESOLVED",
+            "suggested_fix": {
+              "diagnosis": "<the loop's own diagnosis, verbatim where available>",
+              "proposed_action": "<concrete, e.g. add migration 20260609_identity_connector_accounts_add_locg.sql ALTERing the connector CHECK constraint to include lunar/locg/prh>",
+              "fix_class": "CODE-EDIT | NEW-SCHEMA-MIGRATION | CONFIG | OTHER",
+              "boundary_flag": true
+            }
+          }
+        ]
+      }
+
+      Rules:
+      - Include EVERY finding: FIXED-BY-LOOP (for transparency) AND UNRESOLVED.
+      - Emit "suggested_fix" ONLY for UNRESOLVED rows; omit it on FIXED-BY-LOOP rows.
+      - Set boundary_flag=true exactly when fix_class == "NEW-SCHEMA-MIGRATION" (the loop will
+        NOT write that itself; it requires APPROVE-WITH-FIX).
+      - If there are zero unresolved findings, "findings" still lists the fixed ones and
+        "summary" says "0 unresolved".
+
+  # pause-gate: the human approval gate. Fires on BLOCKED (AI tiers could not resolve)
+  # AND on PROCEED (clean builds -- final confirmation before the irreversible commit).
+  # Non-interactive runs (CAULDRON_INTERACTIVE != true) auto-proceed without pausing;
+  # only Mission Control sessions with the flag set actually present this gate.
+  # Three graded choices: APPROVE-AS-IS, APPROVE-WITH-FIX, REJECT.
+  - id: pause-gate
+    depends_on: [findings-consolidate]
+    when: "$block-reclassify.output.status == 'BLOCKED' || $block-reclassify.output.status == 'PROCEED'"
     approval:
       message: |
-        This run is BLOCKED before the irreversible commit and the AI tiers could not
-        safely resolve it. The run is PAUSED (not failed) -- nothing was committed or
-        pushed. Review and either correct + resume, or reject.
+        REVIEW FINDINGS LEDGER (every finding; unresolved ones include a suggested fix):
+        $findings-consolidate.output
 
-        What to inspect:
-        - block-classify / block-reclassify: why it blocked (FALSE_COMPLETE = implement
-          produced no real changes; or diff-review-final = needs_revision).
-        - diff-review-final verdict + the Codex findings.
-        - opus-repair output: what the Opus tier tried and why it could not finish.
-        - $ARTIFACTS_DIR/diff-repair-escalation.txt if present (the escalation payload).
+        Choose:
+        - APPROVE-AS-IS  -> proceed; any unresolved findings stay unresolved and are logged.
+        - APPROVE-WITH-FIX -> authorize the loop to apply the named suggested fix(es), including a
+          new schema migration the self-repair loop deferred; a second review runs before commit.
+        - REJECT -> halt; the worktree is preserved.
 
-        SAFE STATE: no commit, no push, no PR, no Notion write has happened.
+        SAFE STATE: no commit, no push, no PR, no Notion write has happened yet.
 
-        - "approved" / "proceed" -> resume (only do this if you have corrected the worktree
-          so a real, reviewed change exists; commit-and-push still re-checks the gate)
-        - "reject" / "stop" -> halt; the worktree changes (if any) remain for manual handling
+        (BLOCKED runs: the AI tiers could not fully resolve this. PROCEED runs: reviews passed;
+        this is the final confirmation before the irreversible commit.)
+      choices: [approve_as_is, approve_with_fix, reject]
       capture_response: true
       on_reject:
         prompt: |
@@ -1030,10 +1089,95 @@ nodes:
           Output: OPERATOR_REJECTED: <reason from approval response>
         max_attempts: 2
 
+  # apply-suggested-fix: runs ONLY when the operator chose APPROVE-WITH-FIX at the gate.
+  # Authorizes overseer-opus to apply the named suggested fix(es) -- including writing a NEW
+  # schema migration the self-repair loop deferred -- but ONLY for the authorized_fix_ids.
+  # trigger_rule all_done so an APPROVE-AS-IS run (which skips this) does not hang the DAG.
+  - id: apply-suggested-fix
+    agent: overseer-opus
+    effort: xhigh
+    context: fresh
+    depends_on: [pause-gate]
+    trigger_rule: all_done
+    when: "$pause-gate.output.decision_verb == 'approve_with_fix'"
+    prompt: |
+      The operator authorized specific fixes at the approval gate. Apply ONLY the fixes whose
+      ids appear in authorized_fix_ids. Do NOT apply any other finding.
+
+      ## The full ledger (each finding has an id + suggested_fix)
+      $findings-consolidate.output
+
+      ## Operator decision (AUTHORITATIVE -- authorized_fix_ids lives here)
+      $pause-gate.output
+
+      ## Rules
+      - Apply ONLY fixes whose id is in the operator's authorized_fix_ids. If authorized_fix_ids
+        is empty or missing, make NO changes and emit APPLY_SUGGESTED_FIX=nothing-authorized.
+      - For an AUTHORIZED NEW-SCHEMA-MIGRATION fix (its id is in authorized_fix_ids): create the
+        migration file named in proposed_action. Check it does not already exist before writing
+        (idempotent create). NEVER write a migration for a finding whose id is not in
+        authorized_fix_ids -- that is the loop boundary; only an explicit operator authorization
+        may cross it.
+      - Make the minimal change. Do NOT reformat unrelated code (agent-behavior policy).
+      - Work only in the assigned worktree.
+
+      ## Output (last lines)
+        APPLY_SUGGESTED_FIX=<applied|nothing-authorized>
+        FILES_CHANGED:
+        - <path>   (repeat; or "(none)")
+
+  # apply-diff-review-final: re-review the fix(es) apply-suggested-fix wrote, BEFORE any commit.
+  # Distinct id (diff-review-final already ran upstream). Only meaningful on the APPROVE-WITH-FIX path.
+  - id: apply-diff-review-final
+    provider: codex
+    model: gpt-5.5
+    agent: codex-adversarial-reviewer
+    depends_on: [apply-suggested-fix]
+    trigger_rule: all_done
+    when: "$pause-gate.output.decision_verb == 'approve_with_fix'"
+    prompt: |
+      Re-review ONLY the changes apply-suggested-fix just made (especially any new schema
+      migration). Read-only. Verify the fix matches the operator-authorized proposed_action and
+      introduces no regression or unsafe behavior.
+
+      ## What was applied
+      $apply-suggested-fix.output
+
+      ## The authorized ledger
+      $findings-consolidate.output
+
+      ## Output (STDOUT only)
+        APPLY_DIFF_REVIEW_FINAL=<satisfied|needs_revision>
+        UNRESOLVED:
+        - <finding still open>   (or "(none)")
+
+  # classify-apply-review: grep the APPLY_DIFF_REVIEW_FINAL sentinel out of
+  # apply-diff-review-final's multi-line Codex prose and emit ONE JSON line so
+  # the condition-evaluator can use $classify-apply-review.output.verdict without
+  # JSON.parse failing on multi-line output. Mirrors block-classify's bash idiom.
+  # trigger_rule all_done + same when: as apply-diff-review-final so it runs
+  # exactly when that node ran, skips otherwise.
+  - id: classify-apply-review
+    depends_on: [apply-diff-review-final]
+    trigger_rule: all_done
+    when: "$pause-gate.output.decision_verb == 'approve_with_fix'"
+    bash: |
+      set -uo pipefail
+      REVIEW=$apply-diff-review-final.output
+      verdict=$(printf '%s\n' "$REVIEW" \
+        | grep -oE 'APPLY_DIFF_REVIEW_FINAL=(satisfied|needs_revision)' \
+        | tail -n 1 \
+        | sed 's/APPLY_DIFF_REVIEW_FINAL=//')
+      if [ -z "$verdict" ]; then
+        verdict=needs_revision
+      fi
+      printf '{"verdict":"%s"}\n' "$verdict"
+
   - id: decide-push-target
     persona: major-build
-    depends_on: [block-reclassify]
-    when: "$block-reclassify.output.status == 'PROCEED'"
+    depends_on: [pause-gate, classify-apply-review]
+    trigger_rule: all_done
+    when: "$pause-gate.output.decision_verb != 'approve_with_fix' || $classify-apply-review.output.verdict == 'satisfied'"
     task_class: clerical
     prompt: |
       Decide the push target for this BDC feature Work Order.
@@ -1109,8 +1253,9 @@ nodes:
   # backoff) and node fails closed if all attempts fail.
   - id: commit-and-push
     persona: overseer
-    depends_on: [decide-push-target]
-    when: "$block-reclassify.output.status == 'PROCEED'"
+    depends_on: [decide-push-target, classify-apply-review]
+    trigger_rule: all_done
+    when: "$block-reclassify.output.status == 'PROCEED' || $classify-apply-review.output.verdict == 'satisfied'"
     load_bearing: true
     bash: |
       set -euo pipefail
@@ -1135,6 +1280,8 @@ nodes:
       fi
       DIFF_FINAL=$diff-review-final.output
       RECLASS=$block-reclassify.output
+      PAUSE_GATE=$pause-gate.output
+      APPLY_REVIEW=$classify-apply-review.output
       echo "$DECIDE_OUTPUT"
       if printf '%s\n' "$DECIDE_OUTPUT" | grep -q '^out_of_scope: true'; then
         echo "Out of scope for bdc-feature-development; failing closed." >&2
@@ -1146,8 +1293,17 @@ nodes:
       # belt-and-suspenders re-check here (defense in depth) but it must NEVER be the place
       # a block surfaces as a raw failure -- if status isn't PROCEED we should not be here.
       RECLASS_STATUS=$(printf '%s\n' "$RECLASS" | sed -n 's/.*"status":"\([A-Z_]*\)".*/\1/p' | head -1)
-      if [ "$RECLASS_STATUS" != "PROCEED" ]; then
-        echo "ERROR: commit-and-push reached with status='$RECLASS_STATUS' (expected PROCEED). The when-gate should have skipped this node; refusing to commit." >&2
+      # Approve-with-fix bridge: a BLOCKED run may legitimately commit if the operator chose
+      # APPROVE-WITH-FIX at the gate AND the post-fix re-review (apply-diff-review-final,
+      # classified by classify-apply-review) came back satisfied. Read both from node outputs.
+      GATE_VERB=$(printf '%s\n' "$PAUSE_GATE" | sed -n 's/.*"decision_verb":"\([a-z_]*\)".*/\1/p' | head -1)
+      APPLY_VERDICT=$(printf '%s\n' "$APPLY_REVIEW" | sed -n 's/.*"verdict":"\([a-z_]*\)".*/\1/p' | head -1)
+      APPROVE_WITH_FIX_OK=false
+      if [ "$GATE_VERB" = "approve_with_fix" ] && [ "$APPLY_VERDICT" = "satisfied" ]; then
+        APPROVE_WITH_FIX_OK=true
+      fi
+      if [ "$RECLASS_STATUS" != "PROCEED" ] && [ "$APPROVE_WITH_FIX_OK" != "true" ]; then
+        echo "ERROR: commit-and-push reached with status='$RECLASS_STATUS' and no satisfied approve-with-fix authorization. Refusing to commit." >&2
         exit 1
       fi
       # Final-review sanity (still required for a real build): diff-review-final must be satisfied.
@@ -1156,8 +1312,8 @@ nodes:
       final_verdict_cap=$(printf '%s\n' "$DIFF_FINAL" \
         | grep -oE 'DIFF_REVIEW_FINAL=(satisfied|needs_revision)' \
         | tail -n 1)
-      if [ "$final_verdict_cap" != "DIFF_REVIEW_FINAL=satisfied" ]; then
-        echo "ERROR: diff-review-final not satisfied despite PROCEED status -- refusing commit (defense in depth)." >&2
+      if [ "$final_verdict_cap" != "DIFF_REVIEW_FINAL=satisfied" ] && [ "$APPROVE_WITH_FIX_OK" != "true" ]; then
+        echo "ERROR: neither diff-review-final nor a satisfied approve-with-fix re-review authorizes this commit -- refusing (defense in depth)." >&2
         exit 1
       fi
       BRANCH=$(printf '%s\n' "$DECIDE_OUTPUT" | sed -n 's/^push_target: feature-branch://p' | head -n 1)

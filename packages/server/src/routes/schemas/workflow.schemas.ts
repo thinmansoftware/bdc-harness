@@ -248,7 +248,11 @@ export const workflowRunActionResponseSchema = z
 
 /** POST /api/workflows/runs/:runId/approve request body. */
 export const approveWorkflowRunBodySchema = z
-  .object({ comment: z.string().optional() })
+  .object({
+    comment: z.string().optional(),
+    decision_verb: z.enum(['approve_as_is', 'approve_with_fix']).default('approve_as_is'),
+    authorized_fix_ids: z.array(z.string()).optional(),
+  })
   .openapi('ApproveWorkflowRunBody');
 
 /** POST /api/workflows/runs/:runId/reject request body. */

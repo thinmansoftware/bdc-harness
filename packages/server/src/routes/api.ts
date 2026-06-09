@@ -2805,8 +2805,14 @@ export function registerApiRoutes(
       if (run.status !== 'paused') {
         return apiError(c, 400, `Cannot approve workflow in '${run.status}' status`);
       }
-      const body = (await c.req.json().catch(() => ({}))) as { comment?: string };
+      // Validate via the route schema so an invalid decision_verb is rejected with
+      // 400 BEFORE anything is persisted. The OpenAPI defaultHook (validationErrorHook)
+      // returns 400 on a Zod failure before this handler runs; Zod also applies the
+      // .default('approve_as_is') so decision_verb is always a valid enum value here.
+      const body = getValidatedBody(c, approveWorkflowRunBodySchema);
       const comment = body.comment ?? 'Approved';
+      const decisionVerb = body.decision_verb; // schema default already applied
+      const authorizedFixIds = body.authorized_fix_ids ?? [];
       const approval = run.metadata.approval as ApprovalContext | undefined;
       if (!approval?.nodeId) {
         return apiError(c, 400, 'Workflow run is paused but missing approval context');
@@ -2815,7 +2821,18 @@ export function registerApiRoutes(
       // the AI emits the completion signal (actual loop exit). Writing it here would cause
       // the resume to skip the loop node entirely via priorCompletedNodes.
       if (approval.type !== 'interactive_loop') {
-        const nodeOutput = approval.captureResponse === true ? comment : '';
+        // Design A: persist the graded decision verb + authorized fix ids INTO the
+        // captured node_output as JSON, so the DAG when: evaluator can route on
+        // $<gate>.output.decision_verb with no evaluator change. When the gate did not
+        // capture a response, keep node_output empty (legacy binary contract).
+        const nodeOutput =
+          approval.captureResponse === true
+            ? JSON.stringify({
+                decision_verb: decisionVerb,
+                authorized_fix_ids: authorizedFixIds,
+                comment,
+              })
+            : '';
         await workflowEventDb.createWorkflowEvent({
           workflow_run_id: runId,
           event_type: 'node_completed',

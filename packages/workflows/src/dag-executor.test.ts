@@ -5348,6 +5348,9 @@ describe('executeDagWorkflow -- approval node', () => {
   });
 
   it('fresh approval node pauses with extended context (capture_response + on_reject)', async () => {
+    // Set interactive mode so the gate pauses -- this test exercises the pause path.
+    process.env.CAULDRON_INTERACTIVE = 'true';
+
     const store = createMockStore();
     const mockDeps = createMockDeps(store);
     const platform = createMockPlatform();
@@ -5400,6 +5403,9 @@ describe('executeDagWorkflow -- approval node', () => {
   });
 
   it('approval node without capture_response stores empty node output', async () => {
+    // Set interactive mode so the gate pauses -- this test exercises the pause path.
+    process.env.CAULDRON_INTERACTIVE = 'true';
+
     const store = createMockStore();
     const mockDeps = createMockDeps(store);
     const platform = createMockPlatform();
@@ -5444,6 +5450,9 @@ describe('executeDagWorkflow -- approval node', () => {
   });
 
   it('on_reject runs AI prompt and re-pauses on rejection resume', async () => {
+    // Set interactive mode so the gate re-pauses after the on_reject AI run.
+    process.env.CAULDRON_INTERACTIVE = 'true';
+
     mockSendQueryDag.mockImplementation(function* () {
       yield { type: 'assistant', content: 'Fixed based on feedback' };
       yield { type: 'result', sessionId: 'reject-fix-session' };
@@ -5694,6 +5703,10 @@ describe('executeDagWorkflow -- approval node', () => {
   });
 
   it('approval message substitutes $nodeId.output.field references from upstream structured output', async () => {
+    // Set interactive mode so the gate pauses -- this test exercises the message-substitution
+    // path which only runs when the gate reaches the pause logic.
+    process.env.CAULDRON_INTERACTIVE = 'true';
+
     // Repro for: approval gates were rendering literal "$gather-context.output.repo_name"
     // instead of resolved values, breaking interactive workflows like atlas-onboard.
     // Parity: prompt/bash/loop/cancel nodes already get substituteNodeOutputRefs;
@@ -5797,6 +5810,111 @@ describe('executeDagWorkflow -- approval node', () => {
     expect((approvalRequestedEvents[0][0] as { data: { message: string } }).data.message).toBe(
       'Repo: hcr-els | App: CCELS | Port: 3012'
     );
+  });
+
+  // ---------------------------------------------------------------------------
+  // CAULDRON_INTERACTIVE gate bypass tests
+  // T6 (regression/critical): non-interactive mode must NOT pause -- auto-proceed.
+  // T1: interactive mode must pause and send the approval message.
+  // ---------------------------------------------------------------------------
+
+  afterEach(() => {
+    // Restore env after each CAULDRON_INTERACTIVE test
+    delete process.env.CAULDRON_INTERACTIVE;
+  });
+
+  it('T6: non-interactive (CAULDRON_INTERACTIVE unset) approval node does NOT pause -- auto-proceeds', async () => {
+    // Ensure flag is absent (non-interactive default)
+    delete process.env.CAULDRON_INTERACTIVE;
+
+    const store = createMockStore();
+    const mockDeps = createMockDeps(store);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('t6-non-interactive-run');
+
+    // executeDagWorkflow returns string|undefined (last node output), not NodeOutput.
+    // For a single-node approval workflow that bypasses the gate, it returns undefined.
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-t6',
+      testDir,
+      {
+        name: 't6-non-interactive',
+        nodes: [
+          {
+            id: 'gate',
+            approval: { message: 'Approve?' },
+          },
+        ],
+      },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    // pauseWorkflowRun must NOT have been called -- the gate was bypassed
+    const pauseCalls = (
+      store.pauseWorkflowRun as Mock<(id: string, ctx: Record<string, unknown>) => Promise<void>>
+    ).mock.calls;
+    expect(pauseCalls.length).toBe(0);
+
+    // completeWorkflowRun should have been called (DAG completed normally)
+    const completeCalls = (store.completeWorkflowRun as Mock<(id: string) => Promise<void>>).mock
+      .calls;
+    expect(completeCalls.length).toBe(1);
+  });
+
+  it('T1: interactive (CAULDRON_INTERACTIVE=true) approval node pauses and sends the message', async () => {
+    // Set interactive mode -- gate should pause and send the approval message
+    process.env.CAULDRON_INTERACTIVE = 'true';
+
+    const store = createMockStore();
+    const mockDeps = createMockDeps(store);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('t1-interactive-run');
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-t1',
+      testDir,
+      {
+        name: 't1-interactive',
+        nodes: [
+          {
+            id: 'gate',
+            approval: { message: 'Approve this plan?' },
+          },
+        ],
+      },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    // pauseWorkflowRun must have been called exactly once
+    const pauseCalls = (
+      store.pauseWorkflowRun as Mock<(id: string, ctx: Record<string, unknown>) => Promise<void>>
+    ).mock.calls;
+    expect(pauseCalls.length).toBe(1);
+    expect(pauseCalls[0][1]).toMatchObject({ type: 'approval', nodeId: 'gate' });
+
+    // safeSendMessage (via platform.sendMessage) must have sent the approval message
+    const sentMessages = (
+      platform.sendMessage as Mock<(...args: unknown[]) => Promise<void>>
+    ).mock.calls.map((c: unknown[]) => c[1] as string);
+    expect(sentMessages.some(m => m.includes('Approve this plan?'))).toBe(true);
   });
 });
 describe('executeDagWorkflow -- env var injection', () => {
@@ -8029,4 +8147,151 @@ describe('agent persona dispatch', () => {
     // No agent = no persona-injected allowed_tools
     expect(nodeConfig.allowed_tools).toBeUndefined();
   });
+});
+
+// T3: approve_with_fix routing tests
+// These tests verify the condition-evaluator correctly routes the APPROVE-WITH-FIX branch.
+// They use the real evaluator (not mocked) so they prove the actual DAG routing logic.
+import { evaluateCondition } from './condition-evaluator';
+
+it('approve_with_fix routes into apply-suggested-fix; approve_as_is does not', () => {
+  const withFix = new Map<string, NodeOutput>([
+    [
+      'pause-gate',
+      {
+        state: 'completed',
+        output: JSON.stringify({
+          decision_verb: 'approve_with_fix',
+          authorized_fix_ids: ['locg-migration'],
+        }),
+      },
+    ],
+  ]);
+  expect(
+    evaluateCondition("$pause-gate.output.decision_verb == 'approve_with_fix'", withFix).result
+  ).toBe(true);
+
+  const asIs = new Map<string, NodeOutput>([
+    [
+      'pause-gate',
+      { state: 'completed', output: JSON.stringify({ decision_verb: 'approve_as_is' }) },
+    ],
+  ]);
+  expect(
+    evaluateCondition("$pause-gate.output.decision_verb == 'approve_with_fix'", asIs).result
+  ).toBe(false);
+});
+
+// T4: classify-apply-review routing tests
+// Verify decide-push-target's compound when: works correctly for all cases.
+// The condition is: $pause-gate.output.decision_verb != 'approve_with_fix'
+//                  || $classify-apply-review.output.verdict == 'satisfied'
+it('classify-apply-review routes decide-push-target correctly for all gate outcomes', () => {
+  const decidePushCond =
+    "$pause-gate.output.decision_verb != 'approve_with_fix' || $classify-apply-review.output.verdict == 'satisfied'";
+
+  // Non-interactive auto-proceed: pause-gate output is '' (executor returns {output:''})
+  // decision_verb resolves to '' (JSON.parse('') throws -> '') -> '' != 'approve_with_fix' = TRUE
+  const nonInteractive = new Map<string, NodeOutput>([
+    ['pause-gate', { state: 'completed', output: '' }],
+    ['classify-apply-review', { state: 'skipped', output: '' }],
+  ]);
+  expect(evaluateCondition(decidePushCond, nonInteractive).result).toBe(true);
+
+  // APPROVE-AS-IS: decision_verb == 'approve_as_is' != 'approve_with_fix' -> TRUE
+  const approveAsIs = new Map<string, NodeOutput>([
+    [
+      'pause-gate',
+      { state: 'completed', output: JSON.stringify({ decision_verb: 'approve_as_is' }) },
+    ],
+    ['classify-apply-review', { state: 'skipped', output: '' }],
+  ]);
+  expect(evaluateCondition(decidePushCond, approveAsIs).result).toBe(true);
+
+  // APPROVE-WITH-FIX + satisfied: first clause FALSE, second TRUE -> TRUE (push)
+  const approveWithFixSatisfied = new Map<string, NodeOutput>([
+    [
+      'pause-gate',
+      {
+        state: 'completed',
+        output: JSON.stringify({
+          decision_verb: 'approve_with_fix',
+          authorized_fix_ids: ['locg-migration'],
+        }),
+      },
+    ],
+    ['classify-apply-review', { state: 'completed', output: '{"verdict":"satisfied"}' }],
+  ]);
+  expect(evaluateCondition(decidePushCond, approveWithFixSatisfied).result).toBe(true);
+
+  // APPROVE-WITH-FIX + needs_revision: both clauses FALSE -> FALSE (no push)
+  const approveWithFixFailed = new Map<string, NodeOutput>([
+    [
+      'pause-gate',
+      {
+        state: 'completed',
+        output: JSON.stringify({
+          decision_verb: 'approve_with_fix',
+          authorized_fix_ids: ['locg-migration'],
+        }),
+      },
+    ],
+    ['classify-apply-review', { state: 'completed', output: '{"verdict":"needs_revision"}' }],
+  ]);
+  expect(evaluateCondition(decidePushCond, approveWithFixFailed).result).toBe(false);
+
+  // APPROVE-WITH-FIX + classify-apply-review missing sentinel (empty -> 'needs_revision' default)
+  // Classifier emits '{"verdict":"needs_revision"}' when sentinel absent -> no push
+  const approveWithFixMissing = new Map<string, NodeOutput>([
+    [
+      'pause-gate',
+      {
+        state: 'completed',
+        output: JSON.stringify({ decision_verb: 'approve_with_fix', authorized_fix_ids: [] }),
+      },
+    ],
+    // Classifier output missing verdict field -> JSON.parse succeeds but verdict='' -> '' != 'satisfied' = FALSE
+    ['classify-apply-review', { state: 'completed', output: '{"verdict":"needs_revision"}' }],
+  ]);
+  expect(evaluateCondition(decidePushCond, approveWithFixMissing).result).toBe(false);
+});
+
+// T5: commit-and-push when: condition tests
+// Verifies the four paths through the widened when: clause:
+//   "$block-reclassify.output.status == 'PROCEED' || $classify-apply-review.output.verdict == 'satisfied'"
+it('commit-and-push when: evaluates correctly for all paths', () => {
+  const commitCond =
+    "$block-reclassify.output.status == 'PROCEED' || $classify-apply-review.output.verdict == 'satisfied'";
+
+  // Path 1: PROCEED run (classify-apply-review skipped -> output '' -> verdict '' != 'satisfied' = FALSE)
+  // First clause PROCEED == PROCEED = TRUE -> overall TRUE
+  const proceedRun = new Map<string, NodeOutput>([
+    ['block-reclassify', { state: 'completed', output: '{"status":"PROCEED"}' }],
+    ['classify-apply-review', { state: 'skipped', output: '' }],
+  ]);
+  expect(evaluateCondition(commitCond, proceedRun).result).toBe(true);
+
+  // Path 2: approve_with_fix + verdict satisfied
+  // First clause BLOCKED != PROCEED = FALSE; second clause 'satisfied' == 'satisfied' = TRUE -> overall TRUE
+  const approveWithFixSatisfied = new Map<string, NodeOutput>([
+    ['block-reclassify', { state: 'completed', output: '{"status":"BLOCKED"}' }],
+    ['classify-apply-review', { state: 'completed', output: '{"verdict":"satisfied"}' }],
+  ]);
+  expect(evaluateCondition(commitCond, approveWithFixSatisfied).result).toBe(true);
+
+  // Path 3: approve_with_fix + verdict needs_revision -> BLOCKED commit must NOT happen
+  // First clause FALSE, second clause FALSE -> overall FALSE
+  const approveWithFixNeedsRevision = new Map<string, NodeOutput>([
+    ['block-reclassify', { state: 'completed', output: '{"status":"BLOCKED"}' }],
+    ['classify-apply-review', { state: 'completed', output: '{"verdict":"needs_revision"}' }],
+  ]);
+  expect(evaluateCondition(commitCond, approveWithFixNeedsRevision).result).toBe(false);
+
+  // Path 4: plain BLOCKED with no approve-with-fix (classify skipped -> verdict '' -> FALSE)
+  // First clause FALSE, second clause '' == 'satisfied' = FALSE -> overall FALSE
+  const plainBlocked = new Map<string, NodeOutput>([
+    ['block-reclassify', { state: 'completed', output: '{"status":"BLOCKED"}' }],
+    ['classify-apply-review', { state: 'skipped', output: '' }],
+  ]);
+  expect(evaluateCondition(commitCond, plainBlocked).result).toBe(false);
 });

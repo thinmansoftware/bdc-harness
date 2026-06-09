@@ -1842,7 +1842,9 @@ describe('POST /api/workflows/runs/:runId/approve', () => {
     expect(response.status).toBe(400);
   });
 
-  test('stores user comment as node_output when captureResponse is true', async () => {
+  // Design A: node_output is now a JSON object when captureResponse is true,
+  // so the DAG condition-evaluator can route on $<gate>.output.decision_verb.
+  test('stores user comment as node_output when captureResponse is true (Design A JSON shape)', async () => {
     mockGetWorkflowRun.mockResolvedValueOnce({
       ...MOCK_PAUSED_RUN,
       id: 'run-capture',
@@ -1865,9 +1867,15 @@ describe('POST /api/workflows/runs/:runId/approve', () => {
     const nodeCompletedCall = mockCreateWorkflowEvent.mock.calls.find(
       (c: unknown[]) => (c[0] as Record<string, unknown>).event_type === 'node_completed'
     );
-    expect(nodeCompletedCall?.[0]).toMatchObject({
-      data: { node_output: 'Looks great, proceed', approval_decision: 'approved' },
-    });
+    // node_output is now a JSON string; parse it to assert structure.
+    const rawOutput = (nodeCompletedCall?.[0] as Record<string, unknown> | undefined)?.data as
+      | Record<string, unknown>
+      | undefined;
+    expect(rawOutput?.approval_decision).toBe('approved');
+    const parsed = JSON.parse(rawOutput?.node_output as string) as Record<string, unknown>;
+    expect(parsed.decision_verb).toBe('approve_as_is');
+    expect(parsed.comment).toBe('Looks great, proceed');
+    expect(parsed.authorized_fix_ids).toEqual([]);
   });
 
   test('stores empty node_output when captureResponse is not set', async () => {
@@ -1885,6 +1893,104 @@ describe('POST /api/workflows/runs/:runId/approve', () => {
     expect(nodeCompletedCall?.[0]).toMatchObject({
       data: { node_output: '', approval_decision: 'approved' },
     });
+  });
+
+  // TDD new tests: Design A graded verb persistence
+  test('persists decision_verb + authorized_fix_ids as JSON node_output on approve', async () => {
+    mockGetWorkflowRun.mockResolvedValueOnce({
+      ...MOCK_PAUSED_RUN,
+      id: 'run-verb-full',
+      metadata: {
+        approval: {
+          type: 'approval',
+          nodeId: 'review-gate',
+          message: 'Review the plan',
+          captureResponse: true,
+        },
+      },
+    });
+    const { app } = makeApp();
+    const response = await app.request('/api/workflows/runs/run-verb-full/approve', {
+      method: 'POST',
+      body: JSON.stringify({
+        comment: 'Fix the imports',
+        decision_verb: 'approve_with_fix',
+        authorized_fix_ids: ['locg-migration'],
+      }),
+      headers: { 'Content-Type': 'application/json' },
+    });
+    expect(response.status).toBe(200);
+    const nodeCompletedCall = mockCreateWorkflowEvent.mock.calls.find(
+      (c: unknown[]) => (c[0] as Record<string, unknown>).event_type === 'node_completed'
+    );
+    const rawData = (nodeCompletedCall?.[0] as Record<string, unknown> | undefined)?.data as
+      | Record<string, unknown>
+      | undefined;
+    expect(rawData?.approval_decision).toBe('approved');
+    const parsed = JSON.parse(rawData?.node_output as string) as Record<string, unknown>;
+    expect(parsed.decision_verb).toBe('approve_with_fix');
+    expect(parsed.authorized_fix_ids).toEqual(['locg-migration']);
+    expect(parsed.comment).toBe('Fix the imports');
+  });
+
+  test('defaults decision_verb to approve_as_is when body omits it', async () => {
+    mockGetWorkflowRun.mockResolvedValueOnce({
+      ...MOCK_PAUSED_RUN,
+      id: 'run-verb-default',
+      metadata: {
+        approval: {
+          type: 'approval',
+          nodeId: 'review-gate',
+          message: 'Review the plan',
+          captureResponse: true,
+        },
+      },
+    });
+    const { app } = makeApp();
+    const response = await app.request('/api/workflows/runs/run-verb-default/approve', {
+      method: 'POST',
+      body: JSON.stringify({ comment: 'LGTM' }),
+      headers: { 'Content-Type': 'application/json' },
+    });
+    expect(response.status).toBe(200);
+    const nodeCompletedCall = mockCreateWorkflowEvent.mock.calls.find(
+      (c: unknown[]) => (c[0] as Record<string, unknown>).event_type === 'node_completed'
+    );
+    const rawData = (nodeCompletedCall?.[0] as Record<string, unknown> | undefined)?.data as
+      | Record<string, unknown>
+      | undefined;
+    const parsed = JSON.parse(rawData?.node_output as string) as Record<string, unknown>;
+    expect(parsed.decision_verb).toBe('approve_as_is');
+  });
+
+  // Guard: decision_verb drives DAG routing into the DB, so an invalid enum value
+  // MUST be rejected with 400 by schema validation and nothing may be persisted.
+  test('rejects an invalid decision_verb with 400', async () => {
+    mockGetWorkflowRun.mockResolvedValueOnce({
+      ...MOCK_PAUSED_RUN,
+      id: 'run-verb-bogus',
+      metadata: {
+        approval: {
+          type: 'approval',
+          nodeId: 'review-gate',
+          message: 'Review the plan',
+          captureResponse: true,
+        },
+      },
+    });
+    const { app } = makeApp();
+    const response = await app.request('/api/workflows/runs/run-verb-bogus/approve', {
+      method: 'POST',
+      body: JSON.stringify({ comment: 'LGTM', decision_verb: 'bogus' }),
+      headers: { 'Content-Type': 'application/json' },
+    });
+    expect(response.status).toBe(400);
+    // Nothing may be persisted when validation fails.
+    const nodeCompletedCall = mockCreateWorkflowEvent.mock.calls.find(
+      (c: unknown[]) => (c[0] as Record<string, unknown>).event_type === 'node_completed'
+    );
+    expect(nodeCompletedCall).toBeUndefined();
+    expect(mockCreateWorkflowEvent).not.toHaveBeenCalled();
   });
 });
 

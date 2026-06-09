@@ -17,6 +17,71 @@ import { Ban, CheckCircle, Pause, X, XCircle } from 'lucide-react';
 
 import type { DagNode, WorkflowEventResponse } from '@/lib/api';
 import { approveWorkflowRun, cancelWorkflowRun, getNodeEvents, rejectWorkflowRun } from '@/lib/api';
+
+/** The graded choice verbs exposed by the approve gate UI. */
+export type GradedVerb = 'approve_as_is' | 'approve_with_fix' | 'reject';
+
+/**
+ * A single finding row from the gate findings ledger.
+ * Unresolved findings are eligible for approve-with-fix checkboxes.
+ * TODO(findings-consolidate wiring): populated from the findings-consolidate
+ * node output once that output is surfaced into the approval context.
+ */
+export interface GateFinding {
+  id: string;
+  label: string;
+  resolved: boolean;
+}
+
+/**
+ * Parse a gate findings ledger from a JSON-encoded approval message.
+ * Returns an empty array when the message is not a JSON ledger.
+ * The ledger format is { findings: Array<{ id, label, resolved }> }.
+ */
+export function parseFindingsFromMessage(message: string): GateFinding[] {
+  if (!message.trimStart().startsWith('{')) return [];
+  try {
+    const obj = JSON.parse(message) as {
+      findings?: { id?: unknown; label?: unknown; resolved?: unknown }[];
+    };
+    if (!Array.isArray(obj.findings)) return [];
+    const out: GateFinding[] = [];
+    for (const f of obj.findings) {
+      if (f === null || typeof f !== 'object') continue;
+      const entry = f as { id?: unknown; label?: unknown; resolved?: unknown };
+      if (typeof entry.id === 'string' && typeof entry.label === 'string') {
+        out.push({ id: entry.id, label: entry.label, resolved: entry.resolved === true });
+      }
+    }
+    return out;
+  } catch {
+    return [];
+  }
+}
+
+/** Filter a findings ledger to only the unresolved rows (eligible for fix). */
+export function unresolvedFindings(findings: GateFinding[]): GateFinding[] {
+  return findings.filter(f => !f.resolved);
+}
+
+/**
+ * The disabled predicate for the "Approve with fix" control: there is nothing
+ * to fix when no unresolved findings remain (empty ledger OR all resolved).
+ */
+export function isApproveWithFixDisabled(findings: GateFinding[]): boolean {
+  return unresolvedFindings(findings).length === 0;
+}
+
+/**
+ * Cast nodeDef.approval to the extended shape that includes the optional
+ * choices field (present in the Zod schema but not yet in api.generated.d.ts).
+ */
+interface ApprovalDefExtended {
+  message: string;
+  capture_response?: boolean;
+  on_reject?: { prompt: string; max_attempts?: number };
+  choices?: GradedVerb[];
+}
 import { resolveNodeDisplay } from '@/lib/dag-layout';
 import { ensureUtc } from '@/lib/format';
 import { classifyNodeError, deriveLucilleHint } from '@/lib/negan-utils';
@@ -107,6 +172,9 @@ export function NodePeekPanel({
   const queryClient = useQueryClient();
   const [gateBusy, setGateBusy] = useState<null | 'approving' | 'rejecting'>(null);
   const [gateError, setGateError] = useState<string | null>(null);
+  // Graded-choice state: which verb the operator picked + which fix ids are checked.
+  const [gradedVerb, setGradedVerb] = useState<GradedVerb | null>(null);
+  const [checkedFixIds, setCheckedFixIds] = useState<Set<string>>(new Set());
   // WO-MC-NEGAN-DIAGNOSTIC-GRAPH-01: Kill -- the real /cancel control distinct
   // from Reject. Reject auto-resumes into on_reject when defined; Kill always
   // takes the run to status=cancelled.
@@ -134,11 +202,28 @@ export function NodePeekPanel({
   const showInlineGate =
     runStatus === 'paused' && approval?.nodeId === nodeId && nodeDef?.approval != null;
 
+  // Cast to the extended shape to read the optional choices field.
+  const approvalDef = nodeDef?.approval != null ? (nodeDef.approval as ApprovalDefExtended) : null;
+  // Graded mode: only when the YAML node declares all three verbs or at least two.
+  const gradedChoices = approvalDef?.choices ?? null;
+  const isGradedMode = showInlineGate && gradedChoices != null && gradedChoices.length >= 2;
+
+  // Parse findings from the approval message for approve-with-fix checkboxes.
+  const findings: GateFinding[] = useMemo(
+    () => (approval?.message ? parseFindingsFromMessage(approval.message) : []),
+    [approval?.message]
+  );
+  const unresolved = useMemo(() => unresolvedFindings(findings), [findings]);
+  const approveWithFixDisabled = isApproveWithFixDisabled(findings);
+
   const onApprove = async (): Promise<void> => {
     if (gateBusy !== null) return;
     setGateBusy('approving');
     setGateError(null);
     try {
+      // Legacy binary path: send the ORIGINAL wire body (no decision_verb).
+      // The backend schema applies the approve_as_is default itself, so behavior
+      // is identical and the legacy wire shape is preserved unchanged.
       await approveWorkflowRun(runId);
       // Trigger a re-fetch so the run status + events refresh promptly.
       // A transient run.status === 'failed' is expected during auto-resume
@@ -146,6 +231,37 @@ export function NodePeekPanel({
       await queryClient.invalidateQueries({ queryKey: ['workflowRun', runId] });
     } catch (err) {
       setGateError(err instanceof Error ? err.message : 'Approve failed');
+    } finally {
+      setGateBusy(null);
+    }
+  };
+
+  const onApproveAsIs = async (): Promise<void> => {
+    if (gateBusy !== null) return;
+    setGateBusy('approving');
+    setGateError(null);
+    try {
+      await approveWorkflowRun(runId, undefined, { decision_verb: 'approve_as_is' });
+      await queryClient.invalidateQueries({ queryKey: ['workflowRun', runId] });
+    } catch (err) {
+      setGateError(err instanceof Error ? err.message : 'Approve-as-is failed');
+    } finally {
+      setGateBusy(null);
+    }
+  };
+
+  const onApproveWithFix = async (): Promise<void> => {
+    if (gateBusy !== null) return;
+    setGateBusy('approving');
+    setGateError(null);
+    try {
+      await approveWorkflowRun(runId, undefined, {
+        decision_verb: 'approve_with_fix',
+        authorized_fix_ids: Array.from(checkedFixIds),
+      });
+      await queryClient.invalidateQueries({ queryKey: ['workflowRun', runId] });
+    } catch (err) {
+      setGateError(err instanceof Error ? err.message : 'Approve-with-fix failed');
     } finally {
       setGateBusy(null);
     }
@@ -226,8 +342,10 @@ export function NodePeekPanel({
 
       {/* Scrollable body */}
       <div className="flex-1 overflow-y-auto">
-        {/* WO-MC-SELF-REPAIR-LOOP-VIZ-01 (Gap C): inline Approve / Reject for
-            an approval-gate pause. Render BEFORE prompt so it is unmissable. */}
+        {/* WO-MC-SELF-REPAIR-LOOP-VIZ-01 (Gap C): inline gate for an
+            approval-gate pause. Graded three-choice mode when the YAML node
+            declares choices=[]; falls back to binary Approve/Reject otherwise.
+            Render BEFORE prompt so it is unmissable. */}
         {showInlineGate && (
           <section
             className="px-3 py-2 border-b border-border bg-warning/5"
@@ -239,7 +357,7 @@ export function NodePeekPanel({
                 Awaiting approval
               </span>
             </div>
-            {approval?.message && (
+            {approval?.message && !isGradedMode && (
               <p className="text-xs text-text-secondary mb-2 whitespace-pre-wrap break-words">
                 {approval.message}
               </p>
@@ -248,53 +366,181 @@ export function NodePeekPanel({
                 consequence of each choice before the operator clicks.
                 Reject loops the workflow into its on_reject chain;
                 Kill (/cancel) is the actual stop. */}
-            <div className="mb-2 space-y-0.5" data-testid="lucille-hint">
-              <p className="text-[10px] text-success/80">{lucilleHint.approve}</p>
-              <p className="text-[10px] text-error/80">{lucilleHint.reject}</p>
-              <p className="text-[10px] text-text-secondary">
-                Kill (/cancel) -&gt; stops the run immediately
-              </p>
-            </div>
-            <div className="flex items-center gap-2 flex-wrap">
-              <button
-                type="button"
-                onClick={(): void => {
-                  void onApprove();
-                }}
-                disabled={gateBusy !== null || cancelMutation.isPending}
-                className="flex items-center gap-1 rounded-md px-2 py-1 text-xs text-success/90 border border-success/30 hover:bg-success/10 hover:text-success disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
-                data-testid="inline-approve-button"
-              >
-                <CheckCircle className="h-3.5 w-3.5" />
-                {gateBusy === 'approving' ? 'Approving...' : 'Approve'}
-              </button>
-              <button
-                type="button"
-                onClick={(): void => {
-                  void onReject();
-                }}
-                disabled={gateBusy !== null || cancelMutation.isPending}
-                className="flex items-center gap-1 rounded-md px-2 py-1 text-xs text-error/90 border border-error/30 hover:bg-error/10 hover:text-error disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
-                data-testid="inline-reject-button"
-              >
-                <XCircle className="h-3.5 w-3.5" />
-                {gateBusy === 'rejecting' ? 'Rejecting...' : 'Reject'}
-              </button>
-              {/* WO-MC-NEGAN-DIAGNOSTIC-GRAPH-01: KillButton -- distinct from
-                  Reject. Direct /cancel; bypasses the on_reject loop. */}
-              <button
-                type="button"
-                onClick={(): void => {
-                  cancelMutation.mutate();
-                }}
-                disabled={gateBusy !== null || cancelMutation.isPending}
-                className="flex items-center gap-1 rounded-md px-2 py-1 text-xs text-text-secondary border border-border hover:bg-surface-elevated hover:text-text-primary disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
-                data-testid="inline-kill-button"
-              >
-                <Ban className="h-3.5 w-3.5" />
-                {cancelMutation.isPending ? 'Killing...' : 'Kill (/cancel)'}
-              </button>
-            </div>
+            {!isGradedMode && (
+              <div className="mb-2 space-y-0.5" data-testid="lucille-hint">
+                <p className="text-[10px] text-success/80">{lucilleHint.approve}</p>
+                <p className="text-[10px] text-error/80">{lucilleHint.reject}</p>
+                <p className="text-[10px] text-text-secondary">
+                  Kill (/cancel) -&gt; stops the run immediately
+                </p>
+              </div>
+            )}
+
+            {/* GRADED mode: three-choice selector (approve-as-is / approve-with-fix / reject) */}
+            {isGradedMode && (
+              <div data-testid="graded-choice-panel">
+                {/* Verb selector */}
+                <div className="flex items-center gap-2 flex-wrap mb-2">
+                  {gradedChoices.includes('approve_as_is') && (
+                    <button
+                      type="button"
+                      onClick={(): void => {
+                        setGradedVerb(prev => (prev === 'approve_as_is' ? null : 'approve_as_is'));
+                        setCheckedFixIds(new Set());
+                      }}
+                      disabled={gateBusy !== null || cancelMutation.isPending}
+                      className={`flex items-center gap-1 rounded-md px-2 py-1 text-xs border transition-colors disabled:opacity-50 disabled:cursor-not-allowed ${
+                        gradedVerb === 'approve_as_is'
+                          ? 'bg-success/15 text-success border-success/50'
+                          : 'text-success/90 border-success/30 hover:bg-success/10 hover:text-success'
+                      }`}
+                      data-testid="choice-approve-as-is"
+                    >
+                      <CheckCircle className="h-3.5 w-3.5" />
+                      Approve as-is
+                    </button>
+                  )}
+                  {gradedChoices.includes('approve_with_fix') && (
+                    <button
+                      type="button"
+                      onClick={(): void => {
+                        setGradedVerb(prev =>
+                          prev === 'approve_with_fix' ? null : 'approve_with_fix'
+                        );
+                        setCheckedFixIds(new Set());
+                      }}
+                      disabled={
+                        gateBusy !== null || cancelMutation.isPending || approveWithFixDisabled
+                      }
+                      className={`flex items-center gap-1 rounded-md px-2 py-1 text-xs border transition-colors disabled:opacity-50 disabled:cursor-not-allowed ${
+                        gradedVerb === 'approve_with_fix'
+                          ? 'bg-warning/15 text-warning border-warning/50'
+                          : 'text-warning/90 border-warning/30 hover:bg-warning/10 hover:text-warning'
+                      }`}
+                      data-testid="choice-approve-with-fix"
+                    >
+                      Approve with fix
+                    </button>
+                  )}
+                  {gradedChoices.includes('reject') && (
+                    <button
+                      type="button"
+                      onClick={(): void => {
+                        setGradedVerb(prev => (prev === 'reject' ? null : 'reject'));
+                        setCheckedFixIds(new Set());
+                      }}
+                      disabled={gateBusy !== null || cancelMutation.isPending}
+                      className={`flex items-center gap-1 rounded-md px-2 py-1 text-xs border transition-colors disabled:opacity-50 disabled:cursor-not-allowed ${
+                        gradedVerb === 'reject'
+                          ? 'bg-error/15 text-error border-error/50'
+                          : 'text-error/90 border-error/30 hover:bg-error/10 hover:text-error'
+                      }`}
+                      data-testid="choice-reject"
+                    >
+                      <XCircle className="h-3.5 w-3.5" />
+                      Reject
+                    </button>
+                  )}
+                </div>
+
+                {/* Per-finding checkboxes for approve-with-fix */}
+                {gradedVerb === 'approve_with_fix' && unresolved.length > 0 && (
+                  <div className="mb-2 space-y-1" data-testid="fix-findings-list">
+                    <p className="text-[10px] text-text-tertiary uppercase tracking-wide mb-1">
+                      Authorize fixes for:
+                    </p>
+                    {unresolved.map(f => (
+                      <label
+                        key={f.id}
+                        className="flex items-center gap-2 text-xs text-text-secondary cursor-pointer"
+                        data-testid={`fix-finding-${f.id}`}
+                      >
+                        <input
+                          type="checkbox"
+                          checked={checkedFixIds.has(f.id)}
+                          onChange={(e): void => {
+                            setCheckedFixIds(prev => {
+                              const next = new Set(prev);
+                              if (e.target.checked) {
+                                next.add(f.id);
+                              } else {
+                                next.delete(f.id);
+                              }
+                              return next;
+                            });
+                          }}
+                          className="accent-warning"
+                        />
+                        {f.label}
+                      </label>
+                    ))}
+                  </div>
+                )}
+
+                {/* Confirm button for graded choice */}
+                {gradedVerb !== null && (
+                  <button
+                    type="button"
+                    onClick={(): void => {
+                      if (gradedVerb === 'approve_as_is') void onApproveAsIs();
+                      else if (gradedVerb === 'approve_with_fix') void onApproveWithFix();
+                      else void onReject();
+                    }}
+                    disabled={gateBusy !== null || cancelMutation.isPending}
+                    className="mt-1 flex items-center gap-1 rounded-md px-2 py-1 text-xs text-text-primary bg-surface-elevated border border-border hover:bg-surface-hover disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                    data-testid="graded-confirm-button"
+                  >
+                    {gateBusy !== null
+                      ? 'Working...'
+                      : `Confirm: ${gradedVerb === 'approve_as_is' ? 'Approve as-is' : gradedVerb === 'approve_with_fix' ? 'Approve with fix' : 'Reject'}`}
+                  </button>
+                )}
+              </div>
+            )}
+
+            {/* BINARY (legacy) mode: plain Approve / Reject buttons */}
+            {!isGradedMode && (
+              <div className="flex items-center gap-2 flex-wrap">
+                <button
+                  type="button"
+                  onClick={(): void => {
+                    void onApprove();
+                  }}
+                  disabled={gateBusy !== null || cancelMutation.isPending}
+                  className="flex items-center gap-1 rounded-md px-2 py-1 text-xs text-success/90 border border-success/30 hover:bg-success/10 hover:text-success disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                  data-testid="inline-approve-button"
+                >
+                  <CheckCircle className="h-3.5 w-3.5" />
+                  {gateBusy === 'approving' ? 'Approving...' : 'Approve'}
+                </button>
+                <button
+                  type="button"
+                  onClick={(): void => {
+                    void onReject();
+                  }}
+                  disabled={gateBusy !== null || cancelMutation.isPending}
+                  className="flex items-center gap-1 rounded-md px-2 py-1 text-xs text-error/90 border border-error/30 hover:bg-error/10 hover:text-error disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                  data-testid="inline-reject-button"
+                >
+                  <XCircle className="h-3.5 w-3.5" />
+                  {gateBusy === 'rejecting' ? 'Rejecting...' : 'Reject'}
+                </button>
+                {/* WO-MC-NEGAN-DIAGNOSTIC-GRAPH-01: KillButton -- distinct from
+                    Reject. Direct /cancel; bypasses the on_reject loop. */}
+                <button
+                  type="button"
+                  onClick={(): void => {
+                    cancelMutation.mutate();
+                  }}
+                  disabled={gateBusy !== null || cancelMutation.isPending}
+                  className="flex items-center gap-1 rounded-md px-2 py-1 text-xs text-text-secondary border border-border hover:bg-surface-elevated hover:text-text-primary disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                  data-testid="inline-kill-button"
+                >
+                  <Ban className="h-3.5 w-3.5" />
+                  {cancelMutation.isPending ? 'Killing...' : 'Kill (/cancel)'}
+                </button>
+              </div>
+            )}
             {gateError !== null && <p className="mt-1 text-[10px] text-error">{gateError}</p>}
           </section>
         )}
