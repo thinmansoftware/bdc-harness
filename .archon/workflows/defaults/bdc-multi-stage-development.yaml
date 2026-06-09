@@ -120,26 +120,29 @@ nodes:
         echo "ERROR: spec artifact missing or empty at $SPEC_FILE" >&2
         exit 1
       fi
-      # Extract the FIRST yaml-fenced `stages:` block from the spec. The spec body
-      # embeds the contract example inside a ```yaml ... ``` fence; the actual stage
-      # declaration must use the same structure (id / repo / target_branch /
-      # in_scope_files / verify_commands / readiness_bar / depends_on).
-      # We search for `stages:` lines that begin at column 0 (NOT indented inside
-      # a paragraph) and slurp until the closing fence or the next blank-line
-      # paragraph break.
+      # Extract the canonical yaml-fenced `stages:` block from the spec. Spec bodies
+      # frequently embed an example/schema fence BEFORE the real declaration; the
+      # canonical block is the one immediately preceded by either a heading line
+      # "## Canonical stages"/"### Stages" OR a marker comment
+      # "<!-- canonical-stages -->" / "<!-- stages: canonical -->". If no marker
+      # is present, we fall back to the LAST fenced `stages:` block (canonical
+      # declarations conventionally come AFTER examples). Taking the FIRST block
+      # is unsafe: an example schema with 0/1 stages would execute instead of the
+      # real ordered pipeline. The selection rule + chosen block are echoed to
+      # stderr so reviewers can verify which block was consumed.
       OUT="$ARTIFACTS_DIR/stages.yaml"
       python3 - "$SPEC_FILE" "$OUT" <<'PYEOF'
       import sys, re
       spec = open(sys.argv[1], 'r', encoding='utf-8', errors='replace').read()
-      # Find the first fenced yaml block that opens with a `stages:` line.
-      # Pattern: ```yaml ... stages: ... ``` with stages at start of a line in the block.
+      # Find every fenced yaml block that opens with a `stages:` line at column 0.
+      # Pattern: ```yaml ... stages: ... ```.
       fence_re = re.compile(r"```ya?ml\s*\n(.*?)\n```", re.DOTALL)
-      candidates = []
+      candidates = []  # list of (start_offset, body)
       for m in fence_re.finditer(spec):
           body = m.group(1)
           for line in body.splitlines():
               if line.startswith('stages:'):
-                  candidates.append(body)
+                  candidates.append((m.start(), body))
                   break
       if not candidates:
           # Fallback: an unfenced `stages:` block (column 0) followed by indented YAML.
@@ -152,7 +155,6 @@ nodes:
                       capturing = True
                       out.append(line)
                   continue
-              # Stop on a blank line followed by a non-indented non-empty line
               if line == '':
                   out.append(line)
                   continue
@@ -160,12 +162,44 @@ nodes:
                   break
               out.append(line)
           if out:
-              candidates.append('\n'.join(out))
+              candidates.append((0, '\n'.join(out)))
       if not candidates:
           sys.stderr.write("FAIL: no `stages:` declaration found in spec.\n")
           sys.exit(1)
-      open(sys.argv[2], 'w', encoding='utf-8').write(candidates[0])
+      # Selection rule:
+      #  1. Prefer a block immediately preceded (within ~3 lines / ~200 chars) by an
+      #     explicit canonical marker: "## Canonical stages", "### Stages",
+      #     "<!-- canonical-stages -->", or "<!-- stages: canonical -->".
+      #  2. Else fall back to the LAST fenced `stages:` block (canonical
+      #     declarations conventionally come AFTER examples in human-written specs).
+      MARKERS = [
+          re.compile(r"^\s*##+\s+Canonical\s+stages\b", re.IGNORECASE | re.MULTILINE),
+          re.compile(r"^\s*##+\s+Stages\b", re.IGNORECASE | re.MULTILINE),
+          re.compile(r"<!--\s*canonical-stages\s*-->", re.IGNORECASE),
+          re.compile(r"<!--\s*stages:\s*canonical\s*-->", re.IGNORECASE),
+      ]
+      chosen = None
+      chosen_reason = None
+      for marker in MARKERS:
+          for offset, body in candidates:
+              # Look backwards from offset for the marker within a 600-char window.
+              window = spec[max(0, offset - 600):offset]
+              if marker.search(window):
+                  chosen = body
+                  chosen_reason = "explicit-marker:%s" % marker.pattern
+                  break
+          if chosen is not None:
+              break
+      if chosen is None:
+          # Fall back to the LAST block. Heuristic: canonical declaration tends to
+          # come after examples. If only one block exists this is a no-op.
+          chosen = candidates[-1][1]
+          chosen_reason = "last-fenced-stages-block (of %d found)" % len(candidates)
+      sys.stderr.write("stages-block-selected reason=%s\n" % chosen_reason)
+      sys.stderr.write("stages-block-candidates=%d\n" % len(candidates))
+      open(sys.argv[2], 'w', encoding='utf-8').write(chosen)
       print("stages-yaml-extracted=" + sys.argv[2])
+      print("stages-block-selection=" + chosen_reason)
       PYEOF
       if [ ! -s "$OUT" ]; then
         echo "ERROR: extracted stages YAML is empty" >&2
@@ -191,7 +225,10 @@ nodes:
       if not isinstance(stages, list) or len(stages) == 0:
           sys.stderr.write("FAIL: parsed `stages` is not a non-empty list.\n")
           sys.exit(1)
-      required = ['id', 'repo', 'target_branch', 'in_scope_files']
+      # Required keys -- a stage MUST declare its full execution contract. No
+      # downstream defaults are permitted to silently fill these (spec C2 mandates
+      # the contract is explicit at the spec level, not inferred at runtime).
+      required = ['id', 'repo', 'target_branch', 'in_scope_files', 'verify_commands', 'readiness_bar']
       for i, st in enumerate(stages):
           if not isinstance(st, dict):
               sys.stderr.write("FAIL: stage %d is not a mapping.\n" % i)
@@ -199,6 +236,23 @@ nodes:
           for k in required:
               if k not in st:
                   sys.stderr.write("FAIL: stage %d missing required key '%s'.\n" % (i, k))
+                  sys.exit(1)
+          # verify_commands must be a non-empty list (zero-command verify is a no-op gate).
+          vc = st.get('verify_commands')
+          if not isinstance(vc, list) or len(vc) == 0:
+              sys.stderr.write("FAIL: stage %d 'verify_commands' must be a non-empty list.\n" % i)
+              sys.exit(1)
+          # readiness_bar must be a mapping with the four required booleans, all true.
+          rb = st.get('readiness_bar')
+          if not isinstance(rb, dict):
+              sys.stderr.write("FAIL: stage %d 'readiness_bar' must be a mapping.\n" % i)
+              sys.exit(1)
+          for rk in ('pr_open', 'ci_green', 'diff_review_clean', 'mergeable'):
+              if rk not in rb:
+                  sys.stderr.write("FAIL: stage %d 'readiness_bar' missing key '%s'.\n" % (i, rk))
+                  sys.exit(1)
+              if rb[rk] is not True:
+                  sys.stderr.write("FAIL: stage %d 'readiness_bar.%s' must be true (no soft gates).\n" % (i, rk))
                   sys.exit(1)
       open(sys.argv[2], 'w', encoding='utf-8').write(json.dumps(stages, indent=2))
       print("STAGE_COUNT=%d" % len(stages))
@@ -308,18 +362,18 @@ nodes:
   # deterministic stage branch (archon/<wo-id>/<stage-id>, no run-id suffix per
   # spec C5 idempotency contract).
   #
-  # IMPLEMENTATION NOTE (LOUD, NOT SILENT FALLBACK):
-  # The substrate function packages/isolation/src/stage-allocator.ts::createStageWorktree
-  # is the authoritative allocator and the Phase 1 deliverable. It is NOT invoked
-  # from this bash node because workspace package resolution
-  # (`@archon/isolation`) does not reach a target-repo worktree's CWD -- the
-  # script node import pre-condition failed during build (verified 2026-06-09).
-  # The ENGINE INTEGRATION that wires createStageWorktree into the executor is
-  # tracked as a follow-up substrate WO.
-  # Until that ships, this node uses raw `git worktree add` against each stage's
-  # canonical repo path -- and mirrors the substrate's branch derivation rule
-  # EXACTLY so behavior matches when the engine integration lands.
-  # This is documented, tracked, and bounded -- NOT a silent fallback.
+  # IMPLEMENTATION: this node ACTUALLY invokes the authoritative substrate
+  # `packages/isolation/src/stage-allocator.ts::createStageWorktree`. We discover
+  # the bdc-harness source root at runtime (walks up from CWD; falls back to
+  # well-known canonical paths), then spawn `bun` with a shim script that imports
+  # `@archon/isolation`'s `createStageWorktree` and calls it per stage. This means
+  # the branch derivation, sync, worktree adopt-vs-create logic, and error
+  # handling are all the substrate's -- this node is a thin orchestration shell.
+  #
+  # If the harness source root cannot be discovered, the node FAILS CLOSED with a
+  # loud diagnostic. No silent fallback to raw git -- that would re-introduce the
+  # exact gap the substrate exists to close. Operator must register HARNESS_ROOT
+  # env var or run the workflow from a path where the harness is discoverable.
   #
   # Output: $ARTIFACTS_DIR/stage-worktrees.json
   # ---------------------------------------------------------------------------
@@ -340,102 +394,164 @@ nodes:
         exit 1
       fi
       OUT="$ARTIFACTS_DIR/stage-worktrees.json"
-      python3 - "$ENRICHED" "$WO_ID" "$OUT" <<'PYEOF'
-      import sys, json, os, subprocess
-      stages = json.load(open(sys.argv[1]))
-      wo_id = sys.argv[2]
-      out = []
-      for st in stages:
-          stage_id = st['id']
-          repo_path = st['canonicalRepoPath']
-          target_branch = st['target_branch']
-          codebase_id = st['codebaseId']
-          # Deterministic branch derivation -- matches stage-allocator.ts::deriveStageBranchName
-          # exactly: archon/<wo-id>/<stage-id>. NO run-id suffix (C5 contract).
-          branch_name = "archon/%s/%s" % (wo_id, stage_id)
-          # Workspace-scoped worktree path. Mirror getWorktreeBase()'s shape for
-          # consistency once the engine integration lands. For now we place the
-          # worktree under the repo's parent worktrees/ directory using the same
-          # branch name -- the substrate function will own the precise path resolution.
-          # We use $ARCHON_HOME/workspaces/<owner>/<repo>/worktrees/<branch>.
-          archon_home = os.environ.get('ARCHON_HOME', os.path.expanduser('~/.archon'))
-          repo_name = st['repo']
-          base_dir = os.path.join(archon_home, 'workspaces', repo_name, 'worktrees')
-          worktree_path = os.path.join(base_dir, branch_name)
-          os.makedirs(base_dir, exist_ok=True)
-          # Sync the canonical repo on target_branch before creating the worktree.
-          sync_rc = subprocess.run(
-              ['git', '-C', repo_path, 'fetch', 'origin', target_branch],
-              capture_output=True, text=True, timeout=300
-          )
-          if sync_rc.returncode != 0:
-              sys.stderr.write("FAIL: stage '%s' fetch origin/%s in %s: %s\n" %
-                               (stage_id, target_branch, repo_path, sync_rc.stderr))
-              sys.exit(1)
-          # Check if worktree already exists (re-fire adoption).
-          exists_rc = subprocess.run(
-              ['git', '-C', repo_path, 'worktree', 'list', '--porcelain'],
-              capture_output=True, text=True, timeout=30
-          )
-          adopted = False
-          if exists_rc.returncode == 0:
-              wt_real = os.path.realpath(worktree_path)
-              for line in exists_rc.stdout.splitlines():
-                  if line.startswith('worktree '):
-                      candidate = line[len('worktree '):].strip()
-                      if os.path.realpath(candidate) == wt_real and os.path.exists(candidate):
-                          adopted = True
-                          break
-          if not adopted:
-              # Create the worktree on the deterministic branch. Try `-b` first
-              # (new branch from origin/<target_branch>); if branch exists, attach
-              # to existing (preserve commits -- C5 contract).
-              start_point = "origin/%s" % target_branch
-              create_rc = subprocess.run(
-                  ['git', '-C', repo_path, 'worktree', 'add', worktree_path,
-                   '-b', branch_name, start_point],
-                  capture_output=True, text=True, timeout=300
-              )
-              if create_rc.returncode != 0:
-                  stderr = create_rc.stderr or ''
-                  if 'already exists' in stderr:
-                      # Branch exists -- attach to it without resetting (preserve).
-                      attach_rc = subprocess.run(
-                          ['git', '-C', repo_path, 'worktree', 'add', worktree_path,
-                           branch_name],
-                          capture_output=True, text=True, timeout=300
-                      )
-                      if attach_rc.returncode != 0:
-                          sys.stderr.write("FAIL: stage '%s' attach existing branch %s: %s\n" %
-                                           (stage_id, branch_name, attach_rc.stderr))
-                          sys.exit(1)
-                  else:
-                      sys.stderr.write("FAIL: stage '%s' worktree add: %s\n" %
-                                       (stage_id, stderr))
-                      sys.exit(1)
-          out.append({
-              'stageId': stage_id,
-              'branchName': branch_name,
-              'worktreePath': worktree_path,
-              'codebaseId': codebase_id,
-              'canonicalRepoPath': repo_path,
-              'repo': st['repo'],
-              'targetBranch': target_branch,
-              'inScopeFiles': st.get('in_scope_files', []),
-              'verifyCommands': st.get('verify_commands', []),
-              'readinessBar': st.get('readiness_bar', {
-                  'pr_open': True, 'ci_green': True,
-                  'diff_review_clean': True, 'mergeable': True,
-              }),
-              'dependsOn': st.get('depends_on'),
-              'adopted': adopted,
-          })
-      open(sys.argv[3], 'w', encoding='utf-8').write(json.dumps(out, indent=2))
-      print("STAGE_WORKTREES=%s" % sys.argv[3])
-      for st in out:
-          print("  stage=%s branch=%s adopted=%s path=%s" %
-                (st['stageId'], st['branchName'], st['adopted'], st['worktreePath']))
-      PYEOF
+
+      # ---- Locate the bdc-harness source root (where the substrate lives). ----
+      # The substrate is packages/isolation/src/stage-allocator.ts in the harness
+      # repo. We discover it deterministically: prefer explicit HARNESS_ROOT env,
+      # then walk up from CWD, then probe canonical install paths. FAIL CLOSED
+      # if we cannot find it -- no silent fallback to raw git.
+      MARKER_REL="packages/isolation/src/stage-allocator.ts"
+      HARNESS_ROOT=""
+      if [ -n "${HARNESS_ROOT_OVERRIDE:-}" ] && [ -f "${HARNESS_ROOT_OVERRIDE}/${MARKER_REL}" ]; then
+        HARNESS_ROOT="${HARNESS_ROOT_OVERRIDE}"
+      fi
+      if [ -z "$HARNESS_ROOT" ]; then
+        D="$(pwd)"
+        while [ -n "$D" ] && [ "$D" != "/" ]; do
+          if [ -f "$D/$MARKER_REL" ]; then HARNESS_ROOT="$D"; break; fi
+          D="$(dirname "$D")"
+        done
+      fi
+      if [ -z "$HARNESS_ROOT" ]; then
+        for candidate in \
+          "/.archon/workspaces/bluedevilcollectibles/bdc-harness/source" \
+          "${ARCHON_HOME:-$HOME/.archon}/workspaces/bluedevilcollectibles/bdc-harness/source" \
+          "$HOME/.archon/workspaces/bluedevilcollectibles/bdc-harness/source"; do
+          if [ -f "$candidate/$MARKER_REL" ]; then HARNESS_ROOT="$candidate"; break; fi
+        done
+      fi
+      if [ -z "$HARNESS_ROOT" ]; then
+        echo "ERROR: bdc-harness source root not found -- cannot invoke createStageWorktree substrate." >&2
+        echo "Searched: HARNESS_ROOT_OVERRIDE env, walked up from CWD ($(pwd)), and canonical install paths." >&2
+        echo "Set HARNESS_ROOT_OVERRIDE=/path/to/bdc-harness/source and re-run." >&2
+        exit 1
+      fi
+      echo "HARNESS_ROOT=$HARNESS_ROOT"
+      if ! command -v bun >/dev/null 2>&1; then
+        echo "ERROR: bun not on PATH -- cannot run the substrate shim." >&2
+        exit 1
+      fi
+
+      # ---- Substrate shim: imports createStageWorktree and calls it per stage. ----
+      # We write the shim into $ARTIFACTS_DIR so its diagnostic output is auditable,
+      # and we CD into HARNESS_ROOT so bun resolves @archon/isolation via the
+      # workspace package.json. The shim reads stages-enriched.json + WO_ID,
+      # invokes createStageWorktree(...) per stage, and emits the same
+      # stage-worktrees.json shape downstream nodes consume.
+      SHIM="$ARTIFACTS_DIR/stage-alloc-shim.ts"
+      cat > "$SHIM" <<'TSEOF'
+      // Stage allocator shim -- thin wrapper around createStageWorktree.
+      // Invoked from allocate-stage-worktrees node in bdc-multi-stage-development.yaml.
+      //
+      // We use a dynamic import keyed off process.env.HARNESS_ROOT (set by the
+      // calling bash node) so the substrate resolves via an ABSOLUTE filesystem
+      // path. This avoids depending on `bun install` having materialized the
+      // @archon/isolation workspace symlink at runtime -- a real concern in
+      // freshly-cloned worktrees where node_modules has not been populated yet.
+      import { readFileSync, writeFileSync } from 'node:fs';
+      import { join } from 'node:path';
+      const HARNESS_ROOT = process.env.HARNESS_ROOT;
+      if (!HARNESS_ROOT) {
+        process.stderr.write('shim FAIL: HARNESS_ROOT env var not set by caller\n');
+        process.exit(2);
+      }
+      const allocatorPath = join(HARNESS_ROOT, 'packages/isolation/src/stage-allocator.ts');
+      const mod = await import(allocatorPath);
+      const createStageWorktree = mod.createStageWorktree as (
+        opts: {
+          woId: string;
+          stageId: string;
+          codebaseId: string;
+          codebaseName: string;
+          canonicalRepoPath: string;
+          targetBranch: string;
+        }
+      ) => Promise<{ stageId: string; branchName: string; worktreePath: string; codebaseId: string; adopted: boolean }>;
+
+      type EnrichedStage = {
+        id: string;
+        repo: string;
+        target_branch: string;
+        in_scope_files?: unknown;
+        verify_commands?: unknown;
+        readiness_bar?: unknown;
+        depends_on?: unknown;
+        codebaseId: string;
+        codebasePath: string;
+        canonicalRepoPath: string;
+      };
+
+      async function main(): Promise<void> {
+        const enrichedPath = process.argv[2];
+        const woId = process.argv[3];
+        const outPath = process.argv[4];
+        if (!enrichedPath || !woId || !outPath) {
+          process.stderr.write('shim usage: stage-alloc-shim.ts <enriched-json> <wo-id> <out-json>\n');
+          process.exit(2);
+        }
+        const stages: EnrichedStage[] = JSON.parse(readFileSync(enrichedPath, 'utf-8'));
+        const out: Array<Record<string, unknown>> = [];
+        for (const st of stages) {
+          const result = await createStageWorktree({
+            woId,
+            stageId: st.id,
+            codebaseId: st.codebaseId,
+            codebaseName: st.repo,
+            canonicalRepoPath: st.canonicalRepoPath,
+            targetBranch: st.target_branch,
+          });
+          out.push({
+            stageId: result.stageId,
+            branchName: result.branchName,
+            worktreePath: result.worktreePath,
+            codebaseId: result.codebaseId,
+            canonicalRepoPath: st.canonicalRepoPath,
+            repo: st.repo,
+            targetBranch: st.target_branch,
+            inScopeFiles: st.in_scope_files ?? [],
+            verifyCommands: st.verify_commands ?? [],
+            readinessBar: st.readiness_bar,
+            dependsOn: st.depends_on ?? null,
+            adopted: result.adopted,
+          });
+          process.stderr.write(
+            `stage=${result.stageId} branch=${result.branchName} adopted=${result.adopted} path=${result.worktreePath}\n`
+          );
+        }
+        writeFileSync(outPath, JSON.stringify(out, null, 2));
+        process.stdout.write(`STAGE_WORKTREES=${outPath}\n`);
+        for (const row of out) {
+          process.stdout.write(
+            `  stage=${row.stageId} branch=${row.branchName} adopted=${row.adopted} path=${row.worktreePath}\n`
+          );
+        }
+      }
+
+      main().catch((err: unknown) => {
+        const e = err as Error;
+        process.stderr.write(`stage-alloc-shim FAIL: ${e.message}\n`);
+        if (e.stack) process.stderr.write(`${e.stack}\n`);
+        process.exit(1);
+      });
+      TSEOF
+
+      # Invoke the substrate. We CD into HARNESS_ROOT so bun resolves any
+      # transitive workspace packages the substrate may use. HARNESS_ROOT is
+      # exported so the shim can dynamically import the substrate by absolute
+      # path. --no-env-file prevents bun from auto-loading .env from the harness
+      # source (the workflow's runtime env is the source of truth here).
+      ( cd "$HARNESS_ROOT" && HARNESS_ROOT="$HARNESS_ROOT" bun --no-env-file "$SHIM" "$ENRICHED" "$WO_ID" "$OUT" )
+      RC=$?
+      if [ "$RC" -ne 0 ]; then
+        echo "ERROR: createStageWorktree substrate invocation failed (exit $RC)." >&2
+        echo "Shim: $SHIM  Enriched: $ENRICHED  Out: $OUT" >&2
+        exit "$RC"
+      fi
+      if [ ! -s "$OUT" ]; then
+        echo "ERROR: substrate produced no output at $OUT" >&2
+        exit 1
+      fi
+      echo "allocate-stage-worktrees PASS (invoked createStageWorktree for each declared stage)"
 
   # ---------------------------------------------------------------------------
   # implement-pipeline: the sequential N-stage build loop. ONE major-build agent
@@ -464,7 +580,14 @@ nodes:
     task_class: heavy_work
     loop:
       until: __NEVER_EMIT_USE_UNTIL_BASH__
-      max_iterations: 8
+      # max_iterations is a safety ceiling, NOT a stage count. Real completion is
+      # gated by until_bash (pipeline-done.flag OR any stage-*-blocked.json). The
+      # loop builds one stage per iteration and may need extra iterations for
+      # in-stage retries (CI flake re-poll, mergeability re-poll). 64 supports up
+      # to ~32 stages with retries -- well above any realistic pipeline (current
+      # max is ~4 stages). If the loop ever hits this cap that itself is a
+      # diagnostic signal that something is wedged; the cap is not a soft cap.
+      max_iterations: 64
       fresh_context: true
       until_bash: |
         set -uo pipefail
@@ -545,11 +668,19 @@ nodes:
             * pr_open       = state == 'OPEN'
             * ci_green      = every statusCheckRollup entry conclusion in
                               [SUCCESS, NEUTRAL, SKIPPED]
-            * mergeable     = mergeable == 'MERGEABLE' OR 'UNKNOWN' (informational only
-                              after step 5 commit when GitHub hasn't recomputed yet --
-                              treat UNKNOWN as a soft pass after 30s wait, then re-poll)
+            * mergeable     = mergeable == 'MERGEABLE' (HARD GATE -- C3 contract).
+                              UNKNOWN is NOT a pass. If GitHub returns UNKNOWN
+                              (mergeability not yet computed after push), POLL for up
+                              to 3 minutes (re-run `gh pr view ... --json mergeable`
+                              every 15s). If UNKNOWN still after the poll window OR
+                              if mergeable is 'CONFLICTING' / anything other than
+                              'MERGEABLE', this gate is FAIL: write the stage block
+                              artifact with blocking_reason 'pr_not_mergeable: <state>'.
+                              NEVER advance to the next stage on UNKNOWN.
             * diff_review_clean = self-review above did not surface a blocking finding
-        - ALL four readiness criteria must be true to advance.
+        - ALL four readiness criteria must be true to advance. ANY criterion failing
+          (including mergeable=UNKNOWN after poll window) MUST write the block
+          artifact -- no soft pass, no silent advance.
 
         ### 7. Stage outcome
         If readiness PASS:
