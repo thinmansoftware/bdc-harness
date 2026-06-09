@@ -60,3 +60,11 @@ export {
   isPathWithinRoot,
 } from './worktree-copy';
 export type { CopyFileEntry } from './worktree-copy';
+
+// --- Stage allocator (multi-stage pipeline substrate, WO-CAULDRON-MULTI-STAGE-PIPELINE-01) ---
+export {
+  createStageWorktree,
+  deriveStageBranchName,
+  resolveStageRepoPath,
+} from './stage-allocator';
+export type { StageWorktreeOpts, StageWorktreeResult } from './stage-allocator';
