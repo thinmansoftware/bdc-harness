@@ -452,12 +452,22 @@ export async function deleteWorkflowRun(
 
 export async function approveWorkflowRun(
   runId: string,
-  comment?: string
+  comment?: string,
+  options?: {
+    decision_verb?: 'approve_as_is' | 'approve_with_fix';
+    authorized_fix_ids?: string[];
+  }
 ): Promise<{ success: boolean; message: string }> {
   return fetchJSON(`/api/workflows/runs/${encodeURIComponent(runId)}/approve`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ comment }),
+    body: JSON.stringify({
+      comment,
+      ...(options?.decision_verb !== undefined ? { decision_verb: options.decision_verb } : {}),
+      ...(options?.authorized_fix_ids !== undefined
+        ? { authorized_fix_ids: options.authorized_fix_ids }
+        : {}),
+    }),
   });
 }
 
