@@ -3,8 +3,24 @@ import { OpenAPIHono } from '@hono/zod-openapi';
 import type { ConversationLockManager } from '@archon/core';
 import type { WebAdapter } from '../adapters/web';
 import { mkdir, rm, writeFile } from 'fs/promises';
+import { createRequire } from 'node:module';
 import { join } from 'path';
 import { tmpdir } from 'os';
+
+// These tests deliberately rely on the REAL fs/promises behavior: the 404 cases
+// for GET/DELETE /api/workflows/:name depend on readFile/unlink throwing a
+// genuine ENOENT for a path that does not exist on disk. Bun's mock.module() is
+// process-global and persists across test files in a single run; a sibling file
+// (api.host-metrics.test.ts) registers a permanent fs/promises mock whose
+// readFile returns '{}' and whose unlink is a no-op that always succeeds. That
+// leaked stub turns these 404 cases into 200s. To stay deterministic regardless
+// of file load order, capture the real fs/promises via createRequire (which
+// bypasses the module-mock registry) and re-register it as this file's own mock
+// so the real implementation wins for the module under test.
+const realFsPromises = createRequire(import.meta.url)(
+  'fs/promises'
+) as typeof import('fs/promises');
+mock.module('fs/promises', () => ({ ...realFsPromises }));
 import { validationErrorHook } from './openapi-defaults';
 import { makeTestWorkflow, makeTestWorkflowWithSource } from '@archon/workflows/test-utils';
 
