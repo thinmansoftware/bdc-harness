@@ -167,11 +167,14 @@ nodes:
           sys.stderr.write("FAIL: no `stages:` declaration found in spec.\n")
           sys.exit(1)
       # Selection rule:
-      #  1. Prefer a block immediately preceded (within ~3 lines / ~200 chars) by an
+      #  1. Prefer a block immediately preceded (within ~3 lines / ~600 chars) by an
       #     explicit canonical marker: "## Canonical stages", "### Stages",
       #     "<!-- canonical-stages -->", or "<!-- stages: canonical -->".
-      #  2. Else fall back to the LAST fenced `stages:` block (canonical
-      #     declarations conventionally come AFTER examples in human-written specs).
+      #  2. If exactly one block exists, use it.
+      #  3. If multiple blocks exist and none is marked canonical, FAIL CLOSED.
+      #     Picking first or last is unsafe because specs often contain example
+      #     schemas near C2 and may contain later appendix examples. The declared
+      #     executable block must be marked so selection is deterministic.
       MARKERS = [
           re.compile(r"^\s*##+\s+Canonical\s+stages\b", re.IGNORECASE | re.MULTILINE),
           re.compile(r"^\s*##+\s+Stages\b", re.IGNORECASE | re.MULTILINE),
@@ -191,10 +194,16 @@ nodes:
           if chosen is not None:
               break
       if chosen is None:
-          # Fall back to the LAST block. Heuristic: canonical declaration tends to
-          # come after examples. If only one block exists this is a no-op.
-          chosen = candidates[-1][1]
-          chosen_reason = "last-fenced-stages-block (of %d found)" % len(candidates)
+          if len(candidates) == 1:
+              chosen = candidates[0][1]
+              chosen_reason = "single-stages-block"
+          else:
+              sys.stderr.write(
+                  "FAIL: %d `stages:` blocks found but none is marked canonical. "
+                  "Add '<!-- canonical-stages -->' immediately before the declared executable block.\n"
+                  % len(candidates)
+              )
+              sys.exit(1)
       sys.stderr.write("stages-block-selected reason=%s\n" % chosen_reason)
       sys.stderr.write("stages-block-candidates=%d\n" % len(candidates))
       open(sys.argv[2], 'w', encoding='utf-8').write(chosen)
@@ -492,6 +501,19 @@ nodes:
         const stages: EnrichedStage[] = JSON.parse(readFileSync(enrichedPath, 'utf-8'));
         const out: Array<Record<string, unknown>> = [];
         for (const st of stages) {
+          if (!Array.isArray(st.verify_commands) || st.verify_commands.length === 0) {
+            throw new Error(`stage ${st.id} missing required non-empty verify_commands`);
+          }
+          const readiness = st.readiness_bar as Record<string, unknown> | undefined;
+          const readinessKeys = ['pr_open', 'ci_green', 'diff_review_clean', 'mergeable'];
+          if (
+            !readiness ||
+            readinessKeys.some((key) => readiness[key] !== true)
+          ) {
+            throw new Error(
+              `stage ${st.id} missing required readiness_bar booleans: ${readinessKeys.join(', ')}`
+            );
+          }
           const result = await createStageWorktree({
             woId,
             stageId: st.id,
@@ -508,8 +530,8 @@ nodes:
             canonicalRepoPath: st.canonicalRepoPath,
             repo: st.repo,
             targetBranch: st.target_branch,
-            inScopeFiles: st.in_scope_files ?? [],
-            verifyCommands: st.verify_commands ?? [],
+            inScopeFiles: st.in_scope_files,
+            verifyCommands: st.verify_commands,
             readinessBar: st.readiness_bar,
             dependsOn: st.depends_on ?? null,
             adopted: result.adopted,
@@ -580,14 +602,12 @@ nodes:
     task_class: heavy_work
     loop:
       until: __NEVER_EMIT_USE_UNTIL_BASH__
-      # max_iterations is a safety ceiling, NOT a stage count. Real completion is
-      # gated by until_bash (pipeline-done.flag OR any stage-*-blocked.json). The
-      # loop builds one stage per iteration and may need extra iterations for
-      # in-stage retries (CI flake re-poll, mergeability re-poll). 64 supports up
-      # to ~32 stages with retries -- well above any realistic pipeline (current
-      # max is ~4 stages). If the loop ever hits this cap that itself is a
-      # diagnostic signal that something is wedged; the cap is not a soft cap.
-      max_iterations: 64
+      # max_iterations is a retry ceiling for the whole orchestration pass, NOT
+      # a stage ceiling. Each iteration must process the entire declared stage
+      # list in order until all stages PASS or one stage BLOCKS. This reconciles
+      # declared-N stages with the workflow engine's numeric loop guard: N is
+      # bounded by the spec and runtime work, not by the loop iteration count.
+      max_iterations: 3
       fresh_context: true
       until_bash: |
         set -uo pipefail
@@ -616,11 +636,14 @@ nodes:
 
         ## Resume rule
         On every iteration, FIRST scan $ARTIFACTS_DIR for stage-*-done.json and
-        stage-*-blocked.json. Build only stages that have NEITHER (those not yet
-        complete and not blocked). Pick the next stage by the order in
-        stage-worktrees.json whose depends_on (if any) is already PASSED.
+        stage-*-blocked.json. Then process the FULL declared list in order until
+        every stage is done or one stage blocks. Build only stages that have
+        NEITHER (those not yet complete and not blocked). For each such stage,
+        ensure depends_on (if any) is already PASSED before starting it. Do not
+        stop after one successful stage; continue to the next declared stage in
+        the same iteration after writing the current stage's done artifact.
 
-        ## Per-stage build (do all of these for ONE stage per iteration)
+        ## Per-stage build (repeat these steps for each unblocked stage in order)
 
         ### 1. Prepare
         Read the stage entry: stageId, branchName, worktreePath, repo,
@@ -712,7 +735,7 @@ nodes:
               "blockingReason": "<one of: push_failed, ci_red, review_blocked, pr_not_mergeable, verify_failed, plan_ambiguous, registry_missing>: <detail>",
               "earlierPrsStand": true
             }
-          and HALT this iteration. Do NOT continue to later stages on the same iteration.
+          and HALT this iteration. Do NOT continue to later stages after a block.
 
         ### 8. After all stages done
         When every stage in stage-worktrees.json has a corresponding done.json
