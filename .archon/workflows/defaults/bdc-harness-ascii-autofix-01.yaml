@@ -416,9 +416,31 @@ nodes:
       echo "ERROR: implement emitted COMPLETE but produced ZERO real changes (CHANGED=$CHANGED AHEAD=$AHEAD)." >&2
       exit 0
 
-  - id: ascii-gate
+  - id: ascii-autofix
     persona: major-build
     depends_on: [assert-implement-produced-work]
+    bash: |
+      set -uo pipefail
+      WT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
+      cd "$WT"
+      BASE=$(cat "$ARTIFACTS_DIR/run-start-sha.txt" 2>/dev/null || echo "")
+      if [ -z "$BASE" ]; then BASE="unknown"; fi
+      if [ ! -f "harness/scripts/ascii-autofix.py" ]; then
+        echo "ascii-autofix: script missing; ascii-gate remains the backstop" >&2
+        exit 0
+      fi
+      MODIFIED=$(python3 harness/scripts/ascii-autofix.py "$BASE" 2>&1 || true)
+      if [ -n "$MODIFIED" ]; then
+        echo "ascii-autofix modified:"
+        printf '%s\n' "$MODIFIED"
+      else
+        echo "ascii-autofix PASS (no mapped non-ASCII substitutions needed)"
+      fi
+      exit 0
+
+  - id: ascii-gate
+    persona: major-build
+    depends_on: [ascii-autofix]
     load_bearing: true
     bash: |
       set -uo pipefail
