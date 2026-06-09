@@ -30,7 +30,7 @@ describe('dagNodeSchema agent field', () => {
     }
   });
 
-  test('agent field is optional — node without agent still validates', () => {
+  test('agent field is optional -- node without agent still validates', () => {
     const result = dagNodeSchema.safeParse({
       id: 'step',
       prompt: 'Do the thing.',
@@ -41,14 +41,14 @@ describe('dagNodeSchema agent field', () => {
     }
   });
 
-  test('node with agent AND model both present — schema accepts it (executor logs warning)', () => {
+  test('node with agent AND model both present -- schema accepts it (executor logs warning)', () => {
     const result = dagNodeSchema.safeParse({
       id: 'implement',
       agent: 'major-build',
       model: 'sonnet',
       prompt: 'Implement the plan.',
     });
-    // Schema allows coexistence — executor handles model precedence at runtime
+    // Schema allows coexistence -- executor handles model precedence at runtime
     expect(result.success).toBe(true);
     if (result.success) {
       expect((result.data as { agent?: string }).agent).toBe('major-build');
@@ -83,7 +83,7 @@ describe('dagNodeSchema agent field', () => {
   });
 
   test('bash node with agent field is accepted by schema (warning only, not error)', () => {
-    // The schema itself does not error on bash+agent — loader emits a warning at parse time
+    // The schema itself does not error on bash+agent -- loader emits a warning at parse time
     const result = dagNodeSchema.safeParse({
       id: 'step',
       bash: 'echo hello',
