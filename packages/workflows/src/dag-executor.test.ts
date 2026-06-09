@@ -8255,3 +8255,43 @@ it('classify-apply-review routes decide-push-target correctly for all gate outco
   ]);
   expect(evaluateCondition(decidePushCond, approveWithFixMissing).result).toBe(false);
 });
+
+// T5: commit-and-push when: condition tests
+// Verifies the four paths through the widened when: clause:
+//   "$block-reclassify.output.status == 'PROCEED' || $classify-apply-review.output.verdict == 'satisfied'"
+it('commit-and-push when: evaluates correctly for all paths', () => {
+  const commitCond =
+    "$block-reclassify.output.status == 'PROCEED' || $classify-apply-review.output.verdict == 'satisfied'";
+
+  // Path 1: PROCEED run (classify-apply-review skipped -> output '' -> verdict '' != 'satisfied' = FALSE)
+  // First clause PROCEED == PROCEED = TRUE -> overall TRUE
+  const proceedRun = new Map<string, NodeOutput>([
+    ['block-reclassify', { state: 'completed', output: '{"status":"PROCEED"}' }],
+    ['classify-apply-review', { state: 'skipped', output: '' }],
+  ]);
+  expect(evaluateCondition(commitCond, proceedRun).result).toBe(true);
+
+  // Path 2: approve_with_fix + verdict satisfied
+  // First clause BLOCKED != PROCEED = FALSE; second clause 'satisfied' == 'satisfied' = TRUE -> overall TRUE
+  const approveWithFixSatisfied = new Map<string, NodeOutput>([
+    ['block-reclassify', { state: 'completed', output: '{"status":"BLOCKED"}' }],
+    ['classify-apply-review', { state: 'completed', output: '{"verdict":"satisfied"}' }],
+  ]);
+  expect(evaluateCondition(commitCond, approveWithFixSatisfied).result).toBe(true);
+
+  // Path 3: approve_with_fix + verdict needs_revision -> BLOCKED commit must NOT happen
+  // First clause FALSE, second clause FALSE -> overall FALSE
+  const approveWithFixNeedsRevision = new Map<string, NodeOutput>([
+    ['block-reclassify', { state: 'completed', output: '{"status":"BLOCKED"}' }],
+    ['classify-apply-review', { state: 'completed', output: '{"verdict":"needs_revision"}' }],
+  ]);
+  expect(evaluateCondition(commitCond, approveWithFixNeedsRevision).result).toBe(false);
+
+  // Path 4: plain BLOCKED with no approve-with-fix (classify skipped -> verdict '' -> FALSE)
+  // First clause FALSE, second clause '' == 'satisfied' = FALSE -> overall FALSE
+  const plainBlocked = new Map<string, NodeOutput>([
+    ['block-reclassify', { state: 'completed', output: '{"status":"BLOCKED"}' }],
+    ['classify-apply-review', { state: 'skipped', output: '' }],
+  ]);
+  expect(evaluateCondition(commitCond, plainBlocked).result).toBe(false);
+});
