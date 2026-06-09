@@ -1,0 +1,892 @@
+name: bdc-multi-stage-development
+description: |
+  Use when: Executing a BDC Work Order whose spec declares an ordered `stages:` list
+  -- a multi-stage pipeline across one or more repos/targets (connect = 2 stages,
+  storefront = 3-4 stages, future = N). The pipeline builds each stage sequentially,
+  pinned to its repo + target_branch, gating between stages (PR-open + CI-green +
+  review-clean + mergeable, NOT merged).
+  Input: WO_ID in the environment or user message. Spec lives in bdc-xo.
+  Does: Reads the BDC WO spec, parses the explicit per-stage contract, asserts every
+  stage's repo is registered, allocates one worktree per stage, runs the
+  bdc-feature-development build loop pattern per stage in order, threads forward
+  the prior stage's PR/branch/contract, opens a coordinated PR per stage, builds a
+  consolidated multi-stage manifest, and flips Notion REVIEW only when ALL stages
+  pass.
+  NOT for: Single-repo WOs without an explicit `stages:` declaration -- use
+  bdc-feature-development. A 1-stage pipeline IS supported here (N=1 regression
+  invariant -- same stage engine, behavior-equivalent output) but the normal
+  single-repo route remains bdc-feature-development.
+
+  Anchor: 2026-06-09 connect saga -- WO-CONNECT-MANUAL-AND-UI-01 was MIXED-repo
+  (shopops-api backend + lspro-react UI). Every fire allocated ONE worktree for ONE
+  repo, leaving the UI half UNBUILDABLE on a git branch. This workflow is the
+  structural fix for the MIXED-repo WO class AND the tenant-storefront deploy engine.
+
+  Substrate: packages/isolation/src/stage-allocator.ts (Phase 1 code change, requires
+  rebuild + restart). The allocator's deterministic branch derivation
+  (archon/<wo-id>/<stage-id>, NO run-id suffix) is the C5 idempotency contract:
+  re-fires UPDATE the same stage branch -- no duplicate-PR spray.
+
+policyFile: harness/policies/agent-behavior.md
+model: sonnet
+
+nodes:
+  # ---------------------------------------------------------------------------
+  # Pre-flight: fail closed if container lacks GITHUB push auth. Mirrors the
+  # bdc-feature-development pre-flight verbatim. Anchor: 2026-05-16 engine sortie.
+  # ---------------------------------------------------------------------------
+  - id: preflight-github-auth
+    persona: major-build
+    load_bearing: true
+    bash: |
+      set -euo pipefail
+      if ! git push --dry-run origin "HEAD:refs/heads/preflight-auth-probe-$(date +%s)" 2>&1; then
+        echo "ERROR: GITHUB auth check failed -- container cannot push to origin." >&2
+        echo "Likely cause: GITHUB_TOKEN missing in executor env, or token lacks repo scope." >&2
+        exit 1
+      fi
+      echo "preflight-github-auth PASS"
+
+  # ---------------------------------------------------------------------------
+  # read-spec: fetch the WO spec from bdc-xo. Mirror bdc-feature-development.
+  # Captures the immutable run-start SHA for the worktree before any node mutates.
+  # ---------------------------------------------------------------------------
+  - id: read-spec
+    persona: xo
+    depends_on: [preflight-github-auth]
+    bash: |
+      set -euo pipefail
+      WO_ID="${WO_ID:-}"
+      if [ -z "$WO_ID" ]; then
+        WO_ID=$(printf '%s\n' "$USER_MESSAGE" | grep -Eo 'WO-[A-Z0-9-]+' | head -n 1 || true)
+      fi
+      if [ -z "$WO_ID" ]; then
+        echo "WO_ID missing. Provide WO_ID in environment or user message." >&2
+        exit 1
+      fi
+      SPEC_PATH="docs/work-orders/${WO_ID}.md"
+      SPEC_CONTENT=$(gh api "repos/bluedevilcollectibles/bdc-xo/contents/${SPEC_PATH}?ref=main" --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
+      if [ -z "$SPEC_CONTENT" ]; then
+        SPEC_PATH="docs/superpowers/specs/${WO_ID}.md"
+        SPEC_CONTENT=$(gh api "repos/bluedevilcollectibles/bdc-xo/contents/${SPEC_PATH}?ref=main" --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
+      fi
+      if [ -z "$SPEC_CONTENT" ]; then
+        MATCH=$(gh api "repos/bluedevilcollectibles/bdc-xo/contents/docs/superpowers/specs?ref=main" --template '{{range .}}{{.path}}{{"\n"}}{{end}}' 2>/dev/null | grep "${WO_ID}.md$" | head -n 1)
+        if [ -n "$MATCH" ]; then
+          SPEC_PATH="$MATCH"
+          SPEC_CONTENT=$(gh api "repos/bluedevilcollectibles/bdc-xo/contents/${SPEC_PATH}?ref=main" --template '{{.content}}' | tr -d '\n' | base64 -d || true)
+        fi
+      fi
+      if [ -z "$SPEC_CONTENT" ]; then
+        ISSUE_NUM=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'issue=[0-9]+' | head -n 1 | cut -d= -f2 || true)
+        if [ -z "$ISSUE_NUM" ]; then
+          ISSUE_NUM=$(gh issue list --repo bluedevilcollectibles/bdc-xo \
+            --search "${WO_ID} in:title" --json number,title \
+            --jq '.[0].number' 2>/dev/null || true)
+        fi
+        if [ -n "$ISSUE_NUM" ] && [ "$ISSUE_NUM" != "null" ]; then
+          SPEC_CONTENT=$(gh issue view "$ISSUE_NUM" --repo bluedevilcollectibles/bdc-xo \
+            --json body --jq .body 2>/dev/null || true)
+          [ -n "$SPEC_CONTENT" ] && SPEC_PATH="issues/${ISSUE_NUM}"
+        fi
+      fi
+      if [ -z "$SPEC_CONTENT" ]; then echo "Spec not found" >&2; exit 1; fi
+      WT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
+      RUN_START_SHA=$(git -C "$WT" rev-parse HEAD 2>/dev/null || echo unknown)
+      mkdir -p "$ARTIFACTS_DIR" 2>/dev/null || true
+      printf '%s\n' "$RUN_START_SHA" > "$ARTIFACTS_DIR/run-start-sha.txt" 2>/dev/null || true
+      printf '%s' "$SPEC_CONTENT" > "$ARTIFACTS_DIR/spec.md" 2>/dev/null || true
+      printf 'WO_ID=%s\nSPEC_PATH=bdc-xo:%s\nRUN_START_SHA=%s\nSPEC_ARTIFACT=%s\n\n' \
+        "$WO_ID" "$SPEC_PATH" "$RUN_START_SHA" "$ARTIFACTS_DIR/spec.md"
+      printf '%s\n' "$SPEC_CONTENT"
+
+  # ---------------------------------------------------------------------------
+  # parse-stages: extract the explicit `stages:` list from the spec text.
+  # load_bearing: spec C2 mandates explicit stage declaration. No `stages:` block
+  # = FAIL FAST. The list is the truth -- derivation from IN_SCOPE_FILES is NOT
+  # permitted at this gate (it is the convenience the WO body mentions for
+  # in_scope_files only, never for ordering / target_branch / depends_on).
+  #
+  # Output: $ARTIFACTS_DIR/stages.json -- an ordered JSON array.
+  # ---------------------------------------------------------------------------
+  - id: parse-stages
+    persona: major-build
+    depends_on: [read-spec]
+    load_bearing: true
+    bash: |
+      set -uo pipefail
+      SPEC_FILE="$ARTIFACTS_DIR/spec.md"
+      if [ ! -s "$SPEC_FILE" ]; then
+        echo "ERROR: spec artifact missing or empty at $SPEC_FILE" >&2
+        exit 1
+      fi
+      # Extract the canonical yaml-fenced `stages:` block from the spec. Spec bodies
+      # frequently embed an example/schema fence BEFORE the real declaration; the
+      # canonical block is the one immediately preceded by either a heading line
+      # "## Canonical stages"/"### Stages" OR a marker comment
+      # "<!-- canonical-stages -->" / "<!-- stages: canonical -->". If no marker
+      # is present, we fall back to the LAST fenced `stages:` block (canonical
+      # declarations conventionally come AFTER examples). Taking the FIRST block
+      # is unsafe: an example schema with 0/1 stages would execute instead of the
+      # real ordered pipeline. The selection rule + chosen block are echoed to
+      # stderr so reviewers can verify which block was consumed.
+      OUT="$ARTIFACTS_DIR/stages.yaml"
+      python3 - "$SPEC_FILE" "$OUT" <<'PYEOF'
+      import sys, re
+      spec = open(sys.argv[1], 'r', encoding='utf-8', errors='replace').read()
+      # Find every fenced yaml block that opens with a `stages:` line at column 0.
+      # Pattern: ```yaml ... stages: ... ```.
+      fence_re = re.compile(r"```ya?ml\s*\n(.*?)\n```", re.DOTALL)
+      candidates = []  # list of (start_offset, body)
+      for m in fence_re.finditer(spec):
+          body = m.group(1)
+          for line in body.splitlines():
+              if line.startswith('stages:'):
+                  candidates.append((m.start(), body))
+                  break
+      if not candidates:
+          # Fallback: an unfenced `stages:` block (column 0) followed by indented YAML.
+          lines = spec.splitlines()
+          out = []
+          capturing = False
+          for line in lines:
+              if not capturing:
+                  if line.startswith('stages:'):
+                      capturing = True
+                      out.append(line)
+                  continue
+              if line == '':
+                  out.append(line)
+                  continue
+              if not (line.startswith(' ') or line.startswith('\t') or line.startswith('-')):
+                  break
+              out.append(line)
+          if out:
+              candidates.append((0, '\n'.join(out)))
+      if not candidates:
+          sys.stderr.write("FAIL: no `stages:` declaration found in spec.\n")
+          sys.exit(1)
+      # Selection rule:
+      #  1. Prefer a block immediately preceded (within ~3 lines / ~600 chars) by an
+      #     explicit canonical marker: "## Canonical stages", "### Stages",
+      #     "<!-- canonical-stages -->", or "<!-- stages: canonical -->".
+      #  2. If exactly one block exists, use it.
+      #  3. If multiple blocks exist and none is marked canonical, FAIL CLOSED.
+      #     Picking first or last is unsafe because specs often contain example
+      #     schemas near C2 and may contain later appendix examples. The declared
+      #     executable block must be marked so selection is deterministic.
+      MARKERS = [
+          re.compile(r"^\s*##+\s+Canonical\s+stages\b", re.IGNORECASE | re.MULTILINE),
+          re.compile(r"^\s*##+\s+Stages\b", re.IGNORECASE | re.MULTILINE),
+          re.compile(r"<!--\s*canonical-stages\s*-->", re.IGNORECASE),
+          re.compile(r"<!--\s*stages:\s*canonical\s*-->", re.IGNORECASE),
+      ]
+      chosen = None
+      chosen_reason = None
+      for marker in MARKERS:
+          for offset, body in candidates:
+              # Look backwards from offset for the marker within a 600-char window.
+              window = spec[max(0, offset - 600):offset]
+              if marker.search(window):
+                  chosen = body
+                  chosen_reason = "explicit-marker:%s" % marker.pattern
+                  break
+          if chosen is not None:
+              break
+      if chosen is None:
+          if len(candidates) == 1:
+              chosen = candidates[0][1]
+              chosen_reason = "single-stages-block"
+          else:
+              sys.stderr.write(
+                  "FAIL: %d `stages:` blocks found but none is marked canonical. "
+                  "Add '<!-- canonical-stages -->' immediately before the declared executable block.\n"
+                  % len(candidates)
+              )
+              sys.exit(1)
+      sys.stderr.write("stages-block-selected reason=%s\n" % chosen_reason)
+      sys.stderr.write("stages-block-candidates=%d\n" % len(candidates))
+      open(sys.argv[2], 'w', encoding='utf-8').write(chosen)
+      print("stages-yaml-extracted=" + sys.argv[2])
+      print("stages-block-selection=" + chosen_reason)
+      PYEOF
+      if [ ! -s "$OUT" ]; then
+        echo "ERROR: extracted stages YAML is empty" >&2
+        exit 1
+      fi
+      # Convert the extracted YAML fragment to JSON for downstream consumption.
+      # Use python's yaml if available; otherwise fall back to a minimal parser.
+      JSON_OUT="$ARTIFACTS_DIR/stages.json"
+      python3 - "$OUT" "$JSON_OUT" <<'PYEOF'
+      import sys, json
+      try:
+          import yaml
+      except ImportError:
+          sys.stderr.write("FAIL: python yaml module unavailable; cannot parse stages.\n")
+          sys.exit(1)
+      text = open(sys.argv[1], 'r', encoding='utf-8').read()
+      try:
+          data = yaml.safe_load(text)
+      except yaml.YAMLError as e:
+          sys.stderr.write("FAIL: stages YAML parse error: %s\n" % e)
+          sys.exit(1)
+      stages = data.get('stages') if isinstance(data, dict) else None
+      if not isinstance(stages, list) or len(stages) == 0:
+          sys.stderr.write("FAIL: parsed `stages` is not a non-empty list.\n")
+          sys.exit(1)
+      # Required keys -- a stage MUST declare its full execution contract. No
+      # downstream defaults are permitted to silently fill these (spec C2 mandates
+      # the contract is explicit at the spec level, not inferred at runtime).
+      required = ['id', 'repo', 'target_branch', 'in_scope_files', 'verify_commands', 'readiness_bar']
+      for i, st in enumerate(stages):
+          if not isinstance(st, dict):
+              sys.stderr.write("FAIL: stage %d is not a mapping.\n" % i)
+              sys.exit(1)
+          for k in required:
+              if k not in st:
+                  sys.stderr.write("FAIL: stage %d missing required key '%s'.\n" % (i, k))
+                  sys.exit(1)
+          # verify_commands must be a non-empty list (zero-command verify is a no-op gate).
+          vc = st.get('verify_commands')
+          if not isinstance(vc, list) or len(vc) == 0:
+              sys.stderr.write("FAIL: stage %d 'verify_commands' must be a non-empty list.\n" % i)
+              sys.exit(1)
+          # readiness_bar must be a mapping with the four required booleans, all true.
+          rb = st.get('readiness_bar')
+          if not isinstance(rb, dict):
+              sys.stderr.write("FAIL: stage %d 'readiness_bar' must be a mapping.\n" % i)
+              sys.exit(1)
+          for rk in ('pr_open', 'ci_green', 'diff_review_clean', 'mergeable'):
+              if rk not in rb:
+                  sys.stderr.write("FAIL: stage %d 'readiness_bar' missing key '%s'.\n" % (i, rk))
+                  sys.exit(1)
+              if rb[rk] is not True:
+                  sys.stderr.write("FAIL: stage %d 'readiness_bar.%s' must be true (no soft gates).\n" % (i, rk))
+                  sys.exit(1)
+      open(sys.argv[2], 'w', encoding='utf-8').write(json.dumps(stages, indent=2))
+      print("STAGE_COUNT=%d" % len(stages))
+      print("STAGE_IDS=" + ",".join(str(s.get('id')) for s in stages))
+      PYEOF
+      if [ ! -s "$JSON_OUT" ]; then
+        echo "ERROR: stages.json was not produced" >&2
+        exit 1
+      fi
+      echo "STAGES_ARTIFACT=$JSON_OUT"
+      echo "parse-stages PASS"
+
+  # ---------------------------------------------------------------------------
+  # preflight-repo-registry: assert every declared stage's repo is REGISTERED in
+  # the Archon codebase registry BEFORE any stage starts. C7 connect-failure-mode:
+  # an unregistered repo MUST fail fast with the named missing repo -- NEVER
+  # silently skip a repo, NEVER produce a partial REVIEW.
+  #
+  # Enrichment: writes stages-enriched.json -- same ordered array but augmented
+  # per entry with { codebaseId, codebasePath, canonicalRepoPath } resolved from
+  # the API response. This is the ONLY place the codebase registry is queried;
+  # all downstream nodes consume the enriched file.
+  #
+  # API source: the Archon server's /api/codebases endpoint. The server URL is
+  # discovered via the harness convention (ARCHON_SERVER_URL env or default
+  # http://127.0.0.1:3090). Failure to reach the server fails closed -- a
+  # silent fallback would mask the registry gap that this gate exists to catch.
+  # load_bearing: true.
+  # ---------------------------------------------------------------------------
+  - id: preflight-repo-registry
+    persona: major-build
+    depends_on: [parse-stages]
+    load_bearing: true
+    bash: |
+      set -uo pipefail
+      STAGES="$ARTIFACTS_DIR/stages.json"
+      if [ ! -s "$STAGES" ]; then
+        echo "ERROR: stages.json missing" >&2
+        exit 1
+      fi
+      SERVER_URL="${ARCHON_SERVER_URL:-http://127.0.0.1:3090}"
+      CODEBASES_JSON="$ARTIFACTS_DIR/codebases.json"
+      if ! curl -sS --fail "${SERVER_URL}/api/codebases" -o "$CODEBASES_JSON" 2>&1; then
+        echo "ERROR: cannot reach Archon server at ${SERVER_URL}/api/codebases -- registry gate cannot run." >&2
+        echo "Set ARCHON_SERVER_URL or ensure the server is running. NO SILENT FALLBACK." >&2
+        exit 1
+      fi
+      ENRICHED="$ARTIFACTS_DIR/stages-enriched.json"
+      python3 - "$STAGES" "$CODEBASES_JSON" "$ENRICHED" <<'PYEOF'
+      import sys, json
+      stages = json.load(open(sys.argv[1]))
+      catalog = json.load(open(sys.argv[2]))
+      # Catalog shape: { codebases: [ { id, name, defaultCwd, ... }, ... ] }
+      # or possibly a flat list. Handle both.
+      entries = catalog.get('codebases') if isinstance(catalog, dict) else catalog
+      if not isinstance(entries, list):
+          sys.stderr.write("FAIL: codebases response did not return a list.\n")
+          sys.exit(1)
+      by_name = {}
+      for e in entries:
+          if not isinstance(e, dict):
+              continue
+          name = e.get('name') or e.get('full_name') or ''
+          if not name:
+              continue
+          by_name[name.lower()] = e
+          # Also key by short name (without owner) for tolerant matching.
+          short = name.split('/')[-1].lower()
+          by_name.setdefault(short, e)
+      missing = []
+      enriched = []
+      for st in stages:
+          repo = (st.get('repo') or '').strip()
+          if not repo:
+              missing.append({'stageId': st.get('id'), 'repo': '<empty>'})
+              continue
+          entry = by_name.get(repo.lower())
+          if entry is None:
+              short = repo.split('/')[-1].lower()
+              entry = by_name.get(short)
+          if entry is None:
+              missing.append({'stageId': st.get('id'), 'repo': repo})
+              continue
+          codebase_id = entry.get('id') or entry.get('codebase_id') or ''
+          codebase_path = entry.get('defaultCwd') or entry.get('default_cwd') or entry.get('path') or ''
+          out = dict(st)
+          out['codebaseId'] = str(codebase_id)
+          out['codebasePath'] = codebase_path
+          # canonicalRepoPath: same as codebasePath for the registry's main checkout.
+          # The runtime stage-allocator may further resolve this via getCanonicalRepoPath.
+          out['canonicalRepoPath'] = codebase_path
+          enriched.append(out)
+      if missing:
+          sys.stderr.write("FAIL: %d stage(s) reference unregistered repo(s):\n" % len(missing))
+          for m in missing:
+              sys.stderr.write("  - stage '%s' repo '%s' is NOT registered\n" % (m['stageId'], m['repo']))
+          sys.stderr.write("Register each missing repo and re-fire. NO PARTIAL BUILDS.\n")
+          sys.exit(1)
+      open(sys.argv[3], 'w', encoding='utf-8').write(json.dumps(enriched, indent=2))
+      print("REGISTRY_OK=true")
+      print("ENRICHED_STAGES=%s" % sys.argv[3])
+      print("STAGE_REPOS=" + ",".join(s['repo'] for s in enriched))
+      PYEOF
+
+  # ---------------------------------------------------------------------------
+  # allocate-stage-worktrees: allocate ONE git worktree per stage, on the
+  # deterministic stage branch (archon/<wo-id>/<stage-id>, no run-id suffix per
+  # spec C5 idempotency contract).
+  #
+  # IMPLEMENTATION: this node ACTUALLY invokes the authoritative substrate
+  # `packages/isolation/src/stage-allocator.ts::createStageWorktree`. We discover
+  # the bdc-harness source root at runtime (walks up from CWD; falls back to
+  # well-known canonical paths), then spawn `bun` with a shim script that imports
+  # `@archon/isolation`'s `createStageWorktree` and calls it per stage. This means
+  # the branch derivation, sync, worktree adopt-vs-create logic, and error
+  # handling are all the substrate's -- this node is a thin orchestration shell.
+  #
+  # If the harness source root cannot be discovered, the node FAILS CLOSED with a
+  # loud diagnostic. No silent fallback to raw git -- that would re-introduce the
+  # exact gap the substrate exists to close. Operator must register HARNESS_ROOT
+  # env var or run the workflow from a path where the harness is discoverable.
+  #
+  # Output: $ARTIFACTS_DIR/stage-worktrees.json
+  # ---------------------------------------------------------------------------
+  - id: allocate-stage-worktrees
+    persona: major-build
+    depends_on: [preflight-repo-registry]
+    load_bearing: true
+    bash: |
+      set -uo pipefail
+      ENRICHED="$ARTIFACTS_DIR/stages-enriched.json"
+      if [ ! -s "$ENRICHED" ]; then
+        echo "ERROR: stages-enriched.json missing" >&2
+        exit 1
+      fi
+      WO_ID="${WO_ID:-$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'WO-[A-Z0-9-]+' | head -n 1 || true)}"
+      if [ -z "$WO_ID" ]; then
+        echo "ERROR: WO_ID unresolvable for branch derivation" >&2
+        exit 1
+      fi
+      OUT="$ARTIFACTS_DIR/stage-worktrees.json"
+
+      # ---- Locate the bdc-harness source root (where the substrate lives). ----
+      # The substrate is packages/isolation/src/stage-allocator.ts in the harness
+      # repo. We discover it deterministically: prefer explicit HARNESS_ROOT env,
+      # then walk up from CWD, then probe canonical install paths. FAIL CLOSED
+      # if we cannot find it -- no silent fallback to raw git.
+      MARKER_REL="packages/isolation/src/stage-allocator.ts"
+      HARNESS_ROOT=""
+      if [ -n "${HARNESS_ROOT_OVERRIDE:-}" ] && [ -f "${HARNESS_ROOT_OVERRIDE}/${MARKER_REL}" ]; then
+        HARNESS_ROOT="${HARNESS_ROOT_OVERRIDE}"
+      fi
+      if [ -z "$HARNESS_ROOT" ]; then
+        D="$(pwd)"
+        while [ -n "$D" ] && [ "$D" != "/" ]; do
+          if [ -f "$D/$MARKER_REL" ]; then HARNESS_ROOT="$D"; break; fi
+          D="$(dirname "$D")"
+        done
+      fi
+      if [ -z "$HARNESS_ROOT" ]; then
+        for candidate in \
+          "/.archon/workspaces/bluedevilcollectibles/bdc-harness/source" \
+          "${ARCHON_HOME:-$HOME/.archon}/workspaces/bluedevilcollectibles/bdc-harness/source" \
+          "$HOME/.archon/workspaces/bluedevilcollectibles/bdc-harness/source"; do
+          if [ -f "$candidate/$MARKER_REL" ]; then HARNESS_ROOT="$candidate"; break; fi
+        done
+      fi
+      if [ -z "$HARNESS_ROOT" ]; then
+        echo "ERROR: bdc-harness source root not found -- cannot invoke createStageWorktree substrate." >&2
+        echo "Searched: HARNESS_ROOT_OVERRIDE env, walked up from CWD ($(pwd)), and canonical install paths." >&2
+        echo "Set HARNESS_ROOT_OVERRIDE=/path/to/bdc-harness/source and re-run." >&2
+        exit 1
+      fi
+      echo "HARNESS_ROOT=$HARNESS_ROOT"
+      if ! command -v bun >/dev/null 2>&1; then
+        echo "ERROR: bun not on PATH -- cannot run the substrate shim." >&2
+        exit 1
+      fi
+
+      # ---- Substrate shim: imports createStageWorktree and calls it per stage. ----
+      # We write the shim into $ARTIFACTS_DIR so its diagnostic output is auditable,
+      # and we CD into HARNESS_ROOT so bun resolves @archon/isolation via the
+      # workspace package.json. The shim reads stages-enriched.json + WO_ID,
+      # invokes createStageWorktree(...) per stage, and emits the same
+      # stage-worktrees.json shape downstream nodes consume.
+      SHIM="$ARTIFACTS_DIR/stage-alloc-shim.ts"
+      cat > "$SHIM" <<'TSEOF'
+      // Stage allocator shim -- thin wrapper around createStageWorktree.
+      // Invoked from allocate-stage-worktrees node in bdc-multi-stage-development.yaml.
+      //
+      // We use a dynamic import keyed off process.env.HARNESS_ROOT (set by the
+      // calling bash node) so the substrate resolves via an ABSOLUTE filesystem
+      // path. This avoids depending on `bun install` having materialized the
+      // @archon/isolation workspace symlink at runtime -- a real concern in
+      // freshly-cloned worktrees where node_modules has not been populated yet.
+      import { readFileSync, writeFileSync } from 'node:fs';
+      import { join } from 'node:path';
+      const HARNESS_ROOT = process.env.HARNESS_ROOT;
+      if (!HARNESS_ROOT) {
+        process.stderr.write('shim FAIL: HARNESS_ROOT env var not set by caller\n');
+        process.exit(2);
+      }
+      const allocatorPath = join(HARNESS_ROOT, 'packages/isolation/src/stage-allocator.ts');
+      const mod = await import(allocatorPath);
+      const createStageWorktree = mod.createStageWorktree as (
+        opts: {
+          woId: string;
+          stageId: string;
+          codebaseId: string;
+          codebaseName: string;
+          canonicalRepoPath: string;
+          targetBranch: string;
+        }
+      ) => Promise<{ stageId: string; branchName: string; worktreePath: string; codebaseId: string; adopted: boolean }>;
+
+      type EnrichedStage = {
+        id: string;
+        repo: string;
+        target_branch: string;
+        in_scope_files?: unknown;
+        verify_commands?: unknown;
+        readiness_bar?: unknown;
+        depends_on?: unknown;
+        codebaseId: string;
+        codebasePath: string;
+        canonicalRepoPath: string;
+      };
+
+      async function main(): Promise<void> {
+        const enrichedPath = process.argv[2];
+        const woId = process.argv[3];
+        const outPath = process.argv[4];
+        if (!enrichedPath || !woId || !outPath) {
+          process.stderr.write('shim usage: stage-alloc-shim.ts <enriched-json> <wo-id> <out-json>\n');
+          process.exit(2);
+        }
+        const stages: EnrichedStage[] = JSON.parse(readFileSync(enrichedPath, 'utf-8'));
+        const out: Array<Record<string, unknown>> = [];
+        for (const st of stages) {
+          if (!Array.isArray(st.verify_commands) || st.verify_commands.length === 0) {
+            throw new Error(`stage ${st.id} missing required non-empty verify_commands`);
+          }
+          const readiness = st.readiness_bar as Record<string, unknown> | undefined;
+          const readinessKeys = ['pr_open', 'ci_green', 'diff_review_clean', 'mergeable'];
+          if (
+            !readiness ||
+            readinessKeys.some((key) => readiness[key] !== true)
+          ) {
+            throw new Error(
+              `stage ${st.id} missing required readiness_bar booleans: ${readinessKeys.join(', ')}`
+            );
+          }
+          const result = await createStageWorktree({
+            woId,
+            stageId: st.id,
+            codebaseId: st.codebaseId,
+            codebaseName: st.repo,
+            canonicalRepoPath: st.canonicalRepoPath,
+            targetBranch: st.target_branch,
+          });
+          out.push({
+            stageId: result.stageId,
+            branchName: result.branchName,
+            worktreePath: result.worktreePath,
+            codebaseId: result.codebaseId,
+            canonicalRepoPath: st.canonicalRepoPath,
+            repo: st.repo,
+            targetBranch: st.target_branch,
+            inScopeFiles: st.in_scope_files,
+            verifyCommands: st.verify_commands,
+            readinessBar: st.readiness_bar,
+            dependsOn: st.depends_on ?? null,
+            adopted: result.adopted,
+          });
+          process.stderr.write(
+            `stage=${result.stageId} branch=${result.branchName} adopted=${result.adopted} path=${result.worktreePath}\n`
+          );
+        }
+        writeFileSync(outPath, JSON.stringify(out, null, 2));
+        process.stdout.write(`STAGE_WORKTREES=${outPath}\n`);
+        for (const row of out) {
+          process.stdout.write(
+            `  stage=${row.stageId} branch=${row.branchName} adopted=${row.adopted} path=${row.worktreePath}\n`
+          );
+        }
+      }
+
+      main().catch((err: unknown) => {
+        const e = err as Error;
+        process.stderr.write(`stage-alloc-shim FAIL: ${e.message}\n`);
+        if (e.stack) process.stderr.write(`${e.stack}\n`);
+        process.exit(1);
+      });
+      TSEOF
+
+      # Invoke the substrate. We CD into HARNESS_ROOT so bun resolves any
+      # transitive workspace packages the substrate may use. HARNESS_ROOT is
+      # exported so the shim can dynamically import the substrate by absolute
+      # path. --no-env-file prevents bun from auto-loading .env from the harness
+      # source (the workflow's runtime env is the source of truth here).
+      ( cd "$HARNESS_ROOT" && HARNESS_ROOT="$HARNESS_ROOT" bun --no-env-file "$SHIM" "$ENRICHED" "$WO_ID" "$OUT" )
+      RC=$?
+      if [ "$RC" -ne 0 ]; then
+        echo "ERROR: createStageWorktree substrate invocation failed (exit $RC)." >&2
+        echo "Shim: $SHIM  Enriched: $ENRICHED  Out: $OUT" >&2
+        exit "$RC"
+      fi
+      if [ ! -s "$OUT" ]; then
+        echo "ERROR: substrate produced no output at $OUT" >&2
+        exit 1
+      fi
+      echo "allocate-stage-worktrees PASS (invoked createStageWorktree for each declared stage)"
+
+  # ---------------------------------------------------------------------------
+  # implement-pipeline: the sequential N-stage build loop. ONE major-build agent
+  # walks the stages in order; for each stage:
+  #   1. Read forward-threaded artifacts from prior stages (PR URL, branch,
+  #      contract, env vars) at $ARTIFACTS_DIR/stage-<prior-id>-done.json.
+  #   2. Plan + implement INSIDE the stage's worktree (Read/Write/Bash pinned
+  #      to that worktree path).
+  #   3. Verify (stage's verify_commands).
+  #   4. Adversarial diff-review (the agent self-reviews per the same standards
+  #      as bdc-feature-development's diff-review nodes).
+  #   5. Commit + push the deterministic stage branch.
+  #   6. Open the stage PR to its target_branch.
+  #   7. Evaluate readiness bar (PR-open + CI-green + diff-review-clean +
+  #      mergeable via gh).
+  #   8. On stage PASS -> write $ARTIFACTS_DIR/stage-<id>-done.json.
+  #      On stage FAIL/BLOCK -> write $ARTIFACTS_DIR/stage-<id>-blocked.json and
+  #      HALT -- earlier stage PRs STAND, overall pipeline = BLOCKED.
+  # Loop completes when either: pipeline-done.flag exists (all stages PASS) OR
+  # any *-blocked.json exists.
+  # ---------------------------------------------------------------------------
+  - id: implement-pipeline
+    persona: major-build
+    depends_on: [allocate-stage-worktrees]
+    agent: major-build
+    task_class: heavy_work
+    loop:
+      until: __NEVER_EMIT_USE_UNTIL_BASH__
+      # max_iterations is a retry ceiling for the whole orchestration pass, NOT
+      # a stage ceiling. Each iteration must process the entire declared stage
+      # list in order until all stages PASS or one stage BLOCKS. This reconciles
+      # declared-N stages with the workflow engine's numeric loop guard: N is
+      # bounded by the spec and runtime work, not by the loop iteration count.
+      max_iterations: 3
+      fresh_context: true
+      until_bash: |
+        set -uo pipefail
+        DONE="$ARTIFACTS_DIR/pipeline-done.flag"
+        if [ -f "$DONE" ]; then
+          echo "pipeline-done.flag present -- all stages passed"
+          exit 0
+        fi
+        if ls "$ARTIFACTS_DIR"/stage-*-blocked.json >/dev/null 2>&1; then
+          echo "stage blocked artifact present -- pipeline BLOCKED, halting loop"
+          exit 0
+        fi
+        echo "pipeline incomplete; iterating"
+        exit 1
+      prompt: |
+        You are the multi-stage pipeline builder. Build the stages declared in
+        $ARTIFACTS_DIR/stage-worktrees.json IN ORDER, sequentially, gating between.
+
+        ## Inputs (read each FIRST before doing anything)
+        - Stage list with allocated worktrees: $ARTIFACTS_DIR/stage-worktrees.json
+        - Original WO spec: $read-spec.output (also at $ARTIFACTS_DIR/spec.md)
+        - Prior iteration output: $LOOP_PREV_OUTPUT
+        - Per-stage forward artifacts (from prior PASSED stages): files matching
+          $ARTIFACTS_DIR/stage-<id>-done.json (read EACH at startup).
+        - Per-stage block artifacts: files matching $ARTIFACTS_DIR/stage-<id>-blocked.json.
+
+        ## Resume rule
+        On every iteration, FIRST scan $ARTIFACTS_DIR for stage-*-done.json and
+        stage-*-blocked.json. Then process the FULL declared list in order until
+        every stage is done or one stage blocks. Build only stages that have
+        NEITHER (those not yet complete and not blocked). For each such stage,
+        ensure depends_on (if any) is already PASSED before starting it. Do not
+        stop after one successful stage; continue to the next declared stage in
+        the same iteration after writing the current stage's done artifact.
+
+        ## Per-stage build (repeat these steps for each unblocked stage in order)
+
+        ### 1. Prepare
+        Read the stage entry: stageId, branchName, worktreePath, repo,
+        targetBranch, inScopeFiles, verifyCommands, readinessBar.
+        cd into worktreePath (the stage's worktree, NOT this run's worktree).
+        Read every prior stage-<priorId>-done.json so you have the prior PR URL,
+        branch, API contract, staging URL, and env vars to build against.
+
+        ### 2. Plan + Implement (inside the stage worktree)
+        - Modify ONLY files in this stage's inScopeFiles (exact paths only).
+        - Use prior-stage artifacts as the contract you build against -- the
+          backend's branch (NOT main) defines the endpoints the UI calls.
+        - Do NOT touch files outside this stage's inScopeFiles. Do NOT reformat.
+        - Do NOT use `git commit --allow-empty`.
+
+        ### 3. Verify
+        Run every command in verifyCommands from the worktreePath. ALL must pass.
+        If any fail, do NOT mark the stage done -- write a stage-<id>-blocked.json
+        per step 6.
+
+        ### 4. Adversarial diff review (self)
+        Inspect `git diff --stat` and the full diff. Confirm:
+          - Every change is in inScopeFiles. (Contract drift = BLOCK.)
+          - No debug prints, no commented-out code, no TODOs added.
+          - Tests exist for new behavior or there is an explicit reason in the spec.
+        If you find a finding you cannot fix in this iteration, halt that stage
+        and write the block artifact per step 6.
+
+        ### 5. Commit + push (BEFORE marking done)
+        From worktreePath:
+          git add -A -- <inScopeFiles>
+          git commit -m "feat: ${WO_ID} stage:${stageId} -- <one-line summary>"
+          git push -u origin "${branchName}"
+        On push failure: write $ARTIFACTS_DIR/stage-${stageId}-blocked.json with
+        blocking_reason "push_failed: <git error>" and HALT -- no retry, no silent
+        swallow, earlier stage PRs stand. Do NOT write the done artifact.
+
+        ### 6. Open PR + evaluate readiness bar
+        - Open PR: gh pr create --repo <repo> --base <targetBranch> --head <branchName>
+          --title "feat: <stageId> -- ${WO_ID}" --body-file <body>
+          Race recovery: if a PR is already open on this branch, capture its URL
+          via `gh pr list --repo <repo> --head <branchName> --state open --json url`.
+        - Check readiness bar via `gh pr view <URL> --json
+          state,mergeable,statusCheckRollup` and parse:
+            * pr_open       = state == 'OPEN'
+            * ci_green      = every statusCheckRollup entry conclusion in
+                              [SUCCESS, NEUTRAL, SKIPPED]
+            * mergeable     = mergeable == 'MERGEABLE' (HARD GATE -- C3 contract).
+                              UNKNOWN is NOT a pass. If GitHub returns UNKNOWN
+                              (mergeability not yet computed after push), POLL for up
+                              to 3 minutes (re-run `gh pr view ... --json mergeable`
+                              every 15s). If UNKNOWN still after the poll window OR
+                              if mergeable is 'CONFLICTING' / anything other than
+                              'MERGEABLE', this gate is FAIL: write the stage block
+                              artifact with blocking_reason 'pr_not_mergeable: <state>'.
+                              NEVER advance to the next stage on UNKNOWN.
+            * diff_review_clean = self-review above did not surface a blocking finding
+        - ALL four readiness criteria must be true to advance. ANY criterion failing
+          (including mergeable=UNKNOWN after poll window) MUST write the block
+          artifact -- no soft pass, no silent advance.
+
+        ### 7. Stage outcome
+        If readiness PASS:
+          Write $ARTIFACTS_DIR/stage-${stageId}-done.json with shape:
+            {
+              "stageId": "...",
+              "branchName": "...",
+              "prUrl": "...",
+              "repo": "...",
+              "targetBranch": "...",
+              "status": "PASS",
+              "verifyResult": "...one-line summary...",
+              "reviewResult": "...one-line summary...",
+              "blockingReason": null,
+              "forward": {
+                "apiContract": "...optional notes for next stage...",
+                "stagingUrl": "...if applicable...",
+                "envVars": {}
+              }
+            }
+        If readiness FAIL or any prior step failed:
+          Write $ARTIFACTS_DIR/stage-${stageId}-blocked.json with shape:
+            {
+              "stageId": "...",
+              "branchName": "...",
+              "prUrl": "...or null...",
+              "repo": "...",
+              "status": "BLOCKED",
+              "blockingReason": "<one of: push_failed, ci_red, review_blocked, pr_not_mergeable, verify_failed, plan_ambiguous, registry_missing>: <detail>",
+              "earlierPrsStand": true
+            }
+          and HALT this iteration. Do NOT continue to later stages after a block.
+
+        ### 8. After all stages done
+        When every stage in stage-worktrees.json has a corresponding done.json
+        (and zero blocked.json), write $ARTIFACTS_DIR/pipeline-done.flag (empty file).
+
+        ## Stage data passing -- THE forward contract (C4)
+        Each done.json's `forward` object is the contract for downstream stages.
+        Stage N+1 reads stage-<N>-done.json before planning. The backend stage
+        publishes its branch name + API contract; the UI stage builds against
+        that branch (not main, not staging head -- the BACKEND'S PR branch which
+        is the reviewed code).
+
+        ## N=1 invariant (C6)
+        If stages.json has exactly one entry, execute the same stage loop with N=1.
+        Output shape is identical to bdc-feature-development's manifest contract
+        (one PR opened, one stage-<id>-done.json). NO delegation to another
+        workflow; same code path, behavior-equivalent.
+
+        ## Re-fire idempotency (C5)
+        Branch names are deterministic per (WO_ID, stageId) -- no run-id suffix.
+        Re-fires UPDATE the same stage branch and the same PR. Never create
+        a second PR for the same stage.
+
+        ## ASCII-only
+        All file edits MUST be pure ASCII. No emojis, no em-dashes, no smart quotes.
+
+        ## Loop exit
+        This loop is gated by until_bash. Completion = pipeline-done.flag exists
+        OR any stage-*-blocked.json exists. There is NO text sentinel that exits
+        this loop -- write the right artifact and let until_bash decide.
+
+  # ---------------------------------------------------------------------------
+  # consolidated-manifest: reads every stage-*-done.json AND stage-*-blocked.json
+  # and emits ONE manifest row per stage with: branch, PR, repo, status, verify
+  # result, review result, blocking reason. Fails closed (exits non-zero) if any
+  # stage's artifact is missing -- completeness guard (C8 manifest invariant).
+  # ---------------------------------------------------------------------------
+  - id: consolidated-manifest
+    persona: major-build
+    depends_on: [implement-pipeline]
+    trigger_rule: all_done
+    load_bearing: true
+    bash: |
+      set -uo pipefail
+      STAGES="$ARTIFACTS_DIR/stage-worktrees.json"
+      if [ ! -s "$STAGES" ]; then
+        echo "ERROR: stage-worktrees.json missing" >&2
+        exit 1
+      fi
+      OUT="$ARTIFACTS_DIR/pipeline-manifest.json"
+      python3 - "$STAGES" "$ARTIFACTS_DIR" "$OUT" <<'PYEOF'
+      import sys, json, os, glob
+      stages = json.load(open(sys.argv[1]))
+      artifacts_dir = sys.argv[2]
+      rows = []
+      missing_artifacts = []
+      blocked = []
+      passed = []
+      for st in stages:
+          sid = st['stageId']
+          done_path = os.path.join(artifacts_dir, "stage-%s-done.json" % sid)
+          blocked_path = os.path.join(artifacts_dir, "stage-%s-blocked.json" % sid)
+          row = {
+              'stageId': sid,
+              'branchName': st['branchName'],
+              'repo': st['repo'],
+              'targetBranch': st['targetBranch'],
+          }
+          if os.path.exists(done_path):
+              try:
+                  data = json.load(open(done_path))
+              except Exception as e:
+                  missing_artifacts.append("%s (parse error: %s)" % (sid, e))
+                  continue
+              row['status'] = 'PASS'
+              row['prUrl'] = data.get('prUrl')
+              row['verifyResult'] = data.get('verifyResult')
+              row['reviewResult'] = data.get('reviewResult')
+              row['blockingReason'] = None
+              passed.append(sid)
+          elif os.path.exists(blocked_path):
+              try:
+                  data = json.load(open(blocked_path))
+              except Exception as e:
+                  missing_artifacts.append("%s (parse error: %s)" % (sid, e))
+                  continue
+              row['status'] = 'BLOCKED'
+              row['prUrl'] = data.get('prUrl')
+              row['verifyResult'] = data.get('verifyResult')
+              row['reviewResult'] = data.get('reviewResult')
+              row['blockingReason'] = data.get('blockingReason')
+              blocked.append(sid)
+          else:
+              missing_artifacts.append(sid)
+              row['status'] = 'MISSING'
+              row['prUrl'] = None
+              row['verifyResult'] = None
+              row['reviewResult'] = None
+              row['blockingReason'] = 'artifact_missing'
+          rows.append(row)
+      overall = 'PASS' if (len(blocked) == 0 and len(missing_artifacts) == 0) else 'BLOCKED'
+      manifest = {
+          'overall_status': overall,
+          'stage_count': len(stages),
+          'passed_stages': passed,
+          'blocked_stages': blocked,
+          'missing_artifacts': missing_artifacts,
+          'stages': rows,
+      }
+      open(sys.argv[3], 'w', encoding='utf-8').write(json.dumps(manifest, indent=2))
+      print("MANIFEST=%s" % sys.argv[3])
+      print("OVERALL_STATUS=%s" % overall)
+      print("PASSED=%s" % ",".join(passed))
+      print("BLOCKED=%s" % ",".join(blocked))
+      if missing_artifacts:
+          print("MISSING_ARTIFACTS=%s" % ",".join(missing_artifacts))
+      # Fail closed if anything is missing -- completeness guard.
+      if missing_artifacts:
+          sys.stderr.write("FAIL: %d stage artifact(s) missing -- manifest incomplete.\n" % len(missing_artifacts))
+          sys.exit(1)
+      PYEOF
+
+  # ---------------------------------------------------------------------------
+  # flip-notion: REVIEW only when ALL stages PASS. ANY blocked stage -> BLOCKED.
+  # Never partial REVIEW. Never claim a PR where one was not opened.
+  # ---------------------------------------------------------------------------
+  - id: flip-notion
+    persona: xo
+    depends_on: [consolidated-manifest]
+    trigger_rule: all_done
+    task_class: clerical
+    prompt: |
+      Update the Notion Work Order page based on the multi-stage pipeline outcome.
+
+      ## Inputs
+      Consolidated manifest: $consolidated-manifest.output
+      Pipeline manifest file: $ARTIFACTS_DIR/pipeline-manifest.json
+      Original spec: $read-spec.output
+
+      ## Outcome branching
+      Read OVERALL_STATUS from consolidated-manifest output (and re-read
+      pipeline-manifest.json for the full stage list).
+
+      - OVERALL_STATUS=PASS: set Claude Status: REVIEW, Status: Review. Add the
+        manifest as a page comment. The comment MUST include EVERY stage's
+        branch, PR URL, repo, status, verify result, and review result.
+      - OVERALL_STATUS=BLOCKED: do NOT flip to REVIEW. Add a page comment listing
+        which stages PASSED (their PRs STAND) and which BLOCKED (with blocking
+        reason). Emit an XO_ACTION line with the manifest summary so XO knows what
+        to triage.
+
+      Never claim PR URLs that are not in pipeline-manifest.json. Never silently
+      skip a stage. If Notion MCP is not available in the runtime, emit an
+      XO_ACTION line asking XO to flip Notion manually with the manifest.
