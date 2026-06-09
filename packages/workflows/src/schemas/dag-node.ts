@@ -305,6 +305,7 @@ export const approvalNodeSchema = dagNodeBaseSchema.extend({
     message: z.string().min(1, "'approval.message' must not be empty"),
     capture_response: z.boolean().optional(),
     on_reject: approvalOnRejectSchema.optional(),
+    choices: z.array(z.enum(['approve_as_is', 'approve_with_fix', 'reject'])).optional(),
   }),
 });
 
@@ -417,6 +418,7 @@ export const dagNodeSchema = dagNodeBaseSchema
         message: z.string().min(1, "'approval.message' must not be empty"),
         capture_response: z.boolean().optional(),
         on_reject: approvalOnRejectSchema.optional(),
+        choices: z.array(z.enum(['approve_as_is', 'approve_with_fix', 'reject'])).optional(),
       })
       .optional(),
     cancel: z.string().optional(),

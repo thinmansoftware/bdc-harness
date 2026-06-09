@@ -1,5 +1,5 @@
-import { describe, test, expect } from 'bun:test';
-import { dagNodeSchema, BASH_NODE_AI_FIELDS } from './dag-node';
+import { describe, it, test, expect } from 'bun:test';
+import { dagNodeSchema, approvalNodeSchema, BASH_NODE_AI_FIELDS } from './dag-node';
 
 // ---------------------------------------------------------------------------
 // agent: field schema tests
@@ -110,5 +110,38 @@ describe('effortLevelSchema', () => {
   test('rejects unknown effort level', () => {
     const result = dagNodeSchema.safeParse({ id: 'step', prompt: 'x', effort: 'ultra' });
     expect(result.success).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// approval choices (additive) tests
+// ---------------------------------------------------------------------------
+
+describe('approval choices (additive)', () => {
+  it('accepts choices on approvalNodeSchema and preserves the value', () => {
+    const parsed = approvalNodeSchema.parse({
+      id: 'gate',
+      approval: {
+        message: 'hi',
+        choices: ['approve_as_is', 'approve_with_fix', 'reject'],
+      },
+    });
+    expect(parsed.approval.choices).toEqual(['approve_as_is', 'approve_with_fix', 'reject']);
+  });
+
+  it('preserves choices through dagNodeSchema (inline approval object)', () => {
+    const parsed = dagNodeSchema.parse({
+      id: 'gate',
+      approval: { message: 'hi', choices: ['approve_as_is', 'reject'] },
+    });
+    expect((parsed as { approval: { choices?: string[] } }).approval.choices).toEqual([
+      'approve_as_is',
+      'reject',
+    ]);
+  });
+
+  it('still accepts an approval node with NO choices (backward compatible)', () => {
+    const parsed = approvalNodeSchema.parse({ id: 'gate', approval: { message: 'hi' } });
+    expect(parsed.approval.choices).toBeUndefined();
   });
 });
