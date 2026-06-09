@@ -1057,29 +1057,30 @@ nodes:
       - If there are zero unresolved findings, "findings" still lists the fixed ones and
         "summary" says "0 unresolved".
 
-  # pause-gate: the ONLY human touch, and ONLY when still BLOCKED after Opus. This PAUSES
-  # the run (status=paused, resumable via /workflow approve|reject) -- it does NOT fail.
+  # pause-gate: the human approval gate. Fires on BLOCKED (AI tiers could not resolve)
+  # AND on PROCEED (clean builds -- final confirmation before the irreversible commit).
+  # Non-interactive runs (CAULDRON_INTERACTIVE != true) auto-proceed without pausing;
+  # only Mission Control sessions with the flag set actually present this gate.
+  # Three graded choices: APPROVE-AS-IS, APPROVE-WITH-FIX, REJECT.
   - id: pause-gate
-    depends_on: [block-reclassify]
-    when: "$block-reclassify.output.status == 'BLOCKED'"
+    depends_on: [findings-consolidate]
+    when: "$block-reclassify.output.status == 'BLOCKED' || $block-reclassify.output.status == 'PROCEED'"
     approval:
       message: |
-        This run is BLOCKED before the irreversible commit and the AI tiers could not
-        safely resolve it. The run is PAUSED (not failed) -- nothing was committed or
-        pushed. Review and either correct + resume, or reject.
+        REVIEW FINDINGS LEDGER (every finding; unresolved ones include a suggested fix):
+        $findings-consolidate.output
 
-        What to inspect:
-        - block-classify / block-reclassify: why it blocked (FALSE_COMPLETE = implement
-          produced no real changes; or diff-review-final = needs_revision).
-        - diff-review-final verdict + the Codex findings.
-        - opus-repair output: what the Opus tier tried and why it could not finish.
-        - $ARTIFACTS_DIR/diff-repair-escalation.txt if present (the escalation payload).
+        Choose:
+        - APPROVE-AS-IS  -> proceed; any unresolved findings stay unresolved and are logged.
+        - APPROVE-WITH-FIX -> authorize the loop to apply the named suggested fix(es), including a
+          new schema migration the self-repair loop deferred; a second review runs before commit.
+        - REJECT -> halt; the worktree is preserved.
 
-        SAFE STATE: no commit, no push, no PR, no Notion write has happened.
+        SAFE STATE: no commit, no push, no PR, no Notion write has happened yet.
 
-        - "approved" / "proceed" -> resume (only do this if you have corrected the worktree
-          so a real, reviewed change exists; commit-and-push still re-checks the gate)
-        - "reject" / "stop" -> halt; the worktree changes (if any) remain for manual handling
+        (BLOCKED runs: the AI tiers could not fully resolve this. PROCEED runs: reviews passed;
+        this is the final confirmation before the irreversible commit.)
+      choices: [approve_as_is, approve_with_fix, reject]
       capture_response: true
       on_reject:
         prompt: |
@@ -1150,10 +1151,33 @@ nodes:
         UNRESOLVED:
         - <finding still open>   (or "(none)")
 
+  # classify-apply-review: grep the APPLY_DIFF_REVIEW_FINAL sentinel out of
+  # apply-diff-review-final's multi-line Codex prose and emit ONE JSON line so
+  # the condition-evaluator can use $classify-apply-review.output.verdict without
+  # JSON.parse failing on multi-line output. Mirrors block-classify's bash idiom.
+  # trigger_rule all_done + same when: as apply-diff-review-final so it runs
+  # exactly when that node ran, skips otherwise.
+  - id: classify-apply-review
+    depends_on: [apply-diff-review-final]
+    trigger_rule: all_done
+    when: "$pause-gate.output.decision_verb == 'approve_with_fix'"
+    bash: |
+      set -uo pipefail
+      REVIEW=$apply-diff-review-final.output
+      verdict=$(printf '%s\n' "$REVIEW" \
+        | grep -oE 'APPLY_DIFF_REVIEW_FINAL=(satisfied|needs_revision)' \
+        | tail -n 1 \
+        | sed 's/APPLY_DIFF_REVIEW_FINAL=//')
+      if [ -z "$verdict" ]; then
+        verdict=needs_revision
+      fi
+      printf '{"verdict":"%s"}\n' "$verdict"
+
   - id: decide-push-target
     persona: major-build
-    depends_on: [block-reclassify]
-    when: "$block-reclassify.output.status == 'PROCEED'"
+    depends_on: [pause-gate, classify-apply-review]
+    trigger_rule: all_done
+    when: "$pause-gate.output.decision_verb != 'approve_with_fix' || $classify-apply-review.output.verdict == 'satisfied'"
     task_class: clerical
     prompt: |
       Decide the push target for this BDC feature Work Order.

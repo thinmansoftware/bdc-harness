@@ -8181,3 +8181,77 @@ it('approve_with_fix routes into apply-suggested-fix; approve_as_is does not', (
     evaluateCondition("$pause-gate.output.decision_verb == 'approve_with_fix'", asIs).result
   ).toBe(false);
 });
+
+// T4: classify-apply-review routing tests
+// Verify decide-push-target's compound when: works correctly for all cases.
+// The condition is: $pause-gate.output.decision_verb != 'approve_with_fix'
+//                  || $classify-apply-review.output.verdict == 'satisfied'
+it('classify-apply-review routes decide-push-target correctly for all gate outcomes', () => {
+  const decidePushCond =
+    "$pause-gate.output.decision_verb != 'approve_with_fix' || $classify-apply-review.output.verdict == 'satisfied'";
+
+  // Non-interactive auto-proceed: pause-gate output is '' (executor returns {output:''})
+  // decision_verb resolves to '' (JSON.parse('') throws -> '') -> '' != 'approve_with_fix' = TRUE
+  const nonInteractive = new Map<string, NodeOutput>([
+    ['pause-gate', { state: 'completed', output: '' }],
+    ['classify-apply-review', { state: 'skipped', output: '' }],
+  ]);
+  expect(evaluateCondition(decidePushCond, nonInteractive).result).toBe(true);
+
+  // APPROVE-AS-IS: decision_verb == 'approve_as_is' != 'approve_with_fix' -> TRUE
+  const approveAsIs = new Map<string, NodeOutput>([
+    [
+      'pause-gate',
+      { state: 'completed', output: JSON.stringify({ decision_verb: 'approve_as_is' }) },
+    ],
+    ['classify-apply-review', { state: 'skipped', output: '' }],
+  ]);
+  expect(evaluateCondition(decidePushCond, approveAsIs).result).toBe(true);
+
+  // APPROVE-WITH-FIX + satisfied: first clause FALSE, second TRUE -> TRUE (push)
+  const approveWithFixSatisfied = new Map<string, NodeOutput>([
+    [
+      'pause-gate',
+      {
+        state: 'completed',
+        output: JSON.stringify({
+          decision_verb: 'approve_with_fix',
+          authorized_fix_ids: ['locg-migration'],
+        }),
+      },
+    ],
+    ['classify-apply-review', { state: 'completed', output: '{"verdict":"satisfied"}' }],
+  ]);
+  expect(evaluateCondition(decidePushCond, approveWithFixSatisfied).result).toBe(true);
+
+  // APPROVE-WITH-FIX + needs_revision: both clauses FALSE -> FALSE (no push)
+  const approveWithFixFailed = new Map<string, NodeOutput>([
+    [
+      'pause-gate',
+      {
+        state: 'completed',
+        output: JSON.stringify({
+          decision_verb: 'approve_with_fix',
+          authorized_fix_ids: ['locg-migration'],
+        }),
+      },
+    ],
+    ['classify-apply-review', { state: 'completed', output: '{"verdict":"needs_revision"}' }],
+  ]);
+  expect(evaluateCondition(decidePushCond, approveWithFixFailed).result).toBe(false);
+
+  // APPROVE-WITH-FIX + classify-apply-review missing sentinel (empty -> 'needs_revision' default)
+  // Classifier emits '{"verdict":"needs_revision"}' when sentinel absent -> no push
+  const approveWithFixMissing = new Map<string, NodeOutput>([
+    [
+      'pause-gate',
+      {
+        state: 'completed',
+        output: JSON.stringify({ decision_verb: 'approve_with_fix', authorized_fix_ids: [] }),
+      },
+    ],
+    // Classifier output missing verdict field -> JSON.parse succeeds but verdict='' -> '' != 'satisfied' = FALSE
+    ['classify-apply-review', { state: 'completed', output: '{"verdict":"needs_revision"}' }],
+  ]);
+  expect(evaluateCondition(decidePushCond, approveWithFixMissing).result).toBe(false);
+});
