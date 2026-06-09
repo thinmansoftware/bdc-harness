@@ -5348,6 +5348,9 @@ describe('executeDagWorkflow -- approval node', () => {
   });
 
   it('fresh approval node pauses with extended context (capture_response + on_reject)', async () => {
+    // Set interactive mode so the gate pauses -- this test exercises the pause path.
+    process.env.CAULDRON_INTERACTIVE = 'true';
+
     const store = createMockStore();
     const mockDeps = createMockDeps(store);
     const platform = createMockPlatform();
@@ -5400,6 +5403,9 @@ describe('executeDagWorkflow -- approval node', () => {
   });
 
   it('approval node without capture_response stores empty node output', async () => {
+    // Set interactive mode so the gate pauses -- this test exercises the pause path.
+    process.env.CAULDRON_INTERACTIVE = 'true';
+
     const store = createMockStore();
     const mockDeps = createMockDeps(store);
     const platform = createMockPlatform();
@@ -5444,6 +5450,9 @@ describe('executeDagWorkflow -- approval node', () => {
   });
 
   it('on_reject runs AI prompt and re-pauses on rejection resume', async () => {
+    // Set interactive mode so the gate re-pauses after the on_reject AI run.
+    process.env.CAULDRON_INTERACTIVE = 'true';
+
     mockSendQueryDag.mockImplementation(function* () {
       yield { type: 'assistant', content: 'Fixed based on feedback' };
       yield { type: 'result', sessionId: 'reject-fix-session' };
@@ -5694,6 +5703,10 @@ describe('executeDagWorkflow -- approval node', () => {
   });
 
   it('approval message substitutes $nodeId.output.field references from upstream structured output', async () => {
+    // Set interactive mode so the gate pauses -- this test exercises the message-substitution
+    // path which only runs when the gate reaches the pause logic.
+    process.env.CAULDRON_INTERACTIVE = 'true';
+
     // Repro for: approval gates were rendering literal "$gather-context.output.repo_name"
     // instead of resolved values, breaking interactive workflows like atlas-onboard.
     // Parity: prompt/bash/loop/cancel nodes already get substituteNodeOutputRefs;
@@ -5797,6 +5810,111 @@ describe('executeDagWorkflow -- approval node', () => {
     expect((approvalRequestedEvents[0][0] as { data: { message: string } }).data.message).toBe(
       'Repo: hcr-els | App: CCELS | Port: 3012'
     );
+  });
+
+  // ---------------------------------------------------------------------------
+  // CAULDRON_INTERACTIVE gate bypass tests
+  // T6 (regression/critical): non-interactive mode must NOT pause -- auto-proceed.
+  // T1: interactive mode must pause and send the approval message.
+  // ---------------------------------------------------------------------------
+
+  afterEach(() => {
+    // Restore env after each CAULDRON_INTERACTIVE test
+    delete process.env.CAULDRON_INTERACTIVE;
+  });
+
+  it('T6: non-interactive (CAULDRON_INTERACTIVE unset) approval node does NOT pause -- auto-proceeds', async () => {
+    // Ensure flag is absent (non-interactive default)
+    delete process.env.CAULDRON_INTERACTIVE;
+
+    const store = createMockStore();
+    const mockDeps = createMockDeps(store);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('t6-non-interactive-run');
+
+    // executeDagWorkflow returns string|undefined (last node output), not NodeOutput.
+    // For a single-node approval workflow that bypasses the gate, it returns undefined.
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-t6',
+      testDir,
+      {
+        name: 't6-non-interactive',
+        nodes: [
+          {
+            id: 'gate',
+            approval: { message: 'Approve?' },
+          },
+        ],
+      },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    // pauseWorkflowRun must NOT have been called -- the gate was bypassed
+    const pauseCalls = (
+      store.pauseWorkflowRun as Mock<(id: string, ctx: Record<string, unknown>) => Promise<void>>
+    ).mock.calls;
+    expect(pauseCalls.length).toBe(0);
+
+    // completeWorkflowRun should have been called (DAG completed normally)
+    const completeCalls = (store.completeWorkflowRun as Mock<(id: string) => Promise<void>>).mock
+      .calls;
+    expect(completeCalls.length).toBe(1);
+  });
+
+  it('T1: interactive (CAULDRON_INTERACTIVE=true) approval node pauses and sends the message', async () => {
+    // Set interactive mode -- gate should pause and send the approval message
+    process.env.CAULDRON_INTERACTIVE = 'true';
+
+    const store = createMockStore();
+    const mockDeps = createMockDeps(store);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('t1-interactive-run');
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-t1',
+      testDir,
+      {
+        name: 't1-interactive',
+        nodes: [
+          {
+            id: 'gate',
+            approval: { message: 'Approve this plan?' },
+          },
+        ],
+      },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    // pauseWorkflowRun must have been called exactly once
+    const pauseCalls = (
+      store.pauseWorkflowRun as Mock<(id: string, ctx: Record<string, unknown>) => Promise<void>>
+    ).mock.calls;
+    expect(pauseCalls.length).toBe(1);
+    expect(pauseCalls[0][1]).toMatchObject({ type: 'approval', nodeId: 'gate' });
+
+    // safeSendMessage (via platform.sendMessage) must have sent the approval message
+    const sentMessages = (
+      platform.sendMessage as Mock<(...args: unknown[]) => Promise<void>>
+    ).mock.calls.map((c: unknown[]) => c[1] as string);
+    expect(sentMessages.some(m => m.includes('Approve this plan?'))).toBe(true);
   });
 });
 describe('executeDagWorkflow -- env var injection', () => {
