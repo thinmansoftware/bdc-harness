@@ -110,6 +110,8 @@ export function clearAgentRegistryCache(): void {
 }
 
 const MCP_FAILURE_PREFIX = 'MCP server connection failed: ';
+const CODEX_FAILBACK_PREFIX = '[CODEX FAILBACK]';
+const WARNING_PREFIX = '[WARNING]';
 
 /** A failed MCP server entry parsed from the SDK message. `segment` is the
  *  original substring (e.g. `"telegram (disconnected)"`) so callers can
@@ -1052,6 +1054,44 @@ async function executeNodeInternal(
             nodeContext
           );
           if (!delivered) {
+            getLog().error(
+              { nodeId: node.id, workflowRunId: workflowRun.id },
+              'dag.provider_warning_delivery_failed'
+            );
+          }
+        } else if (msg.content.startsWith(CODEX_FAILBACK_PREFIX)) {
+          // Codex failback disclosure: surface to platform AND node output.
+          getLog().warn(
+            { nodeId: node.id, systemContent: msg.content },
+            'dag.provider_warning_forwarded'
+          );
+          const deliveredFailback = await safeSendMessage(
+            platform,
+            conversationId,
+            msg.content,
+            nodeContext
+          );
+          if (!deliveredFailback) {
+            getLog().error(
+              { nodeId: node.id, workflowRunId: workflowRun.id },
+              'dag.provider_warning_delivery_failed'
+            );
+          }
+          // Append disclosure so CROSS_MODEL_REVIEW is visible in node output.
+          nodeOutputText += msg.content;
+        } else if (msg.content.startsWith(WARNING_PREFIX)) {
+          // Resume-warning: surface to platform stream.
+          getLog().warn(
+            { nodeId: node.id, systemContent: msg.content },
+            'dag.provider_warning_forwarded'
+          );
+          const deliveredWarning = await safeSendMessage(
+            platform,
+            conversationId,
+            msg.content,
+            nodeContext
+          );
+          if (!deliveredWarning) {
             getLog().error(
               { nodeId: node.id, workflowRunId: workflowRun.id },
               'dag.provider_warning_delivery_failed'

@@ -7800,6 +7800,58 @@ describe('executeDagWorkflow -- MCP failure filtering', () => {
 
     expect(mcpMessages(platform)).toEqual(['⚠️ Haiku does not support MCP']);
   });
+
+  it('forwards [CODEX FAILBACK] system chunks and appends to node output text', async () => {
+    const failbackContent =
+      '[CODEX FAILBACK] Codex unavailable after retries. Review delegated to claude';
+    const store = createMockStore();
+    const mockDeps = createMockDeps(store);
+    mockSendQueryDag.mockImplementation(function* () {
+      yield { type: 'system', content: failbackContent };
+      yield { type: 'assistant', content: 'claude-review-result' };
+      yield { type: 'result', sessionId: 'failback-sess' };
+    });
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun();
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-failback',
+      testDir,
+      { name: 'failback-test', nodes: [{ id: 'step1', command: 'my-cmd' }] },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+    // 1. Forwarded to platform stream
+    const sentMessages = (platform.sendMessage as ReturnType<typeof mock>).mock.calls.map(
+      (c: unknown[]) => c[1] as string
+    );
+    expect(sentMessages.some((m: string) => m === failbackContent)).toBe(true);
+    // 2. Also in node output text (node_completed event data)
+    const eventCalls = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls;
+    const completed = eventCalls.find(
+      (c: unknown[]) => (c[0] as Record<string, string>).event_type === 'node_completed'
+    );
+    expect(completed).toBeDefined();
+    const nodeOutput = (completed![0] as Record<string, Record<string, string>>).data.node_output;
+    expect(nodeOutput).toContain(failbackContent);
+  });
+
+  it('forwards [WARNING] system chunks to platform but does not add to node output text', async () => {
+    const warnContent = '[WARNING] Could not resume previous session. Starting fresh conversation.';
+    const platform = await runWithSystemChunk(warnContent);
+    // Forwarded to platform stream
+    const sentMessages = (platform.sendMessage as ReturnType<typeof mock>).mock.calls.map(
+      (c: unknown[]) => c[1] as string
+    );
+    expect(sentMessages.some((m: string) => m === warnContent)).toBe(true);
+  });
 });
 
 // ---------------------------------------------------------------------------

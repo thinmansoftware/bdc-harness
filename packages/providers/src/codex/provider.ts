@@ -821,6 +821,10 @@ export class CodexProvider implements IAgentProvider {
             content:
               '[WARNING] Could not resume previous session (rollout missing). Starting fresh conversation.',
           };
+          // NOTE: rollout persistence (CODEX_HOME pin) is deferred to
+          // WO-HARNESS-CODEX-ROLLOUT-PERSISTENCE-01; until then every resume
+          // against an empty rollout store self-heals to a fresh thread
+          // (context-loss is logged via the [WARNING] chunk above).
           rolloutRestartUsed = true;
           try {
             thread = codex.startThread(threadOptions);
