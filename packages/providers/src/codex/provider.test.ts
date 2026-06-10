@@ -1857,4 +1857,106 @@ describe('WO-HARNESS-CODEX-THREAD-RESUME-AND-FAILBACK-01', () => {
 
     await expect(consume()).rejects.toThrow(/Codex crash/);
   }, 10_000);
+
+  // Codex review (2026-06-10, needs_revision -> resolved): the failback
+  // path used to forward `requestOptions` UNCHANGED to the Claude failback
+  // provider. That leaked Codex/OpenAI model ids (e.g. `gpt-5.3-codex`,
+  // `gpt-5.5`) into Claude's option builder, which uses
+  // `requestOptions?.model ?? assistantDefaults.model` directly -- a Codex
+  // model id sent to Claude is rejected by the SDK and the failback
+  // collapses into an immediate error, defeating the entire "keep the
+  // review gate alive" purpose of the failback. This test asserts the
+  // contract fix: the Claude failback's `sendQuery` must not receive a
+  // Codex model in `requestOptions.model`, must not receive a Codex
+  // `fallbackModel`, and must not receive the Codex `assistantConfig`
+  // bag (which itself carries `model`).
+  test('Scenario 3c: failback strips Codex model/fallbackModel/assistantConfig from requestOptions', async () => {
+    mockRunStreamed.mockRejectedValue(
+      new Error('codex exec exited with code 1: persistent subprocess crash')
+    );
+
+    // Capture exactly what the Claude failback receives in its 4th arg.
+    let receivedFailbackOptions: unknown = 'SENTINEL_NOT_CALLED';
+    const failbackSendQuery = mock(async function* (
+      _p: string,
+      _c: string,
+      _r?: string,
+      o?: unknown
+    ) {
+      receivedFailbackOptions = o;
+      yield { type: 'assistant', content: 'claude verdict' } as const;
+      yield { type: 'result', sessionId: 'sx', tokens: { input: 1, output: 1 } } as const;
+    });
+
+    const failbackProvider = {
+      sendQuery: failbackSendQuery,
+      getType: () => 'claude',
+      getCapabilities: () => ({}) as unknown as ReturnType<CodexProvider['getCapabilities']>,
+    };
+
+    const clientWithFailback = new CodexProvider({
+      retryBaseDelayMs: 1,
+      failbackProviderFactory: (() => failbackProvider) as unknown as () => typeof failbackProvider,
+    });
+
+    // Drive the Codex sendQuery with a fully populated requestOptions:
+    //   - model              Codex frontier id
+    //   - fallbackModel      Codex/OpenAI stale id
+    //   - assistantConfig    Codex config bag (incl. `model`, modelReasoningEffort)
+    //   - systemPrompt       universal field -- MUST survive sanitization
+    //   - env                universal field -- MUST survive sanitization
+    //   - nodeConfig         universal-ish -- MUST survive sanitization
+    const codexRequestOptions = {
+      model: 'gpt-5.3-codex',
+      fallbackModel: 'gpt-5.2-codex',
+      systemPrompt: 'please review',
+      env: { FOO: 'bar' },
+      nodeConfig: { output_format: { type: 'object' } },
+      assistantConfig: {
+        model: 'gpt-5.5',
+        modelReasoningEffort: 'medium' as const,
+        webSearchMode: 'live' as const,
+      },
+    };
+
+    const chunks: { type: string }[] = [];
+    for await (const chunk of clientWithFailback.sendQuery(
+      'review this',
+      '/workspace',
+      undefined,
+      codexRequestOptions
+    )) {
+      chunks.push(chunk as { type: string });
+    }
+
+    // Failback was actually exercised.
+    expect(failbackSendQuery).toHaveBeenCalledTimes(1);
+    expect(receivedFailbackOptions).not.toBe('SENTINEL_NOT_CALLED');
+    expect(receivedFailbackOptions).toBeDefined();
+
+    // The Codex-specific keys MUST be absent from what Claude sees.
+    const opts = receivedFailbackOptions as Record<string, unknown>;
+    expect(opts.model).toBeUndefined();
+    expect(opts.fallbackModel).toBeUndefined();
+    expect(opts.assistantConfig).toBeUndefined();
+
+    // Defense-in-depth: the entire Codex model id string must not appear
+    // anywhere in the forwarded payload (catches future leaks via new
+    // pass-through fields, e.g. a downstream addition to AgentRequestOptions
+    // that accidentally re-exposes a model id).
+    const serialized = JSON.stringify(opts);
+    expect(serialized).not.toContain('gpt-5.3-codex');
+    expect(serialized).not.toContain('gpt-5.2-codex');
+    expect(serialized).not.toContain('gpt-5.5');
+
+    // Universal-ish fields MUST survive -- dropping them would degrade the
+    // failback further than necessary.
+    expect(opts.systemPrompt).toBe('please review');
+    expect(opts.env).toEqual({ FOO: 'bar' });
+    expect(opts.nodeConfig).toEqual({ output_format: { type: 'object' } });
+
+    // Sanity: the failback still streamed Claude's verdict through.
+    expect(chunks.some(c => c.type === 'assistant')).toBe(true);
+    expect(chunks.some(c => c.type === 'result')).toBe(true);
+  }, 10_000);
 });

@@ -223,6 +223,55 @@ function classifyCodexError(
   return 'unknown';
 }
 
+/**
+ * Build sanitized SendQueryOptions for the Claude failback path.
+ *
+ * WO-HARNESS-CODEX-THREAD-RESUME-AND-FAILBACK-01 contract fix (2026-06-10,
+ * Codex review: needs_revision -> resolved): when Codex delegates to the
+ * Claude failback provider after terminal failure, the original Codex
+ * `requestOptions` must NOT be forwarded unchanged. Provider-specific
+ * fields would immediately fail Claude:
+ *
+ *   - `model`           Codex/OpenAI model id (e.g. `gpt-5.3-codex`,
+ *                       `gpt-5.5`). Claude's option builder uses
+ *                       `requestOptions?.model ?? assistantDefaults.model`
+ *                       directly, so a Codex model name would be passed
+ *                       to the Claude SDK and rejected -- collapsing the
+ *                       failback into an immediate error and defeating
+ *                       the entire "keep the review gate alive" purpose.
+ *   - `fallbackModel`   Same hazard: a Codex/OpenAI fallback model would
+ *                       reach the Claude SDK as its fallback.
+ *   - `assistantConfig` Raw Codex section of `.archon/config.yaml` (with
+ *                       `modelReasoningEffort`, `webSearchMode`,
+ *                       `codexBinaryPath`, etc.). Claude's
+ *                       `parseClaudeConfig` is defensive about unknown
+ *                       fields but, critically, it ALSO reads `model`
+ *                       from `assistantConfig` -- so even after dropping
+ *                       the top-level `model`, leaving `assistantConfig`
+ *                       intact would let a `codex.model: 'gpt-5.5'` leak
+ *                       back in via the Codex config bag. Drop the whole
+ *                       config bag so Claude resolves its own defaults
+ *                       from its own config section.
+ *
+ * Universal-ish fields (abortSignal, outputFormat, env, systemPrompt,
+ * maxBudgetUsd, forkSession, persistSession, nodeConfig) are preserved
+ * -- Claude understands them, and dropping them would degrade the
+ * failback further than necessary.
+ *
+ * Returns undefined when no original options were provided, preserving
+ * the existing call-shape for `sendQuery(prompt, cwd, undefined, undefined)`.
+ */
+function buildFailbackOptions(original?: SendQueryOptions): SendQueryOptions | undefined {
+  if (!original) return undefined;
+  const { model, fallbackModel, assistantConfig, ...rest } = original;
+  // Reference the destructured locals so the compiler/lint see them as
+  // intentionally discarded (drop-from-payload), not accidentally unused.
+  void model;
+  void fallbackModel;
+  void assistantConfig;
+  return rest;
+}
+
 function extractUsageFromCodexEvent(event: TurnCompletedEvent): TokenUsage {
   if (!event.usage) {
     getLog().warn({ eventType: event.type }, 'codex.usage_null_on_turn_completed');
@@ -846,7 +895,16 @@ export class CodexProvider implements IAgentProvider {
             const failbackProvider = this.failbackProviderFactory();
             // Fresh session for the failback (no resume id; failback runs a
             // brand-new conversation against the same prompt/cwd).
-            yield* failbackProvider.sendQuery(prompt, cwd, undefined, requestOptions);
+            // requestOptions is sanitized: Codex-specific fields (model,
+            // fallbackModel, assistantConfig) are stripped so Claude resolves
+            // its own model defaults rather than receiving a Codex model id.
+            // See buildFailbackOptions() for rationale.
+            yield* failbackProvider.sendQuery(
+              prompt,
+              cwd,
+              undefined,
+              buildFailbackOptions(requestOptions)
+            );
             return;
           }
           throw enrichedError;
@@ -869,7 +927,15 @@ export class CodexProvider implements IAgentProvider {
           'Claude. Reduced cross-model adversarial value -- human review recommended.',
       };
       const failbackProvider = this.failbackProviderFactory();
-      yield* failbackProvider.sendQuery(prompt, cwd, undefined, requestOptions);
+      // Same sanitization rationale as the in-loop failback above:
+      // strip Codex-specific model/fallbackModel/assistantConfig so Claude
+      // does not receive a Codex model id from requestOptions.
+      yield* failbackProvider.sendQuery(
+        prompt,
+        cwd,
+        undefined,
+        buildFailbackOptions(requestOptions)
+      );
       return;
     }
     throw lastError ?? new Error('Codex query failed after retries');
