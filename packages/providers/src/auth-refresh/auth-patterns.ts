@@ -49,19 +49,19 @@ export const AUTH_PATTERNS: readonly string[] = [
   'log out and sign in',
   // WO-HARNESS-CODEX-THREAD-RESUME-AND-FAILBACK-01 (2026-06-10): rollout/resume
   // tokens are intentionally EXCLUDED from AUTH_PATTERNS. The codex binary emits
-  // "thread/resume failed: no rollout found for thread id X" when asked to resume
-  // a thread whose rollout file no longer exists on disk. That is a runtime
-  // subprocess crash (retryable with a fresh thread), NOT an auth failure --
-  // classifying it as auth would short-circuit the crash retry and surface a
-  // misleading "Codex auth error" to operators (who would then look for a
-  // non-existent auth problem). The patterns
-  //   'no rollout found', 'thread/resume failed', 'rollout not found'
-  // are owned by packages/providers/src/codex/provider.ts (constant
-  // ROLLOUT_MISSING_PATTERNS) and checked BEFORE AUTH_PATTERNS in
-  // classifyCodexError() as defense-in-depth. Do NOT add any of those tokens to
-  // this list. If a new auth-class token sounds similar to a rollout token,
-  // verify (with a unit test) that it does not also substring-match a rollout
-  // message before adding it here.
+  // a rollout-missing stderr message (paraphrased: resume of a nonexistent
+  // rollout file for a given thread id) when asked to resume a thread whose
+  // rollout file no longer exists on disk. That is a runtime subprocess crash
+  // (retryable with a fresh thread), NOT an auth failure -- classifying it as
+  // auth would short-circuit the crash retry and surface a misleading "Codex
+  // auth error" to operators (who would then look for a non-existent auth
+  // problem). The literal rollout/resume marker strings are OWNED by
+  // packages/providers/src/codex/provider.ts (constant ROLLOUT_MISSING_PATTERNS)
+  // -- see that file for the canonical token list. They are checked BEFORE
+  // AUTH_PATTERNS in classifyCodexError() as defense-in-depth. Do NOT add any
+  // rollout/resume markers to this list. If a new auth-class token sounds
+  // similar to a rollout marker, verify (with a unit test) that it does not
+  // also substring-match a rollout message before adding it here.
 ];
 
 /**
