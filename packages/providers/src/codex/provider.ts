@@ -1,6 +1,14 @@
 /**
  * Codex SDK wrapper
  * Provides async generator interface for streaming Codex responses
+ *
+ * ASCII-clean as of WO-HARNESS-CODEX-THREAD-RESUME-AND-FAILBACK-01 (2026-06-10).
+ * Per Code Standards v1.2, this file contains only ASCII bytes (0x00-0x7F).
+ * The Cauldron ascii-gate scans every changed source file end-to-end; any
+ * non-ASCII byte fails the build. Replace em-dash with --, smart quotes with
+ * '/", ellipsis with ..., section sign with section, and emoji glyphs with
+ * bracketed ASCII tags like [SEARCH], [MCP], [WARNING], [ERROR], [OK], [X],
+ * [+], [-], [M], [TASKS], [x], [ ].
  */
 import {
   Codex,
@@ -67,7 +75,7 @@ async function getCodex(configCodexBinaryPath?: string): Promise<Codex> {
 /**
  * Anthropic model aliases that must never reach the Codex SDK.
  * If a caller passes one of these (e.g. via node.model or assistantConfig.model),
- * it is silently dropped — Codex authenticates via its own account and resolves
+ * it is silently dropped -- Codex authenticates via its own account and resolves
  * the model internally.  Non-Anthropic models (gpt-5-codex, o3, etc.) are passed through.
  */
 // The live, API-supported Codex frontier model. Used as the explicit default when
@@ -96,7 +104,7 @@ function isAnthropicAlias(model: string): boolean {
 
 /**
  * Build thread options for Codex SDK.
- * Anthropic model aliases are dropped — the Codex SDK rejects them and resolves
+ * Anthropic model aliases are dropped -- the Codex SDK rejects them and resolves
  * the model via the user's OpenAI/Codex account configuration.
  */
 function buildThreadOptions(
@@ -171,7 +179,7 @@ function buildModelAccessMessage(model?: string): string {
     ? `Or set it per-workflow with \`model: ${suggested}\` in workflow YAML.`
     : 'Or set it per-workflow with a valid `model:` in workflow YAML.';
 
-  return `❌ Model "${selectedModel}" is not available for your account.\n\n${fixLine}\n\n${workflowLine}`;
+  return `[ERROR] Model "${selectedModel}" is not available for your account.\n\n${fixLine}\n\n${workflowLine}`;
 }
 
 const MAX_SUBPROCESS_RETRIES = 3;
@@ -182,11 +190,33 @@ const RATE_LIMIT_PATTERNS = ['rate limit', 'too many requests', '429', 'overload
 // to add new auth-error markers.
 const SUBPROCESS_CRASH_PATTERNS = ['exited with code', 'killed', 'signal', 'codex exec'];
 
+// WO-HARNESS-CODEX-THREAD-RESUME-AND-FAILBACK-01 (2026-06-10):
+// Codex resume of a missing rollout surfaces as a runtime subprocess failure
+// (the codex binary writes "thread/resume failed: no rollout found for thread id X"
+// to stderr and exits non-zero). These tokens MUST classify as crash (retryable
+// with a fresh thread), NOT as auth, regardless of how AUTH_PATTERNS evolves.
+// The classifier checks this list BEFORE AUTH_PATTERNS as defense-in-depth so a
+// future broadening of the auth list can never spuriously catch a resume failure.
+// The runtime restart path (sendQuery streaming loop) also uses this list to
+// decide when to start a fresh thread mid-stream once per call.
+const ROLLOUT_MISSING_PATTERNS = ['no rollout found', 'thread/resume failed', 'rollout not found'];
+
+/** True when the message indicates a Codex thread-resume failure due to missing rollout. */
+function isRolloutMissingError(errorMessage: string | undefined): boolean {
+  if (!errorMessage) return false;
+  const m = errorMessage.toLowerCase();
+  return ROLLOUT_MISSING_PATTERNS.some(p => m.includes(p));
+}
+
 function classifyCodexError(
   errorMessage: string
 ): 'rate_limit' | 'auth' | 'crash' | 'model_access' | 'unknown' {
   if (isModelAccessError(errorMessage)) return 'model_access';
   const m = errorMessage.toLowerCase();
+  // Rollout/resume failures are crash-class (retryable with a fresh thread).
+  // Check BEFORE AUTH_PATTERNS so a future auth-pattern broadening cannot
+  // spuriously misclassify a thread-resume failure as auth.
+  if (ROLLOUT_MISSING_PATTERNS.some(p => m.includes(p))) return 'crash';
   if (RATE_LIMIT_PATTERNS.some(p => m.includes(p))) return 'rate_limit';
   if (AUTH_PATTERNS.some(p => m.includes(p))) return 'auth';
   if (SUBPROCESS_CRASH_PATTERNS.some(p => m.includes(p))) return 'crash';
@@ -204,7 +234,7 @@ function extractUsageFromCodexEvent(event: TurnCompletedEvent): TokenUsage {
   };
 }
 
-// ─── Turn Options Builder ────────────────────────────────────────────────
+// --- Turn Options Builder ------------------------------------------------
 
 /**
  * Build turn options for a single Codex turn.
@@ -230,7 +260,7 @@ function buildTurnOptions(requestOptions?: SendQueryOptions): {
   return { turnOptions, hasOutputFormat };
 }
 
-// ─── Stream Normalizer ───────────────────────────────────────────────────
+// --- Stream Normalizer ---------------------------------------------------
 
 /** State maintained across Codex event stream normalization. */
 interface CodexStreamState {
@@ -253,7 +283,7 @@ async function* streamCodexEvents(
   // If the iterator closes without a terminal event (e.g. the model was
   // rejected before the turn even started), we synthesize a fail-stop result
   // after the loop so the dag-executor's `msg.isError` branch catches it
-  // — matching Claude's contract. Both terminal branches below `return`,
+  // -- matching Claude's contract. Both terminal branches below `return`,
   // so reaching the post-loop block can only mean no terminal fired.
   let lastNonMcpError: string | undefined;
 
@@ -274,7 +304,7 @@ async function* streamCodexEvents(
     if (event.type === 'error') {
       const errorEvent = event as { message: string };
       getLog().error({ message: errorEvent.message }, 'stream_error');
-      // MCP client errors are non-fatal — Codex retries internally and may
+      // MCP client errors are non-fatal -- Codex retries internally and may
       // still reach turn.completed. Other errors are captured; whether they
       // are fatal is decided when the stream terminates: turn.completed
       // means the SDK recovered, so the captured error is dropped; loop
@@ -347,7 +377,7 @@ async function* streamCodexEvents(
 
         case 'web_search':
           if (item.query) {
-            const searchToolName = `🔍 Searching: ${item.query as string}`;
+            const searchToolName = `[SEARCH] Searching: ${item.query as string}`;
             yield { type: 'tool', toolName: searchToolName };
             yield { type: 'tool_result', toolName: searchToolName, toolOutput: '' };
           } else {
@@ -366,9 +396,9 @@ async function* streamCodexEvents(
             if (signature !== state.lastTodoListSignature) {
               state.lastTodoListSignature = signature;
               const taskList = normalizedItems
-                .map(t => `${t.completed ? '✅' : '⬜'} ${t.text}`)
+                .map(t => `${t.completed ? '[x]' : '[ ]'} ${t.text}`)
                 .join('\n');
-              yield { type: 'system', content: `📋 Tasks:\n${taskList}` };
+              yield { type: 'system', content: `[TASKS] Tasks:\n${taskList}` };
             }
           } else {
             getLog().debug({ itemId: item.id }, 'todo_list_empty_or_invalid');
@@ -377,7 +407,7 @@ async function* streamCodexEvents(
         }
 
         case 'file_change': {
-          const statusIcon = (item.status as string) === 'failed' ? '❌' : '✅';
+          const statusIcon = (item.status as string) === 'failed' ? '[X]' : '[OK]';
           const rawError = 'error' in item ? (item as { error?: unknown }).error : undefined;
           const fileErrorMessage =
             typeof rawError === 'string'
@@ -390,7 +420,7 @@ async function* streamCodexEvents(
           if (Array.isArray(changes) && changes.length > 0) {
             const changeList = changes
               .map(c => {
-                const icon = c.kind === 'add' ? '➕' : c.kind === 'delete' ? '➖' : '📝';
+                const icon = c.kind === 'add' ? '[+]' : c.kind === 'delete' ? '[-]' : '[M]';
                 return `${icon} ${c.path ?? '(unknown file)'}`;
               })
               .join('\n');
@@ -408,8 +438,8 @@ async function* streamCodexEvents(
               'file_change_failed_no_changes'
             );
             const failMsg = fileErrorMessage
-              ? `❌ File change failed: ${fileErrorMessage}`
-              : '❌ File change failed';
+              ? `[X] File change failed: ${fileErrorMessage}`
+              : '[X] File change failed';
             yield { type: 'system', content: failMsg };
           } else {
             getLog().debug({ itemId: item.id, status: item.status }, 'file_change_no_changes');
@@ -421,7 +451,7 @@ async function* streamCodexEvents(
           const server = item.server as string | undefined;
           const tool = item.tool as string | undefined;
           const toolInfo = server && tool ? `${server}/${tool}` : (tool ?? server ?? 'MCP tool');
-          const mcpToolName = `🔌 MCP: ${toolInfo}`;
+          const mcpToolName = `[MCP] ${toolInfo}`;
 
           yield { type: 'tool', toolName: mcpToolName };
 
@@ -432,8 +462,8 @@ async function* streamCodexEvents(
             );
             const mcpError = item.error as { message?: string } | undefined;
             const errMsg = mcpError?.message
-              ? `❌ Error: ${mcpError.message}`
-              : '❌ Error: MCP tool failed';
+              ? `[ERROR]: ${mcpError.message}`
+              : '[ERROR]: MCP tool failed';
             yield { type: 'tool_result', toolName: mcpToolName, toolOutput: errMsg };
           } else {
             let toolOutput = '';
@@ -480,7 +510,7 @@ async function* streamCodexEvents(
           yield {
             type: 'system',
             content:
-              '⚠️ Structured output requested but Codex returned non-JSON text. ' +
+              '[WARNING] Structured output requested but Codex returned non-JSON text. ' +
               'Downstream $nodeId.output.field references may not evaluate correctly.',
           };
         }
@@ -501,7 +531,7 @@ async function* streamCodexEvents(
   // rejected by the API (model not supported, auth refused) before the turn
   // started. Surface as a fail-stop. The dag-executor's `msg.isError` branch
   // (dag-executor.ts: throws `Node '<id>' failed: SDK returned <subtype>`)
-  // turns this into a thrown node failure — distinct from the empty-output
+  // turns this into a thrown node failure -- distinct from the empty-output
   // guard further down, which returns `{ state: 'failed' }` for AI nodes
   // that streamed nothing but never raised an isError.
   const message = lastNonMcpError ?? 'Codex stream closed without turn.completed or turn.failed';
@@ -515,7 +545,7 @@ async function* streamCodexEvents(
   };
 }
 
-// ─── Error Classification & Retry ────────────────────────────────────────
+// --- Error Classification & Retry ----------------------------------------
 
 /**
  * Classify a Codex error and determine retry eligibility.
@@ -546,7 +576,7 @@ function classifyAndEnrichCodexError(
   return { enrichedError, errorClass, shouldRetry };
 }
 
-// ─── Codex Provider ──────────────────────────────────────────────────────
+// --- Codex Provider ------------------------------------------------------
 
 /**
  * Codex AI agent provider.
@@ -557,12 +587,31 @@ function classifyAndEnrichCodexError(
  * - buildTurnOptions: per-turn configuration (output schema, abort signal)
  * - streamCodexEvents: raw SDK event normalization into MessageChunks
  * - classifyAndEnrichCodexError: error classification for retry decisions
+ *
+ * WO-HARNESS-CODEX-THREAD-RESUME-AND-FAILBACK-01 (2026-06-10) adds:
+ * - A runtime rollout-missing self-heal: when a resume of a missing rollout
+ *   blows up mid-stream, restart the turn ONCE with a fresh thread.
+ * - A Claude failback path: when Codex is terminally unavailable after
+ *   retries exhaust, delegate the query to an injected failback provider
+ *   (registry wires ClaudeProvider) and emit a disclosure chunk noting the
+ *   reduced cross-model adversarial value.
  */
 export class CodexProvider implements IAgentProvider {
   private readonly retryBaseDelayMs: number;
+  private readonly failbackProviderFactory: (() => IAgentProvider) | null;
 
-  constructor(options?: { retryBaseDelayMs?: number }) {
+  constructor(options?: {
+    retryBaseDelayMs?: number;
+    /**
+     * Optional factory that produces a fallback IAgentProvider for the
+     * Claude failback path. When undefined or null, terminal Codex failures
+     * throw as before (no silent degradation without explicit wiring). The
+     * registry wires ClaudeProvider here in production; tests inject a mock.
+     */
+    failbackProviderFactory?: (() => IAgentProvider) | null;
+  }) {
     this.retryBaseDelayMs = options?.retryBaseDelayMs ?? RETRY_BASE_DELAY_MS;
+    this.failbackProviderFactory = options?.failbackProviderFactory ?? null;
   }
 
   private async createCodexClient(
@@ -597,12 +646,12 @@ export class CodexProvider implements IAgentProvider {
     resumeSessionId?: string,
     requestOptions?: SendQueryOptions
   ): AsyncGenerator<MessageChunk> {
-    // BDC fork: Layer 2 — proactive auth freshness check.
+    // BDC fork: Layer 2 -- proactive auth freshness check.
     // For Codex, ensureFreshAuth first attempts a "soft refresh" via the
     // binary's own OAuth path (OpenAI's documented approach per
     // developers.openai.com/codex/auth/ci-cd-auth) and only falls back to a
     // direct refresh-endpoint POST if that path doesn't advance auth.json.
-    // Behavior spec v2 invariant I-1; research doc §Design recommendation L2 + L4.
+    // Behavior spec v2 invariant I-1; research doc section Design recommendation L2 + L4.
     await ensureFreshAuth('codex');
 
     const assistantConfig = requestOptions?.assistantConfig ?? {};
@@ -652,13 +701,17 @@ export class CodexProvider implements IAgentProvider {
     if (sessionResumeFailed) {
       yield {
         type: 'system',
-        content: '⚠️ Could not resume previous session. Starting fresh conversation.',
+        content: '[WARNING] Could not resume previous session. Starting fresh conversation.',
       };
     }
 
     // 3. Build turn options
     const { turnOptions, hasOutputFormat } = buildTurnOptions(requestOptions);
     let lastError: Error | undefined;
+    // Runtime rollout-missing self-heal flag. Fires at most ONCE per sendQuery
+    // call -- prevents an infinite resume loop if the rollout-missing error
+    // somehow recurs after a fresh-thread restart.
+    let rolloutRestartUsed = false;
 
     for (let attempt = 0; attempt <= MAX_SUBPROCESS_RETRIES; attempt++) {
       if (requestOptions?.abortSignal?.aborted) {
@@ -697,6 +750,45 @@ export class CodexProvider implements IAgentProvider {
           throw new Error('Query aborted');
         }
 
+        // WO-HARNESS-CODEX-THREAD-RESUME-AND-FAILBACK-01: runtime rollout-missing
+        // self-heal. When a resume attempt fails at RUNTIME (the codex binary
+        // emits "thread/resume failed: no rollout found" mid-stream and exits),
+        // restart the turn ONCE with a fresh thread. Fires at most once per
+        // sendQuery via the rolloutRestartUsed flag; the second occurrence
+        // falls through to the regular retry/failback path. The disclosure
+        // chunk informs the consumer that the resumed history is unavailable.
+        if (
+          isRolloutMissingError(err.message) &&
+          !rolloutRestartUsed &&
+          attempt === 0 &&
+          resumeSessionId
+        ) {
+          getLog().warn(
+            { sessionId: resumeSessionId, err: err.message },
+            'rollout_missing_restart'
+          );
+          yield {
+            type: 'system',
+            content:
+              '[WARNING] Could not resume previous session (rollout missing). Starting fresh conversation.',
+          };
+          rolloutRestartUsed = true;
+          try {
+            thread = codex.startThread(threadOptions);
+          } catch (startError) {
+            const startErr = startError as Error;
+            if (isModelAccessError(startErr.message)) {
+              throw new Error(buildModelAccessMessage(requestOptions?.model));
+            }
+            throw new Error(`Codex query failed: ${startErr.message}`);
+          }
+          // Restart the loop at attempt 0 without consuming a retry slot --
+          // the rollout restart is a single-shot self-heal, distinct from
+          // the crash-retry budget.
+          attempt = -1; // for-loop will increment to 0
+          continue;
+        }
+
         const { enrichedError, errorClass, shouldRetry } = classifyAndEnrichCodexError(
           err,
           requestOptions?.model
@@ -733,6 +825,30 @@ export class CodexProvider implements IAgentProvider {
         }
 
         if (!shouldRetry || attempt >= MAX_SUBPROCESS_RETRIES) {
+          // WO-HARNESS-CODEX-THREAD-RESUME-AND-FAILBACK-01: Claude failback.
+          // When Codex is terminally unavailable AND a failback provider is
+          // wired, delegate the query to it rather than throwing. The
+          // disclosure chunk informs the consumer that cross-model adversarial
+          // value is reduced -- this path is degraded-with-disclosure, never
+          // the silent default. Auth errors do NOT trigger failback (real auth
+          // failures must still surface so the operator can re-login).
+          if (this.failbackProviderFactory && errorClass !== 'auth') {
+            getLog().warn(
+              { errorClass, attempt, originalError: err.message },
+              'codex_failback_to_claude'
+            );
+            yield {
+              type: 'system',
+              content:
+                '[CODEX FAILBACK] Codex unavailable after retries. Review delegated to ' +
+                'Claude. Reduced cross-model adversarial value -- human review recommended.',
+            };
+            const failbackProvider = this.failbackProviderFactory();
+            // Fresh session for the failback (no resume id; failback runs a
+            // brand-new conversation against the same prompt/cwd).
+            yield* failbackProvider.sendQuery(prompt, cwd, undefined, requestOptions);
+            return;
+          }
           throw enrichedError;
         }
 
@@ -743,6 +859,19 @@ export class CodexProvider implements IAgentProvider {
       }
     }
 
+    // Retry budget exhausted without a thrown error -- also a failback candidate.
+    if (this.failbackProviderFactory) {
+      getLog().warn({ lastError: lastError?.message }, 'codex_failback_to_claude_after_loop_exit');
+      yield {
+        type: 'system',
+        content:
+          '[CODEX FAILBACK] Codex unavailable after retries. Review delegated to ' +
+          'Claude. Reduced cross-model adversarial value -- human review recommended.',
+      };
+      const failbackProvider = this.failbackProviderFactory();
+      yield* failbackProvider.sendQuery(prompt, cwd, undefined, requestOptions);
+      return;
+    }
     throw lastError ?? new Error('Codex query failed after retries');
   }
 

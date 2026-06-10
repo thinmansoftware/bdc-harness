@@ -102,7 +102,7 @@ export function isRegisteredProvider(id: string): boolean {
 }
 
 /**
- * Register built-in providers (Claude, Codex). Idempotent — skips already-registered IDs.
+ * Register built-in providers (Claude, Codex). Idempotent -- skips already-registered IDs.
  * Must be called at process entrypoints (server, CLI) before any provider lookups.
  */
 export function registerBuiltinProviders(): void {
@@ -117,7 +117,12 @@ export function registerBuiltinProviders(): void {
     {
       id: 'codex',
       displayName: 'Codex (OpenAI)',
-      factory: () => new CodexProvider(),
+      // WO-HARNESS-CODEX-THREAD-RESUME-AND-FAILBACK-01: wire ClaudeProvider as the
+      // failback factory so terminal Codex failures (rollout-missing after restart,
+      // crash retries exhausted) delegate to a Claude reviewer with disclosure
+      // rather than blocking the review gate. The factory is invoked lazily inside
+      // sendQuery so the Claude instance is constructed only when actually needed.
+      factory: () => new CodexProvider({ failbackProviderFactory: () => new ClaudeProvider() }),
       capabilities: CODEX_CAPABILITIES,
       builtIn: true,
     },
@@ -141,13 +146,13 @@ export function registerBuiltinProviders(): void {
  *   3. Import + call it here.
  *
  * That's the entire cross-cutting change outside the provider's own
- * directory. No entrypoint edits, no config-type edits — just add a line
+ * directory. No entrypoint edits, no config-type edits -- just add a line
  * to this function. That's the Phase 2 contract (#1195): community
  * providers are a localized addition.
  *
  * Each `register*Provider` is itself idempotent, so calling this
  * aggregator multiple times (e.g. from both CLI and config-loader paths)
- * is safe. Errors during registration are not caught here — a broken
+ * is safe. Errors during registration are not caught here -- a broken
  * community provider should fail loud at bootstrap, not silently
  * disappear.
  */
@@ -155,7 +160,7 @@ export function registerCommunityProviders(): void {
   registerPiProvider();
 }
 
-/** @internal Test-only — clears the registry. Not for production use. */
+/** @internal Test-only -- clears the registry. Not for production use. */
 export function clearRegistry(): void {
   registry.clear();
 }

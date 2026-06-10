@@ -51,7 +51,7 @@ mock.module('../auth-refresh/index.js', () => ({
   buildReauthMessage: (provider: string, reason: string) =>
     `${provider} subscription auth expired (${reason}). Re-run ${provider} login on the harness host.`,
   // L2 + shared module additions (WO-HARNESS-PROVIDER-PROACTIVE-AUTH-REFRESH-01).
-  // ensureFreshAuth is a no-op in tests — the reactive refresh path is what
+  // ensureFreshAuth is a no-op in tests -- the reactive refresh path is what
   // these regression tests exercise. Real preflight behavior is covered by
   // packages/providers/src/auth-refresh/__tests__/preflight.test.ts.
   ensureFreshAuth: mock(async () => {}),
@@ -260,10 +260,10 @@ describe('CodexProvider', () => {
         chunks.push(chunk);
       }
 
-      expect(chunks[0]).toEqual({ type: 'tool', toolName: '\u{1F50D} Searching: codex sdk' });
+      expect(chunks[0]).toEqual({ type: 'tool', toolName: '[SEARCH] Searching: codex sdk' });
       expect(chunks[1]).toEqual({
         type: 'tool_result',
-        toolName: '\u{1F50D} Searching: codex sdk',
+        toolName: '[SEARCH] Searching: codex sdk',
         toolOutput: '',
       });
     });
@@ -292,7 +292,7 @@ describe('CodexProvider', () => {
 
       expect(chunks[0]).toEqual({
         type: 'system',
-        content: '\u{1F4CB} Tasks:\n\u2705 Scan repo\n\u2B1C Add tests',
+        content: '[TASKS] Tasks:\n[x] Scan repo\n[ ] Add tests',
       });
       expect(chunks).toHaveLength(2);
     });
@@ -329,11 +329,11 @@ describe('CodexProvider', () => {
       expect(chunks).toHaveLength(3); // todoV1 + todoV2 + result
       expect(chunks[0]).toEqual({
         type: 'system',
-        content: '\u{1F4CB} Tasks:\n\u2B1C Scan repo\n\u2B1C Add tests',
+        content: '[TASKS] Tasks:\n[ ] Scan repo\n[ ] Add tests',
       });
       expect(chunks[1]).toEqual({
         type: 'system',
-        content: '\u{1F4CB} Tasks:\n\u2705 Scan repo\n\u2B1C Add tests',
+        content: '[TASKS] Tasks:\n[x] Scan repo\n[ ] Add tests',
       });
     });
 
@@ -363,7 +363,7 @@ describe('CodexProvider', () => {
 
       expect(chunks[0]).toEqual({
         type: 'system',
-        content: '\u2705 File changes:\n\u2795 src/new.ts\n\u{1F4DD} src/app.ts\n\u2796 src/old.ts',
+        content: '[OK] File changes:\n[+] src/new.ts\n[M] src/app.ts\n[-] src/old.ts',
       });
     });
 
@@ -390,7 +390,7 @@ describe('CodexProvider', () => {
 
       expect(chunks[0]).toEqual({
         type: 'system',
-        content: '\u274C File changes:\n\u{1F4DD} src/locked.ts\nPermission denied',
+        content: '[X] File changes:\n[M] src/locked.ts\nPermission denied',
       });
     });
 
@@ -416,7 +416,7 @@ describe('CodexProvider', () => {
 
       expect(chunks[0]).toEqual({
         type: 'system',
-        content: '\u274C File change failed: Disk full',
+        content: '[X] File change failed: Disk full',
       });
       expect(mockLogger.warn).toHaveBeenCalledWith(
         expect.objectContaining({ status: 'failed' }),
@@ -442,7 +442,7 @@ describe('CodexProvider', () => {
 
       expect(chunks[0]).toEqual({
         type: 'system',
-        content: '\u274C File change failed',
+        content: '[X] File change failed',
       });
     });
 
@@ -473,18 +473,18 @@ describe('CodexProvider', () => {
       }
 
       // First mcp call (in_progress on item.completed): start + empty result
-      expect(chunks[0]).toEqual({ type: 'tool', toolName: '\u{1F50C} MCP: fs/readFile' });
+      expect(chunks[0]).toEqual({ type: 'tool', toolName: '[MCP] fs/readFile' });
       expect(chunks[1]).toEqual({
         type: 'tool_result',
-        toolName: '\u{1F50C} MCP: fs/readFile',
+        toolName: '[MCP] fs/readFile',
         toolOutput: '',
       });
       // Second mcp call (failed): start + error result so the UI card closes
-      expect(chunks[2]).toEqual({ type: 'tool', toolName: '\u{1F50C} MCP: fs/readFile' });
+      expect(chunks[2]).toEqual({ type: 'tool', toolName: '[MCP] fs/readFile' });
       expect(chunks[3]).toEqual({
         type: 'tool_result',
-        toolName: '\u{1F50C} MCP: fs/readFile',
-        toolOutput: '\u274C Error: Permission denied',
+        toolName: '[MCP] fs/readFile',
+        toolOutput: '[ERROR]: Permission denied',
       });
       expect(mockLogger.warn).toHaveBeenCalledWith(
         expect.objectContaining({ server: 'fs', tool: 'readFile' }),
@@ -516,22 +516,22 @@ describe('CodexProvider', () => {
         chunks.push(chunk);
       }
 
-      expect(chunks[0]).toEqual({ type: 'tool', toolName: '\u{1F50C} MCP: readFile' });
+      expect(chunks[0]).toEqual({ type: 'tool', toolName: '[MCP] readFile' });
       expect(chunks[1]).toEqual({
         type: 'tool_result',
-        toolName: '\u{1F50C} MCP: readFile',
+        toolName: '[MCP] readFile',
         toolOutput: '',
       });
-      expect(chunks[2]).toEqual({ type: 'tool', toolName: '\u{1F50C} MCP: fs' });
+      expect(chunks[2]).toEqual({ type: 'tool', toolName: '[MCP] fs' });
       expect(chunks[3]).toEqual({
         type: 'tool_result',
-        toolName: '\u{1F50C} MCP: fs',
+        toolName: '[MCP] fs',
         toolOutput: '',
       });
-      expect(chunks[4]).toEqual({ type: 'tool', toolName: '\u{1F50C} MCP: MCP tool' });
+      expect(chunks[4]).toEqual({ type: 'tool', toolName: '[MCP] MCP tool' });
       expect(chunks[5]).toEqual({
         type: 'tool_result',
-        toolName: '\u{1F50C} MCP: MCP tool',
+        toolName: '[MCP] MCP tool',
         toolOutput: '',
       });
     });
@@ -552,11 +552,11 @@ describe('CodexProvider', () => {
         chunks.push(chunk);
       }
 
-      expect(chunks[0]).toEqual({ type: 'tool', toolName: '\u{1F50C} MCP: db/query' });
+      expect(chunks[0]).toEqual({ type: 'tool', toolName: '[MCP] db/query' });
       expect(chunks[1]).toEqual({
         type: 'tool_result',
-        toolName: '\u{1F50C} MCP: db/query',
-        toolOutput: '\u274C Error: MCP tool failed',
+        toolName: '[MCP] db/query',
+        toolOutput: '[ERROR]: MCP tool failed',
       });
     });
 
@@ -583,10 +583,10 @@ describe('CodexProvider', () => {
       }
 
       expect(chunks).toHaveLength(3);
-      expect(chunks[0]).toEqual({ type: 'tool', toolName: '\u{1F50C} MCP: fs/readFile' });
+      expect(chunks[0]).toEqual({ type: 'tool', toolName: '[MCP] fs/readFile' });
       expect(chunks[1]).toEqual({
         type: 'tool_result',
-        toolName: '\u{1F50C} MCP: fs/readFile',
+        toolName: '[MCP] fs/readFile',
         toolOutput: JSON.stringify([{ type: 'text', text: 'file contents' }]),
       });
       expect(chunks[2]).toEqual({
@@ -1215,7 +1215,11 @@ describe('CodexProvider', () => {
       await expect(consumeGenerator()).rejects.toThrow(
         'Model "gpt-5.3-codex" is not available for your account'
       );
-      await expect(consumeGenerator()).rejects.toThrow('model: gpt-5.2-codex');
+      // PR #165 repointed CODEX_MODEL_FALLBACKS['gpt-5.3-codex'] to
+      // CODEX_DEFAULT_MODEL ('gpt-5.5'); this assertion was stale and failed
+      // against live code -- re-aligned by
+      // WO-HARNESS-CODEX-THREAD-RESUME-AND-FAILBACK-01 (test file is in scope).
+      await expect(consumeGenerator()).rejects.toThrow('model: gpt-5.5');
     });
 
     test('uses generic dashboard guidance when fallback mapping is unknown', async () => {
@@ -1535,7 +1539,7 @@ describe('CodexProvider', () => {
   });
 });
 
-// ─── Behavioral regression tests (black-box via sendQuery) ───────────────
+// --- Behavioral regression tests (black-box via sendQuery) ---------------
 
 describe('sendQuery decomposition behaviors', () => {
   let client: CodexProvider;
@@ -1636,4 +1640,221 @@ describe('sendQuery decomposition behaviors', () => {
     expect(systemChunks.length).toBeGreaterThanOrEqual(1);
     expect(systemChunks.some(c => c.type === 'system' && c.content.includes('Task 1'))).toBe(true);
   }, 5_000);
+});
+
+// --- WO-HARNESS-CODEX-THREAD-RESUME-AND-FAILBACK-01 regression tests ----
+//
+// These three scenarios anchor the WO's bug fix: a runtime "thread/resume
+// failed: no rollout found" error from the codex binary must NOT classify as
+// auth, must self-heal once with a fresh thread, and -- when terminal --
+// must delegate to an injected Claude failback provider with disclosure
+// rather than blocking the review gate.
+describe('WO-HARNESS-CODEX-THREAD-RESUME-AND-FAILBACK-01', () => {
+  let client: CodexProvider;
+
+  beforeEach(() => {
+    resetCodexSingleton();
+    client = new CodexProvider({ retryBaseDelayMs: 1 });
+    MockCodex.mockClear();
+    mockStartThread.mockClear();
+    mockResumeThread.mockClear();
+    mockRunStreamed.mockClear();
+    mockLogger.info.mockClear();
+    mockLogger.warn.mockClear();
+    mockLogger.error.mockClear();
+    mockLogger.debug.mockClear();
+    mockRefreshIfAuthFailed.mockClear();
+    mockRefreshIfAuthFailed.mockResolvedValue({
+      refreshed: false,
+      reason: 'no_creds' as const,
+    });
+
+    mockStartThread.mockReturnValue(createMockThread('new-thread-id'));
+    mockResumeThread.mockReturnValue(createMockThread('resumed-thread-id'));
+  });
+
+  test('Scenario 1: rollout-missing at runtime self-heals to a fresh thread', async () => {
+    // Codex binary emits this exact shape: a subprocess crash whose stderr
+    // surfaces the rollout-missing message. Resume builds a thread object OK
+    // (resumeThread succeeds synchronously), then runStreamed throws at
+    // streaming time. The runtime self-heal must catch this, emit the
+    // "rollout missing" warning, start a fresh thread, and retry the turn.
+    let callCount = 0;
+    mockRunStreamed.mockImplementation(() => {
+      callCount++;
+      if (callCount === 1) {
+        return Promise.reject(
+          new Error(
+            'Codex Exec exited with code 1: thread/resume failed: no rollout found for thread id abc-123'
+          )
+        );
+      }
+      return Promise.resolve({
+        events: (async function* () {
+          yield { type: 'turn.completed', usage: defaultUsage };
+        })(),
+      });
+    });
+    mockStartThread.mockReturnValue(createMockThread('fresh-thread-after-rollout-restart'));
+
+    const chunks = [];
+    for await (const chunk of client.sendQuery('test prompt', '/workspace', 'abc-123')) {
+      chunks.push(chunk);
+    }
+
+    // Resume was attempted, then a fresh thread was started for the restart.
+    expect(mockResumeThread).toHaveBeenCalledWith('abc-123', expect.any(Object));
+    expect(mockStartThread).toHaveBeenCalled();
+    // Two runStreamed calls: first failed, second succeeded on fresh thread.
+    expect(mockRunStreamed).toHaveBeenCalledTimes(2);
+    // The user-facing disclosure must mention rollout-missing self-heal.
+    const systemChunk = chunks.find(
+      c => c.type === 'system' && c.content.includes('rollout missing')
+    );
+    expect(systemChunk).toBeDefined();
+    // A result chunk must be present (the turn completed after the fresh thread).
+    const resultChunk = chunks.find(c => c.type === 'result');
+    expect(resultChunk).toBeDefined();
+    // The error message must NEVER carry the "Codex auth error:" prefix on this path.
+    // (We assert on the thrown-error type via the fact the generator did not throw,
+    // but if it had thrown, the enriched prefix would be carried to the consumer.)
+  });
+
+  test('Scenario 2: misclassification guard -- rollout-missing is NOT auth', async () => {
+    // Behavioral table test: drive sendQuery with three distinct error
+    // messages, capture the thrown enriched error prefix, and verify which
+    // class the classifier assigned.
+    //
+    // The runtime rollout restart only fires on attempt === 0 AND when a
+    // resumeSessionId was provided. For the rollout-classification probes
+    // we pass NO resumeSessionId so the restart guard is skipped and the
+    // error flows straight to classifyAndEnrichCodexError on the first
+    // attempt. We then read the thrown error's prefix.
+    type Case = { msg: string; expectAuth: boolean; label: string };
+    const cases: Case[] = [
+      {
+        msg: 'thread/resume failed: no rollout found for thread id abc',
+        expectAuth: false,
+        label: 'rollout-missing bare',
+      },
+      {
+        msg: 'Codex Exec exited with code 1: thread/resume failed: no rollout found for thread id xyz',
+        expectAuth: false,
+        label: 'rollout-missing combined with crash signal',
+      },
+      {
+        msg: '401 unauthorized: invalid api key',
+        expectAuth: true,
+        label: 'genuine auth error',
+      },
+    ];
+
+    for (const c of cases) {
+      mockStartThread.mockClear();
+      mockResumeThread.mockClear();
+      mockRunStreamed.mockClear();
+      mockRunStreamed.mockRejectedValue(new Error(c.msg));
+      mockStartThread.mockReturnValue(createMockThread('thread-for-table-test'));
+
+      const consume = async (): Promise<void> => {
+        for await (const _ of client.sendQuery('test', '/workspace')) {
+          // consume
+        }
+      };
+
+      const err = (await consume().catch(e => e as Error)) as Error;
+      expect(err).toBeInstanceOf(Error);
+      if (c.expectAuth) {
+        expect(err.message).toMatch(/Codex auth error:/);
+      } else {
+        // Rollout-missing must NOT be misclassified as auth. It is crash-class.
+        expect(err.message).not.toMatch(/Codex auth error:/);
+        expect(err.message).toMatch(/Codex crash:/);
+      }
+    }
+  });
+
+  test('Scenario 3: terminal Codex failure -> Claude failback with disclosure', async () => {
+    // All Codex runStreamed attempts reject with a persistent crash; the
+    // configured failback factory returns a mock provider that yields one
+    // assistant chunk + one result chunk. The generator must:
+    //   1. Emit a [CODEX FAILBACK] disclosure mentioning "adversarial"
+    //   2. Invoke the failback provider's sendQuery exactly once
+    //   3. Stream the failback provider's chunks through to the consumer
+    //   4. Return normally (NOT throw)
+    mockRunStreamed.mockRejectedValue(
+      new Error('codex exec exited with code 1: persistent subprocess crash')
+    );
+
+    const failbackSendQuery = mock(async function* (
+      _p: string,
+      _c: string,
+      _r?: string,
+      _o?: unknown
+    ) {
+      yield { type: 'assistant', content: 'Claude failback review verdict' } as const;
+      yield {
+        type: 'result',
+        sessionId: 'claude-failback-session',
+        tokens: { input: 100, output: 50 },
+      } as const;
+    });
+
+    const failbackProvider = {
+      sendQuery: failbackSendQuery,
+      getType: () => 'claude',
+      getCapabilities: () => ({}) as unknown as ReturnType<CodexProvider['getCapabilities']>,
+    };
+
+    const factoryCalls = mock(() => failbackProvider);
+    const clientWithFailback = new CodexProvider({
+      retryBaseDelayMs: 1,
+      failbackProviderFactory: factoryCalls as unknown as () => typeof failbackProvider,
+    });
+
+    const chunks: { type: string; content?: string }[] = [];
+    for await (const chunk of clientWithFailback.sendQuery('review this diff', '/workspace')) {
+      chunks.push(chunk as { type: string; content?: string });
+    }
+
+    // Failback factory invoked at least once (and we expect exactly once for
+    // a single sendQuery call -- the lazy factory is invoked when retries
+    // exhaust).
+    expect(factoryCalls).toHaveBeenCalled();
+    expect(failbackSendQuery).toHaveBeenCalledTimes(1);
+
+    // Disclosure chunk present and mentions both CODEX FAILBACK and the
+    // adversarial-value warning (the WO's required language).
+    const disclosure = chunks.find(
+      c => c.type === 'system' && c.content?.includes('CODEX FAILBACK')
+    );
+    expect(disclosure).toBeDefined();
+    expect(disclosure!.content).toMatch(/adversarial/i);
+
+    // Claude's verdict streamed through.
+    expect(
+      chunks.some(c => c.type === 'assistant' && c.content === 'Claude failback review verdict')
+    ).toBe(true);
+    // Generator returned a final result without throwing.
+    expect(chunks.some(c => c.type === 'result')).toBe(true);
+  }, 10_000);
+
+  test('Scenario 3b: terminal Codex with NO failback factory still throws', async () => {
+    // Without a failback factory wired, the provider must preserve its
+    // historical contract: terminal Codex failures throw. This guards
+    // against the failback path becoming the silent default.
+    mockRunStreamed.mockRejectedValue(
+      new Error('codex exec exited with code 1: persistent subprocess crash')
+    );
+
+    const clientNoFailback = new CodexProvider({ retryBaseDelayMs: 1 });
+
+    const consume = async (): Promise<void> => {
+      for await (const _ of clientNoFailback.sendQuery('test', '/workspace')) {
+        // consume
+      }
+    };
+
+    await expect(consume()).rejects.toThrow(/Codex crash/);
+  }, 10_000);
 });
