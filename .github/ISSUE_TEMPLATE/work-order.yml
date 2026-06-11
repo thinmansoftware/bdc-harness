@@ -1,0 +1,210 @@
+# =============================================================================
+# BDC Work Order -- GitHub-native issue form (Cauldron 2.0 P1)
+# =============================================================================
+# Encodes the 12-section WO template (~/.claude/reference/wo-recipe.md).
+# GitHub Issues are the system of record for work (Cauldron 2.0 brief,
+# Section 1) -- there is no Notion mirror. A WO missing any required section
+# is invalid; intake validation runs against this template at issue creation,
+# not at fire time.
+# ASCII only in this file.
+# =============================================================================
+name: Work Order
+description: File a Blue Devil Work Order (12-section spec, wo-recipe.md). Issues filed here ARE the WO queue.
+title: "WO-"
+labels:
+  - wo
+  - needs-spec-review
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Title must be the WO ID** (e.g. `WO-CICD-EXAMPLE-01`). All 12 sections below come from
+        `~/.claude/reference/wo-recipe.md`. A WO missing any required section is invalid.
+        Behavior spec must exist BEFORE the WO -- if it does not, STOP and write it first.
+
+  - type: dropdown
+    id: wo-class
+    attributes:
+      label: WO Class
+      description: Determines the validation evidence Captain CI requires (Rule 14).
+      options:
+        - CODE
+        - INFRA
+        - MIXED
+      default: 0
+    validations:
+      required: true
+
+  - type: dropdown
+    id: priority
+    attributes:
+      label: Priority
+      options:
+        - p0
+        - p1
+        - p2
+        - p3
+      default: 1
+    validations:
+      required: true
+
+  - type: input
+    id: builder
+    attributes:
+      label: Builder
+      description: Major Build, Captain CI, General, XO, or Any.
+      placeholder: "Any"
+    validations:
+      required: true
+
+  - type: textarea
+    id: objective
+    attributes:
+      label: 1. Objective
+      description: One clear sentence describing the OUTCOME being built. No implementation detail, no multiple features.
+      placeholder: "Replicate the LSPRO Import Center inside the React dashboard with identical behavior."
+    validations:
+      required: true
+
+  - type: textarea
+    id: behavior-source
+    attributes:
+      label: 2. Behavior Source of Truth
+      description: Path + version of the behavior spec that defines the system. If no behavior spec exists, STOP -- write the behavior spec first.
+      placeholder: |
+        oracle-seed/behavior-specs/LSPRO/IMPORT_CENTER_BEHAVIOR.md
+        version: v1
+    validations:
+      required: true
+
+  - type: textarea
+    id: prior-art
+    attributes:
+      label: 3. Prior Art Check
+      description: "Does similar code already exist? List files. State the decision explicitly: Extend, Replace, or Verify parity."
+      placeholder: |
+        Existing implementation: GAS Import Center
+        Files: ImportCenter.gs, ImportParser.gs
+        Decision: Replace GAS UI with React UI while preserving backend behavior.
+    validations:
+      required: true
+
+  - type: textarea
+    id: system-context
+    attributes:
+      label: 4. System Context
+      description: Subsystem this WO lives in and its dependencies. Prevents builders from guessing integration points.
+      placeholder: |
+        Subsystem: LSPRO Import System
+        Dependencies: Inventory System, Distributor Import Pipeline, Drive Storage
+    validations:
+      required: true
+
+  - type: textarea
+    id: ui-hierarchy
+    attributes:
+      label: 5. UI Hierarchy (if UI involved)
+      description: Exact component tree for any UI work. Flat feature lists are NOT allowed. Write "N/A -- no UI" for non-UI WOs.
+      placeholder: |
+        Import Center Page
+          Card: Import Type
+            - Button Row
+          Footer
+            - Cancel
+            - Import
+    validations:
+      required: true
+
+  - type: textarea
+    id: mode-matrix
+    attributes:
+      label: 6. Mode Behavior Matrix
+      description: Markdown table of modes vs behavior for any system with modes. Write "N/A -- no modes" if the system has a single mode.
+      placeholder: |
+        | Mode | File Types | Sources | Preview | Button |
+        |------|-----------|---------|---------|--------|
+        | COLLECTION_CSV | .csv .xlsx | Drive, Local | Column map | Import |
+    validations:
+      required: true
+
+  - type: textarea
+    id: backend-functions
+    attributes:
+      label: 7. Backend Function Inventory
+      description: Every function/endpoint touched, each labeled EXISTING or NEW. Invented functions are a rejection.
+      placeholder: |
+        EXISTING: importCenterDrivePreview()
+        NEW: POST /api/imports/preview
+    validations:
+      required: true
+
+  - type: textarea
+    id: data-flow
+    attributes:
+      label: 8. Data Flow
+      description: Concrete step-by-step flow of data through the system. Abstract flows are NOT allowed.
+      placeholder: |
+        User selects file
+          -> POST /api/imports/preview
+          -> server parses CSV
+          -> preview rows returned
+    validations:
+      required: true
+
+  - type: textarea
+    id: schema-references
+    attributes:
+      label: 9. Database Schema References
+      description: Exact table and column names from a live schema audit (information_schema), not from migration files. Write "N/A -- no database surface" if none.
+      placeholder: |
+        Table: inventory_items
+        Columns used: inventory_item_id, series_id, price_cents
+    validations:
+      required: true
+
+  - type: textarea
+    id: deploy-target
+    attributes:
+      label: 10. Deploy Target
+      description: "Where the code runs: repo, container, port. Allowed targets: React Dashboard, ShopOps API, n8n Workflow, WordPress Plugin, BDC Docker Service. (GAS is DEPRECATED -- no new .gs work.)"
+      placeholder: |
+        API Server container: shopops-api, port 3402
+    validations:
+      required: true
+
+  - type: textarea
+    id: test-scenarios
+    attributes:
+      label: 11. Test Scenarios
+      description: Concrete Given/When/Then tests -- success case, validation case, and edge case all required.
+      placeholder: |
+        Test: CSV Import
+        Given: CSV with columns [Title, Issue, Price]
+        When: User uploads file
+        Then: Preview shows 5 rows
+    validations:
+      required: true
+
+  - type: textarea
+    id: stop-conditions
+    attributes:
+      label: 12. Stop Conditions (Completion Criteria)
+      description: "Must be executable commands or Given/When/Then, never prose descriptions. Every stop condition is a CI test Captain CI runs to close this issue -- if CI cannot execute it without human interpretation, the WO is invalid. Wrong: 'staging accessible'. Right: 'curl https://staging.livesellerpro.app returns HTTP 200 and contains <div id=root>'."
+      placeholder: |
+        Test: Staging Accessible
+        Given: Deploy script has run
+        When: curl https://staging.livesellerpro.app
+        Then: HTTP 200, response contains <div id="root">
+          If: HTTP != 200 -> FAIL
+    validations:
+      required: true
+
+  - type: textarea
+    id: references
+    attributes:
+      label: References
+      description: Briefs, behavior specs, prior WOs, Oracle hits consulted (Rule 5.6).
+      placeholder: |
+        BDC_XO/briefs/2026-06-10-cauldron-2-design.md
+    validations:
+      required: false
