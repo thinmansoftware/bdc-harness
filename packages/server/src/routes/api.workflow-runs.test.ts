@@ -275,6 +275,47 @@ const MOCK_PAUSED_INTERACTIVE_RUN: MockWorkflowRun = {
   },
 };
 
+// Standard (non-loop) approval-gate pause, mirroring bdc-harness-wo-onramp's
+// `approval-gate` node. The onramp incident (run 032da37, 2026-06-09) paused
+// here and a re-submitted Approve must be idempotent, not a confusing 400.
+const MOCK_PAUSED_STANDARD_RUN: MockWorkflowRun = {
+  ...MOCK_RUNNING_RUN,
+  id: 'run-uuid-standard-approval',
+  workflow_name: 'bdc-harness-wo-onramp',
+  conversation_id: 'worker-conv-uuid',
+  parent_conversation_id: 'parent-conv-uuid',
+  status: 'paused',
+  completed_at: null,
+  user_message: 'On-ramp the WO',
+  working_path: '/tmp/worktrees/onramp',
+  metadata: {
+    approval: {
+      nodeId: 'approval-gate',
+      message: 'Review the pre-fire packet above.',
+      type: 'approval',
+    },
+  },
+};
+
+// Same run AFTER a successful approve: the approve route flips status to the
+// 'failed' auto-resume sentinel and records approval_response=approved. A
+// duplicate click (the user clicking again because the UI looked stuck) lands
+// here and MUST be treated as already-approved, not rejected with a 400.
+const MOCK_ALREADY_APPROVED_RUN: MockWorkflowRun = {
+  ...MOCK_PAUSED_STANDARD_RUN,
+  status: 'failed',
+  metadata: {
+    approval: {
+      nodeId: 'approval-gate',
+      message: 'Review the pre-fire packet above.',
+      type: 'approval',
+    },
+    approval_response: 'approved',
+    rejection_reason: '',
+    rejection_count: 0,
+  },
+};
+
 const MOCK_PENDING_RUN: MockWorkflowRun = {
   ...MOCK_RUNNING_RUN,
   id: 'run-uuid-3',
@@ -768,6 +809,59 @@ describe('POST /api/workflows/runs/:runId/approve', () => {
       metadata: { loop_user_input: 'approved' },
     });
     expect(mockExecuteWorkflow).not.toHaveBeenCalled();
+  });
+
+  // WO-MC-APPROVE-GATE-RELIABILITY-01: idempotency. The 2026-06-09 onramp
+  // incident showed users re-clicking Approve when the UI looked stuck. A
+  // duplicate approve on an already-approved run previously returned 400
+  // "Cannot approve workflow in 'failed' status" -- indistinguishable from a
+  // real failure. It must now report success (already approved) and NOT write
+  // a second approval_received event.
+  test('idempotent: re-approving an already-approved run returns success, no duplicate event', async () => {
+    mockGetWorkflowRun.mockImplementationOnce(async () => MOCK_ALREADY_APPROVED_RUN);
+
+    const { app } = makeApp();
+    const response = await app.request('/api/workflows/runs/run-uuid-standard-approval/approve', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ comment: 'approved' }),
+    });
+
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { success: boolean; message: string };
+    expect(body.success).toBe(true);
+    expect(body.message).toMatch(/already approved/i);
+    // No new approval_received event written on the duplicate.
+    const approvalReceivedCalls = mockCreateWorkflowEvent.mock.calls.filter(
+      call => (call[0] as { event_type?: string }).event_type === 'approval_received'
+    );
+    expect(approvalReceivedCalls.length).toBe(0);
+    // Status is NOT re-mutated on the duplicate.
+    expect(mockUpdateWorkflowRun).not.toHaveBeenCalled();
+  });
+
+  // WO-MC-APPROVE-GATE-RELIABILITY-01: a standard (non-loop) approval gate --
+  // the exact shape the onramp run paused on -- records approval_received and
+  // a node_completed exactly once on the first submit.
+  test('standard approval gate records approval_received once on first submit', async () => {
+    mockGetWorkflowRun.mockImplementationOnce(async () => MOCK_PAUSED_STANDARD_RUN);
+    mockGetConversationById.mockImplementation(async () => null); // no auto-resume; just record
+
+    const { app } = makeApp();
+    const response = await app.request('/api/workflows/runs/run-uuid-standard-approval/approve', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ comment: 'Approved' }),
+    });
+
+    expect(response.status).toBe(200);
+    const approvalReceivedCalls = mockCreateWorkflowEvent.mock.calls.filter(
+      call => (call[0] as { event_type?: string }).event_type === 'approval_received'
+    );
+    expect(approvalReceivedCalls.length).toBe(1);
+    expect((approvalReceivedCalls[0]?.[0] as { step_name?: string }).step_name).toBe(
+      'approval-gate'
+    );
   });
 });
 
