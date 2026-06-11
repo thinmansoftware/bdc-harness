@@ -1839,6 +1839,92 @@ describe('WO-HARNESS-CODEX-THREAD-RESUME-AND-FAILBACK-01', () => {
     expect(chunks.some(c => c.type === 'result')).toBe(true);
   }, 10_000);
 
+  test('Scenario 3c: failback strips nested nodeConfig model fields (no gpt id reaches Claude)', async () => {
+    // MAJOR 1 (adversarial re-review 2026-06-10): buildFailbackOptions must
+    // strip not only top-level model fields but also nodeConfig.fallbackModel
+    // and nodeConfig.agents[*].model -- those carry Codex (gpt-*) ids that
+    // ClaudeProvider.applyNodeConfig would otherwise feed back into the Claude
+    // SDK on failback, reopening the model-leak BLOCKER 1 closed.
+    mockRunStreamed.mockRejectedValue(
+      new Error('codex exec exited with code 1: persistent subprocess crash')
+    );
+
+    type ReceivedOpts = {
+      model?: string;
+      nodeConfig?: {
+        fallbackModel?: string;
+        agents?: Record<string, { prompt?: string; model?: string }>;
+      };
+    };
+    let receivedOptions: ReceivedOpts | undefined;
+    const failbackSendQuery = mock(async function* (
+      _p: string,
+      _c: string,
+      _r?: string,
+      _o?: unknown
+    ) {
+      receivedOptions = _o as ReceivedOpts;
+      yield { type: 'assistant', content: 'Claude failback review verdict' } as const;
+      yield {
+        type: 'result',
+        sessionId: 'claude-failback-session',
+        tokens: { input: 100, output: 50 },
+      } as const;
+    });
+
+    const failbackProvider = {
+      sendQuery: failbackSendQuery,
+      getType: () => 'claude',
+      getCapabilities: () => ({}) as unknown as ReturnType<CodexProvider['getCapabilities']>,
+    };
+
+    const clientWithFailback = new CodexProvider({
+      retryBaseDelayMs: 1,
+      failbackProviderFactory: (() => failbackProvider) as unknown as () => typeof failbackProvider,
+    });
+
+    const requestOptions = {
+      model: 'gpt-5.5',
+      fallbackModel: 'gpt-5.5',
+      nodeConfig: {
+        fallbackModel: 'gpt-5.5',
+        agents: {
+          'codex-adversarial-reviewer': {
+            description: 'reviewer',
+            prompt: 'review the diff',
+            model: 'gpt-5.5',
+            tools: ['read'],
+          },
+        },
+      },
+    } as unknown as Parameters<CodexProvider['sendQuery']>[3];
+
+    // Drain the generator.
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    for await (const _chunk of clientWithFailback.sendQuery(
+      'review this diff',
+      '/workspace',
+      undefined,
+      requestOptions
+    )) {
+      // no-op
+    }
+
+    expect(failbackSendQuery).toHaveBeenCalledTimes(1);
+    expect(receivedOptions).toBeDefined();
+    // Top-level model fields stripped.
+    expect(receivedOptions!.model).toBeUndefined();
+    // Nested nodeConfig model fields stripped.
+    expect(receivedOptions!.nodeConfig?.fallbackModel).toBeUndefined();
+    expect(
+      receivedOptions!.nodeConfig?.agents?.['codex-adversarial-reviewer']?.model
+    ).toBeUndefined();
+    // Non-model nodeConfig.agents fields preserved (not nuked wholesale).
+    expect(receivedOptions!.nodeConfig?.agents?.['codex-adversarial-reviewer']?.prompt).toBe(
+      'review the diff'
+    );
+  }, 10_000);
+
   test('Scenario 3b: terminal Codex with NO failback factory still throws', async () => {
     // Without a failback factory wired, the provider must preserve its
     // historical contract: terminal Codex failures throw. This guards

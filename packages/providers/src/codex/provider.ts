@@ -256,7 +256,10 @@ function classifyCodexError(
  * Universal-ish fields (abortSignal, outputFormat, env, systemPrompt,
  * maxBudgetUsd, forkSession, persistSession, nodeConfig) are preserved
  * -- Claude understands them, and dropping them would degrade the
- * failback further than necessary.
+ * failback further than necessary. EXCEPTION: nodeConfig's own model
+ * fields (nodeConfig.fallbackModel, nodeConfig.agents[*].model) are
+ * stripped, since those carry Codex (gpt-*) ids that ClaudeProvider
+ * would otherwise feed back into the Claude SDK on failback.
  *
  * Returns undefined when no original options were provided, preserving
  * the existing call-shape for `sendQuery(prompt, cwd, undefined, undefined)`.
@@ -269,6 +272,29 @@ function buildFailbackOptions(original?: SendQueryOptions): SendQueryOptions | u
   void model;
   void fallbackModel;
   void assistantConfig;
+  // Strip nested nodeConfig model fields too. nodeConfig.fallbackModel and
+  // nodeConfig.agents[*].model are Codex (gpt-*) ids; ClaudeProvider's
+  // applyNodeConfig would otherwise read them straight back into the Claude
+  // SDK on failback -- the exact model-leak the top-level strip closes.
+  // Preserve the rest of nodeConfig (prompts, tools, skills, effort, etc).
+  if (rest.nodeConfig) {
+    const { fallbackModel: nodeFallbackModel, agents, ...nodeRest } = rest.nodeConfig;
+    void nodeFallbackModel;
+    rest.nodeConfig = {
+      ...nodeRest,
+      ...(agents
+        ? {
+            agents: Object.fromEntries(
+              Object.entries(agents).map(([id, def]) => {
+                const { model: agentModel, ...defRest } = def;
+                void agentModel;
+                return [id, defRest];
+              })
+            ),
+          }
+        : {}),
+    };
+  }
   return rest;
 }
 
