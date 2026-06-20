@@ -2775,7 +2775,16 @@ async function executeApprovalNode(
     `⏸ **Approval required**: ${renderedMessage}\n\n` +
     `Run ID: \`${workflowRun.id}\`\n` +
     `Approve: \`/workflow approve ${workflowRun.id}\` | Reject: \`/workflow reject ${workflowRun.id}\``;
-  await safeSendMessage(platform, conversationId, approvalMsg, msgContext);
+  // Inline Approve/Reject buttons for platforms that support them (Telegram).
+  // The callbackData words ("approve"/"reject") route through the existing
+  // natural-language approval handler when tapped; other platforms ignore them.
+  await safeSendMessage(platform, conversationId, approvalMsg, msgContext, {
+    category: 'workflow_status',
+    inlineButtons: [
+      { text: '✅ Approve', callbackData: 'approve' },
+      { text: '❌ Reject', callbackData: 'reject' },
+    ],
+  });
 
   deps.store
     .createWorkflowEvent({
