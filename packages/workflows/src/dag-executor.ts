@@ -2786,6 +2786,35 @@ async function executeApprovalNode(
     ],
   });
 
+  // Optional: ALSO push the gate to a fixed Telegram chat (mobile approval) regardless of
+  // which platform the run is on. Gated by TELEGRAM_APPROVAL_CHAT_ID. Buttons carry the
+  // run-scoped command (/workflow approve <id>) so a tap routes to THIS run even from a
+  // chat that is not the run's own conversation. Best-effort: never block/fail the gate.
+  const tgChat = process.env.TELEGRAM_APPROVAL_CHAT_ID;
+  const tgToken = process.env.TELEGRAM_BOT_TOKEN;
+  if (tgChat && tgToken) {
+    void (async (): Promise<void> => {
+      try {
+        await fetch(`https://api.telegram.org/bot${tgToken}/sendMessage`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            chat_id: tgChat,
+            text: `Approval required: ${renderedMessage}\n\nRun ${workflowRun.id}`,
+            reply_markup: {
+              inline_keyboard: [
+                [{ text: '✅ Approve', callback_data: `/workflow approve ${workflowRun.id}` }],
+                [{ text: '❌ Reject', callback_data: `/workflow reject ${workflowRun.id}` }],
+              ],
+            },
+          }),
+        });
+      } catch (err) {
+        getLog().warn({ err, runId: workflowRun.id }, 'approval.telegram_push_failed');
+      }
+    })();
+  }
+
   deps.store
     .createWorkflowEvent({
       workflow_run_id: workflowRun.id,
