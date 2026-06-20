@@ -47,6 +47,12 @@ export interface WorkflowMessageMetadata {
   segment?: 'new' | 'auto';
   workflowDispatch?: { workerConversationId: string; workflowName: string };
   workflowResult?: { workflowName: string; runId: string };
+  /**
+   * Inline action buttons for platforms that support them (Telegram).
+   * Adapters that do not support inline buttons ignore this field.
+   * callbackData is delivered back through the inbound message handler when tapped.
+   */
+  inlineButtons?: { text: string; callbackData: string }[];
 }
 
 // ---------------------------------------------------------------------------

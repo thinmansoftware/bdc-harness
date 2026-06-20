@@ -53,28 +53,46 @@ export class TelegramAdapter implements IPlatformAdapter {
    * - Long messages: Split by paragraphs, format each chunk independently
    *   (paragraphs rarely have formatting that spans across them)
    */
-  async sendMessage(chatId: string, message: string, _metadata?: MessageMetadata): Promise<void> {
+  async sendMessage(chatId: string, message: string, metadata?: MessageMetadata): Promise<void> {
     const id = parseInt(chatId);
     getLog().debug({ chatId, messageLength: message.length }, 'telegram.send_message');
 
+    // Build an inline keyboard from metadata.inlineButtons (one button per row).
+    // Attached only to the (first) chunk so the buttons appear once.
+    const replyMarkup =
+      metadata?.inlineButtons && metadata.inlineButtons.length > 0
+        ? {
+            inline_keyboard: metadata.inlineButtons.map(btn => [
+              { text: btn.text, callback_data: btn.callbackData },
+            ]),
+          }
+        : undefined;
+
     if (message.length <= MAX_LENGTH) {
       // Short message: try MarkdownV2 formatting
-      await this.sendFormattedChunk(id, message);
+      await this.sendFormattedChunk(id, message, replyMarkup);
     } else {
       // Long message: split by paragraphs, format each chunk
       getLog().debug({ messageLength: message.length }, 'telegram.message_splitting');
       const chunks = splitIntoParagraphChunks(message, MAX_LENGTH - 200);
 
-      for (const chunk of chunks) {
-        await this.sendFormattedChunk(id, chunk);
+      for (let ci = 0; ci < chunks.length; ci++) {
+        // Buttons go on the last chunk so they render below the full message
+        const markup = ci === chunks.length - 1 ? replyMarkup : undefined;
+        await this.sendFormattedChunk(id, chunks[ci], markup);
       }
     }
   }
 
   /**
-   * Send a single chunk with MarkdownV2 formatting, with fallback to plain text
+   * Send a single chunk with MarkdownV2 formatting, with fallback to plain text.
+   * Optionally attaches an inline keyboard (reply_markup) for action buttons.
    */
-  private async sendFormattedChunk(id: number, chunk: string): Promise<void> {
+  private async sendFormattedChunk(
+    id: number,
+    chunk: string,
+    replyMarkup?: { inline_keyboard: { text: string; callback_data: string }[][] }
+  ): Promise<void> {
     // If chunk is still too long after paragraph splitting, fall back to plain text
     if (chunk.length > MAX_LENGTH) {
       getLog().debug({ chunkLength: chunk.length }, 'telegram.chunk_too_long_plain_text');
@@ -97,7 +115,10 @@ export class TelegramAdapter implements IPlatformAdapter {
     // Try MarkdownV2 formatting
     const formatted = convertToTelegramMarkdown(chunk);
     try {
-      await this.bot.api.sendMessage(id, formatted, { parse_mode: 'MarkdownV2' });
+      await this.bot.api.sendMessage(id, formatted, {
+        parse_mode: 'MarkdownV2',
+        ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
+      });
       getLog().debug({ chunkLength: chunk.length }, 'telegram.markdownv2_chunk_sent');
     } catch (error) {
       // Fallback to stripped plain text for this chunk
@@ -110,7 +131,9 @@ export class TelegramAdapter implements IPlatformAdapter {
         },
         'telegram.markdownv2_failed'
       );
-      await this.bot.api.sendMessage(id, stripMarkdown(chunk));
+      await this.bot.api.sendMessage(id, stripMarkdown(chunk), {
+        ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
+      });
     }
   }
 
@@ -190,6 +213,41 @@ export class TelegramAdapter implements IPlatformAdapter {
         // In production the server always calls onMessage() before start(); this
         // path only surfaces during development or misconfiguration.
         getLog().debug({ chatId: ctx.chat?.id }, 'telegram.message_dropped_no_handler');
+      }
+    });
+
+    // Inline-button taps (approval gates): deliver the button's callback_data as a
+    // normal message so it flows through the same natural-language approval routing
+    // ("approve" / "reject") that text replies already use.
+    this.bot.on('callback_query:data', async ctx => {
+      const data = ctx.callbackQuery.data;
+
+      // Authorization check - same whitelist as text messages
+      const userId = ctx.from?.id;
+      if (!isUserAuthorized(userId, this.allowedUserIds)) {
+        const maskedId = userId !== undefined ? `${String(userId).slice(0, 4)}***` : 'unknown';
+        getLog().info({ maskedUserId: maskedId }, 'telegram.unauthorized_callback');
+        try {
+          await ctx.answerCallbackQuery({ text: 'Not authorized' });
+        } catch {
+          // best-effort ack
+        }
+        return;
+      }
+
+      // Acknowledge the tap so Telegram clears the button's loading spinner.
+      try {
+        await ctx.answerCallbackQuery({ text: `Received: ${data}` });
+      } catch {
+        // best-effort ack; routing proceeds regardless
+      }
+
+      if (this.messageHandler && data) {
+        const conversationId = this.getConversationId(ctx);
+        getLog().info({ conversationId, action: data }, 'telegram.callback_query_routed');
+        void this.messageHandler({ conversationId, message: data, userId });
+      } else {
+        getLog().debug({ chatId: ctx.chat?.id }, 'telegram.callback_dropped_no_handler');
       }
     });
 
