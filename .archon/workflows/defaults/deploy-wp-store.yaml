@@ -49,6 +49,26 @@ nodes:
   name: Validate Request
   bash: |
     set -euo pipefail
+
+    # --- ssh + docker-provider bootstrap (nodes isolated; needed for terraform docker ssh://) ---
+    export SSH_KEY_PATH=/tmp/claude_exec_key
+    export HETZNER_HOST=5.78.86.90
+    export HETZNER_USER=claude
+    if [ ! -f /tmp/claude_exec_key ]; then printf '%s' "$HETZNER_SSH_KEY_B64" | base64 -d > /tmp/claude_exec_key; chmod 600 /tmp/claude_exec_key; fi
+    mkdir -p ~/.ssh; chmod 700 ~/.ssh
+    ssh-keyscan -H 5.78.86.90 >> ~/.ssh/known_hosts 2>/dev/null || true
+    if ! grep -q "Host 5.78.86.90" ~/.ssh/config 2>/dev/null; then
+      { printf '
+    '; printf 'Host 5.78.86.90
+    '; printf '  User claude
+    '; printf '  IdentityFile /tmp/claude_exec_key
+    '; printf '  StrictHostKeyChecking accept-new
+    '; printf '  ConnectTimeout 10
+    '; } >> ~/.ssh/config
+      chmod 600 ~/.ssh/config
+    fi
+    # --- end bootstrap ---
+
     echo "[validate] Validating WP Store Factory request..."
     echo "[validate] tenant_slug    = ${input.tenant_slug}"
     echo "[validate] primary_domain = ${input.primary_domain}"
@@ -91,6 +111,20 @@ nodes:
     export HETZNER_USER=claude
     if [ ! -f /tmp/claude_exec_key ]; then printf '%s' "$HETZNER_SSH_KEY_B64" | base64 -d > /tmp/claude_exec_key; chmod 600 /tmp/claude_exec_key; fi
     # --- end ssh key bootstrap ---
+    # Docker TF provider uses ssh://claude@host (no -i flag) -- needs ~/.ssh/config + known_hosts
+    mkdir -p ~/.ssh; chmod 700 ~/.ssh
+    ssh-keyscan -H 5.78.86.90 >> ~/.ssh/known_hosts 2>/dev/null || true
+    if ! grep -q "Host 5.78.86.90" ~/.ssh/config 2>/dev/null; then
+      { printf '
+    '; printf 'Host 5.78.86.90
+    '; printf '  User claude
+    '; printf '  IdentityFile /tmp/claude_exec_key
+    '; printf '  StrictHostKeyChecking accept-new
+    '; printf '  ConnectTimeout 10
+    '; } >> ~/.ssh/config
+      chmod 600 ~/.ssh/config
+    fi
+
 
 
     # env: blocks do NOT substitute ${input.X}; build the path from the injected INPUT_ env var
@@ -147,6 +181,20 @@ nodes:
     export HETZNER_USER=claude
     if [ ! -f /tmp/claude_exec_key ]; then printf '%s' "$HETZNER_SSH_KEY_B64" | base64 -d > /tmp/claude_exec_key; chmod 600 /tmp/claude_exec_key; fi
     # --- end ssh key bootstrap ---
+    # Docker TF provider uses ssh://claude@host (no -i flag) -- needs ~/.ssh/config + known_hosts
+    mkdir -p ~/.ssh; chmod 700 ~/.ssh
+    ssh-keyscan -H 5.78.86.90 >> ~/.ssh/known_hosts 2>/dev/null || true
+    if ! grep -q "Host 5.78.86.90" ~/.ssh/config 2>/dev/null; then
+      { printf '
+    '; printf 'Host 5.78.86.90
+    '; printf '  User claude
+    '; printf '  IdentityFile /tmp/claude_exec_key
+    '; printf '  StrictHostKeyChecking accept-new
+    '; printf '  ConnectTimeout 10
+    '; } >> ~/.ssh/config
+      chmod 600 ~/.ssh/config
+    fi
+
 
     CONTAINER_NAME="${input.tenant_slug}-wordpress"
     WORKSPACE="/.archon/workspaces/bluedevilcollectibles/${input.tenant_slug}-wp-store"
@@ -213,6 +261,20 @@ nodes:
     export HETZNER_USER=claude
     if [ ! -f /tmp/claude_exec_key ]; then printf '%s' "$HETZNER_SSH_KEY_B64" | base64 -d > /tmp/claude_exec_key; chmod 600 /tmp/claude_exec_key; fi
     # --- end ssh key bootstrap ---
+    # Docker TF provider uses ssh://claude@host (no -i flag) -- needs ~/.ssh/config + known_hosts
+    mkdir -p ~/.ssh; chmod 700 ~/.ssh
+    ssh-keyscan -H 5.78.86.90 >> ~/.ssh/known_hosts 2>/dev/null || true
+    if ! grep -q "Host 5.78.86.90" ~/.ssh/config 2>/dev/null; then
+      { printf '
+    '; printf 'Host 5.78.86.90
+    '; printf '  User claude
+    '; printf '  IdentityFile /tmp/claude_exec_key
+    '; printf '  StrictHostKeyChecking accept-new
+    '; printf '  ConnectTimeout 10
+    '; } >> ~/.ssh/config
+      chmod 600 ~/.ssh/config
+    fi
+
 
 
     # Halt cleanly if idempotency gate detected an existing tenant
@@ -357,6 +419,26 @@ nodes:
   - generate-tfvars
   bash: |
     set -euo pipefail
+
+    # --- ssh + docker-provider bootstrap (nodes isolated; needed for terraform docker ssh://) ---
+    export SSH_KEY_PATH=/tmp/claude_exec_key
+    export HETZNER_HOST=5.78.86.90
+    export HETZNER_USER=claude
+    if [ ! -f /tmp/claude_exec_key ]; then printf '%s' "$HETZNER_SSH_KEY_B64" | base64 -d > /tmp/claude_exec_key; chmod 600 /tmp/claude_exec_key; fi
+    mkdir -p ~/.ssh; chmod 700 ~/.ssh
+    ssh-keyscan -H 5.78.86.90 >> ~/.ssh/known_hosts 2>/dev/null || true
+    if ! grep -q "Host 5.78.86.90" ~/.ssh/config 2>/dev/null; then
+      { printf '
+    '; printf 'Host 5.78.86.90
+    '; printf '  User claude
+    '; printf '  IdentityFile /tmp/claude_exec_key
+    '; printf '  StrictHostKeyChecking accept-new
+    '; printf '  ConnectTimeout 10
+    '; } >> ~/.ssh/config
+      chmod 600 ~/.ssh/config
+    fi
+    # --- end bootstrap ---
+
     echo "[tf-fmt] Running terraform fmt -check on wp-store root..."
     terraform -chdir=infra/terraform/roots/wp-store fmt -check -recursive
     echo "[tf-fmt] Format check PASSED."
@@ -429,6 +511,20 @@ nodes:
     export HETZNER_USER=claude
     if [ ! -f /tmp/claude_exec_key ]; then printf '%s' "$HETZNER_SSH_KEY_B64" | base64 -d > /tmp/claude_exec_key; chmod 600 /tmp/claude_exec_key; fi
     # --- end ssh key bootstrap ---
+    # Docker TF provider uses ssh://claude@host (no -i flag) -- needs ~/.ssh/config + known_hosts
+    mkdir -p ~/.ssh; chmod 700 ~/.ssh
+    ssh-keyscan -H 5.78.86.90 >> ~/.ssh/known_hosts 2>/dev/null || true
+    if ! grep -q "Host 5.78.86.90" ~/.ssh/config 2>/dev/null; then
+      { printf '
+    '; printf 'Host 5.78.86.90
+    '; printf '  User claude
+    '; printf '  IdentityFile /tmp/claude_exec_key
+    '; printf '  StrictHostKeyChecking accept-new
+    '; printf '  ConnectTimeout 10
+    '; } >> ~/.ssh/config
+      chmod 600 ~/.ssh/config
+    fi
+
 
     WORKSPACE="/.archon/workspaces/bluedevilcollectibles/${input.tenant_slug}-wp-store"
     SLUG="${input.tenant_slug}"
@@ -506,6 +602,26 @@ nodes:
     TF_VAR_wp_admin_user: ${WP_ADMIN_USER}
   bash: |
     set -euo pipefail
+
+    # --- ssh + docker-provider bootstrap (nodes isolated; needed for terraform docker ssh://) ---
+    export SSH_KEY_PATH=/tmp/claude_exec_key
+    export HETZNER_HOST=5.78.86.90
+    export HETZNER_USER=claude
+    if [ ! -f /tmp/claude_exec_key ]; then printf '%s' "$HETZNER_SSH_KEY_B64" | base64 -d > /tmp/claude_exec_key; chmod 600 /tmp/claude_exec_key; fi
+    mkdir -p ~/.ssh; chmod 700 ~/.ssh
+    ssh-keyscan -H 5.78.86.90 >> ~/.ssh/known_hosts 2>/dev/null || true
+    if ! grep -q "Host 5.78.86.90" ~/.ssh/config 2>/dev/null; then
+      { printf '
+    '; printf 'Host 5.78.86.90
+    '; printf '  User claude
+    '; printf '  IdentityFile /tmp/claude_exec_key
+    '; printf '  StrictHostKeyChecking accept-new
+    '; printf '  ConnectTimeout 10
+    '; } >> ~/.ssh/config
+      chmod 600 ~/.ssh/config
+    fi
+    # --- end bootstrap ---
+
     echo "[tf-validate] Running terraform validate..."
     terraform -chdir=infra/terraform/roots/wp-store validate
     echo "[tf-validate] Validation PASSED."
@@ -521,6 +637,26 @@ nodes:
     TF_VAR_wp_admin_user: ${WP_ADMIN_USER}
   bash: |
     set -euo pipefail
+
+    # --- ssh + docker-provider bootstrap (nodes isolated; needed for terraform docker ssh://) ---
+    export SSH_KEY_PATH=/tmp/claude_exec_key
+    export HETZNER_HOST=5.78.86.90
+    export HETZNER_USER=claude
+    if [ ! -f /tmp/claude_exec_key ]; then printf '%s' "$HETZNER_SSH_KEY_B64" | base64 -d > /tmp/claude_exec_key; chmod 600 /tmp/claude_exec_key; fi
+    mkdir -p ~/.ssh; chmod 700 ~/.ssh
+    ssh-keyscan -H 5.78.86.90 >> ~/.ssh/known_hosts 2>/dev/null || true
+    if ! grep -q "Host 5.78.86.90" ~/.ssh/config 2>/dev/null; then
+      { printf '
+    '; printf 'Host 5.78.86.90
+    '; printf '  User claude
+    '; printf '  IdentityFile /tmp/claude_exec_key
+    '; printf '  StrictHostKeyChecking accept-new
+    '; printf '  ConnectTimeout 10
+    '; } >> ~/.ssh/config
+      chmod 600 ~/.ssh/config
+    fi
+    # --- end bootstrap ---
+
     WORKSPACE="/.archon/workspaces/bluedevilcollectibles/${input.tenant_slug}-wp-store"
     TFVARS_PATH="${WORKSPACE}/generated.tfvars"
     PLAN_PATH="${WORKSPACE}/tfplan-${input.tenant_slug}.bin"
@@ -576,6 +712,26 @@ nodes:
     TF_VAR_wp_admin_user: ${WP_ADMIN_USER}
   bash: |
     set -euo pipefail
+
+    # --- ssh + docker-provider bootstrap (nodes isolated; needed for terraform docker ssh://) ---
+    export SSH_KEY_PATH=/tmp/claude_exec_key
+    export HETZNER_HOST=5.78.86.90
+    export HETZNER_USER=claude
+    if [ ! -f /tmp/claude_exec_key ]; then printf '%s' "$HETZNER_SSH_KEY_B64" | base64 -d > /tmp/claude_exec_key; chmod 600 /tmp/claude_exec_key; fi
+    mkdir -p ~/.ssh; chmod 700 ~/.ssh
+    ssh-keyscan -H 5.78.86.90 >> ~/.ssh/known_hosts 2>/dev/null || true
+    if ! grep -q "Host 5.78.86.90" ~/.ssh/config 2>/dev/null; then
+      { printf '
+    '; printf 'Host 5.78.86.90
+    '; printf '  User claude
+    '; printf '  IdentityFile /tmp/claude_exec_key
+    '; printf '  StrictHostKeyChecking accept-new
+    '; printf '  ConnectTimeout 10
+    '; } >> ~/.ssh/config
+      chmod 600 ~/.ssh/config
+    fi
+    # --- end bootstrap ---
+
     WORKSPACE="/.archon/workspaces/bluedevilcollectibles/${input.tenant_slug}-wp-store"
     PLAN_PATH="${WORKSPACE}/tfplan-${input.tenant_slug}.bin"
 
@@ -606,6 +762,20 @@ nodes:
     export HETZNER_USER=claude
     if [ ! -f /tmp/claude_exec_key ]; then printf '%s' "$HETZNER_SSH_KEY_B64" | base64 -d > /tmp/claude_exec_key; chmod 600 /tmp/claude_exec_key; fi
     # --- end ssh key bootstrap ---
+    # Docker TF provider uses ssh://claude@host (no -i flag) -- needs ~/.ssh/config + known_hosts
+    mkdir -p ~/.ssh; chmod 700 ~/.ssh
+    ssh-keyscan -H 5.78.86.90 >> ~/.ssh/known_hosts 2>/dev/null || true
+    if ! grep -q "Host 5.78.86.90" ~/.ssh/config 2>/dev/null; then
+      { printf '
+    '; printf 'Host 5.78.86.90
+    '; printf '  User claude
+    '; printf '  IdentityFile /tmp/claude_exec_key
+    '; printf '  StrictHostKeyChecking accept-new
+    '; printf '  ConnectTimeout 10
+    '; } >> ~/.ssh/config
+      chmod 600 ~/.ssh/config
+    fi
+
 
     WORKSPACE="/.archon/workspaces/bluedevilcollectibles/${input.tenant_slug}-wp-store"
     SECRETS_ENV="${WORKSPACE}/.generated-secrets.env"
@@ -692,6 +862,20 @@ nodes:
     export HETZNER_USER=claude
     if [ ! -f /tmp/claude_exec_key ]; then printf '%s' "$HETZNER_SSH_KEY_B64" | base64 -d > /tmp/claude_exec_key; chmod 600 /tmp/claude_exec_key; fi
     # --- end ssh key bootstrap ---
+    # Docker TF provider uses ssh://claude@host (no -i flag) -- needs ~/.ssh/config + known_hosts
+    mkdir -p ~/.ssh; chmod 700 ~/.ssh
+    ssh-keyscan -H 5.78.86.90 >> ~/.ssh/known_hosts 2>/dev/null || true
+    if ! grep -q "Host 5.78.86.90" ~/.ssh/config 2>/dev/null; then
+      { printf '
+    '; printf 'Host 5.78.86.90
+    '; printf '  User claude
+    '; printf '  IdentityFile /tmp/claude_exec_key
+    '; printf '  StrictHostKeyChecking accept-new
+    '; printf '  ConnectTimeout 10
+    '; } >> ~/.ssh/config
+      chmod 600 ~/.ssh/config
+    fi
+
 
     WORKSPACE="/.archon/workspaces/bluedevilcollectibles/${input.tenant_slug}-wp-store"
     SLUG="${input.tenant_slug}"
@@ -795,6 +979,26 @@ nodes:
   - evidence-canary
   bash: |
     set -euo pipefail
+
+    # --- ssh + docker-provider bootstrap (nodes isolated; needed for terraform docker ssh://) ---
+    export SSH_KEY_PATH=/tmp/claude_exec_key
+    export HETZNER_HOST=5.78.86.90
+    export HETZNER_USER=claude
+    if [ ! -f /tmp/claude_exec_key ]; then printf '%s' "$HETZNER_SSH_KEY_B64" | base64 -d > /tmp/claude_exec_key; chmod 600 /tmp/claude_exec_key; fi
+    mkdir -p ~/.ssh; chmod 700 ~/.ssh
+    ssh-keyscan -H 5.78.86.90 >> ~/.ssh/known_hosts 2>/dev/null || true
+    if ! grep -q "Host 5.78.86.90" ~/.ssh/config 2>/dev/null; then
+      { printf '
+    '; printf 'Host 5.78.86.90
+    '; printf '  User claude
+    '; printf '  IdentityFile /tmp/claude_exec_key
+    '; printf '  StrictHostKeyChecking accept-new
+    '; printf '  ConnectTimeout 10
+    '; } >> ~/.ssh/config
+      chmod 600 ~/.ssh/config
+    fi
+    # --- end bootstrap ---
+
     WORKSPACE="/.archon/workspaces/bluedevilcollectibles/${input.tenant_slug}-wp-store"
     SLUG="${input.tenant_slug}"
     DOMAIN="${input.primary_domain}"
