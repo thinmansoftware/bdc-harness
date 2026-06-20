@@ -92,8 +92,7 @@ nodes:
   # ====================================================================
   - id: validate-request
     name: Validate Request
-    type: bash
-    script: |
+    bash: |
       set -euo pipefail
       echo "[validate] Validating WP Store Factory request..."
       echo "[validate] tenant_slug    = ${{ inputs.tenant_slug }}"
@@ -130,14 +129,13 @@ nodes:
   # ====================================================================
   - id: preflight
     name: Hetzner Preflight
-    type: bash
     depends_on: [validate-request]
     env:
       HETZNER_HOST: "5.78.86.90"
       HETZNER_USER: "claude"
       SSH_KEY_PATH: "/run/secrets/claude_exec_key"
       PREFLIGHT_ARTIFACT_PATH: "/.archon/workspaces/bluedevilcollectibles/${{ inputs.tenant_slug }}-wp-store/preflight.env"
-    script: |
+    bash: |
       set -euo pipefail
 
       # Write SSH private key from secret to expected path
@@ -166,11 +164,10 @@ nodes:
   # ====================================================================
   - id: idempotency-gate
     name: Idempotency Gate
-    type: bash
     depends_on: [preflight]
     env:
       SSH_KEY_PATH: "/run/secrets/claude_exec_key"
-    script: |
+    bash: |
       set -euo pipefail
       CONTAINER_NAME="${{ inputs.tenant_slug }}-wordpress"
       WORKSPACE="/.archon/workspaces/bluedevilcollectibles/${{ inputs.tenant_slug }}-wp-store"
@@ -229,12 +226,11 @@ nodes:
   # ====================================================================
   - id: generate-tfvars
     name: Generate tfvars
-    type: bash
     depends_on: [idempotency-gate]
     env:
       SSH_KEY_PATH: "/run/secrets/claude_exec_key"
       AGE_RECIPIENT: "${{ secrets.AGE_RECIPIENT }}"
-    script: |
+    bash: |
       set -euo pipefail
 
       # Halt cleanly if idempotency gate detected an existing tenant
@@ -378,9 +374,8 @@ nodes:
   # ====================================================================
   - id: tf-fmt-check
     name: Terraform fmt check
-    type: bash
     depends_on: [generate-tfvars]
-    script: |
+    bash: |
       set -euo pipefail
       echo "[tf-fmt] Running terraform fmt -check on wp-store root..."
       terraform -chdir=infra/terraform/roots/wp-store fmt -check -recursive
@@ -397,13 +392,12 @@ nodes:
   # ====================================================================
   - id: tf-init
     name: Terraform init
-    type: bash
     depends_on: [tf-fmt-check]
     env:
       TF_VAR_cloudflare_api_token: "${{ secrets.CLOUDFLARE_API_TOKEN }}"
       CLOUDFLARE_API_TOKEN: "${{ secrets.CLOUDFLARE_API_TOKEN }}"
       SSH_KEY_PATH: "/run/secrets/claude_exec_key"
-    script: |
+    bash: |
       set -euo pipefail
       WORKSPACE="/.archon/workspaces/bluedevilcollectibles/${{ inputs.tenant_slug }}-wp-store"
       STATE_PATH="${WORKSPACE}/terraform-state/${{ inputs.tenant_slug }}-dev.tfstate"
@@ -446,7 +440,6 @@ nodes:
   # ====================================================================
   - id: tf-import
     name: Terraform import (reconcile)
-    type: bash
     depends_on: [tf-init]
     env:
       TF_VAR_cloudflare_api_token: "${{ secrets.CLOUDFLARE_API_TOKEN }}"
@@ -454,7 +447,7 @@ nodes:
       TF_VAR_wp_admin_email: "${{ secrets.WP_ADMIN_EMAIL }}"
       TF_VAR_wp_admin_user: "${{ secrets.WP_ADMIN_USER }}"
       SSH_KEY_PATH: "/run/secrets/claude_exec_key"
-    script: |
+    bash: |
       set -euo pipefail
       WORKSPACE="/.archon/workspaces/bluedevilcollectibles/${{ inputs.tenant_slug }}-wp-store"
       SLUG="${{ inputs.tenant_slug }}"
@@ -526,14 +519,13 @@ nodes:
   # ====================================================================
   - id: tf-validate
     name: Terraform validate
-    type: bash
     depends_on: [tf-import]
     env:
       TF_VAR_cloudflare_api_token: "${{ secrets.CLOUDFLARE_API_TOKEN }}"
       CLOUDFLARE_API_TOKEN: "${{ secrets.CLOUDFLARE_API_TOKEN }}"
       TF_VAR_wp_admin_email: "${{ secrets.WP_ADMIN_EMAIL }}"
       TF_VAR_wp_admin_user: "${{ secrets.WP_ADMIN_USER }}"
-    script: |
+    bash: |
       set -euo pipefail
       echo "[tf-validate] Running terraform validate..."
       terraform -chdir=infra/terraform/roots/wp-store validate
@@ -547,14 +539,13 @@ nodes:
   # ====================================================================
   - id: tf-plan
     name: Terraform plan
-    type: bash
     depends_on: [tf-validate]
     env:
       TF_VAR_cloudflare_api_token: "${{ secrets.CLOUDFLARE_API_TOKEN }}"
       CLOUDFLARE_API_TOKEN: "${{ secrets.CLOUDFLARE_API_TOKEN }}"
       TF_VAR_wp_admin_email: "${{ secrets.WP_ADMIN_EMAIL }}"
       TF_VAR_wp_admin_user: "${{ secrets.WP_ADMIN_USER }}"
-    script: |
+    bash: |
       set -euo pipefail
       WORKSPACE="/.archon/workspaces/bluedevilcollectibles/${{ inputs.tenant_slug }}-wp-store"
       TFVARS_PATH="${WORKSPACE}/generated.tfvars"
@@ -589,22 +580,21 @@ nodes:
   # ====================================================================
   - id: pause-plan-approval
     name: "PAUSE: John approves plan"
-    type: pause
     depends_on: [tf-plan]
-    message: |
-      Terraform plan is ready for review.
+    approval:
+      message: |
+        Terraform plan is ready for review.
 
-      Plan output: /.archon/workspaces/bluedevilcollectibles/${{ inputs.tenant_slug }}-wp-store/tfplan-${{ inputs.tenant_slug }}.txt
+        Plan output: /.archon/workspaces/bluedevilcollectibles/${{ inputs.tenant_slug }}-wp-store/tfplan-${{ inputs.tenant_slug }}.txt
 
-      Review the plan for:
-        - Resources to add: WP container, MySQL container, internal network, 2 volumes, DNS A record
-        - NO destroy operations (new tenant -- nothing should be destroyed)
-        - Correct tenant_slug: ${{ inputs.tenant_slug }}
-        - Correct primary_domain: ${{ inputs.primary_domain }}
-        - No credentials visible (sensitive values show as "(sensitive)")
+        Review the plan for:
+          - Resources to add: WP container, MySQL container, internal network, 2 volumes, DNS A record
+          - NO destroy operations (new tenant -- nothing should be destroyed)
+          - Correct tenant_slug: ${{ inputs.tenant_slug }}
+          - Correct primary_domain: ${{ inputs.primary_domain }}
+          - No credentials visible (sensitive values show as "(sensitive)")
 
-      Approve to proceed with 'terraform apply'.
-    approval_required_from: john
+        Approve to proceed with 'terraform apply'.
 
   # ====================================================================
   # STEP 10: terraform apply
@@ -613,14 +603,13 @@ nodes:
   # ====================================================================
   - id: tf-apply
     name: Terraform apply
-    type: bash
     depends_on: [pause-plan-approval]
     env:
       TF_VAR_cloudflare_api_token: "${{ secrets.CLOUDFLARE_API_TOKEN }}"
       CLOUDFLARE_API_TOKEN: "${{ secrets.CLOUDFLARE_API_TOKEN }}"
       TF_VAR_wp_admin_email: "${{ secrets.WP_ADMIN_EMAIL }}"
       TF_VAR_wp_admin_user: "${{ secrets.WP_ADMIN_USER }}"
-    script: |
+    bash: |
       set -euo pipefail
       WORKSPACE="/.archon/workspaces/bluedevilcollectibles/${{ inputs.tenant_slug }}-wp-store"
       PLAN_PATH="${WORKSPACE}/tfplan-${{ inputs.tenant_slug }}.bin"
@@ -647,11 +636,10 @@ nodes:
   # ====================================================================
   - id: wp-bootstrap
     name: wp-cli bootstrap
-    type: bash
     depends_on: [tf-apply]
     env:
       SSH_KEY_PATH: "/run/secrets/claude_exec_key"
-    script: |
+    bash: |
       set -euo pipefail
       WORKSPACE="/.archon/workspaces/bluedevilcollectibles/${{ inputs.tenant_slug }}-wp-store"
       SECRETS_ENV="${WORKSPACE}/.generated-secrets.env"
@@ -731,11 +719,10 @@ nodes:
   # ====================================================================
   - id: evidence-canary
     name: Evidence and canary check
-    type: bash
     depends_on: [wp-bootstrap]
     env:
       SSH_KEY_PATH: "/run/secrets/claude_exec_key"
-    script: |
+    bash: |
       set -euo pipefail
       WORKSPACE="/.archon/workspaces/bluedevilcollectibles/${{ inputs.tenant_slug }}-wp-store"
       SLUG="${{ inputs.tenant_slug }}"
@@ -840,9 +827,8 @@ nodes:
   # ====================================================================
   - id: provisioning-receipt
     name: Provisioning receipt
-    type: bash
     depends_on: [evidence-canary]
-    script: |
+    bash: |
       set -euo pipefail
       WORKSPACE="/.archon/workspaces/bluedevilcollectibles/${{ inputs.tenant_slug }}-wp-store"
       SLUG="${{ inputs.tenant_slug }}"
@@ -926,20 +912,18 @@ nodes:
   # ====================================================================
   - id: pause-prod-cutover
     name: "PAUSE: Prod/custom-domain cutover (optional)"
-    type: pause
     depends_on: [provisioning-receipt]
-    message: |
-      Provisioning complete for tenant: ${{ inputs.tenant_slug }}
-      Store URL: https://${{ inputs.primary_domain }}
+    approval:
+      message: |
+        Provisioning complete for tenant: ${{ inputs.tenant_slug }}
+        Store URL: https://${{ inputs.primary_domain }}
 
-      Receipt: /.archon/workspaces/bluedevilcollectibles/${{ inputs.tenant_slug }}-wp-store/
+        Receipt: /.archon/workspaces/bluedevilcollectibles/${{ inputs.tenant_slug }}-wp-store/
 
-      If this store needs a custom domain cutover (e.g. from comicstoreos.com subdomain
-      to client's own domain), configure DNS and Traefik here before approving.
-      For bdc-woo-dev (dev/test store), approve to finish.
+        If this store needs a custom domain cutover (e.g. from comicstoreos.com subdomain
+        to client's own domain), configure DNS and Traefik here before approving.
+        For bdc-woo-dev (dev/test store), approve to finish.
 
-      Manual verification:
-        curl -s -o /dev/null -w "%{http_code}" https://${{ inputs.primary_domain }}/wp-json/wc/v3/products
-        (expect 200 with valid consumer key/secret from vault)
-    approval_required_from: john
-    optional: true
+        Manual verification:
+          curl -s -o /dev/null -w "%{http_code}" https://${{ inputs.primary_domain }}/wp-json/wc/v3/products
+          (expect 200 with valid consumer key/secret from vault)
