@@ -734,7 +734,7 @@ nodes:
       # NEVER emit. Thus only until_bash (done.flag exists AND no debug prints in the
       # feature diff) can complete the loop.
       until: __NEVER_EMIT_USE_UNTIL_BASH__
-      max_iterations: 3
+      max_iterations: 10
       until_bash: |
         set -uo pipefail
         # MECHANICAL invariants ONLY. This does NOT prove Codex is satisfied --
