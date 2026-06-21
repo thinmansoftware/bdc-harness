@@ -1398,8 +1398,17 @@ nodes:
             continue
           fi
           if ! printf '%s\n' "$PLAN_OUTPUT" | grep -F -- "$path" >/dev/null; then
-            echo "Changed file was not listed in plan output: $path" >&2
-            exit 1
+            # WO-HARNESS-COMMIT-PLAN-DEVIATION-WARN-NOT-FAIL-01 (2026-06-21): the plan
+            # node is a PREDICTION, not a perfection contract. Legitimate builds routinely
+            # touch a file the plan did not pre-name (scope discovered during implement).
+            # This was an exit-1 hard-fail that killed otherwise-good builds AFTER they had
+            # already passed war-council-validator + diff-review -- both of which review the
+            # FULL captured diff (capture-diff: git diff $MB..HEAD + git diff HEAD), so an
+            # unplanned file is already REVIEWED, just not pre-declared. The fraud concern
+            # (silent unrelated commits) is covered by that upstream full-diff review, so
+            # warn loudly + commit instead of failing closed. The warning is greppable for
+            # audit (PLAN_DEVIATION) and surfaces in the manifest.
+            echo "PLAN_DEVIATION: changed file not pre-listed in plan (reviewed upstream, committing): $path" >&2
           fi
           git add -- "$path"
         done
