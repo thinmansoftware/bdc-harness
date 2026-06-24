@@ -554,10 +554,18 @@ nodes:
         BASE=$(git merge-base HEAD "$BASE_REF" 2>/dev/null || git rev-parse HEAD~1 2>/dev/null || echo "")
       fi
       SRC_RE='\.(js|jsx|ts|tsx|mjs|cjs|html|sh|bash|gs|yaml|yml)$'
+      # Generated/bundled artifacts are NOT hand-authored source -- they legitimately
+      # embed other files' content (e.g. bundled-defaults.generated.ts inlines every
+      # workflow YAML, including ones with valid non-ASCII prose). Scanning them makes
+      # the gate fail on pre-existing bytes the current WO never wrote. Exclude them so
+      # the gate only judges what THIS run actually authored. (Anchor 2026-06-24:
+      # WO-HARNESS-CAULDRON-PR-MANIFEST-AUTOFILL-01 was killed by 89 pre-existing
+      # non-ASCII lines in bundled-defaults.generated.ts identical to those on dev.)
+      EXCLUDE_RE='(\.generated\.(ts|js)$|bundled-defaults\.generated\.|/__snapshots__/|\.snap$)'
       if [ -n "$BASE" ] && git rev-parse --verify "$BASE" >/dev/null 2>&1; then
-        CHANGED=$( { git diff --name-only "$BASE"..HEAD 2>/dev/null; git diff --name-only HEAD 2>/dev/null; git ls-files --others --exclude-standard 2>/dev/null; } | sort -u | grep -E "$SRC_RE" || true )
+        CHANGED=$( { git diff --name-only "$BASE"..HEAD 2>/dev/null; git diff --name-only HEAD 2>/dev/null; git ls-files --others --exclude-standard 2>/dev/null; } | sort -u | grep -E "$SRC_RE" | grep -vE "$EXCLUDE_RE" || true )
       else
-        CHANGED=$( { git diff --name-only HEAD 2>/dev/null; git ls-files --others --exclude-standard 2>/dev/null; } | sort -u | grep -E "$SRC_RE" || true )
+        CHANGED=$( { git diff --name-only HEAD 2>/dev/null; git ls-files --others --exclude-standard 2>/dev/null; } | sort -u | grep -E "$SRC_RE" | grep -vE "$EXCLUDE_RE" || true )
       fi
       if [ -z "$CHANGED" ]; then
         echo "ascii-gate PASS (no changed source files to scan)"
