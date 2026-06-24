@@ -1,11 +1,23 @@
 #!/usr/bin/env python3
-# ascii-autofix.py -- Rule 13 mechanical normalizer.
+# ascii-autofix.py -- Rule 13 mechanical normalizer (TOTAL fixer).
 #
 # Usage: python3 harness/scripts/ascii-autofix.py <BASE_SHA>
 #
-# Purpose: Replace a small, deterministic set of mapped non-ASCII characters
-# before the downstream ascii-gate runs. The gate remains the load-bearing
-# backstop and still fails on any unmapped non-ASCII, including emoji.
+# Purpose: Convert EVERY non-ASCII byte in the gate's scope to ASCII so the
+# downstream ascii-gate becomes a no-fail verification. There are two tiers:
+#
+#   Tier 1: SUBS (semantic map). Known glyphs are replaced by their ASCII
+#           equivalent (em-dash -> --, arrow -> ->, box-drawing -> -, etc.).
+#           See _subs_lookup() for the full table + the U+2500..U+257F range.
+#
+#   Tier 2: STRIP fallback. Any codepoint >= 0x80 with no SUBS entry (emoji,
+#           variation selectors U+FE0F, zero-width joiners, any stray glyph)
+#           is REMOVED. Every stripped codepoint is logged to stderr as
+#           file:line:U+XXXX so a human reviewing the PR sees what decoration
+#           was discarded. Strip is silent in effect, never in record.
+#
+# After both tiers the output is guaranteed pure ASCII by construction, so the
+# gate that runs next cannot fail on agent-leaked non-ASCII.
 #
 # Scope must match ascii-gate's file set:
 # - files changed from BASE..HEAD
@@ -13,10 +25,12 @@
 # - untracked files from git ls-files --others --exclude-standard
 #
 # Safety lines:
-# - Only applies SUBS below. No blind-strip. No '?' replacement.
-# - For tracked files, only rewrites added/changed lines from the committed
-#   diff and working-tree diff. For untracked files, all lines are eligible.
-# - Emoji and any glyph not in SUBS fall through untouched for ascii-gate.
+# - Only files matching SRC_RE are touched (source code extensions).
+# - For tracked files, only rewrites added/changed lines (diff-scoped). For
+#   untracked files, all lines are eligible.
+# - `\uXXXX` escape literals in source files are already ASCII bytes on disk
+#   and pass through both tiers untouched -- this is the correct pattern when
+#   source code must reference a Unicode codepoint (e.g. in a test assertion).
 #
 # Output: one filename per line for each file actually modified.
 # Exit 0 always; errors go to stderr and ascii-gate is the backstop.
@@ -28,20 +42,49 @@ import re
 import subprocess
 import sys
 
+# SUBS: semantic mapping from known non-ASCII codepoints to ASCII equivalents.
+# Box-drawing range U+2500..U+257F is handled by _subs_lookup() (128 codepoints,
+# too many for individual dict entries; all collapse to "-").
 SUBS = {
-    chr(0x2014): "--",   # em dash
-    chr(0x2013): "--",   # en dash
-    chr(0x2018): "'",    # left single quote
-    chr(0x2019): "'",    # right single quote
-    chr(0x201C): '"',    # left double quote
-    chr(0x201D): '"',    # right double quote
-    chr(0x2026): "...",  # ellipsis
-    chr(0x00A0): " ",    # non-breaking space
-    chr(0x2212): "-",    # Unicode minus
+    chr(0x2014): "--",         # em dash
+    chr(0x2013): "--",         # en dash
+    chr(0x2018): "'",          # left single quote
+    chr(0x2019): "'",          # right single quote
+    chr(0x201C): '"',          # left double quote
+    chr(0x201D): '"',          # right double quote
+    chr(0x2026): "...",        # ellipsis
+    chr(0x00A0): " ",          # non-breaking space
+    chr(0x2212): "-",          # Unicode minus
+    chr(0x2192): "->",         # rightwards arrow
+    chr(0x2190): "<-",         # leftwards arrow
+    chr(0x2191): "^",          # upwards arrow
+    chr(0x2193): "v",          # downwards arrow
+    chr(0x00A7): "Section ",   # section sign
+    chr(0x00B7): "-",          # middle dot
+    chr(0x2022): "-",          # bullet
+    chr(0x2713): "[x]",        # check mark
+    chr(0x2717): "[ ]",        # ballot x
+    chr(0x2705): "[x]",        # white heavy check mark
+    chr(0x274C): "[ ]",        # cross mark
+    chr(0x2265): ">=",         # greater-than or equal to
+    chr(0x2264): "<=",         # less-than or equal to
+    chr(0x26A0): "!",          # warning sign
 }
 
 SRC_RE = re.compile(r"\.(js|jsx|ts|tsx|mjs|cjs|html|sh|bash|gs|yaml|yml)$")
 HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
+
+
+def _subs_lookup(ch: str) -> str:
+    """Tier 1 lookup. Returns ASCII replacement for known glyphs, else ch unchanged.
+
+    Box-drawing range U+2500..U+257F collapses to '-' (banners become dashes)."""
+    if ch in SUBS:
+        return SUBS[ch]
+    cp = ord(ch)
+    if 0x2500 <= cp <= 0x257F:
+        return "-"
+    return ch
 
 
 def run_git(args: list[str]) -> tuple[str, int]:
@@ -144,10 +187,35 @@ def eligible_lines(base: str | None, path: str) -> set[int] | None:
     return lines
 
 
-def normalize_line(line: str) -> str:
-    if not any(ch in line for ch in SUBS):
+def normalize_line(line: str, path: str = "", lineno: int = 0) -> str:
+    """Total normalizer: SUBS+STRIP. Output is guaranteed pure ASCII.
+
+    Fast path: lines that are already pure ASCII return unchanged.
+    Otherwise, each character is mapped via _subs_lookup. If the mapped result
+    is still >= 0x80 (no SUBS entry), it is STRIPPED and logged to stderr."""
+    # Fast path: already pure ASCII -- no work to do.
+    if all(ord(c) < 128 for c in line):
         return line
-    return "".join(SUBS.get(ch, ch) for ch in line)
+    out: list[str] = []
+    for ch in line:
+        mapped = _subs_lookup(ch)
+        # mapped is a string (possibly multi-char from SUBS). Append every char
+        # that is ASCII; strip any non-ASCII remainder.
+        for mc in mapped:
+            if ord(mc) < 128:
+                out.append(mc)
+            else:
+                # STRIP fallback: log and discard.
+                if path:
+                    sys.stderr.write(
+                        "ascii-autofix: %s:%d:U+%04X stripped\n"
+                        % (path, lineno, ord(mc))
+                    )
+                else:
+                    sys.stderr.write(
+                        "ascii-autofix: U+%04X stripped\n" % ord(mc)
+                    )
+    return "".join(out)
 
 
 def fix_file(path: str, lines_to_fix: set[int] | None) -> bool:
@@ -164,7 +232,7 @@ def fix_file(path: str, lines_to_fix: set[int] | None) -> bool:
         lineno = index + 1
         if lines_to_fix is not None and lineno not in lines_to_fix:
             continue
-        new_line = normalize_line(line)
+        new_line = normalize_line(line, path, lineno)
         if new_line != line:
             lines[index] = new_line
             changed = True

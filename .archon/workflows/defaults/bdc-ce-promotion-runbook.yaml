@@ -1,11 +1,11 @@
 name: bdc-ce-promotion-runbook
 description: |
-  Use when: Shipping WO-RELEASE-CE-PROMOTION-RUNBOOK-01 — main → release/ce promotion procedure.
+  Use when: Shipping WO-RELEASE-CE-PROMOTION-RUNBOOK-01 -- main -> release/ce promotion procedure.
   Input: WO_ID = WO-RELEASE-CE-PROMOTION-RUNBOOK-01.
   Does: Authors the CE promotion runbook + PR template + first dry-run promotion PR. The runbook
         lives in bdc-xo (governance docs); the PR template lives in lspro-react (.github).
   Repo dual-mode: this YAML CWDs into bdc-xo for the runbook + the bdc-xo template (already exists
-        from WO #1 — verify), then via gh api ensures the lspro-react PR template is present.
+        from WO #1 -- verify), then via gh api ensures the lspro-react PR template is present.
   Class: DOCS / RELEASE.
 
 policyFile: harness/policies/agent-behavior.md
@@ -54,14 +54,14 @@ nodes:
 
         ## Required Files
         - `docs/superpowers/specs/ce-release-branch/runbooks/CE-PROMOTION-RUNBOOK.md`
-          - Step-by-step procedure for promoting selected commits from main → release/ce
+          - Step-by-step procedure for promoting selected commits from main -> release/ce
           - When to promote (criteria from governance: CE-relevant or shared-safe)
           - How to create promotion branch: `git checkout -b promotion/ce/<slug> release/ce && git cherry-pick <commits>`
           - PR template usage (point to lspro-react template `ce-promotion.md`)
           - CE regression check requirement
           - John approval requirement before deploy
           - Rollback procedure
-        - Optionally amend: `xo-wiki/wiki/concepts/ce-release-branch/_index.md` — add cross-link to the runbook
+        - Optionally amend: `xo-wiki/wiki/concepts/ce-release-branch/_index.md` -- add cross-link to the runbook
 
         ## Out of scope
         - PR template file itself (already added to lspro-react by WO-RELEASE-CE-BRANCH-MODEL-01)
@@ -99,7 +99,7 @@ nodes:
         echo "No staged changes; branch already contains requested work"
       else
         git -c user.name="John Ranson" -c user.email="admin@bluedevilcollectibles.com" \
-          commit -m "docs(ce): WO-RELEASE-CE-PROMOTION-RUNBOOK-01 — main → release/ce promotion runbook
+          commit -m "docs(ce): WO-RELEASE-CE-PROMOTION-RUNBOOK-01 -- main -> release/ce promotion runbook
 
         Adds CE-PROMOTION-RUNBOOK.md with step-by-step procedure for promoting commits from main
         to release/ce. References governance doc + lspro-react PR template.
@@ -113,12 +113,12 @@ nodes:
     depends_on: [commit-and-push]
     bash: |
       set -euo pipefail
-      # Hardcoded — must match commit-and-push BRANCH literal. See WO-HARNESS-OPEN-PR-BRANCH-INTERPOLATION-FIX-01.
+      # Hardcoded -- must match commit-and-push BRANCH literal. See WO-HARNESS-OPEN-PR-BRANCH-INTERPOLATION-FIX-01.
       BRANCH="wo/release-ce-promotion-runbook-01"
       REPO="bluedevilcollectibles/bdc-xo"
       BASE="main"
-      TITLE="docs(ce): WO-RELEASE-CE-PROMOTION-RUNBOOK-01 — CE promotion runbook"
-      BODY="Implements WO-RELEASE-CE-PROMOTION-RUNBOOK-01. Docs-only. 🤖 Generated with Claude Code"
+      TITLE="docs(ce): WO-RELEASE-CE-PROMOTION-RUNBOOK-01 -- CE promotion runbook"
+      BODY="Implements WO-RELEASE-CE-PROMOTION-RUNBOOK-01. Docs-only.  Generated with Claude Code"
       # Idempotent PR creation. See WO-HARNESS-OPEN-PR-GRAPHQL-NO-COMMITS-FIX-01.
       existing_pr_url() {
         gh pr list --repo "$REPO" --head "$BRANCH" --state open --json url --jq '.[0].url // empty' 2>/dev/null

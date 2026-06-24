@@ -9,14 +9,14 @@
 #   4. Codebases registered: bluedevilcollectibles/shopops AND bluedevilcollectibles/lspro-react
 #
 # Deploy: BDC_XO/scripts/archon-bridge/sync-workflows.sh WO-SHOPOPS-SHIPMENT-RECONCILIATION-UI-01.yaml
-# REVIEW BEFORE DEPLOY — operator confirms shopops-api has read access to shipment_items
+# REVIEW BEFORE DEPLOY -- operator confirms shopops-api has read access to shipment_items
 # table (verify with curl to information_schema.columns).
 #
-# Polish bar: ROUGH OK — admin tool, manual workaround acceptable. V1 limitations in spec §13.
+# Polish bar: ROUGH OK -- admin tool, manual workaround acceptable. V1 limitations in spec Section 13.
 
 name: bdc-shopops-shipment-reconciliation-ui
 description: |
-  Use when: Executing WO-SHOPOPS-SHIPMENT-RECONCILIATION-UI-01 — distributor invoice vs
+  Use when: Executing WO-SHOPOPS-SHIPMENT-RECONCILIATION-UI-01 -- distributor invoice vs
     shipment reconciliation. CSV-upload-only v1.
   Input: WO_ID = WO-SHOPOPS-SHIPMENT-RECONCILIATION-UI-01.
   Does:
@@ -100,7 +100,7 @@ nodes:
   - id: schema-verify
     depends_on: [fresh-branch]
     bash: |
-      # set -e omitted — best-effort
+      # set -e omitted -- best-effort
       SUPABASE_URL="${SUPABASE_URL:-}"
       SUPABASE_SERVICE_KEY="${SUPABASE_SERVICE_KEY:-}"
       if [ -z "$SUPABASE_URL" ] || [ -z "$SUPABASE_SERVICE_KEY" ]; then
@@ -171,7 +171,7 @@ nodes:
              - match (0 discrepancies)
              - overcharged
              - missing item
-           Mock pg pool via factory. ROUGH-OK polish bar — do NOT add exhaustive
+           Mock pg pool via factory. ROUGH-OK polish bar -- do NOT add exhaustive
            edge-case tests.
         4. Verify column names from $schema-verify.output before writing SQL.
         5. Do NOT push.
@@ -194,14 +194,14 @@ nodes:
           git checkout -b wo/shopops-shipment-reconciliation-ui-01-ui
 
         ## Execution rules
-        1. Create src/lib/csv-parse-distributor.ts — pure function. Validates headers
+        1. Create src/lib/csv-parse-distributor.ts -- pure function. Validates headers
            ['sku', 'title', 'qty_invoiced', 'unit_price_cents', 'total_cents'].
            Returns { ok: true, lines: [...] } | { ok: false, error: '...', line?: number }.
-        2. Create src/pages/admin/ShipmentReconciliationPage.tsx per UI Hierarchy §5.
+        2. Create src/pages/admin/ShipmentReconciliationPage.tsx per UI Hierarchy Section 5.
            UploadCard + ResultsCard + ExportButton (browser-side CSV download).
            Use existing apiFetch helper for POST /distributor/reconcile.
         3. Create src/pages/admin/__tests__/ShipmentReconciliationPage.test.tsx with
-           vitest. AT MINIMUM 1 test — CSV missing 'sku' header shows error banner.
+           vitest. AT MINIMUM 1 test -- CSV missing 'sku' header shows error banner.
            ROUGH-OK polish bar.
         4. Mount route at /admin/receiving/reconcile in the existing router.
         5. Commit identity: John Ranson / admin@bluedevilcollectibles.com.
@@ -248,7 +248,7 @@ nodes:
         echo "No shopops staged changes"
       else
         git -c user.name="John Ranson" -c user.email="admin@bluedevilcollectibles.com" \
-          commit -m "$(printf 'feat(api): WO-SHOPOPS-SHIPMENT-RECONCILIATION-UI-01 — distributor reconcile endpoint\n\nAdds POST /distributor/reconcile (thin compare endpoint).\nJoins request lines (parsed from owner CSV) with shipment_items in date range\nand returns discrepancy summary + per-row category.\n\nROUGH-OK polish bar — CSV-only v1, fixed template. See spec §13 for v1 limitations.\n\nCo-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>')"
+          commit -m "$(printf 'feat(api): WO-SHOPOPS-SHIPMENT-RECONCILIATION-UI-01 -- distributor reconcile endpoint\n\nAdds POST /distributor/reconcile (thin compare endpoint).\nJoins request lines (parsed from owner CSV) with shipment_items in date range\nand returns discrepancy summary + per-row category.\n\nROUGH-OK polish bar -- CSV-only v1, fixed template. See spec Section 13 for v1 limitations.\n\nCo-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>')"
       fi
       git push -u origin "$BRANCH"
       echo "SHOPOPS_SHA=$(git rev-parse HEAD)"
@@ -265,7 +265,7 @@ nodes:
       if [ -n "$EXIST" ]; then echo "SHOPOPS_PR=$EXIST"; exit 0; fi
       for i in 1 2 3; do
         if URL=$(gh pr create --repo "$REPO" --base master --head "$BRANCH" \
-            --title "feat(api): WO-SHOPOPS-SHIPMENT-RECONCILIATION-UI-01 — distributor reconcile" \
+            --title "feat(api): WO-SHOPOPS-SHIPMENT-RECONCILIATION-UI-01 -- distributor reconcile" \
             --body "ROUGH-OK polish bar. CSV-only v1. See bdc-xo:docs/work-orders/WO-SHOPOPS-SHIPMENT-RECONCILIATION-UI-01.md" 2>&1); then
           echo "SHOPOPS_PR=$URL"; exit 0
         fi
@@ -284,7 +284,7 @@ nodes:
         echo "No lspro staged changes"
       else
         git -c user.name="John Ranson" -c user.email="admin@bluedevilcollectibles.com" \
-          commit -m "$(printf 'feat(admin): WO-SHOPOPS-SHIPMENT-RECONCILIATION-UI-01 — CSV reconcile page\n\nAdds /admin/receiving/reconcile page (CSV upload + discrepancy table).\nAdds src/lib/csv-parse-distributor.ts pure parser.\n\nROUGH-OK polish bar.\n\nCo-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>')"
+          commit -m "$(printf 'feat(admin): WO-SHOPOPS-SHIPMENT-RECONCILIATION-UI-01 -- CSV reconcile page\n\nAdds /admin/receiving/reconcile page (CSV upload + discrepancy table).\nAdds src/lib/csv-parse-distributor.ts pure parser.\n\nROUGH-OK polish bar.\n\nCo-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>')"
       fi
       git push -u origin wo/shopops-shipment-reconciliation-ui-01-ui
       EXIST=$(gh pr list --repo bluedevilcollectibles/lspro-react --head wo/shopops-shipment-reconciliation-ui-01-ui --state open \
@@ -292,7 +292,7 @@ nodes:
       if [ -n "$EXIST" ]; then echo "LSPRO_PR=$EXIST"; exit 0; fi
       for i in 1 2 3; do
         if URL=$(gh pr create --repo bluedevilcollectibles/lspro-react --base main --head wo/shopops-shipment-reconciliation-ui-01-ui \
-            --title "feat(admin): WO-SHOPOPS-SHIPMENT-RECONCILIATION-UI-01 — CSV reconcile page" \
+            --title "feat(admin): WO-SHOPOPS-SHIPMENT-RECONCILIATION-UI-01 -- CSV reconcile page" \
             --body "ROUGH-OK polish bar. Staging URL: https://staging.livesellerpro.app/admin/receiving/reconcile" 2>&1); then
           echo "LSPRO_PR=$URL"; exit 0
         fi
@@ -325,7 +325,7 @@ nodes:
 
       WO: WO-SHOPOPS-SHIPMENT-RECONCILIATION-UI-01
       Builder: Devils Cauldron (Archon bdc-shopops-shipment-reconciliation-ui)
-      Polish bar: ROUGH OK (admin tool; v1 limitations in spec §13)
+      Polish bar: ROUGH OK (admin tool; v1 limitations in spec Section 13)
 
       Files created (shopops):
        - shopops-api/routes/distributor-reconcile.js

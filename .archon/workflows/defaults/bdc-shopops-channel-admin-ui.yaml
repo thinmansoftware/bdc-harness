@@ -18,7 +18,7 @@
 
 name: bdc-shopops-channel-admin-ui
 description: |
-  Use when: Shipping WO-SHOPOPS-CHANNEL-ADMIN-UI-01 — Channels admin page in BBDB Dashboard.
+  Use when: Shipping WO-SHOPOPS-CHANNEL-ADMIN-UI-01 -- Channels admin page in BBDB Dashboard.
   Input: WO_ID = WO-SHOPOPS-CHANNEL-ADMIN-UI-01.
   Does: Reads spec from bdc-xo, extends src/pages/ChannelsConfigPage.tsx (route /settings/channels)
         with full connect/disconnect modal UI for Shopify + WooCommerce, entitlement gates,
@@ -78,7 +78,7 @@ nodes:
   - id: audit-prior-art
     depends_on: [read-spec]
     bash: |
-      # set -e DELIBERATELY OMITTED — audit is best-effort; never fails the workflow
+      # set -e DELIBERATELY OMITTED -- audit is best-effort; never fails the workflow
       set -u
       echo "=== Prior art audit for WO-SHOPOPS-CHANNEL-ADMIN-UI-01 ==="
 
@@ -136,9 +136,9 @@ nodes:
       - WO ID: WO-SHOPOPS-CHANNEL-ADMIN-UI-01
       - Files to MODIFY (do NOT create new files unless strictly necessary):
         - src/pages/ChannelsConfigPage.tsx (extend with modal logic, entitlement gates, PATCH calls)
-        - src/lib/api.ts (only if a channels-specific helper is warranted — otherwise use existing apiFetch directly)
+        - src/lib/api.ts (only if a channels-specific helper is warranted -- otherwise use existing apiFetch directly)
       - Files to CREATE (only what the spec requires):
-        - src/tests/channels-admin-ui.test.ts (5 Vitest tests — see test requirements below)
+        - src/tests/channels-admin-ui.test.ts (5 Vitest tests -- see test requirements below)
       - Files explicitly OUT OF SCOPE (do not touch):
         - src/App.tsx (route already wired at /settings/channels)
         - Any other page, component, or route not explicitly listed above
@@ -151,11 +151,11 @@ nodes:
         4. ConnectShopifyModal submits PATCH with correct payload (mock apiFetch, assert call args)
         5. Disconnect confirm guard: PATCH NOT called when user cancels confirm dialog
       - Verification commands:
-        - bun run test (or bun test) — must exit 0 with >= 5 passing assertions
+        - bun run test (or bun test) -- must exit 0 with >= 5 passing assertions
         - bunx tsc --noEmit (TypeScript clean)
         - grep -c "ConnectShopifyModal\|ConnectWooCommerceModal" src/pages/ChannelsConfigPage.tsx
         - grep -c "PATCH" src/pages/ChannelsConfigPage.tsx
-      - Commit message: feat(channels): WO-SHOPOPS-CHANNEL-ADMIN-UI-01 — channels connect/disconnect UI
+      - Commit message: feat(channels): WO-SHOPOPS-CHANNEL-ADMIN-UI-01 -- channels connect/disconnect UI
       - Branch: wo/shopops-channel-admin-ui-01
       - Push policy: feature branch -> PR against main (lspro-react staging gate required)
       - API fallback: if GET /channels/connections is not yet available (WO-SHOPOPS-COMMERCE-SPINE-01
@@ -181,14 +181,14 @@ nodes:
         - CWD is the lspro-react repo root. All paths are relative to it.
         - Read src/pages/ChannelsConfigPage.tsx FIRST before writing any changes.
           Do NOT invent a new layout. Follow the exact inline-CSS style pattern already in use.
-        - Use apiFetch from @/lib/api. It returns Promise<Response> — you MUST call .json() on the result.
+        - Use apiFetch from @/lib/api. It returns Promise<Response> -- you MUST call .json() on the result.
           Pattern: apiFetch('/channels/connections').then(r => r.json()).then(data => ...)
         - If GET /channels/connections is not live, fall back to GET /api/channels/config (already working).
           Detect availability: try /channels/connections, on 404/network error fall back and log.
         - Extend ChannelsConfigPage.tsx with:
-          a) ConnectShopifyModal — inline, rendered conditionally. Fields: shopify_store_url (text),
+          a) ConnectShopifyModal -- inline, rendered conditionally. Fields: shopify_store_url (text),
              shopify_access_token (password). Save button calls PATCH /channels/connections/shopify.
-          b) ConnectWooCommerceModal — inline, rendered conditionally. Fields: woocommerce_store_url (text),
+          b) ConnectWooCommerceModal -- inline, rendered conditionally. Fields: woocommerce_store_url (text),
              woocommerce_consumer_key (text), woocommerce_consumer_secret (password).
              Save button calls PATCH /channels/connections/woocommerce.
           c) ChannelCard action buttons now call openModal(channel) or confirm+PATCH disconnect.
@@ -210,7 +210,7 @@ nodes:
         ## Completion criteria
         Output <promise>COMPLETE</promise> only when:
           - src/pages/ChannelsConfigPage.tsx updated with ConnectShopifyModal, ConnectWooCommerceModal,
-            entitlement gate, PATCH calls (search for these strings — they must be present)
+            entitlement gate, PATCH calls (search for these strings -- they must be present)
           - src/tests/channels-admin-ui.test.ts exists with >= 5 test() / it() blocks
           - No TypeScript errors introduced (key check: apiFetch usage, modal prop types)
           - No new npm dependencies added (package.json unchanged or only scripts updated)
@@ -223,7 +223,7 @@ nodes:
         bunx tsc --noEmit
         echo "TypeScript check: PASS"
       else
-        echo "No tsconfig.json found — skipping type check"
+        echo "No tsconfig.json found -- skipping type check"
       fi
 
   - id: verify-tests
@@ -315,14 +315,14 @@ nodes:
         you can inspect at src/pages/ChannelsConfigPage.tsx. Then produce a MARKDOWN block
         with a text-based mockup if a real screenshot cannot be taken in this headless environment.
 
-        1. SCREENSHOT_1: ChannelsConfigPage — disconnected state
+        1. SCREENSHOT_1: ChannelsConfigPage -- disconnected state
            - All channels show "Not connected" badge
            - Shopify card shows enabled "Connect Shopify" button
            - WooCommerce card shows enabled "Connect WooCommerce" button
            - ComicStoreOS Portal card shows "Connected" badge, no action button
            - No modals open
 
-        2. SCREENSHOT_2: ChannelsConfigPage — Shopify connected state
+        2. SCREENSHOT_2: ChannelsConfigPage -- Shopify connected state
            - Shopify card shows "Connected" badge + store URL
            - Shopify card shows "Disconnect" button
            - Other cards unchanged
@@ -387,7 +387,7 @@ nodes:
 
       # Commit identity: admin@bluedevilcollectibles.com required for Vercel team membership
       git -c user.name="John Ranson" -c user.email="admin@bluedevilcollectibles.com" \
-        commit -m "feat(channels): WO-SHOPOPS-CHANNEL-ADMIN-UI-01 — channels connect/disconnect UI
+        commit -m "feat(channels): WO-SHOPOPS-CHANNEL-ADMIN-UI-01 -- channels connect/disconnect UI
 
       Extends ChannelsConfigPage (/settings/channels) with:
       - ConnectShopifyModal: shopify_store_url + shopify_access_token fields
@@ -411,20 +411,20 @@ nodes:
       BRANCH="$(git rev-parse --abbrev-ref HEAD)"
       REPO="bluedevilcollectibles/lspro-react"
       BASE="main"
-      TITLE="feat(channels): WO-SHOPOPS-CHANNEL-ADMIN-UI-01 — channels connect/disconnect UI"
+      TITLE="feat(channels): WO-SHOPOPS-CHANNEL-ADMIN-UI-01 -- channels connect/disconnect UI"
 
       BODY_FILE=$(mktemp)
       {
         echo "## Summary"
-        echo "Implements **WO-SHOPOPS-CHANNEL-ADMIN-UI-01** — Channels admin page UI."
+        echo "Implements **WO-SHOPOPS-CHANNEL-ADMIN-UI-01** -- Channels admin page UI."
         echo ""
         echo "Route: \`/settings/channels\` (already wired in App.tsx)"
         echo ""
         echo "## Changes"
-        echo "- \`src/pages/ChannelsConfigPage.tsx\` — extended with ConnectShopifyModal,"
+        echo "- \`src/pages/ChannelsConfigPage.tsx\` -- extended with ConnectShopifyModal,"
         echo "  ConnectWooCommerceModal, PATCH /channels/connections/:channel calls,"
         echo "  entitlement gate (shopify/woocommerce disabled without ELITE), disconnect flow"
-        echo "- \`src/tests/channels-admin-ui.test.ts\` — 5 Vitest unit tests"
+        echo "- \`src/tests/channels-admin-ui.test.ts\` -- 5 Vitest unit tests"
         echo ""
         echo "## API dependency"
         echo "GET /channels/connections + PATCH /channels/connections/:channel"
@@ -481,7 +481,7 @@ nodes:
   - id: verify-vercel
     depends_on: [open-pr]
     bash: |
-      # set -e DELIBERATELY OMITTED — best-effort step (Vercel deploy may be in-flight)
+      # set -e DELIBERATELY OMITTED -- best-effort step (Vercel deploy may be in-flight)
       # Rule 11 note: no n8n webhook. Vercel status fetched via gh + Vercel API.
       REPO="bluedevilcollectibles/lspro-react"
 
@@ -527,9 +527,9 @@ nodes:
         grep -c "ConnectWooCommerceModal" src/pages/ChannelsConfigPage.tsx # >= 1
         grep -c "PATCH" src/pages/ChannelsConfigPage.tsx                  # >= 2
         grep -c "test(\|it(" src/tests/channels-admin-ui.test.ts          # >= 5
-      Runtime verification: N/A — lspro-react deploys via Vercel (no runtime container exec required)
+      Runtime verification: N/A -- lspro-react deploys via Vercel (no runtime container exec required)
       Vercel deployment: [from verify-vercel.output; note PR preview URL; production deploys on main merge]
-      API fallback note: [from implement loop — record whether /channels/connections or /api/channels/config was used]
+      API fallback note: [from implement loop -- record whether /channels/connections or /api/channels/config was used]
       VALIDATION: PASS
 
       ## Inputs
@@ -555,7 +555,7 @@ nodes:
       # Find it via: notion search for "WO-SHOPOPS-CHANNEL-ADMIN-UI-01" in the BDC WO database.
       Notion page ID: 35fef4c9-ce00-81b5-a3ed-c7fc2825ae30
 
-      Required Notion changes (Captain CI reads Notes field, NOT comments — per doctrine):
+      Required Notion changes (Captain CI reads Notes field, NOT comments -- per doctrine):
       - Claude Status -> REVIEW
       - Status -> Review
       - Notes -> set to $build-manifest.output verbatim (manifest goes in Notes, not as page comment)

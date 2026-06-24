@@ -1,6 +1,6 @@
 name: bdc-ce-deploy-lane
 description: |
-  Use when: Shipping WO-RELEASE-CE-DEPLOY-LANE-01 — define + wire CE deployment lane.
+  Use when: Shipping WO-RELEASE-CE-DEPLOY-LANE-01 -- define + wire CE deployment lane.
   Input: WO_ID = WO-RELEASE-CE-DEPLOY-LANE-01.
   Does: Reads spec from bdc-xo, audits current CE deploy target on lspro-react, configures Vercel
         so production CE deploys from release/ce ONLY (not arbitrary main commits), documents
@@ -65,9 +65,9 @@ nodes:
       - Vercel deploy config: create `vercel.json` snippet OR document Vercel dashboard config that:
         - Production deploys ONLY from `release/ce` branch (not main)
         - Preview deploys for any PR targeting release/ce
-        - main branch deploys still go where they currently go (staging — preserve existing behavior)
+        - main branch deploys still go where they currently go (staging -- preserve existing behavior)
       - Files to create:
-        - `docs/CE-DEPLOY-LANE.md` — runbook for deploying CE from release/ce + rollback procedure
+        - `docs/CE-DEPLOY-LANE.md` -- runbook for deploying CE from release/ce + rollback procedure
       - Files to modify (if Vercel uses vercel.json): `vercel.json` (add CE production target)
       - Vercel project: check existing setup; the actual Vercel dashboard config change may need to be a TODO for John (can't do via API without project token)
       - Rollback procedure documented in CE-DEPLOY-LANE.md:
@@ -78,7 +78,7 @@ nodes:
         - `ls docs/CE-DEPLOY-LANE.md`
         - If vercel.json modified: `grep -c "release/ce" vercel.json` (>= 1)
         - `gh api repos/bluedevilcollectibles/lspro-react/branches/release/ce --jq .name` returns release/ce
-      - Commit msg: `feat(deploy): WO-RELEASE-CE-DEPLOY-LANE-01 — wire CE deploy lane from release/ce`
+      - Commit msg: `feat(deploy): WO-RELEASE-CE-DEPLOY-LANE-01 -- wire CE deploy lane from release/ce`
       - Push: feature branch `wo/release-ce-deploy-lane-01` -> PR against main
 
       ## Spec
@@ -100,7 +100,7 @@ nodes:
         ## Execution Rules
         - Create `docs/CE-DEPLOY-LANE.md` with full runbook (deploy + rollback).
         - If vercel.json exists in repo root, add release/ce as a production branch target (don't break main behavior).
-        - If no vercel.json, document in CE-DEPLOY-LANE.md the Vercel dashboard steps John needs (project settings → Git → production branch).
+        - If no vercel.json, document in CE-DEPLOY-LANE.md the Vercel dashboard steps John needs (project settings -> Git -> production branch).
         - Do NOT touch any other deploy config (GitHub Actions deploy workflows can stay as-is).
         - Do NOT trigger any actual deploy. Configuration only.
         - Do NOT push to main or release/ce.
@@ -113,7 +113,7 @@ nodes:
       set -euo pipefail
       ls docs/CE-DEPLOY-LANE.md
       if [ -f vercel.json ]; then
-        grep -c "release/ce" vercel.json || echo "Note: vercel.json exists but no release/ce ref — dashboard config may be the path"
+        grep -c "release/ce" vercel.json || echo "Note: vercel.json exists but no release/ce ref -- dashboard config may be the path"
       fi
 
   - id: commit-and-push
@@ -140,7 +140,7 @@ nodes:
         echo "No staged changes; branch already contains requested work"
       else
         git -c user.name="John Ranson" -c user.email="admin@bluedevilcollectibles.com" \
-          commit -m "feat(deploy): WO-RELEASE-CE-DEPLOY-LANE-01 — wire CE deploy lane from release/ce
+          commit -m "feat(deploy): WO-RELEASE-CE-DEPLOY-LANE-01 -- wire CE deploy lane from release/ce
 
         Adds docs/CE-DEPLOY-LANE.md with the CE deployment + rollback runbook.
         Production CE deploys from release/ce ONLY. main continues current behavior.
@@ -154,12 +154,12 @@ nodes:
     depends_on: [commit-and-push]
     bash: |
       set -euo pipefail
-      # Hardcoded — must match commit-and-push BRANCH literal. See WO-HARNESS-OPEN-PR-BRANCH-INTERPOLATION-FIX-01.
+      # Hardcoded -- must match commit-and-push BRANCH literal. See WO-HARNESS-OPEN-PR-BRANCH-INTERPOLATION-FIX-01.
       BRANCH="wo/release-ce-deploy-lane-01"
       REPO="bluedevilcollectibles/lspro-react"
       BASE="main"
-      TITLE="feat(deploy): WO-RELEASE-CE-DEPLOY-LANE-01 — CE deploy lane from release/ce"
-      BODY="Implements WO-RELEASE-CE-DEPLOY-LANE-01. Spec in bdc-xo. Production CE deploys from release/ce only. Rollback procedure in docs/CE-DEPLOY-LANE.md. **If Vercel dashboard config required, see XO_TODO in run log.** 🤖 Generated with Claude Code"
+      TITLE="feat(deploy): WO-RELEASE-CE-DEPLOY-LANE-01 -- CE deploy lane from release/ce"
+      BODY="Implements WO-RELEASE-CE-DEPLOY-LANE-01. Spec in bdc-xo. Production CE deploys from release/ce only. Rollback procedure in docs/CE-DEPLOY-LANE.md. **If Vercel dashboard config required, see XO_TODO in run log.**  Generated with Claude Code"
       # Idempotent PR creation. See WO-HARNESS-OPEN-PR-GRAPHQL-NO-COMMITS-FIX-01.
       existing_pr_url() {
         gh pr list --repo "$REPO" --head "$BRANCH" --state open --json url --jq '.[0].url // empty' 2>/dev/null

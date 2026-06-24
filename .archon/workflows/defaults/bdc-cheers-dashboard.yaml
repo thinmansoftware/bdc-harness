@@ -10,19 +10,19 @@
 #   2. bluedevilcollectibles/shopops registered in Archon (this WO touches BOTH repos via /tmp clone)
 #   3. WO spec committed + pushed to bdc-xo main: docs/work-orders/WO-CHEERS-DASHBOARD-01.md
 #   4. GH_TOKEN with push to both lspro-react + shopops in Archon env
-#   5. Notion page ID for WO-CHEERS-DASHBOARD-01 — fill in 35fef4c9-ce00-81e8-a80d-d32a989e33e6 before firing
+#   5. Notion page ID for WO-CHEERS-DASHBOARD-01 -- fill in 35fef4c9-ce00-81e8-a80d-d32a989e33e6 before firing
 #
 # OPEN QUESTIONS (operator answers before deploy):
-#   Q1: Default location scope for HQ tier — all-locations or location-picker required? Draft assumes all-locations.
-#   Q2: Sidesheet "View Full Profile" — stub button this WO; confirm OK with John.
+#   Q1: Default location scope for HQ tier -- all-locations or location-picker required? Draft assumes all-locations.
+#   Q2: Sidesheet "View Full Profile" -- stub button this WO; confirm OK with John.
 #
 # Deploy: BDC_XO/scripts/archon-bridge/sync-workflows.sh bdc-cheers-dashboard.yaml
 # REVIEW BEFORE DEPLOY: human verifies test thresholds, screenshot loop N=3, Notion page ID, schema-verify
-# columns match WO §9 expected tables (customers, customer_ledger, orders).
+# columns match WO Section 9 expected tables (customers, customer_ledger, orders).
 
 name: bdc-cheers-dashboard
 description: |
-  Use when: Executing WO-CHEERS-DASHBOARD-01 — Cheers customer-intelligence dashboard.
+  Use when: Executing WO-CHEERS-DASHBOARD-01 -- Cheers customer-intelligence dashboard.
   Input: WO_ID = WO-CHEERS-DASHBOARD-01.
   Does: Reads spec from bdc-xo. Verifies customers + customer_ledger + orders schema
         via Supabase REST (best-effort). Adds GET /api/customers/intelligence to
@@ -33,7 +33,7 @@ description: |
         manifest. Flips Notion to REVIEW.
   Repos: bluedevilcollectibles/lspro-react (Archon CWD) + bluedevilcollectibles/shopops
          (cloned to /tmp). WO spec in bluedevilcollectibles/bdc-xo.
-  parallel_ok: false — touches 2 repos.
+  parallel_ok: false -- touches 2 repos.
   NOT for: any other WO.
 
 policyFile: harness/policies/agent-behavior.md
@@ -84,18 +84,18 @@ nodes:
 
       printf 'WO_ID=%s\nWORKFLOW_ID=%s\n\n' "$WO_ID" "$WORKFLOW_ID"
       printf -- '--- SPEC ---\n%s\n\n' "$SPEC_CONTENT"
-      printf -- '--- DESIGN DOC §1-§2.5 ---\n%s\n' "$DESIGN_DOC"
+      printf -- '--- DESIGN DOC Section 1-Section 2.5 ---\n%s\n' "$DESIGN_DOC"
 
   - id: schema-verify
     depends_on: [read-spec]
     bash: |
-      # set -e DELIBERATELY OMITTED — best-effort step (Supabase may 401/429)
+      # set -e DELIBERATELY OMITTED -- best-effort step (Supabase may 401/429)
       SUPABASE_URL="${SUPABASE_URL:-}"
       SUPABASE_SERVICE_KEY="${SUPABASE_SERVICE_KEY:-}"
 
       if [ -z "$SUPABASE_URL" ] || [ -z "$SUPABASE_SERVICE_KEY" ]; then
         echo "STATUS=skipped_no_env"
-        echo "DETAIL=Verify manually: customers + customer_ledger + orders columns per WO §9"
+        echo "DETAIL=Verify manually: customers + customer_ledger + orders columns per WO Section 9"
         exit 0
       fi
 
@@ -174,19 +174,19 @@ nodes:
       - Create: src/lib/cheers-scoring.ts (pure functions, no React)
       - Create: src/tests/cheers-scoring.test.ts (8 Vitest tests)
       - Create: src/tests/cheers-dashboard-page.test.tsx (4 RTL tests)
-      - Modify: src/App.tsx — add route /cheers behind meetsTier('hq')
+      - Modify: src/App.tsx -- add route /cheers behind meetsTier('hq')
       - Branch: wo/cheers-dashboard-01
       - PR base: main
 
       ### shopops files (CWD = /tmp/shopops-work-$WORKFLOW_ID after clone)
-      - Create: shopops-api/routes/customer-intelligence.js — GET /api/customers/intelligence
-      - Create: shopops-api/lib/rfm-scorer.js — pure RFM helpers (mirror of cheers-scoring.ts for backend)
+      - Create: shopops-api/routes/customer-intelligence.js -- GET /api/customers/intelligence
+      - Create: shopops-api/lib/rfm-scorer.js -- pure RFM helpers (mirror of cheers-scoring.ts for backend)
       - Create: shopops-api/tests/test_customer_intelligence.js (6 bun tests)
-      - Modify: shopops-api/index.js — mount /api/customers/intelligence route
+      - Modify: shopops-api/index.js -- mount /api/customers/intelligence route
       - Branch: wo/cheers-dashboard-01
       - PR base: master
 
-      ### Scoring (verbatim from spec §RFM Calibration)
+      ### Scoring (verbatim from spec Section RFM Calibration)
       - Recency: <14d=5, 15-30d=4, 31-45d=3, 46-60d=2, 60+=1
       - Frequency: purchases/30d: 4+=5, 3=4, 2=3, 1=2, 0=1
       - Monetary: tenant-wide quintile rank
@@ -237,7 +237,7 @@ nodes:
              - classifySegment({r, f, m, daysActive}) -> 'champions'|'loyal'|...
         5. Mount route in shopops-api/index.js at /api/customers/intelligence
         6. Create shopops-api/tests/test_customer_intelligence.js with bun:test imports:
-           - 6 tests per WO §7 (shape, at_risk_count, segment filter, location filter,
+           - 6 tests per WO Section 7 (shape, at_risk_count, segment filter, location filter,
              empty tenant, deterministic scoring)
            - Tests assert REAL behavior, not "did not throw"
         7. Do NOT push, do NOT commit yet, do NOT run docker.
@@ -269,7 +269,7 @@ nodes:
         ## Execution Rules
         1. Read src/pages/AdminPage.tsx and src/pages/CustomersPage.tsx FIRST to
            understand the existing card/table style. Match it. Do not invent a new design.
-        2. Use apiFetch from @/lib/api — returns Promise<Response>, call .json() on it.
+        2. Use apiFetch from @/lib/api -- returns Promise<Response>, call .json() on it.
         3. Read src/lib/tiers.ts for meetsTier signature.
         4. Create src/lib/cheers-scoring.ts with the SAME function signatures as
            shopops-api/lib/rfm-scorer.js so frontend can score locally if needed.
@@ -280,9 +280,9 @@ nodes:
            - Sidesheet opens on row click; controlled state at the page level
         6. Create the 4 component files under src/pages/cheers/components/
         7. Modify src/App.tsx: add <Route path="/cheers" element={<CheersDashboardPage />} />
-           gated by meetsTier('hq') — match the existing route guard pattern.
-        8. Create src/tests/cheers-scoring.test.ts — 8 Vitest tests per WO §7
-        9. Create src/tests/cheers-dashboard-page.test.tsx — 4 RTL tests with vi.mock('@/lib/api')
+           gated by meetsTier('hq') -- match the existing route guard pattern.
+        8. Create src/tests/cheers-scoring.test.ts -- 8 Vitest tests per WO Section 7
+        9. Create src/tests/cheers-dashboard-page.test.tsx -- 4 RTL tests with vi.mock('@/lib/api')
         10. Do NOT add new package dependencies.
         11. Do NOT modify AdminPage, CustomersPage, server.js, or any unrelated file.
 
@@ -380,7 +380,7 @@ nodes:
         in src/pages/cheers/components/. Produce a code-level confirmation that
         each screenshot scenario is achievable.
 
-        ## Required (per WO §8 stop condition 8)
+        ## Required (per WO Section 8 stop condition 8)
         1. SHOT_1: /cheers route loads, KPIStrip shows 4 cards with values
         2. SHOT_2: AtRiskCustomerList populated with >=3 rows, each with health dot
         3. SHOT_3: CustomerDrillSidesheet visible after row click, R/F/M scores shown
@@ -422,7 +422,7 @@ nodes:
         echo "No staged changes"
       else
         git -c user.name="John Ranson" -c user.email="admin@bluedevilcollectibles.com" \
-          commit -m "$(printf 'feat(cheers): WO-CHEERS-DASHBOARD-01 — customer-intelligence dashboard\n\nAdds CheersDashboardPage at /cheers (HQ tier gate via meetsTier).\n4-panel layout: KPI strip, at-risk list, activity feed, drill-down sidesheet.\nPure RFM scoring helper (cheers-scoring.ts) shared with shopops-api rfm-scorer.\n\nTests:\n- cheers-scoring.test.ts (8 Vitest) — recency/frequency/monetary/health/segment\n- cheers-dashboard-page.test.tsx (4 RTL) — KPI render, at-risk filter, sidesheet, activity sort\n\nDepends on: shopops-api GET /api/customers/intelligence (companion PR).\nBlocks: WO-CHEERS-CAMPAIGNS-01\n\nCo-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>')"
+          commit -m "$(printf 'feat(cheers): WO-CHEERS-DASHBOARD-01 -- customer-intelligence dashboard\n\nAdds CheersDashboardPage at /cheers (HQ tier gate via meetsTier).\n4-panel layout: KPI strip, at-risk list, activity feed, drill-down sidesheet.\nPure RFM scoring helper (cheers-scoring.ts) shared with shopops-api rfm-scorer.\n\nTests:\n- cheers-scoring.test.ts (8 Vitest) -- recency/frequency/monetary/health/segment\n- cheers-dashboard-page.test.tsx (4 RTL) -- KPI render, at-risk filter, sidesheet, activity sort\n\nDepends on: shopops-api GET /api/customers/intelligence (companion PR).\nBlocks: WO-CHEERS-CAMPAIGNS-01\n\nCo-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>')"
       fi
 
       git push -u origin "$BRANCH"
@@ -452,7 +452,7 @@ nodes:
         echo "No staged changes"
       else
         git -c user.name="John Ranson" -c user.email="admin@bluedevilcollectibles.com" \
-          commit -m "$(printf 'feat(api): WO-CHEERS-DASHBOARD-01 — customer intelligence endpoint\n\nGET /api/customers/intelligence — RFM-scored customer list + KPI rollups\nfor the Cheers dashboard. Multi-tenant isolated. Optional location_id filter.\n\nNew files:\n- routes/customer-intelligence.js\n- lib/rfm-scorer.js (pure functions)\n- tests/test_customer_intelligence.js (6 bun tests)\n\nScoring: R<14d=5..60+=1, F purchases/30d 4+=5..0=1, M tenant-wide quintile,\nHealth = R*0.40 + F*0.35 + M*0.25.\n\nCo-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>')"
+          commit -m "$(printf 'feat(api): WO-CHEERS-DASHBOARD-01 -- customer intelligence endpoint\n\nGET /api/customers/intelligence -- RFM-scored customer list + KPI rollups\nfor the Cheers dashboard. Multi-tenant isolated. Optional location_id filter.\n\nNew files:\n- routes/customer-intelligence.js\n- lib/rfm-scorer.js (pure functions)\n- tests/test_customer_intelligence.js (6 bun tests)\n\nScoring: R<14d=5..60+=1, F purchases/30d 4+=5..0=1, M tenant-wide quintile,\nHealth = R*0.40 + F*0.35 + M*0.25.\n\nCo-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>')"
       fi
 
       git push -u origin "$BRANCH"
@@ -468,7 +468,7 @@ nodes:
       BODY=$(mktemp)
       {
         echo "## Summary"
-        echo "Implements WO-CHEERS-DASHBOARD-01 (lspro-react side) — Cheers dashboard at /cheers (HQ tier)."
+        echo "Implements WO-CHEERS-DASHBOARD-01 (lspro-react side) -- Cheers dashboard at /cheers (HQ tier)."
         echo ""
         echo "## Files"
         echo "- src/pages/cheers/CheersDashboardPage.tsx + 4 components"
@@ -478,7 +478,7 @@ nodes:
         echo "- src/App.tsx (route wired behind meetsTier('hq'))"
         echo ""
         echo "## Companion PR"
-        echo "shopops master: wo/cheers-dashboard-01 — /api/customers/intelligence endpoint"
+        echo "shopops master: wo/cheers-dashboard-01 -- /api/customers/intelligence endpoint"
         echo ""
         echo "Spec: bdc-xo docs/work-orders/WO-CHEERS-DASHBOARD-01.md"
       } > "$BODY"
@@ -490,7 +490,7 @@ nodes:
 
       for attempt in 1 2 3; do
         if PR_OUT=$(gh pr create --repo "$REPO" --base main --head "$BRANCH" \
-            --title "feat(cheers): WO-CHEERS-DASHBOARD-01 — customer-intelligence dashboard" \
+            --title "feat(cheers): WO-CHEERS-DASHBOARD-01 -- customer-intelligence dashboard" \
             --body-file "$BODY" 2>&1); then
           echo "UI_PR_URL=$PR_OUT"; exit 0
         fi
@@ -508,7 +508,7 @@ nodes:
       BODY=$(mktemp)
       {
         echo "## Summary"
-        echo "Implements WO-CHEERS-DASHBOARD-01 (shopops-api side) — GET /api/customers/intelligence."
+        echo "Implements WO-CHEERS-DASHBOARD-01 (shopops-api side) -- GET /api/customers/intelligence."
         echo ""
         echo "## Files"
         echo "- shopops-api/routes/customer-intelligence.js"
@@ -529,7 +529,7 @@ nodes:
 
       for attempt in 1 2 3; do
         if PR_OUT=$(gh pr create --repo "$REPO" --base master --head "$BRANCH" \
-            --title "feat(api): WO-CHEERS-DASHBOARD-01 — customer intelligence endpoint" \
+            --title "feat(api): WO-CHEERS-DASHBOARD-01 -- customer intelligence endpoint" \
             --body-file "$BODY" 2>&1); then
           echo "API_PR_URL=$PR_OUT"; exit 0
         fi
@@ -540,7 +540,7 @@ nodes:
   - id: runtime-verify
     depends_on: [open-pr-api, open-pr-ui]
     bash: |
-      # set -e DELIBERATELY OMITTED — Rule 19 best-effort
+      # set -e DELIBERATELY OMITTED -- Rule 19 best-effort
       RESULT=$(docker exec shopops-api grep -n "customers/intelligence" /app/routes/customer-intelligence.js 2>&1)
       EXIT=$?
       if [ $EXIT -eq 0 ]; then
@@ -558,7 +558,7 @@ nodes:
   - id: verify-vercel
     depends_on: [open-pr-ui]
     bash: |
-      # set -e DELIBERATELY OMITTED — Vercel may be in-flight
+      # set -e DELIBERATELY OMITTED -- Vercel may be in-flight
       sleep 30
       RESULT=$(gh pr list --repo "bluedevilcollectibles/lspro-react" --head "wo/cheers-dashboard-01" \
         --state open --json url,headRefName 2>&1)
@@ -576,7 +576,7 @@ nodes:
     task_class: clerical
     prompt: |
       Build the Captain CI manifest v2 for WO-CHEERS-DASHBOARD-01.
-      Class: MIXED — CODE in 2 repos + Rule 19 runtime check for shopops-api.
+      Class: MIXED -- CODE in 2 repos + Rule 19 runtime check for shopops-api.
 
       WO: WO-CHEERS-DASHBOARD-01
       Builder: Major Build (Archon bdc-cheers-dashboard)
@@ -624,7 +624,7 @@ nodes:
         Command: docker exec shopops-api grep -n 'customers/intelligence' /app/routes/customer-intelligence.js
 
       Vercel deployment:
-        [from verify-vercel.output — preview URL pending PR build]
+        [from verify-vercel.output -- preview URL pending PR build]
 
       VALIDATION: PASS
 
@@ -649,7 +649,7 @@ nodes:
     task_class: clerical
     prompt: |
       Flip Notion WO-CHEERS-DASHBOARD-01 to REVIEW with manifest in Notes property
-      (NOT a page comment — Captain CI reads Notes).
+      (NOT a page comment -- Captain CI reads Notes).
 
       # OPERATOR: Replace 35fef4c9-ce00-81e8-a80d-d32a989e33e6 with real Notion page ID before firing.
       Notion database: a6df831c-0b52-449f-8ca4-d77be6b70d0a

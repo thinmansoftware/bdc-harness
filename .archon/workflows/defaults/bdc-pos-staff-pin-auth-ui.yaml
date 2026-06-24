@@ -8,14 +8,14 @@
 # Pre-flight (4-block): YAML exists (this file), spec exists (docs/work-orders/
 #   WO-POS-STAFF-PIN-AUTH-UI-01.md in bdc-xo), CWD scope = CODE single-repo
 #   (lspro-react), codebase registered. Open Question: if store_staff.pin_hash
-#   missing OR /staff/pin-login route missing in shopops-api, WO grows MIXED —
+#   missing OR /staff/pin-login route missing in shopops-api, WO grows MIXED --
 #   operator surfaces to XO before re-firing.
 #
 # Deploy: BDC_XO/scripts/archon-bridge/sync-workflows.sh WO-POS-STAFF-PIN-AUTH-UI-01.yaml
 
 name: bdc-pos-staff-pin-auth-ui
 description: |
-  Use when: Executing WO-POS-STAFF-PIN-AUTH-UI-01 — Staff PIN login UI for POS.
+  Use when: Executing WO-POS-STAFF-PIN-AUTH-UI-01 -- Staff PIN login UI for POS.
   Input: WO_ID = WO-POS-STAFF-PIN-AUTH-UI-01.
   Does: Reads spec from bdc-xo, audits shopops-api for existing /staff/pin-login
         + store_staff.pin_hash (Open Question gate), implements lspro-react
@@ -96,7 +96,7 @@ nodes:
   - id: audit-backend
     depends_on: [fresh-branch]
     bash: |
-      # best-effort backend audit — surfaces Open Question gate
+      # best-effort backend audit -- surfaces Open Question gate
       EXISTS=$(gh api \
         "repos/bluedevilcollectibles/shopops/contents/shopops-api/routes/staff.js?ref=master" \
         --template '{{.name}}' 2>/dev/null || true)
@@ -150,13 +150,13 @@ nodes:
         $read-spec.output
 
         ## Execution Rules
-        1. Create the 5 source files per WO §7 + 3 test files.
+        1. Create the 5 source files per WO Section 7 + 3 test files.
         2. PIN flow: 4-digit input, auto-submit on 4th digit, POST to /api/staff/pin-login.
         3. PosAuthContext stores JWT in sessionStorage.pos_jwt, exposes { staff, login, logout, token }.
         4. RoleGate: disabled children + overlay when staff.role not in props.roles.
         5. posApiFetch: wraps existing apiFetch, injects Authorization Bearer + X-Shopops-Tenant.
         6. On 401: clear sessionStorage + navigate('/pos/login').
-        7. Tests: >= 7 vitest tests asserting real behavior per WO §11.
+        7. Tests: >= 7 vitest tests asserting real behavior per WO Section 11.
         8. Use existing styling utilities (Tailwind or styled if that is the repo convention).
         9. Do NOT push, do NOT modify auth0 code.
 
@@ -200,7 +200,7 @@ nodes:
         echo "No staged changes"
       else
         git -c user.name="John Ranson" -c user.email="admin@bluedevilcollectibles.com" \
-          commit -m "$(printf 'feat(pos): WO-POS-STAFF-PIN-AUTH-UI-01 — PIN login + RoleGate\n\nAdds src/pos/POSLoginPage.tsx + PinPad.tsx + PosAuthContext.tsx + RoleGate.tsx +\nposApiFetch.ts with 7+ vitest tests.\nGates POS actions by role (clerk/manager/owner) per WO §6 matrix.\n\nCo-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>')"
+          commit -m "$(printf 'feat(pos): WO-POS-STAFF-PIN-AUTH-UI-01 -- PIN login + RoleGate\n\nAdds src/pos/POSLoginPage.tsx + PinPad.tsx + PosAuthContext.tsx + RoleGate.tsx +\nposApiFetch.ts with 7+ vitest tests.\nGates POS actions by role (clerk/manager/owner) per WO Section 6 matrix.\n\nCo-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>')"
       fi
       git push -u origin "$BRANCH"
       echo "SHA=$(git rev-parse HEAD)"
@@ -214,7 +214,7 @@ nodes:
       BODY=$(mktemp)
       {
         echo "## Summary"
-        echo "Implements WO-POS-STAFF-PIN-AUTH-UI-01 — Staff PIN login UI for POS."
+        echo "Implements WO-POS-STAFF-PIN-AUTH-UI-01 -- Staff PIN login UI for POS."
         echo ""
         echo "## Files created"
         echo "- src/pos/POSLoginPage.tsx, PinPad.tsx, PosAuthContext.tsx, RoleGate.tsx, posApiFetch.ts"
@@ -227,7 +227,7 @@ nodes:
       if [ -n "$EXIST" ]; then echo "PR_URL=$EXIST"; exit 0; fi
       for i in 1 2 3; do
         if URL=$(gh pr create --repo "$REPO" --base main --head "$BRANCH" \
-            --title "feat(pos): WO-POS-STAFF-PIN-AUTH-UI-01 — PIN login + RoleGate" \
+            --title "feat(pos): WO-POS-STAFF-PIN-AUTH-UI-01 -- PIN login + RoleGate" \
             --body-file "$BODY" 2>&1); then
           echo "PR_URL=$URL"; exit 0
         fi
@@ -247,7 +247,7 @@ nodes:
                      RoleGate.tsx, posApiFetch.ts + 3 test files
       Files modified: src/pos/POSHeader.tsx, src/pos routing
       Tests: [count from $verify-tests.output] passing | bun test src/pos
-      PRs: [from $open-pr.output PR_URL] — base: main
+      PRs: [from $open-pr.output PR_URL] -- base: main
       Merge ancestors: lspro-react main HEAD: [from $commit-and-push.output SHA], behind_by: 0
       Grep assertions:
         - grep -q 'PosAuthContext' src/pos/PosAuthContext.tsx

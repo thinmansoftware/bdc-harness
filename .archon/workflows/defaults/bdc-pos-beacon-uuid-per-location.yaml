@@ -5,29 +5,29 @@
 # Pre-flight (4-block):
 #   1. YAML exists: this file
 #   2. Spec exists: docs/work-orders/WO-POS-BEACON-UUID-PER-LOCATION-01.md in bdc-xo
-#   3. CWD scope: SINGLE-REPO (shopops only) — primary CWD is shopops repo root
+#   3. CWD scope: SINGLE-REPO (shopops only) -- primary CWD is shopops repo root
 #   4. Codebase registered: bluedevilcollectibles/shopops must be in Archon
 #      Verify: sqlite3 /opt/bdc/archon-data/archon.db "SELECT name FROM remote_agent_codebases"
 #
-# Schema audit (REQUIRED before migration apply — Plan B floor, HIGH polish):
+# Schema audit (REQUIRED before migration apply -- Plan B floor, HIGH polish):
 #   SELECT table_name FROM information_schema.tables WHERE table_name = 'location_beacons'
-#   Expected: 0 rows. If non-empty: STOP and surface — table already exists.
+#   Expected: 0 rows. If non-empty: STOP and surface -- table already exists.
 #
 # Deploy: BDC_XO/scripts/archon-bridge/sync-workflows.sh WO-POS-BEACON-UUID-PER-LOCATION-01.yaml
-# REVIEW BEFORE DEPLOY — operator confirms WALLET_BEACON_UUID env var present in shopops-api .env on Hetzner.
+# REVIEW BEFORE DEPLOY -- operator confirms WALLET_BEACON_UUID env var present in shopops-api .env on Hetzner.
 #
-# Polish bar: HIGH (POS customer arrival depends on this — mission-critical for HQ pitch).
+# Polish bar: HIGH (POS customer arrival depends on this -- mission-critical for HQ pitch).
 
 name: bdc-pos-beacon-uuid-per-location
 description: |
-  Use when: Executing WO-POS-BEACON-UUID-PER-LOCATION-01 — per-location iBeacon UUID
+  Use when: Executing WO-POS-BEACON-UUID-PER-LOCATION-01 -- per-location iBeacon UUID
     registration so wallet passes trigger arrival at the correct store.
   Input: WO_ID = WO-POS-BEACON-UUID-PER-LOCATION-01.
   Does:
     - Reads spec from bdc-xo via gh api (cross-repo spec, single-repo build).
     - Schema-verifies location_beacons does NOT exist yet (best-effort).
     - Writes migration shopops-api/migrations/20260513_location_beacons.sql.
-    - Adds shopops-api/routes/admin-beacons.js with 4 endpoints (§7).
+    - Adds shopops-api/routes/admin-beacons.js with 4 endpoints (Section 7).
     - Modifies shopops-api/routes/wallet.js to look up per-location UUID with
       env fallback.
     - Modifies shopops-api/index.js to mount the new router.
@@ -123,12 +123,12 @@ nodes:
       echo "BRANCH=${BRANCH}"
 
   # -------------------------------------------------------------------------
-  # 3. SCHEMA VERIFY — location_beacons should NOT exist yet (best-effort)
+  # 3. SCHEMA VERIFY -- location_beacons should NOT exist yet (best-effort)
   # -------------------------------------------------------------------------
   - id: schema-verify
     depends_on: [fresh-branch]
     bash: |
-      # set -e intentionally omitted — best-effort (Supabase env may not be in container)
+      # set -e intentionally omitted -- best-effort (Supabase env may not be in container)
       SUPABASE_URL="${SUPABASE_URL:-}"
       SUPABASE_SERVICE_KEY="${SUPABASE_SERVICE_KEY:-}"
       if [ -z "$SUPABASE_URL" ] || [ -z "$SUPABASE_SERVICE_KEY" ]; then
@@ -142,7 +142,7 @@ nodes:
         -H "Authorization: Bearer ${SUPABASE_SERVICE_KEY}" 2>&1) || true
       if echo "$R" | grep -q 'location_beacons'; then
         echo "STATUS=failed_unexpected"
-        echo "DETAIL=location_beacons table ALREADY EXISTS — investigate before proceeding. Response: ${R}"
+        echo "DETAIL=location_beacons table ALREADY EXISTS -- investigate before proceeding. Response: ${R}"
       else
         echo "STATUS=ok"
         echo "DETAIL=location_beacons absent as expected; safe to add migration"
@@ -166,7 +166,7 @@ nodes:
       - Files to modify:
         - shopops-api/routes/wallet.js (add getBeaconForCustomer helper + use in POST /wallet/pass)
         - shopops-api/index.js (mount admin-beacons router under /admin)
-      - Endpoints (§7):
+      - Endpoints (Section 7):
         - POST /admin/locations/:id/beacon
         - POST /admin/locations/:id/beacon/regenerate
         - GET  /admin/locations/:id/beacon
@@ -182,7 +182,7 @@ nodes:
       $schema-verify.output
 
   # -------------------------------------------------------------------------
-  # 5. IMPLEMENT (loop — Rule 10 compliant)
+  # 5. IMPLEMENT (loop -- Rule 10 compliant)
   # -------------------------------------------------------------------------
   - id: implement
     depends_on: [plan]
@@ -201,13 +201,13 @@ nodes:
         $read-spec.output
 
         ## Execution rules
-        1. Create shopops-api/migrations/20260513_location_beacons.sql per §7:
+        1. Create shopops-api/migrations/20260513_location_beacons.sql per Section 7:
            - CREATE TABLE location_beacons with columns location_id (PK FK to locations),
              tenant_id, beacon_uuid (UUID UNIQUE NOT NULL), major (default 1),
              minor (default 1), version (default 1), registered_at, updated_at, notes
            - CREATE INDEX idx_location_beacons_tenant
            - INSERT INTO schema_migrations VALUES ('20260513_location_beacons.sql') ON CONFLICT DO NOTHING
-        2. Create shopops-api/routes/admin-beacons.js with the 4 endpoints from §6.
+        2. Create shopops-api/routes/admin-beacons.js with the 4 endpoints from Section 6.
            Pattern: require('express').Router(); use X-Shopops-Tenant header pattern
            consistent with existing routes/wallet.js. Use crypto.randomUUID() for new UUIDs.
         3. Modify shopops-api/routes/wallet.js:
@@ -218,14 +218,14 @@ nodes:
                   WHERE c.id = $1
            - In POST /wallet/pass handler: call helper; if non-null, pass.beacons[0]
              = { proximityUUID: beacon_uuid, major, minor }. If null, fall back to
-             process.env.WALLET_BEACON_UUID (preserves current behavior — DO NOT remove env path).
+             process.env.WALLET_BEACON_UUID (preserves current behavior -- DO NOT remove env path).
         4. Modify shopops-api/index.js: app.use('/admin', require('./routes/admin-beacons'))
-           OR app.use('/admin/beacons', ...) + app.use('/admin/locations', ...) — pick
-           the pattern that yields the §6 routes exactly.
+           OR app.use('/admin/beacons', ...) + app.use('/admin/locations', ...) -- pick
+           the pattern that yields the Section 6 routes exactly.
         5. Create shopops-api/tests/test_location_beacons.js with bun:test. >= 7 tests
-           covering all 7 scenarios from §11 of the spec. Mock pg pool via factory pattern.
+           covering all 7 scenarios from Section 11 of the spec. Mock pg pool via factory pattern.
            Each test MUST assert actual behavior (response shape, UUID inequality, DB row
-           presence) — not just "did not throw".
+           presence) -- not just "did not throw".
         6. Do NOT modify services/wallet-apn.js, services/wallet-google.js, or any
            pos*.js routes.
         7. Do NOT apply the migration here. Migration application is a deploy-time step.
@@ -264,7 +264,7 @@ nodes:
       echo "verify-grep PASS"
 
   # -------------------------------------------------------------------------
-  # 7. VERIFY TESTS — bun
+  # 7. VERIFY TESTS -- bun
   # -------------------------------------------------------------------------
   - id: verify-tests
     depends_on: [implement]
@@ -294,7 +294,7 @@ nodes:
         echo "No staged changes"
       else
         git -c user.name="John Ranson" -c user.email="admin@bluedevilcollectibles.com" \
-          commit -m "$(printf 'feat(api): WO-POS-BEACON-UUID-PER-LOCATION-01 — per-location iBeacon UUID\n\nAdds shopops-api/migrations/20260513_location_beacons.sql:\n  CREATE TABLE location_beacons(location_id PK, beacon_uuid UNIQUE, major, minor, version, ...)\n\nAdds shopops-api/routes/admin-beacons.js with 4 endpoints:\n  POST /admin/locations/:id/beacon            (register)\n  POST /admin/locations/:id/beacon/regenerate (rotate UUID, bump version)\n  GET  /admin/locations/:id/beacon            (read current)\n  GET  /admin/beacons                          (list all for tenant)\n\nModifies shopops-api/routes/wallet.js:\n  - Adds getBeaconForCustomer(customerId) helper.\n  - POST /wallet/pass now reads per-location UUID from location_beacons,\n    falls back to process.env.WALLET_BEACON_UUID if no row.\n\nAdds shopops-api/tests/test_location_beacons.js with 7+ bun tests covering\nregister, regenerate, read, list, cross-tenant isolation, pass-uses-per-location,\npass-falls-back-to-env.\n\nMounts router in index.js under /admin.\n\nHQ-grade: Mutant Market install 2026-06-15 depends on this. HIGH polish bar.\n\nCo-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>')"
+          commit -m "$(printf 'feat(api): WO-POS-BEACON-UUID-PER-LOCATION-01 -- per-location iBeacon UUID\n\nAdds shopops-api/migrations/20260513_location_beacons.sql:\n  CREATE TABLE location_beacons(location_id PK, beacon_uuid UNIQUE, major, minor, version, ...)\n\nAdds shopops-api/routes/admin-beacons.js with 4 endpoints:\n  POST /admin/locations/:id/beacon            (register)\n  POST /admin/locations/:id/beacon/regenerate (rotate UUID, bump version)\n  GET  /admin/locations/:id/beacon            (read current)\n  GET  /admin/beacons                          (list all for tenant)\n\nModifies shopops-api/routes/wallet.js:\n  - Adds getBeaconForCustomer(customerId) helper.\n  - POST /wallet/pass now reads per-location UUID from location_beacons,\n    falls back to process.env.WALLET_BEACON_UUID if no row.\n\nAdds shopops-api/tests/test_location_beacons.js with 7+ bun tests covering\nregister, regenerate, read, list, cross-tenant isolation, pass-uses-per-location,\npass-falls-back-to-env.\n\nMounts router in index.js under /admin.\n\nHQ-grade: Mutant Market install 2026-06-15 depends on this. HIGH polish bar.\n\nCo-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>')"
       fi
       git push -u origin "$BRANCH"
       echo "BRANCH=${BRANCH}"
@@ -312,7 +312,7 @@ nodes:
       BODY=$(mktemp)
       {
         echo "## Summary"
-        echo "Implements WO-POS-BEACON-UUID-PER-LOCATION-01 — per-location iBeacon UUID."
+        echo "Implements WO-POS-BEACON-UUID-PER-LOCATION-01 -- per-location iBeacon UUID."
         echo "Plan B floor for Mutant Market HQ install (2026-06-15)."
         echo ""
         echo "## Files"
@@ -323,7 +323,7 @@ nodes:
         echo "- Modified: shopops-api/index.js"
         echo ""
         echo "## Stop conditions"
-        echo "See bdc-xo:docs/work-orders/WO-POS-BEACON-UUID-PER-LOCATION-01.md §12."
+        echo "See bdc-xo:docs/work-orders/WO-POS-BEACON-UUID-PER-LOCATION-01.md Section 12."
         echo ""
         echo "## Deploy notes"
         echo "After merge, apply migration via:"
@@ -335,7 +335,7 @@ nodes:
       if [ -n "$EXIST" ]; then echo "PR=$EXIST"; exit 0; fi
       for i in 1 2 3; do
         if URL=$(gh pr create --repo "$REPO" --base master --head "$BRANCH" \
-            --title "feat(api): WO-POS-BEACON-UUID-PER-LOCATION-01 — per-location iBeacon UUID" \
+            --title "feat(api): WO-POS-BEACON-UUID-PER-LOCATION-01 -- per-location iBeacon UUID" \
             --body-file "$BODY" 2>&1); then
           echo "PR=$URL"; exit 0
         fi
@@ -344,12 +344,12 @@ nodes:
       echo "open-pr failed" >&2; exit 1
 
   # -------------------------------------------------------------------------
-  # 10. RUNTIME VERIFY — Rule 19 best-effort
+  # 10. RUNTIME VERIFY -- Rule 19 best-effort
   # -------------------------------------------------------------------------
   - id: runtime-verify
     depends_on: [open-pr]
     bash: |
-      # set -e intentionally omitted — container may not be rebuilt yet
+      # set -e intentionally omitted -- container may not be rebuilt yet
       RESULT=$(docker exec shopops-api grep -n "location_beacons" /app/routes/admin-beacons.js 2>&1)
       EXIT=$?
       if [ $EXIT -eq 0 ]; then
@@ -430,7 +430,7 @@ nodes:
     task_class: clerical
     prompt: |
       Flip Notion WO-POS-BEACON-UUID-PER-LOCATION-01 to REVIEW. Manifest goes in
-      the Notes property (NOT a comment — Captain CI reads Notes).
+      the Notes property (NOT a comment -- Captain CI reads Notes).
 
       Notion database: a6df831c-0b52-449f-8ca4-d77be6b70d0a
       # OPEN QUESTION: page ID for WO-POS-BEACON-UUID-PER-LOCATION-01 not yet authored

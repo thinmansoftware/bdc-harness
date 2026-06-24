@@ -10,11 +10,11 @@
 #
 # Deploy: BDC_XO/scripts/archon-bridge/sync-workflows.sh WO-STOREFRONT-FOOTER-SPACING-01.yaml
 #
-# Polish bar: ROUGH OK — ~30 minute cosmetic fix. Skip exhaustive cross-browser tests.
+# Polish bar: ROUGH OK -- ~30 minute cosmetic fix. Skip exhaustive cross-browser tests.
 
 name: bdc-storefront-footer-spacing
 description: |
-  Use when: Executing WO-STOREFRONT-FOOTER-SPACING-01 — fix run-together footer nav text.
+  Use when: Executing WO-STOREFRONT-FOOTER-SPACING-01 -- fix run-together footer nav text.
   Input: WO_ID = WO-STOREFRONT-FOOTER-SPACING-01.
   Does:
     - Locates the footer component via grep on Catalog + Pull List + Live Shows + About strings.
@@ -87,7 +87,7 @@ nodes:
   - id: locate-footer
     depends_on: [fresh-branch]
     bash: |
-      # set -e DELIBERATELY OMITTED — audit must NEVER fail (BUG-3 tolerant)
+      # set -e DELIBERATELY OMITTED -- audit must NEVER fail (BUG-3 tolerant)
       echo "=== grep for footer-component candidates ==="
       if [ -d app ]; then
         grep -rln "Pull List" app/ 2>/dev/null | head -20 || true
@@ -102,7 +102,7 @@ nodes:
           ls -la "app/shops/[shopSlug]/" 2>/dev/null || true
         fi
       else
-        echo "(app/ not found — non-Next.js layout?)"
+        echo "(app/ not found -- non-Next.js layout?)"
       fi
       # Also tolerate components/ at root
       if [ -d components ]; then
@@ -189,7 +189,7 @@ nodes:
         echo "No staged changes"
       else
         git -c user.name="John Ranson" -c user.email="admin@bluedevilcollectibles.com" \
-          commit -m "$(printf 'fix(storefront): WO-STOREFRONT-FOOTER-SPACING-01 — separate footer nav items\n\nAdds gap-* (or divider) between Catalog / Pull List / Live Shows / About\nin the storefront portal footer. No other changes.\n\nROUGH-OK polish bar — see WO §13 for v1 limitations.\n\nCo-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>')"
+          commit -m "$(printf 'fix(storefront): WO-STOREFRONT-FOOTER-SPACING-01 -- separate footer nav items\n\nAdds gap-* (or divider) between Catalog / Pull List / Live Shows / About\nin the storefront portal footer. No other changes.\n\nROUGH-OK polish bar -- see WO Section 13 for v1 limitations.\n\nCo-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>')"
       fi
       git push -u origin "$BRANCH"
       echo "SHA=$(git rev-parse HEAD)"
@@ -206,7 +206,7 @@ nodes:
       if [ -n "$EXIST" ]; then echo "PR=$EXIST"; exit 0; fi
       for i in 1 2 3; do
         if URL=$(gh pr create --repo "$REPO" --base main --head "$BRANCH" \
-            --title "fix(storefront): WO-STOREFRONT-FOOTER-SPACING-01 — separate footer nav items" \
+            --title "fix(storefront): WO-STOREFRONT-FOOTER-SPACING-01 -- separate footer nav items" \
             --body "ROUGH-OK polish bar. Staging URL: https://staging.comicstoreos.com/shops/bdc/portal/statements" 2>&1); then
           echo "PR=$URL"; exit 0
         fi
@@ -217,7 +217,7 @@ nodes:
   - id: runtime-verify
     depends_on: [open-pr]
     bash: |
-      # Verify staging shows separated items (best-effort — Vercel may not have deployed yet)
+      # Verify staging shows separated items (best-effort -- Vercel may not have deployed yet)
       R=$(curl -s "https://staging.comicstoreos.com/shops/bdc/portal/statements" 2>&1 | head -c 4000)
       EXIT=$?
       if [ $EXIT -eq 0 ] && echo "$R" | grep -q "Pull List"; then
@@ -242,7 +242,7 @@ nodes:
 
       WO: WO-STOREFRONT-FOOTER-SPACING-01
       Builder: Devils Cauldron (Archon bdc-storefront-footer-spacing)
-      Polish bar: ROUGH OK — ~30 min cosmetic fix.
+      Polish bar: ROUGH OK -- ~30 min cosmetic fix.
 
       Files modified:
        - [actual file from $verify-grep.output]

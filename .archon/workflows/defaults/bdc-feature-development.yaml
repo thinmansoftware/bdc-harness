@@ -525,6 +525,38 @@ nodes:
       echo "This is a false/fraudulent completion (anchor 04daeafc). Downstream gate will PAUSE for correction, not commit." >&2
       exit 0
 
+  # ascii-autofix (WO-HARNESS-ASCII-AUTOFIX-WIRE-AND-CLEANUP-01, 2026-06-24).
+  # TOTAL fixer that runs BEFORE ascii-gate. Two tiers: SUBS (semantic map: em-dash,
+  # arrows, box-drawing, etc.) then STRIP fallback (any remaining codepoint >= 0x80
+  # is removed and logged). Output is guaranteed pure ASCII by construction, so the
+  # downstream ascii-gate becomes a verification that cannot fail on agent-leaked
+  # non-ASCII. Exit 0 always (gate is the backstop if the fixer ever has a bug).
+  # Anchor: WO-HARNESS-CAULDRON-PR-MANIFEST-AUTOFILL-01 failed the gate three times
+  # because the agent leaked U+2192 arrows + em-dashes into the YAML it was editing.
+  - id: ascii-autofix
+    persona: major-build
+    depends_on: [assert-implement-produced-work]
+    bash: |
+      set -uo pipefail
+      WT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
+      cd "$WT"
+      if ! command -v python3 >/dev/null 2>&1; then
+        echo "ascii-autofix: WARN -- python3 not found, skipping normalization"
+        exit 0
+      fi
+      # Resolve BASE the SAME way ascii-gate does: immutable run-start SHA first,
+      # then merge-base origin/BASE_BRANCH, then HEAD~1.
+      BASE=$(cat "$ARTIFACTS_DIR/run-start-sha.txt" 2>/dev/null || echo "")
+      if [ -z "$BASE" ] || [ "$BASE" = "unknown" ] || ! git rev-parse --verify "$BASE" >/dev/null 2>&1; then
+        BASE_REF="origin/${BASE_BRANCH:-main}"
+        BASE=$(git merge-base HEAD "$BASE_REF" 2>/dev/null || git rev-parse HEAD~1 2>/dev/null || echo "")
+      fi
+      # Run the total fixer; prefix every output line for node log clarity.
+      python3 harness/scripts/ascii-autofix.py "$BASE" 2>&1 | while IFS= read -r line; do
+        echo "ascii-autofix: $line"
+      done
+      exit 0
+
   # ascii-gate (Rule 13 mechanical enforcement, 2026-06-04 -- WO-HARNESS-CAULDRON-ASCII-ENFORCEMENT).
   # WHY THIS EXISTS: the BDC ASCII-only-source rule lived only in John's personal Windows
   # ~/.claude/CLAUDE.md + a host-side hookify rule. Neither reaches a Cauldron build agent
@@ -535,10 +567,13 @@ nodes:
   # deterministically: it FAILS the build (load_bearing, exit 1) if any changed source file
   # contains a non-ASCII byte. Runs AFTER implement/repair confirmed real work, BEFORE the
   # review + commit-and-push + PR chain, so a violating build never opens a PR / reaches dev.
+  # Updated 2026-06-24 (WO-HARNESS-ASCII-AUTOFIX-WIRE-AND-CLEANUP-01): now runs AFTER the
+  # ascii-autofix TOTAL fixer, so this gate is a verification that should always PASS.
+  # Kept as a cheap defense-in-depth assertion: if the fixer ever has a bug, this catches it.
   # Anchor: a Claude-authored UI build put 87 non-ASCII chars into packages/web and merged.
   - id: ascii-gate
+    depends_on: [ascii-autofix]
     persona: major-build
-    depends_on: [assert-implement-produced-work]
     load_bearing: true
     bash: |
       set -uo pipefail

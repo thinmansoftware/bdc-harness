@@ -3,7 +3,7 @@
 # Doctrine compliance: 13 hard rules of archon-yaml-authoring
 #
 # Pre-flight: codebases bluedevilcollectibles/shopops + bluedevilcollectibles/lspro-react
-#   registered in Archon. VOICE_BRIDGE is local-machine deploy (G10 box, no CI) —
+#   registered in Archon. VOICE_BRIDGE is local-machine deploy (G10 box, no CI) --
 #   VOICE_BRIDGE patches are produced as a diff file in the manifest for John to
 #   apply manually.
 #
@@ -15,7 +15,7 @@
 
 name: bdc-pos-voice-assistant-wiring
 description: |
-  Use when: Executing WO-POS-VOICE-ASSISTANT-WIRING-01 — Voice Bridge wiring for POS.
+  Use when: Executing WO-POS-VOICE-ASSISTANT-WIRING-01 -- Voice Bridge wiring for POS.
   Input: WO_ID = WO-POS-VOICE-ASSISTANT-WIRING-01.
   Does: Reads spec from bdc-xo. Implements shopops-api pos-voice routes (customer-context
         + SSE events + state + log) + pos_voice_log migration + bun tests. Implements
@@ -154,14 +154,14 @@ nodes:
         $read-spec.output
 
         Rules:
-        1. Migration creates pos_voice_log per WO §7.
-        2. routes/pos-voice.js exports 4 endpoints per WO §7:
+        1. Migration creates pos_voice_log per WO Section 7.
+        2. routes/pos-voice.js exports 4 endpoints per WO Section 7:
            POST /pos/voice/customer-context, GET /pos/voice/events (SSE),
            POST /pos/voice/state, POST /pos/voice/log.
         3. services/voice-events.js manages per-tenant SSE subscribers
            (Map<tenantId, Set<response>>); broadcastState(tenantId, payload).
         4. POST /pos/voice/state requires shared secret VOICE_BRIDGE_TOKEN header.
-        5. tests/test_pos_voice.js — >= 5 bun tests per WO §11.
+        5. tests/test_pos_voice.js -- >= 5 bun tests per WO Section 11.
         6. Mount in index.js.
         7. NO push, NO docker.
 
@@ -186,7 +186,7 @@ nodes:
 
         Rules:
         1. VoiceStateIndicator.tsx subscribes to EventSource('/api/pos/voice/events').
-           Renders mic icon + waveform + caption per WO §6 state matrix.
+           Renders mic icon + waveform + caption per WO Section 6 state matrix.
         2. CustomerTakeoverScreen.tsx listens for SSE event type='customer_arrived',
            fetches POST /api/pos/voice/customer-context, renders overlay.
         3. >= 2 component tests per file (4 total minimum).
@@ -206,7 +206,7 @@ nodes:
         - integration into existing wake-word handler
 
       Save the diff to voice-bridge-patch.diff in the shopops CWD root. This file
-      is a manifest artifact — John applies it manually on G10. Do NOT push.
+      is a manifest artifact -- John applies it manually on G10. Do NOT push.
 
       ## Spec
       $read-spec.output
@@ -264,7 +264,7 @@ nodes:
         echo "No staged changes"
       else
         git -c user.name="John Ranson" -c user.email="admin@bluedevilcollectibles.com" \
-          commit -m "$(printf 'feat(api): WO-POS-VOICE-ASSISTANT-WIRING-01 — pos-voice routes + SSE + voice-bridge patch\n\nAdds routes/pos-voice.js (customer-context, events SSE, state, log).\nAdds services/voice-events.js (SSE multiplexer).\nAdds migration 20260513_pos_voice_log.sql.\nAdds tests/test_pos_voice.js (5+ tests).\nIncludes voice-bridge-patch.diff for John to apply on G10.\n\nCo-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>')"
+          commit -m "$(printf 'feat(api): WO-POS-VOICE-ASSISTANT-WIRING-01 -- pos-voice routes + SSE + voice-bridge patch\n\nAdds routes/pos-voice.js (customer-context, events SSE, state, log).\nAdds services/voice-events.js (SSE multiplexer).\nAdds migration 20260513_pos_voice_log.sql.\nAdds tests/test_pos_voice.js (5+ tests).\nIncludes voice-bridge-patch.diff for John to apply on G10.\n\nCo-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>')"
       fi
       git push -u origin "$BRANCH"
       echo "SHOPOPS_SHA=$(git rev-parse HEAD)"
@@ -277,7 +277,7 @@ nodes:
       BODY=$(mktemp)
       {
         echo "## Summary"
-        echo "Implements WO-POS-VOICE-ASSISTANT-WIRING-01 (shopops half) — POS voice routes + SSE."
+        echo "Implements WO-POS-VOICE-ASSISTANT-WIRING-01 (shopops half) -- POS voice routes + SSE."
         echo ""
         echo "## Files"
         echo "- Created: migrations/20260513_pos_voice_log.sql, routes/pos-voice.js, services/voice-events.js, tests/test_pos_voice.js"
@@ -289,7 +289,7 @@ nodes:
       if [ -n "$EXIST" ]; then echo "SHOPOPS_PR=$EXIST"; exit 0; fi
       for i in 1 2 3; do
         if URL=$(gh pr create --repo bluedevilcollectibles/shopops --base master --head "$BRANCH" \
-            --title "feat(api): WO-POS-VOICE-ASSISTANT-WIRING-01 — pos-voice + SSE" \
+            --title "feat(api): WO-POS-VOICE-ASSISTANT-WIRING-01 -- pos-voice + SSE" \
             --body-file "$BODY" 2>&1); then
           echo "SHOPOPS_PR=$URL"; exit 0
         fi
@@ -308,7 +308,7 @@ nodes:
         echo "No lspro changes"
       else
         git -c user.name="John Ranson" -c user.email="admin@bluedevilcollectibles.com" \
-          commit -m "$(printf 'feat(pos): WO-POS-VOICE-ASSISTANT-WIRING-01 — VoiceStateIndicator + CustomerTakeoverScreen\n\nAdds src/pos/VoiceStateIndicator.tsx (SSE-subscribed mic state).\nAdds src/pos/CustomerTakeoverScreen.tsx (beacon arrival overlay).\n\nCo-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>')"
+          commit -m "$(printf 'feat(pos): WO-POS-VOICE-ASSISTANT-WIRING-01 -- VoiceStateIndicator + CustomerTakeoverScreen\n\nAdds src/pos/VoiceStateIndicator.tsx (SSE-subscribed mic state).\nAdds src/pos/CustomerTakeoverScreen.tsx (beacon arrival overlay).\n\nCo-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>')"
       fi
       git push -u origin "$BRANCH"
       BODY=$(mktemp)
@@ -318,7 +318,7 @@ nodes:
       if [ -n "$EXIST" ]; then echo "LSPRO_PR=$EXIST"; exit 0; fi
       for i in 1 2 3; do
         if URL=$(gh pr create --repo bluedevilcollectibles/lspro-react --base main --head "$BRANCH" \
-            --title "feat(pos): WO-POS-VOICE-ASSISTANT-WIRING-01 — voice state UI" \
+            --title "feat(pos): WO-POS-VOICE-ASSISTANT-WIRING-01 -- voice state UI" \
             --body-file "$BODY" 2>&1); then
           echo "LSPRO_PR=$URL"; exit 0
         fi

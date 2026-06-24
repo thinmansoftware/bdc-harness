@@ -1,6 +1,6 @@
 name: bdc-ce-promotion-gate
 description: |
-  Use when: Shipping WO-CI-CE-PROMOTION-GATE-01 — Captain CI gate that blocks unsafe main→release/ce promotions.
+  Use when: Shipping WO-CI-CE-PROMOTION-GATE-01 -- Captain CI gate that blocks unsafe main->release/ce promotions.
   Input: WO_ID = WO-CI-CE-PROMOTION-GATE-01.
   Does: Adds GitHub Actions workflow .github/workflows/ce-promotion-gate.yml on lspro-react that
         runs when a PR targets release/ce. Checks: source is main or promotion/ce/*, PR body
@@ -68,13 +68,13 @@ nodes:
         `.github/workflows/ce-promotion-gate.yml`
 
         ## Checks (each is a job step)
-        1. **Source branch valid** — pr.head.ref must be `main` or match `promotion/ce/*`. Fail if not.
-        2. **PR body matches promotion template** — check for required headings: "Commits included", "CE impact", "Shared systems touched", "Regression result", "Risk summary", "Rollback plan". Fail if any missing.
-        3. **CE regression check** — wait for `ce-regression` check (from WO-CI-CE-REGRESSION-SUITE-01) to pass. Block until it does.
-        4. **No PRO/HQ labels introduced** — `gh pr view --json labels --jq '.labels[].name'` must NOT include any of: `pro-feature`, `hq-feature`, `multi-category`, `experimental`. Fail if present.
-        5. **No entitlement registry drift** — compare `src/lib/tiers.ts` diff: if any line touching `ce` plan removed/changed, require explicit `ce-entitlement-change` label. Fail if missing.
-        6. **No deploy config drift** — fail if `.github/workflows/` files touched without `ce-deploy-config` label.
-        7. **No forbidden file patterns** — fail if any `**/experimental/**`, `**/hq/**`, `**/pro-only/**` paths modified.
+        1. **Source branch valid** -- pr.head.ref must be `main` or match `promotion/ce/*`. Fail if not.
+        2. **PR body matches promotion template** -- check for required headings: "Commits included", "CE impact", "Shared systems touched", "Regression result", "Risk summary", "Rollback plan". Fail if any missing.
+        3. **CE regression check** -- wait for `ce-regression` check (from WO-CI-CE-REGRESSION-SUITE-01) to pass. Block until it does.
+        4. **No PRO/HQ labels introduced** -- `gh pr view --json labels --jq '.labels[].name'` must NOT include any of: `pro-feature`, `hq-feature`, `multi-category`, `experimental`. Fail if present.
+        5. **No entitlement registry drift** -- compare `src/lib/tiers.ts` diff: if any line touching `ce` plan removed/changed, require explicit `ce-entitlement-change` label. Fail if missing.
+        6. **No deploy config drift** -- fail if `.github/workflows/` files touched without `ce-deploy-config` label.
+        7. **No forbidden file patterns** -- fail if any `**/experimental/**`, `**/hq/**`, `**/pro-only/**` paths modified.
 
         Each check posts a PR comment with pass/fail reasons.
 
@@ -120,7 +120,7 @@ nodes:
         echo "No staged changes; branch already contains requested work"
       else
         git -c user.name="John Ranson" -c user.email="admin@bluedevilcollectibles.com" \
-          commit -m "feat(ci): WO-CI-CE-PROMOTION-GATE-01 — Captain CI gate for main → release/ce
+          commit -m "feat(ci): WO-CI-CE-PROMOTION-GATE-01 -- Captain CI gate for main -> release/ce
 
         Adds .github/workflows/ce-promotion-gate.yml. Runs on PRs targeting release/ce.
         7 checks: source branch valid, PR body template, CE regression, no PRO/HQ labels,
@@ -135,12 +135,12 @@ nodes:
     depends_on: [commit-and-push]
     bash: |
       set -euo pipefail
-      # Hardcoded — must match commit-and-push BRANCH literal. See WO-HARNESS-OPEN-PR-BRANCH-INTERPOLATION-FIX-01.
+      # Hardcoded -- must match commit-and-push BRANCH literal. See WO-HARNESS-OPEN-PR-BRANCH-INTERPOLATION-FIX-01.
       BRANCH="wo/ci-ce-promotion-gate-01"
       REPO="bluedevilcollectibles/lspro-react"
       BASE="main"
-      TITLE="feat(ci): WO-CI-CE-PROMOTION-GATE-01 — CE promotion gate"
-      BODY="Implements WO-CI-CE-PROMOTION-GATE-01. Adds Captain CI workflow that gates PRs targeting release/ce. 7 checks. 🤖 Generated with Claude Code"
+      TITLE="feat(ci): WO-CI-CE-PROMOTION-GATE-01 -- CE promotion gate"
+      BODY="Implements WO-CI-CE-PROMOTION-GATE-01. Adds Captain CI workflow that gates PRs targeting release/ce. 7 checks.  Generated with Claude Code"
       # Idempotent PR creation. See WO-HARNESS-OPEN-PR-GRAPHQL-NO-COMMITS-FIX-01.
       existing_pr_url() {
         gh pr list --repo "$REPO" --head "$BRANCH" --state open --json url --jq '.[0].url // empty' 2>/dev/null

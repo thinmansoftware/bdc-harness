@@ -5,7 +5,7 @@
 # Pre-flight (4-block):
 #   1. YAML exists.
 #   2. Spec: bdc-xo:docs/work-orders/WO-SHOPOPS-INVENTORY-SCAN-VALIDATION-01.md
-#   3. CWD scope = shopops repo (subdir shopops-api/) — single-repo MIXED, no UI.
+#   3. CWD scope = shopops repo (subdir shopops-api/) -- single-repo MIXED, no UI.
 #   4. Codebase bluedevilcollectibles/shopops registered.
 #
 # parallel_ok: YES (new table only; no shared-table writes; no FK to multi-location migration).
@@ -15,7 +15,7 @@
 
 name: bdc-shopops-inventory-scan-validation
 description: |
-  Use when: Executing WO-SHOPOPS-INVENTORY-SCAN-VALIDATION-01 — duplicate/qty/unexpected
+  Use when: Executing WO-SHOPOPS-INVENTORY-SCAN-VALIDATION-01 -- duplicate/qty/unexpected
             detection on shipment ingest.
   Input: WO_ID = WO-SHOPOPS-INVENTORY-SCAN-VALIDATION-01.
   Does: Adds shipment_exceptions table (migration 20260515). Adds
@@ -25,8 +25,8 @@ description: |
         to call validator and emit exceptions array in response. 6+ bun tests.
         Commits, opens PR, Rule 19 docker exec verify, MIXED manifest, flip-notion REVIEW.
   Repo: bluedevilcollectibles/shopops (single-repo, no UI).
-  parallel_ok: true — new table only.
-  Polish bar: ROUGH OK — detection-only v1; no auto-resolution; no UI; manual SQL fix
+  parallel_ok: true -- new table only.
+  Polish bar: ROUGH OK -- detection-only v1; no auto-resolution; no UI; manual SQL fix
               by staff is acceptable.
 
 policyFile: harness/policies/agent-behavior.md
@@ -143,12 +143,12 @@ nodes:
       Backend (shopops-api):
       - migrations/20260515_shipment_exceptions.sql (single new table + 2 indexes)
       - services/shipmentValidator.js:
-          * detectDuplicateUpcs(lines) — pure
-          * detectQtyMismatches(lines, distributorOrderLines) — pure
-          * detectUnexpectedItems(lines, distributorOrderLines) — pure
-          * validateShipmentLines(shipmentId) — orchestrator + DB writes
-      - Modify routes/shipments.js — invoke validateShipmentLines after commit; add exceptions to response
-      - tests/test_shipment_validator.js — 6 unit tests (one per scenario A-F in WO spec)
+          * detectDuplicateUpcs(lines) -- pure
+          * detectQtyMismatches(lines, distributorOrderLines) -- pure
+          * detectUnexpectedItems(lines, distributorOrderLines) -- pure
+          * validateShipmentLines(shipmentId) -- orchestrator + DB writes
+      - Modify routes/shipments.js -- invoke validateShipmentLines after commit; add exceptions to response
+      - tests/test_shipment_validator.js -- 6 unit tests (one per scenario A-F in WO spec)
 
       v1 NOT in scope: auto-resolution, exception management UI, alerts, batch resolve endpoints.
 
@@ -183,7 +183,7 @@ nodes:
            CREATE INDEX IF NOT EXISTS shipment_exceptions_shipment_idx ON shipment_exceptions(shipment_id);
            CREATE INDEX IF NOT EXISTS shipment_exceptions_open_idx ON shipment_exceptions(tenant_id) WHERE resolved_at IS NULL;
 
-        2. shopops-api/services/shipmentValidator.js — three pure detectors + orchestrator:
+        2. shopops-api/services/shipmentValidator.js -- three pure detectors + orchestrator:
            - detectDuplicateUpcs(lines): returns [{ upc, line_ids: [...] }]
            - detectQtyMismatches(lines, distributorOrderLines): [{ line_id, scanned, expected }]
            - detectUnexpectedItems(lines, distributorOrderLines): [{ line_id, upc }]
@@ -197,7 +197,7 @@ nodes:
            After existing ingest commits lines (do NOT change commit logic):
              const exceptions = await validateShipmentLines(shipmentId);
              res.json({ ...existing_body, exceptions });
-           Do NOT block ingest on exceptions — informational only in v1.
+           Do NOT block ingest on exceptions -- informational only in v1.
 
         4. shopops-api/tests/test_shipment_validator.js (bun, >= 6 tests):
            - duplicate_upc detected (scenario A)
@@ -245,7 +245,7 @@ nodes:
     depends_on: [verify-grep, verify-tests]
     bash: |
       set -euo pipefail
-      # Use current HEAD branch (set by fresh-branch — may be timestamped variant)
+      # Use current HEAD branch (set by fresh-branch -- may be timestamped variant)
       BRANCH="$(git rev-parse --abbrev-ref HEAD)"
       git add \
         shopops-api/migrations/20260515_shipment_exceptions.sql \
@@ -256,7 +256,7 @@ nodes:
         echo "No staged changes"
       else
         git -c user.name="John Ranson" -c user.email="admin@bluedevilcollectibles.com" \
-          commit -m "$(printf 'feat(api): WO-SHOPOPS-INVENTORY-SCAN-VALIDATION-01 — shipment exception detection\n\nAdds shipment_exceptions table (migration 20260515).\nAdds services/shipmentValidator.js with three pure detectors\n(detectDuplicateUpcs, detectQtyMismatches, detectUnexpectedItems) +\nvalidateShipmentLines orchestrator.\n\nExtends routes/shipments.js ingest path: calls validator after line commit,\nemits exceptions array in response body. Does NOT block ingest (informational v1).\n\n6+ bun tests (one per detection scenario + clean shipment + response shape).\n\nPlan: A (P1 extension for Mutant Market 2026-06-15)\nPolish bar: ROUGH OK — v1 detection-only. No auto-resolution, no UI.\n            Staff resolves via SQL until v1.1 exception management UI ships.\n\nCo-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>')"
+          commit -m "$(printf 'feat(api): WO-SHOPOPS-INVENTORY-SCAN-VALIDATION-01 -- shipment exception detection\n\nAdds shipment_exceptions table (migration 20260515).\nAdds services/shipmentValidator.js with three pure detectors\n(detectDuplicateUpcs, detectQtyMismatches, detectUnexpectedItems) +\nvalidateShipmentLines orchestrator.\n\nExtends routes/shipments.js ingest path: calls validator after line commit,\nemits exceptions array in response body. Does NOT block ingest (informational v1).\n\n6+ bun tests (one per detection scenario + clean shipment + response shape).\n\nPlan: A (P1 extension for Mutant Market 2026-06-15)\nPolish bar: ROUGH OK -- v1 detection-only. No auto-resolution, no UI.\n            Staff resolves via SQL until v1.1 exception management UI ships.\n\nCo-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>')"
       fi
       git push -u origin "$BRANCH"
       echo "BRANCH=${BRANCH}"
@@ -269,9 +269,9 @@ nodes:
       BRANCH="$(git rev-parse --abbrev-ref HEAD)"
       REPO="bluedevilcollectibles/shopops"
       BASE="master"
-      TITLE="feat(api): WO-SHOPOPS-INVENTORY-SCAN-VALIDATION-01 — shipment exception detection"
+      TITLE="feat(api): WO-SHOPOPS-INVENTORY-SCAN-VALIDATION-01 -- shipment exception detection"
       BODY_FILE=$(mktemp)
-      printf '## Summary\nImplements WO-SHOPOPS-INVENTORY-SCAN-VALIDATION-01 — detection-only v1.\n\n## Plan: A (P1)\n## Polish bar: ROUGH OK — staff resolves via SQL in v1.\nv1 NOT in scope: auto-resolution, resolve endpoints, exception management UI, alerts.\n\n## Apply migration 20260515_shipment_exceptions.sql to staging Supabase BEFORE merging.\n' > "$BODY_FILE"
+      printf '## Summary\nImplements WO-SHOPOPS-INVENTORY-SCAN-VALIDATION-01 -- detection-only v1.\n\n## Plan: A (P1)\n## Polish bar: ROUGH OK -- staff resolves via SQL in v1.\nv1 NOT in scope: auto-resolution, resolve endpoints, exception management UI, alerts.\n\n## Apply migration 20260515_shipment_exceptions.sql to staging Supabase BEFORE merging.\n' > "$BODY_FILE"
       existing_pr_url() { gh pr list --repo "$REPO" --head "$BRANCH" --state open --json url --template '{{range .}}{{.url}}{{end}}' 2>/dev/null; }
       PR_URL="$(existing_pr_url)"
       if [ -n "$PR_URL" ]; then echo "PR_URL=$PR_URL"; exit 0; fi
@@ -326,7 +326,7 @@ nodes:
         docker exec shopops-api node -e "<count shipment_exceptions>"
       Schema migration: apply 20260515 to staging Supabase before container rebuild.
         Post-apply: SELECT table_name FROM information_schema.tables WHERE table_name='shipment_exceptions' -- expect 1
-      Vercel deployment: N/A — Hetzner Docker
+      Vercel deployment: N/A -- Hetzner Docker
       v1 limitations explicit:
         - detection only; no auto-resolution
         - no exception management UI
