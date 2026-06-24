@@ -1731,21 +1731,43 @@ nodes:
         exit 1
       fi
 
-      # -- Derive base branch from decide-push-target (staging-gate repos branch
-      #    from staging, others from dev). Mirrors open-pr-if-needed's parse.
-      STAGING_GATE=$(printf '%s\n' "$DECIDE_OUT" | grep -c '^staging_gate_required: true' 2>/dev/null || true)
-      STAGING_GATE="${STAGING_GATE:-0}"
-      if [ "$STAGING_GATE" -ge 1 ] 2>/dev/null; then
-        BASE_REF="origin/staging"
-      else
-        BASE_REF="origin/dev"
+      # -- Derive base branch from the ACTUAL PR (gh pr view), not from a guess.
+      #    open-pr-if-needed passes --base staging for staging-gate repos and
+      #    otherwise omits --base, so gh uses each repo's default branch (which
+      #    may be 'main' on some repos and 'dev' on others). Asking the PR for
+      #    its baseRefName is the only reliable source.
+      PR_BASE=$(gh pr view "$PR_URL" --repo "$REPO" --json baseRefName --jq '.baseRefName' 2>/dev/null || echo "")
+      if [ -z "$PR_BASE" ]; then
+        echo "ERROR: could not read baseRefName from $PR_URL (gh pr view failed) -- cannot derive file lists." >&2
+        exit 1
       fi
+      BASE_REF="origin/${PR_BASE}"
+      # Make sure the local ref is fresh enough to diff against -- in container
+      # runs the worktree may not have fetched the latest base.
+      git fetch --quiet origin "${PR_BASE}" 2>/dev/null || true
 
-      # -- Derive file lists from git diff (the #307 lesson: NEVER list
-      #    preserved/unchanged files -- the validator's sparse checkout cannot
-      #    see them and CHECK 2 will fail).
-      FILES_CREATED=$(git diff --name-status "${BASE_REF}...HEAD" 2>/dev/null | awk '$1=="A"{print $2}' | paste -sd ',' - || echo 'none')
-      FILES_MODIFIED=$(git diff --name-status "${BASE_REF}...HEAD" 2>/dev/null | awk '$1=="M"{print $2}' | paste -sd ',' - || echo 'none')
+      # -- Derive file lists from git diff --name-status (the #307 lesson: NEVER
+      #    list preserved/unchanged files -- the validator's sparse checkout
+      #    cannot see them and CHECK 2 will fail). Map every status the validator
+      #    understands so deletion-only and rename-only PRs do not emit 'none':
+      #      A         -> Files created
+      #      M         -> Files modified
+      #      D         -> Files modified, annotated "(deleted)"  (validator
+      #                   CHECK 2 confirms via `git log --diff-filter=D`)
+      #      R<score>  -> rename: new path -> Files created;
+      #                   old path -> Files modified "(deleted)"
+      #      C<score>  -> copy:   new path -> Files created (source untouched)
+      NAME_STATUS=$(git diff --name-status "${BASE_REF}...HEAD" 2>/dev/null || true)
+      FILES_CREATED=$(printf '%s\n' "$NAME_STATUS" | awk -F'\t' '
+        $1=="A"           { print $2 }
+        $1 ~ /^R[0-9]*$/  { print $3 }
+        $1 ~ /^C[0-9]*$/  { print $3 }
+      ' | grep -v '^$' | paste -sd ',' -)
+      FILES_MODIFIED=$(printf '%s\n' "$NAME_STATUS" | awk -F'\t' '
+        $1=="M"           { print $2 }
+        $1=="D"           { printf "%s (deleted)\n", $2 }
+        $1 ~ /^R[0-9]*$/  { printf "%s (deleted)\n", $2 }
+      ' | grep -v '^$' | paste -sd ',' -)
       [ -z "$FILES_CREATED" ] && FILES_CREATED="none"
       [ -z "$FILES_MODIFIED" ] && FILES_MODIFIED="none"
 
@@ -1776,8 +1798,15 @@ nodes:
       [ -z "$GREP_ASSERT" ] && GREP_ASSERT="N/A (manifest auto-generated; see Tests)"
       RT_VERIFY=$(extract "Runtime verification")
       [ -z "$RT_VERIFY" ] && RT_VERIFY="N/A (deploy via sync-workflows.sh; see workflow run)"
-      VALIDATION_LINE=$(printf '%s\n' "$MANIFEST_OUT" | grep -E '^VALIDATION:' | head -1)
-      [ -z "$VALIDATION_LINE" ] && VALIDATION_LINE="VALIDATION: PASS"
+      # -- Validation line: extract the explicit VALIDATION (or INFRA VALIDATION)
+      #    marker emitted by build-manifest. Fail CLOSED if it is missing -- per
+      #    Rule 14 the manifest MUST include a validation line, and silently
+      #    defaulting to "VALIDATION: PASS" would let an unvalidated build
+      #    slip past Captain CI (the #321 hazard).
+      VALIDATION_LINE=$(printf '%s\n' "$MANIFEST_OUT" | grep -E '^(INFRA )?VALIDATION:' | head -1)
+      if [ -z "$VALIDATION_LINE" ]; then
+        VALIDATION_LINE="VALIDATION: NOT_EMITTED -- build-manifest did not include a VALIDATION line; Captain CI must reject"
+      fi
 
       # -- Assemble v2 manifest block. Use printf (not heredoc) so the bash
       #    source stays indented inside the YAML block scalar.
