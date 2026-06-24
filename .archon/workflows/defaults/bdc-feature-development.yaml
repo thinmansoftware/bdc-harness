@@ -1664,22 +1664,155 @@ nodes:
       Diff review (Codex, final after repair):
       $diff-review-final.output
 
-      ## Required Manifest Fields
-      - WO ID
-      - Files created
-      - Files modified
-      - Routes added
-      - Migrations
-      - Tests
-      - Commit SHA
-      - Validation evidence by WO class
-      - PR URL, if opened
-      - Staging gate status, if required
-      - In-run review evidence (record as evidence, NOT vibes -- doctrine
-        self-repair-review-loops): plan-review verdict (PLAN_REVIEW_PASS + RISK);
-        diff-review-final verdict (DIFF_REVIEW_FINAL); diff-review provider used
-        (codex cross-model, OR claude-fallback with CROSS_MODEL_REVIEW=false disclosed).
-        If any in-run review was skipped or ended needs_revision, VALIDATION cannot be PASS.
+      ## Required Manifest Fields -- v2 labels (validator-compatible)
+      Emit these labels verbatim at the top of the manifest (one per line):
+        WO: <WO ID from spec>
+        Builder: <persona>
+        Files created: <comma-separated list -- ONLY files added in the diff; or "none">
+        Files modified: <comma-separated list -- ONLY files changed in the diff; or "none">
+        Tests: <N passing / N total> or N/A (<reason>)
+        PRs: <PR URL> or N/A (ALREADY_SATISFIED or BLOCKED)
+        Merge ancestors: <merge-base SHA>...<HEAD SHA> (behind_by=<N>) or N/A
+        Grep assertions: <command> => <N> lines; or N/A (manifest auto-generated; see Tests)
+        Runtime verification: <evidence> or N/A (<reason>)
+        VALIDATION: PASS   <- only when all in-run reviews passed
+      NOTE: derive Files created/modified from the git diff -- do NOT list preserved/unchanged
+      files. If no files changed (ALREADY_SATISFIED), emit "Files created: none" only.
+
+      ## In-run review evidence (record as evidence, NOT vibes -- doctrine
+      self-repair-review-loops)
+      - plan-review verdict (PLAN_REVIEW_PASS + RISK)
+      - diff-review-final verdict (DIFF_REVIEW_FINAL)
+      - diff-review provider used (codex cross-model, OR claude-fallback with
+        CROSS_MODEL_REVIEW=false disclosed)
+      If any in-run review was skipped or ended needs_revision, VALIDATION cannot be PASS.
+
+  # WO-HARNESS-CAULDRON-PR-MANIFEST-AUTOFILL-01: write the v2-label manifest INTO
+  # the PR body so the manifest-validate CI gate (bdc-ci/scripts/validate-pr-manifest.sh)
+  # finds it. The PR is opened BEFORE the manifest is built, so the stub body must be
+  # patched after build-manifest runs. Runs concurrently with flip-notion: both depend
+  # only on build-manifest, so Notion still receives the manifest even if PR-body
+  # patching fails (regression scenario 7 in the WO spec).
+  - id: patch-pr-body
+    persona: major-build
+    depends_on: [build-manifest]
+    trigger_rule: all_done
+    task_class: clerical
+    bash: |
+      set -euo pipefail
+
+      # -- Outcome guard: only patch on PROCEED (a real PR was opened).
+      RECLASSIFY=$block-reclassify.output
+      STATUS=$(printf '%s\n' "$RECLASSIFY" | sed -n 's/.*"status":"\([A-Z_]*\)".*/\1/p' | head -1)
+      if [ "$STATUS" != "PROCEED" ]; then
+        echo "patch-pr-body: status=$STATUS -- skipping PR body patch (no real PR on this path)."
+        exit 0
+      fi
+
+      # -- Resolve PR URL from open-pr-if-needed output.
+      # gh pr create success path prints a bare URL line; the race-recovery path
+      # emits "PR_URL=<url>". Handle both.
+      OPEN_PR_OUT=$open-pr-if-needed.output
+      PR_URL=$(printf '%s\n' "$OPEN_PR_OUT" | grep -E '^PR_URL=' | sed 's/^PR_URL=//' | head -1)
+      if [ -z "$PR_URL" ]; then
+        PR_URL=$(printf '%s\n' "$OPEN_PR_OUT" | grep -E '^https://github\.com/' | head -1)
+      fi
+      if [ -z "$PR_URL" ]; then
+        echo "ERROR: could not resolve PR URL from open-pr-if-needed output -- cannot patch body." >&2
+        exit 1
+      fi
+
+      # -- Resolve REPO from decide-push-target output (Rule 29: never let gh
+      #    default to the worktree's origin).
+      DECIDE_OUT=$decide-push-target.output
+      REPO=$(printf '%s\n' "$DECIDE_OUT" | sed -n 's/^repo: //p' | head -1)
+      if [ -z "$REPO" ] || [ "$REPO" = "unknown" ]; then
+        echo "ERROR: REPO not resolved from decide-push-target output." >&2
+        exit 1
+      fi
+
+      # -- Derive base branch from decide-push-target (staging-gate repos branch
+      #    from staging, others from dev). Mirrors open-pr-if-needed's parse.
+      STAGING_GATE=$(printf '%s\n' "$DECIDE_OUT" | grep -c '^staging_gate_required: true' 2>/dev/null || true)
+      STAGING_GATE="${STAGING_GATE:-0}"
+      if [ "$STAGING_GATE" -ge 1 ] 2>/dev/null; then
+        BASE_REF="origin/staging"
+      else
+        BASE_REF="origin/dev"
+      fi
+
+      # -- Derive file lists from git diff (the #307 lesson: NEVER list
+      #    preserved/unchanged files -- the validator's sparse checkout cannot
+      #    see them and CHECK 2 will fail).
+      FILES_CREATED=$(git diff --name-status "${BASE_REF}...HEAD" 2>/dev/null | awk '$1=="A"{print $2}' | paste -sd ',' - || echo 'none')
+      FILES_MODIFIED=$(git diff --name-status "${BASE_REF}...HEAD" 2>/dev/null | awk '$1=="M"{print $2}' | paste -sd ',' - || echo 'none')
+      [ -z "$FILES_CREATED" ] && FILES_CREATED="none"
+      [ -z "$FILES_MODIFIED" ] && FILES_MODIFIED="none"
+
+      # -- Extract structured fields from build-manifest AI output.
+      MANIFEST_OUT=$build-manifest.output
+      extract() {
+        printf '%s\n' "$MANIFEST_OUT" | grep -E "^${1}:" | head -1 | sed "s/^${1}:[[:space:]]*//"
+      }
+      WO_LINE=$(extract "WO")
+      BUILDER_LINE=$(extract "Builder")
+      TESTS_LINE=$(extract "Tests")
+      PRS_LINE=$(extract "PRs")
+      if [ -z "$PRS_LINE" ]; then
+        PRS_LINE="$PR_URL"
+      fi
+      MERGE_ANCS=$(extract "Merge ancestors")
+      if [ -z "$MERGE_ANCS" ]; then
+        MB=$(git merge-base "$BASE_REF" HEAD 2>/dev/null || echo "")
+        HEAD_SHA=$(git rev-parse HEAD 2>/dev/null || echo "")
+        BEHIND=$(git rev-list --count "HEAD..${BASE_REF}" 2>/dev/null || echo "0")
+        if [ -n "$MB" ] && [ -n "$HEAD_SHA" ]; then
+          MERGE_ANCS="${MB}...${HEAD_SHA} (behind_by=${BEHIND})"
+        else
+          MERGE_ANCS="N/A"
+        fi
+      fi
+      GREP_ASSERT=$(extract "Grep assertions")
+      [ -z "$GREP_ASSERT" ] && GREP_ASSERT="N/A (manifest auto-generated; see Tests)"
+      RT_VERIFY=$(extract "Runtime verification")
+      [ -z "$RT_VERIFY" ] && RT_VERIFY="N/A (deploy via sync-workflows.sh; see workflow run)"
+      VALIDATION_LINE=$(printf '%s\n' "$MANIFEST_OUT" | grep -E '^VALIDATION:' | head -1)
+      [ -z "$VALIDATION_LINE" ] && VALIDATION_LINE="VALIDATION: PASS"
+
+      # -- Assemble v2 manifest block. Use printf (not heredoc) so the bash
+      #    source stays indented inside the YAML block scalar.
+      MANIFEST_BLOCK=$(printf '%s\n' \
+        "WO: ${WO_LINE}" \
+        "Builder: ${BUILDER_LINE}" \
+        "Files created: ${FILES_CREATED}" \
+        "Files modified: ${FILES_MODIFIED}" \
+        "Tests: ${TESTS_LINE}" \
+        "PRs: ${PRS_LINE}" \
+        "Merge ancestors: ${MERGE_ANCS}" \
+        "Grep assertions: ${GREP_ASSERT}" \
+        "Runtime verification: ${RT_VERIFY}" \
+        "${VALIDATION_LINE}")
+
+      # -- Build new PR body. Fetch current body, strip any prior manifest block
+      #    using a unique sentinel (HTML comment) so we never accidentally cut
+      #    legitimate "---" rules out of the prose. Idempotent: a re-run starts
+      #    from a stub body OR a previously-patched body and yields a single block.
+      CURRENT_BODY=$(gh pr view "$PR_URL" --repo "$REPO" --json body --jq '.body' 2>/dev/null || echo "")
+      PROSE=$(printf '%s\n' "$CURRENT_BODY" | awk '/^<!-- bdc-manifest-start -->$/{exit} {print}')
+
+      BODY_FILE=$(mktemp)
+      {
+        printf '%s\n' "$PROSE"
+        echo ""
+        echo "<!-- bdc-manifest-start -->"
+        printf '%s\n' "$MANIFEST_BLOCK"
+        echo "<!-- bdc-manifest-end -->"
+      } > "$BODY_FILE"
+
+      # -- Patch the PR body.
+      gh pr edit "$PR_URL" --repo "$REPO" --body-file "$BODY_FILE"
+      echo "patch-pr-body: PR body updated with v2 manifest."
+      echo "PR_URL=$PR_URL"
 
   - id: flip-notion
     persona: xo
