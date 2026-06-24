@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 # test-ascii-autofix.py -- unit tests for ascii-autofix normalize_line().
 #
-# Asserts the four key behaviors of the TOTAL fixer:
-#   1. arrow U+2192          -> "->"  (SUBS mapped)
-#   2. em-dash U+2014        -> "--"  (SUBS mapped)
-#   3. robot emoji U+1F916   -> ""    (STRIP fallback removes it)
-#   4. box-drawing U+2550    -> "-"   (range mapped)
+# Asserts the key behaviors of the TOTAL fixer:
+#   1. arrow U+2192                 -> "->"  (SUBS mapped)
+#   2. em-dash U+2014               -> "--"  (SUBS mapped)
+#   3. robot emoji U+1F916 (alone)  -> ""    (STRIP fallback removes it)
+#   3b. robot emoji in surrounding text gets stripped but neighbors survive
+#   4. box-drawing U+2550           -> "-"   (range mapped)
 #
 # Exit 0 on all pass; exit 1 on any failure.
 
@@ -33,9 +34,12 @@ def main() -> int:
 
     cases = [
         # (label, input, expected_output)
+        # Spec stop condition 0c: robot emoji input must normalize to the
+        # empty string (STRIP fallback removes every unmapped byte).
         ("arrow U+2192",        "→ arrow",        "-> arrow"),
         ("em-dash U+2014",      "em—dash",        "em--dash"),
-        ("robot emoji U+1F916", "\U0001F916 robot",    " robot"),
+        ("robot emoji U+1F916", "\U0001F916",     ""),
+        ("robot emoji in word", "\U0001F916 robot", " robot"),
         ("box-drawing U+2550",  "═ box",          "- box"),
     ]
 
