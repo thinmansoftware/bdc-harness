@@ -4,23 +4,23 @@
 #
 # Pre-flight (OPERATOR MUST VERIFY BEFORE FIRING):
 #   1. lspro-react + shopops registered in Archon
-#   2. WO-SHOPOPS-MULTI-LOCATION-SCOPE-01 MUST be MERGED — location_id column on pull_list_allocations
+#   2. WO-SHOPOPS-MULTI-LOCATION-SCOPE-01 MUST be MERGED -- location_id column on pull_list_allocations
 #      Verify: gh pr list --repo bluedevilcollectibles/shopops --search 'WO-SHOPOPS-MULTI-LOCATION-SCOPE-01' --state merged
 #      AND ssh hetzner-prod 'docker exec shopops-api psql -c "\d pull_list_allocations"' shows location_id
 #   3. Spec at bdc-xo:docs/work-orders/WO-LSPRO-CHAIN-DEMAND-GRID-01.md
-#   4. Notion page ID — fill in 35fef4c9-ce00-81f7-8c60-ebed44513508 before firing
+#   4. Notion page ID -- fill in 35fef4c9-ce00-81f7-8c60-ebed44513508 before firing
 #
 # OPEN QUESTIONS:
-#   Q1: foc_calendar table existence — schema-verify checks; if absent, workflow aborts.
-#   Q2: PRH integration deferred — Lunar only this WO.
-#   Q3: Reallocation notification to affected stores — silent for v1.
+#   Q1: foc_calendar table existence -- schema-verify checks; if absent, workflow aborts.
+#   Q2: PRH integration deferred -- Lunar only this WO.
+#   Q3: Reallocation notification to affected stores -- silent for v1.
 #
 # Deploy: BDC_XO/scripts/archon-bridge/sync-workflows.sh bdc-lspro-chain-demand-grid.yaml
 # REVIEW BEFORE DEPLOY: confirm WO-SHOPOPS-MULTI-LOCATION-SCOPE-01 merged, foc_calendar exists.
 
 name: bdc-lspro-chain-demand-grid
 description: |
-  Use when: Executing WO-LSPRO-CHAIN-DEMAND-GRID-01 — DA FOC demand grid for chain owners.
+  Use when: Executing WO-LSPRO-CHAIN-DEMAND-GRID-01 -- DA FOC demand grid for chain owners.
   Does: Verifies location_id column + foc_calendar table exist. Adds GET /api/chain/demand-grid
         + POST /api/chain/demand-grid/reallocate to shopops-api. Adds ChainDemandGridPage
         + grid components + reallocation modal in lspro-react. Vitest + bun tests.
@@ -72,7 +72,7 @@ nodes:
   - id: schema-verify
     depends_on: [read-spec]
     bash: |
-      # set -e DELIBERATELY OMITTED — best-effort but HARD-FAILS on critical missing columns
+      # set -e DELIBERATELY OMITTED -- best-effort but HARD-FAILS on critical missing columns
       SUPABASE_URL="${SUPABASE_URL:-}"
       SUPABASE_SERVICE_KEY="${SUPABASE_SERVICE_KEY:-}"
 
@@ -126,8 +126,8 @@ nodes:
     depends_on: [schema-verify]
     bash: |
       set -euo pipefail
-      # shopops is the SECONDARY repo here — clone into /tmp using shopops master/main lookup.
-      # Note: $(git remote show origin) reads CWD's origin (lspro-react) — wrong default branch
+      # shopops is the SECONDARY repo here -- clone into /tmp using shopops master/main lookup.
+      # Note: $(git remote show origin) reads CWD's origin (lspro-react) -- wrong default branch
       # for shopops. Hard-code 'master' (verified correct for shopops repo).
       SHOPOPS_DEFAULT="master"
       DIR="/tmp/shopops-work-$WORKFLOW_ID"
@@ -145,7 +145,7 @@ nodes:
   - id: audit-prior-art
     depends_on: [read-spec]
     bash: |
-      # set -e DELIBERATELY OMITTED — audit must NEVER fail (BUG-3 tolerant).
+      # set -e DELIBERATELY OMITTED -- audit must NEVER fail (BUG-3 tolerant).
       # lspro-react DOES have src/ (verified). Tolerate missing files for new modules.
       if [ -d src/pages/cheers ]; then
         ls -la src/pages/cheers/ 2>/dev/null || true
@@ -158,7 +158,7 @@ nodes:
         ls -la src/pages/PullListCommandCenter.tsx 2>/dev/null || true
         head -50 src/pages/PullListCommandCenter.tsx 2>/dev/null || true
       else
-        echo "(PullListCommandCenter.tsx missing — audit tolerant)"
+        echo "(PullListCommandCenter.tsx missing -- audit tolerant)"
       fi
       exit 0
 
@@ -183,17 +183,17 @@ nodes:
       - shopops-api/routes/chain-demand.js with:
           GET /api/chain/demand-grid?tenant_id=&foc_week=
           POST /api/chain/demand-grid/reallocate
-      - shopops-api/lib/demand-grid-builder.js — pure aggregation helper
-      - shopops-api/tests/test_chain_demand.js — 6 bun tests per WO §7
-      - shopops-api/index.js — mount /api/chain/demand-grid
+      - shopops-api/lib/demand-grid-builder.js -- pure aggregation helper
+      - shopops-api/tests/test_chain_demand.js -- 6 bun tests per WO Section 7
+      - shopops-api/index.js -- mount /api/chain/demand-grid
       - Branch: wo/lspro-chain-demand-grid-01, base master
 
       ### lspro-react side (CWD = repo root)
       - src/pages/cheers/ChainDemandGridPage.tsx (route /cheers/chain-demand)
       - src/pages/cheers/components/DemandGridTable.tsx
       - src/pages/cheers/components/ReallocationModal.tsx
-      - src/tests/chain-demand-grid.test.tsx — 7 Vitest tests
-      - src/App.tsx — add route /cheers/chain-demand behind meetsTier('hq')
+      - src/tests/chain-demand-grid.test.tsx -- 7 Vitest tests
+      - src/App.tsx -- add route /cheers/chain-demand behind meetsTier('hq')
       - Branch: wo/lspro-chain-demand-grid-01, base main
 
       ### Important UX rules from spec
@@ -238,7 +238,7 @@ nodes:
            - computeKpis(rows) -> { total_demand, total_allocated, fulfillment_pct }
            Easy to unit test without db.
         4. Mount route in index.js.
-        5. Create tests/test_chain_demand.js — 6 bun tests per WO §7:
+        5. Create tests/test_chain_demand.js -- 6 bun tests per WO Section 7:
            a. GET returns matrix shape
            b. variant_ratio visible for incentive variants
            c. Empty FOC week returns rows=[] without error
@@ -286,7 +286,7 @@ nodes:
            - Show stale-write error if response is 409
         5. Add /cheers/chain-demand route in App.tsx behind meetsTier('hq').
         6. Use apiFetch from @/lib/api.
-        7. Create src/tests/chain-demand-grid.test.tsx — 7 Vitest tests per WO §7.
+        7. Create src/tests/chain-demand-grid.test.tsx -- 7 Vitest tests per WO Section 7.
            Mock apiFetch with vi.mock('@/lib/api').
 
         <promise>COMPLETE</promise> when all files exist + route wired + 7+ tests.
@@ -357,7 +357,7 @@ nodes:
         Verify 3 UI screenshots for WO-LSPRO-CHAIN-DEMAND-GRID-01:
           SHOT_1: /cheers/chain-demand loads, grid renders with sticky first col + 13 location cols
           SHOT_2: ReallocationModal open after cell click, all 13 locations listed editable
-          SHOT_3: Horizontal scroll evidence — 13 columns force overflow, sticky first col stays put
+          SHOT_3: Horizontal scroll evidence -- 13 columns force overflow, sticky first col stays put
 
         Inspect ChainDemandGridPage.tsx + DemandGridTable.tsx + ReallocationModal.tsx.
         Output per shot: PASS|FAIL + Evidence + Gap.
@@ -382,7 +382,7 @@ nodes:
         echo "No staged changes"
       else
         git -c user.name="John Ranson" -c user.email="admin@bluedevilcollectibles.com" \
-          commit -m "$(printf 'feat(da): WO-LSPRO-CHAIN-DEMAND-GRID-01 — chain FOC demand grid\n\nChainDemandGridPage at /cheers/chain-demand (HQ tier).\nSticky first col + horizontal scroll for 13+ locations.\nReallocationModal with optimistic concurrency on save.\n\nTests: chain-demand-grid.test.tsx (7 Vitest tests).\n\nCompanion PR: shopops master wo/lspro-chain-demand-grid-01 (route + builder).\nDepends on: WO-SHOPOPS-MULTI-LOCATION-SCOPE-01 (location_id column).\n\nCo-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>')"
+          commit -m "$(printf 'feat(da): WO-LSPRO-CHAIN-DEMAND-GRID-01 -- chain FOC demand grid\n\nChainDemandGridPage at /cheers/chain-demand (HQ tier).\nSticky first col + horizontal scroll for 13+ locations.\nReallocationModal with optimistic concurrency on save.\n\nTests: chain-demand-grid.test.tsx (7 Vitest tests).\n\nCompanion PR: shopops master wo/lspro-chain-demand-grid-01 (route + builder).\nDepends on: WO-SHOPOPS-MULTI-LOCATION-SCOPE-01 (location_id column).\n\nCo-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>')"
       fi
       git push -u origin "$BRANCH"
       echo "UI_BRANCH=$BRANCH"
@@ -407,7 +407,7 @@ nodes:
         echo "No staged changes"
       else
         git -c user.name="John Ranson" -c user.email="admin@bluedevilcollectibles.com" \
-          commit -m "$(printf 'feat(api): WO-LSPRO-CHAIN-DEMAND-GRID-01 — chain demand grid endpoint\n\nGET /api/chain/demand-grid + POST /api/chain/demand-grid/reallocate.\nAggregates pull_list_allocations across all locations for a tenant + FOC week.\nReallocate validates sum <= total alloc, optimistic concurrency via updated_at.\n\nTests: test_chain_demand.js (6 bun tests).\n\nDepends on: WO-SHOPOPS-MULTI-LOCATION-SCOPE-01 (location_id column).\n\nCo-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>')"
+          commit -m "$(printf 'feat(api): WO-LSPRO-CHAIN-DEMAND-GRID-01 -- chain demand grid endpoint\n\nGET /api/chain/demand-grid + POST /api/chain/demand-grid/reallocate.\nAggregates pull_list_allocations across all locations for a tenant + FOC week.\nReallocate validates sum <= total alloc, optimistic concurrency via updated_at.\n\nTests: test_chain_demand.js (6 bun tests).\n\nDepends on: WO-SHOPOPS-MULTI-LOCATION-SCOPE-01 (location_id column).\n\nCo-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>')"
       fi
       git push -u origin "$BRANCH"
       echo "API_BRANCH=$BRANCH"
@@ -442,7 +442,7 @@ nodes:
 
       for attempt in 1 2 3; do
         if PR_OUT=$(gh pr create --repo "$REPO" --base main --head "$BRANCH" \
-            --title "feat(da): WO-LSPRO-CHAIN-DEMAND-GRID-01 — chain FOC demand grid" \
+            --title "feat(da): WO-LSPRO-CHAIN-DEMAND-GRID-01 -- chain FOC demand grid" \
             --body-file "$BODY" 2>&1); then
           echo "UI_PR_URL=$PR_OUT"; exit 0
         fi
@@ -460,7 +460,7 @@ nodes:
       BODY=$(mktemp)
       {
         echo "## Summary"
-        echo "WO-LSPRO-CHAIN-DEMAND-GRID-01 shopops side — /api/chain/demand-grid."
+        echo "WO-LSPRO-CHAIN-DEMAND-GRID-01 shopops side -- /api/chain/demand-grid."
         echo ""
         echo "## Rule 19 verification"
         echo '  docker exec shopops-api grep -n "chain/demand-grid" /app/routes/chain-demand.js'
@@ -471,7 +471,7 @@ nodes:
 
       for attempt in 1 2 3; do
         if PR_OUT=$(gh pr create --repo "$REPO" --base master --head "$BRANCH" \
-            --title "feat(api): WO-LSPRO-CHAIN-DEMAND-GRID-01 — chain demand grid endpoint" \
+            --title "feat(api): WO-LSPRO-CHAIN-DEMAND-GRID-01 -- chain demand grid endpoint" \
             --body-file "$BODY" 2>&1); then
           echo "API_PR_URL=$PR_OUT"; exit 0
         fi
@@ -482,7 +482,7 @@ nodes:
   - id: runtime-verify
     depends_on: [open-pr-api, open-pr-ui]
     bash: |
-      # set -e DELIBERATELY OMITTED — Rule 19 best-effort
+      # set -e DELIBERATELY OMITTED -- Rule 19 best-effort
       RESULT=$(docker exec shopops-api grep -n "chain/demand-grid" /app/routes/chain-demand.js 2>&1)
       EXIT=$?
       if [ $EXIT -eq 0 ]; then
@@ -499,7 +499,7 @@ nodes:
   - id: verify-vercel
     depends_on: [open-pr-ui]
     bash: |
-      # set -e DELIBERATELY OMITTED — best-effort
+      # set -e DELIBERATELY OMITTED -- best-effort
       BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
       sleep 30
       RESULT=$(gh pr list --repo bluedevilcollectibles/lspro-react --head "$BRANCH" --state open --json url 2>&1)

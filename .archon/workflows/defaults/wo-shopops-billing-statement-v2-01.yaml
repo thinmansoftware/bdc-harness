@@ -1,5 +1,5 @@
 # Drafted by yaml-author subagent for WO-SHOPOPS-BILLING-STATEMENT-V2-01 on 2026-05-23
-# Source pattern: bdc-template-shopops-api.yaml (shopops-api WO — Node.js Express routes + Rule 19 docker exec)
+# Source pattern: bdc-template-shopops-api.yaml (shopops-api WO -- Node.js Express routes + Rule 19 docker exec)
 # Gold standard cross-checked: bdc-ce-regression-suite.yaml (2026-05-12 end-to-end proven)
 # Doctrine compliance: 13 hard rules of archon-yaml-authoring verified at draft time
 #
@@ -12,7 +12,7 @@
 #               then GitHub issue search fallback
 #  [x] Rule 6:  policyFile: harness/policies/agent-behavior.md (no prefix)
 #  [x] Rule 7:  flip-notion final node present; manifest goes in Notes property, not comment
-#  [x] Rule 8:  codebase bluedevilcollectibles/shopops MUST be registered — verify below
+#  [x] Rule 8:  codebase bluedevilcollectibles/shopops MUST be registered -- verify below
 #  [x] Rule 9:  YAML must land in bdc-harness/.archon/workflows/defaults/ (flat or one subdir)
 #  [x] Rule 10: implement loop declares ALL FOUR siblings: prompt, until, max_iterations, fresh_context
 #  [x] Rule 11: NO n8n webhook calls (post-started/post-completed nodes removed)
@@ -43,13 +43,13 @@
 #     "import sys,json; print([w['workflow']['name'] for w in json.load(sys.stdin)['workflows']])"
 #   Expected: 'bdc-shopops-billing-statement-v2-01' in output.
 #
-# REVIEW BEFORE DEPLOY — human verifies: grep assertions match actual file paths, test
+# REVIEW BEFORE DEPLOY -- human verifies: grep assertions match actual file paths, test
 # command matches shopops-api runner (cd shopops-api && node tests/run_all.js), Notion page ID correct,
 # Rule 19 docker exec paths match deployed container layout.
 
 name: bdc-shopops-billing-statement-v2-01
 description: |
-  Use when: Executing WO-SHOPOPS-BILLING-STATEMENT-V2-01 — Billing Statement v2 (WhatNot Pull-List Path).
+  Use when: Executing WO-SHOPOPS-BILLING-STATEMENT-V2-01 -- Billing Statement v2 (WhatNot Pull-List Path).
   Input: WO_ID = WO-SHOPOPS-BILLING-STATEMENT-V2-01.
   Does:
     - Reads spec from bdc-xo docs/work-orders/.
@@ -65,9 +65,9 @@ description: |
     - Commits, pushes feature branch, opens PR to staging.
     - Provides Rule 19 docker exec grep evidence in manifest.
     - Flips Notion WO-SHOPOPS-BILLING-STATEMENT-V2-01 to REVIEW with manifest in Notes.
-  Repo: bluedevilcollectibles/shopops (staging branch — Rule 20 staging-gate repo).
+  Repo: bluedevilcollectibles/shopops (staging branch -- Rule 20 staging-gate repo).
   WO class: CODE (single-repo, schema migration + new routes).
-  Gate: ShopOps Recovery Checklist — Gate 8 (BDC weekly billing path).
+  Gate: ShopOps Recovery Checklist -- Gate 8 (BDC weekly billing path).
   parallel_ok: false
   NOT for: any other WO. Not for /statements/v2 Stripe/Manual path (separate WO).
 
@@ -80,8 +80,8 @@ inputs:
 
 nodes:
 
-  # ─── Node 1: Preflight GitHub auth ──────────────────────────────────────────
-  # Fail-closed if container cannot push (anchor: 2026-05-16 WO-169 engine sortie —
+  # --- Node 1: Preflight GitHub auth ------------------------------------------
+  # Fail-closed if container cannot push (anchor: 2026-05-16 WO-169 engine sortie --
   # git push silently failed, downstream swallow patterns hid it, workflow reported
   # success with no commits on origin).
   - id: preflight-github-auth
@@ -97,7 +97,7 @@ nodes:
       echo "TARGET_REPO=bluedevilcollectibles/shopops"
       echo "TARGET_BRANCH=staging"
 
-  # ─── Node 2: Read spec (cross-repo via gh api from bdc-xo) ──────────────────
+  # --- Node 2: Read spec (cross-repo via gh api from bdc-xo) ------------------
   # Rule 4: paths relative to bdc-xo repo root (no BDC_XO/ prefix).
   # Rule 5: try docs/work-orders/ first, then date-prefix glob, then GitHub issue fallback.
   # Spec lives in bdc-xo, NOT in the shopops worktree.
@@ -155,7 +155,7 @@ nodes:
       printf 'WO_ID=%s\nSPEC_PATH=bdc-xo:%s\nWORKFLOW_ID=%s\n\n' "$WO_ID" "$SPEC_PATH" "$WORKFLOW_ID"
       printf -- '--- SPEC ---\n%s\n' "$SPEC_CONTENT"
 
-  # ─── Node 3: Fresh branch from staging ──────────────────────────────────────
+  # --- Node 3: Fresh branch from staging --------------------------------------
   # Rule 20 staging-gate repos branch fresh from staging HEAD.
   - id: fresh-branch
     depends_on: [read-spec]
@@ -171,11 +171,11 @@ nodes:
       echo "BASE=staging"
       echo "REPO=bluedevilcollectibles/shopops"
 
-  # ─── Node 4: Implement (self-review loop) ───────────────────────────────────
+  # --- Node 4: Implement (self-review loop) -----------------------------------
   # Rule 3: fresh_context: true (required for self-review loops).
   # Rule 10: ALL FOUR siblings declared: prompt, until, max_iterations, fresh_context.
   # Rule 19: builder MUST note RULE19_FILE + RULE19_GREP in output for runtime-verify node.
-  # DO NOT replace existing assertBillingSource — only ADD assertBillingSourceV2 alongside it.
+  # DO NOT replace existing assertBillingSource -- only ADD assertBillingSourceV2 alongside it.
   # Mount /statements/v2 BEFORE /statements in index.js (Express prefix matching).
   - id: implement
     depends_on: [fresh-branch]
@@ -196,29 +196,29 @@ nodes:
 
         ## What to build (in order)
 
-        ### STEP 1 — migrations/20260523_billing_statement_v2.sql
-        Create this file with the EXACT DDL from the spec §9:
+        ### STEP 1 -- migrations/20260523_billing_statement_v2.sql
+        Create this file with the EXACT DDL from the spec Section 9:
         1. Widen billing_statements.status CHECK to add 'ISSUED':
            DROP CONSTRAINT billing_statements_status_check IF EXISTS;
            ADD CONSTRAINT billing_statements_status_check
              CHECK (status IN ('DRAFT','APPROVED','GENERATED','SENT','ISSUED','PARTIAL','PAID','VOID'));
         2. ADD COLUMN IF NOT EXISTS on billing_statements: payment_channel, source, processor,
            processor_account_scope, external_order_id, external_payment_id, payment_url,
-           payment_status, reconciliation_source (exact DDL verbatim from spec §9).
-        3. CREATE TABLE IF NOT EXISTS billing_statement_line_items (exact DDL from spec §9):
+           payment_status, reconciliation_source (exact DDL verbatim from spec Section 9).
+        3. CREATE TABLE IF NOT EXISTS billing_statement_line_items (exact DDL from spec Section 9):
            id, tenant_id, statement_id (FK billing_statements), allocation_id
            (FK pull_allocations(allocation_id)), line_price_cents, quantity, description, created_at.
            Create indexes bsli_statement_id, bsli_tenant_allocation.
            Enable RLS.
         4. ADD COLUMN IF NOT EXISTS on statement_payments: pull_allocation_id, external_order_id.
 
-        ### STEP 2 — lib/billing/errors.js (EXTEND, do not remove existing exports)
+        ### STEP 2 -- lib/billing/errors.js (EXTEND, do not remove existing exports)
         Add two new named exports alongside BillingSourceInvalidError and DACannotMutateBillingError:
         - BillingCutoverError: status 422, code 'BILLING_CUTOVER_GATE'
         - PaymentChannelInvalidError: status 422, code 'PAYMENT_CHANNEL_INVALID'
         Pattern: follow existing error class shape in the file.
 
-        ### STEP 3 — lib/billing/assert-billing-source.js (ADD new exports, KEEP existing)
+        ### STEP 3 -- lib/billing/assert-billing-source.js (ADD new exports, KEEP existing)
         CRITICAL: The existing assertBillingSource function with signature
           ({ lineSources, context, client, tenantId })
         MUST be retained unchanged. routes/invoices.js depends on it.
@@ -235,9 +235,9 @@ nodes:
             3. If any row.status != 'READY_TO_INVOICE' -> throw BillingSourceInvalidError
             4. For each row: assertBillingCutover(row.allocated_at)
 
-        ### STEP 4 — routes/statements-v2.js (CREATE NEW FILE)
-        Express router with 7 routes matching the spec §7 function inventory exactly:
-        - assertPaymentChannel({ payment_channel, processor }) — inline helper
+        ### STEP 4 -- routes/statements-v2.js (CREATE NEW FILE)
+        Express router with 7 routes matching the spec Section 7 function inventory exactly:
+        - assertPaymentChannel({ payment_channel, processor }) -- inline helper
         - POST /   (create: assertBillingSourceV2, assertPaymentChannel, INSERT billing_statements
                     + billing_statement_line_items, UPDATE pull_allocations -> INVOICED, 201)
         - GET /    (list WHERE generation_mode='v2', paginated)
@@ -246,11 +246,11 @@ nodes:
         - PATCH /:id/issue   (DRAFT -> ISSUED, whatnot_sku, NO Stripe PI)
         - PATCH /:id/reconcile (INSERT statement_payments, ISSUED/PARTIAL -> PAID/PARTIAL)
         - PATCH /:id/void    (-> VOID, UPDATE pull_allocations -> RESERVED,
-                               invoiced_at=null, released_at=null — NOT now())
+                               invoiced_at=null, released_at=null -- NOT now())
         Apply daBillingBlockMiddleware to all mutation routes.
         Follow ES5 Express pattern from routes/statements.js.
 
-        ### STEP 5 — index.js (mount /statements/v2 BEFORE /statements)
+        ### STEP 5 -- index.js (mount /statements/v2 BEFORE /statements)
         Find the lines that mount /statements (around line 503-505 per spec).
         Mount /statements/v2 on the line ABOVE the /statements mount:
           app.use('/statements/v2', validateHmac, requireAuth, requireEntitlement, statementsV2Router);
@@ -281,7 +281,7 @@ nodes:
 
         ## Commit (inside this loop, before emitting COMPLETE)
         git -c user.name="John Ranson" -c user.email="admin@bluedevilcollectibles.com" \
-          commit -m "feat(shopops-api): WO-SHOPOPS-BILLING-STATEMENT-V2-01 — billing statement v2 (WhatNot pull-list path)
+          commit -m "feat(shopops-api): WO-SHOPOPS-BILLING-STATEMENT-V2-01 -- billing statement v2 (WhatNot pull-list path)
 
         - migrations/20260523_billing_statement_v2.sql: billing_statement_line_items table,
           billing_statements new columns, statement_payments new columns, ISSUED status widen
@@ -305,7 +305,7 @@ nodes:
         BUILD_COMPLETE
         <promise>COMPLETE</promise>
 
-  # ─── Node 5: Grep assertions (bash-executable, per WO §12 stop conditions) ─
+  # --- Node 5: Grep assertions (bash-executable, per WO Section 12 stop conditions) -
   # Exactly the grep commands from the WO stop conditions, executed as CI evidence.
   - id: verify-grep
     depends_on: [implement]
@@ -371,7 +371,7 @@ nodes:
       [ "$SHOW_PICKUP" -eq 0 ] || (echo "FAIL: SHOW_PICKUP found in statements-v2.js (forbidden)" >&2; exit 1)
       echo "SHOW_PICKUP count: $SHOW_PICKUP (== 0 required) PASS"
 
-      # errors.js — both new error classes present
+      # errors.js -- both new error classes present
       BILLING_CUTOVER_ERR=$(grep -c "BillingCutoverError" shopops-api/lib/billing/errors.js)
       [ "$BILLING_CUTOVER_ERR" -ge 1 ] || (echo "FAIL: BillingCutoverError not in errors.js" >&2; exit 1)
       echo "BillingCutoverError in errors.js: $BILLING_CUTOVER_ERR (>= 1 required) PASS"
@@ -383,7 +383,7 @@ nodes:
       echo ""
       echo "=== All grep assertions PASS ==="
 
-  # ─── Node 6: Run tests ──────────────────────────────────────────────────────
+  # --- Node 6: Run tests ------------------------------------------------------
   # shopops-api test runner runs from the shopops-api subdirectory.
   - id: verify-tests
     depends_on: [implement]
@@ -392,7 +392,7 @@ nodes:
       if [ -f tests/statements-v2.test.js ]; then
         TEST_COUNT=$(grep -c "^  it\|^  test\|^it(\|^test(" tests/statements-v2.test.js || true)
         echo "Test file present. Detected $TEST_COUNT test functions."
-        [ "$TEST_COUNT" -ge 7 ] || echo "WARN: fewer than 7 tests in statements-v2.test.js; check spec §11"
+        [ "$TEST_COUNT" -ge 7 ] || echo "WARN: fewer than 7 tests in statements-v2.test.js; check spec Section 11"
       else
         echo "WARN: tests/statements-v2.test.js not found; implement loop may have skipped test authoring"
       fi
@@ -400,8 +400,8 @@ nodes:
       node tests/run_all.js
       echo "cd shopops-api && node tests/run_all.js PASS"
 
-  # ─── Node 7: Backstop commit-and-push ──────────────────────────────────────
-  # Idempotent — if implement loop already committed + pushed, this is a no-op.
+  # --- Node 7: Backstop commit-and-push --------------------------------------
+  # Idempotent -- if implement loop already committed + pushed, this is a no-op.
   # No swallow patterns on push (load_bearing intent).
   - id: commit-and-push
     depends_on: [verify-grep, verify-tests]
@@ -414,9 +414,9 @@ nodes:
         echo "No staged changes; implement loop already committed."
         COMMITS_AHEAD=$(git rev-list --count "origin/${BRANCH}..HEAD" 2>/dev/null || echo 0)
         if [ "$COMMITS_AHEAD" = "0" ]; then
-          echo "HEAD matches origin/${BRANCH} — backstop no-op."
+          echo "HEAD matches origin/${BRANCH} -- backstop no-op."
         else
-          echo "Backstop: $COMMITS_AHEAD commit(s) ahead of origin — pushing."
+          echo "Backstop: $COMMITS_AHEAD commit(s) ahead of origin -- pushing."
         fi
       else
         git -c user.name="John Ranson" -c user.email="admin@bluedevilcollectibles.com" \
@@ -438,19 +438,19 @@ nodes:
       echo "BRANCH=${BRANCH}"
       echo "SHA=$(git rev-parse HEAD)"
 
-  # ─── Node 8: Open PR ────────────────────────────────────────────────────────
+  # --- Node 8: Open PR --------------------------------------------------------
   # PR base = staging for Rule 20 staging-gate repos.
   # Idempotent: checks for existing PR before attempting creation.
   - id: open-pr
     depends_on: [commit-and-push]
     bash: |
       set -euo pipefail
-      # set -e DELIBERATELY NOT OMITTED here — PR open is not best-effort; it's load-bearing.
+      # set -e DELIBERATELY NOT OMITTED here -- PR open is not best-effort; it's load-bearing.
       WO_ID="WO-SHOPOPS-BILLING-STATEMENT-V2-01"
       REPO="bluedevilcollectibles/shopops"
       BRANCH="$(git rev-parse --abbrev-ref HEAD)"
       BASE="staging"
-      TITLE="feat(shopops-api): WO-SHOPOPS-BILLING-STATEMENT-V2-01 — billing statement v2 (WhatNot pull-list path)"
+      TITLE="feat(shopops-api): WO-SHOPOPS-BILLING-STATEMENT-V2-01 -- billing statement v2 (WhatNot pull-list path)"
 
       # Idempotent: check for existing open PR
       EXIST=$(gh pr list --repo "$REPO" --head "$BRANCH" --state open \
@@ -464,24 +464,24 @@ nodes:
       {
         echo "## Summary"
         echo ""
-        echo "Implements **WO-SHOPOPS-BILLING-STATEMENT-V2-01** — Billing Statement v2, WhatNot Pull-List Path."
-        echo "Gate: ShopOps Recovery Checklist — Gate 8 (BDC weekly billing path)."
+        echo "Implements **WO-SHOPOPS-BILLING-STATEMENT-V2-01** -- Billing Statement v2, WhatNot Pull-List Path."
+        echo "Gate: ShopOps Recovery Checklist -- Gate 8 (BDC weekly billing path)."
         echo ""
         echo "## Files created"
-        echo "- \`migrations/20260523_billing_statement_v2.sql\` — billing_statement_line_items table,"
+        echo "- \`migrations/20260523_billing_statement_v2.sql\` -- billing_statement_line_items table,"
         echo "  billing_statements new columns (payment_channel, source, processor, etc.),"
         echo "  statement_payments new columns (pull_allocation_id, external_order_id),"
         echo "  ISSUED added to status CHECK constraint."
-        echo "- \`routes/statements-v2.js\` — /statements/v2 route family (POST create, GET list,"
+        echo "- \`routes/statements-v2.js\` -- /statements/v2 route family (POST create, GET list,"
         echo "  GET ready, GET :id, PATCH issue, PATCH reconcile, PATCH void)."
         echo ""
         echo "## Files modified"
-        echo "- \`shopops-api/lib/billing/assert-billing-source.js\` — +assertBillingSourceV2 +assertBillingCutover"
+        echo "- \`shopops-api/lib/billing/assert-billing-source.js\` -- +assertBillingSourceV2 +assertBillingCutover"
         echo "  (assertBillingSource retained unchanged for routes/invoices.js compat)."
-        echo "- \`shopops-api/lib/billing/errors.js\` — +BillingCutoverError +PaymentChannelInvalidError."
-        echo "- \`index.js\` — mount /statements/v2 BEFORE /statements mounts."
+        echo "- \`shopops-api/lib/billing/errors.js\` -- +BillingCutoverError +PaymentChannelInvalidError."
+        echo "- \`index.js\` -- mount /statements/v2 BEFORE /statements mounts."
         echo ""
-        echo "## Rule 19 — Runtime verification required after merge"
+        echo "## Rule 19 -- Runtime verification required after merge"
         echo "shopops-api uses COPY . /app at image build time. After merging this PR and"
         echo "rebuilding the container, operator MUST verify:"
         echo ""
@@ -514,10 +514,10 @@ nodes:
         echo "open-pr attempt $attempt failed: $PR_OUT" >&2
         sleep $((attempt * 5))
       done
-      echo "ERROR: gh pr create failed after 5 attempts — branch pushed at $BRANCH but no PR opened." >&2
+      echo "ERROR: gh pr create failed after 5 attempts -- branch pushed at $BRANCH but no PR opened." >&2
       exit 1
 
-  # ─── Node 9: Build manifest (Captain CI v2 format) ──────────────────────────
+  # --- Node 9: Build manifest (Captain CI v2 format) --------------------------
   # Rule 19: manifest MUST include docker exec grep evidence.
   # Rule 7: manifest goes in Notes property, not as page comment.
   - id: build-manifest
@@ -525,7 +525,7 @@ nodes:
     task_class: clerical
     prompt: |
       Build the Captain CI completion manifest v2 for WO-SHOPOPS-BILLING-STATEMENT-V2-01.
-      The manifest MUST be in exact v2 format — Captain CI parses these labels literally.
+      The manifest MUST be in exact v2 format -- Captain CI parses these labels literally.
 
       ## Required manifest fields (fill ALL from the node outputs below)
 
@@ -542,9 +542,9 @@ nodes:
        - shopops/shopops-api/lib/billing/errors.js (+BillingCutoverError, +PaymentChannelInvalidError)
        - shopops/index.js (mount /statements/v2 before /statements)
 
-      Tests: [fill from verify-tests.output — format: N/N (cd shopops-api && node tests/run_all.js)]
+      Tests: [fill from verify-tests.output -- format: N/N (cd shopops-api && node tests/run_all.js)]
 
-      PRs: [fill from open-pr.output — format: repo/PR URL (merged: timestamp, commit: sha)]
+      PRs: [fill from open-pr.output -- format: repo/PR URL (merged: timestamp, commit: sha)]
 
       Merge ancestors:
        - shopops staging HEAD: [fill from commit-and-push.output SHA] | manifest commit: [same] | behind_by: 0
@@ -561,8 +561,8 @@ nodes:
        - shopops: grep -c "BillingCutoverError" shopops-api/lib/billing/errors.js && [ $(grep -c "BillingCutoverError" shopops-api/lib/billing/errors.js) -ge 1 ]
        - shopops: grep -c "PaymentChannelInvalidError" shopops-api/lib/billing/errors.js && [ $(grep -c "PaymentChannelInvalidError" shopops-api/lib/billing/errors.js) -ge 1 ]
 
-      Runtime verification (Rule 19 — shopops-api uses COPY . /app, rebuild required after merge):
-       PENDING — operator must rebuild + restart shopops-api container after John promotes the staged PR.
+      Runtime verification (Rule 19 -- shopops-api uses COPY . /app, rebuild required after merge):
+       PENDING -- operator must rebuild + restart shopops-api container after John promotes the staged PR.
        After rebuild, run:
          docker exec shopops-api grep -n "statements/v2" /app/index.js
            -> Expected: >= 1 match (mount line)
@@ -586,17 +586,17 @@ nodes:
       Commit: $commit-and-push.output
       PR: $open-pr.output
 
-  # ─── Node 10: Flip Notion to REVIEW ─────────────────────────────────────────
+  # --- Node 10: Flip Notion to REVIEW -----------------------------------------
   # Rule 7: MANDATORY final node. Manifest goes in Notes property, NOT as page comment.
-  # Captain CI reads Notes. Never mark DONE — only REVIEW.
+  # Captain CI reads Notes. Never mark DONE -- only REVIEW.
   # Notion page ID: 369ef4c9-ce00-8186-aa2a-e8fd13a5d438
   - id: flip-notion
     depends_on: [build-manifest]
     task_class: clerical
     prompt: |
       Flip Notion WO-SHOPOPS-BILLING-STATEMENT-V2-01 to REVIEW.
-      The manifest MUST go in the Notes property (NOT as a page comment — Captain CI reads Notes).
-      NEVER mark Status as DONE — only REVIEW. Only Captain CI can mark DONE.
+      The manifest MUST go in the Notes property (NOT as a page comment -- Captain CI reads Notes).
+      NEVER mark Status as DONE -- only REVIEW. Only Captain CI can mark DONE.
 
       ## Notion page
       Page ID: 369ef4c9-ce00-8186-aa2a-e8fd13a5d438

@@ -1,6 +1,6 @@
 name: bdc-ce-hotfix-runbook
 description: |
-  Use when: Shipping WO-RELEASE-CE-HOTFIX-RUNBOOK-01 — emergency CE hotfix process.
+  Use when: Shipping WO-RELEASE-CE-HOTFIX-RUNBOOK-01 -- emergency CE hotfix process.
   Input: WO_ID = WO-RELEASE-CE-HOTFIX-RUNBOOK-01.
   Does: Authors the CE hotfix runbook in bdc-xo. PR template (ce-hotfix.md) already added to
         lspro-react by WO-RELEASE-CE-BRANCH-MODEL-01.
@@ -102,7 +102,7 @@ nodes:
         echo "No staged changes; branch already contains requested work"
       else
         git -c user.name="John Ranson" -c user.email="admin@bluedevilcollectibles.com" \
-          commit -m "docs(ce): WO-RELEASE-CE-HOTFIX-RUNBOOK-01 — emergency CE hotfix process
+          commit -m "docs(ce): WO-RELEASE-CE-HOTFIX-RUNBOOK-01 -- emergency CE hotfix process
 
         Adds CE-HOTFIX-RUNBOOK.md. Defines hotfix/ce/* flow to release/ce + backport to main.
         Lists allowed/disallowed hotfix categories per governance.
@@ -116,12 +116,12 @@ nodes:
     depends_on: [commit-and-push]
     bash: |
       set -euo pipefail
-      # Hardcoded — must match commit-and-push BRANCH literal. See WO-HARNESS-OPEN-PR-BRANCH-INTERPOLATION-FIX-01.
+      # Hardcoded -- must match commit-and-push BRANCH literal. See WO-HARNESS-OPEN-PR-BRANCH-INTERPOLATION-FIX-01.
       BRANCH="wo/release-ce-hotfix-runbook-01"
       REPO="bluedevilcollectibles/bdc-xo"
       BASE="main"
-      TITLE="docs(ce): WO-RELEASE-CE-HOTFIX-RUNBOOK-01 — CE hotfix runbook"
-      BODY="Implements WO-RELEASE-CE-HOTFIX-RUNBOOK-01. Docs-only. 🤖 Generated with Claude Code"
+      TITLE="docs(ce): WO-RELEASE-CE-HOTFIX-RUNBOOK-01 -- CE hotfix runbook"
+      BODY="Implements WO-RELEASE-CE-HOTFIX-RUNBOOK-01. Docs-only.  Generated with Claude Code"
       # Idempotent PR creation. See WO-HARNESS-OPEN-PR-GRAPHQL-NO-COMMITS-FIX-01.
       existing_pr_url() {
         gh pr list --repo "$REPO" --head "$BRANCH" --state open --json url --jq '.[0].url // empty' 2>/dev/null

@@ -1,13 +1,13 @@
 name: bdc-ce-regression-suite
 description: |
-  Use when: Shipping WO-CI-CE-REGRESSION-SUITE-01 — CE-only regression suite + CI wiring.
+  Use when: Shipping WO-CI-CE-REGRESSION-SUITE-01 -- CE-only regression suite + CI wiring.
   Input: WO_ID = WO-CI-CE-REGRESSION-SUITE-01.
   Does: Reads spec from bdc-xo via gh api (cross-repo), implements `bun run test:ce-regression`
         on lspro-react covering CE matrix (auth, license, import paths, AutoFix, cover lookup,
         WhatNot export, no PRO/HQ UI), adds .github/workflows/ce-regression.yml that runs on
         PRs targeting release/ce, opens PR against main, flips Notion to REVIEW.
   Repo: bluedevilcollectibles/lspro-react. Spec lives in bluedevilcollectibles/bdc-xo.
-  parallel_ok: true (independent from WO-RELEASE-CE-BRANCH-MODEL-01 — runs in parallel)
+  parallel_ok: true (independent from WO-RELEASE-CE-BRANCH-MODEL-01 -- runs in parallel)
   NOT for: any other WO.
 
 policyFile: harness/policies/agent-behavior.md
@@ -40,7 +40,7 @@ nodes:
       printf -- '--- SPEC ---\n%s\n\n' "$SPEC_CONTENT"
       printf -- '--- CE REGRESSION MATRIX ---\n%s\n' "$MATRIX"
 
-  # post-started node REMOVED 2026-05-12 — n8n webhook hangs from Archon executor subprocess
+  # post-started node REMOVED 2026-05-12 -- n8n webhook hangs from Archon executor subprocess
   # (see WO-HARNESS-N8N-WEBHOOK-EGRESS-FIX-01). Builder-status feed is optional bookkeeping;
   # flip-notion is the canonical close action.
 
@@ -74,8 +74,8 @@ nodes:
         - `bun run test:ce-regression` (locally)
         - `grep -c "test:ce-regression" package.json` (>= 1)
         - `ls .github/workflows/ce-regression.yml`
-      - Commit message: `feat(ci): WO-CI-CE-REGRESSION-SUITE-01 — CE regression gate for release/ce PRs`
-      - Push policy: feature branch `wo/ci-ce-regression-suite-01` → PR against `main`
+      - Commit message: `feat(ci): WO-CI-CE-REGRESSION-SUITE-01 -- CE regression gate for release/ce PRs`
+      - Push policy: feature branch `wo/ci-ce-regression-suite-01` -> PR against `main`
 
       ## Spec + Matrix
       $read-spec.output
@@ -155,13 +155,13 @@ nodes:
         echo "No staged changes; branch already contains requested work"
       else
         git -c user.name="John Ranson" -c user.email="admin@bluedevilcollectibles.com" \
-          commit -m "feat(ci): WO-CI-CE-REGRESSION-SUITE-01 — CE regression gate for release/ce PRs
+          commit -m "feat(ci): WO-CI-CE-REGRESSION-SUITE-01 -- CE regression gate for release/ce PRs
 
         Adds 11 .spec.ts files under tests/ce-regression/ covering the CE Regression Matrix:
         auth/license, sample data import, CLZ/XML/CSV import, AutoFix, cover lookup,
         missing-cover flag, blocker panel, WhatNot export + sample watermark, no PRO/HQ UI.
 
-        Adds .github/workflows/ce-regression.yml — runs on PRs targeting release/ce only.
+        Adds .github/workflows/ce-regression.yml -- runs on PRs targeting release/ce only.
 
         Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>"
       fi
@@ -173,15 +173,15 @@ nodes:
     depends_on: [commit-and-push]
     bash: |
       set -euo pipefail
-      # Hardcoded — must match commit-and-push BASE_BRANCH literal. See WO-HARNESS-OPEN-PR-BRANCH-INTERPOLATION-FIX-01.
+      # Hardcoded -- must match commit-and-push BASE_BRANCH literal. See WO-HARNESS-OPEN-PR-BRANCH-INTERPOLATION-FIX-01.
       BRANCH="wo/ci-ce-regression-suite-01"
       REPO="bluedevilcollectibles/lspro-react"
       BASE="main"
-      TITLE="feat(ci): WO-CI-CE-REGRESSION-SUITE-01 — CE regression gate"
+      TITLE="feat(ci): WO-CI-CE-REGRESSION-SUITE-01 -- CE regression gate"
       BODY_FILE=$(mktemp)
       {
         echo "## Summary"
-        echo "Implements **WO-CI-CE-REGRESSION-SUITE-01** — CE Release Branch Plan WO #2."
+        echo "Implements **WO-CI-CE-REGRESSION-SUITE-01** -- CE Release Branch Plan WO #2."
         echo ""
         echo "Adds CE-specific regression gate that runs on every PR targeting release/ce."
         echo ""
@@ -195,14 +195,14 @@ nodes:
         echo ""
         echo "## Files"
         echo "- 11 spec files under \`tests/ce-regression/\`"
-        echo "- \`.github/workflows/ce-regression.yml\` — runs on \`pull_request\` targeting \`release/ce\`"
-        echo "- \`package.json\` — new \`test:ce-regression\` script"
+        echo "- \`.github/workflows/ce-regression.yml\` -- runs on \`pull_request\` targeting \`release/ce\`"
+        echo "- \`package.json\` -- new \`test:ce-regression\` script"
         echo ""
         echo "## Authoritative source"
         echo "- Spec: bdc-xo \`docs/superpowers/specs/ce-release-branch/work-orders/WO-CI-CE-REGRESSION-SUITE-01.md\`"
         echo "- Matrix: bdc-xo \`docs/superpowers/specs/ce-release-branch/docs/CE-REGRESSION-MATRIX.md\`"
         echo ""
-        echo "🤖 Generated with [Claude Code](https://claude.com/claude-code)"
+        echo " Generated with [Claude Code](https://claude.com/claude-code)"
       } > "$BODY_FILE"
       # Idempotent PR creation. See WO-HARNESS-OPEN-PR-GRAPHQL-NO-COMMITS-FIX-01.
       existing_pr_url() {
@@ -248,7 +248,7 @@ nodes:
       $commit-and-push.output
       $open-pr.output
 
-  # post-completed node REMOVED 2026-05-12 — n8n webhook hangs from Archon executor subprocess
+  # post-completed node REMOVED 2026-05-12 -- n8n webhook hangs from Archon executor subprocess
   # (see WO-HARNESS-N8N-WEBHOOK-EGRESS-FIX-01). Builder-status feed is optional bookkeeping;
   # flip-notion below is the canonical close action.
 

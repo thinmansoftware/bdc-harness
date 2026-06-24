@@ -1,10 +1,10 @@
 name: bdc-ce-backport-policy
 description: |
-  Use when: Shipping WO-RELEASE-CE-BACKPORT-POLICY-01 — Captain CI enforces every CE hotfix
+  Use when: Shipping WO-RELEASE-CE-BACKPORT-POLICY-01 -- Captain CI enforces every CE hotfix
   has a backport PR to main.
   Input: WO_ID = WO-RELEASE-CE-BACKPORT-POLICY-01.
   Does: Implements a Captain CI check in lspro-react `.github/workflows/ce-backport-check.yml`
-        that runs when a PR merges into release/ce from a hotfix/ce/* branch — verifies a
+        that runs when a PR merges into release/ce from a hotfix/ce/* branch -- verifies a
         backport PR to main exists or a waiver is recorded. Opens PR.
   Repo: bluedevilcollectibles/lspro-react. Cross-repo spec from bdc-xo.
 
@@ -63,11 +63,11 @@ nodes:
             3. If none found AND no `ce-backport-waiver` label on the original PR, fail the check + comment on the merged PR with instructions
             4. If found, post comment with backport PR URL + pass
           - Required permissions: `pull-requests: write`, `contents: read`
-        - `docs/CE-BACKPORT-POLICY.md` — short policy doc pointing to bdc-xo governance
+        - `docs/CE-BACKPORT-POLICY.md` -- short policy doc pointing to bdc-xo governance
 
         ## Rules
         - Use only `gh` CLI (preinstalled in GitHub-hosted runners) + standard bash.
-        - The check is INFORMATIONAL (not blocking) for now — comment-only; if we want hard-block later, separate WO.
+        - The check is INFORMATIONAL (not blocking) for now -- comment-only; if we want hard-block later, separate WO.
         - Do NOT modify any other workflow files.
 
         Output <promise>COMPLETE</promise> when both files exist + `yamllint .github/workflows/ce-backport-check.yml` passes (or skipped if yamllint not present).
@@ -103,7 +103,7 @@ nodes:
         echo "No staged changes; branch already contains requested work"
       else
         git -c user.name="John Ranson" -c user.email="admin@bluedevilcollectibles.com" \
-          commit -m "feat(ci): WO-RELEASE-CE-BACKPORT-POLICY-01 — CE hotfix backport policy check
+          commit -m "feat(ci): WO-RELEASE-CE-BACKPORT-POLICY-01 -- CE hotfix backport policy check
 
         Adds .github/workflows/ce-backport-check.yml. Runs when a PR is merged into release/ce
         from a hotfix/ce/* branch. Checks for a backport PR to main, comments instructions if missing.
@@ -118,14 +118,14 @@ nodes:
     depends_on: [commit-and-push]
     bash: |
       set -euo pipefail
-      # Hardcoded — must match commit-and-push BRANCH literal. See WO-HARNESS-OPEN-PR-BRANCH-INTERPOLATION-FIX-01.
+      # Hardcoded -- must match commit-and-push BRANCH literal. See WO-HARNESS-OPEN-PR-BRANCH-INTERPOLATION-FIX-01.
       BRANCH="wo/release-ce-backport-policy-01"
       REPO="bluedevilcollectibles/lspro-react"
       BASE="main"
-      TITLE="feat(ci): WO-RELEASE-CE-BACKPORT-POLICY-01 — CE hotfix backport check"
-      BODY="Implements WO-RELEASE-CE-BACKPORT-POLICY-01. CE hotfixes that merge to release/ce without a backport PR to main now get a CI comment with instructions. 🤖 Generated with Claude Code"
+      TITLE="feat(ci): WO-RELEASE-CE-BACKPORT-POLICY-01 -- CE hotfix backport check"
+      BODY="Implements WO-RELEASE-CE-BACKPORT-POLICY-01. CE hotfixes that merge to release/ce without a backport PR to main now get a CI comment with instructions.  Generated with Claude Code"
       # Idempotent PR creation: check first, then create with retries, re-check after each failed attempt.
-      # See WO-HARNESS-OPEN-PR-GRAPHQL-NO-COMMITS-FIX-01 — gh pr create can server-side-succeed even when client returns error,
+      # See WO-HARNESS-OPEN-PR-GRAPHQL-NO-COMMITS-FIX-01 -- gh pr create can server-side-succeed even when client returns error,
       # and the GitHub PR API needs multi-minute window to resolve newly-pushed refs.
       existing_pr_url() {
         gh pr list --repo "$REPO" --head "$BRANCH" --state open --json url --jq '.[0].url // empty' 2>/dev/null

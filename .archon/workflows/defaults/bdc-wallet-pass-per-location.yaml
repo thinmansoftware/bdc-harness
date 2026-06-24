@@ -4,14 +4,14 @@
 #
 # Pre-flight: codebase bluedevilcollectibles/shopops registered in Archon.
 # Pre-flight (4-block): YAML exists, spec exists, CWD = shopops single-repo, codebase registered.
-# parallel_ok: false — schema migration. Do NOT fire alongside other shopops schema WOs.
+# parallel_ok: false -- schema migration. Do NOT fire alongside other shopops schema WOs.
 #
 # Deploy: BDC_XO/scripts/archon-bridge/sync-workflows.sh WO-WALLET-PASS-PER-LOCATION-01.yaml
-# REVIEW BEFORE DEPLOY — verify wallet_passes existing rows backfill plan with operator.
+# REVIEW BEFORE DEPLOY -- verify wallet_passes existing rows backfill plan with operator.
 
 name: bdc-wallet-pass-per-location
 description: |
-  Use when: Executing WO-WALLET-PASS-PER-LOCATION-01 — per-location wallet pass.
+  Use when: Executing WO-WALLET-PASS-PER-LOCATION-01 -- per-location wallet pass.
   Input: WO_ID = WO-WALLET-PASS-PER-LOCATION-01.
   Does: Reads spec from bdc-xo. Verifies wallet_passes schema. Writes migration
         20260513_wallet_pass_per_location.sql (store_locations table + location_id
@@ -143,7 +143,7 @@ nodes:
         $read-spec.output
 
         Rules:
-        1. Migration per WO §7 (store_locations table, location_id column on wallet_passes,
+        1. Migration per WO Section 7 (store_locations table, location_id column on wallet_passes,
            backfill UPDATE, default-location seed for every tenant, UNIQUE INDEX).
         2. services/store-locations.js exports getLocation(tenantId, locationId) +
            getDefaultLocation(tenantId), with 60s in-memory cache.
@@ -152,7 +152,7 @@ nodes:
            Existing PATCH /wallet/pass/:serial unchanged.
         4. services/wallet-google.js buildPassPayload reads from location.
         5. services/wallet-apn.js pushAllForCustomer iterates serials.
-        6. tests/test_wallet_per_location.js — >= 8 bun tests per WO §11.
+        6. tests/test_wallet_per_location.js -- >= 8 bun tests per WO Section 11.
         7. Keep existing /wallet/pass behavior backward compatible (single-location tenants).
         8. NO push, NO docker, NO migration apply.
 
@@ -202,7 +202,7 @@ nodes:
         echo "No staged changes"
       else
         git -c user.name="John Ranson" -c user.email="admin@bluedevilcollectibles.com" \
-          commit -m "$(printf 'feat(api): WO-WALLET-PASS-PER-LOCATION-01 — per-location wallet passes\n\nAdds migration 20260513_wallet_pass_per_location.sql:\n  - CREATE TABLE store_locations (id, tenant_id, name, color_hex, beacon_uuid, ...)\n  - ALTER TABLE wallet_passes ADD COLUMN location_id\n  - Backfill existing rows + seed default location per tenant\n  - UNIQUE INDEX (customer_id, location_id, tenant_id)\n\nAdds services/store-locations.js (getLocation + getDefaultLocation + 60s cache).\nModifies routes/wallet.js: POST /wallet/pass takes location_id; NEW POST /wallet/pass/sync-all.\nModifies services/wallet-google.js to read branding from location.\nModifies services/wallet-apn.js to add pushAllForCustomer helper.\nAdds tests/test_wallet_per_location.js (8+ bun tests).\n\nPATCH /wallet/pass/:serial interface unchanged (backward compat).\n\nCo-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>')"
+          commit -m "$(printf 'feat(api): WO-WALLET-PASS-PER-LOCATION-01 -- per-location wallet passes\n\nAdds migration 20260513_wallet_pass_per_location.sql:\n  - CREATE TABLE store_locations (id, tenant_id, name, color_hex, beacon_uuid, ...)\n  - ALTER TABLE wallet_passes ADD COLUMN location_id\n  - Backfill existing rows + seed default location per tenant\n  - UNIQUE INDEX (customer_id, location_id, tenant_id)\n\nAdds services/store-locations.js (getLocation + getDefaultLocation + 60s cache).\nModifies routes/wallet.js: POST /wallet/pass takes location_id; NEW POST /wallet/pass/sync-all.\nModifies services/wallet-google.js to read branding from location.\nModifies services/wallet-apn.js to add pushAllForCustomer helper.\nAdds tests/test_wallet_per_location.js (8+ bun tests).\n\nPATCH /wallet/pass/:serial interface unchanged (backward compat).\n\nCo-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>')"
       fi
       git push -u origin "$BRANCH"
       echo "SHA=$(git rev-parse HEAD)"
@@ -215,7 +215,7 @@ nodes:
       BODY=$(mktemp)
       {
         echo "## Summary"
-        echo "Implements WO-WALLET-PASS-PER-LOCATION-01 — wallet pass keyed by (customer, location)."
+        echo "Implements WO-WALLET-PASS-PER-LOCATION-01 -- wallet pass keyed by (customer, location)."
         echo ""
         echo "## Migration"
         echo "shopops-api/migrations/20260513_wallet_pass_per_location.sql"
@@ -224,15 +224,15 @@ nodes:
         echo "- Must be applied to staging Supabase before container rebuild"
         echo ""
         echo "## API"
-        echo "- POST /wallet/pass — now takes location_id (auto-resolves for single-location)"
-        echo "- POST /wallet/pass/sync-all — pushes APN update to every pass for a customer"
-        echo "- PATCH /wallet/pass/:serial — UNCHANGED"
+        echo "- POST /wallet/pass -- now takes location_id (auto-resolves for single-location)"
+        echo "- POST /wallet/pass/sync-all -- pushes APN update to every pass for a customer"
+        echo "- PATCH /wallet/pass/:serial -- UNCHANGED"
       } > "$BODY"
       EXIST=$(gh pr list --repo bluedevilcollectibles/shopops --head "$BRANCH" --state open --json url --template '{{range .}}{{.url}}{{end}}' 2>/dev/null || true)
       if [ -n "$EXIST" ]; then echo "PR_URL=$EXIST"; exit 0; fi
       for i in 1 2 3; do
         if URL=$(gh pr create --repo bluedevilcollectibles/shopops --base master --head "$BRANCH" \
-            --title "feat(api): WO-WALLET-PASS-PER-LOCATION-01 — per-location wallet passes" \
+            --title "feat(api): WO-WALLET-PASS-PER-LOCATION-01 -- per-location wallet passes" \
             --body-file "$BODY" 2>&1); then
           echo "PR_URL=$URL"; exit 0
         fi
@@ -270,7 +270,7 @@ nodes:
       Files modified: shopops-api/routes/wallet.js, services/wallet-google.js,
                        services/wallet-apn.js
       Tests: from $verify-tests.output | bun test shopops-api/tests/test_wallet_per_location.js
-      PRs: from $open-pr.output PR_URL — base: master
+      PRs: from $open-pr.output PR_URL -- base: master
       Merge ancestors: shopops master HEAD from $commit-and-push.output SHA, behind_by: 0
       Grep assertions:
         - grep -q 'store_locations' shopops-api/migrations/20260513_wallet_pass_per_location.sql
@@ -287,7 +287,7 @@ nodes:
           WHERE table_name='wallet_passes' AND column_name='location_id' (expected 1)
         - Backfill verify: SELECT COUNT(*) FROM wallet_passes WHERE location_id IS NULL (expected 0)
         - Seed verify: SELECT COUNT(*) FROM store_locations (expected >= active tenant count)
-      Vercel deployment: N/A — shopops-api is Hetzner Docker
+      Vercel deployment: N/A -- shopops-api is Hetzner Docker
       VALIDATION: PASS (pending migration apply + container rebuild)
 
       Inputs:

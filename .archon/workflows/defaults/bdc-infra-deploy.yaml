@@ -6,7 +6,7 @@ description: |
         collects Rule 14 INFRA evidence (docker inspect, docker logs, curl), commits source if changed, opens PR, builds manifest.
   NOT for: Code-only features (use bdc-feature-development), doctrine updates, database migrations.
 
-  ⚠️  SERIAL ONLY: parallel_ok=false. Multiple infra deploys against the same Hetzner host create race conditions.
+  !  SERIAL ONLY: parallel_ok=false. Multiple infra deploys against the same Hetzner host create race conditions.
        Every WO using this YAML must declare parallel_ok=false.
 
 policyFile: harness/policies/agent-behavior.md
@@ -25,7 +25,7 @@ nodes:
         exit 1
       fi
       # Try direct path first, then date-prefixed glob (specs are commonly named YYYY-MM-DD-WO-...md)
-      # CWD is the bdc-xo repo root (Archon worktree), so paths are relative — no BDC_XO/ prefix.
+      # CWD is the bdc-xo repo root (Archon worktree), so paths are relative -- no BDC_XO/ prefix.
       SPEC_PATH="docs/superpowers/specs/${WO_ID}.md"
       if [ ! -f "$SPEC_PATH" ]; then
         SPEC_PATH=$(ls docs/superpowers/specs/*${WO_ID}.md 2>/dev/null | head -n 1 || true)
@@ -70,7 +70,7 @@ nodes:
       ARTIFACT_DIR="${ARTIFACTS_DIR:-.}"
       mkdir -p "$ARTIFACT_DIR/pre-state"
 
-      # Generic Docker inspection — caller specifies which container via spec
+      # Generic Docker inspection -- caller specifies which container via spec
       CONTAINER_NAME="${CONTAINER_NAME:-overlord}"
 
       echo "=== Capturing pre-state for container: $CONTAINER_NAME ===" | tee "$ARTIFACT_DIR/pre-state/capture.log"
@@ -183,7 +183,7 @@ nodes:
         exit 1
       }
 
-      echo "✓ Container $CONTAINER_NAME is running"
+      echo "[x] Container $CONTAINER_NAME is running"
 
       # Check for health status
       HEALTH=$(docker inspect "$CONTAINER_NAME" --format='{{.State.Health.Status}}' 2>/dev/null || echo "unknown")
@@ -192,7 +192,7 @@ nodes:
       # Save post-state docker inspect
       docker inspect "$CONTAINER_NAME" > "$ARTIFACT_DIR/post-state/docker-inspect.json"
       docker ps --filter "name=$CONTAINER_NAME" > "$ARTIFACT_DIR/post-state/docker-ps.txt"
-      echo "✓ Post-state docker inspect saved"
+      echo "[x] Post-state docker inspect saved"
 
   - id: verify-source-live
     depends_on: [verify-container-healthy]
@@ -212,7 +212,7 @@ nodes:
             echo "Source verification failed: line not found in /app/$SOURCE_FILE" >&2
             exit 1
           }
-          echo "✓ Rule 19: Source line verified live in container"
+          echo "[x] Rule 19: Source line verified live in container"
         else
           echo "SOURCE_LINE not set; skipping Rule 19 grep (not a source change deploy)"
         fi
@@ -239,15 +239,15 @@ nodes:
             continue
           fi
           if docker exec "$CONTAINER_NAME" printenv | grep -q "^${var}="; then
-            echo "✓ $var is set"
+            echo "[x] $var is set"
           else
-            echo "✗ $var is NOT set" >&2
+            echo "[ ] $var is NOT set" >&2
             exit 1
           fi
         done <<EOF
         $ENV_VARS
         EOF
-        echo "✓ All env vars verified"
+        echo "[x] All env vars verified"
       else
         echo "ENV_VARS not set; skipping env var verification"
       fi
@@ -262,7 +262,7 @@ nodes:
 
       echo "Running smoke test: $SMOKE_CMD"
       eval "$SMOKE_CMD" > "$ARTIFACT_DIR/post-state/smoke-test.txt" 2>&1 || true
-      echo "✓ Smoke test complete (evidence saved)"
+      echo "[x] Smoke test complete (evidence saved)"
 
   - id: decide-push-target
     depends_on: [runtime-smoke-test]
@@ -281,8 +281,8 @@ nodes:
 
       ## Analysis
       Check if the apply-change node modified any source files (check git status).
-      If only config/docker-compose/env changes → no_push_needed.
-      If source files changed → feature branch + PR.
+      If only config/docker-compose/env changes -> no_push_needed.
+      If source files changed -> feature branch + PR.
 
   - id: commit-and-push
     depends_on: [decide-push-target]

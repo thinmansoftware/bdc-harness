@@ -16,7 +16,7 @@
 
 name: bdc-channels-oauth-write-flows
 description: |
-  Use when: Executing WO-CHANNELS-OAUTH-WRITE-FLOWS-01 — channel connect/disconnect write flows.
+  Use when: Executing WO-CHANNELS-OAUTH-WRITE-FLOWS-01 -- channel connect/disconnect write flows.
   Input: WO_ID = WO-CHANNELS-OAUTH-WRITE-FLOWS-01.
   Does: Adds PATCH /channels/connect/:channel + DELETE /channels/disconnect/:channel +
         GET /channels/ebay/oauth-start to shopops-api/routes/channels.js. Wraps existing
@@ -25,8 +25,8 @@ description: |
         ConnectModal, DisconnectConfirm. Opens 2 PRs (shopops master + lspro-react staging).
         Rule 19 docker exec verify. MIXED manifest. flip-notion REVIEW.
   Repo: bluedevilcollectibles/shopops PRIMARY, bluedevilcollectibles/lspro-react SIBLING.
-  parallel_ok: true — no migration; idempotent route additions.
-  Polish bar: ROUGH OK — v1 limitations explicit (no token refresh, no validation ping).
+  parallel_ok: true -- no migration; idempotent route additions.
+  Polish bar: ROUGH OK -- v1 limitations explicit (no token refresh, no validation ping).
 
 policyFile: harness/policies/agent-behavior.md
 model: sonnet
@@ -128,19 +128,19 @@ nodes:
     prompt: |
       Plan the channel connect/disconnect implementation. ROUGH OK polish.
 
-      Backend (shopops-api/routes/channels.js — extend, do not replace):
-      - PATCH /channels/connect/:channel — body channel-specific, wraps existing PATCH /channels/connections/:channel with status='connected'
-      - DELETE /channels/disconnect/:channel — flips status='not_connected', clears credentials_ref
-      - GET /channels/ebay/oauth-start — returns { url: '<ebay-oauth-url>' } (placeholder OK)
+      Backend (shopops-api/routes/channels.js -- extend, do not replace):
+      - PATCH /channels/connect/:channel -- body channel-specific, wraps existing PATCH /channels/connections/:channel with status='connected'
+      - DELETE /channels/disconnect/:channel -- flips status='not_connected', clears credentials_ref
+      - GET /channels/ebay/oauth-start -- returns { url: '<ebay-oauth-url>' } (placeholder OK)
       - CHANNEL_IDS validation per existing module
 
-      UI (lspro-react/src/pages/Channels/ChannelsConfigPage.tsx — extend in place):
+      UI (lspro-react/src/pages/Channels/ChannelsConfigPage.tsx -- extend in place):
       - Add StatusPill to each ChannelCard
       - Add ActionButton (Connect/Disconnect/Reconnect based on status)
       - New ConnectModal per channel (Shopify token / Woo key+secret / eBay link)
       - New DisconnectConfirm modal
 
-      Tests (bun): tests/test_channels_connect.js — connect, disconnect, reconnect (round-trip), invalid channel, portal disconnect blocked
+      Tests (bun): tests/test_channels_connect.js -- connect, disconnect, reconnect (round-trip), invalid channel, portal disconnect blocked
 
       v1 explicitly NOT in scope: token validation/ping, refresh worker, error recovery UI beyond toast.
 
@@ -183,7 +183,7 @@ nodes:
         2. Create shopops-api/tests/test_channels_connect.js (bun-compatible, >= 4 tests):
            a. PATCH /channels/connect/shopify { access_token: 'shpat_xxx' } returns 200 + ok:true; channel_connections row exists with status='connected'
            b. DELETE /channels/disconnect/shopify returns 200; row now has status='not_connected', credentials_ref IS NULL
-           c. Reconnect (connect → disconnect → connect) results in exactly 1 row with new credentials (idempotent upsert)
+           c. Reconnect (connect -> disconnect -> connect) results in exactly 1 row with new credentials (idempotent upsert)
            d. PATCH /channels/connect/fakechannel returns 400
            e. DELETE /channels/disconnect/comicstoreos_portal returns 400
 
@@ -236,15 +236,15 @@ nodes:
            first (Rule 17). If file structure differs from spec, read it and adapt.
 
            Add (new components in src/components/Channels/):
-           - StatusPill.tsx — shows 'connected'/'not_connected'/'error' with color
-           - ActionButton.tsx — picks Connect/Disconnect/Reconnect by status
-           - ConnectModal.tsx — variants for Shopify (token input), Woo (key+secret), eBay (link)
-           - DisconnectConfirm.tsx — confirmation modal
+           - StatusPill.tsx -- shows 'connected'/'not_connected'/'error' with color
+           - ActionButton.tsx -- picks Connect/Disconnect/Reconnect by status
+           - ConnectModal.tsx -- variants for Shopify (token input), Woo (key+secret), eBay (link)
+           - DisconnectConfirm.tsx -- confirmation modal
 
         3. Wire each ChannelCard:
            - Pass status from GET /api/channels/connections
-           - On Connect click → open ConnectModal → on save → PATCH /api/channels/connect/<channel>
-           - On Disconnect click → open DisconnectConfirm → on confirm → DELETE /api/channels/disconnect/<channel>
+           - On Connect click -> open ConnectModal -> on save -> PATCH /api/channels/connect/<channel>
+           - On Disconnect click -> open DisconnectConfirm -> on confirm -> DELETE /api/channels/disconnect/<channel>
            - Refetch /api/channels/connections after either action
 
         4. Error handling: toast-only (v1 limitation). No retry, no validation ping.
@@ -255,12 +255,12 @@ nodes:
         6. Commit + push + open PR against staging (Rule 20):
              git add src/pages/Channels/ src/components/Channels/ tests/channels-connect.spec.ts
              git -c user.name="John Ranson" -c user.email="admin@bluedevilcollectibles.com" \
-               commit -m "$(printf 'feat(ui): WO-CHANNELS-OAUTH-WRITE-FLOWS-01 — Connect/Disconnect buttons on ChannelsConfigPage\n\nAdds StatusPill, ActionButton, ConnectModal, DisconnectConfirm. Wires to\nshopops-api /channels/connect + /channels/disconnect. ROUGH OK polish — toast-only errors.\n\nCo-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>')"
+               commit -m "$(printf 'feat(ui): WO-CHANNELS-OAUTH-WRITE-FLOWS-01 -- Connect/Disconnect buttons on ChannelsConfigPage\n\nAdds StatusPill, ActionButton, ConnectModal, DisconnectConfirm. Wires to\nshopops-api /channels/connect + /channels/disconnect. ROUGH OK polish -- toast-only errors.\n\nCo-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>')"
              git push -u origin wo/channels-oauth-write-flows-01-ui
              gh pr create --repo bluedevilcollectibles/lspro-react --base staging \
                --head wo/channels-oauth-write-flows-01-ui \
-               --title "feat(ui): WO-CHANNELS-OAUTH-WRITE-FLOWS-01 — Connect/Disconnect buttons" \
-               --body "Implements UI side of WO-CHANNELS-OAUTH-WRITE-FLOWS-01. Plan: A. ROUGH OK polish — v1 limitations: no token validation/ping, no refresh worker, toast-only errors."
+               --title "feat(ui): WO-CHANNELS-OAUTH-WRITE-FLOWS-01 -- Connect/Disconnect buttons" \
+               --body "Implements UI side of WO-CHANNELS-OAUTH-WRITE-FLOWS-01. Plan: A. ROUGH OK polish -- v1 limitations: no token validation/ping, no refresh worker, toast-only errors."
 
         Output <promise>COMPLETE</promise> with the lspro-react PR URL.
 
@@ -277,7 +277,7 @@ nodes:
         echo "No staged changes"
       else
         git -c user.name="John Ranson" -c user.email="admin@bluedevilcollectibles.com" \
-          commit -m "$(printf 'feat(api): WO-CHANNELS-OAUTH-WRITE-FLOWS-01 — channel connect/disconnect routes\n\nExtends routes/channels.js (preserves all existing routes):\n  - PATCH /channels/connect/:channel — channel-specific body, upserts channel_connections\n  - DELETE /channels/disconnect/:channel — flips status to not_connected\n  - GET /channels/ebay/oauth-start — returns placeholder OAuth URL\n\n4 bun tests (connect, disconnect, reconnect round-trip, invalid channel, portal disconnect).\n\nPlan: A (P1 extension for Mutant Market 2026-06-15)\nPolish bar: ROUGH OK — v1 limitations: no token refresh, no validation ping, toast-only errors.\n\nUI side: bluedevilcollectibles/lspro-react PR\n\nCo-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>')"
+          commit -m "$(printf 'feat(api): WO-CHANNELS-OAUTH-WRITE-FLOWS-01 -- channel connect/disconnect routes\n\nExtends routes/channels.js (preserves all existing routes):\n  - PATCH /channels/connect/:channel -- channel-specific body, upserts channel_connections\n  - DELETE /channels/disconnect/:channel -- flips status to not_connected\n  - GET /channels/ebay/oauth-start -- returns placeholder OAuth URL\n\n4 bun tests (connect, disconnect, reconnect round-trip, invalid channel, portal disconnect).\n\nPlan: A (P1 extension for Mutant Market 2026-06-15)\nPolish bar: ROUGH OK -- v1 limitations: no token refresh, no validation ping, toast-only errors.\n\nUI side: bluedevilcollectibles/lspro-react PR\n\nCo-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>')"
       fi
       git push -u origin "$BRANCH"
       echo "BRANCH=${BRANCH}"
@@ -290,9 +290,9 @@ nodes:
       BRANCH="$(git rev-parse --abbrev-ref HEAD)"
       REPO="bluedevilcollectibles/shopops"
       BASE="master"
-      TITLE="feat(api): WO-CHANNELS-OAUTH-WRITE-FLOWS-01 — channel connect/disconnect"
+      TITLE="feat(api): WO-CHANNELS-OAUTH-WRITE-FLOWS-01 -- channel connect/disconnect"
       BODY_FILE=$(mktemp)
-      printf '## Summary\nImplements WO-CHANNELS-OAUTH-WRITE-FLOWS-01 — backend connect/disconnect routes.\n\n## Plan: A (P1 Mutant Market 2026-06-15)\n\n## Polish bar: ROUGH OK\nv1 limitations explicit: no token refresh, no validation ping, toast-only errors.\nManual disconnect-then-reconnect is acceptable recovery path.\n\nUI companion PR: bluedevilcollectibles/lspro-react.\n' > "$BODY_FILE"
+      printf '## Summary\nImplements WO-CHANNELS-OAUTH-WRITE-FLOWS-01 -- backend connect/disconnect routes.\n\n## Plan: A (P1 Mutant Market 2026-06-15)\n\n## Polish bar: ROUGH OK\nv1 limitations explicit: no token refresh, no validation ping, toast-only errors.\nManual disconnect-then-reconnect is acceptable recovery path.\n\nUI companion PR: bluedevilcollectibles/lspro-react.\n' > "$BODY_FILE"
       existing_pr_url() {
         gh pr list --repo "$REPO" --head "$BRANCH" --state open \
           --json url --template '{{range .}}{{.url}}{{"\n"}}{{end}}' 2>/dev/null | head -1
@@ -334,7 +334,7 @@ nodes:
     prompt: |
       Build Captain CI manifest v2 for WO-CHANNELS-OAUTH-WRITE-FLOWS-01 (MIXED cross-repo, ROUGH OK).
 
-      Polish bar must be stated in manifest: ROUGH OK — admin actions, manual workaround acceptable.
+      Polish bar must be stated in manifest: ROUGH OK -- admin actions, manual workaround acceptable.
 
       Fields:
       WO: WO-CHANNELS-OAUTH-WRITE-FLOWS-01
@@ -356,7 +356,7 @@ nodes:
         docker exec shopops-api grep -n 'channels/connect' /app/routes/channels.js
         docker exec shopops-api grep -n 'channels/disconnect' /app/routes/channels.js
       Vercel deployment: lspro-react staging URL + READY
-      Schema: N/A — no new tables (uses existing channel_connections from COMMERCE-SPINE-01)
+      Schema: N/A -- no new tables (uses existing channel_connections from COMMERCE-SPINE-01)
       v1 limitations explicit:
         - no token refresh worker
         - no connector validation/ping

@@ -9,16 +9,16 @@
 #   4. Both codebases registered:
 #      sqlite3 /opt/bdc/archon-data/archon.db "SELECT name FROM remote_agent_codebases"
 #
-# parallel_ok: NO — schema migration on receiving_sessions/receiving_session_lines (new tables,
+# parallel_ok: NO -- schema migration on receiving_sessions/receiving_session_lines (new tables,
 #   but depends_on WO-SHOPOPS-MULTI-LOCATION-SCOPE-01 must already be merged for location_id FK).
 #
 # Deploy: BDC_XO/scripts/archon-bridge/sync-workflows.sh WO-SHOPOPS-RECEIVING-INTAKE-01.yaml
-# REVIEW BEFORE DEPLOY — verify WO-SHOPOPS-MULTI-LOCATION-SCOPE-01 is merged + applied
+# REVIEW BEFORE DEPLOY -- verify WO-SHOPOPS-MULTI-LOCATION-SCOPE-01 is merged + applied
 #   in staging before firing this workflow (location_id FK needed).
 
 name: bdc-shopops-receiving-intake
 description: |
-  Use when: Executing WO-SHOPOPS-RECEIVING-INTAKE-01 — Receiving Intake (scan/verify).
+  Use when: Executing WO-SHOPOPS-RECEIVING-INTAKE-01 -- Receiving Intake (scan/verify).
   Input: WO_ID = WO-SHOPOPS-RECEIVING-INTAKE-01.
   Does: Reads spec from bdc-xo. Adds receiving_sessions + receiving_session_lines tables
         via migration. Adds shopops-api/routes/receiving-sessions.js (POST create, POST scan,
@@ -29,7 +29,7 @@ description: |
         verify, builds MIXED manifest, flips Notion REVIEW.
   Repo: bluedevilcollectibles/shopops (PRIMARY CWD), bluedevilcollectibles/lspro-react
         (sibling via /tmp clone).
-  parallel_ok: false — schema migration AND depends on multi-location-scope migration first.
+  parallel_ok: false -- schema migration AND depends on multi-location-scope migration first.
   Polish bar: HIGH (warehouse staff use daily).
 
 policyFile: harness/policies/agent-behavior.md
@@ -160,7 +160,7 @@ nodes:
       - services/receivingSession.js (matchScan pure function, reconcileSession)
       - tests/test_receiving_session.js (>=7 tests)
 
-      ## UI (lspro-react) — sibling worktree at /tmp/lspro-react-receiving-<WORKFLOW_ID>
+      ## UI (lspro-react) -- sibling worktree at /tmp/lspro-react-receiving-<WORKFLOW_ID>
       - src/pages/Receiving/ReceivingIntakePage.tsx
       - src/components/Receiving/ScanInput.tsx
       - src/components/Receiving/ExpectedItemsGrid.tsx
@@ -192,16 +192,16 @@ nodes:
            - Indexes
 
         2. shopops-api/routes/receiving-sessions.js:
-           - POST /receiving-sessions — creates session, copies distributor_order_lines into expected_lines
-           - POST /receiving-sessions/:id/scan { upc, qty } — calls matchScan, updates scanned_qty
-           - POST /receiving-sessions/:id/submit { force } — 409 if discrepancy + force=false;
+           - POST /receiving-sessions -- creates session, copies distributor_order_lines into expected_lines
+           - POST /receiving-sessions/:id/scan { upc, qty } -- calls matchScan, updates scanned_qty
+           - POST /receiving-sessions/:id/submit { force } -- 409 if discrepancy + force=false;
              else writes inventory movements + flips distributor_orders.status=received
-           - POST /receiving-sessions/:id/cancel — soft-delete (status=cancelled)
-           - GET /receiving-sessions/:id — returns current session state
+           - POST /receiving-sessions/:id/cancel -- soft-delete (status=cancelled)
+           - GET /receiving-sessions/:id -- returns current session state
 
         3. shopops-api/services/receivingSession.js:
-           - matchScan(session, upc) pure function → returns action: 'increment'|'over'|'unexpected'
-           - reconcileSession(sessionId) → per-line status rollup
+           - matchScan(session, upc) pure function -> returns action: 'increment'|'over'|'unexpected'
+           - reconcileSession(sessionId) -> per-line status rollup
 
         4. shopops-api/tests/test_receiving_session.js:
            - import { describe, it, expect } from 'bun:test'
@@ -265,13 +265,13 @@ nodes:
            (Use staging per Rule 20.)
 
         2. Create files:
-           - src/pages/Receiving/ReceivingIntakePage.tsx — page-level component, fetches
+           - src/pages/Receiving/ReceivingIntakePage.tsx -- page-level component, fetches
              open distributor orders, holds session state, calls API
-           - src/components/Receiving/ScanInput.tsx — autofocus input, Enter submits
-           - src/components/Receiving/ExpectedItemsGrid.tsx — grid with row tint by status
-           - src/components/Receiving/DiscrepancyPanel.tsx — counts + "show only discrepancies" toggle
+           - src/components/Receiving/ScanInput.tsx -- autofocus input, Enter submits
+           - src/components/Receiving/ExpectedItemsGrid.tsx -- grid with row tint by status
+           - src/components/Receiving/DiscrepancyPanel.tsx -- counts + "show only discrepancies" toggle
 
-        3. Wire the route in the router (App.tsx or routes file — verify by reading repo first)
+        3. Wire the route in the router (App.tsx or routes file -- verify by reading repo first)
            and ensure `/receiving` resolves to ReceivingIntakePage.
 
         4. Add Playwright test stub: tests/receiving-intake.spec.ts (1 test minimum)
@@ -281,13 +281,13 @@ nodes:
              git add src/pages/Receiving/ src/components/Receiving/ tests/receiving-intake.spec.ts \
                      <any router file modified>
              git -c user.name="John Ranson" -c user.email="admin@bluedevilcollectibles.com" \
-               commit -m "$(printf 'feat(ui): WO-SHOPOPS-RECEIVING-INTAKE-01 — ReceivingIntakePage + scan/grid/discrepancy\n\nAdds ReceivingIntakePage with scan input, ExpectedItemsGrid (row-tint by status),\nDiscrepancyPanel. Routes /receiving. Wires to shopops-api receiving-sessions endpoints.\n\nCo-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>')"
+               commit -m "$(printf 'feat(ui): WO-SHOPOPS-RECEIVING-INTAKE-01 -- ReceivingIntakePage + scan/grid/discrepancy\n\nAdds ReceivingIntakePage with scan input, ExpectedItemsGrid (row-tint by status),\nDiscrepancyPanel. Routes /receiving. Wires to shopops-api receiving-sessions endpoints.\n\nCo-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>')"
              git push -u origin wo/shopops-receiving-intake-01-ui
 
         6. Open PR on lspro-react against staging (Rule 20):
              gh pr create --repo bluedevilcollectibles/lspro-react --base staging \
                --head wo/shopops-receiving-intake-01-ui \
-               --title "feat(ui): WO-SHOPOPS-RECEIVING-INTAKE-01 — ReceivingIntakePage" \
+               --title "feat(ui): WO-SHOPOPS-RECEIVING-INTAKE-01 -- ReceivingIntakePage" \
                --body "Implements UI side of WO-SHOPOPS-RECEIVING-INTAKE-01. Wires to shopops-api receiving-sessions endpoints. Plan: B."
 
         Output <promise>COMPLETE</promise> with the lspro-react PR URL.
@@ -296,7 +296,7 @@ nodes:
     depends_on: [verify-backend-grep, verify-backend-tests]
     bash: |
       set -euo pipefail
-      # Use current HEAD branch (set by fresh-branch — may be timestamped variant)
+      # Use current HEAD branch (set by fresh-branch -- may be timestamped variant)
       BRANCH="$(git rev-parse --abbrev-ref HEAD)"
       git add \
         shopops-api/migrations/20260514_receiving_sessions.sql \
@@ -316,7 +316,7 @@ nodes:
         echo "No staged changes"
       else
         git -c user.name="John Ranson" -c user.email="admin@bluedevilcollectibles.com" \
-          commit -m "$(printf 'feat(api): WO-SHOPOPS-RECEIVING-INTAKE-01 — receiving session backend\n\nAdds receiving_sessions + receiving_session_lines tables (migration 20260514).\nAdds routes/receiving-sessions.js: POST create, POST scan, POST submit, POST cancel, GET.\nAdds services/receivingSession.js: matchScan + reconcileSession.\n7+ bun tests covering scan, over, unexpected, submit/force flow.\n\nPlan: B (P0 floor, Mutant Market 2026-06-15)\nUI side: bluedevilcollectibles/lspro-react PR\n\nCo-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>')"
+          commit -m "$(printf 'feat(api): WO-SHOPOPS-RECEIVING-INTAKE-01 -- receiving session backend\n\nAdds receiving_sessions + receiving_session_lines tables (migration 20260514).\nAdds routes/receiving-sessions.js: POST create, POST scan, POST submit, POST cancel, GET.\nAdds services/receivingSession.js: matchScan + reconcileSession.\n7+ bun tests covering scan, over, unexpected, submit/force flow.\n\nPlan: B (P0 floor, Mutant Market 2026-06-15)\nUI side: bluedevilcollectibles/lspro-react PR\n\nCo-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>')"
       fi
       git push -u origin "$BRANCH"
       echo "BRANCH=${BRANCH}"
@@ -329,7 +329,7 @@ nodes:
       BRANCH="$(git rev-parse --abbrev-ref HEAD)"
       REPO="bluedevilcollectibles/shopops"
       BASE="master"
-      TITLE="feat(api): WO-SHOPOPS-RECEIVING-INTAKE-01 — receiving session backend"
+      TITLE="feat(api): WO-SHOPOPS-RECEIVING-INTAKE-01 -- receiving session backend"
       BODY_FILE=$(mktemp)
       printf '## Summary\nImplements WO-SHOPOPS-RECEIVING-INTAKE-01 backend (receiving_sessions tables + 5 routes + matchScan/reconcileSession services).\n\n## Plan: B (P0 floor, Mutant Market 2026-06-15)\n\nUI side: bluedevilcollectibles/lspro-react companion PR.\nApply migration to staging Supabase BEFORE merging.\n' > "$BODY_FILE"
       existing_pr_url() { gh pr list --repo "$REPO" --head "$BRANCH" --state open --json url --template '{{range .}}{{.url}}{{end}}' 2>/dev/null; }

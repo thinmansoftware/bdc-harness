@@ -37,7 +37,7 @@ policyFile: harness/policies/agent-behavior.md
 model: sonnet
 target_repo: bluedevilcollectibles/bdc-xo
 
-# 2026-05-16 fix v2: Cauldron API ONLY accepts conversationId + message — the
+# 2026-05-16 fix v2: Cauldron API ONLY accepts conversationId + message -- the
 # `inputs` field in API payloads is silently dropped. Engine injects only the
 # DEFAULTS from this block as $INPUT_<NAME> env vars. To run a different batch,
 # either (a) edit the WO_CONCEPTS_FILE default and re-fire, or (b) pass the path
@@ -154,7 +154,7 @@ nodes:
       printf '=== WO CONCEPTS JSON ===\n%s\n\n' "$WO_CONCEPTS"
       printf '=== PLAN DOC (%s) ===\n%s\n\n' "$PLAN_DOC_PATH" "$PLAN_CONTENT"
       printf '=== CALIBRATION ===\n%s\n\n' "$CALIBRATION"
-      # 2026-05-16: don't use `[ ] && cmd` as terminal line under `set -e` —
+      # 2026-05-16: don't use `[ ] && cmd` as terminal line under `set -e` --
       # if the test is false (ARCHON_DOCTRINE empty), [ exits 1, becomes the
       # script's exit code, and the whole node dies silently with no stderr.
       # Anchor: Codex diagnosis of post-#77 fast-die-no-stderr symptom.
@@ -181,12 +181,12 @@ nodes:
 
         ---
 
-        ## PHASE 1 — AUTHOR
+        ## PHASE 1 -- AUTHOR
 
         For each WO concept in the JSON array:
 
         **1a. Resume check**: Does `docs/work-orders/<wo_id>.md` AND `yaml-drafts/<wo_id>.yaml` already
-        exist on disk? If both exist, SKIP this WO — it passed review in a prior iteration.
+        exist on disk? If both exist, SKIP this WO -- it passed review in a prior iteration.
 
         **1b. Draft the WO spec** (12-section wo-recipe.md template):
         ```
@@ -224,7 +224,7 @@ nodes:
 
         ---
 
-        ## PHASE 2 — ADVERSARIAL REVIEW (you are now a blocking reviewer — no approvals without evidence)
+        ## PHASE 2 -- ADVERSARIAL REVIEW (you are now a blocking reviewer -- no approvals without evidence)
 
         For EACH drafted spec+YAML pair, apply all 12 checks:
 
@@ -232,34 +232,34 @@ nodes:
           ## 1. Objective, ## 2. Behavior Source of Truth, ## 3. Prior Art Check,
           ## 7. Backend Function Inventory, ## 8. Data Flow, ## 10. Deploy Target,
           ## 11. Test Scenarios, ## 12. Stop Point
-          → BLOCK if any missing.
+          -> BLOCK if any missing.
 
         **Check 2**: Body contains the substring `wo-recipe.md`.
-          → BLOCK if absent.
+          -> BLOCK if absent.
 
-        **Check 3**: §2 references at least one concrete artifact (file path or WO ID).
-          → BLOCK if §2 contains only TBD, "see body", or empty text.
+        **Check 3**: Section 2 references at least one concrete artifact (file path or WO ID).
+          -> BLOCK if Section 2 contains only TBD, "see body", or empty text.
 
         **Check 4**: WO ID matches `WO-[A-Z][A-Z0-9-]*-[0-9]+`; consistent across filename, H1, Notion title.
-          → BLOCK if inconsistent.
+          -> BLOCK if inconsistent.
 
-        **Check 5**: §2 cites a real path (e.g. `docs/plans/foo.md`, `research/bar.md`, `WO-XYZ-01`).
-          → BLOCK if §2 is vague without a concrete locator.
+        **Check 5**: Section 2 cites a real path (e.g. `docs/plans/foo.md`, `research/bar.md`, `WO-XYZ-01`).
+          -> BLOCK if Section 2 is vague without a concrete locator.
 
-        **Check 6**: Every function/route/script in §7 labeled `EXISTING (file:line)` or `NEW`.
-          → BLOCK if any name appears without a label.
+        **Check 6**: Every function/route/script in Section 7 labeled `EXISTING (file:line)` or `NEW`.
+          -> BLOCK if any name appears without a label.
 
-        **Check 7**: §9 column/table claims cite `information_schema` query result or migration file.
-          → BLOCK if §9 makes a column claim without citing source.
+        **Check 7**: Section 9 column/table claims cite `information_schema` query result or migration file.
+          -> BLOCK if Section 9 makes a column claim without citing source.
 
-        **Check 8**: §11 has >= 3 test scenarios each with Given/When/Then structure.
-          → BLOCK if fewer than 3, or any test is purely descriptive.
+        **Check 8**: Section 11 has >= 3 test scenarios each with Given/When/Then structure.
+          -> BLOCK if fewer than 3, or any test is purely descriptive.
 
-        **Check 8A**: If WO's files span 2+ repos → must have `Grep assertions` block with grep command per repo.
-          → BLOCK if split-repo WO lacks grep assertions.
+        **Check 8A**: If WO's files span 2+ repos -> must have `Grep assertions` block with grep command per repo.
+          -> BLOCK if split-repo WO lacks grep assertions.
 
-        **Check 9**: §12 stop conditions are CI-executable commands (Given/When/Then).
-          → BLOCK if any stop condition is vague ("staging accessible", "CI validates").
+        **Check 9**: Section 12 stop conditions are CI-executable commands (Given/When/Then).
+          -> BLOCK if any stop condition is vague ("staging accessible", "CI validates").
 
         **Check 10**: 8 required questions addressed somewhere in body:
           1. What behavior exists AFTER this WO?
@@ -270,23 +270,23 @@ nodes:
           6. What MUST NEVER break? (invariants)
           7. How does CI prove it works?
           8. What happens if it runs twice? (idempotency)
-          → BLOCK if any unanswered.
+          -> BLOCK if any unanswered.
 
-        **Check 11** (HARDEST — anti-guess hardening): Every component name, table name, column name,
+        **Check 11** (HARDEST -- anti-guess hardening): Every component name, table name, column name,
         route path in the spec traces to a source file. No invented names.
-          → BLOCK if any specific claim is not anchored to a real source.
+          -> BLOCK if any specific claim is not anchored to a real source.
 
-        **Check 12**: §4 lists dependencies OR explicitly says "standalone".
-          → BLOCK if §4 is empty and WO touches more than one subsystem.
+        **Check 12**: Section 4 lists dependencies OR explicitly says "standalone".
+          -> BLOCK if Section 4 is empty and WO touches more than one subsystem.
 
-        Output per WO: `VALIDATE: PASS` (all 12) or `VALIDATE: FAIL — Check N: <gap>` for each failure.
+        Output per WO: `VALIDATE: PASS` (all 12) or `VALIDATE: FAIL -- Check N: <gap>` for each failure.
 
         ---
 
-        ## PHASE 3 — FIX OR COMMIT
+        ## PHASE 3 -- FIX OR COMMIT
 
         - **FAIL**: Revise spec + YAML to address each listed gap. Re-run all 12 checks on the revision.
-          If revised passes → write files; if still fails → flag for next iteration.
+          If revised passes -> write files; if still fails -> flag for next iteration.
         - **PASS**: Write both files to disk:
           - `docs/work-orders/<wo_id>.md`
           - `yaml-drafts/<wo_id>.yaml`
@@ -313,7 +313,7 @@ nodes:
     depends_on: [author-wo]
     bash: |
       set -euo pipefail
-      # 2026-05-16: mirror read-inputs dual-path pattern — engine injects
+      # 2026-05-16: mirror read-inputs dual-path pattern -- engine injects
       # INPUT_<NAME> from YAML defaults; fall back to bare env for legacy.
       WO_CONCEPTS_FILE="${INPUT_WO_CONCEPTS_FILE:-${WO_CONCEPTS_FILE:-}}"
       [ -z "$WO_CONCEPTS_FILE" ] && { echo "ERROR: WO_CONCEPTS_FILE not set" >&2; exit 1; }
@@ -548,7 +548,7 @@ nodes:
 
       ## NOTION FILING (when DRY_RUN=false)
       For each WO_ID listed as PASS in $verify-files.output:
-      1. Read the spec file `docs/work-orders/<WO_ID>.md` to extract the Objective (§1) as the Notes summary.
+      1. Read the spec file `docs/work-orders/<WO_ID>.md` to extract the Objective (Section 1) as the Notes summary.
       2. Extract builder, priority from the WO concepts JSON (in $read-inputs.output).
       3. Create Notion page in database `a6df831c-0b52-449f-8ca4-d77be6b70d0a` with:
          - Task: <WO_ID>
@@ -559,7 +559,7 @@ nodes:
          - Builder: <from concept, default Major Build>
          - Execution State: ACTIVE
          - Project: <from concept, default Infrastructure>
-         - Notes: first 300 chars of §1 Objective + " WO file: BDC_XO/docs/work-orders/<WO_ID>.md"
+         - Notes: first 300 chars of Section 1 Objective + " WO file: BDC_XO/docs/work-orders/<WO_ID>.md"
       4. Use the Notion MCP notion-create-pages tool.
       5. Output: NOTION_URL=<url> for each created page.
 

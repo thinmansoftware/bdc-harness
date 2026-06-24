@@ -9,9 +9,9 @@
 # Pre-flight: spec committed + pushed to origin on bdc-xo repo before firing
 #   Spec lives at: docs/work-orders/WO-SHOPOPS-SHOPIFY-ORDER-SYNC-01.md
 # Deploy: BDC_XO/scripts/archon-bridge/sync-workflows.sh WO-SHOPOPS-SHOPIFY-ORDER-SYNC-01.yaml
-# REVIEW BEFORE DEPLOY — human verifies schema-audit tables, test thresholds, WO-specific prompts.
+# REVIEW BEFORE DEPLOY -- human verifies schema-audit tables, test thresholds, WO-specific prompts.
 #
-# Rule 19 note: shopops-api uses COPY . /app at build time — source changes need rebuild+restart.
+# Rule 19 note: shopops-api uses COPY . /app at build time -- source changes need rebuild+restart.
 # Runtime verification grep is included in verify-runtime node and in the manifest.
 #
 # OPEN QUESTION: The spec at docs/work-orders/ is a non-standard path vs the usual
@@ -25,7 +25,7 @@
 
 name: bdc-shopops-shopify-order-sync
 description: |
-  Use when: Executing WO-SHOPOPS-SHOPIFY-ORDER-SYNC-01 — Shopify order webhook ingestion.
+  Use when: Executing WO-SHOPOPS-SHOPIFY-ORDER-SYNC-01 -- Shopify order webhook ingestion.
   Input: WO_ID = WO-SHOPOPS-SHOPIFY-ORDER-SYNC-01.
   Does: Reads spec from bdc-xo, reads prior art (routes/shopify-import.js + routes/webhooks.js),
         verifies channel_orders table exists (SPINE WO dependency), implements
@@ -88,7 +88,7 @@ nodes:
   - id: read-prior-art
     depends_on: [read-spec]
     bash: |
-      # set -e DELIBERATELY OMITTED — audit step is informational; must not fail the workflow
+      # set -e DELIBERATELY OMITTED -- audit step is informational; must not fail the workflow
       # CWD is shopops repo root; shopops-api/ is a subdirectory.
       # Read existing Shopify patterns before implementing to reuse proven patterns.
       echo "=== routes/shopify-import.js (lines 1-60: shopifyGet client pattern) ==="
@@ -98,7 +98,7 @@ nodes:
         echo "FILE NOT FOUND: shopops-api/routes/shopify-import.js"
       fi
       echo ""
-      echo "=== routes/webhooks.js (if exists — existing webhook handler patterns) ==="
+      echo "=== routes/webhooks.js (if exists -- existing webhook handler patterns) ==="
       if [ -e shopops-api/routes/webhooks.js ]; then
         cat shopops-api/routes/webhooks.js 2>/dev/null || true
       else
@@ -116,7 +116,7 @@ nodes:
   - id: verify-schema
     depends_on: [read-spec]
     bash: |
-      # set -e DELIBERATELY OMITTED — best-effort step (DB may not be reachable from harness)
+      # set -e DELIBERATELY OMITTED -- best-effort step (DB may not be reachable from harness)
       echo "=== Schema verification: channel_orders table (prerequisite from WO-SHOPOPS-COMMERCE-SPINE-01) ==="
       RESULT=$(docker exec shopops-api psql "$DATABASE_URL" -c "
         SELECT column_name, data_type
@@ -158,7 +158,7 @@ nodes:
       ## Context
       - Repo: bluedevilcollectibles/shopops, working directory: shopops-api/
       - Codebase is Node.js (Express, CommonJS modules), NOT TypeScript
-      - Tests use bun (not npm/node) — Archon container is bun-only
+      - Tests use bun (not npm/node) -- Archon container is bun-only
       - This WO is CODE class, single repo, no schema migration
 
       ## Required Plan Output (Markdown with these headings)
@@ -221,7 +221,7 @@ nodes:
         - Fail-closed pattern for SHOPIFY_WEBHOOK_SECRET (500 on missing, not 401)
         - HMAC validation: use crypto.createHmac('sha256', secret).update(rawBody).digest('base64')
           Compare to X-Shopify-Hmac-Sha256 header value using crypto.timingSafeEqual
-          IMPORTANT: body must be read as raw bytes (Buffer) before JSON.parse — use express.raw() or rawBody middleware
+          IMPORTANT: body must be read as raw bytes (Buffer) before JSON.parse -- use express.raw() or rawBody middleware
         - Idempotency: INSERT INTO channel_orders ... ON CONFLICT (tenant_id, channel, external_order_id) DO UPDATE SET status=EXCLUDED.status, raw_payload=EXCLUDED.raw_payload, updated_at=NOW()
         - Tests in shopops-api/tests/shopify-webhooks.test.js using bun test (not jest/vitest/mocha)
         - Tests must assert actual behavior: HTTP status codes, DB row existence, idempotency count, HMAC rejection, customer linkage
@@ -237,7 +237,7 @@ nodes:
 
         ## Doctrine Baseline Tests
         Write at least 5 test functions each asserting actual behavior (not "did not throw").
-        This is a backend route + HMAC service — target 6-8 tests total covering the happy path,
+        This is a backend route + HMAC service -- target 6-8 tests total covering the happy path,
         security boundary (HMAC), idempotency contract, and customer linkage.
 
         ## Completion Criteria
@@ -247,7 +247,7 @@ nodes:
         - shopops-api/index.js has require + app.use for shopify-webhooks route
         - shopops-api/tests/shopify-webhooks.test.js exists with min 5 real assertions
         - shopops-api/.env.example has SHOPIFY_WEBHOOK_SECRET entry (or .env.example at repo root)
-        - All stop conditions from spec §12 are satisfied
+        - All stop conditions from spec Section 12 are satisfied
 
   - id: verify-grep
     depends_on: [implement]
@@ -308,7 +308,7 @@ nodes:
       set -euo pipefail
       cd shopops-api
       echo "=== Running bun test on shopify-webhooks test suite ==="
-      # Archon container is bun-only — no npm/node fallback
+      # Archon container is bun-only -- no npm/node fallback
       if [ -f tests/shopify-webhooks.test.js ]; then
         bun test tests/shopify-webhooks.test.js || {
           echo "Tests failed. Check test output above for failures." >&2
@@ -332,7 +332,7 @@ nodes:
       if git show-ref --quiet "refs/heads/$BASE_BRANCH"; then
         if git worktree list --porcelain | grep -q "branch refs/heads/$BASE_BRANCH" && \
            [ "$(git rev-parse --abbrev-ref HEAD)" != "$BASE_BRANCH" ]; then
-          # Branch is locked to another worktree — use timestamped variant
+          # Branch is locked to another worktree -- use timestamped variant
           git checkout -b "$BRANCH"
         else
           BRANCH="$BASE_BRANCH"
@@ -358,7 +358,7 @@ nodes:
         echo "No staged changes; branch already contains requested work"
       else
         git -c user.name="John Ranson" -c user.email="admin@bluedevilcollectibles.com" \
-          commit -m "feat(shopops): WO-SHOPOPS-SHOPIFY-ORDER-SYNC-01 — Shopify order webhook ingestion
+          commit -m "feat(shopops): WO-SHOPOPS-SHOPIFY-ORDER-SYNC-01 -- Shopify order webhook ingestion
 
         Adds Shopify order webhook handler with HMAC signature validation.
 
@@ -384,26 +384,26 @@ nodes:
     depends_on: [commit-and-push]
     bash: |
       set -euo pipefail
-      # Use current HEAD branch (set by commit-and-push — may be timestamped variant)
+      # Use current HEAD branch (set by commit-and-push -- may be timestamped variant)
       BRANCH="$(git rev-parse --abbrev-ref HEAD)"
       REPO="bluedevilcollectibles/shopops"
       BASE="main"
-      TITLE="feat(shopops): WO-SHOPOPS-SHOPIFY-ORDER-SYNC-01 — Shopify order webhook ingestion"
+      TITLE="feat(shopops): WO-SHOPOPS-SHOPIFY-ORDER-SYNC-01 -- Shopify order webhook ingestion"
 
       BODY_FILE=$(mktemp)
       {
         echo "## Summary"
-        echo "Implements **WO-SHOPOPS-SHOPIFY-ORDER-SYNC-01** — Shopify order webhook ingest."
+        echo "Implements **WO-SHOPOPS-SHOPIFY-ORDER-SYNC-01** -- Shopify order webhook ingest."
         echo ""
         echo "Orders placed on a connected Shopify store flow into the \`channel_orders\` table"
         echo "via HMAC-validated webhooks. Idempotent upsert prevents duplicate rows on retry."
         echo ""
         echo "## Files"
-        echo "- NEW \`shopops-api/routes/shopify-webhooks.js\` — POST /shopify-webhooks/orders/create + /updated"
-        echo "- NEW \`shopops-api/services/shopifyWebhookAuth.js\` — verifyShopifyHmac() (timing-safe)"
-        echo "- NEW \`shopops-api/tests/shopify-webhooks.test.js\` — min 5 bun tests"
-        echo "- MOD \`shopops-api/index.js\` — route registration"
-        echo "- MOD \`.env.example\` — SHOPIFY_WEBHOOK_SECRET placeholder"
+        echo "- NEW \`shopops-api/routes/shopify-webhooks.js\` -- POST /shopify-webhooks/orders/create + /updated"
+        echo "- NEW \`shopops-api/services/shopifyWebhookAuth.js\` -- verifyShopifyHmac() (timing-safe)"
+        echo "- NEW \`shopops-api/tests/shopify-webhooks.test.js\` -- min 5 bun tests"
+        echo "- MOD \`shopops-api/index.js\` -- route registration"
+        echo "- MOD \`.env.example\` -- SHOPIFY_WEBHOOK_SECRET placeholder"
         echo ""
         echo "## Status Mapping"
         echo "| Shopify financial_status | channel_orders.status |"
@@ -456,8 +456,8 @@ nodes:
   - id: verify-runtime
     depends_on: [open-pr]
     bash: |
-      # set -e DELIBERATELY OMITTED — best-effort step (container may need rebuild first)
-      # Rule 19: shopops-api uses COPY . /app at build — source changes need rebuild+restart.
+      # set -e DELIBERATELY OMITTED -- best-effort step (container may need rebuild first)
+      # Rule 19: shopops-api uses COPY . /app at build -- source changes need rebuild+restart.
       # This step provides best-effort evidence; operator must rebuild container before it passes.
       echo "=== Rule 19: Runtime verification (shopops-api) ==="
       echo "NOTE: This will fail until operator rebuilds + restarts shopops-api container."
@@ -499,14 +499,14 @@ nodes:
       Builder: Major Build (bdc-harness)
       Files modified: [exact list from implement output]
       Files created: [exact list from implement output]
-      Tests: [count passing / count total — from verify-tests output, command: bun test shopops-api/tests/shopify-webhooks.test.js]
+      Tests: [count passing / count total -- from verify-tests output, command: bun test shopops-api/tests/shopify-webhooks.test.js]
       PRs: [PR URL from open-pr output, not yet merged]
       Merge ancestors: [shopops main HEAD at time of branch creation, manifest commit, behind_by]
       Grep assertions:
         docker exec shopops-api grep -n 'shopify-webhooks' /app/index.js
         docker exec shopops-api grep -n 'verifyShopifyHmac' /app/routes/shopify-webhooks.js
         grep -c 'ON CONFLICT' shopops-api/routes/shopify-webhooks.js
-      Runtime verification: [from verify-runtime output — STATUS=ok if container rebuilt, STATUS=pending_rebuild if not yet]
+      Runtime verification: [from verify-runtime output -- STATUS=ok if container rebuilt, STATUS=pending_rebuild if not yet]
       Vercel deployment: N/A (shopops-api is Hetzner Docker, not Vercel)
       VALIDATION: PASS
 
@@ -524,7 +524,7 @@ nodes:
       $open-pr.output
       $verify-runtime.output
 
-  # post-started and post-completed webhook nodes OMITTED — Rule 11:
+  # post-started and post-completed webhook nodes OMITTED -- Rule 11:
   # curl to n8n.bluedevilcollectibles.com from Archon executor subprocess hangs >=120s.
   # flip-notion is the canonical close action.
 

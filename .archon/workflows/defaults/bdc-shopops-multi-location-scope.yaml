@@ -5,20 +5,20 @@
 # Pre-flight (4-block):
 #   1. YAML exists (this file).
 #   2. Spec exists: bdc-xo: docs/work-orders/WO-SHOPOPS-MULTI-LOCATION-SCOPE-01.md
-#   3. CWD scope = shopops repo (subdir shopops-api/) — single-repo MIXED.
+#   3. CWD scope = shopops repo (subdir shopops-api/) -- single-repo MIXED.
 #   4. Codebase bluedevilcollectibles/shopops registered:
 #      sqlite3 /opt/bdc/archon-data/archon.db "SELECT name FROM remote_agent_codebases"
 #
-# parallel_ok: NO — schema migration on shared tables (orders/shipments/inventory_items/
+# parallel_ok: NO -- schema migration on shared tables (orders/shipments/inventory_items/
 #   distributor_orders/channel_orders). MUST NOT run alongside any other shopops migration.
 #
 # Deploy: BDC_XO/scripts/archon-bridge/sync-workflows.sh WO-SHOPOPS-MULTI-LOCATION-SCOPE-01.yaml
-# REVIEW BEFORE DEPLOY — operator verifies store_locations table presence (or absence)
+# REVIEW BEFORE DEPLOY -- operator verifies store_locations table presence (or absence)
 #   and decides whether seed-primary section runs; verifies channel_orders table exists.
 
 name: bdc-shopops-multi-location-scope
 description: |
-  Use when: Executing WO-SHOPOPS-MULTI-LOCATION-SCOPE-01 — Multi-location scope.
+  Use when: Executing WO-SHOPOPS-MULTI-LOCATION-SCOPE-01 -- Multi-location scope.
   Input: WO_ID = WO-SHOPOPS-MULTI-LOCATION-SCOPE-01.
   Does: Reads spec from bdc-xo (cross-repo gh api). Audits live schema in staging
         Supabase for tenant/location tables. Writes migration
@@ -30,7 +30,7 @@ description: |
         POST require, tenant isolation. Commits, opens PR, runs Rule 19 docker exec
         runtime-verify, builds MIXED manifest, flips Notion to REVIEW.
   Repo: bluedevilcollectibles/shopops (shopops-api/ subdir).
-  parallel_ok: false — schema migration, serial only.
+  parallel_ok: false -- schema migration, serial only.
   Polish bar: HIGH (P0 Plan B floor for Mutant Market install).
 
 policyFile: harness/policies/agent-behavior.md
@@ -39,7 +39,7 @@ model: sonnet
 nodes:
 
   # -------------------------------------------------------------------------
-  # 1. READ SPEC — fetches WO from bdc-xo cross-repo via gh api
+  # 1. READ SPEC -- fetches WO from bdc-xo cross-repo via gh api
   # -------------------------------------------------------------------------
   - id: read-spec
     bash: |
@@ -84,13 +84,13 @@ nodes:
       printf -- '--- SPEC ---\n%s\n' "$SPEC_CONTENT"
 
   # -------------------------------------------------------------------------
-  # 2. SCHEMA-VERIFY — query live Supabase for current column presence on each
+  # 2. SCHEMA-VERIFY -- query live Supabase for current column presence on each
   #    target table BEFORE writing migration. Best-effort wrapper.
   # -------------------------------------------------------------------------
   - id: schema-verify
     depends_on: [read-spec]
     bash: |
-      # set -e DELIBERATELY OMITTED — best-effort step per doctrine wrapper
+      # set -e DELIBERATELY OMITTED -- best-effort step per doctrine wrapper
       SUPABASE_URL="${SUPABASE_URL:-}"
       SUPABASE_SERVICE_KEY="${SUPABASE_SERVICE_KEY:-}"
 
@@ -151,7 +151,7 @@ nodes:
       exit 0
 
   # -------------------------------------------------------------------------
-  # 3. FRESH BRANCH — create wo/shopops-multi-location-scope-01 from "origin/$DEFAULT_BRANCH"
+  # 3. FRESH BRANCH -- create wo/shopops-multi-location-scope-01 from "origin/$DEFAULT_BRANCH"
   # -------------------------------------------------------------------------
   - id: fresh-branch
     depends_on: [schema-verify]
@@ -204,7 +204,7 @@ nodes:
       - Test scenarios (minimum 6 covering: cross-location empty, HQ aggregate,
         invalid uuid, POST require, tenant isolation, middleware unit)
       - Verification commands (bun test, not node/npm)
-      - Commit message: "feat(api): WO-SHOPOPS-MULTI-LOCATION-SCOPE-01 — location_id scope on orders/shipments/inventory/distributor-orders"
+      - Commit message: "feat(api): WO-SHOPOPS-MULTI-LOCATION-SCOPE-01 -- location_id scope on orders/shipments/inventory/distributor-orders"
       - Branch: wo/shopops-multi-location-scope-01 (already created)
       - PR base: master
 
@@ -215,7 +215,7 @@ nodes:
       $read-spec.output
 
   # -------------------------------------------------------------------------
-  # 5. IMPLEMENT — write migration + middleware + service + route edits + tests
+  # 5. IMPLEMENT -- write migration + middleware + service + route edits + tests
   # -------------------------------------------------------------------------
   - id: implement
     depends_on: [plan]
@@ -256,14 +256,14 @@ nodes:
         3. Create shopops-api/services/locationScope.js:
            - export function applyLocationScope(locationId)
            - returns { clause: string, params: array } for SQL composition
-           - locationId null → { clause: '', params: [] }
-           - locationId set → { clause: 'AND location_id = $N', params: [locationId] } (caller substitutes $N)
+           - locationId null -> { clause: '', params: [] }
+           - locationId set -> { clause: 'AND location_id = $N', params: [locationId] } (caller substitutes $N)
 
         4. Modify each route file:
            - routes/orders.js, routes/shipments.js, routes/inventory.js, routes/distributor-orders.js
            - GET handlers: apply validateLocationId middleware before handler, use applyLocationScope to extend SQL
            - POST/PATCH handlers: require location_id in body (400 if missing), validate FK
-           - PRESERVE all existing behavior (do not break GET without location_id — must return HQ aggregate)
+           - PRESERVE all existing behavior (do not break GET without location_id -- must return HQ aggregate)
 
         5. Create shopops-api/tests/test_multi_location_scope.js (bun test runner):
            - import { describe, it, expect } from 'bun:test'
@@ -290,7 +290,7 @@ nodes:
           - bun test passes locally (or fails only on missing DB env, never on logic)
 
   # -------------------------------------------------------------------------
-  # 6. VERIFY-GREP — structural assertions (multi-line safe)
+  # 6. VERIFY-GREP -- structural assertions (multi-line safe)
   # -------------------------------------------------------------------------
   - id: verify-grep
     depends_on: [implement]
@@ -377,7 +377,7 @@ nodes:
     depends_on: [verify-grep, verify-tests]
     bash: |
       set -euo pipefail
-      # Use current HEAD branch (set by fresh-branch — may be timestamped variant)
+      # Use current HEAD branch (set by fresh-branch -- may be timestamped variant)
       BRANCH="$(git rev-parse --abbrev-ref HEAD)"
       git add \
         shopops-api/migrations/20260513_multi_location_scope.sql \
@@ -397,17 +397,17 @@ nodes:
       fi
 
       if git diff --cached --quiet; then
-        echo "No staged changes — nothing to commit"
+        echo "No staged changes -- nothing to commit"
       else
         git -c user.name="John Ranson" -c user.email="admin@bluedevilcollectibles.com" \
-          commit -m "$(printf 'feat(api): WO-SHOPOPS-MULTI-LOCATION-SCOPE-01 — location_id scope on orders/shipments/inventory/distributor-orders\n\nAdds idempotent migration 20260513_multi_location_scope.sql:\n  - CREATE TABLE store_locations IF NOT EXISTS (with seed primary per tenant)\n  - ALTER TABLE ... ADD COLUMN IF NOT EXISTS location_id uuid FK to store_locations\n    on orders, shipments, inventory_items, distributor_orders, channel_orders (if present)\n  - Backfill location_id to each tenant'\''s is_primary location\n  - CREATE INDEX <table>_location_id_idx\n\nAdds middleware/location.js validateLocationId — uuid + tenant ownership check\nAdds services/locationScope.js applyLocationScope — SQL fragment composer\n\nExtends route handlers (orders/shipments/inventory/distributor-orders/channel-orders):\n  - GET: location_id optional (HQ aggregate when absent)\n  - POST/PATCH: location_id required, FK validated\n\nAdds tests/test_multi_location_scope.js — 6 bun tests covering cross-location filter,\nHQ aggregate, invalid uuid, POST require, tenant isolation, middleware unit.\n\nPlan: B (P0 floor for Mutant Market HQ install 2026-06-15)\nBlocks: WO-SHOPOPS-RECEIVING-INTAKE-01 and POS per-location writes\n\nCo-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>')"
+          commit -m "$(printf 'feat(api): WO-SHOPOPS-MULTI-LOCATION-SCOPE-01 -- location_id scope on orders/shipments/inventory/distributor-orders\n\nAdds idempotent migration 20260513_multi_location_scope.sql:\n  - CREATE TABLE store_locations IF NOT EXISTS (with seed primary per tenant)\n  - ALTER TABLE ... ADD COLUMN IF NOT EXISTS location_id uuid FK to store_locations\n    on orders, shipments, inventory_items, distributor_orders, channel_orders (if present)\n  - Backfill location_id to each tenant'\''s is_primary location\n  - CREATE INDEX <table>_location_id_idx\n\nAdds middleware/location.js validateLocationId -- uuid + tenant ownership check\nAdds services/locationScope.js applyLocationScope -- SQL fragment composer\n\nExtends route handlers (orders/shipments/inventory/distributor-orders/channel-orders):\n  - GET: location_id optional (HQ aggregate when absent)\n  - POST/PATCH: location_id required, FK validated\n\nAdds tests/test_multi_location_scope.js -- 6 bun tests covering cross-location filter,\nHQ aggregate, invalid uuid, POST require, tenant isolation, middleware unit.\n\nPlan: B (P0 floor for Mutant Market HQ install 2026-06-15)\nBlocks: WO-SHOPOPS-RECEIVING-INTAKE-01 and POS per-location writes\n\nCo-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>')"
       fi
       git push -u origin "$BRANCH"
       echo "BRANCH=${BRANCH}"
       echo "BRANCH_SHA=$(git rev-parse HEAD)"
 
   # -------------------------------------------------------------------------
-  # 9. OPEN-PR — idempotent
+  # 9. OPEN-PR -- idempotent
   # -------------------------------------------------------------------------
   - id: open-pr
     depends_on: [commit-and-push]
@@ -416,16 +416,16 @@ nodes:
       BRANCH="$(git rev-parse --abbrev-ref HEAD)"
       REPO="bluedevilcollectibles/shopops"
       BASE="master"
-      TITLE="feat(api): WO-SHOPOPS-MULTI-LOCATION-SCOPE-01 — multi-location scope"
+      TITLE="feat(api): WO-SHOPOPS-MULTI-LOCATION-SCOPE-01 -- multi-location scope"
 
       BODY_FILE=$(mktemp)
       {
         echo "## Summary"
-        echo "Implements **WO-SHOPOPS-MULTI-LOCATION-SCOPE-01** — adds location_id scope"
+        echo "Implements **WO-SHOPOPS-MULTI-LOCATION-SCOPE-01** -- adds location_id scope"
         echo "to orders/shipments/inventory/distributor-orders for HQ multi-store tenants."
         echo ""
         echo "## Plan tag"
-        echo "plan:B — P0 floor for Mutant Market HQ install (2026-06-15)."
+        echo "plan:B -- P0 floor for Mutant Market HQ install (2026-06-15)."
         echo ""
         echo "## Migration"
         echo "shopops-api/migrations/20260513_multi_location_scope.sql (idempotent)"
@@ -466,12 +466,12 @@ nodes:
       exit 1
 
   # -------------------------------------------------------------------------
-  # 10. RUNTIME-VERIFY — Rule 19 docker exec
+  # 10. RUNTIME-VERIFY -- Rule 19 docker exec
   # -------------------------------------------------------------------------
   - id: runtime-verify
     depends_on: [open-pr]
     bash: |
-      # set -e DELIBERATELY OMITTED — best-effort step
+      # set -e DELIBERATELY OMITTED -- best-effort step
       RESULT=$(docker exec shopops-api grep -n 'location_id\|locationId' /app/routes/orders.js 2>&1)
       EXIT=$?
       if [ $EXIT -eq 0 ]; then
@@ -493,7 +493,7 @@ nodes:
       exit 0
 
   # -------------------------------------------------------------------------
-  # 11. BUILD-MANIFEST — MIXED class
+  # 11. BUILD-MANIFEST -- MIXED class
   # -------------------------------------------------------------------------
   - id: build-manifest
     depends_on: [runtime-verify]
@@ -512,7 +512,7 @@ nodes:
                      middleware/location.js, services/locationScope.js,
                      tests/test_multi_location_scope.js
       Tests: [count from verify-tests.output] passing / total via `bun test shopops-api/tests/test_multi_location_scope.js`
-      PRs: [from open-pr.output PR_URL] — base: master
+      PRs: [from open-pr.output PR_URL] -- base: master
       Merge ancestors: shopops master HEAD=[from commit-and-push BRANCH_SHA], behind_by: 0
       Grep assertions:
         grep -n 'location_id' shopops-api/routes/orders.js
@@ -530,7 +530,7 @@ nodes:
           -- expected: 4 rows (or 5 if channel_orders applicable)
         SELECT COUNT(*) FROM orders WHERE location_id IS NULL -- expected 0
         SELECT id FROM schema_migrations WHERE id='20260513_multi_location_scope' -- expected 1
-      Vercel deployment: N/A — shopops-api is Hetzner Docker
+      Vercel deployment: N/A -- shopops-api is Hetzner Docker
       VALIDATION: PASS (pending migration apply + container rebuild)
       Polish bar: HIGH (P0 Plan B floor)
 

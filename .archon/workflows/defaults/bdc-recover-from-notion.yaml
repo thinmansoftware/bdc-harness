@@ -1,15 +1,15 @@
 # Drafted for WO-HARNESS-RECOVER-FROM-NOTION-WORKFLOW-01 (bdc-xo#172).
 # Purpose: rescue WO spec content from Notion entries when the originating
 # author/build workflow filed the Notion pages but lost the local MD files
-# (anchor: 2026-05-16 engine sortie loss — 13 Notion pointers filed clean,
+# (anchor: 2026-05-16 engine sortie loss -- 13 Notion pointers filed clean,
 # 26 spec/YAML/test-plan MD files vanished when push silently failed).
 #
 # Pipeline:
-#   read-page-ids  → parse comma-separated NOTION_PAGE_IDS, fail if empty
-#   fetch-pages    → for each id: Notion REST GET page + blocks, render MD
-#   write-files    → docs/work-orders/<WO-ID>.md (idempotent; skip if exists)
-#   commit-and-push (load_bearing: true) → real retry, exit !=0 on failure
-#   open-pr         (load_bearing: true) → real retry, exit !=0 on failure
+#   read-page-ids  -> parse comma-separated NOTION_PAGE_IDS, fail if empty
+#   fetch-pages    -> for each id: Notion REST GET page + blocks, render MD
+#   write-files    -> docs/work-orders/<WO-ID>.md (idempotent; skip if exists)
+#   commit-and-push (load_bearing: true) -> real retry, exit !=0 on failure
+#   open-pr         (load_bearing: true) -> real retry, exit !=0 on failure
 #
 # Doctrine compliance:
 #   - YAML Recipe v1 (12 sections)
@@ -37,8 +37,8 @@ description: |
     PR_TITLE: optional. Default derived from page count.
     NOTION_DB_ID: optional. Default Blue Devil WO database.
     DRY_RUN: 'true' writes files locally but skips commit/push/PR.
-  Does: Fetches Notion pages → writes MD specs (idempotent, skips existing) →
-        commits → pushes (load-bearing, real retry) → opens PR (load-bearing).
+  Does: Fetches Notion pages -> writes MD specs (idempotent, skips existing) ->
+        commits -> pushes (load-bearing, real retry) -> opens PR (load-bearing).
   Repo: bluedevilcollectibles/bdc-xo (select bdc-xo codebase when firing).
   NOT for: authoring new specs from scratch (use bdc-author-wo-batch).
   parallel_ok: false
@@ -62,7 +62,7 @@ inputs:
 nodes:
 
   # ---------------------------------------------------------------------------
-  # 1. READ-PAGE-IDS — parse + validate comma-separated input
+  # 1. READ-PAGE-IDS -- parse + validate comma-separated input
   # ---------------------------------------------------------------------------
   - id: read-page-ids
     bash: |
@@ -105,7 +105,7 @@ nodes:
       cat .archon-recover/page-ids.txt
 
   # ---------------------------------------------------------------------------
-  # 2. FETCH-PAGES — for each page: GET /v1/pages + GET /v1/blocks (recursive),
+  # 2. FETCH-PAGES -- for each page: GET /v1/pages + GET /v1/blocks (recursive),
   #    render to MD, derive filename from page title (WO-ID convention).
   # ---------------------------------------------------------------------------
   - id: fetch-pages
@@ -295,14 +295,14 @@ nodes:
       PY
 
   # ---------------------------------------------------------------------------
-  # 3. WRITE-FILES — docs/work-orders/<WO-ID>.md (idempotent; skip if exists)
+  # 3. WRITE-FILES -- docs/work-orders/<WO-ID>.md (idempotent; skip if exists)
   # ---------------------------------------------------------------------------
   - id: write-files
     depends_on: [fetch-pages]
     bash: |
       set -euo pipefail
       if [ ! -f .archon-recover/manifest.json ]; then
-        echo "ERROR: manifest.json missing — fetch-pages did not run" >&2
+        echo "ERROR: manifest.json missing -- fetch-pages did not run" >&2
         exit 1
       fi
 
@@ -381,7 +381,7 @@ nodes:
       PY
 
   # ---------------------------------------------------------------------------
-  # 4. COMMIT-AND-PUSH — load_bearing: true (WO-167 / WO-169)
+  # 4. COMMIT-AND-PUSH -- load_bearing: true (WO-167 / WO-169)
   #    Real retry. Exits non-zero on final failure. NO STATUS=*_failed swallow.
   # ---------------------------------------------------------------------------
   - id: commit-and-push
@@ -397,7 +397,7 @@ nodes:
       fi
 
       if [ -z "${GITHUB_TOKEN:-}" ]; then
-        echo "ERROR: GITHUB_TOKEN missing in container — push will fail." >&2
+        echo "ERROR: GITHUB_TOKEN missing in container -- push will fail." >&2
         echo "       Auth boundary issue is the root cause of the 2026-05-16 loss." >&2
         exit 1
       fi
@@ -417,7 +417,7 @@ nodes:
       git add docs/work-orders/ 2>/dev/null || true
 
       if git diff --cached --quiet; then
-        echo "NO_CHANGES — write-files produced no new content (all pages already on disk)."
+        echo "NO_CHANGES -- write-files produced no new content (all pages already on disk)."
         echo "BRANCH=$TARGET_BRANCH"
         echo "STATUS=no_changes_idempotent"
         exit 0
@@ -434,13 +434,13 @@ nodes:
       Co-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>"
 
       if [ "$DRY_RUN" = "true" ]; then
-        echo "DRY_RUN=true — skipping push"
+        echo "DRY_RUN=true -- skipping push"
         echo "BRANCH=$TARGET_BRANCH"
         echo "STATUS=committed_dry_run"
         exit 0
       fi
 
-      # safe_push_with_retry — load-bearing: real exit non-zero on final failure (WO-167/169).
+      # safe_push_with_retry -- load-bearing: real exit non-zero on final failure (WO-167/169).
       ATTEMPTS=3
       i=1
       while [ "$i" -le "$ATTEMPTS" ]; do
@@ -451,18 +451,18 @@ nodes:
           echo "STATUS=pushed"
           exit 0
         fi
-        echo "PUSH_FAIL attempt=$i — retrying after $((2 ** i))s" >&2
+        echo "PUSH_FAIL attempt=$i -- retrying after $((2 ** i))s" >&2
         sleep $((2 ** i))
         i=$((i + 1))
       done
 
-      echo "ERROR: git push failed after $ATTEMPTS attempts — recovered files are local only." >&2
+      echo "ERROR: git push failed after $ATTEMPTS attempts -- recovered files are local only." >&2
       echo "       Branch $TARGET_BRANCH exists in container; operator must rescue manually." >&2
       echo "STATUS=push_failed" >&2
       exit 1
 
   # ---------------------------------------------------------------------------
-  # 5. OPEN-PR — load_bearing: true (WO-167 / WO-169)
+  # 5. OPEN-PR -- load_bearing: true (WO-167 / WO-169)
   #    Real retry. Exits non-zero on final failure.
   # ---------------------------------------------------------------------------
   - id: open-pr
@@ -474,7 +474,7 @@ nodes:
       PR_TITLE="${INPUT_PR_TITLE:-${PR_TITLE:-}}"
 
       if [ "$DRY_RUN" = "true" ]; then
-        echo "DRY_RUN=true — skipping PR creation"
+        echo "DRY_RUN=true -- skipping PR creation"
         echo "STATUS=skipped_dry_run"
         exit 0
       fi
@@ -495,9 +495,9 @@ nodes:
 
       # Did the upstream commit-and-push actually have changes?
       if ! git diff "origin/${DEFAULT_BRANCH}...HEAD" --quiet 2>/dev/null; then
-        :  # diffs exist — proceed
+        :  # diffs exist -- proceed
       else
-        echo "NO_DIFF vs origin/${DEFAULT_BRANCH} — no PR needed (idempotent run)."
+        echo "NO_DIFF vs origin/${DEFAULT_BRANCH} -- no PR needed (idempotent run)."
         echo "STATUS=no_diff_idempotent"
         exit 0
       fi
@@ -529,7 +529,7 @@ nodes:
         echo "Each recovered file derived from a Notion page body. Files use"
         echo "\`docs/work-orders/<WO-ID>.md\` layout (canonical) or"
         echo "\`docs/work-orders/_recovered/notion-<page-id>.md\` (orphans without"
-        echo "a derivable WO ID — operator renames after review)."
+        echo "a derivable WO ID -- operator renames after review)."
         echo ""
         echo "## Doctrine"
         echo "- WO-167 load-bearing convention applied: commit-and-push and open-pr"
@@ -539,7 +539,7 @@ nodes:
         echo "Generated by bdc-recover-from-notion workflow."
       } > "$BODY_FILE"
 
-      # Real retry — exit non-zero on final failure.
+      # Real retry -- exit non-zero on final failure.
       ATTEMPTS=3
       i=1
       while [ "$i" -le "$ATTEMPTS" ]; do
@@ -557,17 +557,17 @@ nodes:
           echo "STATUS=pr_already_exists_race"
           exit 0
         fi
-        echo "PR_CREATE_FAIL attempt=$i — retrying after $((2 ** i))s" >&2
+        echo "PR_CREATE_FAIL attempt=$i -- retrying after $((2 ** i))s" >&2
         sleep $((2 ** i))
         i=$((i + 1))
       done
 
-      echo "ERROR: gh pr create failed after $ATTEMPTS attempts — branch pushed but no PR." >&2
+      echo "ERROR: gh pr create failed after $ATTEMPTS attempts -- branch pushed but no PR." >&2
       echo "STATUS=pr_open_failed" >&2
       exit 1
 
   # ---------------------------------------------------------------------------
-  # 6. FLIP-NOTION — sentinel for operator handoff. The grader workflow owns
+  # 6. FLIP-NOTION -- sentinel for operator handoff. The grader workflow owns
   #    the actual REVIEW flip on the WO that owns this rescue (WO-172).
   # ---------------------------------------------------------------------------
   - id: flip-notion

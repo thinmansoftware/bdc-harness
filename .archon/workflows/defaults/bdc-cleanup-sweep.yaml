@@ -22,7 +22,7 @@ nodes:
         exit 1
       fi
       # Try direct path first, then date-prefixed glob (specs are commonly named YYYY-MM-DD-WO-...md)
-      # CWD is the bdc-xo repo root (Archon worktree), so paths are relative — no BDC_XO/ prefix.
+      # CWD is the bdc-xo repo root (Archon worktree), so paths are relative -- no BDC_XO/ prefix.
       SPEC_PATH="docs/superpowers/specs/${WO_ID}.md"
       if [ ! -f "$SPEC_PATH" ]; then
         SPEC_PATH=$(ls docs/superpowers/specs/*${WO_ID}.md 2>/dev/null | head -n 1 || true)
@@ -68,13 +68,13 @@ nodes:
       set -euo pipefail
       SPEC="$read-spec.output"
 
-      # Extract locked mapping table — fail fast if missing
+      # Extract locked mapping table -- fail fast if missing
       if ! printf '%s\n' "$SPEC" | grep -q '##.*[Ll]ocked.*[Mm]apping'; then
         echo "Locked mapping table not found in spec. Cleanup sweeps require explicit before/after pairs." >&2
         exit 1
       fi
 
-      # Extract file glob pattern(s) — typically in spec under "In scope" or similar
+      # Extract file glob pattern(s) -- typically in spec under "In scope" or similar
       # For now, just document what needs to be enumerated.
       # Real enumeration happens in the apply-mappings loop.
       echo "Pre-flight enumeration:"
@@ -116,9 +116,9 @@ nodes:
          d. Verify the violation count is now 0 (or matches explicit-exception block in spec)
       4. Output a mapping of files with before/after violation counts:
          ```
-         filename: 0 → 0 (already clean)
-         filename: 5 → 0 (cleaned)
-         filename: 3 → 0 (cleaned)
+         filename: 0 -> 0 (already clean)
+         filename: 5 -> 0 (cleaned)
+         filename: 3 -> 0 (cleaned)
          ```
       5. Stop and report if any file has a violation count that doesn't match the expected result.
 
@@ -185,7 +185,7 @@ nodes:
       3. `Target repo: <owner>/<repo>` (plain header)
       4. `**Target Repo:** \`<owner>/<repo>\`` (Markdown bold, capital R)
 
-      The target repo is where the PR must be opened (NOT the worktree's git origin — Rule 29).
+      The target repo is where the PR must be opened (NOT the worktree's git origin -- Rule 29).
 
       Match the extracted repo against this hardcoded staging-gate list:
       - bluedevilcollectibles/lspro-react
@@ -296,7 +296,7 @@ nodes:
         exit 1
       fi
       WO_ID=$(printf '%s\n' "$read-spec.output" | sed -n 's/^WO_ID=//p' | head -n 1)
-      TITLE="cleanup: ${WO_ID} — sweep per locked mapping"
+      TITLE="cleanup: ${WO_ID} -- sweep per locked mapping"
       BODY_FILE=$(mktemp)
       {
         echo "## Summary"
@@ -340,7 +340,7 @@ nodes:
       - Validation evidence:
         * Build PASS/N/A
         * Types PASS/N/A
-        * Per-file grep counts (before → after)
+        * Per-file grep counts (before -> after)
       - PR URL, if opened
       - Staging gate status, if required
 

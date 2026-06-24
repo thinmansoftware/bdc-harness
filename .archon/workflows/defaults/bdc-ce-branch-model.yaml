@@ -1,6 +1,6 @@
 name: bdc-ce-branch-model
 description: |
-  Use when: Shipping WO-RELEASE-CE-BRANCH-MODEL-01 — create + protect the release/ce branch on lspro-react.
+  Use when: Shipping WO-RELEASE-CE-BRANCH-MODEL-01 -- create + protect the release/ce branch on lspro-react.
   Input: WO_ID = WO-RELEASE-CE-BRANCH-MODEL-01 (or pass via $WORKFLOW_ID env / user message).
   Does: Reads the BDC WO spec from bdc-xo via gh api, creates release/ce from current main HEAD on lspro-react,
         adds GitHub branch protection (PRs required + CE regression check placeholder),
@@ -99,7 +99,7 @@ nodes:
   - id: add-branch-protection
     depends_on: [create-release-ce-branch]
     bash: |
-      # set -e DELIBERATELY OMITTED — protection is best-effort.
+      # set -e DELIBERATELY OMITTED -- protection is best-effort.
       # GitHub branch protection on private repos requires Pro/Team. On free plans
       # the API returns 403 and we record PROTECTION_STATUS=skipped_free_plan so the
       # rest of the workflow can proceed. CE regression check (WO #2) + promotion gate
@@ -165,8 +165,8 @@ nodes:
 
       ## Quick rules (full doctrine in bdc-xo)
 
-      - No direct pushes — PR required.
-      - PR template: choose `ce-promotion.md` (main → release/ce) or `ce-hotfix.md` (hotfix/ce/* → release/ce).
+      - No direct pushes -- PR required.
+      - PR template: choose `ce-promotion.md` (main -> release/ce) or `ce-hotfix.md` (hotfix/ce/* -> release/ce).
       - CE regression must pass (WO-CI-CE-REGRESSION-SUITE-01 implements the check).
       - Every CE hotfix requires a backport PR to main (WO-RELEASE-CE-BACKPORT-POLICY-01 enforces this).
       - John approval required for production deploy from release/ce (WO-RELEASE-CE-DEPLOY-LANE-01 wires the deploy gate).
@@ -175,16 +175,16 @@ nodes:
 
       ```
       main (active development)
-          ↓ promotion/ce/<slug> PR
+          v promotion/ce/<slug> PR
       release/ce (stable customer-facing)
-          ↓ deploy (John approval required)
+          v deploy (John approval required)
       production CE customers
       ```
 
       Hotfix flow:
 
       ```
-      hotfix/ce/<slug> → release/ce → main (backport)
+      hotfix/ce/<slug> -> release/ce -> main (backport)
       ```
       POLICY_EOF
       # Sanity-check files exist before staging (defensive; the cat above + gh api copy above should have created all three)
@@ -205,7 +205,7 @@ nodes:
       set -euo pipefail
       # Commit governance refs to a feature branch (NOT main directly per Rule 20 staging-gate)
       BRANCH="wo/release-ce-branch-model-01"
-      # Idempotent branch checkout — handles re-runs where worktree branch already exists
+      # Idempotent branch checkout -- handles re-runs where worktree branch already exists
       if git show-ref --quiet "refs/heads/$BRANCH"; then
         git checkout "$BRANCH"
       else
@@ -216,7 +216,7 @@ nodes:
         echo "No staged changes; branch already contains requested work"
       else
         git -c user.name="John Ranson" -c user.email="admin@bluedevilcollectibles.com" \
-          commit -m "feat(ce): WO-RELEASE-CE-BRANCH-MODEL-01 — add CE branch policy doc + PR templates
+          commit -m "feat(ce): WO-RELEASE-CE-BRANCH-MODEL-01 -- add CE branch policy doc + PR templates
 
         Adds .github/PULL_REQUEST_TEMPLATE/ce-promotion.md + ce-hotfix.md (copied verbatim
         from bdc-xo canonical templates).
@@ -239,7 +239,7 @@ nodes:
     depends_on: [commit-and-push-main]
     bash: |
       set -euo pipefail
-      # Hardcoded — must match commit-and-push-main BRANCH literal. See WO-HARNESS-OPEN-PR-BRANCH-INTERPOLATION-FIX-01.
+      # Hardcoded -- must match commit-and-push-main BRANCH literal. See WO-HARNESS-OPEN-PR-BRANCH-INTERPOLATION-FIX-01.
       # Archon shell-quote-wraps node output (dag-executor.ts L300), corrupting bash parsing.
       BRANCH="wo/release-ce-branch-model-01"
       PROTECTION_STATUS="unknown"
@@ -248,13 +248,13 @@ nodes:
         PROTECTION_LINE="- Applied GitHub branch protection: PR required, 1 review, no force-push, no deletion, conversation resolution required"
         PROTECTION_CHECK="- [x] Branch protection active (no direct pushes, PR required)"
       else
-        PROTECTION_LINE="- Branch protection: \`${PROTECTION_STATUS}\` — ${PROTECTION_DETAIL}"
+        PROTECTION_LINE="- Branch protection: \`${PROTECTION_STATUS}\` -- ${PROTECTION_DETAIL}"
         PROTECTION_CHECK="- [ ] Branch protection: \`${PROTECTION_STATUS}\` (governance enforced via CI gates from WO #2 + WO #8)"
       fi
       BODY_FILE=$(mktemp)
       {
         echo "## Summary"
-        echo "Implements **WO-RELEASE-CE-BRANCH-MODEL-01** — CE Release Branch Plan WO #1 (foundation)."
+        echo "Implements **WO-RELEASE-CE-BRANCH-MODEL-01** -- CE Release Branch Plan WO #1 (foundation)."
         echo ""
         echo "## Changes"
         echo "- Created \`release/ce\` branch at current \`main\` HEAD"
@@ -278,11 +278,11 @@ nodes:
         echo "## Captain CI Manifest"
         echo "Will be built by build-manifest node and written to Notion Notes."
         echo ""
-        echo "🤖 Generated with [Claude Code](https://claude.com/claude-code)"
+        echo " Generated with [Claude Code](https://claude.com/claude-code)"
       } > "$BODY_FILE"
       REPO="bluedevilcollectibles/lspro-react"
       BASE="main"
-      TITLE="feat(ce): WO-RELEASE-CE-BRANCH-MODEL-01 — release/ce branch + PR templates"
+      TITLE="feat(ce): WO-RELEASE-CE-BRANCH-MODEL-01 -- release/ce branch + PR templates"
       # Idempotent PR creation. See WO-HARNESS-OPEN-PR-GRAPHQL-NO-COMMITS-FIX-01.
       existing_pr_url() {
         gh pr list --repo "$REPO" --head "$BRANCH" --state open --json url --jq '.[0].url // empty' 2>/dev/null

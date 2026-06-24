@@ -21,7 +21,7 @@
 
 name: bdc-wo-author
 description: |
-  Use when: Authoring any new BDC WO. This is the canonical front door — chat,
+  Use when: Authoring any new BDC WO. This is the canonical front door -- chat,
   GitHub issue, Notion stub, and file-drop intake all normalize into one
   pipeline (Author.md 12-section draft -> Validate.md 12-check adversarial gate
   -> dry-run preview -> optional approval gate -> commit-spec -> file-notion
@@ -81,7 +81,7 @@ nodes:
       echo "preflight-github-auth PASS"
 
   # normalize-intake: single prompt node handles all four intake sources.
-  # See WO spec §8 + plan Ambiguity #2 resolution: prompt node, not bash, so
+  # See WO spec Section 8 + plan Ambiguity #2 resolution: prompt node, not bash, so
   # that the --notion <page-id> path can use the Notion MCP tool without
   # splitting into two nodes with fragile when: chains.
   - id: normalize-intake
@@ -122,7 +122,7 @@ nodes:
       for any of: `lspro-react`, `shopops-storefront`, `shopops`, `bdc-harness`,
       `bdc-xo`, `pricing-monolith`, `arena`. Emit the first match as target_repo_hint.
       If none found, emit `target_repo_hint=unknown` -- the author-loop will infer
-      from the WO spec body's §10 Deploy Target.
+      from the WO spec body's Section 10 Deploy Target.
 
       ## WO ID Hint Extraction
 
@@ -255,7 +255,7 @@ nodes:
           repo (LSPRO, STOREFRONT, SHOPOPS, HARNESS, XO, etc.).
         - Example: "Add pull-list export to ShopOps" -> WO-SHOPOPS-PULLLIST-EXPORT-01
         - Deterministic from Objective: running twice with same description
-          MUST produce same ID (idempotency req from spec §8 Q8).
+          MUST produce same ID (idempotency req from spec Section 8 Q8).
 
         **1c. Draft the 12-section WO spec** (wo-recipe.md template):
         ```
@@ -300,31 +300,31 @@ nodes:
         **Check 2**: Body contains the substring `wo-recipe.md`.
           -> BLOCK if absent.
 
-        **Check 3**: §2 references at least one concrete artifact (file path or WO ID).
-          -> BLOCK if §2 contains only TBD, "see body", or empty text.
+        **Check 3**: Section 2 references at least one concrete artifact (file path or WO ID).
+          -> BLOCK if Section 2 contains only TBD, "see body", or empty text.
 
         **Check 4**: WO ID matches `WO-[A-Z][A-Z0-9-]*-[0-9]+`; consistent across
         filename, H1, and (planned) Notion title.
           -> BLOCK if inconsistent.
 
-        **Check 5**: §2 cites a real path (e.g. `docs/plans/foo.md`, `WO-XYZ-01`).
-          -> BLOCK if §2 is vague without a concrete locator.
+        **Check 5**: Section 2 cites a real path (e.g. `docs/plans/foo.md`, `WO-XYZ-01`).
+          -> BLOCK if Section 2 is vague without a concrete locator.
 
-        **Check 6**: Every function/route/script in §7 labeled `EXISTING (file:line)` or `NEW`.
+        **Check 6**: Every function/route/script in Section 7 labeled `EXISTING (file:line)` or `NEW`.
           -> BLOCK if any name appears without a label.
 
-        **Check 7**: §9 column/table claims cite `information_schema` query result
+        **Check 7**: Section 9 column/table claims cite `information_schema` query result
         or migration file path.
-          -> BLOCK if §9 makes a column claim without citing source.
+          -> BLOCK if Section 9 makes a column claim without citing source.
 
-        **Check 8**: §11 has >= 3 test scenarios each with Given/When/Then structure.
+        **Check 8**: Section 11 has >= 3 test scenarios each with Given/When/Then structure.
           -> BLOCK if fewer than 3, or any test is purely descriptive.
 
         **Check 8A**: If WO's files span 2+ repos -> must have `Grep assertions`
         block with grep command per repo.
           -> BLOCK if split-repo WO lacks grep assertions.
 
-        **Check 9**: §12 stop conditions are CI-executable commands (Given/When/Then).
+        **Check 9**: Section 12 stop conditions are CI-executable commands (Given/When/Then).
           -> BLOCK if any stop condition is vague ("staging accessible").
 
         **Check 10**: 8 required questions addressed somewhere in body (see PHASE 1c).
@@ -332,12 +332,12 @@ nodes:
 
         **Check 11** (HARDEST -- anti-guess hardening): Every component name, table
         name, column name, route path in the spec traces to a source file. No
-        invented names. If §7 lists `fetchPullList`, the spec must label it
+        invented names. If Section 7 lists `fetchPullList`, the spec must label it
         `EXISTING (lib/storefront-api.ts:142)` or `NEW`.
           -> BLOCK if any specific claim is not anchored to a real source.
 
-        **Check 12**: §4 lists dependencies OR explicitly says "standalone".
-          -> BLOCK if §4 is empty and WO touches more than one subsystem.
+        **Check 12**: Section 4 lists dependencies OR explicitly says "standalone".
+          -> BLOCK if Section 4 is empty and WO touches more than one subsystem.
 
         Output per WO: `VALIDATE: PASS` (all 12) or
         `VALIDATE: FAIL -- Check N: <gap>` for each failure.
@@ -355,7 +355,7 @@ nodes:
           === AUTHOR-LOOP RESULT ===
           wo_id=<WO_ID>
           spec_path=docs/work-orders/<WO_ID>.md
-          target_repo=<owner/repo from §10 Deploy Target>
+          target_repo=<owner/repo from Section 10 Deploy Target>
           mode=<--draft-only|--queue|--fire from intake>
           auto_approve=<true|false from intake>
           ```
@@ -613,8 +613,8 @@ nodes:
 
       ## Notion Filing (when no duplicate found)
       1. Read the spec file at `spec_path` (from commit-spec output) to extract:
-         - §1 Objective text (first 300 chars for Notes summary)
-         - Target repo from §10 Deploy Target (for Project field)
+         - Section 1 Objective text (first 300 chars for Notes summary)
+         - Target repo from Section 10 Deploy Target (for Project field)
       2. Use the Notion MCP `notion-create-pages` tool to create a page in
          database `${INPUT_NOTION_DB_ID:-a6df831c-0b52-449f-8ca4-d77be6b70d0a}` with:
          - Task: <wo_id>
@@ -625,7 +625,7 @@ nodes:
          - Builder: Major Build (default)
          - Execution State: ACTIVE
          - Project: <target_repo> (or "Infrastructure" if unknown)
-         - Notes: first 300 chars of §1 Objective +
+         - Notes: first 300 chars of Section 1 Objective +
                   " WO file: BDC_XO/<spec_path>" +
                   " Authored by bdc-wo-author."
       3. Output `NOTION_URL=<url>` on the created page.
