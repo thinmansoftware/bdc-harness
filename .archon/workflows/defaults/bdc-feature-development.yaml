@@ -1042,6 +1042,48 @@ nodes:
         printf '{"status":"BLOCKED","note":"opus-could-not-resolve"}\n'
       fi
 
+  # noninteractive-salvage (WO-HARNESS-OPUS-REPAIR-REREVIEW-AND-NONINTERACTIVE-SALVAGE-01, 2026-06-25):
+  # Defect B fix. When a run is BLOCKED but the worktree holds REAL work (e.g. an opus-repair commit),
+  # and the run is NON-INTERACTIVE (CAULDRON_INTERACTIVE != true so pause-gate auto-skips and never
+  # collects a human decision), commit-and-push refuses and the good commit STRANDS in the worktree --
+  # then gets GC'd and lost (anchor: d601ad7 + c0166f9 stranded+lost 2026-06-25). This node preserves
+  # that work by pushing the branch + opening a PR + leaving a FALLBACK note, instead of dead-ending.
+  # Purely ADDITIVE: it reads block-reclassify, never blocks the existing pause-gate / commit-and-push
+  # path (trigger_rule all_done; no-ops on interactive runs and on runs with nothing to salvage).
+  - id: noninteractive-salvage
+    depends_on: [block-reclassify]
+    trigger_rule: all_done
+    bash: |
+      set -uo pipefail
+      RECLASS=$block-reclassify.output
+      STATUS=$(printf '%s\n' "$RECLASS" | sed -n 's/.*"status":"\([A-Z_]*\)".*/\1/p' | head -1)
+      # Only act on a BLOCKED status.
+      [ "$STATUS" = "BLOCKED" ] || { echo "SALVAGE=skip (status=$STATUS)"; exit 0; }
+      # Interactive runs use pause-gate; leave them alone.
+      if [ "${CAULDRON_INTERACTIVE:-}" = "true" ]; then echo "SALVAGE=skip (interactive; pause-gate owns this)"; exit 0; fi
+      WT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
+      cd "$WT" || { echo "SALVAGE=skip (no worktree)"; exit 0; }
+      CHANGED=$(git status --porcelain 2>/dev/null | grep -c . || echo 0)
+      AHEAD=$(git rev-list --count HEAD --not --remotes 2>/dev/null || echo 0)
+      if [ "${CHANGED:-0}" -eq 0 ] && [ "${AHEAD:-0}" -eq 0 ]; then echo "SALVAGE=skip (nothing to preserve)"; exit 0; fi
+      # Branch suffix uses $$ (Rule 2: never $WORKFLOW_ID under set -u).
+      BR="salvage/opus-repair-$(basename "$WT")-$$"
+      git add -A 2>/dev/null || true
+      if ! git diff --cached --quiet 2>/dev/null; then
+        git -c user.name='cauldron-salvage' -c user.email='noreply@bluedevilcollectibles.com' \
+          commit -m "salvage: opus-repaired build preserved for human review (non-interactive BLOCKED)" 2>&1 | tail -1 || true
+      fi
+      if git push -u origin "HEAD:${BR}" 2>&1 | tail -2; then
+        REPO=$(git config --get remote.origin.url | sed -E 's#.*github.com[:/]##; s#\.git$##')
+        PR_URL=$(gh pr create --repo "$REPO" --head "$BR" --base "${BASE_BRANCH:-dev}" \
+          --title "FALLBACK: opus-repaired build needs human review" \
+          --body "FALLBACK PATH: a BLOCKED build was auto-repaired by opus-repair, but the non-interactive run could not reach a human approval gate. The repair commit is pushed here for human review instead of being stranded in the worktree. See run artifacts for the original block reason." \
+          2>&1 | tail -1 || true)
+        echo "SALVAGE=pushed branch ${BR}; PR=${PR_URL}"
+      else
+        echo "SALVAGE=push-failed (work remains in worktree ${WT})"
+      fi
+
   # findings-consolidate: decompose every review finding into a structured ledger row so the
   # human approval gate can show resolution + a concrete suggested fix per UNRESOLVED finding.
   # AI node (not bash): plan-review emits unstructured prose; diff-review/-final + opus-repair
