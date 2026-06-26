@@ -157,14 +157,14 @@ derive_created() {
     $1=="A"           { print $2 }
     $1 ~ /^R[0-9]*$/  { print $3 }
     $1 ~ /^C[0-9]*$/  { print $3 }
-  ' | grep -v '^$' | paste -sd ',' -
+  ' | awk 'NF' | paste -sd ',' -
 }
 derive_modified() {
   printf '%s\n' "$1" | awk -F'\t' '
     $1=="M"           { print $2 }
     $1=="D"           { printf "%s (deleted)\n", $2 }
     $1 ~ /^R[0-9]*$/  { printf "%s (deleted)\n", $2 }
-  ' | grep -v '^$' | paste -sd ',' -
+  ' | awk 'NF' | paste -sd ',' -
 }
 
 # 4a. Mixed A + M (the original happy-path case)
@@ -218,6 +218,101 @@ assert_eq "Empty diff -> Files modified=none" "none" "$FM_EMPTY"
 DIFF_REGRESSION=$'A\tnew.ts\nM\tchanged.ts'
 ALL_OUTPUT=$(derive_created "$DIFF_REGRESSION")$'\n'$(derive_modified "$DIFF_REGRESSION")
 assert_count "no preserved files in output" "0" "preserved" "$ALL_OUTPUT"
+
+# 4h. T1 (WO-HARNESS-PATCH-PR-BODY-PIPEFAIL-FIX-01): empty diff must NOT abort
+# under `set -euo pipefail`. The pre-fix node used `grep -v '^$'`, which exits 1
+# on empty stdin; under pipefail+errexit that exit-1 aborted the FILES_CREATED
+# command substitution BEFORE the `="none"` fallback could run, marking the
+# entire patch-pr-body node as failed even on clean builds. The fix swaps in
+# `awk 'NF'` (always exits 0). This test runs the full derivation in a child
+# bash with strict mode and asserts (a) exit 0 and (b) both lists fall back to
+# "none". We use a temp file rather than `bash -c` to keep the nested quoting
+# from awk literals + pipefail readable.
+echo "--- Test 4h: empty diff does not abort under set -euo pipefail (T1) ---"
+T1_SCRIPT=$(mktemp)
+cat > "$T1_SCRIPT" <<'T1_EOF'
+set -euo pipefail
+NAME_STATUS=""
+FILES_CREATED=$(printf '%s\n' "$NAME_STATUS" | awk -F'\t' '
+  $1=="A"           { print $2 }
+  $1 ~ /^R[0-9]*$/  { print $3 }
+  $1 ~ /^C[0-9]*$/  { print $3 }
+' | awk 'NF' | paste -sd ',' -)
+FILES_MODIFIED=$(printf '%s\n' "$NAME_STATUS" | awk -F'\t' '
+  $1=="M"           { print $2 }
+  $1=="D"           { printf "%s (deleted)\n", $2 }
+  $1 ~ /^R[0-9]*$/  { printf "%s (deleted)\n", $2 }
+' | awk 'NF' | paste -sd ',' -)
+[ -z "$FILES_CREATED" ]  && FILES_CREATED="none"
+[ -z "$FILES_MODIFIED" ] && FILES_MODIFIED="none"
+printf '%s|%s' "$FILES_CREATED" "$FILES_MODIFIED"
+T1_EOF
+set +e
+T1_OUT=$(bash "$T1_SCRIPT")
+T1_EXIT=$?
+set -e
+rm -f "$T1_SCRIPT"
+assert_eq "T1: empty diff does not abort (exit 0)" "0" "$T1_EXIT"
+assert_eq "T1: FILES_CREATED + FILES_MODIFIED fall back to none" "none|none" "$T1_OUT"
+
+# -----------------------------------------------------------------------------
+# Test 4i: empty-tree fallback uses the two-arg diff form (T2)
+# -----------------------------------------------------------------------------
+# Regression guard for WO-HARNESS-PATCH-PR-BODY-PIPEFAIL-FIX-01 codex review:
+# the last-resort fallback sets BASE_REF to git's empty-tree sha when neither
+# origin/<base> nor FETCH_HEAD is present (fresh branch in a sparse worktree).
+# The old code then ran `git diff --name-status "${BASE_REF}...HEAD"` -- but
+# three-dot symmetric-diff requires BOTH endpoints to be commit-ish, and a
+# tree object is rejected. The failure was masked by `|| true`, so the manifest
+# silently emitted NAME_STATUS="" and Files created / modified = "none" even
+# though every tracked file was supposed to be listed as added.
+#
+# The fix routes the empty-tree case through `git diff --name-status BASE HEAD`
+# (two-arg form), which DOES accept a tree on the left and lists every tracked
+# file as A. This test builds a throwaway repo, runs both forms, and asserts:
+#   * three-dot form fails / returns empty (the bug we are guarding against)
+#   * two-arg form returns one A line per tracked file (the fix)
+echo "--- Test 4i: empty-tree fallback uses two-arg diff (T2) ---"
+T2_TMPDIR=$(mktemp -d)
+# IMPORTANT: keep the capture file OUTSIDE the git repo -- if it lived inside
+# the temp dir, `git add .` would track it and inflate the diff line count.
+T2_OUT=$(mktemp)
+(
+  cd "$T2_TMPDIR"
+  git init --quiet
+  git config user.email "test@example.com"
+  git config user.name "Test"
+  mkdir -p a b
+  printf 'one\n'   > a/one.ts
+  printf 'two\n'   > a/two.ts
+  printf 'three\n' > b/three.ts
+  git add .
+  git commit --quiet -m "seed"
+  EMPTY_TREE=$(git hash-object -t tree /dev/null)
+
+  # Three-dot symmetric-diff against a tree must fail (or emit empty) -- this
+  # is the bug the fix exists to avoid. We do NOT want to assert on the exact
+  # exit code here because some git versions print to stderr and exit 128
+  # while others exit 0 with empty stdout; in either case, the captured stdout
+  # is empty, which is the symptom the manifest node would have observed.
+  THREE_DOT_OUT=$(git diff --name-status "${EMPTY_TREE}...HEAD" 2>/dev/null || true)
+  THREE_DOT_LINES=$(printf '%s\n' "$THREE_DOT_OUT" | awk 'NF' | wc -l | tr -d ' ')
+
+  # Two-arg form (the fix) lists every tracked file as added.
+  TWO_ARG_OUT=$(git diff --name-status "${EMPTY_TREE}" HEAD 2>/dev/null || true)
+  TWO_ARG_LINES=$(printf '%s\n' "$TWO_ARG_OUT" | awk 'NF' | wc -l | tr -d ' ')
+  TWO_ARG_A_LINES=$(printf '%s\n' "$TWO_ARG_OUT" | awk -F'\t' '$1=="A"{c++} END{print c+0}')
+
+  printf 'THREE_DOT_LINES=%s\nTWO_ARG_LINES=%s\nTWO_ARG_A_LINES=%s\n' \
+    "$THREE_DOT_LINES" "$TWO_ARG_LINES" "$TWO_ARG_A_LINES"
+) > "$T2_OUT" 2>/dev/null
+T2_THREE_DOT=$(grep -E '^THREE_DOT_LINES=' "$T2_OUT" | sed 's/^THREE_DOT_LINES=//')
+T2_TWO_ARG=$(grep -E '^TWO_ARG_LINES=' "$T2_OUT" | sed 's/^TWO_ARG_LINES=//')
+T2_TWO_ARG_A=$(grep -E '^TWO_ARG_A_LINES=' "$T2_OUT" | sed 's/^TWO_ARG_A_LINES=//')
+rm -rf "$T2_TMPDIR" "$T2_OUT"
+assert_eq "T2: three-dot vs tree returns empty (bug symptom)" "0" "$T2_THREE_DOT"
+assert_eq "T2: two-arg vs tree lists 3 files"                 "3" "$T2_TWO_ARG"
+assert_eq "T2: two-arg vs tree marks all 3 as Added"          "3" "$T2_TWO_ARG_A"
 
 # -----------------------------------------------------------------------------
 # Test 5: Label extraction from build-manifest output
