@@ -919,18 +919,29 @@ nodes:
       ## Inputs
       Spec: $read-spec.output
       Your original findings: $diff-review.output
+      Classifier verdict: $classify-diff-review.output
       Repair pass output: $diff-repair.output
       Refreshed diff provenance: $capture-diff-final.output
       (Read the repaired diff at DIFF_FINAL_ARTIFACT = $ARTIFACTS_DIR/diff-final.patch.
       You have no Bash tool -- do not run git; read that file.)
 
-      ## Branch on the repair outcome FIRST
-      - If diff-repair FAILED or exhausted iterations (its output is empty, shows
-        ESCALATION_REQUIRED=true, or the done.flag was never written): do NOT certify.
-        Emit DIFF_REVIEW_FINAL=needs_revision, summarize the unresolved repair state in
-        UNRESOLVED, and carry through any escalation reason. Never PASS on failed repair.
-      - Otherwise: re-inspect the repaired diff. For EACH finding you raised originally,
-        verify it is actually resolved in the current tree -- not merely claimed resolved.
+      ## Branch on the repair outcome FIRST (check the SATISFIED FAST PATH before anything else)
+      - SATISFIED FAST PATH: if your original review verdict was DIFF_REVIEW=satisfied
+        (Classifier verdict above is {"verdict":"satisfied"}), then diff-repair was
+        correctly SKIPPED by its `when:` guard because there were no findings to fix.
+        An empty $diff-repair.output and a missing done.flag are EXPECTED on this path,
+        NOT a failure. Re-inspect the captured diff once more to confirm no new unsafe
+        behavior was introduced between the original review and now (e.g., scope creep,
+        unrelated edits). If the diff is still clean, emit DIFF_REVIEW_FINAL=satisfied
+        with UNRESOLVED: (none). Do NOT treat the skipped repair as failed repair.
+      - If the original verdict was needs_revision AND diff-repair FAILED or exhausted
+        iterations (its output is empty, shows ESCALATION_REQUIRED=true, or the done.flag
+        was never written): do NOT certify. Emit DIFF_REVIEW_FINAL=needs_revision,
+        summarize the unresolved repair state in UNRESOLVED, and carry through any
+        escalation reason. Never PASS on failed repair.
+      - Otherwise (original verdict was needs_revision AND diff-repair signalled done):
+        re-inspect the repaired diff. For EACH finding you raised originally, verify it
+        is actually resolved in the current tree -- not merely claimed resolved.
 
       ## Output (STDOUT only)
         DIFF_REVIEW_FINAL=<satisfied|needs_revision>
