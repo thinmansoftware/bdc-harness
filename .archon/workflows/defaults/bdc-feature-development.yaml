@@ -1788,6 +1788,19 @@ nodes:
       # runs the worktree may not have fetched the latest base.
       git fetch --quiet origin "${PR_BASE}" 2>/dev/null || true
 
+      # If origin/<base> is not present in this (possibly sparse) worktree, fall back so the
+      # diff is computed against a real ref instead of silently returning empty (which used to
+      # trip the grep/pipefail abort and skip the manifest entirely).
+      if ! git rev-parse --verify --quiet "${BASE_REF}" >/dev/null 2>&1; then
+        if git rev-parse --verify --quiet FETCH_HEAD >/dev/null 2>&1; then
+          BASE_REF="FETCH_HEAD"
+        else
+          # Empty-tree sha (git's well-known empty tree object). Diffing HEAD against it lists
+          # every tracked file as added -- a safe last resort for a fresh branch.
+          BASE_REF="$(git hash-object -t tree /dev/null)"
+        fi
+      fi
+
       # -- Derive file lists from git diff --name-status (the #307 lesson: NEVER
       #    list preserved/unchanged files -- the validator's sparse checkout
       #    cannot see them and CHECK 2 will fail). Map every status the validator
@@ -1804,12 +1817,12 @@ nodes:
         $1=="A"           { print $2 }
         $1 ~ /^R[0-9]*$/  { print $3 }
         $1 ~ /^C[0-9]*$/  { print $3 }
-      ' | grep -v '^$' | paste -sd ',' -)
+      ' | awk 'NF' | paste -sd ',' -)
       FILES_MODIFIED=$(printf '%s\n' "$NAME_STATUS" | awk -F'\t' '
         $1=="M"           { print $2 }
         $1=="D"           { printf "%s (deleted)\n", $2 }
         $1 ~ /^R[0-9]*$/  { printf "%s (deleted)\n", $2 }
-      ' | grep -v '^$' | paste -sd ',' -)
+      ' | awk 'NF' | paste -sd ',' -)
       [ -z "$FILES_CREATED" ] && FILES_CREATED="none"
       [ -z "$FILES_MODIFIED" ] && FILES_MODIFIED="none"
 

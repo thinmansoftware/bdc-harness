@@ -157,14 +157,14 @@ derive_created() {
     $1=="A"           { print $2 }
     $1 ~ /^R[0-9]*$/  { print $3 }
     $1 ~ /^C[0-9]*$/  { print $3 }
-  ' | grep -v '^$' | paste -sd ',' -
+  ' | awk 'NF' | paste -sd ',' -
 }
 derive_modified() {
   printf '%s\n' "$1" | awk -F'\t' '
     $1=="M"           { print $2 }
     $1=="D"           { printf "%s (deleted)\n", $2 }
     $1 ~ /^R[0-9]*$/  { printf "%s (deleted)\n", $2 }
-  ' | grep -v '^$' | paste -sd ',' -
+  ' | awk 'NF' | paste -sd ',' -
 }
 
 # 4a. Mixed A + M (the original happy-path case)
@@ -218,6 +218,42 @@ assert_eq "Empty diff -> Files modified=none" "none" "$FM_EMPTY"
 DIFF_REGRESSION=$'A\tnew.ts\nM\tchanged.ts'
 ALL_OUTPUT=$(derive_created "$DIFF_REGRESSION")$'\n'$(derive_modified "$DIFF_REGRESSION")
 assert_count "no preserved files in output" "0" "preserved" "$ALL_OUTPUT"
+
+# 4h. T1 (WO-HARNESS-PATCH-PR-BODY-PIPEFAIL-FIX-01): empty diff must NOT abort
+# under `set -euo pipefail`. The pre-fix node used `grep -v '^$'`, which exits 1
+# on empty stdin; under pipefail+errexit that exit-1 aborted the FILES_CREATED
+# command substitution BEFORE the `="none"` fallback could run, marking the
+# entire patch-pr-body node as failed even on clean builds. The fix swaps in
+# `awk 'NF'` (always exits 0). This test runs the full derivation in a child
+# bash with strict mode and asserts (a) exit 0 and (b) both lists fall back to
+# "none". We use a temp file rather than `bash -c` to keep the nested quoting
+# from awk literals + pipefail readable.
+echo "--- Test 4h: empty diff does not abort under set -euo pipefail (T1) ---"
+T1_SCRIPT=$(mktemp)
+cat > "$T1_SCRIPT" <<'T1_EOF'
+set -euo pipefail
+NAME_STATUS=""
+FILES_CREATED=$(printf '%s\n' "$NAME_STATUS" | awk -F'\t' '
+  $1=="A"           { print $2 }
+  $1 ~ /^R[0-9]*$/  { print $3 }
+  $1 ~ /^C[0-9]*$/  { print $3 }
+' | awk 'NF' | paste -sd ',' -)
+FILES_MODIFIED=$(printf '%s\n' "$NAME_STATUS" | awk -F'\t' '
+  $1=="M"           { print $2 }
+  $1=="D"           { printf "%s (deleted)\n", $2 }
+  $1 ~ /^R[0-9]*$/  { printf "%s (deleted)\n", $2 }
+' | awk 'NF' | paste -sd ',' -)
+[ -z "$FILES_CREATED" ]  && FILES_CREATED="none"
+[ -z "$FILES_MODIFIED" ] && FILES_MODIFIED="none"
+printf '%s|%s' "$FILES_CREATED" "$FILES_MODIFIED"
+T1_EOF
+set +e
+T1_OUT=$(bash "$T1_SCRIPT")
+T1_EXIT=$?
+set -e
+rm -f "$T1_SCRIPT"
+assert_eq "T1: empty diff does not abort (exit 0)" "0" "$T1_EXIT"
+assert_eq "T1: FILES_CREATED + FILES_MODIFIED fall back to none" "none|none" "$T1_OUT"
 
 # -----------------------------------------------------------------------------
 # Test 5: Label extraction from build-manifest output
