@@ -202,6 +202,112 @@ assert_eq "T6 last sentinel wins" \
   '{"verdict":"satisfied"}' "$T6_DOUBLE"
 
 # -----------------------------------------------------------------------------
+# Helper 3: commit-and-push authorization gate (mirrors the YAML node 1:1).
+# Exercises the defense-in-depth bridge logic added by the autonomous opus
+# re-review chain (Codex review repair 2026-06-26): a BLOCKED run that
+# opus-repair fixed AND classify-opus-rereview marked satisfied must be
+# authorized to commit even though diff-review-final is still needs_revision.
+# Echoes "AUTHORIZED" or "REFUSED:<reason>" instead of touching git.
+# Inputs:
+#   $1 RECLASS       block-reclassify.output JSON
+#   $2 DIFF_FINAL    diff-review-final.output (multi-line prose w/ DIFF_REVIEW_FINAL=)
+#   $3 PAUSE_GATE    pause-gate.output JSON (decision_verb)
+#   $4 APPLY_REVIEW  classify-apply-review.output JSON (verdict)
+#   $5 OPUS_REREVIEW_CLASS classify-opus-rereview.output JSON (verdict)
+# -----------------------------------------------------------------------------
+commit_and_push_gate() {
+  local RECLASS="$1" DIFF_FINAL="$2" PAUSE_GATE="$3" APPLY_REVIEW="$4" OPUS_REREVIEW_CLASS="$5"
+  local RECLASS_STATUS RECLASS_NOTE GATE_VERB APPLY_VERDICT
+  local APPROVE_WITH_FIX_OK=false OPUS_REREVIEW_VERDICT OPUS_REREVIEW_OK=false
+  local final_verdict_cap
+  RECLASS_STATUS=$(printf '%s\n' "$RECLASS" | sed -n 's/.*"status":"\([A-Z_]*\)".*/\1/p' | head -1)
+  RECLASS_NOTE=$(printf '%s\n' "$RECLASS" | sed -n 's/.*"note":"\([a-z0-9_-]*\)".*/\1/p' | head -1)
+  GATE_VERB=$(printf '%s\n' "$PAUSE_GATE" | sed -n 's/.*"decision_verb":"\([a-z_]*\)".*/\1/p' | head -1)
+  APPLY_VERDICT=$(printf '%s\n' "$APPLY_REVIEW" | sed -n 's/.*"verdict":"\([a-z_]*\)".*/\1/p' | head -1)
+  if [ "$GATE_VERB" = "approve_with_fix" ] && [ "$APPLY_VERDICT" = "satisfied" ]; then
+    APPROVE_WITH_FIX_OK=true
+  fi
+  OPUS_REREVIEW_VERDICT=$(printf '%s\n' "$OPUS_REREVIEW_CLASS" | sed -n 's/.*"verdict":"\([a-z_]*\)".*/\1/p' | head -1)
+  if [ "$OPUS_REREVIEW_VERDICT" = "satisfied" ] && [ "$RECLASS_NOTE" = "opus-repaired-and-rereviewed-satisfied" ]; then
+    OPUS_REREVIEW_OK=true
+  fi
+  if [ "$RECLASS_STATUS" != "PROCEED" ] && [ "$APPROVE_WITH_FIX_OK" != "true" ] && [ "$OPUS_REREVIEW_OK" != "true" ]; then
+    printf 'REFUSED:not-authorized\n'
+    return 0
+  fi
+  final_verdict_cap=$(printf '%s\n' "$DIFF_FINAL" \
+    | grep -oE 'DIFF_REVIEW_FINAL=(satisfied|needs_revision)' \
+    | tail -n 1)
+  if [ "$final_verdict_cap" != "DIFF_REVIEW_FINAL=satisfied" ] && [ "$APPROVE_WITH_FIX_OK" != "true" ] && [ "$OPUS_REREVIEW_OK" != "true" ]; then
+    printf 'REFUSED:final-not-satisfied\n'
+    return 0
+  fi
+  printf 'AUTHORIZED\n'
+}
+
+# -----------------------------------------------------------------------------
+# T7: opus-rereview satisfied path -- block-reclassify emits PROCEED with the
+# opus-repaired-and-rereviewed-satisfied note, but diff-review-final stayed
+# needs_revision (it is what triggered the block). Gate MUST authorize.
+# Anchor: Codex review repair 2026-06-26.
+# -----------------------------------------------------------------------------
+echo "--- T7: opus-rereview satisfied + diff-review-final needs_revision -> AUTHORIZED ---"
+RECLASS_OPUS_OK='{"status":"PROCEED","note":"opus-repaired-and-rereviewed-satisfied"}'
+DIFF_FINAL_BAD=$'reviewer prose\nDIFF_REVIEW_FINAL=needs_revision\nfurther prose'
+PAUSE_GATE_EMPTY='{}'
+APPLY_REVIEW_EMPTY='{}'
+OPUS_REREVIEW_OK_JSON='{"verdict":"satisfied"}'
+T7_OUT=$(commit_and_push_gate "$RECLASS_OPUS_OK" "$DIFF_FINAL_BAD" "$PAUSE_GATE_EMPTY" "$APPLY_REVIEW_EMPTY" "$OPUS_REREVIEW_OK_JSON")
+assert_eq "T7 opus-rereview-satisfied bridges past needs_revision final" "AUTHORIZED" "$T7_OUT"
+
+# -----------------------------------------------------------------------------
+# T8: opus-repair fixed but classify-opus-rereview returned needs_revision --
+# block-reclassify would have emitted BLOCKED in that case, and the gate must
+# refuse. Defense in depth: even if a malformed PROCEED leaks through, the
+# rereview verdict gate still rejects.
+# -----------------------------------------------------------------------------
+echo "--- T8: opus-rereview needs_revision -> REFUSED ---"
+RECLASS_BLOCKED='{"status":"BLOCKED","note":"opus-made-changes-rereview-failed"}'
+OPUS_REREVIEW_BAD_JSON='{"verdict":"needs_revision"}'
+T8_OUT=$(commit_and_push_gate "$RECLASS_BLOCKED" "$DIFF_FINAL_BAD" "$PAUSE_GATE_EMPTY" "$APPLY_REVIEW_EMPTY" "$OPUS_REREVIEW_BAD_JSON")
+assert_contains "T8 unauthorized opus rereview is REFUSED" "REFUSED" "$T8_OUT"
+
+# -----------------------------------------------------------------------------
+# T9: diff-review-final satisfied (the normal happy path) -- gate authorizes
+# regardless of any opus path. Pre-existing behavior must not regress.
+# -----------------------------------------------------------------------------
+echo "--- T9: diff-review-final satisfied -> AUTHORIZED (normal happy path) ---"
+RECLASS_PROCEED='{"status":"PROCEED","note":"final-satisfied"}'
+DIFF_FINAL_OK=$'reviewer prose\nDIFF_REVIEW_FINAL=satisfied\nfurther prose'
+OPUS_REREVIEW_NONE='{}'
+T9_OUT=$(commit_and_push_gate "$RECLASS_PROCEED" "$DIFF_FINAL_OK" "$PAUSE_GATE_EMPTY" "$APPLY_REVIEW_EMPTY" "$OPUS_REREVIEW_NONE")
+assert_eq "T9 normal happy path AUTHORIZED" "AUTHORIZED" "$T9_OUT"
+
+# -----------------------------------------------------------------------------
+# T10: approve-with-fix bridge -- pre-existing path must still authorize when
+# the operator chose approve_with_fix AND classify-apply-review came back
+# satisfied, even if diff-review-final is needs_revision.
+# -----------------------------------------------------------------------------
+echo "--- T10: approve_with_fix + classify-apply-review satisfied -> AUTHORIZED ---"
+RECLASS_BLOCKED_AWF='{"status":"BLOCKED","note":"final-needs-revision"}'
+PAUSE_GATE_AWF='{"decision_verb":"approve_with_fix"}'
+APPLY_REVIEW_OK='{"verdict":"satisfied"}'
+T10_OUT=$(commit_and_push_gate "$RECLASS_BLOCKED_AWF" "$DIFF_FINAL_BAD" "$PAUSE_GATE_AWF" "$APPLY_REVIEW_OK" "$OPUS_REREVIEW_NONE")
+assert_eq "T10 approve-with-fix bridge preserved" "AUTHORIZED" "$T10_OUT"
+
+# -----------------------------------------------------------------------------
+# T11: spoofed opus rereview verdict -- a satisfied verdict from
+# classify-opus-rereview MUST NOT authorize a commit when block-reclassify did
+# not emit the matching opus-repaired-and-rereviewed-satisfied note (e.g. the
+# rereview ran but opus-repair did not actually fix anything, so prior_status
+# stayed BLOCKED with a different note).
+# -----------------------------------------------------------------------------
+echo "--- T11: opus-rereview satisfied WITHOUT matching reclass note -> REFUSED ---"
+RECLASS_BLOCKED_OTHER='{"status":"BLOCKED","note":"opus-could-not-resolve"}'
+T11_OUT=$(commit_and_push_gate "$RECLASS_BLOCKED_OTHER" "$DIFF_FINAL_BAD" "$PAUSE_GATE_EMPTY" "$APPLY_REVIEW_EMPTY" "$OPUS_REREVIEW_OK_JSON")
+assert_contains "T11 mismatched opus authorization is REFUSED" "REFUSED" "$T11_OUT"
+
+# -----------------------------------------------------------------------------
 # Summary
 # -----------------------------------------------------------------------------
 echo ""

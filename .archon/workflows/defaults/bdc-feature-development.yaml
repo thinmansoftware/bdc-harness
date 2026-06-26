@@ -1415,9 +1415,9 @@ nodes:
   # backoff) and node fails closed if all attempts fail.
   - id: commit-and-push
     persona: overseer
-    depends_on: [decide-push-target, classify-apply-review]
+    depends_on: [decide-push-target, classify-apply-review, classify-opus-rereview]
     trigger_rule: all_done
-    when: "$block-reclassify.output.status == 'PROCEED' || $classify-apply-review.output.verdict == 'satisfied'"
+    when: "$block-reclassify.output.status == 'PROCEED' || $classify-apply-review.output.verdict == 'satisfied' || $classify-opus-rereview.output.verdict == 'satisfied'"
     load_bearing: true
     bash: |
       set -euo pipefail
@@ -1444,6 +1444,7 @@ nodes:
       RECLASS=$block-reclassify.output
       PAUSE_GATE=$pause-gate.output
       APPLY_REVIEW=$classify-apply-review.output
+      OPUS_REREVIEW_CLASS=$classify-opus-rereview.output
       echo "$DECIDE_OUTPUT"
       if printf '%s\n' "$DECIDE_OUTPUT" | grep -q '^out_of_scope: true'; then
         echo "Out of scope for bdc-feature-development; failing closed." >&2
@@ -1455,6 +1456,7 @@ nodes:
       # belt-and-suspenders re-check here (defense in depth) but it must NEVER be the place
       # a block surfaces as a raw failure -- if status isn't PROCEED we should not be here.
       RECLASS_STATUS=$(printf '%s\n' "$RECLASS" | sed -n 's/.*"status":"\([A-Z_]*\)".*/\1/p' | head -1)
+      RECLASS_NOTE=$(printf '%s\n' "$RECLASS" | sed -n 's/.*"note":"\([a-z0-9_-]*\)".*/\1/p' | head -1)
       # Approve-with-fix bridge: a BLOCKED run may legitimately commit if the operator chose
       # APPROVE-WITH-FIX at the gate AND the post-fix re-review (apply-diff-review-final,
       # classified by classify-apply-review) came back satisfied. Read both from node outputs.
@@ -1464,18 +1466,33 @@ nodes:
       if [ "$GATE_VERB" = "approve_with_fix" ] && [ "$APPLY_VERDICT" = "satisfied" ]; then
         APPROVE_WITH_FIX_OK=true
       fi
-      if [ "$RECLASS_STATUS" != "PROCEED" ] && [ "$APPROVE_WITH_FIX_OK" != "true" ]; then
-        echo "ERROR: commit-and-push reached with status='$RECLASS_STATUS' and no satisfied approve-with-fix authorization. Refusing to commit." >&2
+      # Opus autonomous re-review bridge (WO-HARNESS-OPUS-REPAIR-AUTONOMOUS-REREVIEW-01,
+      # Codex revision 2026-06-26): a BLOCKED run that opus-repair fixed AND classify-opus-rereview
+      # marked satisfied causes block-reclassify to emit PROCEED with note
+      # "opus-repaired-and-rereviewed-satisfied". In that path diff-review-final is still
+      # needs_revision (it is what triggered the block in the first place) and approve-with-fix
+      # is not used. Authorize commit here by reading the opus rereview verdict directly --
+      # mirrors the approve-with-fix bridge above. Fail CLOSED: missing/unparseable verdict
+      # never grants authorization.
+      OPUS_REREVIEW_VERDICT=$(printf '%s\n' "$OPUS_REREVIEW_CLASS" | sed -n 's/.*"verdict":"\([a-z_]*\)".*/\1/p' | head -1)
+      OPUS_REREVIEW_OK=false
+      if [ "$OPUS_REREVIEW_VERDICT" = "satisfied" ] && [ "$RECLASS_NOTE" = "opus-repaired-and-rereviewed-satisfied" ]; then
+        OPUS_REREVIEW_OK=true
+      fi
+      if [ "$RECLASS_STATUS" != "PROCEED" ] && [ "$APPROVE_WITH_FIX_OK" != "true" ] && [ "$OPUS_REREVIEW_OK" != "true" ]; then
+        echo "ERROR: commit-and-push reached with status='$RECLASS_STATUS' and no satisfied approve-with-fix or opus-rereview authorization. Refusing to commit." >&2
         exit 1
       fi
-      # Final-review sanity (still required for a real build): diff-review-final must be satisfied.
-      # Anchor-free parse (defense-in-depth mirror of block-classify). Fail-closed:
-      # anything other than an explicit satisfied leaves the gate refusing.
+      # Final-review sanity (still required for a real build): diff-review-final must be satisfied,
+      # OR an explicit downstream authorization (approve-with-fix re-review satisfied, or opus
+      # autonomous re-review satisfied) overrides it. Anchor-free parse (defense-in-depth mirror
+      # of block-classify). Fail-closed: anything other than an explicit satisfied leaves the
+      # gate refusing unless one of the two downstream bridges is true.
       final_verdict_cap=$(printf '%s\n' "$DIFF_FINAL" \
         | grep -oE 'DIFF_REVIEW_FINAL=(satisfied|needs_revision)' \
         | tail -n 1)
-      if [ "$final_verdict_cap" != "DIFF_REVIEW_FINAL=satisfied" ] && [ "$APPROVE_WITH_FIX_OK" != "true" ]; then
-        echo "ERROR: neither diff-review-final nor a satisfied approve-with-fix re-review authorizes this commit -- refusing (defense in depth)." >&2
+      if [ "$final_verdict_cap" != "DIFF_REVIEW_FINAL=satisfied" ] && [ "$APPROVE_WITH_FIX_OK" != "true" ] && [ "$OPUS_REREVIEW_OK" != "true" ]; then
+        echo "ERROR: neither diff-review-final, a satisfied approve-with-fix re-review, nor a satisfied opus autonomous re-review authorizes this commit -- refusing (defense in depth)." >&2
         exit 1
       fi
       BRANCH=$(printf '%s\n' "$DECIDE_OUTPUT" | sed -n 's/^push_target: feature-branch://p' | head -n 1)
