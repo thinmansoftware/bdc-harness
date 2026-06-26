@@ -373,6 +373,87 @@ MF_FAIL=$'WO: WO-X\nVALIDATION: FAIL -- tests red'
 assert_contains "explicit FAIL preserved" "FAIL" "$(derive_validation_line "$MF_FAIL")"
 
 # -----------------------------------------------------------------------------
+# Test 5c: substituted build-manifest output is captured as data, not bash source
+# -----------------------------------------------------------------------------
+echo "--- Test 5c: build-manifest substitution capture is shell-safe ---"
+INJECTION_TMP=$(mktemp -d)
+OLD_ASSIGN_SCRIPT="$INJECTION_TMP/old-inline-assignment.sh"
+FIXED_CAPTURE_SCRIPT="$INJECTION_TMP/fixed-heredoc-capture.sh"
+OLD_STDERR="$INJECTION_TMP/old.stderr"
+FIXED_OUT="$INJECTION_TMP/fixed.out"
+PWN_FILE="$INJECTION_TMP/pwned"
+PWN_BT_FILE="$INJECTION_TMP/pwned-backtick"
+
+cat > "$OLD_ASSIGN_SCRIPT" <<'OLD_ASSIGN_EOF'
+set -euo pipefail
+MANIFEST_OUT=WO: WO-HARNESS-PATCH-PR-BODY-SUBSTITUTION-INJECTION-01
+Builder: Codex
+Grep assertions: `printf old-backtick-ran >&2`
+Runtime verification: $(printf old-dollar-ran >&2)
+VALIDATION: PASS
+printf '%s\n' "$MANIFEST_OUT"
+OLD_ASSIGN_EOF
+
+set +e
+OLD_ASSIGN_STDOUT=$(bash "$OLD_ASSIGN_SCRIPT" 2>"$OLD_STDERR")
+OLD_ASSIGN_EXIT=$?
+set -e
+assert_eq "old inline assignment aborts" "0" "$([ "$OLD_ASSIGN_EXIT" -ne 0 ]; echo $?)"
+assert_contains "old inline assignment fails before manifest extraction" "command not found" \
+  "$(cat "$OLD_STDERR")"
+
+cat > "$FIXED_CAPTURE_SCRIPT" <<'FIXED_CAPTURE_EOF'
+set -euo pipefail
+capture_node_output() {
+  python3 -c 'import shlex, sys; s=sys.stdin.read(); sys.stdout.write((lambda p: p[0] if len(p)==1 else s)(shlex.split(s)) if len(s)>=2 and s[0]=="'"'"'" and s.rstrip("\n").endswith("'"'"'") else s)'
+}
+PWN_FILE="$1"
+PWN_BT_FILE="$2"
+MANIFEST_OUT=$(capture_node_output <<'BDC_NODE_OUTPUT_MANIFEST'
+WO: WO-HARNESS-PATCH-PR-BODY-SUBSTITUTION-INJECTION-01
+Builder: Codex
+Grep assertions: `touch "$PWN_BT_FILE"` and grep -c "Changed file was not listed in plan output" => 1 lines
+Runtime verification: $(touch "$PWN_FILE") and quoted "literal"
+VALIDATION: PASS
+BDC_NODE_OUTPUT_MANIFEST
+)
+extract() {
+  { printf '%s\n' "$MANIFEST_OUT" | grep -E "^${1}:" | head -1 | sed "s/^${1}:[[:space:]]*//"; } || true
+}
+printf 'GREP_ASSERT=%s\n' "$(extract "Grep assertions")"
+printf 'VALIDATION=%s\n' "$(printf '%s\n' "$MANIFEST_OUT" | grep -E '^(INFRA )?VALIDATION:' | head -1 || true)"
+SHELL_QUOTED=$(python3 -c 'import shlex, sys; sys.stdout.write(shlex.quote(sys.stdin.read()))' <<'BDC_SHELL_QUOTED_EOF'
+WO: WO-HARNESS-PATCH-PR-BODY-SUBSTITUTION-INJECTION-01
+Builder: Codex's "quoted" agent
+Runtime verification: $(touch "$PWN_FILE") and `touch "$PWN_BT_FILE"` stayed literal
+VALIDATION: PASS
+BDC_SHELL_QUOTED_EOF
+)
+SHELL_CAPTURED=$(printf '%s' "$SHELL_QUOTED" | capture_node_output)
+printf 'SHELL_BUILDER=%s\n' "$(printf '%s\n' "$SHELL_CAPTURED" | grep -E '^Builder:' | sed 's/^Builder:[[:space:]]*//')"
+FIXED_CAPTURE_EOF
+
+set +e
+FIXED_CAPTURE_STDOUT=$(bash "$FIXED_CAPTURE_SCRIPT" "$PWN_FILE" "$PWN_BT_FILE" 2>&1)
+FIXED_CAPTURE_EXIT=$?
+set -e
+printf '%s\n' "$FIXED_CAPTURE_STDOUT" > "$FIXED_OUT"
+assert_eq "fixed heredoc capture exits 0" "0" "$FIXED_CAPTURE_EXIT"
+assert_contains "fixed capture preserves literal Grep assertions text" \
+  'GREP_ASSERT=`touch "$PWN_BT_FILE"` and grep -c "Changed file was not listed in plan output" => 1 lines' \
+  "$FIXED_CAPTURE_STDOUT"
+assert_contains "fixed capture preserves VALIDATION" "VALIDATION=VALIDATION: PASS" \
+  "$FIXED_CAPTURE_STDOUT"
+assert_contains "fixed capture normalizes shell-quoted executor output" \
+  "SHELL_BUILDER=Codex's \"quoted\" agent" "$FIXED_CAPTURE_STDOUT"
+assert_eq "fixed capture does not execute dollar command substitution" "0" \
+  "$([ ! -e "$PWN_FILE" ]; echo $?)"
+assert_eq "fixed capture does not execute backticks" "0" \
+  "$([ ! -e "$PWN_BT_FILE" ]; echo $?)"
+
+rm -rf "$INJECTION_TMP"
+
+# -----------------------------------------------------------------------------
 # Test 6: Idempotent re-patch -- running twice yields ONE manifest block
 # -----------------------------------------------------------------------------
 echo "--- Test 6: Idempotent strip + append ---"
