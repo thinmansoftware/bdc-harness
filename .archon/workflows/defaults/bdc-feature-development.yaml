@@ -761,10 +761,24 @@ nodes:
       Be specific: every finding cites a file and the exact problem. "Looks fine" is not
       acceptable; "could be better" is not a finding. Only flag what must change before commit.
 
+  - id: classify-diff-review
+    depends_on: [diff-review]
+    trigger_rule: all_done
+    bash: |
+      set -uo pipefail
+      REVIEW=$diff-review.output
+      verdict=$(printf '%s\n' "$REVIEW" | grep -oE 'DIFF_REVIEW=(satisfied|needs_revision)' | tail -n 1 | sed 's/DIFF_REVIEW=//')
+      # Fail OPEN to needs_revision: if the sentinel is missing/unparseable, run the repair
+      # loop (safer to over-repair than to skip a real finding). This is the OPPOSITE of the
+      # fail-closed classifiers -- here "unknown" must still get a repair+re-review pass.
+      [ -z "$verdict" ] && verdict=needs_revision
+      printf '{"verdict":"%s"}\n' "$verdict"
+
   - id: diff-repair
     persona: major-build
     agent: major-build
-    depends_on: [diff-review]
+    depends_on: [diff-review, classify-diff-review]
+    when: "$classify-diff-review.output.verdict == 'needs_revision'"
     task_class: medium_work
     loop:
       fresh_context: true
