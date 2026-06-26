@@ -1849,9 +1849,9 @@ nodes:
       # gh pr create success path prints a bare URL line; the race-recovery path
       # emits "PR_URL=<url>". Handle both.
       OPEN_PR_OUT=$open-pr-if-needed.output
-      PR_URL=$(printf '%s\n' "$OPEN_PR_OUT" | grep -E '^PR_URL=' | sed 's/^PR_URL=//' | head -1)
+      PR_URL=$(printf '%s\n' "$OPEN_PR_OUT" | grep -E '^PR_URL=' | sed 's/^PR_URL=//' | head -1 || true)
       if [ -z "$PR_URL" ]; then
-        PR_URL=$(printf '%s\n' "$OPEN_PR_OUT" | grep -E '^https://github\.com/' | head -1)
+        PR_URL=$(printf '%s\n' "$OPEN_PR_OUT" | grep -E '^https://github\.com/' | head -1 || true)
       fi
       if [ -z "$PR_URL" ]; then
         echo "ERROR: could not resolve PR URL from open-pr-if-needed output -- cannot patch body." >&2
@@ -1935,7 +1935,13 @@ nodes:
       # -- Extract structured fields from build-manifest AI output.
       MANIFEST_OUT=$build-manifest.output
       extract() {
-        printf '%s\n' "$MANIFEST_OUT" | grep -E "^${1}:" | head -1 | sed "s/^${1}:[[:space:]]*//"
+        # pipefail-safe: grep exits 1 when the field line is absent; under
+        # set -euo pipefail that would abort the whole node mid-manifest. The
+        # `|| true` makes a missing field yield empty (the [ -z ] guards below
+        # supply the fallback) instead of killing patch-pr-body. (Hotfix
+        # 2026-06-26: second grep/pipefail trap in this node, same class as the
+        # file-list awk-NF fix.)
+        { printf '%s\n' "$MANIFEST_OUT" | grep -E "^${1}:" | head -1 | sed "s/^${1}:[[:space:]]*//"; } || true
       }
       WO_LINE=$(extract "WO")
       BUILDER_LINE=$(extract "Builder")
@@ -1964,7 +1970,7 @@ nodes:
       #    Rule 14 the manifest MUST include a validation line, and silently
       #    defaulting to "VALIDATION: PASS" would let an unvalidated build
       #    slip past Captain CI (the #321 hazard).
-      VALIDATION_LINE=$(printf '%s\n' "$MANIFEST_OUT" | grep -E '^(INFRA )?VALIDATION:' | head -1)
+      VALIDATION_LINE=$(printf '%s\n' "$MANIFEST_OUT" | grep -E '^(INFRA )?VALIDATION:' | head -1 || true)
       if [ -z "$VALIDATION_LINE" ]; then
         VALIDATION_LINE="VALIDATION: NOT_EMITTED -- build-manifest did not include a VALIDATION line; Captain CI must reject"
       fi
