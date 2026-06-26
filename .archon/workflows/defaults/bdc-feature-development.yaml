@@ -1008,15 +1008,87 @@ nodes:
           OPUS_REPAIR=needs-human
           REASON=<one sentence>
 
-  # block-reclassify: after the Opus pass (or skip if it wasn't BLOCKED), re-emit the
-  # JSON status. trigger_rule all_done so it runs whether or not opus-repair ran.
+  # classify-opus-repair: bash classifier -- converts the plain-text OPUS_REPAIR=fixed
+  # sentinel to {"fixed":"true|false"} so opus-rereview can gate on
+  # $classify-opus-repair.output.fixed == 'true'. Mirrors classify-apply-review idiom.
+  # (WO-HARNESS-OPUS-REPAIR-AUTONOMOUS-REREVIEW-01)
+  - id: classify-opus-repair
+    depends_on: [opus-repair]
+    trigger_rule: all_done
+    bash: |
+      set -uo pipefail
+      OPUS=$opus-repair.output
+      if printf '%s\n' "$OPUS" | grep -q '^OPUS_REPAIR=fixed'; then
+        printf '{"fixed":"true"}\n'
+      else
+        printf '{"fixed":"false"}\n'
+      fi
+
+  # opus-rereview: autonomous Codex adversarial re-review of the opus-repair diff.
+  # Only runs when classify-opus-repair reports fixed=true. Mirrors apply-diff-review-final.
+  # (WO-HARNESS-OPUS-REPAIR-AUTONOMOUS-REREVIEW-01) -- this is the AUTONOMOUS rung of the
+  # autonomy ladder: a passing re-review here lets block-reclassify emit PROCEED so the
+  # repaired build can land as a normal feature-branch PR instead of dead-ending at a
+  # terminal-BLOCKED on a non-interactive run.
+  - id: opus-rereview
+    provider: codex
+    model: gpt-5.5
+    agent: codex-adversarial-reviewer
+    depends_on: [classify-opus-repair]
+    trigger_rule: all_done
+    when: "$classify-opus-repair.output.fixed == 'true'"
+    prompt: |
+      opus-repair just made autonomous in-scope changes to resolve a BLOCKED build. Re-review
+      ONLY the current worktree diff (the post-repair state). Read-only. Judge ONLY this worktree
+      (no origin/main, no sibling worktrees; never fabricate a diff from already-merged commits).
+      Confirm the build now satisfies the WO and introduces no regression or unsafe behavior.
+
+      ## What opus-repair reported
+      $opus-repair.output
+
+      ## Original block reason
+      $block-classify.output
+      $diff-review-final.output
+
+      ## Output (STDOUT only, last lines)
+        OPUS_REREVIEW=<satisfied|needs_revision>
+        UNRESOLVED:
+        - <finding still open>   (or "(none)")
+
+  # classify-opus-rereview: grep the OPUS_REREVIEW sentinel out of opus-rereview's
+  # multi-line Codex prose and emit ONE JSON line so block-reclassify can read
+  # $classify-opus-rereview.output.verdict. Mirrors classify-apply-review exactly.
+  # Fail CLOSED: missing/unparseable sentinel -> needs_revision, never satisfied.
+  # (WO-HARNESS-OPUS-REPAIR-AUTONOMOUS-REREVIEW-01)
+  - id: classify-opus-rereview
+    depends_on: [opus-rereview]
+    trigger_rule: all_done
+    bash: |
+      set -uo pipefail
+      REVIEW=$opus-rereview.output
+      verdict=$(printf '%s\n' "$REVIEW" \
+        | grep -oE 'OPUS_REREVIEW=(satisfied|needs_revision)' \
+        | tail -n 1 \
+        | sed 's/OPUS_REREVIEW=//')
+      if [ -z "$verdict" ]; then
+        verdict=needs_revision
+      fi
+      printf '{"verdict":"%s"}\n' "$verdict"
+
+  # block-reclassify: after the Opus pass + autonomous re-review (or skip if it wasn't
+  # BLOCKED), re-emit the JSON status. trigger_rule all_done so it runs whether or not
+  # opus-repair / opus-rereview ran. WO-HARNESS-OPUS-REPAIR-AUTONOMOUS-REREVIEW-01 added
+  # classify-opus-rereview to depends_on and replaced the prior dead-end terminal with a
+  # verdict-gated split: satisfied -> PROCEED (opus-repaired-and-rereviewed-satisfied),
+  # needs_revision -> BLOCKED (opus-made-changes-rereview-failed).
   - id: block-reclassify
-    depends_on: [block-classify, opus-repair]
+    depends_on: [block-classify, opus-repair, classify-opus-rereview]
     trigger_rule: all_done
     bash: |
       set -uo pipefail
       PRIOR=$block-classify.output
       OPUS=$opus-repair.output
+      REREVIEW=$classify-opus-rereview.output
       prior_status=$(printf '%s\n' "$PRIOR" | sed -n 's/.*"status":"\([A-Z_]*\)".*/\1/p' | head -1)
 
       # If it wasn't blocked, keep the prior status unchanged.
@@ -1032,10 +1104,15 @@ nodes:
               || git -C "$WT" rev-list --count HEAD --not --remotes 2>/dev/null || echo 0)
 
       if printf '%s\n' "$OPUS" | grep -q '^OPUS_REPAIR=fixed' && { [ "${CHANGED:-0}" -gt 0 ] || [ "${AHEAD:-0}" -gt 0 ]; }; then
-        # Opus made real changes -> needs a fresh review before proceeding. We do NOT
-        # auto-PROCEED (the new diff was not Codex-reviewed). Pause for human to re-run
-        # review or approve. Conservative: treat as BLOCKED-for-human with a clear note.
-        printf '{"status":"BLOCKED","note":"opus-made-changes-need-re-review"}\n'
+        # Opus made real changes. The autonomous re-review verdict decides the path:
+        # satisfied -> PROCEED (normal commit/PR); anything else -> BLOCKED (salvage
+        # net + human gate own it). Fail CLOSED: missing/unparseable verdict -> BLOCKED.
+        rereview_verdict=$(printf '%s\n' "$REREVIEW" | sed -n 's/.*"verdict":"\([a-z_]*\)".*/\1/p' | head -1)
+        if [ "$rereview_verdict" = "satisfied" ]; then
+          printf '{"status":"PROCEED","note":"opus-repaired-and-rereviewed-satisfied"}\n'
+        else
+          printf '{"status":"BLOCKED","note":"opus-made-changes-rereview-failed"}\n'
+        fi
       elif printf '%s\n' "$OPUS" | grep -q '^OPUS_REPAIR=already-satisfied'; then
         printf '{"status":"ALREADY_SATISFIED","note":"opus-confirmed-already-satisfied"}\n'
       else
