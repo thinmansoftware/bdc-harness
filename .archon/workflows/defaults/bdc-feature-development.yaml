@@ -1837,8 +1837,18 @@ nodes:
     bash: |
       set -euo pipefail
 
+      capture_node_output() {
+        # Node output refs are substituted before bash runs. Capturing them via a
+        # quoted heredoc keeps raw backticks, quotes, and $() literal; the Python
+        # shim also normalizes the current executor's shell-quoted substitution.
+        python3 -c 'import shlex, sys; s=sys.stdin.read(); sys.stdout.write((lambda p: p[0] if len(p)==1 else s)(shlex.split(s)) if len(s)>=2 and s[0]=="'"'"'" and s.rstrip("\n").endswith("'"'"'") else s)'
+      }
+
       # -- Outcome guard: only patch on PROCEED (a real PR was opened).
-      RECLASSIFY=$block-reclassify.output
+      RECLASSIFY=$(capture_node_output <<'BDC_NODE_OUTPUT_BLOCK_RECLASSIFY'
+      $block-reclassify.output
+      BDC_NODE_OUTPUT_BLOCK_RECLASSIFY
+      )
       STATUS=$(printf '%s\n' "$RECLASSIFY" | sed -n 's/.*"status":"\([A-Z_]*\)".*/\1/p' | head -1)
       if [ "$STATUS" != "PROCEED" ]; then
         echo "patch-pr-body: status=$STATUS -- skipping PR body patch (no real PR on this path)."
@@ -1848,7 +1858,10 @@ nodes:
       # -- Resolve PR URL from open-pr-if-needed output.
       # gh pr create success path prints a bare URL line; the race-recovery path
       # emits "PR_URL=<url>". Handle both.
-      OPEN_PR_OUT=$open-pr-if-needed.output
+      OPEN_PR_OUT=$(capture_node_output <<'BDC_NODE_OUTPUT_OPEN_PR'
+      $open-pr-if-needed.output
+      BDC_NODE_OUTPUT_OPEN_PR
+      )
       PR_URL=$(printf '%s\n' "$OPEN_PR_OUT" | grep -E '^PR_URL=' | sed 's/^PR_URL=//' | head -1 || true)
       if [ -z "$PR_URL" ]; then
         PR_URL=$(printf '%s\n' "$OPEN_PR_OUT" | grep -E '^https://github\.com/' | head -1 || true)
@@ -1860,7 +1873,10 @@ nodes:
 
       # -- Resolve REPO from decide-push-target output (Rule 29: never let gh
       #    default to the worktree's origin).
-      DECIDE_OUT=$decide-push-target.output
+      DECIDE_OUT=$(capture_node_output <<'BDC_NODE_OUTPUT_DECIDE'
+      $decide-push-target.output
+      BDC_NODE_OUTPUT_DECIDE
+      )
       REPO=$(printf '%s\n' "$DECIDE_OUT" | sed -n 's/^repo: //p' | head -1)
       if [ -z "$REPO" ] || [ "$REPO" = "unknown" ]; then
         echo "ERROR: REPO not resolved from decide-push-target output." >&2
@@ -1933,7 +1949,10 @@ nodes:
       [ -z "$FILES_MODIFIED" ] && FILES_MODIFIED="none"
 
       # -- Extract structured fields from build-manifest AI output.
-      MANIFEST_OUT=$build-manifest.output
+      MANIFEST_OUT=$(capture_node_output <<'BDC_NODE_OUTPUT_MANIFEST'
+      $build-manifest.output
+      BDC_NODE_OUTPUT_MANIFEST
+      )
       extract() {
         # pipefail-safe: grep exits 1 when the field line is absent; under
         # set -euo pipefail that would abort the whole node mid-manifest. The
