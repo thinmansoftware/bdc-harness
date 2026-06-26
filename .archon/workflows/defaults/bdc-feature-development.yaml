@@ -1791,13 +1791,18 @@ nodes:
       # If origin/<base> is not present in this (possibly sparse) worktree, fall back so the
       # diff is computed against a real ref instead of silently returning empty (which used to
       # trip the grep/pipefail abort and skip the manifest entirely).
+      EMPTY_TREE_FALLBACK=0
       if ! git rev-parse --verify --quiet "${BASE_REF}" >/dev/null 2>&1; then
         if git rev-parse --verify --quiet FETCH_HEAD >/dev/null 2>&1; then
           BASE_REF="FETCH_HEAD"
         else
           # Empty-tree sha (git's well-known empty tree object). Diffing HEAD against it lists
           # every tracked file as added -- a safe last resort for a fresh branch.
+          # NOTE: git's three-dot symmetric-diff syntax (BASE...HEAD) requires BOTH endpoints
+          # to be commit-ish; a tree object is rejected. The two-arg form (BASE HEAD) accepts
+          # a tree on the left and produces the same "every tracked file added" listing we want.
           BASE_REF="$(git hash-object -t tree /dev/null)"
+          EMPTY_TREE_FALLBACK=1
         fi
       fi
 
@@ -1812,7 +1817,14 @@ nodes:
       #      R<score>  -> rename: new path -> Files created;
       #                   old path -> Files modified "(deleted)"
       #      C<score>  -> copy:   new path -> Files created (source untouched)
-      NAME_STATUS=$(git diff --name-status "${BASE_REF}...HEAD" 2>/dev/null || true)
+      if [ "$EMPTY_TREE_FALLBACK" = "1" ]; then
+        # Two-arg form: compares the empty tree object directly against HEAD and lists every
+        # tracked file as added. Symmetric-diff (...) would silently fail here because a tree
+        # is not commit-ish, and the `|| true` would mask the failure as an empty NAME_STATUS.
+        NAME_STATUS=$(git diff --name-status "${BASE_REF}" HEAD 2>/dev/null || true)
+      else
+        NAME_STATUS=$(git diff --name-status "${BASE_REF}...HEAD" 2>/dev/null || true)
+      fi
       FILES_CREATED=$(printf '%s\n' "$NAME_STATUS" | awk -F'\t' '
         $1=="A"           { print $2 }
         $1 ~ /^R[0-9]*$/  { print $3 }
