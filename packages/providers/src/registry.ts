@@ -18,6 +18,7 @@ import { CodexProvider } from './codex/provider';
 import { CLAUDE_CAPABILITIES } from './claude/capabilities';
 import { CODEX_CAPABILITIES } from './codex/capabilities';
 import { registerPiProvider } from './community/pi/registration';
+import { registerGlmProvider } from './community/glm/registration';
 import { UnknownProviderError } from './errors';
 import { createLogger } from '@archon/paths';
 
@@ -158,6 +159,7 @@ export function registerBuiltinProviders(): void {
  */
 export function registerCommunityProviders(): void {
   registerPiProvider();
+  registerGlmProvider();
 }
 
 /** @internal Test-only -- clears the registry. Not for production use. */
