@@ -98,6 +98,18 @@ export interface PiProviderDefaults {
   maxConcurrent?: number;
 }
 
+/**
+ * Community provider defaults for GLM (Zhipu/Z.ai) via the OpenAI wire protocol.
+ * v1 minimal shape; extend as capabilities are wired in.
+ */
+export interface GlmProviderDefaults {
+  [key: string]: unknown;
+  /** Default model string, e.g. 'glm-5.2' */
+  model?: string;
+  /** Z.ai API base URL. Defaults to 'https://open.bigmodel.cn/api/paas/v4' when absent. */
+  baseURL?: string;
+}
+
 /** Generic per-provider defaults bag used by config surfaces and UI. */
 export type ProviderDefaults = Record<string, unknown>;
 
