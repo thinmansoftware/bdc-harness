@@ -1,7 +1,7 @@
 name: bdc-feature-development-codex
 description: |
   Codex-implement variant of bdc-feature-development. Identical DAG; implement +
-  diff-repair use Codex gpt-5.4 instead of Claude. Fire when Claude usage is capped.
+  diff-repair use Codex gpt-5.5 instead of Claude. Fire when Claude usage is capped.
   All other nodes (plan, review, validator, manifest, notion) are unchanged.
 
 policyFile: harness/policies/agent-behavior.md
@@ -278,7 +278,7 @@ nodes:
 
   - id: implement
     provider: codex
-    model: gpt-5.4
+    model: gpt-5.5
     depends_on: [plan-review]
     task_class: medium_work
     loop:
@@ -775,7 +775,7 @@ nodes:
 
   - id: diff-repair
     provider: codex
-    model: gpt-5.4
+    model: gpt-5.5
     depends_on: [diff-review, classify-diff-review]
     when: "$classify-diff-review.output.verdict == 'needs_revision'"
     task_class: medium_work
@@ -998,7 +998,7 @@ nodes:
   # resolve the block, then signals. If it can't fix, the run proceeds to the human pause.
   - id: opus-repair
     provider: codex
-    model: gpt-5.4-pro
+    model: gpt-5.5
     depends_on: [block-classify]
     when: "$block-classify.output.status == 'BLOCKED'"
     prompt: |
