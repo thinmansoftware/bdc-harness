@@ -8,8 +8,16 @@ import {
   mockDiscoverWorkflowsWithConfig,
 } from '../test/workflow-mock-factories';
 
+// The operator-token gate in registerApiRoutes() activates whenever
+// ARCHON_OPERATOR_TOKEN is set. Clear it at module level so these tests run
+// deterministically in container envs (Cauldron build image exports this var).
+// Tests that need to exercise the auth gate set the token in their own scope.
+delete process.env.ARCHON_OPERATOR_TOKEN;
+delete process.env.ARCHON_OPERATOR_ACCESS_HOSTS;
+delete process.env.ARCHON_OPERATOR_EMAILS;
+
 // ---------------------------------------------------------------------------
-// Mock setup — must be before dynamic imports of mocked modules
+// Mock setup -- must be before dynamic imports of mocked modules
 // ---------------------------------------------------------------------------
 
 const mockGetWorkflowRun = mock(async (_id: string) => null as null | MockWorkflowRun);
