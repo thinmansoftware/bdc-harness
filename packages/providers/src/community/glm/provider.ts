@@ -11,12 +11,13 @@ import type {
 import { GLM_CAPABILITIES } from './capabilities';
 import { parseGlmConfig } from './config';
 
-const DEFAULT_MODEL = 'glm-5.2';
-const DEFAULT_BASE_URL = 'https://open.bigmodel.cn/api/paas/v4';
+const DEFAULT_MODEL = 'z-ai/glm-5.2';
+const DEFAULT_BASE_URL = 'https://openrouter.ai/api/v1';
 
 /**
  * GlmProvider -- community provider wrapping the OpenAI chat completions API
- * pointed at the Z.ai (Zhipu) endpoint.
+ * pointed at the OpenRouter endpoint (https://openrouter.ai/api/v1).
+ * GLM models are accessed via OpenRouter using the z-ai/ model prefix.
  *
  * GLM-5.2 speaks the OpenAI wire protocol, so this provider reuses the
  * `openai` npm package (already a dep for community/pi transitive usage)
@@ -68,6 +69,10 @@ export class GlmProvider implements IAgentProvider {
     });
 
     const model = options?.model ?? this.model;
+    // Normalize bare model ids to OpenRouter's z-ai/ namespace.
+    // YAML workflows request "glm-5.2"; OpenRouter requires "z-ai/glm-5.2".
+    // Already-prefixed ids (e.g. "z-ai/glm-4.6") pass through unchanged.
+    const resolvedModel = model.includes('/') ? model : 'z-ai/' + model;
 
     // Build messages array from prompt. systemPrompt is prepended when present.
     const messages: OpenAI.Chat.ChatCompletionMessageParam[] = [];
@@ -87,7 +92,7 @@ export class GlmProvider implements IAgentProvider {
     messages.push({ role: 'user', content: userContent });
 
     const stream = await client.chat.completions.create({
-      model,
+      model: resolvedModel,
       messages,
       stream: true,
       stream_options: { include_usage: true },

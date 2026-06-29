@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, mock, test } from 'bun:test';
 
-// ─── Mock @archon/paths logger so provider instantiation is quiet ────────────
+// --- Mock @archon/paths logger so provider instantiation is quiet ----------
 
 const mockLogger = {
   info: mock(() => undefined),
@@ -16,7 +16,7 @@ mock.module('@archon/paths', () => ({
   createLogger: mock(() => mockLogger),
 }));
 
-// ─── Mock openai so no real HTTP calls are made ──────────────────────────────
+// --- Mock openai so no real HTTP calls are made ----------------------------
 
 const mockStreamIterator = {
   [Symbol.asyncIterator]: mock(async function* () {
@@ -48,7 +48,7 @@ mock.module('openai', () => ({
   OpenAI: mockOpenAI,
 }));
 
-// ─── Import under test (after mocks) ────────────────────────────────────────
+// --- Import under test (after mocks) ---------------------------------------
 
 import { clearRegistry, isRegisteredProvider, registerBuiltinProviders } from '../../registry';
 import { GlmProvider } from './provider';
@@ -60,6 +60,8 @@ describe('GlmProvider', () => {
     registerBuiltinProviders();
     // Reset GLM_API_KEY between tests
     delete process.env['GLM_API_KEY'];
+    mockCreate.mockClear();
+    mockOpenAI.mockClear();
   });
 
   test('registerGlmProvider() registers glm and is idempotent', () => {
@@ -83,5 +85,39 @@ describe('GlmProvider', () => {
     const provider = new GlmProvider();
     const gen = provider.sendQuery('hello', '/tmp');
     await expect(gen.next()).rejects.toThrow('GLM_API_KEY');
+  });
+
+  test('GlmProvider uses OpenRouter base URL by default', async () => {
+    process.env['GLM_API_KEY'] = 'sk-or-test';
+    const provider = new GlmProvider();
+    const gen = provider.sendQuery('hello', '/tmp');
+    // Drain the generator so the client constructor runs
+    for await (const _ of gen) {
+      /* discard */
+    }
+    const constructorArg = mockOpenAI.mock.calls[0]?.[0] as Record<string, unknown>;
+    expect(constructorArg?.['baseURL']).toBe('https://openrouter.ai/api/v1');
+  });
+
+  test('GlmProvider normalizes bare glm-5.2 to z-ai/glm-5.2', async () => {
+    process.env['GLM_API_KEY'] = 'sk-or-test';
+    const provider = new GlmProvider();
+    const gen = provider.sendQuery('hello', '/tmp', undefined, { model: 'glm-5.2' });
+    for await (const _ of gen) {
+      /* discard */
+    }
+    const createArg = mockCreate.mock.calls[0]?.[0] as Record<string, unknown>;
+    expect(createArg?.['model']).toBe('z-ai/glm-5.2');
+  });
+
+  test('GlmProvider passes through already-prefixed z-ai/glm-4.6 unchanged', async () => {
+    process.env['GLM_API_KEY'] = 'sk-or-test';
+    const provider = new GlmProvider();
+    const gen = provider.sendQuery('hello', '/tmp', undefined, { model: 'z-ai/glm-4.6' });
+    for await (const _ of gen) {
+      /* discard */
+    }
+    const createArg = mockCreate.mock.calls[0]?.[0] as Record<string, unknown>;
+    expect(createArg?.['model']).toBe('z-ai/glm-4.6');
   });
 });
