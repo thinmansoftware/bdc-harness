@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # ascii-autofix.py -- Rule 13 mechanical normalizer (TOTAL fixer).
 #
-# Usage: python3 harness/scripts/ascii-autofix.py <BASE_SHA>
+# Usage: python3 harness/scripts/ascii-autofix.py <BASE_SHA> [SRC_RE] [EXCLUDE_RE]
 #
 # Purpose: Convert EVERY non-ASCII byte in the gate's scope to ASCII so the
 # downstream ascii-gate becomes a no-fail verification. There are two tiers:
@@ -25,7 +25,8 @@
 # - untracked files from git ls-files --others --exclude-standard
 #
 # Safety lines:
-# - Only files matching SRC_RE are touched (source code extensions).
+# - Only files matching SRC_RE are touched (source code extensions). The workflow
+#   passes ascii-gate's SRC_RE and EXCLUDE_RE so fixer and gate scopes stay aligned.
 # - For tracked files, only rewrites added/changed lines (diff-scoped). For
 #   untracked files, all lines are eligible.
 # - `\uXXXX` escape literals in source files are already ASCII bytes on disk
@@ -71,7 +72,10 @@ SUBS = {
     chr(0x26A0): "!",          # warning sign
 }
 
-SRC_RE = re.compile(r"\.(js|jsx|ts|tsx|mjs|cjs|html|sh|bash|gs|yaml|yml)$")
+DEFAULT_SRC_RE = r"\.(js|jsx|ts|tsx|mjs|cjs|html|sh|bash|gs|yaml|yml)$"
+DEFAULT_EXCLUDE_RE = r"(\.generated\.(ts|js)$|bundled-defaults\.generated\.|/__snapshots__/|\.snap$)"
+SRC_RE = re.compile(DEFAULT_SRC_RE)
+EXCLUDE_RE = re.compile(DEFAULT_EXCLUDE_RE)
 HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
 
 
@@ -111,7 +115,11 @@ def git_ok(args: list[str]) -> bool:
     return rc == 0
 
 
-def source_files_from_gate_scope(base: str | None) -> list[str]:
+def source_files_from_gate_scope(
+    base: str | None,
+    src_re: re.Pattern[str] = SRC_RE,
+    exclude_re: re.Pattern[str] = EXCLUDE_RE,
+) -> list[str]:
     parts: list[str] = []
     if base:
         out, _ = run_git(["diff", "--name-only", "%s..HEAD" % base])
@@ -128,7 +136,7 @@ def source_files_from_gate_scope(base: str | None) -> list[str]:
         if not path or path in seen:
             continue
         seen.add(path)
-        if SRC_RE.search(path):
+        if src_re.search(path) and not exclude_re.search(path):
             files.append(path)
     return files
 
@@ -263,10 +271,23 @@ def resolve_base(argv: list[str]) -> str | None:
     return base
 
 
+def resolve_scope_regexes(argv: list[str]) -> tuple[re.Pattern[str], re.Pattern[str]]:
+    src_pattern = argv[2] if len(argv) >= 3 and argv[2] else DEFAULT_SRC_RE
+    exclude_pattern = argv[3] if len(argv) >= 4 and argv[3] else DEFAULT_EXCLUDE_RE
+    try:
+        return re.compile(src_pattern), re.compile(exclude_pattern)
+    except re.error as exc:
+        sys.stderr.write(
+            "ascii-autofix: invalid scope regex (%s); using built-in defaults\n" % exc
+        )
+        return SRC_RE, EXCLUDE_RE
+
+
 def main(argv: list[str]) -> int:
     base = resolve_base(argv)
+    src_re, exclude_re = resolve_scope_regexes(argv)
     modified: list[str] = []
-    for path in source_files_from_gate_scope(base):
+    for path in source_files_from_gate_scope(base, src_re, exclude_re):
         if not os.path.isfile(path):
             continue
         if fix_file(path, eligible_lines(base, path)):

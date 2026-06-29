@@ -551,8 +551,12 @@ nodes:
         BASE_REF="origin/${BASE_BRANCH:-main}"
         BASE=$(git merge-base HEAD "$BASE_REF" 2>/dev/null || git rev-parse HEAD~1 2>/dev/null || echo "")
       fi
+      SRC_RE='\.(js|jsx|ts|tsx|mjs|cjs|html|sh|bash|gs|yaml|yml)$'
+      # Keep the fixer scope aligned with ascii-gate. Generated/bundled artifacts are
+      # not hand-authored source and may contain pre-existing copied non-ASCII bytes.
+      EXCLUDE_RE='(\.generated\.(ts|js)$|bundled-defaults\.generated\.|/__snapshots__/|\.snap$)'
       # Run the total fixer; prefix every output line for node log clarity.
-      python3 harness/scripts/ascii-autofix.py "$BASE" 2>&1 | while IFS= read -r line; do
+      python3 harness/scripts/ascii-autofix.py "$BASE" "$SRC_RE" "$EXCLUDE_RE" 2>&1 | while IFS= read -r line; do
         echo "ascii-autofix: $line"
       done
       exit 0
