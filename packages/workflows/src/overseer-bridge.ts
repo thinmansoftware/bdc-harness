@@ -24,7 +24,8 @@ import type { Logger } from '@archon/paths';
 import { classifyError, decide, runEscalation, type Decision } from '@archon/overseer';
 import type { WorkflowRun, NodeOutput } from './schemas/workflow-run.ts';
 import type { DagNode } from './schemas/dag-node.ts';
-import type { WorkflowEmitterEvent } from './event-emitter.ts';
+import { buildGateResultField } from './event-emitter';
+import type { WorkflowEmitterEvent, GateResult } from './event-emitter.ts';
 import type { IWorkflowStore } from './store.ts';
 
 export interface HandleNodeFailureDeps {
@@ -58,6 +59,12 @@ export interface HandleNodeFailureContext {
   statusCode?: number;
   /** Optional extra data fields to attach to the persisted node_failed event */
   extraEventData?: Record<string, unknown>;
+  /**
+   * Structured gate outcome to attach to the node_failed store + emitter events.
+   * Set by Phase 5 cascade engine when a gate check fires before failure.
+   * (WO-HARNESS-LAYER1-CLIMB-AND-GATE-EVENTS-01)
+   */
+  gateResult?: GateResult;
   /**
    * Optional war-council-validator stdout captured from a sibling node output map.
    * Forwarded to classify/decide so the silent-dead-end classes can detect
@@ -147,6 +154,9 @@ export async function handleNodeFailure(
         overseer_class: errorClass,
         overseer_decision: result.decision,
         ...(ctx.extraEventData ?? {}),
+        // Layer 1 gate_result field (WO-HARNESS-LAYER1-CLIMB-AND-GATE-EVENTS-01).
+        // Present only when Phase 5 cascade engine provides gateResult in ctx.
+        ...buildGateResultField(ctx.gateResult),
       },
     })
     .catch((err: Error) => {
@@ -162,6 +172,7 @@ export async function handleNodeFailure(
     nodeId: node.id,
     nodeName: node.command ?? node.id,
     error: ctx.errorMsg,
+    ...buildGateResultField(ctx.gateResult),
   });
 
   // Silent-dead-end escalation: fire 3 operator-visible signals (escalation.json

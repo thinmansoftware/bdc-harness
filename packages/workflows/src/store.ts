@@ -31,6 +31,11 @@ export const WORKFLOW_EVENT_TYPES = [
   'approval_received',
   'workflow_cancelled',
   'workflow_artifact',
+  // Layer 1 cascade-step event (WO-HARNESS-LAYER1-CLIMB-AND-GATE-EVENTS-01).
+  // Emitted when a job escalates from one cost tier to another. Distinct from
+  // node_failed / overseer_decision=escalate (the salvage path). No callers in
+  // Phase 3; Phase 5 cascade engine (WO-HARNESS-V1-PERRUN-CASCADE-01) wires it.
+  'cascade_step',
 ] as const;
 
 export type WorkflowEventType = (typeof WORKFLOW_EVENT_TYPES)[number];

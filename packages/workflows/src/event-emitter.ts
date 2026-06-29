@@ -21,6 +21,28 @@ function getLog(): ReturnType<typeof createLogger> {
 }
 
 // ---------------------------------------------------------------------------
+// Layer 1 gate result type (WO-HARNESS-LAYER1-CLIMB-AND-GATE-EVENTS-01).
+// Structured outcome of a quality gate that ran on a node. Known gate names:
+// 'tests' | 'validator' | 'manifest' | 'ci'. Open string for future gates.
+// Populated by the Phase 5 cascade engine; plumbing wired here in Phase 3.
+// ---------------------------------------------------------------------------
+
+export interface GateResult {
+  gate: string;
+  outcome: 'pass' | 'fail';
+  reason: string;
+}
+
+/** Returns { gate_result: GateResult } or {} to spread into store/emitter event data.
+ *  Lives in event-emitter.ts (not dag-executor.ts) to avoid the dag-executor ->
+ *  overseer-bridge circular import: both callers already import from this file. */
+export function buildGateResultField(gateResult: GateResult | undefined): {
+  gate_result?: GateResult;
+} {
+  return gateResult !== undefined ? { gate_result: gateResult } : {};
+}
+
+// ---------------------------------------------------------------------------
 // Event types
 // ---------------------------------------------------------------------------
 
@@ -95,6 +117,9 @@ interface NodeCompletedEvent {
   costUsd?: number;
   stopReason?: string;
   numTurns?: number;
+  // Layer 1 gate result (WO-HARNESS-LAYER1-CLIMB-AND-GATE-EVENTS-01). Optional;
+  // populated by Phase 5 cascade engine via recordGateResult() before node completes.
+  gate_result?: GateResult;
 }
 
 interface NodeFailedEvent {
@@ -103,6 +128,23 @@ interface NodeFailedEvent {
   nodeId: string;
   nodeName: string;
   error: string;
+  // Layer 1 gate result (WO-HARNESS-LAYER1-CLIMB-AND-GATE-EVENTS-01). Optional;
+  // set via HandleNodeFailureContext.gateResult when a gate check causes failure.
+  gate_result?: GateResult;
+}
+
+// Emitted when a job escalates (climbs) from one cost tier to another.
+// DISTINCT from node_failed overseer_decision=escalate (salvage path).
+// Emit-site wired in Phase 3; cascade engine populates in Phase 5
+// (WO-HARNESS-V1-PERRUN-CASCADE-01).
+interface CascadeStepEvent {
+  type: 'cascade_step';
+  runId: string;
+  nodeId: string;
+  from_tier: string;
+  to_tier: string;
+  gate: string;
+  reason: string;
 }
 
 /**
@@ -186,7 +228,8 @@ export type WorkflowEmitterEvent =
   | ToolStartedEvent
   | ToolCompletedEvent
   | ApprovalPendingEvent
-  | WorkflowCancelledEvent;
+  | WorkflowCancelledEvent
+  | CascadeStepEvent;
 
 // ---------------------------------------------------------------------------
 // Emitter class

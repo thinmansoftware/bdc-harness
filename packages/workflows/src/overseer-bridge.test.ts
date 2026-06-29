@@ -216,6 +216,46 @@ describe('handleNodeFailure -- side effects', () => {
     expect(payload.data.error).toBe('bash: line 3: npm: command not found');
   });
 
+  it('T2: structured gate_result appears on node_failed store event when gateResult is provided', async () => {
+    const deps = makeDeps();
+    await handleNodeFailure(deps, makeWorkflowRun(), makeNode('gate-node'), {
+      ...baseCtx,
+      errorMsg: 'tsc returned 14 errors',
+      gateResult: { gate: 'tests', outcome: 'fail', reason: 'tsc returned 14 errors' },
+    });
+    const createEvent = deps.store.createWorkflowEvent as unknown as {
+      mock: { calls: unknown[][] };
+    };
+    expect(createEvent.mock.calls.length).toBe(1);
+    const payload = createEvent.mock.calls[0][0] as {
+      event_type: string;
+      data: Record<string, unknown>;
+    };
+    expect(payload.event_type).toBe('node_failed');
+    const gr = payload.data.gate_result as Record<string, unknown>;
+    expect(gr).toBeDefined();
+    expect(gr.gate).toBe('tests');
+    expect(gr.outcome).toBe('fail');
+    expect(gr.reason).toBe('tsc returned 14 errors');
+  });
+
+  it('T2b: gate_result absent on node_failed store event when gateResult is not provided', async () => {
+    const deps = makeDeps();
+    await handleNodeFailure(deps, makeWorkflowRun(), makeNode('no-gate-node'), {
+      ...baseCtx,
+      errorMsg: 'something weird',
+    });
+    const createEvent = deps.store.createWorkflowEvent as unknown as {
+      mock: { calls: unknown[][] };
+    };
+    const payload = createEvent.mock.calls[0][0] as {
+      event_type: string;
+      data: Record<string, unknown>;
+    };
+    expect(payload.event_type).toBe('node_failed');
+    expect('gate_result' in payload.data).toBe(false);
+  });
+
   it('emits node_failed event on the workflow emitter', async () => {
     const deps = makeDeps();
     await handleNodeFailure(deps, makeWorkflowRun(), makeNode('node-z'), {

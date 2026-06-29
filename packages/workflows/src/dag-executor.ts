@@ -51,7 +51,9 @@ import {
 } from './schemas';
 import { formatToolCall } from './utils/tool-formatter';
 import { createLogger } from '@archon/paths';
-import { getWorkflowEventEmitter } from './event-emitter';
+import { getWorkflowEventEmitter, buildGateResultField } from './event-emitter';
+import type { GateResult } from './event-emitter';
+import type { IWorkflowStore } from './store';
 import { detectSilentFailure } from './silent-failure-detector';
 import { handleNodeFailure } from './overseer-bridge';
 import { evaluateCondition } from './condition-evaluator';
@@ -218,6 +220,63 @@ export function shouldContinueStreamingForStatus(status: string | null): boolean
 /** Throttle state for activity heartbeat writes (only used for stale/zombie detection) */
 const lastNodeActivityUpdate = new Map<string, number>();
 const ACTIVITY_HEARTBEAT_INTERVAL_MS = 60_000;
+
+// ---------------------------------------------------------------------------
+// Layer 1: Cascade-step emit + gate-result plumbing
+// (WO-HARNESS-LAYER1-CLIMB-AND-GATE-EVENTS-01, Phase 3)
+// ---------------------------------------------------------------------------
+
+// Pending gate results keyed by `${runId}:${nodeId}`. Phase 5 cascade engine
+// calls recordGateResult() before the node completes; the node_completed
+// emit-site consumes and clears this entry.
+const pendingGateResults = new Map<string, GateResult>();
+
+/** Phase 5 cascade engine calls this to attach a gate outcome to the next
+ *  node_completed event for (runId, nodeId). No-op until Phase 5 wires it. */
+export function recordGateResult(runId: string, nodeId: string, result: GateResult): void {
+  pendingGateResults.set(`${runId}:${nodeId}`, result);
+}
+
+/** Emit a cascade_step event (store + in-process emitter) when a job
+ *  escalates from one tier to another. Called by Phase 5 cascade engine.
+ *  No callers exist in Phase 3 -- the plumbing is wired, not triggered.
+ *
+ *  DISTINCT from node_failed / overseer_decision=escalate (salvage path). */
+export function emitCascadeStep(
+  store: Pick<IWorkflowStore, 'createWorkflowEvent'>,
+  workflowRun: Pick<WorkflowRun, 'id'>,
+  nodeId: string,
+  params: { from_tier: string; to_tier: string; gate: string; reason: string }
+): void {
+  store
+    .createWorkflowEvent({
+      workflow_run_id: workflowRun.id,
+      event_type: 'cascade_step',
+      step_name: nodeId,
+      data: {
+        from_tier: params.from_tier,
+        to_tier: params.to_tier,
+        gate: params.gate,
+        reason: params.reason,
+      },
+    })
+    .catch((err: Error) => {
+      getLog().error(
+        { err, workflowRunId: workflowRun.id, eventType: 'cascade_step' },
+        'workflow_event_persist_failed'
+      );
+    });
+
+  getWorkflowEventEmitter().emit({
+    type: 'cascade_step',
+    runId: workflowRun.id,
+    nodeId,
+    from_tier: params.from_tier,
+    to_tier: params.to_tier,
+    gate: params.gate,
+    reason: params.reason,
+  });
+}
 
 /** Context for platform message sending */
 interface SendMessageContext {
@@ -1279,6 +1338,12 @@ async function executeNodeInternal(
       tokens: nodeTokens,
     });
 
+    // Consume any gate result registered for this node (Phase 5 cascade engine
+    // calls recordGateResult before node completion). Always clear the map entry.
+    const gateResultKey = `${workflowRun.id}:${node.id}`;
+    const nodeGateResult = pendingGateResults.get(gateResultKey);
+    pendingGateResults.delete(gateResultKey);
+
     deps.store
       .createWorkflowEvent({
         workflow_run_id: workflowRun.id,
@@ -1313,6 +1378,10 @@ async function executeNodeInternal(
           // the frontier rung instead of where it actually ran. Omit-when-absent for tokens.
           entry_rung: deriveEntryRung(provider, nodeOptions?.model),
           ...(nodeTokens ? { frontier_cost_usd: computeFrontierCost(nodeTokens) } : {}),
+          // Layer 1 gate_result field (WO-HARNESS-LAYER1-CLIMB-AND-GATE-EVENTS-01).
+          // Present only when Phase 5 cascade engine registered a gate_result for
+          // this node via recordGateResult() before it completed.
+          ...buildGateResultField(nodeGateResult),
         },
       })
       .catch((err: Error) => {
@@ -1331,6 +1400,7 @@ async function executeNodeInternal(
       ...(nodeCostUsd !== undefined ? { costUsd: nodeCostUsd } : {}),
       ...(nodeStopReason ? { stopReason: nodeStopReason } : {}),
       ...(nodeNumTurns !== undefined ? { numTurns: nodeNumTurns } : {}),
+      ...buildGateResultField(nodeGateResult),
     });
 
     // Clean up throttle entries on completion
