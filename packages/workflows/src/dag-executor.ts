@@ -84,6 +84,7 @@ import { loadAgentRegistry, resolveAgent } from './agents/registry';
 import type { AgentRegistry } from './agents/registry';
 import { loadContext } from '@archon/persona-context-loader';
 import { deriveEntryRung, computeFrontierCost } from './model-rates';
+import type { GateResult } from './gate-result';
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
 let cachedLog: ReturnType<typeof createLogger> | undefined;
@@ -688,6 +689,9 @@ async function executeNodeInternal(
   issueContext?: string
 ): Promise<NodeExecutionResult> {
   const nodeStartTime = Date.now();
+  // Layer 1 gate result (WO-HARNESS-LAYER1-CLIMB-AND-GATE-EVENTS-01). Phase 5 cascade
+  // engine sets this before calling node_completed paths. Absent until then.
+  let nodeGateResult: GateResult | undefined;
   const nodeContext: SendMessageContext = { workflowId: workflowRun.id, nodeName: node.id };
 
   const configuredMcpNames = await loadConfiguredMcpServerNames(node.mcp, cwd);
@@ -1313,6 +1317,8 @@ async function executeNodeInternal(
           // the frontier rung instead of where it actually ran. Omit-when-absent for tokens.
           entry_rung: deriveEntryRung(provider, nodeOptions?.model),
           ...(nodeTokens ? { frontier_cost_usd: computeFrontierCost(nodeTokens) } : {}),
+          // Layer 1 gate result (WO-HARNESS-LAYER1-CLIMB-AND-GATE-EVENTS-01).
+          ...(nodeGateResult !== undefined ? { gate_result: nodeGateResult } : {}),
         },
       })
       .catch((err: Error) => {
@@ -1331,6 +1337,7 @@ async function executeNodeInternal(
       ...(nodeCostUsd !== undefined ? { costUsd: nodeCostUsd } : {}),
       ...(nodeStopReason ? { stopReason: nodeStopReason } : {}),
       ...(nodeNumTurns !== undefined ? { numTurns: nodeNumTurns } : {}),
+      ...(nodeGateResult !== undefined ? { gateResult: nodeGateResult } : {}),
     });
 
     // Clean up throttle entries on completion
@@ -1433,6 +1440,8 @@ async function executeBashNode(
   resolvedInputs?: Record<string, string>
 ): Promise<NodeOutput> {
   const nodeStartTime = Date.now();
+  // Layer 1 gate result (WO-HARNESS-LAYER1-CLIMB-AND-GATE-EVENTS-01). Absent until Phase 5.
+  let bashGateResult: GateResult | undefined;
   const nodeContext: SendMessageContext = { workflowId: workflowRun.id, nodeName: node.id };
 
   getLog().info({ nodeId: node.id, type: 'bash' }, 'dag_node_started');
@@ -1584,7 +1593,13 @@ async function executeBashNode(
         workflow_run_id: workflowRun.id,
         event_type: 'node_completed',
         step_name: node.id,
-        data: { duration_ms: duration, type: 'bash', node_output: output },
+        data: {
+          duration_ms: duration,
+          type: 'bash',
+          node_output: output,
+          // Layer 1 gate result (WO-HARNESS-LAYER1-CLIMB-AND-GATE-EVENTS-01).
+          ...(bashGateResult !== undefined ? { gate_result: bashGateResult } : {}),
+        },
       })
       .catch((err: Error) => {
         getLog().error(
@@ -1599,6 +1614,7 @@ async function executeBashNode(
       nodeId: node.id,
       nodeName: node.id,
       duration,
+      ...(bashGateResult !== undefined ? { gateResult: bashGateResult } : {}),
     });
 
     return { state: 'completed', output };
@@ -1681,6 +1697,8 @@ async function executeScriptNode(
   envVars?: Record<string, string>
 ): Promise<NodeOutput> {
   const nodeStartTime = Date.now();
+  // Layer 1 gate result (WO-HARNESS-LAYER1-CLIMB-AND-GATE-EVENTS-01). Absent until Phase 5.
+  let scriptGateResult: GateResult | undefined;
   const nodeContext: SendMessageContext = { workflowId: workflowRun.id, nodeName: node.id };
 
   getLog().info({ nodeId: node.id, type: 'script', runtime: node.runtime }, 'dag_node_started');
@@ -1909,7 +1927,13 @@ async function executeScriptNode(
         workflow_run_id: workflowRun.id,
         event_type: 'node_completed',
         step_name: node.id,
-        data: { duration_ms: duration, type: 'script', node_output: output },
+        data: {
+          duration_ms: duration,
+          type: 'script',
+          node_output: output,
+          // Layer 1 gate result (WO-HARNESS-LAYER1-CLIMB-AND-GATE-EVENTS-01).
+          ...(scriptGateResult !== undefined ? { gate_result: scriptGateResult } : {}),
+        },
       })
       .catch((err: Error) => {
         getLog().error(
@@ -1924,6 +1948,7 @@ async function executeScriptNode(
       nodeId: node.id,
       nodeName: node.id,
       duration,
+      ...(scriptGateResult !== undefined ? { gateResult: scriptGateResult } : {}),
     });
 
     return { state: 'completed', output };
@@ -2036,6 +2061,8 @@ async function executeLoopNode(
   workflowLevelOptions?: WorkflowLevelOptions
 ): Promise<NodeExecutionResult> {
   const loop = node.loop;
+  // Layer 1 gate result (WO-HARNESS-LAYER1-CLIMB-AND-GATE-EVENTS-01). Absent until Phase 5.
+  let loopGateResult: GateResult | undefined;
   const msgContext = { workflowId: workflowRun.id, nodeName: node.id };
 
   // Resolve AI client — fail fast with descriptive error
@@ -2560,6 +2587,8 @@ async function executeLoopNode(
             // (caller computes loopProvider = node.provider ?? workflowProvider).
             entry_rung: deriveEntryRung(workflowProvider, workflowModel),
             ...(loopTotalTokens ? { frontier_cost_usd: computeFrontierCost(loopTotalTokens) } : {}),
+            // Layer 1 gate result (WO-HARNESS-LAYER1-CLIMB-AND-GATE-EVENTS-01).
+            ...(loopGateResult !== undefined ? { gate_result: loopGateResult } : {}),
           },
         })
         .catch((err: Error) => {
@@ -2577,6 +2606,7 @@ async function executeLoopNode(
         ...(loopTotalCostUsd !== undefined ? { costUsd: loopTotalCostUsd } : {}),
         ...(loopFinalStopReason ? { stopReason: loopFinalStopReason } : {}),
         ...(loopTotalNumTurns !== undefined ? { numTurns: loopTotalNumTurns } : {}),
+        ...(loopGateResult !== undefined ? { gateResult: loopGateResult } : {}),
       });
       return {
         state: 'completed',

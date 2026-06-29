@@ -11,6 +11,7 @@
  */
 import { EventEmitter } from 'events';
 import type { ArtifactType } from './schemas';
+import type { GateResult } from './gate-result';
 import { createLogger } from '@archon/paths';
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
@@ -95,6 +96,8 @@ interface NodeCompletedEvent {
   costUsd?: number;
   stopReason?: string;
   numTurns?: number;
+  /** Structured gate outcome (Phase 3 Layer 1). Absent when no gate ran. */
+  gateResult?: GateResult;
 }
 
 interface NodeFailedEvent {
@@ -103,6 +106,8 @@ interface NodeFailedEvent {
   nodeId: string;
   nodeName: string;
   error: string;
+  /** Structured gate outcome (Phase 3 Layer 1). Absent when no gate ran. */
+  gateResult?: GateResult;
 }
 
 /**
@@ -170,6 +175,21 @@ interface WorkflowCancelledEvent {
   reason: string;
 }
 
+/**
+ * Emitted when a job escalates from one tier to another.
+ * Phase 3 Layer 1 data contract (WO-HARNESS-LAYER1-CLIMB-AND-GATE-EVENTS-01).
+ * Emit-site lives in cascade-step.ts; the cascade engine that fires it lands Phase 5.
+ */
+interface CascadeStepEvent {
+  type: 'cascade_step';
+  runId: string;
+  nodeId: string;
+  fromTier: string;
+  toTier: string;
+  failedGate: string;
+  reason: string;
+}
+
 export type WorkflowEmitterEvent =
   | WorkflowStartedEvent
   | WorkflowCompletedEvent
@@ -186,7 +206,8 @@ export type WorkflowEmitterEvent =
   | ToolStartedEvent
   | ToolCompletedEvent
   | ApprovalPendingEvent
-  | WorkflowCancelledEvent;
+  | WorkflowCancelledEvent
+  | CascadeStepEvent;
 
 // ---------------------------------------------------------------------------
 // Emitter class

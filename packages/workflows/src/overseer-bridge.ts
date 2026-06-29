@@ -21,6 +21,7 @@
  */
 
 import type { Logger } from '@archon/paths';
+import type { GateResult } from './gate-result';
 import { classifyError, decide, runEscalation, type Decision } from '@archon/overseer';
 import type { WorkflowRun, NodeOutput } from './schemas/workflow-run.ts';
 import type { DagNode } from './schemas/dag-node.ts';
@@ -73,6 +74,12 @@ export interface HandleNodeFailureContext {
   threadCommitsAhead?: number;
   /** Optional: whether the unique remote branch exists at origin (classifier discriminator). */
   hasOriginBranch?: boolean;
+  /**
+   * Optional structured gate outcome (Phase 3 Layer 1, WO-HARNESS-LAYER1-CLIMB-AND-GATE-EVENTS-01).
+   * Persisted into node_failed event data and forwarded on the emitter event.
+   * Absent until the cascade engine (Phase 5) sets it.
+   */
+  gate_result?: GateResult;
 }
 
 export interface HandleNodeFailureResult {
@@ -147,6 +154,8 @@ export async function handleNodeFailure(
         overseer_class: errorClass,
         overseer_decision: result.decision,
         ...(ctx.extraEventData ?? {}),
+        // Layer 1 gate result (WO-HARNESS-LAYER1-CLIMB-AND-GATE-EVENTS-01).
+        ...(ctx.gate_result !== undefined ? { gate_result: ctx.gate_result } : {}),
       },
     })
     .catch((err: Error) => {
@@ -162,6 +171,7 @@ export async function handleNodeFailure(
     nodeId: node.id,
     nodeName: node.command ?? node.id,
     error: ctx.errorMsg,
+    ...(ctx.gate_result !== undefined ? { gateResult: ctx.gate_result } : {}),
   });
 
   // Silent-dead-end escalation: fire 3 operator-visible signals (escalation.json
