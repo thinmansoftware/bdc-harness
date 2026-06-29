@@ -414,10 +414,10 @@ describe('POST /api/conversations with message (atomic create+send)', () => {
 
 // Regression tests for non-web adapter conversations (Gitea, GitHub forge adapters)
 // Platform conversation IDs from forge adapters contain slashes and # characters:
-// e.g. "CyberFitz-LLC/devops-platform#24" — these must be URL-encoded by the client
+// e.g. "CyberFitz-LLC/devops-platform#24" -- these must be URL-encoded by the client
 // and correctly decoded by the server route params.
 // Ref: https://github.com/coleam00/Archon/issues/476
-describe('GET /api/conversations/:id — forge platform IDs with encoded slashes', () => {
+describe('GET /api/conversations/:id -- forge platform IDs with encoded slashes', () => {
   const GITEA_CONV = {
     id: 'gitea-internal-uuid',
     platform_conversation_id: 'CyberFitz-LLC/devops-platform#24',

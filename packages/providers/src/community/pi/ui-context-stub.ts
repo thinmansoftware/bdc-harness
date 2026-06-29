@@ -27,7 +27,7 @@ export function createArchonUIBridge(): ArchonUIBridge {
 }
 
 const noop = (): void => {
-  /* no-op — TUI-only setter, nothing to paint into */
+  /* no-op -- TUI-only setter, nothing to paint into */
 };
 
 /**
@@ -35,12 +35,12 @@ const noop = (): void => {
  * (vs Pi's internal `noOpUIContext`) flips `ctx.hasUI` to true so extensions
  * like plannotator surface UI flows. `notify()` forwards to the event stream;
  * interactive prompts resolve to undefined/false; TUI setters no-op; `theme`
- * returns identity decorators — the styled strings get passed into no-op
+ * returns identity decorators -- the styled strings get passed into no-op
  * setStatus/setWidget sinks anyway, so stripping ANSI styling is safe and
  * keeps extensions like plannotator from crashing mid-tool-call.
  */
 export function createArchonUIContext(bridge: ArchonUIBridge): ExtensionUIContext {
-  // Pick the last string argument — handles `fg(color, text)`, `bold(text)`,
+  // Pick the last string argument -- handles `fg(color, text)`, `bold(text)`,
   // `strikethrough(text)`, etc. in a single handler.
   const lastStringArg = (...args: unknown[]): string => {
     for (let i = args.length - 1; i >= 0; i--) {
@@ -85,11 +85,11 @@ export function createArchonUIContext(bridge: ArchonUIBridge): ExtensionUIContex
     notify(message: string, type: 'info' | 'warning' | 'error' = 'info'): void {
       // Emit as `assistant` (not `system`) so the content is captured into
       // `$nodeId.output` for downstream bash/script nodes. System chunks are
-      // filtered to ⚠️/MCP-prefix only by the DAG executor.
-      // `flush: true` forces batch-mode adapters to surface this immediately —
+      // filtered to !/MCP-prefix only by the DAG executor.
+      // `flush: true` forces batch-mode adapters to surface this immediately --
       // extensions like plannotator print review URLs the user must act on
       // before the node unblocks, so we can't wait for node completion.
-      const icon = type === 'error' ? '❌' : type === 'warning' ? '⚠️' : 'ℹ️';
+      const icon = type === 'error' ? '[ ]' : type === 'warning' ? '!' : '';
       bridge.emit({
         type: 'assistant',
         content: `\n[pi extension ${icon}] ${message}\n`,

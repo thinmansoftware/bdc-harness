@@ -49,7 +49,7 @@ function resolveOutputRef(
     if (typeof value === 'string') return value;
     if (typeof value === 'number' || typeof value === 'boolean') return String(value);
     if (Array.isArray(value) || typeof value === 'object') return JSON.stringify(value);
-    return ''; // null, undefined, symbol, bigint → empty
+    return ''; // null, undefined, symbol, bigint -> empty
   } catch {
     getLog().warn(
       { nodeId, field, outputPreview: nodeOutput.output.slice(0, 100) },
@@ -140,8 +140,8 @@ function evaluateAtom(
  * Evaluate a condition expression (possibly compound) against upstream node outputs.
  *
  * @param expr - The when: expression string e.g. "$classify.output.type == 'BUG'"
- * @param nodeOutputs - Map of nodeId → NodeOutput for all settled upstream nodes (completed, failed, or skipped)
- * @returns `{ result: boolean; parsed: boolean }` — result is true to run the node, false to skip;
+ * @param nodeOutputs - Map of nodeId -> NodeOutput for all settled upstream nodes (completed, failed, or skipped)
+ * @returns `{ result: boolean; parsed: boolean }` -- result is true to run the node, false to skip;
  *   parsed is false when the expression could not be parsed (fail-closed: result defaults to false)
  */
 export function evaluateCondition(
@@ -150,11 +150,11 @@ export function evaluateCondition(
 ): { result: boolean; parsed: boolean } {
   const trimmed = expr.trim();
 
-  // Split on || — OR has lower precedence
+  // Split on || -- OR has lower precedence
   const orClauses = splitOutsideQuotes(trimmed, '||');
 
   for (const orClause of orClauses) {
-    // Split each OR clause on && — AND has higher precedence
+    // Split each OR clause on && -- AND has higher precedence
     const andAtoms = splitOutsideQuotes(orClause, '&&');
     let orClauseResult = true;
 

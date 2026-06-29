@@ -214,14 +214,14 @@ async function resolveProjectPaths(
 /**
  * Resolve the policy text for a workflow's declared `policyFile`.
  *
- * Approach B — Central resolver. Resolution order:
- *   1. Target worktree path (`<cwd>/<policyFile>`) — preserves backward
+ * Approach B -- Central resolver. Resolution order:
+ *   1. Target worktree path (`<cwd>/<policyFile>`) -- preserves backward
  *      compatibility when the file is checked in to the target repo (only
  *      `bdc-xo` ships it today).
- *   2. Bundled canonical policy (`BUNDLED_POLICIES[policyFile]`) — embedded at
+ *   2. Bundled canonical policy (`BUNDLED_POLICIES[policyFile]`) -- embedded at
  *      bundle time from `harness/policies/` in this repo. Keys are the verbatim
  *      `policyFile:` path string (e.g. `harness/policies/agent-behavior.md`).
- *   3. Throws — names both sources tried.
+ *   3. Throws -- names both sources tried.
  *
  * Rationale: Cauldron workflows declare `policyFile: harness/policies/agent-behavior.md`
  * but only `bdc-xo` actually ships that file. With local-only resolution every
@@ -252,7 +252,7 @@ async function applyWorkflowPolicyFile(
     policyContent = localContent;
     resolvedSource = 'local';
   } else {
-    // Local file absent — try the bundled canonical policy. The key is the
+    // Local file absent -- try the bundled canonical policy. The key is the
     // verbatim `policyFile:` path (matches the generator's POLICIES_KEY_PREFIX
     // convention in scripts/generate-bundled-defaults.ts).
     const bundled = BUNDLED_POLICIES[workflow.policyFile];
@@ -305,7 +305,7 @@ async function applyWorkflowPolicyFile(
  * Extract owner/repo from a git remote URL.
  * Handles HTTPS (github.com/owner/repo[.git]) and SSH (git@github.com:owner/repo[.git]).
  * Returns lowercase owner/repo or null if the URL cannot be parsed.
- * Rule 28 — anchor: 2026-05-16 cross-repo incident.
+ * Rule 28 -- anchor: 2026-05-16 cross-repo incident.
  */
 function normalizeRemoteToOwnerRepo(url: string): string | null {
   // SSH: git@github.com:owner/repo.git
@@ -363,7 +363,7 @@ export async function executeWorkflow(
   const configuredCommandFolder = config.commands.folder;
 
   // Auto-detect base branch when not configured. Config takes priority.
-  // If detection fails, leave empty — substituteWorkflowVariables throws only if $BASE_BRANCH is referenced.
+  // If detection fails, leave empty -- substituteWorkflowVariables throws only if $BASE_BRANCH is referenced.
   let baseBranch: string;
   if (config.baseBranch) {
     baseBranch = config.baseBranch;
@@ -385,7 +385,7 @@ export async function executeWorkflow(
 
   // Resolve provider and model once (used by all nodes).
   // Provider is explicit: node.provider ?? workflow.provider ?? config.assistant.
-  // Model strings pass through to the SDK as-is — the SDK validates at request time.
+  // Model strings pass through to the SDK as-is -- the SDK validates at request time.
   const resolvedProvider: string = workflow.provider ?? config.assistant;
   const providerSource = workflow.provider ? 'workflow definition' : 'config';
   if (!isRegisteredProvider(resolvedProvider)) {
@@ -420,7 +420,7 @@ export async function executeWorkflow(
 
   // Resume detection: check for prior failed run on same workflow + worktree
   {
-    // Step 1: Find prior failed run — non-critical, fall through on DB error
+    // Step 1: Find prior failed run -- non-critical, fall through on DB error
     let resumableRun: Awaited<ReturnType<typeof deps.store.findResumableRun>> = null;
     try {
       resumableRun = await deps.store.findResumableRun(workflow.name, cwd);
@@ -435,11 +435,11 @@ export async function executeWorkflow(
       await safeSendMessage(
         platform,
         conversationId,
-        '⚠️ Could not check for a prior run to resume (database error). Starting a fresh run instead.'
+        '! Could not check for a prior run to resume (database error). Starting a fresh run instead.'
       );
     }
 
-    // Step 2: Activate the resume — propagate as error if this fails
+    // Step 2: Activate the resume -- propagate as error if this fails
     if (resumableRun) {
       // Load completed node outputs from the prior run's events.
       let priorNodes: Map<string, string>;
@@ -457,16 +457,16 @@ export async function executeWorkflow(
           'workflow.dag_resume_node_outputs_failed'
         );
         // Intentional: fall back to empty map (fresh start) if prior node outputs can't be loaded.
-        // getCompletedDagNodeOutputs threw unexpectedly — safe to degrade rather than abort the run.
+        // getCompletedDagNodeOutputs threw unexpectedly -- safe to degrade rather than abort the run.
         priorNodes = new Map();
         await safeSendMessage(
           platform,
           conversationId,
-          '⚠️ Could not load prior node outputs for resume (database error). Starting a fresh run instead.'
+          '! Could not load prior node outputs for resume (database error). Starting a fresh run instead.'
         );
       }
       // Resume if there are completed nodes OR if the run has interactive loop state
-      // (a paused interactive loop may have no completed nodes yet — just the loop itself pausing)
+      // (a paused interactive loop may have no completed nodes yet -- just the loop itself pausing)
       const hasInteractiveLoopState =
         resumableRun.metadata?.approval &&
         (resumableRun.metadata.approval as Record<string, unknown>).type === 'interactive_loop';
@@ -509,8 +509,8 @@ export async function executeWorkflow(
           );
           const resumeMsg =
             priorNodes.size > 0
-              ? `▶️ **Resuming** workflow \`${workflow.name}\` — skipping ${String(priorNodes.size)} already-completed node(s).\n\nNote: AI session context from prior nodes is not restored. Nodes that depend on prior context may need to re-read artifacts.`
-              : `▶️ **Resuming** workflow \`${workflow.name}\` — continuing interactive loop.`;
+              ? ` **Resuming** workflow \`${workflow.name}\` -- skipping ${String(priorNodes.size)} already-completed node(s).\n\nNote: AI session context from prior nodes is not restored. Nodes that depend on prior context may need to re-read artifacts.`
+              : ` **Resuming** workflow \`${workflow.name}\` -- continuing interactive loop.`;
           await safeSendMessage(platform, conversationId, resumeMsg);
         } catch (error) {
           const err = error as Error;
@@ -520,7 +520,7 @@ export async function executeWorkflow(
           );
           // Release the pre-created lock token. Without this, preCreatedRun
           // sits as `pending` and blocks the path until the 5-min stale
-          // window — the user would see "in use by self" on retry.
+          // window -- the user would see "in use by self" on retry.
           if (preCreatedRun) {
             await deps.store
               .updateWorkflowRun(preCreatedRun.id, { status: 'cancelled' })
@@ -534,12 +534,12 @@ export async function executeWorkflow(
           await sendCriticalMessage(
             platform,
             conversationId,
-            '❌ **Workflow failed**: Found a prior run to resume but could not activate it (database error). Please try again later.'
+            '[ ] **Workflow failed**: Found a prior run to resume but could not activate it (database error). Please try again later.'
           );
           return { success: false, error: 'Database error resuming workflow run' };
         }
       } else {
-        // Found prior failed DAG run but no nodes completed — not worth resuming
+        // Found prior failed DAG run but no nodes completed -- not worth resuming
         getLog().info(
           { workflowRunId: resumableRun.id },
           'workflow.dag_resume_skipped_no_completed_nodes'
@@ -569,7 +569,7 @@ export async function executeWorkflow(
       await sendCriticalMessage(
         platform,
         conversationId,
-        '❌ **Workflow failed**: Unable to start workflow (database error). Please try again later.'
+        '[ ] **Workflow failed**: Unable to start workflow (database error). Please try again later.'
       );
       return { success: false, error: 'Database error creating workflow run' };
     }
@@ -577,7 +577,7 @@ export async function executeWorkflow(
 
   // Path-lock guard: ensure no other workflow run holds this working_path.
   //
-  // Skipped when `workflow.mutates_checkout` is false — the author asserts
+  // Skipped when `workflow.mutates_checkout` is false -- the author asserts
   // that concurrent runs will not race (e.g. all writes are per-run-scoped).
   //
   // Runs after workflowRun is finalized (pre-created, resumed, or freshly
@@ -594,7 +594,7 @@ export async function executeWorkflow(
       if (activeWorkflow) {
         // The lock query found another active row that wins the older-wins
         // tiebreaker. Mark our own row terminal so it falls out of the
-        // active set immediately — without this, our row sits as
+        // active set immediately -- without this, our row sits as
         // pending/running and blocks the path until the 5-min stale window
         // (or never, if we'd already promoted it to running via resume).
         await deps.store
@@ -611,29 +611,29 @@ export async function executeWorkflow(
         const shortId = activeWorkflow.id.slice(0, 8);
 
         // Status-aware copy. The lock query returns running, paused, and
-        // fresh-pending rows — telling the user to "wait for it to finish"
+        // fresh-pending rows -- telling the user to "wait for it to finish"
         // is wrong for `paused` (waiting on user action via approve/reject).
         let stateLine: string;
         let actionLines: string;
         if (activeWorkflow.status === 'paused') {
           stateLine = `paused waiting for user input (${duration} since started, run \`${shortId}\`)`;
           actionLines =
-            `• Approve it: \`/workflow approve ${shortId}\`\n` +
-            `• Reject it: \`/workflow reject ${shortId}\`\n` +
-            `• Cancel it: \`/workflow cancel ${shortId}\`\n` +
-            '• Use a different branch: `--branch <other>`';
+            `- Approve it: \`/workflow approve ${shortId}\`\n` +
+            `- Reject it: \`/workflow reject ${shortId}\`\n` +
+            `- Cancel it: \`/workflow cancel ${shortId}\`\n` +
+            '- Use a different branch: `--branch <other>`';
         } else {
           const verb = activeWorkflow.status === 'pending' ? 'starting' : 'running';
           stateLine = `${verb} ${duration}, run \`${shortId}\``;
           actionLines =
-            '• Wait for it to finish: `/workflow status`\n' +
-            `• Cancel it: \`/workflow cancel ${shortId}\`\n` +
-            '• Use a different branch: `--branch <other>`';
+            '- Wait for it to finish: `/workflow status`\n' +
+            `- Cancel it: \`/workflow cancel ${shortId}\`\n` +
+            '- Use a different branch: `--branch <other>`';
         }
         await sendCriticalMessage(
           platform,
           conversationId,
-          `❌ **This worktree is in use** by \`${activeWorkflow.workflow_name}\` ` +
+          `[ ] **This worktree is in use** by \`${activeWorkflow.workflow_name}\` ` +
             `(${stateLine}).\n${actionLines}`
         );
         return {
@@ -664,7 +664,7 @@ export async function executeWorkflow(
       await sendCriticalMessage(
         platform,
         conversationId,
-        '❌ **Workflow blocked**: Unable to verify if another workflow is running (database error). Please try again in a moment.'
+        '[ ] **Workflow blocked**: Unable to verify if another workflow is running (database error). Please try again in a moment.'
       );
       return { success: false, error: 'Database error checking for active workflow' };
     }
@@ -736,7 +736,7 @@ export async function executeWorkflow(
     await sendCriticalMessage(
       platform,
       conversationId,
-      `❌ **Workflow failed**: Could not create artifacts directory \`${artifactsDir}\`: ${err.message}`
+      `[ ] **Workflow failed**: Could not create artifacts directory \`${artifactsDir}\`: ${err.message}`
     );
     return {
       success: false,
@@ -795,7 +795,7 @@ export async function executeWorkflow(
         );
       });
 
-    // Set status to running now that execution has started (skip for resumed runs — already running)
+    // Set status to running now that execution has started (skip for resumed runs -- already running)
     if (!dagPriorCompletedNodes) {
       try {
         await deps.store.updateWorkflowRun(workflowRun.id, { status: 'running' });
@@ -832,7 +832,7 @@ export async function executeWorkflow(
         await sendCriticalMessage(
           platform,
           conversationId,
-          `📍 ${repoName} @ \`${branchName}\``,
+          ` ${repoName} @ \`${branchName}\``,
           workflowContext,
           2,
           { category: 'isolation_context', segment: 'new' }
@@ -864,7 +864,7 @@ export async function executeWorkflow(
       .join('\n')
       .trim();
     const descriptionText = cleanDescription || executableWorkflow.name;
-    startupMessage += `🚀 **Starting workflow**: \`${executableWorkflow.name}\`\n\n> ${descriptionText}`;
+    startupMessage += ` **Starting workflow**: \`${executableWorkflow.name}\`\n\n> ${descriptionText}`;
 
     // Send consolidated message - use critical send with limited retries (1 retry max)
     // to avoid blocking workflow execution while still catching transient failures
@@ -971,7 +971,7 @@ export async function executeWorkflow(
     const delivered = await sendCriticalMessage(
       platform,
       conversationId,
-      `❌ **Workflow failed**: ${err.message}`
+      `[ ] **Workflow failed**: ${err.message}`
     );
     if (!delivered) {
       getLog().error(
@@ -987,14 +987,14 @@ export async function executeWorkflow(
     // accumulation. Guards against any future code path that exits without
     // calling failWorkflowRun (e.g. a generator cleanup that exits without
     // throwing). Only fires when the process stays alive long enough to run
-    // this finally — see #1561 for the originating zombie-state incident.
+    // this finally -- see #1561 for the originating zombie-state incident.
     if (workflowRun) {
       const runId = workflowRun.id;
       const backstopStatus = await deps.store.getWorkflowRunStatus(runId).catch(() => null);
       if (backstopStatus === 'running') {
         getLog().warn({ workflowRunId: runId }, 'executor.backstop_triggered');
         await deps.store
-          .failWorkflowRun(runId, 'Workflow exited without finalizing — see logs')
+          .failWorkflowRun(runId, 'Workflow exited without finalizing -- see logs')
           .catch((err: unknown) => {
             getLog().error({ err, workflowRunId: runId }, 'executor.backstop_fail_failed');
           });

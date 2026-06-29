@@ -174,7 +174,7 @@ describe('isolationCompleteCommand', () => {
 
     expect(mockRemoveEnvironment).not.toHaveBeenCalled();
     expect(consoleErrorSpy).toHaveBeenCalledWith('  Blocked: dirty-branch');
-    expect(consoleErrorSpy).toHaveBeenCalledWith('    ✗ uncommitted changes in worktree');
+    expect(consoleErrorSpy).toHaveBeenCalledWith('    [ ] uncommitted changes in worktree');
     expect(consoleErrorSpy).toHaveBeenCalledWith('  Use --force to override.');
     expect(consoleLogSpy).toHaveBeenCalledWith('\nComplete: 0 completed, 1 failed, 0 not found');
   });
@@ -190,7 +190,9 @@ describe('isolationCompleteCommand', () => {
 
     expect(mockRemoveEnvironment).not.toHaveBeenCalled();
     expect(consoleErrorSpy).toHaveBeenCalledWith('  Blocked: feature-branch');
-    expect(consoleErrorSpy).toHaveBeenCalledWith('    ✗ running workflow: implement (id: run-abc)');
+    expect(consoleErrorSpy).toHaveBeenCalledWith(
+      '    [ ] running workflow: implement (id: run-abc)'
+    );
     expect(consoleErrorSpy).toHaveBeenCalledWith('  Use --force to override.');
     expect(consoleLogSpy).toHaveBeenCalledWith('\nComplete: 0 completed, 1 failed, 0 not found');
   });
@@ -213,7 +215,7 @@ describe('isolationCompleteCommand', () => {
     expect(mockRemoveEnvironment).not.toHaveBeenCalled();
     expect(consoleErrorSpy).toHaveBeenCalledWith('  Blocked: feature-branch');
     expect(consoleErrorSpy).toHaveBeenCalledWith(
-      '    ✗ open PR #140 — "fix: add metrics session_id"'
+      '    [ ] open PR #140 -- "fix: add metrics session_id"'
     );
     expect(consoleErrorSpy).toHaveBeenCalledWith('  Use --force to override.');
     expect(consoleLogSpy).toHaveBeenCalledWith('\nComplete: 0 completed, 1 failed, 0 not found');
@@ -238,7 +240,7 @@ describe('isolationCompleteCommand', () => {
 
     expect(mockRemoveEnvironment).not.toHaveBeenCalled();
     expect(consoleErrorSpy).toHaveBeenCalledWith('  Blocked: feature-branch');
-    expect(consoleErrorSpy).toHaveBeenCalledWith('    ✗ 2 commit(s) not merged into main');
+    expect(consoleErrorSpy).toHaveBeenCalledWith('    [ ] 2 commit(s) not merged into main');
     expect(consoleErrorSpy).toHaveBeenCalledWith('  Use --force to override.');
     expect(consoleLogSpy).toHaveBeenCalledWith('\nComplete: 0 completed, 1 failed, 0 not found');
   });
@@ -259,7 +261,7 @@ describe('isolationCompleteCommand', () => {
 
     expect(mockRemoveEnvironment).not.toHaveBeenCalled();
     expect(consoleErrorSpy).toHaveBeenCalledWith('  Blocked: feature-branch');
-    expect(consoleErrorSpy).toHaveBeenCalledWith('    ✗ 1 commit(s) not pushed to remote');
+    expect(consoleErrorSpy).toHaveBeenCalledWith('    [ ] 1 commit(s) not pushed to remote');
     expect(consoleErrorSpy).toHaveBeenCalledWith('  Use --force to override.');
     expect(consoleLogSpy).toHaveBeenCalledWith('\nComplete: 0 completed, 1 failed, 0 not found');
   });
@@ -280,7 +282,7 @@ describe('isolationCompleteCommand', () => {
 
     expect(mockRemoveEnvironment).not.toHaveBeenCalled();
     expect(consoleErrorSpy).toHaveBeenCalledWith('  Blocked: feature-branch');
-    expect(consoleErrorSpy).toHaveBeenCalledWith('    ✗ branch has never been pushed to remote');
+    expect(consoleErrorSpy).toHaveBeenCalledWith('    [ ] branch has never been pushed to remote');
     expect(consoleErrorSpy).toHaveBeenCalledWith('  Use --force to override.');
     expect(consoleLogSpy).toHaveBeenCalledWith('\nComplete: 0 completed, 1 failed, 0 not found');
   });
@@ -306,9 +308,11 @@ describe('isolationCompleteCommand', () => {
 
     expect(mockRemoveEnvironment).not.toHaveBeenCalled();
     expect(consoleErrorSpy).toHaveBeenCalledWith('  Blocked: feature-branch');
-    expect(consoleErrorSpy).toHaveBeenCalledWith('    ✗ uncommitted changes in worktree');
-    expect(consoleErrorSpy).toHaveBeenCalledWith('    ✗ running workflow: implement (id: run-abc)');
-    expect(consoleErrorSpy).toHaveBeenCalledWith('    ✗ open PR #140 — "fix: metrics"');
+    expect(consoleErrorSpy).toHaveBeenCalledWith('    [ ] uncommitted changes in worktree');
+    expect(consoleErrorSpy).toHaveBeenCalledWith(
+      '    [ ] running workflow: implement (id: run-abc)'
+    );
+    expect(consoleErrorSpy).toHaveBeenCalledWith('    [ ] open PR #140 -- "fix: metrics"');
     expect(consoleErrorSpy).toHaveBeenCalledWith('  Use --force to override.');
     expect(consoleLogSpy).toHaveBeenCalledWith('\nComplete: 0 completed, 1 failed, 0 not found');
   });
@@ -331,7 +335,7 @@ describe('isolationCompleteCommand', () => {
     await isolationCompleteCommand(['feature-branch'], { force: false, deleteRemote: true });
 
     expect(consoleWarnSpy).toHaveBeenCalledWith(
-      '  Warning: gh CLI not available — skipping open PR check'
+      '  Warning: gh CLI not available -- skipping open PR check'
     );
     // Should still complete since gh check is non-fatal
     expect(mockRemoveEnvironment).toHaveBeenCalled();
@@ -371,7 +375,7 @@ describe('isolationCompleteCommand', () => {
     await isolationCompleteCommand(['bad-branch'], { force: false, deleteRemote: true });
 
     expect(consoleErrorSpy).toHaveBeenCalledWith(
-      '  Failed: bad-branch — git error: cannot remove worktree'
+      '  Failed: bad-branch -- git error: cannot remove worktree'
     );
     expect(consoleLogSpy).toHaveBeenCalledWith('\nComplete: 0 completed, 1 failed, 0 not found');
   });
@@ -404,7 +408,7 @@ describe('isolationCompleteCommand', () => {
     await isolationCompleteCommand(['ghost-branch'], { force: true, deleteRemote: true });
 
     expect(consoleErrorSpy).toHaveBeenCalledWith(
-      '  Blocked: ghost-branch — has uncommitted changes'
+      '  Blocked: ghost-branch -- has uncommitted changes'
     );
     expect(consoleErrorSpy).toHaveBeenCalledWith('    Use --force to override.');
     expect(consoleLogSpy).toHaveBeenCalledWith('\nComplete: 0 completed, 1 failed, 0 not found');
@@ -422,9 +426,9 @@ describe('isolationCompleteCommand', () => {
     await isolationCompleteCommand(['partial-branch'], { force: true, deleteRemote: true });
 
     expect(consoleErrorSpy).toHaveBeenCalledWith(
-      '  Partial: partial-branch — worktree was not removed from disk (branch deleted, DB updated)'
+      '  Partial: partial-branch -- worktree was not removed from disk (branch deleted, DB updated)'
     );
-    expect(consoleErrorSpy).toHaveBeenCalledWith('    ⚠ Some warning');
+    expect(consoleErrorSpy).toHaveBeenCalledWith('    ! Some warning');
     expect(consoleLogSpy).toHaveBeenCalledWith('\nComplete: 0 completed, 1 failed, 0 not found');
   });
 

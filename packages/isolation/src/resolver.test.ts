@@ -117,7 +117,7 @@ describe('IsolationResolver', () => {
     });
   }
 
-  test('existing env valid — returns resolved with method existing', async () => {
+  test('existing env valid -- returns resolved with method existing', async () => {
     const env = makeEnvRow();
     const resolver = createResolver({
       store: makeMockStore({ getById: async () => env }),
@@ -137,7 +137,7 @@ describe('IsolationResolver', () => {
     }
   });
 
-  test('existing env stale (not on disk) — returns stale_cleaned', async () => {
+  test('existing env stale (not on disk) -- returns stale_cleaned', async () => {
     const env = makeEnvRow();
     worktreeExistsSpy.mockResolvedValue(false);
 
@@ -157,7 +157,7 @@ describe('IsolationResolver', () => {
     }
   });
 
-  test('existing env stale with no DB record — returns stale_cleaned', async () => {
+  test('existing env stale with no DB record -- returns stale_cleaned', async () => {
     worktreeExistsSpy.mockResolvedValue(false);
 
     const resolver = createResolver({
@@ -173,7 +173,7 @@ describe('IsolationResolver', () => {
     expect(result.status).toBe('stale_cleaned');
   });
 
-  test('no codebase — returns none', async () => {
+  test('no codebase -- returns none', async () => {
     const resolver = createResolver();
 
     const result = await resolver.resolve({
@@ -188,7 +188,7 @@ describe('IsolationResolver', () => {
     }
   });
 
-  test('workflow reuse — returns resolved with workflow_reuse method', async () => {
+  test('workflow reuse -- returns resolved with workflow_reuse method', async () => {
     const env = makeEnvRow();
     const resolver = createResolver({
       store: makeMockStore({
@@ -210,7 +210,7 @@ describe('IsolationResolver', () => {
     }
   });
 
-  test('linked issue reuse — returns resolved with issueNumber', async () => {
+  test('linked issue reuse -- returns resolved with issueNumber', async () => {
     const linkedEnv = makeEnvRow({
       id: 'env-linked',
       workflow_type: 'issue',
@@ -241,7 +241,7 @@ describe('IsolationResolver', () => {
     }
   });
 
-  test('PR branch adoption — returns resolved with branch_adoption', async () => {
+  test('PR branch adoption -- returns resolved with branch_adoption', async () => {
     findWorktreeByBranchSpy.mockResolvedValue('/worktrees/feature-branch' as git.WorktreePath);
 
     const adoptedEnv = makeEnvRow({
@@ -270,7 +270,7 @@ describe('IsolationResolver', () => {
     }
   });
 
-  test('create new — returns resolved with created method', async () => {
+  test('create new -- returns resolved with created method', async () => {
     const resolver = createResolver();
 
     const result = await resolver.resolve({
@@ -326,7 +326,7 @@ describe('IsolationResolver', () => {
     );
   });
 
-  test('creation error — returns blocked with creation_failed', async () => {
+  test('creation error -- returns blocked with creation_failed', async () => {
     const resolver = createResolver({
       provider: {
         ...makeMockProvider(),
@@ -377,7 +377,7 @@ describe('IsolationResolver', () => {
 
   test('findReusable marks stale DB record as destroyed when worktree gone', async () => {
     const env = makeEnvRow({ workflow_type: 'issue', workflow_id: '42' });
-    // worktreeExists returns false — worktree is gone
+    // worktreeExists returns false -- worktree is gone
     worktreeExistsSpy.mockResolvedValue(false);
 
     let updatedId: string | null = null;
@@ -417,7 +417,7 @@ describe('IsolationResolver', () => {
       working_path: '/worktrees/issue-10',
     });
 
-    // worktreeExists returns false — worktree is gone
+    // worktreeExists returns false -- worktree is gone
     worktreeExistsSpy.mockResolvedValue(false);
 
     let updatedId: string | null = null;
@@ -463,7 +463,7 @@ describe('IsolationResolver', () => {
       }),
     });
 
-    // Should not throw — cleanup errors are caught and logged
+    // Should not throw -- cleanup errors are caught and logged
     const result = await resolver.resolve({
       existingEnvId: null,
       codebase: defaultCodebase,
@@ -602,7 +602,7 @@ describe('IsolationResolver', () => {
           status: 'active',
           createdAt: new Date(),
           metadata: { adopted: false },
-          warnings: ['Config file could not be loaded — copyFiles not applied.'],
+          warnings: ['Config file could not be loaded -- copyFiles not applied.'],
         }),
       },
     });
@@ -616,7 +616,9 @@ describe('IsolationResolver', () => {
 
     expect(result.status).toBe('resolved');
     if (result.status === 'resolved') {
-      expect(result.warnings).toEqual(['Config file could not be loaded — copyFiles not applied.']);
+      expect(result.warnings).toEqual([
+        'Config file could not be loaded -- copyFiles not applied.',
+      ]);
     }
   });
 
@@ -695,7 +697,7 @@ describe('IsolationResolver', () => {
     ).toThrow('staleThresholdDays must be positive, got -1');
   });
 
-  test('existing env — emits warning when base branch mismatches', async () => {
+  test('existing env -- emits warning when base branch mismatches', async () => {
     const env = makeEnvRow();
     isAncestorOfSpy.mockResolvedValue(false);
     const resolver = createResolver({
@@ -716,7 +718,7 @@ describe('IsolationResolver', () => {
     }
   });
 
-  test('existing env — no warning when base branch matches', async () => {
+  test('existing env -- no warning when base branch matches', async () => {
     const env = makeEnvRow();
     isAncestorOfSpy.mockResolvedValue(true);
     const resolver = createResolver({
@@ -736,7 +738,7 @@ describe('IsolationResolver', () => {
     }
   });
 
-  test('workflow reuse — emits warning when base branch mismatches', async () => {
+  test('workflow reuse -- emits warning when base branch mismatches', async () => {
     const env = makeEnvRow();
     isAncestorOfSpy.mockResolvedValue(false);
     const resolver = createResolver({
@@ -760,7 +762,7 @@ describe('IsolationResolver', () => {
     }
   });
 
-  test('workflow reuse — no warning when base branch matches', async () => {
+  test('workflow reuse -- no warning when base branch matches', async () => {
     const env = makeEnvRow();
     isAncestorOfSpy.mockResolvedValue(true);
     const resolver = createResolver({
@@ -783,7 +785,7 @@ describe('IsolationResolver', () => {
     }
   });
 
-  test('existing env — no base branch check when baseBranch not in hints', async () => {
+  test('existing env -- no base branch check when baseBranch not in hints', async () => {
     const env = makeEnvRow();
     const resolver = createResolver({
       store: makeMockStore({ getById: async () => env }),
@@ -833,7 +835,7 @@ describe('IsolationResolver', () => {
         })
       ).rejects.toThrow(/belongs to a different clone/);
 
-      // DB row is preserved — it legitimately belongs to the other clone
+      // DB row is preserved -- it legitimately belongs to the other clone
       expect(updateStatusSpy).not.toHaveBeenCalled();
     });
 
@@ -842,7 +844,7 @@ describe('IsolationResolver', () => {
       const resolver = createResolver({
         store: makeMockStore({ findActiveByWorkflow: async () => env }),
       });
-      // Default ownership spy resolves — same-clone match
+      // Default ownership spy resolves -- same-clone match
 
       const result = await resolver.resolve({
         existingEnvId: null,
@@ -871,7 +873,7 @@ describe('IsolationResolver', () => {
       const updateStatusSpy = mock(() => Promise.resolve());
       const resolver = createResolver({
         store: makeMockStore({
-          // First path (findReusable) misses — no active env for requested workflowId
+          // First path (findReusable) misses -- no active env for requested workflowId
           // Second path (findLinkedIssueEnv) returns linkedEnv for issue 100
           findActiveByWorkflow: async (_c, type, id) =>
             type === 'issue' && id === '100' ? linkedEnv : null,
@@ -898,7 +900,7 @@ describe('IsolationResolver', () => {
         })
       ).rejects.toThrow(/belongs to a different clone/);
 
-      // Linked DB row preserved — belongs to the other clone
+      // Linked DB row preserved -- belongs to the other clone
       expect(updateStatusSpy).not.toHaveBeenCalled();
     });
 
@@ -915,7 +917,7 @@ describe('IsolationResolver', () => {
             type === 'issue' && id === '100' ? linkedEnv : null,
         }),
       });
-      // Default ownership spy resolves — same-clone match
+      // Default ownership spy resolves -- same-clone match
 
       const result = await resolver.resolve({
         existingEnvId: null,
@@ -966,7 +968,7 @@ describe('IsolationResolver', () => {
 
     test('tryBranchAdoption succeeds when discovered worktree belongs to the same clone', async () => {
       findWorktreeByBranchSpy.mockResolvedValue('/worktrees/feature-auth');
-      // Default ownership spy resolves — same-clone match
+      // Default ownership spy resolves -- same-clone match
 
       const resolver = createResolver();
 

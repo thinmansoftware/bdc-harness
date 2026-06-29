@@ -299,11 +299,11 @@ export class GitHubAdapter implements IPlatformAdapter {
    * Parse webhook event and extract relevant data
    *
    * Handles:
-   * - issues.closed / pull_request.closed → cleanup (isCloseEvent: true)
-   * - issue_comment.created → bot @mention detection
+   * - issues.closed / pull_request.closed -> cleanup (isCloseEvent: true)
+   * - issue_comment.created -> bot @mention detection
    *
    * Does NOT handle:
-   * - issues.opened / pull_request.opened → returns null (see #96)
+   * - issues.opened / pull_request.opened -> returns null (see #96)
    */
   private parseEvent(event: WebhookEvent): {
     owner: string;

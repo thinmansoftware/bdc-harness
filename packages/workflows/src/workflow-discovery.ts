@@ -7,12 +7,12 @@
  *
  * Imports parseWorkflow from loader.ts (parsing concern stays there).
  *
- * Scopes (precedence lowest → highest):
- *   1. `bundled` — embedded in the Archon binary (or read from the app's
+ * Scopes (precedence lowest -> highest):
+ *   1. `bundled` -- embedded in the Archon binary (or read from the app's
  *      defaults folder in source mode).
- *   2. `global`  — home-scoped at `~/.archon/workflows/`. Applies to every
+ *   2. `global`  -- home-scoped at `~/.archon/workflows/`. Applies to every
  *      repo; discovered automatically (no caller option needed).
- *   3. `project` — repo-local at `<cwd>/.archon/workflows/`.
+ *   3. `project` -- repo-local at `<cwd>/.archon/workflows/`.
  *
  * Same-named files at a higher scope override those at lower scopes.
  */
@@ -41,7 +41,7 @@ function getLog(): ReturnType<typeof createLogger> {
  * location. Scoped to the process so the warning fires exactly once regardless
  * of how many times discovery runs.
  *
- * The legacy path is ONLY probed for detection — workflows placed there are not
+ * The legacy path is ONLY probed for detection -- workflows placed there are not
  * read. Users migrate manually via the `mv` command printed in the warning.
  * Exported so tests can reset it between cases.
  */
@@ -62,13 +62,13 @@ async function maybeWarnLegacyHomePath(): Promise<void> {
     await access(legacyPath);
   } catch (error) {
     const err = error as NodeJS.ErrnoException;
-    if (err.code === 'ENOENT') return; // happy path — legacy location not in use
+    if (err.code === 'ENOENT') return; // happy path -- legacy location not in use
     // EACCES/EPERM/EIO: directory exists but we can't read it. Surface at WARN
-    // so the user sees it — silent debug would hide a real permission issue.
+    // so the user sees it -- silent debug would hide a real permission issue.
     getLog().warn({ err, legacyPath }, 'workflow.legacy_home_path_probe_error');
     return;
   }
-  // Legacy directory exists — surface an actionable migration hint exactly once.
+  // Legacy directory exists -- surface an actionable migration hint exactly once.
   const moveCommand = `mv "${legacyPath}" "${newPath}" && rmdir "${join(archonPaths.getArchonHome(), '.archon')}"`;
   getLog().warn({ legacyPath, newPath, moveCommand }, 'workflow.legacy_home_path_detected');
 }
@@ -82,7 +82,7 @@ interface DirLoadResult {
  * Maximum subfolder depth we descend into when discovering workflows/commands/scripts.
  *
  * `1` allows one level of grouping (e.g. `.archon/workflows/defaults/foo.yaml`);
- * `0` would mean only files at the root. We stop at 1 deliberately — deeper
+ * `0` would mean only files at the root. We stop at 1 deliberately -- deeper
  * nesting has never been part of the documented convention and adds no
  * organizational value, just routing ambiguity.
  */
@@ -197,16 +197,16 @@ function loadBundledWorkflows(): DirLoadResult {
  *
  * Loads three scopes in order (later overrides earlier by filename):
  *   1. Bundled defaults (unless `options.loadDefaults === false`).
- *   2. Home-scoped `~/.archon/workflows/` — classified as `source: 'global'`.
+ *   2. Home-scoped `~/.archon/workflows/` -- classified as `source: 'global'`.
  *      No caller option: every caller gets home-scoped discovery for free.
- *   3. Repo-scoped `<cwd>/.archon/workflows/` — classified as `source: 'project'`.
+ *   3. Repo-scoped `<cwd>/.archon/workflows/` -- classified as `source: 'project'`.
  *
  * When running as a compiled binary, bundled defaults are loaded from embedded
  * content. In source/dev mode they're loaded from the filesystem.
  *
  * Migration: if the retired `~/.archon/.archon/workflows/` path exists, the
  * first call per process logs a WARN with the exact `mv` command. The legacy
- * location is not read — users must migrate manually.
+ * location is not read -- users must migrate manually.
  */
 export async function discoverWorkflows(
   cwd: string,
@@ -259,7 +259,7 @@ export async function discoverWorkflows(
     }
   }
 
-  // 2. Load home-scoped workflows from ~/.archon/workflows/. No caller option —
+  // 2. Load home-scoped workflows from ~/.archon/workflows/. No caller option --
   // discovery is responsible for surfacing home-scoped content everywhere.
   await maybeWarnLegacyHomePath();
   const homeWorkflowPath = archonPaths.getHomeWorkflowsPath();
@@ -300,7 +300,7 @@ export async function discoverWorkflows(
     for (const [filename, workflow] of repoResult.workflows) {
       const existing = workflowsByFile.get(filename);
       if (existing?.source === 'bundled') {
-        // This file was already loaded as a bundled default — the repo's defaults/
+        // This file was already loaded as a bundled default -- the repo's defaults/
         // subdirectory is re-discovering it. Keep the bundled source label.
         getLog().debug({ filename }, 'repo_default_preserves_bundled_source');
         workflowsByFile.set(filename, { workflow, source: 'bundled' });

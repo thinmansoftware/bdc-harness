@@ -225,7 +225,7 @@ concurrency:
 
       expect(config.assistant).toBe('claude');
       // Built-ins always present; community providers (like `pi`) are
-      // seeded dynamically from the registry — check the built-ins
+      // seeded dynamically from the registry -- check the built-ins
       // explicitly rather than asserting an exhaustive shape.
       expect(config.assistants.claude).toEqual({});
       expect(config.assistants.codex).toEqual({});

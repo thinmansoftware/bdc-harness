@@ -129,7 +129,7 @@ function makeDeps(store?: IWorkflowStore): WorkflowDeps {
   } as unknown as WorkflowDeps;
 }
 
-/** Minimal DAG workflow fixture — the preamble doesn't care about node details */
+/** Minimal DAG workflow fixture -- the preamble doesn't care about node details */
 function makeWorkflow(overrides: Partial<WorkflowDefinition> = {}): WorkflowDefinition {
   return {
     name: 'test-workflow',
@@ -217,7 +217,7 @@ describe('executeWorkflow preamble', () => {
 
       // The guard now runs AFTER the row is created (so it always has a
       // self-ID to exclude). On guard fire, the just-created row is marked
-      // cancelled — preventing zombie pending rows that would block future
+      // cancelled -- preventing zombie pending rows that would block future
       // dispatches.
       expect((store.createWorkflowRun as ReturnType<typeof mock>).mock.calls.length).toBe(1);
       const cancelCall = updateSpy.mock.calls.find(
@@ -301,7 +301,7 @@ describe('executeWorkflow preamble', () => {
       expect(result.error).toContain('Database error');
 
       // The row is created BEFORE the guard runs (so the guard can exclude
-      // self). When the lock query throws, we abort early — the just-created
+      // self). When the lock query throws, we abort early -- the just-created
       // row stays as 'pending' and falls out via the 5-min stale window.
       expect((store.createWorkflowRun as ReturnType<typeof mock>).mock.calls.length).toBe(1);
 
@@ -340,7 +340,7 @@ describe('executeWorkflow preamble', () => {
         'db-conv-id'
       );
 
-      // No createWorkflowRun — resume used existing run
+      // No createWorkflowRun -- resume used existing run
       expect((store.createWorkflowRun as ReturnType<typeof mock>).mock.calls.length).toBe(0);
 
       // resumeWorkflowRun was called with the prior run ID
@@ -380,7 +380,7 @@ describe('executeWorkflow preamble', () => {
         'db-conv-id'
       );
 
-      // No createWorkflowRun — resume used existing run
+      // No createWorkflowRun -- resume used existing run
       expect((store.createWorkflowRun as ReturnType<typeof mock>).mock.calls.length).toBe(0);
 
       // resumeWorkflowRun was called with the prior run ID

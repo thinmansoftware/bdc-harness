@@ -14,7 +14,7 @@ export interface PiModelRef {
 /**
  * Parse a Pi model ref. Splits on the FIRST '/' so that namespaced model ids
  * under providers like OpenRouter work:
- *   'openrouter/qwen/qwen3-coder' → { provider: 'openrouter', modelId: 'qwen/qwen3-coder' }
+ *   'openrouter/qwen/qwen3-coder' -> { provider: 'openrouter', modelId: 'qwen/qwen3-coder' }
  *
  * Returns undefined for malformed refs so callers can surface clear errors.
  */

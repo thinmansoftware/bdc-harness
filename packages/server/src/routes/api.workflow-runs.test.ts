@@ -542,7 +542,7 @@ describe('POST /api/workflows/:name/run', () => {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ conversationId: 'web-test-abc', message: 'Test' }),
     });
-    // Hono routes won't match ../secret as /:name due to path normalization — either 400 or 404
+    // Hono routes won't match ../secret as /:name due to path normalization -- either 400 or 404
     expect([400, 404]).toContain(response.status);
   });
 
@@ -1129,7 +1129,7 @@ describe('GET /api/workflows/runs', () => {
   // so these tests set/unset MAX20X_WINDOW_TOKENS inline within each case and
   // rely on that design for the override to take effect without mock.module()
   // or a separate process. windowTokens comes from a SEPARATE DB call
-  // (sumWorkflowTokensInWindow) — independent of the runs-page LIMIT — so
+  // (sumWorkflowTokensInWindow) -- independent of the runs-page LIMIT -- so
   // these tests stub that mock rather than computing from the listed runs.
 
   test('Scenario 5A -- quotaWindow includes windowTokens + windowBudget when MAX20X_WINDOW_TOKENS configured', async () => {
@@ -1149,7 +1149,7 @@ describe('GET /api/workflows/runs', () => {
       started_at: recent,
     };
     mockListWorkflowRuns.mockImplementationOnce(async () => [runWithTokens, runWithTokens2]);
-    // Authoritative quota sum comes from the DB aggregation — independent of
+    // Authoritative quota sum comes from the DB aggregation -- independent of
     // the page-of-runs.
     mockSumWorkflowTokensInWindow.mockImplementationOnce(async () => 2000);
 
@@ -1230,7 +1230,7 @@ describe('GET /api/workflows/runs', () => {
       started_at: recent,
     };
     mockListWorkflowRuns.mockImplementationOnce(async () => [pageRun]);
-    // The DB aggregation knows about runs outside the page — it returns the
+    // The DB aggregation knows about runs outside the page -- it returns the
     // authoritative full-window total.
     mockSumWorkflowTokensInWindow.mockImplementationOnce(async () => 5000);
 
@@ -1275,7 +1275,7 @@ describe('GET /api/workflows/runs', () => {
 
     const { app } = makeApp();
     const response = await app.request('/api/workflows/runs');
-    // The runs list must still succeed — the quota line is auxiliary.
+    // The runs list must still succeed -- the quota line is auxiliary.
     expect(response.status).toBe(200);
     const body = (await response.json()) as {
       runs: Array<{ id: string }>;
@@ -2269,7 +2269,7 @@ describe('approve/reject auto-resume', () => {
     const body = (await response.json()) as { message: string };
     expect(body.message).toContain('Resuming workflow');
 
-    // dispatchToOrchestrator → lockManager → handleMessage
+    // dispatchToOrchestrator -> lockManager -> handleMessage
     expect(mockHandleMessage).not.toHaveBeenCalled();
     expect(mockExecuteWorkflow).toHaveBeenCalledWith(
       expect.anything(),
@@ -2328,7 +2328,7 @@ describe('approve/reject auto-resume', () => {
 
   test('approve: skips dispatch when parent conversation is on a non-web platform', async () => {
     // A Slack/Telegram/GitHub-sourced run being approved via the dashboard
-    // must not route through dispatchToOrchestrator — that helper is wired
+    // must not route through dispatchToOrchestrator -- that helper is wired
     // to the web adapter + lock manager, so dispatching a Slack thread_ts
     // or Telegram chat_id would misroute through the wrong adapter.
     mockGetWorkflowRun.mockResolvedValueOnce({
@@ -2350,7 +2350,7 @@ describe('approve/reject auto-resume', () => {
 
     expect(response.status).toBe(200);
     const body = (await response.json()) as { message: string };
-    // Same fallback text as no-parent case — user re-runs from the originating platform.
+    // Same fallback text as no-parent case -- user re-runs from the originating platform.
     expect(body.message).toContain('Send a message to continue');
     expect(mockHandleMessage).not.toHaveBeenCalled();
   });
@@ -2424,7 +2424,7 @@ describe('approve/reject auto-resume', () => {
   test('reject: does NOT dispatch when the run is being cancelled (no on_reject configured)', async () => {
     mockGetWorkflowRun.mockResolvedValueOnce({
       ...MOCK_PAUSED_RUN,
-      parent_conversation_id: 'parent-conv-uuid', // set, but doesn't matter — reject cancels
+      parent_conversation_id: 'parent-conv-uuid', // set, but doesn't matter -- reject cancels
     });
 
     const { app } = makeApp();
@@ -2435,7 +2435,7 @@ describe('approve/reject auto-resume', () => {
     });
 
     expect(response.status).toBe(200);
-    // Cancellation path doesn't auto-resume — nothing to resume to.
+    // Cancellation path doesn't auto-resume -- nothing to resume to.
     expect(mockHandleMessage).not.toHaveBeenCalled();
     expect(mockCancelWorkflowRun).toHaveBeenCalledWith('run-paused-1');
   });

@@ -35,15 +35,15 @@ function readLastRefresh(filePath: string): number | undefined {
  * Codex soft-refresh (Layer 4).
  *
  * OpenAI's documented refresh pattern (developers.openai.com/codex/auth/ci-cd-auth)
- * is "run Codex and persist the updated auth.json" — explicitly NOT "call the
+ * is "run Codex and persist the updated auth.json" -- explicitly NOT "call the
  * refresh API yourself." This function honors that guidance by letting the
  * Codex binary run its internal OAuth refresh path on a cheap invocation,
  * then checking whether auth.json.last_refresh advanced.
  *
  * Returns:
- *   true  — the binary advanced last_refresh (it self-refreshed). Caller can
+ *   true  -- the binary advanced last_refresh (it self-refreshed). Caller can
  *           skip the manual direct-POST refresh path.
- *   false — last_refresh did not advance (the binary didn't refresh, or it
+ *   false -- last_refresh did not advance (the binary didn't refresh, or it
  *           failed silently). Caller should fall back to refreshIfAuthFailed.
  *
  * Never throws. Spawn failures, timeouts, and parse errors all return false.
@@ -52,7 +52,7 @@ export async function softRefreshCodex(): Promise<boolean> {
   const filePath = credentialsPath();
   const before = readLastRefresh(filePath);
   if (before === undefined) {
-    // No auth.json or no last_refresh field — nothing for soft-refresh to do.
+    // No auth.json or no last_refresh field -- nothing for soft-refresh to do.
     return false;
   }
 
@@ -113,7 +113,7 @@ export async function softRefreshCodex(): Promise<boolean> {
 
   const after = readLastRefresh(filePath);
   if (after === undefined || after <= before) {
-    // Binary ran but did not advance last_refresh — either auth was already
+    // Binary ran but did not advance last_refresh -- either auth was already
     // fresh AND a no-op command like `--version` doesn't touch the auth
     // manager, OR the binary tried to refresh and failed silently. Either
     // way, caller falls back to refreshIfAuthFailed.

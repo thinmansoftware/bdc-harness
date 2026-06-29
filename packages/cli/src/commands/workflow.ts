@@ -81,7 +81,7 @@ function generateConversationId(): string {
 /**
  * Parses the "Source symlink at X already points to Y, expected Z" error
  * thrown by `createProjectSourceSymlink` in @archon/paths. Cross-package
- * string contract — if that throw site changes wording, this parser silently
+ * string contract -- if that throw site changes wording, this parser silently
  * stops matching. Returns the workspace dir (parent of the `source` link) so
  * the caller can emit an exact cleanup path, or null if unrecognized.
  */
@@ -112,7 +112,7 @@ function buildRegistrationFailureError(action: string, error: Error): Error {
     hint = `Hint: Remove the stale workspace entry at ${staleWorkspaceEntry} and retry, or use --no-worktree to skip isolation.`;
   } else {
     // Guard against a throwing getArchonHome() (misconfigured env vars, etc.):
-    // the registration error we're wrapping is the load-bearing one — we'd
+    // the registration error we're wrapping is the load-bearing one -- we'd
     // rather lose the exact path in the hint than replace it with a secondary
     // home-resolution error that masks the root cause.
     try {
@@ -171,7 +171,7 @@ function renderWorkflowEvent(event: WorkflowEmitterEvent, verbose: boolean): voi
  */
 async function loadWorkflows(cwd: string): Promise<WorkflowLoadResult> {
   try {
-    // Home-scoped workflows at ~/.archon/workflows/ are discovered automatically —
+    // Home-scoped workflows at ~/.archon/workflows/ are discovered automatically --
     // no option needed since the discovery helper reads them unconditionally.
     return await discoverWorkflowsWithConfig(cwd, loadConfig);
   } catch (error) {
@@ -289,7 +289,7 @@ export async function workflowRunCommand(
     );
   }
 
-  // Validate mutually exclusive flags (defensive — cli.ts checks these for UX, but
+  // Validate mutually exclusive flags (defensive -- cli.ts checks these for UX, but
   // workflowRunCommand is the authoritative boundary for programmatic callers)
   if (options.branchName !== undefined && options.noWorktree) {
     throw new Error(
@@ -314,7 +314,7 @@ export async function workflowRunCommand(
   }
 
   // Reconcile workflow-level worktree policy with invocation flags.
-  // The workflow YAML's `worktree.enabled` pins isolation regardless of caller —
+  // The workflow YAML's `worktree.enabled` pins isolation regardless of caller --
   // a mismatch between policy and flags is a user error we surface loudly
   // rather than silently applying one side and ignoring the other.
   const pinnedEnabled = workflow.worktree?.enabled;
@@ -333,7 +333,7 @@ export async function workflowRunCommand(
           "  Drop --from or change the workflow's worktree.enabled."
       );
     }
-    // --no-worktree is redundant but not contradictory — silently accept.
+    // --no-worktree is redundant but not contradictory -- silently accept.
   } else if (pinnedEnabled === true) {
     if (options.noWorktree) {
       throw new Error(
@@ -398,7 +398,7 @@ export async function workflowRunCommand(
         { err, errorType: err.constructor.name, codebaseId: options.codebaseId },
         'cli.codebase_id_lookup_failed'
       );
-      // Intentional: don't set codebaseLookupError — fall through to auto-registration
+      // Intentional: don't set codebaseLookupError -- fall through to auto-registration
     }
   }
 
@@ -492,7 +492,7 @@ export async function workflowRunCommand(
   }
 
   // Default to worktree isolation unless --no-worktree or --resume.
-  // Workflow YAML `worktree.enabled` pins the decision — mismatches with CLI
+  // Workflow YAML `worktree.enabled` pins the decision -- mismatches with CLI
   // flags are rejected above, so by this point the policy (if set) and flags
   // agree. `--resume` reuses an existing worktree and takes precedence over
   // the pinned policy to avoid disturbing a paused run.
@@ -528,7 +528,7 @@ export async function workflowRunCommand(
             `--from ${options.fromBranch} was not applied (worktree already exists).`
         );
       }
-      // Validate base branch before reuse (warning-only — non-blocking)
+      // Validate base branch before reuse (warning-only -- non-blocking)
       try {
         const repoConfig = await loadRepoConfig(codebase.default_cwd);
         const rawBase = repoConfig?.worktree?.baseBranch;
@@ -551,7 +551,7 @@ export async function workflowRunCommand(
         }
       } catch (e) {
         getLog().debug({ err: e }, 'worktree.reuse_base_branch_check_skipped');
-        // Non-blocking — skip warning if base branch cannot be determined
+        // Non-blocking -- skip warning if base branch cannot be determined
       }
       getLog().info({ path: existingEnv.working_path }, 'worktree_reused');
       workingCwd = existingEnv.working_path;
@@ -593,7 +593,7 @@ export async function workflowRunCommand(
   } else if (options.noWorktree) {
     getLog().info({ cwd }, 'workflow.running_without_isolation');
   } else if (wantsIsolation) {
-    // Isolation was expected (default) but codebase is unavailable — fail fast
+    // Isolation was expected (default) but codebase is unavailable -- fail fast
     if (codebaseLookupError) {
       throw new Error(
         'Cannot create worktree: database lookup failed.\n' +
@@ -677,7 +677,7 @@ export async function workflowRunCommand(
   });
 
   // Subscribe to workflow events for progress rendering on stderr.
-  // subscribeForConversation is pure in-memory registration — cannot throw in practice.
+  // subscribeForConversation is pure in-memory registration -- cannot throw in practice.
   // If that changes, this should be moved inside the try block to prevent blocking executeWorkflow.
   const { quiet, verbose } = options;
   const unsubscribe = quiet
@@ -689,7 +689,7 @@ export async function workflowRunCommand(
   // Notify Web UI that a workflow is dispatching.
   // Mirrors the orchestrator dispatch message structure (category/segment/workflowDispatch),
   // but omits the rocket emoji and "(background)" qualifier since the CLI runs synchronously.
-  // In the CLI path there is no separate worker conversation — the CLI itself
+  // In the CLI path there is no separate worker conversation -- the CLI itself
   // is both the dispatcher and the executor, so workerConversationId === conversationId.
   try {
     await adapter.sendMessage(conversationId, `Dispatching workflow: **${workflow.name}**`, {
@@ -723,7 +723,7 @@ export async function workflowRunCommand(
 
   // Check result and exit appropriately
   if (result.success && 'paused' in result && result.paused) {
-    console.log('\nWorkflow paused — waiting for approval.');
+    console.log('\nWorkflow paused -- waiting for approval.');
   } else if (result.success) {
     // Surface workflow result to Web UI as a result card (mirrors orchestrator.ts result message).
     // Paused workflows are handled in the branch above and intentionally do not get a result card.
@@ -751,7 +751,7 @@ export async function workflowRunCommand(
  * Format age of a run from started_at to now.
  */
 function formatAge(startedAt: Date | string): string {
-  // SQLite returns UTC strings without Z suffix — append it so Date parses as UTC
+  // SQLite returns UTC strings without Z suffix -- append it so Date parses as UTC
   const date =
     startedAt instanceof Date
       ? startedAt
@@ -900,12 +900,12 @@ export async function workflowStatusCommand(json?: boolean, verbose?: boolean): 
         console.log('  Nodes:');
         for (const node of nodes) {
           const iconMap: Record<string, string> = {
-            completed: '✓',
-            failed: '✗',
+            completed: '[x]',
+            failed: '[ ]',
             skipped: '-',
-            running: '◌',
+            running: '',
           };
-          const icon = iconMap[node.state] ?? '◌';
+          const icon = iconMap[node.state] ?? '';
           const duration =
             node.durationMs !== undefined ? ` (${formatDuration(node.durationMs)})` : '';
           const stateLabel = node.state === 'running' ? ' (running)' : '';
@@ -927,7 +927,7 @@ export async function workflowStatusCommand(json?: boolean, verbose?: boolean): 
 /**
  * Resume a failed workflow run by ID.
  *
- * Re-executes the workflow with --resume semantics — the executor's
+ * Re-executes the workflow with --resume semantics -- the executor's
  * findResumableRun picks up the prior failed run and skips completed nodes.
  */
 export async function workflowResumeCommand(runId: string): Promise<void> {
@@ -1123,7 +1123,7 @@ export async function workflowEventEmitCommand(
     event_type: eventType,
     data,
   });
-  // createWorkflowEvent is non-throwing (fire-and-forget) — the event may not
+  // createWorkflowEvent is non-throwing (fire-and-forget) -- the event may not
   // have been persisted if the DB was unavailable. Check server logs if missing.
   console.log(`Event submitted (best-effort): ${eventType} for run ${runId}`);
 }

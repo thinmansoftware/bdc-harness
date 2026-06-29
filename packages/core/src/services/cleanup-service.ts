@@ -548,11 +548,11 @@ export async function cleanupStaleWorktrees(
 
 /**
  * Decide whether a branch is safe to remove using a union of signals:
- *   (a) git ancestry  — `git branch --merged` (catches fast-forward / merge-commit)
- *   (b) git cherry    — patch-equivalent commits (catches squash-merge)
- *   (c) GitHub PR state via `gh` CLI — MERGED/CLOSED/OPEN
+ *   (a) git ancestry  -- `git branch --merged` (catches fast-forward / merge-commit)
+ *   (b) git cherry    -- patch-equivalent commits (catches squash-merge)
+ *   (c) GitHub PR state via `gh` CLI -- MERGED/CLOSED/OPEN
  *
- * Returns `{ safe, openPr }`. `openPr=true` only when the PR state is OPEN —
+ * Returns `{ safe, openPr }`. `openPr=true` only when the PR state is OPEN --
  * callers use this to surface a clearer skip reason.
  */
 async function isSafeToRemove(
@@ -562,7 +562,7 @@ async function isSafeToRemove(
   prStateCache: Map<string, PrState>,
   includeClosed: boolean
 ): Promise<{ safe: boolean; openPr: boolean }> {
-  // (a) Fast path — fast-forward / merge-commit ancestry
+  // (a) Fast path -- fast-forward / merge-commit ancestry
   if (await isBranchMerged(repoPath, branchName, mainBranch)) {
     return { safe: true, openPr: false };
   }

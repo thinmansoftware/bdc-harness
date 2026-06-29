@@ -3,7 +3,7 @@
  *
  * Uses spyOn for `@archon/git.execFileAsync` and `globalThis.fetch`.
  * `BUNDLED_IS_BINARY` is a static const re-export and cannot be spied at
- * runtime — `checkClaudeBinary` accepts it as an injectable parameter for
+ * runtime -- `checkClaudeBinary` accepts it as an injectable parameter for
  * testability. Avoids `mock.module()` because it is process-global and
  * irreversible in Bun, which would pollute other test files in this package.
  */
@@ -333,10 +333,10 @@ describe('doctorCommand', () => {
     const exit = await doctorCommand([throwing('A'), passing('B'), failing('C')]);
     // 1 throw + 1 fail = 2 failures, but exit code is still 1.
     expect(exit).toBe(1);
-    // Verify all three were rendered (one per ✓/✗/unknown line).
+    // Verify all three were rendered (one per [x]/[ ]/unknown line).
     const renderedLines = logSpy.mock.calls
       .map(args => String(args[0] ?? ''))
-      .filter(s => s.startsWith('✓') || s.startsWith('✗') || s.startsWith('○'));
+      .filter(s => s.startsWith('[x]') || s.startsWith('[ ]') || s.startsWith(''));
     expect(renderedLines.length).toBeGreaterThanOrEqual(2);
   });
 });

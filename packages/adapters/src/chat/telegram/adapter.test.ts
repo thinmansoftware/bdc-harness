@@ -133,7 +133,7 @@ describe('TelegramAdapter', () => {
 
       await adapter.sendMessage('55555', message);
 
-      // Two separate sendMessage calls — one per paragraph chunk
+      // Two separate sendMessage calls -- one per paragraph chunk
       expect(mockSendMessage).toHaveBeenCalledTimes(2);
       // First call has parse_mode: MarkdownV2
       expect(mockSendMessage).toHaveBeenNthCalledWith(
@@ -162,7 +162,7 @@ describe('TelegramAdapter', () => {
       expect(mockSendMessage).toHaveBeenCalledTimes(2);
       // Second call has no parse_mode (plain text)
       const secondCall = mockSendMessage.mock.calls[1];
-      expect(secondCall.length).toBe(2); // (id, text) — no options object
+      expect(secondCall.length).toBe(2); // (id, text) -- no options object
     });
   });
 
@@ -252,7 +252,7 @@ describe('TelegramAdapter', () => {
 
     test('should retry on 409 and succeed on second attempt', async () => {
       const adapter = new TelegramAdapter('fake-token-for-testing');
-      // grammY's start() resolves when bot stops, not when started — onStart fires on startup
+      // grammY's start() resolves when bot stops, not when started -- onStart fires on startup
       const mockStart = mock<
         (opts?: { drop_pending_updates?: boolean; onStart?: () => void }) => Promise<void>
       >()

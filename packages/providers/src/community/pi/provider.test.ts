@@ -3,14 +3,14 @@ import type { AgentSessionEvent } from '@mariozechner/pi-coding-agent';
 
 import { createMockLogger } from '../../test/mocks/logger';
 
-// ─── Mock @archon/paths logger so provider instantiation is quiet ───────
+// --- Mock @archon/paths logger so provider instantiation is quiet -------
 
 const mockLogger = createMockLogger();
 mock.module('@archon/paths', () => ({
   createLogger: mock(() => mockLogger),
 }));
 
-// ─── Mock Pi SDK surface ────────────────────────────────────────────────
+// --- Mock Pi SDK surface ------------------------------------------------
 //
 // Pi's `createAgentSession` returns a session whose `subscribe(listener)`
 // stores a callback, and whose `prompt(text)` drives events through that
@@ -19,7 +19,7 @@ mock.module('@archon/paths', () => ({
 // sequence synchronously.
 
 // Typed against Pi's actual event union so tests fail at compile time when
-// Pi renames a field (e.g. `assistantMessageEvent` → `amEvent`) rather than
+// Pi renames a field (e.g. `assistantMessageEvent` -> `amEvent`) rather than
 // silently passing while production drifts. Using `as AgentSessionEvent` at
 // the call site covers the cases where we construct partial message objects.
 type FakeEvent = AgentSessionEvent;
@@ -70,7 +70,7 @@ const mockSetRuntimeApiKey = mock((providerId: string, key: string) => {
   runtimeOverrides[providerId] = key;
 });
 const mockGetApiKey = mock(async (providerId: string): Promise<string | undefined> => {
-  // Mirror Pi's resolution: runtime → file api_key → file oauth → env var
+  // Mirror Pi's resolution: runtime -> file api_key -> file oauth -> env var
   if (runtimeOverrides[providerId]) return runtimeOverrides[providerId];
   const cred = fileCreds[providerId];
   if (cred?.type === 'api_key') return cred.key;
@@ -111,13 +111,13 @@ const mockSettingsManagerInMemory = mock((_settings?: unknown) => ({}));
 const mockResourceLoaderReload = mock(async () => undefined);
 // Return-style constructor: bun's mock() wraps the function such that the
 // `this`-binding doesn't reliably propagate to `new` call sites. Returning a
-// plain object from the constructor sidesteps this — ES semantics use the
+// plain object from the constructor sidesteps this -- ES semantics use the
 // returned object when a constructor explicitly returns one.
 const MockDefaultResourceLoader = mock((_opts: unknown) => ({
   reload: mockResourceLoaderReload,
 }));
 
-// Tool factory mocks — each returns an opaque object tagged with the tool
+// Tool factory mocks -- each returns an opaque object tagged with the tool
 // name so assertions can verify which tools the provider selected.
 const mockCreateReadTool = mock((_cwd: string) => ({ __piTool: 'read' }));
 const mockCreateBashTool = mock((_cwd: string, _options?: unknown) => ({ __piTool: 'bash' }));
@@ -150,11 +150,11 @@ mock.module('@mariozechner/pi-coding-agent', () => ({
   createLsTool: mockCreateLsTool,
 }));
 
-// Import AFTER mocks are set — module resolution freezes the mocks.
+// Import AFTER mocks are set -- module resolution freezes the mocks.
 import { PiProvider } from './provider';
 import { PI_CAPABILITIES } from './capabilities';
 
-// ─── Helpers ────────────────────────────────────────────────────────────
+// --- Helpers ------------------------------------------------------------
 
 async function consume(
   generator: AsyncGenerator<unknown>
@@ -173,7 +173,7 @@ function resetScript(events: FakeEvent[]): void {
   scriptedEvents.push(...events);
 }
 
-// ─── Test suite ─────────────────────────────────────────────────────────
+// --- Test suite ---------------------------------------------------------
 
 describe('PiProvider', () => {
   beforeEach(() => {
@@ -237,7 +237,7 @@ describe('PiProvider', () => {
     // its module init, which resolves to a non-existent path inside compiled
     // archon binaries. The shim writes a stub package.json to tmpdir and sets
     // PI_PACKAGE_DIR so Pi's short-circuit kicks in. Must run BEFORE the
-    // dynamic imports in sendQuery — we verify by calling the fast-fail "no
+    // dynamic imports in sendQuery -- we verify by calling the fast-fail "no
     // model" path (which returns before any Pi SDK logic executes) and
     // asserting the env var was set regardless.
     delete process.env.PI_PACKAGE_DIR;
@@ -260,7 +260,7 @@ describe('PiProvider', () => {
   });
 
   test('logs credential hint when Pi provider id is unknown AND no creds available', async () => {
-    // No env var, no auth.json entry → log hint, but continue, to support custom providers that don't use credentials or that use non-Pi means of providing credentials.
+    // No env var, no auth.json entry -> log hint, but continue, to support custom providers that don't use credentials or that use non-Pi means of providing credentials.
     resetScript(scriptedAgentEnd());
     const { error } = await consume(
       new PiProvider().sendQuery('hi', '/tmp', undefined, {
@@ -370,7 +370,7 @@ describe('PiProvider', () => {
   });
 
   test('uses OAuth credential from ~/.pi/agent/auth.json when no env var set', async () => {
-    // Simulate user running `pi /login` → auth.json has OAuth entry
+    // Simulate user running `pi /login` -> auth.json has OAuth entry
     fileCreds.anthropic = { type: 'oauth' };
     resetScript([
       {
@@ -399,7 +399,7 @@ describe('PiProvider', () => {
       })
     );
     expect(error).toBeUndefined();
-    // Runtime override NOT set — no env var present — so Pi's getApiKey
+    // Runtime override NOT set -- no env var present -- so Pi's getApiKey
     // resolves through the OAuth code path.
     expect(mockSetRuntimeApiKey).not.toHaveBeenCalled();
     expect(mockGetApiKey).toHaveBeenCalledWith('anthropic');
@@ -597,7 +597,7 @@ describe('PiProvider', () => {
     expect(chunks[2]).toMatchObject({ type: 'result' });
   });
 
-  test('resumeSessionId not found → fresh session + system warning', async () => {
+  test('resumeSessionId not found -> fresh session + system warning', async () => {
     process.env.GEMINI_API_KEY = 'sk-test';
     mockSessionList.mockImplementationOnce(async () => []);
     resetScript([
@@ -627,7 +627,7 @@ describe('PiProvider', () => {
       })
     );
     expect(error).toBeUndefined();
-    // Resume attempted: list() called; no match → create() called (fresh session)
+    // Resume attempted: list() called; no match -> create() called (fresh session)
     expect(mockSessionList).toHaveBeenCalled();
     expect(mockSessionCreate).toHaveBeenCalledWith('/tmp');
     expect(mockSessionOpen).not.toHaveBeenCalled();
@@ -639,7 +639,7 @@ describe('PiProvider', () => {
     expect(systemChunks.some(c => c.content.includes('Could not resume'))).toBe(true);
   });
 
-  test('resumeSessionId matches existing session → open by path, no warning', async () => {
+  test('resumeSessionId matches existing session -> open by path, no warning', async () => {
     process.env.GEMINI_API_KEY = 'sk-test';
     mockSessionList.mockImplementationOnce(async () => [
       { id: 'existing-id', path: '/sessions/existing-id.jsonl', cwd: '/tmp' },
@@ -730,7 +730,7 @@ describe('PiProvider', () => {
     expect(mockDispose).toHaveBeenCalledTimes(1);
   });
 
-  // ─── v2 wiring: thinking, tools, systemPrompt ─────────────────────────
+  // --- v2 wiring: thinking, tools, systemPrompt -------------------------
 
   function scriptedAgentEnd(): FakeEvent[] {
     return [
@@ -884,7 +884,7 @@ describe('PiProvider', () => {
 
     const [callArgs] = mockCreateAgentSession.mock.calls[0] as [Record<string, unknown>];
     const tools = callArgs.tools as Array<{ __piTool: string }>;
-    // Pi has 7 built-ins, 2 denied → 5 remain
+    // Pi has 7 built-ins, 2 denied -> 5 remain
     expect(tools).toHaveLength(5);
     expect(tools.find(t => t.__piTool === 'bash')).toBeUndefined();
     expect(tools.find(t => t.__piTool === 'write')).toBeUndefined();
@@ -901,7 +901,7 @@ describe('PiProvider', () => {
     );
 
     const [callArgs] = mockCreateAgentSession.mock.calls[0] as [Record<string, unknown>];
-    // tools key should be absent — Pi uses its default codingTools
+    // tools key should be absent -- Pi uses its default codingTools
     expect('tools' in callArgs).toBe(false);
   });
 
@@ -917,7 +917,7 @@ describe('PiProvider', () => {
     );
 
     const [callArgs] = mockCreateAgentSession.mock.calls[0] as [Record<string, unknown>];
-    // Env present → we override Pi's built-in codingTools so bash sees the env.
+    // Env present -> we override Pi's built-in codingTools so bash sees the env.
     const tools = callArgs.tools as Array<{ __piTool: string }>;
     expect(Array.isArray(tools)).toBe(true);
     expect(tools.map(t => t.__piTool).sort()).toEqual(['bash', 'edit', 'read', 'write']);
@@ -1066,7 +1066,7 @@ describe('PiProvider', () => {
     // users run Pi; off-by-default silently broke users who installed or
     // authored one and expected it to fire.
     expect(loaderArgs?.noExtensions).toBe(false);
-    // Skills/prompts/themes/context stay suppressed — only extensions flip on.
+    // Skills/prompts/themes/context stay suppressed -- only extensions flip on.
     expect(loaderArgs?.noSkills).toBe(true);
     expect(loaderArgs?.noPromptTemplates).toBe(true);
     expect(loaderArgs?.noThemes).toBe(true);
@@ -1088,7 +1088,7 @@ describe('PiProvider', () => {
       | Record<string, unknown>
       | undefined;
     expect(loaderArgs?.noExtensions).toBe(false);
-    // Skills/prompts/themes/context still suppressed — only extensions opt-in.
+    // Skills/prompts/themes/context still suppressed -- only extensions opt-in.
     expect(loaderArgs?.noSkills).toBe(true);
     expect(loaderArgs?.noPromptTemplates).toBe(true);
     expect(loaderArgs?.noThemes).toBe(true);
@@ -1136,7 +1136,7 @@ describe('PiProvider', () => {
     expect(loaderArgs?.additionalSkillPaths).toBeUndefined();
   });
 
-  test('nodeConfig.skills absent → no additionalSkillPaths option passed', async () => {
+  test('nodeConfig.skills absent -> no additionalSkillPaths option passed', async () => {
     process.env.GEMINI_API_KEY = 'sk-test';
     resetScript(scriptedAgentEnd());
 
@@ -1152,7 +1152,7 @@ describe('PiProvider', () => {
     expect('additionalSkillPaths' in (loaderArgs ?? {})).toBe(false);
   });
 
-  // ─── Error + lifecycle paths (review: "zero test coverage") ─────────
+  // --- Error + lifecycle paths (review: "zero test coverage") ---------
 
   test('session.prompt rejection surfaces as thrown error to consumer', async () => {
     process.env.GEMINI_API_KEY = 'sk-test';
@@ -1252,7 +1252,7 @@ describe('PiProvider', () => {
     expect(systemChunks.some(c => c.content.includes('sonnet-5 not available'))).toBe(true);
   });
 
-  // ─── structured output (best-effort JSON via prompt engineering) ──────
+  // --- structured output (best-effort JSON via prompt engineering) ------
 
   // Script an assistant text_delta followed by agent_end so the bridge has
   // buffered content to parse when outputFormat is set.
@@ -1294,7 +1294,7 @@ describe('PiProvider', () => {
     expect(sentPrompt).toContain('"area"');
   });
 
-  test('outputFormat: absent → prompt passed through unchanged', async () => {
+  test('outputFormat: absent -> prompt passed through unchanged', async () => {
     process.env.GEMINI_API_KEY = 'sk-test';
     resetScript(scriptedAgentEnd());
 
@@ -1349,7 +1349,7 @@ describe('PiProvider', () => {
     expect(result?.structuredOutput).toEqual({ ok: true });
   });
 
-  test('outputFormat: prose-wrapped JSON → no structuredOutput, degrades cleanly', async () => {
+  test('outputFormat: prose-wrapped JSON -> no structuredOutput, degrades cleanly', async () => {
     process.env.GEMINI_API_KEY = 'sk-test';
     resetScript(scriptedAssistantThenEnd('Here is the JSON:\n{"ok":true}\nHope this helps!'));
 
@@ -1360,7 +1360,7 @@ describe('PiProvider', () => {
       })
     );
 
-    // No crash — downstream degradation is the executor's job via its
+    // No crash -- downstream degradation is the executor's job via its
     // existing dag.structured_output_missing warning path.
     expect(error).toBeUndefined();
     const result = chunks.find(
@@ -1371,7 +1371,7 @@ describe('PiProvider', () => {
     expect(result?.structuredOutput).toBeUndefined();
   });
 
-  test('no outputFormat → structuredOutput never set even if assistant emits JSON', async () => {
+  test('no outputFormat -> structuredOutput never set even if assistant emits JSON', async () => {
     process.env.GEMINI_API_KEY = 'sk-test';
     resetScript(scriptedAssistantThenEnd('{"accidental":"json"}'));
 
@@ -1388,7 +1388,7 @@ describe('PiProvider', () => {
     expect(result?.structuredOutput).toBeUndefined();
   });
 
-  // ─── Interactive ExtensionUIContext binding ───────────────────────────
+  // --- Interactive ExtensionUIContext binding ---------------------------
 
   test('interactive: true with enableExtensions binds a UIContext to the session', async () => {
     process.env.GEMINI_API_KEY = 'sk-test';
@@ -1424,7 +1424,7 @@ describe('PiProvider', () => {
     // When extensions are loaded, session_start MUST fire so each extension's
     // startup handler runs (reads flags, registers tools, etc.). Binding with
     // no uiContext keeps Pi's internal noOpUIContext active so hasUI stays
-    // false — extensions that gate UI flows (like plannotator) will auto-approve
+    // false -- extensions that gate UI flows (like plannotator) will auto-approve
     // in this mode.
     process.env.GEMINI_API_KEY = 'sk-test';
     resetScript(scriptedAgentEnd());
@@ -1441,7 +1441,7 @@ describe('PiProvider', () => {
     expect(bindings.uiContext).toBeUndefined();
   });
 
-  test('default (nothing set) binds with UIContext — extensions + interactive both on', async () => {
+  test('default (nothing set) binds with UIContext -- extensions + interactive both on', async () => {
     process.env.GEMINI_API_KEY = 'sk-test';
     resetScript(scriptedAgentEnd());
 
@@ -1456,7 +1456,7 @@ describe('PiProvider', () => {
     expect(bindings.uiContext).toBeDefined();
   });
 
-  // ─── extensionFlags pass-through ──────────────────────────────────────
+  // --- extensionFlags pass-through --------------------------------------
 
   test('extensionFlags sets flag values before bindExtensions fires session_start', async () => {
     process.env.GEMINI_API_KEY = 'sk-test';
@@ -1550,7 +1550,7 @@ describe('PiProvider', () => {
     }
   });
 
-  // Semaphore tests run last — the module-level piSemaphore singleton persists
+  // Semaphore tests run last -- the module-level piSemaphore singleton persists
   // across tests once initialized, so these must not affect tests that run before.
   test('maxConcurrent initializes semaphore and logs pi.semaphore_initialized', async () => {
     process.env.GEMINI_API_KEY = 'sk-test';
@@ -1584,7 +1584,7 @@ describe('PiProvider', () => {
     expect(initCalls).toHaveLength(0);
   });
 
-  test('settings: create(cwd) called, inMemory seeded with pre-merged global+project (empty project → just global)', async () => {
+  test('settings: create(cwd) called, inMemory seeded with pre-merged global+project (empty project -> just global)', async () => {
     process.env.GEMINI_API_KEY = 'sk-test';
     resetScript(scriptedAgentEnd());
     mockSettingsManagerGetGlobalSettings.mockImplementation(() => ({ defaultProvider: 'google' }));
@@ -1643,7 +1643,7 @@ describe('PiProvider', () => {
         enabled: true,
         attempts: 1,
         backoff: 'exp',
-        nested: { source: 'project' }, // nested objects are NOT recursively merged — one level deep only
+        nested: { source: 'project' }, // nested objects are NOT recursively merged -- one level deep only
       },
       timeoutMs: 2000,
       allow: ['project'],

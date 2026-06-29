@@ -2,7 +2,7 @@ import { mock, describe, test, expect, beforeEach, type Mock } from 'bun:test';
 import { createMockLogger } from '../test/mocks/logger';
 import type { MessageChunk } from '../types';
 
-// ─── Mock setup (BEFORE importing module under test) ─────────────────────────
+// --- Mock setup (BEFORE importing module under test) -------------------------
 
 const mockLogger = createMockLogger();
 mock.module('@archon/paths', () => ({
@@ -18,7 +18,7 @@ mock.module('../db/conversations', () => ({
   updateConversationTitle: mockUpdateConversationTitle,
 }));
 
-// AI client mock — sendQuery returns an AsyncGenerator<MessageChunk>
+// AI client mock -- sendQuery returns an AsyncGenerator<MessageChunk>
 const mockSendQuery = mock(async function* (): AsyncGenerator<MessageChunk> {
   yield { type: 'assistant', content: 'Summarize Project README' };
   yield { type: 'result' };
@@ -40,11 +40,11 @@ mock.module('@archon/providers', () => ({
   getAgentProvider: mockGetAgentProvider,
 }));
 
-// ─── Import module under test (AFTER all mocks) ─────────────────────────────
+// --- Import module under test (AFTER all mocks) -----------------------------
 
 import { generateAndSetTitle } from './title-generator';
 
-// ─── Tests ──────────────────────────────────────────────────────────────────
+// --- Tests ------------------------------------------------------------------
 
 describe('title-generator', () => {
   beforeEach(() => {
@@ -115,7 +115,7 @@ describe('title-generator', () => {
 
     await generateAndSetTitle('conv-5', 'Fix the login bug', 'claude', '/tmp');
 
-    // Should not throw — fire-and-forget safe
+    // Should not throw -- fire-and-forget safe
     expect(mockUpdateConversationTitle).toHaveBeenCalledWith('conv-5', 'Fix the login bug');
   });
 

@@ -13,7 +13,7 @@
  *   - MUST emit `container_startup_auth_verify` exactly once per provider.
  *
  * Wired in via docker-entrypoint.sh BEFORE `bun run start`.
- * Behavior spec v2 invariant D-2; research doc §Design recommendation L5.
+ * Behavior spec v2 invariant D-2; research doc Section Design recommendation L5.
  */
 import { createLogger } from '@archon/paths';
 import { ensureFreshAuth } from '@archon/providers/auth-refresh';
@@ -28,7 +28,7 @@ async function verifyOne(provider: ProviderName): Promise<void> {
   } catch (err) {
     // Never block boot. Surface the failure for ops visibility but exit 0
     // so the container starts. The reactive refresh path (PR #48) still
-    // catches the first workflow's 401 — this is purely preventative.
+    // catches the first workflow's 401 -- this is purely preventative.
     log.warn(
       { provider, result: 'failed', err: (err as Error).message },
       'container_startup_auth_verify'

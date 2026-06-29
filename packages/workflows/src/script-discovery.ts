@@ -50,7 +50,7 @@ function getRuntimeForExtension(ext: string): ScriptRuntime | undefined {
  *
  * `1` matches the workflows/commands convention: allow one level of
  * grouping (e.g. `.archon/scripts/triage/foo.ts`) but no nested folders.
- * We stop at 1 deliberately — deeper nesting has never been part of the
+ * We stop at 1 deliberately -- deeper nesting has never been part of the
  * documented convention and adds no organizational value, just routing
  * ambiguity when two basenames collide across folders.
  */
@@ -92,7 +92,7 @@ async function scanScriptDir(
 
     if (entryStat.isDirectory()) {
       // 1-depth cap: allow one level of grouping (e.g. `.archon/scripts/triage/foo.ts`)
-      // but stop there. Matches the workflows/commands convention — no nested folders.
+      // but stop there. Matches the workflows/commands convention -- no nested folders.
       if (depth >= MAX_SCRIPT_DISCOVERY_DEPTH) continue;
       await scanScriptDir(entryPath, scripts, depth + 1);
       continue;
@@ -137,10 +137,10 @@ export async function discoverScripts(dir: string): Promise<Map<string, ScriptDe
 /**
  * Discover scripts across all scopes for a given repo cwd.
  *
- * Resolution order (repo wins on same-name collision — matches the
+ * Resolution order (repo wins on same-name collision -- matches the
  * workflows/commands precedence):
- *   1. `<cwd>/.archon/scripts/` — repo-scoped (`source: 'project'` equivalent)
- *   2. `~/.archon/scripts/`    — home-scoped (`source: 'global'` equivalent)
+ *   1. `<cwd>/.archon/scripts/` -- repo-scoped (`source: 'project'` equivalent)
+ *   2. `~/.archon/scripts/`    -- home-scoped (`source: 'global'` equivalent)
  *
  * Within a single scope, duplicate basenames across extensions still throw
  * (matches `discoverScripts` behavior). Across scopes, the repo-level entry
@@ -162,7 +162,7 @@ export async function discoverScriptsForCwd(cwd: string): Promise<Map<string, Sc
 }
 
 /**
- * Returns bundled default scripts (empty — no bundled scripts for now).
+ * Returns bundled default scripts (empty -- no bundled scripts for now).
  * Follows the bundled-defaults.ts pattern for future extensibility.
  */
 export function getDefaultScripts(): Map<string, ScriptDefinition> {

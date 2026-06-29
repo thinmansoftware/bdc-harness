@@ -1,7 +1,7 @@
 /**
  * Shared helpers for executor.ts and dag-executor.ts.
  *
- * Extracted here once the Rule of Three was met — both files had
+ * Extracted here once the Rule of Three was met -- both files had
  * identical copies of these error-classification and prompt-building
  * utilities. Single source of truth; no logic changes from either copy.
  */
@@ -21,7 +21,7 @@ function getLog(): ReturnType<typeof createLogger> {
   return cachedLog;
 }
 
-// ─── Error Classification ────────────────────────────────────────────────────
+// --- Error Classification ----------------------------------------------------
 
 /** Result of error classification */
 export type ErrorType = 'TRANSIENT' | 'FATAL' | 'UNKNOWN';
@@ -82,7 +82,7 @@ export function classifyError(error: Error): ErrorType {
   return 'UNKNOWN';
 }
 
-// ─── Subprocess Failure Formatting ───────────────────────────────────────────
+// --- Subprocess Failure Formatting -------------------------------------------
 
 /** Max characters of stderr/message we keep in user-facing and logged fields. */
 const SUBPROCESS_ERROR_MAX_CHARS = 2000;
@@ -90,7 +90,7 @@ const SUBPROCESS_ERROR_MAX_CHARS = 2000;
 /**
  * Raw ExecFileException shape from Node's `child_process.execFile`. For inline
  * scripts via `bash -c <body>` / `bun -e <body>` the entire script body is
- * embedded in `err.message`, `err.cmd`, and the first line of `err.stack` —
+ * embedded in `err.message`, `err.cmd`, and the first line of `err.stack` --
  * which is why `formatSubprocessFailure` strips the prefix and exposes a
  * controlled `logFields` subset rather than the raw error.
  */
@@ -98,7 +98,7 @@ interface RawSubprocessError {
   message?: string;
   stderr?: string;
   stdout?: string;
-  // Numeric exit code OR errno symbol (e.g. 'ENOENT') — mirrors ExecFileException.
+  // Numeric exit code OR errno symbol (e.g. 'ENOENT') -- mirrors ExecFileException.
   code?: number | string | null;
   killed?: boolean;
   cmd?: string;
@@ -109,7 +109,7 @@ interface RawSubprocessError {
  *
  * User-visible output strips Node's `"Command failed: <cmd>"` prefix (which for
  * inline scripts contains the full script body) and prefers stderr when present.
- * Log fields expose a controlled, tail-truncated subset — never the full `err`
+ * Log fields expose a controlled, tail-truncated subset -- never the full `err`
  * object, to prevent Pino's default error serializer from emitting three copies
  * of the script body (`err.message`, `err.stack`, `err.cmd`).
  */
@@ -134,7 +134,7 @@ export function formatSubprocessFailure(
   } else if (bodyAfterPrefix) {
     diagnostic = bodyAfterPrefix;
   } else if (hasCommandFailedPrefix) {
-    // Prefix was the entire message — exit code in the suffix is the only signal.
+    // Prefix was the entire message -- exit code in the suffix is the only signal.
     diagnostic = 'no diagnostic output';
   } else {
     diagnostic = 'unknown error';
@@ -142,7 +142,7 @@ export function formatSubprocessFailure(
 
   const truncated =
     diagnostic.length > SUBPROCESS_ERROR_MAX_CHARS
-      ? diagnostic.slice(-SUBPROCESS_ERROR_MAX_CHARS) + '\n…[truncated]'
+      ? diagnostic.slice(-SUBPROCESS_ERROR_MAX_CHARS) + '\n...[truncated]'
       : diagnostic;
 
   const exitSuffix = err.code != null ? ` [exit ${String(err.code)}]` : '';
@@ -160,7 +160,7 @@ export function formatSubprocessFailure(
   };
 }
 
-// ─── Credit Exhaustion Detection ────────────────────────────────────────────
+// --- Credit Exhaustion Detection --------------------------------------------
 
 /** Patterns that indicate credit/quota exhaustion in streamed assistant output */
 const CREDIT_EXHAUSTION_OUTPUT_PATTERNS = [
@@ -180,12 +180,12 @@ const CREDIT_EXHAUSTION_OUTPUT_PATTERNS = [
 export function detectCreditExhaustion(text: string): string | null {
   const lower = text.toLowerCase();
   if (CREDIT_EXHAUSTION_OUTPUT_PATTERNS.some(p => lower.includes(p))) {
-    return 'Credit exhaustion detected — resume when credits reset';
+    return 'Credit exhaustion detected -- resume when credits reset';
   }
   return null;
 }
 
-// ─── Command Loading ─────────────────────────────────────────────────────────
+// --- Command Loading ---------------------------------------------------------
 
 /**
  * Load command prompt from file.
@@ -231,7 +231,7 @@ export async function loadCommandPrompt(
 
   // Use command folder paths with optional configured folder.
   // Each scope is walked 1 subfolder deep so `triage/review.md` resolves as
-  // `review` — matching the workflows/scripts convention. Resolution
+  // `review` -- matching the workflows/scripts convention. Resolution
   // precedence: repo > home (~/.archon/commands/) > bundled/app defaults.
   const searchPaths = archonPaths.getCommandFolderSearchPaths(configuredFolder);
   const resolvedSearchPaths: string[] = [
@@ -336,7 +336,7 @@ export async function loadCommandPrompt(
   };
 }
 
-// ─── Variable Substitution ───────────────────────────────────────────────────
+// --- Variable Substitution ---------------------------------------------------
 
 /** Pattern string for context variables - used to create fresh regex instances */
 export const CONTEXT_VAR_PATTERN_STR =
@@ -424,7 +424,7 @@ export function substituteWorkflowVariables(
  * input values.
  *
  * Safe in bash: '.' is not a valid bash identifier character, so `${input.name}`
- * can never be a real bash variable expansion — no false positives exist.
+ * can never be a real bash variable expansion -- no false positives exist.
  * Any reference whose name is not in resolvedInputs is left unchanged so the
  * shell's own `bad substitution` surfaces the misconfiguration clearly.
  */
@@ -480,7 +480,7 @@ export function buildPromptWithContext(
   return prompt;
 }
 
-// ─── Completion Signal Detection ────────────────────────────────────────────
+// --- Completion Signal Detection --------------------------------------------
 
 /**
  * Escape special regex characters in string
@@ -498,7 +498,7 @@ function escapeRegExp(str: string): string {
  * 3. Plain SIGNAL - Backwards compatibility; only at end of output or on own line
  *
  * Tag matching uses a backreference (\1) so opening and closing tag names must
- * agree — `<COMPLETE>X</done>` is not treated as a completion, which avoids
+ * agree -- `<COMPLETE>X</done>` is not treated as a completion, which avoids
  * false positives when the AI interleaves tags in prose.
  *
  * Plain signal detection is restrictive to prevent false positives like "not SIGNAL yet".
@@ -525,7 +525,7 @@ export function detectCompletionSignal(output: string, signal: string): boolean 
 
 /**
  * Strip internal completion signal tags before sending to user-facing output.
- * Always strips `<promise>…</promise>` (any content). When `until` is provided,
+ * Always strips `<promise>...</promise>` (any content). When `until` is provided,
  * also strips any XML-wrapped form of that signal with matching tag names
  * (e.g. `<COMPLETE>ALL_CLEAN</COMPLETE>`). Mismatched tag names are left alone
  * so regular prose (`<note>ALL_CLEAN</warning>`) isn't accidentally rewritten.
@@ -552,7 +552,7 @@ export function isInlineScript(script: string): boolean {
   return script.includes('\n') || /[;(){}&|<>$`"' ]/.test(script);
 }
 
-// ─── Agent Persona Resolution ────────────────────────────────────────────────
+// --- Agent Persona Resolution ------------------------------------------------
 
 import type { AgentPersona } from './agents/registry';
 
@@ -600,7 +600,7 @@ export class InfrastructureClassBlock extends Error {
  *   InfrastructureClassBlock. If present, the persona model wins over the node
  *   model (today's behavior), and a mismatch is logged.
  * - any other provider (e.g. pi): pass persona.model through unchanged. Do NOT
- *   apply the codex constraint — providers such as pi require a model.
+ *   apply the codex constraint -- providers such as pi require a model.
  */
 export function resolveAgentPersona(
   persona: AgentPersona,

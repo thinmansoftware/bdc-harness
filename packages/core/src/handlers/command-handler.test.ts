@@ -534,7 +534,7 @@ describe('CommandHandler', () => {
 
         expect(result.success).toBe(true);
         expect(result.message).toContain('Orchestrator Status');
-        expect(result.message).toContain('None — orchestrator will route as needed');
+        expect(result.message).toContain('None -- orchestrator will route as needed');
       });
 
       test('should show no codebase when cwd does not match any codebase', async () => {
@@ -550,7 +550,7 @@ describe('CommandHandler', () => {
         const result = await handleCommand(conversation, '/status');
 
         expect(result.success).toBe(true);
-        expect(result.message).toContain('None — orchestrator will route as needed');
+        expect(result.message).toContain('None -- orchestrator will route as needed');
       });
 
       test('should display worktree from isolation_env_id when set', async () => {
@@ -1379,7 +1379,7 @@ describe('CommandHandler', () => {
         const result = await handleCommand(baseConversation, '/workflow resume run-456');
 
         expect(result.success).toBe(true);
-        // Already failed — no status change needed
+        // Already failed -- no status change needed
         expect(mockFailWorkflowRun).not.toHaveBeenCalled();
       });
 
@@ -1757,7 +1757,7 @@ describe('CommandHandler', () => {
       });
     });
 
-    describe('/workflow approve — interactive_loop branch', () => {
+    describe('/workflow approve -- interactive_loop branch', () => {
       const baseConversation: Conversation = {
         id: 'conv-approve',
         platform_type: 'telegram',
@@ -1833,7 +1833,7 @@ describe('CommandHandler', () => {
 
         await handleCommand(baseConversation, '/workflow approve run-456 LGTM');
 
-        // node_completed should NOT be written by the approve command — only the executor
+        // node_completed should NOT be written by the approve command -- only the executor
         // writes it when the AI emits the completion signal (actual loop exit).
         const nodeCompletedCalls = mockCreateWorkflowEvent.mock.calls.filter(
           (call: unknown[]) => (call[0] as Record<string, unknown>).event_type === 'node_completed'
@@ -1879,7 +1879,7 @@ describe('CommandHandler', () => {
       });
     });
 
-    describe('/workflow approve — standard approval node with captureResponse', () => {
+    describe('/workflow approve -- standard approval node with captureResponse', () => {
       const baseConversation: Conversation = {
         id: 'conv-approve',
         platform_type: 'telegram',
@@ -1959,7 +1959,7 @@ describe('CommandHandler', () => {
       });
     });
 
-    describe('/workflow reject — on_reject branch', () => {
+    describe('/workflow reject -- on_reject branch', () => {
       const baseConversation: Conversation = {
         id: 'conv-approve',
         platform_type: 'telegram',

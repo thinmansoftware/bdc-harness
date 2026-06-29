@@ -206,7 +206,7 @@ export function getProcessUid(): number | undefined {
   return typeof process.getuid === 'function' ? process.getuid() : undefined;
 }
 
-// ─── MCP Config Loading (absorbed from dag-executor) ───────────────────────
+// --- MCP Config Loading (absorbed from dag-executor) -----------------------
 
 /**
  * Expand $VAR_NAME references in string-valued records from process.env.
@@ -276,7 +276,7 @@ export async function loadMcpConfig(
     if (e.code === 'ENOENT') {
       throw new Error(`MCP config file not found: ${mcpPath} (resolved to ${fullPath})`);
     }
-    throw new Error(`Failed to read MCP config file: ${mcpPath} — ${e.message}`);
+    throw new Error(`Failed to read MCP config file: ${mcpPath} -- ${e.message}`);
   }
 
   let parsed: Record<string, unknown>;
@@ -284,7 +284,7 @@ export async function loadMcpConfig(
     parsed = JSON.parse(raw) as Record<string, unknown>;
   } catch (parseErr) {
     const detail = (parseErr as SyntaxError).message;
-    throw new Error(`MCP config file is not valid JSON: ${mcpPath} — ${detail}`);
+    throw new Error(`MCP config file is not valid JSON: ${mcpPath} -- ${detail}`);
   }
 
   if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
@@ -296,7 +296,7 @@ export async function loadMcpConfig(
   return { servers: expanded, serverNames, missingVars };
 }
 
-// ─── SDK Hooks Building (absorbed from dag-executor) ───────────────────────
+// --- SDK Hooks Building (absorbed from dag-executor) -----------------------
 
 /** YAML hook matcher shape (matches @archon/workflows/schemas/dag-node WorkflowNodeHooks) */
 interface YAMLHookMatcher {
@@ -347,7 +347,7 @@ export function buildSDKHooksFromYAML(
   return sdkHooks;
 }
 
-// ─── Provider Warning Type ───────────────────────────────────────────────
+// --- Provider Warning Type -----------------------------------------------
 
 /**
  * Structured provider warning. Providers collect these during translation;
@@ -358,7 +358,7 @@ interface ProviderWarning {
   message: string;
 }
 
-// ─── NodeConfig → SDK Options Translation ──────────────────────────────────
+// --- NodeConfig -> SDK Options Translation ----------------------------------
 
 /**
  * Translate nodeConfig into Claude SDK-specific options.
@@ -371,17 +371,17 @@ async function applyNodeConfig(
   cwd: string
 ): Promise<ProviderWarning[]> {
   const warnings: ProviderWarning[] = [];
-  // allowed_tools → tools
+  // allowed_tools -> tools
   if (nodeConfig.allowed_tools !== undefined) {
     options.tools = nodeConfig.allowed_tools;
   }
 
-  // denied_tools → disallowedTools
+  // denied_tools -> disallowedTools
   if (nodeConfig.denied_tools !== undefined) {
     options.disallowedTools = nodeConfig.denied_tools;
   }
 
-  // hooks → build SDK hooks
+  // hooks -> build SDK hooks
   if (nodeConfig.hooks) {
     const builtHooks = buildSDKHooksFromYAML(
       nodeConfig.hooks as Record<string, YAMLHookMatcher[] | undefined>
@@ -408,7 +408,7 @@ async function applyNodeConfig(
     }
   }
 
-  // mcp → load config and set mcpServers + allowedTools wildcards
+  // mcp -> load config and set mcpServers + allowedTools wildcards
   if (nodeConfig.mcp) {
     const mcpPath = nodeConfig.mcp;
     const { servers, serverNames, missingVars } = await loadMcpConfig(mcpPath, cwd);
@@ -421,7 +421,7 @@ async function applyNodeConfig(
       getLog().warn({ missingVars: uniqueVars }, 'claude.mcp_env_vars_missing');
       warnings.push({
         code: 'mcp_env_vars_missing',
-        message: `MCP config references undefined env vars: ${uniqueVars.join(', ')}. These will be empty strings — MCP servers may fail to authenticate.`,
+        message: `MCP config references undefined env vars: ${uniqueVars.join(', ')}. These will be empty strings -- MCP servers may fail to authenticate.`,
       });
     }
     // Haiku models don't support tool search (lazy loading for many tools)
@@ -430,12 +430,12 @@ async function applyNodeConfig(
       warnings.push({
         code: 'mcp_haiku_tool_search',
         message:
-          'Using Haiku model with MCP servers — tool search (lazy loading for many tools) is not supported on Haiku. Consider using Sonnet or Opus.',
+          'Using Haiku model with MCP servers -- tool search (lazy loading for many tools) is not supported on Haiku. Consider using Sonnet or Opus.',
       });
     }
   }
 
-  // skills → AgentDefinition wrapping
+  // skills -> AgentDefinition wrapping
   if (nodeConfig.skills) {
     const skills = nodeConfig.skills;
     const agentId = 'dag-node-skills';
@@ -461,10 +461,10 @@ async function applyNodeConfig(
     getLog().info({ skills, agentId }, 'claude.skills_agent_created');
   }
 
-  // agents → inline AgentDefinition pass-through.
+  // agents -> inline AgentDefinition pass-through.
   // Runs AFTER skills: so user-defined agents win on ID collision with
   // the internal 'dag-node-skills' wrapper.
-  // options.agent is intentionally left alone — inline agents are sub-agents
+  // options.agent is intentionally left alone -- inline agents are sub-agents
   // invokable via the Task tool, not the primary agent for the query.
   if (nodeConfig.agents) {
     // Warn loudly when a user-defined agent overrides the internal
@@ -533,7 +533,7 @@ async function applyNodeConfig(
   return warnings;
 }
 
-// ─── Base Options Builder ────────────────────────────────────────────────
+// --- Base Options Builder ------------------------------------------------
 
 /** Queued tool result from SDK hooks, consumed during stream normalization. */
 interface ToolResultEntry {
@@ -542,7 +542,7 @@ interface ToolResultEntry {
   toolCallId?: string;
 }
 
-/** Bun-runnable JS extensions. `.ts`/`.tsx`/`.jsx` are excluded — the SDK has
+/** Bun-runnable JS extensions. `.ts`/`.tsx`/`.jsx` are excluded -- the SDK has
  * never shipped those as entry points, so accepting them would only widen the
  * surface for misconfiguration. */
 const BUN_JS_EXTENSIONS = ['.js', '.mjs', '.cjs'] as const;
@@ -553,7 +553,7 @@ const BUN_JS_EXTENSIONS = ['.js', '.mjs', '.cjs'] as const;
  * `--no-env-file` is a Bun flag (consumed by the Bun runtime, not by Claude
  * Code itself) that prevents auto-loading `.env` from the target repo cwd
  * into the spawned process. It only does anything when the SDK spawns a
- * Bun-runnable JS file via `bun cli.js …` — Bun parses the flag and skips
+ * Bun-runnable JS file via `bun cli.js ...` -- Bun parses the flag and skips
  * its env autoload. For native Claude Code binaries the flag is meaningless
  * and, worse, gets handed to the binary which rejects unknown options.
  *
@@ -561,8 +561,8 @@ const BUN_JS_EXTENSIONS = ['.js', '.mjs', '.cjs'] as const;
  * because the SDK shipped `cli.js` inside its package. SDK 0.2.x switched
  * to per-platform native binaries (e.g. `@anthropic-ai/claude-agent-sdk-darwin-arm64/claude`),
  * so dev mode now resolves to a native executable and the historical
- * `undefined → true` heuristic is unsafe. Only return `true` when we have
- * an explicit Bun-runnable JS path (`.js`/`.mjs`/`.cjs`) — i.e. when the
+ * `undefined -> true` heuristic is unsafe. Only return `true` when we have
+ * an explicit Bun-runnable JS path (`.js`/`.mjs`/`.cjs`) -- i.e. when the
  * operator pointed Archon at a legacy Bun/Node-runnable cli script.
  * Otherwise return `false`.
  *
@@ -583,7 +583,7 @@ export function shouldPassNoEnvFile(cliPath: string | undefined): boolean {
 
 /**
  * Build base Claude SDK options from cwd, request options, and assistant defaults.
- * Does not include nodeConfig translation — that is handled by applyNodeConfig.
+ * Does not include nodeConfig translation -- that is handled by applyNodeConfig.
  */
 function buildBaseClaudeOptions(
   cwd: string,
@@ -652,7 +652,7 @@ function buildBaseClaudeOptions(
   };
 }
 
-// ─── Tool Capture Hooks ──────────────────────────────────────────────────
+// --- Tool Capture Hooks --------------------------------------------------
 
 /**
  * Build SDK hooks that capture tool use results into a shared queue.
@@ -699,7 +699,7 @@ function buildToolCaptureHooks(toolResultQueue: ToolResultEntry[]): Options['hoo
               }
               const errorText = rawError ?? 'tool failed';
               const isInterrupt = (input as { is_interrupt?: boolean }).is_interrupt === true;
-              const prefix = isInterrupt ? '⚠️ Interrupted' : '❌ Error';
+              const prefix = isInterrupt ? '! Interrupted' : '[ ] Error';
               toolResultQueue.push({
                 toolName,
                 toolOutput: `${prefix}: ${errorText}`,
@@ -716,7 +716,7 @@ function buildToolCaptureHooks(toolResultQueue: ToolResultEntry[]): Options['hoo
   };
 }
 
-// ─── Stream Normalizer ───────────────────────────────────────────────────
+// --- Stream Normalizer ---------------------------------------------------
 
 /**
  * Normalize raw Claude SDK events into Archon MessageChunks.
@@ -796,7 +796,7 @@ async function* streamClaudeMessages(
       getLog().warn({ rateLimitInfo }, 'claude.rate_limit_event');
       // Auto-throttle: engage the global gate when utilization > 0.85 and the
       // 5-hour window resets within 5 minutes. surpassedThreshold + resetsAt
-      // + utilization come from SDKRateLimitInfo. Idempotent — re-engage is a
+      // + utilization come from SDKRateLimitInfo. Idempotent -- re-engage is a
       // no-op while the gate is already closed.
       try {
         claudeProviderThrottle.checkRateLimitAndMaybeThrottle(rateLimitInfo);
@@ -872,7 +872,7 @@ async function* streamClaudeMessages(
   }
 }
 
-// ─── Error Classification & Retry ────────────────────────────────────────
+// --- Error Classification & Retry ----------------------------------------
 
 /**
  * Classify a subprocess error and enrich with stderr context.
@@ -917,7 +917,7 @@ function classifyAndEnrichError(
   return { enrichedError, errorClass, shouldRetry };
 }
 
-// ─── Claude Provider ───────────────────────────────────────────────────────
+// --- Claude Provider -------------------------------------------------------
 
 /**
  * Claude AI agent provider.
@@ -925,7 +925,7 @@ function classifyAndEnrichError(
  *
  * sendQuery orchestrates the following internal helpers:
  * - buildBaseClaudeOptions: SDK option construction
- * - applyNodeConfig: workflow nodeConfig → SDK option translation + warnings
+ * - applyNodeConfig: workflow nodeConfig -> SDK option translation + warnings
  * - streamClaudeMessages: raw SDK event normalization into MessageChunks
  * - classifyAndEnrichError: error classification for retry decisions
  */
@@ -952,7 +952,7 @@ export class ClaudeProvider implements IAgentProvider {
    */
   // TODO(#1135): Pre-spawn env-leak gate was removed during provider extraction.
   // Caller-side enforcement (orchestrator, dag-executor) is tracked in #1135.
-  // Providers must NOT implement security gates — the platform guarantees safety
+  // Providers must NOT implement security gates -- the platform guarantees safety
   // before a provider runs.
   async *sendQuery(
     prompt: string,
@@ -962,13 +962,13 @@ export class ClaudeProvider implements IAgentProvider {
   ): AsyncGenerator<MessageChunk> {
     let lastError: Error | undefined;
 
-    // BDC fork: Layer 2 — proactive auth freshness check.
+    // BDC fork: Layer 2 -- proactive auth freshness check.
     // Subscription OAuth tokens can expire while the container is idle. The
     // Claude binary subprocess does its own pre-flight check on the
     // credentials file and exits with "Not logged in" before any HTTP call,
     // bypassing the SDK's reactive refresh path. Refresh BEFORE we spawn so
     // the subprocess always sees a fresh access token on disk.
-    // Behavior spec v2 invariant I-1; research doc §Design recommendation L2.
+    // Behavior spec v2 invariant I-1; research doc Section Design recommendation L2.
     await ensureFreshAuth('claude');
 
     const assistantDefaults = parseClaudeConfig(requestOptions?.assistantConfig ?? {});
@@ -994,7 +994,7 @@ export class ClaudeProvider implements IAgentProvider {
 
     // Yield provider warnings once before retries
     for (const warning of nodeConfigWarnings) {
-      yield { type: 'system' as const, content: `⚠️ ${warning.message}` };
+      yield { type: 'system' as const, content: `! ${warning.message}` };
     }
 
     // Track the current attempt's controller so a single abort listener

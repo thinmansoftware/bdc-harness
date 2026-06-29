@@ -291,7 +291,7 @@ describe('registry', () => {
       expect(caps.skills).toBe(true);
       expect(caps.sessionResume).toBe(true);
       expect(caps.envInjection).toBe(true);
-      // Best-effort structured output via prompt engineering + post-parse —
+      // Best-effort structured output via prompt engineering + post-parse --
       // not SDK-enforced like Claude/Codex, but wired up and tested.
       expect(caps.structuredOutput).toBe(true);
       // Still false (out of v2 scope)

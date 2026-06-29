@@ -213,7 +213,7 @@ describe('substituteWorkflowVariables', () => {
       'docs/',
       'context-data'
     );
-    // $CONTEXT_FILE is not a context variable — should be left untouched
+    // $CONTEXT_FILE is not a context variable -- should be left untouched
     expect(prompt).toBe('Path: $CONTEXT_FILE');
     expect(contextSubstituted).toBe(false);
   });
@@ -352,8 +352,8 @@ describe('buildPromptWithContext', () => {
 
 describe('detectCreditExhaustion', () => {
   it('detects "You\'re out of extra usage" (exact SDK phrase)', () => {
-    const result = detectCreditExhaustion("You're out of extra usage · resets in 2h");
-    expect(result).toBe('Credit exhaustion detected — resume when credits reset');
+    const result = detectCreditExhaustion("You're out of extra usage - resets in 2h");
+    expect(result).toBe('Credit exhaustion detected -- resume when credits reset');
   });
 
   it('detects "out of credits" phrase', () => {
@@ -378,7 +378,7 @@ describe('detectCreditExhaustion', () => {
 });
 
 describe('isInlineScript', () => {
-  // Named identifiers — should return false
+  // Named identifiers -- should return false
   it('plain identifier is not inline', () => {
     expect(isInlineScript('my-script')).toBe(false);
   });
@@ -391,7 +391,7 @@ describe('isInlineScript', () => {
     expect(isInlineScript('my.script')).toBe(false);
   });
 
-  // Inline code — should return true
+  // Inline code -- should return true
   it('newline is inline', () => {
     expect(isInlineScript('a\nb')).toBe(true);
   });
@@ -457,7 +457,7 @@ describe('detectCompletionSignal', () => {
   });
 
   it('does NOT detect signal when XML tag names do not match (strict)', () => {
-    // Open/close tag names must agree — guards against AI prose that
+    // Open/close tag names must agree -- guards against AI prose that
     // interleaves tags (e.g. "<COMPLETE>ALL_CLEAN</other-tag>") being
     // treated as a completion.
     expect(detectCompletionSignal('<COMPLETE>ALL_CLEAN</done>', 'ALL_CLEAN')).toBe(false);
@@ -534,7 +534,7 @@ describe('formatSubprocessFailure', () => {
   it('logFields never contain the full message, stack, or cmd', () => {
     const err = {
       message: 'Command failed: bun -e const body = "SECRET_BODY"\n',
-      stack: 'Error: Command failed: bun -e const body = "SECRET_BODY"\n    at …',
+      stack: 'Error: Command failed: bun -e const body = "SECRET_BODY"\n    at ...',
       cmd: 'bun -e const body = "SECRET_BODY"',
       stderr: 'short stderr',
       code: 1,
@@ -672,7 +672,7 @@ describe('resolveAgentPersona', () => {
     expect(warnCalls.length).toBe(0);
   });
 
-  // ── Provider-aware cases (WO-HARNESS-PROVIDER-AWARE-MODEL-RESOLUTION-01) ──
+  // -- Provider-aware cases (WO-HARNESS-PROVIDER-AWARE-MODEL-RESOLUTION-01) --
 
   it('claude: throws InfrastructureClassBlock when persona has no model', () => {
     const persona = makePersona({ model: undefined });
@@ -708,7 +708,7 @@ describe('resolveAgentPersona', () => {
     expect(resolution.model).toBeUndefined();
   });
 
-  it('pi: falls back to currentModel when persona omits model (F2 — pi requires a model)', () => {
+  it('pi: falls back to currentModel when persona omits model (F2 -- pi requires a model)', () => {
     // A pi persona that omits `model:` must receive the node currentModel rather
     // than undefined, so pi does not throw "requires a model" at runtime.
     const persona = makePersona({ model: undefined });

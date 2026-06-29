@@ -4,7 +4,7 @@ import { MockPlatformAdapter } from '../test/mocks/platform';
 import type { Conversation, Codebase } from '../types';
 import type { IsolationEnvironmentRow } from '@archon/isolation';
 
-// ─── Mock setup (BEFORE importing module under test) ─────────────────────────
+// --- Mock setup (BEFORE importing module under test) -------------------------
 
 const mockLogger = createMockLogger();
 mock.module('@archon/paths', () => ({
@@ -78,7 +78,7 @@ mock.module('../services/cleanup-service', () => ({
   STALE_THRESHOLD_DAYS: 7,
 }));
 
-// Mock @archon/isolation — shared resolve mock so tests can control return values
+// Mock @archon/isolation -- shared resolve mock so tests can control return values
 const mockResolve = mock(() => Promise.resolve({ status: 'none' as const, cwd: '/workspace' }));
 
 class MockIsolationResolver {
@@ -107,7 +107,7 @@ mock.module('./prompt-builder', () => ({
 }));
 
 mock.module('../utils/error-formatter', () => ({
-  classifyAndFormatError: mock((err: Error) => `⚠️ Error: ${err.message}`),
+  classifyAndFormatError: mock((err: Error) => `! Error: ${err.message}`),
 }));
 
 mock.module('@archon/workflows/workflow-discovery', () => ({
@@ -131,11 +131,11 @@ mock.module('../services/title-generator', () => ({
   generateAndSetTitle: mock(() => Promise.resolve()),
 }));
 
-// ─── Import module under test AFTER all mocks ────────────────────────────────
+// --- Import module under test AFTER all mocks --------------------------------
 
 const { validateAndResolveIsolation } = await import('./orchestrator');
 
-// ─── Test helpers ────────────────────────────────────────────────────────────
+// --- Test helpers ------------------------------------------------------------
 
 function makeEnvRow(overrides?: Partial<IsolationEnvironmentRow>): IsolationEnvironmentRow {
   return {
@@ -184,7 +184,7 @@ function makeCodebase(overrides?: Partial<Codebase>): Codebase {
   };
 }
 
-// ─── Tests ───────────────────────────────────────────────────────────────────
+// --- Tests -------------------------------------------------------------------
 
 describe('validateAndResolveIsolation', () => {
   let platform: MockPlatformAdapter;

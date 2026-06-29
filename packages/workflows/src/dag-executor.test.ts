@@ -770,7 +770,7 @@ describe('substituteNodeOutputRefs -- shell escaping', () => {
     it('swallows outer double quotes for exact "$node.output" pattern with multi-line output', () => {
       const outputs = new Map([['a', makeOutput('completed', 'line1\nline2\nline3')]]);
       // Author wrote: echo "$a.output"
-      // Without the fix: produces echo "'line1\nline2\nline3'" — bash mis-tokenizes line2/line3.
+      // Without the fix: produces echo "'line1\nline2\nline3'" -- bash mis-tokenizes line2/line3.
       // With the fix:  produces echo 'line1\nline2\nline3' (single-quoted, bash-safe).
       expect(substituteNodeOutputRefs('echo "$a.output"', outputs, true)).toBe(
         "echo 'line1\nline2\nline3'"
@@ -809,7 +809,7 @@ describe('substituteNodeOutputRefs -- shell escaping', () => {
 
     it('leaves bare $node.output (no surrounding quotes) producing shellQuote-wrapped value', () => {
       const outputs = new Map([['a', makeOutput('completed', 'hello world')]]);
-      // No surrounding double quotes — current behavior preserved.
+      // No surrounding double quotes -- current behavior preserved.
       expect(substituteNodeOutputRefs('echo $a.output', outputs, true)).toBe("echo 'hello world'");
     });
 
@@ -1721,7 +1721,7 @@ describe('executeDagWorkflow -- output_format structured output', () => {
   });
 
   it('falls back to concatenated text when structuredOutput is absent', async () => {
-    // Mock without structuredOutput on result — backward compatible
+    // Mock without structuredOutput on result -- backward compatible
     mockSendQueryDag.mockImplementation(function* () {
       yield { type: 'assistant', content: 'plain text response' };
       yield { type: 'result', sessionId: 'sid-2' };
@@ -1932,7 +1932,7 @@ describe('executeDagWorkflow -- when condition parse errors (fail-closed)', () =
 
     const nodes: DagNode[] = [
       { id: 'unconditional', command: 'my-cmd' },
-      // Single = is not valid syntax — will fail to parse
+      // Single = is not valid syntax -- will fail to parse
       {
         id: 'guarded',
         command: 'my-cmd',
@@ -2126,7 +2126,7 @@ describe('executeDagWorkflow -- node-level retry for transient errors', () => {
       minimalConfig
     );
 
-    // max_attempts: 2 = 2 retries → 3 total attempts (delay_ms: 1 keeps test fast)
+    // max_attempts: 2 = 2 retries -> 3 total attempts (delay_ms: 1 keeps test fast)
     expect(callCount).toBe(3);
     expect(mockDeps.store.failWorkflowRun as ReturnType<typeof mock>).toHaveBeenCalled();
   }, 5_000);
@@ -2162,7 +2162,7 @@ describe('executeDagWorkflow -- node-level retry for transient errors', () => {
       minimalConfig
     );
 
-    // FATAL error must not be retried — exactly 1 attempt
+    // FATAL error must not be retried -- exactly 1 attempt
     expect(callCount).toBe(1);
     expect(mockDeps.store.failWorkflowRun as ReturnType<typeof mock>).toHaveBeenCalled();
   });
@@ -2457,7 +2457,7 @@ describe('executeDagWorkflow -- tool_completed event emission', () => {
 });
 
 // ---------------------------------------------------------------------------
-// loadMcpConfig — per-node MCP server config loading (#445)
+// loadMcpConfig -- per-node MCP server config loading (#445)
 // ---------------------------------------------------------------------------
 
 describe('loadMcpConfig', () => {
@@ -2579,7 +2579,7 @@ describe('loadMcpConfig', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Skills — executor-level behavior (#446)
+// Skills -- executor-level behavior (#446)
 // ---------------------------------------------------------------------------
 
 describe('executeDagWorkflow -- skills options', () => {
@@ -2640,7 +2640,7 @@ describe('executeDagWorkflow -- skills options', () => {
     expect(mockSendQueryDag.mock.calls.length).toBeGreaterThan(0);
     const optionsArg = mockSendQueryDag.mock.calls[0][3] as Record<string, unknown>;
     const nodeConfig = optionsArg?.nodeConfig as Record<string, unknown>;
-    // skills are passed in nodeConfig — provider translates to agents internally
+    // skills are passed in nodeConfig -- provider translates to agents internally
     expect(nodeConfig?.skills).toEqual(['codebase-search', 'test-runner']);
   });
 
@@ -2678,7 +2678,7 @@ describe('executeDagWorkflow -- skills options', () => {
     expect(mockSendQueryDag.mock.calls.length).toBeGreaterThan(0);
     const optionsArg = mockSendQueryDag.mock.calls[0][3] as Record<string, unknown>;
     const nodeConfig = optionsArg?.nodeConfig as Record<string, unknown>;
-    // skills and allowed_tools are both in nodeConfig — provider merges internally
+    // skills and allowed_tools are both in nodeConfig -- provider merges internally
     expect(nodeConfig?.skills).toEqual(['codebase-search']);
     expect(nodeConfig?.allowed_tools).toEqual(['Read', 'Grep']);
   });
@@ -2808,7 +2808,7 @@ describe('executeDagWorkflow -- skills options', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Skills — loader validation via discoverWorkflows (#446)
+// Skills -- loader validation via discoverWorkflows (#446)
 // ---------------------------------------------------------------------------
 
 describe('skills field validation via parseWorkflow', () => {
@@ -2896,7 +2896,7 @@ nodes:
 });
 
 // ---------------------------------------------------------------------------
-// Inline agents — field validation via parseWorkflow
+// Inline agents -- field validation via parseWorkflow
 // ---------------------------------------------------------------------------
 
 describe('agents field validation via parseWorkflow', () => {
@@ -3329,7 +3329,7 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
     );
   });
 
-  // ─── Loop Node Tests ─────────────────────────────────────────────────────
+  // --- Loop Node Tests -----------------------------------------------------
 
   describe('loop node execution', () => {
     it('completes on <promise>COMPLETE</promise> signal in first iteration', async () => {
@@ -3590,7 +3590,7 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
 
       expect(mockSendQueryDag.mock.calls.length).toBe(2);
       const promptIter2 = mockSendQueryDag.mock.calls[1][0] as string;
-      // The previous-output payload must be the *cleaned* output — no <promise> tags.
+      // The previous-output payload must be the *cleaned* output -- no <promise> tags.
       expect(promptIter2).toContain('PREV=[Real work output.');
       expect(promptIter2).not.toContain('<promise>');
     });
@@ -3599,14 +3599,14 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
       // Regression guard for the resume-from-approval path: when an interactive
       // loop pauses at the approval gate, the prior `lastIterationOutput` lives
       // in a separate process and is not persisted. On resume, the executor must
-      // substitute $LOOP_PREV_OUTPUT to '' on the first resumed iteration —
+      // substitute $LOOP_PREV_OUTPUT to '' on the first resumed iteration --
       // never to whatever the paused run produced.
       //
       // Wirasm-suggested shape (PR #1367 review): two executeDagWorkflow calls.
       // The first call pauses at the gate after iteration 1; the second call
       // resumes with metadata.approval populated and runs iteration 2.
 
-      // ---- Call 1: fresh run, iteration 1 emits no completion → pauses at gate
+      // ---- Call 1: fresh run, iteration 1 emits no completion -> pauses at gate
       mockSendQueryDag.mockImplementationOnce(function* () {
         yield { type: 'assistant', content: 'Iter1 output: 2 type errors in users.ts' };
         yield { type: 'result', sessionId: 'loop-session-1' };
@@ -3665,7 +3665,7 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
         iteration: 1,
       });
 
-      // ---- Call 2: resumed run — metadata carries iter 1 + user input.
+      // ---- Call 2: resumed run -- metadata carries iter 1 + user input.
       // iter 2 emits the completion signal so the loop exits cleanly.
       mockSendQueryDag.mockImplementationOnce(function* () {
         yield { type: 'assistant', content: 'All clear. <promise>COMPLETE</promise>' };
@@ -3719,7 +3719,7 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
 
       // Second executeDagWorkflow call started a fresh sendQuery generator (mock
       // call index 1 across the two runs). The resumed iteration must NOT carry
-      // the prior process's iter-1 output through $LOOP_PREV_OUTPUT — it must
+      // the prior process's iter-1 output through $LOOP_PREV_OUTPUT -- it must
       // substitute to ''.
       expect(mockSendQueryDag.mock.calls.length).toBe(2);
       const promptResumeIter = mockSendQueryDag.mock.calls[1][0] as string;
@@ -3829,7 +3829,7 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
         minimalConfig
       );
 
-      // 3 iterations run, signal found on iteration 3 → completed, NOT failed
+      // 3 iterations run, signal found on iteration 3 -> completed, NOT failed
       expect(mockSendQueryDag.mock.calls.length).toBe(3);
       expect(
         (
@@ -4264,7 +4264,7 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
       ).toBe(1);
     });
 
-    // ─── Interactive Loop Tests ────────────────────────────────────────────
+    // --- Interactive Loop Tests --------------------------------------------
 
     it('interactive loop with gate_message pauses after first iteration', async () => {
       mockSendQueryDag.mockImplementation(function* () {
@@ -4368,7 +4368,7 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
 
       // On first iteration (fresh start, no user input), the loop MUST pause
       // at the gate even if the AI emits the completion signal. The user hasn't
-      // seen anything yet — they must review before the loop can exit.
+      // seen anything yet -- they must review before the loop can exit.
       const pauseCalls = (
         mockDeps.store.pauseWorkflowRun as Mock<
           (id: string, ctx: Record<string, unknown>) => Promise<void>
@@ -4622,17 +4622,17 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
       expect(pauseCalls.length).toBe(0);
     });
 
-    // ─── Sticky signal detection ───────────────────────────────────────────
+    // --- Sticky signal detection -------------------------------------------
 
     it('sticky detection: signal in iteration 1 exits loop before max_iterations', async () => {
       // stickySignalDetected is set true in iteration 1. The mock yields no signal in
-      // iteration 2+ to prove the loop doesn't need re-emission — but with correct
+      // iteration 2+ to prove the loop doesn't need re-emission -- but with correct
       // detection, the loop exits after iteration 1 (stickySignalDetected || bashComplete).
       let callCount = 0;
       mockSendQueryDag.mockImplementation(function* () {
         callCount++;
         if (callCount === 1) {
-          // Iteration 1: signal on its own line → signalDetected=true → stickySignalDetected=true
+          // Iteration 1: signal on its own line -> signalDetected=true -> stickySignalDetected=true
           yield { type: 'assistant', content: 'All checks passed.\nCOMPLETE' };
         } else {
           // Iteration 2+: deliberately no signal (validates sticky prevents max_iter failure)
@@ -4673,7 +4673,7 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
         minimalConfig
       );
 
-      // Loop exits after iteration 1 — stickySignalDetected becomes true and
+      // Loop exits after iteration 1 -- stickySignalDetected becomes true and
       // completionDetected = stickySignalDetected || bashComplete = true.
       expect(mockSendQueryDag.mock.calls.length).toBe(1);
       expect(
@@ -4731,7 +4731,7 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
         minimalConfig
       );
 
-      // Signal detected (XML wrapped) → stickySignalDetected=true → exits after 1 iteration.
+      // Signal detected (XML wrapped) -> stickySignalDetected=true -> exits after 1 iteration.
       // The until_bash expansion (test -f .archon/done.txt) is a secondary check; on
       // environments without bash it gracefully degrades to bashComplete=false.
       expect(mockSendQueryDag.mock.calls.length).toBe(1);
@@ -4783,12 +4783,12 @@ describe('executeDagWorkflow -- break after result (no hang on subprocess exit)'
     }
   });
 
-  it('command/prompt node completes immediately after result — does not block on post-result messages', async () => {
+  it('command/prompt node completes immediately after result -- does not block on post-result messages', async () => {
     // Generator yields result then hangs forever (simulates subprocess that won't exit)
     mockSendQueryDag.mockImplementation(async function* () {
       yield { type: 'assistant', content: 'response' };
       yield { type: 'result', sessionId: 'sess-break' };
-      // Subprocess hangs — without break, this blocks until idle timeout
+      // Subprocess hangs -- without break, this blocks until idle timeout
       await new Promise<void>(() => {});
     });
 
@@ -4814,14 +4814,14 @@ describe('executeDagWorkflow -- break after result (no hang on subprocess exit)'
         minimalConfig
       ).then(() => 'completed'),
       new Promise<string>((_, reject) =>
-        setTimeout(() => reject(new Error('Timed out — break after result not working')), 5000)
+        setTimeout(() => reject(new Error('Timed out -- break after result not working')), 5000)
       ),
     ]);
 
     expect(result).toBe('completed');
   });
 
-  it('loop node completes immediately after result — does not block on post-result messages', async () => {
+  it('loop node completes immediately after result -- does not block on post-result messages', async () => {
     // Generator yields result then hangs forever
     mockSendQueryDag.mockImplementation(async function* () {
       yield { type: 'assistant', content: 'All done. COMPLETE' };
@@ -4859,7 +4859,7 @@ describe('executeDagWorkflow -- break after result (no hang on subprocess exit)'
         minimalConfig
       ).then(() => 'completed'),
       new Promise<string>((_, reject) =>
-        setTimeout(() => reject(new Error('Timed out — break after result not working')), 5000)
+        setTimeout(() => reject(new Error('Timed out -- break after result not working')), 5000)
       ),
     ]);
 
@@ -4986,7 +4986,7 @@ describe('executeDagWorkflow -- terminal node output selection', () => {
   });
 
   it('does NOT fail node when stream yields no assistant text but a structuredOutput is present', async () => {
-    // Output-format nodes legitimately produce zero free-form text — the
+    // Output-format nodes legitimately produce zero free-form text -- the
     // useful payload is the structuredOutput field. The empty-output guard
     // must spare them.
     mockSendQueryDag.mockImplementation(async function* () {
@@ -5272,7 +5272,7 @@ describe('executeDagWorkflow -- credit exhaustion', () => {
 
   it('marks node as failed when assistant output contains credit exhaustion text', async () => {
     const creditExhaustedQuery = mock(function* () {
-      yield { type: 'assistant', content: "You're out of extra usage · resets in 2h" };
+      yield { type: 'assistant', content: "You're out of extra usage - resets in 2h" };
       yield { type: 'result', sessionId: 'dag-session-credit' };
     });
     mockGetAgentProviderDag.mockReturnValue({
@@ -5462,7 +5462,7 @@ describe('executeDagWorkflow -- approval node', () => {
     const mockDeps = createMockDeps(store);
     const platform = createMockPlatform();
 
-    // Simulate a rejection resume — metadata has rejection_reason set by reject handler
+    // Simulate a rejection resume -- metadata has rejection_reason set by reject handler
     const workflowRun = makeWorkflowRun('reject-resume-run', {
       metadata: {
         approval: {
@@ -5786,7 +5786,7 @@ describe('executeDagWorkflow -- approval node', () => {
     });
 
     // The fix touches FOUR emission sites (safeSendMessage / createWorkflowEvent /
-    // pauseWorkflowRun / event-emitter). Assert the other two reachable surfaces too —
+    // pauseWorkflowRun / event-emitter). Assert the other two reachable surfaces too --
     // a future regression at any one of them would otherwise pass this test silently.
     // (Per CodeRabbit review of PR coleam00/Archon#1426.)
 
@@ -6079,7 +6079,7 @@ describe('executeDagWorkflow -- Claude SDK advanced options', () => {
 
   it('error message includes cost cap when maxBudgetUsd is set', async () => {
     // 'ok' runs first (no deps), then 'capped' runs after (depends_on: ['ok'])
-    // This ensures both nodes run — 'ok' succeeds, 'capped' hits the budget cap
+    // This ensures both nodes run -- 'ok' succeeds, 'capped' hits the budget cap
     let callCount = 0;
     mockSendQueryDag.mockImplementation(function* () {
       callCount++;
@@ -6839,13 +6839,13 @@ describe('executeDagWorkflow -- token tracking', () => {
   // -------------------------------------------------------------------------
   // The SDK can yield tokens BEFORE signalling msg.isError. The original patch
   // surfaced tokens on completed and on the result tuple, but the persisted
-  // node_failed / loop_iteration_failed events still omitted data.tokens —
+  // node_failed / loop_iteration_failed events still omitted data.tokens --
   // losing per-node token attribution exactly for the failure cases that the
   // diagnostic graph needs most. These tests pin the fix.
 
   it('Scenario 9 -- node_failed event persists data.tokens when SDK yielded tokens before erroring', async () => {
     // Mirrors the existing "fails node when SDK returns error_during_execution"
-    // test but the result now also carries tokens — the failed event MUST
+    // test but the result now also carries tokens -- the failed event MUST
     // surface them.
     mockSendQueryDag.mockImplementation(function* () {
       yield {
@@ -6993,7 +6993,7 @@ describe('executeDagWorkflow -- token tracking', () => {
 
   it('Scenario 11 -- loop_iteration_failed (empty output) persists aggregated loop tokens', async () => {
     // Iteration 1 yields tokens, iteration 2 yields empty assistant output
-    // (no content) — the loop fails. The persisted loop_iteration_failed
+    // (no content) -- the loop fails. The persisted loop_iteration_failed
     // event MUST include the accumulated loopTotalTokens from iteration 1.
     let callCount = 0;
     mockSendQueryDag.mockImplementation(function* () {
@@ -7006,7 +7006,7 @@ describe('executeDagWorkflow -- token tracking', () => {
           tokens: { input: 800, output: 400, total: 1200 },
         };
       } else {
-        // Empty assistant output — triggers the empty-output failure branch.
+        // Empty assistant output -- triggers the empty-output failure branch.
         yield { type: 'result', sessionId: 'loop-fail-sid-2' };
       }
     });
@@ -7293,7 +7293,7 @@ describe('executeDagWorkflow -- script nodes', () => {
         user_message: 'test',
       });
 
-      // 200 × 16 chars ≈ 3.2 KB — larger than SUBPROCESS_ERROR_MAX_CHARS (2 KB),
+      // 200 x 16 chars ~= 3.2 KB -- larger than SUBPROCESS_ERROR_MAX_CHARS (2 KB),
       // so any leak of the script body via err.message would violate the length
       // assertion below. Bun's stderr echoes only a few lines of context.
       const paddingAboveMax = '// padding line '.repeat(200);
@@ -7333,7 +7333,7 @@ describe('executeDagWorkflow -- script nodes', () => {
       // 2 KB diagnostic cap + label prefix + truncation marker should stay under
       // 2.1 KB. Bumping SUBPROCESS_ERROR_MAX_CHARS would trip this.
       expect(errorMsg.length).toBeLessThan(2100);
-      // Bun emits `error: <description>\n    at [eval]:L:C` for parse failures —
+      // Bun emits `error: <description>\n    at [eval]:L:C` for parse failures --
       // the location marker is the strongest signal that the diagnostic survived.
       expect(errorMsg).toContain('[eval]');
     }
@@ -7437,7 +7437,7 @@ describe('executeDagWorkflow -- script nodes', () => {
     const nodes: DagNode[] = [
       {
         id: 'script-out',
-        // Print the run ID and artifacts dir — after substitution these are real values
+        // Print the run ID and artifacts dir -- after substitution these are real values
         script: 'console.log("id=$WORKFLOW_ID artifacts=$ARTIFACTS_DIR")',
         runtime: 'bun',
       },
@@ -7477,7 +7477,7 @@ describe('executeDagWorkflow -- script nodes', () => {
       user_message: 'notfound test',
     });
 
-    // Do NOT create .archon/scripts/missing.ts — the script should fail to resolve
+    // Do NOT create .archon/scripts/missing.ts -- the script should fail to resolve
     const scriptNode: ScriptNode = {
       id: 'gone-script',
       script: 'missing',
@@ -7542,7 +7542,7 @@ describe('executeDagWorkflow -- script nodes', () => {
       minimalConfig
     );
 
-    // The node output should be "CLEAN" — the repo .env was not loaded
+    // The node output should be "CLEAN" -- the repo .env was not loaded
     const eventCalls = (mockDeps.store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls;
     const completedEvent = eventCalls.find(
       (call: unknown[]) =>
@@ -7609,7 +7609,7 @@ describe('parseMcpFailureServerNames', () => {
 
   it('returns empty array for unrelated messages', async () => {
     const { parseMcpFailureServerNames } = await import('./dag-executor');
-    expect(parseMcpFailureServerNames('⚠️ Something else')).toEqual([]);
+    expect(parseMcpFailureServerNames('! Something else')).toEqual([]);
     expect(parseMcpFailureServerNames('')).toEqual([]);
   });
 
@@ -7698,7 +7698,7 @@ describe('loadConfiguredMcpServerNames', () => {
 });
 
 // ---------------------------------------------------------------------------
-// MCP plugin-noise filtering — end-to-end through executeDagWorkflow
+// MCP plugin-noise filtering -- end-to-end through executeDagWorkflow
 // ---------------------------------------------------------------------------
 
 describe('executeDagWorkflow -- MCP failure filtering', () => {
@@ -7763,7 +7763,7 @@ describe('executeDagWorkflow -- MCP failure filtering', () => {
     const calls = (platform.sendMessage as Mock<typeof platform.sendMessage>).mock.calls;
     return calls
       .map(c => c[1] as string)
-      .filter(m => m.startsWith('MCP server connection failed:') || m.startsWith('⚠️'));
+      .filter(m => m.startsWith('MCP server connection failed:') || m.startsWith('!'));
   }
 
   it('forwards only workflow-configured failures and preserves status detail', async () => {
@@ -7795,10 +7795,10 @@ describe('executeDagWorkflow -- MCP failure filtering', () => {
     expect(mcpMessages(platform)).toEqual([]);
   });
 
-  it('forwards ⚠️ provider warnings verbatim', async () => {
-    const platform = await runWithSystemChunk('⚠️ Haiku does not support MCP');
+  it('forwards ! provider warnings verbatim', async () => {
+    const platform = await runWithSystemChunk('! Haiku does not support MCP');
 
-    expect(mcpMessages(platform)).toEqual(['⚠️ Haiku does not support MCP']);
+    expect(mcpMessages(platform)).toEqual(['! Haiku does not support MCP']);
   });
 
   it('forwards [CODEX FAILBACK] system chunks and appends to node output text', async () => {
@@ -7867,7 +7867,7 @@ describe('shouldContinueStreamingForStatus', () => {
   it('continues when status is paused (sibling approval node in same layer)', async () => {
     // The key invariant: a concurrent approval node can pause the run while a
     // streaming AI node is mid-response. The streaming node must finish its
-    // own output — workflow progression is gated by the approval node, not
+    // own output -- workflow progression is gated by the approval node, not
     // by tearing down unrelated in-flight streams.
     const { shouldContinueStreamingForStatus } = await import('./dag-executor');
     expect(shouldContinueStreamingForStatus('paused')).toBe(true);
@@ -7902,7 +7902,7 @@ describe('shouldContinueStreamingForStatus', () => {
 
 describe('executeDagWorkflow -- final status derivation', () => {
   // Invariant: if ANY non-skipped node has failed status, the run must be
-  // marked 'failed' — never 'completed' — regardless of how many other nodes
+  // marked 'failed' -- never 'completed' -- regardless of how many other nodes
   // succeeded. This covers the anyFailed branch in executeDagWorkflow
   // (dag-executor.ts ~line 2956), which had no direct test coverage.
   let testDir: string;
@@ -8025,7 +8025,7 @@ describe('executeDagWorkflow -- final status derivation', () => {
     const workflowRun = makeWorkflowRun('dag-status-run-3');
 
     // Layer 1: A and B run in parallel. B fails.
-    // Layer 2: C depends on B with trigger_rule: none_failed — so C is skipped.
+    // Layer 2: C depends on B with trigger_rule: none_failed -- so C is skipped.
     // Expected: anyFailed=true (from B), so run must be marked failed even though C is only skipped.
     const nodes: DagNode[] = [
       { id: 'a', bash: 'echo a' } as BashNode,
@@ -8128,7 +8128,7 @@ describe('agent persona dispatch', () => {
     expect(nodeConfig.allowed_tools).toEqual(['Read', 'Grep']);
   });
 
-  it('prompt node with agent: and model: mismatch — persona model wins', async () => {
+  it('prompt node with agent: and model: mismatch -- persona model wins', async () => {
     await writeAgentFile('sonnet-test-agent', 'sonnet');
 
     const mockStore = createMockStore();
@@ -8136,7 +8136,7 @@ describe('agent persona dispatch', () => {
     const platform = createMockPlatform();
     const workflowRun = makeWorkflowRun('agent-persona-run-2');
 
-    // Node declares model: opus but agent persona is sonnet — persona should win
+    // Node declares model: opus but agent persona is sonnet -- persona should win
     const nodes: DagNode[] = [
       {
         id: 'plan',
@@ -8174,7 +8174,7 @@ describe('agent persona dispatch', () => {
     const platform = createMockPlatform();
     const workflowRun = makeWorkflowRun('agent-persona-run-3');
 
-    // No agent: field — uses current behavior (no persona tool restriction)
+    // No agent: field -- uses current behavior (no persona tool restriction)
     const nodes: DagNode[] = [{ id: 'step', prompt: 'Do the thing.' } as DagNode];
 
     await executeDagWorkflow(

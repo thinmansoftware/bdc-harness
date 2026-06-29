@@ -6,7 +6,7 @@ import * as realPaths from '@archon/paths';
 
 // Mock only the logger so test output stays clean. All other @archon/paths
 // exports (findMarkdownFilesRecursive, getHomeCommandsPath, etc.) use real
-// implementations — loadCommandPrompt exercises them against a tmp dir set
+// implementations -- loadCommandPrompt exercises them against a tmp dir set
 // via ARCHON_HOME below.
 const mockLogFn = mock(() => {});
 const mockLogger = {
@@ -29,14 +29,14 @@ mock.module('@archon/paths', () => ({
 import { loadCommandPrompt } from './executor-shared';
 import type { WorkflowDeps } from './deps';
 
-// Minimal deps stub — loadCommandPrompt only calls loadConfig.
+// Minimal deps stub -- loadCommandPrompt only calls loadConfig.
 function makeDeps(loadDefaultCommands = true): WorkflowDeps {
   return {
     loadConfig: async () => ({ defaults: { loadDefaultCommands } }),
   } as unknown as WorkflowDeps;
 }
 
-describe('loadCommandPrompt — home-scope resolution', () => {
+describe('loadCommandPrompt -- home-scope resolution', () => {
   let archonHome: string;
   let repoRoot: string;
   let prevArchonHome: string | undefined;

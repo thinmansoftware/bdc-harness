@@ -78,17 +78,17 @@ export function buildRoutingRules(): string {
  */
 export function buildRoutingRulesWithProject(projectName?: string): string {
   const rule4 = projectName
-    ? `4. If ambiguous which project → use **${projectName}** (the active project)`
-    : '4. If ambiguous which project → ask the user';
+    ? `4. If ambiguous which project -> use **${projectName}** (the active project)`
+    : '4. If ambiguous which project -> ask the user';
 
   return `## Routing Rules
 
-1. If the user asks a question, wants to explore code, or needs help → answer directly
-2. If the user wants structured development work → invoke the appropriate workflow
-3. If the user mentions a specific project → use that project's name
+1. If the user asks a question, wants to explore code, or needs help -> answer directly
+2. If the user wants structured development work -> invoke the appropriate workflow
+3. If the user mentions a specific project -> use that project's name
 ${rule4}
-5. If no project needed (general question) → answer directly without workflow
-6. If the user wants to add a new project → clone it, then register it (see below)
+5. If no project needed (general question) -> answer directly without workflow
+6. If the user wants to add a new project -> clone it, then register it (see below)
 
 ## Workflow Invocation Format
 
@@ -98,20 +98,20 @@ When invoking a workflow, output the command as the VERY LAST line of your respo
 Rules:
 - Use the project NAME (e.g., "my-project"), not an ID or path.
 - The --prompt MUST be a complete, self-contained task description that fully captures the user's intent.
-- Synthesize the prompt from conversation context — do NOT use vague references like "do what we discussed" or "yes, go ahead."
+- Synthesize the prompt from conversation context -- do NOT use vague references like "do what we discussed" or "yes, go ahead."
 - The prompt should make sense to someone with NO knowledge of the conversation history.
 - You may include a brief explanation before the command. The user will see this text.
 - /invoke-workflow MUST be the absolute last thing in your response. Do NOT use any tools or generate additional text after it.
 
 Routing behavior:
-- If the user clearly wants work done (e.g., "create a plan for X", "implement Y", "fix Z") → include a brief explanation of what you're doing, then invoke the workflow.
-- If the user is asking a question or it's unclear whether they want a workflow → answer their question directly. You may suggest a workflow by name (e.g., "I can run the **archon-assist** workflow for this if you'd like"), but do NOT include /invoke-workflow in your response.
+- If the user clearly wants work done (e.g., "create a plan for X", "implement Y", "fix Z") -> include a brief explanation of what you're doing, then invoke the workflow.
+- If the user is asking a question or it's unclear whether they want a workflow -> answer their question directly. You may suggest a workflow by name (e.g., "I can run the **archon-assist** workflow for this if you'd like"), but do NOT include /invoke-workflow in your response.
 
 Example (clear intent):
 I'll analyze the orchestrator module architecture for you.
 /invoke-workflow archon-assist --project my-project --prompt "Analyze the orchestrator module architecture: explain how it routes messages, manages sessions, and dispatches workflows to AI clients"
 
-Example (ambiguous — answer directly):
+Example (ambiguous -- answer directly):
 User: "What do you think about adding dark mode?"
 Response: "Adding dark mode would involve... [answer the question]. If you'd like me to create a plan for this, I can run the **archon-idea-to-pr** workflow."
 

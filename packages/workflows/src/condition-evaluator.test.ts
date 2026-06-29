@@ -286,7 +286,7 @@ describe('evaluateCondition', () => {
   // --- Operator precedence: && binds tighter than || ---
 
   it('&& has higher precedence than ||: (A && B) || C', () => {
-    // A=false, B=true, C=true → (false && true) || true = true
+    // A=false, B=true, C=true -> (false && true) || true = true
     const outputs = new Map([
       ['a', makeOutput('Z')],
       ['b', makeOutput('Y')],
@@ -295,7 +295,7 @@ describe('evaluateCondition', () => {
     expect(
       evaluateCondition("$a.output == 'X' && $b.output == 'Y' || $c.output == 'V'", outputs).result
     ).toBe(true);
-    // A=true, B=false, C=false → (true && false) || false = false
+    // A=true, B=false, C=false -> (true && false) || false = false
     const outputs2 = new Map([
       ['a', makeOutput('X')],
       ['b', makeOutput('Z')],
@@ -333,7 +333,7 @@ describe('evaluateCondition', () => {
     expect(res.parsed).toBe(false);
   });
 
-  it('|| operator: short-circuits on true first clause — invalid second clause is not evaluated', () => {
+  it('|| operator: short-circuits on true first clause -- invalid second clause is not evaluated', () => {
     // When the first OR clause is true, the second clause (even if invalid) is not reached.
     // This is intentional short-circuit OR behavior. A typo in a later OR clause will still
     // surface as a parse error on runs where the earlier clauses are false.

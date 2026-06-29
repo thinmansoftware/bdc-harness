@@ -11,7 +11,7 @@ import {
   usageToTokens,
 } from './event-bridge';
 
-// ─── AsyncQueue ────────────────────────────────────────────────────────────
+// --- AsyncQueue ------------------------------------------------------------
 
 describe('AsyncQueue', () => {
   test('buffers pushes before consumer starts', async () => {
@@ -94,7 +94,7 @@ describe('AsyncQueue', () => {
   });
 });
 
-// ─── serializeToolResult ───────────────────────────────────────────────────
+// --- serializeToolResult ---------------------------------------------------
 
 describe('serializeToolResult', () => {
   test('returns strings verbatim', () => {
@@ -118,7 +118,7 @@ describe('serializeToolResult', () => {
   });
 });
 
-// ─── usageToTokens ─────────────────────────────────────────────────────────
+// --- usageToTokens ---------------------------------------------------------
 
 describe('usageToTokens', () => {
   test('maps Pi Usage to Archon TokenUsage', () => {
@@ -139,7 +139,7 @@ describe('usageToTokens', () => {
   });
 });
 
-// ─── buildResultChunk ──────────────────────────────────────────────────────
+// --- buildResultChunk ------------------------------------------------------
 
 describe('buildResultChunk', () => {
   const usage = {
@@ -152,7 +152,7 @@ describe('buildResultChunk', () => {
   };
 
   test('flags isError when no assistant message is present', () => {
-    // agent_end with no assistant message in the transcript is anomalous —
+    // agent_end with no assistant message in the transcript is anomalous --
     // must surface as an error so the orchestrator doesn't treat a broken
     // session as a clean success.
     const expected = {
@@ -198,7 +198,7 @@ describe('buildResultChunk', () => {
       expect(chunk1.isError).toBe(true);
       expect(chunk1.errors).toBeUndefined();
     }
-    // empty string — also falsy, also excluded from errors[]
+    // empty string -- also falsy, also excluded from errors[]
     const chunk2 = buildResultChunk([
       { role: 'assistant', usage, stopReason: 'error', errorMessage: '', content: [] },
     ]);
@@ -230,10 +230,10 @@ describe('buildResultChunk', () => {
   });
 });
 
-// ─── mapPiEvent ────────────────────────────────────────────────────────────
+// --- mapPiEvent ------------------------------------------------------------
 
 describe('mapPiEvent', () => {
-  test('text_delta → assistant chunk', () => {
+  test('text_delta -> assistant chunk', () => {
     const chunks = mapPiEvent({
       type: 'message_update',
       message: { role: 'assistant' } as never,
@@ -247,7 +247,7 @@ describe('mapPiEvent', () => {
     expect(chunks).toEqual([{ type: 'assistant', content: 'hi' }]);
   });
 
-  test('thinking_delta → thinking chunk', () => {
+  test('thinking_delta -> thinking chunk', () => {
     const chunks = mapPiEvent({
       type: 'message_update',
       message: { role: 'assistant' } as never,
@@ -274,7 +274,7 @@ describe('mapPiEvent', () => {
     expect(chunks).toEqual([]);
   });
 
-  test('tool_execution_start → tool chunk with toolCallId', () => {
+  test('tool_execution_start -> tool chunk with toolCallId', () => {
     const chunks = mapPiEvent({
       type: 'tool_execution_start',
       toolCallId: 'call-123',
@@ -301,7 +301,7 @@ describe('mapPiEvent', () => {
     expect(chunks[0]).toMatchObject({ type: 'tool', toolInput: {} });
   });
 
-  test('tool_execution_end → tool_result chunk with matching id', () => {
+  test('tool_execution_end -> tool_result chunk with matching id', () => {
     const chunks = mapPiEvent({
       type: 'tool_execution_end',
       toolCallId: 'call-123',
@@ -332,7 +332,7 @@ describe('mapPiEvent', () => {
     expect(chunks[1].type).toBe('tool_result');
   });
 
-  test('auto_retry_start → system chunk', () => {
+  test('auto_retry_start -> system chunk', () => {
     const chunks = mapPiEvent({
       type: 'auto_retry_start',
       attempt: 1,
@@ -348,7 +348,7 @@ describe('mapPiEvent', () => {
     }
   });
 
-  test('agent_end → result chunk', () => {
+  test('agent_end -> result chunk', () => {
     const usage = {
       input: 5,
       output: 10,
@@ -391,7 +391,7 @@ describe('mapPiEvent', () => {
   });
 });
 
-// ─── tryParseStructuredOutput ──────────────────────────────────────────────
+// --- tryParseStructuredOutput ----------------------------------------------
 
 describe('tryParseStructuredOutput', () => {
   test('parses clean JSON object', () => {
@@ -438,9 +438,9 @@ describe('tryParseStructuredOutput', () => {
     // from the first `{` (preamble has no braces) recovers the payload.
     const minimax =
       'Now I have all the inputs. Let me evaluate the three gates:\n\n' +
-      '**Gate A — Direction alignment**: aligned\n' +
-      '**Gate B — Scope**: focused\n' +
-      '**Gate C — Template**: partial\n\n' +
+      '**Gate A -- Direction alignment**: aligned\n' +
+      '**Gate B -- Scope**: focused\n' +
+      '**Gate C -- Template**: partial\n\n' +
       '{"verdict":"review","direction_alignment":"aligned","scope_assessment":"focused","template_quality":"partial"}';
     expect(tryParseStructuredOutput(minimax)).toEqual({
       verdict: 'review',
@@ -492,19 +492,19 @@ describe('tryParseStructuredOutput', () => {
   });
 });
 
-// ─── bridgeSession cleanup ─────────────────────────────────────────────────
+// --- bridgeSession cleanup -------------------------------------------------
 
 describe('bridgeSession cleanup', () => {
   // Regression for #1561: when the consumer throws mid-iteration, bridgeSession's
   // finally block calls session.dispose() and used to await the prompt promise
   // for a "settle so callers see no dangling work" guarantee. That guarantee
-  // was illusory — the queue is closed before the await, so a settled prompt
+  // was illusory -- the queue is closed before the await, so a settled prompt
   // pushes into a closed queue (no-op). The await only existed to suppress
   // unhandled rejections, and it caused #1561: when Pi's prompt() hung after
   // dispose(), the await blocked forever, the consumer's catch never ran, and
   // Bun drained its event loop and exited with code 0 mid-workflow.
   //
-  // The fix is to not await at all — attach a fire-and-forget .catch() so a
+  // The fix is to not await at all -- attach a fire-and-forget .catch() so a
   // late rejection doesn't crash the process. Cleanup is non-blocking
   // regardless of whether prompt() settles.
   test('cleanup does not block when session.prompt() hangs forever after dispose()', async () => {
@@ -517,7 +517,7 @@ describe('bridgeSession cleanup', () => {
       sessionId: 'test-session-id',
       prompt: () => neverSettles,
       dispose: () => {
-        /* synchronous noop — does NOT settle prompt() */
+        /* synchronous noop -- does NOT settle prompt() */
       },
       subscribe: (l: (e: AgentSessionEvent) => void) => {
         listenerRef = l;
@@ -559,7 +559,7 @@ describe('bridgeSession cleanup', () => {
 
     expect(receivedChunk).toBe(true);
     expect(caught?.message).toBe('simulated consumer abort');
-    // Cleanup must return immediately — no timer, no waiting on prompt().
+    // Cleanup must return immediately -- no timer, no waiting on prompt().
     // 200ms is generous for scheduling overhead while still catching any
     // future regression that re-introduces an await on promptPromise.
     expect(elapsed).toBeLessThan(200);

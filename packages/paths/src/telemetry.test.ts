@@ -117,7 +117,7 @@ describe('telemetry ID persistence', () => {
     saved = saveEnv();
     tmpHome = mkdtempSync(join(tmpdir(), 'archon-telemetry-test-'));
     process.env.ARCHON_HOME = tmpHome;
-    // Force-disable actual network capture — we only exercise the ID path.
+    // Force-disable actual network capture -- we only exercise the ID path.
     process.env.ARCHON_TELEMETRY_DISABLED = '1';
     resetTelemetryForTests();
   });
@@ -141,7 +141,7 @@ describe('telemetry ID persistence', () => {
 
     resetTelemetryForTests();
 
-    // Direct, synchronous call — no network, no fire-and-forget, no timer.
+    // Direct, synchronous call -- no network, no fire-and-forget, no timer.
     const resolved = getOrCreateTelemetryId();
 
     expect(resolved).toBe(existingId);

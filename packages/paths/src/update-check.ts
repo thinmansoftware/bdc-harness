@@ -87,7 +87,7 @@ export function parseLatestRelease(json: unknown): { version: string; url: strin
 }
 
 /**
- * Full update check: read cache → fetch if stale → write cache → return result.
+ * Full update check: read cache -> fetch if stale -> write cache -> return result.
  * Network errors are swallowed (returns null).
  * Only call when BUNDLED_IS_BINARY is true.
  */

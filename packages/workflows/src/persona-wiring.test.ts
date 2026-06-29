@@ -2,14 +2,14 @@
  * Verifies persona: declarations across bdc-* workflow YAMLs reference
  * agents that actually exist in .archon/agents/ AND that the harness
  * runtime treats `persona:` as a first-class alias for `agent:` (i.e. the
- * load-path actually loads the persona — not just that the name is valid).
+ * load-path actually loads the persona -- not just that the name is valid).
  *
  * History:
  *  - 2026-05-17 retrofit: original test only validated that each `persona:`
  *    name referenced a known agent. It silently passed while 51/53 nodes
  *    declared `persona:` without `agent:` and loaded NOTHING at runtime.
  *  - 2026-05-24 (WO-HARNESS-PERSONA-DECLARED-NOT-LOADED-01): strengthened to
- *    assert the load-path — the schema must accept persona-only nodes and
+ *    assert the load-path -- the schema must accept persona-only nodes and
  *    dag-executor / validator must resolve them via the `agent ?? persona`
  *    alias chain. A regression that drops the alias would make this test fail.
  */
@@ -84,14 +84,14 @@ test('plan nodes use war-council-architect persona', async () => {
 });
 
 // ---------------------------------------------------------------------------
-// 2026-05-24 (WO-HARNESS-PERSONA-DECLARED-NOT-LOADED-01) — load-path regression guards
+// 2026-05-24 (WO-HARNESS-PERSONA-DECLARED-NOT-LOADED-01) -- load-path regression guards
 // ---------------------------------------------------------------------------
 
 test('persona: declarations resolve without agent: (alias load-path regression guard)', async () => {
   // The schema must accept persona-only nodes (would FAIL pre-fix because
   // `persona:` was not a declared field on dagNodeBaseSchema and was stripped
   // silently by the transform). Sanity-check every persona declaration in the
-  // bdc-* YAMLs parses successfully as a synthetic prompt node — proving the
+  // bdc-* YAMLs parses successfully as a synthetic prompt node -- proving the
   // alias path is sufficient and does not require co-declaring `agent:`.
   for (const yamlFile of YAML_FILES) {
     const content = await readFile(join(YAML_DIR, yamlFile), 'utf-8');
@@ -100,7 +100,7 @@ test('persona: declarations resolve without agent: (alias load-path regression g
     for (const persona of personas) {
       const result = dagNodeSchema.safeParse({
         id: `synthetic-${persona}`,
-        prompt: 'synthetic test node — verifies persona: alias parses',
+        prompt: 'synthetic test node -- verifies persona: alias parses',
         persona,
       });
       expect(result.success).toBe(true);

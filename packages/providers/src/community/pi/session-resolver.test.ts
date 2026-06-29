@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, mock, test } from 'bun:test';
 
-// ─── Mock SessionManager before import ─────────────────────────────────────
+// --- Mock SessionManager before import -------------------------------------
 
 const mockCreate = mock((_cwd: string) => ({ __kind: 'created' }));
 const mockOpen = mock((_path: string) => ({ __kind: 'opened' }));
@@ -24,7 +24,7 @@ describe('resolvePiSession', () => {
     mockList.mockImplementation(async () => []);
   });
 
-  test('no resumeSessionId → create fresh session', async () => {
+  test('no resumeSessionId -> create fresh session', async () => {
     const result = await resolvePiSession('/tmp/proj', undefined);
     expect(result.resumeFailed).toBe(false);
     expect(mockCreate).toHaveBeenCalledWith('/tmp/proj');
@@ -32,7 +32,7 @@ describe('resolvePiSession', () => {
     expect(mockList).not.toHaveBeenCalled();
   });
 
-  test('resume id matches existing session → open by path', async () => {
+  test('resume id matches existing session -> open by path', async () => {
     mockList.mockImplementationOnce(async () => [
       { id: 'abc-123', path: '/sessions/abc-123.jsonl', cwd: '/tmp/proj' },
       { id: 'def-456', path: '/sessions/def-456.jsonl', cwd: '/tmp/proj' },
@@ -44,7 +44,7 @@ describe('resolvePiSession', () => {
     expect(mockCreate).not.toHaveBeenCalled();
   });
 
-  test('resume id not found → fresh session with resumeFailed=true', async () => {
+  test('resume id not found -> fresh session with resumeFailed=true', async () => {
     mockList.mockImplementationOnce(async () => [
       { id: 'abc-123', path: '/sessions/abc-123.jsonl', cwd: '/tmp/proj' },
     ]);
@@ -55,7 +55,7 @@ describe('resolvePiSession', () => {
     expect(mockOpen).not.toHaveBeenCalled();
   });
 
-  test('list() throws ENOENT → treated as not-found, fresh session', async () => {
+  test('list() throws ENOENT -> treated as not-found, fresh session', async () => {
     mockList.mockImplementationOnce(async () => {
       const err = Object.assign(new Error('no such directory'), { code: 'ENOENT' });
       throw err;
@@ -66,7 +66,7 @@ describe('resolvePiSession', () => {
     expect(mockCreate).toHaveBeenCalledWith('/tmp/proj');
   });
 
-  test('list() throws ENOTDIR → treated as not-found, fresh session', async () => {
+  test('list() throws ENOTDIR -> treated as not-found, fresh session', async () => {
     mockList.mockImplementationOnce(async () => {
       const err = Object.assign(new Error('not a directory'), { code: 'ENOTDIR' });
       throw err;
@@ -77,9 +77,9 @@ describe('resolvePiSession', () => {
     expect(mockCreate).toHaveBeenCalledWith('/tmp/proj');
   });
 
-  test('list() throws unexpected error → propagates (no silent fallback)', async () => {
+  test('list() throws unexpected error -> propagates (no silent fallback)', async () => {
     // Permission errors, parse failures, etc. must NOT be swallowed as
-    // "no resume" — that would paper over real config/filesystem problems.
+    // "no resume" -- that would paper over real config/filesystem problems.
     mockList.mockImplementationOnce(async () => {
       const err = Object.assign(new Error('permission denied'), { code: 'EACCES' });
       throw err;
@@ -89,7 +89,7 @@ describe('resolvePiSession', () => {
     expect(mockCreate).not.toHaveBeenCalled();
   });
 
-  test('list() throws plain Error → propagates (no code = not ENOENT)', async () => {
+  test('list() throws plain Error -> propagates (no code = not ENOENT)', async () => {
     mockList.mockImplementationOnce(async () => {
       throw new Error('some other failure');
     });
@@ -97,7 +97,7 @@ describe('resolvePiSession', () => {
     await expect(resolvePiSession('/tmp/proj', 'some-id')).rejects.toThrow(/some other failure/);
   });
 
-  test('empty resumeSessionId string → fresh session (no resume attempted)', async () => {
+  test('empty resumeSessionId string -> fresh session (no resume attempted)', async () => {
     // Treated as "no resume requested" by the truthy check in the resolver.
     const result = await resolvePiSession('/tmp/proj', '');
     expect(result.resumeFailed).toBe(false);

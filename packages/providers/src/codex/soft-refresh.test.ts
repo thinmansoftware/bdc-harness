@@ -45,7 +45,7 @@ mock.module('child_process', () => ({
       try {
         cfg.onSpawn?.();
       } catch {
-        /* test bug — ignore */
+        /* test bug -- ignore */
       }
       ee.emit('exit', cfg.exitCode ?? 0);
     }, cfg.delayMs ?? 1);

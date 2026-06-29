@@ -51,7 +51,7 @@ async function createCommandFile(name: string, content = '# Do something'): Prom
 // =============================================================================
 
 describe('levenshtein', () => {
-  test('identical strings → 0', () => {
+  test('identical strings -> 0', () => {
     expect(levenshtein('abc', 'abc')).toBe(0);
   });
 
@@ -67,12 +67,12 @@ describe('levenshtein', () => {
     expect(levenshtein('abc', 'axc')).toBe(1);
   });
 
-  test('empty string → length of other', () => {
+  test('empty string -> length of other', () => {
     expect(levenshtein('', 'abc')).toBe(3);
     expect(levenshtein('abc', '')).toBe(3);
   });
 
-  test('both empty → 0', () => {
+  test('both empty -> 0', () => {
     expect(levenshtein('', '')).toBe(0);
   });
 
@@ -121,10 +121,10 @@ describe('findSimilar', () => {
 });
 
 // =============================================================================
-// validateWorkflowResources — command nodes
+// validateWorkflowResources -- command nodes
 // =============================================================================
 
-describe('validateWorkflowResources — command nodes', () => {
+describe('validateWorkflowResources -- command nodes', () => {
   test('no issues when command file exists', async () => {
     await createCommandFile('my-command');
     const workflow = makeWorkflow('test', [{ id: 'step1', command: 'my-command' } as DagNode]);
@@ -165,10 +165,10 @@ describe('validateWorkflowResources — command nodes', () => {
 });
 
 // =============================================================================
-// validateWorkflowResources — MCP validation
+// validateWorkflowResources -- MCP validation
 // =============================================================================
 
-describe('validateWorkflowResources — MCP validation', () => {
+describe('validateWorkflowResources -- MCP validation', () => {
   test('error when MCP config file is missing', async () => {
     const workflow = makeWorkflow('test', [
       { id: 'step1', prompt: 'do stuff', mcp: 'missing.json' } as unknown as DagNode,
@@ -291,7 +291,7 @@ describe('discoverAvailableCommands', () => {
     expect(withDefaults.length).toBeGreaterThanOrEqual(without.length);
   });
 
-  // --- Home-scoped commands (~/.archon/commands/) — new capability
+  // --- Home-scoped commands (~/.archon/commands/) -- new capability
   describe('home-scoped commands', () => {
     let homeDir: string;
     const originalArchonHome = process.env.ARCHON_HOME;
@@ -338,7 +338,7 @@ describe('discoverAvailableCommands', () => {
     test('repo command overrides home command with the same name', async () => {
       await createHomeCommand('shared', '# Home version');
       await createCommandFile('shared', '# Repo version');
-      // Both resolve but the repo wins — validator only asserts existence, so the
+      // Both resolve but the repo wins -- validator only asserts existence, so the
       // strong behavioral assertion lives in the executor-shared loadCommand tests.
       // Here we just confirm that having both doesn't error.
       const result = await validateCommand('shared', tmpDir, { loadDefaultCommands: false });
@@ -348,10 +348,10 @@ describe('discoverAvailableCommands', () => {
 });
 
 // =============================================================================
-// validateWorkflowResources — script nodes
+// validateWorkflowResources -- script nodes
 // =============================================================================
 
-describe('validateWorkflowResources — script nodes', () => {
+describe('validateWorkflowResources -- script nodes', () => {
   test('error when named bun script file does not exist', async () => {
     const workflow = makeWorkflow('test', [
       { id: 'step1', script: 'nonexistent-script', runtime: 'bun' } as unknown as DagNode,
@@ -401,10 +401,10 @@ describe('validateWorkflowResources — script nodes', () => {
 });
 
 // =============================================================================
-// validateWorkflowResources — inline agents capability warning
+// validateWorkflowResources -- inline agents capability warning
 // =============================================================================
 
-describe('validateWorkflowResources — agents capability', () => {
+describe('validateWorkflowResources -- agents capability', () => {
   const agentsField = {
     'brief-gen': { description: 'd', prompt: 'p' },
   };

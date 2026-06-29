@@ -1,7 +1,7 @@
 import type { ProviderCapabilities } from '../../types';
 
 /**
- * Pi capabilities — intentionally conservative. Declared flags must reflect
+ * Pi capabilities -- intentionally conservative. Declared flags must reflect
  * wired-up behavior, not potential support. The dag-executor uses these to
  * warn users when a workflow node specifies a feature the provider ignores.
  *

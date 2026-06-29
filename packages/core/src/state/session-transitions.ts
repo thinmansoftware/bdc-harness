@@ -48,7 +48,7 @@ export function shouldDeactivateSession(trigger: TransitionTrigger): boolean {
 }
 
 /**
- * Detect plan→execute transition from command context.
+ * Detect plan->execute transition from command context.
  * Returns 'plan-to-execute' if transitioning, null otherwise.
  */
 export function detectPlanToExecuteTransition(

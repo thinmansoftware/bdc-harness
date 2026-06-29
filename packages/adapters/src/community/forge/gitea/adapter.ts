@@ -2,7 +2,7 @@
  * Gitea platform adapter using REST API and Webhooks
  * Handles issue and PR comments with @mention detection
  *
- * Community forge adapter — see packages/adapters/src/community/forge/README.md
+ * Community forge adapter -- see packages/adapters/src/community/forge/README.md
  */
 import { createHmac, timingSafeEqual } from 'crypto';
 import { readdir, access } from 'fs/promises';
@@ -299,12 +299,12 @@ export class GiteaAdapter implements IPlatformAdapter {
    * Parse webhook event and extract relevant data
    *
    * Handles:
-   * - issues.closed / pull_request.closed → cleanup (isCloseEvent: true)
-   * - issue_comment.created → bot @mention detection
-   * - pull_request_comment.created → bot @mention detection on PR review comments
+   * - issues.closed / pull_request.closed -> cleanup (isCloseEvent: true)
+   * - issue_comment.created -> bot @mention detection
+   * - pull_request_comment.created -> bot @mention detection on PR review comments
    *
    * Does NOT handle:
-   * - issues.opened / pull_request.opened → returns null (descriptions are not commands)
+   * - issues.opened / pull_request.opened -> returns null (descriptions are not commands)
    */
   private parseEvent(event: WebhookEvent): {
     owner: string;

@@ -7,10 +7,10 @@ import { z } from 'astro/zod';
  * Extended docs schema for Archon documentation.
  *
  * Custom fields mirror the GitHub label taxonomy used in the repo:
- * - `category` → sidebar section / directory (like label prefixes)
- * - `area` → package/domain (like `area:*` labels)
- * - `audience` → who the doc targets
- * - `status` → doc lifecycle state
+ * - `category` -> sidebar section / directory (like label prefixes)
+ * - `area` -> package/domain (like `area:*` labels)
+ * - `audience` -> who the doc targets
+ * - `status` -> doc lifecycle state
  *
  * All custom fields are optional so existing/stub pages don't break.
  * Starlight's built-in fields (title, description, sidebar, template,
@@ -22,7 +22,7 @@ export const collections = {
     schema: docsSchema({
       extend: z.object({
         /**
-         * Primary content category — determines which sidebar section
+         * Primary content category -- determines which sidebar section
          * and directory this doc belongs to.
          *
          * - getting-started: Onboarding, installation, first steps
@@ -45,7 +45,7 @@ export const collections = {
           .optional(),
 
         /**
-         * Book of Archon part — groups chapters into narrative sections.
+         * Book of Archon part -- groups chapters into narrative sections.
          * Only used for pages in the `book/` directory.
          */
         part: z
@@ -53,7 +53,7 @@ export const collections = {
           .optional(),
 
         /**
-         * Package or domain area — mirrors the `area:*` GitHub labels.
+         * Package or domain area -- mirrors the `area:*` GitHub labels.
          * Useful for cross-referencing docs with code and issues.
          */
         area: z

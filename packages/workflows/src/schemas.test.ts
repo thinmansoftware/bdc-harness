@@ -77,7 +77,7 @@ describe('workflowDefinitionSchema', () => {
     }
   });
 
-  test('inputs field is optional — workflow without it still validates', () => {
+  test('inputs field is optional -- workflow without it still validates', () => {
     const result = workflowDefinitionSchema.safeParse({
       name: 'no-input-workflow',
       description: 'Workflow without inputs',
@@ -117,7 +117,7 @@ describe('workflowDefinitionSchema', () => {
     }
   });
 
-  test('target_repo is optional — workflow without it still validates', () => {
+  test('target_repo is optional -- workflow without it still validates', () => {
     const result = workflowDefinitionSchema.safeParse({
       name: 'no-target-repo',
       description: 'Workflow without target_repo',
@@ -323,10 +323,10 @@ describe('approvalOnRejectSchema', () => {
 });
 
 // ---------------------------------------------------------------------------
-// dagNodeSchema — empty bash/prompt validation
+// dagNodeSchema -- empty bash/prompt validation
 // ---------------------------------------------------------------------------
 
-describe('dagNodeSchema — empty bash/prompt', () => {
+describe('dagNodeSchema -- empty bash/prompt', () => {
   test('emits "bash script cannot be empty" for bash: ""', () => {
     const result = dagNodeSchema.safeParse({ id: 'n1', bash: '' });
     expect(result.success).toBe(false);
@@ -374,10 +374,10 @@ describe('dagNodeSchema — empty bash/prompt', () => {
 });
 
 // ---------------------------------------------------------------------------
-// dagNodeSchema — Claude SDK options
+// dagNodeSchema -- Claude SDK options
 // ---------------------------------------------------------------------------
 
-describe('dagNodeSchema — new Claude SDK options', () => {
+describe('dagNodeSchema -- new Claude SDK options', () => {
   test('parses effort enum on prompt node', () => {
     const result = dagNodeSchema.safeParse({ id: 'n', prompt: 'do it', effort: 'high' });
     expect(result.success).toBe(true);
@@ -550,10 +550,10 @@ describe('isScriptNode', () => {
 });
 
 // ---------------------------------------------------------------------------
-// dagNodeSchema — ScriptNode parsing and validation
+// dagNodeSchema -- ScriptNode parsing and validation
 // ---------------------------------------------------------------------------
 
-describe('dagNodeSchema — ScriptNode', () => {
+describe('dagNodeSchema -- ScriptNode', () => {
   test('parses a bun script node with inline script', () => {
     const result = dagNodeSchema.safeParse({
       id: 'fetch',
@@ -840,10 +840,10 @@ describe('LOOP_NODE_AI_FIELDS', () => {
 });
 
 // ---------------------------------------------------------------------------
-// dagNodeSchema — loop node with agent field (schema transform round-trip)
+// dagNodeSchema -- loop node with agent field (schema transform round-trip)
 // ---------------------------------------------------------------------------
 
-describe('dagNodeSchema — loop node with agent', () => {
+describe('dagNodeSchema -- loop node with agent', () => {
   test('accepts loop node with agent: field and preserves it through transform', () => {
     const result = dagNodeSchema.safeParse({
       id: 'iterate',
@@ -862,10 +862,10 @@ describe('dagNodeSchema — loop node with agent', () => {
 });
 
 // ---------------------------------------------------------------------------
-// dagNodeSchema — description field
+// dagNodeSchema -- description field
 // ---------------------------------------------------------------------------
 
-describe('dagNodeSchema — description field', () => {
+describe('dagNodeSchema -- description field', () => {
   test('accepts description on a bash node', () => {
     const result = dagNodeSchema.safeParse({
       id: 'read-spec',
@@ -878,7 +878,7 @@ describe('dagNodeSchema — description field', () => {
     }
   });
 
-  test('description is optional — node without it still validates', () => {
+  test('description is optional -- node without it still validates', () => {
     const result = dagNodeSchema.safeParse({ id: 'x', bash: 'echo hello' });
     expect(result.success).toBe(true);
     if (result.success) {

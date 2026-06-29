@@ -16,7 +16,7 @@ async function* hangAfter<T>(values: T[], _hangForever = true): AsyncGenerator<T
   for (const value of values) {
     yield value;
   }
-  // Hang indefinitely — simulates a subprocess that completed work but won't exit
+  // Hang indefinitely -- simulates a subprocess that completed work but won't exit
   await new Promise<void>(() => {});
 }
 
@@ -64,7 +64,7 @@ describe('withIdleTimeout', () => {
   test('exits without onTimeout callback when generator hangs', async () => {
     const result: string[] = [];
 
-    // No onTimeout callback — should still exit cleanly
+    // No onTimeout callback -- should still exit cleanly
     for await (const v of withIdleTimeout(hangAfter(['x', 'y']), 50)) {
       result.push(v);
     }
@@ -76,7 +76,7 @@ describe('withIdleTimeout', () => {
     const onTimeout = mock(() => {});
     const result: number[] = [];
 
-    // Each value takes 20ms, timeout is 200ms — should never fire
+    // Each value takes 20ms, timeout is 200ms -- should never fire
     for await (const v of withIdleTimeout(fromValues([1, 2, 3], 20), 200, onTimeout)) {
       result.push(v);
     }
@@ -90,7 +90,7 @@ describe('withIdleTimeout', () => {
 
     // Create a generator where each value takes 30ms but timeout is 50ms
     // Without resetting, the 3rd value would trigger timeout at 90ms > 50ms
-    // With resetting, each gap is 30ms < 50ms — no timeout
+    // With resetting, each gap is 30ms < 50ms -- no timeout
     const result: number[] = [];
     for await (const v of withIdleTimeout(fromValues([1, 2, 3, 4], 30), 50, onTimeout)) {
       result.push(v);
@@ -119,7 +119,7 @@ describe('withIdleTimeout', () => {
   test('consumer breaking out cleans up normally', async () => {
     const result: number[] = [];
 
-    // Consumer breaks after 2 values — generator should be cleaned up
+    // Consumer breaks after 2 values -- generator should be cleaned up
     for await (const v of withIdleTimeout(fromValues([1, 2, 3, 4, 5]), 1000)) {
       result.push(v);
       if (v === 2) break;
@@ -139,7 +139,7 @@ describe('withIdleTimeout', () => {
     async function* toolThenHang(): AsyncGenerator<Msg> {
       yield { type: 'assistant' };
       yield { type: 'tool' };
-      // Hang — simulates a tool call that never completes
+      // Hang -- simulates a tool call that never completes
       await new Promise<void>(() => {});
     }
 
@@ -173,7 +173,7 @@ describe('withIdleTimeout', () => {
       // Simulate quick tool result (comes as next assistant)
       await new Promise(r => setTimeout(r, 20));
       yield { type: 'assistant' };
-      // Now hang — but timer should have been reset by second assistant
+      // Now hang -- but timer should have been reset by second assistant
       await new Promise<void>(() => {});
     }
 
@@ -195,7 +195,7 @@ describe('withIdleTimeout', () => {
     const onTimeout = mock(() => {});
     const result: Msg[] = [];
 
-    // Without shouldResetTimer, tool events reset the timer — hang after tool
+    // Without shouldResetTimer, tool events reset the timer -- hang after tool
     // does NOT fire within the original window (it fires in a fresh window)
     async function* toolThenHang(): AsyncGenerator<Msg> {
       yield { type: 'assistant' };
@@ -203,7 +203,7 @@ describe('withIdleTimeout', () => {
       await new Promise<void>(() => {});
     }
 
-    // With no shouldResetTimer, timer resets on 'tool' → 100ms fresh window
+    // With no shouldResetTimer, timer resets on 'tool' -> 100ms fresh window
     // Hang fires after 100ms from the 'tool' event
     for await (const v of withIdleTimeout(toolThenHang(), 100, onTimeout)) {
       result.push(v);

@@ -7,11 +7,11 @@
  * the build host's filesystem and does not exist on end-user machines.
  *
  * Resolution order:
- * 1. `CLAUDE_BIN_PATH` environment variable (honored in both modes — escape
+ * 1. `CLAUDE_BIN_PATH` environment variable (honored in both modes -- escape
  *    hatch for hosts where the SDK's per-platform binary auto-resolution
  *    picks the wrong variant, e.g. glibc Linux + musl SDK package)
  * 2. `assistants.claude.claudeBinaryPath` in config (binary mode only)
- * 3. Autodetect canonical install path (binary mode only — native installer default)
+ * 3. Autodetect canonical install path (binary mode only -- native installer default)
  * 4. Throw with install instructions (binary mode only)
  *
  * In dev mode (BUNDLED_IS_BINARY=false), if no env var is set, returns
@@ -23,7 +23,7 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { BUNDLED_IS_BINARY, createLogger } from '@archon/paths';
 
-/** Wrapper for existsSync — enables spyOn in tests (direct imports can't be spied on). */
+/** Wrapper for existsSync -- enables spyOn in tests (direct imports can't be spied on). */
 export function fileExists(path: string): boolean {
   return _existsSync(path);
 }
@@ -39,7 +39,7 @@ const INSTALL_INSTRUCTIONS =
   'Claude Code not found. Archon requires the Claude Code executable to be\n' +
   'reachable at a configured path in compiled builds.\n\n' +
   'To fix, install Claude Code and point Archon at it:\n\n' +
-  '  macOS / Linux (recommended — native installer):\n' +
+  '  macOS / Linux (recommended -- native installer):\n' +
   '    curl -fsSL https://claude.ai/install.sh | bash\n' +
   '    export CLAUDE_BIN_PATH="$HOME/.local/bin/claude"\n\n' +
   '  Windows (PowerShell):\n' +
@@ -68,7 +68,7 @@ const INSTALL_INSTRUCTIONS =
 export async function resolveClaudeBinaryPath(
   configClaudeBinaryPath?: string
 ): Promise<string | undefined> {
-  // 1. Environment variable override — honored in dev mode too, so operators
+  // 1. Environment variable override -- honored in dev mode too, so operators
   // on libc mismatches (e.g. glibc host with the SDK's musl variant first in
   // its resolution order) can pin a known-good binary without a compiled build.
   const envPath = process.env.CLAUDE_BIN_PATH;
@@ -101,7 +101,7 @@ export async function resolveClaudeBinaryPath(
     return configClaudeBinaryPath;
   }
 
-  // 3. Autodetect — the Anthropic native installer
+  // 3. Autodetect -- the Anthropic native installer
   // (`curl -fsSL https://claude.ai/install.sh | bash` on macOS/Linux,
   // `irm https://claude.ai/install.ps1 | iex` on Windows) writes the
   // executable to a fixed location relative to $HOME. Users who follow
@@ -120,6 +120,6 @@ export async function resolveClaudeBinaryPath(
     return nativeInstallerPath;
   }
 
-  // 4. Not found — throw with install instructions
+  // 4. Not found -- throw with install instructions
   throw new Error(INSTALL_INSTRUCTIONS);
 }

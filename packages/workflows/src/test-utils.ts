@@ -1,6 +1,6 @@
 /**
  * Test factories for workflow types.
- * Use these instead of inline fixture objects — schema changes update one file.
+ * Use these instead of inline fixture objects -- schema changes update one file.
  */
 import { workflowDefinitionSchema } from './schemas/workflow';
 import type { WorkflowDefinition, WorkflowWithSource, WorkflowSource } from './schemas/workflow';

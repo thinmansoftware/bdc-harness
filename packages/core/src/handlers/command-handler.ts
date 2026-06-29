@@ -466,8 +466,8 @@ async function handleWorktreeCommand(
 
           const shortPath = shortenPath(wt.path, mainPath);
           const isCurrent = currentWorktreePath && wt.path === currentWorktreePath;
-          const marker = isCurrent ? ' ← current' : '';
-          msg += `  ${wt.branch} → ${shortPath}${marker}\n`;
+          const marker = isCurrent ? ' <- current' : '';
+          msg += `  ${wt.branch} -> ${shortPath}${marker}\n`;
         }
 
         msg += '\nNote: This shows ALL worktrees including those created by external tools.\n';
@@ -505,7 +505,7 @@ async function handleWorktreeCommand(
         if (result.removed.length > 0) {
           msg += `Cleaned up ${String(result.removed.length)} ${cleanupType} worktree(s):\n`;
           for (const branch of result.removed) {
-            msg += `  • ${branch}\n`;
+            msg += `  - ${branch}\n`;
           }
         } else {
           msg += `No ${cleanupType} worktrees to clean up.\n`;
@@ -514,7 +514,7 @@ async function handleWorktreeCommand(
         if (result.skipped.length > 0) {
           msg += `\nSkipped ${String(result.skipped.length)} (protected):\n`;
           for (const { branchName, reason } of result.skipped) {
-            msg += `  • ${branchName} (${reason})\n`;
+            msg += `  - ${branchName} (${reason})\n`;
           }
         }
 
@@ -830,7 +830,7 @@ async function handleWorkflowCommand(
       try {
         workflow = resolveWorkflowName(workflowName, workflows);
       } catch (err) {
-        // Ambiguous match — surface the candidates to the user
+        // Ambiguous match -- surface the candidates to the user
         getLog().warn(
           { requested: workflowName, error: (err as Error).message },
           'cmd.workflow_resolve_ambiguous'
@@ -899,37 +899,37 @@ export async function handleCommand(
         success: true,
         message: `## Archon Orchestrator
 
-Talk naturally — the orchestrator routes your requests to the right workflow and project automatically.
+Talk naturally -- the orchestrator routes your requests to the right workflow and project automatically.
 
 ### Commands
 
 **Chat**
-- Just type your message — the orchestrator handles routing
+- Just type your message -- the orchestrator handles routing
 - Mention a project by name and the orchestrator will use it
 - Ask to "run [workflow] on [project]" for explicit invocation
 
 **Workflows**
-- \`/workflow list\` — List available workflows
-- \`/workflow run <name> [message]\` — Run a workflow explicitly
-- \`/workflow status\` — Show all active workflows
-- \`/workflow cancel\` — Cancel the active workflow
-- \`/workflow resume <id>\` — Resume a failed run
-- \`/workflow abandon <id>\` — Discard a failed run
-- \`/workflow approve <id>\` — Approve a paused run
-- \`/workflow reject <id>\` — Reject a paused run
+- \`/workflow list\` -- List available workflows
+- \`/workflow run <name> [message]\` -- Run a workflow explicitly
+- \`/workflow status\` -- Show all active workflows
+- \`/workflow cancel\` -- Cancel the active workflow
+- \`/workflow resume <id>\` -- Resume a failed run
+- \`/workflow abandon <id>\` -- Discard a failed run
+- \`/workflow approve <id>\` -- Approve a paused run
+- \`/workflow reject <id>\` -- Reject a paused run
 
 **Projects**
-- \`/register-project <name> <path>\` — Register a local project
-- \`/update-project <name> <new-path>\` — Update a project's path
-- \`/remove-project <name>\` — Remove a registered project
+- \`/register-project <name> <path>\` -- Register a local project
+- \`/update-project <name> <new-path>\` -- Update a project's path
+- \`/remove-project <name>\` -- Remove a registered project
 
 **Session**
-- \`/status\` — Show current session and project info
-- \`/reset\` — Clear conversation and start fresh
-- \`/help\` — Show this help message
+- \`/status\` -- Show current session and project info
+- \`/reset\` -- Clear conversation and start fresh
+- \`/help\` -- Show this help message
 
 ### Tips
-- You don't need to select a project first — just describe what you want
+- You don't need to select a project first -- just describe what you want
 - The orchestrator knows all your registered projects and available workflows
 - For project setup, ask the orchestrator: "How do I add a new project?"`,
       };
@@ -948,7 +948,7 @@ Talk naturally — the orchestrator routes your requests to the right workflow a
           msg += `- ${cb.name}${urlSuffix}\n`;
         }
       } else {
-        msg += '\n\n## Registered Projects\nNone — ask the orchestrator to add a project.';
+        msg += '\n\n## Registered Projects\nNone -- ask the orchestrator to add a project.';
       }
 
       // Show conversation context
@@ -963,7 +963,7 @@ Talk naturally — the orchestrator routes your requests to the right workflow a
           msg += `\n- Working Directory: ${conversation.cwd}`;
         }
       } else {
-        msg += '\n\n## Conversation Context\n- Project: None — orchestrator will route as needed';
+        msg += '\n\n## Conversation Context\n- Project: None -- orchestrator will route as needed';
       }
 
       const session = await sessionDb.getActiveSession(conversation.id);
@@ -1005,12 +1005,12 @@ Talk naturally — the orchestrator routes your requests to the right workflow a
           msg += `\n\nWorktrees: ${String(breakdown.total)} active`;
           if (breakdown.merged > 0 || breakdown.stale > 0) {
             if (breakdown.merged > 0) {
-              msg += `\n  • ${String(breakdown.merged)} merged (can auto-remove)`;
+              msg += `\n  - ${String(breakdown.merged)} merged (can auto-remove)`;
             }
             if (breakdown.stale > 0) {
-              msg += `\n  • ${String(breakdown.stale)} stale (14+ days inactive)`;
+              msg += `\n  - ${String(breakdown.stale)} stale (14+ days inactive)`;
             }
-            msg += `\n  • ${String(breakdown.active)} active`;
+            msg += `\n  - ${String(breakdown.active)} active`;
           }
         } catch (error) {
           // Don't fail status if breakdown fails
@@ -1128,11 +1128,11 @@ Task: $ARGUMENTS
           success: true,
           message: `Created .archon structure:
   .archon/
-  ├── config.yaml
-  └── commands/
-      └── example.md
+  --- config.yaml
+  --- commands/
+      --- example.md
 
-Commands are auto-discovered from .archon/commands/ — no registration needed.`,
+Commands are auto-discovered from .archon/commands/ -- no registration needed.`,
         };
       } catch (error) {
         const err = error as Error;

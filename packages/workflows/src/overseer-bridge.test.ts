@@ -1,5 +1,5 @@
 /**
- * Tests for overseer-bridge.ts — the @archon/overseer wiring into dag-executor's
+ * Tests for overseer-bridge.ts -- the @archon/overseer wiring into dag-executor's
  * node-failure handlers.
  *
  * Per WO-HARNESS-OVERSEER-WIRE-V1-01 (bdc-xo#151), this covers each decision path
@@ -36,7 +36,7 @@ function makeMockStore(): IWorkflowStore {
 
 function makeMockLog(): Logger {
   const noop = () => undefined as never;
-  // Cast as Logger — pino has many fields; we only exercise info/warn/error.
+  // Cast as Logger -- pino has many fields; we only exercise info/warn/error.
   return {
     info: mock(noop),
     warn: mock(noop),
@@ -86,7 +86,7 @@ const baseCtx = { errorMsg: '', logDir: '/tmp/test-logs', outputSoFar: '' };
 
 // --- Tests --------------------------------------------------------------------
 
-describe('handleNodeFailure — decision routing', () => {
+describe('handleNodeFailure -- decision routing', () => {
   it('unknown error class -> escalate -> NodeOutput {state:failed}', async () => {
     const deps = makeDeps();
     const result = await handleNodeFailure(deps, makeWorkflowRun(), makeNode(), {
@@ -177,7 +177,7 @@ describe('handleNodeFailure — decision routing', () => {
   });
 });
 
-describe('handleNodeFailure — side effects', () => {
+describe('handleNodeFailure -- side effects', () => {
   it('emits overseer.decision log line with structured fields', async () => {
     const deps = makeDeps();
     await handleNodeFailure(deps, makeWorkflowRun(), makeNode('node-x'), {

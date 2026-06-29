@@ -79,7 +79,7 @@ describe('detectSilentFailure', () => {
     expect(detectSilentFailure('Status=push_failed\n', false)).toBeNull();
   });
 
-  it('anchor: 2026-05-16 sortie scenario — exit-0 + push_failed on stdout', () => {
+  it('anchor: 2026-05-16 sortie scenario -- exit-0 + push_failed on stdout', () => {
     const realWorldStdout = [
       'Committed 13 files',
       'Pushing to origin...',

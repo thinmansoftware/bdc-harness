@@ -11,7 +11,7 @@
  * Located at ~/.archon/config.yaml
  */
 
-// Provider config defaults — canonical definitions live in @archon/providers/types.
+// Provider config defaults -- canonical definitions live in @archon/providers/types.
 // Imported and re-exported here so existing consumers don't break.
 import type {
   ClaudeProviderDefaults,
@@ -36,7 +36,7 @@ export type {
  * They do NOT provide parser safety (each provider's `parseXxxConfig`
  * already takes `Record<string, unknown>` and defends itself).
  *
- * Community providers should NOT be added here — they live behind the
+ * Community providers should NOT be added here -- they live behind the
  * generic `[string]` index. Adding a new community provider must not
  * require a core-package type change; that's the whole point of Phase 2.
  */
@@ -46,10 +46,10 @@ export type AssistantDefaultsConfig = ProviderDefaultsMap & {
 };
 
 /**
- * Required variant — built-ins are always present after `loadConfig`.
+ * Required variant -- built-ins are always present after `loadConfig`.
  *
  * `getDefaults()` seeds every registered provider (built-in + community)
- * with `{}`, so community providers appear in the map too — just typed as
+ * with `{}`, so community providers appear in the map too -- just typed as
  * `ProviderDefaults` via the generic index rather than a specific shape.
  * `registerBuiltinProviders()` is called before `loadConfig()` at every
  * process entrypoint, so claude/codex are guaranteed present.
@@ -160,7 +160,7 @@ export interface RepoConfig {
 
     /**
      * Git-ignored files/directories to copy from main repo to new worktrees.
-     * Tracked files are already in worktrees — only use this for git-ignored files.
+     * Tracked files are already in worktrees -- only use this for git-ignored files.
      * @example [".env", ".archon", "data/fixtures/"]
      */
     copyFiles?: string[];
@@ -182,7 +182,7 @@ export interface RepoConfig {
      * worktrees are created at `<repoRoot>/<path>/<branch>` instead of under
      * `~/.archon/worktrees/` or the workspaces layout.
      *
-     * Opt-in — co-locates worktrees with the repo so they appear in the IDE
+     * Opt-in -- co-locates worktrees with the repo so they appear in the IDE
      * file tree. The user is responsible for adding the directory to their
      * `.gitignore` (no automatic file mutation).
      *
@@ -193,7 +193,7 @@ export interface RepoConfig {
      *   4. default global (`~/.archon/worktrees/`)
      *
      * Must be a safe relative path: no leading `/`, no `..` segments. Absolute
-     * or escaping values fail loudly at worktree creation (Fail Fast — no silent
+     * or escaping values fail loudly at worktree creation (Fail Fast -- no silent
      * fallback).
      *
      * @example '.worktrees'
@@ -215,7 +215,7 @@ export interface RepoConfig {
   /**
    * Per-project environment variables injected into Claude SDK subprocess env.
    * Values here override process.env for workflow node execution.
-   * Sensitive — do not commit actual secrets to version-controlled repos.
+   * Sensitive -- do not commit actual secrets to version-controlled repos.
    */
   env?: Record<string, string>;
 

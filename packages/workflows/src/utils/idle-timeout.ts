@@ -1,7 +1,7 @@
 /**
  * Async generator idle timeout utility.
  *
- * Wraps an async generator with an idle timeout — if no value is yielded
+ * Wraps an async generator with an idle timeout -- if no value is yielded
  * within `timeoutMs`, the wrapper returns normally, converting a hang
  * into a clean exit.
  *
@@ -26,17 +26,17 @@ const IDLE_TIMEOUT_SENTINEL = Symbol('IDLE_TIMEOUT');
 
 /**
  * Wraps an async generator with an idle timeout. If no value is yielded within
- * `timeoutMs`, the wrapper returns normally — converting a hang into a clean exit.
+ * `timeoutMs`, the wrapper returns normally -- converting a hang into a clean exit.
  *
  * When `shouldResetTimer` is provided and returns `false` for a yielded value, the
- * timer is NOT reset — it keeps counting from the previous reset point. Most callers
+ * timer is NOT reset -- it keeps counting from the previous reset point. Most callers
  * should omit this parameter (every message resets the timer, which is the correct
  * default for a deadlock detector).
  *
  * When timeout fires:
  * 1. `onTimeout` callback is invoked (use this to abort the subprocess and log)
  * 2. The pending `generator.next()` promise gets a `.catch()` to prevent unhandled rejection
- * 3. We do NOT call `generator.return()` — it would block on the pending `.next()`
+ * 3. We do NOT call `generator.return()` -- it would block on the pending `.next()`
  * 4. The subprocess is cleaned up asynchronously via the abort signal from `onTimeout`
  *
  * @param generator - The async generator to wrap
@@ -92,12 +92,12 @@ export async function* withIdleTimeout<T>(
     }
   } finally {
     if (!timedOut) {
-      // Normal exit (generator exhausted or consumer broke out) — safe to clean up
+      // Normal exit (generator exhausted or consumer broke out) -- safe to clean up
       try {
         await generator.return(undefined as never);
       } catch (e) {
         // Generator cleanup errors are non-fatal but worth logging for diagnostics
-        // Dynamic import to avoid circular deps — this module has zero @archon/* imports
+        // Dynamic import to avoid circular deps -- this module has zero @archon/* imports
         try {
           const { createLogger } = await import('@archon/paths');
           createLogger('idle-timeout').warn(
@@ -105,11 +105,11 @@ export async function* withIdleTimeout<T>(
             'idle_timeout.generator_cleanup_failed'
           );
         } catch {
-          // If logger is unavailable, swallow — cleanup is best-effort
+          // If logger is unavailable, swallow -- cleanup is best-effort
         }
       }
     }
-    // If timed out, don't call generator.return() — it would hang on the pending .next()
+    // If timed out, don't call generator.return() -- it would hang on the pending .next()
     // The onTimeout callback aborts the subprocess, which causes the pending .next()
     // to reject (caught by nextPromise.catch above) and the generator to finalize
   }

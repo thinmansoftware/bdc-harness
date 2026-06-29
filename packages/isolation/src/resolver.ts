@@ -1,5 +1,5 @@
 /**
- * IsolationResolver — encapsulates all isolation resolution logic.
+ * IsolationResolver -- encapsulates all isolation resolution logic.
  *
  * The resolver determines which isolation environment to use (existing, reusable,
  * adopted, or new) without any platform messaging. It returns rich discriminated
@@ -92,7 +92,7 @@ export class IsolationResolver {
     if (request.existingEnvId) {
       const existing = await this.checkExisting(request.existingEnvId, baseBranch);
       if (existing) return existing;
-      // Stale — tell caller to clear and retry
+      // Stale -- tell caller to clear and retry
       return { status: 'stale_cleaned', previousEnvId: request.existingEnvId };
     }
 
@@ -106,7 +106,7 @@ export class IsolationResolver {
     const workflowType: IsolationWorkflowType = hints?.workflowType ?? 'thread';
     const workflowId = hints?.workflowId ?? '';
 
-    // Compute canonical repo path once — paths 3-6 all need it either for
+    // Compute canonical repo path once -- paths 3-6 all need it either for
     // ownership verification (cross-clone guard) or for worktree creation.
     // Mirror createNewEnvironment's contract: known infrastructure failures
     // (permission denied, ENOENT, malformed worktree pointer, etc.) become
@@ -193,7 +193,7 @@ export class IsolationResolver {
   /**
    * Validate that the worktree is based on the expected base branch.
    * Returns a warning string if mismatched, empty array otherwise.
-   * Never throws — validation errors are non-blocking.
+   * Never throws -- validation errors are non-blocking.
    */
   private async collectBaseBranchWarnings(
     env: IsolationEnvironmentRow,
@@ -251,7 +251,7 @@ export class IsolationResolver {
   /**
    * Verify that an on-disk worktree belongs to the expected repo before
    * adopting. Wraps the shared `verifyWorktreeOwnership` with logging that
-   * includes structured fields for incident debugging — the error message
+   * includes structured fields for incident debugging -- the error message
    * alone is not enough because stack traces and call sites vary.
    *
    * Throws on mismatch (re-throws the original error so `classifyIsolationError`
@@ -278,7 +278,7 @@ export class IsolationResolver {
    * Find a reusable environment by workflow identity.
    *
    * Verifies that the on-disk worktree belongs to `canonicalRepoPath` before
-   * returning. On cross-clone mismatch, throws — the DB row belongs to the
+   * returning. On cross-clone mismatch, throws -- the DB row belongs to the
    * other clone and we must not adopt it. The other clone's row is preserved
    * (no markDestroyed) so the other clone's work continues.
    */
@@ -317,7 +317,7 @@ export class IsolationResolver {
    * Find an environment linked to one of the given issue numbers.
    *
    * Verifies each candidate worktree belongs to `canonicalRepoPath` before
-   * adopting. On cross-clone mismatch, throws — this stops iteration over any
+   * adopting. On cross-clone mismatch, throws -- this stops iteration over any
    * remaining linked issues. Intentional: if a linked env is owned by another
    * clone, the user's machine state is anomalous (two clones of the same
    * remote) and they should resolve it explicitly rather than have us skip
@@ -363,7 +363,7 @@ export class IsolationResolver {
    * Try adopting an existing worktree matching a PR branch.
    *
    * Verifies ownership of the discovered worktree before recording it in the
-   * DB. On cross-clone mismatch, throws — adopting another clone's worktree
+   * DB. On cross-clone mismatch, throws -- adopting another clone's worktree
    * would create a stale DB row pointing at someone else's filesystem state.
    */
   private async tryBranchAdoption(
@@ -495,7 +495,7 @@ export class IsolationResolver {
       };
     }
 
-    // provider.create() succeeded — worktree exists on disk.
+    // provider.create() succeeded -- worktree exists on disk.
     // If store.create() fails, we must clean up the orphaned worktree.
     let env: IsolationEnvironmentRow;
     try {
@@ -523,7 +523,7 @@ export class IsolationResolver {
         'isolation_store_create_failed'
       );
 
-      // Clean up the orphaned worktree — best-effort, don't mask the original error
+      // Clean up the orphaned worktree -- best-effort, don't mask the original error
       try {
         await this.provider.destroy(isolatedEnv.workingPath, {
           canonicalRepoPath: canonicalPath,
@@ -547,7 +547,7 @@ export class IsolationResolver {
         );
       }
 
-      throw err; // Re-throw original store error — this is an unexpected failure
+      throw err; // Re-throw original store error -- this is an unexpected failure
     }
 
     return {

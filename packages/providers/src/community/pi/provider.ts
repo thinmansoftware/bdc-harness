@@ -21,27 +21,27 @@ import { parsePiModelRef } from './model-ref';
 // ui-context-stub, event-bridge). Pi's `@mariozechner/pi-coding-agent/dist/config.js`
 // runs `readFileSync(getPackageJsonPath(), "utf-8")` at module load; inside a
 // compiled Archon binary `getPackageJsonPath()` resolves to
-// `dirname(process.execPath) + "/package.json"` — a path that doesn't exist —
+// `dirname(process.execPath) + "/package.json"` -- a path that doesn't exist --
 // and archon crashes at startup before any command runs (v0.3.7 symptom).
 //
 // All Pi SDK value bindings and Pi-dependent helper modules are dynamically
 // imported inside `sendQuery()` below, which runs only when a Pi workflow is
-// actually invoked. Type-only imports above are fine — TS erases them.
+// actually invoked. Type-only imports above are fine -- TS erases them.
 //
-// Lazy-loading defers the crash from boot-time to sendQuery-time — but the
+// Lazy-loading defers the crash from boot-time to sendQuery-time -- but the
 // crash still happens when Pi is actually used. `ensurePiPackageDirShim()`
 // (see below) fixes the *runtime* half: before any dynamic Pi import in
 // sendQuery, write a stub package.json to tmpdir and point Pi at it via
 // its own documented `PI_PACKAGE_DIR` escape hatch.
 
-// ─── Concurrency throttle ────────────────────────────────────────────────────
+// --- Concurrency throttle ----------------------------------------------------
 
 /**
  * Simple counting semaphore for capping concurrent Pi `session.prompt()` calls.
  * Pi/Minimax has no built-in SDK-level throttling; without this, large parallel
- * workflow batches (e.g. 10+ concurrent review PRs × 5 aspects each) hit rate
+ * workflow batches (e.g. 10+ concurrent review PRs x 5 aspects each) hit rate
  * limits and cascade-fail. Module-level so it's shared across all PiProvider
- * instances within a process — Pi concurrency is global (one upstream backend).
+ * instances within a process -- Pi concurrency is global (one upstream backend).
  */
 class Semaphore {
   private available: number;
@@ -77,8 +77,8 @@ let piSemaphore: Semaphore | undefined;
  * Write a minimal package.json to a stable tmpdir and set `PI_PACKAGE_DIR`
  * so Pi's `config.js` short-circuits its `dirname(process.execPath)` walk
  * (which fails inside a compiled archon binary). Pi only reads three
- * optional fields from that package.json — `piConfig.name`, `piConfig.configDir`,
- * and `version` — so the stub is genuinely minimal. Idempotent: the file is
+ * optional fields from that package.json -- `piConfig.name`, `piConfig.configDir`,
+ * and `version` -- so the stub is genuinely minimal. Idempotent: the file is
  * only written once per host (existsSync check), and the env var is set on
  * every call so multiple PiProvider instances stay consistent.
  *
@@ -92,7 +92,7 @@ function ensurePiPackageDirShim(): void {
   if (!existsSync(shimPkgJson)) {
     mkdirSync(shimDir, { recursive: true });
     // `piConfig: {}` is explicit so Pi's defaults (`name: 'pi'`,
-    // `configDir: '.pi'`) kick in — matches Pi's standalone behavior.
+    // `configDir: '.pi'`) kick in -- matches Pi's standalone behavior.
     writeFileSync(
       shimPkgJson,
       JSON.stringify({
@@ -106,10 +106,10 @@ function ensurePiPackageDirShim(): void {
 }
 
 /**
- * Map Pi provider id → env var name used by pi-ai's getEnvApiKey().
+ * Map Pi provider id -> env var name used by pi-ai's getEnvApiKey().
  * Kept small and explicit: v1 supports the most common API-key providers.
  * OAuth flows (Anthropic subscription, Google Gemini CLI, etc.) are out of
- * scope — Archon is a server-side platform and doesn't drive interactive
+ * scope -- Archon is a server-side platform and doesn't drive interactive
  * login. Extend only when a provider is actually exercised.
  *
  * Cross-reference (authoritative mapping maintained upstream in Pi):
@@ -158,7 +158,7 @@ ${JSON.stringify(schema, null, 2)}`;
 }
 
 /**
- * Pi community provider — wraps `@mariozechner/pi-coding-agent`'s full
+ * Pi community provider -- wraps `@mariozechner/pi-coding-agent`'s full
  * coding-agent harness. Each `sendQuery()` call creates a fresh session
  * (no reuse) so concurrent calls don't collide.
  */
@@ -177,7 +177,7 @@ export class PiProvider implements IAgentProvider {
     ensurePiPackageDirShim();
 
     // Lazy-load Pi SDK and all Pi-dependent helper modules here. Must not move
-    // these imports to module scope — see the header comment for the failure
+    // these imports to module scope -- see the header comment for the failure
     // mode (archon compiled binary crashes at startup when Pi's config.js
     // reads a package.json that doesn't exist next to the executable).
     //
@@ -207,7 +207,7 @@ export class PiProvider implements IAgentProvider {
     // 0. Apply config-level env vars to process.env for in-process extensions
     //    (plannotator reads PLANNOTATOR_REMOTE at session_start, etc.).
     //    Shell env wins: we only set keys not already present. Request-level
-    //    `requestOptions.env` remains a separate channel — it flows through
+    //    `requestOptions.env` remains a separate channel -- it flows through
     //    bash spawn hooks for subprocess isolation, not into process.env.
     if (piConfig.env) {
       const applied: string[] = [];
@@ -222,7 +222,7 @@ export class PiProvider implements IAgentProvider {
       }
     }
 
-    // 1. Resolve model ref: request (workflow node / chat) → config default
+    // 1. Resolve model ref: request (workflow node / chat) -> config default
     const modelRef = requestOptions?.model ?? piConfig.model;
     if (!modelRef) {
       throw new Error(
@@ -240,14 +240,14 @@ export class PiProvider implements IAgentProvider {
     // 2. Build AuthStorage + ModelRegistry. Both `create()` calls read from
     //    disk: AuthStorage reads ~/.pi/agent/auth.json (or
     //    $PI_CODING_AGENT_DIR/auth.json), and ModelRegistry reads
-    //    ~/.pi/agent/models.json — the user's per-host config including
+    //    ~/.pi/agent/models.json -- the user's per-host config including
     //    custom models for local providers (LM Studio, ollama, llamacpp,
     //    custom OpenAI-compatible endpoints). Reads are synchronous and
     //    happen on every sendQuery; we don't cache because the user can
     //    edit either file between calls and expects pickup without restart
     //    (Pi's `/login` flow rewrites auth.json under a file lock).
     //    ModelRegistry captures any models.json load/parse error in its
-    //    internal loadError rather than throwing — surfaced below if the
+    //    internal loadError rather than throwing -- surfaced below if the
     //    requested model is then not found.
     let authStorage: ReturnType<typeof piCodingAgent.AuthStorage.create>;
     let modelRegistry: ReturnType<typeof piCodingAgent.ModelRegistry.create>;
@@ -288,10 +288,10 @@ export class PiProvider implements IAgentProvider {
     }
 
     // 4. Resolve credentials. authStorage already loaded ~/.pi/agent/auth.json
-    //    so any creds populated via `pi` → `/login` (OAuth subscriptions:
+    //    so any creds populated via `pi` -> `/login` (OAuth subscriptions:
     //    Claude Pro/Max, ChatGPT Plus, GitHub Copilot, Gemini CLI,
     //    Antigravity) or by hand-edited api_key entries are picked up
-    //    transparently. Per-request env vars override via setRuntimeApiKey —
+    //    transparently. Per-request env vars override via setRuntimeApiKey --
     //    mirrors Claude's process-env + request-env merge so codebase-scoped
     //    env vars (.archon/config.yaml `env:`) win over the user's global
     //    Pi login.
@@ -304,7 +304,7 @@ export class PiProvider implements IAgentProvider {
     //
     //    OAuth refresh note: Pi refreshes expired access tokens against the
     //    provider's OAuth server and rewrites ~/.pi/agent/auth.json under a
-    //    file lock (same mechanism pi CLI uses — safe for concurrent access).
+    //    file lock (same mechanism pi CLI uses -- safe for concurrent access).
     const envVarName = PI_PROVIDER_ENV_VARS[parsed.provider];
     const envOverride = envVarName
       ? (requestOptions?.env?.[envVarName] ?? process.env[envVarName])
@@ -324,14 +324,14 @@ export class PiProvider implements IAgentProvider {
       }
 
       // Unmapped providers (LM Studio, ollama, llamacpp, custom
-      // OpenAI-compatible endpoints) often don't need credentials at all —
+      // OpenAI-compatible endpoints) often don't need credentials at all --
       // log + continue rather than failing fast so local models work without
       // ceremony. If the SDK call later fails for a provider that *does*
       // need creds, the auth_missing breadcrumb is searchable in the log.
       getLog().info(
         {
           piProvider: parsed.provider,
-          envHint: `Provider '${parsed.provider}' is not in the Archon adapter's env-var table — file an issue if you want a shortcut env var for it.`,
+          envHint: `Provider '${parsed.provider}' is not in the Archon adapter's env-var table -- file an issue if you want a shortcut env var for it.`,
           loginHint: `Or run \`pi\` and type \`/login\` locally to authenticate '${parsed.provider}' via OAuth; credentials land in ~/.pi/agent/auth.json and are picked up automatically.`,
         },
         'pi.auth_missing'
@@ -347,7 +347,7 @@ export class PiProvider implements IAgentProvider {
     //    4a. thinkingLevel: covers `thinking`/`effort` nodeConfig fields.
     const { level: thinkingLevel, warning: thinkingWarning } = resolvePiThinkingLevel(nodeConfig);
     if (thinkingWarning) {
-      yield { type: 'system', content: `⚠️ ${thinkingWarning}` };
+      yield { type: 'system', content: `! ${thinkingWarning}` };
     }
 
     //    4b. tools: covers allowed_tools / denied_tools. `undefined` leaves Pi
@@ -364,7 +364,7 @@ export class PiProvider implements IAgentProvider {
     if (unknownTools.length > 0) {
       yield {
         type: 'system',
-        content: `⚠️ Pi ignored unknown tool names: ${unknownTools.join(', ')}. Pi's built-in tools: read, bash, edit, write, grep, find, ls.`,
+        content: `! Pi ignored unknown tool names: ${unknownTools.join(', ')}. Pi's built-in tools: read, bash, edit, write, grep, find, ls.`,
       };
     }
 
@@ -381,7 +381,7 @@ export class PiProvider implements IAgentProvider {
     if (missingSkills.length > 0) {
       yield {
         type: 'system',
-        content: `⚠️ Pi could not resolve skill names: ${missingSkills.join(', ')}. Searched .agents/skills and .claude/skills (project + user-global). Each must be a directory containing SKILL.md.`,
+        content: `! Pi could not resolve skill names: ${missingSkills.join(', ')}. Searched .agents/skills and .claude/skills (project + user-global). Each must be a directory containing SKILL.md.`,
       };
     }
 
@@ -396,14 +396,14 @@ export class PiProvider implements IAgentProvider {
     if (resumeFailed) {
       yield {
         type: 'system',
-        content: '⚠️ Could not resume Pi session. Starting fresh conversation.',
+        content: '! Could not resume Pi session. Starting fresh conversation.',
       };
     }
 
     // Load user's Pi settings from disk (~/.pi/agent/settings.json for global,
     // <cwd>/.pi/settings.json for project) as the starting point, then seed an
     // in-memory instance. The in-memory instance guarantees no write-back to
-    // the user's settings files — AgentSession setter calls (setModel, etc.)
+    // the user's settings files -- AgentSession setter calls (setModel, etc.)
     // write only to the in-process InMemorySettingsStorage object.
     //
     // NOTE: fileSettings is used only for the initial load; it is NOT passed to
@@ -415,7 +415,7 @@ export class PiProvider implements IAgentProvider {
     // so reload() produces empty settings, wiping all loaded user preferences).
     const fileSettings = piCodingAgent.SettingsManager.create(cwd);
 
-    // Drain and log any settings file parse errors (malformed JSON, etc.) — non-fatal.
+    // Drain and log any settings file parse errors (malformed JSON, etc.) -- non-fatal.
     const settingsErrors = fileSettings.drainErrors();
     for (const { scope, error: err } of settingsErrors) {
       getLog().warn({ scope, err }, 'pi.settings_load_error');
@@ -429,7 +429,7 @@ export class PiProvider implements IAgentProvider {
     // this.projectSettings = {}. save() is called by setDefaultModelAndProvider()
     // (dist/core/settings-manager.js), which AgentSession.setModel() calls
     // (dist/core/agent-session.js) whenever an extension switches models in an
-    // interactive session — silently wiping project overrides mid-session.
+    // interactive session -- silently wiping project overrides mid-session.
     // deepMergeSettings is not exported from the Pi SDK; replicate its one-level-deep
     // semantics (nested objects merged one level deep, primitives/arrays override).
     const globalSettings = fileSettings.getGlobalSettings();
@@ -503,11 +503,11 @@ export class PiProvider implements IAgentProvider {
     });
 
     if (modelFallbackMessage) {
-      yield { type: 'system', content: `⚠️ ${modelFallbackMessage}` };
+      yield { type: 'system', content: `! ${modelFallbackMessage}` };
     }
 
     // 4e. Extension flag pass-through. Must happen before bindExtensions
-    //     below — extensions read flags inside their session_start handler.
+    //     below -- extensions read flags inside their session_start handler.
     if (enableExtensions && piConfig.extensionFlags) {
       const runner = session.extensionRunner;
       if (runner) {
@@ -532,7 +532,7 @@ export class PiProvider implements IAgentProvider {
     //    mode the way Claude and Codex do, so we implement it via prompt
     //    engineering: append the schema + "JSON only, no fences" instruction,
     //    and have the bridge parse the accumulated assistant text on
-    //    agent_end. Parse failures degrade gracefully — the executor's
+    //    agent_end. Parse failures degrade gracefully -- the executor's
     //    existing dag.structured_output_missing warning path handles them.
     const outputFormat = requestOptions?.outputFormat;
     const effectivePrompt = outputFormat
@@ -546,7 +546,7 @@ export class PiProvider implements IAgentProvider {
     //
     //    The module-level semaphore is initialized lazily from the first
     //    config that sets maxConcurrent and reused for the lifetime of the
-    //    process — this is a known v1 tradeoff. Pi concurrency is global
+    //    process -- this is a known v1 tradeoff. Pi concurrency is global
     //    (one upstream backend) so a process-wide cap is the right scope.
     const maxConcurrent = piConfig.maxConcurrent;
     if (maxConcurrent !== undefined && piSemaphore === undefined) {
@@ -554,7 +554,7 @@ export class PiProvider implements IAgentProvider {
       getLog().info({ maxConcurrent }, 'pi.semaphore_initialized');
     }
 
-    // Snapshot before the first await — if a concurrent call initializes the
+    // Snapshot before the first await -- if a concurrent call initializes the
     // module-level piSemaphore after this point, sem stays undefined and the
     // finally block correctly skips release (we never acquired).
     const sem = piSemaphore;

@@ -174,7 +174,7 @@ export async function isolationCleanupMergedCommand(
 }
 
 /**
- * Complete branch lifecycle — remove worktree, local branch, remote branch, mark DB as destroyed
+ * Complete branch lifecycle -- remove worktree, local branch, remote branch, mark DB as destroyed
  */
 export async function isolationCompleteCommand(
   branchNames: string[],
@@ -191,7 +191,7 @@ export async function isolationCompleteCommand(
     } catch (error) {
       const err = error as Error;
       getLog().error({ err, branch }, 'isolation.lookup_failed');
-      console.error(`  Failed: ${branch} — DB lookup error: ${err.message}`);
+      console.error(`  Failed: ${branch} -- DB lookup error: ${err.message}`);
       failed++;
       continue;
     }
@@ -202,7 +202,7 @@ export async function isolationCompleteCommand(
       continue;
     }
 
-    // Run all safety checks before removing — collect all blockers, report at once.
+    // Run all safety checks before removing -- collect all blockers, report at once.
     // Skipped entirely when --force is set.
     if (!options.force) {
       const blockers: string[] = [];
@@ -229,7 +229,7 @@ export async function isolationCompleteCommand(
         }
       } catch (error) {
         getLog().warn({ err: error as Error, branch }, 'isolation.complete_workflow_check_failed');
-        console.warn('  Warning: could not check for running workflows — skipping workflow check');
+        console.warn('  Warning: could not check for running workflows -- skipping workflow check');
       }
 
       // Check 3: open PRs on this branch (requires gh CLI)
@@ -241,13 +241,13 @@ export async function isolationCompleteCommand(
         );
         const prs = JSON.parse(ghResult.stdout) as { number: number; title: string }[];
         for (const pr of prs) {
-          blockers.push(`open PR #${pr.number} — "${pr.title}"`);
+          blockers.push(`open PR #${pr.number} -- "${pr.title}"`);
         }
       } catch (error) {
         const err = error as NodeJS.ErrnoException;
         const isNotInstalled = err.code === 'ENOENT' || err.message.includes('command not found');
         const reason = isNotInstalled ? 'gh CLI not available' : `gh error: ${err.message}`;
-        console.warn(`  Warning: ${reason} — skipping open PR check`);
+        console.warn(`  Warning: ${reason} -- skipping open PR check`);
         getLog().warn({ err, branch }, 'isolation.complete_pr_check_failed');
       }
 
@@ -265,7 +265,7 @@ export async function isolationCompleteCommand(
         }
       } catch (error) {
         getLog().warn({ err: error as Error, branch }, 'isolation.complete_unmerged_check_failed');
-        console.warn('  Warning: could not check for unmerged commits — skipping unmerged check');
+        console.warn('  Warning: could not check for unmerged commits -- skipping unmerged check');
       }
 
       // Check 5: unpushed commits (not yet on remote)
@@ -292,7 +292,7 @@ export async function isolationCompleteCommand(
       if (blockers.length > 0) {
         console.error(`  Blocked: ${branch}`);
         for (const blocker of blockers) {
-          console.error(`    ✗ ${blocker}`);
+          console.error(`    [ ] ${blocker}`);
         }
         console.error('  Use --force to override.');
         failed++;
@@ -312,7 +312,7 @@ export async function isolationCompleteCommand(
       }
 
       if (result.skippedReason) {
-        console.error(`  Blocked: ${branch} — ${result.skippedReason}`);
+        console.error(`  Blocked: ${branch} -- ${result.skippedReason}`);
         if (result.skippedReason === 'has uncommitted changes') {
           console.error('    Use --force to override.');
         }
@@ -322,10 +322,10 @@ export async function isolationCompleteCommand(
         if (result.branchDeleted) parts.push('branch deleted');
         parts.push('DB updated');
         console.error(
-          `  Partial: ${branch} — worktree was not removed from disk (${parts.join(', ')})`
+          `  Partial: ${branch} -- worktree was not removed from disk (${parts.join(', ')})`
         );
         for (const warning of result.warnings) {
-          console.error(`    ⚠ ${warning}`);
+          console.error(`    ! ${warning}`);
         }
         failed++;
       } else {
@@ -335,7 +335,7 @@ export async function isolationCompleteCommand(
     } catch (error) {
       const err = error as Error;
       getLog().warn({ err, branch, envId: env.id }, 'isolation.complete_failed');
-      console.error(`  Failed: ${branch} — ${err.message}`);
+      console.error(`  Failed: ${branch} -- ${err.message}`);
       failed++;
     }
   }

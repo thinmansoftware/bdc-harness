@@ -3,13 +3,13 @@
  * Multi-platform AI coding assistant (Telegram, Discord, Slack, GitHub, Gitea)
  */
 
-// Strip CWD .env keys FIRST — before any application imports read process.env.
+// Strip CWD .env keys FIRST -- before any application imports read process.env.
 // Bun auto-loads .env/.env.local/.env.development/.env.production from CWD;
 // when `bun run dev:server` is run from inside a target repo those keys leak
 // into the server process. stripCwdEnv() removes them before ~/.archon/.env loads.
 import '@archon/paths/strip-cwd-env-boot';
 
-// Load environment variables — after CWD stripping, before application imports.
+// Load environment variables -- after CWD stripping, before application imports.
 import { config } from 'dotenv';
 import { resolve, join } from 'path';
 import { existsSync } from 'fs';
@@ -30,7 +30,7 @@ if (envPath) {
 
 // Load archon-owned env from ~/.archon/.env (user scope) and <cwd>/.archon/.env
 // (repo scope, wins over user) with override: true. Keeps the server in sync
-// with the CLI — see packages/paths/src/env-loader.ts and the three-path model
+// with the CLI -- see packages/paths/src/env-loader.ts and the three-path model
 // (#1302 / #1303).
 import { loadArchonEnv } from '@archon/paths/env-loader';
 loadArchonEnv(process.cwd());
@@ -117,18 +117,18 @@ function createMessageErrorHandler(
  * Exported for testability. Filters specifically for SDK cleanup races
  * ("Operation aborted" when the PostToolUse hook writes to a closed pipe after
  * a DAG node abort). Those are logged at error level but do not exit the process.
- * All other unhandled rejections are unexpected bugs — they are logged at fatal
+ * All other unhandled rejections are unexpected bugs -- they are logged at fatal
  * level and the process exits immediately (Fail Fast principle).
  */
 export function handleUnhandledRejection(reason: unknown): void {
   const message = (reason instanceof Error ? reason.message : String(reason)).toLowerCase();
   // SDK cleanup race: PostToolUse hook writes to a closed pipe after a DAG node
-  // abort. Safe to absorb — these are transient artifacts, not application bugs.
+  // abort. Safe to absorb -- these are transient artifacts, not application bugs.
   if (message.includes('operation aborted')) {
     getLog().error({ reason }, 'unhandled_rejection.sdk_cleanup_race');
     return;
   }
-  // All other unhandled rejections are unexpected — crash loudly so they are
+  // All other unhandled rejections are unexpected -- crash loudly so they are
   // not silently swallowed (CLAUDE.md: "Fail Fast + Explicit Errors").
   getLog().fatal({ reason }, 'unhandled_rejection.fatal');
   process.exit(1);
@@ -140,7 +140,7 @@ export interface ServerOptions {
    * Only effective in production mode (NODE_ENV=production or WEB_UI_DEV unset).
    */
   webDistPath?: string;
-  /** Override the port. Range: 1–65535. */
+  /** Override the port. Range: 1--65535. */
   port?: number;
   /** Run in standalone web-only mode (no Telegram/Slack/GitHub/Discord adapters). */
   skipPlatformAdapters?: boolean;
@@ -207,7 +207,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
   const config = await loadConfig();
   logConfig(config);
 
-  // Validate agent registry at startup — fail closed if any agent file is malformed.
+  // Validate agent registry at startup -- fail closed if any agent file is malformed.
   // loadAgentRegistry already handles ENOENT (no agents dir) by returning an empty registry.
   try {
     await loadAgentRegistry(join(process.cwd(), '.archon', 'agents'));
@@ -223,13 +223,13 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
   // Note: orphaned-run cleanup intentionally NOT called at server startup.
   // Running it here killed parallel workflow runs from other processes
   // (CLI, adapters) by flipping their `running` rows to `failed` mid-flight.
-  // Same lesson the CLI already learned — see packages/cli/src/cli.ts:256-258.
+  // Same lesson the CLI already learned -- see packages/cli/src/cli.ts:256-258.
   // Per CLAUDE.md "No Autonomous Lifecycle Mutation Across Process Boundaries":
   // surface ambiguous state to users and provide a one-click action instead.
   // Users transition a stuck `running` row via the per-row Cancel/Abandon
   // buttons in the Web UI dashboard, or `archon workflow abandon <run-id>`.
   // (`archon workflow cleanup` is a separate command that deletes OLD terminal
-  // rows for disk hygiene — it does not handle stuck `running` rows.)
+  // rows for disk hygiene -- it does not handle stuck `running` rows.)
   // See #1216.
 
   // Log Archon paths configuration
@@ -246,10 +246,10 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
   // Initialize web adapter (always enabled)
   // Note: Circular references between transport/persistence/workflowBridge are safe because:
   // - transport's cleanup callback references persistence/workflowBridge (declared after, but
-  //   only invoked from a grace period timer — well after all constructors complete)
+  //   only invoked from a grace period timer -- well after all constructors complete)
   // - persistence's emitEvent closure references transport.emit (same lazy pattern)
   const transport = new SSETransport(conversationId => {
-    // Flush (not clear!) — the orchestrator/workflow may still be writing messages
+    // Flush (not clear!) -- the orchestrator/workflow may still be writing messages
     // even though the SSE stream disconnected. Clearing the dbId mapping would cause
     // all subsequent messages to be lost (never persisted to DB).
     void persistence.flush(conversationId).catch((e: unknown) => {
@@ -264,7 +264,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
   await webAdapter.start();
   persistence.startPeriodicFlush();
 
-  // Mutable — pushed to as each adapter starts, read by the /api/health endpoint.
+  // Mutable -- pushed to as each adapter starts, read by the /api/health endpoint.
   // Must be a live reference because Telegram starts after the HTTP listener begins
   // accepting requests, so a snapshot taken at registration time would miss it.
   const activePlatforms: string[] = ['Web'];
@@ -398,7 +398,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
       });
 
       // Don't let a Discord login failure (bad token, missing privileged
-      // intents, etc.) bring down the whole server — users running
+      // intents, etc.) bring down the whole server -- users running
       // `archon serve` for the web UI shouldn't lose it because of an
       // unrelated bot misconfiguration. See #1365.
       try {
@@ -735,7 +735,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
   // Guard against SDK cleanup races: when a DAG node is aborted mid-execution,
   // the Claude Agent SDK's PostToolUse hook may be in-flight. After the hook
   // returns { continue: true }, handleControlRequest() tries to write() back to
-  // the subprocess pipe — but the pipe is already closed (abort fired). The
+  // the subprocess pipe -- but the pipe is already closed (abort fired). The
   // write() throws "Operation aborted", which becomes an unhandled rejection
   // because it occurs AFTER the for-await generator loop exits (and thus outside
   // the try/catch in claude.ts). These are SDK cleanup races, not fatal app errors.
@@ -760,7 +760,7 @@ async function checkGhAuth(): Promise<void> {
     getLog().info('gh_auth.status_ok');
   } catch {
     getLog().warn(
-      'gh_auth.status_failed — gh CLI is not authenticated. Workflows using gh commands may fail. ' +
+      'gh_auth.status_failed -- gh CLI is not authenticated. Workflows using gh commands may fail. ' +
         'Run `gh auth login` or set GH_TOKEN in .env to fix this.'
     );
   }

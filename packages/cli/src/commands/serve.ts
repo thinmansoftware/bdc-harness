@@ -11,7 +11,7 @@ function toError(err: unknown): Error {
 }
 
 export interface ServeOptions {
-  /** TCP port to bind. Ignored when downloadOnly is true. Range: 1–65535. */
+  /** TCP port to bind. Ignored when downloadOnly is true. Range: 1--65535. */
   port?: number;
   /** Download the web UI and exit without starting the server. */
   downloadOnly?: boolean;
@@ -68,7 +68,7 @@ export async function serveCommand(opts: ServeOptions): Promise<number> {
     return 1;
   }
 
-  // Block forever — Bun.serve() keeps the event loop alive, but the CLI's
+  // Block forever -- Bun.serve() keeps the event loop alive, but the CLI's
   // process.exit(exitCode) would kill it. Wait on a promise that only resolves
   // on SIGINT/SIGTERM so the server stays running.
   await new Promise<void>(resolve => {
@@ -83,7 +83,7 @@ async function downloadWebDist(version: string, targetDir: string): Promise<void
   const checksumsUrl = `https://github.com/${GITHUB_REPO}/releases/download/v${version}/checksums.txt`;
 
   log.info({ version, targetDir }, 'web_dist.download_started');
-  console.log(`Web UI not found locally — downloading from release v${version}...`);
+  console.log(`Web UI not found locally -- downloading from release v${version}...`);
 
   // Download checksums and tarball in parallel
   console.log(`Downloading ${tarballUrl}...`);
@@ -145,7 +145,7 @@ async function downloadWebDist(version: string, targetDir: string): Promise<void
   if (!existsSync(`${tmpDir}/index.html`)) {
     cleanupAndThrow(
       tmpDir,
-      'Extraction produced unexpected layout — index.html not found in extracted dir'
+      'Extraction produced unexpected layout -- index.html not found in extracted dir'
     );
   }
 

@@ -5,8 +5,8 @@ import { loadArchonEnv } from './env-loader';
 
 /**
  * loadArchonEnv covers the read side of the three-path env model (#1302):
- *   ~/.archon/.env         → home scope, override: true
- *   <cwd>/.archon/.env     → repo scope, override: true (wins over home)
+ *   ~/.archon/.env         -> home scope, override: true
+ *   <cwd>/.archon/.env     -> repo scope, override: true (wins over home)
  *
  * Tests drive the home scope via ARCHON_HOME and the repo scope via the `cwd`
  * argument. Both are tmpdirs; no real ~/.archon/ is touched.
@@ -85,7 +85,7 @@ describe('loadArchonEnv', () => {
     const line = stderrWrites.find(s => s.includes('repo scope, overrides user scope'));
     expect(line).toBeDefined();
     expect(line).toContain('loaded 1 keys');
-    // Path rendering tildes anything under the user's home directory — assert
+    // Path rendering tildes anything under the user's home directory -- assert
     // on the suffix (the `.archon/.env` segment) rather than the full path,
     // because the tmpdir may or may not live under $HOME on CI.
     expect(line).toContain(join('.archon', '.env'));
@@ -148,7 +148,7 @@ describe('loadArchonEnv', () => {
   });
 
   it('exits with error when env file has a dotenv-unparseable layout', () => {
-    // dotenv.parse is very permissive — lines without `=` are silently ignored,
+    // dotenv.parse is very permissive -- lines without `=` are silently ignored,
     // so syntactic errors that actually surface are rare. We instead simulate
     // a permission-style failure by writing a path that cannot be read: pass a
     // directory in place of a file. dotenv.config returns an error for EISDIR.

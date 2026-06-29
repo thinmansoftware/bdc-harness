@@ -80,7 +80,7 @@ describe('SSETransport', () => {
       transport.registerStream('conv-1', stream1);
       transport.removeStream('conv-1');
 
-      // Re-register before grace period expires — cleanup should be cancelled
+      // Re-register before grace period expires -- cleanup should be cancelled
       transport.registerStream('conv-1', stream2);
 
       // Wait longer than the grace period
@@ -112,7 +112,7 @@ describe('SSETransport', () => {
       transport.registerStream('conv-1', stream1);
       transport.registerStream('conv-1', stream2);
 
-      // Attempt to remove with stale stream reference — should be no-op
+      // Attempt to remove with stale stream reference -- should be no-op
       transport.removeStream('conv-1', stream1);
 
       expect(transport.hasActiveStream('conv-1')).toBe(true);
@@ -284,7 +284,7 @@ describe('SSETransport', () => {
       transport.removeStream('conv-1');
       transport.stop();
 
-      // Wait longer than grace period — cleanup should NOT fire (timer was cleared)
+      // Wait longer than grace period -- cleanup should NOT fire (timer was cleared)
       return new Promise<void>(resolve => {
         setTimeout(() => {
           expect(cleanup).not.toHaveBeenCalled();

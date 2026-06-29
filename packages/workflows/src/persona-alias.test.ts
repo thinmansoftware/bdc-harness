@@ -61,7 +61,7 @@ You are the ${name} persona. Test sentinel: PERSONA_LOAD_BEARING.
 }
 
 // ---------------------------------------------------------------------------
-// S1 — persona-only node parses and carries persona through the transform
+// S1 -- persona-only node parses and carries persona through the transform
 // ---------------------------------------------------------------------------
 
 describe('S1: persona:-only node loads via alias', () => {
@@ -74,7 +74,7 @@ describe('S1: persona:-only node loads via alias', () => {
     expect(result.success).toBe(true);
     if (result.success) {
       expect((result.data as { persona?: string }).persona).toBe('overseer');
-      // agent: must NOT be auto-populated — the alias is read at resolution time,
+      // agent: must NOT be auto-populated -- the alias is read at resolution time,
       // not normalized at parse time.
       expect((result.data as { agent?: string }).agent).toBeUndefined();
     }
@@ -126,7 +126,7 @@ describe('S1: persona:-only node loads via alias', () => {
 });
 
 // ---------------------------------------------------------------------------
-// S2 — agent-only nodes still work (regression guard)
+// S2 -- agent-only nodes still work (regression guard)
 // ---------------------------------------------------------------------------
 
 describe('S2: agent:-only node still loads (regression guard)', () => {
@@ -158,10 +158,10 @@ describe('S2: agent:-only node still loads (regression guard)', () => {
 });
 
 // ---------------------------------------------------------------------------
-// S3 — both fields set and agree (no double-injection)
+// S3 -- both fields set and agree (no double-injection)
 // ---------------------------------------------------------------------------
 
-describe('S3: persona: + agent: agree — no double injection', () => {
+describe('S3: persona: + agent: agree -- no double injection', () => {
   test('schema accepts both fields when values match', () => {
     const result = dagNodeSchema.safeParse({
       id: 'both-aligned',
@@ -178,7 +178,7 @@ describe('S3: persona: + agent: agree — no double injection', () => {
 
   test('alias resolution: ?? returns persona name exactly once (not duplicated)', () => {
     // The resolution logic (node.agent ?? node.persona) yields a single string,
-    // which is then passed to resolveAgent() exactly once — preventing
+    // which is then passed to resolveAgent() exactly once -- preventing
     // double-injection of persona context.
     const result = dagNodeSchema.safeParse({
       id: 'both-aligned',
@@ -198,7 +198,7 @@ describe('S3: persona: + agent: agree — no double injection', () => {
 });
 
 // ---------------------------------------------------------------------------
-// S4 — unknown persona fails loud at validation time
+// S4 -- unknown persona fails loud at validation time
 // ---------------------------------------------------------------------------
 
 describe('S4: unknown persona fails loud (before any node runs)', () => {
@@ -248,7 +248,7 @@ describe('S4: unknown persona fails loud (before any node runs)', () => {
 });
 
 // ---------------------------------------------------------------------------
-// S5 — schema rejects conflicting persona: + agent:
+// S5 -- schema rejects conflicting persona: + agent:
 // ---------------------------------------------------------------------------
 
 describe('S5: persona: vs agent: conflict is rejected at parse time', () => {

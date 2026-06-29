@@ -36,7 +36,7 @@ function setupAuth(): void {
     const persistedAuthPath = path.join(os.homedir(), '.codex', 'auth.json');
     if (fs.existsSync(persistedAuthPath)) {
       console.warn(
-        `⚠️  CODEX_* env vars not set, but persisted ${persistedAuthPath} exists from a previous run`
+        `!  CODEX_* env vars not set, but persisted ${persistedAuthPath} exists from a previous run`
       );
       console.warn(
         '    Codex will attempt to use those credentials. If they are stale or revoked,'
@@ -46,12 +46,12 @@ function setupAuth(): void {
       );
       return;
     }
-    console.log('⏭️  Skipping Codex auth setup - credentials not provided');
+    console.log('  Skipping Codex auth setup - credentials not provided');
     console.log('   Codex assistant will be unavailable');
     return;
   }
 
-  console.log('🔐 Setting up Codex authentication...');
+  console.log(' Setting up Codex authentication...');
 
   // Create auth.json structure
   const authData: AuthJson = {
@@ -72,15 +72,15 @@ function setupAuth(): void {
   // Create directory if it doesn't exist
   if (!fs.existsSync(codexHome)) {
     fs.mkdirSync(codexHome, { recursive: true });
-    console.log(`✅ Created directory: ${codexHome}`);
+    console.log(`[x] Created directory: ${codexHome}`);
   }
 
   // Write auth.json file
   try {
     fs.writeFileSync(authPath, JSON.stringify(authData, null, 2));
-    console.log(`✅ Successfully created auth.json at: ${authPath}`);
+    console.log(`[x] Successfully created auth.json at: ${authPath}`);
   } catch (error: unknown) {
-    console.error(`❌ Failed to write auth.json: ${String(error)}`);
+    console.error(`[ ] Failed to write auth.json: ${String(error)}`);
     process.exit(1);
   }
 
@@ -99,16 +99,16 @@ network_access = true
 
   try {
     fs.writeFileSync(configPath, configContent);
-    console.log(`✅ Successfully created config.toml at: ${configPath}`);
+    console.log(`[x] Successfully created config.toml at: ${configPath}`);
     console.log(
-      '✅ Codex YOLO mode enabled (approval_policy="never", sandbox_mode="danger-full-access")'
+      '[x] Codex YOLO mode enabled (approval_policy="never", sandbox_mode="danger-full-access")'
     );
   } catch (error: unknown) {
-    console.error(`❌ Failed to write config.toml: ${String(error)}`);
+    console.error(`[ ] Failed to write config.toml: ${String(error)}`);
     process.exit(1);
   }
 
-  console.log('✅ Codex authentication and configuration complete');
+  console.log('[x] Codex authentication and configuration complete');
 }
 
 // Run the setup

@@ -7,7 +7,7 @@
  *   archon workflow run <name> [msg]  Run a workflow
  *   archon version                    Show version info
  */
-// Must be the very first import — strips Bun-auto-loaded CWD .env keys before
+// Must be the very first import -- strips Bun-auto-loaded CWD .env keys before
 // any module reads process.env at init time (e.g. @archon/paths/logger reads LOG_LEVEL).
 import '@archon/paths/strip-cwd-env-boot';
 // Then load archon-owned env from ~/.archon/.env (user scope) and
@@ -160,7 +160,7 @@ async function printUpdateNotice(quiet: boolean | undefined): Promise<void> {
     const result = await checkForUpdate(BUNDLED_VERSION);
     if (result?.updateAvailable) {
       process.stderr.write(
-        `Update available: v${result.currentVersion} → v${result.latestVersion} — ${result.releaseUrl}\n`
+        `Update available: v${result.currentVersion} -> v${result.latestVersion} -- ${result.releaseUrl}\n`
       );
     }
   } catch (err) {
@@ -175,7 +175,7 @@ async function printUpdateNotice(quiet: boolean | undefined): Promise<void> {
 /**
  * Detect a request for version output. Treats `--version`, `-V`, and the
  * single-dash typo `-version` as version flags anywhere in argv. `-v` keeps
- * its role as the short alias for `--verbose`, except when used alone — then
+ * its role as the short alias for `--verbose`, except when used alone -- then
  * it falls back to version output to match the convention used by node, npm,
  * bun, and most other CLIs.
  */
@@ -342,7 +342,7 @@ async function main(): Promise<number> {
         const forceFlag = (values.force as boolean | undefined) ?? false;
         // For --scope project, resolve to the git repo root so running from a
         // subdirectory writes to <repo-root>/.archon/.env (what loadArchonEnv
-        // reads at boot) — not <subdir>/.archon/.env.
+        // reads at boot) -- not <subdir>/.archon/.env.
         let repoPath = cwd;
         if (scope === 'project') {
           const repoRoot = await git.findRepoRoot(cwd);
@@ -505,7 +505,7 @@ async function main(): Promise<number> {
                 eventData = JSON.parse(rawData) as Record<string, unknown>;
               } catch {
                 console.warn(
-                  `Warning: --data is not valid JSON — event will be emitted without data payload: ${rawData}`
+                  `Warning: --data is not valid JSON -- event will be emitted without data payload: ${rawData}`
                 );
               }
             }

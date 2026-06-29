@@ -2,7 +2,7 @@
  * Unit tests for clone.ts (cloneRepository, registerRepository)
  *
  * Strategy:
- * - mock.module() for DB modules and @archon/paths (safe — no standalone test files for these)
+ * - mock.module() for DB modules and @archon/paths (safe -- no standalone test files for these)
  * - spyOn() for @archon/git (execFileAsync) and fs/promises (access, rm)
  *   to avoid process-global mock.module pollution that would break git.test.ts
  * - Lazy logger pattern means @archon/paths mock must be set up before the module import
@@ -12,7 +12,7 @@ import * as fsPromises from 'fs/promises';
 import * as gitUtils from '@archon/git';
 import { createMockLogger } from '../test/mocks/logger';
 
-// ── DB mocks ────────────────────────────────────────────────────────────────
+// -- DB mocks ----------------------------------------------------------------
 const mockCreateCodebase = mock(() =>
   Promise.resolve({
     id: 'codebase-uuid-1',
@@ -42,7 +42,7 @@ mock.module('../db/codebases', () => ({
   updateCodebase: mockUpdateCodebase,
 }));
 
-// ── @archon/paths mock ──────────────────────────────────────────────────────
+// -- @archon/paths mock ------------------------------------------------------
 const mockLogger = createMockLogger();
 
 mock.module('@archon/paths', () => ({
@@ -60,16 +60,16 @@ mock.module('@archon/paths', () => ({
   }),
 }));
 
-// ── utils/commands mock ─────────────────────────────────────────────────────
+// -- utils/commands mock -----------------------------------------------------
 const mockFindMarkdownFilesRecursive = mock(() => Promise.resolve([]));
 mock.module('../utils/commands', () => ({
   findMarkdownFilesRecursive: mockFindMarkdownFilesRecursive,
 }));
 
-// ── Import module under test AFTER mocks are registered ────────────────────
+// -- Import module under test AFTER mocks are registered --------------------
 import { cloneRepository, registerRepository } from './clone';
 
-// ── Spies for fs/promises and @archon/git ──────────────────────────────────
+// -- Spies for fs/promises and @archon/git ----------------------------------
 let spyFsAccess: ReturnType<typeof spyOn>;
 let spyFsRm: ReturnType<typeof spyOn>;
 let spyExecFileAsync: ReturnType<typeof spyOn>;
@@ -122,7 +122,7 @@ afterAll(() => {
   restoreSpies();
 });
 
-// ── Helpers ─────────────────────────────────────────────────────────────────
+// -- Helpers -----------------------------------------------------------------
 
 /** Build a minimal codebase row for the mock to return */
 function makeCodebase(
@@ -147,7 +147,7 @@ function makeCodebase(
   };
 }
 
-// ────────────────────────────────────────────────────────────────────────────
+// ----------------------------------------------------------------------------
 describe('cloneRepository', () => {
   beforeEach(() => {
     clearMocks();
@@ -156,7 +156,7 @@ describe('cloneRepository', () => {
     delete process.env.GH_TOKEN;
   });
 
-  // ── URL normalization / happy-path cloning ─────────────────────────────
+  // -- URL normalization / happy-path cloning -----------------------------
   describe('HTTPS URL cloning', () => {
     test('clones a standard HTTPS GitHub URL', async () => {
       mockCreateCodebase.mockResolvedValueOnce(
@@ -222,7 +222,7 @@ describe('cloneRepository', () => {
     });
   });
 
-  // ── SSH URL conversion ─────────────────────────────────────────────────
+  // -- SSH URL conversion -------------------------------------------------
   describe('SSH URL conversion', () => {
     test('converts git@ SSH URL to HTTPS before cloning', async () => {
       mockCreateCodebase.mockResolvedValueOnce(
@@ -251,7 +251,7 @@ describe('cloneRepository', () => {
     });
   });
 
-  // ── GH_TOKEN authentication ────────────────────────────────────────────
+  // -- GH_TOKEN authentication --------------------------------------------
   describe('GH_TOKEN authentication', () => {
     beforeEach(() => {
       process.env.GH_TOKEN = 'ghp_testtoken123';
@@ -301,7 +301,7 @@ describe('cloneRepository', () => {
     });
   });
 
-  // ── Already-cloned directory ───────────────────────────────────────────
+  // -- Already-cloned directory -------------------------------------------
   describe('pre-existing clone', () => {
     beforeEach(() => {
       // .git directory exists
@@ -349,7 +349,7 @@ describe('cloneRepository', () => {
     });
   });
 
-  // ── Local path delegation ──────────────────────────────────────────────
+  // -- Local path delegation ----------------------------------------------
   describe('local path delegation', () => {
     test('delegates absolute path (/) to registerRepository', async () => {
       // registerRepository calls git rev-parse, then creates codebase
@@ -363,7 +363,7 @@ describe('cloneRepository', () => {
 
       const result = await cloneRepository('/home/user/myrepo');
 
-      // git clone must NOT be called (local path → register)
+      // git clone must NOT be called (local path -> register)
       const cloneCall = (spyExecFileAsync.mock.calls as string[][]).find(
         args => args[0] === 'git' && args[1]?.[0] === 'clone'
       );
@@ -405,7 +405,7 @@ describe('cloneRepository', () => {
     });
   });
 
-  // ── Error handling ─────────────────────────────────────────────────────
+  // -- Error handling -----------------------------------------------------
   describe('error handling', () => {
     test('wraps git clone failure with sanitized message', async () => {
       process.env.GH_TOKEN = 'super_secret_token';
@@ -446,10 +446,10 @@ describe('cloneRepository', () => {
     });
   });
 
-  // ── Command auto-loading ───────────────────────────────────────────────
+  // -- Command auto-loading -----------------------------------------------
   describe('command auto-loading', () => {
     test('loads commands when .archon/commands directory exists with markdown files', async () => {
-      // access(): .git → ENOENT (proceed to clone), everything else → success (assistant + commands)
+      // access(): .git -> ENOENT (proceed to clone), everything else -> success (assistant + commands)
       spyFsAccess.mockImplementation((path: string) => {
         if (typeof path === 'string' && path.endsWith('.git')) {
           return Promise.reject(Object.assign(new Error('ENOENT'), { code: 'ENOENT' }));
@@ -469,7 +469,7 @@ describe('cloneRepository', () => {
     });
 
     test('returns commandCount 0 when no command folders exist', async () => {
-      // access() always rejects → no command folder found (and no pre-existing .git)
+      // access() always rejects -> no command folder found (and no pre-existing .git)
       spyFsAccess.mockRejectedValue(Object.assign(new Error('ENOENT'), { code: 'ENOENT' }));
       mockCreateCodebase.mockResolvedValueOnce(makeCodebase() as ReturnType<typeof makeCodebase>);
 
@@ -480,7 +480,7 @@ describe('cloneRepository', () => {
     });
 
     test('returns commandCount 0 when command folder exists but contains no markdown files', async () => {
-      // access(): .git → ENOENT, command folder → success
+      // access(): .git -> ENOENT, command folder -> success
       spyFsAccess.mockImplementation((path: string) => {
         if (typeof path === 'string' && path.endsWith('.git')) {
           return Promise.reject(Object.assign(new Error('ENOENT'), { code: 'ENOENT' }));
@@ -497,7 +497,7 @@ describe('cloneRepository', () => {
     });
   });
 
-  // ── Assistant type detection ───────────────────────────────────────────
+  // -- Assistant type detection -------------------------------------------
   describe('assistant type detection', () => {
     test('detects codex assistant when .codex folder exists', async () => {
       // access(): first call is for .git (does not exist), then .codex (exists), then command search
@@ -543,7 +543,7 @@ describe('cloneRepository', () => {
 
     test('detects claude assistant when .claude folder exists but .codex does not', async () => {
       spyFsAccess.mockImplementation((path: string) => {
-        // .codex → ENOENT, .claude → exists, .git → ENOENT, commands → ENOENT
+        // .codex -> ENOENT, .claude -> exists, .git -> ENOENT, commands -> ENOENT
         if (typeof path === 'string' && path.endsWith('.claude')) {
           return Promise.resolve(undefined);
         }
@@ -561,7 +561,7 @@ describe('cloneRepository', () => {
   });
 });
 
-// ────────────────────────────────────────────────────────────────────────────
+// ----------------------------------------------------------------------------
 describe('registerRepository', () => {
   beforeEach(() => {
     clearMocks();
@@ -569,7 +569,7 @@ describe('registerRepository', () => {
     setupSpies();
   });
 
-  // ── Happy path ─────────────────────────────────────────────────────────
+  // -- Happy path ---------------------------------------------------------
   test('registers a valid local git repo not yet in DB', async () => {
     spyExecFileAsync.mockImplementation((cmd: string, args: string[]) => {
       if (args.includes('rev-parse')) return Promise.resolve({ stdout: '.git', stderr: '' });
@@ -606,7 +606,7 @@ describe('registerRepository', () => {
     expect(mockCreateCodebase.mock.calls.length).toBe(0);
   });
 
-  // ── Validation ─────────────────────────────────────────────────────────
+  // -- Validation ---------------------------------------------------------
   test('throws when path is not a git repository', async () => {
     spyExecFileAsync.mockRejectedValueOnce(new Error('not a git repository'));
 
@@ -615,7 +615,7 @@ describe('registerRepository', () => {
     );
   });
 
-  // ── Remote URL handling ────────────────────────────────────────────────
+  // -- Remote URL handling ------------------------------------------------
   test('uses directory name as repo name when no remote URL exists', async () => {
     spyExecFileAsync.mockImplementation((cmd: string, args: string[]) => {
       if (args.includes('rev-parse')) return Promise.resolve({ stdout: '.git', stderr: '' });
@@ -706,7 +706,7 @@ describe('registerRepository', () => {
     expect(createArg.name).toBe('acme/backend');
   });
 
-  // ── Command auto-loading ───────────────────────────────────────────────
+  // -- Command auto-loading -----------------------------------------------
   test('auto-loads markdown commands found in .archon/commands', async () => {
     spyExecFileAsync.mockImplementation((cmd: string, args: string[]) => {
       if (args.includes('rev-parse')) return Promise.resolve({ stdout: '.git', stderr: '' });
@@ -714,7 +714,7 @@ describe('registerRepository', () => {
         return Promise.resolve({ stdout: 'https://github.com/owner/repo', stderr: '' });
       return Promise.resolve({ stdout: '', stderr: '' });
     });
-    // access(): only the command folder path succeeds; .codex/.claude → ENOENT
+    // access(): only the command folder path succeeds; .codex/.claude -> ENOENT
     spyFsAccess.mockImplementation((path: string) => {
       const normalized = typeof path === 'string' ? path.replace(/\\/g, '/') : '';
       if (normalized.includes('.archon/commands')) {
@@ -735,7 +735,7 @@ describe('registerRepository', () => {
   });
 });
 
-// ────────────────────────────────────────────────────────────────────────────
+// ----------------------------------------------------------------------------
 describe('normalizeRepoUrl (via cloneRepository)', () => {
   beforeEach(() => {
     clearMocks();
@@ -775,7 +775,7 @@ describe('normalizeRepoUrl (via cloneRepository)', () => {
   });
 });
 
-// ────────────────────────────────────────────────────────────────────────────
+// ----------------------------------------------------------------------------
 describe('name-based deduplication', () => {
   beforeEach(() => {
     clearMocks();
@@ -845,7 +845,7 @@ describe('name-based deduplication', () => {
       repository_url: 'https://github.com/owner/repo',
       default_cwd: '/home/user/repo',
     });
-    // Clone same repo — name-based lookup finds existing
+    // Clone same repo -- name-based lookup finds existing
     // .git does NOT exist (proceed to clone), but name dedup catches it
     mockFindCodebaseByName.mockResolvedValueOnce(existingCodebase);
     mockCreateCodebase.mockResolvedValueOnce(makeCodebase() as ReturnType<typeof makeCodebase>);
@@ -890,7 +890,7 @@ describe('name-based deduplication', () => {
   });
 });
 
-// ────────────────────────────────────────────────────────────────────────────
+// ----------------------------------------------------------------------------
 describe('RegisterResult shape', () => {
   beforeEach(() => {
     clearMocks();

@@ -2,7 +2,7 @@
  * PR state lookup via the `gh` CLI.
  *
  * Used by cleanup to detect squash-merged or closed PRs that git ancestry
- * checks miss. The `gh` CLI is a soft dependency — if it's missing or fails,
+ * checks miss. The `gh` CLI is a soft dependency -- if it's missing or fails,
  * we return 'NONE' and let callers fall back to git-only signals.
  */
 import { execFileAsync } from '@archon/git';

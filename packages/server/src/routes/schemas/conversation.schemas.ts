@@ -95,7 +95,7 @@ export const sendMessageMultipartSchema = z
       .array(z.string().openapi({ format: 'binary' }))
       .max(5)
       .optional()
-      .openapi({ description: 'Maximum 5 files; each file must be ≤ 10 MB' }),
+      .openapi({ description: 'Maximum 5 files; each file must be <= 10 MB' }),
   })
   .openapi('SendMessageMultipartBody');
 

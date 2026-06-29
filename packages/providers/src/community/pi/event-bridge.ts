@@ -20,7 +20,7 @@ function getLog(): ReturnType<typeof createLogger> {
  *  - sentinel items (in this bridge: `__done` / `__error`) are pushed by the
  *    caller; the queue itself does not know about them
  *
- * Single-consumer is a hard invariant — a second iterator would race with
+ * Single-consumer is a hard invariant -- a second iterator would race with
  * the first over both the buffer and the waiters list, silently dropping
  * items. The constructor enforces this: the first `Symbol.asyncIterator`
  * call sets `consumed=true`; subsequent calls throw so the mistake surfaces
@@ -85,7 +85,7 @@ export class AsyncQueue<T> implements AsyncIterable<T> {
 
 /**
  * Serialize a tool-execution `result` payload to a stable string.
- * Pi tools return arbitrary JS — strings pass through, everything else is
+ * Pi tools return arbitrary JS -- strings pass through, everything else is
  * JSON-serialized (with String() fallback for non-serializable objects).
  */
 export function serializeToolResult(result: unknown): string {
@@ -132,7 +132,7 @@ export function buildResultChunk(messages: readonly unknown[]): MessageChunk {
   const last = [...messages].reverse().find(isAssistantMessage);
   if (!last) {
     // agent_end fired with no assistant message in the transcript. This
-    // shouldn't happen in healthy Pi runs — surface it as a loud error
+    // shouldn't happen in healthy Pi runs -- surface it as a loud error
     // rather than a silent success so orchestrators don't treat a broken
     // session as a clean completion.
     getLog().warn('pi.event-bridge.result_missing_assistant_message');
@@ -167,7 +167,7 @@ export function buildResultChunk(messages: readonly unknown[]): MessageChunk {
  *  - trailing/leading whitespace (always stripped)
  *  - markdown code fences (```json ... ``` or bare ``` ... ```) that models
  *    emit despite the "no code fences" instruction in the prompt
- *  - prose preamble followed by a single trailing JSON object — pattern
+ *  - prose preamble followed by a single trailing JSON object -- pattern
  *    observed on Minimax M2.7 ("Now I have all the inputs. Let me evaluate
  *    the three gates: ... {...}"). Reasoning models tend to "think out loud"
  *    before emitting structured output despite explicit JSON-only prompts.
@@ -186,7 +186,7 @@ export function tryParseStructuredOutput(text: string): unknown {
     .replace(/\n?\s*```\s*$/, '')
     .trim();
 
-  // Tier 1: clean parse — fast path for fully compliant outputs.
+  // Tier 1: clean parse -- fast path for fully compliant outputs.
   try {
     return JSON.parse(cleaned);
   } catch {
@@ -212,7 +212,7 @@ export function tryParseStructuredOutput(text: string): unknown {
 }
 
 /**
- * Pure mapper from Pi's `AgentSessionEvent` → zero-or-more Archon `MessageChunk`s.
+ * Pure mapper from Pi's `AgentSessionEvent` -> zero-or-more Archon `MessageChunk`s.
  *
  * Most Pi events map 1:1 or are skipped. Tool execution is split across
  * `tool_execution_start` / `tool_execution_end`; the start yields `tool` with
@@ -254,7 +254,7 @@ export function mapPiEvent(event: AgentSessionEvent): MessageChunk[] {
       if (event.isError) {
         chunks.push({
           type: 'system',
-          content: `⚠️ Tool ${event.toolName} failed`,
+          content: `! Tool ${event.toolName} failed`,
         });
       }
       chunks.push({
@@ -271,7 +271,7 @@ export function mapPiEvent(event: AgentSessionEvent): MessageChunk[] {
       return [
         {
           type: 'system',
-          content: `⚠️ retry ${event.attempt}/${event.maxAttempts}: ${event.errorMessage}`,
+          content: `! retry ${event.attempt}/${event.maxAttempts}: ${event.errorMessage}`,
         },
       ];
     default:
@@ -337,7 +337,7 @@ export async function* bridgeSession(
 
   const onAbort = (): void => {
     void session.abort().catch((err: unknown) => {
-      // Abort is best-effort — failures are recoverable via the dispose()
+      // Abort is best-effort -- failures are recoverable via the dispose()
       // call in the `finally` below. But log at debug so a regression in
       // Pi's abort path doesn't silently disappear.
       getLog().debug({ err }, 'pi.event-bridge.abort_failed');
@@ -375,7 +375,7 @@ export async function* bridgeSession(
           terminal = { ...terminal, sessionId: session.sessionId };
         }
         // Best-effort structured output: parse the accumulated assistant
-        // transcript as JSON and attach. On parse failure, leave it off —
+        // transcript as JSON and attach. On parse failure, leave it off --
         // the dag-executor's existing dag.structured_output_missing path
         // warns and downstream $node.output.field refs degrade to '' instead
         // of propagating bogus data.
@@ -397,7 +397,7 @@ export async function* bridgeSession(
     }
   } finally {
     // Close the queue first so any producer push() still in flight becomes
-    // a no-op and pending iterate() waiters resolve — otherwise a consumer
+    // a no-op and pending iterate() waiters resolve -- otherwise a consumer
     // abort mid-iteration would leak this generator on the promise forever.
     queue.close();
     uiBridge?.setEmitter(undefined);
@@ -408,13 +408,13 @@ export async function* bridgeSession(
     try {
       session.dispose();
     } catch (err: unknown) {
-      // Dispose is defensive — session may already be torn down. Log at
+      // Dispose is defensive -- session may already be torn down. Log at
       // debug so SDK regressions surface without polluting normal output.
       getLog().debug({ err }, 'pi.event-bridge.dispose_failed');
     }
     // Don't await promptPromise. The queue is closed above (line 392), and the
     // .then() handlers attached at construction (line 344) only push to that
-    // queue — closed pushes are no-ops. There's nothing the caller is waiting
+    // queue -- closed pushes are no-ops. There's nothing the caller is waiting
     // for; whether prompt() resolves in 1ms or never, no observable behavior
     // changes. Awaiting it is what caused #1561: Pi's session.prompt() can
     // hang indefinitely after dispose(), keeping generator.return() suspended,

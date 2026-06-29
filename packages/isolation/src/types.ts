@@ -243,7 +243,7 @@ export interface WorktreeCreateConfig {
   baseBranch?: string;
   copyFiles?: string[];
   /**
-   * Initialize git submodules in the worktree. Defaults to enabled — a worktree
+   * Initialize git submodules in the worktree. Defaults to enabled -- a worktree
    * with uninitialized submodules is a silent broken state for monorepos.
    * Set to `false` to opt out. No-op when `.gitmodules` is absent.
    */
@@ -251,7 +251,7 @@ export interface WorktreeCreateConfig {
   /**
    * Per-project relative path (from repo root) where worktrees should be created.
    * When set, worktrees live at `<repoRoot>/<path>/<branch>` with `repo-local` layout.
-   * Highest priority in path resolution — overrides project-scoped and global defaults.
+   * Highest priority in path resolution -- overrides project-scoped and global defaults.
    *
    * Must be a safe relative path: no leading `/`, no `..` segments, non-empty after trim.
    * Validation is enforced in `WorktreeProvider.getWorktreePath()` (fails fast with a

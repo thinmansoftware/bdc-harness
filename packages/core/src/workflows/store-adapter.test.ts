@@ -99,7 +99,7 @@ describe('createWorkflowStore', () => {
   test('createWorkflowEvent catches and logs unexpected throws', async () => {
     mockCreateWorkflowEvent.mockRejectedValueOnce(new Error('DB connection lost'));
     const store = createWorkflowStore();
-    // Should not throw — the wrapper guarantees the non-throwing contract
+    // Should not throw -- the wrapper guarantees the non-throwing contract
     await expect(
       store.createWorkflowEvent({
         workflow_run_id: 'run-1',

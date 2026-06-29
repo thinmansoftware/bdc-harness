@@ -2,14 +2,14 @@
  * WO-170: Silent-failure detector.
  *
  * Scans bash/script stdout for `STATUS=*_failed` lines emitted by load-bearing
- * nodes that exited 0 — the classic silent-data-loss pattern anchored on the
+ * nodes that exited 0 -- the classic silent-data-loss pattern anchored on the
  * 2026-05-16 engine sortie that completed all-green while losing 13 spec
  * files.
  *
  * Two trigger paths:
  *   1. `load_bearing: true` on the node (WO-167 doctrine, depended on by this
- *      WO) — ANY `STATUS=*_failed` line is a warning.
- *   2. Always-dangerous patterns — even on nodes that didn't opt in. These
+ *      WO) -- ANY `STATUS=*_failed` line is a warning.
+ *   2. Always-dangerous patterns -- even on nodes that didn't opt in. These
  *      are signals of silent data loss regardless of authoring discipline.
  *
  * Does NOT change the underlying `STATUS=*_failed` convention itself; that's
@@ -18,7 +18,7 @@
 
 /**
  * Patterns that always indicate silent data loss when seen on stdout, even
- * for nodes without `load_bearing: true`. Conservative list — only the
+ * for nodes without `load_bearing: true`. Conservative list -- only the
  * unambiguous ones go here. Author-defined warnings need the load_bearing
  * opt-in.
  */
@@ -46,8 +46,8 @@ export interface SilentFailureDetection {
  * Scan stdout for STATUS=*_failed lines. Returns null when nothing matches.
  *
  * Trigger logic:
- *   - load_bearing=true → ANY `STATUS=<name>_failed` is reported.
- *   - load_bearing=false → only ALWAYS_DANGEROUS_PATTERNS are reported.
+ *   - load_bearing=true -> ANY `STATUS=<name>_failed` is reported.
+ *   - load_bearing=false -> only ALWAYS_DANGEROUS_PATTERNS are reported.
  *
  * Match is line-based and case-sensitive on the STATUS prefix (matches what
  * existing nodes emit). The value side allows letters, digits, underscores.
@@ -93,6 +93,6 @@ export function detectSilentFailure(
 
 /**
  * Re-export the always-dangerous pattern list for tests/docs. Adding to this
- * list is a doctrine decision — keep it conservative.
+ * list is a doctrine decision -- keep it conservative.
  */
 export const ALWAYS_DANGEROUS_FAILURE_PATTERNS: readonly string[] = ALWAYS_DANGEROUS_PATTERNS;

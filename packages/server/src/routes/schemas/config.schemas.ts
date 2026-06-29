@@ -15,7 +15,7 @@ export const safeConfigSchema = z
       telegram: z.enum(['stream', 'batch']),
       discord: z.enum(['stream', 'batch']),
       slack: z.enum(['stream', 'batch']),
-      // github removed — never implemented; hardcoded 'batch' in GitHubAdapter
+      // github removed -- never implemented; hardcoded 'batch' in GitHubAdapter
     }),
     concurrency: z.object({ maxConversations: z.number() }),
     defaults: z.object({
@@ -26,7 +26,7 @@ export const safeConfigSchema = z
   })
   .openapi('SafeConfig');
 
-/** Body for PATCH /api/config/assistants — all fields optional (partial update). */
+/** Body for PATCH /api/config/assistants -- all fields optional (partial update). */
 export const updateAssistantConfigBodySchema = z
   .object({
     assistant: z.string().min(1).optional(),
@@ -34,7 +34,7 @@ export const updateAssistantConfigBodySchema = z
   })
   .openapi('UpdateAssistantConfigBody');
 
-/** Response for GET /api/config and PATCH /api/config/assistants — returns updated safe config. */
+/** Response for GET /api/config and PATCH /api/config/assistants -- returns updated safe config. */
 export const configResponseSchema = z
   .object({
     config: safeConfigSchema,

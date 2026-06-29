@@ -4,10 +4,10 @@
  * Design: a flat "raw" schema validates all fields (with mutual exclusivity enforced via
  * superRefine), then a transform produces one of the six concrete variant types
  * (CommandNode, PromptNode, BashNode, LoopNode, ApprovalNode, CancelNode) as the DagNode union.
- * Per-variant schemas (commandNodeSchema etc.) are exported for type derivation only —
+ * Per-variant schemas (commandNodeSchema etc.) are exported for type derivation only --
  * use dagNodeSchema for validation.
  *
- * z.union() is NOT used here — YAML nodes lack an explicit `type` discriminant,
+ * z.union() is NOT used here -- YAML nodes lack an explicit `type` discriminant,
  * so a flat schema with superRefine is cleaner than a z.union() with implicit discriminants.
  */
 import { z } from '@hono/zod-openapi';
@@ -29,21 +29,21 @@ export const triggerRuleSchema = z.enum([
 
 export type TriggerRule = z.infer<typeof triggerRuleSchema>;
 
-/** Canonical list of trigger rules — derived from schema, do not duplicate. */
+/** Canonical list of trigger rules -- derived from schema, do not duplicate. */
 export const TRIGGER_RULES: readonly TriggerRule[] = triggerRuleSchema.options;
 
 // ---------------------------------------------------------------------------
 // Claude SDK option schemas
 // ---------------------------------------------------------------------------
 
-/** Claude Agent SDK effort level — controls reasoning depth. Different from Codex modelReasoningEffort. */
+/** Claude Agent SDK effort level -- controls reasoning depth. Different from Codex modelReasoningEffort. */
 export const effortLevelSchema = z.enum(['low', 'medium', 'high', 'max', 'xhigh']);
 
 export type EffortLevel = z.infer<typeof effortLevelSchema>;
 
 /**
- * Claude Agent SDK ThinkingConfig — string shorthand or full object form.
- * Shorthand: 'adaptive' → { type: 'adaptive' }, 'enabled' → { type: 'enabled' }, 'disabled' → { type: 'disabled' }.
+ * Claude Agent SDK ThinkingConfig -- string shorthand or full object form.
+ * Shorthand: 'adaptive' -> { type: 'adaptive' }, 'enabled' -> { type: 'enabled' }, 'disabled' -> { type: 'disabled' }.
  */
 export const thinkingConfigSchema = z.preprocess(
   val => {
@@ -64,7 +64,7 @@ export const thinkingConfigSchema = z.preprocess(
 export type ThinkingConfig = z.infer<typeof thinkingConfigSchema>;
 
 /**
- * Claude Agent SDK SandboxSettings — OS-level filesystem/network restrictions.
+ * Claude Agent SDK SandboxSettings -- OS-level filesystem/network restrictions.
  * Uses passthrough() to match the SDK's loose schema (index signature allows extra fields).
  */
 export const sandboxSettingsSchema = z
@@ -106,7 +106,7 @@ export const sandboxSettingsSchema = z
 export type SandboxSettings = z.infer<typeof sandboxSettingsSchema>;
 
 /**
- * Claude Agent SDK AgentDefinition — inline sub-agent available via the Task tool.
+ * Claude Agent SDK AgentDefinition -- inline sub-agent available via the Task tool.
  * Mirrors the SDK's AgentDefinition type (sdk.d.ts), minus mcpServers and the
  * experimental critical-reminder field.
  */
@@ -126,7 +126,7 @@ export type AgentDefinition = z.infer<typeof agentDefinitionSchema>;
 const AGENT_ID_REGEX = /^[a-z0-9]+(-[a-z0-9]+)*$/;
 
 // ---------------------------------------------------------------------------
-// DagNodeBase — common fields shared by all node types
+// DagNodeBase -- common fields shared by all node types
 // ---------------------------------------------------------------------------
 
 export const dagNodeBaseSchema = z.object({
@@ -165,7 +165,7 @@ export const dagNodeBaseSchema = z.object({
   sandbox: sandboxSettingsSchema.optional(),
   agent: z.string().min(1, "'agent' must be a non-empty string").optional(),
   /**
-   * Human-facing alias for `agent:` — resolved identically by the executor and
+   * Human-facing alias for `agent:` -- resolved identically by the executor and
    * validator (see WO-HARNESS-PERSONA-DECLARED-NOT-LOADED-01).
    *
    * If both `agent:` and `persona:` are set on the same node they MUST agree;
@@ -174,12 +174,12 @@ export const dagNodeBaseSchema = z.object({
    * setting both is permitted only to make a node self-documenting.
    *
    * Loader emits `*_node_ai_fields_ignored` warnings if `persona:` appears on
-   * a non-AI node (bash, script, approval, cancel) — same treatment as `agent:`.
+   * a non-AI node (bash, script, approval, cancel) -- same treatment as `agent:`.
    */
   persona: z.string().min(1, "'persona' must be a non-empty string").optional(),
   /**
    * WO-170 (depends on WO-167 doctrine, not yet merged): mark this node as
-   * "load-bearing" — its output (commit-and-push, registry write, etc.) is
+   * "load-bearing" -- its output (commit-and-push, registry write, etc.) is
    * critical to overall workflow success. When true, the DAG executor scans
    * stdout for `STATUS=*_failed` patterns even on exit-0 and emits
    * `node_completed_with_warning` instead of `node_completed` so Mission
@@ -188,7 +188,7 @@ export const dagNodeBaseSchema = z.object({
    * Independent of load_bearing, a small set of always-dangerous patterns
    * (push_failed, commit_failed, pr_create_failed, registry_write_failed,
    * artifact_persist_failed, bundle_save_failed, spec_save_failed) trigger
-   * the warning state too — those are silent-data-loss signals regardless of
+   * the warning state too -- those are silent-data-loss signals regardless of
    * how the node was authored.
    */
   load_bearing: z.boolean().optional(),
@@ -197,7 +197,7 @@ export const dagNodeBaseSchema = z.object({
 export type DagNodeBase = z.infer<typeof dagNodeBaseSchema>;
 
 // ---------------------------------------------------------------------------
-// Per-variant schemas — exported for type derivation only (use dagNodeSchema for validation)
+// Per-variant schemas -- exported for type derivation only (use dagNodeSchema for validation)
 // ---------------------------------------------------------------------------
 
 export const commandNodeSchema = dagNodeBaseSchema.extend({
@@ -229,7 +229,7 @@ export type PromptNode = z.infer<typeof promptNodeSchema> & {
 };
 
 /**
- * Bash node schema — extends base with `bash` (shell script) and `timeout` (ms).
+ * Bash node schema -- extends base with `bash` (shell script) and `timeout` (ms).
  * AI-specific fields from the base are present in the type but ignored at runtime with a warning.
  */
 export const bashNodeSchema = dagNodeBaseSchema.extend({
@@ -248,7 +248,7 @@ export type BashNode = z.infer<typeof bashNodeSchema> & {
 };
 
 /**
- * Script node schema — extends base with `script` (inline code or named script),
+ * Script node schema -- extends base with `script` (inline code or named script),
  * `runtime` ('bun' or 'uv'), `deps` (dependency list), and `timeout` (ms).
  * AI-specific fields from the base are present in the type but ignored at runtime with a warning.
  */
@@ -270,7 +270,7 @@ export type ScriptNode = z.infer<typeof scriptNodeSchema> & {
 };
 
 /**
- * Loop node schema — extends base with `loop` config.
+ * Loop node schema -- extends base with `loop` config.
  * AI-specific fields from the base are present in the type but ignored at runtime with a warning.
  * retry is not supported on loop nodes (enforced at parse time).
  */
@@ -297,7 +297,7 @@ export const approvalOnRejectSchema = z.object({
 export type ApprovalOnReject = z.infer<typeof approvalOnRejectSchema>;
 
 /**
- * Approval node schema — pauses the workflow for human review.
+ * Approval node schema -- pauses the workflow for human review.
  * Extends full base for type compatibility; AI-specific fields are ignored at runtime.
  */
 export const approvalNodeSchema = dagNodeBaseSchema.extend({
@@ -320,7 +320,7 @@ export type ApprovalNode = z.infer<typeof approvalNodeSchema> & {
 };
 
 /**
- * Cancel node schema — terminates the workflow run with a reason string.
+ * Cancel node schema -- terminates the workflow run with a reason string.
  * Extends full base for type compatibility; AI-specific fields are ignored at runtime.
  */
 export const cancelNodeSchema = dagNodeBaseSchema.extend({
@@ -351,7 +351,7 @@ export type DagNode =
 // AI-specific fields that are meaningless on non-AI nodes
 // ---------------------------------------------------------------------------
 
-/** AI-specific fields that are meaningless on bash nodes — exported for loader warnings */
+/** AI-specific fields that are meaningless on bash nodes -- exported for loader warnings */
 export const BASH_NODE_AI_FIELDS: readonly string[] = [
   'provider',
   'model',
@@ -374,12 +374,12 @@ export const BASH_NODE_AI_FIELDS: readonly string[] = [
   'persona',
 ];
 
-/** AI-specific fields that are meaningless on script nodes — same as bash nodes */
+/** AI-specific fields that are meaningless on script nodes -- same as bash nodes */
 export const SCRIPT_NODE_AI_FIELDS: readonly string[] = BASH_NODE_AI_FIELDS;
 
 /**
  * AI-specific fields that are unsupported on loop nodes.
- * `model`, `provider`, `agent`, and `persona` are excluded — the DAG executor
+ * `model`, `provider`, `agent`, and `persona` are excluded -- the DAG executor
  * resolves and forwards them to each iteration's AI call. `persona` is the
  * human-facing alias for `agent` (see dagNodeBaseSchema).
  */
@@ -388,7 +388,7 @@ export const LOOP_NODE_AI_FIELDS: readonly string[] = BASH_NODE_AI_FIELDS.filter
 );
 
 // ---------------------------------------------------------------------------
-// dagNodeSchema — flat validation schema with transform to DagNode
+// dagNodeSchema -- flat validation schema with transform to DagNode
 // ---------------------------------------------------------------------------
 
 /**
@@ -404,7 +404,7 @@ export const LOOP_NODE_AI_FIELDS: readonly string[] = BASH_NODE_AI_FIELDS.filter
  *
  * Note: provider identity is validated in loader.ts (workflow-level) and
  * dag-executor.ts (node-level). Model strings are passed through to the SDK
- * unchanged — the SDK is the source of truth for what model names exist.
+ * unchanged -- the SDK is the source of truth for what model names exist.
  */
 export const dagNodeSchema = dagNodeBaseSchema
   .extend({
@@ -565,7 +565,7 @@ export const dagNodeSchema = dagNodeBaseSchema
     if (data.persona !== undefined && data.agent !== undefined && data.persona !== data.agent) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
-        message: `'persona' ('${data.persona}') and 'agent' ('${data.agent}') must agree — they resolve to the same persona. Set only one, or set both to the same value.`,
+        message: `'persona' ('${data.persona}') and 'agent' ('${data.agent}') must agree -- they resolve to the same persona. Set only one, or set both to the same value.`,
         path: ['persona'],
       });
     }
@@ -573,7 +573,7 @@ export const dagNodeSchema = dagNodeBaseSchema
   .transform((data): DagNode => {
     const id = data.id.trim();
 
-    // Common base fields (sparse — only include defined values)
+    // Common base fields (sparse -- only include defined values)
     const base = {
       id,
       ...(data.description !== undefined ? { description: data.description } : {}),
@@ -645,7 +645,7 @@ export const dagNodeSchema = dagNodeBaseSchema
     if (data.cancel !== undefined && data.cancel.trim().length > 0) {
       return { ...base, ...shared, cancel: data.cancel.trim() } as CancelNode;
     }
-    // loop — guaranteed by superRefine to be defined at this point
+    // loop -- guaranteed by superRefine to be defined at this point
     if (!data.loop) throw new Error('unreachable: loop must be defined after superRefine');
     return {
       ...base,

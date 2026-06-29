@@ -573,7 +573,7 @@ describe('GitLabAdapter', () => {
       });
       // Will attempt DB operations which throw, but we can verify the event was parsed
       await adapter.handleWebhook(payload, 'test-secret');
-      // The fork detection happens inside handleWebhook — if it reaches webhook_processing
+      // The fork detection happens inside handleWebhook -- if it reaches webhook_processing
       // log, the event was parsed correctly including the MR context
     });
   });

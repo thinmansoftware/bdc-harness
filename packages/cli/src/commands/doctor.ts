@@ -24,7 +24,7 @@ export interface CheckResult {
 
 export async function checkClaudeBinary(
   env: NodeJS.ProcessEnv,
-  // Injected so tests can drive the binary-mode branch — `BUNDLED_IS_BINARY`
+  // Injected so tests can drive the binary-mode branch -- `BUNDLED_IS_BINARY`
   // is a static const re-export and cannot be spied at runtime.
   isBinary: boolean = BUNDLED_IS_BINARY
 ): Promise<CheckResult> {
@@ -54,7 +54,7 @@ export async function checkClaudeBinary(
 
 export async function checkGhAuth(env: NodeJS.ProcessEnv): Promise<CheckResult> {
   const label = 'gh CLI';
-  // Skip for users without GitHub configured — gh auth is irrelevant
+  // Skip for users without GitHub configured -- gh auth is irrelevant
   // to a CLI-only or Slack/Telegram setup, so reporting fail would be noise.
   if (!env.GITHUB_TOKEN && !env.GH_TOKEN) {
     return { label, status: 'skip', message: 'GitHub not configured (no GITHUB_TOKEN)' };
@@ -86,7 +86,7 @@ export async function checkDatabase(
   try {
     deps = await loadDeps();
   } catch (err) {
-    // Distinguish module-load failure from query failure — surfacing
+    // Distinguish module-load failure from query failure -- surfacing
     // "not reachable" for an import error misleads the user into running
     // `archon setup` when the real fix is a binary rebuild.
     getLog().error({ err }, 'doctor.db_module_load_failed');
@@ -126,7 +126,7 @@ export async function checkWorkspaceWritable(): Promise<CheckResult> {
   try {
     rmSync(probe, { force: true });
   } catch (err) {
-    // Deletion failure is cosmetic — the write succeeded, so the dir is
+    // Deletion failure is cosmetic -- the write succeeded, so the dir is
     // writable. Log so repeated failures leave a diagnostic trace instead of
     // silently accumulating .doctor-probe-* files in ARCHON_HOME.
     getLog().warn({ probe, err }, 'doctor.workspace_probe_delete_failed');
@@ -168,7 +168,7 @@ export async function checkSlack(env: NodeJS.ProcessEnv): Promise<CheckResult> {
     }
     return { label, status: 'fail', message: `auth.test rejected: ${body.error ?? 'unknown'}` };
   } catch (err) {
-    // Network errors → skip, not fail — best-effort by design.
+    // Network errors -> skip, not fail -- best-effort by design.
     return {
       label,
       status: 'skip',
@@ -206,7 +206,7 @@ export async function checkTelegram(env: NodeJS.ProcessEnv): Promise<CheckResult
 }
 
 function renderResult(r: CheckResult): string {
-  const icon = r.status === 'pass' ? '✓' : r.status === 'fail' ? '✗' : '○';
+  const icon = r.status === 'pass' ? '[x]' : r.status === 'fail' ? '[ ]' : '';
   return `${icon} ${r.label}: ${r.message}`;
 }
 
@@ -215,7 +215,7 @@ export async function doctorCommand(
   // Promise.allSettled rejection branch with synthetic checks.
   checks?: (() => Promise<CheckResult>)[]
 ): Promise<number> {
-  console.log('archon doctor — verifying your setup\n');
+  console.log('archon doctor -- verifying your setup\n');
   getLog().info('doctor.run_started');
   const env = process.env;
 
@@ -239,7 +239,7 @@ export async function doctorCommand(
     if (s.status === 'rejected') {
       failures++;
       const msg = s.reason instanceof Error ? s.reason.message : String(s.reason);
-      console.log(`✗ unknown: check threw: ${msg}`);
+      console.log(`[ ] unknown: check threw: ${msg}`);
       getLog().error({ reason: s.reason }, 'doctor.check_threw_unexpectedly');
       continue;
     }

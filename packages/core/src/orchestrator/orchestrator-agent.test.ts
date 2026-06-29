@@ -18,7 +18,7 @@ import { makeTestWorkflow, makeTestWorkflowWithSource } from '@archon/workflows/
 import type { Codebase, Conversation, IPlatformAdapter } from '../types';
 import type { WorkflowDefinition } from '@archon/workflows/schemas/workflow';
 
-// ─── Mock setup (ALL mocks must come before the module under test import) ────
+// --- Mock setup (ALL mocks must come before the module under test import) ----
 
 const mockSyncWorkspace = mock(() =>
   Promise.resolve({
@@ -29,7 +29,7 @@ const mockSyncWorkspace = mock(() =>
     updated: false,
   })
 );
-// Identity passthrough — strips branded type for test simplicity; empty-string guard not needed here
+// Identity passthrough -- strips branded type for test simplicity; empty-string guard not needed here
 const mockToRepoPath = mock((p: string) => p);
 const mockGetOrCreateConversation = mock(() => Promise.resolve(null as unknown));
 const mockGetCodebase = mock(() => Promise.resolve(null as unknown));
@@ -93,7 +93,7 @@ mock.module('../handlers/command-handler', () => ({
 }));
 
 mock.module('@archon/workflows/utils/tool-formatter', () => ({
-  formatToolCall: mock((toolName: string) => `🔧 ${toolName}`),
+  formatToolCall: mock((toolName: string) => ` ${toolName}`),
 }));
 const mockDiscoverWorkflowsWithConfig = mock(() =>
   Promise.resolve({ workflows: [] as Array<{ workflow: WorkflowDefinition }>, errors: [] })
@@ -201,7 +201,7 @@ mock.module('fs', () => ({
   existsSync: mock(() => true),
 }));
 
-// ─── Import module under test (AFTER all mocks) ───────────────────────────────
+// --- Import module under test (AFTER all mocks) -------------------------------
 
 import {
   parseOrchestratorCommands,
@@ -209,7 +209,7 @@ import {
   resolveBoundCodebase,
 } from './orchestrator-agent';
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
+// --- Helpers ------------------------------------------------------------------
 
 function makeCodebase(name: string, id = `id-${name}`): Codebase {
   return {
@@ -309,7 +309,7 @@ describe('resolveBoundCodebase', () => {
   });
 
   // target_repo authoritative over name-prefix (anchor: 2026-06-02 deploy-factory
-  // double-cancel — bdc-storefront-* name-prefix bound shopops-storefront while the
+  // double-cancel -- bdc-storefront-* name-prefix bound shopops-storefront while the
   // YAML declared target_repo: thinman-freight, so the Rule 28 guard killed the run).
   test('binds target_repo over a colliding name-prefix', () => {
     const result = resolveBoundCodebase({
@@ -368,7 +368,7 @@ describe('resolveBoundCodebase', () => {
   });
 });
 
-// ─── parseOrchestratorCommands ────────────────────────────────────────────────
+// --- parseOrchestratorCommands ------------------------------------------------
 
 describe('parseOrchestratorCommands', () => {
   const assistWorkflow = makeTestWorkflow({ name: 'assist' });
@@ -385,7 +385,7 @@ describe('parseOrchestratorCommands', () => {
     mockLogger.warn.mockClear();
   });
 
-  // ─── Basic /invoke-workflow parsing ─────────────────────────────────────────
+  // --- Basic /invoke-workflow parsing -----------------------------------------
 
   describe('/invoke-workflow basic parsing', () => {
     test('parses a simple /invoke-workflow command', () => {
@@ -439,7 +439,7 @@ describe('parseOrchestratorCommands', () => {
     });
   });
 
-  // ─── --prompt parameter ──────────────────────────────────────────────────────
+  // --- --prompt parameter ------------------------------------------------------
 
   describe('--prompt parameter', () => {
     test('parses --prompt with double quotes', () => {
@@ -467,7 +467,7 @@ describe('parseOrchestratorCommands', () => {
 
     test('synthesizedPrompt is undefined when --prompt has empty string (double quotes)', () => {
       // The regex [^"]+ requires at least one character so "" does not match the pattern.
-      // promptMatch is null → synthesizedPrompt stays undefined (no warning is logged).
+      // promptMatch is null -> synthesizedPrompt stays undefined (no warning is logged).
       const response = '/invoke-workflow assist --project my-project --prompt ""';
       const result = parseOrchestratorCommands(response, codebases, workflows);
 
@@ -528,7 +528,7 @@ describe('parseOrchestratorCommands', () => {
     });
   });
 
-  // ─── Workflow validation ──────────────────────────────────────────────────────
+  // --- Workflow validation ------------------------------------------------------
 
   describe('workflow validation', () => {
     test('returns null workflowInvocation when workflow does not exist', () => {
@@ -553,7 +553,7 @@ describe('parseOrchestratorCommands', () => {
     });
   });
 
-  // ─── Project name matching ────────────────────────────────────────────────────
+  // --- Project name matching ----------------------------------------------------
 
   describe('project name matching', () => {
     test('matches project by exact name (case-insensitive)', () => {
@@ -609,7 +609,7 @@ describe('parseOrchestratorCommands', () => {
     });
   });
 
-  // ─── /register-project parsing ────────────────────────────────────────────────
+  // --- /register-project parsing ------------------------------------------------
 
   describe('/register-project parsing', () => {
     test('parses a basic /register-project command', () => {
@@ -654,7 +654,7 @@ describe('parseOrchestratorCommands', () => {
     });
   });
 
-  // ─── No commands ──────────────────────────────────────────────────────────────
+  // --- No commands --------------------------------------------------------------
 
   describe('empty and no-command responses', () => {
     test('returns null for both when response has no commands', () => {
@@ -680,7 +680,7 @@ describe('parseOrchestratorCommands', () => {
     });
   });
 
-  // ─── Both commands present ────────────────────────────────────────────────────
+  // --- Both commands present ----------------------------------------------------
 
   describe('both commands present in same response', () => {
     test('can parse both /invoke-workflow and /register-project in same response', () => {
@@ -695,7 +695,7 @@ describe('parseOrchestratorCommands', () => {
     });
   });
 
-  // ─── Pattern edge cases ───────────────────────────────────────────────────────
+  // --- Pattern edge cases -------------------------------------------------------
 
   describe('pattern edge cases and invalid inputs', () => {
     test('does not match /invoke-workflow without --project argument', () => {
@@ -760,7 +760,7 @@ describe('parseOrchestratorCommands', () => {
     });
   });
 
-  // ─── Complex real-world responses ────────────────────────────────────────────
+  // --- Complex real-world responses --------------------------------------------
 
   describe('complex real-world response patterns', () => {
     test('parses command embedded in longer reasoning text', () => {
@@ -821,7 +821,7 @@ describe('parseOrchestratorCommands', () => {
   });
 });
 
-// ─── filterToolIndicators (tested indirectly through known behavior) ──────────
+// --- filterToolIndicators (tested indirectly through known behavior) ----------
 //
 // filterToolIndicators is a private function but its logic is straightforward
 // enough to test directly by replicating its behavior with the same regex.
@@ -853,62 +853,62 @@ describe('filterToolIndicators logic (replicated regex tests)', () => {
     expect(result).toBe('This is a regular message.');
   });
 
-  test('filters 🔧 (U+1F527) tool usage indicator', () => {
-    const result = applyFilter(['🔧 Running tool foo', 'The answer is 42.']);
-    expect(result).not.toContain('🔧');
+  test('filters  (U+1F527) tool usage indicator', () => {
+    const result = applyFilter([' Running tool foo', 'The answer is 42.']);
+    expect(result).not.toContain('');
     expect(result).toContain('The answer is 42.');
   });
 
-  test('filters 💭 (U+1F4AD) thinking indicator', () => {
-    const result = applyFilter(['💭 Thinking about the problem...', 'Here is my response.']);
-    expect(result).not.toContain('💭');
+  test('filters  (U+1F4AD) thinking indicator', () => {
+    const result = applyFilter([' Thinking about the problem...', 'Here is my response.']);
+    expect(result).not.toContain('');
     expect(result).toContain('Here is my response.');
   });
 
-  test('filters 📝 (U+1F4DD) writing indicator', () => {
-    const result = applyFilter(['📝 Writing file output.txt', 'Done writing.']);
-    expect(result).not.toContain('📝');
+  test('filters  (U+1F4DD) writing indicator', () => {
+    const result = applyFilter([' Writing file output.txt', 'Done writing.']);
+    expect(result).not.toContain('');
     expect(result).toContain('Done writing.');
   });
 
-  test('filters ✏️ (U+270F+FE0F) editing indicator', () => {
+  test('filters  (U+270F+FE0F) editing indicator', () => {
     const result = applyFilter(['\u{270F}\u{FE0F} Editing main.ts', 'Edit complete.']);
     expect(result).not.toContain('\u{270F}');
     expect(result).toContain('Edit complete.');
   });
 
-  test('filters 🗑️ (U+1F5D1+FE0F) deleting indicator', () => {
+  test('filters  (U+1F5D1+FE0F) deleting indicator', () => {
     const result = applyFilter(['\u{1F5D1}\u{FE0F} Deleting temp file', 'File removed.']);
     expect(result).not.toContain('\u{1F5D1}');
     expect(result).toContain('File removed.');
   });
 
-  test('filters 📂 (U+1F4C2) folder indicator', () => {
-    const result = applyFilter(['📂 Reading directory /src', 'Directory listed.']);
-    expect(result).not.toContain('📂');
+  test('filters  (U+1F4C2) folder indicator', () => {
+    const result = applyFilter([' Reading directory /src', 'Directory listed.']);
+    expect(result).not.toContain('');
     expect(result).toContain('Directory listed.');
   });
 
-  test('filters 🔍 (U+1F50D) search indicator', () => {
-    const result = applyFilter(['🔍 Searching for pattern', 'Search complete.']);
-    expect(result).not.toContain('🔍');
+  test('filters  (U+1F50D) search indicator', () => {
+    const result = applyFilter([' Searching for pattern', 'Search complete.']);
+    expect(result).not.toContain('');
     expect(result).toContain('Search complete.');
   });
 
   test('preserves emoji that is not a tool indicator', () => {
-    const result = applyFilter(['🎉 Deployment successful!']);
-    expect(result).toContain('🎉 Deployment successful!');
+    const result = applyFilter([' Deployment successful!']);
+    expect(result).toContain(' Deployment successful!');
   });
 
   test('preserves text that contains tool emoji but does not START with it', () => {
     // The regex requires the emoji at the START of the section
-    const result = applyFilter(['Here is a 🔧 wrench emoji mid-text.']);
-    expect(result).toContain('🔧');
+    const result = applyFilter(['Here is a  wrench emoji mid-text.']);
+    expect(result).toContain('');
   });
 
   test('falls back to all messages when everything gets filtered out', () => {
     // If all sections are tool indicators, return the raw joined messages
-    const messages = ['🔧 Tool call one', '💭 Thinking...'];
+    const messages = [' Tool call one', ' Thinking...'];
     const result = applyFilter(messages);
     // The fallback returns allMessages (raw join)
     expect(result.length).toBeGreaterThan(0);
@@ -917,22 +917,22 @@ describe('filterToolIndicators logic (replicated regex tests)', () => {
   test('handles multiple assistant messages joined with separator', () => {
     const messages = [
       'First part of the response.',
-      '🔧 Some tool usage here',
+      ' Some tool usage here',
       'Second part of the response.',
     ];
     const result = applyFilter(messages);
     expect(result).toContain('First part of the response.');
     expect(result).toContain('Second part of the response.');
-    expect(result).not.toContain('🔧 Some tool usage here');
+    expect(result).not.toContain(' Some tool usage here');
   });
 
   test('sections within a single message are split by double newlines', () => {
     // A single message with embedded double-newline creates multiple sections
-    const messages = ['Normal text.\n\n🔧 Tool output.\n\nMore normal text.'];
+    const messages = ['Normal text.\n\n Tool output.\n\nMore normal text.'];
     const result = applyFilter(messages);
     expect(result).toContain('Normal text.');
     expect(result).toContain('More normal text.');
-    expect(result).not.toContain('🔧');
+    expect(result).not.toContain('');
   });
 
   test('trims whitespace from the final output', () => {
@@ -946,7 +946,7 @@ describe('filterToolIndicators logic (replicated regex tests)', () => {
   });
 });
 
-// ─── Helpers for handleMessage tests ─────────────────────────────────────────
+// --- Helpers for handleMessage tests -----------------------------------------
 
 function makePlatform(): IPlatformAdapter {
   return {
@@ -991,7 +991,7 @@ function makeCodebaseForSync() {
   };
 }
 
-// ─── Constants ────────────────────────────────────────────────────────────────
+// --- Constants ----------------------------------------------------------------
 
 describe('module constants (MAX_BATCH_ASSISTANT_CHUNKS, MAX_BATCH_TOTAL_CHUNKS)', () => {
   // These constants are not exported but their values are defined in the source.
@@ -999,15 +999,15 @@ describe('module constants (MAX_BATCH_ASSISTANT_CHUNKS, MAX_BATCH_TOTAL_CHUNKS)'
   test('MAX_BATCH_ASSISTANT_CHUNKS is 20 per source documentation', () => {
     // This test documents the expected constant value.
     // If the constant changes, this test acts as a regression guard.
-    expect(20).toBe(20); // Symbolic — the actual value is in source line 46
+    expect(20).toBe(20); // Symbolic -- the actual value is in source line 46
   });
 
   test('MAX_BATCH_TOTAL_CHUNKS is 200 per source documentation', () => {
-    expect(200).toBe(200); // Symbolic — the actual value is in source line 48
+    expect(200).toBe(200); // Symbolic -- the actual value is in source line 48
   });
 });
 
-// ─── Type shape tests ─────────────────────────────────────────────────────────
+// --- Type shape tests ---------------------------------------------------------
 
 describe('WorkflowInvocation and ProjectRegistration type shapes', () => {
   test('parseOrchestratorCommands result has the expected shape for workflowInvocation', () => {
@@ -1045,9 +1045,9 @@ describe('WorkflowInvocation and ProjectRegistration type shapes', () => {
   });
 });
 
-// ─── discoverAllWorkflows — remote sync ───────────────────────────────────────
+// --- discoverAllWorkflows -- remote sync ---------------------------------------
 
-describe('discoverAllWorkflows — remote sync', () => {
+describe('discoverAllWorkflows -- remote sync', () => {
   beforeEach(() => {
     mockSyncWorkspace.mockClear();
     mockToRepoPath.mockClear();
@@ -1203,9 +1203,9 @@ describe('discoverAllWorkflows — remote sync', () => {
   });
 });
 
-// ─── Workflow dispatch routing — interactive flag ─────────────────────────────
+// --- Workflow dispatch routing -- interactive flag -----------------------------
 
-describe('workflow dispatch routing — interactive flag', () => {
+describe('workflow dispatch routing -- interactive flag', () => {
   function makeDispatchConversation() {
     return makeConversation({ codebase_id: 'codebase-1' });
   }
@@ -1323,7 +1323,7 @@ describe('workflow dispatch routing — interactive flag', () => {
   });
 });
 
-// ─── Natural-language approval routing ──────────────────────────────────────
+// --- Natural-language approval routing --------------------------------------
 
 describe('natural-language approval routing', () => {
   const approvalWorkflow = makeTestWorkflow({ name: 'prd', interactive: true });
@@ -1400,7 +1400,7 @@ describe('natural-language approval routing', () => {
     expect(mockExecuteWorkflow).toHaveBeenCalled();
   });
 
-  test('slash command bypasses approval interception — getPausedWorkflowRun not called', async () => {
+  test('slash command bypasses approval interception -- getPausedWorkflowRun not called', async () => {
     const conversation = makeConversation({ codebase_id: 'codebase-1' });
     mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(conversation));
     mockHandleCommand.mockReturnValueOnce(
@@ -1495,9 +1495,9 @@ describe('natural-language approval routing', () => {
   });
 });
 
-// ─── handleWorkflowRunCommand E2 path — single codebase auto-select ──────────
+// --- handleWorkflowRunCommand E2 path -- single codebase auto-select ----------
 
-describe('handleWorkflowRunCommand — E2 single codebase auto-select', () => {
+describe('handleWorkflowRunCommand -- E2 single codebase auto-select', () => {
   const assistWorkflow = makeTestWorkflow({ name: 'assist' });
 
   beforeEach(() => {
@@ -1797,9 +1797,9 @@ describe('handleWorkflowRunCommand — E2 single codebase auto-select', () => {
   });
 });
 
-// ─── discoverAllWorkflows — merge with WorkflowWithSource ────────────────────
+// --- discoverAllWorkflows -- merge with WorkflowWithSource --------------------
 
-describe('discoverAllWorkflows — merge repo workflows over global', () => {
+describe('discoverAllWorkflows -- merge repo workflows over global', () => {
   beforeEach(() => {
     mockSyncWorkspace.mockClear();
     mockToRepoPath.mockClear();
@@ -1846,9 +1846,9 @@ describe('discoverAllWorkflows — merge repo workflows over global', () => {
   });
 });
 
-// ─── handleMessage — workflow context injection ───────────────────────────────
+// --- handleMessage -- workflow context injection -------------------------------
 
-describe('handleMessage — workflow context injection', () => {
+describe('handleMessage -- workflow context injection', () => {
   beforeEach(() => {
     mockGetRecentWorkflowResultMessages.mockClear();
     mockGetOrCreateConversation.mockReset();
@@ -1914,12 +1914,12 @@ describe('handleMessage — workflow context injection', () => {
     mockGetRecentWorkflowResultMessages.mockRejectedValueOnce(new Error('unexpected'));
     const platform = makePlatform();
 
-    // Non-critical path — must not block message handling
+    // Non-critical path -- must not block message handling
     await expect(handleMessage(platform, 'conv-1', 'Hello')).resolves.toBeUndefined();
   });
 });
 
-// ─── Stale session ID clearing on error_during_execution ────────────────────
+// --- Stale session ID clearing on error_during_execution --------------------
 
 describe('stale session ID clearing on error_during_execution', () => {
   beforeEach(() => {

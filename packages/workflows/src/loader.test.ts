@@ -87,7 +87,7 @@ describe('Workflow Loader', () => {
     it('should treat non-boolean interactive value as undefined', async () => {
       const workflowDir = join(testDir, '.archon', 'workflows');
       await mkdir(workflowDir, { recursive: true });
-      // YAML string "yes" is not a boolean — should be dropped
+      // YAML string "yes" is not a boolean -- should be dropped
       const yaml = `name: test\ndescription: test\ninteractive: "yes"\nnodes:\n  - id: n\n    prompt: p\n`;
       await writeFile(join(workflowDir, 'test.yaml'), yaml);
       const result = await discoverWorkflows(testDir, { loadDefaults: false });
@@ -160,7 +160,7 @@ describe('Workflow Loader', () => {
     it('should filter non-string tag entries', async () => {
       const workflowDir = join(testDir, '.archon', 'workflows');
       await mkdir(workflowDir, { recursive: true });
-      // YAML coerces unquoted scalars: 123 → number, null → null
+      // YAML coerces unquoted scalars: 123 -> number, null -> null
       const yaml = `name: test\ndescription: mixed\ntags:\n  - GitLab\n  - 123\n  - null\n  - Review\nnodes:\n  - id: n\n    prompt: p\n`;
       await writeFile(join(workflowDir, 'test.yaml'), yaml);
       const result = await discoverWorkflows(testDir, { loadDefaults: false });
@@ -179,7 +179,7 @@ describe('Workflow Loader', () => {
     it('should ignore tags when not an array', async () => {
       const workflowDir = join(testDir, '.archon', 'workflows');
       await mkdir(workflowDir, { recursive: true });
-      // Authoring mistake: scalar instead of list — discarded, workflow still loads
+      // Authoring mistake: scalar instead of list -- discarded, workflow still loads
       const yaml = `name: test\ndescription: scalar tags\ntags: GitLab\nnodes:\n  - id: n\n    prompt: p\n`;
       await writeFile(join(workflowDir, 'test.yaml'), yaml);
       const result = await discoverWorkflows(testDir, { loadDefaults: false });
@@ -217,7 +217,7 @@ describe('Workflow Loader', () => {
     it('should warn and omit mutates_checkout for invalid value', async () => {
       const workflowDir = join(testDir, '.archon', 'workflows');
       await mkdir(workflowDir, { recursive: true });
-      // YAML string "yes" is not a boolean — should be dropped and field omitted
+      // YAML string "yes" is not a boolean -- should be dropped and field omitted
       const yaml = `name: test\ndescription: typo\nmutates_checkout: "yes"\nnodes:\n  - id: n\n    prompt: p\n`;
       await writeFile(join(workflowDir, 'test.yaml'), yaml);
       const result = await discoverWorkflows(testDir, { loadDefaults: false });
@@ -735,7 +735,7 @@ nodes:
   });
 
   describe('home-scoped workflows (~/.archon/workflows/)', () => {
-    // Home-scope is read unconditionally by discovery — no caller option. Tests
+    // Home-scope is read unconditionally by discovery -- no caller option. Tests
     // redirect `getArchonHome()` to a temp dir via the `ARCHON_HOME` env var so
     // they don't touch the user's real `~/.archon/`.
     let homeDir: string;
@@ -830,7 +830,7 @@ nodes:
     });
 
     it('silently skips when ~/.archon/workflows/ does not exist', async () => {
-      // homeDir exists but no workflows/ subdirectory — should not error.
+      // homeDir exists but no workflows/ subdirectory -- should not error.
       const result = await discoverWorkflows(testDir, { loadDefaults: false });
       expect(result.errors).toEqual([]);
     });
@@ -944,7 +944,7 @@ nodes:
     });
 
     it('does not emit the warning when the legacy path is absent', async () => {
-      // No legacy directory created — warning should not fire.
+      // No legacy directory created -- warning should not fire.
       await discoverWorkflows(testDir, { loadDefaults: false });
 
       const warnCalls = mockLogger.warn.mock.calls.filter(
@@ -982,7 +982,7 @@ nodes:
       expect(archonWorkflow).toBeDefined();
     });
 
-    it('surfaces home-scoped workflows without any option — discovery reads ~/.archon/workflows/ internally', async () => {
+    it('surfaces home-scoped workflows without any option -- discovery reads ~/.archon/workflows/ internally', async () => {
       const { discoverWorkflowsWithConfig, resetLegacyHomeWarningForTests } =
         await import('./workflow-discovery');
       resetLegacyHomeWarningForTests();
@@ -1773,7 +1773,7 @@ nodes:
 `
       );
 
-      // Should parse without error — bash: refs are validated at runtime only
+      // Should parse without error -- bash: refs are validated at runtime only
       const result = await discoverWorkflows(testDir, { loadDefaults: false });
       expect(result.errors).toHaveLength(0);
       expect(result.workflows).toHaveLength(1);
@@ -2438,7 +2438,7 @@ nodes:
       );
 
       const result = await discoverWorkflows(testDir, { loadDefaults: false });
-      // Workflow loads successfully — this is a warning, not an error
+      // Workflow loads successfully -- this is a warning, not an error
       expect(result.errors).toHaveLength(0);
       expect(result.workflows).toHaveLength(1);
       // Logger should have been called with the warning event
@@ -2681,7 +2681,7 @@ nodes:
   // Regression guard: parseWorkflow used to silently drop raw.policyFile from
   // the returned workflow object even though the schema accepted it. That made
   // the executor's applyWorkflowPolicyFile() permanently dead code for any
-  // workflow discovered via YAML — every Cauldron run loaded an empty policy.
+  // workflow discovered via YAML -- every Cauldron run loaded an empty policy.
 
   describe('policyFile', () => {
     it('parseWorkflow round-trips policyFile', async () => {

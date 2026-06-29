@@ -162,7 +162,7 @@ const minimalConfig: WorkflowConfig = {
   defaults: { loadDefaultCommands: false, loadDefaultWorkflows: false },
 };
 
-describe('script node deps field — command construction', () => {
+describe('script node deps field -- command construction', () => {
   let testDir: string;
 
   beforeEach(async () => {
@@ -287,7 +287,7 @@ describe('script node deps field — command construction', () => {
     expect(args).toEqual(['run', 'python', '-c', 'print("no deps")']);
   });
 
-  it('bun inline with deps uses bun --no-env-file -e (no extra dep flags — bun auto-installs)', async () => {
+  it('bun inline with deps uses bun --no-env-file -e (no extra dep flags -- bun auto-installs)', async () => {
     const node: ScriptNode = {
       id: 'bun-with-deps',
       script: 'import { z } from "zod"; console.log(z.string().parse("hello"))',
@@ -316,7 +316,7 @@ describe('script node deps field — command construction', () => {
     expect(scriptCall).toBeDefined();
     const [cmd, args] = scriptCall as [string, string[]];
     expect(cmd).toBe('bun');
-    // --no-env-file prevents repo .env auto-load; no dep flags — bun auto-installs
+    // --no-env-file prevents repo .env auto-load; no dep flags -- bun auto-installs
     expect(args).toEqual(['--no-env-file', '-e', node.script]);
     expect(args).not.toContain('--packages');
     expect(args).not.toContain('--with');

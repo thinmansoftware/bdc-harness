@@ -224,8 +224,8 @@ export class SlackAdapter implements IPlatformAdapter {
    */
   async ensureThread(originalConversationId: string, _messageContext?: unknown): Promise<string> {
     // Slack's conversation ID pattern already ensures threading:
-    // - Non-thread: "channel:ts" → sendMessage uses ts as thread_ts
-    // - In-thread: "channel:thread_ts" → sendMessage uses thread_ts
+    // - Non-thread: "channel:ts" -> sendMessage uses ts as thread_ts
+    // - In-thread: "channel:thread_ts" -> sendMessage uses thread_ts
     // No additional work needed.
     return originalConversationId;
   }

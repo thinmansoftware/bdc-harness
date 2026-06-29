@@ -9,7 +9,7 @@
  *   - AI-node failure sites only (4 sites in dag-executor.ts: command-load,
  *     cancelled-during-streaming, credit-exhaustion, empty-output)
  *   - Bash-node failures are out of scope; sibling WO to follow
- *   - All 4 v1 sites currently classify as `unknown` → `escalate` → returns
+ *   - All 4 v1 sites currently classify as `unknown` -> `escalate` -> returns
  *     `{ state: 'failed' }`. Net behavioral change at these 4 sites is zero;
  *     the v1 win is the structured `overseer.decision` log line and the wired
  *     decision path for future extension.
@@ -40,7 +40,7 @@ export interface HandleNodeFailureDeps {
 }
 
 export interface HandleNodeFailureContext {
-  /** Error message text — used for classification + persisted in node_failed event */
+  /** Error message text -- used for classification + persisted in node_failed event */
   errorMsg: string;
   /** Standard log dir for logNodeError */
   logDir: string;
@@ -117,7 +117,7 @@ export async function handleNodeFailure(
     woId: ctx.woId,
   });
 
-  // Observability — Mission Control "Workflow Decisions" tab will consume this when
+  // Observability -- Mission Control "Workflow Decisions" tab will consume this when
   // persistence lands in v2. For v1 we only emit a structured log line.
   deps.log.info(
     {
@@ -167,7 +167,7 @@ export async function handleNodeFailure(
   // Silent-dead-end escalation: fire 3 operator-visible signals (escalation.json
   // on disk, builder-monitor webhook, Notion comment) for the new failure classes
   // identified in the 2026-05-18 Wave A anchor incidents. The presence of
-  // `result.escalationContext` is the contract — only the new classes populate it,
+  // `result.escalationContext` is the contract -- only the new classes populate it,
   // so existing v1 escalate paths (out_of_credits, auth_failed, etc.) are unaffected.
   if (result.decision === 'escalate' && result.escalationContext) {
     await runEscalation(workflowRun.id, result, result.escalationContext).catch((err: Error) => {
@@ -192,7 +192,7 @@ function translateDecision(decision: Decision, errorMsg: string, outputSoFar: st
       return { state: 'failed', output: outputSoFar, error: errorMsg };
 
     case 'skip':
-      // Use existing NodeState.skipped — graceful skip propagates correctly through
+      // Use existing NodeState.skipped -- graceful skip propagates correctly through
       // checkTriggerRule's `all_success` default (downstream nodes also skip).
       return { state: 'skipped', output: outputSoFar };
 

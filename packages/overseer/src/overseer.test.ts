@@ -1,7 +1,7 @@
 import { describe, test, expect } from 'bun:test';
 import { classifyError, decide } from './index.ts';
 
-describe('classifyError — workflow-runtime classes (BDC 2026-05-16)', () => {
+describe('classifyError -- workflow-runtime classes (BDC 2026-05-16)', () => {
   test('sentinel_mismatch: loop node + SDK returned success message', () => {
     expect(
       classifyError({
@@ -73,7 +73,7 @@ describe('classifyError — workflow-runtime classes (BDC 2026-05-16)', () => {
   });
 });
 
-describe('classifyError — provider classes (ported from router.py)', () => {
+describe('classifyError -- provider classes (ported from router.py)', () => {
   test('rate_limit_exceeded: 429 status', () => {
     expect(classifyError({ statusCode: 429, message: 'Rate limit exceeded' })).toBe(
       'rate_limit_exceeded'
@@ -110,19 +110,19 @@ describe('classifyError — provider classes (ported from router.py)', () => {
   });
 });
 
-describe('classifyError — fallback', () => {
+describe('classifyError -- fallback', () => {
   test('unknown for unrecognized input', () => {
     expect(classifyError({ message: 'something weird happened' })).toBe('unknown');
     expect(classifyError({})).toBe('unknown');
   });
 });
 
-describe('decide — provider classes', () => {
+describe('decide -- provider classes', () => {
   test('rate_limit retries with exponential backoff up to attempt 3', () => {
     const r1 = decide({ errorClass: 'rate_limit_exceeded', attempt: 1 });
     expect(r1.decision).toBe('retry');
     expect(r1.backoffMs).toBe(2000); // 2 * 2^1 = 2000? actually 1000*2^1 = 2000... wait
-    // Formula in decide.ts: 1000 * Math.pow(2, attempt) → attempt 1 = 2000ms
+    // Formula in decide.ts: 1000 * Math.pow(2, attempt) -> attempt 1 = 2000ms
     expect(r1.backoffMs).toBeGreaterThan(0);
 
     const r3 = decide({ errorClass: 'rate_limit_exceeded', attempt: 3 });
@@ -138,33 +138,33 @@ describe('decide — provider classes', () => {
   });
 });
 
-describe('decide — workflow-runtime classes', () => {
-  test('sentinel_mismatch with output → commit_and_push_anyway', () => {
+describe('decide -- workflow-runtime classes', () => {
+  test('sentinel_mismatch with output -> commit_and_push_anyway', () => {
     const r = decide({ errorClass: 'sentinel_mismatch', attempt: 1, hasOutput: true });
     expect(r.decision).toBe('commit_and_push_anyway');
   });
 
-  test('sentinel_mismatch without output → escalate', () => {
+  test('sentinel_mismatch without output -> escalate', () => {
     const r = decide({ errorClass: 'sentinel_mismatch', attempt: 1, hasOutput: false });
     expect(r.decision).toBe('escalate');
   });
 
-  test('npm_not_found → skip (legacy YAML; container is bun-only)', () => {
+  test('npm_not_found -> skip (legacy YAML; container is bun-only)', () => {
     const r = decide({ errorClass: 'npm_not_found', attempt: 1 });
     expect(r.decision).toBe('skip');
   });
 
-  test("verify_pre_existing → skip (post-Patch-1, verify-* shouldn't exist; if it does, ignore)", () => {
+  test("verify_pre_existing -> skip (post-Patch-1, verify-* shouldn't exist; if it does, ignore)", () => {
     const r = decide({ errorClass: 'verify_pre_existing', attempt: 1 });
     expect(r.decision).toBe('skip');
   });
 
-  test('worktree_collision → escalate (Rule 17 violation in YAML)', () => {
+  test('worktree_collision -> escalate (Rule 17 violation in YAML)', () => {
     const r = decide({ errorClass: 'worktree_collision', attempt: 1 });
     expect(r.decision).toBe('escalate');
   });
 
-  test('branch_ref_missing → escalate (Rule 16 violation)', () => {
+  test('branch_ref_missing -> escalate (Rule 16 violation)', () => {
     const r = decide({ errorClass: 'branch_ref_missing', attempt: 1 });
     expect(r.decision).toBe('escalate');
   });
@@ -175,8 +175,8 @@ describe('decide — workflow-runtime classes', () => {
   });
 });
 
-describe('decide — unknown', () => {
-  test('unknown class → escalate (preserve current behavior)', () => {
+describe('decide -- unknown', () => {
+  test('unknown class -> escalate (preserve current behavior)', () => {
     const r = decide({ errorClass: 'unknown', attempt: 1 });
     expect(r.decision).toBe('escalate');
     expect(r.reason).toContain('unknown');

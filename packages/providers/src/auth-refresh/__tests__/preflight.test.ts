@@ -9,7 +9,7 @@ mock.module('@archon/paths', () => ({
   createLogger: mock(() => mockLogger),
 }));
 
-// Mock refreshIfAuthFailed from the index module — preflight imports it
+// Mock refreshIfAuthFailed from the index module -- preflight imports it
 // indirectly via the public surface. We can't use mock.module on the index
 // because the same index also exports the function under test, so we mock
 // the underlying ./claude and ./codex implementations instead.
@@ -112,7 +112,7 @@ describe('ensureFreshAuth (Claude)', () => {
   });
 
   test('triggers refresh when expiresAt is within the 60s buffer', async () => {
-    writeClaudeCreds(Date.now() + 30_000); // 30s — inside buffer
+    writeClaudeCreds(Date.now() + 30_000); // 30s -- inside buffer
     await ensureFreshAuth('claude');
     expect(refreshClaudeMock).toHaveBeenCalledTimes(1);
     expect(mockLogger.info).toHaveBeenCalledWith(
@@ -192,7 +192,7 @@ describe('ensureFreshAuth (Claude)', () => {
       ...mockLogger.warn.mock.calls,
     ];
     const serialized = JSON.stringify(allLogCalls);
-    // Match the placeholders we wrote — these are NOT real tokens but the
+    // Match the placeholders we wrote -- these are NOT real tokens but the
     // test still proves redaction by checking they don't leak.
     expect(serialized).not.toContain('ACCESS_PLACEHOLDER');
     expect(serialized).not.toContain('REFRESH_PLACEHOLDER');

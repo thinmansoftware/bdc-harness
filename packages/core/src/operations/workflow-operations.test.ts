@@ -77,7 +77,7 @@ describe('approveWorkflow', () => {
     mockUpdateWorkflowRun.mockClear();
   });
 
-  test('approves standard approval gate — writes node_completed + approval_received', async () => {
+  test('approves standard approval gate -- writes node_completed + approval_received', async () => {
     mockGetWorkflowRun.mockResolvedValueOnce(makePausedRun());
 
     const result = await approveWorkflow('run-1', 'Looks good');
@@ -100,7 +100,7 @@ describe('approveWorkflow', () => {
     });
   });
 
-  test('approves interactive_loop — writes only approval_received, stores loop_user_input', async () => {
+  test('approves interactive_loop -- writes only approval_received, stores loop_user_input', async () => {
     const run = makePausedRun({
       metadata: {
         approval: {
@@ -117,7 +117,7 @@ describe('approveWorkflow', () => {
 
     expect(result.type).toBe('interactive_loop');
 
-    // Only approval_received — NOT node_completed
+    // Only approval_received -- NOT node_completed
     expect(mockCreateWorkflowEvent).toHaveBeenCalledTimes(1);
     const call = mockCreateWorkflowEvent.mock.calls[0][0] as Record<string, unknown>;
     expect(call.event_type).toBe('approval_received');
@@ -129,7 +129,7 @@ describe('approveWorkflow', () => {
     });
   });
 
-  test('approves with captureResponse — stores comment as node output', async () => {
+  test('approves with captureResponse -- stores comment as node output', async () => {
     const run = makePausedRun({
       metadata: {
         approval: {
@@ -177,7 +177,7 @@ describe('rejectWorkflow', () => {
     mockCancelWorkflowRun.mockClear();
   });
 
-  test('rejects with onRejectPrompt under max attempts — transitions to failed', async () => {
+  test('rejects with onRejectPrompt under max attempts -- transitions to failed', async () => {
     const run = makePausedRun({
       metadata: {
         approval: {
@@ -202,7 +202,7 @@ describe('rejectWorkflow', () => {
     });
   });
 
-  test('rejects at max attempts — cancels run', async () => {
+  test('rejects at max attempts -- cancels run', async () => {
     const run = makePausedRun({
       metadata: {
         approval: {
@@ -222,7 +222,7 @@ describe('rejectWorkflow', () => {
     expect(mockCancelWorkflowRun).toHaveBeenCalledWith('run-1');
   });
 
-  test('rejects without onRejectPrompt — cancels immediately', async () => {
+  test('rejects without onRejectPrompt -- cancels immediately', async () => {
     mockGetWorkflowRun.mockResolvedValueOnce(makePausedRun());
 
     const result = await rejectWorkflow('run-1', 'no good');

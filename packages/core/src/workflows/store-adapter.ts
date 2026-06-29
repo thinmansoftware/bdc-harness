@@ -1,5 +1,5 @@
 /**
- * WorkflowStore adapter — bridges @archon/core DB modules to the
+ * WorkflowStore adapter -- bridges @archon/core DB modules to the
  * IWorkflowStore trait defined in @archon/workflows.
  */
 import type { IWorkflowStore } from '@archon/workflows/store';
@@ -64,7 +64,7 @@ export function createWorkflowStore(): IWorkflowStore {
 
 /**
  * Create the canonical WorkflowDeps for the workflow engine.
- * Single construction point — avoids duplicating the wiring across callers.
+ * Single construction point -- avoids duplicating the wiring across callers.
  */
 export function createWorkflowDeps(): WorkflowDeps {
   return {

@@ -113,15 +113,15 @@ ${workflowList}
 
 ## Rules
 
-1. The USER REQUEST is the PRIMARY signal — it determines which workflow to use
-2. The CONTEXT section is supplementary — it tells you WHERE the user is, not WHAT they want
+1. The USER REQUEST is the PRIMARY signal -- it determines which workflow to use
+2. The CONTEXT section is supplementary -- it tells you WHERE the user is, not WHAT they want
 3. Read each workflow's description - especially the "NOT for" and "Use when" sections
 4. CRITICAL: Being on a GitHub issue does NOT mean the user wants to fix it. Only route to "fix-github-issue" if the user EXPLICITLY asks to fix, resolve, or implement something.
 5. IMPORTANT distinctions:
-   - CI failures, test failures, build errors, linting issues → use "assist" (debugging help)
-   - "Fix this issue" / "implement this" / "resolve this bug" (explicit action request) → use "fix-github-issue"
-   - Questions, exploration, explanations, general messages → use "assist"
-   - PR reviews, code reviews → check for a PR review workflow in the list above
+   - CI failures, test failures, build errors, linting issues -> use "assist" (debugging help)
+   - "Fix this issue" / "implement this" / "resolve this bug" (explicit action request) -> use "fix-github-issue"
+   - Questions, exploration, explanations, general messages -> use "assist"
+   - PR reviews, code reviews -> check for a PR review workflow in the list above
 6. If unsure, prefer "assist" (the catch-all)
 7. You MUST pick a workflow - never respond with just text
 
@@ -131,7 +131,7 @@ Your ENTIRE response must be ONLY this single line - no analysis, no explanation
 /invoke-workflow {workflow-name}
 
 Do NOT include any other text before or after. Just the command.
-Do NOT use any tools (Read, Write, Bash, etc.) — this is a routing decision only.`;
+Do NOT use any tools (Read, Write, Bash, etc.) -- this is a routing decision only.`;
   // NOTE: We emphasize "ONLY this single line" because AI models sometimes add analysis
   // before the command. The parseWorkflowInvocation regex uses multiline mode as a fallback,
   // but cleaner output is preferred for GitHub comments where the full response is posted.
@@ -214,8 +214,8 @@ export function findWorkflow(
  * Resolve a workflow by name using a 4-tier fallback hierarchy:
  * 1. Exact match
  * 2. Case-insensitive match
- * 3. Suffix match (e.g. "assist" → "archon-assist")
- * 4. Substring match (e.g. "smart" → "archon-smart-pr-review")
+ * 3. Suffix match (e.g. "assist" -> "archon-assist")
+ * 4. Substring match (e.g. "smart" -> "archon-smart-pr-review")
  *
  * Returns the matched workflow, or undefined if no match found.
  * Throws an Error if multiple workflows match at the same tier (ambiguous).
