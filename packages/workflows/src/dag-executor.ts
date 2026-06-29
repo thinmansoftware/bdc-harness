@@ -83,6 +83,7 @@ import {
 import { loadAgentRegistry, resolveAgent } from './agents/registry';
 import type { AgentRegistry } from './agents/registry';
 import { loadContext } from '@archon/persona-context-loader';
+import { deriveEntryRung, computeFrontierCost } from './model-rates';
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
 let cachedLog: ReturnType<typeof createLogger> | undefined;
@@ -184,7 +185,11 @@ interface WorkflowLevelOptions {
 }
 
 /** Internal node execution result — extends NodeOutput with cost + token data for aggregation. */
-type NodeExecutionResult = NodeOutput & { costUsd?: number; tokens?: TokenUsage };
+type NodeExecutionResult = NodeOutput & {
+  costUsd?: number;
+  tokens?: TokenUsage;
+  frontierCostUsd?: number;
+};
 
 /** Throttle state for cancel checks (reads — no write contention in WAL mode) */
 const lastNodeCancelCheck = new Map<string, number>();
@@ -1301,6 +1306,13 @@ async function executeNodeInternal(
           ...(typeof nodeServedModelId === 'string' && nodeOptions?.model !== undefined
             ? { served_model_mismatch: nodeServedModelId !== nodeOptions.model }
             : {}),
+          // Layer 1 tier + counterfactual cost (WO-HARNESS-LAYER1-TIER-AND-COUNTERFACTUAL-COST-01).
+          // entry_rung is derived from provider + effective per-node model. Phase 4 (router
+          // tiers) will replace this with the router-assigned rung. frontier_cost_usd is
+          // tokens * frontier-model rate -- the counterfactual cost if this node had run on
+          // the frontier rung instead of where it actually ran. Omit-when-absent for tokens.
+          entry_rung: deriveEntryRung(provider, nodeOptions?.model),
+          ...(nodeTokens ? { frontier_cost_usd: computeFrontierCost(nodeTokens) } : {}),
         },
       })
       .catch((err: Error) => {
@@ -1331,6 +1343,7 @@ async function executeNodeInternal(
       sessionId: newSessionId,
       costUsd: nodeCostUsd,
       ...(nodeTokens ? { tokens: nodeTokens } : {}),
+      ...(nodeTokens ? { frontierCostUsd: computeFrontierCost(nodeTokens) } : {}),
     };
   } catch (error) {
     const err = error as Error;
@@ -1348,6 +1361,7 @@ async function executeNodeInternal(
         error: 'Cancelled by user',
         costUsd: nodeCostUsd,
         ...(nodeTokens ? { tokens: nodeTokens } : {}),
+        ...(nodeTokens ? { frontierCostUsd: computeFrontierCost(nodeTokens) } : {}),
       };
     }
 
@@ -1389,6 +1403,7 @@ async function executeNodeInternal(
       error: err.message,
       costUsd: nodeCostUsd,
       ...(nodeTokens ? { tokens: nodeTokens } : {}),
+      ...(nodeTokens ? { frontierCostUsd: computeFrontierCost(nodeTokens) } : {}),
     };
   }
 }
@@ -2540,6 +2555,11 @@ async function executeLoopNode(
             ...(loopFinalStopReason ? { stop_reason: loopFinalStopReason } : {}),
             ...(loopTotalNumTurns !== undefined ? { num_turns: loopTotalNumTurns } : {}),
             ...(loopTotalTokens ? { tokens: loopTotalTokens } : {}),
+            // Layer 1 tier + counterfactual cost (WO-HARNESS-LAYER1-TIER-AND-COUNTERFACTUAL-COST-01).
+            // workflowProvider/workflowModel already carry the per-node-resolved values
+            // (caller computes loopProvider = node.provider ?? workflowProvider).
+            entry_rung: deriveEntryRung(workflowProvider, workflowModel),
+            ...(loopTotalTokens ? { frontier_cost_usd: computeFrontierCost(loopTotalTokens) } : {}),
           },
         })
         .catch((err: Error) => {
@@ -2564,6 +2584,7 @@ async function executeLoopNode(
         sessionId: currentSessionId,
         costUsd: loopTotalCostUsd,
         ...(loopTotalTokens ? { tokens: loopTotalTokens } : {}),
+        ...(loopTotalTokens ? { frontierCostUsd: computeFrontierCost(loopTotalTokens) } : {}),
       };
     }
 
@@ -2954,6 +2975,10 @@ export async function executeDagWorkflow(
   // The same resumed-portion semantics apply to totalTokens.
   let totalCostUsd = 0;
   let totalTokens = 0;
+  // Layer 1 counterfactual cost accumulator (WO-HARNESS-LAYER1-TIER-AND-COUNTERFACTUAL-COST-01).
+  // Sum of frontier_cost_usd across nodes; written to run metadata as total_frontier_cost_usd
+  // so the UI can compute savings = total_frontier_cost_usd - total_cost_usd.
+  let totalFrontierCostUsd = 0;
 
   for (let layerIdx = 0; layerIdx < layers.length; layerIdx++) {
     const layer = layers[layerIdx];
@@ -3402,6 +3427,7 @@ export async function executeDagWorkflow(
         if (output.tokens) {
           totalTokens += output.tokens.total ?? output.tokens.input + output.tokens.output;
         }
+        if (output.frontierCostUsd !== undefined) totalFrontierCostUsd += output.frontierCostUsd;
         nodeOutputs.set(nodeId, output);
         if (output.state === 'completed' && !isParallelLayer && output.sessionId !== undefined) {
           lastSequentialSessionId = output.sessionId;
@@ -3567,6 +3593,10 @@ export async function executeDagWorkflow(
       ...(totalCostUsd > 0 ? { total_cost_usd: totalCostUsd } : {}),
       // totalTokens starts at 0; only write metadata when at least one node reported tokens
       ...(totalTokens > 0 ? { total_tokens: totalTokens } : {}),
+      // Layer 1 counterfactual run total (WO-HARNESS-LAYER1-TIER-AND-COUNTERFACTUAL-COST-01).
+      // Only write when at least one node reported tokens; UI computes savings as
+      // total_frontier_cost_usd - total_cost_usd.
+      ...(totalFrontierCostUsd > 0 ? { total_frontier_cost_usd: totalFrontierCostUsd } : {}),
     });
   } catch (dbErr) {
     getLog().error(

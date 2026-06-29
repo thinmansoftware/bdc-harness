@@ -8559,3 +8559,216 @@ describe('executeDagWorkflow -- served-model capture on node_completed.data', ()
     expect(data).not.toHaveProperty('served_model_mismatch');
   });
 });
+
+// ---------------------------------------------------------------------------
+// Layer 1 tier + counterfactual cost on node_completed.data + run metadata
+// WO-HARNESS-LAYER1-TIER-AND-COUNTERFACTUAL-COST-01
+// ---------------------------------------------------------------------------
+//
+// T1: a node records an entry_rung label derived from provider:model.
+// T2: a node records frontier_cost_usd = tokens.input * INPUT_RATE +
+//     tokens.output * OUTPUT_RATE (exact arithmetic against published Opus-4 rates).
+// T3: run metadata carries both total_cost_usd and total_frontier_cost_usd so the
+//     UI can compute savings = total_frontier_cost_usd - total_cost_usd.
+// T4: existing cost_usd and tokens fields are present and unchanged in shape
+//     (backward compatibility on the data contract).
+describe('executeDagWorkflow -- tier/entry_rung + frontier_cost_usd', () => {
+  let testDir: string;
+
+  beforeEach(async () => {
+    testDir = join(tmpdir(), `dag-tier-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    await mkdir(testDir, { recursive: true });
+    mockSendQueryDag.mockClear();
+    mockGetAgentProviderDag.mockClear();
+  });
+
+  afterEach(async () => {
+    mockGetAgentProviderDag.mockImplementation(() => ({
+      sendQuery: mockSendQueryDag,
+      getType: () => 'claude',
+      getCapabilities: mockClaudeCapabilities,
+    }));
+    try {
+      await rm(testDir, { recursive: true, force: true });
+    } catch {
+      /* ignore cleanup errors */
+    }
+  });
+
+  // Redefined locally -- the same-named helper inside the served-model describe
+  // block above is scoped to that block and not reachable from here.
+  function getNodeCompletedData(store: IWorkflowStore): Record<string, unknown> {
+    const calls = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls as Array<
+      [{ event_type: string; data?: Record<string, unknown> }]
+    >;
+    const completedCalls = calls.filter(([arg]) => arg.event_type === 'node_completed');
+    expect(completedCalls.length).toBe(1);
+    const data = completedCalls[0][0].data;
+    expect(data).toBeDefined();
+    return data as Record<string, unknown>;
+  }
+
+  it('T1: node_completed carries entry_rung derived from provider:model', async () => {
+    mockSendQueryDag.mockImplementation(function* () {
+      yield { type: 'assistant', content: 'done' };
+      yield { type: 'result', sessionId: 's1' };
+    });
+
+    const store = createMockStore();
+    const mockDeps = createMockDeps(store);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('t1-run');
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-t1',
+      testDir,
+      { name: 't1', nodes: [{ id: 'n', prompt: 'p', model: 'claude-opus-4-7' }] },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    const data = getNodeCompletedData(store);
+    // Format: "<provider>:<effective-model>" -- the workflow provider is 'claude'
+    // and the per-node model override flows through nodeOptions.model.
+    expect(data.entry_rung).toBe('claude:claude-opus-4-7');
+  });
+
+  it('T2: frontier_cost_usd == tokens.input * INPUT_RATE + tokens.output * OUTPUT_RATE', async () => {
+    // Known token counts; published frontier rates (claude-opus-4-7):
+    //   INPUT_RATE  = 0.000015 USD/token
+    //   OUTPUT_RATE = 0.000075 USD/token
+    // 1000 * 0.000015 + 200 * 0.000075 = 0.015 + 0.015 = 0.030
+    mockSendQueryDag.mockImplementation(function* () {
+      yield { type: 'assistant', content: 'done' };
+      yield {
+        type: 'result',
+        sessionId: 's2',
+        tokens: { input: 1000, output: 200, total: 1200 },
+      };
+    });
+
+    const store = createMockStore();
+    const mockDeps = createMockDeps(store);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('t2-run');
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-t2',
+      testDir,
+      { name: 't2', nodes: [{ id: 'n', prompt: 'p' }] },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    const data = getNodeCompletedData(store);
+    expect(typeof data.frontier_cost_usd).toBe('number');
+    expect(data.frontier_cost_usd as number).toBeCloseTo(0.03, 10);
+  });
+
+  it('T3: run metadata carries both total_cost_usd and total_frontier_cost_usd', async () => {
+    // Provider yields BOTH cost and tokens so both run totals are populated
+    // and the UI can compute savings = total_frontier_cost_usd - total_cost_usd.
+    mockSendQueryDag.mockImplementation(function* () {
+      yield { type: 'assistant', content: 'done' };
+      yield {
+        type: 'result',
+        sessionId: 's3',
+        cost: 0.001,
+        tokens: { input: 500, output: 100, total: 600 },
+      };
+    });
+
+    const store = createMockStore();
+    const mockDeps = createMockDeps(store);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('t3-run');
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-t3',
+      testDir,
+      { name: 't3', nodes: [{ id: 'n', prompt: 'p' }] },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    const completeCalls = (store.completeWorkflowRun as ReturnType<typeof mock>).mock
+      .calls as Array<[string, Record<string, unknown>?]>;
+    expect(completeCalls.length).toBeGreaterThan(0);
+    const meta = completeCalls[completeCalls.length - 1][1] ?? {};
+    // T3 asserts both fields are present so UI can compute savings.
+    expect(meta).toHaveProperty('total_cost_usd');
+    expect(meta).toHaveProperty('total_frontier_cost_usd');
+    // And both are positive numbers (sanity, not exact math here -- T2 owns math).
+    expect(typeof meta.total_cost_usd).toBe('number');
+    expect(typeof meta.total_frontier_cost_usd).toBe('number');
+    expect(meta.total_frontier_cost_usd as number).toBeGreaterThan(0);
+  });
+
+  it('T4: backward compat -- existing cost_usd and tokens fields unchanged in shape', async () => {
+    mockSendQueryDag.mockImplementation(function* () {
+      yield { type: 'assistant', content: 'done' };
+      yield {
+        type: 'result',
+        sessionId: 's4',
+        cost: 0.005,
+        tokens: { input: 100, output: 50, total: 150 },
+      };
+    });
+
+    const store = createMockStore();
+    const mockDeps = createMockDeps(store);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('t4-run');
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-t4',
+      testDir,
+      { name: 't4', nodes: [{ id: 'n', prompt: 'p' }] },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    const data = getNodeCompletedData(store);
+    // Pre-existing cost_usd field MUST still be present (additive change only).
+    expect(data).toHaveProperty('cost_usd');
+    expect(data.cost_usd).toBe(0.005);
+    // Pre-existing tokens field MUST still carry the same shape.
+    expect(data.tokens).toBeDefined();
+    const tokens = data.tokens as { input: number; output: number; total?: number };
+    expect(tokens.input).toBe(100);
+    expect(tokens.output).toBe(50);
+    expect(tokens.total).toBe(150);
+  });
+});
