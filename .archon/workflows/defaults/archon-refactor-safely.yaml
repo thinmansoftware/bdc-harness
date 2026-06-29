@@ -18,9 +18,9 @@ description: |
 provider: claude
 
 nodes:
-  # ═══════════════════════════════════════════════════════════════
-  # PHASE 1: SCAN — Find files matching the refactoring target
-  # ═══════════════════════════════════════════════════════════════
+  # ---------------------------------------------------------------
+  # PHASE 1: SCAN -- Find files matching the refactoring target
+  # ---------------------------------------------------------------
 
   - id: scan-scope
     bash: |
@@ -56,10 +56,10 @@ nodes:
       done | sort -rn | head -20
     timeout: 60000
 
-  # ═══════════════════════════════════════════════════════════════
-  # PHASE 2: ANALYZE IMPACT — Read-only deep analysis
+  # ---------------------------------------------------------------
+  # PHASE 2: ANALYZE IMPACT -- Read-only deep analysis
   # Maps call sites, identifies risk areas, understands dependencies
-  # ═══════════════════════════════════════════════════════════════
+  # ---------------------------------------------------------------
 
   - id: analyze-impact
     prompt: |
@@ -77,7 +77,7 @@ nodes:
 
       1. Identify the PRIMARY file(s) targeted for refactoring based on the user's request
          and the scan results above
-      2. Read each target file thoroughly — understand every function, type, and export
+      2. Read each target file thoroughly -- understand every function, type, and export
       3. For each target file, map ALL call sites:
          - Use Grep to find every import of the target file across the codebase
          - Track which specific exports are used and where
@@ -119,10 +119,10 @@ nodes:
     context: fresh
     denied_tools: [Write, Edit, Bash]
 
-  # ═══════════════════════════════════════════════════════════════
-  # PHASE 3: PLAN REFACTOR — Ordered task list with rollback strategy
+  # ---------------------------------------------------------------
+  # PHASE 3: PLAN REFACTOR -- Ordered task list with rollback strategy
   # Read-only: produces the plan, does not execute it
-  # ═══════════════════════════════════════════════════════════════
+  # ---------------------------------------------------------------
 
   - id: plan-refactor
     prompt: |
@@ -139,7 +139,7 @@ nodes:
 
       ## Principles
 
-      - **Behavior preservation**: The refactoring must NOT change any behavior — only structure
+      - **Behavior preservation**: The refactoring must NOT change any behavior -- only structure
       - **Incremental**: Each step must leave the codebase in a compilable state
       - **Reversible**: Each step can be independently reverted
       - **No mixed concerns**: Do not combine refactoring with bug fixes or improvements
@@ -201,10 +201,10 @@ nodes:
     context: fresh
     denied_tools: [Write, Edit, Bash]
 
-  # ═══════════════════════════════════════════════════════════════
-  # PHASE 4: EXECUTE REFACTOR — Implements the plan with guardrails
+  # ---------------------------------------------------------------
+  # PHASE 4: EXECUTE REFACTOR -- Implements the plan with guardrails
   # Hooks enforce type-check after every edit and plan adherence
-  # ═══════════════════════════════════════════════════════════════
+  # ---------------------------------------------------------------
 
   - id: execute-refactor
     model: opus[1m]
@@ -213,18 +213,18 @@ nodes:
 
       ## Plan
 
-      Read the full plan from `$ARTIFACTS_DIR/refactor-plan.md` — follow it LITERALLY.
+      Read the full plan from `$ARTIFACTS_DIR/refactor-plan.md` -- follow it LITERALLY.
 
       ## Rules
 
-      - **Follow the plan exactly** — do not add extra improvements or cleanups
-      - **One task at a time** — complete each task fully before starting the next
-      - **Type-check after every file change** — you'll be prompted to do this after each edit
-      - **Preserve all behavior** — refactoring means moving code, not changing it
-      - **Preserve the public API** — if the original file exported something, it must still be
+      - **Follow the plan exactly** -- do not add extra improvements or cleanups
+      - **One task at a time** -- complete each task fully before starting the next
+      - **Type-check after every file change** -- you'll be prompted to do this after each edit
+      - **Preserve all behavior** -- refactoring means moving code, not changing it
+      - **Preserve the public API** -- if the original file exported something, it must still be
         importable from the same path (use re-exports in the original file if needed)
-      - **Update all import sites** — every file that imported from the original must be updated
-      - **Commit after each logical task** — one commit per plan task with a clear message
+      - **Update all import sites** -- every file that imported from the original must be updated
+      - **Commit after each logical task** -- one commit per plan task with a clear message
 
       ## Process for Each Task
 
@@ -235,7 +235,7 @@ nodes:
       5. Update the original file's exports to re-export from the new module (API preservation)
       6. Use Grep to find and update ALL import sites across the codebase
       7. Run `bun run type-check` to verify (you'll be reminded by hooks)
-      8. Commit ONLY the files you edited for this task — never `git add -A`. Stage by name, then commit:
+      8. Commit ONLY the files you edited for this task -- never `git add -A`. Stage by name, then commit:
          ```bash
          git add path/to/file1 path/to/file2 ...
          git status --porcelain  # verify nothing scratch is staged
@@ -249,7 +249,7 @@ nodes:
       - If type-check fails after a change: fix it immediately before proceeding
       - If a task is more complex than planned: complete it anyway, note the deviation
       - If you discover the plan missed an import site: update it and note it
-      - NEVER skip a task — complete them in order
+      - NEVER skip a task -- complete them in order
     depends_on: [plan-refactor]
     context: fresh
     hooks:
@@ -271,7 +271,7 @@ nodes:
               other changes:
               1. Run `bun run type-check` to verify the change compiles
               2. If type-check fails, fix the error immediately
-              3. Verify you preserved the exact same behavior — no logic changes, only structural moves
+              3. Verify you preserved the exact same behavior -- no logic changes, only structural moves
               Only proceed to the next change after type-check passes.
         - matcher: "Bash"
           response:
@@ -281,9 +281,9 @@ nodes:
                 Check the exit code. If type-check or any validation failed, fix the issue
                 before continuing. Do not accumulate broken state.
 
-  # ═══════════════════════════════════════════════════════════════
-  # PHASE 5: VALIDATE — Full test suite (bash, no AI escape hatch)
-  # ═══════════════════════════════════════════════════════════════
+  # ---------------------------------------------------------------
+  # PHASE 5: VALIDATE -- Full test suite (bash, no AI escape hatch)
+  # ---------------------------------------------------------------
 
   - id: validate
     bash: |
@@ -327,10 +327,10 @@ nodes:
     depends_on: [execute-refactor]
     timeout: 300000
 
-  # ═══════════════════════════════════════════════════════════════
+  # ---------------------------------------------------------------
   # PHASE 6: FIX VALIDATION FAILURES (if any)
   # Only does real work if validation failed
-  # ═══════════════════════════════════════════════════════════════
+  # ---------------------------------------------------------------
 
   - id: fix-failures
     prompt: |
@@ -343,19 +343,19 @@ nodes:
       ## Instructions
 
       If the output ends with "VALIDATION_STATUS: PASS", respond with
-      "All checks passed — no fixes needed." and stop.
+      "All checks passed -- no fixes needed." and stop.
 
       If there are failures:
 
       1. Read the validation failures carefully
-      2. Fix ONLY what's broken — do not make additional improvements
+      2. Fix ONLY what's broken -- do not make additional improvements
       3. If a fix requires changing behavior (not just fixing a type/lint error),
          revert the original change instead
       4. Run the specific failing check after each fix to confirm it passes
       5. After all fixes, run the full validation suite: `bun run validate`
 
       If there are files still over 500 lines, note them but do NOT attempt further
-      splitting in this node — that would require a new plan cycle.
+      splitting in this node -- that would require a new plan cycle.
     depends_on: [validate]
     context: fresh
     hooks:
@@ -364,7 +364,7 @@ nodes:
           response:
             systemMessage: >
               You just made a fix. Run the specific failing validation check NOW
-              to verify your fix works. Do not batch fixes — verify each one.
+              to verify your fix works. Do not batch fixes -- verify each one.
       PreToolUse:
         - matcher: "Write|Edit"
           response:
@@ -375,15 +375,15 @@ nodes:
                 beyond what's needed to pass the failing checks. If in doubt, revert
                 the original change that caused the failure.
 
-  # ═══════════════════════════════════════════════════════════════
-  # PHASE 7: VERIFY BEHAVIOR — Read-only confirmation
+  # ---------------------------------------------------------------
+  # PHASE 7: VERIFY BEHAVIOR -- Read-only confirmation
   # Ensures the refactoring preserved behavior by tracing call paths
-  # ═══════════════════════════════════════════════════════════════
+  # ---------------------------------------------------------------
 
   - id: verify-behavior
     prompt: |
       You are a code reviewer verifying that a refactoring preserved exact behavior.
-      You can ONLY read files — you cannot make any changes.
+      You can ONLY read files -- you cannot make any changes.
 
       ## Refactoring Plan
 
@@ -426,14 +426,14 @@ nodes:
       - [ ] All N import sites verified
 
       ### Issues Found
-      [List any behavior changes detected, or "None — refactoring is behavior-preserving"]
+      [List any behavior changes detected, or "None -- refactoring is behavior-preserving"]
     depends_on: [fix-failures]
     context: fresh
     denied_tools: [Write, Edit, Bash]
 
-  # ═══════════════════════════════════════════════════════════════
-  # PHASE 8: CREATE PR — Detailed description with before/after
-  # ═══════════════════════════════════════════════════════════════
+  # ---------------------------------------------------------------
+  # PHASE 8: CREATE PR -- Detailed description with before/after
+  # ---------------------------------------------------------------
 
   - id: create-pr
     prompt: |
@@ -467,7 +467,7 @@ nodes:
 
       ### Motivation
 
-      [Why this refactoring was needed — file sizes, complexity, maintainability]
+      [Why this refactoring was needed -- file sizes, complexity, maintainability]
 
       ### Before
 
@@ -508,7 +508,7 @@ nodes:
             hookSpecificOutput:
               hookEventName: PreToolUse
               permissionDecision: deny
-              permissionDecisionReason: "PR creation node — do not modify source files. Use only git and gh commands."
+              permissionDecisionReason: "PR creation node -- do not modify source files. Use only git and gh commands."
       PostToolUse:
         - matcher: "Bash"
           response:
@@ -525,7 +525,7 @@ nodes:
       ACTUAL=$(gh pr view --json baseRefName -q '.baseRefName')
       if [ "$ACTUAL" != "$EXPECTED" ]; then
         PR_NUMBER=$(gh pr view --json number -q '.number')
-        echo "Base mismatch on PR #$PR_NUMBER: expected=$EXPECTED actual=$ACTUAL — re-targeting" >&2
+        echo "Base mismatch on PR #$PR_NUMBER: expected=$EXPECTED actual=$ACTUAL -- re-targeting" >&2
         gh pr edit "$PR_NUMBER" --base "$EXPECTED"
       else
         echo "PR base verified: $EXPECTED"

@@ -10,7 +10,7 @@ mkdir -p /.archon/workspaces /.archon/worktrees
 if [ "$(id -u)" = "0" ]; then
   # Running as root: fix volume permissions, then drop to appuser
   if ! chown -Rh appuser:appuser /.archon 2>/dev/null; then
-    echo "ERROR: Failed to fix ownership of /.archon — volume may be read-only or mounted with incompatible options" >&2
+    echo "ERROR: Failed to fix ownership of /.archon -- volume may be read-only or mounted with incompatible options" >&2
     exit 1
   fi
   # /home/appuser is persisted to a named volume (or bind-mounted via
@@ -18,7 +18,7 @@ if [ "$(id -u)" = "0" ]; then
   # and other user-specific state survive rebuilds. On bind mounts, host UIDs
   # don't map to appuser (1001), so fix ownership the same way we do /.archon.
   if ! chown -Rh appuser:appuser /home/appuser 2>/dev/null; then
-    echo "ERROR: Failed to fix ownership of /home/appuser — volume may be read-only or mounted with incompatible options" >&2
+    echo "ERROR: Failed to fix ownership of /home/appuser -- volume may be read-only or mounted with incompatible options" >&2
     exit 1
   fi
   # WO-168 Tier 1: /host-artifacts is a host bind mount for load-bearing
@@ -27,7 +27,7 @@ if [ "$(id -u)" = "0" ]; then
   # (older docker-compose without the new volume), do not block startup.
   if [ -d /host-artifacts ]; then
     if ! chown -Rh appuser:appuser /host-artifacts 2>/dev/null; then
-      echo "WARN: Failed to chown /host-artifacts — bundles may fail to write. Check host directory permissions." >&2
+      echo "WARN: Failed to chown /host-artifacts -- bundles may fail to write. Check host directory permissions." >&2
     fi
   fi
   RUNNER="gosu appuser"
@@ -51,9 +51,9 @@ fi
 # On macOS bind mounts (VirtioFS), host UIDs don't map to appuser (1001),
 # so git prints "dubious ownership" and refuses all operations.
 # The Dockerfile RUN-layer registers fixed paths, but that gitconfig lives
-# in the image layer — bind mounts don't inherit it on restart, and
+# in the image layer -- bind mounts don't inherit it on restart, and
 # worktrees are nested at arbitrary depths unknown at build time.
-# With /home/appuser now persisted, ~/.gitconfig survives across restarts —
+# With /home/appuser now persisted, ~/.gitconfig survives across restarts --
 # so we must check before --add or duplicate safe.directory lines accumulate
 # every boot.
 find /.archon -name ".git" -prune -print 2>/dev/null | while IFS= read -r git_dir; do
@@ -65,7 +65,7 @@ done
 
 # Configure git to use a GitHub token for HTTPS clones AND pushes via credential
 # helper. Accept either GH_TOKEN (gh CLI legacy) or GITHUB_TOKEN (compose default
-# in this fork — see WO-HARNESS-CONTAINER-GITHUB-AUTH-BOUNDARY-01 / #171).
+# in this fork -- see WO-HARNESS-CONTAINER-GITHUB-AUTH-BOUNDARY-01 / #171).
 # Uses a helper function so the token stays in the environment, not in ~/.gitconfig.
 _GH_AUTH_TOKEN="${GH_TOKEN:-${GITHUB_TOKEN:-}}"
 if [ -n "$_GH_AUTH_TOKEN" ]; then
@@ -81,7 +81,7 @@ if [ -n "$_GH_AUTH_TOKEN" ]; then
   # Pre-flight: verify the token actually authenticates. We use `gh auth status`
   # because an UNauthenticated ls-remote against a public repo always succeeds
   # and proves nothing about the token. gh auth status is the cheapest call that
-  # actually exercises token + scopes. Failure is LOUD but non-fatal — a stale
+  # actually exercises token + scopes. Failure is LOUD but non-fatal -- a stale
   # token must not block container startup; workflows that try to push will
   # surface the error in their own run logs. Result written to /tmp so future
   # healthcheck wiring can pick it up.
@@ -89,11 +89,11 @@ if [ -n "$_GH_AUTH_TOKEN" ]; then
     echo "[archon] GitHub auth pre-flight: OK (token authenticates to github.com)" >&2
     echo "ok" > /tmp/github-auth-preflight.status
   else
-    echo "[archon] ERROR: GitHub auth pre-flight FAILED — token is missing, expired, or lacks scope. Workflows that push branches/PRs will fail. Refresh GITHUB_TOKEN in .env and restart. See docs/operations/container-github-auth.md." >&2
+    echo "[archon] ERROR: GitHub auth pre-flight FAILED -- token is missing, expired, or lacks scope. Workflows that push branches/PRs will fail. Refresh GITHUB_TOKEN in .env and restart. See docs/operations/container-github-auth.md." >&2
     echo "fail" > /tmp/github-auth-preflight.status
   fi
 else
-  echo "[archon] WARN: No GITHUB_TOKEN or GH_TOKEN set — git push and gh CLI will fail. Workflows that author PRs (bdc-author-wo-batch, sync-workflows, engine sortie) will silently fail. See docs/operations/container-github-auth.md." >&2
+  echo "[archon] WARN: No GITHUB_TOKEN or GH_TOKEN set -- git push and gh CLI will fail. Workflows that author PRs (bdc-author-wo-batch, sync-workflows, engine sortie) will silently fail. See docs/operations/container-github-auth.md." >&2
   echo "missing" > /tmp/github-auth-preflight.status
 fi
 unset _GH_AUTH_TOKEN
@@ -128,7 +128,7 @@ $RUNNER bun run setup-auth
 # BDC fork (WO-HARNESS-PROVIDER-PROACTIVE-AUTH-REFRESH-01, Layer 5):
 # Proactively refresh Claude + Codex OAuth tokens if they're stale at boot.
 # Container may have been stopped for >12h; refresh now so the first
-# workflow/chat doesn't pay the refresh cost. Failure is best-effort — the
+# workflow/chat doesn't pay the refresh cost. Failure is best-effort -- the
 # script always exits 0 and the reactive refresh path (PR #48) catches
 # any 401 that slips through.
 $RUNNER bun run verify-auth || true

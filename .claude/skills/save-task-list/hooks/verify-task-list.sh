@@ -8,7 +8,7 @@
 INPUT=$(cat)
 TASK_LIST_ID="${CLAUDE_CODE_TASK_LIST_ID:-}"
 
-# No task list requested — nothing to do
+# No task list requested -- nothing to do
 if [ -z "$TASK_LIST_ID" ]; then
   exit 0
 fi
@@ -22,7 +22,7 @@ if [ -d "$TASK_DIR" ]; then
     "systemMessage": ("Task list " + $id + " restored (" + $count + " tasks). Use TaskList to review.")
   }'
 else
-  # Warn the user — the task list directory is missing
+  # Warn the user -- the task list directory is missing
   jq -n --arg id "$TASK_LIST_ID" --arg dir "$TASK_DIR" '{
     "systemMessage": ("Warning: Task list " + $id + " not found at " + $dir + ". It may have been cleaned up.")
   }'

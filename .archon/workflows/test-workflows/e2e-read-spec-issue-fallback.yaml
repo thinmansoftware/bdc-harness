@@ -1,4 +1,4 @@
-# E2E smoke test — read-spec 4th fallback (GitHub issue body)
+# E2E smoke test -- read-spec 4th fallback (GitHub issue body)
 # WO-HARNESS-READ-SPEC-ISSUE-BODY-FALLBACK-01
 # Tests: (1) explicit issue=N in message, (2) WO_ID title search, (3) file wins over issue.
 # No AI nodes. Pure bash. Requires gh CLI with bluedevilcollectibles/bdc-xo read access.

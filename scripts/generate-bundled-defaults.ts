@@ -31,7 +31,7 @@ const WORKFLOWS_DIR = join(REPO_ROOT, '.archon/workflows/defaults');
 // Policies are referenced by workflow YAMLs via the verbatim path used in
 // `policyFile:` (e.g. `harness/policies/agent-behavior.md`). The bundled
 // record keys MUST match that path exactly so `BUNDLED_POLICIES[workflow.policyFile]`
-// is a direct lookup in the executor's central resolver (Approach B —
+// is a direct lookup in the executor's central resolver (Approach B --
 // WO-HARNESS-POLICYFILE-NOT-ENFORCED-01).
 const POLICIES_DIR = join(REPO_ROOT, 'harness/policies');
 const POLICIES_KEY_PREFIX = 'harness/policies';
@@ -158,7 +158,7 @@ function renderFile(
 ): string {
   const header = [
     '/**',
-    ' * AUTO-GENERATED — DO NOT EDIT.',
+    ' * AUTO-GENERATED -- DO NOT EDIT.',
     ' *',
     ' * Regenerate with: bun run generate:bundled',
     ' * Verify up-to-date:  bun run check:bundled',
@@ -209,7 +209,7 @@ async function main(): Promise<void> {
     let existing = '';
     try {
       const raw = await readFile(OUTPUT_PATH, 'utf-8');
-      // Same LF normalization as collectFiles — the .ts itself may be
+      // Same LF normalization as collectFiles -- the .ts itself may be
       // checked out with CRLF line endings on Windows.
       existing = raw.replace(/\r\n/g, '\n');
     } catch (e) {

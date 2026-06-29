@@ -9,7 +9,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # ─── Tier 1: Deterministic (no API keys needed) ────────────────────────
+  # --- Tier 1: Deterministic (no API keys needed) ------------------------
   e2e-deterministic:
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -30,7 +30,7 @@ jobs:
       - name: Run deterministic workflow
         run: bun run cli workflow run e2e-deterministic --no-worktree "smoke test"
 
-  # ─── Tier 2a: Claude provider ──────────────────────────────────────────
+  # --- Tier 2a: Claude provider ------------------------------------------
   e2e-claude:
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -60,7 +60,7 @@ jobs:
           export CLAUDE_BIN_PATH="$HOME/.local/bin/claude"
           bun run cli workflow run e2e-claude-smoke --no-worktree "smoke test"
 
-  # ─── Tier 2b: Codex provider ───────────────────────────────────────────
+  # --- Tier 2b: Codex provider -------------------------------------------
   e2e-codex:
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -89,7 +89,7 @@ jobs:
           CODEX_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: bun run cli workflow run e2e-codex-smoke --no-worktree "smoke test"
 
-  # ─── Tier 3: Mixed providers ───────────────────────────────────────────
+  # --- Tier 3: Mixed providers -------------------------------------------
   e2e-mixed:
     runs-on: ubuntu-latest
     timeout-minutes: 5

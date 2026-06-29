@@ -96,7 +96,7 @@ nodes:
       - Files to create (full paths)
       - Files to modify (full paths)
       - Files explicitly out of scope
-      - Section-by-section build order matching the §5 component tree
+      - Section-by-section build order matching the Section 5 component tree
       - Token mapping for every color used (cite tokens.css registry)
       - Verification commands
       - Commit message
@@ -105,14 +105,14 @@ nodes:
       ## Spec
       $read-spec.output
 
-  # 5. Ingest CD source — copy from Downloads into repo working tree as design reference
+  # 5. Ingest CD source -- copy from Downloads into repo working tree as design reference
   - id: ingest-cd-source
     depends_on: [plan]
     bash: |
       set -euo pipefail
       mkdir -p design/home/v5-source
-      # CD source ships from author's Downloads — Archon container does NOT have access to /Users/pcmed/Downloads.
-      # Spec §11.1 requires the design/home/v5-source/index.html to be CREATED by builder from the CD chunk text in $read-spec.output.
+      # CD source ships from author's Downloads -- Archon container does NOT have access to /Users/pcmed/Downloads.
+      # Spec Section 11.1 requires the design/home/v5-source/index.html to be CREATED by builder from the CD chunk text in $read-spec.output.
       # This node creates the directory + a stub readme; the actual HTML is built by the next node (build).
       cat > design/home/v5-source/README.md <<'EOF'
       # Home v5 source (CD-driven)
@@ -121,12 +121,12 @@ nodes:
       EOF
       echo "design/home/v5-source/ scaffolded"
 
-  # 6. Rule 10 pre-pass — pre-check tokens.css registry exists
+  # 6. Rule 10 pre-pass -- pre-check tokens.css registry exists
   - id: rule10-pass
     depends_on: [ingest-cd-source]
     bash: |
       set -euo pipefail
-      test -f app/styles/tokens.css || { echo "BLOCKER: app/styles/tokens.css missing — Rule 10 cannot proceed" >&2; exit 1; }
+      test -f app/styles/tokens.css || { echo "BLOCKER: app/styles/tokens.css missing -- Rule 10 cannot proceed" >&2; exit 1; }
       echo "tokens.css present:"
       grep -E '^\s*--bdc-' app/styles/tokens.css | head -20
 
@@ -145,12 +145,12 @@ nodes:
         $plan.output
 
         ## Hard Rules
-        - Component tree (spec §5) is canonical. Build top-to-bottom.
+        - Component tree (spec Section 5) is canonical. Build top-to-bottom.
         - Rule 10: ZERO raw hex / rgba in app/styles/home.css. Use tokens only. Cover-art palette block is the ONLY exception, wrapped in `/* RULE 10 EXCEPTION */ ... /* END RULE 10 EXCEPTION */`.
-        - Every clickable element MUST have `data-testid="..."` per spec §11.4 table.
-        - Replace the Coming Soon placeholder in `app/shops/[slug]/page.tsx` — do NOT leave it.
+        - Every clickable element MUST have `data-testid="..."` per spec Section 11.4 table.
+        - Replace the Coming Soon placeholder in `app/shops/[slug]/page.tsx` -- do NOT leave it.
         - Inherit Theme Shell v4 chrome (Header, Ticker, Footer, CookieBanner, ToastStack). Do NOT redesign chrome.
-        - CD source path: `Downloads/CD-PROMPT-chunk-2-homepage-guest.md` (full text inside $read-spec.output via spec §2).
+        - CD source path: `Downloads/CD-PROMPT-chunk-2-homepage-guest.md` (full text inside $read-spec.output via spec Section 2).
         - Use BDC component library where available (consult BDC-Component-Library skill).
         - Do NOT reformat unrelated files. Surgical changes only.
 
@@ -177,24 +177,24 @@ nodes:
       echo "home.css raw hex count: $RAW_HEX"
       echo "home.css raw rgba count: $RAW_RGBA"
       if [ "$RAW_HEX" != "0" ]; then
-        echo "FAIL: $RAW_HEX raw hex in home.css — Rule 10 violation" >&2
+        echo "FAIL: $RAW_HEX raw hex in home.css -- Rule 10 violation" >&2
         grep -nE '#[0-9A-Fa-f]{3,8}\b' app/styles/home.css || true
         exit 1
       fi
       if [ "$RAW_RGBA" != "0" ]; then
-        echo "FAIL: $RAW_RGBA raw rgba in home.css — Rule 10 violation" >&2
+        echo "FAIL: $RAW_RGBA raw rgba in home.css -- Rule 10 violation" >&2
         grep -nE 'rgba?\(' app/styles/home.css || true
         exit 1
       fi
       # Also check page.tsx for inline style hex
       INLINE_HEX=$(grep -cE "style=\{\{[^}]*#[0-9A-Fa-f]" app/shops/\[slug\]/page.tsx || echo 0)
       if [ "$INLINE_HEX" != "0" ]; then
-        echo "FAIL: inline style hex in page.tsx — Rule 10 violation" >&2
+        echo "FAIL: inline style hex in page.tsx -- Rule 10 violation" >&2
         exit 1
       fi
       # Also check Coming Soon placeholder is GONE
       if grep -q 'Coming Soon' app/shops/\[slug\]/page.tsx; then
-        echo "FAIL: 'Coming Soon' still present — placeholder not replaced" >&2
+        echo "FAIL: 'Coming Soon' still present -- placeholder not replaced" >&2
         exit 1
       fi
       echo "Rule 10 gate: PASS"
@@ -216,16 +216,16 @@ nodes:
     depends_on: [verify-build, verify-rule10-grep]
     bash: |
       set -euo pipefail
-      test -f tests/playwright/home.spec.ts || { echo "FAIL: tests/playwright/home.spec.ts missing — spec §11.4 not satisfied" >&2; exit 1; }
+      test -f tests/playwright/home.spec.ts || { echo "FAIL: tests/playwright/home.spec.ts missing -- spec Section 11.4 not satisfied" >&2; exit 1; }
       # Assert the suite contains real click+URL assertions, not just toBeVisible
       CLICK_COUNT=$(grep -cE '\.click\(' tests/playwright/home.spec.ts || echo 0)
       URL_ASSERT_COUNT=$(grep -cE 'toHaveURL|toContain.*url' tests/playwright/home.spec.ts || echo 0)
       if [ "$CLICK_COUNT" -lt 8 ]; then
-        echo "FAIL: only $CLICK_COUNT click() calls in home.spec.ts — spec §11.4 needs 10" >&2
+        echo "FAIL: only $CLICK_COUNT click() calls in home.spec.ts -- spec Section 11.4 needs 10" >&2
         exit 1
       fi
       if [ "$URL_ASSERT_COUNT" -lt 6 ]; then
-        echo "FAIL: only $URL_ASSERT_COUNT URL assertions — spec §11.4 needs navigation proofs" >&2
+        echo "FAIL: only $URL_ASSERT_COUNT URL assertions -- spec Section 11.4 needs navigation proofs" >&2
         exit 1
       fi
       # Run the suite against Vercel preview if available, else local dev
@@ -248,13 +248,13 @@ nodes:
 
       ## Required Output
       Return either:
-      - satisfied: with file/line evidence that all 9 stop conditions in spec §11 are met
+      - satisfied: with file/line evidence that all 9 stop conditions in spec Section 11 are met
       - needs_revision: with exact path/line findings
 
       Pay special attention to:
-      - §11.2: Coming Soon REPLACED, headline present
-      - §11.4: every clickable in the table has both click() AND a URL/state assertion
-      - §11.5: ticker shows REAL FOC items (not 'placeholder', 'loading', 'TBD')
+      - Section 11.2: Coming Soon REPLACED, headline present
+      - Section 11.4: every clickable in the table has both click() AND a URL/state assertion
+      - Section 11.5: ticker shows REAL FOC items (not 'placeholder', 'loading', 'TBD')
 
   # 13. Decide push target (Rule 20: PR base = staging)
   - id: decide-push-target
@@ -300,7 +300,7 @@ nodes:
       $CHANGED_FILES
       EOF
       git diff --cached --quiet && { echo "Nothing staged" >&2; exit 1; }
-      git commit -m "feat(storefront): WO-STOREFRONT-HOME-V5-INTAKE-01 — rebuild Home from CD source, Rule 10 at intake"
+      git commit -m "feat(storefront): WO-STOREFRONT-HOME-V5-INTAKE-01 -- rebuild Home from CD source, Rule 10 at intake"
       git push -u origin "$BRANCH"
 
   # 15. Open PR against staging
@@ -329,7 +329,7 @@ nodes:
         echo "## Validator"
         echo "$war-council-validator.output"
       } > "$BODY_FILE"
-      gh pr create --base staging --title "feat(storefront): WO-STOREFRONT-HOME-V5-INTAKE-01 — Home v5 from CD source (Rule 10 at intake)" --body-file "$BODY_FILE"
+      gh pr create --base staging --title "feat(storefront): WO-STOREFRONT-HOME-V5-INTAKE-01 -- Home v5 from CD source (Rule 10 at intake)" --body-file "$BODY_FILE"
 
   # 16. Build Captain CI manifest
   - id: build-manifest
@@ -347,7 +347,7 @@ nodes:
       Playwright: $playwright-click-verify.output
       Validator: $war-council-validator.output
 
-      ## Required Manifest Fields (per spec §12)
+      ## Required Manifest Fields (per spec Section 12)
       - WO ID
       - Files created (full paths)
       - Files modified (full paths)
@@ -371,7 +371,7 @@ nodes:
         -H "Content-Type: application/json" \
         -d "{\"action\":\"completed\",\"wo_id\":\"${WO_ID}\",\"builder\":\"Major Build\",\"detail\":${DETAIL}}"
 
-  # 18. Flip Notion to REVIEW (manifest into Notes field, NOT comments — per Rule 7 + feedback memory)
+  # 18. Flip Notion to REVIEW (manifest into Notes field, NOT comments -- per Rule 7 + feedback memory)
   - id: flip-notion
     depends_on: [post-completed]
     task_class: clerical

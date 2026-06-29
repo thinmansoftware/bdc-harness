@@ -8,7 +8,7 @@
 INPUT=$(cat)
 COMMAND=$(echo "$INPUT" | jq -r '.tool_input.command // empty')
 
-# No command found — not a Bash tool call, allow
+# No command found -- not a Bash tool call, allow
 if [ -z "$COMMAND" ]; then
   exit 0
 fi

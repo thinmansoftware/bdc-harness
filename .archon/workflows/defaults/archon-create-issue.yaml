@@ -12,9 +12,9 @@ description: |
   Instead, it reports what was tried and suggests next steps to the user.
 
 nodes:
-  # ═══════════════════════════════════════════════════════════════
-  # PHASE 1: CLASSIFY — Haiku classification of user's problem
-  # ═══════════════════════════════════════════════════════════════
+  # ---------------------------------------------------------------
+  # PHASE 1: CLASSIFY -- Haiku classification of user's problem
+  # ---------------------------------------------------------------
 
   - id: classify
     prompt: |
@@ -71,9 +71,9 @@ nodes:
           enum: ["true", "false"]
       required: [type, area, title, keywords, repro_hint, needs_server]
 
-  # ═══════════════════════════════════════════════════════════════
+  # ---------------------------------------------------------------
   # PHASE 2: PARALLEL CONTEXT GATHERING
-  # ═══════════════════════════════════════════════════════════════
+  # ---------------------------------------------------------------
 
   - id: fetch-template
     bash: |
@@ -103,7 +103,7 @@ nodes:
       done
 
       if [ "$TEMPLATES_FOUND" -eq 0 ]; then
-        echo "No issue templates found — will use standard format"
+        echo "No issue templates found -- will use standard format"
       fi
     depends_on: [classify]
 
@@ -140,9 +140,9 @@ nodes:
       gh issue list --search "$KEYWORDS" --state closed --limit 3 --json number,title,url,labels 2>/dev/null || echo "No closed matches"
     depends_on: [classify]
 
-  # ═══════════════════════════════════════════════════════════════
-  # PHASE 3: INVESTIGATE — Search codebase for related code
-  # ═══════════════════════════════════════════════════════════════
+  # ---------------------------------------------------------------
+  # PHASE 3: INVESTIGATE -- Search codebase for related code
+  # ---------------------------------------------------------------
 
   - id: investigate
     prompt: |
@@ -168,7 +168,7 @@ nodes:
          - database: `packages/core/src/db/`
          - adapters: `packages/adapters/src/`
          - core: `packages/core/src/orchestrator/`, `packages/core/src/handlers/`
-         - other: search broadly based on keywords — check `packages/*/src/`, config files, build scripts
+         - other: search broadly based on keywords -- check `packages/*/src/`, config files, build scripts
 
       2. Find: entry points, error handling paths, related type definitions, recent changes
          to the affected area (check git log for the specific files).
@@ -177,7 +177,7 @@ nodes:
          ```
          # Codebase Investigation
          ## Relevant Files
-         - `file:line` — description of what's there
+         - `file:line` -- description of what's there
          ## Error Handling
          - How errors are currently handled in this area
          ## Recent Changes
@@ -190,9 +190,9 @@ nodes:
     depends_on: [classify, git-context]
     context: fresh
 
-  # ═══════════════════════════════════════════════════════════════
-  # PHASE 4: REPRODUCE — Area-specific issue reproduction
-  # ═══════════════════════════════════════════════════════════════
+  # ---------------------------------------------------------------
+  # PHASE 4: REPRODUCE -- Area-specific issue reproduction
+  # ---------------------------------------------------------------
 
   - id: start-server
     bash: |
@@ -215,7 +215,7 @@ nodes:
       done
 
       echo "WARNING: Server may not be fully ready after 30s (port $PORT, PID $SERVER_PID)"
-      echo "Continuing anyway — reproduce node will handle connection errors"
+      echo "Continuing anyway -- reproduce node will handle connection errors"
     depends_on: [classify]
     when: "$classify.output.needs_server == 'true'"
     timeout: 45000
@@ -316,7 +316,7 @@ nodes:
       6. Check server logs: `cat "$ARTIFACTS_DIR/.server-log" | tail -50`
 
       ### other
-      1. Run `bun run validate` to check for any obvious failures — capture output:
+      1. Run `bun run validate` to check for any obvious failures -- capture output:
          `bun run validate > "$ARTIFACTS_DIR/repro-validate.txt" 2>&1; echo "EXIT_CODE: $?" >> "$ARTIFACTS_DIR/repro-validate.txt"`
       2. Search the codebase for keywords from the repro_hint:
          - Use Grep/Glob to find related files
@@ -347,12 +347,12 @@ nodes:
       [what should happen]
 
       ## Actual Behavior
-      [what actually happened — or "could not trigger the reported behavior"]
+      [what actually happened -- or "could not trigger the reported behavior"]
 
       ## Evidence Files
-      - `$ARTIFACTS_DIR/repro-*.png` — screenshots (if web-ui)
-      - `$ARTIFACTS_DIR/repro-*.txt` — command output
-      - `$ARTIFACTS_DIR/repro-*.json` — structured data
+      - `$ARTIFACTS_DIR/repro-*.png` -- screenshots (if web-ui)
+      - `$ARTIFACTS_DIR/repro-*.txt` -- command output
+      - `$ARTIFACTS_DIR/repro-*.json` -- structured data
 
       ## Environment
       [OS, versions, relevant config]
@@ -388,9 +388,9 @@ nodes:
           type: string
       required: [status, reproduced, summary]
 
-  # ═══════════════════════════════════════════════════════════════
+  # ---------------------------------------------------------------
   # PHASE 5: CLEANUP + GATE
-  # ═══════════════════════════════════════════════════════════════
+  # ---------------------------------------------------------------
 
   - id: cleanup-server
     bash: |
@@ -398,7 +398,7 @@ nodes:
       SERVER_PORT=$(cat "$ARTIFACTS_DIR/.server-port" 2>/dev/null | tr -d '\n')
 
       if [ -z "$SERVER_PID" ]; then
-        echo "No server was started — skipping cleanup"
+        echo "No server was started -- skipping cleanup"
         exit 0
       fi
 
@@ -438,9 +438,9 @@ nodes:
     depends_on: [cleanup-server]
     trigger_rule: all_done
 
-  # ═══════════════════════════════════════════════════════════════
+  # ---------------------------------------------------------------
   # PHASE 6: BRANCH ON REPRODUCTION RESULT
-  # ═══════════════════════════════════════════════════════════════
+  # ---------------------------------------------------------------
 
   - id: report-failure
     prompt: |
@@ -465,8 +465,8 @@ nodes:
       1. **State upfront**: "Could not reproduce the reported issue. No GitHub issue was created."
 
       2. **Summarize what was tried**: List the specific steps the reproduce node took,
-         based on the area playbook. Be concrete — "Started server on port X, navigated to Y,
-         clicked Z — no error appeared."
+         based on the area playbook. Be concrete -- "Started server on port X, navigated to Y,
+         clicked Z -- no error appeared."
 
       3. **Share what was found**: Include relevant findings from the investigation
          (code references, recent changes, suspected areas).
@@ -542,7 +542,7 @@ nodes:
          [Key file:line references from investigation]
 
          ## Additional Context
-         [Screenshots, logs, database state — reference artifact files]
+         [Screenshots, logs, database state -- reference artifact files]
          ```
 
       4. **Include reproduction evidence**:
@@ -562,9 +562,9 @@ nodes:
     when: "$check-reproduction.output != 'NOT_REPRODUCED'"
     context: fresh
 
-  # ═══════════════════════════════════════════════════════════════
+  # ---------------------------------------------------------------
   # PHASE 7: CREATE ISSUE
-  # ═══════════════════════════════════════════════════════════════
+  # ---------------------------------------------------------------
 
   - id: create-issue
     prompt: |

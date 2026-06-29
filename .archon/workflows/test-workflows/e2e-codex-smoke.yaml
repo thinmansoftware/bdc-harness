@@ -1,4 +1,4 @@
-# E2E smoke test — Codex provider
+# E2E smoke test -- Codex provider
 # Verifies: provider selection, sendQuery, structured output
 name: e2e-codex-smoke
 description: "E2E smoke test for Codex provider. Runs a simple prompt + structured output node."

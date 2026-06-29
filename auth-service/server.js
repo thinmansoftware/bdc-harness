@@ -4,7 +4,7 @@ const http = require('node:http');
 const { createHmac, timingSafeEqual } = require('node:crypto');
 const bcrypt = require('bcryptjs');
 
-// ── Configuration ─────────────────────────────────────────────────────────────
+// -- Configuration -------------------------------------------------------------
 // AUTH_PORT is set by docker-compose from AUTH_SERVICE_PORT in .env (default: 9000)
 const PORT = parseInt(process.env.AUTH_PORT ?? '9000', 10);
 const USERNAME = process.env.AUTH_USERNAME ?? '';
@@ -31,7 +31,7 @@ try {
   process.exit(1);
 }
 
-// ── Cookie helpers ─────────────────────────────────────────────────────────────
+// -- Cookie helpers -------------------------------------------------------------
 function signCookie(value) {
   const sig = createHmac('sha256', COOKIE_SECRET).update(value).digest('base64url');
   return `${value}.${sig}`;
@@ -60,11 +60,11 @@ function parseCookies(header) {
 }
 
 function isSafeRedirect(rd) {
-  // Only allow relative paths — block open redirects (https://, //host, backslash tricks)
+  // Only allow relative paths -- block open redirects (https://, //host, backslash tricks)
   return rd === '/' || (/^\/[^/\\]/.test(rd) && !rd.includes('://'));
 }
 
-// ── HTML helpers ──────────────────────────────────────────────────────────────
+// -- HTML helpers --------------------------------------------------------------
 function escapeHtml(s) {
   return s
     .replace(/&/g, '&amp;')
@@ -73,7 +73,7 @@ function escapeHtml(s) {
     .replace(/"/g, '&quot;');
 }
 
-// ── Login HTML page ───────────────────────────────────────────────────────────
+// -- Login HTML page -----------------------------------------------------------
 function loginPage(rdEncoded, error) {
   const errorHtml = error ? `<div class="error">${escapeHtml(error)}</div>` : '';
   return `<!doctype html>
@@ -81,7 +81,7 @@ function loginPage(rdEncoded, error) {
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>Sign In · Archon</title>
+  <title>Sign In - Archon</title>
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
     body { min-height: 100vh; display: flex; align-items: center; justify-content: center;
@@ -118,8 +118,8 @@ function loginPage(rdEncoded, error) {
 </html>`;
 }
 
-// ── Body reader ───────────────────────────────────────────────────────────────
-const MAX_BODY = 4096; // 4 KB — sufficient for login form; rejects oversized payloads
+// -- Body reader ---------------------------------------------------------------
+const MAX_BODY = 4096; // 4 KB -- sufficient for login form; rejects oversized payloads
 
 function readBody(req) {
   return new Promise((resolve, reject) => {
@@ -138,12 +138,12 @@ function readBody(req) {
   });
 }
 
-// ── Request handler ───────────────────────────────────────────────────────────
+// -- Request handler -----------------------------------------------------------
 const server = http.createServer(async (req, res) => {
   try {
     const url = new URL(req.url, 'http://localhost');
 
-    // GET /verify — Caddy forward_auth calls this for every protected request
+    // GET /verify -- Caddy forward_auth calls this for every protected request
     if (req.method === 'GET' && url.pathname === '/verify') {
       const cookies = parseCookies(req.headers['cookie']);
       const session = verifyCookie(cookies[COOKIE_NAME] ?? '');
@@ -157,14 +157,14 @@ const server = http.createServer(async (req, res) => {
       return res.end();
     }
 
-    // GET /login — serve the styled login form
+    // GET /login -- serve the styled login form
     if (req.method === 'GET' && url.pathname === '/login') {
       const rd = url.searchParams.get('rd') ?? '/';
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
       return res.end(loginPage(encodeURIComponent(rd), null));
     }
 
-    // POST /login — validate credentials, issue session cookie
+    // POST /login -- validate credentials, issue session cookie
     if (req.method === 'POST' && url.pathname === '/login') {
       const body = await readBody(req);
       const params = new URLSearchParams(body);
@@ -189,7 +189,7 @@ const server = http.createServer(async (req, res) => {
       return res.end();
     }
 
-    // GET /logout — clear the session cookie
+    // GET /logout -- clear the session cookie
     if (url.pathname === '/logout') {
       res.writeHead(302, {
         Location: '/login',
