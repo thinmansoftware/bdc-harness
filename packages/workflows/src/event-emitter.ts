@@ -86,6 +86,25 @@ interface NodeStartedEvent {
   nodeName: string; // command name or node.id for inline prompts
 }
 
+/**
+ * WO-HARNESS-LAYER1-CLIMB-AND-GATE-EVENTS-01: structured gate result attached to
+ * node_completed / node_failed events. Lets the UI cascade-trace surface and the
+ * Phase 5 cost-cascade engine read gate outcomes as data rather than parsing
+ * error text.
+ *
+ * `gate`   - which gate ran (tests / validator / manifest / ci).
+ * `outcome` - pass|fail (a node that did not run a gate omits this field
+ *             entirely; presence of `gate_result` implies the gate ran).
+ * `reason`  - optional free-text explanation (e.g. validator REJECT reason).
+ *
+ * Wired now; population is Phase 5 (WO-HARNESS-V1-PERRUN-CASCADE-01).
+ */
+export interface GateResult {
+  gate: 'tests' | 'validator' | 'manifest' | 'ci';
+  outcome: 'pass' | 'fail';
+  reason?: string;
+}
+
 interface NodeCompletedEvent {
   type: 'node_completed';
   runId: string;
@@ -95,6 +114,8 @@ interface NodeCompletedEvent {
   costUsd?: number;
   stopReason?: string;
   numTurns?: number;
+  /** Optional gate outcome for the node (additive Layer 1 field). */
+  gate_result?: GateResult;
 }
 
 interface NodeFailedEvent {
@@ -103,6 +124,26 @@ interface NodeFailedEvent {
   nodeId: string;
   nodeName: string;
   error: string;
+  /** Optional gate outcome for the node (additive Layer 1 field). */
+  gate_result?: GateResult;
+}
+
+/**
+ * WO-HARNESS-LAYER1-CLIMB-AND-GATE-EVENTS-01: tier-climb event emitted when a
+ * job escalates from one cost-cascade rung to the next. Distinct from
+ * `overseer_decision=escalate` (which is the salvage path). Records the
+ * from/to tier, the gate that triggered the climb, and the gate-failure
+ * reason. Emit-site is wired now; cascade engine that populates it lands in
+ * Phase 5 (WO-HARNESS-V1-PERRUN-CASCADE-01).
+ */
+interface CascadeStepEvent {
+  type: 'cascade_step';
+  runId: string;
+  nodeId: string;
+  from_tier: string;
+  to_tier: string;
+  gate: string;
+  reason: string;
 }
 
 /**
@@ -186,7 +227,8 @@ export type WorkflowEmitterEvent =
   | ToolStartedEvent
   | ToolCompletedEvent
   | ApprovalPendingEvent
-  | WorkflowCancelledEvent;
+  | WorkflowCancelledEvent
+  | CascadeStepEvent;
 
 // ---------------------------------------------------------------------------
 // Emitter class

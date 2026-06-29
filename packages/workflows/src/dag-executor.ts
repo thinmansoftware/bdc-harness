@@ -2881,6 +2881,61 @@ async function executeApprovalNode(
 }
 
 /**
+ * Emit a structured tier-climb (cascade_step) event.
+ *
+ * WO-HARNESS-LAYER1-CLIMB-AND-GATE-EVENTS-01: records the from/to tier, the
+ * gate that triggered the climb, and the gate-failure reason as STRUCTURED
+ * data on a dedicated event type -- distinct from `overseer_decision=escalate`
+ * (which is the salvage path, not a cost-cascade climb).
+ *
+ * Wired now; the cascade engine that calls this lands in Phase 5
+ * (WO-HARNESS-V1-PERRUN-CASCADE-01). No-op until then.
+ *
+ * Mirrors the node_completed store/emitter pattern: persist to
+ * workflow_events (freeform JSON `data`) and emit to the in-process
+ * WorkflowEventEmitter for SSE subscribers. Store errors are logged but never
+ * thrown so a database hiccup cannot abort a cascade decision.
+ */
+export async function emitCascadeStep(
+  deps: WorkflowDeps,
+  workflowRun: WorkflowRun,
+  nodeId: string,
+  from_tier: string,
+  to_tier: string,
+  gate: string,
+  reason: string
+): Promise<void> {
+  deps.store
+    .createWorkflowEvent({
+      workflow_run_id: workflowRun.id,
+      event_type: 'cascade_step',
+      step_name: nodeId,
+      data: {
+        from_tier,
+        to_tier,
+        gate,
+        reason,
+      },
+    })
+    .catch((err: Error) => {
+      getLog().error(
+        { err, workflowRunId: workflowRun.id, eventType: 'cascade_step' },
+        'workflow_event_persist_failed'
+      );
+    });
+
+  getWorkflowEventEmitter().emit({
+    type: 'cascade_step',
+    runId: workflowRun.id,
+    nodeId,
+    from_tier,
+    to_tier,
+    gate,
+    reason,
+  });
+}
+
+/**
  * Execute a complete DAG workflow.
  * Called from executeWorkflow() in executor.ts.
  */

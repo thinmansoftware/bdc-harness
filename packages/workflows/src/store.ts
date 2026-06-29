@@ -31,6 +31,11 @@ export const WORKFLOW_EVENT_TYPES = [
   'approval_received',
   'workflow_cancelled',
   'workflow_artifact',
+  // WO-HARNESS-LAYER1-CLIMB-AND-GATE-EVENTS-01: tier-climb event emitted when
+  // a job escalates from one cost-cascade rung to the next. Wired now; the
+  // cascade engine that populates it lands in Phase 5
+  // (WO-HARNESS-V1-PERRUN-CASCADE-01).
+  'cascade_step',
 ] as const;
 
 export type WorkflowEventType = (typeof WORKFLOW_EVENT_TYPES)[number];
