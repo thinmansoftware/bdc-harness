@@ -1,5 +1,6 @@
 ---
 name: claude-adversarial-reviewer
+model: sonnet
 # No model pin: this persona runs via `provider: claude` (diff-review,
 # diff-review-final, opus-rereview, apply-diff-review-final in the Codex lane).
 # The node supplies provider: claude + model: sonnet explicitly in the workflow
