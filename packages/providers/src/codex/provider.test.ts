@@ -1106,52 +1106,69 @@ describe('CodexProvider', () => {
       expect(errors?.[0]).not.toContain('MCP client');
     });
 
-    test('turn.failed yields result.isError with codex_turn_failed subtype', async () => {
-      mockRunStreamed.mockResolvedValue({
-        events: (async function* () {
-          yield { type: 'turn.failed', error: { message: 'Rate limit exceeded' } };
-        })(),
-      });
+    test('turn.failed throws; sendQuery propagates as rate-limit error (BDF Fix A)', async () => {
+      // WO-HARNESS-BDF-RESILIENCE-FIX-A-CODEX-THROW-01: turn.failed used to
+      // yield a result chunk with errorSubtype 'codex_turn_failed' and return
+      // (silently closing the stream and bypassing sendQuery's catch). After
+      // the fix it throws, so the existing classification + retry + failback
+      // pipeline observes the error. mockImplementation (not mockResolvedValue)
+      // returns a fresh exhausted-after-one-event generator on every retry so
+      // each of the MAX_SUBPROCESS_RETRIES attempts sees turn.failed.
+      mockRunStreamed.mockImplementation(() =>
+        Promise.resolve({
+          events: (async function* () {
+            yield { type: 'turn.failed', error: { message: 'Rate limit exceeded' } };
+          })(),
+        })
+      );
 
-      const chunks = [];
-      for await (const chunk of client.sendQuery('test', '/workspace')) {
-        chunks.push(chunk);
+      let caught: Error | undefined;
+      try {
+        for await (const _ of client.sendQuery('test', '/workspace')) {
+          // consume
+        }
+      } catch (e) {
+        caught = e as Error;
       }
 
-      expect(chunks).toHaveLength(1);
-      expect(chunks[0]).toEqual({
-        type: 'result',
-        sessionId: 'new-thread-id',
-        isError: true,
-        errorSubtype: 'codex_turn_failed',
-        errors: ['Rate limit exceeded'],
-      });
+      // Classified as rate_limit (RATE_LIMIT_PATTERNS matches 'rate limit'),
+      // retried MAX_SUBPROCESS_RETRIES times, then -- with no failback factory
+      // wired -- enrichedError surfaces to the caller.
+      expect(caught).toBeInstanceOf(Error);
+      expect(caught!.message).toMatch(/Codex rate_limit:/);
       expect(mockLogger.error).toHaveBeenCalledWith(
         { errorMessage: 'Rate limit exceeded' },
         'turn_failed'
       );
     });
 
-    test('turn.failed without error message yields fail-stop with Unknown error', async () => {
-      mockRunStreamed.mockResolvedValue({
-        events: (async function* () {
-          yield { type: 'turn.failed', error: null };
-        })(),
-      });
+    test('turn.failed with null error throws; sendQuery propagates as unknown error (BDF Fix A)', async () => {
+      // WO-HARNESS-BDF-RESILIENCE-FIX-A-CODEX-THROW-01: after the fix the
+      // null-error turn.failed branch also throws (with the default
+      // 'Unknown error' message). 'Unknown error' does not match any of
+      // RATE_LIMIT_PATTERNS / AUTH_PATTERNS / SUBPROCESS_CRASH_PATTERNS /
+      // ROLLOUT_MISSING_PATTERNS, so classifyCodexError returns 'unknown'
+      // and shouldRetry is false -- the first attempt's enrichedError is
+      // thrown immediately.
+      mockRunStreamed.mockImplementation(() =>
+        Promise.resolve({
+          events: (async function* () {
+            yield { type: 'turn.failed', error: null };
+          })(),
+        })
+      );
 
-      const chunks = [];
-      for await (const chunk of client.sendQuery('test', '/workspace')) {
-        chunks.push(chunk);
+      let caught: Error | undefined;
+      try {
+        for await (const _ of client.sendQuery('test', '/workspace')) {
+          // consume
+        }
+      } catch (e) {
+        caught = e as Error;
       }
 
-      expect(chunks).toHaveLength(1);
-      expect(chunks[0]).toEqual({
-        type: 'result',
-        sessionId: 'new-thread-id',
-        isError: true,
-        errorSubtype: 'codex_turn_failed',
-        errors: ['Unknown error'],
-      });
+      expect(caught).toBeInstanceOf(Error);
+      expect(caught!.message).toMatch(/Codex unknown:/);
       expect(mockLogger.error).toHaveBeenCalledWith(
         { errorMessage: 'Unknown error' },
         'turn_failed'
@@ -2044,5 +2061,172 @@ describe('WO-HARNESS-CODEX-THREAD-RESUME-AND-FAILBACK-01', () => {
     // Sanity: the failback still streamed Claude's verdict through.
     expect(chunks.some(c => c.type === 'assistant')).toBe(true);
     expect(chunks.some(c => c.type === 'result')).toBe(true);
+  }, 10_000);
+});
+
+// --- WO-HARNESS-BDF-RESILIENCE-FIX-A-CODEX-THROW-01 regression tests ------
+//
+// Anchors the Fix A invariant: when streamCodexEvents observes turn.failed
+// it must throw rather than yield-and-return, so sendQuery's catch can
+// classify the error and -- when a failback factory is wired and the class
+// is not auth -- delegate to the Claude failback. T1 proves the failback
+// fires for an 'unknown'-class usage-limit message; T2 proves the auth gate
+// still blocks failback for auth-class messages.
+describe('WO-HARNESS-BDF-RESILIENCE-FIX-A-CODEX-THROW-01', () => {
+  beforeEach(() => {
+    resetCodexSingleton();
+    MockCodex.mockClear();
+    mockStartThread.mockClear();
+    mockResumeThread.mockClear();
+    mockRunStreamed.mockClear();
+    mockLogger.info.mockClear();
+    mockLogger.warn.mockClear();
+    mockLogger.error.mockClear();
+    mockLogger.debug.mockClear();
+    mockRefreshIfAuthFailed.mockClear();
+    mockRefreshIfAuthFailed.mockResolvedValue({
+      refreshed: false,
+      reason: 'no_creds' as const,
+    });
+
+    mockStartThread.mockReturnValue(createMockThread('new-thread-id'));
+    mockResumeThread.mockReturnValue(createMockThread('resumed-thread-id'));
+  });
+
+  test('T1: turn.failed usage-limit -> throw -> failback fires, [CODEX FAILBACK] emitted, no codex_turn_failed subtype', async () => {
+    // "You've hit your usage limit" matches none of RATE_LIMIT_PATTERNS /
+    // AUTH_PATTERNS / SUBPROCESS_CRASH_PATTERNS / ROLLOUT_MISSING_PATTERNS,
+    // so classifyCodexError returns 'unknown' and shouldRetry is false.
+    // With a failback factory wired and errorClass !== 'auth', sendQuery's
+    // catch must delegate to the failback provider on the first attempt and
+    // emit the [CODEX FAILBACK] disclosure chunk.
+    mockRunStreamed.mockImplementation(() =>
+      Promise.resolve({
+        events: (async function* () {
+          yield {
+            type: 'turn.failed',
+            error: { message: "You've hit your usage limit" },
+          };
+        })(),
+      })
+    );
+
+    const failbackSendQuery = mock(async function* (
+      _p: string,
+      _c: string,
+      _r?: string,
+      _o?: unknown
+    ) {
+      yield { type: 'assistant', content: 'Claude failback handled usage-limit' } as const;
+      yield {
+        type: 'result',
+        sessionId: 'claude-failback-session',
+        tokens: { input: 100, output: 50 },
+      } as const;
+    });
+
+    const failbackProvider = {
+      sendQuery: failbackSendQuery,
+      getType: () => 'claude',
+      getCapabilities: () => ({}) as unknown as ReturnType<CodexProvider['getCapabilities']>,
+    };
+
+    const clientWithFailback = new CodexProvider({
+      retryBaseDelayMs: 1,
+      failbackProviderFactory: (() => failbackProvider) as unknown as () => typeof failbackProvider,
+    });
+
+    const chunks: { type: string; content?: string; errorSubtype?: string }[] = [];
+    for await (const chunk of clientWithFailback.sendQuery('test', '/workspace')) {
+      chunks.push(chunk as { type: string; content?: string; errorSubtype?: string });
+    }
+
+    // Disclosure chunk emitted.
+    expect(chunks.some(c => c.type === 'system' && c.content?.includes('[CODEX FAILBACK]'))).toBe(
+      true
+    );
+    // Claude's assistant chunk streamed through.
+    expect(
+      chunks.some(
+        c => c.type === 'assistant' && c.content === 'Claude failback handled usage-limit'
+      )
+    ).toBe(true);
+    // A result chunk arrived.
+    expect(chunks.some(c => c.type === 'result')).toBe(true);
+    // The old codex_turn_failed subtype MUST NOT appear anywhere -- this
+    // is the regression anchor: pre-fix the yield+return emitted a result
+    // chunk with this subtype and silently closed the stream.
+    expect(chunks.some(c => c.errorSubtype === 'codex_turn_failed')).toBe(false);
+    // Failback factory invoked exactly once.
+    expect(failbackSendQuery).toHaveBeenCalledTimes(1);
+    // Logger captured the original turn.failed.
+    expect(mockLogger.error).toHaveBeenCalledWith(
+      { errorMessage: "You've hit your usage limit" },
+      'turn_failed'
+    );
+  }, 10_000);
+
+  test('T2: turn.failed auth-class message -> throw -> failback gate blocked, error propagates', async () => {
+    // "Your credit balance is too low" matches AUTH_PATTERNS ('credit
+    // balance'), so classifyCodexError returns 'auth' and the failback
+    // gate (errorClass !== 'auth') blocks delegation. The first-attempt
+    // refresh path falls through because refreshIfAuthFailed reports
+    // refreshed=false with the non-terminal reason 'no_creds'. The
+    // enrichedError ('Codex auth error: ...') is then thrown.
+    mockRunStreamed.mockImplementation(() =>
+      Promise.resolve({
+        events: (async function* () {
+          yield {
+            type: 'turn.failed',
+            error: { message: 'Your credit balance is too low' },
+          };
+        })(),
+      })
+    );
+
+    const failbackSendQuery = mock(async function* (
+      _p: string,
+      _c: string,
+      _r?: string,
+      _o?: unknown
+    ) {
+      yield { type: 'assistant', content: 'should never run' } as const;
+    });
+
+    const failbackProvider = {
+      sendQuery: failbackSendQuery,
+      getType: () => 'claude',
+      getCapabilities: () => ({}) as unknown as ReturnType<CodexProvider['getCapabilities']>,
+    };
+
+    const clientWithFailback = new CodexProvider({
+      retryBaseDelayMs: 1,
+      failbackProviderFactory: (() => failbackProvider) as unknown as () => typeof failbackProvider,
+    });
+
+    const chunks: { type: string; content?: string }[] = [];
+    let caught: Error | undefined;
+    try {
+      for await (const chunk of clientWithFailback.sendQuery('test', '/workspace')) {
+        chunks.push(chunk as { type: string; content?: string });
+      }
+    } catch (e) {
+      caught = e as Error;
+    }
+
+    // Generator threw (failback was gated out for auth-class errors).
+    expect(caught).toBeInstanceOf(Error);
+    expect(caught!.message).toMatch(/Codex auth error:/);
+    // Failback provider must NOT have been called.
+    expect(failbackSendQuery).toHaveBeenCalledTimes(0);
+    // No [CODEX FAILBACK] disclosure may have been emitted.
+    expect(chunks.some(c => c.type === 'system' && c.content?.includes('[CODEX FAILBACK]'))).toBe(
+      false
+    );
+    // Logger captured the original turn.failed.
+    expect(mockLogger.error).toHaveBeenCalledWith(
+      { errorMessage: 'Your credit balance is too low' },
+      'turn_failed'
+    );
   }, 10_000);
 });

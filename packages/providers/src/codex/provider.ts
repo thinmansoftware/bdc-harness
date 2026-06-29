@@ -395,14 +395,18 @@ async function* streamCodexEvents(
       const errorObj = (event as { error?: { message?: string } }).error;
       const errorMessage = errorObj?.message ?? 'Unknown error';
       getLog().error({ errorMessage }, 'turn_failed');
-      yield {
-        type: 'result',
-        sessionId: threadId ?? undefined,
-        isError: true,
-        errorSubtype: 'codex_turn_failed',
-        errors: [errorMessage],
-      };
-      return;
+      // WO-HARNESS-BDF-RESILIENCE-FIX-A-CODEX-THROW-01: throw instead of
+      // yield+return. The prior yield-and-return path silently closed the
+      // stream and bypassed sendQuery's catch block, which meant the
+      // Claude failback (WO-HARNESS-CODEX-THREAD-RESUME-AND-FAILBACK-01)
+      // never fired for usage-limit / unknown-class turn.failed events.
+      // Throwing here lets the catch block in sendQuery classify the
+      // error and route through the existing retry + failback pipeline
+      // unchanged. Auth-class errors are still gated out of failback in
+      // sendQuery's catch (errorClass !== 'auth' guard), so a genuine
+      // auth failure continues to surface to the operator rather than
+      // being masked.
+      throw new Error(errorMessage);
     }
 
     if (event.type === 'item.completed') {
