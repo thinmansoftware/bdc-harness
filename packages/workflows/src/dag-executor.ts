@@ -772,6 +772,15 @@ async function executeNodeInternal(
   let nodeStopReason: string | undefined;
   let nodeNumTurns: number | undefined;
   let nodeModelUsage: Record<string, unknown> | undefined;
+  // Layer 1 served-model capture (WO-HARNESS-LAYER1-SERVED-MODEL-CAPTURE-01):
+  // requested = the model the node asked for (nodeOptions?.model, resolved
+  // from per-node + workflow + config). served = the model that actually
+  // responded, surfaced by each provider's result chunk. null = the provider
+  // SDK does not expose it (Codex); undefined = the provider has not yet
+  // declared support. served_model_mismatch is only meaningful when served
+  // is a non-null string.
+  let nodeServedModelId: string | null | undefined;
+  let nodeServedMissingReason: string | undefined;
   const batchMessages: string[] = [];
 
   // Create per-node abort controller for idle timeout cleanup
@@ -974,6 +983,13 @@ async function executeNodeInternal(
         if (msg.numTurns !== undefined) nodeNumTurns = msg.numTurns;
         if (msg.modelUsage) nodeModelUsage = msg.modelUsage;
         if (msg.structuredOutput !== undefined) structuredOutput = msg.structuredOutput;
+        // Layer 1 served-model capture (WO-HARNESS-LAYER1-SERVED-MODEL-CAPTURE-01):
+        // Forward provider-reported served-model fields. null is a valid signal
+        // (Codex SDK has no model field) so use explicit undefined checks.
+        if (msg.servedModelId !== undefined) nodeServedModelId = msg.servedModelId;
+        if (msg.servedModelMissingReason !== undefined) {
+          nodeServedMissingReason = msg.servedModelMissingReason;
+        }
         // Fail the node if the SDK reports a cost cap exceeded error
         if (msg.isError && msg.errorSubtype === 'error_max_budget_usd') {
           const cap = nodeOptions?.maxBudgetUsd;
@@ -1271,6 +1287,20 @@ async function executeNodeInternal(
           ...(nodeNumTurns !== undefined ? { num_turns: nodeNumTurns } : {}),
           ...(nodeModelUsage ? { model_usage: nodeModelUsage } : {}),
           ...(nodeTokens ? { tokens: nodeTokens } : {}),
+          // Layer 1 served-model capture (WO-HARNESS-LAYER1-SERVED-MODEL-CAPTURE-01).
+          // requested = nodeOptions?.model (effective per-node model). served =
+          // provider-reported. served_model_mismatch is only written when
+          // served is a non-null string -- a null served has no meaningful
+          // mismatch signal, so omit the flag entirely in that case to avoid
+          // false negatives in downstream readers.
+          ...(nodeOptions?.model !== undefined ? { requested_model_id: nodeOptions.model } : {}),
+          ...(nodeServedModelId !== undefined ? { served_model_id: nodeServedModelId } : {}),
+          ...(nodeServedMissingReason !== undefined
+            ? { served_model_missing_reason: nodeServedMissingReason }
+            : {}),
+          ...(typeof nodeServedModelId === 'string' && nodeOptions?.model !== undefined
+            ? { served_model_mismatch: nodeServedModelId !== nodeOptions.model }
+            : {}),
         },
       })
       .catch((err: Error) => {

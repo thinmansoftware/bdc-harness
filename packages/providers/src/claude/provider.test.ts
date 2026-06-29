@@ -1094,6 +1094,38 @@ describe('ClaudeProvider', () => {
       expect(chunks).toHaveLength(1);
       expect(chunks[0]).toEqual({ type: 'assistant', content: 'Real content' });
     });
+
+    // T2 (WO-HARNESS-LAYER1-SERVED-MODEL-CAPTURE-01): a Claude-lane node runs
+    // -> result chunk carries servedModelId captured from the SDK system/init
+    // event's `model` field. This is the integrity-signal data prerequisite
+    // for the served-vs-requested guard.
+    test('captures servedModelId from system/init event onto result chunk', async () => {
+      mockQuery.mockImplementation(async function* () {
+        yield {
+          type: 'system',
+          subtype: 'init',
+          model: 'claude-sonnet-4-6',
+          mcp_servers: [],
+        };
+        yield {
+          type: 'result',
+          session_id: 'sid-test',
+          is_error: false,
+          usage: { input_tokens: 10, output_tokens: 5 },
+        };
+      });
+
+      const chunks = [];
+      for await (const chunk of client.sendQuery('test', '/workspace')) {
+        chunks.push(chunk);
+      }
+
+      const result = chunks.find(c => c.type === 'result');
+      expect(result).toBeDefined();
+      expect(result && 'servedModelId' in result ? result.servedModelId : undefined).toBe(
+        'claude-sonnet-4-6'
+      );
+    });
   });
 });
 

@@ -168,6 +168,9 @@ describe('CodexProvider', () => {
         type: 'result',
         sessionId: 'new-thread-id',
         tokens: { input: 10, output: 5 },
+        // Layer 1 served-model capture: Codex SDK does not expose served model.
+        servedModelId: null,
+        servedModelMissingReason: 'codex_sdk_does_not_expose_served_model',
       });
     });
 
@@ -593,6 +596,9 @@ describe('CodexProvider', () => {
         type: 'result',
         sessionId: 'new-thread-id',
         tokens: { input: 10, output: 5 },
+        // Layer 1 served-model capture: Codex SDK does not expose served model.
+        servedModelId: null,
+        servedModelMissingReason: 'codex_sdk_does_not_expose_served_model',
       });
     });
 
@@ -683,6 +689,9 @@ describe('CodexProvider', () => {
         type: 'result',
         sessionId: 'fallback-thread',
         tokens: { input: 10, output: 5 },
+        // Layer 1 served-model capture: Codex SDK does not expose served model.
+        servedModelId: null,
+        servedModelMissingReason: 'codex_sdk_does_not_expose_served_model',
       });
     });
 
@@ -1022,6 +1031,9 @@ describe('CodexProvider', () => {
         type: 'result',
         sessionId: 'new-thread-id',
         tokens: { input: 10, output: 5 },
+        // Layer 1 served-model capture: Codex SDK does not expose served model.
+        servedModelId: null,
+        servedModelMissingReason: 'codex_sdk_does_not_expose_served_model',
       });
       expect(mockLogger.error).toHaveBeenCalledWith({ message: 'Transient blip' }, 'stream_error');
     });
@@ -1072,6 +1084,9 @@ describe('CodexProvider', () => {
         type: 'result',
         sessionId: 'new-thread-id',
         tokens: { input: 10, output: 5 },
+        // Layer 1 served-model capture: Codex SDK does not expose served model.
+        servedModelId: null,
+        servedModelMissingReason: 'codex_sdk_does_not_expose_served_model',
       });
       // Logged but not surfaced as failure
       expect(mockLogger.error).toHaveBeenCalledWith(
@@ -1271,6 +1286,9 @@ describe('CodexProvider', () => {
         type: 'result',
         sessionId: 'new-thread-id',
         tokens: { input: 10, output: 5 },
+        // Layer 1 served-model capture: Codex SDK does not expose served model.
+        servedModelId: null,
+        servedModelMissingReason: 'codex_sdk_does_not_expose_served_model',
       });
     });
 
@@ -2045,4 +2063,45 @@ describe('WO-HARNESS-CODEX-THREAD-RESUME-AND-FAILBACK-01', () => {
     expect(chunks.some(c => c.type === 'assistant')).toBe(true);
     expect(chunks.some(c => c.type === 'result')).toBe(true);
   }, 10_000);
+});
+
+// T3 (WO-HARNESS-LAYER1-SERVED-MODEL-CAPTURE-01): the spec asks for a Codex
+// served-model assertion, but @openai/codex-sdk@0.125.0 does NOT expose a
+// served-model field on TurnCompletedEvent, Thread, ThreadOptions, or
+// TurnOptions. Per the spec's T5 clause ("a provider that does not expose
+// served model -> served_model_id=null with a recorded reason"), Codex emits
+// an explicit null + reason. This test asserts that contract -- no
+// fabricated value, no crash, machine-readable reason for downstream.
+describe('CodexProvider served-model capture (T3 redirected to T5 -- SDK limitation)', () => {
+  let client: CodexProvider;
+
+  beforeEach(() => {
+    resetCodexSingleton();
+    client = new CodexProvider({ retryBaseDelayMs: 1 });
+    mockRunStreamed.mockClear();
+    mockStartThread.mockClear();
+    mockStartThread.mockReturnValue(createMockThread('new-thread-id'));
+  });
+
+  test('emits servedModelId=null with codex_sdk_does_not_expose_served_model reason', async () => {
+    mockRunStreamed.mockResolvedValue({
+      events: (async function* () {
+        yield { type: 'turn.completed', usage: defaultUsage };
+      })(),
+    });
+
+    const chunks = [];
+    for await (const chunk of client.sendQuery('test', '/workspace')) {
+      chunks.push(chunk);
+    }
+
+    const result = chunks.find(c => c.type === 'result');
+    expect(result).toBeDefined();
+    // servedModelId is explicitly null -- the provider could not tell us.
+    expect(result && 'servedModelId' in result ? result.servedModelId : 'absent').toBeNull();
+    // Reason string is machine-readable so downstream consumers can branch on it.
+    expect(
+      result && 'servedModelMissingReason' in result ? result.servedModelMissingReason : undefined
+    ).toBe('codex_sdk_does_not_expose_served_model');
+  });
 });

@@ -591,11 +591,18 @@ async function* streamCodexEvents(
         }
       }
 
+      // Layer 1 served-model capture (WO-HARNESS-LAYER1-SERVED-MODEL-CAPTURE-01):
+      // TurnCompletedEvent in @openai/codex-sdk@0.125.0 carries no `model`
+      // field, and neither do Thread/ThreadOptions/TurnOptions. Emit explicit
+      // null + machine-readable reason so the dag-executor can persist
+      // "provider could not tell us" without fabricating a value.
       yield {
         type: 'result',
         sessionId: threadId ?? undefined,
         tokens: usage,
         ...(structuredOutput !== undefined ? { structuredOutput } : {}),
+        servedModelId: null,
+        servedModelMissingReason: 'codex_sdk_does_not_expose_served_model',
       };
       return;
     }
