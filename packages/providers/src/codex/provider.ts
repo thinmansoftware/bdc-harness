@@ -395,14 +395,7 @@ async function* streamCodexEvents(
       const errorObj = (event as { error?: { message?: string } }).error;
       const errorMessage = errorObj?.message ?? 'Unknown error';
       getLog().error({ errorMessage }, 'turn_failed');
-      yield {
-        type: 'result',
-        sessionId: threadId ?? undefined,
-        isError: true,
-        errorSubtype: 'codex_turn_failed',
-        errors: [errorMessage],
-      };
-      return;
+      throw new Error(errorMessage);
     }
 
     if (event.type === 'item.completed') {
