@@ -170,6 +170,24 @@ interface WorkflowCancelledEvent {
   reason: string;
 }
 
+/**
+ * Layer 1 cascade-step event (WO-HARNESS-LAYER1-CLIMB-AND-GATE-EVENTS-01).
+ * Emitted when a job escalates from one tier to another because a gate failed.
+ * Distinct from `node_failed` with overseer_decision=escalate (the salvage path);
+ * this is a planned tier promotion, recording from_tier/to_tier/gate/reason as
+ * structured data. The emit site is wired in cascade-events.ts; the cascade engine
+ * that triggers it lands in Phase 5 (WO-HARNESS-V1-PERRUN-CASCADE-01).
+ */
+interface CascadeStepEvent {
+  type: 'cascade_step';
+  runId: string;
+  nodeId: string;
+  from_tier: string;
+  to_tier: string;
+  gate: string;
+  reason: string;
+}
+
 export type WorkflowEmitterEvent =
   | WorkflowStartedEvent
   | WorkflowCompletedEvent
@@ -186,7 +204,8 @@ export type WorkflowEmitterEvent =
   | ToolStartedEvent
   | ToolCompletedEvent
   | ApprovalPendingEvent
-  | WorkflowCancelledEvent;
+  | WorkflowCancelledEvent
+  | CascadeStepEvent;
 
 // ---------------------------------------------------------------------------
 // Emitter class

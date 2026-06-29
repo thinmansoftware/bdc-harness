@@ -54,6 +54,12 @@ import { createLogger } from '@archon/paths';
 import { getWorkflowEventEmitter } from './event-emitter';
 import { detectSilentFailure } from './silent-failure-detector';
 import { handleNodeFailure } from './overseer-bridge';
+// Layer 1 cascade gate result type (WO-HARNESS-LAYER1-CLIMB-AND-GATE-EVENTS-01).
+// Phase 5 (WO-HARNESS-V1-PERRUN-CASCADE-01) populates `nodeGateResult` before
+// node_completed / node_failed is emitted; Phase 3 leaves it undefined (no-op).
+// The cascade_step event itself is emitted via emitCascadeStep in
+// cascade-events.ts; this executor only spreads the GateResult field.
+import type { GateResult } from './cascade-events';
 import { evaluateCondition } from './condition-evaluator';
 import {
   logNodeStart,
@@ -786,6 +792,12 @@ async function executeNodeInternal(
   // is a non-null string.
   let nodeServedModelId: string | null | undefined;
   let nodeServedMissingReason: string | undefined;
+  // Layer 1 cascade gate result placeholder
+  // (WO-HARNESS-LAYER1-CLIMB-AND-GATE-EVENTS-01). Phase 5
+  // (WO-HARNESS-V1-PERRUN-CASCADE-01) sets this to a real GateResult before
+  // node_completed / node_failed is written. In Phase 3 it stays undefined,
+  // so the spread below is a no-op and existing event shapes are unchanged.
+  const nodeGateResult: GateResult | undefined = undefined;
   const batchMessages: string[] = [];
 
   // Create per-node abort controller for idle timeout cleanup
@@ -1313,6 +1325,10 @@ async function executeNodeInternal(
           // the frontier rung instead of where it actually ran. Omit-when-absent for tokens.
           entry_rung: deriveEntryRung(provider, nodeOptions?.model),
           ...(nodeTokens ? { frontier_cost_usd: computeFrontierCost(nodeTokens) } : {}),
+          // Layer 1 gate result (WO-HARNESS-LAYER1-CLIMB-AND-GATE-EVENTS-01).
+          // Spread only when defined. Phase 5 sets nodeGateResult; Phase 3
+          // leaves it undefined, so existing node_completed shape is unchanged.
+          ...(nodeGateResult ? { gate_result: nodeGateResult } : {}),
         },
       })
       .catch((err: Error) => {
@@ -1380,6 +1396,10 @@ async function executeNodeInternal(
         data: {
           error: err.message,
           ...(nodeTokens ? { tokens: nodeTokens } : {}),
+          // Layer 1 gate result (WO-HARNESS-LAYER1-CLIMB-AND-GATE-EVENTS-01).
+          // Spread only when defined. Phase 5 sets nodeGateResult; Phase 3
+          // leaves it undefined, so existing node_failed shape is unchanged.
+          ...(nodeGateResult ? { gate_result: nodeGateResult } : {}),
         },
       })
       .catch((err: Error) => {

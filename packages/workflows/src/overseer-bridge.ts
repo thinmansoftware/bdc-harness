@@ -26,6 +26,7 @@ import type { WorkflowRun, NodeOutput } from './schemas/workflow-run.ts';
 import type { DagNode } from './schemas/dag-node.ts';
 import type { WorkflowEmitterEvent } from './event-emitter.ts';
 import type { IWorkflowStore } from './store.ts';
+import type { GateResult } from './cascade-events.ts';
 
 export interface HandleNodeFailureDeps {
   store: IWorkflowStore;
@@ -58,6 +59,16 @@ export interface HandleNodeFailureContext {
   statusCode?: number;
   /** Optional extra data fields to attach to the persisted node_failed event */
   extraEventData?: Record<string, unknown>;
+  /**
+   * Structured gate evaluation result (WO-HARNESS-LAYER1-CLIMB-AND-GATE-EVENTS-01).
+   * Populated by the Phase 5 cascade engine (WO-HARNESS-V1-PERRUN-CASCADE-01) when
+   * a gate (tests/validator/manifest/ci) triggered this failure. Undefined in
+   * Phase 3: the field is wired through to the node_failed event payload now so
+   * downstream WOs can rely on the schema. When present, the gate name, outcome,
+   * and reason are persisted as a structured `gate_result` field on node_failed
+   * instead of being parsed out of error text.
+   */
+  gate_result?: GateResult;
   /**
    * Optional war-council-validator stdout captured from a sibling node output map.
    * Forwarded to classify/decide so the silent-dead-end classes can detect
@@ -146,6 +157,11 @@ export async function handleNodeFailure(
         error: ctx.errorMsg,
         overseer_class: errorClass,
         overseer_decision: result.decision,
+        // Layer 1 gate result (WO-HARNESS-LAYER1-CLIMB-AND-GATE-EVENTS-01).
+        // Spread only when defined so existing readers that key off
+        // overseer_class / overseer_decision / error are unaffected (backward
+        // compatibility for T4).
+        ...(ctx.gate_result ? { gate_result: ctx.gate_result } : {}),
         ...(ctx.extraEventData ?? {}),
       },
     })

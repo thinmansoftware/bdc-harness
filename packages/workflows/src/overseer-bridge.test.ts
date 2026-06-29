@@ -251,3 +251,66 @@ describe('handleNodeFailure — side effects', () => {
     expect(result.output.output).toBe('partial response so far');
   });
 });
+
+describe('handleNodeFailure -- gate_result field (WO-HARNESS-LAYER1-CLIMB-AND-GATE-EVENTS-01)', () => {
+  it('T2: gate_result fail is persisted on the node_failed event', async () => {
+    const deps = makeDeps();
+    await handleNodeFailure(deps, makeWorkflowRun(), makeNode('node-gate-fail'), {
+      ...baseCtx,
+      errorMsg: 'coverage gate failed: 64% < 80%',
+      gate_result: {
+        gate: 'tests',
+        outcome: 'fail',
+        reason: 'coverage below 80%',
+      },
+    });
+
+    const createEvent = deps.store.createWorkflowEvent as unknown as {
+      mock: { calls: unknown[][] };
+    };
+    expect(createEvent.mock.calls.length).toBe(1);
+    const payload = createEvent.mock.calls[0][0] as {
+      event_type: string;
+      data: Record<string, unknown>;
+    };
+    expect(payload.event_type).toBe('node_failed');
+
+    // The new structured gate_result field is present and well-formed.
+    expect(payload.data.gate_result).toBeDefined();
+    const gr = payload.data.gate_result as { gate: string; outcome: string; reason: string };
+    expect(gr.gate).toBe('tests');
+    expect(gr.outcome).toBe('fail');
+    expect(gr.reason).toBe('coverage below 80%');
+
+    // Backward compat: existing overseer fields are still present alongside.
+    expect(payload.data.overseer_class).toBeDefined();
+    expect(payload.data.overseer_decision).toBeDefined();
+    expect(payload.data.error).toBe('coverage gate failed: 64% < 80%');
+  });
+
+  it('T4: backward compat -- when gate_result is absent, existing overseer fields are unchanged and no gate_result key is emitted', async () => {
+    const deps = makeDeps();
+    await handleNodeFailure(deps, makeWorkflowRun(), makeNode('node-no-gate'), {
+      ...baseCtx,
+      errorMsg: 'bash: line 3: npm: command not found',
+    });
+
+    const createEvent = deps.store.createWorkflowEvent as unknown as {
+      mock: { calls: unknown[][] };
+    };
+    expect(createEvent.mock.calls.length).toBe(1);
+    const payload = createEvent.mock.calls[0][0] as {
+      event_type: string;
+      data: Record<string, unknown>;
+    };
+
+    // Pre-existing contract: error + overseer_class + overseer_decision still emitted.
+    expect(payload.event_type).toBe('node_failed');
+    expect(payload.data.error).toBe('bash: line 3: npm: command not found');
+    expect(payload.data.overseer_class).toBe('npm_not_found');
+    expect(payload.data.overseer_decision).toBe('skip');
+
+    // gate_result key must be ABSENT (own-property check, not just undefined value).
+    expect(Object.prototype.hasOwnProperty.call(payload.data, 'gate_result')).toBe(false);
+  });
+});

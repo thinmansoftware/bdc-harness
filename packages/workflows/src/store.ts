@@ -31,6 +31,13 @@ export const WORKFLOW_EVENT_TYPES = [
   'approval_received',
   'workflow_cancelled',
   'workflow_artifact',
+  // Layer 1 cascade event (WO-HARNESS-LAYER1-CLIMB-AND-GATE-EVENTS-01).
+  // Emitted when a job escalates from one tier to another (e.g. haiku -> sonnet)
+  // because a gate failed. DISTINCT from overseer_decision=escalate (salvage path):
+  // cascade_step records a planned tier promotion with from_tier/to_tier/gate/reason.
+  // Phase 5 (WO-HARNESS-V1-PERRUN-CASCADE-01) wires the emit site. No DB migration:
+  // events.data is freeform JSON.
+  'cascade_step',
 ] as const;
 
 export type WorkflowEventType = (typeof WORKFLOW_EVENT_TYPES)[number];
