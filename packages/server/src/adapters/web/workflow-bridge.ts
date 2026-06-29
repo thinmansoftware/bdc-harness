@@ -161,6 +161,19 @@ export function mapWorkflowEvent(event: WorkflowEmitterEvent): string | null {
         },
       });
 
+    case 'cascade_step':
+      // Phase 3 plumbing -- emit the raw event payload for Mission Control (Phase 6 renders it).
+      return JSON.stringify({
+        type: 'cascade_step',
+        runId: event.runId,
+        nodeId: event.nodeId,
+        from_tier: event.from_tier,
+        to_tier: event.to_tier,
+        gate: event.gate,
+        reason: event.reason,
+        timestamp: Date.now(),
+      });
+
     case 'workflow_cancelled':
       return JSON.stringify({
         type: 'workflow_status',
