@@ -60,6 +60,16 @@ import { handleNodeFailure } from './overseer-bridge';
 // The cascade_step event itself is emitted via emitCascadeStep in
 // cascade-events.ts; this executor only spreads the GateResult field.
 import type { GateResult } from './cascade-events';
+
+/**
+ * Re-export emitCascadeStep so the cascade engine (Phase 5,
+ * WO-HARNESS-V1-PERRUN-CASCADE-01) can call it via the dag-executor surface
+ * the way it calls handleNodeFailure today. The re-export also makes the
+ * cascade_step emit path reachable from dag-executor.ts at module load time
+ * rather than living as an isolated helper -- consumers can import either
+ * the helper or its types directly from this module.
+ */
+export { emitCascadeStep } from './cascade-events';
 import { evaluateCondition } from './condition-evaluator';
 import {
   logNodeStart,
@@ -797,7 +807,11 @@ async function executeNodeInternal(
   // (WO-HARNESS-V1-PERRUN-CASCADE-01) sets this to a real GateResult before
   // node_completed / node_failed is written. In Phase 3 it stays undefined,
   // so the spread below is a no-op and existing event shapes are unchanged.
-  const nodeGateResult: GateResult | undefined = undefined;
+  // Phase 5 (WO-HARNESS-V1-PERRUN-CASCADE-01) assigns a real GateResult to
+  // this binding before node_completed / node_failed is emitted. Declared as
+  // `let` (not `const`) so the cascade engine can populate it without re-shaping
+  // the executor; the conditional spreads below treat `undefined` as no-gate.
+  let nodeGateResult: GateResult | undefined;
   const batchMessages: string[] = [];
 
   // Create per-node abort controller for idle timeout cleanup
@@ -1328,7 +1342,7 @@ async function executeNodeInternal(
           // Layer 1 gate result (WO-HARNESS-LAYER1-CLIMB-AND-GATE-EVENTS-01).
           // Spread only when defined. Phase 5 sets nodeGateResult; Phase 3
           // leaves it undefined, so existing node_completed shape is unchanged.
-          ...(nodeGateResult ? { gate_result: nodeGateResult } : {}),
+          ...(nodeGateResult !== undefined ? { gate_result: nodeGateResult } : {}),
         },
       })
       .catch((err: Error) => {
@@ -1347,6 +1361,10 @@ async function executeNodeInternal(
       ...(nodeCostUsd !== undefined ? { costUsd: nodeCostUsd } : {}),
       ...(nodeStopReason ? { stopReason: nodeStopReason } : {}),
       ...(nodeNumTurns !== undefined ? { numTurns: nodeNumTurns } : {}),
+      // Layer 1 gate result on the emitter side (WO-HARNESS-LAYER1-CLIMB-AND-GATE-EVENTS-01).
+      // Spread when defined so SSE subscribers (Mission Control) see the same
+      // gate outcome the persisted event carries. Absent in Phase 3.
+      ...(nodeGateResult !== undefined ? { gateResult: nodeGateResult } : {}),
     });
 
     // Clean up throttle entries on completion
@@ -1399,7 +1417,7 @@ async function executeNodeInternal(
           // Layer 1 gate result (WO-HARNESS-LAYER1-CLIMB-AND-GATE-EVENTS-01).
           // Spread only when defined. Phase 5 sets nodeGateResult; Phase 3
           // leaves it undefined, so existing node_failed shape is unchanged.
-          ...(nodeGateResult ? { gate_result: nodeGateResult } : {}),
+          ...(nodeGateResult !== undefined ? { gate_result: nodeGateResult } : {}),
         },
       })
       .catch((err: Error) => {
@@ -1415,6 +1433,9 @@ async function executeNodeInternal(
       nodeId: node.id,
       nodeName: node.command ?? node.id,
       error: err.message,
+      // Layer 1 gate result on the emitter side (WO-HARNESS-LAYER1-CLIMB-AND-GATE-EVENTS-01).
+      // Spread when defined; absent in Phase 3.
+      ...(nodeGateResult !== undefined ? { gateResult: nodeGateResult } : {}),
     });
 
     return {

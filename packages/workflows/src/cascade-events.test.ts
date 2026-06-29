@@ -220,3 +220,138 @@ describe('cascade-events -- GateResult spread mechanism (T3 + T4 node_completed 
     expect(gr.reason).toBe('manifest missing required field tests_passing');
   });
 });
+
+// --- T3-real: round-trip through the real WorkflowEventEmitter --------------
+// The original T3 above asserted only the spread mechanics in isolation. This
+// suite exercises the production singleton emitter path that dag-executor
+// actually uses, so a typed gateResult survives emit -> subscribe end-to-end
+// for both node_completed and node_failed.
+
+import { getWorkflowEventEmitter, resetWorkflowEventEmitter } from './event-emitter.ts';
+
+describe('cascade-events -- real WorkflowEventEmitter round-trip (T3-real)', () => {
+  it('T3-real: gateResult survives the real emitter for node_completed', () => {
+    resetWorkflowEventEmitter();
+    const received: WorkflowEmitterEvent[] = [];
+    const unsubscribe = getWorkflowEventEmitter().subscribe(event => {
+      received.push(event);
+    });
+
+    const gateResult: GateResult = {
+      gate: 'tests',
+      outcome: 'pass',
+      reason: '42 / 42 tests pass',
+    };
+
+    try {
+      getWorkflowEventEmitter().emit({
+        type: 'node_completed',
+        runId: 'run-t3-real',
+        nodeId: 'node-real',
+        nodeName: 'node-real',
+        duration: 100,
+        costUsd: 0.001,
+        gateResult,
+      });
+    } finally {
+      unsubscribe();
+    }
+
+    expect(received.length).toBe(1);
+    const event = received[0];
+    expect(event.type).toBe('node_completed');
+    if (event.type !== 'node_completed') return;
+    // Existing fields unchanged.
+    expect(event.runId).toBe('run-t3-real');
+    expect(event.nodeId).toBe('node-real');
+    expect(event.duration).toBe(100);
+    expect(event.costUsd).toBe(0.001);
+    // New additive gateResult field round-trips with full shape.
+    expect(event.gateResult).toBeDefined();
+    expect(event.gateResult!.gate).toBe('tests');
+    expect(event.gateResult!.outcome).toBe('pass');
+    expect(event.gateResult!.reason).toBe('42 / 42 tests pass');
+  });
+
+  it('T3-real: gateResult survives the real emitter for node_failed', () => {
+    resetWorkflowEventEmitter();
+    const received: WorkflowEmitterEvent[] = [];
+    const unsubscribe = getWorkflowEventEmitter().subscribe(event => {
+      received.push(event);
+    });
+
+    const gateResult: GateResult = {
+      gate: 'manifest',
+      outcome: 'fail',
+      reason: 'manifest missing tests_passing field',
+    };
+
+    try {
+      getWorkflowEventEmitter().emit({
+        type: 'node_failed',
+        runId: 'run-t3-real-fail',
+        nodeId: 'node-real-fail',
+        nodeName: 'node-real-fail',
+        error: 'manifest invalid',
+        gateResult,
+      });
+    } finally {
+      unsubscribe();
+    }
+
+    expect(received.length).toBe(1);
+    const event = received[0];
+    expect(event.type).toBe('node_failed');
+    if (event.type !== 'node_failed') return;
+    // Existing fields unchanged.
+    expect(event.runId).toBe('run-t3-real-fail');
+    expect(event.nodeId).toBe('node-real-fail');
+    expect(event.error).toBe('manifest invalid');
+    // New additive gateResult field round-trips with full shape.
+    expect(event.gateResult).toBeDefined();
+    expect(event.gateResult!.gate).toBe('manifest');
+    expect(event.gateResult!.outcome).toBe('fail');
+    expect(event.gateResult!.reason).toBe('manifest missing tests_passing field');
+  });
+
+  it('T4-real: node_completed without gateResult has no gateResult key on the event', () => {
+    resetWorkflowEventEmitter();
+    const received: WorkflowEmitterEvent[] = [];
+    const unsubscribe = getWorkflowEventEmitter().subscribe(event => {
+      received.push(event);
+    });
+
+    try {
+      getWorkflowEventEmitter().emit({
+        type: 'node_completed',
+        runId: 'run-t4-real',
+        nodeId: 'node-no-gate',
+        nodeName: 'node-no-gate',
+        duration: 250,
+        costUsd: 0.002,
+      });
+    } finally {
+      unsubscribe();
+    }
+
+    expect(received.length).toBe(1);
+    const event = received[0] as Record<string, unknown>;
+    // gateResult key must be ABSENT on the emitted event itself, not just
+    // present-with-undefined, so subscribers can rely on hasOwnProperty.
+    expect(Object.prototype.hasOwnProperty.call(event, 'gateResult')).toBe(false);
+  });
+});
+
+// --- T5: emitCascadeStep is re-exported from dag-executor for Phase 5 ------
+// Documents the cross-module reachability contract: the cascade engine in
+// Phase 5 can import emitCascadeStep from either ./cascade-events or the
+// executor surface (./dag-executor), the same way it imports handleNodeFailure
+// from ./overseer-bridge today.
+import { emitCascadeStep as emitCascadeStepFromExecutor } from './dag-executor.ts';
+import { emitCascadeStep as emitCascadeStepDirect } from './cascade-events.ts';
+
+describe('cascade-events -- emitCascadeStep reachability (T5)', () => {
+  it('T5: emitCascadeStep re-export from dag-executor is the same helper', () => {
+    expect(emitCascadeStepFromExecutor).toBe(emitCascadeStepDirect);
+  });
+});

@@ -178,6 +178,11 @@ export async function handleNodeFailure(
     nodeId: node.id,
     nodeName: node.command ?? node.id,
     error: ctx.errorMsg,
+    // Layer 1 gate result on the emitter side (WO-HARNESS-LAYER1-CLIMB-AND-GATE-EVENTS-01).
+    // Mirror the persisted gate_result field so SSE subscribers receive the
+    // same structured outcome the DB carries. Absent when no gate triggered
+    // the failure (existing non-gate paths are unchanged).
+    ...(ctx.gate_result !== undefined ? { gateResult: ctx.gate_result } : {}),
   });
 
   // Silent-dead-end escalation: fire 3 operator-visible signals (escalation.json

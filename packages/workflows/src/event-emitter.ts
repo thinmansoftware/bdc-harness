@@ -11,6 +11,7 @@
  */
 import { EventEmitter } from 'events';
 import type { ArtifactType } from './schemas';
+import type { GateResult } from './cascade-events';
 import { createLogger } from '@archon/paths';
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
@@ -95,6 +96,12 @@ interface NodeCompletedEvent {
   costUsd?: number;
   stopReason?: string;
   numTurns?: number;
+  /**
+   * Structured gate evaluation result (WO-HARNESS-LAYER1-CLIMB-AND-GATE-EVENTS-01).
+   * Phase 5 cascade engine populates this on emit; Phase 3 leaves absent so
+   * existing subscribers see no shape change.
+   */
+  gateResult?: GateResult;
 }
 
 interface NodeFailedEvent {
@@ -103,6 +110,13 @@ interface NodeFailedEvent {
   nodeId: string;
   nodeName: string;
   error: string;
+  /**
+   * Structured gate evaluation result (WO-HARNESS-LAYER1-CLIMB-AND-GATE-EVENTS-01).
+   * Set when a gate triggered the failure (e.g. tests/validator/manifest/ci);
+   * absent on non-gate failures. Phase 5 cascade engine populates this; Phase 3
+   * pass-through from overseer-bridge ctx.gate_result.
+   */
+  gateResult?: GateResult;
 }
 
 /**
