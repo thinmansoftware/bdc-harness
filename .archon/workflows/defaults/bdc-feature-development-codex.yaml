@@ -721,13 +721,13 @@ nodes:
       echo "DIFF_BYTES=$(wc -c < "$OUT" 2>/dev/null || echo 0)"
 
   - id: diff-review
-    provider: codex
-    model: gpt-5.5
-    agent: codex-adversarial-reviewer
+    provider: claude
+    model: sonnet
+    agent: claude-adversarial-reviewer
     depends_on: [capture-diff]
     task_class: medium_work
     prompt: |
-      You are the Codex adversarial diff reviewer. Cross-model review of the diff that
+      You are the Claude adversarial diff reviewer. Cross-model review of the diff that
       major-build just produced, BEFORE it is committed. You are READ-ONLY: you inspect
       and report. You do NOT edit, write, or run commands that mutate state.
 
@@ -904,14 +904,14 @@ nodes:
       echo "DIFF_FINAL_BYTES=$(wc -c < "$OUT" 2>/dev/null || echo 0)"
 
   - id: diff-review-final
-    provider: codex
-    model: gpt-5.5
-    agent: codex-adversarial-reviewer
+    provider: claude
+    model: sonnet
+    agent: claude-adversarial-reviewer
     depends_on: [capture-diff-final]
     trigger_rule: all_done
     task_class: medium_work
     prompt: |
-      You are the Codex adversarial reviewer doing the FINAL re-review after repair.
+      You are the Claude adversarial reviewer doing the FINAL re-review after repair.
       Read-only. This node decides whether any semantic finding remains before commit --
       the mechanical repair gate did NOT prove your earlier objections were fixed.
 
@@ -1047,16 +1047,16 @@ nodes:
         printf '{"fixed":"false"}\n'
       fi
 
-  # opus-rereview: autonomous Codex adversarial re-review of the opus-repair diff.
+  # opus-rereview: autonomous Claude adversarial re-review of the opus-repair diff.
   # Only runs when classify-opus-repair reports fixed=true. Mirrors apply-diff-review-final.
   # (WO-HARNESS-OPUS-REPAIR-AUTONOMOUS-REREVIEW-01) -- this is the AUTONOMOUS rung of the
   # autonomy ladder: a passing re-review here lets block-reclassify emit PROCEED so the
   # repaired build can land as a normal feature-branch PR instead of dead-ending at a
   # terminal-BLOCKED on a non-interactive run.
   - id: opus-rereview
-    provider: codex
-    model: gpt-5.5
-    agent: codex-adversarial-reviewer
+    provider: claude
+    model: sonnet
+    agent: claude-adversarial-reviewer
     depends_on: [classify-opus-repair]
     trigger_rule: all_done
     when: "$classify-opus-repair.output.fixed == 'true'"
@@ -1314,9 +1314,9 @@ nodes:
   # apply-diff-review-final: re-review the fix(es) apply-suggested-fix wrote, BEFORE any commit.
   # Distinct id (diff-review-final already ran upstream). Only meaningful on the APPROVE-WITH-FIX path.
   - id: apply-diff-review-final
-    provider: codex
-    model: gpt-5.5
-    agent: codex-adversarial-reviewer
+    provider: claude
+    model: sonnet
+    agent: claude-adversarial-reviewer
     depends_on: [apply-suggested-fix]
     trigger_rule: all_done
     when: "$pause-gate.output.decision_verb == 'approve_with_fix'"
