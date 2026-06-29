@@ -103,7 +103,7 @@ interface RouterYamlConfig {
 function parseRouterYaml(raw: string): RouterYamlConfig {
   // Bun runtime exposes Bun.YAML; declare narrowly to avoid global pollution.
   const bunGlobal = (globalThis as { Bun?: { YAML?: { parse(input: string): unknown } } }).Bun;
-  if (!bunGlobal || !bunGlobal.YAML || typeof bunGlobal.YAML.parse !== 'function') {
+  if (!bunGlobal?.YAML || typeof bunGlobal.YAML.parse !== 'function') {
     throw new Error(
       'router-dispatcher: Bun.YAML.parse not available; this module requires the Bun runtime.'
     );
@@ -140,7 +140,7 @@ function walkLadderForReachable(
   for (let i = startIdx; i < orderedKeys.length; i++) {
     const tierKey = orderedKeys[i];
     const engines = tiers[tierKey]?.engines ?? [];
-    const reachable = engines.find((e) => !UNREACHABLE_ENGINES.has(e));
+    const reachable = engines.find(e => !UNREACHABLE_ENGINES.has(e));
     if (reachable !== undefined) {
       return { tier: tierKey, engine: reachable };
     }
@@ -158,7 +158,7 @@ function walkLadderForReachable(
   for (let i = downStart; i >= 0; i--) {
     const tierKey = orderedKeys[i];
     const engines = tiers[tierKey]?.engines ?? [];
-    const reachable = engines.find((e) => !UNREACHABLE_ENGINES.has(e));
+    const reachable = engines.find(e => !UNREACHABLE_ENGINES.has(e));
     if (reachable !== undefined) {
       return { tier: tierKey, engine: reachable };
     }

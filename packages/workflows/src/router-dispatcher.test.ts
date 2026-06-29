@@ -147,10 +147,7 @@ describe('router-dispatcher resolveEntryLane', () => {
     // source. Read the module text and assert the forbidden symbols are absent.
     const fs = await import('node:fs');
     const path = await import('node:path');
-    const src = fs.readFileSync(
-      path.resolve(import.meta.dir, 'router-dispatcher.ts'),
-      'utf8'
-    );
+    const src = fs.readFileSync(path.resolve(import.meta.dir, 'router-dispatcher.ts'), 'utf8');
     expect(src).not.toMatch(/IAgentProvider/);
     expect(src).not.toMatch(/sendQuery/);
     expect(src).not.toMatch(/ClaudeProvider/);

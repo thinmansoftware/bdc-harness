@@ -5,8 +5,15 @@ import type { WebAdapter } from '../adapters/web';
 import { validationErrorHook } from './openapi-defaults';
 import { mockAllWorkflowModules } from '../test/workflow-mock-factories';
 
+// The operator-token gate in registerApiRoutes() activates whenever
+// ARCHON_OPERATOR_TOKEN is set. Clear it at module level so these tests run
+// deterministically in container envs (Cauldron build image exports this var).
+delete process.env.ARCHON_OPERATOR_TOKEN;
+delete process.env.ARCHON_OPERATOR_ACCESS_HOSTS;
+delete process.env.ARCHON_OPERATOR_EMAILS;
+
 // ---------------------------------------------------------------------------
-// Mock setup — must be declared before any dynamic imports of mocked modules
+// Mock setup -- must be declared before any dynamic imports of mocked modules
 // ---------------------------------------------------------------------------
 
 const mockGetCodebase = mock(

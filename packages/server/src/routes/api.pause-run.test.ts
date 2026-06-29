@@ -17,6 +17,13 @@ import type { ConversationLockManager } from '@archon/core';
 import type { WebAdapter } from '../adapters/web';
 import { validationErrorHook } from './openapi-defaults';
 
+// The operator-token gate in registerApiRoutes() activates whenever
+// ARCHON_OPERATOR_TOKEN is set. Clear it at module level so these tests run
+// deterministically in container envs (Cauldron build image exports this var).
+delete process.env.ARCHON_OPERATOR_TOKEN;
+delete process.env.ARCHON_OPERATOR_ACCESS_HOSTS;
+delete process.env.ARCHON_OPERATOR_EMAILS;
+
 // ---------------------------------------------------------------------------
 // Mock setup — must be before dynamic imports of mocked modules
 // ---------------------------------------------------------------------------

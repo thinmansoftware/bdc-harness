@@ -7,6 +7,13 @@ import { createRequire } from 'node:module';
 import { join } from 'path';
 import { tmpdir } from 'os';
 
+// The operator-token gate in registerApiRoutes() activates whenever
+// ARCHON_OPERATOR_TOKEN is set. Clear it at module level so these tests run
+// deterministically in container envs (Cauldron build image exports this var).
+delete process.env.ARCHON_OPERATOR_TOKEN;
+delete process.env.ARCHON_OPERATOR_ACCESS_HOSTS;
+delete process.env.ARCHON_OPERATOR_EMAILS;
+
 // These tests deliberately rely on the REAL fs/promises behavior: the 404 cases
 // for GET/DELETE /api/workflows/:name depend on readFile/unlink throwing a
 // genuine ENOENT for a path that does not exist on disk. Bun's mock.module() is
