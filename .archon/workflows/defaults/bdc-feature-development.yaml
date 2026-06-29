@@ -1520,7 +1520,10 @@ nodes:
         echo "ERROR: neither diff-review-final, a satisfied approve-with-fix re-review, nor a satisfied opus autonomous re-review authorizes this commit -- refusing (defense in depth)." >&2
         exit 1
       fi
-      BRANCH=$(printf '%s\n' "$DECIDE_OUTPUT" | sed -n 's/^push_target: feature-branch://p' | head -n 1)
+      # Defect 1 (WO-HARNESS-CAULDRON-DEFECT-CLEANUP-01): tolerate leading whitespace
+      # and code-fence indentation. The strict ^ anchor broke when an agent emitted
+      # push_target inside an indented ```text fence (PR #165 anchor run 9069e99c).
+      BRANCH=$(printf '%s\n' "$DECIDE_OUTPUT" | sed -n 's/^[[:space:]]*push_target:[[:space:]]*feature-branch:[[:space:]]*\([^[:space:]]*\)[[:space:]]*$/\1/p' | head -n 1)
       if [ -z "$BRANCH" ]; then
         echo "No feature branch target found in decide-push-target output." >&2
         exit 1
@@ -1749,25 +1752,39 @@ nodes:
       } > "$BODY_FILE"
       # WO-169: real retry guard. 3 attempts, 5s/10s/15s backoff, fail closed.
       # No `|| echo 'STATUS=*_failed'` swallow -- this node is load_bearing.
+      # Defect 2 (WO-HARNESS-CAULDRON-DEFECT-CLEANUP-01): check-first design.
+      # The old retry-first loop reported a false failure when the PR already
+      # existed (created by a parallel implement-loop worktree) or when gh pr
+      # create succeeded but returned non-zero (gh CLI quirk). PR #167 anchor
+      # run a0dae1f8. Now: look for an existing PR BEFORE attempting create, and
+      # re-check after each create attempt so a non-zero-exit-but-created PR is
+      # caught instead of triggering a spurious failure.
       PR_OK=false
-      for attempt in 1 2 3; do
-        if gh pr create --repo "$REPO" --title "$TITLE" --body-file "$BODY_FILE" --head "$UNIQUE_BRANCH" ${BASE_BRANCH:+--base "$BASE_BRANCH"} 2>&1; then
-          PR_OK=true
-          break
-        fi
-        # Race-condition recovery: branch already has an open PR.
-        if [ -n "$UNIQUE_BRANCH" ]; then
+      EXIST=$(gh pr list --repo "$REPO" --head "$UNIQUE_BRANCH" --state open \
+        --json url --jq '.[0].url // empty' 2>/dev/null || true)
+      if [ -n "$EXIST" ]; then
+        echo "PR_URL=$EXIST"
+        echo "PR already exists (no create needed)."
+        PR_OK=true
+      else
+        for attempt in 1 2 3; do
+          if gh pr create --repo "$REPO" --title "$TITLE" --body-file "$BODY_FILE" --head "$UNIQUE_BRANCH" ${BASE_BRANCH:+--base "$BASE_BRANCH"} 2>&1; then
+            PR_OK=true
+            break
+          fi
+          # Re-check: gh pr create may have created the PR but returned non-zero.
           EXIST=$(gh pr list --repo "$REPO" --head "$UNIQUE_BRANCH" --state open \
             --json url --jq '.[0].url // empty' 2>/dev/null || true)
           if [ -n "$EXIST" ]; then
             echo "PR_URL=$EXIST"
+            echo "PR created despite non-zero exit (gh CLI quirk; PR confirmed via list)."
             PR_OK=true
             break
           fi
-        fi
-        echo "WARN: gh pr create attempt $attempt failed; retrying after $((attempt * 5))s..." >&2
-        sleep $((attempt * 5))
-      done
+          echo "WARN: gh pr create attempt $attempt failed AND no PR found on origin; retrying after $((attempt * 5))s..." >&2
+          sleep $((attempt * 5))
+        done
+      fi
       if [ "$PR_OK" = "false" ]; then
         # WO-HARNESS-COMMIT-AND-PUSH-ORIGIN-VERIFY-02: gh pr create failed, but the
         # canonical branch was VERIFIED on origin at HEAD above (precondition guard
@@ -2076,3 +2093,59 @@ nodes:
 
       If Notion MCP is not available inside the container, do not invent a workaround.
       Emit an XO_ACTION line asking XO to flip Notion manually with the manifest above.
+
+  # Defect 3 (WO-HARNESS-CAULDRON-DEFECT-CLEANUP-01): fallback Notion flip.
+  # The harness has known-defective tail nodes (commit-and-push, open-pr-if-needed,
+  # build-manifest) that can fail for plumbing reasons AFTER the build is good and
+  # the validator returned satisfied. When that happens the normal flip-notion node
+  # (depends_on: build-manifest) never runs and Notion stays IN_PROGRESS until a
+  # human flips it manually (cauldron-fallback-recovery doctrine, 2026-05-26).
+  #
+  # The spec's original design used `trigger.on_workflow_status: failed`, which the
+  # executor does NOT support. The supported primitives are `trigger_rule: all_done`
+  # (run after deps settle regardless of pass/fail) and `when:` (exact-match only).
+  # Because the validator output is a long markdown report, an exact-match `when:`
+  # cannot test it -- so the satisfied-gate is enforced IN-PROMPT instead (the same
+  # pattern the normal flip-notion uses for its block-reclassify branch). This node
+  # depends on war-council-validator + flip-notion with all_done, so it runs even
+  # when the tail chain between them failed, and no-ops on a real build failure.
+  - id: flip-notion-on-failure
+    persona: xo
+    depends_on: [war-council-validator, flip-notion]
+    trigger_rule: all_done
+    task_class: clerical
+    prompt: |
+      FALLBACK Notion flip. Update Notion ONLY if the normal flip-notion node did NOT
+      already flip the WO to REVIEW, AND the build was genuinely good. This is a
+      safety net for the harness tail-node defect (cauldron-fallback-recovery doctrine).
+
+      ## Step 1 -- did the normal flip already happen? (idempotency guard)
+      flip-notion node output: $flip-notion.output
+      - If $flip-notion.output shows the WO was already flipped to REVIEW (Claude Status
+        REVIEW / Status Review set successfully), STOP. Do nothing. Emit:
+        "FALLBACK_FLIP_SKIPPED: normal flip-notion already set REVIEW." Exit.
+      - If $flip-notion.output is empty, errored, or shows the flip did NOT complete,
+        continue to Step 2.
+
+      ## Step 2 -- was the build actually good? (satisfied-gate -- do NOT flip on a real failure)
+      war-council-validator report: $war-council-validator.output
+      - The validator verdict MUST be `satisfied` (look for "Verdict: satisfied" or
+        "VALIDATION: PASS"). If the verdict is `needs_revision`, `fail`, or the validator
+        never ran (output empty), this is a REAL build failure -- do NOT flip. Emit:
+        "FALLBACK_FLIP_DECLINED: validator verdict not satisfied; real failure; leaving Notion as-is." Exit.
+      - Only if the verdict is satisfied, continue to Step 3.
+
+      ## Step 3 -- perform the fallback flip
+      Set on the Notion WO page:
+      - Claude Status: REVIEW
+      - Status: Review
+      - Add a page comment starting EXACTLY with "FALLBACK PATH:" so the recovery is
+        greppable, including: which tail node failed (infer from the available outputs),
+        that the validator returned satisfied (build good), and the PR/branch info if present.
+
+      ## Inputs for the comment
+      Push status: $commit-and-push.output (may be empty if commit-and-push failed)
+      PR status:   $open-pr-if-needed.output (may be empty if open-pr-if-needed failed)
+
+      If Notion MCP is not available inside the container, do not invent a workaround.
+      Log "FALLBACK_FLIP_DEFERRED: Notion MCP unavailable" and exit 0.
