@@ -208,6 +208,39 @@ function isRolloutMissingError(errorMessage: string | undefined): boolean {
   return ROLLOUT_MISSING_PATTERNS.some(p => m.includes(p));
 }
 
+// WO-HARNESS-CODEX-AUTH-FAILBACK-01 (2026-06-29): token rotation-collision patterns.
+// These match the SPECIFIC "refresh token already used" failure class --
+// a transient credential-sync issue, NOT a persistent "operator must re-login" state.
+// Derived from the anchor incident error (2026-06-11 run 7a442b5c) and codex-sdk
+// auth error surfaces. Do NOT add patterns that could match a successful login check,
+// "not logged in", or "unauthorized" -- those belong in AUTH_PATTERNS and must surface.
+// Do NOT add rollout/resume markers (those belong in ROLLOUT_MISSING_PATTERNS).
+// Note: @openai/codex-sdk@0.125.0 does not define error message strings -- it passes
+// through the codex binary's stderr verbatim. Patterns here come from the anchor
+// incident error text only.
+//
+// IMPORTANT: ALL patterns must be present (use .every(), not .some()).
+// The generic reauth message "Your access token could not be refreshed. Please log out
+// and sign in again." contains only the second pattern and must NOT trigger failback --
+// it routes through the existing refreshIfAuthFailed path (AUTH_PATTERNS). Only the
+// rotation-collision message contains both substrings simultaneously.
+const AUTH_FAILBACK_PATTERNS = [
+  'refresh token was already used',
+  'access token could not be refreshed',
+];
+
+/** True when the message indicates a Codex token rotation collision
+ * that is degradable to the Claude failback path rather than requiring
+ * operator re-login. Requires ALL AUTH_FAILBACK_PATTERNS to be present --
+ * the rotation-collision message contains both substrings; the generic
+ * "please log out" reauth message contains only 'access token could not be
+ * refreshed' and must fall through to the existing refreshIfAuthFailed path. */
+function isAuthFailureError(errorMessage: string | undefined): boolean {
+  if (!errorMessage) return false;
+  const m = errorMessage.toLowerCase();
+  return AUTH_FAILBACK_PATTERNS.every(p => m.includes(p));
+}
+
 function classifyCodexError(
   errorMessage: string
 ): 'rate_limit' | 'auth' | 'crash' | 'model_access' | 'unknown' {
@@ -794,6 +827,9 @@ export class CodexProvider implements IAgentProvider {
     // call -- prevents an infinite resume loop if the rollout-missing error
     // somehow recurs after a fresh-thread restart.
     let rolloutRestartUsed = false;
+    // WO-HARNESS-CODEX-AUTH-FAILBACK-01: single-shot guard for auth-class failback.
+    // Mirrors rolloutRestartUsed -- fires at most once per sendQuery.
+    let authFailbackUsed = false;
 
     for (let attempt = 0; attempt <= MAX_SUBPROCESS_RETRIES; attempt++) {
       if (requestOptions?.abortSignal?.aborted) {
@@ -873,6 +909,32 @@ export class CodexProvider implements IAgentProvider {
           // the crash-retry budget.
           attempt = -1; // for-loop will increment to 0
           continue;
+        }
+
+        // WO-HARNESS-CODEX-AUTH-FAILBACK-01: single-shot auth-class failback.
+        // Codex token rotation collisions (refresh token already used) classify
+        // as auth but are transient -- the run's work is intact; only the
+        // credential sync failed. Delegate to Claude rather than dying.
+        // Fires at most ONCE per sendQuery (authFailbackUsed guard). Without a
+        // factory, falls through to the existing auth-refresh / throw path so
+        // the original error always surfaces (no silent swallowing).
+        if (isAuthFailureError(err.message) && this.failbackProviderFactory && !authFailbackUsed) {
+          authFailbackUsed = true;
+          getLog().warn({ err: err.message }, 'auth_failure_codex_failback');
+          yield {
+            type: 'system',
+            content:
+              '[CODEX FAILBACK] Codex auth failed (credential rotation). Review delegated to ' +
+              'Claude. Reduced cross-model adversarial value -- human review recommended.',
+          };
+          const failbackProvider = this.failbackProviderFactory();
+          yield* failbackProvider.sendQuery(
+            prompt,
+            cwd,
+            undefined,
+            buildFailbackOptions(requestOptions)
+          );
+          return;
         }
 
         const { enrichedError, errorClass, shouldRetry } = classifyAndEnrichCodexError(
