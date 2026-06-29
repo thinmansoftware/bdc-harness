@@ -52,7 +52,7 @@ export interface ResolveOptions {
   /** Task class key as defined in router.yaml task_classes (e.g. "build-code"). */
   taskClass?: string;
   /** WO Class tag (CODE / INFRA / MIXED). Phase 4: logged only, no routing effect. */
-  woClass?: 'CODE' | 'INFRA' | 'MIXED' | string;
+  woClass?: string;
   /** Absolute or worktree-relative path to router.yaml. */
   routerYamlPath: string;
   /**
@@ -221,7 +221,8 @@ export async function resolveEntryLane(opts: ResolveOptions): Promise<ResolveRes
     throw err;
   }
 
-  let { tier: resolvedTier, engine: resolvedEngine } = walked;
+  const { tier: resolvedTier } = walked;
+  let { engine: resolvedEngine } = walked;
 
   // Apply engine_hint within the resolved tier if it is present, reachable,
   // and offered by that tier.
