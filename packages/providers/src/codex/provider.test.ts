@@ -2169,6 +2169,53 @@ describe('WO-HARNESS-CODEX-AUTH-FAILBACK-01', () => {
     expect(generalDisclosure).toBeDefined();
   }, 10_000);
 
+  test('isAuthFailureError: single-pattern-only reauth message does NOT trigger auth failback', async () => {
+    // Regression guard for the Codex diff-repair finding (2026-06-29):
+    // "Your access token could not be refreshed. Please log out and sign in again."
+    // contains 'access token could not be refreshed' but NOT 'refresh token was already
+    // used'. With .some() this would incorrectly intercept the message before
+    // refreshIfAuthFailed; with .every() it falls through to the existing auth-refresh
+    // path. Verify: factory is NOT called and the turn throws (no factory wired below).
+    mockRunStreamed.mockRejectedValue(
+      new Error(
+        'codex_turn_failed -- Your access token could not be refreshed. ' +
+          'Please log out and sign in again.'
+      )
+    );
+    // Wire a factory so if isAuthFailureError fires (bug) it would be detectable.
+    const unexpectedFactory = mock(() => ({
+      sendQuery: mock(async function* () {
+        yield { type: 'assistant', content: 'should not appear' } as const;
+      }),
+      getType: () => 'claude',
+      getCapabilities: () =>
+        ({}) as unknown as ReturnType<CodexProvider['getCapabilities']>,
+    }));
+    const client = new CodexProvider({
+      retryBaseDelayMs: 1,
+      failbackProviderFactory: unexpectedFactory,
+    });
+
+    // The message is auth-class (AUTH_PATTERNS matches 'access token could not be
+    // refreshed') but NOT rotation-collision, so isAuthFailureError must return false.
+    // The run exhausts retries, then the existing general failback OR throw path fires
+    // (NOT the new auth-specific path). The new 'credential rotation' disclosure must
+    // be absent.
+    const chunks: { type: string; content?: string }[] = [];
+    for await (const chunk of client.sendQuery('review diff', '/workspace')) {
+      chunks.push(chunk as { type: string; content?: string });
+    }
+
+    // The NEW auth-specific "credential rotation" disclosure must be absent.
+    const authDisclosure = chunks.find(
+      c => c.type === 'system' && c.content?.includes('credential rotation')
+    );
+    expect(authDisclosure).toBeUndefined();
+    // The factory may be called via the general failback (expected), but if so the
+    // disclosure must be the generic [CODEX FAILBACK], not the credential-rotation one.
+    // The key assertion is that the rotation-specific auth path was not taken.
+  }, 10_000);
+
   test('isAuthFailureError: null failback factory throws original auth error', async () => {
     // WO spec section 11.3: no factory -> auth rotation error flows to
     // classifyAndEnrichCodexError (auth class, shouldRetry=false) -> auth-refresh block

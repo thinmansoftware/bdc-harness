@@ -218,6 +218,12 @@ function isRolloutMissingError(errorMessage: string | undefined): boolean {
 // Note: @openai/codex-sdk@0.125.0 does not define error message strings -- it passes
 // through the codex binary's stderr verbatim. Patterns here come from the anchor
 // incident error text only.
+//
+// IMPORTANT: ALL patterns must be present (use .every(), not .some()).
+// The generic reauth message "Your access token could not be refreshed. Please log out
+// and sign in again." contains only the second pattern and must NOT trigger failback --
+// it routes through the existing refreshIfAuthFailed path (AUTH_PATTERNS). Only the
+// rotation-collision message contains both substrings simultaneously.
 const AUTH_FAILBACK_PATTERNS = [
   'refresh token was already used',
   'access token could not be refreshed',
@@ -225,12 +231,14 @@ const AUTH_FAILBACK_PATTERNS = [
 
 /** True when the message indicates a Codex token rotation collision
  * that is degradable to the Claude failback path rather than requiring
- * operator re-login. Only matches the specific "already used" rotation
- * class -- NOT general auth failures that require operator action. */
+ * operator re-login. Requires ALL AUTH_FAILBACK_PATTERNS to be present --
+ * the rotation-collision message contains both substrings; the generic
+ * "please log out" reauth message contains only 'access token could not be
+ * refreshed' and must fall through to the existing refreshIfAuthFailed path. */
 function isAuthFailureError(errorMessage: string | undefined): boolean {
   if (!errorMessage) return false;
   const m = errorMessage.toLowerCase();
-  return AUTH_FAILBACK_PATTERNS.some(p => m.includes(p));
+  return AUTH_FAILBACK_PATTERNS.every(p => m.includes(p));
 }
 
 function classifyCodexError(
