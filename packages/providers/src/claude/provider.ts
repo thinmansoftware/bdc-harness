@@ -726,6 +726,13 @@ async function* streamClaudeMessages(
   events: AsyncGenerator,
   toolResultQueue: ToolResultEntry[]
 ): AsyncGenerator<MessageChunk> {
+  // Layer 1 served-model capture (WO-HARNESS-LAYER1-SERVED-MODEL-CAPTURE-01):
+  // the SDK emits a `system` event with `subtype === 'init'` at the start of
+  // every query whose payload includes the resolved model id. Capture it and
+  // attach to the result chunk so the dag-executor can persist
+  // requested vs served per node.
+  let capturedServedModel: string | undefined;
+
   for await (const msg of events) {
     // Drain tool results captured by hooks before processing the next event
     while (toolResultQueue.length > 0) {
@@ -761,8 +768,19 @@ async function* streamClaudeMessages(
     } else if (event.type === 'system') {
       const sysMsg = msg as {
         subtype?: string;
+        model?: string;
         mcp_servers?: { name: string; status: string }[];
       };
+      // Layer 1 served-model capture: SDKSystemMessage with subtype 'init'
+      // carries the resolved model id. Record before we branch on mcp_servers
+      // so the capture is independent of MCP wiring.
+      if (
+        sysMsg.subtype === 'init' &&
+        typeof sysMsg.model === 'string' &&
+        sysMsg.model.length > 0
+      ) {
+        capturedServedModel = sysMsg.model;
+      }
       if (sysMsg.subtype === 'init' && sysMsg.mcp_servers) {
         const failed = sysMsg.mcp_servers.filter(s => s.status !== 'connected');
         if (failed.length > 0) {
@@ -835,6 +853,7 @@ async function* streamClaudeMessages(
         ...(resultMsg.model_usage
           ? { modelUsage: resultMsg.model_usage as Record<string, unknown> }
           : {}),
+        ...(capturedServedModel !== undefined ? { servedModelId: capturedServedModel } : {}),
       };
     }
   }

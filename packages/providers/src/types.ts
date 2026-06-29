@@ -155,6 +155,30 @@ export type MessageChunk =
       stopReason?: string;
       numTurns?: number;
       modelUsage?: Record<string, unknown>;
+      /**
+       * The model id that actually responded to the request (the SERVED model),
+       * captured from inside each provider's response handler where the raw
+       * API response is still available.
+       *
+       * Semantics:
+       *   - string: the provider reported a served model (e.g. OpenRouter's
+       *     response body `model`, Claude SDK system/init `model`).
+       *   - null:   the provider's SDK does not expose a served-model field
+       *     (e.g. @openai/codex-sdk). servedModelMissingReason explains why.
+       *   - undefined / absent: the provider has not yet declared support for
+       *     this field. Treat as "no signal" -- never fabricate a value.
+       *
+       * Consumed by dag-executor at the node_completed.data write-site to
+       * persist requested_model_id + served_model_id + served_model_mismatch.
+       * See WO-HARNESS-LAYER1-SERVED-MODEL-CAPTURE-01.
+       */
+      servedModelId?: string | null;
+      /**
+       * Machine-readable reason recorded when servedModelId is null. Lets
+       * downstream consumers distinguish "provider could not tell us" from
+       * "we never tried to capture" without inventing a string.
+       */
+      servedModelMissingReason?: string;
     }
   | { type: 'rate_limit'; rateLimitInfo: Record<string, unknown> }
   | {

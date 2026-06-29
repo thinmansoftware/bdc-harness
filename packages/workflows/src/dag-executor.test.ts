@@ -8347,3 +8347,215 @@ it('commit-and-push when: evaluates correctly for all paths', () => {
   ]);
   expect(evaluateCondition(commitCond, plainBlocked).result).toBe(false);
 });
+
+// ---------------------------------------------------------------------------
+// Layer 1 served-model capture on node_completed.data
+// WO-HARNESS-LAYER1-SERVED-MODEL-CAPTURE-01
+// ---------------------------------------------------------------------------
+//
+// T4 (mismatch): a node requests model X, the provider yields a result chunk
+//   carrying a different servedModelId Y -> node_completed.data carries
+//   requested_model_id=X, served_model_id=Y, served_model_mismatch=true.
+//   This is the GLM-never-ran guard working: the integrity flag has real data.
+//
+// T5 (null provider, per spec): a provider that does NOT expose served model
+//   (e.g. Codex) yields servedModelId=null + servedModelMissingReason.
+//   node_completed.data carries served_model_id=null and the reason string,
+//   served_model_mismatch is OMITTED (a null served has no meaningful
+//   mismatch signal). No crash. No fabricated value.
+describe('executeDagWorkflow -- served-model capture on node_completed.data', () => {
+  let testDir: string;
+
+  beforeEach(async () => {
+    testDir = join(
+      tmpdir(),
+      `dag-served-model-${Date.now()}-${Math.random().toString(36).slice(2)}`
+    );
+    await mkdir(testDir, { recursive: true });
+    mockSendQueryDag.mockClear();
+    mockGetAgentProviderDag.mockClear();
+  });
+
+  afterEach(async () => {
+    // Restore default claude client so other test files are unaffected.
+    mockGetAgentProviderDag.mockImplementation(() => ({
+      sendQuery: mockSendQueryDag,
+      getType: () => 'claude',
+      getCapabilities: mockClaudeCapabilities,
+    }));
+    try {
+      await rm(testDir, { recursive: true, force: true });
+    } catch {
+      /* ignore cleanup errors */
+    }
+  });
+
+  /** Pull the (single) node_completed event payload from a mocked store. */
+  function getNodeCompletedData(store: IWorkflowStore): Record<string, unknown> {
+    const calls = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls as Array<
+      [{ event_type: string; data?: Record<string, unknown> }]
+    >;
+    const completedCalls = calls.filter(([arg]) => arg.event_type === 'node_completed');
+    expect(completedCalls.length).toBe(1);
+    const data = completedCalls[0][0].data;
+    expect(data).toBeDefined();
+    return data as Record<string, unknown>;
+  }
+
+  it('T4: served != requested -> served_model_mismatch=true on node_completed.data', async () => {
+    // Mock provider yields a result chunk that reports a DIFFERENT served
+    // model than the node asked for. Mimics an OpenRouter routing decision
+    // (requested z-ai/glm-5.2, served z-ai/glm-5.2-20260616) or an SDK
+    // silent-fallback (requested sonnet, served haiku).
+    mockSendQueryDag.mockImplementation(function* () {
+      yield { type: 'assistant', content: 'x' };
+      yield {
+        type: 'result',
+        sessionId: 'mismatch-session',
+        servedModelId: 'other-model-actually-served',
+      };
+    });
+
+    const store = createMockStore();
+    const mockDeps = createMockDeps(store);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('served-mismatch-run');
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-mismatch',
+      testDir,
+      {
+        name: 'served-mismatch-test',
+        // PromptNode (no command file needed). model set at the node level so
+        // it flows into nodeOptions.model via effectiveModel.
+        nodes: [
+          {
+            id: 'work',
+            prompt: 'do work',
+            model: 'my-requested-model',
+          },
+        ],
+      },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    const data = getNodeCompletedData(store);
+    expect(data.requested_model_id).toBe('my-requested-model');
+    expect(data.served_model_id).toBe('other-model-actually-served');
+    expect(data.served_model_mismatch).toBe(true);
+    // missing_reason must be absent on the happy path -- only present when
+    // the provider could not tell us.
+    expect(data).not.toHaveProperty('served_model_missing_reason');
+  });
+
+  it('T4 (match path): served == requested -> served_model_mismatch=false', async () => {
+    // Same shape as T4 but the provider honored the request. Locks in that
+    // the boolean really is computed from the comparison, not a constant.
+    mockSendQueryDag.mockImplementation(function* () {
+      yield { type: 'assistant', content: 'x' };
+      yield {
+        type: 'result',
+        sessionId: 'match-session',
+        servedModelId: 'my-requested-model',
+      };
+    });
+
+    const store = createMockStore();
+    const mockDeps = createMockDeps(store);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('served-match-run');
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-match',
+      testDir,
+      {
+        name: 'served-match-test',
+        nodes: [
+          {
+            id: 'work',
+            prompt: 'do work',
+            model: 'my-requested-model',
+          },
+        ],
+      },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    const data = getNodeCompletedData(store);
+    expect(data.requested_model_id).toBe('my-requested-model');
+    expect(data.served_model_id).toBe('my-requested-model');
+    expect(data.served_model_mismatch).toBe(false);
+  });
+
+  it('T5: provider yields servedModelId=null with reason -> no crash, mismatch omitted', async () => {
+    // Mimics the Codex provider's contract: the SDK does not expose a
+    // served-model field, so the provider emits explicit null + a
+    // machine-readable reason. The dag-executor must persist both verbatim
+    // and OMIT served_model_mismatch (null has no meaningful comparison).
+    mockSendQueryDag.mockImplementation(function* () {
+      yield { type: 'assistant', content: 'x' };
+      yield {
+        type: 'result',
+        sessionId: 'null-session',
+        servedModelId: null,
+        servedModelMissingReason: 'codex_sdk_does_not_expose_served_model',
+      };
+    });
+
+    const store = createMockStore();
+    const mockDeps = createMockDeps(store);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('served-null-run');
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-null',
+      testDir,
+      {
+        name: 'served-null-test',
+        nodes: [
+          {
+            id: 'work',
+            prompt: 'do work',
+            model: 'my-requested-model',
+          },
+        ],
+      },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    const data = getNodeCompletedData(store);
+    expect(data.requested_model_id).toBe('my-requested-model');
+    // null is preserved -- no fabricated value, no coercion to undefined.
+    expect(data.served_model_id).toBeNull();
+    expect(data.served_model_missing_reason).toBe('codex_sdk_does_not_expose_served_model');
+    // served_model_mismatch is omitted when served is null (no signal).
+    expect(data).not.toHaveProperty('served_model_mismatch');
+  });
+});

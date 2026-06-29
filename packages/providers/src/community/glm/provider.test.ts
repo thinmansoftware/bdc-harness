@@ -120,4 +120,44 @@ describe('GlmProvider', () => {
     const createArg = mockCreate.mock.calls[0]?.[0] as Record<string, unknown>;
     expect(createArg?.['model']).toBe('z-ai/glm-4.6');
   });
+
+  // T1 (WO-HARNESS-LAYER1-SERVED-MODEL-CAPTURE-01): a GLM-lane node runs ->
+  // result chunk carries servedModelId from the OpenRouter SSE stream's
+  // ChatCompletionChunk.model field (present on every chunk per the OpenAI
+  // wire protocol).
+  test('GlmProvider captures served model id from OpenRouter SSE chunks', async () => {
+    process.env['GLM_API_KEY'] = 'sk-test';
+    // Override the module-level stream once with chunks that carry the served
+    // model id (mimicking OpenRouter's response shape where requested
+    // z-ai/glm-5.2 may be served as z-ai/glm-5.2-20260616).
+    mockCreate.mockImplementationOnce(async () => ({
+      [Symbol.asyncIterator]: async function* () {
+        yield {
+          model: 'z-ai/glm-5.2-20260616',
+          choices: [{ delta: { content: 'hi' } }],
+          usage: null,
+        };
+        yield {
+          model: 'z-ai/glm-5.2-20260616',
+          choices: [{ delta: {} }],
+          usage: { prompt_tokens: 5, completion_tokens: 3, total_tokens: 8 },
+        };
+      },
+    }));
+
+    const provider = new GlmProvider();
+    const chunks = [];
+    for await (const chunk of provider.sendQuery('hello', '/tmp', undefined, {
+      model: 'glm-5.2',
+    })) {
+      chunks.push(chunk);
+    }
+
+    const result = chunks.find(c => c.type === 'result');
+    expect(result).toBeDefined();
+    // Narrow to the result variant for the served-model assertion.
+    expect(result && 'servedModelId' in result ? result.servedModelId : undefined).toBe(
+      'z-ai/glm-5.2-20260616'
+    );
+  });
 });

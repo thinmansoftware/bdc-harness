@@ -100,8 +100,19 @@ export class GlmProvider implements IAgentProvider {
 
     let accumulatedContent = '';
     let usage: OpenAI.CompletionUsage | undefined;
+    // Layer 1 served-model capture (WO-HARNESS-LAYER1-SERVED-MODEL-CAPTURE-01):
+    // OpenRouter SSE chunks carry the served model on every chunk (per the
+    // OpenAI wire protocol). Capture the LAST non-empty value -- in practice
+    // every chunk repeats the same value, but reading the last one guards
+    // against an early empty/placeholder chunk.
+    let capturedServedModel: string | undefined;
 
     for await (const chunk of stream) {
+      // Capture served model id from any chunk that carries it.
+      if (typeof chunk.model === 'string' && chunk.model.length > 0) {
+        capturedServedModel = chunk.model;
+      }
+
       // Capture usage from final chunk (present when include_usage: true)
       if (chunk.usage) {
         usage = chunk.usage;
@@ -136,6 +147,7 @@ export class GlmProvider implements IAgentProvider {
         options?.outputFormat?.type === 'json_schema'
           ? tryParseJson(accumulatedContent)
           : undefined,
+      ...(capturedServedModel !== undefined ? { servedModelId: capturedServedModel } : {}),
     };
   }
 }
