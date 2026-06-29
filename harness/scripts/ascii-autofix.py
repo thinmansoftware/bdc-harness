@@ -26,8 +26,11 @@
 #
 # Safety lines:
 # - Only files matching SRC_RE are touched (source code extensions).
-# - For tracked files, only rewrites added/changed lines (diff-scoped). For
-#   untracked files, all lines are eligible.
+# - All lines in every changed file are normalized (whole-file scope), matching
+#   the gate's whole-file scan. Diff-scoped normalization was abandoned in
+#   WO-HARNESS-BDF-RESILIENCE-FIX-D-ASCII-AUTOFIX-01 because the gate's grep
+#   inspects the entire file, so pre-existing non-ASCII bytes on untouched lines
+#   would otherwise survive autofix and trip the gate on a clean ASCII diff.
 # - `\uXXXX` escape literals in source files are already ASCII bytes on disk
 #   and pass through both tiers untouched -- this is the correct pattern when
 #   source code must reference a Unicode codepoint (e.g. in a test assertion).
@@ -72,6 +75,7 @@ SUBS = {
 }
 
 SRC_RE = re.compile(r"\.(js|jsx|ts|tsx|mjs|cjs|html|sh|bash|gs|yaml|yml)$")
+# dead code -- whole-file normalization used; see WO-HARNESS-BDF-RESILIENCE-FIX-D-ASCII-AUTOFIX-01
 HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
 
 
@@ -133,6 +137,7 @@ def source_files_from_gate_scope(base: str | None) -> list[str]:
     return files
 
 
+# dead code -- whole-file normalization used; see WO-HARNESS-BDF-RESILIENCE-FIX-D-ASCII-AUTOFIX-01
 def is_untracked(path: str) -> bool:
     proc = subprocess.run(
         ["git", "ls-files", "--error-unmatch", "--", path],
@@ -143,6 +148,7 @@ def is_untracked(path: str) -> bool:
     return proc.returncode != 0
 
 
+# dead code -- whole-file normalization used; see WO-HARNESS-BDF-RESILIENCE-FIX-D-ASCII-AUTOFIX-01
 def added_lines_from_diff(args: list[str]) -> set[int]:
     diff, rc = run_git(args)
     if rc != 0 or not diff.strip():
@@ -174,6 +180,7 @@ def added_lines_from_diff(args: list[str]) -> set[int]:
     return added
 
 
+# dead code -- whole-file normalization used; see WO-HARNESS-BDF-RESILIENCE-FIX-D-ASCII-AUTOFIX-01
 def eligible_lines(base: str | None, path: str) -> set[int] | None:
     if is_untracked(path):
         return None
@@ -269,7 +276,8 @@ def main(argv: list[str]) -> int:
     for path in source_files_from_gate_scope(base):
         if not os.path.isfile(path):
             continue
-        if fix_file(path, eligible_lines(base, path)):
+        # whole-file scope: None means normalize every line, not just added lines (WO-HARNESS-BDF-RESILIENCE-FIX-D-ASCII-AUTOFIX-01)
+        if fix_file(path, None):
             modified.append(path)
 
     for path in modified:
