@@ -7,13 +7,13 @@
  * the binary-detection helper.
  *
  * Why two files:
- *   - Generated file is pure data — never hand-edited, diff on PRs shows
+ *   - Generated file is pure data -- never hand-edited, diff on PRs shows
  *     exactly which defaults changed.
  *   - Facade keeps the documented `isBinaryBuild()` wrapper in a file that
  *     humans own.
  *
  * Why inline strings (and not `import X from '...file.md' with { type: 'text' }`)?
- *   - Node cannot load `type: 'text'` import attributes — it's Bun-specific.
+ *   - Node cannot load `type: 'text'` import attributes -- it's Bun-specific.
  *     Using plain string literals keeps `@archon/workflows` importable from
  *     both runtimes, which removes SDK blocker #2.
  *   - Bun still embeds the data at compile time when building the CLI binary,
@@ -37,7 +37,7 @@ export {
  *
  * Kept as a function (rather than a direct re-export of `BUNDLED_IS_BINARY`)
  * so tests can use `spyOn(bundledDefaults, 'isBinaryBuild').mockReturnValue(...)`
- * without resorting to `mock.module('@archon/paths', ...)` — which is
+ * without resorting to `mock.module('@archon/paths', ...)` -- which is
  * process-global and irreversible in Bun and would pollute other test files.
  * See `loader.test.ts` for context.
  */

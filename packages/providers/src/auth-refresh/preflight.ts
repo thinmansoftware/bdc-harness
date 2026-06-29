@@ -112,11 +112,11 @@ export async function ensureFreshAuth(provider: ProviderName): Promise<void> {
 
   getLog().info({ provider }, 'provider_preflight_refresh_attempt');
 
-  // BDC fork: Layer 4 — for Codex only, attempt a binary-driven soft refresh
+  // BDC fork: Layer 4 -- for Codex only, attempt a binary-driven soft refresh
   // FIRST. OpenAI's documented pattern is "run Codex and persist the updated
   // auth.json"; calling the OAuth refresh endpoint directly is explicitly
   // discouraged. If the binary self-refreshes we skip the direct POST.
-  // Research doc §Design recommendation L4.
+  // Research doc Section Design recommendation L4.
   if (provider === 'codex') {
     try {
       // Imported lazily to keep the auth-refresh package free of codex

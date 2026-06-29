@@ -75,8 +75,8 @@ describe('getPort', () => {
 });
 
 // Integration test notes (manual verification):
-// 1. Run in main repo: `bun dev` → should use port 3000 with log "Using default port"
-// 2. Run in worktree: `bun dev` → should auto-allocate port 3XXX with "Worktree detected" log
-// 3. Override: `PORT=4000 bun dev` → should use 4000 (both contexts)
-// 4. Multiple worktrees: Start in 2+ worktrees → different ports
-// 5. Invalid PORT: `PORT=abc bun dev` → should exit with error message
+// 1. Run in main repo: `bun dev` -> should use port 3000 with log "Using default port"
+// 2. Run in worktree: `bun dev` -> should auto-allocate port 3XXX with "Worktree detected" log
+// 3. Override: `PORT=4000 bun dev` -> should use 4000 (both contexts)
+// 4. Multiple worktrees: Start in 2+ worktrees -> different ports
+// 5. Invalid PORT: `PORT=abc bun dev` -> should exit with error message

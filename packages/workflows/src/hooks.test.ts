@@ -237,7 +237,7 @@ nodes:
             decision: block
 `;
     const result = parseWorkflow(yaml, 'test.yaml');
-    // Bash nodes ignore AI fields including hooks — the node should parse successfully
+    // Bash nodes ignore AI fields including hooks -- the node should parse successfully
     // but hooks should not be on the parsed node
     expect(result.error).toBeNull();
     const node = result.workflow!.nodes![0];

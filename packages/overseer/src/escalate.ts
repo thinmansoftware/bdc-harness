@@ -16,12 +16,12 @@
  *     and the webhook STILL fire. The contract is "operator gets at least one signal".
  *   - Idempotent for escalation.json (overwrites cleanly) and webhook (downstream
  *     n8n flow keys on wo_id). Notion comment posts once per (runId, errorClass) by
- *     embedding the runId in the comment body — operators can re-trigger if they
+ *     embedding the runId in the comment body -- operators can re-trigger if they
  *     intentionally retry the same run.
  *   - Notion API access uses the REST API directly (not MCP) so it works inside the
  *     bun-only container at workflow runtime.
  *
- * Anchor: 2026-05-18 Wave A — silent exit-1 on commit-and-push lost work on
+ * Anchor: 2026-05-18 Wave A -- silent exit-1 on commit-and-push lost work on
  * WO-AUTH-RETIRE-GAS-PATH-02 and WO-AUTH-SINGLE-PATH-E2E-04. This module is the
  * mechanism that ensures no Cauldron failure ever exits silently again.
  */
@@ -64,7 +64,7 @@ const DEFAULT_BUILDER_MONITOR_URL = 'https://n8n.bluedevilcollectibles.com/webho
  *
  * Side effects are best-effort and isolated: if any one of (escalation.json /
  * Notion comment / webhook) fails, the others are still attempted. Errors are
- * captured and surfaced via the return value rather than thrown — the caller
+ * captured and surfaced via the return value rather than thrown -- the caller
  * (overseer-bridge) is in a node-failure code path and should not amplify the
  * failure with an escalation-side error.
  */
@@ -75,7 +75,7 @@ export async function runEscalation(
 ): Promise<void> {
   const timestamp = new Date().toISOString();
 
-  // Always start with the on-disk artifact — it is the most reliable signal
+  // Always start with the on-disk artifact -- it is the most reliable signal
   // (no network, no auth, no third-party). Even if everything else fails the
   // operator can grep ARCHON_HOME for escalation.json on the host.
   const archonHome = getArchonHome();
@@ -94,13 +94,13 @@ export async function runEscalation(
     await mkdir(runDir, { recursive: true });
     await writeFile(escalationPath, JSON.stringify(payload, null, 2) + '\n', 'utf8');
   } catch (err) {
-    // Stderr-only — no logger in @archon/overseer to keep the package dep-free.
+    // Stderr-only -- no logger in @archon/overseer to keep the package dep-free.
     // The bridge will see the absence of escalation.json via a fs.stat() check
     // if it cares; for now we surface to the container log.
     console.error('[overseer/escalate] failed to write escalation.json:', err);
   }
 
-  // Webhook fires regardless of Notion outcome — keeps the dashboard the source
+  // Webhook fires regardless of Notion outcome -- keeps the dashboard the source
   // of truth even when Notion is degraded.
   await postBuilderMonitorWebhook(context, decision, runId).catch(err => {
     console.error('[overseer/escalate] builder-monitor webhook failed:', err);
@@ -214,7 +214,7 @@ async function postNotionComment(
  * column. Returns null if no match or if Notion returns an error.
  *
  * BDC's WO database surfaces the WO ID under different property names depending
- * on the row — we try the common ones in order. This is intentionally tolerant:
+ * on the row -- we try the common ones in order. This is intentionally tolerant:
  * the goal is best-effort discovery, not exact-schema enforcement.
  */
 async function lookupNotionPageId(

@@ -214,7 +214,7 @@ describe('scanScriptDir depth cap', () => {
   });
 });
 
-describe('discoverScriptsForCwd — merge repo + home with repo winning', () => {
+describe('discoverScriptsForCwd -- merge repo + home with repo winning', () => {
   beforeEach(() => {
     mockReaddir.mockReset();
     mockStat.mockReset();

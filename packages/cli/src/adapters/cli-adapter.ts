@@ -21,7 +21,7 @@ export interface CLIAdapterOptions {
 
 export class CLIAdapter implements IPlatformAdapter {
   private readonly streamingMode: 'stream' | 'batch';
-  private readonly dbIdMap = new Map<string, string>(); // platform_conversation_id → DB UUID
+  private readonly dbIdMap = new Map<string, string>(); // platform_conversation_id -> DB UUID
 
   constructor(options?: CLIAdapterOptions) {
     this.streamingMode = options?.streamingMode ?? 'batch';

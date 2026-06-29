@@ -48,7 +48,7 @@ import {
  * Pure read of registered provider IDs. Registration is guaranteed by
  * `loadConfig()`'s bootstrap call before any consumer can observe the
  * registry, so this helper must NOT trigger side-effecting registration
- * itself — that hid the ordering coupling and surprised readers.
+ * itself -- that hid the ordering coupling and surprised readers.
  */
 function getRegisteredProviderNames(): string[] {
   return getRegisteredProviders().map(p => p.id);
@@ -58,7 +58,7 @@ function mergeAssistantDefaults(
   base: AssistantDefaults,
   overrides?: AssistantDefaultsConfig
 ): AssistantDefaults {
-  // Deep-copy every provider slot present in base. No per-provider listing —
+  // Deep-copy every provider slot present in base. No per-provider listing --
   // adding a new community provider must not require editing this function.
   const merged: AssistantDefaults = { ...base };
   for (const [providerId, providerDefaults] of Object.entries(base)) {
@@ -86,7 +86,7 @@ function mergeAssistantDefaults(
  * **Allowlist (not denylist) by design.** Any field not listed here is
  * dropped on its way out. New sensitive fields on a provider default
  * config (binary paths, credentials, absolute filesystem paths, etc.)
- * are hidden by default — you have to opt in to expose them.
+ * are hidden by default -- you have to opt in to expose them.
  *
  * Unknown provider IDs (community providers not listed below) fall back
  * to the generic empty allowlist: the web UI sees the provider exists,
@@ -96,7 +96,7 @@ function mergeAssistantDefaults(
 const SAFE_ASSISTANT_FIELDS: Record<string, readonly string[]> = {
   claude: ['model'],
   codex: ['model', 'modelReasoningEffort', 'webSearchMode'],
-  // community providers — list each field we're confident is safe to
+  // community providers -- list each field we're confident is safe to
   // show in the web UI. Unknown providers fall through with no fields.
   pi: ['model'],
 };
@@ -261,7 +261,7 @@ export async function loadRepoConfig(repoPath: string): Promise<RepoConfig> {
  * Get default configuration
  */
 function getDefaults(): MergedConfig {
-  // Seed one empty entry per registered provider — built-in OR community.
+  // Seed one empty entry per registered provider -- built-in OR community.
   // No per-provider listing here: adding a new provider must not require
   // editing this function. `registerBuiltinProviders()` + any community
   // registrations run at process bootstrap (see `packages/providers/src/
@@ -313,7 +313,7 @@ function applyEnvOverrides(config: MergedConfig): MergedConfig {
     config.botName = envBotName;
   }
 
-  // Assistant override — validate against registry, error on unknown provider
+  // Assistant override -- validate against registry, error on unknown provider
   const envAssistant = process.env.DEFAULT_AI_ASSISTANT;
   if (envAssistant && envAssistant.length > 0) {
     if (isRegisteredProvider(envAssistant)) {
@@ -372,7 +372,7 @@ function mergeGlobalConfig(defaults: MergedConfig, global: GlobalConfig): Merged
     result.botName = global.botName;
   }
 
-  // Assistant preference — validate against registry
+  // Assistant preference -- validate against registry
   if (global.defaultAssistant) {
     if (isRegisteredProvider(global.defaultAssistant)) {
       result.assistant = global.defaultAssistant;
@@ -416,7 +416,7 @@ function mergeRepoConfig(merged: MergedConfig, repo: RepoConfig): MergedConfig {
     assistants: mergeAssistantDefaults(merged.assistants),
   };
 
-  // Assistant override (repo-level takes precedence) — validate against registry
+  // Assistant override (repo-level takes precedence) -- validate against registry
   if (repo.assistant) {
     if (isRegisteredProvider(repo.assistant)) {
       result.assistant = repo.assistant;

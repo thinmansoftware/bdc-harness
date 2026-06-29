@@ -374,7 +374,7 @@ describe('git utilities', () => {
 
     test('returns true when codebaseName is invalid (falls back to path-derived)', () => {
       // Under the two-layout model the helper always returns true for any resolvable
-      // owner/repo. Invalid codebaseName + valid repo path → still workspace-scoped.
+      // owner/repo. Invalid codebaseName + valid repo path -> still workspace-scoped.
       delete process.env.WORKSPACE_PATH;
       delete process.env.ARCHON_DOCKER;
       delete process.env.ARCHON_HOME;

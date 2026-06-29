@@ -4,10 +4,10 @@
  * Given a classified error + attempt count, returns what the executor should do:
  *   - retry (with optional backoff hint)
  *   - skip (continue workflow, mark node as warning)
- *   - commit_and_push_anyway (work is good despite node failure — proceed to PR)
- *   - escalate (preserve current behavior — abort + log diagnostic)
+ *   - commit_and_push_anyway (work is good despite node failure -- proceed to PR)
+ *   - escalate (preserve current behavior -- abort + log diagnostic)
  *
- * Design authority: 2026-05-09 WO-HARNESS-OVERLORD-ROUTING-INTEGRATION-01 §4.3.
+ * Design authority: 2026-05-09 WO-HARNESS-OVERLORD-ROUTING-INTEGRATION-01 Section 4.3.
  * Minimal v1 scope: classification-based decisions only. Future v2: per-WO-class rules,
  * provider failover routing, grader integration.
  */
@@ -22,7 +22,7 @@ export interface DecideInput {
   attempt: number;
   /** Optional: did the node produce any output before failing? (for sentinel-mismatch heuristic) */
   hasOutput?: boolean;
-  /** Node ID — some decisions are node-type aware */
+  /** Node ID -- some decisions are node-type aware */
   nodeId?: string;
   /**
    * Optional war-council-validator stdout from a sibling node. Surfaced into
@@ -30,7 +30,7 @@ export interface DecideInput {
    * verbatim remediation list in the Notion comment / escalation.json.
    */
   validatorOutput?: string;
-  /** Optional WO ID parsed from the user message — surfaced into escalationContext. */
+  /** Optional WO ID parsed from the user message -- surfaced into escalationContext. */
   woId?: string;
 }
 
@@ -81,7 +81,7 @@ function extractRemediation(validatorOutput: string | undefined): string[] | und
 
 /**
  * Decide what to do given an error class + attempt count.
- * Returns "escalate" for unknown classes (preserve old behavior — don't auto-recover unknowns).
+ * Returns "escalate" for unknown classes (preserve old behavior -- don't auto-recover unknowns).
  */
 export function decide(input: DecideInput): DecisionResult {
   const { errorClass, attempt, hasOutput, validatorOutput, woId, nodeId } = input;
@@ -111,20 +111,20 @@ export function decide(input: DecideInput): DecisionResult {
       // Provider failover would handle this in v2; for now escalate
       return {
         decision: 'escalate',
-        reason: 'out of credits — provider failover not yet wired (deferred to Overseer v2)',
+        reason: 'out of credits -- provider failover not yet wired (deferred to Overseer v2)',
       };
 
     case 'auth_failed':
       // OAuth refresh runs on cron (deployed 2026-05-16). If we hit this, the timer hasn't caught it.
       return {
         decision: 'escalate',
-        reason: 'auth failed — needs operator /login (refresh timer cycle may not have run yet)',
+        reason: 'auth failed -- needs operator /login (refresh timer cycle may not have run yet)',
       };
 
     case 'invalid_request':
       return {
         decision: 'escalate',
-        reason: 'invalid request shape — likely YAML/code bug, not transient',
+        reason: 'invalid request shape -- likely YAML/code bug, not transient',
       };
 
     // --- Workflow-runtime classes (BDC-specific 2026-05-16) ---
@@ -132,16 +132,16 @@ export function decide(input: DecideInput): DecisionResult {
     case 'sentinel_mismatch':
       // Agent finished work but didn't emit the literal `until:` string.
       // Per Patch 3 (multi-sentinel), future loops emit all 3 standard sentinels.
-      // For legacy loops: if agent produced output, the work is likely good — try to ship it.
+      // For legacy loops: if agent produced output, the work is likely good -- try to ship it.
       if (hasOutput) {
         return {
           decision: 'commit_and_push_anyway',
-          reason: "agent produced output but didn't emit sentinel — work likely complete, ship it",
+          reason: "agent produced output but didn't emit sentinel -- work likely complete, ship it",
         };
       }
       return {
         decision: 'escalate',
-        reason: 'loop ended without output AND without sentinel — likely real failure',
+        reason: 'loop ended without output AND without sentinel -- likely real failure',
       };
 
     case 'npm_not_found':
@@ -150,7 +150,7 @@ export function decide(input: DecideInput): DecisionResult {
       return {
         decision: 'skip',
         reason:
-          'node uses npm/npx/pnpm/yarn but container is bun-only — skip this verify-* style node, continue workflow',
+          'node uses npm/npx/pnpm/yarn but container is bun-only -- skip this verify-* style node, continue workflow',
       };
 
     case 'verify_pre_existing':
@@ -160,7 +160,7 @@ export function decide(input: DecideInput): DecisionResult {
       return {
         decision: 'skip',
         reason:
-          'verify-* node failed on pre-existing rot, not WO change — skip, continue to commit + PR',
+          'verify-* node failed on pre-existing rot, not WO change -- skip, continue to commit + PR',
       };
 
     case 'worktree_collision':
@@ -170,7 +170,7 @@ export function decide(input: DecideInput): DecisionResult {
       return {
         decision: 'escalate',
         reason:
-          'worktree collision — YAML should use timestamped branch per Rule 17 (legacy YAML to patch)',
+          'worktree collision -- YAML should use timestamped branch per Rule 17 (legacy YAML to patch)',
       };
 
     case 'branch_ref_missing':
@@ -179,24 +179,24 @@ export function decide(input: DecideInput): DecisionResult {
       return {
         decision: 'escalate',
         reason:
-          'branch ref missing — YAML hardcodes master/main, should use dynamic default-branch detection (Rule 16)',
+          'branch ref missing -- YAML hardcodes master/main, should use dynamic default-branch detection (Rule 16)',
       };
 
     case 'spec_lookup_failed':
       // read-spec couldn't fetch the WO spec from bdc-xo main.
-      // If attempt 1, possible the spec PR just landed and there's a propagation delay — retry once.
+      // If attempt 1, possible the spec PR just landed and there's a propagation delay -- retry once.
       if (attempt < 2) {
         return {
           decision: 'retry',
           reason:
-            'spec lookup failed on first attempt — possible bdc-xo main propagation delay, retry once',
+            'spec lookup failed on first attempt -- possible bdc-xo main propagation delay, retry once',
           backoffMs: 5000,
         };
       }
       return {
         decision: 'escalate',
         reason:
-          'spec lookup failed on retry — WO_ID may not exist on bdc-xo main, operator must check',
+          'spec lookup failed on retry -- WO_ID may not exist on bdc-xo main, operator must check',
       };
 
     // --- Silent-dead-end classes (BDC-specific 2026-05-18 Wave A anchor incidents) ---
@@ -204,13 +204,13 @@ export function decide(input: DecideInput): DecisionResult {
     // All four escalate with a populated `escalationContext`. The executor wires this
     // through to runEscalation (escalate.ts), which writes escalation.json, posts a
     // Notion comment on the WO page, and fires the builder-monitor webhook. Notion
-    // status stays IN_PROGRESS — operator decides next step from the escalation.
+    // status stays IN_PROGRESS -- operator decides next step from the escalation.
 
     case 'implement_loop_no_output':
       return {
         decision: 'escalate',
         reason:
-          'commit-and-push: no changed files and no commits ahead — agent produced no work, no validator feedback to act on',
+          'commit-and-push: no changed files and no commits ahead -- agent produced no work, no validator feedback to act on',
         escalationContext: {
           errorClass: 'implement_loop_no_output',
           nodeId,
@@ -224,7 +224,7 @@ export function decide(input: DecideInput): DecisionResult {
       return {
         decision: 'escalate',
         reason:
-          'commit-and-push: clean tree after validator emitted actionable remediation — agent did not iterate on feedback',
+          'commit-and-push: clean tree after validator emitted actionable remediation -- agent did not iterate on feedback',
         escalationContext: {
           errorClass: 'validator_feedback_not_applied',
           nodeId,
@@ -238,7 +238,7 @@ export function decide(input: DecideInput): DecisionResult {
       return {
         decision: 'escalate',
         reason:
-          'war-council-validator rejected with REJECT/BLOCK/FAIL — work cannot proceed without operator triage',
+          'war-council-validator rejected with REJECT/BLOCK/FAIL -- work cannot proceed without operator triage',
         escalationContext: {
           errorClass: 'validator_rejected',
           nodeId,
@@ -252,7 +252,7 @@ export function decide(input: DecideInput): DecisionResult {
       return {
         decision: 'escalate',
         reason:
-          'commit-and-push: thread branch HEAD-only, no commits anywhere — agent never wrote to disk',
+          'commit-and-push: thread branch HEAD-only, no commits anywhere -- agent never wrote to disk',
         escalationContext: {
           errorClass: 'implement_loop_skipped',
           nodeId,
@@ -266,7 +266,7 @@ export function decide(input: DecideInput): DecisionResult {
     default:
       return {
         decision: 'escalate',
-        reason: 'unknown error class — preserve current behavior (abort + log diagnostic)',
+        reason: 'unknown error class -- preserve current behavior (abort + log diagnostic)',
       };
   }
 }

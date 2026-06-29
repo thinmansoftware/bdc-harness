@@ -106,7 +106,7 @@ function formatNodeIssue(id: string, issue: z.ZodIssue): string {
  * parseNodeHooks + parseIdleTimeout functions.
  */
 function parseDagNode(raw: unknown, index: number, errors: string[]): DagNode | null {
-  // Extract id early for error messages (may be empty/invalid — schema will catch it)
+  // Extract id early for error messages (may be empty/invalid -- schema will catch it)
   const rawId =
     raw !== null && typeof raw === 'object' && 'id' in raw
       ? String((raw as Record<string, unknown>).id)
@@ -288,7 +288,7 @@ export function parseWorkflow(content: string, filename: string): ParseResult {
     const hasSteps = Array.isArray(raw.steps) && raw.steps.length > 0;
     if (hasSteps) {
       errors.push(
-        '`steps:` format has been removed. Workflows now use `nodes:` (DAG) format exclusively. Your bundled defaults are already updated — custom workflows need manual migration. See docs/sequential-dag-migration-guide.md for conversion patterns, or run: claude "Read docs/sequential-dag-migration-guide.md then convert .archon/workflows/<file> to nodes: format"'
+        '`steps:` format has been removed. Workflows now use `nodes:` (DAG) format exclusively. Your bundled defaults are already updated -- custom workflows need manual migration. See docs/sequential-dag-migration-guide.md for conversion patterns, or run: claude "Read docs/sequential-dag-migration-guide.md then convert .archon/workflows/<file> to nodes: format"'
       );
     }
 
@@ -352,7 +352,7 @@ export function parseWorkflow(content: string, filename: string): ParseResult {
     const model = typeof raw.model === 'string' ? raw.model : undefined;
 
     // Validate provider identity at load time, both at the workflow level and
-    // per node. Model strings are NOT validated — they pass through to the SDK
+    // per node. Model strings are NOT validated -- they pass through to the SDK
     // at run time, which is the source of truth for what model names exist
     // (vendor SDKs ship new models faster than Archon can update).
     if (provider && !isRegisteredProvider(provider)) {
@@ -382,7 +382,7 @@ export function parseWorkflow(content: string, filename: string): ParseResult {
       }
     }
 
-    // Validate modelReasoningEffort — warn and ignore invalid values (preserve original behavior)
+    // Validate modelReasoningEffort -- warn and ignore invalid values (preserve original behavior)
     const modelReasoningEffortResult = modelReasoningEffortSchema.safeParse(
       raw.modelReasoningEffort
     );
@@ -396,7 +396,7 @@ export function parseWorkflow(content: string, filename: string): ParseResult {
       );
     }
 
-    // Validate webSearchMode — warn and ignore invalid values (preserve original behavior)
+    // Validate webSearchMode -- warn and ignore invalid values (preserve original behavior)
     const webSearchModeResult = webSearchModeSchema.safeParse(raw.webSearchMode);
     const webSearchMode = webSearchModeResult.success ? webSearchModeResult.data : undefined;
     if (raw.webSearchMode !== undefined && !webSearchModeResult.success) {
@@ -406,7 +406,7 @@ export function parseWorkflow(content: string, filename: string): ParseResult {
       );
     }
 
-    // Filter additionalDirectories — warn on non-strings (preserve original behavior)
+    // Filter additionalDirectories -- warn on non-strings (preserve original behavior)
     const additionalDirectories = Array.isArray(raw.additionalDirectories)
       ? raw.additionalDirectories.filter((d: unknown) => {
           if (typeof d !== 'string') {
@@ -432,7 +432,7 @@ export function parseWorkflow(content: string, filename: string): ParseResult {
     }
 
     // Parse workflow-level worktree policy. Same warn-and-ignore pattern used
-    // for `interactive` / `modelReasoningEffort` — invalid values are dropped
+    // for `interactive` / `modelReasoningEffort` -- invalid values are dropped
     // rather than rejected, so a typo in one workflow doesn't nuke the whole
     // discovery pass. Only `worktree.enabled` is recognised today.
     let worktreePolicy: { enabled?: boolean } | undefined;
@@ -453,7 +453,7 @@ export function parseWorkflow(content: string, filename: string): ParseResult {
       }
     }
 
-    // Parse mutates_checkout — boolean, omitted means true (run the path-lock guard).
+    // Parse mutates_checkout -- boolean, omitted means true (run the path-lock guard).
     // Same parse/warn pattern as `interactive` (invalid non-boolean values are dropped).
     // When false, the executor skips the path-lock guard and allows concurrent runs on the same checkout.
     let mutatesCheckout: boolean | undefined;
@@ -468,7 +468,7 @@ export function parseWorkflow(content: string, filename: string): ParseResult {
       }
     }
 
-    // Parse optional tags — type-narrow, trim, and dedupe so authors can't
+    // Parse optional tags -- type-narrow, trim, and dedupe so authors can't
     // ship ["GitLab", "GitLab ", "gitlab"] as three distinct values.
     // An explicit empty array is preserved (suppresses keyword inference in the
     // UI); an absent or invalid block leaves `tags` undefined (falls back to
@@ -487,7 +487,7 @@ export function parseWorkflow(content: string, filename: string): ParseResult {
       getLog().warn({ filename, value: raw.tags }, 'invalid_tags_block_ignored');
     }
 
-    // Parse optional target_repo — Rule 28 cross-repo guard.
+    // Parse optional target_repo -- Rule 28 cross-repo guard.
     // Must be a non-empty string (owner/repo). Invalid values are warned and ignored.
     let targetRepo: string | undefined;
     if (typeof raw.target_repo === 'string' && raw.target_repo.trim().length > 0) {
@@ -496,11 +496,11 @@ export function parseWorkflow(content: string, filename: string): ParseResult {
       getLog().warn({ filename, value: raw.target_repo }, 'invalid_target_repo_ignored');
     }
 
-    // Parse optional policyFile — BDC Universal Agent Behavior Policy loader.
+    // Parse optional policyFile -- BDC Universal Agent Behavior Policy loader.
     // The executor reads this and either loads the file from the worktree or
     // falls back to the bundled canonical policy (BUNDLED_POLICIES). Before this
     // block existed, the loader silently dropped raw.policyFile from the
-    // returned workflow object so workflow.policyFile was always undefined —
+    // returned workflow object so workflow.policyFile was always undefined --
     // making the executor's applyWorkflowPolicyFile() dead code for any
     // workflow loaded via YAML discovery. Anchor: WO-HARNESS-POLICYFILE-NOT-ENFORCED-01.
     let policyFile: string | undefined;

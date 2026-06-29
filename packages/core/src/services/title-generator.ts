@@ -3,7 +3,7 @@
  *
  * Generates concise 3-6 word titles using the configured AI assistant.
  * Optionally uses TITLE_GENERATION_MODEL env var for a cheaper/faster model.
- * Designed to be fire-and-forget — never throws, all errors logged internally.
+ * Designed to be fire-and-forget -- never throws, all errors logged internally.
  */
 import { getAgentProvider } from '@archon/providers';
 import * as conversationDb from '../db/conversations';
@@ -22,7 +22,7 @@ const MAX_TITLE_LENGTH = 100;
 /**
  * Generate and save a conversation title using AI.
  *
- * Fire-and-forget safe — catches all errors internally.
+ * Fire-and-forget safe -- catches all errors internally.
  *
  * @param conversationDbId - Database UUID of the conversation
  * @param userMessage - The user's message to generate a title from
@@ -52,7 +52,7 @@ export async function generateAndSetTitle(
 
     for await (const chunk of client.sendQuery(titlePrompt, cwd, undefined, {
       model: titleModel,
-      nodeConfig: { allowed_tools: [] }, // No tool access — pure text generation
+      nodeConfig: { allowed_tools: [] }, // No tool access -- pure text generation
     })) {
       if (chunk.type === 'assistant') {
         generatedTitle += chunk.content;
@@ -74,14 +74,14 @@ export async function generateAndSetTitle(
   } catch (error) {
     const err = error as Error;
     getLog().warn({ err, conversationDbId }, 'title.generate_failed');
-    // Fire-and-forget — do NOT re-throw.
+    // Fire-and-forget -- do NOT re-throw.
     // Fallback: try to set a truncated message title
     try {
       const fallback = truncateMessage(userMessage);
       await conversationDb.updateConversationTitle(conversationDbId, fallback);
       getLog().info({ conversationDbId, title: fallback }, 'title.fallback_set');
     } catch (_fallbackErr: unknown) {
-      // Double failure — just log and move on
+      // Double failure -- just log and move on
       getLog().warn({ conversationDbId }, 'title.fallback_also_failed');
     }
   }
@@ -93,7 +93,7 @@ export async function generateAndSetTitle(
 function buildTitlePrompt(userMessage: string, workflowName?: string): string {
   const context = workflowName ? `\nWorkflow: ${workflowName}` : '';
 
-  return `Generate a concise conversation title (3-6 words) for this user message. The title should capture the essence of what the user is asking or doing. Return ONLY the title text, nothing else — no quotes, no punctuation at the end, no explanation.
+  return `Generate a concise conversation title (3-6 words) for this user message. The title should capture the essence of what the user is asking or doing. Return ONLY the title text, nothing else -- no quotes, no punctuation at the end, no explanation.
 ${context}
 User message: ${userMessage.slice(0, 500)}`;
 }

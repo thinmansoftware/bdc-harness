@@ -108,7 +108,7 @@ Prompt.`;
 });
 
 // ---------------------------------------------------------------------------
-// loadAgentFile — happy path
+// loadAgentFile -- happy path
 // ---------------------------------------------------------------------------
 
 describe('loadAgentFile happy path', () => {
@@ -136,7 +136,7 @@ System prompt here.
 });
 
 // ---------------------------------------------------------------------------
-// loadAgentFile — error codes (fail-closed)
+// loadAgentFile -- error codes (fail-closed)
 // ---------------------------------------------------------------------------
 
 describe('loadAgentFile error codes', () => {
@@ -308,7 +308,7 @@ describe('loadAgentRegistry', () => {
   test('throws on first invalid file (fail-closed)', async () => {
     await writeAgent('valid-agent.md', VALID_AGENT.replace('test-agent', 'valid-agent'));
     // Invalid: a model is present but is not a known alias (agent_invalid_model).
-    // (A missing model is now valid — codex personas omit it.)
+    // (A missing model is now valid -- codex personas omit it.)
     await writeAgent('bad-agent.md', '---\nname: bad-agent\nmodel: gpt-9000\n---\n\nBad alias.');
 
     let err: AgentRegistryError | null = null;
@@ -370,7 +370,7 @@ describe('resolveAgent', () => {
 });
 
 // ---------------------------------------------------------------------------
-// parseFrontmatter — nested context: block
+// parseFrontmatter -- nested context: block
 // ---------------------------------------------------------------------------
 
 describe('parseFrontmatter nested context:', () => {
@@ -416,7 +416,7 @@ describe('parseFrontmatter nested context:', () => {
 });
 
 // ---------------------------------------------------------------------------
-// loadAgentFile — context validation (agent_invalid_context)
+// loadAgentFile -- context validation (agent_invalid_context)
 // ---------------------------------------------------------------------------
 
 describe('loadAgentFile context validation', () => {

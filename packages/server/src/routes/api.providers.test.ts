@@ -10,7 +10,7 @@ import {
 } from '../test/workflow-mock-factories';
 
 // ---------------------------------------------------------------------------
-// Mock setup — must be before dynamic imports
+// Mock setup -- must be before dynamic imports
 // ---------------------------------------------------------------------------
 
 const mockLoadConfig = mock(async () => ({

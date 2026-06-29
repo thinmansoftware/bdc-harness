@@ -1,15 +1,15 @@
-// CONTRACT LAYER — no SDK imports, no runtime deps.
+// CONTRACT LAYER -- no SDK imports, no runtime deps.
 // @archon/workflows and @archon/core import from this subpath (@archon/providers/types).
 // HARD RULE: This file must never import SDK packages or other @archon/* packages.
 
-// ─── Provider Config Defaults ──────────────────────────────────────────────
-// Canonical definitions — @archon/core/config/config-types.ts imports from here.
+// --- Provider Config Defaults ----------------------------------------------
+// Canonical definitions -- @archon/core/config/config-types.ts imports from here.
 // Single source of truth for provider-specific config shapes.
 
 export interface ClaudeProviderDefaults {
   [key: string]: unknown;
   model?: string;
-  /** Claude Code settingSources — controls which sources the SDK loads:
+  /** Claude Code settingSources -- controls which sources the SDK loads:
    *  CLAUDE.md, skills, commands, agents, and hooks. Both project-level
    *  (`<cwd>/.claude/`) and user-level (`~/.claude/`) are loaded by default.
    *  Set explicitly to `['project']` to scope a workflow to project-only
@@ -45,10 +45,10 @@ export interface PiProviderDefaults {
   model?: string;
   /**
    * Opt-in to Pi's extension discovery (tools + lifecycle hooks from community
-   * packages — see https://shittycodingagent.ai/packages). When true, Pi loads
+   * packages -- see https://shittycodingagent.ai/packages). When true, Pi loads
    * extensions from `~/.pi/agent/extensions/`, `~/.pi/agent/settings.json`
    * packages, AND the workflow's cwd (`<cwd>/.pi/extensions/`,
-   * `<cwd>/.pi/settings.json`). The cwd scope is the risky one — a workflow
+   * `<cwd>/.pi/settings.json`). The cwd scope is the risky one -- a workflow
    * running against an untrusted repo can auto-load whatever extension code
    * that repo ships. Disabled by default to preserve the "Archon is source of
    * truth" trust boundary. Flip to true only on hosts whose workflows run
@@ -73,7 +73,7 @@ export interface PiProviderDefaults {
   /**
    * Environment variables injected into `process.env` at session start so
    * in-process extensions (which read `process.env` directly) pick them up.
-   * Existing `process.env` entries are NOT overridden — shell env wins over
+   * Existing `process.env` entries are NOT overridden -- shell env wins over
    * config. Use for extension-config vars like `PLANNOTATOR_REMOTE=1` that
    * must be present before the extension's `session_start` hook runs.
    *
@@ -187,7 +187,7 @@ export type MessageChunk =
       toolInput?: Record<string, unknown>;
       /** Stable per-call ID from the underlying SDK (e.g. Claude `tool_use_id`).
        *  When present, the platform adapter uses it directly instead of generating
-       *  one — guarantees `tool_call`/`tool_result` pair correctly even when
+       *  one -- guarantees `tool_call`/`tool_result` pair correctly even when
        *  multiple tools with the same name run concurrently. */
       toolCallId?: string;
     }
@@ -212,7 +212,7 @@ export interface AgentRequestOptions {
   env?: Record<string, string>;
   maxBudgetUsd?: number;
   fallbackModel?: string;
-  /** Session fork flag — when true, copies prior session history before appending. */
+  /** Session fork flag -- when true, copies prior session history before appending. */
   forkSession?: boolean;
   /** When false, skip writing session transcript to disk. */
   persistSession?: boolean;
@@ -232,7 +232,7 @@ export interface NodeConfig {
    * Intentional hand-written duplicate of `agentDefinitionSchema` (authoritative
    * source: `@archon/workflows/schemas/dag-node`). Normally we follow the
    * project rule "derive types from Zod via `z.infer`, never write parallel
-   * interfaces" — broken here on purpose: `@archon/providers/types` is the
+   * interfaces" -- broken here on purpose: `@archon/providers/types` is the
    * contract subpath consumed by `@archon/workflows`, so importing from
    * `@archon/workflows` would create a circular dependency.
    *
@@ -272,7 +272,7 @@ export interface NodeConfig {
  * The workflow path additionally passes nodeConfig and assistantConfig.
  */
 export interface SendQueryOptions extends AgentRequestOptions {
-  /** Raw YAML node config — provider translates internally to SDK-specific options. */
+  /** Raw YAML node config -- provider translates internally to SDK-specific options. */
   nodeConfig?: NodeConfig;
   /** Per-provider defaults from .archon/config.yaml assistants section. */
   assistantConfig?: Record<string, unknown>;
@@ -305,7 +305,7 @@ export interface ProviderCapabilities {
  * The registry is the source of truth for provider identity, capabilities, and display.
  */
 export interface ProviderRegistration {
-  /** Unique provider identifier — used in YAML, config, DB */
+  /** Unique provider identifier -- used in YAML, config, DB */
   id: string;
 
   /** Human-readable name for UI display */
@@ -314,7 +314,7 @@ export interface ProviderRegistration {
   /** Instantiate a provider */
   factory: () => IAgentProvider;
 
-  /** Static capability declaration — used for dag-executor warnings */
+  /** Static capability declaration -- used for dag-executor warnings */
   capabilities: ProviderCapabilities;
 
   /** Whether this is a built-in (maintained by core team) or community provider */

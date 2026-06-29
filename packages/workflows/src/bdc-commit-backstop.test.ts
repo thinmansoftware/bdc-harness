@@ -7,7 +7,7 @@
  * bdc-cleanup-sweep.yaml, and bdc-doctrine-update.yaml commit-and-push nodes.
  *
  * Runs in a real temp git repo via Bun.spawnSync so no mock.module() calls are
- * needed — safe to run in its own bun test invocation without cross-file pollution.
+ * needed -- safe to run in its own bun test invocation without cross-file pollution.
  */
 
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
@@ -136,7 +136,7 @@ describe('commit-and-push backstop logic', () => {
       writeFileSync(join(worktreeDir, 'feature.ts'), 'export const x = 1;\n');
       git(['add', 'feature.ts'], worktreeDir);
       git(['commit', '-m', 'feat: implement work'], worktreeDir);
-      // Do NOT push — this is the false-negative scenario
+      // Do NOT push -- this is the false-negative scenario
 
       // Working tree is clean; but HEAD is ahead of origin (no origin/feature-test yet)
       const result = bash(BACKSTOP_SCRIPT, worktreeDir, { BRANCH: 'feature-test' });
@@ -173,7 +173,7 @@ describe('commit-and-push backstop logic', () => {
   describe('Scenario D: dirty working tree (uncommitted changes)', () => {
     it('exits 0 with dirty_tree when files are modified but not committed', () => {
       writeFileSync(join(worktreeDir, 'feature.ts'), 'uncommitted work\n');
-      // Not staged, not committed — dirty tree
+      // Not staged, not committed -- dirty tree
 
       const result = bash(BACKSTOP_SCRIPT, worktreeDir, { BRANCH: 'feature-test' });
       expect(result.exitCode).toBe(0);

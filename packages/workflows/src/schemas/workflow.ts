@@ -29,7 +29,7 @@ export type WebSearchMode = z.infer<typeof webSearchModeSchema>;
 /**
  * Per-workflow worktree policy. Pins whether a run uses isolation regardless of
  * how it was invoked (CLI flags, web UI, chat). When the field is omitted the
- * caller's default applies — worktree for task/issue/pr, etc.
+ * caller's default applies -- worktree for task/issue/pr, etc.
  *
  * Currently one field (`enabled`). Other worktree-shaped settings (copyFiles,
  * initSubmodules, path, baseBranch) live in repo-level `.archon/config.yaml`
@@ -39,10 +39,10 @@ export type WebSearchMode = z.infer<typeof webSearchModeSchema>;
 export const workflowWorktreePolicySchema = z.object({
   /**
    * Pin worktree isolation on or off for this workflow.
-   * - `true`  — always run inside a worktree; CLI `--no-worktree` hard-errors
-   * - `false` — always run in the live checkout; CLI `--branch` / `--from`
+   * - `true`  -- always run inside a worktree; CLI `--no-worktree` hard-errors
+   * - `false` -- always run in the live checkout; CLI `--branch` / `--from`
    *             hard-error, orchestrator skips isolation resolution
-   * - omitted — caller decides (current default = worktree for most types)
+   * - omitted -- caller decides (current default = worktree for most types)
    */
   enabled: z.boolean().optional(),
 });
@@ -50,7 +50,7 @@ export const workflowWorktreePolicySchema = z.object({
 export type WorkflowWorktreePolicy = z.infer<typeof workflowWorktreePolicySchema>;
 
 // ---------------------------------------------------------------------------
-// WorkflowBase — common fields shared by all workflow types
+// WorkflowBase -- common fields shared by all workflow types
 // ---------------------------------------------------------------------------
 
 export const workflowBaseSchema = z.object({
@@ -91,7 +91,7 @@ export const workflowBaseSchema = z.object({
 export type WorkflowBase = z.infer<typeof workflowBaseSchema>;
 
 // ---------------------------------------------------------------------------
-// WorkflowDefinition — DAG-based workflow with nodes
+// WorkflowDefinition -- DAG-based workflow with nodes
 // ---------------------------------------------------------------------------
 
 /**
@@ -102,10 +102,10 @@ export const workflowDefinitionSchema = workflowBaseSchema.extend({
   nodes: z.array(dagNodeSchema),
   /**
    * Workflow-level input declarations with default values.
-   * In bash nodes, reference as `${input.name}` — the executor substitutes these
+   * In bash nodes, reference as `${input.name}` -- the executor substitutes these
    * before passing the script to the shell (`.` is not valid in bash identifiers,
    * so no collision with real bash parameter expansion exists).
-   * In prompt nodes, reference as `${input.name}` — the AI sees the literal token
+   * In prompt nodes, reference as `${input.name}` -- the AI sees the literal token
    * inside its system prompt, so prompt-level input interpolation is intentionally
    * left to the AI rather than the executor.
    */
@@ -116,7 +116,7 @@ export const workflowDefinitionSchema = workflowBaseSchema.extend({
 export type WorkflowDefinition = z.infer<typeof workflowDefinitionSchema> & { prompt?: never };
 
 // ---------------------------------------------------------------------------
-// LoadCommandResult — discriminated union for command load outcomes
+// LoadCommandResult -- discriminated union for command load outcomes
 // ---------------------------------------------------------------------------
 
 /**
@@ -133,7 +133,7 @@ export type LoadCommandResult =
     };
 
 // ---------------------------------------------------------------------------
-// WorkflowExecutionResult — discriminated union for execution outcomes
+// WorkflowExecutionResult -- discriminated union for execution outcomes
 // ---------------------------------------------------------------------------
 
 /**
@@ -145,14 +145,14 @@ export type WorkflowExecutionResult =
   | { success: true; paused: true; workflowRunId: string };
 
 // ---------------------------------------------------------------------------
-// WorkflowLoadError / WorkflowLoadResult — workflow discovery results
+// WorkflowLoadError / WorkflowLoadResult -- workflow discovery results
 // ---------------------------------------------------------------------------
 
 /**
  * Workflow origin:
- * - `bundled` — embedded in the Archon binary / bundled defaults
- * - `global`  — user-level, discovered at `~/.archon/workflows/` (applies to every repo)
- * - `project` — repo-local, discovered at `<repoRoot>/.archon/workflows/`
+ * - `bundled` -- embedded in the Archon binary / bundled defaults
+ * - `global`  -- user-level, discovered at `~/.archon/workflows/` (applies to every repo)
+ * - `project` -- repo-local, discovered at `<repoRoot>/.archon/workflows/`
  *
  * Precedence for same-named files: `bundled` < `global` < `project`.
  */

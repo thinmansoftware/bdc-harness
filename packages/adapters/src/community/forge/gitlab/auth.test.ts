@@ -76,7 +76,7 @@ describe('verifyWebhookToken', () => {
 
   test('returns false when both tokens are empty', () => {
     // Pre-fix: Buffer.timingSafeEqual(Buffer.from(''), Buffer.from('')) === true
-    // because two zero-length buffers are trivially equal — a real auth-bypass
+    // because two zero-length buffers are trivially equal -- a real auth-bypass
     expect(verifyWebhookToken('', '')).toBe(false);
   });
 });

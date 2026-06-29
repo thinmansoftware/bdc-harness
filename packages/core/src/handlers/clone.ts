@@ -120,7 +120,7 @@ async function registerRepoAtPath(
     };
   }
 
-  // No existing codebase — create new
+  // No existing codebase -- create new
   const codebase = await codebaseDb.createCodebase({
     name,
     repository_url: repositoryUrl ?? undefined,
@@ -308,7 +308,7 @@ export async function registerRepository(localPath: string): Promise<RegisterRes
     };
   }
 
-  // Get remote URL (optional — local-only repos may not have one)
+  // Get remote URL (optional -- local-only repos may not have one)
   let remoteUrl: string | null = null;
   try {
     const { stdout } = await execFileAsync('git', ['-C', localPath, 'remote', 'get-url', 'origin']);

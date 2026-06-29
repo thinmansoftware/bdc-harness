@@ -6,7 +6,7 @@ import { validationErrorHook } from './openapi-defaults';
 import { mockAllWorkflowModules } from '../test/workflow-mock-factories';
 
 // ---------------------------------------------------------------------------
-// Mock setup — must be declared before any dynamic imports of mocked modules
+// Mock setup -- must be declared before any dynamic imports of mocked modules
 // ---------------------------------------------------------------------------
 
 const mockGetCodebase = mock(
@@ -552,7 +552,7 @@ describe('DELETE /api/codebases/:id', () => {
 
     const app = makeApp();
     const response = await app.request('/api/codebases/codebase-uuid-1', { method: 'DELETE' });
-    // Should still succeed — worktree removal failure is logged and skipped
+    // Should still succeed -- worktree removal failure is logged and skipped
     expect(response.status).toBe(200);
 
     const body = (await response.json()) as { success: boolean };

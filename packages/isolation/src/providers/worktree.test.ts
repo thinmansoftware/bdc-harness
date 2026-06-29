@@ -1,7 +1,7 @@
 import { describe, test, expect, beforeEach, afterEach, spyOn, mock, type Mock } from 'bun:test';
 import { join } from 'node:path';
 
-// Fixed test home — path assertions use this constant; no duplication of production isDocker() logic.
+// Fixed test home -- path assertions use this constant; no duplication of production isDocker() logic.
 const TEST_ARCHON_HOME = '/test/.archon';
 
 // Mock @archon/paths: provide getArchonHome + workspaces path helpers so @archon/git (getWorktreeBase,
@@ -74,7 +74,7 @@ describe('WorktreeProvider', () => {
     findWorktreeByBranchSpy.mockResolvedValue(null);
     getCanonicalRepoPathSpy.mockImplementation(async path => path);
     // Most paths exist by default (directoryExists checks for destroy etc.),
-    // but .gitmodules is absent by default — most repos don't use submodules,
+    // but .gitmodules is absent by default -- most repos don't use submodules,
     // and default-on submodule init must skip cleanly in that case.
     mockAccess.mockImplementation(async (path: unknown) => {
       if (typeof path === 'string' && path.endsWith('.gitmodules')) {
@@ -578,7 +578,7 @@ describe('WorktreeProvider', () => {
         canonicalRepoPath: '/workspace/repo/' as IsolationRequest['canonicalRepoPath'],
       };
       worktreeExistsSpy.mockResolvedValue(true);
-      // .git file has no trailing slash — resolve() should normalize
+      // .git file has no trailing slash -- resolve() should normalize
       mockReadFile.mockResolvedValue('gitdir: /workspace/repo/.git/worktrees/archon/issue-42\n');
 
       const env = await provider.create(request);
@@ -978,7 +978,7 @@ describe('WorktreeProvider', () => {
       })?.[1] as string[] | undefined;
 
     test('initializes submodules by default when .gitmodules exists', async () => {
-      // Default provider has no initSubmodules in config — should run.
+      // Default provider has no initSubmodules in config -- should run.
       makeGitmodulesPresent();
 
       await provider.create(baseRequest);
@@ -1066,7 +1066,7 @@ describe('WorktreeProvider', () => {
       const submoduleProvider = new WorktreeProvider(configLoader);
 
       // .gitmodules read fails with a non-ENOENT error. Silently skipping
-      // would produce a worktree with empty submodule dirs — the exact
+      // would produce a worktree with empty submodule dirs -- the exact
       // silent-broken-state this feature exists to prevent.
       mockAccess.mockImplementation(async (path: unknown) => {
         if (typeof path === 'string' && path.endsWith('.gitmodules')) {
@@ -2161,7 +2161,7 @@ describe('WorktreeProvider', () => {
 
     test('propagates original error when orphan worktree cleanup itself fails', async () => {
       const removeWorktreeSpy = spyOn(git, 'removeWorktree');
-      // Cleanup will fail — but original error should still propagate
+      // Cleanup will fail -- but original error should still propagate
       removeWorktreeSpy.mockRejectedValue(new Error('worktree is locked'));
 
       const request: IsolationRequest = {
@@ -2257,7 +2257,7 @@ describe('WorktreeProvider', () => {
 
       await provider.create(baseRequest);
 
-      // syncWorkspace called with undefined → triggers auto-detect via getDefaultBranch
+      // syncWorkspace called with undefined -> triggers auto-detect via getDefaultBranch
       // resetAfterFetch: false because test path is not a managed clone under ~/.archon/workspaces
       expect(syncWorkspaceSpy).toHaveBeenCalledWith('/workspace/owner/repo', undefined, {
         resetAfterFetch: false,
@@ -2278,7 +2278,7 @@ describe('WorktreeProvider', () => {
 
       await provider.create(request);
 
-      // fromBranch is the start-point for the branch, not for sync — sync auto-detects
+      // fromBranch is the start-point for the branch, not for sync -- sync auto-detects
       expect(syncWorkspaceSpy).toHaveBeenCalledWith('/workspace/owner/repo', undefined, {
         resetAfterFetch: false,
       });
@@ -2308,7 +2308,7 @@ describe('WorktreeProvider', () => {
       const configLoader: RepoConfigLoader = async () => ({});
       provider = new WorktreeProvider(configLoader);
 
-      // baseRequest has workflowType 'issue', not 'task' — fromBranch is ignored, auto-detects
+      // baseRequest has workflowType 'issue', not 'task' -- fromBranch is ignored, auto-detects
       const request: IsolationRequest = {
         ...baseRequest,
         fromBranch: 'dev',
@@ -2316,7 +2316,7 @@ describe('WorktreeProvider', () => {
 
       await provider.create(request);
 
-      // fromBranch is ignored for non-task types, so syncWorkspace gets undefined → auto-detect
+      // fromBranch is ignored for non-task types, so syncWorkspace gets undefined -> auto-detect
       expect(syncWorkspaceSpy).toHaveBeenCalledWith('/workspace/owner/repo', undefined, {
         resetAfterFetch: false,
       });
@@ -2463,7 +2463,7 @@ describe('WorktreeProvider', () => {
   });
 
   // ---------------------------------------------------------------------------
-  // Per-repo `worktree.path` override (co-located worktrees opt-in) — #1117 successor
+  // Per-repo `worktree.path` override (co-located worktrees opt-in) -- #1117 successor
   // ---------------------------------------------------------------------------
   describe('worktree.path repo-local override', () => {
     const baseRequest: IsolationRequest = {
@@ -2553,7 +2553,7 @@ describe('WorktreeProvider', () => {
   // Additional lifecycle method tests
   // ---------------------------------------------------------------------------
 
-  describe('destroy() — additional scenarios', () => {
+  describe('destroy() -- additional scenarios', () => {
     test('branchDeleted is true when branch already gone ("not found" error)', async () => {
       const worktreePath = '/workspace/worktrees/repo/issue-42';
       getCanonicalRepoPathSpy.mockResolvedValue('/workspace/repo');
@@ -2570,7 +2570,7 @@ describe('WorktreeProvider', () => {
       const result = await provider.destroy(worktreePath, { branchName: 'issue-42' });
 
       expect(result.worktreeRemoved).toBe(true);
-      // "not found" counts as already deleted — should be true, not false
+      // "not found" counts as already deleted -- should be true, not false
       expect(result.branchDeleted).toBe(true);
       expect(result.warnings).toHaveLength(0);
     });
@@ -2614,7 +2614,7 @@ describe('WorktreeProvider', () => {
         deleteRemoteBranch: true,
       });
 
-      // "couldn't find remote ref" means already gone — treated as success
+      // "couldn't find remote ref" means already gone -- treated as success
       expect(result.remoteBranchDeleted).toBe(true);
       expect(result.warnings).toHaveLength(0);
     });
@@ -2718,7 +2718,7 @@ describe('WorktreeProvider', () => {
     });
   });
 
-  describe('get() — environment shape', () => {
+  describe('get() -- environment shape', () => {
     test('returned environment has correct id, workingPath, provider, status, and metadata', async () => {
       const worktreePath = '/workspace/worktrees/repo/issue-55';
       worktreeExistsSpy.mockResolvedValue(true);
@@ -2756,7 +2756,7 @@ describe('WorktreeProvider', () => {
     });
   });
 
-  describe('list() — environment shape', () => {
+  describe('list() -- environment shape', () => {
     test('each listed environment has correct provider, status, and metadata shape', async () => {
       listWorktreesSpy.mockResolvedValue([
         { path: '/workspace/repo', branch: 'main' },
@@ -2810,7 +2810,7 @@ describe('WorktreeProvider', () => {
     });
   });
 
-  describe('adopt() — environment shape', () => {
+  describe('adopt() -- environment shape', () => {
     test('returned environment has id equal to the provided path', async () => {
       const adoptPath = '/workspace/worktrees/repo/feature-auth';
       worktreeExistsSpy.mockResolvedValue(true);
@@ -2861,7 +2861,7 @@ describe('WorktreeProvider', () => {
     });
   });
 
-  describe('healthCheck() — error propagation', () => {
+  describe('healthCheck() -- error propagation', () => {
     test('propagates I/O errors from worktreeExists (permission denied)', async () => {
       // worktreeExists throws for permission errors (only returns false for ENOENT)
       worktreeExistsSpy.mockRejectedValue(

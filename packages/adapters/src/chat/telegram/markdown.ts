@@ -19,10 +19,10 @@ function getLog(): ReturnType<typeof createLogger> {
  * Convert GitHub-flavored markdown to Telegram MarkdownV2 format
  *
  * Transformations:
- * - Headers (##) → Bold (*text*)
- * - **bold** → *bold*
- * - *italic* → _italic_
- * - Lists (- item) → Escaped bullet points
+ * - Headers (##) -> Bold (*text*)
+ * - **bold** -> *bold*
+ * - *italic* -> _italic_
+ * - Lists (- item) -> Escaped bullet points
  * - Special characters escaped for MarkdownV2
  *
  * @param markdown - GitHub-flavored markdown text
@@ -100,7 +100,7 @@ export function isAlreadyEscaped(text: string): boolean {
  * - Strikethrough (~~text~~)
  * - Code blocks (```...```)
  * - Inline code (`code`)
- * - Links [text](url) → text (url)
+ * - Links [text](url) -> text (url)
  *
  * @param markdown - Markdown text to strip
  * @returns Plain text without markdown symbols

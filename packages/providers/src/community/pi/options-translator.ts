@@ -26,14 +26,14 @@ type PiTool = (typeof codingTools)[number];
 
 import type { NodeConfig } from '../../types';
 
-// ─── Thinking level ────────────────────────────────────────────────────────
+// --- Thinking level --------------------------------------------------------
 
 /**
  * Pi's ThinkingLevel = 'minimal' | 'low' | 'medium' | 'high' | 'xhigh'.
  * Archon's common surface includes 'off' (from Codex's modelReasoningEffort)
  * and 'max' (from Claude's EffortLevel enum). Map into Pi's vocabulary:
- *  - 'off'    → undefined (no explicit thinkingLevel; Pi's implicit off)
- *  - 'max'    → 'xhigh'  (Archon's EffortLevel doesn't have xhigh)
+ *  - 'off'    -> undefined (no explicit thinkingLevel; Pi's implicit off)
+ *  - 'max'    -> 'xhigh'  (Archon's EffortLevel doesn't have xhigh)
  *  - others pass through if they're already Pi-native
  *
  * See packages/workflows/src/schemas/dag-node.ts#effortLevelSchema for
@@ -68,8 +68,8 @@ export interface ResolvedThinkingLevel {
  * Resolve Archon's `effort` / `thinking` node fields to Pi's `ThinkingLevel`.
  *
  * Precedence: `thinking` > `effort` (when both are set and valid).
- * 'off' on either → `level: undefined` (Pi runs without explicit thinking).
- * Claude-shape `thinking: { type: 'enabled', budget_tokens: N }` object form →
+ * 'off' on either -> `level: undefined` (Pi runs without explicit thinking).
+ * Claude-shape `thinking: { type: 'enabled', budget_tokens: N }` object form ->
  * warning, not applied.
  */
 export function resolvePiThinkingLevel(nodeConfig?: NodeConfig): ResolvedThinkingLevel {
@@ -87,17 +87,17 @@ export function resolvePiThinkingLevel(nodeConfig?: NodeConfig): ResolvedThinkin
   const effortLevel = normalizeToThinkingLevel(effort);
   if (effortLevel) return { level: effortLevel };
 
-  // Claude uses a structured `{ type: 'enabled', budget_tokens: N }` shape —
+  // Claude uses a structured `{ type: 'enabled', budget_tokens: N }` shape --
   // Pi doesn't understand it. Surface the mismatch so users can fix their YAML.
   if (thinking !== undefined && thinking !== null && typeof thinking === 'object') {
     return {
       level: undefined,
       warning:
-        'Pi ignored `thinking` (object form is Claude-specific). Use `effort: low|medium|high|max` in YAML (max → xhigh on Pi).',
+        'Pi ignored `thinking` (object form is Claude-specific). Use `effort: low|medium|high|max` in YAML (max -> xhigh on Pi).',
     };
   }
 
-  // String that isn't a known level (e.g. 'ultra') — warn so users fix it.
+  // String that isn't a known level (e.g. 'ultra') -- warn so users fix it.
   if (typeof thinking === 'string' || typeof effort === 'string') {
     const offender = typeof thinking === 'string' ? thinking : effort;
     return {
@@ -109,7 +109,7 @@ export function resolvePiThinkingLevel(nodeConfig?: NodeConfig): ResolvedThinkin
   return { level: undefined };
 }
 
-// ─── Tool restrictions ─────────────────────────────────────────────────────
+// --- Tool restrictions -----------------------------------------------------
 
 /** Pi's seven built-in coding tools. */
 const PI_TOOL_NAMES = ['read', 'bash', 'edit', 'write', 'grep', 'find', 'ls'] as const;
@@ -152,7 +152,7 @@ function buildPiTool(name: PiToolName, cwd: string, spawnHook: BashSpawnHook | u
 export interface ResolvedTools {
   /**
    * The tools array to pass to Pi, or `undefined` to leave Pi's default
-   * (read/bash/edit/write) in place. An empty array means "no tools —
+   * (read/bash/edit/write) in place. An empty array means "no tools --
    * LLM-only response" which is a valid explicit setting.
    */
   tools: PiTool[] | undefined;
@@ -173,11 +173,11 @@ const PI_DEFAULT_TOOL_NAMES = [
  * `denied_tools` node config, with managed env injected into any bash tool.
  *
  * Semantics:
- *   - neither allow/deny set, no env → return undefined (Pi's default tools)
- *   - neither allow/deny set, env present → return Pi's default 4 tools with
+ *   - neither allow/deny set, no env -> return undefined (Pi's default tools)
+ *   - neither allow/deny set, env present -> return Pi's default 4 tools with
  *     an env-aware bash, so codebase env vars reach bash subprocesses
- *   - allowed_tools: [] → return [] (explicit no-tools; valid Archon idiom)
- *   - allowed_tools: [X, Y] → only X, Y (normalized to lowercase)
+ *   - allowed_tools: [] -> return [] (explicit no-tools; valid Archon idiom)
+ *   - allowed_tools: [X, Y] -> only X, Y (normalized to lowercase)
  *   - denied_tools subtracts from allowed_tools (or full set if allowed_tools absent)
  *   - tool names not in Pi's built-in set are silently dropped but reported
  *     via `unknownTools` so the caller can surface a warning.
@@ -247,7 +247,7 @@ export function resolvePiTools(
   };
 }
 
-// ─── Skills ────────────────────────────────────────────────────────────────
+// --- Skills ----------------------------------------------------------------
 
 export interface ResolvedSkills {
   /** Absolute paths to resolved skill directories. Each contains a SKILL.md. */
@@ -262,17 +262,17 @@ export interface ResolvedSkills {
  * workflows that already work under Claude find the same skills under Pi.
  *
  * Order (first match wins per name):
- *   1. `<cwd>/.agents/skills/<name>/`     — project-local, agentskills.io standard
- *   2. `<cwd>/.claude/skills/<name>/`     — project-local, Claude convention
- *   3. `~/.agents/skills/<name>/`         — user-global, agentskills.io standard
- *   4. `~/.claude/skills/<name>/`         — user-global, Claude convention
+ *   1. `<cwd>/.agents/skills/<name>/`     -- project-local, agentskills.io standard
+ *   2. `<cwd>/.claude/skills/<name>/`     -- project-local, Claude convention
+ *   3. `~/.agents/skills/<name>/`         -- user-global, agentskills.io standard
+ *   4. `~/.claude/skills/<name>/`         -- user-global, Claude convention
  *
- * Ancestor traversal above cwd is deliberately not done in v2 — matches the
+ * Ancestor traversal above cwd is deliberately not done in v2 -- matches the
  * Pi provider's cwd-bound scope and avoids ambiguity about which repo's
  * skills win when Archon runs out of a subdirectory.
  */
 function skillSearchRoots(cwd: string): string[] {
-  // Prefer `HOME` env var when set — Bun's os.homedir() bypasses `HOME` and
+  // Prefer `HOME` env var when set -- Bun's os.homedir() bypasses `HOME` and
   // reads from the system uid lookup, which is correct in production but
   // makes tests using staged temp homes impossible. The fallback to
   // homedir() keeps behavior identical in non-test contexts.
@@ -290,7 +290,7 @@ function skillSearchRoots(cwd: string): string[] {
  * directory paths Pi's resource loader can consume via `additionalSkillPaths`.
  *
  * Each named skill is expected to be a directory containing a `SKILL.md`
- * file — the agentskills.io standard layout.
+ * file -- the agentskills.io standard layout.
  */
 export function resolvePiSkills(cwd: string, skillNames: string[] | undefined): ResolvedSkills {
   if (!skillNames || skillNames.length === 0) {

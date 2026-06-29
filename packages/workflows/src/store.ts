@@ -53,9 +53,9 @@ export interface IWorkflowStore {
    * Pass `self` from the calling dispatch so:
    *   1. Self is never returned (excluded by `id != self.id`).
    *   2. Two near-simultaneous dispatches deterministically agree on which
-   *      is "first" via the `(started_at, id)` tiebreaker — newer aborts.
+   *      is "first" via the `(started_at, id)` tiebreaker -- newer aborts.
    *
-   * `id` and `startedAt` must travel together — the tiebreaker requires
+   * `id` and `startedAt` must travel together -- the tiebreaker requires
    * both. Bundling them as a single optional struct makes the
    * paired-or-nothing invariant structural rather than a doc-only contract.
    *
@@ -82,7 +82,7 @@ export interface IWorkflowStore {
   cancelWorkflowRun(id: string): Promise<void>;
 
   /**
-   * Create a workflow event. Implementations MUST NOT throw — catch all errors
+   * Create a workflow event. Implementations MUST NOT throw -- catch all errors
    * internally and log them. Callers treat this as observable-only: workflow
    * execution continues regardless of whether event persistence succeeds.
    */
@@ -95,12 +95,12 @@ export interface IWorkflowStore {
   }): Promise<void>;
 
   /**
-   * Return a map of nodeId → output for all node_completed events
+   * Return a map of nodeId -> output for all node_completed events
    * from a prior DAG workflow run. Used for DAG resume: the executor
    * pre-populates nodeOutputs so completed nodes are skipped on re-run.
    *
    * Returns an empty map when no completed nodes exist.
-   * Throws on DB error — caller (executor.ts) owns the degradation policy.
+   * Throws on DB error -- caller (executor.ts) owns the degradation policy.
    */
   getCompletedDagNodeOutputs(workflowRunId: string): Promise<Map<string, string>>;
 

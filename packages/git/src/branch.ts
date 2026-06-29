@@ -58,7 +58,7 @@ export async function getDefaultBranch(repoPath: RepoPath): Promise<BranchName> 
     const err = error as Error & { stderr?: string };
     const errorText = `${err.message} ${err.stderr ?? ''}`;
 
-    // Expected: origin/main doesn't exist — no safe default, fail fast
+    // Expected: origin/main doesn't exist -- no safe default, fail fast
     if (
       errorText.includes('Not a valid object name') ||
       errorText.includes('Needed a single revision') ||
@@ -160,7 +160,7 @@ export async function commitAllChanges(
   } catch (error) {
     const err = error as Error & { stderr?: string; stdout?: string };
     // git commit exits with code 1 and writes "nothing to commit" to stdout (not stderr)
-    // when git add -A normalizes line endings (e.g. CRLF→LF on Windows) and the result
+    // when git add -A normalizes line endings (e.g. CRLF->LF on Windows) and the result
     // is identical to HEAD. Treat this as a no-op, not a failure.
     const combinedOutput = `${err.stdout ?? ''} ${err.stderr ?? ''}`;
     if (combinedOutput.toLowerCase().includes('nothing to commit')) {
@@ -294,7 +294,7 @@ export async function isAncestorOf(
     return true;
   } catch (error) {
     const err = error as Error & { code?: number | string; stderr?: string };
-    // exit code 1 = not an ancestor — expected case
+    // exit code 1 = not an ancestor -- expected case
     if (err.code === 1) return false;
     const errorText = `${err.message} ${err.stderr ?? ''}`.toLowerCase();
     const isExpectedError =

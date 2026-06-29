@@ -116,7 +116,7 @@ describe('listEnvironments', () => {
 
     await listEnvironments();
 
-    // listByCodebaseWithAge called only once — no re-fetch needed
+    // listByCodebaseWithAge called only once -- no re-fetch needed
     expect(mockListByCodebaseWithAge).toHaveBeenCalledTimes(1);
   });
 
@@ -125,7 +125,7 @@ describe('listEnvironments', () => {
     mockListByCodebaseWithAge.mockResolvedValue([makeEnvWithAge({ id: 'env-err' })]);
     mockWorktreeExists.mockRejectedValueOnce(new Error('permission denied'));
 
-    // Should not throw — error is swallowed per the try/catch in reconcileGhosts
+    // Should not throw -- error is swallowed per the try/catch in reconcileGhosts
     await expect(listEnvironments()).resolves.toBeDefined();
     expect(mockUpdateStatus).not.toHaveBeenCalled();
     expect(mockLogger.warn).toHaveBeenCalledWith(

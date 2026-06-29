@@ -102,7 +102,7 @@ export async function findCodebaseByDefaultCwd(defaultCwd: string): Promise<Code
 /**
  * Find a codebase whose `default_cwd` is an ancestor of the given path.
  * Used for worktree-based runs where the actual `cwd` is a worktree subdirectory
- * of the registered source path — an exact match via `findCodebaseByDefaultCwd`
+ * of the registered source path -- an exact match via `findCodebaseByDefaultCwd`
  * would always return null in that case.
  *
  * Returns the codebase with the longest matching prefix (most specific match).

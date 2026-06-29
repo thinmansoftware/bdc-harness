@@ -2,12 +2,12 @@
  * Global throttle gate for Claude SDK calls.
  *
  * Two engage paths:
- *   1. Auto-engage  — `checkRateLimitAndMaybeThrottle()` reads the rate-limit
+ *   1. Auto-engage  -- `checkRateLimitAndMaybeThrottle()` reads the rate-limit
  *      info emitted by the SDK; engages when utilization >= AUTO_THROTTLE_UTILIZATION
  *      AND the 5-hour window is about to reset (less than AUTO_THROTTLE_LEAD_MS away).
  *      Mirrors the doctrine the 2026-05-18 incident codified: do not race the
  *      window-end; hold for the rollover.
- *   2. Operator   — `POST /api/admin/throttle` calls `setThrottled(true)`.
+ *   2. Operator   -- `POST /api/admin/throttle` calls `setThrottled(true)`.
  *
  * While throttled, every Claude SDK call awaits `waitForRelease()`. Pending
  * waiters drain FIFO when `setThrottled(false)` runs. Waiters tied to an
@@ -20,7 +20,7 @@
  * window-end stand-down survives a server restart.
  *
  * Singleton: this module owns one process-wide gate. Workflows running in
- * parallel share the same gate by design — the 5-hour quota is shared across
+ * parallel share the same gate by design -- the 5-hour quota is shared across
  * the whole subscription, so per-run gating would not protect it.
  */
 import { mkdirSync, readFileSync, writeFileSync, existsSync, unlinkSync } from 'fs';
@@ -49,7 +49,7 @@ function getLog(): ReturnType<typeof createLogger> {
   return cachedLog;
 }
 
-/** Context describing why the throttle was engaged — surfaced in logs + snapshot. */
+/** Context describing why the throttle was engaged -- surfaced in logs + snapshot. */
 export interface ThrottleEngageContext {
   /** `operator` from `POST /api/admin/throttle`, `auto` from rate-limit event. */
   engagedBy: 'operator' | 'auto';
@@ -81,7 +81,7 @@ let engageContext: ThrottleEngageContext | undefined;
 const waiters: Waiter[] = [];
 
 /**
- * Persist current throttle state to disk. Failures are logged but do not throw —
+ * Persist current throttle state to disk. Failures are logged but do not throw --
  * persistence is best-effort; the in-memory gate is the source of truth.
  */
 function persistSnapshot(): void {
@@ -132,7 +132,7 @@ function restoreFromSnapshot(): void {
   const snap = readSnapshot();
   if (!snap?.paused) return;
   // If a resetsAt was recorded and it has already passed, the throttle would
-  // have auto-released — clear the stale snapshot.
+  // have auto-released -- clear the stale snapshot.
   if (
     snap.resetsAt !== undefined &&
     snap.resetsAt * 1000 + AUTO_THROTTLE_RELEASE_GRACE_MS <= Date.now()
@@ -222,7 +222,7 @@ export function waitForRelease(abortSignal?: AbortSignal): Promise<void> {
 
 /**
  * Process a rate-limit info payload from the Claude SDK and auto-engage or
- * auto-release the gate as appropriate. Idempotent — calling repeatedly with
+ * auto-release the gate as appropriate. Idempotent -- calling repeatedly with
  * the same info is safe.
  *
  * Engage when:
@@ -290,7 +290,7 @@ export function checkRateLimitAndMaybeThrottle(rateLimitInfo: Record<string, unk
     resetsAtMs !== undefined &&
     resetsAtMs > now
   ) {
-    // Only release if the new resetsAt is later than the one we engaged at —
+    // Only release if the new resetsAt is later than the one we engaged at --
     // means the window has actually rolled over.
     const engagedResetsAtMs =
       engageContext.resetsAt !== undefined ? engageContext.resetsAt * 1000 : undefined;
@@ -309,7 +309,7 @@ export function checkRateLimitAndMaybeThrottle(rateLimitInfo: Record<string, unk
 }
 
 /**
- * Reset internal state. Test-only — production code should not call this.
+ * Reset internal state. Test-only -- production code should not call this.
  * Resolves any pending waiters cleanly to avoid leaks across test runs.
  */
 export function resetThrottleForTests(): void {

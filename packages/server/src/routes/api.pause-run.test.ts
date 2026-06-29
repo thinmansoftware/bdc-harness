@@ -18,7 +18,7 @@ import type { WebAdapter } from '../adapters/web';
 import { validationErrorHook } from './openapi-defaults';
 
 // ---------------------------------------------------------------------------
-// Mock setup — must be before dynamic imports of mocked modules
+// Mock setup -- must be before dynamic imports of mocked modules
 // ---------------------------------------------------------------------------
 
 type MockWorkflowRun = {
@@ -51,8 +51,8 @@ const mockGetEngageContext = mock(() =>
   throttleState.paused ? { engagedBy: throttleState.engagedBy ?? 'operator' } : undefined
 );
 const mockWaitForRelease = mock(async () => undefined);
-// Real implementation of checkRateLimitAndMaybeThrottle for test 6 — we
-// validate the integration (rate-limit info → setThrottled) without depending
+// Real implementation of checkRateLimitAndMaybeThrottle for test 6 -- we
+// validate the integration (rate-limit info -> setThrottled) without depending
 // on the actual provider module.
 function fakeCheckRateLimitAndMaybeThrottle(info: Record<string, unknown>): void {
   const utilization = typeof info.utilization === 'number' ? info.utilization : undefined;
@@ -237,7 +237,7 @@ mock.module('@archon/core/utils/commands', () => ({
   findMarkdownFilesRecursive: mock(async () => []),
 }));
 
-// Throttle singleton — mocked at module path so api.ts uses our fake state.
+// Throttle singleton -- mocked at module path so api.ts uses our fake state.
 mock.module('@archon/providers/claude/throttle', () => ({
   claudeProviderThrottle: {
     isThrottled: mockIsThrottled,
@@ -470,7 +470,7 @@ describe('checkRateLimitAndMaybeThrottle (auto-engage + auto-release)', () => {
       status: 'allowed_warning',
       utilization: 0.92,
       surpassedThreshold: 0.9,
-      resetsAt: nowSec + 60, // 60s until reset → within 5min lead
+      resetsAt: nowSec + 60, // 60s until reset -> within 5min lead
     });
     expect(throttleState.paused).toBe(true);
     expect(throttleState.engagedBy).toBe('auto');

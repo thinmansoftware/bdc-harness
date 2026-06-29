@@ -15,14 +15,14 @@ function getLog(): ReturnType<typeof createLogger> {
 /**
  * Layout of a worktree base relative to the repository.
  *
- * Two layouts only — worktrees live either co-located with the repo (opt-in)
+ * Two layouts only -- worktrees live either co-located with the repo (opt-in)
  * or inside the user's archon workspace area (default for every repo):
  *
- * - `repo-local`       — `<repoRoot>/<override.repoLocal>/`  (opt-in per repo config)
- * - `workspace-scoped` — `~/.archon/workspaces/<owner>/<repo>/worktrees/`  (default)
+ * - `repo-local`       -- `<repoRoot>/<override.repoLocal>/`  (opt-in per repo config)
+ * - `workspace-scoped` -- `~/.archon/workspaces/<owner>/<repo>/worktrees/`  (default)
  *
  * In both layouts the base already includes all repo context, so callers append
- * only the branch name to compose the final worktree path — there is no layout
+ * only the branch name to compose the final worktree path -- there is no layout
  * where owner/repo gets tacked on as a separate path segment.
  */
 export type WorktreeLayout = 'repo-local' | 'workspace-scoped';
@@ -48,7 +48,7 @@ export interface WorktreeBaseOverride {
  *   3. Last two path segments of `repoPath` (works for any local checkout)
  *
  * The third fallback is what lets non-cloned / locally-registered repos still
- * land in the workspace-scoped layout — every repo gets a stable owner/repo
+ * land in the workspace-scoped layout -- every repo gets a stable owner/repo
  * identity derived from its filesystem path.
  */
 function resolveOwnerRepo(
@@ -70,7 +70,7 @@ function resolveOwnerRepo(
       return { owner: parts[0], repo: parts[1] };
     }
   }
-  // Fallback: derive from path basename/parent-basename — covers local-registered
+  // Fallback: derive from path basename/parent-basename -- covers local-registered
   // repos that never lived under workspaces/. Delegates to extractOwnerRepo()
   // which throws on pathologically short paths.
   return extractOwnerRepo(repoPath);
@@ -80,11 +80,11 @@ function resolveOwnerRepo(
  * Get the base directory for worktrees and the resolved layout.
  *
  * Resolution (highest to lowest priority):
- *   1. `override.repoLocal` → `<repoRoot>/<repoLocal>/` (layout: `repo-local`)
- *   2. Otherwise             → `~/.archon/workspaces/<owner>/<repo>/worktrees/`
+ *   1. `override.repoLocal` -> `<repoRoot>/<repoLocal>/` (layout: `repo-local`)
+ *   2. Otherwise             -> `~/.archon/workspaces/<owner>/<repo>/worktrees/`
  *                              (layout: `workspace-scoped`)
  *
- * The `<owner>/<repo>` identity is resolved via `resolveOwnerRepo()` — see its
+ * The `<owner>/<repo>` identity is resolved via `resolveOwnerRepo()` -- see its
  * docstring for the precedence. Every repo ends up with a stable workspace-scoped
  * base; there is no `~/.archon/worktrees/owner/repo/` fallback layout.
  */
@@ -108,7 +108,7 @@ export function getWorktreeBase(
  *
  * Kept for backward compatibility with callers outside this package; prefer
  * reading `layout` from `getWorktreeBase()` in new code. This helper is unaware
- * of `override.repoLocal`, so it does not reflect per-repo overrides — use
+ * of `override.repoLocal`, so it does not reflect per-repo overrides -- use
  * `getWorktreeBase(...).layout === 'workspace-scoped'` in override-aware code.
  *
  * @deprecated Use `getWorktreeBase(...).layout === 'workspace-scoped'` instead.
@@ -149,7 +149,7 @@ export async function worktreeExists(worktreePath: WorktreePath): Promise<boolea
   } catch (error) {
     const err = error as NodeJS.ErrnoException;
     if (err.code === 'ENOENT') {
-      // Directory exists but .git is missing — corruption signal
+      // Directory exists but .git is missing -- corruption signal
       getLog().warn({ worktreePath }, 'worktree.corruption_detected');
       return false;
     }
@@ -192,7 +192,7 @@ export async function listWorktrees(repoPath: RepoPath): Promise<WorktreeInfo[]>
     const err = error as Error & { code?: string; stderr?: string };
     const errorText = `${err.message} ${err.stderr ?? ''}`;
 
-    // ENOENT on repo path itself — distinct from "not a git repository"
+    // ENOENT on repo path itself -- distinct from "not a git repository"
     if (errorText.includes('No such file or directory')) {
       getLog().warn({ repoPath }, 'worktree.list_repo_missing');
       return [];
@@ -308,20 +308,20 @@ export async function getCanonicalRepoPath(path: string): Promise<RepoPath> {
  * Throws if the worktree's parent repo doesn't match the request, or if
  * ownership cannot be determined. The caller relies on the throw-or-return
  * contract: a successful return means the caller may safely adopt the
- * worktree. This is intentionally strict — a permissive fallback here
+ * worktree. This is intentionally strict -- a permissive fallback here
  * would re-introduce the cross-checkout bug this guard exists to prevent.
  *
  * Paths are normalized with `resolve()` before comparison to handle trailing
  * slashes and relative components. Symlinked paths (where canonical vs
- * registered paths differ by symlink resolution) are not equated — callers
+ * registered paths differ by symlink resolution) are not equated -- callers
  * should register codebases with consistent path forms.
  *
  * Error classification (surfaced via `classifyIsolationError` in
  * `@archon/isolation/errors.ts`):
- *   - "path contains a full git checkout" → EISDIR
- *   - "Cannot verify worktree ownership" → ENOENT / EACCES / EIO
- *   - "not a git-worktree reference" → submodule pointer or malformed
- *   - "belongs to a different clone" → cross-checkout
+ *   - "path contains a full git checkout" -> EISDIR
+ *   - "Cannot verify worktree ownership" -> ENOENT / EACCES / EIO
+ *   - "not a git-worktree reference" -> submodule pointer or malformed
+ *   - "belongs to a different clone" -> cross-checkout
  */
 export async function verifyWorktreeOwnership(
   worktreePath: WorktreePath,
@@ -333,7 +333,7 @@ export async function verifyWorktreeOwnership(
   } catch (error) {
     const err = error as NodeJS.ErrnoException;
     // Preserve the original errno on the wrapped error so downstream
-    // classifiers can match by `.code` instead of substring — resilient to
+    // classifiers can match by `.code` instead of substring -- resilient to
     // Node.js message format changes. The original error is also kept via
     // `cause` for debugging.
     const wrap = (message: string): Error => {
@@ -341,7 +341,7 @@ export async function verifyWorktreeOwnership(
       if (err.code) (wrapped as NodeJS.ErrnoException).code = err.code;
       return wrapped;
     };
-    // EISDIR: .git is a directory — path holds a full checkout, not a
+    // EISDIR: .git is a directory -- path holds a full checkout, not a
     // worktree. Refusing adoption prevents accidentally treating an
     // unrelated repo at this path as ours.
     if (err.code === 'EISDIR') {
@@ -349,9 +349,9 @@ export async function verifyWorktreeOwnership(
         `Cannot adopt ${worktreePath}: path contains a full git checkout, not a worktree.`
       );
     }
-    // ENOENT: .git file missing despite worktreeExists() reporting true —
+    // ENOENT: .git file missing despite worktreeExists() reporting true --
     // a TOCTOU race or filesystem corruption. Fail fast.
-    // EACCES/EIO/etc.: cannot verify ownership — fail fast rather than
+    // EACCES/EIO/etc.: cannot verify ownership -- fail fast rather than
     // defaulting to permissive adoption.
     throw wrap(`Cannot verify worktree ownership at ${worktreePath}: ${err.message}`);
   }

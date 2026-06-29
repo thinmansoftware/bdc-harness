@@ -4,7 +4,7 @@
 import { z } from '@hono/zod-openapi';
 import { workflowDefinitionSchema as engineWorkflowDefinitionSchema } from '@archon/workflows/schemas/workflow';
 
-/** Workflow definition schema — derived from engine schema via direct subpath import. */
+/** Workflow definition schema -- derived from engine schema via direct subpath import. */
 export const workflowDefinitionSchema =
   engineWorkflowDefinitionSchema.openapi('WorkflowDefinition');
 
@@ -39,7 +39,7 @@ export const workflowValidationErrorSchema = z
   .openapi('WorkflowValidationError');
 
 /**
- * Workflow source — project-defined, bundled default, or home-scoped (global).
+ * Workflow source -- project-defined, bundled default, or home-scoped (global).
  * Precedence for same-named entries: `bundled` < `global` < `project`.
  */
 export const workflowSourceSchema = z
@@ -151,7 +151,7 @@ export const workflowRunSchema = z
  * Derived Max-20x quota-window summary returned by GET /api/workflows/runs.
  *
  * `windowTokens` is an ESTIMATE computed from the current page of runs
- * (not a full-window DB aggregation), and is NOT a billed quota — it is a
+ * (not a full-window DB aggregation), and is NOT a billed quota -- it is a
  * rough rate-limit indicator for the Max-20x subscription window.
  * `windowBudget` is `null` when MAX20X_WINDOW_TOKENS env var is unset.
  */
@@ -186,7 +186,7 @@ export const workflowEventSchema = z
 
 /** GET /api/workflows/runs/:runId/nodes/:nodeId/events query params. */
 export const nodeEventsQuerySchema = z.object({
-  // String — handler parses and clamps to [1, 20]; default 5.
+  // String -- handler parses and clamps to [1, 20]; default 5.
   limit: z.string().optional(),
 });
 
@@ -303,7 +303,7 @@ export const runWorkflowBodySchema = z
 
 /** GET /api/dashboard/runs query params. */
 export const dashboardRunsQuerySchema = z.object({
-  // z.string() — handler validates the enum value and ignores invalid values
+  // z.string() -- handler validates the enum value and ignores invalid values
   status: z.string().optional(),
   codebaseId: z.string().optional(),
   search: z.string().optional(),
@@ -347,7 +347,7 @@ export const bulkDeleteFailedResponseSchema = z
 /** GET /api/workflows/runs query params. */
 export const workflowRunsQuerySchema = z.object({
   conversationId: z.string().optional(),
-  // z.string() — handler validates the enum value and ignores invalid values
+  // z.string() -- handler validates the enum value and ignores invalid values
   status: z.string().optional(),
   codebaseId: z.string().optional(),
   limit: z.string().optional(),

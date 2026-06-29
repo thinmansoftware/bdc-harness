@@ -1,5 +1,5 @@
 /**
- * CLI chat command — send a message to the orchestrator agent
+ * CLI chat command -- send a message to the orchestrator agent
  *
  * Single-shot: streams response to stdout and exits.
  * Multi-turn conversations happen via the web UI.

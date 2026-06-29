@@ -1,7 +1,7 @@
 /**
  * Anonymous PostHog telemetry for Archon.
  *
- * Emits one event — `workflow_invoked` — each time a workflow starts. No PII,
+ * Emits one event -- `workflow_invoked` -- each time a workflow starts. No PII,
  * no user identity. A random UUID is persisted to `${ARCHON_HOME}/telemetry-id`
  * so we can count distinct installs; `$process_person_profile: false` keeps
  * events in PostHog's anonymous tier (no person profile ever created).
@@ -21,7 +21,7 @@ import type { PostHog } from 'posthog-node';
 import { getArchonHome } from './archon-paths';
 import { createLogger } from './logger';
 
-// Minimal shape of posthog-node's `fetch` option — copied from @posthog/core
+// Minimal shape of posthog-node's `fetch` option -- copied from @posthog/core
 // (a transitive dep) to avoid pulling it in as a direct dependency.
 interface PostHogFetchOptions {
   method: 'GET' | 'POST' | 'PUT' | 'PATCH';
@@ -77,7 +77,7 @@ export function isTelemetryDisabled(): boolean {
 /**
  * Load or create a stable anonymous install UUID at `${ARCHON_HOME}/telemetry-id`.
  * If the file can't be read or written (permissions, disk full), a fresh UUID
- * is returned for this session — telemetry still works, just not correlated
+ * is returned for this session -- telemetry still works, just not correlated
  * across runs.
  *
  * Exported so tests can exercise the id-resolution invariants directly
@@ -191,7 +191,7 @@ export interface WorkflowInvokedProperties {
 
 /**
  * Fire-and-forget capture of a `workflow_invoked` event. Never throws, never
- * awaits — safe to call from hot paths.
+ * awaits -- safe to call from hot paths.
  */
 export function captureWorkflowInvoked(props: WorkflowInvokedProperties): void {
   if (isTelemetryDisabled()) return;

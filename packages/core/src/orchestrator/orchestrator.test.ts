@@ -6,7 +6,7 @@ import type { Conversation, Codebase, Session } from '../types';
 import { ConversationNotFoundError } from '../types';
 import type { WorkflowDefinition } from '@archon/workflows/schemas/workflow';
 
-// ─── Mock setup (BEFORE importing module under test) ─────────────────────────
+// --- Mock setup (BEFORE importing module under test) -------------------------
 
 const mockLogger = createMockLogger();
 mock.module('@archon/paths', () => ({
@@ -155,7 +155,7 @@ mock.module('./prompt-builder', () => ({
 
 // Error/tool formatter mocks
 mock.module('../utils/error-formatter', () => ({
-  classifyAndFormatError: mock((err: Error) => `⚠️ Error: ${err.message}`),
+  classifyAndFormatError: mock((err: Error) => `! Error: ${err.message}`),
 }));
 
 mock.module('@archon/workflows/workflow-discovery', () => ({
@@ -168,7 +168,7 @@ mock.module('@archon/workflows/router', () => ({
   findWorkflow: mockFindWorkflow,
 }));
 mock.module('@archon/workflows/utils/tool-formatter', () => ({
-  formatToolCall: mock((toolName: string, _toolInput: unknown) => `🔧 ${toolName.toUpperCase()}`),
+  formatToolCall: mock((toolName: string, _toolInput: unknown) => ` ${toolName.toUpperCase()}`),
 }));
 
 // fs mock for existsSync
@@ -183,14 +183,14 @@ mock.module('../services/title-generator', () => ({
   generateAndSetTitle: mockGenerateAndSetTitle,
 }));
 
-// ─── Import module under test (AFTER all mocks) ─────────────────────────────
+// --- Import module under test (AFTER all mocks) -----------------------------
 
 import { handleMessage, parseOrchestratorCommands } from './orchestrator-agent';
 
 // Also import wrapCommandForExecution which still lives in orchestrator.ts
 import { wrapCommandForExecution } from './orchestrator';
 
-// ─── Test Fixtures ──────────────────────────────────────────────────────────
+// --- Test Fixtures ----------------------------------------------------------
 
 const mockConversation: Conversation = {
   id: 'conv-123',
@@ -250,7 +250,7 @@ const mockClient = {
   getType: mock(() => 'claude'),
 };
 
-// ─── Helpers ────────────────────────────────────────────────────────────────
+// --- Helpers ----------------------------------------------------------------
 
 function clearAllMocks(): void {
   mockLogger.fatal.mockClear();
@@ -290,7 +290,7 @@ function clearAllMocks(): void {
   mockClient.getType.mockClear();
 }
 
-// ─── Tests ──────────────────────────────────────────────────────────────────
+// --- Tests ------------------------------------------------------------------
 
 describe('parseOrchestratorCommands', () => {
   const codebases: Codebase[] = [mockCodebase];
@@ -465,7 +465,7 @@ describe('orchestrator-agent handleMessage', () => {
     });
   });
 
-  // ─── Slash Commands ─────────────────────────────────────────────────────
+  // --- Slash Commands -----------------------------------------------------
 
   describe('slash commands', () => {
     test('delegates /status to command handler', async () => {
@@ -581,7 +581,7 @@ describe('orchestrator-agent handleMessage', () => {
     });
   });
 
-  // ─── Regular Messages (AI Orchestrator Path) ───────────────────────────
+  // --- Regular Messages (AI Orchestrator Path) ---------------------------
 
   describe('AI orchestrator path', () => {
     test('sends message to AI and streams response', async () => {
@@ -597,7 +597,7 @@ describe('orchestrator-agent handleMessage', () => {
     });
 
     test('does NOT require a codebase to function', async () => {
-      // Conversation has no codebase_id — this is fine for the orchestrator
+      // Conversation has no codebase_id -- this is fine for the orchestrator
       mockClient.sendQuery.mockImplementation(async function* () {
         yield { type: 'assistant', content: 'Hello!' };
         yield { type: 'result', sessionId: 'session-id' };
@@ -651,7 +651,7 @@ describe('orchestrator-agent handleMessage', () => {
     });
   });
 
-  // ─── Session Management ────────────────────────────────────────────────
+  // --- Session Management ------------------------------------------------
 
   describe('session management', () => {
     test('creates new session when none exists', async () => {
@@ -697,7 +697,7 @@ describe('orchestrator-agent handleMessage', () => {
     });
   });
 
-  // ─── settingSources forwarding ────────────────────────────────────────
+  // --- settingSources forwarding ----------------------------------------
 
   describe('assistantConfig forwarding', () => {
     test('passes assistantConfig with settingSources for claude', async () => {
@@ -769,7 +769,7 @@ describe('orchestrator-agent handleMessage', () => {
     });
   });
 
-  // ─── Streaming Mode ────────────────────────────────────────────────────
+  // --- Streaming Mode ----------------------------------------------------
 
   describe('stream mode', () => {
     beforeEach(() => {
@@ -798,8 +798,8 @@ describe('orchestrator-agent handleMessage', () => {
 
       await handleMessage(platform, 'chat-456', 'list files');
 
-      // formatToolCall mock returns '🔧 BASH'
-      expect(platform.sendMessage).toHaveBeenCalledWith('chat-456', '🔧 BASH', {
+      // formatToolCall mock returns ' BASH'
+      expect(platform.sendMessage).toHaveBeenCalledWith('chat-456', ' BASH', {
         category: 'tool_call_formatted',
       });
       expect(platform.sendMessage).toHaveBeenCalledWith('chat-456', 'Done');
@@ -906,9 +906,9 @@ describe('orchestrator-agent handleMessage', () => {
       );
 
       mockClient.sendQuery.mockImplementation(async function* () {
-        // Chunk 1: partial command — does not match regex yet, so it IS sent
+        // Chunk 1: partial command -- does not match regex yet, so it IS sent
         yield { type: 'assistant', content: '/invoke-work' };
-        // Chunk 2: completes the command — accumulated string matches, NOT sent
+        // Chunk 2: completes the command -- accumulated string matches, NOT sent
         yield { type: 'assistant', content: 'flow fix-bug --project test-project' };
         yield { type: 'result', sessionId: 'session-id' };
       });
@@ -927,7 +927,7 @@ describe('orchestrator-agent handleMessage', () => {
     });
   });
 
-  // ─── Batch Mode ────────────────────────────────────────────────────────
+  // --- Batch Mode --------------------------------------------------------
 
   describe('batch mode', () => {
     beforeEach(() => {
@@ -952,14 +952,14 @@ describe('orchestrator-agent handleMessage', () => {
 
     test('filters emoji tool indicators from batch response', async () => {
       mockClient.sendQuery.mockImplementation(async function* () {
-        yield { type: 'assistant', content: '🔧 BASH\nnpm test\n\nClean summary here' };
+        yield { type: 'assistant', content: ' BASH\nnpm test\n\nClean summary here' };
         yield { type: 'result', sessionId: 'session-id' };
       });
 
       await handleMessage(platform, 'chat-456', 'run tests');
 
       const sentMessage = platform.sendMessage.mock.calls[0][1] as string;
-      expect(sentMessage).not.toContain('🔧');
+      expect(sentMessage).not.toContain('');
       expect(sentMessage).toContain('Clean summary');
     });
 
@@ -974,7 +974,7 @@ describe('orchestrator-agent handleMessage', () => {
     });
   });
 
-  // ─── Workflow Routing ──────────────────────────────────────────────────
+  // --- Workflow Routing --------------------------------------------------
 
   describe('workflow routing via AI', () => {
     beforeEach(() => {
@@ -1085,7 +1085,7 @@ describe('orchestrator-agent handleMessage', () => {
         expect.anything(), // codebase.id
         undefined, // issueContext
         undefined, // isolationContext
-        expect.anything() // parentConversationId — web approval auto-resume
+        expect.anything() // parentConversationId -- web approval auto-resume
       );
     });
 
@@ -1113,7 +1113,7 @@ describe('orchestrator-agent handleMessage', () => {
         expect.anything(),
         undefined, // issueContext
         undefined, // isolationContext
-        expect.anything() // parentConversationId — web approval auto-resume
+        expect.anything() // parentConversationId -- web approval auto-resume
       );
     });
 
@@ -1149,7 +1149,7 @@ describe('orchestrator-agent handleMessage', () => {
     });
   });
 
-  // ─── Workflow Discovery ────────────────────────────────────────────────
+  // --- Workflow Discovery ------------------------------------------------
 
   describe('workflow discovery', () => {
     test('discovers global workflows from workspaces path', async () => {
@@ -1160,7 +1160,7 @@ describe('orchestrator-agent handleMessage', () => {
 
       await handleMessage(platform, 'chat-456', 'help');
 
-      // Discovery is called positionally with (cwd, loadConfig) — no options arg.
+      // Discovery is called positionally with (cwd, loadConfig) -- no options arg.
       // Home-scoped workflows (~/.archon/workflows/) are discovered internally.
       expect(mockDiscoverWorkflows).toHaveBeenCalledWith(
         '/home/test/.archon/workspaces',
@@ -1226,7 +1226,7 @@ describe('orchestrator-agent handleMessage', () => {
     });
   });
 
-  // ─── Error Handling ────────────────────────────────────────────────────
+  // --- Error Handling ----------------------------------------------------
 
   describe('error handling', () => {
     test('sends classified error message on failure', async () => {
@@ -1234,7 +1234,7 @@ describe('orchestrator-agent handleMessage', () => {
 
       await handleMessage(platform, 'chat-456', 'hello');
 
-      expect(platform.sendMessage).toHaveBeenCalledWith('chat-456', '⚠️ Error: Database error');
+      expect(platform.sendMessage).toHaveBeenCalledWith('chat-456', '! Error: Database error');
     });
 
     test('handles error during error notification gracefully', async () => {
@@ -1251,7 +1251,7 @@ describe('orchestrator-agent handleMessage', () => {
     });
   });
 
-  // ─── Thread Context Inheritance ────────────────────────────────────────
+  // --- Thread Context Inheritance ----------------------------------------
 
   describe('thread context inheritance', () => {
     const threadConversation: Conversation = {
@@ -1363,7 +1363,7 @@ describe('orchestrator-agent handleMessage', () => {
     });
   });
 
-  // ─── Project Registration ──────────────────────────────────────────────
+  // --- Project Registration ----------------------------------------------
 
   describe('project registration', () => {
     test('/register-project command creates codebase', async () => {
@@ -1423,7 +1423,7 @@ describe('orchestrator-agent handleMessage', () => {
     });
   });
 
-  // ─── Prompt Construction ───────────────────────────────────────────────
+  // --- Prompt Construction -----------------------------------------------
 
   describe('prompt construction', () => {
     test('includes issueContext in prompt', async () => {
@@ -1457,7 +1457,7 @@ describe('orchestrator-agent handleMessage', () => {
     });
   });
 
-  // ─── Title Generation ──────────────────────────────────────────────────
+  // --- Title Generation --------------------------------------------------
 
   describe('title generation', () => {
     test('triggers title generation for untitled conversation with regular message', async () => {

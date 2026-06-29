@@ -99,13 +99,13 @@ describe('SqliteAdapter', () => {
   });
 
   describe('placeholder conversion (#999 regression)', () => {
-    test('$N inside SQL comments is treated as a placeholder — avoid $N in comments', async () => {
+    test('$N inside SQL comments is treated as a placeholder -- avoid $N in comments', async () => {
       db = createTestDb();
       await insertCodebase(db, 'cb-1');
 
       // A query with $1 and $2 as real params, but $3 only appears in a comment.
       // convertPlaceholders replaces ALL $N occurrences including inside comments,
-      // producing 3 ? marks for only 2 params → SQLite error.
+      // producing 3 ? marks for only 2 params -> SQLite error.
       const sql = `SELECT * FROM remote_agent_codebases WHERE id = $1 AND name = $2 -- $3 is not a real param`;
       await expect(db.query(sql, ['cb-1', 'test-codebase-cb-1'])).rejects.toThrow();
     });
@@ -149,7 +149,7 @@ describe('SqliteAdapter', () => {
     test('lexical comparison gives wrong answer for SQLite stored format vs ISO param', async () => {
       db = createTestDb();
       // Column-format value (afternoon) is chronologically AFTER the ISO
-      // param (morning), but lex compares char-11 (space < T) → wrong.
+      // param (morning), but lex compares char-11 (space < T) -> wrong.
       const result = await db.query<{ broken: number }>(
         `SELECT ('2026-04-14 12:00:00' < $1) AS broken`,
         ['2026-04-14T10:00:00.000Z']
@@ -164,7 +164,7 @@ describe('SqliteAdapter', () => {
         `SELECT (datetime('2026-04-14 12:00:00') < datetime($1)) AS correct`,
         ['2026-04-14T10:00:00.000Z']
       );
-      // 12:00 < 10:00 is FALSE — datetime() comparison agrees with reality.
+      // 12:00 < 10:00 is FALSE -- datetime() comparison agrees with reality.
       expect(result.rows[0].correct).toBe(0);
     });
 

@@ -39,7 +39,7 @@ export async function continueCommand(
 ): Promise<void> {
   const workflowName = options.workflow ?? DEFAULT_WORKFLOW;
 
-  // 1. Resolve branch → isolation environment
+  // 1. Resolve branch -> isolation environment
   const env = await isolationDb.findActiveByBranchName(branch);
   if (!env) {
     throw new Error(
@@ -88,7 +88,7 @@ export async function continueCommand(
 
 /**
  * Build a markdown context preamble from git state and prior run artifacts.
- * Each section is independently try/caught — failures produce empty strings, never throw.
+ * Each section is independently try/caught -- failures produce empty strings, never throw.
  */
 async function buildContextPreamble(
   workingPath: string,
@@ -128,7 +128,7 @@ async function buildContextPreamble(
     sections.push(`### Changes from Base\n\n\`\`\`\n${diffStat.trim()}\n\`\`\``);
   }
 
-  // PR info (gh CLI may not be installed — always optional)
+  // PR info (gh CLI may not be installed -- always optional)
   const prJson = await safeExec(
     'gh',
     ['pr', 'view', '--json', 'number,title,url,body'],
@@ -141,7 +141,7 @@ async function buildContextPreamble(
         `### PR\n\n**#${String(pr.number)}**: ${pr.title}\n${pr.url}\n\n${pr.body ? pr.body.slice(0, 500) : '(no description)'}`
       );
     } catch {
-      // JSON parse failed — skip PR section
+      // JSON parse failed -- skip PR section
     }
   }
 
@@ -165,7 +165,7 @@ async function loadArtifactSummary(
   codebaseId: string,
   workingPath: string
 ): Promise<string> {
-  // Try project-scoped path first (via codebase name → owner/repo)
+  // Try project-scoped path first (via codebase name -> owner/repo)
   const artifactsDir = await resolveArtifactsDir(runId, codebaseId, workingPath);
   if (!artifactsDir) return '';
 

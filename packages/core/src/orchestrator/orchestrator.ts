@@ -275,7 +275,7 @@ export async function dispatchBackgroundWorkflow(
   });
 
   // 3. Resolve isolation for this worker (each background workflow gets its own worktree).
-  // Isolation failure is fatal — never run a workflow in a shared/parent worktree.
+  // Isolation failure is fatal -- never run a workflow in a shared/parent worktree.
   let workerCwd: string;
   if (ctx.codebaseId) {
     const codebase = await getCodebase(ctx.codebaseId);
@@ -299,14 +299,14 @@ export async function dispatchBackgroundWorkflow(
       );
     });
   } else {
-    // No codebase — run in parent's cwd (no isolation needed for non-repo workflows)
+    // No codebase -- run in parent's cwd (no isolation needed for non-repo workflows)
     workerCwd = ctx.cwd;
   }
 
   // 4. Notify parent chat that workflow is dispatching
   await ctx.platform.sendMessage(
     ctx.conversationId,
-    `🚀 Dispatching workflow: **${workflow.name}** (background)`,
+    ` Dispatching workflow: **${workflow.name}** (background)`,
     {
       category: 'workflow_dispatch_status',
       segment: 'new',
@@ -331,7 +331,7 @@ export async function dispatchBackgroundWorkflow(
     webAdapter.setConversationDbId(workerPlatformId, workerConv.id);
   }
 
-  // 6. Set up event bridge (worker events → parent SSE stream)
+  // 6. Set up event bridge (worker events -> parent SSE stream)
   let unsubscribeBridge: (() => void) | undefined;
   if (webAdapter) {
     unsubscribeBridge = webAdapter.setupEventBridge(workerPlatformId, ctx.conversationId);
@@ -378,7 +378,7 @@ export async function dispatchBackgroundWorkflow(
         );
         // Surface workflow output to parent conversation as a result card
         if ('paused' in result) {
-          // Paused workflows (approval gates) — no result card yet
+          // Paused workflows (approval gates) -- no result card yet
         } else if (result.success && result.summary) {
           try {
             await ctx.platform.sendMessage(ctx.conversationId, result.summary, {
@@ -427,7 +427,7 @@ export async function dispatchBackgroundWorkflow(
           },
           'background_workflow_failed'
         );
-        // Surface error to parent conversation — include workflowResult metadata when
+        // Surface error to parent conversation -- include workflowResult metadata when
         // we have a pre-created run ID so the chat renders a result card with "View full logs"
         const failureRunId = preCreatedRun?.id;
         const failureMessage = `Workflow **${workflow.name}** failed: ${err.message}`;

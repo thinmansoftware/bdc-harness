@@ -2,7 +2,7 @@
  * GitLab platform adapter using REST API v4 and Webhooks
  * Handles issue and MR comments with @mention detection
  *
- * Community forge adapter — see packages/adapters/src/community/forge/README.md
+ * Community forge adapter -- see packages/adapters/src/community/forge/README.md
  */
 import { readdir, access } from 'fs/promises';
 import { join } from 'path';
@@ -397,7 +397,7 @@ Use 'glab issue view ${String(issue.iid)}' for full details if needed.`;
     return `[GitLab Merge Request Context]
 MR !${String(mr.iid)}: "${mr.title}"
 Status: ${mr.state}
-Source: ${mr.source_branch} → ${mr.target_branch}
+Source: ${mr.source_branch} -> ${mr.target_branch}
 
 Description:
 ${mr.description ?? ''}

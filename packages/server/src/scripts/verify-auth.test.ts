@@ -77,7 +77,7 @@ describe('verify-auth script', () => {
   });
 
   test('script file exists and is importable', async () => {
-    // Sanity check the file shape — we cannot import directly because the
+    // Sanity check the file shape -- we cannot import directly because the
     // module runs process.exit at top level, but we can confirm the file
     // is present and syntactically valid as a TypeScript source.
     const fs = await import('fs');
@@ -93,7 +93,7 @@ describe('verify-auth script', () => {
   });
 
   // Note: full subprocess integration of verify-auth.ts is verified by the
-  // §12 stop condition that greps `docker logs --since 10m` for
+  // Section 12 stop condition that greps `docker logs --since 10m` for
   // 'container_startup_auth_verify' on Hetzner staging after deploy.
   void exitSpy; // referenced to silence unused-var lint in stricter configs
 });

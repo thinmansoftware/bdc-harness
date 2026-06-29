@@ -5,7 +5,7 @@ describe('AUTH_PATTERNS', () => {
   test('includes every documented anchor pattern', () => {
     // These are the patterns that anchor each historical incident; if any
     // get accidentally removed during a refactor, the corresponding bypass
-    // path returns. Grep is intentional — keeps the array honest.
+    // path returns. Grep is intentional -- keeps the array honest.
     const required = [
       'credit balance',
       'unauthorized',
@@ -36,7 +36,7 @@ describe('AUTH_PATTERNS', () => {
 
 describe('isAuthErrorMessage', () => {
   test('returns true for the Claude "Not logged in" subprocess message', () => {
-    expect(isAuthErrorMessage('Not logged in · Please run /login')).toBe(true);
+    expect(isAuthErrorMessage('Not logged in - Please run /login')).toBe(true);
   });
 
   test('returns true for the Codex "Not signed in" subprocess message', () => {

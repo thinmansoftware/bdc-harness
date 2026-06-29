@@ -567,7 +567,7 @@ describe('workflows database', () => {
 
       const [query] = mockQuery.mock.calls[0] as [string, unknown[]];
       // Fresh `pending` counts as active so the lock is held immediately
-      // after pre-create — without this, two near-simultaneous dispatches
+      // after pre-create -- without this, two near-simultaneous dispatches
       // both pass the guard.
       expect(query).toContain("status = 'pending'");
       // Age window cutoff prevents orphaned pending rows (from crashed
@@ -585,11 +585,11 @@ describe('workflows database', () => {
       expect(query).toContain('id != $2');
       // PostgreSQL branch: explicit `::timestamptz` cast on the param so
       // the comparison is chronological, not lexical. SQLite branch wraps
-      // both sides in datetime() — covered by tests in adapters/sqlite.test.ts
+      // both sides in datetime() -- covered by tests in adapters/sqlite.test.ts
       // because this suite mocks getDatabaseType as 'postgresql'.
       expect(query).toContain('started_at < $3::timestamptz');
       expect(query).toContain('started_at = $3::timestamptz AND id < $2');
-      // selfStartedAt serialized to ISO — bun:sqlite rejects Date bindings.
+      // selfStartedAt serialized to ISO -- bun:sqlite rejects Date bindings.
       expect(params).toEqual(['/repo/path', 'self-id', startedAt.toISOString()]);
     });
 
@@ -685,7 +685,7 @@ describe('workflows database', () => {
   // WO-HARNESS-TOKEN-ATTRIBUTION-01 -- Codex repair: full-window aggregation
   // -------------------------------------------------------------------------
   // The runs API's quota-window summary needs a sum across ALL runs whose
-  // activity is in the window — not just the page-of-runs. These tests pin
+  // activity is in the window -- not just the page-of-runs. These tests pin
   // the SQL shape that makes that possible (COALESCE on activity, JSONB
   // extraction, NULL guard on the extracted total_tokens).
   describe('sumWorkflowTokensInWindow', () => {
@@ -719,7 +719,7 @@ describe('workflows database', () => {
       expect(result).toBe(0);
     });
 
-    test('coerces string SUM results (pg numeric → string) to number', async () => {
+    test('coerces string SUM results (pg numeric -> string) to number', async () => {
       // PostgreSQL returns SUM() over BIGINT as a string to avoid JS precision loss.
       mockQuery.mockResolvedValueOnce(createQueryResult([{ sum_tokens: '987654321' }]));
 
@@ -804,7 +804,7 @@ describe('workflows database', () => {
     test('refreshes started_at to NOW so resumed row competes fairly in the path-lock tiebreaker', async () => {
       // Without this refresh, a resumed row carries its original (potentially
       // hours-old) started_at and sorts ahead of any currently-active holder
-      // in the older-wins tiebreaker — slipping past the lock and causing
+      // in the older-wins tiebreaker -- slipping past the lock and causing
       // two active workflows on the same working_path.
       mockQuery.mockResolvedValueOnce(createQueryResult([], 1));
       mockQuery.mockResolvedValueOnce(
@@ -927,7 +927,7 @@ describe('workflows database', () => {
     test('throws "not found" when run does not exist', async () => {
       mockQuery
         .mockResolvedValueOnce(createQueryResult([])) // BEGIN
-        .mockResolvedValueOnce(createQueryResult([])); // SELECT guard — empty
+        .mockResolvedValueOnce(createQueryResult([])); // SELECT guard -- empty
 
       await expect(deleteWorkflowRun('missing')).rejects.toThrow('Workflow run not found: missing');
     });

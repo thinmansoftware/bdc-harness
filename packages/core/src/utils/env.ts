@@ -10,7 +10,7 @@
  */
 export function parseEnvFile(content: string): Record<string, string> {
   // Strip UTF-8 BOM if present
-  const stripped = content.startsWith('﻿') ? content.slice(1) : content;
+  const stripped = content.startsWith('\uFEFF') ? content.slice(1) : content;
 
   // Normalize CRLF and CR to LF
   const normalized = stripped.replace(/\r\n/g, '\n').replace(/\r/g, '\n');

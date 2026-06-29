@@ -68,7 +68,7 @@ describe('stripCwdEnv', () => {
 
   it('does not delete key if it was not in process.env (no-op)', () => {
     writeFileSync(join(tmpDir, '.env'), 'TEST_STRIP_KEY=parsed\n');
-    // Do NOT set process.env.TEST_STRIP_KEY — simulate key parsed but not auto-loaded
+    // Do NOT set process.env.TEST_STRIP_KEY -- simulate key parsed but not auto-loaded
     stripCwdEnv(tmpDir);
     expect(process.env.TEST_STRIP_KEY).toBeUndefined(); // still undefined, no error
   });
@@ -84,7 +84,7 @@ describe('stripCwdEnv', () => {
   });
 });
 
-describe('stripCwdEnv — operator logging (#1302)', () => {
+describe('stripCwdEnv -- operator logging (#1302)', () => {
   const tmpDir = join(import.meta.dir, '__strip-cwd-env-log-test-tmp__');
   let stderrSpy: ReturnType<typeof spyOn>;
   let stderrWrites: string[];
@@ -143,7 +143,7 @@ describe('stripCwdEnv — operator logging (#1302)', () => {
   });
 });
 
-describe('stripCwdEnv — nested Claude Code marker stripping', () => {
+describe('stripCwdEnv -- nested Claude Code marker stripping', () => {
   const tmpDir = join(import.meta.dir, '__strip-markers-test-tmp__');
 
   beforeEach(() => {

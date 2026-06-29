@@ -18,12 +18,12 @@ import { dirname, join, resolve } from 'path';
  * command and the interactive setup wizard.
  *
  * The `bundled-skill` module is dynamically imported here so that its 18 top-level
- * `import … with { type: 'text' }` statements only execute when this function is
+ * `import ... with { type: 'text' }` statements only execute when this function is
  * actually called. Compiled binaries (`bun build --compile`) still statically
  * analyze the literal-string `import()` and embed the chunk; linked-source
  * installs (`bun link`) don't touch the source skill files unless the user runs
  * `archon setup` or `archon skill install`. Without this indirection, every
- * `archon` invocation — including `archon --help` — fails at module load when
+ * `archon` invocation -- including `archon --help` -- fails at module load when
  * the source skill files are missing from disk.
  */
 export async function copyArchonSkill(targetPath: string): Promise<void> {

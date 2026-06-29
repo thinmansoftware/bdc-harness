@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import type { NodeConfig } from '../../types';
 import { resolvePiSkills, resolvePiThinkingLevel, resolvePiTools } from './options-translator';
 
-// ─── resolvePiThinkingLevel ─────────────────────────────────────────────
+// --- resolvePiThinkingLevel ---------------------------------------------
 
 describe('resolvePiThinkingLevel', () => {
   test('returns undefined when no config provided', () => {
@@ -70,7 +70,7 @@ describe('resolvePiThinkingLevel', () => {
   });
 });
 
-// ─── resolvePiTools ─────────────────────────────────────────────────────
+// --- resolvePiTools -----------------------------------------------------
 
 describe('resolvePiTools', () => {
   const cwd = '/tmp/test-cwd';
@@ -115,7 +115,7 @@ describe('resolvePiTools', () => {
 
   test('denied_tools alone starts from full built-in set', () => {
     const result = resolvePiTools(cwd, { denied_tools: ['bash', 'write'] });
-    // Pi has 7 built-in tools, 2 denied → 5 remain
+    // Pi has 7 built-in tools, 2 denied -> 5 remain
     expect(result.tools).toHaveLength(5);
     expect(result.unknownTools).toEqual([]);
   });
@@ -134,13 +134,13 @@ describe('resolvePiTools', () => {
     expect(result.unknownTools).toEqual(['UnknownA', 'UnknownB']);
   });
 
-  test('no allow/deny with non-empty env → returns Pi default 4-tool set with env-aware bash', () => {
+  test('no allow/deny with non-empty env -> returns Pi default 4-tool set with env-aware bash', () => {
     const result = resolvePiTools(cwd, undefined, { DATABASE_URL: 'postgres://x' });
     expect(result.tools).toHaveLength(4); // read/bash/edit/write
     expect(result.unknownTools).toEqual([]);
   });
 
-  test('no allow/deny with empty env → still returns undefined (Pi defaults)', () => {
+  test('no allow/deny with empty env -> still returns undefined (Pi defaults)', () => {
     expect(resolvePiTools(cwd, undefined, {})).toEqual({ tools: undefined, unknownTools: [] });
     expect(resolvePiTools(cwd, {}, {})).toEqual({ tools: undefined, unknownTools: [] });
   });
@@ -152,9 +152,9 @@ describe('resolvePiTools', () => {
   });
 });
 
-// ─── resolvePiSkills ───────────────────────────────────────────────────────
+// --- resolvePiSkills -------------------------------------------------------
 //
-// Uses a temp directory to stage synthetic skill layouts — avoids relying on
+// Uses a temp directory to stage synthetic skill layouts -- avoids relying on
 // whatever the developer has in ~/.claude/skills/ or ~/.agents/skills/.
 
 describe('resolvePiSkills', () => {
@@ -187,7 +187,7 @@ describe('resolvePiSkills', () => {
       [join(home, '.claude', 'skills', 'delta'), 'SKILL.md'],
       [join(cwd, '.claude', 'skills', 'shared'), 'SKILL.md'],
       [join(home, '.claude', 'skills', 'shared'), 'SKILL.md'],
-      // A dir without SKILL.md — must not resolve
+      // A dir without SKILL.md -- must not resolve
       [join(cwd, '.claude', 'skills', 'no-skill-md'), '.keep'],
     ];
     for (const [dir, file] of stage) {

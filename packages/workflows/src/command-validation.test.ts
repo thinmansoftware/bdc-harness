@@ -36,7 +36,7 @@ describe('isValidCommandName', () => {
     });
 
     test('name with spaces (not a path separator)', () => {
-      // The function only blocks /, \, .., and leading dot — spaces are allowed
+      // The function only blocks /, \, .., and leading dot -- spaces are allowed
       expect(isValidCommandName('my command')).toBe(true);
     });
   });
@@ -45,7 +45,7 @@ describe('isValidCommandName', () => {
   // Path traversal attempts
   // ---------------------------------------------------------------------------
 
-  describe('path traversal — double dot (..)', () => {
+  describe('path traversal -- double dot (..)', () => {
     test('bare ".."', () => {
       expect(isValidCommandName('..')).toBe(false);
     });
@@ -67,7 +67,7 @@ describe('isValidCommandName', () => {
     });
   });
 
-  describe('path traversal — forward slash (/)', () => {
+  describe('path traversal -- forward slash (/)', () => {
     test('bare "/"', () => {
       expect(isValidCommandName('/')).toBe(false);
     });
@@ -89,7 +89,7 @@ describe('isValidCommandName', () => {
     });
   });
 
-  describe('path traversal — backslash (\\\\)', () => {
+  describe('path traversal -- backslash (\\\\)', () => {
     test('bare backslash', () => {
       expect(isValidCommandName('\\')).toBe(false);
     });
@@ -138,14 +138,14 @@ describe('isValidCommandName', () => {
       expect(isValidCommandName('')).toBe(false);
     });
 
-    test('whitespace only — single space', () => {
+    test('whitespace only -- single space', () => {
       // A single space doesn't start with '.' and contains no path separators,
       // but the function returns true for it (it is not explicitly rejected).
       // This test documents the actual behavior.
       expect(isValidCommandName(' ')).toBe(true);
     });
 
-    test('whitespace only — multiple spaces', () => {
+    test('whitespace only -- multiple spaces', () => {
       // Same reasoning: spaces alone pass the current checks.
       expect(isValidCommandName('   ')).toBe(true);
     });

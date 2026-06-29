@@ -28,7 +28,7 @@ mock.module('../auth-refresh/index.js', () => ({
   buildReauthMessage: (provider: string, reason: string) =>
     `${provider} subscription auth expired (${reason}). Re-run ${provider} login on the harness host.`,
   // L2 + shared module additions (WO-HARNESS-PROVIDER-PROACTIVE-AUTH-REFRESH-01).
-  // ensureFreshAuth is a no-op in tests — the reactive refresh path is what
+  // ensureFreshAuth is a no-op in tests -- the reactive refresh path is what
   // these regression tests exercise.
   ensureFreshAuth: mock(async () => {}),
   AUTH_PATTERNS: [
@@ -68,7 +68,7 @@ import * as claudeModule from './provider';
 import * as binaryResolver from './binary-resolver';
 
 describe('shouldPassNoEnvFile', () => {
-  test('returns false when cliPath is undefined (dev mode — SDK 0.2.x resolves a native binary)', () => {
+  test('returns false when cliPath is undefined (dev mode -- SDK 0.2.x resolves a native binary)', () => {
     // Pre-0.2.x the SDK shipped cli.js and dev mode = JS. Since 0.2.x the
     // SDK ships per-platform native binaries via optional deps. The flag
     // (a Bun runtime option) is meaningless to native binaries and gets
@@ -89,7 +89,7 @@ describe('shouldPassNoEnvFile', () => {
   });
 
   test('returns false for non-Bun-runnable JS-adjacent extensions', () => {
-    // `.ts`/`.tsx`/`.jsx` are deliberately excluded — the SDK never shipped
+    // `.ts`/`.tsx`/`.jsx` are deliberately excluded -- the SDK never shipped
     // those as entry points, so accepting them would only widen misconfiguration.
     expect(shouldPassNoEnvFile('/path/to/cli.ts')).toBe(false);
     expect(shouldPassNoEnvFile('/path/to/cli.tsx')).toBe(false);
@@ -713,11 +713,11 @@ describe('ClaudeProvider', () => {
     });
 
     // BDC fork regression (2026-05-15): the Claude binary's pre-flight token check
-    // returns "Not logged in · Please run /login" which previously classified as
+    // returns "Not logged in - Please run /login" which previously classified as
     // 'unknown' and bypassed the refresh path. AUTH_PATTERNS must catch this so the
     // refresh branch engages. See behavior spec invariant I-2.
     test.each([
-      ['Not logged in · Please run /login', 'binary pre-flight expired-token error'],
+      ['Not logged in - Please run /login', 'binary pre-flight expired-token error'],
       ['Please run /login Error: success', 'binary "please run /login" variant'],
     ])('classifies binary-side auth error as auth: %s (%s)', async (errorMessage, _label) => {
       let callCount = 0;
@@ -1215,7 +1215,7 @@ describe('withFirstMessageTimeout', () => {
   });
 });
 
-// ─── Behavioral regression tests (black-box via sendQuery) ───────────────
+// --- Behavioral regression tests (black-box via sendQuery) ---------------
 // These cover specific fixes from the sendQuery decomposition review:
 // timeout preservation, one-time warnings, abort forwarding, error enrichment.
 
@@ -1263,7 +1263,7 @@ describe('sendQuery decomposition behaviors', () => {
     mockQuery.mockImplementation(async function* () {
       callCount++;
       if (callCount <= 2) {
-        throw new Error('process exited with code 1'); // crash → retried
+        throw new Error('process exited with code 1'); // crash -> retried
       }
       yield {
         type: 'assistant',
@@ -1280,7 +1280,7 @@ describe('sendQuery decomposition behaviors', () => {
 
     // nodeConfig with effort doesn't produce warnings, but let's verify
     // no system chunks are duplicated. Use a nodeConfig that doesn't warn.
-    // The point is: zero warning chunks means zero, not zero × 3 retries.
+    // The point is: zero warning chunks means zero, not zero  3 retries.
     const systemChunks = chunks.filter(c => c.type === 'system');
     expect(systemChunks).toHaveLength(0);
     expect(callCount).toBe(3); // Confirms retries happened
@@ -1293,12 +1293,12 @@ describe('sendQuery decomposition behaviors', () => {
     mockQuery.mockImplementation(async function* () {
       callCount++;
       if (callCount === 1) {
-        // First attempt crashes → triggers retry. Abort during the retry delay
+        // First attempt crashes -> triggers retry. Abort during the retry delay
         // so the next iteration's abortSignal.aborted check catches it.
         setTimeout(() => abortController.abort(), 0);
         throw new Error('process exited with code 1');
       }
-      // Should not reach here — abort fires before retry starts
+      // Should not reach here -- abort fires before retry starts
       yield {
         type: 'assistant',
         message: { content: [{ type: 'text', text: 'should not reach' }] },
@@ -1364,7 +1364,7 @@ describe('sendQuery decomposition behaviors', () => {
       };
     });
 
-    // Should not throw — the try/catch in PostToolUse should handle the circular ref
+    // Should not throw -- the try/catch in PostToolUse should handle the circular ref
     const chunks = [];
     for await (const chunk of client.sendQuery('test', '/workspace')) {
       chunks.push(chunk);

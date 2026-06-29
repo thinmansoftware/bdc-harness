@@ -11,7 +11,7 @@ import type {
 import { TERMINAL_WORKFLOW_STATUSES } from '@archon/workflows/schemas/workflow-run';
 import { createLogger } from '@archon/paths';
 
-/** Best-effort ROLLBACK — log but swallow errors since we're already in an error path. */
+/** Best-effort ROLLBACK -- log but swallow errors since we're already in an error path. */
 function rollback(): Promise<void> {
   return pool.query('ROLLBACK', []).then(
     () => undefined,
@@ -21,7 +21,7 @@ function rollback(): Promise<void> {
   );
 }
 
-/** Guard error for deleteWorkflowRun — re-thrown without wrapping in the outer catch. */
+/** Guard error for deleteWorkflowRun -- re-thrown without wrapping in the outer catch. */
 class WorkflowRunGuardError extends Error {}
 
 /**
@@ -189,7 +189,7 @@ export async function getPausedWorkflowRun(conversationId: string): Promise<Work
  *
  * The lock is held by any row in `(running, paused)` or `pending` younger
  * than `STALE_PENDING_AGE_MS` (orphaned pre-creates beyond that window are
- * ignored — they're from crashed or resume-replaced dispatches).
+ * ignored -- they're from crashed or resume-replaced dispatches).
  *
  * When called from a dispatch that already pre-created its own row, pass
  * `excludeId` and `selfStartedAt` so:
@@ -213,7 +213,7 @@ export async function getActiveWorkflowRunByPath(
     : `datetime('now', '-${String(Math.floor(STALE_PENDING_AGE_MS / 1000))} seconds')`;
 
   // Build params + clauses dynamically. Self exclusion + tiebreaker travel
-  // together — the tiebreaker references both ids and timestamps.
+  // together -- the tiebreaker references both ids and timestamps.
   const params: unknown[] = [workingPath];
   const clauses: string[] = [
     'working_path = $1',
@@ -228,7 +228,7 @@ export async function getActiveWorkflowRunByPath(
     // dispatches always agree on which is "first." Without this, two rows
     // with similar timestamps could mutually see each other and both abort.
     //
-    // Serialize Date to ISO string — bun:sqlite rejects Date bindings.
+    // Serialize Date to ISO string -- bun:sqlite rejects Date bindings.
     //
     // Format-aware comparison:
     //   PostgreSQL: started_at is TIMESTAMPTZ; cast the ISO param to
@@ -236,7 +236,7 @@ export async function getActiveWorkflowRunByPath(
     //   SQLite: started_at is TEXT in "YYYY-MM-DD HH:MM:SS" format. Our
     //     ISO param has "YYYY-MM-DDTHH:MM:SS.mmmZ". Lexical comparison is
     //     WRONG: char 11 is space (0x20) in the column vs T (0x54) in the
-    //     param, so every column value lex-sorts before every ISO param —
+    //     param, so every column value lex-sorts before every ISO param --
     //     making `started_at < $param` always TRUE regardless of actual
     //     time. Wrap both sides in datetime() to force chronological
     //     comparison via SQLite's date/time functions.
@@ -379,7 +379,7 @@ export async function resumeWorkflowRun(id: string): Promise<WorkflowRun> {
     // currently-running holder, slipping past the path lock and causing
     // two active workflows on the same working_path.
     //
-    // We accept losing the original creation time here — `started_at` for
+    // We accept losing the original creation time here -- `started_at` for
     // an active row semantically means "when did this active phase start."
     // The original creation time can be recovered from workflow_events
     // history if needed for analytics.
@@ -426,7 +426,7 @@ export async function resumeWorkflowRun(id: string): Promise<WorkflowRun> {
 
 /**
  * Find the most recent workflow run for a worker platform conversation ID.
- * Joins with conversations table to resolve platform_conversation_id → DB id.
+ * Joins with conversations table to resolve platform_conversation_id -> DB id.
  */
 export async function getWorkflowRunByWorkerPlatformId(
   platformConversationId: string
@@ -589,7 +589,7 @@ export async function cancelWorkflowRun(id: string): Promise<void> {
  * Pause a running workflow run via an operator request (HTTP POST /pause).
  * Distinct from `pauseWorkflowRun` (approval-gate pause): no ApprovalContext
  * is required and no `metadata.approval` is written. Sets status to 'paused'
- * only when the run is currently 'running'. Does NOT set completed_at — the
+ * only when the run is currently 'running'. Does NOT set completed_at -- the
  * run is not finished.
  *
  * Throws when the run is missing or not in the running state so the route
@@ -644,7 +644,7 @@ export async function resumeWorkflowRunFromPause(id: string): Promise<void> {
 /**
  * Pause a running workflow run for human approval.
  * Sets status to 'paused' and stores approval context in metadata.
- * Does NOT set completed_at — the run is not finished.
+ * Does NOT set completed_at -- the run is not finished.
  */
 export async function pauseWorkflowRun(
   id: string,
@@ -938,7 +938,7 @@ export async function listWorkflowRuns(options?: {
  * Sum metadata.total_tokens across runs whose activity timestamp falls inside
  * the given window (sinceMs .. now).
  *
- * Activity timestamp = COALESCE(last_activity_at, started_at) — matches the
+ * Activity timestamp = COALESCE(last_activity_at, started_at) -- matches the
  * fallback used by the runs API quota-window summary.
  *
  * This is a DEDICATED full-window aggregation; it is NOT bounded by the
@@ -1008,7 +1008,7 @@ export async function sumWorkflowTokensInWindow(options: {
 
 /**
  * Update parent_conversation_id on a workflow run.
- * Non-critical — logs error but does not throw.
+ * Non-critical -- logs error but does not throw.
  */
 export async function updateWorkflowRunParent(
   runId: string,
@@ -1022,7 +1022,7 @@ export async function updateWorkflowRunParent(
   } catch (error) {
     const err = error as Error;
     getLog().error({ err, runId, parentConversationId }, 'db.workflow_run_update_parent_failed');
-    // Non-critical — don't throw
+    // Non-critical -- don't throw
   }
 }
 
@@ -1131,7 +1131,7 @@ export async function cancelStaleWorkflowRuns(
  */
 export async function deleteOldWorkflowRuns(olderThanDays: number): Promise<{ count: number }> {
   // Validate olderThanDays is a safe non-negative integer before SQL interpolation.
-  // The dialect has no "date subtract" helper, so we must interpolate — but only after validation.
+  // The dialect has no "date subtract" helper, so we must interpolate -- but only after validation.
   if (!Number.isInteger(olderThanDays) || olderThanDays < 0) {
     throw new Error(
       `Invalid olderThanDays: ${String(olderThanDays)} (must be a non-negative integer)`
@@ -1186,7 +1186,7 @@ export async function deleteWorkflowRun(id: string, force = false): Promise<void
     }
     if (!TERMINAL_WORKFLOW_STATUSES.includes(check.rows[0].status as WorkflowRunStatus)) {
       throw new WorkflowRunGuardError(
-        `Cannot delete workflow run in '${check.rows[0].status}' status — cancel it first`
+        `Cannot delete workflow run in '${check.rows[0].status}' status -- cancel it first`
       );
     }
     if (!force && check.rows[0].archived_at == null) {
@@ -1208,7 +1208,7 @@ export async function deleteWorkflowRun(id: string, force = false): Promise<void
 
 /**
  * Archive a workflow run (soft-hide from default dashboard view).
- * Running runs cannot be archived — cancel first.
+ * Running runs cannot be archived -- cancel first.
  * Idempotent: re-archiving an already-archived run is a no-op.
  */
 export async function archiveWorkflowRun(
@@ -1227,11 +1227,11 @@ export async function archiveWorkflowRun(
     }
     if (check.rows[0].status === 'running' || check.rows[0].status === 'pending') {
       throw new WorkflowRunGuardError(
-        `Cannot archive workflow run in '${check.rows[0].status}' status — cancel first, then archive`
+        `Cannot archive workflow run in '${check.rows[0].status}' status -- cancel first, then archive`
       );
     }
     if (check.rows[0].archived_at != null) {
-      // Already archived — idempotent no-op
+      // Already archived -- idempotent no-op
       return;
     }
     await pool.query(
@@ -1266,7 +1266,7 @@ export async function unarchiveWorkflowRun(id: string): Promise<void> {
       throw new WorkflowRunGuardError(`Workflow run not found: ${id}`);
     }
     if (check.rows[0].archived_at == null) {
-      // Already active — idempotent no-op
+      // Already active -- idempotent no-op
       return;
     }
     await pool.query(

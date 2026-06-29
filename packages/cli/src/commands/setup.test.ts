@@ -129,11 +129,11 @@ CODEX_ACCOUNT_ID=account1
       expect(content).toContain('# Using SQLite (default)');
       expect(content).toContain('CLAUDE_USE_GLOBAL_AUTH=true');
       expect(content).toContain('DEFAULT_AI_ASSISTANT=claude');
-      // PORT is intentionally commented out — server and Vite both default to 3090 when unset (#1152).
+      // PORT is intentionally commented out -- server and Vite both default to 3090 when unset (#1152).
       expect(content).toContain('# PORT=3090');
       expect(content).not.toMatch(/^PORT=/m);
       // Sanity: never emit an active DATABASE_URL line. The "# Set DATABASE_URL=..."
-      // hint is a comment and is fine — only an unprefixed assignment would be wrong.
+      // hint is a comment and is fine -- only an unprefixed assignment would be wrong.
       expect(content).not.toMatch(/^DATABASE_URL=/m);
     });
 
@@ -367,7 +367,7 @@ CODEX_ACCOUNT_ID=account1
 
     it('should create skill files even when target directory does not exist', async () => {
       const target = join(TEST_DIR, 'non-existent-parent', 'skill-target-new');
-      // Do NOT pre-create target — copyArchonSkill must handle it
+      // Do NOT pre-create target -- copyArchonSkill must handle it
 
       await copyArchonSkill(target);
 
@@ -386,7 +386,7 @@ CODEX_ACCOUNT_ID=account1
       expect(result.path).toBe(join(target, '.archon', 'config.yaml'));
       expect(existsSync(result.path)).toBe(true);
       const content = readFileSync(result.path, 'utf-8');
-      // Must be valid YAML — comment lines only — so loaders treat it as empty.
+      // Must be valid YAML -- comment lines only -- so loaders treat it as empty.
       expect(content.split('\n').every(line => line === '' || line.startsWith('#'))).toBe(true);
       expect(content).toContain('Project-scoped Archon config');
       expect(content).toContain('archon.diy/reference/configuration');
@@ -395,7 +395,7 @@ CODEX_ACCOUNT_ID=account1
     it('creates the .archon directory if missing (idempotent on parent)', () => {
       const target = join(TEST_DIR, 'bootstrap-no-archon-dir');
       mkdirSync(target, { recursive: true });
-      // Do NOT pre-create .archon — bootstrap must create it
+      // Do NOT pre-create .archon -- bootstrap must create it
 
       const result = bootstrapProjectConfig(target);
 
@@ -403,7 +403,7 @@ CODEX_ACCOUNT_ID=account1
       expect(existsSync(join(target, '.archon'))).toBe(true);
     });
 
-    it('is idempotent — leaves an existing config untouched', () => {
+    it('is idempotent -- leaves an existing config untouched', () => {
       const target = join(TEST_DIR, 'bootstrap-existing');
       const archonDir = join(target, '.archon');
       mkdirSync(archonDir, { recursive: true });
@@ -423,7 +423,7 @@ CODEX_ACCOUNT_ID=account1
       // (which fs cannot mkdir into) to force a real failure.
       const blocker = join(TEST_DIR, 'blocker-file');
       writeFileSync(blocker, 'not a directory');
-      // mkdir under a file path fails with ENOTDIR — that's the failure mode
+      // mkdir under a file path fails with ENOTDIR -- that's the failure mode
       // we want to model (read-only FS, permission denied, etc.).
       const result = bootstrapProjectConfig(blocker);
 
@@ -497,7 +497,7 @@ describe('detectClaudeExecutablePath probe order', () => {
 
   it('does not return a which-resolved path that fails the existsSync check', () => {
     // `which` returns a path string but the file is not actually present
-    // (stale PATH entry, dangling symlink, etc.) — must not be returned.
+    // (stale PATH entry, dangling symlink, etc.) -- must not be returned.
     npmRootSpy.mockReturnValue('/fake/npm/root');
     whichSpy.mockReturnValue('/stale/path/claude');
     fileExistsSpy.mockReturnValue(false);
@@ -620,7 +620,7 @@ describe('writeScopedEnv (#1303)', () => {
     expect(result.backupPath).toMatch(/\.archon-backup-\d{4}-\d{2}-\d{2}T/);
     // Backup has the old content
     expect(readFileSync(result.backupPath as string, 'utf-8')).toContain('OLD_KEY=old');
-    // Target has the new content only — OLD_KEY is gone
+    // Target has the new content only -- OLD_KEY is gone
     const newContent = readFileSync(result.targetPath, 'utf-8');
     expect(newContent).toContain('DATABASE_URL=sqlite:local');
     expect(newContent).toContain('NEW_KEY=new');

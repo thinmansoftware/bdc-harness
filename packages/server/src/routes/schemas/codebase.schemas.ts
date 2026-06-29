@@ -44,14 +44,14 @@ export const deleteCodebaseResponseSchema = z
   .object({ success: z.boolean() })
   .openapi('DeleteCodebaseResponse');
 
-/** Response for GET /api/codebases/:id/env — returns only keys, never values */
+/** Response for GET /api/codebases/:id/env -- returns only keys, never values */
 export const codebaseEnvVarsResponseSchema = z
   .object({
     keys: z.array(z.string()),
   })
   .openapi('CodebaseEnvVarsResponse');
 
-/** Body for PUT /api/codebases/:id/env — upsert one key-value pair */
+/** Body for PUT /api/codebases/:id/env -- upsert one key-value pair */
 export const setEnvVarBodySchema = z
   .object({
     key: z.string().min(1).max(255),

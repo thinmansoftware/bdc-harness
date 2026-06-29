@@ -19,12 +19,12 @@ const RECONNECT_GRACE_MS = 5_000;
 /**
  * Max time (ms) to hold buffered events waiting for a stream to connect.
  *
- * Must be ≥ RECONNECT_GRACE_MS — otherwise events emitted during a reconnect
+ * Must be >= RECONNECT_GRACE_MS -- otherwise events emitted during a reconnect
  * window are dropped *before* the client has had a chance to reconnect, which
  * manifests as perpetually-spinning tool cards when a `tool_result` happens to
  * land in the gap. 60s covers typical EventSource auto-reconnect delays on
  * flaky networks (mobile, VPN, laptop sleep) without meaningfully growing
- * memory footprint — events are small JSON strings and the cap below bounds
+ * memory footprint -- events are small JSON strings and the cap below bounds
  * the worst case.
  */
 const EVENT_BUFFER_TTL_MS = 60_000;
@@ -76,7 +76,7 @@ export class SSETransport {
     }
     this.streams.set(conversationId, stream);
 
-    // Cancel pending cleanup — client reconnected
+    // Cancel pending cleanup -- client reconnected
     const pendingCleanup = this.cleanupTimers.get(conversationId);
     if (pendingCleanup) {
       clearTimeout(pendingCleanup);
@@ -116,7 +116,7 @@ export class SSETransport {
     // the currently registered stream. This prevents a race condition where
     // a stale onAbort callback (from a replaced stream) removes a newer stream.
     // Critical in React StrictMode which double-mounts components, causing
-    // rapid connect → disconnect → reconnect cycles.
+    // rapid connect -> disconnect -> reconnect cycles.
     if (expectedStream) {
       const current = this.streams.get(conversationId);
       if (current !== expectedStream) return;
@@ -232,14 +232,14 @@ export class SSETransport {
       this.eventBuffer.set(conversationId, buf);
     }
     buf.push({ data, timestamp: Date.now() });
-    // Cap buffer size — drop oldest if over limit. Warn so we notice if
+    // Cap buffer size -- drop oldest if over limit. Warn so we notice if
     // this ever happens in practice: evicted events mean the UI will miss
     // something when the client reconnects.
     if (buf.length > EVENT_BUFFER_MAX) {
       buf.shift();
       // Throttle: a runaway producer could overflow by hundreds in a tight
       // loop and flood logs. Warn at most once per EVICTION_WARN_THROTTLE_MS
-      // per conversation — enough to notice in practice without flooding.
+      // per conversation -- enough to notice in practice without flooding.
       const lastWarn = this.lastEvictionWarnAt.get(conversationId) ?? 0;
       const now = Date.now();
       if (now - lastWarn >= EVICTION_WARN_THROTTLE_MS) {

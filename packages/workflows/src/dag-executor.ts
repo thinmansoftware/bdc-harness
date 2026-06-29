@@ -93,7 +93,7 @@ function getLog(): ReturnType<typeof createLogger> {
 }
 
 // Agent registry cache: keyed by agents directory path, populated on first use.
-// One cache entry per unique repo root — each worktree gets its own registry.
+// One cache entry per unique repo root -- each worktree gets its own registry.
 const agentRegistryCache = new Map<string, AgentRegistry>();
 
 async function getAgentRegistry(cwd: string): Promise<AgentRegistry> {
@@ -105,7 +105,7 @@ async function getAgentRegistry(cwd: string): Promise<AgentRegistry> {
   return registry;
 }
 
-/** Clear the agent registry cache — exposed for testing only. */
+/** Clear the agent registry cache -- exposed for testing only. */
 export function clearAgentRegistryCache(): void {
   agentRegistryCache.clear();
 }
@@ -124,7 +124,7 @@ export interface McpFailureEntry {
 
 /**
  * Parse the SDK's "MCP server connection failed: a (status), b (status)"
- * message. Best-effort — malformed or prefix-free messages return `[]`.
+ * message. Best-effort -- malformed or prefix-free messages return `[]`.
  * Entries are ordered and deduped by name; the segment of the first
  * occurrence wins.
  */
@@ -149,12 +149,12 @@ export function parseMcpFailureServerNames(message: string): McpFailureEntry[] {
  * Returns an empty set when no `mcp:` is configured or when the file can't be
  * read/parsed. Used to distinguish workflow-configured failures (surface to
  * user) from user-plugin failures (silent debug log). We intentionally do not
- * validate or env-expand here — the provider owns full loading and will
+ * validate or env-expand here -- the provider owns full loading and will
  * surface its own parse errors via the warning channel if the file is broken.
  *
  * Read failures are debug-logged so a transient I/O error (EMFILE/EBUSY) that
- * leaves us with an empty set — and silently reclassifies a real workflow-MCP
- * failure as plugin noise — is at least observable.
+ * leaves us with an empty set -- and silently reclassifies a real workflow-MCP
+ * failure as plugin noise -- is at least observable.
  */
 export async function loadConfiguredMcpServerNames(
   nodeMcpPath: string | undefined,
@@ -175,7 +175,7 @@ export async function loadConfiguredMcpServerNames(
   }
 }
 
-/** Workflow-level Claude SDK options — per-node overrides take precedence via ?? */
+/** Workflow-level Claude SDK options -- per-node overrides take precedence via ?? */
 interface WorkflowLevelOptions {
   effort?: EffortLevel;
   thinking?: ThinkingConfig;
@@ -184,14 +184,14 @@ interface WorkflowLevelOptions {
   sandbox?: SandboxSettings;
 }
 
-/** Internal node execution result — extends NodeOutput with cost + token data for aggregation. */
+/** Internal node execution result -- extends NodeOutput with cost + token data for aggregation. */
 type NodeExecutionResult = NodeOutput & {
   costUsd?: number;
   tokens?: TokenUsage;
   frontierCostUsd?: number;
 };
 
-/** Throttle state for cancel checks (reads — no write contention in WAL mode) */
+/** Throttle state for cancel checks (reads -- no write contention in WAL mode) */
 const lastNodeCancelCheck = new Map<string, number>();
 const CANCEL_CHECK_INTERVAL_MS = 10_000;
 
@@ -199,13 +199,13 @@ const CANCEL_CHECK_INTERVAL_MS = 10_000;
  * Policy for the during-streaming cancel check: should the currently-streaming
  * node be allowed to continue for a given observed run status?
  *
- * - `running`: the normal case → continue.
+ * - `running`: the normal case -> continue.
  * - `paused`: a concurrent approval node in the same topological layer has
  *   transitioned the run to paused. The streaming node should finish its own
  *   output; workflow progression is gated by the approval node, not by tearing
  *   down unrelated in-flight streams.
  * - `null` (run deleted), `cancelled`, `failed`, `completed`, or any other
- *   state → abort the stream.
+ *   state -> abort the stream.
  *
  * Exported for unit testing; the full streaming-cancel branch in
  * `executeNodeInternal` only fires once per 10s (CANCEL_CHECK_INTERVAL_MS), so
@@ -320,7 +320,7 @@ function shellQuote(value: string): string {
  *   "$node.output"   (exact double-quoted substitution)
  * anti-pattern and swallows the surrounding double quotes. shellQuote already
  * produces safe single-quote wrapping; wrapping that in additional double quotes
- * mis-tokenizes multi-line node output — line 2+ of the output becomes bare
+ * mis-tokenizes multi-line node output -- line 2+ of the output becomes bare
  * commands. Anchor: WO-HARNESS-NODE-OUTPUT-BASH-QUOTING-01 (bdc-xo#153) 2026-05-16.
  * YAMLs that write `"$node.output"` are now safe to author this natural way; the
  * older pattern of `VAR=$node.output ... "$VAR"` continues to work unchanged.
@@ -368,14 +368,14 @@ export function substituteNodeOutputRefs(
       if (typeof value === 'string') return escapedForBash ? wrap(shellQuote(value)) : value;
       // numbers and booleans from JSON.parse are shell-safe without quoting:
       // JSON disallows NaN/Infinity, so String(number) contains only digits, sign, and '.'.
-      // String(boolean) is 'true' or 'false' — no shell metacharacters.
+      // String(boolean) is 'true' or 'false' -- no shell metacharacters.
       if (typeof value === 'number' || typeof value === 'boolean') return String(value);
       // arrays and objects: JSON-stringify. Bash passes substitution as a single
       // argument, so downstream tools (jq, etc.) receive a JSON literal they can parse.
       if (Array.isArray(value) || typeof value === 'object') {
         return escapedForBash ? wrap(shellQuote(JSON.stringify(value))) : JSON.stringify(value);
       }
-      return escapedForBash ? wrap("''") : ''; // null, undefined, symbol, bigint → empty
+      return escapedForBash ? wrap("''") : ''; // null, undefined, symbol, bigint -> empty
     } catch (jsonErr) {
       getLog().warn(
         { nodeId, field, outputPreview: nodeOutput.output.slice(0, 100), err: jsonErr as Error },
@@ -434,7 +434,7 @@ async function resolveNodeProviderAndModel(
   // Get provider capabilities for capability warnings (static lookup, no instantiation)
   const caps = getProviderCapabilities(provider);
 
-  // Capability warnings — inform users when features are unsupported
+  // Capability warnings -- inform users when features are unsupported
   const capChecks: [string, keyof ProviderCapabilities, boolean][] = [
     [
       'allowed_tools/denied_tools',
@@ -469,7 +469,7 @@ async function resolveNodeProviderAndModel(
     const delivered = await safeSendMessage(
       platform,
       conversationId,
-      `Warning: Node '${node.id}' uses ${unsupported.join(', ')} but ${provider} doesn't support ${unsupported.length === 1 ? 'it' : 'them'} — ${unsupported.length === 1 ? 'this will be' : 'these will be'} ignored.`,
+      `Warning: Node '${node.id}' uses ${unsupported.join(', ')} but ${provider} doesn't support ${unsupported.length === 1 ? 'it' : 'them'} -- ${unsupported.length === 1 ? 'this will be' : 'these will be'} ignored.`,
       { workflowId: workflowRunId, nodeName: node.id }
     );
     if (!delivered) {
@@ -477,7 +477,7 @@ async function resolveNodeProviderAndModel(
     }
   }
 
-  // Surface agents + skills ID collision — user-defined 'dag-node-skills'
+  // Surface agents + skills ID collision -- user-defined 'dag-node-skills'
   // silently overrides Archon's skills wrapper. User wins (by design) but
   // the operator should know they've neutered the wrapper.
   if (
@@ -489,13 +489,13 @@ async function resolveNodeProviderAndModel(
     await safeSendMessage(
       platform,
       conversationId,
-      `Warning: Node '${node.id}' defines an agent with reserved ID 'dag-node-skills' AND uses 'skills:'. Your inline agent overrides Archon's automatic skills wrapper — the 'skills:' field will NOT take effect. Rename the agent or remove 'skills:' to fix.`,
+      `Warning: Node '${node.id}' defines an agent with reserved ID 'dag-node-skills' AND uses 'skills:'. Your inline agent overrides Archon's automatic skills wrapper -- the 'skills:' field will NOT take effect. Rename the agent or remove 'skills:' to fix.`,
       { workflowId: workflowRunId, nodeName: node.id }
     );
   }
 
   // Resolve agent persona (if node declares `agent:` or `persona:`).
-  // `persona:` is the human-facing alias for `agent:` — both resolve identically.
+  // `persona:` is the human-facing alias for `agent:` -- both resolve identically.
   // If both are set they must agree (enforced at parse time by dagNodeSchema).
   // The persona's model overrides the node-resolved model; its system prompt is
   // prepended to any node-level systemPrompt; its tools list (if present) is
@@ -550,7 +550,7 @@ async function resolveNodeProviderAndModel(
     baseOptions.outputFormat = { type: 'json_schema', schema: node.output_format };
   }
 
-  // Build raw nodeConfig — provider translates internally
+  // Build raw nodeConfig -- provider translates internally
   const nodeConfig: NodeConfig = {
     mcp: node.mcp,
     hooks: node.hooks,
@@ -568,7 +568,7 @@ async function resolveNodeProviderAndModel(
     fallbackModel: fb,
   };
 
-  // Pass assistantConfig from config — provider parses internally
+  // Pass assistantConfig from config -- provider parses internally
   const assistantConfig = config.assistants[provider] ?? {};
 
   const options: SendQueryOptions = {
@@ -655,9 +655,9 @@ export function buildTopologicalLayers(nodes: readonly DagNode[]): DagNode[][] {
 
   const totalPlaced = layers.reduce((sum, l) => sum + l.length, 0);
   if (totalPlaced < nodes.length) {
-    // Should never happen — cycle detection runs at load time
+    // Should never happen -- cycle detection runs at load time
     throw new Error(
-      '[DagExecutor] Cycle detected at runtime — was cycle detection skipped at load?'
+      '[DagExecutor] Cycle detected at runtime -- was cycle detection skipped at load?'
     );
   }
 
@@ -734,7 +734,7 @@ async function executeNodeInternal(
     }
     rawPrompt = promptResult.content;
   } else {
-    // node is PromptNode — prompt: string is guaranteed by the discriminated union
+    // node is PromptNode -- prompt: string is guaranteed by the discriminated union
     rawPrompt = node.prompt;
   }
 
@@ -790,7 +790,7 @@ async function executeNodeInternal(
 
   // Create per-node abort controller for idle timeout cleanup
   const nodeAbortController = new AbortController();
-  // Fork when resuming — leaves the source session untouched so retries are safe.
+  // Fork when resuming -- leaves the source session untouched so retries are safe.
   const shouldForkSession = resumeSessionId !== undefined;
   const nodeOptionsWithAbort: SendQueryOptions | undefined = {
     ...nodeOptions,
@@ -817,11 +817,11 @@ async function executeNodeInternal(
       const tickNow = Date.now();
       const nodeKey = `${workflowRun.id}:${node.id}`;
 
-      // Cancel/pause check — read-only, no write contention in WAL mode (every 10s).
+      // Cancel/pause check -- read-only, no write contention in WAL mode (every 10s).
       //
       // `paused` is tolerated here: an approval node can transition the run to
       // paused while this concurrent node is mid-stream (same topological layer).
-      // The streaming node should be allowed to finish its own output — the
+      // The streaming node should be allowed to finish its own output -- the
       // paused gate owns workflow progression, not individual node lifecycles.
       // Only truly terminal / unknown states (null, cancelled, failed, completed)
       // abort the in-flight stream.
@@ -845,7 +845,7 @@ async function executeNodeInternal(
         }
       }
 
-      // Activity heartbeat — write, throttled to every 60s (only for stale/zombie detection)
+      // Activity heartbeat -- write, throttled to every 60s (only for stale/zombie detection)
       if (tickNow - (lastNodeActivityUpdate.get(nodeKey) ?? 0) > ACTIVITY_HEARTBEAT_INTERVAL_MS) {
         lastNodeActivityUpdate.set(nodeKey, tickNow);
         try {
@@ -1008,10 +1008,10 @@ async function executeNodeInternal(
         }
         // Fail loudly on any other SDK error result. Previously we broke out of
         // the stream silently, producing empty/partial output without signaling
-        // failure — which let failed iterations masquerade as successes (#1208).
+        // failure -- which let failed iterations masquerade as successes (#1208).
         if (msg.isError) {
           const subtype = msg.errorSubtype ?? 'unknown';
-          const errorsDetail = msg.errors?.length ? ` — ${msg.errors.join('; ')}` : '';
+          const errorsDetail = msg.errors?.length ? ` -- ${msg.errors.join('; ')}` : '';
           getLog().error(
             {
               nodeId: node.id,
@@ -1025,14 +1025,14 @@ async function executeNodeInternal(
           );
           throw new Error(`Node '${node.id}' failed: SDK returned ${subtype}${errorsDetail}`);
         }
-        break; // Result is the "I'm done" signal — don't wait for subprocess to exit
+        break; // Result is the "I'm done" signal -- don't wait for subprocess to exit
       } else if (msg.type === 'system' && msg.content) {
         // Providers yield system chunks for user-actionable issues (missing env
         // vars, Haiku+MCP, structured output failures, etc.). MCP-failure
         // chunks need filtering: user-level plugin MCPs inherited from
         // `~/.claude/` (e.g. `telegram`) routinely fail to connect inside the
         // headless subprocess and aren't actionable for the workflow author.
-        // Other warnings (⚠️) are always actionable and surface verbatim.
+        // Other warnings (!) are always actionable and surface verbatim.
         if (msg.content.startsWith(MCP_FAILURE_PREFIX)) {
           const failedEntries = parseMcpFailureServerNames(msg.content);
           const workflowFailures = failedEntries.filter(e => configuredMcpNames.has(e.name));
@@ -1063,7 +1063,7 @@ async function executeNodeInternal(
               'dag.mcp_plugin_connection_suppressed'
             );
           }
-        } else if (msg.content.startsWith('⚠️')) {
+        } else if (msg.content.startsWith('!')) {
           getLog().warn(
             { nodeId: node.id, systemContent: msg.content },
             'dag.provider_warning_forwarded'
@@ -1130,7 +1130,7 @@ async function executeNodeInternal(
 
     // When output_format is set and the provider returned structured_output,
     // use it instead of the concatenated assistant text (which includes prose).
-    // Each provider normalizes its own structured output onto the result chunk —
+    // Each provider normalizes its own structured output onto the result chunk --
     // no provider-specific branching here.
     if (nodeOptions?.outputFormat) {
       if (structuredOutput !== undefined) {
@@ -1147,7 +1147,7 @@ async function executeNodeInternal(
         }
         getLog().debug({ nodeId: node.id, streamingMode }, 'dag.structured_output_override');
       } else {
-        // Provider did not populate structuredOutput — warn the user.
+        // Provider did not populate structuredOutput -- warn the user.
         // If the provider detected invalid output, it already yielded a system warning.
         getLog().warn(
           { nodeId: node.id, workflowRunId: workflowRun.id },
@@ -1171,7 +1171,7 @@ async function executeNodeInternal(
       await safeSendMessage(
         platform,
         conversationId,
-        `⚠️ Node \`${node.id}\` completed via idle timeout (no output for ${String(effectiveIdleTimeout / 60000)} min). The AI likely finished but the subprocess didn't exit cleanly.`,
+        `! Node \`${node.id}\` completed via idle timeout (no output for ${String(effectiveIdleTimeout / 60000)} min). The AI likely finished but the subprocess didn't exit cleanly.`,
         nodeContext
       );
     }
@@ -1239,7 +1239,7 @@ async function executeNodeInternal(
       return failResult.output;
     }
 
-    // Empty assistant output is a failure for AI nodes — a provider stream
+    // Empty assistant output is a failure for AI nodes -- a provider stream
     // that closed cleanly with zero content typically means a silent
     // rejection or interruption that didn't produce a result.isError chunk.
     // Bash/script/approval nodes don't reach this path; they have their
@@ -1250,7 +1250,7 @@ async function executeNodeInternal(
     // that to a failure here would directly contradict the on-screen message.
     if (nodeOutputText.trim() === '' && structuredOutput === undefined && !nodeIdleTimedOut) {
       const duration = Date.now() - nodeStartTime;
-      const emptyError = `Node '${node.id}' produced no assistant output. The provider stream closed without yielding content — likely a silent provider rejection or stream interruption.`;
+      const emptyError = `Node '${node.id}' produced no assistant output. The provider stream closed without yielding content -- likely a silent provider rejection or stream interruption.`;
       getLog().error({ nodeId: node.id, durationMs: duration }, 'dag.node_empty_output');
 
       const failResult = await handleNodeFailure(
@@ -1414,7 +1414,7 @@ const SUBPROCESS_DEFAULT_TIMEOUT = 120_000;
 /**
  * Execute a bash (shell script) DAG node.
  * Runs the script via `bash -c`, captures stdout as node output.
- * No AI session is created — bash nodes are free/deterministic.
+ * No AI session is created -- bash nodes are free/deterministic.
  */
 async function executeBashNode(
   deps: WorkflowDeps,
@@ -1569,7 +1569,7 @@ async function executeBashNode(
         loadBearing: warning.loadBearing,
       });
 
-      // Downstream nodes still see this node as completed — the warning is an
+      // Downstream nodes still see this node as completed -- the warning is an
       // observability signal, not a graph-control change. Failing the node
       // here would block dependents; rolling-up at workflow level is the UI's
       // job (see WorkflowExecution.tsx).
@@ -1607,7 +1607,7 @@ async function executeBashNode(
     const isTimeout = err.killed === true || (err.message ?? '').includes('timed out');
     const label = `Bash node '${node.id}'`;
     // Always run the formatter so logs get sanitized fields regardless of which
-    // user-facing branch we end up in — the timeout message also contains the
+    // user-facing branch we end up in -- the timeout message also contains the
     // full `Command failed: bash -c <body>` line and would otherwise leak.
     const formatted = formatSubprocessFailure(err, label);
     let errorMsg: string;
@@ -1746,17 +1746,17 @@ async function executeScriptNode(
         args = ['run', ...withFlags, 'python', '-c', finalScript];
       }
     } else {
-      // Named script — look up across repo and home scopes.
+      // Named script -- look up across repo and home scopes.
       // Precedence: <cwd>/.archon/scripts/ > ~/.archon/scripts/ (repo wins).
       // Wrap discovery in its own try/catch so a permission error on ~/.archon/scripts/
       // isn't mis-attributed by the outer catch's "permission denied (check cwd
-      // permissions)" branch — that branch is for execFileAsync EACCES.
+      // permissions)" branch -- that branch is for execFileAsync EACCES.
       let scripts: Awaited<ReturnType<typeof discoverScriptsForCwd>>;
       try {
         scripts = await discoverScriptsForCwd(cwd);
       } catch (discoveryErr) {
         const err = discoveryErr as Error;
-        const errorMsg = `Script node '${node.id}': failed to discover scripts — ${err.message}`;
+        const errorMsg = `Script node '${node.id}': failed to discover scripts -- ${err.message}`;
         getLog().error({ err, nodeId: node.id, cwd }, 'script_discovery_failed');
         await safeSendMessage(platform, conversationId, errorMsg, nodeContext);
         await logNodeError(logDir, workflowRun.id, node.id, errorMsg);
@@ -1848,7 +1848,7 @@ async function executeScriptNode(
 
     const duration = Date.now() - nodeStartTime;
 
-    // WO-170: same silent-failure detection on script nodes — STATUS=*_failed
+    // WO-170: same silent-failure detection on script nodes -- STATUS=*_failed
     // on stdout when exit code was 0 is a yellow-state signal.
     const warning = detectSilentFailure(output, node.load_bearing === true);
 
@@ -1932,7 +1932,7 @@ async function executeScriptNode(
     const isTimeout = err.killed === true || (err.message ?? '').includes('timed out');
     const label = `Script node '${node.id}'`;
     // Always run the formatter so logs get sanitized fields regardless of which
-    // user-facing branch we end up in — the timeout message also contains the
+    // user-facing branch we end up in -- the timeout message also contains the
     // full `Command failed: bun -e <body>` line and would otherwise leak.
     const formatted = formatSubprocessFailure(err, label);
     let errorMsg: string;
@@ -2010,10 +2010,10 @@ function buildLoopNodeOptions(
 }
 
 /**
- * Execute a loop node — runs prompt repeatedly until completion signal or max iterations.
+ * Execute a loop node -- runs prompt repeatedly until completion signal or max iterations.
  *
  * Key behaviors:
- * - Returns NodeExecutionResult (not void) — DAG executor owns workflow lifecycle
+ * - Returns NodeExecutionResult (not void) -- DAG executor owns workflow lifecycle
  * - Receives upstream node outputs for $nodeId.output substitution
  * - Does not write current_step_index (DAG tracks per-node completion)
  */
@@ -2038,7 +2038,7 @@ async function executeLoopNode(
   const loop = node.loop;
   const msgContext = { workflowId: workflowRun.id, nodeName: node.id };
 
-  // Resolve AI client — fail fast with descriptive error
+  // Resolve AI client -- fail fast with descriptive error
   let aiClient: ReturnType<typeof deps.getAgentProvider>;
   try {
     aiClient = deps.getAgentProvider(workflowProvider);
@@ -2052,7 +2052,7 @@ async function executeLoopNode(
     return { state: 'failed', output: '', error: errorMsg };
   }
 
-  // Detect interactive loop resume — check if workflowRun.metadata has loop gate state for this node
+  // Detect interactive loop resume -- check if workflowRun.metadata has loop gate state for this node
   const rawApproval = workflowRun.metadata?.approval;
   const loopGateMeta = isApprovalContext(rawApproval) ? rawApproval : undefined;
   const isLoopResume = loopGateMeta?.type === 'interactive_loop' && loopGateMeta.nodeId === node.id;
@@ -2076,8 +2076,8 @@ async function executeLoopNode(
   );
 
   // Resolve agent persona for loop node (if `agent:` or `persona:` is declared).
-  // `persona:` is the human-facing alias for `agent:` — both resolve identically.
-  // Applied to every iteration — same semantics as prompt/command nodes:
+  // `persona:` is the human-facing alias for `agent:` -- both resolve identically.
+  // Applied to every iteration -- same semantics as prompt/command nodes:
   // persona model overrides the loop-resolved model; persona system prompt is
   // prepended to any node-level systemPrompt.
   // Note: the loop path does NOT call loadContext (wiki + oracle) today;
@@ -2120,7 +2120,7 @@ async function executeLoopNode(
     // Check for non-running status between iterations. `paused` is tolerated
     // here for the same reason as the streaming check: a sibling approval
     // node in the same topological layer may pause the run while this loop
-    // is between iterations — the loop should continue its own iterations
+    // is between iterations -- the loop should continue its own iterations
     // regardless of unrelated pauses elsewhere in the DAG.
     const runStatus = await deps.store.getWorkflowRunStatus(workflowRun.id);
     if (!shouldContinueStreamingForStatus(runStatus)) {
@@ -2168,7 +2168,7 @@ async function executeLoopNode(
     const iterationAbortController = new AbortController();
 
     try {
-      // Build prompt — substituteWorkflowVariables throws if $BASE_BRANCH referenced but empty
+      // Build prompt -- substituteWorkflowVariables throws if $BASE_BRANCH referenced but empty
       // Pass loopUserInput on the first resumed iteration; '' on all others (non-interactive
       // or subsequent iterations) so $LOOP_USER_INPUT substitutes to empty string explicitly.
       // $LOOP_PREV_OUTPUT carries the previous iteration's cleaned output and is empty on
@@ -2259,12 +2259,12 @@ async function executeLoopNode(
             loopTotalNumTurns = (loopTotalNumTurns ?? 0) + msg.numTurns;
           }
           // Fail the iteration loudly on SDK error results. Previously we broke
-          // silently, producing empty output and continuing to the next iteration —
+          // silently, producing empty output and continuing to the next iteration --
           // which made `error_during_execution` on resumed interactive loops look
           // like a "5-second crash" that kept burning iterations (#1208).
           if (msg.isError) {
             const subtype = msg.errorSubtype ?? 'unknown';
-            const errorsDetail = msg.errors?.length ? ` — ${msg.errors.join('; ')}` : '';
+            const errorsDetail = msg.errors?.length ? ` -- ${msg.errors.join('; ')}` : '';
             getLog().error(
               {
                 nodeId: node.id,
@@ -2280,7 +2280,7 @@ async function executeLoopNode(
               `Loop '${node.id}' iteration ${String(i)} failed: SDK returned ${subtype}${errorsDetail}`
             );
           }
-          break; // Result is the "I'm done" signal — don't wait for subprocess to exit
+          break; // Result is the "I'm done" signal -- don't wait for subprocess to exit
         } else if (msg.type === 'tool' && msg.toolName) {
           const now = Date.now();
 
@@ -2401,18 +2401,18 @@ async function executeLoopNode(
       );
     }
 
-    // Empty assistant output is an iteration failure for AI loops — same
+    // Empty assistant output is an iteration failure for AI loops -- same
     // contract as the single-shot AI-node guard in executeNodeInternal. A
     // provider stream that closed cleanly with zero content typically means
     // a silent rejection or interruption; left unchecked, an interactive
     // loop would pause with a blank gate or burn the full max_iterations
-    // budget producing nothing. Idle-timeout exits are exempt — the
+    // budget producing nothing. Idle-timeout exits are exempt -- the
     // notification above has already told the user the iteration completed
     // via timeout, and flipping that to a failure would contradict it.
     if (!iterationIdleTimedOut && fullOutput.trim() === '') {
       const iterationDuration = Date.now() - iterationStart;
       const emptyError =
-        'Loop iteration produced no assistant output. The provider stream closed without yielding content — likely a silent provider rejection or stream interruption.';
+        'Loop iteration produced no assistant output. The provider stream closed without yielding content -- likely a silent provider rejection or stream interruption.';
       getLog().error(
         { nodeId: node.id, iteration: i, durationMs: iterationDuration },
         'loop_node.iteration_empty_output'
@@ -2458,7 +2458,7 @@ async function executeLoopNode(
 
     lastIterationOutput = cleanOutput || fullOutput;
 
-    // Check LLM completion signal — the AI decides whether the user approved.
+    // Check LLM completion signal -- the AI decides whether the user approved.
     // For interactive loops, the AI emits the signal when the user explicitly approves
     // (e.g., "approved", "looks good"). The prompt instructs the AI on when to emit it.
     const signalDetected = detectCompletionSignal(fullOutput, loop.until);
@@ -2490,7 +2490,7 @@ async function executeLoopNode(
         bashComplete = true; // exit 0 = complete
       } catch (e) {
         const bashErr = e as NodeJS.ErrnoException;
-        // ENOENT or other system errors are unexpected — log them
+        // ENOENT or other system errors are unexpected -- log them
         if (bashErr.code === 'ENOENT') {
           getLog().warn(
             { err: bashErr, nodeId: node.id, iteration: i },
@@ -2528,10 +2528,10 @@ async function executeLoopNode(
       durationMs: duration,
     });
 
-    // Completion signal detected — exit the loop.
+    // Completion signal detected -- exit the loop.
     // For interactive loops: only honor the signal when the AI had user input to evaluate
     // (i.e., this is a resume iteration with loopUserInput). On the first iteration of a
-    // fresh interactive loop, the user hasn't seen anything yet — always gate first.
+    // fresh interactive loop, the user hasn't seen anything yet -- always gate first.
     // For non-interactive loops: the AI signals task completion at any point.
     const interactiveFirstRun = loop.interactive && !isLoopResume;
     if (completionDetected && !interactiveFirstRun) {
@@ -2588,7 +2588,7 @@ async function executeLoopNode(
       };
     }
 
-    // Interactive loop gate — pause after every iteration where the AI did NOT emit the
+    // Interactive loop gate -- pause after every iteration where the AI did NOT emit the
     // completion signal. The user reviews the AI's output and provides feedback or approval.
     // On approval, the AI will emit the signal in the next iteration, exiting above.
     if (loop.interactive && loop.gate_message) {
@@ -2601,7 +2601,7 @@ async function executeLoopNode(
         nodeName: node.id,
       });
       if (!gateSent) {
-        // Gate message failed to deliver — do not pause; fail the node so the user
+        // Gate message failed to deliver -- do not pause; fail the node so the user
         // sees a clear error rather than a silently orphaned paused run.
         getLog().error(
           { nodeId: node.id, workflowRunId: workflowRun.id, iteration: i },
@@ -2610,7 +2610,7 @@ async function executeLoopNode(
         return {
           state: 'failed',
           output: lastIterationOutput,
-          error: `Loop gate message failed to deliver for node '${node.id}' — cannot pause safely`,
+          error: `Loop gate message failed to deliver for node '${node.id}' -- cannot pause safely`,
         };
       }
       deps.store
@@ -2636,7 +2636,7 @@ async function executeLoopNode(
         nodeId: node.id,
         message: loop.gate_message,
       });
-      // Return completed — the between-layer status check sees 'paused' and halts cleanly.
+      // Return completed -- the between-layer status check sees 'paused' and halts cleanly.
       // This mirrors the approval-node pattern, preventing false "DAG nodes failed" warnings
       // in multi-node workflows. Resume correctness relies on the 'paused' DB status, not
       // on the node's output state.
@@ -2666,7 +2666,7 @@ async function executeLoopNode(
 }
 
 /**
- * Execute an approval node — pauses workflow for human review.
+ * Execute an approval node -- pauses workflow for human review.
  * On rejection resume (when on_reject is configured): runs the on_reject prompt via AI,
  * then re-pauses at the approval gate. After max_attempts rejections, cancels normally.
  */
@@ -2691,7 +2691,7 @@ async function executeApprovalNode(
 ): Promise<NodeOutput> {
   const msgContext = { workflowId: workflowRun.id, nodeName: node.id };
 
-  // Detect rejection resume — check metadata for rejection_reason set by reject handlers
+  // Detect rejection resume -- check metadata for rejection_reason set by reject handlers
   const rawApproval = workflowRun.metadata?.approval;
   const approvalMeta = isApprovalContext(rawApproval) ? rawApproval : undefined;
   const rawRejection = workflowRun.metadata?.rejection_reason;
@@ -2730,7 +2730,7 @@ async function executeApprovalNode(
         nodeId: node.id,
         reason: `max_attempts (${String(maxAttempts)}) exhausted`,
       });
-      const cancelMsg = `❌ Approval node \`${node.id}\` cancelled after ${String(maxAttempts)} rejections.`;
+      const cancelMsg = `[ ] Approval node \`${node.id}\` cancelled after ${String(maxAttempts)} rejections.`;
       await safeSendMessage(platform, conversationId, cancelMsg, msgContext);
       return { state: 'completed' as const, output: '' };
     }
@@ -2758,7 +2758,7 @@ async function executeApprovalNode(
     // with nodeId = `${node.id}:on_reject`. These flow through SSE into the web UI, where
     // WorkflowExecution.tsx builds its nodeMap from all node_* events unconditionally.
     // This means a transient `${node.id}:on_reject` phantom entry may appear in the UI's
-    // execution view during an on_reject cycle. This is cosmetic-only — the approval gate
+    // execution view during an on_reject cycle. This is cosmetic-only -- the approval gate
     // still re-presents correctly and the human gate contract is preserved. A follow-up can
     // filter synthetic `:on_reject` IDs from the UI's nodeMap if needed.
     const syntheticNode: PromptNode = {
@@ -2823,7 +2823,7 @@ async function executeApprovalNode(
   // (parity with prompt/bash/loop/cancel nodes, which all run the same substitution).
   const renderedMessage = substituteNodeOutputRefs(node.approval.message, nodeOutputs);
   const approvalMsg =
-    `⏸ **Approval required**: ${renderedMessage}\n\n` +
+    ` **Approval required**: ${renderedMessage}\n\n` +
     `Run ID: \`${workflowRun.id}\`\n` +
     `Approve: \`/workflow approve ${workflowRun.id}\` | Reject: \`/workflow reject ${workflowRun.id}\``;
   // Inline Approve/Reject buttons for platforms that support them (Telegram).
@@ -2832,8 +2832,8 @@ async function executeApprovalNode(
   await safeSendMessage(platform, conversationId, approvalMsg, msgContext, {
     category: 'workflow_status',
     inlineButtons: [
-      { text: '✅ Approve', callbackData: 'approve' },
-      { text: '❌ Reject', callbackData: 'reject' },
+      { text: '[x] Approve', callbackData: 'approve' },
+      { text: '[ ] Reject', callbackData: 'reject' },
     ],
   });
 
@@ -2854,8 +2854,8 @@ async function executeApprovalNode(
             text: `Approval required: ${renderedMessage}\n\nRun ${workflowRun.id}`,
             reply_markup: {
               inline_keyboard: [
-                [{ text: '✅ Approve', callback_data: `/workflow approve ${workflowRun.id}` }],
-                [{ text: '❌ Reject', callback_data: `/workflow reject ${workflowRun.id}` }],
+                [{ text: '[x] Approve', callback_data: `/workflow approve ${workflowRun.id}` }],
+                [{ text: '[ ] Reject', callback_data: `/workflow reject ${workflowRun.id}` }],
               ],
             },
           }),
@@ -2896,7 +2896,7 @@ async function executeApprovalNode(
     message: renderedMessage,
   });
 
-  // Return completed — the between-layer status check will see 'paused' and break.
+  // Return completed -- the between-layer status check will see 'paused' and break.
   // On resume, the approve endpoint writes a real node_completed event with the user's response.
   return { state: 'completed' as const, output: '' };
 }
@@ -2971,7 +2971,7 @@ export async function executeDagWorkflow(
   // For parallel layers (>1 node), always fresh (can't share a session).
   let lastSequentialSessionId: string | undefined;
   // Note: accumulates cost for this invocation only. If this is a resume, nodes skipped
-  // from the prior run are not included — total_cost_usd will reflect resumed-portion cost only.
+  // from the prior run are not included -- total_cost_usd will reflect resumed-portion cost only.
   // The same resumed-portion semantics apply to totalTokens.
   let totalCostUsd = 0;
   let totalTokens = 0;
@@ -2985,7 +2985,7 @@ export async function executeDagWorkflow(
     const isParallelLayer = layer.length > 1;
 
     if (isParallelLayer) {
-      lastSequentialSessionId = undefined; // reset — parallel nodes can't share sessions
+      lastSequentialSessionId = undefined; // reset -- parallel nodes can't share sessions
     }
 
     // Execute all nodes in the layer concurrently
@@ -3143,7 +3143,7 @@ export async function executeDagWorkflow(
             }
           }
 
-          // 3. Bash node dispatch — no AI, no session
+          // 3. Bash node dispatch -- no AI, no session
           if (isBashNode(node)) {
             const output = await executeBashNode(
               deps,
@@ -3164,12 +3164,12 @@ export async function executeDagWorkflow(
             return { nodeId: node.id, output };
           }
 
-          // 3b. Loop node dispatch — manages its own AI sessions and iteration
+          // 3b. Loop node dispatch -- manages its own AI sessions and iteration
           if (isLoopNode(node)) {
             // Resolve per-node provider/model overrides (same logic as other node types).
             // Provider is explicit; model passes through to the SDK. Throw on an
             // unknown provider so the outer catch below emits the standard
-            // node_failed event + user-facing message — the same path
+            // node_failed event + user-facing message -- the same path
             // resolveNodeProviderAndModel uses for non-loop nodes.
             const loopProvider: string = node.provider ?? workflowProvider;
             if (!isRegisteredProvider(loopProvider)) {
@@ -3207,7 +3207,7 @@ export async function executeDagWorkflow(
             return { nodeId: node.id, output };
           }
 
-          // 3c. Approval node dispatch — pauses workflow for human review
+          // 3c. Approval node dispatch -- pauses workflow for human review
           if (isApprovalNode(node)) {
             const output = await executeApprovalNode(
               node,
@@ -3231,7 +3231,7 @@ export async function executeDagWorkflow(
             return { nodeId: node.id, output };
           }
 
-          // 3d. Cancel node dispatch — terminates the workflow run
+          // 3d. Cancel node dispatch -- terminates the workflow run
           if (isCancelNode(node)) {
             const reason = substituteNodeOutputRefs(node.cancel, nodeOutputs);
             const cancelMsg = `\u274c **Workflow cancelled** (node \`${node.id}\`): ${reason}`;
@@ -3259,11 +3259,11 @@ export async function executeDagWorkflow(
               nodeId: node.id,
               reason,
             });
-            // Return completed — the between-layer status check will see 'cancelled' and break.
+            // Return completed -- the between-layer status check will see 'cancelled' and break.
             return { nodeId: node.id, output: { state: 'completed' as const, output: reason } };
           }
 
-          // 3e. Script node dispatch — runs via bun or uv
+          // 3e. Script node dispatch -- runs via bun or uv
           if (isScriptNode(node)) {
             const output = await executeScriptNode(
               deps,
@@ -3296,7 +3296,7 @@ export async function executeDagWorkflow(
             workflowLevelOptions
           );
 
-          // 5. Determine session — parallel or context:fresh → always fresh
+          // 5. Determine session -- parallel or context:fresh -> always fresh
           // Parallel layers always get fresh sessions; explicit 'fresh' context also forces it.
           // 'shared' forces continuation. Default: fresh for parallel, inherited for sequential.
           const isFresh = isParallelLayer || node.context === 'fresh';
@@ -3325,7 +3325,7 @@ export async function executeDagWorkflow(
               baseBranch,
               docsDir,
               nodeOutputs,
-              // Always pass the prior session ID — forkSession:true in executeNodeInternal
+              // Always pass the prior session ID -- forkSession:true in executeNodeInternal
               // ensures the source is never mutated, so retries can safely resume from it.
               resumeSessionId,
               configuredCommandFolder,
@@ -3363,7 +3363,7 @@ export async function executeDagWorkflow(
             await safeSendMessage(
               platform,
               conversationId,
-              `⚠️ Node \`${node.id}\` failed with ${errorKind} (attempt ${String(attempt + 1)}/${String(retryConfig.maxRetries + 1)}). Retrying in ${String(Math.round(delayMs / 1000))}s...`,
+              `! Node \`${node.id}\` failed with ${errorKind} (attempt ${String(attempt + 1)}/${String(retryConfig.maxRetries + 1)}). Retrying in ${String(Math.round(delayMs / 1000))}s...`,
               { workflowId: workflowRun.id, nodeName: node.id }
             );
 
@@ -3377,12 +3377,12 @@ export async function executeDagWorkflow(
           // approve/reject decision can fix (e.g. a codex persona declaring an
           // Anthropic model). Label it so an operator is told to fix the
           // substrate rather than treat it as an ordinary node failure. This
-          // surfaces at the pre-execution catch, NOT the approval/pause-gate —
+          // surfaces at the pre-execution catch, NOT the approval/pause-gate --
           // a throw here never reaches that gate.
           const isInfraBlock = err instanceof InfrastructureClassBlock;
           const failMessage = isInfraBlock
             ? `INFRASTRUCTURE FAULT in node '${node.id}': ${err.message} ` +
-              'Resuming will not help — the fix is a harness/persona/config change, not an ' +
+              'Resuming will not help -- the fix is a harness/persona/config change, not an ' +
               'approve/reject decision. Reject this run and fix the substrate.'
             : `Node '${node.id}' failed before execution: ${err.message}`;
           getLog().error(
@@ -3418,7 +3418,7 @@ export async function executeDagWorkflow(
       })
     );
 
-    // Process layer results — store all outputs, track failures
+    // Process layer results -- store all outputs, track failures
     let layerHadFailure = false;
     for (const result of layerResults) {
       if (result.status === 'fulfilled') {
@@ -3434,7 +3434,7 @@ export async function executeDagWorkflow(
         }
         if (output.state === 'failed') layerHadFailure = true;
       } else {
-        // Should not happen — all errors are caught in the inner try-catch
+        // Should not happen -- all errors are caught in the inner try-catch
         // Handle defensively: log the unexpected rejection
         getLog().error({ err: result.reason as Error, layerIdx }, 'dag_node_unexpected_rejection');
         layerHadFailure = true;
@@ -3465,19 +3465,19 @@ export async function executeDagWorkflow(
           },
           'dag.stop_detected_between_layers'
         );
-        // Paused is intentional (approval gate) — the approval message was already sent
+        // Paused is intentional (approval gate) -- the approval message was already sent
         if (effectiveStatus !== 'paused') {
           await safeSendMessage(
             platform,
             conversationId,
-            `⚠️ **Workflow stopped** (${effectiveStatus}): DAG execution stopped after layer ${String(layerIdx + 1)}/${String(layers.length)}`,
+            `! **Workflow stopped** (${effectiveStatus}): DAG execution stopped after layer ${String(layerIdx + 1)}/${String(layers.length)}`,
             { workflowId: workflowRun.id }
           );
         }
         break;
       }
     } catch (statusErr) {
-      // Non-fatal — status check failure should not crash the workflow
+      // Non-fatal -- status check failure should not crash the workflow
       getLog().warn(
         { err: statusErr as Error, workflowRunId: workflowRun.id },
         'dag.status_check_failed'
@@ -3488,12 +3488,12 @@ export async function executeDagWorkflow(
   /**
    * Bail out of the final completion/failure write if the run was transitioned
    * externally. Strict `!== 'running'` check is correct here because we don't
-   * want to mark a paused run as complete — the approval gate is still live.
+   * want to mark a paused run as complete -- the approval gate is still live.
    *
    * Emitter unregister is conditional: terminal states (cancelled / deleted /
    * completed / failed) unregister to release subscription resources, but
    * `paused` keeps the emitter registered so SSE stays connected while the
-   * approval gate awaits the user — crucial for resume observability.
+   * approval gate awaits the user -- crucial for resume observability.
    */
   async function skipIfStatusChanged(logEvent: string): Promise<boolean> {
     const status = await deps.store.getWorkflowRunStatus(workflowRun.id);
@@ -3525,7 +3525,7 @@ export async function executeDagWorkflow(
     const failMsg =
       `DAG workflow '${workflow.name}' completed with no successful nodes. ` +
       'Check node conditions, trigger rules, and upstream failures.';
-    // Note: nodeCounts not stored for failed runs — failWorkflowRun only stores { error }.
+    // Note: nodeCounts not stored for failed runs -- failWorkflowRun only stores { error }.
     // Frontend guards with isValidNodeCounts so missing node_counts is safe.
     await deps.store.failWorkflowRun(workflowRun.id, failMsg).catch((dbErr: Error) => {
       getLog().error({ err: dbErr, workflowRunId: workflowRun.id }, 'dag_db_fail_failed');
@@ -3547,7 +3547,7 @@ export async function executeDagWorkflow(
     await safeSendMessage(platform, conversationId, `\u274c ${failMsg}`, {
       workflowId: workflowRun.id,
     });
-    // DO NOT throw — outer executor.ts catch would duplicate workflow_failed events
+    // DO NOT throw -- outer executor.ts catch would duplicate workflow_failed events
     return;
   }
 
@@ -3578,7 +3578,7 @@ export async function executeDagWorkflow(
     await safeSendMessage(platform, conversationId, `\u274c ${failMsg}`, {
       workflowId: workflowRun.id,
     });
-    // DO NOT throw — outer executor.ts catch would duplicate workflow_failed events
+    // DO NOT throw -- outer executor.ts catch would duplicate workflow_failed events
     return;
   }
 

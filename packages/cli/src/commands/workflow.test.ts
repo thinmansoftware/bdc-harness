@@ -310,7 +310,7 @@ describe('workflowListCommand', () => {
     expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining('Found 1 workflow(s)'));
   });
 
-  it('calls discoverWorkflowsWithConfig with (cwd, loadConfig) — home scope is internal', async () => {
+  it('calls discoverWorkflowsWithConfig with (cwd, loadConfig) -- home scope is internal', async () => {
     const { discoverWorkflowsWithConfig } = await import('@archon/workflows/workflow-discovery');
     (discoverWorkflowsWithConfig as ReturnType<typeof mock>).mockResolvedValueOnce({
       workflows: [],
@@ -320,7 +320,7 @@ describe('workflowListCommand', () => {
     await workflowListCommand('/test/path');
 
     // After the globalSearchPath refactor, discovery reads ~/.archon/workflows/
-    // on every call with no option — every caller inherits home-scope for free.
+    // on every call with no option -- every caller inherits home-scope for free.
     expect(discoverWorkflowsWithConfig).toHaveBeenCalledWith('/test/path', expect.any(Function));
   });
 
@@ -422,7 +422,7 @@ describe('workflowRunCommand', () => {
       default_cwd: '/test/path',
     });
 
-    // Should resolve successfully — "assist" suffix-matches "archon-assist"
+    // Should resolve successfully -- "assist" suffix-matches "archon-assist"
     await workflowRunCommand('/test/path', 'assist', 'hello');
 
     // Verify suffix matching tier was used
@@ -555,7 +555,7 @@ describe('workflowRunCommand', () => {
     // "assist" exact-matches "assist", should NOT go to suffix matching
     await workflowRunCommand('/test/path', 'assist', 'hello');
 
-    // Should not have logged suffix/substring match — exact match takes priority
+    // Should not have logged suffix/substring match -- exact match takes priority
     expect(mockLogger.info).not.toHaveBeenCalledWith(
       expect.objectContaining({ requested: 'assist' }),
       'workflow_run_suffix_match'
@@ -622,7 +622,7 @@ describe('workflowRunCommand', () => {
       workflowRunId: 'run-123',
     });
 
-    // With --no-worktree, DB failure is non-fatal — user explicitly opted out of isolation
+    // With --no-worktree, DB failure is non-fatal -- user explicitly opted out of isolation
     await workflowRunCommand('/test/path', 'assist', 'hello', { noWorktree: true });
 
     expect(mockLogger.warn).toHaveBeenCalledWith(
@@ -746,7 +746,7 @@ describe('workflowRunCommand', () => {
       errors: [],
     });
 
-    // Validation throws before codebase lookup — no need to mock findCodebaseByDefaultCwd
+    // Validation throws before codebase lookup -- no need to mock findCodebaseByDefaultCwd
     await expect(
       workflowRunCommand('/test/path', 'assist', 'hello', {
         branchName: 'test-branch',
@@ -763,7 +763,7 @@ describe('workflowRunCommand', () => {
       errors: [],
     });
 
-    // Validation throws before codebase lookup — no need to mock findCodebaseByDefaultCwd
+    // Validation throws before codebase lookup -- no need to mock findCodebaseByDefaultCwd
     await expect(
       workflowRunCommand('/test/path', 'assist', 'hello', {
         fromBranch: 'dev',
@@ -801,7 +801,7 @@ describe('workflowRunCommand', () => {
       workflowRunId: 'run-123',
     });
 
-    // No branchName, no noWorktree — should auto-isolate
+    // No branchName, no noWorktree -- should auto-isolate
     await workflowRunCommand('/test/path', 'assist', 'hello', {});
 
     const getIsolationProviderMock = isolation.getIsolationProvider as ReturnType<typeof mock>;
@@ -866,7 +866,7 @@ describe('workflowRunCommand', () => {
   });
 
   // -------------------------------------------------------------------------
-  // Stale workspace source-symlink → truthful CLI error
+  // Stale workspace source-symlink -> truthful CLI error
   // -------------------------------------------------------------------------
 
   it('surfaces auto-registration failures instead of claiming the repo is invalid', async () => {
@@ -1013,7 +1013,7 @@ describe('workflowRunCommand', () => {
       workflowRunId: 'run-123',
     });
 
-    // No flags — policy alone should disable isolation
+    // No flags -- policy alone should disable isolation
     await workflowRunCommand('/test/path', 'triage', 'go', {});
 
     const providerAfter = getIsolationProviderMock.mock.results.at(-1)?.value as
@@ -1090,7 +1090,7 @@ describe('workflowRunCommand', () => {
       workflowRunId: 'run-123',
     });
 
-    // Should not throw — redundant, not contradictory
+    // Should not throw -- redundant, not contradictory
     await workflowRunCommand('/test/path', 'triage', 'go', { noWorktree: true });
   });
 
@@ -1203,7 +1203,7 @@ describe('workflowRunCommand', () => {
       workflow_type: 'task',
       workflow_id: 'my-feature',
     });
-    // isAncestorOf returns true by default — no warning expected
+    // isAncestorOf returns true by default -- no warning expected
     (conversationDb.updateConversation as ReturnType<typeof mock>).mockResolvedValueOnce(undefined);
     (executeWorkflow as ReturnType<typeof mock>).mockResolvedValueOnce({
       success: true,
@@ -1367,14 +1367,14 @@ describe('workflowRunCommand', () => {
       summary: 'Done.',
     });
     // addMessage is called three times: user message persist, dispatch, result
-    // CLIAdapter internally catches DB errors — it logs 'cli_message_persist_failed' and does not throw.
+    // CLIAdapter internally catches DB errors -- it logs 'cli_message_persist_failed' and does not throw.
     // Verify workflowRunCommand does not throw even when the result DB write fails.
     (messagesDb.addMessage as ReturnType<typeof mock>)
       .mockResolvedValueOnce(undefined) // user message persist succeeds
       .mockResolvedValueOnce(undefined) // dispatch succeeds
       .mockRejectedValueOnce(new Error('DB gone')); // result fails (caught inside CLIAdapter)
 
-    // Should not throw — the CLIAdapter swallows the DB error and logs a warn
+    // Should not throw -- the CLIAdapter swallows the DB error and logs a warn
     await expect(
       workflowRunCommand('/test/path', 'assist', 'hello', { noWorktree: true })
     ).resolves.toBeUndefined();
@@ -1412,7 +1412,7 @@ describe('workflowRunCommand', () => {
       .mockResolvedValueOnce(undefined) // user message persist succeeds
       .mockRejectedValueOnce(new Error('DB gone')); // dispatch fails (caught inside CLIAdapter)
 
-    // Should not throw — dispatch failure must not block workflow execution
+    // Should not throw -- dispatch failure must not block workflow execution
     await expect(
       workflowRunCommand('/test/path', 'assist', 'hello', { noWorktree: true })
     ).resolves.toBeUndefined();
@@ -1449,7 +1449,7 @@ describe('workflowRunCommand', () => {
     try {
       await workflowRunCommand('/test/path', 'assist', 'hello', { noWorktree: true });
 
-      // Paused guard fires before summary check — no result card despite having a summary
+      // Paused guard fires before summary check -- no result card despite having a summary
       const resultCalls = (messagesDb.addMessage as ReturnType<typeof mock>).mock.calls.filter(
         (args: unknown[]) => {
           const meta = args[3] as Record<string, unknown> | undefined;
@@ -1459,7 +1459,7 @@ describe('workflowRunCommand', () => {
       expect(resultCalls).toHaveLength(0);
 
       // Confirm paused message was printed
-      expect(consoleSpy).toHaveBeenCalledWith('\nWorkflow paused — waiting for approval.');
+      expect(consoleSpy).toHaveBeenCalledWith('\nWorkflow paused -- waiting for approval.');
     } finally {
       consoleSpy.mockRestore();
     }
@@ -1557,7 +1557,7 @@ describe('workflowStatusCommand', () => {
 
     const calls = consoleSpy.mock.calls.map((c: unknown[]) => String(c[0]));
     expect(calls.some(c => c.includes('Nodes:'))).toBe(true);
-    expect(calls.some(c => c.includes('✓') && c.includes('plan'))).toBe(true);
+    expect(calls.some(c => c.includes('[x]') && c.includes('plan'))).toBe(true);
     expect(calls.some(c => c.includes('Plan output here'))).toBe(true);
   });
 
@@ -1601,7 +1601,7 @@ describe('workflowStatusCommand', () => {
     await workflowStatusCommand(false, true);
 
     const calls = consoleSpy.mock.calls.map((c: unknown[]) => String(c[0]));
-    expect(calls.some(c => c.includes('✗') && c.includes('implement'))).toBe(true);
+    expect(calls.some(c => c.includes('[ ]') && c.includes('implement'))).toBe(true);
     expect(calls.some(c => c.includes('Compilation failed'))).toBe(true);
   });
 
@@ -1709,7 +1709,7 @@ describe('workflowResumeCommand', () => {
     try {
       await workflowResumeCommand('run-1');
     } catch {
-      // workflowRunCommand will fail due to missing mocks — that's fine
+      // workflowRunCommand will fail due to missing mocks -- that's fine
     }
 
     // Printed resume message before delegating to workflowRunCommand
@@ -1763,7 +1763,7 @@ describe('workflowResumeCommand', () => {
     try {
       await workflowResumeCommand('run-1');
     } catch {
-      // workflowRunCommand may fail on other mocks — that's fine
+      // workflowRunCommand may fail on other mocks -- that's fine
     }
 
     // getCodebase SHOULD have been called with the stored codebase_id
@@ -1784,7 +1784,7 @@ describe('workflowResumeCommand', () => {
       codebase_id: 'cb-bad',
     });
 
-    // getCodebase throws — simulates DB hiccup
+    // getCodebase throws -- simulates DB hiccup
     (codebaseDb.getCodebase as ReturnType<typeof mock>).mockRejectedValueOnce(
       new Error('connection refused')
     );
@@ -1802,7 +1802,7 @@ describe('workflowResumeCommand', () => {
       // downstream failure is acceptable
     }
 
-    // Verify warn was called (not error — it's a soft fallback)
+    // Verify warn was called (not error -- it's a soft fallback)
     expect(mockLogger.warn).toHaveBeenCalledWith(
       expect.objectContaining({ codebaseId: 'cb-bad' }),
       'cli.codebase_id_lookup_failed'
@@ -1916,7 +1916,7 @@ describe('workflowApproveCommand', () => {
     try {
       await workflowApproveCommand('run-approve-conv');
     } catch {
-      // downstream failure is acceptable — we only need to reach getOrCreateConversation
+      // downstream failure is acceptable -- we only need to reach getOrCreateConversation
     }
 
     // Verify the original platform conversation ID was passed through
@@ -2155,7 +2155,7 @@ describe('workflowRejectCommand', () => {
     try {
       await workflowRejectCommand('run-reject-conv', 'needs work');
     } catch {
-      // downstream workflowRunCommand failure is acceptable — we only need to reach getOrCreateConversation
+      // downstream workflowRunCommand failure is acceptable -- we only need to reach getOrCreateConversation
     }
 
     // Verify the original platform conversation ID was passed through
@@ -2226,7 +2226,7 @@ describe('workflowRejectCommand', () => {
   });
 });
 
-describe('workflowRunCommand — progress rendering', () => {
+describe('workflowRunCommand -- progress rendering', () => {
   let consoleSpy: ReturnType<typeof spyOn>;
   let stderrSpy: ReturnType<typeof spyOn>;
 
@@ -2520,7 +2520,7 @@ describe('workflowRunCommand — progress rendering', () => {
 });
 
 // ---------------------------------------------------------------------------
-// extractStaleWorkspaceEntry — parser edge cases
+// extractStaleWorkspaceEntry -- parser edge cases
 // ---------------------------------------------------------------------------
 
 describe('extractStaleWorkspaceEntry', () => {

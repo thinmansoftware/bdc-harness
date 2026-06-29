@@ -13,7 +13,7 @@ describe('parseEnvFile', () => {
   });
 
   it('strips UTF-8 BOM prefix', () => {
-    const result = parseEnvFile('﻿FOO=bar\nBAZ=qux\n');
+    const result = parseEnvFile('\uFEFFFOO=bar\nBAZ=qux\n');
     expect(result).toEqual({ FOO: 'bar', BAZ: 'qux' });
   });
 
@@ -57,7 +57,7 @@ describe('parseEnvFile', () => {
   });
 
   it('returns empty object for BOM-only content', () => {
-    expect(parseEnvFile('﻿')).toEqual({});
+    expect(parseEnvFile('\uFEFF')).toEqual({});
   });
 
   it('trims trailing whitespace on CRLF values (no carriage return in value)', () => {

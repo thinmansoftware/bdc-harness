@@ -1,13 +1,13 @@
 /**
  * Integration tests for the env isolation flow:
- *   Bun auto-load (simulated) → stripCwdEnv() → ~/.archon/.env load → subprocess env
+ *   Bun auto-load (simulated) -> stripCwdEnv() -> ~/.archon/.env load -> subprocess env
  *
  * Tests the full user scenario: what keys reach the Claude subprocess when the
  * user has various combinations of CWD .env, ~/.archon/.env, and shell env?
  *
  * Note: We can't actually test Bun's auto-load (it runs before any code), so we
  * simulate it by setting process.env keys before calling stripCwdEnv(). This is
- * equivalent — Bun's auto-load just does process.env[key] = value, same as us.
+ * equivalent -- Bun's auto-load just does process.env[key] = value, same as us.
  */
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 import { writeFileSync, mkdirSync, rmSync } from 'fs';
@@ -90,7 +90,7 @@ describe('env isolation integration', () => {
     // Step 2: stripCwdEnv (same as entry point)
     stripCwdEnv(cwdDir);
 
-    // Step 3: Load ~/.archon/.env with override — user's Archon config wins
+    // Step 3: Load ~/.archon/.env with override -- user's Archon config wins
     // over any shell-inherited vars (same as real entry point).
     writeFileSync(join(archonDir, '.env'), archonEnv);
     config({ path: join(archonDir, '.env'), override: true });
@@ -99,7 +99,7 @@ describe('env isolation integration', () => {
     return { ...process.env };
   }
 
-  it('scenario 1: global auth user with ANTHROPIC_API_KEY in CWD .env — CWD key stripped', () => {
+  it('scenario 1: global auth user with ANTHROPIC_API_KEY in CWD .env -- CWD key stripped', () => {
     // User ran `claude /login` (global auth). Target repo has ANTHROPIC_API_KEY
     // in its .env. That key must NOT reach the subprocess.
     const subprocessEnv = simulateEntryPointFlow(
@@ -112,7 +112,7 @@ describe('env isolation integration', () => {
     expect(subprocessEnv.CLAUDE_USE_GLOBAL_AUTH).toBe('true');
   });
 
-  it('scenario 2: user has OAuth token in archon env + random key in CWD .env — CWD stripped, archon kept', () => {
+  it('scenario 2: user has OAuth token in archon env + random key in CWD .env -- CWD stripped, archon kept', () => {
     const subprocessEnv = simulateEntryPointFlow(
       'CWD_ONLY_KEY=from-target-repo\nLOG_LEVEL=debug\n',
       'CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-my-token\nCLAUDE_USE_GLOBAL_AUTH=false\n'
@@ -146,7 +146,7 @@ describe('env isolation integration', () => {
     expect(hasHome).toBeDefined();
   });
 
-  it('scenario 4: same key in both CWD and archon env — archon value wins', () => {
+  it('scenario 4: same key in both CWD and archon env -- archon value wins', () => {
     // User has ANTHROPIC_API_KEY in both places. CWD one is the target repo's,
     // archon one is the user's intentional config. Archon must win.
     const subprocessEnv = simulateEntryPointFlow(
@@ -173,9 +173,9 @@ describe('env isolation integration', () => {
     expect(subprocessEnv.NODE_OPTIONS).toBeUndefined();
   });
 
-  it('scenario 5: DATABASE_URL in CWD .env does not reach Archon — archon uses its own DB', () => {
+  it('scenario 5: DATABASE_URL in CWD .env does not reach Archon -- archon uses its own DB', () => {
     // Target repo has DATABASE_URL for its own PostgreSQL. Archon must NOT
-    // connect to the target app's database — it should use its own DB
+    // connect to the target app's database -- it should use its own DB
     // (from ~/.archon/.env or default SQLite).
     const subprocessEnv = simulateEntryPointFlow(
       'DATABASE_URL=postgresql://target-app:5432/wrong_db\nREDIS_URL=redis://target:6379\n',
@@ -188,7 +188,7 @@ describe('env isolation integration', () => {
     expect(subprocessEnv.REDIS_URL).toBeUndefined();
   });
 
-  it('scenario 6: DATABASE_URL in CWD .env only (no archon env) — stripped entirely', () => {
+  it('scenario 6: DATABASE_URL in CWD .env only (no archon env) -- stripped entirely', () => {
     // User relies on default SQLite (no DATABASE_URL in ~/.archon/.env).
     // Target repo's DATABASE_URL must not leak.
     const subprocessEnv = simulateEntryPointFlow(
@@ -215,7 +215,7 @@ describe('env isolation integration', () => {
     expect(subprocessEnv.CLAUDE_CODE_OAUTH_TOKEN).toBe('sk-ant-oat01-keep-this');
   });
 
-  // ── Multiple .env file variants ────────────────────────────────────────
+  // -- Multiple .env file variants ----------------------------------------
 
   /** Simulate Bun auto-loading a specific .env file into process.env. */
   function simulateBunAutoLoad(filePath: string): void {
@@ -228,7 +228,7 @@ describe('env isolation integration', () => {
   }
 
   it('strips keys from .env.local in addition to .env', () => {
-    // Bun auto-loads .env.local too — keys from there must also be stripped
+    // Bun auto-loads .env.local too -- keys from there must also be stripped
     writeFileSync(join(cwdDir, '.env.local'), 'OPENAI_API_KEY=sk-local-leaked\n');
     simulateBunAutoLoad(join(cwdDir, '.env.local'));
 
@@ -251,10 +251,10 @@ describe('env isolation integration', () => {
     expect(subprocessEnv.ELEVENLABS_API_KEY).toBeUndefined();
   });
 
-  // ── Shell-inherited env preservation ───────────────────────────────────
+  // -- Shell-inherited env preservation -----------------------------------
 
   it('preserves shell-inherited env that is not in CWD .env', () => {
-    // User has SSH_AUTH_SOCK and HTTP_PROXY in their shell — these must survive
+    // User has SSH_AUTH_SOCK and HTTP_PROXY in their shell -- these must survive
     // because they are not from the target repo's .env
     process.env.SSH_AUTH_SOCK = '/tmp/ssh-agent.sock';
     process.env.HTTP_PROXY = 'http://proxy.corp:8080';
@@ -270,7 +270,7 @@ describe('env isolation integration', () => {
 
   it('strips shell-inherited env if same key also appears in CWD .env', () => {
     // If SSH_AUTH_SOCK is in both shell AND CWD .env, the CWD value is what
-    // Bun auto-loaded — stripping removes it. This is correct behavior:
+    // Bun auto-loaded -- stripping removes it. This is correct behavior:
     // the CWD .env overwrote the shell value during auto-load.
     process.env.SSH_AUTH_SOCK = '/tmp/ssh-agent.sock';
 
@@ -280,10 +280,10 @@ describe('env isolation integration', () => {
     expect(subprocessEnv.SSH_AUTH_SOCK).toBeUndefined();
   });
 
-  // ── Bedrock/Vertex auth preservation ───────────────────────────────────
+  // -- Bedrock/Vertex auth preservation -----------------------------------
 
   it('preserves CLAUDE_CODE_USE_BEDROCK and CLAUDE_CODE_USE_VERTEX', () => {
-    // These are CLAUDE_CODE_* vars but are auth-related — must survive marker strip
+    // These are CLAUDE_CODE_* vars but are auth-related -- must survive marker strip
     process.env.CLAUDECODE = '1';
     process.env.CLAUDE_CODE_ENTRYPOINT = 'cli';
 
@@ -301,7 +301,7 @@ describe('env isolation integration', () => {
     expect(subprocessEnv.CLAUDE_CODE_OAUTH_TOKEN).toBe('sk-token');
   });
 
-  // ── Managed execution env (simulated) ──────────────────────────────────
+  // -- Managed execution env (simulated) ----------------------------------
 
   it('managed execution env merges on top of clean process.env', () => {
     // After the entry point flow, the workflow executor merges managed env

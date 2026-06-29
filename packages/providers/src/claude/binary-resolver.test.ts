@@ -94,7 +94,7 @@ describe('resolveClaudeBinaryPath (binary mode)', () => {
 
     const result = await resolver.resolveClaudeBinaryPath();
     expect(result).toBe(expected);
-    // Log must mark this as autodetect, not 'env' or 'config' — the source
+    // Log must mark this as autodetect, not 'env' or 'config' -- the source
     // string is load-bearing for debug triage.
     expect(mockLogger.info).toHaveBeenCalledWith(
       { binaryPath: expected, source: 'autodetect' },
@@ -126,7 +126,7 @@ describe('resolveClaudeBinaryPath (binary mode)', () => {
   });
 
   test('throws with install instructions when nothing is configured and autodetect misses', async () => {
-    // Every probe returns false — env unset, config unset, native path absent.
+    // Every probe returns false -- env unset, config unset, native path absent.
     fileExistsSpy = spyOn(resolver, 'fileExists').mockReturnValue(false);
 
     const promise = resolver.resolveClaudeBinaryPath();

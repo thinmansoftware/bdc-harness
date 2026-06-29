@@ -1,12 +1,12 @@
 /**
- * @archon/overseer — Cauldron workflow-failure decision layer.
+ * @archon/overseer -- Cauldron workflow-failure decision layer.
  *
  * Minimal v1 (2026-05-16):
  *   - classifyError: maps a workflow failure to a known error class
  *   - decide: given an error class + attempt, returns a decision
  *
  * v2+ (deferred to Cauldron 2.0 era):
- *   - LLM proxy with provider failover (OpenAI ↔ Anthropic)
+ *   - LLM proxy with provider failover (OpenAI  Anthropic)
  *   - Grader integration for output scoring
  *   - bdc_harness_events Supabase logging
  *   - Mission Control "Workflow Decisions" tab

@@ -1,6 +1,6 @@
 /**
  * Standardized error for unknown provider types.
- * Thrown by getAgentProvider() — all surfaces (CLI, server, orchestrator, workflows)
+ * Thrown by getAgentProvider() -- all surfaces (CLI, server, orchestrator, workflows)
  * get the same error shape and message format.
  */
 export class UnknownProviderError extends Error {

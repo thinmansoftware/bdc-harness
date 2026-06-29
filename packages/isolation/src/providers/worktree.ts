@@ -60,11 +60,11 @@ const GIT_OPERATION_TIMEOUT_MS = 5 * 60 * 1000;
  * it as a safe relative path for `getWorktreeBase()`, or `undefined` to fall
  * through to default path resolution.
  *
- * Rules (Fail Fast — malformed values throw; empty/whitespace values are ignored):
- * - `undefined` / empty-after-trim → `undefined` (no override; default resolution applies)
- * - Absolute path                  → throw (users must configure globally, not per-repo)
- * - Contains `..` segment          → throw (escapes repo root)
- * - Resolved path escapes repoRoot → throw (covers symlink / nested `../` edge cases)
+ * Rules (Fail Fast -- malformed values throw; empty/whitespace values are ignored):
+ * - `undefined` / empty-after-trim -> `undefined` (no override; default resolution applies)
+ * - Absolute path                  -> throw (users must configure globally, not per-repo)
+ * - Contains `..` segment          -> throw (escapes repo root)
+ * - Resolved path escapes repoRoot -> throw (covers symlink / nested `../` edge cases)
  *
  * The path is returned trimmed. The caller composes it via `join(repoRoot, result)`.
  */
@@ -98,14 +98,14 @@ function resolveRepoLocalOverride(
     );
   }
 
-  // Double-check via resolved absolute paths — catches edge cases like a path that
+  // Double-check via resolved absolute paths -- catches edge cases like a path that
   // normalizes clean but still escapes when joined (e.g. leading `./../` on some platforms).
   // Uses `path.sep` so the "is inside repoRoot" check works on Windows (\\) as well as POSIX (/).
   const resolved = resolve(repoRoot, normalized);
   const repoRootResolved = resolve(repoRoot);
   if (resolved !== repoRootResolved && !resolved.startsWith(repoRootResolved + sep)) {
     throw new Error(
-      `.archon/config.yaml worktree.path resolves outside the repo root (got: ${trimmed} → ${resolved}).`
+      `.archon/config.yaml worktree.path resolves outside the repo root (got: ${trimmed} -> ${resolved}).`
     );
   }
 
@@ -122,7 +122,7 @@ export class WorktreeProvider implements IIsolationProvider {
    *
    * Config is loaded exactly once here and threaded through the rest of the
    * `create()` call. A malformed `.archon/config.yaml` fails loudly at this
-   * boundary rather than being swallowed — see CLAUDE.md "Fail Fast + Explicit
+   * boundary rather than being swallowed -- see CLAUDE.md "Fail Fast + Explicit
    * Errors". Downstream helpers assume they receive either a valid config
    * object or `null`, never a second chance to reload.
    */
@@ -140,7 +140,7 @@ export class WorktreeProvider implements IIsolationProvider {
     const worktreePath = this.getWorktreePath(request, branchName, repoConfig);
     // envId is, by contract, the worktree filesystem path (see `destroy()` docstring).
     // Assign directly from the resolved path to keep the invariant in sync with
-    // the actual directory created below — computing it via a separate helper would
+    // the actual directory created below -- computing it via a separate helper would
     // risk divergence if resolution rules change.
     const envId = worktreePath;
 
@@ -150,7 +150,7 @@ export class WorktreeProvider implements IIsolationProvider {
       return existing;
     }
 
-    // Create new worktree (re-uses the already-loaded repoConfig — no double load).
+    // Create new worktree (re-uses the already-loaded repoConfig -- no double load).
     const { warnings } = await this.createWorktree(request, worktreePath, branchName, repoConfig);
 
     return {
@@ -263,12 +263,12 @@ export class WorktreeProvider implements IIsolationProvider {
       }
     }
 
-    // Prune stale worktree references — runs even when path is already gone,
+    // Prune stale worktree references -- runs even when path is already gone,
     // because git may still have a stale ref for a manually-deleted worktree
     try {
       await execFileAsync('git', ['-C', repoPath, 'worktree', 'prune'], { timeout: 15000 });
     } catch (_error) {
-      // Best-effort — pruning failure is not critical
+      // Best-effort -- pruning failure is not critical
       getLog().debug({ repoPath }, 'worktree_prune_failed');
     }
 
@@ -499,7 +499,7 @@ export class WorktreeProvider implements IIsolationProvider {
       worktrees = await listWorktrees(repoPath);
     } catch (error) {
       const err = error as Error;
-      // "not a git repository" is an expected case — return null
+      // "not a git repository" is an expected case -- return null
       if (err.message.toLowerCase().includes('not a git repository')) {
         getLog().debug({ path }, 'worktree_adopt_not_git_repo');
         return null;
@@ -576,11 +576,11 @@ export class WorktreeProvider implements IIsolationProvider {
    * Get worktree path for a request, honoring the per-repo override if set.
    *
    * Layouts (see `getWorktreeBase()` in `@archon/git` for resolution):
-   *   - `repo-local`       → `<repoRoot>/<config.path>/{branch}`              (opt-in)
-   *   - `workspace-scoped` → `~/.archon/workspaces/{owner}/{repo}/worktrees/{branch}`  (default)
+   *   - `repo-local`       -> `<repoRoot>/<config.path>/{branch}`              (opt-in)
+   *   - `workspace-scoped` -> `~/.archon/workspaces/{owner}/{repo}/worktrees/{branch}`  (default)
    *
    * In both layouts the resolved base already carries full repo context, so the
-   * caller simply appends the branch name — no owner/repo namespacing here.
+   * caller simply appends the branch name -- no owner/repo namespacing here.
    *
    * The per-repo `config.path` is validated via `resolveRepoLocalOverride()`;
    * unsafe values (absolute, `..` segments, escape-from-repoRoot) throw rather
@@ -611,7 +611,7 @@ export class WorktreeProvider implements IIsolationProvider {
       // Verify the existing worktree belongs to the same repo root before
       // adopting. Two clones of the same remote resolve to the same worktree
       // base dir, so a worktree created from clone A is visible from clone B.
-      // Throws on cross-checkout or unverifiable state — surfacing the problem
+      // Throws on cross-checkout or unverifiable state -- surfacing the problem
       // is safer than falling through to createNewBranch (which would report
       // a confusing "branch already exists" cascade) or silently adopting.
       try {
@@ -641,7 +641,7 @@ export class WorktreeProvider implements IIsolationProvider {
         request.prBranch
       );
       if (existingByBranch) {
-        // Same cross-clone guard as the primary adoption path above — a
+        // Same cross-clone guard as the primary adoption path above -- a
         // worktree matching the PR branch might still belong to a different
         // clone of the same remote.
         try {
@@ -693,7 +693,7 @@ export class WorktreeProvider implements IIsolationProvider {
    * Returns warnings that should be surfaced to the user (non-fatal issues).
    *
    * `repoConfig` is the already-loaded config from `create()`. Receiving it here
-   * keeps the work of each public entrypoint tied to exactly one config load —
+   * keeps the work of each public entrypoint tied to exactly one config load --
    * see the "Fail Fast" comment on `create()`.
    */
   private async createWorktree(
@@ -712,7 +712,7 @@ export class WorktreeProvider implements IIsolationProvider {
       repoLocal: resolveRepoLocalOverride(worktreeConfig?.path, repoPath),
     };
     const { base: worktreeBase } = getWorktreeBase(repoPath, request.codebaseName, override);
-    // In both layouts the base already carries repo context — creating it
+    // In both layouts the base already carries repo context -- creating it
     // recursively is enough.
     await mkdirAsync(worktreeBase, { recursive: true });
 
@@ -742,7 +742,7 @@ export class WorktreeProvider implements IIsolationProvider {
     const warnings: string[] = [];
     if (configLoadFailed) {
       warnings.push(
-        'Config file could not be loaded — copyFiles configuration was not applied. Check your .archon/config.yaml for syntax errors.'
+        'Config file could not be loaded -- copyFiles configuration was not applied. Check your .archon/config.yaml for syntax errors.'
       );
     }
     return { warnings };
@@ -757,14 +757,14 @@ export class WorktreeProvider implements IIsolationProvider {
    *   error if the branch doesn't exist - no silent fallback to default.
    * - If configuredBaseBranch is omitted: Auto-detects the default branch via git.
    *
-   * All sync failures are fatal — creating a worktree from an unknown
+   * All sync failures are fatal -- creating a worktree from an unknown
    * start-point risks branching from the wrong commit.
    *
    * Error classification (for user-facing messages):
-   * - Permission denied → file permission hint
-   * - Not a git repository → workspace integrity hint
-   * - Configured base branch missing → config fix hint
-   * - Network errors, timeouts → connectivity hint
+   * - Permission denied -> file permission hint
+   * - Not a git repository -> workspace integrity hint
+   * - Configured base branch missing -> config fix hint
+   * - Network errors, timeouts -> connectivity hint
    */
   private async syncWorkspaceBeforeCreate(
     repoPath: RepoPath,
@@ -806,7 +806,7 @@ export class WorktreeProvider implements IIsolationProvider {
         // Configured branch errors are fatal - user needs to fix their config
         throw err;
       } else {
-        // Network errors, timeouts — cannot guarantee correct start-point
+        // Network errors, timeouts -- cannot guarantee correct start-point
         throw new Error(
           `Failed to fetch base branch from origin: ${err.message}. ` +
             'Check your network connection and try again.'
@@ -818,7 +818,7 @@ export class WorktreeProvider implements IIsolationProvider {
   /**
    * Copy git-ignored files to worktree based on repo config.
    * Returns `configLoadFailed: true` when no config was provided and the
-   * internal fallback load of the config fails — so the caller can surface
+   * internal fallback load of the config fails -- so the caller can surface
    * a warning without blocking worktree creation.
    */
   private async copyConfiguredFiles(
@@ -847,7 +847,7 @@ export class WorktreeProvider implements IIsolationProvider {
           'repo_config_load_failed'
         );
         configLoadFailed = true;
-        // Continue with default files only — worktree is still usable
+        // Continue with default files only -- worktree is still usable
       }
     }
 
@@ -1079,7 +1079,7 @@ export class WorktreeProvider implements IIsolationProvider {
           );
         }
 
-        // Branch exists but no explicit start-point override — reset it to the
+        // Branch exists but no explicit start-point override -- reset it to the
         // intended start-point before checking out, so we don't inherit stale
         // commits from a previous run or external tool.
         getLog().warn(
@@ -1101,8 +1101,8 @@ export class WorktreeProvider implements IIsolationProvider {
   /**
    * Initialize git submodules in a worktree when the repo uses them.
    *
-   * ENOENT on `.gitmodules` → skip (zero-cost for non-submodule repos).
-   * Any other error (EACCES, EIO, git failure, timeout) → throw. Silent
+   * ENOENT on `.gitmodules` -> skip (zero-cost for non-submodule repos).
+   * Any other error (EACCES, EIO, git failure, timeout) -> throw. Silent
    * success on a half-initialized worktree is the exact class of bug this
    * function exists to prevent; an unreadable `.gitmodules` is materially
    * the same as a failed git op. The thrown error is classified by
@@ -1202,7 +1202,7 @@ export class WorktreeProvider implements IIsolationProvider {
         { repoPath, worktreePath, error: err.message, errorType: err.constructor.name, err },
         'isolation.orphan_cleanup_failed'
       );
-      // Don't throw — the original creation error is more important
+      // Don't throw -- the original creation error is more important
     }
   }
 

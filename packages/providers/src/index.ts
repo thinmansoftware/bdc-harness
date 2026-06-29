@@ -1,4 +1,4 @@
-// Types (contract layer — re-exported for convenience)
+// Types (contract layer -- re-exported for convenience)
 export type {
   IAgentProvider,
   AgentRequestOptions,
@@ -14,7 +14,7 @@ export type {
 } from './types';
 
 // Provider config types (canonical definitions in ./types, re-exported via config modules)
-// Import from ./types directly or from the config modules — both work.
+// Import from ./types directly or from the config modules -- both work.
 
 // Registry
 export {

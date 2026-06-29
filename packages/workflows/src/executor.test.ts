@@ -1,5 +1,5 @@
 /**
- * Tests for executeWorkflow() — the top-level orchestration function.
+ * Tests for executeWorkflow() -- the top-level orchestration function.
  * Covers concurrent-run guards, model/provider resolution, and resume logic
  * that the inner dag-executor.test.ts cannot reach.
  */
@@ -198,7 +198,7 @@ describe('executeWorkflow', () => {
       const activeRun = makeRun({
         id: 'other-run-456',
         status: 'running',
-        started_at: new Date().toISOString(), // Recent — not stale
+        started_at: new Date().toISOString(), // Recent -- not stale
       });
       const store = makeStore({
         getActiveWorkflowRunByPath: mock(async () => activeRun),
@@ -303,7 +303,7 @@ describe('executeWorkflow', () => {
       expect(sentMessage).toContain('archon-implement');
       expect(sentMessage).toContain('abc12345');
       expect(sentMessage).toContain('2m 5s');
-      // Concrete next actions — every line tells the user something to do.
+      // Concrete next actions -- every line tells the user something to do.
       expect(sentMessage).toContain('/workflow status');
       expect(sentMessage).toContain('/workflow cancel abc12345');
       expect(sentMessage).toContain('--branch');
@@ -350,7 +350,7 @@ describe('executeWorkflow', () => {
       const selfRun = makeRun({ id: 'self-run', status: 'pending' });
       const otherRun = makeRun({ id: 'other-run', status: 'running' });
       const updateSpy = mock(async (id: string) => {
-        // Self-cancel attempt fails — must not crash, must still surface
+        // Self-cancel attempt fails -- must not crash, must still surface
         // the "in use" failure to the user.
         if (id === 'self-run') throw new Error('Update failed');
       });
@@ -452,7 +452,7 @@ describe('executeWorkflow', () => {
         preCreated
       );
 
-      // Resume must still complete — the 5-min stale-pending window is the
+      // Resume must still complete -- the 5-min stale-pending window is the
       // safety net for cleanup failures here.
       expect(result.workflowRunId).toBe('failed-prior-run');
     });
@@ -475,7 +475,7 @@ describe('executeWorkflow', () => {
         'test message',
         'db-conv-1'
       );
-      // Should succeed — uses config.assistant (claude) as default
+      // Should succeed -- uses config.assistant (claude) as default
       expect(mockExecuteDagWorkflow).toHaveBeenCalledTimes(1);
     });
 
@@ -500,7 +500,7 @@ describe('executeWorkflow', () => {
       // Provider is explicit; the model string is forwarded verbatim to
       // whichever SDK the resolved provider names. A workflow that sets
       // provider:codex with a Claude-looking model gets the request handed
-      // to the codex SDK as-is — the SDK decides whether to accept it.
+      // to the codex SDK as-is -- the SDK decides whether to accept it.
       const store = makeStore();
       const deps = makeDeps(store);
       await executeWorkflow(
@@ -840,12 +840,12 @@ describe('executeWorkflow', () => {
     });
 
     // -----------------------------------------------------------------------
-    // Bundled fallback (Approach B — central resolver)
+    // Bundled fallback (Approach B -- central resolver)
     // WO-HARNESS-POLICYFILE-NOT-ENFORCED-01
     // -----------------------------------------------------------------------
 
     it('falls back to BUNDLED_POLICIES when the local file is absent', async () => {
-      // No policy file written to cwd — must resolve via the bundled canonical
+      // No policy file written to cwd -- must resolve via the bundled canonical
       // copy embedded at bundle time from harness/policies/.
       const cwd = await mkdtemp(join(tmpdir(), 'archon-policy-'));
       try {
@@ -893,7 +893,7 @@ describe('executeWorkflow', () => {
         await mkdir(subdir, { recursive: true });
         await writeFile(
           join(subdir, 'agent-behavior.md'),
-          'LOCAL OVERRIDE — does not contain sentinels'
+          'LOCAL OVERRIDE -- does not contain sentinels'
         );
         const deps = makeDeps();
 
@@ -913,7 +913,7 @@ describe('executeWorkflow', () => {
         expect(result.success).toBe(true);
         const executedWorkflow = getExecutedWorkflow();
         expect(executedWorkflow.nodes[0].systemPrompt).toBe(
-          'LOCAL OVERRIDE — does not contain sentinels'
+          'LOCAL OVERRIDE -- does not contain sentinels'
         );
         // Bundled sentinels should NOT appear since local took precedence
         expect(executedWorkflow.nodes[0].systemPrompt).not.toContain('Think before building');
@@ -924,7 +924,7 @@ describe('executeWorkflow', () => {
 
     it('fails loud when neither local nor bundled policy resolves', async () => {
       // Declared policyFile path does not exist locally AND is not in
-      // BUNDLED_POLICIES — must throw with both sources named.
+      // BUNDLED_POLICIES -- must throw with both sources named.
       const cwd = await mkdtemp(join(tmpdir(), 'archon-policy-'));
       try {
         const deps = makeDeps();
@@ -951,7 +951,7 @@ describe('executeWorkflow', () => {
 
     it('injects policy exactly once per prompt node (idempotent)', async () => {
       // Each prompt node receives the policy as systemPrompt prefix exactly
-      // once — no duplication within a node when the policy text contains
+      // once -- no duplication within a node when the policy text contains
       // unique markers.
       const cwd = await mkdtemp(join(tmpdir(), 'archon-policy-'));
       try {
@@ -977,7 +977,7 @@ describe('executeWorkflow', () => {
         expect(result.success).toBe(true);
         const executedWorkflow = getExecutedWorkflow();
         // The phrase "Think before building" appears once in the canonical
-        // policy text. Count occurrences per node — must be exactly 1.
+        // policy text. Count occurrences per node -- must be exactly 1.
         for (const node of executedWorkflow.nodes) {
           const sentinelCount = (node.systemPrompt?.match(/Think before building/g) ?? []).length;
           expect(sentinelCount).toBe(1);
@@ -1009,7 +1009,7 @@ describe('executeWorkflow', () => {
       const digest = createHash('sha256').update(bundledContent, 'utf-8').digest('hex');
       expect(digest).toMatch(/^[a-f0-9]{64}$/);
 
-      // Sentinels — these are the Locked Principles 1 and 3 from v1.1.
+      // Sentinels -- these are the Locked Principles 1 and 3 from v1.1.
       expect(bundledContent).toContain('Think before building');
       expect(bundledContent).toContain('Surgical changes only');
     });
@@ -1182,7 +1182,7 @@ describe('executeWorkflow', () => {
   // Status-aware blocking message (review #3)
   //
   // The lock query returns running, paused, AND fresh-pending rows.
-  // Telling a user to "wait" when the holder is `paused` is misleading —
+  // Telling a user to "wait" when the holder is `paused` is misleading --
   // they need to approve/reject to unblock it.
   // -------------------------------------------------------------------------
 

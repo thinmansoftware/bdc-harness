@@ -246,7 +246,7 @@ describe('archon-paths', () => {
       expect(getHomeWorkflowsPath()).toBe(join('/custom/archon', 'workflows'));
     });
 
-    test('no double `.archon/` nesting — must sit next to workspaces/ and worktrees/', () => {
+    test('no double `.archon/` nesting -- must sit next to workspaces/ and worktrees/', () => {
       // Regression guard: the old location was ~/.archon/.archon/workflows/.
       // New location must NOT reintroduce the double-nested path.
       delete process.env.ARCHON_HOME;
@@ -574,7 +574,7 @@ describe('validateAppDefaultsPaths', () => {
     const originalEnv = process.env.ARCHON_DOCKER;
     process.env.ARCHON_DOCKER = 'true';
     try {
-      // In Docker mode, paths won't exist — should still not throw
+      // In Docker mode, paths won't exist -- should still not throw
       await expect(validateAppDefaultsPaths()).resolves.toBeUndefined();
     } finally {
       if (originalEnv === undefined) {

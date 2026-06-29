@@ -73,10 +73,10 @@ export async function getRemoteUrl(repoPath: RepoPath): Promise<string | null> {
  *
  * When `resetAfterFetch` is true (default), the working tree is hard-reset to match
  * the remote. This is safe for Archon-managed clones in `~/.archon/workspaces/` but
- * **destructive for user's local working directories** — callers must check the path
+ * **destructive for user's local working directories** -- callers must check the path
  * before enabling reset.
  *
- * When `resetAfterFetch` is false, only `git fetch` runs — the local working tree is
+ * When `resetAfterFetch` is false, only `git fetch` runs -- the local working tree is
  * untouched. This is safe for locally-registered repos where the user may have
  * uncommitted changes.
  *
@@ -137,10 +137,10 @@ export async function syncWorkspace(
     );
     previousHead = stdout.trim();
   } catch {
-    // Non-fatal — fresh clone or detached HEAD edge case
+    // Non-fatal -- fresh clone or detached HEAD edge case
   }
 
-  // Hard-reset local working tree to match origin — only safe for Archon-managed
+  // Hard-reset local working tree to match origin -- only safe for Archon-managed
   // clones, never for a user's local working directory.
   try {
     await execFileAsync('git', ['-C', workspacePath, 'reset', '--hard', `origin/${branchToSync}`], {

@@ -117,5 +117,5 @@ export type {
   WorkflowWithSource,
 } from './workflow';
 
-// DagWorkflow — alias kept for backward compatibility
+// DagWorkflow -- alias kept for backward compatibility
 export type { WorkflowDefinition as DagWorkflow } from './workflow';

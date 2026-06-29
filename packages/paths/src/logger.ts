@@ -53,7 +53,7 @@ function getInitialLevel(): string {
  * `require.resolve('pino-pretty')` lookup that crashes inside Bun's `/$bunfs/`
  * virtual filesystem in compiled binaries (see GitHub issue #960 / #979).
  *
- * The same code path runs in dev and compiled binaries — no environment
+ * The same code path runs in dev and compiled binaries -- no environment
  * detection required.
  */
 function buildLogger(): Logger {

@@ -30,7 +30,7 @@ interface AssistantBuffer {
 
 export class MessagePersistence {
   private assistantBuffer = new Map<string, AssistantBuffer>();
-  private dbIdMap = new Map<string, string>(); // platform_conversation_id → DB UUID
+  private dbIdMap = new Map<string, string>(); // platform_conversation_id -> DB UUID
 
   constructor(private emitEvent: (conversationId: string, event: string) => Promise<void>) {}
 
@@ -63,7 +63,7 @@ export class MessagePersistence {
     // Start a new segment when:
     // 1. No segments yet
     // 2. Previous segment has tool calls (text after tool = new message in live view)
-    // 3. This is a workflow status message (🚀/✅ should be its own bubble)
+    // 3. This is a workflow status message (/[x] should be its own bubble)
     // 4. Previous segment was a workflow status (next text should be separate)
     const needsNewSegment =
       !lastSeg ||
@@ -87,7 +87,7 @@ export class MessagePersistence {
     }
     this.assistantBuffer.set(conversationId, buf);
 
-    // Prevent unbounded buffer growth — force flush if too many segments
+    // Prevent unbounded buffer growth -- force flush if too many segments
     if (buf.segments.length > 50) {
       getLog().warn({ conversationId, segments: buf.segments.length }, 'assistant_buffer_overflow');
       this.flush(conversationId).catch((e: unknown) => {
@@ -211,7 +211,7 @@ export class MessagePersistence {
     }
 
     if (ready.length === 0) {
-      // All segments have in-flight tools — nothing to flush yet
+      // All segments have in-flight tools -- nothing to flush yet
       return;
     }
 
@@ -225,7 +225,7 @@ export class MessagePersistence {
     const dbId = this.dbIdMap.get(conversationId);
     if (!dbId) {
       getLog().warn({ conversationId, segmentCount: ready.length }, 'assistant_persist_no_db_id');
-      // Restore buffer — dbId may arrive later (e.g., race with conversation creation).
+      // Restore buffer -- dbId may arrive later (e.g., race with conversation creation).
       // Merge ready segments back with any that arrived since we split.
       const existing = this.assistantBuffer.get(conversationId);
       if (existing) {
@@ -285,7 +285,7 @@ export class MessagePersistence {
     if (!buf || buf.segments.length === 0) return;
     const lastSeg = buf.segments[buf.segments.length - 1];
     if (lastSeg.toolCalls.length > 0) {
-      // Preserve tool call records — only clear the text content
+      // Preserve tool call records -- only clear the text content
       lastSeg.content = '';
     } else {
       buf.segments.pop();

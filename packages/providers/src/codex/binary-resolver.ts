@@ -20,7 +20,7 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { BUNDLED_IS_BINARY, getArchonHome, createLogger } from '@archon/paths';
 
-/** Wrapper for existsSync — enables spyOn in tests (direct imports can't be spied on). */
+/** Wrapper for existsSync -- enables spyOn in tests (direct imports can't be spied on). */
 export function fileExists(path: string): boolean {
   return _existsSync(path);
 }
@@ -91,10 +91,10 @@ export async function resolveCodexBinaryPath(
     }
   }
 
-  // 4. Autodetect — probe the handful of paths Codex typically lands at
+  // 4. Autodetect -- probe the handful of paths Codex typically lands at
   // when installed via the documented package managers. Users who install
   // somewhere else (custom npm prefix, etc.) still set one of the higher-
-  // priority sources above. Order: most specific → least specific.
+  // priority sources above. Order: most specific -> least specific.
   const autodetectPaths = getAutodetectPaths();
   for (const probePath of autodetectPaths) {
     if (fileExists(probePath)) {
@@ -103,7 +103,7 @@ export async function resolveCodexBinaryPath(
     }
   }
 
-  // 5. Not found — throw with install instructions
+  // 5. Not found -- throw with install instructions
   const vendorPath = `~/.archon/${CODEX_VENDOR_DIR}/`;
   throw new Error(
     'Codex CLI binary not found. The Codex provider requires a native binary\n' +
@@ -127,20 +127,20 @@ export async function resolveCodexBinaryPath(
  * `{npm_prefix}\<name>.cmd` on Windows). The probes cover the npm prefix
  * a default install lands at on each platform:
  *
- *  - `$HOME/.npm-global/bin/codex` — common when the user ran
+ *  - `$HOME/.npm-global/bin/codex` -- common when the user ran
  *    `npm config set prefix ~/.npm-global` to avoid root writes
- *  - `/opt/homebrew/bin/codex` — mac Apple Silicon with homebrew-node
+ *  - `/opt/homebrew/bin/codex` -- mac Apple Silicon with homebrew-node
  *    (homebrew sets npm prefix to /opt/homebrew)
- *  - `/usr/local/bin/codex` — mac Intel with homebrew-node, or linux
+ *  - `/usr/local/bin/codex` -- mac Intel with homebrew-node, or linux
  *    with system-installed node (npm prefix defaults to /usr/local)
- *  - `%AppData%\npm\codex.cmd` — Windows npm global default
+ *  - `%AppData%\npm\codex.cmd` -- Windows npm global default
  *
  * Not covered (explicit override required via CODEX_BIN_PATH or config):
- *   - users with other custom npm prefixes — `npm root -g` would spawn
+ *   - users with other custom npm prefixes -- `npm root -g` would spawn
  *     a subprocess per resolve, too heavy for a probe helper
- *   - Homebrew cask install (`brew install --cask codex`) — cask layout
+ *   - Homebrew cask install (`brew install --cask codex`) -- cask layout
  *     isn't a PATH binary; users should symlink or set the path
- *   - manual GitHub Releases extract — placement is user-determined
+ *   - manual GitHub Releases extract -- placement is user-determined
  */
 function getAutodetectPaths(): string[] {
   const paths: string[] = [];

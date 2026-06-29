@@ -167,7 +167,7 @@ describe('WorkflowEventEmitter', () => {
 
       unsubscribe();
       emitter.emit(makeWorkflowCompletedEvent());
-      // Still only 1 call — the second event was not delivered
+      // Still only 1 call -- the second event was not delivered
       expect(listener).toHaveBeenCalledTimes(1);
     });
 
@@ -359,7 +359,7 @@ describe('WorkflowEventEmitter', () => {
       expect(() => emitter.emit(makeNodeStartedEvent())).not.toThrow();
 
       expect(good).toHaveBeenCalledTimes(1);
-      // Two throws → two error log calls
+      // Two throws -> two error log calls
       expect(mockLogFn).toHaveBeenCalledTimes(2);
     });
   });
@@ -492,7 +492,7 @@ describe('WorkflowEventEmitter', () => {
 
       unsubscribe();
       emitter.emit(makeWorkflowCompletedEvent('run-1'));
-      // Unsubscribed — no more calls
+      // Unsubscribed -- no more calls
       expect(listener).toHaveBeenCalledTimes(1);
     });
 

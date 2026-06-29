@@ -1,5 +1,5 @@
 /**
- * Workflow and command validation — Level 3 (resource resolution).
+ * Workflow and command validation -- Level 3 (resource resolution).
  *
  * Levels 1-2 (syntax + structure) are handled by parseWorkflow() in loader.ts.
  * This module adds Level 3: checking that referenced resources actually exist
@@ -144,7 +144,7 @@ export async function discoverAvailableCommands(
   const names = new Set<string>();
 
   // Each scope is walked 1 subfolder deep (matches the workflows/scripts
-  // discovery convention — supports `defaults/` grouping, rejects deeper nesting).
+  // discovery convention -- supports `defaults/` grouping, rejects deeper nesting).
 
   // 1. Repo search paths
   const searchPaths = getCommandFolderSearchPaths(config?.commandFolder);
@@ -156,7 +156,7 @@ export async function discoverAvailableCommands(
     }
   }
 
-  // 2. Home-scoped commands (~/.archon/commands/) — personal helpers reusable across repos.
+  // 2. Home-scoped commands (~/.archon/commands/) -- personal helpers reusable across repos.
   // ENOENT already returns []; we only catch other errors (EACCES/EPERM/EIO) so a broken
   // home-scope doesn't take down repo/bundled discovery.
   const homePath = getHomeCommandsPath();
@@ -195,7 +195,7 @@ export async function discoverAvailableCommands(
  *
  * Within a single scope, if two files in different subfolders share a basename
  * (e.g. `triage/review.md` and `team/review.md`), the earlier match by the
- * deterministic walk order wins — duplicates within a scope are a user error.
+ * deterministic walk order wins -- duplicates within a scope are a user error.
  */
 async function resolveCommandInDir(rootDir: string, commandName: string): Promise<string | null> {
   const entries = await findMarkdownFilesRecursive(rootDir, '', { maxDepth: 1 });
@@ -208,16 +208,16 @@ async function resolveCommandInDir(rootDir: string, commandName: string): Promis
  * Returns the resolved path if found, null otherwise.
  *
  * Resolution precedence (first hit wins):
- *   1. Repo-local — `<cwd>/.archon/commands/` and configured folders
- *   2. Home-scoped — `~/.archon/commands/` (personal helpers, reusable across repos)
- *   3. Bundled defaults — embedded in the binary or the app's defaults folder
+ *   1. Repo-local -- `<cwd>/.archon/commands/` and configured folders
+ *   2. Home-scoped -- `~/.archon/commands/` (personal helpers, reusable across repos)
+ *   3. Bundled defaults -- embedded in the binary or the app's defaults folder
  */
 async function resolveCommand(
   commandName: string,
   cwd: string,
   config?: ValidationConfig
 ): Promise<string | null> {
-  // Each scope is walked 1 subfolder deep by basename — so `triage/review.md`
+  // Each scope is walked 1 subfolder deep by basename -- so `triage/review.md`
   // is resolvable as `review`. This matches the workflows/scripts discovery
   // convention and makes the listed commands in `discoverAvailableCommands`
   // actually resolvable.
@@ -261,8 +261,8 @@ async function resolveCommand(
 
 /** Installation hints per runtime */
 const RUNTIME_INSTALL_HINTS: Record<ScriptRuntime, string> = {
-  bun: 'Install bun: https://bun.sh — or run: curl -fsSL https://bun.sh/install | bash',
-  uv: 'Install uv: https://docs.astral.sh/uv/getting-started/installation/ — or run: curl -LsSf https://astral.sh/uv/install.sh | sh',
+  bun: 'Install bun: https://bun.sh -- or run: curl -fsSL https://bun.sh/install | bash',
+  uv: 'Install uv: https://docs.astral.sh/uv/getting-started/installation/ -- or run: curl -LsSf https://astral.sh/uv/install.sh | sh',
 };
 
 const runtimeCache = new Map<string, boolean>();
@@ -329,7 +329,7 @@ export async function validateWorkflowResources(
           level: 'error',
           nodeId: node.id,
           field: 'command',
-          message: `Invalid command name '${node.command}' — must not contain '/', '\\', '..', or start with '.'`,
+          message: `Invalid command name '${node.command}' -- must not contain '/', '\\', '..', or start with '.'`,
           hint: 'Use a simple name like "my-command" (without path separators or the .md extension)',
         });
         continue;
@@ -366,7 +366,7 @@ export async function validateWorkflowResources(
           hint: `Create the file at ${mcpPath} with MCP server definitions (JSON format). Example:\n  {"server-name": {"command": "npx", "args": ["-y", "@package/name"], "env": {}}}`,
         });
       } else {
-        // File exists — check it's valid JSON
+        // File exists -- check it's valid JSON
         try {
           const content = await readFile(mcpPath, 'utf-8');
           const parsed = JSON.parse(content);
@@ -399,7 +399,7 @@ export async function validateWorkflowResources(
             level: 'warning',
             nodeId: node.id,
             field: 'mcp',
-            message: `MCP servers are not supported by provider '${provider}' — this will be ignored`,
+            message: `MCP servers are not supported by provider '${provider}' -- this will be ignored`,
             hint: 'Remove the mcp field or switch to a provider that supports MCP',
           });
         }
@@ -421,7 +421,7 @@ export async function validateWorkflowResources(
             nodeId: node.id,
             field: 'skills',
             message: `Skill '${skillName}' not found in .claude/skills/ or ~/.claude/skills/`,
-            hint: `Install with: npx skills add <repo> — or create manually at .claude/skills/${skillName}/SKILL.md`,
+            hint: `Install with: npx skills add <repo> -- or create manually at .claude/skills/${skillName}/SKILL.md`,
           });
         }
       }
@@ -434,7 +434,7 @@ export async function validateWorkflowResources(
             level: 'warning',
             nodeId: node.id,
             field: 'skills',
-            message: `Skills are not supported by provider '${provider}' — this will be ignored`,
+            message: `Skills are not supported by provider '${provider}' -- this will be ignored`,
             hint: 'Remove the skills field or switch to a provider that supports skills',
           });
         }
@@ -450,7 +450,7 @@ export async function validateWorkflowResources(
           level: 'warning',
           nodeId: node.id,
           field: 'hooks',
-          message: `Hooks are not supported by provider '${provider}' — this will be ignored`,
+          message: `Hooks are not supported by provider '${provider}' -- this will be ignored`,
           hint: 'Remove the hooks field or switch to a provider that supports hooks',
         });
       }
@@ -460,7 +460,7 @@ export async function validateWorkflowResources(
           level: 'warning',
           nodeId: node.id,
           field: 'agents',
-          message: `Inline agents are not supported by provider '${provider}' — this will be ignored`,
+          message: `Inline agents are not supported by provider '${provider}' -- this will be ignored`,
           hint: 'Remove the agents field or switch to a provider that supports inline agents (e.g. claude)',
         });
       }
@@ -474,7 +474,7 @@ export async function validateWorkflowResources(
             level: 'warning',
             nodeId: node.id,
             field: 'allowed_tools/denied_tools',
-            message: `Tool restrictions are not supported by provider '${provider}' — this will be ignored`,
+            message: `Tool restrictions are not supported by provider '${provider}' -- this will be ignored`,
             hint: 'Remove tool restriction fields or switch to a provider that supports them',
           });
         }
@@ -482,7 +482,7 @@ export async function validateWorkflowResources(
     }
 
     // --- Agent persona: check .archon/agents/<name>.md exists and is valid ---
-    // `persona:` is the human-facing alias for `agent:` — both resolve identically.
+    // `persona:` is the human-facing alias for `agent:` -- both resolve identically.
     // If both are set, schema parse (dagNodeSchema) already enforced they agree.
     const nodeAgentRef = node as { agent?: string; persona?: string };
     const agentName = nodeAgentRef.agent ?? nodeAgentRef.persona;
@@ -586,7 +586,7 @@ export async function validateCommand(
     issues.push({
       level: 'error',
       field: 'name',
-      message: `Invalid command name '${commandName}' — must not contain '/', '\\', '..', or start with '.'`,
+      message: `Invalid command name '${commandName}' -- must not contain '/', '\\', '..', or start with '.'`,
       hint: 'Use a simple name like "my-command" (without path separators)',
     });
     return { commandName, valid: false, issues };

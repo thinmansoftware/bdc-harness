@@ -112,7 +112,7 @@ interface NodeFailedEvent {
  * pattern (push_failed, registry_write_failed, etc.) that is always treated
  * as a warning regardless of load_bearing.
  *
- * Mission Control renders this as a yellow checkmark — a third state between
+ * Mission Control renders this as a yellow checkmark -- a third state between
  * green `node_completed` and red `node_failed`.
  *
  * Anchor: 2026-05-16 engine sortie completed all-green while silently losing

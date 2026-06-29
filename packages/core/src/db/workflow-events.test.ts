@@ -95,7 +95,7 @@ describe('workflow-events', () => {
     test('does NOT throw when query fails (fire-and-forget)', async () => {
       mockQuery.mockRejectedValueOnce(new Error('connection refused'));
 
-      // Should NOT throw — fire-and-forget logs error internally
+      // Should NOT throw -- fire-and-forget logs error internally
       await createWorkflowEvent({
         workflow_run_id: 'run-456',
         event_type: 'step_started',
@@ -245,7 +245,7 @@ describe('workflow-events', () => {
   });
 
   describe('getCompletedDagNodeOutputs', () => {
-    test('returns map of nodeId → output from node_completed events', async () => {
+    test('returns map of nodeId -> output from node_completed events', async () => {
       mockQuery.mockResolvedValueOnce(
         createQueryResult([
           { step_name: 'node-a', data: { node_output: 'output A' } },

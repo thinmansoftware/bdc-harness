@@ -4,7 +4,7 @@
  *
  * Dev mode normally lets the SDK resolve the binary from its bundled
  * platform package. CLAUDE_BIN_PATH is honored as an escape hatch for
- * environments where SDK auto-resolution picks the wrong variant — most
+ * environments where SDK auto-resolution picks the wrong variant -- most
  * notably glibc Linux hosts, where the SDK prefers the musl binary first
  * and silently falls over with a misleading "not found" error.
  * Config-file path is intentionally NOT honored in dev mode (still binary-only).

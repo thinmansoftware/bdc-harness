@@ -1,5 +1,5 @@
 /**
- * Shared workflow business logic — approve, reject, status, resume, abandon.
+ * Shared workflow business logic -- approve, reject, status, resume, abandon.
  *
  * Both CLI and command-handler are thin formatting adapters over these functions.
  * Operations throw on errors; callers catch and format for their platform.
@@ -14,7 +14,7 @@ import type { WorkflowRun, ApprovalContext } from '@archon/workflows/schemas/wor
 import * as workflowDb from '../db/workflows';
 import * as workflowEventDb from '../db/workflow-events';
 
-// Lazy logger — NEVER at module scope
+// Lazy logger -- NEVER at module scope
 let cachedLog: ReturnType<typeof createLogger> | undefined;
 function getLog(): ReturnType<typeof createLogger> {
   if (!cachedLog) cachedLog = createLogger('operations');
@@ -34,7 +34,7 @@ export interface ApprovalOperationResult {
   workingPath: string | null;
   userMessage: string | null;
   codebaseId: string | null;
-  /** Internal DB UUID — resolve via getConversationById() to get platform_conversation_id. */
+  /** Internal DB UUID -- resolve via getConversationById() to get platform_conversation_id. */
   conversationId: string;
   type: 'interactive_loop' | 'approval_gate';
 }
@@ -44,7 +44,7 @@ export interface RejectionOperationResult {
   workingPath: string | null;
   userMessage: string | null;
   codebaseId: string | null;
-  /** Internal DB UUID — resolve via getConversationById() to get platform_conversation_id. */
+  /** Internal DB UUID -- resolve via getConversationById() to get platform_conversation_id. */
   conversationId: string;
   /** true = run cancelled; false = transitioning to failed for retry (has onRejectPrompt) */
   cancelled: boolean;
@@ -88,7 +88,7 @@ export async function getWorkflowStatus(): Promise<WorkflowStatusData> {
 
 /**
  * Validate that a run can be resumed and return it.
- * Does NOT execute the workflow — callers decide whether to run.
+ * Does NOT execute the workflow -- callers decide whether to run.
  */
 export async function resumeWorkflow(runId: string): Promise<WorkflowRun> {
   const run = await getRunOrThrow(runId, 'operations.workflow_resume_lookup_failed');
@@ -126,7 +126,7 @@ export async function abandonWorkflow(runId: string): Promise<WorkflowRun> {
  *
  * Handles both interactive_loop and standard approval gate paths.
  * Transitions run to 'failed' so findResumableRun picks it up on next invocation.
- * Does NOT auto-resume — callers decide whether to execute.
+ * Does NOT auto-resume -- callers decide whether to execute.
  */
 export async function approveWorkflow(
   runId: string,
@@ -149,7 +149,7 @@ export async function approveWorkflow(
   const approvalComment = comment ?? 'Approved';
 
   try {
-    // Interactive loop gate — store user input in metadata for the next iteration.
+    // Interactive loop gate -- store user input in metadata for the next iteration.
     // Note: node_completed is NOT written here. The executor writes it when the AI
     // emits the completion signal (meaning the user actually approved). Writing it
     // here would cause the resume to skip the loop node entirely.
@@ -161,7 +161,7 @@ export async function approveWorkflow(
         data: { decision: 'approved', comment: approvalComment, iteration: approval.iteration },
       });
       // Transition to 'failed' so findResumableRun picks it up.
-      // IMPORTANT: metadata is MERGED (not replaced) — the approval context must survive
+      // IMPORTANT: metadata is MERGED (not replaced) -- the approval context must survive
       // intact so the resumed executor can detect the correct startIteration.
       await workflowDb.updateWorkflowRun(runId, {
         status: 'failed',

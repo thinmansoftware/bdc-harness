@@ -58,7 +58,7 @@ const ERROR_PATTERNS: { pattern: string; message: string; known: boolean }[] = [
     known: true,
   },
   {
-    // Deliberately not `known` — this is a user-input / registration bug,
+    // Deliberately not `known` -- this is a user-input / registration bug,
     // not an infrastructure failure. Surface classification, but crash.
     pattern: 'cannot extract owner/repo',
     message:

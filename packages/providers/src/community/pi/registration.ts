@@ -6,7 +6,7 @@ import { PiProvider } from './provider';
 /**
  * Register the Pi community provider.
  *
- * Idempotent — safe to call multiple times, so process entrypoints (CLI,
+ * Idempotent -- safe to call multiple times, so process entrypoints (CLI,
  * server, config-loader) can each call it without coordination. Kept
  * separate from `registerBuiltinProviders()` because `builtIn: false` is
  * load-bearing: Pi validates the Phase 2 community-provider seam and must

@@ -26,7 +26,7 @@ describe('parseValidationResults', () => {
         '',
         '| Check | Result |',
         '|-------|--------|',
-        '| type-check | ✅ |',
+        '| type-check | [x] |',
       ].join('\n');
       expect(parseValidationResults(content)).toEqual([]);
     });
@@ -42,7 +42,7 @@ describe('parseValidationResults', () => {
         '',
         '| Name | Status |',
         '|------|--------|',
-        '| foo  | ✅     |',
+        '| foo  | [x]     |',
       ].join('\n');
       expect(parseValidationResults(content)).toEqual([]);
     });
@@ -54,22 +54,22 @@ describe('parseValidationResults', () => {
 
   describe('parses a valid markdown table', () => {
     test('single passing row', () => {
-      const content = makeContent(['| type-check | ✅ |']);
+      const content = makeContent(['| type-check | [x] |']);
       expect(parseValidationResults(content)).toEqual([{ check: 'type-check', result: 'pass' }]);
     });
 
     test('single failing row', () => {
-      const content = makeContent(['| lint | ❌ |']);
+      const content = makeContent(['| lint | [ ] |']);
       expect(parseValidationResults(content)).toEqual([{ check: 'lint', result: 'fail' }]);
     });
 
-    test('single warning row via ⚠️', () => {
-      const content = makeContent(['| format | ⚠️ |']);
+    test('single warning row via !', () => {
+      const content = makeContent(['| format | ! |']);
       expect(parseValidationResults(content)).toEqual([{ check: 'format', result: 'warn' }]);
     });
 
-    test('single skipped row via ⏭️', () => {
-      const content = makeContent(['| tests | ⏭️ |']);
+    test('single skipped row via ', () => {
+      const content = makeContent(['| tests |  |']);
       expect(parseValidationResults(content)).toEqual([{ check: 'tests', result: 'warn' }]);
     });
 
@@ -96,9 +96,9 @@ describe('parseValidationResults', () => {
 
     test('multiple rows with mixed results', () => {
       const content = makeContent([
-        '| type-check | ✅ |',
-        '| lint       | ❌ |',
-        '| tests      | ⚠️ |',
+        '| type-check | [x] |',
+        '| lint       | [ ] |',
+        '| tests      | ! |',
       ]);
       expect(parseValidationResults(content)).toEqual([
         { check: 'type-check', result: 'pass' },
@@ -109,39 +109,39 @@ describe('parseValidationResults', () => {
   });
 
   describe('error text extraction', () => {
-    test('error text after ❌ is captured', () => {
-      const content = makeContent(['| lint | ❌ eslint rule violation |']);
+    test('error text after [ ] is captured', () => {
+      const content = makeContent(['| lint | [ ] eslint rule violation |']);
       const results = parseValidationResults(content);
       expect(results[0].result).toBe('fail');
       expect(results[0].error).toBe('eslint rule violation');
     });
 
     test('error text with leading dash is stripped of the dash', () => {
-      const content = makeContent(['| lint | ❌ - something broke |']);
+      const content = makeContent(['| lint | [ ] - something broke |']);
       const results = parseValidationResults(content);
       expect(results[0].error).toBe('something broke');
     });
 
     test('error text with leading em-dash is stripped', () => {
-      const content = makeContent(['| lint | ❌ — something broke |']);
+      const content = makeContent(['| lint | [ ] -- something broke |']);
       const results = parseValidationResults(content);
       expect(results[0].error).toBe('something broke');
     });
 
     test('no error field when result cell only contains emoji', () => {
-      const content = makeContent(['| type-check | ✅ |']);
+      const content = makeContent(['| type-check | [x] |']);
       const results = parseValidationResults(content);
       expect(results[0].error).toBeUndefined();
     });
 
     test('no error field for pass with only whitespace around emoji', () => {
-      const content = makeContent(['| type-check |  ✅  |']);
+      const content = makeContent(['| type-check |  [x]  |']);
       const results = parseValidationResults(content);
       expect(results[0].error).toBeUndefined();
     });
 
     test('warning with extra text captures error', () => {
-      const content = makeContent(['| format | ⚠️ minor issues |']);
+      const content = makeContent(['| format | ! minor issues |']);
       const results = parseValidationResults(content);
       expect(results[0].result).toBe('warn');
       expect(results[0].error).toBe('minor issues');
@@ -150,33 +150,33 @@ describe('parseValidationResults', () => {
 
   describe('check name normalization', () => {
     test('uppercase letters are lowercased', () => {
-      const content = makeContent(['| TypeCheck | ✅ |']);
+      const content = makeContent(['| TypeCheck | [x] |']);
       expect(parseValidationResults(content)[0].check).toBe('typecheck');
     });
 
     test('spaces are replaced with hyphens', () => {
-      const content = makeContent(['| type check | ✅ |']);
+      const content = makeContent(['| type check | [x] |']);
       expect(parseValidationResults(content)[0].check).toBe('type-check');
     });
 
     test('multiple consecutive spaces become single hyphen', () => {
-      const content = makeContent(['| type  check | ✅ |']);
+      const content = makeContent(['| type  check | [x] |']);
       expect(parseValidationResults(content)[0].check).toBe('type-check');
     });
 
     test('special characters are stripped', () => {
-      const content = makeContent(['| type_check! | ✅ |']);
+      const content = makeContent(['| type_check! | [x] |']);
       // underscores and ! are stripped; becomes 'typecheck'
       expect(parseValidationResults(content)[0].check).toBe('typecheck');
     });
 
     test('hyphens are preserved', () => {
-      const content = makeContent(['| e2e-tests | ✅ |']);
+      const content = makeContent(['| e2e-tests | [x] |']);
       expect(parseValidationResults(content)[0].check).toBe('e2e-tests');
     });
 
     test('numbers are preserved', () => {
-      const content = makeContent(['| step1 | ✅ |']);
+      const content = makeContent(['| step1 | [x] |']);
       expect(parseValidationResults(content)[0].check).toBe('step1');
     });
   });
@@ -184,26 +184,26 @@ describe('parseValidationResults', () => {
   describe('table parsing edge cases', () => {
     test('separator row is skipped', () => {
       // separator already included by makeContent; ensure row count is correct
-      const content = makeContent(['| type-check | ✅ |']);
+      const content = makeContent(['| type-check | [x] |']);
       expect(parseValidationResults(content)).toHaveLength(1);
     });
 
     test('row with fewer than 2 non-empty cells is skipped', () => {
       // A row that splits into only one cell after filter
       const content = makeContent(['| | |']);
-      // Both cells are empty strings, filtered out → length < 2 → skipped
+      // Both cells are empty strings, filtered out -> length < 2 -> skipped
       expect(parseValidationResults(content)).toEqual([]);
     });
 
     test('table parsing stops when a non-pipe line is encountered', () => {
-      const content = makeContent(['| type-check | ✅ |', '', '| lint | ❌ |']);
+      const content = makeContent(['| type-check | [x] |', '', '| lint | [ ] |']);
       // Empty line breaks the table loop, so only the first row is parsed
       expect(parseValidationResults(content)).toHaveLength(1);
       expect(parseValidationResults(content)[0].check).toBe('type-check');
     });
 
     test('extra columns beyond the second are ignored', () => {
-      const content = makeContent(['| type-check | ✅ | extra-column |']);
+      const content = makeContent(['| type-check | [x] | extra-column |']);
       expect(parseValidationResults(content)).toEqual([{ check: 'type-check', result: 'pass' }]);
     });
 
@@ -213,7 +213,7 @@ describe('parseValidationResults', () => {
         '',
         '| Check | Result |',
         '|-------|--------|',
-        '| type-check | ✅ |',
+        '| type-check | [x] |',
       ].join('\n');
       // lowercase header should NOT match
       expect(parseValidationResults(content)).toEqual([]);
@@ -227,38 +227,38 @@ describe('parseValidationResults', () => {
         '',
         '| Check | Result |',
         '|-------|--------|',
-        '| lint | ✅ |',
+        '| lint | [x] |',
       ].join('\n');
       expect(parseValidationResults(content)).toEqual([{ check: 'lint', result: 'pass' }]);
     });
 
     test('Windows-style CRLF line endings are handled', () => {
       const content =
-        '# Validation Results\r\n\r\n| Check | Result |\r\n|-------|--------|\r\n| lint | ✅ |\r\n';
+        '# Validation Results\r\n\r\n| Check | Result |\r\n|-------|--------|\r\n| lint | [x] |\r\n';
       expect(parseValidationResults(content)).toEqual([{ check: 'lint', result: 'pass' }]);
     });
 
     test('check name that normalizes to empty string is skipped', () => {
       // A check name consisting only of special chars will normalize to ''
-      const content = makeContent(['| !@#$ | ✅ |']);
+      const content = makeContent(['| !@#$ | [x] |']);
       expect(parseValidationResults(content)).toEqual([]);
     });
   });
 
   describe('emoji precedence', () => {
-    test('✅ takes priority when multiple emojis present', () => {
+    test('[x] takes priority when multiple emojis present', () => {
       // hasPass checked first
-      const content = makeContent(['| mixed | ✅ ❌ |']);
+      const content = makeContent(['| mixed | [x] [ ] |']);
       expect(parseValidationResults(content)[0].result).toBe('pass');
     });
 
-    test('❌ takes priority over ⚠️', () => {
-      const content = makeContent(['| mixed | ❌ ⚠️ |']);
+    test('[ ] takes priority over !', () => {
+      const content = makeContent(['| mixed | [ ] ! |']);
       expect(parseValidationResults(content)[0].result).toBe('fail');
     });
 
-    test('⚠️ takes priority over plain text unknown', () => {
-      const content = makeContent(['| mixed | ⚠️ some text |']);
+    test('! takes priority over plain text unknown', () => {
+      const content = makeContent(['| mixed | ! some text |']);
       expect(parseValidationResults(content)[0].result).toBe('warn');
     });
   });

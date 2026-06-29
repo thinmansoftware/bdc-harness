@@ -2,7 +2,7 @@ import { describe, test, expect } from 'bun:test';
 import { formatDuration, parseDbTimestamp } from './duration';
 
 describe('formatDuration', () => {
-  test('rounds 0ms up to "1s" — a run that just started should not display "0s"', () => {
+  test('rounds 0ms up to "1s" -- a run that just started should not display "0s"', () => {
     // 0ms in practice means started_at and now are in the same DB second.
     // Display should show "1s" (active, just started), not the misleading "0s".
     expect(formatDuration(0)).toBe('1s');
@@ -52,7 +52,7 @@ describe('parseDbTimestamp', () => {
   });
 
   test('treats SQLite "YYYY-MM-DD HH:MM:SS" as UTC, not local', () => {
-    // Reproduces the live bug — SQLite returns datetimes without `Z`,
+    // Reproduces the live bug -- SQLite returns datetimes without `Z`,
     // and `new Date('2026-04-14 10:00:00')` parses as local time, making
     // the duration display hours off depending on the user's TZ.
     const sqliteFormat = '2026-04-14 10:00:00';

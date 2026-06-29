@@ -6,7 +6,7 @@
  *
  * All write operations use fire-and-forget pattern (catch + log, never throw)
  * because workflow execution must not fail due to event logging.
- * Read operations also throw on error — callers own the degradation policy.
+ * Read operations also throw on error -- callers own the degradation policy.
  */
 import { pool, getDialect } from './connection';
 import { createLogger } from '@archon/paths';
@@ -24,7 +24,7 @@ export interface WorkflowEventRow {
   event_type: string;
   step_index: number | null;
   step_name: string | null;
-  /** Normalized to object — SQLite returns JSON as string, PG returns object. */
+  /** Normalized to object -- SQLite returns JSON as string, PG returns object. */
   data: Record<string, unknown>;
   created_at: string;
 }
@@ -147,9 +147,9 @@ export async function listRecentEvents(
 }
 
 /**
- * Return a map of nodeId → output for all node_completed events in a workflow run.
+ * Return a map of nodeId -> output for all node_completed events in a workflow run.
  * Used by the DAG executor to restore node outputs when resuming a failed run.
- * Throws on DB error — caller owns the degradation policy.
+ * Throws on DB error -- caller owns the degradation policy.
  */
 export async function getCompletedDagNodeOutputs(
   workflowRunId: string

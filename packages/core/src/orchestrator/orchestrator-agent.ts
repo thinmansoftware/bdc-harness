@@ -70,7 +70,7 @@ function getLog(): ReturnType<typeof createLogger> {
   return cachedLog;
 }
 
-// ─── Constants ───────────────────────────────────────────────────────────────
+// --- Constants ---------------------------------------------------------------
 
 /** Max assistant text chunks to keep in batch mode (oldest are dropped) */
 const MAX_BATCH_ASSISTANT_CHUNKS = 20;
@@ -86,7 +86,7 @@ const WORKFLOW_CODEBASE_PREFIXES: readonly { prefix: string; codebaseName: strin
   { prefix: 'bdc-auth-', codebaseName: 'bluedevilcollectibles/lspro-react' },
 ] as const;
 
-// ─── Types ──────────────────────────────────────────────────────────────────
+// --- Types ------------------------------------------------------------------
 
 export interface WorkflowInvocation {
   workflowName: string;
@@ -111,7 +111,7 @@ export interface OrchestratorCommands {
   projectRegistration: ProjectRegistration | null;
 }
 
-// ─── Command Parsing ────────────────────────────────────────────────────────
+// --- Command Parsing --------------------------------------------------------
 
 /**
  * Find a codebase by exact name or by last path segment (e.g., "repo" matches "owner/repo").
@@ -198,11 +198,11 @@ export function parseOrchestratorCommands(
   return result;
 }
 
-// ─── Batch Mode Helpers ─────────────────────────────────────────────────────
+// --- Batch Mode Helpers -----------------------------------------------------
 
 /**
  * Filter emoji tool indicators from Claude Code SDK responses.
- * These prefixed sections (🔧, 💭, 📝, etc.) are useful for streaming UIs
+ * These prefixed sections (, , , etc.) are useful for streaming UIs
  * but garble batch-mode text output on platforms like Slack/GitHub/CLI.
  */
 function filterToolIndicators(assistantMessages: string[]): string {
@@ -212,9 +212,9 @@ function filterToolIndicators(assistantMessages: string[]): string {
   const sections = allMessages.split('\n\n');
 
   // Tool indicators from Claude Code SDK responses:
-  // 🔧 (U+1F527) - tool usage, 💭 (U+1F4AD) - thinking, 📝 (U+1F4DD) - writing,
-  // ✏️ (U+270F+FE0F) - editing, 🗑️ (U+1F5D1+FE0F) - deleting,
-  // 📂 (U+1F4C2) - folder, 🔍 (U+1F50D) - search
+  //  (U+1F527) - tool usage,  (U+1F4AD) - thinking,  (U+1F4DD) - writing,
+  //  (U+270F+FE0F) - editing,  (U+1F5D1+FE0F) - deleting,
+  //  (U+1F4C2) - folder,  (U+1F50D) - search
   const toolIndicatorRegex =
     /^(?:\u{1F527}|\u{1F4AD}|\u{1F4DD}|\u{270F}\u{FE0F}|\u{1F5D1}\u{FE0F}|\u{1F4C2}|\u{1F50D})/u;
   const cleanSections = sections.filter(section => {
@@ -228,7 +228,7 @@ function filterToolIndicators(assistantMessages: string[]): string {
   return finalMessage || allMessages;
 }
 
-// ─── Workflow Dispatch ──────────────────────────────────────────────────────
+// --- Workflow Dispatch ------------------------------------------------------
 
 /**
  * Dispatch a workflow after the orchestrator resolves a project.
@@ -253,7 +253,7 @@ async function dispatchOrchestratorWorkflow(
 
   // Validate and resolve isolation.
   // A workflow with `worktree.enabled: false` short-circuits the resolver entirely
-  // and runs in the live checkout — no worktree creation, no env row. This is the
+  // and runs in the live checkout -- no worktree creation, no env row. This is the
   // declarative equivalent of CLI `--no-worktree` for workflows that should always
   // run live (e.g. read-only triage, docs generation on the main checkout).
   let cwd: string;
@@ -319,7 +319,7 @@ async function dispatchOrchestratorWorkflow(
         codebase.id,
         undefined, // issueContext
         undefined, // isolationContext
-        conversation.id // parentConversationId — enables approve/reject auto-resume
+        conversation.id // parentConversationId -- enables approve/reject auto-resume
       );
     } else if (workflow.interactive) {
       // Interactive workflows run in foreground so output stays in the user's conversation
@@ -334,7 +334,7 @@ async function dispatchOrchestratorWorkflow(
         codebase.id,
         undefined, // issueContext
         undefined, // isolationContext
-        conversation.id // parentConversationId — enables approve/reject auto-resume
+        conversation.id // parentConversationId -- enables approve/reject auto-resume
       );
     } else {
       await dispatchBackgroundWorkflow(
@@ -363,12 +363,12 @@ async function dispatchOrchestratorWorkflow(
       codebase.id,
       undefined, // issueContext
       undefined, // isolationContext
-      conversation.id // parentConversationId — enables approve/reject auto-resume
+      conversation.id // parentConversationId -- enables approve/reject auto-resume
     );
   }
 }
 
-// ─── Session Helpers ────────────────────────────────────────────────────────
+// --- Session Helpers --------------------------------------------------------
 
 async function tryPersistSessionId(
   sessionId: string,
@@ -384,7 +384,7 @@ async function tryPersistSessionId(
   }
 }
 
-// ─── Extracted Helpers ──────────────────────────────────────────────────────
+// --- Extracted Helpers ------------------------------------------------------
 
 /** Copy parent conversation's project context to child thread if missing */
 async function inheritThreadContext(
@@ -436,7 +436,7 @@ async function discoverAllWorkflows(conversation: Conversation): Promise<Discove
 
   try {
     // Home-scoped workflows at ~/.archon/workflows/ are discovered automatically
-    // by discoverWorkflowsWithConfig — no option needed.
+    // by discoverWorkflowsWithConfig -- no option needed.
     const result = await discoverWorkflowsWithConfig(getArchonWorkspacesPath(), loadConfig);
     workflows = [...result.workflows];
     allErrors.push(...result.errors);
@@ -551,11 +551,11 @@ function buildFullPrompt(
   );
 }
 
-// ─── Main Handler ───────────────────────────────────────────────────────────
+// --- Main Handler -----------------------------------------------------------
 
 /**
  * Handle a message through the orchestrator agent.
- * Single entry point for all platforms — routes slash commands deterministically,
+ * Single entry point for all platforms -- routes slash commands deterministically,
  * and routes everything else through the AI orchestrator which knows all projects
  * and workflows upfront.
  */
@@ -594,7 +594,7 @@ export async function handleMessage(
       );
     }
 
-    // Natural-language approval routing — if a workflow is paused in this
+    // Natural-language approval routing -- if a workflow is paused in this
     // conversation, treat any non-slash message as the approval response.
     if (!message.startsWith('/')) {
       const pausedRun = await workflowDb.getPausedWorkflowRun(conversation.id);
@@ -607,7 +607,7 @@ export async function handleMessage(
           typeof (approvalRaw as Record<string, unknown>).nodeId === 'string';
 
         if (!hasValidApproval) {
-          // Paused run exists but approval context is missing or corrupt —
+          // Paused run exists but approval context is missing or corrupt --
           // tell the user so they can use explicit commands instead.
           await platform.sendMessage(
             conversationId,
@@ -629,7 +629,7 @@ export async function handleMessage(
         );
 
         try {
-          // Write approval events — for interactive loops, do NOT write node_completed
+          // Write approval events -- for interactive loops, do NOT write node_completed
           // (the executor writes it when the AI emits the completion signal on actual exit).
           if (approval.type !== 'interactive_loop') {
             const nodeOutput = approval.captureResponse === true ? message : '';
@@ -665,7 +665,7 @@ export async function handleMessage(
             await platform.sendMessage(
               conversationId,
               `Approved, but workflow \`${pausedRun.workflow_name}\` not found. ` +
-                'The approval was recorded — use `/workflow list` to check available workflows.'
+                'The approval was recorded -- use `/workflow list` to check available workflows.'
             );
             return;
           }
@@ -676,11 +676,11 @@ export async function handleMessage(
             await platform.sendMessage(
               conversationId,
               'Approved, but no project is attached to this conversation. ' +
-                'The approval was recorded — re-run the workflow to resume.'
+                'The approval was recorded -- re-run the workflow to resume.'
             );
             return;
           }
-          await platform.sendMessage(conversationId, `▶️ Resuming **${workflow.name}**...`);
+          await platform.sendMessage(conversationId, ` Resuming **${workflow.name}**...`);
           await dispatchOrchestratorWorkflow(
             platform,
             conversationId,
@@ -830,7 +830,7 @@ export async function handleMessage(
             workflowName = meta.workflowResult?.workflowName ?? 'unknown';
             runId = meta.workflowResult?.runId ?? 'unknown';
           } catch (metaErr) {
-            // Malformed metadata — use defaults
+            // Malformed metadata -- use defaults
             getLog().warn(
               { err: metaErr as Error, conversationId, messageId: msg.id },
               'orchestrator.workflow_result_metadata_parse_failed'
@@ -845,7 +845,7 @@ export async function handleMessage(
         { err: error as Error, conversationId },
         'orchestrator.workflow_context_fetch_failed'
       );
-      // Non-critical — continue without context
+      // Non-critical -- continue without context
     }
 
     const fullPrompt = buildFullPrompt(
@@ -976,7 +976,7 @@ export async function handleMessage(
   }
 }
 
-// ─── Streaming Mode ─────────────────────────────────────────────────────────
+// --- Streaming Mode ---------------------------------------------------------
 
 /**
  * Stream mode: send text chunks immediately for real-time UX (web, Telegram stream).
@@ -1012,7 +1012,7 @@ async function handleStreamMode(
         allMessages.push(msg.content);
         const accumulated = allMessages.join('');
         // Check for orchestrator commands BEFORE streaming to frontend.
-        // If detected, suppress this chunk and all future chunks — the full
+        // If detected, suppress this chunk and all future chunks -- the full
         // response will be parsed post-loop and the command dispatched there.
         if (
           /^\/invoke-workflow\s/m.test(accumulated) ||
@@ -1055,14 +1055,14 @@ async function handleStreamMode(
         newSessionId = msg.sessionId;
       }
       if (msg.isError) {
-        // BDC fork: Layer 3 — detect auth-class errors in the SDK's
+        // BDC fork: Layer 3 -- detect auth-class errors in the SDK's
         // result-with-isError path. The provider's try/catch around
         // sendQuery only catches THROWN errors; the Claude SDK reports
         // some auth failures (subprocess pre-flight short-circuit) as a
         // normal `result` message with isError=true. Without this branch
         // the auth failure flows past PR #48's reactive refresh and the
         // user sees only a generic formatted error.
-        // Behavior spec v2 invariant I-11; research doc §Design rec L3.
+        // Behavior spec v2 invariant I-11; research doc Section Design rec L3.
         if (isAuthErrorMessage(msg.errorSubtype)) {
           const provider = aiClient.getType() as ProviderName;
           getLog().info(
@@ -1076,7 +1076,7 @@ async function handleStreamMode(
             }
             throw new AuthRefreshedRetryNeeded();
           }
-          // Refresh failed — surface re-auth instructions instead of the
+          // Refresh failed -- surface re-auth instructions instead of the
           // generic formatted error so the operator knows what to do.
           getLog().error(
             { conversationId, provider, reason: result.reason },
@@ -1129,7 +1129,7 @@ async function handleStreamMode(
   const commands = parseOrchestratorCommands(fullResponse, codebases, workflows);
 
   if (commands.workflowInvocation) {
-    // Retract streamed text — workflow dispatch replaces it
+    // Retract streamed text -- workflow dispatch replaces it
     if (platform.emitRetract) {
       await platform.emitRetract(conversationId);
     }
@@ -1160,10 +1160,10 @@ async function handleStreamMode(
     return;
   }
 
-  // Text was already streamed — nothing more to send
+  // Text was already streamed -- nothing more to send
 }
 
-// ─── Batch Mode ─────────────────────────────────────────────────────────────
+// --- Batch Mode -------------------------------------------------------------
 
 /**
  * Batch mode: accumulate all chunks, filter tool indicators, send final clean summary.
@@ -1238,8 +1238,8 @@ async function handleBatchMode(
         newSessionId = msg.sessionId;
       }
       if (msg.isError) {
-        // BDC fork: Layer 3 — same auth detection as streaming variant.
-        // Behavior spec v2 invariant I-11; research doc §Design rec L3.
+        // BDC fork: Layer 3 -- same auth detection as streaming variant.
+        // Behavior spec v2 invariant I-11; research doc Section Design rec L3.
         if (isAuthErrorMessage(msg.errorSubtype)) {
           const provider = aiClient.getType() as ProviderName;
           getLog().info(
@@ -1356,12 +1356,12 @@ async function handleBatchMode(
     return;
   }
 
-  // No orchestrator commands — send the clean response
+  // No orchestrator commands -- send the clean response
   getLog().debug({ messageLength: finalMessage.length }, 'sending_final_message');
   await platform.sendMessage(conversationId, finalMessage);
 }
 
-// ─── Orchestrator Command Handlers ──────────────────────────────────────────
+// --- Orchestrator Command Handlers ------------------------------------------
 
 /**
  * Handle a parsed /invoke-workflow command from AI response.
@@ -1455,7 +1455,7 @@ async function handleProjectRegistrationResult(
   await platform.sendMessage(conversationId, regResult);
 }
 
-// ─── Internal Helpers ───────────────────────────────────────────────────────
+// --- Internal Helpers -------------------------------------------------------
 
 /**
  * Handle /register-project command.
@@ -1531,7 +1531,7 @@ async function handleUpdateProject(message: string): Promise<string> {
   try {
     await codebaseDb.updateCodebase(codebase.id, { default_cwd: newPath });
   } catch {
-    return `Project "${projectName}" could not be updated — it may have been removed.`;
+    return `Project "${projectName}" could not be updated -- it may have been removed.`;
   }
   getLog().info(
     { name: projectName, oldPath: codebase.default_cwd, newPath, id: codebase.id },
@@ -1911,7 +1911,7 @@ async function handleWorkflowRunCommand(
     }
 
     // Route through dispatchOrchestratorWorkflow so validateAndResolveIsolation
-    // always runs — ensures a worktree is created regardless of how the codebase
+    // always runs -- ensures a worktree is created regardless of how the codebase
     // was registered (local path or GitHub URL clone).
     await dispatchOrchestratorWorkflow(
       platform,
@@ -1925,7 +1925,7 @@ async function handleWorkflowRunCommand(
     return;
   }
 
-  // No project attached — apply E2 logic
+  // No project attached -- apply E2 logic
   const codebases = await codebaseDb.listCodebases();
 
   if (codebases.length === 0) {
@@ -2035,7 +2035,7 @@ async function handleWorkflowRunCommand(
     return;
   }
 
-  // Multiple projects — ask user to choose
+  // Multiple projects -- ask user to choose
   const projectList = codebases.map(c => `- ${c.name}`).join('\n');
   await platform.sendMessage(
     conversationId,

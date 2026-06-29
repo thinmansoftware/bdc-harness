@@ -156,7 +156,7 @@ describe('CLI argument parsing', () => {
   describe('version flag detection', () => {
     /**
      * Duplicates the isVersionRequest() helper from cli.ts (which is not
-     * exported — importing cli.ts would execute its top-level main()). Must
+     * exported -- importing cli.ts would execute its top-level main()). Must
      * be updated manually if the source logic changes.
      */
     const isVersionRequest = (args: string[]): boolean => {

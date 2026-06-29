@@ -5,7 +5,7 @@ import type { WebAdapter } from '../adapters/web';
 import { validationErrorHook } from './openapi-defaults';
 
 // ---------------------------------------------------------------------------
-// Mock setup — must be before dynamic imports of mocked modules
+// Mock setup -- must be before dynamic imports of mocked modules
 // ---------------------------------------------------------------------------
 
 const mockGetWorkflowRun = mock(async (_id: string) => null as null | MockWorkflowRun);

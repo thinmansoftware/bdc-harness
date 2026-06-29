@@ -42,7 +42,7 @@ export function getDatabase(): IDatabase {
     database = new SqliteAdapter(dbPath);
     dialect = sqliteDialect;
 
-    // Warn if running in Docker without DATABASE_URL — the postgres container
+    // Warn if running in Docker without DATABASE_URL -- the postgres container
     // from --profile with-db is running but the app is silently using SQLite
     if (process.env.ARCHON_DOCKER === 'true') {
       getLog().warn(

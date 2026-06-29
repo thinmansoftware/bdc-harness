@@ -68,7 +68,7 @@ export async function listMessages(
 /**
  * Get recent messages with workflowResult metadata for a conversation.
  * Used to inject workflow context into the orchestrator prompt.
- * Non-throwing — returns empty array on error.
+ * Non-throwing -- returns empty array on error.
  */
 export async function getRecentWorkflowResultMessages(
   conversationId: string,

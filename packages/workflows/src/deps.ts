@@ -2,10 +2,10 @@
  * Workflow dependency injection types.
  *
  * Defines narrow interfaces for what the workflow engine needs from external systems.
- * Callers in @archon/core satisfy these structurally — no adapter wrappers needed.
+ * Callers in @archon/core satisfy these structurally -- no adapter wrappers needed.
  *
  * Provider types are imported directly from @archon/providers/types (contract layer).
- * No more mirror copies — single source of truth for IAgentProvider, MessageChunk, etc.
+ * No more mirror copies -- single source of truth for IAgentProvider, MessageChunk, etc.
  */
 import type { IWorkflowStore } from './store';
 import type { ModelReasoningEffort, WebSearchMode } from './schemas';
@@ -30,11 +30,11 @@ export type {
   ProviderCapabilities,
 };
 
-// Backwards compat alias — deprecated, prefer direct import from @archon/providers/types
+// Backwards compat alias -- deprecated, prefer direct import from @archon/providers/types
 export type WorkflowTokenUsage = TokenUsage;
 
 // ---------------------------------------------------------------------------
-// Platform-specific types (NOT mirrors — unique to workflow engine)
+// Platform-specific types (NOT mirrors -- unique to workflow engine)
 // ---------------------------------------------------------------------------
 
 export interface WorkflowMessageMetadata {
@@ -111,7 +111,7 @@ export interface WorkflowConfig {
 export type AgentProviderFactory = (provider: string) => IAgentProvider;
 
 // ---------------------------------------------------------------------------
-// WorkflowDeps — the single injection point
+// WorkflowDeps -- the single injection point
 // ---------------------------------------------------------------------------
 
 export interface WorkflowDeps {

@@ -18,18 +18,18 @@ function normalizeCheckName(raw: string): string {
 
 function parseResultCell(raw: string): { result: ValidationResult['result']; error?: string } {
   const trimmed = raw.trim();
-  const hasPass = trimmed.includes('✅');
-  const hasFail = trimmed.includes('❌');
-  const hasWarn = trimmed.includes('⚠️');
-  const hasSkip = trimmed.includes('⏭️') || /not run|skipped/i.test(trimmed);
+  const hasPass = trimmed.includes('[x]');
+  const hasFail = trimmed.includes('[ ]');
+  const hasWarn = trimmed.includes('!');
+  const hasSkip = trimmed.includes('') || /not run|skipped/i.test(trimmed);
 
   let result: ValidationResult['result'] = 'unknown';
   if (hasPass) result = 'pass';
   else if (hasFail) result = 'fail';
   else if (hasWarn || hasSkip) result = 'warn';
 
-  const cleaned = trimmed.replace(/✅|❌|⚠️|⏭️/g, '').trim();
-  const error = cleaned ? cleaned.replace(/^[-–—]\s*/, '') : undefined;
+  const cleaned = trimmed.replace(/[x]|[ ]|!|/g, '').trim();
+  const error = cleaned ? cleaned.replace(/^[-----]\s*/, '') : undefined;
 
   return { result, ...(error ? { error } : {}) };
 }

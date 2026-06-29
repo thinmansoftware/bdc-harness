@@ -91,7 +91,7 @@ export interface AgentPersona {
   systemPrompt: string;
 }
 
-/** In-memory registry mapping agent name → persona */
+/** In-memory registry mapping agent name -> persona */
 export type AgentRegistry = Map<string, AgentPersona>;
 
 /**
@@ -203,7 +203,7 @@ export function parseFrontmatter(
               i++;
             }
           } else {
-            // Scalar sub-value — parse as number or string
+            // Scalar sub-value -- parse as number or string
             const asNum = Number(subRest);
             obj[subKey] = isNaN(asNum) ? subRest.replace(/^["']|["']$/g, '') : asNum;
             i++;
@@ -229,7 +229,7 @@ export function parseFrontmatter(
       continue;
     }
 
-    // Plain scalar — strip optional quotes
+    // Plain scalar -- strip optional quotes
     frontmatter[key] = rest.replace(/^["']|["']$/g, '');
     i++;
   }
@@ -465,7 +465,7 @@ export async function loadAgentFile(filePath: string): Promise<AgentPersona> {
  * Load all agent persona files from a directory (non-recursive, *.md only).
  * Returns the populated registry.
  *
- * Throws `AgentRegistryError` for the first invalid file encountered — the
+ * Throws `AgentRegistryError` for the first invalid file encountered -- the
  * registry is all-or-nothing: a single malformed file prevents startup.
  *
  * Returns an empty registry if the directory does not exist (no agents configured).
@@ -479,7 +479,7 @@ export async function loadAgentRegistry(agentsDir: string): Promise<AgentRegistr
   } catch (err) {
     const nodeErr = err as NodeJS.ErrnoException;
     if (nodeErr.code === 'ENOENT') {
-      // No agents directory — return empty registry (agents are optional)
+      // No agents directory -- return empty registry (agents are optional)
       return registry;
     }
     throw new AgentRegistryError(

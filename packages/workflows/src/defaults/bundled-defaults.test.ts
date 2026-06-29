@@ -54,7 +54,7 @@ describe('bundled-defaults', () => {
         expect(content).toBe(diskContent);
       }
       for (const [name, content] of Object.entries(BUNDLED_WORKFLOWS)) {
-        // Workflows may be .yaml or .yml — prefer .yaml, fall back.
+        // Workflows may be .yaml or .yml -- prefer .yaml, fall back.
         let diskContent: string;
         try {
           diskContent = readLF(join(WORKFLOWS_DIR, `${name}.yaml`));

@@ -50,7 +50,7 @@ export function mapWorkflowEvent(event: WorkflowEmitterEvent): string | null {
         runId: event.runId,
         nodeId: event.nodeId,
         step: event.iteration - 1,
-        // total: 0 intentionally — maxIterations is not carried by loop_iteration_completed/failed events.
+        // total: 0 intentionally -- maxIterations is not carried by loop_iteration_completed/failed events.
         // workflow-store.ts handleLoopIteration guards against 0 by preserving the prior wf.maxIterations value.
         total: 0,
         name: `iteration-${String(event.iteration)}`,
@@ -66,7 +66,7 @@ export function mapWorkflowEvent(event: WorkflowEmitterEvent): string | null {
         runId: event.runId,
         nodeId: event.nodeId,
         step: event.iteration - 1,
-        // total: 0 intentionally — maxIterations is not carried by loop_iteration_completed/failed events.
+        // total: 0 intentionally -- maxIterations is not carried by loop_iteration_completed/failed events.
         // workflow-store.ts handleLoopIteration guards against 0 by preserving the prior wf.maxIterations value.
         total: 0,
         name: `iteration-${String(event.iteration)}`,
@@ -210,7 +210,7 @@ export class WorkflowEventBridge {
         if (conversationId) {
           this.transport.emitWorkflowEvent(conversationId, sseEvent);
         }
-        // Fan-out to dashboard stream — no-op when no dashboard client connected
+        // Fan-out to dashboard stream -- no-op when no dashboard client connected
         this.transport.emitWorkflowEvent('__dashboard__', sseEvent);
       }
     });

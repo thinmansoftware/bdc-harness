@@ -33,7 +33,7 @@ export const workflowHookEventSchema = z.enum([
 
 export type WorkflowHookEvent = z.infer<typeof workflowHookEventSchema>;
 
-/** Canonical list of hook events — derived from schema, do not duplicate. */
+/** Canonical list of hook events -- derived from schema, do not duplicate. */
 export const WORKFLOW_HOOK_EVENTS: readonly WorkflowHookEvent[] = workflowHookEventSchema.options;
 
 /**

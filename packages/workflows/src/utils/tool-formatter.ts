@@ -14,7 +14,7 @@
  */
 export function formatToolCall(toolName: string, toolInput?: Record<string, unknown>): string {
   // Start with tool emoji and name
-  let message = `🔧 ${toolName.toUpperCase()}`;
+  let message = ` ${toolName.toUpperCase()}`;
 
   // Add brief command/input info if available
   if (toolInput) {
@@ -92,7 +92,7 @@ function extractBriefInfo(toolName: string, toolInput: Record<string, unknown>):
 export function formatThinking(thinking: string): string {
   const maxLength = 200;
   if (thinking.length > maxLength) {
-    return `💭 ${thinking.substring(0, maxLength)}...`;
+    return ` ${thinking.substring(0, maxLength)}...`;
   }
-  return `💭 ${thinking}`;
+  return ` ${thinking}`;
 }

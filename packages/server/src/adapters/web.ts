@@ -21,7 +21,7 @@ export class WebAdapter implements IWebPlatformAdapter {
   private toolCallCounter = new Map<string, number>();
   /**
    * Per-conversation running tool stack for SSE duration tracking.
-   * Uses a Map of toolCallId → start info so parallel DAG nodes don't
+   * Uses a Map of toolCallId -> start info so parallel DAG nodes don't
    * overwrite each other (they share a conversationId).
    */
   private runningTools = new Map<

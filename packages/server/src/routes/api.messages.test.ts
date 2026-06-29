@@ -6,7 +6,7 @@ import { validationErrorHook } from './openapi-defaults';
 import { mockAllWorkflowModules } from '../test/workflow-mock-factories';
 
 // ---------------------------------------------------------------------------
-// Mock setup — must be before dynamic imports of mocked modules
+// Mock setup -- must be before dynamic imports of mocked modules
 // ---------------------------------------------------------------------------
 
 const mockFindConversationByPlatformId = mock(
@@ -275,7 +275,7 @@ describe('POST /api/conversations/:id/message', () => {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ message: 'Hello' }),
     });
-    // Should still return accepted — message is sent even without persistence
+    // Should still return accepted -- message is sent even without persistence
     expect(response.status).toBe(200);
     const body = (await response.json()) as { accepted: boolean };
     expect(body.accepted).toBe(true);

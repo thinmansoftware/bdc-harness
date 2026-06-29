@@ -43,7 +43,7 @@ describe('createArchonUIContext', () => {
     expect(chunks).toHaveLength(1);
     expect(chunks[0]).toEqual({
       type: 'assistant',
-      content: '\n[pi extension ℹ️] Remote session. Open: http://host:8080/\n',
+      content: '\n[pi extension ] Remote session. Open: http://host:8080/\n',
       flush: true,
     });
   });
@@ -51,15 +51,15 @@ describe('createArchonUIContext', () => {
   test('notify defaults to info when type omitted', () => {
     const { ui, chunks } = mk();
     ui.notify('bare message');
-    expect(chunks[0]?.content).toBe('\n[pi extension ℹ️] bare message\n');
+    expect(chunks[0]?.content).toBe('\n[pi extension ] bare message\n');
   });
 
   test('notify("warning") and notify("error") use distinct glyphs', () => {
     const { ui, chunks } = mk();
     ui.notify('soft', 'warning');
     ui.notify('hard', 'error');
-    expect(chunks[0]?.content).toBe('\n[pi extension ⚠️] soft\n');
-    expect(chunks[1]?.content).toBe('\n[pi extension ❌] hard\n');
+    expect(chunks[0]?.content).toBe('\n[pi extension !] soft\n');
+    expect(chunks[1]?.content).toBe('\n[pi extension [ ]] hard\n');
   });
 
   test('select resolves to undefined (no operator to answer)', async () => {

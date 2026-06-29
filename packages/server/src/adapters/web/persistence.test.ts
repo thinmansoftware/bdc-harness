@@ -39,7 +39,7 @@ describe('MessagePersistence', () => {
     persistence.clearAll();
   });
 
-  describe('flush — sync-clear before async work (race condition fix)', () => {
+  describe('flush -- sync-clear before async work (race condition fix)', () => {
     test('clears buffer before async db write so new appendText creates fresh entry', async () => {
       persistence.setConversationDbId('conv-1', 'db-uuid-1');
       persistence.appendText('conv-1', 'hello');
@@ -47,7 +47,7 @@ describe('MessagePersistence', () => {
       // Trigger flush (it will atomically clear the buffer before the db write)
       const flushPromise = persistence.flush('conv-1');
 
-      // Append text while flush is in progress — should go to a new buffer entry
+      // Append text while flush is in progress -- should go to a new buffer entry
       persistence.appendText('conv-1', 'world');
 
       await flushPromise;
@@ -64,7 +64,7 @@ describe('MessagePersistence', () => {
     });
 
     test('restores buffer when dbId is missing (no segments lost)', async () => {
-      // Do NOT call setConversationDbId — flush should restore
+      // Do NOT call setConversationDbId -- flush should restore
       persistence.appendText('conv-1', 'buffered text');
 
       await persistence.flush('conv-1');
@@ -83,7 +83,7 @@ describe('MessagePersistence', () => {
       // restored so subsequent text is still persisted once dbId becomes available.
       persistence.appendText('conv-1', 'segment-1 ');
 
-      await persistence.flush('conv-1'); // no dbId — restores buffer
+      await persistence.flush('conv-1'); // no dbId -- restores buffer
 
       // Text appended after restore merges into the restored buffer entry
       persistence.appendText('conv-1', 'segment-2');
@@ -121,9 +121,9 @@ describe('MessagePersistence', () => {
 
     test('startPeriodicFlush / stopPeriodicFlush lifecycle', () => {
       persistence.startPeriodicFlush();
-      // Timer is running — no assertion needed beyond no-throw
+      // Timer is running -- no assertion needed beyond no-throw
       persistence.stopPeriodicFlush();
-      // Timer is cleared — no assertion needed beyond no-throw
+      // Timer is cleared -- no assertion needed beyond no-throw
     });
 
     test('timer can be restarted after stop', () => {
@@ -148,7 +148,7 @@ describe('MessagePersistence', () => {
 
     test('skips tool_call_formatted category', () => {
       persistence.appendText('conv-1', 'skip me', { category: 'tool_call_formatted' });
-      // Buffer should be empty — nothing to flush
+      // Buffer should be empty -- nothing to flush
       // Verify by flushing and checking no db write
       persistence.setConversationDbId('conv-1', 'db-uuid-1');
       // Flush is async but we can check the buffer is empty
@@ -315,12 +315,12 @@ describe('MessagePersistence', () => {
     });
   });
 
-  describe('flush — pre-finalization of terminal tool calls', () => {
+  describe('flush -- pre-finalization of terminal tool calls', () => {
     test('flushes segment when last tool call never received a result', async () => {
       persistence.setConversationDbId('conv-1', 'db-uuid-1');
       persistence.appendText('conv-1', 'running tool');
       persistence.appendToolCall('conv-1', { name: 'bash', input: { command: 'ls' } });
-      // No appendToolResult — simulates terminal tool call at turn end
+      // No appendToolResult -- simulates terminal tool call at turn end
 
       await persistence.flush('conv-1');
 

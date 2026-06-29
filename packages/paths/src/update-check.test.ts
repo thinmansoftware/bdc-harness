@@ -9,7 +9,7 @@ import {
   getCachedUpdateCheck,
 } from './update-check';
 
-// ─── isNewerVersion ──────────────────────────────────────────────────
+// --- isNewerVersion --------------------------------------------------
 
 describe('isNewerVersion', () => {
   test('returns true when latest minor is higher', () => {
@@ -37,7 +37,7 @@ describe('isNewerVersion', () => {
   });
 });
 
-// ─── parseLatestRelease ──────────────────────────────────────────────
+// --- parseLatestRelease ----------------------------------------------
 
 describe('parseLatestRelease', () => {
   test('parses valid response with v prefix', () => {
@@ -69,7 +69,7 @@ describe('parseLatestRelease', () => {
   });
 });
 
-// ─── checkForUpdate (with mocked fetch) ──────────────────────────────
+// --- checkForUpdate (with mocked fetch) ------------------------------
 
 describe('checkForUpdate', () => {
   const testDir = join(tmpdir(), `archon-update-check-test-${Date.now()}`);
@@ -204,7 +204,7 @@ describe('checkForUpdate', () => {
   });
 });
 
-// ─── getCachedUpdateCheck ────────────────────────────────────────────
+// --- getCachedUpdateCheck --------------------------------------------
 
 describe('getCachedUpdateCheck', () => {
   const testDir = join(tmpdir(), `archon-cached-check-test-${Date.now()}`);

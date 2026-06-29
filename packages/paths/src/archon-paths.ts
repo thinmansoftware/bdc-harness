@@ -3,13 +3,13 @@
  *
  * Directory structure:
  * ~/.archon/                              # User-level (ARCHON_HOME)
- * ├── workspaces/owner/repo/             # Project-centric layout
- * │   ├── source/                        # Clone or symlink → local path
- * │   ├── worktrees/                     # Git worktrees for this project
- * │   ├── artifacts/runs/{workflow-id}/  # Workflow artifacts (NEVER in git)
- * │   └── logs/{workflow-id}.jsonl       # Workflow execution logs
- * ├── worktrees/                         # Legacy global worktrees (for repos not in workspaces/)
- * └── config.yaml                        # Global config
+ * --- workspaces/owner/repo/             # Project-centric layout
+ * -   --- source/                        # Clone or symlink -> local path
+ * -   --- worktrees/                     # Git worktrees for this project
+ * -   --- artifacts/runs/{workflow-id}/  # Workflow artifacts (NEVER in git)
+ * -   --- logs/{workflow-id}.jsonl       # Workflow execution logs
+ * --- worktrees/                         # Legacy global worktrees (for repos not in workspaces/)
+ * --- config.yaml                        # Global config
  *
  * For Docker: /.archon/
  */
@@ -108,7 +108,7 @@ export function getArchonConfigPath(): string {
 
 /**
  * Get the home-scoped workflows directory (`~/.archon/workflows/`).
- * Workflows placed here are discovered from every repo and apply globally —
+ * Workflows placed here are discovered from every repo and apply globally --
  * overridden per-filename by the same name under `<repoRoot>/.archon/workflows/`.
  *
  * Direct child of `~/.archon/`, matching the convention for `workspaces/`,
@@ -121,7 +121,7 @@ export function getHomeWorkflowsPath(): string {
 
 /**
  * Get the home-scoped commands directory (`~/.archon/commands/`).
- * Commands placed here are resolvable from every repo and apply globally —
+ * Commands placed here are resolvable from every repo and apply globally --
  * overridden per-filename by the same name under `<repoRoot>/.archon/commands/`.
  * Command resolution precedence: repo > home > bundled.
  */
@@ -131,7 +131,7 @@ export function getHomeCommandsPath(): string {
 
 /**
  * Get the home-scoped scripts directory (`~/.archon/scripts/`).
- * Scripts placed here are available to every workflow's `script:` nodes —
+ * Scripts placed here are available to every workflow's `script:` nodes --
  * overridden per-name by the same name under `<repoRoot>/.archon/scripts/`.
  * Script resolution precedence: repo > home.
  */
@@ -143,7 +143,7 @@ export function getHomeScriptsPath(): string {
  * Legacy home-scoped workflows directory (`~/.archon/.archon/workflows/`).
  * Retained only so discovery can DETECT files there and emit a one-time
  * deprecation warning pointing at the migration command. Archon no longer
- * reads workflows from this path — it's a signal, not a source.
+ * reads workflows from this path -- it's a signal, not a source.
  */
 export function getLegacyHomeWorkflowsPath(): string {
   return join(getArchonHome(), '.archon', 'workflows');
@@ -162,7 +162,7 @@ export function getArchonEnvPath(): string {
  * This is the archon-owned env location loaded with override: true AFTER the home
  * env, so per-project values win over user-wide defaults.
  *
- * Note: <cwd>/.env (without the .archon/ prefix) is the USER's — it is stripped at
+ * Note: <cwd>/.env (without the .archon/ prefix) is the USER's -- it is stripped at
  * boot by stripCwdEnv() and never loaded by Archon.
  */
 export function getRepoArchonEnvPath(cwd: string): string {
@@ -208,7 +208,7 @@ export function getWorkflowFolderSearchPaths(): string[] {
  * Skips hidden directories and node_modules.
  *
  * `maxDepth` caps how many folders deep the walk descends. Depth is counted as
- * the number of folder boundaries between `rootPath` and the file — so at
+ * the number of folder boundaries between `rootPath` and the file -- so at
  * `maxDepth: 1`, files at `rootPath/file.md` (depth 0) and `rootPath/group/file.md`
  * (depth 1) are included, but `rootPath/group/sub/file.md` (depth 2) is not.
  * Default is `Infinity` (no cap) for backwards compatibility with callers that
@@ -239,7 +239,7 @@ export async function findMarkdownFilesRecursive(
     }
 
     if (entry.isDirectory()) {
-      // Skip descending if we're already at the depth cap — files at deeper
+      // Skip descending if we're already at the depth cap -- files at deeper
       // levels are silently ignored (matches the convention that `.archon/*/`
       // folders support one level of grouping like `defaults/`).
       if (currentDepth >= maxDepth) continue;
@@ -269,7 +269,7 @@ export async function findMarkdownFilesRecursive(
  */
 export function getAppArchonBasePath(): string {
   // This file is at packages/paths/src/archon-paths.ts
-  // Go up from src → paths → packages → repo root
+  // Go up from src -> paths -> packages -> repo root
   // import.meta.dir = packages/paths/src
   const repoRoot = dirname(dirname(dirname(import.meta.dir)));
   return join(repoRoot, '.archon');

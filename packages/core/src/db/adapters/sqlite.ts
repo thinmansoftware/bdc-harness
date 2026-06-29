@@ -120,10 +120,10 @@ export class SqliteAdapter implements IDatabase {
    * Convert PostgreSQL $1, $2 placeholders to SQLite ? placeholders.
    *
    * PostgreSQL uses explicit indices ($1, $2) so params can appear in any order
-   * in SQL. SQLite uses positional ? — so params must be reordered to match the
+   * in SQL. SQLite uses positional ? -- so params must be reordered to match the
    * left-to-right order of placeholders in the SQL string.
    *
-   * Example: SQL has "$2 ... $1" with params [id, json] →
+   * Example: SQL has "$2 ... $1" with params [id, json] ->
    *   converted SQL: "? ... ?" with reordered params [json, id]
    */
   private convertPlaceholders(sql: string, params: unknown[]): { sql: string; params: unknown[] } {
@@ -138,7 +138,7 @@ export class SqliteAdapter implements IDatabase {
       .replace(/::INTERVAL/g, '');
 
     // Reorder params to match the positional order of ? in the SQL.
-    // $N is 1-based, so $1 → params[0], $2 → params[1], etc.
+    // $N is 1-based, so $1 -> params[0], $2 -> params[1], etc.
     const reordered =
       placeholderOrder.length > 0 ? placeholderOrder.map(idx => params[idx - 1]) : params;
 

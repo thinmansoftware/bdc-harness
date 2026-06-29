@@ -1,5 +1,5 @@
 /**
- * Shared isolation business logic — list, cleanup stale, cleanup merged.
+ * Shared isolation business logic -- list, cleanup stale, cleanup merged.
  *
  * CLI and command-handler are thin formatting adapters over these functions.
  */
@@ -9,7 +9,7 @@ import * as isolationDb from '../db/isolation-environments';
 import { cleanupStaleWorktrees, cleanupMergedWorktrees } from '../services/cleanup-service';
 import type { CleanupOperationResult } from '../services/cleanup-service';
 
-// Lazy logger — NEVER at module scope
+// Lazy logger -- NEVER at module scope
 let cachedLog: ReturnType<typeof createLogger> | undefined;
 function getLog(): ReturnType<typeof createLogger> {
   if (!cachedLog) cachedLog = createLogger('operations');
@@ -40,7 +40,7 @@ export { type CleanupOperationResult } from '../services/cleanup-service';
 // ---------------------------------------------------------------------------
 
 /**
- * Reconcile DB state with filesystem — mark environments as destroyed
+ * Reconcile DB state with filesystem -- mark environments as destroyed
  * if their worktree path no longer exists on disk.
  */
 async function reconcileGhosts(

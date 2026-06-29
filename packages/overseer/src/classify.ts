@@ -56,14 +56,14 @@ export interface ClassifyInput {
   /**
    * Optional flag indicating whether the unique remote branch already exists at origin.
    * Distinguishes `implement_loop_no_output` (origin branch reachable, just no diff) from
-   * `implement_loop_skipped` (origin branch missing AND no commits anywhere — agent never wrote).
+   * `implement_loop_skipped` (origin branch missing AND no commits anywhere -- agent never wrote).
    */
   hasOriginBranch?: boolean;
 }
 
 /**
  * Classify a workflow failure into a known error class.
- * Returns "unknown" for unrecognized errors (caller decides what to do — usually escalate).
+ * Returns "unknown" for unrecognized errors (caller decides what to do -- usually escalate).
  *
  * Priority order matters: workflow-runtime classes checked first because they have specific
  * markers (e.g. "command not found: npm") that won't appear in provider errors.
