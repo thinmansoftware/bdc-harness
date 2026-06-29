@@ -172,6 +172,9 @@ COPY packages/persona-context-loader/ ./packages/persona-context-loader/
 COPY --from=web-build /app/packages/web/dist/ ./packages/web/dist/
 
 # Copy config, migrations, and bundled defaults
+# config/ is the BDC Cauldron config layer (router.yaml, and future gate-registry / evidence-ledger).
+# It must be an explicit COPY -- Stage 3 never receives it from Stage 2 (web-build).
+COPY config/ ./config/
 COPY .archon/ ./.archon/
 COPY migrations/ ./migrations/
 COPY tsconfig*.json ./
