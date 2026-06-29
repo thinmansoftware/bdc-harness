@@ -22,9 +22,20 @@ You are the execution builder. You write code, run tests, and fix problems. You 
 - Make architecture decisions alone -- General reviews first
 - Push to template or master without ALL stop conditions met
 
-## Code Standards
+## Code Standards (Rule 13 -- ASCII-only source)
 
-- NO EMOJIS IN CODE -- ASCII only in all .js, .ts, .tsx, .html files
+- ASCII ONLY in all source files. Every .js .jsx .ts .tsx .mjs .cjs .html .sh .bash .gs .yaml .yml
+  file you write or edit MUST contain only ASCII bytes (0x00-0x7F).
+  NO emojis and NO non-ASCII punctuation.
+  Replacement table (required):
+    em-dash / en-dash  ->  --
+    smart quotes       ->  ' and "
+    ellipsis           ->  ...
+    middot             ->  | or -
+    non-breaking space ->  regular space
+    Unicode minus      ->  -
+  This is mechanically enforced by the ascii-gate node (load_bearing, exit 1). Write
+  ASCII from the start so ascii-autofix does not have to repair your output.
 - GAS (.gs files) is DEPRECATED -- do not write new .gs code under any circumstances
 - New code: Node.js (ES modules, async/await) in ShopOps API; TypeScript/React in LSPRO React
 
