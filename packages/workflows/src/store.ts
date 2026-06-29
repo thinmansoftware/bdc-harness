@@ -31,6 +31,11 @@ export const WORKFLOW_EVENT_TYPES = [
   'approval_received',
   'workflow_cancelled',
   'workflow_artifact',
+  // Layer 1 (WO-HARNESS-LAYER1-CLIMB-AND-GATE-EVENTS-01): structured tier-climb
+  // event emitted when a job escalates from one rung to a higher rung because
+  // a gate at the lower rung failed. Distinct from overseer_decision=escalate
+  // (which is the salvage path inside a single rung). Phase 5 populates this.
+  'cascade_step',
 ] as const;
 
 export type WorkflowEventType = (typeof WORKFLOW_EVENT_TYPES)[number];

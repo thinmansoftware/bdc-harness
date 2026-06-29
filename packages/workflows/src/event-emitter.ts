@@ -21,6 +21,38 @@ function getLog(): ReturnType<typeof createLogger> {
 }
 
 // ---------------------------------------------------------------------------
+// Layer 1 -- gate result + cascade step (WO-HARNESS-LAYER1-CLIMB-AND-GATE-EVENTS-01)
+// ---------------------------------------------------------------------------
+
+/**
+ * Which gate produced a pass/fail outcome on a node.
+ *
+ * Phase 3 (Layer 1) defines the schema; Phase 5 (per-rung cascade) is what
+ * actually populates `nodeGateResult` at the dag-executor emit-sites. Until
+ * Phase 5 lands, this remains undefined at the emit-sites and the field is
+ * omitted from event payloads (omit-when-absent pattern).
+ */
+export type GateName = 'tests' | 'validator' | 'manifest' | 'ci';
+
+/**
+ * Structured pass/fail outcome for a gate the node ran. Replaces parsing
+ * error text to infer gate state; readers (UI cascade-trace, Phase 5
+ * cost-cascade) can query the structured field directly.
+ */
+export interface GateResult {
+  /** Which gate produced the outcome. */
+  gate: GateName;
+  /** Pass or fail -- the structured outcome (do not parse error text). */
+  outcome: 'pass' | 'fail';
+  /**
+   * Optional short reason. On failure: short summary of why the gate failed
+   * (e.g. "TypeScript type error", "manifest missing files"). On pass: usually
+   * omitted -- pass is sufficient on its own.
+   */
+  reason?: string;
+}
+
+// ---------------------------------------------------------------------------
 // Event types
 // ---------------------------------------------------------------------------
 
@@ -95,6 +127,12 @@ interface NodeCompletedEvent {
   costUsd?: number;
   stopReason?: string;
   numTurns?: number;
+  /**
+   * Layer 1: structured pass/fail of the gate this node ran. Omitted when
+   * the node did not run a gate or when the cascade engine that populates
+   * it has not landed yet (Phase 5).
+   */
+  gateResult?: GateResult;
 }
 
 interface NodeFailedEvent {
@@ -103,6 +141,32 @@ interface NodeFailedEvent {
   nodeId: string;
   nodeName: string;
   error: string;
+  /**
+   * Layer 1: structured pass/fail of the gate this node ran. Typically the
+   * `fail` side, with `reason` populated. Omitted when no gate was associated
+   * with the failure.
+   */
+  gateResult?: GateResult;
+}
+
+/**
+ * Layer 1: structured tier-climb event. Emitted when a job escalates from
+ * one tier to a higher tier because a gate at the lower tier failed. DISTINCT
+ * from `overseer_decision = escalate` (which is the salvage path inside a
+ * single rung). Phase 5 populates this via `emitCascadeStep`.
+ */
+interface CascadeStepEvent {
+  type: 'cascade_step';
+  runId: string;
+  nodeId: string;
+  /** Rung the job started from (e.g. "haiku"). */
+  from_tier: string;
+  /** Rung the job climbed to (e.g. "sonnet"). */
+  to_tier: string;
+  /** Which gate failed at `from_tier` and triggered the climb. */
+  gate: GateName;
+  /** Short reason the gate failed. */
+  reason: string;
 }
 
 /**
@@ -186,7 +250,8 @@ export type WorkflowEmitterEvent =
   | ToolStartedEvent
   | ToolCompletedEvent
   | ApprovalPendingEvent
-  | WorkflowCancelledEvent;
+  | WorkflowCancelledEvent
+  | CascadeStepEvent;
 
 // ---------------------------------------------------------------------------
 // Emitter class

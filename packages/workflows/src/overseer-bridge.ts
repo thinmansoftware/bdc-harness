@@ -24,7 +24,7 @@ import type { Logger } from '@archon/paths';
 import { classifyError, decide, runEscalation, type Decision } from '@archon/overseer';
 import type { WorkflowRun, NodeOutput } from './schemas/workflow-run.ts';
 import type { DagNode } from './schemas/dag-node.ts';
-import type { WorkflowEmitterEvent } from './event-emitter.ts';
+import type { WorkflowEmitterEvent, GateResult } from './event-emitter.ts';
 import type { IWorkflowStore } from './store.ts';
 
 export interface HandleNodeFailureDeps {
@@ -73,6 +73,14 @@ export interface HandleNodeFailureContext {
   threadCommitsAhead?: number;
   /** Optional: whether the unique remote branch exists at origin (classifier discriminator). */
   hasOriginBranch?: boolean;
+  /**
+   * Layer 1 (WO-HARNESS-LAYER1-CLIMB-AND-GATE-EVENTS-01): structured pass/fail
+   * for the gate this node ran. When provided, persists as `gate_result` on
+   * the node_failed event payload AND mirrors as `gateResult` on the emitter
+   * event. Omit-when-absent -- if the caller does not pass this, no
+   * `gate_result` / `gateResult` field is added.
+   */
+  gateResult?: GateResult;
 }
 
 export interface HandleNodeFailureResult {
@@ -147,6 +155,10 @@ export async function handleNodeFailure(
         overseer_class: errorClass,
         overseer_decision: result.decision,
         ...(ctx.extraEventData ?? {}),
+        // Layer 1 gate-result (WO-HARNESS-LAYER1-CLIMB-AND-GATE-EVENTS-01).
+        // Spread AFTER extraEventData so the typed `gateResult` wins if both
+        // are ever set (extraEventData is freeform; gateResult is the contract).
+        ...(ctx.gateResult ? { gate_result: ctx.gateResult } : {}),
       },
     })
     .catch((err: Error) => {
@@ -162,6 +174,8 @@ export async function handleNodeFailure(
     nodeId: node.id,
     nodeName: node.command ?? node.id,
     error: ctx.errorMsg,
+    // Layer 1 gate-result emitter mirror -- omit-when-absent.
+    ...(ctx.gateResult ? { gateResult: ctx.gateResult } : {}),
   });
 
   // Silent-dead-end escalation: fire 3 operator-visible signals (escalation.json

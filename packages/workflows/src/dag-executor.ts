@@ -51,7 +51,7 @@ import {
 } from './schemas';
 import { formatToolCall } from './utils/tool-formatter';
 import { createLogger } from '@archon/paths';
-import { getWorkflowEventEmitter } from './event-emitter';
+import { getWorkflowEventEmitter, type GateResult } from './event-emitter';
 import { detectSilentFailure } from './silent-failure-detector';
 import { handleNodeFailure } from './overseer-bridge';
 import { evaluateCondition } from './condition-evaluator';
@@ -786,6 +786,16 @@ async function executeNodeInternal(
   // is a non-null string.
   let nodeServedModelId: string | null | undefined;
   let nodeServedMissingReason: string | undefined;
+  // Layer 1 gate-result capture (WO-HARNESS-LAYER1-CLIMB-AND-GATE-EVENTS-01).
+  // Structured pass/fail of the gate this node ran. Schema is wired NOW
+  // (Phase 3); the cascade engine that POPULATES this lands in Phase 5
+  // (WO-HARNESS-V1-PERRUN-CASCADE-01). Until then it stays undefined and
+  // the field is omitted from event payloads (omit-when-absent pattern).
+  // Kept as `let` (with eslint silenced) so the Phase 5 patch is purely
+  // additive -- reassignment from the cascade engine is the contract, and
+  // forcing `const` here would make Phase 5 churn the declaration.
+  // eslint-disable-next-line prefer-const
+  let nodeGateResult: GateResult | undefined = undefined;
   const batchMessages: string[] = [];
 
   // Create per-node abort controller for idle timeout cleanup
@@ -1313,6 +1323,10 @@ async function executeNodeInternal(
           // the frontier rung instead of where it actually ran. Omit-when-absent for tokens.
           entry_rung: deriveEntryRung(provider, nodeOptions?.model),
           ...(nodeTokens ? { frontier_cost_usd: computeFrontierCost(nodeTokens) } : {}),
+          // Layer 1 gate-result (WO-HARNESS-LAYER1-CLIMB-AND-GATE-EVENTS-01).
+          // Structured pass/fail of the gate this node ran. Omit-when-absent
+          // -- Phase 5 populates `nodeGateResult` before this emit-site runs.
+          ...(nodeGateResult ? { gate_result: nodeGateResult } : {}),
         },
       })
       .catch((err: Error) => {
@@ -1331,6 +1345,8 @@ async function executeNodeInternal(
       ...(nodeCostUsd !== undefined ? { costUsd: nodeCostUsd } : {}),
       ...(nodeStopReason ? { stopReason: nodeStopReason } : {}),
       ...(nodeNumTurns !== undefined ? { numTurns: nodeNumTurns } : {}),
+      // Layer 1 gate-result emitter mirror -- omit-when-absent.
+      ...(nodeGateResult ? { gateResult: nodeGateResult } : {}),
     });
 
     // Clean up throttle entries on completion
@@ -1380,6 +1396,10 @@ async function executeNodeInternal(
         data: {
           error: err.message,
           ...(nodeTokens ? { tokens: nodeTokens } : {}),
+          // Layer 1 gate-result (WO-HARNESS-LAYER1-CLIMB-AND-GATE-EVENTS-01).
+          // Structured pass/fail (typically fail+reason here) of the gate this
+          // node ran. Omit-when-absent.
+          ...(nodeGateResult ? { gate_result: nodeGateResult } : {}),
         },
       })
       .catch((err: Error) => {
@@ -1395,6 +1415,8 @@ async function executeNodeInternal(
       nodeId: node.id,
       nodeName: node.command ?? node.id,
       error: err.message,
+      // Layer 1 gate-result emitter mirror -- omit-when-absent.
+      ...(nodeGateResult ? { gateResult: nodeGateResult } : {}),
     });
 
     return {
