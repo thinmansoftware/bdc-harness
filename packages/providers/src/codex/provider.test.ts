@@ -2065,6 +2065,159 @@ describe('WO-HARNESS-CODEX-THREAD-RESUME-AND-FAILBACK-01', () => {
   }, 10_000);
 });
 
+// --- WO-HARNESS-CODEX-AUTH-FAILBACK-01 regression tests ---
+//
+// Tests for the auth-class (rotation-collision) failback path added by
+// WO-HARNESS-CODEX-AUTH-FAILBACK-01. The existing #192 failback machinery
+// is unchanged; these tests assert only the new isAuthFailureError trigger.
+describe('WO-HARNESS-CODEX-AUTH-FAILBACK-01', () => {
+  // Use the anchor incident error phrases (section 2 of the WO spec).
+  // The separator between "codex_turn_failed" and the message body is
+  // SDK-specific; the pattern matching is substring-based and does not
+  // include the separator, so this ASCII representation is valid.
+  const AUTH_ROTATION_ERROR =
+    'codex_turn_failed -- Your access token could not be refreshed because your refresh token was already used.';
+
+  beforeEach(() => {
+    resetCodexSingleton();
+    MockCodex.mockClear();
+    mockStartThread.mockClear();
+    mockRunStreamed.mockClear();
+    mockRefreshIfAuthFailed.mockClear();
+    mockRefreshIfAuthFailed.mockResolvedValue({ refreshed: false, reason: 'no_creds' as const });
+    mockStartThread.mockReturnValue(createMockThread('new-thread-id'));
+    // All turn attempts throw the rotation-collision auth error
+    mockRunStreamed.mockRejectedValue(new Error(AUTH_ROTATION_ERROR));
+  });
+
+  test('isAuthFailureError: auth rotation error fires failback with disclosure', async () => {
+    // WO spec section 11.1: factory wired, auth rotation error -> [CODEX FAILBACK] + Claude
+    // result, no throw. The new isAuthFailureError branch fires BEFORE
+    // classifyAndEnrichCodexError, so mockRefreshIfAuthFailed must NOT be called.
+    const failbackSendQuery = mock(async function* () {
+      yield { type: 'assistant', content: 'Claude auth-fallback verdict' } as const;
+      yield { type: 'result', sessionId: 'cb-session', tokens: { input: 10, output: 5 } } as const;
+    });
+    const failbackProvider = {
+      sendQuery: failbackSendQuery,
+      getType: () => 'claude',
+      getCapabilities: () =>
+        ({}) as unknown as ReturnType<CodexProvider['getCapabilities']>,
+    };
+    const client = new CodexProvider({
+      retryBaseDelayMs: 1,
+      failbackProviderFactory: () => failbackProvider,
+    });
+
+    const chunks: { type: string; content?: string }[] = [];
+    for await (const chunk of client.sendQuery('review diff', '/workspace')) {
+      chunks.push(chunk as { type: string; content?: string });
+    }
+
+    expect(failbackSendQuery).toHaveBeenCalledTimes(1);
+    // Auth-refresh must NOT be called -- new branch returns before reaching the
+    // auth-refresh block at line 942 (original numbering).
+    expect(mockRefreshIfAuthFailed).not.toHaveBeenCalled();
+    const disclosure = chunks.find(
+      c => c.type === 'system' && c.content?.includes('CODEX FAILBACK')
+    );
+    expect(disclosure).toBeDefined();
+    expect(disclosure!.content).toMatch(/credential rotation/i);
+    expect(
+      chunks.some(c => c.type === 'assistant' && c.content === 'Claude auth-fallback verdict')
+    ).toBe(true);
+    expect(chunks.some(c => c.type === 'result')).toBe(true);
+  }, 10_000);
+
+  test('isAuthFailureError: non-auth generic error does NOT trigger auth failback', async () => {
+    // WO spec section 11.2: a generic crash error must NOT use the new auth-class failback
+    // path. It goes through 3 retries (MAX_SUBPROCESS_RETRIES=3), then the existing
+    // terminal failback fires and DOES call the factory via the general path.
+    // What must be absent is the NEW "credential rotation" disclosure chunk.
+    mockRunStreamed.mockRejectedValue(
+      new Error('codex exec exited with code 1: generic subprocess crash')
+    );
+    const generalFailbackSendQuery = mock(async function* () {
+      yield { type: 'assistant', content: 'general-failback-via-retry-exhaustion' } as const;
+      yield { type: 'result', sessionId: 'x', tokens: { input: 1, output: 1 } } as const;
+    });
+    const generalFailbackProvider = {
+      sendQuery: generalFailbackSendQuery,
+      getType: () => 'claude',
+      getCapabilities: () =>
+        ({}) as unknown as ReturnType<CodexProvider['getCapabilities']>,
+    };
+    const client = new CodexProvider({
+      retryBaseDelayMs: 1,
+      failbackProviderFactory: () => generalFailbackProvider,
+    });
+
+    const chunks: { type: string; content?: string }[] = [];
+    for await (const chunk of client.sendQuery('review diff', '/workspace')) {
+      chunks.push(chunk as { type: string; content?: string });
+    }
+
+    // The NEW auth-specific "credential rotation" disclosure must be absent.
+    const authDisclosure = chunks.find(
+      c => c.type === 'system' && c.content?.includes('credential rotation')
+    );
+    expect(authDisclosure).toBeUndefined();
+    // The existing general [CODEX FAILBACK] disclosure IS present (expected via general path).
+    const generalDisclosure = chunks.find(
+      c => c.type === 'system' && c.content?.includes('CODEX FAILBACK')
+    );
+    expect(generalDisclosure).toBeDefined();
+  }, 10_000);
+
+  test('isAuthFailureError: null failback factory throws original auth error', async () => {
+    // WO spec section 11.3: no factory -> auth rotation error flows to
+    // classifyAndEnrichCodexError (auth class, shouldRetry=false) -> auth-refresh block
+    // (refreshIfAuthFailed returns no_creds, not terminal) -> throw enrichedError.
+    // Must throw, not swallow.
+    const clientNoFactory = new CodexProvider({ retryBaseDelayMs: 1 });
+
+    const consume = async (): Promise<void> => {
+      for await (const _ of clientNoFactory.sendQuery('review diff', '/workspace')) {
+        // consume
+      }
+    };
+
+    await expect(consume()).rejects.toThrow();
+  }, 10_000);
+
+  test('isAuthFailureError: single-shot guard prevents double-delegation', async () => {
+    // WO spec section 11.4: authFailbackUsed prevents re-entry. The first auth-class
+    // catch fires the failback and returns. The loop does not continue after the return,
+    // so the factory is called exactly once.
+    let factoryCallCount = 0;
+    const failbackSendQuery = mock(async function* () {
+      yield { type: 'assistant', content: 'single-shot only' } as const;
+      yield { type: 'result', sessionId: 'x', tokens: { input: 1, output: 1 } } as const;
+    });
+    const failbackProvider = {
+      sendQuery: failbackSendQuery,
+      getType: () => 'claude',
+      getCapabilities: () =>
+        ({}) as unknown as ReturnType<CodexProvider['getCapabilities']>,
+    };
+    const client = new CodexProvider({
+      retryBaseDelayMs: 1,
+      failbackProviderFactory: () => {
+        factoryCallCount++;
+        return failbackProvider;
+      },
+    });
+
+    for await (const _ of client.sendQuery('review diff', '/workspace')) {
+      // consume
+    }
+
+    // Factory invoked exactly once; failback delegated once.
+    expect(factoryCallCount).toBe(1);
+    expect(failbackSendQuery).toHaveBeenCalledTimes(1);
+  }, 10_000);
+});
+
 // T3 (WO-HARNESS-LAYER1-SERVED-MODEL-CAPTURE-01): the spec asks for a Codex
 // served-model assertion, but @openai/codex-sdk@0.125.0 does NOT expose a
 // served-model field on TurnCompletedEvent, Thread, ThreadOptions, or

@@ -1,9 +1,9 @@
 # Docker Compose override for user-extended builds (development / local Docker).
-# Copy this file to docker-compose.override.yml — do NOT modify docker-compose.override.example.yml.
+# Copy this file to docker-compose.override.yml -- do NOT modify docker-compose.override.example.yml.
 # docker-compose.override.yml is gitignored so your customizations stay local.
 #
 # Docker Compose automatically merges docker-compose.override.yml with docker-compose.yml
-# when both files are present — no extra flags needed:
+# when both files are present -- no extra flags needed:
 #   docker compose up -d
 #
 # NOTE: The base docker-compose.yml uses `build: .` (Dockerfile by default). This override
@@ -19,3 +19,19 @@ services:
 # persisted by default via the archon_user_home named volume in the base compose.
 # To bind-mount a host path instead, set ARCHON_USER_HOME=/your/host/path in .env
 # (the host path must be writable by UID 1001). No override-file edit needed.
+
+# Root-HOME credential persistence for Codex (BDC-specific):
+# archon-app-1 runs as root (HOME=/root). The archon_user_home volume only
+# covers /home/appuser, so /root/.codex is wiped on rebuild unless bind-mounted.
+# This mirrors the /root/.claude bind mount pattern already on the host.
+# To enable, add the volumes stanza below to your production docker-compose.override.yml
+# (that file is gitignored on the host -- do NOT add it here):
+#
+# services:
+#   app:
+#     volumes:
+#       - ${ARCHON_USER_HOME:?set ARCHON_USER_HOME in .env}/.codex:/root/.codex
+#
+# After adding, rebuild + restart: docker compose build && docker compose up -d
+# Verify: docker exec archon-app-1 sh -c 'ls /root/.codex/auth.json'
+# Context: WO-HARNESS-CODEX-AUTH-FAILBACK-01 (2026-06-29), anchor incident 2026-06-11.
