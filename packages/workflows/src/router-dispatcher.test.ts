@@ -30,7 +30,12 @@ mock.module('@archon/paths', () => ({
 
 // --- Imports (after mocks) ---
 
-import { resolveEntryLane, pickLane, DEFAULT_ENGINE_TO_LANE, UNREACHABLE_ENGINES } from './router-dispatcher';
+import {
+  resolveEntryLane,
+  pickLane,
+  DEFAULT_ENGINE_TO_LANE,
+  UNREACHABLE_ENGINES,
+} from './router-dispatcher';
 
 // Hermetic fixture covers every scenario the suite asserts. Mirrors the
 // production router.yaml shape: tiers{} + task_classes{} + defaults{}.
