@@ -810,13 +810,19 @@ describe('loopNodeConfigSchema', () => {
 });
 
 describe('LOOP_NODE_AI_FIELDS', () => {
-  test('excludes model, provider, and agent (loop nodes support them)', () => {
+  test('excludes model, provider, agent, persona, and systemPrompt (loop nodes support them)', () => {
+    // model/provider/agent/persona: forwarded to each iteration's AI call by the executor.
+    // systemPrompt: read by buildLoopNodeOptions -- a warning would be a false positive.
     expect(LOOP_NODE_AI_FIELDS).not.toContain('model');
     expect(LOOP_NODE_AI_FIELDS).not.toContain('provider');
     expect(LOOP_NODE_AI_FIELDS).not.toContain('agent');
+    expect(LOOP_NODE_AI_FIELDS).not.toContain('persona');
+    expect(LOOP_NODE_AI_FIELDS).not.toContain('systemPrompt');
   });
 
-  test('contains all other AI-specific fields from BASH_NODE_AI_FIELDS', () => {
+  test('contains AI-specific fields that are genuinely unsupported on loop nodes', () => {
+    // These fields are not read by buildLoopNodeOptions or executeLoopNode;
+    // the loader correctly warns when they appear on a loop node.
     const expectedFields = [
       'context',
       'output_format',
@@ -828,7 +834,6 @@ describe('LOOP_NODE_AI_FIELDS', () => {
       'effort',
       'thinking',
       'maxBudgetUsd',
-      'systemPrompt',
       'fallbackModel',
       'betas',
       'sandbox',

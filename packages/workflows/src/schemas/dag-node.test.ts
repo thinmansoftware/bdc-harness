@@ -229,4 +229,27 @@ describe('loop node provider/model field preservation', () => {
       expect(resolvedProvider).toBe('codex');
     }
   });
+
+  // Scenario E -- systemPrompt on loop node: flows through transform, no false-positive warning
+  it('loop node: systemPrompt survives the transform (buildLoopNodeOptions reads it)', () => {
+    // systemPrompt is NOT in LOOP_NODE_AI_FIELDS (excluded alongside model/provider/agent/
+    // persona) because buildLoopNodeOptions reads node.systemPrompt directly. Before this
+    // fix the loader would have emitted a false-positive loop_node_ai_fields_ignored warning
+    // while the field was silently applied to every AI call.
+    const result = dagNodeSchema.safeParse({
+      id: 'review',
+      systemPrompt: 'You are a strict code reviewer.',
+      loop: {
+        prompt: 'Review the diff.',
+        until: 'LGTM',
+        max_iterations: 4,
+      },
+    });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect((result.data as { systemPrompt?: string }).systemPrompt).toBe(
+        'You are a strict code reviewer.'
+      );
+    }
+  });
 });

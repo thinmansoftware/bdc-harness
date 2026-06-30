@@ -271,10 +271,14 @@ export type ScriptNode = z.infer<typeof scriptNodeSchema> & {
 
 /**
  * Loop node schema -- extends base with `loop` config.
- * AI-specific fields (provider, model, agent, persona, etc.) are supported on loop nodes
- * and flow through to the executor for per-node provider and persona resolution.
- * Fields that the loop executor does not consume (context, output_format, etc.) pass
- * through the transform unchanged; the loader emits a warning for those fields.
+ * AI-specific fields (provider, model, agent, persona, systemPrompt) are supported on
+ * loop nodes and flow through to the executor: provider/model/agent/persona are forwarded
+ * to each iteration's AI call via resolveNodeProviderAndModel; systemPrompt is applied by
+ * buildLoopNodeOptions (dag-executor.ts).
+ * Fields that the loop executor does not consume (context, output_format, allowed_tools,
+ * denied_tools, hooks, mcp, skills, agents, effort, thinking, maxBudgetUsd, fallbackModel,
+ * betas, sandbox) pass through the transform unchanged; the loader emits a warning for
+ * those fields.
  * retry is not supported on loop nodes (enforced at parse time).
  */
 export const loopNodeSchema = dagNodeBaseSchema.extend({
@@ -384,10 +388,12 @@ export const SCRIPT_NODE_AI_FIELDS: readonly string[] = BASH_NODE_AI_FIELDS;
  * AI-specific fields that are unsupported on loop nodes.
  * `model`, `provider`, `agent`, and `persona` are excluded -- the DAG executor
  * resolves and forwards them to each iteration's AI call. `persona` is the
- * human-facing alias for `agent` (see dagNodeBaseSchema).
+ * human-facing alias for `agent` (see dagNodeBaseSchema). `systemPrompt` is excluded
+ * because buildLoopNodeOptions reads node.systemPrompt directly (dag-executor.ts); a
+ * loader warning for it would be a false positive.
  */
 export const LOOP_NODE_AI_FIELDS: readonly string[] = BASH_NODE_AI_FIELDS.filter(
-  f => f !== 'model' && f !== 'provider' && f !== 'agent' && f !== 'persona'
+  f => f !== 'model' && f !== 'provider' && f !== 'agent' && f !== 'persona' && f !== 'systemPrompt'
 );
 
 // ---------------------------------------------------------------------------
