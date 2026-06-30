@@ -50,6 +50,7 @@ import { executeWorkflow } from '@archon/workflows/executor';
 import { getLoaderErrors, parseWorkflow } from '@archon/workflows/loader';
 import { isValidCommandName } from '@archon/workflows/command-validation';
 import { BUNDLED_WORKFLOWS, BUNDLED_COMMANDS, isBinaryBuild } from '@archon/workflows/defaults';
+import { resolveWebLane } from '../adapters/web/workflow-bridge';
 import {
   RESUMABLE_WORKFLOW_STATUSES,
   TERMINAL_WORKFLOW_STATUSES,
@@ -1379,6 +1380,13 @@ export function registerApiRoutes(
     return [...nodes.values()].slice(0, 8);
   }
 
+  function workflowRunTaskClass(run: WorkflowRun): string | undefined {
+    const rawTaskClass = run.metadata.task_class ?? run.metadata.taskClass;
+    if (typeof rawTaskClass !== 'string') return undefined;
+    const taskClass = rawTaskClass.trim();
+    return taskClass.length > 0 ? taskClass : undefined;
+  }
+
   async function sanitizeWorkflowRunForPublic(run: WorkflowRun): Promise<{
     workflow_label: string;
     status: WorkflowRun['status'];
@@ -1691,15 +1699,22 @@ export function registerApiRoutes(
         return false;
       }
 
+      const resolvedWorkflowName =
+        (await resolveWebLane({
+          workflowName: run.workflow_name.trim() || undefined,
+          task_class: workflowRunTaskClass(run),
+          routerYamlPath: join(run.working_path, 'config', 'router.yaml'),
+        })) ?? run.workflow_name;
+
       const discovery = await discoverWorkflowsWithConfig(run.working_path, loadConfig);
       const workflow = discovery.workflows.find(
-        item => item.workflow.name === run.workflow_name
+        item => item.workflow.name === resolvedWorkflowName
       )?.workflow;
       if (!workflow) {
         getLog().warn(
           {
             runId: run.id,
-            workflowName: run.workflow_name,
+            workflowName: resolvedWorkflowName,
             workingPath: run.working_path,
             loaderErrors: discovery.errors,
           },
@@ -1730,7 +1745,7 @@ export function registerApiRoutes(
               category: 'workflow_result',
               segment: 'new',
               workflowResult: {
-                workflowName: run.workflow_name,
+                workflowName: resolvedWorkflowName,
                 runId: run.id,
               },
             });
@@ -1744,7 +1759,7 @@ export function registerApiRoutes(
           unsubscribeBridge();
         });
       getLog().info(
-        { runId: run.id, workflowName: run.workflow_name, platformConvId, workerPlatformConvId },
+        { runId: run.id, workflowName: resolvedWorkflowName, platformConvId, workerPlatformConvId },
         events.executorStarted
       );
       return true;

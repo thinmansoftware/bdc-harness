@@ -221,12 +221,42 @@ describe('pickLane -- Layer 2 dispatcher precedence', () => {
     expect(lane).toBe('bdc-feature-development');
   });
 
-  it('Scenario C -- unresolvable task_class falls back to explicit name', async () => {
+  it('Scenario C -- explicit workflowName short-circuits before resolveEntryLane, even for unknown task_class', async () => {
+    // workflowName check happens at line 281 of router-dispatcher.ts BEFORE
+    // resolveEntryLane is called. The unknown task_class is never consulted.
+    // If invoked WITHOUT workflowName, unknown-class-xyz would resolve to the
+    // fallback_tier lane (bdc-feature-development-glm), NOT undefined.
     const lane = await pickLane({
       taskClass: 'unknown-class-xyz',
       workflowName: 'bdc-feature-development',
       ...FIXTURE_OPTS,
     });
     expect(lane).toBe('bdc-feature-development');
+  });
+
+  it('Scenario D -- null-lane taskClass (Tier 0 deterministic-script) returns undefined', async () => {
+    // deterministic-script maps to null in DEFAULT_ENGINE_TO_LANE.
+    // pickLane must return undefined when laneName is null and no workflowName
+    // was given -- this is the branch at router-dispatcher.ts:290-294.
+    const yamlWithTier0Class = FIXTURE_YAML.replace(
+      'task_classes:\n',
+      'task_classes:\n  notion-flip:\n    starting_tier: "0"\n'
+    );
+    const lane = await pickLane({
+      taskClass: 'notion-flip',
+      routerYamlPath: '/fixture/router.yaml',
+      routerYamlContent: yamlWithTier0Class,
+    });
+    expect(lane).toBeUndefined();
+  });
+
+  it('Scenario E -- fable-session engine (Tier 4, null lane) returns undefined', async () => {
+    // spec-authoring starts at Tier 4 whose engines are fable-session and opus-api,
+    // both mapped to null in DEFAULT_ENGINE_TO_LANE. No workflowName provided.
+    const lane = await pickLane({
+      taskClass: 'spec-authoring',
+      ...FIXTURE_OPTS,
+    });
+    expect(lane).toBeUndefined();
   });
 });
