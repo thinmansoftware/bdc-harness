@@ -54,6 +54,7 @@ import { createLogger } from '@archon/paths';
 import { getWorkflowEventEmitter } from './event-emitter';
 import { detectSilentFailure } from './silent-failure-detector';
 import { handleNodeFailure } from './overseer-bridge';
+import { decide, runEscalation } from '@archon/overseer';
 import { evaluateCondition } from './condition-evaluator';
 import {
   logNodeStart,
@@ -388,6 +389,81 @@ export function substituteNodeOutputRefs(
 
 // buildSDKHooksFromYAML moved to @archon/providers/src/claude/provider.ts
 // loadMcpConfig moved to @archon/providers/src/claude/provider.ts
+
+/**
+ * Node IDs whose text output indicates a blocked build outcome.
+ *
+ * - `build-manifest` is the AI prompt node that emits the manifest. The agent
+ *   prompt instructs it to surface `OUTCOME: BLOCKED` / `OUTCOME=BLOCKED` and
+ *   `VALIDATION: BLOCKED` when the build cannot be shipped. Some BDC YAMLs
+ *   route `BUILD_OUTCOME=FALSE_COMPLETE` through this node's output as well.
+ * - `assert-implement-produced-work` is the bash node that originates
+ *   `BUILD_OUTCOME=FALSE_COMPLETE` -- check it directly so we do not depend on
+ *   it being re-echoed by build-manifest.
+ *
+ * Anchor: WO-HARNESS-HONEST-STATUS-AND-ESCALATE-ON-BLOCKED-01.
+ */
+const BLOCKED_MANIFEST_NODE_ID = 'build-manifest';
+const BLOCKED_ASSERT_NODE_ID = 'assert-implement-produced-work';
+
+/**
+ * Scan node outputs for a blocked build verdict.
+ *
+ * A workflow whose AI nodes all finished without throwing still has
+ * `state === 'completed'`. That is correct at the node level (the node ran),
+ * but the BUILD itself can still be blocked: the build-manifest agent is
+ * required to surface that verdict in its text output, and the
+ * `assert-implement-produced-work` bash node emits an explicit
+ * `BUILD_OUTCOME=FALSE_COMPLETE` marker when the implement loop produced no
+ * shippable work. Without this helper the executor takes the success branch
+ * on those runs and silently calls `completeWorkflowRun`.
+ *
+ * Returns `{ blocked: true, verdict: <short excerpt naming the offending
+ * marker and the originating node id> }` when any of the three accepted
+ * strings is observed. All matches are case-sensitive per WO spec Rule 7
+ * (ASCII-only) and Section 2 (the prompts emit literal strings).
+ *
+ * The `OUTCOME[=:]` regex covers both forms found in the YAML prompts
+ * (`OUTCOME: BLOCKED` per spec Section 2 and `OUTCOME=BLOCKED` per the
+ * existing build-manifest prompt at
+ * `.archon/workflows/defaults/bdc-feature-development.yaml`).
+ */
+export function detectBlockedManifestVerdict(nodeOutputs: Map<string, NodeOutput>): {
+  blocked: boolean;
+  verdict: string;
+} {
+  const manifestEntry = nodeOutputs.get(BLOCKED_MANIFEST_NODE_ID);
+  if (manifestEntry?.state === 'completed') {
+    const text = manifestEntry.output ?? '';
+    if (/OUTCOME[=:]\s*BLOCKED/.test(text)) {
+      return { blocked: true, verdict: 'OUTCOME: BLOCKED in build-manifest output' };
+    }
+    if (text.includes('VALIDATION: BLOCKED')) {
+      return { blocked: true, verdict: 'VALIDATION: BLOCKED in build-manifest output' };
+    }
+    if (text.includes('BUILD_OUTCOME=FALSE_COMPLETE')) {
+      return {
+        blocked: true,
+        verdict: 'BUILD_OUTCOME=FALSE_COMPLETE in build-manifest output',
+      };
+    }
+  }
+  // Belt-and-suspenders: also inspect the assert bash node directly, since
+  // BUILD_OUTCOME=FALSE_COMPLETE originates there (not in build-manifest AI
+  // output). If a YAML rewires the order so build-manifest does not re-echo
+  // the marker, this still catches the blocked outcome.
+  const assertEntry = nodeOutputs.get(BLOCKED_ASSERT_NODE_ID);
+  if (assertEntry?.state === 'completed') {
+    const text = assertEntry.output ?? '';
+    if (text.includes('BUILD_OUTCOME=FALSE_COMPLETE')) {
+      return {
+        blocked: true,
+        verdict: 'BUILD_OUTCOME=FALSE_COMPLETE in assert-implement-produced-work output',
+      };
+    }
+  }
+  return { blocked: false, verdict: '' };
+}
 
 /**
  * Resolve per-node provider and model.
@@ -3575,6 +3651,74 @@ export async function executeDagWorkflow(
       error: failMsg,
     });
     emitterForFail.unregisterRun(workflowRun.id);
+    await safeSendMessage(platform, conversationId, `\u274c ${failMsg}`, {
+      workflowId: workflowRun.id,
+    });
+    // DO NOT throw -- outer executor.ts catch would duplicate workflow_failed events
+    return;
+  }
+
+  // --- Blocked-manifest verdict check (WO-HARNESS-HONEST-STATUS-AND-ESCALATE-ON-BLOCKED-01) ---
+  // build-manifest (AI prompt) and assert-implement-produced-work (bash) nodes have
+  // state=completed even when the build itself was blocked -- they ran without throwing.
+  // Without this check, anyFailed is false and the executor calls completeWorkflowRun
+  // falsely. We re-inspect their text output, then route the verdict through the same
+  // decide() + runEscalation() path that node-throw failures use so escalation.json,
+  // the builder-monitor webhook, and the Notion comment all fire with the unresolved
+  // findings.
+  const blockedVerdict = detectBlockedManifestVerdict(nodeOutputs);
+  if (blockedVerdict.blocked) {
+    if (await skipIfStatusChanged('dag.skip_blocked_status_changed')) return;
+    // woId is extracted in executeBashNode (line ~1639) but that scope does not
+    // reach this completion block (different function). Re-extract from the
+    // run's user_message so the escalation payload can resolve the Notion page.
+    const woIdMatch = workflowRun.user_message
+      ? /\bWO-[A-Z0-9-]+/.exec(workflowRun.user_message)
+      : null;
+    const woIdForEscalation = woIdMatch ? woIdMatch[0] : undefined;
+    const failMsg =
+      `DAG workflow '${workflow.name}' build-manifest emitted a blocked verdict ` +
+      `(${blockedVerdict.verdict}). Run marked failed; operator must triage.`;
+    await deps.store.failWorkflowRun(workflowRun.id, failMsg).catch((dbErr: Error) => {
+      getLog().error({ err: dbErr, workflowRunId: workflowRun.id }, 'dag_db_fail_failed');
+    });
+    await logWorkflowError(logDir, workflowRun.id, failMsg).catch((logErr: Error) => {
+      getLog().error(
+        { err: logErr, workflowRunId: workflowRun.id },
+        'dag.workflow_error_log_write_failed'
+      );
+    });
+    const blockedEmitter = getWorkflowEventEmitter();
+    blockedEmitter.emit({
+      type: 'workflow_failed',
+      runId: workflowRun.id,
+      workflowName: workflow.name,
+      error: failMsg,
+    });
+    blockedEmitter.unregisterRun(workflowRun.id);
+    // Route through decide() + runEscalation() exactly as the node-failure path does.
+    // Surface the offending node's text output as validatorOutput so decide()'s
+    // remediation extractor can pull any bullet list the manifest emitted.
+    const blockedNodeOutput =
+      nodeOutputs.get(BLOCKED_MANIFEST_NODE_ID)?.output ??
+      nodeOutputs.get(BLOCKED_ASSERT_NODE_ID)?.output ??
+      blockedVerdict.verdict;
+    const escalationDecision = decide({
+      errorClass: 'validator_rejected',
+      attempt: 1,
+      nodeId: BLOCKED_MANIFEST_NODE_ID,
+      validatorOutput: blockedNodeOutput,
+      woId: woIdForEscalation,
+    });
+    if (escalationDecision.escalationContext) {
+      await runEscalation(
+        workflowRun.id,
+        escalationDecision,
+        escalationDecision.escalationContext
+      ).catch((err: Error) => {
+        getLog().error({ err, workflowRunId: workflowRun.id }, 'overseer.escalation_failed');
+      });
+    }
     await safeSendMessage(platform, conversationId, `\u274c ${failMsg}`, {
       workflowId: workflowRun.id,
     });
