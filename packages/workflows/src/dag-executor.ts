@@ -423,11 +423,29 @@ const BLOCKED_ASSERT_NODE_ID = 'assert-implement-produced-work';
  * strings is observed. All matches are case-sensitive per WO spec Rule 7
  * (ASCII-only) and Section 2 (the prompts emit literal strings).
  *
+ * Anchoring (Codex repair, 2026-06-30): the markers must appear as their own
+ * verdict lines, not embedded in arbitrary evidence. The build-manifest agent
+ * emits them as standalone lines (per the YAML prompts at
+ * `.archon/workflows/defaults/bdc-feature-development.yaml`), and the bash
+ * assert node `echo`s `BUILD_OUTCOME=FALSE_COMPLETE` on its own line. Using
+ * `text.includes(...)` previously matched the strings anywhere -- including
+ * inside grep/test evidence or quoted code snippets in a happy-path manifest
+ * -- which caused false escalations. The matchers are now anchored to a line
+ * boundary (`^` with the multiline flag, allowing optional leading
+ * whitespace) so only verdict lines trip them.
+ *
  * The `OUTCOME[=:]` regex covers both forms found in the YAML prompts
  * (`OUTCOME: BLOCKED` per spec Section 2 and `OUTCOME=BLOCKED` per the
- * existing build-manifest prompt at
- * `.archon/workflows/defaults/bdc-feature-development.yaml`).
+ * existing build-manifest prompt). The optional `BUILD_` prefix on OUTCOME
+ * also matches the `BUILD_OUTCOME=BLOCKED` form some manifests use.
  */
+// Markers must appear at the start of a line (optionally indented) to count
+// as verdicts. `m` flag lets `^` match after every newline. Word boundary
+// (`\b`) on the trailing token prevents partial matches like `BLOCKEDISH`.
+const BLOCKED_OUTCOME_LINE = /^\s*(?:BUILD_)?OUTCOME[=:]\s*BLOCKED\b/m;
+const BLOCKED_VALIDATION_LINE = /^\s*VALIDATION[=:]\s*BLOCKED\b/m;
+const FALSE_COMPLETE_LINE = /^\s*BUILD_OUTCOME=FALSE_COMPLETE\b/m;
+
 export function detectBlockedManifestVerdict(nodeOutputs: Map<string, NodeOutput>): {
   blocked: boolean;
   verdict: string;
@@ -435,13 +453,13 @@ export function detectBlockedManifestVerdict(nodeOutputs: Map<string, NodeOutput
   const manifestEntry = nodeOutputs.get(BLOCKED_MANIFEST_NODE_ID);
   if (manifestEntry?.state === 'completed') {
     const text = manifestEntry.output ?? '';
-    if (/OUTCOME[=:]\s*BLOCKED/.test(text)) {
+    if (BLOCKED_OUTCOME_LINE.test(text)) {
       return { blocked: true, verdict: 'OUTCOME: BLOCKED in build-manifest output' };
     }
-    if (text.includes('VALIDATION: BLOCKED')) {
+    if (BLOCKED_VALIDATION_LINE.test(text)) {
       return { blocked: true, verdict: 'VALIDATION: BLOCKED in build-manifest output' };
     }
-    if (text.includes('BUILD_OUTCOME=FALSE_COMPLETE')) {
+    if (FALSE_COMPLETE_LINE.test(text)) {
       return {
         blocked: true,
         verdict: 'BUILD_OUTCOME=FALSE_COMPLETE in build-manifest output',
@@ -455,7 +473,7 @@ export function detectBlockedManifestVerdict(nodeOutputs: Map<string, NodeOutput
   const assertEntry = nodeOutputs.get(BLOCKED_ASSERT_NODE_ID);
   if (assertEntry?.state === 'completed') {
     const text = assertEntry.output ?? '';
-    if (text.includes('BUILD_OUTCOME=FALSE_COMPLETE')) {
+    if (FALSE_COMPLETE_LINE.test(text)) {
       return {
         blocked: true,
         verdict: 'BUILD_OUTCOME=FALSE_COMPLETE in assert-implement-produced-work output',

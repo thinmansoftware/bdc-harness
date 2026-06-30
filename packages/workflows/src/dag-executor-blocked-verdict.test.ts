@@ -296,6 +296,129 @@ describe('detectBlockedManifestVerdict (unit)', () => {
     const result = detectBlockedManifestVerdict(outputs);
     expect(result.blocked).toBe(false);
   });
+
+  // --- Anti-false-positive anchoring (Codex repair, 2026-06-30) -------------
+  //
+  // The pre-anchor implementation used `text.includes('BUILD_OUTCOME=FALSE_COMPLETE')`
+  // which matched the marker anywhere in the manifest -- including grep output,
+  // quoted code snippets, and evidence sections of an otherwise PASS manifest.
+  // After anchoring with `^...\b` (multiline), only standalone verdict lines
+  // trip the detector. These tests pin that behavior so a future refactor
+  // cannot silently re-introduce the regression.
+
+  it('regression: BUILD_OUTCOME=FALSE_COMPLETE inside grep evidence does NOT match', () => {
+    // Simulates a happy-path manifest that includes grep output proving the
+    // marker exists in the source code (this very WO's manifest does exactly
+    // this). The verdict line is VALIDATION: PASS; the FALSE_COMPLETE token
+    // only appears as quoted code evidence -- it must NOT count as a verdict.
+    const outputs = new Map<string, NodeOutput>([
+      [
+        'build-manifest',
+        {
+          state: 'completed',
+          output:
+            'Files created: none\n' +
+            'Files modified: packages/workflows/src/dag-executor.ts\n' +
+            'Tests: 9/9 passing\n' +
+            'Evidence (grep):\n' +
+            "  packages/workflows/src/dag-executor.ts:444:    if (text.includes('BUILD_OUTCOME=FALSE_COMPLETE')) {\n" +
+            "  packages/workflows/src/dag-executor.ts:458:    if (text.includes('BUILD_OUTCOME=FALSE_COMPLETE')) {\n" +
+            'VALIDATION: PASS',
+        },
+      ],
+    ]);
+    const result = detectBlockedManifestVerdict(outputs);
+    expect(result.blocked).toBe(false);
+    expect(result.verdict).toBe('');
+  });
+
+  it('regression: OUTCOME: BLOCKED quoted inside narrative prose does NOT match', () => {
+    // A successful manifest that describes the blocked path in prose (e.g.,
+    // documenting what the verdict line would look like) -- the marker is
+    // mid-line, inside backticks, not at line start.
+    const outputs = new Map<string, NodeOutput>([
+      [
+        'build-manifest',
+        {
+          state: 'completed',
+          output:
+            'Files modified: dag-executor.ts\n' +
+            'Notes: the helper emits `OUTCOME: BLOCKED` when the verdict trips; here it did not.\n' +
+            'VALIDATION: PASS',
+        },
+      ],
+    ]);
+    const result = detectBlockedManifestVerdict(outputs);
+    expect(result.blocked).toBe(false);
+    expect(result.verdict).toBe('');
+  });
+
+  it('regression: VALIDATION: BLOCKED quoted inside narrative prose does NOT match', () => {
+    const outputs = new Map<string, NodeOutput>([
+      [
+        'build-manifest',
+        {
+          state: 'completed',
+          output:
+            'Files modified: dag-executor.ts\n' +
+            'Notes: when blocked the agent writes `VALIDATION: BLOCKED` on its own line; not the case here.\n' +
+            'VALIDATION: PASS',
+        },
+      ],
+    ]);
+    const result = detectBlockedManifestVerdict(outputs);
+    expect(result.blocked).toBe(false);
+    expect(result.verdict).toBe('');
+  });
+
+  it('regression: assert node grep snippet without standalone verdict does NOT match', () => {
+    // Same anchoring guard applied to the assert-implement-produced-work node.
+    // A successful bash invocation that happens to echo the literal marker
+    // string as part of a sed/grep filter line, but not as its own verdict.
+    const outputs = new Map<string, NodeOutput>([
+      [
+        'assert-implement-produced-work',
+        {
+          state: 'completed',
+          output:
+            'CHANGED=2 AHEAD=1\n' +
+            "  echo 'matched literal BUILD_OUTCOME=FALSE_COMPLETE token inside a quoted shell example'\n" +
+            'BUILD_OUTCOME=REAL_BUILD',
+        },
+      ],
+    ]);
+    const result = detectBlockedManifestVerdict(outputs);
+    expect(result.blocked).toBe(false);
+    expect(result.verdict).toBe('');
+  });
+
+  it('anchored: OUTCOME=BLOCKED with leading whitespace still matches (verdict line indented)', () => {
+    // YAML heredocs sometimes leave indentation on emitted lines. The
+    // detector should still treat an indented verdict line as a verdict.
+    const outputs = new Map<string, NodeOutput>([
+      [
+        'build-manifest',
+        {
+          state: 'completed',
+          output: 'Manifest header.\n  OUTCOME=BLOCKED\n  VALIDATION: BLOCKED\n',
+        },
+      ],
+    ]);
+    const result = detectBlockedManifestVerdict(outputs);
+    expect(result.blocked).toBe(true);
+    expect(result.verdict).toContain('BLOCKED');
+  });
+
+  it('anchored: BUILD_OUTCOME=BLOCKED prefix form still matches as a verdict line', () => {
+    // The build-manifest prompt emits the `BUILD_OUTCOME=` prefix in addition
+    // to bare `OUTCOME=`. Make sure the anchored matcher accepts that form.
+    const outputs = new Map<string, NodeOutput>([
+      ['build-manifest', { state: 'completed', output: 'Summary.\nBUILD_OUTCOME=BLOCKED\n' }],
+    ]);
+    const result = detectBlockedManifestVerdict(outputs);
+    expect(result.blocked).toBe(true);
+    expect(result.verdict).toContain('BLOCKED');
+  });
 });
 
 // --- Integration tests through executeDagWorkflow ---------------------------
