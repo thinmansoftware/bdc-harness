@@ -107,6 +107,12 @@ export function mapWorkflowEvent(event: WorkflowEmitterEvent): string | null {
         error: event.type === 'node_failed' ? event.error : undefined,
         reason: event.type === 'node_skipped' ? event.reason : undefined,
         costUsd: event.type === 'node_completed' ? event.costUsd : undefined,
+        // Layer 1 gate_result forward (WO-HARNESS-LAYER1-CLIMB-AND-GATE-EVENTS-01).
+        // Undefined for node_started/node_skipped; JSON.stringify omits undefined keys.
+        gateResult:
+          event.type === 'node_completed' || event.type === 'node_failed'
+            ? event.gate_result
+            : undefined,
         timestamp: Date.now(),
       });
 

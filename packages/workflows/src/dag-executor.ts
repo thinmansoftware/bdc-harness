@@ -1422,6 +1422,13 @@ async function executeNodeInternal(
     lastNodeCancelCheck.delete(`${workflowRun.id}:${node.id}`);
     lastNodeActivityUpdate.delete(`${workflowRun.id}:${node.id}`);
 
+    // Consume and clear any pending gate result for this node. The success path
+    // consumes this inside the try block; the exception path must clear it here
+    // to avoid stale map entries and to include the gate outcome on node_failed.
+    const catchGateResultKey = `${workflowRun.id}:${node.id}`;
+    const catchNodeGateResult = pendingGateResults.get(catchGateResultKey);
+    pendingGateResults.delete(catchGateResultKey);
+
     // If the abort was triggered by user cancel (not idle timeout), classify as cancel
     if (nodeAbortController.signal.aborted && !nodeIdleTimedOut) {
       getLog().info({ nodeId: node.id }, 'dag_node_cancelled_via_abort');
@@ -1450,6 +1457,9 @@ async function executeNodeInternal(
         data: {
           error: err.message,
           ...(nodeTokens ? { tokens: nodeTokens } : {}),
+          // Layer 1 gate_result field: present when Phase 5 registered a gate
+          // outcome before the SDK threw (e.g. gate check fired then SDK errored).
+          ...buildGateResultField(catchNodeGateResult),
         },
       })
       .catch((err: Error) => {
@@ -1465,6 +1475,7 @@ async function executeNodeInternal(
       nodeId: node.id,
       nodeName: node.command ?? node.id,
       error: err.message,
+      ...buildGateResultField(catchNodeGateResult),
     });
 
     return {
@@ -1649,12 +1660,23 @@ async function executeBashNode(
     getLog().info({ nodeId: node.id, durationMs: duration }, 'dag_node_completed');
     await logNodeComplete(logDir, workflowRun.id, node.id, '<bash>', { durationMs: duration });
 
+    // Consume any gate result registered for this bash node (Phase 5 cascade engine
+    // calls recordGateResult before node completion). Always clear the map entry.
+    const bashGateResultKey = `${workflowRun.id}:${node.id}`;
+    const bashNodeGateResult = pendingGateResults.get(bashGateResultKey);
+    pendingGateResults.delete(bashGateResultKey);
+
     deps.store
       .createWorkflowEvent({
         workflow_run_id: workflowRun.id,
         event_type: 'node_completed',
         step_name: node.id,
-        data: { duration_ms: duration, type: 'bash', node_output: output },
+        data: {
+          duration_ms: duration,
+          type: 'bash',
+          node_output: output,
+          ...buildGateResultField(bashNodeGateResult),
+        },
       })
       .catch((err: Error) => {
         getLog().error(
@@ -1669,6 +1691,7 @@ async function executeBashNode(
       nodeId: node.id,
       nodeName: node.id,
       duration,
+      ...buildGateResultField(bashNodeGateResult),
     });
 
     return { state: 'completed', output };
@@ -1974,12 +1997,23 @@ async function executeScriptNode(
     getLog().info({ nodeId: node.id, durationMs: duration }, 'dag_node_completed');
     await logNodeComplete(logDir, workflowRun.id, node.id, '<script>', { durationMs: duration });
 
+    // Consume any gate result registered for this script node (Phase 5 cascade engine
+    // calls recordGateResult before node completion). Always clear the map entry.
+    const scriptGateResultKey = `${workflowRun.id}:${node.id}`;
+    const scriptNodeGateResult = pendingGateResults.get(scriptGateResultKey);
+    pendingGateResults.delete(scriptGateResultKey);
+
     deps.store
       .createWorkflowEvent({
         workflow_run_id: workflowRun.id,
         event_type: 'node_completed',
         step_name: node.id,
-        data: { duration_ms: duration, type: 'script', node_output: output },
+        data: {
+          duration_ms: duration,
+          type: 'script',
+          node_output: output,
+          ...buildGateResultField(scriptNodeGateResult),
+        },
       })
       .catch((err: Error) => {
         getLog().error(
@@ -1994,6 +2028,7 @@ async function executeScriptNode(
       nodeId: node.id,
       nodeName: node.id,
       duration,
+      ...buildGateResultField(scriptNodeGateResult),
     });
 
     return { state: 'completed', output };
