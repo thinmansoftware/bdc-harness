@@ -84,6 +84,7 @@ import { loadAgentRegistry, resolveAgent } from './agents/registry';
 import type { AgentRegistry } from './agents/registry';
 import { loadContext } from '@archon/persona-context-loader';
 import { deriveEntryRung, computeFrontierCost } from './model-rates';
+import type { GateResult } from './gate-result';
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
 let cachedLog: ReturnType<typeof createLogger> | undefined;
@@ -113,6 +114,31 @@ export function clearAgentRegistryCache(): void {
 const MCP_FAILURE_PREFIX = 'MCP server connection failed: ';
 const CODEX_FAILBACK_PREFIX = '[CODEX FAILBACK]';
 const WARNING_PREFIX = '[WARNING]';
+
+// ---------------------------------------------------------------------------
+// Gate-result machinery
+// ---------------------------------------------------------------------------
+// pendingGateResults is keyed by "runId:nodeId" so concurrent workflows in the
+// same process never collide. recordGateResult is called immediately before
+// handleNodeFailure; buildGateResultField consumes and removes the entry so
+// a second read returns undefined (one-time read pattern).
+
+const pendingGateResults = new Map<string, GateResult>();
+
+function recordGateResult(key: string, result: GateResult): void {
+  pendingGateResults.set(key, result);
+}
+
+function buildGateResultField(key: string): GateResult | undefined {
+  const r = pendingGateResults.get(key);
+  pendingGateResults.delete(key);
+  return r;
+}
+
+/** Exported for test cleanup only -- clears all pending gate results. */
+export function clearPendingGateResults(): void {
+  pendingGateResults.clear();
+}
 
 /** A failed MCP server entry parsed from the SDK message. `segment` is the
  *  original substring (e.g. `"telegram (disconnected)"`) so callers can
@@ -724,11 +750,18 @@ async function executeNodeInternal(
     if (!promptResult.success) {
       const errMsg = promptResult.message;
       getLog().error({ nodeId: node.id, error: errMsg }, 'dag_node_command_load_failed');
+      const gateKey = `${workflowRun.id}:${node.id}`;
+      recordGateResult(gateKey, { passed: false, nodeType: 'ai' });
       const failResult = await handleNodeFailure(
         { store: deps.store, emitter, log: getLog(), logNodeError },
         workflowRun,
         node,
-        { errorMsg: errMsg, logDir, outputSoFar: '' }
+        {
+          errorMsg: errMsg,
+          logDir,
+          outputSoFar: '',
+          extraEventData: { gate_result: buildGateResultField(gateKey) },
+        }
       );
       return failResult.output;
     }
@@ -1185,6 +1218,8 @@ async function executeNodeInternal(
       );
 
       const cancelMsg = 'Cancelled by user';
+      const gateKey = `${workflowRun.id}:${node.id}`;
+      recordGateResult(gateKey, { passed: false, nodeType: 'ai' });
       const failResult = await handleNodeFailure(
         { store: deps.store, emitter, log: getLog(), logNodeError },
         workflowRun,
@@ -1194,7 +1229,7 @@ async function executeNodeInternal(
           logDir,
           outputSoFar: nodeOutputText,
           hasOutput: nodeOutputText.length > 0,
-          extraEventData: { duration_ms: duration },
+          extraEventData: { duration_ms: duration, gate_result: buildGateResultField(gateKey) },
         }
       );
 
@@ -1220,6 +1255,8 @@ async function executeNodeInternal(
       const duration = Date.now() - nodeStartTime;
       getLog().warn({ nodeId: node.id, durationMs: duration }, 'dag.node_credit_exhausted');
 
+      const gateKey = `${workflowRun.id}:${node.id}`;
+      recordGateResult(gateKey, { passed: false, nodeType: 'ai' });
       const failResult = await handleNodeFailure(
         { store: deps.store, emitter, log: getLog(), logNodeError },
         workflowRun,
@@ -1229,7 +1266,7 @@ async function executeNodeInternal(
           logDir,
           outputSoFar: nodeOutputText,
           hasOutput: nodeOutputText.length > 0,
-          extraEventData: { duration_ms: duration },
+          extraEventData: { duration_ms: duration, gate_result: buildGateResultField(gateKey) },
         }
       );
 
@@ -1253,6 +1290,8 @@ async function executeNodeInternal(
       const emptyError = `Node '${node.id}' produced no assistant output. The provider stream closed without yielding content -- likely a silent provider rejection or stream interruption.`;
       getLog().error({ nodeId: node.id, durationMs: duration }, 'dag.node_empty_output');
 
+      const gateKey = `${workflowRun.id}:${node.id}`;
+      recordGateResult(gateKey, { passed: false, nodeType: 'ai' });
       const failResult = await handleNodeFailure(
         { store: deps.store, emitter, log: getLog(), logNodeError },
         workflowRun,
@@ -1262,7 +1301,7 @@ async function executeNodeInternal(
           logDir,
           outputSoFar: '',
           hasOutput: false,
-          extraEventData: { duration_ms: duration },
+          extraEventData: { duration_ms: duration, gate_result: buildGateResultField(gateKey) },
         }
       );
 
@@ -1639,6 +1678,9 @@ async function executeBashNode(
     const woId = woIdMatch ? woIdMatch[0] : undefined;
     const exitCode = typeof err.code === 'number' ? err.code : undefined;
 
+    const gateKey = `${workflowRun.id}:${node.id}`;
+    recordGateResult(gateKey, { passed: false, nodeType: 'bash', exitCode, isTimeout });
+
     const failResult = await handleNodeFailure(
       { store: deps.store, emitter, log: getLog(), logNodeError },
       workflowRun,
@@ -1652,7 +1694,7 @@ async function executeBashNode(
         exitCode,
         validatorOutput,
         woId,
-        extraEventData: { type: 'bash', isTimeout },
+        extraEventData: { type: 'bash', isTimeout, gate_result: buildGateResultField(gateKey) },
       }
     );
 
@@ -1950,31 +1992,40 @@ async function executeScriptNode(
       { ...formatted.logFields, nodeId: node.id, nodeType: 'script', isTimeout },
       'dag_node_failed'
     );
-    await logNodeError(logDir, workflowRun.id, node.id, errorMsg);
 
-    deps.store
-      .createWorkflowEvent({
-        workflow_run_id: workflowRun.id,
-        event_type: 'node_failed',
-        step_name: node.id,
-        data: { error: errorMsg, type: 'script' },
-      })
-      .catch((dbErr: Error) => {
-        getLog().error(
-          { err: dbErr, workflowRunId: workflowRun.id, eventType: 'node_failed' },
-          'workflow_event_persist_failed'
-        );
-      });
+    // Route through overseer-bridge (parallel to bash failure site) so script-node
+    // failures get classified and gate_result is threaded into the emitted and
+    // persisted node_failed event.
+    // Pre-WO-HARNESS-LAYER1-GATE-RESULT-ALL-FAILURE-SITES-01 this catch block
+    // inlined logNodeError + createWorkflowEvent + emitter.emit and omitted gate_result.
+    const scriptValidatorOutput = nodeOutputs.get('war-council-validator')?.output ?? undefined;
+    const scriptWoIdMatch = workflowRun.user_message
+      ? /\bWO-[A-Z0-9-]+/.exec(workflowRun.user_message)
+      : null;
+    const scriptWoId = scriptWoIdMatch ? scriptWoIdMatch[0] : undefined;
+    const exitCode = typeof err.code === 'number' ? err.code : undefined;
 
-    emitter.emit({
-      type: 'node_failed',
-      runId: workflowRun.id,
-      nodeId: node.id,
-      nodeName: node.id,
-      error: errorMsg,
-    });
+    const gateKey = `${workflowRun.id}:${node.id}`;
+    recordGateResult(gateKey, { passed: false, nodeType: 'script', exitCode, isTimeout });
 
-    return { state: 'failed', output: '', error: errorMsg };
+    const failResult = await handleNodeFailure(
+      { store: deps.store, emitter, log: getLog(), logNodeError },
+      workflowRun,
+      node,
+      {
+        errorMsg,
+        logDir,
+        outputSoFar: '',
+        hasOutput: false,
+        nodeType: 'script',
+        exitCode,
+        validatorOutput: scriptValidatorOutput,
+        woId: scriptWoId,
+        extraEventData: { type: 'script', isTimeout, gate_result: buildGateResultField(gateKey) },
+      }
+    );
+
+    return failResult.output;
   }
 }
 

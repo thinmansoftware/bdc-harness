@@ -11,6 +11,7 @@
  */
 import { EventEmitter } from 'events';
 import type { ArtifactType } from './schemas';
+import type { GateResult } from './gate-result';
 import { createLogger } from '@archon/paths';
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
@@ -103,6 +104,8 @@ interface NodeFailedEvent {
   nodeId: string;
   nodeName: string;
   error: string;
+  /** Structured gate evaluation outcome -- present when the node had a gate result recorded. */
+  gate_result?: GateResult;
 }
 
 /**

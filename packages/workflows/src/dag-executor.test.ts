@@ -40,6 +40,7 @@ import {
   substituteNodeOutputRefs,
   executeDagWorkflow,
   clearAgentRegistryCache,
+  clearPendingGateResults,
 } from './dag-executor';
 import { loadMcpConfig } from '@archon/providers/claude/provider';
 import type { DagNode, BashNode, ScriptNode, NodeOutput, WorkflowRun } from './schemas';
@@ -47,6 +48,8 @@ import { discoverWorkflows } from './workflow-discovery';
 import { parseWorkflow } from './loader';
 import type { WorkflowDeps, IWorkflowPlatform, WorkflowConfig } from './deps';
 import type { IWorkflowStore } from './store';
+import { getWorkflowEventEmitter } from './event-emitter';
+import type { GateResult } from './gate-result';
 
 // --- Mock helpers ---
 
@@ -8770,5 +8773,241 @@ describe('executeDagWorkflow -- tier/entry_rung + frontier_cost_usd', () => {
     expect(tokens.input).toBe(100);
     expect(tokens.output).toBe(50);
     expect(tokens.total).toBe(150);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// gate_result field in node_failed events
+// WO-HARNESS-LAYER1-GATE-RESULT-ALL-FAILURE-SITES-01
+// ---------------------------------------------------------------------------
+
+describe('gate_result field in node_failed events', () => {
+  let testDir: string;
+
+  beforeEach(async () => {
+    testDir = join(
+      tmpdir(),
+      `dag-gate-result-${Date.now()}-${Math.random().toString(36).slice(2)}`
+    );
+    await mkdir(testDir, { recursive: true });
+
+    mockSendQueryDag.mockClear();
+    mockGetAgentProviderDag.mockClear();
+
+    mockSendQueryDag.mockImplementation(function* () {
+      yield { type: 'assistant', content: 'DAG AI response' };
+      yield { type: 'result', sessionId: 'dag-session-id' };
+    });
+
+    mockGetAgentProviderDag.mockImplementation(() => ({
+      sendQuery: mockSendQueryDag,
+      getType: () => 'claude',
+      getCapabilities: mockClaudeCapabilities,
+    }));
+  });
+
+  afterEach(async () => {
+    clearPendingGateResults();
+    try {
+      await rm(testDir, { recursive: true, force: true });
+    } catch {
+      // ignore cleanup errors
+    }
+  });
+
+  it('bash node failure carries gate_result in persisted and emitted node_failed event', async () => {
+    const store = createMockStore();
+    const mockDeps = createMockDeps(store);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('gate-bash-run-id', {
+      workflow_name: 'gate-bash-test',
+      conversation_id: 'conv-gate-bash',
+    });
+
+    // Subscribe to the real emitter singleton to capture emitted events.
+    const emitter = getWorkflowEventEmitter();
+    const emittedFailedEvents: unknown[] = [];
+    const unsub = emitter.subscribe(e => {
+      if (e.type === 'node_failed') emittedFailedEvents.push(e);
+    });
+
+    try {
+      await executeDagWorkflow(
+        mockDeps,
+        platform,
+        'conv-gate-bash',
+        testDir,
+        { name: 'gate-bash-test', nodes: [{ id: 'fail-node', bash: 'exit 1' }] },
+        workflowRun,
+        'claude',
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        minimalConfig
+      );
+    } finally {
+      unsub();
+    }
+
+    // Assert persisted event carries gate_result.
+    const eventCalls = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls;
+    const failedEventCall = eventCalls.find(
+      (call: unknown[]) =>
+        (call[0] as { event_type: string }).event_type === 'node_failed' &&
+        (call[0] as { step_name: string }).step_name === 'fail-node'
+    );
+    expect(failedEventCall).toBeDefined();
+    const persistedData = (failedEventCall![0] as { data: Record<string, unknown> }).data;
+    expect(persistedData.gate_result).toBeDefined();
+    const persistedGr = persistedData.gate_result as GateResult;
+    expect(persistedGr.passed).toBe(false);
+    expect(persistedGr.nodeType).toBe('bash');
+    expect(persistedGr.exitCode).toBe(1);
+    expect(persistedGr.isTimeout).toBe(false);
+
+    // Assert emitted event carries gate_result.
+    expect(emittedFailedEvents.length).toBeGreaterThan(0);
+    const emittedGr = (emittedFailedEvents[0] as { gate_result?: GateResult }).gate_result;
+    expect(emittedGr).toBeDefined();
+    expect(emittedGr!.passed).toBe(false);
+    expect(emittedGr!.nodeType).toBe('bash');
+    expect(emittedGr!.exitCode).toBe(1);
+    expect(emittedGr!.isTimeout).toBe(false);
+  });
+
+  it('script node failure carries gate_result in persisted and emitted node_failed event', async () => {
+    const store = createMockStore();
+    const mockDeps = createMockDeps(store);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('gate-script-run-id', {
+      workflow_name: 'gate-script-test',
+      conversation_id: 'conv-gate-script',
+    });
+
+    const emitter = getWorkflowEventEmitter();
+    const emittedFailedEvents: unknown[] = [];
+    const unsub = emitter.subscribe(e => {
+      if (e.type === 'node_failed') emittedFailedEvents.push(e);
+    });
+
+    try {
+      await executeDagWorkflow(
+        mockDeps,
+        platform,
+        'conv-gate-script',
+        testDir,
+        {
+          name: 'gate-script-test',
+          nodes: [{ id: 'fail-script', script: 'process.exit(2)', runtime: 'bun' }],
+        },
+        workflowRun,
+        'claude',
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        minimalConfig
+      );
+    } finally {
+      unsub();
+    }
+
+    // Assert persisted event carries gate_result.
+    const eventCalls = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls;
+    const failedEventCall = eventCalls.find(
+      (call: unknown[]) =>
+        (call[0] as { event_type: string }).event_type === 'node_failed' &&
+        (call[0] as { step_name: string }).step_name === 'fail-script'
+    );
+    expect(failedEventCall).toBeDefined();
+    const persistedData = (failedEventCall![0] as { data: Record<string, unknown> }).data;
+    expect(persistedData.gate_result).toBeDefined();
+    const persistedGr = persistedData.gate_result as GateResult;
+    expect(persistedGr.passed).toBe(false);
+    expect(persistedGr.nodeType).toBe('script');
+    expect(persistedGr.exitCode).toBe(2);
+    expect(persistedGr.isTimeout).toBe(false);
+
+    // Assert emitted event carries gate_result.
+    expect(emittedFailedEvents.length).toBeGreaterThan(0);
+    const emittedGr = (emittedFailedEvents[0] as { gate_result?: GateResult }).gate_result;
+    expect(emittedGr).toBeDefined();
+    expect(emittedGr!.passed).toBe(false);
+    expect(emittedGr!.nodeType).toBe('script');
+    expect(emittedGr!.exitCode).toBe(2);
+    expect(emittedGr!.isTimeout).toBe(false);
+  });
+
+  it('AI node failure (credit exhaustion) carries gate_result in persisted and emitted node_failed event', async () => {
+    const creditExhaustedQuery = mock(function* () {
+      yield { type: 'assistant', content: 'credit balance is too low' };
+      yield { type: 'result', sessionId: 'dag-session-credit' };
+    });
+    mockGetAgentProviderDag.mockReturnValue({
+      sendQuery: creditExhaustedQuery,
+      getType: () => 'claude',
+      getCapabilities: mockClaudeCapabilities,
+    });
+
+    const store = createMockStore();
+    const deps = createMockDeps(store);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('gate-ai-run-id', {
+      workflow_name: 'gate-ai-test',
+      conversation_id: 'conv-gate-ai',
+    });
+
+    const commandsDir = join(testDir, '.archon', 'commands');
+    await mkdir(commandsDir, { recursive: true });
+
+    const emitter = getWorkflowEventEmitter();
+    const emittedFailedEvents: unknown[] = [];
+    const unsub = emitter.subscribe(e => {
+      if (e.type === 'node_failed') emittedFailedEvents.push(e);
+    });
+
+    try {
+      await executeDagWorkflow(
+        deps,
+        platform,
+        'conv-gate-ai',
+        testDir,
+        { name: 'gate-ai-test', nodes: [{ id: 'ai-node', prompt: 'do something' }] },
+        workflowRun,
+        'claude',
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        minimalConfig
+      );
+    } finally {
+      unsub();
+    }
+
+    // Assert persisted event carries gate_result.
+    const eventCalls = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls;
+    const failedEventCall = eventCalls.find(
+      (call: unknown[]) =>
+        (call[0] as { event_type: string }).event_type === 'node_failed' &&
+        (call[0] as { step_name: string }).step_name === 'ai-node'
+    );
+    expect(failedEventCall).toBeDefined();
+    const persistedData = (failedEventCall![0] as { data: Record<string, unknown> }).data;
+    expect(persistedData.gate_result).toBeDefined();
+    const persistedGr = persistedData.gate_result as GateResult;
+    expect(persistedGr.passed).toBe(false);
+    expect(persistedGr.nodeType).toBe('ai');
+
+    // Assert emitted event carries gate_result.
+    expect(emittedFailedEvents.length).toBeGreaterThan(0);
+    const emittedGr = (emittedFailedEvents[0] as { gate_result?: GateResult }).gate_result;
+    expect(emittedGr).toBeDefined();
+    expect(emittedGr!.passed).toBe(false);
+    expect(emittedGr!.nodeType).toBe('ai');
   });
 });

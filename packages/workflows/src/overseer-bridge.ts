@@ -26,6 +26,7 @@ import type { WorkflowRun, NodeOutput } from './schemas/workflow-run.ts';
 import type { DagNode } from './schemas/dag-node.ts';
 import type { WorkflowEmitterEvent } from './event-emitter.ts';
 import type { IWorkflowStore } from './store.ts';
+import type { GateResult } from './gate-result.ts';
 
 export interface HandleNodeFailureDeps {
   store: IWorkflowStore;
@@ -156,12 +157,17 @@ export async function handleNodeFailure(
       );
     });
 
+  // Forward gate_result from extraEventData into the emitted event.
+  // The persisted event already receives it for free via the extraEventData spread
+  // at line 149. The emitter does not spread extraEventData, so we extract explicitly.
+  const emittedGateResult = ctx.extraEventData?.gate_result as GateResult | undefined;
   deps.emitter.emit({
     type: 'node_failed',
     runId: workflowRun.id,
     nodeId: node.id,
     nodeName: node.command ?? node.id,
     error: ctx.errorMsg,
+    gate_result: emittedGateResult,
   });
 
   // Silent-dead-end escalation: fire 3 operator-visible signals (escalation.json
