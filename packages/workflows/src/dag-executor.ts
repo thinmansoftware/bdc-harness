@@ -1442,17 +1442,26 @@ async function executeNodeInternal(
     const catchNodeGateResult = pendingGateResults.get(catchGateResultKey);
     pendingGateResults.delete(catchGateResultKey);
 
-    // If the abort was triggered by user cancel (not idle timeout), classify as cancel
+    // If the abort was triggered by user cancel (not idle timeout), classify as cancel.
+    // Must call handleNodeFailure here (not early-return) so the node_failed event is
+    // persisted and emitted -- and so catchNodeGateResult is forwarded rather than
+    // silently dropped. Mirrors the in-stream cancel path at dag-executor.ts:1257.
     if (nodeAbortController.signal.aborted && !nodeIdleTimedOut) {
       getLog().info({ nodeId: node.id }, 'dag_node_cancelled_via_abort');
-      return {
-        state: 'failed',
-        output: nodeOutputText,
-        error: 'Cancelled by user',
-        costUsd: nodeCostUsd,
-        ...(nodeTokens ? { tokens: nodeTokens } : {}),
-        ...(nodeTokens ? { frontierCostUsd: computeFrontierCost(nodeTokens) } : {}),
-      };
+      const cancelMsg = 'Cancelled by user';
+      const failResult = await handleNodeFailure(
+        { store: deps.store, emitter, log: getLog(), logNodeError },
+        workflowRun,
+        node,
+        {
+          errorMsg: cancelMsg,
+          logDir,
+          outputSoFar: nodeOutputText,
+          hasOutput: nodeOutputText.length > 0,
+          gateResult: catchNodeGateResult ?? { passed: false, nodeType: 'ai' },
+        }
+      );
+      return failResult.output;
     }
 
     getLog().error({ err, nodeId: node.id }, 'dag_node_failed');
@@ -1667,6 +1676,9 @@ async function executeBashNode(
       // observability signal, not a graph-control change. Failing the node
       // here would block dependents; rolling-up at workflow level is the UI's
       // job (see WorkflowExecution.tsx).
+      // Clear any Phase 5 gate result registered for this node so the map does
+      // not leak when the warning path exits instead of the normal success path.
+      pendingGateResults.delete(`${workflowRun.id}:${node.id}`);
       return { state: 'completed', output };
     }
 
@@ -2010,6 +2022,11 @@ async function executeScriptNode(
         loadBearing: warning.loadBearing,
       });
 
+      // Clear any Phase 5 gate result registered for this node so the map does
+      // not leak when the warning path exits instead of the normal success path
+      // (same map hygiene as the success path at scriptGateResultKey below;
+      // see bash counterpart in executeBashNode).
+      pendingGateResults.delete(`${workflowRun.id}:${node.id}`);
       return { state: 'completed', output };
     }
 

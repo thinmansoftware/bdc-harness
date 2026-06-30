@@ -41,6 +41,7 @@ import {
   executeDagWorkflow,
   clearAgentRegistryCache,
   clearPendingGateResults,
+  recordGateResult,
 } from './dag-executor';
 import { loadMcpConfig } from '@archon/providers/claude/provider';
 import type { DagNode, BashNode, ScriptNode, NodeOutput, WorkflowRun } from './schemas';
@@ -9227,6 +9228,115 @@ describe('gate_result field in node_failed events', () => {
     expect(emittedGr!.passed).toBe(false);
     expect(emittedGr!.nodeType).toBe('ai');
   });
+
+  it('AI node failure (catch-block abort: SDK throws after signal fires) forwards pre-registered catchNodeGateResult to node_failed', async () => {
+    // Exercises dag-executor.ts catch-block abort path (lines 1446+).
+    // When nodeAbortController.signal.aborted is true AND the SDK threw an exception
+    // (rather than exiting the for-await cleanly), the catch block must call
+    // handleNodeFailure so that (a) node_failed is persisted and emitted, and
+    // (b) any Phase 5-registered gate_result is forwarded and not silently dropped.
+    //
+    // We intercept global.AbortController to capture the abort() handle, then
+    // call it from inside the mock generator before throwing -- simulating a real
+    // SDK that fires its AbortError while the signal is already set.
+
+    let capturedAbortFn: (() => void) | null = null;
+    const OrigAbortController = globalThis.AbortController;
+
+    class InterceptedAbortController extends OrigAbortController {
+      constructor() {
+        super();
+        // Capture the most-recently-created controller; for a single-AI-node
+        // workflow only one AbortController is created (dag-executor.ts:861).
+        capturedAbortFn = () => this.abort();
+      }
+    }
+    globalThis.AbortController = InterceptedAbortController as unknown as typeof AbortController;
+
+    try {
+      // Mock sendQuery: yield one event normally, then abort+throw on the next
+      // iteration to simulate an SDK that fires an AbortError after the signal fires.
+      const abortThrowQuery = mock(function* catchAbortThrowQuery(): Generator<{
+        type: string;
+        content?: string;
+        sessionId?: string;
+      }> {
+        yield { type: 'assistant', content: 'partial output before abort' };
+        // Set aborted=true on the nodeAbortController, then throw as an SDK would.
+        capturedAbortFn?.();
+        throw new Error('SDK operation aborted');
+      });
+
+      mockGetAgentProviderDag.mockReturnValue({
+        sendQuery: abortThrowQuery,
+        getType: () => 'claude',
+        getCapabilities: mockClaudeCapabilities,
+      });
+
+      const store = createMockStore();
+      const deps = createMockDeps(store);
+      const platform = createMockPlatform();
+      const workflowRun = makeWorkflowRun('catch-abort-run-id', {
+        workflow_name: 'catch-abort-test',
+        conversation_id: 'conv-catch-abort',
+      });
+
+      // Pre-register a gate result to simulate Phase 5 registering before the throw.
+      recordGateResult(workflowRun.id, 'ai-abort-catch-node', { passed: false, nodeType: 'ai' });
+
+      const emitter = getWorkflowEventEmitter();
+      const emittedFailedEvts: unknown[] = [];
+      const unsub = emitter.subscribe(e => {
+        if (e.type === 'node_failed') emittedFailedEvts.push(e);
+      });
+
+      try {
+        await executeDagWorkflow(
+          deps,
+          platform,
+          'conv-catch-abort',
+          testDir,
+          {
+            name: 'catch-abort-test',
+            nodes: [{ id: 'ai-abort-catch-node', prompt: 'test abort catch path' }],
+          },
+          workflowRun,
+          'claude',
+          undefined,
+          join(testDir, 'artifacts'),
+          join(testDir, 'logs'),
+          'main',
+          'docs/',
+          minimalConfig
+        );
+      } finally {
+        unsub();
+      }
+
+      // Assert persisted node_failed event carries the pre-registered gate_result.
+      const eventCalls = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls;
+      const failedCall = eventCalls.find(
+        (call: unknown[]) =>
+          (call[0] as { event_type: string }).event_type === 'node_failed' &&
+          (call[0] as { step_name: string }).step_name === 'ai-abort-catch-node'
+      );
+      expect(failedCall).toBeDefined();
+      const persistedData = (failedCall![0] as { data: Record<string, unknown> }).data;
+      expect(persistedData.gate_result).toBeDefined();
+      const persistedGr = persistedData.gate_result as GateResult;
+      expect(persistedGr.passed).toBe(false);
+      expect(persistedGr.nodeType).toBe('ai');
+
+      // Assert emitted event also carries gate_result (not silently dropped).
+      expect(emittedFailedEvts.length).toBe(1);
+      const emittedGr2 = (emittedFailedEvts[0] as { gate_result?: GateResult }).gate_result;
+      expect(emittedGr2).toBeDefined();
+      expect(emittedGr2!.passed).toBe(false);
+      expect(emittedGr2!.nodeType).toBe('ai');
+    } finally {
+      globalThis.AbortController = OrigAbortController;
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -9375,5 +9485,217 @@ describe('gate_result field in node_completed success events', () => {
     expect(emittedGr).toBeDefined();
     expect(emittedGr!.passed).toBe(true);
     expect(emittedGr!.nodeType).toBe('script');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// pendingGateResults cleanup in node_completed_with_warning paths
+// WO-HARNESS-LAYER1-GATE-RESULT-ALL-FAILURE-SITES-01 -- warning-path map hygiene
+//
+// When a bash or script node takes the node_completed_with_warning early-return
+// path, it must clear any Phase 5-registered gate_result from pendingGateResults
+// so that subsequent executions of the same (runId, nodeId) pair see a fresh
+// synthetic default rather than a stale leaked value.
+// ---------------------------------------------------------------------------
+
+describe('pendingGateResults cleanup in node_completed_with_warning paths', () => {
+  let testDir: string;
+
+  beforeEach(async () => {
+    testDir = join(tmpdir(), `dag-gate-warn-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    await mkdir(testDir, { recursive: true });
+  });
+
+  afterEach(async () => {
+    clearPendingGateResults();
+    try {
+      await rm(testDir, { recursive: true, force: true });
+    } catch {
+      // ignore cleanup errors
+    }
+  });
+
+  it('bash warning path clears pendingGateResults so a subsequent success path gets the fresh synthetic gate_result', async () => {
+    // Phase 1: register a non-default gate_result, run bash node that triggers
+    // node_completed_with_warning (exit 0 + always-dangerous STATUS= pattern).
+    // With the fix applied, the pre-registered entry is cleared on warning exit.
+    // Phase 2: run the SAME node (same runId+nodeId) on a fresh store with NO
+    // gate_result registered. The success path must synthesize { passed:true,
+    // nodeType:'bash' }. Without the fix it would find the leaked Phase-1 entry
+    // ({ passed:false, nodeType:'ai' }) and use that instead.
+
+    const sharedRunId = 'bash-warn-leak-run';
+    const sharedNodeId = 'bash-warn-leak-node';
+    const platform = createMockPlatform();
+
+    // Pre-register a non-default gate_result (simulates Phase 5 before Phase 1 runs).
+    recordGateResult(sharedRunId, sharedNodeId, { passed: false, nodeType: 'ai' });
+
+    const store1 = createMockStore();
+    const deps1 = createMockDeps(store1);
+    const workflowRun = makeWorkflowRun(sharedRunId, {
+      workflow_name: 'bash-warn-leak-test',
+      conversation_id: 'conv-bash-warn-leak',
+    });
+
+    // Phase 1: STATUS=push_failed is an always-dangerous pattern (triggers warning on exit 0).
+    await executeDagWorkflow(
+      deps1,
+      platform,
+      'conv-bash-warn-leak',
+      testDir,
+      {
+        name: 'bash-warn-leak-test',
+        nodes: [{ id: sharedNodeId, bash: 'echo STATUS=push_failed' }],
+      },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    // Phase 1 must have emitted node_completed_with_warning, not node_completed.
+    const p1Events = (store1.createWorkflowEvent as ReturnType<typeof mock>).mock.calls;
+    const p1Warning = p1Events.find(
+      (c: unknown[]) =>
+        (c[0] as { event_type: string }).event_type === 'node_completed_with_warning'
+    );
+    expect(p1Warning).toBeDefined();
+
+    // Phase 2: run the same node to success (no gate_result registered for this key).
+    // The pending map must be empty for (sharedRunId, sharedNodeId) after Phase 1's fix.
+    const store2 = createMockStore();
+    const deps2 = createMockDeps(store2);
+
+    await executeDagWorkflow(
+      deps2,
+      platform,
+      'conv-bash-warn-leak',
+      testDir,
+      {
+        name: 'bash-warn-leak-test',
+        nodes: [{ id: sharedNodeId, bash: 'echo success' }],
+      },
+      workflowRun, // same workflowRun (same id) -- tests the shared map key
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    // Phase 2 node_completed must carry the fresh synthetic default, NOT the Phase 1 leak.
+    const p2Events = (store2.createWorkflowEvent as ReturnType<typeof mock>).mock.calls;
+    const p2Completed = p2Events.find(
+      (c: unknown[]) =>
+        (c[0] as { event_type: string }).event_type === 'node_completed' &&
+        (c[0] as { step_name: string }).step_name === sharedNodeId
+    );
+    expect(p2Completed).toBeDefined();
+    const p2Data = (p2Completed![0] as { data: Record<string, unknown> }).data;
+    const p2Gr = p2Data.gate_result as GateResult;
+    // Fresh synthetic default: passed=true, nodeType='bash'.
+    // If the Phase 1 entry leaked, this would be { passed:false, nodeType:'ai' }.
+    expect(p2Gr.passed).toBe(true);
+    expect(p2Gr.nodeType).toBe('bash');
+  });
+
+  it('script warning path clears pendingGateResults so a subsequent success path gets the fresh synthetic gate_result', async () => {
+    // Same leak-prevention test as the bash variant above, but for executeScriptNode.
+
+    const sharedRunId = 'script-warn-leak-run';
+    const sharedNodeId = 'script-warn-leak-node';
+    const platform = createMockPlatform();
+
+    recordGateResult(sharedRunId, sharedNodeId, { passed: false, nodeType: 'ai' });
+
+    const store1 = createMockStore();
+    const deps1 = createMockDeps(store1);
+    const workflowRun = makeWorkflowRun(sharedRunId, {
+      workflow_name: 'script-warn-leak-test',
+      conversation_id: 'conv-script-warn-leak',
+    });
+
+    // Phase 1: script outputs STATUS=push_failed (always-dangerous, triggers warning on exit 0).
+    await executeDagWorkflow(
+      deps1,
+      platform,
+      'conv-script-warn-leak',
+      testDir,
+      {
+        name: 'script-warn-leak-test',
+        nodes: [
+          {
+            id: sharedNodeId,
+            script: 'process.stdout.write("STATUS=push_failed\\n")',
+            runtime: 'bun' as const,
+          },
+        ],
+      },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    const p1Events = (store1.createWorkflowEvent as ReturnType<typeof mock>).mock.calls;
+    const p1Warning = p1Events.find(
+      (c: unknown[]) =>
+        (c[0] as { event_type: string }).event_type === 'node_completed_with_warning'
+    );
+    expect(p1Warning).toBeDefined();
+
+    // Phase 2: script succeeds cleanly (no gate_result registered).
+    const store2 = createMockStore();
+    const deps2 = createMockDeps(store2);
+
+    await executeDagWorkflow(
+      deps2,
+      platform,
+      'conv-script-warn-leak',
+      testDir,
+      {
+        name: 'script-warn-leak-test',
+        nodes: [
+          {
+            id: sharedNodeId,
+            script: 'process.stdout.write("success\\n")',
+            runtime: 'bun' as const,
+          },
+        ],
+      },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    const p2Events = (store2.createWorkflowEvent as ReturnType<typeof mock>).mock.calls;
+    const p2Completed = p2Events.find(
+      (c: unknown[]) =>
+        (c[0] as { event_type: string }).event_type === 'node_completed' &&
+        (c[0] as { step_name: string }).step_name === sharedNodeId
+    );
+    expect(p2Completed).toBeDefined();
+    const p2Data = (p2Completed![0] as { data: Record<string, unknown> }).data;
+    const p2Gr = p2Data.gate_result as GateResult;
+    // Fresh synthetic default: passed=true, nodeType='script'.
+    // If the Phase 1 entry leaked, this would be { passed:false, nodeType:'ai' }.
+    expect(p2Gr.passed).toBe(true);
+    expect(p2Gr.nodeType).toBe('script');
   });
 });

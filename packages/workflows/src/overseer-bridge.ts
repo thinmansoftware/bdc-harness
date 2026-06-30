@@ -25,7 +25,7 @@ import { classifyError, decide, runEscalation, type Decision } from '@archon/ove
 import type { WorkflowRun, NodeOutput } from './schemas/workflow-run.ts';
 import type { DagNode } from './schemas/dag-node.ts';
 import { buildGateResultField } from './event-emitter';
-import type { WorkflowEmitterEvent, GateResult } from './event-emitter.ts';
+import type { WorkflowEmitterEvent, GateResult } from './event-emitter';
 import type { IWorkflowStore } from './store.ts';
 
 export interface HandleNodeFailureDeps {
