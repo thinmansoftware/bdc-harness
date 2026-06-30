@@ -213,8 +213,14 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
       break;
     }
 
-    // Poll for terminal state (runId is guaranteed non-null since fireResult.ok is true)
-    const resolvedRunId = fireResult.runId ?? '';
+    // Assert runId is non-null -- fire.ts resolves runId before returning ok=true.
+    // A null here is a contract violation in the fire implementation, not a gate failure.
+    if (fireResult.runId == null) {
+      throw new Error(
+        `[smart-cauldron/cascade] fire returned ok=true but runId is null for tier=${tier.name} woId=${woId}`
+      );
+    }
+    const resolvedRunId = fireResult.runId;
     let pollResult: PollResult;
     try {
       pollResult = await pollImpl({

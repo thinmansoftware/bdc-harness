@@ -82,7 +82,9 @@ function parseArgs(argv: string[]): CliArgs {
   while (i < args.length) {
     const arg = args[i];
     if (arg === '--class' && i + 1 < args.length) {
-      result.woClass = args[i + 1];
+      // Normalize to uppercase so "code", "CODE", "Code" all route correctly
+      const rawClass = args[i + 1];
+      result.woClass = rawClass !== undefined ? rawClass.toUpperCase() : undefined;
       i += 2;
     } else if (arg === '--tags' && i + 1 < args.length) {
       result.tags = (args[i + 1] ?? '')

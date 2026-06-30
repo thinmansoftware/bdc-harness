@@ -24,7 +24,10 @@ interface RunApiResponse {
   events?: {
     event_type: string;
     step_name: string | null;
-    data: Record<string, unknown>;
+    // node_output is the canonical field name confirmed by CLI workflow.ts:814
+    // and server test fixtures (data: { node_output: '...' }).
+    // Typed explicitly so ev.data.output access is a compile-time error.
+    data: { node_output?: string; [key: string]: unknown };
   }[];
 }
 
@@ -97,14 +100,19 @@ async function fetchRunDetail(runId: string, apiBaseUrl: string): Promise<RunApi
  * Extract war-council-validator verdict from node_completed events.
  *
  * Scans for event_type === "node_completed" AND step_name === "war-council-validator".
- * Checks data.output string for "satisfied" or "needs_revision".
+ * Checks data.node_output string for "satisfied" or "needs_revision".
+ * Field name confirmed: CLI workflow.ts:814 uses event.data.node_output.
  */
 function extractValidatorVerdict(
-  events: { event_type: string; step_name: string | null; data: Record<string, unknown> }[]
+  events: {
+    event_type: string;
+    step_name: string | null;
+    data: { node_output?: string; [key: string]: unknown };
+  }[]
 ): 'satisfied' | 'needs_revision' | 'unknown' {
   for (const ev of events) {
     if (ev.event_type === 'node_completed' && ev.step_name === 'war-council-validator') {
-      const output = typeof ev.data.output === 'string' ? ev.data.output : '';
+      const output = typeof ev.data.node_output === 'string' ? ev.data.node_output : '';
       if (/\bsatisfied\b/i.test(output)) return 'satisfied';
       if (/\bneeds[_-]revision\b/i.test(output) || /\bneeds revision\b/i.test(output))
         return 'needs_revision';
@@ -116,20 +124,29 @@ function extractValidatorVerdict(
 /**
  * Extract PR URL from node_completed events.
  *
- * Looks for node with step_name matching "open-pr" or containing "pr".
- * Parses PR_URL=https://... pattern from data.output.
+ * Looks for node with step_name === "open-pr-if-needed" (the real node ID in
+ * bdc-feature-development.yaml, confirmed by canary doc open-pr-if-needed node_output).
+ * Falls back to any step whose name contains "open-pr" to handle custom lanes.
+ * Avoids false positives on "approve" or "preflight" (no longer matches on bare "pr").
+ * Parses PR_URL=https://... pattern from data.node_output.
  */
 function extractPrUrl(
-  events: { event_type: string; step_name: string | null; data: Record<string, unknown> }[]
+  events: {
+    event_type: string;
+    step_name: string | null;
+    data: { node_output?: string; [key: string]: unknown };
+  }[]
 ): string | null {
   const prUrlPattern = /PR_URL=(https?:\/\/\S+)/i;
 
   for (const ev of events) {
     if (ev.event_type !== 'node_completed') continue;
     const stepName = ev.step_name ?? '';
-    if (stepName !== 'open-pr' && !stepName.toLowerCase().includes('pr')) continue;
+    // Exact match on the real step ID; fallback on steps that contain "open-pr"
+    // (not bare "pr" to avoid matching "approve", "preflight", etc.).
+    if (stepName !== 'open-pr-if-needed' && !stepName.toLowerCase().includes('open-pr')) continue;
 
-    const output = typeof ev.data.output === 'string' ? ev.data.output : '';
+    const output = typeof ev.data.node_output === 'string' ? ev.data.node_output : '';
     const match = prUrlPattern.exec(output);
     if (match?.[1]) return match[1];
 
