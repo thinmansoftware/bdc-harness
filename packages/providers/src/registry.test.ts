@@ -12,6 +12,7 @@ import {
   clearRegistry,
 } from './registry';
 import { registerPiProvider } from './community/pi/registration';
+import { registerGlmProvider, registerOprProvider } from './community/glm/registration';
 import { UnknownProviderError } from './errors';
 import type { ProviderRegistration, IAgentProvider, ProviderCapabilities } from './types';
 
@@ -263,6 +264,13 @@ describe('registry', () => {
       const piCount = getRegisteredProviders().filter(p => p.id === 'pi').length;
       expect(piCount).toBe(1);
     });
+
+    test('registers glm and opr alongside pi (Scenario D)', () => {
+      registerCommunityProviders();
+      expect(isRegisteredProvider('pi')).toBe(true);
+      expect(isRegisteredProvider('glm')).toBe(true);
+      expect(isRegisteredProvider('opr')).toBe(true);
+    });
   });
 
   describe('registerPiProvider (community provider)', () => {
@@ -316,6 +324,56 @@ describe('registry', () => {
         .map(p => p.id)
         .sort();
       expect(ids).toEqual(['claude', 'codex', 'pi']);
+    });
+  });
+
+  describe('registerOprProvider (OpenRouter alias for glm)', () => {
+    test('registers opr with builtIn: false (Scenario A)', () => {
+      registerOprProvider();
+      const reg = getRegistration('opr');
+      expect(reg.id).toBe('opr');
+      expect(reg.builtIn).toBe(false);
+      expect(typeof reg.factory).toBe('function');
+    });
+
+    test('getAgentProvider opr returns an IAgentProvider (Scenario A)', () => {
+      registerOprProvider();
+      const provider = getAgentProvider('opr');
+      expect(provider).toBeDefined();
+      expect(typeof provider.sendQuery).toBe('function');
+      expect(typeof provider.getType).toBe('function');
+      expect(typeof provider.getCapabilities).toBe('function');
+    });
+
+    test('opr and glm resolve to the same provider class (Scenario B)', () => {
+      registerGlmProvider();
+      registerOprProvider();
+      const oprProvider = getAgentProvider('opr');
+      const glmProvider = getAgentProvider('glm');
+      expect(oprProvider.constructor).toBe(glmProvider.constructor);
+    });
+
+    test('glm still resolves after opr registration (Scenario C)', () => {
+      registerGlmProvider();
+      registerOprProvider();
+      const provider = getAgentProvider('glm');
+      expect(provider).toBeDefined();
+      expect(typeof provider.sendQuery).toBe('function');
+    });
+
+    test('is idempotent', () => {
+      registerOprProvider();
+      expect(() => registerOprProvider()).not.toThrow();
+      expect(getRegisteredProviders().filter(p => p.id === 'opr')).toHaveLength(1);
+    });
+
+    test('does not collide with glm or built-ins', () => {
+      registerGlmProvider();
+      registerOprProvider();
+      const ids = getRegisteredProviders()
+        .map(p => p.id)
+        .sort();
+      expect(ids).toEqual(['claude', 'codex', 'glm', 'opr']);
     });
   });
 });

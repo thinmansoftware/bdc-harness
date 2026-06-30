@@ -22,3 +22,26 @@ export function registerGlmProvider(): void {
     builtIn: false,
   });
 }
+
+/**
+ * Register the OpenRouter alias provider under the id 'opr'.
+ *
+ * GlmProvider is a generic OpenRouter client (baseURL =
+ * https://openrouter.ai/api/v1, no model allowlist). Registering it as
+ * 'opr' lets new workflow YAML use self-documenting references such as
+ * `provider: opr, model: qwen/qwen3-coder` instead of the misleading
+ * 'glm' id. The 'glm' registration is preserved unchanged for backward
+ * compatibility.
+ *
+ * Idempotent -- mirrors the registerGlmProvider() guard exactly.
+ */
+export function registerOprProvider(): void {
+  if (isRegisteredProvider('opr')) return;
+  registerProvider({
+    id: 'opr',
+    displayName: 'OpenRouter (Qwen / DeepSeek / GLM / any OpenRouter model)',
+    factory: () => new GlmProvider(),
+    capabilities: GLM_CAPABILITIES,
+    builtIn: false,
+  });
+}
