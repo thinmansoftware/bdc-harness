@@ -1,3 +1,4 @@
+import type { IAgentProvider } from '../../types';
 import { isRegisteredProvider, registerProvider } from '../../registry';
 
 import { GLM_CAPABILITIES } from './capabilities';
@@ -11,13 +12,19 @@ import { GlmProvider } from './provider';
  * separate from registerBuiltinProviders() because builtIn: false is
  * load-bearing: GLM validates the community-provider seam and must not
  * be conflated with core providers.
+ *
+ * options.failbackProviderFactory: when provided, the GlmProvider will
+ * delegate to this factory's returned provider on availability errors
+ * (5xx / timeout / network). Wired from registry.ts with ClaudeProvider.
  */
-export function registerGlmProvider(): void {
+export function registerGlmProvider(options?: {
+  failbackProviderFactory?: () => IAgentProvider;
+}): void {
   if (isRegisteredProvider('glm')) return;
   registerProvider({
     id: 'glm',
     displayName: 'GLM (Zhipu/Z.ai community)',
-    factory: () => new GlmProvider(),
+    factory: () => new GlmProvider({ failbackProviderFactory: options?.failbackProviderFactory }),
     capabilities: GLM_CAPABILITIES,
     builtIn: false,
   });
@@ -34,13 +41,17 @@ export function registerGlmProvider(): void {
  * compatibility.
  *
  * Idempotent -- mirrors the registerGlmProvider() guard exactly.
+ *
+ * options.failbackProviderFactory: same semantics as registerGlmProvider.
  */
-export function registerOprProvider(): void {
+export function registerOprProvider(options?: {
+  failbackProviderFactory?: () => IAgentProvider;
+}): void {
   if (isRegisteredProvider('opr')) return;
   registerProvider({
     id: 'opr',
     displayName: 'OpenRouter (Qwen / DeepSeek / GLM / any OpenRouter model)',
-    factory: () => new GlmProvider(),
+    factory: () => new GlmProvider({ failbackProviderFactory: options?.failbackProviderFactory }),
     capabilities: GLM_CAPABILITIES,
     builtIn: false,
   });

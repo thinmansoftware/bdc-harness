@@ -428,14 +428,12 @@ async function* streamCodexEvents(
       const errorObj = (event as { error?: { message?: string } }).error;
       const errorMessage = errorObj?.message ?? 'Unknown error';
       getLog().error({ errorMessage }, 'turn_failed');
-      yield {
-        type: 'result',
-        sessionId: threadId ?? undefined,
-        isError: true,
-        errorSubtype: 'codex_turn_failed',
-        errors: [errorMessage],
-      };
-      return;
+      // BDF Fix A (WO-HARNESS-BDF-RESILIENCE-FIXES-01): throw so the sendQuery
+      // catch block receives the error and can fire the failback provider
+      // (e.g. usage-limit turn.failed -> 'unknown' error class -> failback).
+      // Previously this yielded an error-result chunk and returned normally,
+      // which caused the try block in sendQuery to succeed and bypass failback.
+      throw new Error(errorMessage);
     }
 
     if (event.type === 'item.completed') {

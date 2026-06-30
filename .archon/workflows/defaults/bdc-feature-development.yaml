@@ -6,6 +6,9 @@ description: |
   NOT for: Doctrine-only updates, cleanup sweeps, infrastructure deploys, or bug-fix WOs with their own workflow.
 
 policyFile: harness/policies/agent-behavior.md
+# Main Claude build lane: model: sonnet is CORRECT here -- this lane IS the Claude lane.
+# All build + review nodes are intentionally Claude. Do NOT change this to a cheaper model.
+# See Ambiguity 1 resolution in WO-HARNESS-SMART-CAULDRON-LANE-ROSTER-AND-RESILIENCE-01.
 model: sonnet
 
 nodes:
@@ -653,6 +656,10 @@ nodes:
       exit 0
 
   - id: war-council-validator
+    # Pin to claude/sonnet: the trusted judge must always be Claude regardless of
+    # the lane's top-level default. WO-HARNESS-SMART-CAULDRON-LANE-ROSTER-AND-RESILIENCE-01.
+    provider: claude
+    model: sonnet
     persona: captain-ci-validator
     depends_on: [ascii-gate]
     task_class: medium_work
@@ -791,7 +798,7 @@ nodes:
       # NEVER emit. Thus only until_bash (done.flag exists AND no debug prints in the
       # feature diff) can complete the loop.
       until: __NEVER_EMIT_USE_UNTIL_BASH__
-      max_iterations: 10
+      max_iterations: 20
       until_bash: |
         set -uo pipefail
         # MECHANICAL invariants ONLY. This does NOT prove Codex is satisfied --
@@ -1408,6 +1415,15 @@ nodes:
 
       The target repo is where the PR must be opened (NOT the worktree's git origin - Rule 29).
 
+      If none of those patterns are present in the spec, determine the repo from the git
+      remote origin URL of the current working directory:
+        Run: git remote get-url origin
+      Parse the repo name from the URL. Examples:
+        git@github.com:bluedevilcollectibles/shopops.git -> bluedevilcollectibles/shopops
+        https://github.com/bluedevilcollectibles/bdc-harness.git -> bluedevilcollectibles/bdc-harness
+      Emit that as the repo field. Only emit repo: unknown if the origin URL is also
+      unavailable (not a git repo or no remote configured).
+
       Match the extracted repo against this hardcoded staging-gate list:
       - bluedevilcollectibles/lspro-react
       - bluedevilcollectibles/shopops-storefront
@@ -1431,7 +1447,8 @@ nodes:
       repo: unknown
 
       CRITICAL: You MUST emit a `repo:` line in every output case. If no target_repo is
-      parseable from the spec, emit `repo: unknown` and a WARNING line explaining what is missing.
+      parseable from the spec AND git remote get-url origin is also unavailable, emit
+      `repo: unknown` and a WARNING line explaining that origin is unavailable.
 
   # load_bearing: true (WO-167 doctrine, WO-169 anchor)
   # 2026-05-16 engine sortie: container-side `git push` silently failed; downstream

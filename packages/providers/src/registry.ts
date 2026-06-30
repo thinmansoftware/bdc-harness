@@ -159,8 +159,12 @@ export function registerBuiltinProviders(): void {
  */
 export function registerCommunityProviders(): void {
   registerPiProvider();
-  registerGlmProvider();
-  registerOprProvider();
+  // WO-HARNESS-SMART-CAULDRON-LANE-ROSTER-AND-RESILIENCE-01: wire ClaudeProvider
+  // as the availability failback for both glm and opr providers. When OpenRouter
+  // is unavailable (5xx / timeout / network), the task delegates to Claude with
+  // a [GLM FAILBACK] disclosure chunk rather than dying.
+  registerGlmProvider({ failbackProviderFactory: () => new ClaudeProvider() });
+  registerOprProvider({ failbackProviderFactory: () => new ClaudeProvider() });
 }
 
 /** @internal Test-only -- clears the registry. Not for production use. */
