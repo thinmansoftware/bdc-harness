@@ -27,25 +27,30 @@ function getLog(): ReturnType<typeof createLogger> {
  * Engines whose endpoints are not reachable from the current runtime host.
  * Tier 1 ollama-qwen3 runs on the BDC LAN box and is unreachable from Hetzner.
  * The dispatcher skips tiers whose only reachable engines fall in this set.
+ * Exported for test scenarios (Scenario D).
  */
-const UNREACHABLE_ENGINES: ReadonlySet<string> = new Set(['ollama-qwen3']);
+export const UNREACHABLE_ENGINES: ReadonlySet<string> = new Set(['ollama-qwen3']);
 
 /**
  * Engine key -> lane workflow name. New single-model lanes (Phase 5) extend
  * this table; a null value means no lane is wired yet for that engine
- * (Tier 0 deterministic scripts, Tier 4 fable/opus).
+ * (Tier 0 deterministic scripts, Tier 5 fable/opus).
+ * Exported for test scenarios (Scenarios B, C).
  */
-const DEFAULT_ENGINE_TO_LANE: Record<string, string | null> = {
+export const DEFAULT_ENGINE_TO_LANE: Record<string, string | null> = {
   'sonnet-subscription': 'bdc-feature-development',
   'codex-subscription': 'bdc-feature-development-codex',
   'claude-haiku-api': 'bdc-feature-development-glm',
+  'glm-5.2': 'bdc-feature-development-glm',
+  'qwen3-coder': 'bdc-feature-development-glm',
+  'deepseek-v4-pro': 'bdc-feature-development-glm',
   'deterministic-script': null,
   'fable-session': null,
   'opus-api': null,
 };
 
 /** Terminal tier id. Cascade ceiling per router.yaml; never escalate past it. */
-const TERMINAL_TIER = '4';
+const TERMINAL_TIER = '5';
 
 /** Input options for resolveEntryLane. */
 export interface ResolveOptions {

@@ -30,10 +30,13 @@ mock.module('@archon/paths', () => ({
 
 // --- Imports (after mocks) ---
 
-import { resolveEntryLane, pickLane } from './router-dispatcher';
+import { resolveEntryLane, pickLane, DEFAULT_ENGINE_TO_LANE, UNREACHABLE_ENGINES } from './router-dispatcher';
 
 // Hermetic fixture covers every scenario the suite asserts. Mirrors the
 // production router.yaml shape: tiers{} + task_classes{} + defaults{}.
+// Updated for WO-HARNESS-LAYER2-OPENROUTER-CHEAP-TIER-01: 6-tier structure
+// (0-5) with tier "2" = openrouter-cheap inserted, haiku 2->3, workhorse 3->4,
+// fable-opus 4->5. Task classes updated accordingly.
 const FIXTURE_YAML = `version: 1
 tiers:
   "0":
@@ -45,15 +48,21 @@ tiers:
     engines:
       - ollama-qwen3
   "2":
+    name: openrouter-cheap
+    engines:
+      - glm-5.2
+      - qwen3-coder
+      - deepseek-v4-pro
+  "3":
     name: haiku
     engines:
       - claude-haiku-api
-  "3":
+  "4":
     name: workhorse-subscription
     engines:
       - sonnet-subscription
       - codex-subscription
-  "4":
+  "5":
     name: fable-opus
     engines:
       - fable-session
@@ -66,13 +75,13 @@ task_classes:
   summarize:
     starting_tier: "1"
   build-code:
-    starting_tier: "3"
+    starting_tier: "2"
     engine_hint: sonnet-subscription
   single-builder-pr:
-    starting_tier: "3"
+    starting_tier: "2"
     engine_hint: codex-subscription
   spec-authoring:
-    starting_tier: "4"
+    starting_tier: "5"
 `;
 
 const FIXTURE_OPTS = {
@@ -81,30 +90,36 @@ const FIXTURE_OPTS = {
 };
 
 describe('router-dispatcher resolveEntryLane', () => {
-  it('T1: mechanical CODE class (build-code) resolves to Tier 3 + bdc-feature-development lane', async () => {
+  it('T1: mechanical CODE class (build-code) resolves to Tier 2 + bdc-feature-development-glm lane', async () => {
     const result = await resolveEntryLane({
       taskClass: 'build-code',
       woClass: 'CODE',
       ...FIXTURE_OPTS,
     });
 
-    expect(result.tier).toBe('3');
-    expect(result.laneName).toBe('bdc-feature-development');
-    expect(result.engineHint).toBe('sonnet-subscription');
-    // build-code starts at Tier 3 directly -- no skips.
+    // build-code now starts at Tier 2 (openrouter-cheap). engine_hint
+    // sonnet-subscription is not in Tier 2 engines so the hint is ignored;
+    // first reachable engine is glm-5.2.
+    expect(result.tier).toBe('2');
+    expect(result.laneName).toBe('bdc-feature-development-glm');
+    expect(result.engineHint).toBe('glm-5.2');
+    // build-code starts at Tier 2 directly -- no skips.
     expect(result.skippedTiers).toEqual([]);
   });
 
-  it('T2: codex engine_hint (single-builder-pr) resolves to bdc-feature-development-codex lane', async () => {
+  it('T2: single-builder-pr resolves to Tier 2 + bdc-feature-development-glm lane', async () => {
     const result = await resolveEntryLane({
       taskClass: 'single-builder-pr',
       woClass: 'CODE',
       ...FIXTURE_OPTS,
     });
 
-    expect(result.tier).toBe('3');
-    expect(result.laneName).toBe('bdc-feature-development-codex');
-    expect(result.engineHint).toBe('codex-subscription');
+    // single-builder-pr now starts at Tier 2 (openrouter-cheap). engine_hint
+    // codex-subscription is not in Tier 2 engines so the hint is ignored;
+    // first reachable engine is glm-5.2.
+    expect(result.tier).toBe('2');
+    expect(result.laneName).toBe('bdc-feature-development-glm');
+    expect(result.engineHint).toBe('glm-5.2');
   });
 
   it('T3: deterministic -- same input resolves to identical output every call', async () => {
@@ -128,17 +143,19 @@ describe('router-dispatcher resolveEntryLane', () => {
     expect(JSON.stringify(b)).toBe(JSON.stringify(c));
   });
 
-  it('T4: unreachable Tier 1 (ollama-qwen3) is skipped to Tier 2 + glm lane', async () => {
+  it('T4: unreachable Tier 1 (ollama-qwen3) is skipped to Tier 2 openrouter-cheap + glm lane', async () => {
     const result = await resolveEntryLane({
       taskClass: 'log-triage',
       woClass: 'INFRA',
       ...FIXTURE_OPTS,
     });
 
+    // Tier 1 has ollama-qwen3 (UNREACHABLE) so it is skipped.
+    // Tier 2 is openrouter-cheap; first engine glm-5.2 is reachable.
     expect(result.skippedTiers).toContain('1');
     expect(result.tier).toBe('2');
     expect(result.laneName).toBe('bdc-feature-development-glm');
-    expect(result.engineHint).toBe('claude-haiku-api');
+    expect(result.engineHint).toBe('glm-5.2');
   });
 
   it('T5: resolve path is pure table lookup -- no provider/model symbols imported by the module', async () => {
@@ -157,22 +174,22 @@ describe('router-dispatcher resolveEntryLane', () => {
     expect(src).not.toMatch(/@openai\/codex-sdk/);
 
     // And dynamic call is still pure -- runs to completion without any AI
-    // surface being touched.
+    // surface being touched. build-code now starts at Tier 2 (openrouter-cheap).
     const result = await resolveEntryLane({
       taskClass: 'build-code',
       ...FIXTURE_OPTS,
     });
-    expect(result.laneName).toBe('bdc-feature-development');
+    expect(result.laneName).toBe('bdc-feature-development-glm');
   });
 
-  it('unknown task class falls back to fallback_tier defaults (no synthetic Tier 4 start)', async () => {
+  it('unknown task class falls back to fallback_tier defaults (no synthetic Tier 5 start)', async () => {
     const result = await resolveEntryLane({
       taskClass: 'never-heard-of-this-class',
       ...FIXTURE_OPTS,
     });
 
-    // fallback_tier = "2" in the fixture, Tier 2 has claude-haiku-api which is
-    // reachable -- the dispatcher should resolve there, not escalate to Tier 4.
+    // fallback_tier = "2" in the fixture, Tier 2 is openrouter-cheap (glm-5.2)
+    // which is reachable -- the dispatcher should resolve there, not escalate to Tier 5.
     expect(result.tier).toBe('2');
     expect(result.laneName).toBe('bdc-feature-development-glm');
   });
@@ -200,6 +217,40 @@ describe('router-dispatcher resolveEntryLane', () => {
     expect(result.tier).toBe('0');
     expect(result.engineHint).toBe('deterministic-script');
     expect(result.laneName).toBeNull();
+  });
+
+  // ------------------------------------------------------------------
+  // WO-HARNESS-LAYER2-OPENROUTER-CHEAP-TIER-01 -- Scenarios A through D
+  // ------------------------------------------------------------------
+
+  it('Scenario A: build-code resolves to openrouter-cheap tier (tier 2) after insertion', async () => {
+    const result = await resolveEntryLane({
+      taskClass: 'build-code',
+      woClass: 'CODE',
+      ...FIXTURE_OPTS,
+    });
+    // build-code must now start at tier "2" (the new openrouter-cheap tier).
+    // spec section 5 writes `result.tier === 2` (number) but ResolveResult.tier
+    // is typed string; corrected here to '2'.
+    expect(result.tier).toBe('2');
+    expect(result.laneName).not.toBeNull();
+    expect(result.laneName).not.toBe('');
+  });
+
+  it('Scenario B: DEFAULT_ENGINE_TO_LANE maps glm-5.2 to the OpenRouter lane', () => {
+    expect(DEFAULT_ENGINE_TO_LANE['glm-5.2']).toBeDefined();
+    expect(DEFAULT_ENGINE_TO_LANE['glm-5.2']).toBe('bdc-feature-development-glm');
+  });
+
+  it('Scenario C: DEFAULT_ENGINE_TO_LANE maps qwen3-coder and deepseek-v4-pro to the OpenRouter lane', () => {
+    expect(DEFAULT_ENGINE_TO_LANE['qwen3-coder']).toBeDefined();
+    expect(DEFAULT_ENGINE_TO_LANE['qwen3-coder']).toBe('bdc-feature-development-glm');
+    expect(DEFAULT_ENGINE_TO_LANE['deepseek-v4-pro']).toBeDefined();
+    expect(DEFAULT_ENGINE_TO_LANE['deepseek-v4-pro']).toBe('bdc-feature-development-glm');
+  });
+
+  it('Scenario D: ollama-qwen3 remains in UNREACHABLE_ENGINES', () => {
+    expect(UNREACHABLE_ENGINES.has('ollama-qwen3')).toBe(true);
   });
 });
 
