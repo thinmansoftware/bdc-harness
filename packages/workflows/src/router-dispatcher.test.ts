@@ -30,7 +30,7 @@ mock.module('@archon/paths', () => ({
 
 // --- Imports (after mocks) ---
 
-import { resolveEntryLane } from './router-dispatcher';
+import { resolveEntryLane, pickLane } from './router-dispatcher';
 
 // Hermetic fixture covers every scenario the suite asserts. Mirrors the
 // production router.yaml shape: tiers{} + task_classes{} + defaults{}.
@@ -200,5 +200,33 @@ describe('router-dispatcher resolveEntryLane', () => {
     expect(result.tier).toBe('0');
     expect(result.engineHint).toBe('deterministic-script');
     expect(result.laneName).toBeNull();
+  });
+});
+
+describe('pickLane -- Layer 2 dispatcher precedence', () => {
+  it('Scenario A -- task_class resolves to a lane and fires it', async () => {
+    const lane = await pickLane({ taskClass: 'build-code', ...FIXTURE_OPTS });
+    const expected = await resolveEntryLane({ taskClass: 'build-code', ...FIXTURE_OPTS });
+    expect(lane).toBeDefined();
+    expect(lane).not.toBe('');
+    expect(lane).toBe(expected.laneName);
+  });
+
+  it('Scenario B -- explicit workflow name wins over task_class', async () => {
+    const lane = await pickLane({
+      taskClass: 'build-code',
+      workflowName: 'bdc-feature-development',
+      ...FIXTURE_OPTS,
+    });
+    expect(lane).toBe('bdc-feature-development');
+  });
+
+  it('Scenario C -- unresolvable task_class falls back to explicit name', async () => {
+    const lane = await pickLane({
+      taskClass: 'unknown-class-xyz',
+      workflowName: 'bdc-feature-development',
+      ...FIXTURE_OPTS,
+    });
+    expect(lane).toBe('bdc-feature-development');
   });
 });
