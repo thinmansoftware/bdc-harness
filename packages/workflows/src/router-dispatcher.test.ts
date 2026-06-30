@@ -30,7 +30,7 @@ mock.module('@archon/paths', () => ({
 
 // --- Imports (after mocks) ---
 
-import { resolveEntryLane } from './router-dispatcher';
+import { resolveEntryLane, resolveDispatchTarget } from './router-dispatcher';
 
 // Hermetic fixture covers every scenario the suite asserts. Mirrors the
 // production router.yaml shape: tiers{} + task_classes{} + defaults{}.
@@ -200,5 +200,49 @@ describe('router-dispatcher resolveEntryLane', () => {
     expect(result.tier).toBe('0');
     expect(result.engineHint).toBe('deterministic-script');
     expect(result.laneName).toBeNull();
+  });
+});
+
+describe('resolveDispatchTarget -- Layer 2 fire path lane selection', () => {
+  it('Scenario A -- task_class resolves to a lane and fires it', async () => {
+    // Call resolveEntryLane directly to get the expected laneName, then assert
+    // resolveDispatchTarget returns the same value for the same task_class.
+    const expectedResolution = await resolveEntryLane({
+      taskClass: 'build-code',
+      ...FIXTURE_OPTS,
+    });
+    const result = await resolveDispatchTarget({
+      taskClass: 'build-code',
+      ...FIXTURE_OPTS,
+    });
+    // result must be defined, non-empty, and equal to what resolveEntryLane returned.
+    expect(result).toBeTruthy();
+    expect(typeof result).toBe('string');
+    expect(result).toBe(expectedResolution.laneName);
+    // Hardcoded anchor: FIXTURE_YAML maps build-code -> tier 3 -> sonnet-subscription
+    // -> DEFAULT_ENGINE_TO_LANE['sonnet-subscription'] = 'bdc-feature-development'.
+    expect(result).toBe('bdc-feature-development');
+  });
+
+  it('Scenario B -- explicit workflow name wins over task_class', async () => {
+    const result = await resolveDispatchTarget({
+      workflowName: 'bdc-feature-development',
+      taskClass: 'build-code',
+      ...FIXTURE_OPTS,
+    });
+    // Explicit name is highest precedence -- task_class resolution must NOT override it.
+    expect(result).toBe('bdc-feature-development');
+  });
+
+  it('Scenario C -- unresolvable task_class falls back to explicit name, no exception', async () => {
+    // unknown-class-xyz is not in FIXTURE_YAML task_classes. The explicit workflowName
+    // takes highest precedence and is returned before resolveEntryLane is consulted,
+    // so no exception is thrown regardless of task_class resolvability.
+    const result = await resolveDispatchTarget({
+      workflowName: 'bdc-feature-development',
+      taskClass: 'unknown-class-xyz',
+      ...FIXTURE_OPTS,
+    });
+    expect(result).toBe('bdc-feature-development');
   });
 });

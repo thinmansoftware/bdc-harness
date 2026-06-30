@@ -258,3 +258,43 @@ export async function resolveEntryLane(opts: ResolveOptions): Promise<ResolveRes
 
   return result;
 }
+
+/** Input for the Layer 2 fire-path resolver. Extends ResolveOptions with an optional caller-supplied workflow name. */
+export interface DispatchTargetOptions extends ResolveOptions {
+  /**
+   * Explicit workflow name supplied by the caller (--project / direct bridge call).
+   * When present, this wins over any task_class resolution (highest precedence).
+   */
+  workflowName?: string;
+}
+
+/**
+ * Resolve the workflow name to fire, applying the Layer 2 dispatcher precedence:
+ *   1. workflowName (caller-supplied) -- wins always.
+ *   2. resolveEntryLane(taskClass).laneName -- when taskClass is present and workflowName is absent,
+ *      and the resolved laneName is non-null (null means no lane wired for that engine).
+ *   3. Falls back to workflowName (may be undefined) when taskClass absent or laneName is null.
+ *
+ * Pure function: no path I/O outside what resolveEntryLane already performs.
+ * routerYamlContent can be injected for hermetic testing (same pattern as resolveEntryLane).
+ * Throws only when resolveEntryLane throws (all engines unreachable -- a config bug).
+ *
+ * NOTE: resolveEntryLane always returns ResolveResult (never undefined). laneName is string | null.
+ * A null laneName means no workflow lane is wired for the resolved engine (e.g. Tier 0 script).
+ * The null case falls through to opts.workflowName (which may itself be undefined).
+ */
+export async function resolveDispatchTarget(
+  opts: DispatchTargetOptions
+): Promise<string | undefined> {
+  if (opts.workflowName) return opts.workflowName;
+  if (opts.taskClass) {
+    const result = await resolveEntryLane({
+      taskClass: opts.taskClass,
+      woClass: opts.woClass,
+      routerYamlPath: opts.routerYamlPath,
+      routerYamlContent: opts.routerYamlContent,
+    });
+    if (result.laneName) return result.laneName;
+  }
+  return opts.workflowName;
+}

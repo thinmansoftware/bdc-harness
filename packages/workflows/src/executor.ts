@@ -15,6 +15,7 @@ import { formatDuration, parseDbTimestamp } from './utils/duration';
 import { getWorkflowEventEmitter } from './event-emitter';
 import { isRegisteredProvider, getRegisteredProviders } from '@archon/providers';
 import { classifyError } from './executor-shared';
+import { resolveEntryLane } from './router-dispatcher';
 import { BUNDLED_POLICIES } from './defaults/bundled-defaults';
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
@@ -1001,4 +1002,35 @@ export async function executeWorkflow(
       }
     }
   }
+}
+
+/**
+ * Resolve the workflow name to fire from the Cauldron dispatch path.
+ * Implements the Layer 2 dispatcher precedence:
+ *   1. Explicit workflowName -- wins always.
+ *   2. resolveEntryLane(taskClass) -> laneName -- when taskClass present and no explicit name,
+ *      and laneName is non-null (null means no lane wired for the resolved engine).
+ *   3. Falls back to workflowName (may be undefined) when no taskClass or laneName is null.
+ *
+ * Called by web-facing fire-path entry points (workflow-bridge.ts).
+ * Throws when resolveEntryLane finds no reachable tier -- caller must surface to user.
+ *
+ * @param workflowName - Caller-supplied explicit name (highest precedence; undefined when not set).
+ * @param taskClass    - WO task class key from router.yaml (e.g. "build-code").
+ * @param cwd          - Worktree root; used to locate config/router.yaml.
+ * @param woClass      - Optional WO class tag (CODE/INFRA/MIXED); forwarded to dispatcher log.
+ */
+export async function resolveFireTarget(
+  workflowName: string | undefined,
+  taskClass: string | undefined,
+  cwd: string,
+  woClass?: string
+): Promise<string | undefined> {
+  if (workflowName) return workflowName;
+  if (taskClass) {
+    const routerYamlPath = resolve(cwd, 'config/router.yaml');
+    const result = await resolveEntryLane({ taskClass, woClass, routerYamlPath });
+    if (result.laneName) return result.laneName;
+  }
+  return workflowName;
 }

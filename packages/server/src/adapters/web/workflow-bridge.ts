@@ -1,4 +1,5 @@
 import { createLogger } from '@archon/paths';
+import { resolveFireTarget } from '@archon/workflows/executor';
 import {
   getWorkflowEventEmitter,
   type WorkflowEmitterEvent,
@@ -278,4 +279,35 @@ export class WorkflowEventBridge {
   clearConversation(conversationId: string): void {
     this.outputCallbacks.delete(conversationId);
   }
+}
+
+/** Options for resolving the workflow to fire via the Cauldron dispatch path. */
+export interface CauldronFireOptions {
+  /** WO task class key (e.g. "build-code"). When present, Layer 2 dispatcher resolves the lane. */
+  task_class?: string;
+  /**
+   * Explicit workflow name supplied by the caller.
+   * Takes highest precedence -- overrides any task_class resolution.
+   */
+  workflowName?: string;
+  /** WO class tag (CODE/INFRA/MIXED). Forwarded to dispatcher log; no routing effect in Phase 4. */
+  woClass?: string;
+  /** Absolute worktree path. Used to locate config/router.yaml. */
+  cwd: string;
+}
+
+/**
+ * Resolve the workflow name for a Cauldron-fired WO.
+ * Delegates to resolveFireTarget in executor.ts which applies the Layer 2 dispatcher precedence:
+ *   1. workflowName (explicit) -- always wins.
+ *   2. task_class resolution via resolveEntryLane -- when explicit name absent.
+ *   3. Falls back to workflowName (may be undefined) when task_class absent or laneName is null.
+ *
+ * Callers use the returned name to look up the WorkflowDefinition and call executeWorkflow.
+ * Throws when resolveEntryLane finds no reachable tier for the task_class.
+ */
+export async function resolveWorkflowForFire(
+  opts: CauldronFireOptions
+): Promise<string | undefined> {
+  return resolveFireTarget(opts.workflowName, opts.task_class, opts.cwd, opts.woClass);
 }
