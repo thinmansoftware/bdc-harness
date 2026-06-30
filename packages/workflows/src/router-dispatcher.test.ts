@@ -82,6 +82,10 @@ task_classes:
     engine_hint: codex-subscription
   spec-authoring:
     starting_tier: "5"
+  architecture-review:
+    starting_tier: "5"
+  escalation-review:
+    starting_tier: "5"
 `;
 
 const FIXTURE_OPTS = {
@@ -251,5 +255,37 @@ describe('router-dispatcher resolveEntryLane', () => {
 
   it('Scenario D: ollama-qwen3 remains in UNREACHABLE_ENGINES', () => {
     expect(UNREACHABLE_ENGINES.has('ollama-qwen3')).toBe(true);
+  });
+
+  // ------------------------------------------------------------------
+  // WO-HARNESS-LAYER2-OPENROUTER-CHEAP-TIER-01 -- New tier-5 classes
+  // ------------------------------------------------------------------
+
+  it('architecture-review resolves to Tier 5 (fable-opus) with null lane', async () => {
+    const result = await resolveEntryLane({
+      taskClass: 'architecture-review',
+      woClass: 'CODE',
+      ...FIXTURE_OPTS,
+    });
+    // architecture-review starts at Tier 5. Tier 5 engines: fable-session, opus-api.
+    // Neither has a lane wired in DEFAULT_ENGINE_TO_LANE (both are null).
+    expect(result.tier).toBe('5');
+    expect(result.engineHint).toBe('fable-session');
+    expect(result.laneName).toBeNull();
+    expect(result.skippedTiers).toEqual([]);
+  });
+
+  it('escalation-review resolves to Tier 5 (fable-opus) with null lane', async () => {
+    const result = await resolveEntryLane({
+      taskClass: 'escalation-review',
+      woClass: 'CODE',
+      ...FIXTURE_OPTS,
+    });
+    // escalation-review starts at Tier 5. Tier 5 engines: fable-session, opus-api.
+    // Neither has a lane wired in DEFAULT_ENGINE_TO_LANE (both are null).
+    expect(result.tier).toBe('5');
+    expect(result.engineHint).toBe('fable-session');
+    expect(result.laneName).toBeNull();
+    expect(result.skippedTiers).toEqual([]);
   });
 });
