@@ -127,3 +127,6 @@ test-results/
 # (bundles, manifests, diff stats) generated at runtime.
 harness-artifacts/*
 !harness-artifacts/.gitkeep
+
+# Cauldron Fusion -- local PR review run output (advisory only, never in git)
+fusion-runs/

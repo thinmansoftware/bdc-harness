@@ -1,0 +1,16 @@
+{
+  "name": "@archon/fusion",
+  "version": "0.3.10",
+  "type": "module",
+  "main": "./src/cli.ts",
+  "bin": {
+    "fusion": "./src/cli.ts"
+  },
+  "scripts": {
+    "test": "bun test src/__tests__/gateway.test.ts && bun test src/__tests__/integrity.test.ts && bun test src/__tests__/redact.test.ts && bun test src/__tests__/full-run.test.ts",
+    "type-check": "bun x tsc --noEmit"
+  },
+  "dependencies": {
+    "openai": "^6.45.0"
+  }
+}

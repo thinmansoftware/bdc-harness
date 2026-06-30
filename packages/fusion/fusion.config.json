@@ -1,0 +1,21 @@
+{
+  "reviewers": [
+    {
+      "id": "architect",
+      "modelId": "anthropic/claude-opus-4-5",
+      "role": "architecture-adversarial",
+      "promptTemplate": "reviewer-architecture.txt"
+    },
+    {
+      "id": "systems",
+      "modelId": "z-ai/glm-5.2",
+      "role": "implementation-systems",
+      "promptTemplate": "reviewer-implementation.txt"
+    }
+  ],
+  "synthesizer": {
+    "modelId": "openai/gpt-4.5",
+    "promptTemplate": "synthesizer.txt"
+  },
+  "enableRound2": false
+}

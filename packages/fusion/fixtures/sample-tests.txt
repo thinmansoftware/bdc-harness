@@ -1,0 +1,10 @@
+bun test packages/core/src/__tests__/format.test.ts
+
+formatCurrency
+  [PASS] formats positive amounts
+  [PASS] formats zero
+  [PASS] formats negative amounts
+  [PASS] formats large amounts
+
+4 tests passed, 0 failed.
+All tests completed in 12ms.

@@ -1,0 +1,12 @@
+{
+  "WO": "WO-FUSION-SAMPLE-01",
+  "Files created": [
+    "packages/core/src/utils/format.ts",
+    "packages/core/src/__tests__/format.test.ts"
+  ],
+  "Files modified": [],
+  "Routes added": [],
+  "Migrations added": [],
+  "Tests": "4 passing / 4 total",
+  "Git commit": "abc123def456"
+}
