@@ -655,6 +655,10 @@ nodes:
       exit 0
 
   - id: war-council-validator
+    # Pin to claude/sonnet: trusted judge always Claude; top-level model: gpt-5.5
+    # must not route the validator to Codex. WO-HARNESS-SMART-CAULDRON-LANE-ROSTER-AND-RESILIENCE-01.
+    provider: claude
+    model: sonnet
     persona: captain-ci-validator
     depends_on: [ascii-gate]
     task_class: medium_work
@@ -793,7 +797,7 @@ nodes:
       # NEVER emit. Thus only until_bash (done.flag exists AND no debug prints in the
       # feature diff) can complete the loop.
       until: __NEVER_EMIT_USE_UNTIL_BASH__
-      max_iterations: 10
+      max_iterations: 20
       until_bash: |
         set -uo pipefail
         # MECHANICAL invariants ONLY. This does NOT prove Codex is satisfied --
