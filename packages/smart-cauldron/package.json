@@ -1,0 +1,18 @@
+{
+  "name": "@archon/smart-cauldron",
+  "version": "0.1.0",
+  "description": "Smart Cauldron v1.0 -- per-run escalation cascade. Fires WOs on cheapest tier first; climbs on gate-fail.",
+  "type": "module",
+  "main": "./src/cascade.ts",
+  "bin": {
+    "smart-cauldron": "./src/cli.ts"
+  },
+  "scripts": {
+    "test": "bun test src/__tests__/conductor.test.ts && bun test src/__tests__/cascade.test.ts",
+    "type-check": "bun x tsc --noEmit"
+  },
+  "dependencies": {
+    "@archon/overseer": "workspace:*",
+    "@archon/paths": "workspace:*"
+  }
+}
