@@ -16,6 +16,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Claude provider default `settingSources` changed from `['project']` to `['project', 'user']`, so skills, commands, agents, and `CLAUDE.md` from `~/.claude/` are now loaded by default in all environments — not just Docker. Without this, the new `/home/appuser` persistence would not actually surface user-installed Claude resources. Set `assistants.claude.settingSources: ['project']` in `.archon/config.yaml` to restore the previous project-only behavior (#1518).
 - `.env.example`, `docker-compose.yml`, `deploy/docker-compose.yml`, and `reference/configuration.md` now document that `ARCHON_HOME` is silently overridden inside Docker and `ARCHON_DATA` is a Compose-only host token never read by source. The Docker entrypoint emits a one-line stderr warning when either is set in the container env (#1517).
 
+### Dependency
+
+- `@anthropic-ai/claude-agent-sdk` bumped from `0.2.121` to `0.3.197` so the `sonnet` alias resolves to `claude-sonnet-5` (Sonnet 5) instead of `claude-sonnet-4-6` at runtime. The alias-to-model-id table lives inside the SDK package; SDK 0.3.197 explicitly maps `sonnet -> claude-sonnet-5` per its type definitions (`sdk.d.ts`: "Canonical wire model id this row's value resolves to (e.g. 'sonnet' -> 'claude-sonnet-5')"). Pre-bump served model evidence: `served_model_id=claude-sonnet-4-6` captured in `remote_agent_workflow_events` (workflow_run_id ad34af189e56ff3659b178b8893e9360). Post-bump served_model_id to be confirmed via sqlite3 query after container rebuild with new image (cold deploy requires John's PROCEED). WO: WO-HARNESS-SONNET-5-MODEL-ALIAS-UPGRADE-01.
+
 ### Fixed
 
 - Docker: `git config --global --add safe.directory` in the entrypoint now de-duplicates entries before adding, preventing unbounded growth of `~/.gitconfig` now that `/home/appuser` is persisted (#1518).
