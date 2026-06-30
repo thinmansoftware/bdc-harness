@@ -205,6 +205,93 @@ describe('GlmProvider', () => {
     ).toBe(true);
   });
 
+  // S5b-GLM: HTTP 429 (rate-limit / quota exceeded) is treated as a transient
+  // availability condition and also triggers failback.
+  // Finding 3 fix: 429 was excluded from isAvailabilityError(); now included.
+  test('S5b-GLM: OpenRouter 429 rate-limit triggers failback with disclosure', async () => {
+    process.env['GLM_API_KEY'] = 'sk-or-test';
+
+    const rateLimitError = Object.assign(new Error('429 Too Many Requests'), { status: 429 });
+    mockCreate.mockRejectedValueOnce(rateLimitError);
+
+    const failbackChunks: { type: string; content?: string }[] = [];
+    const failbackSendQuery = mock(async function* (
+      _p: string,
+      _c: string,
+      _r?: string,
+      _o?: unknown
+    ) {
+      yield { type: 'assistant', content: 'claude rate-limit fallback' } as const;
+      yield { type: 'result', sessionId: 'fb-429' } as const;
+    });
+
+    const failbackFactory = mock(() => ({ sendQuery: failbackSendQuery }));
+    const provider = new GlmProvider({
+      failbackProviderFactory: failbackFactory as unknown as () => GlmProvider,
+    });
+
+    for await (const chunk of provider.sendQuery('hello', '/tmp')) {
+      failbackChunks.push(chunk as { type: string; content?: string });
+    }
+
+    expect(failbackFactory).toHaveBeenCalled();
+    const disclosure = failbackChunks.find(
+      c => c.type === 'system' && c.content?.includes('GLM FAILBACK')
+    );
+    expect(disclosure).toBeDefined();
+    expect(
+      failbackChunks.some(
+        c => c.type === 'assistant' && c.content === 'claude rate-limit fallback'
+      )
+    ).toBe(true);
+  });
+
+  // S5c-GLM: failback options sanitization -- model and assistantConfig must be
+  // stripped before delegating to ClaudeProvider so a GLM model id (e.g.
+  // 'z-ai/glm-5.2') does not leak into the Claude SDK and cause an API rejection.
+  // Finding 1 fix: previously options were passed unfiltered.
+  test('S5c-GLM: failback call strips model and assistantConfig from options', async () => {
+    process.env['GLM_API_KEY'] = 'sk-or-test';
+
+    const serverError = Object.assign(new Error('503 Service Unavailable'), { status: 503 });
+    mockCreate.mockRejectedValueOnce(serverError);
+
+    const capturedFailbackOptions: unknown[] = [];
+    const failbackSendQuery = mock(async function* (
+      _p: string,
+      _c: string,
+      _r?: string,
+      opts?: unknown
+    ) {
+      capturedFailbackOptions.push(opts);
+      yield { type: 'result', sessionId: 'fb-strip' } as const;
+    });
+
+    const failbackFactory = mock(() => ({ sendQuery: failbackSendQuery }));
+    const provider = new GlmProvider({
+      failbackProviderFactory: failbackFactory as unknown as () => GlmProvider,
+    });
+
+    // Pass options with a GLM model id and an assistantConfig bag
+    const dirtyOptions = {
+      model: 'z-ai/glm-5.2',
+      assistantConfig: { glmSpecificKey: 'value' },
+      systemPrompt: 'you are helpful',
+    };
+
+    for await (const _ of provider.sendQuery('hello', '/tmp', undefined, dirtyOptions)) {
+      // consume
+    }
+
+    expect(capturedFailbackOptions).toHaveLength(1);
+    const passed = capturedFailbackOptions[0] as Record<string, unknown>;
+    // model and assistantConfig must be absent from the forwarded options
+    expect('model' in passed).toBe(false);
+    expect('assistantConfig' in passed).toBe(false);
+    // Passthrough fields must be preserved
+    expect(passed['systemPrompt']).toBe('you are helpful');
+  });
+
   // S6-GLM: non-availability error (401 auth) does NOT trigger failback.
   test('S6-GLM: 401 auth error re-throws without invoking failback', async () => {
     process.env['GLM_API_KEY'] = 'sk-or-bad';

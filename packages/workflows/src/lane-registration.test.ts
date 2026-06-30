@@ -13,7 +13,15 @@
 import { describe, it, expect } from 'bun:test';
 import { readFileSync, readdirSync } from 'fs';
 import { join } from 'path';
+import { clearRegistry, registerBuiltinProviders, registerCommunityProviders } from '@archon/providers';
 import { parseWorkflow } from './loader';
+
+// Register all providers so parseWorkflow can validate provider: claude/codex/glm/opr/pi
+// references in lane YAML files. Mirrors the setup pattern used in loader.test.ts,
+// executor.test.ts, and validator.test.ts.
+clearRegistry();
+registerBuiltinProviders();
+registerCommunityProviders();
 
 const REPO_ROOT = join(import.meta.dir, '..', '..', '..');
 const LANES_DIR = join(REPO_ROOT, '.archon/workflows/defaults');
@@ -46,16 +54,12 @@ describe('lane registration and war-council-validator pin', () => {
     it(`S4a: ${file} passes parseWorkflow() validation`, () => {
       const content = readFileSync(join(LANES_DIR, file), 'utf-8');
       const result = parseWorkflow(content, file);
-      // ParseResult may have a success/error shape -- accept either pattern
-      if (typeof result === 'object' && result !== null && 'errors' in result) {
-        const errors = (result as { errors?: unknown[] }).errors;
-        if (Array.isArray(errors) && errors.length > 0) {
-          throw new Error(`${file} has parseWorkflow errors: ${JSON.stringify(errors)}`);
-        }
+      // ParseResult is a discriminated union: { workflow: WorkflowDefinition; error: null }
+      // or { workflow: null; error: WorkflowLoadError }. A non-null error means failure.
+      if (result.error !== null) {
+        throw new Error(`${file} has parseWorkflow error: ${JSON.stringify(result.error)}`);
       }
-      // If result has a workflow property, it parsed successfully
-      // If result is the workflow itself (object with name), it parsed successfully
-      expect(result).toBeTruthy();
+      expect(result.workflow).toBeTruthy();
     });
 
     it(`S4b: ${file} has war-council-validator pinned to provider: claude model: sonnet`, () => {
@@ -63,10 +67,10 @@ describe('lane registration and war-council-validator pin', () => {
       const nodes = lane.nodes ?? [];
       const wcv = nodes.find((n: NodeDef) => n.id === 'war-council-validator');
 
-      if (!wcv) {
-        // Some lanes may not have the validator (skip gracefully)
-        return;
-      }
+      // Every lane MUST include the war-council-validator node -- its presence is
+      // the invariant being enforced. A missing node is the regression, not a skip.
+      expect(wcv).toBeDefined();
+      if (!wcv) return; // narrowing guard; expect above already fails the test
 
       expect(wcv.provider).toBe('claude');
       expect(wcv.model).toBe('sonnet');

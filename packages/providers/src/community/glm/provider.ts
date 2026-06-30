@@ -29,9 +29,11 @@ function isAvailabilityError(err: unknown): boolean {
     return false;
   }
   const errObj = err as { status?: unknown; message?: string };
-  // HTTP 5xx = server-side availability failure; 4xx = semantic rejection
+  // HTTP 5xx = server-side availability failure; 4xx = semantic rejection.
+  // HTTP 429 (Too Many Requests / quota exceeded) is also a transient availability
+  // condition on OpenRouter -- treat it the same as 5xx so the failback fires.
   if (typeof errObj.status === 'number') {
-    return errObj.status >= 500;
+    return errObj.status === 429 || errObj.status >= 500;
   }
   // Generic network/timeout errors from the fetch layer (no status code)
   const msg = (errObj.message ?? '').toLowerCase();
@@ -42,6 +44,26 @@ function isAvailabilityError(err: unknown): boolean {
     msg.includes('timeout') ||
     msg.includes('socket hang up')
   );
+}
+
+/**
+ * Strip provider-specific fields from SendQueryOptions before delegating to the
+ * failback provider. This prevents a GLM/OpenRouter model id (e.g. 'z-ai/glm-5.2')
+ * or GLM assistantConfig bag from leaking into the Claude SDK, which would reject
+ * the unknown model id and defeat the failback entirely.
+ *
+ * Mirrors the same pattern in CodexProvider.buildFailbackOptions().
+ * Returns undefined when no original options were provided.
+ */
+function buildFailbackOptions(original?: SendQueryOptions): SendQueryOptions | undefined {
+  if (!original) return undefined;
+  const { model, fallbackModel, assistantConfig, ...rest } = original;
+  // Reference the destructured locals so the compiler/lint see them as
+  // intentionally discarded (drop-from-payload), not accidentally unused.
+  void model;
+  void fallbackModel;
+  void assistantConfig;
+  return rest;
 }
 
 /**
@@ -149,7 +171,7 @@ export class GlmProvider implements IAgentProvider {
             'Reduced cross-model adversarial value -- human review recommended.',
         };
         const failback = this.failbackProviderFactory();
-        yield* failback.sendQuery(prompt, _cwd, undefined, options);
+        yield* failback.sendQuery(prompt, _cwd, undefined, buildFailbackOptions(options));
         return;
       }
       throw err;
@@ -216,7 +238,7 @@ export class GlmProvider implements IAgentProvider {
             'Reduced cross-model adversarial value -- human review recommended.',
         };
         const failback = this.failbackProviderFactory();
-        yield* failback.sendQuery(prompt, _cwd, undefined, options);
+        yield* failback.sendQuery(prompt, _cwd, undefined, buildFailbackOptions(options));
         return;
       }
       throw err;
