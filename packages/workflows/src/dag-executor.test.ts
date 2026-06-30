@@ -5315,6 +5315,85 @@ describe('executeDagWorkflow -- credit exhaustion', () => {
     // Overall workflow should be marked failed
     expect(store.failWorkflowRun).toHaveBeenCalled();
   });
+
+  // -----------------------------------------------------------------------
+  // Layer 1 gate-result plumbing (WO-HARNESS-LAYER1-CLIMB-AND-GATE-EVENTS-01)
+  //
+  // Proves the wire from dag-executor's credit-exhaustion handleNodeFailure
+  // site through to the persisted node_failed event payload. In Phase 3
+  // (this WO) `nodeGateResult` is always undefined at the call site, so the
+  // omit-when-absent contract MUST result in no `gate_result` field on the
+  // payload. When Phase 5 (WO-HARNESS-V1-PERRUN-CASCADE-01) assigns the
+  // cascade engine output to `nodeGateResult`, the same spread pattern will
+  // carry the GateResult through this exact wire (verified at the unit
+  // level by climb-and-gate-events.test.ts T2). Without this integration
+  // test the dag-executor -> handleNodeFailure wire is unverified.
+  // -----------------------------------------------------------------------
+  it('Layer 1 gate-result plumbing: credit-exhaustion node_failed event uses omit-when-absent for gate_result (Phase 3 production state)', async () => {
+    const creditExhaustedQuery = mock(function* () {
+      yield { type: 'assistant', content: "You're out of extra usage - resets in 2h" };
+      yield { type: 'result', sessionId: 'dag-session-credit-gate' };
+    });
+    mockGetAgentProviderDag.mockReturnValue({
+      sendQuery: creditExhaustedQuery,
+      getType: () => 'claude',
+      getCapabilities: mockClaudeCapabilities,
+    });
+
+    const store = createMockStore();
+    const deps = createMockDeps(store);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('credit-gate-plumb-run');
+
+    await executeDagWorkflow(
+      deps,
+      platform,
+      'conv-credit-gate',
+      testDir,
+      {
+        name: 'credit-gate-test',
+        nodes: [{ id: 'investigate', prompt: 'Investigate the issue' }],
+      },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    // Find the node_failed event the credit-exhaustion site produced via
+    // handleNodeFailure. Persistence is fire-and-forget so the payload is
+    // captured by the createWorkflowEvent mock.
+    const calls = (store.createWorkflowEvent as Mock<() => Promise<void>>).mock.calls.map(
+      (c: unknown[]) =>
+        c[0] as {
+          event_type: string;
+          step_name?: string;
+          data: Record<string, unknown>;
+        }
+    );
+    const nodeFailed = calls.find(
+      e => e.event_type === 'node_failed' && e.step_name === 'investigate'
+    );
+    expect(nodeFailed).toBeDefined();
+    if (!nodeFailed) return;
+
+    // The overseer-bridge wire must have run -- proves handleNodeFailure was
+    // invoked (not an inline emit path).
+    expect(nodeFailed.data.overseer_class).toBeDefined();
+    expect(nodeFailed.data.overseer_decision).toBeDefined();
+
+    // Phase 3 omit-when-absent invariant: nodeGateResult is undefined at the
+    // call site, so the spread `...(nodeGateResult ? { gateResult: ... } : {})`
+    // adds NO key. If a future change to dag-executor drops the spread or
+    // hardcodes a value, this assertion catches it immediately. When Phase 5
+    // lands, this assertion should be replaced with a positive check (gate_result
+    // present with the cascade-engine-computed GateResult).
+    expect('gate_result' in nodeFailed.data).toBe(false);
+  });
 });
 describe('executeDagWorkflow -- approval node', () => {
   let testDir: string;

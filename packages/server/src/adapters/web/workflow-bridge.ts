@@ -170,6 +170,23 @@ export function mapWorkflowEvent(event: WorkflowEmitterEvent): string | null {
         timestamp: Date.now(),
       });
 
+    case 'cascade_step':
+      // Layer 1 (WO-HARNESS-LAYER1-CLIMB-AND-GATE-EVENTS-01): structured
+      // tier-climb. Forwarded as a distinct SSE type so Mission Control's
+      // cascade-trace can render rung escalations without parsing log text.
+      // DISTINCT from `overseer_decision = escalate` (which is salvage inside
+      // a single rung; cascade_step is a real tier climb across rungs).
+      return JSON.stringify({
+        type: 'workflow_cascade_step',
+        runId: event.runId,
+        nodeId: event.nodeId,
+        fromTier: event.from_tier,
+        toTier: event.to_tier,
+        gate: event.gate,
+        reason: event.reason,
+        timestamp: Date.now(),
+      });
+
     default: {
       const exhaustiveCheck: never = event;
       getLog().warn(

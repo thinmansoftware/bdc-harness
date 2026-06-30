@@ -52,6 +52,36 @@ export interface GateResult {
   reason?: string;
 }
 
+/**
+ * Spread-ready payload for the gate-result wire at every emit/persist site.
+ *
+ * Returns `{ [key]: gateResult }` when `gateResult` is defined, OR `{}` when
+ * undefined (omit-when-absent contract). Two keys are supported:
+ *   - `'gate_result'` for `createWorkflowEvent.data` persistence (snake_case
+ *     matches the DB freeform-JSON column convention).
+ *   - `'gateResult'` for in-process emitter event payloads and
+ *     `HandleNodeFailureContext.gateResult` (camelCase matches the typed
+ *     event interfaces).
+ *
+ * Extracted from the inline ternary spreads in `dag-executor.ts` so the
+ * structural invariant -- "when set, gate_result/gateResult appears under
+ * the exact key; when undefined, no key is added" -- is directly
+ * unit-testable. In Phase 3 of WO-HARNESS-LAYER1-CLIMB-AND-GATE-EVENTS-01
+ * `nodeGateResult` is always undefined at the dag-executor call sites by
+ * design (Phase 5 cascade-engine populates it). Without this helper, the
+ * only test coverage is the negative (omit-when-absent) path; the helper
+ * lets us prove the positive (key-present-when-set) path in isolation
+ * today, so the Phase 5 patch is purely additive at the assignment site --
+ * the wire is already verified.
+ */
+export function gateResultPayload<K extends 'gate_result' | 'gateResult'>(
+  key: K,
+  gateResult: GateResult | undefined
+): Partial<Record<K, GateResult>> {
+  if (gateResult === undefined) return {};
+  return { [key]: gateResult } as Partial<Record<K, GateResult>>;
+}
+
 // ---------------------------------------------------------------------------
 // Event types
 // ---------------------------------------------------------------------------

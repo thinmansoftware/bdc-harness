@@ -51,7 +51,7 @@ import {
 } from './schemas';
 import { formatToolCall } from './utils/tool-formatter';
 import { createLogger } from '@archon/paths';
-import { getWorkflowEventEmitter, type GateResult } from './event-emitter';
+import { getWorkflowEventEmitter, gateResultPayload, type GateResult } from './event-emitter';
 import { detectSilentFailure } from './silent-failure-detector';
 import { handleNodeFailure } from './overseer-bridge';
 import { evaluateCondition } from './condition-evaluator';
@@ -1205,6 +1205,12 @@ async function executeNodeInternal(
           outputSoFar: nodeOutputText,
           hasOutput: nodeOutputText.length > 0,
           extraEventData: { duration_ms: duration },
+          // Layer 1 gate-result plumb (WO-HARNESS-LAYER1-CLIMB-AND-GATE-EVENTS-01).
+          // Phase 5 cascade engine populates `nodeGateResult` before this
+          // call site runs; omit-when-absent ensures Phase 3 with undefined
+          // adds no field. The spread is the contract -- without it the
+          // handleNodeFailure path cannot emit gate_result on node_failed.
+          ...gateResultPayload('gateResult', nodeGateResult),
         }
       );
 
@@ -1240,6 +1246,8 @@ async function executeNodeInternal(
           outputSoFar: nodeOutputText,
           hasOutput: nodeOutputText.length > 0,
           extraEventData: { duration_ms: duration },
+          // Layer 1 gate-result plumb -- see cancel branch above for full rationale.
+          ...gateResultPayload('gateResult', nodeGateResult),
         }
       );
 
@@ -1273,6 +1281,8 @@ async function executeNodeInternal(
           outputSoFar: '',
           hasOutput: false,
           extraEventData: { duration_ms: duration },
+          // Layer 1 gate-result plumb -- see cancel branch above for full rationale.
+          ...gateResultPayload('gateResult', nodeGateResult),
         }
       );
 
@@ -1326,7 +1336,7 @@ async function executeNodeInternal(
           // Layer 1 gate-result (WO-HARNESS-LAYER1-CLIMB-AND-GATE-EVENTS-01).
           // Structured pass/fail of the gate this node ran. Omit-when-absent
           // -- Phase 5 populates `nodeGateResult` before this emit-site runs.
-          ...(nodeGateResult ? { gate_result: nodeGateResult } : {}),
+          ...gateResultPayload('gate_result', nodeGateResult),
         },
       })
       .catch((err: Error) => {
@@ -1346,7 +1356,7 @@ async function executeNodeInternal(
       ...(nodeStopReason ? { stopReason: nodeStopReason } : {}),
       ...(nodeNumTurns !== undefined ? { numTurns: nodeNumTurns } : {}),
       // Layer 1 gate-result emitter mirror -- omit-when-absent.
-      ...(nodeGateResult ? { gateResult: nodeGateResult } : {}),
+      ...gateResultPayload('gateResult', nodeGateResult),
     });
 
     // Clean up throttle entries on completion
@@ -1399,7 +1409,7 @@ async function executeNodeInternal(
           // Layer 1 gate-result (WO-HARNESS-LAYER1-CLIMB-AND-GATE-EVENTS-01).
           // Structured pass/fail (typically fail+reason here) of the gate this
           // node ran. Omit-when-absent.
-          ...(nodeGateResult ? { gate_result: nodeGateResult } : {}),
+          ...gateResultPayload('gate_result', nodeGateResult),
         },
       })
       .catch((err: Error) => {
@@ -1416,7 +1426,7 @@ async function executeNodeInternal(
       nodeName: node.command ?? node.id,
       error: err.message,
       // Layer 1 gate-result emitter mirror -- omit-when-absent.
-      ...(nodeGateResult ? { gateResult: nodeGateResult } : {}),
+      ...gateResultPayload('gateResult', nodeGateResult),
     });
 
     return {

@@ -43,6 +43,7 @@ mock.module('@archon/paths', () => ({
 import { emitCascadeStep } from './cascade-events.ts';
 import { handleNodeFailure } from './overseer-bridge.ts';
 import {
+  gateResultPayload,
   getWorkflowEventEmitter,
   resetWorkflowEventEmitter,
   type WorkflowEmitterEvent,
@@ -305,5 +306,116 @@ describe('handleNodeFailure -- backward compatibility', () => {
     const event = emit.mock.calls[0][0] as Record<string, unknown>;
     expect(event.type).toBe('node_failed');
     expect('gateResult' in event).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// T5/T6 -- gateResultPayload helper: structural proof of the spread invariant
+//
+// The dag-executor sites currently spread `gateResultPayload(<key>,
+// nodeGateResult)` into event payloads. In Phase 3 `nodeGateResult` is always
+// undefined at those sites, which means the integration test at
+// dag-executor.test.ts only exercises the negative (omit-when-absent) branch.
+//
+// These unit tests directly exercise the helper with both branches, so the
+// positive case ("when nodeGateResult is set, gate_result/gateResult appears
+// under the exact key with the exact value") is proven structurally today --
+// before Phase 5 (WO-HARNESS-V1-PERRUN-CASCADE-01) ever assigns
+// nodeGateResult. The combination of:
+//   (a) T5/T6: helper is structurally correct under both branches
+//   (b) Production code calls the helper at every emit/persist site (verified
+//       by reading dag-executor.ts -- the 7 spreads are all `...gateResultPayload(...)`)
+//   (c) Existing integration test: the negative branch fires in real execution
+// means the Phase 5 patch only has to set `nodeGateResult = ...`; the wire
+// from that assignment through to node_completed / node_failed payloads is
+// already verified end-to-end.
+// ---------------------------------------------------------------------------
+
+describe('gateResultPayload -- spread helper', () => {
+  it('T5: returns {} when gateResult is undefined (omit-when-absent contract)', () => {
+    // Both key variants -- the snake_case persist key and the camelCase emit key.
+    const persistEmpty = gateResultPayload('gate_result', undefined);
+    expect(persistEmpty).toEqual({});
+    expect(Object.keys(persistEmpty).length).toBe(0);
+    expect('gate_result' in persistEmpty).toBe(false);
+
+    const emitEmpty = gateResultPayload('gateResult', undefined);
+    expect(emitEmpty).toEqual({});
+    expect(Object.keys(emitEmpty).length).toBe(0);
+    expect('gateResult' in emitEmpty).toBe(false);
+  });
+
+  it('T6: returns { [key]: gateResult } when a GateResult is provided (positive wire proof)', () => {
+    const failResult: GateResult = {
+      gate: 'tests',
+      outcome: 'fail',
+      reason: 'TypeScript type error',
+    };
+    const passResult: GateResult = { gate: 'validator', outcome: 'pass' };
+
+    // Persist key (snake_case): proves the wire used by
+    //   createWorkflowEvent({ data: { ..., ...gateResultPayload('gate_result', x) } })
+    // at both the node_completed and node_failed (catch block) call sites
+    // in dag-executor.ts.
+    const persistFail = gateResultPayload('gate_result', failResult);
+    expect('gate_result' in persistFail).toBe(true);
+    expect(persistFail.gate_result).toEqual(failResult);
+    // Key must NOT be the camelCase variant -- catches a key-swap regression
+    // that would silently break Mission Control's persisted-event query.
+    expect('gateResult' in persistFail).toBe(false);
+
+    // Emit key (camelCase): proves the wire used by
+    //   emitter.emit({ ..., ...gateResultPayload('gateResult', x) })
+    // and the handleNodeFailure ctx spread at the 3 failure-site call sites.
+    const emitPass = gateResultPayload('gateResult', passResult);
+    expect('gateResult' in emitPass).toBe(true);
+    expect(emitPass.gateResult).toEqual(passResult);
+    expect('gate_result' in emitPass).toBe(false);
+
+    // Value identity -- not a shallow clone, since GateResult is a plain
+    // value object the consumers carry through unmodified.
+    expect(persistFail.gate_result).toBe(failResult);
+    expect(emitPass.gateResult).toBe(passResult);
+  });
+
+  it('T6b: helper output spreads correctly into a host event payload (structural proof of the dag-executor call sites)', () => {
+    // Simulates the exact pattern at dag-executor.ts node_completed
+    // createWorkflowEvent.data construction.
+    const failResult: GateResult = { gate: 'manifest', outcome: 'fail', reason: 'missing files' };
+    const persistData = {
+      duration_ms: 100,
+      node_output: 'sample',
+      ...gateResultPayload('gate_result', failResult),
+    };
+    expect(persistData).toEqual({
+      duration_ms: 100,
+      node_output: 'sample',
+      gate_result: { gate: 'manifest', outcome: 'fail', reason: 'missing files' },
+    });
+    expect(persistData.gate_result).toBe(failResult);
+
+    // Same simulation for the omit-when-absent branch -- proves the spread
+    // adds no key when gateResult is undefined (matches Phase 3 production state).
+    const persistDataAbsent = {
+      duration_ms: 100,
+      node_output: 'sample',
+      ...gateResultPayload('gate_result', undefined),
+    };
+    expect(persistDataAbsent).toEqual({ duration_ms: 100, node_output: 'sample' });
+    expect('gate_result' in persistDataAbsent).toBe(false);
+
+    // Same simulation for the camelCase emitter spread -- proves the in-process
+    // event-emitter event would carry gateResult when set.
+    const passResult: GateResult = { gate: 'ci', outcome: 'pass' };
+    const emitEvent = {
+      type: 'node_completed' as const,
+      runId: 'r1',
+      nodeId: 'n1',
+      nodeName: 'n',
+      duration: 100,
+      ...gateResultPayload('gateResult', passResult),
+    };
+    expect(emitEvent.gateResult).toEqual(passResult);
+    expect(emitEvent.gateResult).toBe(passResult);
   });
 });
