@@ -153,3 +153,80 @@ describe('approval choices (additive)', () => {
     expect(result.success).toBe(false);
   });
 });
+
+// ---------------------------------------------------------------------------
+// loop node provider/model field preservation
+// WO-HARNESS-LOOP-NODE-PROVIDER-MODEL-DROPPED-01
+// ---------------------------------------------------------------------------
+
+describe('loop node provider/model field preservation', () => {
+  // Scenario A -- provider and model survive the schema transform
+  it('loop node: provider and model survive the transform (regression: were silently dropped)', () => {
+    const result = dagNodeSchema.safeParse({
+      id: 'plan-review',
+      provider: 'opr',
+      model: 'glm-5.2',
+      persona: 'war-council-architect-opr',
+      loop: {
+        prompt: 'Review the plan.',
+        until: 'APPROVED',
+        max_iterations: 3,
+      },
+    });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect((result.data as { provider?: string }).provider).toBe('opr');
+      expect((result.data as { model?: string }).model).toBe('glm-5.2');
+    }
+  });
+
+  // Scenario B -- non-loop branches unaffected (no regression)
+  it('prompt node: provider and model still survive (no regression in sibling branches)', () => {
+    const result = dagNodeSchema.safeParse({
+      id: 'step',
+      provider: 'codex',
+      model: 'gpt-5',
+      prompt: 'Implement the feature.',
+    });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect((result.data as { provider?: string }).provider).toBe('codex');
+      expect((result.data as { model?: string }).model).toBe('gpt-5');
+    }
+  });
+
+  it('command node: provider and model still survive (no regression in sibling branches)', () => {
+    const result = dagNodeSchema.safeParse({
+      id: 'step',
+      provider: 'codex',
+      model: 'gpt-5',
+      command: 'archon-assist',
+    });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect((result.data as { provider?: string }).provider).toBe('codex');
+      expect((result.data as { model?: string }).model).toBe('gpt-5');
+    }
+  });
+
+  // Scenario D -- silent-misroute regression: codex loop node provider not dropped to undefined
+  it('codex loop node: provider not dropped to undefined (silent-misroute regression)', () => {
+    // Before fix: node.provider was undefined after the transform.
+    // dag-executor then did: loopProvider = undefined ?? workflowProvider = 'claude'.
+    // The node silently ran with the wrong provider and no error.
+    const result = dagNodeSchema.safeParse({
+      id: 'implement',
+      provider: 'codex',
+      loop: {
+        prompt: 'Implement the feature.',
+        until: 'COMPLETE',
+        max_iterations: 5,
+      },
+    });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      const resolvedProvider = (result.data as { provider?: string }).provider ?? 'claude';
+      expect(resolvedProvider).toBe('codex');
+    }
+  });
+});
