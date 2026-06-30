@@ -4,7 +4,10 @@ import type { WorkflowLoadResult } from '@archon/workflows/schemas/workflow';
 import type { ParseResult } from '@archon/workflows/loader';
 
 export const mockDiscoverWorkflowsWithConfig = mock(
-  async (): Promise<WorkflowLoadResult> => ({ workflows: [], errors: [] })
+  async (): Promise<WorkflowLoadResult> => ({
+    workflows: [],
+    errors: [],
+  })
 );
 export const mockParseWorkflow = mock(
   (): ParseResult => ({
