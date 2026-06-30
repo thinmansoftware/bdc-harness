@@ -1099,12 +1099,22 @@ describe('ClaudeProvider', () => {
     // -> result chunk carries servedModelId captured from the SDK system/init
     // event's `model` field. This is the integrity-signal data prerequisite
     // for the served-vs-requested guard.
+    //
+    // NOTE: This test verifies the CAPTURE MECHANISM only (provider reads the
+    // system/init event's `model` field and surfaces it as servedModelId on the
+    // result chunk). It cannot verify alias resolution -- i.e., whether the
+    // 'sonnet' alias actually routes to 'claude-sonnet-5' at the API level.
+    // That requires a live run; see WO-HARNESS-SONNET-5-MODEL-ALIAS-UPGRADE-01
+    // stop condition 3 (sqlite3 query on remote_agent_workflow_events).
+    // The mock model value below reflects the expected post-bump served model
+    // (claude-sonnet-5) so the test at least exercises the expected steady-state
+    // value rather than the pre-bump claude-sonnet-4-6.
     test('captures servedModelId from system/init event onto result chunk', async () => {
       mockQuery.mockImplementation(async function* () {
         yield {
           type: 'system',
           subtype: 'init',
-          model: 'claude-sonnet-4-6',
+          model: 'claude-sonnet-5',
           mcp_servers: [],
         };
         yield {
@@ -1123,7 +1133,7 @@ describe('ClaudeProvider', () => {
       const result = chunks.find(c => c.type === 'result');
       expect(result).toBeDefined();
       expect(result && 'servedModelId' in result ? result.servedModelId : undefined).toBe(
-        'claude-sonnet-4-6'
+        'claude-sonnet-5'
       );
     });
   });
