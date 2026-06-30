@@ -202,3 +202,122 @@ describe('router-dispatcher resolveEntryLane', () => {
     expect(result.laneName).toBeNull();
   });
 });
+
+// ---------------------------------------------------------------------------
+// Post-WO fixture: openrouter-cheap at tier 2, haiku at tier 3, workhorse at tier 4.
+// Used exclusively by WO-HARNESS-LAYER2-OPENROUTER-CHEAP-TIER-01 scenarios.
+// ---------------------------------------------------------------------------
+const POST_WO_FIXTURE_YAML = `version: 1
+tiers:
+  "0":
+    name: script
+    engines:
+      - deterministic-script
+  "1":
+    name: qwen-local
+    engines:
+      - ollama-qwen3
+  "2":
+    name: openrouter-cheap
+    engines:
+      - glm-5.2
+      - qwen3-coder
+      - deepseek-v4-pro
+  "3":
+    name: haiku
+    engines:
+      - claude-haiku-api
+  "4":
+    name: workhorse-subscription
+    engines:
+      - sonnet-subscription
+      - codex-subscription
+defaults:
+  fallback_tier: "2"
+task_classes:
+  log-triage:
+    starting_tier: "1"
+  build-code:
+    starting_tier: "2"
+  single-builder-pr:
+    starting_tier: "2"
+`;
+
+const POST_WO_OPTS = {
+  routerYamlPath: '/fixture/router.yaml',
+  routerYamlContent: POST_WO_FIXTURE_YAML,
+};
+
+describe('WO-HARNESS-LAYER2-OPENROUTER-CHEAP-TIER-01 -- openrouter-cheap tier insertion', () => {
+  it('Scenario A -- build-code resolves to OpenRouter tier 2 with a defined lane', async () => {
+    const result = await resolveEntryLane({
+      taskClass: 'build-code',
+      woClass: 'CODE',
+      ...POST_WO_OPTS,
+    });
+    expect(result.tier).toBe('2');
+    expect(result.laneName).not.toBeNull();
+    expect(typeof result.laneName).toBe('string');
+    expect((result.laneName as string).length).toBeGreaterThan(0);
+  });
+
+  it('Scenario B -- glm-5.2 engine key maps to the OpenRouter lane', async () => {
+    // tier 2 lists glm-5.2 first; dispatcher picks first reachable engine.
+    const result = await resolveEntryLane({
+      taskClass: 'build-code',
+      woClass: 'CODE',
+      ...POST_WO_OPTS,
+    });
+    expect(result.engineHint).toBe('glm-5.2');
+    expect(result.laneName).toBe('bdc-feature-development-glm');
+  });
+
+  it('Scenario C -- qwen3-coder and deepseek-v4-pro each map to the OpenRouter lane', async () => {
+    const makeFixture = (engine: string): string => `version: 1
+tiers:
+  "1":
+    name: qwen-local
+    engines:
+      - ollama-qwen3
+  "2":
+    name: openrouter-cheap
+    engines:
+      - ${engine}
+  "3":
+    name: haiku
+    engines:
+      - claude-haiku-api
+defaults:
+  fallback_tier: "3"
+task_classes:
+  build-code:
+    starting_tier: "2"
+`;
+    for (const engine of ['qwen3-coder', 'deepseek-v4-pro']) {
+      const result = await resolveEntryLane({
+        taskClass: 'build-code',
+        woClass: 'CODE',
+        routerYamlPath: '/fixture/router.yaml',
+        routerYamlContent: makeFixture(engine),
+      });
+      expect(result.engineHint).toBe(engine);
+      expect(result.laneName).toBe('bdc-feature-development-glm');
+    }
+  });
+
+  it('Scenario D -- ollama-qwen3 remains unreachable; tier 1 is skipped', async () => {
+    // log-triage starts at tier 1 (ollama-qwen3-only). Because ollama-qwen3
+    // stays in UNREACHABLE_ENGINES, the dispatcher advances past tier 1.
+    // This behaviorally verifies that UNREACHABLE_ENGINES still contains
+    // ollama-qwen3: if it were removed, the dispatcher would return tier "1"
+    // and engineHint "ollama-qwen3" -- both assertions below would then fail.
+    const result = await resolveEntryLane({
+      taskClass: 'log-triage',
+      woClass: 'CODE',
+      ...POST_WO_OPTS,
+    });
+    expect(result.tier).not.toBe('1');
+    expect(result.tier).toBe('2');
+    expect(result.engineHint).not.toBe('ollama-qwen3');
+  });
+});

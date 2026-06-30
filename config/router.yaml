@@ -28,13 +28,13 @@
 # =============================================================================
 
 version: 1
-updated: "2026-06-11"
+updated: "2026-06-30"
 source_brief: "BDC_XO/briefs/2026-06-10-cauldron-2-design.md"
 
 # -----------------------------------------------------------------------------
 # TIERS -- the engine ladder, cheapest first.
-# marginal_cost is the operative field: tiers 0-1 are free, 3 is flat-rate
-# subscription (already paid for -- saturate it), 2 and 4 are metered API.
+# marginal_cost is the operative field: tiers 0-1 are free, 4 is flat-rate
+# subscription (already paid for -- saturate it), 2-3 and 5 are metered API.
 # -----------------------------------------------------------------------------
 tiers:
   "0":
@@ -61,6 +61,18 @@ tiers:
       wrong for interactive lanes.
 
   "2":
+    name: openrouter-cheap
+    engines:
+      - glm-5.2
+      - qwen3-coder
+      - deepseek-v4-pro
+    marginal_cost: cheap-api
+    work_shape: >-
+      Low-cost OpenRouter models (GLM-4, Qwen3-coder, DeepSeek v4 Pro) via
+      openrouter.ai/api/v1. Starting tier for build-code and single-builder-pr.
+      Escalates to claude-haiku-api (tier 3) on gate failure. Credential: GLM_API_KEY.
+
+  "3":
     name: haiku
     engines:
       - claude-haiku-api
@@ -69,7 +81,7 @@ tiers:
       Clerical agents, persona walkthroughs, monitors, structured extraction
       where Qwen's quality or latency is not enough.
 
-  "3":
+  "4":
     name: workhorse-subscription
     # TWO pools at flat rate = two or more parallel build lanes at zero
     # marginal cost. The subscription scheduler (P2) tracks each pool's
@@ -84,14 +96,14 @@ tiers:
       The workhorse build tier. Ordinary CODE WOs, multi-file refactors,
       test repair, PR fixes. Default destination for build-code.
 
-  "4":
+  "5":
     name: fable-opus
     engines:
       - fable-session               # PREFERRED when a subscription window is open
       - opus-api                    # fallback when no session window
     marginal_cost: expensive
-    # HARD CAP: every Tier 4 job carries a per-WO budget. The dispatcher
-    # MUST refuse to fire a Tier 4 job without an explicit budget on the WO;
+    # HARD CAP: every Tier 5 job carries a per-WO budget. The dispatcher
+    # MUST refuse to fire a Tier 5 job without an explicit budget on the WO;
     # this default applies only when the WO omits one.
     budget_cap_usd_per_wo_default: 25
     work_shape: >-
@@ -114,21 +126,21 @@ task_classes:
   summarize:
     starting_tier: "1"
   persona-walkthrough:
-    starting_tier: "2"
-  monitor:
-    starting_tier: "2"
-  build-code:
     starting_tier: "3"
+  monitor:
+    starting_tier: "3"
+  build-code:
+    starting_tier: "2"
     engine_hint: sonnet-subscription
   single-builder-pr:
-    starting_tier: "3"
+    starting_tier: "2"
     engine_hint: codex-subscription # Codex's proven shape per Codex-Goal doctrine
   spec-authoring:
-    starting_tier: "4"              # the ONLY class allowed to START at Tier 4
+    starting_tier: "5"              # the ONLY class allowed to START at Tier 5
   architecture-review:
-    starting_tier: "4"
+    starting_tier: "5"
   escalation-review:
-    starting_tier: "4"              # terminal review of jobs the ladder pushed up
+    starting_tier: "5"              # terminal review of jobs the ladder pushed up
 
 # -----------------------------------------------------------------------------
 # ESCALATION LADDER -- how jobs move between tiers.
@@ -149,7 +161,7 @@ escalation:
       - failure-output              # the failing gate output / error text, verbatim
       - relevant-diff               # the diff the lower tier produced (may be empty)
   ceiling: >-
-    Tier 4 is terminal. A Tier 4 failure does not escalate -- it goes to the
+    Tier 5 is terminal. A Tier 5 failure does not escalate -- it goes to the
     WAITING-ON-JOHN queue as a human decision.
   demotion: >-
     v1 has NO automatic demotion. P4 grader feedback will add demotion
@@ -164,10 +176,10 @@ defaults:
   # pass the job's gates. When in doubt between two tiers, pick the cheaper
   # one -- the ladder exists to catch the miss.
   start_at_cheapest_plausible_tier: true
-  # NOTHING starts at Tier 4 unless its task class is spec-authoring (or
-  # another class explicitly mapped to "4" above). A job arriving with a
-  # Tier 4 request and a non-design class is mis-specified: re-class it or
+  # NOTHING starts at Tier 5 unless its task class is spec-authoring (or
+  # another class explicitly mapped to "5" above). A job arriving with a
+  # Tier 5 request and a non-design class is mis-specified: re-class it or
   # kick it back.
-  never_start_at_tier_4_without_spec_authoring_class: true
+  never_start_at_tier_5_without_spec_authoring_class: true
   # Unmapped classes land here until someone maps them properly via PR.
   fallback_tier: "2"
