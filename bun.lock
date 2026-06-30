@@ -90,6 +90,16 @@
         "sharp": "^0.33.0",
       },
     },
+    "packages/fusion": {
+      "name": "@archon/fusion",
+      "version": "0.3.10",
+      "bin": {
+        "fusion": "./src/cli.ts",
+      },
+      "dependencies": {
+        "openai": "^6.45.0",
+      },
+    },
     "packages/git": {
       "name": "@archon/git",
       "version": "0.3.10",
@@ -291,6 +301,8 @@
     "@archon/core": ["@archon/core@workspace:packages/core"],
 
     "@archon/docs-web": ["@archon/docs-web@workspace:packages/docs-web"],
+
+    "@archon/fusion": ["@archon/fusion@workspace:packages/fusion"],
 
     "@archon/git": ["@archon/git@workspace:packages/git"],
 
