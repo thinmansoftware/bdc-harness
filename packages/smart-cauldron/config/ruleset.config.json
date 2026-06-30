@@ -1,0 +1,26 @@
+{
+  "_comment": "Smart Cauldron conductor ruleset. Rules are evaluated top-down; first match wins. defaultEntry fires when no rule matches.",
+  "defaultEntry": "glm",
+  "rules": [
+    {
+      "match": { "tags": ["billing", "money", "payment", "stripe"] },
+      "entry": "claude"
+    },
+    {
+      "match": { "tags": ["auth", "oauth", "security"] },
+      "entry": "claude"
+    },
+    {
+      "match": { "woClass": "INFRA" },
+      "entry": "claude"
+    },
+    {
+      "match": { "woClass": "CODE", "tags": ["mechanical"] },
+      "entry": "glm"
+    },
+    {
+      "match": { "woClass": "CODE" },
+      "entry": "glm"
+    }
+  ]
+}

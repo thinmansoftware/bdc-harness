@@ -130,3 +130,7 @@ harness-artifacts/*
 
 # Cauldron Fusion -- local PR review run output (advisory only, never in git)
 fusion-runs/
+
+# Smart Cauldron v1.0 -- per-run cascade telemetry (local only, never in git)
+cascade-runs/*
+!cascade-runs/.gitkeep

@@ -29,6 +29,7 @@ COPY packages/overseer/package.json ./packages/overseer/
 COPY packages/paths/package.json ./packages/paths/
 COPY packages/providers/package.json ./packages/providers/
 COPY packages/server/package.json ./packages/server/
+COPY packages/smart-cauldron/package.json ./packages/smart-cauldron/
 COPY packages/web/package.json ./packages/web/
 COPY packages/workflows/package.json ./packages/workflows/
 COPY packages/persona-context-loader/package.json ./packages/persona-context-loader/
@@ -152,6 +153,7 @@ COPY packages/overseer/package.json ./packages/overseer/
 COPY packages/paths/package.json ./packages/paths/
 COPY packages/providers/package.json ./packages/providers/
 COPY packages/server/package.json ./packages/server/
+COPY packages/smart-cauldron/package.json ./packages/smart-cauldron/
 COPY packages/web/package.json ./packages/web/
 COPY packages/workflows/package.json ./packages/workflows/
 COPY packages/persona-context-loader/package.json ./packages/persona-context-loader/
