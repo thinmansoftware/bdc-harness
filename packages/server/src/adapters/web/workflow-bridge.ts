@@ -3,6 +3,7 @@ import {
   getWorkflowEventEmitter,
   type WorkflowEmitterEvent,
 } from '@archon/workflows/event-emitter';
+import { resolveExecutorLane } from '@archon/workflows/executor';
 import { SSETransport } from './transport';
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
@@ -297,4 +298,32 @@ export class WorkflowEventBridge {
   clearConversation(conversationId: string): void {
     this.outputCallbacks.delete(conversationId);
   }
+}
+
+/**
+ * Options for a web-initiated Cauldron 2.0 workflow fire request.
+ * task_class drives Layer 2 lane selection when workflowName is absent.
+ */
+export interface WebFireRequest {
+  /** Explicit workflow name from the caller. Overrides task_class when present. */
+  workflowName?: string;
+  /** WO task class key (e.g. "build-code"). Resolved via Layer 2 dispatcher. */
+  task_class?: string;
+  /** Absolute path to config/router.yaml. */
+  routerYamlPath: string;
+}
+
+/**
+ * Resolve the workflow lane for a web-initiated fire, propagating task_class
+ * through the Layer 2 dispatcher. Returns the workflow name to dispatch, or
+ * undefined when neither workflowName nor a resolvable task_class was provided.
+ *
+ * WO-HARNESS-LAYER2-DISPATCHER-FIRES-RESOLVED-LANE-01.
+ */
+export async function resolveWebLane(req: WebFireRequest): Promise<string | undefined> {
+  return resolveExecutorLane({
+    workflowName: req.workflowName,
+    taskClass: req.task_class,
+    routerYamlPath: req.routerYamlPath,
+  });
 }

@@ -16,6 +16,7 @@ import { getWorkflowEventEmitter } from './event-emitter';
 import { isRegisteredProvider, getRegisteredProviders } from '@archon/providers';
 import { classifyError } from './executor-shared';
 import { BUNDLED_POLICIES } from './defaults/bundled-defaults';
+import { resolveEntryLane } from './router-dispatcher';
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
 let cachedLog: ReturnType<typeof createLogger> | undefined;
@@ -315,6 +316,45 @@ function normalizeRemoteToOwnerRepo(url: string): string | null {
   const httpsMatch = /https?:\/\/[^/]+\/([^/]+\/[^/]+?)(?:\.git)?(?:\/.*)?$/.exec(url);
   if (httpsMatch?.[1]) return httpsMatch[1].toLowerCase();
   return null;
+}
+
+/**
+ * Resolve which workflow name to fire, applying Layer 2 dispatcher precedence.
+ * Cauldron 2.0 fire paths (web bridge, n8n hooks) call this before
+ * selecting a WorkflowDefinition to pass to executeWorkflow.
+ *
+ * Precedence (highest to lowest):
+ *   1. workflowName (explicit caller override) -- wins always.
+ *   2. taskClass -> resolveEntryLane() -> laneName when non-null.
+ *   3. Falls back to undefined (caller must handle no-workflow case).
+ *
+ * The duplicate of pickLane() in router-dispatcher.ts is intentional: pickLane
+ * exists for test ergonomics (no executor import overhead in tests); this export
+ * satisfies SC-2 (resolveEntryLane must be called from executor.ts) and serves
+ * as the canonical live-path symbol for Cauldron 2.0 callers.
+ *
+ * WO-HARNESS-LAYER2-DISPATCHER-FIRES-RESOLVED-LANE-01.
+ */
+export async function resolveExecutorLane(opts: {
+  workflowName?: string;
+  taskClass?: string;
+  routerYamlPath: string;
+  routerYamlContent?: string;
+}): Promise<string | undefined> {
+  if (opts.workflowName !== undefined) {
+    return opts.workflowName;
+  }
+  if (opts.taskClass) {
+    const result = await resolveEntryLane({
+      taskClass: opts.taskClass,
+      routerYamlPath: opts.routerYamlPath,
+      routerYamlContent: opts.routerYamlContent,
+    });
+    if (result.laneName !== null) {
+      return result.laneName;
+    }
+  }
+  return undefined;
 }
 
 /**

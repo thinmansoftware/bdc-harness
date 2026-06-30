@@ -258,3 +258,38 @@ export async function resolveEntryLane(opts: ResolveOptions): Promise<ResolveRes
 
   return result;
 }
+
+/**
+ * Pure 3-way precedence wrapper for Layer 2 lane selection.
+ *
+ * Precedence (highest to lowest):
+ *   1. workflowName provided -- return it immediately; no resolveEntryLane call.
+ *   2. taskClass provided -- call resolveEntryLane; return laneName when non-null.
+ *   3. Neither resolved -- return undefined.
+ *
+ * Exists alongside resolveExecutorLane (executor.ts) so tests can exercise the
+ * precedence logic without importing the heavier executor module and its mocks.
+ *
+ * WO-HARNESS-LAYER2-DISPATCHER-FIRES-RESOLVED-LANE-01.
+ */
+export async function pickLane(opts: {
+  workflowName?: string;
+  taskClass?: string;
+  routerYamlPath: string;
+  routerYamlContent?: string;
+}): Promise<string | undefined> {
+  if (opts.workflowName !== undefined) {
+    return opts.workflowName;
+  }
+  if (opts.taskClass) {
+    const result = await resolveEntryLane({
+      taskClass: opts.taskClass,
+      routerYamlPath: opts.routerYamlPath,
+      routerYamlContent: opts.routerYamlContent,
+    });
+    if (result.laneName !== null) {
+      return result.laneName;
+    }
+  }
+  return undefined;
+}

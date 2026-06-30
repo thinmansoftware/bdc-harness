@@ -71,6 +71,10 @@ const mockExecuteWorkflow = mock(async () => ({
   workflowRunId: 'run-uuid-approval',
 }));
 const mockCreateWorkflowDeps = mock(() => ({ store: {} }));
+const mockResolveWebLane = mock(
+  async (req: { workflowName?: string; task_class?: string; routerYamlPath: string }) =>
+    req.workflowName ?? undefined
+);
 
 // Type aliases for clarity in tests
 type MockWorkflowRun = {
@@ -154,6 +158,10 @@ mockAllWorkflowModules();
 
 mock.module('@archon/workflows/executor', () => ({
   executeWorkflow: mockExecuteWorkflow,
+}));
+
+mock.module('../adapters/web/workflow-bridge', () => ({
+  resolveWebLane: mockResolveWebLane,
 }));
 
 mock.module('@archon/core/workflows', () => ({
@@ -698,7 +706,12 @@ describe('POST /api/workflows/runs/:runId/approve', () => {
     mockDiscoverWorkflowsWithConfig.mockReset();
     mockExecuteWorkflow.mockReset();
     mockCreateWorkflowDeps.mockReset();
+    mockResolveWebLane.mockReset();
     mockCreateWorkflowDeps.mockImplementation(() => ({ store: {} }));
+    mockResolveWebLane.mockImplementation(
+      async (req: { workflowName?: string; task_class?: string; routerYamlPath: string }) =>
+        req.workflowName ?? undefined
+    );
     mockExecuteWorkflow.mockImplementation(async () => ({
       success: true,
       workflowRunId: 'run-uuid-approval',
@@ -754,6 +767,11 @@ describe('POST /api/workflows/runs/:runId/approve', () => {
       '/tmp/worktrees/portal-login',
       expect.any(Function)
     );
+    expect(mockResolveWebLane).toHaveBeenCalledWith({
+      workflowName: 'build-portal-login-phone-pin',
+      task_class: undefined,
+      routerYamlPath: '/tmp/worktrees/portal-login/config/router.yaml',
+    });
     expect(mockWebAdapter.setConversationDbId).toHaveBeenCalledWith(
       'web-worker-xyz',
       'worker-conv-uuid'
@@ -762,6 +780,71 @@ describe('POST /api/workflows/runs/:runId/approve', () => {
       'web-worker-xyz',
       'web-parent-abc'
     );
+    expect(mockExecuteWorkflow).toHaveBeenCalledWith(
+      expect.anything(),
+      mockWebAdapter,
+      'web-worker-xyz',
+      '/tmp/worktrees/portal-login',
+      workflow,
+      'Build the portal login',
+      'worker-conv-uuid',
+      'cb-uuid-1',
+      undefined,
+      undefined,
+      'parent-conv-uuid'
+    );
+  });
+
+  test('routes auto-resume through Layer 2 when metadata carries task_class', async () => {
+    const workflow = {
+      name: 'bdc-feature-development-codex',
+      description: 'resolved workflow',
+      nodes: [],
+    };
+    mockGetWorkflowRun.mockImplementationOnce(async () => ({
+      ...MOCK_PAUSED_INTERACTIVE_RUN,
+      workflow_name: '',
+      metadata: {
+        ...MOCK_PAUSED_INTERACTIVE_RUN.metadata,
+        task_class: 'single-builder-pr',
+      },
+    }));
+    mockGetConversationById.mockImplementation(async (id: string) => {
+      if (id === 'parent-conv-uuid') {
+        return {
+          id: 'parent-conv-uuid',
+          platform_conversation_id: 'web-parent-abc',
+          platform_type: 'web',
+        };
+      }
+      if (id === 'worker-conv-uuid') {
+        return {
+          id: 'worker-conv-uuid',
+          platform_conversation_id: 'web-worker-xyz',
+          platform_type: 'web',
+        };
+      }
+      return null;
+    });
+    mockResolveWebLane.mockImplementationOnce(async () => 'bdc-feature-development-codex');
+    mockDiscoverWorkflowsWithConfig.mockImplementationOnce(async () => ({
+      workflows: [{ workflow: workflow as never, source: 'project' }],
+      errors: [],
+    }));
+
+    const { app, mockWebAdapter } = makeApp();
+    const response = await app.request('/api/workflows/runs/run-uuid-approval/approve', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ comment: 'approved' }),
+    });
+
+    expect(response.status).toBe(200);
+    expect(mockResolveWebLane).toHaveBeenCalledWith({
+      workflowName: undefined,
+      task_class: 'single-builder-pr',
+      routerYamlPath: '/tmp/worktrees/portal-login/config/router.yaml',
+    });
     expect(mockExecuteWorkflow).toHaveBeenCalledWith(
       expect.anything(),
       mockWebAdapter,
