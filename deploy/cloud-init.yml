@@ -1,7 +1,7 @@
 #cloud-config
 
 # =============================================================================
-# Archon — Cloud-Init Auto-Setup
+# Archon -- Cloud-Init Auto-Setup
 # =============================================================================
 #
 # Paste this into your VPS provider's "User Data" field when creating a server.
@@ -24,7 +24,7 @@
 #
 # After the server boots (~5-8 min), SSH in as the archon user:
 #   ssh archon@your-server-ip
-#   1. Edit /opt/archon/.env — set your AI credentials, DOMAIN, DATABASE_URL
+#   1. Edit /opt/archon/.env -- set your AI credentials, DOMAIN, DATABASE_URL
 #   2. cd /opt/archon && docker compose --profile with-db --profile cloud up -d
 #   3. Open https://your-domain.com
 #
@@ -86,7 +86,7 @@ runcmd:
   - ufw allow 443/udp
   - ufw --force enable
 
-  # --- Clone and configure (fail fast — single shell so set -e applies) ---
+  # --- Clone and configure (fail fast -- single shell so set -e applies) ---
   - |
     set -e
     git clone https://github.com/coleam00/Archon.git /opt/archon

@@ -908,7 +908,10 @@ describe('workflows database', () => {
     test('deletes events then run within a transaction for terminal run', async () => {
       mockQuery
         .mockResolvedValueOnce(createQueryResult([])) // BEGIN
-        .mockResolvedValueOnce(createQueryResult([{ status: 'completed' }])) // SELECT guard
+        // SELECT guard: terminal AND archived (deletion requires archived_at IS NOT NULL)
+        .mockResolvedValueOnce(
+          createQueryResult([{ status: 'completed', archived_at: new Date('2026-06-01') }])
+        )
         .mockResolvedValueOnce(createQueryResult([], 1)) // events DELETE
         .mockResolvedValueOnce(createQueryResult([], 1)) // run DELETE
         .mockResolvedValueOnce(createQueryResult([])); // COMMIT
@@ -920,6 +923,33 @@ describe('workflows database', () => {
       expect(selectSql).toContain('SELECT status');
       const [eventsSql] = mockQuery.mock.calls[2] as [string, unknown[]];
       expect(eventsSql).toContain('remote_agent_workflow_events');
+      const [runsSql] = mockQuery.mock.calls[3] as [string, unknown[]];
+      expect(runsSql).toContain('remote_agent_workflow_runs');
+    });
+
+    test('throws when a terminal run has not been archived', async () => {
+      mockQuery
+        .mockResolvedValueOnce(createQueryResult([])) // BEGIN
+        // terminal status but archived_at is null -> archive guard fires
+        .mockResolvedValueOnce(createQueryResult([{ status: 'completed', archived_at: null }]));
+
+      await expect(deleteWorkflowRun('run-unarchived')).rejects.toThrow(
+        'Archive the run first before deleting'
+      );
+    });
+
+    test('force=true bypasses the archive guard', async () => {
+      mockQuery
+        .mockResolvedValueOnce(createQueryResult([])) // BEGIN
+        // terminal status, NOT archived, but force=true skips the archive guard
+        .mockResolvedValueOnce(createQueryResult([{ status: 'completed', archived_at: null }]))
+        .mockResolvedValueOnce(createQueryResult([], 1)) // events DELETE
+        .mockResolvedValueOnce(createQueryResult([], 1)) // run DELETE
+        .mockResolvedValueOnce(createQueryResult([])); // COMMIT
+
+      await deleteWorkflowRun('run-forced', true);
+
+      expect(mockQuery).toHaveBeenCalledTimes(5);
       const [runsSql] = mockQuery.mock.calls[3] as [string, unknown[]];
       expect(runsSql).toContain('remote_agent_workflow_runs');
     });

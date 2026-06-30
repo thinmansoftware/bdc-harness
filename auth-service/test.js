@@ -4,7 +4,7 @@
 const assert = require('node:assert/strict');
 const { createHmac, timingSafeEqual } = require('node:crypto');
 
-// ── isSafeRedirect ─────────────────────────────────────────────────────────
+// -- isSafeRedirect ---------------------------------------------------------
 const { isSafeRedirect } = require('./server.js');
 
 // Safe paths (must return true)
@@ -25,7 +25,7 @@ assert.equal(isSafeRedirect('relative/no-leading-slash'), false, 'no leading sla
 
 console.log('isSafeRedirect: all assertions passed');
 
-// ── signCookie / verifyCookie ──────────────────────────────────────────────
+// -- signCookie / verifyCookie ----------------------------------------------
 const { signCookie, verifyCookie } = require('./server.js');
 
 // Round-trip: sign then verify returns original value
@@ -42,7 +42,7 @@ assert.equal(verifyCookie('nodothere'), null, 'missing dot returns null');
 // Empty string returns null
 assert.equal(verifyCookie(''), null, 'empty string returns null');
 
-// Wrong secret returns null — construct a cookie signed with a different secret
+// Wrong secret returns null -- construct a cookie signed with a different secret
 const wrongSig = createHmac('sha256', 'wrong-secret').update('authenticated').digest('base64url');
 assert.equal(verifyCookie(`authenticated.${wrongSig}`), null, 'wrong secret returns null');
 

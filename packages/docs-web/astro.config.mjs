@@ -11,7 +11,7 @@ export default defineConfig({
         src: './src/assets/logo.png',
         alt: 'Archon',
       },
-      description: 'AI workflow engine — package your coding workflows as YAML, run them anywhere.',
+      description: 'AI workflow engine -- package your coding workflows as YAML, run them anywhere.',
       head: [
         {
           tag: 'script',
@@ -23,7 +23,7 @@ export default defineConfig({
         baseUrl: 'https://github.com/coleam00/Archon/edit/main/packages/docs-web/',
       },
       sidebar: [
-        { label: '🗺️  Roadmap', link: '/roadmap/' },
+        { label: '  Roadmap', link: '/roadmap/' },
         {
           label: 'The Book of Archon',
           autogenerate: { directory: 'book' },

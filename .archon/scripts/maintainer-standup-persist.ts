@@ -3,14 +3,14 @@
  * Reads raw synthesize-node output on stdin and writes the brief markdown +
  * state.json to .archon/maintainer-standup/. Handles two formats:
  *
- *   Preferred — delimited markers:
- *     # Maintainer Standup — YYYY-MM-DD
+ *   Preferred -- delimited markers:
+ *     # Maintainer Standup -- YYYY-MM-DD
  *     ...brief...
  *     ARCHON_STATE_JSON_BEGIN
  *     {...state json...}
  *     ARCHON_STATE_JSON_END
  *
- *   Fallback — JSON-wrapped (what Pi/Minimax tends to emit):
+ *   Fallback -- JSON-wrapped (what Pi/Minimax tends to emit):
  *     [optional prose preamble]
  *     {"brief_markdown": "...", "next_state": {...}}
  *
@@ -30,7 +30,7 @@ let brief: string | null = null;
 let state: State | null = null;
 let source: 'delimiter' | 'json-wrapper' | null = null;
 
-// ── Tier 1: delimiter-based extraction ──
+// -- Tier 1: delimiter-based extraction --
 const BEGIN = 'ARCHON_STATE_JSON_BEGIN';
 const END = 'ARCHON_STATE_JSON_END';
 const beginIdx = raw.indexOf(BEGIN);
@@ -48,7 +48,7 @@ if (beginIdx !== -1 && endIdx !== -1 && endIdx > beginIdx) {
   }
 }
 
-// ── Tier 2: JSON-wrapper fallback ({brief_markdown, next_state}) ──
+// -- Tier 2: JSON-wrapper fallback ({brief_markdown, next_state}) --
 if (state === null) {
   const firstBrace = raw.indexOf('{');
   if (firstBrace !== -1) {
@@ -85,7 +85,7 @@ if (state === null || brief === null) {
   process.exit(1);
 }
 
-// Strip leading prose preamble — keep from the first '# ' heading onward.
+// Strip leading prose preamble -- keep from the first '# ' heading onward.
 const lines = brief.split('\n');
 const headingIdx = lines.findIndex((l) => l.startsWith('# '));
 if (headingIdx > 0) {

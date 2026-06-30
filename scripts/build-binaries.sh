@@ -3,8 +3,8 @@
 # Build standalone CLI binaries for all supported platforms.
 #
 # Modes:
-#   - Multi-target (local dev): no env vars → builds all 4 local targets into dist/binaries/
-#   - Single-target (CI):       TARGET + OUTFILE both set → builds only that target
+#   - Multi-target (local dev): no env vars -> builds all 4 local targets into dist/binaries/
+#   - Single-target (CI):       TARGET + OUTFILE both set -> builds only that target
 #
 # Env vars:
 #   VERSION    - version string (default: from package.json)
@@ -31,7 +31,7 @@ bun run scripts/generate-bundled-defaults.ts
 # The file is restored via an EXIT trap so the dev tree is never left dirty,
 # even if `bun build --compile` fails mid-way. See GitHub issue #979.
 BUNDLED_BUILD_FILE="packages/paths/src/bundled-build.ts"
-trap 'echo "Restoring ${BUNDLED_BUILD_FILE}..."; git checkout -- "${BUNDLED_BUILD_FILE}" || echo "WARNING: failed to restore ${BUNDLED_BUILD_FILE} — working tree may be dirty" >&2' EXIT
+trap 'echo "Restoring ${BUNDLED_BUILD_FILE}..."; git checkout -- "${BUNDLED_BUILD_FILE}" || echo "WARNING: failed to restore ${BUNDLED_BUILD_FILE} -- working tree may be dirty" >&2' EXIT
 
 echo "Updating build-time constants (version=${VERSION}, is_binary=true)..."
 cat > "$BUNDLED_BUILD_FILE" << EOF
@@ -40,7 +40,7 @@ cat > "$BUNDLED_BUILD_FILE" << EOF
  *
  * This file is rewritten by scripts/build-binaries.sh before \`bun build --compile\`
  * and restored afterwards via an EXIT trap. Do not edit these values by hand
- * outside the build script — the dev defaults live in the committed copy.
+ * outside the build script -- the dev defaults live in the committed copy.
  */
 
 export const BUNDLED_IS_BINARY = true;
@@ -73,10 +73,10 @@ MIN_BINARY_SIZE=1000000
 # Build each target
 for target_pair in "${TARGETS[@]}"; do
   IFS=':' read -r target outfile <<< "$target_pair"
-  echo "Building $target → $outfile"
+  echo "Building $target -> $outfile"
 
   # --bytecode disabled: Bun 1.3.11 produces broken bytecode for our module graph
-  # (likely triggered by @mariozechner/pi-coding-agent's CJS/ESM interop shape) —
+  # (likely triggered by @mariozechner/pi-coding-agent's CJS/ESM interop shape) --
   # "TypeError: Expected CommonJS module to have a function wrapper" at runtime.
   # Always --minify to match release parity.
   bun build \

@@ -11,7 +11,7 @@
 INPUT=$(cat)
 
 if [ -z "$SLACK_WEBHOOK_URL" ]; then
-  # No webhook configured — skip notification silently
+  # No webhook configured -- skip notification silently
   exit 0
 fi
 
@@ -54,7 +54,7 @@ PAYLOAD=$(jq -n \
     ]
   }')
 
-# Send to Slack — don't let curl failure block the agent
+# Send to Slack -- don't let curl failure block the agent
 curl -s -X POST "$SLACK_WEBHOOK_URL" \
   -H "Content-Type: application/json" \
   -d "$PAYLOAD" > /dev/null 2>&1 || true

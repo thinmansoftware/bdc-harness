@@ -26,7 +26,7 @@
 #     ARCHON_USER_HOME=/opt/archon-user-home    # Any absolute path on the host
 #   Default: Docker-managed volume (archon_user_home)
 #
-# Harness artifacts (load-bearing workflow output — host-persistent, WO-168 Tier 1):
+# Harness artifacts (load-bearing workflow output -- host-persistent, WO-168 Tier 1):
 #   /host-artifacts is a host bind mount where load-bearing workflow nodes save
 #   git bundles + raw artifacts BEFORE remote push, so work survives container
 #   prune / push failure / worktree cleanup. Anchor: 2026-05-16 engine sortie
@@ -38,7 +38,7 @@
 # Cloud (HTTPS):
 #   1. Set DOMAIN=archon.example.com in .env
 #   2. Point DNS A record to your server
-#   3. Add --profile cloud — Caddy handles TLS automatically via Let's Encrypt
+#   3. Add --profile cloud -- Caddy handles TLS automatically via Let's Encrypt
 #
 
 services:
@@ -136,7 +136,7 @@ services:
         condition: service_healthy
 
   # -------------------------------------------------------------------------
-  # Auth service — form-based login for Caddy forward_auth (optional: --profile auth)
+  # Auth service -- form-based login for Caddy forward_auth (optional: --profile auth)
   # Use alongside --profile cloud: docker compose --profile cloud --profile auth up -d
   # Requires AUTH_USERNAME, AUTH_PASSWORD_HASH, COOKIE_SECRET in .env.
   # See docs/docker.md for setup instructions.

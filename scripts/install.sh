@@ -162,9 +162,9 @@ verify_checksum() {
 # Main installation
 main() {
   echo ""
-  echo "  ╔═══════════════════════════════════════╗"
-  echo "  ║      Archon CLI Installer             ║"
-  echo "  ╚═══════════════════════════════════════╝"
+  echo "  -----------------------------------------"
+  echo "  -      Archon CLI Installer             -"
+  echo "  -----------------------------------------"
   echo ""
 
   # Detect platform

@@ -20,7 +20,7 @@ for pkg in packages/*/package.json; do
       pkg.version = '${ROOT_VERSION}';
       fs.writeFileSync('${pkg}', JSON.stringify(pkg, null, 2) + '\n');
     "
-    echo "  ${pkg}: ${current} → ${ROOT_VERSION}"
+    echo "  ${pkg}: ${current} -> ${ROOT_VERSION}"
   fi
 done
 

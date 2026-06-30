@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# lint-yaml.sh — Rule 29 lint gate
+# lint-yaml.sh -- Rule 29 lint gate
 #
 # Fails if any bdc-*.yaml file contains a bare `gh pr create` without --repo or -R
 # in an actual bash command position (not echo strings, not comments, not multi-line
@@ -28,9 +28,9 @@ if [ ! -d "$TARGET_DIR" ]; then
 fi
 
 # Find bare gh pr create calls, filtering false positives:
-#   :[0-9]+:\s*#     — comment lines in the YAML (grep output format includes filename:linenum:)
-#   :[0-9]+:\s*(echo|printf) — echo/printf strings that mention the command as text
-#   \\$              — continuation lines (--repo appears on the NEXT line)
+#   :[0-9]+:\s*#     -- comment lines in the YAML (grep output format includes filename:linenum:)
+#   :[0-9]+:\s*(echo|printf) -- echo/printf strings that mention the command as text
+#   \\$              -- continuation lines (--repo appears on the NEXT line)
 VIOLATIONS=$(
   grep -rn 'gh pr create' "$TARGET_DIR"/bdc-*.yaml 2>/dev/null \
   | grep -Ev ':[0-9]+:[[:space:]]*#' \

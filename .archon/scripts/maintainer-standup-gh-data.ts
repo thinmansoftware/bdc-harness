@@ -12,7 +12,7 @@ import { execFileSync } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 
-// execFileSync with argv arrays — avoids shell-string interpolation and the
+// execFileSync with argv arrays -- avoids shell-string interpolation and the
 // associated quoting hazards (esp. for handles loaded from profile.md).
 function exec(file: string, args: string[]): string {
   try {
@@ -31,7 +31,7 @@ function parseJson<T>(s: string, fallback: T): T {
   }
 }
 
-// ── Load gh_handle from profile.md frontmatter ──
+// -- Load gh_handle from profile.md frontmatter --
 let ghHandle = '';
 const profilePath = resolve(process.cwd(), '.archon/maintainer-standup/profile.md');
 if (existsSync(profilePath)) {
@@ -43,7 +43,7 @@ if (!ghHandle) {
   process.stderr.write('Warning: no gh_handle found in profile.md frontmatter\n');
 }
 
-// ── Load prior state to scope "recently closed" lookups ──
+// -- Load prior state to scope "recently closed" lookups --
 let lastRunAt = '';
 const statePath = resolve(process.cwd(), '.archon/maintainer-standup/state.json');
 if (existsSync(statePath)) {
@@ -55,7 +55,7 @@ if (existsSync(statePath)) {
   }
 }
 
-// ── Open PRs (full metadata for triage) ──
+// -- Open PRs (full metadata for triage) --
 const prFields = [
   'number',
   'title',
@@ -76,7 +76,7 @@ const prFields = [
 ].join(',');
 
 // `gh pr list --json` does NOT auto-paginate beyond `--limit`. 1000 is the
-// practical ceiling for a single GraphQL call and gives ~15× headroom over
+// practical ceiling for a single GraphQL call and gives ~15 headroom over
 // today's open-PR count. The next-run-diff invariant in the synthesis
 // command (observed_prs must include every entry in all_open_prs) requires
 // completeness here, so we warn loudly if we ever hit the cap.
@@ -126,7 +126,7 @@ if (ghHandle) {
   );
 }
 
-// ── Recent unlabeled issues (last 7 days) ──
+// -- Recent unlabeled issues (last 7 days) --
 const sevenDaysAgo = new Date();
 sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
 const sevenDaysAgoStr = sevenDaysAgo.toISOString().slice(0, 10);
@@ -141,7 +141,7 @@ const recentUnlabeledIssues = parseJson<unknown[]>(
   [],
 );
 
-// ── Recently closed/merged since last run (or last 7 days as fallback) ──
+// -- Recently closed/merged since last run (or last 7 days as fallback) --
 const sinceDate = lastRunAt ? lastRunAt.slice(0, 10) : sevenDaysAgoStr;
 const recentlyClosedPrs = parseJson<unknown[]>(
   exec('gh', [
@@ -164,7 +164,7 @@ const recentlyClosedIssues = parseJson<unknown[]>(
   [],
 );
 
-// ── Maintainer's recent commits on dev (what you shipped) ──
+// -- Maintainer's recent commits on dev (what you shipped) --
 let myRecentCommits = '';
 if (ghHandle) {
   const since = lastRunAt || '7 days ago';
@@ -179,7 +179,7 @@ if (ghHandle) {
   }
 }
 
-// ── Replies since last run (contributor comments on PRs/issues) ──
+// -- Replies since last run (contributor comments on PRs/issues) --
 // Fetches all conversation + inline review comments since the last run,
 // filters out the maintainer's own comments, and groups by PR/issue number.
 // Lets the synthesizer surface "@author replied on PR #N" items for the
@@ -251,7 +251,7 @@ if (repoIds && lastRunAt) {
     const author = c.user?.login;
     if (!author) return;
     if (ghHandle && author.toLowerCase() === ghHandle.toLowerCase()) return;
-    // Skip GitHub bots — coderabbitai, codex-connector, dependabot, etc. The
+    // Skip GitHub bots -- coderabbitai, codex-connector, dependabot, etc. The
     // "[bot]" suffix is the canonical GitHub convention for bot accounts and
     // is reliable across all bot integrations. Maintainer wants human replies
     // worth responding to, not the constant churn of automated review tooling.
@@ -284,7 +284,7 @@ if (repoIds && lastRunAt) {
     addComment(num, kind, c, c.issue_url ?? '');
   }
 
-  // /pulls/comments are inline code-review comments — most specific signal,
+  // /pulls/comments are inline code-review comments -- most specific signal,
   // usually need a code-level response.
   const reviewComments = parseJson<GhComment[]>(
     exec('gh', [

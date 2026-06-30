@@ -14,7 +14,7 @@ import { execFileSync } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 
-// execFileSync (argv array, no shell) — defense-in-depth for git invocations.
+// execFileSync (argv array, no shell) -- defense-in-depth for git invocations.
 // All args are hardcoded literals or values from `git` output (SHAs); using
 // execFileSync removes any need to reason about shell metacharacters.
 function git(args: string[]): { stdout: string; ok: boolean } {
@@ -33,7 +33,7 @@ if (existsSync(stateFile)) {
     const state = JSON.parse(readFileSync(stateFile, 'utf8')) as { last_dev_sha?: string };
     priorSha = state.last_dev_sha ?? '';
   } catch {
-    // ignore corrupt state — first-run-like behavior
+    // ignore corrupt state -- first-run-like behavior
   }
 }
 
@@ -63,7 +63,7 @@ if (priorSha && priorSha !== currentDevSha) {
     newCommits = log.stdout;
     diffStat = git(['diff', '--stat', `${priorSha}..origin/dev`]).stdout;
   } else {
-    newCommits = '(prior SHA not found locally — full diff unavailable)';
+    newCommits = '(prior SHA not found locally -- full diff unavailable)';
   }
 }
 

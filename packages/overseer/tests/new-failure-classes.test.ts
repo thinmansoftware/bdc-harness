@@ -23,7 +23,7 @@ import { join } from 'node:path';
 import { classifyError, decide, runEscalation } from '../src/index.ts';
 import type { EscalationContext } from '../src/escalate.ts';
 
-// --- Test 1 — implement_loop_no_output classification ------------------------
+// --- Test 1 -- implement_loop_no_output classification ------------------------
 
 describe('classify: implement_loop_no_output', () => {
   test('commit-and-push stderr alone (no validator context) classifies as implement_loop_no_output', () => {
@@ -51,7 +51,7 @@ describe('classify: implement_loop_no_output', () => {
   });
 });
 
-// --- Test 2 — validator_feedback_not_applied classification ------------------
+// --- Test 2 -- validator_feedback_not_applied classification ------------------
 
 describe('classify: validator_feedback_not_applied', () => {
   test('same stderr as no_output but with validator action verbs in context classifies as validator_feedback_not_applied', () => {
@@ -99,7 +99,7 @@ describe('classify: validator_feedback_not_applied', () => {
   });
 });
 
-// --- Test 3 — validator_rejected classification ------------------------------
+// --- Test 3 -- validator_rejected classification ------------------------------
 
 describe('classify: validator_rejected', () => {
   test('war-council-validator stdout starting with REJECT classifies as validator_rejected', () => {
@@ -137,7 +137,7 @@ describe('classify: validator_rejected', () => {
   });
 });
 
-// --- Test 4 — escalation side effects integration ----------------------------
+// --- Test 4 -- escalation side effects integration ----------------------------
 
 describe('runEscalation: side effects', () => {
   let tmpHome: string;
@@ -244,7 +244,7 @@ describe('runEscalation: side effects', () => {
   });
 });
 
-// --- Test 5 — end-to-end (incident replay) -----------------------------------
+// --- Test 5 -- end-to-end (incident replay) -----------------------------------
 
 describe('end-to-end: WO-AUTH-SINGLE-PATH-E2E-04 incident replay', () => {
   let tmpHome: string;

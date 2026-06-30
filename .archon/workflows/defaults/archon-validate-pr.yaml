@@ -7,16 +7,16 @@ description: |
         E2E test on main (reproduce bug) -> E2E test on feature (verify fix) -> final verdict report.
   NOT for: Quick code-only reviews (use archon-smart-pr-review), fixing issues, general exploration.
 
-  This workflow is designed for running in parallel — each instance finds its own free ports
+  This workflow is designed for running in parallel -- each instance finds its own free ports
   to avoid conflicts. Produces artifacts in $ARTIFACTS_DIR/ and posts a validation report.
 
 provider: claude
 model: opus
 
 nodes:
-  # ═══════════════════════════════════════════════════════════════
-  # PHASE 1: SETUP — Fetch PR info and allocate ports
-  # ═══════════════════════════════════════════════════════════════
+  # ---------------------------------------------------------------
+  # PHASE 1: SETUP -- Fetch PR info and allocate ports
+  # ---------------------------------------------------------------
 
   - id: fetch-pr
     bash: |
@@ -78,9 +78,9 @@ nodes:
       echo "PR_BASE=$PR_BASE"
     depends_on: [fetch-pr]
 
-  # ═══════════════════════════════════════════════════════════════
-  # PHASE 2: CODE REVIEW — Parallel analysis of main vs feature
-  # ═══════════════════════════════════════════════════════════════
+  # ---------------------------------------------------------------
+  # PHASE 2: CODE REVIEW -- Parallel analysis of main vs feature
+  # ---------------------------------------------------------------
 
   - id: code-review-main
     command: archon-validate-pr-code-review-main
@@ -92,9 +92,9 @@ nodes:
     depends_on: [fetch-pr, resolve-paths, code-review-main]
     context: fresh
 
-  # ═══════════════════════════════════════════════════════════════
-  # PHASE 3: E2E TESTING — Sequential (after code reviews finish)
-  # ═══════════════════════════════════════════════════════════════
+  # ---------------------------------------------------------------
+  # PHASE 3: E2E TESTING -- Sequential (after code reviews finish)
+  # ---------------------------------------------------------------
 
   - id: classify-testability
     prompt: |
@@ -145,9 +145,9 @@ nodes:
     context: fresh
     idle_timeout: 1800000
 
-  # ═══════════════════════════════════════════════════════════════
-  # PHASE 4: FINAL REPORT — Synthesize all findings
-  # ═══════════════════════════════════════════════════════════════
+  # ---------------------------------------------------------------
+  # PHASE 4: FINAL REPORT -- Synthesize all findings
+  # ---------------------------------------------------------------
 
   - id: cleanup-processes
     bash: |
@@ -157,7 +157,7 @@ nodes:
       FRONTEND_PORT=$(cat "$ARTIFACTS_DIR/.frontend-port" 2>/dev/null | tr -d '\n')
 
       if [ -z "$BACKEND_PORT" ] || [ -z "$FRONTEND_PORT" ]; then
-        echo "No port files found — skipping cleanup"
+        echo "No port files found -- skipping cleanup"
         exit 0
       fi
 

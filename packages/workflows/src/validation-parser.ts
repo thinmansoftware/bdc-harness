@@ -16,20 +16,35 @@ function normalizeCheckName(raw: string): string {
     .replace(/\s+/g, '-');
 }
 
+// Status markers. The repo is ASCII-only in source (the ascii-gate scans this
+// file), so the legacy emoji are referenced via \u escapes -- ASCII on disk,
+// identical at runtime -- and the ASCII equivalents are accepted alongside them:
+//   pass: [x]  or  U+2705 white-heavy-check / U+2714 heavy-check
+//   fail: [ ]  or  U+274C cross-mark        / U+2716 heavy-multiplication
+//   warn: !    or  U+26A0 warning-sign
+//   skip: [-]  or  U+23ED skip-forward, or the "not run"/"skipped" keywords
+//   U+FE0F is the emoji variation selector that trails some glyphs.
+const PASS_MARK = /\[x\]|\u2705|\u2714/u;
+const FAIL_MARK = /\[ \]|\u274C|\u2716/u;
+const WARN_MARK = /!|\u26A0/u;
+const SKIP_MARK = /\[-\]|\u23ED/u;
+const ALL_MARKS = /\[x\]|\[ \]|\[-\]|!|\u2705|\u2714|\u274C|\u2716|\u26A0|\u23ED|\uFE0F/gu;
+
 function parseResultCell(raw: string): { result: ValidationResult['result']; error?: string } {
   const trimmed = raw.trim();
-  const hasPass = trimmed.includes('[x]');
-  const hasFail = trimmed.includes('[ ]');
-  const hasWarn = trimmed.includes('!');
-  const hasSkip = trimmed.includes('') || /not run|skipped/i.test(trimmed);
+  const hasPass = PASS_MARK.test(trimmed);
+  const hasFail = FAIL_MARK.test(trimmed);
+  const hasWarn = WARN_MARK.test(trimmed);
+  const hasSkip = SKIP_MARK.test(trimmed) || /not run|skipped/i.test(trimmed);
 
   let result: ValidationResult['result'] = 'unknown';
   if (hasPass) result = 'pass';
   else if (hasFail) result = 'fail';
   else if (hasWarn || hasSkip) result = 'warn';
 
-  const cleaned = trimmed.replace(/[x]|[ ]|!|/g, '').trim();
-  const error = cleaned ? cleaned.replace(/^[-----]\s*/, '') : undefined;
+  // Strip every status marker, then surface any remaining text as the error.
+  const cleaned = trimmed.replace(ALL_MARKS, '').trim();
+  const error = cleaned ? cleaned.replace(/^(--|-)\s*/, '') : undefined;
 
   return { result, ...(error ? { error } : {}) };
 }

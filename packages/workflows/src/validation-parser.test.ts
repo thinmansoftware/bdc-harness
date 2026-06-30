@@ -68,8 +68,8 @@ describe('parseValidationResults', () => {
       expect(parseValidationResults(content)).toEqual([{ check: 'format', result: 'warn' }]);
     });
 
-    test('single skipped row via ', () => {
-      const content = makeContent(['| tests |  |']);
+    test('single skipped row via [-] marker', () => {
+      const content = makeContent(['| tests | [-] |']);
       expect(parseValidationResults(content)).toEqual([{ check: 'tests', result: 'warn' }]);
     });
 

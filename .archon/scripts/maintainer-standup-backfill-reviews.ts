@@ -5,22 +5,22 @@
  * gate_verdict, run_id }` entries inferred from comment-body patterns.
  *
  * Use case: after adopting the cross-workflow memory feature, today's
- * morning brief should already mark "✓ reviewed Nd ago" for the PRs that
+ * morning brief should already mark "[x] reviewed Nd ago" for the PRs that
  * were reviewed before the writer node existed. Without backfill, those
  * markers only appear for runs going forward.
  *
  * Inference patterns (from the maintainer-review-pr output):
- *  - Body contains "## Review Summary"           → gate_verdict: review
- *  - Body contains "isn't a direction we're"     → gate_verdict: decline
+ *  - Body contains "## Review Summary"           -> gate_verdict: review
+ *  - Body contains "isn't a direction we're"     -> gate_verdict: decline
  *    OR "Conflicts with `direction.md"
- *  - Body contains "Could you split this"        → gate_verdict: needs_split
+ *  - Body contains "Could you split this"        -> gate_verdict: needs_split
  *    OR "split into <N> focused PRs"
  *
  * Behavior:
  *  - Fetches the maintainer's comments authored in the last 7 days.
  *  - Per PR, takes the LATEST matching comment (newer comments win).
  *  - Existing entries (from real workflow runs) take precedence over
- *    backfilled ones — the writer-node record is more authoritative.
+ *    backfilled ones -- the writer-node record is more authoritative.
  *  - Idempotent: re-running adds nothing new if no new pattern-matching
  *    comments have been authored since.
  */
@@ -44,10 +44,10 @@ type ReviewedEntry = {
 
 const baseDir = resolve(process.cwd(), '.archon/maintainer-standup');
 
-// ── Read gh handle from profile ──
+// -- Read gh handle from profile --
 const profilePath = resolve(baseDir, 'profile.md');
 if (!existsSync(profilePath)) {
-  console.error('No profile.md found — run from repo root, with .archon/maintainer-standup/profile.md present.');
+  console.error('No profile.md found -- run from repo root, with .archon/maintainer-standup/profile.md present.');
   process.exit(1);
 }
 const ghHandleMatch = readFileSync(profilePath, 'utf8').match(/^gh_handle:\s*(\S+)/m);
@@ -57,7 +57,7 @@ if (!ghHandleMatch) {
 }
 const ghHandle = ghHandleMatch[1];
 
-// ── Resolve owner/repo from the origin remote ──
+// -- Resolve owner/repo from the origin remote --
 const remote = execFileSync('git', ['remote', 'get-url', 'origin'], {
   stdio: ['ignore', 'pipe', 'pipe'],
 })
@@ -70,7 +70,7 @@ if (!repoMatch) {
 }
 const [, owner, repo] = repoMatch;
 
-// ── Fetch issue/PR conversation comments since 7 days ago ──
+// -- Fetch issue/PR conversation comments since 7 days ago --
 const sevenDaysAgo = new Date();
 sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
 const since = sevenDaysAgo.toISOString();
@@ -78,7 +78,7 @@ const since = sevenDaysAgo.toISOString();
 console.log(`Scanning ${ghHandle}'s comments on ${owner}/${repo} since ${since}...`);
 
 // Default maxBuffer is 1MB which 7 days of paginated comments easily exceeds
-// in an active repo (1k+ comments → multi-MB JSON). 64MB is generous and
+// in an active repo (1k+ comments -> multi-MB JSON). 64MB is generous and
 // well below available memory; if the repo grows past that, switch to
 // streaming the gh process and parsing line-by-line.
 const allComments = JSON.parse(
@@ -93,13 +93,13 @@ const allComments = JSON.parse(
   ).toString(),
 ) as GhComment[];
 
-// ── Pattern-match the maintainer's own review/decline comments ──
+// -- Pattern-match the maintainer's own review/decline comments --
 function inferVerdict(body: string): ReviewedEntry['gate_verdict'] | null {
   if (body.includes('## Review Summary')) return 'review';
   if (
     body.includes("isn't a direction we're") ||
     body.includes('Conflicts with `direction.md') ||
-    body.includes('direction.md §')
+    body.includes('direction.md Section ')
   )
     return 'decline';
   if (
@@ -146,9 +146,9 @@ console.log(
   `Scanned ${scanned} comments. ${mineMatching} authored by ${ghHandle} matched a review/decline pattern. Unique PRs: ${Object.keys(inferred).length}.`,
 );
 
-// ── Merge with existing reviewed-prs.json ──
+// -- Merge with existing reviewed-prs.json --
 // Existing entries (especially those without source: 'backfill', i.e. written
-// by the workflow's record-review node) take precedence — they're more
+// by the workflow's record-review node) take precedence -- they're more
 // authoritative than pattern-matched bodies.
 if (!existsSync(baseDir)) mkdirSync(baseDir, { recursive: true });
 const outPath = resolve(baseDir, 'reviewed-prs.json');
