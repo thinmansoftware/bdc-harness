@@ -107,6 +107,12 @@ export function mapWorkflowEvent(event: WorkflowEmitterEvent): string | null {
         error: event.type === 'node_failed' ? event.error : undefined,
         reason: event.type === 'node_skipped' ? event.reason : undefined,
         costUsd: event.type === 'node_completed' ? event.costUsd : undefined,
+        // Layer 1 gate_result forward (WO-HARNESS-LAYER1-CLIMB-AND-GATE-EVENTS-01).
+        // Undefined for node_started/node_skipped; JSON.stringify omits undefined keys.
+        gateResult:
+          event.type === 'node_completed' || event.type === 'node_failed'
+            ? event.gate_result
+            : undefined,
         timestamp: Date.now(),
       });
 
@@ -159,6 +165,19 @@ export function mapWorkflowEvent(event: WorkflowEmitterEvent): string | null {
           nodeId: event.nodeId,
           message: event.message,
         },
+      });
+
+    case 'cascade_step':
+      // Phase 3 plumbing -- emit the raw event payload for Mission Control (Phase 6 renders it).
+      return JSON.stringify({
+        type: 'cascade_step',
+        runId: event.runId,
+        nodeId: event.nodeId,
+        from_tier: event.from_tier,
+        to_tier: event.to_tier,
+        gate: event.gate,
+        reason: event.reason,
+        timestamp: Date.now(),
       });
 
     case 'workflow_cancelled':
