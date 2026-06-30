@@ -30,7 +30,7 @@ mock.module('@archon/paths', () => ({
 
 // --- Imports (after mocks) ---
 
-import { resolveEntryLane, resolveDispatchTarget } from './router-dispatcher';
+import { resolveEntryLane, resolveDispatchTarget, resolveFireTarget } from './router-dispatcher';
 
 // Hermetic fixture covers every scenario the suite asserts. Mirrors the
 // production router.yaml shape: tiers{} + task_classes{} + defaults{}.
@@ -225,24 +225,78 @@ describe('resolveDispatchTarget -- Layer 2 fire path lane selection', () => {
   });
 
   it('Scenario B -- explicit workflow name wins over task_class', async () => {
+    // workflowName is 'explicit-caller-override' -- a value that build-code's task_class
+    // resolution would NEVER produce (build-code -> tier 3 -> sonnet-subscription ->
+    // 'bdc-feature-development'). The assertion therefore fails if taskClass is consulted
+    // instead of returning workflowName directly, distinguishing the two code paths.
     const result = await resolveDispatchTarget({
-      workflowName: 'bdc-feature-development',
+      workflowName: 'explicit-caller-override',
       taskClass: 'build-code',
       ...FIXTURE_OPTS,
     });
     // Explicit name is highest precedence -- task_class resolution must NOT override it.
-    expect(result).toBe('bdc-feature-development');
+    expect(result).toBe('explicit-caller-override');
   });
 
-  it('Scenario C -- unresolvable task_class falls back to explicit name, no exception', async () => {
-    // unknown-class-xyz is not in FIXTURE_YAML task_classes. The explicit workflowName
-    // takes highest precedence and is returned before resolveEntryLane is consulted,
-    // so no exception is thrown regardless of task_class resolvability.
+  it('Scenario C -- workflowName short-circuits before resolveEntryLane is called', async () => {
+    // What this test actually proves: when workflowName is set, resolveDispatchTarget
+    // returns it immediately (line 1 of the function body) WITHOUT consulting
+    // resolveEntryLane at all. The taskClass value is irrelevant here -- it never
+    // reaches the resolver. 'unknown-class-xyz' is used to make the intent clear:
+    // even a task_class that is absent from FIXTURE_YAML does NOT cause an error,
+    // because the short-circuit prevents resolveEntryLane from ever running.
+    // (Note: resolveEntryLane does NOT return undefined for unknown classes; it falls
+    // back to defaults.fallback_tier. The class being 'unknown' adds no extra value to
+    // this scenario -- the assertion holds for any taskClass value.)
     const result = await resolveDispatchTarget({
-      workflowName: 'bdc-feature-development',
+      workflowName: 'explicit-caller-override',
       taskClass: 'unknown-class-xyz',
       ...FIXTURE_OPTS,
     });
-    expect(result).toBe('bdc-feature-development');
+    expect(result).toBe('explicit-caller-override');
+  });
+});
+
+describe('resolveFireTarget -- production fire path with cwd-relative yaml', () => {
+  it('FT1: explicit workflowName short-circuits before any file I/O', async () => {
+    // Pass a non-existent cwd to prove the file is NEVER read when workflowName is set.
+    // If the function attempted readFileSync, it would throw ENOENT here.
+    const result = await resolveFireTarget(
+      'explicit-caller-override',
+      'build-code',
+      '/nonexistent-cwd-fire-target-ft1-should-not-read'
+    );
+    expect(result).toBe('explicit-caller-override');
+  });
+
+  it('FT2: taskClass resolves via resolve(cwd, config/router.yaml) path construction', async () => {
+    // Create a real temp dir with config/router.yaml to exercise the path construction
+    // resolve(cwd, 'config/router.yaml'). If the path is misconfigured or has a typo,
+    // readFileSync throws ENOENT rather than returning a wrong value.
+    const { mkdtempSync, mkdirSync, writeFileSync, rmSync } = await import('node:fs');
+    const os = await import('node:os');
+    const path = await import('node:path');
+
+    const tmpDir = mkdtempSync(path.join(os.tmpdir(), 'archon-fire-test-'));
+    mkdirSync(path.join(tmpDir, 'config'));
+    writeFileSync(path.join(tmpDir, 'config', 'router.yaml'), FIXTURE_YAML, 'utf8');
+
+    try {
+      const result = await resolveFireTarget(undefined, 'build-code', tmpDir);
+      // FIXTURE_YAML maps build-code -> tier 3 -> sonnet-subscription -> 'bdc-feature-development'.
+      expect(result).toBe('bdc-feature-development');
+    } finally {
+      rmSync(tmpDir, { recursive: true });
+    }
+  });
+
+  it('FT3: missing config/router.yaml throws ENOENT (path is actively read)', async () => {
+    // When workflowName is absent and taskClass is present, the function MUST read
+    // resolve(cwd, 'config/router.yaml'). If that file does not exist, ENOENT surfaces.
+    // This assertion catches any future path typo: a wrong path would silently fail
+    // to find the file rather than resolving correctly.
+    await expect(
+      resolveFireTarget(undefined, 'build-code', '/nonexistent-cwd-fire-target-ft3-' + Date.now())
+    ).rejects.toThrow(/ENOENT/);
   });
 });

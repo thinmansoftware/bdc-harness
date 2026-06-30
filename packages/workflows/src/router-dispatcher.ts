@@ -14,6 +14,7 @@
  * Source of truth: config/router.yaml (Cauldron 2.0 Tier Router -- v1 STATIC).
  */
 import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 import { createLogger } from '@archon/paths';
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger). */
@@ -297,4 +298,41 @@ export async function resolveDispatchTarget(
     if (result.laneName) return result.laneName;
   }
   return opts.workflowName;
+}
+
+/**
+ * Production fire-path resolver: resolves a workflow name from a cwd-relative
+ * config/router.yaml. Implements the same Layer 2 dispatcher precedence as
+ * resolveDispatchTarget, but accepts a worktree cwd and constructs the yaml
+ * path via resolve(cwd, 'config/router.yaml') rather than accepting injected
+ * content. This is the function called by the web-facing fire-path (workflow-bridge.ts)
+ * and re-exported from '@archon/workflows/executor' for backward compatibility.
+ *
+ * Precedence:
+ *   1. workflowName (caller-supplied) -- wins always; file is NOT read.
+ *   2. resolveEntryLane(taskClass, routerYamlPath) -> laneName -- when taskClass
+ *      is present and workflowName is absent, and laneName is non-null.
+ *   3. Falls back to workflowName (undefined) when taskClass absent or laneName is null.
+ *
+ * Throws when resolveEntryLane finds no reachable tier (configuration bug).
+ * Throws ENOENT when config/router.yaml is missing and taskClass is present.
+ *
+ * @param workflowName - Caller-supplied explicit name (highest precedence; undefined when not set).
+ * @param taskClass    - WO task class key from router.yaml (e.g. "build-code").
+ * @param cwd          - Worktree root; resolves to cwd/config/router.yaml.
+ * @param woClass      - Optional WO class tag (CODE/INFRA/MIXED); forwarded to dispatcher log.
+ */
+export async function resolveFireTarget(
+  workflowName: string | undefined,
+  taskClass: string | undefined,
+  cwd: string,
+  woClass?: string
+): Promise<string | undefined> {
+  if (workflowName) return workflowName;
+  if (taskClass) {
+    const routerYamlPath = resolve(cwd, 'config/router.yaml');
+    const result = await resolveEntryLane({ taskClass, woClass, routerYamlPath });
+    if (result.laneName) return result.laneName;
+  }
+  return workflowName;
 }
