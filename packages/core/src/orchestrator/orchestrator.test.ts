@@ -952,14 +952,14 @@ describe('orchestrator-agent handleMessage', () => {
 
     test('filters emoji tool indicators from batch response', async () => {
       mockClient.sendQuery.mockImplementation(async function* () {
-        yield { type: 'assistant', content: ' BASH\nnpm test\n\nClean summary here' };
+        yield { type: 'assistant', content: '\u{1F527} BASH\nnpm test\n\nClean summary here' };
         yield { type: 'result', sessionId: 'session-id' };
       });
 
       await handleMessage(platform, 'chat-456', 'run tests');
 
       const sentMessage = platform.sendMessage.mock.calls[0][1] as string;
-      expect(sentMessage).not.toContain('');
+      expect(sentMessage).not.toContain('\u{1F527}');
       expect(sentMessage).toContain('Clean summary');
     });
 

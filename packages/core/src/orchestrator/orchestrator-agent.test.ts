@@ -853,62 +853,62 @@ describe('filterToolIndicators logic (replicated regex tests)', () => {
     expect(result).toBe('This is a regular message.');
   });
 
-  test('filters  (U+1F527) tool usage indicator', () => {
-    const result = applyFilter([' Running tool foo', 'The answer is 42.']);
-    expect(result).not.toContain('');
+  test('filters \u{1F527} (U+1F527) tool usage indicator', () => {
+    const result = applyFilter(['\u{1F527} Running tool foo', 'The answer is 42.']);
+    expect(result).not.toContain('\u{1F527}');
     expect(result).toContain('The answer is 42.');
   });
 
-  test('filters  (U+1F4AD) thinking indicator', () => {
-    const result = applyFilter([' Thinking about the problem...', 'Here is my response.']);
-    expect(result).not.toContain('');
+  test('filters \u{1F4AD} (U+1F4AD) thinking indicator', () => {
+    const result = applyFilter(['\u{1F4AD} Thinking about the problem...', 'Here is my response.']);
+    expect(result).not.toContain('\u{1F4AD}');
     expect(result).toContain('Here is my response.');
   });
 
-  test('filters  (U+1F4DD) writing indicator', () => {
-    const result = applyFilter([' Writing file output.txt', 'Done writing.']);
-    expect(result).not.toContain('');
+  test('filters \u{1F4DD} (U+1F4DD) writing indicator', () => {
+    const result = applyFilter(['\u{1F4DD} Writing file output.txt', 'Done writing.']);
+    expect(result).not.toContain('\u{1F4DD}');
     expect(result).toContain('Done writing.');
   });
 
-  test('filters  (U+270F+FE0F) editing indicator', () => {
+  test('filters \u{270F}\u{FE0F} (U+270F+FE0F) editing indicator', () => {
     const result = applyFilter(['\u{270F}\u{FE0F} Editing main.ts', 'Edit complete.']);
     expect(result).not.toContain('\u{270F}');
     expect(result).toContain('Edit complete.');
   });
 
-  test('filters  (U+1F5D1+FE0F) deleting indicator', () => {
+  test('filters \u{1F5D1}\u{FE0F} (U+1F5D1+FE0F) deleting indicator', () => {
     const result = applyFilter(['\u{1F5D1}\u{FE0F} Deleting temp file', 'File removed.']);
     expect(result).not.toContain('\u{1F5D1}');
     expect(result).toContain('File removed.');
   });
 
-  test('filters  (U+1F4C2) folder indicator', () => {
-    const result = applyFilter([' Reading directory /src', 'Directory listed.']);
-    expect(result).not.toContain('');
+  test('filters \u{1F4C2} (U+1F4C2) folder indicator', () => {
+    const result = applyFilter(['\u{1F4C2} Reading directory /src', 'Directory listed.']);
+    expect(result).not.toContain('\u{1F4C2}');
     expect(result).toContain('Directory listed.');
   });
 
-  test('filters  (U+1F50D) search indicator', () => {
-    const result = applyFilter([' Searching for pattern', 'Search complete.']);
-    expect(result).not.toContain('');
+  test('filters \u{1F50D} (U+1F50D) search indicator', () => {
+    const result = applyFilter(['\u{1F50D} Searching for pattern', 'Search complete.']);
+    expect(result).not.toContain('\u{1F50D}');
     expect(result).toContain('Search complete.');
   });
 
   test('preserves emoji that is not a tool indicator', () => {
-    const result = applyFilter([' Deployment successful!']);
-    expect(result).toContain(' Deployment successful!');
+    const result = applyFilter(['\u{1F389} Deployment successful!']);
+    expect(result).toContain('\u{1F389} Deployment successful!');
   });
 
   test('preserves text that contains tool emoji but does not START with it', () => {
     // The regex requires the emoji at the START of the section
-    const result = applyFilter(['Here is a  wrench emoji mid-text.']);
-    expect(result).toContain('');
+    const result = applyFilter(['Here is a \u{1F527} wrench emoji mid-text.']);
+    expect(result).toContain('\u{1F527}');
   });
 
   test('falls back to all messages when everything gets filtered out', () => {
     // If all sections are tool indicators, return the raw joined messages
-    const messages = [' Tool call one', ' Thinking...'];
+    const messages = ['\u{1F527} Tool call one', '\u{1F4AD} Thinking...'];
     const result = applyFilter(messages);
     // The fallback returns allMessages (raw join)
     expect(result.length).toBeGreaterThan(0);
@@ -917,22 +917,22 @@ describe('filterToolIndicators logic (replicated regex tests)', () => {
   test('handles multiple assistant messages joined with separator', () => {
     const messages = [
       'First part of the response.',
-      ' Some tool usage here',
+      '\u{1F527} Some tool usage here',
       'Second part of the response.',
     ];
     const result = applyFilter(messages);
     expect(result).toContain('First part of the response.');
     expect(result).toContain('Second part of the response.');
-    expect(result).not.toContain(' Some tool usage here');
+    expect(result).not.toContain('\u{1F527} Some tool usage here');
   });
 
   test('sections within a single message are split by double newlines', () => {
     // A single message with embedded double-newline creates multiple sections
-    const messages = ['Normal text.\n\n Tool output.\n\nMore normal text.'];
+    const messages = ['Normal text.\n\n\u{1F527} Tool output.\n\nMore normal text.'];
     const result = applyFilter(messages);
     expect(result).toContain('Normal text.');
     expect(result).toContain('More normal text.');
-    expect(result).not.toContain('');
+    expect(result).not.toContain('\u{1F527}');
   });
 
   test('trims whitespace from the final output', () => {

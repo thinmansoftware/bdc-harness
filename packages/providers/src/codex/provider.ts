@@ -978,9 +978,15 @@ export class CodexProvider implements IAgentProvider {
           // wired, delegate the query to it rather than throwing. The
           // disclosure chunk informs the consumer that cross-model adversarial
           // value is reduced -- this path is degraded-with-disclosure, never
-          // the silent default. Auth errors do NOT trigger failback (real auth
-          // failures must still surface so the operator can re-login).
-          if (this.failbackProviderFactory && errorClass !== 'auth') {
+          // the silent default.
+          //
+          // Auth-class handling: the rotation-collision case (isAuthFailureError
+          // true) is already handled above with its own disclosure. A residual
+          // auth error that reaches here still degrades to the general failback
+          // WHEN a factory is wired -- a wired factory signals the caller accepts
+          // delegation. With NO factory, the auth error throws so a real
+          // re-login surfaces to the operator (see the null-factory tests).
+          if (this.failbackProviderFactory) {
             getLog().warn(
               { errorClass, attempt, originalError: err.message },
               'codex_failback_to_claude'

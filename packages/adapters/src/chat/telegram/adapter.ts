@@ -131,9 +131,16 @@ export class TelegramAdapter implements IPlatformAdapter {
         },
         'telegram.markdownv2_failed'
       );
-      await this.bot.api.sendMessage(id, stripMarkdown(chunk), {
-        ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
-      });
+      // Plain-text fallback: only pass an options object when there is reply
+      // markup to attach. Passing an empty {} would set parse-less options that
+      // some callers (and tests) treat as a distinct 3-arg call.
+      if (replyMarkup) {
+        await this.bot.api.sendMessage(id, stripMarkdown(chunk), {
+          reply_markup: replyMarkup,
+        });
+      } else {
+        await this.bot.api.sendMessage(id, stripMarkdown(chunk));
+      }
     }
   }
 
