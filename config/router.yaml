@@ -68,7 +68,7 @@ tiers:
       - deepseek-v4-pro
     marginal_cost: cheap-api
     work_shape: >-
-      Low-cost OpenRouter models (GLM-4, Qwen3-coder, DeepSeek v4 Pro) via
+      Low-cost OpenRouter models (GLM-5.2, Qwen3-coder, DeepSeek v4 Pro) via
       openrouter.ai/api/v1. Starting tier for build-code and single-builder-pr.
       Escalates to claude-haiku-api (tier 3) on gate failure. Credential: GLM_API_KEY.
 

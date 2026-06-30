@@ -126,7 +126,7 @@ function parseRouterYaml(raw: string): RouterYamlConfig {
  *
  * If walking reaches TERMINAL_TIER and TERMINAL_TIER has no reachable engine,
  * fall back DOWN to the highest non-terminal tier that DOES have a reachable
- * engine (per spec: Tier 4 is terminal -- do not escalate past it).
+ * engine (per spec: Tier 5 is terminal -- do not escalate past it).
  */
 function walkLadderForReachable(
   startingTier: string,
@@ -152,7 +152,7 @@ function walkLadderForReachable(
 
   // Forward walk exhausted -- we crossed the terminal tier without finding a
   // reachable engine. Walk DOWN from just-below TERMINAL_TIER looking for the
-  // highest tier with a reachable engine. This honors "Tier 4 is terminal" by
+  // highest tier with a reachable engine. This honors "Tier 5 is terminal" by
   // refusing to escalate past it and falling back to the cheapest viable lane.
   // skipped[] is left as-is so callers can still observe the climbed-then-fell
   // path.

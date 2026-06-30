@@ -272,7 +272,7 @@ describe('WO-HARNESS-LAYER2-OPENROUTER-CHEAP-TIER-01 -- openrouter-cheap tier in
     expect(result.laneName).toBe('bdc-feature-development-glm');
   });
 
-  it('Scenario C -- qwen3-coder and deepseek-v4-pro each map to the OpenRouter lane', async () => {
+  it('Scenario C.1 -- qwen3-coder maps to the OpenRouter lane', async () => {
     const makeFixture = (engine: string): string => `version: 1
 tiers:
   "1":
@@ -293,16 +293,45 @@ task_classes:
   build-code:
     starting_tier: "2"
 `;
-    for (const engine of ['qwen3-coder', 'deepseek-v4-pro']) {
-      const result = await resolveEntryLane({
-        taskClass: 'build-code',
-        woClass: 'CODE',
-        routerYamlPath: '/fixture/router.yaml',
-        routerYamlContent: makeFixture(engine),
-      });
-      expect(result.engineHint).toBe(engine);
-      expect(result.laneName).toBe('bdc-feature-development-glm');
-    }
+    const result = await resolveEntryLane({
+      taskClass: 'build-code',
+      woClass: 'CODE',
+      routerYamlPath: '/fixture/router.yaml',
+      routerYamlContent: makeFixture('qwen3-coder'),
+    });
+    expect(result.engineHint).toBe('qwen3-coder');
+    expect(result.laneName).toBe('bdc-feature-development-glm');
+  });
+
+  it('Scenario C.2 -- deepseek-v4-pro maps to the OpenRouter lane', async () => {
+    const makeFixture = (engine: string): string => `version: 1
+tiers:
+  "1":
+    name: qwen-local
+    engines:
+      - ollama-qwen3
+  "2":
+    name: openrouter-cheap
+    engines:
+      - ${engine}
+  "3":
+    name: haiku
+    engines:
+      - claude-haiku-api
+defaults:
+  fallback_tier: "3"
+task_classes:
+  build-code:
+    starting_tier: "2"
+`;
+    const result = await resolveEntryLane({
+      taskClass: 'build-code',
+      woClass: 'CODE',
+      routerYamlPath: '/fixture/router.yaml',
+      routerYamlContent: makeFixture('deepseek-v4-pro'),
+    });
+    expect(result.engineHint).toBe('deepseek-v4-pro');
+    expect(result.laneName).toBe('bdc-feature-development-glm');
   });
 
   it('Scenario D -- ollama-qwen3 remains unreachable; tier 1 is skipped', async () => {
