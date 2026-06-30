@@ -122,6 +122,13 @@ skills-lock.json
 test-results/
 .archon/ralph/
 
+# Cauldron WIP-checkpoint state blobs: serialized JSON written to .archon/workflows/
+# by the checkpoint mechanism when a pipeline run creates open-model lane variants.
+# These are single-line execution-state objects, not authored YAML workflow definitions.
+# Committed accidentally by "wip: checkpoint" commits; must never land in git.
+.archon/workflows/*-open-a.yaml
+.archon/workflows/*-open-b.yaml
+
 # WO-168 Tier 1: host-mounted artifact directory.
 # Keep the directory tracked via .gitkeep; ignore the per-run subdirectories
 # (bundles, manifests, diff stats) generated at runtime.
