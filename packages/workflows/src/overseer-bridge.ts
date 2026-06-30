@@ -166,6 +166,9 @@ export async function handleNodeFailure(
       );
     });
 
+  // Forward gate_result from ctx.gateResult into the emitted event via buildGateResultField.
+  // The persisted event receives it via the buildGateResultField spread in the store call above.
+  // buildGateResultField returns GateResult | undefined and is the canonical gate_result accessor.
   deps.emitter.emit({
     type: 'node_failed',
     runId: workflowRun.id,

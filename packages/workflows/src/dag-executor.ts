@@ -86,7 +86,6 @@ import { loadAgentRegistry, resolveAgent } from './agents/registry';
 import type { AgentRegistry } from './agents/registry';
 import { loadContext } from '@archon/persona-context-loader';
 import { deriveEntryRung, computeFrontierCost } from './model-rates';
-import type { GateResult } from './gate-result';
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
 let cachedLog: ReturnType<typeof createLogger> | undefined;
@@ -116,31 +115,6 @@ export function clearAgentRegistryCache(): void {
 const MCP_FAILURE_PREFIX = 'MCP server connection failed: ';
 const CODEX_FAILBACK_PREFIX = '[CODEX FAILBACK]';
 const WARNING_PREFIX = '[WARNING]';
-
-// ---------------------------------------------------------------------------
-// Gate-result machinery
-// ---------------------------------------------------------------------------
-// pendingGateResults is keyed by "runId:nodeId" so concurrent workflows in the
-// same process never collide. recordGateResult is called immediately before
-// handleNodeFailure; buildGateResultField consumes and removes the entry so
-// a second read returns undefined (one-time read pattern).
-
-const pendingGateResults = new Map<string, GateResult>();
-
-function recordGateResult(key: string, result: GateResult): void {
-  pendingGateResults.set(key, result);
-}
-
-function buildGateResultField(key: string): GateResult | undefined {
-  const r = pendingGateResults.get(key);
-  pendingGateResults.delete(key);
-  return r;
-}
-
-/** Exported for test cleanup only -- clears all pending gate results. */
-export function clearPendingGateResults(): void {
-  pendingGateResults.clear();
-}
 
 /** A failed MCP server entry parsed from the SDK message. `segment` is the
  *  original substring (e.g. `"telegram (disconnected)"`) so callers can
@@ -261,6 +235,11 @@ const pendingGateResults = new Map<string, GateResult>();
  *  node_completed event for (runId, nodeId). No-op until Phase 5 wires it. */
 export function recordGateResult(runId: string, nodeId: string, result: GateResult): void {
   pendingGateResults.set(`${runId}:${nodeId}`, result);
+}
+
+/** Exported for test cleanup only -- clears all pending gate results. */
+export function clearPendingGateResults(): void {
+  pendingGateResults.clear();
 }
 
 /** Emit a cascade_step event (store + in-process emitter) when a job
@@ -809,8 +788,6 @@ async function executeNodeInternal(
     if (!promptResult.success) {
       const errMsg = promptResult.message;
       getLog().error({ nodeId: node.id, error: errMsg }, 'dag_node_command_load_failed');
-      const gateKey = `${workflowRun.id}:${node.id}`;
-      recordGateResult(gateKey, { passed: false, nodeType: 'ai' });
       const failResult = await handleNodeFailure(
         { store: deps.store, emitter, log: getLog(), logNodeError },
         workflowRun,
@@ -819,7 +796,7 @@ async function executeNodeInternal(
           errorMsg: errMsg,
           logDir,
           outputSoFar: '',
-          extraEventData: { gate_result: buildGateResultField(gateKey) },
+          gateResult: { passed: false, nodeType: 'ai' },
         }
       );
       return failResult.output;
@@ -1277,8 +1254,6 @@ async function executeNodeInternal(
       );
 
       const cancelMsg = 'Cancelled by user';
-      const gateKey = `${workflowRun.id}:${node.id}`;
-      recordGateResult(gateKey, { passed: false, nodeType: 'ai' });
       const failResult = await handleNodeFailure(
         { store: deps.store, emitter, log: getLog(), logNodeError },
         workflowRun,
@@ -1288,7 +1263,8 @@ async function executeNodeInternal(
           logDir,
           outputSoFar: nodeOutputText,
           hasOutput: nodeOutputText.length > 0,
-          extraEventData: { duration_ms: duration, gate_result: buildGateResultField(gateKey) },
+          gateResult: { passed: false, nodeType: 'ai' },
+          extraEventData: { duration_ms: duration },
         }
       );
 
@@ -1314,8 +1290,6 @@ async function executeNodeInternal(
       const duration = Date.now() - nodeStartTime;
       getLog().warn({ nodeId: node.id, durationMs: duration }, 'dag.node_credit_exhausted');
 
-      const gateKey = `${workflowRun.id}:${node.id}`;
-      recordGateResult(gateKey, { passed: false, nodeType: 'ai' });
       const failResult = await handleNodeFailure(
         { store: deps.store, emitter, log: getLog(), logNodeError },
         workflowRun,
@@ -1325,7 +1299,8 @@ async function executeNodeInternal(
           logDir,
           outputSoFar: nodeOutputText,
           hasOutput: nodeOutputText.length > 0,
-          extraEventData: { duration_ms: duration, gate_result: buildGateResultField(gateKey) },
+          gateResult: { passed: false, nodeType: 'ai' },
+          extraEventData: { duration_ms: duration },
         }
       );
 
@@ -1349,8 +1324,6 @@ async function executeNodeInternal(
       const emptyError = `Node '${node.id}' produced no assistant output. The provider stream closed without yielding content -- likely a silent provider rejection or stream interruption.`;
       getLog().error({ nodeId: node.id, durationMs: duration }, 'dag.node_empty_output');
 
-      const gateKey = `${workflowRun.id}:${node.id}`;
-      recordGateResult(gateKey, { passed: false, nodeType: 'ai' });
       const failResult = await handleNodeFailure(
         { store: deps.store, emitter, log: getLog(), logNodeError },
         workflowRun,
@@ -1360,7 +1333,8 @@ async function executeNodeInternal(
           logDir,
           outputSoFar: '',
           hasOutput: false,
-          extraEventData: { duration_ms: duration, gate_result: buildGateResultField(gateKey) },
+          gateResult: { passed: false, nodeType: 'ai' },
+          extraEventData: { duration_ms: duration },
         }
       );
 
@@ -1699,8 +1673,10 @@ async function executeBashNode(
     getLog().info({ nodeId: node.id, durationMs: duration }, 'dag_node_completed');
     await logNodeComplete(logDir, workflowRun.id, node.id, '<bash>', { durationMs: duration });
 
-    // Consume any gate result registered for this bash node (Phase 5 cascade engine
-    // calls recordGateResult before node completion). Always clear the map entry.
+    // Section 1 gate_result contract: field required on BOTH success AND failure for
+    // bash nodes. Consume any gate result registered for this bash node (Phase 5
+    // cascade engine calls recordGateResult before node completion). Always clear
+    // the map entry.
     const bashGateResultKey = `${workflowRun.id}:${node.id}`;
     const bashNodeGateResult = pendingGateResults.get(bashGateResultKey);
     pendingGateResults.delete(bashGateResultKey);
@@ -1771,9 +1747,6 @@ async function executeBashNode(
     const woId = woIdMatch ? woIdMatch[0] : undefined;
     const exitCode = typeof err.code === 'number' ? err.code : undefined;
 
-    const gateKey = `${workflowRun.id}:${node.id}`;
-    recordGateResult(gateKey, { passed: false, nodeType: 'bash', exitCode, isTimeout });
-
     const failResult = await handleNodeFailure(
       { store: deps.store, emitter, log: getLog(), logNodeError },
       workflowRun,
@@ -1787,7 +1760,8 @@ async function executeBashNode(
         exitCode,
         validatorOutput,
         woId,
-        extraEventData: { type: 'bash', isTimeout, gate_result: buildGateResultField(gateKey) },
+        gateResult: { passed: false, nodeType: 'bash', exitCode, isTimeout },
+        extraEventData: { type: 'bash', isTimeout },
       }
     );
 
@@ -2039,8 +2013,10 @@ async function executeScriptNode(
     getLog().info({ nodeId: node.id, durationMs: duration }, 'dag_node_completed');
     await logNodeComplete(logDir, workflowRun.id, node.id, '<script>', { durationMs: duration });
 
-    // Consume any gate result registered for this script node (Phase 5 cascade engine
-    // calls recordGateResult before node completion). Always clear the map entry.
+    // Section 1 gate_result contract: field required on BOTH success AND failure for
+    // script nodes. Consume any gate result registered for this script node (Phase 5
+    // cascade engine calls recordGateResult before node completion). Always clear
+    // the map entry.
     const scriptGateResultKey = `${workflowRun.id}:${node.id}`;
     const scriptNodeGateResult = pendingGateResults.get(scriptGateResultKey);
     pendingGateResults.delete(scriptGateResultKey);
@@ -2110,9 +2086,6 @@ async function executeScriptNode(
     const scriptWoId = scriptWoIdMatch ? scriptWoIdMatch[0] : undefined;
     const exitCode = typeof err.code === 'number' ? err.code : undefined;
 
-    const gateKey = `${workflowRun.id}:${node.id}`;
-    recordGateResult(gateKey, { passed: false, nodeType: 'script', exitCode, isTimeout });
-
     const failResult = await handleNodeFailure(
       { store: deps.store, emitter, log: getLog(), logNodeError },
       workflowRun,
@@ -2126,7 +2099,8 @@ async function executeScriptNode(
         exitCode,
         validatorOutput: scriptValidatorOutput,
         woId: scriptWoId,
-        extraEventData: { type: 'script', isTimeout, gate_result: buildGateResultField(gateKey) },
+        gateResult: { passed: false, nodeType: 'script', exitCode, isTimeout },
+        extraEventData: { type: 'script', isTimeout },
       }
     );
 

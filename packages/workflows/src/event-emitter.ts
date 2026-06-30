@@ -12,6 +12,10 @@
 import { EventEmitter } from 'events';
 import type { ArtifactType } from './schemas';
 import { createLogger } from '@archon/paths';
+import type { GateResult } from './gate-result';
+
+// Re-export so callers can import GateResult from a single place.
+export type { GateResult };
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
 let cachedLog: ReturnType<typeof createLogger> | undefined;
@@ -21,17 +25,12 @@ function getLog(): ReturnType<typeof createLogger> {
 }
 
 // ---------------------------------------------------------------------------
-// Layer 1 gate result type (WO-HARNESS-LAYER1-CLIMB-AND-GATE-EVENTS-01).
-// Structured outcome of a quality gate that ran on a node. Known gate names:
-// 'tests' | 'validator' | 'manifest' | 'ci'. Open string for future gates.
-// Populated by the Phase 5 cascade engine; plumbing wired here in Phase 3.
+// Layer 1 gate result plumbing (WO-HARNESS-LAYER1-CLIMB-AND-GATE-EVENTS-01).
+// GateResult is defined in gate-result.ts and re-exported above.
+// Structured outcome of a node execution gate: passed/failed, node type, exit
+// code and timeout flag. Populated by the Phase 5 cascade engine and at each
+// failure site in dag-executor.ts; plumbing wired here in Phase 3.
 // ---------------------------------------------------------------------------
-
-export interface GateResult {
-  gate: string;
-  outcome: 'pass' | 'fail';
-  reason: string;
-}
 
 /** Returns { gate_result: GateResult } or {} to spread into store/emitter event data.
  *  Lives in event-emitter.ts (not dag-executor.ts) to avoid the dag-executor ->
@@ -119,6 +118,12 @@ interface NodeCompletedEvent {
   numTurns?: number;
   // Layer 1 gate result (WO-HARNESS-LAYER1-CLIMB-AND-GATE-EVENTS-01). Optional;
   // populated by Phase 5 cascade engine via recordGateResult() before node completes.
+  /**
+   * Structured gate evaluation outcome. Populated for bash and script success events
+   * per Section 1 of the gate_result contract (field required on BOTH success AND
+   * failure for non-AI node types). Absent for AI node_completed events (AI gate
+   * evaluation is only meaningful on failure, where credit/cancel state is known).
+   */
   gate_result?: GateResult;
 }
 

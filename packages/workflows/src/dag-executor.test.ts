@@ -8868,7 +8868,7 @@ describe('gate_result field in node_failed events', () => {
     expect(persistedGr.isTimeout).toBe(false);
 
     // Assert emitted event carries gate_result.
-    expect(emittedFailedEvents.length).toBeGreaterThan(0);
+    expect(emittedFailedEvents.length).toBe(1);
     const emittedGr = (emittedFailedEvents[0] as { gate_result?: GateResult }).gate_result;
     expect(emittedGr).toBeDefined();
     expect(emittedGr!.passed).toBe(false);
@@ -8932,7 +8932,7 @@ describe('gate_result field in node_failed events', () => {
     expect(persistedGr.isTimeout).toBe(false);
 
     // Assert emitted event carries gate_result.
-    expect(emittedFailedEvents.length).toBeGreaterThan(0);
+    expect(emittedFailedEvents.length).toBe(1);
     const emittedGr = (emittedFailedEvents[0] as { gate_result?: GateResult }).gate_result;
     expect(emittedGr).toBeDefined();
     expect(emittedGr!.passed).toBe(false);
@@ -9004,10 +9004,376 @@ describe('gate_result field in node_failed events', () => {
     expect(persistedGr.nodeType).toBe('ai');
 
     // Assert emitted event carries gate_result.
-    expect(emittedFailedEvents.length).toBeGreaterThan(0);
+    expect(emittedFailedEvents.length).toBe(1);
     const emittedGr = (emittedFailedEvents[0] as { gate_result?: GateResult }).gate_result;
     expect(emittedGr).toBeDefined();
     expect(emittedGr!.passed).toBe(false);
     expect(emittedGr!.nodeType).toBe('ai');
+  });
+
+  it('AI node failure (command-load) carries gate_result in persisted and emitted node_failed event', async () => {
+    // No command file created -- loadCommandPrompt returns success:false for the missing command,
+    // triggering the command-load failure path at dag-executor.ts:754.
+    const store = createMockStore();
+    const deps = createMockDeps(store);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('gate-ai-cmdload-run-id', {
+      workflow_name: 'gate-ai-cmdload-test',
+      conversation_id: 'conv-gate-ai-cmdload',
+    });
+
+    const emitter = getWorkflowEventEmitter();
+    const emittedFailedEvents: unknown[] = [];
+    const unsub = emitter.subscribe(e => {
+      if (e.type === 'node_failed') emittedFailedEvents.push(e);
+    });
+
+    try {
+      await executeDagWorkflow(
+        deps,
+        platform,
+        'conv-gate-ai-cmdload',
+        testDir,
+        {
+          name: 'gate-ai-cmdload-test',
+          nodes: [{ id: 'cmd-load-node', command: 'gate-cmd-not-found-xyz' }],
+        },
+        workflowRun,
+        'claude',
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        minimalConfig
+      );
+    } finally {
+      unsub();
+    }
+
+    // Assert persisted event carries gate_result.
+    const eventCalls = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls;
+    const failedEventCall = eventCalls.find(
+      (call: unknown[]) =>
+        (call[0] as { event_type: string }).event_type === 'node_failed' &&
+        (call[0] as { step_name: string }).step_name === 'cmd-load-node'
+    );
+    expect(failedEventCall).toBeDefined();
+    const persistedData = (failedEventCall![0] as { data: Record<string, unknown> }).data;
+    expect(persistedData.gate_result).toBeDefined();
+    const persistedGr = persistedData.gate_result as GateResult;
+    expect(persistedGr.passed).toBe(false);
+    expect(persistedGr.nodeType).toBe('ai');
+
+    // Assert emitted event carries gate_result.
+    // Single node workflow -- exactly one node_failed event expected.
+    expect(emittedFailedEvents.length).toBe(1);
+    const emittedGr = (emittedFailedEvents[0] as { gate_result?: GateResult }).gate_result;
+    expect(emittedGr).toBeDefined();
+    expect(emittedGr!.passed).toBe(false);
+    expect(emittedGr!.nodeType).toBe('ai');
+  });
+
+  it('AI node failure (cancelled during streaming) carries gate_result in persisted and emitted node_failed event', async () => {
+    // Mock store: getWorkflowRunStatus returns 'cancelled' so the in-stream cancel
+    // check (fired on first tick because lastNodeCancelCheck has no prior entry for
+    // this run+node key) aborts the stream, triggering dag-executor.ts:1222.
+    const store = createMockStore();
+    (store.getWorkflowRunStatus as ReturnType<typeof mock>).mockImplementation(() =>
+      Promise.resolve('cancelled' as const)
+    );
+
+    // sendQuery yields one assistant message so the cancel-check tick fires before
+    // the generator completes. The abort breaks the for-await loop before the
+    // result event is consumed.
+    const cancelQuery = mock(function* () {
+      yield { type: 'assistant', content: 'partial content' };
+      yield { type: 'result', sessionId: 'dag-session-cancel' };
+    });
+    mockGetAgentProviderDag.mockReturnValue({
+      sendQuery: cancelQuery,
+      getType: () => 'claude',
+      getCapabilities: mockClaudeCapabilities,
+    });
+
+    const deps = createMockDeps(store);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('gate-ai-cancel-run-id', {
+      workflow_name: 'gate-ai-cancel-test',
+      conversation_id: 'conv-gate-ai-cancel',
+    });
+
+    const emitter = getWorkflowEventEmitter();
+    const emittedFailedEvents: unknown[] = [];
+    const unsub = emitter.subscribe(e => {
+      if (e.type === 'node_failed') emittedFailedEvents.push(e);
+    });
+
+    try {
+      await executeDagWorkflow(
+        deps,
+        platform,
+        'conv-gate-ai-cancel',
+        testDir,
+        {
+          name: 'gate-ai-cancel-test',
+          nodes: [{ id: 'ai-cancel-node', prompt: 'do something' }],
+        },
+        workflowRun,
+        'claude',
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        minimalConfig
+      );
+    } finally {
+      unsub();
+    }
+
+    // Assert persisted event carries gate_result.
+    const eventCalls = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls;
+    const failedEventCall = eventCalls.find(
+      (call: unknown[]) =>
+        (call[0] as { event_type: string }).event_type === 'node_failed' &&
+        (call[0] as { step_name: string }).step_name === 'ai-cancel-node'
+    );
+    expect(failedEventCall).toBeDefined();
+    const persistedData = (failedEventCall![0] as { data: Record<string, unknown> }).data;
+    expect(persistedData.gate_result).toBeDefined();
+    const persistedGr = persistedData.gate_result as GateResult;
+    expect(persistedGr.passed).toBe(false);
+    expect(persistedGr.nodeType).toBe('ai');
+
+    // Assert emitted event carries gate_result.
+    // Single node workflow -- exactly one node_failed event expected.
+    expect(emittedFailedEvents.length).toBe(1);
+    const emittedGr = (emittedFailedEvents[0] as { gate_result?: GateResult }).gate_result;
+    expect(emittedGr).toBeDefined();
+    expect(emittedGr!.passed).toBe(false);
+    expect(emittedGr!.nodeType).toBe('ai');
+  });
+
+  it('AI node failure (empty output) carries gate_result in persisted and emitted node_failed event', async () => {
+    // sendQuery yields only a result event with no assistant content, so
+    // nodeOutputText stays empty and structuredOutput stays undefined.
+    // This triggers the empty-output failure path at dag-executor.ts:1294.
+    const emptyOutputQuery = mock(function* () {
+      yield { type: 'result', sessionId: 'dag-session-empty' };
+    });
+    mockGetAgentProviderDag.mockReturnValue({
+      sendQuery: emptyOutputQuery,
+      getType: () => 'claude',
+      getCapabilities: mockClaudeCapabilities,
+    });
+
+    const store = createMockStore();
+    const deps = createMockDeps(store);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('gate-ai-empty-run-id', {
+      workflow_name: 'gate-ai-empty-test',
+      conversation_id: 'conv-gate-ai-empty',
+    });
+
+    const emitter = getWorkflowEventEmitter();
+    const emittedFailedEvents: unknown[] = [];
+    const unsub = emitter.subscribe(e => {
+      if (e.type === 'node_failed') emittedFailedEvents.push(e);
+    });
+
+    try {
+      await executeDagWorkflow(
+        deps,
+        platform,
+        'conv-gate-ai-empty',
+        testDir,
+        {
+          name: 'gate-ai-empty-test',
+          nodes: [{ id: 'ai-empty-node', prompt: 'do something' }],
+        },
+        workflowRun,
+        'claude',
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        minimalConfig
+      );
+    } finally {
+      unsub();
+    }
+
+    // Assert persisted event carries gate_result.
+    const eventCalls = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls;
+    const failedEventCall = eventCalls.find(
+      (call: unknown[]) =>
+        (call[0] as { event_type: string }).event_type === 'node_failed' &&
+        (call[0] as { step_name: string }).step_name === 'ai-empty-node'
+    );
+    expect(failedEventCall).toBeDefined();
+    const persistedData = (failedEventCall![0] as { data: Record<string, unknown> }).data;
+    expect(persistedData.gate_result).toBeDefined();
+    const persistedGr = persistedData.gate_result as GateResult;
+    expect(persistedGr.passed).toBe(false);
+    expect(persistedGr.nodeType).toBe('ai');
+
+    // Assert emitted event carries gate_result.
+    // Single node workflow -- exactly one node_failed event expected.
+    expect(emittedFailedEvents.length).toBe(1);
+    const emittedGr = (emittedFailedEvents[0] as { gate_result?: GateResult }).gate_result;
+    expect(emittedGr).toBeDefined();
+    expect(emittedGr!.passed).toBe(false);
+    expect(emittedGr!.nodeType).toBe('ai');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// gate_result field in node_completed (success) events
+// WO-HARNESS-LAYER1-GATE-RESULT-ALL-FAILURE-SITES-01 -- Section 1 success-path contract
+// Section 1 requires gate_result on BOTH success AND failure for bash and script nodes.
+// ---------------------------------------------------------------------------
+
+describe('gate_result field in node_completed success events', () => {
+  let testDir: string;
+
+  beforeEach(async () => {
+    testDir = join(
+      tmpdir(),
+      `dag-gate-success-${Date.now()}-${Math.random().toString(36).slice(2)}`
+    );
+    await mkdir(testDir, { recursive: true });
+  });
+
+  afterEach(async () => {
+    clearPendingGateResults();
+    try {
+      await rm(testDir, { recursive: true, force: true });
+    } catch {
+      // ignore cleanup errors
+    }
+  });
+
+  it('bash node success carries gate_result in persisted and emitted node_completed event', async () => {
+    const store = createMockStore();
+    const mockDeps = createMockDeps(store);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('gate-bash-success-run-id', {
+      workflow_name: 'gate-bash-success-test',
+      conversation_id: 'conv-gate-bash-success',
+    });
+
+    // Subscribe to the emitter to capture node_completed events.
+    const emitter = getWorkflowEventEmitter();
+    const emittedCompletedEvents: unknown[] = [];
+    const unsub = emitter.subscribe(e => {
+      if (e.type === 'node_completed') emittedCompletedEvents.push(e);
+    });
+
+    try {
+      await executeDagWorkflow(
+        mockDeps,
+        platform,
+        'conv-gate-bash-success',
+        testDir,
+        { name: 'gate-bash-success-test', nodes: [{ id: 'pass-bash-node', bash: 'echo hello' }] },
+        workflowRun,
+        'claude',
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        minimalConfig
+      );
+    } finally {
+      unsub();
+    }
+
+    // Assert persisted node_completed event carries gate_result with passed:true.
+    const eventCalls = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls;
+    const completedCall = eventCalls.find(
+      (call: unknown[]) =>
+        (call[0] as { event_type: string }).event_type === 'node_completed' &&
+        (call[0] as { step_name: string }).step_name === 'pass-bash-node'
+    );
+    expect(completedCall).toBeDefined();
+    const persistedData = (completedCall![0] as { data: Record<string, unknown> }).data;
+    expect(persistedData).toBeDefined();
+    expect(persistedData!.gate_result).toBeDefined();
+    const persistedGr = persistedData!.gate_result as GateResult;
+    expect(persistedGr.passed).toBe(true);
+    expect(persistedGr.nodeType).toBe('bash');
+
+    // Assert emitted event carries gate_result with passed:true.
+    // Single node workflow -- exactly one node_completed event expected.
+    expect(emittedCompletedEvents.length).toBe(1);
+    const emittedGr = (emittedCompletedEvents[0] as { gate_result?: GateResult }).gate_result;
+    expect(emittedGr).toBeDefined();
+    expect(emittedGr!.passed).toBe(true);
+    expect(emittedGr!.nodeType).toBe('bash');
+  });
+
+  it('script node success carries gate_result in persisted and emitted node_completed event', async () => {
+    const store = createMockStore();
+    const mockDeps = createMockDeps(store);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('gate-script-success-run-id', {
+      workflow_name: 'gate-script-success-test',
+      conversation_id: 'conv-gate-script-success',
+    });
+
+    const emitter = getWorkflowEventEmitter();
+    const emittedCompletedEvents: unknown[] = [];
+    const unsub = emitter.subscribe(e => {
+      if (e.type === 'node_completed') emittedCompletedEvents.push(e);
+    });
+
+    try {
+      await executeDagWorkflow(
+        mockDeps,
+        platform,
+        'conv-gate-script-success',
+        testDir,
+        {
+          name: 'gate-script-success-test',
+          nodes: [{ id: 'pass-script-node', script: 'process.stdout.write("ok")', runtime: 'bun' }],
+        },
+        workflowRun,
+        'claude',
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        minimalConfig
+      );
+    } finally {
+      unsub();
+    }
+
+    // Assert persisted node_completed event carries gate_result with passed:true.
+    const eventCalls = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls;
+    const completedCall = eventCalls.find(
+      (call: unknown[]) =>
+        (call[0] as { event_type: string }).event_type === 'node_completed' &&
+        (call[0] as { step_name: string }).step_name === 'pass-script-node'
+    );
+    expect(completedCall).toBeDefined();
+    const persistedData = (completedCall![0] as { data: Record<string, unknown> }).data;
+    expect(persistedData).toBeDefined();
+    expect(persistedData!.gate_result).toBeDefined();
+    const persistedGr = persistedData!.gate_result as GateResult;
+    expect(persistedGr.passed).toBe(true);
+    expect(persistedGr.nodeType).toBe('script');
+
+    // Assert emitted event carries gate_result with passed:true.
+    // Single node workflow -- exactly one node_completed event expected.
+    expect(emittedCompletedEvents.length).toBe(1);
+    const emittedGr = (emittedCompletedEvents[0] as { gate_result?: GateResult }).gate_result;
+    expect(emittedGr).toBeDefined();
+    expect(emittedGr!.passed).toBe(true);
+    expect(emittedGr!.nodeType).toBe('script');
   });
 });
