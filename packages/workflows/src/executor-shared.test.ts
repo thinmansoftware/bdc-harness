@@ -715,4 +715,17 @@ describe('resolveAgentPersona', () => {
     const resolution = resolveAgentPersona(persona, 'opus', 'pi');
     expect(resolution.model).toBe('opus');
   });
+
+  // Scenario C -- opr loop node: no InfrastructureClassBlock when persona omits model
+  it('opr: no InfrastructureClassBlock when persona omits model (loop node opr-provider regression)', () => {
+    // A loop node with `provider: opr` and a no-model-pin persona must not throw.
+    // Before the dag-node.ts fix, the schema dropped 'provider' to undefined, the
+    // executor fell back to the workflow default ('claude'), and resolveAgentPersona
+    // threw InfrastructureClassBlock('Claude persona must declare a model:').
+    // After the fix, provider flows through as 'opr' and the else branch applies.
+    const persona = makePersona({ model: undefined });
+    const resolution = resolveAgentPersona(persona, undefined, 'opr');
+    expect(resolution.agentName).toBe('test-agent');
+    expect(resolution.model).toBeUndefined();
+  });
 });

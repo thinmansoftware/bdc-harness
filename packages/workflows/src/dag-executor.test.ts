@@ -3029,7 +3029,13 @@ nodes:
     expect(wf.nodes[0].agents).toBeUndefined();
   });
 
-  it('ignores agents on loop nodes (field stripped, no error)', () => {
+  it('agents field flows through loop node transform (not stripped -- executeLoopNode ignores it at runtime)', () => {
+    // Before the dag-node.ts fix (WO-HARNESS-LOOP-NODE-PROVIDER-MODEL-DROPPED-01),
+    // the loop branch of the schema transform did not spread aiOnly, so ALL aiOnly
+    // fields (including agents) were silently dropped from LoopNode objects.
+    // After the fix, agents flows through to the LoopNode (consistent with prompt/command
+    // nodes). The loader still emits a LOOP_NODE_AI_FIELDS warning about it, and
+    // executeLoopNode continues to ignore node.agents at runtime.
     const yaml = `
 name: loop-agents
 description: test
@@ -3047,7 +3053,8 @@ nodes:
     const result = parseWorkflow(yaml, 'loop-agents.yaml');
     expect(result.error).toBeNull();
     const wf = result.workflow!;
-    expect(wf.nodes[0].agents).toBeUndefined();
+    // agents now survives the transform (same as provider/model -- the fix spreads all of aiOnly)
+    expect((wf.nodes[0] as { agents?: unknown }).agents).toBeDefined();
   });
 
   it('node with no agents field is undefined', () => {
