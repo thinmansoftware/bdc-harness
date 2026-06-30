@@ -715,4 +715,30 @@ describe('resolveAgentPersona', () => {
     const resolution = resolveAgentPersona(persona, 'opus', 'pi');
     expect(resolution.model).toBe('opus');
   });
+
+  // -- opr / OpenRouter (WO-HARNESS-OPR-PERSONA-MODEL-RESOLUTION-FIX-01) --
+
+  it('opr: does not throw InfrastructureClassBlock when war-council persona omits model', () => {
+    // Scenario A from spec: provider: opr + persona with no model pin must NOT
+    // hit the claude branch. The else branch applies; no constraint on model.
+    const persona = makePersona({ model: undefined, name: 'war-council-architect-opr' });
+    expect(() => resolveAgentPersona(persona, 'glm-5.2', 'opr')).not.toThrow();
+  });
+
+  it('opr: falls back to node currentModel when persona omits model', () => {
+    // The else-branch resolvedModel formula: persona.model ?? currentModel.
+    // With persona.model=undefined and currentModel='glm-5.2', result is 'glm-5.2'.
+    const persona = makePersona({ model: undefined, name: 'war-council-architect-opr' });
+    const resolution = resolveAgentPersona(persona, 'glm-5.2', 'opr');
+    expect(resolution.model).toBe('glm-5.2');
+    expect(resolution.agentName).toBe('war-council-architect-opr');
+  });
+
+  it('opr: passes persona model through unchanged when persona declares one', () => {
+    // Persona model wins over currentModel for the else branch too
+    // (persona.model ?? currentModel resolves to persona.model when set).
+    const persona = makePersona({ model: 'glm-5.2', name: 'war-council-architect-opr' });
+    const resolution = resolveAgentPersona(persona, undefined, 'opr');
+    expect(resolution.model).toBe('glm-5.2');
+  });
 });
