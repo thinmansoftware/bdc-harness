@@ -130,6 +130,7 @@ interface NodeFailedEvent {
   error: string;
   // Layer 1 gate result (WO-HARNESS-LAYER1-CLIMB-AND-GATE-EVENTS-01). Optional;
   // set via HandleNodeFailureContext.gateResult when a gate check causes failure.
+  /** Structured gate evaluation outcome -- present when the node had a gate result recorded. */
   gate_result?: GateResult;
 }
 
