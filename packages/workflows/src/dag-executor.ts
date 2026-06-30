@@ -237,6 +237,11 @@ export function recordGateResult(runId: string, nodeId: string, result: GateResu
   pendingGateResults.set(`${runId}:${nodeId}`, result);
 }
 
+/** Exported for test cleanup only -- clears all pending gate results. */
+export function clearPendingGateResults(): void {
+  pendingGateResults.clear();
+}
+
 /** Emit a cascade_step event (store + in-process emitter) when a job
  *  escalates from one tier to another. Called by Phase 5 cascade engine.
  *  No callers exist in Phase 3 -- the plumbing is wired, not triggered.
@@ -787,7 +792,12 @@ async function executeNodeInternal(
         { store: deps.store, emitter, log: getLog(), logNodeError },
         workflowRun,
         node,
-        { errorMsg: errMsg, logDir, outputSoFar: '' }
+        {
+          errorMsg: errMsg,
+          logDir,
+          outputSoFar: '',
+          gateResult: { passed: false, nodeType: 'ai' },
+        }
       );
       return failResult.output;
     }
@@ -1253,6 +1263,7 @@ async function executeNodeInternal(
           logDir,
           outputSoFar: nodeOutputText,
           hasOutput: nodeOutputText.length > 0,
+          gateResult: { passed: false, nodeType: 'ai' },
           extraEventData: { duration_ms: duration },
         }
       );
@@ -1288,6 +1299,7 @@ async function executeNodeInternal(
           logDir,
           outputSoFar: nodeOutputText,
           hasOutput: nodeOutputText.length > 0,
+          gateResult: { passed: false, nodeType: 'ai' },
           extraEventData: { duration_ms: duration },
         }
       );
@@ -1321,6 +1333,7 @@ async function executeNodeInternal(
           logDir,
           outputSoFar: '',
           hasOutput: false,
+          gateResult: { passed: false, nodeType: 'ai' },
           extraEventData: { duration_ms: duration },
         }
       );
@@ -1429,17 +1442,26 @@ async function executeNodeInternal(
     const catchNodeGateResult = pendingGateResults.get(catchGateResultKey);
     pendingGateResults.delete(catchGateResultKey);
 
-    // If the abort was triggered by user cancel (not idle timeout), classify as cancel
+    // If the abort was triggered by user cancel (not idle timeout), classify as cancel.
+    // Must call handleNodeFailure here (not early-return) so the node_failed event is
+    // persisted and emitted -- and so catchNodeGateResult is forwarded rather than
+    // silently dropped. Mirrors the in-stream cancel path at dag-executor.ts:1257.
     if (nodeAbortController.signal.aborted && !nodeIdleTimedOut) {
       getLog().info({ nodeId: node.id }, 'dag_node_cancelled_via_abort');
-      return {
-        state: 'failed',
-        output: nodeOutputText,
-        error: 'Cancelled by user',
-        costUsd: nodeCostUsd,
-        ...(nodeTokens ? { tokens: nodeTokens } : {}),
-        ...(nodeTokens ? { frontierCostUsd: computeFrontierCost(nodeTokens) } : {}),
-      };
+      const cancelMsg = 'Cancelled by user';
+      const failResult = await handleNodeFailure(
+        { store: deps.store, emitter, log: getLog(), logNodeError },
+        workflowRun,
+        node,
+        {
+          errorMsg: cancelMsg,
+          logDir,
+          outputSoFar: nodeOutputText,
+          hasOutput: nodeOutputText.length > 0,
+          gateResult: catchNodeGateResult ?? { passed: false, nodeType: 'ai' },
+        }
+      );
+      return failResult.output;
     }
 
     getLog().error({ err, nodeId: node.id }, 'dag_node_failed');
@@ -1654,16 +1676,24 @@ async function executeBashNode(
       // observability signal, not a graph-control change. Failing the node
       // here would block dependents; rolling-up at workflow level is the UI's
       // job (see WorkflowExecution.tsx).
+      // Clear any Phase 5 gate result registered for this node so the map does
+      // not leak when the warning path exits instead of the normal success path.
+      pendingGateResults.delete(`${workflowRun.id}:${node.id}`);
       return { state: 'completed', output };
     }
 
     getLog().info({ nodeId: node.id, durationMs: duration }, 'dag_node_completed');
     await logNodeComplete(logDir, workflowRun.id, node.id, '<bash>', { durationMs: duration });
 
-    // Consume any gate result registered for this bash node (Phase 5 cascade engine
-    // calls recordGateResult before node completion). Always clear the map entry.
+    // Section 1 gate_result contract: field required on BOTH success AND failure for
+    // bash nodes. Consume any gate result registered for this bash node (Phase 5
+    // cascade engine calls recordGateResult before node completion). If Phase 5 has
+    // not stored a result, synthesize a default pass result (always clear the entry).
     const bashGateResultKey = `${workflowRun.id}:${node.id}`;
-    const bashNodeGateResult = pendingGateResults.get(bashGateResultKey);
+    const bashNodeGateResult: GateResult = pendingGateResults.get(bashGateResultKey) ?? {
+      passed: true,
+      nodeType: 'bash',
+    };
     pendingGateResults.delete(bashGateResultKey);
 
     deps.store
@@ -1675,7 +1705,7 @@ async function executeBashNode(
           duration_ms: duration,
           type: 'bash',
           node_output: output,
-          ...buildGateResultField(bashNodeGateResult),
+          gate_result: bashNodeGateResult,
         },
       })
       .catch((err: Error) => {
@@ -1691,7 +1721,7 @@ async function executeBashNode(
       nodeId: node.id,
       nodeName: node.id,
       duration,
-      ...buildGateResultField(bashNodeGateResult),
+      gate_result: bashNodeGateResult,
     });
 
     return { state: 'completed', output };
@@ -1745,6 +1775,7 @@ async function executeBashNode(
         exitCode,
         validatorOutput,
         woId,
+        gateResult: { passed: false, nodeType: 'bash', exitCode, isTimeout },
         extraEventData: { type: 'bash', isTimeout },
       }
     );
@@ -1991,16 +2022,26 @@ async function executeScriptNode(
         loadBearing: warning.loadBearing,
       });
 
+      // Clear any Phase 5 gate result registered for this node so the map does
+      // not leak when the warning path exits instead of the normal success path
+      // (same map hygiene as the success path at scriptGateResultKey below;
+      // see bash counterpart in executeBashNode).
+      pendingGateResults.delete(`${workflowRun.id}:${node.id}`);
       return { state: 'completed', output };
     }
 
     getLog().info({ nodeId: node.id, durationMs: duration }, 'dag_node_completed');
     await logNodeComplete(logDir, workflowRun.id, node.id, '<script>', { durationMs: duration });
 
-    // Consume any gate result registered for this script node (Phase 5 cascade engine
-    // calls recordGateResult before node completion). Always clear the map entry.
+    // Section 1 gate_result contract: field required on BOTH success AND failure for
+    // script nodes. Consume any gate result registered for this script node (Phase 5
+    // cascade engine calls recordGateResult before node completion). If Phase 5 has
+    // not stored a result, synthesize a default pass result (always clear the entry).
     const scriptGateResultKey = `${workflowRun.id}:${node.id}`;
-    const scriptNodeGateResult = pendingGateResults.get(scriptGateResultKey);
+    const scriptNodeGateResult: GateResult = pendingGateResults.get(scriptGateResultKey) ?? {
+      passed: true,
+      nodeType: 'script',
+    };
     pendingGateResults.delete(scriptGateResultKey);
 
     deps.store
@@ -2012,7 +2053,7 @@ async function executeScriptNode(
           duration_ms: duration,
           type: 'script',
           node_output: output,
-          ...buildGateResultField(scriptNodeGateResult),
+          gate_result: scriptNodeGateResult,
         },
       })
       .catch((err: Error) => {
@@ -2028,7 +2069,7 @@ async function executeScriptNode(
       nodeId: node.id,
       nodeName: node.id,
       duration,
-      ...buildGateResultField(scriptNodeGateResult),
+      gate_result: scriptNodeGateResult,
     });
 
     return { state: 'completed', output };
@@ -2055,31 +2096,38 @@ async function executeScriptNode(
       { ...formatted.logFields, nodeId: node.id, nodeType: 'script', isTimeout },
       'dag_node_failed'
     );
-    await logNodeError(logDir, workflowRun.id, node.id, errorMsg);
 
-    deps.store
-      .createWorkflowEvent({
-        workflow_run_id: workflowRun.id,
-        event_type: 'node_failed',
-        step_name: node.id,
-        data: { error: errorMsg, type: 'script' },
-      })
-      .catch((dbErr: Error) => {
-        getLog().error(
-          { err: dbErr, workflowRunId: workflowRun.id, eventType: 'node_failed' },
-          'workflow_event_persist_failed'
-        );
-      });
+    // Route through overseer-bridge (parallel to bash failure site) so script-node
+    // failures get classified and gate_result is threaded into the emitted and
+    // persisted node_failed event.
+    // Pre-WO-HARNESS-LAYER1-GATE-RESULT-ALL-FAILURE-SITES-01 this catch block
+    // inlined logNodeError + createWorkflowEvent + emitter.emit and omitted gate_result.
+    const scriptValidatorOutput = nodeOutputs.get('war-council-validator')?.output ?? undefined;
+    const scriptWoIdMatch = workflowRun.user_message
+      ? /\bWO-[A-Z0-9-]+/.exec(workflowRun.user_message)
+      : null;
+    const scriptWoId = scriptWoIdMatch ? scriptWoIdMatch[0] : undefined;
+    const exitCode = typeof err.code === 'number' ? err.code : undefined;
 
-    emitter.emit({
-      type: 'node_failed',
-      runId: workflowRun.id,
-      nodeId: node.id,
-      nodeName: node.id,
-      error: errorMsg,
-    });
+    const failResult = await handleNodeFailure(
+      { store: deps.store, emitter, log: getLog(), logNodeError },
+      workflowRun,
+      node,
+      {
+        errorMsg,
+        logDir,
+        outputSoFar: '',
+        hasOutput: false,
+        nodeType: 'script',
+        exitCode,
+        validatorOutput: scriptValidatorOutput,
+        woId: scriptWoId,
+        gateResult: { passed: false, nodeType: 'script', exitCode, isTimeout },
+        extraEventData: { type: 'script', isTimeout },
+      }
+    );
 
-    return { state: 'failed', output: '', error: errorMsg };
+    return failResult.output;
   }
 }
 

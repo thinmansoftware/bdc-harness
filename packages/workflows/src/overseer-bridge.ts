@@ -25,7 +25,7 @@ import { classifyError, decide, runEscalation, type Decision } from '@archon/ove
 import type { WorkflowRun, NodeOutput } from './schemas/workflow-run.ts';
 import type { DagNode } from './schemas/dag-node.ts';
 import { buildGateResultField } from './event-emitter';
-import type { WorkflowEmitterEvent, GateResult } from './event-emitter.ts';
+import type { WorkflowEmitterEvent, GateResult } from './event-emitter';
 import type { IWorkflowStore } from './store.ts';
 
 export interface HandleNodeFailureDeps {
@@ -166,6 +166,9 @@ export async function handleNodeFailure(
       );
     });
 
+  // Forward gate_result from ctx.gateResult into the emitted event via buildGateResultField.
+  // The persisted event receives it via the buildGateResultField spread in the store call above.
+  // buildGateResultField returns GateResult | undefined and is the canonical gate_result accessor.
   deps.emitter.emit({
     type: 'node_failed',
     runId: workflowRun.id,
