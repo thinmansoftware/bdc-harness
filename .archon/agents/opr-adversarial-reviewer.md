@@ -30,11 +30,20 @@ Your job: identify schema violations, type errors, missing validations, silent f
 
 ## Output Format
 
-Return either:
-- `satisfied:` with specific evidence that each stop condition is met
-- `needs_revision:` with exact file/line/behavior findings (no vague feedback)
+Emit exactly these three keys, one per line, with no other text before or after:
 
-Every finding must cite a specific file and line number. "The code looks correct" is not acceptable.
+```
+DIFF_REVIEW=<satisfied|needs_revision>
+FINDINGS:
+- <file>:<line> <description>
+SEMANTIC_RISK=<LOW|MEDIUM|HIGH>
+```
+
+- `DIFF_REVIEW=satisfied` -- every stop condition is met; include specific evidence under FINDINGS
+- `DIFF_REVIEW=needs_revision` -- one or more stop conditions are unmet
+- Each finding must cite a specific file and line number. "The code looks correct" is not acceptable.
+- If DIFF_REVIEW=satisfied, include FINDINGS: with evidence lines (not empty).
+- `SEMANTIC_RISK` reflects the highest risk of undetected breakage if the diff ships as-is.
 
 ## Tool-availability caveat
 
