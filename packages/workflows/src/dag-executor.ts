@@ -1675,10 +1675,13 @@ async function executeBashNode(
 
     // Section 1 gate_result contract: field required on BOTH success AND failure for
     // bash nodes. Consume any gate result registered for this bash node (Phase 5
-    // cascade engine calls recordGateResult before node completion). Always clear
-    // the map entry.
+    // cascade engine calls recordGateResult before node completion). If Phase 5 has
+    // not stored a result, synthesize a default pass result (always clear the entry).
     const bashGateResultKey = `${workflowRun.id}:${node.id}`;
-    const bashNodeGateResult = pendingGateResults.get(bashGateResultKey);
+    const bashNodeGateResult: GateResult = pendingGateResults.get(bashGateResultKey) ?? {
+      passed: true,
+      nodeType: 'bash',
+    };
     pendingGateResults.delete(bashGateResultKey);
 
     deps.store
@@ -1690,7 +1693,7 @@ async function executeBashNode(
           duration_ms: duration,
           type: 'bash',
           node_output: output,
-          ...buildGateResultField(bashNodeGateResult),
+          gate_result: bashNodeGateResult,
         },
       })
       .catch((err: Error) => {
@@ -1706,7 +1709,7 @@ async function executeBashNode(
       nodeId: node.id,
       nodeName: node.id,
       duration,
-      ...buildGateResultField(bashNodeGateResult),
+      gate_result: bashNodeGateResult,
     });
 
     return { state: 'completed', output };
@@ -2015,10 +2018,13 @@ async function executeScriptNode(
 
     // Section 1 gate_result contract: field required on BOTH success AND failure for
     // script nodes. Consume any gate result registered for this script node (Phase 5
-    // cascade engine calls recordGateResult before node completion). Always clear
-    // the map entry.
+    // cascade engine calls recordGateResult before node completion). If Phase 5 has
+    // not stored a result, synthesize a default pass result (always clear the entry).
     const scriptGateResultKey = `${workflowRun.id}:${node.id}`;
-    const scriptNodeGateResult = pendingGateResults.get(scriptGateResultKey);
+    const scriptNodeGateResult: GateResult = pendingGateResults.get(scriptGateResultKey) ?? {
+      passed: true,
+      nodeType: 'script',
+    };
     pendingGateResults.delete(scriptGateResultKey);
 
     deps.store
@@ -2030,7 +2036,7 @@ async function executeScriptNode(
           duration_ms: duration,
           type: 'script',
           node_output: output,
-          ...buildGateResultField(scriptNodeGateResult),
+          gate_result: scriptNodeGateResult,
         },
       })
       .catch((err: Error) => {
@@ -2046,7 +2052,7 @@ async function executeScriptNode(
       nodeId: node.id,
       nodeName: node.id,
       duration,
-      ...buildGateResultField(scriptNodeGateResult),
+      gate_result: scriptNodeGateResult,
     });
 
     return { state: 'completed', output };
