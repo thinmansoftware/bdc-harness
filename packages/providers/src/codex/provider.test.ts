@@ -2101,8 +2101,7 @@ describe('WO-HARNESS-CODEX-AUTH-FAILBACK-01', () => {
     const failbackProvider = {
       sendQuery: failbackSendQuery,
       getType: () => 'claude',
-      getCapabilities: () =>
-        ({}) as unknown as ReturnType<CodexProvider['getCapabilities']>,
+      getCapabilities: () => ({}) as unknown as ReturnType<CodexProvider['getCapabilities']>,
     };
     const client = new CodexProvider({
       retryBaseDelayMs: 1,
@@ -2144,8 +2143,7 @@ describe('WO-HARNESS-CODEX-AUTH-FAILBACK-01', () => {
     const generalFailbackProvider = {
       sendQuery: generalFailbackSendQuery,
       getType: () => 'claude',
-      getCapabilities: () =>
-        ({}) as unknown as ReturnType<CodexProvider['getCapabilities']>,
+      getCapabilities: () => ({}) as unknown as ReturnType<CodexProvider['getCapabilities']>,
     };
     const client = new CodexProvider({
       retryBaseDelayMs: 1,
@@ -2188,8 +2186,7 @@ describe('WO-HARNESS-CODEX-AUTH-FAILBACK-01', () => {
         yield { type: 'assistant', content: 'should not appear' } as const;
       }),
       getType: () => 'claude',
-      getCapabilities: () =>
-        ({}) as unknown as ReturnType<CodexProvider['getCapabilities']>,
+      getCapabilities: () => ({}) as unknown as ReturnType<CodexProvider['getCapabilities']>,
     }));
     const client = new CodexProvider({
       retryBaseDelayMs: 1,
@@ -2244,8 +2241,7 @@ describe('WO-HARNESS-CODEX-AUTH-FAILBACK-01', () => {
     const failbackProvider = {
       sendQuery: failbackSendQuery,
       getType: () => 'claude',
-      getCapabilities: () =>
-        ({}) as unknown as ReturnType<CodexProvider['getCapabilities']>,
+      getCapabilities: () => ({}) as unknown as ReturnType<CodexProvider['getCapabilities']>,
     };
     const client = new CodexProvider({
       retryBaseDelayMs: 1,
