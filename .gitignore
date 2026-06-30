@@ -127,3 +127,6 @@ test-results/
 # (bundles, manifests, diff stats) generated at runtime.
 harness-artifacts/*
 !harness-artifacts/.gitkeep
+
+# Fusion review runs
+fusion-runs/

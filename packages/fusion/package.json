@@ -1,0 +1,24 @@
+{
+  "name": "@archon/fusion",
+  "version": "0.3.10",
+  "type": "module",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "bin": {
+    "fusion-review": "./src/cli.ts"
+  },
+  "exports": {
+    ".": "./src/index.ts",
+    "./cli": "./src/cli.ts",
+    "./gateway": "./src/gateway.ts",
+    "./runner": "./src/runner.ts",
+    "./synthesis": "./src/synthesis.ts"
+  },
+  "scripts": {
+    "test": "bun test tests/",
+    "type-check": "bun x tsc --noEmit"
+  },
+  "peerDependencies": {
+    "typescript": "^5.0.0"
+  }
+}
