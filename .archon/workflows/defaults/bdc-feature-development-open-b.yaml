@@ -2104,6 +2104,141 @@ nodes:
       If Notion MCP is not available inside the container, do not invent a workaround.
       Emit an XO_ACTION line asking XO to flip Notion manually with the manifest above.
 
+  # WO-HARNESS-FALLBACK-FLIP-HONESTY-01: mechanical 4-condition fallback-flip gate.
+  # Evaluates the accepted-fallback doctrine (John ruling 2026-05-26) via commands
+  # only (gh pr view + grep), not prose read by an AI persona. Anchor incident:
+  # 2026-06-30 fusion-lanes session -- flip-notion-on-failure flipped 3 WOs to
+  # REVIEW off an informal 2-of-4 prose check, including one case where the
+  # validator had returned needs_revision. This node emits one JSON line;
+  # flip-notion-on-failure below branches on it mechanically, it no longer judges.
+  - id: fallback-flip-gate
+    persona: major-build
+    depends_on: [war-council-validator, flip-notion, decide-push-target, commit-and-push, open-pr-if-needed, read-spec]
+    trigger_rule: all_done
+    task_class: clerical
+    bash: |
+      set -euo pipefail
+
+      capture_node_output() {
+        # Node output refs are substituted before bash runs. Capturing them via a
+        # quoted heredoc keeps raw backticks, quotes, and $() literal; the Python
+        # shim also normalizes the current executor's shell-quoted substitution.
+        # (Same idiom as patch-pr-body above -- kept identical intentionally.)
+        python3 -c 'import shlex, sys; s=sys.stdin.read(); sys.stdout.write((lambda p: p[0] if len(p)==1 else s)(shlex.split(s)) if len(s)>=2 and s[0]=="'"'"'" and s.rstrip("\n").endswith("'"'"'") else s)'
+      }
+
+      emit() {
+        # $1=flip_allowed (true|false) $2=failed_condition
+        printf '{"flip_allowed":%s,"failed_condition":"%s","cond1_pr_open_expected_branch":%s,"cond2_pr_mergeable_clean":%s,"cond3_validator_satisfied":%s,"cond4_hard_constraints":%s,"pr_url":"%s","repo":"%s","branch":"%s","validator_verdict":"%s","pr_state":"%s","pr_mergeable":"%s","pr_merge_state_status":"%s","pr_base":"%s"}\n' \
+          "$1" "$2" "$COND1" "$COND2" "$COND3" "$COND4" "$PR_URL" "$REPO" "$UNIQUE_BRANCH" "$VALIDATOR_VERDICT" "$PR_STATE" "$PR_MERGEABLE" "$PR_MERGE_STATE_STATUS" "$PR_BASE"
+      }
+
+      COND1=false; COND2=false; COND3=false; COND4=false
+      PR_URL=""; REPO=""; UNIQUE_BRANCH=""; VALIDATOR_VERDICT=""
+      PR_STATE=""; PR_MERGEABLE=""; PR_MERGE_STATE_STATUS=""; PR_BASE=""
+
+      # -- Step 0 (idempotency pre-check, not one of the 4 doctrine conditions):
+      #    did the normal flip-notion node already flip Notion to REVIEW?
+      FLIP_NOTION_OUT=$(capture_node_output <<'BDC_NODE_OUTPUT_FLIP_NOTION'
+      $flip-notion.output
+      BDC_NODE_OUTPUT_FLIP_NOTION
+      )
+      if printf '%s\n' "$FLIP_NOTION_OUT" | grep -qiE 'claude status:? *review|status:? *review|flipped to review'; then
+        emit true already_flipped
+        echo "fallback-flip-gate: already_flipped -- normal flip-notion succeeded, no-op." >&2
+        exit 0
+      fi
+
+      # -- Resolve REPO + staging-gate expectation from decide-push-target output.
+      DECIDE_OUT=$(capture_node_output <<'BDC_NODE_OUTPUT_DECIDE'
+      $decide-push-target.output
+      BDC_NODE_OUTPUT_DECIDE
+      )
+      REPO=$(printf '%s\n' "$DECIDE_OUT" | sed -n 's/^repo: //p' | head -1)
+      STAGING_GATE_REQUIRED=$(printf '%s\n' "$DECIDE_OUT" | grep -oiE 'staging_gate_required:[[:space:]]*(true|false)' | sed 's/.*:[[:space:]]*//' | tr '[:upper:]' '[:lower:]' | head -1 || true)
+
+      # -- Resolve UNIQUE_BRANCH from commit-and-push output.
+      COMMIT_OUT=$(capture_node_output <<'BDC_NODE_OUTPUT_COMMIT'
+      $commit-and-push.output
+      BDC_NODE_OUTPUT_COMMIT
+      )
+      UNIQUE_BRANCH=$(printf '%s\n' "$COMMIT_OUT" | grep -oE 'unique_branch=[^ ]+' | sed 's/^unique_branch=//' | head -1 || true)
+
+      # -- Resolve PR_URL from open-pr-if-needed output (same idiom as patch-pr-body).
+      OPEN_PR_OUT=$(capture_node_output <<'BDC_NODE_OUTPUT_OPEN_PR'
+      $open-pr-if-needed.output
+      BDC_NODE_OUTPUT_OPEN_PR
+      )
+      PR_URL=$(printf '%s\n' "$OPEN_PR_OUT" | grep -E '^PR_URL=' | sed 's/^PR_URL=//' | head -1 || true)
+      if [ -z "$PR_URL" ]; then
+        PR_URL=$(printf '%s\n' "$OPEN_PR_OUT" | grep -E '^https://github\.com/' | head -1 || true)
+      fi
+      if [ -z "$PR_URL" ] && [ -n "$REPO" ] && [ -n "$UNIQUE_BRANCH" ]; then
+        PR_URL=$(gh pr list --repo "$REPO" --head "$UNIQUE_BRANCH" --state open --json url --jq '.[0].url' 2>/dev/null || true)
+      fi
+
+      # -- Condition 3: war-council-validator satisfied BEFORE the failure. Checked
+      #    first (cheap, no network) so a build that never reached the validator
+      #    fails closed immediately without needing a live PR to evaluate.
+      VALIDATOR_OUT=$(capture_node_output <<'BDC_NODE_OUTPUT_VALIDATOR'
+      $war-council-validator.output
+      BDC_NODE_OUTPUT_VALIDATOR
+      )
+      VALIDATOR_VERDICT=$(printf '%s\n' "$VALIDATOR_OUT" | grep -oiE '\b(satisfied|needs_revision)\b' | tail -n 1 | tr '[:upper:]' '[:lower:]' || true)
+      if [ "$VALIDATOR_VERDICT" = "satisfied" ]; then
+        COND3=true
+      fi
+
+      # -- Conditions 1 and 2: one gh pr view call covers both.
+      if [ -n "$PR_URL" ] && [ -n "$REPO" ]; then
+        PR_JSON=$(gh pr view "$PR_URL" --repo "$REPO" --json state,mergeable,mergeStateStatus,baseRefName,headRefName 2>/dev/null || echo "")
+        if [ -n "$PR_JSON" ]; then
+          PR_STATE=$(printf '%s' "$PR_JSON" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("state",""))' 2>/dev/null || echo "")
+          PR_MERGEABLE=$(printf '%s' "$PR_JSON" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("mergeable",""))' 2>/dev/null || echo "")
+          PR_MERGE_STATE_STATUS=$(printf '%s' "$PR_JSON" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("mergeStateStatus",""))' 2>/dev/null || echo "")
+          PR_BASE=$(printf '%s' "$PR_JSON" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("baseRefName",""))' 2>/dev/null || echo "")
+          PR_HEAD=$(printf '%s' "$PR_JSON" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("headRefName",""))' 2>/dev/null || echo "")
+          if [ "$PR_STATE" = "OPEN" ] && [ -n "$UNIQUE_BRANCH" ] && [ "$PR_HEAD" = "$UNIQUE_BRANCH" ]; then
+            COND1=true
+          fi
+          if [ "$PR_MERGEABLE" = "MERGEABLE" ] && [ "$PR_MERGE_STATE_STATUS" = "CLEAN" ]; then
+            COND2=true
+          fi
+        fi
+      fi
+
+      # -- Condition 4: hard constraints -- base branch matches the Rule-20/staging
+      #    expectation, and (if the spec named a target repo) REPO matches it.
+      COND4=true
+      if [ -z "$PR_BASE" ]; then
+        COND4=false
+      fi
+      if [ "$STAGING_GATE_REQUIRED" = "true" ] && [ "$PR_BASE" != "staging" ]; then
+        COND4=false
+      fi
+      SPEC_OUT=$(capture_node_output <<'BDC_NODE_OUTPUT_SPEC'
+      $read-spec.output
+      BDC_NODE_OUTPUT_SPEC
+      )
+      SPEC_TARGET_REPO=$(printf '%s\n' "$SPEC_OUT" | grep -oE 'target_repo:[[:space:]]*[^ ]+' | sed 's/^target_repo:[[:space:]]*//' | head -1 || true)
+      if [ -n "$SPEC_TARGET_REPO" ] && [ -n "$REPO" ] && [ "$SPEC_TARGET_REPO" != "$REPO" ]; then
+        COND4=false
+      fi
+
+      # -- Decide. Priority on a multi-condition failure matches the anchor case
+      #    (2026-06-30: open PR + needs_revision) -- validator checked first.
+      if [ "$COND1" = "true" ] && [ "$COND2" = "true" ] && [ "$COND3" = "true" ] && [ "$COND4" = "true" ]; then
+        emit true none
+      elif [ "$COND3" != "true" ]; then
+        emit false validator_not_satisfied
+      elif [ "$COND1" != "true" ]; then
+        emit false pr_not_open_or_wrong_branch
+      elif [ "$COND2" != "true" ]; then
+        emit false pr_not_mergeable_clean
+      else
+        emit false hard_constraints_failed
+      fi
+
   # Defect 3 (WO-HARNESS-CAULDRON-DEFECT-CLEANUP-01): fallback Notion flip.
   # The harness has known-defective tail nodes (commit-and-push, open-pr-if-needed,
   # build-manifest) that can fail for plumbing reasons AFTER the build is good and
@@ -2111,51 +2246,39 @@ nodes:
   # (depends_on: build-manifest) never runs and Notion stays IN_PROGRESS until a
   # human flips it manually (cauldron-fallback-recovery doctrine, 2026-05-26).
   #
-  # The spec's original design used `trigger.on_workflow_status: failed`, which the
-  # executor does NOT support. The supported primitives are `trigger_rule: all_done`
-  # (run after deps settle regardless of pass/fail) and `when:` (exact-match only).
-  # Because the validator output is a long markdown report, an exact-match `when:`
-  # cannot test it -- so the satisfied-gate is enforced IN-PROMPT instead (the same
-  # pattern the normal flip-notion uses for its block-reclassify branch). This node
-  # depends on war-council-validator + flip-notion with all_done, so it runs even
-  # when the tail chain between them failed, and no-ops on a real build failure.
+  # WO-HARNESS-FALLBACK-FLIP-HONESTY-01: this node used to decide the flip itself by
+  # reading validator prose in-prompt (2-of-4 doctrine conditions, informally
+  # worded). It now does ZERO judging -- fallback-flip-gate above evaluates all four
+  # conditions by command and this node only branches on that gate's JSON output.
   - id: flip-notion-on-failure
     persona: xo
-    depends_on: [war-council-validator, flip-notion]
+    depends_on: [war-council-validator, flip-notion, fallback-flip-gate]
     trigger_rule: all_done
     task_class: clerical
     prompt: |
-      FALLBACK Notion flip. Update Notion ONLY if the normal flip-notion node did NOT
-      already flip the WO to REVIEW, AND the build was genuinely good. This is a
-      safety net for the harness tail-node defect (cauldron-fallback-recovery doctrine).
+      FALLBACK Notion flip. Branch MECHANICALLY on fallback-flip-gate's single JSON
+      output line below -- do not re-judge the build from prose. The four-condition
+      doctrine evaluation (PR open on origin against the expected branch, PR
+      mergeable/CLEAN, war-council-validator satisfied, hard constraints intact)
+      already happened in fallback-flip-gate via commands (gh pr view + grep).
 
-      ## Step 1 -- did the normal flip already happen? (idempotency guard)
-      flip-notion node output: $flip-notion.output
-      - If $flip-notion.output shows the WO was already flipped to REVIEW (Claude Status
-        REVIEW / Status Review set successfully), STOP. Do nothing. Emit:
+      ## Gate output
+      $fallback-flip-gate.output
+
+      ## Branch on flip_allowed / failed_condition (read the JSON above literally)
+      - "already_flipped":true -> do nothing. Emit exactly:
         "FALLBACK_FLIP_SKIPPED: normal flip-notion already set REVIEW." Exit.
-      - If $flip-notion.output is empty, errored, or shows the flip did NOT complete,
-        continue to Step 2.
+      - "flip_allowed":false -> do NOT touch Notion Status or Claude Status. Add a
+        page comment naming the failed_condition value from the JSON verbatim.
+        Emit exactly "FALLBACK_FLIP_DECLINED:<failed_condition>" (substitute the
+        real value). Exit. This is the normal path for a genuine build failure --
+        leave status as-is.
+      - "flip_allowed":true -> perform the flip:
+        - Claude Status: REVIEW
+        - Status: Review
+        - Add a page comment starting EXACTLY with "FALLBACK PATH:" (greppable
+          convention), including failed_condition=none and the pr_url, repo, and
+          validator_verdict=satisfied fields copied from the gate JSON.
 
-      ## Step 2 -- was the build actually good? (satisfied-gate -- do NOT flip on a real failure)
-      war-council-validator report: $war-council-validator.output
-      - The validator verdict MUST be `satisfied` (look for "Verdict: satisfied" or
-        "VALIDATION: PASS"). If the verdict is `needs_revision`, `fail`, or the validator
-        never ran (output empty), this is a REAL build failure -- do NOT flip. Emit:
-        "FALLBACK_FLIP_DECLINED: validator verdict not satisfied; real failure; leaving Notion as-is." Exit.
-      - Only if the verdict is satisfied, continue to Step 3.
-
-      ## Step 3 -- perform the fallback flip
-      Set on the Notion WO page:
-      - Claude Status: REVIEW
-      - Status: Review
-      - Add a page comment starting EXACTLY with "FALLBACK PATH:" so the recovery is
-        greppable, including: which tail node failed (infer from the available outputs),
-        that the validator returned satisfied (build good), and the PR/branch info if present.
-
-      ## Inputs for the comment
-      Push status: $commit-and-push.output (may be empty if commit-and-push failed)
-      PR status:   $open-pr-if-needed.output (may be empty if open-pr-if-needed failed)
-
-      If Notion MCP is not available inside the container, do not invent a workaround.
-      Log "FALLBACK_FLIP_DEFERRED: Notion MCP unavailable" and exit 0.
+      If Notion MCP is not available inside the container, do not invent a
+      workaround. Log "FALLBACK_FLIP_DEFERRED: Notion MCP unavailable" and exit 0.
