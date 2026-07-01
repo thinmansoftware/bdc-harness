@@ -1,9 +1,10 @@
 name: bdc-feature-development-glm
 description: |
   GLM-implement variant of bdc-feature-development. Identical DAG; implement uses
-  GLM glm-5.2. diff-repair + opus-repair use claude/sonnet (GLM could not converge
-  the review-repair loops -- 2026-07-01, run 818d4b62). Fire when routing the build
-  node to Z.ai is preferred. All review nodes stay on Codex.
+  GLM glm-5.2. Planner nodes (check-already-satisfied, plan, plan-review) and repair
+  nodes (diff-repair, opus-repair) use claude/sonnet -- GLM could not converge the
+  agentic planning or review-repair loops (2026-07-01, runs 818d4b62 + d3f1b36c).
+  Fire when routing the build node to Z.ai is preferred. All review nodes stay on Codex.
 
 policyFile: harness/policies/agent-behavior.md
 # GLM build lane: glm-5.2 is the build default. war-council-validator is pinned to
@@ -94,6 +95,8 @@ nodes:
   - id: check-already-satisfied
     persona: war-council-architect
     agent: war-council-architect
+    provider: claude
+    model: sonnet
     depends_on: [read-spec]
     task_class: clerical
     prompt: |
@@ -149,6 +152,8 @@ nodes:
     persona: war-council-architect
     depends_on: [gate-already-satisfied]
     agent: war-council-architect
+    provider: claude
+    model: sonnet
     task_class: medium_work
     prompt: |
       Read the BDC Work Order spec below and produce a concise implementation plan.
@@ -193,6 +198,8 @@ nodes:
   - id: plan-review
     persona: war-council-architect
     agent: war-council-architect
+    provider: claude
+    model: sonnet
     depends_on: [plan]
     task_class: medium_work
     loop:
