@@ -21,9 +21,10 @@ import { randomUUID } from 'crypto';
 import { loadLadder } from './ladder.js';
 import { loadRuleset, pickEntryTier } from './conductor.js';
 import { fireTier, buildFireMessage } from './fire.js';
-import { pollForTerminal } from './poll.js';
+import { pollForTerminal, TimeoutError } from './poll.js';
 import { judgeGate, classifyAttemptOutcome } from './judge.js';
 import { writeRecord } from './recorder.js';
+import { cancelRun } from './cancel.js';
 import { classifyError } from '@archon/overseer/classify';
 import { runEscalation } from '@archon/overseer/escalate';
 import type {
@@ -31,6 +32,7 @@ import type {
   CascadeAttempt,
   CascadeStatus,
   TierName,
+  LadderTier,
   GateVerdict,
   FireResult,
   PollResult,
@@ -47,6 +49,8 @@ export interface CascadeDeps {
   judge?: typeof judgeGate;
   escalate?: (context: EscalationCallContext) => Promise<void>;
   writeRecord?: typeof writeRecord;
+  /** Best-effort cancel of a hung run on progress-timeout. Failure never blocks the climb. */
+  cancel?: typeof cancelRun;
 }
 
 export interface EscalationCallContext {
@@ -75,7 +79,7 @@ export interface RunCascadeOptions {
   dryRun?: boolean;
   /** Dependency injection (for testing). */
   deps?: CascadeDeps;
-  /** Poll timeout per attempt in ms. Default: 3600000 (1 hour). */
+  /** Poll timeout per attempt in ms. Default: 1800000 (30 minutes). */
   pollTimeoutMs?: number;
   /** Poll interval per attempt in ms. Default: 30000 (30 seconds). */
   pollIntervalMs?: number;
@@ -99,7 +103,7 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
     entryOverride,
     dryRun = false,
     outDir = './cascade-runs',
-    pollTimeoutMs = 3_600_000,
+    pollTimeoutMs = 1_800_000,
     pollIntervalMs = 30_000,
   } = opts;
 
@@ -111,6 +115,7 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
   const judgeImpl = opts.deps?.judge ?? judgeGate;
   const escalateImpl = opts.deps?.escalate ?? defaultEscalate;
   const writeRecordImpl = opts.deps?.writeRecord ?? writeRecord;
+  const cancelImpl = opts.deps?.cancel ?? cancelRun;
 
   // Load config from files (never from inline constants)
   const tiers = loadLadder();
@@ -162,6 +167,58 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
   let climbCount = 0;
   let status: CascadeStatus = 'blocked';
   let winningTier: TierName | null = null;
+
+  /**
+   * Shared climb/frontier logic for both the gate-fail path and the
+   * progress-timeout path (see the poll try/catch below). Escalates + marks
+   * BLOCKED if the failing tier is the frontier or tiers are exhausted;
+   * otherwise advances currentIndex/climbCount to the next tier.
+   *
+   * @param currentTier The tier that just failed (gate-fail or progress-timeout).
+   * @param failReason  Human-readable reason (verdict.reason, or the fixed
+   *                    progress-timeout message -- there is no GateVerdict for
+   *                    a run that never reached a terminal state).
+   * @param runId       runId for the escalation context (may be null).
+   * @returns true if the cascade loop should stop (caller must break), false
+   *          to keep climbing.
+   */
+  async function climbOrStop(
+    currentTier: LadderTier,
+    failReason: string,
+    runId: string | null
+  ): Promise<boolean> {
+    if (currentTier.isFrontier) {
+      // Top rung failed -- BLOCKED
+      await escalateImpl({
+        errorClass: 'validator_rejected',
+        woId,
+        reason: `Frontier tier ${currentTier.name} failed gate: ${failReason}`,
+        remediation: [failReason],
+        runId,
+      });
+
+      status = 'blocked';
+      console.log(`[smart-cauldron] BLOCKED: frontier tier gate-failed for woId=${woId}`);
+      return true;
+    }
+
+    // Climb to next tier
+    currentIndex++;
+    climbCount++;
+
+    if (currentIndex >= tiers.length) {
+      // Exhausted all tiers without a win -- should not happen if frontier is marked
+      status = 'blocked';
+      console.log(`[smart-cauldron] BLOCKED: all tiers exhausted for woId=${woId}`);
+      return true;
+    }
+
+    const nextTier = tiers[currentIndex];
+    console.log(
+      `[smart-cauldron] Climbing to tier=${nextTier?.name ?? 'unknown'} (climb #${climbCount})`
+    );
+    return false;
+  }
 
   while (currentIndex < tiers.length) {
     const tier = tiers[currentIndex];
@@ -224,7 +281,51 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
         intervalMs: pollIntervalMs,
       });
     } catch (pollErr) {
-      // Poll timeout or error -- treat as infra-error
+      if (pollErr instanceof TimeoutError) {
+        // Progress-timeout: the model responded and burned tokens but never
+        // reached a terminal state within budget. Per the three-failure-class
+        // design (v1.1 amendment 2), this is a QUALITY failure, not an infra
+        // failure -- cancel the hung run (best-effort; must not block the
+        // climb) and climb via the same logic used for gate-fail.
+        const cancelResult = await cancelImpl({ runId: resolvedRunId, apiBaseUrl }).catch(
+          (cancelErr: unknown) => ({
+            ok: false,
+            error: `cancel threw: ${(cancelErr as Error).message}`,
+          })
+        );
+        if (!cancelResult.ok) {
+          console.log(
+            `[smart-cauldron] Warning: cancel failed for run ${resolvedRunId} on tier ` +
+              `${tier.name}: ${cancelResult.error ?? 'unknown'} (continuing climb -- ` +
+              'cancellation is best-effort)'
+          );
+        }
+
+        const timeoutReason = `progress-timeout: no terminal state within ${pollTimeoutMs}ms poll budget`;
+        const attempt: CascadeAttempt = {
+          tier: tier.name,
+          workflowName: tier.workflowName,
+          runId: fireResult.runId,
+          outcome: 'progress-timeout',
+          gateFailReason: timeoutReason,
+          infraErrorReason: null,
+          servedModelId: null,
+          costUsd: null,
+          startedAt: attemptStartedAt,
+          completedAt: new Date().toISOString(),
+        };
+        attempts.push(attempt);
+
+        console.log(`[smart-cauldron] Progress-timeout on tier=${tier.name}: ${timeoutReason}`);
+        priorContext = buildTimeoutPriorContext(tier.name, pollTimeoutMs);
+
+        const shouldStop = await climbOrStop(tier, timeoutReason, fireResult.runId);
+        if (shouldStop) break;
+        continue;
+      }
+
+      // Non-timeout poll errors (network, API unreachable/5xx) keep the exact
+      // existing infra-error handling -- unchanged.
       const errMsg = (pollErr as Error).message;
       const attempt: CascadeAttempt = {
         tier: tier.name,
@@ -283,36 +384,8 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
     // Build informed-climb context for the next tier
     priorContext = buildPriorContext(tier.name, verdict, pollResult);
 
-    if (tier.isFrontier) {
-      // Top rung failed -- BLOCKED
-      await escalateImpl({
-        errorClass: 'validator_rejected',
-        woId,
-        reason: `Frontier tier ${tier.name} failed gate: ${verdict.reason}`,
-        remediation: [verdict.reason],
-        runId: fireResult.runId,
-      });
-
-      status = 'blocked';
-      console.log(`[smart-cauldron] BLOCKED: frontier tier gate-failed for woId=${woId}`);
-      break;
-    }
-
-    // Climb to next tier
-    currentIndex++;
-    climbCount++;
-
-    if (currentIndex >= tiers.length) {
-      // Exhausted all tiers without a win -- should not happen if frontier is marked
-      status = 'blocked';
-      console.log(`[smart-cauldron] BLOCKED: all tiers exhausted for woId=${woId}`);
-      break;
-    }
-
-    const nextTier = tiers[currentIndex];
-    console.log(
-      `[smart-cauldron] Climbing to tier=${nextTier?.name ?? 'unknown'} (climb #${climbCount})`
-    );
+    const shouldStop = await climbOrStop(tier, verdict.reason, fireResult.runId);
+    if (shouldStop) break;
   }
 
   // Compute total cost
@@ -376,6 +449,23 @@ function buildPriorContext(tierName: TierName, verdict: GateVerdict, poll: PollR
   );
 
   return lines.join('\n');
+}
+
+/**
+ * Build informed-climb context for the next tier after a progress-timeout.
+ * Distinct from buildPriorContext (gate-fail) since no GateVerdict/PollResult
+ * exists for a run that never reached a terminal state.
+ */
+function buildTimeoutPriorContext(tierName: TierName, timeoutMs: number): string {
+  return [
+    `Prior tier: ${tierName}`,
+    'Outcome: PROGRESS-TIMEOUT (poll watchdog kill)',
+    `The run did not reach a terminal state within the ${timeoutMs}ms poll budget and was cancelled.`,
+    '',
+    'The prior tier likely stalled (repair loop, no-progress churn, or a hang) rather',
+    'than failing a specific gate condition. Focus on completing the work within budget',
+    'rather than repeating whatever caused the stall.',
+  ].join('\n');
 }
 
 /**

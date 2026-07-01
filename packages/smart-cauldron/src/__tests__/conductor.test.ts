@@ -12,7 +12,9 @@ import { describe, test, expect } from 'bun:test';
 import { pickEntryTier } from '../conductor.js';
 import type { ConductorRuleset } from '../types.js';
 
-// Inline stub ruleset -- mirrors structure of config/ruleset.config.json
+// Inline stub ruleset -- mirrors structure of config/ruleset.config.json,
+// including the feature-scale -> codex rule (positioned above the generic
+// CODE rules, same as the real config).
 const stubRuleset: ConductorRuleset = {
   defaultEntry: 'glm',
   rules: [
@@ -27,6 +29,10 @@ const stubRuleset: ConductorRuleset = {
     {
       match: { woClass: 'INFRA' },
       entry: 'claude',
+    },
+    {
+      match: { tags: ['feature', 'net-new', 'multi-surface'] },
+      entry: 'codex',
     },
     {
       match: { woClass: 'CODE', tags: ['mechanical'] },
@@ -74,5 +80,27 @@ describe('conductor -- pickEntryTier', () => {
     // auth comes before CODE/mechanical in the ruleset, so auth wins
     const result = pickEntryTier({ woClass: 'CODE', tags: ['mechanical', 'auth'] }, stubRuleset);
     expect(result).toBe('claude');
+  });
+
+  test('feature-scale rule routes to codex (skips glm entirely)', () => {
+    const result = pickEntryTier({ woClass: 'CODE', tags: ['feature'] }, stubRuleset);
+    expect(result).toBe('codex');
+  });
+
+  test('feature-scale rule matches ANY of its tags (net-new, multi-surface)', () => {
+    expect(pickEntryTier({ woClass: 'CODE', tags: ['net-new'] }, stubRuleset)).toBe('codex');
+    expect(pickEntryTier({ woClass: 'CODE', tags: ['multi-surface'] }, stubRuleset)).toBe('codex');
+  });
+
+  test('feature-scale rule appears before the generic CODE rule (first-match-wins ordering)', () => {
+    // A WO tagged both "feature" and "mechanical" must route to codex, not glm --
+    // proves the feature-scale rule is evaluated before the generic CODE/mechanical rule.
+    const result = pickEntryTier({ woClass: 'CODE', tags: ['feature', 'mechanical'] }, stubRuleset);
+    expect(result).toBe('codex');
+  });
+
+  test('generic mechanical CODE (no feature-scale tag) still enters glm -- no regression', () => {
+    const result = pickEntryTier({ woClass: 'CODE', tags: ['mechanical'] }, stubRuleset);
+    expect(result).toBe('glm');
   });
 });

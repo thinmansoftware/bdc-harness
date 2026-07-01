@@ -17,6 +17,7 @@ import type { CascadeDeps, RunCascadeOptions } from '../cascade.js';
 import type { FireResult, PollResult, GateVerdict, CascadeRunRecord } from '../types.js';
 import { loadLadder } from '../ladder.js';
 import { loadRuleset } from '../conductor.js';
+import { TimeoutError } from '../poll.js';
 
 // ---------------------------------------------------------------------------
 // Shared helpers
@@ -129,6 +130,189 @@ describe('Test 2: CLIMB-ON-GATE-FAIL', () => {
     const nextTier = tiers[tiers.findIndex(t => t.name === 'glm') + 1];
     expect(fireCalls[0]).toBe(entryTier?.workflowName);
     expect(fireCalls[1]).toBe(nextTier?.workflowName);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Test: PROGRESS-TIMEOUT -- cancels and climbs (not infra-error)
+// ---------------------------------------------------------------------------
+
+describe('Test: PROGRESS-TIMEOUT climbs (does not stop as infra-error)', () => {
+  test('timeout cancels the hung run and climbs to the next tier', async () => {
+    const fireCalls: string[] = [];
+    const cancelCalls: { runId: string; apiBaseUrl: string }[] = [];
+    let pollCallIndex = 0;
+
+    const deps: CascadeDeps = {
+      fire: async opts => {
+        fireCalls.push(opts.workflowName);
+        return makeFireOk(`run-${fireCalls.length}`);
+      },
+      poll: async _opts => {
+        pollCallIndex++;
+        if (pollCallIndex === 1) {
+          throw new TimeoutError(
+            '[smart-cauldron/poll] Run run-1 did not reach terminal state within 1800000ms'
+          );
+        }
+        return makePollResult();
+      },
+      judge: _poll => makePassVerdict(),
+      escalate: async _ctx => {
+        /* no-op */
+      },
+      writeRecord: async (record, _dir) => `/tmp/cascade-record-${record.cascadeId}.json`,
+      cancel: async opts => {
+        cancelCalls.push(opts);
+        return { ok: true, error: null };
+      },
+    };
+
+    const record = await runCascade(baseOpts({ deps }));
+
+    // Cancel was called exactly once, for the hung (tier-0) run
+    expect(cancelCalls.length).toBe(1);
+    expect(cancelCalls[0]?.runId).toBe('run-1');
+
+    // Recorded as progress-timeout, NOT infra-error -- and the cascade climbed
+    expect(record.attempts.length).toBe(2);
+    expect(record.attempts[0]?.outcome).toBe('progress-timeout');
+    expect(record.attempts[0]?.outcome).not.toBe('infra-error');
+    expect(record.attempts[0]?.gateFailReason).toContain('progress-timeout');
+    expect(record.attempts[1]?.outcome).toBe('won');
+
+    expect(record.status).toBe('won');
+    expect(record.status).not.toBe('infra-alert');
+    expect(record.telemetry.climbed).toBe(true);
+    expect(record.telemetry.climbCount).toBe(1);
+
+    // Second fire used the next tier's workflowName (same climb semantics as gate-fail)
+    const tiers = loadLadder();
+    const entryTier = tiers.find(t => t.name === 'glm');
+    const nextTier = tiers[tiers.findIndex(t => t.name === 'glm') + 1];
+    expect(fireCalls[0]).toBe(entryTier?.workflowName);
+    expect(fireCalls[1]).toBe(nextTier?.workflowName);
+  });
+
+  test('cancel failure is best-effort -- does not block the climb', async () => {
+    let pollCallIndex = 0;
+    let fireCount = 0;
+
+    const deps: CascadeDeps = {
+      fire: async _opts => {
+        fireCount++;
+        return makeFireOk(`run-${fireCount}`);
+      },
+      poll: async _opts => {
+        pollCallIndex++;
+        if (pollCallIndex === 1) {
+          throw new TimeoutError('poll timeout');
+        }
+        return makePollResult();
+      },
+      judge: _poll => makePassVerdict(),
+      escalate: async _ctx => {
+        /* no-op */
+      },
+      writeRecord: async (record, _dir) => `/tmp/cascade-record-${record.cascadeId}.json`,
+      cancel: async _opts => ({ ok: false, error: 'HTTP 500: cancel endpoint unavailable' }),
+    };
+
+    const record = await runCascade(baseOpts({ deps }));
+
+    expect(fireCount).toBe(2);
+    expect(record.status).toBe('won');
+    expect(record.attempts[0]?.outcome).toBe('progress-timeout');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Test: non-timeout poll error still stops as infra-error (regression)
+// ---------------------------------------------------------------------------
+
+describe('Test: non-timeout poll error still stops as infra-error', () => {
+  test('generic poll error (not TimeoutError) does not climb; infra-alert unchanged', async () => {
+    let fireCount = 0;
+    let escalateCalled = false;
+    let cancelCalled = false;
+
+    const deps: CascadeDeps = {
+      fire: async _opts => {
+        fireCount++;
+        return makeFireOk(`run-${fireCount}`);
+      },
+      poll: async _opts => {
+        throw new Error('network error: ECONNRESET');
+      },
+      judge: _poll => makePassVerdict(),
+      escalate: async _ctx => {
+        escalateCalled = true;
+      },
+      writeRecord: async (record, _dir) => `/tmp/cascade-record-${record.cascadeId}.json`,
+      cancel: async _opts => {
+        cancelCalled = true;
+        return { ok: true, error: null };
+      },
+    };
+
+    const record = await runCascade(baseOpts({ deps }));
+
+    expect(fireCount).toBe(1); // no climb -- stopped after the single tier
+    expect(record.status).toBe('infra-alert');
+    expect(record.attempts.length).toBe(1);
+    expect(record.attempts[0]?.outcome).toBe('infra-error');
+    expect(record.attempts[0]?.outcome).not.toBe('progress-timeout');
+    expect(escalateCalled).toBe(true);
+    expect(cancelCalled).toBe(false); // cancel is only invoked on TimeoutError
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Test: poll timeout default (1800000) + configurable override
+// ---------------------------------------------------------------------------
+
+describe('Test: poll timeout default + override', () => {
+  test('default pollTimeoutMs passed to poll is 1800000 when not overridden', async () => {
+    let observedTimeoutMs: number | undefined;
+
+    const deps: CascadeDeps = {
+      fire: async _opts => makeFireOk('run-default-timeout'),
+      poll: async opts => {
+        observedTimeoutMs = opts.timeoutMs;
+        return makePollResult();
+      },
+      judge: _poll => makePassVerdict(),
+      escalate: async _ctx => {
+        /* no-op */
+      },
+      writeRecord: async (record, _dir) => `/tmp/cascade-record-${record.cascadeId}.json`,
+    };
+
+    await runCascade(baseOpts({ deps }));
+
+    expect(observedTimeoutMs).toBe(1_800_000);
+    expect(observedTimeoutMs).not.toBe(3_600_000);
+  });
+
+  test('pollTimeoutMs override is threaded through to poll', async () => {
+    let observedTimeoutMs: number | undefined;
+
+    const deps: CascadeDeps = {
+      fire: async _opts => makeFireOk('run-override-timeout'),
+      poll: async opts => {
+        observedTimeoutMs = opts.timeoutMs;
+        return makePollResult();
+      },
+      judge: _poll => makePassVerdict(),
+      escalate: async _ctx => {
+        /* no-op */
+      },
+      writeRecord: async (record, _dir) => `/tmp/cascade-record-${record.cascadeId}.json`,
+    };
+
+    await runCascade(baseOpts({ deps, pollTimeoutMs: 900_000 }));
+
+    expect(observedTimeoutMs).toBe(900_000);
   });
 });
 

@@ -14,6 +14,19 @@ const execFileAsync = promisify(execFile);
 
 const TERMINAL_STATUSES = new Set(['completed', 'failed', 'cancelled']);
 
+/**
+ * Thrown by pollForTerminal when a run does not reach a terminal state within
+ * the poll budget. Distinguishable from network/API errors so callers (the
+ * cascade) can treat a progress-timeout as a quality-fail-and-climb signal
+ * instead of an infra-error.
+ */
+export class TimeoutError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'TimeoutError';
+  }
+}
+
 interface RunApiResponse {
   run: {
     id: string;
@@ -31,7 +44,7 @@ interface RunApiResponse {
 interface PollOptions {
   runId: string;
   apiBaseUrl: string;
-  /** How long to wait before giving up (ms). Default: 3600000 (1 hour). */
+  /** How long to wait before giving up (ms). Default: 1800000 (30 minutes). */
   timeoutMs?: number;
   /** Poll interval (ms). Default: 30000 (30 seconds). */
   intervalMs?: number;
@@ -44,7 +57,7 @@ interface PollOptions {
  * @throws If the run does not reach terminal state within timeoutMs.
  */
 export async function pollForTerminal(opts: PollOptions): Promise<PollResult> {
-  const { runId, apiBaseUrl, timeoutMs = 3_600_000, intervalMs = 30_000 } = opts;
+  const { runId, apiBaseUrl, timeoutMs = 1_800_000, intervalMs = 30_000 } = opts;
 
   const deadline = Date.now() + timeoutMs;
 
@@ -78,7 +91,7 @@ export async function pollForTerminal(opts: PollOptions): Promise<PollResult> {
     await new Promise<void>(resolve => setTimeout(resolve, waitMs));
   }
 
-  throw new Error(
+  throw new TimeoutError(
     `[smart-cauldron/poll] Run ${runId} did not reach terminal state within ${timeoutMs}ms`
   );
 }

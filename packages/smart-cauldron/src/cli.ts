@@ -12,6 +12,7 @@
  *   --out-dir <path>           cascade-runs output dir (default: ./cascade-runs)
  *   --dry-run                  Print which tier would be picked, do not fire
  *   --api-url <url>            Archon API base (default: ARCHON_API_BASE_URL or http://localhost:3090)
+ *   --poll-timeout-ms <ms>     Per-attempt poll timeout override (default: 1800000 / 30 min)
  *
  * Secret boundary: API URL comes from env (ARCHON_API_BASE_URL) or --api-url flag.
  * ASCII only. No emojis.
@@ -32,6 +33,7 @@ interface CliArgs {
   outDir: string;
   dryRun: boolean;
   apiUrl?: string;
+  pollTimeoutMs?: number;
 }
 
 function printHelp(): void {
@@ -51,6 +53,7 @@ Options:
   --out-dir <path>   Output directory for cascade records (default: ./cascade-runs)
   --dry-run          Print entry tier selection only; do not fire
   --api-url <url>    Archon API base URL (default: ARCHON_API_BASE_URL env or http://localhost:3090)
+  --poll-timeout-ms <ms>  Per-attempt poll timeout override (default: 1800000 / 30 min)
   --help, -h         Show this help
 
 Examples:
@@ -59,6 +62,7 @@ Examples:
   smart-cauldron fire WO-INFRA-003 --class INFRA
   smart-cauldron fire WO-HARNESS-001 --dry-run
   smart-cauldron fire WO-HARNESS-001 --entry claude --api-url http://localhost:3090
+  smart-cauldron fire WO-HARNESS-001 --poll-timeout-ms 900000
 `);
 }
 
@@ -101,6 +105,15 @@ function parseArgs(argv: string[]): CliArgs {
       i++;
     } else if (arg === '--api-url' && i + 1 < args.length) {
       result.apiUrl = args[i + 1];
+      i += 2;
+    } else if (arg === '--poll-timeout-ms' && i + 1 < args.length) {
+      const raw = args[i + 1] ?? '';
+      const parsed = Number(raw);
+      if (!Number.isFinite(parsed) || parsed <= 0) {
+        console.error(`Invalid --poll-timeout-ms value: "${raw}" (must be a positive number)`);
+        process.exit(1);
+      }
+      result.pollTimeoutMs = parsed;
       i += 2;
     } else if (arg === '--help' || arg === '-h') {
       printHelp();
@@ -146,6 +159,8 @@ async function main(): Promise<void> {
     console.log(`[smart-cauldron]   tags=${args.tags.join(',')}`);
   if (args.entry) console.log(`[smart-cauldron]   entry override=${args.entry}`);
   if (args.dryRun) console.log('[smart-cauldron]   DRY RUN mode');
+  if (args.pollTimeoutMs !== undefined)
+    console.log(`[smart-cauldron]   poll timeout override=${args.pollTimeoutMs}ms`);
 
   const record = await runCascade({
     woId: args.woId,
@@ -155,6 +170,7 @@ async function main(): Promise<void> {
     outDir: args.outDir,
     dryRun: args.dryRun,
     apiBaseUrl: args.apiUrl,
+    pollTimeoutMs: args.pollTimeoutMs,
   });
 
   console.log('');

@@ -10,7 +10,8 @@ export type TierName = string; // e.g. "glm", "codex", "claude", "frontier"
 export type TierOutcome =
   | 'won' // gate passed -- cascade stops
   | 'gate-failed' // ran, built, gate failed -- climb
-  | 'infra-error'; // auth/transport failure -- alert, do not count as "too hard"
+  | 'infra-error' // auth/transport failure -- alert, do not count as "too hard"
+  | 'progress-timeout'; // poll watchdog kill -- run never reached terminal; climb like gate-failed
 
 export interface LadderTier {
   name: TierName;
