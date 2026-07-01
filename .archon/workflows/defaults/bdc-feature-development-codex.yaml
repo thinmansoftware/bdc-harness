@@ -93,6 +93,8 @@ nodes:
   - id: check-already-satisfied
     persona: war-council-architect
     agent: war-council-architect
+    provider: claude
+    model: sonnet
     depends_on: [read-spec]
     task_class: clerical
     prompt: |
@@ -1197,6 +1199,8 @@ nodes:
   # emit sentinels. Only an AI pass normalizes all of them into the per-row JSON ledger.
   - id: findings-consolidate
     persona: xo
+    provider: claude
+    model: sonnet
     depends_on: [block-reclassify]
     trigger_rule: all_done
     task_class: clerical
@@ -1287,6 +1291,8 @@ nodes:
   # trigger_rule all_done so an APPROVE-AS-IS run (which skips this) does not hang the DAG.
   - id: apply-suggested-fix
     agent: overseer-opus
+    provider: claude
+    model: claude-opus-4-7
     effort: xhigh
     context: fresh
     depends_on: [pause-gate]
@@ -1367,6 +1373,8 @@ nodes:
 
   - id: decide-push-target
     persona: major-build
+    provider: claude
+    model: opus[1m]
     depends_on: [pause-gate, classify-apply-review]
     trigger_rule: all_done
     when: "$pause-gate.output.decision_verb != 'approve_with_fix' || $classify-apply-review.output.verdict == 'satisfied'"
@@ -1804,6 +1812,8 @@ nodes:
 
   - id: build-manifest
     persona: major-build
+    provider: claude
+    model: opus[1m]
     depends_on: [open-pr-if-needed, block-reclassify, pause-gate]
     trigger_rule: all_done
     task_class: clerical
@@ -2078,6 +2088,8 @@ nodes:
 
   - id: flip-notion
     persona: xo
+    provider: claude
+    model: sonnet
     depends_on: [build-manifest]
     trigger_rule: all_done
     task_class: clerical
@@ -2116,6 +2128,8 @@ nodes:
   # when the tail chain between them failed, and no-ops on a real build failure.
   - id: flip-notion-on-failure
     persona: xo
+    provider: claude
+    model: sonnet
     depends_on: [war-council-validator, flip-notion]
     trigger_rule: all_done
     task_class: clerical
