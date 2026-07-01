@@ -7,7 +7,13 @@ description: |
   to validate open-model gate-passing code without consuming Claude usage.
 
 policyFile: harness/policies/agent-behavior.md
-model: sonnet
+# open-a build lane: GLM provider / z-ai/glm-5.2 build model via OpenRouter.
+# provider: glm is REQUIRED here (no top-level provider would cause un-pinned nodes
+# to fall through to config-default claude with a GLM model ID -- API rejection).
+# war-council-validator is pinned to claude/sonnet on the node.
+# WO-HARNESS-SMART-CAULDRON-LANE-ROSTER-AND-RESILIENCE-01.
+provider: glm
+model: z-ai/glm-5.2
 
 nodes:
   # Pre-flight: fail closed if container lacks GITHUB auth (WO-169, 2026-05-16).
@@ -654,6 +660,10 @@ nodes:
       exit 0
 
   - id: war-council-validator
+    # Pin to claude/sonnet: trusted judge always Claude, never GLM.
+    # WO-HARNESS-SMART-CAULDRON-LANE-ROSTER-AND-RESILIENCE-01.
+    provider: claude
+    model: sonnet
     persona: captain-ci-validator
     depends_on: [ascii-gate]
     task_class: medium_work
@@ -792,7 +802,7 @@ nodes:
       # NEVER emit. Thus only until_bash (done.flag exists AND no debug prints in the
       # feature diff) can complete the loop.
       until: __NEVER_EMIT_USE_UNTIL_BASH__
-      max_iterations: 10
+      max_iterations: 20
       until_bash: |
         set -uo pipefail
         # MECHANICAL invariants ONLY. This does NOT prove Codex is satisfied --

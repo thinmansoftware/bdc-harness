@@ -1121,56 +1121,130 @@ describe('CodexProvider', () => {
       expect(errors?.[0]).not.toContain('MCP client');
     });
 
-    test('turn.failed yields result.isError with codex_turn_failed subtype', async () => {
-      mockRunStreamed.mockResolvedValue({
+    // BDF Fix A (WO-HARNESS-BDF-RESILIENCE-FIXES-01): turn.failed now THROWS
+    // instead of yielding a result chunk. The sendQuery catch block receives
+    // the thrown error and routes through retry/failback logic.
+    // Use mockImplementation (not mockResolvedValue) so each retry attempt
+    // gets a FRESH generator -- otherwise the exhausted generator would yield
+    // codex_stream_incomplete on retries instead of re-triggering the throw.
+    test('turn.failed (BDF Fix A) throws; rate_limit exhausts retries without failback', async () => {
+      mockRunStreamed.mockImplementation(async () => ({
         events: (async function* () {
           yield { type: 'turn.failed', error: { message: 'Rate limit exceeded' } };
         })(),
-      });
+      }));
 
-      const chunks = [];
-      for await (const chunk of client.sendQuery('test', '/workspace')) {
-        chunks.push(chunk);
-      }
+      const consumeGenerator = async () => {
+        for await (const _ of client.sendQuery('test', '/workspace')) {
+          // consume
+        }
+      };
 
-      expect(chunks).toHaveLength(1);
-      expect(chunks[0]).toEqual({
-        type: 'result',
-        sessionId: 'new-thread-id',
-        isError: true,
-        errorSubtype: 'codex_turn_failed',
-        errors: ['Rate limit exceeded'],
-      });
+      // After retries exhaust, enriched error is thrown: "Codex rate_limit: ..."
+      await expect(consumeGenerator()).rejects.toThrow('Rate limit exceeded');
       expect(mockLogger.error).toHaveBeenCalledWith(
         { errorMessage: 'Rate limit exceeded' },
         'turn_failed'
       );
     });
 
-    test('turn.failed without error message yields fail-stop with Unknown error', async () => {
-      mockRunStreamed.mockResolvedValue({
+    test('turn.failed without error message (BDF Fix A) throws Unknown error', async () => {
+      mockRunStreamed.mockImplementation(async () => ({
         events: (async function* () {
           yield { type: 'turn.failed', error: null };
         })(),
-      });
+      }));
 
-      const chunks = [];
-      for await (const chunk of client.sendQuery('test', '/workspace')) {
-        chunks.push(chunk);
-      }
+      const consumeGenerator = async () => {
+        for await (const _ of client.sendQuery('test', '/workspace')) {
+          // consume
+        }
+      };
 
-      expect(chunks).toHaveLength(1);
-      expect(chunks[0]).toEqual({
-        type: 'result',
-        sessionId: 'new-thread-id',
-        isError: true,
-        errorSubtype: 'codex_turn_failed',
-        errors: ['Unknown error'],
-      });
+      await expect(consumeGenerator()).rejects.toThrow('Unknown error');
       expect(mockLogger.error).toHaveBeenCalledWith(
         { errorMessage: 'Unknown error' },
         'turn_failed'
       );
+    });
+
+    // S5: turn.failed usage-limit triggers failback provider (BDF Fix A core behavior).
+    test('S5 (BDF Fix A): turn.failed usage-limit triggers failback provider', async () => {
+      mockRunStreamed.mockImplementation(async () => ({
+        events: (async function* () {
+          yield { type: 'turn.failed', error: { message: "You've hit your usage limit" } };
+        })(),
+      }));
+
+      const failbackChunks: { type: string; content?: string }[] = [];
+      const failbackSendQuery = mock(async function* (
+        _p: string,
+        _c: string,
+        _r?: string,
+        _o?: unknown
+      ) {
+        yield { type: 'assistant', content: 'failback response' } as const;
+        yield { type: 'result', sessionId: 'fb-session' } as const;
+      });
+      const failbackProvider = {
+        sendQuery: failbackSendQuery,
+        getType: () => 'claude',
+        getCapabilities: () => ({}) as unknown as ReturnType<CodexProvider['getCapabilities']>,
+      };
+      const factory = mock(() => failbackProvider);
+      const clientWithFailback = new CodexProvider({
+        retryBaseDelayMs: 1,
+        failbackProviderFactory: factory as unknown as () => typeof failbackProvider,
+      });
+
+      for await (const chunk of clientWithFailback.sendQuery('review', '/workspace')) {
+        failbackChunks.push(chunk as { type: string; content?: string });
+      }
+
+      // Failback factory was invoked -- turn.failed now reaches the catch block
+      expect(factory).toHaveBeenCalled();
+      // Disclosure chunk present (the [CODEX FAILBACK] system message)
+      const disclosure = failbackChunks.find(
+        c => c.type === 'system' && c.content?.includes('CODEX FAILBACK')
+      );
+      expect(disclosure).toBeDefined();
+      // Failback provider content streamed through
+      expect(
+        failbackChunks.some(c => c.type === 'assistant' && c.content === 'failback response')
+      ).toBe(true);
+      expect(mockLogger.error).toHaveBeenCalledWith(
+        { errorMessage: "You've hit your usage limit" },
+        'turn_failed'
+      );
+    });
+
+    // S6: a successful turn.completed does NOT trigger the failback provider.
+    // Gate failures (build ran, tests failed) produce turn.completed -- the
+    // failover path is for AVAILABILITY errors only (turn.failed / thrown exceptions).
+    test('S6: turn.completed (gate failure content) does NOT invoke failback factory', async () => {
+      mockRunStreamed.mockResolvedValue({
+        events: (async function* () {
+          yield { type: 'turn.completed' };
+        })(),
+      });
+
+      const factory = mock(() => {
+        throw new Error('failback should not be called');
+      });
+      const clientWithFailback = new CodexProvider({
+        retryBaseDelayMs: 1,
+        failbackProviderFactory: factory as unknown as () => CodexProvider,
+      });
+
+      const chunks: unknown[] = [];
+      for await (const chunk of clientWithFailback.sendQuery('test', '/workspace')) {
+        chunks.push(chunk);
+      }
+
+      // Factory never invoked -- availability failover does not fire on turn.completed
+      expect(factory).not.toHaveBeenCalled();
+      // Stream completed without a thrown error
+      expect(chunks.some((c: unknown) => (c as { type?: string }).type === 'result')).toBe(true);
     });
 
     test('iterator that closes with zero events yields codex_stream_incomplete with default message', async () => {

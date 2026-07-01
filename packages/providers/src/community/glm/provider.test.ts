@@ -160,4 +160,76 @@ describe('GlmProvider', () => {
       'z-ai/glm-5.2-20260616'
     );
   });
+
+  // S5-GLM: availability error (5xx) triggers failback provider.
+  // WO-HARNESS-SMART-CAULDRON-LANE-ROSTER-AND-RESILIENCE-01
+  // Uses duck-typed error with `status` property (avoids OpenAI.APIError
+  // instanceof check which fails when openai is mocked).
+  test('S5-GLM: OpenRouter 5xx availability error triggers failback with disclosure', async () => {
+    process.env['GLM_API_KEY'] = 'sk-or-test';
+
+    // Duck-typed 502 error -- isAvailabilityError checks err.status, not instanceof
+    const serverError = Object.assign(new Error('502 Bad Gateway'), { status: 502 });
+    mockCreate.mockRejectedValueOnce(serverError);
+
+    const failbackChunks: { type: string; content?: string }[] = [];
+    const failbackSendQuery = mock(async function* (
+      _p: string,
+      _c: string,
+      _r?: string,
+      _o?: unknown
+    ) {
+      yield { type: 'assistant', content: 'claude fallback content' } as const;
+      yield { type: 'result', sessionId: 'fb' } as const;
+    });
+
+    const failbackFactory = mock(() => ({ sendQuery: failbackSendQuery }));
+    const provider = new GlmProvider({
+      failbackProviderFactory: failbackFactory as unknown as () => GlmProvider,
+    });
+
+    for await (const chunk of provider.sendQuery('hello', '/tmp')) {
+      failbackChunks.push(chunk as { type: string; content?: string });
+    }
+
+    // Factory was invoked on availability error
+    expect(failbackFactory).toHaveBeenCalled();
+    // Disclosure chunk present
+    const disclosure = failbackChunks.find(
+      c => c.type === 'system' && c.content?.includes('GLM FAILBACK')
+    );
+    expect(disclosure).toBeDefined();
+    // Failback content streamed through
+    expect(
+      failbackChunks.some(c => c.type === 'assistant' && c.content === 'claude fallback content')
+    ).toBe(true);
+  });
+
+  // S6-GLM: non-availability error (401 auth) does NOT trigger failback.
+  test('S6-GLM: 401 auth error re-throws without invoking failback', async () => {
+    process.env['GLM_API_KEY'] = 'sk-or-bad';
+
+    // Duck-typed 401 error -- isAvailabilityError returns false for 4xx
+    const authError = Object.assign(new Error('401 Unauthorized: invalid API key'), {
+      status: 401,
+    });
+    mockCreate.mockRejectedValueOnce(authError);
+
+    const failbackFactory = mock(() => {
+      throw new Error('failback must not be called on auth error');
+    });
+    const provider = new GlmProvider({
+      failbackProviderFactory: failbackFactory as unknown as () => GlmProvider,
+    });
+
+    const consumeGenerator = async () => {
+      for await (const _ of provider.sendQuery('hello', '/tmp')) {
+        // consume
+      }
+    };
+
+    // Auth error should re-throw, NOT invoke failback
+    await expect(consumeGenerator()).rejects.toThrow('401 Unauthorized');
+    expect(failbackFactory).not.toHaveBeenCalled();
+  });
 });
