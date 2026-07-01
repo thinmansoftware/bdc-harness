@@ -1,4 +1,5 @@
 import { describe, test, expect, mock, beforeEach } from 'bun:test';
+import { join } from 'path';
 import { OpenAPIHono } from '@hono/zod-openapi';
 import type { ConversationLockManager } from '@archon/core';
 import type { WebAdapter } from '../adapters/web';
@@ -770,7 +771,7 @@ describe('POST /api/workflows/runs/:runId/approve', () => {
     expect(mockResolveWebLane).toHaveBeenCalledWith({
       workflowName: 'build-portal-login-phone-pin',
       task_class: undefined,
-      routerYamlPath: '/tmp/worktrees/portal-login/config/router.yaml',
+      routerYamlPath: join('/tmp/worktrees/portal-login', 'config', 'router.yaml'),
     });
     expect(mockWebAdapter.setConversationDbId).toHaveBeenCalledWith(
       'web-worker-xyz',
@@ -843,7 +844,7 @@ describe('POST /api/workflows/runs/:runId/approve', () => {
     expect(mockResolveWebLane).toHaveBeenCalledWith({
       workflowName: undefined,
       task_class: 'single-builder-pr',
-      routerYamlPath: '/tmp/worktrees/portal-login/config/router.yaml',
+      routerYamlPath: join('/tmp/worktrees/portal-login', 'config', 'router.yaml'),
     });
     expect(mockExecuteWorkflow).toHaveBeenCalledWith(
       expect.anything(),
