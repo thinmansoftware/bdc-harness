@@ -1244,6 +1244,11 @@ nodes:
   # emit sentinels. Only an AI pass normalizes all of them into the per-row JSON ledger.
   - id: findings-consolidate
     persona: xo
+    # Persona xo declares an Anthropic model alias; without an explicit provider pin
+    # this node inherits the lane default (glm/OpenRouter) and the alias ships as
+    # z-ai/sonnet -> 400. Mirror of PR #313's codex-lane fix. Anchor: run 7371997d.
+    provider: claude
+    model: sonnet
     depends_on: [block-reclassify]
     trigger_rule: all_done
     task_class: clerical
@@ -1414,6 +1419,10 @@ nodes:
 
   - id: decide-push-target
     persona: major-build
+    # Provider pin: persona major-build declares opus[1m]; lane default (glm)
+    # would ship it as z-ai/opus[1m] -> 400. Mirror of PR #313. Anchor: 7371997d.
+    provider: claude
+    model: opus[1m]
     depends_on: [pause-gate, classify-apply-review]
     trigger_rule: all_done
     when: "$pause-gate.output.decision_verb != 'approve_with_fix' || $classify-apply-review.output.verdict == 'satisfied'"
@@ -1851,6 +1860,9 @@ nodes:
 
   - id: build-manifest
     persona: major-build
+    # Provider pin -- see decide-push-target. Mirror of PR #313. Anchor: 7371997d.
+    provider: claude
+    model: opus[1m]
     depends_on: [open-pr-if-needed, block-reclassify, pause-gate]
     trigger_rule: all_done
     task_class: clerical
