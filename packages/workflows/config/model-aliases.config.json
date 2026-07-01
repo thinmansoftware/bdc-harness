@@ -1,0 +1,8 @@
+{
+  "_comment": "Alias family map for declared-vs-served model integrity checks (WO-HARNESS-TELEMETRY-DECLARED-MODEL-AND-COST-01). Each key is a short alias a workflow YAML may use in model: (e.g. 'sonnet'); the array lists the exact served model IDs the SDK may resolve that alias to. A served model matching ANY entry in its declared alias's family is NOT a mismatch. Any declared value that is not a key here is compared as an exact-id passthrough (declared === served or it is a mismatch). Edit this file to add/update alias families -- never hardcode model ID lists in model-alias.ts or dag-executor.ts.",
+  "families": {
+    "sonnet": ["claude-sonnet-5", "claude-sonnet-4-5", "claude-sonnet-4"],
+    "haiku": ["claude-haiku-4-5", "claude-haiku-4"],
+    "opus": ["claude-opus-4-7", "claude-opus-4-6", "claude-opus-4"]
+  }
+}
