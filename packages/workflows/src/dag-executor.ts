@@ -86,6 +86,7 @@ import { loadAgentRegistry, resolveAgent } from './agents/registry';
 import type { AgentRegistry } from './agents/registry';
 import { loadContext } from '@archon/persona-context-loader';
 import { deriveEntryRung, computeFrontierCost } from './model-rates';
+import { isDeclaredServedMatch } from './model-alias';
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
 let cachedLog: ReturnType<typeof createLogger> | undefined;
@@ -191,6 +192,17 @@ type NodeExecutionResult = NodeOutput & {
   costUsd?: number;
   tokens?: TokenUsage;
   frontierCostUsd?: number;
+  /**
+   * Declared/requested/served model + mismatch pass-through for the per-run
+   * rollup (WO-HARNESS-TELEMETRY-DECLARED-MODEL-AND-COST-01). See
+   * resolveNodeProviderAndModel's declaredModelId doc for the declared/requested
+   * distinction. modelMismatch is the alias-aware comparison result (only set
+   * when both declaredModelId and a non-null servedModelId are known).
+   */
+  declaredModelId?: string;
+  requestedModelId?: string;
+  servedModelId?: string | null;
+  modelMismatch?: boolean;
 };
 
 /** Throttle state for cancel checks (reads -- no write contention in WAL mode) */
@@ -475,6 +487,16 @@ async function resolveNodeProviderAndModel(
   provider: string;
   model: string | undefined;
   options: SendQueryOptions | undefined;
+  /**
+   * Declared model per WO-HARNESS-TELEMETRY-DECLARED-MODEL-AND-COST-01: the
+   * pre-persona effective model (node.model ?? workflow/assistant default),
+   * captured BEFORE any `agent:`/`persona:` override at line ~577 below. This
+   * is the value that reflects the raw parsed YAML pin (the #298 parse-layer
+   * bug class this WO's integrity check targets) and is distinct from the
+   * post-persona `model` returned above (the actual "requested" value sent to
+   * the SDK, unchanged from prior behavior).
+   */
+  declaredModelId: string | undefined;
 }> {
   // Provider is explicit: node.provider ?? workflow.provider. Model never
   // influences provider selection. Model strings pass through to the SDK.
@@ -641,7 +663,7 @@ async function resolveNodeProviderAndModel(
     assistantConfig,
   };
 
-  return { provider, model: effectiveModel, options };
+  return { provider, model: effectiveModel, options, declaredModelId: model };
 }
 
 /** Evaluate trigger rule for a node given its upstream states */
@@ -742,6 +764,7 @@ async function executeNodeInternal(
   node: CommandNode | PromptNode,
   provider: string,
   nodeOptions: SendQueryOptions | undefined,
+  declaredModelId: string | undefined,
   artifactsDir: string,
   logDir: string,
   baseBranch: string,
@@ -1370,19 +1393,27 @@ async function executeNodeInternal(
           ...(nodeNumTurns !== undefined ? { num_turns: nodeNumTurns } : {}),
           ...(nodeModelUsage ? { model_usage: nodeModelUsage } : {}),
           ...(nodeTokens ? { tokens: nodeTokens } : {}),
-          // Layer 1 served-model capture (WO-HARNESS-LAYER1-SERVED-MODEL-CAPTURE-01).
-          // requested = nodeOptions?.model (effective per-node model). served =
-          // provider-reported. served_model_mismatch is only written when
-          // served is a non-null string -- a null served has no meaningful
-          // mismatch signal, so omit the flag entirely in that case to avoid
-          // false negatives in downstream readers.
+          // Layer 1 served-model capture (WO-HARNESS-LAYER1-SERVED-MODEL-CAPTURE-01),
+          // extended by WO-HARNESS-TELEMETRY-DECLARED-MODEL-AND-COST-01:
+          // declared = the pre-persona effective model (node.model ?? workflow/
+          // assistant default -- reflects the raw parsed YAML pin). requested =
+          // nodeOptions?.model (post-persona effective per-node model, unchanged
+          // from prior behavior). served = provider-reported. served_model_mismatch
+          // is now computed via alias-aware comparison against declared_model_id
+          // (not requested_model_id) so alias resolution (declared 'sonnet' served
+          // 'claude-sonnet-5') is NOT flagged, while a genuine silent substitution
+          // still is. Only written when served is a non-null string AND declared is
+          // known -- a null served or missing declared has no meaningful mismatch
+          // signal, so omit the flag entirely in that case to avoid false negatives
+          // in downstream readers.
+          ...(declaredModelId !== undefined ? { declared_model_id: declaredModelId } : {}),
           ...(nodeOptions?.model !== undefined ? { requested_model_id: nodeOptions.model } : {}),
           ...(nodeServedModelId !== undefined ? { served_model_id: nodeServedModelId } : {}),
           ...(nodeServedMissingReason !== undefined
             ? { served_model_missing_reason: nodeServedMissingReason }
             : {}),
-          ...(typeof nodeServedModelId === 'string' && nodeOptions?.model !== undefined
-            ? { served_model_mismatch: nodeServedModelId !== nodeOptions.model }
+          ...(typeof nodeServedModelId === 'string' && declaredModelId !== undefined
+            ? { served_model_mismatch: !isDeclaredServedMatch(declaredModelId, nodeServedModelId) }
             : {}),
           // Layer 1 tier + counterfactual cost (WO-HARNESS-LAYER1-TIER-AND-COUNTERFACTUAL-COST-01).
           // entry_rung is derived from provider + effective per-node model. Phase 4 (router
@@ -1427,6 +1458,12 @@ async function executeNodeInternal(
       costUsd: nodeCostUsd,
       ...(nodeTokens ? { tokens: nodeTokens } : {}),
       ...(nodeTokens ? { frontierCostUsd: computeFrontierCost(nodeTokens) } : {}),
+      ...(declaredModelId !== undefined ? { declaredModelId } : {}),
+      ...(nodeOptions?.model !== undefined ? { requestedModelId: nodeOptions.model } : {}),
+      ...(nodeServedModelId !== undefined ? { servedModelId: nodeServedModelId } : {}),
+      ...(typeof nodeServedModelId === 'string' && declaredModelId !== undefined
+        ? { modelMismatch: !isDeclaredServedMatch(declaredModelId, nodeServedModelId) }
+        : {}),
     };
   } catch (error) {
     const err = error as Error;
@@ -1507,6 +1544,16 @@ async function executeNodeInternal(
       costUsd: nodeCostUsd,
       ...(nodeTokens ? { tokens: nodeTokens } : {}),
       ...(nodeTokens ? { frontierCostUsd: computeFrontierCost(nodeTokens) } : {}),
+      // Mirrors the completed-path fields (same variables, same omit-when-absent
+      // convention) so the rollup accumulator's node_model_summary stays
+      // consistent with its cost/token accumulation, which already includes
+      // failed nodes that reported partial usage before the SDK threw.
+      ...(declaredModelId !== undefined ? { declaredModelId } : {}),
+      ...(nodeOptions?.model !== undefined ? { requestedModelId: nodeOptions.model } : {}),
+      ...(nodeServedModelId !== undefined ? { servedModelId: nodeServedModelId } : {}),
+      ...(typeof nodeServedModelId === 'string' && declaredModelId !== undefined
+        ? { modelMismatch: !isDeclaredServedMatch(declaredModelId, nodeServedModelId) }
+        : {}),
     };
   }
 }
@@ -2220,6 +2267,13 @@ async function executeLoopNode(
   let loopTotalTokens: TokenUsage | undefined;
   let loopFinalStopReason: string | undefined;
   let loopTotalNumTurns: number | undefined;
+  // Layer 1 served-model capture, extended to loop nodes
+  // (WO-HARNESS-TELEMETRY-DECLARED-MODEL-AND-COST-01). Loop nodes previously
+  // never captured servedModelId at all. Tracks the LAST iteration's reported
+  // value (mirrors currentSessionId's "last seen wins" semantics) since a loop
+  // node's node_completed event represents its final iteration.
+  let loopServedModelId: string | null | undefined;
+  let loopServedMissingReason: string | undefined;
   const resolvedOptions = buildLoopNodeOptions(
     node,
     workflowProvider,
@@ -2410,6 +2464,10 @@ async function executeLoopNode(
           if (msg.stopReason !== undefined) loopFinalStopReason = msg.stopReason;
           if (msg.numTurns !== undefined) {
             loopTotalNumTurns = (loopTotalNumTurns ?? 0) + msg.numTurns;
+          }
+          if (msg.servedModelId !== undefined) loopServedModelId = msg.servedModelId;
+          if (msg.servedModelMissingReason !== undefined) {
+            loopServedMissingReason = msg.servedModelMissingReason;
           }
           // Fail the iteration loudly on SDK error results. Previously we broke
           // silently, producing empty output and continuing to the next iteration --
@@ -2713,6 +2771,28 @@ async function executeLoopNode(
             // (caller computes loopProvider = node.provider ?? workflowProvider).
             entry_rung: deriveEntryRung(workflowProvider, workflowModel),
             ...(loopTotalTokens ? { frontier_cost_usd: computeFrontierCost(loopTotalTokens) } : {}),
+            // Declared/requested/served model capture, extended to loop nodes
+            // (WO-HARNESS-TELEMETRY-DECLARED-MODEL-AND-COST-01). declared =
+            // `workflowModel` param (pre-persona, per-node-resolved value the
+            // caller computed as loopModel -- see comment above). requested =
+            // resolvedOptions.model (post-persona -- overridden above at
+            // ~line 2307 when the loop node declares agent:/persona:). served =
+            // provider-reported, captured per-iteration; loop nodes never
+            // surfaced this before this WO. Same alias-aware compare + omit-
+            // when-absent contract as AI nodes.
+            ...(workflowModel !== undefined ? { declared_model_id: workflowModel } : {}),
+            ...(resolvedOptions.model !== undefined
+              ? { requested_model_id: resolvedOptions.model }
+              : {}),
+            ...(loopServedModelId !== undefined ? { served_model_id: loopServedModelId } : {}),
+            ...(loopServedMissingReason !== undefined
+              ? { served_model_missing_reason: loopServedMissingReason }
+              : {}),
+            ...(typeof loopServedModelId === 'string' && workflowModel !== undefined
+              ? {
+                  served_model_mismatch: !isDeclaredServedMatch(workflowModel, loopServedModelId),
+                }
+              : {}),
           },
         })
         .catch((err: Error) => {
@@ -2738,6 +2818,12 @@ async function executeLoopNode(
         costUsd: loopTotalCostUsd,
         ...(loopTotalTokens ? { tokens: loopTotalTokens } : {}),
         ...(loopTotalTokens ? { frontierCostUsd: computeFrontierCost(loopTotalTokens) } : {}),
+        ...(workflowModel !== undefined ? { declaredModelId: workflowModel } : {}),
+        ...(resolvedOptions.model !== undefined ? { requestedModelId: resolvedOptions.model } : {}),
+        ...(loopServedModelId !== undefined ? { servedModelId: loopServedModelId } : {}),
+        ...(typeof loopServedModelId === 'string' && workflowModel !== undefined
+          ? { modelMismatch: !isDeclaredServedMatch(workflowModel, loopServedModelId) }
+          : {}),
       };
     }
 
@@ -2921,7 +3007,11 @@ async function executeApprovalNode(
       ...(node.idle_timeout ? { idle_timeout: node.idle_timeout } : {}),
     };
 
-    const { provider, options: nodeOptions } = await resolveNodeProviderAndModel(
+    const {
+      provider,
+      options: nodeOptions,
+      declaredModelId,
+    } = await resolveNodeProviderAndModel(
       syntheticNode,
       workflowProvider,
       workflowModel,
@@ -2942,6 +3032,7 @@ async function executeApprovalNode(
       syntheticNode,
       provider,
       nodeOptions,
+      declaredModelId,
       artifactsDir,
       logDir,
       baseBranch,
@@ -3132,6 +3223,19 @@ export async function executeDagWorkflow(
   // Sum of frontier_cost_usd across nodes; written to run metadata as total_frontier_cost_usd
   // so the UI can compute savings = total_frontier_cost_usd - total_cost_usd.
   let totalFrontierCostUsd = 0;
+  // Per-run declared/requested/served model rollup (WO-HARNESS-TELEMETRY-DECLARED-
+  // MODEL-AND-COST-01). Only nodes that reported at least one of the three model
+  // fields are included (bash/script/approval/cancel nodes never do). This is the
+  // deck's data contract for surfaces 2+3 -- field names are provisional pending
+  // the deck-UI WO.
+  const nodeModelSummary: {
+    node_id: string;
+    declared_model_id?: string;
+    requested_model_id?: string;
+    served_model_id?: string | null;
+    mismatch?: boolean;
+  }[] = [];
+  let modelMismatchCount = 0;
 
   for (let layerIdx = 0; layerIdx < layers.length; layerIdx++) {
     const layer = layers[layerIdx];
@@ -3437,7 +3541,11 @@ export async function executeDagWorkflow(
           }
 
           // 4. Resolve per-node provider/model/options
-          const { provider, options: nodeOptions } = await resolveNodeProviderAndModel(
+          const {
+            provider,
+            options: nodeOptions,
+            declaredModelId,
+          } = await resolveNodeProviderAndModel(
             node,
             workflowProvider,
             workflowModel,
@@ -3473,6 +3581,7 @@ export async function executeDagWorkflow(
               node,
               provider,
               nodeOptions,
+              declaredModelId,
               artifactsDir,
               logDir,
               baseBranch,
@@ -3581,6 +3690,26 @@ export async function executeDagWorkflow(
           totalTokens += output.tokens.total ?? output.tokens.input + output.tokens.output;
         }
         if (output.frontierCostUsd !== undefined) totalFrontierCostUsd += output.frontierCostUsd;
+        if (
+          output.declaredModelId !== undefined ||
+          output.requestedModelId !== undefined ||
+          output.servedModelId !== undefined
+        ) {
+          nodeModelSummary.push({
+            node_id: nodeId,
+            ...(output.declaredModelId !== undefined
+              ? { declared_model_id: output.declaredModelId }
+              : {}),
+            ...(output.requestedModelId !== undefined
+              ? { requested_model_id: output.requestedModelId }
+              : {}),
+            ...(output.servedModelId !== undefined
+              ? { served_model_id: output.servedModelId }
+              : {}),
+            ...(output.modelMismatch !== undefined ? { mismatch: output.modelMismatch } : {}),
+          });
+          if (output.modelMismatch === true) modelMismatchCount++;
+        }
         nodeOutputs.set(nodeId, output);
         if (output.state === 'completed' && !isParallelLayer && output.sessionId !== undefined) {
           lastSequentialSessionId = output.sessionId;
@@ -3750,6 +3879,12 @@ export async function executeDagWorkflow(
       // Only write when at least one node reported tokens; UI computes savings as
       // total_frontier_cost_usd - total_cost_usd.
       ...(totalFrontierCostUsd > 0 ? { total_frontier_cost_usd: totalFrontierCostUsd } : {}),
+      // Per-run declared/requested/served model rollup
+      // (WO-HARNESS-TELEMETRY-DECLARED-MODEL-AND-COST-01). Only written when at
+      // least one node reported model telemetry -- deck surfaces 2+3's data
+      // contract; field names are provisional pending the deck-UI WO.
+      ...(nodeModelSummary.length > 0 ? { node_model_summary: nodeModelSummary } : {}),
+      ...(modelMismatchCount > 0 ? { model_mismatch_count: modelMismatchCount } : {}),
     });
   } catch (dbErr) {
     getLog().error(

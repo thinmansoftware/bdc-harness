@@ -8460,8 +8460,14 @@ describe('executeDagWorkflow -- served-model capture on node_completed.data', ()
     );
 
     const data = getNodeCompletedData(store);
+    // WO-HARNESS-TELEMETRY-DECLARED-MODEL-AND-COST-01: declared_model_id is now
+    // captured (pre-persona effective model) alongside requested_model_id. With
+    // no agent:/persona: set on this node, declared === requested.
+    expect(data.declared_model_id).toBe('my-requested-model');
     expect(data.requested_model_id).toBe('my-requested-model');
     expect(data.served_model_id).toBe('other-model-actually-served');
+    // 'other-model-actually-served' is not in any alias family for
+    // 'my-requested-model' -- genuine mismatch (not an alias false positive).
     expect(data.served_model_mismatch).toBe(true);
     // missing_reason must be absent on the happy path -- only present when
     // the provider could not tell us.
@@ -8511,9 +8517,95 @@ describe('executeDagWorkflow -- served-model capture on node_completed.data', ()
     );
 
     const data = getNodeCompletedData(store);
+    expect(data.declared_model_id).toBe('my-requested-model');
     expect(data.requested_model_id).toBe('my-requested-model');
     expect(data.served_model_id).toBe('my-requested-model');
     expect(data.served_model_mismatch).toBe(false);
+  });
+
+  it('T6: alias resolution (declared "sonnet", served "claude-sonnet-5") -> NOT a mismatch', async () => {
+    // This is the anchor false positive from WO section 3: served_model_mismatch
+    // was previously computed via strict equality against requested_model_id,
+    // flagging every aliased call. It must now use the alias-aware compare
+    // against declared_model_id.
+    mockSendQueryDag.mockImplementation(function* () {
+      yield { type: 'assistant', content: 'x' };
+      yield {
+        type: 'result',
+        sessionId: 'alias-session',
+        servedModelId: 'claude-sonnet-5',
+      };
+    });
+
+    const store = createMockStore();
+    const mockDeps = createMockDeps(store);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('alias-ok-run');
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-alias-ok',
+      testDir,
+      {
+        name: 'alias-ok-test',
+        nodes: [{ id: 'work', prompt: 'do work', model: 'sonnet' }],
+      },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    const data = getNodeCompletedData(store);
+    expect(data.declared_model_id).toBe('sonnet');
+    expect(data.requested_model_id).toBe('sonnet');
+    expect(data.served_model_id).toBe('claude-sonnet-5');
+    expect(data.served_model_mismatch).toBe(false);
+  });
+
+  it('T7: silent substitution (declared "glm-5.2", served "claude-sonnet-5") -> mismatch=true', async () => {
+    mockSendQueryDag.mockImplementation(function* () {
+      yield { type: 'assistant', content: 'x' };
+      yield {
+        type: 'result',
+        sessionId: 'substitution-session',
+        servedModelId: 'claude-sonnet-5',
+      };
+    });
+
+    const store = createMockStore();
+    const mockDeps = createMockDeps(store);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('silent-substitution-run');
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-substitution',
+      testDir,
+      {
+        name: 'silent-substitution-test',
+        nodes: [{ id: 'work', prompt: 'do work', model: 'glm-5.2' }],
+      },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    const data = getNodeCompletedData(store);
+    expect(data.declared_model_id).toBe('glm-5.2');
+    expect(data.served_model_id).toBe('claude-sonnet-5');
+    expect(data.served_model_mismatch).toBe(true);
   });
 
   it('T5: provider yields servedModelId=null with reason -> no crash, mismatch omitted', async () => {
@@ -8781,6 +8873,185 @@ describe('executeDagWorkflow -- tier/entry_rung + frontier_cost_usd', () => {
     expect(tokens.input).toBe(100);
     expect(tokens.output).toBe(50);
     expect(tokens.total).toBe(150);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Declared-model capture (loop nodes) + per-run model rollup
+// WO-HARNESS-TELEMETRY-DECLARED-MODEL-AND-COST-01, Section 11 Test Scenarios
+// 3 (loop-node declared reflects the parsed YAML pin) and 4 (rollup exists on
+// terminal).
+// ---------------------------------------------------------------------------
+describe('executeDagWorkflow -- declared model rollup', () => {
+  let testDir: string;
+
+  beforeEach(async () => {
+    testDir = join(tmpdir(), `dag-declared-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    await mkdir(testDir, { recursive: true });
+    mockSendQueryDag.mockClear();
+    mockGetAgentProviderDag.mockClear();
+  });
+
+  afterEach(async () => {
+    mockGetAgentProviderDag.mockImplementation(() => ({
+      sendQuery: mockSendQueryDag,
+      getType: () => 'claude',
+      getCapabilities: mockClaudeCapabilities,
+    }));
+    try {
+      await rm(testDir, { recursive: true, force: true });
+    } catch {
+      /* ignore cleanup errors */
+    }
+  });
+
+  function getNodeCompletedData(store: IWorkflowStore): Record<string, unknown> {
+    const calls = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls as Array<
+      [{ event_type: string; data?: Record<string, unknown> }]
+    >;
+    const completedCalls = calls.filter(([arg]) => arg.event_type === 'node_completed');
+    expect(completedCalls.length).toBe(1);
+    const data = completedCalls[0][0].data;
+    expect(data).toBeDefined();
+    return data as Record<string, unknown>;
+  }
+
+  it('Scenario 3: loop node with a model pinned reflects the pin as declared_model_id (not a root default)', async () => {
+    // Workflow root has NO model set; the loop node itself pins 'claude-opus-4-7'.
+    // declared_model_id must reflect the loop node's own pin, not fall back to
+    // an undefined workflow-root default.
+    mockSendQueryDag.mockImplementation(function* () {
+      yield { type: 'assistant', content: 'Done. <promise>COMPLETE</promise>' };
+      yield {
+        type: 'result',
+        sessionId: 'loop-declared-session',
+        servedModelId: 'claude-opus-4-7',
+      };
+    });
+
+    const store = createMockStore();
+    const mockDeps = createMockDeps(store);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('loop-declared-run');
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-loop-declared',
+      testDir,
+      {
+        name: 'loop-declared-test',
+        nodes: [
+          {
+            id: 'my-loop',
+            model: 'claude-opus-4-7',
+            loop: {
+              prompt: 'Do a task. When done, output <promise>COMPLETE</promise>.',
+              until: 'COMPLETE',
+              max_iterations: 3,
+            },
+          },
+        ],
+      },
+      workflowRun,
+      'claude',
+      undefined, // no workflow-root model -- proves the pin isn't a fallback coincidence
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    const data = getNodeCompletedData(store);
+    expect(data.declared_model_id).toBe('claude-opus-4-7');
+    expect(data.requested_model_id).toBe('claude-opus-4-7');
+    expect(data.served_model_id).toBe('claude-opus-4-7');
+    expect(data.served_model_mismatch).toBe(false);
+  });
+
+  it('Scenario 4: run metadata carries node_model_summary + model_mismatch_count on terminal', async () => {
+    mockSendQueryDag.mockImplementation(function* () {
+      yield { type: 'assistant', content: 'done' };
+      yield {
+        type: 'result',
+        sessionId: 'rollup-session',
+        servedModelId: 'claude-sonnet-5', // does not alias-match glm-5.2 -> real mismatch
+        tokens: { input: 10, output: 5, total: 15 },
+      };
+    });
+
+    const store = createMockStore();
+    const mockDeps = createMockDeps(store);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('rollup-run');
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-rollup',
+      testDir,
+      { name: 'rollup-test', nodes: [{ id: 'n', prompt: 'p', model: 'glm-5.2' }] },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    const completeCalls = (store.completeWorkflowRun as ReturnType<typeof mock>).mock
+      .calls as Array<[string, Record<string, unknown>?]>;
+    expect(completeCalls.length).toBeGreaterThan(0);
+    const meta = completeCalls[completeCalls.length - 1][1] ?? {};
+
+    expect(meta.model_mismatch_count).toBe(1);
+    expect(Array.isArray(meta.node_model_summary)).toBe(true);
+    const summary = meta.node_model_summary as Array<Record<string, unknown>>;
+    expect(summary.length).toBe(1);
+    expect(summary[0].node_id).toBe('n');
+    expect(summary[0].declared_model_id).toBe('glm-5.2');
+    expect(summary[0].requested_model_id).toBe('glm-5.2');
+    expect(summary[0].served_model_id).toBe('claude-sonnet-5');
+    expect(summary[0].mismatch).toBe(true);
+  });
+
+  it('rollup omits node_model_summary/model_mismatch_count when no node reports model telemetry', async () => {
+    mockSendQueryDag.mockImplementation(function* () {
+      yield { type: 'assistant', content: 'done' };
+      yield { type: 'result', sessionId: 'no-model-session' };
+    });
+
+    const store = createMockStore();
+    const mockDeps = createMockDeps(store);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('no-model-run');
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-no-model',
+      testDir,
+      // No model: field anywhere (node or workflow root) -- declared_model_id
+      // is never set, so this node must not appear in node_model_summary.
+      { name: 'no-model-test', nodes: [{ id: 'n', prompt: 'p' }] },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    const completeCalls = (store.completeWorkflowRun as ReturnType<typeof mock>).mock
+      .calls as Array<[string, Record<string, unknown>?]>;
+    const meta = completeCalls[completeCalls.length - 1][1] ?? {};
+    expect(meta).not.toHaveProperty('node_model_summary');
+    expect(meta).not.toHaveProperty('model_mismatch_count');
   });
 });
 
