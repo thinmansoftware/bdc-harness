@@ -271,7 +271,10 @@ export type ScriptNode = z.infer<typeof scriptNodeSchema> & {
 
 /**
  * Loop node schema -- extends base with `loop` config.
- * AI-specific fields from the base are present in the type but ignored at runtime with a warning.
+ * AI-specific fields (provider, model, agent, persona, etc.) are supported on loop nodes
+ * and flow through to the executor for per-node provider and persona resolution.
+ * Fields that the loop executor does not consume (context, output_format, etc.) pass
+ * through the transform unchanged; the loader emits a warning for those fields.
  * retry is not supported on loop nodes (enforced at parse time).
  */
 export const loopNodeSchema = dagNodeBaseSchema.extend({
@@ -590,7 +593,8 @@ export const dagNodeSchema = dagNodeBaseSchema
       ...(data.retry !== undefined ? { retry: data.retry } : {}),
     };
 
-    // AI-only fields (not applicable to bash/loop nodes)
+    // AI-only fields (not applicable to bash, script, approval, or cancel nodes;
+    // loop nodes use provider, model, agent, and persona from this object)
     const aiOnly = {
       ...(data.model !== undefined ? { model: data.model } : {}),
       ...(data.provider !== undefined ? { provider: data.provider } : {}),
@@ -647,12 +651,10 @@ export const dagNodeSchema = dagNodeBaseSchema
     }
     // loop -- guaranteed by superRefine to be defined at this point
     if (!data.loop) throw new Error('unreachable: loop must be defined after superRefine');
-    return {
-      ...base,
-      ...(data.agent !== undefined ? { agent: data.agent } : {}),
-      ...(data.persona !== undefined ? { persona: data.persona } : {}),
-      loop: data.loop,
-    } as LoopNode;
+    // Spread ...shared and ...aiOnly exactly like command/prompt branches do.
+    // agent and persona are already included in aiOnly (see lines above); the old
+    // explicit spreads are removed to avoid duplicate keys.
+    return { ...base, ...shared, ...aiOnly, loop: data.loop } as LoopNode;
   })
   .openapi('DagNode');
 
