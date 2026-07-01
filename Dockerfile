@@ -21,6 +21,8 @@ COPY packages/core/package.json ./packages/core/
 # (see .github/workflows/deploy-docs.yml). package.json is included only
 # so Bun's workspace lockfile resolves correctly.
 COPY packages/docs-web/package.json ./packages/docs-web/
+# fusion source is not yet wired into runtime; package.json only, mirrors docs-web pattern
+COPY packages/fusion/package.json ./packages/fusion/
 COPY packages/git/package.json ./packages/git/
 COPY packages/isolation/package.json ./packages/isolation/
 COPY packages/overseer/package.json ./packages/overseer/
@@ -142,6 +144,8 @@ COPY packages/core/package.json ./packages/core/
 # (see .github/workflows/deploy-docs.yml). package.json is included only
 # so Bun's workspace lockfile resolves correctly.
 COPY packages/docs-web/package.json ./packages/docs-web/
+# fusion source is not yet wired into runtime; package.json only, mirrors docs-web pattern
+COPY packages/fusion/package.json ./packages/fusion/
 COPY packages/git/package.json ./packages/git/
 COPY packages/isolation/package.json ./packages/isolation/
 COPY packages/overseer/package.json ./packages/overseer/
