@@ -1,8 +1,9 @@
 name: bdc-feature-development-glm
 description: |
-  GLM-implement variant of bdc-feature-development. Identical DAG; implement +
-  diff-repair + opus-repair use GLM glm-5.2 instead of Claude or Codex. Fire when
-  routing build nodes to Z.ai is preferred. All review nodes stay on Codex.
+  GLM-implement variant of bdc-feature-development. Identical DAG; implement uses
+  GLM glm-5.2. diff-repair + opus-repair use claude/sonnet (GLM could not converge
+  the review-repair loops -- 2026-07-01, run 818d4b62). Fire when routing the build
+  node to Z.ai is preferred. All review nodes stay on Codex.
 
 policyFile: harness/policies/agent-behavior.md
 # GLM build lane: glm-5.2 is the build default. war-council-validator is pinned to
@@ -781,8 +782,8 @@ nodes:
       printf '{"verdict":"%s"}\n' "$verdict"
 
   - id: diff-repair
-    provider: glm
-    model: glm-5.2
+    provider: claude
+    model: sonnet
     depends_on: [diff-review, classify-diff-review]
     when: "$classify-diff-review.output.verdict == 'needs_revision'"
     task_class: medium_work
@@ -1004,8 +1005,8 @@ nodes:
   # bothering a human (autonomy ladder step 2). Read-only-ish: it may edit in-scope files to
   # resolve the block, then signals. If it can't fix, the run proceeds to the human pause.
   - id: opus-repair
-    provider: glm
-    model: glm-5.2
+    provider: claude
+    model: sonnet
     depends_on: [block-classify]
     when: "$block-classify.output.status == 'BLOCKED'"
     prompt: |
