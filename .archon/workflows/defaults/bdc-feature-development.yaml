@@ -84,6 +84,45 @@ nodes:
       printf 'WO_ID=%s\nSPEC_PATH=bdc-xo:%s\nRUN_START_SHA=%s\n\n' "$WO_ID" "$SPEC_PATH" "$RUN_START_SHA"
       printf '%s\n' "$SPEC_CONTENT"
 
+  - id: claim-issue
+    depends_on: [read-spec]
+    trigger_rule: all_done
+    task_class: clerical
+    bash: |
+      set -euo pipefail
+
+      capture_node_output() {
+        python3 -c 'import shlex, sys; s=sys.stdin.read(); sys.stdout.write((lambda p: p[0] if len(p)==1 else s)(shlex.split(s)) if len(s)>=2 and s[0]=="'"'"'" and s.rstrip("\n").endswith("'"'"'") else s)'
+      }
+
+      READ_SPEC_OUT=$(capture_node_output <<'BDC_NODE_OUTPUT_READ_SPEC'
+      $read-spec.output
+      BDC_NODE_OUTPUT_READ_SPEC
+      )
+      ISSUE_REPO="${ISSUE_REPO:-bluedevilcollectibles/bdc-xo}"
+      ISSUE_NUM=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'issue=[0-9]+' | head -1 | cut -d= -f2 || true)
+      if [ -z "$ISSUE_NUM" ]; then
+        ISSUE_NUM=$(printf '%s\n' "$READ_SPEC_OUT" | sed -n 's/^SPEC_PATH=.*issues\/\([0-9][0-9]*\).*/\1/p' | head -1)
+      fi
+      if [ -z "$ISSUE_NUM" ]; then
+        WO_ID_FROM_SPEC=$(printf '%s\n' "$READ_SPEC_OUT" | sed -n 's/^WO_ID=//p' | head -1)
+        if [ -n "$WO_ID_FROM_SPEC" ]; then
+          ISSUE_NUM=$(gh issue list --repo "$ISSUE_REPO" --search "$WO_ID_FROM_SPEC in:title" --json number --jq '.[0].number // empty' 2>/dev/null || true)
+        fi
+      fi
+      if [ -z "$ISSUE_NUM" ]; then
+        echo "claim-issue: no GitHub issue resolved; skipping status:building label."
+        exit 0
+      fi
+
+      gh label create status:building --repo "$ISSUE_REPO" --color FBCA04 --description "BDC workflow is actively building" 2>/dev/null || true
+      gh label create status:review --repo "$ISSUE_REPO" --color 0E8A16 --description "BDC workflow is ready for review" 2>/dev/null || true
+      gh label create status:blocked --repo "$ISSUE_REPO" --color B60205 --description "BDC workflow is blocked before commit" 2>/dev/null || true
+      gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --remove-label status:review 2>/dev/null || true
+      gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --remove-label status:blocked 2>/dev/null || true
+      gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --add-label status:building
+      echo "claim-issue: $ISSUE_REPO#$ISSUE_NUM -> status:building"
+
   # check-already-satisfied (Fix B, 2026-05-30 -- idempotency short-circuit).
   # Cheap read-only check BEFORE plan/implement: are the WO's deliverables ALREADY
   # present in THIS worktree's HEAD? If clearly yes, route to the ALREADY_SATISFIED
@@ -2053,6 +2092,25 @@ nodes:
         VALIDATION_LINE="VALIDATION: NOT_EMITTED -- build-manifest did not include a VALIDATION line; Captain CI must reject"
       fi
 
+      # -- Resolve the source GitHub issue and append a closing keyword to the PR
+      #    body. This is deliberately added only to the PR body (not issue status),
+      #    so GitHub closes the issue on merge rather than during the build.
+      READ_SPEC_OUT=$(capture_node_output <<'BDC_NODE_OUTPUT_READ_SPEC_FOR_ISSUE'
+      $read-spec.output
+      BDC_NODE_OUTPUT_READ_SPEC_FOR_ISSUE
+      )
+      ISSUE_REPO="${ISSUE_REPO:-bluedevilcollectibles/bdc-xo}"
+      ISSUE_NUM=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'issue=[0-9]+' | head -1 | cut -d= -f2 || true)
+      if [ -z "$ISSUE_NUM" ]; then
+        ISSUE_NUM=$(printf '%s\n' "$READ_SPEC_OUT" | sed -n 's/^SPEC_PATH=.*issues\/\([0-9][0-9]*\).*/\1/p' | head -1)
+      fi
+      if [ -z "$ISSUE_NUM" ]; then
+        WO_ID_FROM_SPEC=$(printf '%s\n' "$READ_SPEC_OUT" | sed -n 's/^WO_ID=//p' | head -1)
+        if [ -n "$WO_ID_FROM_SPEC" ]; then
+          ISSUE_NUM=$(gh issue list --repo "$ISSUE_REPO" --search "$WO_ID_FROM_SPEC in:title" --json number --jq '.[0].number // empty' 2>/dev/null || true)
+        fi
+      fi
+
       # -- Assemble v2 manifest block. Use printf (not heredoc) so the bash
       #    source stays indented inside the YAML block scalar.
       MANIFEST_BLOCK=$(printf '%s\n' \
@@ -2073,10 +2131,18 @@ nodes:
       #    from a stub body OR a previously-patched body and yields a single block.
       CURRENT_BODY=$(gh pr view "$PR_URL" --repo "$REPO" --json body --jq '.body' 2>/dev/null || echo "")
       PROSE=$(printf '%s\n' "$CURRENT_BODY" | awk '/^<!-- bdc-manifest-start -->$/{exit} {print}')
+      CLOSING_LINE=""
+      if [ -n "$ISSUE_NUM" ] && ! printf '%s\n' "$PROSE" | grep -qiE "^(Fixes|Closes|Resolves)[[:space:]]+#${ISSUE_NUM}([[:space:]]|$|[.,;])"; then
+        CLOSING_LINE="Closes #${ISSUE_NUM}"
+      fi
 
       BODY_FILE=$(mktemp)
       {
         printf '%s\n' "$PROSE"
+        if [ -n "$CLOSING_LINE" ]; then
+          echo ""
+          printf '%s\n' "$CLOSING_LINE"
+        fi
         echo ""
         echo "<!-- bdc-manifest-start -->"
         printf '%s\n' "$MANIFEST_BLOCK"
@@ -2088,81 +2154,96 @@ nodes:
       echo "patch-pr-body: PR body updated with v2 manifest."
       echo "PR_URL=$PR_URL"
 
-  - id: flip-notion
-    persona: xo
-    depends_on: [build-manifest]
+  - id: review-issue
+    depends_on: [build-manifest, patch-pr-body]
     trigger_rule: all_done
     task_class: clerical
-    prompt: |
-      Update the Notion Work Order page if Notion MCP is available in this runtime.
+    bash: |
+      set -euo pipefail
 
-      ## Outcome branch (Fix D, 2026-05-30) -- read block-reclassify FIRST
-      block-reclassify status: $block-reclassify.output
-      - status=PROCEED: set Claude Status: REVIEW, Status: Review, add the manifest as a
-        page comment (normal case).
-      - status=ALREADY_SATISFIED: set Claude Status: REVIEW with a note that the WO was
-        already implemented (verified no-op); add the short manifest. Do NOT claim a PR.
-      - status=BLOCKED: do NOT flip to REVIEW. Add a comment that the run PAUSED for human
-        correction with the block reason, and emit an XO_ACTION line. Leave status as-is.
+      capture_node_output() {
+        python3 -c 'import shlex, sys; s=sys.stdin.read(); sys.stdout.write((lambda p: p[0] if len(p)==1 else s)(shlex.split(s)) if len(s)>=2 and s[0]=="'"'"'" and s.rstrip("\n").endswith("'"'"'") else s)'
+      }
 
-      ## Manifest
-      $build-manifest.output
+      RECLASSIFY=$(capture_node_output <<'BDC_NODE_OUTPUT_BLOCK_RECLASSIFY'
+      $block-reclassify.output
+      BDC_NODE_OUTPUT_BLOCK_RECLASSIFY
+      )
+      STATUS=$(printf '%s\n' "$RECLASSIFY" | sed -n 's/.*"status":"\([A-Z_]*\)".*/\1/p' | head -1)
+      if [ "$STATUS" != "PROCEED" ] && [ "$STATUS" != "ALREADY_SATISFIED" ]; then
+        echo "review-issue: status=$STATUS -- not marking issue status:review."
+        exit 0
+      fi
 
-      If Notion MCP is not available inside the container, do not invent a workaround.
-      Emit an XO_ACTION line asking XO to flip Notion manually with the manifest above.
+      READ_SPEC_OUT=$(capture_node_output <<'BDC_NODE_OUTPUT_READ_SPEC'
+      $read-spec.output
+      BDC_NODE_OUTPUT_READ_SPEC
+      )
+      ISSUE_REPO="${ISSUE_REPO:-bluedevilcollectibles/bdc-xo}"
+      ISSUE_NUM=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'issue=[0-9]+' | head -1 | cut -d= -f2 || true)
+      if [ -z "$ISSUE_NUM" ]; then
+        ISSUE_NUM=$(printf '%s\n' "$READ_SPEC_OUT" | sed -n 's/^SPEC_PATH=.*issues\/\([0-9][0-9]*\).*/\1/p' | head -1)
+      fi
+      if [ -z "$ISSUE_NUM" ]; then
+        WO_ID_FROM_SPEC=$(printf '%s\n' "$READ_SPEC_OUT" | sed -n 's/^WO_ID=//p' | head -1)
+        if [ -n "$WO_ID_FROM_SPEC" ]; then
+          ISSUE_NUM=$(gh issue list --repo "$ISSUE_REPO" --search "$WO_ID_FROM_SPEC in:title" --json number --jq '.[0].number // empty' 2>/dev/null || true)
+        fi
+      fi
+      if [ -z "$ISSUE_NUM" ]; then
+        echo "review-issue: no GitHub issue resolved; skipping status:review label."
+        exit 0
+      fi
 
-  # Defect 3 (WO-HARNESS-CAULDRON-DEFECT-CLEANUP-01): fallback Notion flip.
-  # The harness has known-defective tail nodes (commit-and-push, open-pr-if-needed,
-  # build-manifest) that can fail for plumbing reasons AFTER the build is good and
-  # the validator returned satisfied. When that happens the normal flip-notion node
-  # (depends_on: build-manifest) never runs and Notion stays IN_PROGRESS until a
-  # human flips it manually (cauldron-fallback-recovery doctrine, 2026-05-26).
-  #
-  # The spec's original design used `trigger.on_workflow_status: failed`, which the
-  # executor does NOT support. The supported primitives are `trigger_rule: all_done`
-  # (run after deps settle regardless of pass/fail) and `when:` (exact-match only).
-  # Because the validator output is a long markdown report, an exact-match `when:`
-  # cannot test it -- so the satisfied-gate is enforced IN-PROMPT instead (the same
-  # pattern the normal flip-notion uses for its block-reclassify branch). This node
-  # depends on war-council-validator + flip-notion with all_done, so it runs even
-  # when the tail chain between them failed, and no-ops on a real build failure.
-  - id: flip-notion-on-failure
-    persona: xo
-    depends_on: [war-council-validator, flip-notion]
+      gh label create status:review --repo "$ISSUE_REPO" --color 0E8A16 --description "BDC workflow is ready for review" 2>/dev/null || true
+      gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --remove-label status:building 2>/dev/null || true
+      gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --remove-label status:blocked 2>/dev/null || true
+      gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --add-label status:review
+      echo "review-issue: $ISSUE_REPO#$ISSUE_NUM -> status:review"
+
+  - id: blocked-issue
+    depends_on: [block-reclassify]
     trigger_rule: all_done
     task_class: clerical
-    prompt: |
-      FALLBACK Notion flip. Update Notion ONLY if the normal flip-notion node did NOT
-      already flip the WO to REVIEW, AND the build was genuinely good. This is a
-      safety net for the harness tail-node defect (cauldron-fallback-recovery doctrine).
+    bash: |
+      set -euo pipefail
 
-      ## Step 1 -- did the normal flip already happen? (idempotency guard)
-      flip-notion node output: $flip-notion.output
-      - If $flip-notion.output shows the WO was already flipped to REVIEW (Claude Status
-        REVIEW / Status Review set successfully), STOP. Do nothing. Emit:
-        "FALLBACK_FLIP_SKIPPED: normal flip-notion already set REVIEW." Exit.
-      - If $flip-notion.output is empty, errored, or shows the flip did NOT complete,
-        continue to Step 2.
+      capture_node_output() {
+        python3 -c 'import shlex, sys; s=sys.stdin.read(); sys.stdout.write((lambda p: p[0] if len(p)==1 else s)(shlex.split(s)) if len(s)>=2 and s[0]=="'"'"'" and s.rstrip("\n").endswith("'"'"'") else s)'
+      }
 
-      ## Step 2 -- was the build actually good? (satisfied-gate -- do NOT flip on a real failure)
-      war-council-validator report: $war-council-validator.output
-      - The validator verdict MUST be `satisfied` (look for "Verdict: satisfied" or
-        "VALIDATION: PASS"). If the verdict is `needs_revision`, `fail`, or the validator
-        never ran (output empty), this is a REAL build failure -- do NOT flip. Emit:
-        "FALLBACK_FLIP_DECLINED: validator verdict not satisfied; real failure; leaving Notion as-is." Exit.
-      - Only if the verdict is satisfied, continue to Step 3.
+      RECLASSIFY=$(capture_node_output <<'BDC_NODE_OUTPUT_BLOCK_RECLASSIFY'
+      $block-reclassify.output
+      BDC_NODE_OUTPUT_BLOCK_RECLASSIFY
+      )
+      STATUS=$(printf '%s\n' "$RECLASSIFY" | sed -n 's/.*"status":"\([A-Z_]*\)".*/\1/p' | head -1)
+      if [ "$STATUS" != "BLOCKED" ]; then
+        echo "blocked-issue: status=$STATUS -- not marking issue status:blocked."
+        exit 0
+      fi
 
-      ## Step 3 -- perform the fallback flip
-      Set on the Notion WO page:
-      - Claude Status: REVIEW
-      - Status: Review
-      - Add a page comment starting EXACTLY with "FALLBACK PATH:" so the recovery is
-        greppable, including: which tail node failed (infer from the available outputs),
-        that the validator returned satisfied (build good), and the PR/branch info if present.
+      READ_SPEC_OUT=$(capture_node_output <<'BDC_NODE_OUTPUT_READ_SPEC'
+      $read-spec.output
+      BDC_NODE_OUTPUT_READ_SPEC
+      )
+      ISSUE_REPO="${ISSUE_REPO:-bluedevilcollectibles/bdc-xo}"
+      ISSUE_NUM=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'issue=[0-9]+' | head -1 | cut -d= -f2 || true)
+      if [ -z "$ISSUE_NUM" ]; then
+        ISSUE_NUM=$(printf '%s\n' "$READ_SPEC_OUT" | sed -n 's/^SPEC_PATH=.*issues\/\([0-9][0-9]*\).*/\1/p' | head -1)
+      fi
+      if [ -z "$ISSUE_NUM" ]; then
+        WO_ID_FROM_SPEC=$(printf '%s\n' "$READ_SPEC_OUT" | sed -n 's/^WO_ID=//p' | head -1)
+        if [ -n "$WO_ID_FROM_SPEC" ]; then
+          ISSUE_NUM=$(gh issue list --repo "$ISSUE_REPO" --search "$WO_ID_FROM_SPEC in:title" --json number --jq '.[0].number // empty' 2>/dev/null || true)
+        fi
+      fi
+      if [ -z "$ISSUE_NUM" ]; then
+        echo "blocked-issue: no GitHub issue resolved; skipping status:blocked label."
+        exit 0
+      fi
 
-      ## Inputs for the comment
-      Push status: $commit-and-push.output (may be empty if commit-and-push failed)
-      PR status:   $open-pr-if-needed.output (may be empty if open-pr-if-needed failed)
-
-      If Notion MCP is not available inside the container, do not invent a workaround.
-      Log "FALLBACK_FLIP_DEFERRED: Notion MCP unavailable" and exit 0.
+      gh label create status:blocked --repo "$ISSUE_REPO" --color B60205 --description "BDC workflow is blocked before commit" 2>/dev/null || true
+      gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --remove-label status:building 2>/dev/null || true
+      gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --remove-label status:review 2>/dev/null || true
+      gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --add-label status:blocked
+      echo "blocked-issue: $ISSUE_REPO#$ISSUE_NUM -> status:blocked"
