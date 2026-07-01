@@ -194,6 +194,17 @@
         "@types/node": "^22.0.0",
       },
     },
+    "packages/smart-cauldron": {
+      "name": "@archon/smart-cauldron",
+      "version": "0.1.0",
+      "bin": {
+        "smart-cauldron": "./src/cli.ts",
+      },
+      "dependencies": {
+        "@archon/overseer": "workspace:*",
+        "@archon/paths": "workspace:*",
+      },
+    },
     "packages/web": {
       "name": "@archon/web",
       "version": "0.3.10",
@@ -318,6 +329,8 @@
     "@archon/providers": ["@archon/providers@workspace:packages/providers"],
 
     "@archon/server": ["@archon/server@workspace:packages/server"],
+
+    "@archon/smart-cauldron": ["@archon/smart-cauldron@workspace:packages/smart-cauldron"],
 
     "@archon/web": ["@archon/web@workspace:packages/web"],
 

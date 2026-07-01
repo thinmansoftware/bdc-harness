@@ -1,0 +1,29 @@
+{
+  "_comment": "Smart Cauldron v1.0 ordered tier ladder. Edit this file to change tier order or workflow bindings.",
+  "tiers": [
+    {
+      "name": "glm",
+      "workflowName": "bdc-feature-development-glm",
+      "isFrontier": false,
+      "costPerRunUsdEstimate": 0.0005
+    },
+    {
+      "name": "codex",
+      "workflowName": "bdc-feature-development-codex",
+      "isFrontier": false,
+      "costPerRunUsdEstimate": null
+    },
+    {
+      "name": "claude",
+      "workflowName": "bdc-feature-development",
+      "isFrontier": false,
+      "costPerRunUsdEstimate": null
+    },
+    {
+      "name": "frontier",
+      "workflowName": "bdc-feature-development",
+      "isFrontier": true,
+      "costPerRunUsdEstimate": null
+    }
+  ]
+}
