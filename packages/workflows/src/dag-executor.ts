@@ -1661,9 +1661,23 @@ async function executeBashNode(
     let stdout = '';
     let stderr = '';
     try {
-      await mkdir(scriptDir, { recursive: true });
-      await writeFile(scriptFile, finalScript, { mode: 0o600 });
-      await chmod(scriptFile, 0o600);
+      try {
+        await mkdir(scriptDir, { recursive: true });
+        await writeFile(scriptFile, finalScript, { mode: 0o600 });
+        await chmod(scriptFile, 0o600);
+      } catch (error) {
+        const err = error as Error & { code?: number | string };
+        const details = err.message ? `: ${err.message}` : '';
+        throw Object.assign(
+          new Error(`${scriptFile}${details}`),
+          {
+            code: err.code,
+            cause: err,
+            scriptFile,
+            scriptPreparationFailed: true,
+          }
+        );
+      }
       ({ stdout, stderr } = await execFileAsync('bash', [scriptFile], {
         cwd,
         timeout,
@@ -1797,15 +1811,23 @@ async function executeBashNode(
 
     return { state: 'completed', output };
   } catch (error) {
-    const err = error as Error & { killed?: boolean; code?: number | string; stderr?: string };
+    const err = error as Error & {
+      killed?: boolean;
+      code?: number | string;
+      stderr?: string;
+      scriptFile?: string;
+      scriptPreparationFailed?: boolean;
+    };
     const isTimeout = err.killed === true || (err.message ?? '').includes('timed out');
     const label = `Bash node '${node.id}'`;
     // Always run the formatter so logs get sanitized fields regardless of which
-    // user-facing branch we end up in -- the timeout message also contains the
-    // full `Command failed: bash -c <body>` line and would otherwise leak.
+    // user-facing branch we end up in. Spawn failures can still include
+    // command metadata, and the formatter keeps log output constrained.
     const formatted = formatSubprocessFailure(err, label);
     let errorMsg: string;
-    if (isTimeout) {
+    if (err.scriptPreparationFailed) {
+      errorMsg = `${label} failed: unable to prepare temporary script at ${err.scriptFile ?? scriptFile}`;
+    } else if (isTimeout) {
       errorMsg = `${label} timed out after ${String(timeout)}ms`;
     } else if (err.message?.includes('ENOENT')) {
       errorMsg = `${label} failed: bash executable not found in PATH`;

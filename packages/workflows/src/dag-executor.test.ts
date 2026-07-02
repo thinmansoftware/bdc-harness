@@ -1311,7 +1311,7 @@ describe('executeDagWorkflow -- bash nodes', () => {
     expect(failMsg).toBeDefined();
   });
 
-  it('failure message surfaces stderr and does not leak the "Command failed: bash -c <body>" prefix', async () => {
+  it('failure message surfaces stderr and does not leak the generated script body', async () => {
     const mockDeps = createMockDeps();
     const platform = createMockPlatform();
     const workflowRun = makeWorkflowRun('bash-1389-run-id', {
@@ -1320,9 +1320,8 @@ describe('executeDagWorkflow -- bash nodes', () => {
       user_message: 'test',
     });
 
-    // Marker is echoed to stdout only (so it lands in the command line embedded
-    // in err.message but never in stderr). If it shows up in errorMsg the
-    // prefix line was not stripped.
+    // Marker is echoed to stdout only and should never become the diagnostic
+    // when stderr is available.
     const bashNode: BashNode = {
       id: 'fail-bash-1389',
       bash: 'echo UNIQUE_CMDLINE_MARKER_1389; echo "diagnostic from stderr" >&2; exit 1',
@@ -1357,6 +1356,50 @@ describe('executeDagWorkflow -- bash nodes', () => {
     expect(errorMsg).not.toContain('Command failed:');
     expect(errorMsg).not.toContain('UNIQUE_CMDLINE_MARKER_1389');
     expect(errorMsg).toContain('diagnostic from stderr');
+  });
+
+  it('script preparation failure names the temporary script path', async () => {
+    const mockDeps = createMockDeps();
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('bash-script-write-fail-run-id', {
+      workflow_name: 'bash-script-write-fail',
+      conversation_id: 'conv-script-write-fail',
+      user_message: 'test',
+    });
+    const artifactsPathThatIsAFile = join(testDir, 'artifacts-file');
+    await writeFile(artifactsPathThatIsAFile, 'not a directory');
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-script-write-fail',
+      testDir,
+      { name: 'bash-script-write-fail', nodes: [{ id: 'write-fail', bash: 'echo never' }] },
+      workflowRun,
+      'claude',
+      undefined,
+      artifactsPathThatIsAFile,
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    const expectedScriptPath = join(
+      artifactsPathThatIsAFile,
+      'node-write-fail-bash-script-write-fail-run-id.sh'
+    );
+    const eventCalls = (mockDeps.store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls;
+    const failedEvent = eventCalls.find(
+      (call: unknown[]) =>
+        (call[0] as { event_type: string }).event_type === 'node_failed' &&
+        (call[0] as { step_name: string }).step_name === 'write-fail'
+    );
+    expect(failedEvent).toBeDefined();
+    const errorMsg = (failedEvent![0] as { data: { error: string } }).data.error;
+    expect(errorMsg).toBe(
+      `Bash node 'write-fail' failed: unable to prepare temporary script at ${expectedScriptPath}`
+    );
   });
 
   it('variable substitution works in bash scripts', async () => {
