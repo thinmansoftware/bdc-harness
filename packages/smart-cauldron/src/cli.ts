@@ -20,6 +20,37 @@
  * ASCII only. No emojis.
  */
 
+import type { CascadeStatus } from './types.js';
+
+// ---------------------------------------------------------------------------
+// Exit-code mapping
+// ---------------------------------------------------------------------------
+
+/**
+ * Maps a terminal cascade status to a process exit code. Kept as a pure,
+ * exported function so the mapping is unit-testable without running a cascade.
+ *
+ *   won         -> 0 (success; gate passed)
+ *   blocked     -> 2 (all tiers exhausted without a frontier; defensive)
+ *   spec-repair -> 4 (frontier gate-failed; WO needs authoring-layer repair)
+ *   infra-alert -> 3 (infra-error on a tier; escalate/alert)
+ *
+ * spec-repair MUST NOT collapse to 0 -- it is a distinct, visible outcome
+ * (frontier tier gate-failed) and callers key off the exit code.
+ */
+export function statusToExitCode(status: CascadeStatus): number {
+  switch (status) {
+    case 'blocked':
+      return 2;
+    case 'infra-alert':
+      return 3;
+    case 'spec-repair':
+      return 4;
+    default:
+      return 0;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Argument parsing
 // ---------------------------------------------------------------------------
@@ -233,13 +264,17 @@ async function main(): Promise<void> {
     console.log(`  totalCost:   $${record.totalCostUsd.toFixed(6)}`);
   }
 
-  if (record.status === 'blocked') {
-    process.exit(2);
-  } else if (record.status === 'infra-alert') {
-    process.exit(3);
+  // The spec-repair outcome is surfaced without a debug-style print: the
+  // pre-existing `status:` summary line above prints `spec-repair`, and the
+  // distinct non-zero exit code (4) below is the contract callers key off.
+  const exitCode = statusToExitCode(record.status);
+  if (exitCode !== 0) {
+    process.exit(exitCode);
   }
 }
 
+// Only run when invoked as the entry point -- guards against side effects when
+// this module is imported (e.g. unit tests importing statusToExitCode).
 if (import.meta.main) {
   main().catch(err => {
     console.error('[smart-cauldron] Fatal error:', (err as Error).message);
