@@ -21,6 +21,7 @@ import {
   requiredReviewerIds,
   MODE_MATRIX,
   PERSONA_LABEL_TO_REVIEWER_ID,
+  DEFAULT_PERSONA_LABEL_TO_REVIEWER_ID,
 } from '../routing.js';
 import type { ReviewerConfig } from '../types.js';
 
@@ -143,6 +144,12 @@ describe('routing matrix -- spec Test 4: small mechanical bugfix does not over-r
 });
 
 describe('routing matrix -- symbolic-only seats resolve to no Fusion reviewer', () => {
+  it('PERSONA_LABEL_TO_REVIEWER_ID is an alias for the default mapping', () => {
+    // Backward-compatible alias: the deprecated export must point at the same
+    // default map so downstream imports do not silently diverge.
+    expect(PERSONA_LABEL_TO_REVIEWER_ID).toBe(DEFAULT_PERSONA_LABEL_TO_REVIEWER_ID);
+  });
+
   it('maps Doctrine Reviewer, CI Validator, and Synthesizer to null', () => {
     expect(PERSONA_LABEL_TO_REVIEWER_ID['Doctrine Reviewer']).toBeNull();
     expect(PERSONA_LABEL_TO_REVIEWER_ID['CI Validator']).toBeNull();
@@ -177,5 +184,82 @@ describe('routing -- spec Test 7 (v1-scoped self-review guard)', () => {
     const selected = selectReviewers(ROSTER, 'small-mechanical-bugfix');
     expect(selected.length).toBe(1);
     expect(() => assertReviewerDiversity(selected)).not.toThrow();
+  });
+});
+
+describe('routing matrix -- emergency-repair split (spec section 8 conditional)', () => {
+  it('base emergency-repair does NOT require Security/Tenant/PII (spec base case)', () => {
+    const entry = MODE_MATRIX['emergency-repair'];
+    expect(entry.required).not.toContain('Security/Tenant/PII Critic');
+    expect(entry.optional).toContain('Security/Tenant/PII Critic');
+  });
+
+  it('emergency-repair-data REQUIRES Security/Tenant/PII (spec data/billing conditional)', () => {
+    const entry = MODE_MATRIX['emergency-repair-data'];
+    expect(entry.required).toContain('Security/Tenant/PII Critic');
+  });
+
+  it('base emergency-repair selects only adversarial analog (systems), no Security', () => {
+    const selected = selectReviewers(ROSTER, 'emergency-repair');
+    expect(selected.map(r => r.id).sort()).toEqual(['systems']);
+    expect(selected.map(r => r.id)).not.toContain('security-tenant-pii');
+  });
+
+  it('emergency-repair-data selects systems AND security-tenant-pii', () => {
+    const selected = selectReviewers(ROSTER, 'emergency-repair-data');
+    expect(selected.map(r => r.id).sort()).toEqual(['security-tenant-pii', 'systems']);
+  });
+});
+
+describe('routing -- builder-model self-review guard (closes single-reviewer gap)', () => {
+  it('throws when a single reviewer shares the builder model', () => {
+    // small-mechanical-bugfix -> just `systems` (modelId z-ai/glm-5.2). If the
+    // builder ran the same model, that is a self-review even with 1 reviewer.
+    const selected = selectReviewers(ROSTER, 'small-mechanical-bugfix');
+    expect(selected).toHaveLength(1);
+    expect(() => assertReviewerDiversity(selected, 'z-ai/glm-5.2')).toThrow(/self-review guard/i);
+  });
+
+  it('throws when ANY reviewer in a multi-reviewer set shares the builder model', () => {
+    const selected = selectReviewers(ROSTER, 'harness-automation');
+    // `systems` uses z-ai/glm-5.2; picking that as the builder model must fail.
+    expect(() => assertReviewerDiversity(selected, 'z-ai/glm-5.2')).toThrow(/self-review guard/i);
+  });
+
+  it('passes when the builder model does not match any selected reviewer', () => {
+    const selected = selectReviewers(ROSTER, 'harness-automation');
+    expect(() => assertReviewerDiversity(selected, 'openai/gpt-not-in-roster')).not.toThrow();
+  });
+
+  it('single-reviewer selection still passes when no builder model is provided (Tier B fallback)', () => {
+    const selected = selectReviewers(ROSTER, 'small-mechanical-bugfix');
+    expect(selected).toHaveLength(1);
+    expect(() => assertReviewerDiversity(selected)).not.toThrow();
+  });
+});
+
+describe('routing -- persona mapping is config-overridable (removes hardcoded assumption)', () => {
+  it('honors an operator-supplied personaMapping override', () => {
+    // Operator remaps "Adversarial Reviewer" onto a different reviewer id.
+    const override = {
+      ...PERSONA_LABEL_TO_REVIEWER_ID,
+      'Adversarial Reviewer': 'contrarian',
+    };
+    const ids = requiredReviewerIds('small-mechanical-bugfix', override);
+    expect(ids).toEqual(['contrarian']);
+  });
+
+  it('falls back to DEFAULT_PERSONA_LABEL_TO_REVIEWER_ID when no override is passed', () => {
+    const ids = requiredReviewerIds('small-mechanical-bugfix');
+    expect(ids).toEqual(['systems']);
+  });
+
+  it('selectReviewers routes through the override end-to-end', () => {
+    const override = {
+      ...PERSONA_LABEL_TO_REVIEWER_ID,
+      'Adversarial Reviewer': 'contrarian',
+    };
+    const selected = selectReviewers(ROSTER, 'small-mechanical-bugfix', override);
+    expect(selected.map(r => r.id)).toEqual(['contrarian']);
   });
 });

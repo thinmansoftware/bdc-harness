@@ -93,6 +93,7 @@ interface CliArgs {
   ci?: string;
   config?: string;
   woType?: string;
+  builderModel?: string;
   outDir: string;
 }
 
@@ -140,6 +141,10 @@ function parseArgs(argv: string[]): CliArgs {
         result.woType = next;
         i++;
         break;
+      case '--builder-model':
+        result.builderModel = next;
+        i++;
+        break;
       case '--out-dir':
         result.outDir = next ?? './fusion-runs';
         i++;
@@ -168,6 +173,7 @@ function printHelp(): void {
       '    [--ci <path>] \\\n' +
       '    [--config <path>] \\\n' +
       '    [--wo-type <type>] \\\n' +
+      '    [--builder-model <modelId>] \\\n' +
       '    [--out-dir <path>]\n' +
       '\n' +
       'Options:\n' +
@@ -181,6 +187,9 @@ function printHelp(): void {
       '             One of: ' +
       WO_TYPES.join(', ') +
       '\n' +
+      '  --builder-model Builder modelId for self-review guard (optional).\n' +
+      '             When set, ANY selected reviewer sharing this modelId fails\n' +
+      '             closed, including single-reviewer selections.\n' +
       '  --out-dir  Output directory for run folder (default: ./fusion-runs)\n' +
       '\n' +
       'Environment:\n' +
@@ -280,7 +289,7 @@ async function runReview(args: CliArgs): Promise<void> {
       );
       process.exit(1);
     }
-    const selected = selectReviewers(config.reviewers, args.woType);
+    const selected = selectReviewers(config.reviewers, args.woType, config.personaMapping);
     if (selected.length === 0) {
       console.error(
         'Error: WO type "' +
@@ -289,9 +298,11 @@ async function runReview(args: CliArgs): Promise<void> {
       );
       process.exit(1);
     }
-    // Self-review guard (v1-scoped Test 7 proxy) -- throws (non-zero exit) if the
-    // selection cannot support any cross-model review. Fail closed on purpose.
-    assertReviewerDiversity(selected);
+    // Self-review guard (spec Test 7) -- throws (non-zero exit) if the selection
+    // cannot support cross-model review. Fail closed on purpose. When
+    // --builder-model is set, single-reviewer selections that share the builder
+    // model also fail (closes the small-mechanical-bugfix self-review gap).
+    assertReviewerDiversity(selected, args.builderModel);
     runConfig = { ...config, reviewers: selected };
     console.log(
       'WO type "' +

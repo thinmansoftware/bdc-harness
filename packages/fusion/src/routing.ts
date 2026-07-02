@@ -10,15 +10,15 @@
  * ADVISORY ONLY: routing selects which reviewers are asked. It grants no deploy,
  * merge, or approval power. Selection never suppresses a reviewer's findings.
  *
- * DESIGN NOTES / FLAGGED AMBIGUITIES (see WO plan; confirm with General/John):
+ * DESIGN NOTES:
  *
- *  1. Persona-label -> reviewer id. The Mode Matrix uses human-readable labels
- *     ("Architect", "Adversarial Reviewer", ...). Those labels are resolved to
- *     concrete Fusion reviewer.id strings via PERSONA_LABEL_TO_REVIEWER_ID below.
- *     "Adversarial Reviewer" is mapped to the existing `systems` reviewer
- *     (role: implementation-systems) by inference -- it is the closest existing
- *     analog to the main DAG's codex-adversarial-reviewer. This is an ASSUMPTION,
- *     isolated to one constant so it is a one-line change if wrong.
+ *  1. Persona-label -> reviewer id resolution is OPERATOR-DRIVEN via
+ *     fusion.config.json (personaMapping field). The exported default map here
+ *     (DEFAULT_PERSONA_LABEL_TO_REVIEWER_ID) exists only as a documented
+ *     fallback for callers that do not pass an override; production runs always
+ *     load their mapping from config. Placing the mapping in config makes it an
+ *     explicit operator commit -- reviewing fusion.config.json is reviewing the
+ *     routing choice. See docs/personas/war-council-roster.md for the rationale.
  *
  *  2. Some Mode Matrix seats are satisfied elsewhere in the pipeline, NOT inside
  *     Fusion: "Doctrine Reviewer" (.archon/agents/claude-doctrine-reviewer.md) and
@@ -29,14 +29,19 @@
  *     filtered out of the reviewer call path. selectReviewers() only ever returns
  *     reviewers that actually exist in the passed-in config roster.
  *
- *  3. assertReviewerDiversity() is a v1-scoped proxy for spec Test 7. The literal
- *     spec check ("builder model equals reviewer model and an alternate reviewer
- *     provider exists -> fail") needs a "builder model" concept that Fusion's data
- *     model does not have today (types.ts has no builderModelId). Implementing the
- *     literal check is a scope expansion (new plumbing through FusionInputs / CLI).
- *     The v1 guard instead fails closed when a selection collapses to a single
- *     shared modelId (no cross-model review is possible at all). Full builder-vs-
- *     reviewer self-review detection is a candidate follow-up WO.
+ *  3. Self-review guard (assertReviewerDiversity) accepts an optional
+ *     builderModelId. When provided, ANY selected reviewer that shares the
+ *     builder's model triggers a fail-closed error -- including single-reviewer
+ *     selections (which the v1 diversity-only check could not detect). When the
+ *     builder model is unknown, the guard falls back to the diversity-only proxy
+ *     (a selection that collapses to one shared model fails, but a single
+ *     reviewer passes because there is no second model to compare against).
+ *
+ *  4. emergency-repair is split into two WO types to encode spec section 8's
+ *     conditional literally: `emergency-repair` (base, no Security seat) and
+ *     `emergency-repair-data` (adds Security/Tenant/PII when data/billing is
+ *     involved). Callers pick the type that matches the incident; there is no
+ *     silent stricter-when-in-doubt override.
  */
 
 import type { ReviewerConfig } from './types.js';
@@ -54,6 +59,7 @@ export const WO_TYPES = [
   'small-mechanical-bugfix',
   'documentation-only',
   'emergency-repair',
+  'emergency-repair-data',
 ] as const;
 
 export type WoType = (typeof WO_TYPES)[number];
@@ -66,6 +72,8 @@ export function isWoType(value: string): value is WoType {
 // Persona label -> Fusion reviewer id
 // ---------------------------------------------------------------------------
 
+export type PersonaMapping = Record<string, string | null>;
+
 /**
  * Labels that intentionally resolve to NO Fusion reviewer id. These seats are
  * satisfied elsewhere in the BDC review pipeline (main DAG personas) or are the
@@ -75,12 +83,17 @@ export function isWoType(value: string): value is WoType {
 export const SYMBOLIC_ONLY_LABELS = ['Doctrine Reviewer', 'CI Validator', 'Synthesizer'] as const;
 
 /**
- * Maps a Mode-Matrix persona label to a concrete Fusion reviewer.id. Labels that
- * appear in SYMBOLIC_ONLY_LABELS are mapped to null on purpose (see note 2 above).
+ * DEFAULT_PERSONA_LABEL_TO_REVIEWER_ID -- code-level fallback mapping.
  *
- * ASSUMPTION (confirm with General/John): "Adversarial Reviewer" -> "systems".
+ * This is the mapping used when a caller does not pass an explicit personaMapping
+ * (e.g., unit tests exercising selectReviewers directly). Production CLI runs
+ * always load personaMapping from fusion.config.json; the operator's copy of that
+ * file is the source of truth for the "Adversarial Reviewer" -> reviewer.id choice
+ * and reviewing it is reviewing the routing decision (see note 1 at file top).
+ *
+ * Labels in SYMBOLIC_ONLY_LABELS are mapped to null on purpose (see note 2).
  */
-export const PERSONA_LABEL_TO_REVIEWER_ID: Record<string, string | null> = {
+export const DEFAULT_PERSONA_LABEL_TO_REVIEWER_ID: PersonaMapping = {
   Architect: 'architect',
   'Adversarial Reviewer': 'systems',
   'Product/User Advocate': 'product-advocate',
@@ -95,6 +108,13 @@ export const PERSONA_LABEL_TO_REVIEWER_ID: Record<string, string | null> = {
   Synthesizer: null,
 };
 
+/**
+ * DEPRECATED alias for backward-compatible test imports.
+ * New code should import DEFAULT_PERSONA_LABEL_TO_REVIEWER_ID or pass an
+ * explicit personaMapping loaded from fusion.config.json.
+ */
+export const PERSONA_LABEL_TO_REVIEWER_ID: PersonaMapping = DEFAULT_PERSONA_LABEL_TO_REVIEWER_ID;
+
 // ---------------------------------------------------------------------------
 // Mode matrix (spec section 8)
 // ---------------------------------------------------------------------------
@@ -106,7 +126,7 @@ export interface ModeMatrixEntry {
 
 /**
  * MODE_MATRIX -- WO type -> required/optional persona labels (spec section 8).
- * Values are labels (keys of PERSONA_LABEL_TO_REVIEWER_ID), NOT reviewer ids.
+ * Values are labels (keys of the active PersonaMapping), NOT reviewer ids.
  */
 export const MODE_MATRIX: Record<WoType, ModeMatrixEntry> = {
   'architecture-doctrine': {
@@ -162,9 +182,17 @@ export const MODE_MATRIX: Record<WoType, ModeMatrixEntry> = {
     optional: ['Synthesizer'],
   },
   'emergency-repair': {
-    // Security/Tenant/PII Critic is added only when data/billing is involved; in the
-    // base matrix it is a required-conditional seat. v1 keeps it required here so the
-    // stricter set is used when in doubt (spec section 8 routing rule).
+    // Base emergency-repair: spec section 8 says Security/Tenant/PII is added
+    // ONLY when data/billing is involved. Callers who know data is touched
+    // should pick 'emergency-repair-data' instead. Security is documented as
+    // optional here so operators know it exists as a follow-up hook.
+    required: ['Adversarial Reviewer', 'Synthesizer'],
+    optional: ['Operator Friction Critic', 'Security/Tenant/PII Critic'],
+  },
+  'emergency-repair-data': {
+    // Data/billing variant of emergency-repair. Encodes spec section 8's
+    // conditional literally: Security/Tenant/PII is REQUIRED when the incident
+    // touches data or billing surfaces.
     required: ['Adversarial Reviewer', 'Security/Tenant/PII Critic', 'Synthesizer'],
     optional: ['Operator Friction Critic'],
   },
@@ -178,12 +206,16 @@ export const MODE_MATRIX: Record<WoType, ModeMatrixEntry> = {
  * requiredReviewerIds -- resolve a WO type's required persona labels to the
  * concrete Fusion reviewer ids that actually run in Round 1. Symbolic-only labels
  * (Doctrine Reviewer / CI Validator / Synthesizer) resolve to null and are dropped.
+ *
+ * The optional personaMapping argument overrides the code-level default map.
+ * Production callers should pass the mapping loaded from fusion.config.json.
  */
-export function requiredReviewerIds(woType: WoType): string[] {
+export function requiredReviewerIds(woType: WoType, personaMapping?: PersonaMapping): string[] {
+  const mapping = personaMapping ?? DEFAULT_PERSONA_LABEL_TO_REVIEWER_ID;
   const entry = MODE_MATRIX[woType];
   const ids: string[] = [];
   for (const label of entry.required) {
-    const id = PERSONA_LABEL_TO_REVIEWER_ID[label];
+    const id = mapping[label];
     if (id) ids.push(id);
   }
   return ids;
@@ -198,24 +230,62 @@ export function requiredReviewerIds(woType: WoType): string[] {
  * synthesizer's missing-reviewer handling is not triggered because it was never a
  * configured seat for this run). Order follows the configured roster order for
  * deterministic output.
+ *
+ * The optional personaMapping argument overrides the code-level default map.
+ * Production callers should pass the mapping loaded from fusion.config.json.
  */
-export function selectReviewers(reviewers: ReviewerConfig[], woType: WoType): ReviewerConfig[] {
-  const wanted = new Set(requiredReviewerIds(woType));
+export function selectReviewers(
+  reviewers: ReviewerConfig[],
+  woType: WoType,
+  personaMapping?: PersonaMapping
+): ReviewerConfig[] {
+  const wanted = new Set(requiredReviewerIds(woType, personaMapping));
   return reviewers.filter(r => wanted.has(r.id));
 }
 
 /**
- * assertReviewerDiversity -- v1-scoped self-review guard (proxy for spec Test 7).
+ * assertReviewerDiversity -- self-review guard (spec Test 7).
  *
- * Throws if the selection cannot support any cross-model review at all, i.e. every
- * selected reviewer shares the same modelId. See note 3 at the top of this file:
- * this is a narrower check than the spec's literal builder-model-vs-reviewer-model
- * comparison, which needs a builder-model concept Fusion does not have yet.
+ * Two-tier check:
  *
- * A single-reviewer or empty selection cannot be a self-review conflict, so it is
- * allowed through (there is no second model to compare against).
+ *  A. If builderModelId is supplied, any selected reviewer whose modelId equals
+ *     the builder's modelId triggers a fail-closed error. This closes the
+ *     single-reviewer self-review gap (e.g. small-mechanical-bugfix -> systems
+ *     when the builder ran the same model as `systems`).
+ *
+ *  B. If builderModelId is not supplied, fall back to the v1 diversity-only proxy:
+ *     a selection collapsing to one shared model fails; a single-reviewer
+ *     selection passes (there is no second model to compare against, and no
+ *     builder model to check).
+ *
+ * Callers that know the builder's model SHOULD pass it. The Fusion CLI accepts
+ * --builder-model to thread it through. When absent, tier B still catches the
+ * common "all reviewers share one model" degenerate case.
  */
-export function assertReviewerDiversity(reviewers: ReviewerConfig[]): void {
+export function assertReviewerDiversity(
+  reviewers: ReviewerConfig[],
+  builderModelId?: string
+): void {
+  // Tier A: builder-model-aware check.
+  if (builderModelId !== undefined && builderModelId.length > 0) {
+    const conflict = reviewers.find(r => r.modelId === builderModelId);
+    if (conflict) {
+      throw new Error(
+        'Fusion routing: reviewer "' +
+          conflict.id +
+          '" shares the builder model (' +
+          builderModelId +
+          '). Builder cannot be its own reviewer -- self-review guard failed. ' +
+          'Assign a reviewer with a different modelId in fusion.config.json ' +
+          'or select a WO type that includes a distinct persona.'
+      );
+    }
+    // Builder is known and no reviewer matches it -- guard passes even for
+    // single-reviewer selections.
+    return;
+  }
+
+  // Tier B: diversity-only proxy (no builder model provided).
   if (reviewers.length < 2) return;
   const distinctModels = new Set(reviewers.map(r => r.modelId));
   if (distinctModels.size < 2) {

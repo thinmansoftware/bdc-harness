@@ -41,10 +41,22 @@ export interface SynthesizerConfig {
   promptTemplate: string;
 }
 
+/**
+ * Persona label -> Fusion reviewer id mapping.
+ *
+ * When present in fusion.config.json, overrides the code-level default map in
+ * routing.ts. Placing this in config makes the "Adversarial Reviewer" -> reviewer
+ * id choice (and every other label -> id mapping) an explicit operator commit
+ * rather than a code assumption. A null value marks a symbolic-only label
+ * (satisfied outside Fusion; not run as a Round-1 reviewer).
+ */
+export type PersonaMapping = Record<string, string | null>;
+
 export interface FusionConfig {
   reviewers: ReviewerConfig[];
   synthesizer: SynthesizerConfig;
   enableRound2: boolean;
+  personaMapping?: PersonaMapping;
 }
 
 // ---------------------------------------------------------------------------

@@ -53,5 +53,18 @@
     "modelId": "openai/gpt-4.5",
     "promptTemplate": "synthesizer.txt"
   },
-  "enableRound2": false
+  "enableRound2": false,
+  "personaMapping": {
+    "Architect": "architect",
+    "Adversarial Reviewer": "systems",
+    "Product/User Advocate": "product-advocate",
+    "Contrarian / Kill-Switch Critic": "contrarian",
+    "Prior-Art Scout": "prior-art-scout",
+    "Buyer / Money Critic": "buyer-critic",
+    "Operator Friction Critic": "operator-friction",
+    "Security/Tenant/PII Critic": "security-tenant-pii",
+    "Doctrine Reviewer": null,
+    "CI Validator": null,
+    "Synthesizer": null
+  }
 }
