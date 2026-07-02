@@ -1,0 +1,516 @@
+# Drafted by yaml-author subagent for bdc-audit-claude on 2026-07-02
+# Source pattern: bdc-harness-harness-opus-repair-rereview-and-noninteractive-salvage.yaml
+#   (fetched node-schema reference; the canonical bdc-feature-development.yaml lives ONLY on
+#   Hetzner at /app/.archon/workflows/defaults/bdc-feature-development.yaml inside archon-app-1
+#   -- no local clone had it this session. This generated-lane YAML shares the exact same node
+#   schema (persona/agent/task_class/bash/loop conventions, commit-and-push + open-pr-if-needed +
+#   build-manifest + flip-notion tail) because both are produced from the same template family.
+#   VERIFY against the live bdc-feature-development.yaml before first fire -- see OPEN QUESTIONS.)
+# Doctrine compliance: 13 hard rules of archon-yaml-authoring (verified at draft time)
+# Pre-flight: target codebase must be registered in Archon (verify via
+#   ssh hetzner-prod "sqlite3 /opt/bdc/archon-data/archon.db \"SELECT name FROM remote_agent_codebases\"")
+#   This lane is codebase-agnostic (target_repo comes from the WO spec's Target Repo field,
+#   same extraction pattern as decide-push-target below) -- no single repo to pre-register here.
+# Deploy: BDC_XO/scripts/archon-bridge/sync-workflows.sh bdc-audit-claude.yaml
+#   (per Rule 11, sync-workflows.sh is canonical -- do not hand-copy the file to Hetzner)
+# REVIEW BEFORE DEPLOY -- human verifies node schema against the LIVE bdc-feature-development.yaml,
+#   confirms decide-push-target is not over-kept, and confirms report path convention.
+
+name: bdc-audit-claude
+description: |
+  Claude-authored, Claude-reviewed lane for DOCUMENTATION-ONLY audit Work Orders whose sole
+  deliverable is one markdown report file (e.g. WO-*-AUDIT-01, WO-*-REAUDIT-01,
+  WO-*-BUILDSTATE-AUDIT-01). Trimmed from bdc-feature-development: no plan/plan-review,
+  no war-council-validator, no Codex diff-review chain, no opus-repair/pause-gate ladder --
+  there is no code-correctness surface for those nodes to protect. Read spec -> read code/schema
+  per the WO's Behavior Source of Truth section -> write ONE markdown report -> ASCII-gate ->
+  manifest -> flip Notion -> commit+push -> open PR if needed.
+  Use when: the WO body says "audit", "re-audit", "build-state audit", "read-only", or its ONLY
+  file in the Files-to-create list is a single docs/audits/*.md report with no code changes.
+  NOT for: any WO that creates/modifies application code, migrations, or config -- use
+  bdc-feature-development(-codex) for those; the review chain this lane cuts exists to catch
+  code-correctness bugs that a report cannot have.
+policyFile: harness/policies/agent-behavior.md
+model: sonnet
+
+nodes:
+  # Pre-flight: fail closed if container lacks GITHUB auth (mirrors bdc-feature-development).
+  - id: preflight-github-auth
+    persona: major-build
+    load_bearing: true
+    bash: |
+      set -euo pipefail
+      if ! git push --dry-run origin "HEAD:refs/heads/preflight-auth-probe-$(date +%s)" 2>&1; then
+        echo "ERROR: GITHUB auth check failed -- container cannot push to origin." >&2
+        echo "Likely cause: GITHUB_TOKEN missing in executor env, or token lacks repo scope." >&2
+        exit 1
+      fi
+      echo "preflight-github-auth PASS"
+
+  # read-spec: same three-fallback spec lookup as bdc-feature-development (Rule 5 satisfied).
+  # docs/work-orders/<WO_ID>.md is the PRIMARY path (bdc-xo/CLAUDE.md: canonical planned WO
+  # source is bdc-xo/docs/work-orders/<WO-ID>.md on main); docs/superpowers/specs/ direct and
+  # date-prefix glob are fallbacks; GitHub issue body is the last resort.
+  - id: read-spec
+    persona: xo
+    depends_on: [preflight-github-auth]
+    bash: |
+      set -euo pipefail
+      WO_ID="${WO_ID:-}"
+      if [ -z "$WO_ID" ]; then
+        WO_ID=$(printf '%s\n' "$USER_MESSAGE" | grep -Eo 'WO-[A-Z0-9-]+' | head -n 1 || true)
+      fi
+      if [ -z "$WO_ID" ]; then
+        echo "WO_ID missing. Provide WO_ID in environment or user message." >&2
+        exit 1
+      fi
+      # Specs live in bdc-xo (NOT the target codebase). Cross-repo fetch via gh api.
+      SPEC_PATH="docs/work-orders/${WO_ID}.md"
+      SPEC_CONTENT=$(gh api "repos/bluedevilcollectibles/bdc-xo/contents/${SPEC_PATH}?ref=main" --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
+      if [ -z "$SPEC_CONTENT" ]; then
+        # Fallback 1: docs/superpowers/specs/${WO_ID}.md direct
+        SPEC_PATH="docs/superpowers/specs/${WO_ID}.md"
+        SPEC_CONTENT=$(gh api "repos/bluedevilcollectibles/bdc-xo/contents/${SPEC_PATH}?ref=main" --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
+      fi
+      if [ -z "$SPEC_CONTENT" ]; then
+        # Fallback 2: date-prefix glob in docs/superpowers/specs/ (Rule 5)
+        MATCH=$(gh api "repos/bluedevilcollectibles/bdc-xo/contents/docs/superpowers/specs?ref=main" --template '{{range .}}{{.path}}{{"\n"}}{{end}}' 2>/dev/null | grep "${WO_ID}.md$" | head -n 1)
+        if [ -n "$MATCH" ]; then
+          SPEC_PATH="$MATCH"
+          SPEC_CONTENT=$(gh api "repos/bluedevilcollectibles/bdc-xo/contents/${SPEC_PATH}?ref=main" --template '{{.content}}' | tr -d '\n' | base64 -d || true)
+        fi
+      fi
+      if [ -z "$SPEC_CONTENT" ]; then
+        # Fallback 3: GitHub issue body (tracker fallback per bdc-xo/CLAUDE.md)
+        ISSUE_NUM=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'issue=[0-9]+' | head -n 1 | cut -d= -f2 || true)
+        if [ -z "$ISSUE_NUM" ]; then
+          ISSUE_NUM=$(gh issue list --repo bluedevilcollectibles/bdc-xo \
+            --search "${WO_ID} in:title" --json number,title \
+            --jq '.[0].number' 2>/dev/null || true)
+        fi
+        if [ -n "$ISSUE_NUM" ] && [ "$ISSUE_NUM" != "null" ]; then
+          SPEC_CONTENT=$(gh issue view "$ISSUE_NUM" --repo bluedevilcollectibles/bdc-xo \
+            --json body --jq .body 2>/dev/null || true)
+          [ -n "$SPEC_CONTENT" ] && SPEC_PATH="issues/${ISSUE_NUM}"
+        fi
+      fi
+      if [ -z "$SPEC_CONTENT" ]; then echo "Spec not found (tried docs/work-orders/, docs/superpowers/specs/ direct, date-prefix glob, and GitHub issue search)" >&2; exit 1; fi
+      WT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
+      RUN_START_SHA=$(git -C "$WT" rev-parse HEAD 2>/dev/null || echo unknown)
+      mkdir -p "$ARTIFACTS_DIR" 2>/dev/null || true
+      printf '%s\n' "$RUN_START_SHA" > "$ARTIFACTS_DIR/run-start-sha.txt" 2>/dev/null || true
+      printf 'WO_ID=%s\nSPEC_PATH=bdc-xo:%s\nRUN_START_SHA=%s\n\n' "$WO_ID" "$SPEC_PATH" "$RUN_START_SHA"
+      printf '%s\n' "$SPEC_CONTENT"
+
+  # implement: SINGLE PASS. No plan/plan-review upstream -- for a read-only report there is no
+  # code-correctness plan to adversarially review; the WO spec itself IS the plan (its Behavior
+  # Source of Truth section names exactly what to read and where the report goes). This is the
+  # entire trim rationale: nothing downstream needs to catch a code bug because no code changes.
+  - id: implement
+    persona: major-build
+    depends_on: [read-spec]
+    agent: major-build
+    task_class: medium_work
+    loop:
+      prompt: |
+        You are producing a DOCUMENTATION-ONLY audit report for a BDC Work Order. This is a
+        read-only investigation -- you are NOT changing any application code, config, or
+        migration. Your only deliverable is ONE markdown report file.
+
+        ## Spec
+        $read-spec.output
+
+        ## What to do
+        1. Read the spec's "Behavior Source of Truth" section (or equivalent) to find exactly
+           which code paths, schema tables, migrations, and running services to inspect.
+        2. Verify claims LIVE where the spec says to -- read the actual source files (Read/Grep/
+           Glob), query the actual schema if the spec calls for it, do not trust prior specs or
+           memory. If the spec's own claims conflict with what you find in the codebase, trust
+           the codebase and note the discrepancy in the report.
+        3. Write EXACTLY ONE markdown report at the path named in the spec (typically under
+           docs/audits/ in the target repo -- use the spec's own stated path verbatim; do not
+           improvise a different path).
+        4. The report must be evidence-based: cite file paths + line numbers, cite the exact
+           grep/query commands you ran, and state findings as verified facts vs open questions.
+           Do not pad with generic recommendations not grounded in what you actually found.
+
+        ## WORKTREE PINNING
+        You run inside ONE assigned git worktree. Resolve it first:
+          WT=$(git rev-parse --show-toplevel)
+        Do ALL your git/grep/diff/log calls relative to THIS worktree. Do not judge "already
+        done" against origin/main, the shared source/ checkout, or another thread's worktree.
+
+        ## Execution rules
+        - Create/modify ONLY the one report file named in the spec (and, only if the spec
+          explicitly calls for it, an index/README line linking to it -- nothing else).
+        - Do NOT touch application code, tests, migrations, or config. If you find yourself
+          about to edit a non-report file, STOP -- that is out of scope for this lane; report
+          the finding in the audit doc instead and flag it for a follow-up bdc-feature-development
+          WO.
+        - Do not reformat unrelated files.
+        - Do not deploy.
+        - Stop and report BLOCKED if the spec is ambiguous about what to audit or where to write
+          the report.
+
+        ## Commit-and-push BEFORE exit
+        When the report is complete, BEFORE emitting the sentinel below, run:
+
+        ```bash
+        BRANCH=$(git rev-parse --abbrev-ref HEAD)
+        WO_ID="${WO_ID:-$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'WO-[A-Z0-9-]+' | head -n 1 || true)}"
+        git add -A
+        git diff --cached --quiet || git commit -m "docs: audit report for ${WO_ID}
+
+        Read-only investigation. No application code changed.
+
+        Co-Authored-By: Claude (Cauldron major-build) <noreply@anthropic.com>"
+        git push -u origin "$BRANCH" 2>&1 || echo "WARN: push failed - operator must recover from worktree"
+        ```
+
+        ## Completion criteria + sentinel emission
+        Before emitting any completion sentinel, run this self-check IN THIS WORKTREE:
+          WT=$(git rev-parse --show-toplevel)
+          CHANGED=$(git -C "$WT" status --porcelain | wc -l)
+          AHEAD=$(git -C "$WT" rev-list --count "@{upstream}..HEAD" 2>/dev/null \
+                  || git -C "$WT" rev-list --count HEAD --not --remotes 2>/dev/null || echo 0)
+        Then choose EXACTLY ONE ending:
+
+        1. REPORT WRITTEN (you wrote the report file, CHANGED>0 OR AHEAD>0): emit, each on its
+           own line:
+             COMPLETE
+             BUILD_COMPLETE
+             <promise>COMPLETE</promise>
+
+        2. ALREADY SATISFIED (an equivalent up-to-date report already exists in THIS worktree's
+           HEAD and you made no changes): emit BOTH lines, each on its own line:
+             ALREADY_SATISFIED: <one sentence: which report file already exists and why it is current>
+             COMPLETE
+
+        3. TRUE BLOCKER (spec ambiguous / cannot determine what to audit or where to write):
+             BLOCKED: <one-sentence reason>
+
+        Never emit case-1 sentinels unless you actually wrote/updated the report file
+        (CHANGED>0 OR AHEAD>0). A bare COMPLETE with no real change and no ALREADY_SATISFIED
+        line is a false completion.
+      until: COMPLETE
+      max_iterations: 4
+      fresh_context: true
+
+  # ascii-gate: kept from bdc-feature-development. A markdown report is still a source artifact
+  # subject to the ASCII-only rule (harness/policies/agent-behavior.md Code Standards). Scoped to
+  # .md as well as the usual code extensions since the only changed file here IS a .md report.
+  - id: ascii-gate
+    persona: major-build
+    depends_on: [implement]
+    load_bearing: true
+    bash: |
+      set -uo pipefail
+      WT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
+      cd "$WT"
+      BASE=$(cat "$ARTIFACTS_DIR/run-start-sha.txt" 2>/dev/null || echo "")
+      if [ -z "$BASE" ] || [ "$BASE" = "unknown" ] || ! git rev-parse --verify "$BASE" >/dev/null 2>&1; then
+        BASE_REF="origin/${BASE_BRANCH:-main}"
+        BASE=$(git merge-base HEAD "$BASE_REF" 2>/dev/null || git rev-parse HEAD~1 2>/dev/null || echo "")
+      fi
+      SRC_RE='\.(md|js|jsx|ts|tsx|mjs|cjs|html|sh|bash|yaml|yml)$'
+      if [ -n "$BASE" ] && git rev-parse --verify "$BASE" >/dev/null 2>&1; then
+        CHANGED=$( { git diff --name-only "$BASE"..HEAD 2>/dev/null; git diff --name-only HEAD 2>/dev/null; git ls-files --others --exclude-standard 2>/dev/null; } | sort -u | grep -E "$SRC_RE" || true )
+      else
+        CHANGED=$( { git diff --name-only HEAD 2>/dev/null; git ls-files --others --exclude-standard 2>/dev/null; } | sort -u | grep -E "$SRC_RE" || true )
+      fi
+      if [ -z "$CHANGED" ]; then
+        echo "ascii-gate PASS (no changed files to scan)"
+        exit 0
+      fi
+      GREP_P_OK=0
+      if printf 'a\xe2\x80\x94b\n' | grep -qP "[^\x00-\x7F]" 2>/dev/null; then GREP_P_OK=1; fi
+      detect() {
+        f="$1"
+        if [ "$GREP_P_OK" = "1" ]; then
+          grep -lP "[^\x00-\x7F]" "$f" >/dev/null 2>&1 && return 1
+        elif command -v perl >/dev/null 2>&1; then
+          perl -ne 'exit 1 if /[^\x00-\x7F]/' "$f" || return 1
+        else
+          od -An -tu1 "$f" 2>/dev/null | tr ' ' '\n' | grep -qE '^(12[89]|1[3-9][0-9]|2[0-4][0-9]|25[0-5])$' && return 1
+        fi
+        return 0
+      }
+      HITFILE=$(mktemp)
+      printf '%s\n' "$CHANGED" | while IFS= read -r f; do
+        [ -z "$f" ] && continue
+        [ -f "$f" ] || continue
+        if ! detect "$f"; then printf '%s\n' "$f" >> "$HITFILE"; fi
+      done
+      if [ -s "$HITFILE" ]; then
+        echo "ASCII GATE FAILED -- non-ASCII bytes in changed file(s):" >&2
+        cat "$HITFILE" >&2
+        echo "Fix: em-dash/en-dash -> --, smart quotes -> ' and \", ellipsis -> ..., middot -> | or -, nbsp -> space, Unicode minus -> -. No emojis." >&2
+        rm -f "$HITFILE"
+        exit 1
+      fi
+      rm -f "$HITFILE"
+      echo "ascii-gate PASS (scanned $(printf '%s\n' "$CHANGED" | grep -c .) changed file(s), all ASCII)"
+      exit 0
+
+  # decide-push-target: KEPT (trimmed lane still needs it -- see OPEN QUESTION in header/report).
+  # It is the ONLY node in the full lane that (a) extracts the target repo from the spec and
+  # (b) decides Rule 20 staging-gate applicability and branch naming. commit-and-push and
+  # open-pr-if-needed both depend on its output. Nothing here is a code-correctness review --
+  # it is pure routing/naming logic, so it survives the trim on its own merits.
+  - id: decide-push-target
+    persona: major-build
+    depends_on: [ascii-gate]
+    task_class: clerical
+    prompt: |
+      Decide the push target for this BDC audit Work Order.
+
+      ## Inputs
+      Spec:
+      $read-spec.output
+
+      ## Branch Name Derivation Rules
+      The engine already appends a unique "-thread-<hash>" suffix at push time
+      (UNIQUE_BRANCH in commit-and-push). Your job is to emit the BASE branch name only.
+      - Derive the branch name from the WO ID ONLY. Do NOT copy the current git branch name.
+      - Use prefix docs/ followed by the WO ID in lowercase with hyphens.
+        Example: WO-SHOPOPS-CHEERS-CRM-BUILDSTATE-AUDIT-01 -> docs/wo-shopops-cheers-crm-buildstate-audit-01
+      - The branch MUST NOT start with archon/thread- or contain -thread- anywhere.
+      - commit-and-push validates the emitted branch against this allowlist regex:
+        ^(docs/[A-Za-z0-9_-]+|feat/[A-Za-z0-9_-]+|fix/[A-Za-z0-9_-]+|wip/[A-Za-z0-9_-]+)$
+        and fails closed with "Malformed branch name" on mismatch.
+
+      ## Required Repo Policy
+      Extract the target repository from the spec content. Look for any of these patterns
+      (in priority order):
+      1. `target_repo: <owner>/<repo>` (YAML field)
+      2. `**Target repo:** \`<owner>/<repo>\`` (Markdown bold)
+      3. `Target repo: <owner>/<repo>` (plain header)
+      4. `**Target Repo:** \`<owner>/<repo>\`` (Markdown bold, capital R)
+
+      Match the extracted repo against this hardcoded Rule 20 staging-gate list:
+      - bluedevilcollectibles/lspro-react
+      - bluedevilcollectibles/shopops-storefront
+      - bluedevilcollectibles/shopops
+
+      NOTE: audit reports are docs-only and do NOT touch runtime behavior, so even for a
+      staging-gate repo the PR does not require a staging deploy -- but it still opens
+      against the repo's default branch (main, or master for shopops / shopops-storefront
+      per Rule 14). Emit staging_gate_required: false ALWAYS for this lane (docs-only never
+      needs a staging deploy gate); still emit the repo's correct default branch as base.
+
+      If the repo is shopops or shopops-storefront, output:
+      push_target: feature-branch:<spec-derived-branch-name>
+      pr_required: true
+      staging_gate_required: false
+      base_branch: master
+      repo: <owner>/<repo>
+
+      Otherwise (lspro-react, bdc-xo, or any other repo), output:
+      push_target: feature-branch:<spec-derived-branch-name>
+      pr_required: true
+      staging_gate_required: false
+      base_branch: main
+      repo: <owner>/<repo>
+
+      CRITICAL: You MUST emit a `repo:` line and a `base_branch:` line in every output case.
+      If no target_repo is parseable from the spec, emit `repo: unknown` and a WARNING line
+      explaining what is missing.
+
+  # commit-and-push: trimmed -- no diff-review-final / block-reclassify / pause-gate inputs to
+  # check (those nodes are cut). Runs unconditionally after decide-push-target since there is no
+  # BLOCKED path in this lane (a doc-only build has no adversarial gate that can block it).
+  - id: commit-and-push
+    persona: overseer
+    depends_on: [decide-push-target]
+    load_bearing: true
+    bash: |
+      set -euo pipefail
+      DECIDE_OUTPUT=$decide-push-target.output
+      echo "$DECIDE_OUTPUT"
+      if printf '%s\n' "$DECIDE_OUTPUT" | grep -q '^repo: unknown'; then
+        echo "ERROR: decide-push-target could not resolve target repo; failing closed." >&2
+        exit 1
+      fi
+      BRANCH=$(printf '%s\n' "$DECIDE_OUTPUT" | sed -n 's/^push_target: feature-branch://p' | head -n 1)
+      if [ -z "$BRANCH" ]; then
+        echo "No feature branch target found in decide-push-target output." >&2
+        exit 1
+      fi
+      BRANCH_PATTERN='^(docs/[A-Za-z0-9_-]+|feat/[A-Za-z0-9_-]+|fix/[A-Za-z0-9_-]+|wip/[A-Za-z0-9_-]+)$'
+      if ! printf '%s\n' "$BRANCH" | grep -Eq "$BRANCH_PATTERN"; then
+        echo "Malformed branch name: $BRANCH does not match required pattern docs/|feat/|fix/|wip/" >&2
+        exit 1
+      fi
+      THREAD_ID=$(git rev-parse --abbrev-ref HEAD | sed 's|archon/thread-||')
+      UNIQUE_BRANCH="${BRANCH}-thread-${THREAD_ID}"
+      git status --short
+      DIRTY=$(git status --porcelain)
+      if [ -z "$DIRTY" ]; then
+        if git rev-parse --quiet --verify "origin/${UNIQUE_BRANCH}" >/dev/null 2>&1; then
+          COMMITS_AHEAD=$(git rev-list --count "origin/${UNIQUE_BRANCH}..HEAD" 2>/dev/null || echo 0)
+        else
+          COMMITS_AHEAD=$(git rev-list --count HEAD --not --remotes=origin 2>/dev/null || echo 0)
+        fi
+        if [ "$COMMITS_AHEAD" = "0" ]; then
+          LOCAL_HEAD=$(git rev-parse HEAD)
+          RECOVERED=$(git ls-remote origin 2>/dev/null \
+            | awk -v sha="$LOCAL_HEAD" '$1 == sha {sub(/^refs\/heads\//, "", $2); print $2}' \
+            | head -1)
+          if [ -n "$RECOVERED" ]; then
+            echo "Recovered push target from remote: $RECOVERED"
+            UNIQUE_BRANCH="$RECOVERED"
+          else
+            echo "No changed files and no commits ahead of origin/${UNIQUE_BRANCH} -- implement loop did not produce a report" >&2
+            exit 1
+          fi
+        else
+          echo "Backstop: $COMMITS_AHEAD commit(s) ahead of origin -- pushing pre-committed work."
+        fi
+      else
+        CHANGED_FILES=$(printf '%s\n' "$DIRTY" | awk '{print substr($0,4)}')
+        printf '%s\n' "$CHANGED_FILES" | while IFS= read -r path; do
+          [ -z "$path" ] && continue
+          git add -- "$path"
+        done
+        if git diff --cached --quiet; then
+          echo "No changes staged; nothing for backstop to commit." >&2
+          exit 0
+        fi
+        WO_ID="${WO_ID:-$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'WO-[A-Z0-9-]+' | head -n 1 || true)}"
+        git commit -m "docs: audit report for ${WO_ID}"
+      fi
+      PUSH_OK=false
+      for attempt in 1 2 3; do
+        if git push origin HEAD:"${UNIQUE_BRANCH}" 2>&1; then
+          PUSH_OK=true
+          break
+        fi
+        echo "WARN: push attempt $attempt failed; retrying after $((attempt * 5))s..." >&2
+        sleep $((attempt * 5))
+      done
+      if [ "$PUSH_OK" = "false" ]; then
+        echo "ERROR: git push failed after 3 attempts -- aborting workflow (load_bearing node)." >&2
+        exit 1
+      fi
+      REMOTE_HEAD="$(git ls-remote origin "refs/heads/${UNIQUE_BRANCH}" 2>/dev/null | awk '{print $1}')"
+      LOCAL_HEAD="$(git rev-parse HEAD)"
+      if [ "$REMOTE_HEAD" != "$LOCAL_HEAD" ]; then
+        echo "FATAL: canonical branch ${UNIQUE_BRANCH} not durably pushed (origin=${REMOTE_HEAD:-<absent>} local=${LOCAL_HEAD})" >&2
+        exit 1
+      fi
+      echo "VERIFIED: origin/${UNIQUE_BRANCH} == local HEAD (${LOCAL_HEAD})"
+      echo "unique_branch=${UNIQUE_BRANCH}"
+
+  - id: open-pr-if-needed
+    persona: major-build
+    depends_on: [commit-and-push]
+    task_class: clerical
+    load_bearing: true
+    bash: |
+      set -euo pipefail
+      DECIDE_OUTPUT=$decide-push-target.output
+      IMPLEMENT_OUTPUT=$implement.output
+      COMMIT_PUSH_OUTPUT=$commit-and-push.output
+      if ! printf '%s\n' "$DECIDE_OUTPUT" | grep -q '^pr_required: true'; then
+        echo "PR not required; skipping."
+        exit 0
+      fi
+      UNIQUE_BRANCH=$(printf '%s\n' "$COMMIT_PUSH_OUTPUT" | sed -n 's/^unique_branch=//p' | head -n 1)
+      if [ -z "$UNIQUE_BRANCH" ]; then
+        echo "UNIQUE_BRANCH not found in commit-and-push output." >&2
+        exit 1
+      fi
+      REMOTE_HEAD="$(git ls-remote origin "refs/heads/${UNIQUE_BRANCH}" 2>/dev/null | awk '{print $1}')"
+      if [ "$REMOTE_HEAD" != "$(git rev-parse HEAD)" ]; then
+        echo "FATAL: open-pr precondition failed -- ${UNIQUE_BRANCH} not on origin at HEAD (origin=${REMOTE_HEAD:-<absent>})." >&2
+        exit 1
+      fi
+      REPO=$(printf '%s\n' "$DECIDE_OUTPUT" | sed -n 's/^repo: //p' | head -n 1)
+      if [ -z "$REPO" ] || [ "$REPO" = "unknown" ]; then
+        echo "ERROR: decide-push-target did not emit a valid 'repo: <owner>/<repo>'." >&2
+        exit 1
+      fi
+      BASE_BRANCH=$(printf '%s\n' "$DECIDE_OUTPUT" | sed -n 's/^base_branch: //p' | head -n 1)
+      WO_ID="${WO_ID:-$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'WO-[A-Z0-9-]+' | head -n 1 || true)}"
+      TITLE="docs: audit report for ${WO_ID}"
+      BODY_FILE=$(mktemp)
+      {
+        echo "## Summary"
+        echo "Documentation-only audit report per ${WO_ID}. No application code changed."
+        echo
+        echo "## Implement output"
+        echo "$IMPLEMENT_OUTPUT"
+      } > "$BODY_FILE"
+      PR_OK=false
+      for attempt in 1 2 3; do
+        if gh pr create --repo "$REPO" --title "$TITLE" --body-file "$BODY_FILE" --head "$UNIQUE_BRANCH" ${BASE_BRANCH:+--base "$BASE_BRANCH"} 2>&1; then
+          PR_OK=true
+          break
+        fi
+        EXIST=$(gh pr list --repo "$REPO" --head "$UNIQUE_BRANCH" --state open \
+          --json url --jq '.[0].url // empty' 2>/dev/null || true)
+        if [ -n "$EXIST" ]; then
+          echo "PR_URL=$EXIST"
+          PR_OK=true
+          break
+        fi
+        echo "WARN: gh pr create attempt $attempt failed; retrying after $((attempt * 5))s..." >&2
+        sleep $((attempt * 5))
+      done
+      if [ "$PR_OK" = "false" ]; then
+        echo "PR_CREATE_FAILED_BUT_BRANCH_SAFE: repo=${REPO} branch=${UNIQUE_BRANCH} sha=$(git rev-parse HEAD)" >&2
+        echo "ERROR: gh pr create failed after 3 attempts -- aborting workflow (load_bearing node)." >&2
+        echo "RECOVERY: open the PR manually -> gh pr create --repo ${REPO} --head ${UNIQUE_BRANCH} ${BASE_BRANCH:+--base ${BASE_BRANCH}}" >&2
+        exit 1
+      fi
+
+  - id: build-manifest
+    persona: major-build
+    depends_on: [open-pr-if-needed]
+    task_class: clerical
+    prompt: |
+      Construct the Captain CI completion manifest for this BDC audit Work Order.
+
+      ## Inputs
+      Spec:
+      $read-spec.output
+
+      Implementation (report authoring):
+      $implement.output
+
+      ## Required Manifest Fields (Rule 2 v2 manifest, adapted for a DOCS-only WO)
+      - WO ID
+      - Builder: Claude (Cauldron major-build, bdc-audit-claude lane)
+      - Files created: <the single audit report path>
+      - Files modified: <none, unless the spec explicitly required an index update>
+      - Tests: N/A (documentation-only; no test suite applies)
+      - PRs: <repo PR URL, if opened>
+      - Merge ancestors: <repo main/master HEAD, manifest commit>
+      - Grep assertions: N/A (no runtime assertions for a report) OR the specific grep
+        commands used to VERIFY the audit's own claims against the codebase (cite these --
+        they are the evidence the audit did real verification, not guessing)
+      - Runtime verification: N/A (docs-only, no runtime change)
+      - Vercel deployment: N/A (docs-only, no deploy)
+      - VALIDATION: PASS
+
+  - id: flip-notion
+    persona: xo
+    depends_on: [build-manifest]
+    task_class: clerical
+    prompt: |
+      Update the Notion Work Order page if Notion MCP is available in this runtime.
+
+      Set Claude Status: REVIEW and Status: Review. Attach the manifest below to the Notion
+      page's Notes property (NOT a page comment -- Captain CI reads Notes, per doctrine
+      feedback_captain-ci-reads-notes-field-not-comments).
+
+      ## Manifest
+      $build-manifest.output
+
+      If Notion MCP is not available inside the container, do not invent a workaround. Emit an
+      XO_ACTION line asking XO to flip Notion manually with the manifest above.
+
+x-bdc-generated:
+  source: yaml-author subagent (hand-authored, not consume-inbox.ps1)
+  lane: bdc-audit-claude
+  purpose: documentation-only audit WOs, trimmed from bdc-feature-development
