@@ -73,6 +73,10 @@ export interface RunCascadeOptions {
   entryOverride?: TierName;
   /** Archon API base URL. Defaults to ARCHON_API_BASE_URL env or http://localhost:3090. */
   apiBaseUrl?: string;
+  /** Operator token for Archon API auth. Defaults to ARCHON_OPERATOR_TOKEN env in callees. */
+  token?: string;
+  /** Codebase shortname for explicit workflow binding. Required for live fires. */
+  project?: string;
   /** Output directory for cascade-runs/ records. Default: ./cascade-runs. */
   outDir?: string;
   /** Dry-run: print which tier would be picked, do not fire. */
@@ -105,6 +109,8 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
     outDir = './cascade-runs',
     pollTimeoutMs = 1_800_000,
     pollIntervalMs = 30_000,
+    token,
+    project,
   } = opts;
 
   const apiBaseUrl = opts.apiBaseUrl ?? process.env.ARCHON_API_BASE_URL ?? 'http://localhost:3090';
@@ -159,6 +165,12 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
       },
     };
     return record;
+  }
+
+  if (!project) {
+    throw new Error(
+      '[smart-cauldron/cascade] --project is required for cascade fires (explicit codebase binding; no silent fallback allowed).'
+    );
   }
 
   // Cascade loop
@@ -234,8 +246,9 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
     const fireResult: FireResult = await fireImpl({
       workflowName: tier.workflowName,
       woId,
-      message: buildFireMessage(woId, priorContext ?? undefined),
+      message: buildFireMessage(woId, project, priorContext ?? undefined),
       apiBaseUrl,
+      token,
     });
 
     // Infra error: alert + stop (do NOT count as "too hard")
@@ -277,6 +290,7 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
       pollResult = await pollImpl({
         runId: resolvedRunId,
         apiBaseUrl,
+        token,
         timeoutMs: pollTimeoutMs,
         intervalMs: pollIntervalMs,
       });
@@ -287,7 +301,7 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
         // design (v1.1 amendment 2), this is a QUALITY failure, not an infra
         // failure -- cancel the hung run (best-effort; must not block the
         // climb) and climb via the same logic used for gate-fail.
-        const cancelResult = await cancelImpl({ runId: resolvedRunId, apiBaseUrl }).catch(
+        const cancelResult = await cancelImpl({ runId: resolvedRunId, apiBaseUrl, token }).catch(
           (cancelErr: unknown) => ({
             ok: false,
             error: `cancel threw: ${(cancelErr as Error).message}`,

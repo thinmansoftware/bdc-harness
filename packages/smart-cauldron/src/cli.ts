@@ -12,13 +12,13 @@
  *   --out-dir <path>           cascade-runs output dir (default: ./cascade-runs)
  *   --dry-run                  Print which tier would be picked, do not fire
  *   --api-url <url>            Archon API base (default: ARCHON_API_BASE_URL or http://localhost:3090)
+ *   --token <token>            Operator token (default: ARCHON_OPERATOR_TOKEN env)
+ *   --project <shortname>      Required codebase shortname for explicit binding
  *   --poll-timeout-ms <ms>     Per-attempt poll timeout override (default: 1800000 / 30 min)
  *
- * Secret boundary: API URL comes from env (ARCHON_API_BASE_URL) or --api-url flag.
+ * Secret boundary: API URL and token come from env/flags. Never log token values.
  * ASCII only. No emojis.
  */
-
-import { runCascade } from './cascade.js';
 
 // ---------------------------------------------------------------------------
 // Argument parsing
@@ -33,6 +33,8 @@ interface CliArgs {
   outDir: string;
   dryRun: boolean;
   apiUrl?: string;
+  token?: string;
+  project?: string;
   pollTimeoutMs?: number;
 }
 
@@ -53,16 +55,18 @@ Options:
   --out-dir <path>   Output directory for cascade records (default: ./cascade-runs)
   --dry-run          Print entry tier selection only; do not fire
   --api-url <url>    Archon API base URL (default: ARCHON_API_BASE_URL env or http://localhost:3090)
+  --token <token>    Operator token (default: ARCHON_OPERATOR_TOKEN env)
+  --project <name>   Required codebase shortname for explicit binding
   --poll-timeout-ms <ms>  Per-attempt poll timeout override (default: 1800000 / 30 min)
   --help, -h         Show this help
 
 Examples:
-  smart-cauldron fire WO-HARNESS-001 --class CODE --tags mechanical
-  smart-cauldron fire WO-AUTH-002 --class CODE --tags auth,security
-  smart-cauldron fire WO-INFRA-003 --class INFRA
+  smart-cauldron fire WO-HARNESS-001 --project harness --class CODE --tags mechanical
+  smart-cauldron fire WO-AUTH-002 --project shopops --class CODE --tags auth,security
+  smart-cauldron fire WO-INFRA-003 --project harness --class INFRA
   smart-cauldron fire WO-HARNESS-001 --dry-run
-  smart-cauldron fire WO-HARNESS-001 --entry claude --api-url http://localhost:3090
-  smart-cauldron fire WO-HARNESS-001 --poll-timeout-ms 900000
+  smart-cauldron fire WO-HARNESS-001 --project harness --entry claude --api-url http://localhost:3090
+  smart-cauldron fire WO-HARNESS-001 --project harness --poll-timeout-ms 900000
 `);
 }
 
@@ -106,6 +110,12 @@ function parseArgs(argv: string[]): CliArgs {
     } else if (arg === '--api-url' && i + 1 < args.length) {
       result.apiUrl = args[i + 1];
       i += 2;
+    } else if (arg === '--token' && i + 1 < args.length) {
+      result.token = args[i + 1];
+      i += 2;
+    } else if (arg === '--project' && i + 1 < args.length) {
+      result.project = args[i + 1];
+      i += 2;
     } else if (arg === '--poll-timeout-ms' && i + 1 < args.length) {
       const raw = args[i + 1] ?? '';
       const parsed = Number(raw);
@@ -134,6 +144,35 @@ function parseArgs(argv: string[]): CliArgs {
   return result;
 }
 
+export function resolveFireAuth({
+  token,
+  project,
+  dryRun,
+}: {
+  token?: string;
+  project?: string;
+  dryRun: boolean;
+}): { token: string; project: string } | null {
+  if (dryRun) {
+    return null;
+  }
+
+  const resolvedToken = token ?? process.env.ARCHON_OPERATOR_TOKEN ?? '';
+  if (!resolvedToken) {
+    throw new Error(
+      'ARCHON_OPERATOR_TOKEN is required (set the env var or pass --token) for a live cascade fire.'
+    );
+  }
+
+  if (!project) {
+    throw new Error(
+      '--project <shortname> is required for a live cascade fire (explicit codebase binding; no silent fallback allowed).'
+    );
+  }
+
+  return { token: resolvedToken, project };
+}
+
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
@@ -153,6 +192,12 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
+  const fireAuth = resolveFireAuth({
+    token: args.token,
+    project: args.project,
+    dryRun: args.dryRun,
+  });
+
   console.log(`[smart-cauldron] Starting cascade for woId=${args.woId}`);
   if (args.woClass) console.log(`[smart-cauldron]   class=${args.woClass}`);
   if (args.tags && args.tags.length > 0)
@@ -162,6 +207,7 @@ async function main(): Promise<void> {
   if (args.pollTimeoutMs !== undefined)
     console.log(`[smart-cauldron]   poll timeout override=${args.pollTimeoutMs}ms`);
 
+  const { runCascade } = await import('./cascade.js');
   const record = await runCascade({
     woId: args.woId,
     woClass: args.woClass,
@@ -170,6 +216,8 @@ async function main(): Promise<void> {
     outDir: args.outDir,
     dryRun: args.dryRun,
     apiBaseUrl: args.apiUrl,
+    token: fireAuth?.token,
+    project: fireAuth?.project,
     pollTimeoutMs: args.pollTimeoutMs,
   });
 
@@ -192,7 +240,9 @@ async function main(): Promise<void> {
   }
 }
 
-main().catch(err => {
-  console.error('[smart-cauldron] Fatal error:', (err as Error).message);
-  process.exit(1);
-});
+if (import.meta.main) {
+  main().catch(err => {
+    console.error('[smart-cauldron] Fatal error:', (err as Error).message);
+    process.exit(1);
+  });
+}

@@ -44,6 +44,8 @@ interface RunApiResponse {
 interface PollOptions {
   runId: string;
   apiBaseUrl: string;
+  /** Operator token for Archon API auth. Defaults to ARCHON_OPERATOR_TOKEN env. */
+  token?: string;
   /** How long to wait before giving up (ms). Default: 1800000 (30 minutes). */
   timeoutMs?: number;
   /** Poll interval (ms). Default: 30000 (30 seconds). */
@@ -57,12 +59,19 @@ interface PollOptions {
  * @throws If the run does not reach terminal state within timeoutMs.
  */
 export async function pollForTerminal(opts: PollOptions): Promise<PollResult> {
-  const { runId, apiBaseUrl, timeoutMs = 1_800_000, intervalMs = 30_000 } = opts;
+  const {
+    runId,
+    apiBaseUrl,
+    token: tokenOverride,
+    timeoutMs = 1_800_000,
+    intervalMs = 30_000,
+  } = opts;
+  const token = tokenOverride ?? process.env.ARCHON_OPERATOR_TOKEN ?? '';
 
   const deadline = Date.now() + timeoutMs;
 
   while (Date.now() < deadline) {
-    const detail = await fetchRunDetail(runId, apiBaseUrl);
+    const detail = await fetchRunDetail(runId, apiBaseUrl, token);
 
     if (detail && TERMINAL_STATUSES.has(detail.run.status)) {
       const terminalStatus = detail.run.status as 'completed' | 'failed' | 'cancelled';
@@ -96,9 +105,15 @@ export async function pollForTerminal(opts: PollOptions): Promise<PollResult> {
   );
 }
 
-async function fetchRunDetail(runId: string, apiBaseUrl: string): Promise<RunApiResponse | null> {
+async function fetchRunDetail(
+  runId: string,
+  apiBaseUrl: string,
+  token: string
+): Promise<RunApiResponse | null> {
   try {
-    const res = await fetch(`${apiBaseUrl}/api/workflows/runs/${encodeURIComponent(runId)}`);
+    const res = await fetch(`${apiBaseUrl}/api/workflows/runs/${encodeURIComponent(runId)}`, {
+      headers: { 'x-archon-operator-token': token },
+    });
     if (!res.ok) return null;
     return (await res.json()) as RunApiResponse;
   } catch {

@@ -80,6 +80,8 @@ function baseOpts(partial: Partial<RunCascadeOptions> = {}): RunCascadeOptions {
     woClass: 'CODE',
     tags: ['mechanical'],
     outDir: '/tmp/smart-cauldron-test-runs',
+    token: 'test-token',
+    project: 'test-project',
     ...partial,
   };
 }

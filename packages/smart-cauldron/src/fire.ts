@@ -18,6 +18,8 @@ interface FireTierOptions {
   message: string;
   /** Archon API base URL, e.g. http://localhost:3090. */
   apiBaseUrl: string;
+  /** Operator token for Archon API auth. Defaults to ARCHON_OPERATOR_TOKEN env. */
+  token?: string;
   /** How long to wait for run discovery before giving up (ms). Default: 30000. */
   discoverTimeoutMs?: number;
   /** Poll interval for discovery (ms). Default: 3000. */
@@ -41,10 +43,12 @@ export async function fireTier(opts: FireTierOptions): Promise<FireResult> {
     workflowName,
     message,
     apiBaseUrl,
+    token: tokenOverride,
     discoverTimeoutMs = 30_000,
     discoverIntervalMs = 3_000,
   } = opts;
 
+  const token = tokenOverride ?? process.env.ARCHON_OPERATOR_TOKEN ?? '';
   const conversationId = randomUUID();
 
   // Step 1: Fire the run
@@ -52,7 +56,7 @@ export async function fireTier(opts: FireTierOptions): Promise<FireResult> {
   try {
     fireRes = await fetch(`${apiBaseUrl}/api/workflows/${encodeURIComponent(workflowName)}/run`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', 'x-archon-operator-token': token },
       body: JSON.stringify({ conversationId, message }),
     });
   } catch (err) {
@@ -76,7 +80,8 @@ export async function fireTier(opts: FireTierOptions): Promise<FireResult> {
     conversationId,
     apiBaseUrl,
     discoverTimeoutMs,
-    discoverIntervalMs
+    discoverIntervalMs,
+    token
   );
   if (runId === null) {
     return {
@@ -98,14 +103,16 @@ async function discoverRunId(
   conversationId: string,
   apiBaseUrl: string,
   timeoutMs: number,
-  intervalMs: number
+  intervalMs: number,
+  token: string
 ): Promise<string | null> {
   const deadline = Date.now() + timeoutMs;
 
   while (Date.now() < deadline) {
     try {
       const res = await fetch(
-        `${apiBaseUrl}/api/workflows/runs/by-worker/${encodeURIComponent(conversationId)}`
+        `${apiBaseUrl}/api/workflows/runs/by-worker/${encodeURIComponent(conversationId)}`,
+        { headers: { 'x-archon-operator-token': token } }
       );
       if (res.ok) {
         const body = (await res.json()) as { run?: { id?: string } };
@@ -130,9 +137,14 @@ async function discoverRunId(
  * Build a message string for firing a WO, optionally including prior attempt context
  * so the next tier starts informed rather than blind.
  */
-export function buildFireMessage(woId: string, priorAttemptContext?: string): string {
+export function buildFireMessage(
+  woId: string,
+  project: string,
+  priorAttemptContext?: string
+): string {
+  const base = `${woId} --project ${project}`;
   if (!priorAttemptContext) {
-    return woId;
+    return base;
   }
-  return `${woId}\n\n## Prior attempt context\n${priorAttemptContext}`;
+  return `${base}\n\n## Prior attempt context\n${priorAttemptContext}`;
 }
