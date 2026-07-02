@@ -43,7 +43,8 @@ export interface CascadeAttempt {
 
 export type CascadeStatus =
   | 'won' // a tier passed the gate
-  | 'blocked' // frontier failed gate or all tiers exhausted
+  | 'blocked' // all tiers exhausted without a frontier (defensive; should not happen)
+  | 'spec-repair' // frontier (fable) tier gate-failed -> SPEC-REPAIR escalation, not a dead end
   | 'infra-alert'; // infra-error on a tier (escalate/alert, not climb silently)
 
 export interface CascadeRunRecord {
@@ -59,6 +60,21 @@ export interface CascadeRunRecord {
     climbed: boolean;
     climbCount: number;
     wonCheap: boolean; // true if entry tier won without climbing
+  };
+  /**
+   * Populated ONLY when the frontier (fable) tier gate-failed and the cascade
+   * emitted a SPEC-REPAIR escalation (status === 'spec-repair'). Doctrine
+   * 2026-07-02 (John): Fable is the last escalation before failure -- a WO must
+   * never terminally fail. `posted` is true when the WO's GitHub issue received
+   * the SPEC-REPAIR comment + status:blocked label; false when no issue resolved
+   * and the escalate/alert fallback carried the same text instead.
+   */
+  specRepair?: {
+    issueRepo: string | null;
+    issueNumber: number | null;
+    posted: boolean;
+    whatMustChange: string;
+    evidence: string;
   };
 }
 

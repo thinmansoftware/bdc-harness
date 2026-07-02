@@ -18,6 +18,8 @@
  */
 
 import { randomUUID } from 'crypto';
+import { execFile } from 'child_process';
+import { promisify } from 'util';
 import { loadLadder } from './ladder.js';
 import { loadRuleset, pickEntryTier } from './conductor.js';
 import { fireTier, buildFireMessage } from './fire.js';
@@ -39,6 +41,8 @@ import type {
 } from './types.js';
 import type { DecisionResult } from '@archon/overseer/decide';
 
+const execFileAsync = promisify(execFile);
+
 // ---------------------------------------------------------------------------
 // Dependency injection interface (for testability)
 // ---------------------------------------------------------------------------
@@ -51,6 +55,13 @@ export interface CascadeDeps {
   writeRecord?: typeof writeRecord;
   /** Best-effort cancel of a hung run on progress-timeout. Failure never blocks the climb. */
   cancel?: typeof cancelRun;
+  /**
+   * SPEC-REPAIR escalation for a frontier (fable) tier gate-fail. Posts the
+   * failure evidence + "what must change in the spec" to the WO's GitHub issue
+   * (comment + status:blocked label). Injectable for tests. Failure to resolve
+   * an issue is surfaced via `posted: false` (caller falls back to escalate).
+   */
+  specRepair?: (context: SpecRepairCallContext) => Promise<SpecRepairResult>;
 }
 
 export interface EscalationCallContext {
@@ -59,6 +70,24 @@ export interface EscalationCallContext {
   reason: string;
   remediation?: string[];
   runId?: string | null;
+}
+
+export interface SpecRepairCallContext {
+  woId: string;
+  tierName: TierName;
+  failReason: string;
+  runId: string | null;
+  /** Full, human-readable failure evidence (gate reasons, verdict, run id). */
+  evidence: string;
+  /** Concrete "what must change in the spec" statement -- the fix-loop handoff. */
+  whatMustChange: string;
+}
+
+export interface SpecRepairResult {
+  /** true when the WO's GitHub issue received the comment + status:blocked label. */
+  posted: boolean;
+  issueRepo: string | null;
+  issueNumber: number | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -122,6 +151,7 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
   const escalateImpl = opts.deps?.escalate ?? defaultEscalate;
   const writeRecordImpl = opts.deps?.writeRecord ?? writeRecord;
   const cancelImpl = opts.deps?.cancel ?? cancelRun;
+  const specRepairImpl = opts.deps?.specRepair ?? defaultSpecRepair;
 
   // Load config from files (never from inline constants)
   const tiers = loadLadder();
@@ -179,6 +209,7 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
   let climbCount = 0;
   let status: CascadeStatus = 'blocked';
   let winningTier: TierName | null = null;
+  let specRepairRecord: CascadeRunRecord['specRepair'];
 
   /**
    * Shared climb/frontier logic for both the gate-fail path and the
@@ -200,17 +231,62 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
     runId: string | null
   ): Promise<boolean> {
     if (currentTier.isFrontier) {
-      // Top rung failed -- BLOCKED
-      await escalateImpl({
-        errorClass: 'validator_rejected',
-        woId,
-        reason: `Frontier tier ${currentTier.name} failed gate: ${failReason}`,
-        remediation: [failReason],
-        runId,
-      });
+      // Top rung (fable) failed the gate. Per John's 2026-07-02 doctrine ruling
+      // ("Fable is the last escalation before failure -- a WO should never fail,
+      // it should be able to be fixed"), this is NOT a terminal BLOCKED dead end.
+      // Emit a SPEC-REPAIR escalation: post the failure evidence + a concrete
+      // "what must change in the spec" statement to the WO's GitHub issue (comment
+      // + status:blocked label) so the WO re-enters at the authoring layer.
+      const evidence = buildSpecRepairEvidence(currentTier, failReason, runId, attempts);
+      const whatMustChange = buildWhatMustChange(currentTier, failReason);
 
-      status = 'blocked';
-      console.log(`[smart-cauldron] BLOCKED: frontier tier gate-failed for woId=${woId}`);
+      let result: SpecRepairResult;
+      try {
+        result = await specRepairImpl({
+          woId,
+          tierName: currentTier.name,
+          failReason,
+          runId,
+          evidence,
+          whatMustChange,
+        });
+      } catch (specErr) {
+        // A thrown spec-repair impl (e.g. gh totally unavailable) must not swallow
+        // the escalation -- treat as "not posted" and fall through to the alert.
+        console.log(
+          `[smart-cauldron] SPEC-REPAIR impl threw for woId=${woId}: ` +
+            `${(specErr as Error).message} (falling back to escalate/alert)`
+        );
+        result = { posted: false, issueRepo: null, issueNumber: null };
+      }
+
+      if (!result.posted) {
+        // Mode Behavior Matrix row 4: no GitHub issue resolvable -> fall back to the
+        // existing escalate/alert path with the spec-repair text in the payload.
+        // The escalation must NEVER be silently dropped.
+        await escalateImpl({
+          errorClass: 'validator_rejected',
+          woId,
+          reason:
+            `SPEC-REPAIR (no GitHub issue resolved) -- frontier tier ${currentTier.name} ` +
+            `gate-failed: ${failReason}`,
+          remediation: [whatMustChange, evidence],
+          runId,
+        });
+      }
+
+      specRepairRecord = {
+        issueRepo: result.issueRepo,
+        issueNumber: result.issueNumber,
+        posted: result.posted,
+        whatMustChange,
+        evidence,
+      };
+      status = 'spec-repair';
+      console.log(
+        `[smart-cauldron] SPEC-REPAIR: frontier tier gate-failed for woId=${woId} ` +
+          `(issue posted=${result.posted})`
+      );
       return true;
     }
 
@@ -424,6 +500,7 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
       climbCount,
       wonCheap,
     },
+    ...(specRepairRecord ? { specRepair: specRepairRecord } : {}),
   };
 
   // Write local telemetry record
@@ -523,4 +600,158 @@ async function defaultEscalate(ctx: EscalationCallContext): Promise<void> {
     woId: ctx.woId,
     remediation: ctx.remediation,
   });
+}
+
+/**
+ * Build the SPEC-REPAIR failure evidence block for the frontier (fable) gate-fail.
+ * Summarizes what the apex rung tried and why it still failed the gate, so the
+ * authoring layer has the concrete signal to repair the spec.
+ */
+function buildSpecRepairEvidence(
+  tier: LadderTier,
+  failReason: string,
+  runId: string | null,
+  attempts: CascadeAttempt[]
+): string {
+  const lines: string[] = [
+    `Frontier tier: ${tier.name} (workflow: ${tier.workflowName})`,
+    `Run id: ${runId ?? 'unknown'}`,
+    `Gate-fail reason: ${failReason}`,
+    '',
+    'Cascade attempt history (cheapest tier first):',
+  ];
+  for (const a of attempts) {
+    const detail = a.gateFailReason ?? a.infraErrorReason ?? '(no detail)';
+    const served = a.servedModelId ? ` served=${a.servedModelId}` : '';
+    lines.push(`  - ${a.tier} [${a.outcome}]${served}: ${detail}`);
+  }
+  return lines.join('\n');
+}
+
+/**
+ * Build the concrete "what must change in the spec" statement. The fable apex
+ * rung is the strongest available model; if it could not pass the gate, the
+ * problem is upstream of execution -- the spec itself must be repaired.
+ */
+function buildWhatMustChange(tier: LadderTier, failReason: string): string {
+  return [
+    'WHAT MUST CHANGE IN THE SPEC:',
+    `The apex (fable) tier "${tier.name}" is the strongest available model and it still`,
+    `could not pass the completion gate (${failReason}).`,
+    'This is not an execution capacity problem -- re-running will not help. The Work Order',
+    'spec must be repaired before it can succeed. Concretely, revise the spec to resolve the',
+    'gate-fail above: clarify ambiguous or contradictory requirements, correct any file/scope',
+    'claims that did not match the codebase, tighten the stop conditions into concrete',
+    'verifiable commands, or split the WO if it is too large for a single surgical change.',
+    'Re-file the repaired WO to re-enter at the authoring layer.',
+  ].join('\n');
+}
+
+/**
+ * Default SPEC-REPAIR implementation. Resolves the WO's GitHub issue in bdc-xo
+ * (via title search on the WO ID), posts a comment with the failure evidence +
+ * the "what must change" statement, and applies the status:blocked label.
+ *
+ * Never closes the issue (premature-close fence). Returns posted=false when no
+ * issue can be resolved so the caller falls back to the escalate/alert path.
+ *
+ * Mirrors the gh CLI pattern used by the review-issue / blocked-issue bash nodes
+ * in bdc-feature-development.yaml.
+ */
+async function defaultSpecRepair(ctx: SpecRepairCallContext): Promise<SpecRepairResult> {
+  const issueRepo = process.env.ISSUE_REPO ?? 'bluedevilcollectibles/bdc-xo';
+
+  // Resolve the issue number by searching the WO ID in the issue title.
+  let issueNumber: number | null = null;
+  try {
+    const { stdout } = await execFileAsync('gh', [
+      'issue',
+      'list',
+      '--repo',
+      issueRepo,
+      '--search',
+      `${ctx.woId} in:title`,
+      '--json',
+      'number',
+      '--jq',
+      '.[0].number // empty',
+    ]);
+    const parsed = parseInt(stdout.trim(), 10);
+    if (!isNaN(parsed)) issueNumber = parsed;
+  } catch (err) {
+    console.log(
+      `[smart-cauldron] SPEC-REPAIR: gh issue lookup failed for ${ctx.woId}: ` +
+        (err as Error).message
+    );
+    return { posted: false, issueRepo, issueNumber: null };
+  }
+
+  if (issueNumber === null) {
+    console.log(
+      `[smart-cauldron] SPEC-REPAIR: no GitHub issue resolved for ${ctx.woId} in ${issueRepo}.`
+    );
+    return { posted: false, issueRepo, issueNumber: null };
+  }
+
+  const body = [
+    '## SPEC-REPAIR required (Smart Cauldron apex rung gate-fail)',
+    '',
+    `The escalation cascade reached the frontier (fable) tier for **${ctx.woId}** and the`,
+    'apex rung still gate-failed. Per doctrine (John, 2026-07-02): Fable is the last',
+    'escalation before failure -- a WO should never terminally fail, it should be fixed.',
+    '',
+    '### Failure evidence',
+    '```',
+    ctx.evidence,
+    '```',
+    '',
+    '### What must change',
+    ctx.whatMustChange,
+  ].join('\n');
+
+  try {
+    // Ensure the label exists (best-effort; ignore "already exists").
+    await execFileAsync('gh', [
+      'label',
+      'create',
+      'status:blocked',
+      '--repo',
+      issueRepo,
+      '--color',
+      'B60205',
+      '--description',
+      'BDC Work Order blocked -- spec repair required',
+    ]).catch(() => undefined);
+
+    await execFileAsync('gh', [
+      'issue',
+      'comment',
+      String(issueNumber),
+      '--repo',
+      issueRepo,
+      '--body',
+      body,
+    ]);
+
+    await execFileAsync('gh', [
+      'issue',
+      'edit',
+      String(issueNumber),
+      '--repo',
+      issueRepo,
+      '--add-label',
+      'status:blocked',
+    ]);
+
+    console.log(
+      `[smart-cauldron] SPEC-REPAIR: posted comment + status:blocked on ${issueRepo}#${issueNumber}`
+    );
+    return { posted: true, issueRepo, issueNumber };
+  } catch (err) {
+    console.log(
+      `[smart-cauldron] SPEC-REPAIR: gh comment/label failed for ${issueRepo}#${issueNumber}: ` +
+        (err as Error).message
+    );
+    return { posted: false, issueRepo, issueNumber };
+  }
 }

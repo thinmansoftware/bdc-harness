@@ -483,13 +483,19 @@ describe('Test 4: INFRA-ERROR vs GATE-FAIL', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Test 5: FRONTIER-STOP
+// Test 5: FRONTIER-STOP -> SPEC-REPAIR (doctrine 2026-07-02: no terminal failure)
 // ---------------------------------------------------------------------------
 
-describe('Test 5: FRONTIER-STOP', () => {
-  test('frontier gate-fail -> BLOCKED + escalate; no third fire', async () => {
+describe('Test 5: FRONTIER gate-fail -> SPEC-REPAIR (not plain blocked)', () => {
+  test('frontier gate-fail invokes specRepair, records spec-repair, no third fire', async () => {
     let fireCount = 0;
     let escalateCalled = false;
+    const specRepairCalls: {
+      woId: string;
+      whatMustChange: string;
+      evidence: string;
+      failReason: string;
+    }[] = [];
 
     const deps: CascadeDeps = {
       fire: async _opts => {
@@ -501,20 +507,21 @@ describe('Test 5: FRONTIER-STOP', () => {
       escalate: async _ctx => {
         escalateCalled = true;
       },
+      // Issue resolves + comment posts successfully -- the fix-loop signal was delivered.
+      specRepair: async ctx => {
+        specRepairCalls.push({
+          woId: ctx.woId,
+          whatMustChange: ctx.whatMustChange,
+          evidence: ctx.evidence,
+          failReason: ctx.failReason,
+        });
+        return { posted: true, issueRepo: 'bluedevilcollectibles/bdc-xo', issueNumber: 42 };
+      },
       writeRecord: async (record, _dir) => `/tmp/cascade-record-${record.cascadeId}.json`,
     };
 
-    // Use a 2-tier stub ladder so frontier is at index 1 and we don't run 4 real tiers
-    // Override the ladder in the cascade by injecting inline config via entryOverride + patching
-    // We can't directly inject the ladder, so use the entry override to start at the first tier
-    // and rely on the real ladder (zero -> qwen -> codex -> claude -> frontier).
-    // For the frontier-stop test, we want to run exactly 2 attempts and stop at frontier.
-    // The real ladder has 4 tiers, so we need a custom approach.
-    //
-    // Since loadLadder() reads from config, we use entryOverride='claude' to start at
-    // the second-to-last tier (claude), so frontier is immediately next.
-    // Then we verify exactly 2 fires happen (claude + frontier) and the loop terminates.
-
+    // entryOverride='claude' starts at the second-to-last tier so frontier is
+    // immediately next: exactly 2 fires (claude + frontier), then stop.
     const record = await runCascade(
       baseOpts({
         deps,
@@ -522,11 +529,59 @@ describe('Test 5: FRONTIER-STOP', () => {
       })
     );
 
-    // Should have tried claude and frontier (2 attempts), then stopped
-    expect(record.status).toBe('blocked');
-    expect(escalateCalled).toBe(true);
-    expect(fireCount).toBe(2); // claude + frontier only
-    expect(record.attempts.every(a => a.outcome === 'gate-failed')).toBe(true);
+    // Recorded outcome is spec-repair, NOT plain blocked.
+    expect(record.status).toBe('spec-repair');
+    expect(record.status).not.toBe('blocked');
+    expect(fireCount).toBe(2); // claude + frontier only -- no infinite loop
+
+    // The spec-repair (issue-comment) path was invoked with real content.
+    expect(specRepairCalls.length).toBe(1);
+    expect(specRepairCalls[0]?.woId).toBe('WO-TEST-001');
+    expect(specRepairCalls[0]?.whatMustChange).toContain('WHAT MUST CHANGE IN THE SPEC');
+    expect(specRepairCalls[0]?.evidence).toContain('Gate-fail reason: terminal status: failed');
+
+    // Issue was posted -> the plain escalate/alert fallback is NOT used.
+    expect(escalateCalled).toBe(false);
+
+    // The record carries the spec-repair payload for telemetry.
+    expect(record.specRepair?.posted).toBe(true);
+    expect(record.specRepair?.issueNumber).toBe(42);
+    expect(record.specRepair?.whatMustChange).toContain('spec must be repaired');
+  });
+
+  test('Matrix row 4: no GitHub issue resolvable -> falls back to escalate, never silently dropped', async () => {
+    let fireCount = 0;
+    const escalateCalls: { reason: string; remediation?: string[] }[] = [];
+
+    const deps: CascadeDeps = {
+      fire: async _opts => {
+        fireCount++;
+        return makeFireOk(`run-${fireCount}`);
+      },
+      poll: async _opts => makePollResult({ terminalStatus: 'failed' }),
+      judge: _poll => makeFailVerdict('validator verdict: needs_revision'),
+      escalate: async ctx => {
+        escalateCalls.push({ reason: ctx.reason, remediation: ctx.remediation });
+      },
+      // No issue resolves -- posted:false forces the escalate/alert fallback.
+      specRepair: async _ctx => ({ posted: false, issueRepo: null, issueNumber: null }),
+      writeRecord: async (record, _dir) => `/tmp/cascade-record-${record.cascadeId}.json`,
+    };
+
+    const record = await runCascade(baseOpts({ deps, entryOverride: 'claude' }));
+
+    // Still spec-repair (the doctrine outcome), and the escalation was NOT dropped.
+    expect(record.status).toBe('spec-repair');
+    expect(fireCount).toBe(2);
+    expect(escalateCalls.length).toBe(1);
+    expect(escalateCalls[0]?.reason).toContain('SPEC-REPAIR');
+    // The spec-repair text rides along in the alert payload.
+    const remediationBlob = (escalateCalls[0]?.remediation ?? []).join('\n');
+    expect(remediationBlob).toContain('WHAT MUST CHANGE IN THE SPEC');
+
+    // The record still reflects the (unposted) spec-repair attempt.
+    expect(record.specRepair?.posted).toBe(false);
+    expect(record.specRepair?.issueNumber).toBeNull();
   });
 });
 
