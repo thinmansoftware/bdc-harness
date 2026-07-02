@@ -202,6 +202,7 @@ export const workflowRunDetailSchema = z
       worker_platform_id: z.string().optional(),
       parent_platform_id: z.string().optional(),
       conversation_platform_id: z.string().nullable(),
+      token_totals: z.record(z.unknown()).optional(),
     }),
     events: z.array(workflowEventSchema),
   })

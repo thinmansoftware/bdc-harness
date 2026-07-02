@@ -100,6 +100,7 @@ function createMockStore(): IWorkflowStore {
     pauseWorkflowRun: mock(() => Promise.resolve()),
     cancelWorkflowRun: mock(() => Promise.resolve()),
     createWorkflowEvent: mock(() => Promise.resolve()),
+    listWorkflowEvents: mock(() => Promise.resolve([])),
     getCompletedDagNodeOutputs: mock(() => Promise.resolve(new Map<string, string>())),
     getCodebase: mock(() => Promise.resolve(null)),
     getCodebaseEnvVars: mock(() => Promise.resolve({})),
@@ -8873,6 +8874,245 @@ describe('executeDagWorkflow -- tier/entry_rung + frontier_cost_usd', () => {
     expect(tokens.input).toBe(100);
     expect(tokens.output).toBe(50);
     expect(tokens.total).toBe(150);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Token telemetry persistence + terminal run_token_totals rollup
+// WO-HARNESS-TOKEN-TELEMETRY-PERSIST-01
+// ---------------------------------------------------------------------------
+describe('executeDagWorkflow -- token telemetry persistence and rollup', () => {
+  let testDir: string;
+
+  beforeEach(async () => {
+    testDir = join(
+      tmpdir(),
+      `dag-token-rollup-${Date.now()}-${Math.random().toString(36).slice(2)}`
+    );
+    await mkdir(testDir, { recursive: true });
+    mockSendQueryDag.mockClear();
+    mockGetAgentProviderDag.mockClear();
+  });
+
+  afterEach(async () => {
+    mockGetAgentProviderDag.mockImplementation(() => ({
+      sendQuery: mockSendQueryDag,
+      getType: () => 'claude',
+      getCapabilities: mockClaudeCapabilities,
+    }));
+    try {
+      await rm(testDir, { recursive: true, force: true });
+    } catch {
+      /* ignore cleanup errors */
+    }
+  });
+
+  function createEventBackedStore(): IWorkflowStore {
+    const store = createMockStore();
+    (store.listWorkflowEvents as Mock<(runId: string) => Promise<unknown[]>>).mockImplementation(
+      async runId =>
+        (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls.map(
+          ([arg], index: number) => {
+            const event = arg as {
+              event_type: string;
+              step_index?: number;
+              step_name?: string;
+              data?: Record<string, unknown>;
+            };
+            return {
+              id: `evt-${String(index)}`,
+              workflow_run_id: runId,
+              event_type: event.event_type,
+              step_index: event.step_index ?? null,
+              step_name: event.step_name ?? null,
+              data: event.data ?? {},
+              created_at: `2026-07-02T00:00:${String(index).padStart(2, '0')}.000Z`,
+            };
+          }
+        )
+    );
+    return store;
+  }
+
+  async function waitForRunTokenTotals(store: IWorkflowStore): Promise<Record<string, unknown>> {
+    for (let attempt = 0; attempt < 20; attempt++) {
+      const calls = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls as Array<
+        [{ event_type: string; data?: Record<string, unknown> }]
+      >;
+      const rollupCall = calls.find(([arg]) => arg.event_type === 'run_token_totals');
+      if (rollupCall) return rollupCall[0].data ?? {};
+      await new Promise(resolve => setTimeout(resolve, 0));
+    }
+    throw new Error('run_token_totals event was not emitted');
+  }
+
+  it('persists Claude model_usage on node_completed', async () => {
+    mockSendQueryDag.mockImplementation(function* () {
+      yield { type: 'assistant', content: 'done' };
+      yield {
+        type: 'result',
+        sessionId: 'usage-session',
+        tokens: { input: 100, output: 50, total: 150 },
+        modelUsage: {
+          'claude-sonnet-5': { input_tokens: 100, output_tokens: 50, total_tokens: 150 },
+        },
+      };
+    });
+
+    const store = createEventBackedStore();
+    await executeDagWorkflow(
+      createMockDeps(store),
+      createMockPlatform(),
+      'conv-usage',
+      testDir,
+      { name: 'usage-complete', nodes: [{ id: 'n', prompt: 'p' }] },
+      makeWorkflowRun('usage-complete-run'),
+      'claude',
+      'claude-sonnet-5',
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    const completedCall = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls.find(
+      ([arg]) => (arg as { event_type: string }).event_type === 'node_completed'
+    );
+    expect(completedCall).toBeDefined();
+    const data = (completedCall![0] as { data: Record<string, unknown> }).data;
+    expect(data.model_usage).toEqual({
+      'claude-sonnet-5': { input_tokens: 100, output_tokens: 50, total_tokens: 150 },
+    });
+  });
+
+  it('persists partial model_usage on node_failed', async () => {
+    mockSendQueryDag.mockImplementation(function* () {
+      yield {
+        type: 'result',
+        sessionId: 'failed-usage-session',
+        isError: true,
+        errorSubtype: 'provider_error',
+        errors: ['boom'],
+        tokens: { input: 25, output: 10, total: 35 },
+        modelUsage: {
+          'claude-sonnet-5': { input_tokens: 25, output_tokens: 10, total_tokens: 35 },
+        },
+      };
+    });
+
+    const store = createEventBackedStore();
+    await executeDagWorkflow(
+      createMockDeps(store),
+      createMockPlatform(),
+      'conv-failed-usage',
+      testDir,
+      { name: 'usage-failed', nodes: [{ id: 'n', prompt: 'p' }] },
+      makeWorkflowRun('usage-failed-run'),
+      'claude',
+      'claude-sonnet-5',
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    const failedCall = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls.find(
+      ([arg]) => (arg as { event_type: string }).event_type === 'node_failed'
+    );
+    expect(failedCall).toBeDefined();
+    const data = (failedCall![0] as { data: Record<string, unknown> }).data;
+    expect(data.model_usage).toEqual({
+      'claude-sonnet-5': { input_tokens: 25, output_tokens: 10, total_tokens: 35 },
+    });
+  });
+
+  it('emits exactly one terminal run_token_totals event with summed totals', async () => {
+    let callCount = 0;
+    mockSendQueryDag.mockImplementation(function* () {
+      callCount++;
+      yield { type: 'assistant', content: `done ${String(callCount)}` };
+      yield {
+        type: 'result',
+        sessionId: `usage-session-${String(callCount)}`,
+        tokens:
+          callCount === 1
+            ? { input: 100, output: 50, total: 150 }
+            : { input: 30, output: 20, total: 50 },
+        modelUsage:
+          callCount === 1
+            ? { 'claude-sonnet-5': { input_tokens: 100, output_tokens: 50 } }
+            : { 'claude-sonnet-5': { input_tokens: 30, output_tokens: 20 } },
+      };
+    });
+
+    const store = createEventBackedStore();
+    await executeDagWorkflow(
+      createMockDeps(store),
+      createMockPlatform(),
+      'conv-rollup',
+      testDir,
+      {
+        name: 'usage-rollup',
+        nodes: [
+          { id: 'a', prompt: 'a' },
+          { id: 'b', prompt: 'b', depends_on: ['a'] },
+        ],
+      },
+      makeWorkflowRun('usage-rollup-run'),
+      'claude',
+      'claude-sonnet-5',
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    const rollup = await waitForRunTokenTotals(store);
+    const rollupCalls = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls.filter(
+      ([arg]) => (arg as { event_type: string }).event_type === 'run_token_totals'
+    );
+    expect(rollupCalls.length).toBe(1);
+    expect(rollup).toEqual({
+      by_model: { 'claude-sonnet-5': { input_tokens: 130, output_tokens: 70 } },
+      total_input_tokens: 130,
+      total_output_tokens: 70,
+    });
+  });
+
+  it('completes and emits incomplete rollup when provider returns no usage', async () => {
+    mockSendQueryDag.mockImplementation(function* () {
+      yield { type: 'assistant', content: 'done without usage' };
+      yield { type: 'result', sessionId: 'no-usage-session' };
+    });
+
+    const store = createEventBackedStore();
+    await executeDagWorkflow(
+      createMockDeps(store),
+      createMockPlatform(),
+      'conv-no-usage',
+      testDir,
+      { name: 'no-usage-rollup', nodes: [{ id: 'n', prompt: 'p', model: 'model-no-usage' }] },
+      makeWorkflowRun('no-usage-rollup-run'),
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    expect(store.completeWorkflowRun).toHaveBeenCalled();
+    const rollup = await waitForRunTokenTotals(store);
+    expect(rollup).toEqual({
+      by_model: {},
+      total_input_tokens: 0,
+      total_output_tokens: 0,
+      incomplete: true,
+    });
   });
 });
 

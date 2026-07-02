@@ -3180,6 +3180,9 @@ export function registerApiRoutes(
         return apiError(c, 404, 'Workflow run not found');
       }
       const events = await workflowEventDb.listWorkflowEvents(runId);
+      const tokenTotalsEvent = [...events]
+        .reverse()
+        .find(event => event.event_type === 'run_token_totals');
 
       // Look up the run's conversation platform ID.
       // For web runs (parent_conversation_id set): conversation_id is the worker conversation -> set worker_platform_id
@@ -3210,6 +3213,7 @@ export function registerApiRoutes(
           worker_platform_id: workerPlatformId,
           parent_platform_id: parentPlatformId,
           conversation_platform_id: conversationPlatformId ?? null,
+          ...(tokenTotalsEvent ? { token_totals: tokenTotalsEvent.data } : {}),
         },
         events,
       });

@@ -87,6 +87,7 @@ import type { AgentRegistry } from './agents/registry';
 import { loadContext } from '@archon/persona-context-loader';
 import { deriveEntryRung, computeFrontierCost } from './model-rates';
 import { isDeclaredServedMatch } from './model-alias';
+import { emitRunTokenTotals } from './token-rollup';
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
 let cachedLog: ReturnType<typeof createLogger> | undefined;
@@ -191,6 +192,7 @@ interface WorkflowLevelOptions {
 type NodeExecutionResult = NodeOutput & {
   costUsd?: number;
   tokens?: TokenUsage;
+  modelUsage?: Record<string, unknown>;
   frontierCostUsd?: number;
   /**
    * Declared/requested/served model + mismatch pass-through for the per-run
@@ -1380,7 +1382,7 @@ async function executeNodeInternal(
     const nodeGateResult = pendingGateResults.get(gateResultKey);
     pendingGateResults.delete(gateResultKey);
 
-    deps.store
+    await deps.store
       .createWorkflowEvent({
         workflow_run_id: workflowRun.id,
         event_type: 'node_completed',
@@ -1457,6 +1459,7 @@ async function executeNodeInternal(
       sessionId: newSessionId,
       costUsd: nodeCostUsd,
       ...(nodeTokens ? { tokens: nodeTokens } : {}),
+      ...(nodeModelUsage ? { modelUsage: nodeModelUsage } : {}),
       ...(nodeTokens ? { frontierCostUsd: computeFrontierCost(nodeTokens) } : {}),
       ...(declaredModelId !== undefined ? { declaredModelId } : {}),
       ...(nodeOptions?.model !== undefined ? { requestedModelId: nodeOptions.model } : {}),
@@ -1504,7 +1507,7 @@ async function executeNodeInternal(
     getLog().error({ err, nodeId: node.id }, 'dag_node_failed');
     await logNodeError(logDir, workflowRun.id, node.id, err.message);
 
-    deps.store
+    await deps.store
       .createWorkflowEvent({
         workflow_run_id: workflowRun.id,
         event_type: 'node_failed',
@@ -1515,6 +1518,7 @@ async function executeNodeInternal(
         // node_completed contract.
         data: {
           error: err.message,
+          ...(nodeModelUsage ? { model_usage: nodeModelUsage } : {}),
           ...(nodeTokens ? { tokens: nodeTokens } : {}),
           // Layer 1 gate_result field: present when Phase 5 registered a gate
           // outcome before the SDK threw (e.g. gate check fired then SDK errored).
@@ -1543,6 +1547,7 @@ async function executeNodeInternal(
       error: err.message,
       costUsd: nodeCostUsd,
       ...(nodeTokens ? { tokens: nodeTokens } : {}),
+      ...(nodeModelUsage ? { modelUsage: nodeModelUsage } : {}),
       ...(nodeTokens ? { frontierCostUsd: computeFrontierCost(nodeTokens) } : {}),
       // Mirrors the completed-path fields (same variables, same omit-when-absent
       // convention) so the rollup accumulator's node_model_summary stays
@@ -2315,6 +2320,37 @@ async function executeLoopNode(
   const logEventStoreError = (err: Error, iteration: number): void => {
     getLog().error({ err, nodeId: node.id, iteration }, 'loop_node.iteration_event_failed');
   };
+  const persistLoopNodeFailed = async (error: string): Promise<void> => {
+    await deps.store
+      .createWorkflowEvent({
+        workflow_run_id: workflowRun.id,
+        event_type: 'node_failed',
+        step_name: node.id,
+        data: {
+          error,
+          ...(loopTotalTokens ? { tokens: loopTotalTokens } : {}),
+          ...(workflowModel !== undefined ? { declared_model_id: workflowModel } : {}),
+          ...(resolvedOptions.model !== undefined
+            ? { requested_model_id: resolvedOptions.model }
+            : {}),
+          ...(loopServedModelId !== undefined ? { served_model_id: loopServedModelId } : {}),
+          ...(loopServedMissingReason !== undefined
+            ? { served_model_missing_reason: loopServedMissingReason }
+            : {}),
+          ...(typeof loopServedModelId === 'string' && workflowModel !== undefined
+            ? { served_model_mismatch: !isDeclaredServedMatch(workflowModel, loopServedModelId) }
+            : {}),
+          entry_rung: deriveEntryRung(workflowProvider, workflowModel),
+          ...(loopTotalTokens ? { frontier_cost_usd: computeFrontierCost(loopTotalTokens) } : {}),
+        },
+      })
+      .catch((evtErr: Error) => {
+        getLog().error(
+          { err: evtErr, workflowRunId: workflowRun.id, eventType: 'node_failed' },
+          'workflow_event_persist_failed'
+        );
+      });
+  };
 
   // Sticky signal detection: once the completion token appears in any iteration's
   // output it stays true, so a resumed interactive loop or a reset fullOutput on the
@@ -2593,6 +2629,7 @@ async function executeLoopNode(
         .catch((evtErr: Error) => {
           logEventStoreError(evtErr, i);
         });
+      await persistLoopNodeFailed(`Loop iteration ${i} failed: ${err.message}`);
       return {
         state: 'failed',
         output: '',
@@ -2653,6 +2690,7 @@ async function executeLoopNode(
         .catch((evtErr: Error) => {
           logEventStoreError(evtErr, i);
         });
+      await persistLoopNodeFailed(`Loop iteration ${i} failed: ${emptyError}`);
       return {
         state: 'failed',
         output: '',
@@ -2754,7 +2792,7 @@ async function executeLoopNode(
       );
       // Write node_completed event so resume logic (getCompletedDagNodeOutputs) knows this
       // node is done. Without this, a resumed DAG would re-enter the loop node.
-      deps.store
+      await deps.store
         .createWorkflowEvent({
           workflow_run_id: workflowRun.id,
           event_type: 'node_completed',
@@ -2895,6 +2933,7 @@ async function executeLoopNode(
     'loop_node.max_iterations_reached'
   );
   await safeSendMessage(platform, conversationId, errorMsg, msgContext);
+  await persistLoopNodeFailed(errorMsg);
   return {
     state: 'failed',
     output: lastIterationOutput,
@@ -2971,6 +3010,8 @@ async function executeApprovalNode(
       });
       const cancelMsg = `[ ] Approval node \`${node.id}\` cancelled after ${String(maxAttempts)} rejections.`;
       await safeSendMessage(platform, conversationId, cancelMsg, msgContext);
+      // Terminal state reached: emit 'run_token_totals' rollup event (see token-rollup.ts).
+      void emitRunTokenTotals(deps.store, workflowRun.id);
       return { state: 'completed' as const, output: '' };
     }
 
@@ -3236,6 +3277,17 @@ export async function executeDagWorkflow(
     mismatch?: boolean;
   }[] = [];
   let modelMismatchCount = 0;
+  let runTokenTotalsEmitted = false;
+  function emitTerminalRunTokenTotals(): void {
+    if (runTokenTotalsEmitted) return;
+    runTokenTotalsEmitted = true;
+    emitRunTokenTotals(deps.store, workflowRun.id).catch((err: Error) => {
+      getLog().warn(
+        { err, workflowRunId: workflowRun.id },
+        'dag_run_token_totals_unexpected_throw'
+      );
+    });
+  }
 
   for (let layerIdx = 0; layerIdx < layers.length; layerIdx++) {
     const layer = layers[layerIdx];
@@ -3516,6 +3568,8 @@ export async function executeDagWorkflow(
               nodeId: node.id,
               reason,
             });
+            // Terminal state reached: emit 'run_token_totals' rollup event (see token-rollup.ts).
+            emitTerminalRunTokenTotals();
             // Return completed -- the between-layer status check will see 'cancelled' and break.
             return { nodeId: node.id, output: { state: 'completed' as const, output: reason } };
           }
@@ -3782,6 +3836,8 @@ export async function executeDagWorkflow(
     if (status === 'running') return false;
     getLog().info({ workflowRunId: workflowRun.id, status: status ?? 'deleted' }, logEvent);
     if (status !== 'paused') {
+      // Terminal state reached: emit 'run_token_totals' rollup event (see token-rollup.ts).
+      emitTerminalRunTokenTotals();
       getWorkflowEventEmitter().unregisterRun(workflowRun.id);
     }
     return true;
@@ -3812,6 +3868,8 @@ export async function executeDagWorkflow(
     await deps.store.failWorkflowRun(workflowRun.id, failMsg).catch((dbErr: Error) => {
       getLog().error({ err: dbErr, workflowRunId: workflowRun.id }, 'dag_db_fail_failed');
     });
+    // Terminal state reached: emit 'run_token_totals' rollup event (see token-rollup.ts).
+    emitTerminalRunTokenTotals();
     await logWorkflowError(logDir, workflowRun.id, failMsg).catch((logErr: Error) => {
       getLog().error(
         { err: logErr, workflowRunId: workflowRun.id },
@@ -3843,6 +3901,8 @@ export async function executeDagWorkflow(
     await deps.store.failWorkflowRun(workflowRun.id, failMsg).catch((dbErr: Error) => {
       getLog().error({ err: dbErr, workflowRunId: workflowRun.id }, 'dag_db_fail_failed');
     });
+    // Terminal state reached: emit 'run_token_totals' rollup event (see token-rollup.ts).
+    emitTerminalRunTokenTotals();
     await logWorkflowError(logDir, workflowRun.id, failMsg).catch((logErr: Error) => {
       getLog().error(
         { err: logErr, workflowRunId: workflowRun.id },
@@ -3886,6 +3946,8 @@ export async function executeDagWorkflow(
       ...(nodeModelSummary.length > 0 ? { node_model_summary: nodeModelSummary } : {}),
       ...(modelMismatchCount > 0 ? { model_mismatch_count: modelMismatchCount } : {}),
     });
+    // Terminal state reached: emit 'run_token_totals' rollup event (see token-rollup.ts).
+    emitTerminalRunTokenTotals();
   } catch (dbErr) {
     getLog().error(
       { err: dbErr as Error, workflowRunId: workflowRun.id },
