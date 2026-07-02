@@ -304,9 +304,13 @@ nodes:
       fi
       SERVER_URL="${ARCHON_SERVER_URL:-http://127.0.0.1:3090}"
       CODEBASES_JSON="$ARTIFACTS_DIR/codebases.json"
-      if ! curl -sS --fail "${SERVER_URL}/api/codebases" -o "$CODEBASES_JSON" 2>&1; then
-        echo "ERROR: cannot reach Archon server at ${SERVER_URL}/api/codebases -- registry gate cannot run." >&2
-        echo "Set ARCHON_SERVER_URL or ensure the server is running. NO SILENT FALLBACK." >&2
+      # /api/codebases requires the operator token (401 without it). The executor
+      # subprocess inherits the container env, so ARCHON_OPERATOR_TOKEN is present.
+      # Anchor: canary run 63f255b1 (2026-07-01, this lane's FIRST fire) failed here
+      # with a misleading "cannot reach" -- the server was up; the curl was unauthed.
+      if ! curl -sS --fail "${SERVER_URL}/api/codebases"              -H "x-archon-operator-token: ${ARCHON_OPERATOR_TOKEN:-}"              -o "$CODEBASES_JSON" 2>&1; then
+        echo "ERROR: /api/codebases unreachable or unauthorized at ${SERVER_URL} -- registry gate cannot run." >&2
+        echo "Check ARCHON_OPERATOR_TOKEN in executor env and ARCHON_SERVER_URL. NO SILENT FALLBACK." >&2
         exit 1
       fi
       ENRICHED="$ARTIFACTS_DIR/stages-enriched.json"
