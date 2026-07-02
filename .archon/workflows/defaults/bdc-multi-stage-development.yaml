@@ -401,7 +401,13 @@ nodes:
         echo "ERROR: stages-enriched.json missing" >&2
         exit 1
       fi
-      WO_ID="${WO_ID:-$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'WO-[A-Z0-9-]+' | head -n 1 || true)}"
+      # TEMPLATE GOTCHA (skill Rule 2 class): unbraced $USER_MESSAGE is a parse-time
+      # template token (executor-shared ~392); the braced ${USER_MESSAGE:-} form is
+      # invisible to the substitution regex and reads an env var that does not exist.
+      # Anchor: canary run d8fd014c died here with "WO_ID unresolvable" while
+      # read-spec (unbraced form) resolved the same WO fine in the same run.
+      USER_MSG_SUBST="$USER_MESSAGE"
+      WO_ID="${WO_ID:-$(printf '%s\n' "$USER_MSG_SUBST" | grep -Eo 'WO-[A-Z0-9-]+' | head -n 1 || true)}"
       if [ -z "$WO_ID" ]; then
         echo "ERROR: WO_ID unresolvable for branch derivation" >&2
         exit 1
