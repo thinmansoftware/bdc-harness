@@ -7,7 +7,7 @@
     "fusion": "./src/cli.ts"
   },
   "scripts": {
-    "test": "bun test src/__tests__/gateway.test.ts && bun test src/__tests__/integrity.test.ts && bun test src/__tests__/redact.test.ts && bun test src/__tests__/full-run.test.ts",
+    "test": "bun test src/__tests__/gateway.test.ts && bun test src/__tests__/integrity.test.ts && bun test src/__tests__/redact.test.ts && bun test src/__tests__/full-run.test.ts && bun test src/__tests__/routing.test.ts && bun test src/__tests__/persona-sections.test.ts && bun test src/__tests__/dissent.test.ts",
     "type-check": "bun x tsc --noEmit"
   },
   "dependencies": {

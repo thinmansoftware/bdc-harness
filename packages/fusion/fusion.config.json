@@ -11,6 +11,42 @@
       "modelId": "z-ai/glm-5.2",
       "role": "implementation-systems",
       "promptTemplate": "reviewer-implementation.txt"
+    },
+    {
+      "id": "product-advocate",
+      "modelId": "anthropic/claude-opus-4-5",
+      "role": "product-user-advocate",
+      "promptTemplate": "reviewer-product-advocate.txt"
+    },
+    {
+      "id": "contrarian",
+      "modelId": "z-ai/glm-5.2",
+      "role": "contrarian-kill-switch",
+      "promptTemplate": "reviewer-contrarian.txt"
+    },
+    {
+      "id": "prior-art-scout",
+      "modelId": "anthropic/claude-opus-4-5",
+      "role": "prior-art-scout",
+      "promptTemplate": "reviewer-prior-art-scout.txt"
+    },
+    {
+      "id": "buyer-critic",
+      "modelId": "z-ai/glm-5.2",
+      "role": "buyer-money-critic",
+      "promptTemplate": "reviewer-buyer-critic.txt"
+    },
+    {
+      "id": "operator-friction",
+      "modelId": "anthropic/claude-opus-4-5",
+      "role": "operator-friction-critic",
+      "promptTemplate": "reviewer-operator-friction.txt"
+    },
+    {
+      "id": "security-tenant-pii",
+      "modelId": "z-ai/glm-5.2",
+      "role": "security-tenant-pii-critic",
+      "promptTemplate": "reviewer-security-tenant-pii.txt"
     }
   ],
   "synthesizer": {

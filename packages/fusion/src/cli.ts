@@ -25,7 +25,14 @@ import { loadConfig } from './config.js';
 import { buildInputMd, runRound1, runSynthesizer } from './rounds.js';
 import { buildManifest } from './manifest.js';
 import { buildSynthesisMd } from './synthesis.js';
-import type { FusionInputs, ModelGateway, ModelCallRequest, ModelCallResult } from './types.js';
+import { isWoType, selectReviewers, assertReviewerDiversity, WO_TYPES } from './routing.js';
+import type {
+  FusionConfig,
+  FusionInputs,
+  ModelGateway,
+  ModelCallRequest,
+  ModelCallResult,
+} from './types.js';
 
 // ---------------------------------------------------------------------------
 // Stub gateway for smoke testing
@@ -85,6 +92,7 @@ interface CliArgs {
   manifest?: string;
   ci?: string;
   config?: string;
+  woType?: string;
   outDir: string;
 }
 
@@ -128,6 +136,10 @@ function parseArgs(argv: string[]): CliArgs {
         result.config = next;
         i++;
         break;
+      case '--wo-type':
+        result.woType = next;
+        i++;
+        break;
       case '--out-dir':
         result.outDir = next ?? './fusion-runs';
         i++;
@@ -155,6 +167,7 @@ function printHelp(): void {
       '    --manifest <path> \\\n' +
       '    [--ci <path>] \\\n' +
       '    [--config <path>] \\\n' +
+      '    [--wo-type <type>] \\\n' +
       '    [--out-dir <path>]\n' +
       '\n' +
       'Options:\n' +
@@ -164,6 +177,10 @@ function printHelp(): void {
       '  --manifest Path to builder manifest file\n' +
       '  --ci       Path to Captain CI output file (optional)\n' +
       '  --config   Path to fusion.config.json (default: package root)\n' +
+      '  --wo-type  WO type for persona routing (optional; omit = full roster).\n' +
+      '             One of: ' +
+      WO_TYPES.join(', ') +
+      '\n' +
       '  --out-dir  Output directory for run folder (default: ./fusion-runs)\n' +
       '\n' +
       'Environment:\n' +
@@ -252,6 +269,40 @@ async function runReview(args: CliArgs): Promise<void> {
       config.synthesizer.modelId
   );
 
+  // Persona routing: when --wo-type is provided, filter the roster down to the
+  // personas the Mode Matrix requires for that WO type (spec section 8). When it
+  // is absent, the full configured roster runs (unchanged behavior).
+  let runConfig: FusionConfig = config;
+  if (args.woType !== undefined) {
+    if (!isWoType(args.woType)) {
+      console.error(
+        'Error: unknown --wo-type "' + args.woType + '". Valid types: ' + WO_TYPES.join(', ')
+      );
+      process.exit(1);
+    }
+    const selected = selectReviewers(config.reviewers, args.woType);
+    if (selected.length === 0) {
+      console.error(
+        'Error: WO type "' +
+          args.woType +
+          '" selected no configured reviewers. Check fusion.config.json roster.'
+      );
+      process.exit(1);
+    }
+    // Self-review guard (v1-scoped Test 7 proxy) -- throws (non-zero exit) if the
+    // selection cannot support any cross-model review. Fail closed on purpose.
+    assertReviewerDiversity(selected);
+    runConfig = { ...config, reviewers: selected };
+    console.log(
+      'WO type "' +
+        args.woType +
+        '" -> ' +
+        selected.length.toString() +
+        ' persona(s): ' +
+        selected.map(r => r.id).join(', ')
+    );
+  }
+
   // Select gateway
   const useStub = process.env.FUSION_STUB_GATEWAY === '1';
   const gateway: ModelGateway = useStub ? makeStubGateway() : callModel;
@@ -299,7 +350,7 @@ async function runReview(args: CliArgs): Promise<void> {
 
   // Round 1: parallel reviewer fan-out
   console.log('Round 1: Sending to reviewers...');
-  const reviewerResults = await runRound1(config, inputMd, gateway);
+  const reviewerResults = await runRound1(runConfig, inputMd, gateway);
 
   const outputFiles: string[] = ['input.md'];
 
@@ -316,14 +367,14 @@ async function runReview(args: CliArgs): Promise<void> {
   }
 
   // Round 2: gated off in v0.1
-  if (config.enableRound2) {
+  if (runConfig.enableRound2) {
     console.log('\nRound 2: (gated off in v0.1 config)\n');
   }
 
   // Round 3: synthesizer
   console.log('\nRound 3: Running synthesizer...');
   const synthesizerResult = await runSynthesizer(
-    config,
+    runConfig,
     reviewerResults,
     secretFindings,
     inputMd,
