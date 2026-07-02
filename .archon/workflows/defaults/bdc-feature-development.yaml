@@ -521,7 +521,7 @@ nodes:
       # negative is what would have misrouted every legitimate build to BLOCKED.
       BASE=$(cat "$ARTIFACTS_DIR/run-start-sha.txt" 2>/dev/null || echo "")
       HEAD_NOW=$(git -C "$WT" rev-parse HEAD 2>/dev/null || echo "")
-      CHANGED=$(git -C "$WT" status --porcelain 2>/dev/null | grep -c . || echo 0)
+      CHANGED=$(git -C "$WT" status --porcelain 2>/dev/null | grep -c . || true)
       # commits since run start (real work this run produced, even after a checkpoint push)
       if [ -n "$BASE" ] && [ "$BASE" != "unknown" ] && [ -n "$HEAD_NOW" ]; then
         AHEAD=$(git -C "$WT" rev-list --count "${BASE}..HEAD" 2>/dev/null || echo 0)
@@ -1069,13 +1069,28 @@ nodes:
         reviewer named, in scope, in this worktree.
       - Judge ONLY against this worktree (no origin/main, no sibling worktrees). NEVER
         fabricate a diff from already-merged commits.
+      - Before choosing a final OPUS_REPAIR value, resolve the assigned worktree with
+        `WT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)` and run git commands
+        from that exact CWD (`git -C "$WT" ...`). If you claim OPUS_REPAIR=fixed while
+        `git -C "$WT" status --porcelain` is empty AND there are no commits in this run
+        since `$ARTIFACTS_DIR/run-start-sha.txt`, emit
+        SELF_CONSISTENCY_ERROR=claimed-fixed-with-no-worktree-diff and choose
+        OPUS_REPAIR=needs-human instead. A fixed claim without a real in-worktree diff
+        is a false completion.
 
       ## Output (last lines)
       - If you resolved it (real in-scope changes now exist in this worktree):
+          ROOT_CAUSE=<one sentence naming why the original block happened>
+          FILES_CHANGED:
+          - <path>   (repeat)
+          TEST_EVIDENCE=<command/output summary, or N/A with reason>
           OPUS_REPAIR=fixed
       - If it is genuinely already-satisfied (no work needed in this worktree):
+          ROOT_CAUSE=<one sentence naming why the run produced no diff>
+          SATISFIED_EVIDENCE=<one line naming the deliverables verified in this worktree>
           OPUS_REPAIR=already-satisfied
       - If you could NOT resolve it and a human must decide:
+          ROOT_CAUSE=<one sentence naming the blocker>
           OPUS_REPAIR=needs-human
           REASON=<one sentence>
 
@@ -1089,8 +1104,22 @@ nodes:
     bash: |
       set -uo pipefail
       OPUS=$opus-repair.output
+      WT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
+      BASE=$(cat "$ARTIFACTS_DIR/run-start-sha.txt" 2>/dev/null || echo "")
+      HEAD_NOW=$(git -C "$WT" rev-parse HEAD 2>/dev/null || echo "")
+      CHANGED=$(git -C "$WT" status --porcelain 2>/dev/null | grep -c . || true)
+      if [ -n "$BASE" ] && [ "$BASE" != "unknown" ] && [ -n "$HEAD_NOW" ]; then
+        AHEAD=$(git -C "$WT" rev-list --count "${BASE}..HEAD" 2>/dev/null || echo 0)
+      else
+        AHEAD=$(git -C "$WT" rev-list --count HEAD --not --remotes 2>/dev/null || echo 0)
+      fi
       if printf '%s\n' "$OPUS" | grep -q '^OPUS_REPAIR=fixed'; then
-        printf '{"fixed":"true"}\n'
+        if [ "${CHANGED:-0}" -gt 0 ] || [ "${AHEAD:-0}" -gt 0 ]; then
+          printf '{"fixed":"true","changed":%s,"commits_since_run_start":%s}\n' "${CHANGED:-0}" "${AHEAD:-0}"
+        else
+          echo "SELF_CONSISTENCY_ERROR=opus-repair-claimed-fixed-with-no-worktree-diff" >&2
+          printf '{"fixed":"false","note":"SELF_CONSISTENCY_ERROR","changed":0,"commits_since_run_start":0}\n'
+        fi
       else
         printf '{"fixed":"false"}\n'
       fi
@@ -1113,6 +1142,14 @@ nodes:
       ONLY the current worktree diff (the post-repair state). Read-only. Judge ONLY this worktree
       (no origin/main, no sibling worktrees; never fabricate a diff from already-merged commits).
       Confirm the build now satisfies the WO and introduces no regression or unsafe behavior.
+      Resolve the CWD first, then inspect the actual repair delta from that worktree only:
+        WT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
+        BASE=$(cat "$ARTIFACTS_DIR/run-start-sha.txt" 2>/dev/null || git -C "$WT" rev-parse HEAD~1)
+        git -C "$WT" diff "$BASE"..HEAD
+        git -C "$WT" diff HEAD
+      If that combined diff is empty while opus-repair reported OPUS_REPAIR=fixed, emit
+      OPUS_REREVIEW=needs_revision and include
+      SELF_CONSISTENCY_ERROR=opus-repair-claimed-fixed-with-no-worktree-diff in UNRESOLVED.
 
       ## What opus-repair reported
       $opus-repair.output
@@ -1184,8 +1221,12 @@ nodes:
         else
           printf '{"status":"BLOCKED","note":"opus-made-changes-rereview-failed"}\n'
         fi
-      elif printf '%s\n' "$OPUS" | grep -q '^OPUS_REPAIR=already-satisfied'; then
+      elif printf '%s\n' "$OPUS" | grep -q '^OPUS_REPAIR=already-satisfied' \
+           && printf '%s\n' "$OPUS" | grep -q '^ROOT_CAUSE=' \
+           && printf '%s\n' "$OPUS" | grep -q '^SATISFIED_EVIDENCE='; then
         printf '{"status":"ALREADY_SATISFIED","note":"opus-confirmed-already-satisfied"}\n'
+      elif printf '%s\n' "$OPUS" | grep -q '^OPUS_REPAIR=already-satisfied'; then
+        printf '{"status":"BLOCKED","note":"opus-already-satisfied-missing-root-cause-or-evidence"}\n'
       else
         printf '{"status":"BLOCKED","note":"opus-could-not-resolve"}\n'
       fi
