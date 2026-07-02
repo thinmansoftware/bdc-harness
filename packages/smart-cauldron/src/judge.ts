@@ -15,7 +15,7 @@
  * counted as "too hard" (gate failures). They trigger alert escalation instead.
  */
 
-import { classifyError } from '@archon/overseer/classify';
+import { classifyError } from '../../overseer/src/classify';
 import type { GateVerdict, PollResult, FireResult, TierOutcome } from './types.js';
 
 /**

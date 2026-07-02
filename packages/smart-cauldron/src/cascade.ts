@@ -25,8 +25,7 @@ import { pollForTerminal, TimeoutError } from './poll.js';
 import { judgeGate, classifyAttemptOutcome } from './judge.js';
 import { writeRecord } from './recorder.js';
 import { cancelRun } from './cancel.js';
-import { classifyError } from '@archon/overseer/classify';
-import { runEscalation } from '@archon/overseer/escalate';
+import { classifyError } from '../../overseer/src/classify';
 import type {
   CascadeRunRecord,
   CascadeAttempt,
@@ -37,7 +36,8 @@ import type {
   FireResult,
   PollResult,
 } from './types.js';
-import type { DecisionResult } from '@archon/overseer/decide';
+import type { ErrorClass } from '../../overseer/src/classify';
+import type { DecisionResult } from '../../overseer/src/decide';
 
 // ---------------------------------------------------------------------------
 // Dependency injection interface (for testability)
@@ -498,14 +498,15 @@ async function defaultEscalate(ctx: EscalationCallContext): Promise<void> {
     decision: 'escalate',
     reason: ctx.reason,
     escalationContext: {
-      errorClass: ctx.errorClass as import('@archon/overseer/classify').ErrorClass,
+      errorClass: ctx.errorClass as ErrorClass,
       woId: ctx.woId,
       remediation: ctx.remediation,
     },
   };
 
+  const { runEscalation } = await import('../../overseer/src/escalate');
   await runEscalation(ctx.runId ?? `cascade-${randomUUID()}`, decision, {
-    errorClass: ctx.errorClass as import('@archon/overseer/classify').ErrorClass,
+    errorClass: ctx.errorClass as ErrorClass,
     woId: ctx.woId,
     remediation: ctx.remediation,
   });
