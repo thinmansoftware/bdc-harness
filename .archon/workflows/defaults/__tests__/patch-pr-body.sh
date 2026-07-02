@@ -16,8 +16,9 @@
 #   4. Files created/modified lists derive from git diff --name-status (no
 #      preserved files leaking in).
 #   5. Label extraction from build-manifest output.
-#   6. Idempotent re-patch: running twice yields ONE manifest block, not two.
-#   7. PROSE preservation: original PR body content above the sentinel survives.
+#   6. manifest-consistency-check: false-negative PR claims fail closed.
+#   7. Idempotent re-patch: running twice yields ONE manifest block, not two.
+#   8. PROSE preservation: original PR body content above the sentinel survives.
 #
 # Run: bash .archon/workflows/defaults/__tests__/patch-pr-body.sh
 # Exits 0 on all-pass, 1 on any failure.
@@ -457,21 +458,35 @@ rm -rf "$INJECTION_TMP"
 # Test 6: manifest-consistency-check -- false-negative PR claims fail closed
 # -----------------------------------------------------------------------------
 echo "--- Test 6: manifest-consistency-check false-negative guard ---"
-manifest_consistency_check() {
-  local status="$1" pr_url="$2" manifest="$3"
-  local prs_line prs_lower
-  prs_line=$(extract PRs "$manifest")
-  if [ "$status" = "PROCEED" ] && [ -n "$pr_url" ]; then
-    prs_lower=$(printf '%s\n' "$prs_line" | tr '[:upper:]' '[:lower:]')
-    if printf '%s\n' "$prs_lower" | grep -Eq 'no commit|no pr|not opened|n/a' \
-      && ! printf '%s\n' "$prs_line" | grep -Fq "$pr_url"; then
-      printf 'SELF_CONSISTENCY_ERROR: build-manifest claims "%s" but block-reclassify=PROCEED and open-pr-if-needed resolved PR_URL=%s' \
-        "$prs_line" "$pr_url" >&2
-      return 1
-    fi
-  fi
-  printf 'OK'
+CANONICAL_WORKFLOW="${CANONICAL_WORKFLOW:-.archon/workflows/defaults/bdc-feature-development.yaml}"
+
+manifest_consistency_guard_block() {
+  awk '
+    index($0, "if [ \"$STATUS\" = \"PROCEED\" ] && [ -n \"$PR_URL\" ]; then") { capture=1 }
+    capture { sub(/^      /, ""); print }
+    capture && /printf '\''OK\\n'\''/ { exit }
+  ' "$CANONICAL_WORKFLOW"
 }
+
+MANIFEST_CONSISTENCY_GUARD=$(manifest_consistency_guard_block)
+assert_contains "guard test executes extracted workflow block" \
+  "SELF_CONSISTENCY_ERROR: build-manifest claims" "$MANIFEST_CONSISTENCY_GUARD"
+assert_contains "guard test covers false-negative PR pattern from workflow" \
+  "no commit|no pr|not opened|n/a" "$MANIFEST_CONSISTENCY_GUARD"
+
+manifest_consistency_check() (
+  STATUS="$1"
+  PR_URL="$2"
+  MANIFEST_OUT="$3"
+  ARTIFACTS_DIR="${ARTIFACTS_DIR:-}"
+
+  extract() {
+    { printf '%s\n' "$MANIFEST_OUT" | grep -E "^${1}:" | head -1 | sed "s/^${1}:[[:space:]]*//"; } || true
+  }
+  PRS_LINE=$(extract "PRs")
+
+  eval "$MANIFEST_CONSISTENCY_GUARD"
+)
 
 PR_URL_FIXTURE="https://github.com/bluedevilcollectibles/bdc-harness/pull/405"
 MF_FALSE_NEGATIVE=$'WO: WO-X\nPRs: N/A (no commit was made; HEAD still equals RUN_START_SHA a00f47d; no PR opened)\nVALIDATION: FAIL'
