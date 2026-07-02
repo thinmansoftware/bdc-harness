@@ -14,6 +14,7 @@ export const WORKFLOW_EVENT_TYPES = [
   'dag_workflow_failed',
   'node_started',
   'node_completed',
+  'run_token_totals',
   // WO-170: emitted when a node exited 0 but stdout contained STATUS=*_failed.
   // Mission Control renders this yellow (between green completed and red failed).
   'node_completed_with_warning',
@@ -39,6 +40,16 @@ export const WORKFLOW_EVENT_TYPES = [
 ] as const;
 
 export type WorkflowEventType = (typeof WORKFLOW_EVENT_TYPES)[number];
+
+export interface WorkflowEventRecord {
+  id: string;
+  workflow_run_id: string;
+  event_type: string;
+  step_index: number | null;
+  step_name: string | null;
+  data: Record<string, unknown>;
+  created_at: string;
+}
 
 export interface IWorkflowStore {
   // Run lifecycle
@@ -98,6 +109,7 @@ export interface IWorkflowStore {
     step_name?: string;
     data?: Record<string, unknown>;
   }): Promise<void>;
+  listWorkflowEvents(workflowRunId: string): Promise<WorkflowEventRecord[]>;
 
   /**
    * Return a map of nodeId -> output for all node_completed events

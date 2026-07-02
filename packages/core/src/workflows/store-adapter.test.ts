@@ -33,9 +33,11 @@ mock.module('../db/workflows', () => ({
 }));
 
 const mockCreateWorkflowEvent = mock(() => Promise.resolve());
+const mockListWorkflowEvents = mock(() => Promise.resolve([]));
 const mockGetCompletedDagNodeOutputs = mock(() => Promise.resolve(new Map<string, string>()));
 mock.module('../db/workflow-events', () => ({
   createWorkflowEvent: mockCreateWorkflowEvent,
+  listWorkflowEvents: mockListWorkflowEvents,
   getCompletedDagNodeOutputs: mockGetCompletedDagNodeOutputs,
 }));
 
@@ -72,6 +74,7 @@ describe('createWorkflowStore', () => {
       'pauseWorkflowRun',
       'cancelWorkflowRun',
       'createWorkflowEvent',
+      'listWorkflowEvents',
       'getCompletedDagNodeOutputs',
       'getCodebase',
       'getCodebaseEnvVars',
@@ -117,6 +120,25 @@ describe('createWorkflowStore', () => {
     const result = await store.getCompletedDagNodeOutputs('run-123');
     expect(result).toBe(expected);
     expect(mockGetCompletedDagNodeOutputs).toHaveBeenCalledWith('run-123');
+  });
+
+  test('delegates listWorkflowEvents to DB', async () => {
+    const expected = [
+      {
+        id: 'evt-1',
+        workflow_run_id: 'run-123',
+        event_type: 'run_token_totals',
+        step_index: null,
+        step_name: null,
+        data: {},
+        created_at: '2026-07-02T00:00:00.000Z',
+      },
+    ];
+    mockListWorkflowEvents.mockResolvedValueOnce(expected);
+    const store = createWorkflowStore();
+    const result = await store.listWorkflowEvents('run-123');
+    expect(result).toBe(expected);
+    expect(mockListWorkflowEvents).toHaveBeenCalledWith('run-123');
   });
 
   test('delegates cancelWorkflowRun to DB', async () => {

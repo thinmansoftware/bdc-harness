@@ -1432,9 +1432,22 @@ describe('GET /api/workflows/runs/:runId', () => {
       },
       created_at: NOW,
     };
+    const tokenTotalsEvent: MockWorkflowEvent = {
+      id: 'evt-rollup-1',
+      workflow_run_id: 'run-tok-detail-1',
+      event_type: 'run_token_totals',
+      step_index: null,
+      step_name: null,
+      data: {
+        by_model: { 'claude-sonnet-5': { input_tokens: 1000, output_tokens: 500 } },
+        total_input_tokens: 1000,
+        total_output_tokens: 500,
+      },
+      created_at: NOW,
+    };
 
     mockGetWorkflowRun.mockImplementationOnce(async () => runWithTokens);
-    mockListWorkflowEvents.mockImplementationOnce(async () => [eventWithTokens]);
+    mockListWorkflowEvents.mockImplementationOnce(async () => [eventWithTokens, tokenTotalsEvent]);
     mockGetConversationById.mockImplementationOnce(async () => ({
       id: 'conv-uuid-1',
       platform_conversation_id: 'web-conv-abc',
@@ -1445,7 +1458,10 @@ describe('GET /api/workflows/runs/:runId', () => {
     expect(response.status).toBe(200);
 
     const body = (await response.json()) as {
-      run: { metadata: { total_tokens?: number; total_cost_usd?: number } };
+      run: {
+        metadata: { total_tokens?: number; total_cost_usd?: number };
+        token_totals?: Record<string, unknown>;
+      };
       events: Array<{
         event_type: string;
         data: { tokens?: { input: number; output: number; total: number } };
@@ -1453,7 +1469,8 @@ describe('GET /api/workflows/runs/:runId', () => {
     };
     expect(body.run.metadata.total_tokens).toBe(2300);
     expect(body.run.metadata.total_cost_usd).toBe(0.005);
-    expect(body.events.length).toBe(1);
+    expect(body.run.token_totals).toEqual(tokenTotalsEvent.data);
+    expect(body.events.length).toBe(2);
     expect(body.events[0]?.data.tokens).toEqual({ input: 1000, output: 500, total: 1500 });
   });
 
