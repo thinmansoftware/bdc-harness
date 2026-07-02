@@ -5,7 +5,8 @@
  * Independent nodes within the same layer run concurrently via Promise.allSettled.
  * Captures all assistant output regardless of streaming mode for $node_id.output substitution.
  */
-import { readFile } from 'fs/promises';
+import { chmod, mkdir, readFile, unlink, writeFile } from 'fs/promises';
+import { tmpdir } from 'os';
 import { isAbsolute, join, resolve as resolvePath } from 'path';
 import { execFileAsync } from '@archon/git';
 import { discoverScriptsForCwd } from './script-discovery';
@@ -1568,7 +1569,7 @@ const SUBPROCESS_DEFAULT_TIMEOUT = 120_000;
 
 /**
  * Execute a bash (shell script) DAG node.
- * Runs the script via `bash -c`, captures stdout as node output.
+ * Runs the script via a temp file, captures stdout as node output.
  * No AI session is created -- bash nodes are free/deterministic.
  */
 async function executeBashNode(
@@ -1651,12 +1652,30 @@ async function executeBashNode(
     ...(envVars ?? {}),
   };
 
+  const safeNodeId = node.id.replace(/[^A-Za-z0-9._-]/g, '_');
+  const safeRunId = workflowRun.id.replace(/[^A-Za-z0-9._-]/g, '_');
+  const scriptDir = artifactsDir || tmpdir();
+  const scriptFile = join(scriptDir, `node-${safeNodeId}-${safeRunId}.sh`);
+
   try {
-    const { stdout, stderr } = await execFileAsync('bash', ['-c', finalScript], {
-      cwd,
-      timeout,
-      env: subprocessEnv,
-    });
+    let stdout = '';
+    let stderr = '';
+    try {
+      await mkdir(scriptDir, { recursive: true });
+      await writeFile(scriptFile, finalScript, { mode: 0o600 });
+      await chmod(scriptFile, 0o600);
+      ({ stdout, stderr } = await execFileAsync('bash', [scriptFile], {
+        cwd,
+        timeout,
+        env: subprocessEnv,
+      }));
+    } finally {
+      try {
+        await unlink(scriptFile);
+      } catch {
+        // Best-effort cleanup: deletion failures must not change node outcome.
+      }
+    }
 
     // Trim trailing newline from stdout (common shell behavior)
     const output = stdout.replace(/\n$/, '');
