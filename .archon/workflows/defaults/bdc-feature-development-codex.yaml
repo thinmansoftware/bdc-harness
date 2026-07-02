@@ -187,6 +187,12 @@ nodes:
 
   - id: plan
     persona: war-council-architect
+    # Provider pin: persona war-council-architect declares model: sonnet; the lane
+    # default (provider: codex) must never receive an Anthropic alias. Mirror of #313
+    # which pinned the tail nodes but missed plan/plan-review. Anchor: runs 723842fe,
+    # 10f6add0, 28e98197 (2026-07-01) all died at plan with the persona fault.
+    provider: claude
+    model: sonnet
     depends_on: [gate-already-satisfied]
     agent: war-council-architect
     task_class: medium_work
@@ -232,6 +238,12 @@ nodes:
   # async escalation payload, and only at the irreversible-action boundary downstream.
   - id: plan-review
     persona: war-council-architect
+    # Provider pin: persona war-council-architect declares model: sonnet; the lane
+    # default (provider: codex) must never receive an Anthropic alias. Mirror of #313
+    # which pinned the tail nodes but missed plan/plan-review. Anchor: runs 723842fe,
+    # 10f6add0, 28e98197 (2026-07-01) all died at plan with the persona fault.
+    provider: claude
+    model: sonnet
     agent: war-council-architect
     depends_on: [plan]
     task_class: medium_work
