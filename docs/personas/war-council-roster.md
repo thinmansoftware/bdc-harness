@@ -141,3 +141,39 @@ reviewer set.
   required and preserved; missing reviewers force a conservative ruling.
 - **Safety outranks value.** The Security/Tenant/PII Critic is blocking-capable;
   Buyer Critic and other seats may not override a real safety finding.
+
+## Open decisions (require General/John sign-off)
+
+These are explicit, isolated design assumptions made by this WO. Each is safe by
+construction (advisory-only routing, fail-closed guard, stricter-when-in-doubt),
+but each should be confirmed before the routing is relied on. None is a code
+defect; changing any of them without confirmation would itself be an unconfirmed
+architecture change, so they are surfaced here rather than silently altered.
+
+1. **"Adversarial Reviewer" -> `systems`** (`routing.ts`
+   `PERSONA_LABEL_TO_REVIEWER_ID`). The Mode Matrix label is mapped to the
+   existing `systems` reviewer (`role: implementation-systems`) as the closest
+   analog to the main DAG's `codex-adversarial-reviewer`. If the intended
+   adversarial analog is a distinct persona, this is a one-line change in a single
+   named constant; the Mode Matrix rows for `harness-automation`,
+   `ux-app-feature`, `data-billing-inventory`, and `emergency-repair` all resolve
+   through it. **Decision needed:** confirm `systems` is the correct adversarial
+   analog, or name the persona to use.
+
+2. **Self-review guard is a v1 proxy** (`routing.ts` `assertReviewerDiversity`).
+   Fusion has no builder-model concept today, so the guard fails closed when a
+   selection collapses to a single shared model rather than performing the spec's
+   literal builder-model-vs-reviewer-model comparison. A single-reviewer selection
+   (e.g. `small-mechanical-bugfix` -> `systems`) passes the guard; if the builder
+   ran that same model it would be an undetected self-review. **Decision needed:**
+   confirm shipping v1 without builder-model plumbing is acceptable (full check is
+   a candidate follow-up WO), or expand scope to thread builder model through
+   `FusionInputs` / the CLI.
+
+3. **`emergency-repair` requires the Security/Tenant/PII Critic unconditionally**
+   (`routing.ts` `MODE_MATRIX`). Spec section 8 adds this seat only "if
+   data/billing is involved"; v1 keeps it required so the stricter set is used
+   when in doubt (consistent with the "use the stricter reviewer set" routing
+   rule). This is a deliberate safe-side deviation, not a silent divergence.
+   **Decision needed:** confirm the stricter always-required behavior is approved,
+   or make it conditional on a data/billing signal.
