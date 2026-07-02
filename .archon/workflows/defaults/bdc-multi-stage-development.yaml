@@ -420,23 +420,33 @@ nodes:
       # then walk up from CWD, then probe canonical install paths. FAIL CLOSED
       # if we cannot find it -- no silent fallback to raw git.
       MARKER_REL="packages/isolation/src/stage-allocator.ts"
+      # A valid root needs the marker AND materialized workspace deps -- the shim's
+      # substrate import pulls @archon/git etc., which only resolve where bun install
+      # has linked the workspace (node_modules/@archon). Anchor: canary run 162b3dca --
+      # the CWD walk-up matched the FRESH WORKTREE (bdc-harness-target runs), whose
+      # node_modules was never populated, and bun died "Cannot find module @archon/git".
+      root_valid() { [ -f "$1/$MARKER_REL" ] && [ -d "$1/node_modules/@archon" ]; }
       HARNESS_ROOT=""
-      if [ -n "${HARNESS_ROOT_OVERRIDE:-}" ] && [ -f "${HARNESS_ROOT_OVERRIDE}/${MARKER_REL}" ]; then
+      if [ -n "${HARNESS_ROOT_OVERRIDE:-}" ] && root_valid "${HARNESS_ROOT_OVERRIDE}"; then
         HARNESS_ROOT="${HARNESS_ROOT_OVERRIDE}"
       fi
       if [ -z "$HARNESS_ROOT" ]; then
         D="$(pwd)"
         while [ -n "$D" ] && [ "$D" != "/" ]; do
-          if [ -f "$D/$MARKER_REL" ]; then HARNESS_ROOT="$D"; break; fi
+          if root_valid "$D"; then HARNESS_ROOT="$D"; break; fi
           D="$(dirname "$D")"
         done
       fi
       if [ -z "$HARNESS_ROOT" ]; then
+        # /app first: the running image always has installed workspace deps. The
+        # source clone lacks @archon links (verified 2026-07-02). /app may lag dev
+        # until the next image rebuild -- acceptable; the substrate is stable code.
         for candidate in \
+          "/app" \
           "/.archon/workspaces/bluedevilcollectibles/bdc-harness/source" \
           "${ARCHON_HOME:-$HOME/.archon}/workspaces/bluedevilcollectibles/bdc-harness/source" \
           "$HOME/.archon/workspaces/bluedevilcollectibles/bdc-harness/source"; do
-          if [ -f "$candidate/$MARKER_REL" ]; then HARNESS_ROOT="$candidate"; break; fi
+          if root_valid "$candidate"; then HARNESS_ROOT="$candidate"; break; fi
         done
       fi
       if [ -z "$HARNESS_ROOT" ]; then
