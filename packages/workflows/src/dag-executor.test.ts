@@ -8934,6 +8934,67 @@ describe('executeDagWorkflow -- token telemetry persistence and rollup', () => {
     return store;
   }
 
+  function createPersistedEventStore(delayNodeCompletedStep?: string): IWorkflowStore {
+    const store = createMockStore();
+    const persistedEvents: Array<{
+      id: string;
+      workflow_run_id: string;
+      event_type: string;
+      step_index: number | null;
+      step_name: string | null;
+      data: Record<string, unknown>;
+      created_at: string;
+    }> = [];
+    let cancelled = false;
+    let delayedNodePersistStarted = false;
+
+    (store.cancelWorkflowRun as Mock<(id: string) => Promise<void>>).mockImplementation(
+      async () => {
+        cancelled = true;
+      }
+    );
+    (store.getWorkflowRunStatus as Mock<(id: string) => Promise<string>>).mockImplementation(
+      async () => (cancelled && delayedNodePersistStarted ? 'cancelled' : 'running')
+    );
+    (store.createWorkflowEvent as Mock<(event: Record<string, unknown>) => Promise<void>>)
+      .mockImplementation(async event => {
+        if (
+          event.event_type === 'node_completed' &&
+          event.step_name === delayNodeCompletedStep
+        ) {
+          delayedNodePersistStarted = true;
+          await new Promise(resolve => setTimeout(resolve, 10));
+        }
+        const index = persistedEvents.length;
+        persistedEvents.push({
+          id: `evt-${String(index)}`,
+          workflow_run_id: String(event.workflow_run_id),
+          event_type: String(event.event_type),
+          step_index: typeof event.step_index === 'number' ? event.step_index : null,
+          step_name: typeof event.step_name === 'string' ? event.step_name : null,
+          data:
+            event.data !== undefined && typeof event.data === 'object' && event.data !== null
+              ? (event.data as Record<string, unknown>)
+              : {},
+          created_at: `2026-07-02T00:00:${String(index).padStart(2, '0')}.000Z`,
+        });
+      });
+    (store.listWorkflowEvents as Mock<(runId: string) => Promise<unknown[]>>).mockImplementation(
+      async runId => persistedEvents.filter(event => event.workflow_run_id === runId)
+    );
+
+    return store;
+  }
+
+  function createDelayedMessagePlatform(): IWorkflowPlatform {
+    return {
+      ...createMockPlatform(),
+      sendMessage: mock(async () => {
+        await new Promise(resolve => setTimeout(resolve, 1));
+      }),
+    };
+  }
+
   async function waitForRunTokenTotals(store: IWorkflowStore): Promise<Record<string, unknown>> {
     for (let attempt = 0; attempt < 20; attempt++) {
       const calls = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls as Array<
@@ -9079,6 +9140,112 @@ describe('executeDagWorkflow -- token telemetry persistence and rollup', () => {
       by_model: { 'claude-sonnet-5': { input_tokens: 130, output_tokens: 70 } },
       total_input_tokens: 130,
       total_output_tokens: 70,
+    });
+  });
+
+  it('waits for same-layer siblings before rollup after cancel node cancellation', async () => {
+    mockSendQueryDag.mockImplementation(function* () {
+      yield { type: 'assistant', content: 'worker done' };
+      yield {
+        type: 'result',
+        sessionId: 'cancel-sibling-session',
+        tokens: { input: 40, output: 11, total: 51 },
+        modelUsage: {
+          'claude-sonnet-5': { input_tokens: 40, output_tokens: 11 },
+        },
+      };
+    });
+
+    const store = createPersistedEventStore('worker');
+    await executeDagWorkflow(
+      createMockDeps(store),
+      createDelayedMessagePlatform(),
+      'conv-cancel-rollup',
+      testDir,
+      {
+        name: 'cancel-layer-rollup',
+        nodes: [
+          { id: 'worker', prompt: 'work' },
+          { id: 'stop', cancel: 'stop after layer' },
+        ],
+      },
+      makeWorkflowRun('cancel-layer-rollup-run'),
+      'claude',
+      'claude-sonnet-5',
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    const rollup = await waitForRunTokenTotals(store);
+    expect(rollup).toEqual({
+      by_model: { 'claude-sonnet-5': { input_tokens: 40, output_tokens: 11 } },
+      total_input_tokens: 40,
+      total_output_tokens: 11,
+    });
+  });
+
+  it('waits for same-layer siblings before rollup after approval max-attempts cancellation', async () => {
+    mockSendQueryDag.mockImplementation(function* () {
+      yield { type: 'assistant', content: 'worker done' };
+      yield {
+        type: 'result',
+        sessionId: 'approval-sibling-session',
+        tokens: { input: 22, output: 8, total: 30 },
+        modelUsage: {
+          'claude-sonnet-5': { input_tokens: 22, output_tokens: 8 },
+        },
+      };
+    });
+
+    const store = createPersistedEventStore('worker');
+    await executeDagWorkflow(
+      createMockDeps(store),
+      createDelayedMessagePlatform(),
+      'conv-approval-rollup',
+      testDir,
+      {
+        name: 'approval-layer-rollup',
+        nodes: [
+          { id: 'worker', prompt: 'work' },
+          {
+            id: 'review',
+            approval: {
+              message: 'Approve?',
+              on_reject: { prompt: 'Fix: $REJECTION_REASON', max_attempts: 1 },
+            },
+          },
+        ],
+      },
+      makeWorkflowRun('approval-layer-rollup-run', {
+        metadata: {
+          approval: {
+            type: 'approval',
+            nodeId: 'review',
+            message: 'Approve?',
+            onRejectPrompt: 'Fix: $REJECTION_REASON',
+            onRejectMaxAttempts: 1,
+          },
+          rejection_reason: 'No',
+          rejection_count: 1,
+        },
+      }),
+      'claude',
+      'claude-sonnet-5',
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    const rollup = await waitForRunTokenTotals(store);
+    expect(rollup).toEqual({
+      by_model: { 'claude-sonnet-5': { input_tokens: 22, output_tokens: 8 } },
+      total_input_tokens: 22,
+      total_output_tokens: 8,
     });
   });
 

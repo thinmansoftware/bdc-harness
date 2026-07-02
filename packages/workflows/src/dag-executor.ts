@@ -3010,8 +3010,8 @@ async function executeApprovalNode(
       });
       const cancelMsg = `[ ] Approval node \`${node.id}\` cancelled after ${String(maxAttempts)} rejections.`;
       await safeSendMessage(platform, conversationId, cancelMsg, msgContext);
-      // Terminal state reached: emit 'run_token_totals' rollup event (see token-rollup.ts).
-      void emitRunTokenTotals(deps.store, workflowRun.id);
+      // Return completed -- the between-layer status check will see 'cancelled' and emit
+      // terminal token totals after every sibling in this layer has settled.
       return { state: 'completed' as const, output: '' };
     }
 
@@ -3568,9 +3568,8 @@ export async function executeDagWorkflow(
               nodeId: node.id,
               reason,
             });
-            // Terminal state reached: emit 'run_token_totals' rollup event (see token-rollup.ts).
-            emitTerminalRunTokenTotals();
-            // Return completed -- the between-layer status check will see 'cancelled' and break.
+            // Return completed -- the between-layer status check will see 'cancelled', emit
+            // terminal token totals after every sibling in this layer has settled, and break.
             return { nodeId: node.id, output: { state: 'completed' as const, output: reason } };
           }
 
