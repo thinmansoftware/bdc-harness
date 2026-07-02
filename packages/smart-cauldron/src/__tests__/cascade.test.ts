@@ -80,9 +80,85 @@ function baseOpts(partial: Partial<RunCascadeOptions> = {}): RunCascadeOptions {
     woClass: 'CODE',
     tags: ['mechanical'],
     outDir: '/tmp/smart-cauldron-test-runs',
+    token: 'test-token',
+    project: 'test-project',
     ...partial,
   };
 }
+
+// ---------------------------------------------------------------------------
+// Auth/project binding guards
+// ---------------------------------------------------------------------------
+
+describe('auth/project binding guards', () => {
+  test('missing project throws before firing', async () => {
+    let fireCalled = false;
+
+    const deps: CascadeDeps = {
+      fire: async _opts => {
+        fireCalled = true;
+        return makeFireOk('should-not-fire');
+      },
+      poll: async _opts => makePollResult(),
+      judge: _poll => makePassVerdict(),
+      escalate: async _ctx => {
+        /* no-op */
+      },
+      writeRecord: async (record, _dir) => `/tmp/cascade-record-${record.cascadeId}.json`,
+    };
+
+    await expect(runCascade(baseOpts({ deps, project: undefined }))).rejects.toThrow(
+      '--project is required'
+    );
+    expect(fireCalled).toBe(false);
+  });
+
+  test('runCascade passes token to fire/poll/cancel and includes project in fire message', async () => {
+    const fireOpts: Array<Parameters<NonNullable<CascadeDeps['fire']>>[0]> = [];
+    const pollOpts: Array<Parameters<NonNullable<CascadeDeps['poll']>>[0]> = [];
+    const cancelOpts: Array<Parameters<NonNullable<CascadeDeps['cancel']>>[0]> = [];
+    let pollCallIndex = 0;
+
+    const deps: CascadeDeps = {
+      fire: async opts => {
+        fireOpts.push(opts);
+        return makeFireOk(`run-${fireOpts.length}`);
+      },
+      poll: async opts => {
+        pollOpts.push(opts);
+        pollCallIndex++;
+        if (pollCallIndex === 1) {
+          throw new TimeoutError('poll timeout');
+        }
+        return makePollResult();
+      },
+      judge: _poll => makePassVerdict(),
+      escalate: async _ctx => {
+        /* no-op */
+      },
+      writeRecord: async (record, _dir) => `/tmp/cascade-record-${record.cascadeId}.json`,
+      cancel: async opts => {
+        cancelOpts.push(opts);
+        return { ok: true, error: null };
+      },
+    };
+
+    const record = await runCascade(baseOpts({ deps }));
+
+    expect(record.status).toBe('won');
+    expect(fireOpts.length).toBe(2);
+    expect(pollOpts.length).toBe(2);
+    expect(cancelOpts.length).toBe(1);
+
+    expect(fireOpts.every(opts => opts.token === 'test-token')).toBe(true);
+    expect(
+      fireOpts.every(opts => opts.message.startsWith('WO-TEST-001 --project test-project'))
+    ).toBe(true);
+    expect(pollOpts.every(opts => opts.token === 'test-token')).toBe(true);
+    expect(cancelOpts[0]?.token).toBe('test-token');
+    expect(cancelOpts[0]?.runId).toBe('run-1');
+  });
+});
 
 // ---------------------------------------------------------------------------
 // Test 2: CLIMB-ON-GATE-FAIL
