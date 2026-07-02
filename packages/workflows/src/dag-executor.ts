@@ -5,7 +5,8 @@
  * Independent nodes within the same layer run concurrently via Promise.allSettled.
  * Captures all assistant output regardless of streaming mode for $node_id.output substitution.
  */
-import { readFile } from 'fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'fs/promises';
+import { tmpdir } from 'os';
 import { isAbsolute, join, resolve as resolvePath } from 'path';
 import { execFileAsync } from '@archon/git';
 import { discoverScriptsForCwd } from './script-discovery';
@@ -116,6 +117,25 @@ export function clearAgentRegistryCache(): void {
 const MCP_FAILURE_PREFIX = 'MCP server connection failed: ';
 const CODEX_FAILBACK_PREFIX = '[CODEX FAILBACK]';
 const WARNING_PREFIX = '[WARNING]';
+
+async function execBashScriptFile(
+  script: string,
+  options: {
+    cwd: string;
+    timeout?: number;
+    env?: NodeJS.ProcessEnv;
+  }
+): Promise<{ stdout: string; stderr: string }> {
+  const tempDir = await mkdtemp(join(tmpdir(), 'archon-dag-bash-'));
+  const scriptPath = join(tempDir, 'script.sh');
+
+  try {
+    await writeFile(scriptPath, script, { mode: 0o700 });
+    return await execFileAsync('bash', [scriptPath], options);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+}
 
 /** A failed MCP server entry parsed from the SDK message. `segment` is the
  *  original substring (e.g. `"telegram (disconnected)"`) so callers can
@@ -1647,7 +1667,7 @@ async function executeBashNode(
   };
 
   try {
-    const { stdout, stderr } = await execFileAsync('bash', ['-c', finalScript], {
+    const { stdout, stderr } = await execBashScriptFile(finalScript, {
       cwd,
       timeout,
       env: subprocessEnv,
@@ -2697,7 +2717,7 @@ async function executeLoopNode(
           nodeOutputs,
           true // escapedForBash
         );
-        await execFileAsync('bash', ['-c', substitutedBash], { cwd });
+        await execBashScriptFile(substitutedBash, { cwd });
         bashComplete = true; // exit 0 = complete
       } catch (e) {
         const bashErr = e as NodeJS.ErrnoException;
