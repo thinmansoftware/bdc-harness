@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, mock, spyOn, type Mock } from 'bun:test';
-import { mkdir, writeFile, rm } from 'fs/promises';
+import { mkdir, readFile, writeFile, rm } from 'fs/promises';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import * as git from '@archon/git';
@@ -1201,6 +1201,135 @@ describe('executeDagWorkflow -- bash nodes', () => {
     expect(mockSendQueryDag.mock.calls.length).toBe(0);
   });
 
+  it('executes large bash scripts from a temp file to avoid argv limits', async () => {
+    if (isWindows) return;
+
+    const mockDeps = createMockDeps();
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('bash-large-script-run-id', {
+      workflow_name: 'bash-large-script',
+      conversation_id: 'conv-bash-large',
+      user_message: 'large script test',
+    });
+    const payload = 'x'.repeat(3_000_000);
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-bash-large',
+      testDir,
+      {
+        name: 'bash-large-script-test',
+        nodes: [{ id: 'large', bash: `printf "%s" "${payload}" | wc -c` }],
+      },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    const eventCalls = (mockDeps.store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls;
+    const completedEvent = eventCalls.find(
+      (call: unknown[]) =>
+        (call[0] as { event_type: string }).event_type === 'node_completed' &&
+        (call[0] as { step_name: string }).step_name === 'large'
+    );
+    expect(completedEvent).toBeDefined();
+    expect((completedEvent![0] as { data: { node_output: string } }).data.node_output).toBe(
+      '3000000'
+    );
+  });
+
+  it('removes the temp bash script after successful execution', async () => {
+    let scriptPath = '';
+    const execSpy = spyOn(git, 'execFileAsync').mockImplementation(async (_cmd, args) => {
+      scriptPath = args[0];
+      expect(await readFile(scriptPath, 'utf-8')).toBe('echo ok');
+      return { stdout: 'ok\n', stderr: '' };
+    });
+    const mockDeps = createMockDeps();
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('bash-temp-cleanup-success-run-id');
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-temp-cleanup-success',
+      testDir,
+      { name: 'bash-temp-cleanup-success-test', nodes: [{ id: 'cleanup', bash: 'echo ok' }] },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    expect(execSpy).toHaveBeenCalledWith(
+      'bash',
+      [expect.stringContaining('archon-bash-node-')],
+      expect.anything()
+    );
+    let wasRemoved = false;
+    try {
+      await readFile(scriptPath, 'utf-8');
+    } catch {
+      wasRemoved = true;
+    }
+    expect(wasRemoved).toBe(true);
+    execSpy.mockRestore();
+  });
+
+  it('removes the temp bash script after failed execution', async () => {
+    let scriptPath = '';
+    const execSpy = spyOn(git, 'execFileAsync').mockImplementation(async (_cmd, args) => {
+      scriptPath = args[0];
+      expect(await readFile(scriptPath, 'utf-8')).toBe('echo bad >&2; exit 1');
+      const err = Object.assign(new Error('Command failed: bash script.sh'), {
+        code: 1,
+        stderr: 'bad\n',
+      });
+      throw err;
+    });
+    const mockDeps = createMockDeps();
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('bash-temp-cleanup-failure-run-id');
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-temp-cleanup-failure',
+      testDir,
+      {
+        name: 'bash-temp-cleanup-failure-test',
+        nodes: [{ id: 'cleanup-fail', bash: 'echo bad >&2; exit 1' }],
+      },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    let wasRemoved = false;
+    try {
+      await readFile(scriptPath, 'utf-8');
+    } catch {
+      wasRemoved = true;
+    }
+    expect(wasRemoved).toBe(true);
+    execSpy.mockRestore();
+  });
+
   it('bash node stdout is available for downstream $nodeId.output substitution', async () => {
     const mockDeps = createMockDeps();
     const platform = createMockPlatform();
@@ -1403,7 +1532,11 @@ describe('executeDagWorkflow -- bash nodes', () => {
   });
 
   it('passes config.envVars to bash subprocesses', async () => {
-    const execSpy = spyOn(git, 'execFileAsync').mockResolvedValue({ stdout: 'ok\n', stderr: '' });
+    let scriptBody = '';
+    const execSpy = spyOn(git, 'execFileAsync').mockImplementation(async (_cmd, args) => {
+      scriptBody = await readFile(args[0], 'utf-8');
+      return { stdout: 'ok\n', stderr: '' };
+    });
     const mockDeps = createMockDeps();
     const platform = createMockPlatform();
     const workflowRun = makeWorkflowRun('bash-env-run-id');
@@ -1426,11 +1559,12 @@ describe('executeDagWorkflow -- bash nodes', () => {
 
     expect(execSpy).toHaveBeenCalledWith(
       'bash',
-      ['-c', 'echo ok'],
+      [expect.stringContaining('archon-bash-node-')],
       expect.objectContaining({
         env: expect.objectContaining({ MY_SECRET: 'abc123' }),
       })
     );
+    expect(scriptBody).toBe('echo ok');
     execSpy.mockRestore();
   });
 
@@ -1483,7 +1617,11 @@ describe('executeDagWorkflow -- bash nodes', () => {
   });
 
   it('${input.X} tokens are substituted in bash script before exec', async () => {
-    const execSpy = spyOn(git, 'execFileAsync').mockResolvedValue({ stdout: 'bar\n', stderr: '' });
+    let scriptBody = '';
+    const execSpy = spyOn(git, 'execFileAsync').mockImplementation(async (_cmd, args) => {
+      scriptBody = await readFile(args[0], 'utf-8');
+      return { stdout: 'bar\n', stderr: '' };
+    });
     const mockDeps = createMockDeps();
     const platform = createMockPlatform();
     const workflowRun = makeWorkflowRun('bash-input-subst-run-id');
@@ -1508,13 +1646,22 @@ describe('executeDagWorkflow -- bash nodes', () => {
       minimalConfig
     );
 
-    // The bash script passed to execFileAsync must have the token replaced with the value
-    expect(execSpy).toHaveBeenCalledWith('bash', ['-c', 'echo bar'], expect.anything());
+    // The bash script written for execFileAsync must have the token replaced with the value.
+    expect(execSpy).toHaveBeenCalledWith(
+      'bash',
+      [expect.stringContaining('archon-bash-node-')],
+      expect.anything()
+    );
+    expect(scriptBody).toBe('echo bar');
     execSpy.mockRestore();
   });
 
   it('WORKTREE_PATH and INPUT_* env vars are injected into bash subprocess', async () => {
-    const execSpy = spyOn(git, 'execFileAsync').mockResolvedValue({ stdout: 'ok\n', stderr: '' });
+    let scriptBody = '';
+    const execSpy = spyOn(git, 'execFileAsync').mockImplementation(async (_cmd, args) => {
+      scriptBody = await readFile(args[0], 'utf-8');
+      return { stdout: 'ok\n', stderr: '' };
+    });
     const mockDeps = createMockDeps();
     const platform = createMockPlatform();
     const workflowRun = makeWorkflowRun('bash-input-env-run-id');
@@ -1541,7 +1688,7 @@ describe('executeDagWorkflow -- bash nodes', () => {
 
     expect(execSpy).toHaveBeenCalledWith(
       'bash',
-      ['-c', 'echo ok'],
+      [expect.stringContaining('archon-bash-node-')],
       expect.objectContaining({
         env: expect.objectContaining({
           WORKTREE_PATH: testDir,
@@ -1549,11 +1696,16 @@ describe('executeDagWorkflow -- bash nodes', () => {
         }),
       })
     );
+    expect(scriptBody).toBe('echo ok');
     execSpy.mockRestore();
   });
 
   it('undefined ${input.X} token is left unchanged in bash script', async () => {
-    const execSpy = spyOn(git, 'execFileAsync').mockResolvedValue({ stdout: 'ok\n', stderr: '' });
+    let scriptBody = '';
+    const execSpy = spyOn(git, 'execFileAsync').mockImplementation(async (_cmd, args) => {
+      scriptBody = await readFile(args[0], 'utf-8');
+      return { stdout: 'ok\n', stderr: '' };
+    });
     const mockDeps = createMockDeps();
     const platform = createMockPlatform();
     const workflowRun = makeWorkflowRun('bash-input-undef-run-id');
@@ -1581,9 +1733,10 @@ describe('executeDagWorkflow -- bash nodes', () => {
     // Token for 'undefined_key' must remain verbatim (not replaced with empty string or crashed)
     expect(execSpy).toHaveBeenCalledWith(
       'bash',
-      ['-c', 'echo ${input.undefined_key}'],
+      [expect.stringContaining('archon-bash-node-')],
       expect.anything()
     );
+    expect(scriptBody).toBe('echo ${input.undefined_key}');
     execSpy.mockRestore();
   });
 });
