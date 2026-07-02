@@ -1890,6 +1890,12 @@ nodes:
       Implementation:
       $implement.output
 
+      Commit and push evidence (ground truth for HEAD/branch):
+      $commit-and-push.output
+
+      PR evidence (ground truth PR URL/state):
+      $open-pr-if-needed.output
+
       Verification:
       (Workflow-time verify-build/types/tests removed 2026-05-16 - agent self-verifies in
       implement loop, PR-time gates handle real validation. See implement output above.)
@@ -1929,15 +1935,71 @@ nodes:
         CROSS_MODEL_REVIEW=false disclosed)
       If any in-run review was skipped or ended needs_revision, VALIDATION cannot be PASS.
 
+
+  - id: manifest-consistency-check
+    persona: major-build
+    load_bearing: true
+    depends_on: [build-manifest, open-pr-if-needed, block-reclassify]
+    trigger_rule: all_done
+    task_class: clerical
+    bash: |
+      set -euo pipefail
+
+      capture_node_output() {
+        python3 -c 'import shlex, sys; s=sys.stdin.read(); sys.stdout.write((lambda p: p[0] if len(p)==1 else s)(shlex.split(s)) if len(s)>=2 and s[0]=="'"'"'" and s.rstrip("\n").endswith("'"'"'") else s)'
+      }
+
+      RECLASSIFY=$(capture_node_output <<'BDC_NODE_OUTPUT_BLOCK_RECLASSIFY'
+      $block-reclassify.output
+      BDC_NODE_OUTPUT_BLOCK_RECLASSIFY
+      )
+      STATUS=$(printf '%s\n' "$RECLASSIFY" | sed -n 's/.*"status":"\([A-Z_]*\)".*/\1/p' | head -1)
+
+      OPEN_PR_OUT=$(capture_node_output <<'BDC_NODE_OUTPUT_OPEN_PR'
+      $open-pr-if-needed.output
+      BDC_NODE_OUTPUT_OPEN_PR
+      )
+      PR_URL=$(printf '%s\n' "$OPEN_PR_OUT" | grep -E '^PR_URL=' | sed 's/^PR_URL=//' | head -1 || true)
+      if [ -z "$PR_URL" ]; then
+        PR_URL=$(printf '%s\n' "$OPEN_PR_OUT" | grep -E '^https://github\.com/' | head -1 || true)
+      fi
+
+      MANIFEST_OUT=$(capture_node_output <<'BDC_NODE_OUTPUT_MANIFEST'
+      $build-manifest.output
+      BDC_NODE_OUTPUT_MANIFEST
+      )
+      extract() {
+        { printf '%s\n' "$MANIFEST_OUT" | grep -E "^${1}:" | head -1 | sed "s/^${1}:[[:space:]]*//"; } || true
+      }
+      PRS_LINE=$(extract "PRs")
+
+      if [ "$STATUS" = "PROCEED" ] && [ -n "$PR_URL" ]; then
+        PRS_LOWER=$(printf '%s\n' "$PRS_LINE" | tr '[:upper:]' '[:lower:]')
+        if printf '%s\n' "$PRS_LOWER" | grep -Eq 'no commit|no pr|not opened|n/a' \
+          && ! printf '%s\n' "$PRS_LINE" | grep -Fq "$PR_URL"; then
+          WT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
+          HEAD_SHA=$(git -C "$WT" rev-parse HEAD 2>/dev/null || echo unknown)
+          RUN_START_SHA=$(cat "${ARTIFACTS_DIR:-}/run-start-sha.txt" 2>/dev/null || echo unknown)
+          BRANCH=$(git -C "$WT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)
+          ORIGIN_HEAD=$(git -C "$WT" log -1 --format=%H "origin/${BRANCH}" 2>/dev/null || echo unknown)
+          PR_STATE=$(gh pr view "$PR_URL" --json state,number --jq '"#" + (.number|tostring) + " " + .state' 2>/dev/null || echo unknown)
+          echo "SELF_CONSISTENCY_ERROR: build-manifest claims \"${PRS_LINE}\" but block-reclassify=PROCEED and open-pr-if-needed resolved PR_URL=${PR_URL} (HEAD=${HEAD_SHA}, RUN_START_SHA=${RUN_START_SHA}, origin/${BRANCH}=${ORIGIN_HEAD}, PR=${PR_STATE})" >&2
+          exit 1
+        fi
+      fi
+
+      printf 'OK\n'
+
   # WO-HARNESS-CAULDRON-PR-MANIFEST-AUTOFILL-01: write the v2-label manifest INTO
   # the PR body so the manifest-validate CI gate (bdc-ci/scripts/validate-pr-manifest.sh)
   # finds it. The PR is opened BEFORE the manifest is built, so the stub body must be
-  # patched after build-manifest runs. Runs concurrently with flip-notion: both depend
-  # only on build-manifest, so Notion still receives the manifest even if PR-body
-  # patching fails (regression scenario 7 in the WO spec).
+  # patched after build-manifest runs. Publishing nodes are explicitly gated by
+  # manifest-consistency-check so a contradictory AI-composed manifest cannot be
+  # written to the PR body or Notion under trigger_rule: all_done.
   - id: patch-pr-body
     persona: major-build
-    depends_on: [build-manifest]
+    depends_on: [build-manifest, manifest-consistency-check]
+    when: "$manifest-consistency-check.output == 'OK'"
     trigger_rule: all_done
     task_class: clerical
     bash: |

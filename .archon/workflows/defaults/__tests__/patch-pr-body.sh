@@ -16,8 +16,9 @@
 #   4. Files created/modified lists derive from git diff --name-status (no
 #      preserved files leaking in).
 #   5. Label extraction from build-manifest output.
-#   6. Idempotent re-patch: running twice yields ONE manifest block, not two.
-#   7. PROSE preservation: original PR body content above the sentinel survives.
+#   6. manifest-consistency-check: false-negative PR claims fail closed.
+#   7. Idempotent re-patch: running twice yields ONE manifest block, not two.
+#   8. PROSE preservation: original PR body content above the sentinel survives.
 #
 # Run: bash .archon/workflows/defaults/__tests__/patch-pr-body.sh
 # Exits 0 on all-pass, 1 on any failure.
@@ -454,9 +455,69 @@ assert_eq "fixed capture does not execute backticks" "0" \
 rm -rf "$INJECTION_TMP"
 
 # -----------------------------------------------------------------------------
-# Test 6: Idempotent re-patch -- running twice yields ONE manifest block
+# Test 6: manifest-consistency-check -- false-negative PR claims fail closed
 # -----------------------------------------------------------------------------
-echo "--- Test 6: Idempotent strip + append ---"
+echo "--- Test 6: manifest-consistency-check false-negative guard ---"
+CANONICAL_WORKFLOW="${CANONICAL_WORKFLOW:-.archon/workflows/defaults/bdc-feature-development.yaml}"
+
+manifest_consistency_guard_block() {
+  awk '
+    index($0, "if [ \"$STATUS\" = \"PROCEED\" ] && [ -n \"$PR_URL\" ]; then") { capture=1 }
+    capture { sub(/^      /, ""); print }
+    capture && /printf '\''OK\\n'\''/ { exit }
+  ' "$CANONICAL_WORKFLOW"
+}
+
+MANIFEST_CONSISTENCY_GUARD=$(manifest_consistency_guard_block)
+assert_contains "guard test executes extracted workflow block" \
+  "SELF_CONSISTENCY_ERROR: build-manifest claims" "$MANIFEST_CONSISTENCY_GUARD"
+assert_contains "guard test covers false-negative PR pattern from workflow" \
+  "no commit|no pr|not opened|n/a" "$MANIFEST_CONSISTENCY_GUARD"
+
+manifest_consistency_check() (
+  STATUS="$1"
+  PR_URL="$2"
+  MANIFEST_OUT="$3"
+  ARTIFACTS_DIR="${ARTIFACTS_DIR:-}"
+
+  extract() {
+    { printf '%s\n' "$MANIFEST_OUT" | grep -E "^${1}:" | head -1 | sed "s/^${1}:[[:space:]]*//"; } || true
+  }
+  PRS_LINE=$(extract "PRs")
+
+  eval "$MANIFEST_CONSISTENCY_GUARD"
+)
+
+PR_URL_FIXTURE="https://github.com/bluedevilcollectibles/bdc-harness/pull/405"
+MF_FALSE_NEGATIVE=$'WO: WO-X\nPRs: N/A (no commit was made; HEAD still equals RUN_START_SHA a00f47d; no PR opened)\nVALIDATION: FAIL'
+set +e
+GUARD_FALSE_STDERR=$(manifest_consistency_check "PROCEED" "$PR_URL_FIXTURE" "$MF_FALSE_NEGATIVE" 2>&1 >/dev/null)
+GUARD_FALSE_EXIT=$?
+set -e
+assert_eq "guard rejects PROCEED + PR URL contradicted by N/A PRs line" "1" "$GUARD_FALSE_EXIT"
+assert_contains "guard error names SELF_CONSISTENCY_ERROR" "SELF_CONSISTENCY_ERROR" "$GUARD_FALSE_STDERR"
+assert_contains "guard error includes real PR URL" "$PR_URL_FIXTURE" "$GUARD_FALSE_STDERR"
+
+MF_HONEST_PROCEED=$'WO: WO-X\nPRs: https://github.com/bluedevilcollectibles/bdc-harness/pull/405\nVALIDATION: PASS'
+assert_eq "guard passes honest PROCEED manifest" "OK" \
+  "$(manifest_consistency_check "PROCEED" "$PR_URL_FIXTURE" "$MF_HONEST_PROCEED" 2>/dev/null)"
+
+MF_NOOP=$'WO: WO-X\nPRs: N/A (ALREADY_SATISFIED; no PR opened)\nVALIDATION: PASS'
+assert_eq "guard passes ALREADY_SATISFIED no-op manifest unchanged" "OK" \
+  "$(manifest_consistency_check "ALREADY_SATISFIED" "" "$MF_NOOP" 2>/dev/null)"
+assert_eq "guard passes BLOCKED path unchanged" "OK" \
+  "$(manifest_consistency_check "BLOCKED" "" "$MF_NOOP" 2>/dev/null)"
+
+# A failed guard emits no OK, so the downstream when expression
+# `$manifest-consistency-check.output == 'OK'` fails closed and patch-pr-body
+# does not run.
+assert_eq "failed guard does not emit OK for patch-pr-body when gate" "0" \
+  "$(printf '%s\n' "$GUARD_FALSE_STDERR" | grep -cxF "OK" || true)"
+
+# -----------------------------------------------------------------------------
+# Test 7: Idempotent re-patch -- running twice yields ONE manifest block
+# -----------------------------------------------------------------------------
+echo "--- Test 7: Idempotent strip + append ---"
 STUB_BODY=$'## Summary\nLines of summary prose.\n\n## Validation\nLine.\n\n## Implement output\nbuilder output here.\n\n## Validator\nvalidator output.'
 NEW_MANIFEST=$'WO: WO-FOO-01\nBuilder: Codex\nFiles created: a.ts\nFiles modified: b.ts\nTests: 1 / 1\nPRs: https://example/1\nMerge ancestors: N/A\nGrep assertions: N/A (auto)\nRuntime verification: N/A (auto)\nVALIDATION: PASS'
 
@@ -486,9 +547,9 @@ assert_contains "second patch: new Tests count present" "Tests: 2 / 2" "$BODY2"
 assert_count "second patch: old Tests line gone" "0" "Tests: 1 / 1" "$BODY2"
 
 # -----------------------------------------------------------------------------
-# Test 7: Prose with bare --- lines is NOT cut (unique sentinel is safe)
+# Test 8: Prose with bare --- lines is NOT cut (unique sentinel is safe)
 # -----------------------------------------------------------------------------
-echo "--- Test 7: Prose containing --- survives the strip ---"
+echo "--- Test 8: Prose containing --- survives the strip ---"
 PROSE_WITH_HR=$'## Summary\nintro\n---\nmiddle paragraph after horizontal rule\n---\nclosing'
 BODY3=$(build_patched_body "$PROSE_WITH_HR" "$NEW_MANIFEST")
 # Both horizontal-rule lines must survive (strip uses HTML comment sentinel, not ---).
@@ -498,9 +559,9 @@ assert_contains "closing preserved" "closing" "$BODY3"
 assert_count "still exactly 1 manifest block" "1" "^<!-- bdc-manifest-start -->$" "$BODY3"
 
 # -----------------------------------------------------------------------------
-# Test 8: Empty initial body (defensive)
+# Test 9: Empty initial body (defensive)
 # -----------------------------------------------------------------------------
-echo "--- Test 8: Empty current body ---"
+echo "--- Test 9: Empty current body ---"
 BODY4=$(build_patched_body "" "$NEW_MANIFEST")
 assert_count "empty body: 1 manifest block" "1" "^<!-- bdc-manifest-start -->$" "$BODY4"
 assert_contains "empty body: WO line present" "WO: WO-FOO-01" "$BODY4"
