@@ -2578,8 +2578,17 @@ nodes:
       RUN_ID=$(basename "${ARTIFACTS_DIR:-}" 2>/dev/null || true)
       [ -z "$RUN_ID" ] && RUN_ID="unknown"
 
-      # -- PR number (for the pending filename + payload).
-      PR_NUMBER=$(gh pr view "$PR_URL" --repo "$REPO" --json number --jq '.number' 2>/dev/null || true)
+      # -- PR number (for the pending filename + payload). Derive from the
+      #    already-resolved PR_URL trailing path segment (gh emits .../pull/<n>,
+      #    ground truth per manifest-consistency-check) so a flaky `gh pr view`
+      #    cannot collapse the pending filename to ${WO_ID}__0.json. Fall back to
+      #    a gh lookup only when the URL has no numeric tail, and to "0" last.
+      PR_NUMBER="${PR_URL##*/}"
+      case "$PR_NUMBER" in
+        ''|*[!0-9]*)
+          PR_NUMBER=$(gh pr view "$PR_URL" --repo "$REPO" --json number --jq '.number' 2>/dev/null || true)
+          ;;
+      esac
       [ -z "$PR_NUMBER" ] && PR_NUMBER="0"
 
       # -- Bounded poll of PR checks: up to 10 attempts x 60s (10 min cap), per WO
