@@ -5,7 +5,8 @@
  * Independent nodes within the same layer run concurrently via Promise.allSettled.
  * Captures all assistant output regardless of streaming mode for $node_id.output substitution.
  */
-import { readFile } from 'fs/promises';
+import { chmod, mkdir, readFile, unlink, writeFile } from 'fs/promises';
+import { tmpdir } from 'os';
 import { isAbsolute, join, resolve as resolvePath } from 'path';
 import { execFileAsync } from '@archon/git';
 import { discoverScriptsForCwd } from './script-discovery';
@@ -1568,7 +1569,7 @@ const SUBPROCESS_DEFAULT_TIMEOUT = 120_000;
 
 /**
  * Execute a bash (shell script) DAG node.
- * Runs the script via `bash -c`, captures stdout as node output.
+ * Runs the script via a temp file, captures stdout as node output.
  * No AI session is created -- bash nodes are free/deterministic.
  */
 async function executeBashNode(
@@ -1651,12 +1652,41 @@ async function executeBashNode(
     ...(envVars ?? {}),
   };
 
+  const safeNodeId = node.id.replace(/[^A-Za-z0-9._-]/g, '_');
+  const safeRunId = workflowRun.id.replace(/[^A-Za-z0-9._-]/g, '_');
+  const scriptDir = artifactsDir || tmpdir();
+  const scriptFile = join(scriptDir, `node-${safeNodeId}-${safeRunId}.sh`);
+
   try {
-    const { stdout, stderr } = await execFileAsync('bash', ['-c', finalScript], {
-      cwd,
-      timeout,
-      env: subprocessEnv,
-    });
+    let stdout = '';
+    let stderr = '';
+    try {
+      try {
+        await mkdir(scriptDir, { recursive: true });
+        await writeFile(scriptFile, finalScript, { mode: 0o600 });
+        await chmod(scriptFile, 0o600);
+      } catch (error) {
+        const err = error as Error & { code?: number | string };
+        const details = err.message ? `: ${err.message}` : '';
+        throw Object.assign(new Error(`${scriptFile}${details}`), {
+          code: err.code,
+          cause: err,
+          scriptFile,
+          scriptPreparationFailed: true,
+        });
+      }
+      ({ stdout, stderr } = await execFileAsync('bash', [scriptFile], {
+        cwd,
+        timeout,
+        env: subprocessEnv,
+      }));
+    } finally {
+      try {
+        await unlink(scriptFile);
+      } catch {
+        // Best-effort cleanup: deletion failures must not change node outcome.
+      }
+    }
 
     // Trim trailing newline from stdout (common shell behavior)
     const output = stdout.replace(/\n$/, '');
@@ -1778,15 +1808,23 @@ async function executeBashNode(
 
     return { state: 'completed', output };
   } catch (error) {
-    const err = error as Error & { killed?: boolean; code?: number | string; stderr?: string };
+    const err = error as Error & {
+      killed?: boolean;
+      code?: number | string;
+      stderr?: string;
+      scriptFile?: string;
+      scriptPreparationFailed?: boolean;
+    };
     const isTimeout = err.killed === true || (err.message ?? '').includes('timed out');
     const label = `Bash node '${node.id}'`;
     // Always run the formatter so logs get sanitized fields regardless of which
-    // user-facing branch we end up in -- the timeout message also contains the
-    // full `Command failed: bash -c <body>` line and would otherwise leak.
+    // user-facing branch we end up in. Spawn failures can still include
+    // command metadata, and the formatter keeps log output constrained.
     const formatted = formatSubprocessFailure(err, label);
     let errorMsg: string;
-    if (isTimeout) {
+    if (err.scriptPreparationFailed) {
+      errorMsg = `${label} failed: unable to prepare temporary script at ${err.scriptFile ?? scriptFile}`;
+    } else if (isTimeout) {
       errorMsg = `${label} timed out after ${String(timeout)}ms`;
     } else if (err.message?.includes('ENOENT')) {
       errorMsg = `${label} failed: bash executable not found in PATH`;

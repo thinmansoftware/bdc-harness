@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, mock, spyOn, type Mock } from 'bun:test';
-import { mkdir, writeFile, rm } from 'fs/promises';
+import { mkdir, readFile, rm, stat, writeFile } from 'fs/promises';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import * as git from '@archon/git';
@@ -213,7 +213,45 @@ function makeWorkflowRun(id = 'dag-test-run-id', overrides?: Partial<WorkflowRun
   };
 }
 
+function mockBashExecWithScriptCapture(
+  stdout = 'ok\n',
+  stderr = ''
+): {
+  execSpy: ReturnType<typeof spyOn>;
+  scriptFiles: string[];
+  scriptTexts: string[];
+  scriptModes: string[];
+} {
+  const scriptFiles: string[] = [];
+  const scriptTexts: string[] = [];
+  const scriptModes: string[] = [];
+  const execSpy = spyOn(git, 'execFileAsync').mockImplementation(
+    async (command: string, args: string[]) => {
+      expect(command).toBe('bash');
+      expect(args).toHaveLength(1);
+      expect(args[0]).toEndWith('.sh');
+
+      scriptFiles.push(args[0]);
+      scriptTexts.push(await readFile(args[0], 'utf8'));
+      scriptModes.push(((await stat(args[0])).mode & 0o777).toString(8));
+
+      return { stdout, stderr };
+    }
+  );
+
+  return { execSpy, scriptFiles, scriptTexts, scriptModes };
+}
+
 // --- Tests ---
+
+// Restore spies after every test so a failed assertion inside a test body cannot
+// leak its spyOn(git, 'execFileAsync') mock into subsequent tests (a leaked
+// bash-capture mock silently feeds canned output to unrelated tests and fails
+// bun-spawning script nodes). mock.restore() only restores spies, not
+// mock.module registrations.
+afterEach(() => {
+  mock.restore();
+});
 
 describe('buildTopologicalLayers', () => {
   it('single node with no dependencies -> one layer', () => {
@@ -1282,7 +1320,7 @@ describe('executeDagWorkflow -- bash nodes', () => {
     expect(failMsg).toBeDefined();
   });
 
-  it('failure message surfaces stderr and does not leak the "Command failed: bash -c <body>" prefix', async () => {
+  it('failure message surfaces stderr and does not leak the generated script body', async () => {
     const mockDeps = createMockDeps();
     const platform = createMockPlatform();
     const workflowRun = makeWorkflowRun('bash-1389-run-id', {
@@ -1291,9 +1329,8 @@ describe('executeDagWorkflow -- bash nodes', () => {
       user_message: 'test',
     });
 
-    // Marker is echoed to stdout only (so it lands in the command line embedded
-    // in err.message but never in stderr). If it shows up in errorMsg the
-    // prefix line was not stripped.
+    // Marker is echoed to stdout only and should never become the diagnostic
+    // when stderr is available.
     const bashNode: BashNode = {
       id: 'fail-bash-1389',
       bash: 'echo UNIQUE_CMDLINE_MARKER_1389; echo "diagnostic from stderr" >&2; exit 1',
@@ -1328,6 +1365,50 @@ describe('executeDagWorkflow -- bash nodes', () => {
     expect(errorMsg).not.toContain('Command failed:');
     expect(errorMsg).not.toContain('UNIQUE_CMDLINE_MARKER_1389');
     expect(errorMsg).toContain('diagnostic from stderr');
+  });
+
+  it('script preparation failure names the temporary script path', async () => {
+    const mockDeps = createMockDeps();
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('bash-script-write-fail-run-id', {
+      workflow_name: 'bash-script-write-fail',
+      conversation_id: 'conv-script-write-fail',
+      user_message: 'test',
+    });
+    const artifactsPathThatIsAFile = join(testDir, 'artifacts-file');
+    await writeFile(artifactsPathThatIsAFile, 'not a directory');
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-script-write-fail',
+      testDir,
+      { name: 'bash-script-write-fail', nodes: [{ id: 'write-fail', bash: 'echo never' }] },
+      workflowRun,
+      'claude',
+      undefined,
+      artifactsPathThatIsAFile,
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    const expectedScriptPath = join(
+      artifactsPathThatIsAFile,
+      'node-write-fail-bash-script-write-fail-run-id.sh'
+    );
+    const eventCalls = (mockDeps.store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls;
+    const failedEvent = eventCalls.find(
+      (call: unknown[]) =>
+        (call[0] as { event_type: string }).event_type === 'node_failed' &&
+        (call[0] as { step_name: string }).step_name === 'write-fail'
+    );
+    expect(failedEvent).toBeDefined();
+    const errorMsg = (failedEvent![0] as { data: { error: string } }).data.error;
+    expect(errorMsg).toBe(
+      `Bash node 'write-fail' failed: unable to prepare temporary script at ${expectedScriptPath}`
+    );
   });
 
   it('variable substitution works in bash scripts', async () => {
@@ -1404,7 +1485,7 @@ describe('executeDagWorkflow -- bash nodes', () => {
   });
 
   it('passes config.envVars to bash subprocesses', async () => {
-    const execSpy = spyOn(git, 'execFileAsync').mockResolvedValue({ stdout: 'ok\n', stderr: '' });
+    const { execSpy, scriptTexts, scriptModes } = mockBashExecWithScriptCapture();
     const mockDeps = createMockDeps();
     const platform = createMockPlatform();
     const workflowRun = makeWorkflowRun('bash-env-run-id');
@@ -1427,11 +1508,16 @@ describe('executeDagWorkflow -- bash nodes', () => {
 
     expect(execSpy).toHaveBeenCalledWith(
       'bash',
-      ['-c', 'echo ok'],
+      [expect.stringContaining('node-stats-bash-env-run-id.sh')],
       expect.objectContaining({
         env: expect.objectContaining({ MY_SECRET: 'abc123' }),
       })
     );
+    expect(scriptTexts).toEqual(['echo ok']);
+    if (!isWindows) {
+      // NTFS honors only the read-only bit; Node chmod cannot produce 600 on Windows.
+      expect(scriptModes).toEqual(['600']);
+    }
     execSpy.mockRestore();
   });
 
@@ -1484,7 +1570,7 @@ describe('executeDagWorkflow -- bash nodes', () => {
   });
 
   it('${input.X} tokens are substituted in bash script before exec', async () => {
-    const execSpy = spyOn(git, 'execFileAsync').mockResolvedValue({ stdout: 'bar\n', stderr: '' });
+    const { execSpy, scriptTexts } = mockBashExecWithScriptCapture('bar\n');
     const mockDeps = createMockDeps();
     const platform = createMockPlatform();
     const workflowRun = makeWorkflowRun('bash-input-subst-run-id');
@@ -1509,13 +1595,18 @@ describe('executeDagWorkflow -- bash nodes', () => {
       minimalConfig
     );
 
-    // The bash script passed to execFileAsync must have the token replaced with the value
-    expect(execSpy).toHaveBeenCalledWith('bash', ['-c', 'echo bar'], expect.anything());
+    // The bash script written for execFileAsync must have the token replaced with the value.
+    expect(execSpy).toHaveBeenCalledWith(
+      'bash',
+      [expect.stringContaining('node-greet-bash-input-subst-run-id.sh')],
+      expect.anything()
+    );
+    expect(scriptTexts).toEqual(['echo bar']);
     execSpy.mockRestore();
   });
 
   it('WORKTREE_PATH and INPUT_* env vars are injected into bash subprocess', async () => {
-    const execSpy = spyOn(git, 'execFileAsync').mockResolvedValue({ stdout: 'ok\n', stderr: '' });
+    const { execSpy, scriptTexts } = mockBashExecWithScriptCapture();
     const mockDeps = createMockDeps();
     const platform = createMockPlatform();
     const workflowRun = makeWorkflowRun('bash-input-env-run-id');
@@ -1542,7 +1633,7 @@ describe('executeDagWorkflow -- bash nodes', () => {
 
     expect(execSpy).toHaveBeenCalledWith(
       'bash',
-      ['-c', 'echo ok'],
+      [expect.stringContaining('node-step-bash-input-env-run-id.sh')],
       expect.objectContaining({
         env: expect.objectContaining({
           WORKTREE_PATH: testDir,
@@ -1550,11 +1641,12 @@ describe('executeDagWorkflow -- bash nodes', () => {
         }),
       })
     );
+    expect(scriptTexts).toEqual(['echo ok']);
     execSpy.mockRestore();
   });
 
   it('undefined ${input.X} token is left unchanged in bash script', async () => {
-    const execSpy = spyOn(git, 'execFileAsync').mockResolvedValue({ stdout: 'ok\n', stderr: '' });
+    const { execSpy, scriptTexts } = mockBashExecWithScriptCapture();
     const mockDeps = createMockDeps();
     const platform = createMockPlatform();
     const workflowRun = makeWorkflowRun('bash-input-undef-run-id');
@@ -1582,9 +1674,83 @@ describe('executeDagWorkflow -- bash nodes', () => {
     // Token for 'undefined_key' must remain verbatim (not replaced with empty string or crashed)
     expect(execSpy).toHaveBeenCalledWith(
       'bash',
-      ['-c', 'echo ${input.undefined_key}'],
+      [expect.stringContaining('node-step-bash-input-undef-run-id.sh')],
       expect.anything()
     );
+    expect(scriptTexts).toEqual(['echo ${input.undefined_key}']);
+    execSpy.mockRestore();
+  });
+
+  it('runs bash scripts larger than ARG_MAX from a script file', async () => {
+    const mockDeps = createMockDeps();
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('bash-large-script-run-id');
+    const largeLiteral = 'x'.repeat(2_250_000);
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-large-script',
+      testDir,
+      {
+        name: 'bash-large-script-test',
+        nodes: [
+          {
+            id: 'large',
+            bash: `payload='${largeLiteral}'\nprintf "%s" "len=${largeLiteral.length}"`,
+          },
+        ],
+      },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    const eventCalls = (mockDeps.store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls;
+    const completedEvent = eventCalls.find(
+      (call: unknown[]) =>
+        (call[0] as { event_type: string }).event_type === 'node_completed' &&
+        (call[0] as { step_name: string }).step_name === 'large'
+    );
+    expect(completedEvent).toBeDefined();
+    expect((completedEvent![0] as { data: { node_output: string } }).data.node_output).toBe(
+      `len=${largeLiteral.length}`
+    );
+  });
+
+  it('removes the temporary bash script file after completion', async () => {
+    const { execSpy, scriptFiles, scriptModes } = mockBashExecWithScriptCapture();
+    const mockDeps = createMockDeps();
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('bash-temp-cleanup-run-id');
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-temp-cleanup',
+      testDir,
+      { name: 'bash-temp-cleanup-test', nodes: [{ id: 'cleanup', bash: 'echo ok' }] },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    expect(scriptFiles).toHaveLength(1);
+    if (!isWindows) {
+      // NTFS honors only the read-only bit; Node chmod cannot produce 600 on Windows.
+      expect(scriptModes).toEqual(['600']);
+    }
+    await expect(stat(scriptFiles[0])).rejects.toThrow();
     execSpy.mockRestore();
   });
 });
