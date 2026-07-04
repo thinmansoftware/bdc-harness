@@ -5,7 +5,7 @@ description: |
   routing build nodes to Z.ai is preferred. All review nodes stay on Codex.
 
 policyFile: harness/policies/agent-behavior.md
-model: gpt-5.5  # root default non-Claude; bare nodes do not fall to Claude
+model: glm-5.2  # root default non-Claude; bare nodes do not fall to Claude
 
 nodes:
   # Pre-flight: fail closed if container lacks GITHUB auth (WO-169, 2026-05-16).
@@ -281,7 +281,7 @@ nodes:
 
   - id: implement
     provider: codex
-    model: gpt-5.5
+    model: glm-5.2
     depends_on: [plan-review]
     task_class: medium_work
     loop:
@@ -655,7 +655,7 @@ nodes:
       exit 0
 
   - id: war-council-validator
-    # Pin to claude/sonnet: trusted judge always Claude; top-level model: gpt-5.5
+    # Pin to claude/sonnet: trusted judge always Claude; top-level model: glm-5.2
     # must not route the validator to Codex. WO-HARNESS-SMART-CAULDRON-LANE-ROSTER-AND-RESILIENCE-01.
     provider: claude
     model: sonnet
@@ -782,7 +782,7 @@ nodes:
 
   - id: diff-repair
     provider: codex
-    model: gpt-5.5
+    model: glm-5.2
     depends_on: [diff-review, classify-diff-review]
     when: "$classify-diff-review.output.verdict == 'needs_revision'"
     task_class: medium_work
@@ -1005,7 +1005,7 @@ nodes:
   # resolve the block, then signals. If it can't fix, the run proceeds to the human pause.
   - id: opus-repair
     provider: codex
-    model: gpt-5.5
+    model: glm-5.2
     depends_on: [block-classify]
     when: "$block-classify.output.status == 'BLOCKED'"
     prompt: |
