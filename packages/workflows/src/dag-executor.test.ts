@@ -244,6 +244,15 @@ function mockBashExecWithScriptCapture(
 
 // --- Tests ---
 
+// Restore spies after every test so a failed assertion inside a test body cannot
+// leak its spyOn(git, 'execFileAsync') mock into subsequent tests (a leaked
+// bash-capture mock silently feeds canned output to unrelated tests and fails
+// bun-spawning script nodes). mock.restore() only restores spies, not
+// mock.module registrations.
+afterEach(() => {
+  mock.restore();
+});
+
 describe('buildTopologicalLayers', () => {
   it('single node with no dependencies -> one layer', () => {
     const layers = buildTopologicalLayers([node('a')]);
@@ -1505,7 +1514,10 @@ describe('executeDagWorkflow -- bash nodes', () => {
       })
     );
     expect(scriptTexts).toEqual(['echo ok']);
-    expect(scriptModes).toEqual(['600']);
+    if (!isWindows) {
+      // NTFS honors only the read-only bit; Node chmod cannot produce 600 on Windows.
+      expect(scriptModes).toEqual(['600']);
+    }
     execSpy.mockRestore();
   });
 
@@ -1734,7 +1746,10 @@ describe('executeDagWorkflow -- bash nodes', () => {
     );
 
     expect(scriptFiles).toHaveLength(1);
-    expect(scriptModes).toEqual(['600']);
+    if (!isWindows) {
+      // NTFS honors only the read-only bit; Node chmod cannot produce 600 on Windows.
+      expect(scriptModes).toEqual(['600']);
+    }
     await expect(stat(scriptFiles[0])).rejects.toThrow();
     execSpy.mockRestore();
   });

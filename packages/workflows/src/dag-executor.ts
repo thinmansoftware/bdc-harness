@@ -1668,15 +1668,12 @@ async function executeBashNode(
       } catch (error) {
         const err = error as Error & { code?: number | string };
         const details = err.message ? `: ${err.message}` : '';
-        throw Object.assign(
-          new Error(`${scriptFile}${details}`),
-          {
-            code: err.code,
-            cause: err,
-            scriptFile,
-            scriptPreparationFailed: true,
-          }
-        );
+        throw Object.assign(new Error(`${scriptFile}${details}`), {
+          code: err.code,
+          cause: err,
+          scriptFile,
+          scriptPreparationFailed: true,
+        });
       }
       ({ stdout, stderr } = await execFileAsync('bash', [scriptFile], {
         cwd,
