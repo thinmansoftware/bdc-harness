@@ -13,10 +13,13 @@ matter.
 
 LANE RULING (John): Cauldron lanes = CLAUDE + CODEX ONLY.
 
-Only two feature lanes remain active in `.archon/workflows/defaults/`:
+Three feature lanes remain active in `.archon/workflows/defaults/`:
 
 - `bdc-feature-development` (Claude)
 - `bdc-feature-development-codex` (Codex)
+- `bdc-feature-development-qwen` (kept per John's 2026-07-06 amendment: the only
+  non-Claude/Codex lane ever to succeed, 1/1 canary 7/2; retained as the
+  earn-the-seat re-entry vehicle)
 
 All other feature lanes are retired.
 
@@ -36,7 +39,6 @@ The retired lanes were unproven or dead by these numbers.
 
 - bdc-feature-development-glm
 - bdc-feature-development-zero
-- bdc-feature-development-qwen
 - bdc-feature-development-open-a
 - bdc-feature-development-open-b
 - bdc-feature-development-fusion-cx-glm
