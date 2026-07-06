@@ -1124,57 +1124,44 @@ nodes:
   - id: flip-notion
     persona: xo
     depends_on: [build-manifest]
-    trigger_rule: all_done
+    task_class: clerical
     bash: |
-      set -uo pipefail
-      # Rule 7: Archon does NOT auto-update Notion. Flip Claude Status=REVIEW + Status=Review
-      # (NEVER DONE -- Captain CI is the only closer). Fail OPEN: if NOTION_PAGE_ID is still
-      # the placeholder, or NOTION_TOKEN is absent, emit XO_ACTION instead of guessing.
-      PAGE_ID="${NOTION_PAGE_ID:-REPLACE_WITH_NOTION_PAGE_ID}"
-      WO_ID="${WO_ID:-WO-MC-NEGAN-DIAGNOSTIC-GRAPH-01}"
-      MANIFEST=$build-manifest.output
-      RECLASS=$block-reclassify.output
-      STATUS=$(printf '%s\n' "$RECLASS" | sed -n 's/.*"status":"\([A-Z_]*\)".*/\1/p' | head -1)
-      STATUS="${STATUS:-BLOCKED}"
+      set -euo pipefail
 
-      # BLOCKED -> do NOT flip to REVIEW; surface for XO and stop.
-      if [ "$STATUS" = "BLOCKED" ]; then
-        echo "XO_ACTION: run PAUSED/BLOCKED for ${WO_ID}; do NOT flip to REVIEW. Inspect the"
-        echo "pause-gate + diff-review-final + opus-repair output and correct, then resume or re-fire."
+      capture_node_output() {
+        python3 -c 'import shlex, sys; s=sys.stdin.read(); sys.stdout.write((lambda p: p[0] if len(p)==1 else s)(shlex.split(s)) if len(s)>=2 and s[0]=="'"'"'" and s.rstrip("\n").endswith("'"'"'") else s)'
+      }
+
+      MANIFEST=$(capture_node_output <<'BDC_NODE_OUTPUT_MANIFEST'
+      $build-manifest.output
+      BDC_NODE_OUTPUT_MANIFEST
+      )
+
+      READ_SPEC_OUT=$(capture_node_output <<'BDC_NODE_OUTPUT_READ_SPEC'
+      $read-spec.output
+      BDC_NODE_OUTPUT_READ_SPEC
+      )
+      ISSUE_REPO="${ISSUE_REPO:-bluedevilcollectibles/bdc-xo}"
+      ISSUE_NUM=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'issue=[0-9]+' | head -1 | cut -d= -f2 || true)
+      if [ -z "$ISSUE_NUM" ]; then
+        ISSUE_NUM=$(printf '%s\n' "$READ_SPEC_OUT" | sed -n 's/^SPEC_PATH=.*issues\/\([0-9][0-9]*\).*/\1/p' | head -1)
+      fi
+      if [ -z "$ISSUE_NUM" ]; then
+        WO_ID_FROM_SPEC=$(printf '%s\n' "$READ_SPEC_OUT" | sed -n 's/^WO_ID=//p' | head -1)
+        if [ -n "$WO_ID_FROM_SPEC" ]; then
+          ISSUE_NUM=$(gh issue list --repo "$ISSUE_REPO" --search "$WO_ID_FROM_SPEC in:title" --json number --jq '.[0].number // empty' 2>/dev/null || true)
+        fi
+      fi
+      if [ -z "$ISSUE_NUM" ]; then
+        echo "flip-notion: no GitHub issue resolved; skipping status:review label + manifest comment."
         exit 0
       fi
 
-      if [ "$PAGE_ID" = "REPLACE_WITH_NOTION_PAGE_ID" ] || [ -z "$PAGE_ID" ]; then
-        echo "XO_ACTION: NOTION_PAGE_ID not provided (still placeholder). Flip ${WO_ID} to"
-        echo "Claude Status=REVIEW + Status=Review manually and paste the manifest into Notes."
-        echo "--- MANIFEST ---"
-        printf '%s\n' "$MANIFEST"
-        exit 0
-      fi
-      if [ -z "${NOTION_TOKEN:-}" ]; then
-        echo "XO_ACTION: NOTION_TOKEN absent in container; cannot write Notion from the run."
-        echo "Flip ${WO_ID} (page ${PAGE_ID}) to Claude Status=REVIEW + Status=Review manually."
-        echo "--- MANIFEST ---"
-        printf '%s\n' "$MANIFEST"
-        exit 0
-      fi
-
-      # Best-effort Notion API write (Rule 11: NO n8n webhook -- direct api.notion.com only).
-      # Set both select properties to Review/REVIEW. Property names match the BDC tracker.
-      RESP=$(curl -s -w '\n%{http_code}' -X PATCH "https://api.notion.com/v1/pages/${PAGE_ID}" \
-        -H "Authorization: Bearer ${NOTION_TOKEN}" \
-        -H "Notion-Version: 2022-06-28" \
-        -H "Content-Type: application/json" \
-        -d '{"properties":{"Status":{"status":{"name":"Review"}},"Claude Status":{"select":{"name":"REVIEW"}}}}' 2>&1 || true)
-      CODE=$(printf '%s\n' "$RESP" | tail -n 1)
-      if [ "$CODE" = "200" ]; then
-        echo "flip-notion: set ${WO_ID} (page ${PAGE_ID}) -> Status=Review, Claude Status=REVIEW"
-        echo "STATUS=ok"
-      else
-        echo "XO_ACTION: Notion PATCH returned HTTP ${CODE}; flip ${WO_ID} (page ${PAGE_ID}) manually."
-        echo "DETAIL=$(printf '%s\n' "$RESP" | head -n -1)"
-        echo "STATUS=failed_flip"
-      fi
-      echo "--- MANIFEST (for Notes) ---"
-      printf '%s\n' "$MANIFEST"
-      exit 0
+      gh label create status:review --repo "$ISSUE_REPO" --color 0E8A16 --description "BDC workflow is ready for review" 2>/dev/null || true
+      gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --remove-label status:building 2>/dev/null || true
+      gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --remove-label status:blocked 2>/dev/null || true
+      gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --add-label status:review
+      COMMENT_FILE=$(mktemp)
+      printf '%s\n' "$MANIFEST" > "$COMMENT_FILE"
+      gh issue comment "$ISSUE_NUM" --repo "$ISSUE_REPO" --body-file "$COMMENT_FILE"
+      echo "flip-notion: $ISSUE_REPO#$ISSUE_NUM -> status:review (manifest posted as comment)"

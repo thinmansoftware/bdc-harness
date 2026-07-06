@@ -547,19 +547,43 @@ nodes:
   - id: flip-notion
     depends_on: [build-manifest]
     task_class: clerical
-    prompt: |
-      Flip Notion WO-SHOPOPS-CHANNEL-ADMIN-UI-01 to REVIEW with the manifest in Notes property.
+    bash: |
+      set -euo pipefail
 
-      # OPERATOR NOTE: Replace 35fef4c9-ce00-81b5-a3ed-c7fc2825ae30 below with the real Notion page ID
-      # for WO-SHOPOPS-CHANNEL-ADMIN-UI-01 before deploying this YAML.
-      # Find it via: notion search for "WO-SHOPOPS-CHANNEL-ADMIN-UI-01" in the BDC WO database.
-      Notion page ID: 35fef4c9-ce00-81b5-a3ed-c7fc2825ae30
+      capture_node_output() {
+        python3 -c 'import shlex, sys; s=sys.stdin.read(); sys.stdout.write((lambda p: p[0] if len(p)==1 else s)(shlex.split(s)) if len(s)>=2 and s[0]=="'"'"'" and s.rstrip("\n").endswith("'"'"'") else s)'
+      }
 
-      Required Notion changes (Captain CI reads Notes field, NOT comments -- per doctrine):
-      - Claude Status -> REVIEW
-      - Status -> Review
-      - Notes -> set to $build-manifest.output verbatim (manifest goes in Notes, not as page comment)
+      MANIFEST=$(capture_node_output <<'BDC_NODE_OUTPUT_MANIFEST'
+      $build-manifest.output
+      BDC_NODE_OUTPUT_MANIFEST
+      )
 
-      If Notion MCP is unavailable inside the container, output an XO_TODO line:
-        XO_TODO: flip WO-SHOPOPS-CHANNEL-ADMIN-UI-01 to REVIEW in Notion, paste manifest into Notes field.
-        Manifest: $build-manifest.output
+      READ_SPEC_OUT=$(capture_node_output <<'BDC_NODE_OUTPUT_READ_SPEC'
+      $read-spec.output
+      BDC_NODE_OUTPUT_READ_SPEC
+      )
+      ISSUE_REPO="${ISSUE_REPO:-bluedevilcollectibles/bdc-xo}"
+      ISSUE_NUM=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'issue=[0-9]+' | head -1 | cut -d= -f2 || true)
+      if [ -z "$ISSUE_NUM" ]; then
+        ISSUE_NUM=$(printf '%s\n' "$READ_SPEC_OUT" | sed -n 's/^SPEC_PATH=.*issues\/\([0-9][0-9]*\).*/\1/p' | head -1)
+      fi
+      if [ -z "$ISSUE_NUM" ]; then
+        WO_ID_FROM_SPEC=$(printf '%s\n' "$READ_SPEC_OUT" | sed -n 's/^WO_ID=//p' | head -1)
+        if [ -n "$WO_ID_FROM_SPEC" ]; then
+          ISSUE_NUM=$(gh issue list --repo "$ISSUE_REPO" --search "$WO_ID_FROM_SPEC in:title" --json number --jq '.[0].number // empty' 2>/dev/null || true)
+        fi
+      fi
+      if [ -z "$ISSUE_NUM" ]; then
+        echo "flip-notion: no GitHub issue resolved; skipping status:review label + manifest comment."
+        exit 0
+      fi
+
+      gh label create status:review --repo "$ISSUE_REPO" --color 0E8A16 --description "BDC workflow is ready for review" 2>/dev/null || true
+      gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --remove-label status:building 2>/dev/null || true
+      gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --remove-label status:blocked 2>/dev/null || true
+      gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --add-label status:review
+      COMMENT_FILE=$(mktemp)
+      printf '%s\n' "$MANIFEST" > "$COMMENT_FILE"
+      gh issue comment "$ISSUE_NUM" --repo "$ISSUE_REPO" --body-file "$COMMENT_FILE"
+      echo "flip-notion: $ISSUE_REPO#$ISSUE_NUM -> status:review (manifest posted as comment)"
