@@ -354,6 +354,16 @@ function isSdkSuccessContradiction(errorMessage: string): boolean {
 }
 
 /**
+ * Max characters of the serialized SDK message we persist in a contradiction
+ * dump. Mirrors the `SUBPROCESS_ERROR_MAX_CHARS` diagnostic-cap precedent in
+ * executor-shared.ts: a verbose SDK `errors[]`/message must never write an
+ * unbounded blob into `remote_agent_workflow_events`. More generous than the
+ * 2000-char user-facing cap because this field is root-cause evidence, but
+ * still bounded. The head is kept (JSON structure starts there).
+ */
+const SDK_CONTRADICTION_DUMP_MAX_CHARS = 8000;
+
+/**
  * Persist a `sdk-contradiction-dump` node event carrying the full raw SDK
  * message JSON plus the persona-load state, for root-cause evidence when the
  * SDK reports isError=true with errorSubtype='success'. Uses event_type
@@ -373,6 +383,9 @@ async function emitSdkContradictionDump(
     sdkMessageJson = JSON.stringify(sdkMessage);
   } catch (serializeErr) {
     sdkMessageJson = `<<unserializable SDK message: ${(serializeErr as Error).message}>>`;
+  }
+  if (sdkMessageJson.length > SDK_CONTRADICTION_DUMP_MAX_CHARS) {
+    sdkMessageJson = sdkMessageJson.slice(0, SDK_CONTRADICTION_DUMP_MAX_CHARS) + '...[truncated]';
   }
   await deps.store
     .createWorkflowEvent({
@@ -3770,9 +3783,13 @@ export async function executeDagWorkflow(
           // SDK success-contradiction (isError=true AND errorSubtype='success')
           // earns exactly one extra whole-node re-run, independent of the
           // transient-retry budget (WO-HARNESS-PR-STATUS-TRUTH-AND-AUTOMERGE-01).
-          // The transient loop below does NOT retry it (the contradiction message
-          // is neither TRANSIENT nor, by default, on_error:all), so this outer
-          // re-entry is what implements "retry the node once".
+          // The transient loop below explicitly excludes the contradiction from
+          // its budget (see `isContradiction`), so regardless of the node's
+          // on_error setting this outer re-entry is the ONLY thing that retries
+          // it -- exactly once. A contradiction whose errors[] text also matches
+          // a FATAL pattern (auth/permission/credit-balance) is NOT re-run: the
+          // FATAL guard on the outer check below preserves the "FATAL is never
+          // retried" invariant.
           let sdkContradictionRetryUsed = false;
           sdkContradictionRetry: for (;;) {
             for (let attempt = 0; attempt <= retryConfig.maxRetries; attempt++) {
@@ -3807,8 +3824,18 @@ export async function executeDagWorkflow(
                 ? classifyError(new Error(output.error)) === 'FATAL'
                 : false;
               const isTransient = output.error ? isTransientNodeError(output.error) : false;
+              // SDK success-contradictions are NEVER retried by this transient
+              // budget -- the outer `sdkContradictionRetry` loop grants them
+              // exactly one whole-node re-run. Without this exclusion,
+              // on_error:'all' would retry the contradiction maxRetries times
+              // here AND trigger the outer re-run, doubling the promised single
+              // extra execution to up to 2*(maxRetries+1) node runs.
+              const isContradiction = output.error
+                ? isSdkSuccessContradiction(output.error)
+                : false;
               const shouldRetry =
                 !isFatal &&
+                !isContradiction &&
                 (retryConfig.onError === 'all' ||
                   (retryConfig.onError === 'transient' && isTransient));
 
@@ -3841,7 +3868,10 @@ export async function executeDagWorkflow(
               output.state === 'failed' &&
               !sdkContradictionRetryUsed &&
               output.error !== undefined &&
-              isSdkSuccessContradiction(output.error)
+              isSdkSuccessContradiction(output.error) &&
+              // FATAL errors (auth/permission/credit-balance) are never retried,
+              // even when they arrive dressed as a success-contradiction.
+              classifyError(new Error(output.error)) !== 'FATAL'
             ) {
               sdkContradictionRetryUsed = true;
               getLog().warn({ nodeId: node.id }, 'dag.sdk_contradiction_retry');

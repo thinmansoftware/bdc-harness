@@ -10649,6 +10649,146 @@ describe('executeDagWorkflow -- WO-HARNESS-PR-STATUS-TRUTH-AND-AUTOMERGE-01', ()
     expect(toolInput.node_id).toBe('work');
   });
 
+  it('FATAL contradiction: a success-contradiction whose errors[] matches a FATAL pattern is NOT retried', async () => {
+    const mockStore = createMockStore();
+    const mockDeps = createMockDeps(mockStore);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun();
+
+    let calls = 0;
+    mockSendQueryDag.mockImplementation(function* () {
+      calls += 1;
+      // isError + subtype 'success' (contradiction) but errors[] also carries a
+      // FATAL signal ('credit balance'). FATAL must win: no whole-node re-run.
+      yield {
+        type: 'result',
+        isError: true,
+        errorSubtype: 'success',
+        errors: ['credit balance too low to continue'],
+      };
+    });
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-fatal-contradiction',
+      testDir,
+      { name: 'fatal-contradiction', nodes: [{ id: 'work', prompt: 'do the work' }] },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    // Exactly one execution -- the FATAL guard suppresses the contradiction re-run.
+    expect(calls).toBe(1);
+    // Node failed for real (non-paperwork) -> run failed.
+    expect((mockStore.failWorkflowRun as ReturnType<typeof mock>).mock.calls.length).toBe(1);
+    expect((mockStore.completeWorkflowRun as ReturnType<typeof mock>).mock.calls.length).toBe(0);
+  });
+
+  it('on_error:all contradiction: still retried exactly once (no double-counting against the transient budget)', async () => {
+    const mockStore = createMockStore();
+    const mockDeps = createMockDeps(mockStore);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun();
+
+    let calls = 0;
+    mockSendQueryDag.mockImplementation(function* () {
+      calls += 1;
+      // Every attempt is a (non-FATAL) success-contradiction.
+      yield { type: 'result', isError: true, errorSubtype: 'success' };
+    });
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-all-contradiction',
+      testDir,
+      {
+        name: 'all-contradiction',
+        // on_error:'all' with a transient budget of 2 retries. Without the inner
+        // exclusion this would run 2*(max_attempts+1) = 6 times; the contract is
+        // exactly one extra whole-node re-run (2 total).
+        nodes: [
+          {
+            id: 'work',
+            prompt: 'do the work',
+            retry: { max_attempts: 2, delay_ms: 1, on_error: 'all' },
+          },
+        ],
+      },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    // Exactly 2 executions: initial + one whole-node re-run. NOT 6.
+    expect(calls).toBe(2);
+    expect((mockStore.failWorkflowRun as ReturnType<typeof mock>).mock.calls.length).toBe(1);
+    expect((mockStore.completeWorkflowRun as ReturnType<typeof mock>).mock.calls.length).toBe(0);
+  });
+
+  it('contradiction dump: an oversized SDK message is truncated before persistence', async () => {
+    const mockStore = createMockStore();
+    const mockDeps = createMockDeps(mockStore);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun();
+
+    let calls = 0;
+    mockSendQueryDag.mockImplementation(function* () {
+      calls += 1;
+      if (calls === 1) {
+        // First attempt: contradiction with an enormous errors[] payload.
+        yield {
+          type: 'result',
+          isError: true,
+          errorSubtype: 'success',
+          errors: ['x'.repeat(50000)],
+        };
+        return;
+      }
+      // Retry: clean success so the run completes.
+      yield { type: 'assistant', content: 'clean success output' };
+      yield { type: 'result', sessionId: 'retry-sess' };
+    });
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-big-dump',
+      testDir,
+      { name: 'big-dump', nodes: [{ id: 'work', prompt: 'do the work' }] },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    const dumps = eventCalls(mockStore).filter(
+      ([a]) => a.event_type === 'tool_called' && a.data?.tool_name === 'sdk-contradiction-dump'
+    );
+    expect(dumps.length).toBe(1);
+    const toolInput = dumps[0][0].data?.tool_input as Record<string, unknown>;
+    const sdkMessage = toolInput.sdk_message as string;
+    // Bounded (not the full 50k blob) and marked as truncated.
+    expect(sdkMessage.length).toBeLessThan(9000);
+    expect(sdkMessage.endsWith('...[truncated]')).toBe(true);
+  });
+
   it('paperwork persona strip: loadContext is NOT called for a paperwork node', async () => {
     await writeAgent('xo-ctx');
     const mockStore = createMockStore();
