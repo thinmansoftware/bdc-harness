@@ -266,35 +266,43 @@ nodes:
     persona: xo
     depends_on: [open-pr]
     task_class: clerical
-    prompt: |
-      Flip the Notion WO page for WO-MC-SELF-REPAIR-LOOP-VIZ-01 to REVIEW.
+    bash: |
+      set -euo pipefail
 
-      Notion page ID: 371ef4c9-ce00-81b6-9f7f-cde4248aac8e
+      capture_node_output() {
+        python3 -c 'import shlex, sys; s=sys.stdin.read(); sys.stdout.write((lambda p: p[0] if len(p)==1 else s)(shlex.split(s)) if len(s)>=2 and s[0]=="'"'"'" and s.rstrip("\n").endswith("'"'"'") else s)'
+      }
 
-      Write the manifest below into the Notes property VERBATIM (NOT as a page comment -
-      Captain CI / the Cauldron grader reads Notes). Then update the two status fields.
+      MANIFEST=$(capture_node_output <<'BDC_NODE_OUTPUT_MANIFEST'
+      $open-pr.output
+      BDC_NODE_OUTPUT_MANIFEST
+      )
 
-      WO: WO-MC-SELF-REPAIR-LOOP-VIZ-01
-      Builder: Devils Cauldron (Archon bdc-mc-self-repair-loop-viz)
-      Files modified: [from implement output - e.g. packages/web/src/lib/dag-layout.ts, .../WorkflowExecution.tsx, .../WorkflowDagViewer.tsx, .../ExecutionDagNode.tsx]
-      Files created: [from implement output - e.g. packages/web/src/components/workflows/CycleBanner.tsx + test files]
-      Tests: bun run build PASS; bunx tsc --noEmit PASS (zero errors); web test suite - new render tests for looped/paused/no-loop runs pass
-      PRs: $open-pr.output (base dev)
-      Merge ancestors: bdc-harness dev HEAD, behind_by: 0
-      Grep assertions:
-        grep -c 'deriveLoopArcs' packages/web/src/lib/dag-layout.ts && [ $(grep -c 'deriveLoopArcs' packages/web/src/lib/dag-layout.ts) -ge 1 ]
-        grep -c 'approval_requested\|approval_received' packages/web/src/components/workflows/WorkflowExecution.tsx && [ $(grep -c 'approval_requested\|approval_received' packages/web/src/components/workflows/WorkflowExecution.tsx) -ge 1 ]
-        grep -rc 'CycleBanner' packages/web/src/components/workflows/ && [ $(grep -rl 'CycleBanner' packages/web/src/components/workflows/ | wc -l) -ge 1 ]
-      Runtime verification: N/A (frontend render change; visual verification on a real looped run, e.g. anchor 3bb2cbac, post-deploy)
-      Vercel deployment: N/A for source-grep close - Cauldron web deploys per harness pipeline (container rebuild on archon-app-1, or Vercel if web split); operator confirms current path post-merge
-      VALIDATION: PASS
+      READ_SPEC_OUT=$(capture_node_output <<'BDC_NODE_OUTPUT_READ_SPEC'
+      $read-spec.output
+      BDC_NODE_OUTPUT_READ_SPEC
+      )
+      ISSUE_REPO="${ISSUE_REPO:-bluedevilcollectibles/bdc-xo}"
+      ISSUE_NUM=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'issue=[0-9]+' | head -1 | cut -d= -f2 || true)
+      if [ -z "$ISSUE_NUM" ]; then
+        ISSUE_NUM=$(printf '%s\n' "$READ_SPEC_OUT" | sed -n 's/^SPEC_PATH=.*issues\/\([0-9][0-9]*\).*/\1/p' | head -1)
+      fi
+      if [ -z "$ISSUE_NUM" ]; then
+        WO_ID_FROM_SPEC=$(printf '%s\n' "$READ_SPEC_OUT" | sed -n 's/^WO_ID=//p' | head -1)
+        if [ -n "$WO_ID_FROM_SPEC" ]; then
+          ISSUE_NUM=$(gh issue list --repo "$ISSUE_REPO" --search "$WO_ID_FROM_SPEC in:title" --json number --jq '.[0].number // empty' 2>/dev/null || true)
+        fi
+      fi
+      if [ -z "$ISSUE_NUM" ]; then
+        echo "flip-notion: no GitHub issue resolved; skipping status:review label + manifest comment."
+        exit 0
+      fi
 
-      Update the page properties:
-       - Claude Status -> REVIEW
-       - Status -> Review
-       - Notes -> the manifest above, verbatim
-      Do NOT set DONE - only the grader closes the WO after VALIDATED.
-
-      Context for filling [bracketed] fields:
-      PR: $open-pr.output
-      Implement: $implement.output
+      gh label create status:review --repo "$ISSUE_REPO" --color 0E8A16 --description "BDC workflow is ready for review" 2>/dev/null || true
+      gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --remove-label status:building 2>/dev/null || true
+      gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --remove-label status:blocked 2>/dev/null || true
+      gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --add-label status:review
+      COMMENT_FILE=$(mktemp)
+      printf '%s\n' "$MANIFEST" > "$COMMENT_FILE"
+      gh issue comment "$ISSUE_NUM" --repo "$ISSUE_REPO" --body-file "$COMMENT_FILE"
+      echo "flip-notion: $ISSUE_REPO#$ISSUE_NUM -> status:review (manifest posted as comment)"

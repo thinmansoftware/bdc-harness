@@ -5,7 +5,11 @@
  *
  * S4a: Each lane YAML passes parseWorkflow() validation (DAG valid, no loader errors).
  * S4b: war-council-validator node has `provider: claude` and `model: sonnet` in EVERY lane
- *      (trusted judge always Claude regardless of top-level lane default).
+ *      (trusted judge always Claude regardless of top-level lane default), EXCEPT
+ *      bdc-feature-development-zero.yaml, which deliberately pins war-council-validator
+ *      to `provider: codex` -- the zero lane's entire purpose is zero Claude usage
+ *      (see the "zero-Claude law" comment in that file's header; fix(zero-lane) commit
+ *      96770782 landed this design without updating this test).
  *
  * Design: uses the real parseWorkflow() loader so validation logic matches production.
  */
@@ -65,6 +69,12 @@ describe('lane registration and war-council-validator pin', () => {
 
       if (!wcv) {
         // Some lanes may not have the validator (skip gracefully)
+        return;
+      }
+
+      if (file === 'bdc-feature-development-zero.yaml') {
+        // zero-Claude law: this lane pins war-council-validator to codex on purpose.
+        expect(wcv.provider).toBe('codex');
         return;
       }
 
