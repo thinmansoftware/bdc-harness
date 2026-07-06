@@ -28,6 +28,17 @@ mock.module('@archon/paths', () => ({
   getDefaultCommandsPath: () => '/nonexistent/defaults',
 }));
 
+// Mock the persona context loader so the paperwork persona-strip tests
+// (WO-HARNESS-PR-STATUS-TRUTH-AND-AUTOMERGE-01) can observe whether the live
+// wiki/oracle fetch was invoked. Must be registered before dag-executor is
+// imported. Only dag-executor consumes this module in the workflows package,
+// and no test here relies on the real loader, so this is isolation-safe within
+// this file's standalone `bun test` invocation.
+const mockLoadContext = mock(() => Promise.resolve('WIKI+ORACLE CONTEXT BLOCK'));
+mock.module('@archon/persona-context-loader', () => ({
+  loadContext: mockLoadContext,
+}));
+
 // --- Bootstrap provider registry (after path mocks, before dag-executor import) ---
 import { registerBuiltinProviders, clearRegistry } from '@archon/providers';
 clearRegistry();
@@ -10381,5 +10392,321 @@ describe('pendingGateResults cleanup in node_completed_with_warning paths', () =
     // If the Phase 1 entry leaked, this would be { passed:false, nodeType:'ai' }.
     expect(p2Gr.passed).toBe(true);
     expect(p2Gr.nodeType).toBe('script');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// WO-HARNESS-PR-STATUS-TRUTH-AND-AUTOMERGE-01
+// SDK success-contradiction retry, paperwork persona strip, artifact-truth
+// run finalization.
+// ---------------------------------------------------------------------------
+
+describe('executeDagWorkflow -- WO-HARNESS-PR-STATUS-TRUTH-AND-AUTOMERGE-01', () => {
+  let testDir: string;
+
+  beforeEach(async () => {
+    testDir = join(tmpdir(), `dag-wo-truth-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    await mkdir(join(testDir, '.archon', 'commands'), { recursive: true });
+    mockSendQueryDag.mockClear();
+    mockGetAgentProviderDag.mockClear();
+    mockLoadContext.mockClear();
+    mockGetAgentProviderDag.mockImplementation(() => ({
+      sendQuery: mockSendQueryDag,
+      getType: () => 'claude',
+      getCapabilities: mockClaudeCapabilities,
+    }));
+    clearAgentRegistryCache();
+  });
+
+  afterEach(async () => {
+    mockSendQueryDag.mockImplementation(function* () {
+      yield { type: 'assistant', content: 'DAG AI response' };
+      yield { type: 'result', sessionId: 'dag-session-id' };
+    });
+    try {
+      await rm(testDir, { recursive: true, force: true });
+    } catch {
+      // ignore cleanup errors
+    }
+  });
+
+  type EventCall = [{ event_type: string; step_name?: string; data?: Record<string, unknown> }];
+  function eventCalls(store: IWorkflowStore): EventCall[] {
+    return (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls as EventCall[];
+  }
+
+  async function writeAgent(name: string): Promise<void> {
+    const agentsDir = join(testDir, '.archon', 'agents');
+    await mkdir(agentsDir, { recursive: true });
+    await writeFile(
+      join(agentsDir, `${name}.md`),
+      [
+        '---',
+        `name: ${name}`,
+        'model: sonnet',
+        'context:',
+        '  oracle:',
+        '    - test query',
+        '---',
+        '',
+        'Agent prompt.',
+      ].join('\n')
+    );
+  }
+
+  it('artifact-truth: paperwork-only failure after a PR artifact finalizes as completed+degraded', async () => {
+    const mockStore = createMockStore();
+    const mockDeps = createMockDeps(mockStore);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun();
+
+    mockSendQueryDag.mockImplementation(function* (prompt: string) {
+      if (prompt.includes('MANIFEST_MARKER')) {
+        // build-manifest node: SDK success-contradiction on every attempt -> fails.
+        yield { type: 'result', isError: true, errorSubtype: 'success' };
+        return;
+      }
+      // push node: emits a real PR URL artifact then succeeds.
+      yield { type: 'assistant', content: 'PR_URL=https://github.com/foo/bar/pull/463' };
+      yield { type: 'result', sessionId: 'push-sess' };
+    });
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-truth',
+      testDir,
+      {
+        name: 'truth-degraded',
+        nodes: [
+          { id: 'push', prompt: 'PUSH_MARKER open a PR' },
+          {
+            id: 'build-manifest',
+            prompt: 'MANIFEST_MARKER build the manifest',
+            depends_on: ['push'],
+          },
+        ],
+      },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    // Completed as degraded, NOT failed.
+    const completeCalls = (mockStore.completeWorkflowRun as ReturnType<typeof mock>).mock
+      .calls as Array<[string, Record<string, unknown>]>;
+    expect(completeCalls.length).toBe(1);
+    const meta = completeCalls[0][1];
+    expect(meta.paperwork_degraded).toBe(true);
+    expect(meta.degraded_paperwork_nodes).toEqual(['build-manifest']);
+    expect((mockStore.failWorkflowRun as ReturnType<typeof mock>).mock.calls.length).toBe(0);
+
+    // workflow_completed event present.
+    const completedEvt = eventCalls(mockStore).find(([a]) => a.event_type === 'workflow_completed');
+    expect(completedEvt).toBeDefined();
+    expect(completedEvt?.[0].data?.paperwork_degraded).toBe(true);
+  });
+
+  it('real failure still fails: non-paperwork node failure marks the run failed', async () => {
+    const mockStore = createMockStore();
+    const mockDeps = createMockDeps(mockStore);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun();
+
+    mockSendQueryDag.mockImplementation(function* (prompt: string) {
+      if (prompt.includes('IMPLEMENT_MARKER')) {
+        yield { type: 'result', isError: true, errorSubtype: 'error' };
+        return;
+      }
+      // setup node completes with no artifact.
+      yield { type: 'assistant', content: 'setup done, nothing pushed' };
+      yield { type: 'result', sessionId: 'setup-sess' };
+    });
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-realfail',
+      testDir,
+      {
+        name: 'real-failure',
+        nodes: [
+          { id: 'setup', prompt: 'SETUP_MARKER prepare' },
+          { id: 'implement', prompt: 'IMPLEMENT_MARKER do work', depends_on: ['setup'] },
+        ],
+      },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    expect((mockStore.failWorkflowRun as ReturnType<typeof mock>).mock.calls.length).toBe(1);
+    expect((mockStore.completeWorkflowRun as ReturnType<typeof mock>).mock.calls.length).toBe(0);
+  });
+
+  it('artifact-truth guard: paperwork failure with NO artifact still fails', async () => {
+    const mockStore = createMockStore();
+    const mockDeps = createMockDeps(mockStore);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun();
+
+    mockSendQueryDag.mockImplementation(function* (prompt: string) {
+      if (prompt.includes('MANIFEST_MARKER')) {
+        yield { type: 'result', isError: true, errorSubtype: 'success' };
+        return;
+      }
+      // upstream completes but WITHOUT any push/PR artifact.
+      yield { type: 'assistant', content: 'reviewed the diff, all good' };
+      yield { type: 'result', sessionId: 'review-sess' };
+    });
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-noartifact',
+      testDir,
+      {
+        name: 'paperwork-no-artifact',
+        nodes: [
+          { id: 'review', prompt: 'REVIEW_MARKER review' },
+          { id: 'build-manifest', prompt: 'MANIFEST_MARKER manifest', depends_on: ['review'] },
+        ],
+      },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    expect((mockStore.failWorkflowRun as ReturnType<typeof mock>).mock.calls.length).toBe(1);
+    expect((mockStore.completeWorkflowRun as ReturnType<typeof mock>).mock.calls.length).toBe(0);
+  });
+
+  it('contradiction retry: retries once and completes; one sdk-contradiction-dump event exists', async () => {
+    const mockStore = createMockStore();
+    const mockDeps = createMockDeps(mockStore);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun();
+
+    let calls = 0;
+    mockSendQueryDag.mockImplementation(function* () {
+      calls += 1;
+      if (calls === 1) {
+        // First attempt: SDK reports isError + errorSubtype 'success' (contradiction).
+        yield { type: 'result', isError: true, errorSubtype: 'success' };
+        return;
+      }
+      // Retry: clean success.
+      yield { type: 'assistant', content: 'clean success output' };
+      yield { type: 'result', sessionId: 'retry-sess' };
+    });
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-contradiction',
+      testDir,
+      { name: 'contradiction-retry', nodes: [{ id: 'work', prompt: 'do the work' }] },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    // Ran twice (initial contradiction + one retry).
+    expect(mockSendQueryDag.mock.calls.length).toBe(2);
+
+    // Node completed -> run completed.
+    expect((mockStore.completeWorkflowRun as ReturnType<typeof mock>).mock.calls.length).toBe(1);
+    expect((mockStore.failWorkflowRun as ReturnType<typeof mock>).mock.calls.length).toBe(0);
+
+    // Exactly one contradiction-dump event with full evidence.
+    const dumps = eventCalls(mockStore).filter(
+      ([a]) => a.event_type === 'tool_called' && a.data?.tool_name === 'sdk-contradiction-dump'
+    );
+    expect(dumps.length).toBe(1);
+    const toolInput = dumps[0][0].data?.tool_input as Record<string, unknown>;
+    expect(toolInput.persona_context_state).toBe('none');
+    expect(typeof toolInput.sdk_message).toBe('string');
+    expect(toolInput.node_id).toBe('work');
+  });
+
+  it('paperwork persona strip: loadContext is NOT called for a paperwork node', async () => {
+    await writeAgent('xo-ctx');
+    const mockStore = createMockStore();
+    const mockDeps = createMockDeps(mockStore);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun();
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-strip',
+      testDir,
+      {
+        name: 'persona-strip',
+        nodes: [{ id: 'flip-notion', prompt: 'flip the notion', persona: 'xo-ctx' }],
+      },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    // Paperwork node -> context load skipped, but the node still runs.
+    expect(mockLoadContext.mock.calls.length).toBe(0);
+    expect(mockSendQueryDag.mock.calls.length).toBeGreaterThan(0);
+    expect((mockStore.completeWorkflowRun as ReturnType<typeof mock>).mock.calls.length).toBe(1);
+  });
+
+  it('paperwork persona strip control: loadContext IS called for a non-paperwork node', async () => {
+    await writeAgent('xo-ctx');
+    const mockStore = createMockStore();
+    const mockDeps = createMockDeps(mockStore);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun();
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-noStrip',
+      testDir,
+      {
+        name: 'persona-loaded',
+        nodes: [{ id: 'do-work', prompt: 'do the work', persona: 'xo-ctx' }],
+      },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    expect(mockLoadContext.mock.calls.length).toBe(1);
   });
 });

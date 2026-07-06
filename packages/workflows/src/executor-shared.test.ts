@@ -30,6 +30,9 @@ import {
   classifyError,
   resolveAgentPersona,
   InfrastructureClassBlock,
+  PAPERWORK_NODES,
+  isPaperworkNode,
+  hasPushArtifact,
 } from './executor-shared';
 
 describe('substituteWorkflowVariables', () => {
@@ -727,5 +730,58 @@ describe('resolveAgentPersona', () => {
     const resolution = resolveAgentPersona(persona, undefined, 'opr');
     expect(resolution.agentName).toBe('test-agent');
     expect(resolution.model).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// PAPERWORK_NODES + artifact truth (WO-HARNESS-PR-STATUS-TRUTH-AND-AUTOMERGE-01)
+// ---------------------------------------------------------------------------
+
+describe('PAPERWORK_NODES', () => {
+  it('has the exact declared membership (single source of truth)', () => {
+    expect([...PAPERWORK_NODES]).toEqual([
+      'findings-consolidate',
+      'decide-push-target',
+      'build-manifest',
+      'flip-notion',
+      'flip-notion-on-failure',
+    ]);
+  });
+
+  it('isPaperworkNode is true for every declared paperwork node', () => {
+    for (const id of PAPERWORK_NODES) {
+      expect(isPaperworkNode(id)).toBe(true);
+    }
+  });
+
+  it('isPaperworkNode is false for a substantive node', () => {
+    expect(isPaperworkNode('implement')).toBe(false);
+    expect(isPaperworkNode('open-pr-if-needed')).toBe(false);
+    expect(isPaperworkNode('commit-and-push')).toBe(false);
+  });
+});
+
+describe('hasPushArtifact', () => {
+  it('detects a real GitHub PR URL', () => {
+    expect(hasPushArtifact('PR_URL=https://github.com/foo/bar/pull/463')).toBe(true);
+    expect(hasPushArtifact('opened https://github.com/foo/bar-baz/pull/1 ok')).toBe(true);
+  });
+
+  it('detects a pushed unique_branch with a value', () => {
+    expect(hasPushArtifact('unique_branch=feat/wo-123')).toBe(true);
+  });
+
+  it('does NOT match an empty PR_URL= / unique_branch= line', () => {
+    expect(hasPushArtifact('PR_URL=')).toBe(false);
+    expect(hasPushArtifact('unique_branch=')).toBe(false);
+  });
+
+  it('does NOT match arbitrary prose with no artifact', () => {
+    expect(hasPushArtifact('the build finished and everything looks good')).toBe(false);
+    expect(hasPushArtifact('')).toBe(false);
+  });
+
+  it('does NOT match a non-PR github URL', () => {
+    expect(hasPushArtifact('see https://github.com/foo/bar/issues/12')).toBe(false);
   });
 });
