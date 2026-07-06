@@ -82,6 +82,8 @@ import {
   formatSubprocessFailure,
   resolveAgentPersona,
   InfrastructureClassBlock,
+  isPaperworkNode,
+  hasPushArtifact,
 } from './executor-shared';
 import { loadAgentRegistry, resolveAgent } from './agents/registry';
 import type { AgentRegistry } from './agents/registry';
@@ -342,6 +344,72 @@ function isTransientNodeError(errorMessage: string): boolean {
 }
 
 /**
+ * True when a node error message is the SDK success-contradiction
+ * (WO-HARNESS-PR-STATUS-TRUTH-AND-AUTOMERGE-01). The throw site formats it as
+ * `Node '<id>' failed: SDK returned success...`; the outer retry loop uses this
+ * to grant the node exactly one extra re-run, independent of the transient budget.
+ */
+function isSdkSuccessContradiction(errorMessage: string): boolean {
+  return /failed: SDK returned success\b/.test(errorMessage);
+}
+
+/**
+ * Max characters of the serialized SDK message we persist in a contradiction
+ * dump. Mirrors the `SUBPROCESS_ERROR_MAX_CHARS` diagnostic-cap precedent in
+ * executor-shared.ts: a verbose SDK `errors[]`/message must never write an
+ * unbounded blob into `remote_agent_workflow_events`. More generous than the
+ * 2000-char user-facing cap because this field is root-cause evidence, but
+ * still bounded. The head is kept (JSON structure starts there).
+ */
+const SDK_CONTRADICTION_DUMP_MAX_CHARS = 8000;
+
+/**
+ * Persist a `sdk-contradiction-dump` node event carrying the full raw SDK
+ * message JSON plus the persona-load state, for root-cause evidence when the
+ * SDK reports isError=true with errorSubtype='success'. Uses event_type
+ * 'tool_called' / tool_name 'sdk-contradiction-dump' (Section 6 of the WO) so
+ * it rides the existing remote_agent_workflow_events schema with no migration.
+ * Awaited (not fire-and-forget) so the evidence is durable before the node throws.
+ */
+async function emitSdkContradictionDump(
+  deps: WorkflowDeps,
+  workflowRunId: string,
+  nodeId: string,
+  sdkMessage: unknown,
+  personaContextState: string
+): Promise<void> {
+  let sdkMessageJson: string;
+  try {
+    sdkMessageJson = JSON.stringify(sdkMessage);
+  } catch (serializeErr) {
+    sdkMessageJson = `<<unserializable SDK message: ${(serializeErr as Error).message}>>`;
+  }
+  if (sdkMessageJson.length > SDK_CONTRADICTION_DUMP_MAX_CHARS) {
+    sdkMessageJson = sdkMessageJson.slice(0, SDK_CONTRADICTION_DUMP_MAX_CHARS) + '...[truncated]';
+  }
+  await deps.store
+    .createWorkflowEvent({
+      workflow_run_id: workflowRunId,
+      event_type: 'tool_called',
+      step_name: nodeId,
+      data: {
+        tool_name: 'sdk-contradiction-dump',
+        tool_input: {
+          node_id: nodeId,
+          persona_context_state: personaContextState,
+          sdk_message: sdkMessageJson,
+        },
+      },
+    })
+    .catch((err: Error) => {
+      getLog().error(
+        { err, workflowRunId, nodeId, eventType: 'tool_called' },
+        'dag.sdk_contradiction_dump_persist_failed'
+      );
+    });
+}
+
+/**
  * Safely send a message to the platform without crashing on failure.
  * Returns true if message was sent successfully, false otherwise.
  */
@@ -500,6 +568,16 @@ async function resolveNodeProviderAndModel(
    * the SDK, unchanged from prior behavior).
    */
   declaredModelId: string | undefined;
+  /**
+   * Persona wiki/oracle context-load state, forwarded to the SDK-contradiction
+   * dump (WO-HARNESS-PR-STATUS-TRUTH-AND-AUTOMERGE-01) for root-cause evidence:
+   *   - 'none'    -- node declares no persona, or the persona has no context block
+   *   - 'skipped' -- paperwork node: loadContext deliberately NOT called
+   *   - 'loaded'  -- loadContext returned a non-empty context block
+   *   - 'empty'   -- loadContext returned an empty string
+   *   - 'failed'  -- loadContext threw and was caught
+   */
+  personaContextState: string;
 }> {
   // Provider is explicit: node.provider ?? workflow.provider. Model never
   // influences provider selection. Model strings pass through to the SDK.
@@ -592,6 +670,8 @@ async function resolveNodeProviderAndModel(
   let effectiveModel = model;
   let effectiveSystemPrompt = node.systemPrompt;
   let effectiveAllowedTools = node.allowed_tools;
+  // Persona wiki/oracle context-load state, forwarded to the contradiction dump.
+  let personaContextState = 'none';
 
   const nodeAgentRef = node as { agent?: string; persona?: string };
   const agentName = nodeAgentRef.agent ?? nodeAgentRef.persona;
@@ -610,16 +690,30 @@ async function resolveNodeProviderAndModel(
         effectiveAllowedTools = personaResolution.allowedTools;
       }
 
-      // Load persona context (wiki + oracle) and prepend to system prompt
+      // Load persona context (wiki + oracle) and prepend to system prompt.
+      // Paperwork/tail nodes (WO-HARNESS-PR-STATUS-TRUTH-AND-AUTOMERGE-01) run
+      // with a bare model -- skip the live wiki/oracle fetch entirely. Every
+      // failing tail node in the 2026-07-06 incident carried persona: xo and a
+      // context load; skipping it removes that failure surface. Model/system
+      // prompt/tools are still resolved above; only the context fetch is skipped.
       if (persona.context) {
-        const contextBlock = await loadContext(persona).catch((err: unknown) => {
-          getLog().warn({ agentName, err: (err as Error).message }, 'agent.context_load_failed');
-          return '';
-        });
-        if (contextBlock) {
-          effectiveSystemPrompt = effectiveSystemPrompt
-            ? `${contextBlock}\n\n${effectiveSystemPrompt}`
-            : contextBlock;
+        if (isPaperworkNode(node.id)) {
+          personaContextState = 'skipped';
+          getLog().debug({ nodeId: node.id, agentName }, 'dag.persona_context_skipped_paperwork');
+        } else {
+          const contextBlock = await loadContext(persona).catch((err: unknown) => {
+            getLog().warn({ agentName, err: (err as Error).message }, 'agent.context_load_failed');
+            personaContextState = 'failed';
+            return '';
+          });
+          if (contextBlock) {
+            personaContextState = 'loaded';
+            effectiveSystemPrompt = effectiveSystemPrompt
+              ? `${contextBlock}\n\n${effectiveSystemPrompt}`
+              : contextBlock;
+          } else if (personaContextState !== 'failed') {
+            personaContextState = 'empty';
+          }
         }
       }
     }
@@ -666,7 +760,13 @@ async function resolveNodeProviderAndModel(
     assistantConfig,
   };
 
-  return { provider, model: effectiveModel, options, declaredModelId: model };
+  return {
+    provider,
+    model: effectiveModel,
+    options,
+    declaredModelId: model,
+    personaContextState,
+  };
 }
 
 /** Evaluate trigger rule for a node given its upstream states */
@@ -775,7 +875,11 @@ async function executeNodeInternal(
   nodeOutputs: Map<string, NodeOutput>,
   resumeSessionId: string | undefined,
   configuredCommandFolder?: string,
-  issueContext?: string
+  issueContext?: string,
+  // Persona wiki/oracle context-load state from resolveNodeProviderAndModel,
+  // dumped alongside the raw SDK message on a success-contradiction for
+  // root-cause evidence (WO-HARNESS-PR-STATUS-TRUTH-AND-AUTOMERGE-01).
+  personaContextState = 'none'
 ): Promise<NodeExecutionResult> {
   const nodeStartTime = Date.now();
   const nodeContext: SendMessageContext = { workflowId: workflowRun.id, nodeName: node.id };
@@ -1118,6 +1222,16 @@ async function executeNodeInternal(
             },
             'dag.node_sdk_error_result'
           );
+          // SDK success-contradiction (isError=true AND errorSubtype='success'):
+          // the SDK reports both "done successfully" and "errored" at once --
+          // the 2026-07-06 failure class (bdc-harness#344). Dump the full raw
+          // SDK message + persona-load state to a node event for root-cause
+          // evidence BEFORE throwing. The node still fails here; the outer retry
+          // loop re-runs it exactly once (retry-once, per the WO). If the retry
+          // also contradicts, another dump is written and the node fails for real.
+          if (msg.errorSubtype === 'success') {
+            await emitSdkContradictionDump(deps, workflowRun.id, node.id, msg, personaContextState);
+          }
           throw new Error(`Node '${node.id}' failed: SDK returned ${subtype}${errorsDetail}`);
         }
         break; // Result is the "I'm done" signal -- don't wait for subprocess to exit
@@ -3090,6 +3204,7 @@ async function executeApprovalNode(
       provider,
       options: nodeOptions,
       declaredModelId,
+      personaContextState,
     } = await resolveNodeProviderAndModel(
       syntheticNode,
       workflowProvider,
@@ -3119,7 +3234,8 @@ async function executeApprovalNode(
       nodeOutputs,
       undefined, // fresh session
       configuredCommandFolder,
-      issueContext
+      issueContext,
+      personaContextState
     );
 
     if (output.state === 'failed') {
@@ -3637,6 +3753,7 @@ export async function executeDagWorkflow(
             provider,
             options: nodeOptions,
             declaredModelId,
+            personaContextState,
           } = await resolveNodeProviderAndModel(
             node,
             workflowProvider,
@@ -3663,65 +3780,110 @@ export async function executeDagWorkflow(
             error: 'Node did not execute',
           };
 
-          for (let attempt = 0; attempt <= retryConfig.maxRetries; attempt++) {
-            output = await executeNodeInternal(
-              deps,
-              platform,
-              conversationId,
-              cwd,
-              workflowRun,
-              node,
-              provider,
-              nodeOptions,
-              declaredModelId,
-              artifactsDir,
-              logDir,
-              baseBranch,
-              docsDir,
-              nodeOutputs,
-              // Always pass the prior session ID -- forkSession:true in executeNodeInternal
-              // ensures the source is never mutated, so retries can safely resume from it.
-              resumeSessionId,
-              configuredCommandFolder,
-              issueContext
-            );
+          // SDK success-contradiction (isError=true AND errorSubtype='success')
+          // earns exactly one extra whole-node re-run, independent of the
+          // transient-retry budget (WO-HARNESS-PR-STATUS-TRUTH-AND-AUTOMERGE-01).
+          // The transient loop below explicitly excludes the contradiction from
+          // its budget (see `isContradiction`), so regardless of the node's
+          // on_error setting this outer re-entry is the ONLY thing that retries
+          // it -- exactly once. A contradiction whose errors[] text also matches
+          // a FATAL pattern (auth/permission/credit-balance) is NOT re-run: the
+          // FATAL guard on the outer check below preserves the "FATAL is never
+          // retried" invariant.
+          let sdkContradictionRetryUsed = false;
+          sdkContradictionRetry: for (;;) {
+            for (let attempt = 0; attempt <= retryConfig.maxRetries; attempt++) {
+              output = await executeNodeInternal(
+                deps,
+                platform,
+                conversationId,
+                cwd,
+                workflowRun,
+                node,
+                provider,
+                nodeOptions,
+                declaredModelId,
+                artifactsDir,
+                logDir,
+                baseBranch,
+                docsDir,
+                nodeOutputs,
+                // Always pass the prior session ID -- forkSession:true in executeNodeInternal
+                // ensures the source is never mutated, so retries can safely resume from it.
+                resumeSessionId,
+                configuredCommandFolder,
+                issueContext,
+                personaContextState
+              );
 
-            if (output.state !== 'failed') break;
+              if (output.state !== 'failed') break;
 
-            // Check if retryable.
-            // FATAL errors (auth, permissions, credit balance) are never retried even when on_error:all.
-            const isFatal = output.error
-              ? classifyError(new Error(output.error)) === 'FATAL'
-              : false;
-            const isTransient = output.error ? isTransientNodeError(output.error) : false;
-            const shouldRetry =
-              !isFatal &&
-              (retryConfig.onError === 'all' ||
-                (retryConfig.onError === 'transient' && isTransient));
+              // Check if retryable.
+              // FATAL errors (auth, permissions, credit balance) are never retried even when on_error:all.
+              const isFatal = output.error
+                ? classifyError(new Error(output.error)) === 'FATAL'
+                : false;
+              const isTransient = output.error ? isTransientNodeError(output.error) : false;
+              // SDK success-contradictions are NEVER retried by this transient
+              // budget -- the outer `sdkContradictionRetry` loop grants them
+              // exactly one whole-node re-run. Without this exclusion,
+              // on_error:'all' would retry the contradiction maxRetries times
+              // here AND trigger the outer re-run, doubling the promised single
+              // extra execution to up to 2*(maxRetries+1) node runs.
+              const isContradiction = output.error
+                ? isSdkSuccessContradiction(output.error)
+                : false;
+              const shouldRetry =
+                !isFatal &&
+                !isContradiction &&
+                (retryConfig.onError === 'all' ||
+                  (retryConfig.onError === 'transient' && isTransient));
 
-            if (!shouldRetry || attempt >= retryConfig.maxRetries) break;
+              if (!shouldRetry || attempt >= retryConfig.maxRetries) break;
 
-            const delayMs = retryConfig.delayMs * Math.pow(2, attempt);
-            getLog().warn(
-              {
-                nodeId: node.id,
-                attempt: attempt + 1,
-                maxRetries: retryConfig.maxRetries,
-                delayMs,
-                error: output.error,
-              },
-              'dag_node_transient_retry'
-            );
+              const delayMs = retryConfig.delayMs * Math.pow(2, attempt);
+              getLog().warn(
+                {
+                  nodeId: node.id,
+                  attempt: attempt + 1,
+                  maxRetries: retryConfig.maxRetries,
+                  delayMs,
+                  error: output.error,
+                },
+                'dag_node_transient_retry'
+              );
 
-            const errorKind = isTransient ? 'transient error' : 'error';
-            await safeSendMessage(
-              platform,
-              conversationId,
-              `! Node \`${node.id}\` failed with ${errorKind} (attempt ${String(attempt + 1)}/${String(retryConfig.maxRetries + 1)}). Retrying in ${String(Math.round(delayMs / 1000))}s...`,
-              { workflowId: workflowRun.id, nodeName: node.id }
-            );
+              const errorKind = isTransient ? 'transient error' : 'error';
+              await safeSendMessage(
+                platform,
+                conversationId,
+                `! Node \`${node.id}\` failed with ${errorKind} (attempt ${String(attempt + 1)}/${String(retryConfig.maxRetries + 1)}). Retrying in ${String(Math.round(delayMs / 1000))}s...`,
+                { workflowId: workflowRun.id, nodeName: node.id }
+              );
 
-            await new Promise(resolve => setTimeout(resolve, delayMs));
+              await new Promise(resolve => setTimeout(resolve, delayMs));
+            }
+
+            if (
+              output.state === 'failed' &&
+              !sdkContradictionRetryUsed &&
+              output.error !== undefined &&
+              isSdkSuccessContradiction(output.error) &&
+              // FATAL errors (auth/permission/credit-balance) are never retried,
+              // even when they arrive dressed as a success-contradiction.
+              classifyError(new Error(output.error)) !== 'FATAL'
+            ) {
+              sdkContradictionRetryUsed = true;
+              getLog().warn({ nodeId: node.id }, 'dag.sdk_contradiction_retry');
+              await safeSendMessage(
+                platform,
+                conversationId,
+                `! Node \`${node.id}\` hit an SDK success-contradiction (isError + subtype 'success'); retrying once.`,
+                { workflowId: workflowRun.id, nodeName: node.id }
+              );
+              continue sdkContradictionRetry;
+            }
+            break;
           }
 
           return { nodeId: node.id, output };
@@ -3931,6 +4093,94 @@ export async function executeDagWorkflow(
 
   if (anyFailed) {
     if (await skipIfStatusChanged('dag.skip_fail_status_changed')) return;
+
+    // Artifact-truth finalization (WO-HARNESS-PR-STATUS-TRUTH-AND-AUTOMERGE-01):
+    // if EVERY failed node is a paperwork/tail node AND a real pushed-branch/PR
+    // artifact exists among the run's node outputs, then the run's substantive
+    // work landed -- only the paperwork could not be filed. Finalize as
+    // COMPLETED (degraded) instead of FAILED so the dashboard reflects truth and
+    // no green PR is buried under a false-red run. This is the 2026-07-06
+    // failure class tracked in bdc-harness#344. If EITHER condition is false
+    // (a non-paperwork node failed, or no artifact exists) the run fails exactly
+    // as before -- unchanged behavior.
+    const failedNodeIds = [...nodeOutputs.entries()]
+      .filter(([, o]) => o.state === 'failed')
+      .map(([id]) => id);
+    const allFailuresArePaperwork = failedNodeIds.every(id => isPaperworkNode(id));
+    const pushArtifactPresent = [...nodeOutputs.values()].some(o => hasPushArtifact(o.output));
+
+    if (allFailuresArePaperwork && pushArtifactPresent) {
+      getLog().warn(
+        { workflowRunId: workflowRun.id, degradedPaperworkNodes: failedNodeIds },
+        'dag.workflow_completed_paperwork_degraded'
+      );
+      try {
+        await deps.store.completeWorkflowRun(workflowRun.id, {
+          node_counts: nodeCounts,
+          // Degraded-success signal consumed by the dashboard (Section 5 of the
+          // WO): status 'completed' + paperwork_degraded=true, no new enum value.
+          paperwork_degraded: true,
+          degraded_paperwork_nodes: failedNodeIds,
+          ...(totalCostUsd > 0 ? { total_cost_usd: totalCostUsd } : {}),
+          ...(totalTokens > 0 ? { total_tokens: totalTokens } : {}),
+          ...(totalFrontierCostUsd > 0 ? { total_frontier_cost_usd: totalFrontierCostUsd } : {}),
+          ...(nodeModelSummary.length > 0 ? { node_model_summary: nodeModelSummary } : {}),
+          ...(modelMismatchCount > 0 ? { model_mismatch_count: modelMismatchCount } : {}),
+        });
+        // Terminal state reached: emit 'run_token_totals' rollup event.
+        emitTerminalRunTokenTotals();
+      } catch (dbErr) {
+        getLog().error(
+          { err: dbErr as Error, workflowRunId: workflowRun.id },
+          'dag_db_complete_failed'
+        );
+        await safeSendMessage(
+          platform,
+          conversationId,
+          'Warning: workflow completed (degraded) but the run status could not be saved. The workflow result may appear inconsistent.',
+          { workflowId: workflowRun.id }
+        );
+      }
+      await logWorkflowComplete(logDir, workflowRun.id).catch((logErr: Error) => {
+        getLog().error(
+          { err: logErr, workflowRunId: workflowRun.id },
+          'dag.workflow_complete_log_write_failed'
+        );
+      });
+      const degradedDuration = Date.now() - dagStartTime;
+      const emitterDegraded = getWorkflowEventEmitter();
+      emitterDegraded.emit({
+        type: 'workflow_completed',
+        runId: workflowRun.id,
+        workflowName: workflow.name,
+        duration: degradedDuration,
+      });
+      await deps.store
+        .createWorkflowEvent({
+          workflow_run_id: workflowRun.id,
+          event_type: 'workflow_completed',
+          data: {
+            duration_ms: degradedDuration,
+            paperwork_degraded: true,
+            degraded_paperwork_nodes: failedNodeIds,
+          },
+        })
+        .catch((err: Error) => {
+          getLog().error(
+            { err, workflowRunId: workflowRun.id, eventType: 'workflow_completed' },
+            'workflow_event_persist_failed'
+          );
+        });
+      emitterDegraded.unregisterRun(workflowRun.id);
+      await safeSendMessage(
+        platform,
+        conversationId,
+        `\u26a0\ufe0f Workflow '${workflow.name}' completed (degraded): the build landed (branch/PR artifact present) but paperwork node(s) failed: ${failedNodeIds.join(', ')}. Run marked completed with paperwork_degraded=true.`,
+        { workflowId: workflowRun.id }
+      );
+      return;
+    }
+
     const failedNodes = [...nodeOutputs.entries()]
       .filter(([, o]) => o.state === 'failed')
       .map(([id, o]) => `'${id}': ${o.state === 'failed' ? o.error : 'unknown'}`)

@@ -65,6 +65,46 @@ export function matchesPattern(message: string, patterns: string[]): boolean {
   return patterns.some(pattern => message.includes(pattern));
 }
 
+// --- Paperwork nodes + artifact truth (WO-HARNESS-PR-STATUS-TRUTH-AND-AUTOMERGE-01) -----
+
+/**
+ * Tail/paperwork node IDs. These run AFTER the substantive build/review/push
+ * work has produced its artifacts (a pushed branch / PR). When one of these
+ * fails but a real artifact already exists, the run's actual work is done --
+ * so an all-paperwork failure set does not invalidate the run (see the
+ * artifact-truth finalization rule in dag-executor.ts).
+ *
+ * SINGLE definition site (Section 12 stop condition of the WO): the constant
+ * declaration on the next line is the only match for the assignment pattern.
+ */
+export const PAPERWORK_NODES = [
+  'findings-consolidate',
+  'decide-push-target',
+  'build-manifest',
+  'flip-notion',
+  'flip-notion-on-failure',
+] as const;
+
+/** True when a node ID is a declared paperwork/tail node. */
+export function isPaperworkNode(nodeId: string): boolean {
+  return (PAPERWORK_NODES as readonly string[]).includes(nodeId);
+}
+
+/**
+ * Detect a pushed-branch / PR-creation artifact in a node's captured output.
+ * Matches the markers the commit-and-push / open-pr bash nodes actually emit:
+ *   - a real GitHub PR URL: `https://github.com/<owner>/<repo>/pull/<n>`
+ *   - `unique_branch=<name>` with a non-empty value (a pushed branch)
+ * An empty `PR_URL=` / `unique_branch=` line (no value) is NOT a match -- those
+ * are printed even when nothing was pushed.
+ */
+const PUSH_ARTIFACT_PATTERN = /https?:\/\/github\.com\/\S+\/pull\/\d+|unique_branch=\S/;
+
+/** True when the given text contains a pushed-branch or PR-URL artifact. */
+export function hasPushArtifact(text: string): boolean {
+  return PUSH_ARTIFACT_PATTERN.test(text);
+}
+
 /**
  * Classify an error to determine if it's transient (can retry) or fatal (should fail).
  * FATAL patterns take priority over TRANSIENT patterns to prevent an error message
