@@ -56,3 +56,21 @@ export function registerOprProvider(options?: {
     builtIn: false,
   });
 }
+
+/**
+ * Register an OpenRouter alias with no availability failback.
+ *
+ * This exists for exhaustion lanes where a degraded paid-seat fallback would
+ * defeat the lane contract. OpenRouter availability errors should fail the node
+ * instead of silently delegating to another provider.
+ */
+export function registerOprZeroProvider(): void {
+  if (isRegisteredProvider('opr-zero')) return;
+  registerProvider({
+    id: 'opr-zero',
+    displayName: 'OpenRouter (no paid-seat failback)',
+    factory: () => new GlmProvider({ failbackProviderFactory: null }),
+    capabilities: GLM_CAPABILITIES,
+    builtIn: false,
+  });
+}

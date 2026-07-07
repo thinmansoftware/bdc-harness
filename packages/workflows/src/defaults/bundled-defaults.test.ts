@@ -10,6 +10,30 @@ const REPO_ROOT = join(import.meta.dir, '..', '..', '..', '..');
 const COMMANDS_DIR = join(REPO_ROOT, '.archon/commands/defaults');
 const WORKFLOWS_DIR = join(REPO_ROOT, '.archon/workflows/defaults');
 
+function normalizeBundledText(raw: string): string {
+  return raw
+    .replace(/^\uFEFF/, '')
+    .replace(/\r\n/g, '\n')
+    .replace(/\u00A0/g, ' ')
+    .replace(/[\u2010-\u2015]/g, '--')
+    .replace(/[\u2018\u2019\u201A\u201B]/g, "'")
+    .replace(/[\u201C\u201D\u201E\u201F]/g, '"')
+    .replace(/\u2026/g, '...')
+    .replace(/\u00B7/g, '-')
+    .replace(/\u2212/g, '-')
+    .replace(/\u2192/g, '->')
+    .replace(/\u2190/g, '<-')
+    .replace(/\u21D2/g, '=>')
+    .replace(/\u2264/g, '<=')
+    .replace(/\u2265/g, '>=')
+    .replace(/\u2260/g, '!=')
+    .replace(/\u2713/g, 'PASS')
+    .replace(/\u2717/g, 'FAIL')
+    .split('')
+    .filter(char => char.charCodeAt(0) <= 0x7f)
+    .join('');
+}
+
 describe('bundled-defaults', () => {
   describe('isBinaryBuild', () => {
     it('should return false in dev/test mode', () => {
@@ -45,21 +69,22 @@ describe('bundled-defaults', () => {
     });
 
     it('bundled content matches on-disk file content (defense against generator corruption)', () => {
-      // Bundled content is LF-normalized by the generator so it stays identical
-      // regardless of the checkout's line-ending policy. Match that here.
-      const readLF = (path: string): string => readFileSync(path, 'utf-8').replace(/\r\n/g, '\n');
+      // Bundled content is normalized by the generator so it stays identical
+      // across line-ending policies and cannot trip the source ASCII gate.
+      const readBundled = (path: string): string =>
+        normalizeBundledText(readFileSync(path, 'utf-8'));
 
       for (const [name, content] of Object.entries(BUNDLED_COMMANDS)) {
-        const diskContent = readLF(join(COMMANDS_DIR, `${name}.md`));
+        const diskContent = readBundled(join(COMMANDS_DIR, `${name}.md`));
         expect(content).toBe(diskContent);
       }
       for (const [name, content] of Object.entries(BUNDLED_WORKFLOWS)) {
         // Workflows may be .yaml or .yml -- prefer .yaml, fall back.
         let diskContent: string;
         try {
-          diskContent = readLF(join(WORKFLOWS_DIR, `${name}.yaml`));
+          diskContent = readBundled(join(WORKFLOWS_DIR, `${name}.yaml`));
         } catch {
-          diskContent = readLF(join(WORKFLOWS_DIR, `${name}.yml`));
+          diskContent = readBundled(join(WORKFLOWS_DIR, `${name}.yml`));
         }
         expect(content).toBe(diskContent);
       }

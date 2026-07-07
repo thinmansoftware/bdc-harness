@@ -4,7 +4,7 @@
  * Uses inline stub rulesets (does NOT read config files from disk).
  * Asserts the return value of pickEntryTier() directly.
  *
- * Test 1a: woClass=CODE + tags=["mechanical"] -> "glm"
+ * Test 1a: woClass=CODE + tags=["mechanical"] -> "zero"
  * Test 1b: tags=["auth"] -> "claude"
  */
 
@@ -16,7 +16,7 @@ import type { ConductorRuleset } from '../types.js';
 // including the feature-scale -> codex rule (positioned above the generic
 // CODE rules, same as the real config).
 const stubRuleset: ConductorRuleset = {
-  defaultEntry: 'glm',
+  defaultEntry: 'codex',
   rules: [
     {
       match: { tags: ['billing', 'money', 'payment', 'stripe'] },
@@ -36,19 +36,19 @@ const stubRuleset: ConductorRuleset = {
     },
     {
       match: { woClass: 'CODE', tags: ['mechanical'] },
-      entry: 'glm',
+      entry: 'zero',
     },
     {
       match: { woClass: 'CODE' },
-      entry: 'glm',
+      entry: 'codex',
     },
   ],
 };
 
 describe('conductor -- pickEntryTier', () => {
-  test('Test 1a: woClass=CODE + tags=[mechanical] -> glm (cheapest entry for mechanical work)', () => {
+  test('Test 1a: woClass=CODE + tags=[mechanical] -> zero (exhaustion lane for mechanical work)', () => {
     const result = pickEntryTier({ woClass: 'CODE', tags: ['mechanical'] }, stubRuleset);
-    expect(result).toBe('glm');
+    expect(result).toBe('zero');
   });
 
   test('Test 1b: tags=[auth] -> claude (security-sensitive work skips cheap tiers)', () => {
@@ -66,14 +66,14 @@ describe('conductor -- pickEntryTier', () => {
     expect(result).toBe('claude');
   });
 
-  test('CODE class, no special tags -> glm (default for CODE)', () => {
+  test('CODE class, no special tags -> codex (default for CODE)', () => {
     const result = pickEntryTier({ woClass: 'CODE', tags: ['ui-tweak'] }, stubRuleset);
-    expect(result).toBe('glm');
+    expect(result).toBe('codex');
   });
 
-  test('no class, no tags -> defaultEntry (glm)', () => {
+  test('no class, no tags -> defaultEntry (codex)', () => {
     const result = pickEntryTier({}, stubRuleset);
-    expect(result).toBe('glm');
+    expect(result).toBe('codex');
   });
 
   test('rules fire in order; first match wins', () => {
@@ -94,13 +94,13 @@ describe('conductor -- pickEntryTier', () => {
 
   test('feature-scale rule appears before the generic CODE rule (first-match-wins ordering)', () => {
     // A WO tagged both "feature" and "mechanical" must route to codex, not glm --
-    // proves the feature-scale rule is evaluated before the generic CODE/mechanical rule.
+    // proves the feature-scale rule is evaluated before the mechanical CODE rule.
     const result = pickEntryTier({ woClass: 'CODE', tags: ['feature', 'mechanical'] }, stubRuleset);
     expect(result).toBe('codex');
   });
 
-  test('generic mechanical CODE (no feature-scale tag) still enters glm -- no regression', () => {
+  test('generic mechanical CODE (no feature-scale tag) still enters zero -- no regression', () => {
     const result = pickEntryTier({ woClass: 'CODE', tags: ['mechanical'] }, stubRuleset);
-    expect(result).toBe('glm');
+    expect(result).toBe('zero');
   });
 });

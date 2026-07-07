@@ -712,6 +712,8 @@ function classifyAndEnrichCodexError(
 export class CodexProvider implements IAgentProvider {
   private readonly retryBaseDelayMs: number;
   private readonly failbackProviderFactory: (() => IAgentProvider) | null;
+  private readonly failbackLabel: string;
+  private readonly failbackEventName: string;
 
   constructor(options?: {
     retryBaseDelayMs?: number;
@@ -722,9 +724,13 @@ export class CodexProvider implements IAgentProvider {
      * registry wires ClaudeProvider here in production; tests inject a mock.
      */
     failbackProviderFactory?: (() => IAgentProvider) | null;
+    failbackLabel?: string;
+    failbackEventName?: string;
   }) {
     this.retryBaseDelayMs = options?.retryBaseDelayMs ?? RETRY_BASE_DELAY_MS;
     this.failbackProviderFactory = options?.failbackProviderFactory ?? null;
+    this.failbackLabel = options?.failbackLabel ?? 'Claude';
+    this.failbackEventName = options?.failbackEventName ?? 'codex_failback_to_claude';
   }
 
   private async createCodexClient(
@@ -923,7 +929,7 @@ export class CodexProvider implements IAgentProvider {
             type: 'system',
             content:
               '[CODEX FAILBACK] Codex auth failed (credential rotation). Review delegated to ' +
-              'Claude. Reduced cross-model adversarial value -- human review recommended.',
+              `${this.failbackLabel}. Reduced cross-model adversarial value -- human review recommended.`,
           };
           const failbackProvider = this.failbackProviderFactory();
           yield* failbackProvider.sendQuery(
@@ -987,13 +993,13 @@ export class CodexProvider implements IAgentProvider {
           if (this.failbackProviderFactory) {
             getLog().warn(
               { errorClass, attempt, originalError: err.message },
-              'codex_failback_to_claude'
+              this.failbackEventName
             );
             yield {
               type: 'system',
               content:
                 '[CODEX FAILBACK] Codex unavailable after retries. Review delegated to ' +
-                'Claude. Reduced cross-model adversarial value -- human review recommended.',
+                `${this.failbackLabel}. Reduced cross-model adversarial value -- human review recommended.`,
             };
             const failbackProvider = this.failbackProviderFactory();
             // Fresh session for the failback (no resume id; failback runs a
@@ -1022,12 +1028,12 @@ export class CodexProvider implements IAgentProvider {
 
     // Retry budget exhausted without a thrown error -- also a failback candidate.
     if (this.failbackProviderFactory) {
-      getLog().warn({ lastError: lastError?.message }, 'codex_failback_to_claude_after_loop_exit');
+      getLog().warn({ lastError: lastError?.message }, `${this.failbackEventName}_after_loop_exit`);
       yield {
         type: 'system',
         content:
           '[CODEX FAILBACK] Codex unavailable after retries. Review delegated to ' +
-          'Claude. Reduced cross-model adversarial value -- human review recommended.',
+          `${this.failbackLabel}. Reduced cross-model adversarial value -- human review recommended.`,
       };
       const failbackProvider = this.failbackProviderFactory();
       // Same sanitization rationale as the in-loop failback above:

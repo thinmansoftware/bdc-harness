@@ -73,7 +73,7 @@ const TWO_TIER_STUB = [
   { name: 'frontier', workflowName: 'bdc-test-frontier', isFrontier: true, costPerRunUsd: null },
 ];
 
-/** Build base options pointing to the real config (entry defaults to "glm") */
+/** Build base options pointing to the real config (entry defaults to codex). */
 function baseOpts(partial: Partial<RunCascadeOptions> = {}): RunCascadeOptions {
   return {
     woId: 'WO-TEST-001',
@@ -420,7 +420,7 @@ describe('Test 3: WIN-CHEAP', () => {
     expect(record.telemetry.wonCheap).toBe(true);
     expect(record.telemetry.climbed).toBe(false);
     expect(record.telemetry.climbCount).toBe(0);
-    expect(record.winningTier).toBe('qwen'); // entry/cheapest working tier since 2026-07-07 (glm retired)
+    expect(record.winningTier).toBe('zero'); // exhaustion/mechanical tier since 2026-07-07
     expect(record.attempts.length).toBe(1);
     expect(record.attempts[0]?.outcome).toBe('won');
   });
@@ -507,7 +507,7 @@ describe('Test 5: FRONTIER-STOP', () => {
     // Use a 2-tier stub ladder so frontier is at index 1 and we don't run 4 real tiers
     // Override the ladder in the cascade by injecting inline config via entryOverride + patching
     // We can't directly inject the ladder, so use the entry override to start at the first tier
-    // and rely on the real ladder (glm -> codex -> claude -> frontier).
+    // and rely on the real ladder (zero -> qwen -> codex -> claude -> frontier).
     // For the frontier-stop test, we want to run exactly 2 attempts and stop at frontier.
     // The real ladder has 4 tiers, so we need a custom approach.
     //
@@ -599,8 +599,8 @@ describe('config file smoke tests', () => {
     const tiers = loadLadder();
     expect(tiers.length).toBeGreaterThan(0);
     expect(tiers[0]?.name).toBeDefined();
-    // First tier should be qwen (cheapest working tier; glm retired 2026-07-07 -- zero-lane incident)
-    expect(tiers[0]?.name).toBe('qwen');
+    // First tier should be zero (exhaustion/mechanical tier; no paid review seat).
+    expect(tiers[0]?.name).toBe('zero');
     // Last tier should be frontier
     expect(tiers[tiers.length - 1]?.isFrontier).toBe(true);
   });

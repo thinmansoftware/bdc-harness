@@ -1,6 +1,12 @@
 {
-  "_comment": "Smart Cauldron v1.1 ordered tier ladder. Edit this file to change tier order or workflow bindings. GLM tier REMOVED 2026-07-07 (John, zero-lane incident: $15.47/day burned, zero shipped code) -- a dead tier must not be left in the cascade climb order, even at the back, because a gate-fail would climb straight into a workflow name unregistered in Archon and waste a fire. Qwen added 2026-07-07 as the working cheap entry tier: builds on qwen/qwen3-coder via OpenRouter, DeepSeek reviews (not self-grading), Codex repairs.",
+  "_comment": "Smart Cauldron v1.2 ordered tier ladder. Edit this file to change tier order or workflow bindings. GLM tier REMOVED 2026-07-07 (John, zero-lane incident: $15.47/day burned, zero shipped code). Zero added 2026-07-07 for exhaustion/mechanical WOs: qwen builder + DeepSeek review + Codex with OpenRouter failback, no paid review seat. Keep money/auth/infra off this lane.",
   "tiers": [
+    {
+      "name": "zero",
+      "workflowName": "bdc-feature-development-zero-open",
+      "isFrontier": false,
+      "costPerRunUsdEstimate": null
+    },
     {
       "name": "qwen",
       "workflowName": "bdc-feature-development-fusion-cx-qwen",

@@ -58,5 +58,7 @@ export {
   GlmProvider,
   parseGlmConfig,
   registerGlmProvider,
+  registerOprProvider,
+  registerOprZeroProvider,
   type GlmProviderDefaults,
 } from './community/glm';

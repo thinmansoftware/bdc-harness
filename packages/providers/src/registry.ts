@@ -18,7 +18,12 @@ import { CodexProvider } from './codex/provider';
 import { CLAUDE_CAPABILITIES } from './claude/capabilities';
 import { CODEX_CAPABILITIES } from './codex/capabilities';
 import { registerPiProvider } from './community/pi/registration';
-import { registerGlmProvider, registerOprProvider } from './community/glm/registration';
+import {
+  registerGlmProvider,
+  registerOprProvider,
+  registerOprZeroProvider,
+} from './community/glm/registration';
+import { GlmProvider } from './community/glm/provider';
 import { UnknownProviderError } from './errors';
 import { createLogger } from '@archon/paths';
 
@@ -127,6 +132,22 @@ export function registerBuiltinProviders(): void {
       capabilities: CODEX_CAPABILITIES,
       builtIn: true,
     },
+    {
+      id: 'codex-opr',
+      displayName: 'Codex with OpenRouter failback',
+      factory: () =>
+        new CodexProvider({
+          failbackProviderFactory: () =>
+            new GlmProvider({
+              assistantConfig: { model: 'deepseek/deepseek-chat-v3.1' },
+              failbackProviderFactory: null,
+            }),
+          failbackLabel: 'OpenRouter',
+          failbackEventName: 'codex_failback_to_openrouter',
+        }),
+      capabilities: CODEX_CAPABILITIES,
+      builtIn: true,
+    },
   ];
 
   for (const entry of builtins) {
@@ -165,6 +186,7 @@ export function registerCommunityProviders(): void {
   // a [GLM FAILBACK] disclosure chunk rather than dying.
   registerGlmProvider({ failbackProviderFactory: () => new ClaudeProvider() });
   registerOprProvider({ failbackProviderFactory: () => new ClaudeProvider() });
+  registerOprZeroProvider();
 }
 
 /** @internal Test-only -- clears the registry. Not for production use. */
