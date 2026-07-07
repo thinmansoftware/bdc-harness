@@ -12,7 +12,11 @@ import {
   clearRegistry,
 } from './registry';
 import { registerPiProvider } from './community/pi/registration';
-import { registerGlmProvider, registerOprProvider } from './community/glm/registration';
+import {
+  registerGlmProvider,
+  registerOprProvider,
+  registerOprZeroProvider,
+} from './community/glm/registration';
 import { UnknownProviderError } from './errors';
 import type { ProviderRegistration, IAgentProvider, ProviderCapabilities } from './types';
 
@@ -193,23 +197,24 @@ describe('registry', () => {
   describe('getRegisteredProviders', () => {
     test('returns all registered providers', () => {
       const all = getRegisteredProviders();
-      expect(all.length).toBe(2);
+      expect(all.length).toBe(3);
       const ids = all.map(r => r.id);
       expect(ids).toContain('claude');
       expect(ids).toContain('codex');
+      expect(ids).toContain('codex-opr');
     });
 
     test('includes community providers after registration', () => {
       registerProvider(makeMockRegistration('my-llm'));
       const all = getRegisteredProviders();
-      expect(all.length).toBe(3);
+      expect(all.length).toBe(4);
     });
   });
 
   describe('getProviderInfoList', () => {
     test('returns API-safe projection without factory', () => {
       const infos = getProviderInfoList();
-      expect(infos.length).toBe(2);
+      expect(infos.length).toBe(3);
       for (const info of infos) {
         expect(info).toHaveProperty('id');
         expect(info).toHaveProperty('displayName');
@@ -238,7 +243,7 @@ describe('registry', () => {
       registerBuiltinProviders();
       registerBuiltinProviders();
       const all = getRegisteredProviders();
-      expect(all.length).toBe(2);
+      expect(all.length).toBe(3);
     });
   });
 
@@ -270,6 +275,7 @@ describe('registry', () => {
       expect(isRegisteredProvider('pi')).toBe(true);
       expect(isRegisteredProvider('glm')).toBe(true);
       expect(isRegisteredProvider('opr')).toBe(true);
+      expect(isRegisteredProvider('opr-zero')).toBe(true);
     });
   });
 
@@ -323,11 +329,19 @@ describe('registry', () => {
       const ids = getRegisteredProviders()
         .map(p => p.id)
         .sort();
-      expect(ids).toEqual(['claude', 'codex', 'pi']);
+      expect(ids).toEqual(['claude', 'codex', 'codex-opr', 'pi']);
     });
   });
 
   describe('registerOprProvider (OpenRouter alias for glm)', () => {
+    test('registerBuiltinProviders includes codex-opr for OpenRouter failback lanes', () => {
+      const reg = getRegistration('codex-opr');
+      expect(reg.id).toBe('codex-opr');
+      expect(reg.displayName).toBe('Codex with OpenRouter failback');
+      expect(reg.builtIn).toBe(true);
+      expect(typeof reg.factory).toBe('function');
+    });
+
     test('registers opr with builtIn: false (Scenario A)', () => {
       registerOprProvider();
       const reg = getRegistration('opr');
@@ -373,7 +387,23 @@ describe('registry', () => {
       const ids = getRegisteredProviders()
         .map(p => p.id)
         .sort();
-      expect(ids).toEqual(['claude', 'codex', 'glm', 'opr']);
+      expect(ids).toEqual(['claude', 'codex', 'codex-opr', 'glm', 'opr']);
+    });
+  });
+
+  describe('registerOprZeroProvider (OpenRouter no-failback alias)', () => {
+    test('registers opr-zero with builtIn: false', () => {
+      registerOprZeroProvider();
+      const reg = getRegistration('opr-zero');
+      expect(reg.id).toBe('opr-zero');
+      expect(reg.builtIn).toBe(false);
+      expect(typeof reg.factory).toBe('function');
+    });
+
+    test('is idempotent', () => {
+      registerOprZeroProvider();
+      expect(() => registerOprZeroProvider()).not.toThrow();
+      expect(getRegisteredProviders().filter(p => p.id === 'opr-zero')).toHaveLength(1);
     });
   });
 });

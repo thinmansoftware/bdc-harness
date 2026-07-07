@@ -47,6 +47,30 @@ interface BundledFile {
   content: string;
 }
 
+function normalizeBundledText(raw: string): string {
+  return raw
+    .replace(/^\uFEFF/, '')
+    .replace(/\r\n/g, '\n')
+    .replace(/\u00A0/g, ' ')
+    .replace(/[\u2010-\u2015]/g, '--')
+    .replace(/[\u2018\u2019\u201A\u201B]/g, "'")
+    .replace(/[\u201C\u201D\u201E\u201F]/g, '"')
+    .replace(/\u2026/g, '...')
+    .replace(/\u00B7/g, '-')
+    .replace(/\u2212/g, '-')
+    .replace(/\u2192/g, '->')
+    .replace(/\u2190/g, '<-')
+    .replace(/\u21D2/g, '=>')
+    .replace(/\u2264/g, '<=')
+    .replace(/\u2265/g, '>=')
+    .replace(/\u2260/g, '!=')
+    .replace(/\u2713/g, 'PASS')
+    .replace(/\u2717/g, 'FAIL')
+    .split('')
+    .filter(char => char.charCodeAt(0) <= 0x7f)
+    .join('');
+}
+
 async function ensureDir(dir: string, label: string): Promise<void> {
   try {
     await access(dir);
@@ -87,9 +111,9 @@ async function collectFiles(dir: string, extensions: readonly string[]): Promise
     }
     seen.add(name);
     const raw = await readFile(join(dir, entry), 'utf-8');
-    // Normalize to LF so output is identical regardless of the checkout's
-    // line-ending policy (e.g. Windows `core.autocrlf=true` yields CRLF).
-    const content = raw.replace(/\r\n/g, '\n');
+    // Normalize to ASCII + LF so output is identical regardless of the
+    // checkout's line-ending policy and cannot trip the source ASCII gate.
+    const content = normalizeBundledText(raw);
     if (!content.trim()) {
       throw new Error(`Bundled default "${entry}" in ${dir} is empty.`);
     }
@@ -130,7 +154,7 @@ async function collectPoliciesWithPath(dir: string, keyPrefix: string): Promise<
     }
     seen.add(key);
     const raw = await readFile(join(dir, entry), 'utf-8');
-    const content = raw.replace(/\r\n/g, '\n');
+    const content = normalizeBundledText(raw);
     if (!content.trim()) {
       throw new Error(`Bundled policy "${entry}" in ${dir} is empty.`);
     }

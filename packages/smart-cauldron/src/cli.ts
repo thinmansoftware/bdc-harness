@@ -51,7 +51,7 @@ Commands:
 Options:
   --class <CLASS>    WO class for conductor ruleset (CODE, INFRA, MIXED)
   --tags <tags>      Comma-separated tags (e.g. mechanical,auth)
-  --entry <tier>     Override entry tier (qwen, codex, claude, frontier)
+  --entry <tier>     Override entry tier (zero, qwen, codex, claude, frontier)
   --out-dir <path>   Output directory for cascade records (default: ./cascade-runs)
   --dry-run          Print entry tier selection only; do not fire
   --api-url <url>    Archon API base URL (default: ARCHON_API_BASE_URL env or http://localhost:3090)

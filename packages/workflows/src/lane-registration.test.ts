@@ -4,12 +4,11 @@
  * Test scenario 4 from WO-HARNESS-SMART-CAULDRON-LANE-ROSTER-AND-RESILIENCE-01:
  *
  * S4a: Each lane YAML passes parseWorkflow() validation (DAG valid, no loader errors).
- * S4b: war-council-validator node has `provider: claude` and `model: sonnet` in EVERY lane
+ * S4b: war-council-validator node has `provider: claude` and `model: sonnet` in standard lanes
  *      (trusted judge always Claude regardless of top-level lane default), EXCEPT
  *      bdc-feature-development-zero.yaml, which deliberately pins war-council-validator
- *      to `provider: codex` -- the zero lane's entire purpose is zero Claude usage
- *      (see the "zero-Claude law" comment in that file's header; fix(zero-lane) commit
- *      96770782 landed this design without updating this test).
+ *      to `provider: codex`, and bdc-feature-development-zero-claude.yaml, which pins
+ *      it to `provider: codex-opr` so Codex failures degrade to OpenRouter instead.
  *
  * Design: uses the real parseWorkflow() loader so validation logic matches production.
  */
@@ -62,7 +61,7 @@ describe('lane registration and war-council-validator pin', () => {
       expect(result).toBeTruthy();
     });
 
-    it(`S4b: ${file} has war-council-validator pinned to provider: claude model: sonnet`, () => {
+    it(`S4b: ${file} has the expected war-council-validator provider pin`, () => {
       const lane = loadLane(file);
       const nodes = lane.nodes ?? [];
       const wcv = nodes.find((n: NodeDef) => n.id === 'war-council-validator');
@@ -75,6 +74,11 @@ describe('lane registration and war-council-validator pin', () => {
       if (file === 'bdc-feature-development-zero.yaml') {
         // zero-Claude law: this lane pins war-council-validator to codex on purpose.
         expect(wcv.provider).toBe('codex');
+        return;
+      }
+
+      if (file === 'bdc-feature-development-zero-claude.yaml') {
+        expect(wcv.provider).toBe('codex-opr');
         return;
       }
 

@@ -1,5 +1,5 @@
 {
-  "_comment": "Smart Cauldron conductor ruleset v1.2. Rules are evaluated top-down; first match wins (ANY-of match on tags). defaultEntry fires when no rule matches. woClass/tags are supplied entirely by the CLI caller via --class/--tags (smart-cauldron does not parse WO frontmatter itself) -- a WO 'acquires' a tag only if the caller passes it explicitly on the command line. 2026-07-07: mechanical CODE work now routes to qwen (fixed + proven this date: root provider bug resolved, DeepSeek wired as cross-model reviewer) instead of glm (retired -- zero-lane incident, see ladder.config.json).",
+  "_comment": "Smart Cauldron conductor ruleset v1.3. Rules are evaluated top-down; first match wins (ANY-of match on tags). defaultEntry fires when no rule matches. woClass/tags are supplied entirely by the CLI caller via --class/--tags (smart-cauldron does not parse WO frontmatter itself) -- a WO 'acquires' a tag only if the caller passes it explicitly on the command line. 2026-07-07: mechanical CODE work now routes to zero, an exhaustion lane with no paid review seat. Money/auth/infra stay on the stronger lane.",
   "defaultEntry": "codex",
   "rules": [
     {
@@ -31,7 +31,7 @@
         "woClass": "CODE",
         "tags": ["mechanical"]
       },
-      "entry": "qwen"
+      "entry": "zero"
     },
     {
       "match": {
