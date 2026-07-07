@@ -607,7 +607,9 @@ describe('config file smoke tests', () => {
 
   test('loadRuleset returns ruleset with defaultEntry and rules', () => {
     const ruleset = loadRuleset();
-    expect(ruleset.defaultEntry).toBe('glm');
+    // v1.1 (2026-07-02): GLM demoted from defaultEntry after repetition-collapse
+    // + fabricated-build incidents; bare CODE now enters at codex.
+    expect(ruleset.defaultEntry).toBe('codex');
     expect(Array.isArray(ruleset.rules)).toBe(true);
     expect(ruleset.rules.length).toBeGreaterThan(0);
   });
