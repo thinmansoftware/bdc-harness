@@ -52,11 +52,14 @@ export const KNOWN_MODEL_ALIASES: ReadonlySet<string> = new Set([
   'haiku',
   'opus[1m]',
   'sonnet[1m]',
+  'fable',
   // Full model IDs are also accepted
   'claude-opus-4-7',
   'claude-sonnet-4-6',
+  'claude-sonnet-5',
   'claude-haiku-4-5',
   'claude-haiku-4-5-20251001',
+  'claude-fable-5',
 ]);
 
 /** Context block configuration for a persona (wiki + oracle lookups) */
