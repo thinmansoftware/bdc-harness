@@ -190,6 +190,22 @@ export function mapWorkflowEvent(event: WorkflowEmitterEvent): string | null {
         timestamp: Date.now(),
       });
 
+    case 'node_failover':
+      // WO-HARNESS-NODE-PROVIDER-FAILOVER-01: node fell SIDEWAYS to a failover
+      // provider on an availability error. Forward the raw payload for Mission
+      // Control (distinct from cascade_step, which CLIMBS cost tiers).
+      return JSON.stringify({
+        type: 'node_failover',
+        runId: event.runId,
+        nodeId: event.nodeId,
+        fromProvider: event.fromProvider,
+        fromModel: event.fromModel,
+        toProvider: event.toProvider,
+        toModel: event.toModel,
+        errorClass: event.errorClass,
+        timestamp: Date.now(),
+      });
+
     default: {
       const exhaustiveCheck: never = event;
       getLog().warn(

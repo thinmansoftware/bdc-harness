@@ -444,3 +444,91 @@ describe('validateWorkflowResources -- agents capability', () => {
     expect(warning).toBeUndefined();
   });
 });
+
+// =============================================================================
+// validateWorkflowResources -- failover_provider persona-pin conflict
+// (WO-HARNESS-NODE-PROVIDER-FAILOVER-01, Test Scenario 4)
+// =============================================================================
+
+describe('validateWorkflowResources -- failover persona-pin conflict', () => {
+  async function createAgentFile(name: string, opts: { model?: string } = {}): Promise<void> {
+    const dir = join(tmpDir, '.archon', 'agents');
+    await mkdir(dir, { recursive: true });
+    const lines = ['---', `name: ${name}`];
+    if (opts.model) lines.push(`model: ${opts.model}`);
+    lines.push('---', '', 'You are a helper persona.', '');
+    await writeFile(join(dir, `${name}.md`), lines.join('\n'));
+  }
+
+  test('rejects failover_provider: codex on a node whose persona pins an Anthropic model', async () => {
+    await createAgentFile('sonnet-architect', { model: 'sonnet' });
+    const workflow = makeWorkflow(
+      'test',
+      [
+        {
+          id: 'plan',
+          prompt: 'p',
+          persona: 'sonnet-architect',
+          failover_provider: 'codex',
+        } as unknown as DagNode,
+      ],
+      'claude'
+    );
+    const issues = await validateWorkflowResources(workflow, tmpDir);
+    const err = issues.find(i => i.level === 'error' && i.field === 'failover_provider');
+    expect(err).toBeDefined();
+    expect(err!.message).toContain('sonnet-architect');
+    expect(err!.message.toLowerCase()).toContain('codex');
+  });
+
+  test('rejects when the failover_provider is inherited from the workflow level', async () => {
+    await createAgentFile('sonnet-architect-wf', { model: 'sonnet' });
+    const workflow = {
+      name: 'test',
+      description: 'test workflow',
+      failover_provider: 'codex',
+      nodes: [{ id: 'plan', prompt: 'p', persona: 'sonnet-architect-wf' } as unknown as DagNode],
+    } as unknown as WorkflowDefinition;
+    const issues = await validateWorkflowResources(workflow, tmpDir);
+    const err = issues.find(i => i.level === 'error' && i.field === 'failover_provider');
+    expect(err).toBeDefined();
+  });
+
+  test('no conflict when the persona is model-less (opr-style) even with codex failover', async () => {
+    await createAgentFile('opr-architect', {}); // no model line
+    const workflow = makeWorkflow(
+      'test',
+      [
+        {
+          id: 'plan',
+          prompt: 'p',
+          persona: 'opr-architect',
+          failover_provider: 'codex',
+        } as unknown as DagNode,
+      ],
+      'claude'
+    );
+    const issues = await validateWorkflowResources(workflow, tmpDir);
+    const err = issues.find(i => i.level === 'error' && i.field === 'failover_provider');
+    expect(err).toBeUndefined();
+  });
+
+  test('no conflict when failover_provider is non-codex even if the persona pins a model', async () => {
+    await createAgentFile('sonnet-architect-2', { model: 'sonnet' });
+    const workflow = makeWorkflow(
+      'test',
+      [
+        {
+          id: 'plan',
+          prompt: 'p',
+          persona: 'sonnet-architect-2',
+          failover_provider: 'claude',
+        } as unknown as DagNode,
+      ],
+      'claude'
+    );
+    const issues = await validateWorkflowResources(workflow, tmpDir);
+    const err = issues.find(i => i.level === 'error' && i.field === 'failover_provider');
+    expect(err).toBeUndefined();
+  });
+});

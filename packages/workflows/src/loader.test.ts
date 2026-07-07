@@ -34,7 +34,7 @@ clearRegistry();
 registerBuiltinProviders();
 
 import { discoverWorkflows } from './workflow-discovery';
-import { getLoaderErrors } from './loader';
+import { getLoaderErrors, parseWorkflow } from './loader';
 import { isBashNode, isCancelNode, isLoopNode } from './schemas';
 import * as bundledDefaults from './defaults/bundled-defaults';
 
@@ -346,6 +346,81 @@ nodes:
       expect(result.errors).toHaveLength(1);
       expect(result.errors[0].errorType).toBe('validation_error');
       expect(result.errors[0].error).toContain("Unknown provider 'claud'");
+    });
+
+    // WO-HARNESS-NODE-PROVIDER-FAILOVER-01: failover_provider identity is validated
+    // at load time, mirroring provider identity. failover_model is a free SDK string.
+    // These use parseWorkflow directly (hermetic) rather than discoverWorkflows, which
+    // also reads home-scoped ~/.archon/workflows and is environment-dependent.
+    it('should reject unknown node-level failover_provider at load time', () => {
+      const yaml = `name: bad-failover
+description: Node declares an unknown failover_provider
+nodes:
+  - id: plan
+    prompt: do it
+    failover_provider: bogus
+`;
+      const result = parseWorkflow(yaml, 'bad-failover.yaml');
+      expect(result.workflow).toBeNull();
+      expect(result.error?.errorType).toBe('validation_error');
+      expect(result.error?.error).toContain("unknown failover_provider 'bogus'");
+    });
+
+    it('should reject unknown workflow-level failover_provider at load time', () => {
+      const yaml = `name: bad-wf-failover
+description: Workflow declares an unknown failover_provider
+failover_provider: nope
+nodes:
+  - id: plan
+    prompt: do it
+`;
+      const result = parseWorkflow(yaml, 'bad-wf-failover.yaml');
+      expect(result.workflow).toBeNull();
+      expect(result.error?.error).toContain("Unknown failover_provider 'nope'");
+    });
+
+    it('should accept + carry through valid failover_provider/failover_model', () => {
+      const yaml = `name: good-failover
+description: Valid failover config at workflow + node level
+provider: claude
+failover_provider: codex
+failover_model: gpt-5.5
+nodes:
+  - id: plan
+    prompt: do it
+    failover_provider: codex
+    failover_model: gpt-5.5
+`;
+      const result = parseWorkflow(yaml, 'good-failover.yaml');
+      expect(result.error).toBeNull();
+      const wf = result.workflow as unknown as {
+        failover_provider?: string;
+        failover_model?: string;
+        nodes: Array<{ id: string; failover_provider?: string; failover_model?: string }>;
+      };
+      expect(wf.failover_provider).toBe('codex');
+      expect(wf.failover_model).toBe('gpt-5.5');
+      const plan = wf.nodes.find(n => n.id === 'plan')!;
+      expect(plan.failover_provider).toBe('codex');
+      expect(plan.failover_model).toBe('gpt-5.5');
+    });
+
+    it('should load a workflow with no failover fields unchanged (byte-identical)', () => {
+      const yaml = `name: no-failover
+description: No failover fields anywhere
+provider: claude
+nodes:
+  - id: plan
+    prompt: do it
+`;
+      const result = parseWorkflow(yaml, 'no-failover.yaml');
+      expect(result.error).toBeNull();
+      const wf = result.workflow as unknown as {
+        failover_provider?: string;
+        nodes: Array<{ id: string; failover_provider?: string }>;
+      };
+      expect(wf.failover_provider).toBeUndefined();
+      expect(wf.nodes[0].failover_provider).toBeUndefined();
     });
 
     it('should accept any model string with a known provider (SDK validates at run time)', async () => {

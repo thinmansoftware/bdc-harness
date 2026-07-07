@@ -85,6 +85,7 @@ import {
   isPaperworkNode,
   hasPushArtifact,
 } from './executor-shared';
+import { isAvailabilityError } from './node-failover';
 import { loadAgentRegistry, resolveAgent } from './agents/registry';
 import type { AgentRegistry } from './agents/registry';
 import { loadContext } from '@archon/persona-context-loader';
@@ -278,6 +279,84 @@ interface WorkflowLevelOptions {
   fallbackModel?: string;
   betas?: string[];
   sandbox?: SandboxSettings;
+  // WO-HARNESS-NODE-PROVIDER-FAILOVER-01: workflow-level default availability
+  // failover target. A node inherits these unless it declares its own
+  // failover_provider/failover_model. Control-plane only -- never sent to the SDK.
+  failoverProvider?: string;
+  failoverModel?: string;
+}
+
+/**
+ * Resolve a node's declared AVAILABILITY failover target
+ * (WO-HARNESS-NODE-PROVIDER-FAILOVER-01): node-level `failover_provider`/
+ * `failover_model` win over the workflow-level defaults. Returns null when no
+ * failover provider is declared at either level (node behaves as before).
+ * These are pure control-plane fields -- the executor uses them to pick the
+ * sideways re-dispatch target; they are never forwarded into SDK options.
+ */
+function resolveFailoverTarget(
+  node: DagNode,
+  workflowLevelOptions: WorkflowLevelOptions
+): { provider: string; model: string | undefined } | null {
+  const ref = node as { failover_provider?: string; failover_model?: string };
+  const provider = ref.failover_provider ?? workflowLevelOptions.failoverProvider;
+  if (!provider) return null;
+  return { provider, model: ref.failover_model ?? workflowLevelOptions.failoverModel };
+}
+
+/**
+ * Emit + persist a `node_failover` event (WO-HARNESS-NODE-PROVIDER-FAILOVER-01).
+ * Records the sideways re-dispatch from the primary provider/model to the
+ * failover provider/model, plus the error class that triggered it.
+ */
+function emitNodeFailover(
+  deps: WorkflowDeps,
+  runId: string,
+  nodeId: string,
+  from: { provider: string; model: string | undefined },
+  to: { provider: string; model: string | undefined },
+  errorClass: string
+): void {
+  getLog().warn(
+    {
+      nodeId,
+      fromProvider: from.provider,
+      fromModel: from.model,
+      toProvider: to.provider,
+      toModel: to.model,
+      errorClass,
+    },
+    'dag.node_failover'
+  );
+  deps.store
+    .createWorkflowEvent({
+      workflow_run_id: runId,
+      event_type: 'node_failover',
+      step_name: nodeId,
+      data: {
+        from_provider: from.provider,
+        ...(from.model !== undefined ? { from_model: from.model } : {}),
+        to_provider: to.provider,
+        ...(to.model !== undefined ? { to_model: to.model } : {}),
+        error_class: errorClass,
+      },
+    })
+    .catch((err: Error) => {
+      getLog().error(
+        { err, workflowRunId: runId, eventType: 'node_failover' },
+        'workflow_event_persist_failed'
+      );
+    });
+  getWorkflowEventEmitter().emit({
+    type: 'node_failover',
+    runId,
+    nodeId,
+    fromProvider: from.provider,
+    ...(from.model !== undefined ? { fromModel: from.model } : {}),
+    toProvider: to.provider,
+    ...(to.model !== undefined ? { toModel: to.model } : {}),
+    errorClass,
+  });
 }
 
 /** Internal node execution result -- extends NodeOutput with cost + token data for aggregation. */
@@ -3495,6 +3574,10 @@ export async function executeDagWorkflow(
     name: string;
     nodes: readonly DagNode[];
     inputs?: Record<string, { default: string }>;
+    // WO-HARNESS-NODE-PROVIDER-FAILOVER-01: workflow-root failover defaults
+    // (snake_case YAML field names on WorkflowDefinition).
+    failover_provider?: string;
+    failover_model?: string;
   } & WorkflowLevelOptions,
   workflowRun: WorkflowRun,
   workflowProvider: string,
@@ -3515,12 +3598,15 @@ export async function executeDagWorkflow(
   const resolvedInputs: Record<string, string> = workflow.inputs
     ? Object.fromEntries(Object.entries(workflow.inputs).map(([k, v]) => [k, v.default]))
     : {};
-  const workflowLevelOptions = {
+  const workflowLevelOptions: WorkflowLevelOptions = {
     effort: workflow.effort,
     thinking: workflow.thinking,
     fallbackModel: workflow.fallbackModel,
     betas: workflow.betas,
     sandbox: workflow.sandbox,
+    // WO-HARNESS-NODE-PROVIDER-FAILOVER-01: workflow-level failover defaults.
+    failoverProvider: workflow.failover_provider,
+    failoverModel: workflow.failover_model,
   };
   const layers = buildTopologicalLayers(workflow.nodes);
   const nodeOutputs = new Map<string, NodeOutput>();
@@ -3827,7 +3913,7 @@ export async function executeDagWorkflow(
                 ? workflowModel
                 : (loopAssistantConfig?.model as string | undefined));
 
-            const output = await executeLoopNode(
+            let output = await executeLoopNode(
               deps,
               platform,
               conversationId,
@@ -3845,6 +3931,74 @@ export async function executeDagWorkflow(
               issueContext,
               workflowLevelOptions
             );
+
+            // AVAILABILITY failover for loop nodes (WO-HARNESS-NODE-PROVIDER-FAILOVER-01).
+            // Same doctrine as prompt nodes: one sideways re-dispatch on a declared
+            // failover provider when the loop fails with an availability-class error.
+            // executeLoopNode re-resolves the persona against the failover provider
+            // internally (resolveAgentPersona), so an incompatible codex+persona
+            // pairing raises InfrastructureClassBlock -- caught here so the failover
+            // never makes things worse than the original availability failure.
+            const loopFailoverTarget = resolveFailoverTarget(node, workflowLevelOptions);
+            if (
+              output.state === 'failed' &&
+              output.error !== undefined &&
+              loopFailoverTarget !== null &&
+              loopFailoverTarget.provider !== loopProvider &&
+              isRegisteredProvider(loopFailoverTarget.provider) &&
+              isAvailabilityError(output.error)
+            ) {
+              const loopFailoverModel =
+                loopFailoverTarget.model ??
+                (config.assistants[loopFailoverTarget.provider]?.model as string | undefined);
+              try {
+                emitNodeFailover(
+                  deps,
+                  workflowRun.id,
+                  node.id,
+                  { provider: loopProvider, model: loopModel },
+                  { provider: loopFailoverTarget.provider, model: loopFailoverModel },
+                  'availability'
+                );
+                await safeSendMessage(
+                  platform,
+                  conversationId,
+                  `! Loop node \`${node.id}\` hit an availability error on ${loopProvider}; failing over to ${loopFailoverTarget.provider} (one attempt).`,
+                  { workflowId: workflowRun.id, nodeName: node.id }
+                );
+                output = await executeLoopNode(
+                  deps,
+                  platform,
+                  conversationId,
+                  cwd,
+                  workflowRun,
+                  node,
+                  loopFailoverTarget.provider,
+                  loopFailoverModel,
+                  artifactsDir,
+                  logDir,
+                  baseBranch,
+                  docsDir,
+                  nodeOutputs,
+                  config,
+                  issueContext,
+                  workflowLevelOptions
+                );
+              } catch (loopFailoverErr) {
+                const fe = loopFailoverErr as Error;
+                getLog().error(
+                  { err: fe, nodeId: node.id, failoverProvider: loopFailoverTarget.provider },
+                  'dag.node_failover_dispatch_failed'
+                );
+                await safeSendMessage(
+                  platform,
+                  conversationId,
+                  `! Loop node \`${node.id}\` failover to ${loopFailoverTarget.provider} could not be dispatched: ${fe.message}`,
+                  { workflowId: workflowRun.id, nodeName: node.id }
+                );
+              }
+            }
+
             return { nodeId: node.id, output };
           }
 
@@ -4062,6 +4216,96 @@ export async function executeDagWorkflow(
               continue sdkContradictionRetry;
             }
             break;
+          }
+
+          // AVAILABILITY failover (WO-HARNESS-NODE-PROVIDER-FAILOVER-01): the
+          // primary provider (and any transient retries above) is exhausted and
+          // the node failed with an availability-class error (429 / timeout /
+          // 5xx / connection). If the node (or workflow) declares a failover
+          // provider, re-dispatch this ONE node exactly once on it. Auth/billing/
+          // other 4xx errors are NOT availability and fall straight through.
+          const failoverTarget = resolveFailoverTarget(node, workflowLevelOptions);
+          if (
+            output.state === 'failed' &&
+            output.error !== undefined &&
+            failoverTarget !== null &&
+            failoverTarget.provider !== provider && // never "failover" to the same provider
+            isAvailabilityError(output.error)
+          ) {
+            try {
+              // Clone the node with the failover provider/model and re-run the
+              // full resolution path. This re-runs persona resolution against the
+              // failover provider, so an incompatible pairing (e.g. codex failover
+              // + Anthropic-pinned persona) throws InfrastructureClassBlock here
+              // -- the same guard a normal dispatch would apply. The failover
+              // fields themselves are NOT read into nodeConfig/SDK options.
+              const failoverNode = {
+                ...node,
+                provider: failoverTarget.provider,
+                ...(failoverTarget.model !== undefined ? { model: failoverTarget.model } : {}),
+              };
+              const failoverResolved = await resolveNodeProviderAndModel(
+                failoverNode,
+                workflowProvider,
+                workflowModel,
+                config,
+                platform,
+                conversationId,
+                workflowRun.id,
+                cwd,
+                workflowLevelOptions
+              );
+              emitNodeFailover(
+                deps,
+                workflowRun.id,
+                node.id,
+                { provider, model: nodeOptions?.model },
+                { provider: failoverResolved.provider, model: failoverResolved.options?.model },
+                'availability'
+              );
+              await safeSendMessage(
+                platform,
+                conversationId,
+                `! Node \`${node.id}\` hit an availability error on ${provider}; failing over to ${failoverResolved.provider} (one attempt).`,
+                { workflowId: workflowRun.id, nodeName: node.id }
+              );
+              output = await executeNodeInternal(
+                deps,
+                platform,
+                conversationId,
+                cwd,
+                workflowRun,
+                node,
+                failoverResolved.provider,
+                failoverResolved.options,
+                failoverResolved.declaredModelId,
+                artifactsDir,
+                logDir,
+                baseBranch,
+                docsDir,
+                nodeOutputs,
+                resumeSessionId,
+                configuredCommandFolder,
+                issueContext,
+                failoverResolved.personaContextState
+              );
+            } catch (failoverErr) {
+              // A misconfigured failover (e.g. InfrastructureClassBlock from a
+              // codex failover against an Anthropic-pinned persona) must not make
+              // things worse than the original availability failure. Keep the
+              // original failed `output` and surface the failover-dispatch fault.
+              const fe = failoverErr as Error;
+              getLog().error(
+                { err: fe, nodeId: node.id, failoverProvider: failoverTarget.provider },
+                'dag.node_failover_dispatch_failed'
+              );
+              await safeSendMessage(
+                platform,
+                conversationId,
+                `! Node \`${node.id}\` failover to ${failoverTarget.provider} could not be dispatched: ${fe.message}`,
+                { workflowId: workflowRun.id, nodeName: node.id }
+              );
+            }
           }
 
           return { nodeId: node.id, output };
