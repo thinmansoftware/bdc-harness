@@ -301,8 +301,13 @@ nodes:
           SAFE_STATE=<nothing committed/pushed; plan stage only>
 
   - id: implement
-    provider: opr-zero
-    model: qwen/qwen3-coder
+    # SWAPPED TO CODEX-VIA-OPENROUTER 2026-07-07 (John): qwen twice mis-targeted
+    # WO-HARNESS-PLAN-REVIEW-FENCE-WHITESPACE-CORRUPTION-01 (fixed the already-merged
+    # sentinel bug instead of the actual APPROVED_PLAN content-corruption gap, run
+    # eff9d1e8). codex-opr already proven on this lane's war-council-validator seat
+    # (2026-07-03 ruling: "strongest non-paid-seat judge seat", OpenAI billing, zero
+    # Claude). Using it for implement too on precision-text-transformation WOs.
+    provider: codex-opr
     depends_on: [plan-review]
     task_class: medium_work
     loop:

@@ -301,8 +301,17 @@ nodes:
           SAFE_STATE=<nothing committed/pushed; plan stage only>
 
   - id: implement
-    provider: glm
-    model: qwen/qwen3-coder
+    # SWAPPED TO CODEX-VIA-OPENROUTER 2026-07-07 (John): qwen twice mis-targeted
+    # WO-HARNESS-PLAN-REVIEW-FENCE-WHITESPACE-CORRUPTION-01 (fixed the already-merged
+    # sentinel bug instead of the actual APPROVED_PLAN content-corruption gap, run
+    # eff9d1e8). codex-opr already proven on this lane's war-council-validator seat
+    # (2026-07-03 ruling: "strongest non-paid-seat judge seat", OpenAI billing, zero
+    # Claude). Using it for implement too on precision-text-transformation WOs.
+    # ALSO FIXED: this file still had provider: glm (GLM retired 2026-07-07, PR #339)
+    # -- stale leftover from before the roster update, never caught because
+    # bdc-feature-development-zero.yaml (no "-claude" suffix) was not the file
+    # tonight's fixes targeted.
+    provider: codex-opr
     depends_on: [plan-review]
     task_class: medium_work
     loop:
