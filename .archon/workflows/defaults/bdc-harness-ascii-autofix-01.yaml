@@ -978,7 +978,7 @@ nodes:
       set -euo pipefail
       DECIDE_OUTPUT=$decide-push-target.output
       PLAN_REVIEW_RAW=$plan-review.output
-      PLAN_OUTPUT=$(printf '%s\n' "$PLAN_REVIEW_RAW" | sed -n '/=== APPROVED_PLAN_BEGIN ===/,/=== APPROVED_PLAN_END ===/p' | sed '1d;$d')
+      PLAN_OUTPUT=$(printf '%s\n' "$PLAN_REVIEW_RAW" | sed -n '/===[[:space:]]*APPROVED_PLAN_BEGIN[[:space:]]*===/,/===[[:space:]]*APPROVED_PLAN_END[[:space:]]*===/p' | sed '1d;$d')
       if [ -z "$PLAN_OUTPUT" ]; then
         echo "ERROR: plan-review output missing the APPROVED_PLAN fence." >&2
         exit 1
@@ -1098,7 +1098,7 @@ nodes:
       set -euo pipefail
       DECIDE_OUTPUT=$decide-push-target.output
       PLAN_REVIEW_RAW=$plan-review.output
-      PLAN_OUTPUT=$(printf '%s\n' "$PLAN_REVIEW_RAW" | sed -n '/=== APPROVED_PLAN_BEGIN ===/,/=== APPROVED_PLAN_END ===/p' | sed '1d;$d')
+      PLAN_OUTPUT=$(printf '%s\n' "$PLAN_REVIEW_RAW" | sed -n '/===[[:space:]]*APPROVED_PLAN_BEGIN[[:space:]]*===/,/===[[:space:]]*APPROVED_PLAN_END[[:space:]]*===/p' | sed '1d;$d')
       if [ -z "$PLAN_OUTPUT" ]; then
         echo "ERROR: plan-review output missing the APPROVED_PLAN fence." >&2
         exit 1

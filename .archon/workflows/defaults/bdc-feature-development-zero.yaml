@@ -1484,7 +1484,7 @@ nodes:
       # rejected by the allowlist. FAIL CLOSED if the fence is absent (NF1): never fall
       # back to raw output, or PLAN_REVIEW_FINDINGS critique would poison the allowlist.
       PLAN_REVIEW_RAW=$plan-review.output
-      PLAN_OUTPUT=$(printf '%s\n' "$PLAN_REVIEW_RAW" | sed -n '/=== APPROVED_PLAN_BEGIN ===/,/=== APPROVED_PLAN_END ===/p' | sed '1d;$d')
+      PLAN_OUTPUT=$(printf '%s\n' "$PLAN_REVIEW_RAW" | sed -n '/===[[:space:]]*APPROVED_PLAN_BEGIN[[:space:]]*===/,/===[[:space:]]*APPROVED_PLAN_END[[:space:]]*===/p' | sed '1d;$d')
       if [ -z "$PLAN_OUTPUT" ]; then
         echo "ERROR: plan-review output missing the APPROVED_PLAN fence -- cannot extract the approved plan (NF1 fail-closed)." >&2
         echo "--- raw plan-review output (for debugging) ---" >&2
@@ -1705,7 +1705,7 @@ nodes:
       # reviewer critique out of the customer-visible PR. FAIL CLOSED if the fence is
       # absent (NF1): never put raw critique-bearing output in the PR body.
       PLAN_REVIEW_RAW=$plan-review.output
-      PLAN_OUTPUT=$(printf '%s\n' "$PLAN_REVIEW_RAW" | sed -n '/=== APPROVED_PLAN_BEGIN ===/,/=== APPROVED_PLAN_END ===/p' | sed '1d;$d')
+      PLAN_OUTPUT=$(printf '%s\n' "$PLAN_REVIEW_RAW" | sed -n '/===[[:space:]]*APPROVED_PLAN_BEGIN[[:space:]]*===/,/===[[:space:]]*APPROVED_PLAN_END[[:space:]]*===/p' | sed '1d;$d')
       if [ -z "$PLAN_OUTPUT" ]; then
         echo "ERROR: plan-review output missing the APPROVED_PLAN fence -- cannot build PR body (NF1 fail-closed)." >&2
         exit 1
