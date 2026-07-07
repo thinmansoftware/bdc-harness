@@ -1,8 +1,11 @@
 name: bdc-feature-development-fusion-cx-qwen
 description: |
   Qwen-implement variant of bdc-feature-development. Identical DAG; implement +
-  diff-repair + review-repair loops use qwen/qwen3-coder via OpenRouter instead
-  of Claude. Codex reviews; Claude judges only. The cheap non-Claude build lane.
+  diff-repair loops use qwen/qwen3-coder via OpenRouter instead of Claude.
+  Diff review (diff-review, diff-review-final, opus-rereview) runs on DeepSeek
+  via OpenRouter, not Qwen self-grading (John 2026-07-07: DeepSeek's strength
+  is review, not authoring). Codex handles repair; Claude judges only. The
+  cheap non-Claude build lane.
 
 policyFile: harness/policies/agent-behavior.md
 provider: codex  # root provider: bare tail nodes (findings-consolidate, decide-push-target, build-manifest) MUST route gpt-5.5 to Codex, not the Anthropic SDK. Missing this line = dead-at-tail (2026-07-07 runs d469af05/f73fb8b3: builds succeeded, tails died on "model gpt-5.5 may not exist").
@@ -730,7 +733,7 @@ nodes:
 
   - id: diff-review
     provider: opr
-    model: qwen/qwen3-coder
+    model: deepseek/deepseek-chat-v3.1  # cross-model adversarial review, not self-grading (John 2026-07-07: DeepSeek's strong suit is review, not authoring code; never mark its own qwen-authored homework)
     agent: opr-adversarial-reviewer
     depends_on: [capture-diff]
     task_class: medium_work
@@ -913,7 +916,7 @@ nodes:
 
   - id: diff-review-final
     provider: opr
-    model: qwen/qwen3-coder
+    model: deepseek/deepseek-chat-v3.1  # cross-model adversarial review, not self-grading -- see diff-review
     agent: opr-adversarial-reviewer
     depends_on: [capture-diff-final]
     trigger_rule: all_done
@@ -1063,7 +1066,7 @@ nodes:
   # terminal-BLOCKED on a non-interactive run.
   - id: opus-rereview
     provider: opr
-    model: qwen/qwen3-coder
+    model: deepseek/deepseek-chat-v3.1  # cross-model adversarial review, not self-grading -- see diff-review
     agent: opr-adversarial-reviewer
     depends_on: [classify-opus-repair]
     trigger_rule: all_done
