@@ -78,6 +78,14 @@ describe('lane registration and war-council-validator pin', () => {
         return;
       }
 
+      if (file === 'bdc-feature-development-codex.yaml') {
+        // Fable test seat (John 2026-07-02: "add fable in to one for testing for
+        // now"). Superseded by the apex-rung WO (bdc-xo issue #575) when it lands.
+        expect(wcv.provider).toBe('claude');
+        expect(wcv.model).toBe('claude-fable-5');
+        return;
+      }
+
       expect(wcv.provider).toBe('claude');
       expect(wcv.model).toBe('sonnet');
     });
