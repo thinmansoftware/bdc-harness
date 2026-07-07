@@ -501,7 +501,28 @@ export async function validateWorkflowResources(
       } else {
         // Validate the agent file itself (catches model/tool errors at workflow-load time)
         try {
-          await loadAgentFile(agentFilePath);
+          const persona = await loadAgentFile(agentFilePath);
+
+          // WO-HARNESS-NODE-PROVIDER-FAILOVER-01 persona-pin safety:
+          // a `failover_provider: codex` node whose persona declares a `model:`
+          // (only Claude/Anthropic aliases are accepted by the registry) would
+          // throw InfrastructureClassBlock at failover-dispatch time -- the codex
+          // provider cannot receive an Anthropic model. Reject at validation time
+          // so the operator fixes the YAML/persona rather than discovering it when
+          // an availability error actually fires the failover.
+          const failoverProvider =
+            'failover_provider' in node && typeof node.failover_provider === 'string'
+              ? node.failover_provider
+              : workflow.failover_provider;
+          if (failoverProvider === 'codex' && persona.model !== undefined) {
+            issues.push({
+              level: 'error',
+              nodeId: node.id,
+              field: 'failover_provider',
+              message: `failover_provider: codex conflicts with persona '${agentName}' which pins model: '${persona.model}'. A codex node cannot receive an Anthropic model alias, so the failover would fail at dispatch time (InfrastructureClassBlock).`,
+              hint: `Remove 'model:' from .archon/agents/${agentName}.md, or use a non-codex failover_provider for node '${node.id}'.`,
+            });
+          }
         } catch (e) {
           const err = e as Error;
           issues.push({

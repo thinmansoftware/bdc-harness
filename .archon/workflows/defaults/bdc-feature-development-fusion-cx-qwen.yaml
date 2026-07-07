@@ -149,6 +149,16 @@ nodes:
   - id: plan
     provider: opr
     model: qwen/qwen3-coder
+    # WO-HARNESS-NODE-PROVIDER-FAILOVER-01: this builder-side planning node rides
+    # OpenRouter (qwen). If OpenRouter throttles/drops (429/timeout/5xx/connection),
+    # fall SIDEWAYS to Codex once rather than killing the run. The war-council-
+    # architect-opr persona is model-less, so a codex failover carries no Anthropic
+    # model pin (no InfrastructureClassBlock). NOTE: implement/diff-repair already
+    # run on codex (no failover needed); judge/validator seats (plan-review,
+    # diff-review*, war-council-validator) are intentionally NOT wired -- a gate
+    # that silently switches models undermines gate integrity (spec doctrine).
+    failover_provider: codex
+    failover_model: gpt-5.5
     persona: war-council-architect-opr
     depends_on: [gate-already-satisfied]
     task_class: medium_work

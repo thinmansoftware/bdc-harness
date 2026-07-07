@@ -181,6 +181,25 @@ interface NodeCompletedWithWarningEvent {
   costUsd?: number;
 }
 
+/**
+ * WO-HARNESS-NODE-PROVIDER-FAILOVER-01: a node's primary provider call failed
+ * with an availability-class error (429 / timeout / 5xx / connection) and the
+ * node declared a failover provider, so the executor re-dispatched the SAME node
+ * exactly once on `toProvider`/`toModel`. Distinct from cascade_step (which
+ * CLIMBS cost tiers on a quality gate) -- failover moves SIDEWAYS on availability.
+ */
+interface NodeFailoverEvent {
+  type: 'node_failover';
+  runId: string;
+  nodeId: string;
+  fromProvider: string;
+  fromModel?: string;
+  toProvider: string;
+  toModel?: string;
+  /** Overseer/availability error class or short reason the primary attempt failed. */
+  errorClass: string;
+}
+
 interface NodeSkippedEvent {
   type: 'node_skipped';
   runId: string;
@@ -229,6 +248,7 @@ export type WorkflowEmitterEvent =
   | NodeCompletedEvent
   | NodeCompletedWithWarningEvent
   | NodeFailedEvent
+  | NodeFailoverEvent
   | NodeSkippedEvent
   | WorkflowArtifactEvent
   | ToolStartedEvent

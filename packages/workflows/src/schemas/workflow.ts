@@ -67,6 +67,14 @@ export const workflowBaseSchema = z.object({
   fallbackModel: z.string().min(1).optional(),
   betas: z.array(z.string().min(1)).nonempty("'betas' must be a non-empty array").optional(),
   sandbox: sandboxSettingsSchema.optional(),
+  /**
+   * WO-HARNESS-NODE-PROVIDER-FAILOVER-01: workflow-level default AVAILABILITY
+   * failover provider/model. A node inherits these unless it declares its own
+   * `failover_provider`/`failover_model`, mirroring how `provider:`/`model:`
+   * inheritance works. Control-plane only -- never forwarded to the SDK.
+   */
+  failover_provider: z.string().trim().min(1).optional(),
+  failover_model: z.string().trim().min(1).optional(),
   worktree: workflowWorktreePolicySchema.optional(),
   /** Path to file whose content is loaded as systemPrompt for all prompt nodes. BDC patch. */
   policyFile: z.string().optional(),

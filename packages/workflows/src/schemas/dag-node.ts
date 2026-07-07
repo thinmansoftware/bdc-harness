@@ -163,6 +163,19 @@ export const dagNodeBaseSchema = z.object({
   fallbackModel: z.string().min(1).optional(),
   betas: z.array(z.string().min(1)).nonempty("'betas' must be a non-empty array").optional(),
   sandbox: sandboxSettingsSchema.optional(),
+  /**
+   * WO-HARNESS-NODE-PROVIDER-FAILOVER-01: node-level AVAILABILITY failover.
+   * When the primary provider call fails with an availability-class error
+   * (429 / timeout / 5xx / connection error), the DAG executor re-dispatches
+   * this ONE node exactly once on `failover_provider` (+ `failover_model` if
+   * given), instead of failing the run. Auth/billing/other 4xx errors do NOT
+   * failover. These are pure control-plane fields consumed by the executor's
+   * failover logic -- they are NEVER forwarded into provider/SDK options.
+   * A node with no failover_provider (and no workflow-level default) behaves
+   * exactly as before.
+   */
+  failover_provider: z.string().trim().min(1).optional(),
+  failover_model: z.string().trim().min(1).optional(),
   agent: z.string().min(1, "'agent' must be a non-empty string").optional(),
   /**
    * Human-facing alias for `agent:` -- resolved identically by the executor and
@@ -375,6 +388,8 @@ export const BASH_NODE_AI_FIELDS: readonly string[] = [
   'sandbox',
   'agent',
   'persona',
+  'failover_provider',
+  'failover_model',
 ];
 
 /** AI-specific fields that are meaningless on script nodes -- same as bash nodes */
@@ -382,12 +397,20 @@ export const SCRIPT_NODE_AI_FIELDS: readonly string[] = BASH_NODE_AI_FIELDS;
 
 /**
  * AI-specific fields that are unsupported on loop nodes.
- * `model`, `provider`, `agent`, and `persona` are excluded -- the DAG executor
- * resolves and forwards them to each iteration's AI call. `persona` is the
- * human-facing alias for `agent` (see dagNodeBaseSchema).
+ * `model`, `provider`, `agent`, `persona`, and the `failover_*` pair are excluded
+ * -- the DAG executor resolves and forwards them to each iteration's AI call, and
+ * failover applies to loop nodes as well as prompt nodes
+ * (WO-HARNESS-NODE-PROVIDER-FAILOVER-01). `persona` is the human-facing alias for
+ * `agent` (see dagNodeBaseSchema).
  */
 export const LOOP_NODE_AI_FIELDS: readonly string[] = BASH_NODE_AI_FIELDS.filter(
-  f => f !== 'model' && f !== 'provider' && f !== 'agent' && f !== 'persona'
+  f =>
+    f !== 'model' &&
+    f !== 'provider' &&
+    f !== 'agent' &&
+    f !== 'persona' &&
+    f !== 'failover_provider' &&
+    f !== 'failover_model'
 );
 
 // ---------------------------------------------------------------------------
@@ -613,6 +636,14 @@ export const dagNodeSchema = dagNodeBaseSchema
       ...(data.fallbackModel !== undefined ? { fallbackModel: data.fallbackModel } : {}),
       ...(data.betas !== undefined ? { betas: data.betas } : {}),
       ...(data.sandbox !== undefined ? { sandbox: data.sandbox } : {}),
+      // Control-plane failover fields (WO-HARNESS-NODE-PROVIDER-FAILOVER-01).
+      // Populated onto the parsed node so the DAG executor can read
+      // node.failover_provider/node.failover_model. NOT forwarded into
+      // nodeConfig/SDK options (see dag-executor.ts dispatch sites).
+      ...(data.failover_provider !== undefined
+        ? { failover_provider: data.failover_provider }
+        : {}),
+      ...(data.failover_model !== undefined ? { failover_model: data.failover_model } : {}),
       ...(data.agent !== undefined ? { agent: data.agent } : {}),
       ...(data.persona !== undefined ? { persona: data.persona } : {}),
     };
