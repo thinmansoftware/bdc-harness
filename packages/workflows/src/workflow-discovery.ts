@@ -89,6 +89,16 @@ interface DirLoadResult {
 const MAX_DISCOVERY_DEPTH = 1;
 
 /**
+ * Subdirectory name for retired workflows (e.g. `.archon/workflows/retired/`).
+ * Files moved there are archived, NOT served: they must not appear in
+ * `/api/workflows` and must not be resolvable by `/workflow run`. PR #347
+ * relocated the dead cauldron lanes there assuming discovery would skip them,
+ * but the depth-1 descent was still picking them up -- this exclusion makes
+ * the retired/ convention real.
+ */
+const RETIRED_DIR_NAME = 'retired';
+
+/**
  * Load workflows from a directory, descending at most `MAX_DISCOVERY_DEPTH`
  * folders deep. Files deeper than the cap are silently skipped.
  * Failures are per-file: one broken file does not abort loading the rest.
@@ -111,6 +121,11 @@ async function loadWorkflowsFromDir(dirPath: string, depth = 0): Promise<DirLoad
           // subdirectories are ignored (same convention as the paths-package
           // `findMarkdownFilesRecursive` depth cap).
           if (depth >= MAX_DISCOVERY_DEPTH) continue;
+          // retired/ is an archive, not a scope -- never serve workflows from it.
+          if (entry === RETIRED_DIR_NAME) {
+            getLog().debug({ entryPath }, 'workflow_retired_dir_skipped');
+            continue;
+          }
           const subResult = await loadWorkflowsFromDir(entryPath, depth + 1);
           for (const [filename, workflow] of subResult.workflows) {
             workflows.set(filename, workflow);

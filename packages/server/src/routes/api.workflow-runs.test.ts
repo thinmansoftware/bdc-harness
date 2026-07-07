@@ -1,4 +1,4 @@
-import { describe, test, expect, mock, beforeEach } from 'bun:test';
+import { describe, test, expect, mock, beforeEach, afterEach } from 'bun:test';
 import { join } from 'path';
 import { OpenAPIHono } from '@hono/zod-openapi';
 import type { ConversationLockManager } from '@archon/core';
@@ -411,6 +411,52 @@ describe('POST /api/workflows/:name/run', () => {
     mockHandleMessage.mockReset();
     mockAddMessage.mockReset();
     mockGenerateAndSetTitle.mockReset();
+    // Pre-dispatch validation resolves the workflow name against discovery
+    // before accepting -- seed the names these tests dispatch.
+    mockDiscoverWorkflowsWithConfig.mockReset();
+    mockDiscoverWorkflowsWithConfig.mockImplementation(async () => ({
+      workflows: [
+        { workflow: { name: 'deploy' } as never, source: 'project' as const },
+        { workflow: { name: 'test-suite' } as never, source: 'project' as const },
+      ],
+      errors: [],
+    }));
+  });
+
+  afterEach(() => {
+    // Restore the factory default ([] workflows) for other describes.
+    mockDiscoverWorkflowsWithConfig.mockReset();
+    mockDiscoverWorkflowsWithConfig.mockImplementation(async () => ({
+      workflows: [],
+      errors: [],
+    }));
+  });
+
+  test('rejects a nonexistent workflow name with accepted:false before dispatch', async () => {
+    // Regression: 2026-07-07 false-dispatch incident -- unknown lane names
+    // must be rejected at the API boundary, not accepted then failed
+    // in-conversation with no run row.
+    mockFindConversationByPlatformId.mockImplementationOnce(async () => MOCK_CONV);
+    mockAddMessage.mockImplementationOnce(async () => ({
+      id: 'msg-1',
+      conversation_id: MOCK_CONV.id,
+      role: 'user' as const,
+      content: 'Go',
+      metadata: '{}',
+      created_at: NOW,
+    }));
+
+    const { app } = makeApp();
+    const response = await app.request('/api/workflows/no-such-lane/run', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ conversationId: 'web-test-abc', message: 'Go' }),
+    });
+    expect(response.status).toBe(400);
+    const body = (await response.json()) as { accepted: boolean; error: string };
+    expect(body.accepted).toBe(false);
+    expect(body.error).toContain('no-such-lane');
+    expect(mockHandleMessage).not.toHaveBeenCalled();
   });
 
   test('dispatches workflow run to orchestrator and returns accepted', async () => {
