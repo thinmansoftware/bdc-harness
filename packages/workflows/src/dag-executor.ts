@@ -4061,10 +4061,17 @@ export async function executeDagWorkflow(
               // + Anthropic-pinned persona) throws InfrastructureClassBlock here
               // -- the same guard a normal dispatch would apply. The failover
               // fields themselves are NOT read into nodeConfig/SDK options.
+              // Set `model` explicitly (even to undefined) rather than
+              // conditionally spreading it: a bare spread of `...node` would
+              // otherwise LEAK the primary provider's `node.model` (e.g. an
+              // OpenRouter-format `qwen/qwen3-coder`) into the failover dispatch
+              // when `failover_model` is omitted. Clearing it lets
+              // resolveNodeProviderAndModel fall back to the failover provider's
+              // own assistant-config model (mirrors the loop-node path above).
               const failoverNode = {
                 ...node,
                 provider: failoverTarget.provider,
-                ...(failoverTarget.model !== undefined ? { model: failoverTarget.model } : {}),
+                model: failoverTarget.model,
               };
               const failoverResolved = await resolveNodeProviderAndModel(
                 failoverNode,

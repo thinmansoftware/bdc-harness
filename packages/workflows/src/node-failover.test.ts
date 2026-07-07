@@ -129,11 +129,17 @@ function makeProviderHarness(behaviors: Record<string, ProviderBehavior>): {
     getCapabilities: () => ReturnType<typeof CAPS_CLAUDE>;
   };
   calls: Record<string, number>;
+  /** Last resolved model string passed to sendQuery, keyed by provider. */
+  models: Record<string, string | undefined>;
 } {
   const calls: Record<string, number> = {};
+  const models: Record<string, string | undefined> = {};
   const getAgentProvider = (provider: string) => ({
     sendQuery: (..._a: unknown[]) => {
       calls[provider] = (calls[provider] ?? 0) + 1;
+      // 4th positional arg is SendQueryOptions; capture the resolved model.
+      const opts = _a[3] as { model?: string } | undefined;
+      models[provider] = opts?.model;
       const behavior = behaviors[provider];
       if (!behavior) throw new Error(`test: no behavior configured for provider '${provider}'`);
       return behavior();
@@ -141,7 +147,7 @@ function makeProviderHarness(behaviors: Record<string, ProviderBehavior>): {
     getType: () => provider,
     getCapabilities: provider === 'codex' ? CAPS_CODEX : CAPS_CLAUDE,
   });
-  return { getAgentProvider, calls };
+  return { getAgentProvider, calls, models };
 }
 
 function createMockStore(
@@ -213,18 +219,20 @@ afterEach(async () => {
 
 async function runNode(
   node: DagNode,
-  behaviors: Record<string, ProviderBehavior>
+  behaviors: Record<string, ProviderBehavior>,
+  runConfig: WorkflowConfig = config
 ): Promise<{
   calls: Record<string, number>;
+  models: Record<string, string | undefined>;
   events: Array<{ event_type: string; step_name: string | null }>;
 }> {
   const events: Array<{ event_type: string; step_name: string | null }> = [];
   const store = createMockStore(events);
-  const { getAgentProvider, calls } = makeProviderHarness(behaviors);
+  const { getAgentProvider, calls, models } = makeProviderHarness(behaviors);
   const deps: WorkflowDeps = {
     store,
     getAgentProvider: getAgentProvider as unknown as WorkflowDeps['getAgentProvider'],
-    loadConfig: mock(() => Promise.resolve(config)) as unknown as WorkflowDeps['loadConfig'],
+    loadConfig: mock(() => Promise.resolve(runConfig)) as unknown as WorkflowDeps['loadConfig'],
   };
   const run = await store.createWorkflowRun({
     workflow_name: 'f',
@@ -244,9 +252,9 @@ async function runNode(
     join(testDir, 'logs'),
     'main',
     'docs/',
-    config
+    runConfig
   );
-  return { calls, events };
+  return { calls, models, events };
 }
 
 describe('isAvailabilityError -- classifier', () => {
@@ -258,6 +266,19 @@ describe('isAvailabilityError -- classifier', () => {
     expect(isAvailabilityError('Network connection lost.')).toBe(true);
     expect(isAvailabilityError('read ETIMEDOUT')).toBe(true);
     expect(isAvailabilityError('socket hang up')).toBe(true);
+  });
+
+  it('treats a REALISTIC provider 429 (message-only, no statusCode) as availability', () => {
+    // The exact production scenario this WO exists to fix: an OpenAI/OpenRouter
+    // (`opr`) or GLM SDK `APIError` whose numeric `.status` is discarded when the
+    // executor stores only `err.message`. The classifier never sees `429` as a
+    // statusCode and the surviving text is NOT the literal `rate_limit_exceeded`
+    // token, so classifyError alone returns `unknown`. These must still failover
+    // via the message-level AVAILABILITY_CONNECTION_PATTERNS -- with NO statusCode.
+    expect(isAvailabilityError('429 Rate limit reached for gpt-5 in org org-abc')).toBe(true);
+    expect(isAvailabilityError('Request failed with status code 429')).toBe(true);
+    expect(isAvailabilityError('Too Many Requests')).toBe(true);
+    expect(isAvailabilityError('Error: 429 Too Many Requests')).toBe(true);
   });
 
   it('does NOT treat auth / billing / invalid-request / unknown as availability', () => {
@@ -341,5 +362,39 @@ describe('node-level availability failover (prompt node)', () => {
     expect(calls.codex ?? 0).toBe(0); // no failover declared -> codex never touched
     expect(events.filter(e => e.event_type === 'node_failover')).toHaveLength(0);
     expect(events.some(e => e.event_type === 'node_failed' && e.step_name === 'plan')).toBe(true);
+  });
+
+  it('Scenario 5: failover_provider WITHOUT failover_model -> does NOT leak the primary model; resolves the failover provider assistant-config model', async () => {
+    // Regression guard: a bare `{ ...node }` spread on the failover clone would
+    // carry the primary provider's `node.model` (an OpenRouter/`opr`-format
+    // string) into the codex dispatch when `failover_model` is omitted. The
+    // clone must clear `model` so resolveNodeProviderAndModel falls back to the
+    // failover provider's own assistant-config model.
+    const cfg: WorkflowConfig = {
+      assistant: 'claude',
+      assistants: { claude: {}, codex: { model: 'gpt-5.5-codex' } },
+      commands: {},
+      defaults: { loadDefaultCommands: false, loadDefaultWorkflows: false },
+    };
+    const { calls, models, events } = await runNode(
+      {
+        id: 'plan',
+        prompt: 'do the work',
+        provider: 'claude',
+        model: 'qwen/qwen3-coder', // primary (OpenRouter-format) model -- must NOT leak
+        failover_provider: 'codex',
+        // failover_model deliberately omitted
+      } as DagNode,
+      { claude: availabilityFailure, codex: () => success('failover worked') },
+      cfg
+    );
+
+    expect(calls.claude).toBe(1);
+    expect(calls.codex).toBe(1);
+    expect(events.filter(e => e.event_type === 'node_failover')).toHaveLength(1);
+    // The failover dispatch resolved codex's assistant-config model, NOT the
+    // leaked primary OpenRouter-format string.
+    expect(models.codex).toBe('gpt-5.5-codex');
+    expect(models.codex).not.toBe('qwen/qwen3-coder');
   });
 });
