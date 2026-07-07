@@ -161,6 +161,11 @@ nodes:
 
   - id: plan
     persona: war-council-architect-opr
+    # WO-HARNESS-NODE-PROVIDER-FAILOVER-01: architect/planning seat, inherits root
+    # glm/qwen (OpenRouter). Model-free -opr persona = safe failover to codex (no
+    # Anthropic pin risk). Matches fusion-cx-qwen lane precedent.
+    failover_provider: codex
+    failover_model: gpt-5.5
     depends_on: [gate-already-satisfied]
     agent: war-council-architect
     task_class: medium_work
@@ -303,6 +308,15 @@ nodes:
   - id: implement
     provider: glm
     model: qwen/qwen3-coder
+    # WO-HARNESS-NODE-PROVIDER-FAILOVER-01: builder node on OpenRouter (qwen). If
+    # OpenRouter throttles/drops (429/timeout/5xx/connection), fall SIDEWAYS to
+    # Codex once rather than killing the run. This node carries no persona (bare
+    # provider/model), so no InfrastructureClassBlock risk. Judge/review seats
+    # (plan-review, diff-review*, war-council-validator, opus-rereview) are
+    # intentionally NOT wired -- a gate that silently switches models undermines
+    # gate integrity (spec doctrine, matches fusion-cx-qwen lane precedent).
+    failover_provider: codex
+    failover_model: gpt-5.5
     depends_on: [plan-review]
     task_class: medium_work
     loop:
@@ -804,6 +818,11 @@ nodes:
   - id: diff-repair
     provider: glm
     model: qwen/qwen3-coder
+    # WO-HARNESS-NODE-PROVIDER-FAILOVER-01: repair-tier builder node on OpenRouter
+    # (qwen). Same rationale as `implement` above -- fail sideways to Codex once
+    # on availability errors, never on review/judge seats.
+    failover_provider: codex
+    failover_model: gpt-5.5
     depends_on: [diff-review, classify-diff-review]
     when: "$classify-diff-review.output.verdict == 'needs_revision'"
     task_class: medium_work
@@ -1027,6 +1046,10 @@ nodes:
   - id: opus-repair
     provider: glm
     model: qwen/qwen3-coder
+    # WO-HARNESS-NODE-PROVIDER-FAILOVER-01: last-chance repair builder on
+    # OpenRouter (qwen). Same rationale as `implement`/`diff-repair` above.
+    failover_provider: codex
+    failover_model: gpt-5.5
     depends_on: [block-classify]
     when: "$block-classify.output.status == 'BLOCKED'"
     prompt: |
