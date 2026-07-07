@@ -1201,6 +1201,8 @@ nodes:
   # emit sentinels. Only an AI pass normalizes all of them into the per-row JSON ledger.
   - id: findings-consolidate
     persona: xo
+    provider: claude
+    model: sonnet
     depends_on: [block-reclassify]
     trigger_rule: all_done
     task_class: clerical
@@ -1371,6 +1373,8 @@ nodes:
 
   - id: decide-push-target
     persona: major-build
+    provider: claude
+    model: opus[1m]
     depends_on: [pause-gate, classify-apply-review]
     trigger_rule: all_done
     when: "$pause-gate.output.decision_verb != 'approve_with_fix' || $classify-apply-review.output.verdict == 'satisfied'"
@@ -1808,6 +1812,8 @@ nodes:
 
   - id: build-manifest
     persona: major-build
+    provider: claude
+    model: opus[1m]
     depends_on: [open-pr-if-needed, block-reclassify, pause-gate]
     trigger_rule: all_done
     task_class: clerical
