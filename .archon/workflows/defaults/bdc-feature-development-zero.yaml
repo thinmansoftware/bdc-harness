@@ -186,7 +186,6 @@ nodes:
 
       ## BDC Push Policy
       Hardcoded Rule 20 staging-gate repos:
-      - bluedevilcollectibles/lspro-react
       - bluedevilcollectibles/shopops-storefront
       - bluedevilcollectibles/shopops
 
@@ -246,8 +245,10 @@ nodes:
         1. Scope creep -- any file not justified by the spec.
         2. Missing files -- in-scope work the plan omits.
         3. Unsafe assumptions -- "assume X exists" without verification.
-        4. Rule 20 staging gate -- if target repo is lspro-react / shopops-storefront /
-           shopops, plan MUST require --base staging. If not those, must NOT.
+        4. Rule 20 staging gate -- if target repo is shopops-storefront / shopops,
+           plan MUST require --base staging. If not those, must NOT -- and note
+           lspro-react has NO staging branch (its staging IS main): a plan for
+           lspro-react must target main and must NOT require --base staging.
         5. Out-of-scope list present and correct.
 
         ## Self-repair (the point -- do not just report)
@@ -1435,7 +1436,6 @@ nodes:
       The target repo is where the PR must be opened (NOT the worktree's git origin - Rule 29).
 
       Match the extracted repo against this hardcoded staging-gate list:
-      - bluedevilcollectibles/lspro-react
       - bluedevilcollectibles/shopops-storefront
       - bluedevilcollectibles/shopops
 
