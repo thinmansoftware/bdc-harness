@@ -59,6 +59,22 @@ const AVAILABILITY_ERROR_CLASSES: ReadonlySet<ErrorClass> = new Set([
  *   - timeout / timed out           : provider request timeouts (transient).
  *   - overloaded / 529              : Anthropic HTTP 529 = service overloaded
  *                                     (executor-shared.ts TRANSIENT_PATTERNS note).
+ *   - rate limit / too many
+ *     requests / 429                : the exact failure this WO exists to fix.
+ *                                     The overseer classifier only recognizes the
+ *                                     literal snake_case token `rate_limit_exceeded`
+ *                                     or a separately-supplied HTTP `statusCode`.
+ *                                     But providers (OpenAI/OpenRouter `opr`, GLM)
+ *                                     throw an SDK `APIError` whose numeric `.status`
+ *                                     is lost when the executor stores only
+ *                                     `err.message`, and the surviving text reads
+ *                                     like `"429 Rate limit reached for ..."` /
+ *                                     `"Too Many Requests"` -- neither of which the
+ *                                     classifier matches. These message-level
+ *                                     patterns close that gap (checked only AFTER
+ *                                     the non-availability provider-class guard, so
+ *                                     an auth/billing/invalid-request error whose
+ *                                     text mentions a limit still does NOT failover).
  */
 export const AVAILABILITY_CONNECTION_PATTERNS: readonly string[] = [
   'timeout',
@@ -74,6 +90,9 @@ export const AVAILABILITY_CONNECTION_PATTERNS: readonly string[] = [
   'connection reset',
   'overloaded',
   '529',
+  'rate limit',
+  'too many requests',
+  '429',
 ];
 
 /**
