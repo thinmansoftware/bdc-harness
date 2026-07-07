@@ -1,10 +1,11 @@
 name: bdc-feature-development-fusion-cx-qwen
 description: |
-  GLM-implement variant of bdc-feature-development. Identical DAG; implement +
-  diff-repair + opus-repair use GLM glm-5.2 instead of Claude or Codex. Fire when
-  routing build nodes to Z.ai is preferred. All review nodes stay on Codex.
+  Qwen-implement variant of bdc-feature-development. Identical DAG; implement +
+  diff-repair + review-repair loops use qwen/qwen3-coder via OpenRouter instead
+  of Claude. Codex reviews; Claude judges only. The cheap non-Claude build lane.
 
 policyFile: harness/policies/agent-behavior.md
+provider: codex  # root provider: bare tail nodes (findings-consolidate, decide-push-target, build-manifest) MUST route gpt-5.5 to Codex, not the Anthropic SDK. Missing this line = dead-at-tail (2026-07-07 runs d469af05/f73fb8b3: builds succeeded, tails died on "model gpt-5.5 may not exist").
 model: gpt-5.5  # root default non-Claude; bare nodes do not fall to Claude
 
 nodes:
