@@ -8,7 +8,7 @@
  * Options:
  *   --class CODE|INFRA|MIXED   WO class for conductor ruleset
  *   --tags tag1,tag2           Comma-separated tags
- *   --entry glm|codex|claude|frontier  Override entry tier (skips conductor)
+ *   --entry qwen|codex|claude|frontier  Override entry tier (skips conductor)
  *   --out-dir <path>           cascade-runs output dir (default: ./cascade-runs)
  *   --dry-run                  Print which tier would be picked, do not fire
  *   --api-url <url>            Archon API base (default: ARCHON_API_BASE_URL or http://localhost:3090)
@@ -51,7 +51,7 @@ Commands:
 Options:
   --class <CLASS>    WO class for conductor ruleset (CODE, INFRA, MIXED)
   --tags <tags>      Comma-separated tags (e.g. mechanical,auth)
-  --entry <tier>     Override entry tier (glm, codex, claude, frontier)
+  --entry <tier>     Override entry tier (qwen, codex, claude, frontier)
   --out-dir <path>   Output directory for cascade records (default: ./cascade-runs)
   --dry-run          Print entry tier selection only; do not fire
   --api-url <url>    Archon API base URL (default: ARCHON_API_BASE_URL env or http://localhost:3090)
