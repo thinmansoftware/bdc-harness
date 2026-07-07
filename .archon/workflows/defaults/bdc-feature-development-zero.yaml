@@ -1,18 +1,21 @@
 name: bdc-feature-development-zero
 description: |
-  ZERO-CLAUDE lane of bdc-feature-development (John directive 2026-07-03: a
-  completely open lane to preserve Claude usage; desperation-safe). Roster
-  updated 2026-07-07 after the GLM zero-lane incident: build nodes
-  (implement + diff-repair + opus-repair) use Qwen qwen/qwen3-coder via
-  OpenRouter (the proven cheap builder), review nodes use DeepSeek
-  deepseek/deepseek-chat-v3.1 via OpenRouter (cross-model -- the builder
-  never grades its own diff), and the war-council-validator judge seat runs
-  on CODEX (OpenAI billing), not Claude. NO node in this lane consumes
-  Claude usage. All persona-bearing prompt nodes use model-free -opr/-codex
-  persona variants (persona model wins over node model; an Anthropic alias
-  on a non-Claude provider 400s or trips InfrastructureClassBlock -- anchor
-  run bb90a745). Trade-off accepted: the "trusted judge always Claude"
-  doctrine is relaxed HERE ONLY.
+  ZERO-CLAUDE FUSION lane of bdc-feature-development (John directives
+  2026-07-03 "completely open lane to preserve Claude usage" + 2026-07-07
+  "fusion combines open models AS the war council"). The council is composed
+  of DIFFERENT open models attacking each other's work -- cross-model
+  diversity is the quality mechanism that replaces the always-Claude judge:
+    plan (architect seat)        = Qwen qwen/qwen3-coder (root default)
+    plan-review (attack seat)    = DeepSeek deepseek-chat-v3.1
+    implement + repairs (builder)= Qwen qwen/qwen3-coder (proven 2026-07-07)
+    diff reviews (attack seats)  = DeepSeek deepseek-chat-v3.1
+    war-council-validator (judge)= CODEX (OpenAI billing)
+  No model ever grades its own output; NO node consumes Claude usage. All
+  persona-bearing prompt nodes use model-free -opr/-codex persona variants
+  (persona model wins over node model; an Anthropic alias on a non-Claude
+  provider 400s or trips InfrastructureClassBlock -- anchor run bb90a745).
+  Roster updated 2026-07-07 after the GLM zero-lane incident (glm-5.2
+  removed from every seat).
 
 policyFile: harness/policies/agent-behavior.md
 # zero lane: glm provider = the generic OpenRouter client; build model is qwen.
@@ -204,6 +207,12 @@ nodes:
   - id: plan-review
     persona: war-council-architect-opr
     agent: war-council-architect
+    # FUSION war council (John 2026-07-07): every council seat is a DIFFERENT open
+    # model attacking the others' work. The plan authored by qwen (root default)
+    # is reviewed by DeepSeek here -- never self-graded. Cross-model diversity IS
+    # the quality mechanism replacing the Claude judge on this lane.
+    provider: glm
+    model: deepseek/deepseek-chat-v3.1
     depends_on: [plan]
     task_class: medium_work
     loop:
