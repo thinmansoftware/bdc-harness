@@ -1,21 +1,26 @@
 name: bdc-feature-development-zero
 description: |
   ZERO-CLAUDE lane of bdc-feature-development (John directive 2026-07-03: a
-  completely open lane to preserve Claude usage; desperation-safe). Identical
-  DAG to open-a: build nodes (implement + diff-repair + opus-repair) use GLM
-  z-ai/glm-5.2 via OpenRouter, review nodes use Qwen qwen/qwen3-coder via
-  OpenRouter, and -- unlike open-a/open-b -- the war-council-validator judge
-  seat runs on CODEX (OpenAI billing), not Claude. NO node in this lane
-  consumes Claude usage. Trade-off accepted: the "trusted judge always
-  Claude" doctrine is relaxed HERE ONLY; open-a/open-b keep the Claude judge.
+  completely open lane to preserve Claude usage; desperation-safe). Roster
+  updated 2026-07-07 after the GLM zero-lane incident: build nodes
+  (implement + diff-repair + opus-repair) use Qwen qwen/qwen3-coder via
+  OpenRouter (the proven cheap builder), review nodes use DeepSeek
+  deepseek/deepseek-chat-v3.1 via OpenRouter (cross-model -- the builder
+  never grades its own diff), and the war-council-validator judge seat runs
+  on CODEX (OpenAI billing), not Claude. NO node in this lane consumes
+  Claude usage. All persona-bearing prompt nodes use model-free -opr/-codex
+  persona variants (persona model wins over node model; an Anthropic alias
+  on a non-Claude provider 400s or trips InfrastructureClassBlock -- anchor
+  run bb90a745). Trade-off accepted: the "trusted judge always Claude"
+  doctrine is relaxed HERE ONLY.
 
 policyFile: harness/policies/agent-behavior.md
-# zero lane: GLM provider / z-ai/glm-5.2 build model via OpenRouter.
+# zero lane: glm provider = the generic OpenRouter client; build model is qwen.
 # provider: glm is REQUIRED here (no top-level provider would cause un-pinned nodes
-# to fall through to config-default claude with a GLM model ID -- API rejection).
+# to fall through to config-default claude with an OpenRouter model ID -- API rejection).
 # war-council-validator is pinned to codex on the node (zero-Claude law).
 provider: glm
-model: z-ai/glm-5.2
+model: qwen/qwen3-coder
 
 nodes:
   # Pre-flight: fail closed if container lacks GITHUB auth (WO-169, 2026-05-16).
@@ -98,7 +103,7 @@ nodes:
   # the normal build path -- assert-implement-produced-work (Fix A) is the real safety
   # net, this is only an optimization that must never wrongly skip real work.
   - id: check-already-satisfied
-    persona: war-council-architect
+    persona: war-council-architect-opr
     agent: war-council-architect
     depends_on: [read-spec]
     task_class: clerical
@@ -152,7 +157,7 @@ nodes:
       exit 0
 
   - id: plan
-    persona: war-council-architect
+    persona: war-council-architect-opr
     depends_on: [gate-already-satisfied]
     agent: war-council-architect
     task_class: medium_work
@@ -197,7 +202,7 @@ nodes:
   # plan that `implement` consumes. NOT a human gate -- humans are reached only via the
   # async escalation payload, and only at the irreversible-action boundary downstream.
   - id: plan-review
-    persona: war-council-architect
+    persona: war-council-architect-opr
     agent: war-council-architect
     depends_on: [plan]
     task_class: medium_work
@@ -288,7 +293,7 @@ nodes:
 
   - id: implement
     provider: glm
-    model: z-ai/glm-5.2
+    model: qwen/qwen3-coder
     depends_on: [plan-review]
     task_class: medium_work
     loop:
@@ -666,7 +671,7 @@ nodes:
     # Deliberate relaxation of the always-Claude-judge doctrine for THIS lane
     # only (John 2026-07-03). Codex is the strongest non-Claude judge seat.
     provider: codex
-    persona: captain-ci-validator
+    persona: captain-ci-validator-codex
     depends_on: [ascii-gate]
     task_class: medium_work
     prompt: |
@@ -736,7 +741,7 @@ nodes:
 
   - id: diff-review
     provider: glm
-    model: qwen/qwen3-coder
+    model: deepseek/deepseek-chat-v3.1
     agent: codex-adversarial-reviewer
     depends_on: [capture-diff]
     task_class: medium_work
@@ -789,7 +794,7 @@ nodes:
 
   - id: diff-repair
     provider: glm
-    model: z-ai/glm-5.2
+    model: qwen/qwen3-coder
     depends_on: [diff-review, classify-diff-review]
     when: "$classify-diff-review.output.verdict == 'needs_revision'"
     task_class: medium_work
@@ -919,7 +924,7 @@ nodes:
 
   - id: diff-review-final
     provider: glm
-    model: qwen/qwen3-coder
+    model: deepseek/deepseek-chat-v3.1
     agent: codex-adversarial-reviewer
     depends_on: [capture-diff-final]
     trigger_rule: all_done
@@ -1012,7 +1017,7 @@ nodes:
   # resolve the block, then signals. If it can't fix, the run proceeds to the human pause.
   - id: opus-repair
     provider: glm
-    model: z-ai/glm-5.2
+    model: qwen/qwen3-coder
     depends_on: [block-classify]
     when: "$block-classify.output.status == 'BLOCKED'"
     prompt: |
@@ -1069,7 +1074,7 @@ nodes:
   # terminal-BLOCKED on a non-interactive run.
   - id: opus-rereview
     provider: glm
-    model: qwen/qwen3-coder
+    model: deepseek/deepseek-chat-v3.1
     agent: codex-adversarial-reviewer
     depends_on: [classify-opus-repair]
     trigger_rule: all_done
@@ -1203,7 +1208,7 @@ nodes:
   # AI node (not bash): plan-review emits unstructured prose; diff-review/-final + opus-repair
   # emit sentinels. Only an AI pass normalizes all of them into the per-row JSON ledger.
   - id: findings-consolidate
-    persona: xo
+    persona: xo-opr
     depends_on: [block-reclassify]
     trigger_rule: all_done
     task_class: clerical
@@ -1329,7 +1334,7 @@ nodes:
   # Distinct id (diff-review-final already ran upstream). Only meaningful on the APPROVE-WITH-FIX path.
   - id: apply-diff-review-final
     provider: glm
-    model: qwen/qwen3-coder
+    model: deepseek/deepseek-chat-v3.1
     agent: codex-adversarial-reviewer
     depends_on: [apply-suggested-fix]
     trigger_rule: all_done
@@ -1373,7 +1378,7 @@ nodes:
       printf '{"verdict":"%s"}\n' "$verdict"
 
   - id: decide-push-target
-    persona: major-build
+    persona: major-build-opr
     depends_on: [pause-gate, classify-apply-review]
     trigger_rule: all_done
     when: "$pause-gate.output.decision_verb != 'approve_with_fix' || $classify-apply-review.output.verdict == 'satisfied'"
@@ -1810,7 +1815,7 @@ nodes:
       fi
 
   - id: build-manifest
-    persona: major-build
+    persona: major-build-opr
     depends_on: [open-pr-if-needed, block-reclassify, pause-gate]
     trigger_rule: all_done
     task_class: clerical
@@ -2146,7 +2151,7 @@ nodes:
       echo "PR_URL=$PR_URL"
 
   - id: flip-notion
-    persona: xo
+    persona: xo-opr
     depends_on: [build-manifest, manifest-consistency-check]
     when: "$manifest-consistency-check.output == 'OK'"
     trigger_rule: all_done
@@ -2185,7 +2190,7 @@ nodes:
   # depends on war-council-validator + flip-notion with all_done, so it runs even
   # when the tail chain between them failed, and no-ops on a real build failure.
   - id: flip-notion-on-failure
-    persona: xo
+    persona: xo-opr
     depends_on: [war-council-validator, flip-notion]
     trigger_rule: all_done
     task_class: clerical
