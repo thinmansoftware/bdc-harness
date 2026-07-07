@@ -1923,7 +1923,7 @@ nodes:
         Tests: <N passing / N total> or N/A (<reason>)
         PRs: <PR URL> or N/A (ALREADY_SATISFIED or BLOCKED)
         Merge ancestors: <merge-base SHA>...<HEAD SHA> (behind_by=<N>) or N/A
-        Grep assertions: one line; value is a ';'-separated list of sub-assertions, each EXACTLY "<command> => <count>" with a bare integer count -- NO prose after the count, and NO assertion about pre-change state (never write "=> 0" for a path this diff creates -- it is false by construction once the file exists); or "N/A (<reason>)". verify-manifest-assertions executes each sub-assertion and rewrites wrong counts, so emit your best honest count.
+        Grep assertions: one line; value is a ';'-separated list of sub-assertions, each EXACTLY "<command> => <count>" with a bare integer count -- NO prose after the count, and NO assertion about pre-change state (never write "=> 0" for a path this diff creates -- it is false by construction once the file exists); or "N/A (<reason>)". Each <command> MUST be a single read-only inspection built only from grep/egrep/fgrep/rg/wc/find/cat/head/tail/sort/uniq/test, optionally piped ('|') to one of those; it MUST NOT contain a literal ';' or any shell chaining/redirection/substitution metacharacter (';' '&' '`' '$(' '>' '<') -- verify-manifest-assertions splits the value on ';' and DROPS (unexecuted) any command not on that read-only allowlist. verify-manifest-assertions executes each surviving sub-assertion and rewrites wrong counts, so emit your best honest count.
         Runtime verification: <evidence> or N/A (<reason>)
         VALIDATION: PASS   <- only when all in-run reviews passed
       NOTE: derive Files created/modified from the git diff -- do NOT list preserved/unchanged
@@ -1957,6 +1957,38 @@ nodes:
       }
 
       # ---- BEGIN vma core (byte-identical across lanes; extracted by unit test) ----
+      # allow_cmd <command>
+      #   Fail-closed allowlist gate for the assertion command executed via the
+      #   bash -c below. build-manifest COMPOSES these commands, so they are
+      #   AI-authored, UNTRUSTED input executed inside the run worktree (WO
+      #   Section 7 item 2 -- accepted, now guarded). A command is allowed ONLY
+      #   when every pipe ('|') segment starts with a read-only inspection tool
+      #   (grep/egrep/fgrep/rg/wc/find/cat/head/tail/sort/uniq/test). Any shell
+      #   chaining/redirection/substitution metacharacter (';' '&' '`' '$(' '>'
+      #   '<' newline) or a mutating find primary (-delete/-exec/-ok/-fprint*/
+      #   -fls) drops the assertion UNEXECUTED. This is also the fail-closed
+      #   backstop for a command that legitimately contained a ';': it is
+      #   fragmented by the ';'-split below and each fragment fails this gate
+      #   rather than executing.
+      allow_cmd() {
+        local c="$1" seg first
+        case "$c" in
+          *';'*|*'&'*|*'`'*|*'$('*|*'>'*|*'<'*|*$'\n'*) return 1 ;;
+          *' -delete'*|*' -exec'*|*' -ok'*|*' -fprint'*|*' -fls'*) return 1 ;;
+        esac
+        local IFS='|'
+        local -a segs
+        read -ra segs <<<"$c"
+        for seg in "${segs[@]}"; do
+          seg="$(printf '%s' "$seg" | sed 's/^[[:space:]]*//')"
+          first="${seg%%[[:space:]]*}"
+          case "$first" in
+            grep|egrep|fgrep|rg|wc|find|cat|head|tail|sort|uniq|test) ;;
+            *) return 1 ;;
+          esac
+        done
+        return 0
+      }
       # vma_process_assertions <grep-value> <files-created-csv>
       #   Splits the Grep-assertions value on ';', executes each "<command> => <count>"
       #   sub-assertion in the CWD, and applies the Mode Behavior Matrix:
@@ -2007,7 +2039,10 @@ nodes:
               f="$(printf '%s' "$f" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//; s/ (deleted)$//')"
               [ -z "$f" ] && continue
               base="$(basename "$f")"
-              if printf '%s' "$cmd" | grep -Fq "$f" || printf '%s' "$cmd" | grep -Fq "$base"; then
+              # Match on WORD/PATH boundaries (-w), not bare substring: a created
+              # file 'index.ts' must NOT forbid an assertion about 'index.tsx'
+              # (its basename is a literal substring of the longer name).
+              if printf '%s' "$cmd" | grep -Fwq "$f" || printf '%s' "$cmd" | grep -Fwq "$base"; then
                 forbidden=1
                 break
               fi
@@ -2015,6 +2050,10 @@ nodes:
           fi
           if [ "$forbidden" = "1" ]; then
             echo "verify-manifest-assertions: DROP (FORBIDDEN pre-create absence; asserts \"=> 0\" of a path this diff creates): $sub" >&2
+            continue
+          fi
+          if ! allow_cmd "$cmd"; then
+            echo "verify-manifest-assertions: DROP (command not on read-only allowlist; not executed): $sub" >&2
             continue
           fi
           raw="$(bash -c "$cmd" 2>/dev/null)"; rc=$?

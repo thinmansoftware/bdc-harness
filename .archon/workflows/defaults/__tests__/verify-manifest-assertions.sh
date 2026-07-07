@@ -235,6 +235,60 @@ fi
 assert_contains "canonical node block is non-empty" "vma_process_assertions" "$BLOCK_A"
 
 # -----------------------------------------------------------------------------
+# Test 10: basename substring collision -- a created file whose basename is a
+#          literal substring of an UNRELATED file named in a legitimate "=> 0"
+#          assertion must NOT be dropped as FORBIDDEN. Regression: the bare
+#          `grep -Fq "$base"` matched "index.ts" inside "index.tsx".
+# -----------------------------------------------------------------------------
+echo "--- Test 10: basename substring collision not forbidden ---"
+printf 'x\n' > "$FIX/index.ts"
+# Created file: index.ts. Assertion is about a DIFFERENT file, index.tsx, which
+# does not exist -> a real "=> 0" that must be executed and KEPT, not dropped.
+OUT="$(vma_process_assertions "grep -rln index.tsx $FIX => 0" "$FIX/index.ts" 2>/dev/null)"
+assert_eq "created index.ts does not forbid an assertion about index.tsx" \
+  "grep -rln index.tsx $FIX => 0" "$OUT"
+# The exact created path is still forbidden on a word boundary (true positive).
+ERRLOG="$(vma_process_assertions "grep -rln index.ts $FIX => 0" "$FIX/index.ts" 2>&1 >/dev/null)"
+assert_contains "exact-basename '=> 0' still forbidden" "FORBIDDEN pre-create absence" "$ERRLOG"
+
+# -----------------------------------------------------------------------------
+# Test 11: allowlist gate -- an assertion whose command mutates, chains, or
+#          redirects is DROPPED UNEXECUTED (no side effect on the worktree),
+#          including the case where an internal ';' fragments a compound command.
+# -----------------------------------------------------------------------------
+echo "--- Test 11: unsafe command dropped unexecuted ---"
+# (a) bare mutating command -- rm is not on the allowlist first-token set.
+GUARD="$FIX/data.txt"
+vma_process_assertions "rm -f $GUARD => 0" "" >/dev/null 2>&1
+if [ -e "$GUARD" ]; then
+  PASS=$((PASS + 1)); echo "PASS: rm assertion dropped -- data.txt survived"
+else
+  FAIL=$((FAIL + 1)); echo "FAIL: rm assertion executed -- data.txt deleted"
+fi
+# (b) redirection to a file must not execute.
+REDIR="$FIX/redir.out"; rm -f "$REDIR"
+ERRLOG="$(vma_process_assertions "grep -c alpha $FIX/data.txt > $REDIR => 2" "" 2>&1 >/dev/null)"
+if [ -e "$REDIR" ]; then
+  FAIL=$((FAIL + 1)); echo "FAIL: redirect command executed (redir.out created)"
+else
+  PASS=$((PASS + 1)); echo "PASS: redirect command not executed"
+fi
+assert_contains "redirect drop logged" "read-only allowlist" "$ERRLOG"
+# (c) internal ';' compound command -- the split fragments it and the mutating
+#     fragment ('touch') is dropped by the allowlist; no side effect.
+PWNED="$FIX/pwned.txt"; rm -f "$PWNED"
+OUT="$(vma_process_assertions "touch $PWNED => 0" "" 2>/dev/null)"
+assert_contains "touch assertion yields N/A (nothing survives)" "N/A (" "$OUT"
+if [ -e "$PWNED" ]; then
+  FAIL=$((FAIL + 1)); echo "FAIL: touch assertion executed (pwned.txt created)"
+else
+  PASS=$((PASS + 1)); echo "PASS: no side effect -- pwned.txt not created"
+fi
+# (d) a legitimate piped read-only command (grep | wc -l) still passes the gate.
+OUTOK="$(vma_process_assertions "grep -c alpha $FIX/data.txt | wc -l => 1" "" 2>/dev/null)"
+assert_eq "piped read-only command kept" "grep -c alpha $FIX/data.txt | wc -l => 1" "$OUTOK"
+
+# -----------------------------------------------------------------------------
 # Summary
 # -----------------------------------------------------------------------------
 echo ""
