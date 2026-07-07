@@ -2704,4 +2704,42 @@ nodes:
       expect(result.workflows[0].workflow.policyFile).toBeUndefined();
     });
   });
+
+  // ---------------------------------------------------------------------------
+  // retired/ exclusion (2026-07-07 false-dispatch incident)
+  // ---------------------------------------------------------------------------
+  //
+  // Regression guard: PR #347 moved dead cauldron lanes to
+  // .archon/workflows/retired/ assuming they would stop being served, but the
+  // depth-1 subdirectory descent still discovered them, so /api/workflows kept
+  // listing lanes that /workflow run could not actually execute.
+
+  describe('retired/ directory exclusion', () => {
+    it('does not discover workflows under .archon/workflows/retired/', async () => {
+      const workflowDir = join(testDir, '.archon', 'workflows');
+      const retiredDir = join(workflowDir, 'retired');
+      await mkdir(retiredDir, { recursive: true });
+      const activeYaml = `name: active-lane\ndescription: still served\nnodes:\n  - id: n\n    prompt: p\n`;
+      const retiredYaml = `name: retired-lane\ndescription: archived, must not be served\nnodes:\n  - id: n\n    prompt: p\n`;
+      await writeFile(join(workflowDir, 'active-lane.yaml'), activeYaml);
+      await writeFile(join(retiredDir, 'retired-lane.yaml'), retiredYaml);
+
+      const result = await discoverWorkflows(testDir, { loadDefaults: false });
+      const names = result.workflows.map(ws => ws.workflow.name);
+      expect(names).toContain('active-lane');
+      expect(names).not.toContain('retired-lane');
+      expect(result.errors).toHaveLength(0);
+    });
+
+    it('still discovers other subdirectories (defaults/) at depth 1', async () => {
+      const workflowDir = join(testDir, '.archon', 'workflows');
+      const defaultsDir = join(workflowDir, 'defaults');
+      await mkdir(defaultsDir, { recursive: true });
+      const yaml = `name: grouped-lane\ndescription: grouped in defaults\nnodes:\n  - id: n\n    prompt: p\n`;
+      await writeFile(join(defaultsDir, 'grouped-lane.yaml'), yaml);
+
+      const result = await discoverWorkflows(testDir, { loadDefaults: false });
+      expect(result.workflows.map(ws => ws.workflow.name)).toContain('grouped-lane');
+    });
+  });
 });

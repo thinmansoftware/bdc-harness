@@ -46,6 +46,8 @@ import {
   BUNDLED_VERSION,
 } from '@archon/paths';
 import { discoverWorkflowsWithConfig } from '@archon/workflows/workflow-discovery';
+import { resolveWorkflowName } from '@archon/workflows/router';
+import type { WorkflowDefinition } from '@archon/workflows/schemas/workflow';
 import { executeWorkflow } from '@archon/workflows/executor';
 import { getLoaderErrors, parseWorkflow } from '@archon/workflows/loader';
 import { isValidCommandName } from '@archon/workflows/command-validation';
@@ -1526,6 +1528,70 @@ export function registerApiRoutes(
     return false;
   }
 
+  /**
+   * Pre-dispatch validation for `/workflow run <name>` messages.
+   *
+   * The orchestrator dispatch is asynchronous (fire-behind-a-lock), so by the
+   * time the command handler discovers that a workflow name does not resolve,
+   * the HTTP response has already returned `dispatched: true`. That produced
+   * false "run started" reports for retired lanes (2026-07-07 incident:
+   * fire.ps1 got accepted:true for bdc-feature-development-fusion-cx-qwen,
+   * no run row was ever created). Validate the name synchronously here and
+   * reject BEFORE accepting the dispatch.
+   *
+   * Fails open on discovery errors -- a broken YAML tree is surfaced by the
+   * command handler in-conversation; only a definitive "no such workflow"
+   * (or ambiguous name) is rejected at the API boundary.
+   */
+  const WORKFLOW_RUN_COMMAND = /^\/workflow\s+run\s+(\S+)/;
+
+  async function validateWorkflowRunTarget(
+    message: string,
+    codebaseId?: string | null
+  ): Promise<{ valid: true } | { valid: false; error: string }> {
+    const match = WORKFLOW_RUN_COMMAND.exec(message.trim());
+    if (!match) return { valid: true };
+    const workflowName = match[1];
+
+    // Mirror the command handler's cwd resolution (handleWorkflowCommand):
+    // codebase default_cwd when known, else the workspaces root. A fresh
+    // conversation has no per-conversation cwd yet.
+    let cwd: string | undefined;
+    if (codebaseId) {
+      try {
+        const codebase = await codebaseDb.getCodebase(codebaseId);
+        cwd = codebase?.default_cwd ?? undefined;
+      } catch (error) {
+        getLog().warn({ err: error, codebaseId }, 'dispatch_precheck_codebase_lookup_failed');
+      }
+    }
+    if (!cwd) cwd = getArchonWorkspacesPath();
+
+    let workflows: WorkflowDefinition[];
+    try {
+      const discovery = await discoverWorkflowsWithConfig(cwd, loadConfig);
+      workflows = discovery.workflows.map(ws => ws.workflow);
+    } catch (error) {
+      getLog().warn({ err: error, cwd, workflowName }, 'dispatch_precheck_discovery_failed');
+      return { valid: true };
+    }
+
+    try {
+      const workflow = resolveWorkflowName(workflowName, workflows);
+      if (!workflow) {
+        getLog().warn({ workflowName, cwd }, 'dispatch_precheck_workflow_not_found');
+        return {
+          valid: false,
+          error: `Workflow "${workflowName}" not found. Use GET /api/workflows to list available workflows.`,
+        };
+      }
+    } catch (error) {
+      // resolveWorkflowName throws on ambiguous names -- reject with candidates.
+      return { valid: false, error: (error as Error).message };
+    }
+    return { valid: true };
+  }
+
   async function dispatchToOrchestrator(
     conversationId: string,
     message: string,
@@ -1813,6 +1879,15 @@ export function registerApiRoutes(
         const codebase = await codebaseDb.getCodebase(codebaseId);
         if (!codebase) {
           return apiError(c, 400, 'Codebase not found', `No codebase with id "${codebaseId}"`);
+        }
+      }
+
+      // Reject unknown workflow names BEFORE creating the conversation or
+      // reporting dispatch success -- see validateWorkflowRunTarget.
+      if (message) {
+        const check = await validateWorkflowRunTarget(message, codebaseId);
+        if (!check.valid) {
+          return c.json({ accepted: false, dispatched: false, error: check.error }, 400);
         }
       }
 
@@ -2527,6 +2602,10 @@ export function registerApiRoutes(
       }
 
       const fullMessage = `/workflow run ${workflowName} ${message}`;
+      const check = await validateWorkflowRunTarget(fullMessage, conv?.codebase_id);
+      if (!check.valid) {
+        return c.json({ accepted: false, error: check.error }, 400);
+      }
       const result = await dispatchToOrchestrator(conversationId, fullMessage);
       return c.json(result);
     } catch (error) {

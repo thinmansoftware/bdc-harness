@@ -3,7 +3,11 @@ import { OpenAPIHono } from '@hono/zod-openapi';
 import type { ConversationLockManager } from '@archon/core';
 import type { WebAdapter } from '../adapters/web';
 import { validationErrorHook } from './openapi-defaults';
-import { mockAllWorkflowModules } from '../test/workflow-mock-factories';
+import {
+  mockAllWorkflowModules,
+  mockDiscoverWorkflowsWithConfig,
+} from '../test/workflow-mock-factories';
+import type { WorkflowDefinition } from '@archon/workflows/schemas/workflow';
 
 // The operator-token gate in registerApiRoutes() activates whenever
 // ARCHON_OPERATOR_TOKEN is set. Clear it at module level so these tests run
@@ -409,6 +413,83 @@ describe('POST /api/conversations with message (atomic create+send)', () => {
     expect(body.conversationId).toBe('web-test-abc');
     expect(body.id).toBe('internal-uuid-123');
     expect(body.dispatched).toBeUndefined();
+  });
+
+  // Regression: 2026-07-07 false-dispatch incident. Dispatching a retired /
+  // nonexistent workflow via the atomic create+send path returned
+  // {dispatched:true, accepted:true} and the failure only landed as an
+  // assistant message inside the conversation -- fire.ps1 reported "run
+  // started" twice for a lane that could never run. The dispatch endpoint
+  // must validate the workflow name BEFORE accepting.
+  describe('workflow-run pre-dispatch validation', () => {
+    const makeWorkflow = (name: string): WorkflowDefinition =>
+      ({ name, description: 'test', nodes: [{ id: 'n', prompt: 'p' }] }) as WorkflowDefinition;
+
+    test('rejects /workflow run for a nonexistent workflow with accepted:false (no dispatch)', async () => {
+      // Discovery mock returns [] by default -- no workflow can resolve.
+      const acquireLock = mock(async (_convId: string, fn: () => Promise<void>) => {
+        await fn();
+        return { status: 'started' as const };
+      });
+      const app = new OpenAPIHono({ defaultHook: validationErrorHook });
+      registerApiRoutes(app, mockWebAdapter, {
+        acquireLock,
+      } as unknown as ConversationLockManager);
+
+      const response = await app.request('/api/conversations', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          message: '/workflow run bdc-feature-development-fusion-cx-qwen WO_ID=WO-TEST-01',
+        }),
+      });
+      expect(response.status).toBe(400);
+      const body = (await response.json()) as {
+        accepted: boolean;
+        dispatched: boolean;
+        error: string;
+      };
+      expect(body.accepted).toBe(false);
+      expect(body.dispatched).toBe(false);
+      expect(body.error).toContain('bdc-feature-development-fusion-cx-qwen');
+      // The orchestrator must never have been invoked.
+      expect(acquireLock.mock.calls.length).toBe(0);
+    });
+
+    test('accepts /workflow run when the workflow resolves', async () => {
+      mockDiscoverWorkflowsWithConfig.mockImplementationOnce(async () => ({
+        workflows: [
+          { workflow: makeWorkflow('bdc-feature-development'), source: 'project' as const },
+        ],
+        errors: [],
+      }));
+
+      const app = new OpenAPIHono({ defaultHook: validationErrorHook });
+      registerApiRoutes(app, mockWebAdapter, mockLockManager);
+
+      const response = await app.request('/api/conversations', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          message: '/workflow run bdc-feature-development WO_ID=WO-TEST-01',
+        }),
+      });
+      expect(response.status).toBe(200);
+      const body = (await response.json()) as { dispatched: boolean };
+      expect(body.dispatched).toBe(true);
+    });
+
+    test('non-workflow messages are not affected by validation', async () => {
+      const app = new OpenAPIHono({ defaultHook: validationErrorHook });
+      registerApiRoutes(app, mockWebAdapter, mockLockManager);
+
+      const response = await app.request('/api/conversations', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ message: 'plain chat message' }),
+      });
+      expect(response.status).toBe(200);
+    });
   });
 });
 
