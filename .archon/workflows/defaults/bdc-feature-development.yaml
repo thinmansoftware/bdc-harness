@@ -1913,7 +1913,7 @@ nodes:
         Tests: <N passing / N total> or N/A (<reason>)
         PRs: <PR URL> or N/A (ALREADY_SATISFIED or BLOCKED)
         Merge ancestors: <merge-base SHA>...<HEAD SHA> (behind_by=<N>) or N/A
-        Grep assertions: <command> => <N> lines; or N/A (manifest auto-generated; see Tests)
+        Grep assertions: one line; value is a ';'-separated list of sub-assertions, each EXACTLY "<command> => <count>" with a bare integer count -- NO prose after the count, and NO assertion about pre-change state (never write "=> 0" for a path this diff creates -- it is false by construction once the file exists); or "N/A (<reason>)". Each <command> MUST be a single read-only inspection built only from grep/egrep/fgrep/rg/wc/find/cat/head/tail/sort/uniq/test, optionally piped ('|') to one of those; it MUST NOT contain a literal ';' or any shell chaining/redirection/substitution metacharacter (';' '&' '`' '$(' '>' '<') -- verify-manifest-assertions splits the value on ';' and DROPS (unexecuted) any command not on that read-only allowlist. verify-manifest-assertions executes each surviving sub-assertion and rewrites wrong counts, so emit your best honest count.
         Runtime verification: <evidence> or N/A (<reason>)
         VALIDATION: PASS   <- only when all in-run reviews passed
       NOTE: derive Files created/modified from the git diff -- do NOT list preserved/unchanged
@@ -1928,10 +1928,185 @@ nodes:
       If any in-run review was skipped or ended needs_revision, VALIDATION cannot be PASS.
 
 
+  - id: verify-manifest-assertions
+    persona: major-build
+    load_bearing: true
+    depends_on: [build-manifest]
+    trigger_rule: all_done
+    task_class: clerical
+    # WO-HARNESS-BUILD-MANIFEST-ASSERTION-EXECUTE-01: build-manifest COMPOSES grep
+    # assertions but never runs them, in a prose format the CI validator rejects.
+    # This deterministic node EXECUTES every emitted assertion in the run worktree
+    # and rewrites the manifest so only proven, bare "<command> => <count>" claims
+    # reach patch-pr-body -> the PR body -> bdc-ci validate-pr-manifest.sh.
+    bash: |
+      set -uo pipefail
+
+      capture_node_output() {
+        python3 -c 'import shlex, sys; s=sys.stdin.read(); sys.stdout.write((lambda p: p[0] if len(p)==1 else s)(shlex.split(s)) if len(s)>=2 and s[0]=="'"'"'" and s.rstrip("\n").endswith("'"'"'") else s)'
+      }
+
+      # ---- BEGIN vma core (byte-identical across lanes; extracted by unit test) ----
+      # allow_cmd <command>
+      #   Fail-closed allowlist gate for the assertion command executed via the
+      #   bash -c below. build-manifest COMPOSES these commands, so they are
+      #   AI-authored, UNTRUSTED input executed inside the run worktree (WO
+      #   Section 7 item 2 -- accepted, now guarded). A command is allowed ONLY
+      #   when every pipe ('|') segment starts with a read-only inspection tool
+      #   (grep/egrep/fgrep/rg/wc/find/cat/head/tail/sort/uniq/test). Any shell
+      #   chaining/redirection/substitution metacharacter (';' '&' '`' '$(' '>'
+      #   '<' newline) or a mutating find primary (-delete/-exec/-ok/-fprint*/
+      #   -fls) drops the assertion UNEXECUTED. This is also the fail-closed
+      #   backstop for a command that legitimately contained a ';': it is
+      #   fragmented by the ';'-split below and each fragment fails this gate
+      #   rather than executing.
+      allow_cmd() {
+        local c="$1" seg first
+        case "$c" in
+          *';'*|*'&'*|*'`'*|*'$('*|*'>'*|*'<'*|*$'\n'*) return 1 ;;
+          *' -delete'*|*' -exec'*|*' -ok'*|*' -fprint'*|*' -fls'*) return 1 ;;
+        esac
+        local IFS='|'
+        local -a segs
+        read -ra segs <<<"$c"
+        for seg in "${segs[@]}"; do
+          seg="$(printf '%s' "$seg" | sed 's/^[[:space:]]*//')"
+          first="${seg%%[[:space:]]*}"
+          case "$first" in
+            grep|egrep|fgrep|rg|wc|find|cat|head|tail|sort|uniq|test) ;;
+            *) return 1 ;;
+          esac
+        done
+        return 0
+      }
+      # vma_process_assertions <grep-value> <files-created-csv>
+      #   Splits the Grep-assertions value on ';', executes each "<command> => <count>"
+      #   sub-assertion in the CWD, and applies the Mode Behavior Matrix:
+      #     - executes, count matches   -> kept unchanged
+      #     - executes, count differs   -> count rewritten to ACTUAL (logged)
+      #     - prose after the count     -> stripped to bare "<command> => <count>"
+      #     - command errors / no count -> dropped (logged)
+      #     - "=> 0" of a path this diff CREATES -> dropped (logged; false by construction)
+      #   Bare "N/A (...)" sub-assertions pass through. Emits the corrected value on
+      #   stdout, diagnostics on stderr. If nothing survives, emits a single "N/A (...)".
+      vma_process_assertions() {
+        local val="$1" files_created="$2"
+        local out="" sub cmd rest expected actual raw rawtrim rc f base forbidden trimmed
+        local -a subs created
+        # A pure "N/A (...)" value is the whole-list alternative to a set of
+        # assertions -- pass it through intact (its reason text may contain ';',
+        # so it must NOT be split into sub-assertions).
+        trimmed="$(printf '%s' "$val" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+        if printf '%s' "$trimmed" | grep -qiE '^N/A'; then
+          printf '%s' "$trimmed"
+          return 0
+        fi
+        IFS=';' read -ra subs <<<"$val"
+        for sub in "${subs[@]}"; do
+          sub="$(printf '%s' "$sub" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+          [ -z "$sub" ] && continue
+          if printf '%s' "$sub" | grep -qiE '^N/A'; then
+            out="${out:+$out; }$sub"
+            continue
+          fi
+          if ! printf '%s' "$sub" | grep -Fq '=>'; then
+            echo "verify-manifest-assertions: DROP (no '=>' delimiter): $sub" >&2
+            continue
+          fi
+          cmd="${sub%%=>*}"
+          rest="${sub#*=>}"
+          cmd="$(printf '%s' "$cmd" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+          rest="$(printf '%s' "$rest" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+          expected="$(printf '%s' "$rest" | grep -oE '[0-9]+' | head -1 || true)"
+          if [ -z "$cmd" ] || [ -z "$expected" ]; then
+            echo "verify-manifest-assertions: DROP (unparseable command or count): $sub" >&2
+            continue
+          fi
+          forbidden=0
+          if [ "$expected" = "0" ] && [ -n "$files_created" ] && [ "$files_created" != "none" ]; then
+            IFS=',' read -ra created <<<"$files_created"
+            for f in "${created[@]}"; do
+              f="$(printf '%s' "$f" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//; s/ (deleted)$//')"
+              [ -z "$f" ] && continue
+              base="$(basename "$f")"
+              # Match on WORD/PATH boundaries (-w), not bare substring: a created
+              # file 'index.ts' must NOT forbid an assertion about 'index.tsx'
+              # (its basename is a literal substring of the longer name).
+              if printf '%s' "$cmd" | grep -Fwq "$f" || printf '%s' "$cmd" | grep -Fwq "$base"; then
+                forbidden=1
+                break
+              fi
+            done
+          fi
+          if [ "$forbidden" = "1" ]; then
+            echo "verify-manifest-assertions: DROP (FORBIDDEN pre-create absence; asserts \"=> 0\" of a path this diff creates): $sub" >&2
+            continue
+          fi
+          if ! allow_cmd "$cmd"; then
+            echo "verify-manifest-assertions: DROP (command not on read-only allowlist; not executed): $sub" >&2
+            continue
+          fi
+          raw="$(bash -c "$cmd" 2>/dev/null)"; rc=$?
+          rawtrim="$(printf '%s' "$raw" | tr -d '[:space:]')"
+          if printf '%s' "$rawtrim" | grep -qE '^[0-9]+$'; then
+            # Command printed a single integer (the "| wc -l" / "grep -c" form).
+            actual="$rawtrim"
+          elif [ -z "$rawtrim" ]; then
+            # No output: a clean no-match (grep rc<=1) is a real 0; a harder
+            # failure (bad path/regex, command-not-found -> rc>=2) is an error.
+            if [ "$rc" -le 1 ]; then
+              actual="0"
+            else
+              echo "verify-manifest-assertions: DROP (command errored, rc=$rc): $sub" >&2
+              continue
+            fi
+          else
+            # Multi-line / non-numeric output (grep -rn matches, grep -rln paths):
+            # the count is the number of non-empty output lines.
+            actual="$(printf '%s\n' "$raw" | grep -c . || true)"
+          fi
+          if [ "$actual" != "$expected" ]; then
+            echo "verify-manifest-assertions: CORRECT ($expected -> $actual): $cmd" >&2
+          fi
+          out="${out:+$out; }$cmd => $actual"
+        done
+        if [ -z "$out" ]; then
+          out="N/A (all emitted grep assertions dropped during execution; see verify-manifest-assertions log)"
+        fi
+        printf '%s' "$out"
+      }
+
+      # vma_process <files-created-csv>   (reads full manifest on stdin -> stdout)
+      #   Passes a short manifest with no "Grep assertions:" line through untouched
+      #   (the ALREADY_SATISFIED / BLOCKED branches). Otherwise rewrites only that
+      #   one line with the corrected value; every other line is preserved verbatim.
+      vma_process() {
+        local files_created="$1" manifest grep_val corrected
+        manifest="$(cat)"
+        if ! printf '%s\n' "$manifest" | grep -qE '^Grep assertions:'; then
+          printf '%s\n' "$manifest"
+          return 0
+        fi
+        grep_val="$(printf '%s\n' "$manifest" | grep -E '^Grep assertions:' | head -1 | sed 's/^Grep assertions:[[:space:]]*//')"
+        corrected="$(vma_process_assertions "$grep_val" "$files_created")"
+        printf '%s\n' "$manifest" | REPL="Grep assertions: ${corrected}" awk '
+          !seen && /^Grep assertions:/ { print ENVIRON["REPL"]; seen=1; next }
+          { print }
+        '
+      }
+      # ---- END vma core ----
+
+      MANIFEST_OUT="$(capture_node_output <<'BDC_NODE_OUTPUT_MANIFEST'
+      $build-manifest.output
+      BDC_NODE_OUTPUT_MANIFEST
+      )"
+      FILES_CREATED="$(printf '%s\n' "$MANIFEST_OUT" | grep -E '^Files created:' | head -1 | sed 's/^Files created:[[:space:]]*//' || true)"
+      printf '%s\n' "$MANIFEST_OUT" | vma_process "$FILES_CREATED"
+
   - id: manifest-consistency-check
     persona: major-build
     load_bearing: true
-    depends_on: [build-manifest, open-pr-if-needed, block-reclassify]
+    depends_on: [build-manifest, verify-manifest-assertions, open-pr-if-needed, block-reclassify]
     trigger_rule: all_done
     task_class: clerical
     bash: |
@@ -1957,7 +2132,7 @@ nodes:
       fi
 
       MANIFEST_OUT=$(capture_node_output <<'BDC_NODE_OUTPUT_MANIFEST'
-      $build-manifest.output
+      $verify-manifest-assertions.output
       BDC_NODE_OUTPUT_MANIFEST
       )
       extract() {
@@ -1990,7 +2165,7 @@ nodes:
   # written to the PR body or Notion under trigger_rule: all_done.
   - id: patch-pr-body
     persona: major-build
-    depends_on: [build-manifest, manifest-consistency-check]
+    depends_on: [build-manifest, verify-manifest-assertions, manifest-consistency-check]
     when: "$manifest-consistency-check.output == 'OK'"
     trigger_rule: all_done
     task_class: clerical
@@ -2110,7 +2285,7 @@ nodes:
 
       # -- Extract structured fields from build-manifest AI output.
       MANIFEST_OUT=$(capture_node_output <<'BDC_NODE_OUTPUT_MANIFEST'
-      $build-manifest.output
+      $verify-manifest-assertions.output
       BDC_NODE_OUTPUT_MANIFEST
       )
       extract() {
