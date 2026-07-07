@@ -202,8 +202,8 @@ describe('Test 2: CLIMB-ON-GATE-FAIL', () => {
 
     // Second fire used the next tier's workflowName
     const tiers = loadLadder();
-    const entryTier = tiers.find(t => t.name === 'glm');
-    const nextTier = tiers[tiers.findIndex(t => t.name === 'glm') + 1];
+    const entryTier = tiers[0];
+    const nextTier = tiers[1];
     expect(fireCalls[0]).toBe(entryTier?.workflowName);
     expect(fireCalls[1]).toBe(nextTier?.workflowName);
   });
@@ -264,8 +264,8 @@ describe('Test: PROGRESS-TIMEOUT climbs (does not stop as infra-error)', () => {
 
     // Second fire used the next tier's workflowName (same climb semantics as gate-fail)
     const tiers = loadLadder();
-    const entryTier = tiers.find(t => t.name === 'glm');
-    const nextTier = tiers[tiers.findIndex(t => t.name === 'glm') + 1];
+    const entryTier = tiers[0];
+    const nextTier = tiers[1];
     expect(fireCalls[0]).toBe(entryTier?.workflowName);
     expect(fireCalls[1]).toBe(nextTier?.workflowName);
   });
@@ -420,7 +420,7 @@ describe('Test 3: WIN-CHEAP', () => {
     expect(record.telemetry.wonCheap).toBe(true);
     expect(record.telemetry.climbed).toBe(false);
     expect(record.telemetry.climbCount).toBe(0);
-    expect(record.winningTier).toBe('glm');
+    expect(record.winningTier).toBe('qwen'); // entry/cheapest working tier since 2026-07-07 (glm retired)
     expect(record.attempts.length).toBe(1);
     expect(record.attempts[0]?.outcome).toBe('won');
   });
@@ -599,15 +599,17 @@ describe('config file smoke tests', () => {
     const tiers = loadLadder();
     expect(tiers.length).toBeGreaterThan(0);
     expect(tiers[0]?.name).toBeDefined();
-    // First tier should be glm (cheapest)
-    expect(tiers[0]?.name).toBe('glm');
+    // First tier should be qwen (cheapest working tier; glm retired 2026-07-07 -- zero-lane incident)
+    expect(tiers[0]?.name).toBe('qwen');
     // Last tier should be frontier
     expect(tiers[tiers.length - 1]?.isFrontier).toBe(true);
   });
 
   test('loadRuleset returns ruleset with defaultEntry and rules', () => {
     const ruleset = loadRuleset();
-    expect(ruleset.defaultEntry).toBe('glm');
+    // v1.1 (2026-07-02): GLM demoted from defaultEntry after repetition-collapse
+    // + fabricated-build incidents; bare CODE now enters at codex.
+    expect(ruleset.defaultEntry).toBe('codex');
     expect(Array.isArray(ruleset.rules)).toBe(true);
     expect(ruleset.rules.length).toBeGreaterThan(0);
   });

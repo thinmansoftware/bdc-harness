@@ -1,30 +1,43 @@
 {
-  "_comment": "Smart Cauldron conductor ruleset. Rules are evaluated top-down; first match wins (ANY-of match on tags). defaultEntry fires when no rule matches. woClass/tags are supplied entirely by the CLI caller via --class/--tags (smart-cauldron does not parse WO frontmatter itself) -- a WO 'acquires' a tag only if the caller passes it explicitly on the command line.",
-  "defaultEntry": "glm",
+  "_comment": "Smart Cauldron conductor ruleset v1.2. Rules are evaluated top-down; first match wins (ANY-of match on tags). defaultEntry fires when no rule matches. woClass/tags are supplied entirely by the CLI caller via --class/--tags (smart-cauldron does not parse WO frontmatter itself) -- a WO 'acquires' a tag only if the caller passes it explicitly on the command line. 2026-07-07: mechanical CODE work now routes to qwen (fixed + proven this date: root provider bug resolved, DeepSeek wired as cross-model reviewer) instead of glm (retired -- zero-lane incident, see ladder.config.json).",
+  "defaultEntry": "codex",
   "rules": [
     {
-      "match": { "tags": ["billing", "money", "payment", "stripe"] },
+      "match": {
+        "tags": ["billing", "money", "payment", "stripe"]
+      },
       "entry": "claude"
     },
     {
-      "match": { "tags": ["auth", "oauth", "security"] },
+      "match": {
+        "tags": ["auth", "oauth", "security"]
+      },
       "entry": "claude"
     },
     {
-      "match": { "woClass": "INFRA" },
+      "match": {
+        "woClass": "INFRA"
+      },
       "entry": "claude"
     },
     {
-      "match": { "tags": ["feature", "net-new", "multi-surface"] },
+      "match": {
+        "tags": ["feature", "net-new", "multi-surface"]
+      },
       "entry": "codex"
     },
     {
-      "match": { "woClass": "CODE", "tags": ["mechanical"] },
-      "entry": "glm"
+      "match": {
+        "woClass": "CODE",
+        "tags": ["mechanical"]
+      },
+      "entry": "qwen"
     },
     {
-      "match": { "woClass": "CODE" },
-      "entry": "glm"
+      "match": {
+        "woClass": "CODE"
+      },
+      "entry": "codex"
     }
   ]
 }
