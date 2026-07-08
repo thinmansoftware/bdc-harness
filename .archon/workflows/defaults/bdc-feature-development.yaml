@@ -2490,3 +2490,167 @@ nodes:
       gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --remove-label status:review 2>/dev/null || true
       gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --add-label status:blocked
       echo "blocked-issue: $ISSUE_REPO#$ISSUE_NUM -> status:blocked"
+
+  # WO-HARNESS-WO-COMPLETION-COUNTER-01: record a WO completion CANDIDATE after the
+  # PR is opened + its body patched. Design (a) from the WO: bounded `gh pr checks`
+  # poll, then hand a per-WO pending JSON file off to the bdc-xo reconciler, which is
+  # the SINGLE writer of metrics/wo-completions.jsonl (the green-only gate + dedupe on
+  # wo_id+pr_url live there, in one code path). This node NEVER appends to the ledger
+  # directly. It is deliberately fail-soft and NOT load_bearing: a counter outage (gh
+  # flake, still-running checks, or a missing cross-repo write credential) must never
+  # block a WO's own PR pipeline, so every failure path WARNs and exits 0.
+  # UNVERIFIED runtime assumption: a bdc-harness run's gh token may lack write access
+  # to the *different* repo bdc-xo. If the contents PUT is denied, the node WARNs and
+  # exits 0 -- it must not be reported as confirmed-working without a live probe.
+  - id: record-wo-completion-candidate
+    persona: major-build
+    depends_on: [patch-pr-body]
+    trigger_rule: all_done
+    task_class: clerical
+    bash: |
+      # No `set -e`: this node is fail-soft (see node comment). `gh pr checks` exits
+      # non-zero for pending/failing checks BY DESIGN, and a counter outage must never
+      # abort the WO pipeline. We keep `-u` (node-output refs are captured via the
+      # quoted-heredoc shim, so they cannot be unbound) and pipefail, branch on exit
+      # codes explicitly, and ALWAYS exit 0.
+      set -uo pipefail
+
+      LANE="bdc-feature-development"
+      LEDGER_REPO="bluedevilcollectibles/bdc-xo"
+      PENDING_DIR="metrics/wo-completions-pending"
+
+      capture_node_output() {
+        python3 -c 'import shlex, sys; s=sys.stdin.read(); sys.stdout.write((lambda p: p[0] if len(p)==1 else s)(shlex.split(s)) if len(s)>=2 and s[0]=="'"'"'" and s.rstrip("\n").endswith("'"'"'") else s)'
+      }
+
+      # -- Guard: only record on a real, proceeding build (a PR was actually opened).
+      #    Any other outcome (ALREADY_SATISFIED / BLOCKED / run died before PR) records
+      #    nothing -- matches the WO Mode Matrix "Run dies before PR opens -> nothing".
+      RECLASSIFY=$(capture_node_output <<'BDC_NODE_OUTPUT_BLOCK_RECLASSIFY'
+      $block-reclassify.output
+      BDC_NODE_OUTPUT_BLOCK_RECLASSIFY
+      )
+      STATUS=$(printf '%s\n' "$RECLASSIFY" | sed -n 's/.*"status":"\([A-Z_]*\)".*/\1/p' | head -1)
+      if [ "$STATUS" != "PROCEED" ]; then
+        echo "record-wo-completion-candidate: status=${STATUS:-<none>} -- no PR to count; nothing recorded."
+        exit 0
+      fi
+
+      # -- Resolve WO_ID (read-spec first, USER_MESSAGE fallback).
+      READ_SPEC_OUT=$(capture_node_output <<'BDC_NODE_OUTPUT_READ_SPEC'
+      $read-spec.output
+      BDC_NODE_OUTPUT_READ_SPEC
+      )
+      WO_ID=$(printf '%s\n' "$READ_SPEC_OUT" | sed -n 's/^WO_ID=//p' | head -1)
+      [ -z "$WO_ID" ] && WO_ID=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'WO-[A-Z0-9-]+' | head -1 || true)
+      if [ -z "$WO_ID" ]; then
+        echo "WARN: record-wo-completion-candidate: could not resolve WO_ID -- nothing recorded (exit 0)." >&2
+        exit 0
+      fi
+
+      # -- Resolve REPO the PR was opened against (Rule 29: never assume worktree origin).
+      DECIDE_OUT=$(capture_node_output <<'BDC_NODE_OUTPUT_DECIDE'
+      $decide-push-target.output
+      BDC_NODE_OUTPUT_DECIDE
+      )
+      REPO=$(printf '%s\n' "$DECIDE_OUT" | sed -n 's/^repo: //p' | head -1)
+      if [ -z "$REPO" ] || [ "$REPO" = "unknown" ]; then
+        echo "WARN: record-wo-completion-candidate: REPO unresolved -- nothing recorded (exit 0)." >&2
+        exit 0
+      fi
+
+      # -- Resolve PR URL from open-pr-if-needed (ground truth per manifest-consistency-check).
+      OPEN_PR_OUT=$(capture_node_output <<'BDC_NODE_OUTPUT_OPEN_PR'
+      $open-pr-if-needed.output
+      BDC_NODE_OUTPUT_OPEN_PR
+      )
+      PR_URL=$(printf '%s\n' "$OPEN_PR_OUT" | grep -E '^PR_URL=' | sed 's/^PR_URL=//' | head -1)
+      if [ -z "$PR_URL" ]; then
+        PR_URL=$(printf '%s\n' "$OPEN_PR_OUT" | grep -E '^https://github\.com/' | head -1)
+      fi
+      if [ -z "$PR_URL" ]; then
+        echo "WARN: record-wo-completion-candidate: no PR_URL resolved -- nothing recorded (exit 0)." >&2
+        exit 0
+      fi
+
+      # -- Run id: derive from ARTIFACTS_DIR basename. Do NOT use $WORKFLOW_ID under
+      #    set -u (Archon-YAML rule: it is not reliably bound inside bash blocks).
+      RUN_ID=$(basename "${ARTIFACTS_DIR:-}" 2>/dev/null || true)
+      [ -z "$RUN_ID" ] && RUN_ID="unknown"
+
+      # -- PR number (for the pending filename + payload). Derive from the
+      #    already-resolved PR_URL trailing path segment (gh emits .../pull/<n>,
+      #    ground truth per manifest-consistency-check) so a flaky `gh pr view`
+      #    cannot collapse the pending filename to ${WO_ID}__0.json. Fall back to
+      #    a gh lookup only when the URL has no numeric tail, and to "0" last.
+      PR_NUMBER="${PR_URL##*/}"
+      case "$PR_NUMBER" in
+        ''|*[!0-9]*)
+          PR_NUMBER=$(gh pr view "$PR_URL" --repo "$REPO" --json number --jq '.number' 2>/dev/null || true)
+          ;;
+      esac
+      [ -z "$PR_NUMBER" ] && PR_NUMBER="0"
+
+      # -- Bounded poll of PR checks: up to 10 attempts x 60s (10 min cap), per WO
+      #    section 2(a). `gh pr checks` exit codes: 0=all green, 8=pending, other=fail.
+      #    Break early on green or definitive failure. The bdc-xo reconciler RE-VERIFIES
+      #    and is the authoritative green-only gate, so a misclassification here is only
+      #    a hint -- it can never append a non-green PR to the ledger.
+      CHECK_STATUS="pending_checks"
+      GREEN_AT=""
+      for attempt in 1 2 3 4 5 6 7 8 9 10; do
+        gh pr checks "$PR_URL" --repo "$REPO" >/dev/null 2>&1
+        RC=$?
+        if [ "$RC" -eq 0 ]; then
+          CHECK_STATUS="green_pending_reconcile"
+          GREEN_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          break
+        elif [ "$RC" -eq 8 ]; then
+          : # still pending -- keep polling
+        else
+          CHECK_STATUS="failed"
+          break
+        fi
+        if [ "$attempt" -lt 10 ]; then
+          sleep 60
+        fi
+      done
+      echo "record-wo-completion-candidate: WO=${WO_ID} PR=${PR_URL} check_status=${CHECK_STATUS}"
+
+      # -- Build the pending JSON. Values are controlled (WO_ID is [A-Z0-9-], REPO is
+      #    owner/repo, URL/ints/timestamps are safe) but we still escape strings.
+      #    counted_at is intentionally NOT set here -- the reconciler stamps it when it
+      #    appends the ledger line (single source of the counted_at truth).
+      esc() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
+      OBSERVED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+      if [ -n "$GREEN_AT" ]; then GREEN_FIELD=$(printf '"%s"' "$GREEN_AT"); else GREEN_FIELD="null"; fi
+      JSON=$(printf '{"wo_id":"%s","repo":"%s","pr_url":"%s","pr_number":%s,"lane":"%s","run_id":"%s","status":"%s","pr_merged_or_green_at":%s,"observed_at":"%s"}' \
+        "$(esc "$WO_ID")" "$(esc "$REPO")" "$(esc "$PR_URL")" "$PR_NUMBER" "$(esc "$LANE")" "$(esc "$RUN_ID")" "$CHECK_STATUS" "$GREEN_FIELD" "$OBSERVED_AT")
+
+      # -- Write the pending file to bdc-xo via the contents API. Race-safe across
+      #    concurrent runs: GET the current sha (if the file exists), PUT with
+      #    retry-on-409 (3 attempts). CROSS-REPO write (bdc-harness run -> bdc-xo); if
+      #    the run's gh token lacks write access it fails -- we WARN and exit 0.
+      PENDING_PATH="${PENDING_DIR}/${WO_ID}__${PR_NUMBER}.json"
+      CONTENT_B64=$(printf '%s' "$JSON" | base64 -w0 2>/dev/null || printf '%s' "$JSON" | base64 | tr -d '\n')
+      COMMIT_MSG="chore(wo-counter): ${CHECK_STATUS} candidate ${WO_ID} PR#${PR_NUMBER}"
+      WROTE=false
+      for attempt in 1 2 3; do
+        SHA=$(gh api "repos/${LEDGER_REPO}/contents/${PENDING_PATH}?ref=main" --jq '.sha' 2>/dev/null || true)
+        if [ -n "$SHA" ]; then
+          gh api -X PUT "repos/${LEDGER_REPO}/contents/${PENDING_PATH}" \
+            -f message="$COMMIT_MSG" -f content="$CONTENT_B64" -f branch=main -f sha="$SHA" >/dev/null 2>&1 && WROTE=true && break
+        else
+          gh api -X PUT "repos/${LEDGER_REPO}/contents/${PENDING_PATH}" \
+            -f message="$COMMIT_MSG" -f content="$CONTENT_B64" -f branch=main >/dev/null 2>&1 && WROTE=true && break
+        fi
+        echo "WARN: record-wo-completion-candidate: contents PUT attempt ${attempt} failed (409/perm/flake); retrying..." >&2
+        sleep $((attempt * 3))
+      done
+
+      if [ "$WROTE" = "true" ]; then
+        echo "record-wo-completion-candidate: wrote ${LEDGER_REPO}:${PENDING_PATH} (status=${CHECK_STATUS})."
+      else
+        echo "WARN: record-wo-completion-candidate: could NOT write pending file to ${LEDGER_REPO} (cross-repo write access unverified/denied, or gh flake). WO=${WO_ID} PR=${PR_URL} status=${CHECK_STATUS}. Counter skipped; pipeline NOT failed." >&2
+      fi
+      exit 0
