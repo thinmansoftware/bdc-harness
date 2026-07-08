@@ -1874,6 +1874,7 @@ async function executeNodeInternal(
         : {}),
     };
   } catch (error) {
+    let failureError: unknown = error;
     if (error instanceof ResourceExhaustedPause) {
       const key = resourceExhaustedKey(workflowRun.id, node.id);
       const now = Date.now();
@@ -1941,12 +1942,12 @@ async function executeNodeInternal(
       }
 
       resourceExhaustedRetryState.delete(key);
-      error = new Error(
+      failureError = new Error(
         `resource_exhausted_timeout: provider usage exhaustion persisted beyond ${String(ceilingMs)}ms (${error.info.detail})`
       );
     }
 
-    const err = error as Error;
+    const err = failureError as Error;
 
     // Clean up throttle entries on failure
     lastNodeCancelCheck.delete(`${workflowRun.id}:${node.id}`);
@@ -3136,6 +3137,7 @@ async function executeLoopNode(
         // rate_limit chunks: already log.warn'd in claude.ts; not surfaced to SSE per design
       }
     } catch (error) {
+      let failureError: unknown = error;
       if (error instanceof ResourceExhaustedPause) {
         const key = resourceExhaustedKey(workflowRun.id, node.id, i);
         const now = Date.now();
@@ -3184,12 +3186,12 @@ async function executeLoopNode(
         }
 
         resourceExhaustedRetryState.delete(key);
-        error = new Error(
+        failureError = new Error(
           `resource_exhausted_timeout: provider usage exhaustion persisted beyond ${String(ceilingMs)}ms (${error.info.detail})`
         );
       }
 
-      const err = error as Error;
+      const err = failureError as Error;
       const duration = Date.now() - iterationStart;
       getLog().error({ err, nodeId: node.id, iteration: i }, 'loop_node.iteration_failed');
       getWorkflowEventEmitter().emit({
