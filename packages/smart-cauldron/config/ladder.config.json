@@ -27,7 +27,7 @@
     },
     {
       "name": "frontier",
-      "workflowName": "bdc-feature-development",
+      "workflowName": "bdc-feature-development-fable",
       "isFrontier": true,
       "costPerRunUsdEstimate": null
     }

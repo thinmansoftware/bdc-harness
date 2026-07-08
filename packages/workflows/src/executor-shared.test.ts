@@ -1,4 +1,6 @@
 import { describe, it, expect, mock } from 'bun:test';
+import { readFileSync } from 'fs';
+import { join } from 'path';
 
 // Mock logger before importing module under test
 const mockLogFn = mock(() => {});
@@ -783,5 +785,69 @@ describe('hasPushArtifact', () => {
 
   it('does NOT match a non-PR github URL', () => {
     expect(hasPushArtifact('see https://github.com/foo/bar/issues/12')).toBe(false);
+  });
+});
+
+describe('fable apex lane -- build-critical nodes serve claude-fable-5', () => {
+  const REPO_ROOT = join(import.meta.dir, '..', '..', '..');
+  const FABLE_LANE = join(
+    REPO_ROOT,
+    '.archon/workflows/defaults/bdc-feature-development-fable.yaml'
+  );
+
+  interface FableNode {
+    id: string;
+    provider?: string;
+    model?: string;
+    agent?: string;
+    persona?: string;
+  }
+  interface FableLane {
+    name: string;
+    model?: string;
+    nodes?: FableNode[];
+  }
+
+  const lane = (Bun as unknown as { YAML: { parse(s: string): unknown } }).YAML.parse(
+    readFileSync(FABLE_LANE, 'utf-8')
+  ) as FableLane;
+  const nodes = lane.nodes ?? [];
+  const byId = (id: string): FableNode | undefined => nodes.find(n => n.id === id);
+
+  const effectiveModel = (n: FableNode): string | undefined => n.model ?? lane.model;
+
+  const buildCriticalNodes = [
+    'plan',
+    'plan-review',
+    'implement',
+    'diff-repair',
+    'opus-repair',
+    'war-council-validator',
+  ];
+
+  it('the lane is the fable variant with top-level model claude-fable-5', () => {
+    expect(lane.name).toBe('bdc-feature-development-fable');
+    expect(lane.model).toBe('claude-fable-5');
+  });
+
+  for (const id of buildCriticalNodes) {
+    it(`${id}: carries no persona or agent and resolves to claude-fable-5`, () => {
+      const node = byId(id);
+      expect(node).toBeDefined();
+      expect(node!.agent).toBeUndefined();
+      expect(node!.persona).toBeUndefined();
+      expect(effectiveModel(node!)).toBe('claude-fable-5');
+    });
+  }
+
+  it('war-council-validator stays provider: claude', () => {
+    expect(byId('war-council-validator')?.provider).toBe('claude');
+  });
+
+  it('non-build-critical nodes keep their bindings unchanged', () => {
+    expect(byId('commit-and-push')?.persona).toBe('overseer');
+    const diffReview = byId('diff-review');
+    expect(diffReview?.provider).toBe('codex');
+    expect(diffReview?.model).toBe('gpt-5.5');
   });
 });

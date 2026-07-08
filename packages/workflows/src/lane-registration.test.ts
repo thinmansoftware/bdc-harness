@@ -90,8 +90,10 @@ describe('lane registration and war-council-validator pin', () => {
         return;
       }
 
+      const expectedModel =
+        file === 'bdc-feature-development-fable.yaml' ? 'claude-fable-5' : 'sonnet';
       expect(wcv.provider).toBe('claude');
-      expect(wcv.model).toBe('sonnet');
+      expect(wcv.model).toBe(expectedModel);
     });
   }
 });

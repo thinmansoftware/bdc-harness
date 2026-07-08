@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
-import { resolveFireAuth } from '../cli.js';
+import { resolveFireAuth, statusToExitCode } from '../cli.js';
+import type { CascadeStatus } from '../types.js';
 
 let originalToken: string | undefined;
 
@@ -40,5 +41,31 @@ describe('resolveFireAuth', () => {
 
   test('dry-run bypasses token and project checks', () => {
     expect(resolveFireAuth({ dryRun: true })).toBeNull();
+  });
+});
+
+describe('statusToExitCode', () => {
+  test('won maps to success', () => {
+    expect(statusToExitCode('won')).toBe(0);
+  });
+
+  test('blocked maps to 2', () => {
+    expect(statusToExitCode('blocked')).toBe(2);
+  });
+
+  test('infra-alert maps to 3', () => {
+    expect(statusToExitCode('infra-alert')).toBe(3);
+  });
+
+  test('spec-repair maps to distinct non-zero code 4', () => {
+    expect(statusToExitCode('spec-repair')).toBe(4);
+    expect(statusToExitCode('spec-repair')).not.toBe(statusToExitCode('won'));
+  });
+
+  test('every CascadeStatus maps to an integer exit code', () => {
+    const statuses: CascadeStatus[] = ['won', 'blocked', 'spec-repair', 'infra-alert'];
+    for (const status of statuses) {
+      expect(Number.isInteger(statusToExitCode(status))).toBe(true);
+    }
   });
 });
