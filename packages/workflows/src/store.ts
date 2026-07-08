@@ -38,6 +38,11 @@ export const WORKFLOW_EVENT_TYPES = [
   // node_failed / overseer_decision=escalate (the salvage path). No callers in
   // Phase 3; Phase 5 cascade engine (WO-HARNESS-V1-PERRUN-CASCADE-01) wires it.
   'cascade_step',
+  // Node-level AVAILABILITY failover (WO-HARNESS-NODE-PROVIDER-FAILOVER-01).
+  // Emitted when a prompt/loop node's primary provider fails with an
+  // availability-class error and the node is re-dispatched SIDEWAYS exactly once
+  // on a declared failover provider. Distinct from cascade_step (cost-tier CLIMB).
+  'node_failover',
 ] as const;
 
 export type WorkflowEventType = (typeof WORKFLOW_EVENT_TYPES)[number];

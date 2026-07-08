@@ -230,3 +230,80 @@ describe('loop node provider/model field preservation', () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// failover_provider / failover_model (WO-HARNESS-NODE-PROVIDER-FAILOVER-01)
+// ---------------------------------------------------------------------------
+
+describe('dagNodeSchema failover fields', () => {
+  it('accepts + preserves failover_provider/failover_model on a prompt node', () => {
+    const result = dagNodeSchema.safeParse({
+      id: 'plan',
+      provider: 'opr',
+      model: 'qwen/qwen3-coder',
+      failover_provider: 'codex',
+      failover_model: 'gpt-5.5',
+      prompt: 'Plan the implementation.',
+    });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      const d = result.data as { failover_provider?: string; failover_model?: string };
+      expect(d.failover_provider).toBe('codex');
+      expect(d.failover_model).toBe('gpt-5.5');
+    }
+  });
+
+  it('preserves failover_provider/failover_model on a loop node', () => {
+    const result = dagNodeSchema.safeParse({
+      id: 'plan-review',
+      provider: 'opr',
+      failover_provider: 'codex',
+      failover_model: 'gpt-5.5',
+      loop: { prompt: 'Review the plan.', until: 'APPROVED', max_iterations: 3 },
+    });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      const d = result.data as { failover_provider?: string; failover_model?: string };
+      expect(d.failover_provider).toBe('codex');
+      expect(d.failover_model).toBe('gpt-5.5');
+    }
+  });
+
+  it('failover_provider alone (no failover_model) is valid', () => {
+    const result = dagNodeSchema.safeParse({
+      id: 'plan',
+      failover_provider: 'codex',
+      prompt: 'Plan it.',
+    });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      const d = result.data as { failover_provider?: string; failover_model?: string };
+      expect(d.failover_provider).toBe('codex');
+      expect(d.failover_model).toBeUndefined();
+    }
+  });
+
+  it('a node with no failover fields carries neither (byte-identical to before)', () => {
+    const result = dagNodeSchema.safeParse({ id: 'plan', prompt: 'Plan it.' });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      const d = result.data as { failover_provider?: string; failover_model?: string };
+      expect(d.failover_provider).toBeUndefined();
+      expect(d.failover_model).toBeUndefined();
+    }
+  });
+
+  it('rejects an empty failover_provider string', () => {
+    const result = dagNodeSchema.safeParse({
+      id: 'plan',
+      failover_provider: '',
+      prompt: 'Plan it.',
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it('BASH_NODE_AI_FIELDS includes the failover fields (loader warns on bash nodes)', () => {
+    expect(BASH_NODE_AI_FIELDS).toContain('failover_provider');
+    expect(BASH_NODE_AI_FIELDS).toContain('failover_model');
+  });
+});

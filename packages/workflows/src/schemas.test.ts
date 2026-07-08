@@ -103,6 +103,35 @@ describe('workflowDefinitionSchema', () => {
     expect(result.success).toBe(false);
   });
 
+  test('accepts workflow-level failover_provider/failover_model (WO-HARNESS-NODE-PROVIDER-FAILOVER-01)', () => {
+    const result = workflowDefinitionSchema.safeParse({
+      name: 'failover-workflow',
+      description: 'Workflow with root failover defaults',
+      failover_provider: 'codex',
+      failover_model: 'gpt-5.5',
+      nodes: [{ id: 'n', prompt: 'Do something' }],
+    });
+
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect((result.data as { failover_provider?: string }).failover_provider).toBe('codex');
+      expect((result.data as { failover_model?: string }).failover_model).toBe('gpt-5.5');
+    }
+  });
+
+  test('workflow-level failover fields are optional', () => {
+    const result = workflowDefinitionSchema.safeParse({
+      name: 'no-failover-workflow',
+      description: 'Workflow without failover defaults',
+      nodes: [{ id: 'n', prompt: 'Do something' }],
+    });
+
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect((result.data as { failover_provider?: string }).failover_provider).toBeUndefined();
+    }
+  });
+
   test('accepts target_repo field (Rule 28)', () => {
     const result = workflowDefinitionSchema.safeParse({
       name: 'repo-scoped-workflow',

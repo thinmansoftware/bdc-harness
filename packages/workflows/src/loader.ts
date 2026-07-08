@@ -382,6 +382,44 @@ export function parseWorkflow(content: string, filename: string): ParseResult {
       }
     }
 
+    // WO-HARNESS-NODE-PROVIDER-FAILOVER-01: validate failover_provider identity at
+    // load time (workflow level + per node), mirroring the provider identity check
+    // above. failover_model, like model, is a free string passed to the SDK. The
+    // semantic persona-pin conflict (codex failover + Anthropic-pinned persona)
+    // needs the persona file and is checked in validator.ts (async, cwd-aware);
+    // validateDagStructure is sync + filesystem-free and cannot load personas.
+    const workflowFailoverProvider =
+      typeof raw.failover_provider === 'string' && raw.failover_provider.length > 0
+        ? raw.failover_provider
+        : undefined;
+    if (workflowFailoverProvider && !isRegisteredProvider(workflowFailoverProvider)) {
+      return {
+        workflow: null,
+        error: {
+          filename,
+          error: `Unknown failover_provider '${workflowFailoverProvider}'. Registered: ${getRegisteredProviders()
+            .map(p => p.id)
+            .join(', ')}`,
+          errorType: 'validation_error',
+        },
+      };
+    }
+    for (const node of dagNodes) {
+      const nodeFailoverProvider = (node as { failover_provider?: string }).failover_provider;
+      if (nodeFailoverProvider !== undefined && !isRegisteredProvider(nodeFailoverProvider)) {
+        return {
+          workflow: null,
+          error: {
+            filename,
+            error: `Node '${node.id}': unknown failover_provider '${nodeFailoverProvider}'. Registered: ${getRegisteredProviders()
+              .map(p => p.id)
+              .join(', ')}`,
+            errorType: 'validation_error',
+          },
+        };
+      }
+    }
+
     // Validate modelReasoningEffort -- warn and ignore invalid values (preserve original behavior)
     const modelReasoningEffortResult = modelReasoningEffortSchema.safeParse(
       raw.modelReasoningEffort
@@ -526,6 +564,16 @@ export function parseWorkflow(content: string, filename: string): ParseResult {
         ...(tags !== undefined ? { tags } : {}),
         ...(targetRepo !== undefined ? { target_repo: targetRepo } : {}),
         ...(policyFile !== undefined ? { policyFile } : {}),
+        // WO-HARNESS-NODE-PROVIDER-FAILOVER-01: carry workflow-root failover
+        // defaults through to the executor so nodes can inherit them. Identity of
+        // failover_provider was validated above; failover_model is a free SDK
+        // string like model. (workflowFailoverProvider was resolved earlier.)
+        ...(workflowFailoverProvider !== undefined
+          ? { failover_provider: workflowFailoverProvider }
+          : {}),
+        ...(typeof raw.failover_model === 'string' && raw.failover_model.trim().length > 0
+          ? { failover_model: raw.failover_model.trim() }
+          : {}),
         // 2026-05-16 fix: inputs block was declared in workflow.schemas.ts:104 +
         // wired in dag-executor.ts:1362-1365 + 2576-2578, but the loader silently
         // dropped raw.inputs from the returned workflow object. Result: every
