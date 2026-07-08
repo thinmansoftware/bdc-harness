@@ -316,8 +316,17 @@ nodes:
     # earlier tonight, still ZERO runs -- unproven not disproven) keeps the validator
     # seat. Trial protocol: models-earn-seat -- judged ONLY by real merged PRs verified
     # via gh, never manifest text.
+    # BUILDER TRIAL 2 2026-07-08: Gemini 3.1 Pro FAILED (run 8a494672, drain-mode --
+    # plan-review passed clean after real revision, but implement produced only a
+    # 117-byte diff, diff-review-final correctly caught it needs_revision/HIGH,
+    # opus-repair correctly said needs-human -- honest failure, same starved-diff
+    # signature as qwen. 2 of 2 open builders now failed at IMPLEMENT specifically.
+    # BUILDER TRIAL 3: DeepSeek. CAVEAT (John accepted the risk 2026-07-08): DeepSeek
+    # ALSO holds plan-review + diff-review + diff-review-final on this lane -- this
+    # trial has a self-grading confound (it plans/reviews its own implement output).
+    # A PASS here is weaker evidence than a clean trial; a FAIL is still informative.
     provider: opr-zero
-    model: google/gemini-3.1-pro-preview
+    model: deepseek/deepseek-chat-v3.1
     depends_on: [plan-review]
     task_class: medium_work
     loop:
