@@ -91,6 +91,19 @@ interface LoopIterationFailedEvent {
   error: string;
 }
 
+interface ResourceExhaustedRetryEvent {
+  type: 'resource_exhausted_retry';
+  runId: string;
+  nodeId: string;
+  attempt: number;
+  backoffMs: number;
+  elapsedMs: number;
+  ceilingMs: number;
+  reason: string;
+  detail: string;
+  iteration?: number;
+}
+
 interface WorkflowArtifactEvent {
   type: 'workflow_artifact';
   runId: string;
@@ -230,6 +243,7 @@ export type WorkflowEmitterEvent =
   | LoopIterationStartedEvent
   | LoopIterationCompletedEvent
   | LoopIterationFailedEvent
+  | ResourceExhaustedRetryEvent
   | NodeStartedEvent
   | NodeCompletedEvent
   | NodeCompletedWithWarningEvent

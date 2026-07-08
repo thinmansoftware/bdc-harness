@@ -71,6 +71,10 @@ function normalizeBundledText(raw: string): string {
     .join('');
 }
 
+function compareAscii(a: string, b: string): number {
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
 async function ensureDir(dir: string, label: string): Promise<void> {
   try {
     await access(dir);
@@ -91,7 +95,7 @@ async function collectFiles(dir: string, extensions: readonly string[]): Promise
       return ext ? { entry, ext } : undefined;
     })
     .filter((m): m is { entry: string; ext: string } => m !== undefined)
-    .sort((a, b) => a.entry.localeCompare(b.entry));
+    .sort((a, b) => compareAscii(a.entry, b.entry));
 
   const files: BundledFile[] = [];
   const seen = new Set<string>();
@@ -134,7 +138,7 @@ async function collectFiles(dir: string, extensions: readonly string[]): Promise
  */
 async function collectPoliciesWithPath(dir: string, keyPrefix: string): Promise<BundledFile[]> {
   const entries = await readdir(dir);
-  const matched = entries.filter(entry => entry.endsWith('.md')).sort((a, b) => a.localeCompare(b));
+  const matched = entries.filter(entry => entry.endsWith('.md')).sort(compareAscii);
 
   const files: BundledFile[] = [];
   const seen = new Set<string>();

@@ -77,7 +77,7 @@ mock.module('@archon/workflows/executor', () => ({
 // Import module under test (after all mocks are installed)
 // ---------------------------------------------------------------------------
 
-const { resolveWebLane } = await import('./workflow-bridge');
+const { mapWorkflowEvent, resolveWebLane } = await import('./workflow-bridge');
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -160,5 +160,38 @@ describe('resolveWebLane', () => {
     });
 
     expect(result).toBeUndefined();
+  });
+});
+
+describe('mapWorkflowEvent', () => {
+  it('maps resource exhausted retries to running workflow step events', () => {
+    const payload = mapWorkflowEvent({
+      type: 'resource_exhausted_retry',
+      runId: 'run-1',
+      nodeId: 'builder',
+      attempt: 2,
+      backoffMs: 5000,
+      elapsedMs: 10000,
+      ceilingMs: 60000,
+      reason: 'usage_exhausted',
+      detail: 'retry after pause',
+      iteration: 3,
+    });
+
+    expect(payload).not.toBeNull();
+    const event = JSON.parse(payload as string) as Record<string, unknown>;
+    expect(event.type).toBe('workflow_step');
+    expect(event.runId).toBe('run-1');
+    expect(event.nodeId).toBe('builder');
+    expect(event.step).toBe(2);
+    expect(event.status).toBe('running');
+    expect(event.resourceExhaustedRetry).toEqual({
+      attempt: 2,
+      backoffMs: 5000,
+      elapsedMs: 10000,
+      ceilingMs: 60000,
+      reason: 'usage_exhausted',
+      detail: 'retry after pause',
+    });
   });
 });

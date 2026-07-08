@@ -442,6 +442,178 @@ function isSdkSuccessContradiction(errorMessage: string): boolean {
   return /failed: SDK returned success\b/.test(errorMessage);
 }
 
+type ResourceExhaustedReason = 'zero_work_signature' | 'quota_or_rate_limit_message';
+
+interface ResourceExhaustedInfo {
+  reason: ResourceExhaustedReason;
+  detail: string;
+}
+
+interface ResourceExhaustedRetryState {
+  firstDetectedAt: number;
+  attempt: number;
+}
+
+class ResourceExhaustedPause extends Error {
+  readonly info: ResourceExhaustedInfo;
+
+  constructor(info: ResourceExhaustedInfo) {
+    super(`resource_exhausted: ${info.detail}`);
+    this.name = 'ResourceExhaustedPause';
+    this.info = info;
+  }
+}
+
+const RESOURCE_EXHAUSTED_DEFAULT_BACKOFF_MS = [60_000, 300_000, 900_000, 1_800_000];
+const RESOURCE_EXHAUSTED_DEFAULT_CEILING_MS = 6 * 60 * 60 * 1000;
+const resourceExhaustedRetryState = new Map<string, ResourceExhaustedRetryState>();
+
+function parsePositiveIntegerList(value: string | undefined): number[] | undefined {
+  if (!value) return undefined;
+  const parsed = value
+    .split(',')
+    .map(part => Number.parseInt(part.trim(), 10))
+    .filter(n => Number.isFinite(n) && n > 0);
+  return parsed.length > 0 ? parsed : undefined;
+}
+
+function getResourceExhaustedBackoffMs(attempt: number): number {
+  const configured =
+    parsePositiveIntegerList(process.env.ARCHON_RESOURCE_EXHAUSTED_BACKOFF_MS) ??
+    RESOURCE_EXHAUSTED_DEFAULT_BACKOFF_MS;
+  const index = Math.min(Math.max(attempt - 1, 0), configured.length - 1);
+  return configured[index];
+}
+
+function getResourceExhaustedCeilingMs(): number {
+  const configured = Number.parseInt(process.env.ARCHON_RESOURCE_EXHAUSTED_MAX_WAIT_MS ?? '', 10);
+  return Number.isFinite(configured) && configured > 0
+    ? configured
+    : RESOURCE_EXHAUSTED_DEFAULT_CEILING_MS;
+}
+
+function getTokenTotal(tokens: TokenUsage | undefined): number | undefined {
+  if (!tokens) return undefined;
+  if (tokens.total !== undefined) return tokens.total;
+  return tokens.input + tokens.output;
+}
+
+function hasPositiveUsage(tokens: TokenUsage | undefined, cost: number | undefined): boolean {
+  const tokenTotal = getTokenTotal(tokens);
+  return (tokenTotal !== undefined && tokenTotal > 0) || (cost !== undefined && cost > 0);
+}
+
+function isZeroWorkSdkResult(msg: {
+  isError?: boolean;
+  tokens?: TokenUsage;
+  cost?: number;
+}): boolean {
+  if (msg.isError !== true || msg.tokens === undefined || msg.cost !== 0) return false;
+  const total = getTokenTotal(msg.tokens);
+  return total === 0 && msg.tokens.input === 0 && msg.tokens.output === 0;
+}
+
+function stringifySdkFields(msg: {
+  errorSubtype?: string;
+  errors?: string[];
+  stopReason?: string;
+}): string {
+  return [msg.errorSubtype, msg.stopReason, ...(msg.errors ?? [])].filter(Boolean).join(' ');
+}
+
+function classifyResourceExhaustionText(text: string): ResourceExhaustedInfo | undefined {
+  const normalized = text.toLowerCase();
+  if (
+    /you're out of extra usage|out of extra usage|out of credits|credit exhaustion|credit balance|insufficient credit|quota|rate limit|too many requests|\b429\b|overloaded/.test(
+      normalized
+    )
+  ) {
+    return {
+      reason: 'quota_or_rate_limit_message',
+      detail: text.length > 500 ? `${text.slice(0, 500)}...` : text,
+    };
+  }
+  return undefined;
+}
+
+function classifyResourceExhaustedSdkResult(msg: {
+  isError?: boolean;
+  errorSubtype?: string;
+  errors?: string[];
+  stopReason?: string;
+  tokens?: TokenUsage;
+  cost?: number;
+}): ResourceExhaustedInfo | undefined {
+  if (isZeroWorkSdkResult(msg)) {
+    return {
+      reason: 'zero_work_signature',
+      detail: `SDK error result reported zero tokens, zero cost, subtype ${msg.errorSubtype ?? 'unknown'}`,
+    };
+  }
+
+  // Keep real validator failures untouched: once the SDK reports nonzero usage,
+  // this lane is work performed and must remain an ordinary node failure.
+  if (hasPositiveUsage(msg.tokens, msg.cost)) return undefined;
+
+  return classifyResourceExhaustionText(stringifySdkFields(msg));
+}
+
+function resourceExhaustedKey(workflowRunId: string, nodeId: string, iteration?: number): string {
+  return `${workflowRunId}:${nodeId}:${iteration ?? 'node'}`;
+}
+
+async function emitResourceExhaustedRetry(
+  deps: WorkflowDeps,
+  workflowRunId: string,
+  nodeId: string,
+  info: ResourceExhaustedInfo,
+  state: ResourceExhaustedRetryState,
+  backoffMs: number,
+  ceilingMs: number,
+  iteration?: number
+): Promise<void> {
+  const elapsedMs = Date.now() - state.firstDetectedAt;
+  const eventData = {
+    nodeId,
+    attempt: state.attempt,
+    backoffMs,
+    elapsedMs,
+    ceilingMs,
+    reason: info.reason,
+    detail: info.detail,
+    ...(iteration !== undefined ? { iteration } : {}),
+  };
+  getWorkflowEventEmitter().emit({
+    type: 'resource_exhausted_retry',
+    runId: workflowRunId,
+    nodeId,
+    attempt: state.attempt,
+    backoffMs,
+    elapsedMs,
+    ceilingMs,
+    reason: info.reason,
+    detail: info.detail,
+    ...(iteration !== undefined ? { iteration } : {}),
+  });
+  await deps.store
+    .createWorkflowEvent({
+      workflow_run_id: workflowRunId,
+      event_type: 'resource_exhausted_retry',
+      step_name: nodeId,
+      data: eventData,
+    })
+    .catch((err: Error) => {
+      getLog().error(
+        { err, workflowRunId, nodeId, eventType: 'resource_exhausted_retry' },
+        'resource_exhausted_retry_event_persist_failed'
+      );
+    });
+}
+
+async function sleepResourceExhaustedBackoff(ms: number): Promise<void> {
+  await new Promise(resolve => setTimeout(resolve, ms));
+}
+
 /**
  * Max characters of the serialized SDK message we persist in a contradiction
  * dump. Mirrors the `SUBPROCESS_ERROR_MAX_CHARS` diagnostic-cap precedent in
@@ -1298,6 +1470,30 @@ async function executeNodeInternal(
         // the stream silently, producing empty/partial output without signaling
         // failure -- which let failed iterations masquerade as successes (#1208).
         if (msg.isError) {
+          const resourceExhausted = classifyResourceExhaustedSdkResult(msg);
+          if (resourceExhausted) {
+            getLog().warn(
+              {
+                nodeId: node.id,
+                errorSubtype: msg.errorSubtype,
+                errors: msg.errors,
+                reason: resourceExhausted.reason,
+                detail: resourceExhausted.detail,
+                durationMs: Date.now() - nodeStartTime,
+              },
+              'dag.node_resource_exhausted'
+            );
+            if (msg.errorSubtype === 'success') {
+              await emitSdkContradictionDump(
+                deps,
+                workflowRun.id,
+                node.id,
+                msg,
+                personaContextState
+              );
+            }
+            throw new ResourceExhaustedPause(resourceExhausted);
+          }
           const subtype = msg.errorSubtype ?? 'unknown';
           const errorsDetail = msg.errors?.length ? ` -- ${msg.errors.join('; ')}` : '';
           getLog().error(
@@ -1516,6 +1712,10 @@ async function executeNodeInternal(
     const creditError = detectCreditExhaustion(nodeOutputText);
 
     if (creditError) {
+      const resourceExhausted = classifyResourceExhaustionText(creditError);
+      if (resourceExhausted) {
+        throw new ResourceExhaustedPause(resourceExhausted);
+      }
       const duration = Date.now() - nodeStartTime;
       getLog().warn({ nodeId: node.id, durationMs: duration }, 'dag.node_credit_exhausted');
 
@@ -1656,6 +1856,7 @@ async function executeNodeInternal(
     // Clean up throttle entries on completion
     lastNodeCancelCheck.delete(`${workflowRun.id}:${node.id}`);
     lastNodeActivityUpdate.delete(`${workflowRun.id}:${node.id}`);
+    resourceExhaustedRetryState.delete(resourceExhaustedKey(workflowRun.id, node.id));
 
     return {
       state: 'completed',
@@ -1673,7 +1874,80 @@ async function executeNodeInternal(
         : {}),
     };
   } catch (error) {
-    const err = error as Error;
+    let failureError: unknown = error;
+    if (error instanceof ResourceExhaustedPause) {
+      const key = resourceExhaustedKey(workflowRun.id, node.id);
+      const now = Date.now();
+      const state = resourceExhaustedRetryState.get(key) ?? {
+        firstDetectedAt: now,
+        attempt: 0,
+      };
+      state.attempt += 1;
+      resourceExhaustedRetryState.set(key, state);
+      const ceilingMs = getResourceExhaustedCeilingMs();
+      const backoffMs = getResourceExhaustedBackoffMs(state.attempt);
+      const elapsedMs = now - state.firstDetectedAt;
+
+      lastNodeCancelCheck.delete(`${workflowRun.id}:${node.id}`);
+      lastNodeActivityUpdate.delete(`${workflowRun.id}:${node.id}`);
+
+      if (elapsedMs + backoffMs <= ceilingMs) {
+        getLog().warn(
+          {
+            nodeId: node.id,
+            attempt: state.attempt,
+            backoffMs,
+            elapsedMs,
+            ceilingMs,
+            reason: error.info.reason,
+          },
+          'dag.node_resource_exhausted_retry'
+        );
+        await emitResourceExhaustedRetry(
+          deps,
+          workflowRun.id,
+          node.id,
+          error.info,
+          state,
+          backoffMs,
+          ceilingMs
+        );
+        await safeSendMessage(
+          platform,
+          conversationId,
+          `! Node \`${node.id}\` hit provider usage exhaustion (${error.info.reason}); holding for ${String(Math.round(backoffMs / 1000))}s before retry ${String(state.attempt)}.`,
+          nodeContext
+        );
+        await sleepResourceExhaustedBackoff(backoffMs);
+        return executeNodeInternal(
+          deps,
+          platform,
+          conversationId,
+          cwd,
+          workflowRun,
+          node,
+          provider,
+          nodeOptions,
+          declaredModelId,
+          artifactsDir,
+          logDir,
+          baseBranch,
+          docsDir,
+          nodeOutputs,
+          resumeSessionId,
+          configuredCommandFolder,
+          issueContext,
+          personaContextState
+        );
+      }
+
+      resourceExhaustedRetryState.delete(key);
+      failureError = new Error(
+        `resource_exhausted_timeout: provider usage exhaustion persisted beyond ${String(ceilingMs)}ms (${error.info.detail})`
+      );
+    }
+
+    const err = failureError as Error;
 
     // Clean up throttle entries on failure
     lastNodeCancelCheck.delete(`${workflowRun.id}:${node.id}`);
@@ -1685,6 +1959,11 @@ async function executeNodeInternal(
     const catchGateResultKey = `${workflowRun.id}:${node.id}`;
     const catchNodeGateResult = pendingGateResults.get(catchGateResultKey);
     pendingGateResults.delete(catchGateResultKey);
+    const failureGateResult =
+      catchNodeGateResult ??
+      (err.message.startsWith('resource_exhausted_timeout')
+        ? ({ passed: false, nodeType: 'ai' } satisfies GateResult)
+        : undefined);
 
     // If the abort was triggered by user cancel (not idle timeout), classify as cancel.
     // Must call handleNodeFailure here (not early-return) so the node_failed event is
@@ -1722,11 +2001,14 @@ async function executeNodeInternal(
         // node_completed contract.
         data: {
           error: err.message,
+          ...(err.message.startsWith('resource_exhausted_timeout')
+            ? { reason: 'resource_exhausted_timeout' }
+            : {}),
           ...(nodeModelUsage ? { model_usage: nodeModelUsage } : {}),
           ...(nodeTokens ? { tokens: nodeTokens } : {}),
           // Layer 1 gate_result field: present when Phase 5 registered a gate
           // outcome before the SDK threw (e.g. gate check fired then SDK errored).
-          ...buildGateResultField(catchNodeGateResult),
+          ...buildGateResultField(failureGateResult),
         },
       })
       .catch((err: Error) => {
@@ -1742,7 +2024,7 @@ async function executeNodeInternal(
       nodeId: node.id,
       nodeName: node.command ?? node.id,
       error: err.message,
-      ...buildGateResultField(catchNodeGateResult),
+      ...buildGateResultField(failureGateResult),
     });
 
     return {
@@ -2751,6 +3033,20 @@ async function executeLoopNode(
           // which made `error_during_execution` on resumed interactive loops look
           // like a "5-second crash" that kept burning iterations (#1208).
           if (msg.isError) {
+            const resourceExhausted = classifyResourceExhaustedSdkResult(msg);
+            if (resourceExhausted) {
+              getLog().warn(
+                {
+                  nodeId: node.id,
+                  iteration: i,
+                  errorSubtype: msg.errorSubtype,
+                  errors: msg.errors,
+                  reason: resourceExhausted.reason,
+                },
+                'loop_node.iteration_resource_exhausted'
+              );
+              throw new ResourceExhaustedPause(resourceExhausted);
+            }
             const subtype = msg.errorSubtype ?? 'unknown';
             const errorsDetail = msg.errors?.length ? ` -- ${msg.errors.join('; ')}` : '';
             getLog().error(
@@ -2841,7 +3137,61 @@ async function executeLoopNode(
         // rate_limit chunks: already log.warn'd in claude.ts; not surfaced to SSE per design
       }
     } catch (error) {
-      const err = error as Error;
+      let failureError: unknown = error;
+      if (error instanceof ResourceExhaustedPause) {
+        const key = resourceExhaustedKey(workflowRun.id, node.id, i);
+        const now = Date.now();
+        const state = resourceExhaustedRetryState.get(key) ?? {
+          firstDetectedAt: now,
+          attempt: 0,
+        };
+        state.attempt += 1;
+        resourceExhaustedRetryState.set(key, state);
+        const ceilingMs = getResourceExhaustedCeilingMs();
+        const backoffMs = getResourceExhaustedBackoffMs(state.attempt);
+        const elapsedMs = now - state.firstDetectedAt;
+
+        if (elapsedMs + backoffMs <= ceilingMs) {
+          getLog().warn(
+            {
+              nodeId: node.id,
+              iteration: i,
+              attempt: state.attempt,
+              backoffMs,
+              elapsedMs,
+              ceilingMs,
+              reason: error.info.reason,
+            },
+            'loop_node.iteration_resource_exhausted_retry'
+          );
+          await emitResourceExhaustedRetry(
+            deps,
+            workflowRun.id,
+            node.id,
+            error.info,
+            state,
+            backoffMs,
+            ceilingMs,
+            i
+          );
+          await safeSendMessage(
+            platform,
+            conversationId,
+            `! Loop node \`${node.id}\` iteration ${String(i)} hit provider usage exhaustion (${error.info.reason}); holding for ${String(Math.round(backoffMs / 1000))}s before retry ${String(state.attempt)}.`,
+            msgContext
+          );
+          await sleepResourceExhaustedBackoff(backoffMs);
+          i -= 1;
+          continue;
+        }
+
+        resourceExhaustedRetryState.delete(key);
+        failureError = new Error(
+          `resource_exhausted_timeout: provider usage exhaustion persisted beyond ${String(ceilingMs)}ms (${error.info.detail})`
+        );
+      }
+
+      const err = failureError as Error;
       const duration = Date.now() - iterationStart;
       getLog().error({ err, nodeId: node.id, iteration: i }, 'loop_node.iteration_failed');
       getWorkflowEventEmitter().emit({
@@ -2946,6 +3296,7 @@ async function executeLoopNode(
       await safeSendMessage(platform, conversationId, cleanOutput, msgContext);
     }
 
+    resourceExhaustedRetryState.delete(resourceExhaustedKey(workflowRun.id, node.id, i));
     lastIterationOutput = cleanOutput || fullOutput;
 
     // Check LLM completion signal -- the AI decides whether the user approved.
@@ -4002,6 +4353,9 @@ export async function executeDagWorkflow(
                 ? classifyError(new Error(output.error)) === 'FATAL'
                 : false;
               const isTransient = output.error ? isTransientNodeError(output.error) : false;
+              const isResourceExhaustedTimeout = output.error
+                ? output.error.startsWith('resource_exhausted_timeout')
+                : false;
               // SDK success-contradictions are NEVER retried by this transient
               // budget -- the outer `sdkContradictionRetry` loop grants them
               // exactly one whole-node re-run. Without this exclusion,
@@ -4013,6 +4367,7 @@ export async function executeDagWorkflow(
                 : false;
               const shouldRetry =
                 !isFatal &&
+                !isResourceExhaustedTimeout &&
                 !isContradiction &&
                 (retryConfig.onError === 'all' ||
                   (retryConfig.onError === 'transient' && isTransient));

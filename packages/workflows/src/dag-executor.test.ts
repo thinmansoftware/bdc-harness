@@ -5612,8 +5612,12 @@ describe('executeDagWorkflow -- cancel node', () => {
 
 describe('executeDagWorkflow -- credit exhaustion', () => {
   let testDir: string;
+  let previousBackoffMs: string | undefined;
+  let previousMaxWaitMs: string | undefined;
 
   beforeEach(async () => {
+    previousBackoffMs = process.env.ARCHON_RESOURCE_EXHAUSTED_BACKOFF_MS;
+    previousMaxWaitMs = process.env.ARCHON_RESOURCE_EXHAUSTED_MAX_WAIT_MS;
     testDir = join(
       tmpdir(),
       `dag-credit-test-${Date.now()}-${Math.random().toString(36).slice(2)}`
@@ -5626,6 +5630,16 @@ describe('executeDagWorkflow -- credit exhaustion', () => {
   });
 
   afterEach(async () => {
+    if (previousBackoffMs === undefined) {
+      delete process.env.ARCHON_RESOURCE_EXHAUSTED_BACKOFF_MS;
+    } else {
+      process.env.ARCHON_RESOURCE_EXHAUSTED_BACKOFF_MS = previousBackoffMs;
+    }
+    if (previousMaxWaitMs === undefined) {
+      delete process.env.ARCHON_RESOURCE_EXHAUSTED_MAX_WAIT_MS;
+    } else {
+      process.env.ARCHON_RESOURCE_EXHAUSTED_MAX_WAIT_MS = previousMaxWaitMs;
+    }
     mockGetAgentProviderDag.mockImplementation(() => ({
       sendQuery: mockSendQueryDag,
       getType: () => 'claude',
@@ -5642,7 +5656,68 @@ describe('executeDagWorkflow -- credit exhaustion', () => {
     }
   });
 
-  it('marks node as failed when assistant output contains credit exhaustion text', async () => {
+  it('retries zero-work SDK usage exhaustion twice, then completes without node_failed', async () => {
+    process.env.ARCHON_RESOURCE_EXHAUSTED_BACKOFF_MS = '1';
+    process.env.ARCHON_RESOURCE_EXHAUSTED_MAX_WAIT_MS = '1000';
+    let calls = 0;
+    const usageExhaustedQuery = mock(function* () {
+      calls += 1;
+      if (calls <= 2) {
+        yield {
+          type: 'result',
+          isError: true,
+          errorSubtype: 'success',
+          tokens: { input: 0, output: 0, total: 0 },
+          cost: 0,
+        };
+        return;
+      }
+      yield { type: 'assistant', content: 'Recovered after reset.' };
+      yield { type: 'result', sessionId: 'dag-session-recovered' };
+    });
+    mockGetAgentProviderDag.mockReturnValue({
+      sendQuery: usageExhaustedQuery,
+      getType: () => 'claude',
+      getCapabilities: mockClaudeCapabilities,
+    });
+
+    const store = createMockStore();
+    const deps = createMockDeps(store);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('zero-work-exhaustion-run');
+
+    await executeDagWorkflow(
+      deps,
+      platform,
+      'conv-zero-work',
+      testDir,
+      {
+        name: 'zero-work-exhaustion-test',
+        nodes: [{ id: 'investigate', prompt: 'Investigate the issue' }],
+      },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    expect(usageExhaustedQuery.mock.calls.length).toBe(3);
+    const events = (store.createWorkflowEvent as Mock<() => Promise<void>>).mock.calls.map(
+      (c: unknown[]) => c[0] as { event_type: string; data?: Record<string, unknown> }
+    );
+    expect(events.filter(e => e.event_type === 'resource_exhausted_retry').length).toBe(2);
+    expect(events.some(e => e.event_type === 'node_failed')).toBe(false);
+    expect(store.completeWorkflowRun).toHaveBeenCalled();
+    expect(store.failWorkflowRun).not.toHaveBeenCalled();
+  });
+
+  it('fails with resource_exhausted_timeout when the retry ceiling expires', async () => {
+    process.env.ARCHON_RESOURCE_EXHAUSTED_BACKOFF_MS = '2';
+    process.env.ARCHON_RESOURCE_EXHAUSTED_MAX_WAIT_MS = '1';
     const creditExhaustedQuery = mock(function* () {
       yield { type: 'assistant', content: "You're out of extra usage - resets in 2h" };
       yield { type: 'result', sessionId: 'dag-session-credit' };
@@ -5677,15 +5752,137 @@ describe('executeDagWorkflow -- credit exhaustion', () => {
       minimalConfig
     );
 
-    // node_failed (not node_completed) must have been stored
     const events = (store.createWorkflowEvent as Mock<() => Promise<void>>).mock.calls.map(
-      (c: unknown[]) => (c[0] as { event_type: string }).event_type
+      (c: unknown[]) => c[0] as { event_type: string; data?: Record<string, unknown> }
     );
-    expect(events).toContain('node_failed');
-    expect(events).not.toContain('node_completed');
+    const nodeFailed = events.find(e => e.event_type === 'node_failed');
+    expect(nodeFailed?.data?.reason).toBe('resource_exhausted_timeout');
+    expect(nodeFailed?.data?.error).toContain('resource_exhausted_timeout');
+    expect(events.some(e => e.event_type === 'node_completed')).toBe(false);
 
-    // Overall workflow should be marked failed
     expect(store.failWorkflowRun).toHaveBeenCalled();
+  });
+
+  it('keeps real validator SDK errors with nonzero usage on the normal failure path', async () => {
+    process.env.ARCHON_RESOURCE_EXHAUSTED_BACKOFF_MS = '1';
+    process.env.ARCHON_RESOURCE_EXHAUSTED_MAX_WAIT_MS = '1000';
+    const validatorFailureQuery = mock(function* () {
+      yield {
+        type: 'result',
+        isError: true,
+        errorSubtype: 'success',
+        errors: ['validator rejected manifest'],
+        tokens: { input: 10, output: 2, total: 12 },
+        cost: 0.01,
+      };
+    });
+    mockGetAgentProviderDag.mockReturnValue({
+      sendQuery: validatorFailureQuery,
+      getType: () => 'claude',
+      getCapabilities: mockClaudeCapabilities,
+    });
+
+    const store = createMockStore();
+    const deps = createMockDeps(store);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('validator-failure-run');
+
+    await executeDagWorkflow(
+      deps,
+      platform,
+      'conv-validator',
+      testDir,
+      {
+        name: 'validator-failure-test',
+        nodes: [{ id: 'validate', prompt: 'Validate the manifest' }],
+      },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    const events = (store.createWorkflowEvent as Mock<() => Promise<void>>).mock.calls.map(
+      (c: unknown[]) => c[0] as { event_type: string; data?: Record<string, unknown> }
+    );
+    expect(events.some(e => e.event_type === 'resource_exhausted_retry')).toBe(false);
+    const nodeFailed = events.find(e => e.event_type === 'node_failed');
+    expect(nodeFailed?.data?.error).toContain('SDK returned success');
+    expect(store.failWorkflowRun).toHaveBeenCalled();
+  });
+
+  it('does not consume a loop iteration when usage exhaustion retries and then succeeds', async () => {
+    process.env.ARCHON_RESOURCE_EXHAUSTED_BACKOFF_MS = '1';
+    process.env.ARCHON_RESOURCE_EXHAUSTED_MAX_WAIT_MS = '1000';
+    let calls = 0;
+    const loopUsageQuery = mock(function* () {
+      calls += 1;
+      if (calls === 1) {
+        yield {
+          type: 'result',
+          isError: true,
+          errorSubtype: 'success',
+          tokens: { input: 0, output: 0, total: 0 },
+          cost: 0,
+        };
+        return;
+      }
+      yield { type: 'assistant', content: 'Done. <promise>COMPLETE</promise>' };
+      yield { type: 'result', sessionId: 'loop-session-recovered' };
+    });
+    mockGetAgentProviderDag.mockReturnValue({
+      sendQuery: loopUsageQuery,
+      getType: () => 'claude',
+      getCapabilities: mockClaudeCapabilities,
+    });
+
+    const store = createMockStore();
+    const deps = createMockDeps(store);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('loop-exhaustion-run');
+
+    await executeDagWorkflow(
+      deps,
+      platform,
+      'conv-loop-exhaustion',
+      testDir,
+      {
+        name: 'loop-exhaustion-test',
+        nodes: [
+          {
+            id: 'loop-work',
+            loop: {
+              prompt: 'Do a task. When done, output <promise>COMPLETE</promise>.',
+              until: 'COMPLETE',
+              max_iterations: 2,
+            },
+          },
+        ],
+      },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    expect(loopUsageQuery.mock.calls.length).toBe(2);
+    const events = (store.createWorkflowEvent as Mock<() => Promise<void>>).mock.calls.map(
+      (c: unknown[]) => c[0] as { event_type: string; data?: Record<string, unknown> }
+    );
+    expect(events.filter(e => e.event_type === 'resource_exhausted_retry').length).toBe(1);
+    expect(events.some(e => e.event_type === 'loop_iteration_failed')).toBe(false);
+    const completedIterations = events.filter(e => e.event_type === 'loop_iteration_completed');
+    expect(completedIterations.length).toBe(1);
+    expect(completedIterations[0].data?.iteration).toBe(1);
+    expect(store.completeWorkflowRun).toHaveBeenCalled();
   });
 });
 describe('executeDagWorkflow -- approval node', () => {
@@ -9821,6 +10018,10 @@ describe('gate_result field in node_failed events', () => {
   });
 
   it('AI node failure (credit exhaustion) carries gate_result in persisted and emitted node_failed event', async () => {
+    const previousBackoffMs = process.env.ARCHON_RESOURCE_EXHAUSTED_BACKOFF_MS;
+    const previousMaxWaitMs = process.env.ARCHON_RESOURCE_EXHAUSTED_MAX_WAIT_MS;
+    process.env.ARCHON_RESOURCE_EXHAUSTED_BACKOFF_MS = '2';
+    process.env.ARCHON_RESOURCE_EXHAUSTED_MAX_WAIT_MS = '1';
     const creditExhaustedQuery = mock(function* () {
       yield { type: 'assistant', content: 'credit balance is too low' };
       yield { type: 'result', sessionId: 'dag-session-credit' };
@@ -9865,6 +10066,16 @@ describe('gate_result field in node_failed events', () => {
         minimalConfig
       );
     } finally {
+      if (previousBackoffMs === undefined) {
+        delete process.env.ARCHON_RESOURCE_EXHAUSTED_BACKOFF_MS;
+      } else {
+        process.env.ARCHON_RESOURCE_EXHAUSTED_BACKOFF_MS = previousBackoffMs;
+      }
+      if (previousMaxWaitMs === undefined) {
+        delete process.env.ARCHON_RESOURCE_EXHAUSTED_MAX_WAIT_MS;
+      } else {
+        process.env.ARCHON_RESOURCE_EXHAUSTED_MAX_WAIT_MS = previousMaxWaitMs;
+      }
       unsub();
     }
 
@@ -10842,12 +11053,12 @@ describe('executeDagWorkflow -- WO-HARNESS-PR-STATUS-TRUTH-AND-AUTOMERGE-01', ()
     mockSendQueryDag.mockImplementation(function* () {
       calls += 1;
       // isError + subtype 'success' (contradiction) but errors[] also carries a
-      // FATAL signal ('credit balance'). FATAL must win: no whole-node re-run.
+      // non-quota FATAL signal. FATAL must win: no whole-node re-run.
       yield {
         type: 'result',
         isError: true,
         errorSubtype: 'success',
-        errors: ['credit balance too low to continue'],
+        errors: ['permission denied while writing workspace'],
       };
     });
 

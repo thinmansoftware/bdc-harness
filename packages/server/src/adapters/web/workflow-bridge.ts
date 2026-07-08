@@ -76,6 +76,27 @@ export function mapWorkflowEvent(event: WorkflowEmitterEvent): string | null {
         timestamp: Date.now(),
       });
 
+    case 'resource_exhausted_retry':
+      return JSON.stringify({
+        type: 'workflow_step',
+        runId: event.runId,
+        nodeId: event.nodeId,
+        step: event.iteration === undefined ? 0 : event.iteration - 1,
+        total: 0,
+        name: event.iteration === undefined ? event.nodeId : `iteration-${String(event.iteration)}`,
+        status: 'running',
+        iteration: event.iteration,
+        resourceExhaustedRetry: {
+          attempt: event.attempt,
+          backoffMs: event.backoffMs,
+          elapsedMs: event.elapsedMs,
+          ceilingMs: event.ceilingMs,
+          reason: event.reason,
+          detail: event.detail,
+        },
+        timestamp: Date.now(),
+      });
+
     case 'workflow_artifact':
       return JSON.stringify({
         type: 'workflow_artifact',
