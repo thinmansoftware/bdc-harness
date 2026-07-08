@@ -438,6 +438,189 @@ describe('checkTriggerRule', () => {
   });
 });
 
+describe('executeDagWorkflow -- plan-review terminal safety', () => {
+  let testDir: string;
+
+  beforeEach(async () => {
+    testDir = join(
+      tmpdir(),
+      `dag-plan-review-test-${Date.now()}-${Math.random().toString(36).slice(2)}`
+    );
+    await mkdir(testDir, { recursive: true });
+
+    mockSendQueryDag.mockClear();
+    mockGetAgentProviderDag.mockClear();
+  });
+
+  afterEach(async () => {
+    mockGetAgentProviderDag.mockImplementation(() => ({
+      sendQuery: mockSendQueryDag,
+      getType: () => 'claude',
+      getCapabilities: mockClaudeCapabilities,
+    }));
+    try {
+      await rm(testDir, { recursive: true, force: true });
+    } catch {
+      // ignore cleanup errors
+    }
+  });
+
+  it('does not let all_done downstream nodes run after plan-review exhausts without approval', async () => {
+    mockSendQueryDag.mockImplementation(function* () {
+      yield {
+        type: 'assistant',
+        content: 'PLAN_REVIEW_PASS=false\nPLAN_REVIEW_RISK=HIGH\nPLAN_REVIEW_NEEDS_REVISION\n',
+      };
+      yield { type: 'result', sessionId: 'plan-review-session' };
+    });
+
+    const store = createMockStore();
+    const mockDeps = createMockDeps(store);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('plan-review-rejected-run');
+    const artifactsDir = join(testDir, 'artifacts');
+    const logDir = join(testDir, 'logs');
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-dag',
+      testDir,
+      {
+        name: 'plan-review-rejected',
+        nodes: [
+          {
+            id: 'plan-review',
+            loop: {
+              prompt: 'review the plan',
+              until: 'PLAN_REVIEW_APPROVED',
+              max_iterations: 1,
+            },
+          },
+          { id: 'implement', prompt: 'implement', depends_on: ['plan-review'] },
+          {
+            id: 'diff-review-final',
+            depends_on: ['implement'],
+            trigger_rule: 'all_done',
+            bash: 'echo DIFF_REVIEW_FINAL=satisfied',
+          },
+          {
+            id: 'build-manifest',
+            depends_on: ['diff-review-final'],
+            trigger_rule: 'all_done',
+            bash: 'echo VALIDATION: PASS',
+          },
+        ],
+      },
+      workflowRun,
+      'claude',
+      undefined,
+      artifactsDir,
+      logDir,
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    expect(mockSendQueryDag).toHaveBeenCalledTimes(1);
+    const events = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls.map(
+      call => call[0] as { event_type: string; step_name?: string; data?: Record<string, unknown> }
+    );
+    expect(
+      events.some(
+        event =>
+          event.event_type === 'node_skipped' &&
+          event.step_name === 'diff-review-final' &&
+          event.data?.reason === 'upstream_plan_review_not_approved'
+      )
+    ).toBe(true);
+    expect(
+      events.some(
+        event =>
+          event.event_type === 'node_skipped' &&
+          event.step_name === 'build-manifest' &&
+          event.data?.reason === 'upstream_plan_review_not_approved'
+      )
+    ).toBe(true);
+  });
+
+  it('short-circuits plan-review on ESCALATION_REQUIRED and writes a WO-keyed packet', async () => {
+    mockSendQueryDag.mockImplementation(function* () {
+      yield {
+        type: 'assistant',
+        content: [
+          'PLAN_REVIEW_PASS=false',
+          'PLAN_REVIEW_RISK=HIGH',
+          'PLAN_REVIEW_NEEDS_REVISION',
+          '=== PLAN_REVIEW_FINDINGS_BEGIN ===',
+          'ESCALATION_REQUIRED=true',
+          'ESCALATION_REASON=ambiguous-spec',
+          'WO_ID=WO-HARNESS-DOWNSTREAM-NODES-MUST-RESPECT-PLAN-REJECTION-01',
+          'NODE=plan-review',
+          'ATTEMPTS=1/3',
+          'WHAT_FAILED=The spec is missing a source path.',
+          'WHAT_WAS_TRIED=- inspected the spec',
+          'LAST_REVIEW_FINDINGS=- missing source path',
+          'SINGLE_DECISION_NEEDED=Which source path contains the prior logic?',
+          'SAFE_STATE=nothing committed/pushed; plan stage only',
+          '=== PLAN_REVIEW_FINDINGS_END ===',
+        ].join('\n'),
+      };
+      yield { type: 'result', sessionId: 'plan-review-session' };
+    });
+
+    const store = createMockStore();
+    const mockDeps = createMockDeps(store);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('plan-review-escalated-run', {
+      user_message: 'Run WO-HARNESS-DOWNSTREAM-NODES-MUST-RESPECT-PLAN-REJECTION-01',
+    });
+    const artifactsDir = join(testDir, 'artifacts');
+    const logDir = join(testDir, 'logs');
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-dag',
+      testDir,
+      {
+        name: 'plan-review-escalated',
+        nodes: [
+          {
+            id: 'plan-review',
+            loop: {
+              prompt: 'review the plan',
+              until: 'PLAN_REVIEW_APPROVED',
+              max_iterations: 3,
+            },
+          },
+          { id: 'implement', prompt: 'implement', depends_on: ['plan-review'] },
+        ],
+      },
+      workflowRun,
+      'claude',
+      undefined,
+      artifactsDir,
+      logDir,
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    expect(mockSendQueryDag).toHaveBeenCalledTimes(1);
+    const packetPath = join(
+      artifactsDir,
+      'escalations',
+      'WO-HARNESS-DOWNSTREAM-NODES-MUST-RESPECT-PLAN-REJECTION-01-plan-review-escalation.json'
+    );
+    const packet = JSON.parse(await readFile(packetPath, 'utf8')) as Record<string, unknown>;
+    expect(packet.woId).toBe('WO-HARNESS-DOWNSTREAM-NODES-MUST-RESPECT-PLAN-REJECTION-01');
+    expect(packet.iteration).toBe(1);
+    expect(packet.maxIterations).toBe(3);
+    expect(packet.singleDecisionNeeded).toBe('Which source path contains the prior logic?');
+  });
+});
+
 describe('DAG Loader -- cycle detection', () => {
   let testDir: string;
 

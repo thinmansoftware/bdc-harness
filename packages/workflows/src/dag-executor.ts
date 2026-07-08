@@ -120,6 +120,95 @@ export function clearAgentRegistryCache(): void {
 const MCP_FAILURE_PREFIX = 'MCP server connection failed: ';
 const CODEX_FAILBACK_PREFIX = '[CODEX FAILBACK]';
 const WARNING_PREFIX = '[WARNING]';
+const PLAN_REVIEW_NODE_ID = 'plan-review';
+const PLAN_REVIEW_APPROVED_SIGNAL = 'PLAN_REVIEW_APPROVED';
+
+function containsPlanReviewApproval(output: string): boolean {
+  return detectCompletionSignal(output, PLAN_REVIEW_APPROVED_SIGNAL);
+}
+
+function containsPlanReviewEscalation(output: string): boolean {
+  return /^[ \t]*ESCALATION_REQUIRED[ \t]*=[ \t]*true[ \t]*$/im.test(output);
+}
+
+function extractPlanReviewField(output: string, key: string): string | undefined {
+  const escapedKey = key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const match = new RegExp(`^[ \\t]*${escapedKey}[ \\t]*=[ \\t]*(.*)$`, 'im').exec(output);
+  return match?.[1]?.trim();
+}
+
+function sanitizeArtifactKey(value: string): string {
+  const cleaned = value.replace(/[^A-Za-z0-9._-]/g, '_').replace(/^_+|_+$/g, '');
+  return cleaned || 'unknown';
+}
+
+async function writePlanReviewEscalationPacket(
+  artifactsDir: string,
+  workflowRun: WorkflowRun,
+  nodeId: string,
+  iteration: number,
+  maxIterations: number,
+  output: string
+): Promise<string> {
+  const userMessageWoMatch = /\bWO-[A-Z0-9-]+\b/.exec(workflowRun.user_message);
+  const woId = extractPlanReviewField(output, 'WO_ID') ?? userMessageWoMatch?.[0] ?? 'UNKNOWN_WO';
+  const packet = {
+    type: 'plan_review_escalation',
+    workflowRunId: workflowRun.id,
+    workflowName: workflowRun.workflow_name,
+    nodeId,
+    woId,
+    iteration,
+    maxIterations,
+    escalationRequired: true,
+    escalationReason: extractPlanReviewField(output, 'ESCALATION_REASON') ?? null,
+    whatFailed: extractPlanReviewField(output, 'WHAT_FAILED') ?? null,
+    whatWasTried: extractPlanReviewField(output, 'WHAT_WAS_TRIED') ?? null,
+    lastReviewFindings: extractPlanReviewField(output, 'LAST_REVIEW_FINDINGS') ?? null,
+    singleDecisionNeeded: extractPlanReviewField(output, 'SINGLE_DECISION_NEEDED') ?? null,
+    safeState: extractPlanReviewField(output, 'SAFE_STATE') ?? null,
+    rawOutput: output,
+    createdAt: new Date().toISOString(),
+  };
+  const packetDir = join(artifactsDir, 'escalations');
+  const packetPath = join(
+    packetDir,
+    `${sanitizeArtifactKey(woId)}-${sanitizeArtifactKey(nodeId)}-escalation.json`
+  );
+  await mkdir(packetDir, { recursive: true });
+  await writeFile(packetPath, `${JSON.stringify(packet, null, 2)}\n`, 'utf8');
+  return packetPath;
+}
+
+function hasUnapprovedFailedPlanReviewAncestor(
+  node: DagNode,
+  allNodes: readonly DagNode[],
+  nodeOutputs: Map<string, NodeOutput>
+): boolean {
+  const byId = new Map(allNodes.map(n => [n.id, n]));
+  const visited = new Set<string>();
+  const stack = [...(node.depends_on ?? [])];
+
+  while (stack.length > 0) {
+    const ancestorId = stack.pop();
+    if (!ancestorId || visited.has(ancestorId)) continue;
+    visited.add(ancestorId);
+
+    const output = nodeOutputs.get(ancestorId);
+    if (
+      ancestorId === PLAN_REVIEW_NODE_ID &&
+      output?.state === 'failed' &&
+      !containsPlanReviewApproval(output.output)
+    ) {
+      return true;
+    }
+
+    const ancestor = byId.get(ancestorId);
+    if (ancestor) stack.push(...(ancestor.depends_on ?? []));
+  }
+
+  return false;
+}
 
 /** A failed MCP server entry parsed from the SDK message. `segment` is the
  *  original substring (e.g. `"telegram (disconnected)"`) so callers can
@@ -2903,7 +2992,10 @@ async function executeLoopNode(
     }
 
     const duration = Date.now() - iterationStart;
-    const completionDetected = stickySignalDetected || bashComplete;
+    const planReviewEscalationDetected =
+      node.id === PLAN_REVIEW_NODE_ID && containsPlanReviewEscalation(lastIterationOutput);
+    const completionDetected =
+      !planReviewEscalationDetected && (stickySignalDetected || bashComplete);
 
     // Emit iteration completed
     getWorkflowEventEmitter().emit({
@@ -2928,6 +3020,56 @@ async function executeLoopNode(
     await logNodeComplete(logDir, workflowRun.id, `${node.id}-iteration-${String(i)}`, node.id, {
       durationMs: duration,
     });
+
+    if (planReviewEscalationDetected) {
+      const packetPath = await writePlanReviewEscalationPacket(
+        artifactsDir,
+        workflowRun,
+        node.id,
+        i,
+        loop.max_iterations,
+        lastIterationOutput
+      ).catch((err: Error) => {
+        getLog().error(
+          { err, workflowRunId: workflowRun.id, nodeId: node.id, iteration: i },
+          'loop_node.plan_review_escalation_packet_failed'
+        );
+        return undefined;
+      });
+      if (packetPath) {
+        await deps.store
+          .createWorkflowEvent({
+            workflow_run_id: workflowRun.id,
+            event_type: 'workflow_artifact',
+            step_name: node.id,
+            data: {
+              artifact_type: 'file_created',
+              path: packetPath,
+              nodeId: node.id,
+              reason: 'plan_review_escalation',
+            },
+          })
+          .catch((err: Error) => {
+            getLog().error(
+              { err, workflowRunId: workflowRun.id, eventType: 'workflow_artifact' },
+              'workflow_event_persist_failed'
+            );
+          });
+      }
+      const decision =
+        extractPlanReviewField(lastIterationOutput, 'SINGLE_DECISION_NEEDED') ??
+        'plan-review requested human escalation';
+      const errorMsg = `Loop node '${node.id}' escalated at iteration ${String(i)}: ${decision}`;
+      await safeSendMessage(platform, conversationId, errorMsg, msgContext);
+      await persistLoopNodeFailed(errorMsg);
+      return {
+        state: 'failed',
+        output: lastIterationOutput,
+        error: errorMsg,
+        costUsd: loopTotalCostUsd,
+        ...(loopTotalTokens ? { tokens: loopTotalTokens } : {}),
+      };
+    }
 
     // Completion signal detected -- exit the loop.
     // For interactive loops: only honor the signal when the AI had user input to evaluate
@@ -3488,6 +3630,42 @@ export async function executeDagWorkflow(
             return {
               nodeId: node.id,
               output: nodeOutputs.get(node.id) ?? { state: 'skipped' as const, output: '' },
+            };
+          }
+
+          if (hasUnapprovedFailedPlanReviewAncestor(node, workflow.nodes, nodeOutputs)) {
+            const reason = 'upstream_plan_review_not_approved';
+            getLog().warn({ nodeId: node.id, reason }, 'dag_node_skipped_plan_review_block');
+            await logNodeSkip(logDir, workflowRun.id, node.id, reason).catch((err: Error) => {
+              getLog().warn({ err, nodeId: node.id }, 'dag.node_skip_log_write_failed');
+            });
+            deps.store
+              .createWorkflowEvent({
+                workflow_run_id: workflowRun.id,
+                event_type: 'node_skipped',
+                step_name: node.id,
+                data: { reason, blockedBy: PLAN_REVIEW_NODE_ID },
+              })
+              .catch((err: Error) => {
+                getLog().error(
+                  { err, workflowRunId: workflowRun.id, eventType: 'node_skipped' },
+                  'workflow_event_persist_failed'
+                );
+              });
+            const emitter = getWorkflowEventEmitter();
+            emitter.emit({
+              type: 'node_skipped',
+              runId: workflowRun.id,
+              nodeId: node.id,
+              nodeName: node.command ?? node.id,
+              reason,
+            });
+            return {
+              nodeId: node.id,
+              output: {
+                state: 'skipped' as const,
+                output: `SKIPPED: ${reason}; blockedBy=${PLAN_REVIEW_NODE_ID}`,
+              },
             };
           }
 
