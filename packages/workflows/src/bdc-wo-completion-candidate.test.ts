@@ -234,7 +234,10 @@ describe('record-wo-completion-candidate: JSON shape', () => {
 
   it('escapes embedded quotes/backslashes so a hostile-looking WO_ID stays valid JSON', () => {
     if (skipOnWindows()) return;
-    const hostileShape = JSON_SHAPE.replace('WO-HARNESS-WO-COMPLETION-COUNTER-01', 'WO-"evil"\\x');
+    const hostileShape = JSON_SHAPE.replace(
+      'WO-HARNESS-WO-COMPLETION-COUNTER-01',
+      'WO-\\"evil\\"\\\\x'
+    );
     const r = runBash(hostileShape, { ...baseEnv, GREEN_AT: '' });
     expect(r.code).toBe(0);
     const parsed = JSON.parse(r.stdout); // throws if escaping is wrong -> test fails
