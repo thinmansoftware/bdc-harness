@@ -928,6 +928,10 @@ nodes:
 
       ## Inputs
       Spec: $read-spec.output
+      Plan review terminal outcome: $plan-review.output
+      If this output does not contain PLAN_REVIEW_APPROVED, fail closed with
+      DIFF_REVIEW_FINAL=needs_revision. Do not certify a diff after rejected or
+      escalated plan-review output.
       Your original findings: $diff-review.output
       Classifier verdict: $classify-diff-review.output
       Repair pass output: $diff-repair.output
@@ -1856,6 +1860,8 @@ nodes:
 
       Plan review verdict (self-repair loop -- record PLAN_REVIEW_PASS + RISK as evidence):
       $plan-review.output
+      VALIDATION: PASS requires this output to contain PLAN_REVIEW_APPROVED. If plan-review
+      rejected, escalated, or exhausted without that token, emit VALIDATION: BLOCKED.
 
       Diff review (Codex, initial):
       $diff-review.output

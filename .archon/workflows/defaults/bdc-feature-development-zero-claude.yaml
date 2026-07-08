@@ -769,8 +769,8 @@ nodes:
       echo "DIFF_BYTES=$(wc -c < "$OUT" 2>/dev/null || echo 0)"
 
   - id: diff-review
-    provider: opr-zero
-    model: deepseek/deepseek-chat-v3.1
+    provider: codex-opr
+    model: gpt-5.5
     agent: codex-adversarial-reviewer
     depends_on: [capture-diff]
     task_class: medium_work
@@ -952,8 +952,8 @@ nodes:
       echo "DIFF_FINAL_BYTES=$(wc -c < "$OUT" 2>/dev/null || echo 0)"
 
   - id: diff-review-final
-    provider: opr-zero
-    model: deepseek/deepseek-chat-v3.1
+    provider: codex-opr
+    model: gpt-5.5
     agent: codex-adversarial-reviewer
     depends_on: [capture-diff-final]
     trigger_rule: all_done
@@ -965,6 +965,10 @@ nodes:
 
       ## Inputs
       Spec: $read-spec.output
+      Plan review terminal outcome: $plan-review.output
+      If this output does not contain PLAN_REVIEW_APPROVED, fail closed with
+      DIFF_REVIEW_FINAL=needs_revision. Do not certify a diff after rejected or
+      escalated plan-review output.
       Your original findings: $diff-review.output
       Classifier verdict: $classify-diff-review.output
       Repair pass output: $diff-repair.output
@@ -1102,8 +1106,8 @@ nodes:
   # repaired build can land as a normal feature-branch PR instead of dead-ending at a
   # terminal-BLOCKED on a non-interactive run.
   - id: opus-rereview
-    provider: opr-zero
-    model: deepseek/deepseek-chat-v3.1
+    provider: codex-opr
+    model: gpt-5.5
     agent: codex-adversarial-reviewer
     depends_on: [classify-opus-repair]
     trigger_rule: all_done
@@ -1362,8 +1366,8 @@ nodes:
   # apply-diff-review-final: re-review the fix(es) apply-suggested-fix wrote, BEFORE any commit.
   # Distinct id (diff-review-final already ran upstream). Only meaningful on the APPROVE-WITH-FIX path.
   - id: apply-diff-review-final
-    provider: opr-zero
-    model: deepseek/deepseek-chat-v3.1
+    provider: codex-opr
+    model: gpt-5.5
     agent: codex-adversarial-reviewer
     depends_on: [apply-suggested-fix]
     trigger_rule: all_done
@@ -1885,6 +1889,8 @@ nodes:
 
       Plan review verdict (self-repair loop -- record PLAN_REVIEW_PASS + RISK as evidence):
       $plan-review.output
+      VALIDATION: PASS requires this output to contain PLAN_REVIEW_APPROVED. If plan-review
+      rejected, escalated, or exhausted without that token, emit VALIDATION: BLOCKED.
 
       Diff review (Codex, initial):
       $diff-review.output
