@@ -311,7 +311,13 @@ nodes:
     # -- stale leftover from before the roster update, never caught because
     # bdc-feature-development-zero.yaml (no "-claude" suffix) was not the file
     # tonight's fixes targeted.
-    provider: codex-opr
+    # BUILDER TRIAL 2026-07-08 (John: "we havent tried gemini yet"): implement seat
+    # -> Gemini 3.1 Pro via OpenRouter for its first BDC at-bats. codex-opr (swapped in
+    # earlier tonight, still ZERO runs -- unproven not disproven) keeps the validator
+    # seat. Trial protocol: models-earn-seat -- judged ONLY by real merged PRs verified
+    # via gh, never manifest text.
+    provider: opr-zero
+    model: google/gemini-3.1-pro-preview
     depends_on: [plan-review]
     task_class: medium_work
     loop:
