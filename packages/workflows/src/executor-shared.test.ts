@@ -26,6 +26,7 @@ import {
   buildPromptWithContext,
   detectCreditExhaustion,
   detectCompletionSignal,
+  detectPlanReviewApproval,
   stripCompletionTags,
   isInlineScript,
   formatSubprocessFailure,
@@ -470,6 +471,32 @@ describe('detectCompletionSignal', () => {
 
   it('detects signal when tag names match case-insensitively', () => {
     expect(detectCompletionSignal('<Complete>ALL_CLEAN</complete>', 'ALL_CLEAN')).toBe(true);
+  });
+});
+
+describe('detectPlanReviewApproval', () => {
+  it('accepts bare PLAN_REVIEW_APPROVED on its own line', () => {
+    expect(detectPlanReviewApproval('Looks good.\nPLAN_REVIEW_APPROVED\n')).toBe(true);
+  });
+
+  it('accepts PLAN_REVIEW_PASS=true (open-model form)', () => {
+    expect(
+      detectPlanReviewApproval('PLAN_REVIEW_PASS=true\nPLAN_REVIEW_RISK=LOW\n=== APPROVED_PLAN_BEGIN ===')
+    ).toBe(true);
+  });
+
+  it('accepts PLAN_REVIEW_APPROVED=true', () => {
+    expect(detectPlanReviewApproval('notes\nPLAN_REVIEW_APPROVED=true\n')).toBe(true);
+  });
+
+  it('rejects embedded prose false positive', () => {
+    expect(
+      detectPlanReviewApproval('Do not emit PLAN_REVIEW_APPROVED until the plan is solid.')
+    ).toBe(false);
+  });
+
+  it('rejects PLAN_REVIEW_PASS=false', () => {
+    expect(detectPlanReviewApproval('PLAN_REVIEW_PASS=false\n')).toBe(false);
   });
 });
 

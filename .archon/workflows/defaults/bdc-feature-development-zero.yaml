@@ -9,7 +9,7 @@ description: |
     plan-review (attack seat)    = DeepSeek deepseek-chat-v3.1
     implement + repairs (builder)= Qwen qwen/qwen3-coder (proven 2026-07-07)
     diff reviews (attack seats)  = DeepSeek deepseek-chat-v3.1
-    war-council-validator (judge)= CODEX (OpenAI billing)
+    war-council-validator (judge)= DeepSeek via OpenRouter (dual-cap; no Codex required)
   No model ever grades its own output; NO node consumes Claude usage. All
   persona-bearing prompt nodes use model-free -opr/-codex persona variants
   (persona model wins over node model; an Anthropic alias on a non-Claude
@@ -21,7 +21,7 @@ policyFile: harness/policies/agent-behavior.md
 # zero lane: glm provider = the generic OpenRouter client; build model is qwen.
 # provider: glm is REQUIRED here (no top-level provider would cause un-pinned nodes
 # to fall through to config-default claude with an OpenRouter model ID -- API rejection).
-# war-council-validator is pinned to codex on the node (zero-Claude law).
+# war-council-validator: DeepSeek on glm/OpenRouter (dual-cap 2026-07-09).
 provider: glm
 model: qwen/qwen3-coder
 
@@ -713,11 +713,10 @@ nodes:
       exit 0
 
   - id: war-council-validator
-    # ZERO-CLAUDE lane: judge seat on Codex (OpenAI billing), not Claude.
-    # Deliberate relaxation of the always-Claude-judge doctrine for THIS lane
-    # only (John 2026-07-03). Codex is the strongest non-Claude judge seat.
-    provider: codex
+    # Dual-cap (2026-07-09): DeepSeek judge via glm/OpenRouter -- no Claude, no Codex.
+    provider: glm
     persona: captain-ci-validator-codex
+    model: deepseek/deepseek-chat-v3.1
     depends_on: [ascii-gate]
     task_class: medium_work
     prompt: |

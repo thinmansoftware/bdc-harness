@@ -564,6 +564,24 @@ export function detectCompletionSignal(output: string, signal: string): boolean 
 }
 
 /**
+ * Plan-review approval detection (F3, 2026-07-09).
+ * Canonical: bare PLAN_REVIEW_APPROVED via detectCompletionSignal rules.
+ * Also accepts key=value forms open models emit on dual-cap lanes.
+ */
+export function detectPlanReviewApproval(output: string): boolean {
+  if (detectCompletionSignal(output, 'PLAN_REVIEW_APPROVED')) {
+    return true;
+  }
+  if (/^[ \t]*PLAN_REVIEW_PASS[ \t]*=[ \t]*true[ \t]*$/im.test(output)) {
+    return true;
+  }
+  if (/^[ \t]*PLAN_REVIEW_APPROVED[ \t]*=[ \t]*true[ \t]*$/im.test(output)) {
+    return true;
+  }
+  return false;
+}
+
+/**
  * Strip internal completion signal tags before sending to user-facing output.
  * Always strips `<promise>...</promise>` (any content). When `until` is provided,
  * also strips any XML-wrapped form of that signal with matching tag names
