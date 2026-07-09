@@ -1,6 +1,6 @@
 # Smart Cauldron Reliability Kernel Design
 
-Status: APPROVED BY GENERAL (CHATGPT) FOR IMPLEMENTATION PLANNING
+Status: PENDING CUSTOM GPT GENERAL REVIEW
 
 Date: 2026-07-09
 
@@ -10,34 +10,36 @@ Authoring branch: `codex/smart-cauldron-reliability-design`
 
 Design base: `origin/dev` at `b881cb6808e2db87688a5ca705b32e657fb231c8`
 
-General review: approved 2026-07-09 by ChatGPT in the General architecture-review
-role, after verifying the design against John's four binding conditions and the
-current `origin/dev` prior-art inventory.
+Review state: Codex completed a preliminary architecture self-review on 2026-07-09,
+but this is not the required ruling from John's custom ChatGPT named General. The
+packet must be sent to that GPT and its response recorded before implementation
+planning or runtime code begins.
 
-Decision: approve Approach B, an incremental reliability kernel around the current
-engine. This approval authorizes the file-by-file implementation plan and subsequent
-local test-driven implementation in the isolated worktree. It does not authorize a
-push, PR, merge, rebuild, restart, workflow fire, deployment, branch-protection
-change, or production mutation.
+Decision requested: approve Approach B, an incremental reliability kernel around
+the current engine. Approval authorizes the file-by-file implementation plan and
+subsequent local test-driven implementation in the isolated worktree. It does not
+authorize a push, PR, merge, rebuild, restart, workflow fire, deployment,
+branch-protection change, or production mutation.
 
-## 0. General architecture ruling
+## 0. Preliminary architecture self-review for General
 
-Verdict: APPROVED WITH THE EXISTING BINDING CONDITIONS.
+Codex's preliminary verdict is APPROVE WITH THE EXISTING BINDING CONDITIONS. General
+must independently approve or amend it.
 
-General finds the architecture proportionate to the incident evidence. It preserves
-the proven DAG executor and single-stage loop, extends merged provider failover,
+The architecture appears proportionate to the incident evidence. It preserves the
+proven DAG executor and single-stage loop, extends merged provider failover,
 timeouts, ESCALATED status, truth guards, pause/resume, and worktree isolation, and
 adds durable control-plane facts instead of rebuilding the engine.
 
-The four required conditions are satisfied:
+The four required conditions appear satisfied:
 
 1. Phase 0 is first and contains the three independent immediate fixes.
 2. Section 7 maps every kernel component to current prior art or a governing WO.
-3. This recorded ruling is the architecture gate; implementation planning may now
-   begin.
+3. General's recorded ruling remains the architecture gate; implementation planning
+   has not begun.
 4. Section 15 keeps the program off the closure-day and production critical paths.
 
-General adds these enforcement notes without changing the design:
+Codex recommends these enforcement notes for General's ruling:
 
 - Phase 0 PR-sized commits cannot be held behind database/schema kernel work.
 - Each slice refreshes `origin/dev`, open PRs, and governing WOs before editing so
