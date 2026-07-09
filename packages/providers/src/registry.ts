@@ -23,6 +23,7 @@ import {
   registerOprProvider,
   registerOprZeroProvider,
 } from './community/glm/registration';
+import { registerGrokAgentProvider } from './community/grok/registration';
 import { GlmProvider } from './community/glm/provider';
 import { UnknownProviderError } from './errors';
 import { createLogger } from '@archon/paths';
@@ -187,6 +188,9 @@ export function registerCommunityProviders(): void {
   registerGlmProvider({ failbackProviderFactory: () => new ClaudeProvider() });
   registerOprProvider({ failbackProviderFactory: () => new ClaudeProvider() });
   registerOprZeroProvider();
+  // WO-HARNESS-GROK-AGENT-PROVIDER-01: tool-capable Grok implement seat (OpenRouter
+  // + local tool loop). Chat-only opr must NOT be used for implement.
+  registerGrokAgentProvider();
 }
 
 /** @internal Test-only -- clears the registry. Not for production use. */

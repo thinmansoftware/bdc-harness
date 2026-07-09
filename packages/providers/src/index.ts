@@ -62,3 +62,10 @@ export {
   registerOprZeroProvider,
   type GlmProviderDefaults,
 } from './community/glm';
+
+export {
+  GrokAgentProvider,
+  parseGrokAgentConfig,
+  registerGrokAgentProvider,
+  type GrokAgentProviderDefaults,
+} from './community/grok';
