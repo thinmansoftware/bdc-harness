@@ -13,6 +13,8 @@ import type { DashboardRunResponse } from '@/lib/api';
 import { cn } from '@/lib/utils';
 import { formatDuration, formatStarted } from '@/lib/format';
 import { ConfirmRunActionDialog } from './ConfirmRunActionDialog';
+// Centralized status colors (escalated = YELLOW) -- WO-HARNESS-ESCALATED-RUN-STATUS-01
+import { STATUS_DOT_COLORS, getStatusLabel } from '@/lib/status-renderer';
 
 interface WorkflowHistoryTableProps {
   runs: DashboardRunResponse[];
@@ -20,12 +22,6 @@ interface WorkflowHistoryTableProps {
   onArchive?: (runId: string) => void;
   onUnarchive?: (runId: string) => void;
 }
-
-const STATUS_DOT_COLORS: Record<string, string> = {
-  completed: 'bg-success',
-  failed: 'bg-destructive',
-  cancelled: 'bg-text-tertiary',
-};
 
 const PLATFORM_ICONS: Record<string, React.ReactElement> = {
   web: <Globe className="h-3 w-3" />,
@@ -70,6 +66,7 @@ export function WorkflowHistoryTable({
               className={cn(
                 'hover:bg-surface-elevated transition-colors',
                 run.status === 'failed' && 'border-l-2 border-l-destructive',
+                run.status === 'escalated' && 'border-l-2 border-l-warning',
                 run.archived_at != null && 'opacity-50'
               )}
             >
@@ -79,6 +76,7 @@ export function WorkflowHistoryTable({
                     'h-2 w-2 rounded-full',
                     STATUS_DOT_COLORS[run.status] ?? 'bg-text-tertiary'
                   )}
+                  title={getStatusLabel(run.status)}
                 />
               </td>
               <td className="px-3 py-2">

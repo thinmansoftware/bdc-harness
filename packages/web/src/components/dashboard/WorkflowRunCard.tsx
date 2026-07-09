@@ -25,6 +25,7 @@ import { formatDuration } from '@/lib/format';
 import { useWorkflowStore } from '@/stores/workflow-store';
 import type { WorkflowState } from '@/lib/types';
 import { ConfirmRunActionDialog } from './ConfirmRunActionDialog';
+import { getStatusBadgeClasses, getStatusDotColor, getStatusLabel } from '@/lib/status-renderer';
 
 interface WorkflowRunCardProps {
   run: DashboardRunResponse;
@@ -191,9 +192,8 @@ export function WorkflowRunCard({
         <div
           className={cn(
             'h-2.5 w-2.5 shrink-0 rounded-full',
-            run.status === 'running' && 'bg-primary animate-pulse',
-            run.status === 'paused' && 'bg-warning animate-pulse',
-            run.status === 'pending' && 'bg-text-tertiary'
+            getStatusDotColor(run.status),
+            (run.status === 'running' || run.status === 'paused') && 'animate-pulse'
           )}
         />
         <span className="font-medium text-sm text-text-primary truncate flex-1">
@@ -208,12 +208,10 @@ export function WorkflowRunCard({
         <span
           className={cn(
             'inline-flex items-center rounded-full px-1.5 py-0.5 text-[10px] font-medium',
-            run.status === 'running' && 'bg-primary/10 text-primary',
-            run.status === 'paused' && 'bg-warning/10 text-warning',
-            run.status === 'pending' && 'bg-surface-elevated text-text-secondary'
+            getStatusBadgeClasses(run.status)
           )}
         >
-          {run.status}
+          {getStatusLabel(run.status)}
         </span>
         <span className="text-xs text-text-tertiary shrink-0">{elapsed}</span>
       </div>
@@ -221,8 +219,10 @@ export function WorkflowRunCard({
       {/* Live progress */}
       <StepProgress run={run} liveState={liveState} />
 
-      {/* Node outcome summary for completed/failed runs */}
-      {(run.status === 'completed' || run.status === 'failed') &&
+      {/* Node outcome summary for terminal runs (incl. escalated) */}
+      {(run.status === 'completed' ||
+        run.status === 'failed' ||
+        run.status === 'escalated') &&
         isValidNodeCounts(run.metadata?.node_counts) && (
           <div className="flex items-center gap-2">
             <NodeCountsSummary counts={run.metadata.node_counts} />

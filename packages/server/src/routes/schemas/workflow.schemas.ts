@@ -121,9 +121,11 @@ export const commandListResponseSchema = z
 // Workflow run schemas
 // =========================================================================
 
-/** Workflow run status values. */
+/** Workflow run status values.
+ *  'escalated' = gate-rejection ladder uplift (WO-HARNESS-ESCALATED-RUN-STATUS-01),
+ *  terminal, distinct from failed. */
 export const workflowRunStatusSchema = z
-  .enum(['pending', 'running', 'completed', 'failed', 'cancelled', 'paused'])
+  .enum(['pending', 'running', 'completed', 'failed', 'escalated', 'cancelled', 'paused'])
   .openapi('WorkflowRunStatus');
 
 /** A workflow run record. */
@@ -287,6 +289,7 @@ export const dashboardRunsResponseSchema = z
       running: z.number(),
       completed: z.number(),
       failed: z.number(),
+      escalated: z.number(),
       cancelled: z.number(),
       pending: z.number(),
       paused: z.number(),

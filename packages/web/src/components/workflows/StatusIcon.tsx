@@ -19,6 +19,9 @@ export function StatusIcon({ status }: { status: string }): React.ReactElement {
       return <Lock className="h-3 w-3 text-warning animate-pulse" />;
     case 'failed':
       return <span className="text-error text-sm">&#x2717;</span>;
+    case 'escalated':
+      // WO-HARNESS-ESCALATED-RUN-STATUS-01: yellow up-arrow, distinct from failed (red X).
+      return <span className="text-warning text-sm" title="Escalated">&#x25B2;</span>;
     case 'cancelled':
       return <span className="text-text-secondary text-sm">&#x2715;</span>;
     case 'skipped':

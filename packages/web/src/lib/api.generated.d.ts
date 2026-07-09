@@ -3042,7 +3042,7 @@ export interface components {
       message: string;
     };
     /** @enum {string} */
-    WorkflowRunStatus: 'pending' | 'running' | 'completed' | 'failed' | 'cancelled' | 'paused';
+    WorkflowRunStatus: 'pending' | 'running' | 'completed' | 'failed' | 'escalated' | 'cancelled' | 'paused';
     WorkflowRun: {
       id: string;
       workflow_name: string;
@@ -3083,6 +3083,7 @@ export interface components {
         running: number;
         completed: number;
         failed: number;
+        escalated: number;
         cancelled: number;
         pending: number;
         paused: number;
