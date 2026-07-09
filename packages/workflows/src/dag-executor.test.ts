@@ -4099,6 +4099,118 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
       expect(promptIter2).not.toContain('<promise>');
     });
 
+    it('preserves newlines between streamed chunks in $LOOP_PREV_OUTPUT', async () => {
+      let callCount = 0;
+      mockSendQueryDag.mockImplementation(function* () {
+        callCount++;
+        if (callCount === 1) {
+          yield { type: 'assistant', content: 'FIELD_ONE=true' };
+          yield { type: 'assistant', content: '\n' };
+          yield { type: 'assistant', content: 'FIELD_TWO=value' };
+          yield { type: 'result', sessionId: 'chunk-session-1' };
+        } else {
+          yield { type: 'assistant', content: '<promise>COMPLETE</promise>' };
+          yield { type: 'result', sessionId: 'chunk-session-2' };
+        }
+      });
+
+      const mockDeps = createMockDeps();
+      const platform = createMockPlatform();
+      (platform.getStreamingMode as Mock).mockReturnValue('stream');
+      const workflowRun = makeWorkflowRun();
+
+      await executeDagWorkflow(
+        mockDeps,
+        platform,
+        'conv-dag',
+        testDir,
+        {
+          name: 'dag-loop-chunk-newlines',
+          nodes: [
+            {
+              id: 'chunk-loop',
+              loop: {
+                prompt: 'PREV=[$LOOP_PREV_OUTPUT]',
+                until: 'COMPLETE',
+                max_iterations: 3,
+                fresh_context: true,
+              },
+            },
+          ],
+        },
+        workflowRun,
+        'claude',
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        minimalConfig
+      );
+
+      expect(mockSendQueryDag.mock.calls.length).toBe(2);
+      const promptIter2 = mockSendQueryDag.mock.calls[1][0] as string;
+      expect(promptIter2).toContain('PREV=[FIELD_ONE=true\nFIELD_TWO=value]');
+      const streamedFields = (platform.sendMessage as ReturnType<typeof mock>).mock.calls
+        .map((call: unknown[]) => call[1] as string)
+        .filter((message: string) => message.includes('FIELD_'))
+        .join('');
+      expect(streamedFields).toBe('FIELD_ONE=true\nFIELD_TWO=value');
+    });
+
+    it('preserves chunk newlines in persisted output while stripping completion tags', async () => {
+      const store = createMockStore();
+      const mockDeps = createMockDeps(store);
+      mockSendQueryDag.mockImplementation(function* () {
+        yield { type: 'assistant', content: 'FIELD_ONE=true' };
+        yield { type: 'assistant', content: '\n' };
+        yield { type: 'assistant', content: 'FIELD_TWO=value' };
+        yield { type: 'assistant', content: '\n<promise>COMPLETE</promise>' };
+        yield { type: 'result', sessionId: 'chunk-complete-session' };
+      });
+
+      const platform = createMockPlatform();
+      const workflowRun = makeWorkflowRun();
+
+      await executeDagWorkflow(
+        mockDeps,
+        platform,
+        'conv-dag',
+        testDir,
+        {
+          name: 'dag-loop-chunk-persisted-output',
+          nodes: [
+            {
+              id: 'chunk-loop',
+              loop: {
+                prompt: 'Emit fields and COMPLETE.',
+                until: 'COMPLETE',
+                max_iterations: 3,
+              },
+            },
+          ],
+        },
+        workflowRun,
+        'claude',
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        minimalConfig
+      );
+
+      const completed = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls.find(
+        (call: unknown[]) =>
+          (call[0] as { event_type?: string; step_name?: string }).event_type ===
+            'node_completed' && (call[0] as { step_name?: string }).step_name === 'chunk-loop'
+      );
+      expect(completed).toBeDefined();
+      const nodeOutput = (completed![0] as { data: { node_output: string } }).data.node_output;
+      expect(nodeOutput).toBe('FIELD_ONE=true\nFIELD_TWO=value');
+      expect(nodeOutput).not.toContain('<promise>');
+    });
+
     it('$LOOP_PREV_OUTPUT is empty on the first iteration after interactive resume', async () => {
       // Regression guard for the resume-from-approval path: when an interactive
       // loop pauses at the approval gate, the prior `lastIterationOutput` lives

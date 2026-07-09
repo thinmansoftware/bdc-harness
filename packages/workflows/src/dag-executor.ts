@@ -3071,10 +3071,17 @@ async function executeLoopNode(
         if (iterationWallTimedOut) break;
         if (msg.type === 'assistant') {
           fullOutput += msg.content;
-          const cleaned = stripCompletionTags(msg.content, loop.until);
-          cleanOutput += cleaned;
-          if (platform.getStreamingMode() === 'stream' && cleaned) {
-            await safeSendMessage(platform, conversationId, cleaned, msgContext);
+          // Clean the accumulated buffer, not each provider chunk independently.
+          // stripCompletionTags() trims its input, so per-chunk cleaning erased
+          // newline-only chunks and joined adjacent fields in persisted output and
+          // $LOOP_PREV_OUTPUT (anchor: run 42ee6575).
+          const previousCleanOutput = cleanOutput;
+          cleanOutput = stripCompletionTags(fullOutput, loop.until);
+          const cleanedDelta = cleanOutput.startsWith(previousCleanOutput)
+            ? cleanOutput.slice(previousCleanOutput.length)
+            : '';
+          if (platform.getStreamingMode() === 'stream' && cleanedDelta) {
+            await safeSendMessage(platform, conversationId, cleanedDelta, msgContext);
           }
           await logAssistant(logDir, workflowRun.id, msg.content);
         } else if (msg.type === 'result') {
