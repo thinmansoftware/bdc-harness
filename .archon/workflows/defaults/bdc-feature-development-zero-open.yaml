@@ -522,16 +522,30 @@ nodes:
       # negative is what would have misrouted every legitimate build to BLOCKED.
       BASE=$(cat "$ARTIFACTS_DIR/run-start-sha.txt" 2>/dev/null || echo "")
       HEAD_NOW=$(git -C "$WT" rev-parse HEAD 2>/dev/null || echo "")
-      CHANGED=$(git -C "$WT" status --porcelain 2>/dev/null | grep -c . || echo 0)
+      # Anchor 94f61da3: grep -c . || echo 0 yields 0\\n0 when grep exits 1.
+      CHANGED=$(git -C "$WT" status --porcelain 2>/dev/null | grep -c . || true)
+      CHANGED=$(printf '%s' "$CHANGED" | tr -cd '0-9')
+      [ -n "$CHANGED" ] || CHANGED=0
       # commits since run start (real work this run produced, even after a checkpoint push)
       if [ -n "$BASE" ] && [ "$BASE" != "unknown" ] && [ -n "$HEAD_NOW" ]; then
-        AHEAD=$(git -C "$WT" rev-list --count "${BASE}..HEAD" 2>/dev/null || echo 0)
+        AHEAD=$(git -C "$WT" rev-list --count "${BASE}..HEAD" 2>/dev/null || true)
       else
         # fallback: no base captured -> use any-uncommitted OR diff vs upstream
-        AHEAD=$(git -C "$WT" rev-list --count "@{upstream}..HEAD" 2>/dev/null || echo 0)
+        AHEAD=$(git -C "$WT" rev-list --count "@{upstream}..HEAD" 2>/dev/null || true)
       fi
+      AHEAD=$(printf '%s' "$AHEAD" | tr -cd '0-9')
+      [ -n "$AHEAD" ] || AHEAD=0
       HAS_WORK=false
-      if [ "${CHANGED:-0}" -gt 0 ] || [ "${AHEAD:-0}" -gt 0 ]; then HAS_WORK=true; fi
+      if [ "$CHANGED" -gt 0 ] || [ "$AHEAD" -gt 0 ]; then HAS_WORK=true; fi
+      # Disk-truth: implement prose claims docs/canary/*.md but file missing after checkpoint.
+      CLAIMED_CANARY=$(printf '%s\n' "$IMPL" | grep -Eo 'docs/canary/[A-Za-z0-9._/-]+\.md' | head -1 || true)
+      if [ -n "$CLAIMED_CANARY" ] && [ ! -f "$WT/$CLAIMED_CANARY" ]; then
+        echo "BUILD_OUTCOME=FALSE_COMPLETE"
+        echo "ERROR: implement claimed $CLAIMED_CANARY but file is missing after checkpoint (tool-theater)." >&2
+        echo "CHANGED_FILES=$CHANGED"
+        echo "COMMITS_AHEAD=$AHEAD"
+        exit 1
+      fi
 
       SAID_COMPLETE=false
       if printf '%s\n' "$IMPL" | grep -qE '^(COMPLETE|BUILD_COMPLETE)$|<promise>COMPLETE</promise>'; then SAID_COMPLETE=true; fi
@@ -837,25 +851,56 @@ nodes:
       # NEVER emit. Thus only until_bash (done.flag exists AND no debug prints in the
       # feature diff) can complete the loop.
       until: __NEVER_EMIT_USE_UNTIL_BASH__
-      max_iterations: 5
+      max_iterations: 8
       until_bash: |
         set -uo pipefail
-        # MECHANICAL invariants ONLY. This does NOT prove Codex is satisfied --
-        # diff-review-final (a real re-review) does that. Complete when the repair node
-        # signalled done AND the feature diff has no obvious mechanical defects.
+        # MECHANICAL invariants ONLY. Semantic re-check is diff-review-final.
+        # Anchor 94f61da3: open models print "touch done.flag" without writing it.
+        # Self-heal: strip residual non-ASCII on changed sources, then if no debug
+        # prints remain, auto-write the done.flag so until_bash can pass.
         DONE="$ARTIFACTS_DIR/diff-repair-done.flag"
-        [ -f "$DONE" ] || { echo "repair not signalled done"; exit 1; }
-        # F4: implement already committed, so `git diff --cached` is empty. Check the
-        # real feature diff: merge-base..HEAD (committed) PLUS HEAD..worktree (unstaged).
-        # NF2: empty-tree fallback (not HEAD) so a single-commit/no-base repo still
-        # produces a non-empty committed diff to scan for debug prints.
         BASE_REF="origin/${BASE_BRANCH:-main}"
         EMPTY_TREE=$(git hash-object -t tree /dev/null 2>/dev/null || echo 4b825dc642cb6eb9a060e54bf8d69288fbee4904)
         MB=$(git merge-base HEAD "$BASE_REF" 2>/dev/null || git rev-parse HEAD~1 2>/dev/null || echo "$EMPTY_TREE")
         [ -n "$MB" ] || MB="$EMPTY_TREE"
         DEBUG_RE='console\.log\(|debugger;|binding\.pry|import pdb'
+        has_debug=0
         if { git diff --unified=0 "$MB"..HEAD 2>/dev/null; git diff --unified=0 HEAD 2>/dev/null; } \
              | grep -E '^\+' | grep -Eq "$DEBUG_RE"; then
+          has_debug=1
+        fi
+        SRC_RE='\.(md|js|jsx|ts|tsx|mjs|cjs|html|sh|bash|yaml|yml)$'
+        CHANGED_SRC=$( { git diff --name-only "$MB"..HEAD 2>/dev/null; git diff --name-only HEAD 2>/dev/null; git ls-files --others --exclude-standard 2>/dev/null; } | sort -u | grep -E "$SRC_RE" || true )
+        if [ -n "$CHANGED_SRC" ] && command -v python3 >/dev/null 2>&1; then
+          printf '%s\n' "$CHANGED_SRC" | while IFS= read -r f; do
+            [ -f "$f" ] || continue
+            python3 - "$f" <<'PY' || true
+import sys
+path = sys.argv[1]
+try:
+    raw = open(path, "rb").read()
+except OSError:
+    sys.exit(0)
+text = raw.decode("utf-8", errors="replace")
+repl = {
+    "\u2014": "-", "\u2013": "-", "\u2018": "'", "\u2019": "'",
+    "\u201c": '"', "\u201d": '"', "\u2026": "...", "\u00a0": " ",
+    "\u2192": "->", "\u2190": "<-",
+}
+for a, b in repl.items():
+    text = text.replace(a, b)
+text = "".join(ch if ord(ch) < 128 else "?" for ch in text)
+open(path, "w", encoding="ascii", newline="\n").write(text)
+PY
+          done
+        fi
+        if [ ! -f "$DONE" ] && [ "$has_debug" -eq 0 ]; then
+          mkdir -p "$ARTIFACTS_DIR" 2>/dev/null || true
+          : > "$DONE"
+          echo "diff-repair until_bash: auto-wrote done.flag (mechanical clean; no debug prints)"
+        fi
+        [ -f "$DONE" ] || { echo "repair not signalled done"; exit 1; }
+        if [ "$has_debug" -eq 1 ]; then
           echo "debug statement present in feature diff"; exit 1
         fi
         exit 0
