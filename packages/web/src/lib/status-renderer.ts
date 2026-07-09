@@ -10,16 +10,8 @@
  *   - status terminal-ness (for display filters)
  */
 
-/** Run-level workflow statuses the dashboard understands. */
-export type RenderableRunStatus =
-  | 'pending'
-  | 'running'
-  | 'paused'
-  | 'completed'
-  | 'failed'
-  | 'escalated'
-  | 'cancelled'
-  | string;
+/** Run-level workflow statuses the dashboard understands (open string for unknown). */
+export type RenderableRunStatus = string;
 
 /** Dot / chip color classes for status indicators. */
 export const STATUS_DOT_COLORS: Record<string, string> = {

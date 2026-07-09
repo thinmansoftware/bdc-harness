@@ -68,7 +68,11 @@ export function safeEventDataText(data: PacketEvent['data'] | undefined | null):
           return extractOutputFields(parsed as Record<string, unknown>);
         }
         // Primitive JSON (string/number/bool/null) -- stringify solely for search.
-        return typeof parsed === 'string' ? parsed : String(parsed ?? '');
+        if (typeof parsed === 'string') return parsed;
+        if (typeof parsed === 'number' || typeof parsed === 'boolean') {
+          return String(parsed);
+        }
+        return '';
       } catch {
         // Invalid JSON: keep the raw string so rejection phrases still match.
         return data;
@@ -76,9 +80,9 @@ export function safeEventDataText(data: PacketEvent['data'] | undefined | null):
     }
     return data;
   }
-  if (typeof data === 'object') {
+  if (data !== null && typeof data === 'object') {
     try {
-      return extractOutputFields(data as Record<string, unknown>);
+      return extractOutputFields(data);
     } catch {
       return '';
     }
@@ -170,9 +174,8 @@ export function extractPlanText(events: PacketEvent[]): string | null {
 
     if (step === 'plan-review' || step.includes('plan-review')) {
       // Prefer the APPROVED_PLAN fence when present
-      const fenced = text.match(
-        /===+\s*APPROVED_PLAN_BEGIN\s*===+([\s\S]*?)===+\s*APPROVED_PLAN_END\s*===+/i
-      );
+      const fenced =
+        /===+\s*APPROVED_PLAN_BEGIN\s*===+([\s\S]*?)===+\s*APPROVED_PLAN_END\s*===+/i.exec(text);
       if (fenced?.[1]) {
         approvedPlan = trimSection(fenced[1].trim(), 4_000);
       } else if (!approvedPlan) {
@@ -280,7 +283,9 @@ export function buildEscalationPacket(opts: BuildEscalationPacketOptions): Escal
     if (remaining > 200) {
       const effectiveDiffCap = Math.min(diffCap, remaining);
       if (diff.length > effectiveDiffCap) {
-        diff = diff.slice(0, effectiveDiffCap) + `\n...[diff truncated ${String(diff.length - effectiveDiffCap)} chars]`;
+        diff =
+          diff.slice(0, effectiveDiffCap) +
+          `\n...[diff truncated ${String(diff.length - effectiveDiffCap)} chars]`;
         diffTruncated = true;
       }
       body +=
@@ -295,8 +300,7 @@ export function buildEscalationPacket(opts: BuildEscalationPacketOptions): Escal
     } else {
       // Prefer keeping findings/verdict; drop the diff entirely when oversize
       diffTruncated = true;
-      body +=
-        '## REJECTED DIFF\n(omitted: packet size cap would truncate findings otherwise)\n\n';
+      body += '## REJECTED DIFF\n(omitted: packet size cap would truncate findings otherwise)\n\n';
       diff = null;
     }
   }

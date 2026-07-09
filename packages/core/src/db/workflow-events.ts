@@ -80,7 +80,7 @@ export async function listWorkflowEvents(workflowRunId: string): Promise<Workflo
       // dashboard consumers. Fall back to empty object on invalid payload.
       data:
         typeof row.data === 'string'
-          ? (() => {
+          ? ((): Record<string, unknown> => {
               try {
                 const parsed: unknown = JSON.parse(row.data);
                 return parsed && typeof parsed === 'object'
