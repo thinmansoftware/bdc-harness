@@ -132,7 +132,7 @@ nodes:
   # net, this is only an optimization that must never wrongly skip real work.
   - id: check-already-satisfied
     persona: war-council-architect-opr
-    agent: war-council-architect
+    agent: war-council-architect-opr
     provider: codex
     depends_on: [read-spec]
     task_class: clerical
@@ -193,7 +193,7 @@ nodes:
     # 10f6add0, 28e98197 (2026-07-01) all died at plan with the persona fault.
     provider: codex
     depends_on: [gate-already-satisfied]
-    agent: war-council-architect
+    agent: war-council-architect-opr
     task_class: medium_work
     prompt: |
       Read the BDC Work Order spec below and produce a concise implementation plan.
@@ -242,7 +242,7 @@ nodes:
     # which pinned the tail nodes but missed plan/plan-review. Anchor: runs 723842fe,
     # 10f6add0, 28e98197 (2026-07-01) all died at plan with the persona fault.
     provider: codex
-    agent: war-council-architect
+    agent: war-council-architect-opr
     depends_on: [plan]
     task_class: medium_work
     loop:
@@ -783,7 +783,7 @@ nodes:
   - id: diff-review
     persona: codex-adversarial-reviewer
     provider: codex
-    agent: claude-adversarial-reviewer
+    agent: codex-adversarial-reviewer
     depends_on: [capture-diff]
     task_class: medium_work
     prompt: |
@@ -966,7 +966,7 @@ nodes:
   - id: diff-review-final
     persona: codex-adversarial-reviewer
     provider: codex
-    agent: claude-adversarial-reviewer
+    agent: codex-adversarial-reviewer
     depends_on: [capture-diff-final]
     trigger_rule: all_done
     task_class: medium_work
@@ -1120,7 +1120,7 @@ nodes:
   - id: opus-rereview
     persona: codex-adversarial-reviewer
     provider: codex
-    agent: claude-adversarial-reviewer
+    agent: codex-adversarial-reviewer
     depends_on: [classify-opus-repair]
     trigger_rule: all_done
     when: "$classify-opus-repair.output.fixed == 'true'"
@@ -1345,7 +1345,7 @@ nodes:
   # trigger_rule all_done so an APPROVE-AS-IS run (which skips this) does not hang the DAG.
   - id: apply-suggested-fix
     persona: major-build-opr
-    agent: overseer-opus
+    agent: major-build-opr
     provider: codex
     effort: xhigh
     context: fresh
@@ -1383,7 +1383,7 @@ nodes:
   - id: apply-diff-review-final
     persona: codex-adversarial-reviewer
     provider: codex
-    agent: claude-adversarial-reviewer
+    agent: codex-adversarial-reviewer
     depends_on: [apply-suggested-fix]
     trigger_rule: all_done
     when: "$pause-gate.output.decision_verb == 'approve_with_fix'"
