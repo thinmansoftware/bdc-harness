@@ -4,11 +4,8 @@
  * Test scenario 4 from WO-HARNESS-SMART-CAULDRON-LANE-ROSTER-AND-RESILIENCE-01:
  *
  * S4a: Each lane YAML passes parseWorkflow() validation (DAG valid, no loader errors).
- * S4b: war-council-validator node has `provider: claude` and `model: sonnet` in standard lanes
- *      (trusted judge always Claude regardless of top-level lane default), EXCEPT
- *      bdc-feature-development-zero.yaml, which deliberately pins war-council-validator
- *      to `provider: codex`, and bdc-feature-development-zero-claude.yaml, which pins
- *      it to `provider: codex-opr` so Codex failures degrade to OpenRouter instead.
+ * S4b: war-council-validator pin matches the lane's dual-cap / quality intent:
+ *      standard/codex/fable -> Claude judge; zero/zero-open/qwen dual-cap -> open models.
  *
  * Design: uses the real parseWorkflow() loader so validation logic matches production.
  */
@@ -72,13 +69,26 @@ describe('lane registration and war-council-validator pin', () => {
       }
 
       if (file === 'bdc-feature-development-zero.yaml') {
-        // zero-Claude law: this lane pins war-council-validator to codex on purpose.
-        expect(wcv.provider).toBe('codex');
+        // Dual-cap (2026-07-09): DeepSeek judge via glm/OpenRouter.
+        expect(wcv.provider).toBe('glm');
         return;
       }
 
-      if (file === 'bdc-feature-development-zero-claude.yaml') {
-        expect(wcv.provider).toBe('codex-opr');
+      if (file === 'bdc-feature-development-zero-open.yaml') {
+        // Dual-cap: DeepSeek on opr-zero (no Claude, no Codex).
+        expect(wcv.provider).toBe('opr-zero');
+        return;
+      }
+
+      if (file === 'bdc-feature-development-fusion-cx-qwen.yaml') {
+        // Dual-cap qwen: OpenRouter judge.
+        expect(wcv.provider).toBe('opr');
+        return;
+      }
+
+      if (file === 'bdc-feature-development-codex-only.yaml') {
+        // Claude-out / Codex-in: validator on codex with model-free persona.
+        expect(wcv.provider).toBe('codex');
         return;
       }
 
