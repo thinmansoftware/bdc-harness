@@ -1,15 +1,14 @@
 name: bdc-feature-development-fusion-cx-qwen
 description: |
-  Qwen-implement variant of bdc-feature-development. Identical DAG; implement +
-  diff-repair loops use qwen/qwen3-coder via OpenRouter instead of Claude.
-  Diff review (diff-review, diff-review-final, opus-rereview) runs on DeepSeek
-  via OpenRouter, not Qwen self-grading (John 2026-07-07: DeepSeek's strength
-  is review, not authoring). Open models on build+review+judge for dual-cap weeks (no Claude required).
-  Root provider stays codex for bare bash tails only. Prompt nodes pin opr.
+  Fusion cheap lane (Claude-free build path). Plan on Qwen via OpenRouter; implement
+  + repair on Grok 4.5 via OpenRouter (x-ai/grok-4.5) -- substituted for Codex when
+  Codex/Claude seats are exhausted (John 2026-07-09). Diff review stays DeepSeek
+  (cross-model, not self-grading). Root provider is OpenRouter so bare tails never
+  fall through to Anthropic SDK.
 
 policyFile: harness/policies/agent-behavior.md
-provider: codex  # root provider: bare tail nodes (findings-consolidate, decide-push-target, build-manifest) MUST route gpt-5.5 to Codex, not the Anthropic SDK. Missing this line = dead-at-tail (2026-07-07 runs d469af05/f73fb8b3: builds succeeded, tails died on "model gpt-5.5 may not exist").
-model: gpt-5.5  # root default non-Claude; bare nodes do not fall to Claude
+provider: opr  # root: bare AI tails use OpenRouter, not Codex/Claude (Codex exhausted 2026-07-09)
+model: x-ai/grok-4.5  # Grok substitute for prior root gpt-5.5/Codex default
 
 nodes:
   # Pre-flight: fail closed if container lacks GITHUB auth (WO-169, 2026-05-16).
@@ -157,8 +156,8 @@ nodes:
     # run on codex (no failover needed); judge/validator seats (plan-review,
     # diff-review*, war-council-validator) are intentionally NOT wired -- a gate
     # that silently switches models undermines gate integrity (spec doctrine).
-    failover_provider: codex
-    failover_model: gpt-5.5
+    failover_provider: opr
+    failover_model: x-ai/grok-4.5
     persona: war-council-architect-opr
     depends_on: [gate-already-satisfied]
     task_class: medium_work
@@ -294,8 +293,9 @@ nodes:
           SAFE_STATE=<nothing committed/pushed; plan stage only>
 
   - id: implement
-    provider: codex
-    model: gpt-5.5
+    provider: opr
+    model: x-ai/grok-4.5
+    persona: major-build-opr
     depends_on: [plan-review]
     task_class: medium_work
     loop:
@@ -816,8 +816,9 @@ nodes:
       printf '{"verdict":"%s"}\n' "$verdict"
 
   - id: diff-repair
-    provider: codex
-    model: gpt-5.5
+    provider: opr
+    model: x-ai/grok-4.5
+    persona: major-build-opr
     depends_on: [diff-review, classify-diff-review]
     when: "$classify-diff-review.output.verdict == 'needs_revision'"
     task_class: medium_work
@@ -1043,8 +1044,9 @@ nodes:
   # bothering a human (autonomy ladder step 2). Read-only-ish: it may edit in-scope files to
   # resolve the block, then signals. If it can't fix, the run proceeds to the human pause.
   - id: opus-repair
-    provider: codex
-    model: gpt-5.5
+    provider: opr
+    model: x-ai/grok-4.5
+    persona: major-build-opr
     depends_on: [block-classify]
     when: "$block-classify.output.status == 'BLOCKED'"
     prompt: |
