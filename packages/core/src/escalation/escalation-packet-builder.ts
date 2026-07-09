@@ -51,24 +51,48 @@ export interface EscalationPacketResult {
 }
 
 /**
+ * Safely coerce event.data (object | JSON string | null | unexpected) to text.
+ * Never throws -- invalid JSON strings fall back to the raw string so a corrupt
+ * event row cannot crash packet assembly (Codex finding fixed).
+ */
+export function safeEventDataText(data: PacketEvent['data'] | undefined | null): string {
+  if (data == null) return '';
+  if (typeof data === 'string') {
+    const trimmed = data.trim();
+    if (!trimmed) return '';
+    // Attempt JSON parse only when it looks like an object/array payload.
+    if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+      try {
+        const parsed: unknown = JSON.parse(trimmed);
+        if (parsed && typeof parsed === 'object') {
+          return extractOutputFields(parsed as Record<string, unknown>);
+        }
+        // Primitive JSON (string/number/bool/null) -- stringify solely for search.
+        return typeof parsed === 'string' ? parsed : String(parsed ?? '');
+      } catch {
+        // Invalid JSON: keep the raw string so rejection phrases still match.
+        return data;
+      }
+    }
+    return data;
+  }
+  if (typeof data === 'object') {
+    try {
+      return extractOutputFields(data as Record<string, unknown>);
+    } catch {
+      return '';
+    }
+  }
+  return '';
+}
+
+/**
  * Normalize event data to a plain object and a search text blob.
  * Event output lives under data.output, data.node_output, or is the whole data string.
  */
-function eventText(ev: PacketEvent): string {
-  const data = ev.data;
-  if (data == null) return '';
-  if (typeof data === 'string') {
-    try {
-      const parsed = JSON.parse(data) as Record<string, unknown>;
-      return extractOutputFields(parsed);
-    } catch {
-      return data;
-    }
-  }
-  if (typeof data === 'object') {
-    return extractOutputFields(data as Record<string, unknown>);
-  }
-  return '';
+function eventText(ev: PacketEvent | null | undefined): string {
+  if (!ev || typeof ev !== 'object') return '';
+  return safeEventDataText(ev.data);
 }
 
 function extractOutputFields(data: Record<string, unknown>): string {
@@ -295,10 +319,29 @@ export function buildEscalationPacket(opts: BuildEscalationPacketOptions): Escal
 }
 
 /**
+ * Sanitize free-text that will be concatenated into a dispatch message.
+ * Strip NULs and wrought C0 control bytes that can corrupt prompt boundaries.
+ * Does NOT attempt HTML/SQL sanitization -- this is an internal operator message.
+ */
+function sanitizeMessageFragment(text: string): string {
+  // Drop NUL and other C0 controls except \t \n \r.
+  // eslint-disable-next-line no-control-regex
+  return text.replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, '');
+}
+
+/**
  * Prepend an escalation packet to a successor user_message.
  * Returns original message unchanged if packet is empty.
+ *
+ * Boundary format is fixed so the packet cannot silently merge into the original
+ * prompt, and both fragments are control-stripped to prevent messagereshape injection
+ * via accessed event text (Codex finding fixed).
  */
 export function prependEscalationPacket(userMessage: string, packet: string): string {
   if (!packet) return userMessage;
-  return `${packet}\n\n${userMessage}`;
+  const cleanPacket = sanitizeMessageFragment(packet).trimEnd();
+  const cleanUser = sanitizeMessageFragment(userMessage ?? '');
+  // Always separate with a blank line + a stable boundary so UI/grep tools can
+  // re-split if needed, and so a trailing packet fence cannot glue into WO_ID=.
+  return `${cleanPacket}\n\n--- SUCCESSOR USER MESSAGE ---\n${cleanUser}`;
 }

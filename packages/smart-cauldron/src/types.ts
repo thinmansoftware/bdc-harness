@@ -100,7 +100,8 @@ export interface FireResult {
 
 export interface PollResult {
   runId: string;
-  terminalStatus: 'completed' | 'failed' | 'cancelled';
+  /** Includes 'escalated' (WO-HARNESS-ESCALATED-RUN-STATUS-01) as a terminal non-success. */
+  terminalStatus: 'completed' | 'failed' | 'escalated' | 'cancelled';
   validatorVerdict: 'satisfied' | 'needs_revision' | 'unknown';
   prUrl: string | null;
   prMergeable: boolean | null;

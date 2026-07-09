@@ -80,18 +80,49 @@ export function extractWoId(userMessage: string | null | undefined): string | nu
  * A genuine breakage without these phrases returns false -- prior stays 'failed'.
  */
 export function hasValidatorRejectionSignal(
-  events: { event_type?: string; step_name?: string | null; data?: unknown; error?: string }[]
+  events:
+    | {
+        event_type?: string;
+        step_name?: string | null;
+        data?: unknown;
+        error?: string;
+        // Legacy / misspoke field name some event serializers may use.
+        event_data?: unknown;
+      }[]
+    | null
+    | undefined
 ): boolean {
   if (!events || events.length === 0) return false;
 
   for (const ev of events) {
+    // Defensive: skip null / non-object rows so a corrupt events array never TypeErrors.
+    if (!ev || typeof ev !== 'object') continue;
+
     const blobs: string[] = [];
     if (ev.step_name) blobs.push(ev.step_name);
     if (typeof ev.error === 'string') blobs.push(ev.error);
-    if (typeof ev.data === 'string') {
-      blobs.push(ev.data);
-    } else if (ev.data && typeof ev.data === 'object') {
-      const d = ev.data as Record<string, unknown>;
+
+    // Prefer .data; fall back to .event_data (legacy alias) with null safety.
+    const rawData = ev.data !== undefined ? ev.data : ev.event_data;
+    if (typeof rawData === 'string') {
+      blobs.push(rawData);
+      // Parse JSON when string-encoded so nested output fields still match.
+      const trimmed = rawData.trim();
+      if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+        try {
+          const parsed: unknown = JSON.parse(trimmed);
+          if (parsed && typeof parsed === 'object') {
+            const d = parsed as Record<string, unknown>;
+            for (const key of ['output', 'node_output', 'error', 'message', 'text']) {
+              if (typeof d[key] === 'string') blobs.push(d[key] as string);
+            }
+          }
+        } catch {
+          // Invalid JSON is fine -- raw string already in blobs.
+        }
+      }
+    } else if (rawData && typeof rawData === 'object') {
+      const d = rawData as Record<string, unknown>;
       for (const key of ['output', 'node_output', 'error', 'message', 'text']) {
         if (typeof d[key] === 'string') blobs.push(d[key] as string);
       }
@@ -99,7 +130,7 @@ export function hasValidatorRejectionSignal(
       try {
         blobs.push(JSON.stringify(d));
       } catch {
-        // ignore
+        // ignore circular / non-serializable
       }
     }
     const text = blobs.join('\n');
@@ -174,11 +205,15 @@ export async function linkEscalatedPredecessor(
     return { escalatedRunIds: [], packet: '', woId };
   }
 
-  // Filter to same WO_ID, different run, and prior (started earlier if we can tell).
-  // We keep the most recent matching failed prior as packet source.
+  // Filter to same WO_ID ONLY (strict equality on extracted WO_ID token), different
+  // run, and prior (started earlier if we can tell). Never escalate a prior whose
+  // WO_ID does not exactly match the successor message's WO_ID (Codex finding).
   const candidates = failedRuns
-    .filter(r => r.id !== options?.excludeRunId)
-    .filter(r => extractWoId(r.user_message) === woId)
+    .filter(r => r != null && r.id !== options?.excludeRunId)
+    .filter(r => {
+      const priorWo = extractWoId(r.user_message);
+      return priorWo !== null && priorWo === woId;
+    })
     .slice()
     // started_at may be Date or ISO string depending on dialect/normalize
     .sort((a, b) => {
@@ -211,7 +246,20 @@ export async function linkEscalatedPredecessor(
       continue;
     }
 
-    // Flip status to escalated (idempotent if re-entered)
+    // Re-confirm WO_ID match right before the status write (defense in depth:
+    // listWorkflowRuns can race with external status mutation between filter and update).
+    const priorWoConfirm = extractWoId(prior.user_message);
+    if (priorWoConfirm !== woId) {
+      getLog().warn(
+        { priorRunId: prior.id, priorWoConfirm, woId },
+        'escalation.wo_id_mismatch_skip'
+      );
+      continue;
+    }
+
+    // Flip status to escalated (idempotent if re-entered). Existing 'failed' rows
+    // without a same-WO_ID successor stay 'failed' forever -- no bulk migration
+    // rewrites historical genuine breakages (by design).
     try {
       await store.updateWorkflowRun(prior.id, {
         status: 'escalated',
@@ -220,6 +268,7 @@ export async function linkEscalatedPredecessor(
           escalated_reason: 'gate_rejection_with_successor',
           escalated_wo_id: woId,
           escalated_by: 'escalation-linker',
+          escalated_prior_status: prior.status ?? 'failed',
         },
       });
       escalatedRunIds.push(prior.id);

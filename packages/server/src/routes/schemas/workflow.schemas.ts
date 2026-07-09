@@ -123,7 +123,12 @@ export const commandListResponseSchema = z
 
 /** Workflow run status values.
  *  'escalated' = gate-rejection ladder uplift (WO-HARNESS-ESCALATED-RUN-STATUS-01),
- *  terminal, distinct from failed. */
+ *  terminal, distinct from failed.
+ *
+ *  Storage alignment: remote_agent_workflow_runs.status is free TEXT (see
+ *  migrations/008_workflow_runs.sql / sqlite adapter). There is no DB-level
+ *  enum or CHECK constraint to update. This API schema is the source of truth
+ *  for allowed values; DB accepts any string and the app validates here. */
 export const workflowRunStatusSchema = z
   .enum(['pending', 'running', 'completed', 'failed', 'escalated', 'cancelled', 'paused'])
   .openapi('WorkflowRunStatus');

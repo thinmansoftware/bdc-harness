@@ -17,6 +17,12 @@ export const workflowRunStatusSchema = z.enum([
    * A prior lower-tier attempt was rejected by a validator/gate and a
    * higher-tier successor for the same WO_ID was dispatched. Distinct from
    * failed (genuine breakage). Terminal. Dashboard renders YELLOW.
+   *
+   * Schema / storage note: remote_agent_workflow_runs.status is free TEXT
+   * (no CHECK/enum constraint in SQLite or Postgres). Adding this value is a
+   * pure application-level contract change -- no DDL migration is required or
+   * performed. Existing rows remain 'failed' until a same-WO_ID successor
+   * re-labels them via the dispatch-time escalation linker (lazy, one-shot).
    */
   'escalated',
   'cancelled',

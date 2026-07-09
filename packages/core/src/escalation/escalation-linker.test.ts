@@ -123,6 +123,38 @@ describe('hasValidatorRejectionSignal', () => {
   test('returns false for empty events', () => {
     expect(hasValidatorRejectionSignal([])).toBe(false);
   });
+
+  test('tolerates null event rows and null data without throwing', () => {
+    // Codex finding: missing null check on event data / incomplete-event mocks.
+    expect(
+      hasValidatorRejectionSignal([
+        null as unknown as { event_type?: string },
+        {
+          event_type: 'node_completed',
+          step_name: 'war-council-validator',
+          data: null,
+        },
+        {
+          event_type: 'node_completed',
+          step_name: 'flip-notion-on-failure',
+          // legacy alias field, null must not throw
+          event_data: null,
+        } as { event_type?: string },
+      ])
+    ).toBe(false);
+  });
+
+  test('accepts rejection signal nested in stringified JSON data', () => {
+    expect(
+      hasValidatorRejectionSignal([
+        {
+          event_type: 'node_completed',
+          step_name: 'war-council-validator',
+          data: JSON.stringify({ output: 'needs_revision: schema drift' }),
+        },
+      ])
+    ).toBe(true);
+  });
 });
 
 describe('linkEscalatedPredecessor', () => {
@@ -223,6 +255,11 @@ describe('linkEscalatedPredecessor', () => {
     expect(prepared.userMessage.startsWith('=== ESCALATION PACKET')).toBe(true);
     expect(prepared.userMessage).toContain(ESCALATION_FINDINGS_MARKER);
     expect(prepared.userMessage).toContain('original prompt');
+    expect(prepared.userMessage).toContain('--- SUCCESSOR USER MESSAGE ---');
+    // Status update must actually record and use the 'escalated' status (not a silent no-op).
+    expect(store.updates).toHaveLength(1);
+    expect(store.updates[0].updates.status).toBe('escalated');
+    expect(store.updates[0].updates.metadata?.escalated_wo_id).toBe(WO);
   });
 
   test('no WO_ID in message => no-op', async () => {
@@ -230,5 +267,52 @@ describe('linkEscalatedPredecessor', () => {
     const result = await linkEscalatedPredecessor('just chatting', store);
     expect(result.escalatedRunIds).toEqual([]);
     expect(result.woId).toBeNull();
+  });
+
+  test('status update only fires when prior WO_ID exactly matches successor', async () => {
+    // Codex finding: missing validation that successor WO_ID matches prior run.
+    const store = makeStore({
+      failedRuns: [
+        makeRun({
+          id: 'near-miss',
+          // Same prefix family, different WO_ID suffix -- must NOT escalate.
+          user_message: 'WO_ID=WO-HARNESS-ESCALATED-RUN-STATUS-02\nbuild',
+        }),
+      ],
+      eventsByRun: {
+        'near-miss': [
+          {
+            event_type: 'node_completed',
+            step_name: 'flip-notion-on-failure',
+            data: {
+              output:
+                'FALLBACK_FLIP_DECLINED: validator verdict not satisfied; real failure; leaving issue as-is.',
+            },
+          },
+        ],
+      },
+    });
+    const result = await linkEscalatedPredecessor(`WO_ID=${WO}\nrefire`, store);
+    expect(result.escalatedRunIds).toEqual([]);
+    expect(store.updates).toHaveLength(0);
+  });
+
+  test('incomplete events with null data never crash the linker and never escalate', async () => {
+    const store = makeStore({
+      failedRuns: [makeRun({ id: 'prior-null', user_message: priorMsg })],
+      eventsByRun: {
+        'prior-null': [
+          {
+            event_type: 'node_completed',
+            step_name: 'war-council-validator',
+            data: null as unknown as Record<string, unknown>,
+          },
+        ],
+      },
+    });
+    const result = await linkEscalatedPredecessor(`WO_ID=${WO}\nrefire`, store);
+    expect(result.escalatedRunIds).toEqual([]);
+    expect(store.updates).toHaveLength(0);
+    expect(result.packet).toBe('');
   });
 });

@@ -158,6 +158,42 @@ describe('buildEscalationPacket', () => {
 
   test('prependEscalationPacket is a no-op on empty packet', () => {
     expect(prependEscalationPacket('hello', '')).toBe('hello');
-    expect(prependEscalationPacket('hello', 'PKT\n')).toBe('PKT\n\n\nhello');
+    const combined = prependEscalationPacket('hello', 'PKT');
+    expect(combined).toContain('PKT');
+    expect(combined).toContain('--- SUCCESSOR USER MESSAGE ---');
+    expect(combined).toContain('hello');
+  });
+
+  test('invalid JSON event.data does not crash packet build', () => {
+    // Codex finding: missing error handling for invalid JSON in event data.
+    const result = buildEscalationPacket({
+      events: [
+        {
+          event_type: 'node_completed',
+          step_name: 'war-council-validator',
+          data: '{not-valid-json needs_revision',
+        },
+        {
+          event_type: 'node_completed',
+          step_name: 'flip-notion-on-failure',
+          data: null,
+        },
+      ],
+    });
+    // Raw string still matched the needs_revision phrase.
+    expect(result.packet).toContain(ESCALATION_FINDINGS_MARKER);
+    expect(result.packet).toContain('needs_revision');
+  });
+
+  test('prependEscalationPacket strips control chars so packet cannot reshape message', () => {
+    const combined = prependEscalationPacket(
+      'WO_ID=WO-DEMO-01\nprompt',
+      'PKT\u0000with\u0007bell'
+    );
+    expect(combined).not.toContain('\u0000');
+    expect(combined).not.toContain('\u0007');
+    expect(combined).toContain('PKT');
+    expect(combined).toContain('WO_ID=WO-DEMO-01');
+    expect(combined.indexOf('--- SUCCESSOR USER MESSAGE ---')).toBeGreaterThan(0);
   });
 });

@@ -77,7 +77,11 @@ export async function pollForTerminal(opts: PollOptions): Promise<PollResult> {
     const detail = await fetchRunDetail(runId, apiBaseUrl, token);
 
     if (detail && TERMINAL_STATUSES.has(detail.run.status)) {
-      const terminalStatus = detail.run.status as 'completed' | 'failed' | 'cancelled';
+      const terminalStatus = detail.run.status as
+        | 'completed'
+        | 'failed'
+        | 'escalated'
+        | 'cancelled';
       const events = detail.events ?? [];
 
       const validatorVerdict = extractValidatorVerdict(events);

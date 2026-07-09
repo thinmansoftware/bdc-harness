@@ -30,9 +30,14 @@ export function judgeGate(poll: PollResult): GateVerdict {
   const prOpened = prUrl !== null;
   const failingReasons: string[] = [];
 
-  // Condition 1: terminal status
+  // Condition 1: terminal status.
+  // 'escalated' is a re-label applied to a PRIOR rejected run after a successor
+  // fired. If cascaded code ever polls a run already marked escalated, treat it
+  // as a non-success (same ladder-climb signal as failed).
   if (terminalStatus === 'failed') {
     failingReasons.push('terminal status: failed');
+  } else if (terminalStatus === 'escalated') {
+    failingReasons.push('terminal status: escalated');
   } else if (terminalStatus === 'cancelled') {
     failingReasons.push('terminal status: cancelled');
   }

@@ -76,7 +76,23 @@ export async function listWorkflowEvents(workflowRunId: string): Promise<Workflo
     );
     return [...result.rows].map(row => ({
       ...row,
-      data: typeof row.data === 'string' ? JSON.parse(row.data) : row.data,
+      // Null-safe parse: corrupt JSON must not throw and poison escalation /
+      // dashboard consumers. Fall back to empty object on invalid payload.
+      data:
+        typeof row.data === 'string'
+          ? (() => {
+              try {
+                const parsed: unknown = JSON.parse(row.data);
+                return parsed && typeof parsed === 'object'
+                  ? (parsed as Record<string, unknown>)
+                  : { value: parsed };
+              } catch {
+                return { raw: row.data };
+              }
+            })()
+          : row.data && typeof row.data === 'object'
+            ? row.data
+            : {},
     }));
   } catch (error) {
     getLog().error({ err: error as Error, runId: workflowRunId }, 'db.workflow_events_list_failed');
