@@ -19,7 +19,7 @@
  * Requires BOTH: rejection signal AND a same-WO_ID successor dispatch.
  */
 
-import type { WorkflowRun } from '@archon/workflows/schemas/workflow-run';
+import type { WorkflowRun, WorkflowRunStatus } from '@archon/workflows/schemas/workflow-run';
 import {
   buildEscalationPacket,
   prependEscalationPacket,
@@ -33,13 +33,13 @@ function getLog(): {
   warn: (obj: Record<string, unknown>, msg: string) => void;
 } {
   return {
-    info: (obj, msg) => {
+    info: (obj: Record<string, unknown>, msg: string): void => {
       // Structured console for operators / host metrics; no pino required here.
       if (typeof console !== 'undefined' && typeof console.info === 'function') {
         console.info(`[escalation.linker] ${msg}`, obj);
       }
     },
-    warn: (obj, msg) => {
+    warn: (obj: Record<string, unknown>, msg: string): void => {
       if (typeof console !== 'undefined' && typeof console.warn === 'function') {
         console.warn(`[escalation.linker] ${msg}`, obj);
       }
@@ -114,7 +114,7 @@ export function hasValidatorRejectionSignal(
           if (parsed && typeof parsed === 'object') {
             const d = parsed as Record<string, unknown>;
             for (const key of ['output', 'node_output', 'error', 'message', 'text']) {
-              if (typeof d[key] === 'string') blobs.push(d[key] as string);
+              if (typeof d[key] === 'string') blobs.push(d[key]);
             }
           }
         } catch {
@@ -124,7 +124,7 @@ export function hasValidatorRejectionSignal(
     } else if (rawData && typeof rawData === 'object') {
       const d = rawData as Record<string, unknown>;
       for (const key of ['output', 'node_output', 'error', 'message', 'text']) {
-        if (typeof d[key] === 'string') blobs.push(d[key] as string);
+        if (typeof d[key] === 'string') blobs.push(d[key]);
       }
       // Fallback stringification for other shapes
       try {
@@ -147,9 +147,11 @@ export function hasValidatorRejectionSignal(
 
 /** Minimal DB surface the linker needs (narrow for tests). */
 export interface EscalationLinkerStore {
-  listWorkflowRuns(options: {
-    status?: string | string[];
+  listWorkflowRuns(options?: {
+    conversationId?: string;
+    status?: WorkflowRunStatus | WorkflowRunStatus[];
     limit?: number;
+    codebaseId?: string;
     includeArchived?: boolean;
   }): Promise<WorkflowRun[]>;
   listWorkflowEvents(runId: string): Promise<
@@ -161,7 +163,7 @@ export interface EscalationLinkerStore {
   >;
   updateWorkflowRun(
     id: string,
-    updates: { status?: string; metadata?: Record<string, unknown> }
+    updates: Partial<Pick<WorkflowRun, 'status' | 'metadata'>>
   ): Promise<void>;
 }
 
@@ -234,10 +236,7 @@ export async function linkEscalatedPredecessor(
     try {
       events = (await store.listWorkflowEvents(prior.id)) as PacketEvent[];
     } catch (err) {
-      getLog().warn(
-        { err: err as Error, priorRunId: prior.id },
-        'escalation.list_events_error'
-      );
+      getLog().warn({ err: err as Error, priorRunId: prior.id }, 'escalation.list_events_error');
       continue;
     }
 
@@ -272,10 +271,7 @@ export async function linkEscalatedPredecessor(
         },
       });
       escalatedRunIds.push(prior.id);
-      getLog().info(
-        { priorRunId: prior.id, woId },
-        'escalation.prior_run_marked_escalated'
-      );
+      getLog().info({ priorRunId: prior.id, woId }, 'escalation.prior_run_marked_escalated');
     } catch (err) {
       getLog().warn(
         { err: err as Error, priorRunId: prior.id },

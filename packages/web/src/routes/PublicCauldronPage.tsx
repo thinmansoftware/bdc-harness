@@ -24,6 +24,7 @@ const statusLabel: Record<WorkflowRunStatus, string> = {
   paused: 'Paused',
   completed: 'Completed',
   failed: 'Failed',
+  escalated: 'Escalated',
   cancelled: 'Cancelled',
 };
 
@@ -33,6 +34,7 @@ const statusClass: Record<WorkflowRunStatus, string> = {
   paused: 'border-warning/30 bg-warning/10 text-warning',
   completed: 'border-success/30 bg-success/10 text-success',
   failed: 'border-error/30 bg-error/10 text-error',
+  escalated: 'border-warning/30 bg-warning/10 text-warning',
   cancelled: 'border-text-tertiary/30 bg-surface-elevated text-text-secondary',
 };
 
