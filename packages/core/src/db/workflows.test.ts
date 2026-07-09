@@ -211,7 +211,8 @@ describe('workflows database', () => {
 
       const [query] = mockQuery.mock.calls[0] as [string, unknown[]];
       expect(query).toContain('status = $1');
-      expect(query).toContain('completed_at = NOW()');
+      // Preserve existing completed_at when re-labeling terminal runs (escalated path).
+      expect(query).toContain('completed_at = COALESCE(completed_at, NOW())');
     });
 
     test('updates status to failed', async () => {
@@ -221,7 +222,7 @@ describe('workflows database', () => {
 
       const [query] = mockQuery.mock.calls[0] as [string, unknown[]];
       expect(query).toContain('status = $1');
-      expect(query).toContain('completed_at = NOW()');
+      expect(query).toContain('completed_at = COALESCE(completed_at, NOW())');
     });
 
     test('updates metadata', async () => {
@@ -874,7 +875,7 @@ describe('workflows database', () => {
       const [eventsSql] = mockQuery.mock.calls[1] as [string, unknown[]];
       expect(eventsSql).toContain('remote_agent_workflow_events');
       const [runsSql] = mockQuery.mock.calls[2] as [string, unknown[]];
-      expect(runsSql).toContain("status IN ('completed', 'failed', 'cancelled')");
+      expect(runsSql).toContain("status IN ('completed', 'failed', 'escalated', 'cancelled')");
       const [commitSql] = mockQuery.mock.calls[3] as [string, unknown[]];
       expect(commitSql).toBe('COMMIT');
     });
