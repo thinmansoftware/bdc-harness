@@ -10,6 +10,10 @@ describe('isTerminalStatus', () => {
     expect(isTerminalStatus('failed')).toBe(true);
   });
 
+  test('escalated is terminal', () => {
+    expect(isTerminalStatus('escalated')).toBe(true);
+  });
+
   test('cancelled is terminal', () => {
     expect(isTerminalStatus('cancelled')).toBe(true);
   });

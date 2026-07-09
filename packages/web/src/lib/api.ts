@@ -299,6 +299,7 @@ export interface DashboardCounts {
   running: number;
   completed: number;
   failed: number;
+  escalated: number;
   cancelled: number;
   pending: number;
   paused: number;

@@ -12,7 +12,10 @@ import type { PollResult } from './types.js';
 
 const execFileAsync = promisify(execFile);
 
-const TERMINAL_STATUSES = new Set(['completed', 'failed', 'cancelled']);
+// escalated is terminal (gate-rejection re-label) -- include for status robustness;
+// smart-cauldron still treats it like a non-success terminal for climb decisions via
+// the returned terminalStatus string.
+const TERMINAL_STATUSES = new Set(['completed', 'failed', 'escalated', 'cancelled']);
 
 /**
  * Thrown by pollForTerminal when a run does not reach a terminal state within
@@ -74,7 +77,11 @@ export async function pollForTerminal(opts: PollOptions): Promise<PollResult> {
     const detail = await fetchRunDetail(runId, apiBaseUrl, token);
 
     if (detail && TERMINAL_STATUSES.has(detail.run.status)) {
-      const terminalStatus = detail.run.status as 'completed' | 'failed' | 'cancelled';
+      const terminalStatus = detail.run.status as
+        | 'completed'
+        | 'failed'
+        | 'escalated'
+        | 'cancelled';
       const events = detail.events ?? [];
 
       const validatorVerdict = extractValidatorVerdict(events);

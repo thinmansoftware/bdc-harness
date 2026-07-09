@@ -196,6 +196,7 @@ export function DashboardPage(): React.ReactElement {
     running: 0,
     completed: 0,
     failed: 0,
+    escalated: 0,
     cancelled: 0,
     pending: 0,
     paused: 0,
@@ -291,7 +292,11 @@ export function DashboardPage(): React.ReactElement {
   const historyRuns = useMemo(
     () =>
       runs.filter(
-        r => r.status === 'completed' || r.status === 'failed' || r.status === 'cancelled'
+        r =>
+          r.status === 'completed' ||
+          r.status === 'failed' ||
+          r.status === 'escalated' ||
+          r.status === 'cancelled'
       ),
     [runs]
   );

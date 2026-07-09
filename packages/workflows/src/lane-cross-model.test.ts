@@ -76,6 +76,10 @@ describe('lane cross-model review', () => {
     const violations: string[] = [];
 
     for (const file of LANE_FILES) {
+      // codex-only is an intentional mono-provider exhaustion lane (all seats
+      // on Codex). Self-review is accepted there; every other lane must dual-cap.
+      if (file.includes('codex-only')) continue;
+
       const lane = loadLane(file);
       const nodes = lane.nodes ?? [];
 

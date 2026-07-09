@@ -481,9 +481,12 @@ export async function updateWorkflowRun(
       !isApprovalTransition &&
       (updates.status === 'completed' ||
         updates.status === 'failed' ||
+        updates.status === 'escalated' ||
         updates.status === 'cancelled')
     ) {
-      setClauses.push(`completed_at = ${dialect.now()}`);
+      // For escalated (re-label of an already-failed terminal run), preserve any
+      // existing completed_at rather than rewriting it to "now".
+      setClauses.push(`completed_at = COALESCE(completed_at, ${dialect.now()})`);
     }
   }
   if (updates.metadata !== undefined) {
@@ -710,6 +713,7 @@ export interface DashboardRunsResult {
     running: number;
     completed: number;
     failed: number;
+    escalated: number;
     cancelled: number;
     pending: number;
     paused: number;
@@ -854,6 +858,7 @@ export async function listDashboardRuns(
       running: 0,
       completed: 0,
       failed: 0,
+      escalated: 0,
       cancelled: 0,
       pending: 0,
       paused: 0,
@@ -1147,14 +1152,14 @@ export async function deleteOldWorkflowRuns(olderThanDays: number): Promise<{ co
     await pool.query(
       `DELETE FROM remote_agent_workflow_events WHERE workflow_run_id IN (
         SELECT id FROM remote_agent_workflow_runs
-        WHERE status IN ('completed', 'failed', 'cancelled')
+        WHERE status IN ('completed', 'failed', 'escalated', 'cancelled')
           AND started_at < ${cutoff}
       )`,
       []
     );
     const result = await pool.query(
       `DELETE FROM remote_agent_workflow_runs
-       WHERE status IN ('completed', 'failed', 'cancelled')
+       WHERE status IN ('completed', 'failed', 'escalated', 'cancelled')
          AND started_at < ${cutoff}`,
       []
     );

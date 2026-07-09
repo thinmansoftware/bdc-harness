@@ -26,7 +26,15 @@ interface StatusSummaryBarProps {
   onThrottleClick?: () => void;
 }
 
-const STATUS_CHIPS = ['running', 'paused', 'completed', 'failed', 'cancelled', 'pending'] as const;
+const STATUS_CHIPS = [
+  'running',
+  'paused',
+  'completed',
+  'failed',
+  'escalated',
+  'cancelled',
+  'pending',
+] as const;
 
 const DATE_RANGE_OPTIONS: { value: DateRange; label: string }[] = [
   { value: 'today', label: 'Today' },
