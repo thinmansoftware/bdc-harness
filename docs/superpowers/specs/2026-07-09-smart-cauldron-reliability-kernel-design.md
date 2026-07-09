@@ -106,6 +106,8 @@ what actually happened.
 | Provider failback hidden in prose | Executor-level failover has a structured event, while provider-internal Codex/GLM failback can be embedded in output or disappear on loop paths. | Normalize all provider route changes into the durable attempt ledger and one typed event contract. |
 | Idle timeout reported as completion | The loop idle timeout can return a normal-looking iteration result and consume iterations instead of producing a typed progress outcome. | Timeout is a typed progress failure with cancellation evidence, never successful completion. |
 | Nested retry layers | Provider retry, contradiction retry, node retry, quota recursion, failover, and loop iteration have no unified durable history. | One attempt ledger and explicit precedence make every provider call and retry reason visible. |
+| Canonical WO source unavailable or stale | Current audit evidence includes WO references whose claimed canonical file is unavailable on the referenced branch. A run can otherwise fall back to local or issue text without making that substitution visible. | Freeze the exact spec source, revision, bytes, and hash at dispatch. Missing authority fails preflight; an allowed fallback is explicit evidence, never silent. |
+| Source, image, and loaded YAML drift | Prior incidents required separately reconciling host/image revision, source clone revision, and workflow YAML served by the process. | Capture and expose engine, image, bundle, and loaded-workflow revisions. Reject new dispatch when configured authority and loaded bytes disagree. |
 
 ## 5. Design goals and measurable invariants
 
@@ -147,6 +149,9 @@ what actually happened.
   successful loop completion.
 - Provider-internal and executor-level failover produce the same structured route
   evidence.
+- Every node in a run reads the same frozen WO bytes and hash.
+- Engine source, runtime image, bundled defaults, and loaded workflow revisions are
+  visible and mechanically comparable before dispatch.
 
 ## 6. Non-goals
 
@@ -215,6 +220,9 @@ Create one immutable authority record before any builder mutation:
 | `run_id` | Existing workflow run ID. |
 | `dispatch_id` | Idempotency key shared by retries of one operator request. |
 | `wo_id` | Parsed and mechanically validated WO identifier. |
+| `spec_source` | Canonical URI/path or explicitly selected fallback source. |
+| `spec_revision` | Git SHA, issue version marker, or other immutable source revision. |
+| `spec_hash` | SHA-256 of the exact frozen WO bytes used by every node. |
 | `workflow_name` | Registered workflow selected for this attempt. |
 | `codebase_id` | Existing codebase registry ID. |
 | `canonical_remote` | Normalized owner/repo from the registry and verified worktree origin. |
@@ -224,11 +232,20 @@ Create one immutable authority record before any builder mutation:
 | `head_branch` | Deterministic run branch. |
 | `worktree_path` | Durable provider-owned worktree path. |
 | `workflow_revision` | Hash of the exact loaded workflow definition. |
+| `bundle_revision` | Hash/version of the bundled workflow set known to the process. |
+| `engine_revision` | Source commit of the running engine. |
+| `runtime_image_revision` | Immutable image/build identifier when running from an image. |
 | `created_at` | Durable creation time. |
 
-The authority record is append-only. If remote, base, workflow revision, or
-worktree identity changes, execution stops with an explicit authority conflict.
-The system does not silently recalculate a more convenient base.
+The authority record is append-only. The dispatcher reads and freezes the canonical
+WO bytes before worktree mutation. All nodes receive that frozen artifact rather than
+re-reading a moving file. If the canonical source is unavailable, dispatch fails
+unless the workflow contract explicitly allows a fallback such as issue-body text;
+the fallback source and hash are recorded.
+
+If spec, remote, base, engine, bundle, loaded workflow, or worktree identity changes,
+execution stops with an explicit authority conflict. The system does not silently
+recalculate a more convenient source, base, or workflow definition.
 
 ### 8.2 Multidimensional outcomes
 
@@ -440,11 +457,15 @@ the first mutating node:
 
 ```json
 {
+  "spec_source": "git:owner/repo@<sha>:docs/work-orders/WO-ID.md",
+  "spec_hash": "<sha256>",
   "canonical_remote": "owner/repo",
   "base_branch": "release/ce",
   "base_sha": "<verified sha>",
   "run_scope_sha": "<clean pre-implementation sha>",
   "head_branch": "<run branch>",
+  "engine_revision": "<git sha>",
+  "bundle_revision": "<sha256>",
   "workflow_revision": "<sha256>",
   "expected_paths": [".github/workflows/ce-change-scope-gate.yml"]
 }
@@ -865,6 +886,8 @@ Every run view must answer these questions without log archaeology:
 5. Is the run eligible to recover, and what authority was verified?
 6. Is Smart Cauldron waiting, failing over, climbing, or requesting spec repair?
 7. What operator action is safe now?
+8. Which exact WO, engine, image, bundle, and loaded-workflow revisions produced
+   this result?
 
 Recommended operator actions are deterministic mappings from reason codes. A model
 may summarize them, but cannot invent the state.
@@ -897,6 +920,8 @@ General should approve or amend these concrete defaults:
    the manifest slice or formally superseded, never duplicated.
 10. Confirm that implementation planning may begin only after an explicit General
     approval record references this document revision.
+11. Approve frozen WO bytes plus engine/image/bundle/workflow provenance as part of
+    run authority, with fail-closed dispatch on unexplained revision mismatch.
 
 If General rejects a default, the amended decision must name the replacement
 authority and invariant. Implementation cannot resolve architecture by guessing.
@@ -910,13 +935,42 @@ authority and invariant. Implementation cannot resolve architecture by guessing.
 - [ ] Provider outage and usage exhaustion are distinct from quality failure.
 - [ ] Restart recovery is lease-based and worktree-preserving.
 - [ ] Repo/base/diff authority is immutable.
+- [ ] WO source and runtime/workflow provenance are immutable and visible.
 - [ ] Manifests and PR truth are mechanical.
 - [ ] Multi-stage remains a wrapper over the proven single-stage loop.
 - [ ] Conductor integration is feature-flagged and reversible.
 - [ ] Production fire, rebuild, restart, merge, and deploy remain separately gated.
 - [ ] Closure-day work is not blocked.
 
-## 18. Stop point
+## 18. Verified pre-implementation baseline
+
+The isolated worktree was dependency-initialized with `bun install
+--frozen-lockfile`. Installation created ignored dependencies only; tracked state
+remained clean.
+
+Verified on Windows 2026-07-09:
+
+| Check | Result |
+|---|---|
+| `bun --filter @archon/smart-cauldron test` | PASS, 41 tests. |
+| `bun --filter @archon/smart-cauldron type-check` | PASS. |
+| `bun test packages/workflows/src/executor-shared.test.ts` | PASS, 110 tests. |
+| `bun test packages/workflows/src/dag-executor.test.ts` | PASS, 288 tests and 1 intentional skip. |
+| `bun --filter @archon/workflows type-check` | PASS. |
+| `bun run check:bundled` | PASS, 36 commands, 96 workflows, 1 policy. |
+| `bun run check:bundled-skill` | FAIL on current `origin/dev`: 20 guide/example/reference files are not represented in `packages/cli/src/bundled-skill.ts`. |
+
+Windows executor tests require Git Bash and the actual Bun executable directory on
+`PATH`. Running the two test files together in one Bun process exposes one logger-mock
+isolation failure; the repository package script runs them sequentially in separate
+processes, where both are green. The implementation plan must preserve separate test
+processes or fix the test isolation explicitly before using a combined command.
+
+The bundled-skill drift predates this design branch. It is not silently fixed here,
+does not expand the three-item Phase 0 scope, and must be tracked as an independent
+cleanup or reconciled by an already-open WO.
+
+## 19. Stop point
 
 After this document is self-reviewed and committed locally, stop. Do not write the
 implementation plan and do not modify runtime code until General explicitly approves
