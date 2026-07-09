@@ -107,7 +107,7 @@ nodes:
   # net, this is only an optimization that must never wrongly skip real work.
   - id: check-already-satisfied
     persona: war-council-architect-opr
-    agent: war-council-architect
+    agent: war-council-architect-opr
     depends_on: [read-spec]
     task_class: clerical
     prompt: |
@@ -167,7 +167,7 @@ nodes:
     failover_provider: codex
     failover_model: gpt-5.5
     depends_on: [gate-already-satisfied]
-    agent: war-council-architect
+    agent: war-council-architect-opr
     task_class: medium_work
     prompt: |
       Read the BDC Work Order spec below and produce a concise implementation plan.
@@ -209,7 +209,7 @@ nodes:
   # async escalation payload, and only at the irreversible-action boundary downstream.
   - id: plan-review
     persona: war-council-architect-opr
-    agent: war-council-architect
+    agent: war-council-architect-opr
     # FUSION war council (John 2026-07-07): every council seat is a DIFFERENT open
     # model attacking the others' work. The plan authored by qwen (root default)
     # is reviewed by DeepSeek here -- never self-graded. Cross-model diversity IS
