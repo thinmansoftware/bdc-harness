@@ -929,24 +929,8 @@ nodes:
         if [ -n "$CHANGED_SRC" ] && command -v python3 >/dev/null 2>&1; then
           printf '%s\n' "$CHANGED_SRC" | while IFS= read -r f; do
             [ -f "$f" ] || continue
-            python3 - "$f" <<'PY' || true
-import sys
-path = sys.argv[1]
-try:
-    raw = open(path, "rb").read()
-except OSError:
-    sys.exit(0)
-text = raw.decode("utf-8", errors="replace")
-repl = {
-    "\u2014": "-", "\u2013": "-", "\u2018": "'", "\u2019": "'",
-    "\u201c": '"', "\u201d": '"', "\u2026": "...", "\u00a0": " ",
-    "\u2192": "->", "\u2190": "<-",
-}
-for a, b in repl.items():
-    text = text.replace(a, b)
-text = "".join(ch if ord(ch) < 128 else "?" for ch in text)
-open(path, "w", encoding="ascii", newline="\n").write(text)
-PY
+            # YAML-safe ascii strip (single physical line; Bun.YAML rejects col-0 heredocs)
+            python3 -c "import sys,functools;p=sys.argv[1];r=open(p,'rb').read();t=r.decode('utf-8','replace');m={chr(0x2014):'-',chr(0x2013):'-',chr(0x2018):chr(39),chr(0x2019):chr(39),chr(0x201c):chr(34),chr(0x201d):chr(34),chr(0x2026):'...',chr(0xa0):' ',chr(0x2192):'->',chr(0x2190):'<-'};t=functools.reduce(lambda s,ab:s.replace(ab[0],ab[1]), m.items(), t);t=''.join(c if ord(c)<128 else '?' for c in t);open(p,'w',encoding='ascii',newline=chr(10)).write(t)" "$f" || true
           done
         fi
         if [ ! -f "$DONE" ] && [ "$has_debug" -eq 0 ]; then
