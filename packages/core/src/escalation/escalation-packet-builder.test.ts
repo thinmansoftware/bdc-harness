@@ -186,10 +186,7 @@ describe('buildEscalationPacket', () => {
   });
 
   test('prependEscalationPacket strips control chars so packet cannot reshape message', () => {
-    const combined = prependEscalationPacket(
-      'WO_ID=WO-DEMO-01\nprompt',
-      'PKT\u0000with\u0007bell'
-    );
+    const combined = prependEscalationPacket('WO_ID=WO-DEMO-01\nprompt', 'PKT\u0000with\u0007bell');
     expect(combined).not.toContain('\u0000');
     expect(combined).not.toContain('\u0007');
     expect(combined).toContain('PKT');

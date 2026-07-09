@@ -18,7 +18,9 @@ import {
 } from './escalation-linker';
 import { ESCALATION_FINDINGS_MARKER } from './escalation-packet-builder';
 
-function makeRun(partial: Partial<WorkflowRun> & { id: string; user_message: string }): WorkflowRun {
+function makeRun(
+  partial: Partial<WorkflowRun> & { id: string; user_message: string }
+): WorkflowRun {
   return {
     workflow_name: 'bdc-feature-development',
     conversation_id: 'c1',

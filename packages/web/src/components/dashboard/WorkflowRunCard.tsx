@@ -220,9 +220,7 @@ export function WorkflowRunCard({
       <StepProgress run={run} liveState={liveState} />
 
       {/* Node outcome summary for terminal runs (incl. escalated) */}
-      {(run.status === 'completed' ||
-        run.status === 'failed' ||
-        run.status === 'escalated') &&
+      {(run.status === 'completed' || run.status === 'failed' || run.status === 'escalated') &&
         isValidNodeCounts(run.metadata?.node_counts) && (
           <div className="flex items-center gap-2">
             <NodeCountsSummary counts={run.metadata.node_counts} />
