@@ -1,7 +1,7 @@
 name: bdc-feature-development-fusion-cx-qwen
 description: |
   Fusion cheap lane (Claude-free build path). Plan on Qwen via OpenRouter; implement
-  + repair on Grok 4.5 via OpenRouter (x-ai/grok-4.5) -- substituted for Codex when
+  + repair on provider:grok (OpenRouter + local tool loop) when
   Codex/Claude seats are exhausted (John 2026-07-09). Diff review stays DeepSeek
   (cross-model, not self-grading). Root provider is OpenRouter so bare tails never
   fall through to Anthropic SDK.
@@ -293,7 +293,7 @@ nodes:
           SAFE_STATE=<nothing committed/pushed; plan stage only>
 
   - id: implement
-    provider: opr
+    provider: grok
     model: x-ai/grok-4.5
     persona: major-build-opr
     depends_on: [plan-review]
@@ -816,7 +816,7 @@ nodes:
       printf '{"verdict":"%s"}\n' "$verdict"
 
   - id: diff-repair
-    provider: opr
+    provider: grok
     model: x-ai/grok-4.5
     persona: major-build-opr
     depends_on: [diff-review, classify-diff-review]
@@ -1044,7 +1044,7 @@ nodes:
   # bothering a human (autonomy ladder step 2). Read-only-ish: it may edit in-scope files to
   # resolve the block, then signals. If it can't fix, the run proceeds to the human pause.
   - id: opus-repair
-    provider: opr
+    provider: grok
     model: x-ai/grok-4.5
     persona: major-build-opr
     depends_on: [block-classify]
