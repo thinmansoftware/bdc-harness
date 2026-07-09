@@ -9,7 +9,7 @@ description: |
     plan-review (attack seat)    = DeepSeek deepseek-chat-v3.1
     implement + repairs (builder)= Qwen qwen/qwen3-coder (proven 2026-07-07)
     diff reviews (attack seats)  = DeepSeek deepseek-chat-v3.1
-    war-council-validator (judge)= Codex with OpenRouter failback
+    war-council-validator (judge)= DeepSeek via opr-zero (true dual-cap; no Claude, no Codex)
   No model ever grades its own output; NO node consumes the expensive review seat. All
   persona-bearing prompt nodes use model-free -opr/-codex persona variants
   (persona model wins over node model; an incompatible alias on a no-paid-seat
@@ -21,7 +21,7 @@ policyFile: harness/policies/agent-behavior.md
 # zero lane: opr-zero = the generic OpenRouter client with no paid-seat failback.
 # provider: opr-zero is REQUIRED here so unpinned nodes do not inherit the default
 # provider while holding an OpenRouter model ID.
-# war-council-validator is pinned to codex-opr on the node.
+# war-council-validator: DeepSeek on opr-zero (dual-cap 2026-07-09).
 provider: opr-zero
 model: qwen/qwen3-coder
 
@@ -696,11 +696,10 @@ nodes:
       exit 0
 
   - id: war-council-validator
-    # ZERO-paid-seat lane: judge seat on Codex (OpenAI billing), not paid-seat.
-    # Deliberate relaxation of the always-paid-seat-judge doctrine for THIS lane
-    # only (John 2026-07-03). Codex is the strongest non-paid-seat judge seat.
-    provider: codex-opr
+    # Dual-cap (2026-07-09): DeepSeek judge via opr-zero -- no Claude, no Codex.
+    provider: opr-zero
     persona: captain-ci-validator-codex
+    model: deepseek/deepseek-chat-v3.1
     depends_on: [ascii-gate]
     task_class: medium_work
     prompt: |

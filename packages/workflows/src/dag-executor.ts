@@ -77,6 +77,7 @@ import {
   substituteInputRefs,
   buildPromptWithContext,
   detectCompletionSignal,
+  detectPlanReviewApproval,
   stripCompletionTags,
   isInlineScript,
   formatSubprocessFailure,
@@ -122,10 +123,9 @@ const MCP_FAILURE_PREFIX = 'MCP server connection failed: ';
 const CODEX_FAILBACK_PREFIX = '[CODEX FAILBACK]';
 const WARNING_PREFIX = '[WARNING]';
 const PLAN_REVIEW_NODE_ID = 'plan-review';
-const PLAN_REVIEW_APPROVED_SIGNAL = 'PLAN_REVIEW_APPROVED';
 
 function containsPlanReviewApproval(output: string): boolean {
-  return detectCompletionSignal(output, PLAN_REVIEW_APPROVED_SIGNAL);
+  return detectPlanReviewApproval(output);
 }
 
 function containsPlanReviewEscalation(output: string): boolean {
@@ -3381,7 +3381,12 @@ async function executeLoopNode(
     // Check LLM completion signal -- the AI decides whether the user approved.
     // For interactive loops, the AI emits the signal when the user explicitly approves
     // (e.g., "approved", "looks good"). The prompt instructs the AI on when to emit it.
-    const signalDetected = detectCompletionSignal(fullOutput, loop.until);
+    // plan-review uses expanded approval detection (F3) so open models that emit
+    // PLAN_REVIEW_PASS=true still complete the loop.
+    const signalDetected =
+      node.id === PLAN_REVIEW_NODE_ID
+        ? containsPlanReviewApproval(fullOutput)
+        : detectCompletionSignal(fullOutput, loop.until);
     if (signalDetected) stickySignalDetected = true;
 
     // Check deterministic bash condition (if configured).

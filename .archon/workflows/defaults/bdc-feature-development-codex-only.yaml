@@ -1,15 +1,15 @@
-name: bdc-feature-development-fusion-cx-qwen
+name: bdc-feature-development-codex-only
 description: |
-  Qwen-implement variant of bdc-feature-development. Identical DAG; implement +
-  diff-repair loops use qwen/qwen3-coder via OpenRouter instead of Claude.
-  Diff review (diff-review, diff-review-final, opus-rereview) runs on DeepSeek
-  via OpenRouter, not Qwen self-grading (John 2026-07-07: DeepSeek's strength
-  is review, not authoring). Open models on build+review+judge for dual-cap weeks (no Claude required).
-  Root provider stays codex for bare bash tails only. Prompt nodes pin opr.
+  ZERO-CLAUDE Codex lane. All prompt seats on Codex (gpt-5.5). Use when Claude
+  usage is exhausted but OpenAI/Codex quota remains. Model-free *-opr / *-codex
+  personas only (F1 invariant). Not dual-cap (still needs Codex).
+
 
 policyFile: harness/policies/agent-behavior.md
-provider: codex  # root provider: bare tail nodes (findings-consolidate, decide-push-target, build-manifest) MUST route gpt-5.5 to Codex, not the Anthropic SDK. Missing this line = dead-at-tail (2026-07-07 runs d469af05/f73fb8b3: builds succeeded, tails died on "model gpt-5.5 may not exist").
-model: gpt-5.5  # root default non-Claude; bare nodes do not fall to Claude
+# Codex build lane: Codex/gpt-5.5 is the build default. war-council-validator is
+# pinned to claude/sonnet on the node. WO-HARNESS-SMART-CAULDRON-LANE-ROSTER-AND-RESILIENCE-01.
+provider: codex
+model: gpt-5.5
 
 nodes:
   # Pre-flight: fail closed if container lacks GITHUB auth (WO-169, 2026-05-16).
@@ -84,6 +84,45 @@ nodes:
       printf 'WO_ID=%s\nSPEC_PATH=bdc-xo:%s\nRUN_START_SHA=%s\n\n' "$WO_ID" "$SPEC_PATH" "$RUN_START_SHA"
       printf '%s\n' "$SPEC_CONTENT"
 
+  - id: claim-issue
+    depends_on: [read-spec]
+    trigger_rule: all_done
+    task_class: clerical
+    bash: |
+      set -euo pipefail
+
+      capture_node_output() {
+        python3 -c 'import shlex, sys; s=sys.stdin.read(); sys.stdout.write((lambda p: p[0] if len(p)==1 else s)(shlex.split(s)) if len(s)>=2 and s[0]=="'"'"'" and s.rstrip("\n").endswith("'"'"'") else s)'
+      }
+
+      READ_SPEC_OUT=$(capture_node_output <<'BDC_NODE_OUTPUT_READ_SPEC'
+      $read-spec.output
+      BDC_NODE_OUTPUT_READ_SPEC
+      )
+      ISSUE_REPO="${ISSUE_REPO:-bluedevilcollectibles/bdc-xo}"
+      ISSUE_NUM=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'issue=[0-9]+' | head -1 | cut -d= -f2 || true)
+      if [ -z "$ISSUE_NUM" ]; then
+        ISSUE_NUM=$(printf '%s\n' "$READ_SPEC_OUT" | sed -n 's/^SPEC_PATH=.*issues\/\([0-9][0-9]*\).*/\1/p' | head -1)
+      fi
+      if [ -z "$ISSUE_NUM" ]; then
+        WO_ID_FROM_SPEC=$(printf '%s\n' "$READ_SPEC_OUT" | sed -n 's/^WO_ID=//p' | head -1)
+        if [ -n "$WO_ID_FROM_SPEC" ]; then
+          ISSUE_NUM=$(gh issue list --repo "$ISSUE_REPO" --search "$WO_ID_FROM_SPEC in:title" --json number --jq '.[0].number // empty' 2>/dev/null || true)
+        fi
+      fi
+      if [ -z "$ISSUE_NUM" ]; then
+        echo "claim-issue: no GitHub issue resolved; skipping status:building label."
+        exit 0
+      fi
+
+      gh label create status:building --repo "$ISSUE_REPO" --color FBCA04 --description "BDC workflow is actively building" 2>/dev/null || true
+      gh label create status:review --repo "$ISSUE_REPO" --color 0E8A16 --description "BDC workflow is ready for review" 2>/dev/null || true
+      gh label create status:blocked --repo "$ISSUE_REPO" --color B60205 --description "BDC workflow is blocked before commit" 2>/dev/null || true
+      gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --remove-label status:review 2>/dev/null || true
+      gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --remove-label status:blocked 2>/dev/null || true
+      gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --add-label status:building
+      echo "claim-issue: $ISSUE_REPO#$ISSUE_NUM -> status:building"
+
   # check-already-satisfied (Fix B, 2026-05-30 -- idempotency short-circuit).
   # Cheap read-only check BEFORE plan/implement: are the WO's deliverables ALREADY
   # present in THIS worktree's HEAD? If clearly yes, route to the ALREADY_SATISFIED
@@ -92,9 +131,9 @@ nodes:
   # the normal build path -- assert-implement-produced-work (Fix A) is the real safety
   # net, this is only an optimization that must never wrongly skip real work.
   - id: check-already-satisfied
-    provider: opr
-    model: qwen/qwen3-coder
     persona: war-council-architect-opr
+    agent: war-council-architect
+    provider: codex
     depends_on: [read-spec]
     task_class: clerical
     prompt: |
@@ -147,20 +186,14 @@ nodes:
       exit 0
 
   - id: plan
-    provider: opr
-    model: qwen/qwen3-coder
-    # WO-HARNESS-NODE-PROVIDER-FAILOVER-01: this builder-side planning node rides
-    # OpenRouter (qwen). If OpenRouter throttles/drops (429/timeout/5xx/connection),
-    # fall SIDEWAYS to Codex once rather than killing the run. The war-council-
-    # architect-opr persona is model-less, so a codex failover carries no Anthropic
-    # model pin (no InfrastructureClassBlock). NOTE: implement/diff-repair already
-    # run on codex (no failover needed); judge/validator seats (plan-review,
-    # diff-review*, war-council-validator) are intentionally NOT wired -- a gate
-    # that silently switches models undermines gate integrity (spec doctrine).
-    failover_provider: codex
-    failover_model: gpt-5.5
     persona: war-council-architect-opr
+    # Provider pin: persona war-council-architect declares model: sonnet; the lane
+    # default (provider: codex) must never receive an Anthropic alias. Mirror of #313
+    # which pinned the tail nodes but missed plan/plan-review. Anchor: runs 723842fe,
+    # 10f6add0, 28e98197 (2026-07-01) all died at plan with the persona fault.
+    provider: codex
     depends_on: [gate-already-satisfied]
+    agent: war-council-architect
     task_class: medium_work
     prompt: |
       Read the BDC Work Order spec below and produce a concise implementation plan.
@@ -203,9 +236,13 @@ nodes:
   # plan that `implement` consumes. NOT a human gate -- humans are reached only via the
   # async escalation payload, and only at the irreversible-action boundary downstream.
   - id: plan-review
-    provider: opr
-    model: qwen/qwen3-coder
     persona: war-council-architect-opr
+    # Provider pin: persona war-council-architect declares model: sonnet; the lane
+    # default (provider: codex) must never receive an Anthropic alias. Mirror of #313
+    # which pinned the tail nodes but missed plan/plan-review. Anchor: runs 723842fe,
+    # 10f6add0, 28e98197 (2026-07-01) all died at plan with the persona fault.
+    provider: codex
+    agent: war-council-architect
     depends_on: [plan]
     task_class: medium_work
     loop:
@@ -669,9 +706,12 @@ nodes:
       exit 0
 
   - id: war-council-validator
-    # Dual-cap (2026-07-09 F1): OpenRouter DeepSeek judge -- no Claude, no Codex quota.
-    provider: opr
-    model: deepseek/deepseek-chat-v3.1
+    # FABLE TEST SEAT (John 2026-07-02: "add fable in to one for testing for now").
+    # Trusted judge upgraded sonnet -> claude-fable-5 on this lane. Persona VARIANT
+    # required because persona model WINS over node model on provider claude
+    # (persona pin law, wiki doctrine/archon-yaml-authoring 2026-07-02).
+    # Superseded by the apex-rung WO (bdc-xo issue #575) when it lands.
+    provider: codex
     persona: captain-ci-validator-codex
     depends_on: [ascii-gate]
     task_class: medium_work
@@ -741,13 +781,13 @@ nodes:
       echo "DIFF_BYTES=$(wc -c < "$OUT" 2>/dev/null || echo 0)"
 
   - id: diff-review
-    provider: opr
-    model: deepseek/deepseek-chat-v3.1  # cross-model adversarial review, not self-grading (John 2026-07-07: DeepSeek's strong suit is review, not authoring code; never mark its own qwen-authored homework)
-    agent: opr-adversarial-reviewer
+    persona: codex-adversarial-reviewer
+    provider: codex
+    agent: claude-adversarial-reviewer
     depends_on: [capture-diff]
     task_class: medium_work
     prompt: |
-      You are the Codex adversarial diff reviewer. Cross-model review of the diff that
+      You are the Claude adversarial diff reviewer. Cross-model review of the diff that
       major-build just produced, BEFORE it is committed. You are READ-ONLY: you inspect
       and report. You do NOT edit, write, or run commands that mutate state.
 
@@ -924,14 +964,14 @@ nodes:
       echo "DIFF_FINAL_BYTES=$(wc -c < "$OUT" 2>/dev/null || echo 0)"
 
   - id: diff-review-final
-    provider: opr
-    model: deepseek/deepseek-chat-v3.1  # cross-model adversarial review, not self-grading -- see diff-review
-    agent: opr-adversarial-reviewer
+    persona: codex-adversarial-reviewer
+    provider: codex
+    agent: claude-adversarial-reviewer
     depends_on: [capture-diff-final]
     trigger_rule: all_done
     task_class: medium_work
     prompt: |
-      You are the Codex adversarial reviewer doing the FINAL re-review after repair.
+      You are the Claude adversarial reviewer doing the FINAL re-review after repair.
       Read-only. This node decides whether any semantic finding remains before commit --
       the mechanical repair gate did NOT prove your earlier objections were fixed.
 
@@ -1071,16 +1111,16 @@ nodes:
         printf '{"fixed":"false"}\n'
       fi
 
-  # opus-rereview: autonomous Codex adversarial re-review of the opus-repair diff.
+  # opus-rereview: autonomous Claude adversarial re-review of the opus-repair diff.
   # Only runs when classify-opus-repair reports fixed=true. Mirrors apply-diff-review-final.
   # (WO-HARNESS-OPUS-REPAIR-AUTONOMOUS-REREVIEW-01) -- this is the AUTONOMOUS rung of the
   # autonomy ladder: a passing re-review here lets block-reclassify emit PROCEED so the
   # repaired build can land as a normal feature-branch PR instead of dead-ending at a
   # terminal-BLOCKED on a non-interactive run.
   - id: opus-rereview
-    provider: opr
-    model: deepseek/deepseek-chat-v3.1  # cross-model adversarial review, not self-grading -- see diff-review
-    agent: opr-adversarial-reviewer
+    persona: codex-adversarial-reviewer
+    provider: codex
+    agent: claude-adversarial-reviewer
     depends_on: [classify-opus-repair]
     trigger_rule: all_done
     when: "$classify-opus-repair.output.fixed == 'true'"
@@ -1214,8 +1254,7 @@ nodes:
   # emit sentinels. Only an AI pass normalizes all of them into the per-row JSON ledger.
   - id: findings-consolidate
     persona: xo-opr
-    provider: opr
-    model: deepseek/deepseek-chat-v3.1
+    provider: codex
     depends_on: [block-reclassify]
     trigger_rule: all_done
     task_class: clerical
@@ -1305,7 +1344,9 @@ nodes:
   # schema migration the self-repair loop deferred -- but ONLY for the authorized_fix_ids.
   # trigger_rule all_done so an APPROVE-AS-IS run (which skips this) does not hang the DAG.
   - id: apply-suggested-fix
+    persona: major-build-opr
     agent: overseer-opus
+    provider: codex
     effort: xhigh
     context: fresh
     depends_on: [pause-gate]
@@ -1340,8 +1381,8 @@ nodes:
   # apply-diff-review-final: re-review the fix(es) apply-suggested-fix wrote, BEFORE any commit.
   # Distinct id (diff-review-final already ran upstream). Only meaningful on the APPROVE-WITH-FIX path.
   - id: apply-diff-review-final
-    provider: claude
-    model: sonnet
+    persona: codex-adversarial-reviewer
+    provider: codex
     agent: claude-adversarial-reviewer
     depends_on: [apply-suggested-fix]
     trigger_rule: all_done
@@ -1386,8 +1427,7 @@ nodes:
 
   - id: decide-push-target
     persona: major-build-opr
-    provider: opr
-    model: qwen/qwen3-coder
+    provider: codex
     depends_on: [pause-gate, classify-apply-review]
     trigger_rule: all_done
     when: "$pause-gate.output.decision_verb != 'approve_with_fix' || $classify-apply-review.output.verdict == 'satisfied'"
@@ -1825,8 +1865,7 @@ nodes:
 
   - id: build-manifest
     persona: major-build-opr
-    provider: opr
-    model: qwen/qwen3-coder
+    provider: codex
     depends_on: [open-pr-if-needed, block-reclassify, pause-gate]
     trigger_rule: all_done
     task_class: clerical
@@ -1887,7 +1926,7 @@ nodes:
         Tests: <N passing / N total> or N/A (<reason>)
         PRs: <PR URL> or N/A (ALREADY_SATISFIED or BLOCKED)
         Merge ancestors: <merge-base SHA>...<HEAD SHA> (behind_by=<N>) or N/A
-        Grep assertions: <command> => <N> lines; or N/A (manifest auto-generated; see Tests)
+        Grep assertions: one line; value is a ';'-separated list of sub-assertions, each EXACTLY "<command> => <count>" with a bare integer count -- NO prose after the count, and NO assertion about pre-change state (never write "=> 0" for a path this diff creates -- it is false by construction once the file exists); or "N/A (<reason>)". Each <command> MUST be a single read-only inspection built only from grep/egrep/fgrep/rg/wc/find/cat/head/tail/sort/uniq/test, optionally piped ('|') to one of those; it MUST NOT contain a literal ';' or any shell chaining/redirection/substitution metacharacter (';' '&' '`' '$(' '>' '<') -- verify-manifest-assertions splits the value on ';' and DROPS (unexecuted) any command not on that read-only allowlist. verify-manifest-assertions executes each surviving sub-assertion and rewrites wrong counts, so emit your best honest count.
         Runtime verification: <evidence> or N/A (<reason>)
         VALIDATION: PASS   <- only when all in-run reviews passed
       NOTE: derive Files created/modified from the git diff -- do NOT list preserved/unchanged
@@ -1902,10 +1941,185 @@ nodes:
       If any in-run review was skipped or ended needs_revision, VALIDATION cannot be PASS.
 
 
+  - id: verify-manifest-assertions
+    persona: major-build
+    load_bearing: true
+    depends_on: [build-manifest]
+    trigger_rule: all_done
+    task_class: clerical
+    # WO-HARNESS-BUILD-MANIFEST-ASSERTION-EXECUTE-01: build-manifest COMPOSES grep
+    # assertions but never runs them, in a prose format the CI validator rejects.
+    # This deterministic node EXECUTES every emitted assertion in the run worktree
+    # and rewrites the manifest so only proven, bare "<command> => <count>" claims
+    # reach patch-pr-body -> the PR body -> bdc-ci validate-pr-manifest.sh.
+    bash: |
+      set -uo pipefail
+
+      capture_node_output() {
+        python3 -c 'import shlex, sys; s=sys.stdin.read(); sys.stdout.write((lambda p: p[0] if len(p)==1 else s)(shlex.split(s)) if len(s)>=2 and s[0]=="'"'"'" and s.rstrip("\n").endswith("'"'"'") else s)'
+      }
+
+      # ---- BEGIN vma core (byte-identical across lanes; extracted by unit test) ----
+      # allow_cmd <command>
+      #   Fail-closed allowlist gate for the assertion command executed via the
+      #   bash -c below. build-manifest COMPOSES these commands, so they are
+      #   AI-authored, UNTRUSTED input executed inside the run worktree (WO
+      #   Section 7 item 2 -- accepted, now guarded). A command is allowed ONLY
+      #   when every pipe ('|') segment starts with a read-only inspection tool
+      #   (grep/egrep/fgrep/rg/wc/find/cat/head/tail/sort/uniq/test). Any shell
+      #   chaining/redirection/substitution metacharacter (';' '&' '`' '$(' '>'
+      #   '<' newline) or a mutating find primary (-delete/-exec/-ok/-fprint*/
+      #   -fls) drops the assertion UNEXECUTED. This is also the fail-closed
+      #   backstop for a command that legitimately contained a ';': it is
+      #   fragmented by the ';'-split below and each fragment fails this gate
+      #   rather than executing.
+      allow_cmd() {
+        local c="$1" seg first
+        case "$c" in
+          *';'*|*'&'*|*'`'*|*'$('*|*'>'*|*'<'*|*$'\n'*) return 1 ;;
+          *' -delete'*|*' -exec'*|*' -ok'*|*' -fprint'*|*' -fls'*) return 1 ;;
+        esac
+        local IFS='|'
+        local -a segs
+        read -ra segs <<<"$c"
+        for seg in "${segs[@]}"; do
+          seg="$(printf '%s' "$seg" | sed 's/^[[:space:]]*//')"
+          first="${seg%%[[:space:]]*}"
+          case "$first" in
+            grep|egrep|fgrep|rg|wc|find|cat|head|tail|sort|uniq|test) ;;
+            *) return 1 ;;
+          esac
+        done
+        return 0
+      }
+      # vma_process_assertions <grep-value> <files-created-csv>
+      #   Splits the Grep-assertions value on ';', executes each "<command> => <count>"
+      #   sub-assertion in the CWD, and applies the Mode Behavior Matrix:
+      #     - executes, count matches   -> kept unchanged
+      #     - executes, count differs   -> count rewritten to ACTUAL (logged)
+      #     - prose after the count     -> stripped to bare "<command> => <count>"
+      #     - command errors / no count -> dropped (logged)
+      #     - "=> 0" of a path this diff CREATES -> dropped (logged; false by construction)
+      #   Bare "N/A (...)" sub-assertions pass through. Emits the corrected value on
+      #   stdout, diagnostics on stderr. If nothing survives, emits a single "N/A (...)".
+      vma_process_assertions() {
+        local val="$1" files_created="$2"
+        local out="" sub cmd rest expected actual raw rawtrim rc f base forbidden trimmed
+        local -a subs created
+        # A pure "N/A (...)" value is the whole-list alternative to a set of
+        # assertions -- pass it through intact (its reason text may contain ';',
+        # so it must NOT be split into sub-assertions).
+        trimmed="$(printf '%s' "$val" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+        if printf '%s' "$trimmed" | grep -qiE '^N/A'; then
+          printf '%s' "$trimmed"
+          return 0
+        fi
+        IFS=';' read -ra subs <<<"$val"
+        for sub in "${subs[@]}"; do
+          sub="$(printf '%s' "$sub" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+          [ -z "$sub" ] && continue
+          if printf '%s' "$sub" | grep -qiE '^N/A'; then
+            out="${out:+$out; }$sub"
+            continue
+          fi
+          if ! printf '%s' "$sub" | grep -Fq '=>'; then
+            echo "verify-manifest-assertions: DROP (no '=>' delimiter): $sub" >&2
+            continue
+          fi
+          cmd="${sub%%=>*}"
+          rest="${sub#*=>}"
+          cmd="$(printf '%s' "$cmd" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+          rest="$(printf '%s' "$rest" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+          expected="$(printf '%s' "$rest" | grep -oE '[0-9]+' | head -1 || true)"
+          if [ -z "$cmd" ] || [ -z "$expected" ]; then
+            echo "verify-manifest-assertions: DROP (unparseable command or count): $sub" >&2
+            continue
+          fi
+          forbidden=0
+          if [ "$expected" = "0" ] && [ -n "$files_created" ] && [ "$files_created" != "none" ]; then
+            IFS=',' read -ra created <<<"$files_created"
+            for f in "${created[@]}"; do
+              f="$(printf '%s' "$f" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//; s/ (deleted)$//')"
+              [ -z "$f" ] && continue
+              base="$(basename "$f")"
+              # Match on WORD/PATH boundaries (-w), not bare substring: a created
+              # file 'index.ts' must NOT forbid an assertion about 'index.tsx'
+              # (its basename is a literal substring of the longer name).
+              if printf '%s' "$cmd" | grep -Fwq "$f" || printf '%s' "$cmd" | grep -Fwq "$base"; then
+                forbidden=1
+                break
+              fi
+            done
+          fi
+          if [ "$forbidden" = "1" ]; then
+            echo "verify-manifest-assertions: DROP (FORBIDDEN pre-create absence; asserts \"=> 0\" of a path this diff creates): $sub" >&2
+            continue
+          fi
+          if ! allow_cmd "$cmd"; then
+            echo "verify-manifest-assertions: DROP (command not on read-only allowlist; not executed): $sub" >&2
+            continue
+          fi
+          raw="$(bash -c "$cmd" 2>/dev/null)"; rc=$?
+          rawtrim="$(printf '%s' "$raw" | tr -d '[:space:]')"
+          if printf '%s' "$rawtrim" | grep -qE '^[0-9]+$'; then
+            # Command printed a single integer (the "| wc -l" / "grep -c" form).
+            actual="$rawtrim"
+          elif [ -z "$rawtrim" ]; then
+            # No output: a clean no-match (grep rc<=1) is a real 0; a harder
+            # failure (bad path/regex, command-not-found -> rc>=2) is an error.
+            if [ "$rc" -le 1 ]; then
+              actual="0"
+            else
+              echo "verify-manifest-assertions: DROP (command errored, rc=$rc): $sub" >&2
+              continue
+            fi
+          else
+            # Multi-line / non-numeric output (grep -rn matches, grep -rln paths):
+            # the count is the number of non-empty output lines.
+            actual="$(printf '%s\n' "$raw" | grep -c . || true)"
+          fi
+          if [ "$actual" != "$expected" ]; then
+            echo "verify-manifest-assertions: CORRECT ($expected -> $actual): $cmd" >&2
+          fi
+          out="${out:+$out; }$cmd => $actual"
+        done
+        if [ -z "$out" ]; then
+          out="N/A (all emitted grep assertions dropped during execution; see verify-manifest-assertions log)"
+        fi
+        printf '%s' "$out"
+      }
+
+      # vma_process <files-created-csv>   (reads full manifest on stdin -> stdout)
+      #   Passes a short manifest with no "Grep assertions:" line through untouched
+      #   (the ALREADY_SATISFIED / BLOCKED branches). Otherwise rewrites only that
+      #   one line with the corrected value; every other line is preserved verbatim.
+      vma_process() {
+        local files_created="$1" manifest grep_val corrected
+        manifest="$(cat)"
+        if ! printf '%s\n' "$manifest" | grep -qE '^Grep assertions:'; then
+          printf '%s\n' "$manifest"
+          return 0
+        fi
+        grep_val="$(printf '%s\n' "$manifest" | grep -E '^Grep assertions:' | head -1 | sed 's/^Grep assertions:[[:space:]]*//')"
+        corrected="$(vma_process_assertions "$grep_val" "$files_created")"
+        printf '%s\n' "$manifest" | REPL="Grep assertions: ${corrected}" awk '
+          !seen && /^Grep assertions:/ { print ENVIRON["REPL"]; seen=1; next }
+          { print }
+        '
+      }
+      # ---- END vma core ----
+
+      MANIFEST_OUT="$(capture_node_output <<'BDC_NODE_OUTPUT_MANIFEST'
+      $build-manifest.output
+      BDC_NODE_OUTPUT_MANIFEST
+      )"
+      FILES_CREATED="$(printf '%s\n' "$MANIFEST_OUT" | grep -E '^Files created:' | head -1 | sed 's/^Files created:[[:space:]]*//' || true)"
+      printf '%s\n' "$MANIFEST_OUT" | vma_process "$FILES_CREATED"
+
   - id: manifest-consistency-check
     persona: major-build
     load_bearing: true
-    depends_on: [build-manifest, open-pr-if-needed, block-reclassify]
+    depends_on: [build-manifest, verify-manifest-assertions, open-pr-if-needed, block-reclassify]
     trigger_rule: all_done
     task_class: clerical
     bash: |
@@ -1931,7 +2145,7 @@ nodes:
       fi
 
       MANIFEST_OUT=$(capture_node_output <<'BDC_NODE_OUTPUT_MANIFEST'
-      $build-manifest.output
+      $verify-manifest-assertions.output
       BDC_NODE_OUTPUT_MANIFEST
       )
       extract() {
@@ -1964,7 +2178,7 @@ nodes:
   # written to the PR body or Notion under trigger_rule: all_done.
   - id: patch-pr-body
     persona: major-build
-    depends_on: [build-manifest, manifest-consistency-check]
+    depends_on: [build-manifest, verify-manifest-assertions, manifest-consistency-check]
     when: "$manifest-consistency-check.output == 'OK'"
     trigger_rule: all_done
     task_class: clerical
@@ -2084,7 +2298,7 @@ nodes:
 
       # -- Extract structured fields from build-manifest AI output.
       MANIFEST_OUT=$(capture_node_output <<'BDC_NODE_OUTPUT_MANIFEST'
-      $build-manifest.output
+      $verify-manifest-assertions.output
       BDC_NODE_OUTPUT_MANIFEST
       )
       extract() {
@@ -2128,6 +2342,25 @@ nodes:
         VALIDATION_LINE="VALIDATION: NOT_EMITTED -- build-manifest did not include a VALIDATION line; Captain CI must reject"
       fi
 
+      # -- Resolve the source GitHub issue and append a closing keyword to the PR
+      #    body. This is deliberately added only to the PR body (not issue status),
+      #    so GitHub closes the issue on merge rather than during the build.
+      READ_SPEC_OUT=$(capture_node_output <<'BDC_NODE_OUTPUT_READ_SPEC_FOR_ISSUE'
+      $read-spec.output
+      BDC_NODE_OUTPUT_READ_SPEC_FOR_ISSUE
+      )
+      ISSUE_REPO="${ISSUE_REPO:-bluedevilcollectibles/bdc-xo}"
+      ISSUE_NUM=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'issue=[0-9]+' | head -1 | cut -d= -f2 || true)
+      if [ -z "$ISSUE_NUM" ]; then
+        ISSUE_NUM=$(printf '%s\n' "$READ_SPEC_OUT" | sed -n 's/^SPEC_PATH=.*issues\/\([0-9][0-9]*\).*/\1/p' | head -1)
+      fi
+      if [ -z "$ISSUE_NUM" ]; then
+        WO_ID_FROM_SPEC=$(printf '%s\n' "$READ_SPEC_OUT" | sed -n 's/^WO_ID=//p' | head -1)
+        if [ -n "$WO_ID_FROM_SPEC" ]; then
+          ISSUE_NUM=$(gh issue list --repo "$ISSUE_REPO" --search "$WO_ID_FROM_SPEC in:title" --json number --jq '.[0].number // empty' 2>/dev/null || true)
+        fi
+      fi
+
       # -- Assemble v2 manifest block. Use printf (not heredoc) so the bash
       #    source stays indented inside the YAML block scalar.
       MANIFEST_BLOCK=$(printf '%s\n' \
@@ -2148,10 +2381,18 @@ nodes:
       #    from a stub body OR a previously-patched body and yields a single block.
       CURRENT_BODY=$(gh pr view "$PR_URL" --repo "$REPO" --json body --jq '.body' 2>/dev/null || echo "")
       PROSE=$(printf '%s\n' "$CURRENT_BODY" | awk '/^<!-- bdc-manifest-start -->$/{exit} {print}')
+      CLOSING_LINE=""
+      if [ -n "$ISSUE_NUM" ] && ! printf '%s\n' "$PROSE" | grep -qiE "^(Fixes|Closes|Resolves)[[:space:]]+#${ISSUE_NUM}([[:space:]]|$|[.,;])"; then
+        CLOSING_LINE="Closes #${ISSUE_NUM}"
+      fi
 
       BODY_FILE=$(mktemp)
       {
         printf '%s\n' "$PROSE"
+        if [ -n "$CLOSING_LINE" ]; then
+          echo ""
+          printf '%s\n' "$CLOSING_LINE"
+        fi
         echo ""
         echo "<!-- bdc-manifest-start -->"
         printf '%s\n' "$MANIFEST_BLOCK"
@@ -2163,10 +2404,8 @@ nodes:
       echo "patch-pr-body: PR body updated with v2 manifest."
       echo "PR_URL=$PR_URL"
 
-  - id: flip-notion
-    persona: xo
-    depends_on: [build-manifest, manifest-consistency-check]
-    when: "$manifest-consistency-check.output == 'OK'"
+  - id: review-issue
+    depends_on: [build-manifest, patch-pr-body]
     trigger_rule: all_done
     task_class: clerical
     bash: |
@@ -2181,11 +2420,10 @@ nodes:
       BDC_NODE_OUTPUT_BLOCK_RECLASSIFY
       )
       STATUS=$(printf '%s\n' "$RECLASSIFY" | sed -n 's/.*"status":"\([A-Z_]*\)".*/\1/p' | head -1)
-
-      MANIFEST=$(capture_node_output <<'BDC_NODE_OUTPUT_MANIFEST'
-      $build-manifest.output
-      BDC_NODE_OUTPUT_MANIFEST
-      )
+      if [ "$STATUS" != "PROCEED" ] && [ "$STATUS" != "ALREADY_SATISFIED" ]; then
+        echo "review-issue: status=$STATUS -- not marking issue status:review."
+        exit 0
+      fi
 
       READ_SPEC_OUT=$(capture_node_output <<'BDC_NODE_OUTPUT_READ_SPEC'
       $read-spec.output
@@ -2203,23 +2441,7 @@ nodes:
         fi
       fi
       if [ -z "$ISSUE_NUM" ]; then
-        echo "flip-notion: no GitHub issue resolved; skipping status label + manifest comment."
-        exit 0
-      fi
-
-      if [ "$STATUS" = "BLOCKED" ]; then
-        gh label create status:blocked --repo "$ISSUE_REPO" --color B60205 --description "BDC workflow is blocked before commit" 2>/dev/null || true
-        gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --remove-label status:building 2>/dev/null || true
-        gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --remove-label status:review 2>/dev/null || true
-        gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --add-label status:blocked
-        COMMENT_FILE=$(mktemp)
-        {
-          echo "PAUSED for human correction. block-reclassify status: $STATUS"
-          echo
-          printf '%s\n' "$MANIFEST"
-        } > "$COMMENT_FILE"
-        gh issue comment "$ISSUE_NUM" --repo "$ISSUE_REPO" --body-file "$COMMENT_FILE"
-        echo "flip-notion: $ISSUE_REPO#$ISSUE_NUM -> status:blocked (not flipping to review)"
+        echo "review-issue: no GitHub issue resolved; skipping status:review label."
         exit 0
       fi
 
@@ -2227,19 +2449,10 @@ nodes:
       gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --remove-label status:building 2>/dev/null || true
       gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --remove-label status:blocked 2>/dev/null || true
       gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --add-label status:review
-      COMMENT_FILE=$(mktemp)
-      {
-        if [ "$STATUS" = "ALREADY_SATISFIED" ]; then
-          echo "WO already implemented in this worktree (verified no-op). No new PR."
-          echo
-        fi
-        printf '%s\n' "$MANIFEST"
-      } > "$COMMENT_FILE"
-      gh issue comment "$ISSUE_NUM" --repo "$ISSUE_REPO" --body-file "$COMMENT_FILE"
-      echo "flip-notion: $ISSUE_REPO#$ISSUE_NUM -> status:review"
-  - id: flip-notion-on-failure
-    persona: xo
-    depends_on: [war-council-validator, flip-notion]
+      echo "review-issue: $ISSUE_REPO#$ISSUE_NUM -> status:review"
+
+  - id: blocked-issue
+    depends_on: [block-reclassify]
     trigger_rule: all_done
     task_class: clerical
     bash: |
@@ -2249,21 +2462,13 @@ nodes:
         python3 -c 'import shlex, sys; s=sys.stdin.read(); sys.stdout.write((lambda p: p[0] if len(p)==1 else s)(shlex.split(s)) if len(s)>=2 and s[0]=="'"'"'" and s.rstrip("\n").endswith("'"'"'") else s)'
       }
 
-      FLIP_OUT=$(capture_node_output <<'BDC_NODE_OUTPUT_FLIP'
-      $flip-notion.output
-      BDC_NODE_OUTPUT_FLIP
+      RECLASSIFY=$(capture_node_output <<'BDC_NODE_OUTPUT_BLOCK_RECLASSIFY'
+      $block-reclassify.output
+      BDC_NODE_OUTPUT_BLOCK_RECLASSIFY
       )
-      if printf '%s\n' "$FLIP_OUT" | grep -qE 'status:review \(manifest posted|status:review$'; then
-        echo "FALLBACK_FLIP_SKIPPED: normal flip-notion already set status:review."
-        exit 0
-      fi
-
-      VALIDATOR_OUT=$(capture_node_output <<'BDC_NODE_OUTPUT_VALIDATOR'
-      $war-council-validator.output
-      BDC_NODE_OUTPUT_VALIDATOR
-      )
-      if ! printf '%s\n' "$VALIDATOR_OUT" | grep -qiE 'Verdict: satisfied|VALIDATION: PASS'; then
-        echo "FALLBACK_FLIP_DECLINED: validator verdict not satisfied; real failure; leaving issue as-is."
+      STATUS=$(printf '%s\n' "$RECLASSIFY" | sed -n 's/.*"status":"\([A-Z_]*\)".*/\1/p' | head -1)
+      if [ "$STATUS" != "BLOCKED" ]; then
+        echo "blocked-issue: status=$STATUS -- not marking issue status:blocked."
         exit 0
       fi
 
@@ -2283,22 +2488,176 @@ nodes:
         fi
       fi
       if [ -z "$ISSUE_NUM" ]; then
-        echo "FALLBACK_FLIP_DEFERRED: no GitHub issue resolved."
+        echo "blocked-issue: no GitHub issue resolved; skipping status:blocked label."
         exit 0
       fi
 
-      gh label create status:review --repo "$ISSUE_REPO" --color 0E8A16 --description "BDC workflow is ready for review" 2>/dev/null || true
+      gh label create status:blocked --repo "$ISSUE_REPO" --color B60205 --description "BDC workflow is blocked before commit" 2>/dev/null || true
       gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --remove-label status:building 2>/dev/null || true
-      gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --remove-label status:blocked 2>/dev/null || true
-      gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --add-label status:review
-      COMMENT_FILE=$(mktemp)
-      {
-        echo "FALLBACK PATH: normal flip-notion tail node failed to run/complete, but"
-        echo "war-council-validator returned satisfied (build good). Push status:"
-        echo "$commit-and-push.output"
-        echo
-        echo "PR status:"
-        echo "$open-pr-if-needed.output"
-      } > "$COMMENT_FILE"
-      gh issue comment "$ISSUE_NUM" --repo "$ISSUE_REPO" --body-file "$COMMENT_FILE"
-      echo "flip-notion-on-failure: $ISSUE_REPO#$ISSUE_NUM -> status:review (fallback path)"
+      gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --remove-label status:review 2>/dev/null || true
+      gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --add-label status:blocked
+      echo "blocked-issue: $ISSUE_REPO#$ISSUE_NUM -> status:blocked"
+
+  # WO-HARNESS-WO-COMPLETION-COUNTER-01: record a WO completion CANDIDATE after the
+  # PR is opened + its body patched. Design (a) from the WO: bounded `gh pr checks`
+  # poll, then hand a per-WO pending JSON file off to the bdc-xo reconciler, which is
+  # the SINGLE writer of metrics/wo-completions.jsonl (the green-only gate + dedupe on
+  # wo_id+pr_url live there, in one code path). This node NEVER appends to the ledger
+  # directly. It is deliberately fail-soft and NOT load_bearing: a counter outage (gh
+  # flake, still-running checks, or a missing cross-repo write credential) must never
+  # block a WO's own PR pipeline, so every failure path WARNs and exits 0.
+  # UNVERIFIED runtime assumption: a bdc-harness run's gh token may lack write access
+  # to the *different* repo bdc-xo. If the contents PUT is denied, the node WARNs and
+  # exits 0 -- it must not be reported as confirmed-working without a live probe.
+  - id: record-wo-completion-candidate
+    persona: major-build
+    depends_on: [patch-pr-body]
+    trigger_rule: all_done
+    task_class: clerical
+    bash: |
+      # No `set -e`: this node is fail-soft (see node comment). `gh pr checks` exits
+      # non-zero for pending/failing checks BY DESIGN, and a counter outage must never
+      # abort the WO pipeline. We keep `-u` (node-output refs are captured via the
+      # quoted-heredoc shim, so they cannot be unbound) and pipefail, branch on exit
+      # codes explicitly, and ALWAYS exit 0.
+      set -uo pipefail
+
+      LANE="bdc-feature-development-codex"
+      LEDGER_REPO="bluedevilcollectibles/bdc-xo"
+      PENDING_DIR="metrics/wo-completions-pending"
+
+      capture_node_output() {
+        python3 -c 'import shlex, sys; s=sys.stdin.read(); sys.stdout.write((lambda p: p[0] if len(p)==1 else s)(shlex.split(s)) if len(s)>=2 and s[0]=="'"'"'" and s.rstrip("\n").endswith("'"'"'") else s)'
+      }
+
+      # -- Guard: only record on a real, proceeding build (a PR was actually opened).
+      #    Any other outcome (ALREADY_SATISFIED / BLOCKED / run died before PR) records
+      #    nothing -- matches the WO Mode Matrix "Run dies before PR opens -> nothing".
+      RECLASSIFY=$(capture_node_output <<'BDC_NODE_OUTPUT_BLOCK_RECLASSIFY'
+      $block-reclassify.output
+      BDC_NODE_OUTPUT_BLOCK_RECLASSIFY
+      )
+      STATUS=$(printf '%s\n' "$RECLASSIFY" | sed -n 's/.*"status":"\([A-Z_]*\)".*/\1/p' | head -1)
+      if [ "$STATUS" != "PROCEED" ]; then
+        echo "record-wo-completion-candidate: status=${STATUS:-<none>} -- no PR to count; nothing recorded."
+        exit 0
+      fi
+
+      # -- Resolve WO_ID (read-spec first, USER_MESSAGE fallback).
+      READ_SPEC_OUT=$(capture_node_output <<'BDC_NODE_OUTPUT_READ_SPEC'
+      $read-spec.output
+      BDC_NODE_OUTPUT_READ_SPEC
+      )
+      WO_ID=$(printf '%s\n' "$READ_SPEC_OUT" | sed -n 's/^WO_ID=//p' | head -1)
+      [ -z "$WO_ID" ] && WO_ID=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'WO-[A-Z0-9-]+' | head -1 || true)
+      if [ -z "$WO_ID" ]; then
+        echo "WARN: record-wo-completion-candidate: could not resolve WO_ID -- nothing recorded (exit 0)." >&2
+        exit 0
+      fi
+
+      # -- Resolve REPO the PR was opened against (Rule 29: never assume worktree origin).
+      DECIDE_OUT=$(capture_node_output <<'BDC_NODE_OUTPUT_DECIDE'
+      $decide-push-target.output
+      BDC_NODE_OUTPUT_DECIDE
+      )
+      REPO=$(printf '%s\n' "$DECIDE_OUT" | sed -n 's/^repo: //p' | head -1)
+      if [ -z "$REPO" ] || [ "$REPO" = "unknown" ]; then
+        echo "WARN: record-wo-completion-candidate: REPO unresolved -- nothing recorded (exit 0)." >&2
+        exit 0
+      fi
+
+      # -- Resolve PR URL from open-pr-if-needed (ground truth per manifest-consistency-check).
+      OPEN_PR_OUT=$(capture_node_output <<'BDC_NODE_OUTPUT_OPEN_PR'
+      $open-pr-if-needed.output
+      BDC_NODE_OUTPUT_OPEN_PR
+      )
+      PR_URL=$(printf '%s\n' "$OPEN_PR_OUT" | grep -E '^PR_URL=' | sed 's/^PR_URL=//' | head -1)
+      if [ -z "$PR_URL" ]; then
+        PR_URL=$(printf '%s\n' "$OPEN_PR_OUT" | grep -E '^https://github\.com/' | head -1)
+      fi
+      if [ -z "$PR_URL" ]; then
+        echo "WARN: record-wo-completion-candidate: no PR_URL resolved -- nothing recorded (exit 0)." >&2
+        exit 0
+      fi
+
+      # -- Run id: derive from ARTIFACTS_DIR basename. Do NOT use $WORKFLOW_ID under
+      #    set -u (Archon-YAML rule: it is not reliably bound inside bash blocks).
+      RUN_ID=$(basename "${ARTIFACTS_DIR:-}" 2>/dev/null || true)
+      [ -z "$RUN_ID" ] && RUN_ID="unknown"
+
+      # -- PR number (for the pending filename + payload). Derive from the
+      #    already-resolved PR_URL trailing path segment (gh emits .../pull/<n>,
+      #    ground truth per manifest-consistency-check) so a flaky `gh pr view`
+      #    cannot collapse the pending filename to ${WO_ID}__0.json. Fall back to
+      #    a gh lookup only when the URL has no numeric tail, and to "0" last.
+      PR_NUMBER="${PR_URL##*/}"
+      case "$PR_NUMBER" in
+        ''|*[!0-9]*)
+          PR_NUMBER=$(gh pr view "$PR_URL" --repo "$REPO" --json number --jq '.number' 2>/dev/null || true)
+          ;;
+      esac
+      [ -z "$PR_NUMBER" ] && PR_NUMBER="0"
+
+      # -- Bounded poll of PR checks: up to 10 attempts x 60s (10 min cap), per WO
+      #    section 2(a). `gh pr checks` exit codes: 0=all green, 8=pending, other=fail.
+      #    Break early on green or definitive failure. The bdc-xo reconciler RE-VERIFIES
+      #    and is the authoritative green-only gate, so a misclassification here is only
+      #    a hint -- it can never append a non-green PR to the ledger.
+      CHECK_STATUS="pending_checks"
+      GREEN_AT=""
+      for attempt in 1 2 3 4 5 6 7 8 9 10; do
+        gh pr checks "$PR_URL" --repo "$REPO" >/dev/null 2>&1
+        RC=$?
+        if [ "$RC" -eq 0 ]; then
+          CHECK_STATUS="green_pending_reconcile"
+          GREEN_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          break
+        elif [ "$RC" -eq 8 ]; then
+          : # still pending -- keep polling
+        else
+          CHECK_STATUS="failed"
+          break
+        fi
+        if [ "$attempt" -lt 10 ]; then
+          sleep 60
+        fi
+      done
+      echo "record-wo-completion-candidate: WO=${WO_ID} PR=${PR_URL} check_status=${CHECK_STATUS}"
+
+      # -- Build the pending JSON. Values are controlled (WO_ID is [A-Z0-9-], REPO is
+      #    owner/repo, URL/ints/timestamps are safe) but we still escape strings.
+      #    counted_at is intentionally NOT set here -- the reconciler stamps it when it
+      #    appends the ledger line (single source of the counted_at truth).
+      esc() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
+      OBSERVED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+      if [ -n "$GREEN_AT" ]; then GREEN_FIELD=$(printf '"%s"' "$GREEN_AT"); else GREEN_FIELD="null"; fi
+      JSON=$(printf '{"wo_id":"%s","repo":"%s","pr_url":"%s","pr_number":%s,"lane":"%s","run_id":"%s","status":"%s","pr_merged_or_green_at":%s,"observed_at":"%s"}' \
+        "$(esc "$WO_ID")" "$(esc "$REPO")" "$(esc "$PR_URL")" "$PR_NUMBER" "$(esc "$LANE")" "$(esc "$RUN_ID")" "$CHECK_STATUS" "$GREEN_FIELD" "$OBSERVED_AT")
+
+      # -- Write the pending file to bdc-xo via the contents API. Race-safe across
+      #    concurrent runs: GET the current sha (if the file exists), PUT with
+      #    retry-on-409 (3 attempts). CROSS-REPO write (bdc-harness run -> bdc-xo); if
+      #    the run's gh token lacks write access it fails -- we WARN and exit 0.
+      PENDING_PATH="${PENDING_DIR}/${WO_ID}__${PR_NUMBER}.json"
+      CONTENT_B64=$(printf '%s' "$JSON" | base64 -w0 2>/dev/null || printf '%s' "$JSON" | base64 | tr -d '\n')
+      COMMIT_MSG="chore(wo-counter): ${CHECK_STATUS} candidate ${WO_ID} PR#${PR_NUMBER}"
+      WROTE=false
+      for attempt in 1 2 3; do
+        SHA=$(gh api "repos/${LEDGER_REPO}/contents/${PENDING_PATH}?ref=main" --jq '.sha' 2>/dev/null || true)
+        if [ -n "$SHA" ]; then
+          gh api -X PUT "repos/${LEDGER_REPO}/contents/${PENDING_PATH}" \
+            -f message="$COMMIT_MSG" -f content="$CONTENT_B64" -f branch=main -f sha="$SHA" >/dev/null 2>&1 && WROTE=true && break
+        else
+          gh api -X PUT "repos/${LEDGER_REPO}/contents/${PENDING_PATH}" \
+            -f message="$COMMIT_MSG" -f content="$CONTENT_B64" -f branch=main >/dev/null 2>&1 && WROTE=true && break
+        fi
+        echo "WARN: record-wo-completion-candidate: contents PUT attempt ${attempt} failed (409/perm/flake); retrying..." >&2
+        sleep $((attempt * 3))
+      done
+
+      if [ "$WROTE" = "true" ]; then
+        echo "record-wo-completion-candidate: wrote ${LEDGER_REPO}:${PENDING_PATH} (status=${CHECK_STATUS})."
+      else
+        echo "WARN: record-wo-completion-candidate: could NOT write pending file to ${LEDGER_REPO} (cross-repo write access unverified/denied, or gh flake). WO=${WO_ID} PR=${PR_URL} status=${CHECK_STATUS}. Counter skipped; pipeline NOT failed." >&2
+      fi
+      exit 0
