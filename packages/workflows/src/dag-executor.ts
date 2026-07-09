@@ -68,7 +68,12 @@ import {
   logWorkflowComplete,
   logWorkflowError,
 } from './logger';
-import { withIdleTimeout, STEP_IDLE_TIMEOUT_MS } from './utils/idle-timeout';
+import {
+  withIdleTimeout,
+  STEP_IDLE_TIMEOUT_MS,
+  resolveLoopIterationIdleTimeoutMs,
+  resolveLoopIterationWallTimeoutMs,
+} from './utils/idle-timeout';
 import {
   classifyError,
   detectCreditExhaustion,
@@ -3010,7 +3015,20 @@ async function executeLoopNode(
     let fullOutput = ''; // raw, for signal detection
     let cleanOutput = ''; // stripped, for platform display
     let iterationIdleTimedOut = false;
+    let iterationWallTimedOut = false;
     const iterationAbortController = new AbortController();
+    // Per-iteration deadlines (WO-HARNESS-LOOP-OUTPUT-NEWLINE-AND-ITERATION-TIMEOUT-01):
+    // idle is shorter than STEP_IDLE (30m); wall is absolute even if keepalives reset idle.
+    const effectiveIdleTimeout = resolveLoopIterationIdleTimeoutMs(node.idle_timeout);
+    const effectiveWallTimeout = resolveLoopIterationWallTimeoutMs();
+    const wallTimer = setTimeout(() => {
+      iterationWallTimedOut = true;
+      getLog().warn(
+        { nodeId: node.id, iteration: i, timeoutMs: effectiveWallTimeout },
+        'loop_node.wall_timeout_reached'
+      );
+      iterationAbortController.abort();
+    }, effectiveWallTimeout);
 
     try {
       // Build prompt -- substituteWorkflowVariables throws if $BASE_BRANCH referenced but empty
@@ -3042,8 +3060,6 @@ async function executeLoopNode(
       const generator = aiClient.sendQuery(finalPrompt, cwd, resumeSessionId, iterationOptions);
       let lastToolStartedAt: { toolName: string; startedAt: number } | null = null;
 
-      const effectiveIdleTimeout = node.idle_timeout ?? STEP_IDLE_TIMEOUT_MS;
-
       for await (const msg of withIdleTimeout(generator, effectiveIdleTimeout, () => {
         iterationIdleTimedOut = true;
         getLog().warn(
@@ -3052,6 +3068,7 @@ async function executeLoopNode(
         );
         iterationAbortController.abort();
       })) {
+        if (iterationWallTimedOut) break;
         if (msg.type === 'assistant') {
           fullOutput += msg.content;
           const cleaned = stripCompletionTags(msg.content, loop.until);
@@ -3217,7 +3234,13 @@ async function executeLoopNode(
       }
     } catch (error) {
       let failureError: unknown = error;
-      if (error instanceof ResourceExhaustedPause) {
+      // Wall timeout aborts the provider stream; surface a clear fail-closed error
+      // instead of a raw AbortError (anchor: 42ee6575 hung ~28m with no deadline).
+      if (iterationWallTimedOut) {
+        failureError = new Error(
+          `Loop '${node.id}' iteration ${String(i)} exceeded wall timeout (${String(effectiveWallTimeout)}ms)`
+        );
+      } else if (error instanceof ResourceExhaustedPause) {
         const key = resourceExhaustedKey(workflowRun.id, node.id, i);
         const now = Date.now();
         const state = resourceExhaustedRetryState.get(key) ?? {
@@ -3307,6 +3330,48 @@ async function executeLoopNode(
         costUsd: loopTotalCostUsd,
         ...(loopTotalTokens ? { tokens: loopTotalTokens } : {}),
       };
+    } finally {
+      clearTimeout(wallTimer);
+    }
+
+    // Wall timeout without a thrown abort: fail closed (do not treat as idle success).
+    if (iterationWallTimedOut) {
+      const wallError = `Loop '${node.id}' iteration ${String(i)} exceeded wall timeout (${String(effectiveWallTimeout)}ms)`;
+      const duration = Date.now() - iterationStart;
+      getLog().error({ nodeId: node.id, iteration: i, timeoutMs: effectiveWallTimeout }, 'loop_node.iteration_wall_timeout');
+      getWorkflowEventEmitter().emit({
+        type: 'loop_iteration_failed',
+        runId: workflowRun.id,
+        nodeId: node.id,
+        iteration: i,
+        error: wallError,
+      });
+      deps.store
+        .createWorkflowEvent({
+          workflow_run_id: workflowRun.id,
+          event_type: 'loop_iteration_failed',
+          step_name: node.id,
+          data: {
+            iteration: i,
+            error: wallError,
+            duration,
+            nodeId: node.id,
+            wallTimedOut: true,
+            wallTimeoutMs: effectiveWallTimeout,
+            ...(loopTotalTokens ? { tokens: loopTotalTokens } : {}),
+          },
+        })
+        .catch((evtErr: Error) => {
+          logEventStoreError(evtErr, i);
+        });
+      await persistLoopNodeFailed(`Loop iteration ${i} failed: ${wallError}`);
+      return {
+        state: 'failed',
+        output: fullOutput,
+        error: `Loop iteration ${i} failed: ${wallError}`,
+        costUsd: loopTotalCostUsd,
+        ...(loopTotalTokens ? { tokens: loopTotalTokens } : {}),
+      };
     }
 
     // Notify on idle timeout
@@ -3314,7 +3379,7 @@ async function executeLoopNode(
       await safeSendMessage(
         platform,
         conversationId,
-        `Loop node '${node.id}' iteration ${String(i)} completed via idle timeout (no output for ${String((node.idle_timeout ?? STEP_IDLE_TIMEOUT_MS) / 60000)} min)`,
+        `Loop node '${node.id}' iteration ${String(i)} completed via idle timeout (no output for ${String(effectiveIdleTimeout / 60000)} min)`,
         msgContext
       );
     }
@@ -3431,6 +3496,18 @@ async function executeLoopNode(
       node.id === PLAN_REVIEW_NODE_ID && containsPlanReviewEscalation(lastIterationOutput);
     const completionDetected =
       !planReviewEscalationDetected && (stickySignalDetected || bashComplete);
+    // Debug hints for mashed/flattened open-model output (WO loop-newline).
+    // Substring presence is intentional -- not the same as signalDetected.
+    const signalHints = {
+      planReviewPassPresent: /PLAN_REVIEW_PASS/i.test(fullOutput),
+      planReviewPassTruePresent: /PLAN_REVIEW_PASS\s*=\s*true/i.test(fullOutput),
+      planReviewApprovedPresent: /PLAN_REVIEW_APPROVED/i.test(fullOutput),
+      signalDetected,
+      planReviewEscalationDetected,
+      idleTimedOut: iterationIdleTimedOut,
+      outputHead: fullOutput.slice(0, 240),
+      outputTail: fullOutput.length > 240 ? fullOutput.slice(-240) : undefined,
+    };
 
     // Emit iteration completed
     getWorkflowEventEmitter().emit({
@@ -3446,7 +3523,13 @@ async function executeLoopNode(
         workflow_run_id: workflowRun.id,
         event_type: 'loop_iteration_completed',
         step_name: node.id,
-        data: { iteration: i, duration, completionDetected, nodeId: node.id },
+        data: {
+          iteration: i,
+          duration,
+          completionDetected,
+          nodeId: node.id,
+          signalHints,
+        },
       })
       .catch((err: Error) => {
         logEventStoreError(err, i);

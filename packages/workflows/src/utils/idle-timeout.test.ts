@@ -1,5 +1,12 @@
-import { describe, test, expect, mock } from 'bun:test';
-import { withIdleTimeout, STEP_IDLE_TIMEOUT_MS } from './idle-timeout';
+import { describe, test, expect, mock, afterEach } from 'bun:test';
+import {
+  withIdleTimeout,
+  STEP_IDLE_TIMEOUT_MS,
+  LOOP_ITERATION_IDLE_TIMEOUT_MS,
+  LOOP_ITERATION_WALL_TIMEOUT_MS,
+  resolveLoopIterationIdleTimeoutMs,
+  resolveLoopIterationWallTimeoutMs,
+} from './idle-timeout';
 
 /** Helper: create an async generator from an array of values with optional delays */
 async function* fromValues<T>(values: T[], delayMs = 0): AsyncGenerator<T> {
@@ -19,6 +26,36 @@ async function* hangAfter<T>(values: T[], _hangForever = true): AsyncGenerator<T
   // Hang indefinitely -- simulates a subprocess that completed work but won't exit
   await new Promise<void>(() => {});
 }
+
+describe('loop iteration timeout defaults', () => {
+  afterEach(() => {
+    delete process.env.ARCHON_LOOP_ITERATION_IDLE_MS;
+    delete process.env.ARCHON_LOOP_ITERATION_WALL_MS;
+  });
+
+  test('exports shorter loop defaults than step idle', () => {
+    expect(STEP_IDLE_TIMEOUT_MS).toBe(30 * 60 * 1000);
+    expect(LOOP_ITERATION_IDLE_TIMEOUT_MS).toBe(3 * 60 * 1000);
+    expect(LOOP_ITERATION_WALL_TIMEOUT_MS).toBe(8 * 60 * 1000);
+    expect(LOOP_ITERATION_IDLE_TIMEOUT_MS).toBeLessThan(STEP_IDLE_TIMEOUT_MS);
+    expect(LOOP_ITERATION_WALL_TIMEOUT_MS).toBeLessThan(STEP_IDLE_TIMEOUT_MS);
+  });
+
+  test('resolveLoopIterationIdleTimeoutMs prefers node override then env then default', () => {
+    expect(resolveLoopIterationIdleTimeoutMs(50_000)).toBe(50_000);
+    process.env.ARCHON_LOOP_ITERATION_IDLE_MS = '90000';
+    expect(resolveLoopIterationIdleTimeoutMs()).toBe(90_000);
+    delete process.env.ARCHON_LOOP_ITERATION_IDLE_MS;
+    expect(resolveLoopIterationIdleTimeoutMs()).toBe(LOOP_ITERATION_IDLE_TIMEOUT_MS);
+  });
+
+  test('resolveLoopIterationWallTimeoutMs reads env', () => {
+    process.env.ARCHON_LOOP_ITERATION_WALL_MS = '120000';
+    expect(resolveLoopIterationWallTimeoutMs()).toBe(120_000);
+    delete process.env.ARCHON_LOOP_ITERATION_WALL_MS;
+    expect(resolveLoopIterationWallTimeoutMs()).toBe(LOOP_ITERATION_WALL_TIMEOUT_MS);
+  });
+});
 
 describe('withIdleTimeout', () => {
   test('exports a default timeout constant', () => {

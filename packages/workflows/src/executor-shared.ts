@@ -564,18 +564,55 @@ export function detectCompletionSignal(output: string, signal: string): boolean 
 }
 
 /**
- * Plan-review approval detection (F3, 2026-07-09).
+ * Normalize loop/open-model plan-review output for signal detection only.
+ * Open models and some stream paths emit multi-field output on one line
+ * (anchor: zero-open canary 3604d5 / re-fire 42ee6575, Fable diagnosis).
+ * Inserts line breaks before PLAN_REVIEW_* keys and === fences so
+ * line-anchored detectors still work. Does NOT mutate stored node output.
+ */
+export function normalizePlanReviewOutputForSignalDetection(output: string): string {
+  return output
+    .replace(/(PLAN_REVIEW_[A-Z_]+)/g, '\n$1')
+    .replace(/(===)/g, '\n$1');
+}
+
+/**
+ * Plan-review approval detection (F3, 2026-07-09; hardened F5 2026-07-09).
  * Canonical: bare PLAN_REVIEW_APPROVED via detectCompletionSignal rules.
- * Also accepts key=value forms open models emit on dual-cap lanes.
+ * Also accepts key=value forms open models emit, including single-line mashed
+ * output (normalize then line-anchored match).
  */
 export function detectPlanReviewApproval(output: string): boolean {
   if (detectCompletionSignal(output, 'PLAN_REVIEW_APPROVED')) {
     return true;
   }
+  // Line-anchored on raw multi-line output
   if (/^[ \t]*PLAN_REVIEW_PASS[ \t]*=[ \t]*true[ \t]*$/im.test(output)) {
     return true;
   }
   if (/^[ \t]*PLAN_REVIEW_APPROVED[ \t]*=[ \t]*true[ \t]*$/im.test(output)) {
+    return true;
+  }
+  // Mashed single-line / flattened loop output: normalize then re-check
+  const normalized = normalizePlanReviewOutputForSignalDetection(output);
+  if (normalized !== output) {
+    if (detectCompletionSignal(normalized, 'PLAN_REVIEW_APPROVED')) {
+      return true;
+    }
+    if (/^[ \t]*PLAN_REVIEW_PASS[ \t]*=[ \t]*true[ \t]*$/im.test(normalized)) {
+      return true;
+    }
+    if (/^[ \t]*PLAN_REVIEW_APPROVED[ \t]*=[ \t]*true[ \t]*$/im.test(normalized)) {
+      return true;
+    }
+  }
+  // Token form without requiring end-of-line: PASS=true followed by next field,
+  // fence, or end (rejects "not PLAN_REVIEW_PASS=true yet").
+  if (
+    /(?:^|[^A-Za-z0-9_])PLAN_REVIEW_PASS[ \t]*=[ \t]*true(?=\s*(?:PLAN_REVIEW_[A-Z_]+\s*=|===|\s*$))/i.test(
+      output
+    )
+  ) {
     return true;
   }
   return false;
