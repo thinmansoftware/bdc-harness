@@ -12,7 +12,7 @@ import {
 import { useWorkflowStore } from '@/stores/workflow-store';
 import { ConfirmRunActionDialog } from '@/components/dashboard/ConfirmRunActionDialog';
 import { StatusIcon } from '@/components/workflows/StatusIcon';
-import { formatDurationMs } from '@/lib/format';
+import { formatDurationMs, workflowRunDetailPath } from '@/lib/format';
 import { isTerminalStatus } from '@/lib/workflow-utils';
 import { deriveLucilleHint } from '@/lib/negan-utils';
 import type { DagNodeState } from '@/lib/types';
@@ -129,7 +129,7 @@ export function WorkflowProgressCard({
 
   const handleViewFullScreen = (): void => {
     if (runId) {
-      navigate(`/workflows/runs/${runId}`);
+      navigate(workflowRunDetailPath(runId));
     } else {
       navigate(`/chat/${encodeURIComponent(workerConversationId)}`);
     }

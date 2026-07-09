@@ -5,6 +5,7 @@
  */
 import type { WorkflowRunStatus } from '@/lib/types';
 import type { components } from '@/lib/api.generated';
+import { workflowRunApiPath } from '@/lib/format';
 
 export type WorkflowDefinition = components['schemas']['WorkflowDefinition'];
 export type DagNode = components['schemas']['DagNode'];
@@ -513,7 +514,8 @@ export async function listPublicWorkflowRuns(limit = 20): Promise<PublicWorkflow
 export async function getWorkflowRun(
   runId: string
 ): Promise<{ run: WorkflowRunResponse; events: WorkflowEventResponse[] }> {
-  return fetchJSON(`/api/workflows/runs/${encodeURIComponent(runId)}`);
+  // Full run id required -- short prefix 404s (WO-CAULDRON-DASHBOARD-RUN-ID-TRUNCATION-01).
+  return fetchJSON(workflowRunApiPath(runId));
 }
 
 /**

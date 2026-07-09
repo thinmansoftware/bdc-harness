@@ -11,7 +11,7 @@ import {
 } from 'lucide-react';
 import type { DashboardRunResponse } from '@/lib/api';
 import { cn } from '@/lib/utils';
-import { formatDuration, formatStarted } from '@/lib/format';
+import { formatDuration, formatStarted, workflowRunDetailPath } from '@/lib/format';
 import { ConfirmRunActionDialog } from './ConfirmRunActionDialog';
 // Centralized status colors (escalated = YELLOW) -- WO-HARNESS-ESCALATED-RUN-STATUS-01
 import { STATUS_DOT_COLORS, getStatusLabel } from '@/lib/status-renderer';
@@ -81,7 +81,7 @@ export function WorkflowHistoryTable({
               </td>
               <td className="px-3 py-2">
                 <Link
-                  to={`/workflows/runs/${run.id}`}
+                  to={workflowRunDetailPath(run.id)}
                   className="text-text-primary hover:text-primary truncate block"
                 >
                   {run.workflow_name}
@@ -108,7 +108,7 @@ export function WorkflowHistoryTable({
               <td className="px-3 py-2">
                 <div className="flex items-center gap-2">
                   <Link
-                    to={`/workflows/runs/${run.id}`}
+                    to={workflowRunDetailPath(run.id)}
                     className="text-primary hover:text-primary/80 transition-colors"
                   >
                     View Logs
