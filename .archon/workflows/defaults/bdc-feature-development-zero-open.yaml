@@ -468,10 +468,33 @@ nodes:
   - id: checkpoint-push
     persona: overseer
     depends_on: [implement]
+    # Fail closed on unresolved WO_ID (WO-HARNESS-ZERO-OPEN-IMPLEMENT-MANIFEST-CHECKPOINT-TRUTH-01).
+    # load_bearing only on zero-open first; sisters keep best-effort exit 0 on push failure.
+    load_bearing: true
     bash: |
       set -uo pipefail
 
-      WO_ID="${WO_ID:-unknown}"
+      # ---- BEGIN checkpoint-wo-id-derive ----
+      # WO-HARNESS-ZERO-OPEN-IMPLEMENT-MANIFEST-CHECKPOINT-TRUTH-01
+      # Re-derive WO_ID: env -> USER_MESSAGE -> read-spec.output. Fail closed (no wip/unknown-*).
+      WO_ID="${WO_ID:-}"
+      if [ -z "$WO_ID" ] || [ "$WO_ID" = "unknown" ]; then
+        WO_ID=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'WO-[A-Z0-9-]+' | head -n 1 || true)
+      fi
+      # Safe capture of read-spec output (heredoc+python; do not naive-interpolate).
+      _RS_OUT=$(python3 -c 'import shlex, sys; s=sys.stdin.read(); sys.stdout.write((lambda p: p[0] if len(p)==1 else s)(shlex.split(s)) if len(s)>=2 and s[0]=="'"'"'" and s.rstrip("\n").endswith("'"'"'") else s)' <<'BDC_NODE_OUTPUT_READ_SPEC'
+      $read-spec.output
+      BDC_NODE_OUTPUT_READ_SPEC
+      )
+      if [ -z "$WO_ID" ] || [ "$WO_ID" = "unknown" ]; then
+        WO_ID=$(printf '%s\n' "$_RS_OUT" | sed -n 's/^WO_ID=//p' | head -1 || true)
+        WO_ID=$(printf '%s' "$WO_ID" | tr -d '\r' | head -c 200)
+      fi
+      if [ -z "$WO_ID" ] || [ "$WO_ID" = "unknown" ]; then
+        echo "ERROR: checkpoint-push cannot resolve WO_ID (would create wip/unknown-*)" >&2
+        exit 1
+      fi
+      # ---- END checkpoint-wo-id-derive ----
       WIP_BRANCH="wip/${WO_ID}-$(date +%Y%m%d%H%M%S)"
 
       git add -A 2>/dev/null || true
@@ -537,7 +560,9 @@ nodes:
       [ -n "$AHEAD" ] || AHEAD=0
       HAS_WORK=false
       if [ "$CHANGED" -gt 0 ] || [ "$AHEAD" -gt 0 ]; then HAS_WORK=true; fi
-      # Disk-truth: implement prose claims docs/canary/*.md but file missing after checkpoint.
+      # ---- BEGIN assert-implement-deliverable-diff ----
+      # WO-HARNESS-ZERO-OPEN-IMPLEMENT-MANIFEST-CHECKPOINT-TRUTH-01
+      # Disk-truth + committed-truth for claimed canary paths; scope-thrash guard.
       CLAIMED_CANARY=$(printf '%s\n' "$IMPL" | grep -Eo 'docs/canary/[A-Za-z0-9._/-]+\.md' | head -1 || true)
       if [ -n "$CLAIMED_CANARY" ] && [ ! -f "$WT/$CLAIMED_CANARY" ]; then
         echo "BUILD_OUTCOME=FALSE_COMPLETE"
@@ -546,6 +571,36 @@ nodes:
         echo "COMMITS_AHEAD=$AHEAD"
         exit 1
       fi
+      # Committed truth: claimed path must appear in git diff since RUN_START_SHA.
+      if [ -n "$CLAIMED_CANARY" ] && [ -n "$BASE" ] && [ "$BASE" != "unknown" ] && [ -n "$HEAD_NOW" ]; then
+        COMMITTED_LIST=$(git -C "$WT" diff --name-only "${BASE}..HEAD" 2>/dev/null || true)
+        if ! printf '%s\n' "$COMMITTED_LIST" | grep -Fxq "$CLAIMED_CANARY"; then
+          echo "BUILD_OUTCOME=FALSE_COMPLETE"
+          echo "ERROR: implement claimed $CLAIMED_CANARY but it is not in git diff ${BASE}..HEAD (committed-truth fail)." >&2
+          echo "CHANGED_FILES=$CHANGED"
+          echo "COMMITS_AHEAD=$AHEAD"
+          exit 1
+        fi
+      fi
+      # Scope thrash: only .archon/workflows/** committed while claims are docs/** only.
+      if [ -n "$BASE" ] && [ "$BASE" != "unknown" ] && [ -n "$HEAD_NOW" ] && [ "$AHEAD" -gt 0 ]; then
+        COMMITTED_LIST=$(git -C "$WT" diff --name-only "${BASE}..HEAD" 2>/dev/null || true)
+        if [ -n "$COMMITTED_LIST" ]; then
+          NON_ARCHON=$(printf '%s\n' "$COMMITTED_LIST" | grep -v '^\.archon/workflows/' || true)
+          ONLY_ARCHON=false
+          if [ -z "$NON_ARCHON" ]; then ONLY_ARCHON=true; fi
+          CLAIMS_DOCS=false
+          if printf '%s\n' "$IMPL" | grep -qE 'docs/canary/|docs/[A-Za-z0-9._/-]+\.md'; then CLAIMS_DOCS=true; fi
+          if [ "$ONLY_ARCHON" = "true" ] && [ "$CLAIMS_DOCS" = "true" ]; then
+            echo "BUILD_OUTCOME=FALSE_COMPLETE"
+            echo "ERROR: scope thrash -- only .archon/workflows/** committed since ${BASE} while implement claimed docs/** deliverable." >&2
+            echo "CHANGED_FILES=$CHANGED"
+            echo "COMMITS_AHEAD=$AHEAD"
+            exit 1
+          fi
+        fi
+      fi
+      # ---- END assert-implement-deliverable-diff ----
 
       SAID_COMPLETE=false
       if printf '%s\n' "$IMPL" | grep -qE '^(COMPLETE|BUILD_COMPLETE)$|<promise>COMPLETE</promise>'; then SAID_COMPLETE=true; fi
@@ -874,24 +929,8 @@ nodes:
         if [ -n "$CHANGED_SRC" ] && command -v python3 >/dev/null 2>&1; then
           printf '%s\n' "$CHANGED_SRC" | while IFS= read -r f; do
             [ -f "$f" ] || continue
-            python3 - "$f" <<'PY' || true
-import sys
-path = sys.argv[1]
-try:
-    raw = open(path, "rb").read()
-except OSError:
-    sys.exit(0)
-text = raw.decode("utf-8", errors="replace")
-repl = {
-    "\u2014": "-", "\u2013": "-", "\u2018": "'", "\u2019": "'",
-    "\u201c": '"', "\u201d": '"', "\u2026": "...", "\u00a0": " ",
-    "\u2192": "->", "\u2190": "<-",
-}
-for a, b in repl.items():
-    text = text.replace(a, b)
-text = "".join(ch if ord(ch) < 128 else "?" for ch in text)
-open(path, "w", encoding="ascii", newline="\n").write(text)
-PY
+            # YAML-safe ascii strip (single physical line; Bun.YAML rejects col-0 heredocs)
+            python3 -c "import sys,functools;p=sys.argv[1];r=open(p,'rb').read();t=r.decode('utf-8','replace');m={chr(0x2014):'-',chr(0x2013):'-',chr(0x2018):chr(39),chr(0x2019):chr(39),chr(0x201c):chr(34),chr(0x201d):chr(34),chr(0x2026):'...',chr(0xa0):' ',chr(0x2192):'->',chr(0x2190):'<-'};t=functools.reduce(lambda s,ab:s.replace(ab[0],ab[1]), m.items(), t);t=''.join(c if ord(c)<128 else '?' for c in t);open(p,'w',encoding='ascii',newline=chr(10)).write(t)" "$f" || true
           done
         fi
         if [ ! -f "$DONE" ] && [ "$has_debug" -eq 0 ]; then
@@ -2019,6 +2058,57 @@ PY
           exit 1
         fi
       fi
+
+      # ---- BEGIN manifest-pr-content-check ----
+      # WO-HARNESS-ZERO-OPEN-IMPLEMENT-MANIFEST-CHECKPOINT-TRUTH-01
+      # Fail closed when build-manifest claims paths absent from the real PR file list.
+      if [ -n "$PR_URL" ]; then
+        FILES_CREATED_LINE=$(extract "Files created")
+        FILES_MODIFIED_LINE=$(extract "Files modified")
+        CLAIMED_RAW=$(printf '%s\n%s\n' "$FILES_CREATED_LINE" "$FILES_MODIFIED_LINE")
+        CLAIMED_PATHS=$(printf '%s\n' "$CLAIMED_RAW" | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | grep -E '^[A-Za-z0-9_./-]+' | grep -v -E '^(none|n/a|N/A|no files|already.satisfied|ALREADY_SATISFIED|BLOCKED)$' || true)
+        SKIP_PR_FILES=false
+        COMBINED_LOWER=$(printf '%s\n' "$CLAIMED_RAW" "$PRS_LINE" "$MANIFEST_OUT" | tr '[:upper:]' '[:lower:]')
+        if printf '%s\n' "$COMBINED_LOWER" | grep -Eq 'already_satisfied|already satisfied|no files|files created: none|files modified: none|outcome: blocked|blocked'; then
+          if [ -z "$CLAIMED_PATHS" ]; then
+            SKIP_PR_FILES=true
+          fi
+        fi
+        if [ "$SKIP_PR_FILES" = "false" ]; then
+          REPO=$(printf '%s\n' "$PR_URL" | sed -n 's|https://github.com/\([^/]*/[^/]*\)/pull/.*|\1|p' | head -1)
+          PR_NUM=$(printf '%s\n' "$PR_URL" | sed -n 's|.*/pull/\([0-9][0-9]*\).*|\1|p' | head -1)
+          if [ -n "$REPO" ] && [ -n "$PR_NUM" ]; then
+            PR_FILES=$(gh pr view "$PR_NUM" --repo "$REPO" --json files --jq '.files[].path' 2>/dev/null || true)
+            if [ -z "$PR_FILES" ]; then
+              PR_FILES=$(gh pr view "$PR_URL" --json files --jq '.files[].path' 2>/dev/null || true)
+            fi
+            if [ -n "$CLAIMED_PATHS" ]; then
+              MISSING=""
+              MATCH=0
+              while IFS= read -r p; do
+                [ -z "$p" ] && continue
+                if printf '%s\n' "$PR_FILES" | grep -Fxq "$p"; then
+                  MATCH=$((MATCH + 1))
+                else
+                  MISSING="${MISSING}${p} "
+                fi
+              done < <(printf '%s\n' "$CLAIMED_PATHS")
+              if [ -n "$MISSING" ]; then
+                echo "PR_CONTENT_ERROR: claimed path(s) absent from PR file list: ${MISSING}" >&2
+                echo "PR_URL=${PR_URL}" >&2
+                echo "PR_FILES=$(printf '%s' "$PR_FILES" | tr '\n' ' ')" >&2
+                exit 1
+              fi
+              if [ -n "$PR_FILES" ] && [ "$MATCH" -eq 0 ]; then
+                echo "PR_CONTENT_ERROR: PR has files but zero claimed manifest paths match (wrong-content PR)." >&2
+                echo "PR_URL=${PR_URL}" >&2
+                exit 1
+              fi
+            fi
+          fi
+        fi
+      fi
+      # ---- END manifest-pr-content-check ----
 
       printf 'OK\n'
 
