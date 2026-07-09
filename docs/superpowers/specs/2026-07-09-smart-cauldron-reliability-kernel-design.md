@@ -1,6 +1,6 @@
 # Smart Cauldron Reliability Kernel Design
 
-Status: DRAFT FOR GENERAL REVIEW
+Status: APPROVED BY GENERAL (CHATGPT) FOR IMPLEMENTATION PLANNING
 
 Date: 2026-07-09
 
@@ -10,9 +10,45 @@ Authoring branch: `codex/smart-cauldron-reliability-design`
 
 Design base: `origin/dev` at `b881cb6808e2db87688a5ca705b32e657fb231c8`
 
-Decision requested: approve Approach B, an incremental reliability kernel around
-the current engine. Approval of this document authorizes implementation planning,
-not implementation, merge, rebuild, restart, workflow fire, or deployment.
+General review: approved 2026-07-09 by ChatGPT in the General architecture-review
+role, after verifying the design against John's four binding conditions and the
+current `origin/dev` prior-art inventory.
+
+Decision: approve Approach B, an incremental reliability kernel around the current
+engine. This approval authorizes the file-by-file implementation plan and subsequent
+local test-driven implementation in the isolated worktree. It does not authorize a
+push, PR, merge, rebuild, restart, workflow fire, deployment, branch-protection
+change, or production mutation.
+
+## 0. General architecture ruling
+
+Verdict: APPROVED WITH THE EXISTING BINDING CONDITIONS.
+
+General finds the architecture proportionate to the incident evidence. It preserves
+the proven DAG executor and single-stage loop, extends merged provider failover,
+timeouts, ESCALATED status, truth guards, pause/resume, and worktree isolation, and
+adds durable control-plane facts instead of rebuilding the engine.
+
+The four required conditions are satisfied:
+
+1. Phase 0 is first and contains the three independent immediate fixes.
+2. Section 7 maps every kernel component to current prior art or a governing WO.
+3. This recorded ruling is the architecture gate; implementation planning may now
+   begin.
+4. Section 15 keeps the program off the closure-day and production critical paths.
+
+General adds these enforcement notes without changing the design:
+
+- Phase 0 PR-sized commits cannot be held behind database/schema kernel work.
+- Each slice refreshes `origin/dev`, open PRs, and governing WOs before editing so
+  already-landed work is deleted from scope rather than rebuilt.
+- New persistence is additive and compatibility-projected until consumers migrate.
+- The pre-existing bundled-skill drift is reported honestly but cannot be blamed on
+  Phase 0 unless a Phase 0 change touches that bundle contract.
+- The current combined-test mock-isolation failure cannot be hidden by broad green
+  claims; use the repository's separate-process commands or fix isolation explicitly.
+- No operational action is implied by local implementation success. Failure injection
+  remains local/CI, and any live canary requires a separate approval packet.
 
 ## 1. Executive decision
 
