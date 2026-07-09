@@ -619,6 +619,138 @@ describe('executeDagWorkflow -- plan-review terminal safety', () => {
     expect(packet.maxIterations).toBe(3);
     expect(packet.singleDecisionNeeded).toBe('Which source path contains the prior logic?');
   });
+
+  // WO-HARNESS-LOOP-OUTPUT-NEWLINE-AND-ITERATION-TIMEOUT-01
+  it('completes plan-review on single-line mashed PLAN_REVIEW_PASS=true output', async () => {
+    mockSendQueryDag.mockImplementation(function* () {
+      yield {
+        type: 'assistant',
+        content:
+          'ok PLAN_REVIEW_PASS=true PLAN_REVIEW_RISK=LOW === APPROVED_PLAN_BEGIN === do it === APPROVED_PLAN_END === PLAN_REVIEW_APPROVED',
+      };
+      yield { type: 'result', sessionId: 'plan-review-mashed-session' };
+    });
+
+    const store = createMockStore();
+    const mockDeps = createMockDeps(store);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('plan-review-mashed-run');
+    const artifactsDir = join(testDir, 'artifacts-mashed');
+    const logDir = join(testDir, 'logs-mashed');
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-dag',
+      testDir,
+      {
+        name: 'plan-review-mashed',
+        nodes: [
+          {
+            id: 'plan-review',
+            loop: {
+              prompt: 'review the plan',
+              until: 'PLAN_REVIEW_APPROVED',
+              max_iterations: 3,
+            },
+          },
+        ],
+      },
+      workflowRun,
+      'claude',
+      undefined,
+      artifactsDir,
+      logDir,
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    // Only one iteration: mashed approval must complete the loop (not burn max_iterations).
+    expect(mockSendQueryDag).toHaveBeenCalledTimes(1);
+    const events = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls.map(
+      call => call[0] as { event_type: string; step_name?: string; data?: Record<string, unknown> }
+    );
+    const completed = events.find(
+      e => e.event_type === 'loop_iteration_completed' && e.step_name === 'plan-review'
+    );
+    expect(completed).toBeDefined();
+    expect(completed?.data?.completionDetected).toBe(true);
+    const hints = completed?.data?.signalHints as Record<string, unknown> | undefined;
+    expect(hints?.planReviewPassTruePresent).toBe(true);
+    expect(hints?.planReviewApprovedPresent).toBe(true);
+    expect(hints?.signalDetected).toBe(true);
+    expect(
+      events.some(e => e.event_type === 'node_completed' && e.step_name === 'plan-review')
+    ).toBe(true);
+  });
+
+  it('fails plan-review iteration closed on wall timeout (hung mock provider)', async () => {
+    const prevWall = process.env.ARCHON_LOOP_ITERATION_WALL_MS;
+    const prevIdle = process.env.ARCHON_LOOP_ITERATION_IDLE_MS;
+    // Wall fires first; idle is only slightly longer so withIdleTimeout can exit
+    // when the mock ignores abortSignal (still hung). Wall flag then fail-closes.
+    process.env.ARCHON_LOOP_ITERATION_WALL_MS = '60';
+    process.env.ARCHON_LOOP_ITERATION_IDLE_MS = '120';
+    try {
+      mockSendQueryDag.mockImplementation(async function* () {
+        // Hang forever -- mock does not observe abort; wall + short idle unblocks.
+        await new Promise<void>(() => {});
+        yield { type: 'assistant', content: 'never' };
+      });
+
+      const store = createMockStore();
+      const mockDeps = createMockDeps(store);
+      const platform = createMockPlatform();
+      const workflowRun = makeWorkflowRun('plan-review-wall-timeout-run');
+      const artifactsDir = join(testDir, 'artifacts-wall');
+      const logDir = join(testDir, 'logs-wall');
+
+      await executeDagWorkflow(
+        mockDeps,
+        platform,
+        'conv-dag',
+        testDir,
+        {
+          name: 'plan-review-wall-timeout',
+          nodes: [
+            {
+              id: 'plan-review',
+              loop: {
+                prompt: 'review the plan',
+                until: 'PLAN_REVIEW_APPROVED',
+                max_iterations: 1,
+              },
+            },
+          ],
+        },
+        workflowRun,
+        'claude',
+        undefined,
+        artifactsDir,
+        logDir,
+        'main',
+        'docs/',
+        minimalConfig
+      );
+
+      const events = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls.map(
+        call =>
+          call[0] as { event_type: string; step_name?: string; data?: Record<string, unknown> }
+      );
+      const failed = events.filter(
+        e => e.event_type === 'loop_iteration_failed' && e.step_name === 'plan-review'
+      );
+      expect(failed.length).toBeGreaterThanOrEqual(1);
+      const errText = String(failed[0]?.data?.error ?? '');
+      expect(errText.toLowerCase()).toMatch(/wall timeout/);
+    } finally {
+      if (prevWall === undefined) delete process.env.ARCHON_LOOP_ITERATION_WALL_MS;
+      else process.env.ARCHON_LOOP_ITERATION_WALL_MS = prevWall;
+      if (prevIdle === undefined) delete process.env.ARCHON_LOOP_ITERATION_IDLE_MS;
+      else process.env.ARCHON_LOOP_ITERATION_IDLE_MS = prevIdle;
+    }
+  });
 });
 
 describe('DAG Loader -- cycle detection', () => {

@@ -481,7 +481,9 @@ describe('detectPlanReviewApproval', () => {
 
   it('accepts PLAN_REVIEW_PASS=true (open-model form)', () => {
     expect(
-      detectPlanReviewApproval('PLAN_REVIEW_PASS=true\nPLAN_REVIEW_RISK=LOW\n=== APPROVED_PLAN_BEGIN ===')
+      detectPlanReviewApproval(
+        'PLAN_REVIEW_PASS=true\nPLAN_REVIEW_RISK=LOW\n=== APPROVED_PLAN_BEGIN ==='
+      )
     ).toBe(true);
   });
 
@@ -497,6 +499,44 @@ describe('detectPlanReviewApproval', () => {
 
   it('rejects PLAN_REVIEW_PASS=false', () => {
     expect(detectPlanReviewApproval('PLAN_REVIEW_PASS=false\n')).toBe(false);
+  });
+
+  // WO-HARNESS-LOOP-OUTPUT-NEWLINE-AND-ITERATION-TIMEOUT-01 -- mashed open-model output
+  it('accepts single-line mashed PASS=true + RISK + fence (canary 3604d5 class)', () => {
+    const mashed =
+      'Review complete. PLAN_REVIEW_PASS=true PLAN_REVIEW_RISK=LOW === APPROVED_PLAN_BEGIN === do the work === APPROVED_PLAN_END === PLAN_REVIEW_APPROVED';
+    expect(detectPlanReviewApproval(mashed)).toBe(true);
+  });
+
+  it('accepts single-line mashed PLAN_REVIEW_PASS=true without bare APPROVED', () => {
+    expect(
+      detectPlanReviewApproval(
+        'ok PLAN_REVIEW_PASS=true PLAN_REVIEW_RISK=MEDIUM === APPROVED_PLAN_BEGIN === x === APPROVED_PLAN_END ==='
+      )
+    ).toBe(true);
+  });
+
+  it('accepts multi-line approval still (no regression)', () => {
+    expect(
+      detectPlanReviewApproval(
+        [
+          'Looks solid.',
+          'PLAN_REVIEW_PASS=true',
+          'PLAN_REVIEW_RISK=LOW',
+          'PLAN_REVIEW_APPROVED',
+        ].join('\n')
+      )
+    ).toBe(true);
+  });
+
+  it('rejects prose that mentions PASS=true without a real field token', () => {
+    expect(
+      detectPlanReviewApproval('Do not set PLAN_REVIEW_PASS=true yet -- the plan is incomplete.')
+    ).toBe(false);
+  });
+
+  it('rejects not PLAN_REVIEW_PASS=true yet style false positive', () => {
+    expect(detectPlanReviewApproval('not PLAN_REVIEW_PASS=true yet')).toBe(false);
   });
 });
 

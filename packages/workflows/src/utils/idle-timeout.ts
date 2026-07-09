@@ -21,6 +21,47 @@
  */
 export const STEP_IDLE_TIMEOUT_MS = 30 * 60 * 1000;
 
+/**
+ * Default idle timeout for a single loop iteration (plan-review, implement, etc.).
+ *
+ * STEP_IDLE_TIMEOUT_MS is 30 minutes (step-level deadlock detector). Loop
+ * iterations on open models can hang a silent OpenRouter call for nearly that
+ * entire window (anchor: zero-open re-fire 42ee6575 plan-review iter 2 sat
+ * ~28 minutes until human cancel). Per-iteration idle default is much shorter
+ * so a dead stream fails closed instead of looking "stuck forever".
+ *
+ * Override per node with `idle_timeout` (ms). Env: ARCHON_LOOP_ITERATION_IDLE_MS.
+ */
+export const LOOP_ITERATION_IDLE_TIMEOUT_MS = 3 * 60 * 1000; // 3 minutes of silence
+
+/**
+ * Absolute wall-clock cap for one loop iteration (even if the stream emits
+ * keepalives that would reset idle). Env: ARCHON_LOOP_ITERATION_WALL_MS.
+ */
+export const LOOP_ITERATION_WALL_TIMEOUT_MS = 8 * 60 * 1000; // 8 minutes absolute
+
+/**
+ * Resolve per-iteration idle timeout at call time so env overrides work in
+ * tests and ops without reloading the module.
+ */
+export function resolveLoopIterationIdleTimeoutMs(nodeOverride?: number): number {
+  if (nodeOverride != null && Number.isFinite(nodeOverride) && nodeOverride > 0) {
+    return nodeOverride;
+  }
+  const fromEnv = Number.parseInt(process.env.ARCHON_LOOP_ITERATION_IDLE_MS ?? '', 10);
+  if (Number.isFinite(fromEnv) && fromEnv > 0) return fromEnv;
+  return LOOP_ITERATION_IDLE_TIMEOUT_MS;
+}
+
+/**
+ * Resolve per-iteration wall timeout at call time (env-overridable).
+ */
+export function resolveLoopIterationWallTimeoutMs(): number {
+  const fromEnv = Number.parseInt(process.env.ARCHON_LOOP_ITERATION_WALL_MS ?? '', 10);
+  if (Number.isFinite(fromEnv) && fromEnv > 0) return fromEnv;
+  return LOOP_ITERATION_WALL_TIMEOUT_MS;
+}
+
 /** Sentinel value to distinguish idle timeout from normal generator completion */
 const IDLE_TIMEOUT_SENTINEL = Symbol('IDLE_TIMEOUT');
 
