@@ -480,7 +480,27 @@ nodes:
     bash: |
       set -uo pipefail
 
-      WO_ID="${WO_ID:-unknown}"
+      # ---- BEGIN checkpoint-wo-id-derive ----
+      # WO-HARNESS-ZERO-OPEN-IMPLEMENT-MANIFEST-CHECKPOINT-TRUTH-01
+      # Re-derive WO_ID: env -> USER_MESSAGE -> read-spec.output. Fail closed (no wip/unknown-*).
+      WO_ID="${WO_ID:-}"
+      if [ -z "$WO_ID" ] || [ "$WO_ID" = "unknown" ]; then
+        WO_ID=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'WO-[A-Z0-9-]+' | head -n 1 || true)
+      fi
+      # Safe capture of read-spec output (heredoc+python; do not naive-interpolate).
+      _RS_OUT=$(python3 -c 'import shlex, sys; s=sys.stdin.read(); sys.stdout.write((lambda p: p[0] if len(p)==1 else s)(shlex.split(s)) if len(s)>=2 and s[0]=="'"'"'" and s.rstrip("\n").endswith("'"'"'") else s)' <<'BDC_NODE_OUTPUT_READ_SPEC'
+      $read-spec.output
+      BDC_NODE_OUTPUT_READ_SPEC
+      )
+      if [ -z "$WO_ID" ] || [ "$WO_ID" = "unknown" ]; then
+        WO_ID=$(printf '%s\n' "$_RS_OUT" | sed -n 's/^WO_ID=//p' | head -1 || true)
+        WO_ID=$(printf '%s' "$WO_ID" | tr -d '\r' | head -c 200)
+      fi
+      if [ -z "$WO_ID" ] || [ "$WO_ID" = "unknown" ]; then
+        echo "ERROR: checkpoint-push cannot resolve WO_ID (would create wip/unknown-*)" >&2
+        exit 1
+      fi
+      # ---- END checkpoint-wo-id-derive ----
       WIP_BRANCH="wip/${WO_ID}-$(date +%Y%m%d%H%M%S)"
 
       git add -A 2>/dev/null || true

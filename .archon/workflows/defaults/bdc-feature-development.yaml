@@ -470,7 +470,27 @@ nodes:
     bash: |
       set -uo pipefail
 
-      WO_ID="${WO_ID:-unknown}"
+      # ---- BEGIN checkpoint-wo-id-derive ----
+      # WO-HARNESS-ZERO-OPEN-IMPLEMENT-MANIFEST-CHECKPOINT-TRUTH-01
+      # Re-derive WO_ID: env -> USER_MESSAGE -> read-spec.output. Fail closed (no wip/unknown-*).
+      WO_ID="${WO_ID:-}"
+      if [ -z "$WO_ID" ] || [ "$WO_ID" = "unknown" ]; then
+        WO_ID=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'WO-[A-Z0-9-]+' | head -n 1 || true)
+      fi
+      # Safe capture of read-spec output (heredoc+python; do not naive-interpolate).
+      _RS_OUT=$(python3 -c 'import shlex, sys; s=sys.stdin.read(); sys.stdout.write((lambda p: p[0] if len(p)==1 else s)(shlex.split(s)) if len(s)>=2 and s[0]=="'"'"'" and s.rstrip("\n").endswith("'"'"'") else s)' <<'BDC_NODE_OUTPUT_READ_SPEC'
+      $read-spec.output
+      BDC_NODE_OUTPUT_READ_SPEC
+      )
+      if [ -z "$WO_ID" ] || [ "$WO_ID" = "unknown" ]; then
+        WO_ID=$(printf '%s\n' "$_RS_OUT" | sed -n 's/^WO_ID=//p' | head -1 || true)
+        WO_ID=$(printf '%s' "$WO_ID" | tr -d '\r' | head -c 200)
+      fi
+      if [ -z "$WO_ID" ] || [ "$WO_ID" = "unknown" ]; then
+        echo "ERROR: checkpoint-push cannot resolve WO_ID (would create wip/unknown-*)" >&2
+        exit 1
+      fi
+      # ---- END checkpoint-wo-id-derive ----
       WIP_BRANCH="wip/${WO_ID}-$(date +%Y%m%d%H%M%S)"
 
       git add -A 2>/dev/null || true
@@ -2166,6 +2186,57 @@ nodes:
           exit 1
         fi
       fi
+
+      # ---- BEGIN manifest-pr-content-check ----
+      # WO-HARNESS-ZERO-OPEN-IMPLEMENT-MANIFEST-CHECKPOINT-TRUTH-01
+      # Fail closed when build-manifest claims paths absent from the real PR file list.
+      if [ -n "$PR_URL" ]; then
+        FILES_CREATED_LINE=$(extract "Files created")
+        FILES_MODIFIED_LINE=$(extract "Files modified")
+        CLAIMED_RAW=$(printf '%s\n%s\n' "$FILES_CREATED_LINE" "$FILES_MODIFIED_LINE")
+        CLAIMED_PATHS=$(printf '%s\n' "$CLAIMED_RAW" | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | grep -E '^[A-Za-z0-9_./-]+' | grep -v -E '^(none|n/a|N/A|no files|already.satisfied|ALREADY_SATISFIED|BLOCKED)$' || true)
+        SKIP_PR_FILES=false
+        COMBINED_LOWER=$(printf '%s\n' "$CLAIMED_RAW" "$PRS_LINE" "$MANIFEST_OUT" | tr '[:upper:]' '[:lower:]')
+        if printf '%s\n' "$COMBINED_LOWER" | grep -Eq 'already_satisfied|already satisfied|no files|files created: none|files modified: none|outcome: blocked|blocked'; then
+          if [ -z "$CLAIMED_PATHS" ]; then
+            SKIP_PR_FILES=true
+          fi
+        fi
+        if [ "$SKIP_PR_FILES" = "false" ]; then
+          REPO=$(printf '%s\n' "$PR_URL" | sed -n 's|https://github.com/\([^/]*/[^/]*\)/pull/.*|\1|p' | head -1)
+          PR_NUM=$(printf '%s\n' "$PR_URL" | sed -n 's|.*/pull/\([0-9][0-9]*\).*|\1|p' | head -1)
+          if [ -n "$REPO" ] && [ -n "$PR_NUM" ]; then
+            PR_FILES=$(gh pr view "$PR_NUM" --repo "$REPO" --json files --jq '.files[].path' 2>/dev/null || true)
+            if [ -z "$PR_FILES" ]; then
+              PR_FILES=$(gh pr view "$PR_URL" --json files --jq '.files[].path' 2>/dev/null || true)
+            fi
+            if [ -n "$CLAIMED_PATHS" ]; then
+              MISSING=""
+              MATCH=0
+              while IFS= read -r p; do
+                [ -z "$p" ] && continue
+                if printf '%s\n' "$PR_FILES" | grep -Fxq "$p"; then
+                  MATCH=$((MATCH + 1))
+                else
+                  MISSING="${MISSING}${p} "
+                fi
+              done < <(printf '%s\n' "$CLAIMED_PATHS")
+              if [ -n "$MISSING" ]; then
+                echo "PR_CONTENT_ERROR: claimed path(s) absent from PR file list: ${MISSING}" >&2
+                echo "PR_URL=${PR_URL}" >&2
+                echo "PR_FILES=$(printf '%s' "$PR_FILES" | tr '\n' ' ')" >&2
+                exit 1
+              fi
+              if [ -n "$PR_FILES" ] && [ "$MATCH" -eq 0 ]; then
+                echo "PR_CONTENT_ERROR: PR has files but zero claimed manifest paths match (wrong-content PR)." >&2
+                echo "PR_URL=${PR_URL}" >&2
+                exit 1
+              fi
+            fi
+          fi
+        fi
+      fi
+      # ---- END manifest-pr-content-check ----
 
       printf 'OK\n'
 
