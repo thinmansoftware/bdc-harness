@@ -481,7 +481,9 @@ describe('detectPlanReviewApproval', () => {
 
   it('accepts PLAN_REVIEW_PASS=true (open-model form)', () => {
     expect(
-      detectPlanReviewApproval('PLAN_REVIEW_PASS=true\nPLAN_REVIEW_RISK=LOW\n=== APPROVED_PLAN_BEGIN ===')
+      detectPlanReviewApproval(
+        'PLAN_REVIEW_PASS=true\nPLAN_REVIEW_RISK=LOW\n=== APPROVED_PLAN_BEGIN ==='
+      )
     ).toBe(true);
   });
 
@@ -517,18 +519,19 @@ describe('detectPlanReviewApproval', () => {
   it('accepts multi-line approval still (no regression)', () => {
     expect(
       detectPlanReviewApproval(
-        ['Looks solid.', 'PLAN_REVIEW_PASS=true', 'PLAN_REVIEW_RISK=LOW', 'PLAN_REVIEW_APPROVED'].join(
-          '\n'
-        )
+        [
+          'Looks solid.',
+          'PLAN_REVIEW_PASS=true',
+          'PLAN_REVIEW_RISK=LOW',
+          'PLAN_REVIEW_APPROVED',
+        ].join('\n')
       )
     ).toBe(true);
   });
 
   it('rejects prose that mentions PASS=true without a real field token', () => {
     expect(
-      detectPlanReviewApproval(
-        'Do not set PLAN_REVIEW_PASS=true yet -- the plan is incomplete.'
-      )
+      detectPlanReviewApproval('Do not set PLAN_REVIEW_PASS=true yet -- the plan is incomplete.')
     ).toBe(false);
   });
 

@@ -735,7 +735,8 @@ describe('executeDagWorkflow -- plan-review terminal safety', () => {
       );
 
       const events = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls.map(
-        call => call[0] as { event_type: string; step_name?: string; data?: Record<string, unknown> }
+        call =>
+          call[0] as { event_type: string; step_name?: string; data?: Record<string, unknown> }
       );
       const failed = events.filter(
         e => e.event_type === 'loop_iteration_failed' && e.step_name === 'plan-review'

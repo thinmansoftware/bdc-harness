@@ -571,9 +571,7 @@ export function detectCompletionSignal(output: string, signal: string): boolean 
  * line-anchored detectors still work. Does NOT mutate stored node output.
  */
 export function normalizePlanReviewOutputForSignalDetection(output: string): string {
-  return output
-    .replace(/(PLAN_REVIEW_[A-Z_]+)/g, '\n$1')
-    .replace(/(===)/g, '\n$1');
+  return output.replace(/(PLAN_REVIEW_[A-Z_]+)/g, '\n$1').replace(/(===)/g, '\n$1');
 }
 
 /**

@@ -3338,7 +3338,10 @@ async function executeLoopNode(
     if (iterationWallTimedOut) {
       const wallError = `Loop '${node.id}' iteration ${String(i)} exceeded wall timeout (${String(effectiveWallTimeout)}ms)`;
       const duration = Date.now() - iterationStart;
-      getLog().error({ nodeId: node.id, iteration: i, timeoutMs: effectiveWallTimeout }, 'loop_node.iteration_wall_timeout');
+      getLog().error(
+        { nodeId: node.id, iteration: i, timeoutMs: effectiveWallTimeout },
+        'loop_node.iteration_wall_timeout'
+      );
       getWorkflowEventEmitter().emit({
         type: 'loop_iteration_failed',
         runId: workflowRun.id,
