@@ -164,6 +164,25 @@ describe('lane registration and war-council-validator pin', () => {
       expect(authoritativePrefix).toContain('cat "$AUTHORITY_SPEC"');
     });
 
+    it(`S4f: ${file} parseWorkflow() output carries run_authority (loader wiring)`, () => {
+      // Regression pin for the 2026-07-10 factory-down incident: S4d validates the
+      // RAW YAML (Bun.YAML.parse), but the loader used to drop run_authority from
+      // the returned WorkflowDefinition, so the orchestrator/executor authority
+      // freeze gate never fired and every /run lane fire died at read-spec with
+      // "scope_authority_missing: run-authority.json". This asserts the PARSED
+      // definition -- the object production dispatch actually sees.
+      const content = readFileSync(join(LANES_DIR, file), 'utf-8');
+      const result = parseWorkflow(content, file);
+      if (!result.workflow) throw new Error(`${file}: ${result.error?.error ?? 'failed to parse'}`);
+      expect(result.workflow.run_authority).toEqual({
+        required: true,
+        spec_repository: 'bluedevilcollectibles/bdc-xo',
+        spec_revision: 'main',
+        spec_paths: ['docs/work-orders/{WO_ID}.md', 'docs/superpowers/specs/{WO_ID}.md'],
+        allow_issue_fallback: true,
+      });
+    });
+
     it(`S4e: ${file} derives its manifest from mechanical evidence`, () => {
       const content = readFileSync(join(LANES_DIR, file), 'utf-8');
       const result = parseWorkflow(content, file);
