@@ -28,6 +28,7 @@ description: |
   re-fires UPDATE the same stage branch -- no duplicate-PR spray.
 
 policyFile: harness/policies/agent-behavior.md
+provider: claude
 model: sonnet
 
 nodes:

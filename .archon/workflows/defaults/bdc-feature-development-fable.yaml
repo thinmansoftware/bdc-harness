@@ -28,6 +28,7 @@ run_authority:
 # and every existing persona is pinned (sonnet/opus), which would silently shadow fable.
 # All OTHER nodes keep their persona bindings unchanged. war-council-validator keeps
 # provider: claude (trusted judge is always Claude) but serves claude-fable-5 here.
+provider: claude
 model: claude-fable-5
 
 nodes:
