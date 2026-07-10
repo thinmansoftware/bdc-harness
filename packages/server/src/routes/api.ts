@@ -82,6 +82,8 @@ import * as isolationEnvDb from '@archon/core/db/isolation-environments';
 import * as workflowDb from '@archon/core/db/workflows';
 import * as workflowEventDb from '@archon/core/db/workflow-events';
 import * as messageDb from '@archon/core/db/messages';
+import * as dispatchDb from '@archon/core/db/dispatch';
+import { assessDispatchMessageBody } from '@archon/core/utils/dispatch-content-guard';
 import { errorSchema } from './schemas/common.schemas';
 import { updateCheckResponseSchema } from './schemas/system.schemas';
 import {
@@ -153,6 +155,18 @@ import {
   throttleBodySchema,
   throttleResponseSchema,
 } from './schemas/admin.schemas';
+import {
+  claimDispatchMessageBodySchema,
+  createDispatchMessageBodySchema,
+  dispatchMessageIdParamsSchema,
+  dispatchMessageListResponseSchema,
+  dispatchMessageSchema,
+  dispatchWorkerSchema,
+  heartbeatDispatchWorkerBodySchema,
+  listDispatchMessagesQuerySchema,
+  postDispatchResultBodySchema,
+  registerDispatchWorkerBodySchema,
+} from './schemas/dispatch.schemas';
 import { getProviderInfoList, isRegisteredProvider } from '@archon/providers';
 import { claudeProviderThrottle } from '@archon/providers/claude/throttle';
 
@@ -456,6 +470,147 @@ const sendMessageRoute = createRoute({
     400: jsonError('Bad request'),
     500: jsonError('Server error'),
     503: jsonError('Cauldron draining'),
+  },
+});
+
+// =========================================================================
+// Blue Devil Dispatch route configs
+// =========================================================================
+
+const createDispatchMessageRoute = createRoute({
+  method: 'post',
+  path: '/api/dispatch/messages',
+  tags: ['Dispatch'],
+  summary: 'Create an agent dispatch message',
+  request: {
+    body: {
+      content: { 'application/json': { schema: createDispatchMessageBodySchema } },
+      required: true,
+    },
+  },
+  responses: {
+    200: {
+      content: { 'application/json': { schema: dispatchMessageSchema } },
+      description: 'Dispatch message',
+    },
+    400: jsonError('Bad request'),
+    500: jsonError('Server error'),
+  },
+});
+
+const listDispatchMessagesRoute = createRoute({
+  method: 'get',
+  path: '/api/dispatch/messages',
+  tags: ['Dispatch'],
+  summary: 'List agent dispatch messages',
+  request: { query: listDispatchMessagesQuerySchema },
+  responses: {
+    200: {
+      content: { 'application/json': { schema: dispatchMessageListResponseSchema } },
+      description: 'Dispatch messages',
+    },
+    500: jsonError('Server error'),
+  },
+});
+
+const claimDispatchMessageRoute = createRoute({
+  method: 'post',
+  path: '/api/dispatch/messages/{id}/claim',
+  tags: ['Dispatch'],
+  summary: 'Claim an agent dispatch message with a fenced lease',
+  request: {
+    params: dispatchMessageIdParamsSchema,
+    body: {
+      content: { 'application/json': { schema: claimDispatchMessageBodySchema } },
+      required: true,
+    },
+  },
+  responses: {
+    200: {
+      content: { 'application/json': { schema: dispatchMessageSchema } },
+      description: 'Claimed dispatch message',
+    },
+    404: jsonError('Not claimable'),
+    500: jsonError('Server error'),
+  },
+});
+
+const postDispatchResultRoute = createRoute({
+  method: 'post',
+  path: '/api/dispatch/messages/{id}/result',
+  tags: ['Dispatch'],
+  summary: 'Complete an agent dispatch message',
+  request: {
+    params: dispatchMessageIdParamsSchema,
+    body: {
+      content: { 'application/json': { schema: postDispatchResultBodySchema } },
+      required: true,
+    },
+  },
+  responses: {
+    200: {
+      content: { 'application/json': { schema: dispatchMessageSchema } },
+      description: 'Completed dispatch message',
+    },
+    409: jsonError('Stale fencing token or cancelled message'),
+    500: jsonError('Server error'),
+  },
+});
+
+const cancelDispatchMessageRoute = createRoute({
+  method: 'post',
+  path: '/api/dispatch/messages/{id}/cancel',
+  tags: ['Dispatch'],
+  summary: 'Cancel an agent dispatch message',
+  request: { params: dispatchMessageIdParamsSchema },
+  responses: {
+    200: {
+      content: { 'application/json': { schema: dispatchMessageSchema } },
+      description: 'Cancelled dispatch message',
+    },
+    404: jsonError('Not found'),
+    500: jsonError('Server error'),
+  },
+});
+
+const registerDispatchWorkerRoute = createRoute({
+  method: 'post',
+  path: '/api/dispatch/workers/register',
+  tags: ['Dispatch'],
+  summary: 'Register an agent dispatch worker',
+  request: {
+    body: {
+      content: { 'application/json': { schema: registerDispatchWorkerBodySchema } },
+      required: true,
+    },
+  },
+  responses: {
+    200: {
+      content: { 'application/json': { schema: dispatchWorkerSchema } },
+      description: 'Registered dispatch worker',
+    },
+    500: jsonError('Server error'),
+  },
+});
+
+const heartbeatDispatchWorkerRoute = createRoute({
+  method: 'post',
+  path: '/api/dispatch/workers/heartbeat',
+  tags: ['Dispatch'],
+  summary: 'Heartbeat an agent dispatch worker',
+  request: {
+    body: {
+      content: { 'application/json': { schema: heartbeatDispatchWorkerBodySchema } },
+      required: true,
+    },
+  },
+  responses: {
+    200: {
+      content: { 'application/json': { schema: dispatchWorkerSchema } },
+      description: 'Heartbeat accepted',
+    },
+    404: jsonError('Worker not found'),
+    500: jsonError('Server error'),
   },
 });
 
@@ -2315,6 +2470,111 @@ export function registerApiRoutes(
     return c.json(result);
   });
 
+  // =========================================================================
+  // Blue Devil Dispatch endpoints
+  // =========================================================================
+
+  registerOpenApiRoute(createDispatchMessageRoute, async c => {
+    try {
+      const body = getValidatedBody(c, createDispatchMessageBodySchema);
+      const assessment = assessDispatchMessageBody(body.task_type, body.body);
+      if (!assessment.allowed) {
+        return apiError(c, 400, assessment.reason ?? 'dispatch_message_body_rejected');
+      }
+      const message = await dispatchDb.createMessage({
+        ...body,
+        not_before: body.not_before ?? null,
+      });
+      return c.json(message);
+    } catch (error) {
+      getLog().error({ err: error }, 'dispatch_create_message_failed');
+      return apiError(c, 500, 'Failed to create dispatch message');
+    }
+  });
+
+  registerOpenApiRoute(listDispatchMessagesRoute, async c => {
+    try {
+      const rawLimit = Number.parseInt(c.req.query('limit') ?? '100', 10);
+      const messages = await dispatchDb.listMessages({
+        recipient: c.req.query('recipient') ?? undefined,
+        status: c.req.query('status') as dispatchDb.DispatchMessageStatus | undefined,
+        limit: Number.isFinite(rawLimit) ? rawLimit : 100,
+      });
+      return c.json(messages);
+    } catch (error) {
+      getLog().error({ err: error }, 'dispatch_list_messages_failed');
+      return apiError(c, 500, 'Failed to list dispatch messages');
+    }
+  });
+
+  registerOpenApiRoute(claimDispatchMessageRoute, async c => {
+    try {
+      const body = getValidatedBody(c, claimDispatchMessageBodySchema);
+      const message = await dispatchDb.claimMessage({
+        id: c.req.param('id') ?? '',
+        worker_id: body.worker_id,
+        leaseDurationMs: body.lease_duration_ms,
+      });
+      if (!message) return apiError(c, 404, 'Dispatch message is not claimable');
+      return c.json(message);
+    } catch (error) {
+      getLog().error({ err: error }, 'dispatch_claim_message_failed');
+      return apiError(c, 500, 'Failed to claim dispatch message');
+    }
+  });
+
+  registerOpenApiRoute(postDispatchResultRoute, async c => {
+    try {
+      const body = getValidatedBody(c, postDispatchResultBodySchema);
+      const message = await dispatchDb.postResult({
+        id: c.req.param('id') ?? '',
+        worker_id: body.worker_id,
+        fencing_token: body.fencing_token,
+        result_body: body.result_body,
+        status: body.status,
+      });
+      if (!message) return apiError(c, 409, 'Stale fencing token or cancelled dispatch message');
+      return c.json(message);
+    } catch (error) {
+      getLog().error({ err: error }, 'dispatch_post_result_failed');
+      return apiError(c, 500, 'Failed to post dispatch result');
+    }
+  });
+
+  registerOpenApiRoute(cancelDispatchMessageRoute, async c => {
+    try {
+      const message = await dispatchDb.cancelMessage(c.req.param('id') ?? '');
+      if (!message) return apiError(c, 404, 'Dispatch message not found');
+      return c.json(message);
+    } catch (error) {
+      getLog().error({ err: error }, 'dispatch_cancel_message_failed');
+      return apiError(c, 500, 'Failed to cancel dispatch message');
+    }
+  });
+
+  registerOpenApiRoute(registerDispatchWorkerRoute, async c => {
+    try {
+      const body = getValidatedBody(c, registerDispatchWorkerBodySchema);
+      const worker = await dispatchDb.registerWorker(body);
+      return c.json(worker);
+    } catch (error) {
+      getLog().error({ err: error }, 'dispatch_register_worker_failed');
+      return apiError(c, 500, 'Failed to register dispatch worker');
+    }
+  });
+
+  registerOpenApiRoute(heartbeatDispatchWorkerRoute, async c => {
+    try {
+      const body = getValidatedBody(c, heartbeatDispatchWorkerBodySchema);
+      const worker = await dispatchDb.heartbeatWorker(body);
+      if (!worker) return apiError(c, 404, 'Dispatch worker not found');
+      return c.json(worker);
+    } catch (error) {
+      getLog().error({ err: error }, 'dispatch_heartbeat_worker_failed');
+      return apiError(c, 500, 'Failed to heartbeat dispatch worker');
+    }
+  });
+
   // GET /api/stream/__dashboard__ -- multiplexed dashboard SSE (all workflow events)
   // IMPORTANT: Must be registered before /api/stream/:conversationId to avoid param capture.
   app.get('/api/stream/__dashboard__', async c => {
@@ -2594,8 +2854,13 @@ export function registerApiRoutes(
     app.openapi(route, handler as never);
   }
 
-  /** Access Zod-validated body from a handler registered via registerOpenApiRoute. */
-  function getValidatedBody<T>(c: Context, _schema: z.ZodType<T>): T {
+  /**
+   * Access Zod-validated body from a handler registered via registerOpenApiRoute.
+   * Returns the schema OUTPUT type (post-parse), so `.default(...)` values are
+   * typed non-optional -- the validator applies defaults at runtime before the
+   * handler runs.
+   */
+  function getValidatedBody<T>(c: Context, _schema: z.ZodType<T, z.ZodTypeDef, unknown>): T {
     return (c.req as unknown as { valid(k: 'json'): T }).valid('json');
   }
 

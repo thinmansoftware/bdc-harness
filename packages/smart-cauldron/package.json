@@ -4,6 +4,10 @@
   "description": "Smart Cauldron v1.0 -- per-run escalation cascade. Fires WOs on cheapest tier first; climbs on gate-fail.",
   "type": "module",
   "main": "./src/cascade.ts",
+  "exports": {
+    ".": "./src/cascade.ts",
+    "./cascade": "./src/cascade.ts"
+  },
   "bin": {
     "smart-cauldron": "./src/cli.ts"
   },

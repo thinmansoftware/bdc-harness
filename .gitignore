@@ -134,3 +134,6 @@ fusion-runs/
 # Smart Cauldron v1.0 -- per-run cascade telemetry (local only, never in git)
 cascade-runs/*
 !cascade-runs/.gitkeep
+
+scripts/dispatch-worker/config.local.json
+scripts/dispatch-worker/transcripts/
