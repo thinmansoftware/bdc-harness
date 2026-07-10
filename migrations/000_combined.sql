@@ -351,6 +351,9 @@ CREATE TABLE IF NOT EXISTS remote_agent_run_authorities (
   created_at TIMESTAMP WITH TIME ZONE NOT NULL
 );
 
+CREATE UNIQUE INDEX IF NOT EXISTS idx_run_authorities_dispatch_id
+  ON remote_agent_run_authorities(dispatch_id);
+
 CREATE TABLE IF NOT EXISTS remote_agent_run_leases (
   run_id UUID PRIMARY KEY REFERENCES remote_agent_workflow_runs(id) ON DELETE CASCADE,
   owner_id TEXT NOT NULL,

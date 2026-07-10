@@ -1324,7 +1324,7 @@ describe('Smart Cauldron reliability persistence', () => {
 
     await expect(createRunAuthority(authority)).resolves.toBe('created');
     await expect(getRunAuthority(authority.runId)).resolves.toBeNull();
-    expect(mockQuery.mock.calls[0]?.[0]).toContain('ON CONFLICT (run_id) DO NOTHING');
+    expect(mockQuery.mock.calls[0]?.[0]).toContain('ON CONFLICT DO NOTHING');
   });
 
   test('accepts an idempotent authority insert but rejects changed authority', async () => {
@@ -1673,6 +1673,26 @@ describe('Smart Cauldron reliability persistence', () => {
       await expect(createRunAuthority(authority)).resolves.toBe('created');
       await expect(createRunAuthority(authority)).resolves.toBe('unchanged');
       await expect(getRunAuthority(authority.runId)).resolves.toEqual(authority);
+
+      const duplicateDispatchRunId = '88888888-8888-4888-8888-888888888888';
+      await sqlite.query(
+        `INSERT INTO remote_agent_workflow_runs
+         (id, conversation_id, codebase_id, workflow_name, user_message, status)
+         VALUES ($1, $2, $3, $4, $5, $6)`,
+        [
+          duplicateDispatchRunId,
+          '77777777-7777-4777-8777-777777777777',
+          authority.codebaseId,
+          authority.workflowName,
+          'duplicate dispatch test',
+          'running',
+        ]
+      );
+      await expect(
+        createRunAuthority({ ...authority, runId: duplicateDispatchRunId })
+      ).rejects.toThrow('dispatch_conflict');
+      await expect(getRunAuthority(authority.runId)).resolves.toEqual(authority);
+      await expect(getRunAuthority(duplicateDispatchRunId)).resolves.toBeNull();
 
       await expect(claimRunLease(lease)).resolves.toEqual(lease);
       await expect(

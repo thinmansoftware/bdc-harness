@@ -363,7 +363,7 @@ export async function createRunAuthority(
       engine_revision, runtime_image_revision, created_at)
      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
              $15, $16, $17, $18, $19)
-     ON CONFLICT (run_id) DO NOTHING
+     ON CONFLICT DO NOTHING
      RETURNING *`,
     [
       authority.runId,
@@ -391,7 +391,22 @@ export async function createRunAuthority(
 
   const existing = await getRunAuthority(authority.runId);
   if (existing && runAuthoritiesEqual(existing, authority)) return 'unchanged';
+  const existingDispatch = await getRunAuthorityByDispatchId(authority.dispatchId);
+  if (existingDispatch && existingDispatch.runId !== authority.runId) {
+    throw new Error(
+      `dispatch_conflict: dispatch ${authority.dispatchId} already belongs to run ${existingDispatch.runId}`
+    );
+  }
   throw new Error(`authority_conflict: immutable authority differs for run ${authority.runId}`);
+}
+
+async function getRunAuthorityByDispatchId(dispatchId: string): Promise<RunAuthorityRecord | null> {
+  const result = await pool.query<RunAuthorityRow>(
+    'SELECT * FROM remote_agent_run_authorities WHERE dispatch_id = $1',
+    [dispatchId]
+  );
+  const row = result.rows[0];
+  return row ? normalizeRunAuthority(row) : null;
 }
 
 export async function getRunAuthority(runId: string): Promise<RunAuthorityRecord | null> {

@@ -359,6 +359,9 @@ export class SqliteAdapter implements IDatabase {
         created_at TEXT NOT NULL
       );
 
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_run_authorities_dispatch_id
+        ON remote_agent_run_authorities(dispatch_id);
+
       -- One renewable worker lease per workflow run
       CREATE TABLE IF NOT EXISTS remote_agent_run_leases (
         run_id TEXT PRIMARY KEY REFERENCES remote_agent_workflow_runs(id) ON DELETE CASCADE,
