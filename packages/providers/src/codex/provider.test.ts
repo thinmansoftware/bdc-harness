@@ -2334,6 +2334,78 @@ describe('WO-HARNESS-CODEX-AUTH-FAILBACK-01', () => {
     expect(factoryCallCount).toBe(1);
     expect(failbackSendQuery).toHaveBeenCalledTimes(1);
   }, 10_000);
+
+  test('dead-auth refresh token was revoked wraps failback AbortError without unhandled rejection', async () => {
+    mockRunStreamed.mockRejectedValue(new Error('The refresh token was revoked'));
+    const unhandledRejection = mock((_reason: unknown) => {});
+    process.on('unhandledRejection', unhandledRejection);
+    const abortError = new Error('This operation was aborted');
+    abortError.name = 'AbortError';
+    const failbackSendQuery = mock(async function* () {
+      throw abortError;
+    });
+    const failbackProvider = {
+      sendQuery: failbackSendQuery,
+      getType: () => 'claude',
+      getCapabilities: () => ({}) as unknown as ReturnType<CodexProvider['getCapabilities']>,
+    };
+    const client = new CodexProvider({
+      retryBaseDelayMs: 1,
+      failbackProviderFactory: () => failbackProvider,
+    });
+
+    const consume = async (): Promise<void> => {
+      for await (const _ of client.sendQuery('review diff', '/workspace')) {
+        // consume
+      }
+    };
+
+    try {
+      await expect(consume()).rejects.toThrow(/codex auth error/i);
+      await new Promise(resolve => setTimeout(resolve, 0));
+      expect(failbackSendQuery).toHaveBeenCalledTimes(1);
+      expect(unhandledRejection).not.toHaveBeenCalled();
+    } finally {
+      process.off('unhandledRejection', unhandledRejection);
+    }
+  }, 10_000);
+
+  test('dead-auth rotation collision failback fires once and reports auth failure normally', async () => {
+    const unhandledRejection = mock((_reason: unknown) => {});
+    process.on('unhandledRejection', unhandledRejection);
+    const failbackSendQuery = mock(async function* () {
+      throw new Error('This operation was aborted');
+    });
+    const failbackProvider = {
+      sendQuery: failbackSendQuery,
+      getType: () => 'claude',
+      getCapabilities: () => ({}) as unknown as ReturnType<CodexProvider['getCapabilities']>,
+    };
+    let factoryCallCount = 0;
+    const client = new CodexProvider({
+      retryBaseDelayMs: 1,
+      failbackProviderFactory: () => {
+        factoryCallCount++;
+        return failbackProvider;
+      },
+    });
+
+    const consume = async (): Promise<void> => {
+      for await (const _ of client.sendQuery('review diff', '/workspace')) {
+        // consume
+      }
+    };
+
+    try {
+      await expect(consume()).rejects.toThrow(/codex auth error/i);
+      await new Promise(resolve => setTimeout(resolve, 0));
+      expect(factoryCallCount).toBe(1);
+      expect(failbackSendQuery).toHaveBeenCalledTimes(1);
+      expect(unhandledRejection).not.toHaveBeenCalled();
+    } finally {
+      process.off('unhandledRejection', unhandledRejection);
+    }
+  }, 10_000);
 });
 
 // T3 (WO-HARNESS-LAYER1-SERVED-MODEL-CAPTURE-01): the spec asks for a Codex
