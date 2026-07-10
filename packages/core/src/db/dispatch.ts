@@ -88,7 +88,7 @@ function normalizeWorker(row: DispatchWorkerRow): DispatchWorker {
   return {
     ...row,
     capabilities: parseCapabilities(row.capabilities),
-    max_concurrency: Number(row.max_concurrency),
+    max_concurrency: row.max_concurrency,
     registered_at: normalizeTimestamp(row.registered_at),
     last_heartbeat_at: normalizeTimestamp(row.last_heartbeat_at),
   };
@@ -263,7 +263,7 @@ export async function claimMessage(data: {
     if (worker.rowCount !== 1) return null;
 
     const existing = await txQuery<DispatchMessageRow>(
-      `SELECT * FROM agent_dispatch_messages WHERE id = $1`,
+      'SELECT * FROM agent_dispatch_messages WHERE id = $1',
       [data.id]
     );
     const row = existing.rows[0];
