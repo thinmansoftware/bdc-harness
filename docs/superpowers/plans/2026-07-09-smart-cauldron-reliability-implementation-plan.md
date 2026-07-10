@@ -292,7 +292,10 @@ Commit: `feat(workflows): add reliability outcome contracts`
 ### Files
 
 - Modify: `packages/core/src/db/adapters/sqlite.ts`
-- Modify: `packages/core/src/db/adapters/postgres.ts`
+- Modify: `packages/core/src/db/adapters/sqlite.test.ts`
+- Modify: `packages/core/src/db/adapters/postgres.test.ts`
+- Create: `migrations/024_smart_cauldron_reliability.sql`
+- Modify: `migrations/000_combined.sql`
 - Modify: `packages/core/src/db/workflows.ts`
 - Modify: `packages/core/src/db/workflows.test.ts`
 - Modify: `packages/workflows/src/store.ts`
@@ -306,7 +309,9 @@ Commit: `feat(workflows): add reliability outcome contracts`
 3. Add indexes for active leases, due waits, and run/node attempts.
 4. Add create/read/update methods with compare-and-swap where ownership matters.
 5. Keep existing run rows and events unchanged for compatibility.
-6. Prove SQLite and Postgres adapters expose equivalent behavior.
+6. Prove SQLite's additive initializer and PostgreSQL's canonical numbered
+   migration expose equivalent schema and store behavior. Do not add a competing
+   PostgreSQL auto-migration path.
 
 Commit: `feat(core): persist Smart Cauldron reliability state`
 

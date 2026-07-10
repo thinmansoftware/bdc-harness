@@ -1,6 +1,16 @@
 import { mock, describe, test, expect, beforeEach } from 'bun:test';
+import { unlinkSync } from 'fs';
+import { join } from 'path';
 import { createQueryResult, mockPostgresDialect } from '../test/mocks/database';
+import { SqliteAdapter } from './adapters/sqlite';
 import type { WorkflowRun } from '@archon/workflows/schemas/workflow-run';
+import type {
+  ProviderAttemptRecord,
+  RunAuthorityRecord,
+  RunLeaseRecord,
+  RunOutcome,
+  ScheduledProviderWaitRecord,
+} from '@archon/workflows/reliability/types';
 
 const mockQuery = mock(() => Promise.resolve(createQueryResult([])));
 
@@ -30,6 +40,21 @@ import {
   sumWorkflowTokensInWindow,
   deleteOldWorkflowRuns,
   deleteWorkflowRun,
+  createRunAuthority,
+  getRunAuthority,
+  claimRunLease,
+  heartbeatRunLease,
+  releaseRunLease,
+  createProviderAttempt,
+  completeProviderAttempt,
+  listProviderAttempts,
+  upsertRunOutcome,
+  getRunOutcome,
+  scheduleProviderWait,
+  listDueProviderWaits,
+  claimProviderWait,
+  cancelProviderWaits,
+  completeProviderWait,
 } from './workflows';
 
 describe('workflows database', () => {
@@ -982,5 +1007,419 @@ describe('workflows database', () => {
         'Failed to delete workflow run: constraint violation'
       );
     });
+  });
+});
+
+describe('Smart Cauldron reliability persistence', () => {
+  beforeEach(() => {
+    mockQuery.mockReset();
+    mockQuery.mockImplementation(() => Promise.resolve(createQueryResult([])));
+  });
+
+  const authority: RunAuthorityRecord = {
+    runId: '11111111-1111-4111-8111-111111111111',
+    dispatchId: 'dispatch-1',
+    woId: 'WO-HARNESS-TEST-01',
+    specSource: 'git:docs/work-orders/test.md',
+    specRevision: 'a'.repeat(40),
+    specHash: 'b'.repeat(64),
+    workflowName: 'test-workflow',
+    codebaseId: '22222222-2222-4222-8222-222222222222',
+    canonicalRemote: 'owner/repo',
+    baseBranch: 'dev',
+    baseSha: 'c'.repeat(40),
+    runScopeSha: 'd'.repeat(40),
+    headBranch: 'wo/test',
+    worktreePath: '/worktrees/test',
+    workflowRevision: 'e'.repeat(64),
+    bundleRevision: 'bundle-1',
+    engineRevision: 'f'.repeat(40),
+    runtimeImageRevision: null,
+    createdAt: '2026-07-09T12:00:00.000Z',
+  };
+
+  const authorityRow = {
+    run_id: authority.runId,
+    dispatch_id: authority.dispatchId,
+    wo_id: authority.woId,
+    spec_source: authority.specSource,
+    spec_revision: authority.specRevision,
+    spec_hash: authority.specHash,
+    workflow_name: authority.workflowName,
+    codebase_id: authority.codebaseId,
+    canonical_remote: authority.canonicalRemote,
+    base_branch: authority.baseBranch,
+    base_sha: authority.baseSha,
+    run_scope_sha: authority.runScopeSha,
+    head_branch: authority.headBranch,
+    worktree_path: authority.worktreePath,
+    workflow_revision: authority.workflowRevision,
+    bundle_revision: authority.bundleRevision,
+    engine_revision: authority.engineRevision,
+    runtime_image_revision: authority.runtimeImageRevision,
+    created_at: authority.createdAt,
+  };
+
+  test('creates immutable authority and returns its normalized record', async () => {
+    mockQuery.mockResolvedValueOnce(createQueryResult([authorityRow], 1));
+
+    await expect(createRunAuthority(authority)).resolves.toBe('created');
+    await expect(getRunAuthority(authority.runId)).resolves.toBeNull();
+    expect(mockQuery.mock.calls[0]?.[0]).toContain('ON CONFLICT (run_id) DO NOTHING');
+  });
+
+  test('accepts an idempotent authority insert but rejects changed authority', async () => {
+    mockQuery
+      .mockResolvedValueOnce(createQueryResult([], 0))
+      .mockResolvedValueOnce(
+        createQueryResult([{ ...authorityRow, created_at: new Date(authority.createdAt) }], 1)
+      );
+    await expect(createRunAuthority(authority)).resolves.toBe('unchanged');
+
+    mockQuery
+      .mockResolvedValueOnce(createQueryResult([], 0))
+      .mockResolvedValueOnce(
+        createQueryResult([{ ...authorityRow, base_sha: 'changed-base-sha' }], 1)
+      );
+    await expect(createRunAuthority(authority)).rejects.toThrow('authority_conflict');
+  });
+
+  const lease: RunLeaseRecord = {
+    runId: authority.runId,
+    ownerId: 'worker-1',
+    leaseToken: '33333333-3333-4333-8333-333333333333',
+    acquiredAt: '2026-07-09T12:00:00.000Z',
+    lastHeartbeatAt: '2026-07-09T12:00:00.000Z',
+    expiresAt: '2026-07-09T12:01:00.000Z',
+    releasedAt: null,
+  };
+
+  test('claims only absent, released, or expired leases and protects heartbeat/release by token', async () => {
+    mockQuery.mockResolvedValueOnce(
+      createQueryResult([
+        {
+          run_id: lease.runId,
+          owner_id: lease.ownerId,
+          lease_token: lease.leaseToken,
+          acquired_at: lease.acquiredAt,
+          last_heartbeat_at: lease.lastHeartbeatAt,
+          expires_at: lease.expiresAt,
+          released_at: null,
+        },
+      ])
+    );
+    await expect(claimRunLease(lease)).resolves.toEqual(lease);
+    expect(mockQuery.mock.calls[0]?.[0]).toContain('expires_at <= EXCLUDED.acquired_at');
+
+    mockQuery.mockResolvedValueOnce(createQueryResult([], 1));
+    await expect(
+      heartbeatRunLease({
+        runId: lease.runId,
+        ownerId: lease.ownerId,
+        leaseToken: lease.leaseToken,
+        heartbeatAt: '2026-07-09T12:00:30.000Z',
+        expiresAt: '2026-07-09T12:01:30.000Z',
+      })
+    ).resolves.toBe(true);
+    expect(mockQuery.mock.calls[1]?.[0]).toContain('lease_token = $3');
+
+    mockQuery.mockResolvedValueOnce(createQueryResult([], 0));
+    await expect(
+      releaseRunLease({
+        runId: lease.runId,
+        ownerId: lease.ownerId,
+        leaseToken: 'wrong-token',
+        releasedAt: '2026-07-09T12:00:40.000Z',
+      })
+    ).resolves.toBe(false);
+  });
+
+  const attempt: ProviderAttemptRecord = {
+    attemptId: '44444444-4444-4444-8444-444444444444',
+    runId: authority.runId,
+    nodeId: 'implement',
+    attemptNumber: 1,
+    provider: 'claude',
+    model: 'opus',
+    declaredProvider: 'claude',
+    declaredModel: 'opus',
+    requiredCapabilities: ['repo_read', 'repo_write', 'shell'],
+    startedAt: '2026-07-09T12:00:00.000Z',
+    completedAt: null,
+    servedModelId: null,
+    outcomeClass: null,
+    reasonCode: null,
+    resumeAt: null,
+    supersedesAttemptId: null,
+  };
+
+  test('persists attempts before calls and completes each attempt once', async () => {
+    mockQuery.mockResolvedValueOnce(createQueryResult([{ attempt_id: attempt.attemptId }], 1));
+    await expect(createProviderAttempt(attempt)).resolves.toBe(true);
+    expect(mockQuery.mock.calls[0]?.[1]).toContain(JSON.stringify(attempt.requiredCapabilities));
+
+    mockQuery.mockResolvedValueOnce(createQueryResult([], 1));
+    await expect(
+      completeProviderAttempt({
+        attemptId: attempt.attemptId,
+        completedAt: '2026-07-09T12:00:10.000Z',
+        servedModelId: 'claude-opus-4-7',
+        outcomeClass: 'quota',
+        reasonCode: 'provider_quota_wait',
+        resumeAt: '2026-07-09T17:00:00.000Z',
+      })
+    ).resolves.toBe(true);
+    expect(mockQuery.mock.calls[1]?.[0]).toContain('completed_at IS NULL');
+  });
+
+  test('normalizes attempt JSON arrays', async () => {
+    mockQuery.mockResolvedValueOnce(
+      createQueryResult([
+        {
+          attempt_id: attempt.attemptId,
+          run_id: attempt.runId,
+          node_id: attempt.nodeId,
+          attempt_number: attempt.attemptNumber,
+          provider: attempt.provider,
+          model: attempt.model,
+          declared_provider: attempt.declaredProvider,
+          declared_model: attempt.declaredModel,
+          required_capabilities: JSON.stringify(attempt.requiredCapabilities),
+          started_at: attempt.startedAt,
+          completed_at: null,
+          served_model_id: null,
+          outcome_class: null,
+          reason_code: null,
+          resume_at: null,
+          supersedes_attempt_id: null,
+        },
+      ])
+    );
+    await expect(listProviderAttempts(attempt.runId, attempt.nodeId)).resolves.toEqual([attempt]);
+  });
+
+  const outcome: RunOutcome = {
+    executionState: 'waiting_provider',
+    deliverableState: 'worktree_changes',
+    validationState: 'not_run',
+    recoveryState: 'recoverable',
+    routeState: 'exhausted',
+    primaryReason: 'provider_quota_wait',
+    reasonCodes: ['provider_quota_wait'],
+    evidenceRefs: ['attempt:' + attempt.attemptId],
+  };
+
+  test('upserts and reads multidimensional outcomes without changing legacy run rows', async () => {
+    mockQuery.mockResolvedValueOnce(createQueryResult([{ run_id: authority.runId }], 1));
+    await expect(
+      upsertRunOutcome(authority.runId, outcome, '2026-07-09T12:00:10.000Z')
+    ).resolves.toBe(true);
+    expect(mockQuery.mock.calls[0]?.[0]).toContain('remote_agent_run_outcomes');
+    expect(mockQuery.mock.calls[0]?.[0]).not.toContain('remote_agent_workflow_runs');
+    expect(mockQuery.mock.calls[0]?.[0]).toContain(
+      'remote_agent_run_outcomes.updated_at <= EXCLUDED.updated_at'
+    );
+
+    mockQuery.mockResolvedValueOnce(
+      createQueryResult([
+        {
+          run_id: authority.runId,
+          execution_state: outcome.executionState,
+          deliverable_state: outcome.deliverableState,
+          validation_state: outcome.validationState,
+          recovery_state: outcome.recoveryState,
+          route_state: outcome.routeState,
+          primary_reason: outcome.primaryReason,
+          reason_codes: JSON.stringify(outcome.reasonCodes),
+          evidence_refs: JSON.stringify(outcome.evidenceRefs),
+          updated_at: '2026-07-09T12:00:10.000Z',
+        },
+      ])
+    );
+    await expect(getRunOutcome(authority.runId)).resolves.toEqual(outcome);
+  });
+
+  const wait: ScheduledProviderWaitRecord = {
+    waitId: '55555555-5555-4555-8555-555555555555',
+    runId: authority.runId,
+    attemptId: attempt.attemptId,
+    provider: 'claude',
+    reasonCode: 'provider_quota_wait',
+    resumeAt: '2026-07-09T17:00:00.000Z',
+    state: 'scheduled',
+    claimOwnerId: null,
+    claimToken: null,
+    createdAt: '2026-07-09T12:00:10.000Z',
+    claimedAt: null,
+    cancelledAt: null,
+    completedAt: null,
+  };
+
+  test('schedules, atomically claims, cancels, and completes durable waits', async () => {
+    mockQuery.mockResolvedValueOnce(createQueryResult([{ wait_id: wait.waitId }], 1));
+    await expect(scheduleProviderWait(wait)).resolves.toBe(true);
+
+    mockQuery.mockResolvedValueOnce(createQueryResult([], 1));
+    await expect(
+      claimProviderWait({
+        waitId: wait.waitId,
+        ownerId: 'scheduler-1',
+        claimToken: '66666666-6666-4666-8666-666666666666',
+        claimedAt: wait.resumeAt,
+      })
+    ).resolves.toBe(true);
+    expect(mockQuery.mock.calls[1]?.[0]).toContain("state = 'scheduled'");
+    expect(mockQuery.mock.calls[1]?.[0]).toContain('resume_at <= $4');
+
+    mockQuery.mockResolvedValueOnce(createQueryResult([], 2));
+    await expect(cancelProviderWaits(wait.runId, wait.resumeAt)).resolves.toBe(2);
+
+    mockQuery.mockResolvedValueOnce(createQueryResult([], 1));
+    await expect(
+      completeProviderWait({
+        waitId: wait.waitId,
+        claimToken: '66666666-6666-4666-8666-666666666666',
+        completedAt: '2026-07-09T17:00:01.000Z',
+      })
+    ).resolves.toBe(true);
+  });
+
+  test('lists due waits in resume order with a bounded limit', async () => {
+    mockQuery.mockResolvedValueOnce(
+      createQueryResult([
+        {
+          wait_id: wait.waitId,
+          run_id: wait.runId,
+          attempt_id: wait.attemptId,
+          provider: wait.provider,
+          reason_code: wait.reasonCode,
+          resume_at: wait.resumeAt,
+          state: wait.state,
+          claim_owner_id: null,
+          claim_token: null,
+          created_at: wait.createdAt,
+          claimed_at: null,
+          cancelled_at: null,
+          completed_at: null,
+        },
+      ])
+    );
+    await expect(listDueProviderWaits(wait.resumeAt, 25)).resolves.toEqual([wait]);
+    expect(mockQuery).toHaveBeenCalledWith(expect.stringContaining('ORDER BY resume_at ASC'), [
+      wait.resumeAt,
+      25,
+    ]);
+  });
+
+  test('executes the reliability contract end-to-end on SQLite', async () => {
+    const dbPath = join(
+      import.meta.dir,
+      `.test-reliability-${Date.now()}-${Math.random().toString(36).slice(2)}.db`
+    );
+    const sqlite = new SqliteAdapter(dbPath);
+    mockQuery.mockImplementation((sql: string, params?: unknown[]) => sqlite.query(sql, params));
+
+    try {
+      await sqlite.query(
+        `INSERT INTO remote_agent_codebases (id, name, default_cwd) VALUES ($1, $2, $3)`,
+        [authority.codebaseId, 'test-codebase', '/tmp/test']
+      );
+      await sqlite.query(
+        `INSERT INTO remote_agent_conversations
+         (id, platform_type, platform_conversation_id, codebase_id)
+         VALUES ($1, $2, $3, $4)`,
+        ['77777777-7777-4777-8777-777777777777', 'test', 'conversation-1', authority.codebaseId]
+      );
+      await sqlite.query(
+        `INSERT INTO remote_agent_workflow_runs
+         (id, conversation_id, codebase_id, workflow_name, user_message, status)
+         VALUES ($1, $2, $3, $4, $5, $6)`,
+        [
+          authority.runId,
+          '77777777-7777-4777-8777-777777777777',
+          authority.codebaseId,
+          authority.workflowName,
+          'test',
+          'running',
+        ]
+      );
+
+      await expect(createRunAuthority(authority)).resolves.toBe('created');
+      await expect(createRunAuthority(authority)).resolves.toBe('unchanged');
+      await expect(getRunAuthority(authority.runId)).resolves.toEqual(authority);
+
+      await expect(claimRunLease(lease)).resolves.toEqual(lease);
+      await expect(
+        claimRunLease({ ...lease, ownerId: 'worker-2', leaseToken: crypto.randomUUID() })
+      ).resolves.toBeNull();
+      await expect(
+        heartbeatRunLease({
+          runId: lease.runId,
+          ownerId: lease.ownerId,
+          leaseToken: lease.leaseToken,
+          heartbeatAt: '2026-07-09T12:00:30.000Z',
+          expiresAt: '2026-07-09T12:01:30.000Z',
+        })
+      ).resolves.toBe(true);
+
+      await expect(createProviderAttempt(attempt)).resolves.toBe(true);
+      await expect(createProviderAttempt(attempt)).resolves.toBe(false);
+      await expect(listProviderAttempts(attempt.runId, attempt.nodeId)).resolves.toEqual([attempt]);
+
+      await expect(
+        upsertRunOutcome(authority.runId, outcome, '2026-07-09T12:00:10.000Z')
+      ).resolves.toBe(true);
+      await expect(getRunOutcome(authority.runId)).resolves.toEqual(outcome);
+      await expect(
+        upsertRunOutcome(
+          authority.runId,
+          {
+            ...outcome,
+            executionState: 'failed',
+            primaryReason: 'execution_failed',
+            reasonCodes: ['execution_failed'],
+          },
+          '2026-07-09T12:00:09.000Z'
+        )
+      ).resolves.toBe(false);
+      await expect(getRunOutcome(authority.runId)).resolves.toEqual(outcome);
+
+      await expect(scheduleProviderWait(wait)).resolves.toBe(true);
+      await expect(listDueProviderWaits('2026-07-09T16:59:59.000Z', 10)).resolves.toEqual([]);
+      await expect(listDueProviderWaits(wait.resumeAt, 10)).resolves.toEqual([wait]);
+      await expect(
+        claimProviderWait({
+          waitId: wait.waitId,
+          ownerId: 'scheduler-1',
+          claimToken: '66666666-6666-4666-8666-666666666666',
+          claimedAt: wait.resumeAt,
+        })
+      ).resolves.toBe(true);
+      await expect(cancelProviderWaits(wait.runId, wait.resumeAt)).resolves.toBe(1);
+      await expect(
+        completeProviderWait({
+          waitId: wait.waitId,
+          claimToken: '66666666-6666-4666-8666-666666666666',
+          completedAt: '2026-07-09T17:00:01.000Z',
+        })
+      ).resolves.toBe(false);
+      await expect(
+        releaseRunLease({
+          runId: lease.runId,
+          ownerId: lease.ownerId,
+          leaseToken: lease.leaseToken,
+          releasedAt: '2026-07-09T17:00:01.000Z',
+        })
+      ).resolves.toBe(true);
+    } finally {
+      await sqlite.close();
+      for (const suffix of ['', '-wal', '-shm']) {
+        try {
+          unlinkSync(dbPath + suffix);
+        } catch {
+          // File may not exist depending on SQLite checkpoint timing.
+        }
+      }
+    }
   });
 });

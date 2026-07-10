@@ -6,6 +6,13 @@
  * the workflow engine depends only on this narrow interface.
  */
 import type { WorkflowRun, WorkflowRunStatus, ApprovalContext } from './schemas';
+import type {
+  ProviderAttemptRecord,
+  RunAuthorityRecord,
+  RunLeaseRecord,
+  RunOutcome,
+  ScheduledProviderWaitRecord,
+} from './reliability/types';
 
 export const WORKFLOW_EVENT_TYPES = [
   'workflow_started',
@@ -102,6 +109,50 @@ export interface IWorkflowStore {
   failWorkflowRun(id: string, error: string): Promise<void>;
   pauseWorkflowRun(id: string, approvalContext: ApprovalContext): Promise<void>;
   cancelWorkflowRun(id: string): Promise<void>;
+
+  // Smart Cauldron reliability state
+  createRunAuthority(authority: RunAuthorityRecord): Promise<'created' | 'unchanged'>;
+  getRunAuthority(runId: string): Promise<RunAuthorityRecord | null>;
+  claimRunLease(lease: RunLeaseRecord): Promise<RunLeaseRecord | null>;
+  heartbeatRunLease(data: {
+    runId: string;
+    ownerId: string;
+    leaseToken: string;
+    heartbeatAt: string;
+    expiresAt: string;
+  }): Promise<boolean>;
+  releaseRunLease(data: {
+    runId: string;
+    ownerId: string;
+    leaseToken: string;
+    releasedAt: string;
+  }): Promise<boolean>;
+  createProviderAttempt(attempt: ProviderAttemptRecord): Promise<boolean>;
+  completeProviderAttempt(data: {
+    attemptId: string;
+    completedAt: string;
+    servedModelId: string | null;
+    outcomeClass: ProviderAttemptRecord['outcomeClass'];
+    reasonCode: ProviderAttemptRecord['reasonCode'];
+    resumeAt: string | null;
+  }): Promise<boolean>;
+  listProviderAttempts(runId: string, nodeId?: string): Promise<ProviderAttemptRecord[]>;
+  upsertRunOutcome(runId: string, outcome: RunOutcome, updatedAt: string): Promise<boolean>;
+  getRunOutcome(runId: string): Promise<RunOutcome | null>;
+  scheduleProviderWait(wait: ScheduledProviderWaitRecord): Promise<boolean>;
+  listDueProviderWaits(dueAt: string, limit: number): Promise<ScheduledProviderWaitRecord[]>;
+  claimProviderWait(data: {
+    waitId: string;
+    ownerId: string;
+    claimToken: string;
+    claimedAt: string;
+  }): Promise<boolean>;
+  cancelProviderWaits(runId: string, cancelledAt: string): Promise<number>;
+  completeProviderWait(data: {
+    waitId: string;
+    claimToken: string;
+    completedAt: string;
+  }): Promise<boolean>;
 
   /**
    * Create a workflow event. Implementations MUST NOT throw -- catch all errors

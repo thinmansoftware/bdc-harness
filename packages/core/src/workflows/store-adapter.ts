@@ -44,6 +44,21 @@ export function createWorkflowStore(): IWorkflowStore {
     failWorkflowRun: workflowDb.failWorkflowRun,
     pauseWorkflowRun: workflowDb.pauseWorkflowRun,
     cancelWorkflowRun: workflowDb.cancelWorkflowRun,
+    createRunAuthority: workflowDb.createRunAuthority,
+    getRunAuthority: workflowDb.getRunAuthority,
+    claimRunLease: workflowDb.claimRunLease,
+    heartbeatRunLease: workflowDb.heartbeatRunLease,
+    releaseRunLease: workflowDb.releaseRunLease,
+    createProviderAttempt: workflowDb.createProviderAttempt,
+    completeProviderAttempt: workflowDb.completeProviderAttempt,
+    listProviderAttempts: workflowDb.listProviderAttempts,
+    upsertRunOutcome: workflowDb.upsertRunOutcome,
+    getRunOutcome: workflowDb.getRunOutcome,
+    scheduleProviderWait: workflowDb.scheduleProviderWait,
+    listDueProviderWaits: workflowDb.listDueProviderWaits,
+    claimProviderWait: workflowDb.claimProviderWait,
+    cancelProviderWaits: workflowDb.cancelProviderWaits,
+    completeProviderWait: workflowDb.completeProviderWait,
     createWorkflowEvent: async (data): Promise<void> => {
       try {
         await workflowEventDb.createWorkflowEvent(data);

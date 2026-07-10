@@ -9,6 +9,15 @@ import type {
   ApprovalContext,
 } from '@archon/workflows/schemas/workflow-run';
 import { TERMINAL_WORKFLOW_STATUSES } from '@archon/workflows/schemas/workflow-run';
+import type {
+  ExecutionCapability,
+  ProviderAttemptOutcomeClass,
+  ProviderAttemptRecord,
+  RunAuthorityRecord,
+  RunLeaseRecord,
+  RunOutcome,
+  ScheduledProviderWaitRecord,
+} from '@archon/workflows/reliability/types';
 import { createLogger } from '@archon/paths';
 
 /** Best-effort ROLLBACK -- log but swallow errors since we're already in an error path. */
@@ -38,6 +47,200 @@ function normalizeWorkflowRun<T extends WorkflowRun>(row: T): T {
     }
   }
   return row;
+}
+
+type DbTimestamp = string | Date;
+
+interface RunAuthorityRow {
+  run_id: string;
+  dispatch_id: string;
+  wo_id: string;
+  spec_source: string;
+  spec_revision: string;
+  spec_hash: string;
+  workflow_name: string;
+  codebase_id: string;
+  canonical_remote: string;
+  base_branch: string;
+  base_sha: string;
+  run_scope_sha: string;
+  head_branch: string;
+  worktree_path: string;
+  workflow_revision: string;
+  bundle_revision: string;
+  engine_revision: string;
+  runtime_image_revision: string | null;
+  created_at: DbTimestamp;
+}
+
+interface RunLeaseRow {
+  run_id: string;
+  owner_id: string;
+  lease_token: string;
+  acquired_at: DbTimestamp;
+  last_heartbeat_at: DbTimestamp;
+  expires_at: DbTimestamp;
+  released_at: DbTimestamp | null;
+}
+
+interface ProviderAttemptRow {
+  attempt_id: string;
+  run_id: string;
+  node_id: string;
+  attempt_number: number;
+  provider: string;
+  model: string;
+  declared_provider: string;
+  declared_model: string;
+  required_capabilities: unknown;
+  started_at: DbTimestamp;
+  completed_at: DbTimestamp | null;
+  served_model_id: string | null;
+  outcome_class: ProviderAttemptOutcomeClass | null;
+  reason_code: ProviderAttemptRecord['reasonCode'];
+  resume_at: DbTimestamp | null;
+  supersedes_attempt_id: string | null;
+}
+
+interface RunOutcomeRow {
+  execution_state: RunOutcome['executionState'];
+  deliverable_state: RunOutcome['deliverableState'];
+  validation_state: RunOutcome['validationState'];
+  recovery_state: RunOutcome['recoveryState'];
+  route_state: RunOutcome['routeState'];
+  primary_reason: RunOutcome['primaryReason'];
+  reason_codes: unknown;
+  evidence_refs: unknown;
+}
+
+interface ScheduledProviderWaitRow {
+  wait_id: string;
+  run_id: string;
+  attempt_id: string;
+  provider: string;
+  reason_code: ScheduledProviderWaitRecord['reasonCode'];
+  resume_at: DbTimestamp;
+  state: ScheduledProviderWaitRecord['state'];
+  claim_owner_id: string | null;
+  claim_token: string | null;
+  created_at: DbTimestamp;
+  claimed_at: DbTimestamp | null;
+  cancelled_at: DbTimestamp | null;
+  completed_at: DbTimestamp | null;
+}
+
+function normalizeTimestamp(value: DbTimestamp): string {
+  return value instanceof Date ? value.toISOString() : value;
+}
+
+function normalizeNullableTimestamp(value: DbTimestamp | null): string | null {
+  return value === null ? null : normalizeTimestamp(value);
+}
+
+function parseJsonArray<T extends string>(value: unknown): T[] {
+  if (Array.isArray(value)) return value as T[];
+  if (typeof value !== 'string') return [];
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    return Array.isArray(parsed) ? (parsed as T[]) : [];
+  } catch {
+    return [];
+  }
+}
+
+function normalizeRunAuthority(row: RunAuthorityRow): RunAuthorityRecord {
+  return {
+    runId: row.run_id,
+    dispatchId: row.dispatch_id,
+    woId: row.wo_id,
+    specSource: row.spec_source,
+    specRevision: row.spec_revision,
+    specHash: row.spec_hash,
+    workflowName: row.workflow_name,
+    codebaseId: row.codebase_id,
+    canonicalRemote: row.canonical_remote,
+    baseBranch: row.base_branch,
+    baseSha: row.base_sha,
+    runScopeSha: row.run_scope_sha,
+    headBranch: row.head_branch,
+    worktreePath: row.worktree_path,
+    workflowRevision: row.workflow_revision,
+    bundleRevision: row.bundle_revision,
+    engineRevision: row.engine_revision,
+    runtimeImageRevision: row.runtime_image_revision,
+    createdAt: normalizeTimestamp(row.created_at),
+  };
+}
+
+function runAuthoritiesEqual(left: RunAuthorityRecord, right: RunAuthorityRecord): boolean {
+  const keys = Object.keys(left) as (keyof RunAuthorityRecord)[];
+  return keys.length === Object.keys(right).length && keys.every(key => left[key] === right[key]);
+}
+
+function normalizeRunLease(row: RunLeaseRow): RunLeaseRecord {
+  return {
+    runId: row.run_id,
+    ownerId: row.owner_id,
+    leaseToken: row.lease_token,
+    acquiredAt: normalizeTimestamp(row.acquired_at),
+    lastHeartbeatAt: normalizeTimestamp(row.last_heartbeat_at),
+    expiresAt: normalizeTimestamp(row.expires_at),
+    releasedAt: normalizeNullableTimestamp(row.released_at),
+  };
+}
+
+function normalizeProviderAttempt(row: ProviderAttemptRow): ProviderAttemptRecord {
+  return {
+    attemptId: row.attempt_id,
+    runId: row.run_id,
+    nodeId: row.node_id,
+    attemptNumber: row.attempt_number,
+    provider: row.provider,
+    model: row.model,
+    declaredProvider: row.declared_provider,
+    declaredModel: row.declared_model,
+    requiredCapabilities: parseJsonArray<ExecutionCapability>(row.required_capabilities),
+    startedAt: normalizeTimestamp(row.started_at),
+    completedAt: normalizeNullableTimestamp(row.completed_at),
+    servedModelId: row.served_model_id,
+    outcomeClass: row.outcome_class,
+    reasonCode: row.reason_code,
+    resumeAt: normalizeNullableTimestamp(row.resume_at),
+    supersedesAttemptId: row.supersedes_attempt_id,
+  };
+}
+
+function normalizeRunOutcome(row: RunOutcomeRow): RunOutcome {
+  return {
+    executionState: row.execution_state,
+    deliverableState: row.deliverable_state,
+    validationState: row.validation_state,
+    recoveryState: row.recovery_state,
+    routeState: row.route_state,
+    primaryReason: row.primary_reason,
+    reasonCodes: parseJsonArray<RunOutcome['primaryReason']>(row.reason_codes),
+    evidenceRefs: parseJsonArray<string>(row.evidence_refs),
+  };
+}
+
+function normalizeScheduledProviderWait(
+  row: ScheduledProviderWaitRow
+): ScheduledProviderWaitRecord {
+  return {
+    waitId: row.wait_id,
+    runId: row.run_id,
+    attemptId: row.attempt_id,
+    provider: row.provider,
+    reasonCode: row.reason_code,
+    resumeAt: normalizeTimestamp(row.resume_at),
+    state: row.state,
+    claimOwnerId: row.claim_owner_id,
+    claimToken: row.claim_token,
+    createdAt: normalizeTimestamp(row.created_at),
+    claimedAt: normalizeNullableTimestamp(row.claimed_at),
+    cancelledAt: normalizeNullableTimestamp(row.cancelled_at),
+    completedAt: normalizeNullableTimestamp(row.completed_at),
+  };
 }
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
@@ -129,6 +332,332 @@ export async function getWorkflowRun(id: string): Promise<WorkflowRun | null> {
     getLog().error({ err }, 'db.workflow_run_get_failed');
     throw new Error(`Failed to get workflow run: ${err.message}`);
   }
+}
+
+/** Insert the immutable authority record, accepting only a byte-equivalent retry. */
+export async function createRunAuthority(
+  authority: RunAuthorityRecord
+): Promise<'created' | 'unchanged'> {
+  const result = await pool.query<RunAuthorityRow>(
+    `INSERT INTO remote_agent_run_authorities
+     (run_id, dispatch_id, wo_id, spec_source, spec_revision, spec_hash,
+      workflow_name, codebase_id, canonical_remote, base_branch, base_sha,
+      run_scope_sha, head_branch, worktree_path, workflow_revision, bundle_revision,
+      engine_revision, runtime_image_revision, created_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
+             $15, $16, $17, $18, $19)
+     ON CONFLICT (run_id) DO NOTHING
+     RETURNING *`,
+    [
+      authority.runId,
+      authority.dispatchId,
+      authority.woId,
+      authority.specSource,
+      authority.specRevision,
+      authority.specHash,
+      authority.workflowName,
+      authority.codebaseId,
+      authority.canonicalRemote,
+      authority.baseBranch,
+      authority.baseSha,
+      authority.runScopeSha,
+      authority.headBranch,
+      authority.worktreePath,
+      authority.workflowRevision,
+      authority.bundleRevision,
+      authority.engineRevision,
+      authority.runtimeImageRevision,
+      authority.createdAt,
+    ]
+  );
+  if (result.rows[0]) return 'created';
+
+  const existing = await getRunAuthority(authority.runId);
+  if (existing && runAuthoritiesEqual(existing, authority)) return 'unchanged';
+  throw new Error(`authority_conflict: immutable authority differs for run ${authority.runId}`);
+}
+
+export async function getRunAuthority(runId: string): Promise<RunAuthorityRecord | null> {
+  const result = await pool.query<RunAuthorityRow>(
+    'SELECT * FROM remote_agent_run_authorities WHERE run_id = $1',
+    [runId]
+  );
+  const row = result.rows[0];
+  return row ? normalizeRunAuthority(row) : null;
+}
+
+/**
+ * Claim a lease in one compare-and-swap statement.
+ * A live unreleased lease cannot be overwritten by another worker.
+ */
+export async function claimRunLease(lease: RunLeaseRecord): Promise<RunLeaseRecord | null> {
+  const result = await pool.query<RunLeaseRow>(
+    `INSERT INTO remote_agent_run_leases
+     (run_id, owner_id, lease_token, acquired_at, last_heartbeat_at, expires_at, released_at)
+     VALUES ($1, $2, $3, $4, $5, $6, NULL)
+     ON CONFLICT (run_id) DO UPDATE SET
+       owner_id = EXCLUDED.owner_id,
+       lease_token = EXCLUDED.lease_token,
+       acquired_at = EXCLUDED.acquired_at,
+       last_heartbeat_at = EXCLUDED.last_heartbeat_at,
+       expires_at = EXCLUDED.expires_at,
+       released_at = NULL
+     WHERE remote_agent_run_leases.released_at IS NOT NULL
+        OR remote_agent_run_leases.expires_at <= EXCLUDED.acquired_at
+     RETURNING *`,
+    [
+      lease.runId,
+      lease.ownerId,
+      lease.leaseToken,
+      lease.acquiredAt,
+      lease.lastHeartbeatAt,
+      lease.expiresAt,
+    ]
+  );
+  const row = result.rows[0];
+  return row ? normalizeRunLease(row) : null;
+}
+
+export async function heartbeatRunLease(data: {
+  runId: string;
+  ownerId: string;
+  leaseToken: string;
+  heartbeatAt: string;
+  expiresAt: string;
+}): Promise<boolean> {
+  const result = await pool.query(
+    `UPDATE remote_agent_run_leases
+     SET last_heartbeat_at = $4, expires_at = $5
+     WHERE run_id = $1 AND owner_id = $2 AND lease_token = $3
+       AND released_at IS NULL AND expires_at > $4`,
+    [data.runId, data.ownerId, data.leaseToken, data.heartbeatAt, data.expiresAt]
+  );
+  return result.rowCount === 1;
+}
+
+export async function releaseRunLease(data: {
+  runId: string;
+  ownerId: string;
+  leaseToken: string;
+  releasedAt: string;
+}): Promise<boolean> {
+  const result = await pool.query(
+    `UPDATE remote_agent_run_leases
+     SET released_at = $4
+     WHERE run_id = $1 AND owner_id = $2 AND lease_token = $3 AND released_at IS NULL`,
+    [data.runId, data.ownerId, data.leaseToken, data.releasedAt]
+  );
+  return result.rowCount === 1;
+}
+
+/** Persist the attempt before invoking a provider. Duplicate IDs/numbers are rejected. */
+export async function createProviderAttempt(attempt: ProviderAttemptRecord): Promise<boolean> {
+  const result = await pool.query<{ attempt_id: string }>(
+    `INSERT INTO remote_agent_provider_attempts
+     (attempt_id, run_id, node_id, attempt_number, provider, model,
+      declared_provider, declared_model, required_capabilities, started_at,
+      completed_at, served_model_id, outcome_class, reason_code, resume_at,
+      supersedes_attempt_id)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+     ON CONFLICT DO NOTHING
+     RETURNING attempt_id`,
+    [
+      attempt.attemptId,
+      attempt.runId,
+      attempt.nodeId,
+      attempt.attemptNumber,
+      attempt.provider,
+      attempt.model,
+      attempt.declaredProvider,
+      attempt.declaredModel,
+      JSON.stringify(attempt.requiredCapabilities),
+      attempt.startedAt,
+      attempt.completedAt,
+      attempt.servedModelId,
+      attempt.outcomeClass,
+      attempt.reasonCode,
+      attempt.resumeAt,
+      attempt.supersedesAttemptId,
+    ]
+  );
+  return result.rows.length === 1;
+}
+
+export async function completeProviderAttempt(data: {
+  attemptId: string;
+  completedAt: string;
+  servedModelId: string | null;
+  outcomeClass: ProviderAttemptRecord['outcomeClass'];
+  reasonCode: ProviderAttemptRecord['reasonCode'];
+  resumeAt: string | null;
+}): Promise<boolean> {
+  const result = await pool.query(
+    `UPDATE remote_agent_provider_attempts
+     SET completed_at = $2, served_model_id = $3, outcome_class = $4,
+         reason_code = $5, resume_at = $6
+     WHERE attempt_id = $1 AND completed_at IS NULL`,
+    [
+      data.attemptId,
+      data.completedAt,
+      data.servedModelId,
+      data.outcomeClass,
+      data.reasonCode,
+      data.resumeAt,
+    ]
+  );
+  return result.rowCount === 1;
+}
+
+export async function listProviderAttempts(
+  runId: string,
+  nodeId?: string
+): Promise<ProviderAttemptRecord[]> {
+  const result = nodeId
+    ? await pool.query<ProviderAttemptRow>(
+        `SELECT * FROM remote_agent_provider_attempts
+         WHERE run_id = $1 AND node_id = $2 ORDER BY attempt_number ASC`,
+        [runId, nodeId]
+      )
+    : await pool.query<ProviderAttemptRow>(
+        `SELECT * FROM remote_agent_provider_attempts
+         WHERE run_id = $1 ORDER BY node_id ASC, attempt_number ASC`,
+        [runId]
+      );
+  return result.rows.map(normalizeProviderAttempt);
+}
+
+export async function upsertRunOutcome(
+  runId: string,
+  outcome: RunOutcome,
+  updatedAt: string
+): Promise<boolean> {
+  const result = await pool.query<{ run_id: string }>(
+    `INSERT INTO remote_agent_run_outcomes
+     (run_id, execution_state, deliverable_state, validation_state, recovery_state,
+      route_state, primary_reason, reason_codes, evidence_refs, updated_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+     ON CONFLICT (run_id) DO UPDATE SET
+       execution_state = EXCLUDED.execution_state,
+       deliverable_state = EXCLUDED.deliverable_state,
+       validation_state = EXCLUDED.validation_state,
+       recovery_state = EXCLUDED.recovery_state,
+       route_state = EXCLUDED.route_state,
+       primary_reason = EXCLUDED.primary_reason,
+       reason_codes = EXCLUDED.reason_codes,
+       evidence_refs = EXCLUDED.evidence_refs,
+       updated_at = EXCLUDED.updated_at
+     WHERE remote_agent_run_outcomes.updated_at <= EXCLUDED.updated_at
+     RETURNING run_id`,
+    [
+      runId,
+      outcome.executionState,
+      outcome.deliverableState,
+      outcome.validationState,
+      outcome.recoveryState,
+      outcome.routeState,
+      outcome.primaryReason,
+      JSON.stringify(outcome.reasonCodes),
+      JSON.stringify(outcome.evidenceRefs),
+      updatedAt,
+    ]
+  );
+  return result.rows.length === 1;
+}
+
+export async function getRunOutcome(runId: string): Promise<RunOutcome | null> {
+  const result = await pool.query<RunOutcomeRow>(
+    'SELECT * FROM remote_agent_run_outcomes WHERE run_id = $1',
+    [runId]
+  );
+  const row = result.rows[0];
+  return row ? normalizeRunOutcome(row) : null;
+}
+
+export async function scheduleProviderWait(wait: ScheduledProviderWaitRecord): Promise<boolean> {
+  if (
+    wait.state !== 'scheduled' ||
+    wait.claimOwnerId !== null ||
+    wait.claimToken !== null ||
+    wait.claimedAt !== null ||
+    wait.cancelledAt !== null ||
+    wait.completedAt !== null
+  ) {
+    throw new Error('New provider waits must be unclaimed and scheduled');
+  }
+  const result = await pool.query<{ wait_id: string }>(
+    `INSERT INTO remote_agent_scheduled_waits
+     (wait_id, run_id, attempt_id, provider, reason_code, resume_at, state,
+      claim_owner_id, claim_token, created_at, claimed_at, cancelled_at, completed_at)
+     VALUES ($1, $2, $3, $4, $5, $6, 'scheduled', NULL, NULL, $7, NULL, NULL, NULL)
+     ON CONFLICT DO NOTHING
+     RETURNING wait_id`,
+    [
+      wait.waitId,
+      wait.runId,
+      wait.attemptId,
+      wait.provider,
+      wait.reasonCode,
+      wait.resumeAt,
+      wait.createdAt,
+    ]
+  );
+  return result.rows.length === 1;
+}
+
+export async function listDueProviderWaits(
+  dueAt: string,
+  limit: number
+): Promise<ScheduledProviderWaitRecord[]> {
+  if (!Number.isInteger(limit) || limit < 1 || limit > 1000) {
+    throw new Error('Provider wait limit must be an integer between 1 and 1000');
+  }
+  const result = await pool.query<ScheduledProviderWaitRow>(
+    `SELECT * FROM remote_agent_scheduled_waits
+     WHERE state = 'scheduled' AND resume_at <= $1
+     ORDER BY resume_at ASC, wait_id ASC LIMIT $2`,
+    [dueAt, limit]
+  );
+  return result.rows.map(normalizeScheduledProviderWait);
+}
+
+export async function claimProviderWait(data: {
+  waitId: string;
+  ownerId: string;
+  claimToken: string;
+  claimedAt: string;
+}): Promise<boolean> {
+  const result = await pool.query(
+    `UPDATE remote_agent_scheduled_waits
+     SET state = 'claimed', claim_owner_id = $2, claim_token = $3, claimed_at = $4
+     WHERE wait_id = $1 AND state = 'scheduled' AND resume_at <= $4`,
+    [data.waitId, data.ownerId, data.claimToken, data.claimedAt]
+  );
+  return result.rowCount === 1;
+}
+
+/** Operator cancellation wins over scheduled or already-claimed resumes. */
+export async function cancelProviderWaits(runId: string, cancelledAt: string): Promise<number> {
+  const result = await pool.query(
+    `UPDATE remote_agent_scheduled_waits
+     SET state = 'cancelled', cancelled_at = $2
+     WHERE run_id = $1 AND state IN ('scheduled', 'claimed')`,
+    [runId, cancelledAt]
+  );
+  return result.rowCount;
+}
+
+export async function completeProviderWait(data: {
+  waitId: string;
+  claimToken: string;
+  completedAt: string;
+}): Promise<boolean> {
+  const result = await pool.query(
+    `UPDATE remote_agent_scheduled_waits
+     SET state = 'completed', completed_at = $3
+     WHERE wait_id = $1 AND claim_token = $2 AND state = 'claimed'`,
+    [data.waitId, data.claimToken, data.completedAt]
+  );
+  return result.rowCount === 1;
 }
 
 export async function getWorkflowRunStatus(id: string): Promise<string | null> {

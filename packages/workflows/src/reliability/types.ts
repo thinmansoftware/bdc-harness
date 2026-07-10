@@ -152,6 +152,36 @@ export interface ProviderAttemptRecord {
   readonly supersedesAttemptId: string | null;
 }
 
+export interface RunLeaseRecord {
+  readonly runId: string;
+  readonly ownerId: string;
+  readonly leaseToken: string;
+  readonly acquiredAt: string;
+  readonly lastHeartbeatAt: string;
+  readonly expiresAt: string;
+  readonly releasedAt: string | null;
+}
+
+export const SCHEDULED_WAIT_STATES = ['scheduled', 'claimed', 'cancelled', 'completed'] as const;
+
+export type ScheduledWaitState = (typeof SCHEDULED_WAIT_STATES)[number];
+
+export interface ScheduledProviderWaitRecord {
+  readonly waitId: string;
+  readonly runId: string;
+  readonly attemptId: string;
+  readonly provider: string;
+  readonly reasonCode: OutcomeReasonCode;
+  readonly resumeAt: string;
+  readonly state: ScheduledWaitState;
+  readonly claimOwnerId: string | null;
+  readonly claimToken: string | null;
+  readonly createdAt: string;
+  readonly claimedAt: string | null;
+  readonly cancelledAt: string | null;
+  readonly completedAt: string | null;
+}
+
 export interface DeliverableEvidence {
   readonly worktreeChanges?: boolean;
   readonly commitSha?: string;

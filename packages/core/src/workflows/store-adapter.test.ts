@@ -15,6 +15,21 @@ const mockCompleteWorkflowRun = mock(() => Promise.resolve());
 const mockFailWorkflowRun = mock(() => Promise.resolve());
 const mockCancelWorkflowRun = mock(() => Promise.resolve());
 const mockPauseWorkflowRun = mock(() => Promise.resolve());
+const mockCreateRunAuthority = mock(() => Promise.resolve('created' as const));
+const mockGetRunAuthority = mock(() => Promise.resolve(null));
+const mockClaimRunLease = mock(() => Promise.resolve(null));
+const mockHeartbeatRunLease = mock(() => Promise.resolve(false));
+const mockReleaseRunLease = mock(() => Promise.resolve(false));
+const mockCreateProviderAttempt = mock(() => Promise.resolve(false));
+const mockCompleteProviderAttempt = mock(() => Promise.resolve(false));
+const mockListProviderAttempts = mock(() => Promise.resolve([]));
+const mockUpsertRunOutcome = mock(() => Promise.resolve(false));
+const mockGetRunOutcome = mock(() => Promise.resolve(null));
+const mockScheduleProviderWait = mock(() => Promise.resolve(false));
+const mockListDueProviderWaits = mock(() => Promise.resolve([]));
+const mockClaimProviderWait = mock(() => Promise.resolve(false));
+const mockCancelProviderWaits = mock(() => Promise.resolve(0));
+const mockCompleteProviderWait = mock(() => Promise.resolve(false));
 
 mock.module('../db/workflows', () => ({
   createWorkflowRun: mockCreateWorkflowRun,
@@ -30,6 +45,21 @@ mock.module('../db/workflows', () => ({
   failWorkflowRun: mockFailWorkflowRun,
   cancelWorkflowRun: mockCancelWorkflowRun,
   pauseWorkflowRun: mockPauseWorkflowRun,
+  createRunAuthority: mockCreateRunAuthority,
+  getRunAuthority: mockGetRunAuthority,
+  claimRunLease: mockClaimRunLease,
+  heartbeatRunLease: mockHeartbeatRunLease,
+  releaseRunLease: mockReleaseRunLease,
+  createProviderAttempt: mockCreateProviderAttempt,
+  completeProviderAttempt: mockCompleteProviderAttempt,
+  listProviderAttempts: mockListProviderAttempts,
+  upsertRunOutcome: mockUpsertRunOutcome,
+  getRunOutcome: mockGetRunOutcome,
+  scheduleProviderWait: mockScheduleProviderWait,
+  listDueProviderWaits: mockListDueProviderWaits,
+  claimProviderWait: mockClaimProviderWait,
+  cancelProviderWaits: mockCancelProviderWaits,
+  completeProviderWait: mockCompleteProviderWait,
 }));
 
 const mockCreateWorkflowEvent = mock(() => Promise.resolve());
@@ -73,6 +103,21 @@ describe('createWorkflowStore', () => {
       'failWorkflowRun',
       'pauseWorkflowRun',
       'cancelWorkflowRun',
+      'createRunAuthority',
+      'getRunAuthority',
+      'claimRunLease',
+      'heartbeatRunLease',
+      'releaseRunLease',
+      'createProviderAttempt',
+      'completeProviderAttempt',
+      'listProviderAttempts',
+      'upsertRunOutcome',
+      'getRunOutcome',
+      'scheduleProviderWait',
+      'listDueProviderWaits',
+      'claimProviderWait',
+      'cancelProviderWaits',
+      'completeProviderWait',
       'createWorkflowEvent',
       'listWorkflowEvents',
       'getCompletedDagNodeOutputs',
@@ -146,6 +191,26 @@ describe('createWorkflowStore', () => {
     const store = createWorkflowStore();
     await store.cancelWorkflowRun('run-123');
     expect(mockCancelWorkflowRun).toHaveBeenCalledWith('run-123');
+  });
+
+  test('delegates reliability lease and wait operations to DB', async () => {
+    const store = createWorkflowStore();
+    const lease = {
+      runId: 'run-123',
+      ownerId: 'worker-1',
+      leaseToken: 'lease-token',
+      acquiredAt: '2026-07-09T12:00:00.000Z',
+      lastHeartbeatAt: '2026-07-09T12:00:00.000Z',
+      expiresAt: '2026-07-09T12:01:00.000Z',
+      releasedAt: null,
+    };
+    mockClaimRunLease.mockResolvedValueOnce(lease);
+    await expect(store.claimRunLease(lease)).resolves.toEqual(lease);
+    expect(mockClaimRunLease).toHaveBeenCalledWith(lease);
+
+    mockCancelProviderWaits.mockResolvedValueOnce(2);
+    await expect(store.cancelProviderWaits('run-123', '2026-07-09T12:02:00.000Z')).resolves.toBe(2);
+    expect(mockCancelProviderWaits).toHaveBeenCalledWith('run-123', '2026-07-09T12:02:00.000Z');
   });
 
   test('delegates getCodebase to DB', async () => {
