@@ -128,6 +128,25 @@ function repositoryFromRemote(remote: string): string {
   return match[1];
 }
 
+function pullRequestIdentityMatches(
+  pullRequest: PullRequestEvidence,
+  canonicalRemote: string
+): boolean {
+  try {
+    const expectedRepository = repositoryFromRemote(canonicalRemote).toLowerCase();
+    const url = new URL(pullRequest.url);
+    const match = /^\/([^/]+\/[^/]+)\/pull\/([1-9][0-9]*)\/?$/.exec(url.pathname);
+    return (
+      url.protocol === 'https:' &&
+      url.hostname.toLowerCase() === 'github.com' &&
+      match?.[1]?.toLowerCase() === expectedRepository &&
+      Number(match[2]) === pullRequest.number
+    );
+  } catch {
+    return false;
+  }
+}
+
 export function parseGitNameStatus(output: string): readonly GitChangeEvidence[] {
   return output
     .split(/\r?\n/)
@@ -303,6 +322,7 @@ export function collectMechanicalEvidence(
       (pullRequest.baseRef === input.authority.baseBranch &&
         pullRequest.headRef === input.authority.headBranch &&
         pullRequest.headSha === input.git.headSha &&
+        pullRequestIdentityMatches(pullRequest, input.authority.canonicalRemote) &&
         pathsEqual(pullRequest.files, diffPaths)));
   const requiredChecksPassed =
     pullRequest?.requiredChecks.every(check => check.state === 'passed') ?? false;

@@ -94,6 +94,16 @@ describe('createStageWorktree authority and adoption', () => {
 
     await expect(createStageWorktree(opts)).rejects.toThrow('expected branch');
   });
+
+  test('refuses a worktree path owned by a different canonical clone', async () => {
+    existsSpy.mockResolvedValue(true);
+    ownershipSpy.mockRejectedValue(
+      new Error('Worktree belongs to a different clone (/repos/other-repo)')
+    );
+
+    await expect(createStageWorktree(opts)).rejects.toThrow('different clone');
+    expect(listSpy).not.toHaveBeenCalled();
+  });
 });
 
 function resultBranch(): string {
