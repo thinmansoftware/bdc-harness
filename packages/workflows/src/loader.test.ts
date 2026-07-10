@@ -2786,6 +2786,69 @@ nodes:
   });
 
   // ---------------------------------------------------------------------------
+  // run_authority round-trip (2026-07-10 factory-down incident)
+  // ---------------------------------------------------------------------------
+  //
+  // Regression guard: parseWorkflow used to silently drop raw.run_authority from
+  // the returned workflow object even though workflowBaseSchema declared it.
+  // Result: `workflow.run_authority?.required` was undefined at both freeze call
+  // sites (orchestrator dispatchBackgroundWorkflow, executor authority preamble),
+  // freezeWorkOrderSource/persistRunAuthority never executed on any /run API
+  // dispatch, and every lane fire failed at read-spec with
+  // "scope_authority_missing: run-authority.json" (runs cc753fff/e632d716).
+
+  describe('run_authority', () => {
+    const runAuthorityYaml = [
+      'run_authority:',
+      '  required: true',
+      '  spec_repository: bluedevilcollectibles/bdc-xo',
+      '  spec_revision: main',
+      '  spec_paths:',
+      '    - docs/work-orders/{WO_ID}.md',
+      '  allow_issue_fallback: true',
+    ].join('\n');
+
+    it('parseWorkflow round-trips run_authority', async () => {
+      const workflowDir = join(testDir, '.archon', 'workflows');
+      await mkdir(workflowDir, { recursive: true });
+      const yaml = `name: authority-bound\ndescription: Workflow with run_authority policy\n${runAuthorityYaml}\nnodes:\n  - id: n\n    prompt: Do something\n`;
+      await writeFile(join(workflowDir, 'authority-bound.yaml'), yaml);
+      const result = await discoverWorkflows(testDir, { loadDefaults: false });
+      expect(result.workflows).toHaveLength(1);
+      expect(result.workflows[0].workflow.run_authority).toEqual({
+        required: true,
+        spec_repository: 'bluedevilcollectibles/bdc-xo',
+        spec_revision: 'main',
+        spec_paths: ['docs/work-orders/{WO_ID}.md'],
+        allow_issue_fallback: true,
+      });
+    });
+
+    it('parseWorkflow without run_authority leaves field undefined', async () => {
+      const workflowDir = join(testDir, '.archon', 'workflows');
+      await mkdir(workflowDir, { recursive: true });
+      const yaml = `name: no-authority\ndescription: No run_authority\nnodes:\n  - id: n\n    prompt: Do something\n`;
+      await writeFile(join(workflowDir, 'no-authority.yaml'), yaml);
+      const result = await discoverWorkflows(testDir, { loadDefaults: false });
+      expect(result.workflows).toHaveLength(1);
+      expect(result.workflows[0].workflow.run_authority).toBeUndefined();
+    });
+
+    it('parseWorkflow fails closed on an invalid run_authority block', async () => {
+      const workflowDir = join(testDir, '.archon', 'workflows');
+      await mkdir(workflowDir, { recursive: true });
+      // Missing spec_repository/spec_revision/spec_paths -- must be a load error,
+      // never warn-and-ignore (silently dropping it disables the authority gate).
+      const yaml = `name: bad-authority\ndescription: Invalid run_authority\nrun_authority:\n  required: true\nnodes:\n  - id: n\n    prompt: Do something\n`;
+      await writeFile(join(workflowDir, 'bad-authority.yaml'), yaml);
+      const result = await discoverWorkflows(testDir, { loadDefaults: false });
+      expect(result.workflows).toHaveLength(0);
+      expect(result.errors).toHaveLength(1);
+      expect(result.errors[0].error).toContain('Invalid run_authority block');
+    });
+  });
+
+  // ---------------------------------------------------------------------------
   // retired/ exclusion (2026-07-07 false-dispatch incident)
   // ---------------------------------------------------------------------------
   //

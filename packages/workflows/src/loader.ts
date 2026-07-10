@@ -16,7 +16,12 @@ import {
   SCRIPT_NODE_AI_FIELDS,
   LOOP_NODE_AI_FIELDS,
 } from './schemas/dag-node';
-import { modelReasoningEffortSchema, webSearchModeSchema } from './schemas/workflow';
+import {
+  modelReasoningEffortSchema,
+  webSearchModeSchema,
+  runAuthorityPolicySchema,
+} from './schemas/workflow';
+import type { RunAuthorityPolicy } from './schemas/workflow';
 import { workflowNodeHooksSchema } from './schemas/hooks';
 import { z } from '@hono/zod-openapi';
 
@@ -593,6 +598,37 @@ export function parseWorkflow(content: string, filename: string): ParseResult {
       getLog().warn({ filename, value: raw.policyFile }, 'invalid_policy_file_ignored');
     }
 
+    // Parse run_authority -- the work-order authority freeze policy. FAIL CLOSED:
+    // an invalid block is a load error, never warn-and-ignore, because dropping it
+    // silently disables the authority gate. Before this block existed, the loader
+    // silently dropped raw.run_authority from the returned workflow object, so
+    // `workflow.run_authority?.required` was always undefined at the orchestrator
+    // (orchestrator.ts dispatchBackgroundWorkflow) and executor (executor.ts
+    // authority preamble) -- freezeWorkOrderSource/persistRunAuthority never ran
+    // and every /run API lane fire died at read-spec with
+    // "scope_authority_missing: run-authority.json". Same loader wiring class as
+    // the policyFile and inputs incidents above. Anchor: 2026-07-10 factory-down
+    // incident (runs cc753fff/e632d716) after PR #390 deploy.
+    let runAuthority: RunAuthorityPolicy | undefined;
+    if (raw.run_authority !== undefined) {
+      const runAuthorityResult = runAuthorityPolicySchema.safeParse(raw.run_authority);
+      if (!runAuthorityResult.success) {
+        const issues = runAuthorityResult.error.issues
+          .map(issue => `'run_authority.${issue.path.join('.')}' ${issue.message}`)
+          .join('; ');
+        getLog().warn({ filename, issues }, 'invalid_run_authority_block');
+        return {
+          workflow: null,
+          error: {
+            filename,
+            error: `Invalid run_authority block: ${issues}`,
+            errorType: 'validation_error',
+          },
+        };
+      }
+      runAuthority = runAuthorityResult.data;
+    }
+
     return {
       workflow: {
         name: raw.name,
@@ -609,6 +645,7 @@ export function parseWorkflow(content: string, filename: string): ParseResult {
         ...(tags !== undefined ? { tags } : {}),
         ...(targetRepo !== undefined ? { target_repo: targetRepo } : {}),
         ...(policyFile !== undefined ? { policyFile } : {}),
+        ...(runAuthority !== undefined ? { run_authority: runAuthority } : {}),
         // WO-HARNESS-NODE-PROVIDER-FAILOVER-01: carry workflow-root failover
         // defaults through to the executor so nodes can inherit them. Identity of
         // failover_provider was validated above; failover_model is a free SDK
