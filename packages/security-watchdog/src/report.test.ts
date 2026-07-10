@@ -39,7 +39,9 @@ describe('report artifacts', () => {
 
     await expect(writeSecurityWatchdogArtifacts(tempRoot, report())).resolves.toHaveLength(2);
     await writeFile(paths[0], '{}\n');
-    await expect(writeSecurityWatchdogArtifacts(tempRoot, report())).rejects.toThrow('security_watchdog_artifact_conflict');
+    await expect(writeSecurityWatchdogArtifacts(tempRoot, report())).rejects.toThrow(
+      'security_watchdog_artifact_conflict'
+    );
   });
 
   test('rejects report fields that carry Phase 1 action strings', () => {

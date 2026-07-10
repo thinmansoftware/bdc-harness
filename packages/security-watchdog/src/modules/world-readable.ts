@@ -1,9 +1,16 @@
 import type { Baseline, Finding } from '../types';
 
-export type FileModeReader = (path: string) => Promise<{ readonly exists: boolean; readonly mode: number }>;
+export type FileModeReader = (
+  path: string
+) => Promise<{ readonly exists: boolean; readonly mode: number }>;
 
-export async function scanWorldReadableFiles(baseline: Baseline, readMode: FileModeReader): Promise<readonly Finding[]> {
-  const paths = [...new Set(baseline.containerInventory.flatMap(container => container.secretFilePaths))].sort();
+export async function scanWorldReadableFiles(
+  baseline: Baseline,
+  readMode: FileModeReader
+): Promise<readonly Finding[]> {
+  const paths = [
+    ...new Set(baseline.containerInventory.flatMap(container => container.secretFilePaths)),
+  ].sort();
   const findings: Finding[] = [];
   for (const path of paths) {
     const stat = await readMode(path);

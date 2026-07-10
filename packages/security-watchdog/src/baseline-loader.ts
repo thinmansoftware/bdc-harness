@@ -14,11 +14,15 @@ async function readJson(path: string): Promise<unknown> {
 }
 
 export async function loadBaseline(root: string): Promise<Baseline> {
-  const expectedOpenPorts = expectedOpenPortSchema.array().parse(await readJson(join(root, 'expected-open-ports.json')));
+  const expectedOpenPorts = expectedOpenPortSchema
+    .array()
+    .parse(await readJson(join(root, 'expected-open-ports.json')));
   const legitimateAnonGrants = legitimateAnonGrantSchema
     .array()
     .parse(await readJson(join(root, 'legitimate-anon-grants.json')));
-  const authorizedWebhooks = authorizedWebhookSchema.array().parse(await readJson(join(root, 'authorized-webhooks.json')));
+  const authorizedWebhooks = authorizedWebhookSchema
+    .array()
+    .parse(await readJson(join(root, 'authorized-webhooks.json')));
   const containerInventory = containerInventoryEntrySchema
     .array()
     .parse(await readJson(join(root, 'container-inventory.json')));

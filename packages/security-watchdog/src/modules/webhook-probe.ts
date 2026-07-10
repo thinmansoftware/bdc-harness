@@ -7,7 +7,10 @@ export interface WebhookProbeResult {
   readonly bodySample?: string;
 }
 
-export type WebhookFetcher = (path: string, method: WebhookProbeResult['method']) => Promise<WebhookProbeResult>;
+export type WebhookFetcher = (
+  path: string,
+  method: WebhookProbeResult['method']
+) => Promise<WebhookProbeResult>;
 
 export async function scanWebhooks(
   baseline: Baseline,

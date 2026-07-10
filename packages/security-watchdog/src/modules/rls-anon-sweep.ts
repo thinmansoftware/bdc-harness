@@ -19,7 +19,10 @@ export async function scanRlsAnonSweep(query: RlsQueryClient): Promise<readonly 
     .filter(row => row.hasTenantId || row.anonDmlGrant || !row.rlsEnabled || !row.hasPolicy)
     .map(row => ({
       module: 'rls-anon-sweep',
-      severity: row.hasTenantId && (!row.rlsEnabled || !row.hasPolicy || row.anonDmlGrant) ? 'HIGH' : 'CLEAN',
+      severity:
+        row.hasTenantId && (!row.rlsEnabled || !row.hasPolicy || row.anonDmlGrant)
+          ? 'HIGH'
+          : 'CLEAN',
       target: row.table,
       evidence: {
         instance: row.instance,

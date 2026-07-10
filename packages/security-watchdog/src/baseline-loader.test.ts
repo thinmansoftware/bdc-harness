@@ -8,12 +8,18 @@ import { fixtureBaseline } from './test-fixtures';
 let tempRoot: string | null = null;
 
 async function writeBaseline(root: string, override: Record<string, unknown> = {}): Promise<void> {
-  await writeFile(join(root, 'expected-open-ports.json'), JSON.stringify(override.expectedOpenPorts ?? fixtureBaseline.expectedOpenPorts));
+  await writeFile(
+    join(root, 'expected-open-ports.json'),
+    JSON.stringify(override.expectedOpenPorts ?? fixtureBaseline.expectedOpenPorts)
+  );
   await writeFile(
     join(root, 'legitimate-anon-grants.json'),
     JSON.stringify(override.legitimateAnonGrants ?? fixtureBaseline.legitimateAnonGrants)
   );
-  await writeFile(join(root, 'authorized-webhooks.json'), JSON.stringify(override.authorizedWebhooks ?? fixtureBaseline.authorizedWebhooks));
+  await writeFile(
+    join(root, 'authorized-webhooks.json'),
+    JSON.stringify(override.authorizedWebhooks ?? fixtureBaseline.authorizedWebhooks)
+  );
   await writeFile(
     join(root, 'container-inventory.json'),
     JSON.stringify(override.containerInventory ?? fixtureBaseline.containerInventory)

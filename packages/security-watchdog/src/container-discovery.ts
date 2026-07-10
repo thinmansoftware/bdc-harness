@@ -11,7 +11,10 @@ export type ContainerDiscoverer = () => Promise<readonly DiscoveredContainer[]>;
 export async function resolveContainers(
   expected: readonly ContainerInventoryEntry[],
   discover: ContainerDiscoverer
-): Promise<{ readonly containers: readonly DiscoveredContainer[]; readonly findings: readonly Finding[] }> {
+): Promise<{
+  readonly containers: readonly DiscoveredContainer[];
+  readonly findings: readonly Finding[];
+}> {
   const live = await discover();
   const liveNames = new Set(live.map(container => container.name));
   const findings: Finding[] = [];
@@ -32,7 +35,9 @@ export async function resolveContainers(
   return { containers: live, findings };
 }
 
-export async function discoverContainersFromDocker(exec: (command: string) => Promise<string>): Promise<readonly DiscoveredContainer[]> {
+export async function discoverContainersFromDocker(
+  exec: (command: string) => Promise<string>
+): Promise<readonly DiscoveredContainer[]> {
   const output = await exec('docker ps --format "{{.Names}}\\t{{.Image}}\\t{{.Status}}"');
   return output
     .split('\n')

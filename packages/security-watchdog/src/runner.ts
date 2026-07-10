@@ -54,8 +54,15 @@ export async function runScan(options: RunScanOptions = {}): Promise<RunScanResu
     const scanner = options.scanners?.[module] ?? missingScanner(module);
     findings.push(...(await scanner(baseline)));
   }
-  const report = reduceFindings(findings, baseline, options.runId ?? `security-watchdog-${Date.now()}`);
-  const artifactPaths = await writeSecurityWatchdogArtifacts(options.outputRoot ?? defaultOutputRoot(), report);
+  const report = reduceFindings(
+    findings,
+    baseline,
+    options.runId ?? `security-watchdog-${Date.now()}`
+  );
+  const artifactPaths = await writeSecurityWatchdogArtifacts(
+    options.outputRoot ?? defaultOutputRoot(),
+    report
+  );
   const escalatedCriticals = await escalateCriticalFindings(report, {
     token: options.telegramToken,
     sender: options.telegramSender,

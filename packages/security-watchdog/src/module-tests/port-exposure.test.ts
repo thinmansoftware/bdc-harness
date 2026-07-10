@@ -9,7 +9,13 @@ describe('scanPortExposure', () => {
       targetHost: '5.78.86.90',
       extraPorts: [11434],
       prober: async () => [
-        { port: 11434, protocol: 'tcp', addressFamily: 'v4', open: true, vantage: 'third-party-public-prober' },
+        {
+          port: 11434,
+          protocol: 'tcp',
+          addressFamily: 'v4',
+          open: true,
+          vantage: 'third-party-public-prober',
+        },
       ],
     });
     const report = reduceFindings(findings, fixtureBaseline);

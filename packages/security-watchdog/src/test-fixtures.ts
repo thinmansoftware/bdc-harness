@@ -3,9 +3,21 @@ import type { Baseline, Finding } from './types';
 export const fixtureBaseline: Baseline = {
   schemaVersion: 1,
   expectedOpenPorts: [
-    { port: 22, protocol: 'tcp', addressFamily: 'any', allowedSources: ['john-home'], reason: 'ssh' },
+    {
+      port: 22,
+      protocol: 'tcp',
+      addressFamily: 'any',
+      allowedSources: ['john-home'],
+      reason: 'ssh',
+    },
     { port: 80, protocol: 'tcp', addressFamily: 'any', allowedSources: ['public'], reason: 'http' },
-    { port: 443, protocol: 'tcp', addressFamily: 'any', allowedSources: ['public'], reason: 'https' },
+    {
+      port: 443,
+      protocol: 'tcp',
+      addressFamily: 'any',
+      allowedSources: ['public'],
+      reason: 'https',
+    },
   ],
   legitimateAnonGrants: [
     {
@@ -15,7 +27,9 @@ export const fixtureBaseline: Baseline = {
       reason: 'public read table with RLS policy',
     },
   ],
-  authorizedWebhooks: [{ path: '/webhook/order-status', methods: ['POST'], reason: 'signed order status hook' }],
+  authorizedWebhooks: [
+    { path: '/webhook/order-status', methods: ['POST'], reason: 'signed order status hook' },
+  ],
   containerInventory: [
     {
       name: 'lspro-react',

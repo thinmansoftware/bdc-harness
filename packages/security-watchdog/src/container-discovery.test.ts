@@ -16,7 +16,9 @@ describe('container discovery', () => {
   });
 
   test('parses docker ps output dynamically', async () => {
-    const containers = await discoverContainersFromDocker(async () => 'lspro-react\timage:v1\tUp 4 hours\n');
+    const containers = await discoverContainersFromDocker(
+      async () => 'lspro-react\timage:v1\tUp 4 hours\n'
+    );
     expect(containers[0]).toEqual({ name: 'lspro-react', image: 'image:v1', status: 'Up 4 hours' });
   });
 });

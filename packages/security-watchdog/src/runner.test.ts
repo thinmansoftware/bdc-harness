@@ -11,10 +11,22 @@ let tempRoot: string | null = null;
 async function writeBaseline(root: string, baseline: Baseline): Promise<string> {
   const baselineRoot = join(root, 'baseline');
   await mkdir(baselineRoot, { recursive: true });
-  await writeFile(join(baselineRoot, 'expected-open-ports.json'), JSON.stringify(baseline.expectedOpenPorts));
-  await writeFile(join(baselineRoot, 'legitimate-anon-grants.json'), JSON.stringify(baseline.legitimateAnonGrants));
-  await writeFile(join(baselineRoot, 'authorized-webhooks.json'), JSON.stringify(baseline.authorizedWebhooks));
-  await writeFile(join(baselineRoot, 'container-inventory.json'), JSON.stringify(baseline.containerInventory));
+  await writeFile(
+    join(baselineRoot, 'expected-open-ports.json'),
+    JSON.stringify(baseline.expectedOpenPorts)
+  );
+  await writeFile(
+    join(baselineRoot, 'legitimate-anon-grants.json'),
+    JSON.stringify(baseline.legitimateAnonGrants)
+  );
+  await writeFile(
+    join(baselineRoot, 'authorized-webhooks.json'),
+    JSON.stringify(baseline.authorizedWebhooks)
+  );
+  await writeFile(
+    join(baselineRoot, 'container-inventory.json'),
+    JSON.stringify(baseline.containerInventory)
+  );
   return baselineRoot;
 }
 
@@ -54,8 +66,8 @@ describe('runScan', () => {
   test('fails closed when a scanner client is missing', async () => {
     tempRoot = await mkdtemp(join(tmpdir(), 'security-watchdog-runner-'));
     const baselineRoot = await writeBaseline(tempRoot, fixtureBaseline);
-    await expect(runScan({ baselineRoot, outputRoot: join(tempRoot, 'out'), runId: 'run-2' })).rejects.toThrow(
-      'scanner_client_required:port-exposure'
-    );
+    await expect(
+      runScan({ baselineRoot, outputRoot: join(tempRoot, 'out'), runId: 'run-2' })
+    ).rejects.toThrow('scanner_client_required:port-exposure');
   });
 });

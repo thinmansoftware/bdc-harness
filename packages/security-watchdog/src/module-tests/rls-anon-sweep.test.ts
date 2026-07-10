@@ -18,6 +18,8 @@ describe('scanRlsAnonSweep', () => {
       },
     ]);
     const report = reduceFindings(findings, fixtureBaseline);
-    expect(report.findings.some(finding => finding.reason_code === 'rls_gap_off_baseline')).toBe(true);
+    expect(report.findings.some(finding => finding.reason_code === 'rls_gap_off_baseline')).toBe(
+      true
+    );
   });
 });

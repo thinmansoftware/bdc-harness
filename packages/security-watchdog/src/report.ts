@@ -32,7 +32,8 @@ export function renderReportMarkdown(report: ScanReport): string {
     '',
   ];
   const markdown = `${lines.join('\n')}\n`;
-  if (FORBIDDEN_ACTION_PATTERN.test(markdown)) throw new Error('phase1_report_contains_action_string');
+  if (FORBIDDEN_ACTION_PATTERN.test(markdown))
+    throw new Error('phase1_report_contains_action_string');
   return markdown;
 }
 
@@ -45,7 +46,10 @@ async function readIfPresent(path: string): Promise<string | null> {
   }
 }
 
-export async function writeSecurityWatchdogArtifacts(outputRoot: string, report: ScanReport): Promise<readonly string[]> {
+export async function writeSecurityWatchdogArtifacts(
+  outputRoot: string,
+  report: ScanReport
+): Promise<readonly string[]> {
   const parsed = scanReportSchema.parse(redactObject(report));
   const directory = join(outputRoot, parsed.runId);
   const paths = [join(directory, 'findings.json'), join(directory, 'report.md')];
@@ -53,7 +57,8 @@ export async function writeSecurityWatchdogArtifacts(outputRoot: string, report:
   await mkdir(directory, { recursive: true });
   const existing = await Promise.all(paths.map(readIfPresent));
   if (existing.every((value, index) => value === contents[index])) return paths;
-  if (existing.some(value => value !== null)) throw new Error('security_watchdog_artifact_conflict');
+  if (existing.some(value => value !== null))
+    throw new Error('security_watchdog_artifact_conflict');
 
   const writerId = randomUUID();
   const temporary = paths.map(path => `${path}.tmp-${writerId}`);

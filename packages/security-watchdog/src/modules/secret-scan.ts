@@ -7,7 +7,9 @@ export interface SecretCandidate {
   readonly source: 'tracked-file' | 'git-history';
 }
 
-export type TrackedFileReader = () => Promise<readonly { readonly path: string; readonly content: string }[]>;
+export type TrackedFileReader = () => Promise<
+  readonly { readonly path: string; readonly content: string }[]
+>;
 export type HistorySecretReader = () => Promise<readonly SecretCandidate[]>;
 
 const SECRET_PATTERNS = [

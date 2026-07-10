@@ -8,7 +8,10 @@ export interface PublicPortProbeResult {
   readonly vantage: string;
 }
 
-export type ExternalPortProber = (targetHost: string, ports: readonly number[]) => Promise<readonly PublicPortProbeResult[]>;
+export type ExternalPortProber = (
+  targetHost: string,
+  ports: readonly number[]
+) => Promise<readonly PublicPortProbeResult[]>;
 
 export async function externalPublicPortCheckerProbe(
   targetHost: string,
@@ -34,9 +37,12 @@ export async function scanPortExposure(
     readonly extraPorts?: readonly number[];
   }
 ): Promise<readonly Finding[]> {
-  const ports = [...new Set([...baseline.expectedOpenPorts.map(port => port.port), ...(options.extraPorts ?? [])])].sort(
-    (left, right) => left - right
-  );
+  const ports = [
+    ...new Set([
+      ...baseline.expectedOpenPorts.map(port => port.port),
+      ...(options.extraPorts ?? []),
+    ]),
+  ].sort((left, right) => left - right);
   const results = await options.prober(options.targetHost, ports);
   return results.map(result => ({
     module: 'port-exposure',
