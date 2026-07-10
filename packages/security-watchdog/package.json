@@ -1,0 +1,20 @@
+{
+  "name": "@archon/security-watchdog",
+  "version": "0.3.10",
+  "type": "module",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "bin": {
+    "archon-security-watchdog": "./src/cli.ts"
+  },
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "bun test src/",
+    "type-check": "bun x --bun tsc --noEmit"
+  },
+  "dependencies": {
+    "zod": "^3.25.28"
+  }
+}
