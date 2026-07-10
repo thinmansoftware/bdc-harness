@@ -531,6 +531,36 @@ export class SqliteAdapter implements IDatabase {
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       );
 
+      -- Blue Devil Dispatch message drop-box
+      CREATE TABLE IF NOT EXISTS agent_dispatch_messages (
+        id TEXT PRIMARY KEY,
+        correlation_id TEXT NOT NULL,
+        idempotency_key TEXT NOT NULL UNIQUE,
+        task_type TEXT NOT NULL CHECK (task_type IN ('agent_message', 'run_review', 'draft_spec', 'run_report')),
+        sender TEXT NOT NULL,
+        recipient TEXT NOT NULL,
+        body TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'queued' CHECK (status IN ('queued', 'claimed', 'done', 'failed', 'cancelled')),
+        result_body TEXT,
+        created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+        claimed_at TEXT,
+        completed_at TEXT,
+        not_before TEXT,
+        lease_owner TEXT,
+        lease_expires_at TEXT,
+        fencing_token INTEGER NOT NULL DEFAULT 0 CHECK (fencing_token >= 0)
+      );
+
+      CREATE TABLE IF NOT EXISTS agent_dispatch_workers (
+        worker_id TEXT PRIMARY KEY,
+        host TEXT NOT NULL,
+        capabilities TEXT NOT NULL DEFAULT '{}',
+        max_concurrency INTEGER NOT NULL DEFAULT 1 CHECK (max_concurrency > 0),
+        status TEXT NOT NULL DEFAULT 'available' CHECK (status IN ('available', 'unavailable')),
+        registered_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+        last_heartbeat_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+      );
+
       -- Indexes
       CREATE INDEX IF NOT EXISTS idx_codebase_env_vars_codebase_id ON remote_agent_codebase_env_vars(codebase_id);
       CREATE INDEX IF NOT EXISTS idx_conversations_platform ON remote_agent_conversations(platform_type, platform_conversation_id);
@@ -561,6 +591,9 @@ export class SqliteAdapter implements IDatabase {
       CREATE INDEX IF NOT EXISTS idx_cauldron_control_events_created
         ON remote_agent_cauldron_control_events(created_at);
       CREATE INDEX IF NOT EXISTS idx_messages_conversation_id ON remote_agent_messages(conversation_id, created_at ASC);
+      CREATE INDEX IF NOT EXISTS idx_agent_dispatch_messages_recipient_status ON agent_dispatch_messages(recipient, status);
+      CREATE INDEX IF NOT EXISTS idx_agent_dispatch_messages_lease_expiry ON agent_dispatch_messages(lease_expires_at) WHERE status = 'claimed';
+      CREATE INDEX IF NOT EXISTS idx_agent_dispatch_workers_status_heartbeat ON agent_dispatch_workers(status, last_heartbeat_at);
       CREATE INDEX IF NOT EXISTS idx_workflow_runs_parent_conv ON remote_agent_workflow_runs(parent_conversation_id);
       CREATE INDEX IF NOT EXISTS idx_conversations_hidden ON remote_agent_conversations(hidden);
       DROP INDEX IF EXISTS idx_conversations_codebase;
