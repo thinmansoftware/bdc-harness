@@ -118,4 +118,6 @@ export interface WorkflowDeps {
   store: IWorkflowStore;
   getAgentProvider: AgentProviderFactory;
   loadConfig: (cwd: string) => Promise<WorkflowConfig>;
+  /** Internal execution guard installed by the run-lease wrapper. */
+  isRunLeaseValid?: () => boolean;
 }

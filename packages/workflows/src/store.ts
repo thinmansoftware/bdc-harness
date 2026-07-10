@@ -8,6 +8,7 @@
 import type { WorkflowRun, WorkflowRunStatus, ApprovalContext } from './schemas';
 import type {
   ProviderAttemptRecord,
+  ExpiredRunLeaseRecord,
   RunAuthorityRecord,
   RunLeaseRecord,
   RunOutcome,
@@ -40,6 +41,7 @@ export const WORKFLOW_EVENT_TYPES = [
   'approval_requested',
   'approval_received',
   'workflow_cancelled',
+  'workflow_interrupted',
   'status_persist_failed',
   'workflow_artifact',
   // Layer 1 cascade-step event (WO-HARNESS-LAYER1-CLIMB-AND-GATE-EVENTS-01).
@@ -114,7 +116,7 @@ export interface IWorkflowStore {
   ): Promise<void>;
   failWorkflowRun(id: string, error: string, terminal?: TerminalWorkflowPersistence): Promise<void>;
   pauseWorkflowRun(id: string, approvalContext: ApprovalContext): Promise<void>;
-  cancelWorkflowRun(id: string): Promise<void>;
+  cancelWorkflowRun(id: string, terminal?: TerminalWorkflowPersistence): Promise<void>;
 
   // Smart Cauldron reliability state
   createRunAuthority(authority: RunAuthorityRecord): Promise<'created' | 'unchanged'>;
@@ -132,6 +134,13 @@ export interface IWorkflowStore {
     ownerId: string;
     leaseToken: string;
     releasedAt: string;
+  }): Promise<boolean>;
+  listExpiredRunLeases(expiredAt: string): Promise<ExpiredRunLeaseRecord[]>;
+  interruptExpiredRunLease(data: {
+    runId: string;
+    leaseToken: string;
+    expiredAt: string;
+    interruptedAt: string;
   }): Promise<boolean>;
   createProviderAttempt(attempt: ProviderAttemptRecord): Promise<boolean>;
   completeProviderAttempt(data: {

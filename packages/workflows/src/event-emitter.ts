@@ -69,7 +69,7 @@ interface WorkflowFailedEvent {
 interface WorkflowStatusPersistFailedEvent {
   type: 'status_persist_failed';
   runId: string;
-  attemptedStatus: 'completed' | 'failed';
+  attemptedStatus: 'completed' | 'failed' | 'cancelled';
   reason: 'status_persist_failed';
 }
 

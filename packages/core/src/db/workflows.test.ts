@@ -45,6 +45,7 @@ import {
   updateWorkflowRun,
   completeWorkflowRun,
   failWorkflowRun,
+  cancelWorkflowRun,
   updateWorkflowActivity,
   findResumableRun,
   resumeWorkflowRun,
@@ -58,6 +59,8 @@ import {
   claimRunLease,
   heartbeatRunLease,
   releaseRunLease,
+  listExpiredRunLeases,
+  interruptExpiredRunLease,
   createProviderAttempt,
   completeProviderAttempt,
   listProviderAttempts,
@@ -521,6 +524,47 @@ describe('workflows database', () => {
     });
   });
 
+  describe('cancelWorkflowRun', () => {
+    test('atomically persists cancellation outcome, status, and terminal event', async () => {
+      const terminal = {
+        outcome: {
+          executionState: 'cancelled' as const,
+          deliverableState: 'none' as const,
+          validationState: 'not_run' as const,
+          recoveryState: 'not_needed' as const,
+          routeState: 'current' as const,
+          primaryReason: 'cancelled_by_operator' as const,
+          reasonCodes: ['cancelled_by_operator' as const],
+          evidenceRefs: ['run:run-1'],
+        },
+        eventData: { reason_code: 'cancelled_by_operator' },
+        updatedAt: '2026-07-09T20:00:00.000Z',
+      };
+      mockTransactionQuery
+        .mockResolvedValueOnce(createQueryResult([{ status: 'running' }], 1))
+        .mockResolvedValueOnce(createQueryResult([{ run_id: 'run-1' }], 1))
+        .mockResolvedValueOnce(createQueryResult([], 1))
+        .mockResolvedValueOnce(createQueryResult([], 1));
+
+      await cancelWorkflowRun('run-1', terminal);
+
+      expect(mockWithTransaction).toHaveBeenCalledTimes(1);
+      expect(mockTransactionQuery).toHaveBeenCalledTimes(4);
+      expect(mockTransactionQuery.mock.calls[2]?.[0]).toContain('status = $1');
+      expect(mockTransactionQuery.mock.calls[2]?.[1]).toEqual([
+        'cancelled',
+        JSON.stringify({}),
+        'run-1',
+      ]);
+      expect(mockTransactionQuery.mock.calls[3]?.[1]).toEqual([
+        'run-1',
+        'workflow_cancelled',
+        null,
+        JSON.stringify(terminal.eventData),
+      ]);
+    });
+  });
+
   describe('error handling', () => {
     test('createWorkflowRun throws on database error', async () => {
       mockQuery.mockRejectedValueOnce(new Error('Connection refused'));
@@ -927,21 +971,35 @@ describe('workflows database', () => {
   });
 
   describe('failOrphanedRuns', () => {
-    test('transitions all running runs to failed with completed_at and returns count', async () => {
-      mockQuery.mockResolvedValueOnce(createQueryResult([], 2));
+    test('compatibility wrapper interrupts only runs with expired leases', async () => {
+      mockQuery.mockResolvedValueOnce(
+        createQueryResult([
+          {
+            run_id: 'run-1',
+            workflow_name: 'feature',
+            working_path: 'C:/worktrees/run-1',
+            owner_id: 'worker-old',
+            lease_token: 'token-old',
+            expires_at: '2026-07-09T19:00:00.000Z',
+          },
+        ])
+      );
+      mockTransactionQuery
+        .mockResolvedValueOnce(createQueryResult([{ status: 'running' }], 1))
+        .mockResolvedValueOnce(createQueryResult([], 1))
+        .mockResolvedValueOnce(createQueryResult([{ run_id: 'run-1' }], 1))
+        .mockResolvedValueOnce(createQueryResult([], 1))
+        .mockResolvedValueOnce(createQueryResult([], 1));
 
       const result = await failOrphanedRuns();
 
-      expect(result.count).toBe(2);
-      const [query, params] = mockQuery.mock.calls[0] as [string, unknown[]];
-      expect(query).toContain("status = 'failed'");
-      expect(query).toContain('completed_at = NOW()');
-      expect(query).toContain("status = 'running'");
-      expect(params).toContain(JSON.stringify({ failure_reason: 'server_restart' }));
+      expect(result.count).toBe(1);
+      expect(mockQuery.mock.calls[0]?.[0]).toContain('remote_agent_run_leases');
+      expect(mockTransactionQuery.mock.calls[1]?.[0]).toContain("status = 'interrupted'");
     });
 
-    test('returns count 0 when no running runs exist', async () => {
-      mockQuery.mockResolvedValueOnce(createQueryResult([], 0));
+    test('returns count 0 when no expired leases exist', async () => {
+      mockQuery.mockResolvedValueOnce(createQueryResult([]));
 
       const result = await failOrphanedRuns();
 
@@ -952,7 +1010,7 @@ describe('workflows database', () => {
       mockQuery.mockRejectedValueOnce(new Error('Connection lost'));
 
       await expect(failOrphanedRuns()).rejects.toThrow(
-        'Failed to fail orphaned workflow runs: Connection lost'
+        'Failed to reconcile orphaned workflow runs: Connection lost'
       );
     });
   });
@@ -1291,6 +1349,60 @@ describe('Smart Cauldron reliability persistence', () => {
     ).resolves.toBe(false);
   });
 
+  test('lists only expired leases attached to running runs', async () => {
+    mockQuery.mockResolvedValueOnce(
+      createQueryResult([
+        {
+          run_id: 'run-1',
+          workflow_name: 'feature',
+          working_path: 'C:/worktrees/run-1',
+          owner_id: 'worker-old',
+          lease_token: 'token-old',
+          expires_at: '2026-07-09T19:00:00.000Z',
+        },
+      ])
+    );
+
+    await expect(listExpiredRunLeases('2026-07-09T20:00:00.000Z')).resolves.toEqual([
+      {
+        runId: 'run-1',
+        workflowName: 'feature',
+        workingPath: 'C:/worktrees/run-1',
+        ownerId: 'worker-old',
+        leaseToken: 'token-old',
+        expiresAt: '2026-07-09T19:00:00.000Z',
+      },
+    ]);
+    expect(mockQuery.mock.calls[0]?.[0]).toContain("r.status = 'running'");
+    expect(mockQuery.mock.calls[0]?.[0]).toContain('l.expires_at <= $1');
+  });
+
+  test('interrupts an expired lease exactly once and persists recovery evidence', async () => {
+    mockTransactionQuery
+      .mockResolvedValueOnce(createQueryResult([{ status: 'running' }], 1))
+      .mockResolvedValueOnce(createQueryResult([], 1))
+      .mockResolvedValueOnce(createQueryResult([{ run_id: 'run-1' }], 1))
+      .mockResolvedValueOnce(createQueryResult([], 1))
+      .mockResolvedValueOnce(createQueryResult([], 1));
+
+    await expect(
+      interruptExpiredRunLease({
+        runId: 'run-1',
+        leaseToken: 'token-old',
+        expiredAt: '2026-07-09T20:00:00.000Z',
+        interruptedAt: '2026-07-09T20:00:01.000Z',
+      })
+    ).resolves.toBe(true);
+
+    expect(mockWithTransaction).toHaveBeenCalledTimes(1);
+    expect(mockTransactionQuery.mock.calls[0]?.[0]).toContain('l.lease_token = $2');
+    expect(mockTransactionQuery.mock.calls[0]?.[0]).toContain('l.expires_at <= $3');
+    expect(mockTransactionQuery.mock.calls[1]?.[0]).toContain("status = 'interrupted'");
+    expect(mockTransactionQuery.mock.calls[2]?.[0]).toContain('remote_agent_run_outcomes');
+    expect(mockTransactionQuery.mock.calls[3]?.[0]).toContain('workflow_interrupted');
+    expect(mockTransactionQuery.mock.calls[4]?.[0]).toContain('released_at = $3');
+  });
+
   const attempt: ProviderAttemptRecord = {
     attemptId: '44444444-4444-4444-8444-444444444444',
     runId: authority.runId,
@@ -1561,12 +1673,47 @@ describe('Smart Cauldron reliability persistence', () => {
           completedAt: '2026-07-09T17:00:01.000Z',
         })
       ).resolves.toBe(false);
+      const expiredAt = '2026-07-09T17:00:01.000Z';
+      await expect(listExpiredRunLeases(expiredAt)).resolves.toHaveLength(1);
+      await expect(
+        interruptExpiredRunLease({
+          runId: lease.runId,
+          leaseToken: lease.leaseToken,
+          expiredAt,
+          interruptedAt: expiredAt,
+        })
+      ).resolves.toBe(true);
+      await expect(
+        interruptExpiredRunLease({
+          runId: lease.runId,
+          leaseToken: lease.leaseToken,
+          expiredAt,
+          interruptedAt: expiredAt,
+        })
+      ).resolves.toBe(false);
+      await expect(getWorkflowRunStatus(lease.runId)).resolves.toBe('interrupted');
+      await expect(getRunOutcome(lease.runId)).resolves.toMatchObject({
+        executionState: 'interrupted',
+        recoveryState: 'recoverable',
+        primaryReason: 'worker_lease_expired',
+      });
+
+      const recoveryLease: RunLeaseRecord = {
+        ...lease,
+        ownerId: 'worker-2',
+        leaseToken: '88888888-8888-4888-8888-888888888888',
+        acquiredAt: '2026-07-09T17:00:02.000Z',
+        lastHeartbeatAt: '2026-07-09T17:00:02.000Z',
+        expiresAt: '2026-07-09T17:01:02.000Z',
+      };
+      await expect(claimRunLease(recoveryLease)).resolves.toEqual(recoveryLease);
+      await expect(resumeWorkflowRun(lease.runId)).resolves.toMatchObject({ status: 'running' });
       await expect(
         releaseRunLease({
-          runId: lease.runId,
-          ownerId: lease.ownerId,
-          leaseToken: lease.leaseToken,
-          releasedAt: '2026-07-09T17:00:01.000Z',
+          runId: recoveryLease.runId,
+          ownerId: recoveryLease.ownerId,
+          leaseToken: recoveryLease.leaseToken,
+          releasedAt: '2026-07-09T17:00:03.000Z',
         })
       ).resolves.toBe(true);
 

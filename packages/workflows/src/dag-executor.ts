@@ -98,7 +98,103 @@ import { loadContext } from '@archon/persona-context-loader';
 import { deriveEntryRung, computeFrontierCost } from './model-rates';
 import { isDeclaredServedMatch } from './model-alias';
 import { emitRunTokenTotals } from './token-rollup';
-import type { RunOutcome } from './reliability/types';
+import type { RunOutcome, TerminalWorkflowPersistence } from './reliability/types';
+import { withRunLease } from './run-lease';
+
+function cancellationPersistence(
+  runId: string,
+  reason: string,
+  stepName?: string
+): TerminalWorkflowPersistence {
+  return {
+    outcome: {
+      executionState: 'cancelled',
+      deliverableState: 'none',
+      validationState: 'not_run',
+      recoveryState: 'not_needed',
+      routeState: 'current',
+      primaryReason: 'cancelled_by_operator',
+      reasonCodes: ['cancelled_by_operator'],
+      evidenceRefs: [`run:${runId}`],
+    },
+    eventData: { reason, reason_code: 'cancelled_by_operator' },
+    updatedAt: new Date().toISOString(),
+    stepName,
+  };
+}
+
+async function persistCancellation(
+  deps: WorkflowDeps,
+  platform: IWorkflowPlatform,
+  conversationId: string,
+  workflowRun: WorkflowRun,
+  nodeId: string,
+  reason: string
+): Promise<boolean> {
+  try {
+    await deps.store.cancelWorkflowRun(
+      workflowRun.id,
+      cancellationPersistence(workflowRun.id, reason, nodeId)
+    );
+    return true;
+  } catch (error) {
+    const failedAt = new Date().toISOString();
+    getLog().error(
+      { err: error as Error, workflowRunId: workflowRun.id, nodeId },
+      'dag_cancel_persist_failed'
+    );
+    const currentStatus = await deps.store.getWorkflowRunStatus(workflowRun.id).catch(() => null);
+    if (currentStatus === 'running') {
+      await deps.store
+        .updateWorkflowRun(workflowRun.id, {
+          status: 'interrupted',
+          metadata: {
+            terminal_persist_failure: {
+              attempted_status: 'cancelled',
+              reason_code: 'status_persist_failed',
+              failed_at: failedAt,
+            },
+          },
+        })
+        .catch(() => undefined);
+      await deps.store
+        .upsertRunOutcome(
+          workflowRun.id,
+          {
+            executionState: 'interrupted',
+            deliverableState: 'none',
+            validationState: 'not_run',
+            recoveryState: 'recoverable',
+            routeState: 'current',
+            primaryReason: 'status_persist_failed',
+            reasonCodes: ['status_persist_failed'],
+            evidenceRefs: [`run:${workflowRun.id}`, 'status_persist_failed'],
+          },
+          failedAt
+        )
+        .catch(() => undefined);
+    }
+    await deps.store.createWorkflowEvent({
+      workflow_run_id: workflowRun.id,
+      event_type: 'status_persist_failed',
+      step_name: nodeId,
+      data: { attempted_status: 'cancelled', reason_code: 'status_persist_failed' },
+    });
+    getWorkflowEventEmitter().emit({
+      type: 'status_persist_failed',
+      runId: workflowRun.id,
+      attemptedStatus: 'cancelled',
+      reason: 'status_persist_failed',
+    });
+    await safeSendMessage(
+      platform,
+      conversationId,
+      'Warning: workflow cancellation could not be saved. The run is recoverable and no cancellation event was published.',
+      { workflowId: workflowRun.id, nodeName: nodeId }
+    );
+    return false;
+  }
+}
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
 let cachedLog: ReturnType<typeof createLogger> | undefined;
@@ -3811,25 +3907,21 @@ async function executeApprovalNode(
 
     // Check if max attempts exhausted
     if (rejectionCount >= maxAttempts) {
-      await deps.store.cancelWorkflowRun(workflowRun.id);
-      deps.store
-        .createWorkflowEvent({
-          workflow_run_id: workflowRun.id,
-          event_type: 'workflow_cancelled',
-          step_name: node.id,
-          data: { reason: `max_attempts (${String(maxAttempts)}) exhausted` },
-        })
-        .catch((err: Error) => {
-          getLog().error(
-            { err, workflowRunId: workflowRun.id, eventType: 'workflow_cancelled' },
-            'workflow.event_persist_failed'
-          );
-        });
+      const cancelReason = `max_attempts (${String(maxAttempts)}) exhausted`;
+      const cancellationSaved = await persistCancellation(
+        deps,
+        platform,
+        conversationId,
+        workflowRun,
+        node.id,
+        cancelReason
+      );
+      if (!cancellationSaved) return { state: 'completed', output: cancelReason };
       getWorkflowEventEmitter().emit({
         type: 'workflow_cancelled',
         runId: workflowRun.id,
         nodeId: node.id,
-        reason: `max_attempts (${String(maxAttempts)}) exhausted`,
+        reason: cancelReason,
       });
       const cancelMsg = `[ ] Approval node \`${node.id}\` cancelled after ${String(maxAttempts)} rejections.`;
       await safeSendMessage(platform, conversationId, cancelMsg, msgContext);
@@ -4015,7 +4107,7 @@ async function executeApprovalNode(
  * Execute a complete DAG workflow.
  * Called from executeWorkflow() in executor.ts.
  */
-export async function executeDagWorkflow(
+async function executeDagWorkflowInternal(
   deps: WorkflowDeps,
   platform: IWorkflowPlatform,
   conversationId: string,
@@ -4122,6 +4214,10 @@ export async function executeDagWorkflow(
   }
 
   for (let layerIdx = 0; layerIdx < layers.length; layerIdx++) {
+    if (deps.isRunLeaseValid?.() === false) {
+      getLog().warn({ workflowRunId: workflowRun.id }, 'dag.run_lease_lost');
+      return;
+    }
     const layer = layers[layerIdx];
     const isParallelLayer = layer.length > 1;
 
@@ -4480,24 +4576,21 @@ export async function executeDagWorkflow(
           if (isCancelNode(node)) {
             const reason = substituteNodeOutputRefs(node.cancel, nodeOutputs);
             const cancelMsg = `\u274c **Workflow cancelled** (node \`${node.id}\`): ${reason}`;
+            const cancellationSaved = await persistCancellation(
+              deps,
+              platform,
+              conversationId,
+              workflowRun,
+              node.id,
+              reason
+            );
+            if (!cancellationSaved) {
+              return { nodeId: node.id, output: { state: 'completed' as const, output: reason } };
+            }
             await safeSendMessage(platform, conversationId, cancelMsg, {
               workflowId: workflowRun.id,
               nodeName: node.id,
             });
-            deps.store
-              .createWorkflowEvent({
-                workflow_run_id: workflowRun.id,
-                event_type: 'workflow_cancelled',
-                step_name: node.id,
-                data: { reason },
-              })
-              .catch((err: Error) => {
-                getLog().error(
-                  { err, workflowRunId: workflowRun.id, eventType: 'workflow_cancelled' },
-                  'workflow.event_persist_failed'
-                );
-              });
-            await deps.store.cancelWorkflowRun(workflowRun.id);
             getWorkflowEventEmitter().emit({
               type: 'workflow_cancelled',
               runId: workflowRun.id,
@@ -4904,6 +4997,11 @@ export async function executeDagWorkflow(
     }
   }
 
+  if (deps.isRunLeaseValid?.() === false) {
+    getLog().warn({ workflowRunId: workflowRun.id }, 'dag.run_lease_lost_before_terminal');
+    return;
+  }
+
   /**
    * Bail out of the final completion/failure write if the run was transitioned
    * externally. Strict `!== 'running'` check is correct here because we don't
@@ -5282,3 +5380,11 @@ export async function executeDagWorkflow(
 
   return terminalOutput;
 }
+
+export const executeDagWorkflow: typeof executeDagWorkflowInternal = (...args) => {
+  const [deps, , , , , workflowRun] = args;
+  const [, ...executionArgs] = args;
+  return withRunLease(deps.store, workflowRun.id, isRunLeaseValid =>
+    executeDagWorkflowInternal({ ...deps, isRunLeaseValid }, ...executionArgs)
+  );
+};

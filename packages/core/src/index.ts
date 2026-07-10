@@ -56,6 +56,11 @@ export { SessionNotFoundError } from './db/sessions';
 
 // Store adapter (bridges core DB to @archon/workflows IWorkflowStore)
 export { createWorkflowStore } from './workflows/store-adapter';
+export {
+  claimAndResumeInterruptedRun,
+  reconcileExpiredWorkflowLeases,
+  type StartupRecoveryReport,
+} from './workflows/recovery';
 
 // Workflow Events DB
 export * as workflowEventDb from './db/workflow-events';

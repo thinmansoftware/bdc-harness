@@ -64,6 +64,7 @@ import { MessagePersistence } from './adapters/web/persistence';
 import { SSETransport } from './adapters/web/transport';
 import { WorkflowEventBridge } from './adapters/web/workflow-bridge';
 import { registerApiRoutes } from './routes/api';
+import { observeStartupRecovery } from './startup-reconciliation';
 import {
   handleMessage,
   pool,
@@ -204,6 +205,19 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     process.exit(1);
   }
 
+  // Observe expired leases before the HTTP listener can accept new dispatch.
+  // This pass is deliberately non-mutating; explicit recovery uses lease CAS.
+  try {
+    const recovery = await observeStartupRecovery();
+    getLog().info(recovery, 'startup_recovery_observed');
+    if (recovery.blocked > 0) {
+      getLog().warn(recovery, 'startup_recovery_blocked_candidates');
+    }
+  } catch (error) {
+    getLog().fatal({ err: error }, 'startup_recovery_observation_failed');
+    process.exit(1);
+  }
+
   const config = await loadConfig();
   logConfig(config);
 
@@ -220,17 +234,8 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
   // Start cleanup scheduler
   startCleanupScheduler();
 
-  // Note: orphaned-run cleanup intentionally NOT called at server startup.
-  // Running it here killed parallel workflow runs from other processes
-  // (CLI, adapters) by flipping their `running` rows to `failed` mid-flight.
-  // Same lesson the CLI already learned -- see packages/cli/src/cli.ts:256-258.
-  // Per CLAUDE.md "No Autonomous Lifecycle Mutation Across Process Boundaries":
-  // surface ambiguous state to users and provide a one-click action instead.
-  // Users transition a stuck `running` row via the per-row Cancel/Abandon
-  // buttons in the Web UI dashboard, or `archon workflow abandon <run-id>`.
-  // (`archon workflow cleanup` is a separate command that deletes OLD terminal
-  // rows for disk hygiene -- it does not handle stuck `running` rows.)
-  // See #1216.
+  // Startup recovery remains observe-only. It never flips another worker's row,
+  // resumes a run, or touches a worktree without an explicit lease-CAS recovery.
 
   // Log Archon paths configuration
   logArchonPaths();

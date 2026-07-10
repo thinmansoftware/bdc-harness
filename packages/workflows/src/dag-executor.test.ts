@@ -5834,6 +5834,54 @@ describe('executeDagWorkflow -- cancel node', () => {
     expect(cancelMsg).toBeDefined();
   });
 
+  it('does not publish cancellation when atomic cancellation persistence fails', async () => {
+    const store = createMockStore();
+    (store.cancelWorkflowRun as Mock<() => Promise<void>>).mockRejectedValue(
+      new Error('database unavailable')
+    );
+    (store.getWorkflowRunStatus as Mock<() => Promise<string>>).mockResolvedValue('running');
+    let interrupted = false;
+    (store.updateWorkflowRun as Mock<() => Promise<void>>).mockImplementation(async () => {
+      interrupted = true;
+    });
+    (store.getWorkflowRunStatus as Mock<() => Promise<string>>).mockImplementation(async () =>
+      interrupted ? 'interrupted' : 'running'
+    );
+    const platform = createMockPlatform();
+    const emitted: string[] = [];
+    const unsubscribe = getWorkflowEventEmitter().subscribe(event => emitted.push(event.type));
+    try {
+      await executeDagWorkflow(
+        createMockDeps(store),
+        platform,
+        'conv-dag',
+        testDir,
+        { name: 'cancel-persist-failure', nodes: [{ id: 'stop', cancel: 'Stop now' }] },
+        makeWorkflowRun(),
+        'claude',
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        minimalConfig
+      );
+    } finally {
+      unsubscribe();
+    }
+
+    expect(emitted).toContain('status_persist_failed');
+    expect(emitted).not.toContain('workflow_cancelled');
+    expect(store.updateWorkflowRun).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.objectContaining({ status: 'interrupted' })
+    );
+    const messages = (platform.sendMessage as Mock<() => Promise<void>>).mock.calls.map(
+      call => call[1] as string
+    );
+    expect(messages.some(message => message.includes('Workflow cancelled'))).toBe(false);
+  });
+
   it('cancel node with when: false is skipped', async () => {
     const store = createMockStore();
     const mockDeps = createMockDeps(store);

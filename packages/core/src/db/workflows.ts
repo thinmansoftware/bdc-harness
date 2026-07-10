@@ -11,6 +11,7 @@ import type {
 import { TERMINAL_WORKFLOW_STATUSES } from '@archon/workflows/schemas/workflow-run';
 import type {
   ExecutionCapability,
+  ExpiredRunLeaseRecord,
   ProviderAttemptOutcomeClass,
   ProviderAttemptRecord,
   RunAuthorityRecord,
@@ -466,6 +467,122 @@ export async function releaseRunLease(data: {
   return result.rowCount === 1;
 }
 
+interface ExpiredRunLeaseRow {
+  run_id: string;
+  workflow_name: string;
+  working_path: string | null;
+  owner_id: string;
+  lease_token: string;
+  expires_at: string | Date;
+}
+
+export async function listExpiredRunLeases(expiredAt: string): Promise<ExpiredRunLeaseRecord[]> {
+  const result = await pool.query<ExpiredRunLeaseRow>(
+    `SELECT r.id AS run_id, r.workflow_name, r.working_path,
+            l.owner_id, l.lease_token, l.expires_at
+     FROM remote_agent_workflow_runs r
+     JOIN remote_agent_run_leases l ON l.run_id = r.id
+     WHERE r.status = 'running'
+       AND l.released_at IS NULL
+       AND l.expires_at <= $1
+     ORDER BY l.expires_at ASC, r.id ASC`,
+    [expiredAt]
+  );
+  return result.rows.map(row => ({
+    runId: row.run_id,
+    workflowName: row.workflow_name,
+    workingPath: row.working_path,
+    ownerId: row.owner_id,
+    leaseToken: row.lease_token,
+    expiresAt: row.expires_at instanceof Date ? row.expires_at.toISOString() : row.expires_at,
+  }));
+}
+
+/**
+ * Compare-and-swap an expired leased run into recoverable interruption.
+ * A heartbeat, cancellation, or terminal transition that wins first makes this a no-op.
+ */
+export async function interruptExpiredRunLease(data: {
+  runId: string;
+  leaseToken: string;
+  expiredAt: string;
+  interruptedAt: string;
+}): Promise<boolean> {
+  const db = getDatabase();
+  return db.withTransaction(async query => {
+    const lockSuffix = db.dialect === 'postgres' ? ' FOR UPDATE' : '';
+    const candidate = await query<{ status: string }>(
+      `SELECT r.status
+       FROM remote_agent_workflow_runs r
+       JOIN remote_agent_run_leases l ON l.run_id = r.id
+       WHERE r.id = $1 AND l.lease_token = $2 AND l.expires_at <= $3
+         AND l.released_at IS NULL AND r.status = 'running'${lockSuffix}`,
+      [data.runId, data.leaseToken, data.expiredAt]
+    );
+    if (!candidate.rows[0]) return false;
+
+    const update = await query(
+      `UPDATE remote_agent_workflow_runs
+       SET status = 'interrupted',
+           metadata = ${db.sql.jsonMerge('metadata', 1)}
+       WHERE id = $2 AND status = 'running'`,
+      [
+        JSON.stringify({
+          interruption_reason: 'worker_lease_expired',
+          interrupted_at: data.interruptedAt,
+        }),
+        data.runId,
+      ]
+    );
+    if (update.rowCount !== 1) return false;
+
+    await query<{ run_id: string }>(
+      `INSERT INTO remote_agent_run_outcomes
+       (run_id, execution_state, deliverable_state, validation_state, recovery_state,
+        route_state, primary_reason, reason_codes, evidence_refs, updated_at)
+       VALUES ($1, 'interrupted', 'none', 'not_run', 'recoverable',
+               'current', 'worker_lease_expired', $2, $3, $4)
+       ON CONFLICT (run_id) DO UPDATE SET
+         execution_state = EXCLUDED.execution_state,
+         recovery_state = EXCLUDED.recovery_state,
+         primary_reason = EXCLUDED.primary_reason,
+         reason_codes = EXCLUDED.reason_codes,
+         evidence_refs = EXCLUDED.evidence_refs,
+         updated_at = EXCLUDED.updated_at
+       WHERE remote_agent_run_outcomes.updated_at <= EXCLUDED.updated_at
+       RETURNING run_id`,
+      [
+        data.runId,
+        JSON.stringify(['worker_lease_expired']),
+        JSON.stringify([`lease:${data.leaseToken}`]),
+        data.interruptedAt,
+      ]
+    );
+    await query(
+      `INSERT INTO remote_agent_workflow_events (workflow_run_id, event_type, data)
+       SELECT $1, 'workflow_interrupted', $2
+       WHERE NOT EXISTS (
+         SELECT 1 FROM remote_agent_workflow_events
+         WHERE workflow_run_id = $1 AND event_type = 'workflow_interrupted'
+       )`,
+      [
+        data.runId,
+        JSON.stringify({
+          reason_code: 'worker_lease_expired',
+          interrupted_at: data.interruptedAt,
+        }),
+      ]
+    );
+    await query(
+      `UPDATE remote_agent_run_leases
+       SET released_at = $3
+       WHERE run_id = $1 AND lease_token = $2 AND released_at IS NULL`,
+      [data.runId, data.leaseToken, data.interruptedAt]
+    );
+    return true;
+  });
+}
+
 /** Persist the attempt before invoking a provider. Duplicate IDs/numbers are rejected. */
 export async function createProviderAttempt(attempt: ProviderAttemptRecord): Promise<boolean> {
   const result = await pool.query<{ attempt_id: string }>(
@@ -910,7 +1027,7 @@ export async function findResumableRunByParentConversation(
 }
 
 export async function resumeWorkflowRun(id: string): Promise<WorkflowRun> {
-  const dialect = getDialect();
+  const dialect = getDatabase().sql;
 
   // Split into UPDATE + SELECT to support both PostgreSQL and SQLite
   // (SQLite does not support RETURNING on UPDATE statements)
@@ -1065,7 +1182,7 @@ export async function updateWorkflowRun(
 
 async function persistTerminalWorkflowRun(
   id: string,
-  status: 'completed' | 'failed',
+  status: 'completed' | 'failed' | 'cancelled',
   metadata: Record<string, unknown>,
   terminal: TerminalWorkflowPersistence
 ): Promise<void> {
@@ -1150,15 +1267,20 @@ async function persistTerminalWorkflowRun(
       }
     }
 
-    const eventType = status === 'completed' ? 'workflow_completed' : 'workflow_failed';
+    const eventType =
+      status === 'completed'
+        ? 'workflow_completed'
+        : status === 'cancelled'
+          ? 'workflow_cancelled'
+          : 'workflow_failed';
     await query(
-      `INSERT INTO remote_agent_workflow_events (workflow_run_id, event_type, data)
-       SELECT $1, $2, $3
+      `INSERT INTO remote_agent_workflow_events (workflow_run_id, event_type, step_name, data)
+       SELECT $1, $2, $3, $4
        WHERE NOT EXISTS (
          SELECT 1 FROM remote_agent_workflow_events
          WHERE workflow_run_id = $1 AND event_type = $2
        )`,
-      [id, eventType, JSON.stringify(terminal.eventData)]
+      [id, eventType, terminal.stepName ?? null, JSON.stringify(terminal.eventData)]
     );
   });
 }
@@ -1412,7 +1534,20 @@ export async function reconcileTerminalWorkflowRuns(
   });
 }
 
-export async function cancelWorkflowRun(id: string): Promise<void> {
+export async function cancelWorkflowRun(
+  id: string,
+  terminal?: TerminalWorkflowPersistence
+): Promise<void> {
+  if (terminal) {
+    try {
+      await persistTerminalWorkflowRun(id, 'cancelled', terminal.metadata ?? {}, terminal);
+      return;
+    } catch (error) {
+      const err = error as Error;
+      getLog().error({ err }, 'db.workflow_run_terminal_cancel_failed');
+      throw new Error(`Failed to cancel workflow run: ${err.message}`);
+    }
+  }
   const dialect = getDialect();
   try {
     await pool.query(
@@ -1884,32 +2019,32 @@ export async function updateWorkflowActivity(id: string): Promise<void> {
   );
 }
 
-/**
- * Transition all 'running' workflow runs to 'failed'.
- * Called on server startup to mark runs orphaned by process termination.
- * The next invocation of the same workflow at the same path will auto-resume
- * from completed nodes via findResumableRun.
- */
+/** Compatibility wrapper for legacy callers. Only expired leased runs are interrupted. */
 export async function failOrphanedRuns(): Promise<{ count: number }> {
-  const dialect = getDialect();
   try {
-    const result = await pool.query(
-      `UPDATE remote_agent_workflow_runs
-       SET status = 'failed',
-           completed_at = ${dialect.now()},
-           metadata = ${dialect.jsonMerge('metadata', 1)}
-       WHERE status = 'running'`,
-      [JSON.stringify({ failure_reason: 'server_restart' })]
-    );
-    const count = result.rowCount ?? 0;
+    const now = new Date().toISOString();
+    const candidates = await listExpiredRunLeases(now);
+    let count = 0;
+    for (const candidate of candidates) {
+      if (
+        await interruptExpiredRunLease({
+          runId: candidate.runId,
+          leaseToken: candidate.leaseToken,
+          expiredAt: now,
+          interruptedAt: now,
+        })
+      ) {
+        count += 1;
+      }
+    }
     if (count > 0) {
-      getLog().info({ count }, 'db.orphaned_workflow_runs_failed');
+      getLog().info({ count }, 'db.orphaned_workflow_runs_interrupted');
     }
     return { count };
   } catch (error) {
     const err = error as Error;
-    getLog().error({ err }, 'db.orphaned_workflow_runs_fail_failed');
-    throw new Error(`Failed to fail orphaned workflow runs: ${err.message}`);
+    getLog().error({ err }, 'db.orphaned_workflow_runs_reconcile_failed');
+    throw new Error(`Failed to reconcile orphaned workflow runs: ${err.message}`);
   }
 }
 

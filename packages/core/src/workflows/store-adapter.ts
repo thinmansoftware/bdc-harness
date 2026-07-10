@@ -49,6 +49,8 @@ export function createWorkflowStore(): IWorkflowStore {
     claimRunLease: workflowDb.claimRunLease,
     heartbeatRunLease: workflowDb.heartbeatRunLease,
     releaseRunLease: workflowDb.releaseRunLease,
+    listExpiredRunLeases: workflowDb.listExpiredRunLeases,
+    interruptExpiredRunLease: workflowDb.interruptExpiredRunLease,
     createProviderAttempt: workflowDb.createProviderAttempt,
     completeProviderAttempt: workflowDb.completeProviderAttempt,
     listProviderAttempts: workflowDb.listProviderAttempts,

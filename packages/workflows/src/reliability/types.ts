@@ -162,6 +162,15 @@ export interface RunLeaseRecord {
   readonly releasedAt: string | null;
 }
 
+export interface ExpiredRunLeaseRecord {
+  readonly runId: string;
+  readonly workflowName: string;
+  readonly workingPath: string | null;
+  readonly ownerId: string;
+  readonly leaseToken: string;
+  readonly expiresAt: string;
+}
+
 export const SCHEDULED_WAIT_STATES = ['scheduled', 'claimed', 'cancelled', 'completed'] as const;
 
 export type ScheduledWaitState = (typeof SCHEDULED_WAIT_STATES)[number];
@@ -237,6 +246,7 @@ export interface TerminalWorkflowPersistence {
   readonly outcome: RunOutcome;
   readonly eventData: Readonly<Record<string, unknown>>;
   readonly updatedAt: string;
+  readonly stepName?: string;
   readonly metadata?: Readonly<Record<string, unknown>>;
 }
 
