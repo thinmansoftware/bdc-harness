@@ -265,11 +265,12 @@ describe('createWorkflowStore', () => {
 });
 
 describe('createWorkflowDeps', () => {
-  test('returns WorkflowDeps with store, getAgentProvider, and loadConfig', () => {
+  test('returns WorkflowDeps with store, providers, config, and authority freezing', () => {
     const deps = createWorkflowDeps();
     expect(deps.store).toBeDefined();
     expect(typeof deps.getAgentProvider).toBe('function');
     expect(typeof deps.loadConfig).toBe('function');
+    expect(typeof deps.freezeWorkOrderSource).toBe('function');
   });
 
   test('store from createWorkflowDeps has all IWorkflowStore methods', () => {

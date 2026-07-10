@@ -416,6 +416,13 @@ describe('executeWorkflow', () => {
         const createAuthority = mock(async () => 'created' as const);
         const store = makeStore({ createRunAuthority: createAuthority });
         const deps = makeDeps(store);
+        const freezeWorkOrderSource = mock(async () => ({
+          woId: 'WO-TEST-01',
+          specSource: 'github:bluedevilcollectibles/bdc-xo:docs/work-orders/WO-TEST-01.md',
+          specRevision: 'a'.repeat(40),
+          specBytes: Buffer.from('# Exact\n', 'utf8'),
+        }));
+        deps.freezeWorkOrderSource = freezeWorkOrderSource;
         deps.loadConfig = mock(async () => ({
           assistant: 'claude',
           assistants: { claude: {}, codex: {} },
@@ -457,23 +464,14 @@ describe('executeWorkflow', () => {
           }),
           'WO-TEST-01',
           'db-conv-1',
-          'codebase-1',
-          undefined,
-          undefined,
-          undefined,
-          undefined,
-          {
-            dispatchId: 'dispatch-1',
-            woId: 'WO-TEST-01',
-            specSource: 'github:bluedevilcollectibles/bdc-xo:docs/work-orders/WO-TEST-01.md',
-            specRevision: 'a'.repeat(40),
-            specBytes: Buffer.from('# Exact\n', 'utf8'),
-          }
+          'codebase-1'
         );
 
         expect(result).toEqual({ success: true, workflowRunId: 'run-123', summary: undefined });
+        expect(freezeWorkOrderSource).toHaveBeenCalledTimes(1);
         expect(createAuthority).toHaveBeenCalledTimes(1);
         const authority = createAuthority.mock.calls[0]?.[0];
+        expect(authority?.dispatchId).toBe('conv-1');
         expect(authority?.baseSha).toBe('b'.repeat(40));
         expect(authority?.runScopeSha).toBe('c'.repeat(40));
         expect(authority?.headBranch).toBe('archon/thread-test');

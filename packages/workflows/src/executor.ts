@@ -868,18 +868,28 @@ export async function executeWorkflow(
   // Wrap execution in try-catch to ensure workflow is marked as failed on any error
   try {
     if (workflow.run_authority?.required) {
-      if (authoritySource) {
+      let effectiveAuthoritySource = authoritySource;
+      const existingAuthority = effectiveAuthoritySource
+        ? null
+        : await deps.store.getRunAuthority(workflowRun.id);
+      if (!effectiveAuthoritySource && !existingAuthority) {
+        if (!deps.freezeWorkOrderSource) {
+          throw new Error('scope_authority_missing: frozen dispatch source');
+        }
+        const frozen = await deps.freezeWorkOrderSource(workflow.run_authority, userMessage);
+        effectiveAuthoritySource = { ...frozen, dispatchId: conversationId };
+      }
+      if (effectiveAuthoritySource) {
         const authorityInput = await captureRunAuthorityInput(
           cwd,
           workflow,
           workflowRun,
           codebaseId,
           baseBranch,
-          authoritySource
+          effectiveAuthoritySource
         );
         await persistRunAuthority(deps.store, artifactsDir, authorityInput);
       } else {
-        const existingAuthority = await deps.store.getRunAuthority(workflowRun.id);
         if (!existingAuthority) {
           throw new Error('scope_authority_missing: frozen dispatch source');
         }
