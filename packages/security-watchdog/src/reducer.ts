@@ -12,10 +12,23 @@ function anonGrantKey(value: Pick<LegitimateAnonGrant, 'instance' | 'schema' | '
   return `${value.instance}:${value.schema}.${value.table}`;
 }
 
+/**
+ * Read a single evidence field as a string. evidence is Record<string, unknown>,
+ * so a bare `String(x ?? '')` still stringifies an object as '[object Object]'
+ * (no-base-to-string). Coerce only genuine string/number/boolean primitives;
+ * anything else (object, array, null, undefined) falls back to `fallback`.
+ */
+function evStr(evidence: Record<string, unknown>, key: string, fallback = ''): string {
+  const raw = evidence[key];
+  if (typeof raw === 'string') return raw;
+  if (typeof raw === 'number' || typeof raw === 'boolean') return String(raw);
+  return fallback;
+}
+
 function normalizeRlsFinding(finding: Finding, baseline: Baseline): Finding {
-  const instance = String(finding.evidence.instance ?? '');
-  const schema = String(finding.evidence.schema ?? '');
-  const table = String(finding.evidence.table ?? finding.target);
+  const instance = evStr(finding.evidence, 'instance');
+  const schema = evStr(finding.evidence, 'schema');
+  const table = evStr(finding.evidence, 'table', finding.target);
   const rlsEnabled = finding.evidence.rls_enabled === true;
   const hasPolicy = finding.evidence.has_policy === true;
   const carriesAnonDml = finding.evidence.anon_dml_grant === true;
@@ -43,8 +56,10 @@ function normalizeRlsFinding(finding: Finding, baseline: Baseline): Finding {
 
 function normalizePortFinding(finding: Finding, baseline: Baseline): Finding {
   const port = Number(finding.evidence.port);
-  const protocol = String(finding.evidence.protocol ?? 'tcp');
-  const expected = baseline.expectedOpenPorts.some(candidate => candidate.port === port && candidate.protocol === protocol);
+  const protocol = evStr(finding.evidence, 'protocol', 'tcp');
+  const expected = baseline.expectedOpenPorts.some(
+    candidate => candidate.port === port && candidate.protocol === protocol
+  );
   if (expected && finding.reason_code === 'public_port_open') {
     return { ...finding, severity: 'CLEAN', reason_code: 'open_port_baselined' };
   }
@@ -55,9 +70,11 @@ function normalizePortFinding(finding: Finding, baseline: Baseline): Finding {
 }
 
 function normalizeWebhookFinding(finding: Finding, baseline: Baseline): Finding {
-  const method = String(finding.evidence.method ?? 'GET').toUpperCase();
+  const method = evStr(finding.evidence, 'method', 'GET').toUpperCase();
   const authorized = baseline.authorizedWebhooks.some(
-    webhook => webhook.path === finding.target && webhook.methods.includes(method as 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE')
+    webhook =>
+      webhook.path === finding.target &&
+      webhook.methods.includes(method as 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE')
   );
   if (authorized && finding.reason_code === 'webhook_public_reachable') {
     return { ...finding, severity: 'CLEAN', reason_code: 'webhook_authorized' };
@@ -65,7 +82,11 @@ function normalizeWebhookFinding(finding: Finding, baseline: Baseline): Finding 
   return finding;
 }
 
-export function reduceFindings(findings: readonly Finding[], baseline: Baseline, runId = 'security-watchdog'): ScanReport {
+export function reduceFindings(
+  findings: readonly Finding[],
+  baseline: Baseline,
+  runId = 'security-watchdog'
+): ScanReport {
   const normalized = findings.map(raw => {
     const finding = findingSchema.parse(raw);
     if (finding.module === 'rls-anon-sweep') return normalizeRlsFinding(finding, baseline);
