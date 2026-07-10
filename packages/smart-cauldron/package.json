@@ -6,7 +6,10 @@
   "main": "./src/cascade.ts",
   "exports": {
     ".": "./src/cascade.ts",
-    "./cascade": "./src/cascade.ts"
+    "./cascade": "./src/cascade.ts",
+    "./conductor": "./src/conductor.ts",
+    "./ladder": "./src/ladder.ts",
+    "./types": "./src/types.ts"
   },
   "bin": {
     "smart-cauldron": "./src/cli.ts"
