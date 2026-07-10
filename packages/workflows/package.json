@@ -4,6 +4,7 @@
   "type": "module",
   "exports": {
     "./schemas/*": "./src/schemas/*.ts",
+    "./reliability/*": "./src/reliability/*.ts",
     "./executor": "./src/executor.ts",
     "./loader": "./src/loader.ts",
     "./router": "./src/router.ts",
