@@ -559,18 +559,39 @@ nodes:
       # negative is what would have misrouted every legitimate build to BLOCKED.
       BASE=$(cat "$ARTIFACTS_DIR/run-start-sha.txt" 2>/dev/null || echo "")
       HEAD_NOW=$(git -C "$WT" rev-parse HEAD 2>/dev/null || echo "")
-      CHANGED=$(git -C "$WT" status --porcelain 2>/dev/null | grep -c . || true)
-      CHANGED=$(printf '%s' "$CHANGED" | tr -cd '0-9')
-      [ -n "$CHANGED" ] || CHANGED=0
+      validate_implementation_counter() {
+        case "$2" in
+          ''|*[!0-9]*)
+            echo "ERROR: invalid implementation counter $1: expected exactly one digits-only line" >&2
+            return 1
+            ;;
+        esac
+      }
+      STATUS_RAW=$(git -C "$WT" status --porcelain 2>/dev/null) || {
+        echo "ERROR: invalid implementation counter CHANGED: git status failed" >&2
+        exit 1
+      }
+      CHANGED_RAW=$(printf '%s\n' "$STATUS_RAW" | grep -c . || true)
+      validate_implementation_counter CHANGED "$CHANGED_RAW" || exit 1
+      CHANGED=$CHANGED_RAW
       # commits since run start (real work this run produced, even after a checkpoint push)
       if [ -n "$BASE" ] && [ "$BASE" != "unknown" ] && [ -n "$HEAD_NOW" ]; then
-        AHEAD=$(git -C "$WT" rev-list --count "${BASE}..HEAD" 2>/dev/null || echo 0)
+        AHEAD_RAW=$(git -C "$WT" rev-list --count "${BASE}..HEAD" 2>/dev/null) || {
+          echo "ERROR: invalid implementation counter AHEAD: git rev-list failed" >&2
+          exit 1
+        }
       else
         # fallback: no base captured -> use any-uncommitted OR diff vs upstream
-        AHEAD=$(git -C "$WT" rev-list --count "@{upstream}..HEAD" 2>/dev/null || echo 0)
+        AHEAD_RAW=$(git -C "$WT" rev-list --count "@{upstream}..HEAD" 2>/dev/null) ||
+          AHEAD_RAW=$(git -C "$WT" rev-list --count HEAD --not --remotes 2>/dev/null) || {
+            echo "ERROR: invalid implementation counter AHEAD: git rev-list failed" >&2
+            exit 1
+          }
       fi
+      validate_implementation_counter AHEAD "$AHEAD_RAW" || exit 1
+      AHEAD=$AHEAD_RAW
       HAS_WORK=false
-      if [ "${CHANGED:-0}" -gt 0 ] || [ "${AHEAD:-0}" -gt 0 ]; then HAS_WORK=true; fi
+      if [ "$CHANGED" -gt 0 ] || [ "$AHEAD" -gt 0 ]; then HAS_WORK=true; fi
 
       SAID_COMPLETE=false
       if printf '%s\n' "$IMPL" | grep -qE '^(COMPLETE|BUILD_COMPLETE)$|<promise>COMPLETE</promise>'; then SAID_COMPLETE=true; fi
@@ -1221,11 +1242,28 @@ nodes:
 
       # It was blocked: did Opus fix it? Re-check the worktree for real work.
       WT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
-      CHANGED=$(git -C "$WT" status --porcelain 2>/dev/null | grep -c . || true)
-      CHANGED=$(printf '%s' "$CHANGED" | tr -cd '0-9')
-      [ -n "$CHANGED" ] || CHANGED=0
-      AHEAD=$(git -C "$WT" rev-list --count "@{upstream}..HEAD" 2>/dev/null \
-              || git -C "$WT" rev-list --count HEAD --not --remotes 2>/dev/null || echo 0)
+      validate_implementation_counter() {
+        case "$2" in
+          ''|*[!0-9]*)
+            echo "ERROR: invalid implementation counter $1: expected exactly one digits-only line" >&2
+            return 1
+            ;;
+        esac
+      }
+      STATUS_RAW=$(git -C "$WT" status --porcelain 2>/dev/null) || {
+        echo "ERROR: invalid implementation counter CHANGED: git status failed" >&2
+        exit 1
+      }
+      CHANGED_RAW=$(printf '%s\n' "$STATUS_RAW" | grep -c . || true)
+      validate_implementation_counter CHANGED "$CHANGED_RAW" || exit 1
+      CHANGED=$CHANGED_RAW
+      AHEAD_RAW=$(git -C "$WT" rev-list --count "@{upstream}..HEAD" 2>/dev/null) ||
+        AHEAD_RAW=$(git -C "$WT" rev-list --count HEAD --not --remotes 2>/dev/null) || {
+          echo "ERROR: invalid implementation counter AHEAD: git rev-list failed" >&2
+          exit 1
+        }
+      validate_implementation_counter AHEAD "$AHEAD_RAW" || exit 1
+      AHEAD=$AHEAD_RAW
 
       if printf '%s\n' "$OPUS" | grep -q '^OPUS_REPAIR=fixed' && { [ "${CHANGED:-0}" -gt 0 ] || [ "${AHEAD:-0}" -gt 0 ]; }; then
         # Opus made real changes. The autonomous re-review verdict decides the path:
@@ -1264,9 +1302,28 @@ nodes:
       if [ "${CAULDRON_INTERACTIVE:-}" = "true" ]; then echo "SALVAGE=skip (interactive; pause-gate owns this)"; exit 0; fi
       WT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
       cd "$WT" || { echo "SALVAGE=skip (no worktree)"; exit 0; }
-      CHANGED=$(git status --porcelain 2>/dev/null | grep -c . || echo 0)
-      AHEAD=$(git rev-list --count HEAD --not --remotes 2>/dev/null || echo 0)
-      if [ "${CHANGED:-0}" -eq 0 ] && [ "${AHEAD:-0}" -eq 0 ]; then echo "SALVAGE=skip (nothing to preserve)"; exit 0; fi
+      validate_implementation_counter() {
+        case "$2" in
+          ''|*[!0-9]*)
+            echo "ERROR: invalid implementation counter $1: expected exactly one digits-only line" >&2
+            return 1
+            ;;
+        esac
+      }
+      STATUS_RAW=$(git status --porcelain 2>/dev/null) || {
+        echo "ERROR: invalid implementation counter CHANGED: git status failed" >&2
+        exit 1
+      }
+      CHANGED_RAW=$(printf '%s\n' "$STATUS_RAW" | grep -c . || true)
+      validate_implementation_counter CHANGED "$CHANGED_RAW" || exit 1
+      CHANGED=$CHANGED_RAW
+      AHEAD_RAW=$(git rev-list --count HEAD --not --remotes 2>/dev/null) || {
+        echo "ERROR: invalid implementation counter AHEAD: git rev-list failed" >&2
+        exit 1
+      }
+      validate_implementation_counter AHEAD "$AHEAD_RAW" || exit 1
+      AHEAD=$AHEAD_RAW
+      if [ "$CHANGED" -eq 0 ] && [ "$AHEAD" -eq 0 ]; then echo "SALVAGE=skip (nothing to preserve)"; exit 0; fi
       # Branch suffix uses $$ (Rule 2: never $WORKFLOW_ID under set -u).
       BR="salvage/opus-repair-$(basename "$WT")-$$"
       git add -A 2>/dev/null || true
