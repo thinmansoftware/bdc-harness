@@ -18,6 +18,10 @@ import type {
   RunLeaseRecord,
   RunOutcome,
   ScheduledProviderWaitRecord,
+  SupervisorActionRecord,
+  SupervisorIncidentRecord,
+  SupervisorObservationRecord,
+  SupervisorRepairLeaseRecord,
   TerminalWorkflowPersistence,
 } from '@archon/workflows/reliability/types';
 import { createLogger } from '@archon/paths';
@@ -85,6 +89,35 @@ interface RunLeaseRow {
   released_at: DbTimestamp | null;
 }
 
+interface SupervisorIncidentRow {
+  incident_id: string;
+  incident_key: string;
+  run_id: string;
+  wo_id: string;
+  status: SupervisorIncidentRecord['status'];
+  created_at: DbTimestamp;
+  updated_at: DbTimestamp;
+}
+
+interface SupervisorObservationRow {
+  observation_id: string;
+  incident_id: string;
+  supervisor_id: string;
+  assessment: string;
+  evidence_refs: unknown;
+  created_at: DbTimestamp;
+}
+
+interface SupervisorRepairLeaseRow {
+  incident_id: string;
+  owner_id: string;
+  fencing_token: number | string;
+  acquired_at: DbTimestamp;
+  last_heartbeat_at: DbTimestamp;
+  expires_at: DbTimestamp;
+  released_at: DbTimestamp | null;
+}
+
 interface ProviderAttemptRow {
   attempt_id: string;
   run_id: string;
@@ -137,6 +170,45 @@ function normalizeTimestamp(value: DbTimestamp): string {
 
 function normalizeNullableTimestamp(value: DbTimestamp | null): string | null {
   return value === null ? null : normalizeTimestamp(value);
+}
+
+function normalizeSupervisorIncident(row: SupervisorIncidentRow): SupervisorIncidentRecord {
+  return {
+    incidentId: row.incident_id,
+    incidentKey: row.incident_key,
+    runId: row.run_id,
+    woId: row.wo_id,
+    status: row.status,
+    createdAt: normalizeTimestamp(row.created_at),
+    updatedAt: normalizeTimestamp(row.updated_at),
+  };
+}
+
+function normalizeSupervisorObservation(
+  row: SupervisorObservationRow
+): SupervisorObservationRecord {
+  return {
+    observationId: row.observation_id,
+    incidentId: row.incident_id,
+    supervisorId: row.supervisor_id,
+    assessment: row.assessment,
+    evidenceRefs: parseJsonArray<string>(row.evidence_refs),
+    createdAt: normalizeTimestamp(row.created_at),
+  };
+}
+
+function normalizeSupervisorRepairLease(
+  row: SupervisorRepairLeaseRow
+): SupervisorRepairLeaseRecord {
+  return {
+    incidentId: row.incident_id,
+    ownerId: row.owner_id,
+    fencingToken: Number(row.fencing_token),
+    acquiredAt: normalizeTimestamp(row.acquired_at),
+    lastHeartbeatAt: normalizeTimestamp(row.last_heartbeat_at),
+    expiresAt: normalizeTimestamp(row.expires_at),
+    releasedAt: normalizeNullableTimestamp(row.released_at),
+  };
 }
 
 function parseJsonArray<T extends string>(value: unknown): T[] {
@@ -478,6 +550,181 @@ export async function releaseRunLease(data: {
      SET released_at = $4
      WHERE run_id = $1 AND owner_id = $2 AND lease_token = $3 AND released_at IS NULL`,
     [data.runId, data.ownerId, data.leaseToken, data.releasedAt]
+  );
+  return result.rowCount === 1;
+}
+
+export async function createSupervisorIncident(
+  incident: SupervisorIncidentRecord
+): Promise<SupervisorIncidentRecord> {
+  const inserted = await pool.query<SupervisorIncidentRow>(
+    `INSERT INTO remote_agent_supervisor_incidents
+     (incident_id, incident_key, run_id, wo_id, status, created_at, updated_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7)
+     ON CONFLICT (incident_key) DO NOTHING
+     RETURNING *`,
+    [
+      incident.incidentId,
+      incident.incidentKey,
+      incident.runId,
+      incident.woId,
+      incident.status,
+      incident.createdAt,
+      incident.updatedAt,
+    ]
+  );
+  if (inserted.rows[0]) return normalizeSupervisorIncident(inserted.rows[0]);
+  const existing = await pool.query<SupervisorIncidentRow>(
+    'SELECT * FROM remote_agent_supervisor_incidents WHERE incident_key = $1',
+    [incident.incidentKey]
+  );
+  const row = existing.rows[0];
+  if (!row) throw new Error(`supervisor_incident_conflict: ${incident.incidentKey}`);
+  if (row.run_id !== incident.runId || row.wo_id !== incident.woId) {
+    throw new Error(`supervisor_incident_conflict: ${incident.incidentKey}`);
+  }
+  return normalizeSupervisorIncident(row);
+}
+
+export async function appendSupervisorObservation(
+  observation: SupervisorObservationRecord
+): Promise<boolean> {
+  const result = await pool.query(
+    `INSERT INTO remote_agent_supervisor_observations
+     (observation_id, incident_id, supervisor_id, assessment, evidence_refs, created_at)
+     VALUES ($1, $2, $3, $4, $5, $6)
+     ON CONFLICT (observation_id) DO NOTHING`,
+    [
+      observation.observationId,
+      observation.incidentId,
+      observation.supervisorId,
+      observation.assessment,
+      JSON.stringify(observation.evidenceRefs),
+      observation.createdAt,
+    ]
+  );
+  return result.rowCount === 1;
+}
+
+export async function listSupervisorObservations(
+  incidentId: string
+): Promise<SupervisorObservationRecord[]> {
+  const result = await pool.query<SupervisorObservationRow>(
+    `SELECT * FROM remote_agent_supervisor_observations
+     WHERE incident_id = $1 ORDER BY created_at ASC, observation_id ASC`,
+    [incidentId]
+  );
+  return result.rows.map(normalizeSupervisorObservation);
+}
+
+export async function claimSupervisorRepairLease(data: {
+  incidentId: string;
+  ownerId: string;
+  acquiredAt: string;
+  expiresAt: string;
+}): Promise<SupervisorRepairLeaseRecord | null> {
+  const result = await pool.query<SupervisorRepairLeaseRow>(
+    `INSERT INTO remote_agent_supervisor_repair_leases
+     (incident_id, owner_id, fencing_token, acquired_at, last_heartbeat_at, expires_at, released_at)
+     SELECT $1, $2, 1, $3, $3, $4, NULL
+     FROM remote_agent_supervisor_incidents
+     WHERE incident_id = $1 AND status IN ('open', 'repairing')
+     ON CONFLICT (incident_id) DO UPDATE SET
+       owner_id = EXCLUDED.owner_id,
+       fencing_token = remote_agent_supervisor_repair_leases.fencing_token + 1,
+       acquired_at = EXCLUDED.acquired_at,
+       last_heartbeat_at = EXCLUDED.last_heartbeat_at,
+       expires_at = EXCLUDED.expires_at,
+       released_at = NULL
+     WHERE remote_agent_supervisor_repair_leases.released_at IS NOT NULL
+        OR remote_agent_supervisor_repair_leases.expires_at <= EXCLUDED.acquired_at
+     RETURNING *`,
+    [data.incidentId, data.ownerId, data.acquiredAt, data.expiresAt]
+  );
+  const row = result.rows[0];
+  return row ? normalizeSupervisorRepairLease(row) : null;
+}
+
+export async function heartbeatSupervisorRepairLease(data: {
+  incidentId: string;
+  ownerId: string;
+  fencingToken: number;
+  heartbeatAt: string;
+  expiresAt: string;
+}): Promise<boolean> {
+  const result = await pool.query(
+    `UPDATE remote_agent_supervisor_repair_leases
+     SET last_heartbeat_at = $4, expires_at = $5
+     WHERE incident_id = $1 AND owner_id = $2 AND fencing_token = $3
+       AND released_at IS NULL AND expires_at > $4`,
+    [data.incidentId, data.ownerId, data.fencingToken, data.heartbeatAt, data.expiresAt]
+  );
+  return result.rowCount === 1;
+}
+
+export async function authorizeSupervisorMutation(data: {
+  incidentId: string;
+  ownerId: string;
+  fencingToken: number;
+  authorizedAt: string;
+}): Promise<boolean> {
+  const result = await pool.query(
+    `SELECT incident_id FROM remote_agent_supervisor_repair_leases
+     WHERE incident_id = $1 AND owner_id = $2 AND fencing_token = $3
+       AND released_at IS NULL AND expires_at > $4`,
+    [data.incidentId, data.ownerId, data.fencingToken, data.authorizedAt]
+  );
+  return result.rowCount === 1;
+}
+
+export async function appendSupervisorAction(action: SupervisorActionRecord): Promise<boolean> {
+  const db = getDatabase();
+  return db.withTransaction(async query => {
+    const authorized = await query(
+      `SELECT incident_id FROM remote_agent_supervisor_repair_leases
+       WHERE incident_id = $1 AND owner_id = $2 AND fencing_token = $3
+         AND released_at IS NULL AND expires_at > $4`,
+      [action.incidentId, action.ownerId, action.fencingToken, action.createdAt]
+    );
+    if (authorized.rowCount !== 1) return false;
+    const inserted = await query(
+      `INSERT INTO remote_agent_supervisor_actions
+       (action_id, incident_id, owner_id, fencing_token, action_type, outcome, evidence_refs, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+       ON CONFLICT (action_id) DO NOTHING`,
+      [
+        action.actionId,
+        action.incidentId,
+        action.ownerId,
+        action.fencingToken,
+        action.actionType,
+        action.outcome,
+        JSON.stringify(action.evidenceRefs),
+        action.createdAt,
+      ]
+    );
+    if (inserted.rowCount !== 1) return false;
+    await query(
+      `UPDATE remote_agent_supervisor_incidents
+       SET status = 'recovered', updated_at = $2 WHERE incident_id = $1`,
+      [action.incidentId, action.createdAt]
+    );
+    return true;
+  });
+}
+
+export async function releaseSupervisorRepairLease(data: {
+  incidentId: string;
+  ownerId: string;
+  fencingToken: number;
+  releasedAt: string;
+}): Promise<boolean> {
+  const result = await pool.query(
+    `UPDATE remote_agent_supervisor_repair_leases
+     SET released_at = $4
+     WHERE incident_id = $1 AND owner_id = $2 AND fencing_token = $3
+       AND released_at IS NULL`,
+    [data.incidentId, data.ownerId, data.fencingToken, data.releasedAt]
   );
   return result.rowCount === 1;
 }

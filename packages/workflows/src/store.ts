@@ -13,6 +13,10 @@ import type {
   RunLeaseRecord,
   RunOutcome,
   ScheduledProviderWaitRecord,
+  SupervisorActionRecord,
+  SupervisorIncidentRecord,
+  SupervisorObservationRecord,
+  SupervisorRepairLeaseRecord,
   TerminalWorkflowPersistence,
 } from './reliability/types';
 
@@ -172,6 +176,35 @@ export interface IWorkflowStore {
     waitId: string;
     claimToken: string;
     completedAt: string;
+  }): Promise<boolean>;
+  createSupervisorIncident?(incident: SupervisorIncidentRecord): Promise<SupervisorIncidentRecord>;
+  appendSupervisorObservation?(observation: SupervisorObservationRecord): Promise<boolean>;
+  listSupervisorObservations?(incidentId: string): Promise<SupervisorObservationRecord[]>;
+  claimSupervisorRepairLease?(data: {
+    incidentId: string;
+    ownerId: string;
+    acquiredAt: string;
+    expiresAt: string;
+  }): Promise<SupervisorRepairLeaseRecord | null>;
+  heartbeatSupervisorRepairLease?(data: {
+    incidentId: string;
+    ownerId: string;
+    fencingToken: number;
+    heartbeatAt: string;
+    expiresAt: string;
+  }): Promise<boolean>;
+  authorizeSupervisorMutation?(data: {
+    incidentId: string;
+    ownerId: string;
+    fencingToken: number;
+    authorizedAt: string;
+  }): Promise<boolean>;
+  appendSupervisorAction?(action: SupervisorActionRecord): Promise<boolean>;
+  releaseSupervisorRepairLease?(data: {
+    incidentId: string;
+    ownerId: string;
+    fencingToken: number;
+    releasedAt: string;
   }): Promise<boolean>;
 
   /**

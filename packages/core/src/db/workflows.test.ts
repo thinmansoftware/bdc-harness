@@ -11,6 +11,7 @@ import type {
   RunLeaseRecord,
   RunOutcome,
   ScheduledProviderWaitRecord,
+  SupervisorIncidentRecord,
   TerminalWorkflowPersistence,
 } from '@archon/workflows/reliability/types';
 
@@ -72,6 +73,13 @@ import {
   releaseProviderWaitClaim,
   cancelProviderWaits,
   completeProviderWait,
+  createSupervisorIncident,
+  appendSupervisorObservation,
+  listSupervisorObservations,
+  claimSupervisorRepairLease,
+  authorizeSupervisorMutation,
+  appendSupervisorAction,
+  releaseSupervisorRepairLease,
   reconcileTerminalWorkflowRuns,
   getCauldronDrainState,
   setCauldronDrainMode,
@@ -1826,6 +1834,150 @@ describe('Smart Cauldron reliability persistence', () => {
         [authority.runId]
       );
       expect(terminalEvents.rows[0]?.count).toBe(1);
+    } finally {
+      await sqlite.close();
+      for (const suffix of ['', '-wal', '-shm']) {
+        try {
+          unlinkSync(dbPath + suffix);
+        } catch {
+          // File may not exist depending on SQLite checkpoint timing.
+        }
+      }
+    }
+  });
+
+  test('coordinates simultaneous supervisors with fenced expiry takeover on SQLite', async () => {
+    const dbPath = join(
+      import.meta.dir,
+      `.test-supervisors-${Date.now()}-${Math.random().toString(36).slice(2)}.db`
+    );
+    const sqlite = new SqliteAdapter(dbPath);
+    activeDatabase = sqlite;
+    mockQuery.mockImplementation((sql: string, params?: unknown[]) => sqlite.query(sql, params));
+    const incident: SupervisorIncidentRecord = {
+      incidentId: '99999999-9999-4999-8999-999999999999',
+      incidentKey: 'run-supervisor:terminal-failure',
+      runId: authority.runId,
+      woId: authority.woId,
+      status: 'open',
+      createdAt: '2026-07-10T12:00:00.000Z',
+      updatedAt: '2026-07-10T12:00:00.000Z',
+    };
+    try {
+      await sqlite.query(
+        `INSERT INTO remote_agent_codebases (id, name, default_cwd) VALUES ($1, $2, $3)`,
+        [authority.codebaseId, 'supervisor-test', '/tmp/supervisor-test']
+      );
+      await sqlite.query(
+        `INSERT INTO remote_agent_conversations
+         (id, platform_type, platform_conversation_id, codebase_id)
+         VALUES ($1, $2, $3, $4)`,
+        ['aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', 'test', 'supervisor-test', authority.codebaseId]
+      );
+      await sqlite.query(
+        `INSERT INTO remote_agent_workflow_runs
+         (id, conversation_id, codebase_id, workflow_name, user_message, status)
+         VALUES ($1, $2, $3, $4, $5, $6)`,
+        [
+          authority.runId,
+          'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+          authority.codebaseId,
+          authority.workflowName,
+          'supervisor test',
+          'failed',
+        ]
+      );
+      await expect(createSupervisorIncident(incident)).resolves.toEqual(incident);
+      await Promise.all([
+        appendSupervisorObservation({
+          observationId: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
+          incidentId: incident.incidentId,
+          supervisorId: 'sol',
+          assessment: 'repairable',
+          evidenceRefs: ['event:1'],
+          createdAt: '2026-07-10T12:00:01.000Z',
+        }),
+        appendSupervisorObservation({
+          observationId: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc',
+          incidentId: incident.incidentId,
+          supervisorId: 'fable',
+          assessment: 'repairable',
+          evidenceRefs: ['event:2'],
+          createdAt: '2026-07-10T12:00:01.000Z',
+        }),
+      ]);
+      await expect(listSupervisorObservations(incident.incidentId)).resolves.toHaveLength(2);
+
+      const claims = await Promise.all([
+        claimSupervisorRepairLease({
+          incidentId: incident.incidentId,
+          ownerId: 'sol',
+          acquiredAt: '2026-07-10T12:00:02.000Z',
+          expiresAt: '2026-07-10T12:01:02.000Z',
+        }),
+        claimSupervisorRepairLease({
+          incidentId: incident.incidentId,
+          ownerId: 'fable',
+          acquiredAt: '2026-07-10T12:00:02.000Z',
+          expiresAt: '2026-07-10T12:01:02.000Z',
+        }),
+      ]);
+      const firstOwner = claims.find(claim => claim !== null);
+      expect(claims.filter(claim => claim !== null)).toHaveLength(1);
+      expect(firstOwner?.fencingToken).toBe(1);
+
+      const takeoverOwner = firstOwner?.ownerId === 'sol' ? 'fable' : 'sol';
+      const takeover = await claimSupervisorRepairLease({
+        incidentId: incident.incidentId,
+        ownerId: takeoverOwner,
+        acquiredAt: '2026-07-10T12:01:03.000Z',
+        expiresAt: '2026-07-10T12:02:03.000Z',
+      });
+      expect(takeover?.fencingToken).toBe(2);
+      await expect(
+        authorizeSupervisorMutation({
+          incidentId: incident.incidentId,
+          ownerId: firstOwner?.ownerId ?? '',
+          fencingToken: firstOwner?.fencingToken ?? 0,
+          authorizedAt: '2026-07-10T12:01:04.000Z',
+        })
+      ).resolves.toBe(false);
+      await expect(
+        authorizeSupervisorMutation({
+          incidentId: incident.incidentId,
+          ownerId: takeoverOwner,
+          fencingToken: 2,
+          authorizedAt: '2026-07-10T12:01:04.000Z',
+        })
+      ).resolves.toBe(true);
+      await expect(
+        appendSupervisorAction({
+          actionId: 'dddddddd-dddd-4ddd-8ddd-dddddddddddd',
+          incidentId: incident.incidentId,
+          ownerId: takeoverOwner,
+          fencingToken: 2,
+          actionType: 'repair_or_refire',
+          outcome: 'recovered',
+          evidenceRefs: ['run:recovered'],
+          createdAt: '2026-07-10T12:01:05.000Z',
+        })
+      ).resolves.toBe(true);
+      await expect(
+        releaseSupervisorRepairLease({
+          incidentId: incident.incidentId,
+          ownerId: takeoverOwner,
+          fencingToken: 2,
+          releasedAt: '2026-07-10T12:01:06.000Z',
+        })
+      ).resolves.toBe(true);
+      await expect(
+        claimSupervisorRepairLease({
+          incidentId: incident.incidentId,
+          ownerId: firstOwner?.ownerId ?? 'sol',
+          acquiredAt: '2026-07-10T12:01:07.000Z',
+          expiresAt: '2026-07-10T12:02:07.000Z',
+        })
+      ).resolves.toBeNull();
     } finally {
       await sqlite.close();
       for (const suffix of ['', '-wal', '-shm']) {

@@ -60,6 +60,10 @@ describe('SqliteAdapter', () => {
         'remote_agent_provider_attempts',
         'remote_agent_run_outcomes',
         'remote_agent_scheduled_waits',
+        'remote_agent_supervisor_incidents',
+        'remote_agent_supervisor_observations',
+        'remote_agent_supervisor_repair_leases',
+        'remote_agent_supervisor_actions',
       ]) {
         expect(tableNames.has(table)).toBe(true);
       }
@@ -71,6 +75,14 @@ describe('SqliteAdapter', () => {
         'idx_reliability_active_leases',
         'idx_reliability_attempts_run_node',
         'idx_reliability_due_waits',
+      ]);
+      const supervisorIndexes = await db.query<{ name: string }>(
+        `SELECT name FROM sqlite_master WHERE type = 'index' AND name LIKE 'idx_supervisor_%'`
+      );
+      expect(supervisorIndexes.rows.map(row => row.name).sort()).toEqual([
+        'idx_supervisor_actions_incident',
+        'idx_supervisor_observations_incident',
+        'idx_supervisor_repair_leases_expiry',
       ]);
     });
   });

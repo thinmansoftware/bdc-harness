@@ -69,6 +69,7 @@ psql $DATABASE_URL < migrations/022_add_workflow_run_archive_fields.sql
 psql $DATABASE_URL < migrations/023_workflow_status_escalated_note.sql
 psql $DATABASE_URL < migrations/024_smart_cauldron_reliability.sql
 psql $DATABASE_URL < migrations/025_cauldron_drain_mode.sql
+psql $DATABASE_URL < migrations/026_supervisor_incidents.sql
 ```
 
 ## Local PostgreSQL via Docker
@@ -104,6 +105,7 @@ docker compose exec postgres psql -U postgres -d remote_coding_agent
 \i /migrations/023_workflow_status_escalated_note.sql
 \i /migrations/024_smart_cauldron_reliability.sql
 \i /migrations/025_cauldron_drain_mode.sql
+\i /migrations/026_supervisor_incidents.sql
 \q
 ```
 
@@ -116,6 +118,7 @@ psql postgresql://postgres:postgres@localhost:5432/remote_coding_agent < migrati
 psql postgresql://postgres:postgres@localhost:5432/remote_coding_agent < migrations/023_workflow_status_escalated_note.sql
 psql postgresql://postgres:postgres@localhost:5432/remote_coding_agent < migrations/024_smart_cauldron_reliability.sql
 psql postgresql://postgres:postgres@localhost:5432/remote_coding_agent < migrations/025_cauldron_drain_mode.sql
+psql postgresql://postgres:postgres@localhost:5432/remote_coding_agent < migrations/026_supervisor_incidents.sql
 # ... and so on for each migration not yet applied
 ```
 
@@ -178,6 +181,8 @@ The core application tables are prefixed with `remote_agent_`:
 Migration 024 adds the Smart Cauldron reliability tables for immutable run
 authority, leases, provider attempts, run outcomes, and durable provider waits.
 Migration 025 adds the singleton Cauldron control-state table used by drain mode.
+Migration 026 adds dual-supervisor incidents, immutable observations, fenced repair
+leases, and repair action evidence.
 
 ## Migration List
 
@@ -209,3 +214,4 @@ Migration 025 adds the singleton Cauldron control-state table used by drain mode
 | `023_workflow_status_escalated_note.sql` | Documents the escalated workflow status |
 | `024_smart_cauldron_reliability.sql` | Run authority, leases, provider attempts, outcomes, and waits |
 | `025_cauldron_drain_mode.sql` | Durable Cauldron drain-mode control state |
+| `026_supervisor_incidents.sql` | Dual-supervisor incidents, observations, fenced repair leases, and actions |

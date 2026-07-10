@@ -162,6 +162,48 @@ export interface RunLeaseRecord {
   readonly releasedAt: string | null;
 }
 
+export type SupervisorIncidentStatus = 'open' | 'repairing' | 'recovered' | 'escalated';
+
+export interface SupervisorIncidentRecord {
+  readonly incidentId: string;
+  readonly incidentKey: string;
+  readonly runId: string;
+  readonly woId: string;
+  readonly status: SupervisorIncidentStatus;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+}
+
+export interface SupervisorObservationRecord {
+  readonly observationId: string;
+  readonly incidentId: string;
+  readonly supervisorId: string;
+  readonly assessment: string;
+  readonly evidenceRefs: readonly string[];
+  readonly createdAt: string;
+}
+
+export interface SupervisorRepairLeaseRecord {
+  readonly incidentId: string;
+  readonly ownerId: string;
+  readonly fencingToken: number;
+  readonly acquiredAt: string;
+  readonly lastHeartbeatAt: string;
+  readonly expiresAt: string;
+  readonly releasedAt: string | null;
+}
+
+export interface SupervisorActionRecord {
+  readonly actionId: string;
+  readonly incidentId: string;
+  readonly ownerId: string;
+  readonly fencingToken: number;
+  readonly actionType: string;
+  readonly outcome: string;
+  readonly evidenceRefs: readonly string[];
+  readonly createdAt: string;
+}
+
 export interface ExpiredRunLeaseRecord {
   readonly runId: string;
   readonly workflowName: string;

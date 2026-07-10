@@ -75,10 +75,11 @@ describe('PostgresAdapter', () => {
 
   describe('Smart Cauldron reliability schema', () => {
     test('numbered migration defines the same additive tables and indexes as SQLite', () => {
-      const migration = readFileSync(
-        resolve(import.meta.dir, '../../../../../migrations/024_smart_cauldron_reliability.sql'),
-        'utf8'
-      );
+      const migration = ['024_smart_cauldron_reliability.sql', '026_supervisor_incidents.sql']
+        .map(file =>
+          readFileSync(resolve(import.meta.dir, '../../../../../migrations', file), 'utf8')
+        )
+        .join('\n');
 
       for (const table of [
         'remote_agent_run_authorities',
@@ -86,6 +87,10 @@ describe('PostgresAdapter', () => {
         'remote_agent_provider_attempts',
         'remote_agent_run_outcomes',
         'remote_agent_scheduled_waits',
+        'remote_agent_supervisor_incidents',
+        'remote_agent_supervisor_observations',
+        'remote_agent_supervisor_repair_leases',
+        'remote_agent_supervisor_actions',
       ]) {
         expect(migration).toContain(`CREATE TABLE IF NOT EXISTS ${table}`);
       }
@@ -93,6 +98,9 @@ describe('PostgresAdapter', () => {
         'idx_reliability_active_leases',
         'idx_reliability_attempts_run_node',
         'idx_reliability_due_waits',
+        'idx_supervisor_observations_incident',
+        'idx_supervisor_actions_incident',
+        'idx_supervisor_repair_leases_expiry',
       ]) {
         expect(migration).toContain(`CREATE INDEX IF NOT EXISTS ${index}`);
       }

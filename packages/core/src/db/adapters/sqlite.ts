@@ -441,6 +441,47 @@ export class SqliteAdapter implements IDatabase {
         completed_at TEXT
       );
 
+      -- Dual-supervisor coordination; observations are multi-writer, repairs are fenced
+      CREATE TABLE IF NOT EXISTS remote_agent_supervisor_incidents (
+        incident_id TEXT PRIMARY KEY,
+        incident_key TEXT NOT NULL UNIQUE,
+        run_id TEXT NOT NULL REFERENCES remote_agent_workflow_runs(id) ON DELETE CASCADE,
+        wo_id TEXT NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('open', 'repairing', 'recovered', 'escalated')),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS remote_agent_supervisor_observations (
+        observation_id TEXT PRIMARY KEY,
+        incident_id TEXT NOT NULL REFERENCES remote_agent_supervisor_incidents(incident_id) ON DELETE CASCADE,
+        supervisor_id TEXT NOT NULL,
+        assessment TEXT NOT NULL,
+        evidence_refs TEXT NOT NULL DEFAULT '[]',
+        created_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS remote_agent_supervisor_repair_leases (
+        incident_id TEXT PRIMARY KEY REFERENCES remote_agent_supervisor_incidents(incident_id) ON DELETE CASCADE,
+        owner_id TEXT NOT NULL,
+        fencing_token INTEGER NOT NULL CHECK (fencing_token > 0),
+        acquired_at TEXT NOT NULL,
+        last_heartbeat_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        released_at TEXT
+      );
+
+      CREATE TABLE IF NOT EXISTS remote_agent_supervisor_actions (
+        action_id TEXT PRIMARY KEY,
+        incident_id TEXT NOT NULL REFERENCES remote_agent_supervisor_incidents(incident_id) ON DELETE CASCADE,
+        owner_id TEXT NOT NULL,
+        fencing_token INTEGER NOT NULL CHECK (fencing_token > 0),
+        action_type TEXT NOT NULL,
+        outcome TEXT NOT NULL,
+        evidence_refs TEXT NOT NULL DEFAULT '[]',
+        created_at TEXT NOT NULL
+      );
+
       -- Durable maintenance admission state (singleton) and audit trail
       CREATE TABLE IF NOT EXISTS remote_agent_cauldron_control (
         id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -490,6 +531,12 @@ export class SqliteAdapter implements IDatabase {
         ON remote_agent_scheduled_waits(resume_at) WHERE state = 'scheduled';
       CREATE UNIQUE INDEX IF NOT EXISTS unique_reliability_wait_attempt
         ON remote_agent_scheduled_waits(attempt_id);
+      CREATE INDEX IF NOT EXISTS idx_supervisor_observations_incident
+        ON remote_agent_supervisor_observations(incident_id, created_at);
+      CREATE INDEX IF NOT EXISTS idx_supervisor_actions_incident
+        ON remote_agent_supervisor_actions(incident_id, created_at);
+      CREATE INDEX IF NOT EXISTS idx_supervisor_repair_leases_expiry
+        ON remote_agent_supervisor_repair_leases(expires_at) WHERE released_at IS NULL;
       CREATE INDEX IF NOT EXISTS idx_cauldron_control_events_created
         ON remote_agent_cauldron_control_events(created_at);
       CREATE INDEX IF NOT EXISTS idx_messages_conversation_id ON remote_agent_messages(conversation_id, created_at ASC);

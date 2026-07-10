@@ -31,6 +31,14 @@ const mockClaimProviderWait = mock(() => Promise.resolve(false));
 const mockReleaseProviderWaitClaim = mock(() => Promise.resolve(false));
 const mockCancelProviderWaits = mock(() => Promise.resolve(0));
 const mockCompleteProviderWait = mock(() => Promise.resolve(false));
+const mockCreateSupervisorIncident = mock((incident: unknown) => Promise.resolve(incident));
+const mockAppendSupervisorObservation = mock(() => Promise.resolve(true));
+const mockListSupervisorObservations = mock(() => Promise.resolve([]));
+const mockClaimSupervisorRepairLease = mock(() => Promise.resolve(null));
+const mockHeartbeatSupervisorRepairLease = mock(() => Promise.resolve(false));
+const mockAuthorizeSupervisorMutation = mock(() => Promise.resolve(false));
+const mockAppendSupervisorAction = mock(() => Promise.resolve(false));
+const mockReleaseSupervisorRepairLease = mock(() => Promise.resolve(false));
 
 mock.module('../db/workflows', () => ({
   createWorkflowRun: mockCreateWorkflowRun,
@@ -62,6 +70,14 @@ mock.module('../db/workflows', () => ({
   releaseProviderWaitClaim: mockReleaseProviderWaitClaim,
   cancelProviderWaits: mockCancelProviderWaits,
   completeProviderWait: mockCompleteProviderWait,
+  createSupervisorIncident: mockCreateSupervisorIncident,
+  appendSupervisorObservation: mockAppendSupervisorObservation,
+  listSupervisorObservations: mockListSupervisorObservations,
+  claimSupervisorRepairLease: mockClaimSupervisorRepairLease,
+  heartbeatSupervisorRepairLease: mockHeartbeatSupervisorRepairLease,
+  authorizeSupervisorMutation: mockAuthorizeSupervisorMutation,
+  appendSupervisorAction: mockAppendSupervisorAction,
+  releaseSupervisorRepairLease: mockReleaseSupervisorRepairLease,
 }));
 
 const mockCreateWorkflowEvent = mock(() => Promise.resolve());
@@ -121,6 +137,14 @@ describe('createWorkflowStore', () => {
       'releaseProviderWaitClaim',
       'cancelProviderWaits',
       'completeProviderWait',
+      'createSupervisorIncident',
+      'appendSupervisorObservation',
+      'listSupervisorObservations',
+      'claimSupervisorRepairLease',
+      'heartbeatSupervisorRepairLease',
+      'authorizeSupervisorMutation',
+      'appendSupervisorAction',
+      'releaseSupervisorRepairLease',
       'createWorkflowEvent',
       'listWorkflowEvents',
       'getCompletedDagNodeOutputs',

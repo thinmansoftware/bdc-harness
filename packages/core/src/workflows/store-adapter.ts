@@ -62,6 +62,14 @@ export function createWorkflowStore(): IWorkflowStore {
     releaseProviderWaitClaim: workflowDb.releaseProviderWaitClaim,
     cancelProviderWaits: workflowDb.cancelProviderWaits,
     completeProviderWait: workflowDb.completeProviderWait,
+    createSupervisorIncident: workflowDb.createSupervisorIncident,
+    appendSupervisorObservation: workflowDb.appendSupervisorObservation,
+    listSupervisorObservations: workflowDb.listSupervisorObservations,
+    claimSupervisorRepairLease: workflowDb.claimSupervisorRepairLease,
+    heartbeatSupervisorRepairLease: workflowDb.heartbeatSupervisorRepairLease,
+    authorizeSupervisorMutation: workflowDb.authorizeSupervisorMutation,
+    appendSupervisorAction: workflowDb.appendSupervisorAction,
+    releaseSupervisorRepairLease: workflowDb.releaseSupervisorRepairLease,
     createWorkflowEvent: async (data): Promise<void> => {
       try {
         await workflowEventDb.createWorkflowEvent(data);
