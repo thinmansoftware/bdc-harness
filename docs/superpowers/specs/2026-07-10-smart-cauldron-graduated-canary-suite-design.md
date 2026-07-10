@@ -19,8 +19,8 @@ John approved these design choices in chat on 2026-07-10:
 - Use a graduated difficulty suite rather than one ad hoc canary.
 - The highest level is isolated production chaos: real provider/node failure and
   recovery behavior may be exercised, but no customer data or container restart.
-- Use a hybrid schedule: low levels run nightly; higher levels require an explicit
-  operator command.
+- Use a hybrid schedule: low levels run nightly; higher levels require a recorded,
+  current approval from the named authority in Section 11.1.
 - Canary results feed the daily briefing owned by the Duty Officer.
 - The Duty Officer summarizes results; mechanical evidence and gates determine the
   verdict.
@@ -81,7 +81,7 @@ Use an external, manifest-driven runner rather than one script per lane or a
 Cauldron workflow that judges itself.
 
 ```text
-operator or nightly scheduler
+authorized executor or nightly scheduler
   -> independent canary runner
        -> validate suite manifest and reviewed bundle revision
        -> create durable canary plan
@@ -286,7 +286,7 @@ record must bind:
 - lane, dispatch ID, workflow run ID, WO ID, issue revision, and body hash;
 - canonical repository, base branch/SHA, worktree, branch, and allowed paths;
 - difficulty, fault profile, expiry, attempt budget, and runtime budget;
-- operator identity available from the authenticated request;
+- executor identity and approval record available from the authenticated request;
 - planned, running, passed, failed, aborted, or blocked state;
 - evidence references and report paths.
 
@@ -294,7 +294,7 @@ Fault injection is disabled by default. A fault hook may activate only when all 
 these are true:
 
 1. `ARCHON_CANARY_CONTROL_ENABLED` is exactly `true`.
-2. The request used the authenticated operator endpoint.
+2. The request used the authenticated canary administration endpoint.
 3. A non-expired canary plan exists and is bound to the exact dispatch/run.
 4. Repository is `bluedevilcollectibles/bdc-harness` and base is `dev`.
 5. WO and allowed paths match the reviewed manifest.
@@ -309,7 +309,7 @@ branch name, labels, or model output.
 ## 11. Execution and approval flow
 
 Levels 0 through 2 scheduled runs use pre-approved manifest entries and the service
-scheduler. Levels 3 through 5 require an operator-generated plan.
+scheduler. Levels 3 through 5 require an approval-scoped executor plan.
 
 For Level 5:
 
@@ -317,7 +317,7 @@ For Level 5:
 2. The plan displays exact lane, provider boundary, fault, budgets, WO, repository,
    base SHA, and abort behavior.
 3. Execution requires the current phrase `PROCEED CANARY CHAOS <plan-id>` through
-   the authenticated operator command.
+   the authenticated canary command after the required approval is recorded.
 4. The approval expires and cannot be reused for another plan, lane, or profile.
 5. The runner acquires a global canary lock and verifies zero other active canary.
 6. Every abort leaves evidence intact and blocks the next live scenario.
@@ -327,6 +327,30 @@ approval expires after fifteen minutes. Once a run starts, its manifest runtime 
 attempt budgets apply, subject to the 7,200-second and 50-attempt global ceilings.
 
 No approval for one level, lane, or plan authorizes another.
+
+### 11.1 Named approval authorities
+
+`Operator` is not an approval role. The executor carries an already authorized
+action and records evidence. Approval authority is one of these named sources:
+
+| Action | Required authority |
+|---|---|
+| Author and implement the suite through the normal WO/PR pipeline | Current board/work-order governance |
+| Activate the bounded nightly Level 0 through Level 2 schedule | Recorded 2/3 board motion with John veto/freeze retained |
+| Execute a manual Level 3 or Level 4 production canary | Recorded 2/3 board REWORK or PRIORITY motion naming level, lane, scenario, and plan ID |
+| Execute a Level 5 production-chaos plan | Recorded 2/3 board REWORK motion naming lane, profile, plan ID, budgets, and rollback; if any seat flags it as a major change, John Ranson must approve under Reserved Power 2 |
+| Delete retained branches, worktrees, artifacts, database records, volumes, or containers | John Ranson only under Reserved Power 1 |
+| Change credentials, perform a deploy/restart/merge, spend money, or send to a real customer | Outside this suite; abort and use the separately governing John/board process |
+
+During the active 48-hour POC, the authority source is
+`BDC_XO/docs/board/CHARTER.md`. John retains veto and freeze throughout. After the
+POC expires, the runner must resolve and record the then-current ratified governance
+artifact. If no current artifact unambiguously authorizes the action, approval
+defaults to John Ranson rather than inferring standing authority.
+
+One carried motion may authorize the precisely bounded nightly schedule; it does
+not authorize manual Levels 3 through 5. Each Level 5 plan always requires its own
+current motion and phrase.
 
 ## 12. Evidence reducer and verdicts
 
@@ -360,6 +384,13 @@ Nightly schedule:
 - Level 1: all eight lanes.
 - Level 2: one lane selected by oldest successful coverage timestamp.
 
+Level 2 coverage age is measured from the last mechanically successful Level 2 run;
+a skipped or failed night does not reset it. The expected maximum is eight calendar
+days. Age nine or ten days is `coverage_warning`. Age greater than ten days is a red
+`lane_coverage_starved` row that leads the Duty Officer canary section and recommends
+a manual run at the next safe window. Red status does not bypass any skip or safety
+gate. When more than one lane is red, the oldest successful coverage timestamp wins.
+
 The scheduler skips rather than queues a live Level 2 when:
 
 - Cauldron is draining;
@@ -378,10 +409,11 @@ should stay sequential for simpler evidence.
 - Canary PRs are always draft, target `dev`, and carry a `canary` label.
 - The suite captures PR identity and checks before closure.
 - A passing canary PR is closed, never merged.
-- A failed or aborted PR remains open for operator inspection.
+- A failed or aborted PR remains open for executor and approver inspection.
 - Branches, worktrees, and reports remain for a configured retention window.
 - Cleanup reports candidates but does not delete branches or worktrees automatically.
-- Retention cleanup is a separately approved operator action.
+- Retention cleanup is a separately approved John Ranson action because it deletes
+  retained evidence.
 
 ## 15. Duty Officer briefing contract
 
@@ -413,6 +445,12 @@ input. The Command Restructuring implementation must transfer or expose this sec
 to the Duty Officer. Until that happens, the report exists but daily delivery is not
 claimed complete.
 
+Duty Officer ingestion is part of the suite, not an optional follow-up. Manual
+shadow runs may prove Levels 0 through 2 before ingestion lands, but the hybrid
+nightly schedule cannot be activated until the Duty Officer parser is installed,
+its missing/stale behavior passes, and two consecutive report fixtures appear
+correctly in briefing previews.
+
 Immediate SMS/email/Telegram fanout is outside this suite. It becomes a consumer of
 the same report/incident records when the notification router is implemented.
 
@@ -441,7 +479,7 @@ Abort during execution when:
   cleanup is attempted.
 
 On abort, stop new canary dispatch, preserve all evidence, close no PR, delete
-nothing, and surface the deterministic operator action.
+nothing, and surface the deterministic safe next action.
 
 ## 17. Testing strategy
 
@@ -474,7 +512,8 @@ No live production Level 5 run is a substitute for deterministic tests.
 6. Level 4 adversarial repair scenario.
 7. Level 5 profiles except supervisor takeover.
 8. Real supervisor takeover after Sol and Fable workers are independently active.
-9. Nightly scheduler, retention reporting, and Duty Officer briefing ingestion.
+9. Nightly scheduler, retention reporting, and completion-critical Duty Officer
+   briefing ingestion.
 10. Shadow period, controlled production canaries, and separate activation review.
 
 Each slice is independently reviewable and defaults live mutation off.
@@ -492,7 +531,9 @@ Rollout:
 6. Rotate Level 2 through all lanes.
 7. Run Levels 3 and 4 manually.
 8. Enable one Level 5 profile at a time after explicit plan approval.
-9. Activate the nightly hybrid schedule only after the shadow record is clean.
+9. Activate the nightly hybrid schedule through the named board authority only after
+   the shadow record is clean and two Duty Officer briefing previews consume the
+   report correctly.
 
 Rollback:
 
@@ -514,6 +555,8 @@ The suite is complete only when:
 - no fault hook can activate for a normal run;
 - the daily report is generated and the Duty Officer briefing parser reproduces its
   verdict without alteration;
+- Level 2 coverage warnings and the greater-than-ten-day starvation state appear in
+  the briefing exactly as reduced;
 - missing/stale reporting fails visible, not green;
 - rollback disables scheduling and injection without deleting evidence;
 - no customer, deployment, merge, restart, credential, or destructive action occurs.
@@ -526,5 +569,5 @@ The suite is complete only when:
 - The existing run-lease database-clock follow-up remains required before claiming
   full dual-execution resistance below the supervisor layer.
 - Standing canary WOs require separate WO-Lifecycle validation and board/issue setup.
-- Production activation, scheduling, and each Level 5 execution require separate
-  operator approvals after implementation review.
+- Production activation, scheduling, cleanup, and each Level 5 execution require the
+  named authorities in Section 11.1 after implementation review.
