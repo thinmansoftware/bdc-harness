@@ -77,6 +77,9 @@ RUN apt-get update && apt-get install -y \
     ca-certificates \
     gnupg \
     gosu \
+    # jq is load-bearing: lane read-spec bash nodes parse GitHub API JSON with it
+    # (2026-07-10 outage #2: image shipped without jq -> read-spec exit 127)
+    jq \
     postgresql-client \
     unzip \
     # Chromium for agent-browser E2E testing (drives browser via CDP)
