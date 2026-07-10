@@ -1088,7 +1088,12 @@ export class CodexProvider implements IAgentProvider {
       // does not receive a Codex model id from requestOptions.
       yield* streamFailback(
         failbackProvider,
-        Boolean(lastError?.message.toLowerCase().includes('auth'))
+        lastError
+          ? classifyAndEnrichCodexError(
+              lastError.cause instanceof Error ? lastError.cause : lastError,
+              requestOptions?.model
+            ).errorClass === 'auth'
+          : false
       );
       return;
     }

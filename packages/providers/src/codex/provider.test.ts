@@ -1512,6 +1512,23 @@ describe('CodexProvider', () => {
         expect(mockRunStreamed).toHaveBeenCalledTimes(1);
       });
 
+      test('normalizes thrown refresh failures as Codex auth errors', async () => {
+        mockRefreshIfAuthFailed.mockRejectedValue(new Error('refresh endpoint unavailable'));
+        mockRunStreamed.mockRejectedValue(new Error('unauthorized'));
+
+        const consumeGenerator = async (): Promise<void> => {
+          for await (const _ of client.sendQuery('test', '/workspace')) {
+            // consume
+          }
+        };
+
+        await expect(consumeGenerator()).rejects.toThrow(
+          /Codex auth error: refresh endpoint unavailable/
+        );
+        expect(mockRefreshIfAuthFailed).toHaveBeenCalledWith('codex');
+        expect(mockRunStreamed).toHaveBeenCalledTimes(1);
+      });
+
       test('does not retry unknown errors', async () => {
         mockRunStreamed.mockRejectedValue(new Error('something unexpected and unclassified'));
 
@@ -1930,6 +1947,48 @@ describe('WO-HARNESS-CODEX-THREAD-RESUME-AND-FAILBACK-01', () => {
     ).toBe(true);
     // Generator returned a final result without throwing.
     expect(chunks.some(c => c.type === 'result')).toBe(true);
+  }, 10_000);
+
+  test('Scenario 3d: retry-loop exhaustion uses unified terminal failback and contains rejection', async () => {
+    mockRunStreamed.mockRejectedValue(
+      new Error('codex exec exited with code 1: persistent subprocess crash')
+    );
+    const unhandledRejection = mock((_reason: unknown) => {});
+    process.on('unhandledRejection', unhandledRejection);
+    const failbackSendQuery = mock(async function* () {
+      throw new Error('failback provider aborted');
+    });
+    const failbackProvider = {
+      sendQuery: failbackSendQuery,
+      getType: () => 'claude',
+      getCapabilities: () => ({}) as unknown as ReturnType<CodexProvider['getCapabilities']>,
+    };
+    const clientWithFailback = new CodexProvider({
+      retryBaseDelayMs: 1,
+      failbackProviderFactory: () => failbackProvider,
+    });
+
+    const consume = async (): Promise<void> => {
+      for await (const _ of clientWithFailback.sendQuery('review this diff', '/workspace')) {
+        // consume
+      }
+    };
+
+    try {
+      await expect(consume()).rejects.toThrow('failback provider aborted');
+      await new Promise(resolve => setTimeout(resolve, 0));
+      expect(failbackSendQuery).toHaveBeenCalledTimes(1);
+      expect(unhandledRejection).not.toHaveBeenCalled();
+      expect(mockLogger.warn).toHaveBeenCalledWith(
+        expect.objectContaining({
+          errorClass: 'crash',
+          originalError: expect.stringContaining('persistent subprocess crash'),
+        }),
+        'codex_failback_to_claude'
+      );
+    } finally {
+      process.off('unhandledRejection', unhandledRejection);
+    }
   }, 10_000);
 
   test('Scenario 3c: failback strips nested nodeConfig model fields (no gpt id reaches Claude)', async () => {
