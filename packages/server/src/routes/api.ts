@@ -2509,14 +2509,11 @@ export function registerApiRoutes(
 
   registerOpenApiRoute(claimDispatchMessageRoute, async c => {
     try {
-      const { worker_id, lease_duration_ms } = getValidatedBody(
-        c,
-        claimDispatchMessageBodySchema
-      );
+      const body = getValidatedBody(c, claimDispatchMessageBodySchema);
       const message = await dispatchDb.claimMessage({
         id: c.req.param('id') ?? '',
-        worker_id,
-        leaseDurationMs: lease_duration_ms,
+        worker_id: body.worker_id,
+        leaseDurationMs: body.lease_duration_ms,
       });
       if (!message) return apiError(c, 404, 'Dispatch message is not claimable');
       return c.json(message);
@@ -2857,8 +2854,13 @@ export function registerApiRoutes(
     app.openapi(route, handler as never);
   }
 
-  /** Access Zod-validated body from a handler registered via registerOpenApiRoute. */
-  function getValidatedBody<T>(c: Context, _schema: z.ZodType<T>): T {
+  /**
+   * Access Zod-validated body from a handler registered via registerOpenApiRoute.
+   * Returns the schema OUTPUT type (post-parse), so `.default(...)` values are
+   * typed non-optional -- the validator applies defaults at runtime before the
+   * handler runs.
+   */
+  function getValidatedBody<T>(c: Context, _schema: z.ZodType<T, z.ZodTypeDef, unknown>): T {
     return (c.req as unknown as { valid(k: 'json'): T }).valid('json');
   }
 

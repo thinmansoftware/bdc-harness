@@ -69,7 +69,7 @@ async function readConfig(path: string): Promise<Required<WorkerConfig>> {
   };
 }
 
-function authHeaders(token: string): HeadersInit {
+function authHeaders(token: string): Record<string, string> {
   return {
     'Content-Type': 'application/json',
     'x-archon-operator-token': token,
@@ -80,7 +80,7 @@ async function requestJson<T>(
   config: Required<WorkerConfig>,
   token: string,
   path: string,
-  init?: RequestInit
+  init?: Omit<RequestInit, 'headers'> & { headers?: Record<string, string> }
 ): Promise<T> {
   const response = await fetch(`${config.server_url}${path}`, {
     ...init,
@@ -148,7 +148,10 @@ async function writeTranscript(data: {
   return path;
 }
 
-async function runAgent(config: AgentConfig, message: DispatchMessage): Promise<{
+async function runAgent(
+  config: AgentConfig,
+  message: DispatchMessage
+): Promise<{
   resultBody: string;
   status: 'done' | 'failed';
 }> {
@@ -227,7 +230,11 @@ async function processMessage(
   }
 }
 
-async function poll(config: Required<WorkerConfig>, token: string, state: WorkerState): Promise<void> {
+async function poll(
+  config: Required<WorkerConfig>,
+  token: string,
+  state: WorkerState
+): Promise<void> {
   for (const recipient of Object.keys(config.agents)) {
     const messages = await requestJson<DispatchMessage[]>(
       config,
@@ -255,12 +262,17 @@ async function main(): Promise<void> {
 
   await register(config, token);
   const heartbeatTimer = setInterval(() => {
-    if (!state.stopping) void heartbeat(config, token).catch(error => console.error(error));
+    if (!state.stopping)
+      void heartbeat(config, token).catch(error => {
+        console.error(error);
+      });
   }, config.heartbeat_interval_ms);
   heartbeatTimer.unref?.();
 
   while (!state.stopping) {
-    await poll(config, token, state).catch(error => console.error(error));
+    await poll(config, token, state).catch(error => {
+      console.error(error);
+    });
     await Bun.sleep(config.poll_interval_ms);
   }
 }
