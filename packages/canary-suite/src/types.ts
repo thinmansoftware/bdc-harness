@@ -145,3 +145,31 @@ export interface CanaryReduction {
   readonly reasonCodes: readonly string[];
   readonly evidenceRefs: readonly string[];
 }
+
+export interface CanaryLaneReport {
+  readonly lane: CanaryLaneName;
+  readonly level: 0 | 1;
+  readonly verdict: CanaryVerdict;
+  readonly reasonCodes: readonly string[];
+  readonly workflowRevision: string | null;
+  readonly capabilityStatus: 'passed' | 'failed' | 'missing' | 'duplicate';
+  readonly evidenceRefs: readonly string[];
+}
+
+export interface CanaryReport {
+  readonly schemaVersion: 1;
+  readonly suiteRunId: string;
+  readonly level: 0 | 1;
+  readonly generatedAt: string;
+  readonly requestId: string;
+  readonly verdict: CanaryVerdict;
+  readonly reasonCodes: readonly string[];
+  readonly evidenceRefs: readonly string[];
+  readonly lanes: readonly CanaryLaneReport[];
+}
+
+export interface RunCanaryResult {
+  readonly plan: CanaryPlan;
+  readonly report: CanaryReport;
+  readonly artifactPaths: readonly string[];
+}

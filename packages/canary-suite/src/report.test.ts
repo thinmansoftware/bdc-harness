@@ -1,0 +1,43 @@
+import { expect, test } from 'bun:test';
+import { mkdtemp, readFile, rm } from 'fs/promises';
+import { join } from 'path';
+import { tmpdir } from 'os';
+import { buildCanaryPlan } from './planner';
+import { reduceCanaryPlan } from './reducer';
+import { createCanaryReport, writeCanaryArtifacts } from './report';
+import { baseSnapshot, manifest } from './test-fixtures';
+
+test('writes deterministic JSON and Markdown artifacts atomically', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'canary-report-'));
+  try {
+    const plan = buildCanaryPlan(manifest, baseSnapshot);
+    const report = createCanaryReport('suite-fixture-001', 1, plan, reduceCanaryPlan(plan));
+    const paths = await writeCanaryArtifacts(root, plan, report);
+    expect(paths.map(path => path.replaceAll('\\', '/').slice(root.length + 1))).toEqual([
+      'suite-fixture-001/plan.json',
+      'suite-fixture-001/summary.json',
+      'suite-fixture-001/summary.md',
+    ]);
+    const markdown = await readFile(paths[2]!, 'utf8');
+    expect(markdown).toContain('| Lane | Level | Verdict |');
+    expect(markdown).toContain('bdc-feature-development-zero-open');
+    await expect(writeCanaryArtifacts(root, plan, report)).resolves.toEqual(paths);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('rejects conflicting bytes for an existing suite ID', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'canary-report-conflict-'));
+  try {
+    const plan = buildCanaryPlan(manifest, baseSnapshot);
+    const report = createCanaryReport('suite-fixture-001', 1, plan, reduceCanaryPlan(plan));
+    await writeCanaryArtifacts(root, plan, report);
+    const changed = { ...report, reasonCodes: ['changed'] };
+    await expect(writeCanaryArtifacts(root, plan, changed)).rejects.toThrow(
+      'canary_artifact_conflict'
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});

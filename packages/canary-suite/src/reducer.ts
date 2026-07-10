@@ -1,6 +1,6 @@
 import type { CanaryPlan, CanaryReduction } from './types';
 
-export function reduceCanaryPlan(plan: CanaryPlan): CanaryReduction {
+export function reduceCanaryPlan(plan: CanaryPlan, level: 0 | 1 = 1): CanaryReduction {
   const failed: { reason: string; evidence: string }[] = [];
   const blocked: { reason: string; evidence: string }[] = [];
 
@@ -23,9 +23,11 @@ export function reduceCanaryPlan(plan: CanaryPlan): CanaryReduction {
   if (plan.snapshot.loaderErrors.length > 0) {
     failed.push({ reason: 'workflow_loader_error', evidence: 'snapshot:loaderErrors' });
   }
-  for (const route of plan.conductorRoutes) {
-    if (route.tier !== route.expectedTier || route.workflowName !== route.expectedWorkflow) {
-      failed.push({ reason: 'conductor_route_mismatch', evidence: `probe:${route.probeId}` });
+  if (level === 1) {
+    for (const route of plan.conductorRoutes) {
+      if (route.tier !== route.expectedTier || route.workflowName !== route.expectedWorkflow) {
+        failed.push({ reason: 'conductor_route_mismatch', evidence: `probe:${route.probeId}` });
+      }
     }
   }
   if (plan.snapshot.revisions.runtimeImageRevision === null) {

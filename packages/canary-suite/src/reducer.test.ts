@@ -62,3 +62,10 @@ test('failed takes precedence over blocked', () => {
   });
   expect(reduceCanaryPlan(buildCanaryPlan(manifest, input)).verdict).toBe('failed');
 });
+
+test('Level 0 ignores conductor routing while Level 1 evaluates it', () => {
+  const input = snapshot({ ladder: { tiers: [] } });
+  const plan = buildCanaryPlan(manifest, input);
+  expect(reduceCanaryPlan(plan, 0).verdict).toBe('passed');
+  expect(reduceCanaryPlan(plan, 1).reasonCodes).toContain('conductor_route_mismatch');
+});
