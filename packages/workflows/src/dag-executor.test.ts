@@ -6218,7 +6218,14 @@ describe('executeDagWorkflow -- credit exhaustion', () => {
       testDir,
       {
         name: 'attempt-ledger-test',
-        nodes: [{ id: 'investigate', prompt: 'Investigate the issue', model: 'sonnet' }],
+        nodes: [
+          {
+            id: 'investigate',
+            prompt: 'Investigate the issue',
+            model: 'sonnet',
+            allowed_tools: [],
+          },
+        ],
       },
       workflowRun,
       'claude',

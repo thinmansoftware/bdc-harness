@@ -2854,6 +2854,7 @@ provider: opr
 nodes:
   - id: plan
     prompt: Produce a plan.
+    allowed_tools: []
 `,
       'text-plan.yaml'
     );
