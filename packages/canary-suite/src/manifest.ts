@@ -37,6 +37,12 @@ export async function loadCanaryManifest(path: string): Promise<CanaryManifest> 
   for (const expected of CANARY_LANES) {
     if (!laneNames.includes(expected)) throw new Error(`manifest_lane_missing: ${expected}`);
   }
+  for (const [index, expected] of CANARY_LANES.entries()) {
+    const lane = parsed.lanes.find(candidate => candidate.name === expected);
+    if (lane?.order !== index + 1) {
+      throw new Error(`manifest_lane_order_invalid: ${expected}`);
+    }
+  }
   return {
     schemaVersion: 1,
     environment: {

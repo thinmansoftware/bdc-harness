@@ -68,6 +68,18 @@ describe('loadCanaryManifest', () => {
     }
   });
 
+  test('rejects lane order values that differ from the reviewed order', async () => {
+    const fixture = validManifest();
+    const fixtureLanes = fixture.lanes as Array<{ name: string; order: number }>;
+    fixtureLanes[7] = { ...fixtureLanes[7]!, order: 1 };
+    const { dir, path } = await writeFixture(fixture);
+    try {
+      await expect(loadCanaryManifest(path)).rejects.toThrow('manifest_lane_order_invalid');
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   test('rejects a non-production environment or wrong repository', async () => {
     for (const change of [
       { id: 'local', canonical_remote: 'bluedevilcollectibles/bdc-harness' },
