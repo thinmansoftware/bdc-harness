@@ -142,13 +142,20 @@ export class GlmProvider implements IAgentProvider {
       });
     } catch (err) {
       if (isAvailabilityError(err) && this.failbackProviderFactory) {
+        const failback = this.failbackProviderFactory();
+        yield {
+          type: 'provider_route',
+          route: 'failback',
+          fromProvider: 'glm',
+          toProvider: (failback as { getType?: () => string }).getType?.() ?? 'claude',
+          reasonCode: 'provider_unavailable',
+        };
         yield {
           type: 'system',
           content:
             '[GLM FAILBACK] GLM/OpenRouter unavailable. Task delegated to Claude. ' +
             'Reduced cross-model adversarial value -- human review recommended.',
         };
-        const failback = this.failbackProviderFactory();
         yield* failback.sendQuery(prompt, _cwd, undefined, options);
         return;
       }
@@ -209,13 +216,20 @@ export class GlmProvider implements IAgentProvider {
       };
     } catch (err) {
       if (isAvailabilityError(err) && this.failbackProviderFactory) {
+        const failback = this.failbackProviderFactory();
+        yield {
+          type: 'provider_route',
+          route: 'failback',
+          fromProvider: 'glm',
+          toProvider: (failback as { getType?: () => string }).getType?.() ?? 'claude',
+          reasonCode: 'provider_unavailable',
+        };
         yield {
           type: 'system',
           content:
             '[GLM FAILBACK] GLM/OpenRouter stream error. Task delegated to Claude. ' +
             'Reduced cross-model adversarial value -- human review recommended.',
         };
-        const failback = this.failbackProviderFactory();
         yield* failback.sendQuery(prompt, _cwd, undefined, options);
         return;
       }

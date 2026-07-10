@@ -59,6 +59,7 @@ export function createWorkflowStore(): IWorkflowStore {
     scheduleProviderWait: workflowDb.scheduleProviderWait,
     listDueProviderWaits: workflowDb.listDueProviderWaits,
     claimProviderWait: workflowDb.claimProviderWait,
+    releaseProviderWaitClaim: workflowDb.releaseProviderWaitClaim,
     cancelProviderWaits: workflowDb.cancelProviderWaits,
     completeProviderWait: workflowDb.completeProviderWait,
     createWorkflowEvent: async (data): Promise<void> => {

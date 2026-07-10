@@ -69,6 +69,7 @@ import {
   scheduleProviderWait,
   listDueProviderWaits,
   claimProviderWait,
+  releaseProviderWaitClaim,
   cancelProviderWaits,
   completeProviderWait,
   reconcileTerminalWorkflowRuns,
@@ -546,24 +547,62 @@ describe('workflows database', () => {
         .mockResolvedValueOnce(createQueryResult([{ status: 'running' }], 1))
         .mockResolvedValueOnce(createQueryResult([{ run_id: 'run-1' }], 1))
         .mockResolvedValueOnce(createQueryResult([], 1))
+        .mockResolvedValueOnce(createQueryResult([], 1))
         .mockResolvedValueOnce(createQueryResult([], 1));
 
       await cancelWorkflowRun('run-1', terminal);
 
       expect(mockWithTransaction).toHaveBeenCalledTimes(1);
-      expect(mockTransactionQuery).toHaveBeenCalledTimes(4);
+      expect(mockTransactionQuery).toHaveBeenCalledTimes(5);
       expect(mockTransactionQuery.mock.calls[2]?.[0]).toContain('status = $1');
       expect(mockTransactionQuery.mock.calls[2]?.[1]).toEqual([
         'cancelled',
         JSON.stringify({}),
         'run-1',
+        'running',
       ]);
-      expect(mockTransactionQuery.mock.calls[3]?.[1]).toEqual([
+      expect(mockTransactionQuery.mock.calls[3]?.[0]).toContain('remote_agent_scheduled_waits');
+      expect(mockTransactionQuery.mock.calls[4]?.[1]).toEqual([
         'run-1',
         'workflow_cancelled',
         null,
         JSON.stringify(terminal.eventData),
       ]);
+    });
+
+    test('cancels a waiting-provider run and its claimed wake in one transaction', async () => {
+      const terminal: TerminalWorkflowPersistence = {
+        outcome: {
+          executionState: 'cancelled',
+          deliverableState: 'none',
+          validationState: 'not_run',
+          recoveryState: 'not_needed',
+          routeState: 'exhausted',
+          primaryReason: 'cancelled_by_operator',
+          reasonCodes: ['cancelled_by_operator'],
+          evidenceRefs: ['run:run-waiting'],
+        },
+        eventData: { reason_code: 'cancelled_by_operator' },
+        updatedAt: '2026-07-09T20:00:00.000Z',
+      };
+      mockTransactionQuery
+        .mockResolvedValueOnce(createQueryResult([{ status: 'waiting_provider' }], 1))
+        .mockResolvedValueOnce(createQueryResult([{ run_id: 'run-waiting' }], 1))
+        .mockResolvedValueOnce(createQueryResult([], 1))
+        .mockResolvedValueOnce(createQueryResult([], 1))
+        .mockResolvedValueOnce(createQueryResult([], 1));
+
+      await cancelWorkflowRun('run-waiting', terminal);
+
+      expect(mockTransactionQuery.mock.calls[2]?.[1]).toEqual([
+        'cancelled',
+        JSON.stringify({}),
+        'run-waiting',
+        'waiting_provider',
+      ]);
+      expect(mockTransactionQuery.mock.calls[3]?.[0]).toContain(
+        "state IN ('scheduled', 'claimed')"
+      );
     });
   });
 
@@ -1033,6 +1072,9 @@ describe('workflows database', () => {
       const [updateQuery, updateParams] = mockQuery.mock.calls[0] as [string, unknown[]];
       expect(updateQuery).toContain("status = 'running'");
       expect(updateQuery).toContain('completed_at = NULL');
+      expect(updateQuery).toContain(
+        "status IN ('failed', 'paused', 'waiting_provider', 'interrupted')"
+      );
       expect(updateParams).toEqual(['workflow-run-123']);
       // Second call: SELECT
       const [selectQuery, selectParams] = mockQuery.mock.calls[1] as [string, unknown[]];
@@ -1061,7 +1103,7 @@ describe('workflows database', () => {
       mockQuery.mockResolvedValueOnce(createQueryResult([], 0));
 
       await expect(resumeWorkflowRun('nonexistent-id')).rejects.toThrow(
-        'Workflow run not found (id: nonexistent-id)'
+        'Workflow run is not resumable (id: nonexistent-id)'
       );
     });
 
@@ -1541,6 +1583,18 @@ describe('Smart Cauldron reliability persistence', () => {
     ).resolves.toBe(true);
     expect(mockQuery.mock.calls[1]?.[0]).toContain("state = 'scheduled'");
     expect(mockQuery.mock.calls[1]?.[0]).toContain('resume_at <= $4');
+    expect(mockQuery.mock.calls[1]?.[0]).toContain("r.status = 'waiting_provider'");
+
+    mockQuery.mockResolvedValueOnce(createQueryResult([], 1));
+    await expect(
+      releaseProviderWaitClaim({
+        waitId: wait.waitId,
+        claimToken: '66666666-6666-4666-8666-666666666666',
+        resumeAt: '2026-07-09T17:00:30.000Z',
+      })
+    ).resolves.toBe(true);
+    expect(mockQuery.mock.calls[2]?.[0]).toContain("state = 'scheduled'");
+    expect(mockQuery.mock.calls[2]?.[0]).toContain('claim_token = NULL');
 
     mockQuery.mockResolvedValueOnce(createQueryResult([], 2));
     await expect(cancelProviderWaits(wait.runId, wait.resumeAt)).resolves.toBe(2);
@@ -1656,6 +1710,7 @@ describe('Smart Cauldron reliability persistence', () => {
       ).resolves.toBe(false);
       await expect(getRunOutcome(authority.runId)).resolves.toEqual(outcome);
 
+      await updateWorkflowRun(wait.runId, { status: 'waiting_provider' });
       await expect(scheduleProviderWait(wait)).resolves.toBe(true);
       await expect(listDueProviderWaits('2026-07-09T16:59:59.000Z', 10)).resolves.toEqual([]);
       await expect(listDueProviderWaits(wait.resumeAt, 10)).resolves.toEqual([wait]);
@@ -1675,6 +1730,7 @@ describe('Smart Cauldron reliability persistence', () => {
           completedAt: '2026-07-09T17:00:01.000Z',
         })
       ).resolves.toBe(false);
+      await updateWorkflowRun(wait.runId, { status: 'running' });
       const expiredAt = '2026-07-09T17:00:01.000Z';
       await expect(listExpiredRunLeases(expiredAt)).resolves.toHaveLength(1);
       await expect(

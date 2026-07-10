@@ -458,6 +458,22 @@ export async function executeWorkflow(
   let dagPriorCompletedNodes: Map<string, string> | undefined;
   let workflowRun: WorkflowRun | undefined = preCreatedRun;
 
+  // Durable provider waits resume an exact run selected by the scheduler. Do
+  // not rediscover by path: another historical failed row may exist on the same
+  // worktree. The status transition is a DB compare-and-swap, so cancellation
+  // that wins before this point cannot be resurrected by a late wake callback.
+  if (preCreatedRun?.status === 'waiting_provider') {
+    dagPriorCompletedNodes = await deps.store.getCompletedDagNodeOutputs(preCreatedRun.id);
+    workflowRun = await deps.store.resumeWorkflowRun(preCreatedRun.id);
+    getLog().info(
+      {
+        workflowRunId: workflowRun.id,
+        priorCompletedCount: dagPriorCompletedNodes.size,
+      },
+      'workflow.provider_wait_resuming'
+    );
+  }
+
   // Resume detection: check for prior failed run on same workflow + worktree
   {
     // Step 1: Find prior failed run -- non-critical, fall through on DB error

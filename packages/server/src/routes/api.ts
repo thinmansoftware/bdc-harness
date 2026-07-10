@@ -49,6 +49,7 @@ import { discoverWorkflowsWithConfig } from '@archon/workflows/workflow-discover
 import { resolveWorkflowName } from '@archon/workflows/router';
 import type { WorkflowDefinition } from '@archon/workflows/schemas/workflow';
 import { executeWorkflow } from '@archon/workflows/executor';
+import { processDueProviderWaits } from '@archon/workflows/reliability/wait-scheduler';
 import { getLoaderErrors, parseWorkflow } from '@archon/workflows/loader';
 import { isValidCommandName } from '@archon/workflows/command-validation';
 import { BUNDLED_WORKFLOWS, BUNDLED_COMMANDS, isBinaryBuild } from '@archon/workflows/defaults';
@@ -59,6 +60,13 @@ import {
 } from '@archon/workflows/schemas/workflow-run';
 import type { ApprovalContext, WorkflowRun } from '@archon/workflows/schemas/workflow-run';
 import { findMarkdownFilesRecursive } from '@archon/core/utils/commands';
+
+let providerWaitSchedulerTimer: ReturnType<typeof setInterval> | undefined;
+
+export function stopProviderWaitScheduler(): void {
+  if (providerWaitSchedulerTimer) clearInterval(providerWaitSchedulerTimer);
+  providerWaitSchedulerTimer = undefined;
+}
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
 let cachedLog: ReturnType<typeof createLogger> | undefined;
@@ -1737,9 +1745,9 @@ export function registerApiRoutes(
    * the resumed output. Non-web parents skip auto-resume and the originating
    * platform's own re-run flow applies.
    */
-  async function tryAutoResumeAfterGate(
+  async function tryAutoResumeRun(
     run: WorkflowRun,
-    action: 'approve' | 'reject'
+    action: 'approve' | 'reject' | 'provider_wait'
   ): Promise<boolean> {
     if (!run.parent_conversation_id) return false;
     if (!run.conversation_id || !run.working_path) return false;
@@ -1759,17 +1767,30 @@ export function registerApiRoutes(
             executorStarted: 'api.workflow_approve_direct_resume_started' as const,
             executorFailed: 'api.workflow_approve_direct_resume_failed' as const,
           }
-        : {
-            dispatched: 'api.workflow_reject_auto_resume_dispatched' as const,
-            skippedNoPlatformConv:
-              'api.workflow_reject_auto_resume_skipped_no_platform_conv' as const,
-            skippedNonWebParent: 'api.workflow_reject_auto_resume_skipped_non_web_parent' as const,
-            failed: 'api.workflow_reject_auto_resume_failed' as const,
-            missingWorker: 'api.workflow_reject_auto_resume_skipped_no_worker_conv' as const,
-            missingWorkflow: 'api.workflow_reject_auto_resume_skipped_missing_workflow' as const,
-            executorStarted: 'api.workflow_reject_direct_resume_started' as const,
-            executorFailed: 'api.workflow_reject_direct_resume_failed' as const,
-          };
+        : action === 'reject'
+          ? {
+              dispatched: 'api.workflow_reject_auto_resume_dispatched' as const,
+              skippedNoPlatformConv:
+                'api.workflow_reject_auto_resume_skipped_no_platform_conv' as const,
+              skippedNonWebParent:
+                'api.workflow_reject_auto_resume_skipped_non_web_parent' as const,
+              failed: 'api.workflow_reject_auto_resume_failed' as const,
+              missingWorker: 'api.workflow_reject_auto_resume_skipped_no_worker_conv' as const,
+              missingWorkflow: 'api.workflow_reject_auto_resume_skipped_missing_workflow' as const,
+              executorStarted: 'api.workflow_reject_direct_resume_started' as const,
+              executorFailed: 'api.workflow_reject_direct_resume_failed' as const,
+            }
+          : {
+              dispatched: 'api.provider_wait_auto_resume_dispatched' as const,
+              skippedNoPlatformConv:
+                'api.provider_wait_auto_resume_skipped_no_platform_conv' as const,
+              skippedNonWebParent: 'api.provider_wait_auto_resume_skipped_non_web_parent' as const,
+              failed: 'api.provider_wait_auto_resume_failed' as const,
+              missingWorker: 'api.provider_wait_auto_resume_skipped_no_worker_conv' as const,
+              missingWorkflow: 'api.provider_wait_auto_resume_skipped_missing_workflow' as const,
+              executorStarted: 'api.provider_wait_direct_resume_started' as const,
+              executorFailed: 'api.provider_wait_direct_resume_failed' as const,
+            };
     try {
       const parentConv = await conversationDb.getConversationById(run.parent_conversation_id);
       const workerConv = await conversationDb.getConversationById(run.conversation_id);
@@ -1842,19 +1863,35 @@ export function registerApiRoutes(
 
       webAdapter.setConversationDbId(workerPlatformConvId, workerConv.id);
       const unsubscribeBridge = webAdapter.setupEventBridge(workerPlatformConvId, platformConvId);
-      const execution = executeWorkflow(
-        createWorkflowDeps(),
-        webAdapter,
-        workerPlatformConvId,
-        run.working_path,
-        workflow,
-        run.user_message ?? '',
-        workerConv.id,
-        run.codebase_id ?? undefined,
-        undefined,
-        undefined,
-        parentConv.id
-      );
+      const execution =
+        action === 'provider_wait'
+          ? executeWorkflow(
+              createWorkflowDeps(),
+              webAdapter,
+              workerPlatformConvId,
+              run.working_path,
+              workflow,
+              run.user_message ?? '',
+              workerConv.id,
+              run.codebase_id ?? undefined,
+              undefined,
+              undefined,
+              parentConv.id,
+              run
+            )
+          : executeWorkflow(
+              createWorkflowDeps(),
+              webAdapter,
+              workerPlatformConvId,
+              run.working_path,
+              workflow,
+              run.user_message ?? '',
+              workerConv.id,
+              run.codebase_id ?? undefined,
+              undefined,
+              undefined,
+              parentConv.id
+            );
       void execution
         .then(result => {
           if (result.success && 'summary' in result && result.summary) {
@@ -1884,6 +1921,44 @@ export function registerApiRoutes(
       getLog().warn({ err: err as Error, runId: run.id }, events.failed);
       return false;
     }
+  }
+
+  if (process.env.NODE_ENV !== 'test' && providerWaitSchedulerTimer === undefined) {
+    const schedulerStore = createWorkflowDeps().store;
+    const schedulerOwnerId = `provider-wait:${randomUUID()}`;
+    const configuredInterval = Number.parseInt(
+      process.env.ARCHON_PROVIDER_WAIT_POLL_INTERVAL_MS ?? '',
+      10
+    );
+    const intervalMs =
+      Number.isInteger(configuredInterval) && configuredInterval > 0 ? configuredInterval : 15_000;
+    let schedulerInFlight = false;
+    const tick = async (): Promise<void> => {
+      if (schedulerInFlight) return;
+      schedulerInFlight = true;
+      try {
+        const result = await processDueProviderWaits(
+          schedulerStore,
+          async wait => {
+            const run = await schedulerStore.getWorkflowRun(wait.runId);
+            if (run?.status !== 'waiting_provider') {
+              throw new Error(`provider_wait_run_not_waiting: ${wait.runId}`);
+            }
+            const dispatched = await tryAutoResumeRun(run, 'provider_wait');
+            if (!dispatched) throw new Error(`provider_wait_resume_not_dispatched: ${wait.runId}`);
+          },
+          { ownerId: schedulerOwnerId }
+        );
+        if (result.due > 0) getLog().info(result, 'api.provider_wait_scheduler_tick');
+      } catch (error) {
+        getLog().error({ err: error as Error }, 'api.provider_wait_scheduler_failed');
+      } finally {
+        schedulerInFlight = false;
+      }
+    };
+    providerWaitSchedulerTimer = setInterval(() => void tick(), intervalMs);
+    providerWaitSchedulerTimer.unref?.();
+    void tick();
   }
 
   // GET /api/conversations - List conversations
@@ -3078,7 +3153,7 @@ export function registerApiRoutes(
       // `parent_conversation_id` on the run (set by orchestrator-agent for any
       // web-dispatched workflow -- foreground, interactive, and background via
       // the pre-created run) and a web-platform parent (guarded in the helper).
-      const autoResumed = await tryAutoResumeAfterGate(run, 'approve');
+      const autoResumed = await tryAutoResumeRun(run, 'approve');
 
       return c.json({
         success: true,
@@ -3150,7 +3225,7 @@ export function registerApiRoutes(
         // without requiring the user to re-run the workflow command. Mirrors
         // what `workflowRejectCommand` does in the CLI. Same cross-adapter
         // guard as approve -- only web parents auto-resume.
-        const autoResumed = await tryAutoResumeAfterGate(run, 'reject');
+        const autoResumed = await tryAutoResumeRun(run, 'reject');
 
         return c.json({
           success: true,

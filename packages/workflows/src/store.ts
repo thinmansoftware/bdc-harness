@@ -162,6 +162,11 @@ export interface IWorkflowStore {
     claimToken: string;
     claimedAt: string;
   }): Promise<boolean>;
+  releaseProviderWaitClaim?(data: {
+    waitId: string;
+    claimToken: string;
+    resumeAt: string;
+  }): Promise<boolean>;
   cancelProviderWaits(runId: string, cancelledAt: string): Promise<number>;
   completeProviderWait(data: {
     waitId: string;

@@ -182,6 +182,19 @@ export type MessageChunk =
     }
   | { type: 'rate_limit'; rateLimitInfo: Record<string, unknown> }
   | {
+      type: 'provider_route';
+      route: 'failover' | 'failback';
+      fromProvider: string;
+      fromModel?: string;
+      toProvider: string;
+      toModel?: string;
+      reasonCode:
+        | 'provider_unavailable'
+        | 'provider_rate_limited'
+        | 'provider_auth_failed'
+        | 'progress_timeout';
+    }
+  | {
       type: 'tool';
       toolName: string;
       toolInput?: Record<string, unknown>;

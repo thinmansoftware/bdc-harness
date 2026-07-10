@@ -855,8 +855,29 @@ export async function claimProviderWait(data: {
   const result = await pool.query(
     `UPDATE remote_agent_scheduled_waits
      SET state = 'claimed', claim_owner_id = $2, claim_token = $3, claimed_at = $4
-     WHERE wait_id = $1 AND state = 'scheduled' AND resume_at <= $4`,
+     WHERE wait_id = $1 AND state = 'scheduled' AND resume_at <= $4
+       AND EXISTS (
+         SELECT 1 FROM remote_agent_workflow_runs r
+         WHERE r.id = remote_agent_scheduled_waits.run_id
+           AND r.status = 'waiting_provider'
+       )`,
     [data.waitId, data.ownerId, data.claimToken, data.claimedAt]
+  );
+  return result.rowCount === 1;
+}
+
+/** Return a failed scheduler claim to the durable queue for a bounded retry. */
+export async function releaseProviderWaitClaim(data: {
+  waitId: string;
+  claimToken: string;
+  resumeAt: string;
+}): Promise<boolean> {
+  const result = await pool.query(
+    `UPDATE remote_agent_scheduled_waits
+     SET state = 'scheduled', resume_at = $3,
+         claim_owner_id = NULL, claim_token = NULL, claimed_at = NULL
+     WHERE wait_id = $1 AND claim_token = $2 AND state = 'claimed'`,
+    [data.waitId, data.claimToken, data.resumeAt]
   );
   return result.rowCount === 1;
 }
@@ -1144,7 +1165,8 @@ export async function resumeWorkflowRun(id: string): Promise<WorkflowRun> {
            completed_at = NULL,
            started_at = ${dialect.now()},
            last_activity_at = ${dialect.now()}
-       WHERE id = $1`,
+       WHERE id = $1
+         AND status IN ('failed', 'paused', 'waiting_provider', 'interrupted')`,
       [id]
     );
   } catch (error) {
@@ -1156,7 +1178,7 @@ export async function resumeWorkflowRun(id: string): Promise<WorkflowRun> {
   if (updateResult.rowCount === 0) {
     // Logical race: run was deleted or already activated between find and resume
     getLog().warn({ workflowRunId: id }, 'db.workflow_run_resume_not_found');
-    throw new Error(`Workflow run not found (id: ${id})`);
+    throw new Error(`Workflow run is not resumable (id: ${id})`);
   }
 
   let selectResult: Awaited<ReturnType<typeof pool.query<WorkflowRun>>>;
@@ -1289,7 +1311,10 @@ async function persistTerminalWorkflowRun(
     );
     const currentStatus = runResult.rows[0]?.status;
     if (!currentStatus) throw new Error(`Workflow run not found (id: ${id})`);
-    if (currentStatus !== 'running' && currentStatus !== status) {
+    const cancellableStatus =
+      status === 'cancelled' &&
+      ['pending', 'running', 'waiting_provider', 'paused', 'interrupted'].includes(currentStatus);
+    if (currentStatus !== 'running' && currentStatus !== status && !cancellableStatus) {
       throw new Error(
         `terminal_status_conflict: run ${id} is ${currentStatus}, cannot finalize as ${status}`
       );
@@ -1347,17 +1372,26 @@ async function persistTerminalWorkflowRun(
       throw new Error(`terminal_outcome_conflict: newer outcome already exists for run ${id}`);
     }
 
-    if (currentStatus === 'running') {
+    if (currentStatus === 'running' || cancellableStatus) {
       const updateResult = await query(
         `UPDATE remote_agent_workflow_runs
          SET status = $1, completed_at = ${dialect.now()},
              metadata = ${dialect.jsonMerge('metadata', 2)}
-         WHERE id = $3 AND status = 'running'`,
-        [status, JSON.stringify(metadata), id]
+         WHERE id = $3 AND status = $4`,
+        [status, JSON.stringify(metadata), id, currentStatus]
       );
       if (updateResult.rowCount !== 1) {
         throw new Error(`terminal_status_conflict: run ${id} changed during finalization`);
       }
+    }
+
+    if (status === 'cancelled') {
+      await query(
+        `UPDATE remote_agent_scheduled_waits
+         SET state = 'cancelled', cancelled_at = $2
+         WHERE run_id = $1 AND state IN ('scheduled', 'claimed')`,
+        [id, terminal.updatedAt]
+      );
     }
 
     const eventType =
@@ -1649,6 +1683,7 @@ export async function cancelWorkflowRun(
        WHERE id = $1`,
       [id]
     );
+    await cancelProviderWaits(id, new Date().toISOString());
   } catch (error) {
     const err = error as Error;
     getLog().error({ err }, 'db.workflow_run_cancel_failed');

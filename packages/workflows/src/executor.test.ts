@@ -593,6 +593,40 @@ describe('executeWorkflow', () => {
   // -------------------------------------------------------------------------
 
   describe('resume logic', () => {
+    it('resumes the exact waiting-provider run even when it has no completed nodes', async () => {
+      const waitingRun = makeRun({ id: 'waiting-run', status: 'waiting_provider' });
+      const resumedRun = makeRun({ id: 'waiting-run', status: 'running' });
+      const store = makeStore({
+        findResumableRun: mock(async () => null),
+        getCompletedDagNodeOutputs: mock(async () => new Map()),
+        resumeWorkflowRun: mock(async () => resumedRun),
+        getWorkflowRun: mock(async () => ({ ...resumedRun, status: 'completed' as const })),
+      });
+
+      await executeWorkflow(
+        makeDeps(store),
+        makePlatform(),
+        'conv-1',
+        '/tmp',
+        makeWorkflow(),
+        'test message',
+        'db-conv-1',
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        waitingRun
+      );
+
+      expect(store.resumeWorkflowRun).toHaveBeenCalledWith('waiting-run');
+      expect(store.createWorkflowRun).not.toHaveBeenCalled();
+      const dagArgs = mockExecuteDagWorkflow.mock.calls[0];
+      expect(dagArgs?.[5]).toEqual(
+        expect.objectContaining({ id: 'waiting-run', status: 'running' })
+      );
+      expect(dagArgs?.[15]).toEqual(new Map());
+    });
+
     it('starts fresh run when findResumableRun returns null', async () => {
       const store = makeStore({
         findResumableRun: mock(async () => null),

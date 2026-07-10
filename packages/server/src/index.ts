@@ -63,7 +63,7 @@ import { WebAdapter } from './adapters/web';
 import { MessagePersistence } from './adapters/web/persistence';
 import { SSETransport } from './adapters/web/transport';
 import { WorkflowEventBridge } from './adapters/web/workflow-bridge';
-import { registerApiRoutes } from './routes/api';
+import { registerApiRoutes, stopProviderWaitScheduler } from './routes/api';
 import { observeStartupRecovery } from './startup-reconciliation';
 import {
   handleMessage,
@@ -678,6 +678,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
   const shutdown = (): void => {
     getLog().info('server_shutting_down');
     stopCleanupScheduler();
+    stopProviderWaitScheduler();
     persistence.stopPeriodicFlush();
 
     // Flush all buffered messages before stopping adapters

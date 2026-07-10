@@ -28,6 +28,7 @@ const mockGetRunOutcome = mock(() => Promise.resolve(null));
 const mockScheduleProviderWait = mock(() => Promise.resolve(false));
 const mockListDueProviderWaits = mock(() => Promise.resolve([]));
 const mockClaimProviderWait = mock(() => Promise.resolve(false));
+const mockReleaseProviderWaitClaim = mock(() => Promise.resolve(false));
 const mockCancelProviderWaits = mock(() => Promise.resolve(0));
 const mockCompleteProviderWait = mock(() => Promise.resolve(false));
 
@@ -58,6 +59,7 @@ mock.module('../db/workflows', () => ({
   scheduleProviderWait: mockScheduleProviderWait,
   listDueProviderWaits: mockListDueProviderWaits,
   claimProviderWait: mockClaimProviderWait,
+  releaseProviderWaitClaim: mockReleaseProviderWaitClaim,
   cancelProviderWaits: mockCancelProviderWaits,
   completeProviderWait: mockCompleteProviderWait,
 }));
@@ -116,6 +118,7 @@ describe('createWorkflowStore', () => {
       'scheduleProviderWait',
       'listDueProviderWaits',
       'claimProviderWait',
+      'releaseProviderWaitClaim',
       'cancelProviderWaits',
       'completeProviderWait',
       'createWorkflowEvent',

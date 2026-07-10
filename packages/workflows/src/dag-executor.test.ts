@@ -115,8 +115,8 @@ function createMockStore(): IWorkflowStore {
     claimRunLease: mock(() => Promise.resolve(null)),
     heartbeatRunLease: mock(() => Promise.resolve(false)),
     releaseRunLease: mock(() => Promise.resolve(false)),
-    createProviderAttempt: mock(() => Promise.resolve(false)),
-    completeProviderAttempt: mock(() => Promise.resolve(false)),
+    createProviderAttempt: mock(() => Promise.resolve(true)),
+    completeProviderAttempt: mock(() => Promise.resolve(true)),
     listProviderAttempts: mock(() => Promise.resolve([])),
     upsertRunOutcome: mock(() => Promise.resolve(false)),
     getRunOutcome: mock(() => Promise.resolve(null)),
@@ -5963,27 +5963,22 @@ describe('executeDagWorkflow -- credit exhaustion', () => {
     }
   });
 
-  it('retries zero-work SDK usage exhaustion twice, then completes without node_failed', async () => {
+  it('treats zero-work SDK success contradiction as one bounded retry, not quota exhaustion', async () => {
     process.env.ARCHON_RESOURCE_EXHAUSTED_BACKOFF_MS = '1';
     process.env.ARCHON_RESOURCE_EXHAUSTED_MAX_WAIT_MS = '1000';
     let calls = 0;
-    const usageExhaustedQuery = mock(function* () {
+    const contradictoryQuery = mock(function* () {
       calls += 1;
-      if (calls <= 2) {
-        yield {
-          type: 'result',
-          isError: true,
-          errorSubtype: 'success',
-          tokens: { input: 0, output: 0, total: 0 },
-          cost: 0,
-        };
-        return;
-      }
-      yield { type: 'assistant', content: 'Recovered after reset.' };
-      yield { type: 'result', sessionId: 'dag-session-recovered' };
+      yield {
+        type: 'result',
+        isError: true,
+        errorSubtype: 'success',
+        tokens: { input: 0, output: 0, total: 0 },
+        cost: 0,
+      };
     });
     mockGetAgentProviderDag.mockReturnValue({
-      sendQuery: usageExhaustedQuery,
+      sendQuery: contradictoryQuery,
       getType: () => 'claude',
       getCapabilities: mockClaudeCapabilities,
     });
@@ -6012,18 +6007,232 @@ describe('executeDagWorkflow -- credit exhaustion', () => {
       minimalConfig
     );
 
-    expect(usageExhaustedQuery.mock.calls.length).toBe(3);
+    expect(contradictoryQuery.mock.calls.length).toBe(2);
     const events = (store.createWorkflowEvent as Mock<() => Promise<void>>).mock.calls.map(
       (c: unknown[]) => c[0] as { event_type: string; data?: Record<string, unknown> }
     );
-    expect(events.filter(e => e.event_type === 'resource_exhausted_retry').length).toBe(2);
-    expect(events.some(e => e.event_type === 'node_failed')).toBe(false);
-    expect(store.completeWorkflowRun).toHaveBeenCalled();
-    expect(store.failWorkflowRun).not.toHaveBeenCalled();
+    expect(events.some(e => e.event_type === 'resource_exhausted_retry')).toBe(false);
+    expect(events.filter(e => e.event_type === 'node_failed').length).toBeGreaterThan(0);
+    expect(store.completeWorkflowRun).not.toHaveBeenCalled();
+    expect(store.failWorkflowRun).toHaveBeenCalledTimes(1);
   });
 
-  it('fails with resource_exhausted_timeout when the retry ceiling expires', async () => {
-    process.env.ARCHON_RESOURCE_EXHAUSTED_BACKOFF_MS = '2';
+  it('persists and completes an attempt around every provider call', async () => {
+    const order: string[] = [];
+    const providerQuery = mock(function* () {
+      order.push('provider');
+      yield { type: 'assistant', content: 'Attempt completed.' };
+      yield {
+        type: 'result',
+        sessionId: 'attempt-session',
+        servedModelId: 'claude-sonnet-5',
+      };
+    });
+    mockGetAgentProviderDag.mockReturnValue({
+      sendQuery: providerQuery,
+      getType: () => 'claude',
+      getCapabilities: mockClaudeCapabilities,
+    });
+
+    const store = createMockStore();
+    (store.createProviderAttempt as Mock<() => Promise<boolean>>).mockImplementation(async () => {
+      order.push('persist');
+      return true;
+    });
+    const deps = createMockDeps(store);
+    const workflowRun = makeWorkflowRun('attempt-ledger-run');
+
+    await executeDagWorkflow(
+      deps,
+      createMockPlatform(),
+      'conv-attempt-ledger',
+      testDir,
+      {
+        name: 'attempt-ledger-test',
+        nodes: [{ id: 'investigate', prompt: 'Investigate the issue', model: 'sonnet' }],
+      },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    expect(order).toEqual(['persist', 'provider']);
+    expect(store.createProviderAttempt).toHaveBeenCalledTimes(1);
+    expect(store.createProviderAttempt).toHaveBeenCalledWith(
+      expect.objectContaining({
+        runId: workflowRun.id,
+        nodeId: 'investigate',
+        attemptNumber: 1,
+        provider: 'claude',
+        model: 'sonnet',
+        declaredProvider: 'claude',
+        declaredModel: 'sonnet',
+        requiredCapabilities: ['text_generation'],
+      })
+    );
+    const attempt = (store.createProviderAttempt as Mock<() => Promise<boolean>>).mock
+      .calls[0]?.[0] as {
+      attemptId: string;
+    };
+    expect(store.completeProviderAttempt).toHaveBeenCalledWith(
+      expect.objectContaining({
+        attemptId: attempt.attemptId,
+        servedModelId: 'claude-sonnet-5',
+        outcomeClass: 'success',
+        reasonCode: 'execution_completed',
+        resumeAt: null,
+      })
+    );
+  });
+
+  it('turns provider-internal failback into a typed route event and a second attempt', async () => {
+    const routedQuery = mock(function* () {
+      yield {
+        type: 'provider_route',
+        route: 'failback',
+        fromProvider: 'codex',
+        toProvider: 'claude',
+        reasonCode: 'provider_unavailable',
+      };
+      yield { type: 'assistant', content: 'Recovered on Claude.' };
+      yield { type: 'result', servedModelId: 'claude-sonnet-5' };
+    });
+    mockGetAgentProviderDag.mockReturnValue({
+      sendQuery: routedQuery,
+      getType: () => 'codex',
+      getCapabilities: mockCodexCapabilities,
+    });
+
+    const attempts: Array<Parameters<IWorkflowStore['createProviderAttempt']>[0]> = [];
+    const store = createMockStore();
+    (store.listProviderAttempts as Mock<() => Promise<typeof attempts>>).mockImplementation(
+      async () => attempts
+    );
+    (store.createProviderAttempt as Mock<() => Promise<boolean>>).mockImplementation(
+      async attempt => {
+        attempts.push(attempt as (typeof attempts)[number]);
+        return true;
+      }
+    );
+
+    await executeDagWorkflow(
+      createMockDeps(store),
+      createMockPlatform(),
+      'conv-provider-route',
+      testDir,
+      {
+        name: 'provider-route-test',
+        nodes: [{ id: 'review', prompt: 'Review this change.' }],
+      },
+      makeWorkflowRun('provider-route-run'),
+      'codex',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    expect(attempts.map(attempt => [attempt.attemptNumber, attempt.provider])).toEqual([
+      [1, 'codex'],
+      [2, 'claude'],
+    ]);
+    expect(store.completeProviderAttempt).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({
+        attemptId: attempts[0]?.attemptId,
+        outcomeClass: 'availability',
+        reasonCode: 'provider_unavailable',
+      })
+    );
+    expect(store.completeProviderAttempt).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({
+        attemptId: attempts[1]?.attemptId,
+        outcomeClass: 'success',
+        servedModelId: 'claude-sonnet-5',
+      })
+    );
+    expect(store.createWorkflowEvent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        event_type: 'node_failover',
+        data: expect.objectContaining({
+          attempt_id: attempts[0]?.attemptId,
+          route: 'failback',
+          from_provider: 'codex',
+          to_provider: 'claude',
+        }),
+      })
+    );
+  });
+
+  it('enforces one total provider-call ceiling across composed retry policies', async () => {
+    const store = createMockStore();
+    const priorAttempt = {
+      attemptId: 'prior-attempt',
+      runId: 'attempt-ceiling-run',
+      nodeId: 'investigate',
+      attemptNumber: 8,
+      provider: 'claude',
+      model: 'sonnet',
+      declaredProvider: 'claude',
+      declaredModel: 'sonnet',
+      requiredCapabilities: ['text_generation'] as const,
+      startedAt: '2026-07-09T12:00:00.000Z',
+      completedAt: '2026-07-09T12:00:01.000Z',
+      servedModelId: null,
+      outcomeClass: 'availability' as const,
+      reasonCode: 'provider_unavailable' as const,
+      resumeAt: null,
+      supersedesAttemptId: null,
+    };
+    (store.listProviderAttempts as Mock<() => Promise<(typeof priorAttempt)[]>>).mockResolvedValue(
+      Array.from({ length: 8 }, (_, index) => ({
+        ...priorAttempt,
+        attemptId: `prior-attempt-${String(index + 1)}`,
+        attemptNumber: index + 1,
+      }))
+    );
+
+    await executeDagWorkflow(
+      createMockDeps(store),
+      createMockPlatform(),
+      'conv-attempt-ceiling',
+      testDir,
+      {
+        name: 'attempt-ceiling-test',
+        nodes: [{ id: 'investigate', prompt: 'Investigate the issue' }],
+      },
+      makeWorkflowRun('attempt-ceiling-run'),
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    expect(mockSendQueryDag).not.toHaveBeenCalled();
+    expect(store.createProviderAttempt).not.toHaveBeenCalled();
+    expect(store.createWorkflowEvent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        event_type: 'node_failed',
+        data: expect.objectContaining({
+          error: expect.stringContaining('provider_attempt_ceiling_exceeded'),
+        }),
+      })
+    );
+  });
+
+  it('persists a durable provider wait and returns without sleeping the worker', async () => {
+    process.env.ARCHON_RESOURCE_EXHAUSTED_BACKOFF_MS = '60000';
     process.env.ARCHON_RESOURCE_EXHAUSTED_MAX_WAIT_MS = '1';
     const creditExhaustedQuery = mock(function* () {
       yield { type: 'assistant', content: "You're out of extra usage - resets in 2h" };
@@ -6035,7 +6244,21 @@ describe('executeDagWorkflow -- credit exhaustion', () => {
       getCapabilities: mockClaudeCapabilities,
     });
 
+    let status: WorkflowRun['status'] = 'running';
     const store = createMockStore();
+    (store.getRunAuthority as Mock<() => Promise<never>>).mockResolvedValue({} as never);
+    (store.claimRunLease as Mock<() => Promise<unknown>>).mockImplementation(async lease => lease);
+    (store.releaseRunLease as Mock<() => Promise<boolean>>).mockResolvedValue(true);
+    (store.getWorkflowRunStatus as Mock<() => Promise<WorkflowRun['status']>>).mockImplementation(
+      async () => status
+    );
+    (store.updateWorkflowRun as Mock<() => Promise<void>>).mockImplementation(
+      async (_runId: string, updates: { status?: WorkflowRun['status'] }) => {
+        if (updates.status) status = updates.status;
+      }
+    );
+    (store.scheduleProviderWait as Mock<() => Promise<boolean>>).mockResolvedValue(true);
+    (store.upsertRunOutcome as Mock<() => Promise<boolean>>).mockResolvedValue(true);
     const deps = createMockDeps(store);
     const platform = createMockPlatform();
     const workflowRun = makeWorkflowRun('credit-exhaustion-run');
@@ -6062,12 +6285,101 @@ describe('executeDagWorkflow -- credit exhaustion', () => {
     const events = (store.createWorkflowEvent as Mock<() => Promise<void>>).mock.calls.map(
       (c: unknown[]) => c[0] as { event_type: string; data?: Record<string, unknown> }
     );
-    const nodeFailed = events.find(e => e.event_type === 'node_failed');
-    expect(nodeFailed?.data?.reason).toBe('resource_exhausted_timeout');
-    expect(nodeFailed?.data?.error).toContain('resource_exhausted_timeout');
+    expect(creditExhaustedQuery).toHaveBeenCalledTimes(1);
+    expect(events.some(e => e.event_type === 'resource_exhausted_retry')).toBe(true);
+    expect(events.some(e => e.event_type === 'node_failed')).toBe(false);
     expect(events.some(e => e.event_type === 'node_completed')).toBe(false);
+    expect(store.scheduleProviderWait).toHaveBeenCalledWith(
+      expect.objectContaining({
+        runId: workflowRun.id,
+        provider: 'claude',
+        reasonCode: 'provider_quota_wait',
+        state: 'scheduled',
+      })
+    );
+    const wait = (store.scheduleProviderWait as Mock<() => Promise<boolean>>).mock
+      .calls[0]?.[0] as {
+      attemptId: string;
+      resumeAt: string;
+    };
+    expect(new Date(wait.resumeAt).getTime()).toBeGreaterThan(Date.now());
+    expect(store.completeProviderAttempt).toHaveBeenCalledWith(
+      expect.objectContaining({
+        attemptId: wait.attemptId,
+        outcomeClass: 'quota',
+        reasonCode: 'provider_quota_wait',
+        resumeAt: wait.resumeAt,
+      })
+    );
+    expect(store.updateWorkflowRun).toHaveBeenCalledWith(
+      workflowRun.id,
+      expect.objectContaining({ status: 'waiting_provider' })
+    );
+    expect(store.upsertRunOutcome).toHaveBeenCalledWith(
+      workflowRun.id,
+      expect.objectContaining({
+        executionState: 'waiting_provider',
+        primaryReason: 'provider_quota_wait',
+      }),
+      expect.any(String)
+    );
+    expect(store.failWorkflowRun).not.toHaveBeenCalled();
+    expect(store.completeWorkflowRun).not.toHaveBeenCalled();
+    expect(store.releaseRunLease).toHaveBeenCalledTimes(1);
+  });
 
-    expect(store.failWorkflowRun).toHaveBeenCalled();
+  it('treats a transient 429 without reset evidence as availability, not quota', async () => {
+    const rateLimitedQuery = mock(function* () {
+      yield {
+        type: 'result',
+        isError: true,
+        errorSubtype: 'rate_limit_error',
+        errors: ['429 rate limit reached; try again'],
+        tokens: { input: 0, output: 0, total: 0 },
+        cost: 0,
+      };
+    });
+    mockGetAgentProviderDag.mockReturnValue({
+      sendQuery: rateLimitedQuery,
+      getType: () => 'claude',
+      getCapabilities: mockClaudeCapabilities,
+    });
+    const store = createMockStore();
+
+    await executeDagWorkflow(
+      createMockDeps(store),
+      createMockPlatform(),
+      'conv-rate-limit',
+      testDir,
+      {
+        name: 'rate-limit-test',
+        nodes: [
+          {
+            id: 'investigate',
+            prompt: 'Investigate the issue',
+            retry: { max_attempts: 1, delay_ms: 1 },
+          },
+        ],
+      },
+      makeWorkflowRun('rate-limit-run'),
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    expect(store.scheduleProviderWait).not.toHaveBeenCalled();
+    expect(store.completeProviderAttempt).toHaveBeenCalledWith(
+      expect.objectContaining({
+        outcomeClass: 'availability',
+        reasonCode: 'provider_unavailable',
+        resumeAt: null,
+      })
+    );
+    expect(store.failWorkflowRun).toHaveBeenCalledTimes(1);
   });
 
   it('keeps real validator SDK errors with nonzero usage on the normal failure path', async () => {
@@ -6122,24 +6434,18 @@ describe('executeDagWorkflow -- credit exhaustion', () => {
     expect(store.failWorkflowRun).toHaveBeenCalled();
   });
 
-  it('does not consume a loop iteration when usage exhaustion retries and then succeeds', async () => {
-    process.env.ARCHON_RESOURCE_EXHAUSTED_BACKOFF_MS = '1';
-    process.env.ARCHON_RESOURCE_EXHAUSTED_MAX_WAIT_MS = '1000';
-    let calls = 0;
+  it('schedules a durable wait without consuming a loop iteration', async () => {
+    process.env.ARCHON_RESOURCE_EXHAUSTED_BACKOFF_MS = '60000';
+    process.env.ARCHON_RESOURCE_EXHAUSTED_MAX_WAIT_MS = '1';
     const loopUsageQuery = mock(function* () {
-      calls += 1;
-      if (calls === 1) {
-        yield {
-          type: 'result',
-          isError: true,
-          errorSubtype: 'success',
-          tokens: { input: 0, output: 0, total: 0 },
-          cost: 0,
-        };
-        return;
-      }
-      yield { type: 'assistant', content: 'Done. <promise>COMPLETE</promise>' };
-      yield { type: 'result', sessionId: 'loop-session-recovered' };
+      yield {
+        type: 'result',
+        isError: true,
+        errorSubtype: 'rate_limit_error',
+        errors: ['quota exhausted; resets later'],
+        tokens: { input: 0, output: 0, total: 0 },
+        cost: 0,
+      };
     });
     mockGetAgentProviderDag.mockReturnValue({
       sendQuery: loopUsageQuery,
@@ -6147,7 +6453,18 @@ describe('executeDagWorkflow -- credit exhaustion', () => {
       getCapabilities: mockClaudeCapabilities,
     });
 
+    let status: WorkflowRun['status'] = 'running';
     const store = createMockStore();
+    (store.getWorkflowRunStatus as Mock<() => Promise<WorkflowRun['status']>>).mockImplementation(
+      async () => status
+    );
+    (store.updateWorkflowRun as Mock<() => Promise<void>>).mockImplementation(
+      async (_runId: string, updates: { status?: WorkflowRun['status'] }) => {
+        if (updates.status) status = updates.status;
+      }
+    );
+    (store.scheduleProviderWait as Mock<() => Promise<boolean>>).mockResolvedValue(true);
+    (store.upsertRunOutcome as Mock<() => Promise<boolean>>).mockResolvedValue(true);
     const deps = createMockDeps(store);
     const platform = createMockPlatform();
     const workflowRun = makeWorkflowRun('loop-exhaustion-run');
@@ -6180,16 +6497,23 @@ describe('executeDagWorkflow -- credit exhaustion', () => {
       minimalConfig
     );
 
-    expect(loopUsageQuery.mock.calls.length).toBe(2);
+    expect(loopUsageQuery.mock.calls.length).toBe(1);
     const events = (store.createWorkflowEvent as Mock<() => Promise<void>>).mock.calls.map(
       (c: unknown[]) => c[0] as { event_type: string; data?: Record<string, unknown> }
     );
     expect(events.filter(e => e.event_type === 'resource_exhausted_retry').length).toBe(1);
     expect(events.some(e => e.event_type === 'loop_iteration_failed')).toBe(false);
     const completedIterations = events.filter(e => e.event_type === 'loop_iteration_completed');
-    expect(completedIterations.length).toBe(1);
-    expect(completedIterations[0].data?.iteration).toBe(1);
-    expect(store.completeWorkflowRun).toHaveBeenCalled();
+    expect(completedIterations.length).toBe(0);
+    expect(store.scheduleProviderWait).toHaveBeenCalledWith(
+      expect.objectContaining({ runId: workflowRun.id, attemptId: expect.any(String) })
+    );
+    expect(store.updateWorkflowRun).toHaveBeenCalledWith(
+      workflowRun.id,
+      expect.objectContaining({ status: 'waiting_provider' })
+    );
+    expect(store.completeWorkflowRun).not.toHaveBeenCalled();
+    expect(store.failWorkflowRun).not.toHaveBeenCalled();
   });
 });
 describe('executeDagWorkflow -- approval node', () => {
@@ -10459,17 +10783,17 @@ describe('gate_result field in node_failed events', () => {
     expect(emittedGr!.isTimeout).toBe(false);
   });
 
-  it('AI node failure (credit exhaustion) carries gate_result in persisted and emitted node_failed event', async () => {
-    const previousBackoffMs = process.env.ARCHON_RESOURCE_EXHAUSTED_BACKOFF_MS;
-    const previousMaxWaitMs = process.env.ARCHON_RESOURCE_EXHAUSTED_MAX_WAIT_MS;
-    process.env.ARCHON_RESOURCE_EXHAUSTED_BACKOFF_MS = '2';
-    process.env.ARCHON_RESOURCE_EXHAUSTED_MAX_WAIT_MS = '1';
-    const creditExhaustedQuery = mock(function* () {
-      yield { type: 'assistant', content: 'credit balance is too low' };
-      yield { type: 'result', sessionId: 'dag-session-credit' };
+  it('AI node SDK failure carries gate_result in persisted and emitted node_failed event', async () => {
+    const failedQuery = mock(function* () {
+      yield {
+        type: 'result',
+        isError: true,
+        errorSubtype: 'validation_error',
+        errors: ['validator rejected output'],
+      };
     });
     mockGetAgentProviderDag.mockReturnValue({
-      sendQuery: creditExhaustedQuery,
+      sendQuery: failedQuery,
       getType: () => 'claude',
       getCapabilities: mockClaudeCapabilities,
     });
@@ -10481,6 +10805,7 @@ describe('gate_result field in node_failed events', () => {
       workflow_name: 'gate-ai-test',
       conversation_id: 'conv-gate-ai',
     });
+    recordGateResult(workflowRun.id, 'ai-node', { passed: false, nodeType: 'ai' });
 
     const commandsDir = join(testDir, '.archon', 'commands');
     await mkdir(commandsDir, { recursive: true });
@@ -10491,35 +10816,22 @@ describe('gate_result field in node_failed events', () => {
       if (e.type === 'node_failed') emittedFailedEvents.push(e);
     });
 
-    try {
-      await executeDagWorkflow(
-        deps,
-        platform,
-        'conv-gate-ai',
-        testDir,
-        { name: 'gate-ai-test', nodes: [{ id: 'ai-node', prompt: 'do something' }] },
-        workflowRun,
-        'claude',
-        undefined,
-        join(testDir, 'artifacts'),
-        join(testDir, 'logs'),
-        'main',
-        'docs/',
-        minimalConfig
-      );
-    } finally {
-      if (previousBackoffMs === undefined) {
-        delete process.env.ARCHON_RESOURCE_EXHAUSTED_BACKOFF_MS;
-      } else {
-        process.env.ARCHON_RESOURCE_EXHAUSTED_BACKOFF_MS = previousBackoffMs;
-      }
-      if (previousMaxWaitMs === undefined) {
-        delete process.env.ARCHON_RESOURCE_EXHAUSTED_MAX_WAIT_MS;
-      } else {
-        process.env.ARCHON_RESOURCE_EXHAUSTED_MAX_WAIT_MS = previousMaxWaitMs;
-      }
-      unsub();
-    }
+    await executeDagWorkflow(
+      deps,
+      platform,
+      'conv-gate-ai',
+      testDir,
+      { name: 'gate-ai-test', nodes: [{ id: 'ai-node', prompt: 'do something' }] },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+    unsub();
 
     // Assert persisted event carries gate_result.
     const eventCalls = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls;

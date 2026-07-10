@@ -925,13 +925,21 @@ export class CodexProvider implements IAgentProvider {
         if (isAuthFailureError(err.message) && this.failbackProviderFactory && !authFailbackUsed) {
           authFailbackUsed = true;
           getLog().warn({ err: err.message }, 'auth_failure_codex_failback');
+          const failbackProvider = this.failbackProviderFactory();
+          yield {
+            type: 'provider_route',
+            route: 'failback',
+            fromProvider: 'codex',
+            ...(requestOptions?.model ? { fromModel: requestOptions.model } : {}),
+            toProvider: failbackProvider.getType(),
+            reasonCode: 'provider_auth_failed',
+          };
           yield {
             type: 'system',
             content:
               '[CODEX FAILBACK] Codex auth failed (credential rotation). Review delegated to ' +
               `${this.failbackLabel}. Reduced cross-model adversarial value -- human review recommended.`,
           };
-          const failbackProvider = this.failbackProviderFactory();
           yield* failbackProvider.sendQuery(
             prompt,
             cwd,
@@ -995,13 +1003,21 @@ export class CodexProvider implements IAgentProvider {
               { errorClass, attempt, originalError: err.message },
               this.failbackEventName
             );
+            const failbackProvider = this.failbackProviderFactory();
+            yield {
+              type: 'provider_route',
+              route: 'failback',
+              fromProvider: 'codex',
+              ...(requestOptions?.model ? { fromModel: requestOptions.model } : {}),
+              toProvider: failbackProvider.getType(),
+              reasonCode: 'provider_unavailable',
+            };
             yield {
               type: 'system',
               content:
                 '[CODEX FAILBACK] Codex unavailable after retries. Review delegated to ' +
                 `${this.failbackLabel}. Reduced cross-model adversarial value -- human review recommended.`,
             };
-            const failbackProvider = this.failbackProviderFactory();
             // Fresh session for the failback (no resume id; failback runs a
             // brand-new conversation against the same prompt/cwd).
             // requestOptions is sanitized: Codex-specific fields (model,
@@ -1029,13 +1045,21 @@ export class CodexProvider implements IAgentProvider {
     // Retry budget exhausted without a thrown error -- also a failback candidate.
     if (this.failbackProviderFactory) {
       getLog().warn({ lastError: lastError?.message }, `${this.failbackEventName}_after_loop_exit`);
+      const failbackProvider = this.failbackProviderFactory();
+      yield {
+        type: 'provider_route',
+        route: 'failback',
+        fromProvider: 'codex',
+        ...(requestOptions?.model ? { fromModel: requestOptions.model } : {}),
+        toProvider: failbackProvider.getType(),
+        reasonCode: 'provider_unavailable',
+      };
       yield {
         type: 'system',
         content:
           '[CODEX FAILBACK] Codex unavailable after retries. Review delegated to ' +
           `${this.failbackLabel}. Reduced cross-model adversarial value -- human review recommended.`,
       };
-      const failbackProvider = this.failbackProviderFactory();
       // Same sanitization rationale as the in-loop failback above:
       // strip Codex-specific model/fallbackModel/assistantConfig so Claude
       // does not receive a Codex model id from requestOptions.

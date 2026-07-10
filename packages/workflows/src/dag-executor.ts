@@ -6,6 +6,7 @@
  * Captures all assistant output regardless of streaming mode for $node_id.output substitution.
  */
 import { chmod, mkdir, readFile, unlink, writeFile } from 'fs/promises';
+import { randomUUID } from 'crypto';
 import { tmpdir } from 'os';
 import { isAbsolute, join, resolve as resolvePath } from 'path';
 import { execFileAsync } from '@archon/git';
@@ -21,6 +22,7 @@ import type {
   NodeConfig,
   ProviderCapabilities,
   TokenUsage,
+  MessageChunk,
 } from '@archon/providers/types';
 import {
   getProviderCapabilities,
@@ -42,6 +44,7 @@ import type {
   ThinkingConfig,
   SandboxSettings,
 } from './schemas';
+import { deriveNodeExecutionRequirements } from './schemas/dag-node';
 import {
   isBashNode,
   isLoopNode,
@@ -98,7 +101,14 @@ import { loadContext } from '@archon/persona-context-loader';
 import { deriveEntryRung, computeFrontierCost } from './model-rates';
 import { isDeclaredServedMatch } from './model-alias';
 import { emitRunTokenTotals } from './token-rollup';
-import type { RunOutcome, TerminalWorkflowPersistence } from './reliability/types';
+import type {
+  ExecutionCapability,
+  OutcomeReasonCode,
+  ProviderAttemptOutcomeClass,
+  ProviderAttemptRecord,
+  RunOutcome,
+  TerminalWorkflowPersistence,
+} from './reliability/types';
 import { withRunLease } from './run-lease';
 
 function cancellationPersistence(
@@ -623,7 +633,7 @@ function isSdkSuccessContradiction(errorMessage: string): boolean {
   return /failed: SDK returned success\b/.test(errorMessage);
 }
 
-type ResourceExhaustedReason = 'zero_work_signature' | 'quota_or_rate_limit_message';
+type ResourceExhaustedReason = 'quota_or_rate_limit_message';
 
 interface ResourceExhaustedInfo {
   reason: ResourceExhaustedReason;
@@ -647,7 +657,127 @@ class ResourceExhaustedPause extends Error {
 
 const RESOURCE_EXHAUSTED_DEFAULT_BACKOFF_MS = [60_000, 300_000, 900_000, 1_800_000];
 const RESOURCE_EXHAUSTED_DEFAULT_CEILING_MS = 6 * 60 * 60 * 1000;
-const resourceExhaustedRetryState = new Map<string, ResourceExhaustedRetryState>();
+const PROVIDER_TOTAL_ATTEMPT_CEILING = 8;
+
+const EXECUTION_CAPABILITY_LEDGER_MAP = {
+  text: 'text_generation',
+  repositoryRead: 'repo_read',
+  repositoryWrite: 'repo_write',
+  shell: 'shell',
+} as const satisfies Record<string, ExecutionCapability>;
+
+function getProviderTotalAttemptCeiling(): number {
+  const configured = Number.parseInt(process.env.ARCHON_PROVIDER_TOTAL_ATTEMPT_CEILING ?? '', 10);
+  return Number.isInteger(configured) && configured > 0
+    ? configured
+    : PROVIDER_TOTAL_ATTEMPT_CEILING;
+}
+
+async function persistProviderRouteChange(
+  deps: WorkflowDeps,
+  runId: string,
+  nodeId: string,
+  attemptId: string,
+  route: Extract<MessageChunk, { type: 'provider_route' }>
+): Promise<void> {
+  await deps.store.createWorkflowEvent({
+    workflow_run_id: runId,
+    event_type: 'node_failover',
+    step_name: nodeId,
+    data: {
+      node_id: nodeId,
+      attempt_id: attemptId,
+      route: route.route,
+      from_provider: route.fromProvider,
+      ...(route.fromModel ? { from_model: route.fromModel } : {}),
+      to_provider: route.toProvider,
+      ...(route.toModel ? { to_model: route.toModel } : {}),
+      reason_code: route.reasonCode,
+    },
+  });
+  getWorkflowEventEmitter().emit({
+    type: 'node_failover',
+    runId,
+    nodeId,
+    fromProvider: route.fromProvider,
+    ...(route.fromModel ? { fromModel: route.fromModel } : {}),
+    toProvider: route.toProvider,
+    ...(route.toModel ? { toModel: route.toModel } : {}),
+    errorClass: route.reasonCode,
+  });
+}
+
+async function beginProviderAttempt(
+  deps: WorkflowDeps,
+  workflowRun: WorkflowRun,
+  node: CommandNode | PromptNode | LoopNode,
+  provider: string,
+  model: string | undefined,
+  declaredModel: string | undefined
+): Promise<ProviderAttemptRecord> {
+  const prior = await deps.store.listProviderAttempts(workflowRun.id, node.id);
+  const ceiling = getProviderTotalAttemptCeiling();
+  if (prior.length >= ceiling) {
+    throw new Error(
+      `provider_attempt_ceiling_exceeded: node '${node.id}' reached ${String(ceiling)} total provider calls`
+    );
+  }
+  const latest = prior.reduce<ProviderAttemptRecord | null>(
+    (current, attempt) =>
+      current === null || attempt.attemptNumber > current.attemptNumber ? attempt : current,
+    null
+  );
+  const requestedModel = model ?? declaredModel ?? 'provider-default';
+  const attempt: ProviderAttemptRecord = {
+    attemptId: randomUUID(),
+    runId: workflowRun.id,
+    nodeId: node.id,
+    attemptNumber: (latest?.attemptNumber ?? 0) + 1,
+    provider,
+    model: requestedModel,
+    declaredProvider: node.provider ?? provider,
+    declaredModel: declaredModel ?? requestedModel,
+    requiredCapabilities: deriveNodeExecutionRequirements(node).map(
+      capability => EXECUTION_CAPABILITY_LEDGER_MAP[capability]
+    ),
+    startedAt: new Date().toISOString(),
+    completedAt: null,
+    servedModelId: null,
+    outcomeClass: null,
+    reasonCode: null,
+    resumeAt: null,
+    supersedesAttemptId: latest?.attemptId ?? null,
+  };
+  if (!(await deps.store.createProviderAttempt(attempt))) {
+    throw new Error(
+      `provider_attempt_persist_failed: could not reserve attempt ${String(attempt.attemptNumber)} for node '${node.id}'`
+    );
+  }
+  return attempt;
+}
+
+async function finishProviderAttempt(
+  deps: WorkflowDeps,
+  attempt: ProviderAttemptRecord,
+  data: {
+    servedModelId: string | null;
+    outcomeClass: ProviderAttemptOutcomeClass;
+    reasonCode: OutcomeReasonCode;
+    resumeAt?: string | null;
+  }
+): Promise<void> {
+  const completed = await deps.store.completeProviderAttempt({
+    attemptId: attempt.attemptId,
+    completedAt: new Date().toISOString(),
+    servedModelId: data.servedModelId,
+    outcomeClass: data.outcomeClass,
+    reasonCode: data.reasonCode,
+    resumeAt: data.resumeAt ?? null,
+  });
+  if (!completed) {
+    throw new Error(`provider_attempt_complete_failed: attempt ${attempt.attemptId}`);
+  }
+}
 
 function parsePositiveIntegerList(value: string | undefined): number[] | undefined {
   if (!value) return undefined;
@@ -684,16 +814,6 @@ function hasPositiveUsage(tokens: TokenUsage | undefined, cost: number | undefin
   return (tokenTotal !== undefined && tokenTotal > 0) || (cost !== undefined && cost > 0);
 }
 
-function isZeroWorkSdkResult(msg: {
-  isError?: boolean;
-  tokens?: TokenUsage;
-  cost?: number;
-}): boolean {
-  if (msg.isError !== true || msg.tokens === undefined || msg.cost !== 0) return false;
-  const total = getTokenTotal(msg.tokens);
-  return total === 0 && msg.tokens.input === 0 && msg.tokens.output === 0;
-}
-
 function stringifySdkFields(msg: {
   errorSubtype?: string;
   errors?: string[];
@@ -705,7 +825,7 @@ function stringifySdkFields(msg: {
 function classifyResourceExhaustionText(text: string): ResourceExhaustedInfo | undefined {
   const normalized = text.toLowerCase();
   if (
-    /you're out of extra usage|out of extra usage|out of credits|credit exhaustion|credit balance|insufficient credit|quota|rate limit|too many requests|\b429\b|overloaded/.test(
+    /you're out of extra usage|out of extra usage|out of credits|credit exhaustion|credit balance|insufficient credit|quota (?:is )?(?:exhausted|depleted)|usage (?:limit|quota).*(?:reached|exhausted)|resume when credits reset/.test(
       normalized
     )
   ) {
@@ -725,22 +845,15 @@ function classifyResourceExhaustedSdkResult(msg: {
   tokens?: TokenUsage;
   cost?: number;
 }): ResourceExhaustedInfo | undefined {
-  if (isZeroWorkSdkResult(msg)) {
-    return {
-      reason: 'zero_work_signature',
-      detail: `SDK error result reported zero tokens, zero cost, subtype ${msg.errorSubtype ?? 'unknown'}`,
-    };
-  }
+  const explicitEvidence = classifyResourceExhaustionText(stringifySdkFields(msg));
+  if (explicitEvidence) return explicitEvidence;
 
-  // Keep real validator failures untouched: once the SDK reports nonzero usage,
-  // this lane is work performed and must remain an ordinary node failure.
+  // Token/cost counters are integrity evidence, not quota evidence. In particular,
+  // the SDK success-contradiction can report zero work with no quota message. That
+  // result gets the one bounded contradiction retry; it must never start a long
+  // provider wait merely because all counters are zero.
   if (hasPositiveUsage(msg.tokens, msg.cost)) return undefined;
-
-  return classifyResourceExhaustionText(stringifySdkFields(msg));
-}
-
-function resourceExhaustedKey(workflowRunId: string, nodeId: string, iteration?: number): string {
-  return `${workflowRunId}:${nodeId}:${iteration ?? 'node'}`;
+  return undefined;
 }
 
 async function emitResourceExhaustedRetry(
@@ -789,10 +902,6 @@ async function emitResourceExhaustedRetry(
         'resource_exhausted_retry_event_persist_failed'
       );
     });
-}
-
-async function sleepResourceExhaustedBackoff(ms: number): Promise<void> {
-  await new Promise(resolve => setTimeout(resolve, ms));
 }
 
 /**
@@ -1441,6 +1550,15 @@ async function executeNodeInternal(
   let nodeIdleTimedOut = false;
   const effectiveIdleTimeout = node.idle_timeout ?? STEP_IDLE_TIMEOUT_MS;
   let lastToolStartedAt: { toolName: string; startedAt: number } | null = null;
+  let providerAttempt = await beginProviderAttempt(
+    deps,
+    workflowRun,
+    node,
+    provider,
+    nodeOptions?.model,
+    declaredModelId
+  );
+  let providerAttemptCompleted = false;
 
   try {
     for await (const msg of withIdleTimeout(
@@ -1499,7 +1617,30 @@ async function executeNodeInternal(
         }
       }
 
-      if (msg.type === 'assistant' && msg.content) {
+      if (msg.type === 'provider_route') {
+        await finishProviderAttempt(deps, providerAttempt, {
+          servedModelId: null,
+          outcomeClass: 'availability',
+          reasonCode: msg.reasonCode,
+        });
+        providerAttemptCompleted = true;
+        await persistProviderRouteChange(
+          deps,
+          workflowRun.id,
+          node.id,
+          providerAttempt.attemptId,
+          msg
+        );
+        providerAttempt = await beginProviderAttempt(
+          deps,
+          workflowRun,
+          node,
+          msg.toProvider,
+          msg.toModel,
+          declaredModelId
+        );
+        providerAttemptCompleted = false;
+      } else if (msg.type === 'assistant' && msg.content) {
         nodeOutputText += msg.content; // ALWAYS capture for $node_id.output
         if (streamingMode === 'stream' || msg.flush) {
           // `flush` chunks (e.g. Pi notify() emitting a plannotator review URL)
@@ -1837,22 +1978,57 @@ async function executeNodeInternal(
       }
     }
 
-    // If the node completed via idle timeout, log it
+    // Idle is absence of progress, not evidence of completion. Persist the
+    // typed attempt outcome and fail closed so failover/climb policy can act.
     if (nodeIdleTimedOut) {
       getLog().warn(
         { nodeId: node.id, timeoutMs: effectiveIdleTimeout },
-        'dag_node_completed_via_idle_timeout'
+        'dag_node_progress_timeout'
       );
+      if (!providerAttemptCompleted) {
+        await finishProviderAttempt(deps, providerAttempt, {
+          servedModelId: nodeServedModelId ?? null,
+          outcomeClass: 'progress',
+          reasonCode: 'progress_timeout',
+        });
+        providerAttemptCompleted = true;
+      }
+      const progressError = `Node '${node.id}' exceeded idle timeout (${String(effectiveIdleTimeout)}ms) without meaningful progress`;
       await safeSendMessage(
         platform,
         conversationId,
-        `! Node \`${node.id}\` completed via idle timeout (no output for ${String(effectiveIdleTimeout / 60000)} min). The AI likely finished but the subprocess didn't exit cleanly.`,
+        `! Node \`${node.id}\` failed its progress deadline after ${String(effectiveIdleTimeout)}ms.`,
         nodeContext
       );
+      const failResult = await handleNodeFailure(
+        { store: deps.store, emitter, log: getLog(), logNodeError },
+        workflowRun,
+        node,
+        {
+          errorMsg: progressError,
+          logDir,
+          outputSoFar: nodeOutputText,
+          hasOutput: nodeOutputText.length > 0,
+          gateResult: { passed: false, nodeType: 'ai' },
+          extraEventData: {
+            reason_code: 'progress_timeout',
+            idle_timeout_ms: effectiveIdleTimeout,
+          },
+        }
+      );
+      return failResult.output;
     }
 
     // If cancelled during streaming (not idle timeout), return as failed with cancel reason
     if (nodeAbortController.signal.aborted && !nodeIdleTimedOut) {
+      if (!providerAttemptCompleted) {
+        await finishProviderAttempt(deps, providerAttempt, {
+          servedModelId: nodeServedModelId ?? null,
+          outcomeClass: 'cancelled',
+          reasonCode: 'attempt_cancelled',
+        });
+        providerAttemptCompleted = true;
+      }
       const duration = Date.now() - nodeStartTime;
       getLog().info(
         { nodeId: node.id, durationMs: duration },
@@ -1926,13 +2102,18 @@ async function executeNodeInternal(
     // Bash/script/approval nodes don't reach this path; they have their
     // own dispatch and never stream through this loop.
     //
-    // Idle-timeout exits are exempt: the timeout warning at line 1017 has
-    // already told the user the node "completed via idle timeout"; flipping
-    // that to a failure here would directly contradict the on-screen message.
-    if (nodeOutputText.trim() === '' && structuredOutput === undefined && !nodeIdleTimedOut) {
+    if (nodeOutputText.trim() === '' && structuredOutput === undefined) {
       const duration = Date.now() - nodeStartTime;
       const emptyError = `Node '${node.id}' produced no assistant output. The provider stream closed without yielding content -- likely a silent provider rejection or stream interruption.`;
       getLog().error({ nodeId: node.id, durationMs: duration }, 'dag.node_empty_output');
+      if (!providerAttemptCompleted) {
+        await finishProviderAttempt(deps, providerAttempt, {
+          servedModelId: nodeServedModelId ?? null,
+          outcomeClass: 'contradiction',
+          reasonCode: 'sdk_contradiction',
+        });
+        providerAttemptCompleted = true;
+      }
 
       const failResult = await handleNodeFailure(
         { store: deps.store, emitter, log: getLog(), logNodeError },
@@ -1953,6 +2134,13 @@ async function executeNodeInternal(
 
       return failResult.output;
     }
+
+    await finishProviderAttempt(deps, providerAttempt, {
+      servedModelId: nodeServedModelId ?? null,
+      outcomeClass: 'success',
+      reasonCode: 'execution_completed',
+    });
+    providerAttemptCompleted = true;
 
     const duration = Date.now() - nodeStartTime;
     getLog().info({ nodeId: node.id, durationMs: duration }, 'dag_node_completed');
@@ -2037,8 +2225,6 @@ async function executeNodeInternal(
     // Clean up throttle entries on completion
     lastNodeCancelCheck.delete(`${workflowRun.id}:${node.id}`);
     lastNodeActivityUpdate.delete(`${workflowRun.id}:${node.id}`);
-    resourceExhaustedRetryState.delete(resourceExhaustedKey(workflowRun.id, node.id));
-
     return {
       state: 'completed',
       output: nodeOutputText,
@@ -2055,77 +2241,130 @@ async function executeNodeInternal(
         : {}),
     };
   } catch (error) {
-    let failureError: unknown = error;
+    const failureError: unknown = error;
+    if (!providerAttemptCompleted && !(error instanceof ResourceExhaustedPause)) {
+      const attemptOutcome: {
+        outcomeClass: ProviderAttemptOutcomeClass;
+        reasonCode: OutcomeReasonCode;
+      } =
+        error instanceof ResourceExhaustedPause
+          ? { outcomeClass: 'quota', reasonCode: 'provider_quota_wait' }
+          : nodeAbortController.signal.aborted && !nodeIdleTimedOut
+            ? { outcomeClass: 'cancelled', reasonCode: 'attempt_cancelled' }
+            : nodeIdleTimedOut
+              ? { outcomeClass: 'progress', reasonCode: 'progress_timeout' }
+              : isSdkSuccessContradiction((error as Error).message)
+                ? { outcomeClass: 'contradiction', reasonCode: 'sdk_contradiction' }
+                : isAvailabilityError((error as Error).message)
+                  ? { outcomeClass: 'availability', reasonCode: 'provider_unavailable' }
+                  : { outcomeClass: 'quality', reasonCode: 'execution_failed' };
+      await finishProviderAttempt(deps, providerAttempt, {
+        servedModelId: nodeServedModelId ?? null,
+        ...attemptOutcome,
+      });
+      providerAttemptCompleted = true;
+    }
     if (error instanceof ResourceExhaustedPause) {
-      const key = resourceExhaustedKey(workflowRun.id, node.id);
       const now = Date.now();
-      const state = resourceExhaustedRetryState.get(key) ?? {
-        firstDetectedAt: now,
-        attempt: 0,
+      const state: ResourceExhaustedRetryState = {
+        firstDetectedAt: new Date(providerAttempt.startedAt).getTime(),
+        attempt: providerAttempt.attemptNumber,
       };
-      state.attempt += 1;
-      resourceExhaustedRetryState.set(key, state);
       const ceilingMs = getResourceExhaustedCeilingMs();
       const backoffMs = getResourceExhaustedBackoffMs(state.attempt);
       const elapsedMs = now - state.firstDetectedAt;
+      const resumeAt = new Date(now + backoffMs).toISOString();
 
       lastNodeCancelCheck.delete(`${workflowRun.id}:${node.id}`);
       lastNodeActivityUpdate.delete(`${workflowRun.id}:${node.id}`);
-
-      if (elapsedMs + backoffMs <= ceilingMs) {
-        getLog().warn(
-          {
-            nodeId: node.id,
-            attempt: state.attempt,
-            backoffMs,
-            elapsedMs,
-            ceilingMs,
-            reason: error.info.reason,
-          },
-          'dag.node_resource_exhausted_retry'
-        );
-        await emitResourceExhaustedRetry(
-          deps,
-          workflowRun.id,
-          node.id,
-          error.info,
-          state,
+      getLog().warn(
+        {
+          nodeId: node.id,
+          attempt: state.attempt,
           backoffMs,
-          ceilingMs
-        );
-        await safeSendMessage(
-          platform,
-          conversationId,
-          `! Node \`${node.id}\` hit provider usage exhaustion (${error.info.reason}); holding for ${String(Math.round(backoffMs / 1000))}s before retry ${String(state.attempt)}.`,
-          nodeContext
-        );
-        await sleepResourceExhaustedBackoff(backoffMs);
-        return executeNodeInternal(
-          deps,
-          platform,
-          conversationId,
-          cwd,
-          workflowRun,
-          node,
-          provider,
-          nodeOptions,
-          declaredModelId,
-          artifactsDir,
-          logDir,
-          baseBranch,
-          docsDir,
-          nodeOutputs,
-          resumeSessionId,
-          configuredCommandFolder,
-          issueContext,
-          personaContextState
-        );
-      }
-
-      resourceExhaustedRetryState.delete(key);
-      failureError = new Error(
-        `resource_exhausted_timeout: provider usage exhaustion persisted beyond ${String(ceilingMs)}ms (${error.info.detail})`
+          elapsedMs,
+          ceilingMs,
+          reason: error.info.reason,
+          resumeAt,
+        },
+        'dag.node_resource_exhausted_wait_scheduled'
       );
+      await finishProviderAttempt(deps, providerAttempt, {
+        servedModelId: nodeServedModelId ?? null,
+        outcomeClass: 'quota',
+        reasonCode: 'provider_quota_wait',
+        resumeAt,
+      });
+      providerAttemptCompleted = true;
+      const waitId = randomUUID();
+      const scheduled = await deps.store.scheduleProviderWait({
+        waitId,
+        runId: workflowRun.id,
+        attemptId: providerAttempt.attemptId,
+        provider,
+        reasonCode: 'provider_quota_wait',
+        resumeAt,
+        state: 'scheduled',
+        claimOwnerId: null,
+        claimToken: null,
+        createdAt: new Date(now).toISOString(),
+        claimedAt: null,
+        cancelledAt: null,
+        completedAt: null,
+      });
+      if (!scheduled) {
+        throw new Error(`provider_wait_schedule_failed: run ${workflowRun.id} node ${node.id}`);
+      }
+      await deps.store.updateWorkflowRun(workflowRun.id, {
+        status: 'waiting_provider',
+        metadata: {
+          provider_wait: {
+            wait_id: waitId,
+            attempt_id: providerAttempt.attemptId,
+            node_id: node.id,
+            provider,
+            reason_code: 'provider_quota_wait',
+            resume_at: resumeAt,
+          },
+        },
+      });
+      const outcomeUpdated = await deps.store.upsertRunOutcome(
+        workflowRun.id,
+        {
+          executionState: 'waiting_provider',
+          deliverableState: 'none',
+          validationState: 'not_run',
+          recoveryState: 'recoverable',
+          routeState: 'exhausted',
+          primaryReason: 'provider_quota_wait',
+          reasonCodes: ['provider_quota_wait'],
+          evidenceRefs: [
+            `run:${workflowRun.id}`,
+            `attempt:${providerAttempt.attemptId}`,
+            `wait:${waitId}`,
+          ],
+        },
+        new Date(now).toISOString()
+      );
+      if (!outcomeUpdated) {
+        throw new Error(`provider_wait_outcome_persist_failed: run ${workflowRun.id}`);
+      }
+      await emitResourceExhaustedRetry(
+        deps,
+        workflowRun.id,
+        node.id,
+        error.info,
+        state,
+        backoffMs,
+        ceilingMs
+      );
+      await safeSendMessage(
+        platform,
+        conversationId,
+        `! Node \`${node.id}\` is waiting for ${provider} usage to recover. The run is durable and will be eligible to resume at ${resumeAt}.`,
+        nodeContext
+      );
+      return { state: 'skipped', output: '' };
     }
 
     const err = failureError as Error;
@@ -3126,6 +3365,8 @@ async function executeLoopNode(
       );
       iterationAbortController.abort();
     }, effectiveWallTimeout);
+    let iterationAttempt: ProviderAttemptRecord | undefined;
+    let iterationAttemptCompleted = false;
 
     try {
       // Build prompt -- substituteWorkflowVariables throws if $BASE_BRANCH referenced but empty
@@ -3154,6 +3395,14 @@ async function executeLoopNode(
         abortSignal: iterationAbortController.signal,
       };
 
+      iterationAttempt = await beginProviderAttempt(
+        deps,
+        workflowRun,
+        node,
+        workflowProvider,
+        resolvedOptions.model,
+        workflowModel
+      );
       const generator = aiClient.sendQuery(finalPrompt, cwd, resumeSessionId, iterationOptions);
       let lastToolStartedAt: { toolName: string; startedAt: number } | null = null;
 
@@ -3166,7 +3415,31 @@ async function executeLoopNode(
         iterationAbortController.abort();
       })) {
         if (iterationWallTimedOut) break;
-        if (msg.type === 'assistant') {
+        if (msg.type === 'provider_route') {
+          if (!iterationAttempt) throw new Error('provider_route_without_attempt');
+          await finishProviderAttempt(deps, iterationAttempt, {
+            servedModelId: null,
+            outcomeClass: 'availability',
+            reasonCode: msg.reasonCode,
+          });
+          iterationAttemptCompleted = true;
+          await persistProviderRouteChange(
+            deps,
+            workflowRun.id,
+            node.id,
+            iterationAttempt.attemptId,
+            msg
+          );
+          iterationAttempt = await beginProviderAttempt(
+            deps,
+            workflowRun,
+            node,
+            msg.toProvider,
+            msg.toModel,
+            workflowModel
+          );
+          iterationAttemptCompleted = false;
+        } else if (msg.type === 'assistant') {
           fullOutput += msg.content;
           // Clean the accumulated buffer, not each provider chunk independently.
           // stripCompletionTags() trims its input, so per-chunk cleaning erased
@@ -3345,56 +3618,110 @@ async function executeLoopNode(
           `Loop '${node.id}' iteration ${String(i)} exceeded wall timeout (${String(effectiveWallTimeout)}ms)`
         );
       } else if (error instanceof ResourceExhaustedPause) {
-        const key = resourceExhaustedKey(workflowRun.id, node.id, i);
+        if (!iterationAttempt) throw error;
         const now = Date.now();
-        const state = resourceExhaustedRetryState.get(key) ?? {
-          firstDetectedAt: now,
-          attempt: 0,
+        const state: ResourceExhaustedRetryState = {
+          firstDetectedAt: new Date(iterationAttempt.startedAt).getTime(),
+          attempt: iterationAttempt.attemptNumber,
         };
-        state.attempt += 1;
-        resourceExhaustedRetryState.set(key, state);
         const ceilingMs = getResourceExhaustedCeilingMs();
         const backoffMs = getResourceExhaustedBackoffMs(state.attempt);
-        const elapsedMs = now - state.firstDetectedAt;
-
-        if (elapsedMs + backoffMs <= ceilingMs) {
-          getLog().warn(
-            {
-              nodeId: node.id,
-              iteration: i,
-              attempt: state.attempt,
-              backoffMs,
-              elapsedMs,
-              ceilingMs,
-              reason: error.info.reason,
-            },
-            'loop_node.iteration_resource_exhausted_retry'
-          );
-          await emitResourceExhaustedRetry(
-            deps,
-            workflowRun.id,
-            node.id,
-            error.info,
-            state,
-            backoffMs,
-            ceilingMs,
-            i
-          );
-          await safeSendMessage(
-            platform,
-            conversationId,
-            `! Loop node \`${node.id}\` iteration ${String(i)} hit provider usage exhaustion (${error.info.reason}); holding for ${String(Math.round(backoffMs / 1000))}s before retry ${String(state.attempt)}.`,
-            msgContext
-          );
-          await sleepResourceExhaustedBackoff(backoffMs);
-          i -= 1;
-          continue;
+        const resumeAt = new Date(now + backoffMs).toISOString();
+        await finishProviderAttempt(deps, iterationAttempt, {
+          servedModelId: loopServedModelId ?? null,
+          outcomeClass: 'quota',
+          reasonCode: 'provider_quota_wait',
+          resumeAt,
+        });
+        iterationAttemptCompleted = true;
+        const waitId = randomUUID();
+        if (
+          !(await deps.store.scheduleProviderWait({
+            waitId,
+            runId: workflowRun.id,
+            attemptId: iterationAttempt.attemptId,
+            provider: workflowProvider,
+            reasonCode: 'provider_quota_wait',
+            resumeAt,
+            state: 'scheduled',
+            claimOwnerId: null,
+            claimToken: null,
+            createdAt: new Date(now).toISOString(),
+            claimedAt: null,
+            cancelledAt: null,
+            completedAt: null,
+          }))
+        ) {
+          throw new Error(`provider_wait_schedule_failed: run ${workflowRun.id} node ${node.id}`);
         }
-
-        resourceExhaustedRetryState.delete(key);
-        failureError = new Error(
-          `resource_exhausted_timeout: provider usage exhaustion persisted beyond ${String(ceilingMs)}ms (${error.info.detail})`
+        await deps.store.updateWorkflowRun(workflowRun.id, {
+          status: 'waiting_provider',
+          metadata: {
+            provider_wait: {
+              wait_id: waitId,
+              attempt_id: iterationAttempt.attemptId,
+              node_id: node.id,
+              iteration: i,
+              provider: workflowProvider,
+              reason_code: 'provider_quota_wait',
+              resume_at: resumeAt,
+            },
+          },
+        });
+        if (
+          !(await deps.store.upsertRunOutcome(
+            workflowRun.id,
+            {
+              executionState: 'waiting_provider',
+              deliverableState: 'none',
+              validationState: 'not_run',
+              recoveryState: 'recoverable',
+              routeState: 'exhausted',
+              primaryReason: 'provider_quota_wait',
+              reasonCodes: ['provider_quota_wait'],
+              evidenceRefs: [
+                `run:${workflowRun.id}`,
+                `attempt:${iterationAttempt.attemptId}`,
+                `wait:${waitId}`,
+              ],
+            },
+            new Date(now).toISOString()
+          ))
+        ) {
+          throw new Error(`provider_wait_outcome_persist_failed: run ${workflowRun.id}`);
+        }
+        await emitResourceExhaustedRetry(
+          deps,
+          workflowRun.id,
+          node.id,
+          error.info,
+          state,
+          backoffMs,
+          ceilingMs,
+          i
         );
+        await safeSendMessage(
+          platform,
+          conversationId,
+          `! Loop node \`${node.id}\` is durably waiting for ${workflowProvider} usage to recover. It is eligible to resume at ${resumeAt}.`,
+          msgContext
+        );
+        return { state: 'skipped', output: '' };
+      }
+
+      if (iterationAttempt && !iterationAttemptCompleted) {
+        const attemptOutcome = iterationWallTimedOut
+          ? ({ outcomeClass: 'progress', reasonCode: 'progress_timeout' } as const)
+          : isSdkSuccessContradiction((failureError as Error).message)
+            ? ({ outcomeClass: 'contradiction', reasonCode: 'sdk_contradiction' } as const)
+            : isAvailabilityError((failureError as Error).message)
+              ? ({ outcomeClass: 'availability', reasonCode: 'provider_unavailable' } as const)
+              : ({ outcomeClass: 'quality', reasonCode: 'execution_failed' } as const);
+        await finishProviderAttempt(deps, iterationAttempt, {
+          servedModelId: loopServedModelId ?? null,
+          ...attemptOutcome,
+        });
+        iterationAttemptCompleted = true;
       }
 
       const err = failureError as Error;
@@ -3440,6 +3767,14 @@ async function executeLoopNode(
 
     // Wall timeout without a thrown abort: fail closed (do not treat as idle success).
     if (iterationWallTimedOut) {
+      if (iterationAttempt && !iterationAttemptCompleted) {
+        await finishProviderAttempt(deps, iterationAttempt, {
+          servedModelId: loopServedModelId ?? null,
+          outcomeClass: 'progress',
+          reasonCode: 'progress_timeout',
+        });
+        iterationAttemptCompleted = true;
+      }
       const wallError = `Loop '${node.id}' iteration ${String(i)} exceeded wall timeout (${String(effectiveWallTimeout)}ms)`;
       const duration = Date.now() - iterationStart;
       getLog().error(
@@ -3481,14 +3816,26 @@ async function executeLoopNode(
       };
     }
 
-    // Notify on idle timeout
+    // An idle timeout is absence of progress, never proof of successful work.
     if (iterationIdleTimedOut) {
-      await safeSendMessage(
-        platform,
-        conversationId,
-        `Loop node '${node.id}' iteration ${String(i)} completed via idle timeout (no output for ${String(effectiveIdleTimeout / 60000)} min)`,
-        msgContext
-      );
+      if (iterationAttempt && !iterationAttemptCompleted) {
+        await finishProviderAttempt(deps, iterationAttempt, {
+          servedModelId: loopServedModelId ?? null,
+          outcomeClass: 'progress',
+          reasonCode: 'progress_timeout',
+        });
+        iterationAttemptCompleted = true;
+      }
+      const idleError = `Loop '${node.id}' iteration ${String(i)} exceeded idle timeout (${String(effectiveIdleTimeout)}ms)`;
+      await safeSendMessage(platform, conversationId, idleError, msgContext);
+      await persistLoopNodeFailed(idleError);
+      return {
+        state: 'failed',
+        output: fullOutput,
+        error: idleError,
+        costUsd: loopTotalCostUsd,
+        ...(loopTotalTokens ? { tokens: loopTotalTokens } : {}),
+      };
     }
 
     // Empty assistant output is an iteration failure for AI loops -- same
@@ -3500,6 +3847,14 @@ async function executeLoopNode(
     // notification above has already told the user the iteration completed
     // via timeout, and flipping that to a failure would contradict it.
     if (!iterationIdleTimedOut && fullOutput.trim() === '') {
+      if (iterationAttempt && !iterationAttemptCompleted) {
+        await finishProviderAttempt(deps, iterationAttempt, {
+          servedModelId: loopServedModelId ?? null,
+          outcomeClass: 'contradiction',
+          reasonCode: 'sdk_contradiction',
+        });
+        iterationAttemptCompleted = true;
+      }
       const iterationDuration = Date.now() - iterationStart;
       const emptyError =
         'Loop iteration produced no assistant output. The provider stream closed without yielding content -- likely a silent provider rejection or stream interruption.';
@@ -3542,12 +3897,20 @@ async function executeLoopNode(
       };
     }
 
+    if (iterationAttempt && !iterationAttemptCompleted) {
+      await finishProviderAttempt(deps, iterationAttempt, {
+        servedModelId: loopServedModelId ?? null,
+        outcomeClass: 'success',
+        reasonCode: 'execution_completed',
+      });
+      iterationAttemptCompleted = true;
+    }
+
     // Batch mode: send accumulated output
     if (platform.getStreamingMode() === 'batch' && cleanOutput) {
       await safeSendMessage(platform, conversationId, cleanOutput, msgContext);
     }
 
-    resourceExhaustedRetryState.delete(resourceExhaustedKey(workflowRun.id, node.id, i));
     lastIterationOutput = cleanOutput || fullOutput;
 
     // Check LLM completion signal -- the AI decides whether the user approved.
