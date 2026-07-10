@@ -15,7 +15,9 @@ interface TestProvider {
 
 function makeHealthApp(runs: TestRun[]): OpenAPIHono {
   const app = new OpenAPIHono();
-  app.get('/api/health', c => c.json({ status: 'ok', running: runs.filter(r => r.status === 'running').length }));
+  app.get('/api/health', c =>
+    c.json({ status: 'ok', running: runs.filter(r => r.status === 'running').length })
+  );
   return app;
 }
 
