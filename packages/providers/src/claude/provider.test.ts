@@ -164,6 +164,7 @@ describe('ClaudeProvider', () => {
     test('returns full capability set for Claude provider', () => {
       const caps = client.getCapabilities();
       expect(caps).toEqual({
+        execution: { text: true, repositoryRead: true, repositoryWrite: true, shell: true },
         sessionResume: true,
         mcp: true,
         hooks: true,

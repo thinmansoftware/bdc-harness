@@ -14,6 +14,17 @@ import { describe, it, expect } from 'bun:test';
 import { readFileSync, readdirSync } from 'fs';
 import { join } from 'path';
 import { parseWorkflow } from './loader';
+import {
+  clearRegistry,
+  getMissingProviderExecutionCapabilities,
+  registerBuiltinProviders,
+  registerCommunityProviders,
+} from '@archon/providers';
+import { deriveNodeExecutionRequirements } from './schemas/dag-node';
+
+clearRegistry();
+registerBuiltinProviders();
+registerCommunityProviders();
 
 const REPO_ROOT = join(import.meta.dir, '..', '..', '..');
 const LANES_DIR = join(REPO_ROOT, '.archon/workflows/defaults');
@@ -46,16 +57,8 @@ describe('lane registration and war-council-validator pin', () => {
     it(`S4a: ${file} passes parseWorkflow() validation`, () => {
       const content = readFileSync(join(LANES_DIR, file), 'utf-8');
       const result = parseWorkflow(content, file);
-      // ParseResult may have a success/error shape -- accept either pattern
-      if (typeof result === 'object' && result !== null && 'errors' in result) {
-        const errors = (result as { errors?: unknown[] }).errors;
-        if (Array.isArray(errors) && errors.length > 0) {
-          throw new Error(`${file} has parseWorkflow errors: ${JSON.stringify(errors)}`);
-        }
-      }
-      // If result has a workflow property, it parsed successfully
-      // If result is the workflow itself (object with name), it parsed successfully
-      expect(result).toBeTruthy();
+      expect(result.error).toBeNull();
+      expect(result.workflow).not.toBeNull();
     });
 
     it(`S4b: ${file} has the expected war-council-validator provider pin`, () => {
@@ -104,6 +107,24 @@ describe('lane registration and war-council-validator pin', () => {
         file === 'bdc-feature-development-fable.yaml' ? 'claude-fable-5' : 'sonnet';
       expect(wcv.provider).toBe('claude');
       expect(wcv.model).toBe(expectedModel);
+    });
+  }
+
+  for (const file of LANE_FILES) {
+    it(`S4c: ${file} never assigns a chat-only provider to a builder or repair seat`, () => {
+      const content = readFileSync(join(LANES_DIR, file), 'utf-8');
+      const result = parseWorkflow(content, file);
+      if (!result.workflow) throw new Error(`${file}: ${result.error?.error ?? 'failed to parse'}`);
+      for (const node of result.workflow.nodes) {
+        if (!['implement', 'diff-repair', 'opus-repair'].includes(node.id)) continue;
+        const provider = node.provider ?? result.workflow.provider;
+        if (!provider) continue;
+        const missing = getMissingProviderExecutionCapabilities(
+          provider,
+          deriveNodeExecutionRequirements(node)
+        );
+        expect(missing, `${file}:${node.id}:${provider}`).toEqual([]);
+      }
     });
   }
 });

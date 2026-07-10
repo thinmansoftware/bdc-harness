@@ -12,6 +12,7 @@ import type {
   ProviderCapabilities,
   ProviderRegistration,
   ProviderInfo,
+  ProviderExecutionCapability,
 } from './types';
 import { ClaudeProvider } from './claude/provider';
 import { CodexProvider } from './codex/provider';
@@ -80,6 +81,15 @@ export function getRegistration(id: string): ProviderRegistration {
  */
 export function getProviderCapabilities(id: string): ProviderCapabilities {
   return getRegistration(id).capabilities;
+}
+
+/** Return required execution capabilities the provider cannot supply. */
+export function getMissingProviderExecutionCapabilities(
+  id: string,
+  required: readonly ProviderExecutionCapability[]
+): ProviderExecutionCapability[] {
+  const execution = getProviderCapabilities(id).execution;
+  return required.filter(capability => !execution[capability]);
 }
 
 /**

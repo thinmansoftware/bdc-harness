@@ -49,13 +49,18 @@ mock.module('@archon/persona-context-loader', () => ({
 }));
 
 // --- Bootstrap provider registry (after path mocks, before dag-executor import) ---
-import { registerBuiltinProviders, clearRegistry } from '@archon/providers';
+import {
+  registerBuiltinProviders,
+  registerCommunityProviders,
+  clearRegistry,
+} from '@archon/providers';
 clearRegistry();
 registerBuiltinProviders();
+registerCommunityProviders();
 
 // --- Imports (after mocks) ---
 import { executeDagWorkflow } from './dag-executor';
-import { isAvailabilityError } from './node-failover';
+import { assertProviderCanExecuteNode, isAvailabilityError } from './node-failover';
 import type { DagNode, WorkflowRun } from './schemas';
 import type { WorkflowDeps, IWorkflowPlatform, WorkflowConfig } from './deps';
 import type { IWorkflowStore } from './store';
@@ -91,6 +96,7 @@ function success(content = 'ok'): Generator<Chunk, void, unknown> {
 }
 
 const CAPS_CLAUDE = () => ({
+  execution: { text: true, repositoryRead: true, repositoryWrite: true, shell: true },
   sessionResume: true,
   mcp: true,
   hooks: true,
@@ -106,6 +112,7 @@ const CAPS_CLAUDE = () => ({
   sandbox: true,
 });
 const CAPS_CODEX = () => ({
+  execution: { text: true, repositoryRead: true, repositoryWrite: true, shell: true },
   sessionResume: true,
   mcp: false,
   hooks: false,
@@ -119,6 +126,24 @@ const CAPS_CODEX = () => ({
   thinkingControl: false,
   fallbackModel: false,
   sandbox: false,
+});
+
+describe('provider execution capability failover guard', () => {
+  it('rejects chat-only failover for a builder node', () => {
+    const node = {
+      id: 'implement',
+      persona: 'major-build',
+      loop: { prompt: 'Implement.', until: 'COMPLETE', max_iterations: 2, fresh_context: true },
+    } as DagNode;
+    expect(() => assertProviderCanExecuteNode('opr-zero', node)).toThrow(
+      'provider_execution_capability_mismatch'
+    );
+  });
+
+  it('allows chat-only failover for a text-only plan node', () => {
+    const node = { id: 'plan', prompt: 'Plan it.' } as DagNode;
+    expect(() => assertProviderCanExecuteNode('opr-zero', node)).not.toThrow();
+  });
 });
 
 /** Per-provider call counters + a provider factory driven by a behavior map. */
@@ -177,6 +202,7 @@ function createMockStore(
     updateWorkflowRun: mock(() => Promise.resolve()),
     updateWorkflowActivity: mock(() => Promise.resolve()),
     getWorkflowRunStatus: mock(() => Promise.resolve('running' as const)),
+    getRunAuthority: mock(() => Promise.resolve(null)),
     completeWorkflowRun: mock(() => Promise.resolve()),
     failWorkflowRun: mock(() => Promise.resolve()),
     pauseWorkflowRun: mock(() => Promise.resolve()),
@@ -220,7 +246,8 @@ afterEach(async () => {
 async function runNode(
   node: DagNode,
   behaviors: Record<string, ProviderBehavior>,
-  runConfig: WorkflowConfig = config
+  runConfig: WorkflowConfig = config,
+  workflowProvider = 'claude'
 ): Promise<{
   calls: Record<string, number>;
   models: Record<string, string | undefined>;
@@ -246,7 +273,7 @@ async function runNode(
     testDir,
     { name: 'failover-test', nodes: [node] },
     run,
-    'claude',
+    workflowProvider,
     undefined,
     join(testDir, 'artifacts'),
     join(testDir, 'logs'),
@@ -292,6 +319,20 @@ describe('isAvailabilityError -- classifier', () => {
 });
 
 describe('node-level availability failover (prompt node)', () => {
+  it('blocks an implicit chat-only workflow provider before initial builder dispatch', async () => {
+    const { calls, events } = await runNode(
+      { id: 'implement', persona: 'major-build', prompt: 'implement the change' } as DagNode,
+      { 'opr-zero': () => success('must not run') },
+      config,
+      'opr-zero'
+    );
+
+    expect(calls['opr-zero'] ?? 0).toBe(0);
+    expect(events.some(e => e.event_type === 'node_failed' && e.step_name === 'implement')).toBe(
+      true
+    );
+  });
+
   it('Scenario 1: availability error -> exactly one failover dispatch -> success + node_failover event', async () => {
     const { calls, events } = await runNode(
       {
@@ -350,6 +391,23 @@ describe('node-level availability failover (prompt node)', () => {
     expect(
       events.filter(e => e.event_type === 'node_failed' && e.step_name === 'plan').length
     ).toBe(2);
+  });
+
+  it('blocks a chat-only failover before dispatching a builder node', async () => {
+    const { calls, events } = await runNode(
+      {
+        id: 'implement',
+        persona: 'major-build',
+        prompt: 'implement the change',
+        provider: 'claude',
+        failover_provider: 'opr-zero',
+      } as DagNode,
+      { claude: availabilityFailure, 'opr-zero': () => success('must not run') }
+    );
+
+    expect(calls.claude).toBe(1);
+    expect(calls['opr-zero'] ?? 0).toBe(0);
+    expect(events.filter(e => e.event_type === 'node_failover')).toHaveLength(0);
   });
 
   it('Scenario 4e: no failover fields -> byte-identical (no failover, no event) on same error', async () => {

@@ -19,6 +19,20 @@
  * below is kept LOCAL to the failover decision for that reason.
  */
 import { classifyError, type ErrorClass } from '@archon/overseer/classify';
+import { getMissingProviderExecutionCapabilities } from '@archon/providers';
+import { deriveNodeExecutionRequirements } from './schemas/dag-node';
+import type { DagNode } from './schemas/dag-node';
+
+/** Fail closed when a runtime-selected provider cannot execute the node. */
+export function assertProviderCanExecuteNode(providerId: string, node: DagNode): void {
+  const required = deriveNodeExecutionRequirements(node);
+  const missing = getMissingProviderExecutionCapabilities(providerId, required);
+  if (missing.length > 0) {
+    throw new Error(
+      `provider_execution_capability_mismatch: provider '${providerId}' cannot execute node '${node.id}'; missing ${missing.join(', ')}`
+    );
+  }
+}
 
 /**
  * Overseer error classes that count as AVAILABILITY -- the only classes that

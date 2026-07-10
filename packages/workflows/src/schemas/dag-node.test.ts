@@ -1,5 +1,65 @@
 import { describe, it, test, expect } from 'bun:test';
-import { dagNodeSchema, approvalNodeSchema, BASH_NODE_AI_FIELDS } from './dag-node';
+import {
+  dagNodeSchema,
+  approvalNodeSchema,
+  BASH_NODE_AI_FIELDS,
+  deriveNodeExecutionRequirements,
+} from './dag-node';
+
+describe('deriveNodeExecutionRequirements', () => {
+  it('keeps a text-only plan eligible for chat providers', () => {
+    const node = dagNodeSchema.parse({ id: 'plan', prompt: 'Plan it.' });
+    expect(deriveNodeExecutionRequirements(node)).toEqual(['text']);
+  });
+
+  it('requires repository execution for a major-build loop', () => {
+    const node = dagNodeSchema.parse({
+      id: 'implement',
+      persona: 'major-build',
+      loop: { prompt: 'Implement it.', until: 'COMPLETE', max_iterations: 3 },
+    });
+    expect(deriveNodeExecutionRequirements(node)).toEqual([
+      'text',
+      'repositoryRead',
+      'repositoryWrite',
+      'shell',
+    ]);
+  });
+
+  it('derives repository requirements from explicit tool declarations', () => {
+    const node = dagNodeSchema.parse({
+      id: 'inspect',
+      prompt: 'Inspect it.',
+      allowed_tools: ['Read', 'Grep'],
+    });
+    expect(deriveNodeExecutionRequirements(node)).toEqual(['text', 'repositoryRead']);
+  });
+
+  it('requires full repository execution for implement commands', () => {
+    const node = dagNodeSchema.parse({ id: 'implement', command: 'implement-changes' });
+    expect(deriveNodeExecutionRequirements(node)).toEqual([
+      'text',
+      'repositoryRead',
+      'repositoryWrite',
+      'shell',
+    ]);
+  });
+
+  it('requires repository execution for canonical repair seats without a persona', () => {
+    const node = dagNodeSchema.parse({ id: 'diff-repair', prompt: 'Apply the fixes.' });
+    expect(deriveNodeExecutionRequirements(node)).toEqual([
+      'text',
+      'repositoryRead',
+      'repositoryWrite',
+      'shell',
+    ]);
+  });
+
+  it('does not attach provider requirements to deterministic bash nodes', () => {
+    const node = dagNodeSchema.parse({ id: 'verify', bash: 'echo ok' });
+    expect(deriveNodeExecutionRequirements(node)).toEqual([]);
+  });
+});
 
 // ---------------------------------------------------------------------------
 // agent: field schema tests

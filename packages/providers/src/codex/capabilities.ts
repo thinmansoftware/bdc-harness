@@ -1,6 +1,7 @@
 import type { ProviderCapabilities } from '../types';
 
 export const CODEX_CAPABILITIES: ProviderCapabilities = {
+  execution: { text: true, repositoryRead: true, repositoryWrite: true, shell: true },
   sessionResume: true,
   mcp: false,
   hooks: false,

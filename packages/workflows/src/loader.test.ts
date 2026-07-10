@@ -29,9 +29,14 @@ mock.module('@archon/paths', () => ({
 }));
 
 // Bootstrap provider registry (needed by isRegisteredProvider checks at load time)
-import { registerBuiltinProviders, clearRegistry } from '@archon/providers';
+import {
+  registerBuiltinProviders,
+  registerCommunityProviders,
+  clearRegistry,
+} from '@archon/providers';
 clearRegistry();
 registerBuiltinProviders();
+registerCommunityProviders();
 
 import { discoverWorkflows } from './workflow-discovery';
 import { getLoaderErrors, parseWorkflow } from './loader';
@@ -2816,5 +2821,65 @@ nodes:
       const result = await discoverWorkflows(testDir, { loadDefaults: false });
       expect(result.workflows.map(ws => ws.workflow.name)).toContain('grouped-lane');
     });
+  });
+});
+
+describe('provider execution capability validation', () => {
+  it('rejects a chat-only provider on a major-build loop', () => {
+    const result = parseWorkflow(
+      `name: unsafe-builder
+description: unsafe builder
+provider: opr
+nodes:
+  - id: implement
+    persona: major-build
+    loop:
+      prompt: Implement it.
+      until: COMPLETE
+      max_iterations: 3
+`,
+      'unsafe-builder.yaml'
+    );
+    expect(result.workflow).toBeNull();
+    expect(result.error?.error).toContain(
+      "provider 'opr' lacks required execution capabilities: repositoryRead, repositoryWrite, shell"
+    );
+  });
+
+  it('keeps a chat-only provider eligible for a text-only plan', () => {
+    const result = parseWorkflow(
+      `name: text-plan
+description: text plan
+provider: opr
+nodes:
+  - id: plan
+    prompt: Produce a plan.
+`,
+      'text-plan.yaml'
+    );
+    expect(result.error).toBeNull();
+    expect(result.workflow?.name).toBe('text-plan');
+  });
+
+  it('rejects a chat-only failover provider for a builder seat', () => {
+    const result = parseWorkflow(
+      `name: unsafe-failover
+description: unsafe failover
+provider: claude
+failover_provider: opr-zero
+nodes:
+  - id: implement
+    persona: major-build
+    loop:
+      prompt: Implement it.
+      until: COMPLETE
+      max_iterations: 3
+`,
+      'unsafe-failover.yaml'
+    );
+    expect(result.workflow).toBeNull();
+    expect(result.error?.error).toContain(
+      "failover provider 'opr-zero' lacks required execution capabilities"
+    );
   });
 });

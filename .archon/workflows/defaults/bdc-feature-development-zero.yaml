@@ -355,8 +355,11 @@ nodes:
     # ALSO holds plan-review + diff-review + diff-review-final on this lane -- this
     # trial has a self-grading confound (it plans/reviews its own implement output).
     # A PASS here is weaker evidence than a clean trial; a FAIL is still informative.
-    provider: opr-zero
-    model: deepseek/deepseek-chat-v3.1
+    # Chat-only opr-zero cannot write files or run tests. Route the builder seat
+    # through the proven OpenRouter local-tool-loop provider instead.
+    provider: grok
+    model: x-ai/grok-4.5
+    persona: major-build-opr
     # WO-HARNESS-NODE-PROVIDER-FAILOVER-01: builder node on OpenRouter. If
     # OpenRouter throttles/drops (429/timeout/5xx/connection), fall SIDEWAYS to
     # Codex once rather than killing the run. Judge/review seats (plan-review,
@@ -957,10 +960,11 @@ nodes:
       printf '{"verdict":"%s"}\n' "$verdict"
 
   - id: diff-repair
-    provider: glm
-    model: qwen/qwen3-coder
-    # WO-HARNESS-NODE-PROVIDER-FAILOVER-01: repair-tier builder node on OpenRouter
-    # (qwen). Same rationale as `implement` above -- fail sideways to Codex once
+    provider: grok
+    model: x-ai/grok-4.5
+    persona: major-build-opr
+    # WO-HARNESS-NODE-PROVIDER-FAILOVER-01: repair-tier builder node on the
+    # OpenRouter local-tool-loop provider. Fail sideways to Codex once
     # on availability errors, never on review/judge seats.
     failover_provider: codex
     failover_model: gpt-5.5
@@ -1189,10 +1193,11 @@ nodes:
   # bothering a human (autonomy ladder step 2). Read-only-ish: it may edit in-scope files to
   # resolve the block, then signals. If it can't fix, the run proceeds to the human pause.
   - id: opus-repair
-    provider: glm
-    model: qwen/qwen3-coder
+    provider: grok
+    model: x-ai/grok-4.5
+    persona: major-build-opr
     # WO-HARNESS-NODE-PROVIDER-FAILOVER-01: last-chance repair builder on
-    # OpenRouter (qwen). Same rationale as `implement`/`diff-repair` above.
+    # OpenRouter local-tool-loop provider. Same rationale as `implement`/`diff-repair` above.
     failover_provider: codex
     failover_model: gpt-5.5
     depends_on: [block-classify]

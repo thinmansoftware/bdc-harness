@@ -128,6 +128,7 @@ describe('CodexProvider', () => {
     test('returns limited capability set for Codex provider', () => {
       const caps = client.getCapabilities();
       expect(caps).toEqual({
+        execution: { text: true, repositoryRead: true, repositoryWrite: true, shell: true },
         sessionResume: true,
         mcp: false,
         hooks: false,

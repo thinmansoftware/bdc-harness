@@ -91,7 +91,7 @@ import {
   isPaperworkNode,
   hasPushArtifact,
 } from './executor-shared';
-import { isAvailabilityError } from './node-failover';
+import { assertProviderCanExecuteNode, isAvailabilityError } from './node-failover';
 import { loadAgentRegistry, resolveAgent } from './agents/registry';
 import type { AgentRegistry } from './agents/registry';
 import { loadContext } from '@archon/persona-context-loader';
@@ -4459,6 +4459,7 @@ async function executeDagWorkflowInternal(
                 ? workflowModel
                 : (loopAssistantConfig?.model as string | undefined));
 
+            assertProviderCanExecuteNode(loopProvider, node);
             let output = await executeLoopNode(
               deps,
               platform,
@@ -4498,6 +4499,7 @@ async function executeDagWorkflowInternal(
                 loopFailoverTarget.model ??
                 (config.assistants[loopFailoverTarget.provider]?.model as string | undefined);
               try {
+                assertProviderCanExecuteNode(loopFailoverTarget.provider, node);
                 emitNodeFailover(
                   deps,
                   workflowRun.id,
@@ -4640,6 +4642,7 @@ async function executeDagWorkflowInternal(
             cwd,
             workflowLevelOptions
           );
+          assertProviderCanExecuteNode(provider, node);
 
           // 5. Determine session -- parallel or context:fresh -> always fresh
           // Parallel layers always get fresh sessions; explicit 'fresh' context also forces it.
@@ -4780,6 +4783,7 @@ async function executeDagWorkflowInternal(
             isAvailabilityError(output.error)
           ) {
             try {
+              assertProviderCanExecuteNode(failoverTarget.provider, node);
               // Clone the node with the failover provider/model and re-run the
               // full resolution path. This re-runs persona resolution against the
               // failover provider, so an incompatible pairing (e.g. codex failover

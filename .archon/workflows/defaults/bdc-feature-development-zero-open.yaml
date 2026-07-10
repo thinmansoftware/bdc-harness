@@ -346,8 +346,10 @@ nodes:
     # ALSO holds plan-review + diff-review + diff-review-final on this lane -- this
     # trial has a self-grading confound (it plans/reviews its own implement output).
     # A PASS here is weaker evidence than a clean trial; a FAIL is still informative.
-    provider: opr-zero
-    model: deepseek/deepseek-chat-v3.1
+    # Builder seats require repository write and shell capabilities.
+    provider: grok
+    model: x-ai/grok-4.5
+    persona: major-build-opr
     depends_on: [capture-run-scope]
     task_class: medium_work
     loop:
@@ -984,8 +986,9 @@ nodes:
       printf '{"verdict":"%s"}\n' "$verdict"
 
   - id: diff-repair
-    provider: opr-zero
-    model: qwen/qwen3-coder
+    provider: grok
+    model: x-ai/grok-4.5
+    persona: major-build-opr
     depends_on: [diff-review, classify-diff-review]
     when: "$classify-diff-review.output.verdict == 'needs_revision'"
     task_class: medium_work
@@ -1226,8 +1229,9 @@ nodes:
   # bothering a human (autonomy ladder step 2). Read-only-ish: it may edit in-scope files to
   # resolve the block, then signals. If it can't fix, the run proceeds to the human pause.
   - id: opus-repair
-    provider: opr-zero
-    model: qwen/qwen3-coder
+    provider: grok
+    model: x-ai/grok-4.5
+    persona: major-build-opr
     depends_on: [block-classify]
     when: "$block-classify.output.status == 'BLOCKED'"
     prompt: |

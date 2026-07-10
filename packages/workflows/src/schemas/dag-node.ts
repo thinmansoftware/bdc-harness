@@ -15,6 +15,7 @@ import { stepRetryConfigSchema } from './retry';
 import { loopNodeConfigSchema } from './loop';
 import { workflowNodeHooksSchema } from './hooks';
 import { isValidCommandName } from '../command-validation';
+import type { ProviderExecutionCapability } from '@archon/providers/types';
 
 // ---------------------------------------------------------------------------
 // TriggerRule
@@ -362,6 +363,60 @@ export type DagNode =
   | ApprovalNode
   | CancelNode
   | ScriptNode;
+
+const REPOSITORY_READ_TOOLS = new Set(['read', 'grep', 'glob', 'search']);
+const REPOSITORY_WRITE_TOOLS = new Set(['edit', 'write', 'applypatch', 'notebookedit']);
+const SHELL_TOOLS = new Set(['bash', 'shell', 'terminal', 'execute']);
+
+/**
+ * Derive the minimum provider execution authority required by an AI node.
+ * This is intentionally mechanical and does not inspect prompt prose. Text-only
+ * planning and review remain eligible for chat providers unless the node declares
+ * repository tools or occupies a known builder/repair seat.
+ */
+export function deriveNodeExecutionRequirements(node: DagNode): ProviderExecutionCapability[] {
+  if (!('command' in node) && !('prompt' in node) && !('loop' in node)) return [];
+
+  const required = new Set<ProviderExecutionCapability>(['text']);
+  const requireRepositoryExecution = (): void => {
+    required.add('repositoryRead');
+    required.add('repositoryWrite');
+    required.add('shell');
+  };
+
+  const persona = (node.persona ?? node.agent ?? '').toLowerCase();
+  const builderPersona = persona === 'major-build' || persona.startsWith('major-build-');
+  const canonicalBuilderSeat = /^(implement|build|.*-repair)$/i.test(node.id);
+  if (canonicalBuilderSeat || (builderPersona && 'loop' in node)) {
+    requireRepositoryExecution();
+  }
+
+  if (
+    'command' in node &&
+    typeof node.command === 'string' &&
+    /(^|[-_/])(implement|repair|build)([-_/]|$)/i.test(node.command)
+  ) {
+    requireRepositoryExecution();
+  }
+
+  for (const rawTool of node.allowed_tools ?? []) {
+    const tool = rawTool.toLowerCase().replace(/[^a-z]/g, '');
+    if (REPOSITORY_READ_TOOLS.has(tool)) required.add('repositoryRead');
+    if (REPOSITORY_WRITE_TOOLS.has(tool)) {
+      required.add('repositoryRead');
+      required.add('repositoryWrite');
+    }
+    if (SHELL_TOOLS.has(tool)) requireRepositoryExecution();
+  }
+
+  const order: readonly ProviderExecutionCapability[] = [
+    'text',
+    'repositoryRead',
+    'repositoryWrite',
+    'shell',
+  ];
+  return order.filter(capability => required.has(capability));
+}
 
 // ---------------------------------------------------------------------------
 // AI-specific fields that are meaningless on non-AI nodes
