@@ -98,6 +98,7 @@ import { loadContext } from '@archon/persona-context-loader';
 import { deriveEntryRung, computeFrontierCost } from './model-rates';
 import { isDeclaredServedMatch } from './model-alias';
 import { emitRunTokenTotals } from './token-rollup';
+import type { RunOutcome } from './reliability/types';
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
 let cachedLog: ReturnType<typeof createLogger> | undefined;
@@ -4935,6 +4936,111 @@ export async function executeDagWorkflow(
   const anyCompleted = nodeCounts.completed > 0;
   const anyFailed = nodeCounts.failed > 0;
 
+  const pushArtifactPresent = [...nodeOutputs.values()].some(o => hasPushArtifact(o.output));
+
+  function makeTerminalOutcome(executionState: 'completed' | 'failed'): RunOutcome {
+    const primaryReason =
+      executionState === 'completed' ? 'execution_completed' : 'execution_failed';
+    return {
+      executionState,
+      deliverableState: pushArtifactPresent ? 'pushed' : 'none',
+      validationState: 'not_run',
+      recoveryState: executionState === 'failed' ? 'recoverable' : 'not_needed',
+      routeState: 'current',
+      primaryReason,
+      reasonCodes: [primaryReason],
+      evidenceRefs: [`run:${workflowRun.id}`],
+    };
+  }
+
+  async function handleTerminalPersistenceFailure(
+    attemptedStatus: 'completed' | 'failed',
+    terminalOutcome: RunOutcome,
+    error: Error
+  ): Promise<void> {
+    const failedAt = new Date().toISOString();
+    getLog().error(
+      { err: error, workflowRunId: workflowRun.id, attemptedStatus },
+      'dag_terminal_persist_failed'
+    );
+    const interruptedOutcome: RunOutcome = {
+      ...terminalOutcome,
+      executionState: 'interrupted',
+      recoveryState: 'recoverable',
+      primaryReason: 'status_persist_failed',
+      reasonCodes: ['status_persist_failed'],
+      evidenceRefs: [...terminalOutcome.evidenceRefs, 'status_persist_failed'],
+    };
+    let currentStatus: Awaited<ReturnType<IWorkflowStore['getWorkflowRunStatus']>> | undefined;
+    try {
+      currentStatus = await deps.store.getWorkflowRunStatus(workflowRun.id);
+    } catch (statusErr) {
+      getLog().error(
+        { err: statusErr as Error, workflowRunId: workflowRun.id, attemptedStatus },
+        'dag_terminal_persist_status_read_failed'
+      );
+    }
+    if (
+      currentStatus === 'completed' ||
+      currentStatus === 'failed' ||
+      currentStatus === 'cancelled' ||
+      currentStatus === 'escalated'
+    ) {
+      getLog().warn(
+        { workflowRunId: workflowRun.id, attemptedStatus, currentStatus },
+        'dag_terminal_persist_already_terminal'
+      );
+      return;
+    }
+    if (currentStatus === 'running') {
+      await deps.store
+        .updateWorkflowRun(workflowRun.id, {
+          status: 'interrupted',
+          metadata: {
+            terminal_persist_failure: {
+              attempted_status: attemptedStatus,
+              reason_code: 'status_persist_failed',
+              failed_at: failedAt,
+            },
+          },
+        })
+        .catch((interruptErr: Error) => {
+          getLog().error(
+            { err: interruptErr, workflowRunId: workflowRun.id, attemptedStatus },
+            'dag_interrupt_status_persist_failed'
+          );
+        });
+      await deps.store
+        .upsertRunOutcome(workflowRun.id, interruptedOutcome, failedAt)
+        .catch((outcomeErr: Error) => {
+          getLog().error(
+            { err: outcomeErr, workflowRunId: workflowRun.id, attemptedStatus },
+            'dag_interrupt_outcome_persist_failed'
+          );
+        });
+    }
+    await deps.store.createWorkflowEvent({
+      workflow_run_id: workflowRun.id,
+      event_type: 'status_persist_failed',
+      data: {
+        attempted_status: attemptedStatus,
+        reason_code: 'status_persist_failed',
+      },
+    });
+    getWorkflowEventEmitter().emit({
+      type: 'status_persist_failed',
+      runId: workflowRun.id,
+      attemptedStatus,
+      reason: 'status_persist_failed',
+    });
+    await safeSendMessage(
+      platform,
+      conversationId,
+      `Warning: workflow terminal state '${attemptedStatus}' could not be saved. The run is recoverable and no terminal success/failure event was published.`,
+      { workflowId: workflowRun.id }
+    );
+  }
+
   getLog().info(
     { nodeCount: workflow.nodes.length, anyCompleted, anyFailed },
     'dag_workflow_finished'
@@ -4945,11 +5051,22 @@ export async function executeDagWorkflow(
     const failMsg =
       `DAG workflow '${workflow.name}' completed with no successful nodes. ` +
       'Check node conditions, trigger rules, and upstream failures.';
-    // Note: nodeCounts not stored for failed runs -- failWorkflowRun only stores { error }.
-    // Frontend guards with isValidNodeCounts so missing node_counts is safe.
-    await deps.store.failWorkflowRun(workflowRun.id, failMsg).catch((dbErr: Error) => {
-      getLog().error({ err: dbErr, workflowRunId: workflowRun.id }, 'dag_db_fail_failed');
-    });
+    const failedOutcome = makeTerminalOutcome('failed');
+    try {
+      await deps.store.failWorkflowRun(workflowRun.id, failMsg, {
+        outcome: failedOutcome,
+        updatedAt: new Date().toISOString(),
+        metadata: { node_counts: nodeCounts, terminal_cause: 'no_successful_nodes' },
+        eventData: {
+          error: failMsg,
+          node_counts: nodeCounts,
+          terminal_cause: 'no_successful_nodes',
+        },
+      });
+    } catch (dbErr) {
+      await handleTerminalPersistenceFailure('failed', failedOutcome, dbErr as Error);
+      return;
+    }
     // Terminal state reached: emit 'run_token_totals' rollup event (see token-rollup.ts).
     emitTerminalRunTokenTotals();
     await logWorkflowError(logDir, workflowRun.id, failMsg).catch((logErr: Error) => {
@@ -4989,39 +5106,46 @@ export async function executeDagWorkflow(
       .filter(([, o]) => o.state === 'failed')
       .map(([id]) => id);
     const allFailuresArePaperwork = failedNodeIds.every(id => isPaperworkNode(id));
-    const pushArtifactPresent = [...nodeOutputs.values()].some(o => hasPushArtifact(o.output));
-
     if (allFailuresArePaperwork && pushArtifactPresent) {
       getLog().warn(
         { workflowRunId: workflowRun.id, degradedPaperworkNodes: failedNodeIds },
         'dag.workflow_completed_paperwork_degraded'
       );
+      const degradedDuration = Date.now() - dagStartTime;
+      const degradedOutcome = makeTerminalOutcome('completed');
       try {
-        await deps.store.completeWorkflowRun(workflowRun.id, {
-          node_counts: nodeCounts,
-          // Degraded-success signal consumed by the dashboard (Section 5 of the
-          // WO): status 'completed' + paperwork_degraded=true, no new enum value.
-          paperwork_degraded: true,
-          degraded_paperwork_nodes: failedNodeIds,
-          ...(totalCostUsd > 0 ? { total_cost_usd: totalCostUsd } : {}),
-          ...(totalTokens > 0 ? { total_tokens: totalTokens } : {}),
-          ...(totalFrontierCostUsd > 0 ? { total_frontier_cost_usd: totalFrontierCostUsd } : {}),
-          ...(nodeModelSummary.length > 0 ? { node_model_summary: nodeModelSummary } : {}),
-          ...(modelMismatchCount > 0 ? { model_mismatch_count: modelMismatchCount } : {}),
-        });
+        await deps.store.completeWorkflowRun(
+          workflowRun.id,
+          {
+            node_counts: nodeCounts,
+            // Degraded-success signal consumed by the dashboard (Section 5 of the
+            // WO): status 'completed' + paperwork_degraded=true, no new enum value.
+            paperwork_degraded: true,
+            degraded_paperwork_nodes: failedNodeIds,
+            ...(totalCostUsd > 0 ? { total_cost_usd: totalCostUsd } : {}),
+            ...(totalTokens > 0 ? { total_tokens: totalTokens } : {}),
+            ...(totalFrontierCostUsd > 0 ? { total_frontier_cost_usd: totalFrontierCostUsd } : {}),
+            ...(nodeModelSummary.length > 0 ? { node_model_summary: nodeModelSummary } : {}),
+            ...(modelMismatchCount > 0 ? { model_mismatch_count: modelMismatchCount } : {}),
+            terminal_cause: 'paperwork_degraded',
+          },
+          {
+            outcome: degradedOutcome,
+            updatedAt: new Date().toISOString(),
+            eventData: {
+              duration_ms: degradedDuration,
+              node_counts: nodeCounts,
+              terminal_cause: 'paperwork_degraded',
+              paperwork_degraded: true,
+              degraded_paperwork_nodes: failedNodeIds,
+            },
+          }
+        );
         // Terminal state reached: emit 'run_token_totals' rollup event.
         emitTerminalRunTokenTotals();
       } catch (dbErr) {
-        getLog().error(
-          { err: dbErr as Error, workflowRunId: workflowRun.id },
-          'dag_db_complete_failed'
-        );
-        await safeSendMessage(
-          platform,
-          conversationId,
-          'Warning: workflow completed (degraded) but the run status could not be saved. The workflow result may appear inconsistent.',
-          { workflowId: workflowRun.id }
-        );
+        await handleTerminalPersistenceFailure('completed', degradedOutcome, dbErr as Error);
+        return;
       }
       await logWorkflowComplete(logDir, workflowRun.id).catch((logErr: Error) => {
         getLog().error(
@@ -5029,7 +5153,6 @@ export async function executeDagWorkflow(
           'dag.workflow_complete_log_write_failed'
         );
       });
-      const degradedDuration = Date.now() - dagStartTime;
       const emitterDegraded = getWorkflowEventEmitter();
       emitterDegraded.emit({
         type: 'workflow_completed',
@@ -5037,22 +5160,6 @@ export async function executeDagWorkflow(
         workflowName: workflow.name,
         duration: degradedDuration,
       });
-      await deps.store
-        .createWorkflowEvent({
-          workflow_run_id: workflowRun.id,
-          event_type: 'workflow_completed',
-          data: {
-            duration_ms: degradedDuration,
-            paperwork_degraded: true,
-            degraded_paperwork_nodes: failedNodeIds,
-          },
-        })
-        .catch((err: Error) => {
-          getLog().error(
-            { err, workflowRunId: workflowRun.id, eventType: 'workflow_completed' },
-            'workflow_event_persist_failed'
-          );
-        });
       emitterDegraded.unregisterRun(workflowRun.id);
       await safeSendMessage(
         platform,
@@ -5068,9 +5175,27 @@ export async function executeDagWorkflow(
       .map(([id, o]) => `'${id}': ${o.state === 'failed' ? o.error : 'unknown'}`)
       .join('; ');
     const failMsg = `DAG workflow '${workflow.name}' completed with failures: ${failedNodes}`;
-    await deps.store.failWorkflowRun(workflowRun.id, failMsg).catch((dbErr: Error) => {
-      getLog().error({ err: dbErr, workflowRunId: workflowRun.id }, 'dag_db_fail_failed');
-    });
+    const failedOutcome = makeTerminalOutcome('failed');
+    try {
+      await deps.store.failWorkflowRun(workflowRun.id, failMsg, {
+        outcome: failedOutcome,
+        updatedAt: new Date().toISOString(),
+        metadata: {
+          node_counts: nodeCounts,
+          terminal_cause: 'node_failures',
+          failed_nodes: failedNodeIds,
+        },
+        eventData: {
+          error: failMsg,
+          node_counts: nodeCounts,
+          terminal_cause: 'node_failures',
+          failed_nodes: failedNodeIds,
+        },
+      });
+    } catch (dbErr) {
+      await handleTerminalPersistenceFailure('failed', failedOutcome, dbErr as Error);
+      return;
+    }
     // Terminal state reached: emit 'run_token_totals' rollup event (see token-rollup.ts).
     emitTerminalRunTokenTotals();
     await logWorkflowError(logDir, workflowRun.id, failMsg).catch((logErr: Error) => {
@@ -5097,41 +5222,46 @@ export async function executeDagWorkflow(
   // Check if status was changed externally (e.g. cancelled) before marking complete.
   if (await skipIfStatusChanged('dag.skip_complete_status_changed')) return;
 
-  // Update DB and emit completion
+  // Persist terminal facts before publishing any terminal event.
+  const duration = Date.now() - dagStartTime;
+  const completedOutcome = makeTerminalOutcome('completed');
   try {
-    await deps.store.completeWorkflowRun(workflowRun.id, {
-      node_counts: nodeCounts,
-      // totalCostUsd starts at 0; only write metadata when at least one node reported cost
-      ...(totalCostUsd > 0 ? { total_cost_usd: totalCostUsd } : {}),
-      // totalTokens starts at 0; only write metadata when at least one node reported tokens
-      ...(totalTokens > 0 ? { total_tokens: totalTokens } : {}),
-      // Layer 1 counterfactual run total (WO-HARNESS-LAYER1-TIER-AND-COUNTERFACTUAL-COST-01).
-      // Only write when at least one node reported tokens; UI computes savings as
-      // total_frontier_cost_usd - total_cost_usd.
-      ...(totalFrontierCostUsd > 0 ? { total_frontier_cost_usd: totalFrontierCostUsd } : {}),
-      // Per-run declared/requested/served model rollup
-      // (WO-HARNESS-TELEMETRY-DECLARED-MODEL-AND-COST-01). Only written when at
-      // least one node reported model telemetry -- deck surfaces 2+3's data
-      // contract; field names are provisional pending the deck-UI WO.
-      ...(nodeModelSummary.length > 0 ? { node_model_summary: nodeModelSummary } : {}),
-      ...(modelMismatchCount > 0 ? { model_mismatch_count: modelMismatchCount } : {}),
-    });
+    await deps.store.completeWorkflowRun(
+      workflowRun.id,
+      {
+        node_counts: nodeCounts,
+        // totalCostUsd starts at 0; only write metadata when at least one node reported cost
+        ...(totalCostUsd > 0 ? { total_cost_usd: totalCostUsd } : {}),
+        // totalTokens starts at 0; only write metadata when at least one node reported tokens
+        ...(totalTokens > 0 ? { total_tokens: totalTokens } : {}),
+        // Layer 1 counterfactual run total (WO-HARNESS-LAYER1-TIER-AND-COUNTERFACTUAL-COST-01).
+        // Only write when at least one node reported tokens; UI computes savings as
+        // total_frontier_cost_usd - total_cost_usd.
+        ...(totalFrontierCostUsd > 0 ? { total_frontier_cost_usd: totalFrontierCostUsd } : {}),
+        // Per-run declared/requested/served model rollup
+        // (WO-HARNESS-TELEMETRY-DECLARED-MODEL-AND-COST-01). Only written when at
+        // least one node reported model telemetry -- deck surfaces 2+3's data
+        // contract; field names are provisional pending the deck-UI WO.
+        ...(nodeModelSummary.length > 0 ? { node_model_summary: nodeModelSummary } : {}),
+        ...(modelMismatchCount > 0 ? { model_mismatch_count: modelMismatchCount } : {}),
+      },
+      {
+        outcome: completedOutcome,
+        updatedAt: new Date().toISOString(),
+        eventData: {
+          duration_ms: duration,
+          node_counts: nodeCounts,
+          terminal_cause: 'all_nodes_satisfied',
+        },
+      }
+    );
     // Terminal state reached: emit 'run_token_totals' rollup event (see token-rollup.ts).
     emitTerminalRunTokenTotals();
   } catch (dbErr) {
-    getLog().error(
-      { err: dbErr as Error, workflowRunId: workflowRun.id },
-      'dag_db_complete_failed'
-    );
-    await safeSendMessage(
-      platform,
-      conversationId,
-      'Warning: workflow completed but the run status could not be saved. The workflow result may appear inconsistent.',
-      { workflowId: workflowRun.id }
-    );
+    await handleTerminalPersistenceFailure('completed', completedOutcome, dbErr as Error);
+    return;
   }
   await logWorkflowComplete(logDir, workflowRun.id);
-  const duration = Date.now() - dagStartTime;
   const emitter = getWorkflowEventEmitter();
   emitter.emit({
     type: 'workflow_completed',
@@ -5139,18 +5269,6 @@ export async function executeDagWorkflow(
     workflowName: workflow.name,
     duration,
   });
-  deps.store
-    .createWorkflowEvent({
-      workflow_run_id: workflowRun.id,
-      event_type: 'workflow_completed',
-      data: { duration_ms: duration },
-    })
-    .catch((err: Error) => {
-      getLog().error(
-        { err, workflowRunId: workflowRun.id, eventType: 'workflow_completed' },
-        'workflow_event_persist_failed'
-      );
-    });
   emitter.unregisterRun(workflowRun.id);
 
   // Return the first terminal node's output (nodes with no dependents) for the parent

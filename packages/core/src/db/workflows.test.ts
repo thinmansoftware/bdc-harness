@@ -3,6 +3,7 @@ import { unlinkSync } from 'fs';
 import { join } from 'path';
 import { createQueryResult, mockPostgresDialect } from '../test/mocks/database';
 import { SqliteAdapter } from './adapters/sqlite';
+import type { IDatabase } from './adapters/types';
 import type { WorkflowRun } from '@archon/workflows/schemas/workflow-run';
 import type {
   ProviderAttemptRecord,
@@ -10,9 +11,20 @@ import type {
   RunLeaseRecord,
   RunOutcome,
   ScheduledProviderWaitRecord,
+  TerminalWorkflowPersistence,
 } from '@archon/workflows/reliability/types';
 
 const mockQuery = mock(() => Promise.resolve(createQueryResult([])));
+const mockTransactionQuery = mock(() => Promise.resolve(createQueryResult([])));
+const mockWithTransaction = mock((fn: (query: typeof mockTransactionQuery) => Promise<unknown>) =>
+  fn(mockTransactionQuery)
+);
+const defaultMockDatabase = {
+  dialect: 'postgres' as const,
+  sql: mockPostgresDialect,
+  withTransaction: mockWithTransaction,
+};
+let activeDatabase: Pick<IDatabase, 'dialect' | 'sql' | 'withTransaction'> = defaultMockDatabase;
 
 // Mock the connection module before importing the module under test
 mock.module('./connection', () => ({
@@ -21,6 +33,7 @@ mock.module('./connection', () => ({
   },
   getDialect: () => mockPostgresDialect,
   getDatabaseType: () => 'postgresql' as const,
+  getDatabase: () => activeDatabase,
 }));
 
 import {
@@ -55,12 +68,17 @@ import {
   claimProviderWait,
   cancelProviderWaits,
   completeProviderWait,
+  reconcileTerminalWorkflowRuns,
 } from './workflows';
 
 describe('workflows database', () => {
   beforeEach(() => {
     mockQuery.mockReset();
     mockQuery.mockImplementation(() => Promise.resolve(createQueryResult([])));
+    mockTransactionQuery.mockReset();
+    mockTransactionQuery.mockImplementation(() => Promise.resolve(createQueryResult([])));
+    mockWithTransaction.mockClear();
+    activeDatabase = defaultMockDatabase;
   });
 
   const mockWorkflowRun: WorkflowRun = {
@@ -283,6 +301,103 @@ describe('workflows database', () => {
   });
 
   describe('completeWorkflowRun', () => {
+    test('atomically persists outcome, legacy status, and terminal event before returning', async () => {
+      const terminal: TerminalWorkflowPersistence = {
+        outcome: {
+          executionState: 'completed',
+          deliverableState: 'none',
+          validationState: 'not_run',
+          recoveryState: 'not_needed',
+          routeState: 'current',
+          primaryReason: 'execution_completed',
+          reasonCodes: ['execution_completed'],
+          evidenceRefs: ['run:workflow-run-123'],
+        },
+        updatedAt: '2026-07-09T18:00:00.000Z',
+        eventData: { duration_ms: 100 },
+      };
+      mockTransactionQuery
+        .mockResolvedValueOnce(createQueryResult([{ status: 'running' }], 1))
+        .mockResolvedValueOnce(createQueryResult([{ run_id: 'workflow-run-123' }], 1))
+        .mockResolvedValueOnce(createQueryResult([], 1))
+        .mockResolvedValueOnce(createQueryResult([], 1));
+
+      await completeWorkflowRun('workflow-run-123', { node_counts: { total: 1 } }, terminal);
+
+      expect(mockWithTransaction).toHaveBeenCalledTimes(1);
+      const queries = mockTransactionQuery.mock.calls.map(call => call[0] as string);
+      expect(queries[0]).toContain('SELECT status');
+      expect(queries[1]).toContain('remote_agent_run_outcomes');
+      expect(queries[2]).toContain('remote_agent_workflow_runs');
+      expect(queries[3]).toContain('remote_agent_workflow_events');
+      expect(mockQuery).not.toHaveBeenCalled();
+    });
+
+    test('propagates an atomic terminal event failure without falling back to legacy writes', async () => {
+      const terminal: TerminalWorkflowPersistence = {
+        outcome: {
+          executionState: 'completed',
+          deliverableState: 'none',
+          validationState: 'not_run',
+          recoveryState: 'not_needed',
+          routeState: 'current',
+          primaryReason: 'execution_completed',
+          reasonCodes: ['execution_completed'],
+          evidenceRefs: ['run:workflow-run-123'],
+        },
+        updatedAt: '2026-07-09T18:00:00.000Z',
+        eventData: { duration_ms: 100 },
+      };
+      mockTransactionQuery
+        .mockResolvedValueOnce(createQueryResult([{ status: 'running' }], 1))
+        .mockResolvedValueOnce(createQueryResult([{ run_id: 'workflow-run-123' }], 1))
+        .mockResolvedValueOnce(createQueryResult([], 1))
+        .mockRejectedValueOnce(new Error('event insert failed'));
+
+      await expect(
+        completeWorkflowRun('workflow-run-123', { node_counts: { total: 1 } }, terminal)
+      ).rejects.toThrow('event insert failed');
+      expect(mockWithTransaction).toHaveBeenCalledTimes(1);
+      expect(mockQuery).not.toHaveBeenCalled();
+    });
+
+    test('rejects a changed outcome when retrying an already-terminal finalization', async () => {
+      const terminal: TerminalWorkflowPersistence = {
+        outcome: {
+          executionState: 'completed',
+          deliverableState: 'none',
+          validationState: 'not_run',
+          recoveryState: 'not_needed',
+          routeState: 'current',
+          primaryReason: 'execution_completed',
+          reasonCodes: ['execution_completed'],
+          evidenceRefs: ['run:workflow-run-123'],
+        },
+        updatedAt: '2026-07-09T18:00:00.000Z',
+        eventData: { duration_ms: 100 },
+      };
+      mockTransactionQuery
+        .mockResolvedValueOnce(createQueryResult([{ status: 'completed' }], 1))
+        .mockResolvedValueOnce(
+          createQueryResult([
+            {
+              execution_state: 'completed',
+              deliverable_state: 'pushed',
+              validation_state: 'not_run',
+              recovery_state: 'not_needed',
+              route_state: 'current',
+              primary_reason: 'execution_completed',
+              reason_codes: ['execution_completed'],
+              evidence_refs: ['run:workflow-run-123'],
+            },
+          ])
+        );
+
+      await expect(
+        completeWorkflowRun('workflow-run-123', { node_counts: { total: 1 } }, terminal)
+      ).rejects.toThrow('terminal_outcome_conflict');
+    });
+
     test('marks workflow run as completed', async () => {
       mockQuery.mockResolvedValueOnce(createQueryResult([], 1));
 
@@ -331,6 +446,44 @@ describe('workflows database', () => {
   });
 
   describe('failWorkflowRun', () => {
+    test('atomically stores failed node counts, terminal cause, outcome, and event', async () => {
+      const terminal: TerminalWorkflowPersistence = {
+        outcome: {
+          executionState: 'failed',
+          deliverableState: 'worktree_changes',
+          validationState: 'not_run',
+          recoveryState: 'recoverable',
+          routeState: 'current',
+          primaryReason: 'execution_failed',
+          reasonCodes: ['execution_failed'],
+          evidenceRefs: ['run:workflow-run-123'],
+        },
+        updatedAt: '2026-07-09T18:00:00.000Z',
+        metadata: {
+          node_counts: { completed: 1, failed: 1, skipped: 0, total: 2 },
+          terminal_cause: 'node_failures',
+        },
+        eventData: { terminal_cause: 'node_failures' },
+      };
+      mockTransactionQuery
+        .mockResolvedValueOnce(createQueryResult([{ status: 'running' }], 1))
+        .mockResolvedValueOnce(createQueryResult([{ run_id: 'workflow-run-123' }], 1))
+        .mockResolvedValueOnce(createQueryResult([], 1))
+        .mockResolvedValueOnce(createQueryResult([], 1));
+
+      await failWorkflowRun('workflow-run-123', 'implement failed', terminal);
+
+      const updateCall = mockTransactionQuery.mock.calls[2] as [string, unknown[]];
+      expect(updateCall[0]).toContain('remote_agent_workflow_runs');
+      expect(JSON.parse(updateCall[1][1] as string)).toEqual({
+        error: 'implement failed',
+        node_counts: { completed: 1, failed: 1, skipped: 0, total: 2 },
+        terminal_cause: 'node_failures',
+      });
+      const eventCall = mockTransactionQuery.mock.calls[3] as [string, unknown[]];
+      expect(eventCall[1][1]).toBe('workflow_failed');
+    });
+
     test('marks workflow run as failed with error', async () => {
       mockQuery.mockResolvedValueOnce(createQueryResult([], 1));
 
@@ -1014,6 +1167,10 @@ describe('Smart Cauldron reliability persistence', () => {
   beforeEach(() => {
     mockQuery.mockReset();
     mockQuery.mockImplementation(() => Promise.resolve(createQueryResult([])));
+    mockTransactionQuery.mockReset();
+    mockTransactionQuery.mockImplementation(() => Promise.resolve(createQueryResult([])));
+    mockWithTransaction.mockClear();
+    activeDatabase = defaultMockDatabase;
   });
 
   const authority: RunAuthorityRecord = {
@@ -1317,6 +1474,7 @@ describe('Smart Cauldron reliability persistence', () => {
       `.test-reliability-${Date.now()}-${Math.random().toString(36).slice(2)}.db`
     );
     const sqlite = new SqliteAdapter(dbPath);
+    activeDatabase = sqlite;
     mockQuery.mockImplementation((sql: string, params?: unknown[]) => sqlite.query(sql, params));
 
     try {
@@ -1411,6 +1569,38 @@ describe('Smart Cauldron reliability persistence', () => {
           releasedAt: '2026-07-09T17:00:01.000Z',
         })
       ).resolves.toBe(true);
+
+      const terminal: TerminalWorkflowPersistence = {
+        outcome: {
+          executionState: 'completed',
+          deliverableState: 'worktree_changes',
+          validationState: 'not_run',
+          recoveryState: 'not_needed',
+          routeState: 'current',
+          primaryReason: 'execution_completed',
+          reasonCodes: ['execution_completed'],
+          evidenceRefs: [`run:${authority.runId}`],
+        },
+        updatedAt: '2026-07-09T18:00:00.000Z',
+        eventData: { duration_ms: 100, terminal_cause: 'test' },
+      };
+      const terminalMetadata = {
+        node_counts: { completed: 1, failed: 0, skipped: 0, total: 1 },
+      };
+      await completeWorkflowRun(authority.runId, terminalMetadata, terminal);
+      await completeWorkflowRun(authority.runId, terminalMetadata, terminal);
+
+      const finalizedRun = await sqlite.query<{ status: string }>(
+        'SELECT status FROM remote_agent_workflow_runs WHERE id = $1',
+        [authority.runId]
+      );
+      expect(finalizedRun.rows[0]?.status).toBe('completed');
+      const terminalEvents = await sqlite.query<{ count: number }>(
+        `SELECT COUNT(*) AS count FROM remote_agent_workflow_events
+         WHERE workflow_run_id = $1 AND event_type = 'workflow_completed'`,
+        [authority.runId]
+      );
+      expect(terminalEvents.rows[0]?.count).toBe(1);
     } finally {
       await sqlite.close();
       for (const suffix of ['', '-wal', '-shm']) {
@@ -1421,5 +1611,46 @@ describe('Smart Cauldron reliability persistence', () => {
         }
       }
     }
+  });
+
+  test('reconciles durable terminal evidence and reports contradictions without guessing', async () => {
+    mockTransactionQuery.mockResolvedValueOnce(
+      createQueryResult([
+        {
+          id: 'run-outcome',
+          status: 'running',
+          execution_state: 'completed',
+          route_state: 'current',
+          terminal_event: null,
+        },
+        {
+          id: 'run-event',
+          status: 'running',
+          execution_state: null,
+          route_state: null,
+          terminal_event: 'workflow_failed',
+        },
+        {
+          id: 'run-conflict',
+          status: 'running',
+          execution_state: 'completed',
+          route_state: 'current',
+          terminal_event: 'workflow_failed',
+        },
+      ])
+    );
+    mockTransactionQuery.mockImplementation(() => Promise.resolve(createQueryResult([], 1)));
+
+    await expect(reconcileTerminalWorkflowRuns('2026-07-09T19:00:00.000Z')).resolves.toEqual({
+      scanned: 3,
+      repaired: 2,
+      conflicts: 1,
+    });
+
+    const updates = mockTransactionQuery.mock.calls.filter(call =>
+      (call[0] as string).includes('UPDATE remote_agent_workflow_runs')
+    );
+    expect(updates).toHaveLength(2);
+    expect(updates.map(call => (call[1] as unknown[])[0]).sort()).toEqual(['completed', 'failed']);
   });
 });

@@ -1,7 +1,7 @@
 /**
  * Database operations for workflow runs
  */
-import { pool, getDialect, getDatabaseType } from './connection';
+import { pool, getDatabase, getDialect, getDatabaseType } from './connection';
 import type { IDatabase } from './adapters/types';
 import type {
   WorkflowRun,
@@ -17,6 +17,7 @@ import type {
   RunLeaseRecord,
   RunOutcome,
   ScheduledProviderWaitRecord,
+  TerminalWorkflowPersistence,
 } from '@archon/workflows/reliability/types';
 import { createLogger } from '@archon/paths';
 
@@ -221,6 +222,21 @@ function normalizeRunOutcome(row: RunOutcomeRow): RunOutcome {
     reasonCodes: parseJsonArray<RunOutcome['primaryReason']>(row.reason_codes),
     evidenceRefs: parseJsonArray<string>(row.evidence_refs),
   };
+}
+
+function runOutcomesEqual(left: RunOutcome, right: RunOutcome): boolean {
+  return (
+    left.executionState === right.executionState &&
+    left.deliverableState === right.deliverableState &&
+    left.validationState === right.validationState &&
+    left.recoveryState === right.recoveryState &&
+    left.routeState === right.routeState &&
+    left.primaryReason === right.primaryReason &&
+    left.reasonCodes.length === right.reasonCodes.length &&
+    left.reasonCodes.every((value, index) => value === right.reasonCodes[index]) &&
+    left.evidenceRefs.length === right.evidenceRefs.length &&
+    left.evidenceRefs.every((value, index) => value === right.evidenceRefs[index])
+  );
 }
 
 function normalizeScheduledProviderWait(
@@ -1047,10 +1063,121 @@ export async function updateWorkflowRun(
   }
 }
 
+async function persistTerminalWorkflowRun(
+  id: string,
+  status: 'completed' | 'failed',
+  metadata: Record<string, unknown>,
+  terminal: TerminalWorkflowPersistence
+): Promise<void> {
+  const db = getDatabase();
+  const dialect = db.sql;
+  await db.withTransaction(async query => {
+    const lockSuffix = db.dialect === 'postgres' ? ' FOR UPDATE' : '';
+    const runResult = await query<{ status: string }>(
+      `SELECT status FROM remote_agent_workflow_runs WHERE id = $1${lockSuffix}`,
+      [id]
+    );
+    const currentStatus = runResult.rows[0]?.status;
+    if (!currentStatus) throw new Error(`Workflow run not found (id: ${id})`);
+    if (currentStatus !== 'running' && currentStatus !== status) {
+      throw new Error(
+        `terminal_status_conflict: run ${id} is ${currentStatus}, cannot finalize as ${status}`
+      );
+    }
+
+    const outcome = terminal.outcome;
+    let outcomeAlreadyPersisted = false;
+    if (currentStatus === status) {
+      const existingOutcomeResult = await query<RunOutcomeRow>(
+        'SELECT * FROM remote_agent_run_outcomes WHERE run_id = $1',
+        [id]
+      );
+      const existingOutcomeRow = existingOutcomeResult.rows[0];
+      if (existingOutcomeRow) {
+        if (!runOutcomesEqual(normalizeRunOutcome(existingOutcomeRow), outcome)) {
+          throw new Error(`terminal_outcome_conflict: immutable outcome differs for run ${id}`);
+        }
+        outcomeAlreadyPersisted = true;
+      }
+    }
+
+    const outcomeResult = outcomeAlreadyPersisted
+      ? { rows: [{ run_id: id }], rowCount: 1 }
+      : await query<{ run_id: string }>(
+          `INSERT INTO remote_agent_run_outcomes
+       (run_id, execution_state, deliverable_state, validation_state, recovery_state,
+        route_state, primary_reason, reason_codes, evidence_refs, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+       ON CONFLICT (run_id) DO UPDATE SET
+         execution_state = EXCLUDED.execution_state,
+         deliverable_state = EXCLUDED.deliverable_state,
+         validation_state = EXCLUDED.validation_state,
+         recovery_state = EXCLUDED.recovery_state,
+         route_state = EXCLUDED.route_state,
+         primary_reason = EXCLUDED.primary_reason,
+         reason_codes = EXCLUDED.reason_codes,
+         evidence_refs = EXCLUDED.evidence_refs,
+         updated_at = EXCLUDED.updated_at
+       WHERE remote_agent_run_outcomes.updated_at <= EXCLUDED.updated_at
+       RETURNING run_id`,
+          [
+            id,
+            outcome.executionState,
+            outcome.deliverableState,
+            outcome.validationState,
+            outcome.recoveryState,
+            outcome.routeState,
+            outcome.primaryReason,
+            JSON.stringify(outcome.reasonCodes),
+            JSON.stringify(outcome.evidenceRefs),
+            terminal.updatedAt,
+          ]
+        );
+    if (outcomeResult.rows.length !== 1) {
+      throw new Error(`terminal_outcome_conflict: newer outcome already exists for run ${id}`);
+    }
+
+    if (currentStatus === 'running') {
+      const updateResult = await query(
+        `UPDATE remote_agent_workflow_runs
+         SET status = $1, completed_at = ${dialect.now()},
+             metadata = ${dialect.jsonMerge('metadata', 2)}
+         WHERE id = $3 AND status = 'running'`,
+        [status, JSON.stringify(metadata), id]
+      );
+      if (updateResult.rowCount !== 1) {
+        throw new Error(`terminal_status_conflict: run ${id} changed during finalization`);
+      }
+    }
+
+    const eventType = status === 'completed' ? 'workflow_completed' : 'workflow_failed';
+    await query(
+      `INSERT INTO remote_agent_workflow_events (workflow_run_id, event_type, data)
+       SELECT $1, $2, $3
+       WHERE NOT EXISTS (
+         SELECT 1 FROM remote_agent_workflow_events
+         WHERE workflow_run_id = $1 AND event_type = $2
+       )`,
+      [id, eventType, JSON.stringify(terminal.eventData)]
+    );
+  });
+}
+
 export async function completeWorkflowRun(
   id: string,
-  metadata?: Record<string, unknown>
+  metadata?: Record<string, unknown>,
+  terminal?: TerminalWorkflowPersistence
 ): Promise<void> {
+  if (terminal) {
+    try {
+      await persistTerminalWorkflowRun(id, 'completed', metadata ?? {}, terminal);
+      return;
+    } catch (error) {
+      const err = error as Error;
+      getLog().error({ err }, 'db.workflow_run_terminal_complete_failed');
+      throw new Error(`Failed to complete workflow run: ${err.message}`);
+    }
+  }
   const dialect = getDialect();
   let result: Awaited<ReturnType<IDatabase['query']>>;
   try {
@@ -1080,7 +1207,26 @@ export async function completeWorkflowRun(
   }
 }
 
-export async function failWorkflowRun(id: string, error: string): Promise<void> {
+export async function failWorkflowRun(
+  id: string,
+  error: string,
+  terminal?: TerminalWorkflowPersistence
+): Promise<void> {
+  if (terminal) {
+    try {
+      await persistTerminalWorkflowRun(
+        id,
+        'failed',
+        { error, ...(terminal.metadata ?? {}) },
+        terminal
+      );
+      return;
+    } catch (dbError) {
+      const err = dbError as Error;
+      getLog().error({ err }, 'db.workflow_run_terminal_fail_failed');
+      throw new Error(`Failed to fail workflow run: ${err.message}`);
+    }
+  }
   const dialect = getDialect();
   let result: Awaited<ReturnType<IDatabase['query']>>;
   try {
@@ -1099,6 +1245,171 @@ export async function failWorkflowRun(id: string, error: string): Promise<void> 
     getLog().warn({ workflowRunId: id }, 'db.workflow_run_fail_no_match');
     throw new Error(`Workflow run not found or not in running state (id: ${id})`);
   }
+}
+
+interface TerminalMismatchRow {
+  id: string;
+  status: string;
+  execution_state: string | null;
+  route_state: string | null;
+  terminal_event: string | null;
+}
+
+type ReconciledTerminalStatus = 'completed' | 'failed' | 'cancelled' | 'escalated';
+
+function terminalStatusFromOutcome(row: TerminalMismatchRow): ReconciledTerminalStatus | null {
+  if (row.execution_state === 'completed') return 'completed';
+  if (row.execution_state === 'cancelled') return 'cancelled';
+  if (row.execution_state === 'failed') {
+    return row.route_state === 'escalated' ? 'escalated' : 'failed';
+  }
+  return null;
+}
+
+function terminalStatusFromEvent(eventType: string | null): ReconciledTerminalStatus | null {
+  if (eventType === 'workflow_completed') return 'completed';
+  if (eventType === 'workflow_failed') return 'failed';
+  if (eventType === 'workflow_cancelled') return 'cancelled';
+  return null;
+}
+
+/**
+ * Repair historical terminal event/status gaps created before atomic finalization.
+ * Contradictory durable evidence is reported and left untouched.
+ */
+export async function reconcileTerminalWorkflowRuns(
+  reconciledAt = new Date().toISOString()
+): Promise<{ scanned: number; repaired: number; conflicts: number }> {
+  const db = getDatabase();
+  return db.withTransaction(async query => {
+    const result = await query<TerminalMismatchRow>(
+      `WITH candidates AS (
+         SELECT r.id, r.status, o.execution_state, o.route_state,
+           (SELECT e.event_type
+            FROM remote_agent_workflow_events e
+            WHERE e.workflow_run_id = r.id
+              AND e.event_type IN ('workflow_completed', 'workflow_failed', 'workflow_cancelled')
+            ORDER BY e.created_at DESC, e.id DESC LIMIT 1) AS terminal_event
+         FROM remote_agent_workflow_runs r
+         LEFT JOIN remote_agent_run_outcomes o ON o.run_id = r.id
+       )
+       SELECT * FROM candidates
+       WHERE
+         (status IN ('completed', 'failed', 'cancelled', 'escalated') AND
+           (execution_state IS NULL OR
+            (status <> 'escalated' AND terminal_event IS NULL)))
+         OR (status NOT IN ('completed', 'failed', 'cancelled', 'escalated') AND
+           (execution_state IN ('completed', 'failed', 'cancelled') OR terminal_event IS NOT NULL))
+         OR (status = 'completed' AND execution_state IS NOT NULL AND execution_state <> 'completed')
+         OR (status = 'failed' AND execution_state IS NOT NULL AND execution_state <> 'failed')
+         OR (status = 'cancelled' AND execution_state IS NOT NULL AND execution_state <> 'cancelled')
+         OR (status = 'escalated' AND
+           (execution_state IS NOT NULL AND execution_state <> 'failed' OR
+            route_state IS NULL OR route_state <> 'escalated'))
+         OR (terminal_event = 'workflow_completed' AND execution_state IS NOT NULL AND execution_state <> 'completed')
+         OR (terminal_event = 'workflow_failed' AND execution_state IS NOT NULL AND execution_state <> 'failed')
+         OR (terminal_event = 'workflow_cancelled' AND execution_state IS NOT NULL AND execution_state <> 'cancelled')`
+    );
+
+    let repaired = 0;
+    let conflicts = 0;
+    const terminalStatuses = new Set<ReconciledTerminalStatus>([
+      'completed',
+      'failed',
+      'cancelled',
+      'escalated',
+    ]);
+
+    for (const row of result.rows) {
+      const statusTarget = terminalStatuses.has(row.status as ReconciledTerminalStatus)
+        ? (row.status as ReconciledTerminalStatus)
+        : null;
+      const outcomeTarget = terminalStatusFromOutcome(row);
+      const eventTarget = terminalStatusFromEvent(row.terminal_event);
+      const targets = new Set(
+        [statusTarget, outcomeTarget, eventTarget].filter(
+          (value): value is ReconciledTerminalStatus => value !== null
+        )
+      );
+      if (targets.size !== 1) {
+        conflicts += 1;
+        continue;
+      }
+      const target = [...targets][0];
+
+      if (!outcomeTarget) {
+        const executionState = target === 'escalated' ? 'failed' : target;
+        const routeState = target === 'escalated' ? 'escalated' : 'current';
+        const primaryReason =
+          target === 'completed'
+            ? 'execution_completed'
+            : target === 'cancelled'
+              ? 'cancelled_by_operator'
+              : target === 'escalated'
+                ? 'gate_rejection_with_successor'
+                : 'execution_failed';
+        await query(
+          `INSERT INTO remote_agent_run_outcomes
+           (run_id, execution_state, deliverable_state, validation_state, recovery_state,
+            route_state, primary_reason, reason_codes, evidence_refs, updated_at)
+           VALUES ($1, $2, 'none', 'not_run', $3, $4, $5, $6, $7, $8)
+           ON CONFLICT (run_id) DO NOTHING`,
+          [
+            row.id,
+            executionState,
+            target === 'failed' || target === 'escalated' ? 'recoverable' : 'not_needed',
+            routeState,
+            primaryReason,
+            JSON.stringify([primaryReason]),
+            JSON.stringify([`reconciled:${row.terminal_event ?? row.status}`]),
+            reconciledAt,
+          ]
+        );
+      }
+
+      if (!statusTarget) {
+        const update = await query(
+          `UPDATE remote_agent_workflow_runs
+           SET status = $1, completed_at = COALESCE(completed_at, ${db.sql.now()})
+           WHERE id = $2 AND status NOT IN ('completed', 'failed', 'cancelled', 'escalated')`,
+          [target, row.id]
+        );
+        if (update.rowCount !== 1) {
+          conflicts += 1;
+          continue;
+        }
+      }
+
+      if (!eventTarget && target !== 'escalated') {
+        const eventType =
+          target === 'completed'
+            ? 'workflow_completed'
+            : target === 'cancelled'
+              ? 'workflow_cancelled'
+              : 'workflow_failed';
+        await query(
+          `INSERT INTO remote_agent_workflow_events (workflow_run_id, event_type, data)
+           SELECT $1, $2, $3
+           WHERE NOT EXISTS (
+             SELECT 1 FROM remote_agent_workflow_events
+             WHERE workflow_run_id = $1 AND event_type = $2
+           )`,
+          [
+            row.id,
+            eventType,
+            JSON.stringify({
+              reconciled: true,
+              reason_code: 'status_persist_failed',
+              reconciled_at: reconciledAt,
+            }),
+          ]
+        );
+      }
+      repaired += 1;
+    }
+
+    return { scanned: result.rows.length, repaired, conflicts };
+  });
 }
 
 export async function cancelWorkflowRun(id: string): Promise<void> {

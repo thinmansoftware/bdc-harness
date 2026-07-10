@@ -211,6 +211,17 @@ export function mapWorkflowEvent(event: WorkflowEmitterEvent): string | null {
         timestamp: Date.now(),
       });
 
+    case 'status_persist_failed':
+      return JSON.stringify({
+        type: 'workflow_status',
+        runId: event.runId,
+        workflowName: '',
+        status: 'interrupted',
+        reason: event.reason,
+        attemptedStatus: event.attemptedStatus,
+        timestamp: Date.now(),
+      });
+
     case 'node_failover':
       // WO-HARNESS-NODE-PROVIDER-FAILOVER-01: node fell SIDEWAYS to a failover
       // provider on an availability error. Forward the raw payload for Mission

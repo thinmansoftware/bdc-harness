@@ -233,6 +233,13 @@ export interface RunOutcome {
   readonly evidenceRefs: readonly string[];
 }
 
+export interface TerminalWorkflowPersistence {
+  readonly outcome: RunOutcome;
+  readonly eventData: Readonly<Record<string, unknown>>;
+  readonly updatedAt: string;
+  readonly metadata?: Readonly<Record<string, unknown>>;
+}
+
 export type RunOutcomeProjection =
   | 'pending'
   | 'running'

@@ -12,6 +12,7 @@ import type {
   RunLeaseRecord,
   RunOutcome,
   ScheduledProviderWaitRecord,
+  TerminalWorkflowPersistence,
 } from './reliability/types';
 
 export const WORKFLOW_EVENT_TYPES = [
@@ -39,6 +40,7 @@ export const WORKFLOW_EVENT_TYPES = [
   'approval_requested',
   'approval_received',
   'workflow_cancelled',
+  'status_persist_failed',
   'workflow_artifact',
   // Layer 1 cascade-step event (WO-HARNESS-LAYER1-CLIMB-AND-GATE-EVENTS-01).
   // Emitted when a job escalates from one cost tier to another. Distinct from
@@ -105,8 +107,12 @@ export interface IWorkflowStore {
   ): Promise<void>;
   updateWorkflowActivity(id: string): Promise<void>;
   getWorkflowRunStatus(id: string): Promise<WorkflowRunStatus | null>;
-  completeWorkflowRun(id: string, metadata?: Record<string, unknown>): Promise<void>;
-  failWorkflowRun(id: string, error: string): Promise<void>;
+  completeWorkflowRun(
+    id: string,
+    metadata?: Record<string, unknown>,
+    terminal?: TerminalWorkflowPersistence
+  ): Promise<void>;
+  failWorkflowRun(id: string, error: string, terminal?: TerminalWorkflowPersistence): Promise<void>;
   pauseWorkflowRun(id: string, approvalContext: ApprovalContext): Promise<void>;
   cancelWorkflowRun(id: string): Promise<void>;
 

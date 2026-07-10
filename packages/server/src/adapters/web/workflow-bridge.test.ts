@@ -164,6 +164,21 @@ describe('resolveWebLane', () => {
 });
 
 describe('mapWorkflowEvent', () => {
+  it('maps terminal persistence failures to recoverable interrupted status', () => {
+    const payload = mapWorkflowEvent({
+      type: 'status_persist_failed',
+      runId: 'run-1',
+      attemptedStatus: 'completed',
+      reason: 'status_persist_failed',
+    });
+
+    const event = JSON.parse(payload as string) as Record<string, unknown>;
+    expect(event.type).toBe('workflow_status');
+    expect(event.status).toBe('interrupted');
+    expect(event.reason).toBe('status_persist_failed');
+    expect(event.attemptedStatus).toBe('completed');
+  });
+
   it('maps resource exhausted retries to running workflow step events', () => {
     const payload = mapWorkflowEvent({
       type: 'resource_exhausted_retry',

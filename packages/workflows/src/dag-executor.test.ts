@@ -110,6 +110,21 @@ function createMockStore(): IWorkflowStore {
     failWorkflowRun: mock(() => Promise.resolve()),
     pauseWorkflowRun: mock(() => Promise.resolve()),
     cancelWorkflowRun: mock(() => Promise.resolve()),
+    createRunAuthority: mock(() => Promise.resolve('created' as const)),
+    getRunAuthority: mock(() => Promise.resolve(null)),
+    claimRunLease: mock(() => Promise.resolve(null)),
+    heartbeatRunLease: mock(() => Promise.resolve(false)),
+    releaseRunLease: mock(() => Promise.resolve(false)),
+    createProviderAttempt: mock(() => Promise.resolve(false)),
+    completeProviderAttempt: mock(() => Promise.resolve(false)),
+    listProviderAttempts: mock(() => Promise.resolve([])),
+    upsertRunOutcome: mock(() => Promise.resolve(false)),
+    getRunOutcome: mock(() => Promise.resolve(null)),
+    scheduleProviderWait: mock(() => Promise.resolve(false)),
+    listDueProviderWaits: mock(() => Promise.resolve([])),
+    claimProviderWait: mock(() => Promise.resolve(false)),
+    cancelProviderWaits: mock(() => Promise.resolve(0)),
+    completeProviderWait: mock(() => Promise.resolve(false)),
     createWorkflowEvent: mock(() => Promise.resolve()),
     listWorkflowEvents: mock(() => Promise.resolve([])),
     getCompletedDagNodeOutputs: mock(() => Promise.resolve(new Map<string, string>())),
@@ -8748,6 +8763,132 @@ describe('executeDagWorkflow -- final status derivation', () => {
     }
   });
 
+  it('does not publish terminal success when terminal persistence fails', async () => {
+    const mockStore = createMockStore();
+    (mockStore.completeWorkflowRun as ReturnType<typeof mock>).mockRejectedValueOnce(
+      new Error('terminal write failed')
+    );
+    const mockDeps = createMockDeps(mockStore);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('dag-terminal-persist-failure');
+    const received: string[] = [];
+    const unsubscribe = getWorkflowEventEmitter().subscribe(event => {
+      if (event.runId === workflowRun.id) received.push(event.type);
+    });
+
+    try {
+      await executeDagWorkflow(
+        mockDeps,
+        platform,
+        'conv-status',
+        testDir,
+        { name: 'terminal-persist-failure', nodes: [{ id: 'pass', bash: 'echo ok' }] },
+        workflowRun,
+        'claude',
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        minimalConfig
+      );
+    } finally {
+      unsubscribe();
+    }
+
+    expect(received).not.toContain('workflow_completed');
+    expect(received).toContain('status_persist_failed');
+    expect(mockStore.updateWorkflowRun).toHaveBeenCalledWith(
+      workflowRun.id,
+      expect.objectContaining({ status: 'interrupted' })
+    );
+    const persistedEvents = (
+      mockStore.createWorkflowEvent as ReturnType<typeof mock>
+    ).mock.calls.map(call => call[0] as { event_type: string });
+    expect(persistedEvents.some(event => event.event_type === 'workflow_completed')).toBe(false);
+    expect(persistedEvents.some(event => event.event_type === 'status_persist_failed')).toBe(true);
+  });
+
+  it('does not publish terminal failure when terminal persistence fails', async () => {
+    const mockStore = createMockStore();
+    (mockStore.failWorkflowRun as ReturnType<typeof mock>).mockRejectedValueOnce(
+      new Error('terminal write failed')
+    );
+    const mockDeps = createMockDeps(mockStore);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('dag-failure-persist-failure');
+    const received: string[] = [];
+    const unsubscribe = getWorkflowEventEmitter().subscribe(event => {
+      if (event.runId === workflowRun.id) received.push(event.type);
+    });
+
+    try {
+      await executeDagWorkflow(
+        mockDeps,
+        platform,
+        'conv-status',
+        testDir,
+        {
+          name: 'failure-persist-failure',
+          nodes: [
+            { id: 'pass', bash: 'echo ok' },
+            { id: 'fail', bash: 'exit 1' },
+          ],
+        },
+        workflowRun,
+        'claude',
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        minimalConfig
+      );
+    } finally {
+      unsubscribe();
+    }
+
+    expect(received).not.toContain('workflow_failed');
+    expect(received).toContain('status_persist_failed');
+    expect(mockStore.updateWorkflowRun).toHaveBeenCalledWith(
+      workflowRun.id,
+      expect.objectContaining({ status: 'interrupted' })
+    );
+  });
+
+  it('never downgrades a concurrently terminal run to interrupted', async () => {
+    const mockStore = createMockStore();
+    (mockStore.completeWorkflowRun as ReturnType<typeof mock>).mockRejectedValueOnce(
+      new Error('terminal outcome conflict')
+    );
+    (mockStore.getWorkflowRunStatus as ReturnType<typeof mock>)
+      .mockResolvedValueOnce('running')
+      .mockResolvedValueOnce('running')
+      .mockResolvedValueOnce('completed');
+    const mockDeps = createMockDeps(mockStore);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('dag-concurrent-terminal');
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-status',
+      testDir,
+      { name: 'concurrent-terminal', nodes: [{ id: 'pass', bash: 'echo ok' }] },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    expect(mockStore.updateWorkflowRun).not.toHaveBeenCalled();
+    expect(mockStore.upsertRunOutcome).not.toHaveBeenCalled();
+  });
+
   it('one success + one independent failure -> failWorkflowRun, not completeWorkflowRun', async () => {
     const mockStore = createMockStore();
     const mockDeps = createMockDeps(mockStore);
@@ -8779,7 +8920,10 @@ describe('executeDagWorkflow -- final status derivation', () => {
     expect((mockStore.completeWorkflowRun as ReturnType<typeof mock>).mock.calls.length).toBe(0);
     expect(mockStore.failWorkflowRun).toHaveBeenCalledWith(
       expect.anything(),
-      expect.stringContaining('fail')
+      expect.stringContaining('fail'),
+      expect.objectContaining({
+        metadata: expect.objectContaining({ terminal_cause: 'node_failures' }),
+      })
     );
 
     // Confirm the failure message names the failing node
@@ -8822,7 +8966,10 @@ describe('executeDagWorkflow -- final status derivation', () => {
     expect((mockStore.completeWorkflowRun as ReturnType<typeof mock>).mock.calls.length).toBe(0);
     expect(mockStore.failWorkflowRun).toHaveBeenCalledWith(
       expect.anything(),
-      expect.stringContaining('fail')
+      expect.stringContaining('fail'),
+      expect.objectContaining({
+        metadata: expect.objectContaining({ terminal_cause: 'node_failures' }),
+      })
     );
 
     const sendMessage = platform.sendMessage as ReturnType<typeof mock>;
@@ -8866,7 +9013,10 @@ describe('executeDagWorkflow -- final status derivation', () => {
     expect((mockStore.completeWorkflowRun as ReturnType<typeof mock>).mock.calls.length).toBe(0);
     expect(mockStore.failWorkflowRun).toHaveBeenCalledWith(
       expect.anything(),
-      expect.stringContaining('b')
+      expect.stringContaining('b'),
+      expect.objectContaining({
+        metadata: expect.objectContaining({ terminal_cause: 'node_failures' }),
+      })
     );
   });
 });
@@ -11137,17 +11287,15 @@ describe('executeDagWorkflow -- WO-HARNESS-PR-STATUS-TRUTH-AND-AUTOMERGE-01', ()
 
     // Completed as degraded, NOT failed.
     const completeCalls = (mockStore.completeWorkflowRun as ReturnType<typeof mock>).mock
-      .calls as Array<[string, Record<string, unknown>]>;
+      .calls as Array<[string, Record<string, unknown>, { eventData: Record<string, unknown> }]>;
     expect(completeCalls.length).toBe(1);
     const meta = completeCalls[0][1];
     expect(meta.paperwork_degraded).toBe(true);
     expect(meta.degraded_paperwork_nodes).toEqual(['build-manifest']);
     expect((mockStore.failWorkflowRun as ReturnType<typeof mock>).mock.calls.length).toBe(0);
 
-    // workflow_completed event present.
-    const completedEvt = eventCalls(mockStore).find(([a]) => a.event_type === 'workflow_completed');
-    expect(completedEvt).toBeDefined();
-    expect(completedEvt?.[0].data?.paperwork_degraded).toBe(true);
+    // The terminal event is part of the same atomic persistence request.
+    expect(completeCalls[0][2].eventData.paperwork_degraded).toBe(true);
   });
 
   it('real failure still fails: non-paperwork node failure marks the run failed', async () => {
