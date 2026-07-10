@@ -349,10 +349,22 @@ export const dashboardRunsResponseSchema = z
   .openapi('DashboardRunsResponse');
 
 /** POST /api/workflows/:name/run request body. */
+export const conductorDispatchSchema = z.object({
+  enabled: z.literal(true),
+  woId: z.string().regex(/^WO-[A-Z0-9-]+$/),
+  project: z.string().min(1),
+  woClass: z.enum(['CODE', 'INFRA', 'MIXED']).optional(),
+  tags: z.array(z.string().min(1)).optional(),
+  entryOverride: z.string().min(1).optional(),
+  idempotencyKey: z.string().min(1),
+  dryRun: z.boolean().optional(),
+});
+
 export const runWorkflowBodySchema = z
   .object({
     conversationId: z.string(),
     message: z.string(),
+    conductor: conductorDispatchSchema.optional(),
   })
   .openapi('RunWorkflowBody');
 

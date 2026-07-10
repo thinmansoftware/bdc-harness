@@ -67,12 +67,6 @@ function makeFailVerdict(reason: string): GateVerdict {
   };
 }
 
-/** Build a minimal 2-tier stub ladder (for frontier test) */
-const TWO_TIER_STUB = [
-  { name: 'cheap', workflowName: 'bdc-test-cheap', isFrontier: false, costPerRunUsd: 0.001 },
-  { name: 'frontier', workflowName: 'bdc-test-frontier', isFrontier: true, costPerRunUsd: null },
-];
-
 /** Build base options pointing to the real config (entry defaults to codex). */
 function baseOpts(partial: Partial<RunCascadeOptions> = {}): RunCascadeOptions {
   return {
@@ -91,6 +85,28 @@ function baseOpts(partial: Partial<RunCascadeOptions> = {}): RunCascadeOptions {
 // ---------------------------------------------------------------------------
 
 describe('auth/project binding guards', () => {
+  test('lane preflight failure is recorded and prevents provider fire', async () => {
+    let fireCalled = false;
+    const deps: CascadeDeps = {
+      preflight: async tier => {
+        throw new Error(`workflow ${tier.workflowName} is unavailable`);
+      },
+      fire: async () => {
+        fireCalled = true;
+        return makeFireOk('should-not-fire');
+      },
+      escalate: async () => undefined,
+      writeRecord: async (record, _dir) => `/tmp/cascade-record-${record.cascadeId}.json`,
+    };
+
+    const result = await runCascade(baseOpts({ deps }));
+
+    expect(fireCalled).toBe(false);
+    expect(result.status).toBe('infra-alert');
+    expect(result.attempts[0]?.outcome).toBe('infra-error');
+    expect(result.attempts[0]?.infraErrorReason).toContain('is unavailable');
+  });
+
   test('missing project throws before firing', async () => {
     let fireCalled = false;
 
@@ -642,6 +658,85 @@ describe('Test 6: WRAPPER -- cascade does not touch @archon/workflows', () => {
 
     expect(fireCalledInDryRun).toBe(false);
     expect(record.woId).toBe('WO-TEST-001');
+    expect(record.status).toBe('planned');
+  });
+
+  test('checkpoints the cascade and in-flight attempt before the provider lane is fired', async () => {
+    const snapshots: CascadeRunRecord[] = [];
+    const deps: CascadeDeps = {
+      fire: async () => makeFireOk('run-checkpoint'),
+      poll: async () => makePollResult({ runId: 'run-checkpoint' }),
+      judge: () => makePassVerdict(),
+      escalate: async () => undefined,
+      writeRecord: async record => {
+        snapshots.push(structuredClone(record));
+        return `/tmp/cascade-record-${record.cascadeId}.json`;
+      },
+    };
+
+    const record = await runCascade(baseOpts({ deps }));
+
+    expect(snapshots[0]?.status).toBe('running');
+    expect(snapshots[0]?.attempts).toEqual([]);
+    expect(
+      snapshots.some(
+        snapshot =>
+          snapshot.status === 'running' &&
+          snapshot.attempts.length === 1 &&
+          snapshot.attempts[0]?.outcome === 'running' &&
+          snapshot.attempts[0]?.completedAt === null
+      )
+    ).toBe(true);
+    expect(snapshots.at(-1)?.status).toBe('won');
+    expect(record.status).toBe('won');
+  });
+
+  test('returns the durable record for a duplicate dispatch without firing another lane', async () => {
+    let fireCalled = false;
+    const existing: CascadeRunRecord = {
+      cascadeId: 'dispatch-stable',
+      woId: 'WO-TEST-001',
+      project: 'test-project',
+      request: {
+        woClass: 'CODE',
+        tags: ['mechanical'],
+        entryOverride: null,
+        dryRun: false,
+      },
+      createdAt: '2026-07-09T12:00:00.000Z',
+      status: 'running',
+      winningTier: null,
+      attempts: [],
+      totalCostUsd: null,
+      telemetry: {
+        entryTier: 'zero',
+        climbed: false,
+        climbCount: 0,
+        wonCheap: false,
+      },
+    };
+    const deps: CascadeDeps = {
+      fire: async () => {
+        fireCalled = true;
+        return makeFireOk('duplicate-run');
+      },
+      poll: async () => makePollResult(),
+      judge: () => makePassVerdict(),
+      escalate: async () => undefined,
+      createRecord: async () => ({
+        created: false,
+        path: '/tmp/existing/cascade-record.json',
+        record: existing,
+      }),
+      writeRecord: async record => `/tmp/cascade-record-${record.cascadeId}.json`,
+    };
+
+    const record = await runCascade(
+      baseOpts({ deps, dispatchId: 'dispatch-stable' } as Partial<RunCascadeOptions>)
+    );
+
+    expect(fireCalled).toBe(false);
+    expect(record).toEqual(existing);
   });
 });
 

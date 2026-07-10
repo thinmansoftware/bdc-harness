@@ -29,6 +29,7 @@ import {
   generateAndSetTitle,
 } from '@archon/core';
 import { createWorkflowDeps } from '@archon/core/workflows';
+import { runCascade } from '@archon/smart-cauldron/cascade';
 import { removeWorktree, toRepoPath, toWorktreePath } from '@archon/git';
 import {
   createLogger,
@@ -2703,7 +2704,7 @@ export function registerApiRoutes(
     try {
       const drainRejection = await rejectNewDispatchIfDraining(c);
       if (drainRejection) return drainRejection;
-      const { conversationId, message } = getValidatedBody(c, runWorkflowBodySchema);
+      const { conversationId, message, conductor } = getValidatedBody(c, runWorkflowBodySchema);
       // Persist user message and register DB ID (same as message endpoint).
       // /run callers may provide a fresh platform conversation id; create that
       // row up front so workflow dispatch can attach a run and web persistence
@@ -2734,6 +2735,67 @@ export function registerApiRoutes(
             workflowName
           );
         }
+      }
+
+      if (
+        conductor?.enabled === true &&
+        process.env.ARCHON_SMART_CAULDRON_DISPATCH_ENABLED === 'true'
+      ) {
+        const cascadeOptions = {
+          woId: conductor.woId,
+          woClass: conductor.woClass,
+          tags: conductor.tags,
+          entryOverride: conductor.entryOverride,
+          dispatchId: conductor.idempotencyKey,
+          dryRun: conductor.dryRun ?? false,
+          project: conductor.project,
+          token: c.req.header('x-archon-operator-token') ?? process.env.ARCHON_OPERATOR_TOKEN ?? '',
+        };
+        if (cascadeOptions.dryRun) {
+          const record = await runCascade(cascadeOptions);
+          return c.json({
+            accepted: true,
+            status: record.status,
+            dispatchMode: 'conductor' as const,
+            cascadeId: record.cascadeId,
+            entryTier: record.telemetry.entryTier,
+          });
+        }
+
+        let resolveAdmission: ((record: Awaited<ReturnType<typeof runCascade>>) => void) | null =
+          null;
+        let rejectAdmission: ((error: unknown) => void) | null = null;
+        const admission = new Promise<Awaited<ReturnType<typeof runCascade>>>((resolve, reject) => {
+          resolveAdmission = resolve;
+          rejectAdmission = reject;
+        });
+        const cascadePromise = runCascade({
+          ...cascadeOptions,
+          deps: {
+            preflight: async tier => {
+              const check = await validateWorkflowRunTarget(
+                `/workflow run ${tier.workflowName}`,
+                conv?.codebase_id
+              );
+              if (!check.valid) throw new Error(check.error);
+            },
+          },
+          onAdmission: record => resolveAdmission?.(record),
+        });
+        void cascadePromise.catch((error: unknown) => {
+          rejectAdmission?.(error);
+          getLog().error(
+            { err: error, cascadeId: conductor.idempotencyKey, woId: conductor.woId },
+            'smart_cauldron_dispatch_failed'
+          );
+        });
+        const admittedRecord = await admission;
+        return c.json({
+          accepted: true,
+          status: admittedRecord.status === 'running' ? 'queued' : admittedRecord.status,
+          dispatchMode: 'conductor' as const,
+          cascadeId: admittedRecord.cascadeId,
+        });
       }
 
       const fullMessage = `/workflow run ${workflowName} ${message}`;

@@ -10,6 +10,8 @@
       "@archon/workflows": ["../workflows/src"],
       "@archon/workflows/*": ["../workflows/src/*"],
       "@archon/paths": ["../paths/src"],
+      "@archon/smart-cauldron": ["../smart-cauldron/src/cascade.ts"],
+      "@archon/smart-cauldron/*": ["../smart-cauldron/src/*"],
       "@archon/git": ["../git/src"]
     }
   },

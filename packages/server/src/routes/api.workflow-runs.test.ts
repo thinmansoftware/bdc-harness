@@ -90,6 +90,30 @@ const mockSetCauldronDrainMode = mock(async (data: { mode: 'normal' | 'draining'
   changed: true,
   mode: data.mode,
 }));
+const mockRunCascade = mock(
+  async (opts: {
+    dryRun?: boolean;
+    onAdmission?: (record: Record<string, unknown>, created: boolean) => void;
+  }) => {
+    const record = {
+      cascadeId: opts.dryRun ? 'cascade-test' : 'dispatch-live',
+      woId: 'WO-TEST-001',
+      createdAt: NOW,
+      status: opts.dryRun ? ('planned' as const) : ('running' as const),
+      winningTier: null,
+      attempts: [],
+      totalCostUsd: null,
+      telemetry: {
+        entryTier: 'zero',
+        climbed: false,
+        climbCount: 0,
+        wonCheap: false,
+      },
+    };
+    opts.onAdmission?.(record, true);
+    return record;
+  }
+);
 
 // Type aliases for clarity in tests
 type MockWorkflowRun = {
@@ -184,6 +208,10 @@ mockAllWorkflowModules();
 
 mock.module('@archon/workflows/executor', () => ({
   executeWorkflow: mockExecuteWorkflow,
+}));
+
+mock.module('@archon/smart-cauldron/cascade', () => ({
+  runCascade: mockRunCascade,
 }));
 
 mock.module('../adapters/web/workflow-bridge', () => ({
@@ -441,6 +469,8 @@ describe('POST /api/workflows/:name/run', () => {
     mockGenerateAndSetTitle.mockReset();
     mockGetCauldronDrainState.mockReset();
     mockGetCauldronDrainState.mockResolvedValue(normalDrainState);
+    mockRunCascade.mockClear();
+    delete process.env.ARCHON_SMART_CAULDRON_DISPATCH_ENABLED;
     // Pre-dispatch validation resolves the workflow name against discovery
     // before accepting -- seed the names these tests dispatch.
     mockDiscoverWorkflowsWithConfig.mockReset();
@@ -454,6 +484,7 @@ describe('POST /api/workflows/:name/run', () => {
   });
 
   afterEach(() => {
+    delete process.env.ARCHON_SMART_CAULDRON_DISPATCH_ENABLED;
     // Restore the factory default ([] workflows) for other describes.
     mockDiscoverWorkflowsWithConfig.mockReset();
     mockDiscoverWorkflowsWithConfig.mockImplementation(async () => ({
@@ -514,7 +545,125 @@ describe('POST /api/workflows/:name/run', () => {
     expect(body.status).toBe('started');
   });
 
+  test('keeps explicit direct-lane dispatch when conductor integration is disabled', async () => {
+    const { app } = makeApp();
+    const response = await app.request('/api/workflows/deploy/run', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        conversationId: 'web-test-abc',
+        message: 'WO-TEST-001',
+        conductor: {
+          enabled: true,
+          woId: 'WO-TEST-001',
+          project: 'test-project',
+          woClass: 'CODE',
+          tags: ['mechanical'],
+          idempotencyKey: 'dispatch-direct-disabled',
+        },
+      }),
+    });
+
+    expect(response.status).toBe(200);
+    expect(mockRunCascade).not.toHaveBeenCalled();
+    expect(mockHandleMessage).toHaveBeenCalled();
+  });
+
+  test('returns a distinct planned result for an enabled conductor dry run', async () => {
+    process.env.ARCHON_SMART_CAULDRON_DISPATCH_ENABLED = 'true';
+    const { app } = makeApp();
+    const response = await app.request('/api/workflows/deploy/run', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        conversationId: 'web-test-abc',
+        message: 'WO-TEST-001',
+        conductor: {
+          enabled: true,
+          woId: 'WO-TEST-001',
+          project: 'test-project',
+          woClass: 'CODE',
+          tags: ['mechanical'],
+          idempotencyKey: 'dispatch-dry-run',
+          dryRun: true,
+        },
+      }),
+    });
+    const body = (await response.json()) as {
+      accepted: boolean;
+      status: string;
+      dispatchMode: string;
+      cascadeId: string;
+      entryTier: string;
+    };
+
+    expect(response.status).toBe(200);
+    expect(body).toEqual({
+      accepted: true,
+      status: 'planned',
+      dispatchMode: 'conductor',
+      cascadeId: 'cascade-test',
+      entryTier: 'zero',
+    });
+    expect(mockHandleMessage).not.toHaveBeenCalled();
+    expect(mockRunCascade).toHaveBeenCalledWith(
+      expect.objectContaining({
+        woId: 'WO-TEST-001',
+        project: 'test-project',
+        dispatchId: 'dispatch-dry-run',
+        dryRun: true,
+      })
+    );
+  });
+
+  test('queues an enabled live conductor request with stable idempotency and no direct dispatch', async () => {
+    process.env.ARCHON_SMART_CAULDRON_DISPATCH_ENABLED = 'true';
+    const { app } = makeApp();
+    const response = await app.request('/api/workflows/deploy/run', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-archon-operator-token': 'test-token',
+      },
+      body: JSON.stringify({
+        conversationId: 'web-test-abc',
+        message: 'WO-TEST-001',
+        conductor: {
+          enabled: true,
+          woId: 'WO-TEST-001',
+          project: 'test-project',
+          woClass: 'CODE',
+          tags: ['mechanical'],
+          idempotencyKey: 'dispatch-live',
+        },
+      }),
+    });
+    const body = (await response.json()) as {
+      accepted: boolean;
+      status: string;
+      dispatchMode: string;
+      cascadeId: string;
+    };
+
+    expect(response.status).toBe(200);
+    expect(body).toEqual({
+      accepted: true,
+      status: 'queued',
+      dispatchMode: 'conductor',
+      cascadeId: 'dispatch-live',
+    });
+    expect(mockHandleMessage).not.toHaveBeenCalled();
+    expect(mockRunCascade).toHaveBeenCalledWith(
+      expect.objectContaining({
+        dispatchId: 'dispatch-live',
+        token: 'test-token',
+        dryRun: false,
+      })
+    );
+  });
+
   test('rejects new workflow dispatch while draining without touching in-flight work', async () => {
+    process.env.ARCHON_SMART_CAULDRON_DISPATCH_ENABLED = 'true';
     mockGetCauldronDrainState.mockResolvedValueOnce({
       ...normalDrainState,
       mode: 'draining',
@@ -526,10 +675,20 @@ describe('POST /api/workflows/:name/run', () => {
     const response = await app.request('/api/workflows/deploy/run', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ conversationId: 'web-test-abc', message: 'Deploy' }),
+      body: JSON.stringify({
+        conversationId: 'web-test-abc',
+        message: 'WO-TEST-001',
+        conductor: {
+          enabled: true,
+          woId: 'WO-TEST-001',
+          project: 'test-project',
+          idempotencyKey: 'dispatch-draining',
+        },
+      }),
     });
 
     expect(response.status).toBe(503);
+    expect(mockRunCascade).not.toHaveBeenCalled();
     expect(mockHandleMessage).not.toHaveBeenCalled();
     expect(mockCancelWorkflowRun).not.toHaveBeenCalled();
   });

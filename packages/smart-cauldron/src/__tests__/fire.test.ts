@@ -40,7 +40,7 @@ afterEach(() => {
 
 describe('fireTier auth headers', () => {
   test('sends x-archon-operator-token on fire POST and discovery GET from option', async () => {
-    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
       const url = String(input);
       fetchCalls.push({ url, init });
 
@@ -69,7 +69,7 @@ describe('fireTier auth headers', () => {
 
   test('uses ARCHON_OPERATOR_TOKEN env fallback for fire and discovery headers', async () => {
     process.env.ARCHON_OPERATOR_TOKEN = 'env-token';
-    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
       const url = String(input);
       fetchCalls.push({ url, init });
 

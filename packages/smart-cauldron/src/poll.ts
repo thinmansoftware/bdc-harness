@@ -30,6 +30,17 @@ export class TimeoutError extends Error {
   }
 }
 
+/** A real HTTP/network failure while reading run state. Never masquerades as progress timeout. */
+export class PollTransportError extends Error {
+  readonly statusCode: number | null;
+
+  constructor(message: string, statusCode: number | null = null) {
+    super(message);
+    this.name = 'PollTransportError';
+    this.statusCode = statusCode;
+  }
+}
+
 interface RunApiResponse {
   run: {
     id: string;
@@ -76,7 +87,7 @@ export async function pollForTerminal(opts: PollOptions): Promise<PollResult> {
   while (Date.now() < deadline) {
     const detail = await fetchRunDetail(runId, apiBaseUrl, token);
 
-    if (detail && TERMINAL_STATUSES.has(detail.run.status)) {
+    if (TERMINAL_STATUSES.has(detail.run.status)) {
       const terminalStatus = detail.run.status as
         | 'completed'
         | 'failed'
@@ -116,16 +127,24 @@ async function fetchRunDetail(
   runId: string,
   apiBaseUrl: string,
   token: string
-): Promise<RunApiResponse | null> {
+): Promise<RunApiResponse> {
+  let res: Response;
   try {
-    const res = await fetch(`${apiBaseUrl}/api/workflows/runs/${encodeURIComponent(runId)}`, {
+    res = await fetch(`${apiBaseUrl}/api/workflows/runs/${encodeURIComponent(runId)}`, {
       headers: { 'x-archon-operator-token': token },
     });
-    if (!res.ok) return null;
-    return (await res.json()) as RunApiResponse;
-  } catch {
-    return null;
+  } catch (error) {
+    throw new PollTransportError(
+      `[smart-cauldron/poll] Network failure reading run ${runId}: ${(error as Error).message}`
+    );
   }
+  if (!res.ok) {
+    throw new PollTransportError(
+      `[smart-cauldron/poll] HTTP ${String(res.status)} reading run ${runId}`,
+      res.status
+    );
+  }
+  return (await res.json()) as RunApiResponse;
 }
 
 /**
