@@ -2882,7 +2882,7 @@ async function executeScriptNode(
     if (isInlineScript(finalScript)) {
       // Inline code execution
       if (node.runtime === 'bun') {
-        cmd = 'bun';
+        cmd = process.execPath;
         // --no-env-file prevents Bun from auto-loading .env from the execution
         // cwd (the target repo). Without this, repo .env leaks into the script
         // subprocess despite Archon's parent process cleanup.
@@ -2970,7 +2970,7 @@ async function executeScriptNode(
         const withFlags = nodeDeps.flatMap(dep => ['--with', dep]);
         args = ['run', ...withFlags, scriptDef.path];
       } else {
-        cmd = 'bun';
+        cmd = process.execPath;
         args = ['--no-env-file', 'run', scriptDef.path];
       }
     }

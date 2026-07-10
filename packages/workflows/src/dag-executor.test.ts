@@ -9003,7 +9003,7 @@ describe('executeDagWorkflow -- script nodes', () => {
     );
 
     expect(execSpy).toHaveBeenCalledWith(
-      'bun',
+      process.execPath,
       ['--no-env-file', '-e', 'console.log("ok")'],
       expect.objectContaining({
         env: expect.objectContaining({ MY_SECRET: 'abc123' }),
