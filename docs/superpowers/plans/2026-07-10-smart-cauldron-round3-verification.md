@@ -115,3 +115,21 @@ Docker job. No Hetzner or production container was accessed.
 The existing per-run executor lease still uses application time. That is not
 silently represented as fixed; it is a separate follow-up described in
 `2026-07-10-smart-cauldron-run-lease-db-clock-follow-up.md`.
+
+Final Round 4 verification found one additional Windows-only identity defect:
+GitHub supplied the canonical repository through the `RUNNER~1` short path while
+Git's worktree pointer returned the equivalent `runneradmin` long path. Ownership
+verification now resolves existing paths to their filesystem identity before
+comparison, remains case-insensitive on Windows, and still fails closed on
+filesystem errors other than a missing path. A junction-alias regression test
+failed before this change and passed afterward.
+
+GitHub CI run `29094167889` passed on head `3abe0207`:
+
+- Ubuntu test, typecheck, lint, format, and bundled-default gates passed.
+- Windows test, typecheck, lint, format, and bundled-default gates passed,
+  including restart-safe worktree adoption.
+- The Docker image built, the container started, and `/api/health` passed.
+
+PR #390 remains draft. No local Docker instance, Hetzner host, production
+container, production workflow, or production database was mutated.
