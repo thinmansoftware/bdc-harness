@@ -18,10 +18,11 @@ export async function captureRuntimeRevisions(workflow: WorkflowDefinition): Pro
   readonly engineRevision: string;
   readonly runtimeImageRevision: string | null;
 }> {
+  const runtimeImageRevision = process.env.ARCHON_RUNTIME_IMAGE_REVISION?.trim() || null;
   return {
     workflowRevision: hashWorkflowDefinition(workflow),
     bundleRevision: sha256(JSON.stringify(BUNDLED_POLICIES)),
     engineRevision: sha256(await readFile(ENGINE_SOURCE_URL)),
-    runtimeImageRevision: process.env.ARCHON_RUNTIME_IMAGE_REVISION ?? null,
+    runtimeImageRevision,
   };
 }

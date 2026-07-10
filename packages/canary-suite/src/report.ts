@@ -1,4 +1,5 @@
-import { mkdir, readFile, rename, rm, writeFile } from 'fs/promises';
+import { randomUUID } from 'crypto';
+import { link, mkdir, readFile, rm, writeFile } from 'fs/promises';
 import { join } from 'path';
 import type { CanaryPlan, CanaryReduction, CanaryReport, CanaryVerdict } from './types';
 
@@ -91,18 +92,23 @@ export async function writeCanaryArtifacts(
   if (existing.every((value, index) => value === contents[index])) return paths;
   if (existing.some(value => value !== null)) throw new Error('canary_artifact_conflict');
 
-  const temporary = paths.map(path => `${path}.tmp`);
+  const writerId = randomUUID();
+  const temporary = paths.map(path => `${path}.tmp-${writerId}`);
   try {
     for (let index = 0; index < temporary.length; index += 1) {
       await writeFile(temporary[index], contents[index], { flag: 'wx' });
     }
     for (let index = 0; index < paths.length; index += 1) {
-      await rename(temporary[index], paths[index]);
+      try {
+        await link(temporary[index], paths[index]);
+      } catch (error) {
+        const published = await readIfPresent(paths[index]);
+        if (published !== contents[index]) throw error;
+      }
+      await rm(temporary[index], { force: true });
     }
   } catch (error) {
     await Promise.all(temporary.map(path => rm(path, { force: true })));
-    const raced = await Promise.all(paths.map(readIfPresent));
-    if (raced.every((value, index) => value === contents[index])) return paths;
     throw error;
   }
   return paths;

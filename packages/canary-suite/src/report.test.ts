@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test';
-import { mkdtemp, readFile, rm } from 'fs/promises';
+import { mkdtemp, readFile, readdir, rm } from 'fs/promises';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { buildCanaryPlan } from './planner';
@@ -37,6 +37,26 @@ test('rejects conflicting bytes for an existing suite ID', async () => {
     await expect(writeCanaryArtifacts(root, plan, changed)).rejects.toThrow(
       'canary_artifact_conflict'
     );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('allows concurrent identical writers without deleting another writer temporary files', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'canary-report-concurrent-'));
+  try {
+    const plan = buildCanaryPlan(manifest, baseSnapshot);
+    const report = createCanaryReport('suite-fixture-001', 1, plan, reduceCanaryPlan(plan));
+    const [first, second] = await Promise.all([
+      writeCanaryArtifacts(root, plan, report),
+      writeCanaryArtifacts(root, plan, report),
+    ]);
+    expect(first).toEqual(second);
+    expect(await readdir(join(root, 'suite-fixture-001'))).toEqual([
+      'plan.json',
+      'summary.json',
+      'summary.md',
+    ]);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

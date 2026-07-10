@@ -32,3 +32,14 @@ test('redacts the token from non-2xx response errors', async () => {
   expect(message).toContain('[REDACTED]');
   expect(message).not.toContain(token);
 });
+
+test('rejects an empty runtime image revision from the server', async () => {
+  const fetcher = mock(async () =>
+    Response.json({
+      ...baseSnapshot,
+      revisions: { ...baseSnapshot.revisions, runtimeImageRevision: '' },
+    })
+  );
+  const client = new ArchonCanaryClient('http://127.0.0.1:3090', 'fixture-token', fetcher);
+  await expect(client.getSnapshot('codebase-1', 'dev')).rejects.toThrow();
+});

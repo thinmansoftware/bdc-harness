@@ -30,7 +30,7 @@ export function reduceCanaryPlan(plan: CanaryPlan, level: 0 | 1 = 1): CanaryRedu
       }
     }
   }
-  if (plan.snapshot.revisions.runtimeImageRevision === null) {
+  if (!plan.snapshot.revisions.runtimeImageRevision?.trim()) {
     blocked.push({
       reason: 'runtime_image_revision_missing',
       evidence: 'snapshot:revisions',

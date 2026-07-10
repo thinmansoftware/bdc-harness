@@ -38,6 +38,12 @@ test.each([
     'runtime_image_revision_missing',
   ],
   [
+    'empty image revision',
+    snapshot({ revisions: { ...baseSnapshot.revisions, runtimeImageRevision: '' } }),
+    'blocked',
+    'runtime_image_revision_missing',
+  ],
+  [
     'draining',
     snapshot({ drain: { ...baseSnapshot.drain, mode: 'draining' } }),
     'blocked',

@@ -35,3 +35,14 @@ test('runtime revisions preserve executor, bundle, and image authority values', 
     else process.env.ARCHON_RUNTIME_IMAGE_REVISION = original;
   }
 });
+
+test('normalizes an empty runtime image revision to missing', async () => {
+  const original = process.env.ARCHON_RUNTIME_IMAGE_REVISION;
+  process.env.ARCHON_RUNTIME_IMAGE_REVISION = '   ';
+  try {
+    expect((await captureRuntimeRevisions(workflow)).runtimeImageRevision).toBeNull();
+  } finally {
+    if (original === undefined) delete process.env.ARCHON_RUNTIME_IMAGE_REVISION;
+    else process.env.ARCHON_RUNTIME_IMAGE_REVISION = original;
+  }
+});
