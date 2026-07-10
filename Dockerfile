@@ -18,6 +18,7 @@ COPY packages/adapters/package.json ./packages/adapters/
 COPY packages/canary-suite/package.json ./packages/canary-suite/
 COPY packages/cli/package.json ./packages/cli/
 COPY packages/core/package.json ./packages/core/
+COPY packages/security-watchdog/package.json ./packages/security-watchdog/
 # docs-web source is NOT copied — it's a static site deployed separately
 # (see .github/workflows/deploy-docs.yml). package.json is included only
 # so Bun's workspace lockfile resolves correctly.
@@ -146,6 +147,7 @@ COPY packages/adapters/package.json ./packages/adapters/
 COPY packages/canary-suite/package.json ./packages/canary-suite/
 COPY packages/cli/package.json ./packages/cli/
 COPY packages/core/package.json ./packages/core/
+COPY packages/security-watchdog/package.json ./packages/security-watchdog/
 # docs-web source is NOT copied — it's a static site deployed separately
 # (see .github/workflows/deploy-docs.yml). package.json is included only
 # so Bun's workspace lockfile resolves correctly.
@@ -176,6 +178,7 @@ COPY packages/isolation/ ./packages/isolation/
 COPY packages/overseer/ ./packages/overseer/
 COPY packages/paths/ ./packages/paths/
 COPY packages/providers/ ./packages/providers/
+COPY packages/security-watchdog/ ./packages/security-watchdog/
 COPY packages/server/ ./packages/server/
 COPY packages/smart-cauldron/ ./packages/smart-cauldron/
 COPY packages/workflows/ ./packages/workflows/

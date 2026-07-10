@@ -1,0 +1,14 @@
+[
+  {
+    "instance": "prod",
+    "schema": "public",
+    "table": "public_profiles",
+    "reason": "Known-good RLS-on table with policy-backed public read access"
+  },
+  {
+    "instance": "staging",
+    "schema": "public",
+    "table": "public_profiles",
+    "reason": "Known-good RLS-on table with policy-backed public read access"
+  }
+]

@@ -1,0 +1,7 @@
+[
+  {
+    "path": "/webhook/order-status",
+    "methods": ["POST"],
+    "reason": "Signed order status webhook"
+  }
+]
