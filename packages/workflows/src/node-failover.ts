@@ -19,7 +19,7 @@
  * below is kept LOCAL to the failover decision for that reason.
  */
 import { classifyError, type ErrorClass } from '@archon/overseer/classify';
-import { getMissingProviderExecutionCapabilities } from '@archon/providers';
+import { getMissingProviderExecutionCapabilities, isRegisteredProvider } from '@archon/providers';
 import { deriveNodeExecutionRequirements } from './schemas/dag-node';
 import type { DagNode } from './schemas/dag-node';
 
@@ -32,6 +32,42 @@ export function assertProviderCanExecuteNode(providerId: string, node: DagNode):
       `provider_execution_capability_mismatch: provider '${providerId}' cannot execute node '${node.id}'; missing ${missing.join(', ')}`
     );
   }
+}
+
+export interface FailoverDefaults {
+  failoverProvider?: string;
+  failoverModel?: string;
+}
+
+export type QuotaExhaustionRoute =
+  | { kind: 'failover'; provider: string; model: string | undefined }
+  | { kind: 'wait' };
+
+/**
+ * Select a declared, independently registered, capability-eligible provider for
+ * quota exhaustion. The function is provider-neutral: Claude-to-Codex and
+ * Codex-to-Claude use the same path. Missing, same-provider, unknown, or
+ * incapable targets fail closed to a durable wait.
+ */
+export function selectQuotaExhaustionRoute(
+  currentProvider: string,
+  node: DagNode,
+  defaults: FailoverDefaults
+): QuotaExhaustionRoute {
+  const declared = node as { failover_provider?: string; failover_model?: string };
+  const provider = declared.failover_provider ?? defaults.failoverProvider;
+  if (!provider || provider === currentProvider || !isRegisteredProvider(provider)) {
+    return { kind: 'wait' };
+  }
+  const required = deriveNodeExecutionRequirements(node);
+  if (getMissingProviderExecutionCapabilities(provider, required).length > 0) {
+    return { kind: 'wait' };
+  }
+  return {
+    kind: 'failover',
+    provider,
+    model: declared.failover_model ?? defaults.failoverModel,
+  };
 }
 
 /**

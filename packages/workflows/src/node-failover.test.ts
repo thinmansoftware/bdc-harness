@@ -88,6 +88,16 @@ function authFailure(): Generator<Chunk, void, unknown> {
     };
   })();
 }
+function quotaFailure(): Generator<Chunk, void, unknown> {
+  return (function* () {
+    yield {
+      type: 'result',
+      isError: true,
+      errorSubtype: 'quota_exhausted',
+      errors: ["You're out of extra usage"],
+    };
+  })();
+}
 function success(content = 'ok'): Generator<Chunk, void, unknown> {
   return (function* () {
     yield { type: 'assistant', content };
@@ -375,6 +385,43 @@ describe('node-level availability failover (prompt node)', () => {
     expect(events.some(e => e.event_type === 'node_completed' && e.step_name === 'plan')).toBe(
       true
     );
+  });
+
+  it('routes real quota exhaustion to a declared capable provider before scheduling a wait', async () => {
+    const node = {
+      id: 'quota-route',
+      prompt: 'Do work.',
+      provider: 'claude',
+      failover_provider: 'codex',
+      failover_model: 'sol',
+      allowed_tools: [],
+    } as DagNode;
+    const result = await runNode(node, {
+      claude: quotaFailure,
+      codex: () => success('served by sol'),
+    });
+
+    expect(result.calls.claude).toBe(1);
+    expect(result.calls.codex).toBe(1);
+    expect(result.events.some(event => event.event_type === 'node_failover')).toBe(true);
+  });
+
+  it('routes loop quota exhaustion through the same declared failover path', async () => {
+    const node = {
+      id: 'quota-loop-route',
+      loop: { prompt: 'Do work.', until: 'COMPLETE', max_iterations: 1 },
+      provider: 'claude',
+      failover_provider: 'codex',
+      failover_model: 'sol',
+    } as DagNode;
+    const result = await runNode(node, {
+      claude: quotaFailure,
+      codex: () => success('COMPLETE'),
+    });
+
+    expect(result.calls.claude).toBe(1);
+    expect(result.calls.codex).toBe(1);
+    expect(result.events.some(event => event.event_type === 'node_failover')).toBe(true);
   });
 
   it('Scenario 2: auth error -> NO failover, normal failure', async () => {

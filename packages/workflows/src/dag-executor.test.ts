@@ -6476,8 +6476,8 @@ describe('executeDagWorkflow -- credit exhaustion', () => {
       expect.objectContaining({
         attemptId: wait.attemptId,
         outcomeClass: 'quota',
-        reasonCode: 'provider_quota_wait',
-        resumeAt: wait.resumeAt,
+        reasonCode: 'provider_quota_exhausted',
+        resumeAt: null,
       })
     );
     expect(store.updateWorkflowRun).toHaveBeenCalledWith(

@@ -8,7 +8,11 @@ import {
   registerBuiltinProviders,
   registerCommunityProviders,
 } from '@archon/providers';
-import { assertProviderCanExecuteNode, isAvailabilityError } from '../node-failover';
+import {
+  assertProviderCanExecuteNode,
+  isAvailabilityError,
+  selectQuotaExhaustionRoute,
+} from '../node-failover';
 import type { DagNode } from '../schemas/dag-node';
 import type { IWorkflowStore } from '../store';
 import { collectMechanicalEvidence, type MechanicalEvidenceInput } from './evidence-collector';
@@ -136,24 +140,40 @@ function scheduledWait(provider: string): ScheduledProviderWaitRecord {
 
 describe('Smart Cauldron controlled failure injection', () => {
   test('Claude exhausted routes sideways to capable Codex', async () => {
-    const persisted = await durable('claude-to-codex', {
-      exhaustedProvider: 'claude',
-      servedProvider: 'codex',
-      outcome: reduceRunOutcome(outcome({ routeState: 'failed_over' })),
+    const node = {
+      id: 'implement',
+      prompt: 'Implement.',
+      failover_provider: 'codex',
+      failover_model: 'sol',
+    } as DagNode;
+    expect(selectQuotaExhaustionRoute('claude', node, {})).toEqual({
+      kind: 'failover',
+      provider: 'codex',
+      model: 'sol',
     });
-    expect(isAvailabilityError('429 rate limit reached')).toBe(true);
-    expect(persisted.servedProvider).toBe('codex');
-    expect(persisted.outcome.routeState).toBe('failed_over');
   });
 
   test('Codex exhausted routes sideways to capable Claude', async () => {
-    const persisted = await durable('codex-to-claude', {
-      exhaustedProvider: 'codex',
-      servedProvider: 'claude',
-      outcome: reduceRunOutcome(outcome({ routeState: 'failed_over' })),
+    const node = {
+      id: 'implement',
+      prompt: 'Implement.',
+      failover_provider: 'claude',
+      failover_model: 'fable',
+    } as DagNode;
+    expect(selectQuotaExhaustionRoute('codex', node, {})).toEqual({
+      kind: 'failover',
+      provider: 'claude',
+      model: 'fable',
     });
-    expect(persisted.servedProvider).toBe('claude');
-    expect(persisted.outcome.routeState).toBe('failed_over');
+  });
+
+  test('quota exhaustion waits when the declared failover lacks execution capability', () => {
+    const node = {
+      id: 'apply-patch',
+      prompt: 'Fix it.',
+      failover_provider: 'opr-zero',
+    } as DagNode;
+    expect(selectQuotaExhaustionRoute('claude', node, {})).toEqual({ kind: 'wait' });
   });
 
   test('all capable providers exhausted remains a durable provider wait after restart', async () => {

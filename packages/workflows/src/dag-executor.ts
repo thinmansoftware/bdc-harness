@@ -97,7 +97,11 @@ import {
   isPaperworkNode,
   hasPushArtifact,
 } from './executor-shared';
-import { assertProviderCanExecuteNode, isAvailabilityError } from './node-failover';
+import {
+  assertProviderCanExecuteNode,
+  isAvailabilityError,
+  selectQuotaExhaustionRoute,
+} from './node-failover';
 import { loadAgentRegistry, resolveAgent } from './agents/registry';
 import type { AgentRegistry } from './agents/registry';
 import { loadContext } from '@archon/persona-context-loader';
@@ -491,6 +495,14 @@ type NodeExecutionResult = NodeOutput & {
   requestedModelId?: string;
   servedModelId?: string | null;
   modelMismatch?: boolean;
+  quotaExhausted?: {
+    attemptId: string;
+    attemptNumber: number;
+    attemptStartedAt: string;
+    provider: string;
+    info: ResourceExhaustedInfo;
+    iteration?: number;
+  };
 };
 
 /** Throttle state for cancel checks (reads -- no write contention in WAL mode) */
@@ -905,6 +917,91 @@ async function emitResourceExhaustedRetry(
         'resource_exhausted_retry_event_persist_failed'
       );
     });
+}
+
+async function scheduleDurableProviderWait(
+  deps: WorkflowDeps,
+  platform: IWorkflowPlatform,
+  conversationId: string,
+  workflowRun: WorkflowRun,
+  nodeId: string,
+  exhausted: NonNullable<NodeExecutionResult['quotaExhausted']>
+): Promise<NodeExecutionResult> {
+  const now = Date.now();
+  const state: ResourceExhaustedRetryState = {
+    firstDetectedAt: new Date(exhausted.attemptStartedAt).getTime(),
+    attempt: exhausted.attemptNumber,
+  };
+  const ceilingMs = getResourceExhaustedCeilingMs();
+  const backoffMs = getResourceExhaustedBackoffMs(state.attempt);
+  const resumeAt = new Date(now + backoffMs).toISOString();
+  const waitId = randomUUID();
+  const scheduled = await deps.store.scheduleProviderWait({
+    waitId,
+    runId: workflowRun.id,
+    attemptId: exhausted.attemptId,
+    provider: exhausted.provider,
+    reasonCode: 'provider_quota_wait',
+    resumeAt,
+    state: 'scheduled',
+    claimOwnerId: null,
+    claimToken: null,
+    createdAt: new Date(now).toISOString(),
+    claimedAt: null,
+    cancelledAt: null,
+    completedAt: null,
+  });
+  if (!scheduled) {
+    throw new Error(`provider_wait_schedule_failed: run ${workflowRun.id} node ${nodeId}`);
+  }
+  await deps.store.updateWorkflowRun(workflowRun.id, {
+    status: 'waiting_provider',
+    metadata: {
+      provider_wait: {
+        wait_id: waitId,
+        attempt_id: exhausted.attemptId,
+        node_id: nodeId,
+        ...(exhausted.iteration !== undefined ? { iteration: exhausted.iteration } : {}),
+        provider: exhausted.provider,
+        reason_code: 'provider_quota_wait',
+        resume_at: resumeAt,
+      },
+    },
+  });
+  const outcomeUpdated = await deps.store.upsertRunOutcome(
+    workflowRun.id,
+    {
+      executionState: 'waiting_provider',
+      deliverableState: 'none',
+      validationState: 'not_run',
+      recoveryState: 'recoverable',
+      routeState: 'exhausted',
+      primaryReason: 'provider_quota_wait',
+      reasonCodes: ['provider_quota_wait'],
+      evidenceRefs: [`run:${workflowRun.id}`, `attempt:${exhausted.attemptId}`, `wait:${waitId}`],
+    },
+    new Date(now).toISOString()
+  );
+  if (!outcomeUpdated) {
+    throw new Error(`provider_wait_outcome_persist_failed: run ${workflowRun.id}`);
+  }
+  await emitResourceExhaustedRetry(
+    deps,
+    workflowRun.id,
+    nodeId,
+    exhausted.info,
+    state,
+    backoffMs,
+    ceilingMs,
+    exhausted.iteration
+  );
+  await safeSendMessage(
+    platform,
+    conversationId,
+    `! Node \`${nodeId}\` is durably waiting for ${exhausted.provider} usage to recover. It is eligible to resume at ${resumeAt}.`,
+    { workflowId: workflowRun.id, nodeName: nodeId }
+  );
+  return { state: 'skipped', output: '' };
 }
 
 /**
@@ -2268,106 +2365,35 @@ async function executeNodeInternal(
       providerAttemptCompleted = true;
     }
     if (error instanceof ResourceExhaustedPause) {
-      const now = Date.now();
-      const state: ResourceExhaustedRetryState = {
-        firstDetectedAt: new Date(providerAttempt.startedAt).getTime(),
-        attempt: providerAttempt.attemptNumber,
-      };
-      const ceilingMs = getResourceExhaustedCeilingMs();
-      const backoffMs = getResourceExhaustedBackoffMs(state.attempt);
-      const elapsedMs = now - state.firstDetectedAt;
-      const resumeAt = new Date(now + backoffMs).toISOString();
-
       lastNodeCancelCheck.delete(`${workflowRun.id}:${node.id}`);
       lastNodeActivityUpdate.delete(`${workflowRun.id}:${node.id}`);
       getLog().warn(
         {
           nodeId: node.id,
-          attempt: state.attempt,
-          backoffMs,
-          elapsedMs,
-          ceilingMs,
+          attempt: providerAttempt.attemptNumber,
+          provider,
           reason: error.info.reason,
-          resumeAt,
         },
-        'dag.node_resource_exhausted_wait_scheduled'
+        'dag.node_resource_exhausted_route_pending'
       );
       await finishProviderAttempt(deps, providerAttempt, {
         servedModelId: nodeServedModelId ?? null,
         outcomeClass: 'quota',
-        reasonCode: 'provider_quota_wait',
-        resumeAt,
+        reasonCode: 'provider_quota_exhausted',
       });
       providerAttemptCompleted = true;
-      const waitId = randomUUID();
-      const scheduled = await deps.store.scheduleProviderWait({
-        waitId,
-        runId: workflowRun.id,
-        attemptId: providerAttempt.attemptId,
-        provider,
-        reasonCode: 'provider_quota_wait',
-        resumeAt,
-        state: 'scheduled',
-        claimOwnerId: null,
-        claimToken: null,
-        createdAt: new Date(now).toISOString(),
-        claimedAt: null,
-        cancelledAt: null,
-        completedAt: null,
-      });
-      if (!scheduled) {
-        throw new Error(`provider_wait_schedule_failed: run ${workflowRun.id} node ${node.id}`);
-      }
-      await deps.store.updateWorkflowRun(workflowRun.id, {
-        status: 'waiting_provider',
-        metadata: {
-          provider_wait: {
-            wait_id: waitId,
-            attempt_id: providerAttempt.attemptId,
-            node_id: node.id,
-            provider,
-            reason_code: 'provider_quota_wait',
-            resume_at: resumeAt,
-          },
+      return {
+        state: 'failed',
+        output: '',
+        error: `resource_exhausted: ${error.info.detail}`,
+        quotaExhausted: {
+          attemptId: providerAttempt.attemptId,
+          attemptNumber: providerAttempt.attemptNumber,
+          attemptStartedAt: providerAttempt.startedAt,
+          provider,
+          info: error.info,
         },
-      });
-      const outcomeUpdated = await deps.store.upsertRunOutcome(
-        workflowRun.id,
-        {
-          executionState: 'waiting_provider',
-          deliverableState: 'none',
-          validationState: 'not_run',
-          recoveryState: 'recoverable',
-          routeState: 'exhausted',
-          primaryReason: 'provider_quota_wait',
-          reasonCodes: ['provider_quota_wait'],
-          evidenceRefs: [
-            `run:${workflowRun.id}`,
-            `attempt:${providerAttempt.attemptId}`,
-            `wait:${waitId}`,
-          ],
-        },
-        new Date(now).toISOString()
-      );
-      if (!outcomeUpdated) {
-        throw new Error(`provider_wait_outcome_persist_failed: run ${workflowRun.id}`);
-      }
-      await emitResourceExhaustedRetry(
-        deps,
-        workflowRun.id,
-        node.id,
-        error.info,
-        state,
-        backoffMs,
-        ceilingMs
-      );
-      await safeSendMessage(
-        platform,
-        conversationId,
-        `! Node \`${node.id}\` is waiting for ${provider} usage to recover. The run is durable and will be eligible to resume at ${resumeAt}.`,
-        nodeContext
-      );
-      return { state: 'skipped', output: '' };
+      };
     }
 
     const err = failureError as Error;
@@ -3622,94 +3648,25 @@ async function executeLoopNode(
         );
       } else if (error instanceof ResourceExhaustedPause) {
         if (!iterationAttempt) throw error;
-        const now = Date.now();
-        const state: ResourceExhaustedRetryState = {
-          firstDetectedAt: new Date(iterationAttempt.startedAt).getTime(),
-          attempt: iterationAttempt.attemptNumber,
-        };
-        const ceilingMs = getResourceExhaustedCeilingMs();
-        const backoffMs = getResourceExhaustedBackoffMs(state.attempt);
-        const resumeAt = new Date(now + backoffMs).toISOString();
         await finishProviderAttempt(deps, iterationAttempt, {
           servedModelId: loopServedModelId ?? null,
           outcomeClass: 'quota',
-          reasonCode: 'provider_quota_wait',
-          resumeAt,
+          reasonCode: 'provider_quota_exhausted',
         });
         iterationAttemptCompleted = true;
-        const waitId = randomUUID();
-        if (
-          !(await deps.store.scheduleProviderWait({
-            waitId,
-            runId: workflowRun.id,
+        return {
+          state: 'failed',
+          output: '',
+          error: `resource_exhausted: ${error.info.detail}`,
+          quotaExhausted: {
             attemptId: iterationAttempt.attemptId,
+            attemptNumber: iterationAttempt.attemptNumber,
+            attemptStartedAt: iterationAttempt.startedAt,
             provider: workflowProvider,
-            reasonCode: 'provider_quota_wait',
-            resumeAt,
-            state: 'scheduled',
-            claimOwnerId: null,
-            claimToken: null,
-            createdAt: new Date(now).toISOString(),
-            claimedAt: null,
-            cancelledAt: null,
-            completedAt: null,
-          }))
-        ) {
-          throw new Error(`provider_wait_schedule_failed: run ${workflowRun.id} node ${node.id}`);
-        }
-        await deps.store.updateWorkflowRun(workflowRun.id, {
-          status: 'waiting_provider',
-          metadata: {
-            provider_wait: {
-              wait_id: waitId,
-              attempt_id: iterationAttempt.attemptId,
-              node_id: node.id,
-              iteration: i,
-              provider: workflowProvider,
-              reason_code: 'provider_quota_wait',
-              resume_at: resumeAt,
-            },
+            info: error.info,
+            iteration: i,
           },
-        });
-        if (
-          !(await deps.store.upsertRunOutcome(
-            workflowRun.id,
-            {
-              executionState: 'waiting_provider',
-              deliverableState: 'none',
-              validationState: 'not_run',
-              recoveryState: 'recoverable',
-              routeState: 'exhausted',
-              primaryReason: 'provider_quota_wait',
-              reasonCodes: ['provider_quota_wait'],
-              evidenceRefs: [
-                `run:${workflowRun.id}`,
-                `attempt:${iterationAttempt.attemptId}`,
-                `wait:${waitId}`,
-              ],
-            },
-            new Date(now).toISOString()
-          ))
-        ) {
-          throw new Error(`provider_wait_outcome_persist_failed: run ${workflowRun.id}`);
-        }
-        await emitResourceExhaustedRetry(
-          deps,
-          workflowRun.id,
-          node.id,
-          error.info,
-          state,
-          backoffMs,
-          ceilingMs,
-          i
-        );
-        await safeSendMessage(
-          platform,
-          conversationId,
-          `! Loop node \`${node.id}\` is durably waiting for ${workflowProvider} usage to recover. It is eligible to resume at ${resumeAt}.`,
-          msgContext
-        );
-        return { state: 'skipped', output: '' };
+        };
       }
 
       if (iterationAttempt && !iterationAttemptCompleted) {
@@ -4928,14 +4885,21 @@ async function executeDagWorkflowInternal(
             // internally (resolveAgentPersona), so an incompatible codex+persona
             // pairing raises InfrastructureClassBlock -- caught here so the failover
             // never makes things worse than the original availability failure.
-            const loopFailoverTarget = resolveFailoverTarget(node, workflowLevelOptions);
+            const loopQuotaRoute = output.quotaExhausted
+              ? selectQuotaExhaustionRoute(loopProvider, node, workflowLevelOptions)
+              : null;
+            const loopFailoverTarget =
+              loopQuotaRoute?.kind === 'failover'
+                ? { provider: loopQuotaRoute.provider, model: loopQuotaRoute.model }
+                : resolveFailoverTarget(node, workflowLevelOptions);
+            const loopFailoverErrorClass = output.quotaExhausted ? 'quota' : 'availability';
             if (
               output.state === 'failed' &&
               output.error !== undefined &&
               loopFailoverTarget !== null &&
               loopFailoverTarget.provider !== loopProvider &&
               isRegisteredProvider(loopFailoverTarget.provider) &&
-              isAvailabilityError(output.error)
+              (loopQuotaRoute?.kind === 'failover' || isAvailabilityError(output.error))
             ) {
               const loopFailoverModel =
                 loopFailoverTarget.model ??
@@ -4948,12 +4912,12 @@ async function executeDagWorkflowInternal(
                   node.id,
                   { provider: loopProvider, model: loopModel },
                   { provider: loopFailoverTarget.provider, model: loopFailoverModel },
-                  'availability'
+                  loopFailoverErrorClass
                 );
                 await safeSendMessage(
                   platform,
                   conversationId,
-                  `! Loop node \`${node.id}\` hit an availability error on ${loopProvider}; failing over to ${loopFailoverTarget.provider} (one attempt).`,
+                  `! Loop node \`${node.id}\` hit a ${loopFailoverErrorClass} error on ${loopProvider}; failing over to ${loopFailoverTarget.provider} (one attempt).`,
                   { workflowId: workflowRun.id, nodeName: node.id }
                 );
                 output = await executeLoopNode(
@@ -4987,6 +4951,17 @@ async function executeDagWorkflowInternal(
                   { workflowId: workflowRun.id, nodeName: node.id }
                 );
               }
+            }
+
+            if (output.quotaExhausted) {
+              output = await scheduleDurableProviderWait(
+                deps,
+                platform,
+                conversationId,
+                workflowRun,
+                node.id,
+                output.quotaExhausted
+              );
             }
 
             return { nodeId: node.id, output };
@@ -5147,6 +5122,7 @@ async function executeDagWorkflowInternal(
               const isResourceExhaustedTimeout = output.error
                 ? output.error.startsWith('resource_exhausted_timeout')
                 : false;
+              const isQuotaExhausted = output.quotaExhausted !== undefined;
               // SDK success-contradictions are NEVER retried by this transient
               // budget -- the outer `sdkContradictionRetry` loop grants them
               // exactly one whole-node re-run. Without this exclusion,
@@ -5159,6 +5135,7 @@ async function executeDagWorkflowInternal(
               const shouldRetry =
                 !isFatal &&
                 !isResourceExhaustedTimeout &&
+                !isQuotaExhausted &&
                 !isContradiction &&
                 (retryConfig.onError === 'all' ||
                   (retryConfig.onError === 'transient' && isTransient));
@@ -5216,13 +5193,20 @@ async function executeDagWorkflowInternal(
           // 5xx / connection). If the node (or workflow) declares a failover
           // provider, re-dispatch this ONE node exactly once on it. Auth/billing/
           // other 4xx errors are NOT availability and fall straight through.
-          const failoverTarget = resolveFailoverTarget(node, workflowLevelOptions);
+          const quotaRoute = output.quotaExhausted
+            ? selectQuotaExhaustionRoute(provider, node, workflowLevelOptions)
+            : null;
+          const failoverTarget =
+            quotaRoute?.kind === 'failover'
+              ? { provider: quotaRoute.provider, model: quotaRoute.model }
+              : resolveFailoverTarget(node, workflowLevelOptions);
+          const failoverErrorClass = output.quotaExhausted ? 'quota' : 'availability';
           if (
             output.state === 'failed' &&
             output.error !== undefined &&
             failoverTarget !== null &&
             failoverTarget.provider !== provider && // never "failover" to the same provider
-            isAvailabilityError(output.error)
+            (quotaRoute?.kind === 'failover' || isAvailabilityError(output.error))
           ) {
             try {
               assertProviderCanExecuteNode(failoverTarget.provider, node);
@@ -5261,12 +5245,12 @@ async function executeDagWorkflowInternal(
                 node.id,
                 { provider, model: nodeOptions?.model },
                 { provider: failoverResolved.provider, model: failoverResolved.options?.model },
-                'availability'
+                failoverErrorClass
               );
               await safeSendMessage(
                 platform,
                 conversationId,
-                `! Node \`${node.id}\` hit an availability error on ${provider}; failing over to ${failoverResolved.provider} (one attempt).`,
+                `! Node \`${node.id}\` hit a ${failoverErrorClass} error on ${provider}; failing over to ${failoverResolved.provider} (one attempt).`,
                 { workflowId: workflowRun.id, nodeName: node.id }
               );
               output = await executeNodeInternal(
@@ -5306,6 +5290,17 @@ async function executeDagWorkflowInternal(
                 { workflowId: workflowRun.id, nodeName: node.id }
               );
             }
+          }
+
+          if (output.quotaExhausted) {
+            output = await scheduleDurableProviderWait(
+              deps,
+              platform,
+              conversationId,
+              workflowRun,
+              node.id,
+              output.quotaExhausted
+            );
           }
 
           return { nodeId: node.id, output };
