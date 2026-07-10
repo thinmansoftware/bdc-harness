@@ -169,3 +169,50 @@ performed. The following require separate user decisions and authority:
 
 The safe current state is a clean isolated worktree with durable local commits and
 the original dirty checkout preserved.
+
+## 2026-07-10 Round 3 correction
+
+This section supersedes the dual-supervisor verification claims above where they
+conflict. Round 2 review found that the earlier implementation and ledger were not
+yet sufficient. Round 3 closes the branch-owned findings as follows:
+
+- text-only AI fixtures now declare `allowed_tools: []`; undeclared authority
+  remains fail-closed
+- supervisor lease acquisition, takeover, authorization, reservation, and
+  finalization compare against database time rather than application clocks
+- a repair action must be atomically reserved before the external repair callback
+  runs; one unique reservation is allowed per incident
+- repair finalization records completed or failed status and closes the incident
+  as recovered or escalated under the same owner and fencing token
+- recovered or escalated incidents cannot be claimed for another automated repair
+- every initial workflow dispatch freezes or reuses persisted work-order authority
+  in the shared executor before any DAG node runs
+- all seven feature-development lanes are enumerated and tested for frozen-source
+  artifact and hash consumption
+- managed-clone reset eligibility now uses an exact descendant boundary rather
+  than a vulnerable string prefix
+- mechanical run-outcome persistence now fails on a lost compare-and-swap instead
+  of emitting false completion evidence
+- Windows Bun script nodes spawn `process.execPath`, removing the eight portability
+  failures previously attributed to Linux-only verification
+
+Round 3 verification at commit `f96e0976`:
+
+- `@archon/workflows` package test command: exit 0
+- sequential all-workspace test command: exit 0
+- repository `check:bundled`: exit 0; 36 commands, 96 workflows, 1 policy
+- repository `type-check`: exit 0 for every workspace package and scripts
+- repository `lint --max-warnings 0`: exit 0
+- repository `format:check`: exit 0
+- `git diff --check`: exit 0
+- ASCII scan of changed script and code files: exit 0
+
+Two qualifications remain. The root parallel test wrapper exits silently on this
+Windows host, while the same workspace tests pass sequentially. Also,
+`check:bundled-skill` reports an existing CLI documentation inventory drift in
+files untouched by this branch. Neither result is represented as green.
+
+The supervisor hook remains opt-in and unactivated. No live supervisor provider,
+refire, feature flag, deployment, merge, production mutation, or production
+database migration was performed. PostgreSQL behavior is covered by SQL-shape and
+type tests; live PostgreSQL execution remains a canary requirement.
