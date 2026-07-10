@@ -1,0 +1,71 @@
+# =============================================================================
+# Cauldron STAGING instance -- laptop (WO-HARNESS-CAULDRON-LAPTOP-STAGING-01)
+# =============================================================================
+#
+# Runs the SAME image as production archon-app-1 on Hetzner, fully isolated:
+#   - own event store:      ./staging-data/archon.db  (bind -> /.archon)
+#   - own user home:        ./staging-user-home       (bind -> /home/appuser)
+#   - own artifacts:        ./staging-artifacts       (bind -> /host-artifacts)
+#   - own operator token:   ARCHON_OPERATOR_TOKEN in .env.staging (NEVER the prod value)
+#   - port 3091, bound to 127.0.0.1 ONLY (prod is 3090 on Hetzner)
+#   - NO Telegram / Discord / Slack / Notion / n8n tokens (see .env.staging.example)
+#   - NOTHING mounted from prod paths; no SSH creds to Hetzner inside the container
+#
+# Lifecycle: use scripts/staging/staging-up.ps1 / staging-down.ps1 -- they build
+# the image at a named git ref (default origin/dev) and tag it archon-staging:current.
+# Do NOT `docker compose up` this file by hand without building first.
+#
+# Promote flow: docs/staging.md (merge -> stage -> canary -> M-09 motion -> Hetzner
+# rebuild at the SAME commit).
+
+name: archon-staging
+
+services:
+  app:
+    # Image is built by scripts/staging/staging-up.ps1 from a clean worktree at
+    # the requested ref (same Dockerfile as prod). No build: key here on purpose:
+    # the deployed commit must be explicit, not "whatever the checkout happens to be".
+    image: archon-staging:current
+    container_name: archon-staging
+    env_file: .env.staging
+    environment:
+      ARCHON_DOCKER: "true"
+      # Server listen port inside the container. Must match the host mapping below
+      # and the healthcheck. Staging is 3091 so it can never be mistaken for prod 3090.
+      PORT: "3091"
+      # Same dual-name token mapping as prod compose (WO #171): workflows push
+      # branches/PRs via gh CLI (GITHUB_TOKEN) and the legacy entrypoint check
+      # (GH_TOKEN). Values come from .env.staging (gitignored) -- never literals here.
+      GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+      GH_TOKEN: ${GH_TOKEN:-${GITHUB_TOKEN:-}}
+    ports:
+      # localhost-only bind -- staging must never be reachable off the laptop.
+      - "127.0.0.1:3091:3091"
+    volumes:
+      # Own event store + workspaces/worktrees. The engine keeps everything under
+      # /.archon (archon.db, workspaces/, worktrees/), so this ONE bind is the
+      # isolation boundary for run state. Persists across up/down (bind mount).
+      - ./staging-data:/.archon
+      # Own user home (Claude/Codex auth state, gitconfig). Prod persists this to
+      # a named volume / host path on Hetzner; staging gets its own local dir.
+      - ./staging-user-home:/home/appuser
+      # WO-168 Tier 1 artifact mount (load-bearing workflow output before push).
+      - ./staging-artifacts:/host-artifacts
+    networks:
+      - archon-staging-network
+    # No restart policy: staging must NOT autostart at boot (WO section 6;
+    # Phase 2 of the restructuring plan owns startup supervision).
+    restart: "no"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3091/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    dns:
+      - 8.8.8.8
+      - 8.8.4.4
+
+networks:
+  archon-staging-network:
+    driver: bridge
