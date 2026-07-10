@@ -6,9 +6,16 @@ Operator-run watcher for `WO-HARNESS-DISPATCH-DROPBOX-V1-01`.
 
 1. Copy `scripts/dispatch-worker/config.example.json` to `scripts/dispatch-worker/config.local.json`.
 2. Set the operator token in the env var named by `operator_token_env` (default `ARCHON_OPERATOR_TOKEN`).
-3. Verify the local headless CLI forms on the laptop before first use:
-   - Claude Code: `claude -p <prompt>`
-   - Codex/Sol: `codex exec <prompt>`
+3. Headless CLI forms -- LIVE-VERIFIED on the operator desktop 2026-07-10
+   (closes the plan's Dependency #1 / WO Stop Condition #4 CLI-shape check):
+   - Claude Code: `claude -p <prompt>` -- verified working as-is.
+   - Codex/Sol: `codex exec --skip-git-repo-check <prompt>` -- the
+     `--skip-git-repo-check` flag is REQUIRED: without it codex exec refuses
+     to run in any untrusted/non-git working directory ("Not inside a trusted
+     directory"), and dispatch tasks run in arbitrary workdirs. The example
+     config ships this flag.
+   A full end-to-end dispatch transcript on the desktop remains the final
+   Stop Condition #4 evidence once the worker is activated (M-10 gate).
 4. Run:
 
 ```bash

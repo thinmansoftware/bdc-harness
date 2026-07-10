@@ -22,7 +22,7 @@
     },
     "codex": {
       "command": "codex",
-      "args": ["exec", "{{prompt}}"]
+      "args": ["exec", "--skip-git-repo-check", "{{prompt}}"]
     }
   }
 }
