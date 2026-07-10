@@ -15,6 +15,7 @@ COPY package.json bun.lock ./
 
 # Copy ALL workspace package.json files (monorepo lockfile depends on all of them)
 COPY packages/adapters/package.json ./packages/adapters/
+COPY packages/canary-suite/package.json ./packages/canary-suite/
 COPY packages/cli/package.json ./packages/cli/
 COPY packages/core/package.json ./packages/core/
 # docs-web source is NOT copied — it's a static site deployed separately
@@ -142,6 +143,7 @@ COPY package.json bun.lock ./
 
 # Copy ALL workspace package.json files
 COPY packages/adapters/package.json ./packages/adapters/
+COPY packages/canary-suite/package.json ./packages/canary-suite/
 COPY packages/cli/package.json ./packages/cli/
 COPY packages/core/package.json ./packages/core/
 # docs-web source is NOT copied — it's a static site deployed separately
@@ -166,6 +168,7 @@ RUN bun install --frozen-lockfile --production --ignore-scripts --linker=hoisted
 
 # Copy application source (Bun runs TypeScript directly, no compile step needed)
 COPY packages/adapters/ ./packages/adapters/
+COPY packages/canary-suite/ ./packages/canary-suite/
 COPY packages/cli/ ./packages/cli/
 COPY packages/core/ ./packages/core/
 COPY packages/git/ ./packages/git/

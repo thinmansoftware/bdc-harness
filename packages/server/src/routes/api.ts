@@ -149,6 +149,7 @@ import {
   codebaseEnvironmentsResponseSchema,
 } from './schemas/config.schemas';
 import { providerListResponseSchema } from './schemas/provider.schemas';
+import { canarySnapshotQuerySchema, canarySnapshotResponseSchema } from './schemas/canary.schemas';
 import {
   drainBodySchema,
   drainResponseSchema,
@@ -169,6 +170,7 @@ import {
 } from './schemas/dispatch.schemas';
 import { getProviderInfoList, isRegisteredProvider } from '@archon/providers';
 import { claudeProviderThrottle } from '@archon/providers/claude/throttle';
+import { buildProductionCanarySnapshot } from '../services/canary-snapshot';
 
 // Read app version: use build-time constant in binary, package.json in dev
 let appVersion = 'unknown';
@@ -997,6 +999,22 @@ const getAdminDrainRoute = createRoute({
   },
 });
 
+const getCanarySnapshotRoute = createRoute({
+  method: 'get',
+  path: '/api/admin/canary/snapshot',
+  tags: ['Admin'],
+  summary: 'Read immutable Smart Cauldron canary planning facts',
+  request: { query: canarySnapshotQuerySchema },
+  responses: {
+    200: {
+      content: { 'application/json': { schema: canarySnapshotResponseSchema } },
+      description: 'Read-only canary snapshot',
+    },
+    400: jsonError('Bad request'),
+    500: jsonError('Server error'),
+  },
+});
+
 const cancelStaleWorkflowRunsRoute = createRoute({
   method: 'post',
   path: '/api/workflows/runs/cancel-stale',
@@ -1400,7 +1418,8 @@ export function registerApiRoutes(
   app: OpenAPIHono,
   webAdapter: WebAdapter,
   lockManager: ConversationLockManager,
-  activePlatforms?: readonly string[]
+  activePlatforms?: readonly string[],
+  canarySnapshotBuilder: typeof buildProductionCanarySnapshot = buildProductionCanarySnapshot
 ): void {
   function apiError(
     c: Context,
@@ -3297,6 +3316,20 @@ export function registerApiRoutes(
     } catch (error) {
       getLog().error({ err: error }, 'get_admin_drain_api_failed');
       return apiError(c, 500, 'Failed to read drain state');
+    }
+  });
+
+  registerOpenApiRoute(getCanarySnapshotRoute, async c => {
+    try {
+      const query = (
+        c.req as unknown as {
+          valid(k: 'query'): { codebaseId: string; baseBranch: 'dev' };
+        }
+      ).valid('query');
+      return c.json(await canarySnapshotBuilder(query.codebaseId, query.baseBranch));
+    } catch (error) {
+      getLog().error({ err: error }, 'get_canary_snapshot_api_failed');
+      return apiError(c, 500, 'Failed to build canary snapshot');
     }
   });
 

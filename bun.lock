@@ -39,6 +39,17 @@
         "typescript": "^5.0.0",
       },
     },
+    "packages/canary-suite": {
+      "name": "@archon/canary-suite",
+      "version": "0.3.10",
+      "bin": {
+        "archon-canary": "./src/cli.ts",
+      },
+      "dependencies": {
+        "@archon/smart-cauldron": "workspace:*",
+        "zod": "^3.25.28",
+      },
+    },
     "packages/cli": {
       "name": "@archon/cli",
       "version": "0.3.10",
@@ -308,6 +319,8 @@
     "@anthropic-ai/sdk": ["@anthropic-ai/sdk@0.93.0", "", { "dependencies": { "json-schema-to-ts": "^3.1.1" }, "peerDependencies": { "zod": "^3.25.0 || ^4.0.0" }, "optionalPeers": ["zod"], "bin": { "anthropic-ai-sdk": "bin/cli" } }, "sha512-q9vaSZQVFx6B/gPxetGYfLXSJD5v0sOmh0OpZDq7yCrTSA+Rscvrtyol7JJTW40wEpQB4U1B4JXzxQitbQ3CAA=="],
 
     "@archon/adapters": ["@archon/adapters@workspace:packages/adapters"],
+
+    "@archon/canary-suite": ["@archon/canary-suite@workspace:packages/canary-suite"],
 
     "@archon/cli": ["@archon/cli@workspace:packages/cli"],
 

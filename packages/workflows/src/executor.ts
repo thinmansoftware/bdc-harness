@@ -2,7 +2,6 @@
  * Workflow Executor - runs DAG-based workflows
  */
 import { mkdir, readFile } from 'fs/promises';
-import { createHash } from 'crypto';
 import { join, resolve } from 'path';
 import type { IWorkflowPlatform, WorkflowMessageMetadata } from './deps';
 import type { WorkflowDeps, WorkflowConfig } from './deps';
@@ -23,6 +22,7 @@ import {
   type RunAuthorityDispatch,
   type RunAuthorityInput,
 } from './reliability/run-authority';
+import { captureRuntimeRevisions } from './reliability/runtime-revisions';
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
 let cachedLog: ReturnType<typeof createLogger> | undefined;
@@ -66,10 +66,6 @@ function logSendError(
 /** Threshold for consecutive UNKNOWN errors before aborting */
 const UNKNOWN_ERROR_THRESHOLD = 3;
 
-function sha256(value: string | Uint8Array): string {
-  return `sha256:${createHash('sha256').update(value).digest('hex')}`;
-}
-
 async function gitRevision(cwd: string, revision: string): Promise<string> {
   const { stdout } = await execFileAsync(
     'git',
@@ -100,8 +96,7 @@ async function captureRunAuthorityInput(
   );
   const headBranch = branchOutput.trim();
   if (!headBranch) throw new Error('scope_authority_missing: headBranch');
-  const workflowRevision = sha256(JSON.stringify(workflow));
-  const engineRevision = sha256(await readFile(new URL(import.meta.url)));
+  const revisions = await captureRuntimeRevisions(workflow);
 
   return {
     ...source,
@@ -114,10 +109,10 @@ async function captureRunAuthorityInput(
     runScopeSha: await gitRevision(cwd, 'HEAD'),
     headBranch,
     worktreePath: resolve(cwd),
-    workflowRevision,
-    bundleRevision: sha256(JSON.stringify(BUNDLED_POLICIES)),
-    engineRevision,
-    runtimeImageRevision: process.env.ARCHON_RUNTIME_IMAGE_REVISION ?? null,
+    workflowRevision: revisions.workflowRevision,
+    bundleRevision: revisions.bundleRevision,
+    engineRevision: revisions.engineRevision,
+    runtimeImageRevision: revisions.runtimeImageRevision,
     createdAt: new Date(parseDbTimestamp(workflowRun.started_at)).toISOString(),
   };
 }

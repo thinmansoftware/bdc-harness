@@ -4,12 +4,21 @@
 import { z } from '@hono/zod-openapi';
 
 /** Provider capability flags. */
+const providerExecutionCapabilitiesSchema = z.object({
+  text: z.boolean(),
+  repositoryRead: z.boolean(),
+  repositoryWrite: z.boolean(),
+  shell: z.boolean(),
+});
+
 const providerCapabilitiesSchema = z
   .object({
+    execution: providerExecutionCapabilitiesSchema,
     sessionResume: z.boolean(),
     mcp: z.boolean(),
     hooks: z.boolean(),
     skills: z.boolean(),
+    agents: z.boolean(),
     toolRestrictions: z.boolean(),
     structuredOutput: z.boolean(),
     envInjection: z.boolean(),

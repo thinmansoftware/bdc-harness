@@ -3,6 +3,7 @@ import { OpenAPIHono } from '@hono/zod-openapi';
 import { registerBuiltinProviders, clearRegistry } from '@archon/providers';
 import type { ConversationLockManager } from '@archon/core';
 import type { WebAdapter } from '../adapters/web';
+import { providerListResponseSchema } from './schemas/provider.schemas';
 import {
   makeDiscoverWorkflowsMock,
   makeLoaderMock,
@@ -227,5 +228,19 @@ describe('GET /api/providers', () => {
     expect(typeof caps.mcp).toBe('boolean');
     expect(typeof caps.hooks).toBe('boolean');
     expect(typeof caps.structuredOutput).toBe('boolean');
+  });
+
+  test('documents execution capabilities and agent support', async () => {
+    const response = await app.request('/api/providers');
+    const runtimeBody = await response.json();
+    const documentedBody = providerListResponseSchema.parse(runtimeBody) as {
+      providers: Array<{ capabilities: Record<string, unknown> }>;
+    };
+    for (const provider of documentedBody.providers) {
+      expect(typeof provider.capabilities.agents).toBe('boolean');
+      expect(
+        Object.keys(provider.capabilities.execution as Record<string, boolean>).sort()
+      ).toEqual(['repositoryRead', 'repositoryWrite', 'shell', 'text']);
+    }
   });
 });
