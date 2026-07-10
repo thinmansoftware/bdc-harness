@@ -885,6 +885,52 @@ describe('executeDagWorkflow -- mechanical evidence node', () => {
       expect(
         await readFile(join(testDir, 'artifacts', 'evidence', 'manifest-v2.txt'), 'utf8')
       ).toContain('PRs: https://github.com/bluedevilcollectibles/example/pull/42');
+
+      const casRunId = 'evidence-cas-run';
+      persistedOutcome = null;
+      (store.upsertRunOutcome as ReturnType<typeof mock>).mockImplementation(async () => false);
+      (store.getRunAuthority as ReturnType<typeof mock>).mockResolvedValue({
+        ...authority,
+        runId: casRunId,
+      });
+      (store.completeWorkflowRun as ReturnType<typeof mock>).mockClear();
+      (store.failWorkflowRun as ReturnType<typeof mock>).mockClear();
+      (store.createWorkflowEvent as ReturnType<typeof mock>).mockClear();
+
+      await executeDagWorkflow(
+        createMockDeps(store),
+        createMockPlatform(),
+        'conv-dag-cas',
+        testDir,
+        {
+          name: 'evidence-workflow',
+          nodes: [
+            {
+              id: 'build-manifest',
+              evidence: { kind: 'manifest_v2', required_gates: ['plan-review'] },
+            },
+          ],
+        },
+        makeWorkflowRun(casRunId),
+        'claude',
+        undefined,
+        join(testDir, 'artifacts-cas'),
+        join(testDir, 'logs-cas'),
+        'main',
+        'docs/',
+        minimalConfig
+      );
+
+      const casCompletedEvent = (
+        store.createWorkflowEvent as ReturnType<typeof mock>
+      ).mock.calls.find(
+        call =>
+          (call[0] as { event_type: string; step_name?: string }).event_type === 'node_completed' &&
+          (call[0] as { event_type: string; step_name?: string }).step_name === 'build-manifest'
+      );
+      expect(casCompletedEvent).toBeUndefined();
+      expect(store.failWorkflowRun).toHaveBeenCalled();
+      expect(store.completeWorkflowRun).not.toHaveBeenCalled();
     } finally {
       await rm(testDir, { recursive: true, force: true });
     }

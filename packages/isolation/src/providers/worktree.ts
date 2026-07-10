@@ -937,9 +937,11 @@ export class WorktreeProvider implements IIsolationProvider {
       );
       // Only hard-reset for Archon-managed clones (under ~/.archon/workspaces/).
       // Locally-registered repos get fetch-only to avoid destroying uncommitted work.
-      const isManagedClone = repoPath
+      const normalizedRepoPath = repoPath.replace(/\\/g, '/');
+      const normalizedManagedRoot = getArchonWorkspacesPath()
         .replace(/\\/g, '/')
-        .startsWith(getArchonWorkspacesPath().replace(/\\/g, '/'));
+        .replace(/\/+$/, '');
+      const isManagedClone = normalizedRepoPath.startsWith(`${normalizedManagedRoot}/`);
       const { branch } = await syncWorkspace(
         repoPath,
         configuredBaseBranch ? toBranchName(configuredBaseBranch) : undefined,

@@ -2330,6 +2330,34 @@ describe('WorktreeProvider', () => {
       });
     });
 
+    test('does not hard-reset a sibling path that only shares the managed-root prefix', async () => {
+      worktreeExistsSpy.mockResolvedValue(false);
+      const request: IsolationRequest = {
+        ...baseRequest,
+        canonicalRepoPath: join(TEST_ARCHON_HOME, 'workspaces-staging', 'owner', 'repo'),
+      };
+
+      await provider.create(request);
+
+      expect(syncWorkspaceSpy).toHaveBeenCalledWith(request.canonicalRepoPath, 'main', {
+        resetAfterFetch: false,
+      });
+    });
+
+    test('hard-resets a clone below the exact managed workspace root', async () => {
+      worktreeExistsSpy.mockResolvedValue(false);
+      const request: IsolationRequest = {
+        ...baseRequest,
+        canonicalRepoPath: join(TEST_ARCHON_HOME, 'workspaces', 'owner', 'repo'),
+      };
+
+      await provider.create(request);
+
+      expect(syncWorkspaceSpy).toHaveBeenCalledWith(request.canonicalRepoPath, 'main', {
+        resetAfterFetch: true,
+      });
+    });
+
     test('auto-detects base branch when fromBranch is set but no baseBranch configured', async () => {
       worktreeExistsSpy.mockResolvedValue(false);
       const configLoader: RepoConfigLoader = async () => ({});

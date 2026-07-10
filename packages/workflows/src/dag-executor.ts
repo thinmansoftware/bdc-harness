@@ -4474,7 +4474,14 @@ async function executeEvidenceNode(
     'utf8'
   );
   await writeFile(join(evidenceDir, 'manifest-v2.txt'), `${manifest}\n`, 'utf8');
-  await deps.store.upsertRunOutcome(workflowRun.id, evidence.outcome, new Date().toISOString());
+  const outcomeUpdated = await deps.store.upsertRunOutcome(
+    workflowRun.id,
+    evidence.outcome,
+    new Date().toISOString()
+  );
+  if (!outcomeUpdated) {
+    throw new Error(`run_outcome_conflict: ${workflowRun.id}`);
+  }
   await deps.store.createWorkflowEvent({
     workflow_run_id: workflowRun.id,
     event_type: 'node_completed',
