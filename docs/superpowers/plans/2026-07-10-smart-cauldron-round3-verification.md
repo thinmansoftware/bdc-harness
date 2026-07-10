@@ -87,3 +87,31 @@ f96e0976 fix(workflows): spawn current bun runtime for script nodes
 6. Run Linux CI and a disposable PostgreSQL integration canary.
 7. Only after those gates, separately approve supervisor activation and controlled
    Sol/Fable canary traffic.
+
+## Round 4 CI and authority correction
+
+Fable's Round 3 PR verification found two branch-owned CI failures and an
+undisclosed authority compatibility gap. The repair keeps PR #390 in draft and
+changes the implementation as follows:
+
+- Bun runtime path parsing now uses Win32 or POSIX path semantics selected by the
+  injected platform instead of the host running the test.
+- The production Docker stage copies `packages/smart-cauldron/`; the prior image
+  contained its package manifest but not the source imported by the server.
+- All seven feature-development lanes remain fail-closed and WO-scoped.
+- Each lane enables the explicit issue fallback. A message with `issue=<number>`
+  may freeze the GitHub issue body only when its title or body identifies a WO.
+- A message with neither a WO ID nor an approved issue remains rejected before DAG
+  execution.
+- Production authority retrieval accepts `GITHUB_TOKEN` or `GH_TOKEN`; a custom
+  injected fetcher remains available for hermetic tests.
+
+GitHub CI run `29090147158` established the original failures: three Linux resolver
+tests failed, and the Docker smoke exited because the server could not resolve
+`@archon/smart-cauldron/cascade`. The local host has no Docker CLI, so container
+boot is not claimed locally and must be proven by the repaired disposable GitHub
+Docker job. No Hetzner or production container was accessed.
+
+The existing per-run executor lease still uses application time. That is not
+silently represented as fixed; it is a separate follow-up described in
+`2026-07-10-smart-cauldron-run-lease-db-clock-follow-up.md`.

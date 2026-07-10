@@ -25,6 +25,7 @@ run_authority:
   spec_paths:
     - docs/work-orders/{WO_ID}.md
     - docs/superpowers/specs/{WO_ID}.md
+  allow_issue_fallback: true
 # zero lane: opr-zero = the generic OpenRouter client with no paid-seat failback.
 # provider: opr-zero is REQUIRED here so unpinned nodes do not inherit the default
 # provider while holding an OpenRouter model ID.

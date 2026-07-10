@@ -17,6 +17,30 @@ async function git(cwd: string, ...args: string[]): Promise<void> {
 
 afterEach(async () => {
   for (const root of temporaryRoots.splice(0)) {
+    const canonicalRepo = join(root, 'canonical');
+    try {
+      const { stdout } = await execFileAsync(
+        'git',
+        ['-C', canonicalRepo, 'worktree', 'list', '--porcelain'],
+        { windowsHide: true }
+      );
+      const worktrees = stdout
+        .split(/\r?\n/)
+        .filter(line => line.startsWith('worktree '))
+        .map(line => line.slice('worktree '.length))
+        .filter(path => path !== canonicalRepo);
+      for (const worktree of worktrees) {
+        await execFileAsync(
+          'git',
+          ['-C', canonicalRepo, 'worktree', 'remove', '--force', worktree],
+          {
+            windowsHide: true,
+          }
+        );
+      }
+    } catch {
+      // Setup may have failed before the repository or worktree existed.
+    }
     await rm(root, { recursive: true, force: true });
   }
 });

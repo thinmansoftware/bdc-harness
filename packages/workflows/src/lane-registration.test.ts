@@ -51,6 +51,7 @@ interface LaneDef {
     spec_repository?: string;
     spec_revision?: string;
     spec_paths?: string[];
+    allow_issue_fallback?: boolean;
   };
 }
 
@@ -153,6 +154,7 @@ describe('lane registration and war-council-validator pin', () => {
         spec_repository: 'bluedevilcollectibles/bdc-xo',
         spec_revision: 'main',
         spec_paths: ['docs/work-orders/{WO_ID}.md', 'docs/superpowers/specs/{WO_ID}.md'],
+        allow_issue_fallback: true,
       });
       const readSpec = lane.nodes?.find(node => node.id === 'read-spec');
       const authoritativePrefix = readSpec?.bash?.split('exit 0', 1)[0] ?? '';

@@ -8499,6 +8499,16 @@ describe('resolveBunRuntimeExecutable', () => {
     ).toBe('/usr/local/bin/bun');
   });
 
+  it('uses injected POSIX path semantics even when given a Windows-looking executable', () => {
+    expect(
+      resolveBunRuntimeExecutable({
+        execPath: 'C:\\tools\\bun.exe',
+        platform: 'linux',
+        which: () => '/usr/local/bin/bun',
+      })
+    ).toBe('/usr/local/bin/bun');
+  });
+
   it('resolves the native executable behind the Windows npm shim', () => {
     const native = 'C:\\npm\\node_modules\\bun\\bin\\bun.exe';
     expect(

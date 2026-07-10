@@ -25,6 +25,7 @@ run_authority:
   spec_paths:
     - docs/work-orders/{WO_ID}.md
     - docs/superpowers/specs/{WO_ID}.md
+  allow_issue_fallback: true
 # zero lane: glm provider = the generic OpenRouter client; build model is qwen.
 # provider: glm is REQUIRED here (no top-level provider would cause un-pinned nodes
 # to fall through to config-default claude with an OpenRouter model ID -- API rejection).

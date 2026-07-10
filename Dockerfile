@@ -171,6 +171,7 @@ COPY packages/overseer/ ./packages/overseer/
 COPY packages/paths/ ./packages/paths/
 COPY packages/providers/ ./packages/providers/
 COPY packages/server/ ./packages/server/
+COPY packages/smart-cauldron/ ./packages/smart-cauldron/
 COPY packages/workflows/ ./packages/workflows/
 COPY packages/persona-context-loader/ ./packages/persona-context-loader/
 

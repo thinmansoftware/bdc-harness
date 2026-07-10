@@ -65,9 +65,56 @@ describe('freezeWorkOrderSource', () => {
     );
   });
 
-  it('does not silently use an issue fallback', async () => {
+  it('freezes an explicit GitHub issue when the issue body identifies the WO', async () => {
+    const calls: Array<{ url: string; authorization?: string }> = [];
+    const fetcher: typeof fetch = async (input, init) => {
+      calls.push({
+        url: String(input),
+        authorization: new Headers(init?.headers).get('authorization') ?? undefined,
+      });
+      return response(200, {
+        number: 42,
+        title: 'WO-ISSUE-FALLBACK-01 implementation',
+        body: '# WO-ISSUE-FALLBACK-01\n\nExact issue-backed spec.\n',
+        updated_at: '2026-07-10T12:00:00Z',
+      });
+    };
+
+    const frozen = await freezeWorkOrderSource(
+      { ...policy, allow_issue_fallback: true },
+      'run issue=42',
+      { fetcher, githubToken: 'gh-token' }
+    );
+
+    expect(frozen.woId).toBe('WO-ISSUE-FALLBACK-01');
+    expect(frozen.specSource).toBe('github:bluedevilcollectibles/bdc-xo:issues/42');
+    expect(frozen.specRevision).toBe('issue:42:2026-07-10T12:00:00Z');
+    expect(Buffer.from(frozen.specBytes).toString('utf8')).toContain('Exact issue-backed spec');
+    expect(calls).toEqual([
+      {
+        url: 'https://api.github.com/repos/bluedevilcollectibles/bdc-xo/issues/42',
+        authorization: 'Bearer gh-token',
+      },
+    ]);
+  });
+
+  it('rejects an issue fallback that does not identify a WO', async () => {
+    const fetcher: typeof fetch = async () =>
+      response(200, {
+        number: 42,
+        title: 'Unscoped request',
+        body: 'No work-order identifier here.',
+        updated_at: '2026-07-10T12:00:00Z',
+      });
+
     await expect(
-      freezeWorkOrderSource({ ...policy, allow_issue_fallback: true }, 'WO-TEST-01')
-    ).rejects.toThrow('issue fallback is not implemented');
+      freezeWorkOrderSource({ ...policy, allow_issue_fallback: true }, 'issue=42', { fetcher })
+    ).rejects.toThrow('scope_authority_missing: woId');
+  });
+
+  it('still rejects an unscoped fire with neither a WO nor an issue', async () => {
+    await expect(
+      freezeWorkOrderSource({ ...policy, allow_issue_fallback: true }, 'build something')
+    ).rejects.toThrow('scope_authority_missing: woId or issue');
   });
 });

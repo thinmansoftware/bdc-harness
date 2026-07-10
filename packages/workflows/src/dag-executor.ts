@@ -9,7 +9,13 @@ import { existsSync } from 'fs';
 import { chmod, mkdir, readFile, unlink, writeFile } from 'fs/promises';
 import { randomUUID } from 'crypto';
 import { tmpdir } from 'os';
-import { basename, dirname, isAbsolute, join, resolve as resolvePath } from 'path';
+import {
+  isAbsolute,
+  join,
+  posix as posixPath,
+  resolve as resolvePath,
+  win32 as win32Path,
+} from 'path';
 import { execFileAsync } from '@archon/git';
 import { discoverScriptsForCwd } from './script-discovery';
 import type {
@@ -5865,17 +5871,24 @@ export function resolveBunRuntimeExecutable(options: BunRuntimeResolutionOptions
   const platform = options.platform ?? process.platform;
   const which = options.which ?? ((name: string): string | null => Bun.which(name));
   const exists = options.exists ?? existsSync;
-  const execName = basename(execPath).toLowerCase();
+  const platformPath = platform === 'win32' ? win32Path : posixPath;
+  const execName = platformPath.basename(execPath).toLowerCase();
   if (execName === 'bun' || execName === 'bun.exe') return execPath;
 
   const discovered = which('bun');
   if (!discovered) throw new Error('bun_runtime_executable_unavailable');
-  const discoveredName = basename(discovered).toLowerCase();
+  const discoveredName = platformPath.basename(discovered).toLowerCase();
   if (platform !== 'win32' || (discoveredName !== 'bun.cmd' && discoveredName !== 'bun.ps1')) {
     return discovered;
   }
 
-  const npmNative = join(dirname(discovered), 'node_modules', 'bun', 'bin', 'bun.exe');
+  const npmNative = platformPath.join(
+    platformPath.dirname(discovered),
+    'node_modules',
+    'bun',
+    'bin',
+    'bun.exe'
+  );
   if (exists(npmNative)) return npmNative;
   throw new Error(`bun_runtime_executable_unavailable: shell shim ${discovered}`);
 }

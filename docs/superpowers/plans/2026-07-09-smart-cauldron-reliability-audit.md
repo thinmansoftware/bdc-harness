@@ -225,3 +225,16 @@ The supervisor hook remains opt-in and unactivated. No live supervisor provider,
 refire, feature flag, deployment, merge, production mutation, or production
 database migration was performed. PostgreSQL behavior is covered by SQL-shape and
 type tests; live PostgreSQL execution remains a canary requirement.
+
+## 2026-07-10 Round 4 CI correction
+
+Fable's PR #390 verification correctly disproved the earlier implication that the
+branch was ready to advance. GitHub run `29090147158` failed on Linux path semantics
+and on a production image missing Smart Cauldron source. It also exposed that
+strict authority freezing needed the existing issue-backed fire pattern.
+
+Round 4 keeps unscoped feature fires rejected, enables explicit issue-backed
+authority for all seven governed lanes, selects path semantics from the requested
+platform, and packages Smart Cauldron source in the production image. The PR must
+remain draft until fresh Ubuntu, Windows, and Docker checks pass. Hetzner was not
+accessed or changed.

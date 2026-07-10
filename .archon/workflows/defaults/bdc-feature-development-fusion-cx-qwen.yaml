@@ -14,6 +14,7 @@ run_authority:
   spec_paths:
     - docs/work-orders/{WO_ID}.md
     - docs/superpowers/specs/{WO_ID}.md
+  allow_issue_fallback: true
 provider: opr  # root: bare AI tails use OpenRouter, not Codex/Claude (Codex exhausted 2026-07-09)
 model: x-ai/grok-4.5  # Grok substitute for prior root gpt-5.5/Codex default
 
