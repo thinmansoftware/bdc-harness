@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 # ascii-autofix.py -- Rule 13 mechanical normalizer (TOTAL fixer).
 #
-# Usage: python3 harness/scripts/ascii-autofix.py <BASE_SHA>
+# Usage:
+#   python3 harness/scripts/ascii-autofix.py --files-from <PATH>
+#   python3 harness/scripts/ascii-autofix.py <BASE_SHA>  # legacy compatibility
 #
 # Purpose: Convert EVERY non-ASCII byte in the gate's scope to ASCII so the
 # downstream ascii-gate becomes a no-fail verification. There are two tiers:
@@ -19,10 +21,9 @@
 # After both tiers the output is guaranteed pure ASCII by construction, so the
 # gate that runs next cannot fail on agent-leaked non-ASCII.
 #
-# Scope must match ascii-gate's file set:
-# - files changed from BASE..HEAD
-# - tracked/staged/uncommitted edits from git diff HEAD
-# - untracked files from git ls-files --others --exclude-standard
+# Normal workflow scope comes from --files-from. The workflow derives that sorted,
+# immutable list once, and both this fixer and ascii-gate consume the same bytes.
+# The positional BASE_SHA mode remains only for compatibility with older callers.
 #
 # Safety lines:
 # - Only files matching SRC_RE are touched (source code extensions).
@@ -41,6 +42,7 @@
 from __future__ import annotations
 
 import os
+import pathlib
 import re
 import subprocess
 import sys
@@ -135,6 +137,52 @@ def source_files_from_gate_scope(base: str | None) -> list[str]:
         if SRC_RE.search(path):
             files.append(path)
     return files
+
+
+class ScopeFileError(ValueError):
+    """The authoritative scope artifact is missing, invalid, or unsafe."""
+
+
+def source_files_from_manifest(manifest: str) -> tuple[pathlib.Path, list[str]]:
+    """Read a fail-closed source-file list rooted in the current Git repository."""
+    root_out, root_rc = run_git(["rev-parse", "--show-toplevel"])
+    if root_rc != 0 or not root_out.strip():
+        raise ScopeFileError("scope_authority_missing: repository root unavailable")
+    root = pathlib.Path(root_out.strip()).resolve()
+
+    manifest_path = pathlib.Path(manifest).resolve()
+    if not manifest_path.is_file():
+        raise ScopeFileError("scope_authority_missing: files-from list is missing")
+
+    try:
+        raw_lines = manifest_path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError) as exc:
+        raise ScopeFileError("scope_authority_missing: cannot read files-from list: %s" % exc)
+
+    seen: set[str] = set()
+    files: list[str] = []
+    for raw in raw_lines:
+        path = raw.strip()
+        if not path:
+            continue
+        listed = pathlib.Path(path)
+        if listed.is_absolute() or ".." in listed.parts:
+            raise ScopeFileError("outside repository: %s" % path)
+        resolved = (root / listed).resolve()
+        try:
+            resolved.relative_to(root)
+        except ValueError:
+            raise ScopeFileError("outside repository: %s" % path)
+        relative = listed.as_posix()
+        if relative in seen:
+            raise ScopeFileError("duplicate scope file: %s" % relative)
+        if not SRC_RE.search(relative):
+            raise ScopeFileError("unsupported scope file: %s" % relative)
+        if not resolved.is_file():
+            raise ScopeFileError("missing scope file: %s" % relative)
+        seen.add(relative)
+        files.append(relative)
+    return root, files
 
 
 # dead code -- whole-file normalization used; see WO-HARNESS-BDF-RESILIENCE-FIX-D-ASCII-AUTOFIX-01
@@ -258,7 +306,7 @@ def fix_file(path: str, lines_to_fix: set[int] | None) -> bool:
 
 def resolve_base(argv: list[str]) -> str | None:
     if len(argv) < 2:
-        sys.stderr.write("ascii-autofix: usage: ascii-autofix.py <BASE_SHA>\n")
+        sys.stderr.write("ascii-autofix: legacy usage requires <BASE_SHA>\n")
         return None
     base = argv[1].strip()
     if not base or base == "unknown":
@@ -271,11 +319,24 @@ def resolve_base(argv: list[str]) -> str | None:
 
 
 def main(argv: list[str]) -> int:
-    base = resolve_base(argv)
+    if len(argv) == 3 and argv[1] == "--files-from":
+        try:
+            root, files = source_files_from_manifest(argv[2])
+        except ScopeFileError as exc:
+            sys.stderr.write("ascii-autofix: %s\n" % exc)
+            return 2
+        os.chdir(root)
+    elif len(argv) == 2 and argv[1] != "--files-from":
+        base = resolve_base(argv)
+        files = source_files_from_gate_scope(base)
+    else:
+        sys.stderr.write(
+            "ascii-autofix: usage: ascii-autofix.py --files-from <PATH>\n"
+        )
+        return 2
+
     modified: list[str] = []
-    for path in source_files_from_gate_scope(base):
-        if not os.path.isfile(path):
-            continue
+    for path in files:
         # whole-file scope: None means normalize every line, not just added lines (WO-HARNESS-BDF-RESILIENCE-FIX-D-ASCII-AUTOFIX-01)
         if fix_file(path, None):
             modified.append(path)

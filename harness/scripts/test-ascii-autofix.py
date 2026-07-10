@@ -36,11 +36,11 @@ def main() -> int:
         # (label, input, expected_output)
         # Spec stop condition 0c: robot emoji input must normalize to the
         # empty string (STRIP fallback removes every unmapped byte).
-        ("arrow U+2192",        "→ arrow",        "-> arrow"),
-        ("em-dash U+2014",      "em—dash",        "em--dash"),
+        ("arrow U+2192",        "\u2192 arrow",        "-> arrow"),
+        ("em-dash U+2014",      "em\u2014dash",        "em--dash"),
         ("robot emoji U+1F916", "\U0001F916",     ""),
         ("robot emoji in word", "\U0001F916 robot", " robot"),
-        ("box-drawing U+2550",  "═ box",          "- box"),
+        ("box-drawing U+2550",  "\u2550 box",          "- box"),
     ]
 
     failures: list[str] = []

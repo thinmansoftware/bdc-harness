@@ -330,10 +330,35 @@ nodes:
           SINGLE_DECISION_NEEDED=<one sentence John can answer>
           SAFE_STATE=<nothing committed/pushed; plan stage only>
 
+  - id: capture-run-scope
+    persona: major-build
+    depends_on: [plan-review]
+    load_bearing: true
+    bash: |
+      set -euo pipefail
+      WT=$(git rev-parse --show-toplevel 2>/dev/null) || {
+        echo "scope_authority_missing: assigned worktree unavailable" >&2
+        exit 1
+      }
+      cd "$WT"
+      DIRTY=$(git status --porcelain=v1 --untracked-files=all)
+      if [ -n "$DIRTY" ]; then
+        echo "run_scope_dirty_at_capture" >&2
+        printf '%s\n' "$DIRTY" >&2
+        exit 1
+      fi
+      RUN_SCOPE_SHA=$(git rev-parse --verify 'HEAD^{commit}') || {
+        echo "scope_authority_missing: HEAD is not a commit" >&2
+        exit 1
+      }
+      mkdir -p "$ARTIFACTS_DIR"
+      printf '%s\n' "$RUN_SCOPE_SHA" > "$ARTIFACTS_DIR/run-scope-sha.txt"
+      echo "RUN_SCOPE_SHA=$RUN_SCOPE_SHA"
+
   - id: implement
     provider: codex
     model: gpt-5.5
-    depends_on: [plan-review]
+    depends_on: [capture-run-scope]
     task_class: medium_work
     loop:
       prompt: |
@@ -629,9 +654,57 @@ nodes:
   # non-ASCII. Exit 0 always (gate is the backstop if the fixer ever has a bug).
   # Anchor: WO-HARNESS-CAULDRON-PR-MANIFEST-AUTOFILL-01 failed the gate three times
   # because the agent leaked U+2192 arrows + em-dashes into the YAML it was editing.
-  - id: ascii-autofix
+  - id: derive-run-source-scope
     persona: major-build
     depends_on: [assert-implement-produced-work]
+    load_bearing: true
+    bash: |
+      set -euo pipefail
+      WT=$(git rev-parse --show-toplevel 2>/dev/null) || {
+        echo "scope_authority_missing: assigned worktree unavailable" >&2
+        exit 1
+      }
+      cd "$WT"
+      SCOPE_SHA_FILE="$ARTIFACTS_DIR/run-scope-sha.txt"
+      LIST_FILE="$ARTIFACTS_DIR/run-changed-source-files.txt"
+      if [ ! -s "$SCOPE_SHA_FILE" ]; then
+        echo "scope_authority_missing: run scope SHA is missing" >&2
+        exit 1
+      fi
+      SCOPE_SHA=$(cat "$SCOPE_SHA_FILE")
+      case "$SCOPE_SHA" in
+        *[!0-9a-f]*|'')
+          echo "scope_authority_missing: run scope SHA is invalid" >&2
+          exit 1
+          ;;
+      esac
+      if [ "${#SCOPE_SHA}" -ne 40 ] || ! git cat-file -e "${SCOPE_SHA}^{commit}" 2>/dev/null; then
+        echo "scope_authority_missing: run scope SHA is not a commit" >&2
+        exit 1
+      fi
+      if ! git merge-base --is-ancestor "$SCOPE_SHA" HEAD; then
+        echo "scope_authority_missing: run scope SHA is not an ancestor of HEAD" >&2
+        exit 1
+      fi
+      RAW_FILE=$(mktemp)
+      LIST_TMP=$(mktemp)
+      trap 'rm -f "$RAW_FILE" "$LIST_TMP"' EXIT
+      git diff --name-only --diff-filter=ACMRT "$SCOPE_SHA"..HEAD > "$RAW_FILE"
+      git diff --name-only --diff-filter=ACMRT HEAD >> "$RAW_FILE"
+      git ls-files --others --exclude-standard >> "$RAW_FILE"
+      LC_ALL=C sort -u "$RAW_FILE" | awk '
+        /\.(js|jsx|ts|tsx|mjs|cjs|html|sh|bash|gs|yaml|yml)$/ &&
+        $0 !~ /(\.generated\.(ts|js)$|bundled-defaults\.generated\.|\/__snapshots__\/|\.snap$)/
+      ' > "$LIST_TMP"
+      mv "$LIST_TMP" "$LIST_FILE"
+      rm -f "$RAW_FILE"
+      trap - EXIT
+      COUNT=$(grep -c . "$LIST_FILE" || true)
+      echo "RUN_CHANGED_SOURCE_FILES=$COUNT"
+
+  - id: ascii-autofix
+    persona: major-build
+    depends_on: [derive-run-source-scope]
     bash: |
       set -uo pipefail
       WT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
@@ -640,17 +713,22 @@ nodes:
         echo "ascii-autofix: WARN -- python3 not found, skipping normalization"
         exit 0
       fi
-      # Resolve BASE the SAME way ascii-gate does: immutable run-start SHA first,
-      # then merge-base origin/BASE_BRANCH, then HEAD~1.
-      BASE=$(cat "$ARTIFACTS_DIR/run-start-sha.txt" 2>/dev/null || echo "")
-      if [ -z "$BASE" ] || [ "$BASE" = "unknown" ] || ! git rev-parse --verify "$BASE" >/dev/null 2>&1; then
-        BASE_REF="origin/${BASE_BRANCH:-main}"
-        BASE=$(git merge-base HEAD "$BASE_REF" 2>/dev/null || git rev-parse HEAD~1 2>/dev/null || echo "")
+      if [ ! -f harness/scripts/ascii-autofix.py ]; then
+        echo "ascii-autofix: WARN -- normalizer not present in target worktree; gate remains authoritative"
+        exit 0
+      fi
+      SCOPE_FILE="$ARTIFACTS_DIR/run-changed-source-files.txt"
+      if [ ! -f "$SCOPE_FILE" ]; then
+        echo "scope_authority_missing: changed-source list is missing" >&2
+        exit 1
       fi
       # Run the total fixer; prefix every output line for node log clarity.
-      python3 harness/scripts/ascii-autofix.py "$BASE" 2>&1 | while IFS= read -r line; do
+      if ! python3 harness/scripts/ascii-autofix.py --files-from "$SCOPE_FILE" 2>&1 | while IFS= read -r line; do
         echo "ascii-autofix: $line"
-      done
+      done; then
+        echo "ascii-autofix: authoritative scope rejected" >&2
+        exit 1
+      fi
       exit 0
 
   # ascii-gate (Rule 13 mechanical enforcement, 2026-06-04 -- WO-HARNESS-CAULDRON-ASCII-ENFORCEMENT).
@@ -673,35 +751,33 @@ nodes:
     load_bearing: true
     bash: |
       set -uo pipefail
-      # Scope to source files changed by THIS run. Base = the immutable run-start SHA
-      # captured by read-spec (NOT a $RUN_START_SHA env var -- that token is substituted
-      # at parse time and is never exported to bash; read it from the artifact like the
-      # other nodes do). Fall back to origin/BASE_BRANCH merge-base if the artifact is gone.
+      # Consume the exact path list already used by ascii-autofix. Never recompute scope.
       WT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
       cd "$WT"
-      BASE=$(cat "$ARTIFACTS_DIR/run-start-sha.txt" 2>/dev/null || echo "")
-      if [ -z "$BASE" ] || [ "$BASE" = "unknown" ] || ! git rev-parse --verify "$BASE" >/dev/null 2>&1; then
-        BASE_REF="origin/${BASE_BRANCH:-main}"
-        BASE=$(git merge-base HEAD "$BASE_REF" 2>/dev/null || git rev-parse HEAD~1 2>/dev/null || echo "")
+      SCOPE_FILE="$ARTIFACTS_DIR/run-changed-source-files.txt"
+      if [ ! -f "$SCOPE_FILE" ]; then
+        echo "scope_authority_missing: changed-source list is missing" >&2
+        exit 1
       fi
-      SRC_RE='\.(js|jsx|ts|tsx|mjs|cjs|html|sh|bash|gs|yaml|yml)$'
-      # Generated/bundled artifacts are NOT hand-authored source -- they legitimately
-      # embed other files' content (e.g. bundled-defaults.generated.ts inlines every
-      # workflow YAML, including ones with valid non-ASCII prose). Scanning them makes
-      # the gate fail on pre-existing bytes the current WO never wrote. Exclude them so
-      # the gate only judges what THIS run actually authored. (Anchor 2026-06-24:
-      # WO-HARNESS-CAULDRON-PR-MANIFEST-AUTOFILL-01 was killed by 89 pre-existing
-      # non-ASCII lines in bundled-defaults.generated.ts identical to those on dev.)
-      EXCLUDE_RE='(\.generated\.(ts|js)$|bundled-defaults\.generated\.|/__snapshots__/|\.snap$)'
-      if [ -n "$BASE" ] && git rev-parse --verify "$BASE" >/dev/null 2>&1; then
-        CHANGED=$( { git diff --name-only "$BASE"..HEAD 2>/dev/null; git diff --name-only HEAD 2>/dev/null; git ls-files --others --exclude-standard 2>/dev/null; } | sort -u | grep -E "$SRC_RE" | grep -vE "$EXCLUDE_RE" || true )
-      else
-        CHANGED=$( { git diff --name-only HEAD 2>/dev/null; git ls-files --others --exclude-standard 2>/dev/null; } | sort -u | grep -E "$SRC_RE" | grep -vE "$EXCLUDE_RE" || true )
-      fi
-      if [ -z "$CHANGED" ]; then
+      if [ ! -s "$SCOPE_FILE" ]; then
         echo "ascii-gate PASS (no changed source files to scan)"
         exit 0
       fi
+      INVALID_SCOPE=$(mktemp)
+      while IFS= read -r f; do
+        [ -z "$f" ] && continue
+        case "$f" in
+          /*|..|../*|*/../*) printf '%s\n' "$f" >> "$INVALID_SCOPE" ;;
+          *) [ -f "$f" ] || printf '%s\n' "$f" >> "$INVALID_SCOPE" ;;
+        esac
+      done < "$SCOPE_FILE"
+      if [ -s "$INVALID_SCOPE" ]; then
+        echo "scope_authority_missing: invalid or missing changed-source path" >&2
+        cat "$INVALID_SCOPE" >&2
+        rm -f "$INVALID_SCOPE"
+        exit 1
+      fi
+      rm -f "$INVALID_SCOPE"
       # Portable non-ASCII detector. grep -P is not present in every build image, so probe
       # it once and fall back to perl, then to an LC_ALL=C byte-class grep.
       GREP_P_OK=0
@@ -722,11 +798,10 @@ nodes:
       # Accumulate offending files to a temp file (the while loop is fed by a pipe and
       # would otherwise run in a subshell where a HITS shell var could not persist).
       HITFILE=$(mktemp)
-      printf '%s\n' "$CHANGED" | while IFS= read -r f; do
+      while IFS= read -r f; do
         [ -z "$f" ] && continue
-        [ -f "$f" ] || continue
         if ! detect "$f"; then printf '%s\n' "$f" >> "$HITFILE"; fi
-      done
+      done < "$SCOPE_FILE"
       if [ -s "$HITFILE" ]; then
         echo "ASCII GATE FAILED -- non-ASCII bytes in changed source file(s):" >&2
         cat "$HITFILE" >&2
@@ -745,7 +820,8 @@ nodes:
         exit 1
       fi
       rm -f "$HITFILE"
-      echo "ascii-gate PASS (scanned $(printf '%s\n' "$CHANGED" | grep -c .) changed source file(s), all ASCII)"
+      COUNT=$(grep -c . "$SCOPE_FILE" || true)
+      echo "ascii-gate PASS (scanned $COUNT changed source file(s), all ASCII)"
       exit 0
 
   - id: war-council-validator
