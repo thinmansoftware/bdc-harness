@@ -689,6 +689,21 @@ function classifyAndEnrichCodexError(
   return { enrichedError, errorClass, shouldRetry };
 }
 
+function toErrorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function toCodexAuthPathError(error: unknown): Error {
+  if (error instanceof Error && error.message.toLowerCase().includes('codex auth error')) {
+    return error;
+  }
+  const authError = new Error(`Codex auth error: ${toErrorMessage(error)}`);
+  if (error instanceof Error) {
+    authError.cause = error;
+  }
+  return authError;
+}
+
 // --- Codex Provider ------------------------------------------------------
 
 /**
@@ -783,6 +798,24 @@ export class CodexProvider implements IAgentProvider {
     if (requestOptions?.abortSignal?.aborted) {
       throw new Error('Query aborted');
     }
+
+    const streamFailback = async function* (
+      failbackProvider: IAgentProvider,
+      authPath: boolean
+    ): AsyncGenerator<MessageChunk> {
+      try {
+        yield* failbackProvider.sendQuery(
+          prompt,
+          cwd,
+          undefined,
+          buildFailbackOptions(requestOptions)
+        );
+      } catch (failbackError) {
+        // WO-HARNESS-CODEX-PROVIDER-CRASH-ISOLATION-01: keep auth failback/abort
+        // rejections inside sendQuery so dag-executor fails the run, not the server.
+        throw authPath ? toCodexAuthPathError(failbackError) : failbackError;
+      }
+    };
 
     // 2. Create or resume thread
     let sessionResumeFailed = false;
@@ -940,12 +973,7 @@ export class CodexProvider implements IAgentProvider {
               '[CODEX FAILBACK] Codex auth failed (credential rotation). Review delegated to ' +
               `${this.failbackLabel}. Reduced cross-model adversarial value -- human review recommended.`,
           };
-          yield* failbackProvider.sendQuery(
-            prompt,
-            cwd,
-            undefined,
-            buildFailbackOptions(requestOptions)
-          );
+          yield* streamFailback(failbackProvider, true);
           return;
         }
 
@@ -980,7 +1008,7 @@ export class CodexProvider implements IAgentProvider {
             }
           } catch (refreshErr) {
             getLog().error({ provider: 'codex', err: refreshErr }, 'token_refresh_threw');
-            throw refreshErr;
+            throw toCodexAuthPathError(refreshErr);
           }
         }
 
@@ -1024,12 +1052,7 @@ export class CodexProvider implements IAgentProvider {
             // fallbackModel, assistantConfig) are stripped so Claude resolves
             // its own model defaults rather than receiving a Codex model id.
             // See buildFailbackOptions() for rationale.
-            yield* failbackProvider.sendQuery(
-              prompt,
-              cwd,
-              undefined,
-              buildFailbackOptions(requestOptions)
-            );
+            yield* streamFailback(failbackProvider, errorClass === 'auth');
             return;
           }
           throw enrichedError;
@@ -1063,11 +1086,9 @@ export class CodexProvider implements IAgentProvider {
       // Same sanitization rationale as the in-loop failback above:
       // strip Codex-specific model/fallbackModel/assistantConfig so Claude
       // does not receive a Codex model id from requestOptions.
-      yield* failbackProvider.sendQuery(
-        prompt,
-        cwd,
-        undefined,
-        buildFailbackOptions(requestOptions)
+      yield* streamFailback(
+        failbackProvider,
+        Boolean(lastError?.message.toLowerCase().includes('auth'))
       );
       return;
     }
