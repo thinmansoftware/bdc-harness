@@ -2044,7 +2044,10 @@ nodes:
     depends_on: [open-pr-if-needed, block-reclassify, pause-gate]
     trigger_rule: all_done
     task_class: clerical
-    prompt: |
+    evidence:
+      kind: manifest_v2
+      required_gates: [plan-review, block-reclassify, open-pr-if-needed]
+    legacy_prompt: |
       Construct the Captain CI completion manifest for this BDC feature Work Order.
 
       ## Outcome branch (Fix D, 2026-05-30) -- read this FIRST

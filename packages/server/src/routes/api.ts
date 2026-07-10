@@ -2757,6 +2757,8 @@ export function registerApiRoutes(
       const dashboardValidStatuses = [
         'pending',
         'running',
+        'waiting_provider',
+        'interrupted',
         'completed',
         'failed',
         'cancelled',
@@ -2788,7 +2790,13 @@ export function registerApiRoutes(
         offset,
         includeArchived,
       });
-      return c.json(result);
+      const runs = await Promise.all(
+        result.runs.map(async run => ({
+          ...run,
+          outcome: await workflowDb.getRunOutcome(run.id),
+        }))
+      );
+      return c.json({ ...result, runs });
     } catch (error) {
       getLog().error({ err: error }, 'list_dashboard_runs_failed');
       return apiError(c, 500, 'Failed to list dashboard runs');
@@ -3370,6 +3378,8 @@ export function registerApiRoutes(
       const validStatuses = [
         'pending',
         'running',
+        'waiting_provider',
+        'interrupted',
         'completed',
         'failed',
         'cancelled',
@@ -3390,10 +3400,16 @@ export function registerApiRoutes(
         limit,
         codebaseId,
       });
+      const runsWithOutcomes = await Promise.all(
+        runs.map(async run => ({
+          ...run,
+          outcome: await workflowDb.getRunOutcome(run.id),
+        }))
+      );
       // computeQuotaWindow queries the DB independently of the runs page so
       // windowTokens reflects ALL in-window runs, not just this page.
       const quotaWindow = await computeQuotaWindow(codebaseId);
-      return c.json({ runs, quotaWindow });
+      return c.json({ runs: runsWithOutcomes, quotaWindow });
     } catch (error) {
       getLog().error({ err: error }, 'list_workflow_runs_failed');
       return apiError(c, 500, 'Failed to list workflow runs');
@@ -3409,7 +3425,7 @@ export function registerApiRoutes(
       if (!run) {
         return apiError(c, 404, 'No workflow run found for this worker');
       }
-      return c.json({ run });
+      return c.json({ run: { ...run, outcome: await workflowDb.getRunOutcome(run.id) } });
     } catch (error) {
       getLog().error({ err: error }, 'workflow_run_by_worker_lookup_failed');
       return apiError(c, 500, 'Failed to look up workflow run');
@@ -3425,6 +3441,7 @@ export function registerApiRoutes(
         return apiError(c, 404, 'Workflow run not found');
       }
       const events = await workflowEventDb.listWorkflowEvents(runId);
+      const outcome = await workflowDb.getRunOutcome(runId);
       const tokenTotalsEvent = [...events]
         .reverse()
         .find(event => event.event_type === 'run_token_totals');
@@ -3455,6 +3472,7 @@ export function registerApiRoutes(
       return c.json({
         run: {
           ...run,
+          outcome,
           worker_platform_id: workerPlatformId,
           parent_platform_id: parentPlatformId,
           conversation_platform_id: conversationPlatformId ?? null,

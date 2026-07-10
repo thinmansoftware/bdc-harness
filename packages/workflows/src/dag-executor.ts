@@ -37,6 +37,7 @@ import type {
   PromptNode,
   LoopNode,
   ScriptNode,
+  EvidenceNode,
   NodeOutput,
   TriggerRule,
   WorkflowRun,
@@ -51,8 +52,10 @@ import {
   isApprovalNode,
   isCancelNode,
   isScriptNode,
+  isEvidenceNode,
   isApprovalContext,
 } from './schemas';
+import { collectRuntimeEvidence, renderManifestV2 } from './reliability/evidence-collector';
 import { formatToolCall } from './utils/tool-formatter';
 import { createLogger } from '@archon/paths';
 import { getWorkflowEventEmitter, buildGateResultField } from './event-emitter';
@@ -4466,6 +4469,76 @@ async function executeApprovalNode(
   return { state: 'completed' as const, output: '' };
 }
 
+async function executeEvidenceNode(
+  deps: WorkflowDeps,
+  cwd: string,
+  workflowRun: WorkflowRun,
+  node: EvidenceNode,
+  artifactsDir: string
+): Promise<NodeExecutionResult> {
+  const startedAt = Date.now();
+  await deps.store.createWorkflowEvent({
+    workflow_run_id: workflowRun.id,
+    event_type: 'node_started',
+    step_name: node.id,
+    data: { kind: node.evidence.kind, mechanical: true },
+  });
+  getWorkflowEventEmitter().emit({
+    type: 'node_started',
+    runId: workflowRun.id,
+    nodeId: node.id,
+    nodeName: node.id,
+  });
+
+  const evidence = await collectRuntimeEvidence(
+    deps.store,
+    async (command, args, commandCwd) => {
+      const result = await execFileAsync(command, [...args], {
+        cwd: commandCwd,
+        timeout: 30000,
+      });
+      return { stdout: result.stdout, stderr: result.stderr };
+    },
+    {
+      runId: workflowRun.id,
+      cwd,
+      executionState: 'running',
+      recoveryState: 'not_needed',
+      routeState: 'current',
+      requiredGateIds: node.evidence.required_gates,
+    }
+  );
+  const manifest = renderManifestV2(evidence);
+  const evidenceDir = join(artifactsDir, 'evidence');
+  await mkdir(evidenceDir, { recursive: true });
+  await writeFile(
+    join(evidenceDir, 'mechanical-evidence.json'),
+    `${JSON.stringify(evidence, null, 2)}\n`,
+    'utf8'
+  );
+  await writeFile(join(evidenceDir, 'manifest-v2.txt'), `${manifest}\n`, 'utf8');
+  await deps.store.upsertRunOutcome(workflowRun.id, evidence.outcome, new Date().toISOString());
+  await deps.store.createWorkflowEvent({
+    workflow_run_id: workflowRun.id,
+    event_type: 'node_completed',
+    step_name: node.id,
+    data: {
+      duration_ms: Date.now() - startedAt,
+      node_output: manifest,
+      mechanical: true,
+      outcome: evidence.outcome,
+    },
+  });
+  getWorkflowEventEmitter().emit({
+    type: 'node_completed',
+    runId: workflowRun.id,
+    nodeId: node.id,
+    nodeName: node.id,
+    duration: Date.now() - startedAt,
+  });
+  return { state: 'completed', output: manifest };
+}
+
 /**
  * Execute a complete DAG workflow.
  * Called from executeWorkflow() in executor.ts.
@@ -4779,7 +4852,13 @@ async function executeDagWorkflowInternal(
             }
           }
 
-          // 3. Bash node dispatch -- no AI, no session
+          // 3. Engine-side evidence node -- facts are collected mechanically, never by AI.
+          if (isEvidenceNode(node)) {
+            const output = await executeEvidenceNode(deps, cwd, workflowRun, node, artifactsDir);
+            return { nodeId: node.id, output };
+          }
+
+          // 3a. Bash node dispatch -- no AI, no session
           if (isBashNode(node)) {
             const output = await executeBashNode(
               deps,
@@ -5402,19 +5481,34 @@ async function executeDagWorkflowInternal(
   const anyFailed = nodeCounts.failed > 0;
 
   const pushArtifactPresent = [...nodeOutputs.values()].some(o => hasPushArtifact(o.output));
+  const hasMechanicalEvidenceNode = workflow.nodes.some(isEvidenceNode);
 
-  function makeTerminalOutcome(executionState: 'completed' | 'failed'): RunOutcome {
-    const primaryReason =
-      executionState === 'completed' ? 'execution_completed' : 'execution_failed';
+  async function makeTerminalOutcome(executionState: 'completed' | 'failed'): Promise<RunOutcome> {
+    const existing = await deps.store.getRunOutcome(workflowRun.id);
+    const deliverableState =
+      existing?.deliverableState ?? (pushArtifactPresent ? 'pushed' : 'none');
+    const validationState = existing?.validationState ?? 'not_run';
+    const primaryReason: RunOutcome['primaryReason'] =
+      executionState === 'failed'
+        ? deliverableState === 'pr_ready'
+          ? 'execution_failed_pr_ready'
+          : 'execution_failed'
+        : validationState === 'failed'
+          ? 'gate_failed'
+          : validationState === 'indeterminate'
+            ? 'gate_indeterminate'
+            : deliverableState === 'pr_ready'
+              ? 'pr_ready'
+              : 'execution_completed';
     return {
       executionState,
-      deliverableState: pushArtifactPresent ? 'pushed' : 'none',
-      validationState: 'not_run',
+      deliverableState,
+      validationState,
       recoveryState: executionState === 'failed' ? 'recoverable' : 'not_needed',
-      routeState: 'current',
+      routeState: existing?.routeState ?? 'current',
       primaryReason,
-      reasonCodes: [primaryReason],
-      evidenceRefs: [`run:${workflowRun.id}`],
+      reasonCodes: [...new Set([primaryReason, ...(existing?.reasonCodes ?? [])])],
+      evidenceRefs: [...new Set([`run:${workflowRun.id}`, ...(existing?.evidenceRefs ?? [])])],
     };
   }
 
@@ -5516,7 +5610,7 @@ async function executeDagWorkflowInternal(
     const failMsg =
       `DAG workflow '${workflow.name}' completed with no successful nodes. ` +
       'Check node conditions, trigger rules, and upstream failures.';
-    const failedOutcome = makeTerminalOutcome('failed');
+    const failedOutcome = await makeTerminalOutcome('failed');
     try {
       await deps.store.failWorkflowRun(workflowRun.id, failMsg, {
         outcome: failedOutcome,
@@ -5571,13 +5665,13 @@ async function executeDagWorkflowInternal(
       .filter(([, o]) => o.state === 'failed')
       .map(([id]) => id);
     const allFailuresArePaperwork = failedNodeIds.every(id => isPaperworkNode(id));
-    if (allFailuresArePaperwork && pushArtifactPresent) {
+    if (!hasMechanicalEvidenceNode && allFailuresArePaperwork && pushArtifactPresent) {
       getLog().warn(
         { workflowRunId: workflowRun.id, degradedPaperworkNodes: failedNodeIds },
         'dag.workflow_completed_paperwork_degraded'
       );
       const degradedDuration = Date.now() - dagStartTime;
-      const degradedOutcome = makeTerminalOutcome('completed');
+      const degradedOutcome = await makeTerminalOutcome('completed');
       try {
         await deps.store.completeWorkflowRun(
           workflowRun.id,
@@ -5640,7 +5734,7 @@ async function executeDagWorkflowInternal(
       .map(([id, o]) => `'${id}': ${o.state === 'failed' ? o.error : 'unknown'}`)
       .join('; ');
     const failMsg = `DAG workflow '${workflow.name}' completed with failures: ${failedNodes}`;
-    const failedOutcome = makeTerminalOutcome('failed');
+    const failedOutcome = await makeTerminalOutcome('failed');
     try {
       await deps.store.failWorkflowRun(workflowRun.id, failMsg, {
         outcome: failedOutcome,
@@ -5689,7 +5783,7 @@ async function executeDagWorkflowInternal(
 
   // Persist terminal facts before publishing any terminal event.
   const duration = Date.now() - dagStartTime;
-  const completedOutcome = makeTerminalOutcome('completed');
+  const completedOutcome = await makeTerminalOutcome('completed');
   try {
     await deps.store.completeWorkflowRun(
       workflowRun.id,

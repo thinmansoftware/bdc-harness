@@ -768,6 +768,175 @@ describe('executeDagWorkflow -- plan-review terminal safety', () => {
   });
 });
 
+describe('executeDagWorkflow -- mechanical evidence node', () => {
+  it('persists a verified PR-ready manifest and preserves it at terminal completion', async () => {
+    const testDir = join(tmpdir(), `dag-evidence-${Date.now()}`);
+    await mkdir(testDir, { recursive: true });
+    const headSha = '7'.repeat(40);
+    const baseSha = '3'.repeat(40);
+    const authority = {
+      runId: 'evidence-run',
+      dispatchId: 'dispatch-1',
+      woId: 'WO-TEST-01',
+      specSource: 'github:bluedevilcollectibles/bdc-xo:docs/work-orders/WO-TEST-01.md',
+      specRevision: '1'.repeat(40),
+      specHash: `sha256:${'2'.repeat(64)}`,
+      workflowName: 'evidence-workflow',
+      codebaseId: 'codebase-1',
+      canonicalRemote: 'https://github.com/bluedevilcollectibles/example.git',
+      baseBranch: 'main',
+      baseSha,
+      runScopeSha: baseSha,
+      headBranch: 'archon/thread-test',
+      worktreePath: testDir,
+      workflowRevision: `sha256:${'4'.repeat(64)}`,
+      bundleRevision: `sha256:${'5'.repeat(64)}`,
+      engineRevision: `sha256:${'6'.repeat(64)}`,
+      runtimeImageRevision: null,
+      createdAt: new Date().toISOString(),
+    } as const;
+    const store = createMockStore();
+    let persistedOutcome: unknown = null;
+    (store.upsertRunOutcome as ReturnType<typeof mock>).mockImplementation(
+      async (_runId, outcome) => {
+        persistedOutcome = outcome;
+        return true;
+      }
+    );
+    (store.getRunOutcome as ReturnType<typeof mock>).mockImplementation(
+      async () => persistedOutcome
+    );
+    (store.getRunAuthority as ReturnType<typeof mock>).mockResolvedValue(authority);
+    (store.claimRunLease as ReturnType<typeof mock>).mockImplementation(async lease => lease);
+    (store.releaseRunLease as ReturnType<typeof mock>).mockResolvedValue(true);
+    (store.listWorkflowEvents as ReturnType<typeof mock>).mockResolvedValue([
+      {
+        id: 'event-1',
+        workflow_run_id: 'evidence-run',
+        event_type: 'node_completed',
+        step_index: 0,
+        step_name: 'plan-review',
+        data: { node_output: 'PLAN_REVIEW_APPROVED' },
+        created_at: new Date().toISOString(),
+      },
+    ]);
+    spyOn(git, 'execFileAsync').mockImplementation(async (command: string, args: string[]) => {
+      if (command === 'gh') {
+        return {
+          stdout: JSON.stringify({
+            url: 'https://github.com/bluedevilcollectibles/example/pull/42',
+            number: 42,
+            state: 'OPEN',
+            isDraft: false,
+            baseRefName: 'main',
+            headRefName: 'archon/thread-test',
+            headRefOid: headSha,
+            files: [{ path: 'src/new.ts' }],
+            statusCheckRollup: [{ name: 'ci', conclusion: 'SUCCESS' }],
+          }),
+          stderr: '',
+        };
+      }
+      const joined = args.join(' ');
+      if (joined.includes('rev-parse')) return { stdout: `${headSha}\n`, stderr: '' };
+      if (joined.includes('symbolic-ref')) {
+        return { stdout: 'archon/thread-test\n', stderr: '' };
+      }
+      if (joined.includes('remote get-url')) {
+        return {
+          stdout: 'https://github.com/bluedevilcollectibles/example.git\n',
+          stderr: '',
+        };
+      }
+      if (joined.includes('merge-base')) return { stdout: `${baseSha}\n`, stderr: '' };
+      if (joined.includes('rev-list')) return { stdout: '0\n', stderr: '' };
+      if (joined.includes('diff --name-status')) return { stdout: 'A\tsrc/new.ts\n', stderr: '' };
+      throw new Error(`unexpected command: ${command} ${joined}`);
+    });
+
+    try {
+      await executeDagWorkflow(
+        createMockDeps(store),
+        createMockPlatform(),
+        'conv-dag',
+        testDir,
+        {
+          name: 'evidence-workflow',
+          nodes: [
+            {
+              id: 'build-manifest',
+              evidence: { kind: 'manifest_v2', required_gates: ['plan-review'] },
+            },
+          ],
+        },
+        makeWorkflowRun('evidence-run'),
+        'claude',
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        minimalConfig
+      );
+
+      const completionCall = (store.completeWorkflowRun as ReturnType<typeof mock>).mock.calls[0];
+      const terminal = completionCall?.[2] as { outcome?: { deliverableState?: string } };
+      expect(terminal.outcome?.deliverableState).toBe('pr_ready');
+      expect(
+        await readFile(join(testDir, 'artifacts', 'evidence', 'manifest-v2.txt'), 'utf8')
+      ).toContain('PRs: https://github.com/bluedevilcollectibles/example/pull/42');
+    } finally {
+      await rm(testDir, { recursive: true, force: true });
+    }
+  });
+
+  it('does not collapse a failed mechanical evidence tail into degraded completion', async () => {
+    const testDir = join(tmpdir(), `dag-evidence-failure-${Date.now()}`);
+    await mkdir(testDir, { recursive: true });
+    const store = createMockStore();
+    (store.getRunAuthority as ReturnType<typeof mock>).mockResolvedValue(null);
+    (store.claimRunLease as ReturnType<typeof mock>).mockImplementation(async lease => lease);
+    (store.releaseRunLease as ReturnType<typeof mock>).mockResolvedValue(true);
+    mockSendQueryDag.mockImplementation(function* () {
+      yield { type: 'assistant', content: 'PR_URL=https://github.com/foo/bar/pull/463' };
+      yield { type: 'result', sessionId: 'push-sess' };
+    });
+
+    try {
+      await executeDagWorkflow(
+        createMockDeps(store),
+        createMockPlatform(),
+        'conv-evidence-failure',
+        testDir,
+        {
+          name: 'evidence-failure-workflow',
+          nodes: [
+            { id: 'push-branch', prompt: 'push the branch' },
+            {
+              id: 'build-manifest',
+              evidence: { kind: 'manifest_v2', required_gates: [] },
+              depends_on: ['push-branch'],
+            },
+          ],
+        },
+        makeWorkflowRun('evidence-failure-run'),
+        'claude',
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        minimalConfig
+      );
+
+      expect((store.failWorkflowRun as ReturnType<typeof mock>).mock.calls.length).toBe(1);
+      expect((store.completeWorkflowRun as ReturnType<typeof mock>).mock.calls.length).toBe(0);
+    } finally {
+      await rm(testDir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('DAG Loader -- cycle detection', () => {
   let testDir: string;
 

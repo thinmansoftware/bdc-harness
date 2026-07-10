@@ -283,6 +283,24 @@ export type ScriptNode = z.infer<typeof scriptNodeSchema> & {
   cancel?: never;
 };
 
+export const evidenceNodeSchema = dagNodeBaseSchema.extend({
+  evidence: z.object({
+    kind: z.literal('manifest_v2'),
+    required_gates: z.array(z.string().min(1)).min(1),
+  }),
+});
+
+/** Engine-side mechanical evidence collection. Never delegates facts to an AI provider. */
+export type EvidenceNode = z.infer<typeof evidenceNodeSchema> & {
+  command?: never;
+  prompt?: never;
+  bash?: never;
+  loop?: never;
+  approval?: never;
+  cancel?: never;
+  script?: never;
+};
+
 /**
  * Loop node schema -- extends base with `loop` config.
  * AI-specific fields (provider, model, agent, persona, etc.) are supported on loop nodes
@@ -362,7 +380,8 @@ export type DagNode =
   | LoopNode
   | ApprovalNode
   | CancelNode
-  | ScriptNode;
+  | ScriptNode
+  | EvidenceNode;
 
 const REPOSITORY_READ_TOOLS = new Set(['read', 'grep', 'glob', 'search']);
 const REPOSITORY_WRITE_TOOLS = new Set(['edit', 'write', 'applypatch', 'notebookedit']);
@@ -505,6 +524,12 @@ export const dagNodeSchema = dagNodeBaseSchema
     cancel: z.string().optional(),
     // Script-only
     script: z.string().optional(),
+    evidence: z
+      .object({
+        kind: z.literal('manifest_v2'),
+        required_gates: z.array(z.string().min(1)).min(1),
+      })
+      .optional(),
     runtime: z.enum(['bun', 'uv']).optional(),
     deps: z.array(z.string().min(1, 'each dep must be a non-empty string')).optional(),
     // Bash/Script shared
@@ -530,6 +555,7 @@ export const dagNodeSchema = dagNodeBaseSchema
     const hasApproval = data.approval !== undefined;
     const hasCancel = typeof data.cancel === 'string' && data.cancel.trim().length > 0;
     const hasScript = typeof data.script === 'string' && data.script.trim().length > 0;
+    const hasEvidence = data.evidence !== undefined;
 
     const modeCount = [
       hasCommand,
@@ -539,13 +565,14 @@ export const dagNodeSchema = dagNodeBaseSchema
       hasApproval,
       hasCancel,
       hasScript,
+      hasEvidence,
     ].filter(Boolean).length;
 
     if (modeCount > 1) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
         message:
-          "'command', 'prompt', 'bash', 'loop', 'approval', 'cancel', and 'script' are mutually exclusive",
+          "'command', 'prompt', 'bash', 'loop', 'approval', 'cancel', 'script', and 'evidence' are mutually exclusive",
       });
       return z.NEVER;
     }
@@ -577,7 +604,7 @@ export const dagNodeSchema = dagNodeBaseSchema
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
         message:
-          "must have either 'command', 'prompt', 'bash', 'loop', 'approval', 'cancel', or 'script'",
+          "must have either 'command', 'prompt', 'bash', 'loop', 'approval', 'cancel', 'script', or 'evidence'",
       });
       return z.NEVER;
     }
@@ -729,6 +756,9 @@ export const dagNodeSchema = dagNodeBaseSchema
         ...(data.timeout !== undefined ? { timeout: data.timeout } : {}),
       } as ScriptNode;
     }
+    if (data.evidence !== undefined) {
+      return { ...base, evidence: data.evidence } as EvidenceNode;
+    }
     if (data.approval !== undefined) {
       return { ...base, ...shared, approval: data.approval } as ApprovalNode;
     }
@@ -771,6 +801,11 @@ export function isCancelNode(node: DagNode): node is CancelNode {
 /** Type guard: check if a DAG node is a script node */
 export function isScriptNode(node: DagNode): node is ScriptNode {
   return 'script' in node && typeof node.script === 'string';
+}
+
+/** Type guard: check if a node collects engine-side mechanical evidence. */
+export function isEvidenceNode(node: DagNode): node is EvidenceNode {
+  return 'evidence' in node && node.evidence?.kind === 'manifest_v2';
 }
 
 /** Type guard: validates a value is a known TriggerRule */

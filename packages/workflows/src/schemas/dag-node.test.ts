@@ -4,7 +4,33 @@ import {
   approvalNodeSchema,
   BASH_NODE_AI_FIELDS,
   deriveNodeExecutionRequirements,
+  isEvidenceNode,
 } from './dag-node';
+
+describe('mechanical evidence nodes', () => {
+  it('parses a manifest_v2 evidence node without AI execution fields', () => {
+    const node = dagNodeSchema.parse({
+      id: 'build-manifest',
+      evidence: { kind: 'manifest_v2', required_gates: ['plan-review'] },
+    });
+
+    expect(isEvidenceNode(node)).toBe(true);
+    expect(node).toEqual({
+      id: 'build-manifest',
+      evidence: { kind: 'manifest_v2', required_gates: ['plan-review'] },
+    });
+  });
+
+  it('rejects evidence combined with an AI prompt', () => {
+    expect(
+      dagNodeSchema.safeParse({
+        id: 'build-manifest',
+        prompt: 'Invent a manifest.',
+        evidence: { kind: 'manifest_v2', required_gates: [] },
+      }).success
+    ).toBe(false);
+  });
+});
 
 describe('deriveNodeExecutionRequirements', () => {
   it('keeps a text-only plan eligible for chat providers', () => {

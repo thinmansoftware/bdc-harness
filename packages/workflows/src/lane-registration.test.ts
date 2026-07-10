@@ -20,7 +20,7 @@ import {
   registerBuiltinProviders,
   registerCommunityProviders,
 } from '@archon/providers';
-import { deriveNodeExecutionRequirements } from './schemas/dag-node';
+import { deriveNodeExecutionRequirements, isEvidenceNode } from './schemas/dag-node';
 
 clearRegistry();
 registerBuiltinProviders();
@@ -148,6 +148,16 @@ describe('lane registration and war-council-validator pin', () => {
       expect(authoritativePrefix).toContain('work-order.md');
       expect(authoritativePrefix).toContain('sha256sum');
       expect(authoritativePrefix).toContain('cat "$AUTHORITY_SPEC"');
+    });
+
+    it(`S4e: ${file} derives its manifest from mechanical evidence`, () => {
+      const content = readFileSync(join(LANES_DIR, file), 'utf-8');
+      const result = parseWorkflow(content, file);
+      if (!result.workflow) throw new Error(`${file}: ${result.error?.error ?? 'failed to parse'}`);
+      const manifestNode = result.workflow.nodes.find(node => node.id === 'build-manifest');
+      expect(manifestNode).toBeDefined();
+      expect(manifestNode && isEvidenceNode(manifestNode)).toBe(true);
+      expect(manifestNode && 'prompt' in manifestNode).toBe(false);
     });
   }
 });

@@ -24,6 +24,7 @@ delete process.env.ARCHON_OPERATOR_EMAILS;
 const mockGetWorkflowRun = mock(async (_id: string) => null as null | MockWorkflowRun);
 const mockCancelWorkflowRun = mock(async (_id: string) => {});
 const mockListWorkflowRuns = mock(async () => [] as MockWorkflowRun[]);
+const mockGetRunOutcome = mock(async (_id: string) => null as null | MockRunOutcome);
 const mockSumWorkflowTokensInWindow = mock(
   async (_opts: { sinceMs: number; codebaseId?: string }) => 0
 );
@@ -114,6 +115,17 @@ type MockWorkflowEvent = {
   step_name: string | null;
   data: Record<string, unknown>;
   created_at: string;
+};
+
+type MockRunOutcome = {
+  executionState: 'completed' | 'failed';
+  deliverableState: 'none' | 'pr_ready';
+  validationState: 'passed' | 'failed' | 'indeterminate';
+  recoveryState: 'not_needed';
+  routeState: 'current';
+  primaryReason: string;
+  reasonCodes: string[];
+  evidenceRefs: string[];
 };
 
 mock.module('@archon/core', () => ({
@@ -232,6 +244,7 @@ mock.module('@archon/core/db/workflows', () => ({
   sumWorkflowTokensInWindow: mockSumWorkflowTokensInWindow,
   getCauldronDrainState: mockGetCauldronDrainState,
   setCauldronDrainMode: mockSetCauldronDrainMode,
+  getRunOutcome: mockGetRunOutcome,
 }));
 
 const mockCreateWorkflowEvent = mock(async (_event: unknown) => {});
@@ -1119,6 +1132,30 @@ describe('GET /api/workflows/runs', () => {
   beforeEach(() => {
     mockListWorkflowRuns.mockReset();
     mockListWorkflowEvents.mockReset();
+    mockGetRunOutcome.mockReset();
+    mockGetRunOutcome.mockImplementation(async () => null);
+  });
+
+  test('returns persisted multidimensional outcomes without collapsing PR readiness', async () => {
+    mockListWorkflowRuns.mockImplementationOnce(async () => [MOCK_RUNNING_RUN]);
+    mockGetRunOutcome.mockImplementationOnce(async () => ({
+      executionState: 'failed',
+      deliverableState: 'pr_ready',
+      validationState: 'passed',
+      recoveryState: 'not_needed',
+      routeState: 'current',
+      primaryReason: 'execution_failed_pr_ready',
+      reasonCodes: ['execution_failed_pr_ready'],
+      evidenceRefs: ['pr:42'],
+    }));
+
+    const { app } = makeApp();
+    const response = await app.request('/api/workflows/runs');
+    const body = (await response.json()) as { runs: Array<{ outcome: MockRunOutcome | null }> };
+
+    expect(response.status).toBe(200);
+    expect(body.runs[0]?.outcome?.executionState).toBe('failed');
+    expect(body.runs[0]?.outcome?.deliverableState).toBe('pr_ready');
   });
 
   test('requires operator token when ARCHON_OPERATOR_TOKEN is configured', async () => {
@@ -1533,6 +1570,8 @@ describe('GET /api/workflows/runs/:runId', () => {
     mockGetWorkflowRun.mockReset();
     mockListWorkflowEvents.mockReset();
     mockGetConversationById.mockReset();
+    mockGetRunOutcome.mockReset();
+    mockGetRunOutcome.mockImplementation(async () => null);
   });
 
   test('returns run with events for a known runId', async () => {
@@ -1557,6 +1596,30 @@ describe('GET /api/workflows/runs/:runId', () => {
     expect(body.events.length).toBe(3);
     expect(body.events[0]?.event_type).toBe('step_started');
     expect(body.events[2]?.event_type).toBe('tool_called');
+  });
+
+  test('returns persisted outcome dimensions in run detail', async () => {
+    mockGetWorkflowRun.mockImplementationOnce(async () => MOCK_RUNNING_RUN);
+    mockListWorkflowEvents.mockImplementationOnce(async () => []);
+    mockGetRunOutcome.mockImplementationOnce(async () => ({
+      executionState: 'completed',
+      deliverableState: 'pr_ready',
+      validationState: 'passed',
+      recoveryState: 'not_needed',
+      routeState: 'current',
+      primaryReason: 'pr_ready',
+      reasonCodes: ['pr_ready'],
+      evidenceRefs: ['pr:42'],
+    }));
+    mockGetConversationById.mockImplementationOnce(async () => null);
+
+    const { app } = makeApp();
+    const response = await app.request('/api/workflows/runs/run-uuid-1');
+    const body = (await response.json()) as { run: { outcome: MockRunOutcome | null } };
+
+    expect(response.status).toBe(200);
+    expect(body.run.outcome?.deliverableState).toBe('pr_ready');
+    expect(body.run.outcome?.validationState).toBe('passed');
   });
 
   // ------------------------------------------------------------------------
