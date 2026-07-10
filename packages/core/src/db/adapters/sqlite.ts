@@ -336,6 +336,108 @@ export class SqliteAdapter implements IDatabase {
         created_at TEXT DEFAULT (datetime('now'))
       );
 
+      -- Smart Cauldron reliability authority (immutable after insert)
+      CREATE TABLE IF NOT EXISTS remote_agent_run_authorities (
+        run_id TEXT PRIMARY KEY REFERENCES remote_agent_workflow_runs(id) ON DELETE CASCADE,
+        dispatch_id TEXT NOT NULL,
+        wo_id TEXT NOT NULL,
+        spec_source TEXT NOT NULL,
+        spec_revision TEXT NOT NULL,
+        spec_hash TEXT NOT NULL,
+        workflow_name TEXT NOT NULL,
+        codebase_id TEXT NOT NULL,
+        canonical_remote TEXT NOT NULL,
+        base_branch TEXT NOT NULL,
+        base_sha TEXT NOT NULL,
+        run_scope_sha TEXT NOT NULL,
+        head_branch TEXT NOT NULL,
+        worktree_path TEXT NOT NULL,
+        workflow_revision TEXT NOT NULL,
+        bundle_revision TEXT NOT NULL,
+        engine_revision TEXT NOT NULL,
+        runtime_image_revision TEXT,
+        created_at TEXT NOT NULL
+      );
+
+      -- One renewable worker lease per workflow run
+      CREATE TABLE IF NOT EXISTS remote_agent_run_leases (
+        run_id TEXT PRIMARY KEY REFERENCES remote_agent_workflow_runs(id) ON DELETE CASCADE,
+        owner_id TEXT NOT NULL,
+        lease_token TEXT NOT NULL UNIQUE,
+        acquired_at TEXT NOT NULL,
+        last_heartbeat_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        released_at TEXT
+      );
+
+      -- Provider call ledger; rows are inserted before each call and completed once
+      CREATE TABLE IF NOT EXISTS remote_agent_provider_attempts (
+        attempt_id TEXT PRIMARY KEY,
+        run_id TEXT NOT NULL REFERENCES remote_agent_workflow_runs(id) ON DELETE CASCADE,
+        node_id TEXT NOT NULL,
+        attempt_number INTEGER NOT NULL,
+        provider TEXT NOT NULL,
+        model TEXT NOT NULL,
+        declared_provider TEXT NOT NULL,
+        declared_model TEXT NOT NULL,
+        required_capabilities TEXT NOT NULL DEFAULT '[]',
+        started_at TEXT NOT NULL,
+        completed_at TEXT,
+        served_model_id TEXT,
+        outcome_class TEXT CHECK (
+          outcome_class IS NULL OR outcome_class IN
+            ('success', 'availability', 'quality', 'progress', 'quota', 'contradiction', 'cancelled')
+        ),
+        reason_code TEXT,
+        resume_at TEXT,
+        supersedes_attempt_id TEXT REFERENCES remote_agent_provider_attempts(attempt_id),
+        UNIQUE(run_id, node_id, attempt_number)
+      );
+
+      -- Authoritative multidimensional outcome; legacy workflow status remains a projection
+      CREATE TABLE IF NOT EXISTS remote_agent_run_outcomes (
+        run_id TEXT PRIMARY KEY REFERENCES remote_agent_workflow_runs(id) ON DELETE CASCADE,
+        execution_state TEXT NOT NULL CHECK (
+          execution_state IN
+            ('queued', 'running', 'waiting_provider', 'paused_human', 'interrupted', 'completed', 'failed', 'cancelled')
+        ),
+        deliverable_state TEXT NOT NULL CHECK (
+          deliverable_state IN ('none', 'worktree_changes', 'committed', 'pushed', 'pr_open', 'pr_ready')
+        ),
+        validation_state TEXT NOT NULL CHECK (
+          validation_state IN ('not_run', 'passed', 'failed', 'indeterminate')
+        ),
+        recovery_state TEXT NOT NULL CHECK (
+          recovery_state IN ('not_needed', 'recoverable', 'recovering', 'recovered', 'abandoned_by_operator')
+        ),
+        route_state TEXT NOT NULL CHECK (
+          route_state IN ('current', 'failed_over', 'escalated', 'spec_repair', 'exhausted')
+        ),
+        primary_reason TEXT NOT NULL,
+        reason_codes TEXT NOT NULL DEFAULT '[]',
+        evidence_refs TEXT NOT NULL DEFAULT '[]',
+        updated_at TEXT NOT NULL
+      );
+
+      -- Durable quota/provider waits replace in-process sleeps
+      CREATE TABLE IF NOT EXISTS remote_agent_scheduled_waits (
+        wait_id TEXT PRIMARY KEY,
+        run_id TEXT NOT NULL REFERENCES remote_agent_workflow_runs(id) ON DELETE CASCADE,
+        attempt_id TEXT NOT NULL REFERENCES remote_agent_provider_attempts(attempt_id) ON DELETE CASCADE,
+        provider TEXT NOT NULL,
+        reason_code TEXT NOT NULL,
+        resume_at TEXT NOT NULL,
+        state TEXT NOT NULL DEFAULT 'scheduled' CHECK (
+          state IN ('scheduled', 'claimed', 'cancelled', 'completed')
+        ),
+        claim_owner_id TEXT,
+        claim_token TEXT,
+        created_at TEXT NOT NULL,
+        claimed_at TEXT,
+        cancelled_at TEXT,
+        completed_at TEXT
+      );
+
       -- Messages table (conversation history for Web UI)
       CREATE TABLE IF NOT EXISTS remote_agent_messages (
         id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
@@ -357,6 +459,14 @@ export class SqliteAdapter implements IDatabase {
       CREATE INDEX IF NOT EXISTS idx_workflow_runs_status ON remote_agent_workflow_runs(status);
       CREATE INDEX IF NOT EXISTS idx_workflow_events_run_id ON remote_agent_workflow_events(workflow_run_id);
       CREATE INDEX IF NOT EXISTS idx_workflow_events_type ON remote_agent_workflow_events(event_type);
+      CREATE INDEX IF NOT EXISTS idx_reliability_active_leases
+        ON remote_agent_run_leases(expires_at) WHERE released_at IS NULL;
+      CREATE INDEX IF NOT EXISTS idx_reliability_attempts_run_node
+        ON remote_agent_provider_attempts(run_id, node_id, attempt_number);
+      CREATE INDEX IF NOT EXISTS idx_reliability_due_waits
+        ON remote_agent_scheduled_waits(resume_at) WHERE state = 'scheduled';
+      CREATE UNIQUE INDEX IF NOT EXISTS unique_reliability_wait_attempt
+        ON remote_agent_scheduled_waits(attempt_id);
       CREATE INDEX IF NOT EXISTS idx_messages_conversation_id ON remote_agent_messages(conversation_id, created_at ASC);
       CREATE INDEX IF NOT EXISTS idx_workflow_runs_parent_conv ON remote_agent_workflow_runs(parent_conversation_id);
       CREATE INDEX IF NOT EXISTS idx_conversations_hidden ON remote_agent_conversations(hidden);
