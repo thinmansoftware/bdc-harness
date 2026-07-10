@@ -60,6 +60,18 @@ function loadLane(filename: string): LaneDef {
 }
 
 describe('lane registration and war-council-validator pin', () => {
+  it('S4: enumerates exactly the seven governed feature lanes', () => {
+    expect(LANE_FILES).toEqual([
+      'bdc-feature-development-codex-only.yaml',
+      'bdc-feature-development-codex.yaml',
+      'bdc-feature-development-fable.yaml',
+      'bdc-feature-development-fusion-cx-qwen.yaml',
+      'bdc-feature-development-zero-open.yaml',
+      'bdc-feature-development-zero.yaml',
+      'bdc-feature-development.yaml',
+    ]);
+  });
+
   for (const file of LANE_FILES) {
     it(`S4a: ${file} passes parseWorkflow() validation`, () => {
       const content = readFileSync(join(LANES_DIR, file), 'utf-8');
