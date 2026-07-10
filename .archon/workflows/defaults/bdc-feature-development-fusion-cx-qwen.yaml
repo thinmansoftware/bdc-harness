@@ -114,8 +114,8 @@ nodes:
   # the normal build path -- assert-implement-produced-work (Fix A) is the real safety
   # net, this is only an optimization that must never wrongly skip real work.
   - id: check-already-satisfied
-    provider: opr
-    model: qwen/qwen3-coder
+    provider: grok
+    model: x-ai/grok-4.5
     persona: war-council-architect-opr
     depends_on: [read-spec]
     task_class: clerical
@@ -184,6 +184,7 @@ nodes:
     persona: war-council-architect-opr
     depends_on: [gate-already-satisfied]
     task_class: medium_work
+    allowed_tools: []
     prompt: |
       Read the BDC Work Order spec below and produce a concise implementation plan.
 
@@ -225,7 +226,7 @@ nodes:
   # plan that `implement` consumes. NOT a human gate -- humans are reached only via the
   # async escalation payload, and only at the irreversible-action boundary downstream.
   - id: plan-review
-    provider: opr
+    provider: codex-opr
     model: qwen/qwen3-coder
     persona: war-council-architect-opr
     depends_on: [plan]
@@ -811,8 +812,8 @@ nodes:
       exit 0
 
   - id: war-council-validator
-    # Dual-cap (2026-07-09 F1): OpenRouter DeepSeek judge -- no Claude, no Codex quota.
-    provider: opr
+    # DeepSeek judge through the repository-capable OpenRouter tool loop.
+    provider: codex-opr
     model: deepseek/deepseek-chat-v3.1
     persona: captain-ci-validator-codex
     depends_on: [ascii-gate]
@@ -883,7 +884,7 @@ nodes:
       echo "DIFF_BYTES=$(wc -c < "$OUT" 2>/dev/null || echo 0)"
 
   - id: diff-review
-    provider: opr
+    provider: codex-opr
     model: deepseek/deepseek-chat-v3.1  # cross-model adversarial review, not self-grading (John 2026-07-07: DeepSeek's strong suit is review, not authoring code; never mark its own qwen-authored homework)
     agent: opr-adversarial-reviewer
     depends_on: [capture-diff]
@@ -1067,7 +1068,7 @@ nodes:
       echo "DIFF_FINAL_BYTES=$(wc -c < "$OUT" 2>/dev/null || echo 0)"
 
   - id: diff-review-final
-    provider: opr
+    provider: codex-opr
     model: deepseek/deepseek-chat-v3.1  # cross-model adversarial review, not self-grading -- see diff-review
     agent: opr-adversarial-reviewer
     depends_on: [capture-diff-final]
@@ -1222,7 +1223,7 @@ nodes:
   # repaired build can land as a normal feature-branch PR instead of dead-ending at a
   # terminal-BLOCKED on a non-interactive run.
   - id: opus-rereview
-    provider: opr
+    provider: codex-opr
     model: deepseek/deepseek-chat-v3.1  # cross-model adversarial review, not self-grading -- see diff-review
     agent: opr-adversarial-reviewer
     depends_on: [classify-opus-repair]
@@ -1401,6 +1402,7 @@ nodes:
     depends_on: [block-reclassify]
     trigger_rule: all_done
     task_class: clerical
+    allowed_tools: []
     prompt: |
       Build the human-facing findings ledger for the approval gate. Read every review output
       below and emit ONE JSON object. Do not invent findings; only consolidate what the reviews
@@ -1487,6 +1489,8 @@ nodes:
   # schema migration the self-repair loop deferred -- but ONLY for the authorized_fix_ids.
   # trigger_rule all_done so an APPROVE-AS-IS run (which skips this) does not hang the DAG.
   - id: apply-suggested-fix
+    provider: grok
+    model: x-ai/grok-4.5
     agent: overseer-opus
     effort: xhigh
     context: fresh
@@ -1574,6 +1578,7 @@ nodes:
     trigger_rule: all_done
     when: "$pause-gate.output.decision_verb != 'approve_with_fix' || $classify-apply-review.output.verdict == 'satisfied'"
     task_class: clerical
+    allowed_tools: []
     prompt: |
       Decide the push target for this BDC feature Work Order.
 

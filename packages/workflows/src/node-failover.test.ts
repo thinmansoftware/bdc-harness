@@ -141,8 +141,15 @@ describe('provider execution capability failover guard', () => {
   });
 
   it('allows chat-only failover for a text-only plan node', () => {
-    const node = { id: 'plan', prompt: 'Plan it.' } as DagNode;
+    const node = { id: 'plan', prompt: 'Plan it.', allowed_tools: [] } as DagNode;
     expect(() => assertProviderCanExecuteNode('opr-zero', node)).not.toThrow();
+  });
+
+  it('rejects chat-only failover when an unknown AI seat leaves tools unspecified', () => {
+    const node = { id: 'apply-patch', prompt: 'Fix it.' } as DagNode;
+    expect(() => assertProviderCanExecuteNode('opr-zero', node)).toThrow(
+      'provider_execution_capability_mismatch'
+    );
   });
 });
 
@@ -202,10 +209,23 @@ function createMockStore(
     updateWorkflowRun: mock(() => Promise.resolve()),
     updateWorkflowActivity: mock(() => Promise.resolve()),
     getWorkflowRunStatus: mock(() => Promise.resolve('running' as const)),
+    createRunAuthority: mock(() => Promise.resolve('created' as const)),
     getRunAuthority: mock(() => Promise.resolve(null)),
+    claimRunLease: mock(() => Promise.resolve(null)),
+    heartbeatRunLease: mock(() => Promise.resolve(false)),
+    releaseRunLease: mock(() => Promise.resolve(false)),
+    listExpiredRunLeases: mock(() => Promise.resolve([])),
+    interruptExpiredRunLease: mock(() => Promise.resolve(false)),
     createProviderAttempt: mock(() => Promise.resolve(true)),
     completeProviderAttempt: mock(() => Promise.resolve(true)),
     listProviderAttempts: mock(() => Promise.resolve([])),
+    upsertRunOutcome: mock(() => Promise.resolve(true)),
+    getRunOutcome: mock(() => Promise.resolve(null)),
+    scheduleProviderWait: mock(() => Promise.resolve(true)),
+    listDueProviderWaits: mock(() => Promise.resolve([])),
+    claimProviderWait: mock(() => Promise.resolve(false)),
+    cancelProviderWaits: mock(() => Promise.resolve(0)),
+    completeProviderWait: mock(() => Promise.resolve(false)),
     completeWorkflowRun: mock(() => Promise.resolve()),
     failWorkflowRun: mock(() => Promise.resolve()),
     pauseWorkflowRun: mock(() => Promise.resolve()),

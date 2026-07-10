@@ -129,6 +129,8 @@ nodes:
   # the normal build path -- assert-implement-produced-work (Fix A) is the real safety
   # net, this is only an optimization that must never wrongly skip real work.
   - id: check-already-satisfied
+    provider: grok
+    model: x-ai/grok-4.5
     persona: war-council-architect-opr
     agent: war-council-architect-opr
     depends_on: [read-spec]
@@ -187,6 +189,7 @@ nodes:
     depends_on: [gate-already-satisfied]
     agent: war-council-architect-opr
     task_class: medium_work
+    allowed_tools: []
     prompt: |
       Read the BDC Work Order spec below and produce a concise implementation plan.
 
@@ -226,13 +229,13 @@ nodes:
   # plan that `implement` consumes. NOT a human gate -- humans are reached only via the
   # async escalation payload, and only at the irreversible-action boundary downstream.
   - id: plan-review
+    provider: codex-opr
     persona: war-council-architect-opr
     agent: war-council-architect-opr
     # FUSION war council (John 2026-07-07): every council seat is a DIFFERENT open
     # model attacking the others' work. The plan authored by qwen (root default)
     # is reviewed by DeepSeek here -- never self-graded. Cross-model diversity IS
     # the quality mechanism replacing the paid-seat judge on this lane.
-    provider: opr-zero
     model: deepseek/deepseek-chat-v3.1
     depends_on: [plan]
     task_class: medium_work
@@ -884,8 +887,8 @@ nodes:
       exit 0
 
   - id: war-council-validator
-    # Dual-cap (2026-07-09): DeepSeek judge via opr-zero -- no Claude, no Codex.
-    provider: opr-zero
+    # DeepSeek judge through the repository-capable OpenRouter tool loop.
+    provider: codex-opr
     persona: captain-ci-validator-codex
     model: deepseek/deepseek-chat-v3.1
     depends_on: [ascii-gate]
@@ -1487,6 +1490,7 @@ nodes:
     depends_on: [block-reclassify]
     trigger_rule: all_done
     task_class: clerical
+    allowed_tools: []
     prompt: |
       Build the human-facing findings ledger for the approval gate. Read every review output
       below and emit ONE JSON object. Do not invent findings; only consolidate what the reviews
@@ -1573,6 +1577,8 @@ nodes:
   # schema migration the self-repair loop deferred -- but ONLY for the authorized_fix_ids.
   # trigger_rule all_done so an APPROVE-AS-IS run (which skips this) does not hang the DAG.
   - id: apply-suggested-fix
+    provider: grok
+    model: x-ai/grok-4.5
     agent: overseer-opus
     effort: xhigh
     context: fresh
@@ -1658,6 +1664,7 @@ nodes:
     trigger_rule: all_done
     when: "$pause-gate.output.decision_verb != 'approve_with_fix' || $classify-apply-review.output.verdict == 'satisfied'"
     task_class: clerical
+    allowed_tools: []
     prompt: |
       Decide the push target for this BDC feature Work Order.
 
@@ -2487,6 +2494,7 @@ nodes:
     when: "$manifest-consistency-check.output == 'OK'"
     trigger_rule: all_done
     task_class: clerical
+    allowed_tools: []
     prompt: |
       Update the Notion Work Order page if Notion MCP is available in this runtime.
 
@@ -2525,6 +2533,7 @@ nodes:
     depends_on: [war-council-validator, flip-notion]
     trigger_rule: all_done
     task_class: clerical
+    allowed_tools: []
     prompt: |
       FALLBACK Notion flip. Update Notion ONLY if the normal flip-notion node did NOT
       already flip the WO to REVIEW, AND the build was genuinely good. This is a

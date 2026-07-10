@@ -403,6 +403,12 @@ export function deriveNodeExecutionRequirements(node: DagNode): ProviderExecutio
     required.add('shell');
   };
 
+  // Provider defaults may include repository write and shell tools. When an AI
+  // node does not declare a tool posture, treating it as text-only would grant a
+  // chat-only provider a seat that can mutate the repository at runtime. An
+  // explicit empty list is the mechanical declaration for a text-only node.
+  if (node.allowed_tools === undefined) requireRepositoryExecution();
+
   const persona = (node.persona ?? node.agent ?? '').toLowerCase();
   const builderPersona = persona === 'major-build' || persona.startsWith('major-build-');
   const canonicalBuilderSeat = /^(implement|build|.*-repair)$/i.test(node.id);

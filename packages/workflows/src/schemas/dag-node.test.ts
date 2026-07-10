@@ -34,8 +34,28 @@ describe('mechanical evidence nodes', () => {
 
 describe('deriveNodeExecutionRequirements', () => {
   it('keeps a text-only plan eligible for chat providers', () => {
-    const node = dagNodeSchema.parse({ id: 'plan', prompt: 'Plan it.' });
+    const node = dagNodeSchema.parse({ id: 'plan', prompt: 'Plan it.', allowed_tools: [] });
     expect(deriveNodeExecutionRequirements(node)).toEqual(['text']);
+  });
+
+  it('fails closed for an unrecognized AI node with an unspecified tool posture', () => {
+    const node = dagNodeSchema.parse({ id: 'apply-patch', prompt: 'Fix it.' });
+    expect(deriveNodeExecutionRequirements(node)).toEqual([
+      'text',
+      'repositoryRead',
+      'repositoryWrite',
+      'shell',
+    ]);
+  });
+
+  it('fails closed for a lint-fix seat whose name is not a canonical builder alias', () => {
+    const node = dagNodeSchema.parse({ id: 'fix-lint', command: 'lint-fixer' });
+    expect(deriveNodeExecutionRequirements(node)).toEqual([
+      'text',
+      'repositoryRead',
+      'repositoryWrite',
+      'shell',
+    ]);
   });
 
   it('requires repository execution for a major-build loop', () => {

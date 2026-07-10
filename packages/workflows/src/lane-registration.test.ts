@@ -79,20 +79,20 @@ describe('lane registration and war-council-validator pin', () => {
       }
 
       if (file === 'bdc-feature-development-zero.yaml') {
-        // Dual-cap (2026-07-09): DeepSeek judge via glm/OpenRouter.
-        expect(wcv.provider).toBe('glm');
+        // DeepSeek judge through the repository-capable OpenRouter tool loop.
+        expect(wcv.provider).toBe('codex-opr');
         return;
       }
 
       if (file === 'bdc-feature-development-zero-open.yaml') {
-        // Dual-cap: DeepSeek on opr-zero (no Claude, no Codex).
-        expect(wcv.provider).toBe('opr-zero');
+        // DeepSeek judge through the repository-capable OpenRouter tool loop.
+        expect(wcv.provider).toBe('codex-opr');
         return;
       }
 
       if (file === 'bdc-feature-development-fusion-cx-qwen.yaml') {
-        // Dual-cap qwen: OpenRouter judge.
-        expect(wcv.provider).toBe('opr');
+        // DeepSeek judge through the repository-capable OpenRouter tool loop.
+        expect(wcv.provider).toBe('codex-opr');
         return;
       }
 
