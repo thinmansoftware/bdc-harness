@@ -101,11 +101,68 @@ bf12be7f docs: add Smart Cauldron canary proof packet
 
 ## Remaining gated work
 
+## 2026-07-10 dual-supervisor reliability addendum
+
+The approved Phase 0 and dual-supervisor work is implemented locally. The
+additional controls are:
+
+- dispatch identity is unique at the database boundary
+- unspecified AI tool authority fails closed to repository-read, repository-write,
+  and shell capability requirements
+- real quota exhaustion routes to a declared capable provider in both directions;
+  a durable provider wait is used only when no eligible declared provider remains
+- Sol and Fable can append independent immutable observations to one incident
+- one database compare-and-swap repair lease selects the mutation owner
+- every repair lease has a monotonically increasing fencing token; expired owners
+  cannot authorize a repair after takeover
+- repair action evidence is committed before lease release and atomically marks the
+  incident recovered, preventing a later duplicate repair
+- Smart Cauldron exposes an opt-in failure-supervision hook; no live supervisor,
+  provider call, refire, feature flag, or production mutation was enabled
+
+Focused verification at commit `c25de3a8`:
+
+- workflow reliability directory: 50 pass, 0 fail
+- core workflow persistence, SQLite/PostgreSQL parity, and store adapter: 151 pass,
+  0 fail
+- Smart Cauldron cascade: 21 pass, 0 fail
+- quota/failover focused tests: 29 pass, 0 fail
+- repository `check:bundled`: exit 0; 36 commands, 96 workflows, 1 policy
+- repository `type-check`: exit 0 for every workspace package and scripts
+- repository `format:check`: exit 0
+
+Repository-wide test evidence:
+
+- without a Bash path, the parallel run stopped with exit 130 after five
+  `uv_spawn 'bash'` failures
+- with Git-for-Windows Bash added only to the child process `PATH`, the run reached
+  the complete DAG executor file and reported 292 pass, 1 skip, 8 fail
+- all eight remaining failures are pre-existing Windows script-node execution
+  failures: the executor spawns `bun` as a native executable, while this host has
+  only npm command/PowerShell shims in `PATH`
+- all new supervisor, persistence, routing, capability, schema, and cascade tests
+  passed; Linux CI remains required for the eight script-node fixtures
+
+New local commits:
+
+```text
+acaaa591 docs: design dual-supervisor recovery control plane
+a979c15c test(workflows): restore reliability store mock
+4adb74a5 fix(core): reject duplicate reliability dispatches
+c2690927 fix(workflows): fail closed on undeclared tool authority
+effaf2c9 fix(workflows): route quota exhaustion across providers
+909a4230 feat(reliability): add fenced supervisor incident ledger
+c25de3a8 feat(smart-cauldron): delegate terminal recovery to supervisors
+```
+
+No branch was pushed, no PR was created, and nothing was merged, deployed, fired,
+restarted, or enabled.
+
 The implementation goal is complete locally, but integration is intentionally not
 performed. The following require separate user decisions and authority:
 
 - review the local commit series and decide whether to publish a branch or PR
-- rerun the 5 Bash-dependent workflow fixtures in Linux/Bash CI
+- rerun the 8 Windows-incompatible script-node fixtures in Linux/Bash CI
 - review and approve the canary packet
 - separately approve any drain, rebuild, restart, feature-flag enablement, fire,
   push, PR creation, merge, or deployment
