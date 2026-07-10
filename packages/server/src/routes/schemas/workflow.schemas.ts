@@ -130,8 +130,53 @@ export const commandListResponseSchema = z
  *  enum or CHECK constraint to update. This API schema is the source of truth
  *  for allowed values; DB accepts any string and the app validates here. */
 export const workflowRunStatusSchema = z
-  .enum(['pending', 'running', 'completed', 'failed', 'escalated', 'cancelled', 'paused'])
+  .enum([
+    'pending',
+    'running',
+    'waiting_provider',
+    'interrupted',
+    'completed',
+    'failed',
+    'escalated',
+    'cancelled',
+    'paused',
+  ])
   .openapi('WorkflowRunStatus');
+
+export const runOutcomeSchema = z
+  .object({
+    executionState: z.enum([
+      'queued',
+      'running',
+      'waiting_provider',
+      'paused_human',
+      'interrupted',
+      'completed',
+      'failed',
+      'cancelled',
+    ]),
+    deliverableState: z.enum([
+      'none',
+      'worktree_changes',
+      'committed',
+      'pushed',
+      'pr_open',
+      'pr_ready',
+    ]),
+    validationState: z.enum(['not_run', 'passed', 'failed', 'indeterminate']),
+    recoveryState: z.enum([
+      'not_needed',
+      'recoverable',
+      'recovering',
+      'recovered',
+      'abandoned_by_operator',
+    ]),
+    routeState: z.enum(['current', 'failed_over', 'escalated', 'spec_repair', 'exhausted']),
+    primaryReason: z.string(),
+    reasonCodes: z.array(z.string()),
+    evidenceRefs: z.array(z.string()),
+  })
+  .openapi('RunOutcome');
 
 /** A workflow run record. */
 export const workflowRunSchema = z
@@ -151,6 +196,7 @@ export const workflowRunSchema = z
     archived_at: z.string().nullable(),
     archived_by: z.string().nullable(),
     archive_reason: z.string().nullable(),
+    outcome: runOutcomeSchema.nullable().optional(),
   })
   .openapi('WorkflowRun');
 
@@ -303,10 +349,22 @@ export const dashboardRunsResponseSchema = z
   .openapi('DashboardRunsResponse');
 
 /** POST /api/workflows/:name/run request body. */
+export const conductorDispatchSchema = z.object({
+  enabled: z.literal(true),
+  woId: z.string().regex(/^WO-[A-Z0-9-]+$/),
+  project: z.string().min(1),
+  woClass: z.enum(['CODE', 'INFRA', 'MIXED']).optional(),
+  tags: z.array(z.string().min(1)).optional(),
+  entryOverride: z.string().min(1).optional(),
+  idempotencyKey: z.string().min(1),
+  dryRun: z.boolean().optional(),
+});
+
 export const runWorkflowBodySchema = z
   .object({
     conversationId: z.string(),
     message: z.string(),
+    conductor: conductorDispatchSchema.optional(),
   })
   .openapi('RunWorkflowBody');
 

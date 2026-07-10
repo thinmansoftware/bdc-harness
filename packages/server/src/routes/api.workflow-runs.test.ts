@@ -24,6 +24,7 @@ delete process.env.ARCHON_OPERATOR_EMAILS;
 const mockGetWorkflowRun = mock(async (_id: string) => null as null | MockWorkflowRun);
 const mockCancelWorkflowRun = mock(async (_id: string) => {});
 const mockListWorkflowRuns = mock(async () => [] as MockWorkflowRun[]);
+const mockGetRunOutcome = mock(async (_id: string) => null as null | MockRunOutcome);
 const mockSumWorkflowTokensInWindow = mock(
   async (_opts: { sinceMs: number; codebaseId?: string }) => 0
 );
@@ -76,6 +77,43 @@ const mockResolveWebLane = mock(
   async (req: { workflowName?: string; task_class?: string; routerYamlPath: string }) =>
     req.workflowName ?? undefined
 );
+const normalDrainState = {
+  mode: 'normal' as const,
+  activeLeaseCount: 0,
+  activeRunCount: 0,
+  activeRunIds: [] as string[],
+  drained: false,
+  updatedAt: null as string | null,
+};
+const mockGetCauldronDrainState = mock(async () => normalDrainState);
+const mockSetCauldronDrainMode = mock(async (data: { mode: 'normal' | 'draining' }) => ({
+  changed: true,
+  mode: data.mode,
+}));
+const mockRunCascade = mock(
+  async (opts: {
+    dryRun?: boolean;
+    onAdmission?: (record: Record<string, unknown>, created: boolean) => void;
+  }) => {
+    const record = {
+      cascadeId: opts.dryRun ? 'cascade-test' : 'dispatch-live',
+      woId: 'WO-TEST-001',
+      createdAt: NOW,
+      status: opts.dryRun ? ('planned' as const) : ('running' as const),
+      winningTier: null,
+      attempts: [],
+      totalCostUsd: null,
+      telemetry: {
+        entryTier: 'zero',
+        climbed: false,
+        climbCount: 0,
+        wonCheap: false,
+      },
+    };
+    opts.onAdmission?.(record, true);
+    return record;
+  }
+);
 
 // Type aliases for clarity in tests
 type MockWorkflowRun = {
@@ -101,6 +139,17 @@ type MockWorkflowEvent = {
   step_name: string | null;
   data: Record<string, unknown>;
   created_at: string;
+};
+
+type MockRunOutcome = {
+  executionState: 'completed' | 'failed';
+  deliverableState: 'none' | 'pr_ready';
+  validationState: 'passed' | 'failed' | 'indeterminate';
+  recoveryState: 'not_needed';
+  routeState: 'current';
+  primaryReason: string;
+  reasonCodes: string[];
+  evidenceRefs: string[];
 };
 
 mock.module('@archon/core', () => ({
@@ -161,6 +210,10 @@ mock.module('@archon/workflows/executor', () => ({
   executeWorkflow: mockExecuteWorkflow,
 }));
 
+mock.module('@archon/smart-cauldron/cascade', () => ({
+  runCascade: mockRunCascade,
+}));
+
 mock.module('../adapters/web/workflow-bridge', () => ({
   resolveWebLane: mockResolveWebLane,
 }));
@@ -217,6 +270,9 @@ mock.module('@archon/core/db/workflows', () => ({
   updateWorkflowRun: mockUpdateWorkflowRun,
   getWorkflowRunByWorkerPlatformId: mockGetWorkflowRunByWorkerPlatformId,
   sumWorkflowTokensInWindow: mockSumWorkflowTokensInWindow,
+  getCauldronDrainState: mockGetCauldronDrainState,
+  setCauldronDrainMode: mockSetCauldronDrainMode,
+  getRunOutcome: mockGetRunOutcome,
 }));
 
 const mockCreateWorkflowEvent = mock(async (_event: unknown) => {});
@@ -411,6 +467,10 @@ describe('POST /api/workflows/:name/run', () => {
     mockHandleMessage.mockReset();
     mockAddMessage.mockReset();
     mockGenerateAndSetTitle.mockReset();
+    mockGetCauldronDrainState.mockReset();
+    mockGetCauldronDrainState.mockResolvedValue(normalDrainState);
+    mockRunCascade.mockClear();
+    delete process.env.ARCHON_SMART_CAULDRON_DISPATCH_ENABLED;
     // Pre-dispatch validation resolves the workflow name against discovery
     // before accepting -- seed the names these tests dispatch.
     mockDiscoverWorkflowsWithConfig.mockReset();
@@ -424,6 +484,7 @@ describe('POST /api/workflows/:name/run', () => {
   });
 
   afterEach(() => {
+    delete process.env.ARCHON_SMART_CAULDRON_DISPATCH_ENABLED;
     // Restore the factory default ([] workflows) for other describes.
     mockDiscoverWorkflowsWithConfig.mockReset();
     mockDiscoverWorkflowsWithConfig.mockImplementation(async () => ({
@@ -482,6 +543,154 @@ describe('POST /api/workflows/:name/run', () => {
     const body = (await response.json()) as { accepted: boolean; status: string };
     expect(body.accepted).toBe(true);
     expect(body.status).toBe('started');
+  });
+
+  test('keeps explicit direct-lane dispatch when conductor integration is disabled', async () => {
+    const { app } = makeApp();
+    const response = await app.request('/api/workflows/deploy/run', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        conversationId: 'web-test-abc',
+        message: 'WO-TEST-001',
+        conductor: {
+          enabled: true,
+          woId: 'WO-TEST-001',
+          project: 'test-project',
+          woClass: 'CODE',
+          tags: ['mechanical'],
+          idempotencyKey: 'dispatch-direct-disabled',
+        },
+      }),
+    });
+
+    expect(response.status).toBe(200);
+    expect(mockRunCascade).not.toHaveBeenCalled();
+    expect(mockHandleMessage).toHaveBeenCalled();
+  });
+
+  test('returns a distinct planned result for an enabled conductor dry run', async () => {
+    process.env.ARCHON_SMART_CAULDRON_DISPATCH_ENABLED = 'true';
+    const { app } = makeApp();
+    const response = await app.request('/api/workflows/deploy/run', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        conversationId: 'web-test-abc',
+        message: 'WO-TEST-001',
+        conductor: {
+          enabled: true,
+          woId: 'WO-TEST-001',
+          project: 'test-project',
+          woClass: 'CODE',
+          tags: ['mechanical'],
+          idempotencyKey: 'dispatch-dry-run',
+          dryRun: true,
+        },
+      }),
+    });
+    const body = (await response.json()) as {
+      accepted: boolean;
+      status: string;
+      dispatchMode: string;
+      cascadeId: string;
+      entryTier: string;
+    };
+
+    expect(response.status).toBe(200);
+    expect(body).toEqual({
+      accepted: true,
+      status: 'planned',
+      dispatchMode: 'conductor',
+      cascadeId: 'cascade-test',
+      entryTier: 'zero',
+    });
+    expect(mockHandleMessage).not.toHaveBeenCalled();
+    expect(mockRunCascade).toHaveBeenCalledWith(
+      expect.objectContaining({
+        woId: 'WO-TEST-001',
+        project: 'test-project',
+        dispatchId: 'dispatch-dry-run',
+        dryRun: true,
+      })
+    );
+  });
+
+  test('queues an enabled live conductor request with stable idempotency and no direct dispatch', async () => {
+    process.env.ARCHON_SMART_CAULDRON_DISPATCH_ENABLED = 'true';
+    const { app } = makeApp();
+    const response = await app.request('/api/workflows/deploy/run', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-archon-operator-token': 'test-token',
+      },
+      body: JSON.stringify({
+        conversationId: 'web-test-abc',
+        message: 'WO-TEST-001',
+        conductor: {
+          enabled: true,
+          woId: 'WO-TEST-001',
+          project: 'test-project',
+          woClass: 'CODE',
+          tags: ['mechanical'],
+          idempotencyKey: 'dispatch-live',
+        },
+      }),
+    });
+    const body = (await response.json()) as {
+      accepted: boolean;
+      status: string;
+      dispatchMode: string;
+      cascadeId: string;
+    };
+
+    expect(response.status).toBe(200);
+    expect(body).toEqual({
+      accepted: true,
+      status: 'queued',
+      dispatchMode: 'conductor',
+      cascadeId: 'dispatch-live',
+    });
+    expect(mockHandleMessage).not.toHaveBeenCalled();
+    expect(mockRunCascade).toHaveBeenCalledWith(
+      expect.objectContaining({
+        dispatchId: 'dispatch-live',
+        token: 'test-token',
+        dryRun: false,
+      })
+    );
+  });
+
+  test('rejects new workflow dispatch while draining without touching in-flight work', async () => {
+    process.env.ARCHON_SMART_CAULDRON_DISPATCH_ENABLED = 'true';
+    mockGetCauldronDrainState.mockResolvedValueOnce({
+      ...normalDrainState,
+      mode: 'draining',
+      activeLeaseCount: 1,
+      activeRunCount: 1,
+      activeRunIds: ['run-active'],
+    });
+    const { app } = makeApp();
+    const response = await app.request('/api/workflows/deploy/run', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        conversationId: 'web-test-abc',
+        message: 'WO-TEST-001',
+        conductor: {
+          enabled: true,
+          woId: 'WO-TEST-001',
+          project: 'test-project',
+          idempotencyKey: 'dispatch-draining',
+        },
+      }),
+    });
+
+    expect(response.status).toBe(503);
+    expect(mockRunCascade).not.toHaveBeenCalled();
+    expect(mockHandleMessage).not.toHaveBeenCalled();
+    expect(mockCancelWorkflowRun).not.toHaveBeenCalled();
   });
 
   test('sends /workflow run <name> <message> to orchestrator', async () => {
@@ -625,6 +834,77 @@ describe('POST /api/workflows/:name/run', () => {
       body: 'not valid json {{{',
     });
     expect(response.status).toBe(400);
+  });
+});
+
+describe('GET/POST /api/admin/drain', () => {
+  beforeEach(() => {
+    mockGetCauldronDrainState.mockReset();
+    mockGetCauldronDrainState.mockResolvedValue(normalDrainState);
+    mockSetCauldronDrainMode.mockReset();
+    mockSetCauldronDrainMode.mockImplementation(async data => ({
+      changed: true,
+      mode: data.mode,
+    }));
+  });
+
+  test('reuses operator authentication for drain controls', async () => {
+    const previousToken = process.env.ARCHON_OPERATOR_TOKEN;
+    process.env.ARCHON_OPERATOR_TOKEN = 'test-operator-token';
+    try {
+      const { app } = makeApp();
+      const response = await app.request('/api/admin/drain');
+      expect(response.status).toBe(401);
+      expect(mockGetCauldronDrainState).not.toHaveBeenCalled();
+    } finally {
+      if (previousToken === undefined) delete process.env.ARCHON_OPERATOR_TOKEN;
+      else process.env.ARCHON_OPERATOR_TOKEN = previousToken;
+    }
+  });
+
+  test('enables drain idempotently and reports active work without cancelling it', async () => {
+    const previousToken = process.env.ARCHON_OPERATOR_TOKEN;
+    process.env.ARCHON_OPERATOR_TOKEN = 'test-operator-token';
+    mockGetCauldronDrainState.mockResolvedValue({
+      ...normalDrainState,
+      mode: 'draining',
+      activeLeaseCount: 1,
+      activeRunCount: 1,
+      activeRunIds: ['run-active'],
+    });
+    try {
+      const { app } = makeApp();
+      const response = await app.request('/api/admin/drain', {
+        method: 'POST',
+        headers: {
+          Authorization: 'Bearer test-operator-token',
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ draining: true, reason: 'maintenance' }),
+      });
+      expect(response.status).toBe(200);
+      const body = (await response.json()) as {
+        mode: string;
+        activeRunIds: string[];
+        drained: boolean;
+      };
+      expect(body).toMatchObject({
+        mode: 'draining',
+        activeRunIds: ['run-active'],
+        drained: false,
+      });
+      expect(mockSetCauldronDrainMode).toHaveBeenCalledWith(
+        expect.objectContaining({
+          mode: 'draining',
+          actor: 'operator',
+          reason: 'maintenance',
+        })
+      );
+      expect(mockCancelWorkflowRun).not.toHaveBeenCalled();
+    } finally {
+      if (previousToken === undefined) delete process.env.ARCHON_OPERATOR_TOKEN;
+      else process.env.ARCHON_OPERATOR_TOKEN = previousToken;
+    }
   });
 });
 
@@ -1011,6 +1291,30 @@ describe('GET /api/workflows/runs', () => {
   beforeEach(() => {
     mockListWorkflowRuns.mockReset();
     mockListWorkflowEvents.mockReset();
+    mockGetRunOutcome.mockReset();
+    mockGetRunOutcome.mockImplementation(async () => null);
+  });
+
+  test('returns persisted multidimensional outcomes without collapsing PR readiness', async () => {
+    mockListWorkflowRuns.mockImplementationOnce(async () => [MOCK_RUNNING_RUN]);
+    mockGetRunOutcome.mockImplementationOnce(async () => ({
+      executionState: 'failed',
+      deliverableState: 'pr_ready',
+      validationState: 'passed',
+      recoveryState: 'not_needed',
+      routeState: 'current',
+      primaryReason: 'execution_failed_pr_ready',
+      reasonCodes: ['execution_failed_pr_ready'],
+      evidenceRefs: ['pr:42'],
+    }));
+
+    const { app } = makeApp();
+    const response = await app.request('/api/workflows/runs');
+    const body = (await response.json()) as { runs: Array<{ outcome: MockRunOutcome | null }> };
+
+    expect(response.status).toBe(200);
+    expect(body.runs[0]?.outcome?.executionState).toBe('failed');
+    expect(body.runs[0]?.outcome?.deliverableState).toBe('pr_ready');
   });
 
   test('requires operator token when ARCHON_OPERATOR_TOKEN is configured', async () => {
@@ -1425,6 +1729,8 @@ describe('GET /api/workflows/runs/:runId', () => {
     mockGetWorkflowRun.mockReset();
     mockListWorkflowEvents.mockReset();
     mockGetConversationById.mockReset();
+    mockGetRunOutcome.mockReset();
+    mockGetRunOutcome.mockImplementation(async () => null);
   });
 
   test('returns run with events for a known runId', async () => {
@@ -1449,6 +1755,30 @@ describe('GET /api/workflows/runs/:runId', () => {
     expect(body.events.length).toBe(3);
     expect(body.events[0]?.event_type).toBe('step_started');
     expect(body.events[2]?.event_type).toBe('tool_called');
+  });
+
+  test('returns persisted outcome dimensions in run detail', async () => {
+    mockGetWorkflowRun.mockImplementationOnce(async () => MOCK_RUNNING_RUN);
+    mockListWorkflowEvents.mockImplementationOnce(async () => []);
+    mockGetRunOutcome.mockImplementationOnce(async () => ({
+      executionState: 'completed',
+      deliverableState: 'pr_ready',
+      validationState: 'passed',
+      recoveryState: 'not_needed',
+      routeState: 'current',
+      primaryReason: 'pr_ready',
+      reasonCodes: ['pr_ready'],
+      evidenceRefs: ['pr:42'],
+    }));
+    mockGetConversationById.mockImplementationOnce(async () => null);
+
+    const { app } = makeApp();
+    const response = await app.request('/api/workflows/runs/run-uuid-1');
+    const body = (await response.json()) as { run: { outcome: MockRunOutcome | null } };
+
+    expect(response.status).toBe(200);
+    expect(body.run.outcome?.deliverableState).toBe('pr_ready');
+    expect(body.run.outcome?.validationState).toBe('passed');
   });
 
   // ------------------------------------------------------------------------

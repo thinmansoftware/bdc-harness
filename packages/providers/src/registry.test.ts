@@ -2,6 +2,7 @@ import { describe, test, expect, beforeEach } from 'bun:test';
 import {
   getAgentProvider,
   getProviderCapabilities,
+  getMissingProviderExecutionCapabilities,
   registerProvider,
   getRegistration,
   getRegisteredProviders,
@@ -25,6 +26,7 @@ function makeMockProvider(id: string): IAgentProvider {
   return {
     getType: () => id,
     getCapabilities: () => ({
+      execution: { text: true, repositoryRead: false, repositoryWrite: false, shell: false },
       sessionResume: false,
       mcp: false,
       hooks: false,
@@ -160,6 +162,51 @@ describe('registry', () => {
 
     test('is case sensitive - Claude throws', () => {
       expect(() => getProviderCapabilities('Claude')).toThrow(UnknownProviderError);
+    });
+
+    test('declares Claude and Codex as repository execution providers', () => {
+      for (const id of ['claude', 'codex', 'codex-opr']) {
+        expect(getProviderCapabilities(id).execution).toEqual({
+          text: true,
+          repositoryRead: true,
+          repositoryWrite: true,
+          shell: true,
+        });
+      }
+    });
+
+    test('keeps chat-only GLM aliases eligible for text but not repository execution', () => {
+      registerCommunityProviders();
+      for (const id of ['glm', 'opr', 'opr-zero']) {
+        expect(getProviderCapabilities(id).execution).toEqual({
+          text: true,
+          repositoryRead: false,
+          repositoryWrite: false,
+          shell: false,
+        });
+      }
+    });
+
+    test('declares Pi and Grok as repository execution providers', () => {
+      registerCommunityProviders();
+      for (const id of ['pi', 'grok']) {
+        expect(getProviderCapabilities(id).execution).toEqual({
+          text: true,
+          repositoryRead: true,
+          repositoryWrite: true,
+          shell: true,
+        });
+      }
+    });
+
+    test('reports missing execution capabilities mechanically', () => {
+      registerCommunityProviders();
+      const required = ['text', 'repositoryWrite', 'shell'] as const;
+      expect(getMissingProviderExecutionCapabilities('opr', required)).toEqual([
+        'repositoryWrite',
+        'shell',
+      ]);
+      expect(getMissingProviderExecutionCapabilities('claude', required)).toEqual([]);
     });
   });
 

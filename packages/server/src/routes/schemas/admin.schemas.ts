@@ -24,3 +24,23 @@ export const throttleResponseSchema = z
     engagedBy: z.enum(['operator', 'auto']).optional(),
   })
   .openapi('AdminThrottleResponse');
+
+export const drainBodySchema = z
+  .object({
+    draining: z.boolean(),
+    reason: z.string().trim().max(500).optional(),
+  })
+  .openapi('AdminDrainBody');
+
+export const drainResponseSchema = z
+  .object({
+    success: z.boolean(),
+    changed: z.boolean().optional(),
+    mode: z.enum(['normal', 'draining']),
+    drained: z.boolean(),
+    activeLeaseCount: z.number().int().nonnegative(),
+    activeRunCount: z.number().int().nonnegative(),
+    activeRunIds: z.array(z.string()),
+    updatedAt: z.string().nullable(),
+  })
+  .openapi('AdminDrainResponse');

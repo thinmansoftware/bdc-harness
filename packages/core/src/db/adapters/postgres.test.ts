@@ -1,4 +1,6 @@
 import { describe, test, expect, mock, beforeEach } from 'bun:test';
+import { readFileSync } from 'fs';
+import { resolve } from 'path';
 
 // ---- pg mock setup --------------------------------------------------------
 // Must be declared before importing the module under test so that the mock
@@ -69,6 +71,40 @@ describe('PostgresAdapter', () => {
     poolErrorHandler = undefined;
 
     adapter = new PostgresAdapter('postgresql://localhost:5432/testdb');
+  });
+
+  describe('Smart Cauldron reliability schema', () => {
+    test('numbered migration defines the same additive tables and indexes as SQLite', () => {
+      const migration = ['024_smart_cauldron_reliability.sql', '026_supervisor_incidents.sql']
+        .map(file =>
+          readFileSync(resolve(import.meta.dir, '../../../../../migrations', file), 'utf8')
+        )
+        .join('\n');
+
+      for (const table of [
+        'remote_agent_run_authorities',
+        'remote_agent_run_leases',
+        'remote_agent_provider_attempts',
+        'remote_agent_run_outcomes',
+        'remote_agent_scheduled_waits',
+        'remote_agent_supervisor_incidents',
+        'remote_agent_supervisor_observations',
+        'remote_agent_supervisor_repair_leases',
+        'remote_agent_supervisor_actions',
+      ]) {
+        expect(migration).toContain(`CREATE TABLE IF NOT EXISTS ${table}`);
+      }
+      for (const index of [
+        'idx_reliability_active_leases',
+        'idx_reliability_attempts_run_node',
+        'idx_reliability_due_waits',
+        'idx_supervisor_observations_incident',
+        'idx_supervisor_actions_incident',
+        'idx_supervisor_repair_leases_expiry',
+      ]) {
+        expect(migration).toContain(`CREATE INDEX IF NOT EXISTS ${index}`);
+      }
+    });
   });
 
   // -------------------------------------------------------------------------

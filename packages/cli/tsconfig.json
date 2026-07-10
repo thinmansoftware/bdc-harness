@@ -9,6 +9,8 @@
       "@archon/core/*": ["../core/src/*"],
       "@archon/server": ["../server/src"],
       "@archon/server/*": ["../server/src/*"],
+      "@archon/smart-cauldron": ["../smart-cauldron/src/cascade.ts"],
+      "@archon/smart-cauldron/*": ["../smart-cauldron/src/*"],
       "@archon/workflows": ["../workflows/src"],
       "@archon/workflows/*": ["../workflows/src/*"],
       "@archon/paths": ["../paths/src"],

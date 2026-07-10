@@ -268,6 +268,12 @@ describe('WorkflowEventEmitter', () => {
         makeWorkflowStartedEvent(),
         makeWorkflowCompletedEvent(),
         makeWorkflowFailedEvent(),
+        {
+          type: 'status_persist_failed',
+          runId: 'run-1',
+          attemptedStatus: 'completed',
+          reason: 'status_persist_failed',
+        },
         { type: 'loop_iteration_started', runId: 'run-1', iteration: 1, maxIterations: 5 },
         {
           type: 'loop_iteration_completed',

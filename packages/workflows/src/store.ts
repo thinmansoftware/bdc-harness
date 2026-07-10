@@ -6,6 +6,19 @@
  * the workflow engine depends only on this narrow interface.
  */
 import type { WorkflowRun, WorkflowRunStatus, ApprovalContext } from './schemas';
+import type {
+  ProviderAttemptRecord,
+  ExpiredRunLeaseRecord,
+  RunAuthorityRecord,
+  RunLeaseRecord,
+  RunOutcome,
+  ScheduledProviderWaitRecord,
+  SupervisorActionRecord,
+  SupervisorIncidentRecord,
+  SupervisorObservationRecord,
+  SupervisorRepairLeaseRecord,
+  TerminalWorkflowPersistence,
+} from './reliability/types';
 
 export const WORKFLOW_EVENT_TYPES = [
   'workflow_started',
@@ -32,6 +45,8 @@ export const WORKFLOW_EVENT_TYPES = [
   'approval_requested',
   'approval_received',
   'workflow_cancelled',
+  'workflow_interrupted',
+  'status_persist_failed',
   'workflow_artifact',
   // Layer 1 cascade-step event (WO-HARNESS-LAYER1-CLIMB-AND-GATE-EVENTS-01).
   // Emitted when a job escalates from one cost tier to another. Distinct from
@@ -98,10 +113,107 @@ export interface IWorkflowStore {
   ): Promise<void>;
   updateWorkflowActivity(id: string): Promise<void>;
   getWorkflowRunStatus(id: string): Promise<WorkflowRunStatus | null>;
-  completeWorkflowRun(id: string, metadata?: Record<string, unknown>): Promise<void>;
-  failWorkflowRun(id: string, error: string): Promise<void>;
+  completeWorkflowRun(
+    id: string,
+    metadata?: Record<string, unknown>,
+    terminal?: TerminalWorkflowPersistence
+  ): Promise<void>;
+  failWorkflowRun(id: string, error: string, terminal?: TerminalWorkflowPersistence): Promise<void>;
   pauseWorkflowRun(id: string, approvalContext: ApprovalContext): Promise<void>;
-  cancelWorkflowRun(id: string): Promise<void>;
+  cancelWorkflowRun(id: string, terminal?: TerminalWorkflowPersistence): Promise<void>;
+
+  // Smart Cauldron reliability state
+  createRunAuthority(authority: RunAuthorityRecord): Promise<'created' | 'unchanged'>;
+  getRunAuthority(runId: string): Promise<RunAuthorityRecord | null>;
+  claimRunLease(lease: RunLeaseRecord): Promise<RunLeaseRecord | null>;
+  heartbeatRunLease(data: {
+    runId: string;
+    ownerId: string;
+    leaseToken: string;
+    heartbeatAt: string;
+    expiresAt: string;
+  }): Promise<boolean>;
+  releaseRunLease(data: {
+    runId: string;
+    ownerId: string;
+    leaseToken: string;
+    releasedAt: string;
+  }): Promise<boolean>;
+  listExpiredRunLeases(expiredAt: string): Promise<ExpiredRunLeaseRecord[]>;
+  interruptExpiredRunLease(data: {
+    runId: string;
+    leaseToken: string;
+    expiredAt: string;
+    interruptedAt: string;
+  }): Promise<boolean>;
+  createProviderAttempt(attempt: ProviderAttemptRecord): Promise<boolean>;
+  completeProviderAttempt(data: {
+    attemptId: string;
+    completedAt: string;
+    servedModelId: string | null;
+    outcomeClass: ProviderAttemptRecord['outcomeClass'];
+    reasonCode: ProviderAttemptRecord['reasonCode'];
+    resumeAt: string | null;
+  }): Promise<boolean>;
+  listProviderAttempts(runId: string, nodeId?: string): Promise<ProviderAttemptRecord[]>;
+  upsertRunOutcome(runId: string, outcome: RunOutcome, updatedAt: string): Promise<boolean>;
+  getRunOutcome(runId: string): Promise<RunOutcome | null>;
+  scheduleProviderWait(wait: ScheduledProviderWaitRecord): Promise<boolean>;
+  listDueProviderWaits(dueAt: string, limit: number): Promise<ScheduledProviderWaitRecord[]>;
+  claimProviderWait(data: {
+    waitId: string;
+    ownerId: string;
+    claimToken: string;
+    claimedAt: string;
+  }): Promise<boolean>;
+  releaseProviderWaitClaim?(data: {
+    waitId: string;
+    claimToken: string;
+    resumeAt: string;
+  }): Promise<boolean>;
+  cancelProviderWaits(runId: string, cancelledAt: string): Promise<number>;
+  completeProviderWait(data: {
+    waitId: string;
+    claimToken: string;
+    completedAt: string;
+  }): Promise<boolean>;
+  createSupervisorIncident?(incident: SupervisorIncidentRecord): Promise<SupervisorIncidentRecord>;
+  appendSupervisorObservation?(observation: SupervisorObservationRecord): Promise<boolean>;
+  listSupervisorObservations?(incidentId: string): Promise<SupervisorObservationRecord[]>;
+  claimSupervisorRepairLease?(data: {
+    incidentId: string;
+    ownerId: string;
+    leaseDurationMs: number;
+  }): Promise<SupervisorRepairLeaseRecord | null>;
+  heartbeatSupervisorRepairLease?(data: {
+    incidentId: string;
+    ownerId: string;
+    fencingToken: number;
+    leaseDurationMs: number;
+  }): Promise<boolean>;
+  authorizeSupervisorMutation?(data: {
+    incidentId: string;
+    ownerId: string;
+    fencingToken: number;
+  }): Promise<boolean>;
+  reserveSupervisorAction?(action: SupervisorActionRecord): Promise<boolean>;
+  finalizeSupervisorAction?(data: {
+    actionId: string;
+    incidentId: string;
+    ownerId: string;
+    fencingToken: number;
+    status: 'completed' | 'failed';
+    outcome: string;
+    evidenceRefs: readonly string[];
+    completedAt: string;
+  }): Promise<boolean>;
+  appendSupervisorAction?(action: SupervisorActionRecord): Promise<boolean>;
+  releaseSupervisorRepairLease?(data: {
+    incidentId: string;
+    ownerId: string;
+    fencingToken: number;
+    releasedAt: string;
+  }): Promise<boolean>;
 
   /**
    * Create a workflow event. Implementations MUST NOT throw -- catch all errors

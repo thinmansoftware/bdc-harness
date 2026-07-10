@@ -13,6 +13,7 @@ import * as envVarDb from '../db/env-vars';
 import { getAgentProvider } from '@archon/providers';
 import { loadConfig as loadMergedConfig } from '../config/config-loader';
 import { createLogger } from '@archon/paths';
+import { freezeWorkOrderSource } from './work-order-source';
 
 // Compile-time assertion: MergedConfig must remain a structural subtype of WorkflowConfig.
 // If MergedConfig drifts from WorkflowConfig, this line becomes a type error.
@@ -44,6 +45,34 @@ export function createWorkflowStore(): IWorkflowStore {
     failWorkflowRun: workflowDb.failWorkflowRun,
     pauseWorkflowRun: workflowDb.pauseWorkflowRun,
     cancelWorkflowRun: workflowDb.cancelWorkflowRun,
+    createRunAuthority: workflowDb.createRunAuthority,
+    getRunAuthority: workflowDb.getRunAuthority,
+    claimRunLease: workflowDb.claimRunLease,
+    heartbeatRunLease: workflowDb.heartbeatRunLease,
+    releaseRunLease: workflowDb.releaseRunLease,
+    listExpiredRunLeases: workflowDb.listExpiredRunLeases,
+    interruptExpiredRunLease: workflowDb.interruptExpiredRunLease,
+    createProviderAttempt: workflowDb.createProviderAttempt,
+    completeProviderAttempt: workflowDb.completeProviderAttempt,
+    listProviderAttempts: workflowDb.listProviderAttempts,
+    upsertRunOutcome: workflowDb.upsertRunOutcome,
+    getRunOutcome: workflowDb.getRunOutcome,
+    scheduleProviderWait: workflowDb.scheduleProviderWait,
+    listDueProviderWaits: workflowDb.listDueProviderWaits,
+    claimProviderWait: workflowDb.claimProviderWait,
+    releaseProviderWaitClaim: workflowDb.releaseProviderWaitClaim,
+    cancelProviderWaits: workflowDb.cancelProviderWaits,
+    completeProviderWait: workflowDb.completeProviderWait,
+    createSupervisorIncident: workflowDb.createSupervisorIncident,
+    appendSupervisorObservation: workflowDb.appendSupervisorObservation,
+    listSupervisorObservations: workflowDb.listSupervisorObservations,
+    claimSupervisorRepairLease: workflowDb.claimSupervisorRepairLease,
+    heartbeatSupervisorRepairLease: workflowDb.heartbeatSupervisorRepairLease,
+    authorizeSupervisorMutation: workflowDb.authorizeSupervisorMutation,
+    reserveSupervisorAction: workflowDb.reserveSupervisorAction,
+    finalizeSupervisorAction: workflowDb.finalizeSupervisorAction,
+    appendSupervisorAction: workflowDb.appendSupervisorAction,
+    releaseSupervisorRepairLease: workflowDb.releaseSupervisorRepairLease,
     createWorkflowEvent: async (data): Promise<void> => {
       try {
         await workflowEventDb.createWorkflowEvent(data);
@@ -72,5 +101,6 @@ export function createWorkflowDeps(): WorkflowDeps {
     store: createWorkflowStore(),
     getAgentProvider,
     loadConfig: loadMergedConfig,
+    freezeWorkOrderSource,
   };
 }

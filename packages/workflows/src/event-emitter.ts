@@ -66,6 +66,13 @@ interface WorkflowFailedEvent {
   error: string;
 }
 
+interface WorkflowStatusPersistFailedEvent {
+  type: 'status_persist_failed';
+  runId: string;
+  attemptedStatus: 'completed' | 'failed' | 'cancelled';
+  reason: 'status_persist_failed';
+}
+
 interface LoopIterationStartedEvent {
   type: 'loop_iteration_started';
   runId: string;
@@ -259,6 +266,7 @@ export type WorkflowEmitterEvent =
   | WorkflowStartedEvent
   | WorkflowCompletedEvent
   | WorkflowFailedEvent
+  | WorkflowStatusPersistFailedEvent
   | LoopIterationStartedEvent
   | LoopIterationCompletedEvent
   | LoopIterationFailedEvent

@@ -8,6 +8,7 @@
 export type TierName = string; // e.g. "glm", "codex", "claude", "frontier"
 
 export type TierOutcome =
+  | 'running' // attempt intent persisted before the workflow lane is fired
   | 'won' // gate passed -- cascade stops
   | 'gate-failed' // ran, built, gate failed -- climb
   | 'infra-error' // auth/transport failure -- alert, do not count as "too hard"
@@ -42,14 +43,24 @@ export interface CascadeAttempt {
 }
 
 export type CascadeStatus =
+  | 'planned' // dry-run selection only; no provider or workflow was fired
+  | 'running' // durable cascade record exists and an attempt may be in flight
   | 'won' // a tier passed the gate
   | 'blocked' // all tiers exhausted without a frontier (defensive; should not happen)
   | 'spec-repair' // frontier (fable) tier gate-failed -> SPEC-REPAIR escalation, not a dead end
+  | 'recovery-delegated' // an explicitly injected fenced supervisor accepted recovery ownership
   | 'infra-alert'; // infra-error on a tier (escalate/alert, not climb silently)
 
 export interface CascadeRunRecord {
   cascadeId: string; // randomUUID
   woId: string;
+  project: string | null; // frozen codebase authority; null only for dry-run plans
+  request: {
+    woClass: string | null;
+    tags: string[];
+    entryOverride: TierName | null;
+    dryRun: boolean;
+  };
   createdAt: string;
   status: CascadeStatus;
   winningTier: TierName | null;
@@ -75,6 +86,11 @@ export interface CascadeRunRecord {
     posted: boolean;
     whatMustChange: string;
     evidence: string;
+  };
+  supervisorRecovery?: {
+    ownerId: string;
+    fencingToken: number;
+    evidenceRefs: string[];
   };
 }
 

@@ -29,6 +29,7 @@ import {
   generateAndSetTitle,
 } from '@archon/core';
 import { createWorkflowDeps } from '@archon/core/workflows';
+import { runCascade } from '@archon/smart-cauldron/cascade';
 import { removeWorktree, toRepoPath, toWorktreePath } from '@archon/git';
 import {
   createLogger,
@@ -49,6 +50,7 @@ import { discoverWorkflowsWithConfig } from '@archon/workflows/workflow-discover
 import { resolveWorkflowName } from '@archon/workflows/router';
 import type { WorkflowDefinition } from '@archon/workflows/schemas/workflow';
 import { executeWorkflow } from '@archon/workflows/executor';
+import { processDueProviderWaits } from '@archon/workflows/reliability/wait-scheduler';
 import { getLoaderErrors, parseWorkflow } from '@archon/workflows/loader';
 import { isValidCommandName } from '@archon/workflows/command-validation';
 import { BUNDLED_WORKFLOWS, BUNDLED_COMMANDS, isBinaryBuild } from '@archon/workflows/defaults';
@@ -59,6 +61,13 @@ import {
 } from '@archon/workflows/schemas/workflow-run';
 import type { ApprovalContext, WorkflowRun } from '@archon/workflows/schemas/workflow-run';
 import { findMarkdownFilesRecursive } from '@archon/core/utils/commands';
+
+let providerWaitSchedulerTimer: ReturnType<typeof setInterval> | undefined;
+
+export function stopProviderWaitScheduler(): void {
+  if (providerWaitSchedulerTimer) clearInterval(providerWaitSchedulerTimer);
+  providerWaitSchedulerTimer = undefined;
+}
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
 let cachedLog: ReturnType<typeof createLogger> | undefined;
@@ -138,7 +147,12 @@ import {
   codebaseEnvironmentsResponseSchema,
 } from './schemas/config.schemas';
 import { providerListResponseSchema } from './schemas/provider.schemas';
-import { throttleBodySchema, throttleResponseSchema } from './schemas/admin.schemas';
+import {
+  drainBodySchema,
+  drainResponseSchema,
+  throttleBodySchema,
+  throttleResponseSchema,
+} from './schemas/admin.schemas';
 import { getProviderInfoList, isRegisteredProvider } from '@archon/providers';
 import { claudeProviderThrottle } from '@archon/providers/claude/throttle';
 
@@ -357,6 +371,7 @@ const createConversationRoute = createRoute({
     },
     400: jsonError('Bad request'),
     500: jsonError('Server error'),
+    503: jsonError('Cauldron draining'),
   },
 });
 
@@ -440,6 +455,7 @@ const sendMessageRoute = createRoute({
     },
     400: jsonError('Bad request'),
     500: jsonError('Server error'),
+    503: jsonError('Cauldron draining'),
   },
 });
 
@@ -593,6 +609,7 @@ const runWorkflowRoute = createRoute({
     },
     400: jsonError('Bad request'),
     500: jsonError('Server error'),
+    503: jsonError('Cauldron draining'),
   },
 });
 
@@ -788,6 +805,38 @@ const getAdminThrottleRoute = createRoute({
     200: {
       content: { 'application/json': { schema: throttleResponseSchema } },
       description: 'Current throttle state',
+    },
+    500: jsonError('Server error'),
+  },
+});
+
+const adminDrainRoute = createRoute({
+  method: 'post',
+  path: '/api/admin/drain',
+  tags: ['Admin'],
+  summary: 'Enable or disable durable Cauldron drain mode',
+  request: {
+    body: { content: { 'application/json': { schema: drainBodySchema } } },
+  },
+  responses: {
+    200: {
+      content: { 'application/json': { schema: drainResponseSchema } },
+      description: 'Drain state updated',
+    },
+    400: jsonError('Bad request'),
+    500: jsonError('Server error'),
+  },
+});
+
+const getAdminDrainRoute = createRoute({
+  method: 'get',
+  path: '/api/admin/drain',
+  tags: ['Admin'],
+  summary: 'Read durable Cauldron drain mode and active work',
+  responses: {
+    200: {
+      content: { 'application/json': { schema: drainResponseSchema } },
+      description: 'Current drain state',
     },
     500: jsonError('Server error'),
   },
@@ -1205,6 +1254,17 @@ export function registerApiRoutes(
     detail?: string
   ): Response {
     return c.json({ error: message, ...(detail ? { detail } : {}) }, status);
+  }
+
+  async function rejectNewDispatchIfDraining(c: Context): Promise<Response | null> {
+    const drain = await workflowDb.getCauldronDrainState();
+    if (drain.mode !== 'draining') return null;
+    return apiError(
+      c,
+      503,
+      'Cauldron is draining; new dispatch is disabled',
+      `active_leases=${String(drain.activeLeaseCount)} active_runs=${String(drain.activeRunCount)}`
+    );
   }
 
   /**
@@ -1686,9 +1746,9 @@ export function registerApiRoutes(
    * the resumed output. Non-web parents skip auto-resume and the originating
    * platform's own re-run flow applies.
    */
-  async function tryAutoResumeAfterGate(
+  async function tryAutoResumeRun(
     run: WorkflowRun,
-    action: 'approve' | 'reject'
+    action: 'approve' | 'reject' | 'provider_wait'
   ): Promise<boolean> {
     if (!run.parent_conversation_id) return false;
     if (!run.conversation_id || !run.working_path) return false;
@@ -1708,17 +1768,30 @@ export function registerApiRoutes(
             executorStarted: 'api.workflow_approve_direct_resume_started' as const,
             executorFailed: 'api.workflow_approve_direct_resume_failed' as const,
           }
-        : {
-            dispatched: 'api.workflow_reject_auto_resume_dispatched' as const,
-            skippedNoPlatformConv:
-              'api.workflow_reject_auto_resume_skipped_no_platform_conv' as const,
-            skippedNonWebParent: 'api.workflow_reject_auto_resume_skipped_non_web_parent' as const,
-            failed: 'api.workflow_reject_auto_resume_failed' as const,
-            missingWorker: 'api.workflow_reject_auto_resume_skipped_no_worker_conv' as const,
-            missingWorkflow: 'api.workflow_reject_auto_resume_skipped_missing_workflow' as const,
-            executorStarted: 'api.workflow_reject_direct_resume_started' as const,
-            executorFailed: 'api.workflow_reject_direct_resume_failed' as const,
-          };
+        : action === 'reject'
+          ? {
+              dispatched: 'api.workflow_reject_auto_resume_dispatched' as const,
+              skippedNoPlatformConv:
+                'api.workflow_reject_auto_resume_skipped_no_platform_conv' as const,
+              skippedNonWebParent:
+                'api.workflow_reject_auto_resume_skipped_non_web_parent' as const,
+              failed: 'api.workflow_reject_auto_resume_failed' as const,
+              missingWorker: 'api.workflow_reject_auto_resume_skipped_no_worker_conv' as const,
+              missingWorkflow: 'api.workflow_reject_auto_resume_skipped_missing_workflow' as const,
+              executorStarted: 'api.workflow_reject_direct_resume_started' as const,
+              executorFailed: 'api.workflow_reject_direct_resume_failed' as const,
+            }
+          : {
+              dispatched: 'api.provider_wait_auto_resume_dispatched' as const,
+              skippedNoPlatformConv:
+                'api.provider_wait_auto_resume_skipped_no_platform_conv' as const,
+              skippedNonWebParent: 'api.provider_wait_auto_resume_skipped_non_web_parent' as const,
+              failed: 'api.provider_wait_auto_resume_failed' as const,
+              missingWorker: 'api.provider_wait_auto_resume_skipped_no_worker_conv' as const,
+              missingWorkflow: 'api.provider_wait_auto_resume_skipped_missing_workflow' as const,
+              executorStarted: 'api.provider_wait_direct_resume_started' as const,
+              executorFailed: 'api.provider_wait_direct_resume_failed' as const,
+            };
     try {
       const parentConv = await conversationDb.getConversationById(run.parent_conversation_id);
       const workerConv = await conversationDb.getConversationById(run.conversation_id);
@@ -1791,19 +1864,35 @@ export function registerApiRoutes(
 
       webAdapter.setConversationDbId(workerPlatformConvId, workerConv.id);
       const unsubscribeBridge = webAdapter.setupEventBridge(workerPlatformConvId, platformConvId);
-      const execution = executeWorkflow(
-        createWorkflowDeps(),
-        webAdapter,
-        workerPlatformConvId,
-        run.working_path,
-        workflow,
-        run.user_message ?? '',
-        workerConv.id,
-        run.codebase_id ?? undefined,
-        undefined,
-        undefined,
-        parentConv.id
-      );
+      const execution =
+        action === 'provider_wait'
+          ? executeWorkflow(
+              createWorkflowDeps(),
+              webAdapter,
+              workerPlatformConvId,
+              run.working_path,
+              workflow,
+              run.user_message ?? '',
+              workerConv.id,
+              run.codebase_id ?? undefined,
+              undefined,
+              undefined,
+              parentConv.id,
+              run
+            )
+          : executeWorkflow(
+              createWorkflowDeps(),
+              webAdapter,
+              workerPlatformConvId,
+              run.working_path,
+              workflow,
+              run.user_message ?? '',
+              workerConv.id,
+              run.codebase_id ?? undefined,
+              undefined,
+              undefined,
+              parentConv.id
+            );
       void execution
         .then(result => {
           if (result.success && 'summary' in result && result.summary) {
@@ -1833,6 +1922,44 @@ export function registerApiRoutes(
       getLog().warn({ err: err as Error, runId: run.id }, events.failed);
       return false;
     }
+  }
+
+  if (process.env.NODE_ENV !== 'test' && providerWaitSchedulerTimer === undefined) {
+    const schedulerStore = createWorkflowDeps().store;
+    const schedulerOwnerId = `provider-wait:${randomUUID()}`;
+    const configuredInterval = Number.parseInt(
+      process.env.ARCHON_PROVIDER_WAIT_POLL_INTERVAL_MS ?? '',
+      10
+    );
+    const intervalMs =
+      Number.isInteger(configuredInterval) && configuredInterval > 0 ? configuredInterval : 15_000;
+    let schedulerInFlight = false;
+    const tick = async (): Promise<void> => {
+      if (schedulerInFlight) return;
+      schedulerInFlight = true;
+      try {
+        const result = await processDueProviderWaits(
+          schedulerStore,
+          async wait => {
+            const run = await schedulerStore.getWorkflowRun(wait.runId);
+            if (run?.status !== 'waiting_provider') {
+              throw new Error(`provider_wait_run_not_waiting: ${wait.runId}`);
+            }
+            const dispatched = await tryAutoResumeRun(run, 'provider_wait');
+            if (!dispatched) throw new Error(`provider_wait_resume_not_dispatched: ${wait.runId}`);
+          },
+          { ownerId: schedulerOwnerId }
+        );
+        if (result.due > 0) getLog().info(result, 'api.provider_wait_scheduler_tick');
+      } catch (error) {
+        getLog().error({ err: error as Error }, 'api.provider_wait_scheduler_failed');
+      } finally {
+        schedulerInFlight = false;
+      }
+    };
+    providerWaitSchedulerTimer = setInterval(() => void tick(), intervalMs);
+    providerWaitSchedulerTimer.unref?.();
+    void tick();
   }
 
   // GET /api/conversations - List conversations
@@ -1873,6 +2000,11 @@ export function registerApiRoutes(
   registerOpenApiRoute(createConversationRoute, async c => {
     try {
       const { codebaseId, message } = getValidatedBody(c, createConversationBodySchema);
+
+      if (message) {
+        const drainRejection = await rejectNewDispatchIfDraining(c);
+        if (drainRejection) return drainRejection;
+      }
 
       // Validate codebase exists if provided
       if (codebaseId) {
@@ -2009,6 +2141,8 @@ export function registerApiRoutes(
   // POST /api/conversations/:id/message - Send message
   // Manual body parsing: multipart uses parseBody(), JSON uses req.json().
   registerOpenApiRoute(sendMessageRoute, async c => {
+    const drainRejection = await rejectNewDispatchIfDraining(c);
+    if (drainRejection) return drainRejection;
     const conversationId = c.req.param('id') ?? '';
 
     // Reject conversation IDs that could be used for path traversal when building
@@ -2568,7 +2702,9 @@ export function registerApiRoutes(
       return apiError(c, 400, 'Invalid workflow name');
     }
     try {
-      const { conversationId, message } = getValidatedBody(c, runWorkflowBodySchema);
+      const drainRejection = await rejectNewDispatchIfDraining(c);
+      if (drainRejection) return drainRejection;
+      const { conversationId, message, conductor } = getValidatedBody(c, runWorkflowBodySchema);
       // Persist user message and register DB ID (same as message endpoint).
       // /run callers may provide a fresh platform conversation id; create that
       // row up front so workflow dispatch can attach a run and web persistence
@@ -2601,6 +2737,67 @@ export function registerApiRoutes(
         }
       }
 
+      if (
+        conductor?.enabled === true &&
+        process.env.ARCHON_SMART_CAULDRON_DISPATCH_ENABLED === 'true'
+      ) {
+        const cascadeOptions = {
+          woId: conductor.woId,
+          woClass: conductor.woClass,
+          tags: conductor.tags,
+          entryOverride: conductor.entryOverride,
+          dispatchId: conductor.idempotencyKey,
+          dryRun: conductor.dryRun ?? false,
+          project: conductor.project,
+          token: c.req.header('x-archon-operator-token') ?? process.env.ARCHON_OPERATOR_TOKEN ?? '',
+        };
+        if (cascadeOptions.dryRun) {
+          const record = await runCascade(cascadeOptions);
+          return c.json({
+            accepted: true,
+            status: record.status,
+            dispatchMode: 'conductor' as const,
+            cascadeId: record.cascadeId,
+            entryTier: record.telemetry.entryTier,
+          });
+        }
+
+        let resolveAdmission: ((record: Awaited<ReturnType<typeof runCascade>>) => void) | null =
+          null;
+        let rejectAdmission: ((error: unknown) => void) | null = null;
+        const admission = new Promise<Awaited<ReturnType<typeof runCascade>>>((resolve, reject) => {
+          resolveAdmission = resolve;
+          rejectAdmission = reject;
+        });
+        const cascadePromise = runCascade({
+          ...cascadeOptions,
+          deps: {
+            preflight: async tier => {
+              const check = await validateWorkflowRunTarget(
+                `/workflow run ${tier.workflowName}`,
+                conv?.codebase_id
+              );
+              if (!check.valid) throw new Error(check.error);
+            },
+          },
+          onAdmission: record => resolveAdmission?.(record),
+        });
+        void cascadePromise.catch((error: unknown) => {
+          rejectAdmission?.(error);
+          getLog().error(
+            { err: error, cascadeId: conductor.idempotencyKey, woId: conductor.woId },
+            'smart_cauldron_dispatch_failed'
+          );
+        });
+        const admittedRecord = await admission;
+        return c.json({
+          accepted: true,
+          status: admittedRecord.status === 'running' ? 'queued' : admittedRecord.status,
+          dispatchMode: 'conductor' as const,
+          cascadeId: admittedRecord.cascadeId,
+        });
+      }
+
       const fullMessage = `/workflow run ${workflowName} ${message}`;
       const check = await validateWorkflowRunTarget(fullMessage, conv?.codebase_id);
       if (!check.valid) {
@@ -2622,6 +2819,8 @@ export function registerApiRoutes(
       const dashboardValidStatuses = [
         'pending',
         'running',
+        'waiting_provider',
+        'interrupted',
         'completed',
         'failed',
         'cancelled',
@@ -2653,7 +2852,13 @@ export function registerApiRoutes(
         offset,
         includeArchived,
       });
-      return c.json(result);
+      const runs = await Promise.all(
+        result.runs.map(async run => ({
+          ...run,
+          outcome: await workflowDb.getRunOutcome(run.id),
+        }))
+      );
+      return c.json({ ...result, runs });
     } catch (error) {
       getLog().error({ err: error }, 'list_dashboard_runs_failed');
       return apiError(c, 500, 'Failed to list dashboard runs');
@@ -2817,6 +3022,37 @@ export function registerApiRoutes(
     } catch (error) {
       getLog().error({ err: error }, 'admin_throttle_api_failed');
       return apiError(c, 500, 'Failed to update throttle state');
+    }
+  });
+
+  registerOpenApiRoute(getAdminDrainRoute, async c => {
+    try {
+      const state = await workflowDb.getCauldronDrainState();
+      return c.json({ success: true, ...state });
+    } catch (error) {
+      getLog().error({ err: error }, 'get_admin_drain_api_failed');
+      return apiError(c, 500, 'Failed to read drain state');
+    }
+  });
+
+  registerOpenApiRoute(adminDrainRoute, async c => {
+    try {
+      const body = getValidatedBody(c, drainBodySchema);
+      const mode = body.draining ? 'draining' : 'normal';
+      const actor =
+        c.req.header('cf-access-authenticated-user-email')?.trim().toLowerCase() ?? 'operator';
+      const updatedAt = new Date().toISOString();
+      const transition = await workflowDb.setCauldronDrainMode({
+        mode,
+        actor,
+        reason: body.reason ?? null,
+        updatedAt,
+      });
+      const state = await workflowDb.getCauldronDrainState(updatedAt);
+      return c.json({ success: true, changed: transition.changed, ...state });
+    } catch (error) {
+      getLog().error({ err: error }, 'admin_drain_api_failed');
+      return apiError(c, 500, 'Failed to update drain state');
     }
   });
 
@@ -2987,7 +3223,7 @@ export function registerApiRoutes(
       // `parent_conversation_id` on the run (set by orchestrator-agent for any
       // web-dispatched workflow -- foreground, interactive, and background via
       // the pre-created run) and a web-platform parent (guarded in the helper).
-      const autoResumed = await tryAutoResumeAfterGate(run, 'approve');
+      const autoResumed = await tryAutoResumeRun(run, 'approve');
 
       return c.json({
         success: true,
@@ -3059,7 +3295,7 @@ export function registerApiRoutes(
         // without requiring the user to re-run the workflow command. Mirrors
         // what `workflowRejectCommand` does in the CLI. Same cross-adapter
         // guard as approve -- only web parents auto-resume.
-        const autoResumed = await tryAutoResumeAfterGate(run, 'reject');
+        const autoResumed = await tryAutoResumeRun(run, 'reject');
 
         return c.json({
           success: true,
@@ -3204,6 +3440,8 @@ export function registerApiRoutes(
       const validStatuses = [
         'pending',
         'running',
+        'waiting_provider',
+        'interrupted',
         'completed',
         'failed',
         'cancelled',
@@ -3224,10 +3462,16 @@ export function registerApiRoutes(
         limit,
         codebaseId,
       });
+      const runsWithOutcomes = await Promise.all(
+        runs.map(async run => ({
+          ...run,
+          outcome: await workflowDb.getRunOutcome(run.id),
+        }))
+      );
       // computeQuotaWindow queries the DB independently of the runs page so
       // windowTokens reflects ALL in-window runs, not just this page.
       const quotaWindow = await computeQuotaWindow(codebaseId);
-      return c.json({ runs, quotaWindow });
+      return c.json({ runs: runsWithOutcomes, quotaWindow });
     } catch (error) {
       getLog().error({ err: error }, 'list_workflow_runs_failed');
       return apiError(c, 500, 'Failed to list workflow runs');
@@ -3243,7 +3487,7 @@ export function registerApiRoutes(
       if (!run) {
         return apiError(c, 404, 'No workflow run found for this worker');
       }
-      return c.json({ run });
+      return c.json({ run: { ...run, outcome: await workflowDb.getRunOutcome(run.id) } });
     } catch (error) {
       getLog().error({ err: error }, 'workflow_run_by_worker_lookup_failed');
       return apiError(c, 500, 'Failed to look up workflow run');
@@ -3259,6 +3503,7 @@ export function registerApiRoutes(
         return apiError(c, 404, 'Workflow run not found');
       }
       const events = await workflowEventDb.listWorkflowEvents(runId);
+      const outcome = await workflowDb.getRunOutcome(runId);
       const tokenTotalsEvent = [...events]
         .reverse()
         .find(event => event.event_type === 'run_token_totals');
@@ -3289,6 +3534,7 @@ export function registerApiRoutes(
       return c.json({
         run: {
           ...run,
+          outcome,
           worker_platform_id: workerPlatformId,
           parent_platform_id: parentPlatformId,
           conversation_platform_id: conversationPlatformId ?? null,

@@ -24,24 +24,27 @@
  * lock-step with WorktreeProvider for the operations we share.
  *
  * Idempotency: if the stage branch already exists at the resolved worktree path,
- * the existing worktree is adopted (re-fire update path). If the branch exists but
+ * the existing worktree is adopted only after repo ownership and exact branch
+ * identity are verified (re-fire update path). If the branch exists but
  * the worktree is missing (e.g. cleaned up between fires), the branch is reused
  * and a fresh worktree is created on it -- the branch's commits are preserved so
  * the same PR is updated. If neither exists, both are created fresh from
  * `target_branch` on origin.
  */
 
-import { join } from 'path';
+import { join, resolve } from 'path';
 
 import {
   execFileAsync,
   getCanonicalRepoPath,
   getWorktreeBase,
+  listWorktrees,
   mkdirAsync,
   syncWorkspace,
   toBranchName,
   toRepoPath,
   toWorktreePath,
+  verifyWorktreeOwnership,
   worktreeExists,
 } from '@archon/git';
 import type { RepoPath } from '@archon/git';
@@ -106,6 +109,8 @@ export interface StageWorktreeResult {
   branchName: string;
   worktreePath: string;
   codebaseId: string;
+  /** Immutable origin/<targetBranch> authority captured before allocation. */
+  baseSha: string;
   adopted: boolean;
 }
 
@@ -129,12 +134,11 @@ export function deriveStageBranchName(woId: string, stageId: string): string {
  * Allocate a stage worktree.
  *
  * Behavior:
- *   1. Sync the canonical repo with origin on `targetBranch` so the start-point is
- *      fresh. Fails closed on sync errors (per syncWorkspace contract).
+ *   1. Fetch `targetBranch` without resetting the canonical checkout, then freeze
+ *      its full origin commit SHA as this stage's immutable base authority.
  *   2. Compute the workspace-scoped worktree path: `<base>/archon/<woId>/<stageId>`.
- *   3. If a worktree already exists at the path, adopt it (no-op create) and return
- *      `adopted: true`. This is the re-fire update path -- the same branch + same
- *      PR get updated in place.
+ *   3. If a worktree already exists at the path, verify its canonical repo owner
+ *      and exact deterministic branch before returning `adopted: true`.
  *   4. Otherwise create the worktree. If the branch already exists (worktree was
  *      cleaned up but the branch survived), reuse the branch's commits and attach
  *      a new worktree to it. If the branch does not exist, create it from
@@ -177,11 +181,10 @@ export async function createStageWorktree(
     // Continue -- default layout still works.
   }
 
-  // Sync the main checkout on the stage's target_branch BEFORE creating the worktree.
-  // We use targetBranch as the sync target because that is the start-point for new
-  // branch creation; an out-of-date origin/<targetBranch> would branch from stale code.
+  // Fetch target authority without resetting or checking out the canonical repo.
+  // The main checkout may contain operator work and is never an allocator scratchpad.
   try {
-    await syncWorkspace(repoPath, toBranchName(targetBranch), { resetAfterFetch: true });
+    await syncWorkspace(repoPath, toBranchName(targetBranch), { resetAfterFetch: false });
   } catch (error) {
     const err = error as Error;
     getLog().error(
@@ -193,11 +196,31 @@ export async function createStageWorktree(
     );
   }
 
+  const { stdout: baseStdout } = await execFileAsync(
+    'git',
+    ['-C', repoPath, 'rev-parse', `origin/${targetBranch}^{commit}`],
+    { timeout: GIT_OPERATION_TIMEOUT_MS }
+  );
+  const baseSha = baseStdout.trim();
+  if (!/^[0-9a-f]{40}$/.test(baseSha)) {
+    throw new Error(`Stage allocator: origin/${targetBranch} did not resolve to a full commit SHA`);
+  }
+
   const { base: worktreeBase } = getWorktreeBase(repoPath, codebaseName);
   const worktreePath = join(worktreeBase, branchName);
 
   // Adopt if worktree already exists at the expected path (re-fire update path).
   if (await worktreeExists(toWorktreePath(worktreePath))) {
+    await verifyWorktreeOwnership(toWorktreePath(worktreePath), repoPath);
+    const registered = (await listWorktrees(repoPath)).find(
+      worktree => resolve(worktree.path) === resolve(worktreePath)
+    );
+    if (registered?.branch !== branchName) {
+      throw new Error(
+        `Cannot adopt ${worktreePath}: expected branch ${branchName}, ` +
+          `found ${registered?.branch ?? 'unregistered worktree'}.`
+      );
+    }
     getLog().info(
       { worktreePath, branchName, woId, stageId, codebaseId },
       'stage_allocator.worktree_adopted'
@@ -207,6 +230,7 @@ export async function createStageWorktree(
       branchName,
       worktreePath,
       codebaseId,
+      baseSha,
       adopted: true,
     };
   }
@@ -230,6 +254,7 @@ export async function createStageWorktree(
     branchName,
     worktreePath,
     codebaseId,
+    baseSha,
     adopted: false,
   };
 }

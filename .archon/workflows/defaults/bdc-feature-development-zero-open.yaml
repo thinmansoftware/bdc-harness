@@ -18,6 +18,14 @@ description: |
   removed from every seat).
 
 policyFile: harness/policies/agent-behavior.md
+run_authority:
+  required: true
+  spec_repository: bluedevilcollectibles/bdc-xo
+  spec_revision: main
+  spec_paths:
+    - docs/work-orders/{WO_ID}.md
+    - docs/superpowers/specs/{WO_ID}.md
+  allow_issue_fallback: true
 # zero lane: opr-zero = the generic OpenRouter client with no paid-seat failback.
 # provider: opr-zero is REQUIRED here so unpinned nodes do not inherit the default
 # provider while holding an OpenRouter model ID.
@@ -47,6 +55,22 @@ nodes:
     depends_on: [preflight-github-auth]
     bash: |
       set -euo pipefail
+      AUTHORITY_DIR="$ARTIFACTS_DIR/authority"
+      AUTHORITY_MANIFEST="$AUTHORITY_DIR/run-authority.json"
+      AUTHORITY_SPEC="$AUTHORITY_DIR/work-order.md"
+      [ -s "$AUTHORITY_MANIFEST" ] || { echo "scope_authority_missing: run-authority.json" >&2; exit 1; }
+      [ -s "$AUTHORITY_SPEC" ] || { echo "scope_authority_missing: work-order.md" >&2; exit 1; }
+      WO_ID=$(jq -er '.woId' "$AUTHORITY_MANIFEST")
+      SPEC_PATH=$(jq -er '.specSource' "$AUTHORITY_MANIFEST")
+      SPEC_REVISION=$(jq -er '.specRevision' "$AUTHORITY_MANIFEST")
+      EXPECTED_HASH=$(jq -er '.specHash' "$AUTHORITY_MANIFEST")
+      ACTUAL_HASH="sha256:$(sha256sum "$AUTHORITY_SPEC" | awk '{print $1}')"
+      [ "$ACTUAL_HASH" = "$EXPECTED_HASH" ] || { echo "authority_conflict: work-order.md hash mismatch" >&2; exit 1; }
+      RUN_START_SHA=$(git rev-parse --verify 'HEAD^{commit}') || { echo "scope_authority_missing: HEAD" >&2; exit 1; }
+      printf '%s\n' "$RUN_START_SHA" > "$ARTIFACTS_DIR/run-start-sha.txt"
+      printf 'WO_ID=%s\nSPEC_PATH=%s\nSPEC_REVISION=%s\nSPEC_HASH=%s\nRUN_START_SHA=%s\n\n' "$WO_ID" "$SPEC_PATH" "$SPEC_REVISION" "$EXPECTED_HASH" "$RUN_START_SHA"
+      cat "$AUTHORITY_SPEC"
+      exit 0
       WO_ID="${WO_ID:-}"
       if [ -z "$WO_ID" ]; then
         WO_ID=$(printf '%s\n' "$USER_MESSAGE" | grep -Eo 'WO-[A-Z0-9-]+' | head -n 1 || true)
@@ -106,6 +130,8 @@ nodes:
   # the normal build path -- assert-implement-produced-work (Fix A) is the real safety
   # net, this is only an optimization that must never wrongly skip real work.
   - id: check-already-satisfied
+    provider: grok
+    model: x-ai/grok-4.5
     persona: war-council-architect-opr
     agent: war-council-architect-opr
     depends_on: [read-spec]
@@ -164,6 +190,7 @@ nodes:
     depends_on: [gate-already-satisfied]
     agent: war-council-architect-opr
     task_class: medium_work
+    allowed_tools: []
     prompt: |
       Read the BDC Work Order spec below and produce a concise implementation plan.
 
@@ -203,13 +230,13 @@ nodes:
   # plan that `implement` consumes. NOT a human gate -- humans are reached only via the
   # async escalation payload, and only at the irreversible-action boundary downstream.
   - id: plan-review
+    provider: codex-opr
     persona: war-council-architect-opr
     agent: war-council-architect-opr
     # FUSION war council (John 2026-07-07): every council seat is a DIFFERENT open
     # model attacking the others' work. The plan authored by qwen (root default)
     # is reviewed by DeepSeek here -- never self-graded. Cross-model diversity IS
     # the quality mechanism replacing the paid-seat judge on this lane.
-    provider: opr-zero
     model: deepseek/deepseek-chat-v3.1
     depends_on: [plan]
     task_class: medium_work
@@ -300,6 +327,31 @@ nodes:
           SINGLE_DECISION_NEEDED=<one sentence John can answer>
           SAFE_STATE=<nothing committed/pushed; plan stage only>
 
+  - id: capture-run-scope
+    persona: major-build
+    depends_on: [plan-review]
+    load_bearing: true
+    bash: |
+      set -euo pipefail
+      WT=$(git rev-parse --show-toplevel 2>/dev/null) || {
+        echo "scope_authority_missing: assigned worktree unavailable" >&2
+        exit 1
+      }
+      cd "$WT"
+      DIRTY=$(git status --porcelain=v1 --untracked-files=all)
+      if [ -n "$DIRTY" ]; then
+        echo "run_scope_dirty_at_capture" >&2
+        printf '%s\n' "$DIRTY" >&2
+        exit 1
+      fi
+      RUN_SCOPE_SHA=$(git rev-parse --verify 'HEAD^{commit}') || {
+        echo "scope_authority_missing: HEAD is not a commit" >&2
+        exit 1
+      }
+      mkdir -p "$ARTIFACTS_DIR"
+      printf '%s\n' "$RUN_SCOPE_SHA" > "$ARTIFACTS_DIR/run-scope-sha.txt"
+      echo "RUN_SCOPE_SHA=$RUN_SCOPE_SHA"
+
   - id: implement
     # SWAPPED TO CODEX-VIA-OPENROUTER 2026-07-07 (John): qwen twice mis-targeted
     # WO-HARNESS-PLAN-REVIEW-FENCE-WHITESPACE-CORRUPTION-01 (fixed the already-merged
@@ -321,9 +373,11 @@ nodes:
     # ALSO holds plan-review + diff-review + diff-review-final on this lane -- this
     # trial has a self-grading confound (it plans/reviews its own implement output).
     # A PASS here is weaker evidence than a clean trial; a FAIL is still informative.
-    provider: opr-zero
-    model: deepseek/deepseek-chat-v3.1
-    depends_on: [plan-review]
+    # Builder seats require repository write and shell capabilities.
+    provider: grok
+    model: x-ai/grok-4.5
+    persona: major-build-opr
+    depends_on: [capture-run-scope]
     task_class: medium_work
     loop:
       prompt: |
@@ -545,19 +599,37 @@ nodes:
       # negative is what would have misrouted every legitimate build to BLOCKED.
       BASE=$(cat "$ARTIFACTS_DIR/run-start-sha.txt" 2>/dev/null || echo "")
       HEAD_NOW=$(git -C "$WT" rev-parse HEAD 2>/dev/null || echo "")
-      # Anchor 94f61da3: grep -c . || echo 0 yields 0\\n0 when grep exits 1.
-      CHANGED=$(git -C "$WT" status --porcelain 2>/dev/null | grep -c . || true)
-      CHANGED=$(printf '%s' "$CHANGED" | tr -cd '0-9')
-      [ -n "$CHANGED" ] || CHANGED=0
+      validate_implementation_counter() {
+        case "$2" in
+          ''|*[!0-9]*)
+            echo "ERROR: invalid implementation counter $1: expected exactly one digits-only line" >&2
+            return 1
+            ;;
+        esac
+      }
+      STATUS_RAW=$(git -C "$WT" status --porcelain 2>/dev/null) || {
+        echo "ERROR: invalid implementation counter CHANGED: git status failed" >&2
+        exit 1
+      }
+      CHANGED_RAW=$(printf '%s\n' "$STATUS_RAW" | grep -c . || true)
+      validate_implementation_counter CHANGED "$CHANGED_RAW" || exit 1
+      CHANGED=$CHANGED_RAW
       # commits since run start (real work this run produced, even after a checkpoint push)
       if [ -n "$BASE" ] && [ "$BASE" != "unknown" ] && [ -n "$HEAD_NOW" ]; then
-        AHEAD=$(git -C "$WT" rev-list --count "${BASE}..HEAD" 2>/dev/null || true)
+        AHEAD_RAW=$(git -C "$WT" rev-list --count "${BASE}..HEAD" 2>/dev/null) || {
+          echo "ERROR: invalid implementation counter AHEAD: git rev-list failed" >&2
+          exit 1
+        }
       else
         # fallback: no base captured -> use any-uncommitted OR diff vs upstream
-        AHEAD=$(git -C "$WT" rev-list --count "@{upstream}..HEAD" 2>/dev/null || true)
+        AHEAD_RAW=$(git -C "$WT" rev-list --count "@{upstream}..HEAD" 2>/dev/null) ||
+          AHEAD_RAW=$(git -C "$WT" rev-list --count HEAD --not --remotes 2>/dev/null) || {
+            echo "ERROR: invalid implementation counter AHEAD: git rev-list failed" >&2
+            exit 1
+          }
       fi
-      AHEAD=$(printf '%s' "$AHEAD" | tr -cd '0-9')
-      [ -n "$AHEAD" ] || AHEAD=0
+      validate_implementation_counter AHEAD "$AHEAD_RAW" || exit 1
+      AHEAD=$AHEAD_RAW
       HAS_WORK=false
       if [ "$CHANGED" -gt 0 ] || [ "$AHEAD" -gt 0 ]; then HAS_WORK=true; fi
       # ---- BEGIN assert-implement-deliverable-diff ----
@@ -645,9 +717,57 @@ nodes:
   # non-ASCII. Exit 0 always (gate is the backstop if the fixer ever has a bug).
   # Anchor: WO-HARNESS-CAULDRON-PR-MANIFEST-AUTOFILL-01 failed the gate three times
   # because the agent leaked U+2192 arrows + em-dashes into the YAML it was editing.
-  - id: ascii-autofix
+  - id: derive-run-source-scope
     persona: major-build
     depends_on: [assert-implement-produced-work]
+    load_bearing: true
+    bash: |
+      set -euo pipefail
+      WT=$(git rev-parse --show-toplevel 2>/dev/null) || {
+        echo "scope_authority_missing: assigned worktree unavailable" >&2
+        exit 1
+      }
+      cd "$WT"
+      SCOPE_SHA_FILE="$ARTIFACTS_DIR/run-scope-sha.txt"
+      LIST_FILE="$ARTIFACTS_DIR/run-changed-source-files.txt"
+      if [ ! -s "$SCOPE_SHA_FILE" ]; then
+        echo "scope_authority_missing: run scope SHA is missing" >&2
+        exit 1
+      fi
+      SCOPE_SHA=$(cat "$SCOPE_SHA_FILE")
+      case "$SCOPE_SHA" in
+        *[!0-9a-f]*|'')
+          echo "scope_authority_missing: run scope SHA is invalid" >&2
+          exit 1
+          ;;
+      esac
+      if [ "${#SCOPE_SHA}" -ne 40 ] || ! git cat-file -e "${SCOPE_SHA}^{commit}" 2>/dev/null; then
+        echo "scope_authority_missing: run scope SHA is not a commit" >&2
+        exit 1
+      fi
+      if ! git merge-base --is-ancestor "$SCOPE_SHA" HEAD; then
+        echo "scope_authority_missing: run scope SHA is not an ancestor of HEAD" >&2
+        exit 1
+      fi
+      RAW_FILE=$(mktemp)
+      LIST_TMP=$(mktemp)
+      trap 'rm -f "$RAW_FILE" "$LIST_TMP"' EXIT
+      git diff --name-only --diff-filter=ACMRT "$SCOPE_SHA"..HEAD > "$RAW_FILE"
+      git diff --name-only --diff-filter=ACMRT HEAD >> "$RAW_FILE"
+      git ls-files --others --exclude-standard >> "$RAW_FILE"
+      LC_ALL=C sort -u "$RAW_FILE" | awk '
+        /\.(js|jsx|ts|tsx|mjs|cjs|html|sh|bash|gs|yaml|yml)$/ &&
+        $0 !~ /(\.generated\.(ts|js)$|bundled-defaults\.generated\.|\/__snapshots__\/|\.snap$)/
+      ' > "$LIST_TMP"
+      mv "$LIST_TMP" "$LIST_FILE"
+      rm -f "$RAW_FILE"
+      trap - EXIT
+      COUNT=$(grep -c . "$LIST_FILE" || true)
+      echo "RUN_CHANGED_SOURCE_FILES=$COUNT"
+
+  - id: ascii-autofix
+    persona: major-build
+    depends_on: [derive-run-source-scope]
     bash: |
       set -uo pipefail
       WT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
@@ -656,17 +776,22 @@ nodes:
         echo "ascii-autofix: WARN -- python3 not found, skipping normalization"
         exit 0
       fi
-      # Resolve BASE the SAME way ascii-gate does: immutable run-start SHA first,
-      # then merge-base origin/BASE_BRANCH, then HEAD~1.
-      BASE=$(cat "$ARTIFACTS_DIR/run-start-sha.txt" 2>/dev/null || echo "")
-      if [ -z "$BASE" ] || [ "$BASE" = "unknown" ] || ! git rev-parse --verify "$BASE" >/dev/null 2>&1; then
-        BASE_REF="origin/${BASE_BRANCH:-main}"
-        BASE=$(git merge-base HEAD "$BASE_REF" 2>/dev/null || git rev-parse HEAD~1 2>/dev/null || echo "")
+      if [ ! -f harness/scripts/ascii-autofix.py ]; then
+        echo "ascii-autofix: WARN -- normalizer not present in target worktree; gate remains authoritative"
+        exit 0
+      fi
+      SCOPE_FILE="$ARTIFACTS_DIR/run-changed-source-files.txt"
+      if [ ! -f "$SCOPE_FILE" ]; then
+        echo "scope_authority_missing: changed-source list is missing" >&2
+        exit 1
       fi
       # Run the total fixer; prefix every output line for node log clarity.
-      python3 harness/scripts/ascii-autofix.py "$BASE" 2>&1 | while IFS= read -r line; do
+      if ! python3 harness/scripts/ascii-autofix.py --files-from "$SCOPE_FILE" 2>&1 | while IFS= read -r line; do
         echo "ascii-autofix: $line"
-      done
+      done; then
+        echo "ascii-autofix: authoritative scope rejected" >&2
+        exit 1
+      fi
       exit 0
 
   # ascii-gate (Rule 13 mechanical enforcement, 2026-06-04 -- WO-HARNESS-CAULDRON-ASCII-ENFORCEMENT).
@@ -689,35 +814,33 @@ nodes:
     load_bearing: true
     bash: |
       set -uo pipefail
-      # Scope to source files changed by THIS run. Base = the immutable run-start SHA
-      # captured by read-spec (NOT a $RUN_START_SHA env var -- that token is substituted
-      # at parse time and is never exported to bash; read it from the artifact like the
-      # other nodes do). Fall back to origin/BASE_BRANCH merge-base if the artifact is gone.
+      # Consume the exact path list already used by ascii-autofix. Never recompute scope.
       WT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
       cd "$WT"
-      BASE=$(cat "$ARTIFACTS_DIR/run-start-sha.txt" 2>/dev/null || echo "")
-      if [ -z "$BASE" ] || [ "$BASE" = "unknown" ] || ! git rev-parse --verify "$BASE" >/dev/null 2>&1; then
-        BASE_REF="origin/${BASE_BRANCH:-main}"
-        BASE=$(git merge-base HEAD "$BASE_REF" 2>/dev/null || git rev-parse HEAD~1 2>/dev/null || echo "")
+      SCOPE_FILE="$ARTIFACTS_DIR/run-changed-source-files.txt"
+      if [ ! -f "$SCOPE_FILE" ]; then
+        echo "scope_authority_missing: changed-source list is missing" >&2
+        exit 1
       fi
-      SRC_RE='\.(js|jsx|ts|tsx|mjs|cjs|html|sh|bash|gs|yaml|yml)$'
-      # Generated/bundled artifacts are NOT hand-authored source -- they legitimately
-      # embed other files' content (e.g. bundled-defaults.generated.ts inlines every
-      # workflow YAML, including ones with valid non-ASCII prose). Scanning them makes
-      # the gate fail on pre-existing bytes the current WO never wrote. Exclude them so
-      # the gate only judges what THIS run actually authored. (Anchor 2026-06-24:
-      # WO-HARNESS-CAULDRON-PR-MANIFEST-AUTOFILL-01 was killed by 89 pre-existing
-      # non-ASCII lines in bundled-defaults.generated.ts identical to those on dev.)
-      EXCLUDE_RE='(\.generated\.(ts|js)$|bundled-defaults\.generated\.|/__snapshots__/|\.snap$)'
-      if [ -n "$BASE" ] && git rev-parse --verify "$BASE" >/dev/null 2>&1; then
-        CHANGED=$( { git diff --name-only "$BASE"..HEAD 2>/dev/null; git diff --name-only HEAD 2>/dev/null; git ls-files --others --exclude-standard 2>/dev/null; } | sort -u | grep -E "$SRC_RE" | grep -vE "$EXCLUDE_RE" || true )
-      else
-        CHANGED=$( { git diff --name-only HEAD 2>/dev/null; git ls-files --others --exclude-standard 2>/dev/null; } | sort -u | grep -E "$SRC_RE" | grep -vE "$EXCLUDE_RE" || true )
-      fi
-      if [ -z "$CHANGED" ]; then
+      if [ ! -s "$SCOPE_FILE" ]; then
         echo "ascii-gate PASS (no changed source files to scan)"
         exit 0
       fi
+      INVALID_SCOPE=$(mktemp)
+      while IFS= read -r f; do
+        [ -z "$f" ] && continue
+        case "$f" in
+          /*|..|../*|*/../*) printf '%s\n' "$f" >> "$INVALID_SCOPE" ;;
+          *) [ -f "$f" ] || printf '%s\n' "$f" >> "$INVALID_SCOPE" ;;
+        esac
+      done < "$SCOPE_FILE"
+      if [ -s "$INVALID_SCOPE" ]; then
+        echo "scope_authority_missing: invalid or missing changed-source path" >&2
+        cat "$INVALID_SCOPE" >&2
+        rm -f "$INVALID_SCOPE"
+        exit 1
+      fi
+      rm -f "$INVALID_SCOPE"
       # Portable non-ASCII detector. grep -P is not present in every build image, so probe
       # it once and fall back to perl, then to an LC_ALL=C byte-class grep.
       GREP_P_OK=0
@@ -738,11 +861,10 @@ nodes:
       # Accumulate offending files to a temp file (the while loop is fed by a pipe and
       # would otherwise run in a subshell where a HITS shell var could not persist).
       HITFILE=$(mktemp)
-      printf '%s\n' "$CHANGED" | while IFS= read -r f; do
+      while IFS= read -r f; do
         [ -z "$f" ] && continue
-        [ -f "$f" ] || continue
         if ! detect "$f"; then printf '%s\n' "$f" >> "$HITFILE"; fi
-      done
+      done < "$SCOPE_FILE"
       if [ -s "$HITFILE" ]; then
         echo "ASCII GATE FAILED -- non-ASCII bytes in changed source file(s):" >&2
         cat "$HITFILE" >&2
@@ -761,12 +883,13 @@ nodes:
         exit 1
       fi
       rm -f "$HITFILE"
-      echo "ascii-gate PASS (scanned $(printf '%s\n' "$CHANGED" | grep -c .) changed source file(s), all ASCII)"
+      COUNT=$(grep -c . "$SCOPE_FILE" || true)
+      echo "ascii-gate PASS (scanned $COUNT changed source file(s), all ASCII)"
       exit 0
 
   - id: war-council-validator
-    # Dual-cap (2026-07-09): DeepSeek judge via opr-zero -- no Claude, no Codex.
-    provider: opr-zero
+    # DeepSeek judge through the repository-capable OpenRouter tool loop.
+    provider: codex-opr
     persona: captain-ci-validator-codex
     model: deepseek/deepseek-chat-v3.1
     depends_on: [ascii-gate]
@@ -890,8 +1013,9 @@ nodes:
       printf '{"verdict":"%s"}\n' "$verdict"
 
   - id: diff-repair
-    provider: opr-zero
-    model: qwen/qwen3-coder
+    provider: grok
+    model: x-ai/grok-4.5
+    persona: major-build-opr
     depends_on: [diff-review, classify-diff-review]
     when: "$classify-diff-review.output.verdict == 'needs_revision'"
     task_class: medium_work
@@ -1132,8 +1256,9 @@ nodes:
   # bothering a human (autonomy ladder step 2). Read-only-ish: it may edit in-scope files to
   # resolve the block, then signals. If it can't fix, the run proceeds to the human pause.
   - id: opus-repair
-    provider: opr-zero
-    model: qwen/qwen3-coder
+    provider: grok
+    model: x-ai/grok-4.5
+    persona: major-build-opr
     depends_on: [block-classify]
     when: "$block-classify.output.status == 'BLOCKED'"
     prompt: |
@@ -1257,9 +1382,28 @@ nodes:
 
       # It was blocked: did Opus fix it? Re-check the worktree for real work.
       WT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
-      CHANGED=$(git -C "$WT" status --porcelain 2>/dev/null | grep -c . || echo 0)
-      AHEAD=$(git -C "$WT" rev-list --count "@{upstream}..HEAD" 2>/dev/null \
-              || git -C "$WT" rev-list --count HEAD --not --remotes 2>/dev/null || echo 0)
+      validate_implementation_counter() {
+        case "$2" in
+          ''|*[!0-9]*)
+            echo "ERROR: invalid implementation counter $1: expected exactly one digits-only line" >&2
+            return 1
+            ;;
+        esac
+      }
+      STATUS_RAW=$(git -C "$WT" status --porcelain 2>/dev/null) || {
+        echo "ERROR: invalid implementation counter CHANGED: git status failed" >&2
+        exit 1
+      }
+      CHANGED_RAW=$(printf '%s\n' "$STATUS_RAW" | grep -c . || true)
+      validate_implementation_counter CHANGED "$CHANGED_RAW" || exit 1
+      CHANGED=$CHANGED_RAW
+      AHEAD_RAW=$(git -C "$WT" rev-list --count "@{upstream}..HEAD" 2>/dev/null) ||
+        AHEAD_RAW=$(git -C "$WT" rev-list --count HEAD --not --remotes 2>/dev/null) || {
+          echo "ERROR: invalid implementation counter AHEAD: git rev-list failed" >&2
+          exit 1
+        }
+      validate_implementation_counter AHEAD "$AHEAD_RAW" || exit 1
+      AHEAD=$AHEAD_RAW
 
       if printf '%s\n' "$OPUS" | grep -q '^OPUS_REPAIR=fixed' && { [ "${CHANGED:-0}" -gt 0 ] || [ "${AHEAD:-0}" -gt 0 ]; }; then
         # Opus made real changes. The autonomous re-review verdict decides the path:
@@ -1298,9 +1442,28 @@ nodes:
       if [ "${CAULDRON_INTERACTIVE:-}" = "true" ]; then echo "SALVAGE=skip (interactive; pause-gate owns this)"; exit 0; fi
       WT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
       cd "$WT" || { echo "SALVAGE=skip (no worktree)"; exit 0; }
-      CHANGED=$(git status --porcelain 2>/dev/null | grep -c . || echo 0)
-      AHEAD=$(git rev-list --count HEAD --not --remotes 2>/dev/null || echo 0)
-      if [ "${CHANGED:-0}" -eq 0 ] && [ "${AHEAD:-0}" -eq 0 ]; then echo "SALVAGE=skip (nothing to preserve)"; exit 0; fi
+      validate_implementation_counter() {
+        case "$2" in
+          ''|*[!0-9]*)
+            echo "ERROR: invalid implementation counter $1: expected exactly one digits-only line" >&2
+            return 1
+            ;;
+        esac
+      }
+      STATUS_RAW=$(git status --porcelain 2>/dev/null) || {
+        echo "ERROR: invalid implementation counter CHANGED: git status failed" >&2
+        exit 1
+      }
+      CHANGED_RAW=$(printf '%s\n' "$STATUS_RAW" | grep -c . || true)
+      validate_implementation_counter CHANGED "$CHANGED_RAW" || exit 1
+      CHANGED=$CHANGED_RAW
+      AHEAD_RAW=$(git rev-list --count HEAD --not --remotes 2>/dev/null) || {
+        echo "ERROR: invalid implementation counter AHEAD: git rev-list failed" >&2
+        exit 1
+      }
+      validate_implementation_counter AHEAD "$AHEAD_RAW" || exit 1
+      AHEAD=$AHEAD_RAW
+      if [ "$CHANGED" -eq 0 ] && [ "$AHEAD" -eq 0 ]; then echo "SALVAGE=skip (nothing to preserve)"; exit 0; fi
       # Branch suffix uses $$ (Rule 2: never $WORKFLOW_ID under set -u).
       BR="salvage/opus-repair-$(basename "$WT")-$$"
       git add -A 2>/dev/null || true
@@ -1328,6 +1491,7 @@ nodes:
     depends_on: [block-reclassify]
     trigger_rule: all_done
     task_class: clerical
+    allowed_tools: []
     prompt: |
       Build the human-facing findings ledger for the approval gate. Read every review output
       below and emit ONE JSON object. Do not invent findings; only consolidate what the reviews
@@ -1414,6 +1578,8 @@ nodes:
   # schema migration the self-repair loop deferred -- but ONLY for the authorized_fix_ids.
   # trigger_rule all_done so an APPROVE-AS-IS run (which skips this) does not hang the DAG.
   - id: apply-suggested-fix
+    provider: grok
+    model: x-ai/grok-4.5
     agent: overseer-opus
     effort: xhigh
     context: fresh
@@ -1499,6 +1665,7 @@ nodes:
     trigger_rule: all_done
     when: "$pause-gate.output.decision_verb != 'approve_with_fix' || $classify-apply-review.output.verdict == 'satisfied'"
     task_class: clerical
+    allowed_tools: []
     prompt: |
       Decide the push target for this BDC feature Work Order.
 
@@ -1935,7 +2102,10 @@ nodes:
     depends_on: [open-pr-if-needed, block-reclassify, pause-gate]
     trigger_rule: all_done
     task_class: clerical
-    prompt: |
+    evidence:
+      kind: manifest_v2
+      required_gates: [plan-review, block-reclassify, open-pr-if-needed]
+    legacy_prompt: |
       Construct the Captain CI completion manifest for this BDC feature Work Order.
 
       ## Outcome branch (Fix D, 2026-05-30) -- read this FIRST
@@ -2325,6 +2495,7 @@ nodes:
     when: "$manifest-consistency-check.output == 'OK'"
     trigger_rule: all_done
     task_class: clerical
+    allowed_tools: []
     prompt: |
       Update the Notion Work Order page if Notion MCP is available in this runtime.
 
@@ -2363,6 +2534,7 @@ nodes:
     depends_on: [war-council-validator, flip-notion]
     trigger_rule: all_done
     task_class: clerical
+    allowed_tools: []
     prompt: |
       FALLBACK Notion flip. Update Notion ONLY if the normal flip-notion node did NOT
       already flip the WO to REVIEW, AND the build was genuinely good. This is a

@@ -49,6 +49,16 @@ export const workflowWorktreePolicySchema = z.object({
 
 export type WorkflowWorktreePolicy = z.infer<typeof workflowWorktreePolicySchema>;
 
+export const runAuthorityPolicySchema = z.object({
+  required: z.boolean(),
+  spec_repository: z.string().regex(/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/),
+  spec_revision: z.string().min(1),
+  spec_paths: z.array(z.string().min(1)).min(1),
+  allow_issue_fallback: z.boolean().optional(),
+});
+
+export type RunAuthorityPolicy = z.infer<typeof runAuthorityPolicySchema>;
+
 // ---------------------------------------------------------------------------
 // WorkflowBase -- common fields shared by all workflow types
 // ---------------------------------------------------------------------------
@@ -76,6 +86,8 @@ export const workflowBaseSchema = z.object({
   failover_provider: z.string().trim().min(1).optional(),
   failover_model: z.string().trim().min(1).optional(),
   worktree: workflowWorktreePolicySchema.optional(),
+  /** Freeze canonical work-order bytes and repository scope before any workflow node runs. */
+  run_authority: runAuthorityPolicySchema.optional(),
   /** Path to file whose content is loaded as systemPrompt for all prompt nodes. BDC patch. */
   policyFile: z.string().optional(),
   /**

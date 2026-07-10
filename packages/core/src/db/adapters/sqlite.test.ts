@@ -46,6 +46,47 @@ describe('SqliteAdapter', () => {
     }
   });
 
+  describe('Smart Cauldron reliability schema', () => {
+    test('creates all additive reliability tables and indexes', async () => {
+      db = createTestDb();
+
+      const tables = await db.query<{ name: string }>(
+        `SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'remote_agent_%'`
+      );
+      const tableNames = new Set(tables.rows.map(row => row.name));
+      for (const table of [
+        'remote_agent_run_authorities',
+        'remote_agent_run_leases',
+        'remote_agent_provider_attempts',
+        'remote_agent_run_outcomes',
+        'remote_agent_scheduled_waits',
+        'remote_agent_supervisor_incidents',
+        'remote_agent_supervisor_observations',
+        'remote_agent_supervisor_repair_leases',
+        'remote_agent_supervisor_actions',
+      ]) {
+        expect(tableNames.has(table)).toBe(true);
+      }
+
+      const indexes = await db.query<{ name: string }>(
+        `SELECT name FROM sqlite_master WHERE type = 'index' AND name LIKE 'idx_reliability_%'`
+      );
+      expect(indexes.rows.map(row => row.name).sort()).toEqual([
+        'idx_reliability_active_leases',
+        'idx_reliability_attempts_run_node',
+        'idx_reliability_due_waits',
+      ]);
+      const supervisorIndexes = await db.query<{ name: string }>(
+        `SELECT name FROM sqlite_master WHERE type = 'index' AND name LIKE 'idx_supervisor_%'`
+      );
+      expect(supervisorIndexes.rows.map(row => row.name).sort()).toEqual([
+        'idx_supervisor_actions_incident',
+        'idx_supervisor_observations_incident',
+        'idx_supervisor_repair_leases_expiry',
+      ]);
+    });
+  });
+
   describe('INSERT with RETURNING', () => {
     test('returns inserted row via native RETURNING', async () => {
       db = createTestDb();

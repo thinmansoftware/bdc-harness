@@ -25,6 +25,7 @@ import type { ProviderCapabilities } from '../../types';
  * - sandbox: false -- no sandbox mode.
  */
 export const GLM_CAPABILITIES: ProviderCapabilities = {
+  execution: { text: true, repositoryRead: false, repositoryWrite: false, shell: false },
   sessionResume: false,
   mcp: false,
   hooks: false,

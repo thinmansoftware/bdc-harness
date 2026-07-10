@@ -182,6 +182,19 @@ export type MessageChunk =
     }
   | { type: 'rate_limit'; rateLimitInfo: Record<string, unknown> }
   | {
+      type: 'provider_route';
+      route: 'failover' | 'failback';
+      fromProvider: string;
+      fromModel?: string;
+      toProvider: string;
+      toModel?: string;
+      reasonCode:
+        | 'provider_unavailable'
+        | 'provider_rate_limited'
+        | 'provider_auth_failed'
+        | 'progress_timeout';
+    }
+  | {
       type: 'tool';
       toolName: string;
       toolInput?: Record<string, unknown>;
@@ -279,10 +292,15 @@ export interface SendQueryOptions extends AgentRequestOptions {
 }
 
 /**
- * Provider capability flags. The dag-executor uses these for capability warnings
- * when a node specifies features the target provider doesn't support.
+ * Provider capability flags. SDK feature flags drive compatibility warnings;
+ * execution capabilities are enforced at workflow load and dispatch boundaries.
  */
 export interface ProviderCapabilities {
+  /**
+   * Execution authority is separate from SDK feature support. A provider can
+   * produce structured text while still lacking any repository or shell tools.
+   */
+  execution: ProviderExecutionCapabilities;
   sessionResume: boolean;
   mcp: boolean;
   hooks: boolean;
@@ -299,6 +317,15 @@ export interface ProviderCapabilities {
   sandbox: boolean;
 }
 
+export interface ProviderExecutionCapabilities {
+  text: boolean;
+  repositoryRead: boolean;
+  repositoryWrite: boolean;
+  shell: boolean;
+}
+
+export type ProviderExecutionCapability = keyof ProviderExecutionCapabilities;
+
 /**
  * Registration entry for a provider in the provider registry.
  * Each entry carries metadata, a factory, and model-compatibility logic.
@@ -314,7 +341,7 @@ export interface ProviderRegistration {
   /** Instantiate a provider */
   factory: () => IAgentProvider;
 
-  /** Static capability declaration -- used for dag-executor warnings */
+  /** Static capability declaration -- used for warnings and execution enforcement */
   capabilities: ProviderCapabilities;
 
   /** Whether this is a built-in (maintained by core team) or community provider */

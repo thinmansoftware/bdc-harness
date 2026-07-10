@@ -40,6 +40,8 @@ import type { CascadeStatus } from './types.js';
  */
 export function statusToExitCode(status: CascadeStatus): number {
   switch (status) {
+    case 'running':
+      return 5;
     case 'blocked':
       return 2;
     case 'infra-alert':

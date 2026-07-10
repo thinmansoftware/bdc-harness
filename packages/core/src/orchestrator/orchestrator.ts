@@ -51,6 +51,7 @@ import { getCodebase } from '../db/codebases';
 import { executeWorkflow } from '@archon/workflows/executor';
 import type { WorkflowDefinition } from '@archon/workflows/schemas/workflow';
 import { createWorkflowDeps } from '../workflows/store-adapter';
+import { freezeWorkOrderSource } from '../workflows/work-order-source';
 import {
   cleanupToMakeRoom,
   getWorktreeStatusBreakdown,
@@ -263,8 +264,15 @@ export async function dispatchBackgroundWorkflow(
     prBranch?: string;
   }
 ): Promise<void> {
+  const frozenSpecSource = workflow.run_authority?.required
+    ? await freezeWorkOrderSource(workflow.run_authority, ctx.originalMessage)
+    : undefined;
+
   // 1. Generate worker conversation ID
   const workerPlatformId = `web-worker-${Date.now()}-${Math.random().toString(36).substring(2, 8)}`;
+  const authoritySource = frozenSpecSource
+    ? { ...frozenSpecSource, dispatchId: workerPlatformId }
+    : undefined;
 
   // 2. Create worker conversation in DB
   const workerConv = await db.getOrCreateConversation('web', workerPlatformId);
@@ -411,7 +419,8 @@ export async function dispatchBackgroundWorkflow(
           ctx.issueContext,
           isolationContext,
           ctx.conversationDbId,
-          preCreatedRun
+          preCreatedRun,
+          authoritySource
         );
         // Surface workflow output to parent conversation as a result card
         if ('paused' in result) {

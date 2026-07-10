@@ -2,6 +2,14 @@
  * Zod schemas for workflow run state types.
  */
 import { z } from '@hono/zod-openapi';
+import {
+  DELIVERABLE_STATES,
+  EXECUTION_STATES,
+  OUTCOME_REASON_CODES,
+  RECOVERY_STATES,
+  ROUTE_STATES,
+  VALIDATION_STATES,
+} from '../reliability/types';
 
 // ---------------------------------------------------------------------------
 // WorkflowRunStatus
@@ -10,6 +18,8 @@ import { z } from '@hono/zod-openapi';
 export const workflowRunStatusSchema = z.enum([
   'pending',
   'running',
+  'waiting_provider',
+  'interrupted',
   'completed',
   'failed',
   /**
@@ -42,8 +52,33 @@ export const TERMINAL_WORKFLOW_STATUSES: readonly WorkflowRunStatus[] = [
 /** Statuses that allow a user to resume execution. */
 export const RESUMABLE_WORKFLOW_STATUSES: readonly WorkflowRunStatus[] = [
   'failed',
+  'interrupted',
   'paused',
 ] as const;
+
+// ---------------------------------------------------------------------------
+// Multidimensional reliability outcome
+// ---------------------------------------------------------------------------
+
+export const executionStateSchema = z.enum(EXECUTION_STATES);
+export const deliverableStateSchema = z.enum(DELIVERABLE_STATES);
+export const validationStateSchema = z.enum(VALIDATION_STATES);
+export const recoveryStateSchema = z.enum(RECOVERY_STATES);
+export const routeStateSchema = z.enum(ROUTE_STATES);
+export const outcomeReasonCodeSchema = z.enum(OUTCOME_REASON_CODES);
+
+export const runOutcomeSchema = z.object({
+  executionState: executionStateSchema,
+  deliverableState: deliverableStateSchema,
+  validationState: validationStateSchema,
+  recoveryState: recoveryStateSchema,
+  routeState: routeStateSchema,
+  primaryReason: outcomeReasonCodeSchema,
+  reasonCodes: z.array(outcomeReasonCodeSchema),
+  evidenceRefs: z.array(z.string()),
+});
+
+export type PersistedRunOutcome = z.infer<typeof runOutcomeSchema>;
 
 // ---------------------------------------------------------------------------
 // WorkflowStepStatus

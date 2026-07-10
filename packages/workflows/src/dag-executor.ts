@@ -5,9 +5,17 @@
  * Independent nodes within the same layer run concurrently via Promise.allSettled.
  * Captures all assistant output regardless of streaming mode for $node_id.output substitution.
  */
+import { existsSync } from 'fs';
 import { chmod, mkdir, readFile, unlink, writeFile } from 'fs/promises';
+import { randomUUID } from 'crypto';
 import { tmpdir } from 'os';
-import { isAbsolute, join, resolve as resolvePath } from 'path';
+import {
+  isAbsolute,
+  join,
+  posix as posixPath,
+  resolve as resolvePath,
+  win32 as win32Path,
+} from 'path';
 import { execFileAsync } from '@archon/git';
 import { discoverScriptsForCwd } from './script-discovery';
 import type {
@@ -21,6 +29,7 @@ import type {
   NodeConfig,
   ProviderCapabilities,
   TokenUsage,
+  MessageChunk,
 } from '@archon/providers/types';
 import {
   getProviderCapabilities,
@@ -35,6 +44,7 @@ import type {
   PromptNode,
   LoopNode,
   ScriptNode,
+  EvidenceNode,
   NodeOutput,
   TriggerRule,
   WorkflowRun,
@@ -42,14 +52,17 @@ import type {
   ThinkingConfig,
   SandboxSettings,
 } from './schemas';
+import { deriveNodeExecutionRequirements } from './schemas/dag-node';
 import {
   isBashNode,
   isLoopNode,
   isApprovalNode,
   isCancelNode,
   isScriptNode,
+  isEvidenceNode,
   isApprovalContext,
 } from './schemas';
+import { collectRuntimeEvidence, renderManifestV2 } from './reliability/evidence-collector';
 import { formatToolCall } from './utils/tool-formatter';
 import { createLogger } from '@archon/paths';
 import { getWorkflowEventEmitter, buildGateResultField } from './event-emitter';
@@ -91,13 +104,121 @@ import {
   isPaperworkNode,
   hasPushArtifact,
 } from './executor-shared';
-import { isAvailabilityError } from './node-failover';
+import {
+  assertProviderCanExecuteNode,
+  isAvailabilityError,
+  selectQuotaExhaustionRoute,
+} from './node-failover';
 import { loadAgentRegistry, resolveAgent } from './agents/registry';
 import type { AgentRegistry } from './agents/registry';
 import { loadContext } from '@archon/persona-context-loader';
 import { deriveEntryRung, computeFrontierCost } from './model-rates';
 import { isDeclaredServedMatch } from './model-alias';
 import { emitRunTokenTotals } from './token-rollup';
+import type {
+  ExecutionCapability,
+  OutcomeReasonCode,
+  ProviderAttemptOutcomeClass,
+  ProviderAttemptRecord,
+  RunOutcome,
+  TerminalWorkflowPersistence,
+} from './reliability/types';
+import { withRunLease } from './run-lease';
+
+function cancellationPersistence(
+  runId: string,
+  reason: string,
+  stepName?: string
+): TerminalWorkflowPersistence {
+  return {
+    outcome: {
+      executionState: 'cancelled',
+      deliverableState: 'none',
+      validationState: 'not_run',
+      recoveryState: 'not_needed',
+      routeState: 'current',
+      primaryReason: 'cancelled_by_operator',
+      reasonCodes: ['cancelled_by_operator'],
+      evidenceRefs: [`run:${runId}`],
+    },
+    eventData: { reason, reason_code: 'cancelled_by_operator' },
+    updatedAt: new Date().toISOString(),
+    stepName,
+  };
+}
+
+async function persistCancellation(
+  deps: WorkflowDeps,
+  platform: IWorkflowPlatform,
+  conversationId: string,
+  workflowRun: WorkflowRun,
+  nodeId: string,
+  reason: string
+): Promise<boolean> {
+  try {
+    await deps.store.cancelWorkflowRun(
+      workflowRun.id,
+      cancellationPersistence(workflowRun.id, reason, nodeId)
+    );
+    return true;
+  } catch (error) {
+    const failedAt = new Date().toISOString();
+    getLog().error(
+      { err: error as Error, workflowRunId: workflowRun.id, nodeId },
+      'dag_cancel_persist_failed'
+    );
+    const currentStatus = await deps.store.getWorkflowRunStatus(workflowRun.id).catch(() => null);
+    if (currentStatus === 'running') {
+      await deps.store
+        .updateWorkflowRun(workflowRun.id, {
+          status: 'interrupted',
+          metadata: {
+            terminal_persist_failure: {
+              attempted_status: 'cancelled',
+              reason_code: 'status_persist_failed',
+              failed_at: failedAt,
+            },
+          },
+        })
+        .catch(() => undefined);
+      await deps.store
+        .upsertRunOutcome(
+          workflowRun.id,
+          {
+            executionState: 'interrupted',
+            deliverableState: 'none',
+            validationState: 'not_run',
+            recoveryState: 'recoverable',
+            routeState: 'current',
+            primaryReason: 'status_persist_failed',
+            reasonCodes: ['status_persist_failed'],
+            evidenceRefs: [`run:${workflowRun.id}`, 'status_persist_failed'],
+          },
+          failedAt
+        )
+        .catch(() => undefined);
+    }
+    await deps.store.createWorkflowEvent({
+      workflow_run_id: workflowRun.id,
+      event_type: 'status_persist_failed',
+      step_name: nodeId,
+      data: { attempted_status: 'cancelled', reason_code: 'status_persist_failed' },
+    });
+    getWorkflowEventEmitter().emit({
+      type: 'status_persist_failed',
+      runId: workflowRun.id,
+      attemptedStatus: 'cancelled',
+      reason: 'status_persist_failed',
+    });
+    await safeSendMessage(
+      platform,
+      conversationId,
+      'Warning: workflow cancellation could not be saved. The run is recoverable and no cancellation event was published.',
+      { workflowId: workflowRun.id, nodeName: nodeId }
+    );
+    return false;
+  }
+}
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
 let cachedLog: ReturnType<typeof createLogger> | undefined;
@@ -381,6 +502,14 @@ type NodeExecutionResult = NodeOutput & {
   requestedModelId?: string;
   servedModelId?: string | null;
   modelMismatch?: boolean;
+  quotaExhausted?: {
+    attemptId: string;
+    attemptNumber: number;
+    attemptStartedAt: string;
+    provider: string;
+    info: ResourceExhaustedInfo;
+    iteration?: number;
+  };
 };
 
 /** Throttle state for cancel checks (reads -- no write contention in WAL mode) */
@@ -526,7 +655,7 @@ function isSdkSuccessContradiction(errorMessage: string): boolean {
   return /failed: SDK returned success\b/.test(errorMessage);
 }
 
-type ResourceExhaustedReason = 'zero_work_signature' | 'quota_or_rate_limit_message';
+type ResourceExhaustedReason = 'quota_or_rate_limit_message';
 
 interface ResourceExhaustedInfo {
   reason: ResourceExhaustedReason;
@@ -550,7 +679,127 @@ class ResourceExhaustedPause extends Error {
 
 const RESOURCE_EXHAUSTED_DEFAULT_BACKOFF_MS = [60_000, 300_000, 900_000, 1_800_000];
 const RESOURCE_EXHAUSTED_DEFAULT_CEILING_MS = 6 * 60 * 60 * 1000;
-const resourceExhaustedRetryState = new Map<string, ResourceExhaustedRetryState>();
+const PROVIDER_TOTAL_ATTEMPT_CEILING = 8;
+
+const EXECUTION_CAPABILITY_LEDGER_MAP = {
+  text: 'text_generation',
+  repositoryRead: 'repo_read',
+  repositoryWrite: 'repo_write',
+  shell: 'shell',
+} as const satisfies Record<string, ExecutionCapability>;
+
+function getProviderTotalAttemptCeiling(): number {
+  const configured = Number.parseInt(process.env.ARCHON_PROVIDER_TOTAL_ATTEMPT_CEILING ?? '', 10);
+  return Number.isInteger(configured) && configured > 0
+    ? configured
+    : PROVIDER_TOTAL_ATTEMPT_CEILING;
+}
+
+async function persistProviderRouteChange(
+  deps: WorkflowDeps,
+  runId: string,
+  nodeId: string,
+  attemptId: string,
+  route: Extract<MessageChunk, { type: 'provider_route' }>
+): Promise<void> {
+  await deps.store.createWorkflowEvent({
+    workflow_run_id: runId,
+    event_type: 'node_failover',
+    step_name: nodeId,
+    data: {
+      node_id: nodeId,
+      attempt_id: attemptId,
+      route: route.route,
+      from_provider: route.fromProvider,
+      ...(route.fromModel ? { from_model: route.fromModel } : {}),
+      to_provider: route.toProvider,
+      ...(route.toModel ? { to_model: route.toModel } : {}),
+      reason_code: route.reasonCode,
+    },
+  });
+  getWorkflowEventEmitter().emit({
+    type: 'node_failover',
+    runId,
+    nodeId,
+    fromProvider: route.fromProvider,
+    ...(route.fromModel ? { fromModel: route.fromModel } : {}),
+    toProvider: route.toProvider,
+    ...(route.toModel ? { toModel: route.toModel } : {}),
+    errorClass: route.reasonCode,
+  });
+}
+
+async function beginProviderAttempt(
+  deps: WorkflowDeps,
+  workflowRun: WorkflowRun,
+  node: CommandNode | PromptNode | LoopNode,
+  provider: string,
+  model: string | undefined,
+  declaredModel: string | undefined
+): Promise<ProviderAttemptRecord> {
+  const prior = await deps.store.listProviderAttempts(workflowRun.id, node.id);
+  const ceiling = getProviderTotalAttemptCeiling();
+  if (prior.length >= ceiling) {
+    throw new Error(
+      `provider_attempt_ceiling_exceeded: node '${node.id}' reached ${String(ceiling)} total provider calls`
+    );
+  }
+  const latest = prior.reduce<ProviderAttemptRecord | null>(
+    (current, attempt) =>
+      current === null || attempt.attemptNumber > current.attemptNumber ? attempt : current,
+    null
+  );
+  const requestedModel = model ?? declaredModel ?? 'provider-default';
+  const attempt: ProviderAttemptRecord = {
+    attemptId: randomUUID(),
+    runId: workflowRun.id,
+    nodeId: node.id,
+    attemptNumber: (latest?.attemptNumber ?? 0) + 1,
+    provider,
+    model: requestedModel,
+    declaredProvider: node.provider ?? provider,
+    declaredModel: declaredModel ?? requestedModel,
+    requiredCapabilities: deriveNodeExecutionRequirements(node).map(
+      capability => EXECUTION_CAPABILITY_LEDGER_MAP[capability]
+    ),
+    startedAt: new Date().toISOString(),
+    completedAt: null,
+    servedModelId: null,
+    outcomeClass: null,
+    reasonCode: null,
+    resumeAt: null,
+    supersedesAttemptId: latest?.attemptId ?? null,
+  };
+  if (!(await deps.store.createProviderAttempt(attempt))) {
+    throw new Error(
+      `provider_attempt_persist_failed: could not reserve attempt ${String(attempt.attemptNumber)} for node '${node.id}'`
+    );
+  }
+  return attempt;
+}
+
+async function finishProviderAttempt(
+  deps: WorkflowDeps,
+  attempt: ProviderAttemptRecord,
+  data: {
+    servedModelId: string | null;
+    outcomeClass: ProviderAttemptOutcomeClass;
+    reasonCode: OutcomeReasonCode;
+    resumeAt?: string | null;
+  }
+): Promise<void> {
+  const completed = await deps.store.completeProviderAttempt({
+    attemptId: attempt.attemptId,
+    completedAt: new Date().toISOString(),
+    servedModelId: data.servedModelId,
+    outcomeClass: data.outcomeClass,
+    reasonCode: data.reasonCode,
+    resumeAt: data.resumeAt ?? null,
+  });
+  if (!completed) {
+    throw new Error(`provider_attempt_complete_failed: attempt ${attempt.attemptId}`);
+  }
+}
 
 function parsePositiveIntegerList(value: string | undefined): number[] | undefined {
   if (!value) return undefined;
@@ -587,16 +836,6 @@ function hasPositiveUsage(tokens: TokenUsage | undefined, cost: number | undefin
   return (tokenTotal !== undefined && tokenTotal > 0) || (cost !== undefined && cost > 0);
 }
 
-function isZeroWorkSdkResult(msg: {
-  isError?: boolean;
-  tokens?: TokenUsage;
-  cost?: number;
-}): boolean {
-  if (msg.isError !== true || msg.tokens === undefined || msg.cost !== 0) return false;
-  const total = getTokenTotal(msg.tokens);
-  return total === 0 && msg.tokens.input === 0 && msg.tokens.output === 0;
-}
-
 function stringifySdkFields(msg: {
   errorSubtype?: string;
   errors?: string[];
@@ -608,7 +847,7 @@ function stringifySdkFields(msg: {
 function classifyResourceExhaustionText(text: string): ResourceExhaustedInfo | undefined {
   const normalized = text.toLowerCase();
   if (
-    /you're out of extra usage|out of extra usage|out of credits|credit exhaustion|credit balance|insufficient credit|quota|rate limit|too many requests|\b429\b|overloaded/.test(
+    /you're out of extra usage|out of extra usage|out of credits|credit exhaustion|credit balance|insufficient credit|quota (?:is )?(?:exhausted|depleted)|usage (?:limit|quota).*(?:reached|exhausted)|resume when credits reset/.test(
       normalized
     )
   ) {
@@ -628,22 +867,15 @@ function classifyResourceExhaustedSdkResult(msg: {
   tokens?: TokenUsage;
   cost?: number;
 }): ResourceExhaustedInfo | undefined {
-  if (isZeroWorkSdkResult(msg)) {
-    return {
-      reason: 'zero_work_signature',
-      detail: `SDK error result reported zero tokens, zero cost, subtype ${msg.errorSubtype ?? 'unknown'}`,
-    };
-  }
+  const explicitEvidence = classifyResourceExhaustionText(stringifySdkFields(msg));
+  if (explicitEvidence) return explicitEvidence;
 
-  // Keep real validator failures untouched: once the SDK reports nonzero usage,
-  // this lane is work performed and must remain an ordinary node failure.
+  // Token/cost counters are integrity evidence, not quota evidence. In particular,
+  // the SDK success-contradiction can report zero work with no quota message. That
+  // result gets the one bounded contradiction retry; it must never start a long
+  // provider wait merely because all counters are zero.
   if (hasPositiveUsage(msg.tokens, msg.cost)) return undefined;
-
-  return classifyResourceExhaustionText(stringifySdkFields(msg));
-}
-
-function resourceExhaustedKey(workflowRunId: string, nodeId: string, iteration?: number): string {
-  return `${workflowRunId}:${nodeId}:${iteration ?? 'node'}`;
+  return undefined;
 }
 
 async function emitResourceExhaustedRetry(
@@ -694,8 +926,89 @@ async function emitResourceExhaustedRetry(
     });
 }
 
-async function sleepResourceExhaustedBackoff(ms: number): Promise<void> {
-  await new Promise(resolve => setTimeout(resolve, ms));
+async function scheduleDurableProviderWait(
+  deps: WorkflowDeps,
+  platform: IWorkflowPlatform,
+  conversationId: string,
+  workflowRun: WorkflowRun,
+  nodeId: string,
+  exhausted: NonNullable<NodeExecutionResult['quotaExhausted']>
+): Promise<NodeExecutionResult> {
+  const now = Date.now();
+  const state: ResourceExhaustedRetryState = {
+    firstDetectedAt: new Date(exhausted.attemptStartedAt).getTime(),
+    attempt: exhausted.attemptNumber,
+  };
+  const ceilingMs = getResourceExhaustedCeilingMs();
+  const backoffMs = getResourceExhaustedBackoffMs(state.attempt);
+  const resumeAt = new Date(now + backoffMs).toISOString();
+  const waitId = randomUUID();
+  const scheduled = await deps.store.scheduleProviderWait({
+    waitId,
+    runId: workflowRun.id,
+    attemptId: exhausted.attemptId,
+    provider: exhausted.provider,
+    reasonCode: 'provider_quota_wait',
+    resumeAt,
+    state: 'scheduled',
+    claimOwnerId: null,
+    claimToken: null,
+    createdAt: new Date(now).toISOString(),
+    claimedAt: null,
+    cancelledAt: null,
+    completedAt: null,
+  });
+  if (!scheduled) {
+    throw new Error(`provider_wait_schedule_failed: run ${workflowRun.id} node ${nodeId}`);
+  }
+  await deps.store.updateWorkflowRun(workflowRun.id, {
+    status: 'waiting_provider',
+    metadata: {
+      provider_wait: {
+        wait_id: waitId,
+        attempt_id: exhausted.attemptId,
+        node_id: nodeId,
+        ...(exhausted.iteration !== undefined ? { iteration: exhausted.iteration } : {}),
+        provider: exhausted.provider,
+        reason_code: 'provider_quota_wait',
+        resume_at: resumeAt,
+      },
+    },
+  });
+  const outcomeUpdated = await deps.store.upsertRunOutcome(
+    workflowRun.id,
+    {
+      executionState: 'waiting_provider',
+      deliverableState: 'none',
+      validationState: 'not_run',
+      recoveryState: 'recoverable',
+      routeState: 'exhausted',
+      primaryReason: 'provider_quota_wait',
+      reasonCodes: ['provider_quota_wait'],
+      evidenceRefs: [`run:${workflowRun.id}`, `attempt:${exhausted.attemptId}`, `wait:${waitId}`],
+    },
+    new Date(now).toISOString()
+  );
+  if (!outcomeUpdated) {
+    throw new Error(`provider_wait_outcome_persist_failed: run ${workflowRun.id}`);
+  }
+  await emitResourceExhaustedRetry(
+    deps,
+    workflowRun.id,
+    nodeId,
+    exhausted.info,
+    state,
+    backoffMs,
+    ceilingMs,
+    exhausted.iteration
+  );
+  await safeSendMessage(
+    platform,
+    conversationId,
+    `! Node \`${nodeId}\` is durably waiting for ${exhausted.provider} usage to recover. It is eligible to resume at ${resumeAt}.`,
+    { workflowId: workflowRun.id, nodeName: nodeId }
+  );
+  return { state: 'skipped', output: '' };
 }
 
 /**
@@ -1344,6 +1657,15 @@ async function executeNodeInternal(
   let nodeIdleTimedOut = false;
   const effectiveIdleTimeout = node.idle_timeout ?? STEP_IDLE_TIMEOUT_MS;
   let lastToolStartedAt: { toolName: string; startedAt: number } | null = null;
+  let providerAttempt = await beginProviderAttempt(
+    deps,
+    workflowRun,
+    node,
+    provider,
+    nodeOptions?.model,
+    declaredModelId
+  );
+  let providerAttemptCompleted = false;
 
   try {
     for await (const msg of withIdleTimeout(
@@ -1402,7 +1724,30 @@ async function executeNodeInternal(
         }
       }
 
-      if (msg.type === 'assistant' && msg.content) {
+      if (msg.type === 'provider_route') {
+        await finishProviderAttempt(deps, providerAttempt, {
+          servedModelId: null,
+          outcomeClass: 'availability',
+          reasonCode: msg.reasonCode,
+        });
+        providerAttemptCompleted = true;
+        await persistProviderRouteChange(
+          deps,
+          workflowRun.id,
+          node.id,
+          providerAttempt.attemptId,
+          msg
+        );
+        providerAttempt = await beginProviderAttempt(
+          deps,
+          workflowRun,
+          node,
+          msg.toProvider,
+          msg.toModel,
+          declaredModelId
+        );
+        providerAttemptCompleted = false;
+      } else if (msg.type === 'assistant' && msg.content) {
         nodeOutputText += msg.content; // ALWAYS capture for $node_id.output
         if (streamingMode === 'stream' || msg.flush) {
           // `flush` chunks (e.g. Pi notify() emitting a plannotator review URL)
@@ -1740,22 +2085,57 @@ async function executeNodeInternal(
       }
     }
 
-    // If the node completed via idle timeout, log it
+    // Idle is absence of progress, not evidence of completion. Persist the
+    // typed attempt outcome and fail closed so failover/climb policy can act.
     if (nodeIdleTimedOut) {
       getLog().warn(
         { nodeId: node.id, timeoutMs: effectiveIdleTimeout },
-        'dag_node_completed_via_idle_timeout'
+        'dag_node_progress_timeout'
       );
+      if (!providerAttemptCompleted) {
+        await finishProviderAttempt(deps, providerAttempt, {
+          servedModelId: nodeServedModelId ?? null,
+          outcomeClass: 'progress',
+          reasonCode: 'progress_timeout',
+        });
+        providerAttemptCompleted = true;
+      }
+      const progressError = `Node '${node.id}' exceeded idle timeout (${String(effectiveIdleTimeout)}ms) without meaningful progress`;
       await safeSendMessage(
         platform,
         conversationId,
-        `! Node \`${node.id}\` completed via idle timeout (no output for ${String(effectiveIdleTimeout / 60000)} min). The AI likely finished but the subprocess didn't exit cleanly.`,
+        `! Node \`${node.id}\` failed its progress deadline after ${String(effectiveIdleTimeout)}ms.`,
         nodeContext
       );
+      const failResult = await handleNodeFailure(
+        { store: deps.store, emitter, log: getLog(), logNodeError },
+        workflowRun,
+        node,
+        {
+          errorMsg: progressError,
+          logDir,
+          outputSoFar: nodeOutputText,
+          hasOutput: nodeOutputText.length > 0,
+          gateResult: { passed: false, nodeType: 'ai' },
+          extraEventData: {
+            reason_code: 'progress_timeout',
+            idle_timeout_ms: effectiveIdleTimeout,
+          },
+        }
+      );
+      return failResult.output;
     }
 
     // If cancelled during streaming (not idle timeout), return as failed with cancel reason
     if (nodeAbortController.signal.aborted && !nodeIdleTimedOut) {
+      if (!providerAttemptCompleted) {
+        await finishProviderAttempt(deps, providerAttempt, {
+          servedModelId: nodeServedModelId ?? null,
+          outcomeClass: 'cancelled',
+          reasonCode: 'attempt_cancelled',
+        });
+        providerAttemptCompleted = true;
+      }
       const duration = Date.now() - nodeStartTime;
       getLog().info(
         { nodeId: node.id, durationMs: duration },
@@ -1829,13 +2209,18 @@ async function executeNodeInternal(
     // Bash/script/approval nodes don't reach this path; they have their
     // own dispatch and never stream through this loop.
     //
-    // Idle-timeout exits are exempt: the timeout warning at line 1017 has
-    // already told the user the node "completed via idle timeout"; flipping
-    // that to a failure here would directly contradict the on-screen message.
-    if (nodeOutputText.trim() === '' && structuredOutput === undefined && !nodeIdleTimedOut) {
+    if (nodeOutputText.trim() === '' && structuredOutput === undefined) {
       const duration = Date.now() - nodeStartTime;
       const emptyError = `Node '${node.id}' produced no assistant output. The provider stream closed without yielding content -- likely a silent provider rejection or stream interruption.`;
       getLog().error({ nodeId: node.id, durationMs: duration }, 'dag.node_empty_output');
+      if (!providerAttemptCompleted) {
+        await finishProviderAttempt(deps, providerAttempt, {
+          servedModelId: nodeServedModelId ?? null,
+          outcomeClass: 'contradiction',
+          reasonCode: 'sdk_contradiction',
+        });
+        providerAttemptCompleted = true;
+      }
 
       const failResult = await handleNodeFailure(
         { store: deps.store, emitter, log: getLog(), logNodeError },
@@ -1856,6 +2241,13 @@ async function executeNodeInternal(
 
       return failResult.output;
     }
+
+    await finishProviderAttempt(deps, providerAttempt, {
+      servedModelId: nodeServedModelId ?? null,
+      outcomeClass: 'success',
+      reasonCode: 'execution_completed',
+    });
+    providerAttemptCompleted = true;
 
     const duration = Date.now() - nodeStartTime;
     getLog().info({ nodeId: node.id, durationMs: duration }, 'dag_node_completed');
@@ -1940,8 +2332,6 @@ async function executeNodeInternal(
     // Clean up throttle entries on completion
     lastNodeCancelCheck.delete(`${workflowRun.id}:${node.id}`);
     lastNodeActivityUpdate.delete(`${workflowRun.id}:${node.id}`);
-    resourceExhaustedRetryState.delete(resourceExhaustedKey(workflowRun.id, node.id));
-
     return {
       state: 'completed',
       output: nodeOutputText,
@@ -1958,77 +2348,59 @@ async function executeNodeInternal(
         : {}),
     };
   } catch (error) {
-    let failureError: unknown = error;
+    const failureError: unknown = error;
+    if (!providerAttemptCompleted && !(error instanceof ResourceExhaustedPause)) {
+      const attemptOutcome: {
+        outcomeClass: ProviderAttemptOutcomeClass;
+        reasonCode: OutcomeReasonCode;
+      } =
+        error instanceof ResourceExhaustedPause
+          ? { outcomeClass: 'quota', reasonCode: 'provider_quota_wait' }
+          : nodeAbortController.signal.aborted && !nodeIdleTimedOut
+            ? { outcomeClass: 'cancelled', reasonCode: 'attempt_cancelled' }
+            : nodeIdleTimedOut
+              ? { outcomeClass: 'progress', reasonCode: 'progress_timeout' }
+              : isSdkSuccessContradiction((error as Error).message)
+                ? { outcomeClass: 'contradiction', reasonCode: 'sdk_contradiction' }
+                : isAvailabilityError((error as Error).message)
+                  ? { outcomeClass: 'availability', reasonCode: 'provider_unavailable' }
+                  : { outcomeClass: 'quality', reasonCode: 'execution_failed' };
+      await finishProviderAttempt(deps, providerAttempt, {
+        servedModelId: nodeServedModelId ?? null,
+        ...attemptOutcome,
+      });
+      providerAttemptCompleted = true;
+    }
     if (error instanceof ResourceExhaustedPause) {
-      const key = resourceExhaustedKey(workflowRun.id, node.id);
-      const now = Date.now();
-      const state = resourceExhaustedRetryState.get(key) ?? {
-        firstDetectedAt: now,
-        attempt: 0,
-      };
-      state.attempt += 1;
-      resourceExhaustedRetryState.set(key, state);
-      const ceilingMs = getResourceExhaustedCeilingMs();
-      const backoffMs = getResourceExhaustedBackoffMs(state.attempt);
-      const elapsedMs = now - state.firstDetectedAt;
-
       lastNodeCancelCheck.delete(`${workflowRun.id}:${node.id}`);
       lastNodeActivityUpdate.delete(`${workflowRun.id}:${node.id}`);
-
-      if (elapsedMs + backoffMs <= ceilingMs) {
-        getLog().warn(
-          {
-            nodeId: node.id,
-            attempt: state.attempt,
-            backoffMs,
-            elapsedMs,
-            ceilingMs,
-            reason: error.info.reason,
-          },
-          'dag.node_resource_exhausted_retry'
-        );
-        await emitResourceExhaustedRetry(
-          deps,
-          workflowRun.id,
-          node.id,
-          error.info,
-          state,
-          backoffMs,
-          ceilingMs
-        );
-        await safeSendMessage(
-          platform,
-          conversationId,
-          `! Node \`${node.id}\` hit provider usage exhaustion (${error.info.reason}); holding for ${String(Math.round(backoffMs / 1000))}s before retry ${String(state.attempt)}.`,
-          nodeContext
-        );
-        await sleepResourceExhaustedBackoff(backoffMs);
-        return executeNodeInternal(
-          deps,
-          platform,
-          conversationId,
-          cwd,
-          workflowRun,
-          node,
+      getLog().warn(
+        {
+          nodeId: node.id,
+          attempt: providerAttempt.attemptNumber,
           provider,
-          nodeOptions,
-          declaredModelId,
-          artifactsDir,
-          logDir,
-          baseBranch,
-          docsDir,
-          nodeOutputs,
-          resumeSessionId,
-          configuredCommandFolder,
-          issueContext,
-          personaContextState
-        );
-      }
-
-      resourceExhaustedRetryState.delete(key);
-      failureError = new Error(
-        `resource_exhausted_timeout: provider usage exhaustion persisted beyond ${String(ceilingMs)}ms (${error.info.detail})`
+          reason: error.info.reason,
+        },
+        'dag.node_resource_exhausted_route_pending'
       );
+      await finishProviderAttempt(deps, providerAttempt, {
+        servedModelId: nodeServedModelId ?? null,
+        outcomeClass: 'quota',
+        reasonCode: 'provider_quota_exhausted',
+      });
+      providerAttemptCompleted = true;
+      return {
+        state: 'failed',
+        output: '',
+        error: `resource_exhausted: ${error.info.detail}`,
+        quotaExhausted: {
+          attemptId: providerAttempt.attemptId,
+          attemptNumber: providerAttempt.attemptNumber,
+          attemptStartedAt: providerAttempt.startedAt,
+          provider,
+          info: error.info,
+        },
+      };
     }
 
     const err = failureError as Error;
@@ -2517,7 +2889,7 @@ async function executeScriptNode(
     if (isInlineScript(finalScript)) {
       // Inline code execution
       if (node.runtime === 'bun') {
-        cmd = 'bun';
+        cmd = resolveBunRuntimeExecutable();
         // --no-env-file prevents Bun from auto-loading .env from the execution
         // cwd (the target repo). Without this, repo .env leaks into the script
         // subprocess despite Archon's parent process cleanup.
@@ -2605,7 +2977,7 @@ async function executeScriptNode(
         const withFlags = nodeDeps.flatMap(dep => ['--with', dep]);
         args = ['run', ...withFlags, scriptDef.path];
       } else {
-        cmd = 'bun';
+        cmd = resolveBunRuntimeExecutable();
         args = ['--no-env-file', 'run', scriptDef.path];
       }
     }
@@ -3029,6 +3401,8 @@ async function executeLoopNode(
       );
       iterationAbortController.abort();
     }, effectiveWallTimeout);
+    let iterationAttempt: ProviderAttemptRecord | undefined;
+    let iterationAttemptCompleted = false;
 
     try {
       // Build prompt -- substituteWorkflowVariables throws if $BASE_BRANCH referenced but empty
@@ -3057,6 +3431,14 @@ async function executeLoopNode(
         abortSignal: iterationAbortController.signal,
       };
 
+      iterationAttempt = await beginProviderAttempt(
+        deps,
+        workflowRun,
+        node,
+        workflowProvider,
+        resolvedOptions.model,
+        workflowModel
+      );
       const generator = aiClient.sendQuery(finalPrompt, cwd, resumeSessionId, iterationOptions);
       let lastToolStartedAt: { toolName: string; startedAt: number } | null = null;
 
@@ -3069,12 +3451,43 @@ async function executeLoopNode(
         iterationAbortController.abort();
       })) {
         if (iterationWallTimedOut) break;
-        if (msg.type === 'assistant') {
+        if (msg.type === 'provider_route') {
+          if (!iterationAttempt) throw new Error('provider_route_without_attempt');
+          await finishProviderAttempt(deps, iterationAttempt, {
+            servedModelId: null,
+            outcomeClass: 'availability',
+            reasonCode: msg.reasonCode,
+          });
+          iterationAttemptCompleted = true;
+          await persistProviderRouteChange(
+            deps,
+            workflowRun.id,
+            node.id,
+            iterationAttempt.attemptId,
+            msg
+          );
+          iterationAttempt = await beginProviderAttempt(
+            deps,
+            workflowRun,
+            node,
+            msg.toProvider,
+            msg.toModel,
+            workflowModel
+          );
+          iterationAttemptCompleted = false;
+        } else if (msg.type === 'assistant') {
           fullOutput += msg.content;
-          const cleaned = stripCompletionTags(msg.content, loop.until);
-          cleanOutput += cleaned;
-          if (platform.getStreamingMode() === 'stream' && cleaned) {
-            await safeSendMessage(platform, conversationId, cleaned, msgContext);
+          // Clean the accumulated buffer, not each provider chunk independently.
+          // stripCompletionTags() trims its input, so per-chunk cleaning erased
+          // newline-only chunks and joined adjacent fields in persisted output and
+          // $LOOP_PREV_OUTPUT (anchor: run 42ee6575).
+          const previousCleanOutput = cleanOutput;
+          cleanOutput = stripCompletionTags(fullOutput, loop.until);
+          const cleanedDelta = cleanOutput.startsWith(previousCleanOutput)
+            ? cleanOutput.slice(previousCleanOutput.length)
+            : '';
+          if (platform.getStreamingMode() === 'stream' && cleanedDelta) {
+            await safeSendMessage(platform, conversationId, cleanedDelta, msgContext);
           }
           await logAssistant(logDir, workflowRun.id, msg.content);
         } else if (msg.type === 'result') {
@@ -3241,56 +3654,41 @@ async function executeLoopNode(
           `Loop '${node.id}' iteration ${String(i)} exceeded wall timeout (${String(effectiveWallTimeout)}ms)`
         );
       } else if (error instanceof ResourceExhaustedPause) {
-        const key = resourceExhaustedKey(workflowRun.id, node.id, i);
-        const now = Date.now();
-        const state = resourceExhaustedRetryState.get(key) ?? {
-          firstDetectedAt: now,
-          attempt: 0,
+        if (!iterationAttempt) throw error;
+        await finishProviderAttempt(deps, iterationAttempt, {
+          servedModelId: loopServedModelId ?? null,
+          outcomeClass: 'quota',
+          reasonCode: 'provider_quota_exhausted',
+        });
+        iterationAttemptCompleted = true;
+        return {
+          state: 'failed',
+          output: '',
+          error: `resource_exhausted: ${error.info.detail}`,
+          quotaExhausted: {
+            attemptId: iterationAttempt.attemptId,
+            attemptNumber: iterationAttempt.attemptNumber,
+            attemptStartedAt: iterationAttempt.startedAt,
+            provider: workflowProvider,
+            info: error.info,
+            iteration: i,
+          },
         };
-        state.attempt += 1;
-        resourceExhaustedRetryState.set(key, state);
-        const ceilingMs = getResourceExhaustedCeilingMs();
-        const backoffMs = getResourceExhaustedBackoffMs(state.attempt);
-        const elapsedMs = now - state.firstDetectedAt;
+      }
 
-        if (elapsedMs + backoffMs <= ceilingMs) {
-          getLog().warn(
-            {
-              nodeId: node.id,
-              iteration: i,
-              attempt: state.attempt,
-              backoffMs,
-              elapsedMs,
-              ceilingMs,
-              reason: error.info.reason,
-            },
-            'loop_node.iteration_resource_exhausted_retry'
-          );
-          await emitResourceExhaustedRetry(
-            deps,
-            workflowRun.id,
-            node.id,
-            error.info,
-            state,
-            backoffMs,
-            ceilingMs,
-            i
-          );
-          await safeSendMessage(
-            platform,
-            conversationId,
-            `! Loop node \`${node.id}\` iteration ${String(i)} hit provider usage exhaustion (${error.info.reason}); holding for ${String(Math.round(backoffMs / 1000))}s before retry ${String(state.attempt)}.`,
-            msgContext
-          );
-          await sleepResourceExhaustedBackoff(backoffMs);
-          i -= 1;
-          continue;
-        }
-
-        resourceExhaustedRetryState.delete(key);
-        failureError = new Error(
-          `resource_exhausted_timeout: provider usage exhaustion persisted beyond ${String(ceilingMs)}ms (${error.info.detail})`
-        );
+      if (iterationAttempt && !iterationAttemptCompleted) {
+        const attemptOutcome = iterationWallTimedOut
+          ? ({ outcomeClass: 'progress', reasonCode: 'progress_timeout' } as const)
+          : isSdkSuccessContradiction((failureError as Error).message)
+            ? ({ outcomeClass: 'contradiction', reasonCode: 'sdk_contradiction' } as const)
+            : isAvailabilityError((failureError as Error).message)
+              ? ({ outcomeClass: 'availability', reasonCode: 'provider_unavailable' } as const)
+              : ({ outcomeClass: 'quality', reasonCode: 'execution_failed' } as const);
+        await finishProviderAttempt(deps, iterationAttempt, {
+          servedModelId: loopServedModelId ?? null,
+          ...attemptOutcome,
+        });
+        iterationAttemptCompleted = true;
       }
 
       const err = failureError as Error;
@@ -3336,6 +3734,14 @@ async function executeLoopNode(
 
     // Wall timeout without a thrown abort: fail closed (do not treat as idle success).
     if (iterationWallTimedOut) {
+      if (iterationAttempt && !iterationAttemptCompleted) {
+        await finishProviderAttempt(deps, iterationAttempt, {
+          servedModelId: loopServedModelId ?? null,
+          outcomeClass: 'progress',
+          reasonCode: 'progress_timeout',
+        });
+        iterationAttemptCompleted = true;
+      }
       const wallError = `Loop '${node.id}' iteration ${String(i)} exceeded wall timeout (${String(effectiveWallTimeout)}ms)`;
       const duration = Date.now() - iterationStart;
       getLog().error(
@@ -3377,14 +3783,26 @@ async function executeLoopNode(
       };
     }
 
-    // Notify on idle timeout
+    // An idle timeout is absence of progress, never proof of successful work.
     if (iterationIdleTimedOut) {
-      await safeSendMessage(
-        platform,
-        conversationId,
-        `Loop node '${node.id}' iteration ${String(i)} completed via idle timeout (no output for ${String(effectiveIdleTimeout / 60000)} min)`,
-        msgContext
-      );
+      if (iterationAttempt && !iterationAttemptCompleted) {
+        await finishProviderAttempt(deps, iterationAttempt, {
+          servedModelId: loopServedModelId ?? null,
+          outcomeClass: 'progress',
+          reasonCode: 'progress_timeout',
+        });
+        iterationAttemptCompleted = true;
+      }
+      const idleError = `Loop '${node.id}' iteration ${String(i)} exceeded idle timeout (${String(effectiveIdleTimeout)}ms)`;
+      await safeSendMessage(platform, conversationId, idleError, msgContext);
+      await persistLoopNodeFailed(idleError);
+      return {
+        state: 'failed',
+        output: fullOutput,
+        error: idleError,
+        costUsd: loopTotalCostUsd,
+        ...(loopTotalTokens ? { tokens: loopTotalTokens } : {}),
+      };
     }
 
     // Empty assistant output is an iteration failure for AI loops -- same
@@ -3396,6 +3814,14 @@ async function executeLoopNode(
     // notification above has already told the user the iteration completed
     // via timeout, and flipping that to a failure would contradict it.
     if (!iterationIdleTimedOut && fullOutput.trim() === '') {
+      if (iterationAttempt && !iterationAttemptCompleted) {
+        await finishProviderAttempt(deps, iterationAttempt, {
+          servedModelId: loopServedModelId ?? null,
+          outcomeClass: 'contradiction',
+          reasonCode: 'sdk_contradiction',
+        });
+        iterationAttemptCompleted = true;
+      }
       const iterationDuration = Date.now() - iterationStart;
       const emptyError =
         'Loop iteration produced no assistant output. The provider stream closed without yielding content -- likely a silent provider rejection or stream interruption.';
@@ -3438,12 +3864,20 @@ async function executeLoopNode(
       };
     }
 
+    if (iterationAttempt && !iterationAttemptCompleted) {
+      await finishProviderAttempt(deps, iterationAttempt, {
+        servedModelId: loopServedModelId ?? null,
+        outcomeClass: 'success',
+        reasonCode: 'execution_completed',
+      });
+      iterationAttemptCompleted = true;
+    }
+
     // Batch mode: send accumulated output
     if (platform.getStreamingMode() === 'batch' && cleanOutput) {
       await safeSendMessage(platform, conversationId, cleanOutput, msgContext);
     }
 
-    resourceExhaustedRetryState.delete(resourceExhaustedKey(workflowRun.id, node.id, i));
     lastIterationOutput = cleanOutput || fullOutput;
 
     // Check LLM completion signal -- the AI decides whether the user approved.
@@ -3803,25 +4237,21 @@ async function executeApprovalNode(
 
     // Check if max attempts exhausted
     if (rejectionCount >= maxAttempts) {
-      await deps.store.cancelWorkflowRun(workflowRun.id);
-      deps.store
-        .createWorkflowEvent({
-          workflow_run_id: workflowRun.id,
-          event_type: 'workflow_cancelled',
-          step_name: node.id,
-          data: { reason: `max_attempts (${String(maxAttempts)}) exhausted` },
-        })
-        .catch((err: Error) => {
-          getLog().error(
-            { err, workflowRunId: workflowRun.id, eventType: 'workflow_cancelled' },
-            'workflow.event_persist_failed'
-          );
-        });
+      const cancelReason = `max_attempts (${String(maxAttempts)}) exhausted`;
+      const cancellationSaved = await persistCancellation(
+        deps,
+        platform,
+        conversationId,
+        workflowRun,
+        node.id,
+        cancelReason
+      );
+      if (!cancellationSaved) return { state: 'completed', output: cancelReason };
       getWorkflowEventEmitter().emit({
         type: 'workflow_cancelled',
         runId: workflowRun.id,
         nodeId: node.id,
-        reason: `max_attempts (${String(maxAttempts)}) exhausted`,
+        reason: cancelReason,
       });
       const cancelMsg = `[ ] Approval node \`${node.id}\` cancelled after ${String(maxAttempts)} rejections.`;
       await safeSendMessage(platform, conversationId, cancelMsg, msgContext);
@@ -4003,11 +4433,88 @@ async function executeApprovalNode(
   return { state: 'completed' as const, output: '' };
 }
 
+async function executeEvidenceNode(
+  deps: WorkflowDeps,
+  cwd: string,
+  workflowRun: WorkflowRun,
+  node: EvidenceNode,
+  artifactsDir: string
+): Promise<NodeExecutionResult> {
+  const startedAt = Date.now();
+  await deps.store.createWorkflowEvent({
+    workflow_run_id: workflowRun.id,
+    event_type: 'node_started',
+    step_name: node.id,
+    data: { kind: node.evidence.kind, mechanical: true },
+  });
+  getWorkflowEventEmitter().emit({
+    type: 'node_started',
+    runId: workflowRun.id,
+    nodeId: node.id,
+    nodeName: node.id,
+  });
+
+  const evidence = await collectRuntimeEvidence(
+    deps.store,
+    async (command, args, commandCwd) => {
+      const result = await execFileAsync(command, [...args], {
+        cwd: commandCwd,
+        timeout: 30000,
+      });
+      return { stdout: result.stdout, stderr: result.stderr };
+    },
+    {
+      runId: workflowRun.id,
+      cwd,
+      executionState: 'running',
+      recoveryState: 'not_needed',
+      routeState: 'current',
+      requiredGateIds: node.evidence.required_gates,
+    }
+  );
+  const manifest = renderManifestV2(evidence);
+  const evidenceDir = join(artifactsDir, 'evidence');
+  await mkdir(evidenceDir, { recursive: true });
+  await writeFile(
+    join(evidenceDir, 'mechanical-evidence.json'),
+    `${JSON.stringify(evidence, null, 2)}\n`,
+    'utf8'
+  );
+  await writeFile(join(evidenceDir, 'manifest-v2.txt'), `${manifest}\n`, 'utf8');
+  const outcomeUpdated = await deps.store.upsertRunOutcome(
+    workflowRun.id,
+    evidence.outcome,
+    new Date().toISOString()
+  );
+  if (!outcomeUpdated) {
+    throw new Error(`run_outcome_conflict: ${workflowRun.id}`);
+  }
+  await deps.store.createWorkflowEvent({
+    workflow_run_id: workflowRun.id,
+    event_type: 'node_completed',
+    step_name: node.id,
+    data: {
+      duration_ms: Date.now() - startedAt,
+      node_output: manifest,
+      mechanical: true,
+      outcome: evidence.outcome,
+    },
+  });
+  getWorkflowEventEmitter().emit({
+    type: 'node_completed',
+    runId: workflowRun.id,
+    nodeId: node.id,
+    nodeName: node.id,
+    duration: Date.now() - startedAt,
+  });
+  return { state: 'completed', output: manifest };
+}
+
 /**
  * Execute a complete DAG workflow.
  * Called from executeWorkflow() in executor.ts.
  */
-export async function executeDagWorkflow(
+async function executeDagWorkflowInternal(
   deps: WorkflowDeps,
   platform: IWorkflowPlatform,
   conversationId: string,
@@ -4114,6 +4621,10 @@ export async function executeDagWorkflow(
   }
 
   for (let layerIdx = 0; layerIdx < layers.length; layerIdx++) {
+    if (deps.isRunLeaseValid?.() === false) {
+      getLog().warn({ workflowRunId: workflowRun.id }, 'dag.run_lease_lost');
+      return;
+    }
     const layer = layers[layerIdx];
     const isParallelLayer = layer.length > 1;
 
@@ -4312,7 +4823,13 @@ export async function executeDagWorkflow(
             }
           }
 
-          // 3. Bash node dispatch -- no AI, no session
+          // 3. Engine-side evidence node -- facts are collected mechanically, never by AI.
+          if (isEvidenceNode(node)) {
+            const output = await executeEvidenceNode(deps, cwd, workflowRun, node, artifactsDir);
+            return { nodeId: node.id, output };
+          }
+
+          // 3a. Bash node dispatch -- no AI, no session
           if (isBashNode(node)) {
             const output = await executeBashNode(
               deps,
@@ -4355,6 +4872,7 @@ export async function executeDagWorkflow(
                 ? workflowModel
                 : (loopAssistantConfig?.model as string | undefined));
 
+            assertProviderCanExecuteNode(loopProvider, node);
             let output = await executeLoopNode(
               deps,
               platform,
@@ -4381,31 +4899,39 @@ export async function executeDagWorkflow(
             // internally (resolveAgentPersona), so an incompatible codex+persona
             // pairing raises InfrastructureClassBlock -- caught here so the failover
             // never makes things worse than the original availability failure.
-            const loopFailoverTarget = resolveFailoverTarget(node, workflowLevelOptions);
+            const loopQuotaRoute = output.quotaExhausted
+              ? selectQuotaExhaustionRoute(loopProvider, node, workflowLevelOptions)
+              : null;
+            const loopFailoverTarget =
+              loopQuotaRoute?.kind === 'failover'
+                ? { provider: loopQuotaRoute.provider, model: loopQuotaRoute.model }
+                : resolveFailoverTarget(node, workflowLevelOptions);
+            const loopFailoverErrorClass = output.quotaExhausted ? 'quota' : 'availability';
             if (
               output.state === 'failed' &&
               output.error !== undefined &&
               loopFailoverTarget !== null &&
               loopFailoverTarget.provider !== loopProvider &&
               isRegisteredProvider(loopFailoverTarget.provider) &&
-              isAvailabilityError(output.error)
+              (loopQuotaRoute?.kind === 'failover' || isAvailabilityError(output.error))
             ) {
               const loopFailoverModel =
                 loopFailoverTarget.model ??
                 (config.assistants[loopFailoverTarget.provider]?.model as string | undefined);
               try {
+                assertProviderCanExecuteNode(loopFailoverTarget.provider, node);
                 emitNodeFailover(
                   deps,
                   workflowRun.id,
                   node.id,
                   { provider: loopProvider, model: loopModel },
                   { provider: loopFailoverTarget.provider, model: loopFailoverModel },
-                  'availability'
+                  loopFailoverErrorClass
                 );
                 await safeSendMessage(
                   platform,
                   conversationId,
-                  `! Loop node \`${node.id}\` hit an availability error on ${loopProvider}; failing over to ${loopFailoverTarget.provider} (one attempt).`,
+                  `! Loop node \`${node.id}\` hit a ${loopFailoverErrorClass} error on ${loopProvider}; failing over to ${loopFailoverTarget.provider} (one attempt).`,
                   { workflowId: workflowRun.id, nodeName: node.id }
                 );
                 output = await executeLoopNode(
@@ -4441,6 +4967,17 @@ export async function executeDagWorkflow(
               }
             }
 
+            if (output.quotaExhausted) {
+              output = await scheduleDurableProviderWait(
+                deps,
+                platform,
+                conversationId,
+                workflowRun,
+                node.id,
+                output.quotaExhausted
+              );
+            }
+
             return { nodeId: node.id, output };
           }
 
@@ -4472,24 +5009,21 @@ export async function executeDagWorkflow(
           if (isCancelNode(node)) {
             const reason = substituteNodeOutputRefs(node.cancel, nodeOutputs);
             const cancelMsg = `\u274c **Workflow cancelled** (node \`${node.id}\`): ${reason}`;
+            const cancellationSaved = await persistCancellation(
+              deps,
+              platform,
+              conversationId,
+              workflowRun,
+              node.id,
+              reason
+            );
+            if (!cancellationSaved) {
+              return { nodeId: node.id, output: { state: 'completed' as const, output: reason } };
+            }
             await safeSendMessage(platform, conversationId, cancelMsg, {
               workflowId: workflowRun.id,
               nodeName: node.id,
             });
-            deps.store
-              .createWorkflowEvent({
-                workflow_run_id: workflowRun.id,
-                event_type: 'workflow_cancelled',
-                step_name: node.id,
-                data: { reason },
-              })
-              .catch((err: Error) => {
-                getLog().error(
-                  { err, workflowRunId: workflowRun.id, eventType: 'workflow_cancelled' },
-                  'workflow.event_persist_failed'
-                );
-              });
-            await deps.store.cancelWorkflowRun(workflowRun.id);
             getWorkflowEventEmitter().emit({
               type: 'workflow_cancelled',
               runId: workflowRun.id,
@@ -4539,6 +5073,7 @@ export async function executeDagWorkflow(
             cwd,
             workflowLevelOptions
           );
+          assertProviderCanExecuteNode(provider, node);
 
           // 5. Determine session -- parallel or context:fresh -> always fresh
           // Parallel layers always get fresh sessions; explicit 'fresh' context also forces it.
@@ -4601,6 +5136,7 @@ export async function executeDagWorkflow(
               const isResourceExhaustedTimeout = output.error
                 ? output.error.startsWith('resource_exhausted_timeout')
                 : false;
+              const isQuotaExhausted = output.quotaExhausted !== undefined;
               // SDK success-contradictions are NEVER retried by this transient
               // budget -- the outer `sdkContradictionRetry` loop grants them
               // exactly one whole-node re-run. Without this exclusion,
@@ -4613,6 +5149,7 @@ export async function executeDagWorkflow(
               const shouldRetry =
                 !isFatal &&
                 !isResourceExhaustedTimeout &&
+                !isQuotaExhausted &&
                 !isContradiction &&
                 (retryConfig.onError === 'all' ||
                   (retryConfig.onError === 'transient' && isTransient));
@@ -4670,15 +5207,23 @@ export async function executeDagWorkflow(
           // 5xx / connection). If the node (or workflow) declares a failover
           // provider, re-dispatch this ONE node exactly once on it. Auth/billing/
           // other 4xx errors are NOT availability and fall straight through.
-          const failoverTarget = resolveFailoverTarget(node, workflowLevelOptions);
+          const quotaRoute = output.quotaExhausted
+            ? selectQuotaExhaustionRoute(provider, node, workflowLevelOptions)
+            : null;
+          const failoverTarget =
+            quotaRoute?.kind === 'failover'
+              ? { provider: quotaRoute.provider, model: quotaRoute.model }
+              : resolveFailoverTarget(node, workflowLevelOptions);
+          const failoverErrorClass = output.quotaExhausted ? 'quota' : 'availability';
           if (
             output.state === 'failed' &&
             output.error !== undefined &&
             failoverTarget !== null &&
             failoverTarget.provider !== provider && // never "failover" to the same provider
-            isAvailabilityError(output.error)
+            (quotaRoute?.kind === 'failover' || isAvailabilityError(output.error))
           ) {
             try {
+              assertProviderCanExecuteNode(failoverTarget.provider, node);
               // Clone the node with the failover provider/model and re-run the
               // full resolution path. This re-runs persona resolution against the
               // failover provider, so an incompatible pairing (e.g. codex failover
@@ -4714,12 +5259,12 @@ export async function executeDagWorkflow(
                 node.id,
                 { provider, model: nodeOptions?.model },
                 { provider: failoverResolved.provider, model: failoverResolved.options?.model },
-                'availability'
+                failoverErrorClass
               );
               await safeSendMessage(
                 platform,
                 conversationId,
-                `! Node \`${node.id}\` hit an availability error on ${provider}; failing over to ${failoverResolved.provider} (one attempt).`,
+                `! Node \`${node.id}\` hit a ${failoverErrorClass} error on ${provider}; failing over to ${failoverResolved.provider} (one attempt).`,
                 { workflowId: workflowRun.id, nodeName: node.id }
               );
               output = await executeNodeInternal(
@@ -4759,6 +5304,17 @@ export async function executeDagWorkflow(
                 { workflowId: workflowRun.id, nodeName: node.id }
               );
             }
+          }
+
+          if (output.quotaExhausted) {
+            output = await scheduleDurableProviderWait(
+              deps,
+              platform,
+              conversationId,
+              workflowRun,
+              node.id,
+              output.quotaExhausted
+            );
           }
 
           return { nodeId: node.id, output };
@@ -4896,6 +5452,11 @@ export async function executeDagWorkflow(
     }
   }
 
+  if (deps.isRunLeaseValid?.() === false) {
+    getLog().warn({ workflowRunId: workflowRun.id }, 'dag.run_lease_lost_before_terminal');
+    return;
+  }
+
   /**
    * Bail out of the final completion/failure write if the run was transitioned
    * externally. Strict `!== 'running'` check is correct here because we don't
@@ -4928,6 +5489,126 @@ export async function executeDagWorkflow(
   const anyCompleted = nodeCounts.completed > 0;
   const anyFailed = nodeCounts.failed > 0;
 
+  const pushArtifactPresent = [...nodeOutputs.values()].some(o => hasPushArtifact(o.output));
+  const hasMechanicalEvidenceNode = workflow.nodes.some(isEvidenceNode);
+
+  async function makeTerminalOutcome(executionState: 'completed' | 'failed'): Promise<RunOutcome> {
+    const existing = await deps.store.getRunOutcome(workflowRun.id);
+    const deliverableState =
+      existing?.deliverableState ?? (pushArtifactPresent ? 'pushed' : 'none');
+    const validationState = existing?.validationState ?? 'not_run';
+    const primaryReason: RunOutcome['primaryReason'] =
+      executionState === 'failed'
+        ? deliverableState === 'pr_ready'
+          ? 'execution_failed_pr_ready'
+          : 'execution_failed'
+        : validationState === 'failed'
+          ? 'gate_failed'
+          : validationState === 'indeterminate'
+            ? 'gate_indeterminate'
+            : deliverableState === 'pr_ready'
+              ? 'pr_ready'
+              : 'execution_completed';
+    return {
+      executionState,
+      deliverableState,
+      validationState,
+      recoveryState: executionState === 'failed' ? 'recoverable' : 'not_needed',
+      routeState: existing?.routeState ?? 'current',
+      primaryReason,
+      reasonCodes: [...new Set([primaryReason, ...(existing?.reasonCodes ?? [])])],
+      evidenceRefs: [...new Set([`run:${workflowRun.id}`, ...(existing?.evidenceRefs ?? [])])],
+    };
+  }
+
+  async function handleTerminalPersistenceFailure(
+    attemptedStatus: 'completed' | 'failed',
+    terminalOutcome: RunOutcome,
+    error: Error
+  ): Promise<void> {
+    const failedAt = new Date().toISOString();
+    getLog().error(
+      { err: error, workflowRunId: workflowRun.id, attemptedStatus },
+      'dag_terminal_persist_failed'
+    );
+    const interruptedOutcome: RunOutcome = {
+      ...terminalOutcome,
+      executionState: 'interrupted',
+      recoveryState: 'recoverable',
+      primaryReason: 'status_persist_failed',
+      reasonCodes: ['status_persist_failed'],
+      evidenceRefs: [...terminalOutcome.evidenceRefs, 'status_persist_failed'],
+    };
+    let currentStatus: Awaited<ReturnType<IWorkflowStore['getWorkflowRunStatus']>> | undefined;
+    try {
+      currentStatus = await deps.store.getWorkflowRunStatus(workflowRun.id);
+    } catch (statusErr) {
+      getLog().error(
+        { err: statusErr as Error, workflowRunId: workflowRun.id, attemptedStatus },
+        'dag_terminal_persist_status_read_failed'
+      );
+    }
+    if (
+      currentStatus === 'completed' ||
+      currentStatus === 'failed' ||
+      currentStatus === 'cancelled' ||
+      currentStatus === 'escalated'
+    ) {
+      getLog().warn(
+        { workflowRunId: workflowRun.id, attemptedStatus, currentStatus },
+        'dag_terminal_persist_already_terminal'
+      );
+      return;
+    }
+    if (currentStatus === 'running') {
+      await deps.store
+        .updateWorkflowRun(workflowRun.id, {
+          status: 'interrupted',
+          metadata: {
+            terminal_persist_failure: {
+              attempted_status: attemptedStatus,
+              reason_code: 'status_persist_failed',
+              failed_at: failedAt,
+            },
+          },
+        })
+        .catch((interruptErr: Error) => {
+          getLog().error(
+            { err: interruptErr, workflowRunId: workflowRun.id, attemptedStatus },
+            'dag_interrupt_status_persist_failed'
+          );
+        });
+      await deps.store
+        .upsertRunOutcome(workflowRun.id, interruptedOutcome, failedAt)
+        .catch((outcomeErr: Error) => {
+          getLog().error(
+            { err: outcomeErr, workflowRunId: workflowRun.id, attemptedStatus },
+            'dag_interrupt_outcome_persist_failed'
+          );
+        });
+    }
+    await deps.store.createWorkflowEvent({
+      workflow_run_id: workflowRun.id,
+      event_type: 'status_persist_failed',
+      data: {
+        attempted_status: attemptedStatus,
+        reason_code: 'status_persist_failed',
+      },
+    });
+    getWorkflowEventEmitter().emit({
+      type: 'status_persist_failed',
+      runId: workflowRun.id,
+      attemptedStatus,
+      reason: 'status_persist_failed',
+    });
+    await safeSendMessage(
+      platform,
+      conversationId,
+      `Warning: workflow terminal state '${attemptedStatus}' could not be saved. The run is recoverable and no terminal success/failure event was published.`,
+      { workflowId: workflowRun.id }
+    );
+  }
+
   getLog().info(
     { nodeCount: workflow.nodes.length, anyCompleted, anyFailed },
     'dag_workflow_finished'
@@ -4938,11 +5619,22 @@ export async function executeDagWorkflow(
     const failMsg =
       `DAG workflow '${workflow.name}' completed with no successful nodes. ` +
       'Check node conditions, trigger rules, and upstream failures.';
-    // Note: nodeCounts not stored for failed runs -- failWorkflowRun only stores { error }.
-    // Frontend guards with isValidNodeCounts so missing node_counts is safe.
-    await deps.store.failWorkflowRun(workflowRun.id, failMsg).catch((dbErr: Error) => {
-      getLog().error({ err: dbErr, workflowRunId: workflowRun.id }, 'dag_db_fail_failed');
-    });
+    const failedOutcome = await makeTerminalOutcome('failed');
+    try {
+      await deps.store.failWorkflowRun(workflowRun.id, failMsg, {
+        outcome: failedOutcome,
+        updatedAt: new Date().toISOString(),
+        metadata: { node_counts: nodeCounts, terminal_cause: 'no_successful_nodes' },
+        eventData: {
+          error: failMsg,
+          node_counts: nodeCounts,
+          terminal_cause: 'no_successful_nodes',
+        },
+      });
+    } catch (dbErr) {
+      await handleTerminalPersistenceFailure('failed', failedOutcome, dbErr as Error);
+      return;
+    }
     // Terminal state reached: emit 'run_token_totals' rollup event (see token-rollup.ts).
     emitTerminalRunTokenTotals();
     await logWorkflowError(logDir, workflowRun.id, failMsg).catch((logErr: Error) => {
@@ -4982,39 +5674,46 @@ export async function executeDagWorkflow(
       .filter(([, o]) => o.state === 'failed')
       .map(([id]) => id);
     const allFailuresArePaperwork = failedNodeIds.every(id => isPaperworkNode(id));
-    const pushArtifactPresent = [...nodeOutputs.values()].some(o => hasPushArtifact(o.output));
-
-    if (allFailuresArePaperwork && pushArtifactPresent) {
+    if (!hasMechanicalEvidenceNode && allFailuresArePaperwork && pushArtifactPresent) {
       getLog().warn(
         { workflowRunId: workflowRun.id, degradedPaperworkNodes: failedNodeIds },
         'dag.workflow_completed_paperwork_degraded'
       );
+      const degradedDuration = Date.now() - dagStartTime;
+      const degradedOutcome = await makeTerminalOutcome('completed');
       try {
-        await deps.store.completeWorkflowRun(workflowRun.id, {
-          node_counts: nodeCounts,
-          // Degraded-success signal consumed by the dashboard (Section 5 of the
-          // WO): status 'completed' + paperwork_degraded=true, no new enum value.
-          paperwork_degraded: true,
-          degraded_paperwork_nodes: failedNodeIds,
-          ...(totalCostUsd > 0 ? { total_cost_usd: totalCostUsd } : {}),
-          ...(totalTokens > 0 ? { total_tokens: totalTokens } : {}),
-          ...(totalFrontierCostUsd > 0 ? { total_frontier_cost_usd: totalFrontierCostUsd } : {}),
-          ...(nodeModelSummary.length > 0 ? { node_model_summary: nodeModelSummary } : {}),
-          ...(modelMismatchCount > 0 ? { model_mismatch_count: modelMismatchCount } : {}),
-        });
+        await deps.store.completeWorkflowRun(
+          workflowRun.id,
+          {
+            node_counts: nodeCounts,
+            // Degraded-success signal consumed by the dashboard (Section 5 of the
+            // WO): status 'completed' + paperwork_degraded=true, no new enum value.
+            paperwork_degraded: true,
+            degraded_paperwork_nodes: failedNodeIds,
+            ...(totalCostUsd > 0 ? { total_cost_usd: totalCostUsd } : {}),
+            ...(totalTokens > 0 ? { total_tokens: totalTokens } : {}),
+            ...(totalFrontierCostUsd > 0 ? { total_frontier_cost_usd: totalFrontierCostUsd } : {}),
+            ...(nodeModelSummary.length > 0 ? { node_model_summary: nodeModelSummary } : {}),
+            ...(modelMismatchCount > 0 ? { model_mismatch_count: modelMismatchCount } : {}),
+            terminal_cause: 'paperwork_degraded',
+          },
+          {
+            outcome: degradedOutcome,
+            updatedAt: new Date().toISOString(),
+            eventData: {
+              duration_ms: degradedDuration,
+              node_counts: nodeCounts,
+              terminal_cause: 'paperwork_degraded',
+              paperwork_degraded: true,
+              degraded_paperwork_nodes: failedNodeIds,
+            },
+          }
+        );
         // Terminal state reached: emit 'run_token_totals' rollup event.
         emitTerminalRunTokenTotals();
       } catch (dbErr) {
-        getLog().error(
-          { err: dbErr as Error, workflowRunId: workflowRun.id },
-          'dag_db_complete_failed'
-        );
-        await safeSendMessage(
-          platform,
-          conversationId,
-          'Warning: workflow completed (degraded) but the run status could not be saved. The workflow result may appear inconsistent.',
-          { workflowId: workflowRun.id }
-        );
+        await handleTerminalPersistenceFailure('completed', degradedOutcome, dbErr as Error);
+        return;
       }
       await logWorkflowComplete(logDir, workflowRun.id).catch((logErr: Error) => {
         getLog().error(
@@ -5022,7 +5721,6 @@ export async function executeDagWorkflow(
           'dag.workflow_complete_log_write_failed'
         );
       });
-      const degradedDuration = Date.now() - dagStartTime;
       const emitterDegraded = getWorkflowEventEmitter();
       emitterDegraded.emit({
         type: 'workflow_completed',
@@ -5030,22 +5728,6 @@ export async function executeDagWorkflow(
         workflowName: workflow.name,
         duration: degradedDuration,
       });
-      await deps.store
-        .createWorkflowEvent({
-          workflow_run_id: workflowRun.id,
-          event_type: 'workflow_completed',
-          data: {
-            duration_ms: degradedDuration,
-            paperwork_degraded: true,
-            degraded_paperwork_nodes: failedNodeIds,
-          },
-        })
-        .catch((err: Error) => {
-          getLog().error(
-            { err, workflowRunId: workflowRun.id, eventType: 'workflow_completed' },
-            'workflow_event_persist_failed'
-          );
-        });
       emitterDegraded.unregisterRun(workflowRun.id);
       await safeSendMessage(
         platform,
@@ -5061,9 +5743,27 @@ export async function executeDagWorkflow(
       .map(([id, o]) => `'${id}': ${o.state === 'failed' ? o.error : 'unknown'}`)
       .join('; ');
     const failMsg = `DAG workflow '${workflow.name}' completed with failures: ${failedNodes}`;
-    await deps.store.failWorkflowRun(workflowRun.id, failMsg).catch((dbErr: Error) => {
-      getLog().error({ err: dbErr, workflowRunId: workflowRun.id }, 'dag_db_fail_failed');
-    });
+    const failedOutcome = await makeTerminalOutcome('failed');
+    try {
+      await deps.store.failWorkflowRun(workflowRun.id, failMsg, {
+        outcome: failedOutcome,
+        updatedAt: new Date().toISOString(),
+        metadata: {
+          node_counts: nodeCounts,
+          terminal_cause: 'node_failures',
+          failed_nodes: failedNodeIds,
+        },
+        eventData: {
+          error: failMsg,
+          node_counts: nodeCounts,
+          terminal_cause: 'node_failures',
+          failed_nodes: failedNodeIds,
+        },
+      });
+    } catch (dbErr) {
+      await handleTerminalPersistenceFailure('failed', failedOutcome, dbErr as Error);
+      return;
+    }
     // Terminal state reached: emit 'run_token_totals' rollup event (see token-rollup.ts).
     emitTerminalRunTokenTotals();
     await logWorkflowError(logDir, workflowRun.id, failMsg).catch((logErr: Error) => {
@@ -5090,41 +5790,46 @@ export async function executeDagWorkflow(
   // Check if status was changed externally (e.g. cancelled) before marking complete.
   if (await skipIfStatusChanged('dag.skip_complete_status_changed')) return;
 
-  // Update DB and emit completion
+  // Persist terminal facts before publishing any terminal event.
+  const duration = Date.now() - dagStartTime;
+  const completedOutcome = await makeTerminalOutcome('completed');
   try {
-    await deps.store.completeWorkflowRun(workflowRun.id, {
-      node_counts: nodeCounts,
-      // totalCostUsd starts at 0; only write metadata when at least one node reported cost
-      ...(totalCostUsd > 0 ? { total_cost_usd: totalCostUsd } : {}),
-      // totalTokens starts at 0; only write metadata when at least one node reported tokens
-      ...(totalTokens > 0 ? { total_tokens: totalTokens } : {}),
-      // Layer 1 counterfactual run total (WO-HARNESS-LAYER1-TIER-AND-COUNTERFACTUAL-COST-01).
-      // Only write when at least one node reported tokens; UI computes savings as
-      // total_frontier_cost_usd - total_cost_usd.
-      ...(totalFrontierCostUsd > 0 ? { total_frontier_cost_usd: totalFrontierCostUsd } : {}),
-      // Per-run declared/requested/served model rollup
-      // (WO-HARNESS-TELEMETRY-DECLARED-MODEL-AND-COST-01). Only written when at
-      // least one node reported model telemetry -- deck surfaces 2+3's data
-      // contract; field names are provisional pending the deck-UI WO.
-      ...(nodeModelSummary.length > 0 ? { node_model_summary: nodeModelSummary } : {}),
-      ...(modelMismatchCount > 0 ? { model_mismatch_count: modelMismatchCount } : {}),
-    });
+    await deps.store.completeWorkflowRun(
+      workflowRun.id,
+      {
+        node_counts: nodeCounts,
+        // totalCostUsd starts at 0; only write metadata when at least one node reported cost
+        ...(totalCostUsd > 0 ? { total_cost_usd: totalCostUsd } : {}),
+        // totalTokens starts at 0; only write metadata when at least one node reported tokens
+        ...(totalTokens > 0 ? { total_tokens: totalTokens } : {}),
+        // Layer 1 counterfactual run total (WO-HARNESS-LAYER1-TIER-AND-COUNTERFACTUAL-COST-01).
+        // Only write when at least one node reported tokens; UI computes savings as
+        // total_frontier_cost_usd - total_cost_usd.
+        ...(totalFrontierCostUsd > 0 ? { total_frontier_cost_usd: totalFrontierCostUsd } : {}),
+        // Per-run declared/requested/served model rollup
+        // (WO-HARNESS-TELEMETRY-DECLARED-MODEL-AND-COST-01). Only written when at
+        // least one node reported model telemetry -- deck surfaces 2+3's data
+        // contract; field names are provisional pending the deck-UI WO.
+        ...(nodeModelSummary.length > 0 ? { node_model_summary: nodeModelSummary } : {}),
+        ...(modelMismatchCount > 0 ? { model_mismatch_count: modelMismatchCount } : {}),
+      },
+      {
+        outcome: completedOutcome,
+        updatedAt: new Date().toISOString(),
+        eventData: {
+          duration_ms: duration,
+          node_counts: nodeCounts,
+          terminal_cause: 'all_nodes_satisfied',
+        },
+      }
+    );
     // Terminal state reached: emit 'run_token_totals' rollup event (see token-rollup.ts).
     emitTerminalRunTokenTotals();
   } catch (dbErr) {
-    getLog().error(
-      { err: dbErr as Error, workflowRunId: workflowRun.id },
-      'dag_db_complete_failed'
-    );
-    await safeSendMessage(
-      platform,
-      conversationId,
-      'Warning: workflow completed but the run status could not be saved. The workflow result may appear inconsistent.',
-      { workflowId: workflowRun.id }
-    );
+    await handleTerminalPersistenceFailure('completed', completedOutcome, dbErr as Error);
+    return;
   }
   await logWorkflowComplete(logDir, workflowRun.id);
-  const duration = Date.now() - dagStartTime;
   const emitter = getWorkflowEventEmitter();
   emitter.emit({
     type: 'workflow_completed',
@@ -5132,18 +5837,6 @@ export async function executeDagWorkflow(
     workflowName: workflow.name,
     duration,
   });
-  deps.store
-    .createWorkflowEvent({
-      workflow_run_id: workflowRun.id,
-      event_type: 'workflow_completed',
-      data: { duration_ms: duration },
-    })
-    .catch((err: Error) => {
-      getLog().error(
-        { err, workflowRunId: workflowRun.id, eventType: 'workflow_completed' },
-        'workflow_event_persist_failed'
-      );
-    });
   emitter.unregisterRun(workflowRun.id);
 
   // Return the first terminal node's output (nodes with no dependents) for the parent
@@ -5156,4 +5849,46 @@ export async function executeDagWorkflow(
     .find(o => o?.state === 'completed' && o.output.trim().length > 0)?.output;
 
   return terminalOutput;
+}
+
+export const executeDagWorkflow: typeof executeDagWorkflowInternal = (...args) => {
+  const [deps, , , , , workflowRun] = args;
+  const [, ...executionArgs] = args;
+  return withRunLease(deps.store, workflowRun.id, isRunLeaseValid =>
+    executeDagWorkflowInternal({ ...deps, isRunLeaseValid }, ...executionArgs)
+  );
+};
+interface BunRuntimeResolutionOptions {
+  readonly execPath?: string;
+  readonly platform?: NodeJS.Platform;
+  readonly which?: (name: string) => string | null;
+  readonly exists?: (path: string) => boolean;
+}
+
+/** Resolve a real Bun CLI, never the compiled Archon executable or a Windows shell shim. */
+export function resolveBunRuntimeExecutable(options: BunRuntimeResolutionOptions = {}): string {
+  const execPath = options.execPath ?? process.execPath;
+  const platform = options.platform ?? process.platform;
+  const which = options.which ?? ((name: string): string | null => Bun.which(name));
+  const exists = options.exists ?? existsSync;
+  const platformPath = platform === 'win32' ? win32Path : posixPath;
+  const execName = platformPath.basename(execPath).toLowerCase();
+  if (execName === 'bun' || execName === 'bun.exe') return execPath;
+
+  const discovered = which('bun');
+  if (!discovered) throw new Error('bun_runtime_executable_unavailable');
+  const discoveredName = platformPath.basename(discovered).toLowerCase();
+  if (platform !== 'win32' || (discoveredName !== 'bun.cmd' && discoveredName !== 'bun.ps1')) {
+    return discovered;
+  }
+
+  const npmNative = platformPath.join(
+    platformPath.dirname(discovered),
+    'node_modules',
+    'bun',
+    'bin',
+    'bun.exe'
+  );
+  if (exists(npmNative)) return npmNative;
+  throw new Error(`bun_runtime_executable_unavailable: shell shim ${discovered}`);
 }

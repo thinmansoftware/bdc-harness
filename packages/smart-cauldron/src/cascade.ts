@@ -25,7 +25,8 @@ import { loadRuleset, pickEntryTier } from './conductor.js';
 import { fireTier, buildFireMessage } from './fire.js';
 import { pollForTerminal, TimeoutError } from './poll.js';
 import { judgeGate, classifyAttemptOutcome } from './judge.js';
-import { writeRecord } from './recorder.js';
+import { createRecord, writeRecord } from './recorder.js';
+import type { CreateCascadeRecordResult } from './recorder.js';
 import { cancelRun } from './cancel.js';
 import { classifyError } from '@archon/overseer/classify';
 import { runEscalation } from '@archon/overseer/escalate';
@@ -48,11 +49,15 @@ const execFileAsync = promisify(execFile);
 // ---------------------------------------------------------------------------
 
 export interface CascadeDeps {
+  /** Verify that the selected workflow lane is available before any provider fire. */
+  preflight?: (tier: LadderTier) => Promise<void>;
   fire?: typeof fireTier;
   poll?: typeof pollForTerminal;
   judge?: typeof judgeGate;
   escalate?: (context: EscalationCallContext) => Promise<void>;
   writeRecord?: typeof writeRecord;
+  /** Exclusive admission writer used to make dispatch idempotent across processes. */
+  createRecord?: typeof createRecord;
   /** Best-effort cancel of a hung run on progress-timeout. Failure never blocks the climb. */
   cancel?: typeof cancelRun;
   /**
@@ -62,6 +67,24 @@ export interface CascadeDeps {
    * an issue is surfaced via `posted: false` (caller falls back to escalate).
    */
   specRepair?: (context: SpecRepairCallContext) => Promise<SpecRepairResult>;
+  /** Optional dual-supervisor control plane. Absent by default; never starts a live worker. */
+  superviseFailure?: (context: SupervisorFailureContext) => Promise<SupervisorFailureResult>;
+}
+
+export interface SupervisorFailureContext {
+  woId: string;
+  cascadeId: string;
+  tierName: TierName;
+  runId: string | null;
+  reason: string;
+  failureKind: 'frontier-gate' | 'infrastructure';
+}
+
+export interface SupervisorFailureResult {
+  handled: boolean;
+  ownerId: string | null;
+  fencingToken: number | null;
+  evidenceRefs: string[];
 }
 
 export interface EscalationCallContext {
@@ -96,6 +119,10 @@ export interface SpecRepairResult {
 
 export interface RunCascadeOptions {
   woId: string;
+  /** Stable caller-supplied dispatch identity. Replays return the existing durable record. */
+  dispatchId?: string;
+  /** Resolves only after the initial record is durable; used by async API dispatch. */
+  onAdmission?: (record: CascadeRunRecord, created: boolean) => void;
   woClass?: string;
   tags?: string[];
   /** Override the entry tier (skips conductor ruleset). */
@@ -131,6 +158,8 @@ export interface RunCascadeOptions {
 export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRecord> {
   const {
     woId,
+    dispatchId,
+    onAdmission,
     woClass,
     tags,
     entryOverride,
@@ -146,12 +175,26 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
 
   // Inject real implementations unless overridden (for testing)
   const fireImpl = opts.deps?.fire ?? fireTier;
+  const preflightImpl = opts.deps?.preflight;
   const pollImpl = opts.deps?.poll ?? pollForTerminal;
   const judgeImpl = opts.deps?.judge ?? judgeGate;
   const escalateImpl = opts.deps?.escalate ?? defaultEscalate;
   const writeRecordImpl = opts.deps?.writeRecord ?? writeRecord;
+  const createRecordImpl =
+    opts.deps?.createRecord ??
+    (opts.deps?.writeRecord
+      ? async (
+          record: CascadeRunRecord,
+          recordOutDir: string
+        ): Promise<CreateCascadeRecordResult> => ({
+          created: true,
+          path: await writeRecordImpl(record, recordOutDir),
+          record,
+        })
+      : createRecord);
   const cancelImpl = opts.deps?.cancel ?? cancelRun;
   const specRepairImpl = opts.deps?.specRepair ?? defaultSpecRepair;
+  const superviseFailureImpl = opts.deps?.superviseFailure;
 
   // Load config from files (never from inline constants)
   const tiers = loadLadder();
@@ -167,7 +210,7 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
     );
   }
 
-  const cascadeId = randomUUID();
+  const cascadeId = dispatchId ?? randomUUID();
   const createdAt = new Date().toISOString();
 
   // Dry-run: just log and return a stub record
@@ -182,8 +225,15 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
     const record: CascadeRunRecord = {
       cascadeId,
       woId,
+      project: project ?? null,
+      request: {
+        woClass: woClass ?? null,
+        tags: [...(tags ?? [])].sort(),
+        entryOverride: entryOverride ?? null,
+        dryRun: true,
+      },
       createdAt,
-      status: 'won',
+      status: 'planned',
       winningTier: null,
       attempts: [],
       totalCostUsd: null,
@@ -194,7 +244,9 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
         wonCheap: false,
       },
     };
-    return record;
+    const admission = await createRecordImpl(record, outDir);
+    onAdmission?.(admission.record, admission.created);
+    return admission.record;
   }
 
   if (!project) {
@@ -207,9 +259,49 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
   const attempts: CascadeAttempt[] = [];
   let priorContext: string | null = null;
   let climbCount = 0;
-  let status: CascadeStatus = 'blocked';
+  let status: CascadeStatus = 'running';
   let winningTier: TierName | null = null;
   let specRepairRecord: CascadeRunRecord['specRepair'];
+  let supervisorRecoveryRecord: CascadeRunRecord['supervisorRecovery'];
+
+  function buildCurrentRecord(): CascadeRunRecord {
+    const entryTier: TierName = attempts[0]?.tier ?? entryTierName;
+    const climbed = climbCount > 0;
+    return {
+      cascadeId,
+      woId,
+      project: project ?? null,
+      request: {
+        woClass: woClass ?? null,
+        tags: [...(tags ?? [])].sort(),
+        entryOverride: entryOverride ?? null,
+        dryRun: false,
+      },
+      createdAt,
+      status,
+      winningTier,
+      attempts,
+      totalCostUsd: computeTotalCost(attempts),
+      telemetry: {
+        entryTier,
+        climbed,
+        climbCount,
+        wonCheap: status === 'won' && !climbed,
+      },
+      ...(specRepairRecord ? { specRepair: specRepairRecord } : {}),
+      ...(supervisorRecoveryRecord ? { supervisorRecovery: supervisorRecoveryRecord } : {}),
+    };
+  }
+
+  async function checkpoint(): Promise<string> {
+    return writeRecordImpl(buildCurrentRecord(), outDir);
+  }
+
+  // Persist admission before any provider lane can be fired. A duplicate dispatch
+  // returns the existing record and cannot create a second provider attempt.
+  const admission = await createRecordImpl(buildCurrentRecord(), outDir);
+  onAdmission?.(admission.record, admission.created);
+  if (!admission.created) return admission.record;
 
   /**
    * Shared climb/frontier logic for both the gate-fail path and the
@@ -231,6 +323,25 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
     runId: string | null
   ): Promise<boolean> {
     if (currentTier.isFrontier) {
+      if (superviseFailureImpl) {
+        const recovery = await superviseFailureImpl({
+          woId,
+          cascadeId,
+          tierName: currentTier.name,
+          runId,
+          reason: failReason,
+          failureKind: 'frontier-gate',
+        });
+        if (recovery.handled && recovery.ownerId !== null && recovery.fencingToken !== null) {
+          supervisorRecoveryRecord = {
+            ownerId: recovery.ownerId,
+            fencingToken: recovery.fencingToken,
+            evidenceRefs: recovery.evidenceRefs,
+          };
+          status = 'recovery-delegated';
+          return true;
+        }
+      }
       // Top rung (fable) failed the gate. Per John's 2026-07-02 doctrine ruling
       // ("Fable is the last escalation before failure -- a WO should never fail,
       // it should be able to be fixed"), this is NOT a terminal BLOCKED dead end.
@@ -312,10 +423,44 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
     const tier = tiers[currentIndex];
     if (!tier) break;
     const attemptStartedAt = new Date().toISOString();
+    const attempt: CascadeAttempt = {
+      tier: tier.name,
+      workflowName: tier.workflowName,
+      runId: null,
+      outcome: 'running',
+      gateFailReason: null,
+      infraErrorReason: null,
+      servedModelId: null,
+      costUsd: null,
+      startedAt: attemptStartedAt,
+      completedAt: null,
+    };
+    attempts.push(attempt);
+    await checkpoint();
+
+    if (preflightImpl) {
+      try {
+        await preflightImpl(tier);
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : String(error);
+        attempt.outcome = 'infra-error';
+        attempt.infraErrorReason = `lane preflight failed: ${reason}`;
+        attempt.completedAt = new Date().toISOString();
+        status = 'infra-alert';
+        await escalateImpl({
+          errorClass: 'configuration',
+          woId,
+          reason: `Lane preflight failed on tier ${tier.name}: ${reason}`,
+          runId: null,
+        });
+        await checkpoint();
+        break;
+      }
+    }
 
     console.log(
       `[smart-cauldron] Firing woId=${woId} on tier=${tier.name} ` +
-        `workflow=${tier.workflowName} (attempt ${attempts.length + 1})`
+        `workflow=${tier.workflowName} (attempt ${attempts.length})`
     );
 
     // Fire the WO on this tier
@@ -326,6 +471,7 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
       apiBaseUrl,
       token,
     });
+    attempt.runId = fireResult.runId;
 
     // Infra error: alert + stop (do NOT count as "too hard")
     if (!fireResult.ok) {
@@ -334,19 +480,30 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
         statusCode: extractStatusCode(fireResult.infraError ?? ''),
       });
 
-      const attempt: CascadeAttempt = {
-        tier: tier.name,
-        workflowName: tier.workflowName,
-        runId: null,
-        outcome: 'infra-error',
-        gateFailReason: null,
-        infraErrorReason: fireResult.infraError,
-        servedModelId: null,
-        costUsd: null,
-        startedAt: attemptStartedAt,
-        completedAt: new Date().toISOString(),
-      };
-      attempts.push(attempt);
+      attempt.outcome = 'infra-error';
+      attempt.infraErrorReason = fireResult.infraError;
+      attempt.completedAt = new Date().toISOString();
+
+      if (superviseFailureImpl) {
+        const recovery = await superviseFailureImpl({
+          woId,
+          cascadeId,
+          tierName: tier.name,
+          runId: fireResult.runId,
+          reason: fireResult.infraError ?? 'unknown infrastructure failure',
+          failureKind: 'infrastructure',
+        });
+        if (recovery.handled && recovery.ownerId !== null && recovery.fencingToken !== null) {
+          supervisorRecoveryRecord = {
+            ownerId: recovery.ownerId,
+            fencingToken: recovery.fencingToken,
+            evidenceRefs: recovery.evidenceRefs,
+          };
+          status = 'recovery-delegated';
+          await checkpoint();
+          break;
+        }
+      }
 
       await escalateImpl({
         errorClass,
@@ -356,8 +513,12 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
       });
 
       status = 'infra-alert';
+      await checkpoint();
       break;
     }
+
+    // The workflow run identity is durable before polling begins.
+    await checkpoint();
 
     // Poll for terminal state (runId is guaranteed non-null since fireResult.ok is true)
     const resolvedRunId = fireResult.runId ?? '';
@@ -392,24 +553,15 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
         }
 
         const timeoutReason = `progress-timeout: no terminal state within ${pollTimeoutMs}ms poll budget`;
-        const attempt: CascadeAttempt = {
-          tier: tier.name,
-          workflowName: tier.workflowName,
-          runId: fireResult.runId,
-          outcome: 'progress-timeout',
-          gateFailReason: timeoutReason,
-          infraErrorReason: null,
-          servedModelId: null,
-          costUsd: null,
-          startedAt: attemptStartedAt,
-          completedAt: new Date().toISOString(),
-        };
-        attempts.push(attempt);
+        attempt.outcome = 'progress-timeout';
+        attempt.gateFailReason = timeoutReason;
+        attempt.completedAt = new Date().toISOString();
 
         console.log(`[smart-cauldron] Progress-timeout on tier=${tier.name}: ${timeoutReason}`);
         priorContext = buildTimeoutPriorContext(tier.name, pollTimeoutMs);
 
         const shouldStop = await climbOrStop(tier, timeoutReason, fireResult.runId);
+        await checkpoint();
         if (shouldStop) break;
         continue;
       }
@@ -417,19 +569,9 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
       // Non-timeout poll errors (network, API unreachable/5xx) keep the exact
       // existing infra-error handling -- unchanged.
       const errMsg = (pollErr as Error).message;
-      const attempt: CascadeAttempt = {
-        tier: tier.name,
-        workflowName: tier.workflowName,
-        runId: fireResult.runId,
-        outcome: 'infra-error',
-        gateFailReason: null,
-        infraErrorReason: `poll error: ${errMsg}`,
-        servedModelId: null,
-        costUsd: null,
-        startedAt: attemptStartedAt,
-        completedAt: new Date().toISOString(),
-      };
-      attempts.push(attempt);
+      attempt.outcome = 'infra-error';
+      attempt.infraErrorReason = `poll error: ${errMsg}`;
+      attempt.completedAt = new Date().toISOString();
 
       await escalateImpl({
         errorClass: 'service_unavailable',
@@ -439,6 +581,7 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
       });
 
       status = 'infra-alert';
+      await checkpoint();
       break;
     }
 
@@ -446,24 +589,16 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
     const verdict: GateVerdict = judgeImpl(pollResult);
     const outcome = classifyAttemptOutcome(fireResult, verdict);
 
-    const attempt: CascadeAttempt = {
-      tier: tier.name,
-      workflowName: tier.workflowName,
-      runId: fireResult.runId,
-      outcome,
-      gateFailReason: verdict.pass ? null : verdict.reason,
-      infraErrorReason: null,
-      servedModelId: pollResult.servedModelId,
-      costUsd: null,
-      startedAt: attemptStartedAt,
-      completedAt: new Date().toISOString(),
-    };
-    attempts.push(attempt);
+    attempt.outcome = outcome;
+    attempt.gateFailReason = verdict.pass ? null : verdict.reason;
+    attempt.servedModelId = pollResult.servedModelId;
+    attempt.completedAt = new Date().toISOString();
 
     if (verdict.pass) {
       // Gate passed -- cascade stops
       status = 'won';
       winningTier = tier.name;
+      await checkpoint();
       console.log(`[smart-cauldron] WON on tier=${tier.name} after ${attempts.length} attempt(s)`);
       break;
     }
@@ -475,33 +610,11 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
     priorContext = buildPriorContext(tier.name, verdict, pollResult);
 
     const shouldStop = await climbOrStop(tier, verdict.reason, fireResult.runId);
+    await checkpoint();
     if (shouldStop) break;
   }
 
-  // Compute total cost
-  const totalCostUsd = computeTotalCost(attempts);
-
-  const firstAttempt = attempts[0];
-  const entryTier: TierName = firstAttempt?.tier ?? entryTierName;
-  const climbed = climbCount > 0;
-  const wonCheap = status === 'won' && !climbed;
-
-  const record: CascadeRunRecord = {
-    cascadeId,
-    woId,
-    createdAt,
-    status,
-    winningTier,
-    attempts,
-    totalCostUsd,
-    telemetry: {
-      entryTier,
-      climbed,
-      climbCount,
-      wonCheap,
-    },
-    ...(specRepairRecord ? { specRepair: specRepairRecord } : {}),
-  };
+  const record = buildCurrentRecord();
 
   // Write local telemetry record
   const recordPath = await writeRecordImpl(record, outDir);

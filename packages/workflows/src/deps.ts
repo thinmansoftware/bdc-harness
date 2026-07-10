@@ -9,6 +9,8 @@
  */
 import type { IWorkflowStore } from './store';
 import type { ModelReasoningEffort, WebSearchMode } from './schemas';
+import type { RunAuthorityPolicy } from './schemas/workflow';
+import type { FrozenSpecSource } from './reliability/run-authority';
 import type {
   IAgentProvider,
   MessageChunk,
@@ -118,4 +120,10 @@ export interface WorkflowDeps {
   store: IWorkflowStore;
   getAgentProvider: AgentProviderFactory;
   loadConfig: (cwd: string) => Promise<WorkflowConfig>;
+  freezeWorkOrderSource?: (
+    policy: RunAuthorityPolicy,
+    userMessage: string
+  ) => Promise<FrozenSpecSource>;
+  /** Internal execution guard installed by the run-lease wrapper. */
+  isRunLeaseValid?: () => boolean;
 }

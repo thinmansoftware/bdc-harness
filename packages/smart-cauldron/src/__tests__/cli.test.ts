@@ -63,7 +63,14 @@ describe('statusToExitCode', () => {
   });
 
   test('every CascadeStatus maps to an integer exit code', () => {
-    const statuses: CascadeStatus[] = ['won', 'blocked', 'spec-repair', 'infra-alert'];
+    const statuses: CascadeStatus[] = [
+      'planned',
+      'running',
+      'won',
+      'blocked',
+      'spec-repair',
+      'infra-alert',
+    ];
     for (const status of statuses) {
       expect(Number.isInteger(statusToExitCode(status))).toBe(true);
     }

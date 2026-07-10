@@ -4,9 +4,14 @@
 import type { WorkflowDefinition, WorkflowLoadError, DagNode, WorkflowNodeHooks } from './schemas';
 import { isLoopNode, isApprovalNode, isCancelNode, isScriptNode } from './schemas';
 import { createLogger } from '@archon/paths';
-import { isRegisteredProvider, getRegisteredProviders } from '@archon/providers';
+import {
+  isRegisteredProvider,
+  getRegisteredProviders,
+  getMissingProviderExecutionCapabilities,
+} from '@archon/providers';
 import {
   dagNodeSchema,
+  deriveNodeExecutionRequirements,
   BASH_NODE_AI_FIELDS,
   SCRIPT_NODE_AI_FIELDS,
   LOOP_NODE_AI_FIELDS,
@@ -382,6 +387,24 @@ export function parseWorkflow(content: string, filename: string): ParseResult {
       }
     }
 
+    for (const node of dagNodes) {
+      const required = deriveNodeExecutionRequirements(node);
+      const effectiveProvider = node.provider ?? provider;
+      if (effectiveProvider) {
+        const missing = getMissingProviderExecutionCapabilities(effectiveProvider, required);
+        if (missing.length > 0) {
+          return {
+            workflow: null,
+            error: {
+              filename,
+              error: `Node '${node.id}': provider '${effectiveProvider}' lacks required execution capabilities: ${missing.join(', ')}`,
+              errorType: 'validation_error',
+            },
+          };
+        }
+      }
+    }
+
     // WO-HARNESS-NODE-PROVIDER-FAILOVER-01: validate failover_provider identity at
     // load time (workflow level + per node), mirroring the provider identity check
     // above. failover_model, like model, is a free string passed to the SDK. The
@@ -417,6 +440,28 @@ export function parseWorkflow(content: string, filename: string): ParseResult {
             errorType: 'validation_error',
           },
         };
+      }
+    }
+
+    for (const node of dagNodes) {
+      const effectiveFailoverProvider =
+        (node as { failover_provider?: string }).failover_provider ?? workflowFailoverProvider;
+      if (effectiveFailoverProvider) {
+        const required = deriveNodeExecutionRequirements(node);
+        const missing = getMissingProviderExecutionCapabilities(
+          effectiveFailoverProvider,
+          required
+        );
+        if (missing.length > 0) {
+          return {
+            workflow: null,
+            error: {
+              filename,
+              error: `Node '${node.id}': failover provider '${effectiveFailoverProvider}' lacks required execution capabilities: ${missing.join(', ')}`,
+              errorType: 'validation_error',
+            },
+          };
+        }
       }
     }
 

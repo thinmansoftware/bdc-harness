@@ -17,6 +17,7 @@ import type { ProviderCapabilities } from '../../types';
  * dag-executor's existing dag.structured_output_missing path.
  */
 export const PI_CAPABILITIES: ProviderCapabilities = {
+  execution: { text: true, repositoryRead: true, repositoryWrite: true, shell: true },
   sessionResume: true,
   mcp: false,
   hooks: false,

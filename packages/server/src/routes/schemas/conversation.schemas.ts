@@ -104,5 +104,8 @@ export const dispatchResponseSchema = z
   .object({
     accepted: z.boolean(),
     status: z.string(),
+    dispatchMode: z.enum(['direct', 'conductor']).optional(),
+    cascadeId: z.string().optional(),
+    entryTier: z.string().optional(),
   })
   .openapi('DispatchResponse');

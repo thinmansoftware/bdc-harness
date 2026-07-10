@@ -11,6 +11,7 @@ import type { ProviderCapabilities } from '../../types';
  * "no shell/filesystem tools" and never wrote files.
  */
 export const GROK_AGENT_CAPABILITIES: ProviderCapabilities = {
+  execution: { text: true, repositoryRead: true, repositoryWrite: true, shell: true },
   sessionResume: false,
   mcp: false,
   hooks: false,

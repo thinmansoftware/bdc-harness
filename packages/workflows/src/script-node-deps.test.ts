@@ -97,8 +97,25 @@ function createMockStore(): IWorkflowStore {
     failWorkflowRun: mock(() => Promise.resolve()),
     pauseWorkflowRun: mock(() => Promise.resolve()),
     cancelWorkflowRun: mock(() => Promise.resolve()),
+    createRunAuthority: mock(() => Promise.resolve('created' as const)),
     createWorkflowEvent: mock(() => Promise.resolve()),
     listWorkflowEvents: mock(() => Promise.resolve([])),
+    getRunAuthority: mock(() => Promise.resolve(null)),
+    claimRunLease: mock(() => Promise.resolve(null)),
+    heartbeatRunLease: mock(() => Promise.resolve(false)),
+    releaseRunLease: mock(() => Promise.resolve(false)),
+    listExpiredRunLeases: mock(() => Promise.resolve([])),
+    interruptExpiredRunLease: mock(() => Promise.resolve(false)),
+    createProviderAttempt: mock(() => Promise.resolve(true)),
+    completeProviderAttempt: mock(() => Promise.resolve(true)),
+    listProviderAttempts: mock(() => Promise.resolve([])),
+    upsertRunOutcome: mock(() => Promise.resolve(true)),
+    getRunOutcome: mock(() => Promise.resolve(null)),
+    scheduleProviderWait: mock(() => Promise.resolve(true)),
+    listDueProviderWaits: mock(() => Promise.resolve([])),
+    claimProviderWait: mock(() => Promise.resolve(false)),
+    cancelProviderWaits: mock(() => Promise.resolve(0)),
+    completeProviderWait: mock(() => Promise.resolve(false)),
     getCompletedDagNodeOutputs: mock(() => Promise.resolve(new Map<string, string>())),
     getCodebase: mock(() => Promise.resolve(null)),
     getCodebaseEnvVars: mock(() => Promise.resolve({})),
@@ -313,10 +330,10 @@ describe('script node deps field -- command construction', () => {
     );
 
     const calls = mockExecFileAsync.mock.calls;
-    const scriptCall = calls.find(c => (c[0] as string) === 'bun');
+    const scriptCall = calls.find(c => (c[0] as string) === process.execPath);
     expect(scriptCall).toBeDefined();
     const [cmd, args] = scriptCall as [string, string[]];
-    expect(cmd).toBe('bun');
+    expect(cmd).toBe(process.execPath);
     // --no-env-file prevents repo .env auto-load; no dep flags -- bun auto-installs
     expect(args).toEqual(['--no-env-file', '-e', node.script]);
     expect(args).not.toContain('--packages');
@@ -347,10 +364,10 @@ describe('script node deps field -- command construction', () => {
     );
 
     const calls = mockExecFileAsync.mock.calls;
-    const scriptCall = calls.find(c => (c[0] as string) === 'bun');
+    const scriptCall = calls.find(c => (c[0] as string) === process.execPath);
     expect(scriptCall).toBeDefined();
     const [cmd, args] = scriptCall as [string, string[]];
-    expect(cmd).toBe('bun');
+    expect(cmd).toBe(process.execPath);
     expect(args).toEqual(['--no-env-file', '-e', 'console.log("hello")']);
   });
 

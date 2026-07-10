@@ -495,7 +495,7 @@ nodes:
           canonicalRepoPath: string;
           targetBranch: string;
         }
-      ) => Promise<{ stageId: string; branchName: string; worktreePath: string; codebaseId: string; adopted: boolean }>;
+      ) => Promise<{ stageId: string; branchName: string; worktreePath: string; codebaseId: string; baseSha: string; adopted: boolean }>;
 
       type EnrichedStage = {
         id: string;
@@ -541,6 +541,7 @@ nodes:
             codebaseName: st.repo,
             canonicalRepoPath: st.canonicalRepoPath,
             targetBranch: st.target_branch,
+            baseSha: result.baseSha,
           });
           out.push({
             stageId: result.stageId,
@@ -576,6 +577,8 @@ nodes:
         process.exit(1);
       });
       TSEOF
+
+      printf '%s\n' "$HARNESS_ROOT" > "$ARTIFACTS_DIR/harness-root.txt"
 
       # Invoke the substrate. We CD into HARNESS_ROOT so bun resolves any
       # transitive workspace packages the substrate may use. HARNESS_ROOT is
@@ -667,7 +670,7 @@ nodes:
 
         ### 1. Prepare
         Read the stage entry: stageId, branchName, worktreePath, repo,
-        targetBranch, inScopeFiles, verifyCommands, readinessBar.
+        targetBranch, baseSha, inScopeFiles, verifyCommands, readinessBar.
         cd into worktreePath (the stage's worktree, NOT this run's worktree).
         Read every prior stage-<priorId>-done.json so you have the prior PR URL,
         branch, API contract, staging URL, and env vars to build against.
@@ -678,6 +681,11 @@ nodes:
           backend's branch (NOT main) defines the endpoints the UI calls.
         - Do NOT touch files outside this stage's inScopeFiles. Do NOT reformat.
         - Do NOT use `git commit --allow-empty`.
+        - Before editing, persist an attempt entry to
+          $ARTIFACTS_DIR/stage-${stageId}-attempts.json with attemptNumber,
+          startedAt, completedAt=null, and result=null. On exit, atomically
+          replace it with completedAt and result=passed|blocked. Never erase
+          prior attempts on a re-fire.
 
         ### 3. Verify
         Run every command in verifyCommands from the worktreePath. ALL must pass.
@@ -691,6 +699,11 @@ nodes:
           - Tests exist for new behavior or there is an explicit reason in the spec.
         If you find a finding you cannot fix in this iteration, halt that stage
         and write the block artifact per step 6.
+        Mechanically verify `git merge-base --is-ancestor "${baseSha}" HEAD`.
+        Derive the exact changed-file list from `${baseSha}` plus untracked files
+        and require every path to be present in inScopeFiles. A missing/invalid
+        base SHA or out-of-scope path is BLOCKED with authority_conflict or
+        scope_mismatch; it is never repaired by reset or branch adoption.
 
         ### 5. Commit + push (BEFORE marking done)
         From worktreePath:
@@ -734,6 +747,18 @@ nodes:
               "prUrl": "...",
               "repo": "...",
               "targetBranch": "...",
+              "authority": {
+                "stageId": "...", "branchName": "...", "repo": "...",
+                "targetBranch": "...", "baseSha": "40-char frozen SHA"
+              },
+              "attempts": [{
+                "attemptNumber": 1, "startedAt": "...", "completedAt": "...",
+                "result": "passed"
+              }],
+              "evidence": {
+                "prUrl": "...", "exactFiles": ["..."],
+                "verifyResult": "...", "reviewResult": "..."
+              },
               "status": "PASS",
               "verifyResult": "...one-line summary...",
               "reviewResult": "...one-line summary...",
@@ -751,6 +776,18 @@ nodes:
               "branchName": "...",
               "prUrl": "...or null...",
               "repo": "...",
+              "authority": {
+                "stageId": "...", "branchName": "...", "repo": "...",
+                "targetBranch": "...", "baseSha": "40-char frozen SHA"
+              },
+              "attempts": [{
+                "attemptNumber": 1, "startedAt": "...", "completedAt": "...",
+                "result": "blocked"
+              }],
+              "evidence": {
+                "prUrl": "...or null...", "exactFiles": ["..."],
+                "verifyResult": "...", "reviewResult": "..."
+              },
               "status": "BLOCKED",
               "blockingReason": "<one of: push_failed, ci_red, review_blocked, pr_not_mergeable, verify_failed, plan_ambiguous, registry_missing>: <detail>",
               "earlierPrsStand": true
@@ -806,77 +843,19 @@ nodes:
         exit 1
       fi
       OUT="$ARTIFACTS_DIR/pipeline-manifest.json"
-      python3 - "$STAGES" "$ARTIFACTS_DIR" "$OUT" <<'PYEOF'
-      import sys, json, os, glob
-      stages = json.load(open(sys.argv[1]))
-      artifacts_dir = sys.argv[2]
-      rows = []
-      missing_artifacts = []
-      blocked = []
-      passed = []
-      for st in stages:
-          sid = st['stageId']
-          done_path = os.path.join(artifacts_dir, "stage-%s-done.json" % sid)
-          blocked_path = os.path.join(artifacts_dir, "stage-%s-blocked.json" % sid)
-          row = {
-              'stageId': sid,
-              'branchName': st['branchName'],
-              'repo': st['repo'],
-              'targetBranch': st['targetBranch'],
-          }
-          if os.path.exists(done_path):
-              try:
-                  data = json.load(open(done_path))
-              except Exception as e:
-                  missing_artifacts.append("%s (parse error: %s)" % (sid, e))
-                  continue
-              row['status'] = 'PASS'
-              row['prUrl'] = data.get('prUrl')
-              row['verifyResult'] = data.get('verifyResult')
-              row['reviewResult'] = data.get('reviewResult')
-              row['blockingReason'] = None
-              passed.append(sid)
-          elif os.path.exists(blocked_path):
-              try:
-                  data = json.load(open(blocked_path))
-              except Exception as e:
-                  missing_artifacts.append("%s (parse error: %s)" % (sid, e))
-                  continue
-              row['status'] = 'BLOCKED'
-              row['prUrl'] = data.get('prUrl')
-              row['verifyResult'] = data.get('verifyResult')
-              row['reviewResult'] = data.get('reviewResult')
-              row['blockingReason'] = data.get('blockingReason')
-              blocked.append(sid)
-          else:
-              missing_artifacts.append(sid)
-              row['status'] = 'MISSING'
-              row['prUrl'] = None
-              row['verifyResult'] = None
-              row['reviewResult'] = None
-              row['blockingReason'] = 'artifact_missing'
-          rows.append(row)
-      overall = 'PASS' if (len(blocked) == 0 and len(missing_artifacts) == 0) else 'BLOCKED'
-      manifest = {
-          'overall_status': overall,
-          'stage_count': len(stages),
-          'passed_stages': passed,
-          'blocked_stages': blocked,
-          'missing_artifacts': missing_artifacts,
-          'stages': rows,
-      }
-      open(sys.argv[3], 'w', encoding='utf-8').write(json.dumps(manifest, indent=2))
-      print("MANIFEST=%s" % sys.argv[3])
-      print("OVERALL_STATUS=%s" % overall)
-      print("PASSED=%s" % ",".join(passed))
-      print("BLOCKED=%s" % ",".join(blocked))
-      if missing_artifacts:
-          print("MISSING_ARTIFACTS=%s" % ",".join(missing_artifacts))
-      # Fail closed if anything is missing -- completeness guard.
-      if missing_artifacts:
-          sys.stderr.write("FAIL: %d stage artifact(s) missing -- manifest incomplete.\n" % len(missing_artifacts))
-          sys.exit(1)
-      PYEOF
+      HARNESS_ROOT_FILE="$ARTIFACTS_DIR/harness-root.txt"
+      if [ ! -s "$HARNESS_ROOT_FILE" ]; then
+        echo "ERROR: frozen harness root missing" >&2
+        exit 1
+      fi
+      HARNESS_ROOT=$(cat "$HARNESS_ROOT_FILE")
+      REDUCER="$HARNESS_ROOT/packages/workflows/src/reliability/multi-stage-lifecycle.ts"
+      if [ ! -f "$REDUCER" ]; then
+        echo "ERROR: multi-stage lifecycle reducer missing at $REDUCER" >&2
+        exit 1
+      fi
+      bun "$REDUCER" "$STAGES" "$ARTIFACTS_DIR" "$OUT"
+      test -s "$OUT"
 
   # ---------------------------------------------------------------------------
   # flip-notion: REVIEW only when ALL stages PASS. ANY blocked stage -> BLOCKED.
@@ -893,10 +872,14 @@ nodes:
         python3 -c 'import shlex, sys; s=sys.stdin.read(); sys.stdout.write((lambda p: p[0] if len(p)==1 else s)(shlex.split(s)) if len(s)>=2 and s[0]=="'"'"'" and s.rstrip("\n").endswith("'"'"'") else s)'
       }
 
-      MANIFEST=$(capture_node_output <<'BDC_NODE_OUTPUT_MANIFEST'
-      $consolidated-manifest.output
-      BDC_NODE_OUTPUT_MANIFEST
-      )
+      MANIFEST_FILE="$ARTIFACTS_DIR/pipeline-manifest.json"
+      if [ ! -s "$MANIFEST_FILE" ]; then
+        echo "flip-notion: pipeline manifest missing; refusing status mutation" >&2
+        exit 1
+      fi
+      MANIFEST=$(cat "$MANIFEST_FILE")
+      OVERALL_STATUS=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["overallStatus"])' "$MANIFEST_FILE")
+      PARENT_PROJECTION=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["parentProjection"])' "$MANIFEST_FILE")
 
       READ_SPEC_OUT=$(capture_node_output <<'BDC_NODE_OUTPUT_READ_SPEC'
       $read-spec.output
@@ -918,11 +901,21 @@ nodes:
         exit 0
       fi
 
+      COMMENT_FILE=$(mktemp)
+      printf '%s\n' "$MANIFEST" > "$COMMENT_FILE"
+      if [ "$OVERALL_STATUS" != "PASS" ] || [ "$PARENT_PROJECTION" != "completed" ]; then
+        gh label create status:blocked --repo "$ISSUE_REPO" --color B60205 --description "BDC workflow is blocked" 2>/dev/null || true
+        gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --remove-label status:building 2>/dev/null || true
+        gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --remove-label status:review 2>/dev/null || true
+        gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --add-label status:blocked
+        gh issue comment "$ISSUE_NUM" --repo "$ISSUE_REPO" --body-file "$COMMENT_FILE"
+        echo "flip-notion: $ISSUE_REPO#$ISSUE_NUM -> status:blocked (parent reducer refused REVIEW)"
+        exit 0
+      fi
+
       gh label create status:review --repo "$ISSUE_REPO" --color 0E8A16 --description "BDC workflow is ready for review" 2>/dev/null || true
       gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --remove-label status:building 2>/dev/null || true
       gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --remove-label status:blocked 2>/dev/null || true
       gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --add-label status:review
-      COMMENT_FILE=$(mktemp)
-      printf '%s\n' "$MANIFEST" > "$COMMENT_FILE"
       gh issue comment "$ISSUE_NUM" --repo "$ISSUE_REPO" --body-file "$COMMENT_FILE"
       echo "flip-notion: $ISSUE_REPO#$ISSUE_NUM -> status:review (manifest posted as comment)"
