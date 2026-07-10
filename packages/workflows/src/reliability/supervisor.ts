@@ -124,7 +124,20 @@ export async function coordinateSupervisorRecovery(
     evidenceRefs: [],
     createdAt: input.acquiredAt,
   });
-  if (!reserved) return { incident, observations, repairOwner, repaired: false };
+  const releaseRepairOwner = (): Promise<boolean> =>
+    store.releaseSupervisorRepairLease({
+      incidentId: incident.incidentId,
+      ownerId: repairOwner.ownerId,
+      fencingToken: repairOwner.fencingToken,
+      releasedAt: input.acquiredAt,
+    });
+  const releaseRepairOwnerBestEffort = async (): Promise<void> => {
+    await releaseRepairOwner().catch(() => false);
+  };
+  if (!reserved) {
+    await releaseRepairOwnerBestEffort();
+    return { incident, observations, repairOwner, repaired: false };
+  }
 
   try {
     const result = await input.repair(repairOwner);
@@ -138,13 +151,11 @@ export async function coordinateSupervisorRecovery(
       evidenceRefs: result.evidenceRefs,
       completedAt: input.acquiredAt,
     });
-    if (!finalized) return { incident, observations, repairOwner, repaired: false };
-    await store.releaseSupervisorRepairLease({
-      incidentId: incident.incidentId,
-      ownerId: repairOwner.ownerId,
-      fencingToken: repairOwner.fencingToken,
-      releasedAt: input.acquiredAt,
-    });
+    if (!finalized) {
+      await releaseRepairOwnerBestEffort();
+      return { incident, observations, repairOwner, repaired: false };
+    }
+    await releaseRepairOwnerBestEffort();
     return { incident, observations, repairOwner, repaired: true };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
@@ -158,12 +169,7 @@ export async function coordinateSupervisorRecovery(
       evidenceRefs: [],
       completedAt: input.acquiredAt,
     });
-    await store.releaseSupervisorRepairLease({
-      incidentId: incident.incidentId,
-      ownerId: repairOwner.ownerId,
-      fencingToken: repairOwner.fencingToken,
-      releasedAt: input.acquiredAt,
-    });
+    await releaseRepairOwnerBestEffort();
     throw error;
   }
 }

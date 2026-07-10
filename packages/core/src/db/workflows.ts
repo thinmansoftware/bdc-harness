@@ -747,6 +747,17 @@ export async function reserveSupervisorAction(action: SupervisorActionRecord): P
     if (error instanceof Error && error.message === 'supervisor_action_reservation_conflict') {
       return false;
     }
+    const sqliteCode =
+      db.dialect === 'sqlite' && typeof error === 'object' && error !== null && 'code' in error
+        ? String((error as { code?: unknown }).code)
+        : '';
+    if (
+      sqliteCode.startsWith('SQLITE_BUSY') ||
+      sqliteCode === 'SQLITE_CONSTRAINT_UNIQUE' ||
+      sqliteCode === 'SQLITE_CONSTRAINT_PRIMARYKEY'
+    ) {
+      return false;
+    }
     throw error;
   }
 }
@@ -762,13 +773,25 @@ export async function finalizeSupervisorAction(data: {
   completedAt: string;
 }): Promise<boolean> {
   const db = getDatabase();
+  const activeSql =
+    db.dialect === 'postgres'
+      ? 'l.expires_at > NOW()'
+      : "julianday(l.expires_at) > julianday('now')";
   try {
     return await db.withTransaction(async query => {
       const finalized = await query(
         `UPDATE remote_agent_supervisor_actions
          SET status = $5, outcome = $6, evidence_refs = $7, completed_at = $8
          WHERE action_id = $1 AND incident_id = $2 AND owner_id = $3
-           AND fencing_token = $4 AND status = 'reserved'`,
+           AND fencing_token = $4 AND status = 'reserved'
+           AND EXISTS (
+             SELECT 1 FROM remote_agent_supervisor_repair_leases l
+             JOIN remote_agent_supervisor_incidents i ON i.incident_id = l.incident_id
+             WHERE l.incident_id = remote_agent_supervisor_actions.incident_id
+               AND l.owner_id = $3 AND l.fencing_token = $4
+               AND l.released_at IS NULL AND ${activeSql}
+               AND i.status = 'repairing'
+           )`,
         [
           data.actionId,
           data.incidentId,

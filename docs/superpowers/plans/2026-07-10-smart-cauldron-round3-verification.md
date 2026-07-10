@@ -12,7 +12,8 @@ ready for code review and CI, but it is not activated or deployed.
 1. Capability fixtures explicitly declare text-only authority. Unknown AI seats
    continue to fail closed.
 2. Supervisor lease validity uses database time for acquisition, takeover,
-   authorization, repair reservation, and finalization.
+   authorization, repair reservation, and finalization. Expired or replaced owners
+   cannot close an incident.
 3. Exactly one repair reservation can be created per incident. Reservation occurs
    before the external callback, and finalization is fenced by owner and token.
 4. Closed incidents cannot be reclaimed for another automated repair.
@@ -24,13 +25,18 @@ ready for code review and CI, but it is not activated or deployed.
    prefix collisions.
 8. A lost run-outcome compare-and-swap now fails the evidence node instead of
    emitting false completion.
-9. Bun script nodes spawn the current runtime executable on Windows.
+9. Bun script nodes resolve a real Bun CLI instead of a Windows shell shim or the
+   compiled Archon executable.
+10. SQLite reservation lock/constraint contention returns a safe lost-race result;
+    no external repair callback runs.
+11. Lost reservation or finalization fencing releases the caller's lease when it
+    is still the current lease.
 
 ## Verification evidence
 
 | Gate | Result |
 |---|---|
-| `packages/workflows: bun run test` | PASS, exit 0 |
+| `packages/workflows: bun run test` | PASS, exit 0 with Git-for-Windows Bash on child `PATH` |
 | `bun --filter '*' test` | PASS, exit 0 across all workspaces |
 | `bun run check:bundled` | PASS, 36 commands, 96 workflows, 1 policy |
 | `bun run type-check` | PASS, every package and scripts |
@@ -41,8 +47,12 @@ ready for code review and CI, but it is not activated or deployed.
 | `bun run check:bundled-skill` | FAIL, unrelated existing CLI docs inventory drift |
 | root parallel `bun run test` on Windows | INCONCLUSIVE, silent exit 1 |
 
-The root parallel wrapper result is not hidden: the equivalent workspace test
-command passes when run sequentially. The bundled-skill drift concerns CLI skill
+The Bash-dependent workflow fixtures require
+`C:\Program Files\Git\bin` and `C:\Program Files\Git\usr\bin` on the child
+process `PATH` on this Windows host. Without that prerequisite, the workflows
+package stops with five `uv_spawn 'bash'` failures. The root parallel wrapper
+result is not hidden: the equivalent workspace test command passes when run
+sequentially with the same Bash `PATH`. The bundled-skill drift concerns CLI skill
 documentation and `packages/cli/src/bundled-skill.ts`, none of which this branch
 changes.
 
@@ -73,6 +83,7 @@ f96e0976 fix(workflows): spawn current bun runtime for script nodes
 2. Review the reserve-before-repair coordinator order and incident closure guards.
 3. Review shared-executor authority freezing and resume behavior.
 4. Review path-boundary and outcome compare-and-swap regressions.
-5. Run Linux CI and a disposable PostgreSQL integration canary.
-6. Only after those gates, separately approve supervisor activation and controlled
+5. Review the real Bun CLI resolver in source and compiled-binary modes.
+6. Run Linux CI and a disposable PostgreSQL integration canary.
+7. Only after those gates, separately approve supervisor activation and controlled
    Sol/Fable canary traffic.

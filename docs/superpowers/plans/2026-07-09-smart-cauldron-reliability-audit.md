@@ -193,13 +193,16 @@ yet sufficient. Round 3 closes the branch-owned findings as follows:
   than a vulnerable string prefix
 - mechanical run-outcome persistence now fails on a lost compare-and-swap instead
   of emitting false completion evidence
-- Windows Bun script nodes spawn `process.execPath`, removing the eight portability
-  failures previously attributed to Linux-only verification
+- Bun script nodes resolve a real Bun CLI in source and compiled distributions,
+  including the native executable behind a Windows npm shim
+- stale repair owners cannot finalize after DB-clock lease expiry or takeover;
+  SQLite lock contention is treated as a safe lost reservation race
 
 Round 3 verification at commit `f96e0976`:
 
-- `@archon/workflows` package test command: exit 0
-- sequential all-workspace test command: exit 0
+- `@archon/workflows` package test command with Git-for-Windows Bash on the child
+  `PATH`: exit 0
+- sequential all-workspace test command with the same child `PATH`: exit 0
 - repository `check:bundled`: exit 0; 36 commands, 96 workflows, 1 policy
 - repository `type-check`: exit 0 for every workspace package and scripts
 - repository `lint --max-warnings 0`: exit 0
@@ -207,10 +210,16 @@ Round 3 verification at commit `f96e0976`:
 - `git diff --check`: exit 0
 - ASCII scan of changed script and code files: exit 0
 
-Two qualifications remain. The root parallel test wrapper exits silently on this
-Windows host, while the same workspace tests pass sequentially. Also,
+Two qualifications remain. Without Git-for-Windows Bash on the child `PATH`, five
+Bash fixtures fail with `uv_spawn 'bash'`. With that prerequisite, the root
+parallel test wrapper still exits silently on this Windows host, while the same
+workspace tests pass sequentially. Also,
 `check:bundled-skill` reports an existing CLI documentation inventory drift in
 files untouched by this branch. Neither result is represented as green.
+
+An independent pre-publication review found and drove repairs for stale-owner
+finalization, SQLite reservation contention, compiled-binary Bun resolution, lease
+release on lost fencing, and missing authority reuse tests.
 
 The supervisor hook remains opt-in and unactivated. No live supervisor provider,
 refire, feature flag, deployment, merge, production mutation, or production

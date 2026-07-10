@@ -53,6 +53,7 @@ import {
   clearAgentRegistryCache,
   clearPendingGateResults,
   recordGateResult,
+  resolveBunRuntimeExecutable,
 } from './dag-executor';
 import { loadMcpConfig } from '@archon/providers/claude/provider';
 import type { DagNode, BashNode, ScriptNode, NodeOutput, WorkflowRun } from './schemas';
@@ -8472,6 +8473,53 @@ describe('executeDagWorkflow -- token tracking', () => {
     // The last loop_iteration_failed event must carry the aggregated tokens.
     const lastFailed = failedIters[failedIters.length - 1][0].data;
     expect(lastFailed.tokens).toEqual({ input: 800, output: 400, total: 1200 });
+  });
+});
+
+describe('resolveBunRuntimeExecutable', () => {
+  it('uses the current executable only when it is the Bun CLI', () => {
+    expect(
+      resolveBunRuntimeExecutable({
+        execPath: 'C:\\tools\\bun.exe',
+        platform: 'win32',
+        which: () => {
+          throw new Error('must not search PATH');
+        },
+      })
+    ).toBe('C:\\tools\\bun.exe');
+  });
+
+  it('uses a discovered Bun CLI instead of a compiled Archon executable', () => {
+    expect(
+      resolveBunRuntimeExecutable({
+        execPath: '/opt/archon/archon',
+        platform: 'linux',
+        which: () => '/usr/local/bin/bun',
+      })
+    ).toBe('/usr/local/bin/bun');
+  });
+
+  it('resolves the native executable behind the Windows npm shim', () => {
+    const native = 'C:\\npm\\node_modules\\bun\\bin\\bun.exe';
+    expect(
+      resolveBunRuntimeExecutable({
+        execPath: 'C:\\archon\\archon.exe',
+        platform: 'win32',
+        which: () => 'C:\\npm\\bun.cmd',
+        exists: path => path === native,
+      })
+    ).toBe(native);
+  });
+
+  it('fails closed when only an unresolved Windows shell shim is available', () => {
+    expect(() =>
+      resolveBunRuntimeExecutable({
+        execPath: 'C:\\archon\\archon.exe',
+        platform: 'win32',
+        which: () => 'C:\\custom\\bun.cmd',
+        exists: () => false,
+      })
+    ).toThrow('bun_runtime_executable_unavailable');
   });
 });
 

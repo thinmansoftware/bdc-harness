@@ -5,10 +5,11 @@
  * Independent nodes within the same layer run concurrently via Promise.allSettled.
  * Captures all assistant output regardless of streaming mode for $node_id.output substitution.
  */
+import { existsSync } from 'fs';
 import { chmod, mkdir, readFile, unlink, writeFile } from 'fs/promises';
 import { randomUUID } from 'crypto';
 import { tmpdir } from 'os';
-import { isAbsolute, join, resolve as resolvePath } from 'path';
+import { basename, dirname, isAbsolute, join, resolve as resolvePath } from 'path';
 import { execFileAsync } from '@archon/git';
 import { discoverScriptsForCwd } from './script-discovery';
 import type {
@@ -2882,7 +2883,7 @@ async function executeScriptNode(
     if (isInlineScript(finalScript)) {
       // Inline code execution
       if (node.runtime === 'bun') {
-        cmd = process.execPath;
+        cmd = resolveBunRuntimeExecutable();
         // --no-env-file prevents Bun from auto-loading .env from the execution
         // cwd (the target repo). Without this, repo .env leaks into the script
         // subprocess despite Archon's parent process cleanup.
@@ -2970,7 +2971,7 @@ async function executeScriptNode(
         const withFlags = nodeDeps.flatMap(dep => ['--with', dep]);
         args = ['run', ...withFlags, scriptDef.path];
       } else {
-        cmd = process.execPath;
+        cmd = resolveBunRuntimeExecutable();
         args = ['--no-env-file', 'run', scriptDef.path];
       }
     }
@@ -5851,3 +5852,30 @@ export const executeDagWorkflow: typeof executeDagWorkflowInternal = (...args) =
     executeDagWorkflowInternal({ ...deps, isRunLeaseValid }, ...executionArgs)
   );
 };
+interface BunRuntimeResolutionOptions {
+  readonly execPath?: string;
+  readonly platform?: NodeJS.Platform;
+  readonly which?: (name: string) => string | null;
+  readonly exists?: (path: string) => boolean;
+}
+
+/** Resolve a real Bun CLI, never the compiled Archon executable or a Windows shell shim. */
+export function resolveBunRuntimeExecutable(options: BunRuntimeResolutionOptions = {}): string {
+  const execPath = options.execPath ?? process.execPath;
+  const platform = options.platform ?? process.platform;
+  const which = options.which ?? ((name: string): string | null => Bun.which(name));
+  const exists = options.exists ?? existsSync;
+  const execName = basename(execPath).toLowerCase();
+  if (execName === 'bun' || execName === 'bun.exe') return execPath;
+
+  const discovered = which('bun');
+  if (!discovered) throw new Error('bun_runtime_executable_unavailable');
+  const discoveredName = basename(discovered).toLowerCase();
+  if (platform !== 'win32' || (discoveredName !== 'bun.cmd' && discoveredName !== 'bun.ps1')) {
+    return discovered;
+  }
+
+  const npmNative = join(dirname(discovered), 'node_modules', 'bun', 'bin', 'bun.exe');
+  if (exists(npmNative)) return npmNative;
+  throw new Error(`bun_runtime_executable_unavailable: shell shim ${discovered}`);
+}

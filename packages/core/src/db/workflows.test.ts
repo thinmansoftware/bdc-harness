@@ -1888,6 +1888,58 @@ describe('Smart Cauldron reliability persistence', () => {
     }
   });
 
+  test('treats SQLite reservation lock contention as a lost race', async () => {
+    const busy = Object.assign(new Error('database is locked'), {
+      code: 'SQLITE_BUSY_SNAPSHOT',
+    });
+    activeDatabase = {
+      dialect: 'sqlite',
+      sql: mockPostgresDialect,
+      withTransaction: mock(async () => {
+        throw busy;
+      }),
+    };
+
+    await expect(
+      reserveSupervisorAction({
+        actionId: 'dddddddd-dddd-4ddd-8ddd-dddddddddddd',
+        incidentId: '99999999-9999-4999-8999-999999999999',
+        ownerId: 'sol',
+        fencingToken: 1,
+        actionType: 'repair_or_refire',
+        outcome: 'reserved',
+        evidenceRefs: [],
+        createdAt: '2026-07-10T12:01:05.000Z',
+      })
+    ).resolves.toBe(false);
+  });
+
+  test('does not hide unrelated SQLite reservation integrity failures', async () => {
+    const foreignKey = Object.assign(new Error('foreign key constraint failed'), {
+      code: 'SQLITE_CONSTRAINT_FOREIGNKEY',
+    });
+    activeDatabase = {
+      dialect: 'sqlite',
+      sql: mockPostgresDialect,
+      withTransaction: mock(async () => {
+        throw foreignKey;
+      }),
+    };
+
+    await expect(
+      reserveSupervisorAction({
+        actionId: 'dddddddd-dddd-4ddd-8ddd-dddddddddddd',
+        incidentId: '99999999-9999-4999-8999-999999999999',
+        ownerId: 'sol',
+        fencingToken: 1,
+        actionType: 'repair_or_refire',
+        outcome: 'reserved',
+        evidenceRefs: [],
+        createdAt: '2026-07-10T12:01:05.000Z',
+      })
+    ).rejects.toBe(foreignKey);
+  });
+
   test('coordinates simultaneous supervisors with fenced expiry takeover on SQLite', async () => {
     const dbPath = join(
       import.meta.dir,
@@ -2017,6 +2069,30 @@ describe('Smart Cauldron reliability persistence', () => {
           createdAt: '2026-07-10T12:01:05.000Z',
         })
       ).resolves.toBe(false);
+      await sqlite.query(
+        `UPDATE remote_agent_supervisor_repair_leases
+         SET expires_at = '2000-01-01T00:00:00.000Z'
+         WHERE incident_id = $1`,
+        [incident.incidentId]
+      );
+      await expect(
+        finalizeSupervisorAction({
+          actionId: 'dddddddd-dddd-4ddd-8ddd-dddddddddddd',
+          incidentId: incident.incidentId,
+          ownerId: takeoverOwner,
+          fencingToken: 2,
+          status: 'completed',
+          outcome: 'must-not-close-after-expiry',
+          evidenceRefs: [],
+          completedAt: '2026-07-10T12:01:05.000Z',
+        })
+      ).resolves.toBe(false);
+      await sqlite.query(
+        `UPDATE remote_agent_supervisor_repair_leases
+         SET expires_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '+60 seconds')
+         WHERE incident_id = $1`,
+        [incident.incidentId]
+      );
       await expect(
         finalizeSupervisorAction({
           actionId: 'dddddddd-dddd-4ddd-8ddd-dddddddddddd',

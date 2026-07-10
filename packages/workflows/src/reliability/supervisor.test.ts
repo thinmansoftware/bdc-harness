@@ -130,5 +130,53 @@ describe('dual supervisor recovery coordination', () => {
 
     expect(repair).not.toHaveBeenCalled();
     expect(result.repaired).toBe(false);
+    expect(store.releaseSupervisorRepairLease).toHaveBeenCalledTimes(1);
+  });
+
+  test('releases the lease when repair succeeds but fenced finalization loses', async () => {
+    const { store } = makeSupervisorStore();
+    (store.finalizeSupervisorAction as ReturnType<typeof mock>).mockResolvedValue(false);
+
+    const result = await coordinateSupervisorRecovery(store, {
+      incident,
+      supervisors: [
+        {
+          supervisorId: 'sol',
+          observe: async () => ({ assessment: 'repairable', evidenceRefs: [] }),
+        },
+      ],
+      acquiredAt: '2026-07-10T12:00:01.000Z',
+      expiresAt: '2026-07-10T12:01:01.000Z',
+      actionType: 'repair_or_refire',
+      repair: async () => ({ assessment: 'repaired', evidenceRefs: [] }),
+    });
+
+    expect(result.repaired).toBe(false);
+    expect(store.releaseSupervisorRepairLease).toHaveBeenCalledTimes(1);
+  });
+
+  test('does not replace a repair failure when best-effort lease release also fails', async () => {
+    const { store } = makeSupervisorStore();
+    (store.releaseSupervisorRepairLease as ReturnType<typeof mock>).mockRejectedValue(
+      new Error('release unavailable')
+    );
+
+    await expect(
+      coordinateSupervisorRecovery(store, {
+        incident,
+        supervisors: [
+          {
+            supervisorId: 'sol',
+            observe: async () => ({ assessment: 'repairable', evidenceRefs: [] }),
+          },
+        ],
+        acquiredAt: '2026-07-10T12:00:01.000Z',
+        expiresAt: '2026-07-10T12:01:01.000Z',
+        actionType: 'repair_or_refire',
+        repair: async () => {
+          throw new Error('repair failed');
+        },
+      })
+    ).rejects.toThrow('repair failed');
   });
 });

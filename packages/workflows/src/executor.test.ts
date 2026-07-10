@@ -480,6 +480,125 @@ describe('executeWorkflow', () => {
         await rm(cwd, { recursive: true, force: true });
       }
     });
+
+    it('uses a caller-supplied frozen source without fetching it again', async () => {
+      const cwd = await mkdtemp(join(tmpdir(), 'executor-supplied-authority-'));
+      try {
+        const createAuthority = mock(async () => 'created' as const);
+        const store = makeStore({ createRunAuthority: createAuthority });
+        const deps = makeDeps(store);
+        const freezeWorkOrderSource = mock(async () => {
+          throw new Error('must not refetch caller-supplied authority');
+        });
+        deps.freezeWorkOrderSource = freezeWorkOrderSource;
+        mockGetRemoteUrl.mockImplementationOnce(
+          async () => 'https://github.com/bluedevilcollectibles/example.git'
+        );
+        mockExecFileAsync.mockImplementation(async (_command, args) => {
+          const values = args as string[];
+          if (values.includes('symbolic-ref')) {
+            return { stdout: 'archon/thread-test\n', stderr: '' };
+          }
+          return { stdout: `${'b'.repeat(40)}\n`, stderr: '' };
+        });
+
+        const result = await executeWorkflow(
+          deps,
+          makePlatform(),
+          'conv-1',
+          cwd,
+          makeWorkflow({
+            run_authority: {
+              required: true,
+              spec_repository: 'bluedevilcollectibles/bdc-xo',
+              spec_revision: 'main',
+              spec_paths: ['docs/work-orders/{WO_ID}.md'],
+            },
+          }),
+          'WO-TEST-01',
+          'db-conv-1',
+          'codebase-1',
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          {
+            dispatchId: 'dispatch-frozen',
+            woId: 'WO-TEST-01',
+            specSource: 'github:bluedevilcollectibles/bdc-xo:docs/work-orders/WO-TEST-01.md',
+            specRevision: 'a'.repeat(40),
+            specBytes: Buffer.from('# Exact\n', 'utf8'),
+          }
+        );
+
+        expect(result.success).toBe(true);
+        expect(freezeWorkOrderSource).not.toHaveBeenCalled();
+        expect(createAuthority.mock.calls[0]?.[0]?.dispatchId).toBe('dispatch-frozen');
+      } finally {
+        await rm(cwd, { recursive: true, force: true });
+      }
+    });
+
+    it('reuses persisted authority when resuming a failed run', async () => {
+      const resumedRun = makeRun({ id: 'run-resumed', status: 'failed' });
+      const createAuthority = mock(async () => 'created' as const);
+      const persistedAuthority = {
+        runId: resumedRun.id,
+        dispatchId: 'dispatch-original',
+        woId: 'WO-TEST-01',
+        specSource: 'github:bluedevilcollectibles/bdc-xo:docs/work-orders/WO-TEST-01.md',
+        specRevision: 'a'.repeat(40),
+        specHash: `sha256:${'1'.repeat(64)}`,
+        workflowName: 'test-workflow',
+        codebaseId: 'codebase-1',
+        canonicalRemote: 'https://github.com/bluedevilcollectibles/example.git',
+        baseBranch: 'main',
+        baseSha: 'b'.repeat(40),
+        runScopeSha: 'c'.repeat(40),
+        headBranch: 'archon/thread-test',
+        worktreePath: '/tmp',
+        workflowRevision: `sha256:${'2'.repeat(64)}`,
+        bundleRevision: `sha256:${'3'.repeat(64)}`,
+        engineRevision: `sha256:${'4'.repeat(64)}`,
+        runtimeImageRevision: null,
+        createdAt: '2026-07-10T12:00:00.000Z',
+      };
+      const store = makeStore({
+        findResumableRun: mock(async () => resumedRun),
+        getCompletedDagNodeOutputs: mock(async () => new Map([['node0', 'done']])),
+        resumeWorkflowRun: mock(async () => ({ ...resumedRun, status: 'running' })),
+        getRunAuthority: mock(async () => persistedAuthority),
+        createRunAuthority: createAuthority,
+      });
+      const deps = makeDeps(store);
+      const freezeWorkOrderSource = mock(async () => {
+        throw new Error('must not refetch persisted authority');
+      });
+      deps.freezeWorkOrderSource = freezeWorkOrderSource;
+
+      const result = await executeWorkflow(
+        deps,
+        makePlatform(),
+        'conv-1',
+        '/tmp',
+        makeWorkflow({
+          run_authority: {
+            required: true,
+            spec_repository: 'bluedevilcollectibles/bdc-xo',
+            spec_revision: 'main',
+            spec_paths: ['docs/work-orders/{WO_ID}.md'],
+          },
+        }),
+        'WO-TEST-01',
+        'db-conv-1',
+        'codebase-1'
+      );
+
+      expect(result.success).toBe(true);
+      expect(freezeWorkOrderSource).not.toHaveBeenCalled();
+      expect(createAuthority).not.toHaveBeenCalled();
+      expect(mockExecuteDagWorkflow).toHaveBeenCalledTimes(1);
+    });
   });
 
   // -------------------------------------------------------------------------
