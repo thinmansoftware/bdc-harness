@@ -38,6 +38,7 @@ interface NodeDef {
   id: string;
   provider?: string;
   model?: string;
+  bash?: string;
 }
 
 interface LaneDef {
@@ -45,6 +46,12 @@ interface LaneDef {
   provider?: string;
   model?: string;
   nodes?: NodeDef[];
+  run_authority?: {
+    required?: boolean;
+    spec_repository?: string;
+    spec_revision?: string;
+    spec_paths?: string[];
+  };
 }
 
 function loadLane(filename: string): LaneDef {
@@ -125,6 +132,22 @@ describe('lane registration and war-council-validator pin', () => {
         );
         expect(missing, `${file}:${node.id}:${provider}`).toEqual([]);
       }
+    });
+
+    it(`S4d: ${file} consumes the frozen work-order artifact`, () => {
+      const lane = loadLane(file);
+      expect(lane.run_authority).toEqual({
+        required: true,
+        spec_repository: 'bluedevilcollectibles/bdc-xo',
+        spec_revision: 'main',
+        spec_paths: ['docs/work-orders/{WO_ID}.md', 'docs/superpowers/specs/{WO_ID}.md'],
+      });
+      const readSpec = lane.nodes?.find(node => node.id === 'read-spec');
+      const authoritativePrefix = readSpec?.bash?.split('exit 0', 1)[0] ?? '';
+      expect(authoritativePrefix).toContain('run-authority.json');
+      expect(authoritativePrefix).toContain('work-order.md');
+      expect(authoritativePrefix).toContain('sha256sum');
+      expect(authoritativePrefix).toContain('cat "$AUTHORITY_SPEC"');
     });
   }
 });

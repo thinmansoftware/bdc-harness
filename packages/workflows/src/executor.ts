@@ -2,12 +2,13 @@
  * Workflow Executor - runs DAG-based workflows
  */
 import { mkdir, readFile } from 'fs/promises';
+import { createHash } from 'crypto';
 import { join, resolve } from 'path';
 import type { IWorkflowPlatform, WorkflowMessageMetadata } from './deps';
 import type { WorkflowDeps, WorkflowConfig } from './deps';
 import * as archonPaths from '@archon/paths';
 import { createLogger, captureWorkflowInvoked, BUNDLED_VERSION } from '@archon/paths';
-import { getDefaultBranch, getRemoteUrl, toRepoPath } from '@archon/git';
+import { execFileAsync, getDefaultBranch, getRemoteUrl, toRepoPath } from '@archon/git';
 import type { WorkflowDefinition, WorkflowRun, WorkflowExecutionResult } from './schemas';
 import { executeDagWorkflow } from './dag-executor';
 import { logWorkflowStart, logWorkflowError } from './logger';
@@ -17,6 +18,11 @@ import { isRegisteredProvider, getRegisteredProviders } from '@archon/providers'
 import { classifyError } from './executor-shared';
 import { BUNDLED_POLICIES } from './defaults/bundled-defaults';
 import { resolveEntryLane } from './router-dispatcher';
+import {
+  persistRunAuthority,
+  type RunAuthorityDispatch,
+  type RunAuthorityInput,
+} from './reliability/run-authority';
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
 let cachedLog: ReturnType<typeof createLogger> | undefined;
@@ -59,6 +65,62 @@ function logSendError(
 
 /** Threshold for consecutive UNKNOWN errors before aborting */
 const UNKNOWN_ERROR_THRESHOLD = 3;
+
+function sha256(value: string | Uint8Array): string {
+  return `sha256:${createHash('sha256').update(value).digest('hex')}`;
+}
+
+async function gitRevision(cwd: string, revision: string): Promise<string> {
+  const { stdout } = await execFileAsync(
+    'git',
+    ['-C', cwd, 'rev-parse', '--verify', `${revision}^{commit}`],
+    { timeout: 10000 }
+  );
+  const value = stdout.trim();
+  if (!value) throw new Error(`scope_authority_missing: git revision ${revision}`);
+  return value;
+}
+
+async function captureRunAuthorityInput(
+  cwd: string,
+  workflow: WorkflowDefinition,
+  workflowRun: WorkflowRun,
+  codebaseId: string | undefined,
+  baseBranch: string,
+  source: RunAuthorityDispatch
+): Promise<RunAuthorityInput> {
+  if (!codebaseId) throw new Error('scope_authority_missing: codebaseId');
+  if (!baseBranch) throw new Error('scope_authority_missing: baseBranch');
+  const canonicalRemote = await getRemoteUrl(toRepoPath(cwd));
+  if (!canonicalRemote) throw new Error('scope_authority_missing: canonicalRemote');
+  const { stdout: branchOutput } = await execFileAsync(
+    'git',
+    ['-C', cwd, 'symbolic-ref', '--quiet', '--short', 'HEAD'],
+    { timeout: 10000 }
+  );
+  const headBranch = branchOutput.trim();
+  if (!headBranch) throw new Error('scope_authority_missing: headBranch');
+  const workflowRevision = sha256(JSON.stringify(workflow));
+  const engineRevision = sha256(await readFile(new URL(import.meta.url)));
+
+  return {
+    ...source,
+    runId: workflowRun.id,
+    workflowName: workflow.name,
+    codebaseId,
+    canonicalRemote,
+    baseBranch,
+    baseSha: await gitRevision(cwd, `refs/remotes/origin/${baseBranch}`),
+    runScopeSha: await gitRevision(cwd, 'HEAD'),
+    headBranch,
+    worktreePath: resolve(cwd),
+    workflowRevision,
+    bundleRevision: sha256(JSON.stringify(BUNDLED_POLICIES)),
+    engineRevision,
+    runtimeImageRevision: process.env.ARCHON_RUNTIME_IMAGE_REVISION ?? null,
+    createdAt: new Date(parseDbTimestamp(workflowRun.started_at)).toISOString(),
+  };
+}
 
 /** Mutable counter for tracking consecutive unknown errors across calls */
 interface UnknownErrorTracker {
@@ -391,7 +453,8 @@ export async function executeWorkflow(
     prBranch?: string;
   },
   parentConversationId?: string,
-  preCreatedRun?: WorkflowRun
+  preCreatedRun?: WorkflowRun,
+  authoritySource?: RunAuthorityDispatch
 ): Promise<WorkflowExecutionResult> {
   // Load config once for the entire workflow execution
   const fileConfig = await deps.loadConfig(cwd);
@@ -804,6 +867,32 @@ export async function executeWorkflow(
 
   // Wrap execution in try-catch to ensure workflow is marked as failed on any error
   try {
+    if (workflow.run_authority?.required) {
+      if (authoritySource) {
+        const authorityInput = await captureRunAuthorityInput(
+          cwd,
+          workflow,
+          workflowRun,
+          codebaseId,
+          baseBranch,
+          authoritySource
+        );
+        await persistRunAuthority(deps.store, artifactsDir, authorityInput);
+      } else {
+        const existingAuthority = await deps.store.getRunAuthority(workflowRun.id);
+        if (!existingAuthority) {
+          throw new Error('scope_authority_missing: frozen dispatch source');
+        }
+        if (
+          existingAuthority.workflowName !== workflow.name ||
+          existingAuthority.codebaseId !== codebaseId ||
+          resolve(existingAuthority.worktreePath) !== resolve(cwd)
+        ) {
+          throw new Error(`authority_conflict: run ${workflowRun.id}`);
+        }
+      }
+    }
+
     // BDC patch: load policyFile if specified and inject as systemPrompt for all prompt nodes.
     const executableWorkflow = await applyWorkflowPolicyFile(workflow, cwd);
 

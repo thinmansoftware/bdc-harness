@@ -32,7 +32,9 @@ mock.module('@archon/paths', () => ({
 
 // --- Mock git ---
 const mockGetRemoteUrl = mock(async (): Promise<string | null> => null);
+const mockExecFileAsync = mock(async () => ({ stdout: '', stderr: '' }));
 mock.module('@archon/git', () => ({
+  execFileAsync: mockExecFileAsync,
   getDefaultBranch: mock(async () => 'main'),
   getRemoteUrl: mockGetRemoteUrl,
   toRepoPath: mock((p: string) => p),
@@ -89,6 +91,8 @@ function makeStore(overrides: Partial<IWorkflowStore> = {}): IWorkflowStore {
     resumeWorkflowRun: mock(async () => makeRun()),
     getCodebase: mock(async () => null),
     getCodebaseEnvVars: mock(async () => ({})),
+    createRunAuthority: mock(async () => 'created' as const),
+    getRunAuthority: mock(async () => null),
     ...overrides,
   };
 }
@@ -375,6 +379,108 @@ describe('executeWorkflow', () => {
       // Cleanup failure must not mask the "in use" outcome.
       expect(result.success).toBe(false);
       expect(result.error).toContain('already active');
+    });
+  });
+
+  describe('run authority', () => {
+    it('fails closed before DAG execution when a required frozen source is missing', async () => {
+      const failSpy = mock(async () => {});
+      const store = makeStore({ failWorkflowRun: failSpy });
+      const result = await executeWorkflow(
+        makeDeps(store),
+        makePlatform(),
+        'conv-1',
+        '/tmp',
+        makeWorkflow({
+          run_authority: {
+            required: true,
+            spec_repository: 'bluedevilcollectibles/bdc-xo',
+            spec_revision: 'main',
+            spec_paths: ['docs/work-orders/{WO_ID}.md'],
+          },
+        }),
+        'WO-TEST-01',
+        'db-conv-1',
+        'codebase-1'
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.error).toContain('scope_authority_missing');
+      expect(mockExecuteDagWorkflow).not.toHaveBeenCalled();
+      expect(failSpy).toHaveBeenCalled();
+    });
+
+    it('persists immutable repository facts before starting the DAG', async () => {
+      const cwd = await mkdtemp(join(tmpdir(), 'executor-authority-'));
+      try {
+        const createAuthority = mock(async () => 'created' as const);
+        const store = makeStore({ createRunAuthority: createAuthority });
+        const deps = makeDeps(store);
+        deps.loadConfig = mock(async () => ({
+          assistant: 'claude',
+          assistants: { claude: {}, codex: {} },
+          baseBranch: 'main',
+          commands: { folder: '' },
+        })) as WorkflowDeps['loadConfig'];
+        mockGetRemoteUrl.mockImplementationOnce(
+          async () => 'https://github.com/bluedevilcollectibles/example.git'
+        );
+        mockExecFileAsync.mockImplementation(async (_command, args) => {
+          const values = args as string[];
+          if (values.includes('symbolic-ref')) {
+            return { stdout: 'archon/thread-test\n', stderr: '' };
+          }
+          if (values.includes('rev-parse')) {
+            const revision = values.at(-1) ?? '';
+            return {
+              stdout: revision.startsWith('refs/remotes/origin/main')
+                ? `${'b'.repeat(40)}\n`
+                : `${'c'.repeat(40)}\n`,
+              stderr: '',
+            };
+          }
+          return { stdout: '', stderr: '' };
+        });
+
+        const result = await executeWorkflow(
+          deps,
+          makePlatform(),
+          'conv-1',
+          cwd,
+          makeWorkflow({
+            run_authority: {
+              required: true,
+              spec_repository: 'bluedevilcollectibles/bdc-xo',
+              spec_revision: 'main',
+              spec_paths: ['docs/work-orders/{WO_ID}.md'],
+            },
+          }),
+          'WO-TEST-01',
+          'db-conv-1',
+          'codebase-1',
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          {
+            dispatchId: 'dispatch-1',
+            woId: 'WO-TEST-01',
+            specSource: 'github:bluedevilcollectibles/bdc-xo:docs/work-orders/WO-TEST-01.md',
+            specRevision: 'a'.repeat(40),
+            specBytes: Buffer.from('# Exact\n', 'utf8'),
+          }
+        );
+
+        expect(result).toEqual({ success: true, workflowRunId: 'run-123', summary: undefined });
+        expect(createAuthority).toHaveBeenCalledTimes(1);
+        const authority = createAuthority.mock.calls[0]?.[0];
+        expect(authority?.baseSha).toBe('b'.repeat(40));
+        expect(authority?.runScopeSha).toBe('c'.repeat(40));
+        expect(authority?.headBranch).toBe('archon/thread-test');
+        expect(mockExecuteDagWorkflow).toHaveBeenCalledTimes(1);
+      } finally {
+        await rm(cwd, { recursive: true, force: true });
+      }
     });
   });
 

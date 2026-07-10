@@ -7,6 +7,13 @@ description: |
   fall through to Anthropic SDK.
 
 policyFile: harness/policies/agent-behavior.md
+run_authority:
+  required: true
+  spec_repository: bluedevilcollectibles/bdc-xo
+  spec_revision: main
+  spec_paths:
+    - docs/work-orders/{WO_ID}.md
+    - docs/superpowers/specs/{WO_ID}.md
 provider: opr  # root: bare AI tails use OpenRouter, not Codex/Claude (Codex exhausted 2026-07-09)
 model: x-ai/grok-4.5  # Grok substitute for prior root gpt-5.5/Codex default
 
@@ -32,6 +39,22 @@ nodes:
     depends_on: [preflight-github-auth]
     bash: |
       set -euo pipefail
+      AUTHORITY_DIR="$ARTIFACTS_DIR/authority"
+      AUTHORITY_MANIFEST="$AUTHORITY_DIR/run-authority.json"
+      AUTHORITY_SPEC="$AUTHORITY_DIR/work-order.md"
+      [ -s "$AUTHORITY_MANIFEST" ] || { echo "scope_authority_missing: run-authority.json" >&2; exit 1; }
+      [ -s "$AUTHORITY_SPEC" ] || { echo "scope_authority_missing: work-order.md" >&2; exit 1; }
+      WO_ID=$(jq -er '.woId' "$AUTHORITY_MANIFEST")
+      SPEC_PATH=$(jq -er '.specSource' "$AUTHORITY_MANIFEST")
+      SPEC_REVISION=$(jq -er '.specRevision' "$AUTHORITY_MANIFEST")
+      EXPECTED_HASH=$(jq -er '.specHash' "$AUTHORITY_MANIFEST")
+      ACTUAL_HASH="sha256:$(sha256sum "$AUTHORITY_SPEC" | awk '{print $1}')"
+      [ "$ACTUAL_HASH" = "$EXPECTED_HASH" ] || { echo "authority_conflict: work-order.md hash mismatch" >&2; exit 1; }
+      RUN_START_SHA=$(git rev-parse --verify 'HEAD^{commit}') || { echo "scope_authority_missing: HEAD" >&2; exit 1; }
+      printf '%s\n' "$RUN_START_SHA" > "$ARTIFACTS_DIR/run-start-sha.txt"
+      printf 'WO_ID=%s\nSPEC_PATH=%s\nSPEC_REVISION=%s\nSPEC_HASH=%s\nRUN_START_SHA=%s\n\n' "$WO_ID" "$SPEC_PATH" "$SPEC_REVISION" "$EXPECTED_HASH" "$RUN_START_SHA"
+      cat "$AUTHORITY_SPEC"
+      exit 0
       WO_ID="${WO_ID:-}"
       if [ -z "$WO_ID" ]; then
         WO_ID=$(printf '%s\n' "$USER_MESSAGE" | grep -Eo 'WO-[A-Z0-9-]+' | head -n 1 || true)
