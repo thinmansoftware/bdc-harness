@@ -55,6 +55,77 @@ function getLog(): ReturnType<typeof createLogger> {
  */
 const GIT_OPERATION_TIMEOUT_MS = 5 * 60 * 1000;
 
+interface WorktreeIdentityRecord {
+  version: 1;
+  worktreePath: string;
+  canonicalRepoPath: string;
+  branchName: string;
+  codebaseId: string;
+  workflowType: IsolationRequest['workflowType'];
+  identifier: string;
+  requestFingerprint: string;
+}
+
+function requestFingerprint(request: IsolationRequest): string {
+  const authority = {
+    codebaseId: request.codebaseId,
+    workflowType: request.workflowType,
+    identifier: request.identifier,
+    ...('prBranch' in request ? { prBranch: request.prBranch } : {}),
+    ...('prSha' in request ? { prSha: request.prSha ?? null } : {}),
+    ...('isForkPR' in request ? { isForkPR: request.isForkPR } : {}),
+    ...('fromBranch' in request ? { fromBranch: request.fromBranch ?? null } : {}),
+  };
+  return createHash('sha256').update(JSON.stringify(authority)).digest('hex');
+}
+
+function buildWorktreeIdentity(
+  request: IsolationRequest,
+  worktreePath: string,
+  branchName: string
+): WorktreeIdentityRecord {
+  return {
+    version: 1,
+    worktreePath: resolve(worktreePath),
+    canonicalRepoPath: resolve(request.canonicalRepoPath),
+    branchName,
+    codebaseId: request.codebaseId,
+    workflowType: request.workflowType,
+    identifier: request.identifier,
+    requestFingerprint: requestFingerprint(request),
+  };
+}
+
+function identityConfigKey(worktreePath: string): string {
+  const pathHash = createHash('sha256').update(resolve(worktreePath)).digest('hex').slice(0, 24);
+  return `archon.worktreeIdentity-${pathHash}.record`;
+}
+
+function identitiesEqual(left: WorktreeIdentityRecord, right: WorktreeIdentityRecord): boolean {
+  return (
+    left.version === right.version &&
+    left.worktreePath === right.worktreePath &&
+    left.canonicalRepoPath === right.canonicalRepoPath &&
+    left.branchName === right.branchName &&
+    left.codebaseId === right.codebaseId &&
+    left.workflowType === right.workflowType &&
+    left.identifier === right.identifier &&
+    left.requestFingerprint === right.requestFingerprint
+  );
+}
+
+function isBranchAlreadyExists(error: Error & { stderr?: string }): boolean {
+  const message = error.stderr ?? error.message;
+  return (
+    /branch(?: named)? .+ already exists/i.test(message) ||
+    /refs\/heads\/.+reference already exists/i.test(message)
+  );
+}
+
+function isWorktreePathCollision(error: Error & { stderr?: string }): boolean {
+  return /destination path .*(?:already exists|is not empty)/i.test(error.stderr ?? error.message);
+}
+
 /**
  * Validate a user-supplied `worktree.path` from `.archon/config.yaml` and return
  * it as a safe relative path for `getWorktreeBase()`, or `undefined` to fall
@@ -152,6 +223,7 @@ export class WorktreeProvider implements IIsolationProvider {
 
     // Create new worktree (re-uses the already-loaded repoConfig -- no double load).
     const { warnings } = await this.createWorktree(request, worktreePath, branchName, repoConfig);
+    await this.writeWorktreeIdentity(request, worktreePath, branchName);
 
     return {
       id: envId,
@@ -616,6 +688,7 @@ export class WorktreeProvider implements IIsolationProvider {
       // a confusing "branch already exists" cascade) or silently adopting.
       try {
         await verifyWorktreeOwnership(toWorktreePath(worktreePath), request.canonicalRepoPath);
+        await this.verifyWorktreeIdentity(request, worktreePath, branchName);
       } catch (err) {
         getLog().warn(
           {
@@ -646,6 +719,7 @@ export class WorktreeProvider implements IIsolationProvider {
         // clone of the same remote.
         try {
           await verifyWorktreeOwnership(existingByBranch, request.canonicalRepoPath);
+          await this.verifyWorktreeIdentity(request, existingByBranch, request.prBranch);
         } catch (err) {
           getLog().warn(
             {
@@ -669,6 +743,92 @@ export class WorktreeProvider implements IIsolationProvider {
     }
 
     return null;
+  }
+
+  private async readWorktreeIdentity(
+    canonicalRepoPath: string,
+    worktreePath: string
+  ): Promise<WorktreeIdentityRecord | null> {
+    const key = identityConfigKey(worktreePath);
+    let stdout: string;
+    try {
+      ({ stdout } = await execFileAsync(
+        'git',
+        ['-C', canonicalRepoPath, 'config', '--local', '--get', key],
+        { timeout: GIT_OPERATION_TIMEOUT_MS }
+      ));
+    } catch (error) {
+      const err = error as Error & { code?: number | string };
+      if (err.code === 1 || err.code === '1') {
+        return null;
+      }
+      throw new Error(
+        `Cannot read authoritative worktree identity for ${worktreePath}: ${err.message}`
+      );
+    }
+    const encoded = stdout.trim();
+    if (!encoded) return null;
+    try {
+      const parsed = JSON.parse(
+        Buffer.from(encoded, 'base64url').toString('utf8')
+      ) as Partial<WorktreeIdentityRecord>;
+      if (
+        parsed.version !== 1 ||
+        typeof parsed.worktreePath !== 'string' ||
+        typeof parsed.canonicalRepoPath !== 'string' ||
+        typeof parsed.branchName !== 'string' ||
+        typeof parsed.codebaseId !== 'string' ||
+        typeof parsed.workflowType !== 'string' ||
+        typeof parsed.identifier !== 'string' ||
+        typeof parsed.requestFingerprint !== 'string'
+      ) {
+        throw new Error('identity record is incomplete');
+      }
+      return parsed as WorktreeIdentityRecord;
+    } catch (error) {
+      throw new Error(
+        `Invalid authoritative worktree identity for ${worktreePath}: ${(error as Error).message}`
+      );
+    }
+  }
+
+  private async verifyWorktreeIdentity(
+    request: IsolationRequest,
+    worktreePath: string,
+    branchName: string
+  ): Promise<void> {
+    const existing = await this.readWorktreeIdentity(request.canonicalRepoPath, worktreePath);
+    if (!existing) {
+      getLog().warn({ worktreePath, branchName }, 'worktree.identity_missing_legacy_adoption');
+      return;
+    }
+    const expected = buildWorktreeIdentity(request, worktreePath, branchName);
+    if (!identitiesEqual(existing, expected)) {
+      throw new Error(
+        `worktree_identity_conflict: ${worktreePath} belongs to a different authoritative request`
+      );
+    }
+  }
+
+  private async writeWorktreeIdentity(
+    request: IsolationRequest,
+    worktreePath: string,
+    branchName: string
+  ): Promise<void> {
+    const identity = buildWorktreeIdentity(request, worktreePath, branchName);
+    const encoded = Buffer.from(JSON.stringify(identity), 'utf8').toString('base64url');
+    await execFileAsync(
+      'git',
+      [
+        '-C',
+        request.canonicalRepoPath,
+        'config',
+        '--local',
+        identityConfigKey(worktreePath),
+        encoded,
+      ],
+      { timeout: GIT_OPERATION_TIMEOUT_MS }
+    );
   }
 
   private buildAdoptedEnvironment(
@@ -891,9 +1051,6 @@ export class WorktreeProvider implements IIsolationProvider {
    * commit (detached HEAD), then a local tracking branch is created.
    */
   private async createFromPR(request: PRIsolationRequest, worktreePath: string): Promise<void> {
-    // Clean up any orphan directory before creating worktree
-    await this.cleanOrphanDirectoryIfExists(worktreePath);
-
     const repoPath = request.canonicalRepoPath;
     const prNumber = request.identifier;
 
@@ -906,6 +1063,12 @@ export class WorktreeProvider implements IIsolationProvider {
         await this.createFromForkPR(repoPath, worktreePath, prNumber, request.prSha);
       }
     } catch (error) {
+      const cause = error as Error & { stderr?: string };
+      if (isWorktreePathCollision(cause)) {
+        throw new Error(
+          `worktree_path_collision: ${worktreePath} is occupied; refusing to delete or adopt it`
+        );
+      }
       // Clean up orphaned git-registered worktree from partial failure
       // (e.g., worktree add succeeded but createBranchWithStaleRetry failed)
       await this.cleanOrphanWorktreeIfExists(repoPath, worktreePath);
@@ -938,7 +1101,7 @@ export class WorktreeProvider implements IIsolationProvider {
     } catch (error) {
       const err = error as Error & { stderr?: string };
       // Branch already exists locally - use it directly
-      if (err.stderr?.includes('already exists')) {
+      if (isBranchAlreadyExists(err)) {
         await execFileAsync('git', ['-C', repoPath, 'worktree', 'add', worktreePath, prBranch], {
           timeout: GIT_OPERATION_TIMEOUT_MS,
         });
@@ -963,8 +1126,7 @@ export class WorktreeProvider implements IIsolationProvider {
   /**
    * Create worktree for fork PR using synthetic review branch
    *
-   * Handles stale branches: If a branch already exists from a previous worktree
-   * that was deleted, we delete the stale branch and retry.
+   * Existing synthetic branches are treated as authority collisions and never deleted.
    */
   private async createFromForkPR(
     repoPath: string,
@@ -986,7 +1148,6 @@ export class WorktreeProvider implements IIsolationProvider {
 
       // Create a local tracking branch so it's not detached HEAD
       await this.createBranchWithStaleRetry(
-        repoPath,
         () =>
           execFileAsync('git', ['-C', worktreePath, 'checkout', '-b', reviewBranch, prSha], {
             timeout: GIT_OPERATION_TIMEOUT_MS,
@@ -996,7 +1157,6 @@ export class WorktreeProvider implements IIsolationProvider {
     } else {
       // No SHA: fetch and create review branch
       await this.createBranchWithStaleRetry(
-        repoPath,
         () =>
           execFileAsync(
             'git',
@@ -1013,11 +1173,9 @@ export class WorktreeProvider implements IIsolationProvider {
   }
 
   /**
-   * Execute a git command that creates a branch, with retry logic for stale branches.
-   * If the branch already exists, delete it and retry the command.
+   * Execute a git command that creates a branch without deleting a collision.
    */
   private async createBranchWithStaleRetry(
-    repoPath: string,
     createCommand: () => Promise<{ stdout: string; stderr: string }>,
     branchName: string
   ): Promise<void> {
@@ -1025,12 +1183,10 @@ export class WorktreeProvider implements IIsolationProvider {
       await createCommand();
     } catch (error) {
       const err = error as Error & { stderr?: string };
-      if (err.stderr?.includes('already exists')) {
-        getLog().debug({ repoPath, branchName }, 'stale_branch_retry');
-        await execFileAsync('git', ['-C', repoPath, 'branch', '-D', branchName], {
-          timeout: GIT_OPERATION_TIMEOUT_MS,
-        });
-        await createCommand();
+      if (isBranchAlreadyExists(err)) {
+        throw new Error(
+          `branch_identity_conflict: branch "${branchName}" already exists; refusing to delete or reset it`
+        );
       } else {
         throw error;
       }
@@ -1047,9 +1203,6 @@ export class WorktreeProvider implements IIsolationProvider {
     branchName: string,
     baseBranch: string
   ): Promise<void> {
-    // Clean up any orphan directory before creating worktree
-    await this.cleanOrphanDirectoryIfExists(worktreePath);
-
     // Determine start-point: explicit fromBranch overrides base branch
     const startPoint =
       request.workflowType === 'task' && request.fromBranch
@@ -1067,8 +1220,13 @@ export class WorktreeProvider implements IIsolationProvider {
       );
     } catch (error) {
       const err = error as Error & { stderr?: string };
-      // Branch already exists - reset to intended start-point and use it
-      if (err.stderr?.includes('already exists')) {
+      if (isWorktreePathCollision(err)) {
+        throw new Error(
+          `worktree_path_collision: ${worktreePath} is occupied; refusing to delete or adopt it`
+        );
+      }
+      // Branch collisions are never reset or adopted implicitly.
+      if (isBranchAlreadyExists(err)) {
         const taskFromBranch = request.workflowType === 'task' ? request.fromBranch : undefined;
         if (taskFromBranch) {
           // Branch already exists but caller specified an explicit start point.
@@ -1079,19 +1237,9 @@ export class WorktreeProvider implements IIsolationProvider {
           );
         }
 
-        // Branch exists but no explicit start-point override -- reset it to the
-        // intended start-point before checking out, so we don't inherit stale
-        // commits from a previous run or external tool.
-        getLog().warn(
-          { branchName, startPoint, repoPath },
-          'worktree.branch_exists_resetting_to_start_point'
+        throw new Error(
+          `branch_identity_conflict: branch "${branchName}" already exists; refusing to reset or adopt it`
         );
-        await execFileAsync('git', ['-C', repoPath, 'branch', '-f', branchName, startPoint], {
-          timeout: 10000,
-        });
-        await execFileAsync('git', ['-C', repoPath, 'worktree', 'add', worktreePath, branchName], {
-          timeout: GIT_OPERATION_TIMEOUT_MS,
-        });
       } else {
         throw error;
       }
@@ -1154,34 +1302,6 @@ export class WorktreeProvider implements IIsolationProvider {
       throw new Error(
         `Failed to check directory at ${path}: ${err.message} (code: ${err.code ?? 'unknown'})`
       );
-    }
-  }
-
-  /**
-   * Clean up an orphan directory if it exists but is not a valid worktree.
-   * An orphan directory can occur when git worktree remove succeeds but leaves
-   * untracked files (like .archon/) behind.
-   */
-  private async cleanOrphanDirectoryIfExists(worktreePath: string): Promise<void> {
-    const dirExists = await this.directoryExists(worktreePath);
-    if (!dirExists) {
-      return;
-    }
-
-    const isValidWorktree = await worktreeExists(toWorktreePath(worktreePath));
-    if (isValidWorktree) {
-      return; // Not an orphan - it's a valid worktree
-    }
-
-    // Orphan directory - remove it before creating worktree
-    getLog().debug({ worktreePath }, 'orphan_directory_cleaning');
-    try {
-      await rm(worktreePath, { recursive: true, force: true });
-      getLog().debug({ worktreePath }, 'isolation.orphan_directory_removed');
-    } catch (error) {
-      const err = error as NodeJS.ErrnoException;
-      // Provide context for the error - orphan cleanup is critical for worktree creation
-      throw new Error(`Failed to clean orphan directory at ${worktreePath}: ${err.message}`);
     }
   }
 
