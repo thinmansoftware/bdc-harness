@@ -138,7 +138,12 @@ import {
   codebaseEnvironmentsResponseSchema,
 } from './schemas/config.schemas';
 import { providerListResponseSchema } from './schemas/provider.schemas';
-import { throttleBodySchema, throttleResponseSchema } from './schemas/admin.schemas';
+import {
+  drainBodySchema,
+  drainResponseSchema,
+  throttleBodySchema,
+  throttleResponseSchema,
+} from './schemas/admin.schemas';
 import { getProviderInfoList, isRegisteredProvider } from '@archon/providers';
 import { claudeProviderThrottle } from '@archon/providers/claude/throttle';
 
@@ -357,6 +362,7 @@ const createConversationRoute = createRoute({
     },
     400: jsonError('Bad request'),
     500: jsonError('Server error'),
+    503: jsonError('Cauldron draining'),
   },
 });
 
@@ -440,6 +446,7 @@ const sendMessageRoute = createRoute({
     },
     400: jsonError('Bad request'),
     500: jsonError('Server error'),
+    503: jsonError('Cauldron draining'),
   },
 });
 
@@ -593,6 +600,7 @@ const runWorkflowRoute = createRoute({
     },
     400: jsonError('Bad request'),
     500: jsonError('Server error'),
+    503: jsonError('Cauldron draining'),
   },
 });
 
@@ -788,6 +796,38 @@ const getAdminThrottleRoute = createRoute({
     200: {
       content: { 'application/json': { schema: throttleResponseSchema } },
       description: 'Current throttle state',
+    },
+    500: jsonError('Server error'),
+  },
+});
+
+const adminDrainRoute = createRoute({
+  method: 'post',
+  path: '/api/admin/drain',
+  tags: ['Admin'],
+  summary: 'Enable or disable durable Cauldron drain mode',
+  request: {
+    body: { content: { 'application/json': { schema: drainBodySchema } } },
+  },
+  responses: {
+    200: {
+      content: { 'application/json': { schema: drainResponseSchema } },
+      description: 'Drain state updated',
+    },
+    400: jsonError('Bad request'),
+    500: jsonError('Server error'),
+  },
+});
+
+const getAdminDrainRoute = createRoute({
+  method: 'get',
+  path: '/api/admin/drain',
+  tags: ['Admin'],
+  summary: 'Read durable Cauldron drain mode and active work',
+  responses: {
+    200: {
+      content: { 'application/json': { schema: drainResponseSchema } },
+      description: 'Current drain state',
     },
     500: jsonError('Server error'),
   },
@@ -1205,6 +1245,17 @@ export function registerApiRoutes(
     detail?: string
   ): Response {
     return c.json({ error: message, ...(detail ? { detail } : {}) }, status);
+  }
+
+  async function rejectNewDispatchIfDraining(c: Context): Promise<Response | null> {
+    const drain = await workflowDb.getCauldronDrainState();
+    if (drain.mode !== 'draining') return null;
+    return apiError(
+      c,
+      503,
+      'Cauldron is draining; new dispatch is disabled',
+      `active_leases=${String(drain.activeLeaseCount)} active_runs=${String(drain.activeRunCount)}`
+    );
   }
 
   /**
@@ -1874,6 +1925,11 @@ export function registerApiRoutes(
     try {
       const { codebaseId, message } = getValidatedBody(c, createConversationBodySchema);
 
+      if (message) {
+        const drainRejection = await rejectNewDispatchIfDraining(c);
+        if (drainRejection) return drainRejection;
+      }
+
       // Validate codebase exists if provided
       if (codebaseId) {
         const codebase = await codebaseDb.getCodebase(codebaseId);
@@ -2009,6 +2065,8 @@ export function registerApiRoutes(
   // POST /api/conversations/:id/message - Send message
   // Manual body parsing: multipart uses parseBody(), JSON uses req.json().
   registerOpenApiRoute(sendMessageRoute, async c => {
+    const drainRejection = await rejectNewDispatchIfDraining(c);
+    if (drainRejection) return drainRejection;
     const conversationId = c.req.param('id') ?? '';
 
     // Reject conversation IDs that could be used for path traversal when building
@@ -2568,6 +2626,8 @@ export function registerApiRoutes(
       return apiError(c, 400, 'Invalid workflow name');
     }
     try {
+      const drainRejection = await rejectNewDispatchIfDraining(c);
+      if (drainRejection) return drainRejection;
       const { conversationId, message } = getValidatedBody(c, runWorkflowBodySchema);
       // Persist user message and register DB ID (same as message endpoint).
       // /run callers may provide a fresh platform conversation id; create that
@@ -2817,6 +2877,37 @@ export function registerApiRoutes(
     } catch (error) {
       getLog().error({ err: error }, 'admin_throttle_api_failed');
       return apiError(c, 500, 'Failed to update throttle state');
+    }
+  });
+
+  registerOpenApiRoute(getAdminDrainRoute, async c => {
+    try {
+      const state = await workflowDb.getCauldronDrainState();
+      return c.json({ success: true, ...state });
+    } catch (error) {
+      getLog().error({ err: error }, 'get_admin_drain_api_failed');
+      return apiError(c, 500, 'Failed to read drain state');
+    }
+  });
+
+  registerOpenApiRoute(adminDrainRoute, async c => {
+    try {
+      const body = getValidatedBody(c, drainBodySchema);
+      const mode = body.draining ? 'draining' : 'normal';
+      const actor =
+        c.req.header('cf-access-authenticated-user-email')?.trim().toLowerCase() ?? 'operator';
+      const updatedAt = new Date().toISOString();
+      const transition = await workflowDb.setCauldronDrainMode({
+        mode,
+        actor,
+        reason: body.reason ?? null,
+        updatedAt,
+      });
+      const state = await workflowDb.getCauldronDrainState(updatedAt);
+      return c.json({ success: true, changed: transition.changed, ...state });
+    } catch (error) {
+      getLog().error({ err: error }, 'admin_drain_api_failed');
+      return apiError(c, 500, 'Failed to update drain state');
     }
   });
 

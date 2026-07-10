@@ -72,6 +72,8 @@ import {
   cancelProviderWaits,
   completeProviderWait,
   reconcileTerminalWorkflowRuns,
+  getCauldronDrainState,
+  setCauldronDrainMode,
 } from './workflows';
 
 describe('workflows database', () => {
@@ -1799,5 +1801,158 @@ describe('Smart Cauldron reliability persistence', () => {
     );
     expect(updates).toHaveLength(2);
     expect(updates.map(call => (call[1] as unknown[])[0]).sort()).toEqual(['completed', 'failed']);
+  });
+});
+
+describe('Cauldron drain mode', () => {
+  beforeEach(() => {
+    mockQuery.mockReset();
+    mockQuery.mockImplementation(() => Promise.resolve(createQueryResult([])));
+    mockTransactionQuery.mockReset();
+    mockTransactionQuery.mockImplementation(() => Promise.resolve(createQueryResult([])));
+    mockWithTransaction.mockClear();
+    activeDatabase = defaultMockDatabase;
+  });
+
+  test('reports durable mode, active leases and runs, and conservative drained state', async () => {
+    mockTransactionQuery
+      .mockResolvedValueOnce(createQueryResult([{ mode: 'draining', updated_at: 'now' }]))
+      .mockResolvedValueOnce(createQueryResult([{ active_lease_count: 0 }]))
+      .mockResolvedValueOnce(createQueryResult([{ active_run_count: 1 }]))
+      .mockResolvedValueOnce(createQueryResult([{ id: 'run-legacy' }]));
+
+    await expect(getCauldronDrainState('2026-07-09T20:00:00.000Z')).resolves.toEqual({
+      mode: 'draining',
+      activeLeaseCount: 0,
+      activeRunCount: 1,
+      activeRunIds: ['run-legacy'],
+      drained: false,
+      updatedAt: 'now',
+    });
+  });
+
+  test('changes drain mode and appends audit evidence atomically', async () => {
+    mockTransactionQuery
+      .mockResolvedValueOnce(createQueryResult([{ mode: 'normal' }], 1))
+      .mockResolvedValueOnce(createQueryResult([], 1))
+      .mockResolvedValueOnce(createQueryResult([], 1));
+
+    await expect(
+      setCauldronDrainMode({
+        mode: 'draining',
+        actor: 'operator',
+        reason: 'maintenance',
+        updatedAt: '2026-07-09T20:00:00.000Z',
+      })
+    ).resolves.toEqual({ changed: true, mode: 'draining' });
+    expect(mockTransactionQuery.mock.calls[1]?.[0]).toContain('remote_agent_cauldron_control');
+    expect(mockTransactionQuery.mock.calls[2]?.[0]).toContain(
+      'remote_agent_cauldron_control_events'
+    );
+  });
+
+  test('setting the current drain mode is idempotent and emits no duplicate audit row', async () => {
+    mockTransactionQuery.mockResolvedValueOnce(createQueryResult([{ mode: 'draining' }], 1));
+
+    await expect(
+      setCauldronDrainMode({
+        mode: 'draining',
+        actor: 'operator',
+        reason: null,
+        updatedAt: '2026-07-09T20:00:00.000Z',
+      })
+    ).resolves.toEqual({ changed: false, mode: 'draining' });
+    expect(mockTransactionQuery).toHaveBeenCalledTimes(1);
+  });
+
+  test('persists idempotent drain transitions and audit evidence on SQLite', async () => {
+    const dbPath = join(
+      import.meta.dir,
+      `.test-drain-${Date.now()}-${Math.random().toString(36).slice(2)}.db`
+    );
+    const sqlite = new SqliteAdapter(dbPath);
+    activeDatabase = sqlite;
+    mockQuery.mockImplementation((sql: string, params?: unknown[]) => sqlite.query(sql, params));
+    try {
+      await expect(getCauldronDrainState()).resolves.toMatchObject({
+        mode: 'normal',
+        drained: false,
+      });
+      const change = {
+        mode: 'draining' as const,
+        actor: 'operator',
+        reason: 'maintenance',
+        updatedAt: '2026-07-09T20:00:00.000Z',
+      };
+      await expect(setCauldronDrainMode(change)).resolves.toEqual({
+        changed: true,
+        mode: 'draining',
+      });
+      const codebaseId = '99999999-9999-4999-8999-999999999999';
+      const conversationId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+      const runId = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+      await sqlite.query(
+        'INSERT INTO remote_agent_codebases (id, name, default_cwd) VALUES ($1, $2, $3)',
+        [codebaseId, 'drain-test', '/tmp/drain-test']
+      );
+      await sqlite.query(
+        `INSERT INTO remote_agent_conversations
+         (id, platform_type, platform_conversation_id, codebase_id)
+         VALUES ($1, 'test', 'drain-conversation', $2)`,
+        [conversationId, codebaseId]
+      );
+      await sqlite.query(
+        `INSERT INTO remote_agent_workflow_runs
+         (id, conversation_id, codebase_id, workflow_name, user_message, status)
+         VALUES ($1, $2, $3, 'feature', 'test', 'running')`,
+        [runId, conversationId, codebaseId]
+      );
+      await sqlite.query(
+        `INSERT INTO remote_agent_run_leases
+         (run_id, owner_id, lease_token, acquired_at, last_heartbeat_at, expires_at)
+         VALUES ($1, 'worker', 'cccccccc-cccc-4ccc-8ccc-cccccccccccc',
+                 '2026-07-09T20:00:00.000Z', '2026-07-09T20:00:00.000Z',
+                 '2999-07-09T20:00:00.000Z')`,
+        [runId]
+      );
+      await expect(getCauldronDrainState()).resolves.toMatchObject({
+        mode: 'draining',
+        activeLeaseCount: 1,
+        activeRunCount: 1,
+        activeRunIds: [runId],
+        drained: false,
+      });
+      await expect(setCauldronDrainMode(change)).resolves.toEqual({
+        changed: false,
+        mode: 'draining',
+      });
+      await sqlite.query(
+        "UPDATE remote_agent_workflow_runs SET status = 'completed' WHERE id = $1",
+        [runId]
+      );
+      await sqlite.query('UPDATE remote_agent_run_leases SET released_at = $2 WHERE run_id = $1', [
+        runId,
+        '2026-07-09T20:01:00.000Z',
+      ]);
+      await expect(getCauldronDrainState()).resolves.toMatchObject({
+        mode: 'draining',
+        activeLeaseCount: 0,
+        activeRunCount: 0,
+        drained: true,
+      });
+      const audit = await sqlite.query<{ count: number }>(
+        'SELECT COUNT(*) AS count FROM remote_agent_cauldron_control_events'
+      );
+      expect(audit.rows[0]?.count).toBe(1);
+    } finally {
+      await sqlite.close();
+      for (const suffix of ['', '-wal', '-shm']) {
+        try {
+          unlinkSync(dbPath + suffix);
+        } catch {
+          // File may not exist depending on SQLite checkpoint timing.
+        }
+      }
+    }
   });
 });

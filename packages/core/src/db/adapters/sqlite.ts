@@ -438,6 +438,26 @@ export class SqliteAdapter implements IDatabase {
         completed_at TEXT
       );
 
+      -- Durable maintenance admission state (singleton) and audit trail
+      CREATE TABLE IF NOT EXISTS remote_agent_cauldron_control (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        mode TEXT NOT NULL CHECK (mode IN ('normal', 'draining')),
+        updated_at TEXT,
+        updated_by TEXT
+      );
+      INSERT INTO remote_agent_cauldron_control (id, mode)
+      VALUES (1, 'normal')
+      ON CONFLICT (id) DO NOTHING;
+
+      CREATE TABLE IF NOT EXISTS remote_agent_cauldron_control_events (
+        id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+        from_mode TEXT NOT NULL CHECK (from_mode IN ('normal', 'draining')),
+        to_mode TEXT NOT NULL CHECK (to_mode IN ('normal', 'draining')),
+        actor TEXT NOT NULL,
+        reason TEXT,
+        created_at TEXT NOT NULL
+      );
+
       -- Messages table (conversation history for Web UI)
       CREATE TABLE IF NOT EXISTS remote_agent_messages (
         id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
@@ -467,6 +487,8 @@ export class SqliteAdapter implements IDatabase {
         ON remote_agent_scheduled_waits(resume_at) WHERE state = 'scheduled';
       CREATE UNIQUE INDEX IF NOT EXISTS unique_reliability_wait_attempt
         ON remote_agent_scheduled_waits(attempt_id);
+      CREATE INDEX IF NOT EXISTS idx_cauldron_control_events_created
+        ON remote_agent_cauldron_control_events(created_at);
       CREATE INDEX IF NOT EXISTS idx_messages_conversation_id ON remote_agent_messages(conversation_id, created_at ASC);
       CREATE INDEX IF NOT EXISTS idx_workflow_runs_parent_conv ON remote_agent_workflow_runs(parent_conversation_id);
       CREATE INDEX IF NOT EXISTS idx_conversations_hidden ON remote_agent_conversations(hidden);

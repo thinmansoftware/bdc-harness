@@ -43,6 +43,14 @@ const mockAddMessage = mock(
 );
 const mockListMessages = mock(async (_conversationId: string, _limit?: number) => []);
 const mockHandleMessage = mock(async () => {});
+const mockGetCauldronDrainState = mock(async () => ({
+  mode: 'normal' as 'normal' | 'draining',
+  activeLeaseCount: 0,
+  activeRunCount: 0,
+  activeRunIds: [] as string[],
+  drained: false,
+  updatedAt: null,
+}));
 
 mock.module('@archon/core', () => ({
   handleMessage: mockHandleMessage,
@@ -144,6 +152,7 @@ mock.module('@archon/core/db/workflows', () => ({
   getWorkflowRun: mock(async () => null),
   cancelWorkflowRun: mock(async () => {}),
   getWorkflowRunByWorkerPlatformId: mock(async () => null),
+  getCauldronDrainState: mockGetCauldronDrainState,
 }));
 
 mock.module('@archon/core/db/workflow-events', () => ({
@@ -223,6 +232,15 @@ describe('POST /api/conversations/:id/message', () => {
     mockFindConversationByPlatformId.mockReset();
     mockHandleMessage.mockReset();
     mockAddMessage.mockReset();
+    mockGetCauldronDrainState.mockReset();
+    mockGetCauldronDrainState.mockResolvedValue({
+      mode: 'normal',
+      activeLeaseCount: 0,
+      activeRunCount: 0,
+      activeRunIds: [],
+      drained: false,
+      updatedAt: null,
+    });
   });
 
   test('accepts a valid message and dispatches to orchestrator', async () => {
@@ -248,6 +266,27 @@ describe('POST /api/conversations/:id/message', () => {
     const body = (await response.json()) as { accepted: boolean; status: string };
     expect(body.accepted).toBe(true);
     expect(body.status).toBe('started');
+  });
+
+  test('rejects message dispatch before persistence while Cauldron is draining', async () => {
+    mockGetCauldronDrainState.mockResolvedValueOnce({
+      mode: 'draining',
+      activeLeaseCount: 1,
+      activeRunCount: 1,
+      activeRunIds: ['run-active'],
+      drained: false,
+      updatedAt: new Date().toISOString(),
+    });
+    const { app } = makeApp();
+    const response = await app.request('/api/conversations/web-test-abc/message', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message: 'Start more work' }),
+    });
+
+    expect(response.status).toBe(503);
+    expect(mockAddMessage).not.toHaveBeenCalled();
+    expect(mockHandleMessage).not.toHaveBeenCalled();
   });
 
   test('persists user message to DB when conversation is found', async () => {
