@@ -1,4 +1,4 @@
-import { readFile, access } from 'fs/promises';
+import { readFile, access, realpath } from 'fs/promises';
 import { join, resolve } from 'path';
 import { createLogger, getArchonWorkspacesPath, getProjectWorktreesPath } from '@archon/paths';
 import { execFileAsync } from './exec';
@@ -364,13 +364,29 @@ export async function verifyWorktreeOwnership(
     throw new Error(`Cannot adopt ${worktreePath}: .git pointer is not a git-worktree reference.`);
   }
 
-  // Compare on resolved paths (normalizes trailing slashes and relative
-  // components) but display the raw path from the .git pointer so the user
-  // sees the value they'd recognize. On Windows, `resolve()` would prepend
-  // a drive letter to the POSIX-style gitdir, making the error message
-  // misleading and causing platform-specific test breakage.
+  // Compare filesystem identities when the paths exist. This expands Windows
+  // 8.3 aliases (for example RUNNER~1 vs runneradmin) and symlink/junction
+  // aliases before deciding that the worktree belongs to another clone.
+  // Nonexistent paths retain the lexical fallback used by unit tests and by
+  // corruption diagnostics; other filesystem errors remain fail-closed.
   const existingRepoRaw = match[1];
-  if (resolve(existingRepoRaw) !== resolve(expectedRepo)) {
+  const normalizeIdentity = async (path: string): Promise<string> => {
+    let normalized: string;
+    try {
+      normalized = await realpath(path);
+    } catch (error) {
+      const err = error as NodeJS.ErrnoException;
+      if (err.code !== 'ENOENT') throw error;
+      normalized = resolve(path);
+    }
+    const resolved = resolve(normalized);
+    return process.platform === 'win32' ? resolved.toLowerCase() : resolved;
+  };
+  const [existingIdentity, expectedIdentity] = await Promise.all([
+    normalizeIdentity(existingRepoRaw),
+    normalizeIdentity(expectedRepo),
+  ]);
+  if (existingIdentity !== expectedIdentity) {
     throw new Error(
       `Worktree at ${worktreePath} belongs to a different clone (${existingRepoRaw}). ` +
         'Remove it from that clone or use a different codebase registration.'

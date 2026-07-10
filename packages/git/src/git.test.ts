@@ -1,5 +1,5 @@
 import { describe, test, expect, beforeEach, afterEach, mock, spyOn, type Mock } from 'bun:test';
-import { writeFile, mkdir as realMkdir, rm } from 'fs/promises';
+import { writeFile, mkdir as realMkdir, rm, symlink } from 'fs/promises';
 import { join } from 'path';
 import { tmpdir, homedir } from 'os';
 
@@ -1961,6 +1961,19 @@ branch refs/heads/feature/auth
           git.toWorktreePath(testDir),
           git.toRepoPath('/workspace/my-repo/')
         )
+      ).resolves.toBeUndefined();
+    });
+
+    test('accepts two filesystem aliases for the same canonical clone', async () => {
+      const canonicalRepo = join(testDir, 'canonical-repo');
+      const aliasRepo = join(testDir, 'canonical-alias');
+      await realMkdir(canonicalRepo, { recursive: true });
+      await symlink(canonicalRepo, aliasRepo, process.platform === 'win32' ? 'junction' : 'dir');
+      const gitPointerRepo = aliasRepo.replaceAll('\\', '/');
+      await writeFile(join(testDir, '.git'), `gitdir: ${gitPointerRepo}/.git/worktrees/issue-42\n`);
+
+      await expect(
+        git.verifyWorktreeOwnership(git.toWorktreePath(testDir), git.toRepoPath(canonicalRepo))
       ).resolves.toBeUndefined();
     });
 
