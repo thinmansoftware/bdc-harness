@@ -43,3 +43,14 @@ test('rejects an empty runtime image revision from the server', async () => {
   const client = new ArchonCanaryClient('http://127.0.0.1:3090', 'fixture-token', fetcher);
   await expect(client.getSnapshot('codebase-1', 'dev')).rejects.toThrow();
 });
+
+test('rejects a whitespace-only runtime image revision from the server', async () => {
+  const fetcher = mock(async () =>
+    Response.json({
+      ...baseSnapshot,
+      revisions: { ...baseSnapshot.revisions, runtimeImageRevision: '   ' },
+    })
+  );
+  const client = new ArchonCanaryClient('http://127.0.0.1:3090', 'fixture-token', fetcher);
+  await expect(client.getSnapshot('codebase-1', 'dev')).rejects.toThrow();
+});

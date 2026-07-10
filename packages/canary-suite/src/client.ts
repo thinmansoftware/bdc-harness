@@ -34,9 +34,9 @@ export const canarySnapshotSchema = z.object({
     headSha: z.string().regex(/^[a-f0-9]{40}$/),
   }),
   revisions: z.object({
-    engineRevision: z.string().min(1),
-    bundleRevision: z.string().min(1),
-    runtimeImageRevision: z.string().min(1).nullable(),
+    engineRevision: z.string().trim().min(1),
+    bundleRevision: z.string().trim().min(1),
+    runtimeImageRevision: z.string().trim().min(1).nullable(),
   }),
   drain: z.object({
     mode: z.enum(['normal', 'draining']),
