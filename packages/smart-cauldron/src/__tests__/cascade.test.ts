@@ -503,6 +503,42 @@ describe('Test 4: INFRA-ERROR vs GATE-FAIL', () => {
 // ---------------------------------------------------------------------------
 
 describe('Test 5: FRONTIER gate-fail -> SPEC-REPAIR (not plain blocked)', () => {
+  test('explicit dual-supervisor hook delegates frontier recovery before terminal failure', async () => {
+    let fireCount = 0;
+    let specRepairCalled = false;
+    const supervisorCalls: string[] = [];
+    const deps: CascadeDeps = {
+      fire: async () => makeFireOk(`run-${++fireCount}`),
+      poll: async () => makePollResult({ terminalStatus: 'failed' }),
+      judge: () => makeFailVerdict('terminal status: failed'),
+      superviseFailure: async context => {
+        supervisorCalls.push(context.failureKind);
+        return {
+          handled: true,
+          ownerId: 'sol',
+          fencingToken: 7,
+          evidenceRefs: ['incident:recorded', 'action:refired'],
+        };
+      },
+      specRepair: async () => {
+        specRepairCalled = true;
+        return { posted: true, issueRepo: 'unused', issueNumber: 1 };
+      },
+      writeRecord: async record => `/tmp/cascade-record-${record.cascadeId}.json`,
+    };
+
+    const record = await runCascade(baseOpts({ deps, entryOverride: 'frontier' }));
+
+    expect(record.status).toBe('recovery-delegated');
+    expect(supervisorCalls).toEqual(['frontier-gate']);
+    expect(specRepairCalled).toBe(false);
+    expect(record.supervisorRecovery).toEqual({
+      ownerId: 'sol',
+      fencingToken: 7,
+      evidenceRefs: ['incident:recorded', 'action:refired'],
+    });
+  });
+
   test('frontier gate-fail invokes specRepair, records spec-repair, no third fire', async () => {
     let fireCount = 0;
     let escalateCalled = false;

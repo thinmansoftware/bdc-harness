@@ -67,6 +67,24 @@ export interface CascadeDeps {
    * an issue is surfaced via `posted: false` (caller falls back to escalate).
    */
   specRepair?: (context: SpecRepairCallContext) => Promise<SpecRepairResult>;
+  /** Optional dual-supervisor control plane. Absent by default; never starts a live worker. */
+  superviseFailure?: (context: SupervisorFailureContext) => Promise<SupervisorFailureResult>;
+}
+
+export interface SupervisorFailureContext {
+  woId: string;
+  cascadeId: string;
+  tierName: TierName;
+  runId: string | null;
+  reason: string;
+  failureKind: 'frontier-gate' | 'infrastructure';
+}
+
+export interface SupervisorFailureResult {
+  handled: boolean;
+  ownerId: string | null;
+  fencingToken: number | null;
+  evidenceRefs: string[];
 }
 
 export interface EscalationCallContext {
@@ -176,6 +194,7 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
       : createRecord);
   const cancelImpl = opts.deps?.cancel ?? cancelRun;
   const specRepairImpl = opts.deps?.specRepair ?? defaultSpecRepair;
+  const superviseFailureImpl = opts.deps?.superviseFailure;
 
   // Load config from files (never from inline constants)
   const tiers = loadLadder();
@@ -243,6 +262,7 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
   let status: CascadeStatus = 'running';
   let winningTier: TierName | null = null;
   let specRepairRecord: CascadeRunRecord['specRepair'];
+  let supervisorRecoveryRecord: CascadeRunRecord['supervisorRecovery'];
 
   function buildCurrentRecord(): CascadeRunRecord {
     const entryTier: TierName = attempts[0]?.tier ?? entryTierName;
@@ -269,6 +289,7 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
         wonCheap: status === 'won' && !climbed,
       },
       ...(specRepairRecord ? { specRepair: specRepairRecord } : {}),
+      ...(supervisorRecoveryRecord ? { supervisorRecovery: supervisorRecoveryRecord } : {}),
     };
   }
 
@@ -302,6 +323,25 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
     runId: string | null
   ): Promise<boolean> {
     if (currentTier.isFrontier) {
+      if (superviseFailureImpl) {
+        const recovery = await superviseFailureImpl({
+          woId,
+          cascadeId,
+          tierName: currentTier.name,
+          runId,
+          reason: failReason,
+          failureKind: 'frontier-gate',
+        });
+        if (recovery.handled && recovery.ownerId !== null && recovery.fencingToken !== null) {
+          supervisorRecoveryRecord = {
+            ownerId: recovery.ownerId,
+            fencingToken: recovery.fencingToken,
+            evidenceRefs: recovery.evidenceRefs,
+          };
+          status = 'recovery-delegated';
+          return true;
+        }
+      }
       // Top rung (fable) failed the gate. Per John's 2026-07-02 doctrine ruling
       // ("Fable is the last escalation before failure -- a WO should never fail,
       // it should be able to be fixed"), this is NOT a terminal BLOCKED dead end.
@@ -443,6 +483,27 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
       attempt.outcome = 'infra-error';
       attempt.infraErrorReason = fireResult.infraError;
       attempt.completedAt = new Date().toISOString();
+
+      if (superviseFailureImpl) {
+        const recovery = await superviseFailureImpl({
+          woId,
+          cascadeId,
+          tierName: tier.name,
+          runId: fireResult.runId,
+          reason: fireResult.infraError ?? 'unknown infrastructure failure',
+          failureKind: 'infrastructure',
+        });
+        if (recovery.handled && recovery.ownerId !== null && recovery.fencingToken !== null) {
+          supervisorRecoveryRecord = {
+            ownerId: recovery.ownerId,
+            fencingToken: recovery.fencingToken,
+            evidenceRefs: recovery.evidenceRefs,
+          };
+          status = 'recovery-delegated';
+          await checkpoint();
+          break;
+        }
+      }
 
       await escalateImpl({
         errorClass,

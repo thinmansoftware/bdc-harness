@@ -48,6 +48,7 @@ export type CascadeStatus =
   | 'won' // a tier passed the gate
   | 'blocked' // all tiers exhausted without a frontier (defensive; should not happen)
   | 'spec-repair' // frontier (fable) tier gate-failed -> SPEC-REPAIR escalation, not a dead end
+  | 'recovery-delegated' // an explicitly injected fenced supervisor accepted recovery ownership
   | 'infra-alert'; // infra-error on a tier (escalate/alert, not climb silently)
 
 export interface CascadeRunRecord {
@@ -85,6 +86,11 @@ export interface CascadeRunRecord {
     posted: boolean;
     whatMustChange: string;
     evidence: string;
+  };
+  supervisorRecovery?: {
+    ownerId: string;
+    fencingToken: number;
+    evidenceRefs: string[];
   };
 }
 
