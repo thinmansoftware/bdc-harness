@@ -10,5 +10,10 @@ describe('production Docker packaging', () => {
     );
 
     expect(dockerfile).toContain('COPY packages/smart-cauldron/ ./packages/smart-cauldron/');
+    expect(
+      dockerfile.match(/COPY packages\/canary-suite\/package\.json \.\/packages\/canary-suite\//g)
+    ).toHaveLength(2);
+    expect(dockerfile).toContain('COPY packages/canary-suite/ ./packages/canary-suite/');
+    expect(dockerfile).toContain('COPY .archon/ ./.archon/');
   });
 });
