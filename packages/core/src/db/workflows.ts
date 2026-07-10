@@ -620,13 +620,20 @@ export async function listSupervisorObservations(
 export async function claimSupervisorRepairLease(data: {
   incidentId: string;
   ownerId: string;
-  acquiredAt: string;
-  expiresAt: string;
+  leaseDurationMs: number;
 }): Promise<SupervisorRepairLeaseRecord | null> {
+  const isPostgres = getDatabase().dialect === 'postgres';
+  const nowSql = isPostgres ? 'NOW()' : "strftime('%Y-%m-%dT%H:%M:%fZ', 'now')";
+  const expiresSql = isPostgres
+    ? "NOW() + ($3::bigint * INTERVAL '1 millisecond')"
+    : "strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '+' || ($3 / 1000.0) || ' seconds')";
+  const expiredSql = isPostgres
+    ? 'remote_agent_supervisor_repair_leases.expires_at <= NOW()'
+    : "julianday(remote_agent_supervisor_repair_leases.expires_at) <= julianday('now')";
   const result = await pool.query<SupervisorRepairLeaseRow>(
     `INSERT INTO remote_agent_supervisor_repair_leases
      (incident_id, owner_id, fencing_token, acquired_at, last_heartbeat_at, expires_at, released_at)
-     SELECT $1, $2, 1, $3, $3, $4, NULL
+     SELECT $1, $2, 1, ${nowSql}, ${nowSql}, ${expiresSql}, NULL
      FROM remote_agent_supervisor_incidents
      WHERE incident_id = $1 AND status IN ('open', 'repairing')
      ON CONFLICT (incident_id) DO UPDATE SET
@@ -636,10 +643,15 @@ export async function claimSupervisorRepairLease(data: {
        last_heartbeat_at = EXCLUDED.last_heartbeat_at,
        expires_at = EXCLUDED.expires_at,
        released_at = NULL
-     WHERE remote_agent_supervisor_repair_leases.released_at IS NOT NULL
-        OR remote_agent_supervisor_repair_leases.expires_at <= EXCLUDED.acquired_at
+     WHERE (remote_agent_supervisor_repair_leases.released_at IS NOT NULL
+        OR ${expiredSql})
+       AND EXISTS (
+         SELECT 1 FROM remote_agent_supervisor_incidents i
+         WHERE i.incident_id = remote_agent_supervisor_repair_leases.incident_id
+           AND i.status IN ('open', 'repairing')
+       )
      RETURNING *`,
-    [data.incidentId, data.ownerId, data.acquiredAt, data.expiresAt]
+    [data.incidentId, data.ownerId, data.leaseDurationMs]
   );
   const row = result.rows[0];
   return row ? normalizeSupervisorRepairLease(row) : null;
@@ -649,15 +661,20 @@ export async function heartbeatSupervisorRepairLease(data: {
   incidentId: string;
   ownerId: string;
   fencingToken: number;
-  heartbeatAt: string;
-  expiresAt: string;
+  leaseDurationMs: number;
 }): Promise<boolean> {
+  const isPostgres = getDatabase().dialect === 'postgres';
+  const nowSql = isPostgres ? 'NOW()' : "strftime('%Y-%m-%dT%H:%M:%fZ', 'now')";
+  const expiresSql = isPostgres
+    ? "NOW() + ($4::bigint * INTERVAL '1 millisecond')"
+    : "strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '+' || ($4 / 1000.0) || ' seconds')";
+  const activeSql = isPostgres ? 'expires_at > NOW()' : "julianday(expires_at) > julianday('now')";
   const result = await pool.query(
     `UPDATE remote_agent_supervisor_repair_leases
-     SET last_heartbeat_at = $4, expires_at = $5
+     SET last_heartbeat_at = ${nowSql}, expires_at = ${expiresSql}
      WHERE incident_id = $1 AND owner_id = $2 AND fencing_token = $3
-       AND released_at IS NULL AND expires_at > $4`,
-    [data.incidentId, data.ownerId, data.fencingToken, data.heartbeatAt, data.expiresAt]
+       AND released_at IS NULL AND ${activeSql}`,
+    [data.incidentId, data.ownerId, data.fencingToken, data.leaseDurationMs]
   );
   return result.rowCount === 1;
 }
@@ -666,51 +683,73 @@ export async function authorizeSupervisorMutation(data: {
   incidentId: string;
   ownerId: string;
   fencingToken: number;
-  authorizedAt: string;
 }): Promise<boolean> {
+  const activeSql =
+    getDatabase().dialect === 'postgres'
+      ? 'l.expires_at > NOW()'
+      : "julianday(l.expires_at) > julianday('now')";
   const result = await pool.query(
-    `SELECT incident_id FROM remote_agent_supervisor_repair_leases
-     WHERE incident_id = $1 AND owner_id = $2 AND fencing_token = $3
-       AND released_at IS NULL AND expires_at > $4`,
-    [data.incidentId, data.ownerId, data.fencingToken, data.authorizedAt]
+    `SELECT l.incident_id FROM remote_agent_supervisor_repair_leases l
+     JOIN remote_agent_supervisor_incidents i ON i.incident_id = l.incident_id
+     WHERE l.incident_id = $1 AND l.owner_id = $2 AND l.fencing_token = $3
+       AND l.released_at IS NULL AND ${activeSql}
+       AND i.status IN ('open', 'repairing')`,
+    [data.incidentId, data.ownerId, data.fencingToken]
   );
   return result.rowCount === 1;
 }
 
 export async function appendSupervisorAction(action: SupervisorActionRecord): Promise<boolean> {
   const db = getDatabase();
-  return db.withTransaction(async query => {
-    const authorized = await query(
-      `SELECT incident_id FROM remote_agent_supervisor_repair_leases
-       WHERE incident_id = $1 AND owner_id = $2 AND fencing_token = $3
-         AND released_at IS NULL AND expires_at > $4`,
-      [action.incidentId, action.ownerId, action.fencingToken, action.createdAt]
-    );
-    if (authorized.rowCount !== 1) return false;
-    const inserted = await query(
-      `INSERT INTO remote_agent_supervisor_actions
-       (action_id, incident_id, owner_id, fencing_token, action_type, outcome, evidence_refs, created_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-       ON CONFLICT (action_id) DO NOTHING`,
-      [
-        action.actionId,
-        action.incidentId,
-        action.ownerId,
-        action.fencingToken,
-        action.actionType,
-        action.outcome,
-        JSON.stringify(action.evidenceRefs),
-        action.createdAt,
-      ]
-    );
-    if (inserted.rowCount !== 1) return false;
-    await query(
-      `UPDATE remote_agent_supervisor_incidents
-       SET status = 'recovered', updated_at = $2 WHERE incident_id = $1`,
-      [action.incidentId, action.createdAt]
-    );
-    return true;
-  });
+  const activeSql =
+    db.dialect === 'postgres'
+      ? 'l.expires_at > NOW()'
+      : "julianday(l.expires_at) > julianday('now')";
+  try {
+    return await db.withTransaction(async query => {
+      const authorized = await query(
+        `SELECT l.incident_id FROM remote_agent_supervisor_repair_leases l
+         JOIN remote_agent_supervisor_incidents i ON i.incident_id = l.incident_id
+         WHERE l.incident_id = $1 AND l.owner_id = $2 AND l.fencing_token = $3
+           AND l.released_at IS NULL AND ${activeSql}
+           AND i.status IN ('open', 'repairing')`,
+        [action.incidentId, action.ownerId, action.fencingToken]
+      );
+      if (authorized.rowCount !== 1) return false;
+      const inserted = await query(
+        `INSERT INTO remote_agent_supervisor_actions
+         (action_id, incident_id, owner_id, fencing_token, action_type, outcome, evidence_refs, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+         ON CONFLICT (action_id) DO NOTHING`,
+        [
+          action.actionId,
+          action.incidentId,
+          action.ownerId,
+          action.fencingToken,
+          action.actionType,
+          action.outcome,
+          JSON.stringify(action.evidenceRefs),
+          action.createdAt,
+        ]
+      );
+      if (inserted.rowCount !== 1) return false;
+      const closed = await query(
+        `UPDATE remote_agent_supervisor_incidents
+         SET status = 'recovered', updated_at = $2
+         WHERE incident_id = $1 AND status IN ('open', 'repairing')`,
+        [action.incidentId, action.createdAt]
+      );
+      if (closed.rowCount !== 1) {
+        throw new Error('supervisor_incident_close_conflict');
+      }
+      return true;
+    });
+  } catch (error) {
+    if (error instanceof Error && error.message === 'supervisor_incident_close_conflict') {
+      return false;
+    }
+    throw error;
+  }
 }
 
 export async function releaseSupervisorRepairLease(data: {

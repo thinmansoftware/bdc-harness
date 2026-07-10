@@ -77,6 +77,7 @@ import {
   appendSupervisorObservation,
   listSupervisorObservations,
   claimSupervisorRepairLease,
+  heartbeatSupervisorRepairLease,
   authorizeSupervisorMutation,
   appendSupervisorAction,
   releaseSupervisorRepairLease,
@@ -1644,6 +1645,45 @@ describe('Smart Cauldron reliability persistence', () => {
     ]);
   });
 
+  test('uses the database clock for every supervisor lease validity predicate', async () => {
+    const leaseRow = {
+      incident_id: '99999999-9999-4999-8999-999999999999',
+      owner_id: 'sol',
+      fencing_token: 1,
+      acquired_at: '2026-07-10T12:00:00.000Z',
+      last_heartbeat_at: '2026-07-10T12:00:00.000Z',
+      expires_at: '2026-07-10T12:01:00.000Z',
+      released_at: null,
+    };
+    mockQuery.mockResolvedValueOnce(createQueryResult([leaseRow], 1));
+    await claimSupervisorRepairLease({
+      incidentId: leaseRow.incident_id,
+      ownerId: leaseRow.owner_id,
+      leaseDurationMs: 60_000,
+    });
+    expect(mockQuery.mock.calls[0]?.[0]).toContain('NOW()');
+    expect(mockQuery.mock.calls[0]?.[0]).not.toContain('expires_at <= EXCLUDED.acquired_at');
+    expect(mockQuery.mock.calls[0]?.[1]).toEqual([leaseRow.incident_id, leaseRow.owner_id, 60_000]);
+
+    mockQuery.mockResolvedValueOnce(createQueryResult([], 1));
+    await heartbeatSupervisorRepairLease({
+      incidentId: leaseRow.incident_id,
+      ownerId: leaseRow.owner_id,
+      fencingToken: 1,
+      leaseDurationMs: 60_000,
+    });
+    expect(mockQuery.mock.calls[1]?.[0]).toContain('expires_at > NOW()');
+
+    mockQuery.mockResolvedValueOnce(createQueryResult([{ incident_id: leaseRow.incident_id }], 1));
+    await authorizeSupervisorMutation({
+      incidentId: leaseRow.incident_id,
+      ownerId: leaseRow.owner_id,
+      fencingToken: 1,
+    });
+    expect(mockQuery.mock.calls[2]?.[0]).toContain('expires_at > NOW()');
+    expect(mockQuery.mock.calls[2]?.[1]).toEqual([leaseRow.incident_id, leaseRow.owner_id, 1]);
+  });
+
   test('executes the reliability contract end-to-end on SQLite', async () => {
     const dbPath = join(
       import.meta.dir,
@@ -1912,14 +1952,12 @@ describe('Smart Cauldron reliability persistence', () => {
         claimSupervisorRepairLease({
           incidentId: incident.incidentId,
           ownerId: 'sol',
-          acquiredAt: '2026-07-10T12:00:02.000Z',
-          expiresAt: '2026-07-10T12:01:02.000Z',
+          leaseDurationMs: 60_000,
         }),
         claimSupervisorRepairLease({
           incidentId: incident.incidentId,
           ownerId: 'fable',
-          acquiredAt: '2026-07-10T12:00:02.000Z',
-          expiresAt: '2026-07-10T12:01:02.000Z',
+          leaseDurationMs: 60_000,
         }),
       ]);
       const firstOwner = claims.find(claim => claim !== null);
@@ -1927,11 +1965,16 @@ describe('Smart Cauldron reliability persistence', () => {
       expect(firstOwner?.fencingToken).toBe(1);
 
       const takeoverOwner = firstOwner?.ownerId === 'sol' ? 'fable' : 'sol';
+      await sqlite.query(
+        `UPDATE remote_agent_supervisor_repair_leases
+         SET expires_at = '2000-01-01T00:00:00.000Z'
+         WHERE incident_id = $1`,
+        [incident.incidentId]
+      );
       const takeover = await claimSupervisorRepairLease({
         incidentId: incident.incidentId,
         ownerId: takeoverOwner,
-        acquiredAt: '2026-07-10T12:01:03.000Z',
-        expiresAt: '2026-07-10T12:02:03.000Z',
+        leaseDurationMs: 60_000,
       });
       expect(takeover?.fencingToken).toBe(2);
       await expect(
@@ -1939,7 +1982,6 @@ describe('Smart Cauldron reliability persistence', () => {
           incidentId: incident.incidentId,
           ownerId: firstOwner?.ownerId ?? '',
           fencingToken: firstOwner?.fencingToken ?? 0,
-          authorizedAt: '2026-07-10T12:01:04.000Z',
         })
       ).resolves.toBe(false);
       await expect(
@@ -1947,7 +1989,6 @@ describe('Smart Cauldron reliability persistence', () => {
           incidentId: incident.incidentId,
           ownerId: takeoverOwner,
           fencingToken: 2,
-          authorizedAt: '2026-07-10T12:01:04.000Z',
         })
       ).resolves.toBe(true);
       await expect(
@@ -1974,8 +2015,7 @@ describe('Smart Cauldron reliability persistence', () => {
         claimSupervisorRepairLease({
           incidentId: incident.incidentId,
           ownerId: firstOwner?.ownerId ?? 'sol',
-          acquiredAt: '2026-07-10T12:01:07.000Z',
-          expiresAt: '2026-07-10T12:02:07.000Z',
+          leaseDurationMs: 60_000,
         })
       ).resolves.toBeNull();
     } finally {

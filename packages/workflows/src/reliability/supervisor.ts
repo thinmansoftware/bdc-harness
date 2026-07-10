@@ -72,6 +72,10 @@ export async function coordinateSupervisorRecovery(
   input: CoordinateSupervisorRecoveryInput
 ): Promise<CoordinateSupervisorRecoveryResult> {
   const store = requireSupervisorStore(workflowStore);
+  const leaseDurationMs = Date.parse(input.expiresAt) - Date.parse(input.acquiredAt);
+  if (!Number.isFinite(leaseDurationMs) || leaseDurationMs <= 0) {
+    throw new Error('supervisor_lease_duration_invalid');
+  }
   const incident = await store.createSupervisorIncident(input.incident);
   await Promise.all(
     input.supervisors.map(async supervisor => {
@@ -92,8 +96,7 @@ export async function coordinateSupervisorRecovery(
       store.claimSupervisorRepairLease({
         incidentId: incident.incidentId,
         ownerId: supervisor.supervisorId,
-        acquiredAt: input.acquiredAt,
-        expiresAt: input.expiresAt,
+        leaseDurationMs,
       })
     )
   );
@@ -105,7 +108,6 @@ export async function coordinateSupervisorRecovery(
     incidentId: incident.incidentId,
     ownerId: repairOwner.ownerId,
     fencingToken: repairOwner.fencingToken,
-    authorizedAt: input.acquiredAt,
   });
   if (!authorized) return { incident, observations, repairOwner, repaired: false };
 

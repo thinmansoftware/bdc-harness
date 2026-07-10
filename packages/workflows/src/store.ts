@@ -183,21 +183,18 @@ export interface IWorkflowStore {
   claimSupervisorRepairLease?(data: {
     incidentId: string;
     ownerId: string;
-    acquiredAt: string;
-    expiresAt: string;
+    leaseDurationMs: number;
   }): Promise<SupervisorRepairLeaseRecord | null>;
   heartbeatSupervisorRepairLease?(data: {
     incidentId: string;
     ownerId: string;
     fencingToken: number;
-    heartbeatAt: string;
-    expiresAt: string;
+    leaseDurationMs: number;
   }): Promise<boolean>;
   authorizeSupervisorMutation?(data: {
     incidentId: string;
     ownerId: string;
     fencingToken: number;
-    authorizedAt: string;
   }): Promise<boolean>;
   appendSupervisorAction?(action: SupervisorActionRecord): Promise<boolean>;
   releaseSupervisorRepairLease?(data: {

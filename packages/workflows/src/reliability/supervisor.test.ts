@@ -30,20 +30,15 @@ function makeSupervisorStore() {
     }),
     listSupervisorObservations: mock(async () => observations),
     claimSupervisorRepairLease: mock(
-      async (data: {
-        incidentId: string;
-        ownerId: string;
-        acquiredAt: string;
-        expiresAt: string;
-      }) => {
+      async (data: { incidentId: string; ownerId: string; leaseDurationMs: number }) => {
         if (lease !== null) return null;
         lease = {
           incidentId: data.incidentId,
           ownerId: data.ownerId,
           fencingToken: 1,
-          acquiredAt: data.acquiredAt,
-          lastHeartbeatAt: data.acquiredAt,
-          expiresAt: data.expiresAt,
+          acquiredAt: '2026-07-10T12:00:01.000Z',
+          lastHeartbeatAt: '2026-07-10T12:00:01.000Z',
+          expiresAt: '2026-07-10T12:01:01.000Z',
           releasedAt: null,
         };
         return lease;
