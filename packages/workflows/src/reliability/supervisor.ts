@@ -40,7 +40,8 @@ type SupervisorStore = Required<
     | 'listSupervisorObservations'
     | 'claimSupervisorRepairLease'
     | 'authorizeSupervisorMutation'
-    | 'appendSupervisorAction'
+    | 'reserveSupervisorAction'
+    | 'finalizeSupervisorAction'
     | 'releaseSupervisorRepairLease'
   >
 >;
@@ -52,7 +53,8 @@ function requireSupervisorStore(store: IWorkflowStore): SupervisorStore {
     'listSupervisorObservations',
     'claimSupervisorRepairLease',
     'authorizeSupervisorMutation',
-    'appendSupervisorAction',
+    'reserveSupervisorAction',
+    'finalizeSupervisorAction',
     'releaseSupervisorRepairLease',
   ];
   for (const method of methods) {
@@ -111,23 +113,57 @@ export async function coordinateSupervisorRecovery(
   });
   if (!authorized) return { incident, observations, repairOwner, repaired: false };
 
-  const result = await input.repair(repairOwner);
-  const recorded = await store.appendSupervisorAction({
-    actionId: randomUUID(),
+  const actionId = randomUUID();
+  const reserved = await store.reserveSupervisorAction({
+    actionId,
     incidentId: incident.incidentId,
     ownerId: repairOwner.ownerId,
     fencingToken: repairOwner.fencingToken,
     actionType: input.actionType,
-    outcome: result.assessment,
-    evidenceRefs: result.evidenceRefs,
+    outcome: 'reserved',
+    evidenceRefs: [],
     createdAt: input.acquiredAt,
   });
-  if (!recorded) return { incident, observations, repairOwner, repaired: false };
-  await store.releaseSupervisorRepairLease({
-    incidentId: incident.incidentId,
-    ownerId: repairOwner.ownerId,
-    fencingToken: repairOwner.fencingToken,
-    releasedAt: input.acquiredAt,
-  });
-  return { incident, observations, repairOwner, repaired: true };
+  if (!reserved) return { incident, observations, repairOwner, repaired: false };
+
+  try {
+    const result = await input.repair(repairOwner);
+    const finalized = await store.finalizeSupervisorAction({
+      actionId,
+      incidentId: incident.incidentId,
+      ownerId: repairOwner.ownerId,
+      fencingToken: repairOwner.fencingToken,
+      status: 'completed',
+      outcome: result.assessment,
+      evidenceRefs: result.evidenceRefs,
+      completedAt: input.acquiredAt,
+    });
+    if (!finalized) return { incident, observations, repairOwner, repaired: false };
+    await store.releaseSupervisorRepairLease({
+      incidentId: incident.incidentId,
+      ownerId: repairOwner.ownerId,
+      fencingToken: repairOwner.fencingToken,
+      releasedAt: input.acquiredAt,
+    });
+    return { incident, observations, repairOwner, repaired: true };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    await store.finalizeSupervisorAction({
+      actionId,
+      incidentId: incident.incidentId,
+      ownerId: repairOwner.ownerId,
+      fencingToken: repairOwner.fencingToken,
+      status: 'failed',
+      outcome: message,
+      evidenceRefs: [],
+      completedAt: input.acquiredAt,
+    });
+    await store.releaseSupervisorRepairLease({
+      incidentId: incident.incidentId,
+      ownerId: repairOwner.ownerId,
+      fencingToken: repairOwner.fencingToken,
+      releasedAt: input.acquiredAt,
+    });
+    throw error;
+  }
 }

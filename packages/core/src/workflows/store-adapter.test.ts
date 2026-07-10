@@ -37,6 +37,8 @@ const mockListSupervisorObservations = mock(() => Promise.resolve([]));
 const mockClaimSupervisorRepairLease = mock(() => Promise.resolve(null));
 const mockHeartbeatSupervisorRepairLease = mock(() => Promise.resolve(false));
 const mockAuthorizeSupervisorMutation = mock(() => Promise.resolve(false));
+const mockReserveSupervisorAction = mock(() => Promise.resolve(false));
+const mockFinalizeSupervisorAction = mock(() => Promise.resolve(false));
 const mockAppendSupervisorAction = mock(() => Promise.resolve(false));
 const mockReleaseSupervisorRepairLease = mock(() => Promise.resolve(false));
 
@@ -76,6 +78,8 @@ mock.module('../db/workflows', () => ({
   claimSupervisorRepairLease: mockClaimSupervisorRepairLease,
   heartbeatSupervisorRepairLease: mockHeartbeatSupervisorRepairLease,
   authorizeSupervisorMutation: mockAuthorizeSupervisorMutation,
+  reserveSupervisorAction: mockReserveSupervisorAction,
+  finalizeSupervisorAction: mockFinalizeSupervisorAction,
   appendSupervisorAction: mockAppendSupervisorAction,
   releaseSupervisorRepairLease: mockReleaseSupervisorRepairLease,
 }));
@@ -143,6 +147,8 @@ describe('createWorkflowStore', () => {
       'claimSupervisorRepairLease',
       'heartbeatSupervisorRepairLease',
       'authorizeSupervisorMutation',
+      'reserveSupervisorAction',
+      'finalizeSupervisorAction',
       'appendSupervisorAction',
       'releaseSupervisorRepairLease',
       'createWorkflowEvent',

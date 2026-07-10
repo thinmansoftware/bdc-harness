@@ -79,6 +79,8 @@ import {
   claimSupervisorRepairLease,
   heartbeatSupervisorRepairLease,
   authorizeSupervisorMutation,
+  reserveSupervisorAction,
+  finalizeSupervisorAction,
   appendSupervisorAction,
   releaseSupervisorRepairLease,
   reconcileTerminalWorkflowRuns,
@@ -1992,15 +1994,39 @@ describe('Smart Cauldron reliability persistence', () => {
         })
       ).resolves.toBe(true);
       await expect(
-        appendSupervisorAction({
+        reserveSupervisorAction({
           actionId: 'dddddddd-dddd-4ddd-8ddd-dddddddddddd',
           incidentId: incident.incidentId,
           ownerId: takeoverOwner,
           fencingToken: 2,
           actionType: 'repair_or_refire',
+          outcome: 'reserved',
+          evidenceRefs: [],
+          createdAt: '2026-07-10T12:01:05.000Z',
+        })
+      ).resolves.toBe(true);
+      await expect(
+        reserveSupervisorAction({
+          actionId: 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee',
+          incidentId: incident.incidentId,
+          ownerId: takeoverOwner,
+          fencingToken: 2,
+          actionType: 'repair_or_refire',
+          outcome: 'reserved',
+          evidenceRefs: [],
+          createdAt: '2026-07-10T12:01:05.000Z',
+        })
+      ).resolves.toBe(false);
+      await expect(
+        finalizeSupervisorAction({
+          actionId: 'dddddddd-dddd-4ddd-8ddd-dddddddddddd',
+          incidentId: incident.incidentId,
+          ownerId: takeoverOwner,
+          fencingToken: 2,
+          status: 'completed',
           outcome: 'recovered',
           evidenceRefs: ['run:recovered'],
-          createdAt: '2026-07-10T12:01:05.000Z',
+          completedAt: '2026-07-10T12:01:05.000Z',
         })
       ).resolves.toBe(true);
       await expect(

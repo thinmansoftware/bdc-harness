@@ -215,6 +215,23 @@ export class SqliteAdapter implements IDatabase {
     } catch (e: unknown) {
       getLog().warn({ err: e as Error }, 'db.sqlite_migration_session_columns_failed');
     }
+
+    try {
+      const actionCols = this.db
+        .prepare("PRAGMA table_info('remote_agent_supervisor_actions')")
+        .all() as { name: string }[];
+      const actionColNames = new Set(actionCols.map(c => c.name));
+      if (!actionColNames.has('status')) {
+        this.db.run(
+          "ALTER TABLE remote_agent_supervisor_actions ADD COLUMN status TEXT NOT NULL DEFAULT 'completed' CHECK (status IN ('reserved', 'completed', 'failed'))"
+        );
+      }
+      if (!actionColNames.has('completed_at')) {
+        this.db.run('ALTER TABLE remote_agent_supervisor_actions ADD COLUMN completed_at TEXT');
+      }
+    } catch (e: unknown) {
+      getLog().warn({ err: e as Error }, 'db.sqlite_migration_supervisor_action_columns_failed');
+    }
   }
 
   /**
@@ -479,7 +496,9 @@ export class SqliteAdapter implements IDatabase {
         action_type TEXT NOT NULL,
         outcome TEXT NOT NULL,
         evidence_refs TEXT NOT NULL DEFAULT '[]',
-        created_at TEXT NOT NULL
+        created_at TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'completed' CHECK (status IN ('reserved', 'completed', 'failed')),
+        completed_at TEXT
       );
 
       -- Durable maintenance admission state (singleton) and audit trail
@@ -535,6 +554,8 @@ export class SqliteAdapter implements IDatabase {
         ON remote_agent_supervisor_observations(incident_id, created_at);
       CREATE INDEX IF NOT EXISTS idx_supervisor_actions_incident
         ON remote_agent_supervisor_actions(incident_id, created_at);
+      CREATE UNIQUE INDEX IF NOT EXISTS uq_supervisor_action_incident
+        ON remote_agent_supervisor_actions(incident_id);
       CREATE INDEX IF NOT EXISTS idx_supervisor_repair_leases_expiry
         ON remote_agent_supervisor_repair_leases(expires_at) WHERE released_at IS NULL;
       CREATE INDEX IF NOT EXISTS idx_cauldron_control_events_created

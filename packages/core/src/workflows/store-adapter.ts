@@ -68,6 +68,8 @@ export function createWorkflowStore(): IWorkflowStore {
     claimSupervisorRepairLease: workflowDb.claimSupervisorRepairLease,
     heartbeatSupervisorRepairLease: workflowDb.heartbeatSupervisorRepairLease,
     authorizeSupervisorMutation: workflowDb.authorizeSupervisorMutation,
+    reserveSupervisorAction: workflowDb.reserveSupervisorAction,
+    finalizeSupervisorAction: workflowDb.finalizeSupervisorAction,
     appendSupervisorAction: workflowDb.appendSupervisorAction,
     releaseSupervisorRepairLease: workflowDb.releaseSupervisorRepairLease,
     createWorkflowEvent: async (data): Promise<void> => {

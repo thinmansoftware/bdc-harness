@@ -500,12 +500,16 @@ CREATE TABLE IF NOT EXISTS remote_agent_supervisor_actions (
   action_type TEXT NOT NULL,
   outcome TEXT NOT NULL,
   evidence_refs JSONB NOT NULL DEFAULT '[]'::jsonb,
-  created_at TIMESTAMP WITH TIME ZONE NOT NULL
+  created_at TIMESTAMP WITH TIME ZONE NOT NULL,
+  status TEXT NOT NULL DEFAULT 'completed' CHECK (status IN ('reserved', 'completed', 'failed')),
+  completed_at TIMESTAMP WITH TIME ZONE
 );
 
 CREATE INDEX IF NOT EXISTS idx_supervisor_observations_incident
   ON remote_agent_supervisor_observations(incident_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_supervisor_actions_incident
   ON remote_agent_supervisor_actions(incident_id, created_at);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_supervisor_action_incident
+  ON remote_agent_supervisor_actions(incident_id);
 CREATE INDEX IF NOT EXISTS idx_supervisor_repair_leases_expiry
   ON remote_agent_supervisor_repair_leases(expires_at) WHERE released_at IS NULL;

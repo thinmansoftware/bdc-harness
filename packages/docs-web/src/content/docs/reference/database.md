@@ -70,6 +70,7 @@ psql $DATABASE_URL < migrations/023_workflow_status_escalated_note.sql
 psql $DATABASE_URL < migrations/024_smart_cauldron_reliability.sql
 psql $DATABASE_URL < migrations/025_cauldron_drain_mode.sql
 psql $DATABASE_URL < migrations/026_supervisor_incidents.sql
+psql $DATABASE_URL < migrations/027_supervisor_action_reservation.sql
 ```
 
 ## Local PostgreSQL via Docker
@@ -106,6 +107,7 @@ docker compose exec postgres psql -U postgres -d remote_coding_agent
 \i /migrations/024_smart_cauldron_reliability.sql
 \i /migrations/025_cauldron_drain_mode.sql
 \i /migrations/026_supervisor_incidents.sql
+\i /migrations/027_supervisor_action_reservation.sql
 \q
 ```
 
@@ -119,6 +121,7 @@ psql postgresql://postgres:postgres@localhost:5432/remote_coding_agent < migrati
 psql postgresql://postgres:postgres@localhost:5432/remote_coding_agent < migrations/024_smart_cauldron_reliability.sql
 psql postgresql://postgres:postgres@localhost:5432/remote_coding_agent < migrations/025_cauldron_drain_mode.sql
 psql postgresql://postgres:postgres@localhost:5432/remote_coding_agent < migrations/026_supervisor_incidents.sql
+psql postgresql://postgres:postgres@localhost:5432/remote_coding_agent < migrations/027_supervisor_action_reservation.sql
 # ... and so on for each migration not yet applied
 ```
 
@@ -183,6 +186,8 @@ authority, leases, provider attempts, run outcomes, and durable provider waits.
 Migration 025 adds the singleton Cauldron control-state table used by drain mode.
 Migration 026 adds dual-supervisor incidents, immutable observations, fenced repair
 leases, and repair action evidence.
+Migration 027 reserves one action per incident before external repair and records
+completion state so a second supervisor cannot trigger a duplicate repair.
 
 ## Migration List
 
@@ -215,3 +220,4 @@ leases, and repair action evidence.
 | `024_smart_cauldron_reliability.sql` | Run authority, leases, provider attempts, outcomes, and waits |
 | `025_cauldron_drain_mode.sql` | Durable Cauldron drain-mode control state |
 | `026_supervisor_incidents.sql` | Dual-supervisor incidents, observations, fenced repair leases, and actions |
+| `027_supervisor_action_reservation.sql` | One-shot supervisor action reservation and completion state |

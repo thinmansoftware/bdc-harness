@@ -22,6 +22,7 @@ function makeSupervisorStore() {
   const observations: SupervisorObservationRecord[] = [];
   const actions: SupervisorActionRecord[] = [];
   let lease: SupervisorRepairLeaseRecord | null = null;
+  const callOrder: string[] = [];
   const store = {
     createSupervisorIncident: mock(async () => incident),
     appendSupervisorObservation: mock(async (observation: SupervisorObservationRecord) => {
@@ -48,18 +49,27 @@ function makeSupervisorStore() {
       async (data: { ownerId: string; fencingToken: number }) =>
         lease?.ownerId === data.ownerId && lease.fencingToken === data.fencingToken
     ),
+    reserveSupervisorAction: mock(async (action: SupervisorActionRecord) => {
+      callOrder.push('reserve');
+      actions.push(action);
+      return true;
+    }),
+    finalizeSupervisorAction: mock(async () => {
+      callOrder.push('finalize');
+      return true;
+    }),
     appendSupervisorAction: mock(async (action: SupervisorActionRecord) => {
       actions.push(action);
       return true;
     }),
     releaseSupervisorRepairLease: mock(async () => true),
   };
-  return { store: store as unknown as IWorkflowStore, observations, actions };
+  return { store: store as unknown as IWorkflowStore, observations, actions, callOrder };
 }
 
 describe('dual supervisor recovery coordination', () => {
   test('Sol and Fable observe concurrently while only one lease winner repairs', async () => {
-    const { store, observations, actions } = makeSupervisorStore();
+    const { store, observations, actions, callOrder } = makeSupervisorStore();
     let started = 0;
     let releaseObservers: (() => void) | undefined;
     const bothStarted = new Promise<void>(resolve => {
@@ -71,10 +81,13 @@ describe('dual supervisor recovery coordination', () => {
       await bothStarted;
       return { assessment: `${name}-assessment`, evidenceRefs: [`event:${name}`] };
     };
-    const repair = mock(async (owner: SupervisorRepairLeaseRecord) => ({
-      assessment: `repaired-by-${owner.ownerId}`,
-      evidenceRefs: ['action:repair'],
-    }));
+    const repair = mock(async (owner: SupervisorRepairLeaseRecord) => {
+      callOrder.push('repair');
+      return {
+        assessment: `repaired-by-${owner.ownerId}`,
+        evidenceRefs: ['action:repair'],
+      };
+    });
 
     const result = await coordinateSupervisorRecovery(store, {
       incident,
@@ -92,6 +105,30 @@ describe('dual supervisor recovery coordination', () => {
     expect(repair).toHaveBeenCalledTimes(1);
     expect(actions).toHaveLength(1);
     expect(actions[0]?.fencingToken).toBe(1);
+    expect(callOrder).toEqual(['reserve', 'repair', 'finalize']);
     expect(result.repaired).toBe(true);
+  });
+
+  test('does not run the external repair when action reservation loses the race', async () => {
+    const { store } = makeSupervisorStore();
+    (store.reserveSupervisorAction as ReturnType<typeof mock>).mockResolvedValue(false);
+    const repair = mock(async () => ({ assessment: 'must-not-run', evidenceRefs: [] }));
+
+    const result = await coordinateSupervisorRecovery(store, {
+      incident,
+      supervisors: [
+        {
+          supervisorId: 'sol',
+          observe: async () => ({ assessment: 'repairable', evidenceRefs: [] }),
+        },
+      ],
+      acquiredAt: '2026-07-10T12:00:01.000Z',
+      expiresAt: '2026-07-10T12:01:01.000Z',
+      actionType: 'repair_or_refire',
+      repair,
+    });
+
+    expect(repair).not.toHaveBeenCalled();
+    expect(result.repaired).toBe(false);
   });
 });

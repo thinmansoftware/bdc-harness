@@ -196,6 +196,17 @@ export interface IWorkflowStore {
     ownerId: string;
     fencingToken: number;
   }): Promise<boolean>;
+  reserveSupervisorAction?(action: SupervisorActionRecord): Promise<boolean>;
+  finalizeSupervisorAction?(data: {
+    actionId: string;
+    incidentId: string;
+    ownerId: string;
+    fencingToken: number;
+    status: 'completed' | 'failed';
+    outcome: string;
+    evidenceRefs: readonly string[];
+    completedAt: string;
+  }): Promise<boolean>;
   appendSupervisorAction?(action: SupervisorActionRecord): Promise<boolean>;
   releaseSupervisorRepairLease?(data: {
     incidentId: string;

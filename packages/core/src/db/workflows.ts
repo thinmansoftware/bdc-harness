@@ -699,6 +699,106 @@ export async function authorizeSupervisorMutation(data: {
   return result.rowCount === 1;
 }
 
+export async function reserveSupervisorAction(action: SupervisorActionRecord): Promise<boolean> {
+  const db = getDatabase();
+  const activeSql =
+    db.dialect === 'postgres'
+      ? 'l.expires_at > NOW()'
+      : "julianday(l.expires_at) > julianday('now')";
+  try {
+    return await db.withTransaction(async query => {
+      const authorized = await query(
+        `SELECT l.incident_id FROM remote_agent_supervisor_repair_leases l
+         JOIN remote_agent_supervisor_incidents i ON i.incident_id = l.incident_id
+         WHERE l.incident_id = $1 AND l.owner_id = $2 AND l.fencing_token = $3
+           AND l.released_at IS NULL AND ${activeSql}
+           AND i.status IN ('open', 'repairing')`,
+        [action.incidentId, action.ownerId, action.fencingToken]
+      );
+      if (authorized.rowCount !== 1) return false;
+      const inserted = await query(
+        `INSERT INTO remote_agent_supervisor_actions
+         (action_id, incident_id, owner_id, fencing_token, action_type, outcome,
+          evidence_refs, created_at, status, completed_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'reserved', NULL)
+         ON CONFLICT (incident_id) DO NOTHING`,
+        [
+          action.actionId,
+          action.incidentId,
+          action.ownerId,
+          action.fencingToken,
+          action.actionType,
+          action.outcome,
+          JSON.stringify(action.evidenceRefs),
+          action.createdAt,
+        ]
+      );
+      if (inserted.rowCount !== 1) return false;
+      const marked = await query(
+        `UPDATE remote_agent_supervisor_incidents
+         SET status = 'repairing', updated_at = $2
+         WHERE incident_id = $1 AND status IN ('open', 'repairing')`,
+        [action.incidentId, action.createdAt]
+      );
+      if (marked.rowCount !== 1) throw new Error('supervisor_action_reservation_conflict');
+      return true;
+    });
+  } catch (error) {
+    if (error instanceof Error && error.message === 'supervisor_action_reservation_conflict') {
+      return false;
+    }
+    throw error;
+  }
+}
+
+export async function finalizeSupervisorAction(data: {
+  actionId: string;
+  incidentId: string;
+  ownerId: string;
+  fencingToken: number;
+  status: 'completed' | 'failed';
+  outcome: string;
+  evidenceRefs: readonly string[];
+  completedAt: string;
+}): Promise<boolean> {
+  const db = getDatabase();
+  try {
+    return await db.withTransaction(async query => {
+      const finalized = await query(
+        `UPDATE remote_agent_supervisor_actions
+         SET status = $5, outcome = $6, evidence_refs = $7, completed_at = $8
+         WHERE action_id = $1 AND incident_id = $2 AND owner_id = $3
+           AND fencing_token = $4 AND status = 'reserved'`,
+        [
+          data.actionId,
+          data.incidentId,
+          data.ownerId,
+          data.fencingToken,
+          data.status,
+          data.outcome,
+          JSON.stringify(data.evidenceRefs),
+          data.completedAt,
+        ]
+      );
+      if (finalized.rowCount !== 1) return false;
+      const incidentStatus = data.status === 'completed' ? 'recovered' : 'escalated';
+      const closed = await query(
+        `UPDATE remote_agent_supervisor_incidents
+         SET status = $2, updated_at = $3
+         WHERE incident_id = $1 AND status = 'repairing'`,
+        [data.incidentId, incidentStatus, data.completedAt]
+      );
+      if (closed.rowCount !== 1) throw new Error('supervisor_action_finalization_conflict');
+      return true;
+    });
+  } catch (error) {
+    if (error instanceof Error && error.message === 'supervisor_action_finalization_conflict') {
+      return false;
+    }
+    throw error;
+  }
+}
+
 export async function appendSupervisorAction(action: SupervisorActionRecord): Promise<boolean> {
   const db = getDatabase();
   const activeSql =
