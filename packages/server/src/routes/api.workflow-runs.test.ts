@@ -114,6 +114,8 @@ const mockRunCascade = mock(
     return record;
   }
 );
+const mockCheckCodexDispatchGate = mock(async () => ({ fresh: true as const }));
+const mockFetch = mock(async () => new Response('ok', { status: 200 }));
 
 // Type aliases for clarity in tests
 type MockWorkflowRun = {
@@ -212,6 +214,10 @@ mock.module('@archon/workflows/executor', () => ({
 
 mock.module('@archon/smart-cauldron/cascade', () => ({
   runCascade: mockRunCascade,
+}));
+
+mock.module('@archon/providers/auth-refresh/dispatch-gate', () => ({
+  checkCodexDispatchGate: mockCheckCodexDispatchGate,
 }));
 
 mock.module('../adapters/web/workflow-bridge', () => ({
@@ -470,6 +476,11 @@ describe('POST /api/workflows/:name/run', () => {
     mockGetCauldronDrainState.mockReset();
     mockGetCauldronDrainState.mockResolvedValue(normalDrainState);
     mockRunCascade.mockClear();
+    mockCheckCodexDispatchGate.mockReset();
+    mockCheckCodexDispatchGate.mockImplementation(async () => ({ fresh: true as const }));
+    mockFetch.mockReset();
+    mockFetch.mockImplementation(async () => new Response('ok', { status: 200 }));
+    globalThis.fetch = mockFetch as unknown as typeof fetch;
     delete process.env.ARCHON_SMART_CAULDRON_DISPATCH_ENABLED;
     // Pre-dispatch validation resolves the workflow name against discovery
     // before accepting -- seed the names these tests dispatch.
@@ -478,6 +489,14 @@ describe('POST /api/workflows/:name/run', () => {
       workflows: [
         { workflow: { name: 'deploy' } as never, source: 'project' as const },
         { workflow: { name: 'test-suite' } as never, source: 'project' as const },
+        {
+          workflow: { name: 'codex-lane', nodes: [{ provider: 'codex' }] } as never,
+          source: 'project' as const,
+        },
+        {
+          workflow: { name: 'claude-lane', nodes: [{ provider: 'claude' }] } as never,
+          source: 'project' as const,
+        },
       ],
       errors: [],
     }));
@@ -543,6 +562,71 @@ describe('POST /api/workflows/:name/run', () => {
     const body = (await response.json()) as { accepted: boolean; status: string };
     expect(body.accepted).toBe(true);
     expect(body.status).toBe('started');
+  });
+
+  test('refuses codex lane dispatch when auth remains stale', async () => {
+    mockCheckCodexDispatchGate.mockImplementationOnce(async () => ({
+      fresh: false as const,
+      reason: 'stale',
+    }));
+
+    const { app } = makeApp();
+    const response = await app.request('/api/workflows/codex-lane/run', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        conversationId: 'web-test-abc',
+        message: 'WO-HARNESS-CODEX-AUTH-SYNC-AND-FRESHNESS-GATE-01',
+        conductor: {
+          enabled: true,
+          woId: 'WO-HARNESS-CODEX-AUTH-SYNC-AND-FRESHNESS-GATE-01',
+          project: 'bdc-harness',
+          woClass: 'MIXED',
+          idempotencyKey: 'codex-auth-stale-test',
+        },
+      }),
+    });
+
+    expect(response.status).toBe(503);
+    expect(await response.json()).toEqual({ error: 'codex_auth_stale' });
+    expect(mockHandleMessage).not.toHaveBeenCalled();
+    expect(mockCheckCodexDispatchGate).toHaveBeenCalledTimes(1);
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(mockFetch).toHaveBeenCalledWith(
+      'https://n8n.bluedevilcollectibles.com/webhook/builder-status',
+      expect.objectContaining({
+        method: 'POST',
+        body: JSON.stringify({
+          builder: 'Cauldron',
+          wo_id: 'WO-HARNESS-CODEX-AUTH-SYNC-AND-FRESHNESS-GATE-01',
+          action: 'blocked',
+          detail: 'codex auth stale -- dispatch refused',
+        }),
+      })
+    );
+    expect(JSON.stringify(mockFetch.mock.calls)).not.toContain('eyJ');
+  });
+
+  test('passes fresh codex lanes and does not consult gate for non-codex lanes', async () => {
+    const { app } = makeApp();
+    const codexResponse = await app.request('/api/workflows/codex-lane/run', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ conversationId: 'web-test-abc', message: 'Run codex lane' }),
+    });
+
+    expect(codexResponse.status).toBe(200);
+    expect(mockCheckCodexDispatchGate).toHaveBeenCalledTimes(1);
+
+    mockCheckCodexDispatchGate.mockClear();
+    const claudeResponse = await app.request('/api/workflows/claude-lane/run', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ conversationId: 'web-test-def', message: 'Run claude lane' }),
+    });
+
+    expect(claudeResponse.status).toBe(200);
+    expect(mockCheckCodexDispatchGate).toHaveBeenCalledTimes(0);
   });
 
   test('keeps explicit direct-lane dispatch when conductor integration is disabled', async () => {
