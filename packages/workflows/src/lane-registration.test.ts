@@ -39,6 +39,9 @@ interface NodeDef {
   provider?: string;
   model?: string;
   bash?: string;
+  loop?: {
+    prompt?: string;
+  };
 }
 
 interface LaneDef {
@@ -181,6 +184,14 @@ describe('lane registration and war-council-validator pin', () => {
         spec_paths: ['docs/work-orders/{WO_ID}.md', 'docs/superpowers/specs/{WO_ID}.md'],
         allow_issue_fallback: true,
       });
+    });
+
+    it(`S4g: ${file} wires implement to read gate-already-satisfied output`, () => {
+      const lane = loadLane(file);
+      const implement = lane.nodes?.find(node => node.id === 'implement');
+      expect(implement?.loop?.prompt).toContain('$gate-already-satisfied.output');
+      expect(implement?.loop?.prompt).toContain('PRECHECK_VERDICT=already-satisfied');
+      expect(implement?.loop?.prompt).toContain('Completion Criteria case 2');
     });
 
     it(`S4e: ${file} derives its manifest from mechanical evidence`, () => {

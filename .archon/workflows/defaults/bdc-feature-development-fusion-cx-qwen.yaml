@@ -355,6 +355,14 @@ nodes:
         ## Spec
         $read-spec.output
 
+        ## Idempotency short-circuit -- CHECK THIS FIRST (WO-HARNESS-IMPLEMENT-SKIP-WHEN-ALREADY-SATISFIED-01)
+        Pre-check verdict from gate-already-satisfied (upstream, already decided this):
+        $gate-already-satisfied.output
+        If the line above contains PRECHECK_VERDICT=already-satisfied, do NOT run a fresh
+        investigation. On THIS iteration, verify the SATISFIED_EVIDENCE claim with a single
+        cheap check in THIS worktree, then go straight to Completion Criteria case 2
+        (ALREADY SATISFIED) below and emit its sentinel. Do not consume additional iterations.
+
         ## Plan (approved by plan-review)
         Use ONLY the text between the === APPROVED_PLAN_BEGIN === and
         === APPROVED_PLAN_END === markers below as the plan. IGNORE everything outside
