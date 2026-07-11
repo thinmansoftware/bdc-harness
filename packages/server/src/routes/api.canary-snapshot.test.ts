@@ -10,8 +10,12 @@ import {
   makeLoaderMock,
 } from '../test/workflow-mock-factories';
 
-const mockAddMessage = mock(async () => null);
-const mockCreateWorkflowRun = mock(async () => null);
+const messageDb = {
+  addMessage: mock(async () => null),
+};
+const workflowDb = {
+  createWorkflowRun: mock(async () => null),
+};
 
 mock.module('@archon/core', () => ({
   handleMessage: mock(async () => {}),
@@ -89,7 +93,7 @@ mock.module('@archon/core/db/codebases', () => ({
 mock.module('@archon/core/db/env-vars', () => ({}));
 mock.module('@archon/core/db/isolation-environments', () => ({}));
 mock.module('@archon/core/db/workflows', () => ({
-  createWorkflowRun: mockCreateWorkflowRun,
+  createWorkflowRun: workflowDb.createWorkflowRun,
   getCauldronDrainState: mock(async () => ({
     mode: 'normal',
     activeLeaseCount: 0,
@@ -100,7 +104,7 @@ mock.module('@archon/core/db/workflows', () => ({
   })),
 }));
 mock.module('@archon/core/db/workflow-events', () => ({}));
-mock.module('@archon/core/db/messages', () => ({ addMessage: mockAddMessage }));
+mock.module('@archon/core/db/messages', () => ({ addMessage: messageDb.addMessage }));
 mock.module('@archon/core/utils/commands', () => ({
   findMarkdownFilesRecursive: mock(async () => []),
 }));
@@ -151,8 +155,8 @@ let previousToken: string | undefined;
 beforeEach(() => {
   previousToken = process.env.ARCHON_OPERATOR_TOKEN;
   process.env.ARCHON_OPERATOR_TOKEN = 'test-operator-token';
-  mockAddMessage.mockClear();
-  mockCreateWorkflowRun.mockClear();
+  messageDb.addMessage.mockClear();
+  workflowDb.createWorkflowRun.mockClear();
 });
 
 afterEach(() => {
@@ -177,7 +181,7 @@ describe('GET /api/admin/canary/snapshot', () => {
     expect(response.status).toBe(200);
     expect(await response.json()).toEqual(snapshot);
     expect(builder).toHaveBeenCalledWith('codebase-1', 'dev');
-    expect(mockAddMessage).not.toHaveBeenCalled();
-    expect(mockCreateWorkflowRun).not.toHaveBeenCalled();
+    expect(messageDb.addMessage).not.toHaveBeenCalled();
+    expect(workflowDb.createWorkflowRun).not.toHaveBeenCalled();
   });
 });
