@@ -17,6 +17,7 @@ run_authority:
 # Main Claude build lane: model: sonnet is CORRECT here -- this lane IS the Claude lane.
 # All build + review nodes are intentionally Claude. Do NOT change this to a cheaper model.
 # See Ambiguity 1 resolution in WO-HARNESS-SMART-CAULDRON-LANE-ROSTER-AND-RESILIENCE-01.
+provider: claude
 model: sonnet
 
 nodes:
