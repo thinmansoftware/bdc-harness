@@ -227,7 +227,7 @@ nodes:
   # plan that `implement` consumes. NOT a human gate -- humans are reached only via the
   # async escalation payload, and only at the irreversible-action boundary downstream.
   - id: plan-review
-    provider: codex-opr
+    provider: opr
     model: qwen/qwen3-coder
     persona: war-council-architect-opr
     depends_on: [plan]
