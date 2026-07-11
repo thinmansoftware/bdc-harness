@@ -1750,6 +1750,43 @@ describe('handleWorkflowRunCommand -- E2 single codebase auto-select', () => {
     );
   });
 
+  test('passes definition source SHA for multi-codebase command-handler binding', async () => {
+    const conversation = makeConversation({ codebase_id: null });
+    const harness = makeCodebase('bluedevilcollectibles/bdc-harness', 'harness-id');
+    const shopops = makeCodebase('bluedevilcollectibles/shopops', 'shopops-id');
+    const workflow = makeTestWorkflow({
+      name: 'assist',
+      target_repo: 'bluedevilcollectibles/shopops',
+    });
+    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(conversation));
+    mockParseCommand.mockReturnValueOnce({ command: 'commands', args: [] });
+    mockHandleCommand.mockReturnValueOnce(
+      Promise.resolve({
+        success: true,
+        message: 'Running workflow assist...',
+        workflow: {
+          definition: workflow,
+          args: 'WO-123',
+          definitionSourceSha: 'def67890',
+        },
+      })
+    );
+    mockListCodebases.mockReturnValueOnce(Promise.resolve([harness, shopops]));
+
+    const platform = makePlatform();
+    await handleMessage(platform, 'conv-1', '/commands');
+
+    expect(mockDispatchBackgroundWorkflow).toHaveBeenCalledWith(
+      expect.objectContaining({
+        originalMessage: 'WO-123',
+        conversationDbId: 'conv-1',
+        codebaseId: shopops.id,
+        definitionSourceSha: 'def67890',
+      }),
+      expect.objectContaining({ name: 'assist' })
+    );
+  });
+
   test('strips --project flag from app-default /workflow run before dispatch', async () => {
     const conversation = makeConversation({ codebase_id: null });
     const harness = makeCodebase('bluedevilcollectibles/bdc-harness', 'harness-id');

@@ -36,10 +36,7 @@ import { AuthRefreshedRetryNeeded } from './auth-retry-sentinel';
 import { getArchonWorkspacesPath, ensureArchonWorkspacesPath } from '@archon/paths';
 import { syncArchonToWorktree } from '../utils/worktree-sync';
 import type { WorkspaceSyncResult } from '@archon/git';
-import {
-  definitionSourceShaFromSync,
-  syncCodebaseSourceClone,
-} from '../utils/codebase-sync';
+import { definitionSourceShaFromSync, syncCodebaseSourceClone } from '../utils/codebase-sync';
 import { discoverWorkflowsWithConfig } from '@archon/workflows/workflow-discovery';
 import { findWorkflow } from '@archon/workflows/router';
 import { executeWorkflow } from '@archon/workflows/executor';
@@ -2044,7 +2041,8 @@ async function handleWorkflowRunCommand(
       binding.codebase,
       workflow,
       binding.userMessage,
-      isolationHints
+      isolationHints,
+      definitionSourceSha
     );
     return;
   }
