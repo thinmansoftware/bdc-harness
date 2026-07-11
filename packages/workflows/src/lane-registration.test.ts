@@ -39,6 +39,7 @@ interface NodeDef {
   provider?: string;
   model?: string;
   bash?: string;
+  prompt?: string;
   loop?: {
     prompt?: string;
   };
@@ -192,6 +193,18 @@ describe('lane registration and war-council-validator pin', () => {
       expect(implement?.loop?.prompt).toContain('$gate-already-satisfied.output');
       expect(implement?.loop?.prompt).toContain('PRECHECK_VERDICT=already-satisfied');
       expect(implement?.loop?.prompt).toContain('Completion Criteria case 2');
+    });
+
+    it(`S4h: ${file} wires plan/plan-review for already-satisfied verification`, () => {
+      const lane = loadLane(file);
+      const plan = lane.nodes?.find(node => node.id === 'plan');
+      const planReview = lane.nodes?.find(node => node.id === 'plan-review');
+      expect(plan?.prompt).toContain('$gate-already-satisfied.output');
+      expect(plan?.prompt).toContain('PRECHECK_VERDICT=already-satisfied');
+      expect(plan?.prompt).toContain('minimal plan that VERIFIES');
+      expect(planReview?.loop?.prompt).toContain('$gate-already-satisfied.output');
+      expect(planReview?.loop?.prompt).toContain('PRECHECK_VERDICT=already-satisfied');
+      expect(planReview?.loop?.prompt).toContain('minimal plan that VERIFIES');
     });
 
     it(`S4e: ${file} derives its manifest from mechanical evidence`, () => {

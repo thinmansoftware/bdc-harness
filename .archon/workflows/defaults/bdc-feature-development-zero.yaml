@@ -270,6 +270,10 @@ nodes:
 
         ## Inputs
         Original plan: $plan.output
+        Pre-check verdict (from gate-already-satisfied): $gate-already-satisfied.output
+        If PRECHECK_VERDICT=already-satisfied, the deliverables already exist in this
+        worktree. Ensure the approved plan remains a minimal plan that VERIFIES the
+        existing state rather than re-creating it.
         Spec: $read-spec.output
 
         ## Attack the plan on these dimensions
