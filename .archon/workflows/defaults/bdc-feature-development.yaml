@@ -2373,10 +2373,71 @@ nodes:
       FILES_CREATED="$(printf '%s\n' "$MANIFEST_OUT" | grep -E '^Files created:' | head -1 | sed 's/^Files created:[[:space:]]*//' || true)"
       printf '%s\n' "$MANIFEST_OUT" | vma_process "$FILES_CREATED"
 
+  - id: stamp-manifest-pr
+    persona: major-build
+    load_bearing: true
+    depends_on: [verify-manifest-assertions, open-pr-if-needed, block-reclassify]
+    trigger_rule: all_done
+    task_class: clerical
+    # WO-HARNESS-MANIFEST-PR-FIELD-MECHANICAL-01: build-manifest prose is not
+    # authoritative for the load-bearing PRs: field. Stamp it from the same
+    # mechanical open-pr-if-needed evidence consumed by manifest-consistency-check.
+    bash: |
+      set -uo pipefail
+
+      capture_node_output() {
+        python3 -c 'import shlex, sys; s=sys.stdin.read(); sys.stdout.write((lambda p: p[0] if len(p)==1 else s)(shlex.split(s)) if len(s)>=2 and s[0]=="'"'"'" and s.rstrip("\n").endswith("'"'"'") else s)'
+      }
+
+      # ---- BEGIN stamp-manifest-pr core (byte-identical across lanes; extracted by unit test) ----
+      # smp_process <status> <pr-url>   (reads full manifest on stdin -> stdout)
+      #   When block-reclassify says PROCEED and open-pr-if-needed resolved a PR,
+      #   mechanically overwrite the first PRs: line with that URL. Non-PROCEED
+      #   paths and genuine open-pr failures pass through unchanged.
+      smp_process() {
+        local status="$1" pr_url="$2" manifest
+        manifest="$(cat)"
+        if [ "$status" = "PROCEED" ] && [ -n "$pr_url" ]; then
+          if printf '%s\n' "$manifest" | grep -qE '^PRs:'; then
+            printf '%s\n' "$manifest" | REPL="PRs: ${pr_url}" awk '
+              !seen && /^PRs:/ { print ENVIRON["REPL"]; seen=1; next }
+              { print }
+            '
+          else
+            printf '%s\n' "$manifest"
+            printf 'PRs: %s\n' "$pr_url"
+          fi
+          return 0
+        fi
+        printf '%s\n' "$manifest"
+      }
+      # ---- END stamp-manifest-pr core ----
+
+      RECLASSIFY=$(capture_node_output <<'BDC_NODE_OUTPUT_BLOCK_RECLASSIFY'
+      $block-reclassify.output
+      BDC_NODE_OUTPUT_BLOCK_RECLASSIFY
+      )
+      STATUS=$(printf '%s\n' "$RECLASSIFY" | sed -n 's/.*"status":"\([A-Z_]*\)".*/\1/p' | head -1)
+
+      OPEN_PR_OUT=$(capture_node_output <<'BDC_NODE_OUTPUT_OPEN_PR'
+      $open-pr-if-needed.output
+      BDC_NODE_OUTPUT_OPEN_PR
+      )
+      PR_URL=$(printf '%s\n' "$OPEN_PR_OUT" | grep -E '^PR_URL=' | sed 's/^PR_URL=//' | head -1 || true)
+      if [ -z "$PR_URL" ]; then
+        PR_URL=$(printf '%s\n' "$OPEN_PR_OUT" | grep -E '^https://github\.com/' | head -1 || true)
+      fi
+
+      MANIFEST_OUT=$(capture_node_output <<'BDC_NODE_OUTPUT_MANIFEST'
+      $verify-manifest-assertions.output
+      BDC_NODE_OUTPUT_MANIFEST
+      )
+      printf '%s\n' "$MANIFEST_OUT" | smp_process "$STATUS" "$PR_URL"
+
   - id: manifest-consistency-check
     persona: major-build
     load_bearing: true
-    depends_on: [build-manifest, verify-manifest-assertions, open-pr-if-needed, block-reclassify]
+    depends_on: [build-manifest, verify-manifest-assertions, stamp-manifest-pr, open-pr-if-needed, block-reclassify]
     trigger_rule: all_done
     task_class: clerical
     bash: |
@@ -2402,7 +2463,7 @@ nodes:
       fi
 
       MANIFEST_OUT=$(capture_node_output <<'BDC_NODE_OUTPUT_MANIFEST'
-      $verify-manifest-assertions.output
+      $stamp-manifest-pr.output
       BDC_NODE_OUTPUT_MANIFEST
       )
       extract() {
@@ -2486,7 +2547,7 @@ nodes:
   # written to the PR body or Notion under trigger_rule: all_done.
   - id: patch-pr-body
     persona: major-build
-    depends_on: [build-manifest, verify-manifest-assertions, manifest-consistency-check]
+    depends_on: [build-manifest, verify-manifest-assertions, stamp-manifest-pr, manifest-consistency-check]
     when: "$manifest-consistency-check.output == 'OK'"
     trigger_rule: all_done
     task_class: clerical
@@ -2604,9 +2665,9 @@ nodes:
       [ -z "$FILES_CREATED" ] && FILES_CREATED="none"
       [ -z "$FILES_MODIFIED" ] && FILES_MODIFIED="none"
 
-      # -- Extract structured fields from build-manifest AI output.
+      # -- Extract structured fields from mechanically stamped manifest output.
       MANIFEST_OUT=$(capture_node_output <<'BDC_NODE_OUTPUT_MANIFEST'
-      $verify-manifest-assertions.output
+      $stamp-manifest-pr.output
       BDC_NODE_OUTPUT_MANIFEST
       )
       extract() {
