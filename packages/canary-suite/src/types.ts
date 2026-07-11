@@ -1,15 +1,3 @@
-export const CANARY_LANES = [
-  'bdc-feature-development-zero-open',
-  'bdc-feature-development-zero',
-  'bdc-feature-development-fusion-cx-qwen',
-  'bdc-feature-development-codex-only',
-  'bdc-feature-development-codex',
-  'bdc-feature-development',
-  'bdc-feature-development-fable',
-  'bdc-multi-stage-development',
-] as const;
-
-export type CanaryLaneName = (typeof CANARY_LANES)[number];
 export type CanaryVerdict = 'passed' | 'failed' | 'blocked' | 'aborted';
 
 export interface LaneManifest {
@@ -173,3 +161,16 @@ export interface RunCanaryResult {
   readonly report: CanaryReport;
   readonly artifactPaths: readonly string[];
 }
+
+export const CANARY_LANES = [
+  'bdc-feature-development-zero-open',
+  'bdc-feature-development-zero',
+  'bdc-feature-development-fusion-cx-qwen',
+  'bdc-feature-development-codex-only',
+  'bdc-feature-development-codex',
+  'bdc-feature-development',
+  'bdc-feature-development-fable',
+  'bdc-multi-stage-development',
+] as const;
+
+export type CanaryLaneName = (typeof CANARY_LANES)[number];
