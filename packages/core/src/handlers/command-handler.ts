@@ -18,6 +18,10 @@ import {
 } from '../services/cleanup-service';
 import { getArchonWorkspacesPath } from '@archon/paths';
 import { loadConfig } from '../config/config-loader';
+import {
+  definitionSourceShaFromSync,
+  syncCodebaseSourceClone,
+} from '../utils/codebase-sync';
 import { discoverWorkflowsWithConfig } from '@archon/workflows/workflow-discovery';
 import { resolveWorkflowName } from '@archon/workflows/router';
 import type {
@@ -803,6 +807,7 @@ async function handleWorkflowCommand(
       // Discover workflows with error handling
       let workflowEntries: readonly WorkflowWithSource[];
       let loadErrors: readonly WorkflowLoadError[];
+      const sync = codebase ? await syncCodebaseSourceClone(codebase) : undefined;
       try {
         const result = await discoverWorkflowsWithConfig(workflowCwd, loadConfig);
         workflowEntries = result.workflows;
@@ -874,6 +879,7 @@ async function handleWorkflowCommand(
         workflow: {
           definition: workflow,
           args: workflowArgs,
+          definitionSourceSha: sync ? definitionSourceShaFromSync(sync) : undefined,
         },
       };
     }

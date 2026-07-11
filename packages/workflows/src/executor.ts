@@ -449,7 +449,8 @@ export async function executeWorkflow(
   },
   parentConversationId?: string,
   preCreatedRun?: WorkflowRun,
-  authoritySource?: RunAuthorityDispatch
+  authoritySource?: RunAuthorityDispatch,
+  definitionSourceSha?: string
 ): Promise<WorkflowExecutionResult> {
   // Load config once for the entire workflow execution
   const fileConfig = await deps.loadConfig(cwd);
@@ -921,6 +922,7 @@ export async function executeWorkflow(
       runId: workflowRun.id,
       workflowName: executableWorkflow.name,
       conversationId: conversationDbId,
+      definitionSourceSha,
     });
 
     // Fire-and-forget anonymous usage telemetry. No PII: only workflow name +
@@ -936,7 +938,10 @@ export async function executeWorkflow(
       .createWorkflowEvent({
         workflow_run_id: workflowRun.id,
         event_type: 'workflow_started',
-        data: { workflowName: executableWorkflow.name },
+        data: {
+          workflowName: executableWorkflow.name,
+          ...(definitionSourceSha ? { definitionSourceSha } : {}),
+        },
       })
       .catch((err: Error) => {
         getLog().error(

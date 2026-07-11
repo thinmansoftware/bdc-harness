@@ -29,6 +29,7 @@ const mockSyncWorkspace = mock(() =>
     updated: false,
   })
 );
+const mockExecFileAsync = mock(() => Promise.resolve({ stdout: 'abc12345\n', stderr: '' }));
 // Identity passthrough -- strips branded type for test simplicity; empty-string guard not needed here
 const mockToRepoPath = mock((p: string) => p);
 const mockGetOrCreateConversation = mock(() => Promise.resolve(null as unknown));
@@ -193,6 +194,7 @@ mock.module('../utils/worktree-sync', () => ({
 }));
 
 mock.module('@archon/git', () => ({
+  execFileAsync: mockExecFileAsync,
   syncWorkspace: mockSyncWorkspace,
   toRepoPath: mockToRepoPath,
 }));
@@ -1050,6 +1052,7 @@ describe('WorkflowInvocation and ProjectRegistration type shapes', () => {
 describe('discoverAllWorkflows -- remote sync', () => {
   beforeEach(() => {
     mockSyncWorkspace.mockClear();
+    mockExecFileAsync.mockClear();
     mockToRepoPath.mockClear();
     mockGetOrCreateConversation.mockReset();
     mockGetCodebase.mockReset();
@@ -1067,6 +1070,14 @@ describe('discoverAllWorkflows -- remote sync', () => {
         envVars: {},
       })
     );
+    mockSyncWorkspace.mockResolvedValue({
+      branch: 'main',
+      synced: true,
+      previousHead: 'abc12345',
+      newHead: 'abc12345',
+      updated: false,
+    });
+    mockExecFileAsync.mockResolvedValue({ stdout: 'abc12345\n', stderr: '' });
   });
 
   test('calls syncWorkspace with codebase.default_cwd when conversation has codebase_id', async () => {
@@ -1145,6 +1156,82 @@ describe('discoverAllWorkflows -- remote sync', () => {
 
     expect(mockLogger.warn).toHaveBeenCalledWith(
       expect.objectContaining({ codebaseId: 'codebase-1' }),
+      'workspace.sync_failed'
+    );
+  });
+
+  test('slash workflow run syncs codebase clone before repo workflow discovery', async () => {
+    const conversation = makeConversation({ codebase_id: null });
+    const codebase = makeCodebaseForSync();
+    const workflow = makeTestWorkflow({
+      name: 'test-workflow',
+      nodes: [
+        { id: 'old-node', command: 'echo old' },
+        { id: 'node-added-on-origin', command: 'echo new' },
+      ],
+    });
+    const order: string[] = [];
+    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(conversation));
+    mockListCodebases.mockResolvedValueOnce([codebase]);
+    mockDiscoverWorkflowsWithConfig.mockImplementation(async (cwd: string) => {
+      order.push(`discover:${cwd}`);
+      if (cwd === '/repos/test-repo') {
+        return {
+          workflows: [{ workflow }],
+          errors: [],
+        };
+      }
+      return { workflows: [], errors: [] };
+    });
+    mockSyncWorkspace.mockImplementationOnce(() => {
+      order.push('sync');
+      return Promise.resolve({
+        branch: 'main',
+        synced: true,
+        previousHead: 'abc12345',
+        newHead: 'def67890',
+        updated: true,
+      });
+    });
+
+    const platform = makePlatform();
+    await handleMessage(platform, 'conv-1', '/workflow run test-workflow payload');
+
+    expect(order.indexOf('sync')).toBeGreaterThan(-1);
+    expect(order.indexOf('sync')).toBeLessThan(order.indexOf('discover:/repos/test-repo'));
+    expect(mockSyncWorkspace).toHaveBeenCalledTimes(1);
+    expect(mockDispatchBackgroundWorkflow).toHaveBeenCalled();
+    const [ctx, dispatchedWorkflow] = mockDispatchBackgroundWorkflow.mock.calls[0] as unknown[];
+    expect((dispatchedWorkflow as WorkflowDefinition).nodes.map(node => node.id)).toContain(
+      'node-added-on-origin'
+    );
+    expect((ctx as { definitionSourceSha?: string }).definitionSourceSha).toBe('def67890');
+  });
+
+  test('slash workflow run fails open when source clone sync fails', async () => {
+    const conversation = makeConversation({ codebase_id: null });
+    const codebase = makeCodebaseForSync();
+    const workflow = makeTestWorkflow({ name: 'test-workflow' });
+    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(conversation));
+    mockListCodebases.mockResolvedValueOnce([codebase]);
+    mockDiscoverWorkflowsWithConfig.mockImplementation(async (cwd: string) => {
+      if (cwd === '/repos/test-repo') {
+        return { workflows: [{ workflow }], errors: [] };
+      }
+      return { workflows: [], errors: [] };
+    });
+    mockSyncWorkspace.mockRejectedValueOnce(new Error('remote unavailable'));
+    mockExecFileAsync.mockResolvedValueOnce({ stdout: 'abc12345\n', stderr: '' });
+
+    const platform = makePlatform();
+    await handleMessage(platform, 'conv-1', '/workflow run test-workflow payload');
+
+    expect(mockDispatchBackgroundWorkflow).toHaveBeenCalled();
+    expect(mockLogger.warn).toHaveBeenCalledWith(
+      expect.objectContaining({
+        codebaseId: 'codebase-1',
+        definitionSourceSha: 'abc12345',
+      }),
       'workspace.sync_failed'
     );
   });

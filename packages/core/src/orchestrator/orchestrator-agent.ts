@@ -35,8 +35,11 @@ import type { ProviderName } from '@archon/providers/auth-refresh';
 import { AuthRefreshedRetryNeeded } from './auth-retry-sentinel';
 import { getArchonWorkspacesPath, ensureArchonWorkspacesPath } from '@archon/paths';
 import { syncArchonToWorktree } from '../utils/worktree-sync';
-import { syncWorkspace, toRepoPath } from '@archon/git';
 import type { WorkspaceSyncResult } from '@archon/git';
+import {
+  definitionSourceShaFromSync,
+  syncCodebaseSourceClone,
+} from '../utils/codebase-sync';
 import { discoverWorkflowsWithConfig } from '@archon/workflows/workflow-discovery';
 import { findWorkflow } from '@archon/workflows/router';
 import { executeWorkflow } from '@archon/workflows/executor';
@@ -244,7 +247,8 @@ async function dispatchOrchestratorWorkflow(
   codebase: Codebase,
   workflow: WorkflowDefinition,
   userMessage: string,
-  isolationHints?: HandleMessageContext['isolationHints']
+  isolationHints?: HandleMessageContext['isolationHints'],
+  definitionSourceSha?: string
 ): Promise<void> {
   // Auto-attach project to conversation
   await db.updateConversation(conversation.id, {
@@ -319,7 +323,10 @@ async function dispatchOrchestratorWorkflow(
         codebase.id,
         undefined, // issueContext
         undefined, // isolationContext
-        conversation.id // parentConversationId -- enables approve/reject auto-resume
+        conversation.id, // parentConversationId -- enables approve/reject auto-resume
+        undefined, // preCreatedRun
+        undefined, // authoritySource
+        definitionSourceSha
       );
     } else if (workflow.interactive) {
       // Interactive workflows run in foreground so output stays in the user's conversation
@@ -334,7 +341,10 @@ async function dispatchOrchestratorWorkflow(
         codebase.id,
         undefined, // issueContext
         undefined, // isolationContext
-        conversation.id // parentConversationId -- enables approve/reject auto-resume
+        conversation.id, // parentConversationId -- enables approve/reject auto-resume
+        undefined, // preCreatedRun
+        undefined, // authoritySource
+        definitionSourceSha
       );
     } else {
       await dispatchBackgroundWorkflow(
@@ -347,6 +357,7 @@ async function dispatchOrchestratorWorkflow(
           codebaseId: codebase.id,
           availableWorkflows: [workflow],
           isolationHints,
+          definitionSourceSha,
         },
         workflow
       );
@@ -363,7 +374,10 @@ async function dispatchOrchestratorWorkflow(
       codebase.id,
       undefined, // issueContext
       undefined, // isolationContext
-      conversation.id // parentConversationId -- enables approve/reject auto-resume
+      conversation.id, // parentConversationId -- enables approve/reject auto-resume
+      undefined, // preCreatedRun
+      undefined, // authoritySource
+      definitionSourceSha
     );
   }
 }
@@ -449,31 +463,9 @@ async function discoverAllWorkflows(conversation: Conversation): Promise<Discove
     try {
       const codebase = await codebaseDb.getCodebase(conversation.codebase_id);
       if (codebase) {
-        // Sync canonical source with remote before the AI reads codebase state.
-        // Only hard-reset for Archon-managed clones (under ~/.archon/workspaces/).
-        // Locally-registered repos get fetch-only to avoid destroying uncommitted work.
-        // Non-fatal: if fetch fails (network, no remote), proceed with local state.
-        try {
-          const isManagedClone = codebase.default_cwd
-            .replace(/\\/g, '/')
-            .startsWith(getArchonWorkspacesPath().replace(/\\/g, '/'));
-          syncResult = await syncWorkspace(toRepoPath(codebase.default_cwd), undefined, {
-            resetAfterFetch: isManagedClone,
-          });
-          getLog().debug(
-            {
-              codebaseId: codebase.id,
-              repoPath: codebase.default_cwd,
-              isManagedClone,
-              ...syncResult,
-            },
-            'workspace.sync_completed'
-          );
-        } catch (err) {
-          const error = err as Error;
-          syncError = error.message;
-          getLog().warn({ err: error, codebaseId: codebase.id }, 'workspace.sync_failed');
-        }
+        const sync = await syncCodebaseSourceClone(codebase);
+        syncResult = sync.syncResult;
+        syncError = sync.syncError;
         const workflowCwd = conversation.cwd ?? codebase.default_cwd;
         await syncArchonToWorktree(workflowCwd);
         // Load config once for this codebase path; reuse below to avoid a second disk read
@@ -772,7 +764,8 @@ export async function handleMessage(
             conversation,
             result.workflow.definition,
             result.workflow.args ?? message,
-            isolationHints
+            isolationHints,
+            result.workflow.definitionSourceSha
           );
         }
         return;
@@ -1676,11 +1669,18 @@ function workflowLoadErrorForName(
 
 async function discoverWorkflowForCodebase(
   workflowName: string,
-  workflowCwd: string
+  codebase: Codebase
 ): Promise<
-  | { ok: true; workflow?: WorkflowDefinition; loadError?: WorkflowLoadError }
+  | {
+      ok: true;
+      workflow?: WorkflowDefinition;
+      loadError?: WorkflowLoadError;
+      definitionSourceSha?: string;
+    }
   | { ok: false; error: Error }
 > {
+  const workflowCwd = codebase.default_cwd;
+  const sync = await syncCodebaseSourceClone(codebase);
   try {
     await syncArchonToWorktree(workflowCwd);
   } catch (error) {
@@ -1694,6 +1694,7 @@ async function discoverWorkflowForCodebase(
       ok: true,
       workflow: resolveWorkflowByName(workflowName, workflows),
       loadError: workflowLoadErrorForName(workflowName, discovery.errors),
+      definitionSourceSha: definitionSourceShaFromSync(sync),
     };
   } catch (error) {
     return { ok: false, error: error as Error };
@@ -1781,25 +1782,32 @@ async function handleWorkflowRunSlashCommand(
     getLog().warn({ err: error as Error, workflowName }, 'global_workflow_run_discovery_failed');
   }
 
-  const matches: { codebase: Codebase; workflow: WorkflowDefinition }[] = [];
+  const matches: {
+    codebase: Codebase;
+    workflow: WorkflowDefinition;
+    definitionSourceSha?: string;
+  }[] = [];
   let firstLoadError: WorkflowLoadError | undefined;
   let firstDiscoveryError: { codebase: Codebase; error: Error } | undefined;
 
   for (const codebase of codebases) {
-    const workflowCwd = codebase.default_cwd;
-    const discovery = await discoverWorkflowForCodebase(workflowName, workflowCwd);
+    const discovery = await discoverWorkflowForCodebase(workflowName, codebase);
     if (!discovery.ok) {
       firstDiscoveryError ??= { codebase, error: discovery.error };
       continue;
     }
     firstLoadError ??= discovery.loadError;
     if (discovery.workflow) {
-      matches.push({ codebase, workflow: discovery.workflow });
+      matches.push({
+        codebase,
+        workflow: discovery.workflow,
+        definitionSourceSha: discovery.definitionSourceSha,
+      });
     }
   }
 
   if (matches.length === 1) {
-    const { workflow } = matches[0];
+    const { workflow, definitionSourceSha } = matches[0];
     const binding = resolveBoundCodebase({
       workflowName: workflow.name,
       userMessage,
@@ -1819,7 +1827,8 @@ async function handleWorkflowRunSlashCommand(
       codebase,
       workflow,
       binding.userMessage,
-      isolationHints
+      isolationHints,
+      definitionSourceSha
     );
     return true;
   }
@@ -1850,7 +1859,8 @@ async function handleWorkflowRunSlashCommand(
           binding.codebase,
           match.workflow,
           binding.userMessage,
-          isolationHints
+          isolationHints,
+          match.definitionSourceSha
         );
         return true;
       }
@@ -1900,7 +1910,8 @@ async function handleWorkflowRunCommand(
   conversation: Conversation,
   workflow: WorkflowDefinition,
   userMessage: string,
-  isolationHints?: HandleMessageContext['isolationHints']
+  isolationHints?: HandleMessageContext['isolationHints'],
+  definitionSourceSha?: string
 ): Promise<void> {
   // Check if conversation has a project
   if (conversation.codebase_id) {
@@ -1920,7 +1931,8 @@ async function handleWorkflowRunCommand(
       codebase,
       workflow,
       userMessage,
-      isolationHints
+      isolationHints,
+      definitionSourceSha
     );
     return;
   }
@@ -1950,6 +1962,7 @@ async function handleWorkflowRunCommand(
       'workflow_codebase_bound'
     );
     const workflowCwd = conversation.cwd ?? codebase.default_cwd;
+    const sync = await syncCodebaseSourceClone(codebase);
     try {
       await syncArchonToWorktree(workflowCwd);
     } catch (error) {
@@ -2007,7 +2020,8 @@ async function handleWorkflowRunCommand(
       codebase,
       resolvedWorkflow,
       binding.userMessage,
-      isolationHints
+      isolationHints,
+      definitionSourceShaFromSync(sync)
     );
     return;
   }

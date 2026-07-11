@@ -44,6 +44,7 @@ const mockCreateWorkflowEvent = mock(() => Promise.resolve());
 // Spies for internal modules (use spyOn instead of mock.module to avoid global pollution)
 let spyIsPathWithinWorkspace: ReturnType<typeof spyOn>;
 let spyExecFileAsync: ReturnType<typeof spyOn>;
+let spySyncWorkspace: ReturnType<typeof spyOn>;
 let spyWorktreeExists: ReturnType<typeof spyOn>;
 let spyListWorktrees: ReturnType<typeof spyOn>;
 let spyRemoveWorktree: ReturnType<typeof spyOn>;
@@ -249,6 +250,13 @@ function setupSpies(): void {
 
   // Git utility spies
   spyExecFileAsync = spyOn(gitUtils, 'execFileAsync').mockResolvedValue({ stdout: '', stderr: '' });
+  spySyncWorkspace = spyOn(gitUtils, 'syncWorkspace').mockResolvedValue({
+    branch: 'main' as never,
+    synced: true,
+    previousHead: '11111111',
+    newHead: '22222222',
+    updated: true,
+  });
   spyWorktreeExists = spyOn(gitUtils, 'worktreeExists').mockResolvedValue(false);
   spyListWorktrees = spyOn(gitUtils, 'listWorktrees').mockResolvedValue([]);
   spyRemoveWorktree = spyOn(gitUtils, 'removeWorktree').mockResolvedValue();
@@ -280,6 +288,7 @@ function setupSpies(): void {
 function restoreSpies(): void {
   spyIsPathWithinWorkspace?.mockRestore();
   spyExecFileAsync?.mockRestore();
+  spySyncWorkspace?.mockRestore();
   spyWorktreeExists?.mockRestore();
   spyListWorktrees?.mockRestore();
   spyRemoveWorktree?.mockRestore();
@@ -1154,6 +1163,45 @@ describe('CommandHandler', () => {
 
         expect(result.success).toBe(true);
         expect(result.workflow?.definition.name).toBe('assist');
+      });
+
+      test('syncs codebase clone before discovering workflow for run dispatch', async () => {
+        const order: string[] = [];
+        spySyncWorkspace.mockImplementationOnce(() => {
+          order.push('sync');
+          return Promise.resolve({
+            branch: 'main' as never,
+            synced: true,
+            previousHead: '11111111',
+            newHead: '22222222',
+            updated: true,
+          });
+        });
+        spyDiscoverWorkflows.mockImplementationOnce(() => {
+          order.push('discover');
+          return Promise.resolve({
+            workflows: [
+              makeTestWorkflowWithSource({
+                name: 'assist',
+                description: 'General assistant',
+                nodes: [
+                  { id: 'old-node', command: 'echo old' },
+                  { id: 'node-added-on-origin', command: 'echo new' },
+                ],
+              }),
+            ],
+            errors: [],
+          });
+        });
+
+        const result = await handleCommand(conversationWithCodebase, '/workflow run assist');
+
+        expect(order).toEqual(['sync', 'discover']);
+        expect(result.success).toBe(true);
+        expect(result.workflow?.definition.nodes.map(node => node.id)).toContain(
+          'node-added-on-origin'
+        );
+        expect(result.workflow?.definitionSourceSha).toBe('22222222');
       });
 
       test('should match workflow name via suffix match', async () => {

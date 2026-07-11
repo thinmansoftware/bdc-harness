@@ -247,6 +247,10 @@ export interface WorkflowRoutingContext {
    * Hints for isolation environment (PR review context, etc.)
    */
   readonly isolationHints?: IsolationHints;
+  /**
+   * HEAD sha of the source clone used to resolve this workflow definition.
+   */
+  readonly definitionSourceSha?: string;
 }
 
 /**
@@ -420,7 +424,8 @@ export async function dispatchBackgroundWorkflow(
           isolationContext,
           ctx.conversationDbId,
           preCreatedRun,
-          authoritySource
+          authoritySource,
+          ctx.definitionSourceSha
         );
         // Surface workflow output to parent conversation as a result card
         if ('paused' in result) {

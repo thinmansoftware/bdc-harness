@@ -1,0 +1,98 @@
+{
+  "manifest_version": 2,
+  "wo_id": "WO-HARNESS-DISPATCH-SYNC-BEFORE-RESOLVE-01",
+  "spec_revision": "77de9d526c4d5b39684251e058c540ece817d7d5",
+  "run_start_sha": "b96a6dffdd332c8ffc6e7aec32624a6a5e2f5110",
+  "summary": [
+    "Extracted the existing codebase source-clone sync behavior into syncCodebaseSourceClone.",
+    "Synced codebase source clones before workflow discovery in deterministic /workflow run dispatch paths.",
+    "Threaded the source clone HEAD used for definition resolution into workflow_started event data as definitionSourceSha."
+  ],
+  "files_changed": [
+    "packages/core/src/utils/codebase-sync.ts",
+    "packages/core/src/utils/codebase-sync.test.ts",
+    "packages/core/src/handlers/command-handler.ts",
+    "packages/core/src/handlers/command-handler.test.ts",
+    "packages/core/src/orchestrator/orchestrator-agent.ts",
+    "packages/core/src/orchestrator/orchestrator-agent.test.ts",
+    "packages/core/src/orchestrator/orchestrator.ts",
+    "packages/core/src/types/index.ts",
+    "packages/core/package.json",
+    "packages/workflows/src/executor.ts",
+    "packages/workflows/src/event-emitter.ts",
+    "harness-artifacts/WO-HARNESS-DISPATCH-SYNC-BEFORE-RESOLVE-01.manifest.json"
+  ],
+  "dispatch_path_audit": [
+    {
+      "path": "packages/core/src/handlers/command-handler.ts case 'run'",
+      "status": "fixed",
+      "reason": "syncCodebaseSourceClone(codebase) runs before discoverWorkflowsWithConfig for codebase-scoped deterministic run dispatch."
+    },
+    {
+      "path": "packages/core/src/orchestrator/orchestrator-agent.ts discoverWorkflowForCodebase",
+      "status": "fixed",
+      "reason": "slash-command multi-codebase resolution syncs each codebase.default_cwd before repo workflow discovery."
+    },
+    {
+      "path": "packages/core/src/orchestrator/orchestrator-agent.ts single-codebase auto-select branch",
+      "status": "fixed",
+      "reason": "E2 re-resolution syncs the single codebase source clone before rediscovering the executable workflow definition."
+    },
+    {
+      "path": "packages/core/src/orchestrator/orchestrator-agent.ts discoverAllWorkflows",
+      "status": "already-correct-refactored",
+      "reason": "Existing pre-discovery sync behavior was preserved through the shared helper."
+    },
+    {
+      "path": "command-handler list/reload, GET /api/workflows, validate-only routes, CLI, canary snapshot, existing-run resume",
+      "status": "out-of-scope",
+      "reason": "Read-only, preflight-only, user-local, deferred canary, or already-pinned worktree paths do not determine a freshly executed DAG per the WO."
+    },
+    {
+      "path": "packages/smart-cauldron/src/cascade.ts",
+      "status": "ambiguous-follow-up",
+      "reason": "No independent discoverWorkflowsWithConfig dispatch path was located in the WO source-of-truth files; if conductor dispatch bypasses the fixed message path, file a follow-up WO."
+    }
+  ],
+  "workflow_event_schema": {
+    "status": "open-record",
+    "details": "IWorkflowStore WorkflowEventRecord.data is Record<string, unknown>; no closed workflow_started Zod schema change was required. The in-memory WorkflowStartedEvent type was extended with optional definitionSourceSha."
+  },
+  "verification": [
+    {
+      "command": "grep -n \"syncCodebaseSourceClone\\|discoverWorkflowsWithConfig\" packages/core/src/handlers/command-handler.ts",
+      "status": "passed",
+      "evidence": "case 'run' sync call at line 810 precedes discoverWorkflowsWithConfig at line 812; list/reload discovery calls remain unsynced."
+    },
+    {
+      "command": "bun test packages/core/src/utils/codebase-sync.test.ts",
+      "status": "passed",
+      "evidence": "3 pass, 0 fail."
+    },
+    {
+      "command": "bun test packages/core/src/handlers/command-handler.test.ts",
+      "status": "blocked",
+      "evidence": "Container cannot resolve existing workspace package @archon/workflows/test-utils before tests execute."
+    },
+    {
+      "command": "bun test packages/core/src/orchestrator/orchestrator-agent.test.ts",
+      "status": "blocked",
+      "evidence": "Container cannot resolve existing workspace package @archon/workflows/test-utils before tests execute."
+    },
+    {
+      "command": "bun run type-check",
+      "status": "blocked",
+      "evidence": "Container lacks node/tsc and dependency extraction failed for several workspace packages."
+    },
+    {
+      "command": "bun run check:bundled && bun run check:bundled-skill",
+      "status": "not-run",
+      "evidence": "Deferred after type-check environment blocker; no bundled workflow defaults were edited."
+    },
+    {
+      "command": "runtime acceptance merge-then-fire production check",
+      "status": "n/a-pending-deploy",
+      "evidence": "Deploy is deferred to the next cutover window; no deploy was performed in this build session."
+    }
+  ]
+}
