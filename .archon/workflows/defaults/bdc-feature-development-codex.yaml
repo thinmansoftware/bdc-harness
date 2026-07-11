@@ -2694,8 +2694,8 @@ nodes:
       CURRENT_BODY=$(gh pr view "$PR_URL" --repo "$REPO" --json body --jq '.body' 2>/dev/null || echo "")
       PROSE=$(printf '%s\n' "$CURRENT_BODY" | awk '/^<!-- bdc-manifest-start -->$/{exit} {print}')
       CLOSING_LINE=""
-      if [ -n "$ISSUE_NUM" ] && ! printf '%s\n' "$PROSE" | grep -qiE "^(Fixes|Closes|Resolves)[[:space:]]+#${ISSUE_NUM}([[:space:]]|$|[.,;])"; then
-        CLOSING_LINE="Closes #${ISSUE_NUM}"
+      if [ -n "$ISSUE_NUM" ] && ! printf '%s\n' "$PROSE" | grep -qiE "^(Fixes|Closes|Resolves)[[:space:]]+(${ISSUE_REPO//\//\\/}#|#)${ISSUE_NUM}([[:space:]]|$|[.,;])"; then
+        CLOSING_LINE="Closes ${ISSUE_REPO}#${ISSUE_NUM}"
       fi
 
       BODY_FILE=$(mktemp)
