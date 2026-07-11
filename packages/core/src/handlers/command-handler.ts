@@ -18,10 +18,7 @@ import {
 } from '../services/cleanup-service';
 import { getArchonWorkspacesPath } from '@archon/paths';
 import { loadConfig } from '../config/config-loader';
-import {
-  definitionSourceShaFromSync,
-  syncCodebaseSourceClone,
-} from '../utils/codebase-sync';
+import { definitionSourceShaFromSync, syncCodebaseSourceClone } from '../utils/codebase-sync';
 import { discoverWorkflowsWithConfig } from '@archon/workflows/workflow-discovery';
 import { resolveWorkflowName } from '@archon/workflows/router';
 import type {
