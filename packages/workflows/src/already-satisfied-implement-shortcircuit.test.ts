@@ -259,4 +259,127 @@ describe('already-satisfied implement short-circuit', () => {
       (store.failWorkflowRun as Mock<(id: string, error: string) => Promise<void>>).mock.calls
     ).toHaveLength(0);
   });
+
+  it('feeds the gate verdict through plan into plan-review before rendering the loop prompt', async () => {
+    const prompts: string[] = [];
+    const mockSendQuery = mock(function* (prompt: string) {
+      prompts.push(prompt);
+      if (prompts.length === 1) {
+        yield {
+          type: 'assistant',
+          content:
+            'PRECHECK_VERDICT=already-satisfied\nSATISFIED_EVIDENCE=branch already contains required plan-review change\n',
+        };
+      } else if (prompts.length === 2) {
+        yield {
+          type: 'assistant',
+          content: 'Plan: verify the already-satisfied evidence without making code changes.',
+        };
+      } else if (prompts.length === 3) {
+        yield {
+          type: 'assistant',
+          content:
+            'PLAN_REVIEW_PASS=true\nAPPROVED_PLAN=Verify the already-satisfied evidence in this worktree.\n',
+        };
+      } else {
+        yield { type: 'assistant', content: 'implement reached' };
+      }
+      yield { type: 'result', sessionId: `sid-${String(prompts.length)}` };
+    });
+
+    const store = createMockStore();
+    const deps: WorkflowDeps = {
+      store,
+      getAgentProvider: mock(() => ({
+        sendQuery: mockSendQuery,
+        getType: () => 'claude',
+        getCapabilities: mockClaudeCapabilities,
+      })),
+      loadConfig: mock(() => Promise.resolve(minimalConfig)),
+    };
+    const platform: IWorkflowPlatform = {
+      sendMessage: mock(() => Promise.resolve()),
+      getStreamingMode: mock(() => 'batch' as const),
+      getPlatformType: mock(() => 'test'),
+      sendStructuredEvent: mock(() => Promise.resolve()),
+    };
+
+    await executeDagWorkflow(
+      deps,
+      platform,
+      'conv-dag',
+      testDir,
+      {
+        name: 'already-satisfied-plan-review',
+        nodes: [
+          {
+            id: 'gate-already-satisfied',
+            prompt: 'Emit the precheck verdict.',
+          },
+          {
+            id: 'plan',
+            depends_on: ['gate-already-satisfied'],
+            prompt: [
+              'Draft a minimal plan that VERIFIES the already-satisfied work.',
+              'Pre-check verdict from gate-already-satisfied:',
+              '$gate-already-satisfied.output',
+            ].join('\n'),
+          },
+          {
+            id: 'plan-review',
+            depends_on: ['plan'],
+            loop: {
+              prompt: [
+                'Review the plan.',
+                'Plan:',
+                '$plan.output',
+                'Pre-check verdict from gate-already-satisfied:',
+                '$gate-already-satisfied.output',
+                'If the line above contains PRECHECK_VERDICT=already-satisfied, approve a minimal verification plan.',
+              ].join('\n'),
+              until: 'PLAN_REVIEW_PASS=true',
+              max_iterations: 3,
+            },
+          },
+          {
+            id: 'implement',
+            depends_on: ['plan-review'],
+            prompt: 'Implement reached after approved plan-review.',
+          },
+        ],
+      },
+      makeWorkflowRun('already-satisfied-plan-review-run'),
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    expect(prompts).toHaveLength(4);
+    expect(prompts[2]).toContain('PRECHECK_VERDICT=already-satisfied');
+    expect(prompts[2]).toContain(
+      'SATISFIED_EVIDENCE=branch already contains required plan-review change'
+    );
+    expect(prompts[2]).toContain(
+      'Plan: verify the already-satisfied evidence without making code changes.'
+    );
+    expect(prompts[2]).not.toContain('$gate-already-satisfied.output');
+    expect(mockSendQuery.mock.calls[2][0]).toBe(prompts[2]);
+    expect(prompts[3]).toContain('Implement reached after approved plan-review.');
+    expect(
+      (
+        store.completeWorkflowRun as Mock<
+          (id: string, metadata?: Record<string, unknown>) => Promise<void>
+        >
+      ).mock.calls[0][1]
+    ).toEqual({
+      node_counts: { completed: 4, failed: 0, skipped: 0, total: 4 },
+    });
+    expect(
+      (store.failWorkflowRun as Mock<(id: string, error: string) => Promise<void>>).mock.calls
+    ).toHaveLength(0);
+  });
 });
