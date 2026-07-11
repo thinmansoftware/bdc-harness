@@ -28,7 +28,6 @@
 
 import { mkdir, writeFile } from 'fs/promises';
 import { join } from 'path';
-import { getArchonHome } from '@archon/paths';
 import type { DecisionResult } from './decide.ts';
 import type { ErrorClass } from './classify.ts';
 
@@ -59,6 +58,10 @@ const NOTION_VERSION = '2022-06-28';
 const NOTION_API_BASE = 'https://api.notion.com/v1';
 const DEFAULT_BUILDER_MONITOR_URL = 'https://n8n.bluedevilcollectibles.com/webhook/builder-status';
 
+function getEscalationArchonHome(): string {
+  return process.env.ARCHON_HOME ?? join(process.env.HOME ?? process.cwd(), '.archon');
+}
+
 /**
  * Run an escalation for a non-recoverable workflow failure.
  *
@@ -78,7 +81,7 @@ export async function runEscalation(
   // Always start with the on-disk artifact -- it is the most reliable signal
   // (no network, no auth, no third-party). Even if everything else fails the
   // operator can grep ARCHON_HOME for escalation.json on the host.
-  const archonHome = getArchonHome();
+  const archonHome = getEscalationArchonHome();
   const runDir = join(archonHome, 'runs', runId);
   const escalationPath = join(runDir, 'escalation.json');
   const payload = {

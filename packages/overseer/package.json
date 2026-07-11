@@ -9,10 +9,19 @@
     ".": "./src/index.ts",
     "./classify": "./src/classify.ts",
     "./decide": "./src/decide.ts",
-    "./escalate": "./src/escalate.ts"
+    "./escalate": "./src/escalate.ts",
+    "./watch": "./src/watch.ts",
+    "./judge-pr": "./src/judge-pr.ts",
+    "./reconcile": "./src/reconcile.ts",
+    "./budget": "./src/budget.ts",
+    "./service": "./src/service.ts",
+    "./actions/merge-ready": "./src/actions/merge-ready.ts",
+    "./actions/salvage": "./src/actions/salvage.ts",
+    "./actions/rate-limit": "./src/actions/rate-limit.ts",
+    "./actions/refire": "./src/actions/refire.ts"
   },
   "scripts": {
-    "test": "bun test src/overseer.test.ts && bun test tests/",
+    "test": "bun test src/overseer.test.ts src/__tests__/*.test.ts && bun test tests/",
     "type-check": "bun x tsc --noEmit"
   },
   "dependencies": {

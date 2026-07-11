@@ -29,3 +29,19 @@ export type { Decision, DecideInput, DecisionResult } from './decide';
 
 export { runEscalation } from './escalate';
 export type { EscalationContext } from './escalate';
+
+export { watchFailure } from './watch';
+export type { WatchFailureInput } from './watch';
+export { judgePr } from './judge-pr';
+export type { JudgePrInput, JudgePrResult } from './judge-pr';
+export { reconcileRun } from './reconcile';
+export type { ReconcileInput } from './reconcile';
+export { OverseerService, MemoryOverseerActionStore } from './service';
+export type { OverseerActionStore, OverseerServiceOptions } from './service';
+export { assertWithinBudget, DEFAULT_OVERSEER_BUDGET } from './budget';
+export type { OverseerBudget } from './budget';
+export { planMergeReadyAction } from './actions/merge-ready';
+export { planSalvageAction } from './actions/salvage';
+export { planRateLimitAction } from './actions/rate-limit';
+export { planRefireAction } from './actions/refire';
+export type { OverseerAction, OverseerActionKind, OverseerActionStatus } from './actions/types';
