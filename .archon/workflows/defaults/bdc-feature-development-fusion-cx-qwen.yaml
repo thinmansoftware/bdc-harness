@@ -228,7 +228,7 @@ nodes:
   # async escalation payload, and only at the irreversible-action boundary downstream.
   - id: plan-review
     provider: codex-opr
-    model: qwen/qwen3-coder
+    model: deepseek/deepseek-chat-v3.1  # REVIEWER seat, not builder: qwen (the builder model) is not servable by codex-opr on a ChatGPT account (HTTP 400), and plan-review is a cross-model adversarial REVIEW of qwen's plan -- so it must be a different model anyway (never self-grade). deepseek matches the other review seats (diff-review, opus-rereview). Fixes every fusion-cx-qwen run dying at plan-review 2026-07-11.
     persona: war-council-architect-opr
     depends_on: [plan]
     task_class: medium_work
