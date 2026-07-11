@@ -19,7 +19,7 @@ function credentialsPath(provider: ProviderName): string {
   return path.join(os.homedir(), '.codex', 'auth.json');
 }
 
-interface FreshnessRead {
+export interface FreshnessRead {
   freshExpiresAt?: number;
   hasCreds: boolean;
   hasRefreshToken: boolean;
@@ -44,7 +44,7 @@ function readClaudeFreshness(filePath: string): FreshnessRead {
   };
 }
 
-function readCodexFreshness(filePath: string): FreshnessRead {
+export function readCodexFreshness(filePath: string): FreshnessRead {
   // Codex auth.json has no explicit expiresAt; the binary handles refresh in-process
   // and stamps last_refresh. Treat tokens as fresh when last_refresh is < ~12h old
   // (matches Codex's documented ~12h access token lifetime per ChatGPT-managed auth).
@@ -67,6 +67,10 @@ function readCodexFreshness(filePath: string): FreshnessRead {
     hasCreds: true,
     hasRefreshToken: Boolean(refreshToken),
   };
+}
+
+export function getCodexCredentialsPath(): string {
+  return credentialsPath('codex');
 }
 
 function readFreshness(provider: ProviderName): FreshnessRead {

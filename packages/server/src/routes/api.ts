@@ -50,6 +50,7 @@ import { discoverWorkflowsWithConfig } from '@archon/workflows/workflow-discover
 import { resolveWorkflowName } from '@archon/workflows/router';
 import type { WorkflowDefinition } from '@archon/workflows/schemas/workflow';
 import { executeWorkflow } from '@archon/workflows/executor';
+import { checkCodexDispatchGate } from '@archon/providers/auth-refresh/dispatch-gate';
 import { processDueProviderWaits } from '@archon/workflows/reliability/wait-scheduler';
 import { getLoaderErrors, parseWorkflow } from '@archon/workflows/loader';
 import { isValidCommandName } from '@archon/workflows/command-validation';
@@ -1778,11 +1779,48 @@ export function registerApiRoutes(
    * (or ambiguous name) is rejected at the API boundary.
    */
   const WORKFLOW_RUN_COMMAND = /^\/workflow\s+run\s+(\S+)/;
+  const DEFAULT_BUILDER_MONITOR_URL =
+    'https://n8n.bluedevilcollectibles.com/webhook/builder-status';
+
+  function workflowHasCodexNode(workflow: WorkflowDefinition): boolean {
+    return (
+      workflow.provider === 'codex' ||
+      (workflow.nodes ?? []).some(node => 'provider' in node && node.provider === 'codex')
+    );
+  }
+
+  async function postBuilderStatusAlert(
+    action: string,
+    detail: string,
+    woId?: string | null
+  ): Promise<void> {
+    const url = process.env.BUILDER_MONITOR_WEBHOOK_URL ?? DEFAULT_BUILDER_MONITOR_URL;
+    try {
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          builder: 'Cauldron',
+          wo_id: woId ?? 'unknown',
+          action,
+          detail,
+        }),
+      });
+      if (!response.ok) {
+        getLog().warn(
+          { status: response.status, action, woId },
+          'builder_status_alert_post_failed'
+        );
+      }
+    } catch (error) {
+      getLog().warn({ err: error, action, woId }, 'builder_status_alert_post_failed');
+    }
+  }
 
   async function validateWorkflowRunTarget(
     message: string,
     codebaseId?: string | null
-  ): Promise<{ valid: true } | { valid: false; error: string }> {
+  ): Promise<{ valid: true } | { valid: false; error: string; httpStatus?: number }> {
     const match = WORKFLOW_RUN_COMMAND.exec(message.trim());
     if (!match) return { valid: true };
     const workflowName = match[1];
@@ -1810,18 +1848,30 @@ export function registerApiRoutes(
       return { valid: true };
     }
 
+    let workflow: WorkflowDefinition | undefined;
     try {
-      const workflow = resolveWorkflowName(workflowName, workflows);
-      if (!workflow) {
-        getLog().warn({ workflowName, cwd }, 'dispatch_precheck_workflow_not_found');
-        return {
-          valid: false,
-          error: `Workflow "${workflowName}" not found. Use GET /api/workflows to list available workflows.`,
-        };
-      }
+      workflow = resolveWorkflowName(workflowName, workflows);
     } catch (error) {
       // resolveWorkflowName throws on ambiguous names -- reject with candidates.
       return { valid: false, error: (error as Error).message };
+    }
+    if (!workflow) {
+      getLog().warn({ workflowName, cwd }, 'dispatch_precheck_workflow_not_found');
+      return {
+        valid: false,
+        error: `Workflow "${workflowName}" not found. Use GET /api/workflows to list available workflows.`,
+      };
+    }
+    if (workflowHasCodexNode(workflow)) {
+      getLog().info({ workflowName }, 'codex_dispatch_gate_consult');
+      try {
+        const gate = await checkCodexDispatchGate();
+        if (gate.fresh) return { valid: true };
+        getLog().warn({ workflowName, reason: gate.reason }, 'codex_dispatch_gate_refused');
+      } catch (error) {
+        getLog().warn({ err: error, workflowName }, 'codex_dispatch_gate_failed');
+      }
+      return { valid: false, error: 'codex_auth_stale', httpStatus: 503 };
     }
     return { valid: true };
   }
@@ -3085,6 +3135,14 @@ export function registerApiRoutes(
       const fullMessage = `/workflow run ${workflowName} ${message}`;
       const check = await validateWorkflowRunTarget(fullMessage, conv?.codebase_id);
       if (!check.valid) {
+        if (check.httpStatus === 503 && check.error === 'codex_auth_stale') {
+          void postBuilderStatusAlert(
+            'blocked',
+            'codex auth stale -- dispatch refused',
+            conductor?.woId
+          );
+          return c.json({ error: 'codex_auth_stale' }, 503);
+        }
         return c.json({ accepted: false, error: check.error }, 400);
       }
       const result = await dispatchToOrchestrator(conversationId, fullMessage);
