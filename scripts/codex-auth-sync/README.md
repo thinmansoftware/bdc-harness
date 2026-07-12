@@ -9,7 +9,7 @@ Windows-side sync for `C:\Users\pcmed\.codex\auth.json` to the Hetzner host copy
 ## Files
 
 - `sync-codex-auth.ps1`: newest-wins sync with SHA-256 no-op detection, dated host backup, owner/mode repair, container verify probe, restore-on-failure, and builder-status posts.
-- `install-sync-task.ps1`: registers `sync-codex-auth.ps1` as a Windows Scheduled Task every 30 minutes.
+- `install-sync-task.ps1`: copies `sync-codex-auth.ps1` to `%LOCALAPPDATA%\BlueDevil\codex-auth-sync\` and registers that stable copy as a Windows Scheduled Task every 30 minutes.
 
 ## Logging
 
@@ -35,25 +35,65 @@ From this repo on the Windows desktop:
 powershell -ExecutionPolicy Bypass -File scripts\codex-auth-sync\sync-codex-auth.ps1
 ```
 
-Install the recurring task:
+## Dry Verification
+
+Before installation, verify the scripts without registering a task or syncing credentials:
 
 ```powershell
+bun test .\scripts\codex-auth-sync\codex-auth-sync.test.ts
+$tokens = $null
+$errors = $null
+[System.Management.Automation.Language.Parser]::ParseFile(
+  (Resolve-Path .\scripts\codex-auth-sync\install-sync-task.ps1),
+  [ref]$tokens,
+  [ref]$errors
+) | Out-Null
+if ($errors.Count -ne 0) { $errors | Format-List; exit 1 }
+```
+
+## Install The Recurring Task
+
+Install only after the PR is merged and the installer is available in the canonical `C:\Users\pcmed\projects\bdc-harness` checkout. Do not install from a branch or worktree.
+
+From the canonical checkout:
+
+```powershell
+Set-Location C:\Users\pcmed\projects\bdc-harness
 powershell -ExecutionPolicy Bypass -File scripts\codex-auth-sync\install-sync-task.ps1
 ```
 
+The installer copies the sync script to:
+
+```text
+%LOCALAPPDATA%\BlueDevil\codex-auth-sync\sync-codex-auth.ps1
+```
+
+The scheduled task action references that installed copy, so removing or updating a worktree cannot break the task path.
+
 ## Verification
 
-Run after a real sync attempt:
+Inspect the task without running it:
+
+```powershell
+Get-ScheduledTask -TaskName "BDC Codex Auth Sync" |
+  Select-Object TaskName, State
+Get-ScheduledTaskInfo -TaskName "BDC Codex Auth Sync" |
+  Select-Object LastRunTime, LastTaskResult, NextRunTime
+```
+
+After a scheduled or manual sync attempt, inspect only redacted metadata and check for forbidden credential markers:
+
+```powershell
+Get-Content "$env:USERPROFILE\.codex\codex-auth-sync.log" -Tail 20
+$matches = Select-String -Path "$env:USERPROFILE\.codex\codex-auth-sync.log" `
+  -Pattern 'access_token|refresh_token|id_token|eyJ' -CaseSensitive:$false
+if ($matches) { throw "Credential marker found in auth sync log" }
+```
+
+For a real sync attempt, backup evidence can be inspected separately:
 
 ```powershell
 ssh hetzner-prod "ls /opt/bdc/archon-user-home/.codex/auth.json.bak.*"
-grep -c "eyJ" "$env:USERPROFILE\.codex\codex-auth-sync.log"
-```
-
-Expected token-leak result:
-
-```text
-0
 ```
 
 If the sync output was `skipped` or `no-op`, a new backup may not exist for that run. Use the log line as evidence for that branch.

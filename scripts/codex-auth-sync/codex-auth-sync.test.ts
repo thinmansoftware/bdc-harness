@@ -7,6 +7,8 @@ import { join } from 'node:path';
 
 const scriptPath = new URL('./sync-codex-auth.ps1', import.meta.url);
 const script = readFileSync(scriptPath, 'utf8');
+const installerPath = new URL('./install-sync-task.ps1', import.meta.url);
+const installer = readFileSync(installerPath, 'utf8');
 const tempDirectories: string[] = [];
 
 function quotePowerShellLiteral(value: string): string {
@@ -50,6 +52,17 @@ afterEach(() => {
 });
 
 describe('Codex auth sync static contract', () => {
+  test('installs the sync script to a stable operator path before task registration', () => {
+    expect(installer).toContain('$env:LOCALAPPDATA');
+    expect(installer).toContain('BlueDevil\\codex-auth-sync');
+    expect(installer).toMatch(/Copy-Item[\s\S]*Register-ScheduledTask/);
+    expect(installer).toMatch(/-File `"\$InstalledScriptPath`"/);
+
+    const action = installer.match(/\$action = New-ScheduledTaskAction[\s\S]*?\r?\n\r?\n/)?.[0];
+    expect(action).toBeDefined();
+    expect(action).not.toContain('$PSScriptRoot');
+  });
+
   test('keeps every protected auth operation inside docker exec', () => {
     expect(script).not.toContain('$RemoteAuthPath');
     expect(script).not.toContain('/opt/bdc/archon-user-home/.codex/auth.json');
