@@ -29,6 +29,7 @@ const mockSyncWorkspace = mock(() =>
     updated: false,
   })
 );
+const mockExecFileAsync = mock(() => Promise.resolve({ stdout: 'current-head\n', stderr: '' }));
 // Identity passthrough -- strips branded type for test simplicity; empty-string guard not needed here
 const mockToRepoPath = mock((p: string) => p);
 const mockGetOrCreateConversation = mock(() => Promise.resolve(null as unknown));
@@ -193,6 +194,7 @@ mock.module('../utils/worktree-sync', () => ({
 }));
 
 mock.module('@archon/git', () => ({
+  execFileAsync: mockExecFileAsync,
   syncWorkspace: mockSyncWorkspace,
   toRepoPath: mockToRepoPath,
 }));
@@ -1507,9 +1509,13 @@ describe('handleWorkflowRunCommand -- E2 single codebase auto-select', () => {
     mockParseCommand.mockReset();
     mockHandleCommand.mockReset();
     mockDiscoverWorkflowsWithConfig.mockReset();
+    mockSyncWorkspace.mockReset();
+    mockToRepoPath.mockClear();
+    mockExecFileAsync.mockReset();
     mockUpdateConversation.mockClear();
     mockDispatchBackgroundWorkflow.mockClear();
     mockLogger.error.mockClear();
+    mockLogger.warn.mockClear();
 
     // Default: return empty conversation without codebase
     mockGetOrCreateConversation.mockImplementation(() => Promise.resolve(null));
@@ -1517,6 +1523,18 @@ describe('handleWorkflowRunCommand -- E2 single codebase auto-select', () => {
     mockListCodebases.mockImplementation(() => Promise.resolve([]));
     mockDiscoverWorkflowsWithConfig.mockImplementation(() =>
       Promise.resolve({ workflows: [], errors: [] })
+    );
+    mockSyncWorkspace.mockImplementation(() =>
+      Promise.resolve({
+        branch: 'main',
+        synced: true,
+        previousHead: 'abc12345',
+        newHead: 'abc12345',
+        updated: false,
+      })
+    );
+    mockExecFileAsync.mockImplementation(() =>
+      Promise.resolve({ stdout: 'current-head\n', stderr: '' })
     );
   });
 
@@ -1585,6 +1603,85 @@ describe('handleWorkflowRunCommand -- E2 single codebase auto-select', () => {
         codebaseId: codebase.id,
       }),
       expect.objectContaining({ name: 'assist' })
+    );
+  });
+
+  test('syncs codebase clone before discovering API-style /workflow run', async () => {
+    const order: string[] = [];
+    const conversation = makeConversation({ codebase_id: null });
+    const codebase = makeCodebaseForSync();
+    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(conversation));
+    mockParseCommand.mockReturnValueOnce({
+      command: 'workflow',
+      args: ['run', 'assist', 'WO-123'],
+    });
+    mockHandleCommand.mockImplementationOnce(() => {
+      throw new Error('generic command handler should not pre-resolve workflow run');
+    });
+    mockListCodebases.mockReturnValueOnce(Promise.resolve([codebase]));
+    mockSyncWorkspace.mockImplementationOnce(async () => {
+      order.push('sync');
+      return {
+        branch: 'main',
+        synced: true,
+        previousHead: 'abc12345',
+        newHead: 'def67890',
+        updated: true,
+      };
+    });
+    mockDiscoverWorkflowsWithConfig.mockResolvedValueOnce({ workflows: [], errors: [] });
+    mockDiscoverWorkflowsWithConfig.mockImplementationOnce(async () => {
+      order.push('discover');
+      return {
+        workflows: [makeTestWorkflowWithSource({ name: 'assist' })],
+        errors: [],
+      };
+    });
+
+    const platform = makePlatform();
+    await handleMessage(platform, 'conv-1', '/workflow run assist WO-123');
+
+    expect(mockSyncWorkspace).toHaveBeenCalledWith('/repos/test-repo', undefined, {
+      resetAfterFetch: false,
+    });
+    expect(order).toEqual(['sync', 'discover']);
+    expect(mockDispatchBackgroundWorkflow).toHaveBeenCalled();
+  });
+
+  test('fails open and discovers API-style /workflow run when sync rejects', async () => {
+    const order: string[] = [];
+    const conversation = makeConversation({ codebase_id: null });
+    const codebase = makeCodebaseForSync();
+    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(conversation));
+    mockParseCommand.mockReturnValueOnce({
+      command: 'workflow',
+      args: ['run', 'assist', 'WO-123'],
+    });
+    mockHandleCommand.mockImplementationOnce(() => {
+      throw new Error('generic command handler should not pre-resolve workflow run');
+    });
+    mockListCodebases.mockReturnValueOnce(Promise.resolve([codebase]));
+    mockSyncWorkspace.mockImplementationOnce(async () => {
+      order.push('sync');
+      throw new Error('fetch failed');
+    });
+    mockDiscoverWorkflowsWithConfig.mockResolvedValueOnce({ workflows: [], errors: [] });
+    mockDiscoverWorkflowsWithConfig.mockImplementationOnce(async () => {
+      order.push('discover');
+      return {
+        workflows: [makeTestWorkflowWithSource({ name: 'assist' })],
+        errors: [],
+      };
+    });
+
+    const platform = makePlatform();
+    await handleMessage(platform, 'conv-1', '/workflow run assist WO-123');
+
+    expect(order).toEqual(['sync', 'discover']);
+    expect(mockDispatchBackgroundWorkflow).toHaveBeenCalled();
+    expect(mockLogger.warn).toHaveBeenCalledWith(
+      expect.objectContaining({ workflowCwd: '/repos/test-repo', cloneHeadSha: 'current-head' }),
+      'workflow_run_workspace_sync_failed'
     );
   });
 

@@ -916,11 +916,22 @@ export async function executeWorkflow(
     const emitter = getWorkflowEventEmitter();
     emitter.registerRun(workflowRun.id, conversationId);
 
+    let definitionSourceSha: string | undefined;
+    try {
+      definitionSourceSha = await gitRevision(cwd, 'HEAD');
+    } catch (err) {
+      getLog().warn(
+        { err: err as Error, workflowRunId: workflowRun.id, cwd },
+        'workflow_definition_source_sha_failed'
+      );
+    }
+
     emitter.emit({
       type: 'workflow_started',
       runId: workflowRun.id,
       workflowName: executableWorkflow.name,
       conversationId: conversationDbId,
+      ...(definitionSourceSha ? { definitionSourceSha } : {}),
     });
 
     // Fire-and-forget anonymous usage telemetry. No PII: only workflow name +
@@ -936,7 +947,10 @@ export async function executeWorkflow(
       .createWorkflowEvent({
         workflow_run_id: workflowRun.id,
         event_type: 'workflow_started',
-        data: { workflowName: executableWorkflow.name },
+        data: {
+          workflowName: executableWorkflow.name,
+          ...(definitionSourceSha ? { definitionSourceSha } : {}),
+        },
       })
       .catch((err: Error) => {
         getLog().error(

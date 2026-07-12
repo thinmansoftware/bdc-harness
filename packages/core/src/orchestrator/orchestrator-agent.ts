@@ -35,7 +35,7 @@ import type { ProviderName } from '@archon/providers/auth-refresh';
 import { AuthRefreshedRetryNeeded } from './auth-retry-sentinel';
 import { getArchonWorkspacesPath, ensureArchonWorkspacesPath } from '@archon/paths';
 import { syncArchonToWorktree } from '../utils/worktree-sync';
-import { syncWorkspace, toRepoPath } from '@archon/git';
+import { execFileAsync, syncWorkspace, toRepoPath } from '@archon/git';
 import type { WorkspaceSyncResult } from '@archon/git';
 import { discoverWorkflowsWithConfig } from '@archon/workflows/workflow-discovery';
 import { findWorkflow } from '@archon/workflows/router';
@@ -1674,6 +1674,18 @@ function workflowLoadErrorForName(
   );
 }
 
+async function readCloneHeadSha(repoPath: string): Promise<string | undefined> {
+  try {
+    const { stdout } = await execFileAsync('git', ['-C', repoPath, 'rev-parse', 'HEAD'], {
+      timeout: 10000,
+    });
+    return stdout.trim() || undefined;
+  } catch (error) {
+    getLog().debug({ err: error as Error, repoPath }, 'workflow_git_head_read_failed');
+    return undefined;
+  }
+}
+
 async function discoverWorkflowForCodebase(
   workflowName: string,
   workflowCwd: string
@@ -1681,6 +1693,25 @@ async function discoverWorkflowForCodebase(
   | { ok: true; workflow?: WorkflowDefinition; loadError?: WorkflowLoadError }
   | { ok: false; error: Error }
 > {
+  try {
+    const isManagedClone = workflowCwd
+      .replace(/\\/g, '/')
+      .startsWith(getArchonWorkspacesPath().replace(/\\/g, '/'));
+    const syncResult = await syncWorkspace(toRepoPath(workflowCwd), undefined, {
+      resetAfterFetch: isManagedClone,
+    });
+    getLog().debug(
+      { workflowCwd, isManagedClone, ...syncResult },
+      'workflow_run_workspace_sync_completed'
+    );
+  } catch (error) {
+    const cloneHeadSha = await readCloneHeadSha(workflowCwd);
+    getLog().warn(
+      { err: error as Error, workflowCwd, cloneHeadSha },
+      'workflow_run_workspace_sync_failed'
+    );
+  }
+
   try {
     await syncArchonToWorktree(workflowCwd);
   } catch (error) {

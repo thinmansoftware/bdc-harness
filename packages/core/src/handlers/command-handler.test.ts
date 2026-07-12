@@ -46,6 +46,7 @@ let spyIsPathWithinWorkspace: ReturnType<typeof spyOn>;
 let spyExecFileAsync: ReturnType<typeof spyOn>;
 let spyWorktreeExists: ReturnType<typeof spyOn>;
 let spyListWorktrees: ReturnType<typeof spyOn>;
+let spySyncWorkspace: ReturnType<typeof spyOn>;
 let spyRemoveWorktree: ReturnType<typeof spyOn>;
 let spyGetWorktreeBase: ReturnType<typeof spyOn>;
 let spyGetCanonicalRepoPath: ReturnType<typeof spyOn>;
@@ -251,6 +252,13 @@ function setupSpies(): void {
   spyExecFileAsync = spyOn(gitUtils, 'execFileAsync').mockResolvedValue({ stdout: '', stderr: '' });
   spyWorktreeExists = spyOn(gitUtils, 'worktreeExists').mockResolvedValue(false);
   spyListWorktrees = spyOn(gitUtils, 'listWorktrees').mockResolvedValue([]);
+  spySyncWorkspace = spyOn(gitUtils, 'syncWorkspace').mockResolvedValue({
+    branch: 'main',
+    synced: true,
+    previousHead: 'abc12345',
+    newHead: 'abc12345',
+    updated: false,
+  });
   spyRemoveWorktree = spyOn(gitUtils, 'removeWorktree').mockResolvedValue();
   spyGetWorktreeBase = spyOn(gitUtils, 'getWorktreeBase').mockImplementation((repoPath: string) =>
     join(repoPath, 'worktrees')
@@ -282,6 +290,7 @@ function restoreSpies(): void {
   spyExecFileAsync?.mockRestore();
   spyWorktreeExists?.mockRestore();
   spyListWorktrees?.mockRestore();
+  spySyncWorkspace?.mockRestore();
   spyRemoveWorktree?.mockRestore();
   spyGetWorktreeBase?.mockRestore();
   spyGetCanonicalRepoPath?.mockRestore();
@@ -1579,6 +1588,66 @@ describe('CommandHandler', () => {
         expect(result.workflow).toBeDefined();
         expect(result.workflow?.definition.name).toBe('test-workflow');
         expect(result.workflow?.args).toBe('');
+      });
+
+      test('should sync codebase clone before discovering workflow for run', async () => {
+        const order: string[] = [];
+        spySyncWorkspace.mockImplementationOnce(async () => {
+          order.push('sync');
+          return {
+            branch: 'main',
+            synced: true,
+            previousHead: 'abc12345',
+            newHead: 'def67890',
+            updated: true,
+          };
+        });
+        spyDiscoverWorkflows.mockImplementationOnce(async () => {
+          order.push('discover');
+          return {
+            workflows: [
+              makeTestWorkflowWithSource({ name: 'test-workflow', description: 'A test workflow' }),
+            ],
+            errors: [],
+          };
+        });
+
+        const result = await handleCommand(conversationWithCodebase, '/workflow run test-workflow');
+
+        expect(result.success).toBe(true);
+        expect(spySyncWorkspace).toHaveBeenCalledWith('/workspace/test-repo', undefined, {
+          resetAfterFetch: false,
+        });
+        expect(order).toEqual(['sync', 'discover']);
+      });
+
+      test('should fail open and discover workflow when pre-run sync fails', async () => {
+        const order: string[] = [];
+        mockLogger.warn.mockClear();
+        spyExecFileAsync.mockResolvedValueOnce({ stdout: 'current-head\n', stderr: '' });
+        spySyncWorkspace.mockImplementationOnce(async () => {
+          order.push('sync');
+          throw new Error('fetch failed');
+        });
+        spyDiscoverWorkflows.mockImplementationOnce(async () => {
+          order.push('discover');
+          return {
+            workflows: [
+              makeTestWorkflowWithSource({ name: 'test-workflow', description: 'A test workflow' }),
+            ],
+            errors: [],
+          };
+        });
+
+        const result = await handleCommand(conversationWithCodebase, '/workflow run test-workflow');
+
+        expect(result.success).toBe(true);
+        expect(order).toEqual(['sync', 'discover']);
+        expect(spyDiscoverWorkflows).toHaveBeenCalled();
+        expect(mockLogger.warn).toHaveBeenCalledWith(
+          expect.objectContaining({ codebaseId: 'codebase-123', cloneHeadSha: 'current-head' }),
+          'cmd.workspace_sync_failed'
+        );
       });
 
       test('should pass arguments to workflow', async () => {

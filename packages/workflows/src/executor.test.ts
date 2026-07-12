@@ -156,7 +156,83 @@ describe('executeWorkflow', () => {
     mockEmitter.registerRun.mockClear();
     mockEmitter.unregisterRun.mockClear();
     mockEmitter.emit.mockClear();
+    mockExecFileAsync.mockClear();
+    mockExecFileAsync.mockImplementation(async () => ({ stdout: '', stderr: '' }));
     mockExecuteDagWorkflow.mockImplementation(async (): Promise<string | undefined> => undefined);
+  });
+
+  it('records definitionSourceSha in workflow_started events', async () => {
+    const createEventSpy = mock(async () => {});
+    const store = makeStore({ createWorkflowEvent: createEventSpy });
+    const deps = makeDeps(store);
+    const definitionSourceSha = 'd'.repeat(40);
+    mockExecFileAsync.mockImplementation(async (_command, args) => {
+      const values = args as string[];
+      if (values.includes('rev-parse') && values.includes('--verify')) {
+        return { stdout: `${definitionSourceSha}\n`, stderr: '' };
+      }
+      return { stdout: '', stderr: '' };
+    });
+
+    const result = await executeWorkflow(
+      deps,
+      makePlatform(),
+      'conv-1',
+      '/tmp',
+      makeWorkflow(),
+      'test message',
+      'db-conv-1'
+    );
+
+    expect(result.success).toBe(true);
+    expect(mockEmitter.emit).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: 'workflow_started',
+        definitionSourceSha,
+      })
+    );
+    const startedCall = (createEventSpy.mock.calls as unknown[][]).find(
+      c => (c[0] as { event_type: string }).event_type === 'workflow_started'
+    );
+    expect(startedCall).toBeDefined();
+    expect((startedCall?.[0] as { data: Record<string, unknown> }).data.definitionSourceSha).toBe(
+      definitionSourceSha
+    );
+  });
+
+  it('continues workflow_started when definitionSourceSha cannot be read', async () => {
+    const createEventSpy = mock(async () => {});
+    const store = makeStore({ createWorkflowEvent: createEventSpy });
+    const deps = makeDeps(store);
+    mockExecFileAsync.mockImplementation(async (_command, args) => {
+      const values = args as string[];
+      if (values.includes('rev-parse') && values.includes('--verify')) {
+        throw new Error('rev-parse failed');
+      }
+      return { stdout: '', stderr: '' };
+    });
+
+    const result = await executeWorkflow(
+      deps,
+      makePlatform(),
+      'conv-1',
+      '/tmp',
+      makeWorkflow(),
+      'test message',
+      'db-conv-1'
+    );
+
+    expect(result.success).toBe(true);
+    expect(mockEmitter.emit).toHaveBeenCalledWith(
+      expect.not.objectContaining({ definitionSourceSha: expect.any(String) })
+    );
+    const startedCall = (createEventSpy.mock.calls as unknown[][]).find(
+      c => (c[0] as { event_type: string }).event_type === 'workflow_started'
+    );
+    expect(startedCall).toBeDefined();
+    expect(
+      (startedCall?.[0] as { data: Record<string, unknown> }).data.definitionSourceSha
+    ).toBeUndefined();
   });
 
   // -------------------------------------------------------------------------

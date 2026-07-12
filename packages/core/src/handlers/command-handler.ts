@@ -8,7 +8,7 @@ import { type Conversation, type CommandResult, ConversationNotFoundError } from
 import * as db from '../db/conversations';
 import * as codebaseDb from '../db/codebases';
 import * as sessionDb from '../db/sessions';
-import { listWorktrees, execFileAsync, toRepoPath } from '@archon/git';
+import { listWorktrees, execFileAsync, syncWorkspace, toRepoPath } from '@archon/git';
 import { getIsolationProvider } from '@archon/isolation';
 import * as isolationEnvDb from '../db/isolation-environments';
 import {
@@ -134,6 +134,18 @@ async function getCurrentBranch(repoPath: string): Promise<string> {
   } catch (error) {
     getLog().debug({ err: error, repoPath }, 'get_branch_failed');
     return 'unknown';
+  }
+}
+
+async function getCurrentHeadSha(repoPath: string): Promise<string | undefined> {
+  try {
+    const { stdout } = await execFileAsync('git', ['-C', repoPath, 'rev-parse', 'HEAD'], {
+      timeout: 10000,
+    });
+    return stdout.trim() || undefined;
+  } catch (error) {
+    getLog().debug({ err: error as Error, repoPath }, 'cmd.git_head_read_failed');
+    return undefined;
   }
 }
 
@@ -799,6 +811,37 @@ async function handleWorkflowCommand(
         { workflowName, args: workflowArgs, cwd: workflowCwd },
         'cmd.workflow_run_invoked'
       );
+
+      if (codebase) {
+        try {
+          const isManagedClone = codebase.default_cwd
+            .replace(/\\/g, '/')
+            .startsWith(getArchonWorkspacesPath().replace(/\\/g, '/'));
+          const syncResult = await syncWorkspace(toRepoPath(codebase.default_cwd), undefined, {
+            resetAfterFetch: isManagedClone,
+          });
+          getLog().debug(
+            {
+              codebaseId: codebase.id,
+              repoPath: codebase.default_cwd,
+              isManagedClone,
+              ...syncResult,
+            },
+            'cmd.workspace_sync_completed'
+          );
+        } catch (error) {
+          const cloneHeadSha = await getCurrentHeadSha(codebase.default_cwd);
+          getLog().warn(
+            {
+              err: error as Error,
+              codebaseId: codebase.id,
+              repoPath: codebase.default_cwd,
+              cloneHeadSha,
+            },
+            'cmd.workspace_sync_failed'
+          );
+        }
+      }
 
       // Discover workflows with error handling
       let workflowEntries: readonly WorkflowWithSource[];
