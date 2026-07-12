@@ -49,9 +49,11 @@ describe('loop iteration timeout defaults', () => {
     expect(resolveLoopIterationIdleTimeoutMs()).toBe(LOOP_ITERATION_IDLE_TIMEOUT_MS);
   });
 
-  test('resolveLoopIterationWallTimeoutMs reads env', () => {
+  test('resolveLoopIterationWallTimeoutMs prefers node override then env then default', () => {
+    expect(resolveLoopIterationWallTimeoutMs(180_000)).toBe(180_000);
     process.env.ARCHON_LOOP_ITERATION_WALL_MS = '120000';
     expect(resolveLoopIterationWallTimeoutMs()).toBe(120_000);
+    expect(resolveLoopIterationWallTimeoutMs(240_000)).toBe(240_000);
     delete process.env.ARCHON_LOOP_ITERATION_WALL_MS;
     expect(resolveLoopIterationWallTimeoutMs()).toBe(LOOP_ITERATION_WALL_TIMEOUT_MS);
   });

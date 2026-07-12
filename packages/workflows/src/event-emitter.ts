@@ -220,6 +220,17 @@ interface NodeFailoverEvent {
   errorClass: string;
 }
 
+interface NodeWallBreachEvent {
+  type: 'node_wall_breach';
+  runId: string;
+  nodeId: string;
+  iteration: number;
+  attempt: 1 | 2;
+  elapsedMs: number;
+  wallMs: number;
+  rung: string;
+}
+
 interface NodeSkippedEvent {
   type: 'node_skipped';
   runId: string;
@@ -276,6 +287,7 @@ export type WorkflowEmitterEvent =
   | NodeCompletedWithWarningEvent
   | NodeFailedEvent
   | NodeFailoverEvent
+  | NodeWallBreachEvent
   | NodeSkippedEvent
   | WorkflowArtifactEvent
   | ToolStartedEvent

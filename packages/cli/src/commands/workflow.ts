@@ -159,6 +159,11 @@ function renderWorkflowEvent(event: WorkflowEmitterEvent, verbose: boolean): voi
         );
       }
       break;
+    case 'node_wall_breach':
+      process.stderr.write(
+        `[${event.nodeId}] Wall timeout breach ${String(event.attempt)} on iteration ${String(event.iteration)} (${String(event.elapsedMs)}/${String(event.wallMs)}ms, rung ${event.rung})\n`
+      );
+      break;
     default:
       // Workflow-level, loop, artifact, and cancelled events are intentionally not rendered.
       break;

@@ -3383,369 +3383,58 @@ async function executeLoopNode(
     const needsFreshSession = loop.fresh_context || i === 1;
     const resumeSessionId = needsFreshSession ? undefined : currentSessionId;
 
-    // Stream AI response for this iteration
+    // Stream AI response for this iteration. A wall breach gets one inner retry
+    // with a longer wall; it does not consume another loop iteration.
     let fullOutput = ''; // raw, for signal detection
     let cleanOutput = ''; // stripped, for platform display
     let iterationIdleTimedOut = false;
-    let iterationWallTimedOut = false;
-    const iterationAbortController = new AbortController();
     // Per-iteration deadlines (WO-HARNESS-LOOP-OUTPUT-NEWLINE-AND-ITERATION-TIMEOUT-01):
     // idle is shorter than STEP_IDLE (30m); wall is absolute even if keepalives reset idle.
     const effectiveIdleTimeout = resolveLoopIterationIdleTimeoutMs(node.idle_timeout);
-    const effectiveWallTimeout = resolveLoopIterationWallTimeoutMs();
-    const wallTimer = setTimeout(() => {
-      iterationWallTimedOut = true;
-      getLog().warn(
-        { nodeId: node.id, iteration: i, timeoutMs: effectiveWallTimeout },
-        'loop_node.wall_timeout_reached'
-      );
-      iterationAbortController.abort();
-    }, effectiveWallTimeout);
+    const effectiveWallTimeout = resolveLoopIterationWallTimeoutMs(node.wall_timeout_ms);
     let iterationAttempt: ProviderAttemptRecord | undefined;
     let iterationAttemptCompleted = false;
+    const wallBreaches: { attempt: 1 | 2; elapsedMs: number; wallMs: number }[] = [];
 
-    try {
-      // Build prompt -- substituteWorkflowVariables throws if $BASE_BRANCH referenced but empty
-      // Pass loopUserInput on the first resumed iteration; '' on all others (non-interactive
-      // or subsequent iterations) so $LOOP_USER_INPUT substitutes to empty string explicitly.
-      // $LOOP_PREV_OUTPUT carries the previous iteration's cleaned output and is empty on
-      // the first iteration (no prior output exists). Across an interactive resume, the
-      // executor starts a fresh `lastIterationOutput` variable, so the first iteration of
-      // the resume also receives an empty $LOOP_PREV_OUTPUT.
-      const { prompt: substitutedPrompt } = substituteWorkflowVariables(
-        loop.prompt,
-        workflowRun.id,
-        workflowRun.user_message,
-        artifactsDir,
-        baseBranch,
-        docsDir,
-        issueContext,
-        i === startIteration ? loopUserInput : '',
-        undefined, // rejectionReason
-        i === startIteration ? '' : lastIterationOutput
-      );
-      const finalPrompt = substituteNodeOutputRefs(substitutedPrompt, nodeOutputs);
-
-      const iterationOptions: SendQueryOptions | undefined = {
-        ...resolvedOptions,
-        abortSignal: iterationAbortController.signal,
-      };
-
-      iterationAttempt = await beginProviderAttempt(
-        deps,
-        workflowRun,
-        node,
-        workflowProvider,
-        resolvedOptions.model,
-        workflowModel
-      );
-      const generator = aiClient.sendQuery(finalPrompt, cwd, resumeSessionId, iterationOptions);
-      let lastToolStartedAt: { toolName: string; startedAt: number } | null = null;
-
-      for await (const msg of withIdleTimeout(generator, effectiveIdleTimeout, () => {
-        iterationIdleTimedOut = true;
-        getLog().warn(
-          { nodeId: node.id, iteration: i, timeoutMs: effectiveIdleTimeout },
-          'loop_node.idle_timeout_reached'
-        );
-        iterationAbortController.abort();
-      })) {
-        if (iterationWallTimedOut) break;
-        if (msg.type === 'provider_route') {
-          if (!iterationAttempt) throw new Error('provider_route_without_attempt');
-          await finishProviderAttempt(deps, iterationAttempt, {
-            servedModelId: null,
-            outcomeClass: 'availability',
-            reasonCode: msg.reasonCode,
-          });
-          iterationAttemptCompleted = true;
-          await persistProviderRouteChange(
-            deps,
-            workflowRun.id,
-            node.id,
-            iterationAttempt.attemptId,
-            msg
-          );
-          iterationAttempt = await beginProviderAttempt(
-            deps,
-            workflowRun,
-            node,
-            msg.toProvider,
-            msg.toModel,
-            workflowModel
-          );
-          iterationAttemptCompleted = false;
-        } else if (msg.type === 'assistant') {
-          fullOutput += msg.content;
-          // Clean the accumulated buffer, not each provider chunk independently.
-          // stripCompletionTags() trims its input, so per-chunk cleaning erased
-          // newline-only chunks and joined adjacent fields in persisted output and
-          // $LOOP_PREV_OUTPUT (anchor: run 42ee6575).
-          const previousCleanOutput = cleanOutput;
-          cleanOutput = stripCompletionTags(fullOutput, loop.until);
-          const cleanedDelta = cleanOutput.startsWith(previousCleanOutput)
-            ? cleanOutput.slice(previousCleanOutput.length)
-            : '';
-          if (platform.getStreamingMode() === 'stream' && cleanedDelta) {
-            await safeSendMessage(platform, conversationId, cleanedDelta, msgContext);
-          }
-          await logAssistant(logDir, workflowRun.id, msg.content);
-        } else if (msg.type === 'result') {
-          // Emit tool_completed for the last tool in the iteration
-          if (lastToolStartedAt) {
-            const prevTool = lastToolStartedAt;
-            getWorkflowEventEmitter().emit({
-              type: 'tool_completed',
-              runId: workflowRun.id,
-              toolName: prevTool.toolName,
-              stepName: node.id,
-              durationMs: Date.now() - prevTool.startedAt,
-            });
-            deps.store
-              .createWorkflowEvent({
-                workflow_run_id: workflowRun.id,
-                event_type: 'tool_completed',
-                step_name: node.id,
-                data: {
-                  tool_name: prevTool.toolName,
-                  duration_ms: Date.now() - prevTool.startedAt,
-                },
-              })
-              .catch((err: Error) => {
-                logEventStoreError(err, i);
-              });
-            lastToolStartedAt = null;
-          }
-          if (msg.sessionId) currentSessionId = msg.sessionId;
-          if (msg.cost !== undefined) {
-            loopTotalCostUsd = (loopTotalCostUsd ?? 0) + msg.cost;
-          }
-          if (msg.tokens) {
-            const t = msg.tokens;
-            if (!loopTotalTokens) loopTotalTokens = { input: 0, output: 0 };
-            loopTotalTokens.input += t.input;
-            loopTotalTokens.output += t.output;
-            if (t.total !== undefined) {
-              loopTotalTokens.total = (loopTotalTokens.total ?? 0) + t.total;
-            }
-          }
-          if (msg.stopReason !== undefined) loopFinalStopReason = msg.stopReason;
-          if (msg.numTurns !== undefined) {
-            loopTotalNumTurns = (loopTotalNumTurns ?? 0) + msg.numTurns;
-          }
-          if (msg.servedModelId !== undefined) loopServedModelId = msg.servedModelId;
-          if (msg.servedModelMissingReason !== undefined) {
-            loopServedMissingReason = msg.servedModelMissingReason;
-          }
-          // Fail the iteration loudly on SDK error results. Previously we broke
-          // silently, producing empty output and continuing to the next iteration --
-          // which made `error_during_execution` on resumed interactive loops look
-          // like a "5-second crash" that kept burning iterations (#1208).
-          if (msg.isError) {
-            const resourceExhausted = classifyResourceExhaustedSdkResult(msg);
-            if (resourceExhausted) {
-              getLog().warn(
-                {
-                  nodeId: node.id,
-                  iteration: i,
-                  errorSubtype: msg.errorSubtype,
-                  errors: msg.errors,
-                  reason: resourceExhausted.reason,
-                },
-                'loop_node.iteration_resource_exhausted'
-              );
-              throw new ResourceExhaustedPause(resourceExhausted);
-            }
-            const subtype = msg.errorSubtype ?? 'unknown';
-            const errorsDetail = msg.errors?.length ? ` -- ${msg.errors.join('; ')}` : '';
-            getLog().error(
-              {
-                nodeId: node.id,
-                iteration: i,
-                errorSubtype: subtype,
-                errors: msg.errors,
-                sessionId: msg.sessionId,
-                stopReason: msg.stopReason,
-              },
-              'loop_node.iteration_sdk_error'
-            );
-            throw new Error(
-              `Loop '${node.id}' iteration ${String(i)} failed: SDK returned ${subtype}${errorsDetail}`
-            );
-          }
-          break; // Result is the "I'm done" signal -- don't wait for subprocess to exit
-        } else if (msg.type === 'tool' && msg.toolName) {
-          const now = Date.now();
-
-          // Emit tool_completed for the previous tool
-          if (lastToolStartedAt) {
-            const prevTool = lastToolStartedAt;
-            getWorkflowEventEmitter().emit({
-              type: 'tool_completed',
-              runId: workflowRun.id,
-              toolName: prevTool.toolName,
-              stepName: node.id,
-              durationMs: now - prevTool.startedAt,
-            });
-            deps.store
-              .createWorkflowEvent({
-                workflow_run_id: workflowRun.id,
-                event_type: 'tool_completed',
-                step_name: node.id,
-                data: { tool_name: prevTool.toolName, duration_ms: now - prevTool.startedAt },
-              })
-              .catch((err: Error) => {
-                logEventStoreError(err, i);
-              });
-          }
-          lastToolStartedAt = { toolName: msg.toolName, startedAt: now };
-
-          // Emit tool_started for the current tool (fire-and-forget)
-          getWorkflowEventEmitter().emit({
-            type: 'tool_started',
-            runId: workflowRun.id,
-            toolName: msg.toolName,
-            stepName: node.id,
-          });
-
-          if (platform.getStreamingMode() === 'stream') {
-            const toolMsg = formatToolCall(msg.toolName, msg.toolInput);
-            if (toolMsg) {
-              await safeSendMessage(platform, conversationId, toolMsg, msgContext, {
-                category: 'tool_call_formatted',
-              } as WorkflowMessageMetadata);
-            }
-            if (platform.sendStructuredEvent) {
-              await platform.sendStructuredEvent(conversationId, msg);
-            }
-          }
-
-          const toolInput: Record<string, unknown> = msg.toolInput
-            ? Object.fromEntries(
-                Object.entries(msg.toolInput).map(([k, v]) =>
-                  typeof v === 'string' && v.length > 500 ? [k, v.slice(0, 500) + '...'] : [k, v]
-                )
-              )
-            : {};
-          await logTool(logDir, workflowRun.id, msg.toolName, toolInput);
-
-          // Persist tool_called event
-          deps.store
-            .createWorkflowEvent({
-              workflow_run_id: workflowRun.id,
-              event_type: 'tool_called',
-              step_name: node.id,
-              data: { tool_name: msg.toolName, tool_input: toolInput },
-            })
-            .catch((err: Error) => {
-              logEventStoreError(err, i);
-            });
-        } else if (msg.type === 'tool_result' && platform.sendStructuredEvent) {
-          await platform.sendStructuredEvent(conversationId, msg);
-        }
-        // rate_limit chunks: already log.warn'd in claude.ts; not surfaced to SSE per design
-      }
-    } catch (error) {
-      let failureError: unknown = error;
-      // Wall timeout aborts the provider stream; surface a clear fail-closed error
-      // instead of a raw AbortError (anchor: 42ee6575 hung ~28m with no deadline).
-      if (iterationWallTimedOut) {
-        failureError = new Error(
-          `Loop '${node.id}' iteration ${String(i)} exceeded wall timeout (${String(effectiveWallTimeout)}ms)`
-        );
-      } else if (error instanceof ResourceExhaustedPause) {
-        if (!iterationAttempt) throw error;
-        await finishProviderAttempt(deps, iterationAttempt, {
-          servedModelId: loopServedModelId ?? null,
-          outcomeClass: 'quota',
-          reasonCode: 'provider_quota_exhausted',
-        });
-        iterationAttemptCompleted = true;
-        return {
-          state: 'failed',
-          output: '',
-          error: `resource_exhausted: ${error.info.detail}`,
-          quotaExhausted: {
-            attemptId: iterationAttempt.attemptId,
-            attemptNumber: iterationAttempt.attemptNumber,
-            attemptStartedAt: iterationAttempt.startedAt,
-            provider: workflowProvider,
-            info: error.info,
-            iteration: i,
-          },
-        };
-      }
-
-      if (iterationAttempt && !iterationAttemptCompleted) {
-        const attemptOutcome = iterationWallTimedOut
-          ? ({ outcomeClass: 'progress', reasonCode: 'progress_timeout' } as const)
-          : isSdkSuccessContradiction((failureError as Error).message)
-            ? ({ outcomeClass: 'contradiction', reasonCode: 'sdk_contradiction' } as const)
-            : isAvailabilityError((failureError as Error).message)
-              ? ({ outcomeClass: 'availability', reasonCode: 'provider_unavailable' } as const)
-              : ({ outcomeClass: 'quality', reasonCode: 'execution_failed' } as const);
-        await finishProviderAttempt(deps, iterationAttempt, {
-          servedModelId: loopServedModelId ?? null,
-          ...attemptOutcome,
-        });
-        iterationAttemptCompleted = true;
-      }
-
-      const err = failureError as Error;
-      const duration = Date.now() - iterationStart;
-      getLog().error({ err, nodeId: node.id, iteration: i }, 'loop_node.iteration_failed');
+    const emitWallBreach = async (
+      attempt: 1 | 2,
+      elapsedMs: number,
+      wallMs: number
+    ): Promise<void> => {
+      wallBreaches.push({ attempt, elapsedMs, wallMs });
+      const rung = deriveEntryRung(workflowProvider, workflowModel);
       getWorkflowEventEmitter().emit({
-        type: 'loop_iteration_failed',
+        type: 'node_wall_breach',
         runId: workflowRun.id,
         nodeId: node.id,
         iteration: i,
-        error: err.message,
+        attempt,
+        elapsedMs,
+        wallMs,
+        rung,
       });
-      deps.store
+      await deps.store
         .createWorkflowEvent({
           workflow_run_id: workflowRun.id,
-          event_type: 'loop_iteration_failed',
+          event_type: 'node_wall_breach',
           step_name: node.id,
-          // Persist aggregate tokens accumulated across iterations BEFORE the
-          // failure so per-node token attribution survives loop SDK errors.
-          // Mirrors the omit-when-absent contract used on loop completion.
-          data: {
-            iteration: i,
-            error: err.message,
-            duration,
-            nodeId: node.id,
-            ...(loopTotalTokens ? { tokens: loopTotalTokens } : {}),
-          },
+          data: { iteration: i, attempt, elapsedMs, wallMs, rung, nodeId: node.id },
         })
         .catch((evtErr: Error) => {
           logEventStoreError(evtErr, i);
         });
-      await persistLoopNodeFailed(`Loop iteration ${i} failed: ${err.message}`);
-      return {
-        state: 'failed',
-        output: '',
-        error: `Loop iteration ${i} failed: ${err.message}`,
-        costUsd: loopTotalCostUsd,
-        ...(loopTotalTokens ? { tokens: loopTotalTokens } : {}),
-      };
-    } finally {
-      clearTimeout(wallTimer);
-    }
+    };
 
-    // Wall timeout without a thrown abort: fail closed (do not treat as idle success).
-    if (iterationWallTimedOut) {
-      if (iterationAttempt && !iterationAttemptCompleted) {
-        await finishProviderAttempt(deps, iterationAttempt, {
-          servedModelId: loopServedModelId ?? null,
-          outcomeClass: 'progress',
-          reasonCode: 'progress_timeout',
-        });
-        iterationAttemptCompleted = true;
-      }
-      const wallError = `Loop '${node.id}' iteration ${String(i)} exceeded wall timeout (${String(effectiveWallTimeout)}ms)`;
+    const failAfterWallBreaches = async (): Promise<NodeExecutionResult> => {
+      const first = wallBreaches[0];
+      const second = wallBreaches[1];
+      const wallError =
+        first && second
+          ? `Loop '${node.id}' iteration ${String(i)} exceeded wall timeout twice: attempt 1 ${String(first.elapsedMs)}ms/${String(first.wallMs)}ms, attempt 2 ${String(second.elapsedMs)}ms/${String(second.wallMs)}ms`
+          : `Loop '${node.id}' iteration ${String(i)} exceeded wall timeout (${String(effectiveWallTimeout)}ms)`;
       const duration = Date.now() - iterationStart;
       getLog().error(
-        { nodeId: node.id, iteration: i, timeoutMs: effectiveWallTimeout },
+        { nodeId: node.id, iteration: i, timeoutMs: effectiveWallTimeout, wallBreaches },
         'loop_node.iteration_wall_timeout'
       );
       getWorkflowEventEmitter().emit({
@@ -3755,7 +3444,7 @@ async function executeLoopNode(
         iteration: i,
         error: wallError,
       });
-      deps.store
+      await deps.store
         .createWorkflowEvent({
           workflow_run_id: workflowRun.id,
           event_type: 'loop_iteration_failed',
@@ -3767,6 +3456,7 @@ async function executeLoopNode(
             nodeId: node.id,
             wallTimedOut: true,
             wallTimeoutMs: effectiveWallTimeout,
+            wallBreaches,
             ...(loopTotalTokens ? { tokens: loopTotalTokens } : {}),
           },
         })
@@ -3781,6 +3471,395 @@ async function executeLoopNode(
         costUsd: loopTotalCostUsd,
         ...(loopTotalTokens ? { tokens: loopTotalTokens } : {}),
       };
+    };
+
+    for (const wallAttempt of [1, 2] as const) {
+      const attemptWallTimeout =
+        wallAttempt === 1 ? effectiveWallTimeout : Math.min(effectiveWallTimeout * 2, 3_600_000);
+      const attemptStartedAt = Date.now();
+      let iterationWallTimedOut = false;
+      const iterationAbortController = new AbortController();
+      const wallTimer = setTimeout(() => {
+        iterationWallTimedOut = true;
+        getLog().warn(
+          { nodeId: node.id, iteration: i, attempt: wallAttempt, timeoutMs: attemptWallTimeout },
+          'loop_node.wall_timeout_reached'
+        );
+        iterationAbortController.abort();
+      }, attemptWallTimeout);
+      iterationAttempt = undefined;
+      iterationAttemptCompleted = false;
+      iterationIdleTimedOut = false;
+
+      try {
+        // Build prompt -- substituteWorkflowVariables throws if $BASE_BRANCH referenced but empty
+        // Pass loopUserInput on the first resumed iteration; '' on all others (non-interactive
+        // or subsequent iterations) so $LOOP_USER_INPUT substitutes to empty string explicitly.
+        // $LOOP_PREV_OUTPUT carries the previous iteration's cleaned output and is empty on
+        // the first iteration (no prior output exists). Across an interactive resume, the
+        // executor starts a fresh `lastIterationOutput` variable, so the first iteration of
+        // the resume also receives an empty $LOOP_PREV_OUTPUT.
+        const { prompt: substitutedPrompt } = substituteWorkflowVariables(
+          loop.prompt,
+          workflowRun.id,
+          workflowRun.user_message,
+          artifactsDir,
+          baseBranch,
+          docsDir,
+          issueContext,
+          i === startIteration ? loopUserInput : '',
+          undefined, // rejectionReason
+          i === startIteration ? '' : lastIterationOutput
+        );
+        const finalPrompt = substituteNodeOutputRefs(substitutedPrompt, nodeOutputs);
+
+        const iterationOptions: SendQueryOptions | undefined = {
+          ...resolvedOptions,
+          abortSignal: iterationAbortController.signal,
+        };
+
+        iterationAttempt = await beginProviderAttempt(
+          deps,
+          workflowRun,
+          node,
+          workflowProvider,
+          resolvedOptions.model,
+          workflowModel
+        );
+        const generator = aiClient.sendQuery(finalPrompt, cwd, resumeSessionId, iterationOptions);
+        let lastToolStartedAt: { toolName: string; startedAt: number } | null = null;
+
+        for await (const msg of withIdleTimeout(generator, effectiveIdleTimeout, () => {
+          iterationIdleTimedOut = true;
+          getLog().warn(
+            { nodeId: node.id, iteration: i, timeoutMs: effectiveIdleTimeout },
+            'loop_node.idle_timeout_reached'
+          );
+          iterationAbortController.abort();
+        })) {
+          if (iterationWallTimedOut) break;
+          if (msg.type === 'provider_route') {
+            if (!iterationAttempt) throw new Error('provider_route_without_attempt');
+            await finishProviderAttempt(deps, iterationAttempt, {
+              servedModelId: null,
+              outcomeClass: 'availability',
+              reasonCode: msg.reasonCode,
+            });
+            iterationAttemptCompleted = true;
+            await persistProviderRouteChange(
+              deps,
+              workflowRun.id,
+              node.id,
+              iterationAttempt.attemptId,
+              msg
+            );
+            iterationAttempt = await beginProviderAttempt(
+              deps,
+              workflowRun,
+              node,
+              msg.toProvider,
+              msg.toModel,
+              workflowModel
+            );
+            iterationAttemptCompleted = false;
+          } else if (msg.type === 'assistant') {
+            fullOutput += msg.content;
+            // Clean the accumulated buffer, not each provider chunk independently.
+            // stripCompletionTags() trims its input, so per-chunk cleaning erased
+            // newline-only chunks and joined adjacent fields in persisted output and
+            // $LOOP_PREV_OUTPUT (anchor: run 42ee6575).
+            const previousCleanOutput = cleanOutput;
+            cleanOutput = stripCompletionTags(fullOutput, loop.until);
+            const cleanedDelta = cleanOutput.startsWith(previousCleanOutput)
+              ? cleanOutput.slice(previousCleanOutput.length)
+              : '';
+            if (platform.getStreamingMode() === 'stream' && cleanedDelta) {
+              await safeSendMessage(platform, conversationId, cleanedDelta, msgContext);
+            }
+            await logAssistant(logDir, workflowRun.id, msg.content);
+          } else if (msg.type === 'result') {
+            // Emit tool_completed for the last tool in the iteration
+            if (lastToolStartedAt) {
+              const prevTool = lastToolStartedAt;
+              getWorkflowEventEmitter().emit({
+                type: 'tool_completed',
+                runId: workflowRun.id,
+                toolName: prevTool.toolName,
+                stepName: node.id,
+                durationMs: Date.now() - prevTool.startedAt,
+              });
+              deps.store
+                .createWorkflowEvent({
+                  workflow_run_id: workflowRun.id,
+                  event_type: 'tool_completed',
+                  step_name: node.id,
+                  data: {
+                    tool_name: prevTool.toolName,
+                    duration_ms: Date.now() - prevTool.startedAt,
+                  },
+                })
+                .catch((err: Error) => {
+                  logEventStoreError(err, i);
+                });
+              lastToolStartedAt = null;
+            }
+            if (msg.sessionId) currentSessionId = msg.sessionId;
+            if (msg.cost !== undefined) {
+              loopTotalCostUsd = (loopTotalCostUsd ?? 0) + msg.cost;
+            }
+            if (msg.tokens) {
+              const t = msg.tokens;
+              if (!loopTotalTokens) loopTotalTokens = { input: 0, output: 0 };
+              loopTotalTokens.input += t.input;
+              loopTotalTokens.output += t.output;
+              if (t.total !== undefined) {
+                loopTotalTokens.total = (loopTotalTokens.total ?? 0) + t.total;
+              }
+            }
+            if (msg.stopReason !== undefined) loopFinalStopReason = msg.stopReason;
+            if (msg.numTurns !== undefined) {
+              loopTotalNumTurns = (loopTotalNumTurns ?? 0) + msg.numTurns;
+            }
+            if (msg.servedModelId !== undefined) loopServedModelId = msg.servedModelId;
+            if (msg.servedModelMissingReason !== undefined) {
+              loopServedMissingReason = msg.servedModelMissingReason;
+            }
+            // Fail the iteration loudly on SDK error results. Previously we broke
+            // silently, producing empty output and continuing to the next iteration --
+            // which made `error_during_execution` on resumed interactive loops look
+            // like a "5-second crash" that kept burning iterations (#1208).
+            if (msg.isError) {
+              const resourceExhausted = classifyResourceExhaustedSdkResult(msg);
+              if (resourceExhausted) {
+                getLog().warn(
+                  {
+                    nodeId: node.id,
+                    iteration: i,
+                    errorSubtype: msg.errorSubtype,
+                    errors: msg.errors,
+                    reason: resourceExhausted.reason,
+                  },
+                  'loop_node.iteration_resource_exhausted'
+                );
+                throw new ResourceExhaustedPause(resourceExhausted);
+              }
+              const subtype = msg.errorSubtype ?? 'unknown';
+              const errorsDetail = msg.errors?.length ? ` -- ${msg.errors.join('; ')}` : '';
+              getLog().error(
+                {
+                  nodeId: node.id,
+                  iteration: i,
+                  errorSubtype: subtype,
+                  errors: msg.errors,
+                  sessionId: msg.sessionId,
+                  stopReason: msg.stopReason,
+                },
+                'loop_node.iteration_sdk_error'
+              );
+              throw new Error(
+                `Loop '${node.id}' iteration ${String(i)} failed: SDK returned ${subtype}${errorsDetail}`
+              );
+            }
+            break; // Result is the "I'm done" signal -- don't wait for subprocess to exit
+          } else if (msg.type === 'tool' && msg.toolName) {
+            const now = Date.now();
+
+            // Emit tool_completed for the previous tool
+            if (lastToolStartedAt) {
+              const prevTool = lastToolStartedAt;
+              getWorkflowEventEmitter().emit({
+                type: 'tool_completed',
+                runId: workflowRun.id,
+                toolName: prevTool.toolName,
+                stepName: node.id,
+                durationMs: now - prevTool.startedAt,
+              });
+              deps.store
+                .createWorkflowEvent({
+                  workflow_run_id: workflowRun.id,
+                  event_type: 'tool_completed',
+                  step_name: node.id,
+                  data: { tool_name: prevTool.toolName, duration_ms: now - prevTool.startedAt },
+                })
+                .catch((err: Error) => {
+                  logEventStoreError(err, i);
+                });
+            }
+            lastToolStartedAt = { toolName: msg.toolName, startedAt: now };
+
+            // Emit tool_started for the current tool (fire-and-forget)
+            getWorkflowEventEmitter().emit({
+              type: 'tool_started',
+              runId: workflowRun.id,
+              toolName: msg.toolName,
+              stepName: node.id,
+            });
+
+            if (platform.getStreamingMode() === 'stream') {
+              const toolMsg = formatToolCall(msg.toolName, msg.toolInput);
+              if (toolMsg) {
+                await safeSendMessage(platform, conversationId, toolMsg, msgContext, {
+                  category: 'tool_call_formatted',
+                } as WorkflowMessageMetadata);
+              }
+              if (platform.sendStructuredEvent) {
+                await platform.sendStructuredEvent(conversationId, msg);
+              }
+            }
+
+            const toolInput: Record<string, unknown> = msg.toolInput
+              ? Object.fromEntries(
+                  Object.entries(msg.toolInput).map(([k, v]) =>
+                    typeof v === 'string' && v.length > 500 ? [k, v.slice(0, 500) + '...'] : [k, v]
+                  )
+                )
+              : {};
+            await logTool(logDir, workflowRun.id, msg.toolName, toolInput);
+
+            // Persist tool_called event
+            deps.store
+              .createWorkflowEvent({
+                workflow_run_id: workflowRun.id,
+                event_type: 'tool_called',
+                step_name: node.id,
+                data: { tool_name: msg.toolName, tool_input: toolInput },
+              })
+              .catch((err: Error) => {
+                logEventStoreError(err, i);
+              });
+          } else if (msg.type === 'tool_result' && platform.sendStructuredEvent) {
+            await platform.sendStructuredEvent(conversationId, msg);
+          }
+          // rate_limit chunks: already log.warn'd in claude.ts; not surfaced to SSE per design
+        }
+      } catch (error) {
+        let failureError: unknown = error;
+        if (iterationWallTimedOut) {
+          failureError = new Error(
+            `Loop '${node.id}' iteration ${String(i)} exceeded wall timeout (${String(attemptWallTimeout)}ms)`
+          );
+        } else if (error instanceof ResourceExhaustedPause) {
+          if (!iterationAttempt) throw error;
+          await finishProviderAttempt(deps, iterationAttempt, {
+            servedModelId: loopServedModelId ?? null,
+            outcomeClass: 'quota',
+            reasonCode: 'provider_quota_exhausted',
+          });
+          iterationAttemptCompleted = true;
+          return {
+            state: 'failed',
+            output: '',
+            error: `resource_exhausted: ${error.info.detail}`,
+            quotaExhausted: {
+              attemptId: iterationAttempt.attemptId,
+              attemptNumber: iterationAttempt.attemptNumber,
+              attemptStartedAt: iterationAttempt.startedAt,
+              provider: workflowProvider,
+              info: error.info,
+              iteration: i,
+            },
+          };
+        }
+
+        if (iterationAttempt && !iterationAttemptCompleted) {
+          const attemptOutcome = iterationWallTimedOut
+            ? ({ outcomeClass: 'progress', reasonCode: 'progress_timeout' } as const)
+            : isSdkSuccessContradiction((failureError as Error).message)
+              ? ({ outcomeClass: 'contradiction', reasonCode: 'sdk_contradiction' } as const)
+              : isAvailabilityError((failureError as Error).message)
+                ? ({ outcomeClass: 'availability', reasonCode: 'provider_unavailable' } as const)
+                : ({ outcomeClass: 'quality', reasonCode: 'execution_failed' } as const);
+          await finishProviderAttempt(deps, iterationAttempt, {
+            servedModelId: loopServedModelId ?? null,
+            ...attemptOutcome,
+          });
+          iterationAttemptCompleted = true;
+        }
+
+        if (iterationWallTimedOut) {
+          await emitWallBreach(wallAttempt, Date.now() - attemptStartedAt, attemptWallTimeout);
+          if (wallAttempt === 1) {
+            fullOutput = '';
+            cleanOutput = '';
+            continue;
+          }
+          return await failAfterWallBreaches();
+        }
+
+        const err = failureError as Error;
+        const duration = Date.now() - iterationStart;
+        getLog().error({ err, nodeId: node.id, iteration: i }, 'loop_node.iteration_failed');
+        getWorkflowEventEmitter().emit({
+          type: 'loop_iteration_failed',
+          runId: workflowRun.id,
+          nodeId: node.id,
+          iteration: i,
+          error: err.message,
+        });
+        deps.store
+          .createWorkflowEvent({
+            workflow_run_id: workflowRun.id,
+            event_type: 'loop_iteration_failed',
+            step_name: node.id,
+            // Persist aggregate tokens accumulated across iterations BEFORE the
+            // failure so per-node token attribution survives loop SDK errors.
+            // Mirrors the omit-when-absent contract used on loop completion.
+            data: {
+              iteration: i,
+              error: err.message,
+              duration,
+              nodeId: node.id,
+              ...(loopTotalTokens ? { tokens: loopTotalTokens } : {}),
+            },
+          })
+          .catch((evtErr: Error) => {
+            logEventStoreError(evtErr, i);
+          });
+        await persistLoopNodeFailed(`Loop iteration ${i} failed: ${err.message}`);
+        return {
+          state: 'failed',
+          output: '',
+          error: `Loop iteration ${i} failed: ${err.message}`,
+          costUsd: loopTotalCostUsd,
+          ...(loopTotalTokens ? { tokens: loopTotalTokens } : {}),
+        };
+      } finally {
+        clearTimeout(wallTimer);
+      }
+
+      // Wall timeout without a thrown abort: retry once, then fail closed.
+      if (iterationWallTimedOut) {
+        if (iterationAttempt && !iterationAttemptCompleted) {
+          await finishProviderAttempt(deps, iterationAttempt, {
+            servedModelId: loopServedModelId ?? null,
+            outcomeClass: 'progress',
+            reasonCode: 'progress_timeout',
+          });
+          iterationAttemptCompleted = true;
+        }
+        await emitWallBreach(wallAttempt, Date.now() - attemptStartedAt, attemptWallTimeout);
+        if (wallAttempt === 1) {
+          fullOutput = '';
+          cleanOutput = '';
+          continue;
+        }
+        return await failAfterWallBreaches();
+      }
+
+      break;
+    }
+
+    // Wall timeout without a thrown abort: fail closed (do not treat as idle success).
+    if (wallBreaches.length >= 2) {
+      if (iterationAttempt && !iterationAttemptCompleted) {
+        await finishProviderAttempt(deps, iterationAttempt, {
+          servedModelId: loopServedModelId ?? null,
+          outcomeClass: 'progress',
+          reasonCode: 'progress_timeout',
+        });
+        iterationAttemptCompleted = true;
+      }
+      return await failAfterWallBreaches();
     }
 
     // An idle timeout is absence of progress, never proof of successful work.

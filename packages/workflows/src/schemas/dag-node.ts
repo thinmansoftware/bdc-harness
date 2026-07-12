@@ -143,6 +143,7 @@ export const dagNodeBaseSchema = z.object({
   allowed_tools: z.array(z.string()).optional(),
   denied_tools: z.array(z.string()).optional(),
   idle_timeout: z.number().optional(),
+  wall_timeout_ms: z.number().int().optional(),
   retry: stepRetryConfigSchema.optional(),
   hooks: workflowNodeHooksSchema.optional(),
   mcp: z.string().min(1, "'mcp' must be a non-empty string path").optional(),
@@ -674,6 +675,21 @@ export const dagNodeSchema = dagNodeBaseSchema
       });
     }
 
+    // wall_timeout_ms is a per-loop-iteration absolute cap, bounded to prevent
+    // accidental runaway or unusably short workflow YAML.
+    if (
+      data.wall_timeout_ms !== undefined &&
+      (!isFinite(data.wall_timeout_ms) ||
+        data.wall_timeout_ms < 60_000 ||
+        data.wall_timeout_ms > 3_600_000)
+    ) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "'wall_timeout_ms' must be a finite integer between 60000 and 3600000 (ms)",
+        path: ['wall_timeout_ms'],
+      });
+    }
+
     // persona/agent conflict: both fields allowed only if they agree.
     // Fail-closed: no silent precedence (see WO-HARNESS-PERSONA-DECLARED-NOT-LOADED-01).
     if (data.persona !== undefined && data.agent !== undefined && data.persona !== data.agent) {
@@ -697,6 +713,7 @@ export const dagNodeSchema = dagNodeBaseSchema
       ...(data.when !== undefined ? { when: data.when } : {}),
       ...(data.trigger_rule !== undefined ? { trigger_rule: data.trigger_rule } : {}),
       ...(data.idle_timeout !== undefined ? { idle_timeout: data.idle_timeout } : {}),
+      ...(data.wall_timeout_ms !== undefined ? { wall_timeout_ms: data.wall_timeout_ms } : {}),
     };
 
     // Shared optional fields (valid on AI and bash nodes)

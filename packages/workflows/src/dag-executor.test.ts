@@ -701,7 +701,7 @@ describe('executeDagWorkflow -- plan-review terminal safety', () => {
     ).toBe(true);
   });
 
-  it('fails plan-review iteration closed on wall timeout (hung mock provider)', async () => {
+  it('retries plan-review iteration once before failing on repeated wall timeout', async () => {
     const prevWall = process.env.ARCHON_LOOP_ITERATION_WALL_MS;
     const prevIdle = process.env.ARCHON_LOOP_ITERATION_IDLE_MS;
     // Wall fires first; idle is only slightly longer so withIdleTimeout can exit
@@ -754,12 +754,111 @@ describe('executeDagWorkflow -- plan-review terminal safety', () => {
         call =>
           call[0] as { event_type: string; step_name?: string; data?: Record<string, unknown> }
       );
+      const wallBreaches = events.filter(
+        e => e.event_type === 'node_wall_breach' && e.step_name === 'plan-review'
+      );
+      expect(wallBreaches).toHaveLength(2);
+      expect(wallBreaches[0]?.data?.iteration).toBe(1);
+      expect(wallBreaches[0]?.data?.attempt).toBe(1);
+      expect(wallBreaches[0]?.data?.wallMs).toBe(60);
+      expect(wallBreaches[1]?.data?.iteration).toBe(1);
+      expect(wallBreaches[1]?.data?.attempt).toBe(2);
+      expect(wallBreaches[1]?.data?.wallMs).toBe(120);
+      expect(mockSendQueryDag).toHaveBeenCalledTimes(2);
       const failed = events.filter(
         e => e.event_type === 'loop_iteration_failed' && e.step_name === 'plan-review'
       );
-      expect(failed.length).toBeGreaterThanOrEqual(1);
+      expect(failed).toHaveLength(1);
       const errText = String(failed[0]?.data?.error ?? '');
-      expect(errText.toLowerCase()).toMatch(/wall timeout/);
+      expect(errText).toMatch(/wall timeout twice/i);
+      expect(errText).toMatch(/attempt 1 \d+ms\/60ms/);
+      expect(errText).toMatch(/attempt 2 \d+ms\/120ms/);
+      const started = events.filter(
+        e => e.event_type === 'loop_iteration_started' && e.step_name === 'plan-review'
+      );
+      expect(started).toHaveLength(1);
+      expect(started[0]?.data?.iteration).toBe(1);
+    } finally {
+      if (prevWall === undefined) delete process.env.ARCHON_LOOP_ITERATION_WALL_MS;
+      else process.env.ARCHON_LOOP_ITERATION_WALL_MS = prevWall;
+      if (prevIdle === undefined) delete process.env.ARCHON_LOOP_ITERATION_IDLE_MS;
+      else process.env.ARCHON_LOOP_ITERATION_IDLE_MS = prevIdle;
+    }
+  });
+
+  it('emits node_wall_breach and completes when the retry attempt succeeds', async () => {
+    const prevWall = process.env.ARCHON_LOOP_ITERATION_WALL_MS;
+    const prevIdle = process.env.ARCHON_LOOP_ITERATION_IDLE_MS;
+    process.env.ARCHON_LOOP_ITERATION_WALL_MS = '60';
+    process.env.ARCHON_LOOP_ITERATION_IDLE_MS = '120';
+    try {
+      let calls = 0;
+      mockSendQueryDag.mockImplementation(async function* () {
+        calls += 1;
+        if (calls === 1) {
+          await new Promise<void>(() => {});
+          yield { type: 'assistant', content: 'never' };
+          return;
+        }
+        yield { type: 'assistant', content: 'looks good PLAN_REVIEW_APPROVED' };
+        yield { type: 'result', sessionId: 'retry-session' };
+      });
+
+      const store = createMockStore();
+      const mockDeps = createMockDeps(store);
+      const platform = createMockPlatform();
+      const workflowRun = makeWorkflowRun('plan-review-wall-timeout-retry-success-run');
+      const artifactsDir = join(testDir, 'artifacts-wall-retry-success');
+      const logDir = join(testDir, 'logs-wall-retry-success');
+
+      await executeDagWorkflow(
+        mockDeps,
+        platform,
+        'conv-dag',
+        testDir,
+        {
+          name: 'plan-review-wall-timeout-retry-success',
+          nodes: [
+            {
+              id: 'plan-review',
+              loop: {
+                prompt: 'review the plan',
+                until: 'PLAN_REVIEW_APPROVED',
+                max_iterations: 1,
+              },
+            },
+          ],
+        },
+        workflowRun,
+        'claude',
+        undefined,
+        artifactsDir,
+        logDir,
+        'main',
+        'docs/',
+        minimalConfig
+      );
+
+      const events = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls.map(
+        call =>
+          call[0] as { event_type: string; step_name?: string; data?: Record<string, unknown> }
+      );
+      const wallBreaches = events.filter(
+        e => e.event_type === 'node_wall_breach' && e.step_name === 'plan-review'
+      );
+      expect(wallBreaches).toHaveLength(1);
+      expect(wallBreaches[0]?.data?.attempt).toBe(1);
+      expect(wallBreaches[0]?.data?.wallMs).toBe(60);
+      expect(mockSendQueryDag).toHaveBeenCalledTimes(2);
+      expect(
+        events.some(
+          e => e.event_type === 'loop_iteration_completed' && e.step_name === 'plan-review'
+        )
+      ).toBe(true);
+      expect(events.some(e => e.event_type === 'node_failed')).toBe(false);
+      expect(
+        events.some(e => e.event_type === 'node_completed' && e.step_name === 'plan-review')
+      ).toBe(true);
     } finally {
       if (prevWall === undefined) delete process.env.ARCHON_LOOP_ITERATION_WALL_MS;
       else process.env.ARCHON_LOOP_ITERATION_WALL_MS = prevWall;

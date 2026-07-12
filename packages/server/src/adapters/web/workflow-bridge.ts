@@ -238,6 +238,19 @@ export function mapWorkflowEvent(event: WorkflowEmitterEvent): string | null {
         timestamp: Date.now(),
       });
 
+    case 'node_wall_breach':
+      return JSON.stringify({
+        type: 'node_wall_breach',
+        runId: event.runId,
+        nodeId: event.nodeId,
+        iteration: event.iteration,
+        attempt: event.attempt,
+        elapsedMs: event.elapsedMs,
+        wallMs: event.wallMs,
+        rung: event.rung,
+        timestamp: Date.now(),
+      });
+
     default: {
       const exhaustiveCheck: never = event;
       getLog().warn(
