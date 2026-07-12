@@ -139,6 +139,14 @@ $InstallDirectory = Join-Path $env:LOCALAPPDATA "BlueDevil\codex-auth-sync"
 $InstalledScriptPath = Join-Path $InstallDirectory "sync-codex-auth.ps1"
 $tempPath = Join-Path $InstallDirectory "sync-codex-auth.ps1.tmp.$([guid]::NewGuid().ToString('N'))"
 $replaceBackupPath = Join-Path $InstallDirectory "sync-codex-auth.ps1.replace-backup.$([guid]::NewGuid().ToString('N'))"
+$failedCandidatePath = Join-Path $InstallDirectory "sync-codex-auth.ps1.failed.$([guid]::NewGuid().ToString('N'))"
+$destinationExisted = Test-Path -LiteralPath $InstalledScriptPath -PathType Leaf
+$destinationHash = if ($destinationExisted) {
+  (Get-FileHash -Algorithm SHA256 -LiteralPath $InstalledScriptPath).Hash
+} else {
+  $null
+}
+$replacementCompleted = $false
 
 New-Item -ItemType Directory -Path $InstallDirectory -Force | Out-Null
 Set-ProtectedOperatorAcl -Path $InstallDirectory -IsDirectory $true
@@ -153,12 +161,12 @@ try {
   Set-ProtectedOperatorAcl -Path $tempPath -IsDirectory $false
   Assert-ProtectedOperatorAcl -Path $tempPath
 
-  if (Test-Path -LiteralPath $InstalledScriptPath -PathType Leaf) {
+  if ($destinationExisted) {
     [IO.File]::Replace($tempPath, $InstalledScriptPath, $replaceBackupPath)
-    Remove-Item -LiteralPath $replaceBackupPath -Force
   } else {
     [IO.File]::Move($tempPath, $InstalledScriptPath)
   }
+  $replacementCompleted = $true
 
   Set-ProtectedOperatorAcl -Path $InstalledScriptPath -IsDirectory $false
   Assert-ProtectedOperatorAcl -Path $InstalledScriptPath
@@ -166,12 +174,45 @@ try {
   if ($installedHash -ne $sourceHash) {
     throw "installed copy hash verification failed"
   }
+  if ($destinationExisted) {
+    Remove-Item -LiteralPath $replaceBackupPath -Force
+  }
+} catch {
+  $installError = $_
+  if ($replacementCompleted) {
+    try {
+      if ($destinationExisted) {
+        if (-not (Test-Path -LiteralPath $replaceBackupPath -PathType Leaf)) {
+          throw "replacement backup is missing"
+        }
+        if (Test-Path -LiteralPath $InstalledScriptPath -PathType Leaf) {
+          [IO.File]::Replace($replaceBackupPath, $InstalledScriptPath, $failedCandidatePath)
+        } else {
+          [IO.File]::Move($replaceBackupPath, $InstalledScriptPath)
+        }
+        $restoredHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $InstalledScriptPath).Hash
+        if ($restoredHash -ne $destinationHash) {
+          throw "restored copy hash verification failed"
+        }
+        if (Test-Path -LiteralPath $failedCandidatePath) {
+          Remove-Item -LiteralPath $failedCandidatePath -Force
+        }
+      } else {
+        if (Test-Path -LiteralPath $InstalledScriptPath) {
+          Remove-Item -LiteralPath $InstalledScriptPath -Force
+        }
+        if (Test-Path -LiteralPath $InstalledScriptPath) {
+          throw "failed first install was not removed"
+        }
+      }
+    } catch {
+      throw "sync task installation failed and rollback verification failed"
+    }
+  }
+  throw $installError
 } finally {
   if (Test-Path -LiteralPath $tempPath) {
     Remove-Item -LiteralPath $tempPath -Force
-  }
-  if (Test-Path -LiteralPath $replaceBackupPath) {
-    Remove-Item -LiteralPath $replaceBackupPath -Force
   }
 }
 

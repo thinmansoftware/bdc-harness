@@ -301,10 +301,10 @@ try {
     writeFileSync(sourcePath, 'Write-Output "valid"\r\n', 'ascii');
 
     const command = `${schedulerMockPrelude(registrationMarker)}
-$script:HashCall = 0
+$global:HashCall = 0
 function Get-FileHash {
-  $script:HashCall++
-  if ($script:HashCall -eq 1) { return [pscustomobject]@{ Hash = ('a' * 64) } }
+  $global:HashCall++
+  if ($global:HashCall -eq 1) { return [pscustomobject]@{ Hash = ('a' * 64) } }
   return [pscustomobject]@{ Hash = ('b' * 64) }
 }
 $env:LOCALAPPDATA = ${quotePowerShellLiteral(localAppData)}
@@ -317,6 +317,114 @@ try {
     const result = runPowerShell(command);
 
     expect(result.status).not.toBe(0);
+    expect(existsSync(registrationMarker)).toBe(false);
+  });
+
+  test('restores the old destination when final ACL enforcement fails after replacement', () => {
+    const directory = mkdtempSync(join(tmpdir(), 'codex-auth-installer-final-acl-'));
+    tempDirectories.push(directory);
+    const localAppData = join(directory, 'local');
+    const sourcePath = join(directory, 'valid.ps1');
+    const installDirectory = join(localAppData, 'BlueDevil', 'codex-auth-sync');
+    const installedPath = join(installDirectory, 'sync-codex-auth.ps1');
+    const registrationMarker = join(directory, 'registered.txt');
+    const failureStageMarker = join(directory, 'failure-stage.txt');
+    const oldBytes = Buffer.from('Write-Output "old stable copy"\r\n', 'ascii');
+    const newBytes = Buffer.from('Write-Output "new candidate"\r\n', 'ascii');
+    mkdirSync(installDirectory, { recursive: true });
+    writeFileSync(sourcePath, newBytes);
+    writeFileSync(installedPath, oldBytes);
+
+    const command = `${schedulerMockPrelude(registrationMarker)}
+$global:SetAclCall = 0
+function Set-Acl {
+  param([string]$LiteralPath, $AclObject)
+  $global:SetAclCall++
+  if ($global:SetAclCall -eq 3) {
+    $currentHash = (Microsoft.PowerShell.Utility\\Get-FileHash -Algorithm SHA256 -LiteralPath ${quotePowerShellLiteral(installedPath)}).Hash
+    $backupExists = [bool](Get-ChildItem -LiteralPath ${quotePowerShellLiteral(installDirectory)} -Filter '*.replace-backup.*')
+    "call=3 current_hash=$currentHash backup_exists=$backupExists" | Set-Content -LiteralPath ${quotePowerShellLiteral(failureStageMarker)} -Encoding ascii
+    throw 'simulated final ACL failure'
+  }
+  Microsoft.PowerShell.Security\\Set-Acl -LiteralPath $LiteralPath -AclObject $AclObject
+}
+$env:LOCALAPPDATA = ${quotePowerShellLiteral(localAppData)}
+try {
+  & ${quotePowerShellLiteral(windowsPath(installerPath))} -SourceScriptPath ${quotePowerShellLiteral(sourcePath)}
+} catch {
+  exit 17
+}
+`;
+    const result = runPowerShell(command);
+
+    expect(result.status).not.toBe(0);
+    if (!existsSync(failureStageMarker)) {
+      throw new Error(`Expected final ACL failure stage: ${result.stderr}`);
+    }
+    expect(readFileSync(failureStageMarker, 'ascii')).toContain(
+      createHash('sha256').update(newBytes).digest('hex').toUpperCase()
+    );
+    expect(readFileSync(failureStageMarker, 'ascii')).toContain('backup_exists=True');
+    expect(readFileSync(installedPath)).toEqual(oldBytes);
+    expect(
+      readdirSync(installDirectory).filter(
+        name => name.includes('.replace-backup.') || name.includes('.failed.')
+      )
+    ).toEqual([]);
+    expect(existsSync(registrationMarker)).toBe(false);
+  });
+
+  test('restores the old destination when the final installed hash check fails', () => {
+    const directory = mkdtempSync(join(tmpdir(), 'codex-auth-installer-final-hash-'));
+    tempDirectories.push(directory);
+    const localAppData = join(directory, 'local');
+    const sourcePath = join(directory, 'valid.ps1');
+    const installDirectory = join(localAppData, 'BlueDevil', 'codex-auth-sync');
+    const installedPath = join(installDirectory, 'sync-codex-auth.ps1');
+    const registrationMarker = join(directory, 'registered.txt');
+    const failureStageMarker = join(directory, 'failure-stage.txt');
+    const oldBytes = Buffer.from('Write-Output "old stable copy"\r\n', 'ascii');
+    const newBytes = Buffer.from('Write-Output "new candidate"\r\n', 'ascii');
+    mkdirSync(installDirectory, { recursive: true });
+    writeFileSync(sourcePath, newBytes);
+    writeFileSync(installedPath, oldBytes);
+
+    const command = `${schedulerMockPrelude(registrationMarker)}
+$global:SetAclCall = 0
+function Set-Acl {
+  param([string]$LiteralPath, $AclObject)
+  $global:SetAclCall++
+  Microsoft.PowerShell.Security\\Set-Acl -LiteralPath $LiteralPath -AclObject $AclObject
+  if ($global:SetAclCall -eq 3) {
+    [IO.File]::WriteAllText(${quotePowerShellLiteral(installedPath)}, 'simulated post-ACL corruption')
+    $actualHash = (Microsoft.PowerShell.Utility\\Get-FileHash -Algorithm SHA256 -LiteralPath ${quotePowerShellLiteral(installedPath)}).Hash
+    $backupExists = [bool](Get-ChildItem -LiteralPath ${quotePowerShellLiteral(installDirectory)} -Filter '*.replace-backup.*')
+    "call=3 current_hash=$actualHash backup_exists=$backupExists" | Set-Content -LiteralPath ${quotePowerShellLiteral(failureStageMarker)} -Encoding ascii
+  }
+}
+$env:LOCALAPPDATA = ${quotePowerShellLiteral(localAppData)}
+try {
+  & ${quotePowerShellLiteral(windowsPath(installerPath))} -SourceScriptPath ${quotePowerShellLiteral(sourcePath)}
+} catch {
+  exit 17
+}
+`;
+    const result = runPowerShell(command);
+
+    expect(result.status).not.toBe(0);
+    if (!existsSync(failureStageMarker)) {
+      throw new Error(`Expected final hash failure stage: ${result.stderr}`);
+    }
+    expect(readFileSync(failureStageMarker, 'ascii')).toContain(
+      createHash('sha256').update('simulated post-ACL corruption').digest('hex').toUpperCase()
+    );
+    expect(readFileSync(failureStageMarker, 'ascii')).toContain('backup_exists=True');
+    expect(readFileSync(installedPath)).toEqual(oldBytes);
+    expect(
+      readdirSync(installDirectory).filter(
+        name => name.includes('.replace-backup.') || name.includes('.failed.')
+      )
+    ).toEqual([]);
     expect(existsSync(registrationMarker)).toBe(false);
   });
 });
