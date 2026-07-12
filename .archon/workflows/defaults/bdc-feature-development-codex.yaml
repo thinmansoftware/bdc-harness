@@ -271,7 +271,6 @@ nodes:
     agent: war-council-architect
     depends_on: [plan]
     task_class: medium_work
-    wall_timeout_ms: 1800000
     loop:
       fresh_context: true
       # Success-only sentinel. The war-council-architect persona is READ-ONLY
@@ -391,6 +390,7 @@ nodes:
     model: gpt-5.5
     depends_on: [capture-run-scope]
     task_class: medium_work
+    wall_timeout_ms: 1800000
     loop:
       prompt: |
         Implement the approved plan for this BDC feature Work Order.
