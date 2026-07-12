@@ -1,19 +1,19 @@
 param(
   [string]$SshAlias = "hetzner-prod",
   [string]$DesktopAuthPath = "$env:USERPROFILE\.codex\auth.json",
-  [string]$RemoteAuthPath = "/opt/bdc/archon-user-home/.codex/auth.json",
+  [string]$ContainerName = "archon-app-1",
+  [string]$ContainerAuthPath = "/root/.codex/auth.json",
   [string]$WebhookUrl = "https://n8n.bluedevilcollectibles.com/webhook/builder-status",
   [string]$LogPath = "$env:USERPROFILE\.codex\codex-auth-sync.log"
 )
 
-# Sync Codex desktop OAuth credentials to the Hetzner host using newest-wins.
-# Verify probe: after a copy, docker exec runs Bun in archon-app-1 and imports
-# the provider preflight reader against /root/.codex/auth.json. The probe only
-# emits booleans and exits non-zero if auth.json cannot be read as credentials.
+# Sync Codex desktop OAuth credentials to the Hetzner container using newest-wins.
+# Protected remote file operations run as root through docker exec. The verify
+# probe emits booleans only and fails if the replacement is not valid credentials.
 
 $ErrorActionPreference = "Stop"
 $WoId = "WO-HARNESS-CODEX-AUTH-SYNC-AND-FRESHNESS-GATE-01"
-$RemoteTempPath = "/tmp/codex-auth-sync-auth.json"
+$ContainerTempPath = "/root/.codex/auth.json.tmp.sync"
 
 function Write-RedactedLog {
   param([string]$Action, [string]$Detail)
@@ -37,7 +37,7 @@ function Send-BuilderStatus {
   try {
     Invoke-RestMethod -Method Post -Uri $WebhookUrl -ContentType "application/json" -Body $body | Out-Null
   } catch {
-    Write-RedactedLog -Action "failed" -Detail "webhook_post_failed status=unknown"
+    Write-RedactedLog -Action "failed" -Detail "status=webhook_post_failed"
   }
 }
 
@@ -64,24 +64,19 @@ function Invoke-RemoteChecked {
   }
 }
 
-function Get-LocalLastRefreshMs {
+function Get-LocalJwtIssuedAtSeconds {
   param([string]$Path)
   try {
-    $json = Get-Content -Raw -Path $Path | ConvertFrom-Json
-    if (-not $json.last_refresh) { return $null }
-    return ([DateTimeOffset]::Parse([string]$json.last_refresh)).ToUnixTimeMilliseconds()
-  } catch {
-    return $null
-  }
-}
+    $json = Get-Content -Raw -LiteralPath $Path | ConvertFrom-Json
+    $token = [string]$json.tokens.access_token
+    $parts = $token.Split(".")
+    if ($parts.Length -ne 3) { return $null }
 
-function Get-RemoteLastRefreshMs {
-  try {
-    $raw = Invoke-RemoteText -Command "cat $RemoteAuthPath 2>/dev/null || true"
-    if (-not $raw) { return $null }
-    $json = $raw | ConvertFrom-Json
-    if (-not $json.last_refresh) { return $null }
-    return ([DateTimeOffset]::Parse([string]$json.last_refresh)).ToUnixTimeMilliseconds()
+    $payload = $parts[1].Replace("-", "+").Replace("_", "/")
+    while (($payload.Length % 4) -ne 0) { $payload += "=" }
+    $payloadJson = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($payload)) | ConvertFrom-Json
+    if ($null -eq $payloadJson.iat) { return $null }
+    return [int64]$payloadJson.iat
   } catch {
     return $null
   }
@@ -89,90 +84,81 @@ function Get-RemoteLastRefreshMs {
 
 function Get-LocalSha256 {
   param([string]$Path)
-  return (Get-FileHash -Algorithm SHA256 -Path $Path).Hash.ToLowerInvariant()
+  return (Get-FileHash -Algorithm SHA256 -LiteralPath $Path).Hash.ToLowerInvariant()
 }
 
-function Get-RemoteSha256 {
-  try {
-    return Invoke-RemoteText -Command "test -f $RemoteAuthPath && sha256sum $RemoteAuthPath | cut -d' ' -f1 || true"
-  } catch {
-    return ""
-  }
-}
-
-function Get-RemoteMtimeSeconds {
-  try {
-    $value = Invoke-RemoteText -Command "stat -c %Y $RemoteAuthPath 2>/dev/null || true"
-    if (-not $value) { return $null }
-    return [int64]$value
-  } catch {
-    return $null
-  }
+function Get-ContainerMetadata {
+  $command = @"
+docker exec $ContainerName bun -e "import {readFileSync,statSync} from 'node:fs';import {createHash} from 'node:crypto';const p='$ContainerAuthPath';try{const raw=readFileSync(p);const stat=statSync(p);const json=JSON.parse(raw.toString('utf8'));const token=json?.tokens?.access_token;let iat=null;if(typeof token==='string'){const parts=token.split('.');if(parts.length===3){try{const payload=JSON.parse(Buffer.from(parts[1],'base64url').toString('utf8'));if(Number.isFinite(payload.iat))iat=Math.trunc(payload.iat);}catch{}}}console.log(JSON.stringify({exists:true,sha256:createHash('sha256').update(raw).digest('hex'),bytes:raw.length,mtimeSeconds:Math.trunc(stat.mtimeMs/1000),iat}));}catch{console.log(JSON.stringify({exists:false,sha256:'',bytes:0,mtimeSeconds:null,iat:null}));}"
+"@
+  $raw = Invoke-RemoteText -Command $command.Trim()
+  return $raw | ConvertFrom-Json
 }
 
 function Invoke-VerifyProbe {
   $probe = @"
-docker exec archon-app-1 bun -e "import('/app/packages/providers/src/auth-refresh/preflight.ts').then(m=>{const f=m.readCodexFreshness('/root/.codex/auth.json');if(!f.hasCreds||!f.hasRefreshToken)process.exit(2);console.log(JSON.stringify({hasCreds:f.hasCreds,hasRefreshToken:f.hasRefreshToken,fresh:Boolean(f.freshExpiresAt)}));}).catch(()=>process.exit(3))"
+docker exec $ContainerName bun -e "import('/app/packages/providers/src/auth-refresh/preflight.ts').then(m=>{const f=m.readCodexFreshness('$ContainerAuthPath');if(!f.hasCreds||!f.hasRefreshToken)process.exit(2);console.log(JSON.stringify({hasCreds:f.hasCreds,hasRefreshToken:f.hasRefreshToken,fresh:Boolean(f.freshExpiresAt)}));}).catch(()=>process.exit(3))"
 "@
   Invoke-RemoteChecked -Command $probe.Trim()
 }
 
 try {
-  if (-not (Test-Path $DesktopAuthPath)) {
-    Complete-Action -Action "failed" -Detail "desktop_auth_missing path=$DesktopAuthPath"
+  if (-not (Test-Path -LiteralPath $DesktopAuthPath)) {
+    Complete-Action -Action "failed" -Detail "status=desktop_auth_missing"
     exit 1
   }
 
   $desktopHash = Get-LocalSha256 -Path $DesktopAuthPath
-  $remoteHash = Get-RemoteSha256
-  $desktopBytes = (Get-Item $DesktopAuthPath).Length
-  $remoteBytesText = Invoke-RemoteText -Command "stat -c %s $RemoteAuthPath 2>/dev/null || true"
-  $remoteBytes = if ($remoteBytesText) { [int64]$remoteBytesText } else { 0 }
-  $desktopRefreshMs = Get-LocalLastRefreshMs -Path $DesktopAuthPath
-  $remoteRefreshMs = Get-RemoteLastRefreshMs
+  $desktopBytes = (Get-Item -LiteralPath $DesktopAuthPath).Length
+  $desktopIssuedAtSeconds = Get-LocalJwtIssuedAtSeconds -Path $DesktopAuthPath
+  $containerMetadata = Get-ContainerMetadata
+  $remoteHash = [string]$containerMetadata.sha256
+  $remoteBytes = [int64]$containerMetadata.bytes
+  $remoteIssuedAtSeconds = if ($null -ne $containerMetadata.iat) { [int64]$containerMetadata.iat } else { $null }
   $desktopHashPrefix = $desktopHash.Substring(0, 8)
   $remoteHashPrefix = if ($remoteHash.Length -ge 8) { $remoteHash.Substring(0, 8) } else { "missing" }
 
   if ($desktopHash -and $remoteHash -and $desktopHash -eq $remoteHash) {
-    Complete-Action -Action "no-op" -Detail "hashes_identical desktop_sha=$desktopHashPrefix remote_sha=$remoteHashPrefix bytes=$desktopBytes"
+    Complete-Action -Action "no-op" -Detail "status=hashes_identical desktop_sha=$desktopHashPrefix remote_sha=$remoteHashPrefix desktop_bytes=$desktopBytes remote_bytes=$remoteBytes"
     exit 0
   }
 
-  $desktopIsNewer = $false
-  $usedMtimeFallback = $false
-  if ($null -ne $desktopRefreshMs -and $null -ne $remoteRefreshMs) {
-    $desktopIsNewer = $desktopRefreshMs -gt $remoteRefreshMs
+  $comparison = "jwt_iat"
+  if ($null -ne $desktopIssuedAtSeconds -and $null -ne $remoteIssuedAtSeconds) {
+    $desktopIsNewer = $desktopIssuedAtSeconds -gt $remoteIssuedAtSeconds
   } else {
-    $usedMtimeFallback = $true
-    $desktopMtime = ([DateTimeOffset](Get-Item $DesktopAuthPath).LastWriteTimeUtc).ToUnixTimeSeconds()
-    $remoteMtime = Get-RemoteMtimeSeconds
+    $comparison = "mtime_fallback"
+    $desktopMtime = ([DateTimeOffset](Get-Item -LiteralPath $DesktopAuthPath).LastWriteTimeUtc).ToUnixTimeSeconds()
+    $remoteMtime = if ($null -ne $containerMetadata.mtimeSeconds) { [int64]$containerMetadata.mtimeSeconds } else { $null }
     $desktopIsNewer = $null -eq $remoteMtime -or $desktopMtime -gt $remoteMtime
   }
 
   if (-not $desktopIsNewer) {
-    Complete-Action -Action "skipped" -Detail "container_newer_or_equal desktop_sha=$desktopHashPrefix remote_sha=$remoteHashPrefix desktop_bytes=$desktopBytes remote_bytes=$remoteBytes"
+    Complete-Action -Action "skipped" -Detail "status=container_newer_or_equal comparison=$comparison desktop_sha=$desktopHashPrefix remote_sha=$remoteHashPrefix desktop_bytes=$desktopBytes remote_bytes=$remoteBytes"
     exit 0
   }
 
   $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
-  $backupPath = "$RemoteAuthPath.bak.$stamp"
-  Invoke-RemoteChecked -Command "test -f $RemoteAuthPath && cp $RemoteAuthPath $backupPath || true"
-  & scp $DesktopAuthPath "$SshAlias`:$RemoteTempPath" | Out-Null
-  if ($LASTEXITCODE -ne 0) { throw "scp failed exit=$LASTEXITCODE" }
-  Invoke-RemoteChecked -Command "mv $RemoteTempPath $RemoteAuthPath && chown appuser:appuser $RemoteAuthPath && chmod 600 $RemoteAuthPath"
+  $backupPath = "$ContainerAuthPath.bak.$stamp"
+  Invoke-RemoteChecked -Command "docker exec $ContainerName sh -c `"if [ -f '$ContainerAuthPath' ]; then cp '$ContainerAuthPath' '$backupPath'; fi`""
+
+  Get-Content -Raw -LiteralPath $DesktopAuthPath |
+    & ssh $SshAlias "docker exec -i $ContainerName sh -c `"umask 077; cat > $ContainerTempPath`"" | Out-Null
+  if ($LASTEXITCODE -ne 0) { throw "credential stream failed exit=$LASTEXITCODE" }
+
+  Invoke-RemoteChecked -Command "docker exec $ContainerName sh -c `"chmod 600 $ContainerTempPath && mv $ContainerTempPath $ContainerAuthPath`""
 
   try {
     Invoke-VerifyProbe
   } catch {
-    Invoke-RemoteChecked -Command "test -f $backupPath && mv $backupPath $RemoteAuthPath || true"
-    Complete-Action -Action "failed" -Detail "verify_probe_failed restored_backup=$backupPath desktop_sha=$desktopHashPrefix bytes=$desktopBytes"
+    Invoke-RemoteChecked -Command "docker exec $ContainerName sh -c `"if [ -f '$backupPath' ]; then cp '$backupPath' '$ContainerAuthPath' && chmod 600 '$ContainerAuthPath'; fi`""
+    Complete-Action -Action "failed" -Detail "status=verify_probe_failed comparison=$comparison desktop_sha=$desktopHashPrefix remote_sha=$remoteHashPrefix desktop_bytes=$desktopBytes remote_bytes=$remoteBytes"
     exit 1
   }
 
-  $mode = if ($usedMtimeFallback) { "mtime_fallback" } else { "last_refresh" }
-  Complete-Action -Action "synced" -Detail "copied mode=$mode backup=$backupPath desktop_sha=$desktopHashPrefix remote_sha_before=$remoteHashPrefix bytes=$desktopBytes"
+  Complete-Action -Action "synced" -Detail "status=synced comparison=$comparison desktop_sha=$desktopHashPrefix remote_sha=$remoteHashPrefix desktop_bytes=$desktopBytes remote_bytes=$remoteBytes"
   exit 0
 } catch {
-  Complete-Action -Action "failed" -Detail "sync_error type=$($_.Exception.GetType().Name)"
+  Complete-Action -Action "failed" -Detail "status=sync_error"
   exit 1
 }
