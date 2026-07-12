@@ -388,6 +388,7 @@ nodes:
     # (persona major-build would pin opus[1m] and shadow fable). See header.
     depends_on: [capture-run-scope]
     task_class: medium_work
+    wall_timeout_ms: 1800000
     loop:
       prompt: |
         Implement the approved plan for this BDC feature Work Order.

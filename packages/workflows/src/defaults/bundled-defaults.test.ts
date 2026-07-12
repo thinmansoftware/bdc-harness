@@ -34,6 +34,15 @@ function normalizeBundledText(raw: string): string {
     .join('');
 }
 
+function extractWorkflowNode(content: string, id: string): string {
+  const lines = content.split('\n');
+  const start = lines.findIndex(line => line === `  - id: ${id}`);
+  expect(start).toBeGreaterThanOrEqual(0);
+
+  const end = lines.findIndex((line, index) => index > start && /^  - id: /.test(line));
+  return lines.slice(start, end === -1 ? undefined : end).join('\n');
+}
+
 describe('bundled-defaults', () => {
   describe('isBinaryBuild', () => {
     it('should return false in dev/test mode', () => {
@@ -140,6 +149,29 @@ describe('bundled-defaults', () => {
         expect(content).toContain('name:');
         expect(content).toContain('description:');
         expect(content.includes('nodes:')).toBe(true);
+      }
+    });
+
+    describe('feature-development implement wall timeout placement', () => {
+      const AFFECTED = [
+        'bdc-feature-development',
+        'bdc-feature-development-codex',
+        'bdc-feature-development-codex-only',
+        'bdc-feature-development-fable',
+        'bdc-feature-development-fusion-cx-qwen',
+        'bdc-feature-development-zero-open',
+        'bdc-feature-development-zero',
+      ];
+
+      for (const name of AFFECTED) {
+        it(`${name} applies the 30-minute wall timeout to implement, not plan-review`, () => {
+          const content = BUNDLED_WORKFLOWS[name];
+          const planReview = extractWorkflowNode(content, 'plan-review');
+          const implement = extractWorkflowNode(content, 'implement');
+
+          expect(planReview).not.toContain('wall_timeout_ms: 1800000');
+          expect(implement).toContain('wall_timeout_ms: 1800000');
+        });
       }
     });
 

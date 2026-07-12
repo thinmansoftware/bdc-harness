@@ -151,6 +151,31 @@ describe('WorkflowEventEmitter', () => {
       });
     });
 
+    it('delivers node_wall_breach events', () => {
+      const emitter = getWorkflowEventEmitter();
+      const listener = mock((_event: WorkflowEmitterEvent) => {});
+
+      emitter.subscribe(listener);
+      emitter.emit({
+        type: 'node_wall_breach',
+        runId: 'run-1',
+        nodeId: 'implement',
+        iteration: 1,
+        attempt: 1,
+        elapsedMs: 60_001,
+        wallMs: 60_000,
+        rung: 'codex:gpt-5.5',
+      });
+
+      expect(listener).toHaveBeenCalledTimes(1);
+      expect(listener.mock.calls[0][0]).toMatchObject({
+        type: 'node_wall_breach',
+        iteration: 1,
+        attempt: 1,
+        wallMs: 60_000,
+      });
+    });
+
     it('returns an unsubscribe function', () => {
       const emitter = getWorkflowEventEmitter();
       const unsubscribe = emitter.subscribe(mock(() => {}));

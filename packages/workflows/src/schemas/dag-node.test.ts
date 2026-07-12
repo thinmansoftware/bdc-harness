@@ -32,6 +32,39 @@ describe('mechanical evidence nodes', () => {
   });
 });
 
+describe('dagNodeSchema wall_timeout_ms field', () => {
+  it('accepts valid wall timeout boundaries on loop nodes', () => {
+    const min = dagNodeSchema.safeParse({
+      id: 'implement',
+      loop: { prompt: 'Implement it.', until: 'COMPLETE', max_iterations: 1 },
+      wall_timeout_ms: 60_000,
+    });
+    const max = dagNodeSchema.safeParse({
+      id: 'implement',
+      loop: { prompt: 'Implement it.', until: 'COMPLETE', max_iterations: 1 },
+      wall_timeout_ms: 3_600_000,
+    });
+
+    expect(min.success).toBe(true);
+    expect(max.success).toBe(true);
+    if (min.success) expect(min.data.wall_timeout_ms).toBe(60_000);
+    if (max.success) expect(max.data.wall_timeout_ms).toBe(3_600_000);
+  });
+
+  it('rejects wall_timeout_ms below the minimum', () => {
+    const result = dagNodeSchema.safeParse({
+      id: 'implement',
+      loop: { prompt: 'Implement it.', until: 'COMPLETE', max_iterations: 1 },
+      wall_timeout_ms: 10,
+    });
+
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues[0]?.message).toMatch(/wall_timeout_ms.*60000.*3600000/i);
+    }
+  });
+});
+
 describe('deriveNodeExecutionRequirements', () => {
   it('keeps a text-only plan eligible for chat providers', () => {
     const node = dagNodeSchema.parse({ id: 'plan', prompt: 'Plan it.', allowed_tools: [] });

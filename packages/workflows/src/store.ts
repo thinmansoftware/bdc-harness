@@ -58,6 +58,9 @@ export const WORKFLOW_EVENT_TYPES = [
   // availability-class error and the node is re-dispatched SIDEWAYS exactly once
   // on a declared failover provider. Distinct from cascade_step (cost-tier CLIMB).
   'node_failover',
+  // WO-HARNESS-IMPLEMENT-WALL-TIMEOUT-HONEST-01: emitted for each loop
+  // iteration wall breach before the retry/final failure decision.
+  'node_wall_breach',
 ] as const;
 
 export type WorkflowEventType = (typeof WORKFLOW_EVENT_TYPES)[number];

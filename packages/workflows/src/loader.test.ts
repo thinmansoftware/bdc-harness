@@ -1539,6 +1539,58 @@ nodes:
       expect(wf.nodes[0].idle_timeout).toBe(600000);
     });
 
+    it('should parse wall_timeout_ms on loop node', async () => {
+      const workflowDir = join(testDir, '.archon', 'workflows');
+      await mkdir(workflowDir, { recursive: true });
+
+      await writeFile(
+        join(workflowDir, 'wall-timeout-loop.yaml'),
+        `
+name: wall-timeout-loop
+description: Loop node with wall timeout
+nodes:
+  - id: implement
+    wall_timeout_ms: 120000
+    loop:
+      prompt: "do something slow"
+      until: COMPLETE
+      max_iterations: 1
+`
+      );
+
+      const result = await discoverWorkflows(testDir, { loadDefaults: false });
+      expect(result.errors).toHaveLength(0);
+      const wf = result.workflows.find(w => w.workflow.name === 'wall-timeout-loop')?.workflow;
+      expect(wf).toBeDefined();
+      if (!wf) throw new Error('wall-timeout-loop workflow was not discovered');
+      expect(wf.nodes).toBeDefined();
+      expect(wf.nodes[0].wall_timeout_ms).toBe(120000);
+    });
+
+    it('should reject invalid wall_timeout_ms (below minimum)', async () => {
+      const workflowDir = join(testDir, '.archon', 'workflows');
+      await mkdir(workflowDir, { recursive: true });
+
+      await writeFile(
+        join(workflowDir, 'bad-wall-timeout.yaml'),
+        `
+name: bad-wall-timeout
+description: Invalid wall timeout
+nodes:
+  - id: implement
+    wall_timeout_ms: 10
+    loop:
+      prompt: "do something"
+      until: COMPLETE
+      max_iterations: 1
+`
+      );
+
+      const result = await discoverWorkflows(testDir, { loadDefaults: false });
+      expect(result.errors).toHaveLength(1);
+      expect(result.errors[0].error).toMatch(/wall_timeout_ms.*60000.*3600000/i);
+    });
+
     it('should parse idle_timeout on bash node', async () => {
       const workflowDir = join(testDir, '.archon', 'workflows');
       await mkdir(workflowDir, { recursive: true });
