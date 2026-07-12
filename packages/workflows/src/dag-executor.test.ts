@@ -788,7 +788,7 @@ describe('executeDagWorkflow -- plan-review terminal safety', () => {
           yield { type: 'assistant', content: 'never' };
           return;
         }
-        yield { type: 'assistant', content: 'COMPLETE' };
+        yield { type: 'assistant', content: 'PLAN_REVIEW_PASS=true\nPLAN_REVIEW_APPROVED' };
         yield { type: 'result', sessionId: 'retry-success-session' };
       });
 
@@ -811,7 +811,7 @@ describe('executeDagWorkflow -- plan-review terminal safety', () => {
               id: 'plan-review',
               loop: {
                 prompt: 'review the plan',
-                until: 'COMPLETE',
+                until: 'PLAN_REVIEW_APPROVED',
                 max_iterations: 1,
               },
             },
@@ -840,7 +840,7 @@ describe('executeDagWorkflow -- plan-review terminal safety', () => {
       expect(
         events.some(e => e.event_type === 'node_failed' && e.step_name === 'plan-review')
       ).toBe(false);
-      expect(result).toBe('completed');
+      expect(result).toBe('PLAN_REVIEW_PASS=true\nPLAN_REVIEW_APPROVED');
     } finally {
       if (prevWall === undefined) delete process.env.ARCHON_LOOP_ITERATION_WALL_MS;
       else process.env.ARCHON_LOOP_ITERATION_WALL_MS = prevWall;
