@@ -467,6 +467,7 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
     const fireResult: FireResult = await fireImpl({
       workflowName: tier.workflowName,
       woId,
+      project,
       message: buildFireMessage(woId, project, priorContext ?? undefined),
       apiBaseUrl,
       token,
