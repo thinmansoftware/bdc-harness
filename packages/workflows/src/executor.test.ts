@@ -156,6 +156,8 @@ describe('executeWorkflow', () => {
     mockEmitter.registerRun.mockClear();
     mockEmitter.unregisterRun.mockClear();
     mockEmitter.emit.mockClear();
+    mockExecFileAsync.mockClear();
+    mockExecFileAsync.mockImplementation(async () => ({ stdout: '', stderr: '' }));
     mockExecuteDagWorkflow.mockImplementation(async (): Promise<string | undefined> => undefined);
   });
 
@@ -379,6 +381,73 @@ describe('executeWorkflow', () => {
       // Cleanup failure must not mask the "in use" outcome.
       expect(result.success).toBe(false);
       expect(result.error).toContain('already active');
+    });
+  });
+
+  describe('workflow_started HEAD evidence', () => {
+    it('emits and persists cwdHeadSha when HEAD can be resolved', async () => {
+      const headSha = 'a'.repeat(40);
+      mockExecFileAsync.mockImplementation(async (_command, args) => {
+        const values = args as string[];
+        if (values.includes('rev-parse') && values.includes('HEAD^{commit}')) {
+          return { stdout: `${headSha}\n`, stderr: '' };
+        }
+        return { stdout: '', stderr: '' };
+      });
+      const createEventSpy = mock(async () => {});
+      const store = makeStore({ createWorkflowEvent: createEventSpy });
+
+      await executeWorkflow(
+        makeDeps(store),
+        makePlatform(),
+        'conv-1',
+        '/tmp',
+        makeWorkflow(),
+        'test message',
+        'db-conv-1'
+      );
+
+      expect(mockEmitter.emit).toHaveBeenCalledWith(
+        expect.objectContaining({
+          type: 'workflow_started',
+          cwdHeadSha: headSha,
+        })
+      );
+      expect(createEventSpy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          event_type: 'workflow_started',
+          data: { workflowName: 'test-workflow', cwdHeadSha: headSha },
+        })
+      );
+    });
+
+    it('emits and persists null cwdHeadSha when HEAD cannot be resolved', async () => {
+      mockExecFileAsync.mockRejectedValueOnce(new Error('not a git repo'));
+      const createEventSpy = mock(async () => {});
+      const store = makeStore({ createWorkflowEvent: createEventSpy });
+
+      await executeWorkflow(
+        makeDeps(store),
+        makePlatform(),
+        'conv-1',
+        '/tmp',
+        makeWorkflow(),
+        'test message',
+        'db-conv-1'
+      );
+
+      expect(mockEmitter.emit).toHaveBeenCalledWith(
+        expect.objectContaining({
+          type: 'workflow_started',
+          cwdHeadSha: null,
+        })
+      );
+      expect(createEventSpy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          event_type: 'workflow_started',
+          data: { workflowName: 'test-workflow', cwdHeadSha: null },
+        })
+      );
     });
   });
 

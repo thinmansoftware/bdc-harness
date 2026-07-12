@@ -151,6 +151,22 @@ describe('WorkflowEventEmitter', () => {
       });
     });
 
+    it('forwards optional cwdHeadSha on workflow_started events', () => {
+      const emitter = getWorkflowEventEmitter();
+      const listener = mock((_event: WorkflowEmitterEvent) => {});
+      const headSha = 'a'.repeat(40);
+
+      emitter.subscribe(listener);
+      emitter.emit({ ...makeWorkflowStartedEvent(), cwdHeadSha: headSha });
+
+      expect(listener).toHaveBeenCalledWith(
+        expect.objectContaining({
+          type: 'workflow_started',
+          cwdHeadSha: headSha,
+        })
+      );
+    });
+
     it('returns an unsubscribe function', () => {
       const emitter = getWorkflowEventEmitter();
       const unsubscribe = emitter.subscribe(mock(() => {}));

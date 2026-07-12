@@ -17,6 +17,7 @@ import * as fsPromises from 'fs/promises';
 import * as gitUtils from '@archon/git';
 import * as pathValidation from '../utils/path-validation';
 import * as workflowDiscovery from '@archon/workflows/workflow-discovery';
+import * as codebaseSourceSync from '../utils/codebase-source-sync';
 
 // Create mock functions for database modules (safe to mock - no standalone tests)
 const mockUpdateConversation = mock(() => Promise.resolve());
@@ -52,6 +53,7 @@ let spyGetCanonicalRepoPath: ReturnType<typeof spyOn>;
 let spyIsWorktreePath: ReturnType<typeof spyOn>;
 let spyFindWorktreeByBranch: ReturnType<typeof spyOn>;
 let spyMkdirAsync: ReturnType<typeof spyOn>;
+let spySyncCodebaseSourceClone: ReturnType<typeof spyOn>;
 
 // Spies for fs/promises (avoid global mock.module pollution)
 let spyFsAccess: ReturnType<typeof spyOn>;
@@ -261,6 +263,10 @@ function setupSpies(): void {
   spyIsWorktreePath = spyOn(gitUtils, 'isWorktreePath').mockResolvedValue(false);
   spyFindWorktreeByBranch = spyOn(gitUtils, 'findWorktreeByBranch').mockResolvedValue(null);
   spyMkdirAsync = spyOn(gitUtils, 'mkdirAsync').mockResolvedValue();
+  spySyncCodebaseSourceClone = spyOn(
+    codebaseSourceSync,
+    'syncCodebaseSourceClone'
+  ).mockResolvedValue({ headSha: 'synced-head' });
 
   // fs/promises spies (avoid global mock.module pollution)
   spyFsAccess = spyOn(fsPromises, 'access').mockImplementation(() =>
@@ -288,6 +294,7 @@ function restoreSpies(): void {
   spyIsWorktreePath?.mockRestore();
   spyFindWorktreeByBranch?.mockRestore();
   spyMkdirAsync?.mockRestore();
+  spySyncCodebaseSourceClone?.mockRestore();
   spyFsAccess?.mockRestore();
   spyFsReaddir?.mockRestore();
   spyFsRm?.mockRestore();
@@ -1579,6 +1586,51 @@ describe('CommandHandler', () => {
         expect(result.workflow).toBeDefined();
         expect(result.workflow?.definition.name).toBe('test-workflow');
         expect(result.workflow?.args).toBe('');
+      });
+
+      test('syncs codebase source clone before resolving workflow definition', async () => {
+        const codebase = {
+          id: 'codebase-123',
+          repository_url: 'https://github.com/test/repo',
+          default_cwd: '/workspace/test-repo',
+          commands: {},
+          created_at: new Date(),
+          updated_at: new Date(),
+        };
+        mockGetCodebase.mockResolvedValueOnce(codebase);
+        let synced = false;
+        spySyncCodebaseSourceClone.mockImplementationOnce(async () => {
+          synced = true;
+          return { headSha: 'post-sync-head' };
+        });
+        spyDiscoverWorkflows.mockImplementationOnce(async () => {
+          expect(synced).toBe(true);
+          return {
+            workflows: [
+              makeTestWorkflowWithSource({
+                name: 'test-workflow',
+                description: 'A post-sync workflow',
+                nodes: [
+                  { id: 'before-sync', prompt: 'Before sync' },
+                  { id: 'node-added-on-origin', prompt: 'After sync' },
+                ],
+              }),
+            ],
+            errors: [],
+          };
+        });
+
+        const result = await handleCommand(conversationWithCodebase, '/workflow run test-workflow');
+
+        expect(result.success).toBe(true);
+        expect(spySyncCodebaseSourceClone).toHaveBeenCalledWith(codebase);
+        expect(spyDiscoverWorkflows).toHaveBeenCalledWith(
+          '/workspace/test-repo',
+          expect.any(Function)
+        );
+        expect(result.workflow?.definition.nodes.map(node => node.id)).toContain(
+          'node-added-on-origin'
+        );
       });
 
       test('should pass arguments to workflow', async () => {

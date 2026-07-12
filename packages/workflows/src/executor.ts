@@ -915,12 +915,14 @@ export async function executeWorkflow(
     // Register run with emitter and emit workflow_started
     const emitter = getWorkflowEventEmitter();
     emitter.registerRun(workflowRun.id, conversationId);
+    const cwdHeadSha = await gitRevision(cwd, 'HEAD').catch(() => null);
 
     emitter.emit({
       type: 'workflow_started',
       runId: workflowRun.id,
       workflowName: executableWorkflow.name,
       conversationId: conversationDbId,
+      cwdHeadSha,
     });
 
     // Fire-and-forget anonymous usage telemetry. No PII: only workflow name +
@@ -936,7 +938,7 @@ export async function executeWorkflow(
       .createWorkflowEvent({
         workflow_run_id: workflowRun.id,
         event_type: 'workflow_started',
-        data: { workflowName: executableWorkflow.name },
+        data: { workflowName: executableWorkflow.name, cwdHeadSha },
       })
       .catch((err: Error) => {
         getLog().error(

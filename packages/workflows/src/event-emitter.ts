@@ -50,6 +50,7 @@ interface WorkflowStartedEvent {
   runId: string;
   workflowName: string;
   conversationId: string;
+  cwdHeadSha?: string | null;
 }
 
 interface WorkflowCompletedEvent {

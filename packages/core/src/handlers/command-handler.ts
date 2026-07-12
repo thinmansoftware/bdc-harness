@@ -36,6 +36,7 @@ import {
 import { getTriggerForCommand, type DeactivatingCommand } from '../state/session-transitions';
 import { SessionNotFoundError } from '../db/sessions';
 import { createLogger } from '@archon/paths';
+import { syncCodebaseSourceClone } from '../utils/codebase-source-sync';
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
 let cachedLog: ReturnType<typeof createLogger> | undefined;
@@ -804,6 +805,9 @@ async function handleWorkflowCommand(
       let workflowEntries: readonly WorkflowWithSource[];
       let loadErrors: readonly WorkflowLoadError[];
       try {
+        if (codebase) {
+          await syncCodebaseSourceClone(codebase);
+        }
         const result = await discoverWorkflowsWithConfig(workflowCwd, loadConfig);
         workflowEntries = result.workflows;
         loadErrors = result.errors;

@@ -35,6 +35,7 @@ import type { ProviderName } from '@archon/providers/auth-refresh';
 import { AuthRefreshedRetryNeeded } from './auth-retry-sentinel';
 import { getArchonWorkspacesPath, ensureArchonWorkspacesPath } from '@archon/paths';
 import { syncArchonToWorktree } from '../utils/worktree-sync';
+import { syncCodebaseSourceClone } from '../utils/codebase-source-sync';
 import { syncWorkspace, toRepoPath } from '@archon/git';
 import type { WorkspaceSyncResult } from '@archon/git';
 import { discoverWorkflowsWithConfig } from '@archon/workflows/workflow-discovery';
@@ -1676,11 +1677,14 @@ function workflowLoadErrorForName(
 
 async function discoverWorkflowForCodebase(
   workflowName: string,
-  workflowCwd: string
+  codebase: Codebase
 ): Promise<
   | { ok: true; workflow?: WorkflowDefinition; loadError?: WorkflowLoadError }
   | { ok: false; error: Error }
 > {
+  const workflowCwd = codebase.default_cwd;
+  await syncCodebaseSourceClone(codebase);
+
   try {
     await syncArchonToWorktree(workflowCwd);
   } catch (error) {
@@ -1786,8 +1790,7 @@ async function handleWorkflowRunSlashCommand(
   let firstDiscoveryError: { codebase: Codebase; error: Error } | undefined;
 
   for (const codebase of codebases) {
-    const workflowCwd = codebase.default_cwd;
-    const discovery = await discoverWorkflowForCodebase(workflowName, workflowCwd);
+    const discovery = await discoverWorkflowForCodebase(workflowName, codebase);
     if (!discovery.ok) {
       firstDiscoveryError ??= { codebase, error: discovery.error };
       continue;
@@ -1950,6 +1953,8 @@ async function handleWorkflowRunCommand(
       'workflow_codebase_bound'
     );
     const workflowCwd = conversation.cwd ?? codebase.default_cwd;
+    await syncCodebaseSourceClone(codebase);
+
     try {
       await syncArchonToWorktree(workflowCwd);
     } catch (error) {

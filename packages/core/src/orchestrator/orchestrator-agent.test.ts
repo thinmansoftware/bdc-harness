@@ -48,6 +48,7 @@ const mockLoadConfig = mock(() =>
     envVars: {},
   })
 );
+const mockSyncCodebaseSourceClone = mock(() => Promise.resolve({ headSha: 'post-sync-head' }));
 
 const mockLogger = createMockLogger();
 
@@ -190,6 +191,10 @@ mock.module('@archon/isolation', () => ({
 
 mock.module('../utils/worktree-sync', () => ({
   syncArchonToWorktree: mock(() => Promise.resolve()),
+}));
+
+mock.module('../utils/codebase-source-sync', () => ({
+  syncCodebaseSourceClone: mockSyncCodebaseSourceClone,
 }));
 
 mock.module('@archon/git', () => ({
@@ -1507,6 +1512,7 @@ describe('handleWorkflowRunCommand -- E2 single codebase auto-select', () => {
     mockParseCommand.mockReset();
     mockHandleCommand.mockReset();
     mockDiscoverWorkflowsWithConfig.mockReset();
+    mockSyncCodebaseSourceClone.mockClear();
     mockUpdateConversation.mockClear();
     mockDispatchBackgroundWorkflow.mockClear();
     mockLogger.error.mockClear();
@@ -1517,6 +1523,9 @@ describe('handleWorkflowRunCommand -- E2 single codebase auto-select', () => {
     mockListCodebases.mockImplementation(() => Promise.resolve([]));
     mockDiscoverWorkflowsWithConfig.mockImplementation(() =>
       Promise.resolve({ workflows: [], errors: [] })
+    );
+    mockSyncCodebaseSourceClone.mockImplementation(() =>
+      Promise.resolve({ headSha: 'post-sync-head' })
     );
   });
 
@@ -1585,6 +1594,102 @@ describe('handleWorkflowRunCommand -- E2 single codebase auto-select', () => {
         codebaseId: codebase.id,
       }),
       expect.objectContaining({ name: 'assist' })
+    );
+  });
+
+  test('syncs codebase source before slash-command repo workflow discovery', async () => {
+    const conversation = makeConversation({ codebase_id: null });
+    const codebase = makeCodebaseForSync();
+    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(conversation));
+    mockParseCommand.mockReturnValueOnce({
+      command: 'workflow',
+      args: ['run', 'assist', 'WO-123'],
+    });
+    mockHandleCommand.mockImplementationOnce(() => {
+      throw new Error('generic command handler should not pre-resolve workflow run');
+    });
+    mockListCodebases.mockReturnValueOnce(Promise.resolve([codebase]));
+    let synced = false;
+    mockSyncCodebaseSourceClone.mockImplementationOnce(async () => {
+      synced = true;
+      return { headSha: 'post-sync-head' };
+    });
+    mockDiscoverWorkflowsWithConfig
+      .mockResolvedValueOnce({ workflows: [], errors: [] })
+      .mockImplementationOnce(async () => {
+        expect(synced).toBe(true);
+        return {
+          workflows: [
+            makeTestWorkflowWithSource({
+              name: 'assist',
+              nodes: [
+                { id: 'before-sync', prompt: 'Before sync' },
+                { id: 'node-added-on-origin', prompt: 'After sync' },
+              ],
+            }),
+          ],
+          errors: [],
+        };
+      });
+
+    const platform = makePlatform();
+    await handleMessage(platform, 'conv-1', '/workflow run assist WO-123');
+
+    expect(mockSyncCodebaseSourceClone).toHaveBeenCalledWith(codebase);
+    expect(mockDispatchBackgroundWorkflow).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        name: 'assist',
+        nodes: expect.arrayContaining([expect.objectContaining({ id: 'node-added-on-origin' })]),
+      })
+    );
+  });
+
+  test('syncs codebase source before E2 single-codebase workflow rediscovery', async () => {
+    const conversation = makeConversation({ codebase_id: null });
+    const codebase = makeCodebaseForSync();
+    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(conversation));
+    mockParseCommand.mockReturnValueOnce({ command: 'status', args: [] });
+    mockHandleCommand.mockReturnValueOnce(
+      Promise.resolve({
+        success: true,
+        message: 'Starting workflow...',
+        workflow: { definition: assistWorkflow, args: 'WO-123' },
+      })
+    );
+    mockListCodebases.mockReturnValueOnce(Promise.resolve([codebase]));
+    let synced = false;
+    mockSyncCodebaseSourceClone.mockImplementationOnce(async () => {
+      synced = true;
+      return { headSha: 'post-sync-head' };
+    });
+    mockDiscoverWorkflowsWithConfig.mockImplementationOnce(async () => {
+      expect(synced).toBe(true);
+      return {
+        workflows: [
+          makeTestWorkflowWithSource({
+            name: 'assist',
+            nodes: [
+              { id: 'before-sync', prompt: 'Before sync' },
+              { id: 'node-added-on-origin', prompt: 'After sync' },
+            ],
+          }),
+        ],
+        errors: [],
+      };
+    });
+
+    const platform = makePlatform();
+    await handleMessage(platform, 'conv-1', '/status');
+
+    expect(mockSyncCodebaseSourceClone).toHaveBeenCalledWith(codebase);
+    expect(mockUpdateConversation).toHaveBeenCalledWith('conv-1', { codebase_id: codebase.id });
+    expect(mockDispatchBackgroundWorkflow).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        name: 'assist',
+        nodes: expect.arrayContaining([expect.objectContaining({ id: 'node-added-on-origin' })]),
+      })
     );
   });
 
