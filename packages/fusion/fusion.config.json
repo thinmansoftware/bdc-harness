@@ -8,7 +8,7 @@
     },
     {
       "id": "systems",
-      "modelId": "z-ai/glm-5.2",
+      "modelId": "deepseek/deepseek-chat-v3.1",
       "role": "implementation-systems",
       "promptTemplate": "reviewer-implementation.txt"
     }
