@@ -86,7 +86,7 @@ describe('checkCodexDispatchGate', () => {
     expect(softRefreshCodexMock).toHaveBeenCalledTimes(0);
   });
 
-  test('soft-refreshes an expired JWT despite recent last_refresh', async () => {
+  test('refuses an expired JWT without soft-refresh despite recent last_refresh', async () => {
     const accessToken = placeholderJwt({ exp: Math.floor(Date.now() / 1000) - 60 });
     writeCodexCreds(
       new Date(Date.now() - 60_000).toISOString(),
@@ -97,7 +97,7 @@ describe('checkCodexDispatchGate', () => {
     const result = await checkCodexDispatchGate();
 
     expect(result).toEqual({ fresh: false, reason: 'stale' });
-    expect(softRefreshCodexMock).toHaveBeenCalledTimes(1);
+    expect(softRefreshCodexMock).toHaveBeenCalledTimes(0);
   });
 
   test('passes fresh auth without soft-refresh', async () => {
@@ -109,7 +109,7 @@ describe('checkCodexDispatchGate', () => {
     expect(softRefreshCodexMock).toHaveBeenCalledTimes(0);
   });
 
-  test('passes when stale auth is advanced by soft-refresh', async () => {
+  test('does not treat a soft-refresh signal as dispatch authorization', async () => {
     writeCodexCreds(new Date(Date.now() - 13 * 60 * 60 * 1000).toISOString());
     softRefreshCodexMock.mockImplementationOnce(async () => {
       writeCodexCreds(new Date(Date.now()).toISOString());
@@ -118,24 +118,24 @@ describe('checkCodexDispatchGate', () => {
 
     const result = await checkCodexDispatchGate();
 
-    expect(result).toEqual({ fresh: true, reason: 'fresh' });
-    expect(softRefreshCodexMock).toHaveBeenCalledTimes(1);
+    expect(result).toEqual({ fresh: false, reason: 'stale' });
+    expect(softRefreshCodexMock).toHaveBeenCalledTimes(0);
   });
 
-  test('refuses when soft-refresh does not advance stale auth', async () => {
+  test('refuses stale auth without soft-refresh', async () => {
     writeCodexCreds(new Date(Date.now() - 13 * 60 * 60 * 1000).toISOString());
 
     const result = await checkCodexDispatchGate();
 
     expect(result).toEqual({ fresh: false, reason: 'stale' });
-    expect(softRefreshCodexMock).toHaveBeenCalledTimes(1);
+    expect(softRefreshCodexMock).toHaveBeenCalledTimes(0);
   });
 
   test('refuses missing auth.json', async () => {
     const result = await checkCodexDispatchGate();
 
     expect(result).toEqual({ fresh: false, reason: 'missing_creds' });
-    expect(softRefreshCodexMock).toHaveBeenCalledTimes(1);
+    expect(softRefreshCodexMock).toHaveBeenCalledTimes(0);
   });
 
   test('does not return token-like fixture values', async () => {
