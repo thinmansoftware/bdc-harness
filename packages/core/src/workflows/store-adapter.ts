@@ -8,6 +8,7 @@ import type { WorkflowRunStatus } from '@archon/workflows/schemas/workflow-run';
 import type { MergedConfig } from '../config/config-types';
 import * as workflowDb from '../db/workflows';
 import * as workflowEventDb from '../db/workflow-events';
+import * as knownBadBindingsDb from '../db/known-bad-bindings';
 import * as codebaseDb from '../db/codebases';
 import * as envVarDb from '../db/env-vars';
 import { getAgentProvider } from '@archon/providers';
@@ -57,6 +58,10 @@ export function createWorkflowStore(): IWorkflowStore {
     listProviderAttempts: workflowDb.listProviderAttempts,
     upsertRunOutcome: workflowDb.upsertRunOutcome,
     getRunOutcome: workflowDb.getRunOutcome,
+    getActiveKnownBadBinding: knownBadBindingsDb.getActiveKnownBadBinding,
+    upsertKnownBadBinding: knownBadBindingsDb.upsertKnownBadBinding,
+    incrementKnownBadBindingHit: knownBadBindingsDb.incrementKnownBadBindingHit,
+    clearKnownBadBinding: knownBadBindingsDb.clearKnownBadBinding,
     scheduleProviderWait: workflowDb.scheduleProviderWait,
     listDueProviderWaits: workflowDb.listDueProviderWaits,
     claimProviderWait: workflowDb.claimProviderWait,

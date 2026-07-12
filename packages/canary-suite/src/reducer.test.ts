@@ -56,9 +56,11 @@ test.each([
   expect(report.evidenceRefs.length).toBeGreaterThan(0);
 });
 
-test('passes a complete clean snapshot', () => {
+test('static-only clean snapshot never reports healthy', () => {
   const result = reduceCanaryPlan(buildCanaryPlan(manifest, baseSnapshot));
-  expect(result).toEqual({ verdict: 'passed', reasonCodes: [], evidenceRefs: [] });
+  expect(result).toEqual({ verdict: 'static_only', reasonCodes: [], evidenceRefs: [] });
+  expect(result.verdict).not.toBe('passed');
+  expect(result.verdict).not.toBe('probe_passed');
 });
 
 test('failed takes precedence over blocked', () => {
@@ -72,6 +74,6 @@ test('failed takes precedence over blocked', () => {
 test('Level 0 ignores conductor routing while Level 1 evaluates it', () => {
   const input = snapshot({ ladder: { tiers: [] } });
   const plan = buildCanaryPlan(manifest, input);
-  expect(reduceCanaryPlan(plan, 0).verdict).toBe('passed');
+  expect(reduceCanaryPlan(plan, 0).verdict).toBe('static_only');
   expect(reduceCanaryPlan(plan, 1).reasonCodes).toContain('conductor_route_mismatch');
 });

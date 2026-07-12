@@ -15,6 +15,7 @@
     "./codex/config": "./src/codex/config.ts",
     "./codex/binary-resolver": "./src/codex/binary-resolver.ts",
     "./auth-refresh": "./src/auth-refresh/index.ts",
+    "./probe": "./src/probe/index.ts",
     "./auth-refresh/dispatch-gate": "./src/auth-refresh/dispatch-gate.ts",
     "./community/pi": "./src/community/pi/index.ts",
     "./community/glm": "./src/community/glm/index.ts",

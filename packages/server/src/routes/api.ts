@@ -52,6 +52,7 @@ import type { WorkflowDefinition } from '@archon/workflows/schemas/workflow';
 import { executeWorkflow } from '@archon/workflows/executor';
 import { checkCodexDispatchGate } from '@archon/providers/auth-refresh/dispatch-gate';
 import { processDueProviderWaits } from '@archon/workflows/reliability/wait-scheduler';
+import { resolveWorkflowBindings } from '@archon/workflows/reliability/resolve-binding';
 import { getLoaderErrors, parseWorkflow } from '@archon/workflows/loader';
 import { isValidCommandName } from '@archon/workflows/command-validation';
 import { BUNDLED_WORKFLOWS, BUNDLED_COMMANDS, isBinaryBuild } from '@archon/workflows/defaults';
@@ -82,6 +83,7 @@ import * as envVarDb from '@archon/core/db/env-vars';
 import * as isolationEnvDb from '@archon/core/db/isolation-environments';
 import * as workflowDb from '@archon/core/db/workflows';
 import * as workflowEventDb from '@archon/core/db/workflow-events';
+import * as knownBadBindingsDb from '@archon/core/db/known-bad-bindings';
 import * as messageDb from '@archon/core/db/messages';
 import * as dispatchDb from '@archon/core/db/dispatch';
 import { assessDispatchMessageBody } from '@archon/core/utils/dispatch-content-guard';
@@ -4085,6 +4087,37 @@ export function registerApiRoutes(
     const parsed = parseWorkflow(yamlContent, `${name}.yaml`);
     if (parsed.error) {
       return apiError(c, 400, 'Workflow definition is invalid', parsed.error.error);
+    }
+
+    try {
+      const workflowConfig = await createWorkflowDeps().loadConfig(workingDir);
+      const workflowProvider = parsed.workflow.provider ?? workflowConfig.assistant;
+      const assistantDefaults = workflowConfig.assistants[workflowProvider] ?? {};
+      const workflowModel =
+        parsed.workflow.model ??
+        (assistantDefaults.model as string | undefined) ??
+        'claude-sonnet-4-5';
+      const bindings = resolveWorkflowBindings(
+        parsed.workflow,
+        workflowConfig,
+        workflowProvider,
+        workflowModel
+      );
+      for (const binding of bindings) {
+        const active = await knownBadBindingsDb.getActiveKnownBadBinding(binding.bindingKey);
+        if (active) {
+          return apiError(
+            c,
+            400,
+            `known_bad_binding: ${active.error_body_excerpt}`,
+            active.error_body_excerpt
+          );
+        }
+      }
+    } catch (error) {
+      const err = error instanceof Error ? error : new Error(String(error));
+      getLog().error({ err, name }, 'workflow.known_bad_binding_gate_failed');
+      return apiError(c, 400, `Workflow registration rejected: ${err.message}`);
     }
 
     try {

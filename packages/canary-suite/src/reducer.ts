@@ -1,4 +1,5 @@
 import type { CanaryPlan, CanaryReduction } from './types';
+import { verdictForStaticOnly } from './layer3-policy';
 
 export function reduceCanaryPlan(plan: CanaryPlan, level: 0 | 1 = 1): CanaryReduction {
   const failed: { reason: string; evidence: string }[] = [];
@@ -42,7 +43,7 @@ export function reduceCanaryPlan(plan: CanaryPlan, level: 0 | 1 = 1): CanaryRedu
 
   const findings = failed.length > 0 ? failed : blocked;
   return {
-    verdict: failed.length > 0 ? 'failed' : blocked.length > 0 ? 'blocked' : 'passed',
+    verdict: failed.length > 0 ? 'failed' : blocked.length > 0 ? 'blocked' : verdictForStaticOnly(),
     reasonCodes: [...new Set(findings.map(finding => finding.reason))],
     evidenceRefs: [...new Set(findings.map(finding => finding.evidence))],
   };

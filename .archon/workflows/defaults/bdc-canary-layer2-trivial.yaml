@@ -1,0 +1,10 @@
+name: bdc-canary-layer2-trivial
+description: Event-triggered Layer 2 canary fixture for provider, lane, or runtime changes.
+provider: codex
+model: gpt-5.5
+nodes:
+  - id: build_trivial_fixture
+    type: prompt
+    prompt: |
+      Create a trivial no-op pull request proving this lane can complete plan to build to PR.
+      Do not alter production code beyond the fixture requested by the operator event.

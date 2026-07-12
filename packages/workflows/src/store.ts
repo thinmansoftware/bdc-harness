@@ -158,6 +158,25 @@ export interface IWorkflowStore {
   listProviderAttempts(runId: string, nodeId?: string): Promise<ProviderAttemptRecord[]>;
   upsertRunOutcome(runId: string, outcome: RunOutcome, updatedAt: string): Promise<boolean>;
   getRunOutcome(runId: string): Promise<RunOutcome | null>;
+  getActiveKnownBadBinding?(bindingKey: string): Promise<{
+    binding_key: string;
+    error_body_excerpt: string;
+    hit_count: number;
+  } | null>;
+  upsertKnownBadBinding?(data: {
+    binding_key: string;
+    provider_id: string;
+    model_id: string;
+    auth_context_id: string;
+    assistant_config_hash: string;
+    node_override_hash: string;
+    error_class: string;
+    http_status?: number | null;
+    error_body_excerpt: string;
+    source: string;
+  }): Promise<unknown>;
+  incrementKnownBadBindingHit?(bindingKey: string): Promise<unknown>;
+  clearKnownBadBinding?(bindingKey: string, reason: 'operator' | 'fire_reprobe'): Promise<unknown>;
   scheduleProviderWait(wait: ScheduledProviderWaitRecord): Promise<boolean>;
   listDueProviderWaits(dueAt: string, limit: number): Promise<ScheduledProviderWaitRecord[]>;
   claimProviderWait(data: {

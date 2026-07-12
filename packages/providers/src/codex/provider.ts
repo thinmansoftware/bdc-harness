@@ -34,6 +34,7 @@ import {
   refreshIfAuthFailed,
 } from '../auth-refresh/index.js';
 import { createLogger } from '@archon/paths';
+import { classifyProbeError } from '../probe/probe-classifier';
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
 let cachedLog: ReturnType<typeof createLogger> | undefined;
@@ -159,11 +160,11 @@ const CODEX_MODEL_FALLBACKS: Record<string, string> = {
 };
 
 function isModelAccessError(errorMessage: string): boolean {
-  const m = errorMessage.toLowerCase();
-  const hasModel = m.includes('model');
-  const hasAvailabilitySignal =
-    m.includes('not available') || m.includes('not found') || m.includes('access denied');
-  return hasModel && hasAvailabilitySignal;
+  const classification = classifyProbeError({ httpStatus: 400, body: errorMessage });
+  return (
+    classification.errorClass === 'structural_model_not_supported' ||
+    classification.errorClass === 'structural_account_model_incompat'
+  );
 }
 
 function buildModelAccessMessage(model?: string): string {

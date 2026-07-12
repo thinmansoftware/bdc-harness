@@ -10,6 +10,8 @@ import { createLogger, captureWorkflowInvoked, BUNDLED_VERSION } from '@archon/p
 import { execFileAsync, getDefaultBranch, getRemoteUrl, toRepoPath } from '@archon/git';
 import type { WorkflowDefinition, WorkflowRun, WorkflowExecutionResult } from './schemas';
 import { executeDagWorkflow } from './dag-executor';
+import { runFireTimeProbe } from './reliability/fire-time-probe';
+import { blockLane } from './reliability/lane-block';
 import { logWorkflowStart, logWorkflowError } from './logger';
 import { formatDuration, parseDbTimestamp } from './utils/duration';
 import { getWorkflowEventEmitter } from './event-emitter';
@@ -1032,6 +1034,38 @@ export async function executeWorkflow(
         'startup_message_delivery_failed'
       );
       // Continue anyway - workflow is already recorded in database
+    }
+
+    const probeDecision = await runFireTimeProbe({
+      workflow: executableWorkflow,
+      config,
+      workflowProvider: resolvedProvider,
+      workflowModel: resolvedModel,
+      cwd,
+      getAgentProvider: deps.getAgentProvider,
+      store: deps.store,
+      alert: async alert => {
+        getLog().warn(
+          {
+            workflowName: alert.workflowName,
+            providerId: alert.providerId,
+            modelId: alert.modelId,
+            bindingKey: alert.bindingKey,
+            errorClass: alert.errorClass,
+          },
+          alert.level === 'red' ? 'canary_probe_red' : 'canary_probe_warn'
+        );
+      },
+    });
+    if (probeDecision.status === 'block') {
+      blockLane(workflow.name, 'probe_red');
+      const first = probeDecision.failures[0];
+      const message = first
+        ? `[CANARY PROBE RED] Workflow '${workflow.name}' blocked before DAG execution: ${first.classification.errorClass}: ${first.classification.errorBodyExcerpt}`
+        : `[CANARY PROBE RED] Workflow '${workflow.name}' blocked before DAG execution`;
+      await sendCriticalMessage(platform, conversationId, message, workflowContext);
+      await deps.store.failWorkflowRun(workflowRun.id, message);
+      return { success: false, workflowRunId: workflowRun.id, error: message };
     }
 
     // Execute the DAG workflow

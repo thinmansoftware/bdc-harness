@@ -28,7 +28,7 @@ export function createCanaryReport(
             : capabilityFailed
               ? 'failed'
               : 'passed';
-      const verdict: CanaryVerdict = capabilityStatus === 'passed' ? 'passed' : 'failed';
+      const verdict: CanaryVerdict = capabilityStatus === 'passed' ? 'static_only' : 'failed';
       return {
         lane: route.lane,
         level,
