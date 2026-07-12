@@ -21,10 +21,17 @@ test('writes deterministic JSON and Markdown artifacts atomically', async () => 
     const markdown = await readFile(paths[2]!, 'utf8');
     expect(markdown).toContain('| Lane | Level | Verdict |');
     expect(markdown).toContain('bdc-feature-development-zero-open');
+    expect(report.lanes[0]?.verdict).toBe('static_only');
     await expect(writeCanaryArtifacts(root, plan, report)).resolves.toEqual(paths);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+});
+
+test('demotes clean per-lane static capability to static_only', () => {
+  const plan = buildCanaryPlan(manifest, baseSnapshot);
+  const report = createCanaryReport('suite-fixture-002', 1, plan, reduceCanaryPlan(plan));
+  expect(report.lanes.every(lane => lane.verdict === 'static_only')).toBe(true);
 });
 
 test('rejects conflicting bytes for an existing suite ID', async () => {

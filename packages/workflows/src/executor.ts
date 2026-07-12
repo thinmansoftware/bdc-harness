@@ -23,6 +23,7 @@ import {
   type RunAuthorityInput,
 } from './reliability/run-authority';
 import { captureRuntimeRevisions } from './reliability/runtime-revisions';
+import { formatProbeBlock, runFireTimeProbe } from './reliability/fire-time-probe';
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
 let cachedLog: ReturnType<typeof createLogger> | undefined;
@@ -900,6 +901,55 @@ export async function executeWorkflow(
 
     // BDC patch: load policyFile if specified and inject as systemPrompt for all prompt nodes.
     const executableWorkflow = await applyWorkflowPolicyFile(workflow, cwd);
+
+    const probeDecision = await runFireTimeProbe(deps, {
+      workflow: executableWorkflow,
+      workflowProvider: resolvedProvider,
+      workflowModel: resolvedModel,
+      config,
+      cwd,
+      source: 'fire_probe',
+      allowFireReprobeClear: true,
+    });
+    for (const warning of probeDecision.warnings) {
+      if (!warning.ok) {
+        getLog().warn(
+          {
+            workflowName: executableWorkflow.name,
+            providerId: warning.binding.providerId,
+            modelId: warning.binding.modelId,
+            errorClass: warning.classification.errorClass,
+            httpStatus: warning.classification.httpStatus,
+          },
+          'workflow.canary_probe_warn'
+        );
+      }
+    }
+    if (probeDecision.blocked) {
+      const reason = formatProbeBlock(probeDecision);
+      await deps.store
+        .createWorkflowEvent({
+          workflow_run_id: workflowRun.id,
+          event_type: 'dag_workflow_failed',
+          data: {
+            reason: 'canary_probe_blocked',
+            detail: reason,
+          },
+        })
+        .catch((err: Error) => {
+          getLog().error(
+            { err, workflowRunId: workflowRun.id, eventType: 'dag_workflow_failed' },
+            'workflow_event_persist_failed'
+          );
+        });
+      await deps.store.failWorkflowRun(workflowRun.id, reason);
+      await sendCriticalMessage(
+        platform,
+        conversationId,
+        `[ ] **Workflow blocked**: ${reason}`
+      );
+      return { success: false, workflowRunId: workflowRun.id, error: reason };
+    }
 
     getLog().info(
       {

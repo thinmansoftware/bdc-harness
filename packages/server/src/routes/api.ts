@@ -52,6 +52,7 @@ import type { WorkflowDefinition } from '@archon/workflows/schemas/workflow';
 import { executeWorkflow } from '@archon/workflows/executor';
 import { checkCodexDispatchGate } from '@archon/providers/auth-refresh/dispatch-gate';
 import { processDueProviderWaits } from '@archon/workflows/reliability/wait-scheduler';
+import { resolveWorkflowProbeBindings } from '@archon/workflows/reliability/resolve-binding';
 import { getLoaderErrors, parseWorkflow } from '@archon/workflows/loader';
 import { isValidCommandName } from '@archon/workflows/command-validation';
 import { BUNDLED_WORKFLOWS, BUNDLED_COMMANDS, isBinaryBuild } from '@archon/workflows/defaults';
@@ -76,6 +77,41 @@ function getLog(): ReturnType<typeof createLogger> {
   if (!cachedLog) cachedLog = createLogger('api');
   return cachedLog;
 }
+
+async function rejectKnownBadWorkflowBinding(
+  workflow: WorkflowDefinition,
+  cwd: string
+): Promise<string | null> {
+  const config = await loadConfig(cwd);
+  const assistants = config.assistants ?? { claude: {}, codex: {} };
+  const workflowProvider = workflow.provider ?? config.assistant ?? 'claude';
+  const assistantDefaults = assistants[workflowProvider];
+  const workflowModel =
+    workflow.model ?? (assistantDefaults?.model as string | undefined) ?? 'claude-sonnet-4-5';
+  let bindings: ReturnType<typeof resolveWorkflowProbeBindings>;
+  try {
+    bindings = resolveWorkflowProbeBindings({
+      workflow,
+      workflowProvider,
+      workflowModel,
+      config: { ...config, assistant: workflowProvider, assistants },
+    });
+  } catch (error) {
+    getLog().warn(
+      { err: error as Error, workflowName: workflow.name },
+      'workflow.known_bad_binding_resolution_skipped'
+    );
+    return null;
+  }
+  for (const binding of bindings) {
+    if (!binding.bindingKey) continue;
+    const active = await knownBadBindingsDb.findActiveByBindingKey(binding.bindingKey);
+    if (active) {
+      return `known_bad_binding:${active.provider_id}:${active.model_id}:${active.error_body_excerpt}`;
+    }
+  }
+  return null;
+}
 import * as conversationDb from '@archon/core/db/conversations';
 import * as codebaseDb from '@archon/core/db/codebases';
 import * as envVarDb from '@archon/core/db/env-vars';
@@ -84,6 +120,7 @@ import * as workflowDb from '@archon/core/db/workflows';
 import * as workflowEventDb from '@archon/core/db/workflow-events';
 import * as messageDb from '@archon/core/db/messages';
 import * as dispatchDb from '@archon/core/db/dispatch';
+import * as knownBadBindingsDb from '@archon/core/db/known-bad-bindings';
 import { assessDispatchMessageBody } from '@archon/core/utils/dispatch-content-guard';
 import { errorSchema } from './schemas/common.schemas';
 import { updateCheckResponseSchema } from './schemas/system.schemas';
@@ -4085,6 +4122,10 @@ export function registerApiRoutes(
     const parsed = parseWorkflow(yamlContent, `${name}.yaml`);
     if (parsed.error) {
       return apiError(c, 400, 'Workflow definition is invalid', parsed.error.error);
+    }
+    const knownBadBinding = await rejectKnownBadWorkflowBinding(parsed.workflow, workingDir);
+    if (knownBadBinding) {
+      return apiError(c, 400, 'Workflow definition is blocked by known bad binding', knownBadBinding);
     }
 
     try {

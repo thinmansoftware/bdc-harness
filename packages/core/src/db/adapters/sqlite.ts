@@ -561,6 +561,25 @@ export class SqliteAdapter implements IDatabase {
         last_heartbeat_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
       );
 
+      CREATE TABLE IF NOT EXISTS known_bad_bindings (
+        id TEXT PRIMARY KEY,
+        binding_key TEXT NOT NULL UNIQUE,
+        provider_id TEXT NOT NULL,
+        model_id TEXT NOT NULL,
+        auth_context_id TEXT NOT NULL,
+        assistant_config_hash TEXT NOT NULL,
+        node_override_hash TEXT NOT NULL DEFAULT '',
+        error_class TEXT NOT NULL,
+        http_status INTEGER,
+        error_body_excerpt TEXT NOT NULL,
+        first_seen_at TEXT NOT NULL,
+        last_seen_at TEXT NOT NULL,
+        hit_count INTEGER NOT NULL DEFAULT 1,
+        source TEXT NOT NULL,
+        cleared_at TEXT,
+        clear_reason TEXT
+      );
+
       -- Indexes
       CREATE INDEX IF NOT EXISTS idx_codebase_env_vars_codebase_id ON remote_agent_codebase_env_vars(codebase_id);
       CREATE INDEX IF NOT EXISTS idx_conversations_platform ON remote_agent_conversations(platform_type, platform_conversation_id);
@@ -594,6 +613,8 @@ export class SqliteAdapter implements IDatabase {
       CREATE INDEX IF NOT EXISTS idx_agent_dispatch_messages_recipient_status ON agent_dispatch_messages(recipient, status);
       CREATE INDEX IF NOT EXISTS idx_agent_dispatch_messages_lease_expiry ON agent_dispatch_messages(lease_expires_at) WHERE status = 'claimed';
       CREATE INDEX IF NOT EXISTS idx_agent_dispatch_workers_status_heartbeat ON agent_dispatch_workers(status, last_heartbeat_at);
+      CREATE INDEX IF NOT EXISTS idx_known_bad_bindings_provider_model ON known_bad_bindings(provider_id, model_id);
+      CREATE INDEX IF NOT EXISTS idx_known_bad_bindings_active ON known_bad_bindings(binding_key) WHERE cleared_at IS NULL;
       CREATE INDEX IF NOT EXISTS idx_workflow_runs_parent_conv ON remote_agent_workflow_runs(parent_conversation_id);
       CREATE INDEX IF NOT EXISTS idx_conversations_hidden ON remote_agent_conversations(hidden);
       DROP INDEX IF EXISTS idx_conversations_codebase;

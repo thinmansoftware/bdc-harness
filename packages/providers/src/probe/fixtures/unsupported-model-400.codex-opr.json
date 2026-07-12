@@ -1,0 +1,6 @@
+{
+  "provider": "codex-opr",
+  "httpStatus": 400,
+  "body": "The qwen/qwen3-coder model is not supported when using Codex with a ChatGPT account.",
+  "expectClass": "structural_model_not_supported"
+}

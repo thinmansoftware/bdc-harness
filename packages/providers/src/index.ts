@@ -35,6 +35,7 @@ export {
 
 // Error
 export { UnknownProviderError } from './errors';
+export * from './probe';
 
 // Provider classes
 export { ClaudeProvider } from './claude/provider';

@@ -14,7 +14,16 @@ function flag(args: readonly string[], name: string): string | undefined {
 }
 
 function exitFor(verdict: RunCanaryResult['report']['verdict']): number {
-  return { passed: 0, failed: 2, blocked: 3, aborted: 4 }[verdict];
+  return {
+    passed: 0,
+    probe_passed: 0,
+    failed: 2,
+    probe_failed: 2,
+    build_failed: 2,
+    blocked: 3,
+    aborted: 4,
+    static_only: 5,
+  }[verdict];
 }
 
 export async function runCanaryCli(
