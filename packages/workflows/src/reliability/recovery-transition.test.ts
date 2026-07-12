@@ -103,6 +103,8 @@ interface Harness {
   >[0][];
   releaseCalls: number;
   reserveCalls: number;
+  fetchCalls: number;
+  gateCalls: number;
 }
 
 function makeHarness(
@@ -110,7 +112,7 @@ function makeHarness(
   prByNumber?: PullRequestEvidence | null
 ): Harness {
   const finalizeCalls: Harness['finalizeCalls'] = [];
-  const state = { releaseCalls: 0, reserveCalls: 0 };
+  const state = { releaseCalls: 0, reserveCalls: 0, fetchCalls: 0, gateCalls: 0 };
   let idCounter = 0;
 
   const incident: SupervisorIncidentRecord = {
@@ -154,9 +156,14 @@ function makeHarness(
 
   const deps: RecoveryTransitionDeps = {
     store: store as IWorkflowStore,
-    fetchPullRequest: async () => (prByNumber === undefined ? mergedPr() : prByNumber),
-    loadRequiredGateEvidence: async () =>
-      config.gates ?? [{ id: 'validate', required: true, state: 'passed' }],
+    fetchPullRequest: async () => {
+      state.fetchCalls += 1;
+      return prByNumber === undefined ? mergedPr() : prByNumber;
+    },
+    loadRequiredGateEvidence: async () => {
+      state.gateCalls += 1;
+      return config.gates ?? [{ id: 'validate', required: true, state: 'passed' }];
+    },
     now: () => '2026-07-12T00:00:05.000Z',
     newId: () => `id-${String(++idCounter)}`,
   };
@@ -169,6 +176,12 @@ function makeHarness(
     },
     get reserveCalls() {
       return state.reserveCalls;
+    },
+    get fetchCalls() {
+      return state.fetchCalls;
+    },
+    get gateCalls() {
+      return state.gateCalls;
     },
   };
 }
@@ -396,6 +409,110 @@ describe('M-26 transitionRunRecovery orchestration', () => {
     const result = await transitionRunRecovery(h.deps, request({ attemptId }));
     expect(result.status).toBe('unchanged');
     expect(h.finalizeCalls).toHaveLength(0);
+  });
+
+  test('Test 4: identical completed retry stays unchanged when GitHub is unavailable', async () => {
+    const attemptId = '11111111-1111-4111-8111-111111111111';
+    const h = makeHarness(
+      {
+        outcome: outcome({ recoveryState: 'recovered' }),
+        recoveryActions: [
+          {
+            actionId: 'action-complete',
+            attemptId,
+            incidentId: 'inc-1',
+            ownerId: OWNER,
+            fencingToken: 1,
+            actionType: 'complete',
+            outcome: 'complete',
+            evidenceRefs: ['immutable-completed-evidence'],
+            createdAt: '2026-07-12T00:00:05.000Z',
+            status: 'completed',
+            completedAt: '2026-07-12T00:00:05.000Z',
+            pullRequestNumber: 394,
+            recoveredHeadSha: TERMINAL_HEAD,
+            targetBase: BASE,
+            mergeSha: MERGE_SHA,
+          },
+        ],
+      },
+      null
+    );
+
+    await expect(transitionRunRecovery(h.deps, request({ attemptId }))).resolves.toEqual({
+      status: 'unchanged',
+      recoveryState: 'recovered',
+      evidenceRefs: ['immutable-completed-evidence'],
+    });
+    expect(h.gateCalls).toBe(0);
+    expect(h.fetchCalls).toBe(0);
+  });
+
+  test('Test 4: identical completed retry ignores a later required-check rerun failure', async () => {
+    const attemptId = '11111111-1111-4111-8111-111111111111';
+    const h = makeHarness(
+      {
+        outcome: outcome({ recoveryState: 'recovered' }),
+        recoveryActions: [
+          {
+            actionId: 'action-complete',
+            attemptId,
+            incidentId: 'inc-1',
+            ownerId: OWNER,
+            fencingToken: 1,
+            actionType: 'complete',
+            outcome: 'complete',
+            evidenceRefs: ['immutable-completed-evidence'],
+            createdAt: '2026-07-12T00:00:05.000Z',
+            status: 'completed',
+            completedAt: '2026-07-12T00:00:05.000Z',
+            pullRequestNumber: 394,
+            recoveredHeadSha: TERMINAL_HEAD,
+            targetBase: BASE,
+            mergeSha: MERGE_SHA,
+          },
+        ],
+      },
+      mergedPr({ requiredChecks: [{ name: 'validate', state: 'failed' }] })
+    );
+
+    expect((await transitionRunRecovery(h.deps, request({ attemptId }))).status).toBe('unchanged');
+    expect(h.gateCalls).toBe(0);
+    expect(h.fetchCalls).toBe(0);
+  });
+
+  test('Test 4: mismatched completed-attempt tuple revalidates instead of returning unchanged', async () => {
+    const attemptId = '11111111-1111-4111-8111-111111111111';
+    const h = makeHarness(
+      {
+        recoveryActions: [
+          {
+            actionId: 'action-complete',
+            attemptId,
+            incidentId: 'inc-1',
+            ownerId: OWNER,
+            fencingToken: 1,
+            actionType: 'complete',
+            outcome: 'complete',
+            evidenceRefs: ['immutable-completed-evidence'],
+            createdAt: '2026-07-12T00:00:05.000Z',
+            status: 'completed',
+            completedAt: '2026-07-12T00:00:05.000Z',
+            pullRequestNumber: 394,
+            recoveredHeadSha: TERMINAL_HEAD,
+            targetBase: BASE,
+            mergeSha: MERGE_SHA,
+          },
+        ],
+      },
+      null
+    );
+
+    await expect(
+      transitionRunRecovery(h.deps, request({ attemptId, pullRequestNumber: 395 }))
+    ).resolves.toEqual({ status: 'rejected', reason: 'pr_evidence_unavailable' });
+    expect(h.gateCalls).toBe(1);
+    expect(h.fetchCalls).toBe(1);
   });
 
   test('Test 4: same abandon tuple with changed reason conflicts', async () => {

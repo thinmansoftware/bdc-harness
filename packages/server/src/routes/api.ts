@@ -10,8 +10,6 @@ import { rm, readFile, writeFile, unlink, mkdir } from 'fs/promises';
 import { readFileSync } from 'fs';
 import { normalize, join, sep, basename } from 'path';
 import { randomUUID } from 'crypto';
-import { execFile } from 'node:child_process';
-import { promisify } from 'node:util';
 import type { Context } from 'hono';
 import type {
   ConversationLockManager,
@@ -32,7 +30,7 @@ import {
 } from '@archon/core';
 import { createWorkflowDeps } from '@archon/core/workflows';
 import { runCascade } from '@archon/smart-cauldron/cascade';
-import { removeWorktree, toRepoPath, toWorktreePath } from '@archon/git';
+import { execFileAsync, removeWorktree, toRepoPath, toWorktreePath } from '@archon/git';
 import {
   createLogger,
   getWorkflowFolderSearchPaths,
@@ -219,7 +217,6 @@ function jsonError(description: string): {
 const cwdQuerySchema = z.object({ cwd: z.string().optional() });
 
 // M-26: live PR evidence runner + fenced-recovery repair-lease duration.
-const execFileAsync = promisify(execFile);
 const RECOVERY_LEASE_MS = 5 * 60 * 1000;
 
 const getWorkflowsRoute = createRoute({

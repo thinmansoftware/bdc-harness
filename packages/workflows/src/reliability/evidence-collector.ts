@@ -187,14 +187,15 @@ export function gateEvidenceFromEvents(
     return { id: gateId, required: true, state: 'failed' };
   }
   const gateResult = event.data.gate_result;
+  let recognizedPass = false;
   if (typeof gateResult === 'object' && gateResult !== null) {
     const record = gateResult as Record<string, unknown>;
     if (record.outcome === 'fail' || record.passed === false) {
       return { id: gateId, required: true, state: 'failed' };
     }
-    if (record.outcome !== 'pass' && record.passed !== true) {
-      return { id: gateId, required: true, state: 'indeterminate' };
-    }
+    recognizedPass =
+      (record.passed === true && ['bash', 'script', 'ai'].includes(String(record.nodeType))) ||
+      (record.outcome === 'pass' && record.gate === gateId);
   }
   const nodeOutput = event.data.node_output;
   if (
@@ -202,6 +203,12 @@ export function gateEvidenceFromEvents(
     /"status"\s*:\s*"BLOCKED"|NEEDS_REVISION|VALIDATION:\s*(?:FAIL|BLOCKED)/i.test(nodeOutput)
   ) {
     return { id: gateId, required: true, state: 'failed', evidence: nodeOutput };
+  }
+  const exactValidationPass =
+    typeof nodeOutput === 'string' &&
+    /^[ \t]*(?:INFRA )?VALIDATION:[ \t]*PASS[ \t]*$/im.test(nodeOutput);
+  if (!recognizedPass && !exactValidationPass) {
+    return { id: gateId, required: true, state: 'indeterminate' };
   }
   return {
     id: gateId,

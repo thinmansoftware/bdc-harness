@@ -159,6 +159,40 @@ export async function transitionRunRecovery(
   if (!terminalGitRef) return { status: 'rejected', reason: 'terminal_git_evidence_missing' };
   const terminalHead = terminalHeadOf(terminalGitRef);
 
+  if (
+    actionType === 'complete' &&
+    (typeof request.pullRequestNumber !== 'number' || request.pullRequestNumber <= 0)
+  ) {
+    return { status: 'rejected', reason: 'pull_request_number_required' };
+  }
+
+  // A completed attempt is immutable. Retry recognition must happen before any
+  // live gate or GitHub lookup because those external facts can disappear or be
+  // rerun after the transition was durably committed. Only caller-authoritative
+  // tuple fields participate in this early match; a mismatch continues through
+  // normal revalidation and the full immutable-tuple conflict check below.
+  const recoveryDetails = await store.getRunRecoveryDetails(runId);
+  const priorAttempt = recoveryDetails.actions.find(
+    action => action.attemptId === attemptId && action.actionType === actionType
+  );
+  const callerPullRequestNumber =
+    actionType === 'complete' ? (request.pullRequestNumber ?? null) : null;
+  if (
+    actionType === 'complete' &&
+    priorAttempt?.attemptId === attemptId &&
+    priorAttempt.actionType === actionType &&
+    priorAttempt.ownerId === ownerId &&
+    priorAttempt.status === 'completed' &&
+    priorAttempt.outcome === actionType &&
+    (priorAttempt.pullRequestNumber ?? null) === callerPullRequestNumber
+  ) {
+    return {
+      status: 'unchanged',
+      recoveryState: RECOVERY_TO[actionType],
+      evidenceRefs: priorAttempt.evidenceRefs,
+    };
+  }
+
   // Per-action evidence gate (fail-closed before reservation).
   let structured: {
     pullRequestNumber?: number;
@@ -169,7 +203,8 @@ export async function transitionRunRecovery(
   const evidenceRefs: string[] = [];
 
   if (actionType === 'complete') {
-    if (typeof request.pullRequestNumber !== 'number' || request.pullRequestNumber <= 0) {
+    const pullRequestNumber = request.pullRequestNumber;
+    if (typeof pullRequestNumber !== 'number') {
       return { status: 'rejected', reason: 'pull_request_number_required' };
     }
     if (outcome.validationState !== 'passed') {
@@ -186,9 +221,9 @@ export async function transitionRunRecovery(
     ) {
       return { status: 'rejected', reason: 'stop_conditions_not_passed' };
     }
-    const pr = await deps.fetchPullRequest(request.pullRequestNumber);
+    const pr = await deps.fetchPullRequest(pullRequestNumber);
     if (!pr) return { status: 'rejected', reason: 'pr_evidence_unavailable' };
-    if (pr.number !== request.pullRequestNumber) {
+    if (pr.number !== pullRequestNumber) {
       return { status: 'rejected', reason: 'pr_number_mismatch' };
     }
     if (pr.state !== 'MERGED') return { status: 'rejected', reason: 'pr_not_merged' };
@@ -239,10 +274,6 @@ export async function transitionRunRecovery(
   // Attempt-level idempotency is checked before from-state and lease admission.
   // A successful retry must remain unchanged after the first call has already
   // moved the recovery/incident to its target state and released its old fence.
-  const recoveryDetails = await store.getRunRecoveryDetails(runId);
-  const priorAttempt = recoveryDetails.actions.find(
-    action => action.attemptId === attemptId && action.actionType === actionType
-  );
   if (priorAttempt) {
     const identical =
       priorAttempt.ownerId === ownerId &&

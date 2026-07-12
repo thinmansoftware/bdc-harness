@@ -1,4 +1,5 @@
 import { describe, test, expect, mock, beforeEach, afterEach } from 'bun:test';
+import { createHash } from 'node:crypto';
 import { join } from 'path';
 import { OpenAPIHono } from '@hono/zod-openapi';
 import type { ConversationLockManager } from '@archon/core';
@@ -122,6 +123,12 @@ const mockRunCascade = mock(
 );
 const mockCheckCodexDispatchGate = mock(async () => ({ fresh: true as const }));
 const mockFetch = mock(async () => new Response('ok', { status: 200 }));
+let mockGhPullRequestJson = '';
+let mockGhUnavailable = false;
+const mockExecFileAsync = mock(async () => {
+  if (mockGhUnavailable) throw new Error('gh unavailable');
+  return { stdout: mockGhPullRequestJson, stderr: '' };
+});
 
 // Type aliases for clarity in tests
 type MockWorkflowRun = {
@@ -235,6 +242,7 @@ mock.module('@archon/core/workflows', () => ({
 }));
 
 mock.module('@archon/git', () => ({
+  execFileAsync: mockExecFileAsync,
   removeWorktree: mock(async () => {}),
   toRepoPath: (p: string) => p,
   toWorktreePath: (p: string) => p,
@@ -1386,6 +1394,42 @@ describe('POST /api/workflows/runs/:runId/approve', () => {
 describe('POST /api/workflows/runs/:runId/recovery', () => {
   const actor = 'xo@bluedevil.test';
   const attemptId = '11111111-1111-4111-8111-111111111111';
+  const terminalHead = '2'.repeat(40);
+  const mergeSha = '3'.repeat(40);
+  const recoveryWorkflow = {
+    name: 'deploy',
+    nodes: [
+      {
+        id: 'recovery-manifest',
+        evidence: { kind: 'manifest_v2', required_gates: ['validate'] },
+      },
+    ],
+  };
+  const recoveryWorkflowRevision = `sha256:${createHash('sha256')
+    .update(JSON.stringify(recoveryWorkflow))
+    .digest('hex')}`;
+
+  const recoveryRequest = (
+    body: Record<string, unknown> = {
+      actionType: 'complete',
+      attemptId,
+      pullRequestNumber: 426,
+    }
+  ): Request =>
+    new Request('http://localhost/api/workflows/runs/run-recovery-1/recovery', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+
+  const expectRecoveryError = async (
+    response: Response,
+    status: 400 | 409,
+    message: string
+  ): Promise<void> => {
+    expect(response.status).toBe(status);
+    expect((await response.json()) as { error: string }).toEqual({ error: message });
+  };
 
   beforeEach(() => {
     process.env.ARCHON_RECOVERY_DEFAULT_ACTOR = actor;
@@ -1400,7 +1444,7 @@ describe('POST /api/workflows/runs/:runId/recovery', () => {
       canonicalRemote: 'https://github.com/bluedevilcollectibles/bdc-harness.git',
       baseBranch: 'dev',
       workflowName: 'deploy',
-      workflowRevision: 'sha256:test',
+      workflowRevision: recoveryWorkflowRevision,
       worktreePath: '/tmp/worktrees/recovery',
     });
     mockGetRunOutcome.mockReset();
@@ -1432,12 +1476,45 @@ describe('POST /api/workflows/runs/:runId/recovery', () => {
     mockReleaseSupervisorRepairLease.mockResolvedValue(true);
     mockFinalizeSupervisorRecoveryTransition.mockReset();
     mockFinalizeSupervisorRecoveryTransition.mockResolvedValue('applied');
+    mockDiscoverWorkflowsWithConfig.mockReset();
+    mockDiscoverWorkflowsWithConfig.mockResolvedValue({
+      workflows: [{ workflow: recoveryWorkflow as never, source: 'project' }],
+      errors: [],
+    });
+    mockListWorkflowEvents.mockReset();
+    mockListWorkflowEvents.mockResolvedValue([
+      {
+        id: 'gate-event-1',
+        workflow_run_id: 'run-recovery-1',
+        event_type: 'node_completed',
+        step_index: 1,
+        step_name: 'validate',
+        data: { gate_result: { passed: true, nodeType: 'bash' } },
+        created_at: NOW,
+      },
+    ]);
+    mockGhUnavailable = false;
+    mockGhPullRequestJson = JSON.stringify({
+      url: 'https://github.com/bluedevilcollectibles/bdc-harness/pull/426',
+      number: 426,
+      state: 'MERGED',
+      isDraft: false,
+      baseRefName: 'dev',
+      headRefName: 'repair/m26',
+      headRefOid: terminalHead,
+      mergeCommit: { oid: mergeSha },
+      files: [{ path: 'packages/workflows/src/reliability/recovery-transition.ts' }],
+      statusCheckRollup: [{ name: 'validate', conclusion: 'SUCCESS' }],
+    });
+    mockExecFileAsync.mockClear();
   });
 
   afterEach(() => {
     delete process.env.ARCHON_RECOVERY_DEFAULT_ACTOR;
     delete process.env.ARCHON_RECOVERY_OPERATOR_EMAILS;
     delete process.env.ARCHON_RECOVERY_READONLY_PRINCIPALS;
+    mockDiscoverWorkflowsWithConfig.mockReset();
+    mockDiscoverWorkflowsWithConfig.mockResolvedValue({ workflows: [], errors: [] });
   });
 
   test('fails closed with 403 when no XO/John/V1C operator mapping is configured', async () => {
@@ -1497,6 +1574,88 @@ describe('POST /api/workflows/runs/:runId/recovery', () => {
     });
     expect(response.status).toBe(400);
     expect(mockCreateSupervisorIncident).not.toHaveBeenCalled();
+  });
+
+  test('complete returns exact 400 reason when the revision-pinned workflow hash mismatches', async () => {
+    process.env.ARCHON_RECOVERY_OPERATOR_EMAILS = actor;
+    mockGetRunAuthority.mockResolvedValue({
+      runId: 'run-recovery-1',
+      woId: 'WO-RECOVERY-1',
+      canonicalRemote: 'https://github.com/bluedevilcollectibles/bdc-harness.git',
+      baseBranch: 'dev',
+      workflowName: 'deploy',
+      workflowRevision: 'sha256:stale-revision',
+      worktreePath: '/tmp/worktrees/recovery',
+    });
+    const { app } = makeApp();
+
+    await expectRecoveryError(
+      await app.request(recoveryRequest()),
+      400,
+      'Recovery rejected: required_gate_evidence_missing'
+    );
+    expect(mockExecFileAsync).not.toHaveBeenCalled();
+  });
+
+  test('complete cannot launder a persisted passed ref through weak immutable gate evidence', async () => {
+    process.env.ARCHON_RECOVERY_OPERATOR_EMAILS = actor;
+    mockListWorkflowEvents.mockResolvedValue([
+      {
+        id: 'gate-event-weak',
+        workflow_run_id: 'run-recovery-1',
+        event_type: 'node_completed',
+        step_index: 1,
+        step_name: 'validate',
+        data: {},
+        created_at: NOW,
+      },
+    ]);
+    const { app } = makeApp();
+
+    await expectRecoveryError(
+      await app.request(recoveryRequest()),
+      400,
+      'Recovery rejected: stop_conditions_not_passed'
+    );
+    expect(mockExecFileAsync).not.toHaveBeenCalled();
+  });
+
+  test('complete returns exact 400 reasons for live head, base, merge, and check failures', async () => {
+    process.env.ARCHON_RECOVERY_OPERATOR_EMAILS = actor;
+    const baseEvidence = JSON.parse(mockGhPullRequestJson) as Record<string, unknown>;
+    const cases: Array<{ override: Record<string, unknown>; reason: string }> = [
+      { override: { headRefOid: '9'.repeat(40) }, reason: 'pr_head_mismatch' },
+      { override: { baseRefName: 'main' }, reason: 'pr_base_mismatch' },
+      { override: { mergeCommit: null }, reason: 'merge_sha_missing' },
+      {
+        override: { statusCheckRollup: [{ name: 'validate', conclusion: 'FAILURE' }] },
+        reason: 'required_pr_checks_not_passed',
+      },
+    ];
+
+    for (const item of cases) {
+      mockGhPullRequestJson = JSON.stringify({ ...baseEvidence, ...item.override });
+      const { app } = makeApp();
+      await expectRecoveryError(
+        await app.request(recoveryRequest()),
+        400,
+        `Recovery rejected: ${item.reason}`
+      );
+    }
+    expect(mockFinalizeSupervisorRecoveryTransition).not.toHaveBeenCalled();
+  });
+
+  test('complete returns the exact 409 reason when no fenced lease can be claimed', async () => {
+    process.env.ARCHON_RECOVERY_OPERATOR_EMAILS = actor;
+    mockClaimSupervisorRepairLease.mockResolvedValue(null);
+    const { app } = makeApp();
+
+    await expectRecoveryError(
+      await app.request(recoveryRequest()),
+      409,
+      'Recovery conflict: repair_lease_unavailable'
+    );
+    expect(mockFinalizeSupervisorRecoveryTransition).not.toHaveBeenCalled();
   });
 });
 
