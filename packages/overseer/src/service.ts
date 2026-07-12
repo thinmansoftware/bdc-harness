@@ -1,4 +1,5 @@
 import { Octokit } from '@octokit/rest';
+import { createLogger } from '@archon/paths';
 import {
   insertOverseerAction,
   listRunEventsForOverseer,
@@ -16,6 +17,8 @@ import type {
   WatchedRunRecord,
 } from './types.ts';
 
+const log = createLogger('overseer/service');
+
 export interface OverseerServiceOptions {
   once?: boolean;
   enabled?: boolean;
@@ -28,39 +31,66 @@ function envEnabled(value: string | undefined): boolean {
   return value === '1' || value === 'true' || value === 'yes';
 }
 
-function jsonDecisionLine(record: WatchedRunRecord, action?: string): string {
-  return JSON.stringify({
-    runId: record.runId,
-    woId: record.woId,
-    class: record.errorClass ?? 'none',
-    action: action ?? record.action,
-    reason: record.reason,
-  });
-}
-
 async function handleRecord(
   record: WatchedRunRecord,
   deps: OverseerActionsDeps & GitHubClientDeps,
   dryRun: boolean
 ): Promise<void> {
   if (record.action === 'success' || record.action === 'ignore') {
-    console.log(jsonDecisionLine(record));
+    log.info(
+      {
+        runId: record.runId,
+        woId: record.woId,
+        action: record.action,
+        class: record.errorClass ?? 'none',
+        reason: record.reason,
+      },
+      'overseer.decision_completed'
+    );
     return;
   }
 
   if (dryRun) {
-    console.log(jsonDecisionLine(record, 'dry_run'));
+    log.info(
+      {
+        runId: record.runId,
+        woId: record.woId,
+        action: 'dry_run',
+        class: record.errorClass ?? 'none',
+        reason: record.reason,
+        dryRun: true,
+      },
+      'overseer.decision_dry_run'
+    );
     return;
   }
 
   if (record.action === 'merge_ready') {
     const result = await handleMergeReady(record, deps);
-    console.log(jsonDecisionLine(record, result.action));
+    log.info(
+      {
+        runId: record.runId,
+        woId: record.woId,
+        action: result.action,
+        class: record.errorClass ?? 'none',
+        reason: record.reason,
+      },
+      'overseer.merge_ready_handled'
+    );
     return;
   }
 
   if (!record.decision || !record.errorClass) {
-    console.log(jsonDecisionLine(record, 'skipped'));
+    log.info(
+      {
+        runId: record.runId,
+        woId: record.woId,
+        action: 'skipped',
+        class: 'none',
+        reason: record.reason,
+      },
+      'overseer.decision_skipped'
+    );
     return;
   }
 
@@ -82,7 +112,16 @@ async function handleRecord(
     action: 'escalate',
     result: record.reason,
   });
-  console.log(jsonDecisionLine(record));
+  log.info(
+    {
+      runId: record.runId,
+      woId: record.woId,
+      action: 'escalate',
+      class: record.errorClass,
+      reason: record.reason,
+    },
+    'overseer.escalation_completed'
+  );
 }
 
 export async function runOverseerService(options: OverseerServiceOptions = {}): Promise<void> {

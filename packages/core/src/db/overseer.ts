@@ -1,5 +1,8 @@
 import { randomUUID } from 'crypto';
+import { createLogger } from '@archon/paths';
 import { getDatabase } from './connection';
+
+const log = createLogger('db/overseer');
 
 export interface OverseerWatchRun {
   id: string;
@@ -53,7 +56,15 @@ function parseObject(value: unknown): Record<string, unknown> {
     return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
       ? (parsed as Record<string, unknown>)
       : {};
-  } catch {
+  } catch (err) {
+    log.warn(
+      {
+        err: err as Error,
+        valueType: typeof value,
+        valuePreview: typeof value === 'string' ? value.slice(0, 100) : String(value),
+      },
+      'db.metadata_parse_failed'
+    );
     return {};
   }
 }

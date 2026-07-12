@@ -58,50 +58,36 @@ describe('service', () => {
   test('OVERSEER_DRY_RUN logs decision and makes zero side-effect calls', async () => {
     const insertOverseerAction = mock(async () => undefined);
     const mergePullRequest = mock(async () => ({ merged: true }));
-    const lines: string[] = [];
-    const oldLog = console.log;
-    console.log = (line?: unknown) => {
-      lines.push(String(line));
-    };
-    try {
-      await runOverseerService({
-        once: true,
-        enabled: true,
-        dryRun: true,
-        deps: {
-          listRunsForWatch: async () => [
-            {
-              id: 'run-dry',
-              woId: 'WO-DRY-01',
-              owner: 'bluedevilcollectibles',
-              repo: 'bdc-harness',
-              status: 'failed',
-              headBranch: 'wo/dry',
-            },
-          ],
-          listRunEvents: async () => [],
-          findPullRequest: async () => ({
-            exists: true,
-            state: 'open',
-            checks: { total: 1, passed: 1, failed: 0, pending: 0 },
-            mergeable: true,
-            pr: { owner: 'bluedevilcollectibles', repo: 'bdc-harness', number: 3 },
-          }),
-          mergePullRequest,
-          insertOverseerAction,
-        },
-      });
-    } finally {
-      console.log = oldLog;
-    }
 
-    expect(JSON.parse(lines[0])).toEqual(
-      expect.objectContaining({
-        runId: 'run-dry',
-        class: 'tail_node_false_fail',
-        action: 'dry_run',
-      })
-    );
+    await runOverseerService({
+      once: true,
+      enabled: true,
+      dryRun: true,
+      deps: {
+        listRunsForWatch: async () => [
+          {
+            id: 'run-dry',
+            woId: 'WO-DRY-01',
+            owner: 'bluedevilcollectibles',
+            repo: 'bdc-harness',
+            status: 'failed',
+            headBranch: 'wo/dry',
+          },
+        ],
+        listRunEvents: async () => [],
+        findPullRequest: async () => ({
+          exists: true,
+          state: 'open',
+          checks: { total: 1, passed: 1, failed: 0, pending: 0 },
+          mergeable: true,
+          pr: { owner: 'bluedevilcollectibles', repo: 'bdc-harness', number: 3 },
+        }),
+        mergePullRequest,
+        insertOverseerAction,
+      },
+    });
+
+    // Verify no side effects (merge/action) were called in dry-run mode
     expect(mergePullRequest).not.toHaveBeenCalled();
     expect(insertOverseerAction).not.toHaveBeenCalled();
   });
@@ -142,9 +128,40 @@ describe('service', () => {
     expect(JSON.parse(messages[0].body)).toEqual(
       expect.objectContaining({ runId: 'run-report-1', class: 'validator_rejected' })
     );
+
+    // CRITICAL: Close DB before cleanup on Windows to avoid EBUSY
     await closeDatabase();
     resetDatabase();
     rmSync(archonHome, { recursive: true, force: true });
+  });
+
+  test('runEscalation dispatch path closes DB for Windows cleanup', async () => {
+    const archonHome = join(
+      import.meta.dir,
+      `.archon-windows-cleanup-${Date.now()}-${Math.random().toString(36).slice(2)}`
+    );
+    mkdirSync(archonHome, { recursive: true });
+    process.env.ARCHON_HOME = archonHome;
+
+    // Trigger the dispatch path that opens SQLite
+    await runEscalation(
+      'run-windows-cleanup',
+      { decision: 'escalate', reason: 'test Windows file handle cleanup' },
+      { errorClass: 'validator_rejected', woId: 'WO-WINDOWS-01', nodeId: 'gate' }
+    );
+
+    // Verify dispatch message was created
+    const messages = await listMessages({ recipient: 'operator', status: 'queued' });
+    expect(messages.some(m => m.correlation_id === 'run-windows-cleanup')).toBe(true);
+
+    // CRITICAL: Explicitly close DB before cleanup (the fix for Windows EBUSY)
+    await closeDatabase();
+    resetDatabase();
+
+    // This is the Windows CI failure point - rmSync should NOT throw EBUSY
+    expect(() => {
+      rmSync(archonHome, { recursive: true, force: true });
+    }).not.toThrow(/EBUSY|EPERM/);
   });
 
   test('silent dead-end writes escalation.json with unknown class', async () => {

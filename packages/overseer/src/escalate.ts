@@ -193,7 +193,9 @@ async function postBuilderMonitorWebhook(
     body: JSON.stringify(body),
   });
   if (!res.ok) {
-    throw new Error(`builder-monitor responded ${res.status}: ${await res.text()}`);
+    const responseText = await res.text();
+    console.error(`[overseer/escalate] builder-monitor responded ${res.status}:`, responseText);
+    throw new Error(`builder-monitor responded ${res.status}: ${responseText}`);
   }
 }
 
@@ -255,7 +257,9 @@ async function postNotionComment(
     body: JSON.stringify(body),
   });
   if (!res.ok) {
-    throw new Error(`Notion comments API responded ${res.status}: ${await res.text()}`);
+    const responseText = await res.text();
+    console.error(`[overseer/escalate] Notion comments API responded ${res.status}:`, responseText);
+    throw new Error(`Notion comments API responded ${res.status}: ${responseText}`);
   }
 }
 
@@ -295,7 +299,9 @@ async function lookupNotionPageId(
     body: JSON.stringify(body),
   });
   if (!res.ok) {
-    throw new Error(`Notion database query failed ${res.status}: ${await res.text()}`);
+    const responseText = await res.text();
+    console.error(`[overseer/escalate] Notion database query failed ${res.status}:`, responseText);
+    throw new Error(`Notion database query failed ${res.status}: ${responseText}`);
   }
   const data = (await res.json()) as { results?: { id?: string }[] };
   const first = data.results?.[0];
