@@ -26,12 +26,14 @@ import type {
   LoopIterationInfo,
 } from '@/lib/types';
 
-import type { WorkflowEventResponse } from '@/lib/api';
+import type { WorkflowEventResponse, RunOutcome, RecoveryAction } from '@/lib/api';
 import {
   deriveLoopArcs,
   deriveCycleState,
   extractApprovalContext,
 } from '@/lib/dag-self-repair-loop';
+import { RecoveryStatusBadge } from '@/components/dashboard/RecoveryStatusBadge';
+import { getRecoveryLabel } from '@/lib/recovery-renderer';
 
 /** Tool call event extracted from workflow_events for display in WorkflowLogs. */
 export interface ToolEvent {
@@ -62,6 +64,11 @@ interface WorkflowRunQueryData {
    *  Field exists on WorkflowRunResponse.metadata at server side; we just
    *  carry it through here. */
   runMetadataApproval: { onRejectPrompt?: string; onRejectMaxAttempts?: number } | null;
+  /** WO-HARNESS-RUN-RECOVERY-DUAL-TRUTH-01: dual-truth outcome + recovery
+   *  actions from the run-detail endpoint. Prefer recovery.outcome, fall back
+   *  to run.outcome; recovery.actions drives the Recovery detail region. */
+  outcome: RunOutcome | null;
+  recoveryActions: RecoveryAction[];
 }
 
 interface WorkflowExecutionProps {
@@ -100,6 +107,99 @@ function StatusBadge({
   const label = effectiveStatus === 'completed_with_warning' ? 'completed (warning)' : status;
   return (
     <span className={`px-2 py-0.5 rounded-full text-xs font-medium ${className}`}>{label}</span>
+  );
+}
+
+/** Labeled key/value line used in the Recovery detail region. */
+function RecoveryField({
+  label,
+  value,
+}: {
+  label: string;
+  value: React.ReactNode;
+}): React.ReactElement {
+  return (
+    <div className="flex gap-2 text-xs">
+      <span className="text-text-tertiary shrink-0">{label}:</span>
+      <span className="text-text-secondary break-all">{value}</span>
+    </div>
+  );
+}
+
+/**
+ * WO-HARNESS-RUN-RECOVERY-DUAL-TRUTH-01: Recovery detail region. Renders when a
+ * recovery incident exists (actions non-empty OR recoveryState !== 'not_needed').
+ * Surfaces deliverable/validation/recovery states plus per-action evidence
+ * (original terminal git range, PR number, recovered head, target base, merge
+ * sha) so operators can audit every attempt and any abandonment.
+ */
+function RecoveryDetailRegion({
+  outcome,
+  actions,
+}: {
+  outcome: RunOutcome | null;
+  actions: RecoveryAction[];
+}): React.ReactElement | null {
+  const hasIncident =
+    actions.length > 0 || (outcome != null && outcome.recoveryState !== 'not_needed');
+  if (!hasIncident) return null;
+
+  // Original terminal git range: the `git:<base>...<head>` evidence ref, if present.
+  const gitRangeRef =
+    outcome?.evidenceRefs.find(ref => ref.startsWith('git:') && ref.includes('...')) ?? null;
+  const recoveryLabel = outcome ? getRecoveryLabel(outcome) : null;
+
+  return (
+    <div className="border-b border-border px-4 py-3 space-y-3">
+      <div className="flex items-center gap-2">
+        <h3 className="text-sm font-semibold text-text-primary">Recovery</h3>
+        <RecoveryStatusBadge outcome={outcome} />
+      </div>
+
+      {outcome && (
+        <div className="space-y-1">
+          <RecoveryField label="Deliverable state" value={outcome.deliverableState} />
+          <RecoveryField label="Validation state" value={outcome.validationState} />
+          <RecoveryField label="Recovery state" value={recoveryLabel ?? outcome.recoveryState} />
+          {gitRangeRef && <RecoveryField label="Original terminal Git range" value={gitRangeRef} />}
+        </div>
+      )}
+
+      {actions.length > 0 && (
+        <div className="space-y-2">
+          <p className="text-[11px] uppercase tracking-wide text-text-tertiary">
+            Actions ({String(actions.length)})
+          </p>
+          {actions.map(action => (
+            <div
+              key={action.actionId}
+              className="rounded-md border border-border bg-surface-elevated px-3 py-2 space-y-1"
+            >
+              <RecoveryField label="Actor" value={action.ownerId} />
+              <RecoveryField label="Action type" value={action.actionType} />
+              <RecoveryField
+                label="Outcome"
+                value={action.status ? `${action.outcome} (${action.status})` : action.outcome}
+              />
+              {typeof action.pullRequestNumber === 'number' && (
+                <RecoveryField
+                  label="Pull request"
+                  value={`#${String(action.pullRequestNumber)}`}
+                />
+              )}
+              {action.recoveredHeadSha && (
+                <RecoveryField label="Recovered head" value={action.recoveredHeadSha} />
+              )}
+              {action.targetBase && <RecoveryField label="Target base" value={action.targetBase} />}
+              {action.mergeSha && <RecoveryField label="Merge sha" value={action.mergeSha} />}
+              {action.evidenceRefs.length > 0 && (
+                <RecoveryField label="Evidence" value={action.evidenceRefs.join(', ')} />
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -333,6 +433,10 @@ export function WorkflowExecution({ runId }: WorkflowExecutionProps): React.Reac
                 : undefined,
           };
         })(),
+        // WO-HARNESS-RUN-RECOVERY-DUAL-TRUTH-01: prefer the recovery envelope's
+        // outcome, fall back to the run-level outcome.
+        outcome: data.recovery?.outcome ?? data.run.outcome ?? null,
+        recoveryActions: data.recovery?.actions ?? [],
       };
     },
     refetchInterval: (query): number | false => {
@@ -860,6 +964,9 @@ export function WorkflowExecution({ runId }: WorkflowExecutionProps): React.Reac
             status={workflow.status}
             hasWarning={workflow.dagNodes.some(n => n.status === 'completed_with_warning')}
           />
+          {/* Recovery axis (M-26): independent badge alongside the execution
+              StatusBadge -- never replaces it. */}
+          <RecoveryStatusBadge outcome={queryData?.outcome} />
         </div>
         <div className="flex items-center gap-2 ml-auto shrink-0">
           {codebaseName && <span className="text-xs text-text-secondary">{codebaseName}</span>}
@@ -878,6 +985,13 @@ export function WorkflowExecution({ runId }: WorkflowExecutionProps): React.Reac
           <RunCostBadge usd={runTotalCostUsd} />
         </div>
       </div>
+
+      {/* Recovery detail region (M-26) -- below the header, only when a recovery
+          incident exists. Independent of the execution status above. */}
+      <RecoveryDetailRegion
+        outcome={queryData?.outcome ?? null}
+        actions={queryData?.recoveryActions ?? []}
+      />
 
       {/* View tabs -- only for DAG workflows */}
       {isDag && (

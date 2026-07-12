@@ -10,6 +10,8 @@ import { rm, readFile, writeFile, unlink, mkdir } from 'fs/promises';
 import { readFileSync } from 'fs';
 import { normalize, join, sep, basename } from 'path';
 import { randomUUID } from 'crypto';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import type { Context } from 'hono';
 import type {
   ConversationLockManager,
@@ -52,6 +54,12 @@ import type { WorkflowDefinition } from '@archon/workflows/schemas/workflow';
 import { executeWorkflow } from '@archon/workflows/executor';
 import { checkCodexDispatchGate } from '@archon/providers/auth-refresh/dispatch-gate';
 import { processDueProviderWaits } from '@archon/workflows/reliability/wait-scheduler';
+import { transitionRunRecovery } from '@archon/workflows/reliability/recovery-transition';
+import type { IWorkflowStore } from '@archon/workflows/store';
+import {
+  parsePullRequest,
+  repositoryFromRemote,
+} from '@archon/workflows/reliability/evidence-collector';
 import { getLoaderErrors, parseWorkflow } from '@archon/workflows/loader';
 import { isValidCommandName } from '@archon/workflows/command-validation';
 import { BUNDLED_WORKFLOWS, BUNDLED_COMMANDS, isBinaryBuild } from '@archon/workflows/defaults';
@@ -118,6 +126,8 @@ import {
   bulkArchiveBodySchema,
   bulkArchiveResponseSchema,
   bulkDeleteFailedResponseSchema,
+  recoveryTransitionRequestBodySchema,
+  recoveryTransitionResponseSchema,
 } from './schemas/workflow.schemas';
 import {
   conversationListResponseSchema,
@@ -205,6 +215,10 @@ function jsonError(description: string): {
 }
 
 const cwdQuerySchema = z.object({ cwd: z.string().optional() });
+
+// M-26: live PR evidence runner + fenced-recovery repair-lease duration.
+const execFileAsync = promisify(execFile);
+const RECOVERY_LEASE_MS = 5 * 60 * 1000;
 
 const getWorkflowsRoute = createRoute({
   method: 'get',
@@ -1100,6 +1114,28 @@ const rejectWorkflowRunRoute = createRoute({
     },
     400: jsonError('Bad request'),
     404: jsonError('Not found'),
+    500: jsonError('Server error'),
+  },
+});
+
+const transitionWorkflowRunRecoveryRoute = createRoute({
+  method: 'post',
+  path: '/api/workflows/runs/{runId}/recovery',
+  tags: ['Workflows'],
+  summary: 'Apply an evidence-gated recovery transition to a failed/cancelled run',
+  request: {
+    params: z.object({ runId: z.string() }),
+    body: { content: { 'application/json': { schema: recoveryTransitionRequestBodySchema } } },
+  },
+  responses: {
+    200: {
+      content: { 'application/json': { schema: recoveryTransitionResponseSchema } },
+      description: 'Recovery transition result',
+    },
+    400: jsonError('Bad request'),
+    403: jsonError('Forbidden'),
+    404: jsonError('Not found'),
+    409: jsonError('Conflict'),
     500: jsonError('Server error'),
   },
 });
@@ -3672,6 +3708,108 @@ export function registerApiRoutes(
     }
   });
 
+  // POST /api/workflows/runs/:runId/recovery
+  // M-26 dual-truth run recovery: apply an evidence-gated recovery transition to
+  // a failed/cancelled run WITHOUT changing execution truth. The actor is derived
+  // from the trusted operator principal; owner/fence/evidence/gates are never
+  // caller-authoritative. Read-only M-28 principals (Grok/Overseer) are rejected.
+  registerOpenApiRoute(transitionWorkflowRunRecoveryRoute, async c => {
+    const runId = c.req.param('runId') ?? '';
+    try {
+      const run = await workflowDb.getWorkflowRun(runId);
+      if (!run) {
+        getLog().info({ runId }, 'api.workflow_run_recovery_not_found');
+        return apiError(c, 404, 'Workflow run not found');
+      }
+
+      // Derive the authenticated actor and authorize it for recovery mutation.
+      const actorEmail = c.req.header('cf-access-authenticated-user-email')?.trim().toLowerCase();
+      const actor =
+        actorEmail || (process.env.ARCHON_RECOVERY_DEFAULT_ACTOR ?? 'operator').toLowerCase();
+      const readOnlyPrincipals = envList('ARCHON_RECOVERY_READONLY_PRINCIPALS');
+      const recoveryOperators = envList('ARCHON_RECOVERY_OPERATOR_EMAILS');
+      if (
+        readOnlyPrincipals.includes(actor) ||
+        (recoveryOperators.length > 0 && !recoveryOperators.includes(actor))
+      ) {
+        getLog().warn({ runId, actor }, 'api.workflow_run_recovery_forbidden');
+        return apiError(c, 403, 'Principal not authorized for recovery mutation');
+      }
+
+      const body = getValidatedBody(c, recoveryTransitionRequestBodySchema);
+
+      // Minimal store built from the trusted DB module. owner/fence/gates/evidence
+      // are derived inside the transition, not from the caller.
+      const store = {
+        getRunAuthority: workflowDb.getRunAuthority,
+        getRunOutcome: workflowDb.getRunOutcome,
+        createSupervisorIncident: workflowDb.createSupervisorIncident,
+        claimSupervisorRepairLease: workflowDb.claimSupervisorRepairLease,
+        releaseSupervisorRepairLease: workflowDb.releaseSupervisorRepairLease,
+        finalizeSupervisorRecoveryTransition: workflowDb.finalizeSupervisorRecoveryTransition,
+      } as unknown as IWorkflowStore;
+
+      const result = await transitionRunRecovery(
+        {
+          store,
+          fetchPullRequest: async (pullRequestNumber: number) => {
+            const authority = await workflowDb.getRunAuthority(runId);
+            if (!authority) return null;
+            const repository = repositoryFromRemote(authority.canonicalRemote);
+            try {
+              const { stdout } = await execFileAsync('gh', [
+                'pr',
+                'view',
+                String(pullRequestNumber),
+                '--repo',
+                repository,
+                '--json',
+                'url,number,state,isDraft,baseRefName,headRefName,headRefOid,mergeCommit,files,statusCheckRollup',
+              ]);
+              return parsePullRequest(stdout);
+            } catch {
+              return null;
+            }
+          },
+          now: () => new Date().toISOString(),
+          newId: () => randomUUID(),
+        },
+        {
+          runId,
+          actionType: body.actionType,
+          attemptId: body.attemptId,
+          ownerId: actor,
+          pullRequestNumber: body.pullRequestNumber,
+          reason: body.reason,
+          leaseDurationMs: RECOVERY_LEASE_MS,
+        }
+      );
+
+      if (result.status === 'rejected') {
+        getLog().info(
+          { runId, actor, reason: result.reason },
+          'api.workflow_run_recovery_rejected'
+        );
+        return apiError(c, 400, `Recovery rejected: ${result.reason}`);
+      }
+      if (result.status === 'conflict') {
+        getLog().info(
+          { runId, actor, reason: result.reason },
+          'api.workflow_run_recovery_conflict'
+        );
+        return apiError(c, 409, `Recovery conflict: ${result.reason}`);
+      }
+      return c.json({
+        success: true,
+        status: result.status,
+        recoveryState: result.recoveryState,
+      });
+    } catch (error) {
+      getLog().error({ err: error, runId }, 'api.workflow_run_recovery_failed');
+      return apiError(c, 500, 'Failed to apply recovery transition');
+    }
+  });
+
   // POST /api/workflows/runs/:runId/archive
   registerOpenApiRoute(archiveWorkflowRunRoute, async c => {
     const runId = c.req.param('runId') ?? '';
@@ -3860,6 +3998,9 @@ export function registerApiRoutes(
       }
       const events = await workflowEventDb.listWorkflowEvents(runId);
       const outcome = await workflowDb.getRunOutcome(runId);
+      // M-26: run detail also carries recovery actor/attempt evidence. Read-only;
+      // never writes.
+      const recovery = await workflowDb.getRunRecoveryDetails(runId);
       const tokenTotalsEvent = [...events]
         .reverse()
         .find(event => event.event_type === 'run_token_totals');
@@ -3897,6 +4038,7 @@ export function registerApiRoutes(
           ...(tokenTotalsEvent ? { token_totals: tokenTotalsEvent.data } : {}),
         },
         events,
+        recovery,
       });
     } catch (error) {
       getLog().error({ err: error }, 'get_workflow_run_failed');

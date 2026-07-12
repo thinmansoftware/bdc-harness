@@ -212,6 +212,66 @@ export async function deleteCodebase(id: string): Promise<{ success: boolean }> 
   return fetchJSON<{ success: boolean }>(`/api/codebases/${id}`, { method: 'DELETE' });
 }
 
+/**
+ * RunOutcome -- the dual-truth outcome envelope attached to runs by the server
+ * (WO-HARNESS-RUN-RECOVERY-DUAL-TRUTH-01). Execution and recovery are separate
+ * axes; the recovery axis never hides the execution axis. Hand-written to mirror
+ * the server RunOutcome shape (web must not import from @archon/workflows).
+ */
+export interface RunOutcome {
+  executionState:
+    | 'queued'
+    | 'running'
+    | 'waiting_provider'
+    | 'paused_human'
+    | 'interrupted'
+    | 'completed'
+    | 'failed'
+    | 'cancelled';
+  deliverableState: 'none' | 'worktree_changes' | 'committed' | 'pushed' | 'pr_open' | 'pr_ready';
+  validationState: 'not_run' | 'passed' | 'failed' | 'indeterminate';
+  recoveryState:
+    | 'not_needed'
+    | 'recoverable'
+    | 'recovering'
+    | 'recovered'
+    | 'abandoned_by_operator';
+  routeState: 'current' | 'failed_over' | 'escalated' | 'spec_repair' | 'exhausted';
+  primaryReason: string;
+  reasonCodes: string[];
+  evidenceRefs: string[];
+}
+
+/**
+ * RecoveryAction -- a single recovery attempt / action recorded for a run.
+ * Hand-written to mirror the server RecoveryAction shape.
+ */
+export interface RecoveryAction {
+  actionId: string;
+  attemptId: string;
+  incidentId: string;
+  ownerId: string;
+  actionType: string;
+  outcome: string;
+  status?: string;
+  evidenceRefs: string[];
+  createdAt: string;
+  completedAt?: string | null;
+  pullRequestNumber?: number | null;
+  recoveredHeadSha?: string | null;
+  targetBase?: string | null;
+  mergeSha?: string | null;
+}
+
+/**
+ * RunRecoveryDetail -- the recovery detail envelope returned by the run-detail
+ * endpoint (GET /api/workflows/runs/:runId).
+ */
+export interface RunRecoveryDetail {
+  outcome: RunOutcome | null;
+  actions: RecoveryAction[];
+}
+
 export interface WorkflowRunResponse {
   id: string;
   workflow_name: string;
@@ -230,6 +290,9 @@ export interface WorkflowRunResponse {
   archived_at: string | null;
   archived_by: string | null;
   archive_reason: string | null;
+  // WO-HARNESS-RUN-RECOVERY-DUAL-TRUTH-01: dual-truth outcome envelope attached
+  // by the server to each run. Flows to DashboardRunResponse via extension.
+  outcome?: RunOutcome | null;
 }
 
 export interface PublicWorkflowRunResponse {
@@ -510,9 +573,13 @@ export async function listPublicWorkflowRuns(limit = 20): Promise<PublicWorkflow
   return result.runs;
 }
 
-export async function getWorkflowRun(
-  runId: string
-): Promise<{ run: WorkflowRunResponse; events: WorkflowEventResponse[] }> {
+export async function getWorkflowRun(runId: string): Promise<{
+  run: WorkflowRunResponse;
+  events: WorkflowEventResponse[];
+  // WO-HARNESS-RUN-RECOVERY-DUAL-TRUTH-01: run-detail now returns the recovery
+  // envelope (outcome + recovery actions) alongside the run and events.
+  recovery?: RunRecoveryDetail;
+}> {
   return fetchJSON(`/api/workflows/runs/${encodeURIComponent(runId)}`);
 }
 

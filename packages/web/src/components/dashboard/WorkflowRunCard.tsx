@@ -26,6 +26,8 @@ import { useWorkflowStore } from '@/stores/workflow-store';
 import type { WorkflowState } from '@/lib/types';
 import { ConfirmRunActionDialog } from './ConfirmRunActionDialog';
 import { getStatusBadgeClasses, getStatusDotColor, getStatusLabel } from '@/lib/status-renderer';
+import { RecoveryStatusBadge } from './RecoveryStatusBadge';
+import { getRecoveryLabel } from '@/lib/recovery-renderer';
 
 interface WorkflowRunCardProps {
   run: DashboardRunResponse;
@@ -213,8 +215,19 @@ export function WorkflowRunCard({
         >
           {getStatusLabel(run.status)}
         </span>
+        {/* Recovery axis (M-26): second, independent badge -- never hides the
+            execution status above. Omitted when recovery is not needed. */}
+        <RecoveryStatusBadge outcome={run.outcome} />
         <span className="text-xs text-text-tertiary shrink-0">{elapsed}</span>
       </div>
+
+      {/* Recovered runs: tiny muted execution -> recovery sequence summary. */}
+      {run.outcome?.recoveryState === 'recovered' && (
+        <p className="text-[10px] text-text-tertiary">
+          {getStatusLabel(run.status).toUpperCase()} -&gt;{' '}
+          {(getRecoveryLabel(run.outcome) ?? 'RECOVERED').toUpperCase()}
+        </p>
+      )}
 
       {/* Live progress */}
       <StepProgress run={run} liveState={liveState} />

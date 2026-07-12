@@ -41,6 +41,8 @@ const mockReserveSupervisorAction = mock(() => Promise.resolve(false));
 const mockFinalizeSupervisorAction = mock(() => Promise.resolve(false));
 const mockAppendSupervisorAction = mock(() => Promise.resolve(false));
 const mockReleaseSupervisorRepairLease = mock(() => Promise.resolve(false));
+const mockFinalizeSupervisorRecoveryTransition = mock(() => Promise.resolve('applied' as const));
+const mockGetRunRecoveryDetails = mock(() => Promise.resolve({ outcome: null, actions: [] }));
 
 mock.module('../db/workflows', () => ({
   createWorkflowRun: mockCreateWorkflowRun,
@@ -82,6 +84,8 @@ mock.module('../db/workflows', () => ({
   finalizeSupervisorAction: mockFinalizeSupervisorAction,
   appendSupervisorAction: mockAppendSupervisorAction,
   releaseSupervisorRepairLease: mockReleaseSupervisorRepairLease,
+  finalizeSupervisorRecoveryTransition: mockFinalizeSupervisorRecoveryTransition,
+  getRunRecoveryDetails: mockGetRunRecoveryDetails,
 }));
 
 const mockCreateWorkflowEvent = mock(() => Promise.resolve());
@@ -151,6 +155,8 @@ describe('createWorkflowStore', () => {
       'finalizeSupervisorAction',
       'appendSupervisorAction',
       'releaseSupervisorRepairLease',
+      'finalizeSupervisorRecoveryTransition',
+      'getRunRecoveryDetails',
       'createWorkflowEvent',
       'listWorkflowEvents',
       'getCompletedDagNodeOutputs',

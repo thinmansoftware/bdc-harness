@@ -39,6 +39,9 @@ export interface PullRequestEvidence {
   readonly baseRef: string;
   readonly headRef: string;
   readonly headSha: string;
+  // M-26: the merge commit oid, present only when state is MERGED. Required to
+  // gate a recovered transition on live merged-PR evidence.
+  readonly mergeSha: string | null;
   readonly files: readonly string[];
   readonly requiredChecks: readonly RequiredCheckEvidence[];
 }
@@ -122,7 +125,7 @@ function requiredGateState(gates: readonly GateEvidence[]): ValidationState {
   return 'passed';
 }
 
-function repositoryFromRemote(remote: string): string {
+export function repositoryFromRemote(remote: string): string {
   const match = /github\.com[/:]([^/]+\/[^/]+?)(?:\.git)?$/.exec(remote.trim());
   if (!match?.[1]) throw new Error('scope_authority_missing: GitHub canonicalRemote');
   return match[1];
@@ -207,7 +210,7 @@ function gateFromEvents(gateId: string, events: readonly WorkflowEventRecord[]):
   };
 }
 
-function parsePullRequest(json: string): PullRequestEvidence | null {
+export function parsePullRequest(json: string): PullRequestEvidence | null {
   if (!json.trim()) return null;
   const value = JSON.parse(json) as Record<string, unknown>;
   if (typeof value.url !== 'string' || typeof value.number !== 'number') return null;
@@ -233,6 +236,11 @@ function parsePullRequest(json: string): PullRequestEvidence | null {
     const name = stringField(record.name ?? record.context) || `check-${String(index + 1)}`;
     return { name, state };
   });
+  const mergeCommit =
+    typeof value.mergeCommit === 'object' && value.mergeCommit !== null
+      ? (value.mergeCommit as Record<string, unknown>)
+      : null;
+  const mergeShaRaw = mergeCommit ? stringField(mergeCommit.oid) : '';
   return {
     url: value.url,
     number: value.number,
@@ -241,6 +249,7 @@ function parsePullRequest(json: string): PullRequestEvidence | null {
     baseRef: stringField(value.baseRefName),
     headRef: stringField(value.headRefName),
     headSha: stringField(value.headRefOid),
+    mergeSha: mergeShaRaw === '' ? null : mergeShaRaw,
     files,
     requiredChecks,
   };
@@ -280,7 +289,7 @@ export async function collectRuntimeEvidence(
         '--repo',
         repository,
         '--json',
-        'url,number,state,isDraft,baseRefName,headRefName,headRefOid,files,statusCheckRollup',
+        'url,number,state,isDraft,baseRefName,headRefName,headRefOid,mergeCommit,files,statusCheckRollup',
       ],
       request.cwd
     );

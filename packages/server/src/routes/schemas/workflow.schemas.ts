@@ -178,6 +178,60 @@ export const runOutcomeSchema = z
   })
   .openapi('RunOutcome');
 
+/**
+ * M-26 recovery action audit record (subset of SupervisorActionRecord exposed
+ * to the run-detail surface). Structured merged-PR anchors are nullable for
+ * non-complete and historical actions.
+ */
+export const recoveryActionSchema = z
+  .object({
+    actionId: z.string(),
+    attemptId: z.string(),
+    incidentId: z.string(),
+    ownerId: z.string(),
+    actionType: z.string(),
+    outcome: z.string(),
+    status: z.string().optional(),
+    evidenceRefs: z.array(z.string()),
+    createdAt: z.string(),
+    completedAt: z.string().nullable().optional(),
+    pullRequestNumber: z.number().nullable().optional(),
+    recoveredHeadSha: z.string().nullable().optional(),
+    targetBase: z.string().nullable().optional(),
+    mergeSha: z.string().nullable().optional(),
+  })
+  .openapi('RecoveryAction');
+
+/** M-26 run-detail recovery surface: canonical outcome + action audit trail. */
+export const runRecoveryDetailSchema = z
+  .object({
+    outcome: runOutcomeSchema.nullable(),
+    actions: z.array(recoveryActionSchema),
+  })
+  .openapi('RunRecoveryDetail');
+
+/** POST /api/workflows/runs/:runId/recovery request body. */
+export const recoveryTransitionRequestBodySchema = z
+  .object({
+    actionType: z.enum(['start', 'complete', 'abandon', 'reopen']),
+    attemptId: z.string().uuid(),
+    // Required for `complete`; enforced by the transition (returns a precise reason).
+    pullRequestNumber: z.number().int().positive().optional(),
+    // Required for `abandon`; enforced by the transition.
+    reason: z.string().min(1).optional(),
+  })
+  .openapi('RecoveryTransitionRequest');
+
+/** POST /api/workflows/runs/:runId/recovery response. */
+export const recoveryTransitionResponseSchema = z
+  .object({
+    success: z.boolean(),
+    status: z.enum(['applied', 'unchanged', 'conflict', 'rejected']),
+    reason: z.string().optional(),
+    recoveryState: z.string().optional(),
+  })
+  .openapi('RecoveryTransitionResponse');
+
 /** A workflow run record. */
 export const workflowRunSchema = z
   .object({
@@ -258,6 +312,8 @@ export const workflowRunDetailSchema = z
       token_totals: z.record(z.unknown()).optional(),
     }),
     events: z.array(workflowEventSchema),
+    // M-26: recovery actor/attempt evidence, exposed on run detail only.
+    recovery: runRecoveryDetailSchema.optional(),
   })
   .openapi('WorkflowRunDetail');
 
