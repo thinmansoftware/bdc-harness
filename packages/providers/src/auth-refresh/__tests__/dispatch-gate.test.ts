@@ -23,7 +23,17 @@ function codexCredsPath(): string {
   return path.join(tempHome, '.codex', 'auth.json');
 }
 
-function writeCodexCreds(lastRefresh: string, refreshToken = 'eyJ_REFRESH_PLACEHOLDER'): void {
+function placeholderJwt(payload: Record<string, unknown>): string {
+  const encode = (value: Record<string, unknown>): string =>
+    Buffer.from(JSON.stringify(value)).toString('base64url');
+  return `${encode({ alg: 'none', typ: 'JWT' })}.${encode(payload)}.SIGNATURE_PLACEHOLDER`;
+}
+
+function writeCodexCreds(
+  lastRefresh: string,
+  refreshToken = 'eyJ_REFRESH_PLACEHOLDER',
+  accessToken = 'eyJ_ACCESS_PLACEHOLDER'
+): void {
   fs.mkdirSync(path.dirname(codexCredsPath()), { recursive: true });
   fs.writeFileSync(
     codexCredsPath(),
@@ -32,7 +42,7 @@ function writeCodexCreds(lastRefresh: string, refreshToken = 'eyJ_REFRESH_PLACEH
         OPENAI_API_KEY: null,
         tokens: {
           id_token: 'eyJ_ID_PLACEHOLDER',
-          access_token: 'eyJ_ACCESS_PLACEHOLDER',
+          access_token: accessToken,
           refresh_token: refreshToken,
           account_id: 'ACCT_PLACEHOLDER',
         },
@@ -62,6 +72,34 @@ afterEach(() => {
 });
 
 describe('checkCodexDispatchGate', () => {
+  test('passes a ten-day JWT without soft-refresh despite stale last_refresh', async () => {
+    const accessToken = placeholderJwt({ exp: Math.floor(Date.now() / 1000) + 10 * 24 * 60 * 60 });
+    writeCodexCreds(
+      new Date(Date.now() - 13 * 60 * 60 * 1000).toISOString(),
+      'REFRESH_PLACEHOLDER',
+      accessToken
+    );
+
+    const result = await checkCodexDispatchGate();
+
+    expect(result).toEqual({ fresh: true, reason: 'fresh' });
+    expect(softRefreshCodexMock).toHaveBeenCalledTimes(0);
+  });
+
+  test('soft-refreshes an expired JWT despite recent last_refresh', async () => {
+    const accessToken = placeholderJwt({ exp: Math.floor(Date.now() / 1000) - 60 });
+    writeCodexCreds(
+      new Date(Date.now() - 60_000).toISOString(),
+      'REFRESH_PLACEHOLDER',
+      accessToken
+    );
+
+    const result = await checkCodexDispatchGate();
+
+    expect(result).toEqual({ fresh: false, reason: 'stale' });
+    expect(softRefreshCodexMock).toHaveBeenCalledTimes(1);
+  });
+
   test('passes fresh auth without soft-refresh', async () => {
     writeCodexCreds(new Date(Date.now() - 60 * 60 * 1000).toISOString());
 

@@ -8,6 +8,23 @@ import { buildReauthMessage, isTerminalRefreshReason } from './shared.js';
 
 const FRESHNESS_BUFFER_MS = 60_000;
 
+function readJwtExpiresAt(accessToken: unknown): number | undefined {
+  if (typeof accessToken !== 'string') return undefined;
+  const segments = accessToken.split('.');
+  if (segments.length !== 3) return undefined;
+
+  try {
+    const payload = JSON.parse(Buffer.from(segments[1], 'base64url').toString('utf-8')) as {
+      exp?: unknown;
+    };
+    return typeof payload.exp === 'number' && Number.isFinite(payload.exp)
+      ? payload.exp * 1000
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 let cachedLog: ReturnType<typeof createLogger> | undefined;
 function getLog(): ReturnType<typeof createLogger> {
   if (!cachedLog) cachedLog = createLogger('provider.auth-refresh.preflight');
@@ -45,9 +62,6 @@ function readClaudeFreshness(filePath: string): FreshnessRead {
 }
 
 export function readCodexFreshness(filePath: string): FreshnessRead {
-  // Codex auth.json has no explicit expiresAt; the binary handles refresh in-process
-  // and stamps last_refresh. Treat tokens as fresh when last_refresh is < ~12h old
-  // (matches Codex's documented ~12h access token lifetime per ChatGPT-managed auth).
   if (!fs.existsSync(filePath)) return { hasCreds: false, hasRefreshToken: false };
   let parsed: CodexCreds;
   try {
@@ -56,12 +70,16 @@ export function readCodexFreshness(filePath: string): FreshnessRead {
     return { hasCreds: true, hasRefreshToken: false };
   }
   const refreshToken = parsed.tokens?.refresh_token;
+  const jwtExpiresAt = readJwtExpiresAt(parsed.tokens?.access_token);
   const lastRefreshStr = parsed.last_refresh;
   const lastRefreshMs = lastRefreshStr ? new Date(lastRefreshStr).getTime() : NaN;
-  const fresh =
+  const legacyExpiresAt =
     Number.isFinite(lastRefreshMs) && Date.now() - lastRefreshMs < 11 * 60 * 60 * 1000
       ? lastRefreshMs + 12 * 60 * 60 * 1000
       : undefined;
+  const expiresAt = jwtExpiresAt ?? legacyExpiresAt;
+  const fresh =
+    expiresAt !== undefined && expiresAt > Date.now() + FRESHNESS_BUFFER_MS ? expiresAt : undefined;
   return {
     freshExpiresAt: fresh,
     hasCreds: true,
