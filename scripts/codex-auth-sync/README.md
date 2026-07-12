@@ -81,13 +81,21 @@ Get-ScheduledTaskInfo -TaskName "BDC Codex Auth Sync" |
   Select-Object LastRunTime, LastTaskResult, NextRunTime
 ```
 
-After a scheduled or manual sync attempt, inspect only redacted metadata and check for forbidden credential markers:
+After a scheduled or manual sync attempt, scan silently for credential markers first. Fail closed before emitting any log content, then print only allowlisted redacted metadata fields:
 
 ```powershell
-Get-Content "$env:USERPROFILE\.codex\codex-auth-sync.log" -Tail 20
-$matches = Select-String -Path "$env:USERPROFILE\.codex\codex-auth-sync.log" `
-  -Pattern 'access_token|refresh_token|id_token|eyJ' -CaseSensitive:$false
-if ($matches) { throw "Credential marker found in auth sync log" }
+$ErrorActionPreference = "Stop"
+$logPath = "$env:USERPROFILE\.codex\codex-auth-sync.log"
+if (-not (Test-Path -LiteralPath $logPath -PathType Leaf)) { throw "Auth sync log is missing" }
+$leakFound = Select-String -LiteralPath $logPath `
+  -Pattern 'access_token|refresh_token|id_token|Bearer\s|eyJ[A-Za-z0-9_-]' `
+  -CaseSensitive:$false -Quiet
+if ($leakFound) { throw "Credential marker found in auth sync log" }
+
+$allowedField = '^(?:action|status|comparison|desktop_sha|remote_sha|desktop_bytes|remote_bytes)=[A-Za-z0-9_-]+$'
+Select-String -LiteralPath $logPath -Pattern 'action=' | Select-Object -Last 20 | ForEach-Object {
+  (($_.Line -split ' ') | Where-Object { $_ -match $allowedField }) -join ' '
+}
 ```
 
 For a real sync attempt, backup evidence can be inspected separately:
