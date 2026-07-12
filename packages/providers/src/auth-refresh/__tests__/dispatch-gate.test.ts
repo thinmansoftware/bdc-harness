@@ -32,7 +32,7 @@ function placeholderJwt(payload: Record<string, unknown>): string {
 function writeCodexCreds(
   lastRefresh: string,
   refreshToken = 'eyJ_REFRESH_PLACEHOLDER',
-  accessToken = 'eyJ_ACCESS_PLACEHOLDER'
+  accessToken: unknown = 'eyJ_ACCESS_PLACEHOLDER'
 ): void {
   fs.mkdirSync(path.dirname(codexCredsPath()), { recursive: true });
   fs.writeFileSync(
@@ -98,6 +98,43 @@ describe('checkCodexDispatchGate', () => {
 
     expect(result).toEqual({ fresh: false, reason: 'stale' });
     expect(softRefreshCodexMock).toHaveBeenCalledTimes(0);
+  });
+
+  test.each([
+    ['missing access token', null],
+    ['malformed three-segment JWT', 'HEADER_PLACEHOLDER.NOT_BASE64.SIGNATURE_PLACEHOLDER'],
+    ['JWT without a finite numeric exp', placeholderJwt({ exp: 'not-a-number' })],
+  ])('refuses %s despite recent last_refresh', async (_label, accessToken) => {
+    writeCodexCreds(
+      new Date(Date.now() - 60_000).toISOString(),
+      'REFRESH_PLACEHOLDER',
+      accessToken
+    );
+
+    const result = await checkCodexDispatchGate();
+
+    expect(result).toEqual({ fresh: false, reason: 'stale' });
+  });
+
+  test('allows a true opaque non-JWT token with recent last_refresh', async () => {
+    writeCodexCreds(
+      new Date(Date.now() - 60_000).toISOString(),
+      'REFRESH_PLACEHOLDER',
+      'OPAQUE_ACCESS_PLACEHOLDER'
+    );
+
+    const result = await checkCodexDispatchGate();
+
+    expect(result).toEqual({ fresh: true, reason: 'fresh' });
+  });
+
+  test('reports missing_refresh_token explicitly', async () => {
+    const accessToken = placeholderJwt({ exp: Math.floor(Date.now() / 1000) + 3600 });
+    writeCodexCreds(new Date().toISOString(), '', accessToken);
+
+    const result = await checkCodexDispatchGate();
+
+    expect(result).toEqual({ fresh: false, reason: 'missing_refresh_token' });
   });
 
   test('passes fresh auth without soft-refresh', async () => {

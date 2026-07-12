@@ -8,20 +8,29 @@ import { buildReauthMessage, isTerminalRefreshReason } from './shared.js';
 
 const FRESHNESS_BUFFER_MS = 60_000;
 
-function readJwtExpiresAt(accessToken: unknown): number | undefined {
-  if (typeof accessToken !== 'string') return undefined;
+type AccessTokenExpiryParse =
+  | { kind: 'opaque' }
+  | { kind: 'jwt'; expiresAt?: number }
+  | { kind: 'invalid' };
+
+function parseAccessTokenExpiry(accessToken: unknown): AccessTokenExpiryParse {
+  if (typeof accessToken !== 'string' || accessToken.length === 0) return { kind: 'invalid' };
   const segments = accessToken.split('.');
-  if (segments.length !== 3) return undefined;
+  if (segments.length !== 3) return { kind: 'opaque' };
 
   try {
     const payload = JSON.parse(Buffer.from(segments[1], 'base64url').toString('utf-8')) as {
       exp?: unknown;
     };
-    return typeof payload.exp === 'number' && Number.isFinite(payload.exp)
-      ? payload.exp * 1000
-      : undefined;
+    return {
+      kind: 'jwt',
+      expiresAt:
+        typeof payload.exp === 'number' && Number.isFinite(payload.exp)
+          ? payload.exp * 1000
+          : undefined,
+    };
   } catch {
-    return undefined;
+    return { kind: 'jwt' };
   }
 }
 
@@ -70,14 +79,19 @@ export function readCodexFreshness(filePath: string): FreshnessRead {
     return { hasCreds: true, hasRefreshToken: false };
   }
   const refreshToken = parsed.tokens?.refresh_token;
-  const jwtExpiresAt = readJwtExpiresAt(parsed.tokens?.access_token);
+  const accessTokenExpiry = parseAccessTokenExpiry(parsed.tokens?.access_token);
   const lastRefreshStr = parsed.last_refresh;
   const lastRefreshMs = lastRefreshStr ? new Date(lastRefreshStr).getTime() : NaN;
   const legacyExpiresAt =
     Number.isFinite(lastRefreshMs) && Date.now() - lastRefreshMs < 11 * 60 * 60 * 1000
       ? lastRefreshMs + 12 * 60 * 60 * 1000
       : undefined;
-  const expiresAt = jwtExpiresAt ?? legacyExpiresAt;
+  const expiresAt =
+    accessTokenExpiry.kind === 'jwt'
+      ? accessTokenExpiry.expiresAt
+      : accessTokenExpiry.kind === 'opaque'
+        ? legacyExpiresAt
+        : undefined;
   const fresh =
     expiresAt !== undefined && expiresAt > Date.now() + FRESHNESS_BUFFER_MS ? expiresAt : undefined;
   return {

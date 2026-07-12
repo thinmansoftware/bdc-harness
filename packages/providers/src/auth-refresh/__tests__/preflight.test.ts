@@ -230,6 +230,39 @@ describe('ensureFreshAuth (Codex)', () => {
     expect(refreshCodexMock).toHaveBeenCalledTimes(1);
   });
 
+  test.each([
+    ['missing access token', undefined],
+    ['malformed three-segment JWT', 'HEADER_PLACEHOLDER.NOT_BASE64.SIGNATURE_PLACEHOLDER'],
+    ['JWT without a finite numeric exp', placeholderJwt({ exp: null })],
+  ])('triggers refresh for %s despite recent last_refresh', async (_label, accessToken) => {
+    const recent = new Date(Date.now() - 60_000).toISOString();
+    writeCodexCreds(
+      recent,
+      {
+        tokens: {
+          id_token: 'ID_PLACEHOLDER',
+          access_token: accessToken,
+          refresh_token: 'REFRESH_PLACEHOLDER',
+          account_id: 'ACCT_PLACEHOLDER',
+        },
+      },
+      accessToken as string
+    );
+
+    await ensureFreshAuth('codex');
+
+    expect(refreshCodexMock).toHaveBeenCalledTimes(1);
+  });
+
+  test('allows a true opaque non-JWT token to use recent last_refresh', async () => {
+    const recent = new Date(Date.now() - 60_000).toISOString();
+    writeCodexCreds(recent, {}, 'OPAQUE_ACCESS_PLACEHOLDER');
+
+    await ensureFreshAuth('codex');
+
+    expect(refreshCodexMock).toHaveBeenCalledTimes(0);
+  });
+
   test('short-circuits when last_refresh is recent (<11h ago)', async () => {
     const recent = new Date(Date.now() - 60_000).toISOString(); // 1 min ago
     writeCodexCreds(recent);

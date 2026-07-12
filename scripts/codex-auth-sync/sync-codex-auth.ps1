@@ -128,8 +128,35 @@ function Get-ContainerMetadata {
 }
 
 function Invoke-VerifyProbe {
-  $probe = 'import("/app/packages/providers/src/auth-refresh/preflight.ts").then(m=>{const f=m.readCodexFreshness(process.argv[1]);if(!f.hasCreds||!f.hasRefreshToken)process.exit(2);console.log(JSON.stringify({hasCreds:f.hasCreds,hasRefreshToken:f.hasRefreshToken,fresh:Boolean(f.freshExpiresAt)}));}).catch(()=>process.exit(3))'
+  $probe = 'import("/app/packages/providers/src/auth-refresh/preflight.ts").then(m=>{const f=m.readCodexFreshness(process.argv[1]);if(!f.hasCreds||!f.hasRefreshToken||f.freshExpiresAt===undefined)process.exit(2);console.log(JSON.stringify({hasCreds:f.hasCreds,hasRefreshToken:f.hasRefreshToken,fresh:true}));}).catch(()=>process.exit(3))'
   Invoke-RemoteChecked -Command "docker exec $ContainerName bun -e '$probe' $ContainerAuthPath"
+}
+
+function Confirm-ReplacementCredential {
+  param(
+    [bool]$targetExisted,
+    [string]$backupPath,
+    [string]$restorePath,
+    [string]$comparison,
+    [string]$desktopHashPrefix,
+    [string]$remoteHashPrefix,
+    [int64]$desktopBytes,
+    [int64]$remoteBytes
+  )
+  try {
+    Invoke-VerifyProbe
+    return $true
+  } catch {
+    if ($targetExisted) {
+      Invoke-RemoteChecked -Command "docker exec $ContainerName cp -- $backupPath $restorePath"
+      Invoke-RemoteChecked -Command "docker exec $ContainerName chmod 600 $restorePath"
+      Invoke-RemoteChecked -Command "docker exec $ContainerName mv -f $restorePath $ContainerAuthPath"
+    } else {
+      Invoke-RemoteChecked -Command "docker exec $ContainerName rm -f $ContainerAuthPath"
+    }
+    Complete-Action -Action "failed" -Detail "status=verify_probe_failed comparison=$comparison desktop_sha=$desktopHashPrefix remote_sha=$remoteHashPrefix desktop_bytes=$desktopBytes remote_bytes=$remoteBytes" | Out-Null
+    return $false
+  }
 }
 
 Assert-SafeIdentifier -Name "SshAlias" -Value $SshAlias
@@ -183,17 +210,8 @@ try {
   Invoke-RemoteChecked -Command "docker exec $ContainerName chmod 600 $ContainerTempPath"
   Invoke-RemoteChecked -Command "docker exec $ContainerName mv -f $ContainerTempPath $ContainerAuthPath"
 
-  try {
-    Invoke-VerifyProbe
-  } catch {
-    if ($targetExisted) {
-      Invoke-RemoteChecked -Command "docker exec $ContainerName cp -- $backupPath $restorePath"
-      Invoke-RemoteChecked -Command "docker exec $ContainerName chmod 600 $restorePath"
-      Invoke-RemoteChecked -Command "docker exec $ContainerName mv -f $restorePath $ContainerAuthPath"
-    } else {
-      Invoke-RemoteChecked -Command "docker exec $ContainerName rm -f $ContainerAuthPath"
-    }
-    Complete-Action -Action "failed" -Detail "status=verify_probe_failed comparison=$comparison desktop_sha=$desktopHashPrefix remote_sha=$remoteHashPrefix desktop_bytes=$desktopBytes remote_bytes=$remoteBytes"
+  $replacementAccepted = Confirm-ReplacementCredential -TargetExisted $targetExisted -BackupPath $backupPath -RestorePath $restorePath -Comparison $comparison -DesktopHashPrefix $desktopHashPrefix -RemoteHashPrefix $remoteHashPrefix -DesktopBytes $desktopBytes -RemoteBytes $remoteBytes
+  if (-not $replacementAccepted) {
     exit 1
   }
 

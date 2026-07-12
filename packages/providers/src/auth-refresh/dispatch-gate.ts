@@ -21,6 +21,11 @@ function reasonForStale(hasCreds: boolean, hasRefreshToken: boolean): DispatchGa
 export async function checkCodexDispatchGate(): Promise<DispatchGateResult> {
   const filePath = getCodexCredentialsPath();
   const freshness = readCodexFreshness(filePath);
+  if (!freshness.hasCreds || !freshness.hasRefreshToken) {
+    const reason = reasonForStale(freshness.hasCreds, freshness.hasRefreshToken);
+    getLog().error({ fresh: false, reason }, 'codex_dispatch_gate_blocked');
+    return { fresh: false, reason };
+  }
   if (freshness.freshExpiresAt !== undefined) {
     getLog().debug(
       { fresh: true, freshExpiresAtISO: new Date(freshness.freshExpiresAt).toISOString() },

@@ -78,6 +78,22 @@ Invoke-Expression $functionAst.Extent.Text
     .join('\n');
 }
 
+function verifyProbeProgram(): string {
+  const match = script.match(/\$probe = '([^'\r\n]+)'/);
+  if (!match) throw new Error('Verify probe program not found');
+  const preflightUrl = new URL(
+    '../../packages/providers/src/auth-refresh/preflight.ts',
+    import.meta.url
+  ).href;
+  return match[1].replace('/app/packages/providers/src/auth-refresh/preflight.ts', preflightUrl);
+}
+
+function placeholderJwt(exp: number): string {
+  const encode = (value: Record<string, unknown>): string =>
+    Buffer.from(JSON.stringify(value)).toString('base64url');
+  return `${encode({ alg: 'none', typ: 'JWT' })}.${encode({ exp })}.SIGNATURE_PLACEHOLDER`;
+}
+
 afterEach(() => {
   for (const directory of tempDirectories.splice(0)) {
     rmSync(directory, { recursive: true, force: true });
@@ -158,6 +174,10 @@ describe('Codex auth sync static contract', () => {
     expect(script).toMatch(
       /else \{[\s\r\n]*Invoke-RemoteChecked -Command "docker exec \$ContainerName rm -f \$ContainerAuthPath"/
     );
+  });
+
+  test('requires the verification probe to report a fresh expiry', () => {
+    expect(script).toMatch(/!f\.hasCreds\|\|!f\.hasRefreshToken\|\|f\.freshExpiresAt===undefined/);
   });
 
   test('fixes the protected path, validates identifiers, and passes Bun data via argv', () => {
@@ -430,6 +450,70 @@ try {
 });
 
 describe('Codex auth sync local integration', () => {
+  test('verify probe exits nonzero for expired auth and zero for fresh auth', () => {
+    const directory = mkdtempSync(join(tmpdir(), 'codex-auth-probe-'));
+    tempDirectories.push(directory);
+    const authPath = join(directory, 'auth.json');
+    const writeAuth = (exp: number): void => {
+      writeFileSync(
+        authPath,
+        JSON.stringify({
+          tokens: {
+            access_token: placeholderJwt(exp),
+            refresh_token: 'REFRESH_PLACEHOLDER',
+          },
+          last_refresh: new Date().toISOString(),
+        }),
+        'ascii'
+      );
+    };
+
+    writeAuth(Math.floor(Date.now() / 1000) - 60);
+    const expired = spawnSync(process.execPath, ['-e', verifyProbeProgram(), authPath], {
+      encoding: 'utf8',
+    });
+    expect(expired.status).not.toBe(0);
+
+    writeAuth(Math.floor(Date.now() / 1000) + 3600);
+    const fresh = spawnSync(process.execPath, ['-e', verifyProbeProgram(), authPath], {
+      encoding: 'utf8',
+    });
+    expect(fresh.status).toBe(0);
+  });
+
+  test('a rejected replacement restores the prior credential and reports failed action', () => {
+    const directory = mkdtempSync(join(tmpdir(), 'codex-auth-rejected-replacement-'));
+    tempDirectories.push(directory);
+    const commandLog = join(directory, 'commands.txt');
+    const actionLog = join(directory, 'action.txt');
+    const command = `${functionExtractionPrelude(['Confirm-ReplacementCredential'])}
+function Invoke-VerifyProbe { throw 'expired replacement' }
+function Invoke-RemoteChecked {
+  param([string]$Command)
+  Add-Content -LiteralPath ${quotePowerShellLiteral(commandLog)} -Value $Command -Encoding ascii
+}
+function Complete-Action {
+  param([string]$Action, [string]$Detail)
+  "$Action $Detail" | Set-Content -LiteralPath ${quotePowerShellLiteral(actionLog)} -Encoding ascii
+}
+$ContainerName = 'archon-app-1'
+$ContainerAuthPath = '/root/.codex/auth.json'
+$accepted = Confirm-ReplacementCredential -TargetExisted $true -BackupPath '/root/.codex/auth.json.bak.test' -RestorePath '/root/.codex/auth.json.restore.test' -Comparison 'jwt_iat' -DesktopHashPrefix '11111111' -RemoteHashPrefix '22222222' -DesktopBytes 10 -RemoteBytes 9
+if ($accepted) { throw 'Rejected replacement was accepted' }
+`;
+
+    const result = runPowerShell(command);
+
+    expect(result.status).toBe(0);
+    expect(readFileSync(commandLog, 'ascii')).toContain(
+      'cp -- /root/.codex/auth.json.bak.test /root/.codex/auth.json.restore.test'
+    );
+    expect(readFileSync(commandLog, 'ascii')).toContain(
+      'mv -f /root/.codex/auth.json.restore.test /root/.codex/auth.json'
+    );
+    expect(readFileSync(actionLog, 'ascii')).toContain('failed status=verify_probe_failed');
+  });
+
   test('copies BOM and CRLF credential bytes to process stdin without hash changes', () => {
     const directory = mkdtempSync(join(tmpdir(), 'codex-auth-sync-'));
     tempDirectories.push(directory);
