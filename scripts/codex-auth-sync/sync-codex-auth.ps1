@@ -2,7 +2,6 @@ param(
   [string]$SshAlias = "hetzner-prod",
   [string]$DesktopAuthPath = "$env:USERPROFILE\.codex\auth.json",
   [string]$ContainerName = "archon-app-1",
-  [string]$ContainerAuthPath = "/root/.codex/auth.json",
   [string]$WebhookUrl = "https://n8n.bluedevilcollectibles.com/webhook/builder-status",
   [string]$LogPath = "$env:USERPROFILE\.codex\codex-auth-sync.log"
 )
@@ -13,6 +12,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 $WoId = "WO-HARNESS-CODEX-AUTH-SYNC-AND-FRESHNESS-GATE-01"
+$ContainerAuthPath = "/root/.codex/auth.json"
 $ContainerTempPath = "/root/.codex/auth.json.tmp.sync"
 
 function Write-RedactedLog {
@@ -47,6 +47,13 @@ function Complete-Action {
   Send-BuilderStatus -Action $Action -Detail $Detail
 }
 
+function Assert-SafeIdentifier {
+  param([string]$Name, [string]$Value)
+  if ([string]::IsNullOrWhiteSpace($Value) -or $Value -notmatch "^[A-Za-z0-9][A-Za-z0-9._-]*$") {
+    throw "$Name contains unsupported characters"
+  }
+}
+
 function Invoke-RemoteText {
   param([string]$Command)
   $output = & ssh $SshAlias $Command
@@ -62,6 +69,32 @@ function Invoke-RemoteChecked {
   if ($LASTEXITCODE -ne 0) {
     throw "ssh command failed exit=$LASTEXITCODE"
   }
+}
+
+function Invoke-BinaryRedirectedCommand {
+  param([string]$FileName, [string]$Arguments, [string]$InputPath)
+  if ($FileName -match '["%&|<>^!]' -or $InputPath -match '["%&|<>^!]') {
+    throw "binary redirect path contains unsupported characters"
+  }
+
+  $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+  $startInfo.FileName = $env:ComSpec
+  $startInfo.Arguments = "/d /s /c `"`"$FileName`" $Arguments < `"$InputPath`"`""
+  $startInfo.UseShellExecute = $false
+  $startInfo.CreateNoWindow = $true
+
+  $process = New-Object System.Diagnostics.Process
+  $process.StartInfo = $startInfo
+  if (-not $process.Start()) { throw "binary redirect process failed to start" }
+  $process.WaitForExit()
+  if ($process.ExitCode -ne 0) {
+    throw "binary redirect process failed exit=$($process.ExitCode)"
+  }
+}
+
+function Send-FileToRemoteCommand {
+  param([string]$Path, [string]$Command)
+  Invoke-BinaryRedirectedCommand -FileName "ssh.exe" -Arguments "$SshAlias `"$Command`"" -InputPath $Path
 }
 
 function Get-LocalJwtIssuedAtSeconds {
@@ -88,19 +121,19 @@ function Get-LocalSha256 {
 }
 
 function Get-ContainerMetadata {
-  $command = @"
-docker exec $ContainerName bun -e "import {readFileSync,statSync} from 'node:fs';import {createHash} from 'node:crypto';const p='$ContainerAuthPath';try{const raw=readFileSync(p);const stat=statSync(p);const json=JSON.parse(raw.toString('utf8'));const token=json?.tokens?.access_token;let iat=null;if(typeof token==='string'){const parts=token.split('.');if(parts.length===3){try{const payload=JSON.parse(Buffer.from(parts[1],'base64url').toString('utf8'));if(Number.isFinite(payload.iat))iat=Math.trunc(payload.iat);}catch{}}}console.log(JSON.stringify({exists:true,sha256:createHash('sha256').update(raw).digest('hex'),bytes:raw.length,mtimeSeconds:Math.trunc(stat.mtimeMs/1000),iat}));}catch{console.log(JSON.stringify({exists:false,sha256:'',bytes:0,mtimeSeconds:null,iat:null}));}"
-"@
-  $raw = Invoke-RemoteText -Command $command.Trim()
+  $program = 'import {readFileSync,statSync} from "node:fs";import {createHash} from "node:crypto";const p=process.argv[1];try{const raw=readFileSync(p);const stat=statSync(p);const json=JSON.parse(raw.toString("utf8"));const token=json?.tokens?.access_token;let iat=null;if(typeof token==="string"){const parts=token.split(".");if(parts.length===3){try{const payload=JSON.parse(Buffer.from(parts[1],"base64url").toString("utf8"));if(Number.isFinite(payload.iat))iat=Math.trunc(payload.iat);}catch{}}}console.log(JSON.stringify({exists:true,sha256:createHash("sha256").update(raw).digest("hex"),bytes:raw.length,mtimeSeconds:Math.trunc(stat.mtimeMs/1000),iat}));}catch(error){if(error?.code==="ENOENT"){console.log(JSON.stringify({exists:false,sha256:"",bytes:0,mtimeSeconds:null,iat:null}));}else{process.exit(4);}}'
+  $command = "docker exec $ContainerName bun -e '$program' $ContainerAuthPath"
+  $raw = Invoke-RemoteText -Command $command
   return $raw | ConvertFrom-Json
 }
 
 function Invoke-VerifyProbe {
-  $probe = @"
-docker exec $ContainerName bun -e "import('/app/packages/providers/src/auth-refresh/preflight.ts').then(m=>{const f=m.readCodexFreshness('$ContainerAuthPath');if(!f.hasCreds||!f.hasRefreshToken)process.exit(2);console.log(JSON.stringify({hasCreds:f.hasCreds,hasRefreshToken:f.hasRefreshToken,fresh:Boolean(f.freshExpiresAt)}));}).catch(()=>process.exit(3))"
-"@
-  Invoke-RemoteChecked -Command $probe.Trim()
+  $probe = 'import("/app/packages/providers/src/auth-refresh/preflight.ts").then(m=>{const f=m.readCodexFreshness(process.argv[1]);if(!f.hasCreds||!f.hasRefreshToken)process.exit(2);console.log(JSON.stringify({hasCreds:f.hasCreds,hasRefreshToken:f.hasRefreshToken,fresh:Boolean(f.freshExpiresAt)}));}).catch(()=>process.exit(3))'
+  Invoke-RemoteChecked -Command "docker exec $ContainerName bun -e '$probe' $ContainerAuthPath"
 }
+
+Assert-SafeIdentifier -Name "SshAlias" -Value $SshAlias
+Assert-SafeIdentifier -Name "ContainerName" -Value $ContainerName
 
 try {
   if (-not (Test-Path -LiteralPath $DesktopAuthPath)) {
@@ -112,6 +145,7 @@ try {
   $desktopBytes = (Get-Item -LiteralPath $DesktopAuthPath).Length
   $desktopIssuedAtSeconds = Get-LocalJwtIssuedAtSeconds -Path $DesktopAuthPath
   $containerMetadata = Get-ContainerMetadata
+  $targetExisted = [bool]$containerMetadata.exists
   $remoteHash = [string]$containerMetadata.sha256
   $remoteBytes = [int64]$containerMetadata.bytes
   $remoteIssuedAtSeconds = if ($null -ne $containerMetadata.iat) { [int64]$containerMetadata.iat } else { $null }
@@ -140,18 +174,25 @@ try {
 
   $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
   $backupPath = "$ContainerAuthPath.bak.$stamp"
-  Invoke-RemoteChecked -Command "docker exec $ContainerName sh -c `"if [ -f '$ContainerAuthPath' ]; then cp '$ContainerAuthPath' '$backupPath'; fi`""
+  $restorePath = "$ContainerAuthPath.restore.$stamp"
+  if ($targetExisted) {
+    Invoke-RemoteChecked -Command "docker exec $ContainerName cp -- $ContainerAuthPath $backupPath"
+  }
 
-  Get-Content -Raw -LiteralPath $DesktopAuthPath |
-    & ssh $SshAlias "docker exec -i $ContainerName sh -c `"umask 077; cat > $ContainerTempPath`"" | Out-Null
-  if ($LASTEXITCODE -ne 0) { throw "credential stream failed exit=$LASTEXITCODE" }
-
-  Invoke-RemoteChecked -Command "docker exec $ContainerName sh -c `"chmod 600 $ContainerTempPath && mv $ContainerTempPath $ContainerAuthPath`""
+  Send-FileToRemoteCommand -Path $DesktopAuthPath -Command "docker exec -i $ContainerName dd of=$ContainerTempPath status=none"
+  Invoke-RemoteChecked -Command "docker exec $ContainerName chmod 600 $ContainerTempPath"
+  Invoke-RemoteChecked -Command "docker exec $ContainerName mv -f $ContainerTempPath $ContainerAuthPath"
 
   try {
     Invoke-VerifyProbe
   } catch {
-    Invoke-RemoteChecked -Command "docker exec $ContainerName sh -c `"if [ -f '$backupPath' ]; then cp '$backupPath' '$ContainerAuthPath' && chmod 600 '$ContainerAuthPath'; fi`""
+    if ($targetExisted) {
+      Invoke-RemoteChecked -Command "docker exec $ContainerName cp -- $backupPath $restorePath"
+      Invoke-RemoteChecked -Command "docker exec $ContainerName chmod 600 $restorePath"
+      Invoke-RemoteChecked -Command "docker exec $ContainerName mv -f $restorePath $ContainerAuthPath"
+    } else {
+      Invoke-RemoteChecked -Command "docker exec $ContainerName rm -f $ContainerAuthPath"
+    }
     Complete-Action -Action "failed" -Detail "status=verify_probe_failed comparison=$comparison desktop_sha=$desktopHashPrefix remote_sha=$remoteHashPrefix desktop_bytes=$desktopBytes remote_bytes=$remoteBytes"
     exit 1
   }
