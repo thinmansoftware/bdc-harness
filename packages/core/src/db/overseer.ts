@@ -1,13 +1,12 @@
 import { randomUUID } from 'crypto';
 import { getDatabase } from './connection';
-import type { WorkflowRunStatus } from '@archon/workflows/schemas/workflow-run';
 
 export interface OverseerWatchRun {
   id: string;
   woId: string;
   repo: string;
   owner: string;
-  status: WorkflowRunStatus | string;
+  status: string;
   headBranch?: string;
   metadata: Record<string, unknown>;
 }
@@ -46,7 +45,8 @@ interface WorkflowEventRow {
 }
 
 function parseObject(value: unknown): Record<string, unknown> {
-  if (value && typeof value === 'object' && !Array.isArray(value)) return value as Record<string, unknown>;
+  if (value && typeof value === 'object' && !Array.isArray(value))
+    return value as Record<string, unknown>;
   if (typeof value !== 'string') return {};
   try {
     const parsed = JSON.parse(value) as unknown;
@@ -69,14 +69,16 @@ function stringField(metadata: Record<string, unknown>, keys: string[]): string 
 function parseWoId(metadata: Record<string, unknown>, userMessage: string): string {
   return (
     stringField(metadata, ['woId', 'wo_id', 'WO_ID']) ??
-    userMessage.match(/\bWO-[A-Z0-9-]+\b/)?.[0] ??
+    /\bWO-[A-Z0-9-]+\b/.exec(userMessage)?.[0] ??
     'unknown'
   );
 }
 
 function parseRepo(metadata: Record<string, unknown>): { owner: string; repo: string } {
   const target = stringField(metadata, ['targetRepo', 'target_repo', 'repository', 'repo']) ?? '';
-  const [owner, repo] = target.includes('/') ? target.split('/').slice(-2) : ['bluedevilcollectibles', target];
+  const [owner, repo] = target.includes('/')
+    ? target.split('/').slice(-2)
+    : ['bluedevilcollectibles', target];
   return {
     owner: owner || 'bluedevilcollectibles',
     repo: repo || 'bdc-harness',
@@ -153,7 +155,7 @@ export async function insertOverseerAction(record: {
 
 export async function getOverseerActionsForRun(runId: string): Promise<OverseerAction[]> {
   const result = await getDatabase().query<OverseerAction>(
-    `SELECT * FROM overseer_actions WHERE run_id = $1 ORDER BY created_at ASC`,
+    'SELECT * FROM overseer_actions WHERE run_id = $1 ORDER BY created_at ASC',
     [runId]
   );
   return [...result.rows];

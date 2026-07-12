@@ -18,14 +18,15 @@ function isTerminalStatus(status: string): status is WorkflowRunStatus {
 }
 
 function newestEvent(events: OverseerWorkflowEvent[]): OverseerWorkflowEvent | undefined {
-  return [...events].sort((a, b) => String(a.created_at ?? '').localeCompare(String(b.created_at ?? ''))).at(-1);
+  return [...events].sort((a, b) => (a.created_at ?? '').localeCompare(b.created_at ?? '')).at(-1);
 }
 
 function eventMessage(event: OverseerWorkflowEvent | undefined): string {
   if (!event) return '';
   const data = event.data;
   const candidates = [data.error, data.message, data.stderr, data.output, data.reason];
-  return candidates.find(value => typeof value === 'string') as string | undefined ?? JSON.stringify(data);
+  const found = candidates.find(value => typeof value === 'string');
+  return typeof found === 'string' ? found : JSON.stringify(data);
 }
 
 async function assessRun(
@@ -126,10 +127,10 @@ export async function watchLoop(
   options: { intervalMs?: number; once?: boolean } = {}
 ): Promise<void> {
   const intervalMs = options.intervalMs ?? DEFAULT_WATCH_INTERVAL_MS;
-  do {
+  for (;;) {
     const records = await watchOnce(deps);
     for (const record of records) await onRecord(record);
     if (options.once) return;
     await new Promise(resolve => setTimeout(resolve, intervalMs));
-  } while (true);
+  }
 }

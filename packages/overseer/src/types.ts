@@ -1,7 +1,7 @@
 import type { DecisionResult } from './decide.ts';
 import type { ErrorClass } from './classify.ts';
 
-export type WatchedRunStatus = 'completed' | 'failed' | 'escalated' | 'cancelled' | string;
+export type WatchedRunStatus = string;
 
 export interface OverseerRunRecord {
   id: string;
@@ -27,7 +27,7 @@ export interface PullRequestRef {
   number: number;
 }
 
-export type PullRequestState = 'open' | 'closed' | 'merged' | 'missing' | string;
+export type PullRequestState = string;
 
 export interface PullRequestCheckSummary {
   total: number;
@@ -89,5 +89,7 @@ export interface GitHubPullRequestMergeInput extends PullRequestRef {
 
 export interface GitHubClientDeps {
   findPullRequest(input: GitHubPullRequestSearchInput): Promise<PullRequestEvidence>;
-  mergePullRequest(input: GitHubPullRequestMergeInput): Promise<{ merged: boolean; message?: string }>;
+  mergePullRequest(
+    input: GitHubPullRequestMergeInput
+  ): Promise<{ merged: boolean; message?: string }>;
 }

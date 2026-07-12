@@ -78,7 +78,7 @@ async function handleRecord(
   await deps.insertOverseerAction({
     runId: record.runId,
     woId: record.woId,
-    class: String(record.errorClass),
+    class: record.errorClass,
     action: 'escalate',
     result: record.reason,
   });
@@ -103,11 +103,11 @@ function createDefaultDeps(): OverseerRunStoreDeps & OverseerActionsDeps & GitHu
   return {
     listRunsForWatch: listRunsForOverseerWatch,
     listRunEvents: listRunEventsForOverseer,
-    insertOverseerAction: async record => {
+    insertOverseerAction: async (record): Promise<void> => {
       await insertOverseerAction(record);
     },
     findPullRequest: input => findPullRequest(octokit, input),
-    mergePullRequest: async input => {
+    mergePullRequest: async (input): Promise<{ merged: boolean; message?: string }> => {
       const response = await octokit.pulls.merge({
         owner: input.owner,
         repo: input.repo,
@@ -136,7 +136,10 @@ async function findPullRequest(
   const pr =
     candidates.data.find(candidate => {
       if (input.headBranch && candidate.head.ref === input.headBranch) return true;
-      return Boolean(input.woId && (candidate.title.includes(input.woId) || candidate.head.ref.includes(input.woId)));
+      return Boolean(
+        input.woId &&
+        (candidate.title.includes(input.woId) || candidate.head.ref.includes(input.woId))
+      );
     }) ?? null;
 
   if (!pr) {
@@ -159,8 +162,13 @@ async function findPullRequest(
     ref: pr.head.sha,
   });
   const runs = checks.data.check_runs;
-  const failed = runs.filter(run => ['failure', 'cancelled', 'timed_out', 'action_required'].includes(String(run.conclusion))).length;
-  const passed = runs.filter(run => run.conclusion === 'success' || run.conclusion === 'neutral' || run.conclusion === 'skipped').length;
+  const failed = runs.filter(run =>
+    ['failure', 'cancelled', 'timed_out', 'action_required'].includes(String(run.conclusion))
+  ).length;
+  const passed = runs.filter(
+    run =>
+      run.conclusion === 'success' || run.conclusion === 'neutral' || run.conclusion === 'skipped'
+  ).length;
   const pending = runs.length - failed - passed;
   return {
     exists: true,
