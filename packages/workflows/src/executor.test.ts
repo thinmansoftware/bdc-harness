@@ -3,7 +3,7 @@
  * Covers concurrent-run guards, model/provider resolution, and resume logic
  * that the inner dag-executor.test.ts cannot reach.
  */
-import { describe, it, expect, mock, beforeEach } from 'bun:test';
+import { describe, it, expect, mock, beforeEach, afterEach } from 'bun:test';
 import { mkdir, mkdtemp, rm, writeFile } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join } from 'path';
@@ -753,6 +753,86 @@ describe('executeWorkflow', () => {
           'db-conv-1'
         )
       ).rejects.toThrow(/unknown provider 'claud'/);
+    });
+  });
+
+  describe('canary probe Telegram alerts', () => {
+    const originalFetch = globalThis.fetch;
+    const originalToken = process.env.TELEGRAM_BOT_TOKEN;
+
+    function providerThatThrows(error: Error) {
+      return {
+        getType: () => 'claude',
+        getCapabilities: () => ({}),
+        sendQuery: async function* () {
+          throw error;
+        },
+      };
+    }
+
+    afterEach(() => {
+      globalThis.fetch = originalFetch;
+      if (originalToken === undefined) delete process.env.TELEGRAM_BOT_TOKEN;
+      else process.env.TELEGRAM_BOT_TOKEN = originalToken;
+    });
+
+    it('pages Telegram for canary probe warnings', async () => {
+      process.env.TELEGRAM_BOT_TOKEN = 'test-token';
+      const fetchCalls: RequestInit[] = [];
+      globalThis.fetch = mock(async (_url: string | URL | Request, init?: RequestInit) => {
+        if (init) fetchCalls.push(init);
+        return new Response('{}', { status: 200 });
+      }) as unknown as typeof fetch;
+      const err = Object.assign(new Error('bad request'), { httpStatus: 400 });
+      const deps = {
+        ...makeDeps(),
+        getAgentProvider: mock(() => providerThatThrows(err)),
+      } as unknown as WorkflowDeps;
+
+      await executeWorkflow(
+        deps,
+        makePlatform(),
+        'conv-1',
+        '/tmp',
+        makeWorkflow(),
+        'test message',
+        'db-conv-1'
+      );
+
+      const body = JSON.parse(String(fetchCalls[0]?.body)) as { text: string };
+      expect(body.text).toContain('[CANARY PROBE WARN]');
+      expect(body.text).toContain('unknown_400');
+    });
+
+    it('pages Telegram for canary probe red blocks', async () => {
+      process.env.TELEGRAM_BOT_TOKEN = 'test-token';
+      const fetchCalls: RequestInit[] = [];
+      globalThis.fetch = mock(async (_url: string | URL | Request, init?: RequestInit) => {
+        if (init) fetchCalls.push(init);
+        return new Response('{}', { status: 200 });
+      }) as unknown as typeof fetch;
+      const err = Object.assign(new Error('model is not supported'), { httpStatus: 400 });
+      const store = makeStore();
+      const deps = {
+        ...makeDeps(store),
+        getAgentProvider: mock(() => providerThatThrows(err)),
+      } as unknown as WorkflowDeps;
+
+      const result = await executeWorkflow(
+        deps,
+        makePlatform(),
+        'conv-1',
+        '/tmp',
+        makeWorkflow(),
+        'test message',
+        'db-conv-1'
+      );
+
+      const body = JSON.parse(String(fetchCalls[0]?.body)) as { text: string };
+      expect(result.success).toBe(false);
+      expect(body.text).toContain('[CANARY PROBE RED]');
+      expect(body.text).toContain('structural_model_not_supported');
+      expect(mockExecuteDagWorkflow).not.toHaveBeenCalled();
     });
   });
 

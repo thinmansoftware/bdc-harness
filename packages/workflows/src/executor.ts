@@ -24,12 +24,25 @@ import {
 } from './reliability/run-authority';
 import { captureRuntimeRevisions } from './reliability/runtime-revisions';
 import { formatProbeBlock, runFireTimeProbe } from './reliability/fire-time-probe';
+import {
+  renderCanaryProbeRed,
+  renderCanaryProbeWarn,
+  sendCanaryTelegramAlert,
+} from './reliability/canary-telegram-alert';
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
 let cachedLog: ReturnType<typeof createLogger> | undefined;
 function getLog(): ReturnType<typeof createLogger> {
   if (!cachedLog) cachedLog = createLogger('workflow.executor');
   return cachedLog;
+}
+
+async function pageCanaryTelegram(text: string, context: Record<string, unknown>): Promise<void> {
+  try {
+    await sendCanaryTelegramAlert(text);
+  } catch (err) {
+    getLog().error({ err: err as Error, ...context }, 'workflow.canary_telegram_alert_failed');
+  }
 }
 
 /** Context for platform message sending */
@@ -913,6 +926,20 @@ export async function executeWorkflow(
     });
     for (const warning of probeDecision.warnings) {
       if (!warning.ok) {
+        await pageCanaryTelegram(
+          renderCanaryProbeWarn({
+            workflowName: executableWorkflow.name,
+            providerId: warning.binding.providerId,
+            modelId: warning.binding.modelId,
+            errorClass: warning.classification.errorClass,
+          }),
+          {
+            workflowName: executableWorkflow.name,
+            providerId: warning.binding.providerId,
+            modelId: warning.binding.modelId,
+            errorClass: warning.classification.errorClass,
+          }
+        );
         getLog().warn(
           {
             workflowName: executableWorkflow.name,
@@ -927,6 +954,22 @@ export async function executeWorkflow(
     }
     if (probeDecision.blocked) {
       const reason = formatProbeBlock(probeDecision);
+      if (probeDecision.blockedResult && !probeDecision.blockedResult.ok) {
+        await pageCanaryTelegram(
+          renderCanaryProbeRed({
+            workflowName: executableWorkflow.name,
+            providerId: probeDecision.blockedResult.binding.providerId,
+            modelId: probeDecision.blockedResult.binding.modelId,
+            errorClass: probeDecision.blockedResult.classification.errorClass,
+          }),
+          {
+            workflowName: executableWorkflow.name,
+            providerId: probeDecision.blockedResult.binding.providerId,
+            modelId: probeDecision.blockedResult.binding.modelId,
+            errorClass: probeDecision.blockedResult.classification.errorClass,
+          }
+        );
+      }
       await deps.store
         .createWorkflowEvent({
           workflow_run_id: workflowRun.id,
