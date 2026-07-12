@@ -11,6 +11,13 @@ export const loopNodeConfigSchema = z
     until: z.string().min(1, "loop node requires 'loop.until' (completion signal string)"),
     /** Maximum iterations allowed; exceeding this fails the node. */
     max_iterations: z.number().int().positive("'loop.max_iterations' must be a positive integer"),
+    /** Absolute wall-clock cap for each loop iteration, in milliseconds. */
+    wall_timeout_ms: z
+      .number()
+      .int("'loop.wall_timeout_ms' must be an integer")
+      .min(60000, "'loop.wall_timeout_ms' must be at least 60000")
+      .max(3600000, "'loop.wall_timeout_ms' must be at most 3600000")
+      .optional(),
     /** Whether to start fresh session each iteration (default: true). */
     fresh_context: z.boolean().default(true),
     /** Optional bash script run after each iteration; exit 0 = complete. */

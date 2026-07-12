@@ -54,9 +54,12 @@ export function resolveLoopIterationIdleTimeoutMs(nodeOverride?: number): number
 }
 
 /**
- * Resolve per-iteration wall timeout at call time (env-overridable).
+ * Resolve per-iteration wall timeout at call time (node/env-overridable).
  */
-export function resolveLoopIterationWallTimeoutMs(): number {
+export function resolveLoopIterationWallTimeoutMs(nodeOverride?: number): number {
+  if (nodeOverride != null && Number.isFinite(nodeOverride) && nodeOverride > 0) {
+    return nodeOverride;
+  }
   const fromEnv = Number.parseInt(process.env.ARCHON_LOOP_ITERATION_WALL_MS ?? '', 10);
   if (Number.isFinite(fromEnv) && fromEnv > 0) return fromEnv;
   return LOOP_ITERATION_WALL_TIMEOUT_MS;

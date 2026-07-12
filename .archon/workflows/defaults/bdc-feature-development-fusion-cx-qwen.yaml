@@ -353,6 +353,7 @@ nodes:
     depends_on: [capture-run-scope]
     task_class: medium_work
     loop:
+      wall_timeout_ms: 1800000
       prompt: |
         Implement the approved plan for this BDC feature Work Order.
 

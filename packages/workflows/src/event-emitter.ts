@@ -220,6 +220,21 @@ interface NodeFailoverEvent {
   errorClass: string;
 }
 
+/**
+ * WO-HARNESS-IMPLEMENT-WALL-TIMEOUT-HONEST-01: a loop iteration breached its
+ * absolute wall-clock cap. Attempt 1 is retried once; attempt 2 is terminal.
+ */
+interface NodeWallBreachEvent {
+  type: 'node_wall_breach';
+  runId: string;
+  nodeId: string;
+  iteration: number;
+  elapsedMs: number;
+  wallMs: number;
+  rung: string;
+  attempt: 1 | 2;
+}
+
 interface NodeSkippedEvent {
   type: 'node_skipped';
   runId: string;
@@ -276,6 +291,7 @@ export type WorkflowEmitterEvent =
   | NodeCompletedWithWarningEvent
   | NodeFailedEvent
   | NodeFailoverEvent
+  | NodeWallBreachEvent
   | NodeSkippedEvent
   | WorkflowArtifactEvent
   | ToolStartedEvent

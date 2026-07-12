@@ -1627,6 +1627,82 @@ nodes:
       expect(result.errors[0].error).toMatch(/idle_timeout.*finite.*positive/i);
     });
 
+    it('should parse loop wall_timeout_ms', async () => {
+      const workflowDir = join(testDir, '.archon', 'workflows');
+      await mkdir(workflowDir, { recursive: true });
+
+      await writeFile(
+        join(workflowDir, 'loop-wall-timeout.yaml'),
+        `
+name: loop-wall-timeout
+description: Loop node with wall timeout
+nodes:
+  - id: implement
+    loop:
+      prompt: "do work"
+      until: "COMPLETE"
+      max_iterations: 2
+      wall_timeout_ms: 120000
+`
+      );
+
+      const result = await discoverWorkflows(testDir, { loadDefaults: false });
+      expect(result.errors).toHaveLength(0);
+      const wf = result.workflows[0].workflow;
+      expect(wf.nodes).toBeDefined();
+      if (isLoopNode(wf.nodes[0])) {
+        expect(wf.nodes[0].loop.wall_timeout_ms).toBe(120000);
+      }
+    });
+
+    it('should reject loop wall_timeout_ms below minimum', async () => {
+      const workflowDir = join(testDir, '.archon', 'workflows');
+      await mkdir(workflowDir, { recursive: true });
+
+      await writeFile(
+        join(workflowDir, 'bad-loop-wall-timeout-low.yaml'),
+        `
+name: bad-loop-wall-timeout-low
+description: Invalid loop wall timeout
+nodes:
+  - id: implement
+    loop:
+      prompt: "do work"
+      until: "COMPLETE"
+      max_iterations: 2
+      wall_timeout_ms: 10
+`
+      );
+
+      const result = await discoverWorkflows(testDir, { loadDefaults: false });
+      expect(result.errors).toHaveLength(1);
+      expect(result.errors[0].error).toMatch(/wall_timeout_ms.*60000/i);
+    });
+
+    it('should reject loop wall_timeout_ms above maximum', async () => {
+      const workflowDir = join(testDir, '.archon', 'workflows');
+      await mkdir(workflowDir, { recursive: true });
+
+      await writeFile(
+        join(workflowDir, 'bad-loop-wall-timeout-high.yaml'),
+        `
+name: bad-loop-wall-timeout-high
+description: Invalid loop wall timeout
+nodes:
+  - id: implement
+    loop:
+      prompt: "do work"
+      until: "COMPLETE"
+      max_iterations: 2
+      wall_timeout_ms: 3600001
+`
+      );
+
+      const result = await discoverWorkflows(testDir, { loadDefaults: false });
+      expect(result.errors).toHaveLength(1);
+      expect(result.errors[0].error).toMatch(/wall_timeout_ms.*3600000/i);
+    });
+
     it('should ignore AI-specific fields on bash nodes (parses successfully, fields stripped)', async () => {
       const workflowDir = join(testDir, '.archon', 'workflows');
       await mkdir(workflowDir, { recursive: true });
