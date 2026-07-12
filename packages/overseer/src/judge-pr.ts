@@ -27,5 +27,10 @@ export function isPrGreen(evidence: PullRequestEvidence): boolean {
 }
 
 export function isPrMergeReady(evidence: PullRequestEvidence): boolean {
-  return evidence.exists && evidence.state === 'open' && evidence.mergeable === true && isPrGreen(evidence);
+  return (
+    evidence.exists &&
+    evidence.state === 'open' &&
+    evidence.mergeable === true &&
+    isPrGreen(evidence)
+  );
 }

@@ -150,7 +150,9 @@ async function emitDispatchRunReport(
   const body = buildDispatchRunReportBody(context, decision, runId, timestamp);
   const assessment = assessDispatchMessageBody('run_report', body);
   if (!assessment.allowed) {
-    throw new Error(`dispatch-content-guard rejected run_report: ${assessment.reason ?? 'unknown'}`);
+    throw new Error(
+      `dispatch-content-guard rejected run_report: ${assessment.reason ?? 'unknown'}`
+    );
   }
   await createMessage({
     correlation_id: runId,

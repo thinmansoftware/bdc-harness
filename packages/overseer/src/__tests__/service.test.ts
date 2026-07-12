@@ -96,7 +96,11 @@ describe('service', () => {
     }
 
     expect(JSON.parse(lines[0])).toEqual(
-      expect.objectContaining({ runId: 'run-dry', class: 'tail_node_false_fail', action: 'dry_run' })
+      expect.objectContaining({
+        runId: 'run-dry',
+        class: 'tail_node_false_fail',
+        action: 'dry_run',
+      })
     );
     expect(mergePullRequest).not.toHaveBeenCalled();
     expect(insertOverseerAction).not.toHaveBeenCalled();
