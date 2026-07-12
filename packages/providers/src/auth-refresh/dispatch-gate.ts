@@ -1,5 +1,4 @@
 import { createLogger } from '@archon/paths';
-import { softRefreshCodex } from '../codex/soft-refresh.js';
 import { getCodexCredentialsPath, readCodexFreshness } from './preflight.js';
 
 export interface DispatchGateResult {
@@ -21,32 +20,21 @@ function reasonForStale(hasCreds: boolean, hasRefreshToken: boolean): DispatchGa
 
 export async function checkCodexDispatchGate(): Promise<DispatchGateResult> {
   const filePath = getCodexCredentialsPath();
-  const before = readCodexFreshness(filePath);
-  if (before.freshExpiresAt !== undefined) {
+  const freshness = readCodexFreshness(filePath);
+  if (!freshness.hasCreds || !freshness.hasRefreshToken) {
+    const reason = reasonForStale(freshness.hasCreds, freshness.hasRefreshToken);
+    getLog().error({ fresh: false, reason }, 'codex_dispatch_gate_blocked');
+    return { fresh: false, reason };
+  }
+  if (freshness.freshExpiresAt !== undefined) {
     getLog().debug(
-      { fresh: true, freshExpiresAtISO: new Date(before.freshExpiresAt).toISOString() },
+      { fresh: true, freshExpiresAtISO: new Date(freshness.freshExpiresAt).toISOString() },
       'codex_dispatch_gate_fresh'
     );
     return { fresh: true, reason: 'fresh' };
   }
 
-  const reason = reasonForStale(before.hasCreds, before.hasRefreshToken);
-  getLog().warn({ fresh: false, reason }, 'codex_dispatch_gate_soft_refresh_attempt');
-
-  const advanced = await softRefreshCodex();
-  const after = readCodexFreshness(filePath);
-  if (advanced && after.freshExpiresAt !== undefined) {
-    getLog().info(
-      { fresh: true, freshExpiresAtISO: new Date(after.freshExpiresAt).toISOString() },
-      'codex_dispatch_gate_refreshed'
-    );
-    return { fresh: true, reason: 'fresh' };
-  }
-
-  const postReason = reasonForStale(after.hasCreds, after.hasRefreshToken);
-  getLog().error(
-    { fresh: false, reason: postReason, softRefreshAdvanced: advanced },
-    'codex_dispatch_gate_blocked'
-  );
-  return { fresh: false, reason: postReason };
+  const reason = reasonForStale(freshness.hasCreds, freshness.hasRefreshToken);
+  getLog().error({ fresh: false, reason }, 'codex_dispatch_gate_blocked');
+  return { fresh: false, reason };
 }
