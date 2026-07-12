@@ -812,30 +812,30 @@ async function handleWorkflowCommand(
         'cmd.workflow_run_invoked'
       );
 
-      if (codebase) {
+      if (workflowCwd === codebase?.default_cwd) {
         try {
-          const isManagedClone = codebase.default_cwd
+          const isManagedClone = workflowCwd
             .replace(/\\/g, '/')
             .startsWith(getArchonWorkspacesPath().replace(/\\/g, '/'));
-          const syncResult = await syncWorkspace(toRepoPath(codebase.default_cwd), undefined, {
+          const syncResult = await syncWorkspace(toRepoPath(workflowCwd), undefined, {
             resetAfterFetch: isManagedClone,
           });
           getLog().debug(
             {
               codebaseId: codebase.id,
-              repoPath: codebase.default_cwd,
+              repoPath: workflowCwd,
               isManagedClone,
               ...syncResult,
             },
             'cmd.workspace_sync_completed'
           );
         } catch (error) {
-          const cloneHeadSha = await getCurrentHeadSha(codebase.default_cwd);
+          const cloneHeadSha = await getCurrentHeadSha(workflowCwd);
           getLog().warn(
             {
               err: error as Error,
               codebaseId: codebase.id,
-              repoPath: codebase.default_cwd,
+              repoPath: workflowCwd,
               cloneHeadSha,
             },
             'cmd.workspace_sync_failed'

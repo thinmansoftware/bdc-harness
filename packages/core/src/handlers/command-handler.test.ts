@@ -1621,6 +1621,33 @@ describe('CommandHandler', () => {
         expect(order).toEqual(['sync', 'discover']);
       });
 
+      test('should discover workflow from conversation worktree without persistent-clone sync when cwd diverges', async () => {
+        const worktreeConversation: Conversation = {
+          ...conversationWithCodebase,
+          cwd: '/workspace/test-repo/worktrees/feature-branch',
+        };
+        const order: string[] = [];
+        spyDiscoverWorkflows.mockImplementationOnce(async () => {
+          order.push('discover');
+          return {
+            workflows: [
+              makeTestWorkflowWithSource({ name: 'test-workflow', description: 'A test workflow' }),
+            ],
+            errors: [],
+          };
+        });
+
+        const result = await handleCommand(worktreeConversation, '/workflow run test-workflow');
+
+        expect(result.success).toBe(true);
+        expect(spySyncWorkspace).not.toHaveBeenCalled();
+        expect(spyDiscoverWorkflows).toHaveBeenCalledWith(
+          '/workspace/test-repo/worktrees/feature-branch',
+          expect.any(Function)
+        );
+        expect(order).toEqual(['discover']);
+      });
+
       test('should fail open and discover workflow when pre-run sync fails', async () => {
         const order: string[] = [];
         mockLogger.warn.mockClear();

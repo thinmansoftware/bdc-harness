@@ -66,14 +66,18 @@ function logSendError(
 /** Threshold for consecutive UNKNOWN errors before aborting */
 const UNKNOWN_ERROR_THRESHOLD = 3;
 
-async function gitRevision(cwd: string, revision: string): Promise<string> {
+async function gitRevision(
+  cwd: string,
+  revision: string,
+  missingPrefix = 'scope_authority_missing'
+): Promise<string> {
   const { stdout } = await execFileAsync(
     'git',
     ['-C', cwd, 'rev-parse', '--verify', `${revision}^{commit}`],
     { timeout: 10000 }
   );
   const value = stdout.trim();
-  if (!value) throw new Error(`scope_authority_missing: git revision ${revision}`);
+  if (!value) throw new Error(`${missingPrefix}: git revision ${revision}`);
   return value;
 }
 
@@ -918,7 +922,11 @@ export async function executeWorkflow(
 
     let definitionSourceSha: string | undefined;
     try {
-      definitionSourceSha = await gitRevision(cwd, 'HEAD');
+      definitionSourceSha = await gitRevision(
+        cwd,
+        'HEAD',
+        'workflow_definition_source_sha_missing'
+      );
     } catch (err) {
       getLog().warn(
         { err: err as Error, workflowRunId: workflowRun.id, cwd },
