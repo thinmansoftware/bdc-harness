@@ -9,13 +9,21 @@
     ".": "./src/index.ts",
     "./classify": "./src/classify.ts",
     "./decide": "./src/decide.ts",
-    "./escalate": "./src/escalate.ts"
+    "./escalate": "./src/escalate.ts",
+    "./watch": "./src/watch.ts",
+    "./judge-pr": "./src/judge-pr.ts",
+    "./service": "./src/service.ts",
+    "./actions/merge-ready": "./src/actions/merge-ready.ts"
   },
   "scripts": {
-    "test": "bun test src/overseer.test.ts && bun test tests/",
-    "type-check": "bun x tsc --noEmit"
+    "test": "bun test src/overseer.test.ts && bun test tests/ && bun test src/__tests__/",
+    "overseer:serve": "bun src/service.ts",
+    "type-check": "bun x --bun tsc --noEmit"
   },
   "dependencies": {
+    "@archon/core": "workspace:*",
+    "@archon/workflows": "workspace:*",
+    "@octokit/rest": "^22.0.0",
     "@archon/paths": "workspace:*"
   },
   "devDependencies": {

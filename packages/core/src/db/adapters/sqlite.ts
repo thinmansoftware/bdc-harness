@@ -634,6 +634,16 @@ export class SqliteAdapter implements IDatabase {
           SELECT RAISE(ABORT, 'board_audit_events is append-only');
         END;
 
+      CREATE TABLE IF NOT EXISTS overseer_actions (
+        id TEXT PRIMARY KEY,
+        run_id TEXT NOT NULL REFERENCES remote_agent_workflow_runs(id) ON DELETE CASCADE,
+        wo_id TEXT NOT NULL,
+        class TEXT NOT NULL,
+        action TEXT NOT NULL,
+        result TEXT NOT NULL,
+        created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+      );
+
       -- Indexes
       CREATE INDEX IF NOT EXISTS idx_codebase_env_vars_codebase_id ON remote_agent_codebase_env_vars(codebase_id);
       CREATE INDEX IF NOT EXISTS idx_conversations_platform ON remote_agent_conversations(platform_type, platform_conversation_id);
@@ -675,6 +685,7 @@ export class SqliteAdapter implements IDatabase {
         ON board_audit_events(created_at);
       CREATE INDEX IF NOT EXISTS idx_board_audit_events_motion
         ON board_audit_events(motion_id, motion_revision_sha) WHERE motion_id IS NOT NULL;
+      CREATE INDEX IF NOT EXISTS idx_overseer_actions_run_id ON overseer_actions(run_id);
       CREATE INDEX IF NOT EXISTS idx_workflow_runs_parent_conv ON remote_agent_workflow_runs(parent_conversation_id);
       CREATE INDEX IF NOT EXISTS idx_conversations_hidden ON remote_agent_conversations(hidden);
       DROP INDEX IF EXISTS idx_conversations_codebase;
