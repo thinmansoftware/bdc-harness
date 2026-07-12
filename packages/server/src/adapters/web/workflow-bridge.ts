@@ -238,6 +238,21 @@ export function mapWorkflowEvent(event: WorkflowEmitterEvent): string | null {
         timestamp: Date.now(),
       });
 
+    case 'node_wall_breach':
+      // Node exceeded its per-attempt wall-clock budget on a rung. Forward the
+      // raw payload for Mission Control (same pattern as node_failover).
+      return JSON.stringify({
+        type: 'node_wall_breach',
+        runId: event.runId,
+        nodeId: event.nodeId,
+        iteration: event.iteration,
+        elapsedMs: event.elapsedMs,
+        wallMs: event.wallMs,
+        rung: event.rung,
+        attempt: event.attempt,
+        timestamp: Date.now(),
+      });
+
     default: {
       const exhaustiveCheck: never = event;
       getLog().warn(
