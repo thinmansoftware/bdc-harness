@@ -57,9 +57,11 @@ import { processDueProviderWaits } from '@archon/workflows/reliability/wait-sche
 import { transitionRunRecovery } from '@archon/workflows/reliability/recovery-transition';
 import type { IWorkflowStore } from '@archon/workflows/store';
 import {
+  gateEvidenceFromEvents,
   parsePullRequest,
   repositoryFromRemote,
 } from '@archon/workflows/reliability/evidence-collector';
+import { hashWorkflowDefinition } from '@archon/workflows/reliability/runtime-revisions';
 import { getLoaderErrors, parseWorkflow } from '@archon/workflows/loader';
 import { isValidCommandName } from '@archon/workflows/command-validation';
 import { BUNDLED_WORKFLOWS, BUNDLED_COMMANDS, isBinaryBuild } from '@archon/workflows/defaults';
@@ -3724,15 +3726,18 @@ export function registerApiRoutes(
 
       // Derive the authenticated actor and authorize it for recovery mutation.
       const actorEmail = c.req.header('cf-access-authenticated-user-email')?.trim().toLowerCase();
-      const actor =
-        actorEmail || (process.env.ARCHON_RECOVERY_DEFAULT_ACTOR ?? 'operator').toLowerCase();
+      const configuredDefaultActor =
+        process.env.ARCHON_RECOVERY_DEFAULT_ACTOR?.trim().toLowerCase();
+      const actor = actorEmail || configuredDefaultActor;
       const readOnlyPrincipals = envList('ARCHON_RECOVERY_READONLY_PRINCIPALS');
       const recoveryOperators = envList('ARCHON_RECOVERY_OPERATOR_EMAILS');
       if (
+        !actor ||
+        recoveryOperators.length === 0 ||
         readOnlyPrincipals.includes(actor) ||
-        (recoveryOperators.length > 0 && !recoveryOperators.includes(actor))
+        !recoveryOperators.includes(actor)
       ) {
-        getLog().warn({ runId, actor }, 'api.workflow_run_recovery_forbidden');
+        getLog().warn({ runId, actor: actor ?? 'unmapped' }, 'api.workflow_run_recovery_forbidden');
         return apiError(c, 403, 'Principal not authorized for recovery mutation');
       }
 
@@ -3747,6 +3752,7 @@ export function registerApiRoutes(
         claimSupervisorRepairLease: workflowDb.claimSupervisorRepairLease,
         releaseSupervisorRepairLease: workflowDb.releaseSupervisorRepairLease,
         finalizeSupervisorRecoveryTransition: workflowDb.finalizeSupervisorRecoveryTransition,
+        getRunRecoveryDetails: workflowDb.getRunRecoveryDetails,
       } as unknown as IWorkflowStore;
 
       const result = await transitionRunRecovery(
@@ -3770,6 +3776,36 @@ export function registerApiRoutes(
             } catch {
               return null;
             }
+          },
+          loadRequiredGateEvidence: async () => {
+            const authority = await workflowDb.getRunAuthority(runId);
+            if (!authority) return [];
+            const discovery = await discoverWorkflowsWithConfig(
+              run.working_path ?? authority.worktreePath,
+              loadConfig
+            );
+            const workflow = resolveWorkflowName(
+              authority.workflowName,
+              discovery.workflows.map(entry => entry.workflow)
+            );
+            if (
+              !workflow ||
+              workflow.name !== authority.workflowName ||
+              hashWorkflowDefinition(workflow) !== authority.workflowRevision
+            ) {
+              return [];
+            }
+            const requiredGateIds = [
+              ...new Set(
+                workflow.nodes.flatMap(node =>
+                  'evidence' in node && node.evidence.kind === 'manifest_v2'
+                    ? node.evidence.required_gates
+                    : []
+                )
+              ),
+            ];
+            const events = await workflowEventDb.listWorkflowEvents(runId);
+            return requiredGateIds.map(gateId => gateEvidenceFromEvents(gateId, events));
           },
           now: () => new Date().toISOString(),
           newId: () => randomUUID(),
@@ -4000,7 +4036,27 @@ export function registerApiRoutes(
       const outcome = await workflowDb.getRunOutcome(runId);
       // M-26: run detail also carries recovery actor/attempt evidence. Read-only;
       // never writes.
-      const recovery = await workflowDb.getRunRecoveryDetails(runId);
+      const recoveryDetails = await workflowDb.getRunRecoveryDetails(runId);
+      const recoveryAuthority = await workflowDb.getRunAuthority(runId);
+      let recoveryRepository: string | null = null;
+      if (recoveryAuthority) {
+        try {
+          recoveryRepository = repositoryFromRemote(recoveryAuthority.canonicalRemote);
+        } catch {
+          recoveryRepository = null;
+        }
+      }
+      const recovery = {
+        ...recoveryDetails,
+        actions: recoveryDetails.actions.map(action => ({
+          ...action,
+          ...(recoveryRepository && action.pullRequestNumber
+            ? {
+                pullRequestUrl: `https://github.com/${recoveryRepository}/pull/${String(action.pullRequestNumber)}`,
+              }
+            : {}),
+        })),
+      };
       const tokenTotalsEvent = [...events]
         .reverse()
         .find(event => event.event_type === 'run_token_totals');

@@ -11,7 +11,7 @@
  *   - recoveryState -> Tailwind color class (dot / badge)
  *   - RunOutcome    -> human recovery label (or null when omitted)
  */
-import type { RunOutcome } from './api';
+import type { RecoveryAction, RunOutcome } from './api';
 
 /** Recovery-axis state values understood by the dashboard. */
 export type RenderableRecoveryState = string;
@@ -83,4 +83,22 @@ export function getRecoveryDotColor(recoveryState: RenderableRecoveryState): str
  */
 export function getRecoveryBadgeClasses(recoveryState: RenderableRecoveryState): string {
   return RECOVERY_BADGE_CLASSES[recoveryState] ?? 'bg-surface-elevated text-text-tertiary';
+}
+
+export function getRecoveryPullRequestHref(action: RecoveryAction): string | null {
+  if (!action.pullRequestUrl || typeof action.pullRequestNumber !== 'number') return null;
+  try {
+    const url = new URL(action.pullRequestUrl);
+    const expectedSuffix = `/pull/${String(action.pullRequestNumber)}`;
+    if (
+      url.protocol !== 'https:' ||
+      url.hostname.toLowerCase() !== 'github.com' ||
+      !url.pathname.endsWith(expectedSuffix)
+    ) {
+      return null;
+    }
+    return url.toString();
+  } catch {
+    return null;
+  }
 }

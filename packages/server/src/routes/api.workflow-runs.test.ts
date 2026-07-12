@@ -25,6 +25,12 @@ const mockGetWorkflowRun = mock(async (_id: string) => null as null | MockWorkfl
 const mockCancelWorkflowRun = mock(async (_id: string) => {});
 const mockListWorkflowRuns = mock(async () => [] as MockWorkflowRun[]);
 const mockGetRunOutcome = mock(async (_id: string) => null as null | MockRunOutcome);
+const mockGetRunRecoveryDetails = mock(async (_id: string) => ({ outcome: null, actions: [] }));
+const mockGetRunAuthority = mock(async (_id: string) => null as Record<string, unknown> | null);
+const mockCreateSupervisorIncident = mock(async (incident: Record<string, unknown>) => incident);
+const mockClaimSupervisorRepairLease = mock(async () => null as Record<string, unknown> | null);
+const mockReleaseSupervisorRepairLease = mock(async () => true);
+const mockFinalizeSupervisorRecoveryTransition = mock(async () => 'applied' as const);
 const mockSumWorkflowTokensInWindow = mock(
   async (_opts: { sinceMs: number; codebaseId?: string }) => 0
 );
@@ -147,7 +153,7 @@ type MockRunOutcome = {
   executionState: 'completed' | 'failed';
   deliverableState: 'none' | 'pr_ready';
   validationState: 'passed' | 'failed' | 'indeterminate';
-  recoveryState: 'not_needed';
+  recoveryState: 'not_needed' | 'recoverable' | 'recovering' | 'recovered';
   routeState: 'current';
   primaryReason: string;
   reasonCodes: string[];
@@ -279,6 +285,12 @@ mock.module('@archon/core/db/workflows', () => ({
   getCauldronDrainState: mockGetCauldronDrainState,
   setCauldronDrainMode: mockSetCauldronDrainMode,
   getRunOutcome: mockGetRunOutcome,
+  getRunRecoveryDetails: mockGetRunRecoveryDetails,
+  getRunAuthority: mockGetRunAuthority,
+  createSupervisorIncident: mockCreateSupervisorIncident,
+  claimSupervisorRepairLease: mockClaimSupervisorRepairLease,
+  releaseSupervisorRepairLease: mockReleaseSupervisorRepairLease,
+  finalizeSupervisorRecoveryTransition: mockFinalizeSupervisorRecoveryTransition,
 }));
 
 const mockCreateWorkflowEvent = mock(async (_event: unknown) => {});
@@ -1368,6 +1380,127 @@ describe('POST /api/workflows/runs/:runId/approve', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Tests: POST /api/workflows/runs/:runId/recovery
+// ---------------------------------------------------------------------------
+
+describe('POST /api/workflows/runs/:runId/recovery', () => {
+  const actor = 'xo@bluedevil.test';
+  const attemptId = '11111111-1111-4111-8111-111111111111';
+
+  beforeEach(() => {
+    process.env.ARCHON_RECOVERY_DEFAULT_ACTOR = actor;
+    delete process.env.ARCHON_RECOVERY_OPERATOR_EMAILS;
+    delete process.env.ARCHON_RECOVERY_READONLY_PRINCIPALS;
+    mockGetWorkflowRun.mockReset();
+    mockGetWorkflowRun.mockResolvedValue({ ...MOCK_FAILED_RUN, id: 'run-recovery-1' });
+    mockGetRunAuthority.mockReset();
+    mockGetRunAuthority.mockResolvedValue({
+      runId: 'run-recovery-1',
+      woId: 'WO-RECOVERY-1',
+      canonicalRemote: 'https://github.com/bluedevilcollectibles/bdc-harness.git',
+      baseBranch: 'dev',
+      workflowName: 'deploy',
+      workflowRevision: 'sha256:test',
+      worktreePath: '/tmp/worktrees/recovery',
+    });
+    mockGetRunOutcome.mockReset();
+    mockGetRunOutcome.mockResolvedValue({
+      executionState: 'failed',
+      deliverableState: 'pr_ready',
+      validationState: 'passed',
+      recoveryState: 'recoverable',
+      routeState: 'current',
+      primaryReason: 'execution_failed_pr_ready',
+      reasonCodes: ['execution_failed_pr_ready'],
+      evidenceRefs: [`git:${'1'.repeat(40)}...${'2'.repeat(40)}`, 'gate:validate:passed'],
+    });
+    mockGetRunRecoveryDetails.mockReset();
+    mockGetRunRecoveryDetails.mockResolvedValue({ outcome: null, actions: [] });
+    mockCreateSupervisorIncident.mockReset();
+    mockCreateSupervisorIncident.mockImplementation(async incident => incident);
+    mockClaimSupervisorRepairLease.mockReset();
+    mockClaimSupervisorRepairLease.mockResolvedValue({
+      incidentId: 'incident-recovery-1',
+      ownerId: actor,
+      fencingToken: 1,
+      acquiredAt: NOW,
+      lastHeartbeatAt: NOW,
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+      releasedAt: null,
+    });
+    mockReleaseSupervisorRepairLease.mockReset();
+    mockReleaseSupervisorRepairLease.mockResolvedValue(true);
+    mockFinalizeSupervisorRecoveryTransition.mockReset();
+    mockFinalizeSupervisorRecoveryTransition.mockResolvedValue('applied');
+  });
+
+  afterEach(() => {
+    delete process.env.ARCHON_RECOVERY_DEFAULT_ACTOR;
+    delete process.env.ARCHON_RECOVERY_OPERATOR_EMAILS;
+    delete process.env.ARCHON_RECOVERY_READONLY_PRINCIPALS;
+  });
+
+  test('fails closed with 403 when no XO/John/V1C operator mapping is configured', async () => {
+    const { app } = makeApp();
+    const response = await app.request('/api/workflows/runs/run-recovery-1/recovery', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ actionType: 'start', attemptId }),
+    });
+    expect(response.status).toBe(403);
+    expect(mockCreateSupervisorIncident).not.toHaveBeenCalled();
+  });
+
+  test('allows an explicitly mapped acting XO and derives the owner server-side', async () => {
+    process.env.ARCHON_RECOVERY_OPERATOR_EMAILS = actor;
+    const { app } = makeApp();
+    const response = await app.request('/api/workflows/runs/run-recovery-1/recovery', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ actionType: 'start', attemptId }),
+    });
+    expect(response.status).toBe(200);
+    expect(mockFinalizeSupervisorRecoveryTransition).toHaveBeenCalledTimes(1);
+    expect(mockFinalizeSupervisorRecoveryTransition.mock.calls[0]?.[0]).toMatchObject({
+      ownerId: actor,
+      actionType: 'start',
+      attemptId,
+    });
+  });
+
+  test('rejects an explicitly read-only Overseer principal before reservation', async () => {
+    process.env.ARCHON_RECOVERY_OPERATOR_EMAILS = actor;
+    process.env.ARCHON_RECOVERY_READONLY_PRINCIPALS = actor;
+    const { app } = makeApp();
+    const response = await app.request('/api/workflows/runs/run-recovery-1/recovery', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ actionType: 'start', attemptId }),
+    });
+    expect(response.status).toBe(403);
+    expect(mockCreateSupervisorIncident).not.toHaveBeenCalled();
+  });
+
+  test('rejects caller-supplied owner, fence, or evidence fields', async () => {
+    process.env.ARCHON_RECOVERY_OPERATOR_EMAILS = actor;
+    const { app } = makeApp();
+    const response = await app.request('/api/workflows/runs/run-recovery-1/recovery', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        actionType: 'start',
+        attemptId,
+        ownerId: 'spoofed',
+        fencingToken: 999,
+        evidenceRefs: ['spoofed'],
+      }),
+    });
+    expect(response.status).toBe(400);
+    expect(mockCreateSupervisorIncident).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Tests: GET /api/workflows/runs
 // ---------------------------------------------------------------------------
 
@@ -1377,6 +1510,10 @@ describe('GET /api/workflows/runs', () => {
     mockListWorkflowEvents.mockReset();
     mockGetRunOutcome.mockReset();
     mockGetRunOutcome.mockImplementation(async () => null);
+    mockGetRunRecoveryDetails.mockReset();
+    mockGetRunRecoveryDetails.mockResolvedValue({ outcome: null, actions: [] });
+    mockGetRunAuthority.mockReset();
+    mockGetRunAuthority.mockResolvedValue(null);
   });
 
   test('returns persisted multidimensional outcomes without collapsing PR readiness', async () => {
@@ -1863,6 +2000,42 @@ describe('GET /api/workflows/runs/:runId', () => {
     expect(response.status).toBe(200);
     expect(body.run.outcome?.deliverableState).toBe('pr_ready');
     expect(body.run.outcome?.validationState).toBe('passed');
+  });
+
+  test('returns canonical clickable pull request evidence in recovery action history', async () => {
+    mockGetWorkflowRun.mockResolvedValueOnce(MOCK_FAILED_RUN);
+    mockListWorkflowEvents.mockResolvedValueOnce([]);
+    mockGetConversationById.mockResolvedValueOnce(null);
+    mockGetRunRecoveryDetails.mockResolvedValueOnce({
+      outcome: null,
+      actions: [
+        {
+          actionId: 'action-426',
+          attemptId: 'attempt-426',
+          incidentId: 'incident-426',
+          ownerId: 'xo',
+          fencingToken: 1,
+          actionType: 'complete',
+          outcome: 'complete',
+          evidenceRefs: ['pr:426'],
+          createdAt: NOW,
+          pullRequestNumber: 426,
+        },
+      ],
+    });
+    mockGetRunAuthority.mockResolvedValueOnce({
+      canonicalRemote: 'https://github.com/bluedevilcollectibles/bdc-harness.git',
+    });
+
+    const { app } = makeApp();
+    const response = await app.request('/api/workflows/runs/run-uuid-4');
+    const body = (await response.json()) as {
+      recovery: { actions: Array<{ pullRequestUrl?: string }> };
+    };
+    expect(response.status).toBe(200);
+    expect(body.recovery.actions[0]?.pullRequestUrl).toBe(
+      'https://github.com/bluedevilcollectibles/bdc-harness/pull/426'
+    );
   });
 
   // ------------------------------------------------------------------------

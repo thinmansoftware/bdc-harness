@@ -258,6 +258,7 @@ export interface RecoveryAction {
   createdAt: string;
   completedAt?: string | null;
   pullRequestNumber?: number | null;
+  pullRequestUrl?: string | null;
   recoveredHeadSha?: string | null;
   targetBase?: string | null;
   mergeSha?: string | null;

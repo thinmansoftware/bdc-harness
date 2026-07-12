@@ -33,7 +33,7 @@ import {
   extractApprovalContext,
 } from '@/lib/dag-self-repair-loop';
 import { RecoveryStatusBadge } from '@/components/dashboard/RecoveryStatusBadge';
-import { getRecoveryLabel } from '@/lib/recovery-renderer';
+import { getRecoveryLabel, getRecoveryPullRequestHref } from '@/lib/recovery-renderer';
 
 /** Tool call event extracted from workflow_events for display in WorkflowLogs. */
 export interface ToolEvent {
@@ -184,7 +184,20 @@ function RecoveryDetailRegion({
               {typeof action.pullRequestNumber === 'number' && (
                 <RecoveryField
                   label="Pull request"
-                  value={`#${String(action.pullRequestNumber)}`}
+                  value={
+                    getRecoveryPullRequestHref(action) ? (
+                      <a
+                        href={getRecoveryPullRequestHref(action) ?? undefined}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="text-primary hover:underline"
+                      >
+                        #{String(action.pullRequestNumber)}
+                      </a>
+                    ) : (
+                      `#${String(action.pullRequestNumber)}`
+                    )
+                  }
                 />
               )}
               {action.recoveredHeadSha && (

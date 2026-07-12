@@ -173,7 +173,10 @@ export function parseGitNameStatus(output: string): readonly GitChangeEvidence[]
     });
 }
 
-function gateFromEvents(gateId: string, events: readonly WorkflowEventRecord[]): GateEvidence {
+export function gateEvidenceFromEvents(
+  gateId: string,
+  events: readonly WorkflowEventRecord[]
+): GateEvidence {
   const event = [...events]
     .reverse()
     .find(candidate => candidate.step_name === gateId && candidate.event_type.startsWith('node_'));
@@ -298,7 +301,7 @@ export async function collectRuntimeEvidence(
     pullRequest = null;
   }
   const events = await store.listWorkflowEvents(request.runId);
-  const gates = request.requiredGateIds.map(id => gateFromEvents(id, events));
+  const gates = request.requiredGateIds.map(id => gateEvidenceFromEvents(id, events));
   return collectMechanicalEvidence({
     authority,
     executionState: request.executionState,

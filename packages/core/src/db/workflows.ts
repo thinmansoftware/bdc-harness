@@ -1102,6 +1102,10 @@ export async function finalizeSupervisorRecoveryTransition(data: {
         const row = existingTuple.rows[0];
         const same =
           row.owner_id === data.ownerId &&
+          row.status === 'completed' &&
+          row.outcome === data.actionType &&
+          JSON.stringify(parseJsonArray<string>(row.evidence_refs)) ===
+            JSON.stringify(data.evidenceRefs) &&
           (row.pull_request_number ?? null) === (data.pullRequestNumber ?? null) &&
           (row.recovered_head_sha ?? null) === (data.recoveredHeadSha ?? null) &&
           (row.target_base ?? null) === (data.targetBase ?? null) &&

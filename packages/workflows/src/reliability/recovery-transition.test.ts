@@ -12,7 +12,7 @@
 import { describe, test, expect } from 'bun:test';
 import { transitionRunRecovery } from './recovery-transition';
 import type { RecoveryTransitionDeps, RecoveryTransitionRequest } from './recovery-transition';
-import type { PullRequestEvidence } from './evidence-collector';
+import type { GateEvidence, PullRequestEvidence } from './evidence-collector';
 import type { IWorkflowStore } from '../store';
 import type {
   RunAuthorityRecord,
@@ -90,6 +90,10 @@ interface FakeStoreConfig {
   outcome?: RunOutcome | null;
   lease?: SupervisorRepairLeaseRecord | null;
   finalize?: SupervisorActionReservation;
+  recoveryActions?: Awaited<
+    ReturnType<NonNullable<IWorkflowStore['getRunRecoveryDetails']>>
+  >['actions'];
+  gates?: readonly GateEvidence[];
 }
 
 interface Harness {
@@ -137,6 +141,10 @@ function makeHarness(
       state.releaseCalls += 1;
       return true;
     },
+    getRunRecoveryDetails: async () => ({
+      outcome: config.outcome === undefined ? outcome() : config.outcome,
+      actions: config.recoveryActions ?? [],
+    }),
     finalizeSupervisorRecoveryTransition: async data => {
       state.reserveCalls += 1;
       finalizeCalls.push(data);
@@ -147,6 +155,8 @@ function makeHarness(
   const deps: RecoveryTransitionDeps = {
     store: store as IWorkflowStore,
     fetchPullRequest: async () => (prByNumber === undefined ? mergedPr() : prByNumber),
+    loadRequiredGateEvidence: async () =>
+      config.gates ?? [{ id: 'validate', required: true, state: 'passed' }],
     now: () => '2026-07-12T00:00:05.000Z',
     newId: () => `id-${String(++idCounter)}`,
   };
@@ -302,6 +312,32 @@ describe('M-26 transitionRunRecovery orchestration', () => {
     expect(h.finalizeCalls).toHaveLength(0);
   });
 
+  test('Test 3: complete rejects missing/failed immutable gates and required PR checks', async () => {
+    const missingGate = makeHarness({ gates: [] });
+    await expect(transitionRunRecovery(missingGate.deps, request())).resolves.toEqual({
+      status: 'rejected',
+      reason: 'required_gate_evidence_missing',
+    });
+    expect(missingGate.finalizeCalls).toHaveLength(0);
+
+    const failedGate = makeHarness({
+      gates: [{ id: 'validate', required: true, state: 'failed' }],
+    });
+    await expect(transitionRunRecovery(failedGate.deps, request())).resolves.toEqual({
+      status: 'rejected',
+      reason: 'stop_conditions_not_passed',
+    });
+
+    const failedCheck = makeHarness(
+      {},
+      mergedPr({ requiredChecks: [{ name: 'test', state: 'failed' }] })
+    );
+    await expect(transitionRunRecovery(failedCheck.deps, request())).resolves.toEqual({
+      status: 'rejected',
+      reason: 'required_pr_checks_not_passed',
+    });
+  });
+
   // Test 3 (cont) -- missing authority fails closed before any incident/lease.
   test('Test 3: missing authority is rejected before reservation', async () => {
     const h = makeHarness({ authority: null });
@@ -324,6 +360,70 @@ describe('M-26 transitionRunRecovery orchestration', () => {
     expect(r2.status).toBe('conflict');
     // Even on conflict the lease is released (finally).
     expect(conflict.releaseCalls).toBe(1);
+  });
+
+  test('Test 4: identical completed retry is unchanged before target-state rejection or lease claim', async () => {
+    const attemptId = '11111111-1111-4111-8111-111111111111';
+    const h = makeHarness({
+      outcome: outcome({ recoveryState: 'recovered' }),
+      lease: null,
+      recoveryActions: [
+        {
+          actionId: 'action-complete',
+          attemptId,
+          incidentId: 'inc-1',
+          ownerId: OWNER,
+          fencingToken: 1,
+          actionType: 'complete',
+          outcome: 'complete',
+          evidenceRefs: [
+            `recovery:complete:by:${OWNER}`,
+            'pr:394',
+            `recovered-head:${TERMINAL_HEAD}`,
+            `target-base:${BASE}`,
+            `merge:${MERGE_SHA}`,
+          ],
+          createdAt: '2026-07-12T00:00:05.000Z',
+          status: 'completed',
+          completedAt: '2026-07-12T00:00:05.000Z',
+          pullRequestNumber: 394,
+          recoveredHeadSha: TERMINAL_HEAD,
+          targetBase: BASE,
+          mergeSha: MERGE_SHA,
+        },
+      ],
+    });
+    const result = await transitionRunRecovery(h.deps, request({ attemptId }));
+    expect(result.status).toBe('unchanged');
+    expect(h.finalizeCalls).toHaveLength(0);
+  });
+
+  test('Test 4: same abandon tuple with changed reason conflicts', async () => {
+    const attemptId = '44444444-4444-4444-8444-444444444444';
+    const h = makeHarness({
+      outcome: outcome({ recoveryState: 'abandoned_by_operator' }),
+      recoveryActions: [
+        {
+          actionId: 'action-abandon',
+          attemptId,
+          incidentId: 'inc-1',
+          ownerId: OWNER,
+          fencingToken: 1,
+          actionType: 'abandon',
+          outcome: 'abandon',
+          evidenceRefs: [`recovery:abandon:by:${OWNER}`, 'recovery:reason:original reason'],
+          createdAt: '2026-07-12T00:00:05.000Z',
+          status: 'completed',
+          completedAt: '2026-07-12T00:00:05.000Z',
+        },
+      ],
+    });
+    const result = await transitionRunRecovery(
+      h.deps,
+      request({ actionType: 'abandon', attemptId, reason: 'changed reason' })
+    );
+    expect(result.status).toBe('conflict');
+    expect(h.finalizeCalls).toHaveLength(0);
   });
 
   // Test 5 -- abandon and reopen fencing/gating.

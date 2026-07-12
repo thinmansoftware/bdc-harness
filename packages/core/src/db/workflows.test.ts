@@ -2351,6 +2351,13 @@ describe('M-26 run recovery dual-truth transitions', () => {
           mergeSha: 'f'.repeat(40),
         })
       ).resolves.toBe('conflict');
+      // Evidence/reason is immutable payload too; changing it must conflict.
+      await expect(
+        finalizeSupervisorRecoveryTransition({
+          ...completePayload(seed, attemptId, 'b5b5b5b5-b5b5-4b5b-8b5b-b5b5b5b5b5b5'),
+          evidenceRefs: ['recovery:complete:by:different-actor'],
+        })
+      ).resolves.toBe('conflict');
       const details = await getRunRecoveryDetails(RUN_ID);
       expect(details.actions).toHaveLength(1);
     }

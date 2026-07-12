@@ -20,7 +20,7 @@
 // untouched; its tests passing unmodified are the non-interference proof.
 
 import type { IWorkflowStore } from '../store';
-import type { PullRequestEvidence } from './evidence-collector';
+import type { GateEvidence, PullRequestEvidence } from './evidence-collector';
 import type {
   RecoveryActionType,
   RecoveryState,
@@ -61,6 +61,8 @@ export interface RecoveryTransitionDeps {
   readonly store: IWorkflowStore;
   /** Fetch live PR evidence by number from the canonical remote. Null if not found. */
   fetchPullRequest(pullRequestNumber: number): Promise<PullRequestEvidence | null>;
+  /** Load required gate results from the run's revision-pinned workflow and immutable events. */
+  loadRequiredGateEvidence(): Promise<readonly GateEvidence[]>;
   /** Injected clock (ISO-8601). */
   now(): string;
   /** Injected id generator. */
@@ -85,6 +87,7 @@ type RequiredRecoveryStore = Required<
     | 'claimSupervisorRepairLease'
     | 'releaseSupervisorRepairLease'
     | 'finalizeSupervisorRecoveryTransition'
+    | 'getRunRecoveryDetails'
   >
 >;
 
@@ -96,6 +99,7 @@ function requireRecoveryStore(store: IWorkflowStore): RequiredRecoveryStore {
     'claimSupervisorRepairLease',
     'releaseSupervisorRepairLease',
     'finalizeSupervisorRecoveryTransition',
+    'getRunRecoveryDetails',
   ];
   for (const method of methods) {
     if (typeof store[method] !== 'function') {
@@ -121,6 +125,11 @@ function sanitizeEvidenceValue(value: string): string {
     .replace(/\s{2,}/g, ' ')
     .trim()
     .slice(0, 300);
+}
+
+function stringArraysEqual(left: readonly string[], right: readonly string[]): boolean {
+  if (left.length !== right.length) return false;
+  return left.every((value, index) => value === right[index]);
 }
 
 /**
@@ -150,10 +159,6 @@ export async function transitionRunRecovery(
   if (!terminalGitRef) return { status: 'rejected', reason: 'terminal_git_evidence_missing' };
   const terminalHead = terminalHeadOf(terminalGitRef);
 
-  if (!RECOVERY_FROM[actionType].includes(outcome.recoveryState)) {
-    return { status: 'rejected', reason: `recovery_from_state_invalid:${outcome.recoveryState}` };
-  }
-
   // Per-action evidence gate (fail-closed before reservation).
   let structured: {
     pullRequestNumber?: number;
@@ -170,6 +175,17 @@ export async function transitionRunRecovery(
     if (outcome.validationState !== 'passed') {
       return { status: 'rejected', reason: 'stop_conditions_not_passed' };
     }
+    const requiredGates = await deps.loadRequiredGateEvidence();
+    if (requiredGates.length === 0 || requiredGates.some(gate => !gate.required)) {
+      return { status: 'rejected', reason: 'required_gate_evidence_missing' };
+    }
+    if (
+      requiredGates.some(
+        gate => gate.state !== 'passed' || !outcome.evidenceRefs.includes(`gate:${gate.id}:passed`)
+      )
+    ) {
+      return { status: 'rejected', reason: 'stop_conditions_not_passed' };
+    }
     const pr = await deps.fetchPullRequest(request.pullRequestNumber);
     if (!pr) return { status: 'rejected', reason: 'pr_evidence_unavailable' };
     if (pr.number !== request.pullRequestNumber) {
@@ -177,6 +193,12 @@ export async function transitionRunRecovery(
     }
     if (pr.state !== 'MERGED') return { status: 'rejected', reason: 'pr_not_merged' };
     if (!pr.mergeSha) return { status: 'rejected', reason: 'merge_sha_missing' };
+    if (
+      pr.requiredChecks.length === 0 ||
+      pr.requiredChecks.some(check => check.state !== 'passed')
+    ) {
+      return { status: 'rejected', reason: 'required_pr_checks_not_passed' };
+    }
     // Terminal-head equality: v1 requires a new run when terminal-head equality is
     // lost (no rebased/cherry-picked lineage). A deleted head branch is accepted
     // only through this live merged-PR headRefOid match.
@@ -212,6 +234,35 @@ export async function transitionRunRecovery(
   } else {
     // reopen
     evidenceRefs.push(`recovery:reopen:by:${sanitizeEvidenceValue(ownerId)}`);
+  }
+
+  // Attempt-level idempotency is checked before from-state and lease admission.
+  // A successful retry must remain unchanged after the first call has already
+  // moved the recovery/incident to its target state and released its old fence.
+  const recoveryDetails = await store.getRunRecoveryDetails(runId);
+  const priorAttempt = recoveryDetails.actions.find(
+    action => action.attemptId === attemptId && action.actionType === actionType
+  );
+  if (priorAttempt) {
+    const identical =
+      priorAttempt.ownerId === ownerId &&
+      priorAttempt.status === 'completed' &&
+      priorAttempt.outcome === actionType &&
+      stringArraysEqual(priorAttempt.evidenceRefs, evidenceRefs) &&
+      (priorAttempt.pullRequestNumber ?? null) === (structured.pullRequestNumber ?? null) &&
+      (priorAttempt.recoveredHeadSha ?? null) === (structured.recoveredHeadSha ?? null) &&
+      (priorAttempt.targetBase ?? null) === (structured.targetBase ?? null) &&
+      (priorAttempt.mergeSha ?? null) === (structured.mergeSha ?? null);
+    if (!identical) return { status: 'conflict', reason: 'recovery_attempt_payload_conflict' };
+    return {
+      status: 'unchanged',
+      recoveryState: RECOVERY_TO[actionType],
+      evidenceRefs,
+    };
+  }
+
+  if (!RECOVERY_FROM[actionType].includes(outcome.recoveryState)) {
+    return { status: 'rejected', reason: `recovery_from_state_invalid:${outcome.recoveryState}` };
   }
 
   const now = deps.now();

@@ -7,14 +7,28 @@
  * never replace it.
  */
 import { describe, expect, test } from 'bun:test';
-import type { RunOutcome } from './api';
+import type { RecoveryAction, RunOutcome } from './api';
 import {
   getRecoveryBadgeClasses,
   getRecoveryDotColor,
   getRecoveryLabel,
+  getRecoveryPullRequestHref,
   RECOVERY_BADGE_CLASSES,
   RECOVERY_DOT_COLORS,
 } from './recovery-renderer';
+
+const RECOVERY_ACTION: RecoveryAction = {
+  actionId: 'action-1',
+  attemptId: 'attempt-1',
+  incidentId: 'incident-1',
+  ownerId: 'xo',
+  actionType: 'complete',
+  outcome: 'complete',
+  evidenceRefs: [],
+  createdAt: '2026-07-12T00:00:00Z',
+  pullRequestNumber: 426,
+  pullRequestUrl: 'https://github.com/bluedevilcollectibles/bdc-harness/pull/426',
+};
 
 /** Build a RunOutcome fixture with sensible defaults, overridable per case. */
 function makeOutcome(overrides: Partial<RunOutcome>): RunOutcome {
@@ -130,5 +144,22 @@ describe('recovery-renderer color tokens', () => {
     ] as const) {
       expect(RECOVERY_BADGE_CLASSES[state]).toBeDefined();
     }
+  });
+});
+
+describe('recovery action links', () => {
+  test('returns the canonical GitHub pull request URL for a completed action', () => {
+    expect(getRecoveryPullRequestHref(RECOVERY_ACTION)).toBe(
+      'https://github.com/bluedevilcollectibles/bdc-harness/pull/426'
+    );
+  });
+
+  test('rejects a URL whose pull request number does not match the action', () => {
+    expect(
+      getRecoveryPullRequestHref({
+        ...RECOVERY_ACTION,
+        pullRequestUrl: 'https://github.com/bluedevilcollectibles/bdc-harness/pull/999',
+      })
+    ).toBeNull();
   });
 });

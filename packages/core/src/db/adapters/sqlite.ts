@@ -151,8 +151,122 @@ export class SqliteAdapter implements IDatabase {
    * ensuring new tables from migrations are created in existing databases.
    */
   private initSchema(): void {
+    // Existing databases still have the migration-027 action table. Upgrade it
+    // before createSchema() creates indexes that reference the new attempt_id.
+    this.migrateSupervisorRecoverySchemaBeforeIndexes();
     this.createSchema();
     this.migrateColumns();
+  }
+
+  private migrateSupervisorRecoverySchemaBeforeIndexes(): void {
+    const actionTable = this.db
+      .prepare(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'remote_agent_supervisor_actions'"
+      )
+      .get() as { sql?: string } | null;
+    const incidentTable = this.db
+      .prepare(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'remote_agent_supervisor_incidents'"
+      )
+      .get() as { sql?: string } | null;
+    if (!actionTable && !incidentTable) return;
+
+    const actionColumns = actionTable
+      ? (this.db.prepare("PRAGMA table_info('remote_agent_supervisor_actions')").all() as {
+          name: string;
+          notnull: number;
+        }[])
+      : [];
+    const actionColumnNames = new Set(actionColumns.map(column => column.name));
+    const attemptColumn = actionColumns.find(column => column.name === 'attempt_id');
+    const needsActionRebuild = Boolean(
+      actionTable &&
+      (attemptColumn?.notnull !== 1 ||
+        !actionColumnNames.has('pull_request_number') ||
+        !actionColumnNames.has('recovered_head_sha') ||
+        !actionColumnNames.has('target_base') ||
+        !actionColumnNames.has('merge_sha'))
+    );
+    const needsIncidentRebuild = Boolean(
+      incidentTable && !/['"]abandoned['"]/i.test(incidentTable.sql ?? '')
+    );
+    if (!needsActionRebuild && !needsIncidentRebuild) return;
+
+    const selectColumn = (name: string, fallback: string): string =>
+      actionColumnNames.has(name) ? name : fallback;
+
+    this.db.run('PRAGMA foreign_keys = OFF');
+    this.db.run('BEGIN IMMEDIATE');
+    try {
+      if (needsIncidentRebuild) {
+        this.db.run(`
+          DROP TABLE IF EXISTS remote_agent_supervisor_incidents_m26;
+          CREATE TABLE remote_agent_supervisor_incidents_m26 (
+            incident_id TEXT PRIMARY KEY,
+            incident_key TEXT NOT NULL UNIQUE,
+            run_id TEXT NOT NULL REFERENCES remote_agent_workflow_runs(id) ON DELETE CASCADE,
+            wo_id TEXT NOT NULL,
+            status TEXT NOT NULL CHECK (status IN ('open', 'repairing', 'recovered', 'escalated', 'abandoned')),
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+          );
+          INSERT INTO remote_agent_supervisor_incidents_m26
+            (incident_id, incident_key, run_id, wo_id, status, created_at, updated_at)
+          SELECT incident_id, incident_key, run_id, wo_id, status, created_at, updated_at
+          FROM remote_agent_supervisor_incidents;
+        `);
+      }
+
+      if (needsActionRebuild) {
+        this.db.run(`
+          DROP TABLE IF EXISTS remote_agent_supervisor_actions_m26;
+          CREATE TABLE remote_agent_supervisor_actions_m26 (
+            action_id TEXT PRIMARY KEY,
+            attempt_id TEXT NOT NULL,
+            incident_id TEXT NOT NULL REFERENCES remote_agent_supervisor_incidents(incident_id) ON DELETE CASCADE,
+            owner_id TEXT NOT NULL,
+            fencing_token INTEGER NOT NULL CHECK (fencing_token > 0),
+            action_type TEXT NOT NULL,
+            outcome TEXT NOT NULL,
+            evidence_refs TEXT NOT NULL DEFAULT '[]',
+            created_at TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'completed' CHECK (status IN ('reserved', 'completed', 'failed')),
+            completed_at TEXT,
+            pull_request_number INTEGER,
+            recovered_head_sha TEXT,
+            target_base TEXT,
+            merge_sha TEXT
+          );
+          INSERT INTO remote_agent_supervisor_actions_m26
+            (action_id, attempt_id, incident_id, owner_id, fencing_token, action_type, outcome,
+             evidence_refs, created_at, status, completed_at, pull_request_number,
+             recovered_head_sha, target_base, merge_sha)
+          SELECT action_id, ${actionColumnNames.has('attempt_id') ? 'COALESCE(attempt_id, action_id)' : 'action_id'},
+                 incident_id, owner_id, fencing_token, action_type, outcome, evidence_refs,
+                 created_at, ${selectColumn('status', "'completed'")},
+                 ${selectColumn('completed_at', 'NULL')},
+                 ${selectColumn('pull_request_number', 'NULL')},
+                 ${selectColumn('recovered_head_sha', 'NULL')},
+                 ${selectColumn('target_base', 'NULL')}, ${selectColumn('merge_sha', 'NULL')}
+          FROM remote_agent_supervisor_actions;
+          DROP TABLE remote_agent_supervisor_actions;
+          ALTER TABLE remote_agent_supervisor_actions_m26 RENAME TO remote_agent_supervisor_actions;
+        `);
+      }
+
+      if (needsIncidentRebuild) {
+        this.db.run(`
+          DROP TABLE remote_agent_supervisor_incidents;
+          ALTER TABLE remote_agent_supervisor_incidents_m26 RENAME TO remote_agent_supervisor_incidents;
+        `);
+      }
+      this.db.run('COMMIT');
+    } catch (error) {
+      this.db.run('ROLLBACK');
+      throw error;
+    } finally {
+      this.db.run('PRAGMA foreign_keys = ON');
+    }
   }
 
   /**

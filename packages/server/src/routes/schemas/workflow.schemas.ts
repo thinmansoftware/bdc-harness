@@ -196,6 +196,7 @@ export const recoveryActionSchema = z
     createdAt: z.string(),
     completedAt: z.string().nullable().optional(),
     pullRequestNumber: z.number().nullable().optional(),
+    pullRequestUrl: z.string().url().nullable().optional(),
     recoveredHeadSha: z.string().nullable().optional(),
     targetBase: z.string().nullable().optional(),
     mergeSha: z.string().nullable().optional(),
@@ -220,6 +221,7 @@ export const recoveryTransitionRequestBodySchema = z
     // Required for `abandon`; enforced by the transition.
     reason: z.string().min(1).optional(),
   })
+  .strict()
   .openapi('RecoveryTransitionRequest');
 
 /** POST /api/workflows/runs/:runId/recovery response. */
