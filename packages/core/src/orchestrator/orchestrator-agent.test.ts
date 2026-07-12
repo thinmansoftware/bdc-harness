@@ -1171,6 +1171,10 @@ describe('discoverAllWorkflows -- remote sync', () => {
       ],
     });
     const order: string[] = [];
+    mockParseCommand.mockReturnValueOnce({
+      command: 'workflow',
+      args: ['run', 'test-workflow', 'payload'],
+    });
     mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(conversation));
     mockListCodebases.mockResolvedValueOnce([codebase]);
     mockDiscoverWorkflowsWithConfig.mockImplementation(async (cwd: string) => {
@@ -1212,6 +1216,10 @@ describe('discoverAllWorkflows -- remote sync', () => {
     const conversation = makeConversation({ codebase_id: null });
     const codebase = makeCodebaseForSync();
     const workflow = makeTestWorkflow({ name: 'test-workflow' });
+    mockParseCommand.mockReturnValueOnce({
+      command: 'workflow',
+      args: ['run', 'test-workflow', 'payload'],
+    });
     mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(conversation));
     mockListCodebases.mockResolvedValueOnce([codebase]);
     mockDiscoverWorkflowsWithConfig.mockImplementation(async (cwd: string) => {
