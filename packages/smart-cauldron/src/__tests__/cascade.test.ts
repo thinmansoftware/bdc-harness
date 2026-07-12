@@ -167,8 +167,9 @@ describe('auth/project binding guards', () => {
     expect(cancelOpts.length).toBe(1);
 
     expect(fireOpts.every(opts => opts.token === 'test-token')).toBe(true);
+    expect(fireOpts.every(opts => opts.project === 'test-project')).toBe(true);
     expect(
-      fireOpts.every(opts => opts.message.startsWith('WO-TEST-001 --project test-project'))
+      fireOpts.every(opts => opts.message.startsWith('WO_ID=WO-TEST-001 --project test-project'))
     ).toBe(true);
     expect(pollOpts.every(opts => opts.token === 'test-token')).toBe(true);
     expect(cancelOpts[0]?.token).toBe('test-token');

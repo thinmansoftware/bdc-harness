@@ -105,12 +105,13 @@ export interface GateVerdict {
 
 /**
  * FireResult: runId is null on infra-error or while run discovery is pending.
- * fire.ts resolves runId via by-worker discovery BEFORE returning to the cascade.
+ * conversationId is supplied by the atomic conversation response and remains
+ * null when dispatch never created a conversation.
  */
 export interface FireResult {
   ok: boolean;
   runId: string | null; // resolved via discovery poll; null only on infra-error
-  conversationId: string; // the UUID the cascade generated for this attempt
+  conversationId: string | null; // server-issued parent platform conversation id
   infraError: string | null; // set when HTTP != 200 or discovery times out
 }
 
