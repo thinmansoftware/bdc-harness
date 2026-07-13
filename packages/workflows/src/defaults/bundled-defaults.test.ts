@@ -1,7 +1,23 @@
 import { describe, it, expect } from 'bun:test';
+import {
+  clearRegistry,
+  registerBuiltinProviders,
+  registerCommunityProviders,
+} from '@archon/providers';
 import { readFileSync, readdirSync } from 'fs';
 import { join } from 'path';
 import { isBinaryBuild, BUNDLED_COMMANDS, BUNDLED_WORKFLOWS } from './bundled-defaults';
+import { parseWorkflow } from '../loader';
+import type { DagNode } from '../schemas/dag-node';
+import type { WorkflowDefinition } from '../schemas/workflow';
+import {
+  LOOP_ITERATION_IDLE_TIMEOUT_MS,
+  resolveLoopIterationIdleTimeoutMs,
+} from '../utils/idle-timeout';
+
+clearRegistry();
+registerBuiltinProviders();
+registerCommunityProviders();
 
 // Resolve the on-disk defaults directories relative to this test file so the
 // tests work regardless of cwd. From packages/workflows/src/defaults go up
@@ -41,6 +57,33 @@ function extractWorkflowNode(content: string, id: string): string {
 
   const end = lines.findIndex((line, index) => index > start && /^  - id: /.test(line));
   return lines.slice(start, end === -1 ? undefined : end).join('\n');
+}
+
+function parseBundledWorkflow(name: string): WorkflowDefinition {
+  const result = parseWorkflow(BUNDLED_WORKFLOWS[name], `${name}.yaml`);
+  expect(result.error).toBeNull();
+  expect(result.workflow).not.toBeNull();
+  return result.workflow!;
+}
+
+function getWorkflowNode(workflow: WorkflowDefinition, id: string): DagNode {
+  const node = workflow.nodes.find(candidate => candidate.id === id);
+  expect(node).toBeDefined();
+  return node!;
+}
+
+function withDefaultLoopIterationIdleEnv<T>(fn: () => T): T {
+  const previous = process.env.ARCHON_LOOP_ITERATION_IDLE_MS;
+  delete process.env.ARCHON_LOOP_ITERATION_IDLE_MS;
+  try {
+    return fn();
+  } finally {
+    if (previous === undefined) {
+      delete process.env.ARCHON_LOOP_ITERATION_IDLE_MS;
+    } else {
+      process.env.ARCHON_LOOP_ITERATION_IDLE_MS = previous;
+    }
+  }
 }
 
 describe('bundled-defaults', () => {
@@ -187,42 +230,65 @@ describe('bundled-defaults', () => {
         'bdc-feature-development-zero-open',
         'bdc-feature-development-zero',
       ];
-      const OUT_OF_SCOPE_NODES = [
-        'opus-repair',
-        'diff-review',
-        'diff-review-final',
-        'diff-repair',
-      ];
+      const OUT_OF_SCOPE_NODES = ['opus-repair', 'diff-review', 'diff-review-final', 'diff-repair'];
 
       for (const name of REASONING_BOUND) {
         it(`${name} applies the 10-minute idle timeout to plan-review and implement`, () => {
           const content = BUNDLED_WORKFLOWS[name];
+          const workflow = parseBundledWorkflow(name);
           const planReview = extractWorkflowNode(content, 'plan-review');
           const implement = extractWorkflowNode(content, 'implement');
+          const planReviewNode = getWorkflowNode(workflow, 'plan-review');
+          const implementNode = getWorkflowNode(workflow, 'implement');
 
           expect(planReview).toContain('idle_timeout: 600000');
           expect(implement).toContain('idle_timeout: 600000');
+          expect(planReviewNode.idle_timeout).toBe(600000);
+          expect(implementNode.idle_timeout).toBe(600000);
+          expect(resolveLoopIterationIdleTimeoutMs(planReviewNode.idle_timeout)).toBe(600000);
+          expect(resolveLoopIterationIdleTimeoutMs(implementNode.idle_timeout)).toBe(600000);
         });
       }
 
       for (const name of OPEN_MODEL) {
         it(`${name} keeps the default loop idle timeout on plan-review and implement`, () => {
-          const content = BUNDLED_WORKFLOWS[name];
-          const planReview = extractWorkflowNode(content, 'plan-review');
-          const implement = extractWorkflowNode(content, 'implement');
+          withDefaultLoopIterationIdleEnv(() => {
+            const content = BUNDLED_WORKFLOWS[name];
+            const workflow = parseBundledWorkflow(name);
+            const planReview = extractWorkflowNode(content, 'plan-review');
+            const implement = extractWorkflowNode(content, 'implement');
+            const planReviewNode = getWorkflowNode(workflow, 'plan-review');
+            const implementNode = getWorkflowNode(workflow, 'implement');
 
-          expect(planReview).not.toContain('idle_timeout: 600000');
-          expect(implement).not.toContain('idle_timeout: 600000');
+            expect(planReview).not.toContain('idle_timeout: 600000');
+            expect(implement).not.toContain('idle_timeout: 600000');
+            expect(planReviewNode.idle_timeout).toBeUndefined();
+            expect(implementNode.idle_timeout).toBeUndefined();
+            expect(resolveLoopIterationIdleTimeoutMs(planReviewNode.idle_timeout)).toBe(
+              LOOP_ITERATION_IDLE_TIMEOUT_MS
+            );
+            expect(resolveLoopIterationIdleTimeoutMs(implementNode.idle_timeout)).toBe(
+              LOOP_ITERATION_IDLE_TIMEOUT_MS
+            );
+          });
         });
       }
 
       for (const name of [...REASONING_BOUND, ...OPEN_MODEL]) {
         for (const nodeId of OUT_OF_SCOPE_NODES) {
           it(`${name} does not apply the plan-review/implement idle timeout to ${nodeId}`, () => {
-            const content = BUNDLED_WORKFLOWS[name];
-            const node = extractWorkflowNode(content, nodeId);
+            withDefaultLoopIterationIdleEnv(() => {
+              const content = BUNDLED_WORKFLOWS[name];
+              const workflow = parseBundledWorkflow(name);
+              const nodeSource = extractWorkflowNode(content, nodeId);
+              const node = getWorkflowNode(workflow, nodeId);
 
-            expect(node).not.toContain('idle_timeout: 600000');
+              expect(nodeSource).not.toContain('idle_timeout: 600000');
+              expect(node.idle_timeout).toBeUndefined();
+              expect(resolveLoopIterationIdleTimeoutMs(node.idle_timeout)).toBe(
+                LOOP_ITERATION_IDLE_TIMEOUT_MS
+              );
+            });
           });
         }
       }
