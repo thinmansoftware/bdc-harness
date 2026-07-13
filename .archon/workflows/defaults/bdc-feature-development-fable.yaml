@@ -284,6 +284,11 @@ nodes:
     trigger_rule: all_done
     when: "$gate-already-satisfied.output.ALREADY_SATISFIED != 'true'"
     task_class: medium_work
+    # Per-node idle-timeout override (WO-HARNESS-IDLE-TIMEOUT-REASONING-NODES-01):
+    # this node runs on claude-fable-5, a claude-family reasoning model. Raise the
+    # loop-iteration idle timeout to 10 min so deep reasoning is not killed as a
+    # dead stream. Open-model lanes keep the 3-min default (anchor 42ee6575).
+    idle_timeout: 600000
     loop:
       fresh_context: true
       # Success-only sentinel. The war-council-architect persona is READ-ONLY
@@ -406,6 +411,11 @@ nodes:
     trigger_rule: all_done
     when: "$gate-already-satisfied.output.ALREADY_SATISFIED != 'true'"
     task_class: medium_work
+    # Per-node idle-timeout override (WO-HARNESS-IDLE-TIMEOUT-REASONING-NODES-01):
+    # implement runs on claude-fable-5, a claude-family reasoning model. Raise the
+    # loop-iteration idle timeout to 10 min so deep reasoning is not killed as a
+    # dead stream. Distinct from wall_timeout_ms (PR #423, untouched).
+    idle_timeout: 600000
     wall_timeout_ms: 1800000
     loop:
       prompt: |
@@ -1109,6 +1119,11 @@ nodes:
     depends_on: [diff-review, classify-diff-review]
     when: "$classify-diff-review.output.verdict == 'needs_revision'"
     task_class: medium_work
+    # Per-node idle-timeout override (WO-HARNESS-IDLE-TIMEOUT-REASONING-NODES-01):
+    # diff-repair runs on claude-fable-5, a claude-family reasoning model. Raise the
+    # loop-iteration idle timeout to 10 min so deep reasoning is not killed as a
+    # dead stream. Open-model lanes keep the 3-min default.
+    idle_timeout: 600000
     loop:
       fresh_context: true
       # NF3 + schema fix: the loader REQUIRES loop.until (schemas/loop.ts:11,
