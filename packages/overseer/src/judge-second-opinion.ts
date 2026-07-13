@@ -14,7 +14,7 @@ interface JudgeWithGrokOptions {
 }
 
 export function parseGrokVerdict(stdout: string): 'approve' | 'hold' {
-  const match = stdout.match(/^VERDICT:\s*(APPROVE|HOLD)\s*$/m);
+  const match = /^VERDICT:\s*(APPROVE|HOLD)\s*$/m.exec(stdout);
   return match?.[1] === 'APPROVE' ? 'approve' : 'hold';
 }
 
@@ -24,7 +24,9 @@ export async function judgeWithGrok(
 ): Promise<'approve' | 'hold'> {
   const prompt = buildGrokPrompt(evidence);
   const spawn =
-    options.spawn ?? (input => spawnGrok(input, options.timeoutMs ?? DEFAULT_TIMEOUT_MS));
+    options.spawn ??
+    ((input: string): Promise<GrokSpawnResult> =>
+      spawnGrok(input, options.timeoutMs ?? DEFAULT_TIMEOUT_MS));
 
   try {
     const result = await spawn(prompt);
