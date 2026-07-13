@@ -1056,7 +1056,9 @@ export async function orphanPendingWorkflowRun(data: {
         data.runId,
       ]
     );
-    return update.rowCount === 1;
+    if (update.rowCount !== 1) return false;
+
+    return true;
   });
 }
 

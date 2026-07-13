@@ -66,6 +66,13 @@ const pendingRun: WorkflowRun = {
   archive_reason: null,
 };
 
+const runningRun: WorkflowRun = {
+  ...pendingRun,
+  id: 'run-running-1',
+  status: 'running',
+  working_path: 'C:/worktrees/run-running-1',
+};
+
 describe('startup lease reconciliation', () => {
   test('observe mode verifies authority and worktree without mutating state', async () => {
     const store = recoveryStore();
@@ -234,6 +241,24 @@ describe('boot pending reconciliation', () => {
     });
   });
 
+  test('reports CAS races without recording orphan events', async () => {
+    const store = recoveryStore({
+      listPendingWorkflowRunsBefore: mock(async () => [pendingRun]),
+      orphanPendingWorkflowRun: mock(async () => false),
+      createWorkflowEvent: mock(async () => {}),
+    });
+
+    await expect(
+      reconcilePendingWorkflowRunsAtBoot(store, { now: '2026-07-13T17:53:00.000Z' })
+    ).resolves.toEqual({
+      observed: 1,
+      orphaned: 0,
+      raced: 1,
+      entries: [{ runId: 'run-pending-1', disposition: 'cas_race_lost' }],
+    });
+    expect(store.createWorkflowEvent).not.toHaveBeenCalled();
+  });
+
   test('does not mutate when no pending rows predate the boot cutoff', async () => {
     const store = recoveryStore({
       listPendingWorkflowRunsBefore: mock(async () => []),
@@ -249,8 +274,16 @@ describe('boot pending reconciliation', () => {
   });
 
   test('leaves running rows untouched because the DB candidate query is pending-only', async () => {
+    const rowsAtBoot = [runningRun];
     const store = recoveryStore({
-      listPendingWorkflowRunsBefore: mock(async () => []),
+      listPendingWorkflowRunsBefore: mock(async cutoff =>
+        rowsAtBoot.filter(
+          row =>
+            row.status === 'pending' &&
+            row.started_at instanceof Date &&
+            row.started_at.toISOString() <= cutoff
+        )
+      ),
       orphanPendingWorkflowRun: mock(async () => true),
       createWorkflowEvent: mock(async () => {}),
     });
@@ -260,5 +293,6 @@ describe('boot pending reconciliation', () => {
       '2026-07-13T17:53:00.000Z'
     );
     expect(store.orphanPendingWorkflowRun).not.toHaveBeenCalled();
+    expect(runningRun.status).toBe('running');
   });
 });

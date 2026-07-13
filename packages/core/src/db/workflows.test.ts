@@ -1503,9 +1503,17 @@ describe('Smart Cauldron reliability persistence', () => {
     ).resolves.toBe(true);
 
     expect(mockWithTransaction).toHaveBeenCalledTimes(1);
+    expect(mockTransactionQuery).toHaveBeenCalledTimes(2);
     expect(mockTransactionQuery.mock.calls[0]?.[0]).toContain("status = 'pending'");
     expect(mockTransactionQuery.mock.calls[1]?.[0]).toContain("status = 'orphaned'");
     expect(mockTransactionQuery.mock.calls[1]?.[0]).toContain("WHERE id = $2 AND status = 'pending'");
+    expect(mockTransactionQuery.mock.calls[1]?.[1]).toEqual([
+      JSON.stringify({
+        orphaned_reason: 'pending_run_predates_orchestrator_boot',
+        orphaned_at: '2026-07-13T17:53:00.000Z',
+      }),
+      'run-pending-1',
+    ]);
   });
 
   test('orphan pending workflow CAS returns false when no pending row matches', async () => {
