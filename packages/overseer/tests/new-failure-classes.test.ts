@@ -21,6 +21,7 @@ import { mkdtemp, rm, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { classifyError, decide, runEscalation } from '../src/index.ts';
+import { closeDatabase, resetDatabase } from '@archon/core/db';
 import type { EscalationContext } from '../src/escalate.ts';
 
 // --- Test 1 -- implement_loop_no_output classification ------------------------
@@ -174,6 +175,8 @@ describe('runEscalation: side effects', () => {
     if (originalArchonDocker !== undefined) process.env.ARCHON_DOCKER = originalArchonDocker;
     if (originalHome !== undefined) process.env.HOME = originalHome;
     fetchSpy.mockRestore();
+    await closeDatabase();
+    resetDatabase();
     await rm(tmpHome, { recursive: true, force: true });
   });
 
@@ -274,6 +277,8 @@ describe('end-to-end: WO-AUTH-SINGLE-PATH-E2E-04 incident replay', () => {
     if (originalWorkspacePath !== undefined) process.env.WORKSPACE_PATH = originalWorkspacePath;
     if (originalArchonDocker !== undefined) process.env.ARCHON_DOCKER = originalArchonDocker;
     fetchSpy.mockRestore();
+    await closeDatabase();
+    resetDatabase();
     await rm(tmpHome, { recursive: true, force: true });
   });
 
