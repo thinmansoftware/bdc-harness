@@ -187,25 +187,37 @@ nodes:
       running a redundant build that the downstream no-op guard will catch.
 
   # gate-already-satisfied: bash gate that reads check-already-satisfied's verdict and
-  # records BUILD_OUTCOME for the terminal nodes. If ALREADY_SATISFIED=true, the plan ->
-  # implement -> review chain still runs but will legitimately find no diff; flip-notion
-  # records verified-no-op. (We do NOT hard-skip nodes here -- the executor has no goto;
-  # instead the outcome is recorded and the no-op flows through the existing chain, which
-  # now distinguishes ALREADY_SATISFIED from FALSE_COMPLETE via assert-implement-produced-work.)
+  # emits a single JSON document on stdout for downstream when: conditions. Human-readable
+  # diagnostics go to stderr so condition-evaluator can parse $gate-already-satisfied.output.
   - id: gate-already-satisfied
     depends_on: [check-already-satisfied]
     bash: |
       set -uo pipefail
-      CAS=$check-already-satisfied.output
+      CAS=$(cat <<'BDC_FEATURE_DEV_CHECK_ALREADY_SATISFIED_20260713_F9C2A1'
+      $check-already-satisfied.output
+      BDC_FEATURE_DEV_CHECK_ALREADY_SATISFIED_20260713_F9C2A1
+      )
       if printf '%s\n' "$CAS" | grep -qE '^ALREADY_SATISFIED=true'; then
-        echo "ALREADY_SATISFIED=true"
-        echo "PRECHECK_VERDICT=already-satisfied"
-        printf '%s\n' "$CAS" | grep '^SATISFIED_EVIDENCE=' | head -1 || true
-        echo "Note: WO appears already implemented in this worktree; the build chain will"
-        echo "produce no diff and the run will resolve as a verified no-op (not a failure)."
+        SATISFIED_EVIDENCE=$(printf '%s\n' "$CAS" | sed -n 's/^SATISFIED_EVIDENCE=//p' | head -1)
+        ALREADY_VALUE=true PRECHECK_VERDICT=already-satisfied SATISFIED_EVIDENCE="$SATISFIED_EVIDENCE" python3 - <<'PY'
+      import json
+      import os
+      print(json.dumps({
+          "ALREADY_SATISFIED": os.environ.get("ALREADY_VALUE") == "true",
+          "PRECHECK_VERDICT": os.environ.get("PRECHECK_VERDICT", "already-satisfied"),
+          "SATISFIED_EVIDENCE": os.environ.get("SATISFIED_EVIDENCE", ""),
+      }, separators=(",", ":")))
+      PY
+        echo "gate-already-satisfied: WO appears already implemented in this worktree; build-only nodes will be skipped." >&2
       else
-        echo "ALREADY_SATISFIED=false"
-        echo "PRECHECK_VERDICT=needs-build"
+        ALREADY_VALUE=false PRECHECK_VERDICT=needs-build python3 - <<'PY'
+      import json
+      import os
+      print(json.dumps({
+          "ALREADY_SATISFIED": os.environ.get("ALREADY_VALUE") == "true",
+          "PRECHECK_VERDICT": os.environ.get("PRECHECK_VERDICT", "needs-build"),
+      }, separators=(",", ":")))
+      PY
       fi
       exit 0
 
@@ -217,6 +229,7 @@ nodes:
     # 10f6add0, 28e98197 (2026-07-01) all died at plan with the persona fault.
     provider: codex
     depends_on: [gate-already-satisfied]
+    when: "$gate-already-satisfied.output.ALREADY_SATISFIED != 'true'"
     agent: war-council-architect-opr
     task_class: medium_work
     prompt: |
@@ -268,6 +281,8 @@ nodes:
     provider: codex
     agent: war-council-architect-opr
     depends_on: [plan]
+    trigger_rule: all_done
+    when: "$gate-already-satisfied.output.ALREADY_SATISFIED != 'true'"
     task_class: medium_work
     loop:
       fresh_context: true
@@ -361,6 +376,7 @@ nodes:
   - id: capture-run-scope
     persona: major-build
     depends_on: [plan-review]
+    trigger_rule: all_done
     load_bearing: true
     bash: |
       set -euo pipefail
@@ -387,6 +403,8 @@ nodes:
     provider: codex
     model: gpt-5.5
     depends_on: [capture-run-scope]
+    trigger_rule: all_done
+    when: "$gate-already-satisfied.output.ALREADY_SATISFIED != 'true'"
     task_class: medium_work
     wall_timeout_ms: 1800000
     loop:
@@ -540,6 +558,7 @@ nodes:
   - id: checkpoint-push
     persona: overseer
     depends_on: [implement]
+    trigger_rule: all_done
     bash: |
       set -uo pipefail
 
@@ -652,12 +671,30 @@ nodes:
       if printf '%s\n' "$IMPL" | grep -qE '^(COMPLETE|BUILD_COMPLETE)$|<promise>COMPLETE</promise>'; then SAID_COMPLETE=true; fi
       SAID_ALREADY=false
       if printf '%s\n' "$IMPL" | grep -qE '^ALREADY_SATISFIED:'; then SAID_ALREADY=true; fi
+      GATE_ALREADY=false
+      GATE_JSON=$(cat <<'BDC_FEATURE_DEV_GATE_ALREADY_SATISFIED_20260713_A8E4D3'
+      $gate-already-satisfied.output
+      BDC_FEATURE_DEV_GATE_ALREADY_SATISFIED_20260713_A8E4D3
+      )
+      if [ -n "$GATE_JSON" ]; then
+        GATE_ALREADY=$(GATE_JSON="$GATE_JSON" python3 - <<'PY' 2>/dev/null || printf 'false\n'
+      import json
+      import os
+      try:
+          print('true' if json.loads(os.environ.get('GATE_JSON', '{}')).get('ALREADY_SATISFIED') is True else 'false')
+      except Exception:
+          print('false')
+      PY
+      )
+      fi
+      case "$GATE_ALREADY" in true) ;; *) GATE_ALREADY=false ;; esac
 
       echo "WORKTREE=$WT"
       echo "CHANGED_FILES=$CHANGED"
       echo "COMMITS_AHEAD=$AHEAD"
       echo "IMPL_SAID_COMPLETE=$SAID_COMPLETE"
       echo "IMPL_SAID_ALREADY_SATISFIED=$SAID_ALREADY"
+      echo "GATE_ALREADY_SATISFIED=$GATE_ALREADY"
 
       if [ "$HAS_WORK" = "true" ]; then
         echo "BUILD_OUTCOME=REAL_BUILD"
@@ -665,7 +702,14 @@ nodes:
         exit 0
       fi
 
-      # No work in this worktree.
+      # No work in this worktree. A true node-level skip leaves $implement.output empty,
+      # so classify the already-satisfied path directly from gate-already-satisfied JSON.
+      if [ "$GATE_ALREADY" = "true" ]; then
+        echo "BUILD_OUTCOME=ALREADY_SATISFIED"
+        echo "assert-implement-produced-work: gate reported ALREADY_SATISFIED and worktree is genuinely clean -- legitimate no-op"
+        exit 0
+      fi
+
       # Codex FINDING_3 interaction: implement now emits BOTH "ALREADY_SATISFIED:" AND
       # COMPLETE in the genuine no-op case (COMPLETE is required to exit the until:COMPLETE
       # loop). So ALREADY_SATISFIED WINS whenever the agent declared it AND the worktree is
@@ -694,6 +738,7 @@ nodes:
   - id: derive-run-source-scope
     persona: major-build
     depends_on: [assert-implement-produced-work]
+    trigger_rule: all_done
     load_bearing: true
     bash: |
       set -euo pipefail
@@ -784,6 +829,7 @@ nodes:
   # Anchor: a Claude-authored UI build put 87 non-ASCII chars into packages/web and merged.
   - id: ascii-gate
     depends_on: [ascii-autofix]
+    trigger_rule: all_done
     persona: major-build
     load_bearing: true
     bash: |
