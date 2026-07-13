@@ -15,6 +15,12 @@
     "claude": 1,
     "codex": 1
   },
+  "board_delivery": {
+    "enabled": false,
+    "credential_id": "example-board-worker",
+    "token_env": "DISPATCH_WORKER_TOKEN",
+    "allowed_principals": ["claude"]
+  },
   "agents": {
     "claude": {
       "command": "claude",

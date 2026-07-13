@@ -134,6 +134,34 @@ describe('PostgresAdapter', () => {
     });
   });
 
+  describe('Board motion dispatch schema', () => {
+    test('numbered migration, combined schema, and SQLite bootstrap define resolution fields', () => {
+      const migration = readFileSync(
+        resolve(import.meta.dir, '../../../../../migrations', '031_board_motion_dispatch.sql'),
+        'utf8'
+      );
+      const combined = readFileSync(
+        resolve(import.meta.dir, '../../../../../migrations', '000_combined.sql'),
+        'utf8'
+      );
+      const sqlite = readFileSync(resolve(import.meta.dir, 'sqlite.ts'), 'utf8');
+
+      for (const schema of [migration, combined, sqlite]) {
+        expect(schema).toContain('recipient_alias');
+        expect(schema).toContain('motion_id');
+        expect(schema).toContain('motion_revision_sha');
+        expect(schema).toContain('resolved_recipient');
+        expect(schema).toContain('resolved_xo_lease_id');
+        expect(schema).toContain('resolved_xo_fencing_token');
+        expect(schema).toContain('resolved_at');
+        expect(schema).toContain('idx_dispatch_board_pending');
+        expect(schema).toContain('board_motion');
+        expect(schema).toContain('board_petition_delivered');
+        expect(schema).not.toContain('board_execution_claim');
+      }
+    });
+  });
+
   // -------------------------------------------------------------------------
   // Static properties
   // -------------------------------------------------------------------------
