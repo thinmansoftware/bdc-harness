@@ -274,6 +274,7 @@ nodes:
     trigger_rule: all_done
     when: "$gate-already-satisfied.output.ALREADY_SATISFIED != 'true'"
     task_class: medium_work
+    idle_timeout: 600000
     loop:
       fresh_context: true
       # Success-only sentinel. The war-council-architect persona is READ-ONLY
@@ -397,6 +398,7 @@ nodes:
     agent: major-build
     task_class: medium_work
     wall_timeout_ms: 1800000
+    idle_timeout: 600000
     loop:
       prompt: |
         Implement the approved plan for this BDC feature Work Order.
@@ -1098,6 +1100,7 @@ nodes:
     depends_on: [diff-review, classify-diff-review]
     when: "$classify-diff-review.output.verdict == 'needs_revision'"
     task_class: medium_work
+    idle_timeout: 600000
     loop:
       fresh_context: true
       # NF3 + schema fix: the loader REQUIRES loop.until (schemas/loop.ts:11,
