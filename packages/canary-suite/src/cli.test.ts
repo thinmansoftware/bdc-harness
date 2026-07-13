@@ -8,7 +8,7 @@ const baseReport: CanaryReport = {
   level: 1,
   generatedAt: '2026-07-10T12:00:00.000Z',
   requestId: `sha256:${'a'.repeat(64)}`,
-  verdict: 'passed',
+  verdict: 'static_only',
   reasonCodes: [],
   evidenceRefs: [],
   lanes: [],
@@ -41,9 +41,13 @@ test('fails before runner/network access when the token is missing', async () =>
 
 test.each([
   ['passed', 0],
+  ['probe_passed', 0],
   ['failed', 2],
+  ['probe_failed', 2],
+  ['build_failed', 2],
   ['blocked', 3],
   ['aborted', 4],
+  ['static_only', 5],
 ] as const)('maps %s to exit %d and never prints the token', async (verdict, expectedExit) => {
   const token = 'fixture-secret-token';
   const output: string[] = [];

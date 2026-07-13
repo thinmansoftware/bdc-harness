@@ -28,6 +28,7 @@
   },
   "dependencies": {
     "@archon/git": "workspace:*",
+    "@archon/core": "workspace:*",
     "@archon/overseer": "workspace:*",
     "@archon/paths": "workspace:*",
     "@archon/persona-context-loader": "workspace:*",

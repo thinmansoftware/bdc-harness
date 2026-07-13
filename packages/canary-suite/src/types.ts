@@ -1,4 +1,12 @@
-export type CanaryVerdict = 'passed' | 'failed' | 'blocked' | 'aborted';
+export type CanaryVerdict =
+  | 'passed'
+  | 'failed'
+  | 'blocked'
+  | 'aborted'
+  | 'probe_passed'
+  | 'probe_failed'
+  | 'static_only'
+  | 'build_failed';
 
 export interface LaneManifest {
   readonly name: CanaryLaneName;
@@ -132,6 +140,7 @@ export interface CanaryReduction {
   readonly verdict: CanaryVerdict;
   readonly reasonCodes: readonly string[];
   readonly evidenceRefs: readonly string[];
+  readonly reasonClass?: 'infra' | 'fixture' | 'static';
 }
 
 export interface CanaryLaneReport {

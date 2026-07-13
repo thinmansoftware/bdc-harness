@@ -1,4 +1,4 @@
-import { describe, test, expect, mock } from 'bun:test';
+import { beforeEach, describe, test, expect, mock } from 'bun:test';
 import { OpenAPIHono } from '@hono/zod-openapi';
 import type { ConversationLockManager } from '@archon/core';
 import type { WebAdapter } from '../adapters/web';
@@ -43,6 +43,8 @@ const mockDiscoverWorkflows = mock(async (_cwd: string) => ({
   ],
 }));
 
+const mockLoadConfig = mock(async () => ({}));
+
 // Default: returns a valid workflow. Use mockReturnValueOnce in tests that need a parse failure.
 const mockParseWorkflow = mock((_content: string, _filename: string) => ({
   workflow: makeTestWorkflow({ name: 'test', description: 'Test workflow' }),
@@ -62,7 +64,7 @@ const mockGetLoaderErrors = mock(() => [
 mock.module('@archon/core', () => ({
   handleMessage: mock(async () => {}),
   getDatabaseType: () => 'sqlite',
-  loadConfig: mock(async () => ({})),
+  loadConfig: mockLoadConfig,
   getWorkflowFolderSearchPaths: mock(() => ['.archon/workflows']),
   getCommandFolderSearchPaths: mock(() => ['.archon/commands', '.archon/commands/defaults']),
   getDefaultCommandsPath: mock(() => '/tmp/.archon-test-nonexistent/commands/defaults'),
@@ -95,6 +97,19 @@ mock.module('@archon/workflows/loader', () => ({
   parseWorkflow: mockParseWorkflow,
   getLoaderErrors: mockGetLoaderErrors,
 }));
+const mockResolveWorkflowProbeBindings = mock(() => [
+  {
+    bindingKey: 'binding-key',
+    providerId: 'codex',
+    modelId: 'gpt-5.5',
+    authContextId: 'codex:chatgpt-account',
+    assistantConfigHash: 'assistant',
+    nodeOverrideHash: 'node',
+  },
+]);
+mock.module('@archon/workflows/reliability/resolve-binding', () => ({
+  resolveWorkflowProbeBindings: mockResolveWorkflowProbeBindings,
+}));
 mock.module('@archon/workflows/command-validation', () => ({
   isValidCommandName: mock(
     (name: string) =>
@@ -125,6 +140,10 @@ mock.module('@archon/core/db/isolation-environments', () => ({}));
 mock.module('@archon/core/db/workflows', () => ({}));
 mock.module('@archon/core/db/workflow-events', () => ({}));
 mock.module('@archon/core/db/messages', () => ({}));
+const mockFindActiveKnownBadBinding = mock(async () => null);
+mock.module('@archon/core/db/known-bad-bindings', () => ({
+  findActiveByBindingKey: mockFindActiveKnownBadBinding,
+}));
 
 const mockListCodebases = mock(async () => [{ default_cwd: '/tmp/project' }]);
 mock.module('@archon/core/db/codebases', () => ({
@@ -423,6 +442,21 @@ describe('GET /api/workflows/:name - cwd validation', () => {
 });
 
 describe('PUT /api/workflows/:name', () => {
+  beforeEach(() => {
+    mockLoadConfig.mockImplementation(async () => ({}));
+    mockResolveWorkflowProbeBindings.mockImplementation(() => [
+      {
+        bindingKey: 'binding-key',
+        providerId: 'codex',
+        modelId: 'gpt-5.5',
+        authContextId: 'codex:chatgpt-account',
+        assistantConfigHash: 'assistant',
+        nodeOverrideHash: 'node',
+      },
+    ]);
+    mockFindActiveKnownBadBinding.mockImplementation(async () => null);
+  });
+
   test('returns 400 for invalid name', async () => {
     const app = createTestApp();
     registerApiRoutes(app, {} as WebAdapter, {} as ConversationLockManager);
@@ -507,6 +541,83 @@ describe('PUT /api/workflows/:name', () => {
     const body = (await response.json()) as { error: string; detail: string };
     expect(body.error).toContain('invalid');
     expect(body.detail).toBeDefined();
+  });
+
+  test('returns 400 with known_bad_binding reason when save targets an active bad binding', async () => {
+    const testDir = join(tmpdir(), `wf-known-bad-test-${Date.now()}`);
+    mockFindActiveKnownBadBinding.mockImplementationOnce(async () => ({
+      binding_key: 'binding-key',
+      provider_id: 'codex',
+      model_id: 'gpt-5.5',
+      auth_context_id: 'codex:chatgpt-account',
+      assistant_config_hash: 'assistant',
+      node_override_hash: 'node',
+      error_class: 'structural_model_not_supported',
+      http_status: 400,
+      error_body_excerpt: 'model not supported',
+      source: 'fire_probe',
+      first_seen_at: new Date().toISOString(),
+      last_seen_at: new Date().toISOString(),
+      hit_count: 1,
+      cleared_at: null,
+      cleared_reason: null,
+    }));
+
+    try {
+      const app = createTestApp();
+      registerApiRoutes(app, {} as WebAdapter, {} as ConversationLockManager);
+      mockListCodebases.mockImplementationOnce(async () => [{ default_cwd: testDir }]);
+
+      const response = await app.request(`/api/workflows/my-workflow?cwd=${testDir}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          definition: {
+            name: 'my-workflow',
+            description: 'Test',
+            nodes: [{ id: 'plan', prompt: 'plan', provider: 'codex', model: 'gpt-5.5' }],
+          },
+        }),
+      });
+
+      expect(response.status).toBe(400);
+      const body = (await response.json()) as { error: string; detail: string };
+      expect(body.error).toContain('known bad binding');
+      expect(body.detail).toBe('known_bad_binding:codex:gpt-5.5:model not supported');
+    } finally {
+      await rm(testDir, { recursive: true, force: true });
+    }
+  });
+
+  test('fails open when known-bad binding resolution cannot inspect a workflow', async () => {
+    const testDir = join(tmpdir(), `wf-known-bad-fail-open-test-${Date.now()}`);
+    mockFindActiveKnownBadBinding.mockClear();
+    mockResolveWorkflowProbeBindings.mockImplementationOnce(() => {
+      throw new Error('unknown provider');
+    });
+
+    try {
+      const app = createTestApp();
+      registerApiRoutes(app, {} as WebAdapter, {} as ConversationLockManager);
+      mockListCodebases.mockImplementationOnce(async () => [{ default_cwd: testDir }]);
+
+      const response = await app.request(`/api/workflows/my-workflow?cwd=${testDir}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          definition: {
+            name: 'my-workflow',
+            description: 'Test',
+            nodes: [{ id: 'plan', prompt: 'plan', provider: 'future-provider' }],
+          },
+        }),
+      });
+
+      expect(response.status).toBe(200);
+      expect(mockFindActiveKnownBadBinding).not.toHaveBeenCalled();
+    } finally {
+      await rm(testDir, { recursive: true, force: true });
+    }
   });
 
   test('saves valid workflow and returns parsed workflow with source:project', async () => {

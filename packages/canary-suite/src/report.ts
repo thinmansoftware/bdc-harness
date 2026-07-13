@@ -2,6 +2,7 @@ import { randomUUID } from 'crypto';
 import { link, mkdir, readFile, rm, writeFile } from 'fs/promises';
 import { join } from 'path';
 import type { CanaryPlan, CanaryReduction, CanaryReport, CanaryVerdict } from './types';
+import { verdictForStaticCapability } from './layer3-policy';
 
 export function createCanaryReport(
   suiteRunId: string,
@@ -28,7 +29,8 @@ export function createCanaryReport(
             : capabilityFailed
               ? 'failed'
               : 'passed';
-      const verdict: CanaryVerdict = capabilityStatus === 'passed' ? 'passed' : 'failed';
+      // Clean static capability is demoted by policy to static_only, never passed.
+      const verdict: CanaryVerdict = verdictForStaticCapability(capabilityStatus);
       return {
         lane: route.lane,
         level,

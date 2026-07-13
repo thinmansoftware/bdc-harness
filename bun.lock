@@ -46,7 +46,9 @@
         "archon-canary": "./src/cli.ts",
       },
       "dependencies": {
+        "@archon/providers": "workspace:*",
         "@archon/smart-cauldron": "workspace:*",
+        "@archon/workflows": "workspace:*",
         "zod": "^3.25.28",
       },
     },
@@ -283,6 +285,7 @@
       "name": "@archon/workflows",
       "version": "0.3.10",
       "dependencies": {
+        "@archon/core": "workspace:*",
         "@archon/git": "workspace:*",
         "@archon/overseer": "workspace:*",
         "@archon/paths": "workspace:*",
