@@ -15,6 +15,11 @@ import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 
+// Windows CI runners' git is sometimes slower than bun's default 5000ms test
+// timeout (flakes on 2026-07-13: runs 29249126291 and 29251514278). Raise the
+// per-test timeout well above worst observed latency.
+const TEST_TIMEOUT_MS = 30000;
+
 // The core backstop bash logic extracted from the fixed commit-and-push nodes.
 // Uses BRANCH variable passed via env to bash (set before this snippet in the workflow).
 // $DIRTY, $BRANCH etc. without braces are fine in TS template literals; \${BRANCH}
@@ -94,6 +99,10 @@ beforeEach(() => {
   git(['clone', originDir, worktreeDir], tmpdir());
   git(['config', 'user.email', 'test@test.com'], worktreeDir);
   git(['config', 'user.name', 'Test'], worktreeDir);
+  // Avoid Windows-specific stalls: fsmonitor daemon spin-up and auto-gc can
+  // add seconds per git invocation on CI runners.
+  git(['config', 'core.fsmonitor', 'false'], worktreeDir);
+  git(['config', 'gc.auto', '0'], worktreeDir);
 
   // Make an initial commit on main so origin/main exists
   writeFileSync(join(worktreeDir, 'README.md'), 'init\n');
@@ -116,68 +125,88 @@ afterEach(() => {
 
 describe('commit-and-push backstop logic', () => {
   describe('Scenario A: implement loop committed AND pushed (already synced)', () => {
-    it('exits 0 with already_synced when origin/BRANCH exists and HEAD matches', () => {
-      // Simulate: implement loop made a commit and pushed it
-      writeFileSync(join(worktreeDir, 'feature.ts'), 'export const x = 1;\n');
-      git(['add', 'feature.ts'], worktreeDir);
-      git(['commit', '-m', 'feat: implement work'], worktreeDir);
-      git(['push', 'origin', 'feature-test'], worktreeDir);
+    it(
+      'exits 0 with already_synced when origin/BRANCH exists and HEAD matches',
+      () => {
+        // Simulate: implement loop made a commit and pushed it
+        writeFileSync(join(worktreeDir, 'feature.ts'), 'export const x = 1;\n');
+        git(['add', 'feature.ts'], worktreeDir);
+        git(['commit', '-m', 'feat: implement work'], worktreeDir);
+        git(['push', 'origin', 'feature-test'], worktreeDir);
 
-      // Working tree is clean; origin/feature-test exists and HEAD matches
-      const result = bash(BACKSTOP_SCRIPT, worktreeDir, { BRANCH: 'feature-test' });
-      expect(result.exitCode).toBe(0);
-      expect(result.stdout).toContain('BACKSTOP_RESULT=already_synced');
-    });
+        // Working tree is clean; origin/feature-test exists and HEAD matches
+        const result = bash(BACKSTOP_SCRIPT, worktreeDir, { BRANCH: 'feature-test' });
+        expect(result.exitCode).toBe(0);
+        expect(result.stdout).toContain('BACKSTOP_RESULT=already_synced');
+      },
+      TEST_TIMEOUT_MS
+    );
   });
 
   describe('Scenario B: implement loop committed but did NOT push (false-negative case)', () => {
-    it('exits 0 with push_needed when tree is clean but commits exist ahead of origin', () => {
-      // Simulate: implement loop committed but push was skipped/failed
-      writeFileSync(join(worktreeDir, 'feature.ts'), 'export const x = 1;\n');
-      git(['add', 'feature.ts'], worktreeDir);
-      git(['commit', '-m', 'feat: implement work'], worktreeDir);
-      // Do NOT push -- this is the false-negative scenario
+    it(
+      'exits 0 with push_needed when tree is clean but commits exist ahead of origin',
+      () => {
+        // Simulate: implement loop committed but push was skipped/failed
+        writeFileSync(join(worktreeDir, 'feature.ts'), 'export const x = 1;\n');
+        git(['add', 'feature.ts'], worktreeDir);
+        git(['commit', '-m', 'feat: implement work'], worktreeDir);
+        // Do NOT push -- this is the false-negative scenario
 
-      // Working tree is clean; but HEAD is ahead of origin (no origin/feature-test yet)
-      const result = bash(BACKSTOP_SCRIPT, worktreeDir, { BRANCH: 'feature-test' });
-      expect(result.exitCode).toBe(0);
-      expect(result.stdout).toContain('BACKSTOP_RESULT=push_needed');
-      expect(result.stdout).toContain('commits_ahead=1');
-    });
+        // Working tree is clean; but HEAD is ahead of origin (no origin/feature-test yet)
+        const result = bash(BACKSTOP_SCRIPT, worktreeDir, { BRANCH: 'feature-test' });
+        expect(result.exitCode).toBe(0);
+        expect(result.stdout).toContain('BACKSTOP_RESULT=push_needed');
+        expect(result.stdout).toContain('commits_ahead=1');
+      },
+      TEST_TIMEOUT_MS
+    );
 
-    it('exits 0 with push_needed when multiple commits exist ahead', () => {
-      writeFileSync(join(worktreeDir, 'a.ts'), 'a\n');
-      git(['add', 'a.ts'], worktreeDir);
-      git(['commit', '-m', 'feat: first'], worktreeDir);
-      writeFileSync(join(worktreeDir, 'b.ts'), 'b\n');
-      git(['add', 'b.ts'], worktreeDir);
-      git(['commit', '-m', 'feat: second'], worktreeDir);
-      // Not pushed
+    it(
+      'exits 0 with push_needed when multiple commits exist ahead',
+      () => {
+        writeFileSync(join(worktreeDir, 'a.ts'), 'a\n');
+        git(['add', 'a.ts'], worktreeDir);
+        git(['commit', '-m', 'feat: first'], worktreeDir);
+        writeFileSync(join(worktreeDir, 'b.ts'), 'b\n');
+        git(['add', 'b.ts'], worktreeDir);
+        git(['commit', '-m', 'feat: second'], worktreeDir);
+        // Not pushed
 
-      const result = bash(BACKSTOP_SCRIPT, worktreeDir, { BRANCH: 'feature-test' });
-      expect(result.exitCode).toBe(0);
-      expect(result.stdout).toContain('BACKSTOP_RESULT=push_needed');
-      expect(result.stdout).toContain('commits_ahead=2');
-    });
+        const result = bash(BACKSTOP_SCRIPT, worktreeDir, { BRANCH: 'feature-test' });
+        expect(result.exitCode).toBe(0);
+        expect(result.stdout).toContain('BACKSTOP_RESULT=push_needed');
+        expect(result.stdout).toContain('commits_ahead=2');
+      },
+      TEST_TIMEOUT_MS
+    );
   });
 
   describe('Scenario C: implement loop did nothing (true no-op)', () => {
-    it('exits 1 with true_noop when tree is clean and no commits ahead', () => {
-      // No work done: HEAD is at origin/main, feature branch has no extra commits
-      const result = bash(BACKSTOP_SCRIPT, worktreeDir, { BRANCH: 'feature-test' });
-      expect(result.exitCode).toBe(1);
-      expect(result.stdout).toContain('BACKSTOP_RESULT=true_noop');
-    });
+    it(
+      'exits 1 with true_noop when tree is clean and no commits ahead',
+      () => {
+        // No work done: HEAD is at origin/main, feature branch has no extra commits
+        const result = bash(BACKSTOP_SCRIPT, worktreeDir, { BRANCH: 'feature-test' });
+        expect(result.exitCode).toBe(1);
+        expect(result.stdout).toContain('BACKSTOP_RESULT=true_noop');
+      },
+      TEST_TIMEOUT_MS
+    );
   });
 
   describe('Scenario D: dirty working tree (uncommitted changes)', () => {
-    it('exits 0 with dirty_tree when files are modified but not committed', () => {
-      writeFileSync(join(worktreeDir, 'feature.ts'), 'uncommitted work\n');
-      // Not staged, not committed -- dirty tree
+    it(
+      'exits 0 with dirty_tree when files are modified but not committed',
+      () => {
+        writeFileSync(join(worktreeDir, 'feature.ts'), 'uncommitted work\n');
+        // Not staged, not committed -- dirty tree
 
-      const result = bash(BACKSTOP_SCRIPT, worktreeDir, { BRANCH: 'feature-test' });
-      expect(result.exitCode).toBe(0);
-      expect(result.stdout).toContain('BACKSTOP_RESULT=dirty_tree');
-    });
+        const result = bash(BACKSTOP_SCRIPT, worktreeDir, { BRANCH: 'feature-test' });
+        expect(result.exitCode).toBe(0);
+        expect(result.stdout).toContain('BACKSTOP_RESULT=dirty_tree');
+      },
+      TEST_TIMEOUT_MS
+    );
   });
 });
