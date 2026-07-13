@@ -18,6 +18,9 @@ function record(repo: string): WatchedRunRecord {
       checks: { total: 1, passed: 1, failed: 0, pending: 0 },
       mergeable: true,
       pr: { owner: 'bluedevilcollectibles', repo, number: 12 },
+      prTitle: 'Add overseer merge judge',
+      filesChangedCount: 3,
+      diffStat: '+42 -7',
     },
   };
 }
@@ -44,6 +47,87 @@ describe('merge-ready action', () => {
         class: 'tail_node_false_fail',
         action: 'merge_ready',
       })
+    );
+  });
+
+  test('flag off merge proceeds without invoking grok judge', async () => {
+    const mergePullRequest = mock(async () => ({ merged: true, message: 'merged' }));
+    const insertOverseerAction = mock(async () => undefined);
+    const judgeSecondOpinion = mock(async () => 'hold' as const);
+
+    const result = await handleMergeReady(
+      record('bdc-harness'),
+      {
+        findPullRequest: async () => {
+          throw new Error('not used');
+        },
+        mergePullRequest,
+        insertOverseerAction,
+        judgeSecondOpinion,
+      },
+      { mergeJudge: 'off' }
+    );
+
+    expect(result.action).toBe('merged');
+    expect(result.merged).toBe(true);
+    expect(judgeSecondOpinion).not.toHaveBeenCalled();
+    expect(mergePullRequest).toHaveBeenCalledTimes(1);
+    expect(insertOverseerAction).toHaveBeenCalledWith(
+      expect.objectContaining({ action: 'merge_ready' })
+    );
+  });
+
+  test('grok approve merge proceeds and records merge_judged action', async () => {
+    const mergePullRequest = mock(async () => ({ merged: true, message: 'merged' }));
+    const insertOverseerAction = mock(async () => undefined);
+    const judgeSecondOpinion = mock(async () => 'approve' as const);
+
+    const result = await handleMergeReady(
+      record('bdc-harness'),
+      {
+        findPullRequest: async () => {
+          throw new Error('not used');
+        },
+        mergePullRequest,
+        insertOverseerAction,
+        judgeSecondOpinion,
+      },
+      { mergeJudge: 'grok' }
+    );
+
+    expect(result.action).toBe('merged');
+    expect(result.merged).toBe(true);
+    expect(judgeSecondOpinion).toHaveBeenCalledTimes(1);
+    expect(mergePullRequest).toHaveBeenCalledTimes(1);
+    expect(insertOverseerAction).toHaveBeenCalledWith(
+      expect.objectContaining({ action: 'merge_judged', result: 'approve' })
+    );
+  });
+
+  test('grok hold blocks merge and records merge_held action', async () => {
+    const mergePullRequest = mock(async () => ({ merged: true, message: 'merged' }));
+    const insertOverseerAction = mock(async () => undefined);
+    const judgeSecondOpinion = mock(async () => 'hold' as const);
+
+    const result = await handleMergeReady(
+      record('bdc-harness'),
+      {
+        findPullRequest: async () => {
+          throw new Error('not used');
+        },
+        mergePullRequest,
+        insertOverseerAction,
+        judgeSecondOpinion,
+      },
+      { mergeJudge: 'grok' }
+    );
+
+    expect(result.action).toBe('merge_held');
+    expect(result.merged).toBe(false);
+    expect(judgeSecondOpinion).toHaveBeenCalledTimes(1);
+    expect(mergePullRequest).not.toHaveBeenCalled();
+    expect(insertOverseerAction).toHaveBeenCalledWith(
+      expect.objectContaining({ action: 'merge_held', result: 'hold' })
     );
   });
 
