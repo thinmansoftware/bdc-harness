@@ -14,7 +14,7 @@
 
 import type { ErrorClass } from './classify.ts';
 
-export type Decision = 'retry' | 'skip' | 'commit_and_push_anyway' | 'escalate';
+export type Decision = 'retry' | 'skip' | 'commit_and_push_anyway' | 'escalate' | 'merge_ready';
 
 export interface DecideInput {
   errorClass: ErrorClass;

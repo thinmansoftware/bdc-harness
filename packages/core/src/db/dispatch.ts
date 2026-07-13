@@ -1,6 +1,9 @@
 import { randomUUID } from 'crypto';
+import { createLogger } from '@archon/paths';
 import { getDatabase } from './connection';
 import { appendBoardAuditEvent, resolveBoardRecipient } from './board-authority';
+
+const log = createLogger('db/dispatch');
 
 export type DispatchTaskType =
   | 'agent_message'
@@ -101,7 +104,15 @@ function parseCapabilities(value: unknown): Record<string, unknown> {
     return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
       ? (parsed as Record<string, unknown>)
       : {};
-  } catch {
+  } catch (err) {
+    log.warn(
+      {
+        err: err as Error,
+        valueType: typeof value,
+        valuePreview: typeof value === 'string' ? value.slice(0, 100) : String(value),
+      },
+      'db.capabilities_parse_failed'
+    );
     return {};
   }
 }

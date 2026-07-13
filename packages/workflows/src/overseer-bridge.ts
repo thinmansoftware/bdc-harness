@@ -224,6 +224,11 @@ function translateDecision(decision: Decision, errorMsg: string, outputSoFar: st
       // For v1: treat as escalate (no PR-with-note path wired at AI-node sites).
       return { state: 'failed', output: outputSoFar, error: errorMsg };
 
+    case 'merge_ready':
+      // Standing overseer service handles this decision directly after PR evidence
+      // judging. The per-node bridge should never auto-merge from an AI-node hook.
+      return { state: 'failed', output: outputSoFar, error: errorMsg };
+
     default: {
       // Compile-time exhaustiveness guard. If Decision gains a 5th variant this fails to build.
       decision satisfies never;
