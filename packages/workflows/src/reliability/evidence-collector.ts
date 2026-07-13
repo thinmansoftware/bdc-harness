@@ -39,9 +39,6 @@ export interface PullRequestEvidence {
   readonly baseRef: string;
   readonly headRef: string;
   readonly headSha: string;
-  // M-26: the merge commit oid, present only when state is MERGED. Required to
-  // gate a recovered transition on live merged-PR evidence.
-  readonly mergeSha: string | null;
   readonly files: readonly string[];
   readonly requiredChecks: readonly RequiredCheckEvidence[];
 }
@@ -125,7 +122,7 @@ function requiredGateState(gates: readonly GateEvidence[]): ValidationState {
   return 'passed';
 }
 
-export function repositoryFromRemote(remote: string): string {
+function repositoryFromRemote(remote: string): string {
   const match = /github\.com[/:]([^/]+\/[^/]+?)(?:\.git)?$/.exec(remote.trim());
   if (!match?.[1]) throw new Error('scope_authority_missing: GitHub canonicalRemote');
   return match[1];
@@ -173,10 +170,7 @@ export function parseGitNameStatus(output: string): readonly GitChangeEvidence[]
     });
 }
 
-export function gateEvidenceFromEvents(
-  gateId: string,
-  events: readonly WorkflowEventRecord[]
-): GateEvidence {
+function gateFromEvents(gateId: string, events: readonly WorkflowEventRecord[]): GateEvidence {
   const event = [...events]
     .reverse()
     .find(candidate => candidate.step_name === gateId && candidate.event_type.startsWith('node_'));
@@ -187,15 +181,14 @@ export function gateEvidenceFromEvents(
     return { id: gateId, required: true, state: 'failed' };
   }
   const gateResult = event.data.gate_result;
-  let recognizedPass = false;
   if (typeof gateResult === 'object' && gateResult !== null) {
     const record = gateResult as Record<string, unknown>;
     if (record.outcome === 'fail' || record.passed === false) {
       return { id: gateId, required: true, state: 'failed' };
     }
-    recognizedPass =
-      (record.passed === true && ['bash', 'script', 'ai'].includes(String(record.nodeType))) ||
-      (record.outcome === 'pass' && record.gate === gateId);
+    if (record.outcome !== 'pass' && record.passed !== true) {
+      return { id: gateId, required: true, state: 'indeterminate' };
+    }
   }
   const nodeOutput = event.data.node_output;
   if (
@@ -203,12 +196,6 @@ export function gateEvidenceFromEvents(
     /"status"\s*:\s*"BLOCKED"|NEEDS_REVISION|VALIDATION:\s*(?:FAIL|BLOCKED)/i.test(nodeOutput)
   ) {
     return { id: gateId, required: true, state: 'failed', evidence: nodeOutput };
-  }
-  const exactValidationPass =
-    typeof nodeOutput === 'string' &&
-    /^[ \t]*(?:INFRA )?VALIDATION:[ \t]*PASS[ \t]*$/im.test(nodeOutput);
-  if (!recognizedPass && !exactValidationPass) {
-    return { id: gateId, required: true, state: 'indeterminate' };
   }
   return {
     id: gateId,
@@ -220,7 +207,7 @@ export function gateEvidenceFromEvents(
   };
 }
 
-export function parsePullRequest(json: string): PullRequestEvidence | null {
+function parsePullRequest(json: string): PullRequestEvidence | null {
   if (!json.trim()) return null;
   const value = JSON.parse(json) as Record<string, unknown>;
   if (typeof value.url !== 'string' || typeof value.number !== 'number') return null;
@@ -246,11 +233,6 @@ export function parsePullRequest(json: string): PullRequestEvidence | null {
     const name = stringField(record.name ?? record.context) || `check-${String(index + 1)}`;
     return { name, state };
   });
-  const mergeCommit =
-    typeof value.mergeCommit === 'object' && value.mergeCommit !== null
-      ? (value.mergeCommit as Record<string, unknown>)
-      : null;
-  const mergeShaRaw = mergeCommit ? stringField(mergeCommit.oid) : '';
   return {
     url: value.url,
     number: value.number,
@@ -259,7 +241,6 @@ export function parsePullRequest(json: string): PullRequestEvidence | null {
     baseRef: stringField(value.baseRefName),
     headRef: stringField(value.headRefName),
     headSha: stringField(value.headRefOid),
-    mergeSha: mergeShaRaw === '' ? null : mergeShaRaw,
     files,
     requiredChecks,
   };
@@ -299,7 +280,7 @@ export async function collectRuntimeEvidence(
         '--repo',
         repository,
         '--json',
-        'url,number,state,isDraft,baseRefName,headRefName,headRefOid,mergeCommit,files,statusCheckRollup',
+        'url,number,state,isDraft,baseRefName,headRefName,headRefOid,files,statusCheckRollup',
       ],
       request.cwd
     );
@@ -308,7 +289,7 @@ export async function collectRuntimeEvidence(
     pullRequest = null;
   }
   const events = await store.listWorkflowEvents(request.runId);
-  const gates = request.requiredGateIds.map(id => gateEvidenceFromEvents(id, events));
+  const gates = request.requiredGateIds.map(id => gateFromEvents(id, events));
   return collectMechanicalEvidence({
     authority,
     executionState: request.executionState,

@@ -2,7 +2,6 @@ import { describe, test, expect, afterEach } from 'bun:test';
 import { SqliteAdapter } from './sqlite';
 import { unlinkSync } from 'fs';
 import { join } from 'path';
-import { Database } from 'bun:sqlite';
 
 let currentDbPath = '';
 
@@ -85,82 +84,6 @@ describe('SqliteAdapter', () => {
         'idx_supervisor_observations_incident',
         'idx_supervisor_repair_leases_expiry',
       ]);
-    });
-
-    test('upgrades legacy supervisor actions before creating attempt indexes and enforces NOT NULL', async () => {
-      currentDbPath = join(
-        import.meta.dir,
-        `.test-sqlite-adapter-upgrade-${Date.now()}-${Math.random().toString(36).slice(2)}.db`
-      );
-      const legacy = new Database(currentDbPath);
-      legacy.run(`
-        CREATE TABLE remote_agent_supervisor_incidents (
-          incident_id TEXT PRIMARY KEY,
-          incident_key TEXT NOT NULL UNIQUE,
-          run_id TEXT NOT NULL,
-          wo_id TEXT NOT NULL,
-          status TEXT NOT NULL CHECK (status IN ('open', 'repairing', 'recovered', 'escalated')),
-          created_at TEXT NOT NULL,
-          updated_at TEXT NOT NULL
-        );
-        INSERT INTO remote_agent_supervisor_incidents
-          (incident_id, incident_key, run_id, wo_id, status, created_at, updated_at)
-        VALUES
-          ('incident-1', 'recovery:run-1', 'run-1', 'WO-1', 'open',
-           '2026-07-12T00:00:00Z', '2026-07-12T00:00:00Z');
-        CREATE TABLE remote_agent_supervisor_actions (
-          action_id TEXT PRIMARY KEY,
-          incident_id TEXT NOT NULL,
-          owner_id TEXT NOT NULL,
-          fencing_token INTEGER NOT NULL,
-          action_type TEXT NOT NULL,
-          outcome TEXT NOT NULL,
-          evidence_refs TEXT NOT NULL DEFAULT '[]',
-          created_at TEXT NOT NULL,
-          status TEXT NOT NULL DEFAULT 'completed',
-          completed_at TEXT
-        );
-        CREATE UNIQUE INDEX uq_supervisor_action_incident
-          ON remote_agent_supervisor_actions(incident_id);
-        INSERT INTO remote_agent_supervisor_actions
-          (action_id, incident_id, owner_id, fencing_token, action_type, outcome, created_at)
-        VALUES ('action-1', 'incident-1', 'xo', 1, 'repair', 'completed', '2026-07-12T00:00:00Z');
-      `);
-      legacy.close();
-
-      db = new SqliteAdapter(currentDbPath);
-
-      const columns = await db.query<{ name: string; is_not_null: number }>(
-        `SELECT name, "notnull" AS is_not_null
-         FROM pragma_table_info('remote_agent_supervisor_actions')`
-      );
-      expect(columns.rows.find(column => column.name === 'attempt_id')?.is_not_null).toBe(1);
-      const upgraded = await db.query<{ action_id: string; attempt_id: string }>(
-        'SELECT action_id, attempt_id FROM remote_agent_supervisor_actions'
-      );
-      expect(upgraded.rows).toEqual([{ action_id: 'action-1', attempt_id: 'action-1' }]);
-      await db.query(
-        "UPDATE remote_agent_supervisor_incidents SET status = 'abandoned' WHERE incident_id = 'incident-1'"
-      );
-      await expect(
-        db.query(
-          `INSERT INTO remote_agent_supervisor_actions
-           (action_id, attempt_id, incident_id, owner_id, fencing_token, action_type, outcome,
-            evidence_refs, created_at, status)
-           VALUES ($1, NULL, $2, $3, $4, $5, $6, $7, $8, $9)`,
-          [
-            'action-2',
-            'incident-2',
-            'xo',
-            2,
-            'repair',
-            'completed',
-            '[]',
-            '2026-07-12T00:00:01Z',
-            'completed',
-          ]
-        )
-      ).rejects.toThrow();
     });
   });
 

@@ -114,12 +114,8 @@ export async function coordinateSupervisorRecovery(
   if (!authorized) return { incident, observations, repairOwner, repaired: false };
 
   const actionId = randomUUID();
-  // Each auto-repair coordination is a fresh attempt; attemptId == actionId keeps
-  // the attempt-scoped unique index (incident_id, attempt_id, action_type) satisfied
-  // while preserving the historical one-reservation-per-coordination behavior.
   const reserved = await store.reserveSupervisorAction({
     actionId,
-    attemptId: actionId,
     incidentId: incident.incidentId,
     ownerId: repairOwner.ownerId,
     fencingToken: repairOwner.fencingToken,
@@ -138,7 +134,7 @@ export async function coordinateSupervisorRecovery(
   const releaseRepairOwnerBestEffort = async (): Promise<void> => {
     await releaseRepairOwner().catch(() => false);
   };
-  if (reserved !== 'applied') {
+  if (!reserved) {
     await releaseRepairOwnerBestEffort();
     return { incident, observations, repairOwner, repaired: false };
   }
