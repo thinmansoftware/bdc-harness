@@ -107,6 +107,33 @@ describe('PostgresAdapter', () => {
     });
   });
 
+  describe('Board authority foundation schema', () => {
+    test('numbered migration, combined schema, and SQLite bootstrap define authority tables', () => {
+      const migration = readFileSync(
+        resolve(import.meta.dir, '../../../../../migrations', '029_board_authority_foundation.sql'),
+        'utf8'
+      );
+      const combined = readFileSync(
+        resolve(import.meta.dir, '../../../../../migrations', '000_combined.sql'),
+        'utf8'
+      );
+      const sqlite = readFileSync(resolve(import.meta.dir, 'sqlite.ts'), 'utf8');
+
+      for (const schema of [migration, combined, sqlite]) {
+        expect(schema).toContain('CREATE TABLE IF NOT EXISTS board_xo_leases');
+        expect(schema).toContain('CREATE TABLE IF NOT EXISTS board_audit_events');
+        expect(schema).toContain('idx_board_xo_leases_active');
+        expect(schema).toContain('idx_board_audit_events_created');
+        expect(schema).toContain('idx_board_audit_events_motion');
+        expect(schema).toContain('trg_board_audit_events_no_update');
+        expect(schema).toContain('trg_board_audit_events_no_delete');
+        expect(schema).toContain("seat_id IN ('john', 'general', 'xo')");
+        expect(schema).toContain('holder_token_hash');
+        expect(schema).toContain('fencing_token');
+      }
+    });
+  });
+
   // -------------------------------------------------------------------------
   // Static properties
   // -------------------------------------------------------------------------

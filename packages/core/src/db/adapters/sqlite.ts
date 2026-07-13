@@ -580,6 +580,60 @@ export class SqliteAdapter implements IDatabase {
         clear_reason TEXT
       );
 
+      -- Board authority foundation
+      CREATE TABLE IF NOT EXISTS board_xo_leases (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        lease_id TEXT NOT NULL UNIQUE,
+        principal_id TEXT NOT NULL,
+        seat_id TEXT NOT NULL CHECK (seat_id IN ('john', 'general', 'xo')),
+        holder_id TEXT NOT NULL,
+        holder_token_hash TEXT NOT NULL,
+        fencing_token INTEGER NOT NULL CHECK (fencing_token > 0),
+        acquired_at TEXT NOT NULL,
+        renewed_at TEXT,
+        expires_at TEXT NOT NULL,
+        released_at TEXT
+      );
+
+      CREATE TABLE IF NOT EXISTS board_audit_events (
+        id TEXT PRIMARY KEY,
+        event_type TEXT NOT NULL CHECK (
+          event_type IN (
+            'xo_lease_acquired',
+            'xo_lease_acquire_rejected',
+            'xo_lease_renewed',
+            'xo_lease_renew_rejected',
+            'xo_lease_released',
+            'xo_lease_release_rejected',
+            'board_recipient_resolved',
+            'board_recipient_deferred',
+            'canonical_motion_frozen',
+            'canonical_approval_accepted',
+            'canonical_approval_rejected'
+          )
+        ),
+        actor_principal_id TEXT,
+        actor_seat_id TEXT CHECK (actor_seat_id IS NULL OR actor_seat_id IN ('john', 'general', 'xo')),
+        xo_lease_id TEXT,
+        xo_fencing_token INTEGER CHECK (xo_fencing_token IS NULL OR xo_fencing_token > 0),
+        motion_id TEXT,
+        motion_revision_sha TEXT,
+        details TEXT NOT NULL DEFAULT '{}',
+        created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+      );
+
+      CREATE TRIGGER IF NOT EXISTS trg_board_audit_events_no_update
+        BEFORE UPDATE ON board_audit_events
+        BEGIN
+          SELECT RAISE(ABORT, 'board_audit_events is append-only');
+        END;
+
+      CREATE TRIGGER IF NOT EXISTS trg_board_audit_events_no_delete
+        BEFORE DELETE ON board_audit_events
+        BEGIN
+          SELECT RAISE(ABORT, 'board_audit_events is append-only');
+        END;
+
       -- Indexes
       CREATE INDEX IF NOT EXISTS idx_codebase_env_vars_codebase_id ON remote_agent_codebase_env_vars(codebase_id);
       CREATE INDEX IF NOT EXISTS idx_conversations_platform ON remote_agent_conversations(platform_type, platform_conversation_id);
@@ -615,6 +669,12 @@ export class SqliteAdapter implements IDatabase {
       CREATE INDEX IF NOT EXISTS idx_agent_dispatch_workers_status_heartbeat ON agent_dispatch_workers(status, last_heartbeat_at);
       CREATE INDEX IF NOT EXISTS idx_known_bad_bindings_provider_model ON known_bad_bindings(provider_id, model_id);
       CREATE INDEX IF NOT EXISTS idx_known_bad_bindings_active ON known_bad_bindings(binding_key) WHERE cleared_at IS NULL;
+      CREATE INDEX IF NOT EXISTS idx_board_xo_leases_active
+        ON board_xo_leases(expires_at) WHERE released_at IS NULL;
+      CREATE INDEX IF NOT EXISTS idx_board_audit_events_created
+        ON board_audit_events(created_at);
+      CREATE INDEX IF NOT EXISTS idx_board_audit_events_motion
+        ON board_audit_events(motion_id, motion_revision_sha) WHERE motion_id IS NOT NULL;
       CREATE INDEX IF NOT EXISTS idx_workflow_runs_parent_conv ON remote_agent_workflow_runs(parent_conversation_id);
       CREATE INDEX IF NOT EXISTS idx_conversations_hidden ON remote_agent_conversations(hidden);
       DROP INDEX IF EXISTS idx_conversations_codebase;
