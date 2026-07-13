@@ -121,6 +121,7 @@ import * as workflowEventDb from '@archon/core/db/workflow-events';
 import * as messageDb from '@archon/core/db/messages';
 import * as dispatchDb from '@archon/core/db/dispatch';
 import * as knownBadBindingsDb from '@archon/core/db/known-bad-bindings';
+import * as boardAuthorityDb from '@archon/core/db/board-authority';
 import { assessDispatchMessageBody } from '@archon/core/utils/dispatch-content-guard';
 import { errorSchema } from './schemas/common.schemas';
 import { updateCheckResponseSchema } from './schemas/system.schemas';
@@ -206,6 +207,13 @@ import {
   postDispatchResultBodySchema,
   registerDispatchWorkerBodySchema,
 } from './schemas/dispatch.schemas';
+import {
+  boardRecipientResponseSchema,
+  xoLeaseAcquireBodySchema,
+  xoLeaseReleaseBodySchema,
+  xoLeaseRenewBodySchema,
+  xoLeaseSchema,
+} from './schemas/board-authority.schemas';
 import { getProviderInfoList, isRegisteredProvider } from '@archon/providers';
 import { claudeProviderThrottle } from '@archon/providers/claude/throttle';
 import { buildProductionCanarySnapshot } from '../services/canary-snapshot';
@@ -650,6 +658,104 @@ const heartbeatDispatchWorkerRoute = createRoute({
       description: 'Heartbeat accepted',
     },
     404: jsonError('Worker not found'),
+    500: jsonError('Server error'),
+  },
+});
+
+// =========================================================================
+// Board authority route configs
+// =========================================================================
+
+const acquireXoLeaseRoute = createRoute({
+  method: 'post',
+  path: '/api/board/xo-lease/acquire',
+  tags: ['Board Authority'],
+  summary: 'Acquire or take over the fenced XO lease',
+  request: {
+    body: {
+      content: { 'application/json': { schema: xoLeaseAcquireBodySchema } },
+      required: true,
+    },
+  },
+  responses: {
+    200: {
+      content: { 'application/json': { schema: xoLeaseSchema } },
+      description: 'Current XO lease',
+    },
+    401: jsonError('Board principal rejected'),
+    409: jsonError('Lease conflict'),
+    500: jsonError('Server error'),
+  },
+});
+
+const renewXoLeaseRoute = createRoute({
+  method: 'post',
+  path: '/api/board/xo-lease/renew',
+  tags: ['Board Authority'],
+  summary: 'Renew the current fenced XO lease',
+  request: {
+    body: {
+      content: { 'application/json': { schema: xoLeaseRenewBodySchema } },
+      required: true,
+    },
+  },
+  responses: {
+    200: {
+      content: { 'application/json': { schema: xoLeaseSchema } },
+      description: 'Renewed XO lease',
+    },
+    401: jsonError('Board principal rejected'),
+    409: jsonError('Stale lease token'),
+    500: jsonError('Server error'),
+  },
+});
+
+const releaseXoLeaseRoute = createRoute({
+  method: 'post',
+  path: '/api/board/xo-lease/release',
+  tags: ['Board Authority'],
+  summary: 'Release the current fenced XO lease',
+  request: {
+    body: {
+      content: { 'application/json': { schema: xoLeaseReleaseBodySchema } },
+      required: true,
+    },
+  },
+  responses: {
+    200: {
+      content: { 'application/json': { schema: xoLeaseSchema } },
+      description: 'Released XO lease',
+    },
+    401: jsonError('Board principal rejected'),
+    409: jsonError('Stale lease token'),
+    500: jsonError('Server error'),
+  },
+});
+
+const currentXoLeaseRoute = createRoute({
+  method: 'get',
+  path: '/api/board/xo-lease/current',
+  tags: ['Board Authority'],
+  summary: 'Read the current unexpired XO lease',
+  responses: {
+    200: {
+      content: { 'application/json': { schema: xoLeaseSchema.nullable() } },
+      description: 'Current XO lease or null',
+    },
+    500: jsonError('Server error'),
+  },
+});
+
+const boardRecipientRoute = createRoute({
+  method: 'get',
+  path: '/api/board/recipient',
+  tags: ['Board Authority'],
+  summary: 'Resolve the board alias to the current XO holder',
+  responses: {
+    200: {
+      content: { 'application/json': { schema: boardRecipientResponseSchema } },
+      description: 'Board recipient resolution',
+    },
     500: jsonError('Server error'),
   },
 });
@@ -1466,6 +1572,10 @@ export function registerApiRoutes(
     detail?: string
   ): Response {
     return c.json({ error: message, ...(detail ? { detail } : {}) }, status);
+  }
+
+  function isBoardPrincipalAuthError(error: unknown): boolean {
+    return error instanceof Error && error.message.startsWith('board_principal_auth_');
   }
 
   async function rejectNewDispatchIfDraining(c: Context): Promise<Response | null> {
@@ -2678,6 +2788,92 @@ export function registerApiRoutes(
     } catch (error) {
       getLog().error({ err: error }, 'dispatch_heartbeat_worker_failed');
       return apiError(c, 500, 'Failed to heartbeat dispatch worker');
+    }
+  });
+
+  // =========================================================================
+  // Board authority endpoints
+  // =========================================================================
+
+  registerOpenApiRoute(acquireXoLeaseRoute, async c => {
+    try {
+      const body = getValidatedBody(c, xoLeaseAcquireBodySchema);
+      const principal = await boardAuthorityDb.authenticateBoardPrincipal(body);
+      const result = await boardAuthorityDb.acquireXoLease({
+        principal,
+        holder_id: body.holder_id,
+        holder_token: body.holder_token,
+        lease_duration_ms: body.lease_duration_ms,
+      });
+      if (!result.ok || !result.lease) {
+        return apiError(c, 409, result.reason ?? 'xo_lease_conflict');
+      }
+      return c.json(result.lease);
+    } catch (error) {
+      if (isBoardPrincipalAuthError(error)) return apiError(c, 401, (error as Error).message);
+      getLog().error({ err: error }, 'board_xo_lease_acquire_failed');
+      return apiError(c, 500, 'Failed to acquire XO lease');
+    }
+  });
+
+  registerOpenApiRoute(renewXoLeaseRoute, async c => {
+    try {
+      const body = getValidatedBody(c, xoLeaseRenewBodySchema);
+      const principal = await boardAuthorityDb.authenticateBoardPrincipal(body);
+      const result = await boardAuthorityDb.renewXoLease({
+        principal,
+        holder_id: body.holder_id,
+        holder_token: body.holder_token,
+        fencing_token: body.fencing_token,
+        lease_duration_ms: body.lease_duration_ms,
+      });
+      if (!result.ok || !result.lease) {
+        return apiError(c, 409, result.reason ?? 'stale_xo_lease_token');
+      }
+      return c.json(result.lease);
+    } catch (error) {
+      if (isBoardPrincipalAuthError(error)) return apiError(c, 401, (error as Error).message);
+      getLog().error({ err: error }, 'board_xo_lease_renew_failed');
+      return apiError(c, 500, 'Failed to renew XO lease');
+    }
+  });
+
+  registerOpenApiRoute(releaseXoLeaseRoute, async c => {
+    try {
+      const body = getValidatedBody(c, xoLeaseReleaseBodySchema);
+      const principal = await boardAuthorityDb.authenticateBoardPrincipal(body);
+      const result = await boardAuthorityDb.releaseXoLease({
+        principal,
+        holder_id: body.holder_id,
+        holder_token: body.holder_token,
+        fencing_token: body.fencing_token,
+      });
+      if (!result.ok || !result.lease) {
+        return apiError(c, 409, result.reason ?? 'stale_xo_lease_token');
+      }
+      return c.json(result.lease);
+    } catch (error) {
+      if (isBoardPrincipalAuthError(error)) return apiError(c, 401, (error as Error).message);
+      getLog().error({ err: error }, 'board_xo_lease_release_failed');
+      return apiError(c, 500, 'Failed to release XO lease');
+    }
+  });
+
+  registerOpenApiRoute(currentXoLeaseRoute, async c => {
+    try {
+      return c.json(await boardAuthorityDb.getCurrentXoLease());
+    } catch (error) {
+      getLog().error({ err: error }, 'board_xo_lease_current_failed');
+      return apiError(c, 500, 'Failed to read current XO lease');
+    }
+  });
+
+  registerOpenApiRoute(boardRecipientRoute, async c => {
+    try {
+      return c.json(await boardAuthorityDb.resolveBoardRecipient());
+    } catch (error) {
+      getLog().error({ err: error }, 'board_recipient_resolve_failed');
+      return apiError(c, 500, 'Failed to resolve board recipient');
     }
   });
 
