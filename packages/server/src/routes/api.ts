@@ -122,6 +122,7 @@ import * as messageDb from '@archon/core/db/messages';
 import * as dispatchDb from '@archon/core/db/dispatch';
 import * as knownBadBindingsDb from '@archon/core/db/known-bad-bindings';
 import * as boardAuthorityDb from '@archon/core/db/board-authority';
+import * as executionClaimsDb from '@archon/core/db/execution-claims';
 import {
   deriveBoardMotionNotificationKey,
   recordBoardPetitionDelivery,
@@ -221,6 +222,24 @@ import {
   xoLeaseRenewBodySchema,
   xoLeaseSchema,
 } from './schemas/board-authority.schemas';
+import {
+  acquireExecutionClaimBodySchema,
+  acquireExecutionClaimResponseSchema,
+  completeExecutionClaimBodySchema,
+  completeExecutionClaimResponseSchema,
+  executionClaimIdParamsSchema,
+  executionFenceBodySchema,
+  getExecutionClaimQuerySchema,
+  getExecutionClaimResponseSchema,
+  preEffectResponseSchema,
+  reconcileExecutionClaimBodySchema,
+  reconcileExecutionClaimResponseSchema,
+  reconciliationRequiredBodySchema,
+  reconciliationRequiredResponseSchema,
+  releaseExecutionClaimResponseSchema,
+  renewExecutionClaimBodySchema,
+  renewExecutionClaimResponseSchema,
+} from './schemas/execution-claims.schemas';
 import { getProviderInfoList, isRegisteredProvider } from '@archon/providers';
 import { claudeProviderThrottle } from '@archon/providers/claude/throttle';
 import { buildProductionCanarySnapshot } from '../services/canary-snapshot';
@@ -763,6 +782,199 @@ const boardRecipientRoute = createRoute({
       content: { 'application/json': { schema: boardRecipientResponseSchema } },
       description: 'Board recipient resolution',
     },
+    500: jsonError('Server error'),
+  },
+});
+
+// =========================================================================
+// Execution claim route configs (M-27B)
+// =========================================================================
+
+const acquireExecutionClaimRoute = createRoute({
+  method: 'post',
+  path: '/api/board/execution-claims/acquire',
+  tags: ['Execution Claims'],
+  summary: 'Acquire, take over, or reactivate a fenced execution claim',
+  request: {
+    body: {
+      content: { 'application/json': { schema: acquireExecutionClaimBodySchema } },
+      required: true,
+    },
+  },
+  responses: {
+    200: {
+      content: { 'application/json': { schema: acquireExecutionClaimResponseSchema } },
+      description: 'Existing claim for the same action identity',
+    },
+    201: {
+      content: { 'application/json': { schema: acquireExecutionClaimResponseSchema } },
+      description: 'New, taken-over, or reactivated claim',
+    },
+    400: jsonError('Validation failed'),
+    401: jsonError('Board principal or holder rejected'),
+    409: jsonError('Claim conflict or reconciliation required'),
+    500: jsonError('Server error'),
+  },
+});
+
+const renewExecutionClaimRoute = createRoute({
+  method: 'post',
+  path: '/api/board/execution-claims/{claim_id}/renew',
+  tags: ['Execution Claims'],
+  summary: 'Renew a current execution claim',
+  request: {
+    params: executionClaimIdParamsSchema,
+    body: {
+      content: { 'application/json': { schema: renewExecutionClaimBodySchema } },
+      required: true,
+    },
+  },
+  responses: {
+    200: {
+      content: { 'application/json': { schema: renewExecutionClaimResponseSchema } },
+      description: 'Renewed claim',
+    },
+    401: jsonError('Board principal or holder rejected'),
+    404: jsonError('Claim not found'),
+    409: jsonError('Stale fence'),
+    500: jsonError('Server error'),
+  },
+});
+
+const preEffectExecutionClaimRoute = createRoute({
+  method: 'post',
+  path: '/api/board/execution-claims/{claim_id}/pre-effect',
+  tags: ['Execution Claims'],
+  summary: 'Atomically arm a reconciliation-required effect attempt',
+  request: {
+    params: executionClaimIdParamsSchema,
+    body: {
+      content: { 'application/json': { schema: executionFenceBodySchema } },
+      required: true,
+    },
+  },
+  responses: {
+    200: {
+      content: { 'application/json': { schema: preEffectResponseSchema } },
+      description: 'Pre-effect permission granted after arm commit',
+    },
+    401: jsonError('Board principal or holder rejected'),
+    404: jsonError('Claim not found'),
+    409: jsonError('Stale fence or reconciliation required'),
+    500: jsonError('Server error'),
+  },
+});
+
+const reconciliationRequiredExecutionClaimRoute = createRoute({
+  method: 'post',
+  path: '/api/board/execution-claims/{claim_id}/reconciliation-required',
+  tags: ['Execution Claims'],
+  summary: 'Record an uncertain external outcome and block the claim',
+  request: {
+    params: executionClaimIdParamsSchema,
+    body: {
+      content: { 'application/json': { schema: reconciliationRequiredBodySchema } },
+      required: true,
+    },
+  },
+  responses: {
+    200: {
+      content: { 'application/json': { schema: reconciliationRequiredResponseSchema } },
+      description: 'Reconciliation required recorded',
+    },
+    401: jsonError('Board principal or holder rejected'),
+    404: jsonError('Claim not found'),
+    409: jsonError('Effect attempt mismatch or stale fence'),
+    500: jsonError('Server error'),
+  },
+});
+
+const reconcileExecutionClaimRoute = createRoute({
+  method: 'post',
+  path: '/api/board/execution-claims/{claim_id}/reconcile',
+  tags: ['Execution Claims'],
+  summary: 'Resolve a reconciliation-required claim with live-state evidence',
+  request: {
+    params: executionClaimIdParamsSchema,
+    body: {
+      content: { 'application/json': { schema: reconcileExecutionClaimBodySchema } },
+      required: true,
+    },
+  },
+  responses: {
+    200: {
+      content: { 'application/json': { schema: reconcileExecutionClaimResponseSchema } },
+      description: 'Reconciliation resolved',
+    },
+    400: jsonError('Validation failed'),
+    401: jsonError('Board principal or holder rejected'),
+    404: jsonError('Claim not found'),
+    409: jsonError('Effect attempt mismatch or stale fence'),
+    500: jsonError('Server error'),
+  },
+});
+
+const releaseExecutionClaimRoute = createRoute({
+  method: 'post',
+  path: '/api/board/execution-claims/{claim_id}/release',
+  tags: ['Execution Claims'],
+  summary: 'Release a current execution claim without deleting history',
+  request: {
+    params: executionClaimIdParamsSchema,
+    body: {
+      content: { 'application/json': { schema: executionFenceBodySchema } },
+      required: true,
+    },
+  },
+  responses: {
+    200: {
+      content: { 'application/json': { schema: releaseExecutionClaimResponseSchema } },
+      description: 'Released claim',
+    },
+    401: jsonError('Board principal or holder rejected'),
+    404: jsonError('Claim not found'),
+    409: jsonError('Stale fence or reconciliation required'),
+    500: jsonError('Server error'),
+  },
+});
+
+const completeExecutionClaimRoute = createRoute({
+  method: 'post',
+  path: '/api/board/execution-claims/{claim_id}/complete',
+  tags: ['Execution Claims'],
+  summary: 'Complete an armed execution claim with structured evidence',
+  request: {
+    params: executionClaimIdParamsSchema,
+    body: {
+      content: { 'application/json': { schema: completeExecutionClaimBodySchema } },
+      required: true,
+    },
+  },
+  responses: {
+    200: {
+      content: { 'application/json': { schema: completeExecutionClaimResponseSchema } },
+      description: 'Completed claim',
+    },
+    400: jsonError('Validation failed'),
+    401: jsonError('Board principal or holder rejected'),
+    404: jsonError('Claim not found'),
+    409: jsonError('Effect attempt mismatch or stale fence'),
+    500: jsonError('Server error'),
+  },
+});
+
+const getExecutionClaimRoute = createRoute({
+  method: 'get',
+  path: '/api/board/execution-claims',
+  tags: ['Execution Claims'],
+  summary: 'Read an execution claim by exact action identity',
+  request: { query: getExecutionClaimQuerySchema },
+  responses: {
+    200: {
+      content: { 'application/json': { schema: getExecutionClaimResponseSchema } },
+      description: 'Execution claim',
+    },
+    404: jsonError('Claim not found'),
     500: jsonError('Server error'),
   },
 });
@@ -3000,6 +3212,239 @@ export function registerApiRoutes(
     } catch (error) {
       getLog().error({ err: error }, 'board_recipient_resolve_failed');
       return apiError(c, 500, 'Failed to resolve board recipient');
+    }
+  });
+
+  // =======================================================================
+  // Execution claim handlers (M-27B)
+  // =======================================================================
+
+  const executionClaimStatusByCode: Record<
+    executionClaimsDb.ClaimFailureCode,
+    400 | 401 | 404 | 409
+  > = {
+    validation_failed: 400,
+    authority_rejected: 401,
+    claim_conflict: 409,
+    stale_fence: 409,
+    reconciliation_required: 409,
+    effect_attempt_mismatch: 409,
+    not_found: 404,
+  };
+
+  function claimError(
+    c: Context,
+    code: executionClaimsDb.ClaimFailureCode,
+    message: string
+  ): Response {
+    return c.json({ error: { code, message } }, executionClaimStatusByCode[code]);
+  }
+
+  function requireHolderToken(c: Context): string | null {
+    return c.req.header('x-xo-holder-token')?.trim() || null;
+  }
+
+  registerOpenApiRoute(acquireExecutionClaimRoute, async c => {
+    try {
+      const body = getValidatedBody(c, acquireExecutionClaimBodySchema);
+      const principal = await boardAuthorityDb.authenticateBoardPrincipal(
+        boardPrincipalProofFromHeaders(c)
+      );
+      const holderToken = requireHolderToken(c);
+      if (!holderToken) return claimError(c, 'authority_rejected', 'missing_holder_token');
+      const result = await executionClaimsDb.acquireExecutionClaim({
+        motion_id: body.motion_id,
+        action_kind: body.action_kind,
+        environment: body.environment,
+        target_sha: body.target_sha,
+        motion_file_path: body.motion_file_path,
+        xo_holder_id: body.xo_holder_id,
+        xo_lease_id: body.xo_lease_id,
+        xo_fencing_token: body.xo_fencing_token,
+        xo_holder_token: holderToken,
+        lease_duration_ms: body.lease_duration_ms,
+        initiator_principal_id: principal.principal_id,
+        initiator_seat_id: principal.seat_id,
+      });
+      if (!result.ok) return claimError(c, result.code, result.message);
+      return c.json(
+        { claim: result.claim, created: result.created, outcome: result.outcome },
+        result.created ? 201 : 200
+      );
+    } catch (error) {
+      if (isBoardPrincipalAuthError(error)) return apiError(c, 401, (error as Error).message);
+      getLog().error({ err: error }, 'execution_claim_acquire_failed');
+      return apiError(c, 500, 'Failed to acquire execution claim');
+    }
+  });
+
+  registerOpenApiRoute(renewExecutionClaimRoute, async c => {
+    try {
+      const body = getValidatedBody(c, renewExecutionClaimBodySchema);
+      await boardAuthorityDb.authenticateBoardPrincipal(boardPrincipalProofFromHeaders(c));
+      const holderToken = requireHolderToken(c);
+      if (!holderToken) return claimError(c, 'authority_rejected', 'missing_holder_token');
+      const result = await executionClaimsDb.renewExecutionClaim({
+        claim_id: c.req.param('claim_id') ?? '',
+        execution_fencing_token: body.execution_fencing_token,
+        xo_holder_id: body.xo_holder_id,
+        xo_lease_id: body.xo_lease_id,
+        xo_fencing_token: body.xo_fencing_token,
+        xo_holder_token: holderToken,
+        lease_duration_ms: body.lease_duration_ms,
+      });
+      if (!result.ok) return claimError(c, result.code, result.message);
+      return c.json({ claim: result.claim, renewed: true as const });
+    } catch (error) {
+      if (isBoardPrincipalAuthError(error)) return apiError(c, 401, (error as Error).message);
+      getLog().error({ err: error }, 'execution_claim_renew_failed');
+      return apiError(c, 500, 'Failed to renew execution claim');
+    }
+  });
+
+  registerOpenApiRoute(preEffectExecutionClaimRoute, async c => {
+    try {
+      const body = getValidatedBody(c, executionFenceBodySchema);
+      await boardAuthorityDb.authenticateBoardPrincipal(boardPrincipalProofFromHeaders(c));
+      const holderToken = requireHolderToken(c);
+      if (!holderToken) return claimError(c, 'authority_rejected', 'missing_holder_token');
+      const result = await executionClaimsDb.validateExecutionFence({
+        claim_id: c.req.param('claim_id') ?? '',
+        execution_fencing_token: body.execution_fencing_token,
+        xo_holder_id: body.xo_holder_id,
+        xo_lease_id: body.xo_lease_id,
+        xo_fencing_token: body.xo_fencing_token,
+        xo_holder_token: holderToken,
+      });
+      if (!result.ok) return claimError(c, result.code, result.message);
+      return c.json({
+        claim_id: result.claim_id,
+        permitted: true as const,
+        effect_attempt_id: result.effect_attempt_id,
+        execution_fencing_token: result.execution_fencing_token,
+        motion_revision_sha: result.motion_revision_sha,
+      });
+    } catch (error) {
+      if (isBoardPrincipalAuthError(error)) return apiError(c, 401, (error as Error).message);
+      getLog().error({ err: error }, 'execution_claim_pre_effect_failed');
+      return apiError(c, 500, 'Failed to validate execution fence');
+    }
+  });
+
+  registerOpenApiRoute(reconciliationRequiredExecutionClaimRoute, async c => {
+    try {
+      const body = getValidatedBody(c, reconciliationRequiredBodySchema);
+      await boardAuthorityDb.authenticateBoardPrincipal(boardPrincipalProofFromHeaders(c));
+      const holderToken = requireHolderToken(c);
+      if (!holderToken) return claimError(c, 'authority_rejected', 'missing_holder_token');
+      const result = await executionClaimsDb.markExecutionReconciliationRequired({
+        claim_id: c.req.param('claim_id') ?? '',
+        execution_fencing_token: body.execution_fencing_token,
+        xo_holder_id: body.xo_holder_id,
+        xo_lease_id: body.xo_lease_id,
+        xo_fencing_token: body.xo_fencing_token,
+        xo_holder_token: holderToken,
+        effect_attempt_id: body.effect_attempt_id,
+        uncertainty: body.uncertainty,
+      });
+      if (!result.ok) return claimError(c, result.code, result.message);
+      return c.json({ claim: result.claim, reconciliation_required: true as const });
+    } catch (error) {
+      if (isBoardPrincipalAuthError(error)) return apiError(c, 401, (error as Error).message);
+      getLog().error({ err: error }, 'execution_claim_reconciliation_required_failed');
+      return apiError(c, 500, 'Failed to record reconciliation requirement');
+    }
+  });
+
+  registerOpenApiRoute(reconcileExecutionClaimRoute, async c => {
+    try {
+      const body = getValidatedBody(c, reconcileExecutionClaimBodySchema);
+      await boardAuthorityDb.authenticateBoardPrincipal(boardPrincipalProofFromHeaders(c));
+      const holderToken = requireHolderToken(c);
+      if (!holderToken) return claimError(c, 'authority_rejected', 'missing_holder_token');
+      const result = await executionClaimsDb.resolveExecutionReconciliation({
+        claim_id: c.req.param('claim_id') ?? '',
+        execution_fencing_token: body.execution_fencing_token,
+        xo_holder_id: body.xo_holder_id,
+        xo_lease_id: body.xo_lease_id,
+        xo_fencing_token: body.xo_fencing_token,
+        xo_holder_token: holderToken,
+        effect_attempt_id: body.effect_attempt_id,
+        resolution: body.resolution,
+        evidence: body.evidence,
+        external_effect_reference: body.external_effect_reference ?? null,
+      });
+      if (!result.ok) return claimError(c, result.code, result.message);
+      return c.json({ claim: result.claim, resolution: body.resolution });
+    } catch (error) {
+      if (isBoardPrincipalAuthError(error)) return apiError(c, 401, (error as Error).message);
+      getLog().error({ err: error }, 'execution_claim_reconcile_failed');
+      return apiError(c, 500, 'Failed to resolve execution reconciliation');
+    }
+  });
+
+  registerOpenApiRoute(releaseExecutionClaimRoute, async c => {
+    try {
+      const body = getValidatedBody(c, executionFenceBodySchema);
+      await boardAuthorityDb.authenticateBoardPrincipal(boardPrincipalProofFromHeaders(c));
+      const holderToken = requireHolderToken(c);
+      if (!holderToken) return claimError(c, 'authority_rejected', 'missing_holder_token');
+      const result = await executionClaimsDb.releaseExecutionClaim({
+        claim_id: c.req.param('claim_id') ?? '',
+        execution_fencing_token: body.execution_fencing_token,
+        xo_holder_id: body.xo_holder_id,
+        xo_lease_id: body.xo_lease_id,
+        xo_fencing_token: body.xo_fencing_token,
+        xo_holder_token: holderToken,
+      });
+      if (!result.ok) return claimError(c, result.code, result.message);
+      return c.json({ claim: result.claim, released: true as const });
+    } catch (error) {
+      if (isBoardPrincipalAuthError(error)) return apiError(c, 401, (error as Error).message);
+      getLog().error({ err: error }, 'execution_claim_release_failed');
+      return apiError(c, 500, 'Failed to release execution claim');
+    }
+  });
+
+  registerOpenApiRoute(completeExecutionClaimRoute, async c => {
+    try {
+      const body = getValidatedBody(c, completeExecutionClaimBodySchema);
+      await boardAuthorityDb.authenticateBoardPrincipal(boardPrincipalProofFromHeaders(c));
+      const holderToken = requireHolderToken(c);
+      if (!holderToken) return claimError(c, 'authority_rejected', 'missing_holder_token');
+      const result = await executionClaimsDb.completeExecutionClaim({
+        claim_id: c.req.param('claim_id') ?? '',
+        execution_fencing_token: body.execution_fencing_token,
+        xo_holder_id: body.xo_holder_id,
+        xo_lease_id: body.xo_lease_id,
+        xo_fencing_token: body.xo_fencing_token,
+        xo_holder_token: holderToken,
+        effect_attempt_id: body.effect_attempt_id,
+        external_effect_reference: body.external_effect_reference,
+        evidence: body.evidence,
+      });
+      if (!result.ok) return claimError(c, result.code, result.message);
+      return c.json({ claim: result.claim, completed: true as const });
+    } catch (error) {
+      if (isBoardPrincipalAuthError(error)) return apiError(c, 401, (error as Error).message);
+      getLog().error({ err: error }, 'execution_claim_complete_failed');
+      return apiError(c, 500, 'Failed to complete execution claim');
+    }
+  });
+
+  registerOpenApiRoute(getExecutionClaimRoute, async c => {
+    try {
+      const claim = await executionClaimsDb.getExecutionClaim({
+        motion_id: c.req.query('motion_id') ?? '',
+        action_kind: c.req.query('action_kind') ?? '',
+        environment: c.req.query('environment') ?? '',
+        target_sha: c.req.query('target_sha') ?? '',
+      });
+      if (!claim) return claimError(c, 'not_found', 'claim_not_found');
+      return c.json({ claim });
+    } catch (error) {
+      getLog().error({ err: error }, 'execution_claim_get_failed');
+      return apiError(c, 500, 'Failed to read execution claim');
     }
   });
 

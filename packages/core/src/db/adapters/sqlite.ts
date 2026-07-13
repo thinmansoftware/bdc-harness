@@ -689,7 +689,9 @@ export class SqliteAdapter implements IDatabase {
             'motion_notification_enqueued',
             'motion_notification_deduplicated',
             'board_alias_resolved',
-            'board_petition_delivered'
+            'board_petition_delivered',
+            'execution_claim_authority_rejected',
+            'manual_initiation_recorded'
           )
         ),
         actor_principal_id TEXT,
@@ -712,6 +714,112 @@ export class SqliteAdapter implements IDatabase {
         BEFORE DELETE ON board_audit_events
         BEGIN
           SELECT RAISE(ABORT, 'board_audit_events is append-only');
+        END;
+
+      -- Board execution claims (migration 032): exclusive fenced action ownership.
+      CREATE TABLE IF NOT EXISTS board_execution_claims (
+        claim_id TEXT PRIMARY KEY,
+        motion_id TEXT NOT NULL,
+        action_kind TEXT NOT NULL CHECK (action_kind = 'production_deploy'),
+        environment TEXT NOT NULL CHECK (environment = 'production'),
+        target_sha TEXT NOT NULL CHECK (
+          length(target_sha) = 40 AND target_sha NOT GLOB '*[^0-9a-f]*'
+        ),
+        action_key TEXT NOT NULL UNIQUE,
+        idempotency_key TEXT NOT NULL UNIQUE,
+        motion_file_path TEXT NOT NULL,
+        motion_revision_sha TEXT NOT NULL CHECK (
+          length(motion_revision_sha) = 40 AND motion_revision_sha NOT GLOB '*[^0-9a-f]*'
+        ),
+        claimant_principal TEXT NOT NULL,
+        claimant_xo_holder_id TEXT NOT NULL,
+        claimant_xo_lease_id TEXT NOT NULL,
+        claimant_xo_fencing_token INTEGER NOT NULL CHECK (claimant_xo_fencing_token > 0),
+        execution_fencing_token INTEGER NOT NULL CHECK (execution_fencing_token > 0),
+        status TEXT NOT NULL CHECK (status IN ('active', 'released', 'completed')),
+        reconciliation_status TEXT NOT NULL CHECK (
+          reconciliation_status IN ('clear', 'required', 'resolved_retryable', 'resolved_completed')
+        ),
+        effect_attempt_id TEXT,
+        effect_attempt_state TEXT NOT NULL CHECK (
+          effect_attempt_state IN ('none', 'armed', 'completed', 'reconciled')
+        ),
+        effect_armed_at TEXT,
+        acquired_at TEXT NOT NULL,
+        renewed_at TEXT,
+        expires_at TEXT NOT NULL,
+        released_at TEXT,
+        completed_at TEXT,
+        external_effect_reference TEXT,
+        completion_evidence_json TEXT CHECK (
+          completion_evidence_json IS NULL OR json_valid(completion_evidence_json)
+        ),
+        reconciliation_evidence_json TEXT CHECK (
+          reconciliation_evidence_json IS NULL OR json_valid(reconciliation_evidence_json)
+        ),
+        CONSTRAINT board_execution_claims_action_identity_unique
+          UNIQUE (motion_id, action_kind, environment, target_sha),
+        CONSTRAINT board_execution_claims_status_reconciliation_pair CHECK (
+          (status = 'active' AND reconciliation_status IN ('clear', 'required'))
+          OR (status = 'released' AND reconciliation_status IN ('clear', 'resolved_retryable'))
+          OR (status = 'completed' AND reconciliation_status IN ('clear', 'resolved_completed'))
+        ),
+        CONSTRAINT board_execution_claims_arm_iff_required CHECK (
+          (reconciliation_status = 'required') = (effect_attempt_state = 'armed')
+        ),
+        CONSTRAINT board_execution_claims_armed_attempt_present CHECK (
+          effect_attempt_state <> 'armed'
+          OR (effect_attempt_id IS NOT NULL AND effect_armed_at IS NOT NULL)
+        )
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_board_execution_claims_active
+        ON board_execution_claims(status, reconciliation_status, expires_at);
+
+      CREATE TABLE IF NOT EXISTS board_execution_claim_events (
+        event_id TEXT PRIMARY KEY,
+        claim_id TEXT NOT NULL REFERENCES board_execution_claims(claim_id),
+        event_sequence INTEGER NOT NULL CHECK (event_sequence > 0),
+        event_type TEXT NOT NULL CHECK (
+          event_type IN (
+            'claim_acquired',
+            'claim_conflict',
+            'claim_renewed',
+            'claim_taken_over',
+            'claim_released',
+            'claim_stale_rejected',
+            'claim_effect_armed',
+            'claim_reconciliation_required',
+            'claim_reconciled_retryable',
+            'claim_reconciled_completed',
+            'claim_completed'
+          )
+        ),
+        actor_principal TEXT NOT NULL,
+        actor_kind TEXT NOT NULL CHECK (actor_kind IN ('xo', 'john', 'system')),
+        xo_lease_id TEXT,
+        xo_fencing_token INTEGER CHECK (xo_fencing_token IS NULL OR xo_fencing_token > 0),
+        execution_fencing_token INTEGER CHECK (
+          execution_fencing_token IS NULL OR execution_fencing_token > 0
+        ),
+        details_json TEXT NOT NULL,
+        created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+        CONSTRAINT board_execution_claim_events_sequence_unique UNIQUE (claim_id, event_sequence)
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_board_execution_claim_events_claim
+        ON board_execution_claim_events(claim_id, created_at);
+
+      CREATE TRIGGER IF NOT EXISTS trg_board_execution_claim_events_no_update
+        BEFORE UPDATE ON board_execution_claim_events
+        BEGIN
+          SELECT RAISE(ABORT, 'board_execution_claim_events is append-only');
+        END;
+
+      CREATE TRIGGER IF NOT EXISTS trg_board_execution_claim_events_no_delete
+        BEFORE DELETE ON board_execution_claim_events
+        BEGIN
+          SELECT RAISE(ABORT, 'board_execution_claim_events is append-only');
         END;
 
       CREATE TABLE IF NOT EXISTS overseer_actions (

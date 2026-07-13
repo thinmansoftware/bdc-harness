@@ -157,8 +157,55 @@ describe('PostgresAdapter', () => {
         expect(schema).toContain('idx_dispatch_board_pending');
         expect(schema).toContain('board_motion');
         expect(schema).toContain('board_petition_delivered');
-        expect(schema).not.toContain('board_execution_claim');
       }
+      // The M-27A dispatch migration must never mention execution claims; that
+      // feature is owned by the M-27B migration. The combined and SQLite
+      // surfaces legitimately carry the execution-claim tables (see the
+      // "Board execution claims schema" block below), so the negative
+      // assertion applies only to the numbered dispatch migration.
+      expect(migration).not.toContain('board_execution_claim');
+    });
+  });
+
+  describe('Board execution claims schema', () => {
+    test('numbered migration, combined schema, and SQLite bootstrap define claim tables', () => {
+      const migration = readFileSync(
+        resolve(import.meta.dir, '../../../../../migrations', '032_board_execution_claims.sql'),
+        'utf8'
+      );
+      const combined = readFileSync(
+        resolve(import.meta.dir, '../../../../../migrations', '000_combined.sql'),
+        'utf8'
+      );
+      const sqlite = readFileSync(resolve(import.meta.dir, 'sqlite.ts'), 'utf8');
+
+      for (const schema of [migration, combined, sqlite]) {
+        expect(schema).toContain('CREATE TABLE IF NOT EXISTS board_execution_claims');
+        expect(schema).toContain('CREATE TABLE IF NOT EXISTS board_execution_claim_events');
+        expect(schema).toContain('idx_board_execution_claims_active');
+        expect(schema).toContain('idx_board_execution_claim_events_claim');
+        expect(schema).toContain('trg_board_execution_claim_events_no_update');
+        expect(schema).toContain('trg_board_execution_claim_events_no_delete');
+        // Action identity + idempotency uniqueness make concurrent acquire atomic.
+        expect(schema).toContain('action_key');
+        expect(schema).toContain('idempotency_key');
+        expect(schema).toContain('board_execution_claims_action_identity_unique');
+        expect(schema).toContain('board_execution_claim_events_sequence_unique');
+        // Closed enums.
+        expect(schema).toContain("action_kind = 'production_deploy'");
+        expect(schema).toContain("environment = 'production'");
+        expect(schema).toContain("status IN ('active', 'released', 'completed')");
+        expect(schema).toContain('execution_fencing_token');
+        expect(schema).toContain('effect_attempt_state');
+        expect(schema).toContain('reconciliation_status');
+        // Pre-claim board-audit events extend the foundation closed check.
+        expect(schema).toContain('execution_claim_authority_rejected');
+        expect(schema).toContain('manual_initiation_recorded');
+      }
+      // Hard separation: the numbered M-27B migration references no Dispatch
+      // table. (The combined/sqlite surfaces legitimately contain the Dispatch
+      // schema from earlier migrations, so this applies only to 032.)
+      expect(migration).not.toContain('agent_dispatch_messages');
     });
   });
 
