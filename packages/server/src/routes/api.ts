@@ -2806,31 +2806,32 @@ export function registerApiRoutes(
   registerOpenApiRoute(listDispatchMessagesRoute, async c => {
     try {
       const rawLimit = Number.parseInt(c.req.query('limit') ?? '100', 10);
+      const recipient = c.req.query('recipient');
+      const status = c.req.query('status') as dispatchDb.DispatchMessageStatus | undefined;
+      const workerCredentialId = c.req.header('x-dispatch-worker-credential-id');
+      const workerToken = c.req.header('x-dispatch-worker-token');
+      const workerId = c.req.header('x-dispatch-worker-id');
+      const hasWorkerCredentialHeaders =
+        workerCredentialId !== undefined && workerToken !== undefined && workerId !== undefined;
       const messages = await dispatchDb.listMessages({
-        recipient: c.req.query('recipient') ?? undefined,
-        status: c.req.query('status') as dispatchDb.DispatchMessageStatus | undefined,
+        recipient: recipient ?? undefined,
+        status,
         limit: Number.isFinite(rawLimit) ? rawLimit : 100,
         allowBoardAlias:
-          c.req.query('recipient') !== undefined &&
-          c.req.query('status') === 'queued' &&
+          recipient !== undefined &&
+          status === 'queued' &&
+          hasWorkerCredentialHeaders &&
           authenticateDispatchWorkerCredential({
-            credential_id: c.req.header('x-dispatch-worker-credential-id'),
-            token: c.req.header('x-dispatch-worker-token'),
-            worker_id: c.req.header('x-dispatch-worker-id') ?? '',
-            delivery_principal: c.req.query('recipient') ?? undefined,
+            credential_id: workerCredentialId,
+            token: workerToken,
+            worker_id: workerId,
+            delivery_principal: recipient,
           }) !== null,
       });
       return c.json(messages);
     } catch (error) {
       if (error instanceof Error && error.message === 'worker_unauthorized') {
-        const rawLimit = Number.parseInt(c.req.query('limit') ?? '100', 10);
-        const messages = await dispatchDb.listMessages({
-          recipient: c.req.query('recipient') ?? undefined,
-          status: c.req.query('status') as dispatchDb.DispatchMessageStatus | undefined,
-          limit: Number.isFinite(rawLimit) ? rawLimit : 100,
-          allowBoardAlias: false,
-        });
-        return c.json(messages);
+        return apiError(c, 401, 'worker_unauthorized');
       }
       getLog().error({ err: error }, 'dispatch_list_messages_failed');
       return apiError(c, 500, 'Failed to list dispatch messages');

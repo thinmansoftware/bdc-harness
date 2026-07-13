@@ -16,6 +16,7 @@ import {
   createMessage,
   evaluateWorkerStaleness,
   heartbeatWorker,
+  listMessages,
   postResult,
   registerWorker,
   resolveDispatchRecipient,
@@ -218,6 +219,30 @@ describe('dispatch db', () => {
     });
   });
 
+  test('board alias list records one deferral while no XO lease exists', async () => {
+    await createMessage({
+      correlation_id: 'corr-board-deferral',
+      idempotency_key: 'board-motion:M-28:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:board',
+      task_type: 'board_motion',
+      sender: 'gpt',
+      recipient: 'board',
+      body: '{"motion_id":"M-28","title":"T","file_path":"docs/board/motions/M.md"}',
+      recipient_alias: 'board',
+      motion_id: 'M-28',
+      motion_revision_sha: 'a'.repeat(40),
+    });
+
+    await listMessages({ recipient: 'claude', status: 'queued', allowBoardAlias: true });
+    await listMessages({ recipient: 'claude', status: 'queued', allowBoardAlias: true });
+
+    const events = await db.query<{ count: number }>(
+      `SELECT COUNT(*) AS count
+       FROM board_audit_events
+       WHERE event_type = 'board_recipient_deferred'`
+    );
+    expect(Number(events.rows[0]?.count ?? 0)).toBe(1);
+  });
+
   test('board alias list and claim bind the current XO lease', async () => {
     await registerWorker({
       worker_id: 'worker-a',
@@ -251,9 +276,11 @@ describe('dispatch db', () => {
       motion_revision_sha: 'a'.repeat(40),
     });
 
-    const listed = await import('./dispatch').then(module =>
-      module.listMessages({ recipient: 'claude', status: 'queued', allowBoardAlias: true })
-    );
+    const listed = await listMessages({
+      recipient: 'claude',
+      status: 'queued',
+      allowBoardAlias: true,
+    });
     expect(listed.map(item => item.id)).toContain(message.id);
 
     const stalePrincipalClaim = await claimMessage({

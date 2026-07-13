@@ -251,6 +251,12 @@ async function recordBoardDeferrals(): Promise<void> {
     `SELECT id, motion_id, motion_revision_sha
      FROM agent_dispatch_messages
      WHERE recipient_alias = 'board' AND status = 'queued'
+       AND NOT EXISTS (
+         SELECT 1
+         FROM board_audit_events
+         WHERE event_type = 'board_recipient_deferred'
+           AND details LIKE '%' || agent_dispatch_messages.id || '%'
+       )
      ORDER BY created_at ASC
      LIMIT 100`
   );

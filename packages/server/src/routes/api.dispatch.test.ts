@@ -266,6 +266,38 @@ describe('dispatch API', () => {
     expect(((await second.json()) as { body: string }).body).toBe('Please summarize this.');
   });
 
+  test('lists ordinary queued recipient poll without worker credential headers', async () => {
+    const app = makeApp();
+    const created = await app.request('/api/dispatch/messages', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(VALID_BODY),
+    });
+    const message = (await created.json()) as { id: string };
+
+    const list = await app.request('/api/dispatch/messages?recipient=codex&status=queued');
+    expect(list.status).toBe(200);
+    expect(((await list.json()) as { id: string }[]).map(item => item.id)).toContain(message.id);
+  });
+
+  test('rejects operator-token-only concrete-principal claim', async () => {
+    const app = makeApp('secret-token');
+    const created = await app.request('/api/dispatch/messages', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-archon-operator-token': 'secret-token' },
+      body: JSON.stringify(VALID_BODY),
+    });
+    const message = (await created.json()) as { id: string };
+
+    const claim = await app.request(`/api/dispatch/messages/${message.id}/claim`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-archon-operator-token': 'secret-token' },
+      body: JSON.stringify({ worker_id: 'worker-a', delivery_principal: 'claude' }),
+    });
+    expect(claim.status).toBe(401);
+    expect(((await claim.json()) as { error: string }).error).toBe('worker_unauthorized');
+  });
+
   test('requires seated motion_notifier for board_motion before insert', async () => {
     principal = { principal_id: 'john-ranson', seat_id: 'john', roles: [] };
     const response = await makeApp().request('/api/dispatch/messages', {
