@@ -64,7 +64,7 @@ import { MessagePersistence } from './adapters/web/persistence';
 import { SSETransport } from './adapters/web/transport';
 import { WorkflowEventBridge } from './adapters/web/workflow-bridge';
 import { registerApiRoutes, stopProviderWaitScheduler } from './routes/api';
-import { observeStartupRecovery } from './startup-reconciliation';
+import { observeStartupRecovery, reconcilePendingRunsAtBoot } from './startup-reconciliation';
 import {
   handleMessage,
   pool,
@@ -205,16 +205,26 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     process.exit(1);
   }
 
+  const startupReconciliationAt = new Date().toISOString();
+
   // Observe expired leases before the HTTP listener can accept new dispatch.
   // This pass is deliberately non-mutating; explicit recovery uses lease CAS.
   try {
-    const recovery = await observeStartupRecovery();
+    const recovery = await observeStartupRecovery(undefined, startupReconciliationAt);
     getLog().info(recovery, 'startup_recovery_observed');
     if (recovery.blocked > 0) {
       getLog().warn(recovery, 'startup_recovery_blocked_candidates');
     }
   } catch (error) {
     getLog().fatal({ err: error }, 'startup_recovery_observation_failed');
+    process.exit(1);
+  }
+
+  try {
+    const pendingReconcile = await reconcilePendingRunsAtBoot(undefined, startupReconciliationAt);
+    getLog().info(pendingReconcile, 'startup_pending_reconciliation_completed');
+  } catch (error) {
+    getLog().fatal({ err: error }, 'startup_pending_reconciliation_failed');
     process.exit(1);
   }
 

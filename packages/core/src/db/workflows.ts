@@ -1015,6 +1015,51 @@ export async function listExpiredRunLeases(expiredAt: string): Promise<ExpiredRu
   }));
 }
 
+export async function listPendingWorkflowRunsBefore(cutoff: string): Promise<WorkflowRun[]> {
+  const result = await pool.query<WorkflowRun>(
+    `SELECT *
+     FROM remote_agent_workflow_runs
+     WHERE status = 'pending'
+       AND started_at <= $1
+     ORDER BY started_at ASC`,
+    [cutoff]
+  );
+  return result.rows.map(normalizeWorkflowRun);
+}
+
+export async function orphanPendingWorkflowRun(data: {
+  runId: string;
+  reason: string;
+  orphanedAt: string;
+}): Promise<boolean> {
+  const db = getDatabase();
+  return db.withTransaction(async query => {
+    const lockSuffix = db.dialect === 'postgres' ? ' FOR UPDATE' : '';
+    const candidate = await query<{ status: string }>(
+      `SELECT status
+       FROM remote_agent_workflow_runs
+       WHERE id = $1 AND status = 'pending'${lockSuffix}`,
+      [data.runId]
+    );
+    if (!candidate.rows[0]) return false;
+
+    const update = await query(
+      `UPDATE remote_agent_workflow_runs
+       SET status = 'orphaned',
+           metadata = ${db.sql.jsonMerge('metadata', 1)}
+       WHERE id = $2 AND status = 'pending'`,
+      [
+        JSON.stringify({
+          orphaned_reason: data.reason,
+          orphaned_at: data.orphanedAt,
+        }),
+        data.runId,
+      ]
+    );
+    return update.rowCount === 1;
+  });
+}
+
 /**
  * Compare-and-swap an expired leased run into recoverable interruption.
  * A heartbeat, cancellation, or terminal transition that wins first makes this a no-op.

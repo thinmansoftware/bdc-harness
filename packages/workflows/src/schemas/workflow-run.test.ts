@@ -34,6 +34,12 @@ describe('reliability outcome schemas', () => {
     expect(RESUMABLE_WORKFLOW_STATUSES).toContain('interrupted');
   });
 
+  it('accepts orphaned without making it terminal or resumable', () => {
+    expect(workflowRunStatusSchema.parse('orphaned')).toBe('orphaned');
+    expect(TERMINAL_WORKFLOW_STATUSES).not.toContain('orphaned');
+    expect(RESUMABLE_WORKFLOW_STATUSES).not.toContain('orphaned');
+  });
+
   it('parses all five dimensions without collapsing the CE false-fail facts', () => {
     expect(
       runOutcomeSchema.parse({

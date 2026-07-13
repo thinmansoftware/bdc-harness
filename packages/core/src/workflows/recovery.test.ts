@@ -1,7 +1,12 @@
 import { describe, expect, mock, test } from 'bun:test';
 import type { IWorkflowStore } from '@archon/workflows/store';
 import type { RunAuthorityRecord, RunLeaseRecord } from '@archon/workflows/reliability/types';
-import { claimAndResumeInterruptedRun, reconcileExpiredWorkflowLeases } from './recovery';
+import type { WorkflowRun } from '@archon/workflows/schemas/workflow-run';
+import {
+  claimAndResumeInterruptedRun,
+  reconcileExpiredWorkflowLeases,
+  reconcilePendingWorkflowRunsAtBoot,
+} from './recovery';
 
 const authority: RunAuthorityRecord = {
   runId: 'run-1',
@@ -42,6 +47,24 @@ function recoveryStore(overrides: Partial<IWorkflowStore> = {}): IWorkflowStore 
     ...overrides,
   } as IWorkflowStore;
 }
+
+const pendingRun: WorkflowRun = {
+  id: 'run-pending-1',
+  workflow_name: 'feature',
+  conversation_id: 'conversation-1',
+  parent_conversation_id: null,
+  codebase_id: 'codebase-1',
+  status: 'pending',
+  user_message: 'build it',
+  metadata: {},
+  started_at: new Date('2026-07-13T17:46:29.000Z'),
+  completed_at: null,
+  last_activity_at: new Date('2026-07-13T17:46:29.000Z'),
+  working_path: null,
+  archived_at: null,
+  archived_by: null,
+  archive_reason: null,
+};
 
 describe('startup lease reconciliation', () => {
   test('observe mode verifies authority and worktree without mutating state', async () => {
@@ -171,5 +194,71 @@ describe('startup lease reconciliation', () => {
       leaseToken: lease.leaseToken,
       releasedAt: expect.any(String),
     });
+  });
+});
+
+describe('boot pending reconciliation', () => {
+  test('orphans pending rows that predate boot and records an event', async () => {
+    const store = recoveryStore({
+      listPendingWorkflowRunsBefore: mock(async () => [pendingRun]),
+      orphanPendingWorkflowRun: mock(async () => true),
+      createWorkflowEvent: mock(async () => {}),
+    });
+
+    const report = await reconcilePendingWorkflowRunsAtBoot(store, {
+      now: '2026-07-13T17:53:00.000Z',
+    });
+
+    expect(report).toEqual({
+      observed: 1,
+      orphaned: 1,
+      raced: 0,
+      entries: [{ runId: 'run-pending-1', disposition: 'orphaned' }],
+    });
+    expect(store.listPendingWorkflowRunsBefore).toHaveBeenCalledWith(
+      '2026-07-13T17:53:00.000Z'
+    );
+    expect(store.orphanPendingWorkflowRun).toHaveBeenCalledWith({
+      runId: 'run-pending-1',
+      reason: 'pending_run_predates_orchestrator_boot',
+      orphanedAt: '2026-07-13T17:53:00.000Z',
+    });
+    expect(store.createWorkflowEvent).toHaveBeenCalledWith({
+      workflow_run_id: 'run-pending-1',
+      event_type: 'workflow_orphaned',
+      data: {
+        reason: 'pending_run_predates_orchestrator_boot',
+        orphaned_at: '2026-07-13T17:53:00.000Z',
+        previous_status: 'pending',
+      },
+    });
+  });
+
+  test('does not mutate when no pending rows predate the boot cutoff', async () => {
+    const store = recoveryStore({
+      listPendingWorkflowRunsBefore: mock(async () => []),
+      orphanPendingWorkflowRun: mock(async () => true),
+      createWorkflowEvent: mock(async () => {}),
+    });
+
+    await expect(
+      reconcilePendingWorkflowRunsAtBoot(store, { now: '2026-07-13T17:53:00.000Z' })
+    ).resolves.toMatchObject({ observed: 0, orphaned: 0 });
+    expect(store.orphanPendingWorkflowRun).not.toHaveBeenCalled();
+    expect(store.createWorkflowEvent).not.toHaveBeenCalled();
+  });
+
+  test('leaves running rows untouched because the DB candidate query is pending-only', async () => {
+    const store = recoveryStore({
+      listPendingWorkflowRunsBefore: mock(async () => []),
+      orphanPendingWorkflowRun: mock(async () => true),
+      createWorkflowEvent: mock(async () => {}),
+    });
+
+    await reconcilePendingWorkflowRunsAtBoot(store, { now: '2026-07-13T17:53:00.000Z' });
+    expect(store.listPendingWorkflowRunsBefore).toHaveBeenCalledWith(
+      '2026-07-13T17:53:00.000Z'
+    );
+    expect(store.orphanPendingWorkflowRun).not.toHaveBeenCalled();
   });
 });
