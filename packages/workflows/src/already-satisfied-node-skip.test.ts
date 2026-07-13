@@ -213,7 +213,7 @@ function createWorkflow(alreadySatisfied: boolean) {
           '$gate-already-satisfied.output',
           'JSON',
           ')',
-          "if printf '%s\\n' \"$GATE_JSON\" | grep -q '\"ALREADY_SATISFIED\":true'; then",
+          'if printf \'%s\\n\' "$GATE_JSON" | grep -q \'"ALREADY_SATISFIED":true\'; then',
           '  echo "BUILD_OUTCOME=ALREADY_SATISFIED"',
           'else',
           '  echo "BUILD_OUTCOME=REAL_BUILD"',
