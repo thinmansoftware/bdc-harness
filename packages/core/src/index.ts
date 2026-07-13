@@ -59,6 +59,8 @@ export { createWorkflowStore } from './workflows/store-adapter';
 export {
   claimAndResumeInterruptedRun,
   reconcileExpiredWorkflowLeases,
+  reconcilePendingWorkflowRunsAtBoot,
+  type PendingReconcileReport,
   type StartupRecoveryReport,
 } from './workflows/recovery';
 

@@ -35,6 +35,17 @@ export const workflowRunStatusSchema = z.enum([
    * re-labels them via the dispatch-time escalation linker (lazy, one-shot).
    */
   'escalated',
+  /**
+   * Boot-time pending reconciliation (WO-HARNESS-DRAIN-PENDING-BEFORE-RESTART-01).
+   * A row was created as pending before this orchestrator process started, but
+   * was never picked up by the prior process. Kept non-terminal so cleanup and
+   * resume semantics remain explicit follow-up work.
+   *
+   * Schema / storage note: remote_agent_workflow_runs.status is free TEXT
+   * (no CHECK/enum constraint in SQLite or Postgres). Adding this value is a
+   * pure application-level contract change -- no DDL migration is required.
+   */
+  'orphaned',
   'cancelled',
   'paused',
 ]);

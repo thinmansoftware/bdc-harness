@@ -3,6 +3,9 @@ import { resolve } from 'path';
 import type { IWorkflowStore } from '@archon/workflows/store';
 import type { RunLeaseRecord } from '@archon/workflows/reliability/types';
 import type { WorkflowRun } from '@archon/workflows/schemas/workflow-run';
+import { createLogger } from '@archon/paths';
+
+const log = createLogger('workflow.recovery');
 
 export type StartupRecoveryDisposition =
   | 'recoverable'
@@ -22,6 +25,20 @@ export interface StartupRecoveryReport {
   interrupted: number;
   blocked: number;
   entries: StartupRecoveryEntry[];
+}
+
+export type PendingReconcileDisposition = 'orphaned' | 'cas_race_lost';
+
+export interface PendingReconcileEntry {
+  runId: string;
+  disposition: PendingReconcileDisposition;
+}
+
+export interface PendingReconcileReport {
+  observed: number;
+  orphaned: number;
+  raced: number;
+  entries: PendingReconcileEntry[];
 }
 
 function samePath(left: string, right: string): boolean {
@@ -92,6 +109,48 @@ export async function reconcileExpiredWorkflowLeases(
     }
     report.entries.push({ runId: candidate.runId, disposition });
   }
+  return report;
+}
+
+export async function reconcilePendingWorkflowRunsAtBoot(
+  store: IWorkflowStore,
+  options: { now: string }
+): Promise<PendingReconcileReport> {
+  const candidates = await store.listPendingWorkflowRunsBefore(options.now);
+  const report: PendingReconcileReport = {
+    observed: candidates.length,
+    orphaned: 0,
+    raced: 0,
+    entries: [],
+  };
+  const reason = 'pending_run_predates_orchestrator_boot';
+
+  for (const candidate of candidates) {
+    const orphaned = await store.orphanPendingWorkflowRun({
+      runId: candidate.id,
+      reason,
+      orphanedAt: options.now,
+    });
+    if (!orphaned) {
+      report.raced += 1;
+      report.entries.push({ runId: candidate.id, disposition: 'cas_race_lost' });
+      continue;
+    }
+
+    report.orphaned += 1;
+    report.entries.push({ runId: candidate.id, disposition: 'orphaned' });
+    await store.createWorkflowEvent({
+      workflow_run_id: candidate.id,
+      event_type: 'workflow_orphaned',
+      data: {
+        reason,
+        orphaned_at: options.now,
+        previous_status: 'pending',
+      },
+    });
+  }
+
+  log.info(report, 'orchestrator_boot_reconcile');
   return report;
 }
 

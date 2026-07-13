@@ -46,6 +46,7 @@ export const WORKFLOW_EVENT_TYPES = [
   'approval_received',
   'workflow_cancelled',
   'workflow_interrupted',
+  'workflow_orphaned',
   'status_persist_failed',
   'workflow_artifact',
   // Layer 1 cascade-step event (WO-HARNESS-LAYER1-CLIMB-AND-GATE-EVENTS-01).
@@ -109,6 +110,12 @@ export interface IWorkflowStore {
   ): Promise<WorkflowRun | null>;
   findResumableRun(workflowName: string, workingPath: string): Promise<WorkflowRun | null>;
   failOrphanedRuns(): Promise<{ count: number }>;
+  listPendingWorkflowRunsBefore(cutoff: string): Promise<WorkflowRun[]>;
+  orphanPendingWorkflowRun(data: {
+    runId: string;
+    reason: string;
+    orphanedAt: string;
+  }): Promise<boolean>;
   resumeWorkflowRun(id: string): Promise<WorkflowRun>;
   updateWorkflowRun(
     id: string,

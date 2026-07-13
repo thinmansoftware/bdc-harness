@@ -63,6 +63,8 @@ import {
   releaseRunLease,
   listExpiredRunLeases,
   interruptExpiredRunLease,
+  listPendingWorkflowRunsBefore,
+  orphanPendingWorkflowRun,
   createProviderAttempt,
   completeProviderAttempt,
   listProviderAttempts,
@@ -1454,6 +1456,72 @@ describe('Smart Cauldron reliability persistence', () => {
     ]);
     expect(mockQuery.mock.calls[0]?.[0]).toContain("r.status = 'running'");
     expect(mockQuery.mock.calls[0]?.[0]).toContain('l.expires_at <= $1');
+  });
+
+  test('lists pending workflow runs before the boot cutoff', async () => {
+    const pendingRun = {
+      id: 'run-pending-1',
+      workflow_name: 'feature-development',
+      conversation_id: 'conv-456',
+      parent_conversation_id: null,
+      codebase_id: 'codebase-789',
+      status: 'pending',
+      user_message: 'Add dark mode support',
+      metadata: {},
+      started_at: new Date('2026-07-13T17:46:29.000Z'),
+      completed_at: null,
+      last_activity_at: new Date('2026-07-13T17:46:29.000Z'),
+      working_path: null,
+      archived_at: null,
+      archived_by: null,
+      archive_reason: null,
+    };
+    mockQuery.mockResolvedValueOnce(createQueryResult([pendingRun]));
+
+    await expect(listPendingWorkflowRunsBefore('2026-07-13T17:53:00.000Z')).resolves.toEqual([
+      pendingRun,
+    ]);
+
+    const [query, params] = mockQuery.mock.calls[0] as [string, unknown[]];
+    expect(query).toContain("status = 'pending'");
+    expect(query).toContain('started_at <= $1');
+    expect(query).toContain('ORDER BY started_at ASC');
+    expect(params).toEqual(['2026-07-13T17:53:00.000Z']);
+  });
+
+  test('orphans a pending workflow run with a guarded CAS update', async () => {
+    mockTransactionQuery
+      .mockResolvedValueOnce(createQueryResult([{ status: 'pending' }], 1))
+      .mockResolvedValueOnce(createQueryResult([], 1));
+
+    await expect(
+      orphanPendingWorkflowRun({
+        runId: 'run-pending-1',
+        reason: 'pending_run_predates_orchestrator_boot',
+        orphanedAt: '2026-07-13T17:53:00.000Z',
+      })
+    ).resolves.toBe(true);
+
+    expect(mockWithTransaction).toHaveBeenCalledTimes(1);
+    expect(mockTransactionQuery.mock.calls[0]?.[0]).toContain("status = 'pending'");
+    expect(mockTransactionQuery.mock.calls[1]?.[0]).toContain("status = 'orphaned'");
+    expect(mockTransactionQuery.mock.calls[1]?.[0]).toContain(
+      "WHERE id = $2 AND status = 'pending'"
+    );
+  });
+
+  test('orphan pending workflow CAS returns false when no pending row matches', async () => {
+    mockTransactionQuery.mockResolvedValueOnce(createQueryResult([], 0));
+
+    await expect(
+      orphanPendingWorkflowRun({
+        runId: 'run-pending-1',
+        reason: 'pending_run_predates_orchestrator_boot',
+        orphanedAt: '2026-07-13T17:53:00.000Z',
+      })
+    ).resolves.toBe(false);
+
+    expect(mockTransactionQuery).toHaveBeenCalledTimes(1);
   });
 
   test('interrupts an expired lease exactly once and persists recovery evidence', async () => {
