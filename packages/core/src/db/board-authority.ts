@@ -78,7 +78,7 @@ export async function authenticateBoardPrincipal(
     throw new Error('board_principal_auth_unconfigured');
   }
   const principal = await resolver(proof);
-  if (!principal || !principal.principal_id || !principal.seat_id) {
+  if (!principal?.principal_id || !principal.seat_id) {
     throw new Error('board_principal_auth_rejected');
   }
   if (!['john', 'general', 'xo'].includes(principal.seat_id)) {
@@ -215,8 +215,7 @@ export async function acquireXoLease(input: {
     const current = await txQuery<XoLeaseRow>('SELECT * FROM board_xo_leases WHERE id = 1');
     const row = current.rows[0];
     if (
-      !row ||
-      row.holder_id !== input.holder_id ||
+      row?.holder_id !== input.holder_id ||
       row.holder_token_hash !== tokenHash ||
       row.principal_id !== input.principal.principal_id
     ) {
@@ -358,7 +357,7 @@ async function databaseNow(): Promise<string> {
   const sql =
     db.dialect === 'sqlite'
       ? "SELECT strftime('%Y-%m-%dT%H:%M:%fZ', 'now') AS now"
-      : "SELECT to_char(clock_timestamp() AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') AS now";
+      : 'SELECT to_char(clock_timestamp() AT TIME ZONE \'UTC\', \'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"\') AS now';
   const result = await db.query<{ now: string }>(sql);
   return result.rows[0]?.now ?? new Date().toISOString();
 }
@@ -385,7 +384,7 @@ function normalizeLease(row: XoLeaseRow): XoLease {
     principal_id: row.principal_id,
     seat_id: row.seat_id,
     holder_id: row.holder_id,
-    fencing_token: Number(row.fencing_token),
+    fencing_token: row.fencing_token,
     acquired_at: row.acquired_at,
     renewed_at: row.renewed_at,
     expires_at: row.expires_at,
@@ -394,7 +393,10 @@ function normalizeLease(row: XoLeaseRow): XoLease {
 }
 
 async function insertAuditWithQuery(
-  query: <T>(sql: string, params?: unknown[]) => Promise<{ rows: T[]; rowCount: number }>,
+  query: (
+    sql: string,
+    params?: unknown[]
+  ) => Promise<{ rows: readonly unknown[]; rowCount: number }>,
   input: BoardAuditEventInput
 ): Promise<void> {
   await query(

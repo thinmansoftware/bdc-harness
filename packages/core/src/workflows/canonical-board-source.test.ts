@@ -117,8 +117,9 @@ describe('canonical board source', () => {
   });
 
   test('approval fails closed for unknown fields, duplicate principal, and mismatched John authorization', () => {
-    expect(() => parseCanonicalBoardApproval(frozen(motionWithApproval(', "unknown": true'))))
-      .toThrow('canonical_approval_rejected');
+    expect(() =>
+      parseCanonicalBoardApproval(frozen(motionWithApproval(', "unknown": true')))
+    ).toThrow('canonical_approval_rejected');
 
     const duplicatePrincipal = motionWithApproval().replace('"john-ranson"', '"xo-model"');
     expect(() => parseCanonicalBoardApproval(frozen(duplicatePrincipal))).toThrow(

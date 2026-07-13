@@ -156,10 +156,7 @@ export function parseCanonicalBoardApproval(
 }
 
 function readApprovalRecord(text: string): ApprovalRecord {
-  const fencePattern = new RegExp(
-    '```' + BOARD_APPROVAL_FENCE + '\\s*\\n([\\s\\S]*?)\\n```',
-    'g'
-  );
+  const fencePattern = new RegExp('```' + BOARD_APPROVAL_FENCE + '\\s*\\n([\\s\\S]*?)\\n```', 'g');
   const matches = [...text.matchAll(fencePattern)];
   if (matches.length !== 1) {
     throw new Error('canonical_approval_rejected: expected one board-approval-v1 block');
@@ -179,7 +176,10 @@ function validateApprovalRecord(record: ApprovalRecord): void {
   if (record.john_authorization.target_sha !== record.target_sha) {
     throw new Error('canonical_approval_rejected: john target mismatch');
   }
-  if (record.john_authorization.revoked === true) {
+  // Schema types `revoked` as `false | undefined`, but keep the runtime guard
+  // as defense-in-depth against records that bypassed schema validation.
+  const johnRevoked: boolean = record.john_authorization.revoked ?? false;
+  if (johnRevoked) {
     throw new Error('canonical_approval_rejected: john authorization revoked');
   }
   if (record.no_staging_exception && !record.rollback_test_evidence) {
