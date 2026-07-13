@@ -21,9 +21,8 @@ mock.module('@archon/core', () => ({
   reconcilePendingWorkflowRunsAtBoot,
 }));
 
-const { observeStartupRecovery, reconcilePendingRunsAtBoot } = await import(
-  './startup-reconciliation'
-);
+const { observeStartupRecovery, reconcilePendingRunsAtBoot } =
+  await import('./startup-reconciliation');
 
 test('startup reconciliation is observe-only', async () => {
   const store = {} as IWorkflowStore;

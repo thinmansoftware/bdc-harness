@@ -1478,9 +1478,9 @@ describe('Smart Cauldron reliability persistence', () => {
     };
     mockQuery.mockResolvedValueOnce(createQueryResult([pendingRun]));
 
-    await expect(
-      listPendingWorkflowRunsBefore('2026-07-13T17:53:00.000Z')
-    ).resolves.toEqual([pendingRun]);
+    await expect(listPendingWorkflowRunsBefore('2026-07-13T17:53:00.000Z')).resolves.toEqual([
+      pendingRun,
+    ]);
 
     const [query, params] = mockQuery.mock.calls[0] as [string, unknown[]];
     expect(query).toContain("status = 'pending'");
@@ -1505,7 +1505,9 @@ describe('Smart Cauldron reliability persistence', () => {
     expect(mockWithTransaction).toHaveBeenCalledTimes(1);
     expect(mockTransactionQuery.mock.calls[0]?.[0]).toContain("status = 'pending'");
     expect(mockTransactionQuery.mock.calls[1]?.[0]).toContain("status = 'orphaned'");
-    expect(mockTransactionQuery.mock.calls[1]?.[0]).toContain("WHERE id = $2 AND status = 'pending'");
+    expect(mockTransactionQuery.mock.calls[1]?.[0]).toContain(
+      "WHERE id = $2 AND status = 'pending'"
+    );
   });
 
   test('orphan pending workflow CAS returns false when no pending row matches', async () => {

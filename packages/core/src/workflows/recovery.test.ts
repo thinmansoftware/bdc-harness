@@ -215,9 +215,7 @@ describe('boot pending reconciliation', () => {
       raced: 0,
       entries: [{ runId: 'run-pending-1', disposition: 'orphaned' }],
     });
-    expect(store.listPendingWorkflowRunsBefore).toHaveBeenCalledWith(
-      '2026-07-13T17:53:00.000Z'
-    );
+    expect(store.listPendingWorkflowRunsBefore).toHaveBeenCalledWith('2026-07-13T17:53:00.000Z');
     expect(store.orphanPendingWorkflowRun).toHaveBeenCalledWith({
       runId: 'run-pending-1',
       reason: 'pending_run_predates_orchestrator_boot',
@@ -256,9 +254,7 @@ describe('boot pending reconciliation', () => {
     });
 
     await reconcilePendingWorkflowRunsAtBoot(store, { now: '2026-07-13T17:53:00.000Z' });
-    expect(store.listPendingWorkflowRunsBefore).toHaveBeenCalledWith(
-      '2026-07-13T17:53:00.000Z'
-    );
+    expect(store.listPendingWorkflowRunsBefore).toHaveBeenCalledWith('2026-07-13T17:53:00.000Z');
     expect(store.orphanPendingWorkflowRun).not.toHaveBeenCalled();
   });
 });
