@@ -30,6 +30,9 @@ jobs:
       - name: Check bundled defaults
         run: bun run check:bundled
 
+      - name: Check bundled skill
+        run: bun run check:bundled-skill
+
       - name: Type check
         run: bun run type-check
 
