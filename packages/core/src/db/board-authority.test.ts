@@ -87,6 +87,82 @@ describe('board authority db', () => {
     ]);
   });
 
+  test('concurrent first-time acquisitions return one owner and one conflict', async () => {
+    const realDb = db;
+    let selected = 0;
+    let releaseSelects: (() => void) | undefined;
+    const bothSelected = new Promise<void>(resolve => {
+      releaseSelects = resolve;
+    });
+    let row:
+      | {
+          id: number;
+          lease_id: string;
+          principal_id: string;
+          seat_id: 'john' | 'general' | 'xo';
+          holder_id: string;
+          holder_token_hash: string;
+          fencing_token: number;
+          acquired_at: string;
+          renewed_at: string | null;
+          expires_at: string;
+          released_at: string | null;
+        }
+      | undefined;
+
+    const txQuery = mock(async (sql: string, params?: unknown[]) => {
+      if (sql.includes('SELECT * FROM board_xo_leases WHERE id = 1')) {
+        if (!row) {
+          selected += 1;
+          if (selected === 2) releaseSelects?.();
+          await bothSelected;
+          return { rows: [], rowCount: 0 };
+        }
+        return { rows: [row], rowCount: 1 };
+      }
+      if (sql.includes('INSERT INTO board_xo_leases')) {
+        if (!row) {
+          row = {
+            id: 1,
+            lease_id: params?.[0] as string,
+            principal_id: params?.[1] as string,
+            seat_id: params?.[2] as 'john' | 'general' | 'xo',
+            holder_id: params?.[3] as string,
+            holder_token_hash: params?.[4] as string,
+            fencing_token: 1,
+            acquired_at: params?.[5] as string,
+            renewed_at: null,
+            expires_at: params?.[6] as string,
+            released_at: null,
+          };
+        }
+        return { rows: [], rowCount: row.holder_id === params?.[3] ? 1 : 0 };
+      }
+      return { rows: [], rowCount: 1 };
+    });
+    const fakeDb = {
+      dialect: 'sqlite',
+      query: mock(async () => ({ rows: [{ now: '2026-01-01T00:00:00.000Z' }], rowCount: 1 })),
+      withTransaction: mock(async (fn: (query: typeof txQuery) => Promise<unknown>) => fn(txQuery)),
+      close: mock(async () => {}),
+    };
+
+    db = fakeDb as unknown as SqliteAdapter;
+    try {
+      const results = await Promise.all([
+        acquireXoLease({ principal: XO, holder_id: 'holder-a', holder_token: 'token-a' }),
+        acquireXoLease({ principal: GENERAL, holder_id: 'holder-b', holder_token: 'token-b' }),
+      ]);
+
+      expect(results.filter(result => result.ok)).toHaveLength(1);
+      expect(results.filter(result => !result.ok).map(result => result.reason)).toEqual([
+        'active_xo_lease_exists',
+      ]);
+    } finally {
+      db = realDb;
+    }
+  });
+
   test('takeover increments fence and stale holder cannot renew or release', async () => {
     const first = await acquireXoLease({
       principal: XO,
@@ -149,6 +225,7 @@ describe('board authority db', () => {
     });
     expect(first.ok).toBe(true);
     expect(second.ok).toBe(false);
+    expect(second.reason).toBe('active_xo_lease_exists');
 
     const renewed = await renewXoLease({
       principal: XO,
@@ -156,7 +233,21 @@ describe('board authority db', () => {
       holder_token: 'token-a',
       fencing_token: first.lease?.fencing_token ?? 0,
     });
+    const nonholderRenew = await renewXoLease({
+      principal: XO,
+      holder_id: 'holder-b',
+      holder_token: 'token-b',
+      fencing_token: first.lease?.fencing_token ?? 0,
+    });
+    const nonholderRelease = await releaseXoLease({
+      principal: XO,
+      holder_id: 'holder-b',
+      holder_token: 'token-b',
+      fencing_token: first.lease?.fencing_token ?? 0,
+    });
     expect(renewed.ok).toBe(true);
+    expect(nonholderRenew).toEqual({ ok: false, reason: 'stale_xo_lease_token' });
+    expect(nonholderRelease).toEqual({ ok: false, reason: 'stale_xo_lease_token' });
   });
 
   test('injected principal resolver authenticates eligible principals only', async () => {

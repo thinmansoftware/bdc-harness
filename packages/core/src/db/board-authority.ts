@@ -28,6 +28,9 @@ let defaultPrincipalResolver:
 export function setBoardPrincipalResolverForTests(
   resolver: ((proof: BoardPrincipalProof) => Promise<BoardPrincipal | null>) | undefined
 ): void {
+  if (!isTestEnvironment()) {
+    throw new Error('setBoardPrincipalResolverForTests is only available in test environments');
+  }
   defaultPrincipalResolver = resolver;
 }
 
@@ -171,7 +174,8 @@ export async function acquireXoLease(input: {
            id, lease_id, principal_id, seat_id, holder_id, holder_token_hash,
            fencing_token, acquired_at, renewed_at, expires_at, released_at
          )
-         VALUES (1, $1, $2, $3, $4, $5, 1, $6, NULL, $7, NULL)`,
+         VALUES (1, $1, $2, $3, $4, $5, 1, $6, NULL, $7, NULL)
+         ON CONFLICT(id) DO NOTHING`,
         [
           randomUUID(),
           input.principal.principal_id,
@@ -216,6 +220,15 @@ export async function acquireXoLease(input: {
       row.holder_token_hash !== tokenHash ||
       row.principal_id !== input.principal.principal_id
     ) {
+      await insertAuditWithQuery(txQuery, {
+        event_type: 'xo_lease_acquire_rejected',
+        actor_principal_id: input.principal.principal_id,
+        actor_seat_id: input.principal.seat_id,
+        xo_lease_id: row?.lease_id ?? null,
+        xo_fencing_token: row?.fencing_token ?? null,
+        details: { reason: 'active_xo_lease_exists' },
+        created_at: now,
+      });
       return { ok: false, reason: 'active_xo_lease_exists' };
     }
 
@@ -356,6 +369,10 @@ function hashHolderToken(token: string): string {
 
 function addMillisecondsIso(baseIso: string, ms: number): string {
   return new Date(new Date(baseIso).getTime() + ms).toISOString();
+}
+
+function isTestEnvironment(): boolean {
+  return process.env.NODE_ENV === 'test' || process.env.BUN_ENV === 'test';
 }
 
 function isActive(row: XoLeaseRow, now: string): boolean {

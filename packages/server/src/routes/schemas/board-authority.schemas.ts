@@ -2,15 +2,6 @@ import { z } from '@hono/zod-openapi';
 
 export const boardSeatSchema = z.enum(['john', 'general', 'xo']);
 
-export const boardPrincipalProofSchema = z
-  .object({
-    principal_token: z.string().min(1).optional(),
-    holder_id: z.string().min(1),
-    holder_token: z.string().min(1),
-  })
-  .strict()
-  .openapi('BoardPrincipalProof');
-
 export const xoLeaseSchema = z
   .object({
     lease_id: z.string(),
