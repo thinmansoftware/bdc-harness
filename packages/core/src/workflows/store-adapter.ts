@@ -73,8 +73,6 @@ export function createWorkflowStore(): IWorkflowStore {
     finalizeSupervisorAction: workflowDb.finalizeSupervisorAction,
     appendSupervisorAction: workflowDb.appendSupervisorAction,
     releaseSupervisorRepairLease: workflowDb.releaseSupervisorRepairLease,
-    finalizeSupervisorRecoveryTransition: workflowDb.finalizeSupervisorRecoveryTransition,
-    getRunRecoveryDetails: workflowDb.getRunRecoveryDetails,
     createWorkflowEvent: async (data): Promise<void> => {
       try {
         await workflowEventDb.createWorkflowEvent(data);

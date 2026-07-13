@@ -468,7 +468,7 @@ CREATE TABLE IF NOT EXISTS remote_agent_supervisor_incidents (
   incident_key TEXT NOT NULL UNIQUE,
   run_id UUID NOT NULL REFERENCES remote_agent_workflow_runs(id) ON DELETE CASCADE,
   wo_id TEXT NOT NULL,
-  status TEXT NOT NULL CHECK (status IN ('open', 'repairing', 'recovered', 'escalated', 'abandoned')),
+  status TEXT NOT NULL CHECK (status IN ('open', 'repairing', 'recovered', 'escalated')),
   created_at TIMESTAMP WITH TIME ZONE NOT NULL,
   updated_at TIMESTAMP WITH TIME ZONE NOT NULL
 );
@@ -494,7 +494,6 @@ CREATE TABLE IF NOT EXISTS remote_agent_supervisor_repair_leases (
 
 CREATE TABLE IF NOT EXISTS remote_agent_supervisor_actions (
   action_id UUID PRIMARY KEY,
-  attempt_id UUID NOT NULL,
   incident_id UUID NOT NULL REFERENCES remote_agent_supervisor_incidents(incident_id) ON DELETE CASCADE,
   owner_id TEXT NOT NULL,
   fencing_token BIGINT NOT NULL CHECK (fencing_token > 0),
@@ -503,20 +502,14 @@ CREATE TABLE IF NOT EXISTS remote_agent_supervisor_actions (
   evidence_refs JSONB NOT NULL DEFAULT '[]'::jsonb,
   created_at TIMESTAMP WITH TIME ZONE NOT NULL,
   status TEXT NOT NULL DEFAULT 'completed' CHECK (status IN ('reserved', 'completed', 'failed')),
-  completed_at TIMESTAMP WITH TIME ZONE,
-  pull_request_number INTEGER,
-  recovered_head_sha TEXT,
-  target_base TEXT,
-  merge_sha TEXT
+  completed_at TIMESTAMP WITH TIME ZONE
 );
 
 CREATE INDEX IF NOT EXISTS idx_supervisor_observations_incident
   ON remote_agent_supervisor_observations(incident_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_supervisor_actions_incident
   ON remote_agent_supervisor_actions(incident_id, created_at);
--- M-26: attempt-scoped audit (was uq_supervisor_action_incident in migration 027,
--- replaced in migration 030).
-CREATE UNIQUE INDEX IF NOT EXISTS uq_supervisor_action_attempt
-  ON remote_agent_supervisor_actions(incident_id, attempt_id, action_type);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_supervisor_action_incident
+  ON remote_agent_supervisor_actions(incident_id);
 CREATE INDEX IF NOT EXISTS idx_supervisor_repair_leases_expiry
   ON remote_agent_supervisor_repair_leases(expires_at) WHERE released_at IS NULL;

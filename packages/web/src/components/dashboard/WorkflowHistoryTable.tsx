@@ -15,8 +15,6 @@ import { formatDuration, formatStarted } from '@/lib/format';
 import { ConfirmRunActionDialog } from './ConfirmRunActionDialog';
 // Centralized status colors (escalated = YELLOW) -- WO-HARNESS-ESCALATED-RUN-STATUS-01
 import { STATUS_DOT_COLORS, getStatusLabel } from '@/lib/status-renderer';
-// Recovery axis (M-26) -- WO-HARNESS-RUN-RECOVERY-DUAL-TRUTH-01
-import { getRecoveryDotColor, getRecoveryLabel } from '@/lib/recovery-renderer';
 
 interface WorkflowHistoryTableProps {
   runs: DashboardRunResponse[];
@@ -73,35 +71,13 @@ export function WorkflowHistoryTable({
               )}
             >
               <td className="px-3 py-2">
-                {/* Execution dot (always) + independent recovery dot (M-26).
-                    The recovery dot is a second axis; it never replaces the
-                    execution dot. Recovery label surfaced via tooltip. */}
-                <div className="flex items-center gap-1">
-                  <div
-                    className={cn(
-                      'h-2 w-2 rounded-full',
-                      STATUS_DOT_COLORS[run.status] ?? 'bg-text-tertiary'
-                    )}
-                    title={getStatusLabel(run.status)}
-                  />
-                  {getRecoveryLabel(run.outcome) !== null && run.outcome && (
-                    <div
-                      className={cn(
-                        'h-2 w-2 rounded-full',
-                        getRecoveryDotColor(run.outcome.recoveryState)
-                      )}
-                      title={`Recovery: ${getRecoveryLabel(run.outcome) ?? ''}`}
-                    />
+                <div
+                  className={cn(
+                    'h-2 w-2 rounded-full',
+                    STATUS_DOT_COLORS[run.status] ?? 'bg-text-tertiary'
                   )}
-                </div>
-                {getRecoveryLabel(run.outcome) === 'PR Ready (Validated)' && (
-                  <span
-                    className="mt-0.5 block text-[10px] text-success"
-                    title="PR Ready (Validated)"
-                  >
-                    PR Ready (Validated)
-                  </span>
-                )}
+                  title={getStatusLabel(run.status)}
+                />
               </td>
               <td className="px-3 py-2">
                 <Link
