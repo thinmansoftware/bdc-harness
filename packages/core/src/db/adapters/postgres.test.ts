@@ -137,7 +137,7 @@ describe('PostgresAdapter', () => {
   describe('Board motion dispatch schema', () => {
     test('numbered migration, combined schema, and SQLite bootstrap define resolution fields', () => {
       const migration = readFileSync(
-        resolve(import.meta.dir, '../../../../../migrations', '030_board_motion_dispatch.sql'),
+        resolve(import.meta.dir, '../../../../../migrations', '031_board_motion_dispatch.sql'),
         'utf8'
       );
       const combined = readFileSync(
