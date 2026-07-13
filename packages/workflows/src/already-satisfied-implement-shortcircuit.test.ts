@@ -141,6 +141,9 @@ const minimalConfig: WorkflowConfig = {
   defaults: { loadDefaultCommands: false, loadDefaultWorkflows: false },
 };
 
+// Defense-in-depth fallback coverage only: these hand-built DAGs intentionally omit
+// lane-level when: guards, so they prove the prompt-level short-circuit still works
+// if a workflow forgets the ratified Option B node-skip wiring.
 describe('already-satisfied implement short-circuit', () => {
   let testDir: string;
 
