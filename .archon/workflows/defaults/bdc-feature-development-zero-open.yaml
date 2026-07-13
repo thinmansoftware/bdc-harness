@@ -169,9 +169,9 @@ nodes:
     depends_on: [check-already-satisfied]
     bash: |
       set -uo pipefail
-      CAS=$(cat <<'BDC_CHECK_ALREADY_SATISFIED_OUTPUT'
+      CAS=$(cat <<'BDC_FEATURE_DEV_CHECK_ALREADY_SATISFIED_20260713_F9C2A1'
       $check-already-satisfied.output
-      BDC_CHECK_ALREADY_SATISFIED_OUTPUT
+      BDC_FEATURE_DEV_CHECK_ALREADY_SATISFIED_20260713_F9C2A1
       )
       if printf '%s\n' "$CAS" | grep -qE '^ALREADY_SATISFIED=true'; then
         SATISFIED_EVIDENCE=$(printf '%s\n' "$CAS" | sed -n 's/^SATISFIED_EVIDENCE=//p' | head -1)
@@ -711,9 +711,9 @@ nodes:
       SAID_ALREADY=false
       if printf '%s\n' "$IMPL" | grep -qE '^ALREADY_SATISFIED:'; then SAID_ALREADY=true; fi
       GATE_ALREADY=false
-      GATE_JSON=$(cat <<'BDC_GATE_ALREADY_SATISFIED_OUTPUT'
+      GATE_JSON=$(cat <<'BDC_FEATURE_DEV_GATE_ALREADY_SATISFIED_20260713_A8E4D3'
       $gate-already-satisfied.output
-      BDC_GATE_ALREADY_SATISFIED_OUTPUT
+      BDC_FEATURE_DEV_GATE_ALREADY_SATISFIED_20260713_A8E4D3
       )
       if [ -n "$GATE_JSON" ]; then
         GATE_ALREADY=$(GATE_JSON="$GATE_JSON" python3 - <<'PY' 2>/dev/null || printf 'false\n'

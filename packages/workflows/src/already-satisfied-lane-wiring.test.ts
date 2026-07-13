@@ -15,13 +15,15 @@ registerCommunityProviders();
 const REPO_ROOT = join(import.meta.dir, '..', '..', '..');
 const LANES_DIR = join(REPO_ROOT, '.archon/workflows/defaults');
 
-const LANE_FILES = readdirSync(LANES_DIR)
-  .filter(file => file.startsWith('bdc-feature-development') && file.endsWith('.yaml'))
+const ALL_GATE_FILES = readdirSync(LANES_DIR)
+  .filter(file => file.endsWith('.yaml'))
   .filter(file => {
     const content = readFileSync(join(LANES_DIR, file), 'utf-8');
     return content.includes('- id: gate-already-satisfied');
   })
   .sort();
+
+const LANE_FILES = ALL_GATE_FILES.filter(file => file.startsWith('bdc-feature-development'));
 
 async function runGateScript(script: string, checkOutput: string) {
   const rendered = script.replace('$check-already-satisfied.output', checkOutput);
@@ -51,7 +53,7 @@ describe('already-satisfied lane wiring', () => {
     ]);
   });
 
-  for (const file of LANE_FILES) {
+  for (const file of ALL_GATE_FILES) {
     it(`${file} wires implement to read gate-already-satisfied output`, () => {
       const content = readFileSync(join(LANES_DIR, file), 'utf-8');
       const result = parseWorkflow(content, file);
@@ -62,7 +64,9 @@ describe('already-satisfied lane wiring', () => {
       expect(implement?.loop?.prompt).toContain('PRECHECK_VERDICT=already-satisfied');
       expect(implement?.loop?.prompt).toContain('Completion Criteria case 2');
     });
+  }
 
+  for (const file of LANE_FILES) {
     it(`${file} wires true node-skip guards and all_done downstream trigger rules`, () => {
       const content = readFileSync(join(LANES_DIR, file), 'utf-8');
       const result = parseWorkflow(content, file);
@@ -133,6 +137,39 @@ describe('already-satisfied lane wiring', () => {
         PRECHECK_VERDICT: 'needs-build',
       });
       expect(needsBuild.stderr).toBe('');
+    });
+
+    it(`${file} preserves adversarial already-satisfied evidence through shell embedding`, async () => {
+      const content = readFileSync(join(LANES_DIR, file), 'utf-8');
+      const result = parseWorkflow(content, file);
+      if (!result.workflow) throw new Error(`${file}: ${result.error?.error ?? 'failed to parse'}`);
+
+      const gate = result.workflow.nodes.find(node => node.id === 'gate-already-satisfied');
+      expect(gate?.bash).toBeString();
+      expect(gate?.bash).not.toContain('BDC_CHECK_ALREADY_SATISFIED_OUTPUT');
+
+      const evidence = [
+        "branch contains quoted value 'already done'",
+        'literal backtick ` should remain data',
+        'old heredoc marker BDC_CHECK_ALREADY_SATISFIED_OUTPUT should remain data',
+      ].join(' / ');
+      const already = await runGateScript(
+        gate?.bash ?? '',
+        [
+          'ALREADY_SATISFIED=true',
+          `SATISFIED_EVIDENCE=${evidence}`,
+          'BDC_CHECK_ALREADY_SATISFIED_OUTPUT',
+        ].join('\n')
+      );
+
+      expect(already.exitCode).toBe(0);
+      expect(already.stdout.trim().split('\n')).toHaveLength(1);
+      expect(JSON.parse(already.stdout)).toEqual({
+        ALREADY_SATISFIED: true,
+        PRECHECK_VERDICT: 'already-satisfied',
+        SATISFIED_EVIDENCE: evidence,
+      });
+      expect(already.stderr).toContain('build-only nodes will be skipped');
     });
   }
 });
