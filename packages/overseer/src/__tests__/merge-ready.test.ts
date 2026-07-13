@@ -131,6 +131,34 @@ describe('merge-ready action', () => {
     );
   });
 
+  test('grok required without judge dependency holds and never merges', async () => {
+    const mergePullRequest = mock(async () => ({ merged: true, message: 'merged' }));
+    const insertOverseerAction = mock(async () => undefined);
+
+    const result = await handleMergeReady(
+      record('bdc-harness'),
+      {
+        findPullRequest: async () => {
+          throw new Error('not used');
+        },
+        mergePullRequest,
+        insertOverseerAction,
+      },
+      { mergeJudge: 'grok' }
+    );
+
+    expect(result.action).toBe('merge_held');
+    expect(result.merged).toBe(false);
+    expect(result.result).toBe('hold: grok merge judge is required but not configured');
+    expect(mergePullRequest).not.toHaveBeenCalled();
+    expect(insertOverseerAction).toHaveBeenCalledWith(
+      expect.objectContaining({
+        action: 'merge_held',
+        result: 'hold: grok merge judge is required but not configured',
+      })
+    );
+  });
+
   test('tail-node false-fail customer repo is report-only and never merges', async () => {
     const mergePullRequest = mock(async () => ({ merged: true }));
     const insertOverseerAction = mock(async () => undefined);

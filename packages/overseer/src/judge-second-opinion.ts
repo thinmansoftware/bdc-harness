@@ -41,7 +41,7 @@ function buildGrokPrompt(evidence: GrokJudgeEvidence): string {
     'Return exactly one verdict line: VERDICT: APPROVE or VERDICT: HOLD.',
     'APPROVE means the PR evidence supports auto-merge. HOLD means an operator should review.',
     '',
-    'WO: WO-HARNESS-OVERSEER-V1B-GROK-MERGE-JUDGE-01',
+    `WO: ${evidence.woId}`,
     `PR: #${evidence.prNumber} ${evidence.prTitle}`,
     `Checks: total=${evidence.checksSummary.total}, passed=${evidence.checksSummary.passed}, failed=${evidence.checksSummary.failed}, pending=${evidence.checksSummary.pending}, conclusion=${evidence.checksSummary.conclusion ?? 'unknown'}`,
     `Files changed: ${evidence.filesChangedCount}`,

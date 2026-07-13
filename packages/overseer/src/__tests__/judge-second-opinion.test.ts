@@ -28,6 +28,27 @@ describe('grok second-opinion judge', () => {
     ).resolves.toBe('hold');
   });
 
+  test('sends required evidence fields in grok prompt', async () => {
+    let prompt = '';
+
+    await expect(
+      judgeWithGrok(evidence, {
+        spawn: async input => {
+          prompt = input;
+          return { exitCode: 0, stdout: 'VERDICT: APPROVE\n', timedOut: false };
+        },
+      })
+    ).resolves.toBe('approve');
+
+    expect(prompt).toContain(`WO: ${evidence.woId}`);
+    expect(prompt).toContain(`PR: #${evidence.prNumber} ${evidence.prTitle}`);
+    expect(prompt).toContain(
+      'Checks: total=3, passed=3, failed=0, pending=0, conclusion=unknown'
+    );
+    expect(prompt).toContain(`Files changed: ${evidence.filesChangedCount}`);
+    expect(prompt).toContain(`Diff stat: ${evidence.diffStat}`);
+  });
+
   test('treats garbage, empty, and malformed verdicts as hold', () => {
     expect(parseGrokVerdict('APPROVE')).toBe('hold');
     expect(parseGrokVerdict('')).toBe('hold');

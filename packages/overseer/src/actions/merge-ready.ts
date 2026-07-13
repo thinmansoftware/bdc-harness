@@ -67,6 +67,18 @@ export async function handleMergeReady(
   const judgeSecondOpinion = options.mergeJudge === 'grok' ? deps.judgeSecondOpinion : undefined;
   let action = 'merge_ready';
   let actionResult: string | undefined;
+  if (options.mergeJudge === 'grok' && !judgeSecondOpinion) {
+    const result = 'hold: grok merge judge is required but not configured';
+    await deps.insertOverseerAction({
+      runId: record.runId,
+      woId: record.woId,
+      class: 'tail_node_false_fail',
+      action: 'merge_held',
+      result,
+    });
+    return { decision, action: 'merge_held', merged: false, result };
+  }
+
   if (judgeSecondOpinion) {
     const verdict = await judgeSecondOpinion(buildGrokJudgeEvidence(record));
     if (verdict === 'hold') {
