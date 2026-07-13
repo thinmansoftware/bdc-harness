@@ -81,6 +81,8 @@ import {
   authorizeSupervisorMutation,
   reserveSupervisorAction,
   finalizeSupervisorAction,
+  finalizeSupervisorRecoveryTransition,
+  getRunRecoveryDetails,
   appendSupervisorAction,
   releaseSupervisorRepairLease,
   reconcileTerminalWorkflowRuns,
@@ -1903,6 +1905,7 @@ describe('Smart Cauldron reliability persistence', () => {
     await expect(
       reserveSupervisorAction({
         actionId: 'dddddddd-dddd-4ddd-8ddd-dddddddddddd',
+        attemptId: 'dddddddd-dddd-4ddd-8ddd-dddddddddddd',
         incidentId: '99999999-9999-4999-8999-999999999999',
         ownerId: 'sol',
         fencingToken: 1,
@@ -1911,7 +1914,7 @@ describe('Smart Cauldron reliability persistence', () => {
         evidenceRefs: [],
         createdAt: '2026-07-10T12:01:05.000Z',
       })
-    ).resolves.toBe(false);
+    ).resolves.toBe('conflict');
   });
 
   test('does not hide unrelated SQLite reservation integrity failures', async () => {
@@ -1929,6 +1932,7 @@ describe('Smart Cauldron reliability persistence', () => {
     await expect(
       reserveSupervisorAction({
         actionId: 'dddddddd-dddd-4ddd-8ddd-dddddddddddd',
+        attemptId: 'dddddddd-dddd-4ddd-8ddd-dddddddddddd',
         incidentId: '99999999-9999-4999-8999-999999999999',
         ownerId: 'sol',
         fencingToken: 1,
@@ -2048,6 +2052,7 @@ describe('Smart Cauldron reliability persistence', () => {
       await expect(
         reserveSupervisorAction({
           actionId: 'dddddddd-dddd-4ddd-8ddd-dddddddddddd',
+          attemptId: 'ffffffff-ffff-4fff-8fff-ffffffffffff',
           incidentId: incident.incidentId,
           ownerId: takeoverOwner,
           fencingToken: 2,
@@ -2056,10 +2061,13 @@ describe('Smart Cauldron reliability persistence', () => {
           evidenceRefs: [],
           createdAt: '2026-07-10T12:01:05.000Z',
         })
-      ).resolves.toBe(true);
+      ).resolves.toBe('applied');
+      // Same attempt tuple + identical immutable payload retried -> idempotent
+      // 'unchanged' (no duplicate action), even with a fresh action_id.
       await expect(
         reserveSupervisorAction({
           actionId: 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee',
+          attemptId: 'ffffffff-ffff-4fff-8fff-ffffffffffff',
           incidentId: incident.incidentId,
           ownerId: takeoverOwner,
           fencingToken: 2,
@@ -2068,7 +2076,7 @@ describe('Smart Cauldron reliability persistence', () => {
           evidenceRefs: [],
           createdAt: '2026-07-10T12:01:05.000Z',
         })
-      ).resolves.toBe(false);
+      ).resolves.toBe('unchanged');
       await sqlite.query(
         `UPDATE remote_agent_supervisor_repair_leases
          SET expires_at = '2000-01-01T00:00:00.000Z'
@@ -2172,6 +2180,383 @@ describe('Smart Cauldron reliability persistence', () => {
     expect(updates).toHaveLength(2);
     expect(updates.map(call => (call[1] as unknown[])[0]).sort()).toEqual(['completed', 'failed']);
   });
+});
+
+describe('M-26 run recovery dual-truth transitions', () => {
+  beforeEach(() => {
+    mockQuery.mockReset();
+    mockQuery.mockImplementation(() => Promise.resolve(createQueryResult([])));
+    activeDatabase = defaultMockDatabase;
+  });
+
+  const RUN_ID = '11111111-1111-4111-8111-111111111111';
+  const CODEBASE_ID = '22222222-2222-4222-8222-222222222222';
+  const CONV_ID = '77777777-7777-4777-8777-777777777777';
+  const INCIDENT_ID = '99999999-9999-4999-8999-999999999999';
+  const TERMINAL_BASE = 'c'.repeat(40);
+  const TERMINAL_HEAD = 'd'.repeat(40);
+  const TERMINAL_GIT_REF = `git:${TERMINAL_BASE}...${TERMINAL_HEAD}`;
+  const MERGE_SHA = 'e'.repeat(40);
+
+  async function seedFailedRecoverableRun(
+    sqlite: SqliteAdapter,
+    opts?: { recoveryState?: string; incidentStatus?: string }
+  ): Promise<{ ownerId: string; fencingToken: number }> {
+    await sqlite.query(
+      `INSERT INTO remote_agent_codebases (id, name, default_cwd) VALUES ($1, $2, $3)`,
+      [CODEBASE_ID, 'recovery-test', '/tmp/recovery-test']
+    );
+    await sqlite.query(
+      `INSERT INTO remote_agent_conversations
+       (id, platform_type, platform_conversation_id, codebase_id)
+       VALUES ($1, $2, $3, $4)`,
+      [CONV_ID, 'test', 'recovery-conv', CODEBASE_ID]
+    );
+    await sqlite.query(
+      `INSERT INTO remote_agent_workflow_runs
+       (id, conversation_id, codebase_id, workflow_name, user_message, status)
+       VALUES ($1, $2, $3, $4, $5, $6)`,
+      [RUN_ID, CONV_ID, CODEBASE_ID, 'test-workflow', 'recovery test', 'failed']
+    );
+    await sqlite.query(
+      `INSERT INTO remote_agent_run_outcomes
+       (run_id, execution_state, deliverable_state, validation_state, recovery_state,
+        route_state, primary_reason, reason_codes, evidence_refs, updated_at)
+       VALUES ($1, 'failed', 'pr_ready', 'passed', $2, 'current',
+        'execution_failed_pr_ready', $3, $4, '2026-07-12T12:00:00.000Z')`,
+      [
+        RUN_ID,
+        opts?.recoveryState ?? 'recoverable',
+        JSON.stringify(['execution_failed_pr_ready']),
+        JSON.stringify([`authority:${RUN_ID}`, TERMINAL_GIT_REF]),
+      ]
+    );
+    await createSupervisorIncident({
+      incidentId: INCIDENT_ID,
+      incidentKey: `recovery:${RUN_ID}`,
+      runId: RUN_ID,
+      woId: 'WO-HARNESS-TEST-01',
+      status: opts?.incidentStatus ?? 'open',
+      createdAt: '2026-07-12T12:00:00.000Z',
+      updatedAt: '2026-07-12T12:00:00.000Z',
+    });
+    if ((opts?.incidentStatus ?? 'open') === 'abandoned') {
+      await sqlite.query(
+        `UPDATE remote_agent_supervisor_incidents SET status = 'abandoned' WHERE incident_id = $1`,
+        [INCIDENT_ID]
+      );
+    }
+    const lease = await claimSupervisorRepairLease({
+      incidentId: INCIDENT_ID,
+      ownerId: 'xo@bluedevilcollectibles.com',
+      leaseDurationMs: 60_000,
+    });
+    if (!lease) throw new Error('failed to seed repair lease');
+    return { ownerId: lease.ownerId, fencingToken: lease.fencingToken };
+  }
+
+  function withSqlite(name: string, fn: (sqlite: SqliteAdapter) => Promise<void>): void {
+    test(name, async () => {
+      const dbPath = join(
+        import.meta.dir,
+        `.test-recovery-${Date.now()}-${Math.random().toString(36).slice(2)}.db`
+      );
+      const sqlite = new SqliteAdapter(dbPath);
+      activeDatabase = sqlite;
+      mockQuery.mockImplementation((sql: string, params?: unknown[]) => sqlite.query(sql, params));
+      try {
+        await fn(sqlite);
+      } finally {
+        await sqlite.close();
+        for (const suffix of ['', '-wal', '-shm']) {
+          try {
+            unlinkSync(dbPath + suffix);
+          } catch {
+            // best-effort cleanup
+          }
+        }
+      }
+    });
+  }
+
+  const completePayload = (
+    seed: { ownerId: string; fencingToken: number },
+    attemptId: string,
+    actionId: string
+  ) => ({
+    runId: RUN_ID,
+    incidentId: INCIDENT_ID,
+    ownerId: seed.ownerId,
+    fencingToken: seed.fencingToken,
+    actionId,
+    attemptId,
+    actionType: 'complete' as const,
+    now: '2026-07-12T12:05:00.000Z',
+    expectedTerminalGitRef: TERMINAL_GIT_REF,
+    evidenceRefs: [`recovery:complete:by:${seed.ownerId}`, `merge:${MERGE_SHA}`],
+    pullRequestNumber: 42,
+    recoveredHeadSha: TERMINAL_HEAD,
+    targetBase: 'dev',
+    mergeSha: MERGE_SHA,
+  });
+
+  // Test 1 -- successful recovered transition preserves execution truth.
+  withSqlite('complete transition marks recovered while execution stays failed', async sqlite => {
+    const seed = await seedFailedRecoverableRun(sqlite);
+    await expect(
+      finalizeSupervisorRecoveryTransition(
+        completePayload(
+          seed,
+          'a1a1a1a1-a1a1-4a1a-8a1a-a1a1a1a1a1a1',
+          'b1b1b1b1-b1b1-4b1b-8b1b-b1b1b1b1b1b1'
+        )
+      )
+    ).resolves.toBe('applied');
+    const after = await getRunOutcome(RUN_ID);
+    expect(after?.executionState).toBe('failed');
+    expect(after?.recoveryState).toBe('recovered');
+    expect(after?.validationState).toBe('passed');
+    expect(after?.deliverableState).toBe('pr_ready');
+    // Terminal Git evidence is never deleted.
+    expect(after?.evidenceRefs).toContain(TERMINAL_GIT_REF);
+    expect(after?.evidenceRefs).toContain(`merge:${MERGE_SHA}`);
+    const details = await getRunRecoveryDetails(RUN_ID);
+    expect(details.actions).toHaveLength(1);
+    expect(details.actions[0]?.actionType).toBe('complete');
+    expect(details.actions[0]?.mergeSha).toBe(MERGE_SHA);
+    expect(details.actions[0]?.pullRequestNumber).toBe(42);
+  });
+
+  // Test 4 -- attempt/outcome idempotency.
+  withSqlite(
+    'identical attempt retry is unchanged; conflicting payload is conflict',
+    async sqlite => {
+      const seed = await seedFailedRecoverableRun(sqlite);
+      const attemptId = 'a2a2a2a2-a2a2-4a2a-8a2a-a2a2a2a2a2a2';
+      await expect(
+        finalizeSupervisorRecoveryTransition(
+          completePayload(seed, attemptId, 'b2b2b2b2-b2b2-4b2b-8b2b-b2b2b2b2b2b2')
+        )
+      ).resolves.toBe('applied');
+      // Same attempt tuple + identical immutable payload -> unchanged, no duplicate.
+      await expect(
+        finalizeSupervisorRecoveryTransition(
+          completePayload(seed, attemptId, 'b3b3b3b3-b3b3-4b3b-8b3b-b3b3b3b3b3b3')
+        )
+      ).resolves.toBe('unchanged');
+      // Same tuple, conflicting immutable payload (different merge sha) -> conflict.
+      await expect(
+        finalizeSupervisorRecoveryTransition({
+          ...completePayload(seed, attemptId, 'b4b4b4b4-b4b4-4b4b-8b4b-b4b4b4b4b4b4'),
+          mergeSha: 'f'.repeat(40),
+        })
+      ).resolves.toBe('conflict');
+      // Evidence/reason is immutable payload too; changing it must conflict.
+      await expect(
+        finalizeSupervisorRecoveryTransition({
+          ...completePayload(seed, attemptId, 'b5b5b5b5-b5b5-4b5b-8b5b-b5b5b5b5b5b5'),
+          evidenceRefs: ['recovery:complete:by:different-actor'],
+        })
+      ).resolves.toBe('conflict');
+      const details = await getRunRecoveryDetails(RUN_ID);
+      expect(details.actions).toHaveLength(1);
+    }
+  );
+
+  // Test 4 (cont) -- repeating a recovered run/head/merge from a NEW attempt is unchanged.
+  withSqlite('re-completing same run/head/merge from a new attempt is unchanged', async sqlite => {
+    const seed = await seedFailedRecoverableRun(sqlite);
+    await expect(
+      finalizeSupervisorRecoveryTransition(
+        completePayload(
+          seed,
+          'a5a5a5a5-a5a5-4a5a-8a5a-a5a5a5a5a5a5',
+          'b5b5b5b5-b5b5-4b5b-8b5b-b5b5b5b5b5b5'
+        )
+      )
+    ).resolves.toBe('applied');
+    await expect(
+      finalizeSupervisorRecoveryTransition(
+        completePayload(
+          seed,
+          'a6a6a6a6-a6a6-4a6a-8a6a-a6a6a6a6a6a6',
+          'b6b6b6b6-b6b6-4b6b-8b6b-b6b6b6b6b6b6'
+        )
+      )
+    ).resolves.toBe('unchanged');
+  });
+
+  // Test 5 -- abandon then reopen; abandon action stays visible.
+  withSqlite(
+    'abandon then reopen returns to recoverable while execution stays failed',
+    async sqlite => {
+      const seed = await seedFailedRecoverableRun(sqlite);
+      await expect(
+        finalizeSupervisorRecoveryTransition({
+          runId: RUN_ID,
+          incidentId: INCIDENT_ID,
+          ownerId: seed.ownerId,
+          fencingToken: seed.fencingToken,
+          actionId: 'c1c1c1c1-c1c1-4c1c-8c1c-c1c1c1c1c1c1',
+          attemptId: 'd1d1d1d1-d1d1-4d1d-8d1d-d1d1d1d1d1d1',
+          actionType: 'abandon',
+          now: '2026-07-12T12:06:00.000Z',
+          expectedTerminalGitRef: TERMINAL_GIT_REF,
+          evidenceRefs: [`recovery:abandon:by:${seed.ownerId}`, 'recovery:reason:not pursuing'],
+        })
+      ).resolves.toBe('applied');
+      let after = await getRunOutcome(RUN_ID);
+      expect(after?.executionState).toBe('failed');
+      expect(after?.recoveryState).toBe('abandoned_by_operator');
+      // Release the abandon lease (the orchestration does this in its finally block).
+      await releaseSupervisorRepairLease({
+        incidentId: INCIDENT_ID,
+        ownerId: seed.ownerId,
+        fencingToken: seed.fencingToken,
+        releasedAt: '2026-07-12T12:06:30.000Z',
+      });
+      // A fenced reopen must re-claim the (now abandoned) incident.
+      const reopenLease = await claimSupervisorRepairLease({
+        incidentId: INCIDENT_ID,
+        ownerId: 'john@bluedevilcollectibles.com',
+        leaseDurationMs: 60_000,
+      });
+      expect(reopenLease).not.toBeNull();
+      await expect(
+        finalizeSupervisorRecoveryTransition({
+          runId: RUN_ID,
+          incidentId: INCIDENT_ID,
+          ownerId: reopenLease?.ownerId ?? '',
+          fencingToken: reopenLease?.fencingToken ?? 0,
+          actionId: 'c2c2c2c2-c2c2-4c2c-8c2c-c2c2c2c2c2c2',
+          attemptId: 'd2d2d2d2-d2d2-4d2d-8d2d-d2d2d2d2d2d2',
+          actionType: 'reopen',
+          now: '2026-07-12T12:07:00.000Z',
+          expectedTerminalGitRef: TERMINAL_GIT_REF,
+          evidenceRefs: [`recovery:reopen:by:${reopenLease?.ownerId ?? ''}`],
+        })
+      ).resolves.toBe('applied');
+      after = await getRunOutcome(RUN_ID);
+      expect(after?.recoveryState).toBe('recoverable');
+      // The abandonment action remains visible in the audit trail.
+      const details = await getRunRecoveryDetails(RUN_ID);
+      const types = details.actions.map(a => a.actionType).sort();
+      expect(types).toEqual(['abandon', 'reopen']);
+    }
+  );
+
+  // Test 3 -- fail closed: an expired/invalid fence yields conflict with no mutation.
+  withSqlite('rejects finalize with an invalid fencing token', async sqlite => {
+    const seed = await seedFailedRecoverableRun(sqlite);
+    await expect(
+      finalizeSupervisorRecoveryTransition({
+        ...completePayload(
+          seed,
+          'a7a7a7a7-a7a7-4a7a-8a7a-a7a7a7a7a7a7',
+          'b7b7b7b7-b7b7-4b7b-8b7b-b7b7b7b7b7b7'
+        ),
+        fencingToken: 999,
+      })
+    ).resolves.toBe('conflict');
+    const after = await getRunOutcome(RUN_ID);
+    expect(after?.recoveryState).toBe('recoverable');
+    const details = await getRunRecoveryDetails(RUN_ID);
+    expect(details.actions).toHaveLength(0);
+  });
+
+  // Test 3 -- fail closed: terminal Git ref mismatch yields conflict.
+  withSqlite('rejects finalize when the terminal Git ref is absent from evidence', async sqlite => {
+    const seed = await seedFailedRecoverableRun(sqlite);
+    await expect(
+      finalizeSupervisorRecoveryTransition({
+        ...completePayload(
+          seed,
+          'a8a8a8a8-a8a8-4a8a-8a8a-a8a8a8a8a8a8',
+          'b8b8b8b8-b8b8-4b8b-8b8b-b8b8b8b8b8b8'
+        ),
+        expectedTerminalGitRef: `git:${'0'.repeat(40)}...${'1'.repeat(40)}`,
+      })
+    ).resolves.toBe('conflict');
+    const after = await getRunOutcome(RUN_ID);
+    expect(after?.recoveryState).toBe('recoverable');
+  });
+
+  // Test 9 -- completion atomicity: exactly one completion wins; the other
+  // returns unchanged or conflict with no partial state. (bun:sqlite serializes
+  // on one synchronous connection, so the two finalizers are awaited in sequence;
+  // the guarded from-state UPDATEs are what enforce single-winner semantics --
+  // the same guards that make Postgres safe under true concurrency.)
+  withSqlite(
+    'a second complete after the first yields unchanged or conflict, never double-apply',
+    async sqlite => {
+      const seed = await seedFailedRecoverableRun(sqlite);
+      const first = await finalizeSupervisorRecoveryTransition(
+        completePayload(
+          seed,
+          'aaaa1111-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+          'bbbb1111-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
+        )
+      );
+      // A distinct attempt with a DIFFERENT head/merge must hit the from-state guard
+      // (recovery is already 'recovered') and be rejected -- not double-applied.
+      const second = await finalizeSupervisorRecoveryTransition({
+        ...completePayload(
+          seed,
+          'aaaa2222-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+          'bbbb2222-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
+        ),
+        recoveredHeadSha: TERMINAL_HEAD,
+        mergeSha: 'f'.repeat(40),
+      });
+      expect(first).toBe('applied');
+      expect(['unchanged', 'conflict']).toContain(second);
+      const after = await getRunOutcome(RUN_ID);
+      expect(after?.executionState).toBe('failed');
+      expect(after?.recoveryState).toBe('recovered');
+      expect(after?.evidenceRefs).toContain(TERMINAL_GIT_REF);
+      // Exactly one completion action persisted.
+      const details = await getRunRecoveryDetails(RUN_ID);
+      expect(details.actions.filter(a => a.actionType === 'complete')).toHaveLength(1);
+    }
+  );
+
+  // Test 8 -- fresh SQLite bootstrap supports distinct attempt-scoped action types.
+  withSqlite(
+    'attempt-scoped unique index allows distinct action types per attempt',
+    async sqlite => {
+      const seed = await seedFailedRecoverableRun(sqlite);
+      // start then complete under the same run are distinct action types and both persist.
+      await expect(
+        finalizeSupervisorRecoveryTransition({
+          runId: RUN_ID,
+          incidentId: INCIDENT_ID,
+          ownerId: seed.ownerId,
+          fencingToken: seed.fencingToken,
+          actionId: 'ca11ca11-ca11-4a11-8a11-ca11ca11ca11',
+          attemptId: 'da11da11-da11-4a11-8a11-da11da11da11',
+          actionType: 'start',
+          now: '2026-07-12T12:05:00.000Z',
+          expectedTerminalGitRef: TERMINAL_GIT_REF,
+          evidenceRefs: [`recovery:start:by:${seed.ownerId}`],
+        })
+      ).resolves.toBe('applied');
+      let after = await getRunOutcome(RUN_ID);
+      expect(after?.recoveryState).toBe('recovering');
+      await expect(
+        finalizeSupervisorRecoveryTransition(
+          completePayload(
+            seed,
+            'da22da22-da22-4a22-8a22-da22da22da22',
+            'ca22ca22-ca22-4a22-8a22-ca22ca22ca22'
+          )
+        )
+      ).resolves.toBe('applied');
+      after = await getRunOutcome(RUN_ID);
+      expect(after?.recoveryState).toBe('recovered');
+      const details = await getRunRecoveryDetails(RUN_ID);
+      expect(details.actions.map(a => a.actionType).sort()).toEqual(['complete', 'start']);
+    }
+  );
 });
 
 describe('Cauldron drain mode', () => {

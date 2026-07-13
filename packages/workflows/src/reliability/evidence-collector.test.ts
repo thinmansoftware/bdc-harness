@@ -3,9 +3,11 @@ import { describe, expect, it } from 'bun:test';
 import type { RunAuthorityRecord } from './types';
 import {
   collectMechanicalEvidence,
+  gateEvidenceFromEvents,
   renderManifestV2,
   type MechanicalEvidenceInput,
 } from './evidence-collector';
+import type { WorkflowEventRecord } from '../store';
 
 const authority: RunAuthorityRecord = {
   runId: 'run-1',
@@ -128,6 +130,60 @@ describe('collectMechanicalEvidence', () => {
 
     expect(wrongBranch.scopeValid).toBe(false);
     expect(wrongRemote.scopeValid).toBe(false);
+  });
+});
+
+describe('gateEvidenceFromEvents', () => {
+  const completedEvent = (data: Record<string, unknown>): WorkflowEventRecord => ({
+    id: 'event-1',
+    workflow_run_id: 'run-1',
+    event_type: 'node_completed',
+    step_index: 1,
+    step_name: 'validate',
+    data,
+    created_at: '2026-07-12T00:00:00.000Z',
+  });
+
+  it('does not infer pass from an empty or merely completed gate event', () => {
+    expect(gateEvidenceFromEvents('validate', [completedEvent({})]).state).toBe('indeterminate');
+    expect(
+      gateEvidenceFromEvents('validate', [
+        completedEvent({ node_output: 'Validation finished without a structured verdict.' }),
+      ]).state
+    ).toBe('indeterminate');
+  });
+
+  it('accepts only a recognized positive gate result or the exact validation contract', () => {
+    expect(
+      gateEvidenceFromEvents('validate', [
+        completedEvent({ gate_result: { passed: true, nodeType: 'bash' } }),
+      ]).state
+    ).toBe('passed');
+    expect(
+      gateEvidenceFromEvents('validate', [
+        completedEvent({ gate_result: { gate: 'validate', outcome: 'pass' } }),
+      ]).state
+    ).toBe('passed');
+    expect(
+      gateEvidenceFromEvents('validate', [completedEvent({ node_output: 'VALIDATION: PASS' })])
+        .state
+    ).toBe('passed');
+  });
+
+  it('keeps weak or mismatched positive-looking data indeterminate', () => {
+    expect(
+      gateEvidenceFromEvents('validate', [completedEvent({ gate_result: { passed: true } })]).state
+    ).toBe('indeterminate');
+    expect(
+      gateEvidenceFromEvents('validate', [
+        completedEvent({ gate_result: { gate: 'other-gate', outcome: 'pass' } }),
+      ]).state
+    ).toBe('indeterminate');
+    expect(
+      gateEvidenceFromEvents('validate', [
+        completedEvent({ node_output: 'VALIDATION: PASS if the remaining checks succeed' }),
+      ]).state
+    ).toBe('indeterminate');
   });
 });
 

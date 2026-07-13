@@ -52,7 +52,7 @@ function makeSupervisorStore() {
     reserveSupervisorAction: mock(async (action: SupervisorActionRecord) => {
       callOrder.push('reserve');
       actions.push(action);
-      return true;
+      return 'applied';
     }),
     finalizeSupervisorAction: mock(async () => {
       callOrder.push('finalize');
@@ -111,7 +111,7 @@ describe('dual supervisor recovery coordination', () => {
 
   test('does not run the external repair when action reservation loses the race', async () => {
     const { store } = makeSupervisorStore();
-    (store.reserveSupervisorAction as ReturnType<typeof mock>).mockResolvedValue(false);
+    (store.reserveSupervisorAction as ReturnType<typeof mock>).mockResolvedValue('conflict');
     const repair = mock(async () => ({ assessment: 'must-not-run', evidenceRefs: [] }));
 
     const result = await coordinateSupervisorRecovery(store, {

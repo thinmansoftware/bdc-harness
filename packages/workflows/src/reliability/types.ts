@@ -162,7 +162,30 @@ export interface RunLeaseRecord {
   readonly releasedAt: string | null;
 }
 
-export type SupervisorIncidentStatus = 'open' | 'repairing' | 'recovered' | 'escalated';
+// M-26 run-recovery dual-truth: 'abandoned' is a reopen-capable terminal-ish
+// incident status. A fenced abandon parks the incident; a fenced reopen returns
+// it to 'open'. It NEVER changes the run's execution truth.
+export type SupervisorIncidentStatus =
+  | 'open'
+  | 'repairing'
+  | 'recovered'
+  | 'escalated'
+  | 'abandoned';
+
+// Exhaustive operator-driven recovery transition action set (M-26 Section 6).
+export const RECOVERY_ACTION_TYPES = ['start', 'complete', 'abandon', 'reopen'] as const;
+
+export type RecoveryActionType = (typeof RECOVERY_ACTION_TYPES)[number];
+
+/**
+ * Result of reserving a supervisor action against the attempt-scoped unique
+ * index (incident_id, attempt_id, action_type):
+ * - 'applied'   -> a new fenced reservation was inserted
+ * - 'unchanged' -> the identical tuple + immutable payload already existed
+ * - 'conflict'  -> the tuple exists with a conflicting immutable payload, or
+ *                  the caller could not be fenced; nothing was mutated
+ */
+export type SupervisorActionReservation = 'applied' | 'unchanged' | 'conflict';
 
 export interface SupervisorIncidentRecord {
   readonly incidentId: string;
@@ -195,6 +218,12 @@ export interface SupervisorRepairLeaseRecord {
 
 export interface SupervisorActionRecord {
   readonly actionId: string;
+  // Immutable per-attempt identity. Deduplication is enforced by
+  // UNIQUE (incident_id, attempt_id, action_type); incident_id is already bound
+  // to exactly one run_id, so this is the persisted equivalent of M-26's
+  // run_id + attempt_id + action_type. Backfilled from action_id for pre-M-26
+  // rows so it is always present.
+  readonly attemptId: string;
   readonly incidentId: string;
   readonly ownerId: string;
   readonly fencingToken: number;
@@ -202,6 +231,28 @@ export interface SupervisorActionRecord {
   readonly outcome: string;
   readonly evidenceRefs: readonly string[];
   readonly createdAt: string;
+  // Structured completion evidence. Populated only by a successful `complete`
+  // recovery transition; null for reservations, non-complete actions, and
+  // historical rows. Final recovery dedup compares run_id + recoveredHeadSha +
+  // mergeSha, so these are the canonical merged-PR anchors.
+  readonly pullRequestNumber?: number | null;
+  readonly recoveredHeadSha?: string | null;
+  readonly targetBase?: string | null;
+  readonly mergeSha?: string | null;
+  // Reservation/finalization lifecycle. Absent on the reserve input path.
+  readonly status?: 'reserved' | 'completed' | 'failed';
+  readonly completedAt?: string | null;
+}
+
+/**
+ * Recovery detail surface for a single run: the canonical outcome plus the
+ * ordered supervisor action audit trail (actor, action type, evidence, and
+ * structured merged-PR anchors). Returned by getRunRecoveryDetails() and
+ * exposed on the run-detail API only.
+ */
+export interface RunRecoveryDetails {
+  readonly outcome: RunOutcome | null;
+  readonly actions: readonly SupervisorActionRecord[];
 }
 
 export interface ExpiredRunLeaseRecord {

@@ -16,9 +16,13 @@ import type {
   ProviderAttemptRecord,
   RunAuthorityRecord,
   RunLeaseRecord,
+  RecoveryActionType,
+  RecoveryState,
   RunOutcome,
+  RunRecoveryDetails,
   ScheduledProviderWaitRecord,
   SupervisorActionRecord,
+  SupervisorActionReservation,
   SupervisorIncidentRecord,
   SupervisorObservationRecord,
   SupervisorRepairLeaseRecord,
@@ -118,6 +122,24 @@ interface SupervisorRepairLeaseRow {
   released_at: DbTimestamp | null;
 }
 
+interface SupervisorActionRow {
+  action_id: string;
+  attempt_id: string;
+  incident_id: string;
+  owner_id: string;
+  fencing_token: number | string;
+  action_type: string;
+  outcome: string;
+  evidence_refs: unknown;
+  created_at: DbTimestamp;
+  status: string;
+  completed_at: DbTimestamp | null;
+  pull_request_number: number | null;
+  recovered_head_sha: string | null;
+  target_base: string | null;
+  merge_sha: string | null;
+}
+
 interface ProviderAttemptRow {
   attempt_id: string;
   run_id: string;
@@ -209,6 +231,47 @@ function normalizeSupervisorRepairLease(
     expiresAt: normalizeTimestamp(row.expires_at),
     releasedAt: normalizeNullableTimestamp(row.released_at),
   };
+}
+
+function normalizeSupervisorAction(row: SupervisorActionRow): SupervisorActionRecord {
+  return {
+    actionId: row.action_id,
+    attemptId: row.attempt_id,
+    incidentId: row.incident_id,
+    ownerId: row.owner_id,
+    fencingToken: Number(row.fencing_token),
+    actionType: row.action_type,
+    outcome: row.outcome,
+    evidenceRefs: parseJsonArray<string>(row.evidence_refs),
+    createdAt: normalizeTimestamp(row.created_at),
+    status: row.status as SupervisorActionRecord['status'],
+    completedAt: normalizeNullableTimestamp(row.completed_at),
+    pullRequestNumber: row.pull_request_number,
+    recoveredHeadSha: row.recovered_head_sha,
+    targetBase: row.target_base,
+    mergeSha: row.merge_sha,
+  };
+}
+
+/**
+ * Compare the immutable payload of an existing action row against a reservation
+ * request. action_id is the row identity and is NOT compared (callers mint a
+ * fresh action_id per retry); the attempt tuple (incident_id, attempt_id,
+ * action_type) is already the match key. Owner, fence, outcome, and evidence are
+ * the immutable payload -- any divergence is a conflict, not an idempotent retry.
+ */
+function supervisorActionPayloadMatches(
+  row: SupervisorActionRow,
+  action: SupervisorActionRecord
+): boolean {
+  const rowEvidence = parseJsonArray<string>(row.evidence_refs);
+  return (
+    row.owner_id === action.ownerId &&
+    Number(row.fencing_token) === action.fencingToken &&
+    row.outcome === action.outcome &&
+    rowEvidence.length === action.evidenceRefs.length &&
+    rowEvidence.every((value, index) => value === action.evidenceRefs[index])
+  );
 }
 
 function parseJsonArray<T extends string>(value: unknown): T[] {
@@ -635,7 +698,7 @@ export async function claimSupervisorRepairLease(data: {
      (incident_id, owner_id, fencing_token, acquired_at, last_heartbeat_at, expires_at, released_at)
      SELECT $1, $2, 1, ${nowSql}, ${nowSql}, ${expiresSql}, NULL
      FROM remote_agent_supervisor_incidents
-     WHERE incident_id = $1 AND status IN ('open', 'repairing')
+     WHERE incident_id = $1 AND status IN ('open', 'repairing', 'abandoned')
      ON CONFLICT (incident_id) DO UPDATE SET
        owner_id = EXCLUDED.owner_id,
        fencing_token = remote_agent_supervisor_repair_leases.fencing_token + 1,
@@ -648,7 +711,7 @@ export async function claimSupervisorRepairLease(data: {
        AND EXISTS (
          SELECT 1 FROM remote_agent_supervisor_incidents i
          WHERE i.incident_id = remote_agent_supervisor_repair_leases.incident_id
-           AND i.status IN ('open', 'repairing')
+           AND i.status IN ('open', 'repairing', 'abandoned')
        )
      RETURNING *`,
     [data.incidentId, data.ownerId, data.leaseDurationMs]
@@ -699,14 +762,31 @@ export async function authorizeSupervisorMutation(data: {
   return result.rowCount === 1;
 }
 
-export async function reserveSupervisorAction(action: SupervisorActionRecord): Promise<boolean> {
+/**
+ * Reserve one fenced supervisor action, scoped per attempt.
+ *
+ * M-26 (WO-HARNESS-RUN-RECOVERY-DUAL-TRUTH-01): the conflict target moved from
+ * uq_supervisor_action_incident (one action per incident) to the attempt-scoped
+ * unique index (incident_id, attempt_id, action_type). Because incident_id is
+ * already bound to exactly one run_id, this is the persisted equivalent of
+ * M-26's run_id + attempt_id + action_type dedup key.
+ *
+ * Returns:
+ * - 'applied'   -> a new fenced reservation was inserted
+ * - 'unchanged' -> the identical tuple + immutable payload already existed
+ * - 'conflict'  -> the tuple exists with a conflicting immutable payload, or the
+ *                  caller could not be fenced; nothing was mutated
+ */
+export async function reserveSupervisorAction(
+  action: SupervisorActionRecord
+): Promise<SupervisorActionReservation> {
   const db = getDatabase();
   const activeSql =
     db.dialect === 'postgres'
       ? 'l.expires_at > NOW()'
       : "julianday(l.expires_at) > julianday('now')";
   try {
-    return await db.withTransaction(async query => {
+    return await db.withTransaction<SupervisorActionReservation>(async query => {
       const authorized = await query(
         `SELECT l.incident_id FROM remote_agent_supervisor_repair_leases l
          JOIN remote_agent_supervisor_incidents i ON i.incident_id = l.incident_id
@@ -715,15 +795,16 @@ export async function reserveSupervisorAction(action: SupervisorActionRecord): P
            AND i.status IN ('open', 'repairing')`,
         [action.incidentId, action.ownerId, action.fencingToken]
       );
-      if (authorized.rowCount !== 1) return false;
+      if (authorized.rowCount !== 1) return 'conflict';
       const inserted = await query(
         `INSERT INTO remote_agent_supervisor_actions
-         (action_id, incident_id, owner_id, fencing_token, action_type, outcome,
+         (action_id, attempt_id, incident_id, owner_id, fencing_token, action_type, outcome,
           evidence_refs, created_at, status, completed_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'reserved', NULL)
-         ON CONFLICT (incident_id) DO NOTHING`,
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'reserved', NULL)
+         ON CONFLICT (incident_id, attempt_id, action_type) DO NOTHING`,
         [
           action.actionId,
+          action.attemptId,
           action.incidentId,
           action.ownerId,
           action.fencingToken,
@@ -733,7 +814,18 @@ export async function reserveSupervisorAction(action: SupervisorActionRecord): P
           action.createdAt,
         ]
       );
-      if (inserted.rowCount !== 1) return false;
+      if (inserted.rowCount !== 1) {
+        // Tuple already present: unchanged when the immutable payload matches,
+        // conflict when it diverges. No mutation happens on either branch.
+        const existing = await query<SupervisorActionRow>(
+          `SELECT * FROM remote_agent_supervisor_actions
+           WHERE incident_id = $1 AND attempt_id = $2 AND action_type = $3`,
+          [action.incidentId, action.attemptId, action.actionType]
+        );
+        const row = existing.rows[0];
+        if (row && supervisorActionPayloadMatches(row, action)) return 'unchanged';
+        return 'conflict';
+      }
       const marked = await query(
         `UPDATE remote_agent_supervisor_incidents
          SET status = 'repairing', updated_at = $2
@@ -741,11 +833,11 @@ export async function reserveSupervisorAction(action: SupervisorActionRecord): P
         [action.incidentId, action.createdAt]
       );
       if (marked.rowCount !== 1) throw new Error('supervisor_action_reservation_conflict');
-      return true;
+      return 'applied';
     });
   } catch (error) {
     if (error instanceof Error && error.message === 'supervisor_action_reservation_conflict') {
-      return false;
+      return 'conflict';
     }
     const sqliteCode =
       db.dialect === 'sqlite' && typeof error === 'object' && error !== null && 'code' in error
@@ -756,7 +848,7 @@ export async function reserveSupervisorAction(action: SupervisorActionRecord): P
       sqliteCode === 'SQLITE_CONSTRAINT_UNIQUE' ||
       sqliteCode === 'SQLITE_CONSTRAINT_PRIMARYKEY'
     ) {
-      return false;
+      return 'conflict';
     }
     throw error;
   }
@@ -841,11 +933,12 @@ export async function appendSupervisorAction(action: SupervisorActionRecord): Pr
       if (authorized.rowCount !== 1) return false;
       const inserted = await query(
         `INSERT INTO remote_agent_supervisor_actions
-         (action_id, incident_id, owner_id, fencing_token, action_type, outcome, evidence_refs, created_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+         (action_id, attempt_id, incident_id, owner_id, fencing_token, action_type, outcome, evidence_refs, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
          ON CONFLICT (action_id) DO NOTHING`,
         [
           action.actionId,
+          action.attemptId,
           action.incidentId,
           action.ownerId,
           action.fencingToken,
@@ -889,6 +982,287 @@ export async function releaseSupervisorRepairLease(data: {
     [data.incidentId, data.ownerId, data.fencingToken, data.releasedAt]
   );
   return result.rowCount === 1;
+}
+
+/**
+ * Exhaustive M-26 recovery transition table. Each recovery action_type maps a
+ * permitted incident from-state set and recovery from-state set to their target
+ * states plus the outcome primary reason. execution_state is NEVER a target
+ * here -- it is asserted unchanged inside the transaction.
+ */
+const RECOVERY_TRANSITIONS: Record<
+  RecoveryActionType,
+  {
+    readonly incidentFrom: readonly SupervisorIncidentRecord['status'][];
+    readonly incidentTo: SupervisorIncidentRecord['status'];
+    readonly recoveryFrom: readonly RecoveryState[];
+    readonly recoveryTo: RecoveryState;
+    readonly primaryReason: RunOutcome['primaryReason'];
+    readonly setValidationPassed: boolean;
+    readonly setDeliverablePrReady: boolean;
+  }
+> = {
+  start: {
+    incidentFrom: ['open', 'repairing'],
+    incidentTo: 'repairing',
+    recoveryFrom: ['recoverable'],
+    recoveryTo: 'recovering',
+    primaryReason: 'recovery_started',
+    setValidationPassed: false,
+    setDeliverablePrReady: false,
+  },
+  complete: {
+    incidentFrom: ['open', 'repairing'],
+    incidentTo: 'recovered',
+    recoveryFrom: ['recoverable', 'recovering'],
+    recoveryTo: 'recovered',
+    primaryReason: 'recovery_completed',
+    setValidationPassed: true,
+    setDeliverablePrReady: true,
+  },
+  abandon: {
+    incidentFrom: ['open', 'repairing'],
+    incidentTo: 'abandoned',
+    recoveryFrom: ['recoverable', 'recovering'],
+    recoveryTo: 'abandoned_by_operator',
+    primaryReason: 'abandoned_by_operator',
+    setValidationPassed: false,
+    setDeliverablePrReady: false,
+  },
+  reopen: {
+    incidentFrom: ['abandoned'],
+    incidentTo: 'open',
+    recoveryFrom: ['abandoned_by_operator'],
+    recoveryTo: 'recoverable',
+    primaryReason: 'execution_failed_pr_ready',
+    setValidationPassed: false,
+    setDeliverablePrReady: false,
+  },
+};
+
+/**
+ * Atomically finalize one fenced recovery transition (M-26).
+ *
+ * A single dialect-safe transaction verifies the permitted from-state, the
+ * active owner/fencing token, an unchanged terminal execution_state, and the
+ * immutable terminal Git reference, then conditionally updates the action,
+ * incident, and current run outcome. Evidence is appended without deletion or
+ * duplication. execution_state is preserved -- recovery NEVER rewrites
+ * execution truth.
+ *
+ * Returns:
+ * - 'applied'   -> the transition was persisted
+ * - 'unchanged' -> the same attempt tuple, or the same recovered run/head/merge,
+ *                  already exists; nothing was mutated
+ * - 'conflict'  -> the fence was invalid, a from-state guard failed, the
+ *                  terminal Git ref changed, or a conflicting immutable payload
+ *                  exists; nothing was mutated
+ */
+export async function finalizeSupervisorRecoveryTransition(data: {
+  runId: string;
+  incidentId: string;
+  ownerId: string;
+  fencingToken: number;
+  actionId: string;
+  attemptId: string;
+  actionType: RecoveryActionType;
+  now: string;
+  expectedTerminalGitRef: string;
+  evidenceRefs: readonly string[];
+  pullRequestNumber?: number | null;
+  recoveredHeadSha?: string | null;
+  targetBase?: string | null;
+  mergeSha?: string | null;
+}): Promise<SupervisorActionReservation> {
+  const db = getDatabase();
+  const activeSql =
+    db.dialect === 'postgres' ? 'expires_at > NOW()' : "julianday(expires_at) > julianday('now')";
+  const transition = RECOVERY_TRANSITIONS[data.actionType];
+  const CONFLICT = 'recovery_transition_conflict';
+  const UNCHANGED = 'recovery_transition_unchanged';
+  try {
+    return await db.withTransaction<SupervisorActionReservation>(async query => {
+      // 1. Fence: an active, unreleased repair lease held by this owner+token.
+      const fenced = await query(
+        `SELECT incident_id FROM remote_agent_supervisor_repair_leases
+         WHERE incident_id = $1 AND owner_id = $2 AND fencing_token = $3
+           AND released_at IS NULL AND ${activeSql}`,
+        [data.incidentId, data.ownerId, data.fencingToken]
+      );
+      if (fenced.rowCount !== 1) throw new Error(CONFLICT);
+
+      // 2. Attempt-tuple dedup: identical (incident, attempt, type) is a no-op or
+      //    conflict, decided by immutable payload. No mutation on either branch.
+      const existingTuple = await query<SupervisorActionRow>(
+        `SELECT * FROM remote_agent_supervisor_actions
+         WHERE incident_id = $1 AND attempt_id = $2 AND action_type = $3`,
+        [data.incidentId, data.attemptId, data.actionType]
+      );
+      if (existingTuple.rows[0]) {
+        const row = existingTuple.rows[0];
+        const same =
+          row.owner_id === data.ownerId &&
+          row.status === 'completed' &&
+          row.outcome === data.actionType &&
+          JSON.stringify(parseJsonArray<string>(row.evidence_refs)) ===
+            JSON.stringify(data.evidenceRefs) &&
+          (row.pull_request_number ?? null) === (data.pullRequestNumber ?? null) &&
+          (row.recovered_head_sha ?? null) === (data.recoveredHeadSha ?? null) &&
+          (row.target_base ?? null) === (data.targetBase ?? null) &&
+          (row.merge_sha ?? null) === (data.mergeSha ?? null);
+        throw new Error(same ? UNCHANGED : CONFLICT);
+      }
+
+      // 3. Final recovered-outcome dedup: a completed `complete` with the same
+      //    run/head/merge is idempotent regardless of attempt_id.
+      if (data.actionType === 'complete') {
+        // Null-safe compare works on both Postgres and SQLite.
+        const priorComplete = await query(
+          `SELECT action_id FROM remote_agent_supervisor_actions
+           WHERE incident_id = $1 AND action_type = 'complete' AND status = 'completed'
+             AND ((recovered_head_sha = $2) OR (recovered_head_sha IS NULL AND $2 IS NULL))
+             AND ((merge_sha = $3) OR (merge_sha IS NULL AND $3 IS NULL))`,
+          [data.incidentId, data.recoveredHeadSha ?? null, data.mergeSha ?? null]
+        );
+        if (priorComplete.rowCount >= 1) throw new Error(UNCHANGED);
+      }
+
+      // 4. Load the current outcome; execution must still be terminal-failed and
+      //    the immutable terminal Git ref must be present and unchanged.
+      const outcomeResult = await query<RunOutcomeRow>(
+        'SELECT * FROM remote_agent_run_outcomes WHERE run_id = $1',
+        [data.runId]
+      );
+      const outcomeRow = outcomeResult.rows[0];
+      if (!outcomeRow) throw new Error(CONFLICT);
+      if (outcomeRow.execution_state !== 'failed' && outcomeRow.execution_state !== 'cancelled') {
+        throw new Error(CONFLICT);
+      }
+      const currentEvidence = parseJsonArray<string>(outcomeRow.evidence_refs);
+      if (!currentEvidence.includes(data.expectedTerminalGitRef)) throw new Error(CONFLICT);
+      if (!transition.recoveryFrom.includes(outcomeRow.recovery_state)) throw new Error(CONFLICT);
+
+      // 5. Insert the completed action row (attempt-scoped uniqueness enforced).
+      const inserted = await query(
+        `INSERT INTO remote_agent_supervisor_actions
+         (action_id, attempt_id, incident_id, owner_id, fencing_token, action_type, outcome,
+          evidence_refs, created_at, status, completed_at, pull_request_number,
+          recovered_head_sha, target_base, merge_sha)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'completed', $9, $10, $11, $12, $13)
+         ON CONFLICT (incident_id, attempt_id, action_type) DO NOTHING`,
+        [
+          data.actionId,
+          data.attemptId,
+          data.incidentId,
+          data.ownerId,
+          data.fencingToken,
+          data.actionType,
+          data.actionType,
+          JSON.stringify(data.evidenceRefs),
+          data.now,
+          data.pullRequestNumber ?? null,
+          data.recoveredHeadSha ?? null,
+          data.targetBase ?? null,
+          data.mergeSha ?? null,
+        ]
+      );
+      if (inserted.rowCount !== 1) throw new Error(CONFLICT);
+
+      // 6. Transition the incident, guarded by its permitted from-states.
+      const incidentPlaceholders = transition.incidentFrom
+        .map((_, index) => `$${String(index + 3)}`)
+        .join(', ');
+      const incidentUpdated = await query(
+        `UPDATE remote_agent_supervisor_incidents
+         SET status = $2, updated_at = $1
+         WHERE incident_id = $${String(transition.incidentFrom.length + 3)}
+           AND status IN (${incidentPlaceholders})`,
+        [data.now, transition.incidentTo, ...transition.incidentFrom, data.incidentId]
+      );
+      if (incidentUpdated.rowCount !== 1) throw new Error(CONFLICT);
+
+      // 7. Update ONLY validation/recovery/deliverable/evidence, preserving
+      //    execution_state and route_state. Guarded by the recovery from-state
+      //    so exactly one concurrent completer wins.
+      const nextEvidence = [...currentEvidence];
+      for (const ref of data.evidenceRefs) {
+        if (!nextEvidence.includes(ref)) nextEvidence.push(ref);
+      }
+      const currentReasonCodes = parseJsonArray<RunOutcome['primaryReason']>(
+        outcomeRow.reason_codes
+      );
+      const nextReasonCodes = currentReasonCodes.includes(transition.primaryReason)
+        ? currentReasonCodes
+        : [...currentReasonCodes, transition.primaryReason];
+      const nextValidation = transition.setValidationPassed
+        ? 'passed'
+        : outcomeRow.validation_state;
+      const nextDeliverable = transition.setDeliverablePrReady
+        ? 'pr_ready'
+        : outcomeRow.deliverable_state;
+      const recoveryPlaceholders = transition.recoveryFrom
+        .map((_, index) => `$${String(index + 9)}`)
+        .join(', ');
+      const outcomeUpdated = await query(
+        `UPDATE remote_agent_run_outcomes
+         SET recovery_state = $2,
+             validation_state = $3,
+             deliverable_state = $4,
+             primary_reason = $5,
+             reason_codes = $6,
+             evidence_refs = $7,
+             updated_at = $8
+         WHERE run_id = $1
+           AND execution_state IN ('failed', 'cancelled')
+           AND recovery_state IN (${recoveryPlaceholders})`,
+        [
+          data.runId,
+          transition.recoveryTo,
+          nextValidation,
+          nextDeliverable,
+          transition.primaryReason,
+          JSON.stringify(nextReasonCodes),
+          JSON.stringify(nextEvidence),
+          data.now,
+          ...transition.recoveryFrom,
+        ]
+      );
+      if (outcomeUpdated.rowCount !== 1) throw new Error(CONFLICT);
+      return 'applied';
+    });
+  } catch (error) {
+    if (error instanceof Error && error.message === UNCHANGED) return 'unchanged';
+    if (error instanceof Error && error.message === CONFLICT) return 'conflict';
+    const sqliteCode =
+      db.dialect === 'sqlite' && typeof error === 'object' && error !== null && 'code' in error
+        ? String((error as { code?: unknown }).code)
+        : '';
+    if (
+      sqliteCode.startsWith('SQLITE_BUSY') ||
+      sqliteCode === 'SQLITE_CONSTRAINT_UNIQUE' ||
+      sqliteCode === 'SQLITE_CONSTRAINT_PRIMARYKEY'
+    ) {
+      return 'conflict';
+    }
+    throw error;
+  }
+}
+
+/**
+ * Recovery detail for the run-detail surface: the canonical outcome plus the
+ * ordered supervisor recovery action audit trail (actor, action type, evidence,
+ * and structured merged-PR anchors). Read-only; never writes.
+ */
+export async function getRunRecoveryDetails(runId: string): Promise<RunRecoveryDetails> {
+  const outcome = await getRunOutcome(runId);
+  const actions = await pool.query<SupervisorActionRow>(
+    `SELECT a.* FROM remote_agent_supervisor_actions a
+     JOIN remote_agent_supervisor_incidents i ON i.incident_id = a.incident_id
+     WHERE i.run_id = $1
+     ORDER BY a.created_at ASC`,
+    [runId]
+  );
+  return { outcome, actions: actions.rows.map(normalizeSupervisorAction) };
 }
 
 export type CauldronDrainMode = 'normal' | 'draining';

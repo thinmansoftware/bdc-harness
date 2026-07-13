@@ -9,11 +9,14 @@ import type { WorkflowRun, WorkflowRunStatus, ApprovalContext } from './schemas'
 import type {
   ProviderAttemptRecord,
   ExpiredRunLeaseRecord,
+  RecoveryActionType,
   RunAuthorityRecord,
   RunLeaseRecord,
   RunOutcome,
+  RunRecoveryDetails,
   ScheduledProviderWaitRecord,
   SupervisorActionRecord,
+  SupervisorActionReservation,
   SupervisorIncidentRecord,
   SupervisorObservationRecord,
   SupervisorRepairLeaseRecord,
@@ -199,7 +202,7 @@ export interface IWorkflowStore {
     ownerId: string;
     fencingToken: number;
   }): Promise<boolean>;
-  reserveSupervisorAction?(action: SupervisorActionRecord): Promise<boolean>;
+  reserveSupervisorAction?(action: SupervisorActionRecord): Promise<SupervisorActionReservation>;
   finalizeSupervisorAction?(data: {
     actionId: string;
     incidentId: string;
@@ -217,6 +220,28 @@ export interface IWorkflowStore {
     fencingToken: number;
     releasedAt: string;
   }): Promise<boolean>;
+  /**
+   * M-26: atomically finalize one fenced recovery transition. Returns
+   * 'applied' | 'unchanged' | 'conflict'; preserves terminal execution truth.
+   */
+  finalizeSupervisorRecoveryTransition?(data: {
+    runId: string;
+    incidentId: string;
+    ownerId: string;
+    fencingToken: number;
+    actionId: string;
+    attemptId: string;
+    actionType: RecoveryActionType;
+    now: string;
+    expectedTerminalGitRef: string;
+    evidenceRefs: readonly string[];
+    pullRequestNumber?: number | null;
+    recoveredHeadSha?: string | null;
+    targetBase?: string | null;
+    mergeSha?: string | null;
+  }): Promise<SupervisorActionReservation>;
+  /** M-26: read-only recovery detail (outcome + supervisor action audit trail). */
+  getRunRecoveryDetails?(runId: string): Promise<RunRecoveryDetails>;
 
   /**
    * Create a workflow event. Implementations MUST NOT throw -- catch all errors
