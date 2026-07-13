@@ -51,7 +51,10 @@ function stringifyBody(body: unknown): string {
   try {
     return JSON.stringify(body);
   } catch {
-    return String(body);
+    // JSON.stringify only throws on circular refs/BigInt; String(body) on an
+    // object would yield "[object Object]" (lint: no-base-to-string) -- an
+    // honest sentinel is more useful in an error excerpt anyway.
+    return '[unserializable-body]';
   }
 }
 

@@ -43,7 +43,7 @@ export async function probeProviderBinding(
   deps: ProviderProbeDeps
 ): Promise<ProviderProbeResult> {
   const provider = deps.getAgentProvider(binding.providerId);
-  const sleep = deps.sleep ?? (ms => new Promise<void>(resolve => setTimeout(resolve, ms)));
+  const sleep = deps.sleep ?? ((ms: number): Promise<void> => new Promise<void>(resolve => setTimeout(resolve, ms)));
   let lastClassification: ProbeClassification | null = null;
 
   for (let attempt = 1; attempt <= 2; attempt += 1) {
