@@ -29,6 +29,8 @@
 import { mkdir, writeFile } from 'fs/promises';
 import { join } from 'path';
 import { getArchonHome } from '@archon/paths';
+import { createMessage } from '@archon/core/db/dispatch';
+import { assessDispatchMessageBody } from '@archon/core/utils/dispatch-content-guard';
 import type { DecisionResult } from './decide.ts';
 import type { ErrorClass } from './classify.ts';
 
@@ -58,6 +60,8 @@ const BDC_DEFAULT_NOTION_DB_ID = 'a6df831c-0b52-449f-8ca4-d77be6b70d0a';
 const NOTION_VERSION = '2022-06-28';
 const NOTION_API_BASE = 'https://api.notion.com/v1';
 const DEFAULT_BUILDER_MONITOR_URL = 'https://n8n.bluedevilcollectibles.com/webhook/builder-status';
+const DISPATCH_SENDER = 'overseer';
+const DISPATCH_RECIPIENT = 'operator';
 
 /**
  * Run an escalation for a non-recoverable workflow failure.
@@ -100,6 +104,10 @@ export async function runEscalation(
     console.error('[overseer/escalate] failed to write escalation.json:', err);
   }
 
+  await emitDispatchRunReport(context, decision, runId, timestamp).catch(err => {
+    console.error('[overseer/escalate] dispatch run_report failed:', err);
+  });
+
   // Webhook fires regardless of Notion outcome -- keeps the dashboard the source
   // of truth even when Notion is degraded.
   await postBuilderMonitorWebhook(context, decision, runId).catch(err => {
@@ -111,6 +119,48 @@ export async function runEscalation(
   // signals if this fails.
   await postNotionComment(context, decision, runId, escalationPath, timestamp).catch(err => {
     console.error('[overseer/escalate] notion comment post failed:', err);
+  });
+}
+
+export function buildDispatchRunReportBody(
+  context: EscalationContext,
+  decision: DecisionResult,
+  runId: string,
+  timestamp = new Date().toISOString()
+): string {
+  return JSON.stringify({
+    kind: 'overseer_run_report',
+    runId,
+    woId: context.woId ?? 'unknown',
+    class: context.errorClass,
+    nodeId: context.nodeId ?? null,
+    decision: decision.decision,
+    reason: decision.reason,
+    remediation: context.remediation ?? [],
+    timestamp,
+  });
+}
+
+async function emitDispatchRunReport(
+  context: EscalationContext,
+  decision: DecisionResult,
+  runId: string,
+  timestamp: string
+): Promise<void> {
+  const body = buildDispatchRunReportBody(context, decision, runId, timestamp);
+  const assessment = assessDispatchMessageBody('run_report', body);
+  if (!assessment.allowed) {
+    throw new Error(
+      `dispatch-content-guard rejected run_report: ${assessment.reason ?? 'unknown'}`
+    );
+  }
+  await createMessage({
+    correlation_id: runId,
+    idempotency_key: `overseer:run_report:${runId}:${context.errorClass}`,
+    task_type: 'run_report',
+    sender: DISPATCH_SENDER,
+    recipient: DISPATCH_RECIPIENT,
+    body,
   });
 }
 
@@ -143,7 +193,9 @@ async function postBuilderMonitorWebhook(
     body: JSON.stringify(body),
   });
   if (!res.ok) {
-    throw new Error(`builder-monitor responded ${res.status}: ${await res.text()}`);
+    const responseText = await res.text();
+    console.error(`[overseer/escalate] builder-monitor responded ${res.status}:`, responseText);
+    throw new Error(`builder-monitor responded ${res.status}: ${responseText}`);
   }
 }
 
@@ -205,7 +257,9 @@ async function postNotionComment(
     body: JSON.stringify(body),
   });
   if (!res.ok) {
-    throw new Error(`Notion comments API responded ${res.status}: ${await res.text()}`);
+    const responseText = await res.text();
+    console.error(`[overseer/escalate] Notion comments API responded ${res.status}:`, responseText);
+    throw new Error(`Notion comments API responded ${res.status}: ${responseText}`);
   }
 }
 
@@ -245,7 +299,9 @@ async function lookupNotionPageId(
     body: JSON.stringify(body),
   });
   if (!res.ok) {
-    throw new Error(`Notion database query failed ${res.status}: ${await res.text()}`);
+    const responseText = await res.text();
+    console.error(`[overseer/escalate] Notion database query failed ${res.status}:`, responseText);
+    throw new Error(`Notion database query failed ${res.status}: ${responseText}`);
   }
   const data = (await res.json()) as { results?: { id?: string }[] };
   const first = data.results?.[0];

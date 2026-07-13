@@ -138,7 +138,10 @@
       "name": "@archon/overseer",
       "version": "0.1.0",
       "dependencies": {
+        "@archon/core": "workspace:*",
         "@archon/paths": "workspace:*",
+        "@archon/workflows": "workspace:*",
+        "@octokit/rest": "^22.0.0",
       },
       "devDependencies": {
         "@types/node": "^22.10.5",

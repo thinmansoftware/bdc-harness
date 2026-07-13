@@ -21,6 +21,7 @@ export * as isolationEnvDb from './isolation-environments';
 export * as workflowDb from './workflows';
 export * as dispatchDb from './dispatch';
 export * as knownBadBindingsDb from './known-bad-bindings';
+export * as overseerDb from './overseer';
 
 // Also export individual functions for direct imports
 export * from './conversations';
@@ -31,3 +32,4 @@ export * from './isolation-environments';
 export * from './workflows';
 export * from './dispatch';
 export * from './known-bad-bindings';
+export * from './overseer';

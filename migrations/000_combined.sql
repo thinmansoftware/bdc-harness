@@ -583,3 +583,17 @@ DROP TRIGGER IF EXISTS trg_board_audit_events_no_delete ON board_audit_events;
 CREATE TRIGGER trg_board_audit_events_no_delete
   BEFORE DELETE ON board_audit_events
   FOR EACH ROW EXECUTE FUNCTION prevent_board_audit_event_mutation();
+
+-- Overseer actions (migration 030)
+CREATE TABLE IF NOT EXISTS overseer_actions (
+  id UUID PRIMARY KEY,
+  run_id UUID NOT NULL REFERENCES remote_agent_workflow_runs(id) ON DELETE CASCADE,
+  wo_id TEXT NOT NULL,
+  class TEXT NOT NULL,
+  action TEXT NOT NULL,
+  result TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_overseer_actions_run_id
+  ON overseer_actions(run_id);
