@@ -122,7 +122,14 @@ import * as messageDb from '@archon/core/db/messages';
 import * as dispatchDb from '@archon/core/db/dispatch';
 import * as knownBadBindingsDb from '@archon/core/db/known-bad-bindings';
 import * as boardAuthorityDb from '@archon/core/db/board-authority';
+import {
+  deriveBoardMotionNotificationKey,
+  recordBoardPetitionDelivery,
+  validateBoardPetitionPointer,
+  validateBoardMotionPointer,
+} from '@archon/core/utils/board-motion-pointer';
 import { assessDispatchMessageBody } from '@archon/core/utils/dispatch-content-guard';
+import { authenticateDispatchWorkerCredential } from '../auth/dispatch-worker-credential';
 import { errorSchema } from './schemas/common.schemas';
 import { updateCheckResponseSchema } from './schemas/system.schemas';
 import {
@@ -1578,6 +1585,18 @@ export function registerApiRoutes(
     return error instanceof Error && error.message.startsWith('board_principal_auth_');
   }
 
+  function boardPrincipalProofFromHeaders(c: Context): boardAuthorityDb.BoardPrincipalProof {
+    return { principal_token: c.req.header('x-board-principal-token')?.trim() };
+  }
+
+  function parseDispatchJsonBody(body: string): unknown {
+    try {
+      return JSON.parse(body) as unknown;
+    } catch {
+      throw new Error('dispatch_json_body_invalid');
+    }
+  }
+
   async function rejectNewDispatchIfDraining(c: Context): Promise<Response | null> {
     const drain = await workflowDb.getCauldronDrainState();
     if (drain.mode !== 'draining') return null;
@@ -2697,12 +2716,88 @@ export function registerApiRoutes(
       if (!assessment.allowed) {
         return apiError(c, 400, assessment.reason ?? 'dispatch_message_body_rejected');
       }
+      if (body.task_type === 'board_motion') {
+        const principal = await boardAuthorityDb.authenticateBoardPrincipal(
+          boardPrincipalProofFromHeaders(c)
+        );
+        if (!principal.roles.includes('motion_notifier') || principal.seat_id === 'john') {
+          return apiError(c, 403, 'board_motion_notifier_required');
+        }
+        const pointer = await validateBoardMotionPointer(parseDispatchJsonBody(body.body));
+        const canonicalBody = JSON.stringify(pointer.payload);
+        const message = await dispatchDb.createMessage({
+          correlation_id: body.correlation_id,
+          idempotency_key: deriveBoardMotionNotificationKey({
+            motion_id: pointer.payload.motion_id,
+            motion_revision_sha: pointer.motion_revision_sha,
+          }),
+          task_type: 'board_motion',
+          sender: principal.principal_id,
+          recipient: 'board',
+          body: canonicalBody,
+          not_before: body.not_before ?? null,
+          recipient_alias: 'board',
+          motion_id: pointer.payload.motion_id,
+          motion_revision_sha: pointer.motion_revision_sha,
+        });
+        await boardAuthorityDb.appendBoardAuditEvent({
+          event_type: 'motion_notification_enqueued',
+          actor_principal_id: principal.principal_id,
+          actor_seat_id: principal.seat_id,
+          motion_id: pointer.payload.motion_id,
+          motion_revision_sha: pointer.motion_revision_sha,
+          details: {
+            dispatch_message_id: message.id,
+            file_path: pointer.payload.file_path,
+            title: pointer.payload.title,
+            canonical_commit_sha: pointer.commit_sha,
+          },
+        });
+        return c.json(message);
+      }
+      if (body.task_type === 'agent_message' && body.recipient === 'board') {
+        const principal = await boardAuthorityDb.authenticateBoardPrincipal(
+          boardPrincipalProofFromHeaders(c)
+        );
+        if (!principal.roles.includes('petition_eligible') || principal.seat_id === 'john') {
+          return apiError(c, 403, 'board_petition_principal_required');
+        }
+        const petitionBody = parseDispatchJsonBody(body.body);
+        const petition = await validateBoardPetitionPointer(petitionBody);
+        const message = await dispatchDb.createMessage({
+          ...body,
+          sender: principal.principal_id,
+          body: JSON.stringify({
+            motion_id: petition.motion_id,
+            file_path: petition.file_path,
+            requested_action: petition.requested_action,
+          }),
+          not_before: body.not_before ?? null,
+          recipient_alias: 'board',
+          motion_id: petition.motion_id,
+          motion_revision_sha: petition.motion_revision_sha,
+        });
+        await recordBoardPetitionDelivery({
+          actor_principal_id: principal.principal_id,
+          actor_seat_id: principal.seat_id,
+          body: petitionBody,
+          dispatch_message_id: message.id,
+        });
+        return c.json(message);
+      }
       const message = await dispatchDb.createMessage({
         ...body,
         not_before: body.not_before ?? null,
       });
       return c.json(message);
     } catch (error) {
+      if (isBoardPrincipalAuthError(error)) return apiError(c, 401, (error as Error).message);
+      if (error instanceof Error && error.message.startsWith('dispatch_json_body_invalid')) {
+        return apiError(c, 400, error.message);
+      }
+      if (error instanceof Error && error.message.includes('invalid')) {
+        return apiError(c, 400, error.message);
+      }
       getLog().error({ err: error }, 'dispatch_create_message_failed');
       return apiError(c, 500, 'Failed to create dispatch message');
     }
@@ -2715,9 +2810,28 @@ export function registerApiRoutes(
         recipient: c.req.query('recipient') ?? undefined,
         status: c.req.query('status') as dispatchDb.DispatchMessageStatus | undefined,
         limit: Number.isFinite(rawLimit) ? rawLimit : 100,
+        allowBoardAlias:
+          c.req.query('recipient') !== undefined &&
+          c.req.query('status') === 'queued' &&
+          authenticateDispatchWorkerCredential({
+            credential_id: c.req.header('x-dispatch-worker-credential-id'),
+            token: c.req.header('x-dispatch-worker-token'),
+            worker_id: c.req.header('x-dispatch-worker-id') ?? '',
+            delivery_principal: c.req.query('recipient') ?? undefined,
+          }) !== null,
       });
       return c.json(messages);
     } catch (error) {
+      if (error instanceof Error && error.message === 'worker_unauthorized') {
+        const rawLimit = Number.parseInt(c.req.query('limit') ?? '100', 10);
+        const messages = await dispatchDb.listMessages({
+          recipient: c.req.query('recipient') ?? undefined,
+          status: c.req.query('status') as dispatchDb.DispatchMessageStatus | undefined,
+          limit: Number.isFinite(rawLimit) ? rawLimit : 100,
+          allowBoardAlias: false,
+        });
+        return c.json(messages);
+      }
       getLog().error({ err: error }, 'dispatch_list_messages_failed');
       return apiError(c, 500, 'Failed to list dispatch messages');
     }
@@ -2726,14 +2840,26 @@ export function registerApiRoutes(
   registerOpenApiRoute(claimDispatchMessageRoute, async c => {
     try {
       const body = getValidatedBody(c, claimDispatchMessageBodySchema);
+      if (body.delivery_principal) {
+        authenticateDispatchWorkerCredential({
+          credential_id: c.req.header('x-dispatch-worker-credential-id'),
+          token: c.req.header('x-dispatch-worker-token'),
+          worker_id: body.worker_id,
+          delivery_principal: body.delivery_principal,
+        });
+      }
       const message = await dispatchDb.claimMessage({
         id: c.req.param('id') ?? '',
         worker_id: body.worker_id,
+        delivery_principal: body.delivery_principal ?? null,
         leaseDurationMs: body.lease_duration_ms,
       });
       if (!message) return apiError(c, 404, 'Dispatch message is not claimable');
       return c.json(message);
     } catch (error) {
+      if (error instanceof Error && error.message === 'worker_unauthorized') {
+        return apiError(c, 401, 'worker_unauthorized');
+      }
       getLog().error({ err: error }, 'dispatch_claim_message_failed');
       return apiError(c, 500, 'Failed to claim dispatch message');
     }

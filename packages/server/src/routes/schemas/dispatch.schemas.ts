@@ -5,6 +5,7 @@ export const dispatchTaskTypeSchema = z.enum([
   'run_review',
   'draft_spec',
   'run_report',
+  'board_motion',
 ]);
 
 export const dispatchMessageStatusSchema = z.enum([
@@ -33,6 +34,13 @@ export const dispatchMessageSchema = z
     lease_owner: z.string().nullable(),
     lease_expires_at: z.string().nullable(),
     fencing_token: z.number(),
+    recipient_alias: z.literal('board').nullable().optional(),
+    motion_id: z.string().nullable().optional(),
+    motion_revision_sha: z.string().nullable().optional(),
+    resolved_recipient: z.string().nullable().optional(),
+    resolved_xo_lease_id: z.string().nullable().optional(),
+    resolved_xo_fencing_token: z.number().nullable().optional(),
+    resolved_at: z.string().nullable().optional(),
   })
   .openapi('DispatchMessage');
 
@@ -60,6 +68,7 @@ export const listDispatchMessagesQuerySchema = z.object({
 export const claimDispatchMessageBodySchema = z
   .object({
     worker_id: z.string().min(1),
+    delivery_principal: z.string().min(1).optional(),
     lease_duration_ms: z.number().int().positive().max(3_600_000).optional(),
   })
   .strict()

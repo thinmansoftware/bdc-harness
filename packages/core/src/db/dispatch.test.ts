@@ -18,6 +18,7 @@ import {
   heartbeatWorker,
   postResult,
   registerWorker,
+  resolveDispatchRecipient,
 } from './dispatch';
 
 function cleanupDb(path: string): void {
@@ -181,5 +182,94 @@ describe('dispatch db', () => {
       workerStaleAfterMs: 1_000,
     });
     expect(onlineClaim?.status).toBe('claimed');
+  });
+
+  test('resolveDispatchRecipient preserves concrete recipients', async () => {
+    await expect(resolveDispatchRecipient('codex')).resolves.toEqual({
+      ok: true,
+      recipient: 'codex',
+      recipient_alias: null,
+      resolved_xo_lease_id: null,
+      resolved_xo_fencing_token: null,
+    });
+  });
+
+  test('board alias resolves only with a current XO lease', async () => {
+    await expect(resolveDispatchRecipient('board')).resolves.toEqual({
+      ok: false,
+      reason: 'no_valid_xo_lease',
+    });
+    const now = new Date();
+    await db.query(
+      `INSERT INTO board_xo_leases (
+         id, lease_id, principal_id, seat_id, holder_id, holder_token_hash,
+         fencing_token, acquired_at, renewed_at, expires_at, released_at
+       )
+       VALUES (1, $1, 'claude', 'xo', 'holder', $2, 7, $3, NULL, $4, NULL)`,
+      ['lease-1', 'a'.repeat(64), now.toISOString(), new Date(now.getTime() + 60_000).toISOString()]
+    );
+
+    await expect(resolveDispatchRecipient('board')).resolves.toEqual({
+      ok: true,
+      recipient: 'claude',
+      recipient_alias: 'board',
+      resolved_xo_lease_id: 'lease-1',
+      resolved_xo_fencing_token: 7,
+    });
+  });
+
+  test('board alias list and claim bind the current XO lease', async () => {
+    await registerWorker({
+      worker_id: 'worker-a',
+      host: 'host',
+      capabilities: { providers: ['claude'] },
+      max_concurrency: 1,
+    });
+    const now = new Date();
+    await db.query(
+      `INSERT INTO board_xo_leases (
+         id, lease_id, principal_id, seat_id, holder_id, holder_token_hash,
+         fencing_token, acquired_at, renewed_at, expires_at, released_at
+       )
+       VALUES (1, $1, 'claude', 'xo', 'holder', $2, 11, $3, NULL, $4, NULL)`,
+      [
+        'lease-claim',
+        'b'.repeat(64),
+        now.toISOString(),
+        new Date(now.getTime() + 60_000).toISOString(),
+      ]
+    );
+    const message = await createMessage({
+      correlation_id: 'corr-board',
+      idempotency_key: 'board-motion:M-27:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:board',
+      task_type: 'board_motion',
+      sender: 'gpt',
+      recipient: 'board',
+      body: '{"motion_id":"M-27","title":"T","file_path":"docs/board/motions/M.md"}',
+      recipient_alias: 'board',
+      motion_id: 'M-27',
+      motion_revision_sha: 'a'.repeat(40),
+    });
+
+    const listed = await import('./dispatch').then(module =>
+      module.listMessages({ recipient: 'claude', status: 'queued', allowBoardAlias: true })
+    );
+    expect(listed.map(item => item.id)).toContain(message.id);
+
+    const stalePrincipalClaim = await claimMessage({
+      id: message.id,
+      worker_id: 'worker-a',
+      delivery_principal: 'gpt',
+    });
+    expect(stalePrincipalClaim).toBeNull();
+
+    const claim = await claimMessage({
+      id: message.id,
+      worker_id: 'worker-a',
+      delivery_principal: 'claude',
+    });
+    expect(claim?.resolved_recipient).toBe('claude');
+    expect(claim?.resolved_xo_lease_id).toBe('lease-claim');
+    expect(claim?.resolved_xo_fencing_token).toBe(11);
   });
 });

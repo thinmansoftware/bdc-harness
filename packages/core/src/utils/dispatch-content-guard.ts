@@ -1,4 +1,9 @@
-export type DispatchTaskType = 'agent_message' | 'run_review' | 'draft_spec' | 'run_report';
+export type DispatchTaskType =
+  | 'agent_message'
+  | 'run_review'
+  | 'draft_spec'
+  | 'run_report'
+  | 'board_motion';
 
 export interface DispatchContentAssessment {
   allowed: boolean;

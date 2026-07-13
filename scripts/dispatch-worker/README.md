@@ -33,5 +33,16 @@ Each spawn runs in a fresh temp directory and writes a local transcript before p
 `agent_message`, `run_review`, `draft_spec`, and `run_report` are supported. The API rejects
 arbitrary shell task types and repo-mutating `agent_message` content before a worker can claim it.
 
+`board_motion` delivery is optional and disabled unless `board_delivery.enabled` is true.
+When enabled, `credential_id` must match an active or retiring server-side
+`board_delivery_worker` record in `DISPATCH_WORKER_CREDENTIALS_JSON`, and `token_env` names the
+environment variable containing that raw worker token. `allowed_principals` must be covered by both
+the server credential and local `agents`; the worker still polls only concrete principals and never
+uses a `board` agent entry.
+
+Credential rotation is overlap-based: add the new active credential beside the retiring one, update
+the worker config to the new `credential_id` and token env value, verify an authenticated queued-list
+probe, then claim and complete a staging-only fixture before disabling the old credential.
+
 On clean shutdown, the worker stops heartbeats and lets any in-flight leases lapse; v1 has no
 release endpoint.

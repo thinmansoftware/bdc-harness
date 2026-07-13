@@ -2,8 +2,14 @@ import { mkdir, mkdtemp, writeFile } from 'fs/promises';
 import { tmpdir, hostname } from 'os';
 import { join } from 'path';
 import { spawn } from 'bun';
+import { isBoardAliasMessage, renderBoardMotionPrompt } from './board-motion';
 
-type DispatchTaskType = 'agent_message' | 'run_review' | 'draft_spec' | 'run_report';
+type DispatchTaskType =
+  | 'agent_message'
+  | 'run_review'
+  | 'draft_spec'
+  | 'run_report'
+  | 'board_motion';
 type DispatchStatus = 'queued' | 'claimed' | 'done' | 'failed' | 'cancelled';
 
 interface DispatchMessage {
@@ -14,11 +20,20 @@ interface DispatchMessage {
   body: string;
   status: DispatchStatus;
   fencing_token: number;
+  recipient_alias?: 'board' | null;
+  resolved_recipient?: string | null;
 }
 
 interface AgentConfig {
   command: string;
   args: string[];
+}
+
+interface BoardDeliveryConfig {
+  enabled: boolean;
+  credential_id: string;
+  token_env: string;
+  allowed_principals: string[];
 }
 
 interface WorkerConfig {
@@ -31,8 +46,18 @@ interface WorkerConfig {
   lease_duration_ms?: number;
   capabilities?: Record<string, unknown>;
   max_concurrency?: Record<string, number>;
+  board_delivery?: {
+    enabled?: boolean;
+    credential_id?: string;
+    token_env?: string;
+    allowed_principals?: string[];
+  };
   agents: Record<string, AgentConfig>;
 }
+
+type NormalizedWorkerConfig = Required<Omit<WorkerConfig, 'board_delivery'>> & {
+  board_delivery: BoardDeliveryConfig;
+};
 
 interface WorkerState {
   stopping: boolean;
@@ -47,7 +72,7 @@ function parseArgs(): string {
   return process.argv[index + 1];
 }
 
-async function readConfig(path: string): Promise<Required<WorkerConfig>> {
+async function readConfig(path: string): Promise<NormalizedWorkerConfig> {
   const raw = await Bun.file(path).text();
   const parsed = JSON.parse(raw) as WorkerConfig;
   if (!parsed.server_url) throw new Error('config.server_url is required');
@@ -65,6 +90,12 @@ async function readConfig(path: string): Promise<Required<WorkerConfig>> {
     lease_duration_ms: parsed.lease_duration_ms ?? 300_000,
     capabilities: parsed.capabilities ?? { providers: Object.keys(parsed.agents) },
     max_concurrency: parsed.max_concurrency ?? {},
+    board_delivery: {
+      enabled: parsed.board_delivery?.enabled ?? false,
+      credential_id: parsed.board_delivery?.credential_id ?? '',
+      token_env: parsed.board_delivery?.token_env ?? 'DISPATCH_WORKER_TOKEN',
+      allowed_principals: parsed.board_delivery?.allowed_principals ?? [],
+    },
     agents: parsed.agents,
   };
 }
@@ -77,7 +108,7 @@ function authHeaders(token: string): Record<string, string> {
 }
 
 async function requestJson<T>(
-  config: Required<WorkerConfig>,
+  config: NormalizedWorkerConfig,
   token: string,
   path: string,
   init?: Omit<RequestInit, 'headers'> & { headers?: Record<string, string> }
@@ -93,7 +124,7 @@ async function requestJson<T>(
   return (await response.json()) as T;
 }
 
-async function register(config: Required<WorkerConfig>, token: string): Promise<void> {
+async function register(config: NormalizedWorkerConfig, token: string): Promise<void> {
   await requestJson(config, token, '/api/dispatch/workers/register', {
     method: 'POST',
     body: JSON.stringify({
@@ -108,7 +139,7 @@ async function register(config: Required<WorkerConfig>, token: string): Promise<
   });
 }
 
-async function heartbeat(config: Required<WorkerConfig>, token: string): Promise<void> {
+async function heartbeat(config: NormalizedWorkerConfig, token: string): Promise<void> {
   await requestJson(config, token, '/api/dispatch/workers/heartbeat', {
     method: 'POST',
     body: JSON.stringify({ worker_id: config.worker_id }),
@@ -125,6 +156,8 @@ function promptFor(message: DispatchMessage): string {
       return `Draft a specification from this request by ${message.sender}:\n\n${message.body}`;
     case 'run_report':
       return `Prepare a concise report for ${message.sender}:\n\n${message.body}`;
+    case 'board_motion':
+      return renderBoardMotionPrompt(message.body);
   }
 }
 
@@ -187,12 +220,13 @@ async function runAgent(
 }
 
 async function processMessage(
-  config: Required<WorkerConfig>,
+  config: NormalizedWorkerConfig,
   token: string,
   state: WorkerState,
-  queued: DispatchMessage
+  queued: DispatchMessage,
+  deliveryPrincipal?: string
 ): Promise<void> {
-  const agent = queued.recipient;
+  const agent = deliveryPrincipal ?? queued.resolved_recipient ?? queued.recipient;
   const active = state.activeByAgent.get(agent) ?? 0;
   const cap = config.max_concurrency[agent] ?? 1;
   if (active >= cap) return;
@@ -201,14 +235,17 @@ async function processMessage(
 
   state.activeByAgent.set(agent, active + 1);
   try {
+    const boardHeaders = isBoardAliasMessage(queued) ? boardDeliveryHeaders(config, agent) : {};
     const claimed = await requestJson<DispatchMessage>(
       config,
       token,
       `/api/dispatch/messages/${queued.id}/claim`,
       {
         method: 'POST',
+        headers: boardHeaders,
         body: JSON.stringify({
           worker_id: config.worker_id,
+          ...(isBoardAliasMessage(queued) ? { delivery_principal: agent } : {}),
           lease_duration_ms: config.lease_duration_ms,
         }),
       }
@@ -231,21 +268,45 @@ async function processMessage(
 }
 
 async function poll(
-  config: Required<WorkerConfig>,
+  config: NormalizedWorkerConfig,
   token: string,
   state: WorkerState
 ): Promise<void> {
   for (const recipient of Object.keys(config.agents)) {
+    const headers = config.board_delivery.allowed_principals.includes(recipient)
+      ? boardDeliveryHeaders(config, recipient)
+      : {};
     const messages = await requestJson<DispatchMessage[]>(
       config,
       token,
-      `/api/dispatch/messages?recipient=${encodeURIComponent(recipient)}&status=queued`
+      `/api/dispatch/messages?recipient=${encodeURIComponent(recipient)}&status=queued`,
+      { headers }
     );
     for (const message of messages) {
       if (state.stopping) return;
-      void processMessage(config, token, state, message);
+      void processMessage(config, token, state, message, recipient);
     }
   }
+}
+
+function boardDeliveryHeaders(
+  config: NormalizedWorkerConfig,
+  deliveryPrincipal: string
+): Record<string, string> {
+  if (
+    !config.board_delivery.enabled ||
+    !config.board_delivery.credential_id ||
+    !config.board_delivery.allowed_principals.includes(deliveryPrincipal)
+  ) {
+    return {};
+  }
+  const token = process.env[config.board_delivery.token_env];
+  if (!token) return {};
+  return {
+    'x-dispatch-worker-id': config.worker_id,
+    'x-dispatch-worker-credential-id': config.board_delivery.credential_id,
+    'x-dispatch-worker-token': token,
+  };
 }
 
 async function main(): Promise<void> {

@@ -1,7 +1,13 @@
 import { randomUUID } from 'crypto';
 import { getDatabase } from './connection';
+import { appendBoardAuditEvent, resolveBoardRecipient } from './board-authority';
 
-export type DispatchTaskType = 'agent_message' | 'run_review' | 'draft_spec' | 'run_report';
+export type DispatchTaskType =
+  | 'agent_message'
+  | 'run_review'
+  | 'draft_spec'
+  | 'run_report'
+  | 'board_motion';
 export type DispatchMessageStatus = 'queued' | 'claimed' | 'done' | 'failed' | 'cancelled';
 export type DispatchWorkerStatus = 'available' | 'unavailable';
 
@@ -22,6 +28,13 @@ export interface DispatchMessage {
   lease_owner: string | null;
   lease_expires_at: string | null;
   fencing_token: number;
+  recipient_alias: 'board' | null;
+  motion_id: string | null;
+  motion_revision_sha: string | null;
+  resolved_recipient: string | null;
+  resolved_xo_lease_id: string | null;
+  resolved_xo_fencing_token: number | null;
+  resolved_at: string | null;
 }
 
 export interface DispatchWorker {
@@ -34,8 +47,12 @@ export interface DispatchWorker {
   last_heartbeat_at: string;
 }
 
-interface DispatchMessageRow extends Omit<DispatchMessage, 'fencing_token'> {
+interface DispatchMessageRow extends Omit<
+  DispatchMessage,
+  'fencing_token' | 'resolved_xo_fencing_token'
+> {
   fencing_token: number | string;
+  resolved_xo_fencing_token: number | string | null;
 }
 
 interface DispatchWorkerRow extends Omit<DispatchWorker, 'capabilities'> {
@@ -66,6 +83,11 @@ function normalizeMessage(row: DispatchMessageRow): DispatchMessage {
     not_before: normalizeNullableTimestamp(row.not_before),
     lease_expires_at: normalizeNullableTimestamp(row.lease_expires_at),
     fencing_token: Number(row.fencing_token),
+    resolved_xo_fencing_token:
+      row.resolved_xo_fencing_token === null || row.resolved_xo_fencing_token === undefined
+        ? null
+        : Number(row.resolved_xo_fencing_token),
+    resolved_at: normalizeNullableTimestamp(row.resolved_at),
   };
 }
 
@@ -110,13 +132,17 @@ export async function createMessage(data: {
   recipient: string;
   body: string;
   not_before?: string | null;
+  recipient_alias?: 'board' | null;
+  motion_id?: string | null;
+  motion_revision_sha?: string | null;
 }): Promise<DispatchMessage> {
   const db = getDatabase();
   const now = nowIso();
   const result = await db.query<DispatchMessageRow>(
     `INSERT INTO agent_dispatch_messages
-     (id, correlation_id, idempotency_key, task_type, sender, recipient, body, status, created_at, not_before, fencing_token)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, 'queued', $8, $9, 0)
+     (id, correlation_id, idempotency_key, task_type, sender, recipient, body, status, created_at, not_before, fencing_token,
+      recipient_alias, motion_id, motion_revision_sha)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, 'queued', $8, $9, 0, $10, $11, $12)
      ON CONFLICT (idempotency_key) DO UPDATE SET idempotency_key = EXCLUDED.idempotency_key
      RETURNING *`,
     [
@@ -129,6 +155,9 @@ export async function createMessage(data: {
       data.body,
       now,
       data.not_before ?? null,
+      data.recipient_alias ?? null,
+      data.motion_id ?? null,
+      data.motion_revision_sha ?? null,
     ]
   );
   const row = result.rows[0];
@@ -149,12 +178,28 @@ export async function listMessages(filters: {
   recipient?: string;
   status?: DispatchMessageStatus;
   limit?: number;
+  allowBoardAlias?: boolean;
 }): Promise<DispatchMessage[]> {
   const clauses: string[] = [];
   const params: unknown[] = [];
   if (filters.recipient) {
     params.push(filters.recipient);
-    clauses.push(`recipient = $${params.length}`);
+    const recipientParam = `$${params.length}`;
+    if (filters.allowBoardAlias) {
+      const resolved = await resolveDispatchRecipient('board');
+      if (resolved.ok && resolved.recipient === filters.recipient) {
+        clauses.push(
+          `(recipient = ${recipientParam} OR (recipient_alias = 'board' AND status = 'queued'))`
+        );
+      } else {
+        if (!resolved.ok && filters.status === 'queued') {
+          await recordBoardDeferrals();
+        }
+        clauses.push(`recipient = ${recipientParam}`);
+      }
+    } else {
+      clauses.push(`recipient = ${recipientParam}`);
+    }
   }
   if (filters.status) {
     params.push(filters.status);
@@ -167,6 +212,57 @@ export async function listMessages(filters: {
     params
   );
   return result.rows.map(normalizeMessage);
+}
+
+export async function resolveDispatchRecipient(recipient: string): Promise<
+  | {
+      ok: true;
+      recipient: string;
+      recipient_alias: 'board' | null;
+      resolved_xo_lease_id: string | null;
+      resolved_xo_fencing_token: number | null;
+    }
+  | { ok: false; reason: 'no_valid_xo_lease' }
+> {
+  if (recipient !== 'board') {
+    return {
+      ok: true,
+      recipient,
+      recipient_alias: null,
+      resolved_xo_lease_id: null,
+      resolved_xo_fencing_token: null,
+    };
+  }
+  const resolved = await resolveBoardRecipient();
+  if (!resolved.ok) return { ok: false, reason: 'no_valid_xo_lease' };
+  return {
+    ok: true,
+    recipient: resolved.principal_id,
+    recipient_alias: 'board',
+    resolved_xo_lease_id: resolved.lease_id,
+    resolved_xo_fencing_token: resolved.fencing_token,
+  };
+}
+
+async function recordBoardDeferrals(): Promise<void> {
+  const result = await getDatabase().query<
+    Pick<DispatchMessageRow, 'id' | 'motion_id' | 'motion_revision_sha'>
+  >(
+    `SELECT id, motion_id, motion_revision_sha
+     FROM agent_dispatch_messages
+     WHERE recipient_alias = 'board' AND status = 'queued'
+     ORDER BY created_at ASC
+     LIMIT 100`
+  );
+  for (const row of result.rows) {
+    await appendBoardAuditEvent({
+      event_type: 'board_recipient_deferred',
+      actor_principal_id: 'dispatch',
+      motion_id: row.motion_id,
+      motion_revision_sha: row.motion_revision_sha,
+      details: { dispatch_message_id: row.id, reason: 'no_valid_xo_lease' },
+    });
+  }
 }
 
 export async function registerWorker(data: {
@@ -247,6 +343,7 @@ export async function evaluateWorkerStaleness(
 export async function claimMessage(data: {
   id: string;
   worker_id: string;
+  delivery_principal?: string | null;
   leaseDurationMs?: number;
   workerStaleAfterMs?: number;
 }): Promise<DispatchMessage | null> {
@@ -277,6 +374,32 @@ export async function claimMessage(data: {
     const notBeforeReady =
       current.not_before === null || new Date(current.not_before).getTime() <= Date.now();
     if (!claimable || !notBeforeReady) return null;
+    let resolvedRecipient: {
+      principal_id: string;
+      lease_id: string;
+      fencing_token: number;
+    } | null = null;
+    if (current.recipient_alias === 'board') {
+      if (!data.delivery_principal) return null;
+      const lease = (
+        await txQuery<{
+          lease_id: string;
+          principal_id: string;
+          fencing_token: number | string;
+        }>(
+          `SELECT lease_id, principal_id, fencing_token
+           FROM board_xo_leases
+           WHERE id = 1 AND released_at IS NULL AND expires_at > $1`,
+          [now]
+        )
+      ).rows[0];
+      if (lease?.principal_id !== data.delivery_principal) return null;
+      resolvedRecipient = {
+        principal_id: lease.principal_id,
+        lease_id: lease.lease_id,
+        fencing_token: Number(lease.fencing_token),
+      };
+    }
 
     await txQuery(
       `UPDATE agent_dispatch_messages
@@ -284,20 +407,51 @@ export async function claimMessage(data: {
            claimed_at = $2,
            lease_owner = $3,
            lease_expires_at = $4,
-           fencing_token = fencing_token + 1
+           fencing_token = fencing_token + 1,
+           resolved_recipient = COALESCE($5, resolved_recipient),
+           resolved_xo_lease_id = COALESCE($6, resolved_xo_lease_id),
+           resolved_xo_fencing_token = COALESCE($7, resolved_xo_fencing_token),
+           resolved_at = CASE WHEN $5 IS NULL THEN resolved_at ELSE $2 END
        WHERE id = $1
          AND (
            status = 'queued'
            OR (status = 'claimed' AND lease_expires_at <= $2)
          )
          AND (not_before IS NULL OR not_before <= $2)`,
-      [data.id, now, data.worker_id, leaseExpiresAt]
+      [
+        data.id,
+        now,
+        data.worker_id,
+        leaseExpiresAt,
+        resolvedRecipient?.principal_id ?? null,
+        resolvedRecipient?.lease_id ?? null,
+        resolvedRecipient?.fencing_token ?? null,
+      ]
     );
     const claimed = await txQuery<DispatchMessageRow>(
       'SELECT * FROM agent_dispatch_messages WHERE id = $1 AND lease_owner = $2',
       [data.id, data.worker_id]
     );
     const claimedRow = claimed.rows[0];
+    if (claimedRow?.recipient_alias === 'board' && resolvedRecipient) {
+      await txQuery(
+        `INSERT INTO board_audit_events (
+           id, event_type, actor_principal_id, actor_seat_id, xo_lease_id, xo_fencing_token,
+           motion_id, motion_revision_sha, details, created_at
+         )
+         VALUES ($1, 'board_alias_resolved', $2, NULL, $3, $4, $5, $6, $7, $8)`,
+        [
+          randomUUID(),
+          resolvedRecipient.principal_id,
+          resolvedRecipient.lease_id,
+          resolvedRecipient.fencing_token,
+          claimedRow.motion_id,
+          claimedRow.motion_revision_sha,
+          JSON.stringify({ dispatch_message_id: claimedRow.id, worker_id: data.worker_id }),
+          now,
+        ]
+      );
+    }
     return claimedRow ? normalizeMessage(claimedRow) : null;
   });
 }

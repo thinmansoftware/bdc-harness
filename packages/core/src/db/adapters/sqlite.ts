@@ -153,6 +153,9 @@ export class SqliteAdapter implements IDatabase {
   private initSchema(): void {
     this.createSchema();
     this.migrateColumns();
+    this.db.run(
+      'CREATE INDEX IF NOT EXISTS idx_dispatch_board_pending ON agent_dispatch_messages(recipient_alias, status, created_at)'
+    );
   }
 
   /**
@@ -214,6 +217,36 @@ export class SqliteAdapter implements IDatabase {
       }
     } catch (e: unknown) {
       getLog().warn({ err: e as Error }, 'db.sqlite_migration_session_columns_failed');
+    }
+
+    // Dispatch board-motion columns
+    try {
+      const dispatchCols = this.db
+        .prepare("PRAGMA table_info('agent_dispatch_messages')")
+        .all() as { name: string }[];
+      const dispatchColNames = new Set(dispatchCols.map(c => c.name));
+      const columns: [string, string][] = [
+        ['recipient_alias', "TEXT CHECK (recipient_alias IS NULL OR recipient_alias = 'board')"],
+        ['motion_id', 'TEXT'],
+        [
+          'motion_revision_sha',
+          "TEXT CHECK (motion_revision_sha IS NULL OR motion_revision_sha GLOB '[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]')",
+        ],
+        ['resolved_recipient', 'TEXT'],
+        ['resolved_xo_lease_id', 'TEXT'],
+        [
+          'resolved_xo_fencing_token',
+          'INTEGER CHECK (resolved_xo_fencing_token IS NULL OR resolved_xo_fencing_token > 0)',
+        ],
+        ['resolved_at', 'TEXT'],
+      ];
+      for (const [name, definition] of columns) {
+        if (!dispatchColNames.has(name)) {
+          this.db.run(`ALTER TABLE agent_dispatch_messages ADD COLUMN ${name} ${definition}`);
+        }
+      }
+    } catch (e: unknown) {
+      getLog().warn({ err: e as Error }, 'db.sqlite_migration_dispatch_columns_failed');
     }
 
     try {
@@ -536,7 +569,7 @@ export class SqliteAdapter implements IDatabase {
         id TEXT PRIMARY KEY,
         correlation_id TEXT NOT NULL,
         idempotency_key TEXT NOT NULL UNIQUE,
-        task_type TEXT NOT NULL CHECK (task_type IN ('agent_message', 'run_review', 'draft_spec', 'run_report')),
+        task_type TEXT NOT NULL CHECK (task_type IN ('agent_message', 'run_review', 'draft_spec', 'run_report', 'board_motion')),
         sender TEXT NOT NULL,
         recipient TEXT NOT NULL,
         body TEXT NOT NULL,
@@ -548,7 +581,14 @@ export class SqliteAdapter implements IDatabase {
         not_before TEXT,
         lease_owner TEXT,
         lease_expires_at TEXT,
-        fencing_token INTEGER NOT NULL DEFAULT 0 CHECK (fencing_token >= 0)
+        fencing_token INTEGER NOT NULL DEFAULT 0 CHECK (fencing_token >= 0),
+        recipient_alias TEXT CHECK (recipient_alias IS NULL OR recipient_alias = 'board'),
+        motion_id TEXT,
+        motion_revision_sha TEXT CHECK (motion_revision_sha IS NULL OR motion_revision_sha GLOB '[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]'),
+        resolved_recipient TEXT,
+        resolved_xo_lease_id TEXT,
+        resolved_xo_fencing_token INTEGER CHECK (resolved_xo_fencing_token IS NULL OR resolved_xo_fencing_token > 0),
+        resolved_at TEXT
       );
 
       CREATE TABLE IF NOT EXISTS agent_dispatch_workers (
@@ -609,7 +649,11 @@ export class SqliteAdapter implements IDatabase {
             'board_recipient_deferred',
             'canonical_motion_frozen',
             'canonical_approval_accepted',
-            'canonical_approval_rejected'
+            'canonical_approval_rejected',
+            'motion_notification_enqueued',
+            'motion_notification_deduplicated',
+            'board_alias_resolved',
+            'board_petition_delivered'
           )
         ),
         actor_principal_id TEXT,
