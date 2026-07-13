@@ -13,7 +13,7 @@
 import { createHash, randomUUID } from 'crypto';
 import { getDatabase } from './connection';
 import type { IDatabase } from './adapters/types';
-import { appendBoardAuditEvent } from './board-authority';
+import { appendDeduplicatedBoardAuditEvent } from './board-authority';
 import {
   freezeCanonicalBoardMotion,
   parseCanonicalBoardApproval,
@@ -321,6 +321,23 @@ async function verifyCurrentXo(
   return { principal_id: row.principal_id, seat_id: row.seat_id };
 }
 
+/**
+ * Same-holder fencing for post-acquire mutations. verifyCurrentXo only proves
+ * the proof is the current singleton XO lease; it does NOT prove the caller is
+ * the principal that actually owns this claim. A later current XO holder must
+ * not operate on an earlier holder's still-unexpired claim (takeover is the only
+ * legitimate path to change ownership, and it rewrites these binding columns).
+ * This binds the mutation to the claim's recorded claimant holder id, lease id,
+ * and XO fencing token.
+ */
+function proofBindsToClaimHolder(claim: ClaimRow, proof: XoProof): boolean {
+  return (
+    claim.claimant_xo_holder_id === proof.xo_holder_id &&
+    claim.claimant_xo_lease_id === proof.xo_lease_id &&
+    toNumber(claim.claimant_xo_fencing_token) === proof.xo_fencing_token
+  );
+}
+
 interface ClaimEventInput {
   readonly claim_id: string;
   readonly event_type: string;
@@ -428,7 +445,7 @@ export async function recordExecutionAuthorityRejection(
     return;
   }
 
-  await appendBoardAuditEvent({
+  await appendDeduplicatedBoardAuditEvent({
     event_type: 'execution_claim_authority_rejected',
     actor_principal_id: input.actor_principal,
     actor_seat_id: normalizeSeat(input.actor_seat),
@@ -461,7 +478,7 @@ export async function recordManualInitiation(input: ManualInitiationInput): Prom
   if (await boardAuditEventExists('manual_initiation_recorded', eventKey)) {
     return;
   }
-  await appendBoardAuditEvent({
+  await appendDeduplicatedBoardAuditEvent({
     event_type: 'manual_initiation_recorded',
     actor_principal_id: input.john_principal_id,
     actor_seat_id: 'john',
@@ -870,6 +887,9 @@ export async function renewExecutionClaim(input: RenewInput): Promise<ClaimMutat
     }
     const xo = await verifyCurrentXo(query, input, now);
     if (!xo) return { ok: false, code: 'authority_rejected', message: 'xo_authority_invalid' };
+    if (!proofBindsToClaimHolder(claim, input)) {
+      return { ok: false, code: 'authority_rejected', message: 'claim_holder_mismatch' };
+    }
 
     const expiresAt = addMillisecondsIso(now, input.lease_duration_ms ?? DEFAULT_LEASE_DURATION_MS);
     await query(
@@ -945,11 +965,20 @@ export async function validateExecutionFence(
     if (toNumber(claim.execution_fencing_token) !== input.execution_fencing_token) {
       return { ok: false, code: 'stale_fence', message: 'stale_execution_fence' };
     }
+    // An expired claim must fail closed here and be resolved via takeover, not
+    // armed. Arming an expired claim would hand out pre-effect permission on a
+    // lease the holder no longer owns.
+    if (claim.expires_at <= now) {
+      return { ok: false, code: 'stale_fence', message: 'claim_expired' };
+    }
     if (claim.reconciliation_status === 'required' || claim.effect_attempt_state !== 'none') {
       return { ok: false, code: 'reconciliation_required', message: 'reconciliation_required' };
     }
     const xo = await verifyCurrentXo(query, input, now);
     if (!xo) return { ok: false, code: 'authority_rejected', message: 'xo_authority_invalid' };
+    if (!proofBindsToClaimHolder(claim, input)) {
+      return { ok: false, code: 'authority_rejected', message: 'claim_holder_mismatch' };
+    }
 
     const effectAttemptId = randomUUID();
     await query(
@@ -957,8 +986,8 @@ export async function validateExecutionFence(
          SET effect_attempt_id = $1, effect_attempt_state = 'armed', effect_armed_at = $2,
              reconciliation_status = 'required'
        WHERE claim_id = $3 AND status = 'active' AND execution_fencing_token = $4
-         AND effect_attempt_state = 'none'`,
-      [effectAttemptId, now, input.claim_id, input.execution_fencing_token]
+         AND effect_attempt_state = 'none' AND expires_at > $5`,
+      [effectAttemptId, now, input.claim_id, input.execution_fencing_token, now]
     );
     const row = await selectClaimById(query, input.claim_id);
     if (row?.effect_attempt_id !== effectAttemptId || row.effect_attempt_state !== 'armed') {
@@ -1021,6 +1050,9 @@ export async function markExecutionReconciliationRequired(
     }
     const xo = await verifyCurrentXo(query, input, now);
     if (!xo) return { ok: false, code: 'authority_rejected', message: 'xo_authority_invalid' };
+    if (!proofBindsToClaimHolder(claim, input)) {
+      return { ok: false, code: 'authority_rejected', message: 'claim_holder_mismatch' };
+    }
 
     // Arming already set reconciliation_status='required'; this records the
     // explicit uncertain-outcome evidence and keeps the claim blocked.
@@ -1075,6 +1107,9 @@ export async function resolveExecutionReconciliation(
     }
     const xo = await verifyCurrentXo(query, input, now);
     if (!xo) return { ok: false, code: 'authority_rejected', message: 'xo_authority_invalid' };
+    if (!proofBindsToClaimHolder(claim, input)) {
+      return { ok: false, code: 'authority_rejected', message: 'claim_holder_mismatch' };
+    }
 
     const observed = input.evidence.observed_state;
     if (input.resolution === 'retryable') {
@@ -1182,6 +1217,9 @@ export async function releaseExecutionClaim(input: ReleaseInput): Promise<ClaimM
     }
     const xo = await verifyCurrentXo(query, input, now);
     if (!xo) return { ok: false, code: 'authority_rejected', message: 'xo_authority_invalid' };
+    if (!proofBindsToClaimHolder(claim, input)) {
+      return { ok: false, code: 'authority_rejected', message: 'claim_holder_mismatch' };
+    }
 
     await query(
       `UPDATE board_execution_claims
@@ -1250,6 +1288,9 @@ export async function completeExecutionClaim(input: CompleteInput): Promise<Clai
     }
     const xo = await verifyCurrentXo(query, input, now);
     if (!xo) return { ok: false, code: 'authority_rejected', message: 'xo_authority_invalid' };
+    if (!proofBindsToClaimHolder(claim, input)) {
+      return { ok: false, code: 'authority_rejected', message: 'claim_holder_mismatch' };
+    }
 
     await query(
       `UPDATE board_execution_claims

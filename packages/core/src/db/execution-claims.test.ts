@@ -11,7 +11,12 @@ mock.module('./connection', () => ({
   getDatabase: () => db,
 }));
 
-import { acquireXoLease, type BoardPrincipal } from './board-authority';
+import {
+  acquireXoLease,
+  appendDeduplicatedBoardAuditEvent,
+  releaseXoLease,
+  type BoardPrincipal,
+} from './board-authority';
 import {
   acquireExecutionClaim,
   completeExecutionClaim,
@@ -601,5 +606,124 @@ describe('execution claims db', () => {
     const moduleSource = readFileSync(join(import.meta.dir, 'execution-claims.ts'), 'utf8');
     expect(fkPattern.test(migration)).toBe(false);
     expect(fkPattern.test(moduleSource)).toBe(false);
+  });
+
+  // Test 12 -- Holder isolation: a later current XO cannot operate on another
+  // holder's unexpired claim even though they hold the singleton lease and know
+  // the execution token. Only takeover (which rewrites the binding columns) may
+  // change ownership.
+  test('a different current XO holder cannot mutate another holder claim', async () => {
+    const proofA = await seedXo('holder-a', 'token-a', 60_000);
+    const acquire = await acquireExecutionClaim(
+      acquireInput(proofA, { lease_duration_ms: 60_000 }),
+      approvalDeps()
+    );
+    expect(acquire.ok).toBe(true);
+    const claimId = acquire.ok ? acquire.claim.claim_id : '';
+
+    // holder-a hands the singleton XO seat to holder-b; the claim (unexpired)
+    // remains bound to holder-a.
+    const released = await releaseXoLease({
+      principal: XO,
+      holder_id: 'holder-a',
+      holder_token: 'token-a',
+      fencing_token: proofA.xo_fencing_token,
+    });
+    expect(released.ok).toBe(true);
+    const proofB = await seedXo('holder-b', 'token-b', 60_000);
+    expect(proofB.xo_lease_id).not.toBe(proofA.xo_lease_id);
+
+    const badRenew = await renewExecutionClaim({
+      claim_id: claimId,
+      execution_fencing_token: 1,
+      ...proofB,
+    });
+    expect(badRenew.ok).toBe(false);
+    if (!badRenew.ok) {
+      expect(badRenew.code).toBe('authority_rejected');
+      expect(badRenew.message).toBe('claim_holder_mismatch');
+    }
+
+    const badArm = await validateExecutionFence(
+      { claim_id: claimId, execution_fencing_token: 1, ...proofB },
+      approvalDeps()
+    );
+    expect(badArm.ok).toBe(false);
+    if (!badArm.ok) expect(badArm.code).toBe('authority_rejected');
+
+    const badRelease = await releaseExecutionClaim({
+      claim_id: claimId,
+      execution_fencing_token: 1,
+      ...proofB,
+    });
+    expect(badRelease.ok).toBe(false);
+    if (!badRelease.ok) expect(badRelease.code).toBe('authority_rejected');
+
+    // The claim was never armed or released by the intruder.
+    const after = await getExecutionClaim(identity());
+    expect(after?.claimant_xo_lease_id).toBe(proofA.xo_lease_id);
+    expect(after?.status).toBe('active');
+    expect(after?.effect_attempt_state).toBe('none');
+
+    // The rightful holder-a token is stale now (its XO lease was released), so it
+    // also cannot arm -- ownership is resolved only by takeover.
+    const staleOwnerArm = await validateExecutionFence(
+      { claim_id: claimId, execution_fencing_token: 1, ...proofA },
+      approvalDeps()
+    );
+    expect(staleOwnerArm.ok).toBe(false);
+  });
+
+  // Test 13 -- An expired (un-taken-over) claim fails closed instead of arming.
+  test('validateExecutionFence refuses to arm an expired claim', async () => {
+    // Long-lived XO lease so verifyCurrentXo passes; short claim lease so the
+    // claim itself expires without any takeover having occurred.
+    const proof = await seedXo('holder-a', 'token-a', 60_000);
+    const acquire = await acquireExecutionClaim(
+      acquireInput(proof, { lease_duration_ms: 5 }),
+      approvalDeps()
+    );
+    expect(acquire.ok).toBe(true);
+    const claimId = acquire.ok ? acquire.claim.claim_id : '';
+    await Bun.sleep(25);
+
+    const armed = await validateExecutionFence(
+      { claim_id: claimId, execution_fencing_token: 1, ...proof },
+      approvalDeps()
+    );
+    expect(armed.ok).toBe(false);
+    if (!armed.ok) {
+      expect(armed.code).toBe('stale_fence');
+      expect(armed.message).toBe('claim_expired');
+    }
+
+    const after = await getExecutionClaim(identity());
+    expect(after?.effect_attempt_state).toBe('none');
+    expect(after?.reconciliation_status).toBe('clear');
+  });
+
+  // Test 14 -- Exact-once dedup is enforced at the DB level (unique index +
+  // ON CONFLICT DO NOTHING), not by a racy read-before-insert check.
+  test('appendDeduplicatedBoardAuditEvent inserts a dedup key at most once', async () => {
+    const eventKey = 'execution-claim-authority-rejected:M-x:key-x';
+    const first = await appendDeduplicatedBoardAuditEvent({
+      event_type: 'execution_claim_authority_rejected',
+      details: { event_key: eventKey, reason_code: 'xo_authority_invalid' },
+    });
+    const second = await appendDeduplicatedBoardAuditEvent({
+      event_type: 'execution_claim_authority_rejected',
+      details: { event_key: eventKey, reason_code: 'xo_authority_invalid' },
+    });
+    expect(first).toBe(true);
+    expect(second).toBe(false);
+    expect(await countEvents('execution_claim_authority_rejected')).toBe(1);
+
+    // A different event_key is a distinct event and still lands.
+    const other = await appendDeduplicatedBoardAuditEvent({
+      event_type: 'execution_claim_authority_rejected',
+      details: { event_key: `${eventKey}:other`, reason_code: 'xo_authority_invalid' },
+    });
+    expect(other).toBe(true);
+    expect(await countEvents('execution_claim_authority_rejected')).toBe(2);
   });
 });

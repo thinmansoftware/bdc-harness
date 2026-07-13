@@ -716,6 +716,14 @@ export class SqliteAdapter implements IDatabase {
           SELECT RAISE(ABORT, 'board_audit_events is append-only');
         END;
 
+      -- Exact-once dedup for the two M-27B pre-claim audit events (migration 032).
+      -- A read-before-insert LIKE check races under concurrency; this partial
+      -- unique index makes the losing INSERT ... ON CONFLICT DO NOTHING a no-op so
+      -- identical authority rejections / John initiations append exactly one event.
+      CREATE UNIQUE INDEX IF NOT EXISTS uq_board_audit_events_dedup_key
+        ON board_audit_events (event_type, json_extract(details, '$.event_key'))
+        WHERE event_type IN ('execution_claim_authority_rejected', 'manual_initiation_recorded');
+
       -- Board execution claims (migration 032): exclusive fenced action ownership.
       CREATE TABLE IF NOT EXISTS board_execution_claims (
         claim_id TEXT PRIMARY KEY,

@@ -145,3 +145,11 @@ ALTER TABLE board_audit_events
       'manual_initiation_recorded'
     )
   );
+
+-- Exact-once dedup for the two M-27B pre-claim audit events. A read-before-insert
+-- LIKE check races under concurrency; this partial unique index makes the losing
+-- INSERT ... ON CONFLICT DO NOTHING a no-op so identical authority rejections /
+-- John initiations append exactly one event.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_board_audit_events_dedup_key
+  ON board_audit_events (event_type, (details->>'event_key'))
+  WHERE event_type IN ('execution_claim_authority_rejected', 'manual_initiation_recorded');

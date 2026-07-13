@@ -625,6 +625,14 @@ CREATE INDEX IF NOT EXISTS idx_board_audit_events_motion
   ON board_audit_events(motion_id, motion_revision_sha)
   WHERE motion_id IS NOT NULL;
 
+-- Exact-once dedup for the two M-27B pre-claim audit events (migration 032). A
+-- read-before-insert LIKE check races under concurrency; this partial unique
+-- index makes the losing INSERT ... ON CONFLICT DO NOTHING a no-op so identical
+-- authority rejections / John initiations append exactly one event.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_board_audit_events_dedup_key
+  ON board_audit_events (event_type, (details->>'event_key'))
+  WHERE event_type IN ('execution_claim_authority_rejected', 'manual_initiation_recorded');
+
 CREATE OR REPLACE FUNCTION prevent_board_audit_event_mutation()
 RETURNS TRIGGER AS $$
 BEGIN

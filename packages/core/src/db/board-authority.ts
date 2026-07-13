@@ -112,6 +112,46 @@ export async function appendBoardAuditEvent(input: BoardAuditEventInput): Promis
   return id;
 }
 
+/**
+ * Insert a board audit event that must appear at most once per
+ * (event_type, details.event_key). A read-before-insert existence check cannot
+ * make this safe under concurrency: two identical writers can both observe "not
+ * present" and both insert. The partial unique index
+ * uq_board_audit_events_dedup_key is the real guarantee -- the losing INSERT is
+ * a no-op via ON CONFLICT DO NOTHING. `input.details.event_key` MUST be set by
+ * the caller; without it the dedup index does not apply.
+ *
+ * Returns true if this call inserted the row, false if an identical event
+ * already existed (either previously or written by a concurrent racer).
+ */
+export async function appendDeduplicatedBoardAuditEvent(
+  input: BoardAuditEventInput
+): Promise<boolean> {
+  const id = randomUUID();
+  const db = getDatabase();
+  const result = await db.query(
+    `INSERT INTO board_audit_events (
+       id, event_type, actor_principal_id, actor_seat_id, xo_lease_id, xo_fencing_token,
+       motion_id, motion_revision_sha, details, created_at
+     )
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+     ON CONFLICT DO NOTHING`,
+    [
+      id,
+      input.event_type,
+      input.actor_principal_id ?? null,
+      input.actor_seat_id ?? null,
+      input.xo_lease_id ?? null,
+      input.xo_fencing_token ?? null,
+      input.motion_id ?? null,
+      input.motion_revision_sha ?? null,
+      JSON.stringify(input.details ?? {}),
+      input.created_at ?? (await databaseNow()),
+    ]
+  );
+  return result.rowCount > 0;
+}
+
 export async function getCurrentXoLease(): Promise<XoLease | null> {
   const now = await databaseNow();
   const result = await getDatabase().query<XoLeaseRow>(
