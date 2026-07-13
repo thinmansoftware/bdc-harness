@@ -54,7 +54,10 @@ describe('known-bad-bindings db', () => {
         source: 'fire_probe',
       })
     ).resolves.toEqual(row);
-    expect(mockQuery).toHaveBeenCalledWith(expect.stringContaining('ON CONFLICT'), expect.any(Array));
+    expect(mockQuery).toHaveBeenCalledWith(
+      expect.stringContaining('ON CONFLICT'),
+      expect.any(Array)
+    );
   });
 
   test('finds an active binding', async () => {

@@ -18,7 +18,8 @@ function authContextId(providerId: string): string {
     (providerId === 'openrouter' && Boolean(process.env.OPENROUTER_API_KEY)) ||
     (providerId === 'claude' && Boolean(process.env.ANTHROPIC_API_KEY)) ||
     (providerId === 'codex' && Boolean(process.env.OPENAI_API_KEY));
-  if (providerId.startsWith('codex')) return hasApiKey ? `${providerId}:api-key` : `${providerId}:chatgpt-account`;
+  if (providerId.startsWith('codex'))
+    return hasApiKey ? `${providerId}:api-key` : `${providerId}:chatgpt-account`;
   return hasApiKey ? `${providerId}:api-key` : `${providerId}:ambient-auth`;
 }
 

@@ -31,7 +31,9 @@ export interface FireTimeProbeDecision {
   readonly bindings: readonly ProviderProbeBinding[];
 }
 
-function isFailed(result: ProviderProbeResult): result is Extract<ProviderProbeResult, { ok: false }> {
+function isFailed(
+  result: ProviderProbeResult
+): result is Extract<ProviderProbeResult, { ok: false }> {
   return !result.ok;
 }
 

@@ -15,7 +15,8 @@ function provider(chunksOrErrors: readonly (MessageChunk[] | Error)[]): IAgentPr
   let index = 0;
   return {
     getType: () => 'codex',
-    getCapabilities: () => ({}) as IAgentProvider['getCapabilities'] extends () => infer T ? T : never,
+    getCapabilities: () =>
+      ({}) as IAgentProvider['getCapabilities'] extends () => infer T ? T : never,
     sendQuery: mock(async function* () {
       const next = chunksOrErrors[index++];
       if (next instanceof Error) throw next;
@@ -36,7 +37,10 @@ describe('provider probe', () => {
   test('retries transient once and warns open', async () => {
     const result = await probeProviderBinding(binding, '/tmp', {
       getAgentProvider: () =>
-        provider([Object.assign(new Error('rate limit'), { httpStatus: 429 }), [{ type: 'assistant', content: 'OK' }]]),
+        provider([
+          Object.assign(new Error('rate limit'), { httpStatus: 429 }),
+          [{ type: 'assistant', content: 'OK' }],
+        ]),
       sleep: async () => {},
     });
     expect(result.ok).toBe(true);

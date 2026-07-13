@@ -23,7 +23,9 @@ function canonicalize(value: unknown): unknown {
 }
 
 export function stableHash(value: unknown): string {
-  return createHash('sha256').update(JSON.stringify(canonicalize(value))).digest('hex');
+  return createHash('sha256')
+    .update(JSON.stringify(canonicalize(value)))
+    .digest('hex');
 }
 
 export function computeBindingKey(binding: Omit<ProviderProbeBinding, 'bindingKey'>): string {
@@ -36,6 +38,8 @@ export function computeBindingKey(binding: Omit<ProviderProbeBinding, 'bindingKe
   });
 }
 
-export function withBindingKey(binding: Omit<ProviderProbeBinding, 'bindingKey'>): ProviderProbeBinding {
+export function withBindingKey(
+  binding: Omit<ProviderProbeBinding, 'bindingKey'>
+): ProviderProbeBinding {
   return { ...binding, bindingKey: computeBindingKey(binding) };
 }

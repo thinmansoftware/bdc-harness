@@ -18,7 +18,9 @@ export type ProviderProbeResult =
 
 function resultChunkFailed(chunk: MessageChunk): string | null {
   if (chunk.type !== 'result' || !chunk.isError) return null;
-  return [chunk.stopReason, ...(chunk.errors ?? [])].filter(Boolean).join(' ') || 'probe_result_error';
+  return (
+    [chunk.stopReason, ...(chunk.errors ?? [])].filter(Boolean).join(' ') || 'probe_result_error'
+  );
 }
 
 async function runSingleProbe(
@@ -43,7 +45,9 @@ export async function probeProviderBinding(
   deps: ProviderProbeDeps
 ): Promise<ProviderProbeResult> {
   const provider = deps.getAgentProvider(binding.providerId);
-  const sleep = deps.sleep ?? ((ms: number): Promise<void> => new Promise<void>(resolve => setTimeout(resolve, ms)));
+  const sleep =
+    deps.sleep ??
+    ((ms: number): Promise<void> => new Promise<void>(resolve => setTimeout(resolve, ms)));
   let lastClassification: ProbeClassification | null = null;
 
   for (let attempt = 1; attempt <= 2; attempt += 1) {

@@ -4125,7 +4125,12 @@ export function registerApiRoutes(
     }
     const knownBadBinding = await rejectKnownBadWorkflowBinding(parsed.workflow, workingDir);
     if (knownBadBinding) {
-      return apiError(c, 400, 'Workflow definition is blocked by known bad binding', knownBadBinding);
+      return apiError(
+        c,
+        400,
+        'Workflow definition is blocked by known bad binding',
+        knownBadBinding
+      );
     }
 
     try {

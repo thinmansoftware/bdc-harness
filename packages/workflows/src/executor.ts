@@ -986,11 +986,7 @@ export async function executeWorkflow(
           );
         });
       await deps.store.failWorkflowRun(workflowRun.id, reason);
-      await sendCriticalMessage(
-        platform,
-        conversationId,
-        `[ ] **Workflow blocked**: ${reason}`
-      );
+      await sendCriticalMessage(platform, conversationId, `[ ] **Workflow blocked**: ${reason}`);
       return { success: false, workflowRunId: workflowRun.id, error: reason };
     }
 
