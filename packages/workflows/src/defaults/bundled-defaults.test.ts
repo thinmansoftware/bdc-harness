@@ -175,6 +175,59 @@ describe('bundled-defaults', () => {
       }
     });
 
+    describe('feature-development reasoning loop idle timeout placement', () => {
+      const REASONING_BOUND = [
+        'bdc-feature-development',
+        'bdc-feature-development-codex',
+        'bdc-feature-development-codex-only',
+        'bdc-feature-development-fable',
+      ];
+      const OPEN_MODEL = [
+        'bdc-feature-development-fusion-cx-qwen',
+        'bdc-feature-development-zero-open',
+        'bdc-feature-development-zero',
+      ];
+      const OUT_OF_SCOPE_NODES = [
+        'opus-repair',
+        'diff-review',
+        'diff-review-final',
+        'diff-repair',
+      ];
+
+      for (const name of REASONING_BOUND) {
+        it(`${name} applies the 10-minute idle timeout to plan-review and implement`, () => {
+          const content = BUNDLED_WORKFLOWS[name];
+          const planReview = extractWorkflowNode(content, 'plan-review');
+          const implement = extractWorkflowNode(content, 'implement');
+
+          expect(planReview).toContain('idle_timeout: 600000');
+          expect(implement).toContain('idle_timeout: 600000');
+        });
+      }
+
+      for (const name of OPEN_MODEL) {
+        it(`${name} keeps the default loop idle timeout on plan-review and implement`, () => {
+          const content = BUNDLED_WORKFLOWS[name];
+          const planReview = extractWorkflowNode(content, 'plan-review');
+          const implement = extractWorkflowNode(content, 'implement');
+
+          expect(planReview).not.toContain('idle_timeout: 600000');
+          expect(implement).not.toContain('idle_timeout: 600000');
+        });
+      }
+
+      for (const name of [...REASONING_BOUND, ...OPEN_MODEL]) {
+        for (const nodeId of OUT_OF_SCOPE_NODES) {
+          it(`${name} does not apply the plan-review/implement idle timeout to ${nodeId}`, () => {
+            const content = BUNDLED_WORKFLOWS[name];
+            const node = extractWorkflowNode(content, nodeId);
+
+            expect(node).not.toContain('idle_timeout: 600000');
+          });
+        }
+      }
+    });
+
     // WO-HARNESS-COMMIT-AND-PUSH-BACKSTOP-FALSE-NEGATIVE-01 regression guard:
     // Ensure the false-negative pattern is gone and the corrected COMMITS_AHEAD
     // check is present in all four affected bdc-* workflows.
