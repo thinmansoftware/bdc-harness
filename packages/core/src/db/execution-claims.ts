@@ -885,6 +885,12 @@ export async function renewExecutionClaim(input: RenewInput): Promise<ClaimMutat
     if (toNumber(claim.execution_fencing_token) !== input.execution_fencing_token) {
       return { ok: false, code: 'stale_fence', message: 'stale_execution_fence' };
     }
+    // An expired claim must fail closed here and be resolved via takeover, not
+    // renewed. Renewing an expired claim would let a stale owner revive the old
+    // execution fencing token instead of forcing a takeover with token N+1.
+    if (claim.expires_at <= now) {
+      return { ok: false, code: 'stale_fence', message: 'claim_expired' };
+    }
     const xo = await verifyCurrentXo(query, input, now);
     if (!xo) return { ok: false, code: 'authority_rejected', message: 'xo_authority_invalid' };
     if (!proofBindsToClaimHolder(claim, input)) {
@@ -895,7 +901,8 @@ export async function renewExecutionClaim(input: RenewInput): Promise<ClaimMutat
     await query(
       `UPDATE board_execution_claims
          SET renewed_at = $1, expires_at = $2
-       WHERE claim_id = $3 AND status = 'active' AND execution_fencing_token = $4`,
+       WHERE claim_id = $3 AND status = 'active' AND execution_fencing_token = $4
+         AND expires_at > $1`,
       [now, expiresAt, input.claim_id, input.execution_fencing_token]
     );
     const row = await selectClaimById(query, input.claim_id);

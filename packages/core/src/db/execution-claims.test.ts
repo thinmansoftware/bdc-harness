@@ -702,6 +702,31 @@ describe('execution claims db', () => {
     expect(after?.reconciliation_status).toBe('clear');
   });
 
+  // Test 13b -- An expired (un-taken-over) claim cannot be renewed with its
+  // still-current execution fencing token. The stale owner must be forced
+  // through takeover to token N+1, not permitted to revive token N.
+  test('renewExecutionClaim refuses to renew an expired claim', async () => {
+    const proof = await seedXo('holder-a', 'token-a', 60_000);
+    const acquire = await acquireExecutionClaim(
+      acquireInput(proof, { lease_duration_ms: 5 }),
+      approvalDeps()
+    );
+    expect(acquire.ok).toBe(true);
+    const claimId = acquire.ok ? acquire.claim.claim_id : '';
+    await Bun.sleep(25);
+
+    const renew = await renewExecutionClaim({
+      claim_id: claimId,
+      execution_fencing_token: 1,
+      ...proof,
+    });
+    expect(renew.ok).toBe(false);
+    if (!renew.ok) {
+      expect(renew.code).toBe('stale_fence');
+      expect(renew.message).toBe('claim_expired');
+    }
+  });
+
   // Test 14 -- Exact-once dedup is enforced at the DB level (unique index +
   // ON CONFLICT DO NOTHING), not by a racy read-before-insert check.
   test('appendDeduplicatedBoardAuditEvent inserts a dedup key at most once', async () => {
