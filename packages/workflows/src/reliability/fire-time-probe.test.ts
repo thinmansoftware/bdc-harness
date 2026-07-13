@@ -1,4 +1,5 @@
-import { beforeEach, describe, expect, mock, test } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test';
+import { clearRegistry, registerBuiltinProviders } from '@archon/providers';
 import type { IAgentProvider, MessageChunk } from '@archon/providers/types';
 import { runFireTimeProbe } from './fire-time-probe';
 import type { WorkflowConfig } from '../deps';
@@ -16,10 +17,16 @@ mock.module('@archon/core/db/known-bad-bindings', () => ({
   incrementKnownBadBindingHit: increment,
 }));
 
-mock.module('@archon/providers', () => ({
-  isRegisteredProvider: () => true,
-  getRegisteredProviders: () => [{ id: 'codex' }],
-}));
+// Use the REAL provider registry (register builtins, clear after) rather than
+// mock.module('@archon/providers') -- bun module mocks are process-global and
+// leak into every later test file in the same run, which broke the
+// capability-audit tests in CI (isRegisteredProvider stubbed always-true).
+// Matches the hygiene pattern in workflow-capability-audit.test.ts.
+beforeEach(() => {
+  clearRegistry();
+  registerBuiltinProviders();
+});
+afterEach(clearRegistry);
 
 const workflow: WorkflowDefinition = {
   name: 'probe-test',
