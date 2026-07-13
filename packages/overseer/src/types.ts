@@ -43,7 +43,19 @@ export interface PullRequestEvidence {
   checks: PullRequestCheckSummary;
   mergeable: boolean | null;
   pr?: PullRequestRef;
+  prTitle?: string;
+  filesChangedCount?: number;
+  diffStat?: string;
   htmlUrl?: string;
+}
+
+export interface GrokJudgeEvidence {
+  woId: string;
+  prNumber: number;
+  prTitle: string;
+  checksSummary: PullRequestCheckSummary;
+  filesChangedCount: number;
+  diffStat: string;
 }
 
 export interface WatchedRunRecord {
@@ -74,6 +86,10 @@ export interface OverseerActionsDeps {
     action: string;
     result: string;
   }): Promise<void>;
+}
+
+export interface GrokJudgeDeps {
+  judgeSecondOpinion?(evidence: GrokJudgeEvidence): Promise<'approve' | 'hold'>;
 }
 
 export interface GitHubPullRequestSearchInput {

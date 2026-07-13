@@ -12,6 +12,7 @@
     "./escalate": "./src/escalate.ts",
     "./watch": "./src/watch.ts",
     "./judge-pr": "./src/judge-pr.ts",
+    "./judge-second-opinion": "./src/judge-second-opinion.ts",
     "./service": "./src/service.ts",
     "./actions/merge-ready": "./src/actions/merge-ready.ts"
   },

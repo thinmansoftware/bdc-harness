@@ -33,9 +33,12 @@ export type { EscalationContext } from './escalate';
 
 export { watchLoop, watchOnce, DEFAULT_WATCH_INTERVAL_MS } from './watch';
 export { judgePullRequest, isPrGreen, isPrMergeReady } from './judge-pr';
+export { judgeWithGrok } from './judge-second-opinion';
 export { handleMergeReady, isInternalMergeAllowed } from './actions/merge-ready';
 export { runOverseerService } from './service';
 export type {
+  GrokJudgeDeps,
+  GrokJudgeEvidence,
   GitHubClientDeps,
   OverseerActionsDeps,
   OverseerRunRecord,

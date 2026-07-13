@@ -8,9 +8,11 @@ import {
 import type { ErrorClass } from './classify.ts';
 import { runEscalation } from './escalate';
 import { handleMergeReady } from './actions/merge-ready';
+import { judgeWithGrok } from './judge-second-opinion';
 import { watchLoop } from './watch';
 import type {
   GitHubClientDeps,
+  GrokJudgeDeps,
   OverseerActionsDeps,
   OverseerRunStoreDeps,
   PullRequestEvidence,
@@ -23,18 +25,24 @@ export interface OverseerServiceOptions {
   once?: boolean;
   enabled?: boolean;
   dryRun?: boolean;
+  mergeJudge?: 'off' | 'grok';
   intervalMs?: number;
-  deps?: OverseerRunStoreDeps & OverseerActionsDeps & GitHubClientDeps;
+  deps?: OverseerRunStoreDeps & OverseerActionsDeps & GitHubClientDeps & Partial<GrokJudgeDeps>;
 }
 
 function envEnabled(value: string | undefined): boolean {
   return value === '1' || value === 'true' || value === 'yes';
 }
 
+function envMergeJudge(value: string | undefined): 'off' | 'grok' {
+  return value === 'grok' ? 'grok' : 'off';
+}
+
 async function handleRecord(
   record: WatchedRunRecord,
-  deps: OverseerActionsDeps & GitHubClientDeps,
-  dryRun: boolean
+  deps: OverseerActionsDeps & GitHubClientDeps & Partial<GrokJudgeDeps>,
+  dryRun: boolean,
+  mergeJudge: 'off' | 'grok'
 ): Promise<void> {
   if (record.action === 'success' || record.action === 'ignore') {
     log.info(
@@ -66,7 +74,7 @@ async function handleRecord(
   }
 
   if (record.action === 'merge_ready') {
-    const result = await handleMergeReady(record, deps);
+    const result = await handleMergeReady(record, deps, { mergeJudge });
     log.info(
       {
         runId: record.runId,
@@ -129,14 +137,18 @@ export async function runOverseerService(options: OverseerServiceOptions = {}): 
   if (!enabled) return;
 
   const dryRun = options.dryRun ?? envEnabled(process.env.OVERSEER_DRY_RUN);
+  const mergeJudge = options.mergeJudge ?? envMergeJudge(process.env.OVERSEER_MERGE_JUDGE);
   const deps = options.deps ?? createDefaultDeps();
-  await watchLoop(deps, record => handleRecord(record, deps, dryRun), {
+  await watchLoop(deps, record => handleRecord(record, deps, dryRun, mergeJudge), {
     intervalMs: options.intervalMs,
     once: options.once,
   });
 }
 
-function createDefaultDeps(): OverseerRunStoreDeps & OverseerActionsDeps & GitHubClientDeps {
+function createDefaultDeps(): OverseerRunStoreDeps &
+  OverseerActionsDeps &
+  GitHubClientDeps &
+  Partial<GrokJudgeDeps> {
   const token = process.env.GH_TOKEN ?? process.env.GITHUB_TOKEN;
   const octokit = new Octokit(token ? { auth: token } : {});
   return {
@@ -158,6 +170,7 @@ function createDefaultDeps(): OverseerRunStoreDeps & OverseerActionsDeps & GitHu
         message: response.data.message,
       };
     },
+    judgeSecondOpinion: judgeWithGrok,
   };
 }
 
@@ -215,6 +228,9 @@ async function findPullRequest(
     checks: { total: runs.length, passed, failed, pending },
     mergeable: details.data.mergeable,
     pr: { owner: input.owner, repo: input.repo, number: pr.number },
+    prTitle: details.data.title,
+    filesChangedCount: details.data.changed_files,
+    diffStat: `+${details.data.additions} -${details.data.deletions}`,
     htmlUrl: pr.html_url,
   };
 }
