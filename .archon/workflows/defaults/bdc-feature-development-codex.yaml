@@ -274,6 +274,7 @@ nodes:
   # plan that `implement` consumes. NOT a human gate -- humans are reached only via the
   # async escalation payload, and only at the irreversible-action boundary downstream.
   - id: plan-review
+    idle_timeout: 600000
     persona: war-council-architect
     # Provider pin: persona war-council-architect declares model: sonnet; the lane
     # default (provider: codex) must never receive an Anthropic alias. Mirror of #313
@@ -402,6 +403,7 @@ nodes:
       echo "RUN_SCOPE_SHA=$RUN_SCOPE_SHA"
 
   - id: implement
+    idle_timeout: 600000
     provider: codex
     model: gpt-5.5
     depends_on: [capture-run-scope]

@@ -268,6 +268,7 @@ nodes:
   # plan that `implement` consumes. NOT a human gate -- humans are reached only via the
   # async escalation payload, and only at the irreversible-action boundary downstream.
   - id: plan-review
+    idle_timeout: 600000
     persona: war-council-architect
     agent: war-council-architect
     depends_on: [plan]
@@ -390,6 +391,7 @@ nodes:
       echo "RUN_SCOPE_SHA=$RUN_SCOPE_SHA"
 
   - id: implement
+    idle_timeout: 600000
     persona: major-build
     depends_on: [capture-run-scope]
     trigger_rule: all_done
