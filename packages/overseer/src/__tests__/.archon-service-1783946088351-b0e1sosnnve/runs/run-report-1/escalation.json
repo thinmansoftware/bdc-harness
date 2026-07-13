@@ -1,0 +1,13 @@
+{
+  "runId": "run-report-1",
+  "timestamp": "2026-07-13T12:34:48.352Z",
+  "decision": {
+    "decision": "escalate",
+    "reason": "gate rejected"
+  },
+  "context": {
+    "errorClass": "validator_rejected",
+    "woId": "WO-RPT-01",
+    "nodeId": "gate"
+  }
+}

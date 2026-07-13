@@ -58,8 +58,12 @@ export class SqliteAdapter implements IDatabase {
 
       if (isSelect) {
         const stmt = this.db.prepare(convertedSql);
-        const rows = stmt.all(...sqliteParams) as T[];
-        return { rows, rowCount: rows.length };
+        try {
+          const rows = stmt.all(...sqliteParams) as T[];
+          return { rows, rowCount: rows.length };
+        } finally {
+          stmt.finalize();
+        }
       } else {
         const upperSql = sql.toUpperCase();
 
@@ -69,8 +73,12 @@ export class SqliteAdapter implements IDatabase {
         // ON CONFLICT DO UPDATE fires.
         if (upperSql.includes('RETURNING') && upperSql.includes('INSERT')) {
           const stmt = this.db.prepare(convertedSql);
-          const rows = stmt.all(...sqliteParams) as T[];
-          return { rows, rowCount: rows.length };
+          try {
+            const rows = stmt.all(...sqliteParams) as T[];
+            return { rows, rowCount: rows.length };
+          } finally {
+            stmt.finalize();
+          }
         }
 
         // UPDATE/DELETE with RETURNING not supported
@@ -84,8 +92,12 @@ export class SqliteAdapter implements IDatabase {
 
         // Standard INSERT/UPDATE/DELETE without RETURNING
         const stmt = this.db.prepare(convertedSql);
-        const result = stmt.run(...sqliteParams);
-        return { rows: [], rowCount: result.changes };
+        try {
+          const result = stmt.run(...sqliteParams);
+          return { rows: [], rowCount: result.changes };
+        } finally {
+          stmt.finalize();
+        }
       }
     } catch (error) {
       const err = error as Error;
@@ -113,7 +125,31 @@ export class SqliteAdapter implements IDatabase {
   }
 
   async close(): Promise<void> {
+    // Checkpoint and truncate the WAL before closing so the -wal/-shm files are
+    // released; on Windows a lingering WAL handle makes rmSync fail with EBUSY.
+    try {
+      this.db.run('PRAGMA wal_checkpoint(TRUNCATE)');
+    } catch {
+      // Best-effort: closing matters more than the checkpoint.
+    }
     this.db.close();
+    // Bun keeps the sqlite file handle alive in a GC finalizer after close();
+    // on Windows this makes rmSync on the db directory fail with EBUSY until a
+    // collection runs. Force one so close() means closed. (Verified 2026-07-13:
+    // rm fails after close(), succeeds after Bun.gc(true).)
+    if (typeof Bun !== 'undefined' && typeof Bun.gc === 'function') {
+      Bun.gc(true);
+    }
+  }
+
+  /** Run a PRAGMA query and finalize the statement immediately. */
+  private pragmaAll(sql: string): unknown[] {
+    const stmt = this.db.prepare(sql);
+    try {
+      return stmt.all();
+    } finally {
+      stmt.finalize();
+    }
   }
 
   /**
@@ -164,7 +200,7 @@ export class SqliteAdapter implements IDatabase {
   private migrateColumns(): void {
     // Conversations columns
     try {
-      const cols = this.db.prepare("PRAGMA table_info('remote_agent_conversations')").all() as {
+      const cols = this.pragmaAll("PRAGMA table_info('remote_agent_conversations')") as {
         name: string;
       }[];
       const colNames = new Set(cols.map(c => c.name));
@@ -184,7 +220,7 @@ export class SqliteAdapter implements IDatabase {
 
     // Workflow runs columns
     try {
-      const wfCols = this.db.prepare("PRAGMA table_info('remote_agent_workflow_runs')").all() as {
+      const wfCols = this.pragmaAll("PRAGMA table_info('remote_agent_workflow_runs')") as {
         name: string;
       }[];
       const wfColNames = new Set(wfCols.map(c => c.name));
@@ -204,7 +240,7 @@ export class SqliteAdapter implements IDatabase {
 
     // Sessions columns
     try {
-      const sessCols = this.db.prepare("PRAGMA table_info('remote_agent_sessions')").all() as {
+      const sessCols = this.pragmaAll("PRAGMA table_info('remote_agent_sessions')") as {
         name: string;
       }[];
       const sessColNames = new Set(sessCols.map(c => c.name));

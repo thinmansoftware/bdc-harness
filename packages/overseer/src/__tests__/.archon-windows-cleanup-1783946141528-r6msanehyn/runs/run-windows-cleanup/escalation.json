@@ -1,0 +1,13 @@
+{
+  "runId": "run-windows-cleanup",
+  "timestamp": "2026-07-13T12:35:41.528Z",
+  "decision": {
+    "decision": "escalate",
+    "reason": "test Windows file handle cleanup"
+  },
+  "context": {
+    "errorClass": "validator_rejected",
+    "woId": "WO-WINDOWS-01",
+    "nodeId": "gate"
+  }
+}
