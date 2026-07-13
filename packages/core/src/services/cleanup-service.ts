@@ -24,6 +24,7 @@ import type { RepoPath, BranchName } from '@archon/git';
 import { createLogger } from '@archon/paths';
 import type { IsolationEnvironmentRow } from '@archon/isolation';
 import { ConversationNotFoundError } from '../types';
+import { sweepTerminalWorkflowWorktrees } from './worktree-sweep';
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
 let cachedLog: ReturnType<typeof createLogger> | undefined;
@@ -392,6 +393,14 @@ export async function runScheduledCleanup(): Promise<CleanupReport> {
     const err = error as Error;
     getLog().error({ err: error }, 'session_cleanup_failed');
     report.errors.push({ id: 'session-cleanup', error: err.message });
+  }
+
+  try {
+    await sweepTerminalWorkflowWorktrees();
+  } catch (error) {
+    const err = error as Error;
+    getLog().error({ err: error }, 'terminal_worktree_sweep_failed');
+    report.errors.push({ id: 'terminal-worktree-sweep', error: err.message });
   }
 
   getLog().info(

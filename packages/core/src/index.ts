@@ -113,6 +113,10 @@ export {
   onConversationClosed,
   SESSION_RETENTION_DAYS,
 } from './services/cleanup-service';
+export {
+  sweepTerminalWorkflowWorktrees,
+  WORKTREE_SWEEP_GRACE_PERIOD_MS,
+} from './services/worktree-sweep';
 
 export { generateAndSetTitle } from './services/title-generator';
 

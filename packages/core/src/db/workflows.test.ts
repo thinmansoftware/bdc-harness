@@ -52,6 +52,7 @@ import {
   resumeWorkflowRun,
   failOrphanedRuns,
   listWorkflowRuns,
+  listWorkflowRunsWithWorkingPath,
   sumWorkflowTokensInWindow,
   deleteOldWorkflowRuns,
   deleteWorkflowRun,
@@ -953,6 +954,29 @@ describe('workflows database', () => {
       const result = await listWorkflowRuns();
 
       expect(result).toEqual([mockWorkflowRun]);
+    });
+  });
+
+  describe('listWorkflowRunsWithWorkingPath', () => {
+    test('lists only workflow runs that have a working path', async () => {
+      const completedRun = {
+        id: 'run-completed',
+        status: 'completed',
+        working_path: '/tmp/workspaces/owner/repo/worktrees/archon/thread-1',
+        completed_at: new Date('2026-07-12T00:00:00Z'),
+      };
+      mockQuery.mockResolvedValueOnce(createQueryResult([completedRun]));
+
+      const result = await listWorkflowRunsWithWorkingPath();
+
+      expect(result).toEqual([completedRun]);
+      expect(mockQuery).toHaveBeenCalledWith(
+        expect.stringContaining('SELECT id, status, working_path, completed_at'),
+        []
+      );
+      const [query] = mockQuery.mock.calls[0] as [string, unknown[]];
+      expect(query).toContain('FROM remote_agent_workflow_runs');
+      expect(query).toContain('WHERE working_path IS NOT NULL');
     });
   });
 

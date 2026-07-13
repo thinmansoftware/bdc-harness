@@ -2466,6 +2466,26 @@ export async function listWorkflowRuns(options?: {
   }
 }
 
+export async function listWorkflowRunsWithWorkingPath(): Promise<
+  Pick<WorkflowRun, 'id' | 'status' | 'working_path' | 'completed_at'>[]
+> {
+  try {
+    const result = await pool.query<
+      Pick<WorkflowRun, 'id' | 'status' | 'working_path' | 'completed_at'>
+    >(
+      `SELECT id, status, working_path, completed_at
+       FROM remote_agent_workflow_runs
+       WHERE working_path IS NOT NULL`,
+      []
+    );
+    return [...result.rows];
+  } catch (error) {
+    const err = error as Error;
+    getLog().error({ err }, 'db.workflow_runs_with_working_path_list_failed');
+    throw new Error(`Failed to list workflow runs with working paths: ${err.message}`);
+  }
+}
+
 /**
  * Sum metadata.total_tokens across runs whose activity timestamp falls inside
  * the given window (sinceMs .. now).

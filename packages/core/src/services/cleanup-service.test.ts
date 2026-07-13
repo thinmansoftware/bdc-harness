@@ -93,6 +93,11 @@ mock.module('../db/codebases', () => ({
   getCodebase: mockGetCodebase,
 }));
 
+const mockSweepTerminalWorkflowWorktrees = mock(() => Promise.resolve());
+mock.module('./worktree-sweep', () => ({
+  sweepTerminalWorkflowWorktrees: mockSweepTerminalWorkflowWorktrees,
+}));
+
 import {
   runScheduledCleanup,
   startCleanupScheduler,
@@ -114,6 +119,7 @@ describe('cleanup-service', () => {
     mockGetDefaultBranch.mockClear();
     mockIsBranchMerged.mockClear();
     mockGetLastCommitDate.mockClear();
+    mockSweepTerminalWorkflowWorktrees.mockClear();
     mockDestroy.mockClear();
     mockUpdateStatus.mockClear();
     mockGetById.mockClear();
@@ -473,6 +479,7 @@ describe('runScheduledCleanup', () => {
     expect(report.removed).toHaveLength(0);
     expect(report.skipped).toHaveLength(0);
     expect(report.errors).toHaveLength(0);
+    expect(mockSweepTerminalWorkflowWorktrees).toHaveBeenCalledTimes(1);
   });
 
   test('marks missing paths as destroyed and cleans up branch', async () => {
@@ -774,6 +781,18 @@ describe('runScheduledCleanup', () => {
     expect(report.errors).toContainEqual({
       id: 'session-cleanup',
       error: 'database locked',
+    });
+  });
+
+  test('records error when terminal worktree sweep fails', async () => {
+    mockListAllActiveWithCodebase.mockResolvedValueOnce([]);
+    mockSweepTerminalWorkflowWorktrees.mockRejectedValueOnce(new Error('sweep failed'));
+
+    const report = await runScheduledCleanup();
+
+    expect(report.errors).toContainEqual({
+      id: 'terminal-worktree-sweep',
+      error: 'sweep failed',
     });
   });
 });
