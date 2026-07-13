@@ -2,6 +2,7 @@ import { readdir, stat } from 'fs/promises';
 import { dirname, join, resolve } from 'path';
 import { getWorktreeBase, toRepoPath } from '@archon/git';
 import { getIsolationProvider } from '@archon/isolation';
+import type { DestroyResult } from '@archon/isolation';
 import { createLogger } from '@archon/paths';
 import { TERMINAL_WORKFLOW_STATUSES } from '@archon/workflows/schemas/workflow-run';
 import type { WorkflowRunStatus } from '@archon/workflows/schemas/workflow-run';
@@ -41,7 +42,7 @@ export interface WorktreeSweepOptions {
   workspacesRoot?: string;
   now?: Date;
   listRuns?: () => Promise<WorktreeSweepRun[]>;
-  destroyWorktree?: (worktreePath: string) => Promise<void>;
+  destroyWorktree?: (worktreePath: string) => Promise<DestroyResult>;
 }
 
 function defaultWorkspacesRoot(): string {
@@ -111,8 +112,13 @@ function completedAtAgeMs(completedAt: string | Date | null, now: Date): number 
   return now.getTime() - timestamp;
 }
 
-async function defaultDestroyWorktree(worktreePath: string): Promise<void> {
-  await getIsolationProvider().destroy(worktreePath, { force: true });
+async function defaultDestroyWorktree(worktreePath: string): Promise<DestroyResult> {
+  return getIsolationProvider().destroy(worktreePath, { force: true });
+}
+
+function formatDestroyFailure(result: DestroyResult): string {
+  const warnings = result.warnings.length > 0 ? `: ${result.warnings.join('; ')}` : '';
+  return `destroy did not remove worktree cleanly${warnings}`;
 }
 
 export async function sweepTerminalWorkflowWorktrees(
@@ -169,7 +175,16 @@ export async function sweepTerminalWorkflowWorktrees(
 
     try {
       const bytes = await directorySize(worktreeDir);
-      await destroyWorktree(worktreeDir);
+      const result = await destroyWorktree(worktreeDir);
+      if (!result.worktreeRemoved || !result.directoryClean) {
+        const error = formatDestroyFailure(result);
+        report.errors.push({ path: worktreeDir, runId: run.id, error });
+        getLog().error(
+          { worktreePath: worktreeDir, runId: run.id, result },
+          'worktree_sweep_remove_failed'
+        );
+        continue;
+      }
       report.removed.push(worktreeDir);
       report.bytesFreed += bytes;
       getLog().info(

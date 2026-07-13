@@ -5,21 +5,34 @@ import { join } from 'path';
 import { tmpdir } from 'os';
 import { createMockLogger } from '../test/mocks/logger';
 import type { WorktreeSweepRun } from './worktree-sweep';
+import type { DestroyResult } from '@archon/isolation';
 
 const mockLogger = createMockLogger();
 mock.module('@archon/paths', () => ({
   createLogger: mock(() => mockLogger),
 }));
 
+let mockWorktreeBase = '/unused/workspaces/owner/repo/worktrees';
 mock.module('@archon/git', () => ({
   getWorktreeBase: () => ({
-    base: '/unused/workspaces/owner/repo/worktrees',
+    base: mockWorktreeBase,
     layout: 'workspace-scoped',
   }),
   toRepoPath: (path: string) => path,
 }));
 
-const mockDestroy = mock(async () => undefined);
+function destroyResult(overrides: Partial<DestroyResult> = {}): DestroyResult {
+  return {
+    worktreeRemoved: true,
+    branchDeleted: null,
+    remoteBranchDeleted: null,
+    directoryClean: true,
+    warnings: [],
+    ...overrides,
+  };
+}
+
+const mockDestroy = mock(async () => destroyResult());
 mock.module('@archon/isolation', () => ({
   getIsolationProvider: () => ({
     destroy: mockDestroy,
@@ -50,6 +63,7 @@ describe('sweepTerminalWorkflowWorktrees', () => {
 
   beforeEach(async () => {
     workspacesRoot = await mkdtemp(join(tmpdir(), 'archon-worktree-sweep-'));
+    mockWorktreeBase = '/unused/workspaces/owner/repo/worktrees';
     mockDestroy.mockClear();
     mockListWorkflowRunsWithWorkingPath.mockClear();
     mockLogger.warn.mockClear();
@@ -73,6 +87,7 @@ describe('sweepTerminalWorkflowWorktrees', () => {
     ]);
     mockDestroy.mockImplementationOnce(async path => {
       await rm(path as string, { recursive: true, force: true });
+      return destroyResult();
     });
 
     const report = await sweepTerminalWorkflowWorktrees({
@@ -88,6 +103,54 @@ describe('sweepTerminalWorkflowWorktrees', () => {
     expect(mockLogger.info).toHaveBeenCalledWith(
       expect.objectContaining({ worktreePath, runId: 'run-old' }),
       'worktree_sweep_removed'
+    );
+  });
+
+  test('records a non-throwing destroy failure as an error without crediting bytes freed', async () => {
+    const worktreePath = await createWorktree(workspacesRoot, 'owner', 'repo', 'thread-stuck');
+    mockListWorkflowRunsWithWorkingPath.mockResolvedValueOnce([
+      {
+        id: 'run-stuck',
+        status: 'completed',
+        working_path: worktreePath,
+        completed_at: '2026-07-11T00:00:00Z',
+      },
+    ]);
+    mockDestroy.mockResolvedValueOnce(
+      destroyResult({
+        worktreeRemoved: false,
+        directoryClean: false,
+        warnings: ['worktree still registered in git'],
+      })
+    );
+
+    const report = await sweepTerminalWorkflowWorktrees({
+      workspacesRoot,
+      now: new Date('2026-07-13T00:00:00Z'),
+      gracePeriodMs: 24 * 60 * 60 * 1000,
+    });
+
+    expect(existsSync(worktreePath)).toBe(true);
+    expect(report.removed).toEqual([]);
+    expect(report.bytesFreed).toBe(0);
+    expect(report.errors).toEqual([
+      {
+        path: worktreePath,
+        runId: 'run-stuck',
+        error: 'destroy did not remove worktree cleanly: worktree still registered in git',
+      },
+    ]);
+    expect(mockLogger.info).not.toHaveBeenCalledWith(
+      expect.objectContaining({ worktreePath, runId: 'run-stuck' }),
+      'worktree_sweep_removed'
+    );
+    expect(mockLogger.error).toHaveBeenCalledWith(
+      expect.objectContaining({
+        worktreePath,
+        runId: 'run-stuck',
+        result: expect.objectContaining({ worktreeRemoved: false }),
+      }),
+      'worktree_sweep_remove_failed'
     );
   });
 
@@ -182,6 +245,7 @@ describe('sweepTerminalWorkflowWorktrees', () => {
     ]);
     mockDestroy.mockImplementationOnce(async path => {
       await rm(path as string, { recursive: true, force: true });
+      return destroyResult();
     });
 
     const report = await sweepTerminalWorkflowWorktrees({
@@ -202,5 +266,36 @@ describe('sweepTerminalWorkflowWorktrees', () => {
       }),
       'worktree_sweep_disk_report'
     );
+  });
+
+  test('uses the default workspace root derived from getWorktreeBase', async () => {
+    mockWorktreeBase = join(workspacesRoot, 'owner', 'repo', 'worktrees');
+    const worktreePath = await createWorktree(
+      workspacesRoot,
+      'owner',
+      'repo',
+      'thread-default-root'
+    );
+    mockListWorkflowRunsWithWorkingPath.mockResolvedValueOnce([
+      {
+        id: 'run-default-root',
+        status: 'completed',
+        working_path: worktreePath,
+        completed_at: '2026-07-11T00:00:00Z',
+      },
+    ]);
+    mockDestroy.mockImplementationOnce(async path => {
+      await rm(path as string, { recursive: true, force: true });
+      return destroyResult();
+    });
+
+    const report = await sweepTerminalWorkflowWorktrees({
+      now: new Date('2026-07-13T00:00:00Z'),
+      gracePeriodMs: 24 * 60 * 60 * 1000,
+    });
+
+    expect(mockDestroy).toHaveBeenCalledWith(worktreePath, { force: true });
+    expect(report.scanned).toBe(1);
+    expect(report.removed).toEqual([worktreePath]);
   });
 });
