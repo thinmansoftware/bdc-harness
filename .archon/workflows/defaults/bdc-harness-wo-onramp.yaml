@@ -226,12 +226,13 @@ nodes:
         echo "ERROR: BUSINESS_RISK_INVARIANT missing from normalize-spec output" >&2
         exit 1
       fi
-      for BAD in placeholder TODO unknown "BUSINESS_RISK_INVARIANT" "invariant here" "one sentence"; do
-        if printf '%s\n' "$BRI" | grep -qi "$BAD"; then
+      BRI_LOWER=$(printf '%s\n' "$BRI" | tr '[:upper:]' '[:lower:]')
+      case "$BRI_LOWER" in
+        placeholder|todo|unknown|business_risk_invariant|"invariant here"|"one sentence")
           echo "ERROR: BUSINESS_RISK_INVARIANT is a placeholder: $BRI" >&2
           exit 1
-        fi
-      done
+          ;;
+      esac
       if [ "${#BRI}" -lt 20 ]; then
         echo "ERROR: BUSINESS_RISK_INVARIANT too short (${#BRI} chars): $BRI" >&2
         exit 1
