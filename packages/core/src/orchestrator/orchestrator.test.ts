@@ -1043,6 +1043,7 @@ describe('orchestrator-agent handleMessage', () => {
         | Record<string, unknown>
         | undefined;
       expect(hintsArg?.workflowType).toBe('task');
+      expect(hintsArg?.workflowId).toBe('web-parent-conv');
       expect(hintsArg?.fromBranch).toBe('origin/release/ce');
     });
 

@@ -2237,9 +2237,16 @@ export function registerApiRoutes(
       workflows = discovery.workflows.map(ws => ws.workflow);
     } catch (error) {
       getLog().warn({ err: error, cwd, workflowName }, 'dispatch_precheck_discovery_failed');
-      // Branch format was already validated above; policy (worktree.enabled)
-      // could not be checked because discovery degraded. Preserve the validated
-      // hints so a valid override still reaches dispatch.
+      // An explicit branch override also requires proving the resolved workflow
+      // permits worktrees. If discovery is unavailable, that policy cannot be
+      // checked, so fail closed before creating a conversation. Preserve the
+      // existing graceful-degradation behavior for fires without an override.
+      if (isolationHints) {
+        return {
+          valid: false,
+          error: `Workflow discovery failed; cannot safely apply --from/--from-branch for "${workflowName}".`,
+        };
+      }
       return { valid: true, isolationHints };
     }
 

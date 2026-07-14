@@ -180,6 +180,10 @@ describe('dispatchBackgroundWorkflow (real implementation)', () => {
     mockUpdateConversation.mockClear();
     mockFreeze.mockClear();
     mockGetCodebase.mockClear();
+    mockResolve.mockImplementation((_input: unknown) => {
+      callOrder.push('resolve');
+      return Promise.resolve({ status: 'none' as const, cwd: '/workspace/worker' });
+    });
     // Restore default freeze behavior (a test overrides it to reject).
     mockFreeze.mockImplementation(() => {
       callOrder.push('freeze');
@@ -218,6 +222,67 @@ describe('dispatchBackgroundWorkflow (real implementation)', () => {
     expect(resolveArg.hints?.workflowType).toBe('thread');
     expect(resolveArg.hints?.fromBranch).toBeUndefined();
     expect(String(resolveArg.hints?.workflowId)).toMatch(/^web-worker-/);
+  });
+
+  test('two fires create distinct workers, branches, worktrees, and environments', async () => {
+    const environments: Array<{
+      id: string;
+      branch_name: string;
+      working_path: string;
+    }> = [];
+    mockResolve.mockImplementation((input: unknown) => {
+      callOrder.push('resolve');
+      const hints = (input as { hints?: Record<string, unknown> }).hints;
+      const workerId = String(hints?.workflowId);
+      const env = {
+        id: `env-${workerId}`,
+        codebase_id: 'cb-1',
+        workflow_type: 'task' as const,
+        workflow_id: workerId,
+        provider: 'worktree' as const,
+        working_path: `/worktrees/${workerId}`,
+        branch_name: `archon/${workerId}`,
+        status: 'active' as const,
+        created_at: new Date(),
+        created_by_platform: 'web',
+        metadata: {},
+      };
+      environments.push(env);
+      return Promise.resolve({
+        status: 'resolved' as const,
+        cwd: env.working_path,
+        env,
+        method: { type: 'created' as const },
+      });
+    });
+
+    const ctx = makeCtx({
+      isolationHints: {
+        workflowType: 'task',
+        workflowId: 'parent-platform-conv',
+        fromBranch: 'origin/release/ce',
+      },
+    });
+
+    await dispatchBackgroundWorkflow(ctx as never, makeWorkflow());
+    await dispatchBackgroundWorkflow(ctx as never, makeWorkflow());
+
+    expect(mockGetOrCreateConversation).toHaveBeenCalledTimes(2);
+    expect(mockResolve).toHaveBeenCalledTimes(2);
+    const workerIds = mockGetOrCreateConversation.mock.calls.map(call => String(call[1]));
+    const resolveHints = mockResolve.mock.calls.map(
+      call => (call[0] as { hints?: Record<string, unknown> }).hints
+    );
+    expect(new Set(workerIds).size).toBe(2);
+    expect(resolveHints.map(hints => hints?.workflowId)).toEqual(workerIds);
+    expect(resolveHints.map(hints => hints?.workflowType)).toEqual(['task', 'task']);
+    expect(resolveHints.map(hints => hints?.fromBranch)).toEqual([
+      'origin/release/ce',
+      'origin/release/ce',
+    ]);
+    expect(new Set(environments.map(env => env.id)).size).toBe(2);
+    expect(new Set(environments.map(env => env.branch_name)).size).toBe(2);
+    expect(new Set(environments.map(env => env.working_path)).size).toBe(2);
   });
 
   test('thread-typed hints are NOT promoted to task', async () => {
