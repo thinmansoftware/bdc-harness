@@ -1211,6 +1211,23 @@ export class WorktreeProvider implements IIsolationProvider {
         ? request.fromBranch
         : `origin/${baseBranch}`;
 
+    // Atomic web/API fires request a REMOTE start ref shaped "origin/<branch>".
+    // The pre-create sync only fetched the configured/default base, so the
+    // requested remote ref may be stale (or absent) locally. Fetch it now and
+    // pin the refreshed origin/<branch>. CLI callers pass local refs (no
+    // "origin/" prefix) and are left untouched -- no extra fetch, existing
+    // local-start-point semantics preserved.
+    if (
+      request.workflowType === 'task' &&
+      request.fromBranch &&
+      request.fromBranch.startsWith('origin/')
+    ) {
+      const remoteBranch = request.fromBranch.slice('origin/'.length);
+      await execFileAsync('git', ['-C', repoPath, 'fetch', 'origin', remoteBranch], {
+        timeout: GIT_OPERATION_TIMEOUT_MS,
+      });
+    }
+
     try {
       // Try to create with new branch
       await execFileAsync(

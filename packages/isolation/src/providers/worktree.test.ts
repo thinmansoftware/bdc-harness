@@ -294,6 +294,86 @@ describe('WorktreeProvider', () => {
       );
     });
 
+    test('fetches remote branch and pins origin/<branch> for a remote fromBranch', async () => {
+      const request: IsolationRequest = {
+        ...baseRequest,
+        workflowType: 'task',
+        identifier: 'ce-staging',
+        fromBranch: 'origin/release/ce',
+      };
+
+      await provider.create(request);
+
+      // The remote branch is fetched so origin/release/ce is refreshed...
+      expect(execSpy).toHaveBeenCalledWith(
+        'git',
+        ['-C', '/workspace/repo', 'fetch', 'origin', 'release/ce'],
+        expect.any(Object)
+      );
+
+      // ...and the refreshed origin/release/ce is the worktree-add start point.
+      expect(execSpy).toHaveBeenCalledWith(
+        'git',
+        expect.arrayContaining([
+          '-C',
+          '/workspace/repo',
+          'worktree',
+          'add',
+          expect.any(String),
+          '-b',
+          'archon/task-ce-staging',
+          'origin/release/ce',
+        ]),
+        expect.any(Object)
+      );
+
+      // Order: the fetch must precede the worktree add.
+      const fetchIdx = execSpy.mock.calls.findIndex((call: unknown[]) => {
+        const args = call[1] as string[];
+        return args.includes('fetch') && args.includes('release/ce');
+      });
+      const addIdx = execSpy.mock.calls.findIndex((call: unknown[]) => {
+        const args = call[1] as string[];
+        return (
+          args.includes('worktree') && args.includes('add') && args.includes('origin/release/ce')
+        );
+      });
+      expect(fetchIdx).toBeGreaterThanOrEqual(0);
+      expect(addIdx).toBeGreaterThan(fetchIdx);
+    });
+
+    test('does NOT fetch for a local (non-origin) fromBranch (CLI regression guard)', async () => {
+      const request: IsolationRequest = {
+        ...baseRequest,
+        workflowType: 'task',
+        identifier: 'local-start',
+        fromBranch: 'feature/extract-adapters',
+      };
+
+      await provider.create(request);
+
+      // No `git fetch origin feature/extract-adapters` -- local-ref semantics unchanged.
+      const fetchCalls = execSpy.mock.calls.filter((call: unknown[]) => {
+        const args = call[1] as string[];
+        return args.includes('fetch') && args.includes('feature/extract-adapters');
+      });
+      expect(fetchCalls).toHaveLength(0);
+
+      // Start point is the local ref, used directly.
+      expect(execSpy).toHaveBeenCalledWith(
+        'git',
+        expect.arrayContaining([
+          'worktree',
+          'add',
+          expect.any(String),
+          '-b',
+          'archon/task-local-start',
+          'feature/extract-adapters',
+        ]),
+        expect.any(Object)
+      );
+    });
+
     test('throws when branch already exists and fromBranch is specified', async () => {
       const alreadyExistsError = new Error('fatal: branch already exists') as Error & {
         stderr: string;

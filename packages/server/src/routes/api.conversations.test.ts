@@ -33,8 +33,9 @@ const mockSoftDeleteConversation = mock(async (_id: string) => {});
 const mockUpdateConversationTitle = mock(async (_id: string, _title: string) => {});
 
 const mockGenerateAndSetTitle = mock(async () => {});
+const mockHandleMessage = mock(async (..._args: unknown[]) => {});
 mock.module('@archon/core', () => ({
-  handleMessage: mock(async () => {}),
+  handleMessage: mockHandleMessage,
   getDatabaseType: () => 'sqlite',
   loadConfig: mock(async () => ({})),
   getWorkflowFolderSearchPaths: mock(() => ['.archon/workflows']),
@@ -70,21 +71,22 @@ mock.module('@archon/core', () => ({
 
 mockAllWorkflowModules();
 
+const mockGetOrCreateConversation = mock(async () => ({
+  id: 'internal-uuid-123',
+  platform_conversation_id: 'web-test-abc',
+  title: null,
+  created_at: new Date().toISOString(),
+  updated_at: new Date().toISOString(),
+  platform_type: 'web',
+  deleted_at: null,
+  codebase_id: null,
+}));
 mock.module('@archon/core/db/conversations', () => ({
   findConversationByPlatformId: mockFindConversationByPlatformId,
   softDeleteConversation: mockSoftDeleteConversation,
   updateConversationTitle: mockUpdateConversationTitle,
   listConversations: mock(async () => []),
-  getOrCreateConversation: mock(async () => ({
-    id: 'internal-uuid-123',
-    platform_conversation_id: 'web-test-abc',
-    title: null,
-    created_at: new Date().toISOString(),
-    updated_at: new Date().toISOString(),
-    platform_type: 'web',
-    deleted_at: null,
-    codebase_id: null,
-  })),
+  getOrCreateConversation: mockGetOrCreateConversation,
 }));
 
 mock.module('@archon/core/db/isolation-environments', () => ({}));
@@ -489,6 +491,167 @@ describe('POST /api/conversations with message (atomic create+send)', () => {
         body: JSON.stringify({ message: 'plain chat message' }),
       });
       expect(response.status).toBe(200);
+    });
+  });
+
+  // WO-HARNESS-ATOMIC-FIRE-FROM-BRANCH-01: atomic --from origin/<branch> override.
+  describe('--from branch override (atomic fire)', () => {
+    const makeWorkflow = (name: string, extra?: Partial<WorkflowDefinition>): WorkflowDefinition =>
+      ({
+        name,
+        description: 'test',
+        nodes: [{ id: 'n', prompt: 'p' }],
+        ...extra,
+      }) as WorkflowDefinition;
+
+    const resolvingDiscovery = (wf: WorkflowDefinition) => {
+      mockDiscoverWorkflowsWithConfig.mockImplementationOnce(async () => ({
+        workflows: [{ workflow: wf, source: 'project' as const }],
+        errors: [],
+      }));
+    };
+
+    const post = async (message: string, lock?: ConversationLockManager) => {
+      const app = new OpenAPIHono({ defaultHook: validationErrorHook });
+      registerApiRoutes(app, mockWebAdapter, lock ?? mockLockManager);
+      return app.request('/api/conversations', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ message }),
+      });
+    };
+
+    test('valid --from origin/release/ce dispatches task hints to handleMessage', async () => {
+      resolvingDiscovery(makeWorkflow('bdc-feature-development'));
+      mockHandleMessage.mockClear();
+
+      const response = await post(
+        '/workflow run bdc-feature-development WO_ID=WO-X --from origin/release/ce'
+      );
+      expect(response.status).toBe(200);
+      const body = (await response.json()) as { dispatched: boolean };
+      expect(body.dispatched).toBe(true);
+
+      const ctxArg = mockHandleMessage.mock.calls.at(-1)?.[3] as
+        | { isolationHints?: Record<string, unknown> }
+        | undefined;
+      expect(ctxArg?.isolationHints?.workflowType).toBe('task');
+      expect(ctxArg?.isolationHints?.fromBranch).toBe('origin/release/ce');
+      // workflowId keyed to the conversation at this layer (worker id assigned later).
+      expect(ctxArg?.isolationHints?.workflowId).toBe('web-test-abc');
+    });
+
+    test('alias --from-branch behaves identically', async () => {
+      resolvingDiscovery(makeWorkflow('bdc-feature-development'));
+      mockHandleMessage.mockClear();
+
+      const response = await post(
+        '/workflow run bdc-feature-development WO_ID=WO-X --from-branch origin/release/ce'
+      );
+      expect(response.status).toBe(200);
+      const ctxArg = mockHandleMessage.mock.calls.at(-1)?.[3] as
+        | { isolationHints?: Record<string, unknown> }
+        | undefined;
+      expect(ctxArg?.isolationHints?.workflowType).toBe('task');
+      expect(ctxArg?.isolationHints?.fromBranch).toBe('origin/release/ce');
+    });
+
+    test('no --from preserves thread isolation (regression)', async () => {
+      resolvingDiscovery(makeWorkflow('bdc-feature-development'));
+      mockHandleMessage.mockClear();
+
+      await post('/workflow run bdc-feature-development WO_ID=WO-X');
+      const ctxArg = mockHandleMessage.mock.calls.at(-1)?.[3] as
+        | { isolationHints?: Record<string, unknown> }
+        | undefined;
+      expect(ctxArg?.isolationHints?.workflowType).toBe('thread');
+      expect(ctxArg?.isolationHints?.fromBranch).toBeUndefined();
+    });
+
+    test('non-origin value (bare release/ce) rejected 400 before conversation creation', async () => {
+      mockGetOrCreateConversation.mockClear();
+      mockAddMessage.mockClear();
+      const acquireLock = mock(async (_c: string, fn: () => Promise<void>) => {
+        await fn();
+        return { status: 'started' as const };
+      });
+
+      const response = await post(
+        '/workflow run bdc-feature-development WO_ID=WO-X --from release/ce',
+        { acquireLock } as unknown as ConversationLockManager
+      );
+      expect(response.status).toBe(400);
+      const body = (await response.json()) as { accepted: boolean; dispatched: boolean };
+      expect(body.accepted).toBe(false);
+      expect(body.dispatched).toBe(false);
+      expect(mockGetOrCreateConversation.mock.calls.length).toBe(0);
+      expect(mockAddMessage.mock.calls.length).toBe(0);
+      expect(acquireLock.mock.calls.length).toBe(0);
+    });
+
+    test('missing --from value rejected 400', async () => {
+      const response = await post('/workflow run bdc-feature-development WO_ID=WO-X --from');
+      expect(response.status).toBe(400);
+    });
+
+    test('duplicate --from flags rejected 400', async () => {
+      const response = await post(
+        '/workflow run bdc-feature-development --from origin/release/ce --from origin/main'
+      );
+      expect(response.status).toBe(400);
+    });
+
+    test('mixed --from/--from-branch flags rejected 400', async () => {
+      const response = await post(
+        '/workflow run bdc-feature-development --from origin/release/ce --from-branch origin/main'
+      );
+      expect(response.status).toBe(400);
+    });
+
+    test('option-like value rejected 400', async () => {
+      const response = await post(
+        '/workflow run bdc-feature-development --from=-origin/release/ce'
+      );
+      expect(response.status).toBe(400);
+    });
+
+    test('invalid git ref (dot-dot) rejected 400', async () => {
+      const response = await post('/workflow run bdc-feature-development --from origin/foo..bar');
+      expect(response.status).toBe(400);
+    });
+
+    test('worktree.enabled:false workflow with valid --from rejected 400, no conversation', async () => {
+      resolvingDiscovery(makeWorkflow('read-only-triage', { worktree: { enabled: false } }));
+      mockGetOrCreateConversation.mockClear();
+      mockAddMessage.mockClear();
+
+      const response = await post('/workflow run read-only-triage --from origin/release/ce');
+      expect(response.status).toBe(400);
+      const body = (await response.json()) as { accepted: boolean; dispatched: boolean };
+      expect(body.accepted).toBe(false);
+      expect(body.dispatched).toBe(false);
+      expect(mockGetOrCreateConversation.mock.calls.length).toBe(0);
+      expect(mockAddMessage.mock.calls.length).toBe(0);
+    });
+
+    test('two valid fires get independent conversation-keyed hints (idempotency)', async () => {
+      resolvingDiscovery(makeWorkflow('bdc-feature-development'));
+      mockHandleMessage.mockClear();
+      await post('/workflow run bdc-feature-development WO_ID=WO-A --from origin/release/ce');
+      const first = mockHandleMessage.mock.calls.at(-1)?.[3] as {
+        isolationHints?: Record<string, unknown>;
+      };
+
+      resolvingDiscovery(makeWorkflow('bdc-feature-development'));
+      await post('/workflow run bdc-feature-development WO_ID=WO-B --from origin/release/ce');
+      const second = mockHandleMessage.mock.calls.at(-1)?.[3] as {
+        isolationHints?: Record<string, unknown>;
+      };
+
+      expect(first?.isolationHints?.fromBranch).toBe('origin/release/ce');
+      expect(second?.isolationHints?.fromBranch).toBe('origin/release/ce');
+      expect(first?.isolationHints?.workflowType).toBe('task');
+      expect(second?.isolationHints?.workflowType).toBe('task');
     });
   });
 });
