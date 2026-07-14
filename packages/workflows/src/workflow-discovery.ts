@@ -128,7 +128,13 @@ async function loadWorkflowsFromDir(dirPath: string, depth = 0): Promise<DirLoad
           }
           const subResult = await loadWorkflowsFromDir(entryPath, depth + 1);
           for (const [filename, workflow] of subResult.workflows) {
-            workflows.set(filename, workflow);
+            // A shallower project workflow is the explicit override surface.
+            // Do not let a recursively discovered defaults/ copy replace a
+            // same-named file from this directory. If the directory is visited
+            // first, the later root file still replaces it below.
+            if (!workflows.has(filename)) {
+              workflows.set(filename, workflow);
+            }
           }
           errors.push(...subResult.errors);
         } else if (entry.endsWith('.yaml') || entry.endsWith('.yml')) {
