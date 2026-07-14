@@ -75,6 +75,8 @@ async function maybeWarnLegacyHomePath(): Promise<void> {
 
 interface DirLoadResult {
   workflows: Map<string, WorkflowDefinition>;
+  /** Valid workflows parsed directly from this directory, excluding descendants. */
+  directWorkflows: Map<string, WorkflowDefinition>;
   errors: WorkflowLoadError[];
 }
 
@@ -105,6 +107,7 @@ const RETIRED_DIR_NAME = 'retired';
  */
 async function loadWorkflowsFromDir(dirPath: string, depth = 0): Promise<DirLoadResult> {
   const workflows = new Map<string, WorkflowDefinition>();
+  const directWorkflows = new Map<string, WorkflowDefinition>();
   const errors: WorkflowLoadError[] = [];
 
   try {
@@ -137,6 +140,7 @@ async function loadWorkflowsFromDir(dirPath: string, depth = 0): Promise<DirLoad
 
           if (result.workflow) {
             workflows.set(entry, result.workflow);
+            directWorkflows.set(entry, result.workflow);
             getLog().debug({ workflowName: result.workflow.name, dirPath }, 'workflow_loaded');
           } else {
             recordLoaderError(result.error, entryPath);
@@ -173,7 +177,7 @@ async function loadWorkflowsFromDir(dirPath: string, depth = 0): Promise<DirLoad
     }
   }
 
-  return { workflows, errors };
+  return { workflows, directWorkflows, errors };
 }
 
 /**
@@ -185,6 +189,7 @@ async function loadWorkflowsFromDir(dirPath: string, depth = 0): Promise<DirLoad
  */
 function loadBundledWorkflows(): DirLoadResult {
   const workflows = new Map<string, WorkflowDefinition>();
+  const directWorkflows = new Map<string, WorkflowDefinition>();
   const errors: WorkflowLoadError[] = [];
 
   for (const [name, content] of Object.entries(BUNDLED_WORKFLOWS)) {
@@ -192,6 +197,7 @@ function loadBundledWorkflows(): DirLoadResult {
     const result = parseWorkflow(content, filename);
     if (result.workflow) {
       workflows.set(filename, result.workflow);
+      directWorkflows.set(filename, result.workflow);
       getLog().debug({ workflowName: result.workflow.name }, 'bundled_workflow_loaded');
     } else {
       // Bundled workflows should ALWAYS be valid - this indicates a build-time error
@@ -204,7 +210,7 @@ function loadBundledWorkflows(): DirLoadResult {
     }
   }
 
-  return { workflows, errors };
+  return { workflows, directWorkflows, errors };
 }
 
 /**
@@ -309,12 +315,22 @@ export async function discoverWorkflows(
     await access(workflowPath);
     const repoResult = await loadWorkflowsFromDir(workflowPath);
 
+    // Recursive discovery intentionally preserves the existing sibling-directory
+    // collision behavior. Overlay the already-parsed root-level workflows so the
+    // documented project override surface wins over a same-named defaults/ copy
+    // without parsing files twice or duplicating parser warning side effects.
+    for (const [filename, workflow] of repoResult.directWorkflows) {
+      repoResult.workflows.set(filename, workflow);
+    }
+
     // Repo workflows override bundled AND home scope by exact filename match.
     // Preserve 'bundled' source for workflows loaded from the defaults/ subdirectory
     // that were already registered as bundled in step 1.
     for (const [filename, workflow] of repoResult.workflows) {
       const existing = workflowsByFile.get(filename);
-      if (existing?.source === 'bundled') {
+      if (repoResult.directWorkflows.has(filename)) {
+        workflowsByFile.set(filename, { workflow, source: 'project' });
+      } else if (existing?.source === 'bundled') {
         // This file was already loaded as a bundled default -- the repo's defaults/
         // subdirectory is re-discovering it. Keep the bundled source label.
         getLog().debug({ filename }, 'repo_default_preserves_bundled_source');
