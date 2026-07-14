@@ -201,7 +201,6 @@ nodes:
     provider: claude
     model: sonnet
     persona: captain-ci-validator
-    agent: war-council-validator
     depends_on: [implement]
     trigger_rule: all_done
     task_class: medium_work
@@ -236,7 +235,6 @@ nodes:
     provider: claude
     model: sonnet
     persona: captain-ci-validator
-    agent: war-council-validator
     depends_on: [war-council-validator]
     trigger_rule: all_done
     load_bearing: true
