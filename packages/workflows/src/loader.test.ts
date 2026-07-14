@@ -591,6 +591,28 @@ nodes:
       expect(result.workflows[0]?.workflow.name).toBe('hot-reloaded-onramp');
       expect(result.workflows[0]?.workflow.description).toBe('Project-scoped hot reload');
     });
+
+    it('should preserve later sibling-directory precedence for duplicate filenames', async () => {
+      const workflowDir = join(testDir, '.archon', 'workflows');
+      const firstDir = join(workflowDir, 'a');
+      const secondDir = join(workflowDir, 'b');
+      await mkdir(firstDir, { recursive: true });
+      await mkdir(secondDir, { recursive: true });
+
+      await writeFile(
+        join(firstDir, 'same.yaml'),
+        `name: sibling-a\ndescription: First sibling\nnodes:\n  - id: a\n    command: a\n`
+      );
+      await writeFile(
+        join(secondDir, 'same.yaml'),
+        `name: sibling-b\ndescription: Later sibling\nnodes:\n  - id: b\n    command: b\n`
+      );
+
+      const result = await discoverWorkflows(testDir, { loadDefaults: false });
+
+      expect(result.workflows).toHaveLength(1);
+      expect(result.workflows[0]?.workflow.name).toBe('sibling-b');
+    });
   });
 
   describe('command name validation (Issue #129)', () => {
@@ -1196,6 +1218,28 @@ nodes:
       );
       expect(assistWorkflow).toBeDefined();
       expect(assistWorkflow?.name).toBe('custom-assist-override');
+    });
+
+    it('should classify a root override as project when a nested bundled copy exists', async () => {
+      isBinaryBuildSpy.mockReturnValue(true);
+
+      const repoWorkflowDir = join(testDir, '.archon', 'workflows');
+      const nestedDefaultsDir = join(repoWorkflowDir, 'defaults');
+      await mkdir(nestedDefaultsDir, { recursive: true });
+      await writeFile(
+        join(repoWorkflowDir, 'archon-assist.yaml'),
+        `name: root-override\ndescription: Root project override\nnodes:\n  - id: root\n    command: root\n`
+      );
+      await writeFile(
+        join(nestedDefaultsDir, 'archon-assist.yaml'),
+        `name: nested-default\ndescription: Nested bundled copy\nnodes:\n  - id: nested\n    command: nested\n`
+      );
+
+      const result = await discoverWorkflows(testDir, { loadDefaults: true });
+      const override = result.workflows.find(ws => ws.workflow.name === 'root-override');
+
+      expect(override).toBeDefined();
+      expect(override?.source).toBe('project');
     });
 
     it('should combine bundled workflows with repo workflows', async () => {
