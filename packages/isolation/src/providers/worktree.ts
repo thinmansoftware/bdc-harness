@@ -1213,9 +1213,13 @@ export class WorktreeProvider implements IIsolationProvider {
 
     // Atomic web/API fires request a REMOTE start ref shaped "origin/<branch>".
     // The pre-create sync only fetched the configured/default base, so the
-    // requested remote ref may be stale (or absent) locally. Fetch it now and
-    // pin the refreshed origin/<branch>. CLI callers pass local refs (no
-    // "origin/" prefix) and are left untouched -- no extra fetch, existing
+    // requested remote ref may be stale (or absent) locally. Fetch it now with
+    // an explicit destination refspec so refs/remotes/origin/<branch> is
+    // updated in place (a bare `git fetch origin <branch>` only writes
+    // FETCH_HEAD and can leave the remote-tracking ref stale depending on the
+    // remote's configured fetch refspec, so the following worktree add would
+    // pin a stale origin/<branch>). CLI callers pass local refs (no "origin/"
+    // prefix) and are left untouched -- no extra fetch, existing
     // local-start-point semantics preserved.
     if (
       request.workflowType === 'task' &&
@@ -1223,9 +1227,19 @@ export class WorktreeProvider implements IIsolationProvider {
       request.fromBranch.startsWith('origin/')
     ) {
       const remoteBranch = request.fromBranch.slice('origin/'.length);
-      await execFileAsync('git', ['-C', repoPath, 'fetch', 'origin', remoteBranch], {
-        timeout: GIT_OPERATION_TIMEOUT_MS,
-      });
+      await execFileAsync(
+        'git',
+        [
+          '-C',
+          repoPath,
+          'fetch',
+          'origin',
+          `+refs/heads/${remoteBranch}:refs/remotes/origin/${remoteBranch}`,
+        ],
+        {
+          timeout: GIT_OPERATION_TIMEOUT_MS,
+        }
+      );
     }
 
     try {

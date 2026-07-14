@@ -307,7 +307,13 @@ describe('WorktreeProvider', () => {
       // The remote branch is fetched so origin/release/ce is refreshed...
       expect(execSpy).toHaveBeenCalledWith(
         'git',
-        ['-C', '/workspace/repo', 'fetch', 'origin', 'release/ce'],
+        [
+          '-C',
+          '/workspace/repo',
+          'fetch',
+          'origin',
+          '+refs/heads/release/ce:refs/remotes/origin/release/ce',
+        ],
         expect.any(Object)
       );
 
@@ -330,7 +336,10 @@ describe('WorktreeProvider', () => {
       // Order: the fetch must precede the worktree add.
       const fetchIdx = execSpy.mock.calls.findIndex((call: unknown[]) => {
         const args = call[1] as string[];
-        return args.includes('fetch') && args.includes('release/ce');
+        return (
+          args.includes('fetch') &&
+          args.includes('+refs/heads/release/ce:refs/remotes/origin/release/ce')
+        );
       });
       const addIdx = execSpy.mock.calls.findIndex((call: unknown[]) => {
         const args = call[1] as string[];
