@@ -227,12 +227,11 @@ nodes:
         exit 1
       fi
       BRI_LOWER=$(printf '%s\n' "$BRI" | tr '[:upper:]' '[:lower:]')
-      case "$BRI_LOWER" in
-        placeholder|todo|unknown|business_risk_invariant|"invariant here"|"one sentence")
-          echo "ERROR: BUSINESS_RISK_INVARIANT is a placeholder: $BRI" >&2
-          exit 1
-          ;;
-      esac
+      if [ "$BRI_LOWER" = "unknown" ] || \
+         printf '%s\n' "$BRI_LOWER" | grep -qE 'placeholder|todo|business_risk_invariant|invariant here|one sentence'; then
+        echo "ERROR: BUSINESS_RISK_INVARIANT is a placeholder: $BRI" >&2
+        exit 1
+      fi
       if [ "${#BRI}" -lt 20 ]; then
         echo "ERROR: BUSINESS_RISK_INVARIANT too short (${#BRI} chars): $BRI" >&2
         exit 1
