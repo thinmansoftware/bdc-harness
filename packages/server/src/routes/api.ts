@@ -48,6 +48,7 @@ import {
 } from '@archon/paths';
 import { discoverWorkflowsWithConfig } from '@archon/workflows/workflow-discovery';
 import { resolveWorkflowName } from '@archon/workflows/router';
+import { parseWorkflowRunBranchOverride } from './workflow-run-branch-override';
 import type { WorkflowDefinition } from '@archon/workflows/schemas/workflow';
 import { executeWorkflow } from '@archon/workflows/executor';
 import { checkCodexDispatchGate } from '@archon/providers/auth-refresh/dispatch-gate';
@@ -2198,10 +2199,23 @@ export function registerApiRoutes(
   async function validateWorkflowRunTarget(
     message: string,
     codebaseId?: string | null
-  ): Promise<{ valid: true } | { valid: false; error: string; httpStatus?: number }> {
+  ): Promise<
+    | { valid: true; isolationHints?: HandleMessageContext['isolationHints'] }
+    | { valid: false; error: string; httpStatus?: number }
+  > {
     const match = WORKFLOW_RUN_COMMAND.exec(message.trim());
     if (!match) return { valid: true };
     const workflowName = match[1];
+
+    // Parse and validate the optional atomic `--from origin/<branch>` override
+    // BEFORE resolving the workflow so malformed/unsafe input fails closed even
+    // when workflow discovery later degrades. The single validated hints object
+    // is threaded through to dispatch (never re-parsed downstream).
+    const branchOverride = await parseWorkflowRunBranchOverride(message);
+    if (branchOverride.kind === 'error') {
+      return { valid: false, error: branchOverride.error };
+    }
+    const isolationHints = branchOverride.kind === 'ok' ? branchOverride.hints : undefined;
 
     // Mirror the command handler's cwd resolution (handleWorkflowCommand):
     // codebase default_cwd when known, else the workspaces root. A fresh
@@ -2223,7 +2237,10 @@ export function registerApiRoutes(
       workflows = discovery.workflows.map(ws => ws.workflow);
     } catch (error) {
       getLog().warn({ err: error, cwd, workflowName }, 'dispatch_precheck_discovery_failed');
-      return { valid: true };
+      // Branch format was already validated above; policy (worktree.enabled)
+      // could not be checked because discovery degraded. Preserve the validated
+      // hints so a valid override still reaches dispatch.
+      return { valid: true, isolationHints };
     }
 
     let workflow: WorkflowDefinition | undefined;
@@ -2240,33 +2257,55 @@ export function registerApiRoutes(
         error: `Workflow "${workflowName}" not found. Use GET /api/workflows to list available workflows.`,
       };
     }
+    // A branch override requests task-worktree isolation. A workflow that pins
+    // `worktree.enabled: false` would run in the live checkout, so honoring the
+    // override is impossible -- reject before anything is created.
+    if (isolationHints && workflow.worktree?.enabled === false) {
+      getLog().warn(
+        { workflowName },
+        'dispatch_precheck_branch_override_rejected_worktree_disabled'
+      );
+      return {
+        valid: false,
+        error: `Workflow "${workflowName}" runs in the live checkout (worktree.enabled: false); --from/--from-branch cannot be applied.`,
+      };
+    }
     if (workflowHasCodexNode(workflow)) {
       getLog().info({ workflowName }, 'codex_dispatch_gate_consult');
       try {
         const gate = await checkCodexDispatchGate();
-        if (gate.fresh) return { valid: true };
+        if (gate.fresh) return { valid: true, isolationHints };
         getLog().warn({ workflowName, reason: gate.reason }, 'codex_dispatch_gate_refused');
       } catch (error) {
         getLog().warn({ err: error, workflowName }, 'codex_dispatch_gate_failed');
       }
       return { valid: false, error: 'codex_auth_stale', httpStatus: 503 };
     }
-    return { valid: true };
+    return { valid: true, isolationHints };
   }
 
   async function dispatchToOrchestrator(
     conversationId: string,
     message: string,
     extraContext?: Omit<HandleMessageContext, 'isolationHints'>,
-    filesToCleanup?: { files: AttachedFile[]; uploadDir: string }
+    filesToCleanup?: { files: AttachedFile[]; uploadDir: string },
+    isolationHintsOverride?: HandleMessageContext['isolationHints']
   ): Promise<{ accepted: boolean; status: string }> {
+    // Default: thread isolation keyed to this conversation. When an atomic fire
+    // supplied a validated `--from origin/<branch>` override, use its task hints
+    // instead, always keying workflowId to this conversation (the worker gets its
+    // own unique id later in dispatchBackgroundWorkflow).
+    const isolationHints: NonNullable<HandleMessageContext['isolationHints']> =
+      isolationHintsOverride
+        ? { ...isolationHintsOverride, workflowId: conversationId }
+        : { workflowType: 'thread', workflowId: conversationId };
     const result = await lockManager.acquireLock(conversationId, async () => {
       // Emit lock:true at handler start so the UI knows processing has begun.
       // Fire-and-forget -- if no SSE stream is connected yet, the event is buffered.
       webAdapter.emitLockEvent(conversationId, true);
       try {
         await handleMessage(webAdapter, conversationId, message, {
-          isolationHints: { workflowType: 'thread', workflowId: conversationId },
+          isolationHints,
           ...extraContext,
         });
       } catch (error) {
@@ -2616,13 +2655,17 @@ export function registerApiRoutes(
         }
       }
 
-      // Reject unknown workflow names BEFORE creating the conversation or
-      // reporting dispatch success -- see validateWorkflowRunTarget.
+      // Reject unknown workflow names and malformed/unsafe --from overrides
+      // BEFORE creating the conversation or reporting dispatch success -- see
+      // validateWorkflowRunTarget. The single validated isolation-hints object is
+      // captured here and threaded into dispatch (never re-parsed).
+      let dispatchIsolationHints: HandleMessageContext['isolationHints'];
       if (message) {
         const check = await validateWorkflowRunTarget(message, codebaseId);
         if (!check.valid) {
           return c.json({ accepted: false, dispatched: false, error: check.error }, 400);
         }
+        dispatchIsolationHints = check.isolationHints;
       }
 
       const conversationId = `web-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
@@ -2658,7 +2701,13 @@ export function registerApiRoutes(
           );
         }
 
-        const result = await dispatchToOrchestrator(conversation.platform_conversation_id, message);
+        const result = await dispatchToOrchestrator(
+          conversation.platform_conversation_id,
+          message,
+          undefined,
+          undefined,
+          dispatchIsolationHints
+        );
 
         return c.json({
           conversationId: conversation.platform_conversation_id,

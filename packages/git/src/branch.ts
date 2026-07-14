@@ -78,6 +78,39 @@ export async function getDefaultBranch(repoPath: RepoPath): Promise<BranchName> 
 }
 
 /**
+ * Validate a branch name using git's own ref-format rules.
+ *
+ * Wraps `git check-ref-format --branch <name>`, which exits 0 for a
+ * syntactically valid branch name and non-zero for an invalid one (e.g. names
+ * containing `..`, `~`, `^`, `:`, spaces, control chars, a trailing `.lock`, or
+ * a leading `-`). Returns a boolean rather than throwing for invalid input so
+ * callers can fail closed on user-supplied refs without try/catch noise.
+ *
+ * Throws ONLY for unexpected exec failures (e.g. the `git` binary is missing),
+ * matching this module's fail-fast-but-classify convention -- a missing git is
+ * an environment fault, not an invalid ref.
+ */
+export async function isValidBranchName(name: string): Promise<boolean> {
+  try {
+    await execFileAsync('git', ['check-ref-format', '--branch', name], { timeout: 10000 });
+    return true;
+  } catch (error) {
+    const err = error as Error & { code?: number | string; stderr?: string };
+    // git check-ref-format exits with a non-zero numeric status for a
+    // syntactically invalid branch name -- the expected "reject" path.
+    if (typeof err.code === 'number') return false;
+    // ENOENT => git binary not found. Surface it; validation cannot proceed.
+    if (err.code === 'ENOENT') {
+      getLog().error({ name, err }, 'branch.check_ref_format_git_missing');
+      throw new Error(`Cannot validate branch name (git unavailable): ${err.message}`);
+    }
+    // Unknown error shape -- fail closed (treat as invalid) but log for triage.
+    getLog().warn({ name, err, stderr: err.stderr }, 'branch.check_ref_format_unexpected');
+    return false;
+  }
+}
+
+/**
  * Checkout a branch (creating it if it doesn't exist)
  */
 export async function checkout(repoPath: RepoPath, branchName: BranchName): Promise<void> {

@@ -2051,4 +2051,55 @@ branch refs/heads/feature/auth
       }
     });
   });
+
+  describe('isValidBranchName', () => {
+    // Uses real `git check-ref-format` for the accept/reject cases (git is
+    // available in the build image). The git-missing path is exercised via a spy.
+    test('accepts a simple branch name', async () => {
+      expect(await git.isValidBranchName('main')).toBe(true);
+    });
+
+    test('accepts a multi-segment branch name', async () => {
+      expect(await git.isValidBranchName('release/ce')).toBe(true);
+      expect(await git.isValidBranchName('feature/nested/name')).toBe(true);
+    });
+
+    test('rejects dot-dot in name', async () => {
+      expect(await git.isValidBranchName('foo..bar')).toBe(false);
+    });
+
+    test('rejects trailing .lock', async () => {
+      expect(await git.isValidBranchName('foo.lock')).toBe(false);
+    });
+
+    test('rejects a leading dash', async () => {
+      expect(await git.isValidBranchName('-foo')).toBe(false);
+    });
+
+    test('rejects a name with a space', async () => {
+      expect(await git.isValidBranchName('foo bar')).toBe(false);
+    });
+
+    test('rejects an empty name', async () => {
+      expect(await git.isValidBranchName('')).toBe(false);
+    });
+
+    test('throws when git binary is unavailable (ENOENT)', async () => {
+      const execSpy = spyOn(git, 'execFileAsync');
+      execSpy.mockRejectedValueOnce(
+        Object.assign(new Error('spawn git ENOENT'), { code: 'ENOENT' })
+      );
+      await expect(git.isValidBranchName('main')).rejects.toThrow(/git unavailable/);
+      execSpy.mockRestore();
+    });
+
+    test('returns false (not throw) on a non-zero numeric exit code', async () => {
+      const execSpy = spyOn(git, 'execFileAsync');
+      execSpy.mockRejectedValueOnce(
+        Object.assign(new Error('invalid'), { code: 128, stderr: 'fatal: not a valid branch name' })
+      );
+      expect(await git.isValidBranchName('whatever')).toBe(false);
+      execSpy.mockRestore();
+    });
+  });
 });
