@@ -1,0 +1,486 @@
+name: bdc-harness-overseer-m31-substrate-01
+description: |
+  Use when: Executing WO-HARNESS-OVERSEER-M31-SUBSTRATE-01 (M-42 Slice 2) in
+  bluedevilcollectibles/bdc-harness -- the immutable M-31 evidence, proposal, and
+  single-use permit substrate.
+  Input: WO_ID is baked in at root; no user message required at fire time.
+  Does: Reads the WO spec, plans a surgical implementation, implements + self-verifies,
+  runs war-council validation, enforces the M-31 business-risk invariant (load_bearing),
+  commits, pushes, opens a PR, builds a Captain CI manifest, and flips Notion to Review.
+  NOT for: Deploys, activation, provider mutation, doctrine-only edits, or other WOs.
+
+policyFile: harness/policies/agent-behavior.md
+
+# Main Claude build lane: model: sonnet is correct -- this IS the Claude build lane.
+# All build + review nodes are intentionally Claude. Do not downgrade to a cheaper model.
+provider: claude
+model: sonnet
+
+inputs:
+  WO_ID:
+    default: "WO-HARNESS-OVERSEER-M31-SUBSTRATE-01"
+
+nodes:
+  # Pre-flight: fail closed if the container lacks GitHub push auth (WO-169 anchor).
+  - id: preflight-github-auth
+    persona: major-build
+    load_bearing: true
+    bash: |
+      set -euo pipefail
+      if ! git push --dry-run origin "HEAD:refs/heads/preflight-auth-probe-$(date +%s)" 2>&1; then
+        echo "ERROR: GitHub auth check failed -- container cannot push to origin." >&2
+        echo "Likely cause: GITHUB_TOKEN missing in executor env, or token lacks repo scope." >&2
+        exit 1
+      fi
+      echo "preflight-github-auth PASS"
+
+  - id: read-spec
+    persona: xo
+    depends_on: [preflight-github-auth]
+    trigger_rule: all_done
+    bash: |
+      set -euo pipefail
+      WO_ID="${WO_ID:-WO-HARNESS-OVERSEER-M31-SUBSTRATE-01}"
+      if [ -z "$WO_ID" ]; then
+        WO_ID=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'WO-[A-Z0-9-]+' | head -n 1 || true)
+      fi
+      if [ -z "$WO_ID" ]; then
+        echo "WO_ID missing. Provide WO_ID input or user message." >&2
+        exit 1
+      fi
+      # Specs live in bdc-xo (NOT the target codebase). Cross-repo fetch via gh api.
+      SPEC_PATH="docs/work-orders/${WO_ID}.md"
+      SPEC_CONTENT=$(gh api "repos/bluedevilcollectibles/bdc-xo/contents/${SPEC_PATH}?ref=main" --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
+      if [ -z "$SPEC_CONTENT" ]; then
+        SPEC_PATH="docs/superpowers/specs/${WO_ID}.md"
+        SPEC_CONTENT=$(gh api "repos/bluedevilcollectibles/bdc-xo/contents/${SPEC_PATH}?ref=main" --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
+      fi
+      if [ -z "$SPEC_CONTENT" ]; then
+        MATCH=$(gh api "repos/bluedevilcollectibles/bdc-xo/contents/docs/superpowers/specs?ref=main" --template '{{range .}}{{.path}}{{"\n"}}{{end}}' 2>/dev/null | grep "${WO_ID}.md$" | head -n 1 || true)
+        if [ -n "$MATCH" ]; then
+          SPEC_PATH="$MATCH"
+          SPEC_CONTENT=$(gh api "repos/bluedevilcollectibles/bdc-xo/contents/${SPEC_PATH}?ref=main" --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
+        fi
+      fi
+      if [ -z "$SPEC_CONTENT" ]; then
+        echo "Spec not found for ${WO_ID} (tried docs/work-orders/, docs/superpowers/specs/ direct + glob)." >&2
+        exit 1
+      fi
+      # Capture an immutable run-start base SHA BEFORE any node mutates the worktree.
+      WT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
+      RUN_START_SHA=$(git -C "$WT" rev-parse HEAD 2>/dev/null || echo unknown)
+      mkdir -p "$ARTIFACTS_DIR" 2>/dev/null || true
+      printf '%s\n' "$RUN_START_SHA" > "$ARTIFACTS_DIR/run-start-sha.txt" 2>/dev/null || true
+      printf 'WO_ID=%s\nSPEC_PATH=bdc-xo:%s\nRUN_START_SHA=%s\n\n' "$WO_ID" "$SPEC_PATH" "$RUN_START_SHA"
+      printf '%s\n' "$SPEC_CONTENT"
+
+  - id: plan
+    persona: war-council-architect
+    agent: war-council-architect
+    depends_on: [read-spec]
+    trigger_rule: all_done
+    task_class: medium_work
+    prompt: |
+      Read the BDC Work Order spec below and produce a concise, surgical implementation plan.
+
+      ## Required Output (structured Markdown with these headings)
+      - WO ID
+      - Files to modify
+      - Files to create
+      - Files explicitly out of scope
+      - Verification commands
+      - Commit message
+      - Push policy
+      - Staging gate required
+
+      ## BDC Push Policy
+      Hardcoded Rule 20 staging-gate repos:
+      - bluedevilcollectibles/lspro-react
+      - bluedevilcollectibles/shopops-storefront
+      - bluedevilcollectibles/shopops
+      The target of this WO is bluedevilcollectibles/bdc-harness, which is NOT a
+      staging-gate repo: use a feature branch plus PR WITHOUT the staging gate.
+
+      ## Scope discipline (M-42 Slice 2)
+      This WO owns migration 033 and the shared schema integration. It MUST NOT modify
+      packages/overseer/src/service.ts, packages/overseer/src/actions/merge-ready.ts,
+      any deployment configuration, or any provider mutation path. No execute, merge,
+      deploy, or activation logic is in scope. Permit preparation ends at a returned
+      permit or a typed failure -- never at an external side effect.
+
+      ## Spec
+      $read-spec.output
+
+  - id: implement
+    idle_timeout: 600000
+    persona: major-build
+    agent: major-build
+    depends_on: [plan]
+    trigger_rule: all_done
+    task_class: medium_work
+    wall_timeout_ms: 1800000
+    loop:
+      fresh_context: true
+      until: COMPLETE
+      max_iterations: 5
+      prompt: |
+        Implement the approved plan for BDC Work Order WO-HARNESS-OVERSEER-M31-SUBSTRATE-01.
+
+        ## Spec
+        $read-spec.output
+
+        ## Approved plan
+        $plan.output
+
+        ## Prior iteration output (empty on first pass)
+        $LOOP_PREV_OUTPUT
+
+        ## Worktree pinning
+        You run inside ONE assigned git worktree. Resolve it first with
+        WT=$(git rev-parse --show-toplevel) and make EVERY git/grep/diff call relative to
+        THIS worktree. Do NOT judge "already done" against origin/main or any sibling
+        worktree. Whether the WO is satisfied is decided ONLY by THIS worktree's HEAD.
+
+        ## Execution rules
+        - Modify only files in scope per the spec's output contract:
+          migrations/033_overseer_m31_substrate.sql, packages/core/src/db/merge-steward.ts,
+          packages/core/src/db/merge-steward.test.ts, packages/overseer/src/m31-substrate.ts,
+          packages/overseer/src/__tests__/m31-substrate.test.ts,
+          packages/server/src/routes/schemas/merge-steward.schemas.ts,
+          packages/server/src/routes/api.merge-steward.test.ts,
+          docs/contracts/overseer-m31-substrate-v1.md, and the enumerated integration files
+          (packages/core/src/db/adapters/sqlite.ts, packages/core/src/db/index.ts,
+          packages/core/package.json, packages/overseer/src/types.ts,
+          packages/overseer/src/index.ts, packages/overseer/package.json,
+          packages/server/src/routes/api.ts, packages/server/package.json).
+        - You MUST NOT modify packages/overseer/src/service.ts,
+          packages/overseer/src/actions/merge-ready.ts, deployment config, or any provider
+          mutation path.
+        - All five M-31 tables are append-only. Snapshot membership is explicit and sorted.
+          Proposal IDs and execution IDs are unique. Permit issuance requires an exact
+          live-state comparison inside the 60-second validity window and single-use
+          consumption of the execution ID.
+        - Prefer existing repo patterns (execution-claims fencing, board-authority audit,
+          registerOpenApiRoute). ASCII-only source. Do not reformat unrelated code. Do not
+          deploy. Do not use empty/verify-only commits.
+        - Tests must assert real behavior (append-only rejection, 60/61-second boundary,
+          replay rejection, PostgreSQL/SQLite parity, structural absence of provider mutation).
+
+        ## Commit and push BEFORE exit
+        When implementation is complete, BEFORE emitting the sentinel below, run:
+        ```bash
+        BRANCH=$(git rev-parse --abbrev-ref HEAD)
+        WO_ID="${WO_ID:-WO-HARNESS-OVERSEER-M31-SUBSTRATE-01}"
+        git add -A
+        git diff --cached --quiet || git commit -m "feat: implement ${WO_ID}
+
+        Implementation per WO spec. Self-verified within implement loop.
+
+        Co-Authored-By: Claude (Cauldron major-build) <noreply@anthropic.com>"
+        git push -u origin "$BRANCH" 2>&1 || echo "WARN: push failed -- operator must recover from worktree"
+        ```
+
+        ## Completion criteria + sentinel
+        Run this self-check IN THIS WORKTREE first:
+          WT=$(git rev-parse --show-toplevel)
+          CHANGED=$(git -C "$WT" status --porcelain | wc -l)
+          AHEAD=$(git -C "$WT" rev-list --count "@{upstream}..HEAD" 2>/dev/null || git -C "$WT" rev-list --count HEAD --not --remotes 2>/dev/null || echo 0)
+        Then choose EXACTLY ONE ending:
+        1. REAL BUILD (you made in-scope changes; CHANGED>0 OR AHEAD>0). Emit each on its own line:
+             COMPLETE
+             BUILD_COMPLETE
+             <promise>COMPLETE</promise>
+        2. ALREADY SATISFIED (deliverables already reachable from THIS worktree HEAD; no changes):
+             ALREADY_SATISFIED: <one sentence naming the deliverables already present>
+             COMPLETE
+        3. TRUE BLOCKER (spec ambiguous / missing source of truth):
+             BLOCKED: <one-sentence reason>
+        Anti-fraud: emit the case-1 build sentinels ONLY if you made real in-scope edits.
+
+  - id: war-council-validator
+    provider: claude
+    model: sonnet
+    persona: captain-ci-validator
+    agent: war-council-validator
+    depends_on: [implement]
+    trigger_rule: all_done
+    task_class: medium_work
+    prompt: |
+      Run the war-council-validator review for WO-HARNESS-OVERSEER-M31-SUBSTRATE-01.
+
+      ## Inputs
+      Spec:
+      $read-spec.output
+
+      Plan:
+      $plan.output
+
+      Implementation output:
+      $implement.output
+
+      Git diff:
+      Run `git diff --stat` and `git diff --check`, then inspect the changed files.
+
+      ## Required Output
+      Return either:
+      - satisfied: with evidence that the spec deliverables and stop conditions were met
+        (append-only tables, sorted membership, unique proposal/execution IDs, 60/61-second
+        boundary, replay rejection, PostgreSQL/SQLite parity, no provider mutation path).
+      - needs_revision: with exact file/path/behavior findings.
+
+  # business-risk-gate (load_bearing): enforce the WO's business-risk invariant BEFORE any
+  # push target is chosen or code reaches a PR. Fails closed -- if the invariant cannot be
+  # positively confirmed as upheld by the diff, the gate BLOCKS and downstream push/PR nodes
+  # are skipped (nothing reaches a provider mutation path).
+  - id: business-risk-gate
+    provider: claude
+    model: sonnet
+    persona: captain-ci-validator
+    agent: war-council-validator
+    depends_on: [war-council-validator]
+    trigger_rule: all_done
+    load_bearing: true
+    task_class: medium_work
+    prompt: |
+      You are the business-risk gate for WO-HARNESS-OVERSEER-M31-SUBSTRATE-01. You decide
+      ONE thing: does the implemented diff uphold the WO's business-risk invariant? You are
+      read-only; judge ONLY this worktree's diff (run `git diff` and inspect changed files).
+
+      ## BUSINESS_RISK_INVARIANT (verbatim -- must hold)
+      The M-31 substrate must never allow its append-only evidence, snapshots, discrepancies, or proposals to be mutated or an execution permit to be issued without an exact live-state comparison inside the 60-second validity window, and no replayed or duplicate execution may ever reach a provider mutation path.
+
+      ## How to decide
+      Confirm ALL of the following are true in the diff, with concrete file:line evidence:
+      1. The five M-31 tables (snapshots, snapshot_members, discrepancies, action_proposals,
+         execution_receipts) are append-only -- UPDATE/DELETE are structurally rejected in
+         both the PostgreSQL migration 033 and the SQLite parity surface.
+      2. An execution permit is issued ONLY after an exact live-state comparison, and ONLY
+         when the bound observation age is 60 seconds or less (61 seconds returns
+         observation_stale with no permit).
+      3. Proposal IDs and execution IDs are unique, and a replayed or duplicate execution is
+         rejected transactionally BEFORE any external dependency can run
+         (proposal_replayed / execution_id_conflict).
+      4. No provider client, GitHub mutation, deploy call, or other external side effect is
+         reachable from the permit-preparation path; service.ts and actions/merge-ready.ts
+         are unchanged.
+
+      ## Output (last line must be EXACTLY one of these)
+      - If every clause above is confirmed upheld by the diff:
+          BUSINESS_RISK_GATE=PASS
+      - If any clause is violated, unproven, or you cannot confirm with high confidence:
+          BUSINESS_RISK_GATE=BLOCK
+        followed by: BUSINESS_RISK_REASON=<one line naming the violated clause + evidence>
+      Default to BUSINESS_RISK_GATE=BLOCK. A permit path that might reach provider mutation,
+      a mutable evidence row, or a missing 60-second check is an automatic BLOCK.
+
+  - id: decide-push-target
+    persona: major-build
+    depends_on: [business-risk-gate]
+    trigger_rule: all_done
+    when: "$business-risk-gate.output contains 'BUSINESS_RISK_GATE=PASS'"
+    task_class: clerical
+    prompt: |
+      Decide the push target for WO-HARNESS-OVERSEER-M31-SUBSTRATE-01.
+
+      ## Inputs
+      Spec:
+      $read-spec.output
+      Validator:
+      $war-council-validator.output
+
+      ## Branch name derivation
+      Derive the branch name from the WO ID ONLY -- do NOT copy the current git branch and
+      do NOT embed any archon/thread- suffix. Use prefix feat/ + WO ID lowercased with
+      hyphens: feat/wo-harness-overseer-m31-substrate-01
+      The engine appends a unique -thread-<hash> suffix at push time; emit the BASE name only.
+
+      ## Repo policy
+      Target repository: bluedevilcollectibles/bdc-harness. This repo is NOT in the Rule 20
+      staging-gate list (lspro-react, shopops-storefront, shopops), so the PR targets the
+      repo default branch (no --base staging).
+
+      Emit exactly:
+        push_target: feature-branch:feat/wo-harness-overseer-m31-substrate-01
+        pr_required: true
+        staging_gate_required: false
+        repo: bluedevilcollectibles/bdc-harness
+
+  - id: commit-and-push
+    persona: overseer
+    depends_on: [decide-push-target]
+    trigger_rule: all_done
+    when: "$business-risk-gate.output contains 'BUSINESS_RISK_GATE=PASS'"
+    load_bearing: true
+    bash: |
+      set -euo pipefail
+      DECIDE_OUTPUT=$decide-push-target.output
+      if printf '%s\n' "$DECIDE_OUTPUT" | grep -q '^out_of_scope: true'; then
+        echo "Out of scope for this lane; failing closed." >&2
+        exit 1
+      fi
+      WT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
+      cd "$WT"
+      BASE_BRANCH=$(printf '%s\n' "$DECIDE_OUTPUT" | sed -n 's|^push_target: feature-branch:||p' | head -n 1)
+      if ! printf '%s\n' "$BASE_BRANCH" | grep -qE '^(feat/[A-Za-z0-9_-]+|fix/[A-Za-z0-9_-]+|wip/[A-Za-z0-9_-]+)$'; then
+        echo "Malformed branch name: '${BASE_BRANCH}'" >&2
+        exit 1
+      fi
+      THREAD_SUFFIX=$(git rev-parse --short HEAD)
+      UNIQUE_BRANCH="${BASE_BRANCH}-thread-${THREAD_SUFFIX}"
+      git add -A
+      WO_ID="${WO_ID:-WO-HARNESS-OVERSEER-M31-SUBSTRATE-01}"
+      git diff --cached --quiet || git commit -m "feat: implement ${WO_ID}
+
+      M-42 Slice 2: immutable M-31 evidence/proposal/permit substrate.
+
+      Co-Authored-By: Claude (Cauldron overseer) <noreply@anthropic.com>"
+      # Real push with retry (3 attempts, exponential backoff). Fail closed.
+      PUSHED=false
+      for attempt in 1 2 3; do
+        if git push -u origin "HEAD:${UNIQUE_BRANCH}" 2>&1; then PUSHED=true; break; fi
+        echo "WARN: push attempt ${attempt} failed; retrying..." >&2
+        sleep $((attempt * 5))
+      done
+      if [ "$PUSHED" != "true" ]; then
+        echo "ERROR: commit-and-push failed after 3 attempts -- no commits reached origin." >&2
+        exit 1
+      fi
+      REMOTE_HEAD="$(git ls-remote origin "refs/heads/${UNIQUE_BRANCH}" 2>/dev/null | awk '{print $1}')"
+      if [ "$REMOTE_HEAD" != "$(git rev-parse HEAD)" ]; then
+        echo "ERROR: origin verify failed -- ${UNIQUE_BRANCH} not at HEAD on origin." >&2
+        exit 1
+      fi
+      echo "unique_branch=${UNIQUE_BRANCH}"
+      echo "pushed_head=$(git rev-parse HEAD)"
+      echo "commit-and-push: ${UNIQUE_BRANCH} verified on origin at HEAD"
+
+  - id: open-pr-if-needed
+    persona: major-build
+    depends_on: [commit-and-push]
+    trigger_rule: all_done
+    load_bearing: true
+    bash: |
+      set -euo pipefail
+      DECIDE_OUTPUT=$decide-push-target.output
+      COMMIT_PUSH_OUTPUT=$commit-and-push.output
+      IMPLEMENT_OUTPUT=$implement.output
+      VALIDATOR_OUTPUT=$war-council-validator.output
+      if ! printf '%s\n' "$DECIDE_OUTPUT" | grep -q '^pr_required: true'; then
+        echo "PR not required; skipping."
+        exit 0
+      fi
+      UNIQUE_BRANCH=$(printf '%s\n' "$COMMIT_PUSH_OUTPUT" | sed -n 's/^unique_branch=//p' | head -n 1)
+      if [ -z "$UNIQUE_BRANCH" ]; then
+        echo "ERROR: unique_branch not found in commit-and-push output." >&2
+        exit 1
+      fi
+      REMOTE_HEAD="$(git ls-remote origin "refs/heads/${UNIQUE_BRANCH}" 2>/dev/null | awk '{print $1}')"
+      if [ "$REMOTE_HEAD" != "$(git rev-parse HEAD)" ]; then
+        echo "ERROR: open-pr precondition failed -- ${UNIQUE_BRANCH} not on origin at HEAD." >&2
+        exit 1
+      fi
+      REPO=$(printf '%s\n' "$DECIDE_OUTPUT" | sed -n 's/^repo: //p' | head -n 1)
+      if [ -z "$REPO" ] || [ "$REPO" = "unknown" ]; then
+        echo "ERROR: decide-push-target did not emit a valid 'repo:'." >&2
+        exit 1
+      fi
+      STAGING_GATE=$(printf '%s\n' "$DECIDE_OUTPUT" | grep -c '^staging_gate_required: true' 2>/dev/null || true)
+      STAGING_GATE="${STAGING_GATE:-0}"
+      if [ "$STAGING_GATE" -ge 1 ] 2>/dev/null; then BASE_ARG=(--base staging); else BASE_ARG=(); fi
+      TITLE="feat: WO-HARNESS-OVERSEER-M31-SUBSTRATE-01 (M-42 Slice 2 -- M-31 substrate)"
+      BODY_FILE=$(mktemp)
+      {
+        echo "## Summary"
+        echo "M-42 Slice 2: immutable M-31 evidence, proposal, and single-use permit substrate."
+        echo "Slice 2 complete does not activate Overseer or authorize mutation."
+        echo
+        echo "## Implement output"
+        printf '%s\n' "$IMPLEMENT_OUTPUT"
+        echo
+        echo "## Validator"
+        printf '%s\n' "$VALIDATOR_OUTPUT"
+      } > "$BODY_FILE"
+      EXISTING=$(gh pr list --repo "$REPO" --head "$UNIQUE_BRANCH" --json url --jq '.[0].url' 2>/dev/null || true)
+      if [ -n "$EXISTING" ]; then
+        echo "PR already exists: $EXISTING"
+        echo "PR_URL=$EXISTING"
+        exit 0
+      fi
+      PR_URL=""
+      for attempt in 1 2 3; do
+        PR_URL=$(gh pr create --repo "$REPO" --head "$UNIQUE_BRANCH" "${BASE_ARG[@]}" --title "$TITLE" --body-file "$BODY_FILE" 2>&1 | grep -Eo 'https://github.com/[^ ]+/pull/[0-9]+' | head -n 1 || true)
+        [ -n "$PR_URL" ] && break
+        echo "WARN: gh pr create attempt ${attempt} failed; retrying..." >&2
+        sleep $((attempt * 5))
+      done
+      if [ -z "$PR_URL" ]; then
+        echo "ERROR: PR creation failed after 3 attempts." >&2
+        exit 1
+      fi
+      echo "PR opened: $PR_URL"
+      echo "PR_URL=$PR_URL"
+
+  - id: build-manifest
+    persona: major-build
+    depends_on: [open-pr-if-needed]
+    trigger_rule: all_done
+    task_class: clerical
+    prompt: |
+      Construct the Captain CI completion manifest (v2) for WO-HARNESS-OVERSEER-M31-SUBSTRATE-01.
+
+      ## Inputs
+      Spec:
+      $read-spec.output
+      Plan:
+      $plan.output
+      Implementation:
+      $implement.output
+      Business-risk gate:
+      $business-risk-gate.output
+      Commit and push evidence (ground truth for branch/HEAD):
+      $commit-and-push.output
+      PR evidence (ground truth PR URL):
+      $open-pr-if-needed.output
+      Validator:
+      $war-council-validator.output
+
+      ## Required manifest fields (emit verbatim labels, one per line)
+        WO: WO-HARNESS-OVERSEER-M31-SUBSTRATE-01
+        Builder: major-build
+        Files created: <comma-separated files ADDED in the diff, or none>
+        Files modified: <comma-separated files CHANGED in the diff, or none>
+        Migrations added: migrations/033_overseer_m31_substrate.sql
+        Tests: <N passing / N total> or N/A (<reason>)
+        PRs: <PR URL from open-pr-if-needed, or N/A>
+        Business risk: <BUSINESS_RISK_GATE value from business-risk-gate>
+        Grep assertions: <read-only assertions, or N/A (<reason>)>
+        VALIDATION: PASS
+      VALIDATION: PASS requires war-council-validator to be satisfied AND
+      business-risk-gate to be BUSINESS_RISK_GATE=PASS. Otherwise emit VALIDATION: BLOCKED.
+      Derive Files created/modified from the git diff -- do not list unchanged files.
+
+  - id: flip-notion
+    persona: major-build
+    depends_on: [build-manifest]
+    trigger_rule: all_done
+    task_class: clerical
+    bash: |
+      set -uo pipefail
+      WO_ID="${WO_ID:-WO-HARNESS-OVERSEER-M31-SUBSTRATE-01}"
+      GATE=$business-risk-gate.output
+      OPEN_PR=$open-pr-if-needed.output
+      PR_URL=$(printf '%s\n' "$OPEN_PR" | sed -n 's/^PR_URL=//p' | head -n 1)
+      if printf '%s\n' "$GATE" | grep -q 'BUSINESS_RISK_GATE=PASS' && [ -n "$PR_URL" ]; then
+        NEW_STATUS="Review"
+      else
+        NEW_STATUS="Blocked"
+      fi
+      echo "flip-notion: WO_ID=${WO_ID} target_status=${NEW_STATUS} pr=${PR_URL:-<none>}"
+      # Notion mutation is operator-side (Notion API not guaranteed in the build container).
+      # Write the intended flip as a durable artifact; the operator/XO reconciler applies it.
+      mkdir -p "$ARTIFACTS_DIR" 2>/dev/null || true
+      printf 'WO_ID=%s\nCLAUDE_STATUS=%s\nSTATUS=%s\nPR_URL=%s\n' \
+        "$WO_ID" "$([ "$NEW_STATUS" = "Review" ] && echo REVIEW || echo QUEUED)" "$NEW_STATUS" "${PR_URL:-}" \
+        > "$ARTIFACTS_DIR/notion-flip.txt" 2>/dev/null || true
+      echo "flip-notion: recorded intended Notion flip to $ARTIFACTS_DIR/notion-flip.txt"
+      exit 0
