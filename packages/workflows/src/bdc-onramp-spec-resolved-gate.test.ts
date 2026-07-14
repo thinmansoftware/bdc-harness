@@ -62,4 +62,10 @@ describe('on-ramp assert-spec-resolved business invariant gate', () => {
     expect(result.stderr).toContain('BUSINESS_RISK_INVARIANT is a placeholder');
     expect(result.exitCode).not.toBe(0);
   });
+
+  it('rejects a longer invariant that still contains an unresolved TODO marker', () => {
+    const result = runGate('TODO: fill in the business risk before execution');
+    expect(result.stderr).toContain('BUSINESS_RISK_INVARIANT is a placeholder');
+    expect(result.exitCode).not.toBe(0);
+  });
 });
