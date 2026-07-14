@@ -128,13 +128,7 @@ async function loadWorkflowsFromDir(dirPath: string, depth = 0): Promise<DirLoad
           }
           const subResult = await loadWorkflowsFromDir(entryPath, depth + 1);
           for (const [filename, workflow] of subResult.workflows) {
-            // A shallower project workflow is the explicit override surface.
-            // Do not let a recursively discovered defaults/ copy replace a
-            // same-named file from this directory. If the directory is visited
-            // first, the later root file still replaces it below.
-            if (!workflows.has(filename)) {
-              workflows.set(filename, workflow);
-            }
+            workflows.set(filename, workflow);
           }
           errors.push(...subResult.errors);
         } else if (entry.endsWith('.yaml') || entry.endsWith('.yml')) {
@@ -315,12 +309,34 @@ export async function discoverWorkflows(
     await access(workflowPath);
     const repoResult = await loadWorkflowsFromDir(workflowPath);
 
+    // Recursive discovery intentionally preserves the existing sibling-directory
+    // collision behavior. Re-read only valid root-level files so the documented
+    // project override surface wins over a same-named defaults/ copy regardless
+    // of directory enumeration order, and so its provenance remains project.
+    const rootWorkflowFilenames = new Set<string>();
+    const rootEntries = await readdir(workflowPath);
+    for (const entry of rootEntries) {
+      if (!entry.endsWith('.yaml') && !entry.endsWith('.yml')) continue;
+      try {
+        const content = await readFile(join(workflowPath, entry), 'utf-8');
+        const result = parseWorkflow(content, entry);
+        if (result.workflow) {
+          repoResult.workflows.set(entry, result.workflow);
+          rootWorkflowFilenames.add(entry);
+        }
+      } catch (error) {
+        getLog().debug({ error, entry }, 'repo_root_workflow_reread_skipped');
+      }
+    }
+
     // Repo workflows override bundled AND home scope by exact filename match.
     // Preserve 'bundled' source for workflows loaded from the defaults/ subdirectory
     // that were already registered as bundled in step 1.
     for (const [filename, workflow] of repoResult.workflows) {
       const existing = workflowsByFile.get(filename);
-      if (existing?.source === 'bundled') {
+      if (rootWorkflowFilenames.has(filename)) {
+        workflowsByFile.set(filename, { workflow, source: 'project' });
+      } else if (existing?.source === 'bundled') {
         // This file was already loaded as a bundled default -- the repo's defaults/
         // subdirectory is re-discovering it. Keep the bundled source label.
         getLog().debug({ filename }, 'repo_default_preserves_bundled_source');
