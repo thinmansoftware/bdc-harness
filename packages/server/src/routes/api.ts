@@ -124,6 +124,9 @@ import * as dispatchDb from '@archon/core/db/dispatch';
 import * as knownBadBindingsDb from '@archon/core/db/known-bad-bindings';
 import * as boardAuthorityDb from '@archon/core/db/board-authority';
 import * as executionClaimsDb from '@archon/core/db/execution-claims';
+import * as mergeStewardDb from '@archon/core/db/merge-steward';
+import * as m31Substrate from '@archon/overseer/m31-substrate';
+import type { M31LiveStateReader } from '@archon/overseer/m31-substrate';
 import {
   deriveBoardMotionNotificationKey,
   recordBoardPetitionDelivery,
@@ -241,6 +244,18 @@ import {
   renewExecutionClaimBodySchema,
   renewExecutionClaimResponseSchema,
 } from './schemas/execution-claims.schemas';
+import {
+  registerM31SnapshotBodySchema,
+  m31SnapshotResponseSchema,
+  m31SnapshotIdParamsSchema,
+  appendM31DiscrepancyBodySchema,
+  m31DiscrepancyResponseSchema,
+  createM31ProposalBodySchema,
+  m31ProposalResponseSchema,
+  m31ProposalIdParamsSchema,
+  compareAndConsumeM31BodySchema,
+  m31PermitResponseSchema,
+} from './schemas/merge-steward.schemas';
 import { getProviderInfoList, isRegisteredProvider } from '@archon/providers';
 import { claudeProviderThrottle } from '@archon/providers/claude/throttle';
 import { buildProductionCanarySnapshot } from '../services/canary-snapshot';
@@ -976,6 +991,138 @@ const getExecutionClaimRoute = createRoute({
       description: 'Execution claim',
     },
     404: jsonError('Claim not found'),
+    500: jsonError('Server error'),
+  },
+});
+
+// =========================================================================
+// M-31 Overseer merge-steward substrate route configs (M-42 Slice 2)
+// =========================================================================
+
+const registerM31SnapshotRoute = createRoute({
+  method: 'post',
+  path: '/api/overseer/m31/snapshots',
+  tags: ['Overseer M31'],
+  summary: 'Register an immutable M-31 live-state snapshot with sorted membership',
+  request: {
+    body: {
+      content: { 'application/json': { schema: registerM31SnapshotBodySchema } },
+      required: true,
+    },
+  },
+  responses: {
+    201: {
+      content: { 'application/json': { schema: m31SnapshotResponseSchema } },
+      description: 'Registered snapshot',
+    },
+    400: jsonError('Validation failed'),
+    401: jsonError('Board principal rejected'),
+    500: jsonError('Server error'),
+  },
+});
+
+const getM31SnapshotRoute = createRoute({
+  method: 'get',
+  path: '/api/overseer/m31/snapshots/{snapshot_id}',
+  tags: ['Overseer M31'],
+  summary: 'Read an immutable M-31 snapshot and its sorted members',
+  request: { params: m31SnapshotIdParamsSchema },
+  responses: {
+    200: {
+      content: { 'application/json': { schema: m31SnapshotResponseSchema } },
+      description: 'Snapshot',
+    },
+    401: jsonError('Board principal rejected'),
+    404: jsonError('Snapshot not found'),
+    500: jsonError('Server error'),
+  },
+});
+
+const appendM31DiscrepancyRoute = createRoute({
+  method: 'post',
+  path: '/api/overseer/m31/snapshots/{snapshot_id}/discrepancies',
+  tags: ['Overseer M31'],
+  summary: 'Append an M-31 discrepancy without mutating prior evidence',
+  request: {
+    params: m31SnapshotIdParamsSchema,
+    body: {
+      content: { 'application/json': { schema: appendM31DiscrepancyBodySchema } },
+      required: true,
+    },
+  },
+  responses: {
+    201: {
+      content: { 'application/json': { schema: m31DiscrepancyResponseSchema } },
+      description: 'Appended discrepancy',
+    },
+    400: jsonError('Validation failed'),
+    401: jsonError('Board principal rejected'),
+    500: jsonError('Server error'),
+  },
+});
+
+const createM31ProposalRoute = createRoute({
+  method: 'post',
+  path: '/api/overseer/m31/proposals',
+  tags: ['Overseer M31'],
+  summary: 'Create an immutable, expiring, exact-state M-31 action proposal',
+  request: {
+    body: {
+      content: { 'application/json': { schema: createM31ProposalBodySchema } },
+      required: true,
+    },
+  },
+  responses: {
+    201: {
+      content: { 'application/json': { schema: m31ProposalResponseSchema } },
+      description: 'Created proposal',
+    },
+    400: jsonError('Validation failed'),
+    401: jsonError('Board principal rejected'),
+    409: jsonError('Evidence, chain, or discrepancy failure'),
+    500: jsonError('Server error'),
+  },
+});
+
+const getM31ProposalRoute = createRoute({
+  method: 'get',
+  path: '/api/overseer/m31/proposals/{proposal_id}',
+  tags: ['Overseer M31'],
+  summary: 'Read an M-31 action proposal by exact identity',
+  request: { params: m31ProposalIdParamsSchema },
+  responses: {
+    200: {
+      content: { 'application/json': { schema: m31ProposalResponseSchema } },
+      description: 'Proposal',
+    },
+    401: jsonError('Board principal rejected'),
+    404: jsonError('Proposal not found'),
+    500: jsonError('Server error'),
+  },
+});
+
+const compareAndConsumeM31ProposalRoute = createRoute({
+  method: 'post',
+  path: '/api/overseer/m31/proposals/{proposal_id}/compare-and-consume',
+  tags: ['Overseer M31'],
+  summary: 'Final exact live-state comparison and single-use permit issuance',
+  request: {
+    params: m31ProposalIdParamsSchema,
+    body: {
+      content: { 'application/json': { schema: compareAndConsumeM31BodySchema } },
+      required: true,
+    },
+  },
+  responses: {
+    200: {
+      content: { 'application/json': { schema: m31PermitResponseSchema } },
+      description: 'Permit issued',
+    },
+    400: jsonError('Validation failed'),
+    401: jsonError('Board principal rejected'),
+    403: jsonError('Capability gate denied'),
+    404: jsonError('Proposal not found'),
+    409: jsonError('Typed comparison or single-use failure'),
     500: jsonError('Server error'),
   },
 });
@@ -3501,6 +3648,169 @@ export function registerApiRoutes(
     } catch (error) {
       getLog().error({ err: error }, 'execution_claim_get_failed');
       return apiError(c, 500, 'Failed to read execution claim');
+    }
+  });
+
+  // =========================================================================
+  // M-31 Overseer merge-steward substrate handlers (M-42 Slice 2).
+  // All typed failures fail closed with HTTP 409; the capability gate denies
+  // with 403. No provider mutation is reachable from any handler below.
+  // =========================================================================
+
+  function m31FailureResponse(c: Context, failure: mergeStewardDb.M31TypedFailure): Response {
+    return c.json({ error: { failure, message: failure } }, 409);
+  }
+
+  registerOpenApiRoute(registerM31SnapshotRoute, async c => {
+    try {
+      const body = getValidatedBody(c, registerM31SnapshotBodySchema);
+      await boardAuthorityDb.authenticateBoardPrincipal(boardPrincipalProofFromHeaders(c));
+      const snapshot = await mergeStewardDb.registerM31Snapshot({
+        snapshot_id: body.snapshot_id,
+        repository: body.repository,
+        capture_started_at: body.capture_started_at,
+        capture_completed_at: body.capture_completed_at,
+        operator_actor: body.operator_actor,
+        operator_model: body.operator_model,
+        read_only_query_method: body.read_only_query_method,
+        base_branch: body.base_branch,
+        base_sha: body.base_sha,
+        predecessor_snapshot_id: body.predecessor_snapshot_id ?? null,
+        predecessor_evidence_git_blob: body.predecessor_evidence_git_blob ?? null,
+        artifact_path: body.artifact_path,
+        git_object_format: body.git_object_format,
+        evidence_git_blob: body.evidence_git_blob,
+        mutation_attempted: body.mutation_attempted,
+        fusion_calls_attempted: body.fusion_calls_attempted,
+        members: body.members,
+      });
+      return c.json({ snapshot }, 201);
+    } catch (error) {
+      if (isBoardPrincipalAuthError(error)) return apiError(c, 401, (error as Error).message);
+      getLog().error({ err: error }, 'm31_snapshot_register_failed');
+      return apiError(c, 500, 'Failed to register M-31 snapshot');
+    }
+  });
+
+  registerOpenApiRoute(getM31SnapshotRoute, async c => {
+    try {
+      await boardAuthorityDb.authenticateBoardPrincipal(boardPrincipalProofFromHeaders(c));
+      const snapshot = await mergeStewardDb.getM31Snapshot(c.req.param('snapshot_id') ?? '');
+      if (!snapshot) return apiError(c, 404, 'M-31 snapshot not found');
+      return c.json({ snapshot });
+    } catch (error) {
+      if (isBoardPrincipalAuthError(error)) return apiError(c, 401, (error as Error).message);
+      getLog().error({ err: error }, 'm31_snapshot_get_failed');
+      return apiError(c, 500, 'Failed to read M-31 snapshot');
+    }
+  });
+
+  registerOpenApiRoute(appendM31DiscrepancyRoute, async c => {
+    try {
+      const body = getValidatedBody(c, appendM31DiscrepancyBodySchema);
+      await boardAuthorityDb.authenticateBoardPrincipal(boardPrincipalProofFromHeaders(c));
+      const discrepancy = await mergeStewardDb.appendM31Discrepancy({
+        snapshot_id: c.req.param('snapshot_id') ?? '',
+        evidence_git_blob: body.evidence_git_blob,
+        affected_rows: body.affected_rows,
+        observed_conflict: body.observed_conflict,
+        recorder: body.recorder,
+        resolution: body.resolution ?? null,
+        predecessor_discrepancy_id: body.predecessor_discrepancy_id ?? null,
+      });
+      return c.json({ discrepancy }, 201);
+    } catch (error) {
+      if (isBoardPrincipalAuthError(error)) return apiError(c, 401, (error as Error).message);
+      getLog().error({ err: error }, 'm31_discrepancy_append_failed');
+      return apiError(c, 500, 'Failed to append M-31 discrepancy');
+    }
+  });
+
+  registerOpenApiRoute(createM31ProposalRoute, async c => {
+    try {
+      const body = getValidatedBody(c, createM31ProposalBodySchema);
+      await boardAuthorityDb.authenticateBoardPrincipal(boardPrincipalProofFromHeaders(c));
+      const result = await mergeStewardDb.createM31ActionProposal({
+        proposal_id: body.proposal_id,
+        repository: body.repository,
+        pr_number: body.pr_number,
+        head_sha: body.head_sha,
+        base_branch: body.base_branch,
+        base_sha: body.base_sha,
+        snapshot_id: body.snapshot_id,
+        evidence_path: body.evidence_path,
+        action_kind: body.action_kind,
+        action_parameters: body.action_parameters,
+        actor: body.actor,
+        policy_digest: body.policy_digest,
+        verifier_registry_digest: body.verifier_registry_digest,
+        ttl_ms: body.ttl_ms,
+        max_evidence_age_ms: body.max_evidence_age_ms,
+      });
+      if (!result.ok) return m31FailureResponse(c, result.failure);
+      return c.json({ proposal: result.value }, 201);
+    } catch (error) {
+      if (isBoardPrincipalAuthError(error)) return apiError(c, 401, (error as Error).message);
+      getLog().error({ err: error }, 'm31_proposal_create_failed');
+      return apiError(c, 500, 'Failed to create M-31 proposal');
+    }
+  });
+
+  registerOpenApiRoute(getM31ProposalRoute, async c => {
+    try {
+      await boardAuthorityDb.authenticateBoardPrincipal(boardPrincipalProofFromHeaders(c));
+      const proposal = await mergeStewardDb.getM31ActionProposal(c.req.param('proposal_id') ?? '');
+      if (!proposal) return apiError(c, 404, 'M-31 proposal not found');
+      return c.json({ proposal });
+    } catch (error) {
+      if (isBoardPrincipalAuthError(error)) return apiError(c, 401, (error as Error).message);
+      getLog().error({ err: error }, 'm31_proposal_get_failed');
+      return apiError(c, 500, 'Failed to read M-31 proposal');
+    }
+  });
+
+  registerOpenApiRoute(compareAndConsumeM31ProposalRoute, async c => {
+    try {
+      const body = getValidatedBody(c, compareAndConsumeM31BodySchema);
+      await boardAuthorityDb.authenticateBoardPrincipal(boardPrincipalProofFromHeaders(c));
+      // The authenticated operator supplies the exact read-only live observation.
+      // This slice reaches NO provider: the reader returns the submitted observation.
+      const submittedObservation = body.observation;
+      const reader: M31LiveStateReader = {
+        readBoundState: async () => submittedObservation,
+      };
+      const result = await m31Substrate.prepareM31ActionPermit(
+        {
+          proposal_id: c.req.param('proposal_id') ?? '',
+          validity_window_ms: body.validity_window_ms,
+        },
+        {
+          liveStateReader: reader,
+          capabilityGate: m31Substrate.createFailClosedM31CapabilityGate(),
+        }
+      );
+      if (result.ok) return c.json({ permit: result.permit, receipt: result.receipt });
+      if ('not_found' in result) return apiError(c, 404, 'M-31 proposal not found');
+      if ('denied' in result) {
+        return c.json(
+          {
+            error: {
+              reason: 'gate_denied' as const,
+              capability: result.denied.capability,
+              message: result.denied.reason,
+            },
+          },
+          403
+        );
+      }
+      return m31FailureResponse(c, result.failure);
+    } catch (error) {
+      if (isBoardPrincipalAuthError(error)) return apiError(c, 401, (error as Error).message);
+      if (error instanceof mergeStewardDb.M31ProposalNotFoundError) {
+        return apiError(c, 404, 'M-31 proposal not found');
+      }
+      getLog().error({ err: error }, 'm31_compare_and_consume_failed');
+      return apiError(c, 500, 'Failed to compare and consume M-31 proposal');
     }
   });
 

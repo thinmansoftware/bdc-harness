@@ -14,7 +14,8 @@
     "./judge-pr": "./src/judge-pr.ts",
     "./judge-second-opinion": "./src/judge-second-opinion.ts",
     "./service": "./src/service.ts",
-    "./actions/merge-ready": "./src/actions/merge-ready.ts"
+    "./actions/merge-ready": "./src/actions/merge-ready.ts",
+    "./m31-substrate": "./src/m31-substrate.ts"
   },
   "scripts": {
     "test": "bun test src/overseer.test.ts && bun test tests/ && bun test src/__tests__/",
