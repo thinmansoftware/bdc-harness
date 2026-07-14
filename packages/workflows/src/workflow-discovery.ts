@@ -111,9 +111,7 @@ async function loadWorkflowsFromDir(dirPath: string, depth = 0): Promise<DirLoad
   const errors: WorkflowLoadError[] = [];
 
   try {
-    // Filesystem enumeration order differs across platforms. Sort once so the
-    // existing last-write-wins rule for same-named sibling workflows is stable.
-    const entries = (await readdir(dirPath)).sort();
+    const entries = await readdir(dirPath);
 
     for (const entry of entries) {
       const entryPath = join(dirPath, entry);

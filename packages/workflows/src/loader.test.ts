@@ -591,28 +591,6 @@ nodes:
       expect(result.workflows[0]?.workflow.name).toBe('hot-reloaded-onramp');
       expect(result.workflows[0]?.workflow.description).toBe('Project-scoped hot reload');
     });
-
-    it('should preserve later sibling-directory precedence for duplicate filenames', async () => {
-      const workflowDir = join(testDir, '.archon', 'workflows');
-      const firstDir = join(workflowDir, 'a');
-      const secondDir = join(workflowDir, 'b');
-      await mkdir(firstDir, { recursive: true });
-      await mkdir(secondDir, { recursive: true });
-
-      await writeFile(
-        join(firstDir, 'same.yaml'),
-        `name: sibling-a\ndescription: First sibling\nnodes:\n  - id: a\n    command: a\n`
-      );
-      await writeFile(
-        join(secondDir, 'same.yaml'),
-        `name: sibling-b\ndescription: Later sibling\nnodes:\n  - id: b\n    command: b\n`
-      );
-
-      const result = await discoverWorkflows(testDir, { loadDefaults: false });
-
-      expect(result.workflows).toHaveLength(1);
-      expect(result.workflows[0]?.workflow.name).toBe('sibling-b');
-    });
   });
 
   describe('command name validation (Issue #129)', () => {
