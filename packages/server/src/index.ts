@@ -65,6 +65,7 @@ import { SSETransport } from './adapters/web/transport';
 import { WorkflowEventBridge } from './adapters/web/workflow-bridge';
 import { registerApiRoutes, stopProviderWaitScheduler } from './routes/api';
 import { observeStartupRecovery, reconcilePendingRunsAtBoot } from './startup-reconciliation';
+import { startOverseerRuntime, stopOverseerRuntime } from './overseer-runtime';
 import {
   handleMessage,
   pool,
@@ -227,6 +228,8 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     getLog().fatal({ err: error }, 'startup_pending_reconciliation_failed');
     process.exit(1);
   }
+
+  startOverseerRuntime();
 
   const config = await loadConfig();
   logConfig(config);
@@ -690,6 +693,9 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     stopCleanupScheduler();
     stopProviderWaitScheduler();
     persistence.stopPeriodicFlush();
+    void stopOverseerRuntime().catch((e: unknown) => {
+      getLog().error({ err: e }, 'overseer_runtime_stop_failed');
+    });
 
     // Flush all buffered messages before stopping adapters
     persistence

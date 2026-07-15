@@ -124,13 +124,28 @@ export async function watchOnce(
 export async function watchLoop(
   deps: OverseerRunStoreDeps & GitHubClientDeps,
   onRecord: (record: WatchedRunRecord) => Promise<void>,
-  options: { intervalMs?: number; once?: boolean } = {}
+  options: { intervalMs?: number; once?: boolean; signal?: AbortSignal } = {}
 ): Promise<void> {
   const intervalMs = options.intervalMs ?? DEFAULT_WATCH_INTERVAL_MS;
   for (;;) {
+    if (options.signal?.aborted) return;
     const records = await watchOnce(deps);
-    for (const record of records) await onRecord(record);
+    for (const record of records) {
+      if (options.signal?.aborted) return;
+      await onRecord(record);
+    }
     if (options.once) return;
-    await new Promise(resolve => setTimeout(resolve, intervalMs));
+    await new Promise<void>(resolve => {
+      const timer = setTimeout(resolve, intervalMs);
+      options.signal?.addEventListener(
+        'abort',
+        () => {
+          clearTimeout(timer);
+          resolve();
+        },
+        { once: true }
+      );
+    });
+    if (options.signal?.aborted) return;
   }
 }

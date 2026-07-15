@@ -27,6 +27,7 @@ export interface OverseerServiceOptions {
   dryRun?: boolean;
   mergeJudge?: 'off' | 'grok';
   intervalMs?: number;
+  signal?: AbortSignal;
   deps?: OverseerRunStoreDeps & OverseerActionsDeps & GitHubClientDeps & Partial<GrokJudgeDeps>;
 }
 
@@ -142,6 +143,7 @@ export async function runOverseerService(options: OverseerServiceOptions = {}): 
   await watchLoop(deps, record => handleRecord(record, deps, dryRun, mergeJudge), {
     intervalMs: options.intervalMs,
     once: options.once,
+    signal: options.signal,
   });
 }
 
