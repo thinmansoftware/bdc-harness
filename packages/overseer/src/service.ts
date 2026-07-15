@@ -4,11 +4,7 @@ import {
   listRunEventsForOverseer,
   listRunsForOverseerWatch,
 } from '@archon/core/db/overseer';
-import {
-  appendOverseerCapabilityEvent,
-  listOverseerCapabilityEvents,
-} from '@archon/core/db/overseer-capabilities';
-import type { ErrorClass } from './classify.ts';
+import { appendOverseerCapabilityEvent } from '@archon/core/db/overseer-capabilities';
 import { runAuthorizedEscalation } from './authorized-escalation';
 import {
   createFakeGitHubAdapter,
@@ -136,34 +132,22 @@ async function handleRecord(
     return;
   }
 
-  const escalation = await runAuthorizedEscalation(
-    record.runId,
-    record.decision,
-    {
-      errorClass: record.errorClass as ErrorClass,
-      nodeId: record.lastEvent?.step_name ?? undefined,
-      woId: record.woId,
-      validatorOutput:
-        typeof record.lastEvent?.data.validatorOutput === 'string'
-          ? record.lastEvent.data.validatorOutput
-          : undefined,
-      repo: record.repo,
-      prEvidence: record.prEvidence,
-    },
-    { permit: permitFromMetadata(record.metadata), actor }
-  );
+  const escalation = await runAuthorizedEscalation(record.runId, {
+    permit: permitFromMetadata(record.metadata),
+    actor,
+  });
   await deps.insertOverseerAction({
     runId: record.runId,
     woId: record.woId,
     class: record.errorClass,
-    action: escalation.executed ? 'escalate' : 'escalation_denied',
+    action: escalation.accepted ? 'fake_escalation_attempt' : 'escalation_denied',
     result: escalation.reason,
   });
   log.info(
     {
       runId: record.runId,
       woId: record.woId,
-      action: escalation.executed ? 'escalate' : 'escalation_denied',
+      action: escalation.accepted ? 'fake_escalation_attempt' : 'escalation_denied',
       class: record.errorClass,
       reason: record.reason,
     },
@@ -240,28 +224,15 @@ function fixtureRepositories(): string[] {
 }
 
 function createDefaultFakeGitHubAdapter(): FakeGitHubAdapter {
-  const claimed = new Set<string>();
   return createFakeGitHubAdapter({
     allowed_repositories: fixtureRepositories(),
     authorization_deps: {
       getPolicy: async () => readOverseerActionPolicyFromEnv(),
     },
-    consume_execution: async executionId => {
-      if (claimed.has(executionId)) return false;
-      const events = await listOverseerCapabilityEvents();
-      if (
-        events.some(
-          event =>
-            event.event_type === 'adapter_attempt' &&
-            event.execution_id === executionId &&
-            event.details.accepted === true
-        )
-      ) {
-        return false;
-      }
-      claimed.add(executionId);
-      return true;
-    },
+    // The adapter_attempt insert is the persistent claim. Migration 034 owns a
+    // partial UNIQUE index on execution_id for adapter_attempt rows, so only one
+    // concurrent or post-restart attempt can be accepted and audited.
+    consume_execution: async () => true,
     record_attempt: appendOverseerCapabilityEvent,
   });
 }

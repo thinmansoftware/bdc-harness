@@ -293,7 +293,8 @@ export async function appendOverseerCapabilityEvent(
 ): Promise<OverseerCapabilityEvent> {
   validateEventInput(input);
   const db = getDatabase();
-  return db.withTransaction(async query => appendEventWithQuery(query, input, await txNow(query)));
+  const query = db.query.bind(db);
+  return appendEventWithQuery(query, input, await txNow(query));
 }
 
 export async function listOverseerCapabilityEvents(

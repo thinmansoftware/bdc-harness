@@ -191,22 +191,21 @@ export async function handleNodeFailure(
   // so existing v1 escalate paths (out_of_credits, auth_failed, etc.) are unaffected.
   //
   if (result.decision === 'escalate' && result.escalationContext) {
-    const escalation = await runAuthorizedEscalation(
-      workflowRun.id,
-      result,
-      result.escalationContext,
-      {
-        permit: permitFromMetadata(workflowRun.metadata),
-        actor: 'overseer-workflow-bridge',
-      }
-    ).catch((err: Error) => {
+    const escalation = await runAuthorizedEscalation(workflowRun.id, {
+      permit: permitFromMetadata(workflowRun.metadata),
+      actor: 'overseer-workflow-bridge',
+    }).catch((err: Error) => {
       deps.log.error(
         { err, workflowRunId: workflowRun.id, nodeId: node.id, errorClass },
         'overseer.escalation_failed'
       );
-      return { executed: false as const, reason: 'authorization_boundary_failed' };
+      return {
+        accepted: false as const,
+        reason: 'authorization_boundary_failed',
+        mutation_sent: false as const,
+      };
     });
-    if (!escalation.executed) {
+    if (!escalation.accepted) {
       deps.log.info(
         {
           runId: workflowRun.id,

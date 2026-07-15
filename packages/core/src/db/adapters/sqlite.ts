@@ -1062,6 +1062,9 @@ export class SqliteAdapter implements IDatabase {
 
       CREATE INDEX IF NOT EXISTS idx_overseer_capability_events_capability
         ON overseer_capability_events(capability, created_at);
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_overseer_capability_events_adapter_execution
+        ON overseer_capability_events(execution_id)
+        WHERE event_type = 'adapter_attempt' AND execution_id IS NOT NULL;
 
       INSERT OR IGNORE INTO overseer_capability_state (
         capability, action_enabled, circuit_state, circuit_reason, circuit_opened_at,

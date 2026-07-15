@@ -42,6 +42,13 @@ CREATE TABLE IF NOT EXISTS overseer_capability_events (
 CREATE INDEX IF NOT EXISTS idx_overseer_capability_events_capability
   ON overseer_capability_events(capability, created_at);
 
+-- One execution may cross a fake mutation boundary at most once. The partial
+-- unique index is the persistent compare-and-set used by fake adapters; it
+-- closes replay races across concurrent tasks and process restarts.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_overseer_capability_events_adapter_execution
+  ON overseer_capability_events(execution_id)
+  WHERE event_type = 'adapter_attempt' AND execution_id IS NOT NULL;
+
 INSERT INTO overseer_capability_state (
   capability, action_enabled, circuit_state, circuit_reason, circuit_opened_at,
   policy_digest, verifier_registry_digest, updated_at, updated_by

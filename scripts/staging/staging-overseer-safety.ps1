@@ -108,19 +108,18 @@ process.stdout.write(JSON.stringify(j));
     Fail "Failed to reach container /api/health: $($_.Exception.Message)"
   }
 
-  # Verify no live Octokit client is constructed (fake adapter selected)
+  # Verify the configured adapter is fake. The enabled watcher proof runs below;
+  # a disabled service is not accepted as evidence for this assertion.
   $adapterCheckJs = @'
 const env = process.env;
 const isFake = env.OVERSEER_USE_FAKE_GITHUB_ADAPTER === "1" || env.OVERSEER_USE_FAKE_GITHUB_ADAPTER === "true";
-const isDisabled = !(env.OVERSEER_ENABLED === "1" || env.OVERSEER_ENABLED === "true" || env.OVERSEER_ENABLED === "yes");
-if (isDisabled) { console.log("OVERSEER_DISABLED"); process.exit(0); }
 if (!isFake) { console.log("REAL_ADAPTER_ACTIVE"); process.exit(1); }
 console.log("FAKE_ADAPTER_CONFIRMED");
 '@
   try {
     $adapterCheck = & $Docker exec archon-staging bun -e $adapterCheckJs 2>$null
-    if ($adapterCheck -match "FAKE_ADAPTER_CONFIRMED|OVERSEER_DISABLED") {
-      Pass "Fake adapter or disabled state confirmed in container env"
+    if ($adapterCheck -match "FAKE_ADAPTER_CONFIRMED") {
+      Pass "Fake adapter confirmed in container env"
     } else {
       Fail "Real adapter may be active in staging container: $adapterCheck"
     }
@@ -208,67 +207,162 @@ try {
   }
 }
 
-# --- Assertion 7: fake adapter boundary -- adapter_attempt receipt verified ---
-# Exercise the actual createFakeGitHubAdapter factory: attempt a mutation against
-# an allowlisted repository and verify the adapter emits an adapter_attempt receipt
-# with mutation_sent=false and accepted=false (repository_not_allowlisted because
-# the test repo is not in the runtime allowlist). This proves the boundary is
-# constructed and enforced, not just declared in env variables.
+# --- Assertion 7: enabled live service path -- one persisted fake attempt ---
+# Run the actual one-shot Overseer watcher/service with a valid persistent
+# proposal, permit, and capability state. The subprocess temporarily enables one
+# fake capability, restores the prior state in finally, and fails unless exactly
+# one adapter_attempt is persisted with mutation_sent=false. No provider client
+# or mutation callback is allowed to run.
 if ($ContainerState -eq "running") {
-  $fakeAdapterJs = @'
-const { createFakeGitHubAdapter } = await import("/app/packages/overseer/src/adapters/fake-github.ts");
-const received = [];
-const adapter = createFakeGitHubAdapter({
-  allowed_repositories: [],
-  authorization_deps: {
-    getPolicy: async () => ({
-      service_enabled: false,
-      emergency_stop: true,
-      legacy_dry_run: true,
-      capability_flags: { escalation: false, repair: false, branch: false, lifecycle: false, merge: false },
-    }),
-  },
-  consume_execution: async () => false,
-  record_attempt: async (evt) => { received.push(evt); },
-});
-const request = {
-  permit_id: "test-permit",
-  repository: "outside-fixture",
-  pr_number: 1,
-  head_sha: "a".repeat(40),
-  base_branch: "main",
-  base_sha: "b".repeat(40),
-  snapshot_id: "snap-1",
-  proposal_id: "prop-1",
-  execution_id: "exec-1",
-  action_kind: "MERGE",
-};
-const authInput = {
-  requested_capability: "merge",
-  permit: { ...request, capability: "merge", valid_until: new Date(Date.now() + 60000).toISOString() },
-  actor: "test",
-  correlation_id: "test-corr",
-};
-const receipt = await adapter.attemptMutation(request, authInput);
-if (receipt.mutation_sent !== false) {
-  console.log("FAIL:mutation_sent_true");
-  process.exit(1);
+  $serviceCanaryJs = @'
+const { randomUUID } = await import("crypto");
+const { getDatabase, closeDatabase } = await import("/app/packages/core/src/db/connection.ts");
+const { listOverseerCapabilityEvents } = await import("/app/packages/core/src/db/overseer-capabilities.ts");
+const { runOverseerService } = await import("/app/packages/overseer/src/service.ts");
+
+if (process.env.OVERSEER_ENABLED !== "true") throw new Error("watcher_not_enabled");
+if (process.env.OVERSEER_USE_FAKE_GITHUB_ADAPTER !== "1") throw new Error("fake_adapter_not_enabled");
+if (process.env.OVERSEER_MERGE_ACTIONS_ENABLED !== "true") throw new Error("merge_canary_not_enabled");
+
+const db = getDatabase();
+const suffix = randomUUID();
+const snapshotId = "staging-snapshot-" + suffix;
+const proposalId = "staging-proposal-" + suffix;
+const executionId = "staging-execution-" + suffix;
+const permitId = "staging-permit-" + suffix;
+const policyDigest = "a".repeat(64);
+const verifierDigest = "b".repeat(64);
+const evidenceBlob = suffix.replaceAll("-", "").padEnd(40, "0").slice(0, 40);
+const now = Date.now();
+const createdAt = new Date(now - 30000).toISOString();
+const expiresAt = new Date(now + 300000).toISOString();
+const priorState = (await db.query("SELECT * FROM overseer_capability_state WHERE capability = $1", ["merge"])).rows[0];
+if (!priorState) throw new Error("merge_capability_state_missing");
+
+let mergeCalls = 0;
+const actions = [];
+try {
+  await db.query(
+    `INSERT INTO overseer_m31_snapshots (
+      snapshot_id, schema_version, repository, capture_started_at, capture_completed_at,
+      operator_actor, operator_model, read_only_query_method, base_branch, base_sha,
+      artifact_path, git_object_format, evidence_git_blob, mutation_attempted,
+      mutation_succeeded, fusion_calls_attempted, fusion_calls_succeeded
+    ) VALUES ($1, 'v1', $2, $3, $3, 'staging-canary', 'bun', 'local-fixture',
+      'dev', $4, $5, 'sha1', $6, 0, 0, 0, 0)`,
+    [snapshotId, "bluedevilcollectibles/bdc-harness", createdAt, "c".repeat(40),
+      "artifacts/" + suffix + ".json", evidenceBlob]
+  );
+  await db.query(
+    `INSERT INTO overseer_m31_action_proposals (
+      proposal_id, repository, pr_number, head_sha, base_branch, base_sha,
+      snapshot_id, evidence_path, evidence_git_blob, action_kind,
+      action_parameters_json, actor, created_at, expires_at, execution_id,
+      capability, policy_digest, verifier_registry_digest
+    ) VALUES ($1, $2, 42, $3, 'dev', $4, $5, $6, $7, 'MERGE', '{}',
+      'staging-canary', $8, $9, $10, 'overseer.m31.merge', $11, $12)`,
+    [proposalId, "bluedevilcollectibles/bdc-harness", "d".repeat(40), "c".repeat(40),
+      snapshotId, "artifacts/" + suffix + ".json", evidenceBlob, createdAt, expiresAt,
+      executionId, policyDigest, verifierDigest]
+  );
+  await db.query(
+    `UPDATE overseer_capability_state
+     SET action_enabled = 1, circuit_state = 'closed', circuit_reason = NULL,
+       circuit_opened_at = NULL, policy_digest = $1, verifier_registry_digest = $2,
+       updated_at = $3, updated_by = 'staging-canary'
+     WHERE capability = 'merge'`,
+    [policyDigest, verifierDigest, createdAt]
+  );
+
+  const permit = {
+    permit_id: permitId,
+    proposal_id: proposalId,
+    execution_id: executionId,
+    repository: "bluedevilcollectibles/bdc-harness",
+    pr_number: 42,
+    head_sha: "d".repeat(40),
+    base_branch: "dev",
+    base_sha: "c".repeat(40),
+    snapshot_id: snapshotId,
+    action_kind: "MERGE",
+    capability: "overseer.m31.merge",
+    issued_at: new Date(now - 1000).toISOString(),
+    valid_until: new Date(now + 60000).toISOString(),
+  };
+
+  await runOverseerService({
+    once: true,
+    enabled: true,
+    dryRun: false,
+    adapterKind: "fake",
+    deps: {
+      listRunsForWatch: async () => [{
+        id: "staging-run-" + suffix,
+        woId: "WO-M42-STAGING-CANARY",
+        owner: "bluedevilcollectibles",
+        repo: "bdc-harness",
+        status: "failed",
+        metadata: { overseer_m31_permit: permit },
+      }],
+      listRunEvents: async () => [],
+      findPullRequest: async () => ({
+        exists: true,
+        state: "open",
+        checks: { total: 1, passed: 1, failed: 0, pending: 0 },
+        mergeable: true,
+        pr: { owner: "bluedevilcollectibles", repo: "bdc-harness", number: 42 },
+      }),
+      mergePullRequest: async () => {
+        mergeCalls++;
+        throw new Error("real_merge_boundary_reached");
+      },
+      insertOverseerAction: async action => { actions.push(action); },
+    },
+  });
+
+  const attempts = (await listOverseerCapabilityEvents("merge")).filter(
+    event => event.event_type === "adapter_attempt" && event.execution_id === executionId
+  );
+  if (mergeCalls !== 0) throw new Error("real_merge_callback_called:" + mergeCalls);
+  if (actions.length !== 1 || actions[0].action !== "fake_merge_attempt") {
+    throw new Error("unexpected_service_action:" + JSON.stringify(actions));
+  }
+  if (attempts.length !== 1) throw new Error("adapter_attempt_count:" + attempts.length);
+  if (attempts[0].details.adapter !== "fake-github") throw new Error("wrong_adapter");
+  if (attempts[0].details.accepted !== true) throw new Error("fake_attempt_not_accepted");
+  if (attempts[0].details.mutation_sent !== false) throw new Error("mutation_sent_true");
+  console.log("LIVE_SERVICE_CANARY_OK:attempts=1:mutation_sent=false:real_calls=0");
+} finally {
+  await db.query(
+    `UPDATE overseer_capability_state
+     SET action_enabled = $1, circuit_state = $2, circuit_reason = $3,
+       circuit_opened_at = $4, policy_digest = $5, verifier_registry_digest = $6,
+       updated_at = $7, updated_by = $8
+     WHERE capability = 'merge'`,
+    [priorState.action_enabled, priorState.circuit_state, priorState.circuit_reason,
+      priorState.circuit_opened_at, priorState.policy_digest,
+      priorState.verifier_registry_digest, priorState.updated_at, priorState.updated_by]
+  );
+  await closeDatabase();
 }
-if (received.length !== 1 || received[0].event_type !== "adapter_attempt") {
-  console.log("FAIL:no_adapter_attempt_event:count=" + received.length);
-  process.exit(1);
-}
-console.log("FAKE_ADAPTER_RECEIPT:reason=" + receipt.reason + ":mutation_sent=false:event_recorded=true");
 '@
   try {
-    $fakeAdapterCheck = & $Docker exec archon-staging bun -e $fakeAdapterJs 2>$null
-    if ($fakeAdapterCheck -match "^FAKE_ADAPTER_RECEIPT:") {
-      Pass "Fake adapter boundary exercised: adapter_attempt event recorded, mutation_sent=false: $fakeAdapterCheck"
+    $serviceCanary = & $Docker exec `
+      -e ARCHON_HOME=/.archon `
+      -e OVERSEER_ENABLED=true `
+      -e OVERSEER_EMERGENCY_STOP=false `
+      -e OVERSEER_DRY_RUN=false `
+      -e OVERSEER_USE_FAKE_GITHUB_ADAPTER=1 `
+      -e OVERSEER_FAKE_GITHUB_REPOSITORIES=bluedevilcollectibles/bdc-harness `
+      -e OVERSEER_MERGE_ACTIONS_ENABLED=true `
+      archon-staging bun -e $serviceCanaryJs 2>$null
+    if ($serviceCanary -match "LIVE_SERVICE_CANARY_OK:attempts=1:mutation_sent=false:real_calls=0") {
+      Pass "Enabled live Overseer service persisted exactly one inert fake attempt: $serviceCanary"
     } else {
-      Fail "Fake adapter boundary check failed: $fakeAdapterCheck"
+      Fail "Enabled live Overseer service canary failed: $serviceCanary"
     }
   } catch {
-    Fail "Fake adapter boundary check exception: $($_.Exception.Message)"
+    Fail "Enabled live Overseer service canary exception: $($_.Exception.Message)"
   }
 }
 

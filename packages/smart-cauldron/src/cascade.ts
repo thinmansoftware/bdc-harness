@@ -41,7 +41,6 @@ import type {
   FireResult,
   PollResult,
 } from './types.js';
-import type { DecisionResult } from '@archon/overseer/decide';
 
 const execFileAsync = promisify(execFile);
 
@@ -707,26 +706,10 @@ function extractStatusCode(infraError: string): number | undefined {
  * Default escalation implementation using the shared persistent M-42 boundary.
  */
 async function defaultEscalate(ctx: EscalationCallContext): Promise<void> {
-  const decision: DecisionResult = {
-    decision: 'escalate',
-    reason: ctx.reason,
-    escalationContext: {
-      errorClass: ctx.errorClass as import('@archon/overseer/classify').ErrorClass,
-      woId: ctx.woId,
-      remediation: ctx.remediation,
-    },
-  };
-
-  await runAuthorizedEscalation(
-    ctx.runId ?? `cascade-${randomUUID()}`,
-    decision,
-    {
-      errorClass: ctx.errorClass as import('@archon/overseer/classify').ErrorClass,
-      woId: ctx.woId,
-      remediation: ctx.remediation,
-    },
-    { permit: ctx.overseerPermit ?? null, actor: 'smart-cauldron' }
-  );
+  await runAuthorizedEscalation(ctx.runId ?? `cascade-${randomUUID()}`, {
+    permit: ctx.overseerPermit ?? null,
+    actor: 'smart-cauldron',
+  });
 }
 
 /**

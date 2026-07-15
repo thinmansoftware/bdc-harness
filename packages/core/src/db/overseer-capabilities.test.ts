@@ -238,6 +238,7 @@ describe('overseer capability persistence (sqlite)', () => {
       expect(schema).toContain('CREATE TABLE IF NOT EXISTS overseer_capability_events');
       expect(schema).toContain('trg_overseer_capability_events_no_update');
       expect(schema).toContain('trg_overseer_capability_events_no_delete');
+      expect(schema).toContain('idx_overseer_capability_events_adapter_execution');
       for (const capability of OVERSEER_CAPABILITIES) {
         expect(stateTable).toContain(`'${capability}'`);
         expect(eventTable).toContain(`'${capability}'`);
@@ -299,6 +300,88 @@ describe('overseer capability persistence (sqlite)', () => {
       db.query('UPDATE overseer_capability_events SET reason = $1', ['tamper'])
     ).rejects.toThrow(/append-only/);
     await expect(db.query('DELETE FROM overseer_capability_events')).rejects.toThrow(/append-only/);
+  });
+
+  test('atomically accepts only one adapter attempt per execution id', async () => {
+    await db.query(
+      `INSERT INTO overseer_m31_snapshots (
+        snapshot_id, schema_version, repository, capture_started_at, capture_completed_at,
+        operator_actor, operator_model, read_only_query_method, base_branch, base_sha,
+        artifact_path, git_object_format, evidence_git_blob, mutation_attempted,
+        mutation_succeeded, fusion_calls_attempted, fusion_calls_succeeded
+      ) VALUES ($1, $2, $3, $4, $4, $5, $5, $6, $7, $8, $9, $10, $11, 0, 0, 0, 0)`,
+      [
+        'snapshot-adapter-claim',
+        'v1',
+        'bluedevilcollectibles/bdc-harness',
+        '2026-07-15T12:00:00.000Z',
+        'test',
+        'unit-test',
+        'dev',
+        'a'.repeat(40),
+        'artifacts/adapter-claim.json',
+        'sha1',
+        'b'.repeat(40),
+      ]
+    );
+    await db.query(
+      `INSERT INTO overseer_m31_action_proposals (
+        proposal_id, repository, pr_number, head_sha, base_branch, base_sha,
+        snapshot_id, evidence_path, evidence_git_blob, action_kind,
+        action_parameters_json, actor, created_at, expires_at, execution_id,
+        capability, policy_digest, verifier_registry_digest
+      ) VALUES ($1, $2, 42, $3, $4, $5, $6, $7, $8, 'MERGE', '{}', $9,
+        $10, $11, $12, $13, $14, $15)`,
+      [
+        'proposal-adapter-claim',
+        'bluedevilcollectibles/bdc-harness',
+        'c'.repeat(40),
+        'dev',
+        'a'.repeat(40),
+        'snapshot-adapter-claim',
+        'artifacts/adapter-claim.json',
+        'b'.repeat(40),
+        'test',
+        '2026-07-15T12:00:00.000Z',
+        '2026-07-15T12:05:00.000Z',
+        'execution-adapter-claim',
+        'overseer.m31.merge',
+        POLICY_DIGEST,
+        VERIFIER_DIGEST,
+      ]
+    );
+
+    const attempts = await Promise.allSettled([
+      appendOverseerCapabilityEvent(
+        eventInput({
+          event_id: 'adapter-claim-a',
+          event_type: 'adapter_attempt',
+          proposal_id: 'proposal-adapter-claim',
+          execution_id: 'execution-adapter-claim',
+        })
+      ),
+      appendOverseerCapabilityEvent(
+        eventInput({
+          event_id: 'adapter-claim-b',
+          event_type: 'adapter_attempt',
+          proposal_id: 'proposal-adapter-claim',
+          execution_id: 'execution-adapter-claim',
+        })
+      ),
+    ]);
+
+    expect(attempts.filter(result => result.status === 'fulfilled')).toHaveLength(1);
+    expect(attempts.filter(result => result.status === 'rejected')).toHaveLength(1);
+    const rejection = attempts.find(result => result.status === 'rejected');
+    expect(rejection?.reason).toHaveProperty(
+      'message',
+      expect.stringContaining('overseer_capability_events.execution_id')
+    );
+    expect(
+      (await listOverseerCapabilityEvents('merge')).filter(
+        event => event.event_type === 'adapter_attempt'
+      )
+    ).toHaveLength(1);
   });
 
   test('rejects generic transition events before writes while circuit open emits atomically', async () => {
