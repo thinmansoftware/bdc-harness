@@ -1136,6 +1136,7 @@ nodes:
       set -euo pipefail
       REG_OUT=$register-yaml.output
       APPROVAL=$approval-gate.output
+      API_BASE="${ARCHON_API_BASE:-https://archon.bluedevilcollectibles.com}"
 
       # Re-check approval in case trigger_rule brings us here unexpectedly
       if ! printf '%s\n' "$APPROVAL" | grep -iqE 'approved|proceed|^yes|fire'; then
@@ -1169,7 +1170,7 @@ nodes:
       # running. If so, SKIP the fire and treat the existing run as ours. Best-effort:
       # a probe failure must NOT block the fire (shell-only parse; no multi-line python
       # heredoc -- that breaks the YAML block scalar, per bun-yaml-parser gotcha).
-      RUNS_JSON=$(curl -fsS --max-time 15 "https://archon.bluedevilcollectibles.com/api/workflows/runs?limit=20" -H "x-archon-operator-token: ${ARCHON_OPERATOR_TOKEN}" 2>/dev/null || true)
+      RUNS_JSON=$(curl -fsS --max-time 15 "${API_BASE}/api/workflows/runs?limit=20" -H "x-archon-operator-token: ${ARCHON_OPERATOR_TOKEN}" 2>/dev/null || true)
       # Compact to one-object-per-line, then keep only entries for THIS slug that are running/pending/started.
       DUP_HIT=$(printf '%s' "$RUNS_JSON" | tr '{' '\n' | grep -F "\"workflow_name\":\"${WO_SLUG}\"" | grep -E '"status":"(running|pending|started)"' | head -n 1 || true)
       if [ -n "$DUP_HIT" ]; then
@@ -1182,7 +1183,7 @@ nodes:
       echo "Firing: workflowSlug=${WO_SLUG} conversationId=${CONV_ID} message='${FIRE_MESSAGE}' repo=${TARGET_REPO_FULL}"
 
       RESPONSE=$(curl -fsS -X POST \
-        "https://archon.bluedevilcollectibles.com/api/workflows/${WO_SLUG}/run" \
+        "${API_BASE}/api/workflows/${WO_SLUG}/run" \
         -H "Content-Type: application/json" \
         -H "x-archon-operator-token: ${ARCHON_OPERATOR_TOKEN}" \
         --max-time 30 \
@@ -1247,7 +1248,7 @@ nodes:
       WO_SLUG=$(printf '%s\n' "$FIRE_OUT" | sed -n 's/^WO_SLUG=//p' | head -n 1)
       EXPECTED_REPO=$(printf '%s\n' "$FIRE_OUT" | sed -n 's/^TARGET_REPO_FULL=//p' | head -n 1)
 
-      API_BASE="https://archon.bluedevilcollectibles.com"
+      API_BASE="${ARCHON_API_BASE:-https://archon.bluedevilcollectibles.com}"
       echo "=== verify-binding: polling for run (RUN_ID=${RUN_ID} CONV_ID=${CONV_ID} WO_SLUG=${WO_SLUG}) up to 90s ==="
 
       # Resolve the codebase_id -> repo-name map once (so we can compare binding).

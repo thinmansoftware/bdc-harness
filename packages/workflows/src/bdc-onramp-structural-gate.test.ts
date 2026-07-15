@@ -195,6 +195,21 @@ describe('on-ramp atom structural placeholder gate', () => {
     expect(result.workflow?.name).toBe('bdc-harness-wo-onramp');
   });
 
+  it('routes child dispatch and binding verification through the configured Archon API', () => {
+    const path = join(REPO_ROOT, '.archon/workflows/defaults/bdc-harness-wo-onramp.yaml');
+    const result = parseWorkflow(readFileSync(path, 'utf8'), 'bdc-harness-wo-onramp.yaml');
+    const nodes = new Map(result.workflow?.nodes.map(node => [node.id, node]));
+    const productionDefault = '${ARCHON_API_BASE:-https://archon.bluedevilcollectibles.com}';
+
+    for (const id of ['fire-child', 'verify-binding']) {
+      const bash = String(nodes.get(id)?.bash || '');
+      expect(bash).toContain(productionDefault);
+      expect(bash.replaceAll(productionDefault, '')).not.toContain(
+        'https://archon.bluedevilcollectibles.com'
+      );
+    }
+  });
+
   it('FAILS a draft with an unfilled inputs.WO_ID.default stub', () => {
     const { failed, detail } = runGate(BROKEN_UNFILLED_WO_ID, dir);
     expect(failed).toBe(true);
