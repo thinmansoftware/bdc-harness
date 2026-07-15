@@ -28,6 +28,8 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs
 import { tmpdir } from 'os';
 import { join } from 'path';
 
+const REPO_ROOT = join(import.meta.dir, '..', '..', '..');
+
 // The exact structural-check snippet embedded in bdc-harness-wo-onramp.yaml (both gates).
 // Reads the draft path from $DRAFT, prints failures to stdout (empty = pass), exits 0.
 // The caller treats non-empty stdout as a gate FAIL.
@@ -225,7 +227,7 @@ describe('on-ramp atom structural placeholder gate', () => {
 
   it('keeps both real on-ramp validation gates in parity with the risk-chain check', () => {
     const source = readFileSync(
-      join(process.cwd(), '.archon/workflows/defaults/bdc-harness-wo-onramp.yaml'),
+      join(REPO_ROOT, '.archon/workflows/defaults/bdc-harness-wo-onramp.yaml'),
       'utf8'
     );
     expect(
