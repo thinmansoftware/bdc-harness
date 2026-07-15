@@ -355,6 +355,36 @@ nodes:
             if (v === null || typeof v === "object") continue;
             if (stubs.includes(String(v))) { fails.push("top-level field " + k + " is an unfilled stub: " + String(v)); }
           }
+          // (f) every side-effect chain node must be a descendant of the risk gate and
+          // must independently require the gate's mechanical proceed verdict. This is
+          // mandatory even with trigger_rule: all_done, which otherwise bypasses failure.
+          const nodes = Array.isArray(obj.nodes) ? obj.nodes : [];
+          const byId = new Map(nodes.map(node => [node && node.id, node]));
+          const risk = byId.get("business-risk-gate");
+          if (!risk || typeof risk !== "object") {
+            fails.push("business-risk-gate missing");
+          } else if (!String(risk.bash || "").includes(JSON.stringify({gate:"proceed"}))) {
+            fails.push("business-risk-gate must emit gate=proceed only after its checks pass");
+          }
+          const ancestors = id => {
+            const seen = new Set();
+            const visit = current => {
+              const node = byId.get(current);
+              const deps = Array.isArray(node && node.depends_on) ? node.depends_on : [];
+              for (const dep of deps) if (!seen.has(dep)) { seen.add(dep); visit(dep); }
+            };
+            visit(id);
+            return seen;
+          };
+          const requiredWhen = "$business-risk-gate.output.gate == " + String.fromCharCode(39) + "proceed" + String.fromCharCode(39);
+          for (const id of ["decide-push-target", "commit-and-push", "open-pr-if-needed", "build-manifest", "flip-notion"]) {
+            const node = byId.get(id);
+            if (!node) { fails.push(id + " missing"); continue; }
+            if (!ancestors(id).has("business-risk-gate")) fails.push(id + " is not downstream of business-risk-gate");
+            if (String(node.when || "").trim() !== requiredWhen) {
+              fails.push(id + " must condition on $business-risk-gate.output.gate == proceed");
+            }
+          }
           if (fails.length) { console.log(fails.join("; ")); }
         ' 2>&1 || true)
         if [ -n "$STRUCT_ERR" ]; then
@@ -410,6 +440,13 @@ nodes:
         commit-and-push (load_bearing) -> open-pr-if-needed (load_bearing) ->
         build-manifest (trigger_rule: all_done) -> flip-notion.
 
+        The business-risk-gate success path MUST end by emitting exactly
+        {"gate":"proceed"}. The decide-push-target, commit-and-push,
+        open-pr-if-needed, build-manifest, and flip-notion nodes MUST each be
+        downstream of the gate and carry this condition verbatim:
+          when: "$business-risk-gate.output.gate == 'proceed'"
+        This condition is required even when a node uses trigger_rule: all_done.
+
         ## Tailoring requirements
 
         1. Bake in WO_ID at root so the child needs no USER_MESSAGE at fire time:
@@ -436,6 +473,9 @@ nodes:
         - no n8n webhook calls
         - flip-notion final node; business-risk-gate present and load_bearing: true
         - business-risk-gate includes BUSINESS_RISK_INVARIANT verbatim
+        - business-risk-gate emits {"gate":"proceed"} only after all checks pass
+        - decide-push-target, commit-and-push, open-pr-if-needed, build-manifest, and
+          flip-notion each condition on $business-risk-gate.output.gate == 'proceed'
         - root name: is the real child slug (NOT "<slug>" / "<bdc-slug>")
         - inputs.WO_ID.default is the real WO_ID (NOT "<WO_ID>" / "<WO_ID from normalize-spec>")
         - no dev-error tokens: TODO, FIXME, TBD, REPLACE_ME, lorem ipsum
@@ -550,6 +590,33 @@ nodes:
           if (v === null || typeof v === "object") continue;
           if (stubs.includes(String(v))) { fails.push("top-level field " + k + " unfilled stub: " + String(v)); }
         }
+        const nodes = Array.isArray(obj.nodes) ? obj.nodes : [];
+        const byId = new Map(nodes.map(node => [node && node.id, node]));
+        const risk = byId.get("business-risk-gate");
+        if (!risk || typeof risk !== "object") {
+          fails.push("business-risk-gate missing");
+        } else if (!String(risk.bash || "").includes(JSON.stringify({gate:"proceed"}))) {
+          fails.push("business-risk-gate must emit gate=proceed only after its checks pass");
+        }
+        const ancestors = id => {
+          const seen = new Set();
+          const visit = current => {
+            const node = byId.get(current);
+            const deps = Array.isArray(node && node.depends_on) ? node.depends_on : [];
+            for (const dep of deps) if (!seen.has(dep)) { seen.add(dep); visit(dep); }
+          };
+          visit(id);
+          return seen;
+        };
+        const requiredWhen = "$business-risk-gate.output.gate == " + String.fromCharCode(39) + "proceed" + String.fromCharCode(39);
+        for (const id of ["decide-push-target", "commit-and-push", "open-pr-if-needed", "build-manifest", "flip-notion"]) {
+          const node = byId.get(id);
+          if (!node) { fails.push(id + " missing"); continue; }
+          if (!ancestors(id).has("business-risk-gate")) fails.push(id + " is not downstream of business-risk-gate");
+          if (String(node.when || "").trim() !== requiredWhen) {
+            fails.push(id + " must condition on $business-risk-gate.output.gate == proceed");
+          }
+        }
         if (fails.length) { console.log(fails.join("; ")); }
       ' 2>&1 || true)
       if [ -n "$STRUCT_ERR" ]; then
@@ -636,8 +703,11 @@ nodes:
 
       2. **Business-risk-gate correctness** (1-10): Does the business-risk-gate node's invariant
          match BUSINESS_RISK_INVARIANT from the spec exactly (or closely)? Is it load_bearing: true?
-         Does it fail closed (set -euo pipefail; exit 1 path exists)?
-         Score <7 if invariant is generic/wrong or the node lacks fail-closed logic.
+         Does it fail closed (set -euo pipefail; exit 1 path exists), emit {"gate":"proceed"}
+         only after passing, and mechanically condition decide-push-target, commit-and-push,
+         open-pr-if-needed, build-manifest, and flip-notion on that proceed verdict?
+         Score <7 if invariant is generic/wrong, the node lacks fail-closed logic, or any
+         push/PR/Notion chain node can run without the proceed condition.
 
       3. **Rule 20 compliance** (1-10): If RULE20_STAGING_GATE=true, does the child YAML enforce
          staging branch as PR base? If false, does it correctly skip that gate?

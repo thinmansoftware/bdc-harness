@@ -4292,6 +4292,7 @@ async function executeApprovalNode(
   nodeOutputs: Map<string, NodeOutput>,
   config: WorkflowConfig,
   workflowLevelOptions: WorkflowLevelOptions,
+  workflowInteractive: boolean | undefined,
   configuredCommandFolder?: string,
   issueContext?: string
 ): Promise<NodeOutput> {
@@ -4416,10 +4417,10 @@ async function executeApprovalNode(
     // Fall through to re-pause at the approval gate
   }
 
-  // Interactive-mode gate (CAULDRON_INTERACTIVE). Default false so CI and orchestrator
-  // child runs do not hang at the human gate -- they auto-proceed. Only operator-driven
-  // Mission Control sessions (flag true) actually pause and present the message.
-  const interactive = process.env.CAULDRON_INTERACTIVE === 'true';
+  // Root interactive workflows are dispatched in the operator conversation and must
+  // honor their approval nodes even when the process-wide override is unset. The env
+  // flag remains an explicit override for callers whose workflow has no root setting.
+  const interactive = workflowInteractive === true || process.env.CAULDRON_INTERACTIVE === 'true';
   if (!interactive) {
     getLog().info(
       { workflowRunId: workflowRun.id, nodeId: node.id },
@@ -4602,6 +4603,7 @@ async function executeDagWorkflowInternal(
     name: string;
     nodes: readonly DagNode[];
     inputs?: Record<string, { default: string }>;
+    interactive?: boolean;
     // WO-HARNESS-NODE-PROVIDER-FAILOVER-01: workflow-root failover defaults
     // (snake_case YAML field names on WorkflowDefinition).
     failover_provider?: string;
@@ -5078,6 +5080,7 @@ async function executeDagWorkflowInternal(
               nodeOutputs,
               config,
               workflowLevelOptions,
+              workflow.interactive,
               configuredCommandFolder,
               issueContext
             );
