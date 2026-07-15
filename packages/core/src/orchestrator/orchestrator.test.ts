@@ -1016,6 +1016,56 @@ describe('orchestrator-agent handleMessage', () => {
       expect(platform.sendMessage).toHaveBeenCalledWith('chat-456', 'Let me investigate this.');
     });
 
+    // WO-HARNESS-ATOMIC-FIRE-FROM-BRANCH-01: task/from-branch isolation hints
+    // supplied on the dispatch context must reach validateAndResolveIsolation
+    // unchanged (start-point intent), rather than being dropped. The unique
+    // worker-id assignment is asserted in orchestrator-background-dispatch.test.ts
+    // against the real dispatchBackgroundWorkflow.
+    test('forwards task + fromBranch isolation hints to validateAndResolveIsolation', async () => {
+      mockClient.sendQuery.mockImplementation(async function* () {
+        yield {
+          type: 'assistant',
+          content: 'On it.\n/invoke-workflow fix-bug --project test-project',
+        };
+        yield { type: 'result', sessionId: 'session-id' };
+      });
+
+      await handleMessage(platform, 'chat-456', 'fix the login bug', {
+        isolationHints: {
+          workflowType: 'task',
+          workflowId: 'web-parent-conv',
+          fromBranch: 'origin/release/ce',
+        },
+      });
+
+      expect(mockValidateAndResolveIsolation).toHaveBeenCalled();
+      const hintsArg = mockValidateAndResolveIsolation.mock.calls.at(-1)?.[4] as
+        | Record<string, unknown>
+        | undefined;
+      expect(hintsArg?.workflowType).toBe('task');
+      expect(hintsArg?.workflowId).toBe('web-parent-conv');
+      expect(hintsArg?.fromBranch).toBe('origin/release/ce');
+    });
+
+    test('no isolation hints -> validateAndResolveIsolation not given task/from-branch', async () => {
+      mockClient.sendQuery.mockImplementation(async function* () {
+        yield {
+          type: 'assistant',
+          content: 'On it.\n/invoke-workflow fix-bug --project test-project',
+        };
+        yield { type: 'result', sessionId: 'session-id' };
+      });
+
+      await handleMessage(platform, 'chat-456', 'fix the login bug');
+
+      expect(mockValidateAndResolveIsolation).toHaveBeenCalled();
+      const hintsArg = mockValidateAndResolveIsolation.mock.calls.at(-1)?.[4] as
+        | Record<string, unknown>
+        | undefined;
+      expect(hintsArg?.workflowType).not.toBe('task');
+      expect(hintsArg?.fromBranch).toBeUndefined();
+    });
+
     test('sends error for unknown project in workflow invocation', async () => {
       mockClient.sendQuery.mockImplementation(async function* () {
         yield {

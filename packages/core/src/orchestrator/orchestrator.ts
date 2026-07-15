@@ -292,12 +292,26 @@ export async function dispatchBackgroundWorkflow(
         `Cannot dispatch workflow "${workflow.name}": codebase ${ctx.codebaseId} not found`
       );
     }
+    // Preserve an explicit task/from-branch request from the parent dispatch so
+    // the worker worktree starts from the requested branch. The worker always
+    // gets its own unique workflowId (workerPlatformId); only the start-point
+    // intent (workflowType: 'task' + fromBranch) is inherited. Absent or
+    // non-task hints fall back to today's thread isolation exactly.
+    const parentHints = ctx.isolationHints;
+    const workerHints: IsolationHints =
+      parentHints?.workflowType === 'task'
+        ? {
+            workflowType: 'task',
+            workflowId: workerPlatformId,
+            fromBranch: parentHints.fromBranch,
+          }
+        : { workflowType: 'thread', workflowId: workerPlatformId };
     const result = await validateAndResolveIsolation(
       workerConv,
       codebase,
       ctx.platform,
       workerPlatformId,
-      { workflowType: 'thread', workflowId: workerPlatformId }
+      workerHints
     );
     workerCwd = result.cwd;
     await db.updateConversation(workerConv.id, { cwd: workerCwd }).catch((e: unknown) => {
