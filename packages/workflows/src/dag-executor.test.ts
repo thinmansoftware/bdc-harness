@@ -7392,6 +7392,46 @@ describe('executeDagWorkflow -- approval node', () => {
     expect(completeCalls.length).toBe(1);
   });
 
+  it('pauses an interactive workflow approval when CAULDRON_INTERACTIVE is unset', async () => {
+    delete process.env.CAULDRON_INTERACTIVE;
+
+    const store = createMockStore();
+    const mockDeps = createMockDeps(store);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('root-interactive-approval-run');
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-root-interactive',
+      testDir,
+      {
+        name: 'root-interactive-approval',
+        interactive: true,
+        nodes: [
+          {
+            id: 'gate',
+            approval: { message: 'Approve this interactive workflow?' },
+          },
+        ],
+      },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    const pauseCalls = (
+      store.pauseWorkflowRun as Mock<(id: string, ctx: Record<string, unknown>) => Promise<void>>
+    ).mock.calls;
+    expect(pauseCalls.length).toBe(1);
+    expect(pauseCalls[0][1]).toMatchObject({ type: 'approval', nodeId: 'gate' });
+  });
+
   it('T1: interactive (CAULDRON_INTERACTIVE=true) approval node pauses and sends the message', async () => {
     // Set interactive mode -- gate should pause and send the approval message
     process.env.CAULDRON_INTERACTIVE = 'true';

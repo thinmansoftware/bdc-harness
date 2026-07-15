@@ -24,7 +24,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
-import { mkdtempSync, rmSync, writeFileSync } from 'fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 
@@ -54,6 +54,33 @@ STRUCT_ERR=$(DRAFT="$DRAFT" bun -e '
     if (v === null || typeof v === "object") continue;
     if (stubs.includes(String(v))) { fails.push("top-level field " + k + " unfilled stub: " + String(v)); }
   }
+  const nodes = Array.isArray(obj.nodes) ? obj.nodes : [];
+  const byId = new Map(nodes.map(node => [node && node.id, node]));
+  const risk = byId.get("business-risk-gate");
+  if (!risk || typeof risk !== "object") {
+    fails.push("business-risk-gate missing");
+  } else if (!String(risk.bash || "").includes(JSON.stringify({gate:"proceed"}))) {
+    fails.push("business-risk-gate must emit gate=proceed only after its checks pass");
+  }
+  const ancestors = id => {
+    const seen = new Set();
+    const visit = current => {
+      const node = byId.get(current);
+      const deps = Array.isArray(node && node.depends_on) ? node.depends_on : [];
+      for (const dep of deps) if (!seen.has(dep)) { seen.add(dep); visit(dep); }
+    };
+    visit(id);
+    return seen;
+  };
+  const requiredWhen = "$business-risk-gate.output.gate == " + String.fromCharCode(39) + "proceed" + String.fromCharCode(39);
+  for (const id of ["decide-push-target", "commit-and-push", "open-pr-if-needed", "build-manifest", "flip-notion"]) {
+    const node = byId.get(id);
+    if (!node) { fails.push(id + " missing"); continue; }
+    if (!ancestors(id).has("business-risk-gate")) fails.push(id + " is not downstream of business-risk-gate");
+    if (String(node.when || "").trim() !== requiredWhen) {
+      fails.push(id + " must condition on $business-risk-gate.output.gate == proceed");
+    }
+  }
   if (fails.length) { console.log(fails.join("; ")); }
 ' 2>&1 || true)
 printf '%s' "$STRUCT_ERR"
@@ -62,7 +89,9 @@ printf '%s' "$STRUCT_ERR"
 function runGate(yamlText: string, dir: string): { failed: boolean; detail: string } {
   const draftPath = join(dir, 'candidate.yaml.draft');
   writeFileSync(draftPath, yamlText, 'utf8');
-  const result = Bun.spawnSync(['bash', '-c', STRUCTURAL_CHECK], {
+  const gitBash = 'C:\\Program Files\\Git\\bin\\bash.exe';
+  const bash = process.platform === 'win32' && existsSync(gitBash) ? gitBash : 'bash';
+  const result = Bun.spawnSync([bash, '-c', STRUCTURAL_CHECK], {
     cwd: dir,
     env: { ...process.env, DRAFT: draftPath },
     stdout: 'pipe',
@@ -91,13 +120,41 @@ nodes:
     load_bearing: true
     bash: |
       echo "guard the invariant"
-  - id: decide
+      echo '{"gate":"proceed"}'
+  - id: decide-push-target
+    depends_on: [business-risk-gate]
+    when: "$business-risk-gate.output.gate == 'proceed'"
     prompt: |
       Emit SINGLE_DECISION_NEEDED=<one sentence John can answer> and a status.
+  - id: commit-and-push
+    depends_on: [decide-push-target]
+    when: "$business-risk-gate.output.gate == 'proceed'"
+    bash: echo push
+  - id: open-pr-if-needed
+    depends_on: [commit-and-push]
+    when: "$business-risk-gate.output.gate == 'proceed'"
+    bash: echo pr
+  - id: build-manifest
+    depends_on: [open-pr-if-needed]
+    trigger_rule: all_done
+    when: "$business-risk-gate.output.gate == 'proceed'"
+    prompt: Build a truthful manifest.
   - id: flip-notion
+    depends_on: [build-manifest]
+    when: "$business-risk-gate.output.gate == 'proceed'"
     prompt: |
       Flip the WO to REVIEW.
 `;
+
+const BROKEN_UNGATED_SIDE_EFFECTS = HEALTHY_CHILD.replace(
+  /\n    when: "\$business-risk-gate\.output\.gate == 'proceed'"/g,
+  ''
+);
+
+const BROKEN_INVERTED_RISK_CONDITION = HEALTHY_CHILD.replace(
+  /\$business-risk-gate\.output\.gate == 'proceed'/g,
+  "$business-risk-gate.output.gate != 'proceed'"
+);
 
 // Same shape, but the agent forgot to substitute inputs.WO_ID.default -- the literal
 // atom template stub survived. This is the real failure class the gate must catch.
@@ -149,6 +206,31 @@ describe('on-ramp atom structural placeholder gate', () => {
     const { failed, detail } = runGate('name: [unclosed\n  model: sonnet', dir);
     expect(failed).toBe(true);
     expect(detail).toContain('parse');
+  });
+
+  it('FAILS a child whose push, PR, and Notion nodes are not conditioned on risk PASS', () => {
+    const { failed, detail } = runGate(BROKEN_UNGATED_SIDE_EFFECTS, dir);
+    expect(failed).toBe(true);
+    expect(detail).toContain('commit-and-push');
+    expect(detail).toContain('open-pr-if-needed');
+    expect(detail).toContain('build-manifest');
+    expect(detail).toContain('flip-notion');
+  });
+
+  it('FAILS a child whose risk condition is inverted', () => {
+    const { failed, detail } = runGate(BROKEN_INVERTED_RISK_CONDITION, dir);
+    expect(failed).toBe(true);
+    expect(detail).toContain('must condition');
+  });
+
+  it('keeps both real on-ramp validation gates in parity with the risk-chain check', () => {
+    const source = readFileSync(
+      join(process.cwd(), '.archon/workflows/defaults/bdc-harness-wo-onramp.yaml'),
+      'utf8'
+    );
+    expect(
+      source.match(/must condition on \$business-risk-gate\.output\.gate == proceed/g)?.length
+    ).toBe(2);
   });
 
   it('does NOT false-fire on a bare <one sentence> token inside a prompt body', () => {
