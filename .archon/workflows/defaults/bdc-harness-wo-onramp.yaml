@@ -783,7 +783,11 @@ nodes:
       ADV_PASS=$(printf '%s\n' "$ADV_OUT" | sed -n 's/^ADV_PASS=//p' | head -n 1)
       RISK=$(printf '%s\n' "$ADV_OUT" | sed -n 's/^RISK=//p' | head -n 1)
 
-      API_BASE="${ARCHON_API_BASE:-https://archon.bluedevilcollectibles.com}"
+      API_BASE="${ARCHON_API_BASE:-}"
+      if ! API_BASE="$API_BASE" python3 -c 'import os,sys; from urllib.parse import urlsplit; u=urlsplit(os.environ.get("API_BASE", "")); sys.exit(0 if u.scheme == "http" and u.hostname in ("127.0.0.1", "localhost") and u.port is not None and u.username is None and u.password is None and u.path in ("", "/") and not u.query and not u.fragment else 1)'; then
+        echo "ERROR: ARCHON_API_BASE must be an explicit loopback staging URL; refusing external or unset target." >&2
+        exit 1
+      fi
       HARNESS_REPO="bluedevilcollectibles/bdc-harness"
       ARCHON_HEADERS=(-H "x-archon-operator-token: ${ARCHON_OPERATOR_TOKEN}")
       if [ -n "${CF_ACCESS_CLIENT_ID:-}" ] && [ -n "${CF_ACCESS_CLIENT_SECRET:-}" ]; then
@@ -942,7 +946,11 @@ nodes:
       YAML_CONTENT=$(base64 < "$YAML_FILENAME" | tr -d '\n')
       COMMIT_MSG="feat(on-ramp): register ${WO_SLUG} child workflow via bdc-harness-wo-onramp"
       HARNESS_REPO="bluedevilcollectibles/bdc-harness"
-      API_BASE="${ARCHON_API_BASE:-https://archon.bluedevilcollectibles.com}"
+      API_BASE="${ARCHON_API_BASE:-}"
+      if ! API_BASE="$API_BASE" python3 -c 'import os,sys; from urllib.parse import urlsplit; u=urlsplit(os.environ.get("API_BASE", "")); sys.exit(0 if u.scheme == "http" and u.hostname in ("127.0.0.1", "localhost") and u.port is not None and u.username is None and u.password is None and u.path in ("", "/") and not u.query and not u.fragment else 1)'; then
+        echo "ERROR: ARCHON_API_BASE must be an explicit loopback staging URL; refusing external or unset target." >&2
+        exit 1
+      fi
       ARCHON_HEADERS=(-H "x-archon-operator-token: ${ARCHON_OPERATOR_TOKEN}")
       CF_ACCESS_ENABLED=false
       if [ -n "${CF_ACCESS_CLIENT_ID:-}" ] && [ -n "${CF_ACCESS_CLIENT_SECRET:-}" ]; then
@@ -1136,7 +1144,11 @@ nodes:
       set -euo pipefail
       REG_OUT=$register-yaml.output
       APPROVAL=$approval-gate.output
-      API_BASE="${ARCHON_API_BASE:-https://archon.bluedevilcollectibles.com}"
+      API_BASE="${ARCHON_API_BASE:-}"
+      if ! API_BASE="$API_BASE" python3 -c 'import os,sys; from urllib.parse import urlsplit; u=urlsplit(os.environ.get("API_BASE", "")); sys.exit(0 if u.scheme == "http" and u.hostname in ("127.0.0.1", "localhost") and u.port is not None and u.username is None and u.password is None and u.path in ("", "/") and not u.query and not u.fragment else 1)'; then
+        echo "ERROR: ARCHON_API_BASE must be an explicit loopback staging URL; refusing external or unset target." >&2
+        exit 1
+      fi
 
       # Re-check approval in case trigger_rule brings us here unexpectedly
       if ! printf '%s\n' "$APPROVAL" | grep -iqE 'approved|proceed|^yes|fire'; then
@@ -1248,7 +1260,11 @@ nodes:
       WO_SLUG=$(printf '%s\n' "$FIRE_OUT" | sed -n 's/^WO_SLUG=//p' | head -n 1)
       EXPECTED_REPO=$(printf '%s\n' "$FIRE_OUT" | sed -n 's/^TARGET_REPO_FULL=//p' | head -n 1)
 
-      API_BASE="${ARCHON_API_BASE:-https://archon.bluedevilcollectibles.com}"
+      API_BASE="${ARCHON_API_BASE:-}"
+      if ! API_BASE="$API_BASE" python3 -c 'import os,sys; from urllib.parse import urlsplit; u=urlsplit(os.environ.get("API_BASE", "")); sys.exit(0 if u.scheme == "http" and u.hostname in ("127.0.0.1", "localhost") and u.port is not None and u.username is None and u.password is None and u.path in ("", "/") and not u.query and not u.fragment else 1)'; then
+        echo "ERROR: ARCHON_API_BASE must be an explicit loopback staging URL; refusing external or unset target." >&2
+        exit 1
+      fi
       echo "=== verify-binding: polling for run (RUN_ID=${RUN_ID} CONV_ID=${CONV_ID} WO_SLUG=${WO_SLUG}) up to 90s ==="
 
       # Resolve the codebase_id -> repo-name map once (so we can compare binding).

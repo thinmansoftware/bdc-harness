@@ -104,6 +104,29 @@ function runGate(yamlText: string, dir: string): { failed: boolean; detail: stri
   return { failed: out.length > 0, detail: out };
 }
 
+function runApiBaseGuard(
+  bashSource: string,
+  apiBase?: string
+): { exitCode: number; stderr: string } {
+  const start = bashSource.indexOf('API_BASE="${ARCHON_API_BASE:-}"');
+  const end = bashSource.indexOf('\nfi', start);
+  const guard = start >= 0 && end >= 0 ? bashSource.slice(start, end + '\nfi'.length) : '';
+  const gitBash = 'C:\\Program Files\\Git\\bin\\bash.exe';
+  const bash = process.platform === 'win32' && existsSync(gitBash) ? gitBash : 'bash';
+  const env = { ...process.env };
+  delete env.ARCHON_API_BASE;
+  if (apiBase !== undefined) env.ARCHON_API_BASE = apiBase;
+  const result = Bun.spawnSync([bash, '-c', guard], {
+    env,
+    stdout: 'pipe',
+    stderr: 'pipe',
+  });
+  return {
+    exitCode: result.exitCode,
+    stderr: new TextDecoder().decode(result.stderr).trim(),
+  };
+}
+
 // A healthy child YAML that legitimately contains every token class the OLD gate
 // false-fired on: "{{" Go-template, the word "template", and a "<... John can answer>"
 // angle-bracket instruction inside a prompt body. All filled structural positions are real.
@@ -195,18 +218,22 @@ describe('on-ramp atom structural placeholder gate', () => {
     expect(result.workflow?.name).toBe('bdc-harness-wo-onramp');
   });
 
-  it('routes child dispatch and binding verification through the configured Archon API', () => {
+  it('requires every API-touching node to use an explicit loopback Archon base', () => {
     const path = join(REPO_ROOT, '.archon/workflows/defaults/bdc-harness-wo-onramp.yaml');
     const result = parseWorkflow(readFileSync(path, 'utf8'), 'bdc-harness-wo-onramp.yaml');
     const nodes = new Map(result.workflow?.nodes.map(node => [node.id, node]));
-    const productionDefault = '${ARCHON_API_BASE:-https://archon.bluedevilcollectibles.com}';
 
-    for (const id of ['fire-child', 'verify-binding']) {
+    for (const id of ['prefire-plan', 'register-yaml', 'fire-child', 'verify-binding']) {
       const bash = String(nodes.get(id)?.bash || '');
-      expect(bash).toContain(productionDefault);
-      expect(bash.replaceAll(productionDefault, '')).not.toContain(
-        'https://archon.bluedevilcollectibles.com'
+      expect(bash).toContain('API_BASE="${ARCHON_API_BASE:-}"');
+      expect(bash).not.toContain('https://archon.bluedevilcollectibles.com');
+      expect(runApiBaseGuard(bash).exitCode).not.toBe(0);
+      expect(runApiBaseGuard(bash, 'https://archon.bluedevilcollectibles.com').exitCode).not.toBe(
+        0
       );
+      expect(runApiBaseGuard(bash, 'http://127.0.0.1:3092@external.example').exitCode).not.toBe(0);
+      expect(runApiBaseGuard(bash, 'http://127.0.0.1:3092').exitCode).toBe(0);
+      expect(runApiBaseGuard(bash, 'http://localhost:3092').exitCode).toBe(0);
     }
   });
 
