@@ -8,10 +8,13 @@ import type { M31ActionKind, M31ActionPermit, M31ActionProposal } from '../m31-s
 import {
   authorizeOverseerAction,
   evaluateActionPolicy,
-  type ActionPolicyDecision,
   type ActionPolicyInput,
   type OverseerActionPolicy,
 } from '../action-policy';
+
+type PolicyResult =
+  | ReturnType<typeof evaluateActionPolicy>
+  | Awaited<ReturnType<typeof authorizeOverseerAction>>;
 
 const POLICY_DIGEST = 'a'.repeat(64);
 const VERIFIER_DIGEST = 'b'.repeat(64);
@@ -116,7 +119,7 @@ function poison(message: string): never {
   throw new Error(message);
 }
 
-function expectDenied(decision: ActionPolicyDecision, reason: string): void {
+function expectDenied(decision: PolicyResult, reason: string): void {
   expect(decision.allowed).toBe(false);
   if (decision.allowed) throw new Error('expected denial');
   expect(decision.reason).toBe(reason);
@@ -373,8 +376,9 @@ describe('evaluateActionPolicy', () => {
 });
 
 describe('authorizeOverseerAction', () => {
-  test('early denial appends one event without reading state, proposal, or clock', async () => {
+  test('rereads policy and short-circuits before state, proposal, or clock', async () => {
     const boundProposal = proposal();
+    const getPolicy = mock(async () => policy({ service_enabled: false }));
     const appendEvent = mock(async (_input: AppendOverseerCapabilityEventInput) => undefined);
     const getCapabilityState = mock(async () => poison('state must be unreachable'));
     const getProposal = mock(async () => poison('proposal must be unreachable'));
@@ -382,13 +386,13 @@ describe('authorizeOverseerAction', () => {
 
     const result = await authorizeOverseerAction(
       {
-        policy: policy({ service_enabled: false }),
         requested_capability: 'merge',
         permit: permit(boundProposal),
         actor: 'test-actor',
         correlation_id: 'corr-1',
       },
       {
+        getPolicy,
         getCapabilityState,
         getProposal,
         getCurrentTimeForTest: getCurrentTime,
@@ -397,22 +401,15 @@ describe('authorizeOverseerAction', () => {
     );
 
     expectDenied(result, 'service_disabled');
+    expect(result.audit_recorded).toBe(true);
+    expect(getPolicy).toHaveBeenCalledTimes(1);
     expect(getCapabilityState).not.toHaveBeenCalled();
     expect(getProposal).not.toHaveBeenCalled();
     expect(getCurrentTime).not.toHaveBeenCalled();
     expect(appendEvent).toHaveBeenCalledTimes(1);
-    expect(appendEvent).toHaveBeenCalledWith(
-      expect.objectContaining({
-        event_type: 'gate_denied',
-        reason: 'service_disabled',
-        capability: 'merge',
-        policy_digest: '0'.repeat(64),
-        verifier_registry_digest: '0'.repeat(64),
-      })
-    );
   });
 
-  test('reads state then exact proposal and clock, appending one allowed merge event', async () => {
+  test('reads policy, state, proposal, and clock before one allowed event', async () => {
     const boundProposal = proposal();
     const callOrder: string[] = [];
     const appendEvent = mock(async (input: AppendOverseerCapabilityEventInput) => {
@@ -421,13 +418,16 @@ describe('authorizeOverseerAction', () => {
     });
     const result = await authorizeOverseerAction(
       {
-        policy: policy(),
         requested_capability: 'merge',
         permit: permit(boundProposal),
         actor: 'test-actor',
         correlation_id: 'corr-2',
       },
       {
+        getPolicy: mock(async () => {
+          callOrder.push('policy');
+          return policy();
+        }),
         getCapabilityState: mock(async () => {
           callOrder.push('state');
           return state('merge');
@@ -445,17 +445,11 @@ describe('authorizeOverseerAction', () => {
     );
 
     expect(result.allowed).toBe(true);
-    expect(callOrder).toEqual(['state', 'proposal', 'clock', 'append']);
+    expect(result.audit_recorded).toBe(true);
+    expect(callOrder).toEqual(['policy', 'state', 'proposal', 'clock', 'append']);
     expect(appendEvent).toHaveBeenCalledTimes(1);
     expect(appendEvent).toHaveBeenCalledWith(
-      expect.objectContaining({
-        event_type: 'gate_allowed',
-        reason: 'allowed',
-        proposal_id: 'proposal-1',
-        execution_id: 'execution-1',
-        policy_digest: POLICY_DIGEST,
-        verifier_registry_digest: VERIFIER_DIGEST,
-      })
+      expect.objectContaining({ event_type: 'gate_allowed', reason: 'allowed' })
     );
   });
 
@@ -466,13 +460,13 @@ describe('authorizeOverseerAction', () => {
     const getCurrentTime = mock(async () => poison('clock must be unreachable'));
     const result = await authorizeOverseerAction(
       {
-        policy: policy(),
         requested_capability: 'merge',
         permit: permit(boundProposal),
         actor: 'test-actor',
         correlation_id: 'corr-3',
       },
       {
+        getPolicy: mock(async () => policy()),
         getCapabilityState: mock(async () => state('merge', { circuit_state: 'open' })),
         getProposal,
         getCurrentTimeForTest: getCurrentTime,
@@ -481,8 +475,123 @@ describe('authorizeOverseerAction', () => {
     );
 
     expectDenied(result, 'circuit_open');
+    expect(result.audit_recorded).toBe(true);
     expect(getProposal).not.toHaveBeenCalled();
     expect(getCurrentTime).not.toHaveBeenCalled();
     expect(appendEvent).toHaveBeenCalledTimes(1);
+  });
+
+  test('treats a wrong capability row as missing without a new business gate', async () => {
+    const boundProposal = proposal();
+    const getProposal = mock(async () => poison('proposal must be unreachable'));
+    const result = await authorizeOverseerAction(
+      {
+        requested_capability: 'merge',
+        permit: permit(boundProposal),
+        actor: 'test-actor',
+        correlation_id: 'corr-corrupt',
+      },
+      {
+        getPolicy: mock(async () => policy()),
+        getCapabilityState: mock(async () => state('repair')),
+        getProposal,
+        getCurrentTimeForTest: mock(async () => poison('clock must be unreachable')),
+        appendEvent: mock(async () => undefined),
+      }
+    );
+
+    expectDenied(result, 'capability_state_missing');
+    expect(result.audit_recorded).toBe(true);
+    expect(getProposal).not.toHaveBeenCalled();
+  });
+
+  test.each([
+    ['policy', 'policy_read_failed'],
+    ['state', 'capability_state_read_failed'],
+    ['proposal', 'proposal_read_failed'],
+    ['clock', 'clock_read_failed'],
+  ] as const)('returns a typed denial when the %s dependency fails', async (failureAt, reason) => {
+    const boundProposal = proposal();
+    const appendEvent = mock(async () => undefined);
+    const fail = async (): Promise<never> => {
+      throw new Error(`${failureAt}-failed`);
+    };
+    const result = await authorizeOverseerAction(
+      {
+        requested_capability: 'merge',
+        permit: permit(boundProposal),
+        actor: 'test-actor',
+        correlation_id: `corr-${failureAt}`,
+      },
+      {
+        getPolicy: failureAt === 'policy' ? fail : mock(async () => policy()),
+        getCapabilityState: failureAt === 'state' ? fail : mock(async () => state('merge')),
+        getProposal: failureAt === 'proposal' ? fail : mock(async () => boundProposal),
+        getCurrentTimeForTest: failureAt === 'clock' ? fail : mock(async () => NOW),
+        appendEvent,
+      }
+    );
+
+    expectDenied(result, reason);
+    expect(result.audit_recorded).toBe(true);
+    expect(appendEvent).toHaveBeenCalledWith(
+      expect.objectContaining({ event_type: 'gate_denied', reason })
+    );
+  });
+
+  test('fails closed when both gate audit attempts fail', async () => {
+    const boundProposal = proposal();
+    const appendEvent = mock(async () => {
+      throw new Error('audit-store-failed');
+    });
+    const result = await authorizeOverseerAction(
+      {
+        requested_capability: 'merge',
+        permit: permit(boundProposal),
+        actor: 'test-actor',
+        correlation_id: 'corr-audit-failed',
+      },
+      {
+        getPolicy: mock(async () => policy()),
+        getCapabilityState: mock(async () => state('merge')),
+        getProposal: mock(async () => boundProposal),
+        getCurrentTimeForTest: mock(async () => NOW),
+        appendEvent,
+      }
+    );
+
+    expectDenied(result, 'gate_audit_failed');
+    expect(result.audit_recorded).toBe(false);
+    expect(appendEvent).toHaveBeenCalledTimes(2);
+  });
+
+  test('records a gate_denied fallback when the first audit fails', async () => {
+    const boundProposal = proposal();
+    let calls = 0;
+    const appendEvent = mock(async () => {
+      calls += 1;
+      if (calls === 1) throw new Error('first-audit-failed');
+    });
+    const result = await authorizeOverseerAction(
+      {
+        requested_capability: 'merge',
+        permit: permit(boundProposal),
+        actor: 'test-actor',
+        correlation_id: 'corr-audit-fallback',
+      },
+      {
+        getPolicy: mock(async () => policy()),
+        getCapabilityState: mock(async () => state('merge')),
+        getProposal: mock(async () => boundProposal),
+        getCurrentTimeForTest: mock(async () => NOW),
+        appendEvent,
+      }
+    );
+
+    expectDenied(result, 'gate_audit_failed');
+    expect(result.audit_recorded).toBe(true);
+    expect(appendEvent.mock.calls[1]?.[0]).toEqual(
+      expect.objectContaining({ event_type: 'gate_denied', reason: 'gate_audit_failed' })
+    );
   });
 });

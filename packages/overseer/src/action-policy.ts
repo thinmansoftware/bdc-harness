@@ -55,7 +55,6 @@ export type ActionPolicyDenialReason =
   | 'legacy_dry_run'
   | 'capability_flag_disabled'
   | 'capability_state_missing'
-  | 'capability_state_mismatch'
   | 'capability_state_disabled'
   | 'circuit_open'
   | 'proposal_missing'
@@ -76,9 +75,15 @@ export type ActionPolicyDenialReason =
   | 'permit_expiry_invalid'
   | 'permit_expired'
   | 'policy_digest_mismatch'
-  | 'verifier_registry_mismatch';
+  | 'verifier_registry_mismatch'
+  | 'policy_read_failed'
+  | 'capability_state_read_failed'
+  | 'proposal_read_failed'
+  | 'clock_read_failed'
+  | 'policy_evaluation_failed'
+  | 'gate_audit_failed';
 
-export interface AllowedActionPolicyDecision {
+interface AllowedActionPolicyDecision {
   readonly allowed: true;
   readonly reason: 'allowed';
   readonly capability: OverseerCapability;
@@ -96,13 +101,13 @@ export interface AllowedActionPolicyDecision {
   readonly verifier_registry_digest: string;
 }
 
-export interface DeniedActionPolicyDecision {
+interface DeniedActionPolicyDecision {
   readonly allowed: false;
   readonly reason: ActionPolicyDenialReason;
   readonly capability: OverseerCapability;
 }
 
-export type ActionPolicyDecision = AllowedActionPolicyDecision | DeniedActionPolicyDecision;
+type ActionPolicyDecision = AllowedActionPolicyDecision | DeniedActionPolicyDecision;
 
 interface StagedActionPolicyInput {
   readonly policy: OverseerActionPolicy;
@@ -151,8 +156,9 @@ function evaluateStagedActionPolicy(
 
   if (!available.state) return { required: 'state' };
   const state = input.capability_state;
-  if (!state) return deny(capability, 'capability_state_missing');
-  if (state.capability !== capability) return deny(capability, 'capability_state_mismatch');
+  if (state?.capability !== capability) {
+    return deny(capability, 'capability_state_missing');
+  }
   if (!isExactlyTrue(state.action_enabled)) return deny(capability, 'capability_state_disabled');
   if (state.circuit_state !== 'closed') return deny(capability, 'circuit_open');
 
@@ -233,7 +239,6 @@ export function evaluateActionPolicy(input: ActionPolicyInput): ActionPolicyDeci
 }
 
 export interface AuthorizeOverseerActionInput {
-  readonly policy: OverseerActionPolicy;
   readonly requested_capability: OverseerCapability;
   readonly permit: M31ActionPermit;
   readonly actor: string;
@@ -241,6 +246,7 @@ export interface AuthorizeOverseerActionInput {
 }
 
 export interface AuthorizeOverseerActionDeps {
+  readonly getPolicy: () => Promise<OverseerActionPolicy>;
   readonly getCapabilityState?: (
     capability: OverseerCapability
   ) => Promise<OverseerCapabilityState | null>;
@@ -263,6 +269,7 @@ async function getDatabaseCurrentTime(): Promise<string> {
 }
 
 interface ResolvedAuthorizeOverseerActionDeps {
+  readonly getPolicy: () => Promise<OverseerActionPolicy>;
   readonly getCapabilityState: (
     capability: OverseerCapability
   ) => Promise<OverseerCapabilityState | null>;
@@ -281,11 +288,11 @@ async function recordDecision(
   decision: ActionPolicyDecision,
   state: OverseerCapabilityState | null | undefined,
   proposal: M31ActionProposal | null | undefined
-): Promise<ActionPolicyDecision> {
-  await deps.appendEvent({
+): Promise<ActionAuthorizationResult> {
+  const eventFor = (eventDecision: ActionPolicyDecision): AppendOverseerCapabilityEventInput => ({
     capability: input.requested_capability,
-    event_type: decision.allowed ? 'gate_allowed' : 'gate_denied',
-    reason: decision.reason,
+    event_type: eventDecision.allowed ? 'gate_allowed' : 'gate_denied',
+    reason: eventDecision.reason,
     actor: input.actor,
     correlation_id: input.correlation_id,
     proposal_id: input.permit.proposal_id,
@@ -300,8 +307,23 @@ async function recordDecision(
       action_kind: input.permit.action_kind,
     },
   });
-  return decision;
+  try {
+    await deps.appendEvent(eventFor(decision));
+    return { ...decision, audit_recorded: true };
+  } catch {
+    const auditFailure = deny(input.requested_capability, 'gate_audit_failed');
+    try {
+      await deps.appendEvent(eventFor(auditFailure));
+      return { ...auditFailure, audit_recorded: true };
+    } catch {
+      return { ...auditFailure, audit_recorded: false };
+    }
+  }
 }
+
+type ActionAuthorizationResult =
+  | (AllowedActionPolicyDecision & { readonly audit_recorded: true })
+  | (DeniedActionPolicyDecision & { readonly audit_recorded: boolean });
 
 /**
  * Loads each policy dependency only when its gate is reached, then records one
@@ -311,8 +333,9 @@ async function recordDecision(
 export async function authorizeOverseerAction(
   input: AuthorizeOverseerActionInput,
   deps: AuthorizeOverseerActionDeps
-): Promise<ActionPolicyDecision> {
+): Promise<ActionAuthorizationResult> {
   const resolvedDeps: ResolvedAuthorizeOverseerActionDeps = {
+    getPolicy: deps.getPolicy,
     getCapabilityState: deps.getCapabilityState ?? getOverseerCapabilityState,
     getProposal: deps.getProposal ?? getM31ActionProposal,
     getCurrentTime: deps.getCurrentTimeForTest ?? getDatabaseCurrentTime,
@@ -322,31 +345,85 @@ export async function authorizeOverseerAction(
   let boundProposal: M31ActionProposal | null | undefined;
   let currentTime: string | undefined;
   const available = { state: false, proposal: false, current_time: false };
+  let currentPolicy: OverseerActionPolicy;
+
+  try {
+    currentPolicy = await resolvedDeps.getPolicy();
+  } catch {
+    return recordDecision(
+      input,
+      resolvedDeps,
+      deny(input.requested_capability, 'policy_read_failed'),
+      capabilityState,
+      boundProposal
+    );
+  }
 
   while (true) {
-    const decision = evaluateStagedActionPolicy(
-      {
-        policy: input.policy,
-        requested_capability: input.requested_capability,
-        permit: input.permit,
-        capability_state: capabilityState,
-        proposal: boundProposal,
-        current_time: currentTime,
-      },
-      available
-    );
+    let decision: StagedDecision;
+    try {
+      decision = evaluateStagedActionPolicy(
+        {
+          policy: currentPolicy,
+          requested_capability: input.requested_capability,
+          permit: input.permit,
+          capability_state: capabilityState,
+          proposal: boundProposal,
+          current_time: currentTime,
+        },
+        available
+      );
+    } catch {
+      return recordDecision(
+        input,
+        resolvedDeps,
+        deny(input.requested_capability, 'policy_evaluation_failed'),
+        capabilityState,
+        boundProposal
+      );
+    }
     if (!('required' in decision)) {
       return recordDecision(input, resolvedDeps, decision, capabilityState, boundProposal);
     }
 
     if (decision.required === 'state') {
-      capabilityState = await resolvedDeps.getCapabilityState(input.requested_capability);
+      try {
+        capabilityState = await resolvedDeps.getCapabilityState(input.requested_capability);
+      } catch {
+        return recordDecision(
+          input,
+          resolvedDeps,
+          deny(input.requested_capability, 'capability_state_read_failed'),
+          capabilityState,
+          boundProposal
+        );
+      }
       available.state = true;
     } else if (decision.required === 'proposal') {
-      boundProposal = await resolvedDeps.getProposal(input.permit.proposal_id);
+      try {
+        boundProposal = await resolvedDeps.getProposal(input.permit.proposal_id);
+      } catch {
+        return recordDecision(
+          input,
+          resolvedDeps,
+          deny(input.requested_capability, 'proposal_read_failed'),
+          capabilityState,
+          boundProposal
+        );
+      }
       available.proposal = true;
     } else {
-      currentTime = await resolvedDeps.getCurrentTime();
+      try {
+        currentTime = await resolvedDeps.getCurrentTime();
+      } catch {
+        return recordDecision(
+          input,
+          resolvedDeps,
+          deny(input.requested_capability, 'clock_read_failed'),
+          capabilityState,
+          boundProposal
+        );
+      }
       available.current_time = true;
     }
   }

@@ -59,13 +59,10 @@ export type {
 // M-42 Slice 1 fail-closed action policy and deterministic fixture boundary.
 export { authorizeOverseerAction, evaluateActionPolicy } from './action-policy';
 export type {
-  ActionPolicyDecision,
   ActionPolicyDenialReason,
   ActionPolicyInput,
-  AllowedActionPolicyDecision,
   AuthorizeOverseerActionDeps,
   AuthorizeOverseerActionInput,
-  DeniedActionPolicyDecision,
   OverseerActionPolicy,
 } from './action-policy';
 export { createFakeGitHubAdapter } from './adapters/fake-github';
