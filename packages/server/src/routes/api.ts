@@ -214,6 +214,9 @@ import {
   dispatchMessageListResponseSchema,
   dispatchMessageSchema,
   dispatchWorkerSchema,
+  dispatchStatusQuerySchema,
+  dispatchStatusResponseSchema,
+  executionHandoffBodySchema,
   heartbeatDispatchWorkerBodySchema,
   listDispatchMessagesQuerySchema,
   postDispatchResultBodySchema,
@@ -700,6 +703,42 @@ const heartbeatDispatchWorkerRoute = createRoute({
       description: 'Heartbeat accepted',
     },
     404: jsonError('Worker not found'),
+    500: jsonError('Server error'),
+  },
+});
+
+const getDispatchStatusRoute = createRoute({
+  method: 'get',
+  path: '/api/dispatch/status',
+  tags: ['Dispatch'],
+  summary: 'Get truthful worker, queue, report, and handoff status',
+  request: { query: dispatchStatusQuerySchema },
+  responses: {
+    200: {
+      content: { 'application/json': { schema: dispatchStatusResponseSchema } },
+      description: 'Dispatch status',
+    },
+    500: jsonError('Server error'),
+  },
+});
+
+const createExecutionHandoffRoute = createRoute({
+  method: 'post',
+  path: '/api/dispatch/execution-handoffs',
+  tags: ['Dispatch'],
+  summary: 'Queue an approved local or staging execution handoff',
+  request: {
+    body: {
+      content: { 'application/json': { schema: executionHandoffBodySchema } },
+      required: true,
+    },
+  },
+  responses: {
+    200: {
+      content: { 'application/json': { schema: dispatchMessageSchema } },
+      description: 'Queued execution handoff',
+    },
+    400: jsonError('Bad request'),
     500: jsonError('Server error'),
   },
 });
@@ -3329,6 +3368,93 @@ export function registerApiRoutes(
     } catch (error) {
       getLog().error({ err: error }, 'dispatch_heartbeat_worker_failed');
       return apiError(c, 500, 'Failed to heartbeat dispatch worker');
+    }
+  });
+
+  registerOpenApiRoute(getDispatchStatusRoute, async c => {
+    try {
+      const rawStaleAfterMs = Number.parseInt(
+        c.req.query('worker_stale_after_ms') ?? String(dispatchDb.DEFAULT_WORKER_STALE_AFTER_MS),
+        10
+      );
+      const staleAfterMs = Number.isFinite(rawStaleAfterMs)
+        ? Math.max(1, Math.min(rawStaleAfterMs, 86_400_000))
+        : dispatchDb.DEFAULT_WORKER_STALE_AFTER_MS;
+      const [workers, messages] = await Promise.all([
+        dispatchDb.listWorkers(staleAfterMs),
+        dispatchDb.listMessages({ limit: 500 }),
+      ]);
+      const queue: Record<dispatchDb.DispatchMessageStatus, number> = {
+        queued: 0,
+        claimed: 0,
+        done: 0,
+        failed: 0,
+        cancelled: 0,
+      };
+      for (const message of messages) queue[message.status] += 1;
+      const item = (
+        message: dispatchDb.DispatchMessage
+      ): {
+        id: string;
+        sender: string;
+        recipient: string;
+        status: dispatchDb.DispatchMessageStatus;
+        created_at: string;
+        body_preview: string;
+        result_preview: string | null;
+      } => ({
+        id: message.id,
+        sender: message.sender,
+        recipient: message.recipient,
+        status: message.status,
+        created_at: message.created_at,
+        body_preview: message.body.slice(0, 240),
+        result_preview: message.result_body?.slice(0, 240) ?? null,
+      });
+      const isExecutionHandoff = (message: dispatchDb.DispatchMessage): boolean => {
+        if (message.task_type !== 'run_report') return false;
+        try {
+          return (
+            (JSON.parse(message.body) as { kind?: string }).kind === 'approved_execution_handoff'
+          );
+        } catch {
+          return false;
+        }
+      };
+      return c.json({
+        generated_at: new Date().toISOString(),
+        worker_stale_after_ms: staleAfterMs,
+        workers,
+        queue,
+        operator_reports: messages
+          .filter(message => message.task_type === 'run_report' && !isExecutionHandoff(message))
+          .map(item),
+        execution_handoffs: messages.filter(isExecutionHandoff).map(item),
+      });
+    } catch (error) {
+      getLog().error({ err: error }, 'dispatch_status_failed');
+      return apiError(c, 500, 'Failed to get dispatch status');
+    }
+  });
+
+  registerOpenApiRoute(createExecutionHandoffRoute, async c => {
+    try {
+      const body = getValidatedBody(c, executionHandoffBodySchema);
+      const message = await dispatchDb.createMessage({
+        correlation_id: body.correlation_id,
+        idempotency_key: body.idempotency_key,
+        task_type: 'run_report',
+        sender: 'xo',
+        recipient: body.target,
+        body: JSON.stringify({ kind: 'approved_execution_handoff', ...body }),
+      });
+      return c.json(message);
+    } catch (error) {
+      if (error instanceof Error && error.message.includes('invalid')) {
+        return apiError(c, 400, error.message);
+      }
+      getLog().error({ err: error }, 'dispatch_execution_handoff_failed');
+      return apiError(c, 500, 'Failed to create execution handoff');
     }
   });
 

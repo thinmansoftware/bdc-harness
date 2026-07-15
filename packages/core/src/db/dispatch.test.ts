@@ -16,6 +16,7 @@ import {
   createMessage,
   evaluateWorkerStaleness,
   heartbeatWorker,
+  listWorkers,
   postResult,
   registerWorker,
   resolveDispatchRecipient,
@@ -182,6 +183,32 @@ describe('dispatch db', () => {
       workerStaleAfterMs: 1_000,
     });
     expect(onlineClaim?.status).toBe('claimed');
+  });
+
+  test('listWorkers expires stale available rows before reporting health', async () => {
+    await registerWorker({
+      worker_id: 'worker-stale',
+      host: 'host-stale',
+      capabilities: { providers: ['codex'] },
+      max_concurrency: 1,
+    });
+    await registerWorker({
+      worker_id: 'worker-fresh',
+      host: 'host-fresh',
+      capabilities: { providers: ['claude'] },
+      max_concurrency: 1,
+    });
+    await db.query(
+      `UPDATE agent_dispatch_workers
+       SET last_heartbeat_at = $2
+       WHERE worker_id = $1`,
+      ['worker-stale', new Date(Date.now() - 10_000).toISOString()]
+    );
+
+    const workers = await listWorkers(1_000);
+
+    expect(workers.find(worker => worker.worker_id === 'worker-stale')?.status).toBe('unavailable');
+    expect(workers.find(worker => worker.worker_id === 'worker-fresh')?.status).toBe('available');
   });
 
   test('resolveDispatchRecipient preserves concrete recipients', async () => {

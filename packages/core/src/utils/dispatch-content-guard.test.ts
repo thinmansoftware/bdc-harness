@@ -26,4 +26,13 @@ describe('assessDispatchMessageBody', () => {
 
     expect(result.allowed).toBe(true);
   });
+
+  test('rejects repo mutation hidden in a free-form report task', () => {
+    expect(
+      assessDispatchMessageBody('run_report', 'Push this branch and merge it to dev.')
+    ).toEqual({
+      allowed: false,
+      reason: 'repo_mutating_dispatch_body_rejected',
+    });
+  });
 });

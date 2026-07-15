@@ -119,3 +119,46 @@ export const heartbeatDispatchWorkerBodySchema = z
 export const dispatchMessageListResponseSchema = z
   .array(dispatchMessageSchema)
   .openapi('DispatchMessageListResponse');
+
+export const dispatchStatusQuerySchema = z.object({
+  worker_stale_after_ms: z.coerce.number().int().positive().max(86_400_000).optional(),
+});
+
+const dispatchStatusItemSchema = z.object({
+  id: z.string(),
+  sender: z.string(),
+  recipient: z.string(),
+  status: dispatchMessageStatusSchema,
+  created_at: z.string(),
+  body_preview: z.string(),
+  result_preview: z.string().nullable(),
+});
+
+export const dispatchStatusResponseSchema = z
+  .object({
+    generated_at: z.string(),
+    worker_stale_after_ms: z.number(),
+    workers: z.array(dispatchWorkerSchema),
+    queue: z.record(z.number()),
+    operator_reports: z.array(dispatchStatusItemSchema),
+    execution_handoffs: z.array(dispatchStatusItemSchema),
+  })
+  .openapi('DispatchStatusResponse');
+
+export const executionHandoffBodySchema = z
+  .object({
+    correlation_id: z.string().min(1).max(200),
+    idempotency_key: z.string().min(1).max(200),
+    target: z.enum(['overseer', 'cauldron']),
+    work_order_id: z.string().regex(/^WO-[A-Z0-9-]+$/),
+    environment: z.enum(['local', 'staging']),
+    target_repo: z.string().min(1).max(300),
+    target_ref: z.string().regex(/^[0-9a-f]{40}$/i),
+    approved: z.literal(true),
+    approved_by: z.string().min(1).max(200),
+    approval_ref: z.string().min(1).max(200),
+    objective: z.string().min(1).max(4_000),
+    constraints: z.array(z.string().min(1).max(1_000)).max(50),
+  })
+  .strict()
+  .openapi('ExecutionHandoffBody');

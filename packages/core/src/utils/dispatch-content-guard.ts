@@ -25,13 +25,16 @@ export function assessDispatchMessageBody(
   taskType: DispatchTaskType,
   body: string
 ): DispatchContentAssessment {
-  if (taskType !== 'agent_message') return { allowed: true };
+  if (taskType === 'board_motion') return { allowed: true };
 
   const normalized = body.replace(/\s+/g, ' ').trim();
   if (MUTATING_ACTION_RE.test(normalized) && REPO_TARGET_RE.test(normalized)) {
     return {
       allowed: false,
-      reason: 'repo_mutating_agent_message_rejected',
+      reason:
+        taskType === 'agent_message'
+          ? 'repo_mutating_agent_message_rejected'
+          : 'repo_mutating_dispatch_body_rejected',
     };
   }
 
