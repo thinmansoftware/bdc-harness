@@ -240,6 +240,19 @@ describe('evaluateActionPolicy', () => {
     }
   );
 
+  test('never authorizes escalation with enabled, closed policy state', () => {
+    const boundProposal = proposal();
+    const decision = evaluateActionPolicy({
+      policy: policy(),
+      requested_capability: 'escalation',
+      capability_state: state('escalation'),
+      proposal: boundProposal,
+      permit: permit(boundProposal),
+      current_time: NOW,
+    });
+    expectDenied(decision, 'coarse_capability_mismatch');
+  });
+
   test.each([
     ['proposal_id', 'different', 'proposal_id_mismatch'],
     ['execution_id', 'different', 'execution_id_mismatch'],
@@ -352,6 +365,7 @@ describe('evaluateActionPolicy', () => {
       proposal_id: 'proposal-1',
       execution_id: 'execution-1',
       action_kind: 'MERGE',
+      valid_until: '2026-07-15T12:01:00.000Z',
       policy_digest: POLICY_DIGEST,
       verifier_registry_digest: VERIFIER_DIGEST,
     });
@@ -374,7 +388,12 @@ describe('authorizeOverseerAction', () => {
         actor: 'test-actor',
         correlation_id: 'corr-1',
       },
-      { getCapabilityState, getProposal, getCurrentTime, appendEvent }
+      {
+        getCapabilityState,
+        getProposal,
+        getCurrentTimeForTest: getCurrentTime,
+        appendEvent,
+      }
     );
 
     expectDenied(result, 'service_disabled');
@@ -417,7 +436,7 @@ describe('authorizeOverseerAction', () => {
           callOrder.push('proposal');
           return boundProposal;
         }),
-        getCurrentTime: mock(async () => {
+        getCurrentTimeForTest: mock(async () => {
           callOrder.push('clock');
           return NOW;
         }),
@@ -456,7 +475,7 @@ describe('authorizeOverseerAction', () => {
       {
         getCapabilityState: mock(async () => state('merge', { circuit_state: 'open' })),
         getProposal,
-        getCurrentTime,
+        getCurrentTimeForTest: getCurrentTime,
         appendEvent,
       }
     );

@@ -11,6 +11,7 @@ import {
   type M31ActionPermit,
   type M31ActionProposal,
 } from '@archon/core/db/merge-steward';
+import { getDatabase } from '@archon/core/db/connection';
 // Direct imports keep the default path on the frozen M-31 and Task 1 stores.
 
 const DIGEST_RE = /^[0-9a-f]{64}$/;
@@ -90,6 +91,7 @@ export interface AllowedActionPolicyDecision {
   readonly proposal_id: string;
   readonly execution_id: string;
   readonly action_kind: M31ActionKind;
+  readonly valid_until: string;
   readonly policy_digest: string;
   readonly verifier_registry_digest: string;
 }
@@ -211,6 +213,7 @@ function evaluateStagedActionPolicy(
     proposal_id: proposal.proposal_id,
     execution_id: proposal.execution_id,
     action_kind: proposal.action_kind,
+    valid_until: permit.valid_until,
     policy_digest: proposal.policy_digest,
     verifier_registry_digest: proposal.verifier_registry_digest,
   };
@@ -242,8 +245,21 @@ export interface AuthorizeOverseerActionDeps {
     capability: OverseerCapability
   ) => Promise<OverseerCapabilityState | null>;
   readonly getProposal?: (proposalId: string) => Promise<M31ActionProposal | null>;
-  readonly getCurrentTime: () => Promise<string>;
+  /** Test-only clock seam. Production defaults to the database clock. */
+  readonly getCurrentTimeForTest?: () => Promise<string>;
   readonly appendEvent?: (input: AppendOverseerCapabilityEventInput) => Promise<unknown>;
+}
+
+async function getDatabaseCurrentTime(): Promise<string> {
+  const db = getDatabase();
+  const sql =
+    db.dialect === 'sqlite'
+      ? "SELECT strftime('%Y-%m-%dT%H:%M:%fZ', 'now') AS now"
+      : 'SELECT to_char(clock_timestamp() AT TIME ZONE \'UTC\', \'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"\') AS now';
+  const result = await db.query<{ now: string }>(sql);
+  const now = result.rows[0]?.now;
+  if (!now) throw new Error('overseer_action_policy_database_clock_unavailable');
+  return now;
 }
 
 interface ResolvedAuthorizeOverseerActionDeps {
@@ -299,7 +315,7 @@ export async function authorizeOverseerAction(
   const resolvedDeps: ResolvedAuthorizeOverseerActionDeps = {
     getCapabilityState: deps.getCapabilityState ?? getOverseerCapabilityState,
     getProposal: deps.getProposal ?? getM31ActionProposal,
-    getCurrentTime: deps.getCurrentTime,
+    getCurrentTime: deps.getCurrentTimeForTest ?? getDatabaseCurrentTime,
     appendEvent: deps.appendEvent ?? appendOverseerCapabilityEvent,
   };
   let capabilityState: OverseerCapabilityState | null | undefined;

@@ -27,6 +27,7 @@ function allowedMerge(
     proposal_id: 'proposal-1',
     execution_id: 'execution-1',
     action_kind: 'MERGE',
+    valid_until: '2026-07-15T12:01:00.000Z',
     policy_digest: 'a'.repeat(64),
     verifier_registry_digest: 'b'.repeat(64),
     ...overrides,
@@ -57,6 +58,7 @@ describe('fake GitHub mutation adapter', () => {
       record_attempt: mock(async event => {
         attempts.push(event);
       }),
+      get_current_time: mock(async () => '2026-07-15T12:00:00.000Z'),
     });
 
     const receipt = await adapter.attemptMutation(request(), allowedMerge());
@@ -101,6 +103,9 @@ describe('fake GitHub mutation adapter', () => {
       record_attempt: mock(async event => {
         attempts.push(event);
       }),
+      get_current_time: mock(async () => {
+        throw new Error('clock must be unreachable');
+      }),
     });
 
     const receipt = await adapter.attemptMutation(
@@ -126,6 +131,9 @@ describe('fake GitHub mutation adapter', () => {
       record_attempt: mock(async event => {
         attempts.push(event);
       }),
+      get_current_time: mock(async () => {
+        throw new Error('clock must be unreachable');
+      }),
     });
 
     const deniedReceipt = await adapter.attemptMutation(request(), {
@@ -144,6 +152,27 @@ describe('fake GitHub mutation adapter', () => {
       'policy_not_allowed',
       'action_identity_mismatch',
     ]);
+  });
+
+  test('rejects an allowed decision expired at the fake boundary', async () => {
+    const attempts: AppendOverseerCapabilityEventInput[] = [];
+    const getCurrentTime = mock(async () => '2026-07-15T12:01:00.001Z');
+    const adapter = createFakeGitHubAdapter({
+      allowed_repositories: ['bluedevilcollectibles/bdc-harness'],
+      record_attempt: mock(async event => {
+        attempts.push(event);
+      }),
+      get_current_time: getCurrentTime,
+    });
+
+    const result = await adapter.attemptMutation(request(), allowedMerge());
+
+    expect(result.accepted).toBe(false);
+    expect(result.reason).toBe('permit_expired');
+    expect(result.mutation_sent).toBe(false);
+    expect(getCurrentTime).toHaveBeenCalledTimes(1);
+    expect(attempts).toHaveLength(1);
+    expect(attempts[0]?.reason).toBe('permit_expired');
   });
 
   test('source has no real provider, credential, shell, or network dependency', async () => {

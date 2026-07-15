@@ -23,7 +23,9 @@ export type FakeGitHubReceiptReason =
   | 'fake_accepted'
   | 'policy_not_allowed'
   | 'repository_not_allowlisted'
-  | 'action_identity_mismatch';
+  | 'action_identity_mismatch'
+  | 'permit_expiry_invalid'
+  | 'permit_expired';
 
 export interface FakeGitHubReceipt {
   readonly adapter: 'fake-github';
@@ -44,6 +46,8 @@ export interface FakeGitHubReceipt {
 export interface FakeGitHubAdapterDeps {
   readonly allowed_repositories: readonly string[];
   readonly record_attempt: (input: AppendOverseerCapabilityEventInput) => Promise<unknown>;
+  /** Inject the same database-owned clock used at the real side-effect boundary. */
+  readonly get_current_time: () => Promise<string>;
 }
 
 export interface FakeGitHubAdapter {
@@ -113,6 +117,14 @@ export function createFakeGitHubAdapter(deps: FakeGitHubAdapterDeps): FakeGitHub
         reason = 'repository_not_allowlisted';
       } else if (!identityMatches(request, decision)) {
         reason = 'action_identity_mismatch';
+      } else {
+        const nowMs = Date.parse(await deps.get_current_time());
+        const validUntilMs = Date.parse(decision.valid_until);
+        if (!Number.isFinite(nowMs) || !Number.isFinite(validUntilMs)) {
+          reason = 'permit_expiry_invalid';
+        } else if (nowMs > validUntilMs) {
+          reason = 'permit_expired';
+        }
       }
 
       const accepted = reason === 'fake_accepted';
