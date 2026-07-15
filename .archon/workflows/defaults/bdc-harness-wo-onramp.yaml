@@ -376,13 +376,13 @@ nodes:
             visit(id);
             return seen;
           };
-          const requiredWhen = "$business-risk-gate.output.gate == " + String.fromCharCode(39) + "proceed" + String.fromCharCode(39);
+          const requiredWhen = "$" + "business-risk-gate.output.gate == " + String.fromCharCode(39) + "proceed" + String.fromCharCode(39);
           for (const id of ["decide-push-target", "commit-and-push", "open-pr-if-needed", "build-manifest", "flip-notion"]) {
             const node = byId.get(id);
             if (!node) { fails.push(id + " missing"); continue; }
             if (!ancestors(id).has("business-risk-gate")) fails.push(id + " is not downstream of business-risk-gate");
             if (String(node.when || "").trim() !== requiredWhen) {
-              fails.push(id + " must condition on $business-risk-gate.output.gate == proceed");
+              fails.push(id + " must condition on $" + "business-risk-gate.output.gate == proceed");
             }
           }
           if (fails.length) { console.log(fails.join("; ")); }
@@ -444,7 +444,8 @@ nodes:
         {"gate":"proceed"}. The decide-push-target, commit-and-push,
         open-pr-if-needed, build-manifest, and flip-notion nodes MUST each be
         downstream of the gate and carry this condition verbatim:
-          when: "$business-risk-gate.output.gate == 'proceed'"
+          when: "<DOLLAR>business-risk-gate.output.gate == 'proceed'"
+        Replace <DOLLAR> with one literal ASCII dollar sign in the child YAML.
         This condition is required even when a node uses trigger_rule: all_done.
 
         ## Tailoring requirements
@@ -475,7 +476,7 @@ nodes:
         - business-risk-gate includes BUSINESS_RISK_INVARIANT verbatim
         - business-risk-gate emits {"gate":"proceed"} only after all checks pass
         - decide-push-target, commit-and-push, open-pr-if-needed, build-manifest, and
-          flip-notion each condition on $business-risk-gate.output.gate == 'proceed'
+          flip-notion each condition on <DOLLAR>business-risk-gate.output.gate == 'proceed'
         - root name: is the real child slug (NOT "<slug>" / "<bdc-slug>")
         - inputs.WO_ID.default is the real WO_ID (NOT "<WO_ID>" / "<WO_ID from normalize-spec>")
         - no dev-error tokens: TODO, FIXME, TBD, REPLACE_ME, lorem ipsum
@@ -608,13 +609,13 @@ nodes:
           visit(id);
           return seen;
         };
-        const requiredWhen = "$business-risk-gate.output.gate == " + String.fromCharCode(39) + "proceed" + String.fromCharCode(39);
+        const requiredWhen = "$" + "business-risk-gate.output.gate == " + String.fromCharCode(39) + "proceed" + String.fromCharCode(39);
         for (const id of ["decide-push-target", "commit-and-push", "open-pr-if-needed", "build-manifest", "flip-notion"]) {
           const node = byId.get(id);
           if (!node) { fails.push(id + " missing"); continue; }
           if (!ancestors(id).has("business-risk-gate")) fails.push(id + " is not downstream of business-risk-gate");
           if (String(node.when || "").trim() !== requiredWhen) {
-            fails.push(id + " must condition on $business-risk-gate.output.gate == proceed");
+            fails.push(id + " must condition on $" + "business-risk-gate.output.gate == proceed");
           }
         }
         if (fails.length) { console.log(fails.join("; ")); }

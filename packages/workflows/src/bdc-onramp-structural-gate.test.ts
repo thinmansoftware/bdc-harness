@@ -27,6 +27,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
+import { parseWorkflow } from './loader';
 
 const REPO_ROOT = join(import.meta.dir, '..', '..', '..');
 
@@ -74,13 +75,13 @@ STRUCT_ERR=$(DRAFT="$DRAFT" bun -e '
     visit(id);
     return seen;
   };
-  const requiredWhen = "$business-risk-gate.output.gate == " + String.fromCharCode(39) + "proceed" + String.fromCharCode(39);
+  const requiredWhen = "$" + "business-risk-gate.output.gate == " + String.fromCharCode(39) + "proceed" + String.fromCharCode(39);
   for (const id of ["decide-push-target", "commit-and-push", "open-pr-if-needed", "build-manifest", "flip-notion"]) {
     const node = byId.get(id);
     if (!node) { fails.push(id + " missing"); continue; }
     if (!ancestors(id).has("business-risk-gate")) fails.push(id + " is not downstream of business-risk-gate");
     if (String(node.when || "").trim() !== requiredWhen) {
-      fails.push(id + " must condition on $business-risk-gate.output.gate == proceed");
+      fails.push(id + " must condition on $" + "business-risk-gate.output.gate == proceed");
     }
   }
   if (fails.length) { console.log(fails.join("; ")); }
@@ -186,6 +187,14 @@ describe('on-ramp atom structural placeholder gate', () => {
     expect(failed).toBe(false);
   });
 
+  it('loads the canonical parent workflow without treating child-only refs as parent deps', () => {
+    const path = join(REPO_ROOT, '.archon/workflows/defaults/bdc-harness-wo-onramp.yaml');
+    const result = parseWorkflow(readFileSync(path, 'utf8'), 'bdc-harness-wo-onramp.yaml');
+
+    expect(result.error).toBeNull();
+    expect(result.workflow?.name).toBe('bdc-harness-wo-onramp');
+  });
+
   it('FAILS a draft with an unfilled inputs.WO_ID.default stub', () => {
     const { failed, detail } = runGate(BROKEN_UNFILLED_WO_ID, dir);
     expect(failed).toBe(true);
@@ -231,7 +240,7 @@ describe('on-ramp atom structural placeholder gate', () => {
       'utf8'
     );
     expect(
-      source.match(/must condition on \$business-risk-gate\.output\.gate == proceed/g)?.length
+      source.match(/must condition on \$" \+ "business-risk-gate\.output\.gate == proceed/g)?.length
     ).toBe(2);
   });
 
