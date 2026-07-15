@@ -36,6 +36,25 @@ export { judgePullRequest, isPrGreen, isPrMergeReady } from './judge-pr';
 export { judgeWithGrok } from './judge-second-opinion';
 export { handleMergeReady, isInternalMergeAllowed } from './actions/merge-ready';
 export { runOverseerService } from './service';
+
+// M-31 merge-steward substrate (M-42 Slice 2): read-only permit preparation.
+export { prepareM31ActionPermit, createFailClosedM31CapabilityGate } from './m31-substrate';
+export type {
+  M31LiveStateReader,
+  M31CapabilityGate,
+  M31GateRequest,
+  M31GateDecision,
+  M31GateDenial,
+  PrepareM31ActionPermitInput,
+  PrepareM31ActionPermitResult,
+  M31PermitPreparationDeps,
+  M31ActionKind,
+  M31ActionPermit,
+  M31ActionProposal,
+  M31ExecutionReceipt,
+  M31LiveObservation,
+  M31TypedFailure,
+} from './m31-substrate';
 export type {
   GrokJudgeDeps,
   GrokJudgeEvidence,

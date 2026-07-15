@@ -822,6 +822,199 @@ export class SqliteAdapter implements IDatabase {
           SELECT RAISE(ABORT, 'board_execution_claim_events is append-only');
         END;
 
+      -- M-31 Overseer merge-steward substrate (migration 033): five append-only
+      -- tables for immutable snapshots, sorted membership, discrepancies, exact
+      -- expiring proposals, and single-use compare-and-consume receipts. Mirrors
+      -- migrations/033_overseer_m31_substrate.sql (booleans as INTEGER 0/1).
+      CREATE TABLE IF NOT EXISTS overseer_m31_snapshots (
+        snapshot_id TEXT PRIMARY KEY,
+        schema_version TEXT NOT NULL,
+        repository TEXT NOT NULL,
+        capture_started_at TEXT NOT NULL,
+        capture_completed_at TEXT NOT NULL,
+        operator_actor TEXT NOT NULL,
+        operator_model TEXT NOT NULL,
+        read_only_query_method TEXT NOT NULL,
+        base_branch TEXT NOT NULL,
+        base_sha TEXT NOT NULL CHECK (
+          (length(base_sha) = 40 OR length(base_sha) = 64) AND base_sha NOT GLOB '*[^0-9a-f]*'
+        ),
+        predecessor_snapshot_id TEXT REFERENCES overseer_m31_snapshots(snapshot_id),
+        predecessor_evidence_git_blob TEXT CHECK (
+          predecessor_evidence_git_blob IS NULL
+          OR ((length(predecessor_evidence_git_blob) = 40 OR length(predecessor_evidence_git_blob) = 64)
+              AND predecessor_evidence_git_blob NOT GLOB '*[^0-9a-f]*')
+        ),
+        artifact_path TEXT NOT NULL,
+        git_object_format TEXT NOT NULL CHECK (git_object_format IN ('sha1', 'sha256')),
+        evidence_git_blob TEXT NOT NULL UNIQUE CHECK (
+          (length(evidence_git_blob) = 40 OR length(evidence_git_blob) = 64)
+          AND evidence_git_blob NOT GLOB '*[^0-9a-f]*'
+        ),
+        mutation_attempted INTEGER NOT NULL CHECK (mutation_attempted IN (0, 1)),
+        mutation_succeeded INTEGER NOT NULL CHECK (mutation_succeeded = 0),
+        fusion_calls_attempted INTEGER NOT NULL CHECK (fusion_calls_attempted >= 0),
+        fusion_calls_succeeded INTEGER NOT NULL CHECK (fusion_calls_succeeded = 0),
+        created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+        CONSTRAINT overseer_m31_snapshots_predecessor_pair CHECK (
+          (predecessor_snapshot_id IS NULL) = (predecessor_evidence_git_blob IS NULL)
+        )
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_overseer_m31_snapshots_repo
+        ON overseer_m31_snapshots(repository, created_at);
+      CREATE INDEX IF NOT EXISTS idx_overseer_m31_snapshots_predecessor
+        ON overseer_m31_snapshots(predecessor_snapshot_id) WHERE predecessor_snapshot_id IS NOT NULL;
+
+      CREATE TABLE IF NOT EXISTS overseer_m31_snapshot_members (
+        snapshot_id TEXT NOT NULL REFERENCES overseer_m31_snapshots(snapshot_id),
+        ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+        pr_number INTEGER NOT NULL CHECK (pr_number > 0),
+        head_sha TEXT NOT NULL CHECK (
+          (length(head_sha) = 40 OR length(head_sha) = 64) AND head_sha NOT GLOB '*[^0-9a-f]*'
+        ),
+        base_branch TEXT NOT NULL,
+        base_sha TEXT NOT NULL CHECK (
+          (length(base_sha) = 40 OR length(base_sha) = 64) AND base_sha NOT GLOB '*[^0-9a-f]*'
+        ),
+        state TEXT NOT NULL,
+        checks_json TEXT NOT NULL CHECK (json_valid(checks_json)),
+        check_source_sha TEXT NOT NULL CHECK (
+          (length(check_source_sha) = 40 OR length(check_source_sha) = 64)
+          AND check_source_sha NOT GLOB '*[^0-9a-f]*'
+        ),
+        checks_observed_at TEXT NOT NULL,
+        review_state TEXT NOT NULL,
+        mergeability TEXT NOT NULL,
+        merge_state_status TEXT NOT NULL,
+        linked_work_evidence_json TEXT NOT NULL CHECK (json_valid(linked_work_evidence_json)),
+        evidence_artifact_path TEXT NOT NULL,
+        git_object_format TEXT NOT NULL CHECK (git_object_format IN ('sha1', 'sha256')),
+        evidence_git_blob TEXT NOT NULL CHECK (
+          (length(evidence_git_blob) = 40 OR length(evidence_git_blob) = 64)
+          AND evidence_git_blob NOT GLOB '*[^0-9a-f]*'
+        ),
+        observed_at TEXT NOT NULL,
+        PRIMARY KEY (snapshot_id, ordinal),
+        CONSTRAINT overseer_m31_snapshot_members_pr_unique UNIQUE (snapshot_id, pr_number)
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_overseer_m31_snapshot_members_snapshot
+        ON overseer_m31_snapshot_members(snapshot_id, ordinal);
+
+      CREATE TABLE IF NOT EXISTS overseer_m31_discrepancies (
+        discrepancy_id TEXT PRIMARY KEY,
+        snapshot_id TEXT NOT NULL REFERENCES overseer_m31_snapshots(snapshot_id),
+        evidence_git_blob TEXT NOT NULL CHECK (
+          (length(evidence_git_blob) = 40 OR length(evidence_git_blob) = 64)
+          AND evidence_git_blob NOT GLOB '*[^0-9a-f]*'
+        ),
+        affected_rows_json TEXT NOT NULL CHECK (json_valid(affected_rows_json)),
+        observed_conflict TEXT NOT NULL,
+        recorder TEXT NOT NULL,
+        recorded_at TEXT NOT NULL,
+        resolution TEXT,
+        predecessor_discrepancy_id TEXT REFERENCES overseer_m31_discrepancies(discrepancy_id)
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_overseer_m31_discrepancies_snapshot
+        ON overseer_m31_discrepancies(snapshot_id, recorded_at);
+      CREATE INDEX IF NOT EXISTS idx_overseer_m31_discrepancies_unresolved
+        ON overseer_m31_discrepancies(snapshot_id) WHERE resolution IS NULL;
+
+      CREATE TABLE IF NOT EXISTS overseer_m31_action_proposals (
+        proposal_id TEXT PRIMARY KEY,
+        repository TEXT NOT NULL,
+        pr_number INTEGER NOT NULL CHECK (pr_number > 0),
+        head_sha TEXT NOT NULL CHECK (
+          (length(head_sha) = 40 OR length(head_sha) = 64) AND head_sha NOT GLOB '*[^0-9a-f]*'
+        ),
+        base_branch TEXT NOT NULL,
+        base_sha TEXT NOT NULL CHECK (
+          (length(base_sha) = 40 OR length(base_sha) = 64) AND base_sha NOT GLOB '*[^0-9a-f]*'
+        ),
+        snapshot_id TEXT NOT NULL REFERENCES overseer_m31_snapshots(snapshot_id),
+        evidence_path TEXT NOT NULL,
+        evidence_git_blob TEXT NOT NULL CHECK (
+          (length(evidence_git_blob) = 40 OR length(evidence_git_blob) = 64)
+          AND evidence_git_blob NOT GLOB '*[^0-9a-f]*'
+        ),
+        action_kind TEXT NOT NULL CHECK (action_kind IN (
+          'MERGE', 'CLOSE', 'REOPEN', 'REFRESH', 'REBASE', 'PUSH', 'RETARGET',
+          'REPAIR', 'REFIRE', 'COMMENT', 'LABEL', 'ASSIGN', 'REVIEW',
+          'STAGING_MUTATION', 'PRODUCTION_MUTATION', 'DEPLOY'
+        )),
+        action_parameters_json TEXT NOT NULL CHECK (json_valid(action_parameters_json)),
+        actor TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        execution_id TEXT NOT NULL UNIQUE,
+        capability TEXT NOT NULL,
+        policy_digest TEXT NOT NULL CHECK (
+          length(policy_digest) = 64 AND policy_digest NOT GLOB '*[^0-9a-f]*'
+        ),
+        verifier_registry_digest TEXT NOT NULL CHECK (
+          length(verifier_registry_digest) = 64 AND verifier_registry_digest NOT GLOB '*[^0-9a-f]*'
+        ),
+        CONSTRAINT overseer_m31_action_proposals_expiry_after_creation CHECK (expires_at > created_at)
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_overseer_m31_action_proposals_repo
+        ON overseer_m31_action_proposals(repository, pr_number);
+      CREATE INDEX IF NOT EXISTS idx_overseer_m31_action_proposals_snapshot
+        ON overseer_m31_action_proposals(snapshot_id);
+
+      CREATE TABLE IF NOT EXISTS overseer_m31_execution_receipts (
+        receipt_id TEXT PRIMARY KEY,
+        proposal_id TEXT NOT NULL UNIQUE REFERENCES overseer_m31_action_proposals(proposal_id),
+        execution_id TEXT NOT NULL UNIQUE,
+        snapshot_id TEXT NOT NULL REFERENCES overseer_m31_snapshots(snapshot_id),
+        live_observation_json TEXT NOT NULL CHECK (json_valid(live_observation_json)),
+        live_observation_digest TEXT NOT NULL CHECK (
+          length(live_observation_digest) = 64 AND live_observation_digest NOT GLOB '*[^0-9a-f]*'
+        ),
+        revalidated_at TEXT NOT NULL,
+        valid_until TEXT NOT NULL,
+        compare_result TEXT NOT NULL CHECK (compare_result = 'permit_issued'),
+        provider_atomic_operation TEXT CHECK (provider_atomic_operation IS NULL),
+        created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+        CONSTRAINT overseer_m31_execution_receipts_validity_window CHECK (valid_until > revalidated_at)
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_overseer_m31_execution_receipts_proposal
+        ON overseer_m31_execution_receipts(proposal_id);
+
+      CREATE TRIGGER IF NOT EXISTS trg_overseer_m31_snapshots_no_update
+        BEFORE UPDATE ON overseer_m31_snapshots
+        BEGIN SELECT RAISE(ABORT, 'overseer_m31_snapshots is append-only'); END;
+      CREATE TRIGGER IF NOT EXISTS trg_overseer_m31_snapshots_no_delete
+        BEFORE DELETE ON overseer_m31_snapshots
+        BEGIN SELECT RAISE(ABORT, 'overseer_m31_snapshots is append-only'); END;
+      CREATE TRIGGER IF NOT EXISTS trg_overseer_m31_snapshot_members_no_update
+        BEFORE UPDATE ON overseer_m31_snapshot_members
+        BEGIN SELECT RAISE(ABORT, 'overseer_m31_snapshot_members is append-only'); END;
+      CREATE TRIGGER IF NOT EXISTS trg_overseer_m31_snapshot_members_no_delete
+        BEFORE DELETE ON overseer_m31_snapshot_members
+        BEGIN SELECT RAISE(ABORT, 'overseer_m31_snapshot_members is append-only'); END;
+      CREATE TRIGGER IF NOT EXISTS trg_overseer_m31_discrepancies_no_update
+        BEFORE UPDATE ON overseer_m31_discrepancies
+        BEGIN SELECT RAISE(ABORT, 'overseer_m31_discrepancies is append-only'); END;
+      CREATE TRIGGER IF NOT EXISTS trg_overseer_m31_discrepancies_no_delete
+        BEFORE DELETE ON overseer_m31_discrepancies
+        BEGIN SELECT RAISE(ABORT, 'overseer_m31_discrepancies is append-only'); END;
+      CREATE TRIGGER IF NOT EXISTS trg_overseer_m31_action_proposals_no_update
+        BEFORE UPDATE ON overseer_m31_action_proposals
+        BEGIN SELECT RAISE(ABORT, 'overseer_m31_action_proposals is append-only'); END;
+      CREATE TRIGGER IF NOT EXISTS trg_overseer_m31_action_proposals_no_delete
+        BEFORE DELETE ON overseer_m31_action_proposals
+        BEGIN SELECT RAISE(ABORT, 'overseer_m31_action_proposals is append-only'); END;
+      CREATE TRIGGER IF NOT EXISTS trg_overseer_m31_execution_receipts_no_update
+        BEFORE UPDATE ON overseer_m31_execution_receipts
+        BEGIN SELECT RAISE(ABORT, 'overseer_m31_execution_receipts is append-only'); END;
+      CREATE TRIGGER IF NOT EXISTS trg_overseer_m31_execution_receipts_no_delete
+        BEFORE DELETE ON overseer_m31_execution_receipts
+        BEGIN SELECT RAISE(ABORT, 'overseer_m31_execution_receipts is append-only'); END;
+
       CREATE TABLE IF NOT EXISTS overseer_actions (
         id TEXT PRIMARY KEY,
         run_id TEXT NOT NULL REFERENCES remote_agent_workflow_runs(id) ON DELETE CASCADE,

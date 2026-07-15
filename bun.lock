@@ -208,6 +208,7 @@
         "@archon/adapters": "workspace:*",
         "@archon/core": "workspace:*",
         "@archon/git": "workspace:*",
+        "@archon/overseer": "workspace:*",
         "@archon/paths": "workspace:*",
         "@archon/providers": "workspace:*",
         "@archon/smart-cauldron": "workspace:*",
