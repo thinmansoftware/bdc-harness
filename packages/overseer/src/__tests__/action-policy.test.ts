@@ -323,6 +323,45 @@ describe('evaluateActionPolicy', () => {
     );
   });
 
+  test('preserves identity, freshness, and digest reason precedence', () => {
+    const boundProposal = proposal();
+    expectDenied(
+      evaluateActionPolicy(
+        evaluation({
+          proposal: boundProposal,
+          permit: permit(boundProposal, {
+            proposal_id: 'wrong-proposal',
+            execution_id: 'wrong-execution',
+          }),
+        })
+      ),
+      'proposal_id_mismatch'
+    );
+
+    expectDenied(
+      evaluateActionPolicy(
+        evaluation({
+          proposal: boundProposal,
+          permit: permit(boundProposal, { valid_until: '2026-07-15T11:59:59.999Z' }),
+          capability_state: state('merge', { policy_digest: 'f'.repeat(64) }),
+        })
+      ),
+      'permit_expired'
+    );
+
+    expectDenied(
+      evaluateActionPolicy(
+        evaluation({
+          capability_state: state('merge', {
+            policy_digest: 'f'.repeat(64),
+            verifier_registry_digest: 'f'.repeat(64),
+          }),
+        })
+      ),
+      'policy_digest_mismatch'
+    );
+  });
+
   test.each([
     ['MERGE', 'merge'],
     ['REPAIR', 'repair'],

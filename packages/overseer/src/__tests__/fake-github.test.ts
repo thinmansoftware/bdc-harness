@@ -116,6 +116,7 @@ interface HarnessOptions {
   fail_dependency?: 'policy' | 'state' | 'proposal' | 'clock' | 'consume';
   fail_gate_audit?: boolean;
   fail_attempt_audit?: boolean;
+  on_gate_audit?: () => void;
 }
 
 function harness(options: HarnessOptions = {}) {
@@ -152,6 +153,7 @@ function harness(options: HarnessOptions = {}) {
         return liveNow;
       },
       appendEvent: async event => {
+        options.on_gate_audit?.();
         if (options.fail_gate_audit) throw new Error('gate-audit-failed');
         gateEvents.push(event);
       },
@@ -223,6 +225,33 @@ describe('fake GitHub mutation adapter', () => {
     expect(result.reason).toBe('authorization_denied');
     expect(result.authorization_reason).toBe('emergency_stop');
     expect(h.consumeExecution).not.toHaveBeenCalled();
+  });
+
+  test('snapshots caller-owned identities before authorization awaits', async () => {
+    const mutationRequest = request();
+    let authorization!: AuthorizeOverseerActionInput;
+    const h = harness({
+      on_gate_audit: () => {
+        Object.assign(mutationRequest, {
+          permit_id: 'permit-forged',
+          execution_id: 'execution-forged',
+        });
+        Object.assign(authorization.permit, {
+          permit_id: 'permit-forged',
+          execution_id: 'execution-forged',
+        });
+      },
+    });
+    authorization = h.authorization;
+
+    const result = await h.adapter.attemptMutation(mutationRequest, authorization);
+
+    expect(result.accepted).toBe(true);
+    expect(result.permit_id).toBe('permit-1');
+    expect(result.execution_id).toBe('execution-1');
+    expect(h.consumeExecution).toHaveBeenCalledWith('execution-1');
+    expect(h.consumeExecution).not.toHaveBeenCalledWith('execution-forged');
+    expect(h.attemptEvents[0]?.details).toEqual(expect.objectContaining({ permit_id: 'permit-1' }));
   });
 
   test('atomically rejects replay of the same execution after one acceptance', async () => {

@@ -115,6 +115,21 @@ function receipt(
   };
 }
 
+function snapshotRequest(request: FakeGitHubMutationRequest): FakeGitHubMutationRequest {
+  return { ...request };
+}
+
+function snapshotAuthorization(
+  authorization: AuthorizeOverseerActionInput
+): AuthorizeOverseerActionInput {
+  return {
+    requested_capability: authorization.requested_capability,
+    permit: { ...authorization.permit },
+    actor: authorization.actor,
+    correlation_id: authorization.correlation_id,
+  };
+}
+
 /** Deterministic fixture boundary. It records attempts and returns inert data only. */
 export function createFakeGitHubAdapter(deps: FakeGitHubAdapterDeps): FakeGitHubAdapter {
   const allowedRepositories = new Set(
@@ -126,6 +141,8 @@ export function createFakeGitHubAdapter(deps: FakeGitHubAdapterDeps): FakeGitHub
       request: FakeGitHubMutationRequest,
       authorizationInput: AuthorizeOverseerActionInput
     ): Promise<FakeGitHubReceipt> {
+      const boundRequest = snapshotRequest(request);
+      const boundAuthorization = snapshotAuthorization(authorizationInput);
       let reason: FakeGitHubReceiptReason = 'fake_accepted';
       let authorizationReason: ActionPolicyDenialReason | null = null;
       let authorizationAuditRecorded = false;
@@ -134,7 +151,7 @@ export function createFakeGitHubAdapter(deps: FakeGitHubAdapterDeps): FakeGitHub
 
       try {
         const authorization = await authorizeOverseerAction(
-          authorizationInput,
+          boundAuthorization,
           deps.authorization_deps
         );
         authorizationAuditRecorded = authorization.audit_recorded;
@@ -152,15 +169,15 @@ export function createFakeGitHubAdapter(deps: FakeGitHubAdapterDeps): FakeGitHub
 
       if (reason === 'fake_accepted') {
         if (
-          !EXACT_REPOSITORY_RE.test(request.repository) ||
-          !allowedRepositories.has(request.repository)
+          !EXACT_REPOSITORY_RE.test(boundRequest.repository) ||
+          !allowedRepositories.has(boundRequest.repository)
         ) {
           reason = 'repository_not_allowlisted';
-        } else if (!identityMatches(request, authorizationInput)) {
+        } else if (!identityMatches(boundRequest, boundAuthorization)) {
           reason = 'action_identity_mismatch';
         } else {
           try {
-            const consumed = await deps.consume_execution(request.execution_id);
+            const consumed = await deps.consume_execution(boundRequest.execution_id);
             if (!consumed) reason = 'execution_replayed';
           } catch {
             reason = 'execution_check_failed';
@@ -170,13 +187,13 @@ export function createFakeGitHubAdapter(deps: FakeGitHubAdapterDeps): FakeGitHub
 
       const accepted = reason === 'fake_accepted';
       const attemptEvent: AppendOverseerCapabilityEventInput = {
-        capability: authorizationInput.requested_capability,
+        capability: boundAuthorization.requested_capability,
         event_type: 'adapter_attempt',
         reason,
-        actor: authorizationInput.actor,
-        correlation_id: authorizationInput.correlation_id,
-        proposal_id: request.proposal_id,
-        execution_id: request.execution_id,
+        actor: boundAuthorization.actor,
+        correlation_id: boundAuthorization.correlation_id,
+        proposal_id: boundRequest.proposal_id,
+        execution_id: boundRequest.execution_id,
         policy_digest: policyDigest,
         verifier_registry_digest: verifierDigest,
         details: {
@@ -185,21 +202,21 @@ export function createFakeGitHubAdapter(deps: FakeGitHubAdapterDeps): FakeGitHub
           authorization_reason: authorizationReason,
           authorization_audit_recorded: authorizationAuditRecorded,
           mutation_sent: false,
-          permit_id: request.permit_id,
-          repository: request.repository,
-          pr_number: request.pr_number,
-          head_sha: request.head_sha,
-          base_branch: request.base_branch,
-          base_sha: request.base_sha,
-          snapshot_id: request.snapshot_id,
-          action_kind: request.action_kind,
+          permit_id: boundRequest.permit_id,
+          repository: boundRequest.repository,
+          pr_number: boundRequest.pr_number,
+          head_sha: boundRequest.head_sha,
+          base_branch: boundRequest.base_branch,
+          base_sha: boundRequest.base_sha,
+          snapshot_id: boundRequest.snapshot_id,
+          action_kind: boundRequest.action_kind,
         },
       };
 
       try {
         await deps.record_attempt(attemptEvent);
         return receipt(
-          request,
+          boundRequest,
           accepted,
           reason,
           authorizationReason,
@@ -208,7 +225,7 @@ export function createFakeGitHubAdapter(deps: FakeGitHubAdapterDeps): FakeGitHub
         );
       } catch {
         return receipt(
-          request,
+          boundRequest,
           false,
           'attempt_audit_failed',
           authorizationReason,
