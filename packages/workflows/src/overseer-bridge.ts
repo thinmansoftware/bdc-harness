@@ -21,7 +21,13 @@
  */
 
 import type { Logger } from '@archon/paths';
-import { classifyError, decide, runEscalation, type Decision } from '@archon/overseer';
+import {
+  classifyError,
+  decide,
+  permitFromMetadata,
+  runAuthorizedEscalation,
+  type Decision,
+} from '@archon/overseer';
 import type { WorkflowRun, NodeOutput } from './schemas/workflow-run.ts';
 import type { DagNode } from './schemas/dag-node.ts';
 import { buildGateResultField } from './event-emitter';
@@ -73,7 +79,7 @@ export interface HandleNodeFailureContext {
   validatorOutput?: string;
   /**
    * Optional WO ID parsed from the workflow user_message. Surfaced into the
-   * escalation payload so runEscalation can post a Notion comment on the right page.
+   * escalation payload so the authorized boundary can notify the right WO page.
    */
   woId?: string;
   /** Optional: commits-ahead-of-origin count on the thread branch (escalation context only). */
@@ -183,13 +189,34 @@ export async function handleNodeFailure(
   // identified in the 2026-05-18 Wave A anchor incidents. The presence of
   // `result.escalationContext` is the contract -- only the new classes populate it,
   // so existing v1 escalate paths (out_of_credits, auth_failed, etc.) are unaffected.
+  //
   if (result.decision === 'escalate' && result.escalationContext) {
-    await runEscalation(workflowRun.id, result, result.escalationContext).catch((err: Error) => {
+    const escalation = await runAuthorizedEscalation(
+      workflowRun.id,
+      result,
+      result.escalationContext,
+      {
+        permit: permitFromMetadata(workflowRun.metadata),
+        actor: 'overseer-workflow-bridge',
+      }
+    ).catch((err: Error) => {
       deps.log.error(
         { err, workflowRunId: workflowRun.id, nodeId: node.id, errorClass },
         'overseer.escalation_failed'
       );
+      return { executed: false as const, reason: 'authorization_boundary_failed' };
     });
+    if (!escalation.executed) {
+      deps.log.info(
+        {
+          runId: workflowRun.id,
+          nodeId: node.id,
+          errorClass,
+          reason: escalation.reason,
+        },
+        'overseer.escalation_denied'
+      );
+    }
   }
 
   // Translate decision to NodeOutput state.

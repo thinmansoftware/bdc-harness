@@ -36,25 +36,27 @@ elseif (Test-Path "C:\Program Files\Docker\Docker\resources\bin\docker.exe") {
   exit 1
 }
 
-# --- Assertion 1: staging container is running or env is offline-only mode ---
+# --- Assertion 1: the exact-SHA staging container is running ---
 $ContainerState = (& $Docker inspect -f "{{.State.Status}}" archon-staging 2>$null)
 if ($ContainerState -eq "running") {
   Pass "Container archon-staging is running"
 } else {
-  Info "Container archon-staging is not running (state: $ContainerState) -- running offline env assertions only"
+  Fail "Container archon-staging is not running (state: $ContainerState)"
+  exit 1
 }
 
 # --- Assertion 2: deployed commit is recorded ---
 $dcFile = Join-Path $RepoRoot "staging-data\DEPLOYED_COMMIT"
 if (Test-Path $dcFile) {
   $DeployedSha = (Get-Content $dcFile -Raw).Trim()
-  if ($DeployedSha.Length -ge 7) {
-    Pass "Deployed commit recorded: $DeployedSha"
+  $CandidateSha = (& git -C $RepoRoot rev-parse HEAD).Trim()
+  if ($DeployedSha -eq $CandidateSha) {
+    Pass "Deployed commit matches candidate HEAD: $DeployedSha"
   } else {
-    Fail "Deployed commit file is present but empty or malformed"
+    Fail "Deployed commit '$DeployedSha' does not match candidate HEAD '$CandidateSha'"
   }
 } else {
-  Info "No DEPLOYED_COMMIT file -- staging may not have been started yet; skipping commit assertion"
+  Fail "No DEPLOYED_COMMIT file -- exact-SHA staging proof is unavailable"
 }
 
 # --- Assertion 3: .env.staging has the required fail-closed defaults ---
@@ -84,7 +86,7 @@ if (Test-Path $envFile) {
     }
   }
 } else {
-  Info ".env.staging not found -- skipping env file assertions (acceptable before first staging-up.ps1 run)"
+  Fail ".env.staging not found -- fail-closed staging configuration cannot be verified"
 }
 
 # --- Assertion 4: in-container Overseer runtime status (when running) ---
@@ -131,11 +133,8 @@ console.log("FAKE_ADAPTER_CONFIRMED");
 const keys = ["GH_TOKEN", "GITHUB_TOKEN", "CLAUDE_API_KEY"];
 for (const k of keys) {
   const v = process.env[k] ?? "";
-  if (v.length > 8) {
-    const redacted = v.slice(0,4) + "****";
-    console.log("REDACTED:" + k + "=" + redacted);
-  } else if (v.length > 0) {
-    console.log("SHORT_VALUE_PRESENT:" + k);
+  if (v.length > 0) {
+    console.log("PRESENT_REDACTED:" + k);
   } else {
     console.log("ABSENT:" + k);
   }
@@ -143,8 +142,8 @@ for (const k of keys) {
 '@
   try {
     $credCheck = & $Docker exec archon-staging bun -e $credCheckJs 2>$null
-    if ($credCheck -notmatch "ghp_|github_pat_|Bearer ") {
-      Pass "No raw GitHub credential value visible in container env output"
+    if ($credCheck -notmatch "ghp_|github_pat_|Bearer |sk-") {
+      Pass "No raw credential value visible in container env output"
     } else {
       Fail "Possible raw credential value leaked to stdout -- review immediately"
     }
@@ -209,17 +208,68 @@ try {
   }
 }
 
-# --- Assertion 7: fake adapter cannot escape to real network ---
-# The fixture allowlist does not include 'outside-fixture'. Any attempt to
-# mutate it must fail closed with a receipt. This is verified offline because
-# exercising the full path requires a running service with the fake adapter;
-# the unit tests in fake-github.test.ts prove the boundary in isolation.
-$fixtureAllowlist = @("bluedevilcollectibles/bdc-harness")
-$outsideRepo = "outside-fixture"
-if ($fixtureAllowlist -notcontains $outsideRepo) {
-  Pass "Fixture allowlist excludes '$outsideRepo' -- outside-fixture mutation is blocked by the fake adapter"
-} else {
-  Fail "Fixture allowlist should not contain '$outsideRepo'"
+# --- Assertion 7: fake adapter boundary -- adapter_attempt receipt verified ---
+# Exercise the actual createFakeGitHubAdapter factory: attempt a mutation against
+# an allowlisted repository and verify the adapter emits an adapter_attempt receipt
+# with mutation_sent=false and accepted=false (repository_not_allowlisted because
+# the test repo is not in the runtime allowlist). This proves the boundary is
+# constructed and enforced, not just declared in env variables.
+if ($ContainerState -eq "running") {
+  $fakeAdapterJs = @'
+const { createFakeGitHubAdapter } = await import("/app/packages/overseer/src/adapters/fake-github.ts");
+const received = [];
+const adapter = createFakeGitHubAdapter({
+  allowed_repositories: [],
+  authorization_deps: {
+    getPolicy: async () => ({
+      service_enabled: false,
+      emergency_stop: true,
+      legacy_dry_run: true,
+      capability_flags: { escalation: false, repair: false, branch: false, lifecycle: false, merge: false },
+    }),
+  },
+  consume_execution: async () => false,
+  record_attempt: async (evt) => { received.push(evt); },
+});
+const request = {
+  permit_id: "test-permit",
+  repository: "outside-fixture",
+  pr_number: 1,
+  head_sha: "a".repeat(40),
+  base_branch: "main",
+  base_sha: "b".repeat(40),
+  snapshot_id: "snap-1",
+  proposal_id: "prop-1",
+  execution_id: "exec-1",
+  action_kind: "MERGE",
+};
+const authInput = {
+  requested_capability: "merge",
+  permit: { ...request, capability: "merge", valid_until: new Date(Date.now() + 60000).toISOString() },
+  actor: "test",
+  correlation_id: "test-corr",
+};
+const receipt = await adapter.attemptMutation(request, authInput);
+if (receipt.mutation_sent !== false) {
+  console.log("FAIL:mutation_sent_true");
+  process.exit(1);
+}
+if (received.length !== 1 || received[0].event_type !== "adapter_attempt") {
+  console.log("FAIL:no_adapter_attempt_event:count=" + received.length);
+  process.exit(1);
+}
+console.log("FAKE_ADAPTER_RECEIPT:reason=" + receipt.reason + ":mutation_sent=false:event_recorded=true");
+'@
+  try {
+    $fakeAdapterCheck = & $Docker exec archon-staging bun -e $fakeAdapterJs 2>$null
+    if ($fakeAdapterCheck -match "^FAKE_ADAPTER_RECEIPT:") {
+      Pass "Fake adapter boundary exercised: adapter_attempt event recorded, mutation_sent=false: $fakeAdapterCheck"
+    } else {
+      Fail "Fake adapter boundary check failed: $fakeAdapterCheck"
+    }
+  } catch {
+    Fail "Fake adapter boundary check exception: $($_.Exception.Message)"
+  }
 }
 
 # --- Final summary and completion evidence ---

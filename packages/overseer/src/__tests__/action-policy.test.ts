@@ -630,7 +630,12 @@ describe('authorizeOverseerAction', () => {
     expectDenied(result, 'gate_audit_failed');
     expect(result.audit_recorded).toBe(true);
     expect(appendEvent.mock.calls[1]?.[0]).toEqual(
-      expect.objectContaining({ event_type: 'gate_denied', reason: 'gate_audit_failed' })
+      expect.objectContaining({
+        event_type: 'gate_denied',
+        reason: 'gate_audit_failed',
+        proposal_id: null,
+        execution_id: null,
+      })
     );
   });
 });

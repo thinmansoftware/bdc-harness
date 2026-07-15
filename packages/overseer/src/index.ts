@@ -27,14 +27,14 @@ export type { ErrorClass, ClassifyInput } from './classify';
 export { decide } from './decide';
 export type { Decision, DecideInput, DecisionResult } from './decide';
 
-export { runEscalation } from './escalate';
+export { runAuthorizedEscalation } from './authorized-escalation';
+export { parseM31ActionPermit, permitFromMetadata } from './permit';
 export { buildDispatchRunReportBody } from './escalate';
 export type { EscalationContext } from './escalate';
 
 export { watchLoop, watchOnce, DEFAULT_WATCH_INTERVAL_MS } from './watch';
 export { judgePullRequest, isPrGreen, isPrMergeReady } from './judge-pr';
 export { judgeWithGrok } from './judge-second-opinion';
-export { handleMergeReady, isInternalMergeAllowed } from './actions/merge-ready';
 export { runOverseerService } from './service';
 
 // M-31 merge-steward substrate (M-42 Slice 2): read-only permit preparation.

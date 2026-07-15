@@ -65,6 +65,7 @@ export interface WatchedRunRecord {
   owner: string;
   status: WatchedRunStatus;
   headBranch?: string;
+  metadata?: Record<string, unknown>;
   errorClass?: ErrorClass | 'tail_node_false_fail';
   action: 'success' | 'merge_ready' | 'escalate' | 'ignore';
   reason: string;

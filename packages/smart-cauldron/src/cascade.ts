@@ -29,7 +29,8 @@ import { createRecord, writeRecord } from './recorder.js';
 import type { CreateCascadeRecordResult } from './recorder.js';
 import { cancelRun } from './cancel.js';
 import { classifyError } from '@archon/overseer/classify';
-import { runEscalation } from '@archon/overseer/escalate';
+import { runAuthorizedEscalation } from '@archon/overseer/authorized-escalation';
+import type { M31ActionPermit } from '@archon/overseer/m31-substrate';
 import type {
   CascadeRunRecord,
   CascadeAttempt,
@@ -93,6 +94,7 @@ export interface EscalationCallContext {
   reason: string;
   remediation?: string[];
   runId?: string | null;
+  overseerPermit?: M31ActionPermit;
 }
 
 export interface SpecRepairCallContext {
@@ -137,6 +139,8 @@ export interface RunCascadeOptions {
   outDir?: string;
   /** Dry-run: print which tier would be picked, do not fire. */
   dryRun?: boolean;
+  /** M-31 permit required before default escalation side effects can run. */
+  overseerPermit?: M31ActionPermit;
   /** Dependency injection (for testing). */
   deps?: CascadeDeps;
   /** Poll timeout per attempt in ms. Default: 1800000 (30 minutes). */
@@ -383,6 +387,7 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
             `gate-failed: ${failReason}`,
           remediation: [whatMustChange, evidence],
           runId,
+          overseerPermit: opts.overseerPermit,
         });
       }
 
@@ -451,6 +456,7 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
           errorClass: 'configuration',
           woId,
           reason: `Lane preflight failed on tier ${tier.name}: ${reason}`,
+          overseerPermit: opts.overseerPermit,
           runId: null,
         });
         await checkpoint();
@@ -510,6 +516,7 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
         errorClass,
         woId,
         reason: `Infra error on tier ${tier.name}: ${fireResult.infraError ?? 'unknown'}`,
+        overseerPermit: opts.overseerPermit,
         runId: null,
       });
 
@@ -578,6 +585,7 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
         errorClass: 'service_unavailable',
         woId,
         reason: `Poll timeout/error on tier ${tier.name}: ${errMsg}`,
+        overseerPermit: opts.overseerPermit,
         runId: fireResult.runId,
       });
 
@@ -696,7 +704,7 @@ function extractStatusCode(infraError: string): number | undefined {
 }
 
 /**
- * Default escalation implementation using @archon/overseer/escalate.
+ * Default escalation implementation using the shared persistent M-42 boundary.
  */
 async function defaultEscalate(ctx: EscalationCallContext): Promise<void> {
   const decision: DecisionResult = {
@@ -709,11 +717,16 @@ async function defaultEscalate(ctx: EscalationCallContext): Promise<void> {
     },
   };
 
-  await runEscalation(ctx.runId ?? `cascade-${randomUUID()}`, decision, {
-    errorClass: ctx.errorClass as import('@archon/overseer/classify').ErrorClass,
-    woId: ctx.woId,
-    remediation: ctx.remediation,
-  });
+  await runAuthorizedEscalation(
+    ctx.runId ?? `cascade-${randomUUID()}`,
+    decision,
+    {
+      errorClass: ctx.errorClass as import('@archon/overseer/classify').ErrorClass,
+      woId: ctx.woId,
+      remediation: ctx.remediation,
+    },
+    { permit: ctx.overseerPermit ?? null, actor: 'smart-cauldron' }
+  );
 }
 
 /**

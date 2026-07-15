@@ -693,13 +693,17 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     stopCleanupScheduler();
     stopProviderWaitScheduler();
     persistence.stopPeriodicFlush();
-    void stopOverseerRuntime().catch((e: unknown) => {
+
+    // Await overseer watcher abort before flushing; bounded by the watcher's own
+    // abort-signal handler. If the promise rejects (already-degraded watcher), we
+    // log and continue -- shutdown must not block on an already-failed service.
+    const overseerStop = stopOverseerRuntime().catch((e: unknown) => {
       getLog().error({ err: e }, 'overseer_runtime_stop_failed');
     });
 
     // Flush all buffered messages before stopping adapters
-    persistence
-      .flushAll()
+    Promise.resolve(overseerStop)
+      .then(() => persistence.flushAll())
       .catch((e: unknown) => {
         getLog().error({ err: e }, 'shutdown_flush_failed');
       })

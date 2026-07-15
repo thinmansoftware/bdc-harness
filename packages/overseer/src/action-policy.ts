@@ -31,6 +31,7 @@ const ACTION_CAPABILITIES: Readonly<Partial<Record<M31ActionKind, OverseerCapabi
   LABEL: 'lifecycle',
   ASSIGN: 'lifecycle',
   REVIEW: 'lifecycle',
+  STAGING_MUTATION: 'escalation',
 };
 
 export interface OverseerActionPolicy {
@@ -38,6 +39,26 @@ export interface OverseerActionPolicy {
   readonly emergency_stop: boolean;
   readonly legacy_dry_run: boolean;
   readonly capability_flags: Readonly<Record<OverseerCapability, boolean>>;
+}
+
+function envExactlyTrue(value: string | undefined): boolean {
+  return value === '1' || value === 'true' || value === 'yes';
+}
+
+/** Read the process-level global gates. Missing stop flags fail closed. */
+export function readOverseerActionPolicyFromEnv(): OverseerActionPolicy {
+  return {
+    service_enabled: envExactlyTrue(process.env.OVERSEER_ENABLED),
+    emergency_stop: !['0', 'false', 'no'].includes(process.env.OVERSEER_EMERGENCY_STOP ?? ''),
+    legacy_dry_run: envExactlyTrue(process.env.OVERSEER_DRY_RUN),
+    capability_flags: {
+      escalation: envExactlyTrue(process.env.OVERSEER_ESCALATION_ACTIONS_ENABLED),
+      repair: envExactlyTrue(process.env.OVERSEER_REPAIR_ACTIONS_ENABLED),
+      branch: envExactlyTrue(process.env.OVERSEER_BRANCH_ACTIONS_ENABLED),
+      lifecycle: envExactlyTrue(process.env.OVERSEER_LIFECYCLE_ACTIONS_ENABLED),
+      merge: envExactlyTrue(process.env.OVERSEER_MERGE_ACTIONS_ENABLED),
+    },
+  };
 }
 
 export interface ActionPolicyInput {
@@ -289,14 +310,21 @@ async function recordDecision(
   state: OverseerCapabilityState | null | undefined,
   proposal: M31ActionProposal | null | undefined
 ): Promise<ActionAuthorizationResult> {
-  const eventFor = (eventDecision: ActionPolicyDecision): AppendOverseerCapabilityEventInput => ({
+  const eventFor = (
+    eventDecision: ActionPolicyDecision,
+    detachUntrustedIdentity = false
+  ): AppendOverseerCapabilityEventInput => ({
     capability: input.requested_capability,
     event_type: eventDecision.allowed ? 'gate_allowed' : 'gate_denied',
     reason: eventDecision.reason,
     actor: input.actor,
     correlation_id: input.correlation_id,
-    proposal_id: input.permit.proposal_id,
-    execution_id: input.permit.execution_id,
+    // A malformed or fabricated permit can name proposal/execution rows that do
+    // not exist. The primary audit attempt intentionally preserves that identity.
+    // If the store rejects its foreign keys, the fail-closed audit must detach
+    // those untrusted references or the fallback would repeat the same failure.
+    proposal_id: detachUntrustedIdentity ? null : input.permit.proposal_id,
+    execution_id: detachUntrustedIdentity ? null : input.permit.execution_id,
     policy_digest: eventDigest(state?.policy_digest ?? proposal?.policy_digest),
     verifier_registry_digest: eventDigest(
       state?.verifier_registry_digest ?? proposal?.verifier_registry_digest
@@ -313,7 +341,7 @@ async function recordDecision(
   } catch {
     const auditFailure = deny(input.requested_capability, 'gate_audit_failed');
     try {
-      await deps.appendEvent(eventFor(auditFailure));
+      await deps.appendEvent(eventFor(auditFailure, true));
       return { ...auditFailure, audit_recorded: true };
     } catch {
       return { ...auditFailure, audit_recorded: false };

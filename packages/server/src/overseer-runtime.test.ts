@@ -1,13 +1,25 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test';
 
-const runOverseerServiceMock = mock(async (_opts?: unknown) => {});
+const listCapabilityStatesMock = mock(
+  async (): Promise<
+    Array<{ capability: string; action_enabled: boolean; circuit_state: string }>
+  > => []
+);
 
-mock.module('@archon/overseer/service', () => ({
-  runOverseerService: runOverseerServiceMock,
-}));
+// Capture adapterKind passed into runOverseerService for real-wiring assertions.
+let capturedServiceOptions: { adapterKind?: string } | null = null;
+const runOverseerServiceMock = mock(async (opts?: unknown) => {
+  capturedServiceOptions = (opts ?? {}) as { adapterKind?: string };
+});
 
-const { startOverseerRuntime, stopOverseerRuntime, getOverseerRuntimeStatus } =
-  await import('./overseer-runtime');
+import {
+  startOverseerRuntime,
+  stopOverseerRuntime,
+  getOverseerRuntimeStatus,
+} from './overseer-runtime';
+
+const getStatus = () =>
+  getOverseerRuntimeStatus({ listCapabilityStates: listCapabilityStatesMock });
 
 const oldEnabled = process.env.OVERSEER_ENABLED;
 const oldEmergencyStop = process.env.OVERSEER_EMERGENCY_STOP;
@@ -40,6 +52,13 @@ function setEnabledEnv(): void {
 describe('overseer-runtime', () => {
   beforeEach(() => {
     runOverseerServiceMock.mockReset();
+    // Re-apply base capture impl after reset (mockReset clears implementation).
+    runOverseerServiceMock.mockImplementation(async (opts?: unknown) => {
+      capturedServiceOptions = (opts ?? {}) as { adapterKind?: string };
+    });
+    listCapabilityStatesMock.mockReset();
+    listCapabilityStatesMock.mockImplementation(async () => []);
+    capturedServiceOptions = null;
     setDisabledEnv();
   });
 
@@ -56,9 +75,14 @@ describe('overseer-runtime', () => {
 
   test('disabled service starts no watcher and makes no db reads', () => {
     setDisabledEnv();
-    startOverseerRuntime();
+    startOverseerRuntime({ runService: runOverseerServiceMock });
     expect(runOverseerServiceMock).not.toHaveBeenCalled();
-    const status = getOverseerRuntimeStatus();
+  });
+
+  test('disabled service watcher state is stopped', async () => {
+    setDisabledEnv();
+    startOverseerRuntime({ runService: runOverseerServiceMock });
+    const status = await getStatus();
     expect(status.watcher).toBe('stopped');
   });
 
@@ -72,11 +96,11 @@ describe('overseer-runtime', () => {
     );
 
     setEnabledEnv();
-    startOverseerRuntime();
-    startOverseerRuntime();
+    startOverseerRuntime({ runService: runOverseerServiceMock });
+    startOverseerRuntime({ runService: runOverseerServiceMock });
 
     expect(runOverseerServiceMock).toHaveBeenCalledTimes(1);
-    const status = getOverseerRuntimeStatus();
+    const status = await getStatus();
     expect(status.watcher).toBe('running');
 
     resolveService();
@@ -99,11 +123,13 @@ describe('overseer-runtime', () => {
     });
 
     setEnabledEnv();
-    startOverseerRuntime();
-    expect(getOverseerRuntimeStatus().watcher).toBe('running');
+    startOverseerRuntime({ runService: runOverseerServiceMock });
+    const statusBefore = await getStatus();
+    expect(statusBefore.watcher).toBe('running');
     await stopOverseerRuntime();
     expect(abortSeen).toBe(true);
-    expect(getOverseerRuntimeStatus().watcher).toBe('stopped');
+    const statusAfter = await getStatus();
+    expect(statusAfter.watcher).toBe('stopped');
   });
 
   test('watcher exception degrades status without throwing to the caller', async () => {
@@ -112,10 +138,10 @@ describe('overseer-runtime', () => {
     });
 
     setEnabledEnv();
-    startOverseerRuntime();
+    startOverseerRuntime({ runService: runOverseerServiceMock });
 
     await new Promise<void>(resolve => setTimeout(resolve, 20));
-    const status = getOverseerRuntimeStatus();
+    const status = await getStatus();
     expect(status.watcher).toBe('degraded');
   });
 
@@ -123,17 +149,65 @@ describe('overseer-runtime', () => {
     await expect(stopOverseerRuntime()).resolves.toBeUndefined();
   });
 
-  test('status reports emergency_stop and five closed circuits without credential values', () => {
+  test('status reports emergency_stop and no credential fields', async () => {
     setEnabledEnv();
-    const status = getOverseerRuntimeStatus();
+    const status = await getStatus();
     expect(status.emergency_stop).toBe(true);
-    const caps = ['escalation', 'repair', 'branch', 'lifecycle', 'merge'];
-    for (const cap of caps) {
-      expect(status.capability_flags[cap]).toBe(false);
-      expect(status.circuit_states[cap]).toBe('closed');
-    }
     expect(Object.keys(status).includes('token')).toBe(false);
     expect(JSON.stringify(status)).not.toContain('REPLACE_WITH');
+  });
+
+  test('circuit_states default to unknown when DB returns empty (not closed)', async () => {
+    listCapabilityStatesMock.mockImplementation(async () => []);
+    const status = await getStatus();
+    const caps = ['escalation', 'repair', 'branch', 'lifecycle', 'merge'];
+    for (const cap of caps) {
+      // Must be 'unknown' when no DB rows -- never hardcode 'closed'
+      expect(status.circuit_states[cap]).toBe('unknown');
+    }
+  });
+
+  test('circuit_states reflect persisted DB values when available', async () => {
+    listCapabilityStatesMock.mockImplementation(async () => [
+      {
+        capability: 'escalation',
+        action_enabled: false,
+        circuit_state: 'open',
+        circuit_reason: 'test',
+        circuit_opened_at: null,
+        policy_digest: '0'.repeat(64),
+        verifier_registry_digest: '0'.repeat(64),
+        updated_at: '',
+        updated_by: '',
+      },
+      {
+        capability: 'merge',
+        action_enabled: false,
+        circuit_state: 'closed',
+        circuit_reason: null,
+        circuit_opened_at: null,
+        policy_digest: '0'.repeat(64),
+        verifier_registry_digest: '0'.repeat(64),
+        updated_at: '',
+        updated_by: '',
+      },
+    ]);
+    const status = await getStatus();
+    expect(status.circuit_states['escalation']).toBe('open');
+    expect(status.circuit_states['merge']).toBe('closed');
+    // Capabilities not in DB response remain 'unknown'
+    expect(status.circuit_states['repair']).toBe('unknown');
+  });
+
+  test('circuit_states fall back to unknown when DB read fails', async () => {
+    listCapabilityStatesMock.mockImplementation(async () => {
+      throw new Error('db_read_failed');
+    });
+    const status = await getStatus();
+    const caps = ['escalation', 'repair', 'branch', 'lifecycle', 'merge'];
+    for (const cap of caps) {
+      expect(status.circuit_states[cap]).toBe('unknown');
+    }
   });
 
   test('fake adapter is selected when OVERSEER_USE_FAKE_GITHUB_ADAPTER is set', async () => {
@@ -147,9 +221,45 @@ describe('overseer-runtime', () => {
 
     setEnabledEnv();
     process.env.OVERSEER_USE_FAKE_GITHUB_ADAPTER = '1';
-    startOverseerRuntime();
-    const status = getOverseerRuntimeStatus();
+    startOverseerRuntime({ runService: runOverseerServiceMock });
+    const status = await getStatus();
     expect(status.adapter).toBe('fake');
+
+    resolveService();
+    await stopOverseerRuntime();
+  });
+
+  test('enabled real adapter is rejected before watcher construction', async () => {
+    process.env.OVERSEER_ENABLED = 'true';
+    process.env.OVERSEER_USE_FAKE_GITHUB_ADAPTER = 'false';
+    process.env.GITHUB_TOKEN = 'poison-token';
+
+    startOverseerRuntime({ runService: runOverseerServiceMock });
+    const status = await getOverseerRuntimeStatus({ listCapabilityStates: async () => [] });
+
+    expect(runOverseerServiceMock).not.toHaveBeenCalled();
+    expect(status.adapter).toBe('real');
+    expect(status.watcher).toBe('degraded');
+  });
+
+  test('fake adapterKind is forwarded to runOverseerService -- no live Octokit wired', async () => {
+    let resolveService!: () => void;
+    runOverseerServiceMock.mockImplementation(
+      (opts?: unknown) =>
+        new Promise<void>(resolve => {
+          // Capture opts here so we can assert after startOverseerRuntime returns.
+          capturedServiceOptions = (opts ?? {}) as { adapterKind?: string };
+          resolveService = resolve;
+        })
+    );
+
+    setEnabledEnv();
+    process.env.OVERSEER_USE_FAKE_GITHUB_ADAPTER = '1';
+    startOverseerRuntime({ runService: runOverseerServiceMock });
+
+    // The runtime must forward adapterKind='fake' into the service so the service
+    // wires stub deps instead of constructing a live Octokit client.
+    expect(capturedServiceOptions?.adapterKind).toBe('fake');
 
     resolveService();
     await stopOverseerRuntime();
