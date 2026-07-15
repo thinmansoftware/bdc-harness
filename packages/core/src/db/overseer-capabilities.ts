@@ -89,10 +89,10 @@ interface CapabilityStateRow {
   readonly action_enabled: boolean | number | string;
   readonly circuit_state: string;
   readonly circuit_reason: string | null;
-  readonly circuit_opened_at: string | null;
+  readonly circuit_opened_at: Date | string | null;
   readonly policy_digest: string;
   readonly verifier_registry_digest: string;
-  readonly updated_at: string;
+  readonly updated_at: Date | string;
   readonly updated_by: string;
 }
 
@@ -108,7 +108,7 @@ interface CapabilityEventRow {
   readonly policy_digest: string;
   readonly verifier_registry_digest: string;
   readonly details_json: unknown;
-  readonly created_at: string;
+  readonly created_at: Date | string;
 }
 
 function isOverseerCapability(value: string): value is OverseerCapability {
@@ -141,7 +141,10 @@ function requireDigest(name: string, value: string): void {
 
 function validateEventInput(input: AppendOverseerCapabilityEventInput): void {
   requireCapability(input.capability);
-  requireEventType(input.event_type);
+  const eventType = requireEventType(input.event_type);
+  if (eventType === 'circuit_opened' || eventType === 'circuit_reset') {
+    throw new Error(`transition_event_requires_atomic_operation:${eventType}`);
+  }
   requireDigest('policy_digest', input.policy_digest);
   requireDigest('verifier_registry_digest', input.verifier_registry_digest);
 }
@@ -164,16 +167,25 @@ function parseDetails(value: unknown): Record<string, unknown> {
   return parsed as Record<string, unknown>;
 }
 
+function normalizeTimestamp(value: Date | string): string {
+  const timestamp = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(timestamp.getTime())) {
+    throw new Error('invalid_overseer_capability_timestamp');
+  }
+  return timestamp.toISOString();
+}
+
 function normalizeState(row: CapabilityStateRow): OverseerCapabilityState {
   return {
     capability: requireCapability(row.capability),
     action_enabled: toBoolean(row.action_enabled),
     circuit_state: row.circuit_state === 'open' ? 'open' : 'closed',
     circuit_reason: row.circuit_reason,
-    circuit_opened_at: row.circuit_opened_at,
+    circuit_opened_at:
+      row.circuit_opened_at === null ? null : normalizeTimestamp(row.circuit_opened_at),
     policy_digest: row.policy_digest,
     verifier_registry_digest: row.verifier_registry_digest,
-    updated_at: row.updated_at,
+    updated_at: normalizeTimestamp(row.updated_at),
     updated_by: row.updated_by,
   };
 }
@@ -191,7 +203,7 @@ function normalizeEvent(row: CapabilityEventRow): OverseerCapabilityEvent {
     policy_digest: row.policy_digest,
     verifier_registry_digest: row.verifier_registry_digest,
     details: parseDetails(row.details_json),
-    created_at: row.created_at,
+    created_at: normalizeTimestamp(row.created_at),
   };
 }
 

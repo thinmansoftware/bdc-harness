@@ -2,8 +2,9 @@ import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test';
 import { readFileSync, unlinkSync } from 'fs';
 import { join } from 'path';
 import { SqliteAdapter } from './adapters/sqlite';
+import type { IDatabase, QueryResult, SqlDialect } from './adapters/types';
 
-let db: SqliteAdapter;
+let db: IDatabase;
 let currentDbPath = '';
 
 mock.module('./connection', () => ({
@@ -24,6 +25,7 @@ const VERIFIER_DIGEST = 'b'.repeat(64);
 const ZERO_DIGEST = '0'.repeat(64);
 
 function cleanupDb(path: string): void {
+  if (!path) return;
   for (const suffix of ['', '-wal', '-shm']) {
     try {
       unlinkSync(path + suffix);
@@ -59,6 +61,91 @@ function eventInput(overrides: Record<string, unknown> = {}): {
   };
 }
 
+function timestampRowDatabase(sqlDialect: SqlDialect): IDatabase {
+  const dateTimestamp = new Date('2026-07-15T12:34:56.789Z');
+  const offsetTimestamp = '2026-07-15T08:34:56.789-04:00';
+  const stateRows: readonly Record<string, unknown>[] = [
+    {
+      capability: 'repair',
+      action_enabled: false,
+      circuit_state: 'open',
+      circuit_reason: 'test',
+      circuit_opened_at: dateTimestamp,
+      policy_digest: POLICY_DIGEST,
+      verifier_registry_digest: VERIFIER_DIGEST,
+      updated_at: offsetTimestamp,
+      updated_by: 'test-operator',
+    },
+    {
+      capability: 'merge',
+      action_enabled: false,
+      circuit_state: 'closed',
+      circuit_reason: null,
+      circuit_opened_at: null,
+      policy_digest: POLICY_DIGEST,
+      verifier_registry_digest: VERIFIER_DIGEST,
+      updated_at: dateTimestamp,
+      updated_by: 'test-operator',
+    },
+  ];
+  const eventRows: readonly Record<string, unknown>[] = [
+    {
+      event_id: 'event-string-time',
+      capability: 'merge',
+      event_type: 'gate_denied',
+      reason: 'test',
+      actor: 'test-operator',
+      correlation_id: 'corr-string-time',
+      proposal_id: null,
+      execution_id: null,
+      policy_digest: POLICY_DIGEST,
+      verifier_registry_digest: VERIFIER_DIGEST,
+      details_json: '{}',
+      created_at: offsetTimestamp,
+    },
+    {
+      event_id: 'event-date-time',
+      capability: 'merge',
+      event_type: 'gate_denied',
+      reason: 'test',
+      actor: 'test-operator',
+      correlation_id: 'corr-date-time',
+      proposal_id: null,
+      execution_id: null,
+      policy_digest: POLICY_DIGEST,
+      verifier_registry_digest: VERIFIER_DIGEST,
+      details_json: '{}',
+      created_at: dateTimestamp,
+    },
+  ];
+
+  return {
+    dialect: 'postgres',
+    sql: sqlDialect,
+    async query<T>(statement: string): Promise<QueryResult<T>> {
+      const source = statement.includes('overseer_capability_state') ? stateRows : eventRows;
+      return { rows: source as readonly T[], rowCount: source.length };
+    },
+    async withTransaction<T>(
+      _fn: (
+        query: <U>(statement: string, params?: unknown[]) => Promise<QueryResult<U>>
+      ) => Promise<T>
+    ): Promise<T> {
+      throw new Error('transaction_not_expected');
+    },
+    async close(): Promise<void> {},
+  };
+}
+
+function createTableDefinition(schema: string, table: string): string {
+  const start = schema.indexOf(`CREATE TABLE IF NOT EXISTS ${table}`);
+  if (start < 0) throw new Error(`missing_table_definition:${table}`);
+  const markerPattern = /\n\s*(?:CREATE (?:TABLE|INDEX|TRIGGER)|INSERT |-- [A-Z])/g;
+  markerPattern.lastIndex = start + 1;
+  const next = markerPattern.exec(schema);
+  return schema.slice(start, next?.index ?? schema.length);
+}
+
 describe('overseer capability persistence (sqlite)', () => {
   beforeEach(() => {
     currentDbPath = join(
@@ -90,6 +177,26 @@ describe('overseer capability persistence (sqlite)', () => {
     }
 
     expect((await getOverseerCapabilityState('merge'))?.capability).toBe('merge');
+  });
+
+  test('normalizes PostgreSQL Date and string timestamps to ISO strings', async () => {
+    const sqlDialect = db.sql;
+    await db.close();
+    cleanupDb(currentDbPath);
+    currentDbPath = '';
+    db = timestampRowDatabase(sqlDialect);
+
+    const states = await listOverseerCapabilityStates();
+    expect(states[0]?.circuit_opened_at).toBe('2026-07-15T12:34:56.789Z');
+    expect(states[0]?.updated_at).toBe('2026-07-15T12:34:56.789Z');
+    expect(states[1]?.circuit_opened_at).toBeNull();
+    expect(states[1]?.updated_at).toBe('2026-07-15T12:34:56.789Z');
+
+    const events = await listOverseerCapabilityEvents('merge');
+    expect(events.map(event => event.created_at)).toEqual([
+      '2026-07-15T12:34:56.789Z',
+      '2026-07-15T12:34:56.789Z',
+    ]);
   });
 
   test('keeps PostgreSQL migration and SQLite schema logically equivalent', async () => {
@@ -125,11 +232,16 @@ describe('overseer capability persistence (sqlite)', () => {
     ];
 
     for (const schema of [migration, sqlite]) {
+      const stateTable = createTableDefinition(schema, 'overseer_capability_state');
+      const eventTable = createTableDefinition(schema, 'overseer_capability_events');
       expect(schema).toContain('CREATE TABLE IF NOT EXISTS overseer_capability_state');
       expect(schema).toContain('CREATE TABLE IF NOT EXISTS overseer_capability_events');
       expect(schema).toContain('trg_overseer_capability_events_no_update');
       expect(schema).toContain('trg_overseer_capability_events_no_delete');
-      for (const capability of OVERSEER_CAPABILITIES) expect(schema).toContain(`'${capability}'`);
+      for (const capability of OVERSEER_CAPABILITIES) {
+        expect(stateTable).toContain(`'${capability}'`);
+        expect(eventTable).toContain(`'${capability}'`);
+      }
       for (const eventType of [
         'gate_allowed',
         'gate_denied',
@@ -137,18 +249,24 @@ describe('overseer capability persistence (sqlite)', () => {
         'circuit_reset',
         'adapter_attempt',
       ]) {
-        expect(schema).toContain(`'${eventType}'`);
+        expect(eventTable).toContain(`'${eventType}'`);
       }
-      for (const column of [...requiredStateColumns, ...requiredEventColumns]) {
-        expect(schema).toContain(column);
-      }
-      expect(schema).toContain("circuit_state IN ('closed', 'open')");
-      expect(schema).toContain(
+      for (const column of requiredStateColumns) expect(stateTable).toContain(column);
+      for (const column of requiredEventColumns) expect(eventTable).toContain(column);
+      expect(stateTable).toMatch(/action_enabled (?:BOOLEAN|INTEGER) NOT NULL DEFAULT (?:FALSE|0)/);
+      expect(stateTable).toContain("circuit_state TEXT NOT NULL DEFAULT 'closed'");
+      expect(stateTable).toContain("circuit_state IN ('closed', 'open')");
+      expect(eventTable).toContain(
         'proposal_id TEXT REFERENCES overseer_m31_action_proposals(proposal_id)'
       );
-      expect(schema).toContain(
+      expect(eventTable).toContain(
         'execution_id TEXT REFERENCES overseer_m31_action_proposals(execution_id)'
       );
+      expect(eventTable).toMatch(/details_json (?:JSONB|TEXT) NOT NULL DEFAULT/);
+      for (const column of ['policy_digest', 'verifier_registry_digest']) {
+        expect(stateTable).toContain(`${column} TEXT NOT NULL`);
+        expect(eventTable).toContain(`${column} TEXT NOT NULL`);
+      }
     }
 
     expect(migration).toContain('action_enabled BOOLEAN NOT NULL DEFAULT FALSE');
@@ -181,6 +299,28 @@ describe('overseer capability persistence (sqlite)', () => {
       db.query('UPDATE overseer_capability_events SET reason = $1', ['tamper'])
     ).rejects.toThrow(/append-only/);
     await expect(db.query('DELETE FROM overseer_capability_events')).rejects.toThrow(/append-only/);
+  });
+
+  test('rejects generic transition events before writes while circuit open emits atomically', async () => {
+    for (const eventType of ['circuit_opened', 'circuit_reset']) {
+      await expect(
+        appendOverseerCapabilityEvent(eventInput({ event_type: eventType }))
+      ).rejects.toThrow(/transition.*event/i);
+      expect(await listOverseerCapabilityEvents('merge')).toHaveLength(0);
+    }
+
+    const opened = await openOverseerCapabilityCircuit({
+      capability: 'merge',
+      reason: 'atomic-transition',
+      actor: 'test-operator',
+      correlation_id: 'corr-transition',
+      policy_digest: POLICY_DIGEST,
+      verifier_registry_digest: VERIFIER_DIGEST,
+    });
+
+    expect(opened.event.event_type).toBe('circuit_opened');
+    expect(opened.state.circuit_state).toBe('open');
+    expect(await listOverseerCapabilityEvents('merge')).toHaveLength(1);
   });
 
   test('opens only the requested circuit and appends its circuit_opened event', async () => {
