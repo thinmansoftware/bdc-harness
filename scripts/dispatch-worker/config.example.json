@@ -1,19 +1,23 @@
 {
   "worker_id": "dispatch-worker-localhost",
   "host": "localhost",
-  "server_url": "http://localhost:3090",
+  "server_url": "http://127.0.0.1:3900",
   "operator_token_env": "ARCHON_OPERATOR_TOKEN",
+  "operator_token_file": "C:/Users/USERNAME/.config/bdc/archon-operator-token",
   "poll_interval_ms": 5000,
   "heartbeat_interval_ms": 30000,
   "lease_duration_ms": 300000,
   "capabilities": {
-    "providers": ["claude", "codex"],
+    "providers": ["claude", "codex", "grok", "cursor", "fusion"],
     "docker": false,
     "browser": false
   },
   "max_concurrency": {
     "claude": 1,
-    "codex": 1
+    "codex": 1,
+    "grok": 1,
+    "cursor": 1,
+    "fusion": 1
   },
   "board_delivery": {
     "enabled": false,
@@ -24,11 +28,32 @@
   "agents": {
     "claude": {
       "command": "claude",
-      "args": ["-p", "{{prompt}}"]
+      "args": ["--permission-mode", "plan", "-p", "{{prompt}}"]
     },
     "codex": {
       "command": "codex",
-      "args": ["exec", "--skip-git-repo-check", "{{prompt}}"]
+      "args": [
+        "exec",
+        "--skip-git-repo-check",
+        "--sandbox",
+        "read-only",
+        "--ephemeral",
+        "--ignore-user-config",
+        "{{prompt}}"
+      ]
+    },
+    "grok": {
+      "command": "grok",
+      "args": ["--permission-mode", "plan", "--no-subagents", "-p", "{{prompt}}"]
+    },
+    "cursor": {
+      "command": "cursor-agent",
+      "args": ["--print", "--mode", "ask", "--trust", "{{prompt}}"]
+    },
+    "fusion": {
+      "kind": "fusion",
+      "command": "bun",
+      "args": []
     }
   }
 }

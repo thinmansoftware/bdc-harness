@@ -7,7 +7,7 @@ import type { ConversationLockManager } from '@archon/core';
 import type { WebAdapter } from '../adapters/web';
 import { SqliteAdapter } from '@archon/core/db/adapters/sqlite';
 import { setBoardPrincipalResolverForTests } from '@archon/core/db/board-authority';
-import { registerWorker } from '@archon/core/db/dispatch';
+import { createMessage, registerWorker } from '@archon/core/db/dispatch';
 import { validationErrorHook } from './openapi-defaults';
 import { mockAllWorkflowModules } from '../test/workflow-mock-factories';
 
@@ -391,6 +391,116 @@ describe('dispatch API', () => {
     expect(claim.status).toBe(200);
     expect(((await claim.json()) as { resolved_recipient: string }).resolved_recipient).toBe(
       'claude'
+    );
+  });
+
+  test('dispatch status expires stale workers and surfaces queued operator reports', async () => {
+    const app = makeApp('secret-token');
+    await registerWorker({
+      worker_id: 'worker-stale',
+      host: 'host',
+      capabilities: { providers: ['claude', 'codex'] },
+      max_concurrency: 2,
+    });
+    await db.query(
+      `UPDATE agent_dispatch_workers
+       SET last_heartbeat_at = $2
+       WHERE worker_id = $1`,
+      ['worker-stale', new Date(Date.now() - 10 * 60_000).toISOString()]
+    );
+    await createMessage({
+      correlation_id: 'report-correlation',
+      idempotency_key: 'report-idempotency',
+      task_type: 'run_report',
+      sender: 'claude',
+      recipient: 'xo',
+      body: 'Overnight report is ready for John.',
+    });
+
+    const response = await app.request('/api/dispatch/status?worker_stale_after_ms=1000', {
+      headers: { 'x-archon-operator-token': 'secret-token' },
+    });
+
+    expect(response.status).toBe(200);
+    const status = (await response.json()) as {
+      queue: Record<string, number>;
+      workers: { worker_id: string; status: string }[];
+      operator_reports: { recipient: string; body_preview: string }[];
+    };
+    expect(status.queue.queued).toBe(1);
+    expect(status.workers[0]?.status).toBe('unavailable');
+    expect(status.operator_reports).toEqual([
+      expect.objectContaining({
+        recipient: 'xo',
+        body_preview: 'Overnight report is ready for John.',
+      }),
+    ]);
+  });
+
+  test('accepts only approved structured non-production execution handoffs', async () => {
+    const app = makeApp('secret-token');
+    const valid = {
+      correlation_id: 'handoff-correlation',
+      idempotency_key: 'handoff-idempotency',
+      target: 'cauldron',
+      work_order_id: 'WO-HARNESS-DISPATCH-RESTORE-01',
+      environment: 'staging',
+      target_repo: 'bluedevilcollectibles/bdc-harness',
+      target_ref: 'c8ee059de5a5aecf550e5298db8a24aba46809cd',
+      approved: true,
+      approved_by: 'john-ranson',
+      approval_ref: 'M-48',
+      objective: 'Run the approved staging-only verification workflow.',
+      constraints: ['no production deploy', 'no customer sends'],
+    };
+    const accepted = await app.request('/api/dispatch/execution-handoffs', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-archon-operator-token': 'secret-token',
+      },
+      body: JSON.stringify(valid),
+    });
+    expect(accepted.status).toBe(200);
+    const message = (await accepted.json()) as {
+      task_type: string;
+      recipient: string;
+      body: string;
+    };
+    expect(message.task_type).toBe('run_report');
+    expect(message.recipient).toBe('cauldron');
+    expect(JSON.parse(message.body)).toEqual(
+      expect.objectContaining({
+        kind: 'approved_execution_handoff',
+        approved: true,
+        environment: 'staging',
+      })
+    );
+
+    const rejected = await app.request('/api/dispatch/execution-handoffs', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-archon-operator-token': 'secret-token',
+      },
+      body: JSON.stringify({ ...valid, environment: 'production' }),
+    });
+    expect(rejected.status).toBe(400);
+  });
+
+  test('rejects repo mutation hidden in a free-form run_report', async () => {
+    const response = await makeApp().request('/api/dispatch/messages', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        ...VALID_BODY,
+        task_type: 'run_report',
+        body: 'Commit the patch and push the branch.',
+      }),
+    });
+    expect(response.status).toBe(400);
+    expect(((await response.json()) as { error: string }).error).toBe(
+      'repo_mutating_dispatch_body_rejected'
     );
   });
 });

@@ -1,8 +1,15 @@
 import { mkdir, mkdtemp, writeFile } from 'fs/promises';
-import { tmpdir, hostname } from 'os';
-import { join } from 'path';
+import { tmpdir, hostname, homedir } from 'os';
+import { join, resolve } from 'path';
 import { spawn } from 'bun';
 import { isBoardAliasMessage, renderBoardMotionPrompt } from './board-motion';
+import {
+  buildAgentInvocation,
+  defaultAgentConfigs,
+  parseFusionReviewBody,
+  type AgentConfig,
+} from './adapters';
+import { resolveOperatorToken } from './credentials';
 
 type DispatchTaskType =
   | 'agent_message'
@@ -24,11 +31,6 @@ interface DispatchMessage {
   resolved_recipient?: string | null;
 }
 
-interface AgentConfig {
-  command: string;
-  args: string[];
-}
-
 interface BoardDeliveryConfig {
   enabled: boolean;
   credential_id: string;
@@ -41,6 +43,7 @@ interface WorkerConfig {
   host?: string;
   server_url: string;
   operator_token_env?: string;
+  operator_token_file?: string;
   poll_interval_ms?: number;
   heartbeat_interval_ms?: number;
   lease_duration_ms?: number;
@@ -52,10 +55,14 @@ interface WorkerConfig {
     token_env?: string;
     allowed_principals?: string[];
   };
-  agents: Record<string, AgentConfig>;
+  agents?: Record<string, AgentConfig>;
 }
 
-type NormalizedWorkerConfig = Required<Omit<WorkerConfig, 'board_delivery'>> & {
+type NormalizedWorkerConfig = Required<
+  Omit<WorkerConfig, 'board_delivery' | 'operator_token_file' | 'agents'>
+> & {
+  operator_token_file: string;
+  agents: Record<string, AgentConfig>;
   board_delivery: BoardDeliveryConfig;
 };
 
@@ -76,19 +83,19 @@ async function readConfig(path: string): Promise<NormalizedWorkerConfig> {
   const raw = await Bun.file(path).text();
   const parsed = JSON.parse(raw) as WorkerConfig;
   if (!parsed.server_url) throw new Error('config.server_url is required');
-  if (!parsed.agents || Object.keys(parsed.agents).length === 0) {
-    throw new Error('config.agents must include at least one local agent');
-  }
+  const agents = { ...defaultAgentConfigs, ...(parsed.agents ?? {}) };
 
   return {
     worker_id: parsed.worker_id ?? `dispatch-worker-${hostname()}`,
     host: parsed.host ?? hostname(),
     server_url: parsed.server_url.replace(/\/+$/, ''),
     operator_token_env: parsed.operator_token_env ?? 'ARCHON_OPERATOR_TOKEN',
+    operator_token_file:
+      parsed.operator_token_file ?? join(homedir(), '.config', 'bdc', 'archon-operator-token'),
     poll_interval_ms: parsed.poll_interval_ms ?? 5_000,
     heartbeat_interval_ms: parsed.heartbeat_interval_ms ?? 30_000,
     lease_duration_ms: parsed.lease_duration_ms ?? 300_000,
-    capabilities: parsed.capabilities ?? { providers: Object.keys(parsed.agents) },
+    capabilities: parsed.capabilities ?? { providers: Object.keys(agents) },
     max_concurrency: parsed.max_concurrency ?? {},
     board_delivery: {
       enabled: parsed.board_delivery?.enabled ?? false,
@@ -96,7 +103,7 @@ async function readConfig(path: string): Promise<NormalizedWorkerConfig> {
       token_env: parsed.board_delivery?.token_env ?? 'DISPATCH_WORKER_TOKEN',
       allowed_principals: parsed.board_delivery?.allowed_principals ?? [],
     },
-    agents: parsed.agents,
+    agents,
   };
 }
 
@@ -161,10 +168,6 @@ function promptFor(message: DispatchMessage): string {
   }
 }
 
-function buildArgs(template: string[], prompt: string): string[] {
-  return template.map(arg => (arg === '{{prompt}}' ? prompt : arg));
-}
-
 async function writeTranscript(data: {
   message: DispatchMessage;
   command: string;
@@ -189,10 +192,33 @@ async function runAgent(
   status: 'done' | 'failed';
 }> {
   const cwd = await mkdtemp(join(tmpdir(), `bdc-dispatch-${message.recipient}-`));
-  const prompt = promptFor(message);
-  const args = buildArgs(config.args, prompt);
+  let command = config.command;
+  let args: string[];
+  if (config.kind === 'fusion') {
+    if (message.task_type !== 'run_review') throw new Error('fusion_review_task_type_required');
+    const review = parseFusionReviewBody(message.body);
+    const fusionCli = resolve(import.meta.dir, '..', '..', 'packages', 'fusion', 'src', 'cli.ts');
+    args = [
+      'run',
+      fusionCli,
+      'review',
+      '--wo',
+      review.wo,
+      '--diff',
+      review.diff,
+      '--tests',
+      review.tests,
+      '--manifest',
+      review.manifest,
+      ...(review.ci ? ['--ci'] : []),
+    ];
+  } else {
+    const invocation = buildAgentInvocation(config, promptFor(message));
+    command = invocation.command;
+    args = invocation.args;
+  }
   const proc = spawn({
-    cmd: [config.command, ...args],
+    cmd: [command, ...args],
     cwd,
     stdout: 'pipe',
     stderr: 'pipe',
@@ -205,7 +231,7 @@ async function runAgent(
   ]);
   const transcript = await writeTranscript({
     message,
-    command: config.command,
+    command,
     args,
     cwd,
     stdout,
@@ -311,8 +337,10 @@ function boardDeliveryHeaders(
 
 async function main(): Promise<void> {
   const config = await readConfig(parseArgs());
-  const token = process.env[config.operator_token_env];
-  if (!token) throw new Error(`${config.operator_token_env} must be set`);
+  const token = await resolveOperatorToken({
+    envName: config.operator_token_env,
+    tokenFile: config.operator_token_file,
+  });
   const state: WorkerState = { stopping: false, activeByAgent: new Map() };
 
   const stop = (): void => {

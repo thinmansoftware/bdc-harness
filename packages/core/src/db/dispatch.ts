@@ -62,7 +62,7 @@ interface DispatchWorkerRow extends Omit<DispatchWorker, 'capabilities'> {
   capabilities: unknown;
 }
 
-const DEFAULT_WORKER_STALE_AFTER_MS = 120_000;
+export const DEFAULT_WORKER_STALE_AFTER_MS = 120_000;
 const DEFAULT_LEASE_DURATION_MS = 300_000;
 
 function nowIso(): string {
@@ -349,6 +349,16 @@ export async function evaluateWorkerStaleness(
     [staleCutoffIso(staleAfterMs)]
   );
   return result.rowCount;
+}
+
+export async function listWorkers(
+  staleAfterMs = DEFAULT_WORKER_STALE_AFTER_MS
+): Promise<DispatchWorker[]> {
+  await evaluateWorkerStaleness(staleAfterMs);
+  const result = await getDatabase().query<DispatchWorkerRow>(
+    'SELECT * FROM agent_dispatch_workers ORDER BY worker_id ASC'
+  );
+  return result.rows.map(normalizeWorker);
 }
 
 export async function claimMessage(data: {
