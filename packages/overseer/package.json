@@ -15,7 +15,9 @@
     "./judge-second-opinion": "./src/judge-second-opinion.ts",
     "./service": "./src/service.ts",
     "./actions/merge-ready": "./src/actions/merge-ready.ts",
-    "./m31-substrate": "./src/m31-substrate.ts"
+    "./m31-substrate": "./src/m31-substrate.ts",
+    "./action-policy": "./src/action-policy.ts",
+    "./adapters/fake-github": "./src/adapters/fake-github.ts"
   },
   "scripts": {
     "test": "bun test src/overseer.test.ts && bun test tests/ && bun test src/__tests__/",
