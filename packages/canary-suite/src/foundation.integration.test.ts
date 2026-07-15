@@ -44,7 +44,7 @@ test('proves the read-only Levels 0 and 1 foundation end to end', async () => {
     expect(result.plan.conductorRoutes).toHaveLength(4);
     expect(result.report.verdict).toBe('static_only');
     expect(requests).toEqual([{ method: 'GET', path: '/api/admin/canary/snapshot' }]);
-    const files = await readdir(join(root, result.report.suiteRunId));
+    const files = (await readdir(join(root, result.report.suiteRunId))).sort();
     expect(files).toEqual(['plan.json', 'summary.json', 'summary.md']);
     const combined = (
       await Promise.all(result.artifactPaths.map(async path => readFile(path, 'utf8')))

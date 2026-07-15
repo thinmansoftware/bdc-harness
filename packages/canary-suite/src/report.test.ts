@@ -59,7 +59,7 @@ test('allows concurrent identical writers without deleting another writer tempor
       writeCanaryArtifacts(root, plan, report),
     ]);
     expect(first).toEqual(second);
-    expect(await readdir(join(root, 'suite-fixture-001'))).toEqual([
+    expect((await readdir(join(root, 'suite-fixture-001'))).sort()).toEqual([
       'plan.json',
       'summary.json',
       'summary.md',
