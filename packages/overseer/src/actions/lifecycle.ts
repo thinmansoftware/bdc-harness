@@ -505,6 +505,7 @@ export type LifecycleOutcomeResult =
 export type LifecycleStage =
   | 'assessment'
   | 'worktree'
+  | 'binding'
   | 'salvage'
   | 'reopen_recipe'
   | 'policy'
@@ -589,6 +590,51 @@ function denied(
   return { status: 'denied', stage, reason, adapter_invoked: false, operator_card: card };
 }
 
+// ---------------------------------------------------------------------------
+// Cross-object binding. Every artifact that authorizes a mutation (mutation
+// request, injected policy request, reopen recipe, salvage receipt) MUST
+// describe the SAME repository / action / target the caller is executing.
+// Without this a valid "allowed" decision, recipe, or salvage for target A
+// could be replayed to authorize a different mutation on target B. The
+// mutation request is the canonical target: the fake adapter later enforces it
+// against the permit issued from input.proposal_id, so binding to it anchors
+// the whole chain back to the permit.
+// ---------------------------------------------------------------------------
+
+function bindMutationRequest(input: LifecycleExecutionInput): string | null {
+  const m = input.mutation_request;
+  if (m.repository !== input.repository) return 'mutation_repository_unbound';
+  if (m.action_kind !== input.action_kind) return 'mutation_action_kind_unbound';
+  if (m.proposal_id !== input.proposal_id) return 'mutation_proposal_unbound';
+  return null;
+}
+
+function bindPolicyRequest(input: LifecycleExecutionInput): string | null {
+  const p = input.policy_request;
+  const m = input.mutation_request;
+  if (p.capability !== 'lifecycle') return 'policy_capability_unbound';
+  if (p.repository !== input.repository) return 'policy_repository_unbound';
+  if (p.action_kind !== input.action_kind) return 'policy_action_kind_unbound';
+  if (p.target_kind !== m.target_kind) return 'policy_target_kind_unbound';
+  if (p.target_key !== m.target_key) return 'policy_target_key_unbound';
+  if (p.target_digest !== m.target_digest) return 'policy_target_digest_unbound';
+  if (p.proposal_id !== input.proposal_id) return 'policy_proposal_unbound';
+  if (p.execution_id !== m.execution_id) return 'policy_execution_unbound';
+  return null;
+}
+
+function bindReopenRecipe(
+  recipe: OverseerReopenRecipeV1,
+  input: LifecycleExecutionInput
+): string | null {
+  const m = input.mutation_request;
+  if (recipe.repository !== input.repository) return 'reopen_recipe_repository_unbound';
+  if (recipe.target_kind !== m.target_kind) return 'reopen_recipe_target_kind_unbound';
+  if (recipe.target_key !== m.target_key) return 'reopen_recipe_target_key_unbound';
+  if (recipe.target_digest !== m.target_digest) return 'reopen_recipe_target_digest_unbound';
+  return null;
+}
+
 function validateInjectedPolicyDecision(
   request: InjectedActionPolicyRequestV1,
   decision: InjectedActionPolicyDecisionV1,
@@ -633,19 +679,35 @@ export async function executeLifecycleAction(
   const worktree = await deps.verifyWorktree(input.worktree);
   if (!worktree.owned) return denied('worktree', worktree.reason, card);
 
+  // Bind every authorizing artifact to the same repository / action / target
+  // before any gate can accept it.
+  const mutationBinding = bindMutationRequest(input);
+  if (mutationBinding !== null) return denied('binding', mutationBinding, card);
+  const policyBinding = bindPolicyRequest(input);
+  if (policyBinding !== null) return denied('binding', policyBinding, card);
+
   if (input.action_kind === 'CLOSE') {
     if (input.salvage_receipt === null) return denied('salvage', 'salvage_receipt_missing', card);
+    if (input.salvage_receipt.repository !== input.repository) {
+      return denied('salvage', 'salvage_repository_unbound', card);
+    }
     const salvage = await verifySalvageArtifact(input.salvage_receipt, deps.salvage);
     if (!salvage.verified) return denied('salvage', salvage.reason, card);
-    if (!isValidReopenRecipe(input.reopen_recipe)) {
+    const recipe = input.reopen_recipe;
+    if (!isValidReopenRecipe(recipe)) {
       return denied('reopen_recipe', 'reopen_recipe_invalid', card);
     }
+    const recipeBinding = bindReopenRecipe(recipe, input);
+    if (recipeBinding !== null) return denied('reopen_recipe', recipeBinding, card);
   }
 
   if (input.action_kind === 'REOPEN') {
-    if (!isValidReopenRecipe(input.reopen_recipe)) {
+    const recipe = input.reopen_recipe;
+    if (!isValidReopenRecipe(recipe)) {
       return denied('reopen_recipe', 'reopen_recipe_invalid', card);
     }
+    const recipeBinding = bindReopenRecipe(recipe, input);
+    if (recipeBinding !== null) return denied('reopen_recipe', recipeBinding, card);
   }
 
   const decision = await deps.policy.evaluateActionPolicy(input.policy_request);

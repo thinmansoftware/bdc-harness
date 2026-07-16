@@ -630,4 +630,164 @@ describe('overseer lifecycle actions', () => {
       expect(spy.calls()).toBe(0);
     }
   });
+
+  test('Cross-object binding: policy decision for a different target cannot authorize', async () => {
+    const OTHER_KEY = 'issue:org/repo#99';
+    const OTHER_DIGEST = H('issue-99');
+
+    // A policy request that names a different target than the mutation is
+    // rejected at the binding gate even when the injected decision is allowed.
+    const spyTarget = countingAdapter(acceptingAdapter());
+    const wrongTarget = await executeLifecycleAction(
+      makeInput('CLOSE', {
+        policy_request: { ...policyRequestFor('CLOSE'), target_key: OTHER_KEY },
+      }),
+      makeDeps('CLOSE', { adapter: spyTarget.adapter })
+    );
+    expect(wrongTarget.status).toBe('denied');
+    if (wrongTarget.status === 'denied') {
+      expect(wrongTarget.stage).toBe('binding');
+      expect(wrongTarget.reason).toBe('policy_target_key_unbound');
+    }
+    expect(spyTarget.calls()).toBe(0);
+
+    // A policy request whose digest names a different target is also rejected.
+    const spyDigest = countingAdapter(acceptingAdapter());
+    const wrongDigest = await executeLifecycleAction(
+      makeInput('CLOSE', {
+        policy_request: { ...policyRequestFor('CLOSE'), target_digest: OTHER_DIGEST },
+      }),
+      makeDeps('CLOSE', { adapter: spyDigest.adapter })
+    );
+    expect(wrongDigest.status).toBe('denied');
+    if (wrongDigest.status === 'denied')
+      expect(wrongDigest.reason).toBe('policy_target_digest_unbound');
+    expect(spyDigest.calls()).toBe(0);
+
+    // A policy request for a different repository is rejected.
+    const spyRepo = countingAdapter(acceptingAdapter());
+    const wrongRepo = await executeLifecycleAction(
+      makeInput('CLOSE', {
+        policy_request: { ...policyRequestFor('CLOSE'), repository: 'org/other' },
+      }),
+      makeDeps('CLOSE', { adapter: spyRepo.adapter })
+    );
+    expect(wrongRepo.status).toBe('denied');
+    if (wrongRepo.status === 'denied') expect(wrongRepo.reason).toBe('policy_repository_unbound');
+    expect(spyRepo.calls()).toBe(0);
+
+    // A policy request for a different action kind is rejected.
+    const spyAction = countingAdapter(acceptingAdapter());
+    const wrongAction = await executeLifecycleAction(
+      makeInput('CLOSE', {
+        policy_request: { ...policyRequestFor('CLOSE'), action_kind: 'COMMENT' },
+      }),
+      makeDeps('CLOSE', { adapter: spyAction.adapter })
+    );
+    expect(wrongAction.status).toBe('denied');
+    if (wrongAction.status === 'denied')
+      expect(wrongAction.reason).toBe('policy_action_kind_unbound');
+    expect(spyAction.calls()).toBe(0);
+
+    // A branch-capability policy request cannot authorize a lifecycle mutation.
+    const spyCap = countingAdapter(acceptingAdapter());
+    const wrongCap = await executeLifecycleAction(
+      makeInput('CLOSE', {
+        policy_request: { ...policyRequestFor('CLOSE'), capability: 'branch' },
+      }),
+      makeDeps('CLOSE', { adapter: spyCap.adapter })
+    );
+    expect(wrongCap.status).toBe('denied');
+    if (wrongCap.status === 'denied') expect(wrongCap.reason).toBe('policy_capability_unbound');
+    expect(spyCap.calls()).toBe(0);
+  });
+
+  test('Cross-object binding: reopen recipe must match the mutation target', async () => {
+    const OTHER_KEY = 'issue:org/repo#99';
+    const otherRecipe = buildReopenRecipe({
+      repository: REPO,
+      target: {
+        target_kind: 'issue',
+        repository: REPO,
+        target_key: OTHER_KEY,
+        target_digest: H('issue-99'),
+      },
+      prior_close_proposal_id: 'close-proposal-1',
+      required_observation_digest: H('observation'),
+    });
+
+    // CLOSE with a valid recipe describing a different target is denied.
+    const spyClose = countingAdapter(acceptingAdapter());
+    const closeResult = await executeLifecycleAction(
+      makeInput('CLOSE', { reopen_recipe: otherRecipe }),
+      makeDeps('CLOSE', { adapter: spyClose.adapter })
+    );
+    expect(closeResult.status).toBe('denied');
+    if (closeResult.status === 'denied') {
+      expect(closeResult.stage).toBe('reopen_recipe');
+      expect(closeResult.reason).toBe('reopen_recipe_target_key_unbound');
+    }
+    expect(spyClose.calls()).toBe(0);
+
+    // REOPEN with a recipe for a different repository is denied.
+    const otherRepoRecipe = buildReopenRecipe({
+      repository: 'org/other',
+      target: {
+        target_kind: 'issue',
+        repository: 'org/other',
+        target_key: TARGET_KEY,
+        target_digest: TARGET_DIGEST,
+      },
+      prior_close_proposal_id: 'close-proposal-1',
+      required_observation_digest: H('observation'),
+    });
+    const spyReopen = countingAdapter(acceptingAdapter());
+    const reopenResult = await executeLifecycleAction(
+      makeInput('REOPEN', { reopen_recipe: otherRepoRecipe }),
+      makeDeps('REOPEN', { adapter: spyReopen.adapter })
+    );
+    expect(reopenResult.status).toBe('denied');
+    if (reopenResult.status === 'denied') {
+      expect(reopenResult.stage).toBe('reopen_recipe');
+      expect(reopenResult.reason).toBe('reopen_recipe_repository_unbound');
+    }
+    expect(spyReopen.calls()).toBe(0);
+  });
+
+  test('Cross-object binding: salvage receipt for a different repository cannot permit a close', async () => {
+    const foreignSalvage: OverseerSalvageReceiptV1 = {
+      ...salvageGitObject,
+      repository: 'org/other',
+    };
+    const spy = countingAdapter(acceptingAdapter());
+    const result = await executeLifecycleAction(
+      makeInput('CLOSE', { salvage_receipt: foreignSalvage }),
+      makeDeps('CLOSE', { adapter: spy.adapter })
+    );
+    expect(result.status).toBe('denied');
+    if (result.status === 'denied') {
+      expect(result.stage).toBe('salvage');
+      expect(result.reason).toBe('salvage_repository_unbound');
+    }
+    expect(spy.calls()).toBe(0);
+  });
+
+  test('Cross-object binding: mutation request must agree with the requested action', async () => {
+    // The gates run against input.action_kind; a mutation request that names a
+    // different action would launder a heavier mutation through lighter gates.
+    const spy = countingAdapter(acceptingAdapter());
+    const result = await executeLifecycleAction(
+      makeInput('COMMENT', {
+        policy_request: policyRequestFor('COMMENT'),
+        mutation_request: { ...mutationRequestFor('COMMENT'), action_kind: 'CLOSE' },
+      }),
+      makeDeps('COMMENT', { adapter: spy.adapter })
+    );
+    expect(result.status).toBe('denied');
+    if (result.status === 'denied') {
+      expect(result.stage).toBe('binding');
+      expect(result.reason).toBe('mutation_action_kind_unbound');
+    }
+    expect(spy.calls()).toBe(0);
+  });
 });
