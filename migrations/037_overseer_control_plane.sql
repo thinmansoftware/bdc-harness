@@ -126,6 +126,93 @@ BEGIN
 END;
 $$;
 
+CREATE OR REPLACE FUNCTION overseer_control_validate_mutable_update() RETURNS trigger
+LANGUAGE plpgsql AS $$
+DECLARE allowed BOOLEAN := FALSE;
+BEGIN
+  IF TG_TABLE_NAME = 'overseer_parent_commitments' THEN
+    allowed := (
+      to_jsonb(NEW) - ARRAY['heartbeat_at','lease_expires_at'] =
+        to_jsonb(OLD) - ARRAY['heartbeat_at','lease_expires_at']
+      AND OLD.state IN ('BUILDING','REVIEW','STAGING','RECOVERY','ACTION_PENDING')
+      AND NEW.heartbeat_at >= OLD.heartbeat_at
+      AND NEW.lease_expires_at = NEW.heartbeat_at + INTERVAL '300 seconds'
+    ) OR (
+      to_jsonb(NEW) - 'state' = to_jsonb(OLD) - 'state'
+      AND OLD.state IN ('BUILDING','REVIEW','STAGING','RECOVERY','ACTION_PENDING')
+      AND NEW.state IN ('BUILDING','REVIEW','STAGING','RECOVERY','ACTION_PENDING')
+    ) OR (
+      to_jsonb(NEW) - ARRAY['state','fencing_token','released_at','terminal_reason'] =
+        to_jsonb(OLD) - ARRAY['state','fencing_token','released_at','terminal_reason']
+      AND OLD.state IN ('BUILDING','REVIEW','STAGING','RECOVERY','ACTION_PENDING')
+      AND NEW.state IN ('COMPLETED','FAILED','CANCELLED')
+      AND NEW.fencing_token = OLD.fencing_token + 1
+      AND NEW.released_at IS NOT NULL
+      AND NEW.terminal_reason IS NOT NULL
+    );
+  ELSIF TG_TABLE_NAME = 'overseer_parent_children' THEN
+    allowed := (
+      to_jsonb(NEW) - 'state' = to_jsonb(OLD) - 'state'
+      AND OLD.state = 'PENDING' AND NEW.state = 'RUNNING'
+    ) OR (
+      to_jsonb(NEW) - ARRAY['state','terminal_at'] =
+        to_jsonb(OLD) - ARRAY['state','terminal_at']
+      AND OLD.state IN ('PENDING','RUNNING')
+      AND NEW.state IN ('COMPLETED','FAILED','CANCELLED')
+      AND OLD.terminal_at IS NULL AND NEW.terminal_at IS NOT NULL
+    );
+  ELSIF TG_TABLE_NAME = 'overseer_repository_mutation_leases' THEN
+    allowed := (
+      to_jsonb(NEW) - ARRAY['heartbeat_at','expires_at'] =
+        to_jsonb(OLD) - ARRAY['heartbeat_at','expires_at']
+      AND OLD.state = 'ACTIVE'
+      AND NEW.heartbeat_at >= OLD.heartbeat_at
+      AND NEW.expires_at = NEW.heartbeat_at + INTERVAL '300 seconds'
+    ) OR (
+      to_jsonb(NEW) - ARRAY['state','released_at'] =
+        to_jsonb(OLD) - ARRAY['state','released_at']
+      AND OLD.state = 'ACTIVE' AND NEW.state = 'RELEASED'
+      AND OLD.released_at IS NULL AND NEW.released_at IS NOT NULL
+    ) OR (
+      NEW.repository = OLD.repository
+      AND NEW.fencing_token = OLD.fencing_token + 1
+      AND NEW.state = 'ACTIVE'
+      AND NEW.acquired_at = NEW.heartbeat_at
+      AND NEW.expires_at = NEW.heartbeat_at + INTERVAL '300 seconds'
+      AND NEW.released_at IS NULL
+      AND (OLD.state <> 'ACTIVE' OR clock_timestamp() >= OLD.expires_at)
+    );
+  ELSIF TG_TABLE_NAME = 'overseer_fusion_budget_reservations' THEN
+    allowed := (
+      to_jsonb(NEW) - ARRAY['status','call_started_at'] =
+        to_jsonb(OLD) - ARRAY['status','call_started_at']
+      AND OLD.status = 'RESERVED' AND NEW.status = 'IN_FLIGHT'
+      AND OLD.call_started_at IS NULL AND NEW.call_started_at IS NOT NULL
+    ) OR (
+      to_jsonb(NEW) - ARRAY['status','actual_microusd','reconciled_at'] =
+        to_jsonb(OLD) - ARRAY['status','actual_microusd','reconciled_at']
+      AND OLD.status = 'IN_FLIGHT' AND NEW.status = 'RECONCILED'
+      AND NEW.actual_microusd IS NOT NULL AND NEW.reconciled_at IS NOT NULL
+    ) OR (
+      to_jsonb(NEW) - ARRAY['status','released_at','release_reason'] =
+        to_jsonb(OLD) - ARRAY['status','released_at','release_reason']
+      AND OLD.status = 'RESERVED' AND NEW.status = 'RELEASED'
+      AND NEW.released_at IS NOT NULL
+      AND NEW.release_reason IN (
+        'call_cancelled_before_start',
+        'authorization_revoked_before_start',
+        'provider_unavailable_before_start'
+      )
+    );
+  END IF;
+
+  IF NOT allowed THEN
+    RAISE EXCEPTION '% rejects non-CAS update', TG_TABLE_NAME;
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
 CREATE OR REPLACE FUNCTION overseer_control_validate_event_chain() RETURNS trigger
 LANGUAGE plpgsql AS $$
 BEGIN
@@ -169,6 +256,19 @@ BEGIN
     EXECUTE format('DROP TRIGGER IF EXISTS %I_reject_delete ON %I', table_name, table_name);
     EXECUTE format(
       'CREATE TRIGGER %I_reject_delete BEFORE DELETE ON %I FOR EACH ROW EXECUTE FUNCTION overseer_control_reject_delete()',
+      table_name,
+      table_name
+    );
+  END LOOP;
+  FOREACH table_name IN ARRAY ARRAY[
+    'overseer_parent_commitments',
+    'overseer_parent_children',
+    'overseer_repository_mutation_leases',
+    'overseer_fusion_budget_reservations'
+  ] LOOP
+    EXECUTE format('DROP TRIGGER IF EXISTS %I_validate_update ON %I', table_name, table_name);
+    EXECUTE format(
+      'CREATE TRIGGER %I_validate_update BEFORE UPDATE ON %I FOR EACH ROW EXECUTE FUNCTION overseer_control_validate_mutable_update()',
       table_name,
       table_name
     );

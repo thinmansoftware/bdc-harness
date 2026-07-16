@@ -34,6 +34,11 @@ PostgreSQL 17 uses `TIMESTAMPTZ`, `JSONB`, `BIGINT`, and `BOOLEAN`. SQLite uses
 RFC3339 UTC text, JSON text validated with `json_valid`, `INTEGER`, and boolean
 integers restricted to 0 or 1.
 
+State, lease, and budget rows reject delete. Their update triggers freeze
+identity and immutable fields and permit only the exact named transition shapes
+below; store updates also compare the previously read identity, state, and
+fence in the `WHERE` clause. All other direct updates are rejected.
+
 ### `overseer_parent_commitments`
 
 - `parent_id` TEXT primary key.
@@ -123,6 +128,9 @@ integers restricted to 0 or 1.
 ## Function contract
 
 Every mutation returns `{ ok: true, value }` or `{ ok: false, code }`.
+`admitOverseerParent`, `linkOverseerChild`, `registerVerifierRegistry`, and
+`reserveFusionBudget` additionally return `created: true` for the first insert
+and `created: false` for an exact idempotent replay.
 Contract denials do not throw. Unexpected database failures throw and roll back.
 
 ### Parent commitment functions
