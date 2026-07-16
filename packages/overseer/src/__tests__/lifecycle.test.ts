@@ -5,6 +5,11 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, mock, test } from 'bun:test';
 import {
+  canonicalJsonV2,
+  type M31ActionPermitV2,
+  type M31ExecutionReceiptEventV2,
+} from '@archon/core/db/m31-target-v2';
+import {
   createLifecycleMutationAdapter,
   reconcileLifecycleResult,
   type LifecycleMutationAdapterV1,
@@ -63,6 +68,7 @@ function initRepoWithCommit(): { repo: string; commit: string } {
   git(repo, ['config', 'user.email', 'fixture@example.com']);
   git(repo, ['config', 'user.name', 'Fixture']);
   git(repo, ['config', 'commit.gpgsign', 'false']);
+  git(repo, ['config', 'core.autocrlf', 'false']);
   writeFileSync(join(repo, 'file.txt'), 'salvage\n');
   git(repo, ['add', '-A']);
   git(repo, ['commit', '-m', 'salvage']);
@@ -206,34 +212,84 @@ function candidate(
     protected_boundaries: [],
     customer_contact: false,
     governance_filing: false,
+    resulting_deployment_effect: 'none',
+    credential_principal: 'overseer-fixture',
     ...overrides,
   };
 }
 
 function eligiblePolicy(): InjectedActionPolicyDepsV1 {
   return {
-    evaluateActionPolicy(input) {
+    async evaluateActionPolicy(input) {
       return {
-        eligible: true,
-        effect_allowed: true,
-        action_parameters_digest: input.action_parameters_digest,
+        schema_version: 'overseer-injected-action-policy-decision-v1',
+        request_digest: sha256hex(canonicalJsonV2(input)),
+        policy_digest: POLICY_DIGEST,
+        allowed: true,
+        denial_reason: null,
       };
     },
   };
 }
 
-interface ReceiptStub {
-  receipt_event_id: string;
-  event_type: string;
-  event_sequence: number;
+function permit(
+  actionKind: LifecycleActionKindV1,
+  proposalId = `proposal-${actionKind.toLowerCase()}`
+): M31ActionPermitV2 {
+  return {
+    permit_id: `permit-${proposalId}`,
+    proposal_id: proposalId,
+    execution_id: `exec-${proposalId}`,
+    repository: 'bluedevilcollectibles/bdc-harness',
+    target: targetBinding().target,
+    target_key: 'pr:101',
+    target_digest: DIGEST_A,
+    snapshot_id: 'snapshot-1',
+    action_kind: actionKind,
+    capability: `overseer.m31.${actionKind.toLowerCase()}`,
+    issued_at: '2026-07-16T00:00:00.000Z',
+    valid_until: '2026-07-16T00:10:00.000Z',
+  };
 }
 
-function receipt(eventType: string, sequence: number): ReceiptStub {
-  return {
-    receipt_event_id: `receipt-${eventType}-${sequence}`,
-    event_type: eventType,
+function receipt(
+  eventType: M31ExecutionReceiptEventV2['event_type'],
+  sequence: number,
+  boundPermit: M31ActionPermitV2,
+  previousEventDigest: string | null,
+  overrides: Partial<M31ExecutionReceiptEventV2> = {}
+): M31ExecutionReceiptEventV2 {
+  const event = {
+    receipt_event_id:
+      eventType === 'permit_issued' ? boundPermit.permit_id : `receipt-${eventType}-${sequence}`,
+    proposal_id: boundPermit.proposal_id,
+    execution_id: boundPermit.execution_id,
     event_sequence: sequence,
+    event_type: eventType,
+    target_kind: boundPermit.target.target_kind,
+    target_key: boundPermit.target_key,
+    target_digest: boundPermit.target_digest,
+    live_observation: null,
+    live_observation_digest: null,
+    revalidated_at: null,
+    valid_until: null,
+    adapter_name: eventType === 'effect_reserved' ? 'fake-lifecycle' : null,
+    provider_operation: eventType === 'effect_reserved' ? boundPermit.action_kind : null,
+    external_effect_reference: null,
+    reason: eventType,
+    evidence:
+      eventType === 'effect_reserved'
+        ? {
+            target_key: boundPermit.target_key,
+            target_digest: boundPermit.target_digest,
+            action_parameters_digest: PARAMS_DIGEST,
+          }
+        : null,
+    previous_event_digest: previousEventDigest,
+    created_at: '2026-07-16T00:00:00.000Z',
+    ...overrides,
   };
+  return { ...event, event_digest: sha256hex(canonicalJsonV2(event)) };
 }
 
 function makeGate(
@@ -243,29 +299,18 @@ function makeGate(
     authDenied?: string;
     reserveFailure?: string;
     recordFailure?: string;
+    permitAction?: LifecycleActionKindV1;
   } = {}
 ): LifecycleGateDepsV1 {
   return {
     async preparePermit({ proposal_id }) {
       order.push('prepare');
       if (opts.prepareDenied) return { ok: false, denied: opts.prepareDenied };
+      const boundPermit = permit(opts.permitAction ?? 'CLOSE', proposal_id);
       return {
         ok: true,
-        permit: {
-          permit_id: `permit-${proposal_id}`,
-          proposal_id,
-          execution_id: `exec-${proposal_id}`,
-          repository: 'bluedevilcollectibles/bdc-harness',
-          target: targetBinding().target,
-          target_key: 'pr:101',
-          target_digest: DIGEST_A,
-          snapshot_id: 'snapshot-1',
-          action_kind: 'CLOSE',
-          capability: 'overseer.m31.lifecycle',
-          issued_at: '2026-07-16T00:00:00.000Z',
-          valid_until: '2026-07-16T00:10:00.000Z',
-        } as never,
-        receipt: receipt('permit_issued', 1) as never,
+        permit: boundPermit,
+        receipt: receipt('permit_issued', 1, boundPermit, null),
       };
     },
     async authorizeLifecycleAction() {
@@ -273,15 +318,34 @@ function makeGate(
       if (opts.authDenied) return { allowed: false, reason: opts.authDenied };
       return { allowed: true };
     },
-    async reserveEffect() {
+    async reserveEffect({ permit: boundPermit }) {
       order.push('reserve');
       if (opts.reserveFailure) return { ok: false, failure: opts.reserveFailure as never };
-      return { ok: true, receipt: receipt('effect_reserved', 2) as never };
+      const permitReceipt = receipt('permit_issued', 1, boundPermit, null);
+      return {
+        ok: true,
+        receipt: receipt('effect_reserved', 2, boundPermit, permitReceipt.event_digest),
+      };
     },
-    async recordOutcome({ outcome }) {
+    async recordOutcome({ execution_id, outcome, evidence, external_effect_reference }) {
       order.push(`outcome:${outcome}`);
       if (opts.recordFailure) return { ok: false, failure: opts.recordFailure as never };
-      return { ok: true, receipt: receipt(outcome, 3) as never };
+      const actionKind = opts.permitAction ?? 'CLOSE';
+      const boundPermit = permit(actionKind, execution_id.replace(/^exec-/, ''));
+      const permitReceipt = receipt('permit_issued', 1, boundPermit, null);
+      const reservationReceipt = receipt(
+        'effect_reserved',
+        2,
+        boundPermit,
+        permitReceipt.event_digest
+      );
+      return {
+        ok: true,
+        receipt: receipt(outcome, 3, boundPermit, reservationReceipt.event_digest, {
+          external_effect_reference: external_effect_reference ?? null,
+          evidence,
+        }),
+      };
     },
   };
 }
@@ -293,6 +357,8 @@ function makeDeps(
     liveDigest?: string;
     policy?: InjectedActionPolicyDepsV1;
     gate?: LifecycleGateDepsV1;
+    permitAction?: LifecycleActionKindV1;
+    observeError?: Error;
   } = {}
 ): ExecuteLifecycleActionDepsV1 {
   return {
@@ -308,6 +374,7 @@ function makeDeps(
     },
     async observeLiveTarget() {
       order.push('observe');
+      if (opts.observeError) throw opts.observeError;
       return {
         target_digest: opts.liveDigest ?? DIGEST_A,
         state: 'open',
@@ -315,7 +382,7 @@ function makeDeps(
         verifier_registry_digest: REGISTRY_DIGEST,
       };
     },
-    gate: opts.gate ?? makeGate(order),
+    gate: opts.gate ?? makeGate(order, { permitAction: opts.permitAction }),
     adapter,
   };
 }
@@ -348,19 +415,91 @@ describe('lifecycle assessment', () => {
 
   test('customer and governance content denied at assessment', () => {
     expect(
-      assessLifecycleCandidate(candidate('COMMENT', { customer_contact: true }), {
-        policy: eligiblePolicy(),
-      })
+      assessLifecycleCandidate(candidate('COMMENT', { customer_contact: true }))
     ).toMatchObject({ disposition: 'denied', reason: 'protected_boundary' });
     expect(
-      assessLifecycleCandidate(candidate('COMMENT', { governance_filing: true }), {
-        policy: eligiblePolicy(),
-      })
+      assessLifecycleCandidate(candidate('COMMENT', { governance_filing: true }))
     ).toMatchObject({ disposition: 'denied', reason: 'protected_boundary' });
   });
 });
 
 describe('lifecycle execution', () => {
+  test('permit action mismatch cannot execute a different lifecycle action', async () => {
+    const order: string[] = [];
+    const adapter = { perform: mock(async () => undefined as never) };
+    const result = await executeLifecycleAction(
+      execInput('COMMENT'),
+      makeDeps(adapter, order, { permitAction: 'CLOSE' })
+    );
+
+    expect(result).toMatchObject({ outcome: 'denied', reason: 'permit_action_mismatch' });
+    expect(order).toEqual(['prepare']);
+    expect(adapter.perform).toHaveBeenCalledTimes(0);
+  });
+
+  test('policy request digest is derived from exact permit and action parameters', async () => {
+    const order: string[] = [];
+    const requests: unknown[] = [];
+    const adapter = createLifecycleMutationAdapter({
+      allowed_repositories: ['bluedevilcollectibles/bdc-harness'],
+      allowed_actions: ['COMMENT'],
+      async consume_execution() {
+        return true;
+      },
+    });
+    const policy: InjectedActionPolicyDepsV1 = {
+      async evaluateActionPolicy(request) {
+        requests.push(request);
+        return {
+          schema_version: 'overseer-injected-action-policy-decision-v1',
+          request_digest: sha256hex(canonicalJsonV2(request)),
+          policy_digest: POLICY_DIGEST,
+          allowed: true,
+          denial_reason: null,
+        };
+      },
+    };
+
+    const result = await executeLifecycleAction(
+      execInput('COMMENT'),
+      makeDeps(adapter, order, { permitAction: 'COMMENT', policy })
+    );
+
+    expect(result.outcome).toBe('succeeded');
+    expect(requests).toEqual([
+      {
+        schema_version: 'overseer-injected-action-policy-request-v1',
+        proposal_id: 'proposal-comment',
+        execution_id: 'exec-proposal-comment',
+        repository: 'bluedevilcollectibles/bdc-harness',
+        target_kind: 'pull_request',
+        target_key: 'pr:101',
+        target_digest: DIGEST_A,
+        action_kind: 'COMMENT',
+        capability: 'lifecycle',
+        action_parameters_digest: PARAMS_DIGEST,
+        resulting_deployment_effect: 'none',
+        credential_principal: 'overseer-fixture',
+      },
+    ]);
+    expect(order).toEqual([
+      'prepare',
+      'authorize',
+      'reserve',
+      'observe',
+      'outcome:effect_succeeded',
+    ]);
+    expect(result.receipts[1]).toMatchObject({
+      target_key: 'pr:101',
+      target_digest: DIGEST_A,
+      provider_operation: 'COMMENT',
+    });
+    expect(result.receipts[2]?.evidence).toMatchObject({
+      action_kind: 'COMMENT',
+      action_parameters_digest: PARAMS_DIGEST,
+    });
+  });
+
   test('verified duplicate close preserves membership evidence and emits one result receipt', async () => {
     const order: string[] = [];
     const adapter = createLifecycleMutationAdapter({
@@ -384,6 +523,39 @@ describe('lifecycle execution', () => {
       'outcome:effect_succeeded',
     ]);
 
+    const boundPermit = permit('CLOSE');
+    const permitReceipt = receipt('permit_issued', 1, boundPermit, null);
+    const reservationReceipt = receipt(
+      'effect_reserved',
+      2,
+      boundPermit,
+      permitReceipt.event_digest
+    );
+    const reconciliationMutation = {
+      adapter: 'fake-lifecycle',
+      accepted: true,
+      reason: 'fake_accepted',
+      mutation_sent: false,
+      external_effect_reference: result.external_effect_reference,
+      permit_id: boundPermit.permit_id,
+      execution_id: boundPermit.execution_id,
+      repository: 'bluedevilcollectibles/bdc-harness',
+      target_kind: 'pull_request',
+      target_key: 'pr:101',
+      target_digest: DIGEST_A,
+      action_kind: 'CLOSE',
+      action_parameters_digest: PARAMS_DIGEST,
+    } as const;
+    const outcomeReceipt = receipt(
+      'effect_succeeded',
+      3,
+      boundPermit,
+      reservationReceipt.event_digest,
+      {
+        external_effect_reference: result.external_effect_reference,
+        evidence: reconciliationMutation,
+      }
+    );
     const reconciled = reconcileLifecycleResult({
       snapshot_id: 'snapshot-1',
       original_member_target_key: 'pr:100',
@@ -391,21 +563,11 @@ describe('lifecycle execution', () => {
       issue_or_pr_key: 'pr:101',
       run_id: 'run-1',
       card_id: 'card-1',
-      mutation: {
-        adapter: 'fake-lifecycle',
-        accepted: true,
-        reason: 'fake_accepted',
-        mutation_sent: false,
-        external_effect_reference: result.external_effect_reference,
-        permit_id: 'permit-1',
-        execution_id: 'exec-1',
-        repository: 'bluedevilcollectibles/bdc-harness',
-        target_kind: 'pull_request',
-        target_key: 'pr:101',
-        target_digest: DIGEST_A,
-        action_kind: 'CLOSE',
-        action_parameters_digest: PARAMS_DIGEST,
-      },
+      permit: boundPermit,
+      permit_receipt: permitReceipt,
+      reservation_receipt: reservationReceipt,
+      outcome_receipt: outcomeReceipt,
+      mutation: reconciliationMutation,
       existing_lineage: [
         {
           predecessor_target_key: 'pr:100',
@@ -436,7 +598,10 @@ describe('lifecycle execution', () => {
         return true;
       },
     });
-    const result = await executeLifecycleAction(execInput('REOPEN'), makeDeps(adapter, order));
+    const result = await executeLifecycleAction(
+      execInput('REOPEN'),
+      makeDeps(adapter, order, { permitAction: 'REOPEN' })
+    );
     expect(result.outcome).toBe('succeeded');
     expect(result.action_kind).toBe('REOPEN');
     expect(candidate('REOPEN').reopen_evidence).toMatchObject({
@@ -455,7 +620,10 @@ describe('lifecycle execution', () => {
         },
       });
       const order: string[] = [];
-      const result = await executeLifecycleAction(execInput(action), makeDeps(adapter, order));
+      const result = await executeLifecycleAction(
+        execInput(action),
+        makeDeps(adapter, order, { permitAction: action })
+      );
       expect(result.outcome).toBe('succeeded');
       expect(result.action_kind).toBe(action);
     }
@@ -480,7 +648,7 @@ describe('lifecycle execution', () => {
     const driftOrder: string[] = [];
     const liveDrift = await executeLifecycleAction(
       execInput('COMMENT'),
-      makeDeps(adapter, driftOrder, { liveDigest: DIGEST_B })
+      makeDeps(adapter, driftOrder, { liveDigest: DIGEST_B, permitAction: 'COMMENT' })
     );
     expect(liveDrift.outcome).toBe('live_state_mismatch');
     expect(adapter.perform).toHaveBeenCalledTimes(0);
@@ -488,12 +656,15 @@ describe('lifecycle execution', () => {
     const policyDrift = await executeLifecycleAction(
       execInput('COMMENT'),
       makeDeps(adapter, [], {
+        permitAction: 'COMMENT',
         policy: {
-          evaluateActionPolicy() {
+          async evaluateActionPolicy(request) {
             return {
-              eligible: true,
-              effect_allowed: true,
-              action_parameters_digest: sha256hex('stale'),
+              schema_version: 'overseer-injected-action-policy-decision-v1',
+              request_digest: sha256hex(canonicalJsonV2(request)),
+              policy_digest: sha256hex('stale'),
+              allowed: true,
+              denial_reason: null,
             };
           },
         },
@@ -501,6 +672,159 @@ describe('lifecycle execution', () => {
     );
     expect(policyDrift.outcome).toBe('denied');
     expect(adapter.perform).toHaveBeenCalledTimes(0);
+  });
+
+  test('reconciliation rejects receipts or mutation not bound to the execution chain', () => {
+    const boundPermit = permit('COMMENT');
+    const permitReceipt = receipt('permit_issued', 1, boundPermit, null);
+    const reservationReceipt = receipt(
+      'effect_reserved',
+      2,
+      boundPermit,
+      permitReceipt.event_digest
+    );
+    const externalReference = 'fake://comment';
+    const mutation = {
+      adapter: 'fake-lifecycle' as const,
+      accepted: true,
+      reason: 'fake_accepted' as const,
+      mutation_sent: false as const,
+      external_effect_reference: externalReference,
+      permit_id: boundPermit.permit_id,
+      execution_id: boundPermit.execution_id,
+      repository: boundPermit.repository,
+      target_kind: boundPermit.target.target_kind as 'pull_request',
+      target_key: boundPermit.target_key,
+      target_digest: boundPermit.target_digest,
+      action_kind: 'COMMENT' as const,
+      action_parameters_digest: PARAMS_DIGEST,
+    };
+    const outcomeReceipt = receipt(
+      'effect_succeeded',
+      3,
+      boundPermit,
+      reservationReceipt.event_digest,
+      { external_effect_reference: externalReference, evidence: mutation }
+    );
+    const base = {
+      snapshot_id: boundPermit.snapshot_id,
+      original_member_target_key: 'pr:100',
+      wo_id: 'WO-TEST-LIFECYCLE',
+      issue_or_pr_key: boundPermit.target_key,
+      run_id: 'run-1',
+      card_id: 'card-1',
+      permit: boundPermit,
+      permit_receipt: permitReceipt,
+      reservation_receipt: reservationReceipt,
+      outcome_receipt: outcomeReceipt,
+      mutation,
+      existing_lineage: [] as const,
+      new_lineage: [] as const,
+    };
+
+    expect(() =>
+      reconcileLifecycleResult({
+        ...base,
+        mutation: { ...base.mutation, action_kind: 'LABEL' },
+      })
+    ).toThrow('lifecycle_reconciliation_action_mismatch');
+    expect(() =>
+      reconcileLifecycleResult({
+        ...base,
+        outcome_receipt: receipt('effect_succeeded', 3, boundPermit, DIGEST_B, {
+          external_effect_reference: externalReference,
+          evidence: mutation,
+        }),
+      })
+    ).toThrow('lifecycle_reconciliation_receipt_chain_mismatch');
+  });
+
+  test('post reservation rejection throw and invalid response record terminal outcomes', async () => {
+    const scenarios: readonly {
+      readonly name: string;
+      readonly adapter: LifecycleMutationAdapterV1;
+      readonly expectedReceipt: 'effect_failed' | 'effect_indeterminate';
+      readonly observeError?: Error;
+    }[] = [
+      {
+        name: 'rejection',
+        adapter: {
+          async perform(request) {
+            return {
+              ...request,
+              adapter: 'fake-lifecycle',
+              accepted: false,
+              reason: 'execution_replayed',
+              mutation_sent: false,
+              external_effect_reference: null,
+            };
+          },
+        },
+        expectedReceipt: 'effect_failed',
+      },
+      {
+        name: 'throw',
+        adapter: {
+          async perform() {
+            throw new Error('adapter exploded');
+          },
+        },
+        expectedReceipt: 'effect_indeterminate',
+      },
+      {
+        name: 'invalid response',
+        adapter: {
+          async perform(request) {
+            return { ...request, action_kind: 'CLOSE', accepted: true } as never;
+          },
+        },
+        expectedReceipt: 'effect_indeterminate',
+      },
+      {
+        name: 'live observation exception',
+        adapter: { perform: mock(async () => undefined as never) },
+        observeError: new Error('observation exploded'),
+        expectedReceipt: 'effect_indeterminate',
+      },
+    ];
+
+    for (const scenario of scenarios) {
+      const order: string[] = [];
+      const result = await executeLifecycleAction(
+        execInput('COMMENT'),
+        makeDeps(scenario.adapter, order, {
+          permitAction: 'COMMENT',
+          observeError: scenario.observeError,
+        })
+      );
+      expect(result.outcome, scenario.name).not.toBe('succeeded');
+      expect(
+        order.filter(item => item.startsWith('outcome:')),
+        scenario.name
+      ).toEqual([`outcome:${scenario.expectedReceipt}`]);
+      expect(result.receipt_types.at(-1), scenario.name).toBe(scenario.expectedReceipt);
+    }
+
+    const persistenceOrder: string[] = [];
+    const acceptedAdapter = createLifecycleMutationAdapter({
+      allowed_repositories: ['bluedevilcollectibles/bdc-harness'],
+      allowed_actions: ['COMMENT'],
+      async consume_execution() {
+        return true;
+      },
+    });
+    const persistenceFailure = await executeLifecycleAction(
+      execInput('COMMENT'),
+      makeDeps(acceptedAdapter, persistenceOrder, {
+        permitAction: 'COMMENT',
+        gate: makeGate(persistenceOrder, {
+          permitAction: 'COMMENT',
+          recordFailure: 'evidence_conflicting',
+        }),
+      })
+    );
+    expect(persistenceFailure.outcome).toBe('outcome_record_failed');
+    expect(persistenceFailure.receipt_types).not.toContain('effect_succeeded');
   });
 });
 
@@ -541,6 +865,36 @@ describe('salvage verification and floors', () => {
       action_parameters_digest: PARAMS_DIGEST,
     });
     expect(recipe.inverse_provider_action).toBe('REOPEN');
+    const boundPermit = permit('CLOSE');
+    const permitReceipt = receipt('permit_issued', 1, boundPermit, null);
+    const reservationReceipt = receipt(
+      'effect_reserved',
+      2,
+      boundPermit,
+      permitReceipt.event_digest
+    );
+    const reconciliationMutation = {
+      adapter: 'fake-lifecycle',
+      accepted: true,
+      reason: 'fake_accepted',
+      mutation_sent: false,
+      external_effect_reference: 'fake://close',
+      permit_id: boundPermit.permit_id,
+      execution_id: boundPermit.execution_id,
+      repository: 'bluedevilcollectibles/bdc-harness',
+      target_kind: 'pull_request',
+      target_key: 'pr:101',
+      target_digest: DIGEST_A,
+      action_kind: 'CLOSE',
+      action_parameters_digest: PARAMS_DIGEST,
+    } as const;
+    const outcomeReceipt = receipt(
+      'effect_succeeded',
+      3,
+      boundPermit,
+      reservationReceipt.event_digest,
+      { external_effect_reference: 'fake://close', evidence: reconciliationMutation }
+    );
     const reconciled = reconcileLifecycleResult({
       snapshot_id: 'snapshot-1',
       original_member_target_key: 'pr:100',
@@ -548,21 +902,11 @@ describe('salvage verification and floors', () => {
       issue_or_pr_key: 'pr:101',
       run_id: 'run-1',
       card_id: 'card-1',
-      mutation: {
-        adapter: 'fake-lifecycle',
-        accepted: true,
-        reason: 'fake_accepted',
-        mutation_sent: false,
-        external_effect_reference: 'fake://close',
-        permit_id: 'permit-1',
-        execution_id: 'exec-1',
-        repository: 'bluedevilcollectibles/bdc-harness',
-        target_kind: 'pull_request',
-        target_key: 'pr:101',
-        target_digest: DIGEST_A,
-        action_kind: 'CLOSE',
-        action_parameters_digest: PARAMS_DIGEST,
-      },
+      permit: boundPermit,
+      permit_receipt: permitReceipt,
+      reservation_receipt: reservationReceipt,
+      outcome_receipt: outcomeReceipt,
+      mutation: reconciliationMutation,
       existing_lineage: [
         {
           predecessor_target_key: 'pr:100',

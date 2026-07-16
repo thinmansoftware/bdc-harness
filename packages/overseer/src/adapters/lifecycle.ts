@@ -1,3 +1,9 @@
+import { createHash } from 'node:crypto';
+import {
+  canonicalJsonV2,
+  type M31ActionPermitV2,
+  type M31ExecutionReceiptEventV2,
+} from '@archon/core/db/m31-target-v2';
 import type { LifecycleActionKindV1, LifecycleTargetKindV1 } from '../actions/lifecycle';
 
 export interface LifecycleMutationRequestV1 {
@@ -104,6 +110,10 @@ export interface ReconcileLifecycleResultInputV1 {
   readonly issue_or_pr_key: string;
   readonly run_id: string;
   readonly card_id: string;
+  readonly permit: M31ActionPermitV2;
+  readonly permit_receipt: M31ExecutionReceiptEventV2;
+  readonly reservation_receipt: M31ExecutionReceiptEventV2;
+  readonly outcome_receipt: M31ExecutionReceiptEventV2;
   readonly mutation: LifecycleMutationReceiptV1;
   readonly existing_lineage: readonly LifecycleLineageSupportV1[];
   readonly new_lineage: readonly LifecycleLineageSupportV1[];
@@ -125,6 +135,87 @@ export interface LifecycleReconciliationReceiptV1 {
 export function reconcileLifecycleResult(
   input: ReconcileLifecycleResultInputV1
 ): LifecycleReconciliationReceiptV1 {
+  const permit = input.permit;
+  const permitReceipt = input.permit_receipt;
+  const reservationReceipt = input.reservation_receipt;
+  const outcomeReceipt = input.outcome_receipt;
+  const mutation = input.mutation;
+  const lifecycleActions: readonly string[] = ['CLOSE', 'REOPEN', 'COMMENT', 'LABEL', 'ASSIGN'];
+
+  if (
+    !lifecycleActions.includes(permit.action_kind) ||
+    permit.snapshot_id !== input.snapshot_id ||
+    permit.target_key !== input.issue_or_pr_key ||
+    permit.target.target_kind !== mutation.target_kind ||
+    permit.repository !== mutation.repository ||
+    permit.target_key !== mutation.target_key ||
+    permit.target_digest !== mutation.target_digest ||
+    !/^[0-9a-f]{64}$/.test(mutation.target_digest) ||
+    !/^[0-9a-f]{64}$/.test(mutation.action_parameters_digest)
+  ) {
+    throw new Error('lifecycle_reconciliation_target_mismatch');
+  }
+  if (permit.action_kind !== mutation.action_kind) {
+    throw new Error('lifecycle_reconciliation_action_mismatch');
+  }
+  if (permit.capability !== `overseer.m31.${mutation.action_kind.toLowerCase()}`) {
+    throw new Error('lifecycle_reconciliation_capability_mismatch');
+  }
+  if (
+    permit.permit_id !== mutation.permit_id ||
+    permit.execution_id !== mutation.execution_id ||
+    permitReceipt.receipt_event_id !== permit.permit_id ||
+    permitReceipt.proposal_id !== permit.proposal_id ||
+    permitReceipt.execution_id !== permit.execution_id ||
+    reservationReceipt.proposal_id !== permit.proposal_id ||
+    reservationReceipt.execution_id !== permit.execution_id ||
+    outcomeReceipt.proposal_id !== permit.proposal_id ||
+    outcomeReceipt.execution_id !== permit.execution_id
+  ) {
+    throw new Error('lifecycle_reconciliation_execution_mismatch');
+  }
+  for (const receipt of [permitReceipt, reservationReceipt, outcomeReceipt]) {
+    if (
+      receipt.target_kind !== permit.target.target_kind ||
+      receipt.target_key !== permit.target_key ||
+      receipt.target_digest !== permit.target_digest ||
+      !receiptDigestValid(receipt)
+    ) {
+      throw new Error('lifecycle_reconciliation_receipt_binding_mismatch');
+    }
+  }
+  if (
+    permitReceipt.event_type !== 'permit_issued' ||
+    permitReceipt.event_sequence !== 1 ||
+    permitReceipt.previous_event_digest !== null ||
+    reservationReceipt.event_type !== 'effect_reserved' ||
+    reservationReceipt.event_sequence !== 2 ||
+    reservationReceipt.previous_event_digest !== permitReceipt.event_digest ||
+    outcomeReceipt.event_type !== 'effect_succeeded' ||
+    outcomeReceipt.event_sequence !== 3 ||
+    outcomeReceipt.previous_event_digest !== reservationReceipt.event_digest
+  ) {
+    throw new Error('lifecycle_reconciliation_receipt_chain_mismatch');
+  }
+  if (
+    reservationReceipt.adapter_name !== mutation.adapter ||
+    reservationReceipt.provider_operation !== mutation.action_kind ||
+    !isObject(reservationReceipt.evidence) ||
+    reservationReceipt.evidence.target_key !== mutation.target_key ||
+    reservationReceipt.evidence.target_digest !== mutation.target_digest ||
+    reservationReceipt.evidence.action_parameters_digest !== mutation.action_parameters_digest
+  ) {
+    throw new Error('lifecycle_reconciliation_reservation_mismatch');
+  }
+  if (
+    !mutation.accepted ||
+    mutation.reason !== 'fake_accepted' ||
+    !mutation.external_effect_reference ||
+    outcomeReceipt.external_effect_reference !== mutation.external_effect_reference ||
+    canonicalJsonV2(outcomeReceipt.evidence) !== canonicalJsonV2(mutation)
+  ) {
+    throw new Error('lifecycle_reconciliation_outcome_mismatch');
+  }
   return {
     schema_version: 'overseer-lifecycle-reconciliation-v1',
     snapshot_id: input.snapshot_id,
@@ -137,4 +228,16 @@ export function reconcileLifecycleResult(
     lineage: [...input.existing_lineage, ...input.new_lineage],
     membership_collapsed: false,
   };
+}
+
+function isObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null;
+}
+
+function receiptDigestValid(receipt: M31ExecutionReceiptEventV2): boolean {
+  const { event_digest: eventDigest, ...event } = receipt;
+  return (
+    /^[0-9a-f]{64}$/.test(eventDigest) &&
+    createHash('sha256').update(canonicalJsonV2(event)).digest('hex') === eventDigest
+  );
 }
