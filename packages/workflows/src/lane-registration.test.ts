@@ -38,6 +38,7 @@ interface NodeDef {
   id: string;
   provider?: string;
   model?: string;
+  fallbackModel?: string;
   bash?: string;
   prompt?: string;
   loop?: {
@@ -65,12 +66,13 @@ function loadLane(filename: string): LaneDef {
 }
 
 describe('lane registration and war-council-validator pin', () => {
-  it('S4: enumerates exactly the seven governed feature lanes', () => {
+  it('S4: enumerates exactly the eight governed feature lanes', () => {
     expect(LANE_FILES).toEqual([
       'bdc-feature-development-codex-only.yaml',
       'bdc-feature-development-codex.yaml',
       'bdc-feature-development-fable.yaml',
       'bdc-feature-development-fusion-cx-qwen.yaml',
+      'bdc-feature-development-grok.yaml',
       'bdc-feature-development-zero-open.yaml',
       'bdc-feature-development-zero.yaml',
       'bdc-feature-development.yaml',
@@ -113,6 +115,13 @@ describe('lane registration and war-council-validator pin', () => {
         return;
       }
 
+      if (file === 'bdc-feature-development-grok.yaml') {
+        // Grok builds; a repository-capable non-Grok judge validates.
+        expect(wcv.provider).toBe('codex-opr');
+        expect(wcv.model).not.toBe('x-ai/grok-4.5');
+        return;
+      }
+
       if (file === 'bdc-feature-development-codex-only.yaml') {
         // Claude-out / Codex-in: validator on codex with model-free persona.
         expect(wcv.provider).toBe('codex');
@@ -133,6 +142,49 @@ describe('lane registration and war-council-validator pin', () => {
       expect(wcv.model).toBe(expectedModel);
     });
   }
+
+  it('S4i: the dedicated Grok lane pins execution to Grok and review to non-Grok seats', () => {
+    const file = 'bdc-feature-development-grok.yaml';
+    const lane = loadLane(file);
+    const content = readFileSync(join(LANES_DIR, file), 'utf-8');
+    const nodes = lane.nodes ?? [];
+    const node = (id: string) => nodes.find(candidate => candidate.id === id);
+
+    expect(lane.provider).toBe('grok');
+    expect(lane.model).toBe('x-ai/grok-4.5');
+    expect(content).not.toContain('provider: claude');
+    expect(content).not.toContain('model: claude');
+    expect(content).not.toContain('agent: overseer-opus');
+
+    for (const id of [
+      'check-already-satisfied',
+      'plan',
+      'implement',
+      'diff-repair',
+      'opus-repair',
+      'apply-suggested-fix',
+    ]) {
+      const executionNode = node(id);
+      expect(executionNode?.provider, `${file}:${id}:provider`).toBe('grok');
+      expect(executionNode?.model, `${file}:${id}:model`).toBe('x-ai/grok-4.5');
+      expect(executionNode?.fallbackModel, `${file}:${id}:fallbackModel`).toBeUndefined();
+    }
+
+    for (const id of [
+      'plan-review',
+      'war-council-validator',
+      'diff-review',
+      'diff-review-final',
+      'opus-rereview',
+      'findings-consolidate',
+      'apply-diff-review-final',
+    ]) {
+      const reviewNode = node(id);
+      expect(reviewNode?.provider, `${file}:${id}:provider`).toBe('codex-opr');
+      expect(reviewNode?.model, `${file}:${id}:model`).not.toBe('x-ai/grok-4.5');
+      expect(reviewNode?.fallbackModel, `${file}:${id}:fallbackModel`).toBeUndefined();
+    }
+  });
 
   for (const file of LANE_FILES) {
     it(`S4c: ${file} never assigns a chat-only provider to a builder or repair seat`, () => {

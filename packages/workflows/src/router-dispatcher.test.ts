@@ -43,6 +43,7 @@ const LIVE_GOVERNED_LANES: readonly string[] = [
   'bdc-feature-development-codex',
   'bdc-feature-development-fable',
   'bdc-feature-development-fusion-cx-qwen',
+  'bdc-feature-development-grok',
   'bdc-feature-development-zero-open',
   'bdc-feature-development-zero',
   'bdc-feature-development',

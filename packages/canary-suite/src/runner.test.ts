@@ -45,7 +45,7 @@ test('runs Levels 0 and 1 through exactly one GET and writes evidence', async ()
       fetcher,
     });
     expect(result.report.verdict).toBe('static_only');
-    expect(result.report.lanes).toHaveLength(8);
+    expect(result.report.lanes).toHaveLength(9);
     expect(methods).toEqual(['GET']);
     expect((await readdir(join(root, 'artifacts', result.report.suiteRunId))).sort()).toEqual([
       'plan.json',
