@@ -35,6 +35,9 @@ const POLICY_DIGEST =
   }).entries[0]?.policy_digest ?? '';
 const VERIFIER_DIGEST = 'c3'.repeat(32);
 const TARGET_DIGEST = 'e4'.repeat(32);
+const FUSION_RECEIPT_DIGEST = 'a7'.repeat(32);
+const FUSION_EVIDENCE_DIGEST = 'b8'.repeat(32);
+const OUTCOME_EVENT_DIGEST = 'd5'.repeat(32);
 
 const REGISTRY = loadOverseerActionPolicyRegistry({
   text: readFileSync(
@@ -111,7 +114,10 @@ function validEvidence(overrides: Partial<QualifiedMergeEvidence> = {}): Qualifi
       cost_recorded: true,
       verifier_correlated: false,
       hidden_model_substitution: false,
+      receipt_digest: FUSION_RECEIPT_DIGEST,
+      evidence_digest: FUSION_EVIDENCE_DIGEST,
     },
+    expected_verifier_registry_digest: VERIFIER_DIGEST,
     final_state_consistent: true,
     ...overrides,
   };
@@ -218,7 +224,7 @@ function outcomeReceiptEvent(
     reason: type,
     evidence: {},
     previous_event_digest: RESERVATION_EVENT_DIGEST,
-    event_digest: 'd5'.repeat(32),
+    event_digest: OUTCOME_EVENT_DIGEST,
     created_at: '2026-07-15T12:00:01.000Z',
   };
 }
@@ -388,7 +394,7 @@ describe('assessQualifiedMerge', () => {
 
 describe('executeQualifiedMerge -- Section 11', () => {
   // Test 1
-  test('exact qualified fake merge produces reserved, succeeded, and reconciliation evidence', async () => {
+  test('exact qualified fake merge produces reserved and succeeded primary outcome evidence', async () => {
     const h = harness();
     const result = await executeQualifiedMerge(validEvidence(), h.deps);
 
@@ -400,7 +406,9 @@ describe('executeQualifiedMerge -- Section 11', () => {
     expect(result.permitEventDigest).toBe(PERMIT_EVENT_DIGEST);
     expect(result.reservationEventDigest).toBe(RESERVATION_EVENT_DIGEST);
     expect(h.calls.filter(c => c === 'mergeAdapter')).toHaveLength(1);
-    expect(h.deps.reconcile).toHaveBeenCalledTimes(1);
+    // target-v2: reconciliation is only after effect_indeterminate; success is terminal.
+    expect(h.deps.reconcile).not.toHaveBeenCalled();
+    expect(h.calls).not.toContain('reconcile');
     expect(h.calls).toContain('reserveEffect');
     expect(h.calls).toContain('recordOutcome');
     expect(h.outcomeCalls).toEqual([
@@ -566,43 +574,59 @@ describe('executeQualifiedMerge -- Section 11', () => {
 
   // Test 5
   test('missing or correlated Fusion/verifier stops with no adapter call', async () => {
+    const baseFusion = {
+      present: true,
+      components: ['a', 'b'] as readonly string[],
+      raw_dissent_recorded: true,
+      cost_recorded: true,
+      verifier_correlated: false,
+      hidden_model_substitution: false,
+      receipt_digest: FUSION_RECEIPT_DIGEST,
+      evidence_digest: FUSION_EVIDENCE_DIGEST,
+    };
     const cases: Partial<QualifiedMergeEvidence>[] = [
       { fusion: null },
       {
         fusion: {
-          present: true,
+          ...baseFusion,
           components: ['only-one'],
           raw_dissent_recorded: false,
-          cost_recorded: true,
-          verifier_correlated: false,
-          hidden_model_substitution: false,
         },
       },
       {
         fusion: {
-          present: true,
-          components: ['a', 'b'],
-          raw_dissent_recorded: true,
-          cost_recorded: true,
+          ...baseFusion,
           verifier_correlated: true,
-          hidden_model_substitution: false,
         },
       },
       {
         fusion: {
-          present: true,
-          components: ['a', 'b'],
-          raw_dissent_recorded: true,
-          cost_recorded: true,
-          verifier_correlated: false,
+          ...baseFusion,
           hidden_model_substitution: true,
         },
+      },
+      {
+        fusion: {
+          ...baseFusion,
+          receipt_digest: 'NOT_A_DIGEST',
+        },
+      },
+      {
+        fusion: {
+          ...baseFusion,
+          // Upper-case fails the lower-case 64-hex requirement.
+          evidence_digest: 'A'.repeat(64),
+        },
+      },
+      {
+        expected_verifier_registry_digest: 'NOT_HEX',
       },
     ];
     for (const override of cases) {
       const h = harness();
       const result = await executeQualifiedMerge(validEvidence(override), h.deps);
       expect(result.action).toBe('denied');
+      expect(result.merged).toBe(false);
       expect(result.adapterCalled).toBe(false);
       expect(h.calls).not.toContain('mergeAdapter');
     }
@@ -694,6 +718,8 @@ describe('adversarial regressions -- Slice 7 repair', () => {
     expect(request?.reservation_event_digest).toBe(RESERVATION_EVENT_DIGEST);
     expect(request?.policy_digest).toBe(POLICY_DIGEST);
     expect(request?.verifier_registry_digest).toBe(VERIFIER_DIGEST);
+    expect(request?.fusion_receipt_digest).toBe(FUSION_RECEIPT_DIGEST);
+    expect(request?.fusion_evidence_digest).toBe(FUSION_EVIDENCE_DIGEST);
     expect(request?.head_sha).toBe(HEAD);
     expect(request?.base_sha).toBe(BASE);
     expect(request?.pr_number).toBe(42);
@@ -815,5 +841,167 @@ describe('adversarial regressions -- Slice 7 repair', () => {
     const shippedText = readFileSync(shipped, 'utf8');
     expect(loadOverseerActionPolicyRegistry({ text: syntheticText }).entries).toHaveLength(1);
     expect(loadOverseerActionPolicyRegistry({ text: shippedText }).entries).toHaveLength(0);
+  });
+
+  test('adapter throw records effect_indeterminate once and never reports merged', async () => {
+    let adapterAttempts = 0;
+    const h = harness(
+      {},
+      {
+        adapterImpl: {
+          attemptMerge: async () => {
+            adapterAttempts += 1;
+            throw new Error('provider_timeout');
+          },
+        },
+      }
+    );
+    const result = await executeQualifiedMerge(validEvidence(), h.deps);
+    expect(result.merged).toBe(false);
+    expect(result.action).toBe('indeterminate');
+    expect(result.reason).toBe('adapter_threw:provider_timeout');
+    expect(result.adapterCalled).toBe(true);
+    expect(result.primaryOutcome).toBe('effect_indeterminate');
+    expect(result.receipts).toEqual(['effect_reserved', 'effect_indeterminate']);
+    expect(h.outcomeCalls).toHaveLength(1);
+    expect(h.outcomeCalls[0]?.outcome).toBe('effect_indeterminate');
+    expect(h.deps.reconcile).not.toHaveBeenCalled();
+    expect(adapterAttempts).toBe(1);
+    expect(h.outcomeCalls.filter(c => c.outcome === 'effect_succeeded')).toHaveLength(0);
+  });
+
+  test('invalid adapter response records effect_indeterminate and never reports merged', async () => {
+    let adapterAttempts = 0;
+    const tracked: QualifiedMergeAdapterV2 = {
+      attemptMerge: async () => {
+        adapterAttempts += 1;
+        return {
+          schema_version: 'not-a-valid-result-v2',
+          status: 'succeeded',
+          reason: 'spoofed',
+          external_effect_reference: 'x',
+          evidence_digest: 'f6'.repeat(32),
+        } as unknown as QualifiedMergeAdapterResultV2;
+      },
+    };
+    const h = harness({}, { adapterImpl: tracked });
+    const result = await executeQualifiedMerge(validEvidence(), h.deps);
+    expect(result.merged).toBe(false);
+    expect(result.action).toBe('indeterminate');
+    expect(result.reason).toBe('adapter_result_invalid');
+    expect(result.adapterCalled).toBe(true);
+    expect(result.primaryOutcome).toBe('effect_indeterminate');
+    expect(result.receipts).toEqual(['effect_reserved', 'effect_indeterminate']);
+    expect(h.outcomeCalls).toEqual([
+      { outcome: 'effect_indeterminate', reason: 'adapter_result_invalid' },
+    ]);
+    expect(h.deps.reconcile).not.toHaveBeenCalled();
+    expect(adapterAttempts).toBe(1);
+  });
+
+  test('mismatched primary outcome receipt fails closed and never reports merged', async () => {
+    let attempts = 0;
+    const h = harness({
+      recordOutcome: mock(async input => {
+        attempts += 1;
+        // Adversarial: claim ok with wrong event type / identity.
+        return {
+          ok: true as const,
+          value: {
+            ...outcomeReceiptEvent('effect_failed'),
+            event_type: 'effect_failed' as const,
+            proposal_id: 'wrong-proposal',
+            execution_id: 'wrong-execution',
+            target_key: 'wrong-target',
+            target_digest: '0'.repeat(64),
+            previous_event_digest: '1'.repeat(64),
+            event_sequence: 99,
+          },
+        };
+      }),
+    });
+    const result = await executeQualifiedMerge(validEvidence(), h.deps);
+    expect(result.merged).toBe(false);
+    expect(result.action).toBe('indeterminate');
+    expect(result.reason).toBe('outcome_write_failed_after_adapter_success');
+    // First success attempt rejected by identity bind; second indeterminate also
+    // rejected by the same adversarial mock -- still never merged.
+    expect(result.primaryOutcome).toBe('effect_indeterminate');
+    expect(result.receipts).toEqual(['effect_reserved']);
+    expect(attempts).toBe(2);
+    expect(h.deps.reconcile).not.toHaveBeenCalled();
+    expect(h.calls.filter(c => c === 'mergeAdapter')).toHaveLength(1);
+  });
+
+  test('mismatched previous_event_digest on primary outcome fails closed', async () => {
+    let attempts = 0;
+    const h = harness({
+      recordOutcome: mock(async input => {
+        attempts += 1;
+        h.calls.push('recordOutcome');
+        h.outcomeCalls.push({ outcome: input.outcome, reason: input.reason });
+        if (input.outcome === 'effect_succeeded') {
+          return {
+            ok: true as const,
+            value: {
+              ...outcomeReceiptEvent('effect_succeeded'),
+              previous_event_digest: '9'.repeat(64),
+            },
+          };
+        }
+        return { ok: true as const, value: outcomeReceiptEvent(input.outcome) };
+      }),
+    });
+    const result = await executeQualifiedMerge(validEvidence(), h.deps);
+    expect(result.merged).toBe(false);
+    expect(result.action).toBe('indeterminate');
+    expect(result.reason).toBe('outcome_write_failed_after_adapter_success');
+    expect(result.primaryOutcome).toBe('effect_indeterminate');
+    expect(result.receipts).toEqual(['effect_reserved', 'effect_indeterminate']);
+    expect(attempts).toBe(2);
+    expect(h.deps.reconcile).not.toHaveBeenCalled();
+  });
+
+  test('successful effect_succeeded never calls reconcile (no sequence-4 after success)', async () => {
+    const h = harness();
+    const result = await executeQualifiedMerge(validEvidence(), h.deps);
+    expect(result.merged).toBe(true);
+    expect(result.primaryOutcome).toBe('effect_succeeded');
+    expect(h.deps.reconcile).not.toHaveBeenCalled();
+    expect(h.calls).not.toContain('reconcile');
+    // Source must not invoke effect_reconciled_succeeded on the success path.
+    const source = readFileSync(
+      fileURLToPath(new URL('../actions/merge-ready.ts', import.meta.url)),
+      'utf8'
+    );
+    // Direct success path no longer contains a reconcile invocation after succeeded.
+    expect(source).not.toMatch(/outcome:\s*'effect_succeeded'[\s\S]{0,800}deps\.reconcile\(/);
+  });
+
+  test('expected verifier registry digest mismatch fails before reservation', async () => {
+    const h = harness();
+    const result = await executeQualifiedMerge(
+      validEvidence({ expected_verifier_registry_digest: 'f'.repeat(64) }),
+      h.deps
+    );
+    expect(result.merged).toBe(false);
+    expect(result.action).toBe('permit_denied');
+    expect(result.reason).toBe('identity_recheck_failed:auth_verifier_registry_digest_mismatch');
+    expect(h.deps.reserveEffect).not.toHaveBeenCalled();
+    expect(h.calls).not.toContain('mergeAdapter');
+    expect(h.deps.reconcile).not.toHaveBeenCalled();
+  });
+
+  test('malformed expected verifier digest denies at assessment', async () => {
+    const h = harness();
+    const result = await executeQualifiedMerge(
+      validEvidence({ expected_verifier_registry_digest: 'ZZ' }),
+      h.deps
+    );
+    expect(result.merged).toBe(false);
+    expect(result.action).toBe('denied');
+    expect(result.reason).toBe('expected_verifier_registry_digest_malformed');
+    expect(h.deps.preparePermit).not.toHaveBeenCalled();
+    expect(h.calls).not.toContain('mergeAdapter');
   });
 });

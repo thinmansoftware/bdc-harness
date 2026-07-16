@@ -144,6 +144,10 @@ export interface FusionEvidence {
   readonly cost_recorded: boolean;
   readonly verifier_correlated: boolean;
   readonly hidden_model_substitution: boolean;
+  /** Lower-case 64-hex content address of the Fusion receipt. */
+  readonly receipt_digest: string;
+  /** Lower-case 64-hex content address of independent Fusion evidence. */
+  readonly evidence_digest: string;
 }
 
 export interface QualifiedMergeEvidence {
@@ -166,6 +170,11 @@ export interface QualifiedMergeEvidence {
   readonly proposal_id: string | null;
   readonly proposal_present: boolean;
   readonly fusion: FusionEvidence | null;
+  /**
+   * Independently expected verifier-registry digest (lower-case 64-hex). Must
+   * equal the authorized verifier_registry_digest before reservation.
+   */
+  readonly expected_verifier_registry_digest: string;
   readonly final_state_consistent: boolean;
 }
 
@@ -280,7 +289,8 @@ export function assessQualifiedMerge(evidence: QualifiedMergeEvidence): Qualifie
   }
 
   // 8. Mandatory Fusion record with disclosed components, raw dissent, and cost,
-  //    and an uncorrelated verifier with no hidden model substitution.
+  //    content-addressed receipt/evidence digests, and an uncorrelated verifier
+  //    with no hidden model substitution.
   const fusion = evidence.fusion;
   if (!fusion || !fusion.present || fusion.components.length === 0) {
     return deny('fusion', 'fusion_missing');
@@ -290,6 +300,12 @@ export function assessQualifiedMerge(evidence: QualifiedMergeEvidence): Qualifie
   }
   if (fusion.verifier_correlated || fusion.hidden_model_substitution) {
     return deny('fusion', 'fusion_verifier_correlated');
+  }
+  if (!HEX64_RE.test(fusion.receipt_digest) || !HEX64_RE.test(fusion.evidence_digest)) {
+    return deny('fusion', 'fusion_digest_malformed');
+  }
+  if (!HEX64_RE.test(evidence.expected_verifier_registry_digest)) {
+    return deny('verifier', 'expected_verifier_registry_digest_malformed');
   }
 
   // 9. Final compare-and-act: exact live state must still match the proposal.
@@ -322,6 +338,8 @@ export interface QualifiedMergeAdapterRequestV2 {
   readonly action_kind: 'MERGE';
   readonly policy_digest: string;
   readonly verifier_registry_digest: string;
+  readonly fusion_receipt_digest: string;
+  readonly fusion_evidence_digest: string;
   readonly permit_event_digest: string;
   readonly reservation_event_digest: string;
 }
@@ -501,6 +519,15 @@ function recheckIdentitiesBeforeReserve(input: {
   if (!HEX64_RE.test(authorization.verifier_registry_digest)) {
     return 'auth_verifier_registry_digest_malformed';
   }
+  if (authorization.verifier_registry_digest !== evidence.expected_verifier_registry_digest) {
+    return 'auth_verifier_registry_digest_mismatch';
+  }
+  if (!evidence.fusion || !HEX64_RE.test(evidence.fusion.receipt_digest)) {
+    return 'fusion_receipt_digest_malformed';
+  }
+  if (!HEX64_RE.test(evidence.fusion.evidence_digest)) {
+    return 'fusion_evidence_digest_malformed';
+  }
 
   return null;
 }
@@ -529,18 +556,59 @@ function bindReservationChain(
   return null;
 }
 
+/**
+ * Bind a durable primary-outcome receipt to the exact expected v2 identity.
+ * Any mismatch fails closed; callers must never report merged:true on failure.
+ */
+function bindPrimaryOutcomeReceipt(input: {
+  readonly expectedOutcome: PrimaryOutcomeKind;
+  readonly receipt: M31ExecutionReceiptEventV2;
+  readonly permit: M31ActionPermitV2;
+  readonly reservation: M31ExecutionReceiptEventV2;
+}): string | null {
+  const { expectedOutcome, receipt, permit, reservation } = input;
+  if (receipt.event_type !== expectedOutcome) return 'primary_outcome_type_mismatch';
+  if (receipt.event_sequence !== 3) return 'primary_outcome_sequence_mismatch';
+  if (!HEX64_RE.test(receipt.event_digest)) return 'primary_outcome_event_digest_malformed';
+  if (receipt.previous_event_digest !== reservation.event_digest) {
+    return 'primary_outcome_previous_digest_mismatch';
+  }
+  if (receipt.execution_id !== permit.execution_id) return 'primary_outcome_execution_mismatch';
+  if (receipt.proposal_id !== permit.proposal_id) return 'primary_outcome_proposal_mismatch';
+  if (receipt.target_key !== permit.target_key) return 'primary_outcome_target_key_mismatch';
+  if (receipt.target_digest !== permit.target_digest) {
+    return 'primary_outcome_target_digest_mismatch';
+  }
+  return null;
+}
+
 async function appendPrimaryOutcome(
   deps: ExecuteQualifiedMergeDeps,
   input: RecordExecutionOutcomeInput,
-  receipts: string[]
+  receipts: string[],
+  chain: {
+    readonly permit: M31ActionPermitV2;
+    readonly reservation: M31ExecutionReceiptEventV2;
+  }
 ): Promise<{ readonly recorded: PrimaryOutcomeKind | null; readonly ok: boolean }> {
   try {
     const outcome = await deps.recordOutcome(input);
-    if (outcome.ok) {
-      receipts.push(input.outcome);
-      return { recorded: input.outcome, ok: true };
+    if (!outcome.ok) {
+      return { recorded: null, ok: false };
     }
-    return { recorded: null, ok: false };
+    // ok:true is insufficient: the durable receipt must be the exact expected
+    // v2 primary outcome bound to proposal/execution/target/previous digest.
+    const bindFailure = bindPrimaryOutcomeReceipt({
+      expectedOutcome: input.outcome,
+      receipt: outcome.value,
+      permit: chain.permit,
+      reservation: chain.reservation,
+    });
+    if (bindFailure) {
+      return { recorded: null, ok: false };
+    }
+    receipts.push(input.outcome);
+    return { recorded: input.outcome, ok: true };
   } catch {
     // Outcome-recording uncertainty after reservation: do not claim success and
     // do not retry (no replay after indeterminate / uncertain primary write).
@@ -581,6 +649,8 @@ async function finalizeAfterReservation(input: {
     reservationEventDigest: reservation.event_digest,
   };
 
+  const outcomeChain = { permit, reservation };
+
   const adapter = deps.mergeAdapter;
   if (!adapter) {
     // Should have been caught earlier; if reached post-reserve, fail closed.
@@ -592,7 +662,8 @@ async function finalizeAfterReservation(input: {
         reason: 'merge_adapter_missing_after_reservation',
         evidence: { stage: 'post_reserve' },
       },
-      receipts
+      receipts,
+      outcomeChain
     );
     await recordAction(
       deps,
@@ -601,6 +672,33 @@ async function finalizeAfterReservation(input: {
       'merge_adapter_missing_after_reservation'
     );
     return closed(assessment, 'indeterminate', 'merge_adapter_missing_after_reservation', {
+      ...chainExtras,
+      primaryOutcome: primary.recorded ?? 'effect_indeterminate',
+    });
+  }
+
+  // Fusion digests were validated at assessment and recheck; bind them into the
+  // exact adapter request so the merge boundary carries content-addressed proof.
+  const fusion = evidence.fusion;
+  if (!fusion || !HEX64_RE.test(fusion.receipt_digest) || !HEX64_RE.test(fusion.evidence_digest)) {
+    const primary = await appendPrimaryOutcome(
+      deps,
+      {
+        execution_id: permit.execution_id,
+        outcome: 'effect_indeterminate',
+        reason: 'fusion_digest_missing_after_reservation',
+        evidence: { stage: 'post_reserve' },
+      },
+      receipts,
+      outcomeChain
+    );
+    await recordAction(
+      deps,
+      evidence.record,
+      'circuit_open',
+      'fusion_digest_missing_after_reservation'
+    );
+    return closed(assessment, 'indeterminate', 'fusion_digest_missing_after_reservation', {
       ...chainExtras,
       primaryOutcome: primary.recorded ?? 'effect_indeterminate',
     });
@@ -623,6 +721,8 @@ async function finalizeAfterReservation(input: {
     action_kind: 'MERGE',
     policy_digest: authorization.policy_digest,
     verifier_registry_digest: authorization.verifier_registry_digest,
+    fusion_receipt_digest: fusion.receipt_digest,
+    fusion_evidence_digest: fusion.evidence_digest,
     permit_event_digest: permitReceipt.event_digest,
     reservation_event_digest: reservation.event_digest,
   };
@@ -640,7 +740,8 @@ async function finalizeAfterReservation(input: {
         reason: `adapter_threw:${reason}`,
         evidence: { stage: 'adapter_invoke' },
       },
-      receipts
+      receipts,
+      outcomeChain
     );
     await recordAction(deps, evidence.record, 'circuit_open', `adapter_threw:${reason}`);
     return closed(assessment, 'indeterminate', `adapter_threw:${reason}`, {
@@ -664,7 +765,8 @@ async function finalizeAfterReservation(input: {
         reason: 'adapter_result_invalid',
         evidence: { adapterResult },
       },
-      receipts
+      receipts,
+      outcomeChain
     );
     await recordAction(deps, evidence.record, 'circuit_open', 'adapter_result_invalid');
     return closed(assessment, 'indeterminate', 'adapter_result_invalid', {
@@ -688,7 +790,8 @@ async function finalizeAfterReservation(input: {
         },
         external_effect_reference: adapterResult.external_effect_reference,
       },
-      receipts
+      receipts,
+      outcomeChain
     );
     if (!primary.ok) {
       // Could not durably record the definitive failure: escalate to indeterminate
@@ -701,7 +804,8 @@ async function finalizeAfterReservation(input: {
           reason: `outcome_write_failed_after_adapter_reject:${adapterResult.reason}`,
           evidence: { prior_attempt: 'effect_failed' },
         },
-        receipts
+        receipts,
+        outcomeChain
       );
       await recordAction(
         deps,
@@ -746,7 +850,8 @@ async function finalizeAfterReservation(input: {
         },
         external_effect_reference: adapterResult.external_effect_reference,
       },
-      receipts
+      receipts,
+      outcomeChain
     );
     await recordAction(
       deps,
@@ -761,8 +866,10 @@ async function finalizeAfterReservation(input: {
     });
   }
 
-  // Adapter reported definitive success: only claim merged after a durable
-  // effect_succeeded primary outcome.
+  // Adapter reported definitive success: only claim merged after a durable,
+  // identity-bound effect_succeeded primary outcome. effect_succeeded is the
+  // terminal primary outcome under target-v2; reconciliation is allowed only
+  // after effect_indeterminate and is never attempted on this success path.
   const primary = await appendPrimaryOutcome(
     deps,
     {
@@ -774,15 +881,19 @@ async function finalizeAfterReservation(input: {
         external_effect_reference: adapterResult.external_effect_reference,
         evidence_digest: adapterResult.evidence_digest,
         entry_digest: assessment.entry.policy_digest,
+        fusion_receipt_digest: fusion.receipt_digest,
+        fusion_evidence_digest: fusion.evidence_digest,
       },
       external_effect_reference: adapterResult.external_effect_reference,
     },
-    receipts
+    receipts,
+    outcomeChain
   );
 
   if (!primary.ok) {
-    // Outcome-recording uncertainty after a claimed adapter success: never report
-    // merged. Append indeterminate once and open the circuit. No replay.
+    // Outcome-recording uncertainty or receipt identity mismatch after a claimed
+    // adapter success: never report merged. Append indeterminate once and open
+    // the circuit. No replay and no reconciliation after success.
     const indeterminate = await appendPrimaryOutcome(
       deps,
       {
@@ -791,7 +902,8 @@ async function finalizeAfterReservation(input: {
         reason: 'outcome_write_failed_after_adapter_success',
         evidence: { prior_attempt: 'effect_succeeded' },
       },
-      receipts
+      receipts,
+      outcomeChain
     );
     await recordAction(
       deps,
@@ -804,19 +916,6 @@ async function finalizeAfterReservation(input: {
       adapterCalled: true,
       primaryOutcome: indeterminate.recorded ?? 'effect_indeterminate',
     });
-  }
-
-  try {
-    await deps.reconcile({
-      execution_id: permit.execution_id,
-      outcome: 'effect_reconciled_succeeded',
-      reason: 'qualified_merge_reconciled',
-      evidence: { entry_digest: assessment.entry.policy_digest },
-      external_effect_reference: adapterResult.external_effect_reference,
-    });
-  } catch {
-    // Reconciliation failure after a durable success does not un-merge the
-    // primary outcome; still report merged because effect_succeeded is recorded.
   }
 
   await recordAction(deps, evidence.record, 'merged', `adapter_accepted:${adapterResult.reason}`);
@@ -925,7 +1024,8 @@ export async function executeQualifiedMerge(
           reservation_event_digest: reservation.value.event_digest,
         },
       },
-      receipts
+      receipts,
+      { permit, reservation: reservation.value }
     );
     await recordAction(deps, record, 'circuit_open', `reservation_chain_invalid:${chainFailure}`);
     return closed(assessment, 'indeterminate', `reservation_chain_invalid:${chainFailure}`, {
