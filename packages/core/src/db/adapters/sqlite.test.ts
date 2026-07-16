@@ -1,5 +1,6 @@
 import { describe, test, expect, afterEach } from 'bun:test';
 import { SqliteAdapter } from './sqlite';
+import { Database } from 'bun:sqlite';
 import { unlinkSync } from 'fs';
 import { join } from 'path';
 
@@ -84,6 +85,59 @@ describe('SqliteAdapter', () => {
         'idx_supervisor_observations_incident',
         'idx_supervisor_repair_leases_expiry',
       ]);
+    });
+  });
+
+  describe('workflow run archive schema', () => {
+    const expectedArchiveColumns = ['archived_at', 'archived_by', 'archive_reason'];
+
+    test('creates archive columns in a fresh database', async () => {
+      db = createTestDb();
+
+      const columns = await db.query<{ name: string }>(
+        `SELECT name FROM pragma_table_info('remote_agent_workflow_runs')`
+      );
+      const names = new Set(columns.rows.map(column => column.name));
+
+      for (const column of expectedArchiveColumns) {
+        expect(names.has(column)).toBe(true);
+      }
+    });
+
+    test('adds archive columns to an existing workflow runs table', async () => {
+      currentDbPath = join(
+        import.meta.dir,
+        `.test-sqlite-adapter-${Date.now()}-${Math.random().toString(36).slice(2)}.db`
+      );
+      const legacy = new Database(currentDbPath);
+      legacy.run(`
+        CREATE TABLE remote_agent_workflow_runs (
+          id TEXT PRIMARY KEY,
+          conversation_id TEXT NOT NULL,
+          codebase_id TEXT,
+          workflow_name TEXT NOT NULL,
+          user_message TEXT NOT NULL,
+          status TEXT NOT NULL DEFAULT 'pending',
+          current_step_index INTEGER,
+          metadata TEXT DEFAULT '{}',
+          parent_conversation_id TEXT,
+          started_at TEXT DEFAULT (datetime('now')),
+          completed_at TEXT,
+          last_activity_at TEXT DEFAULT (datetime('now')),
+          working_path TEXT
+        )
+      `);
+      legacy.close();
+
+      db = new SqliteAdapter(currentDbPath);
+      const columns = await db.query<{ name: string }>(
+        `SELECT name FROM pragma_table_info('remote_agent_workflow_runs')`
+      );
+      const names = new Set(columns.rows.map(column => column.name));
+
+      for (const column of expectedArchiveColumns) {
+        expect(names.has(column)).toBe(true);
+      }
     });
   });
 
