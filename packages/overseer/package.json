@@ -17,6 +17,8 @@
     "./action-policy": "./src/action-policy.ts",
     "./authorized-escalation": "./src/authorized-escalation.ts",
     "./permit": "./src/permit.ts",
+    "./operator-card": "./src/operator-card.ts",
+    "./escalation-delivery": "./src/escalation-delivery.ts",
     "./adapters/fake-github": "./src/adapters/fake-github.ts"
   },
   "scripts": {

@@ -6,6 +6,7 @@ import {
 } from '@archon/core/db/overseer';
 import { appendOverseerCapabilityEvent } from '@archon/core/db/overseer-capabilities';
 import { runAuthorizedEscalation } from './authorized-escalation';
+import { runEscalation } from './escalate';
 import {
   createFakeGitHubAdapter,
   type FakeGitHubAdapter,
@@ -130,17 +131,53 @@ async function handleRecord(
     );
     return;
   }
+  if (record.errorClass === 'tail_node_false_fail') {
+    throw new Error('operator_card_non_actionable_error_class');
+  }
 
   const escalation = await runAuthorizedEscalation(record.runId, {
     permit: permitFromMetadata(record.metadata),
     actor,
   });
+  let operatorCardId: string | null = null;
+  if (escalation.accepted) {
+    if (!record.lastEvent?.id || !record.lastEvent.created_at) {
+      throw new Error('operator_card_source_event_identity_missing');
+    }
+    const card = await runEscalation(
+      record.runId,
+      record.decision,
+      {
+        ...(record.decision.escalationContext ?? {}),
+        errorClass: record.errorClass,
+        woId: record.woId,
+        repository: `${record.owner}/${record.repo}`,
+        branch: record.headBranch ?? null,
+        prUrl: record.prEvidence?.htmlUrl ?? null,
+        prNumber: record.prEvidence?.pr?.number ?? null,
+        checks: record.prEvidence?.checks ?? {},
+        mergeability:
+          record.prEvidence?.mergeable === null
+            ? 'unknown'
+            : String(record.prEvidence?.mergeable ?? 'unknown'),
+      },
+      {
+        sourceEventId: record.lastEvent.id,
+        eventType: record.lastEvent.event_type,
+        stepName: record.lastEvent.step_name ?? 'unknown',
+        eventCreatedAt: record.lastEvent.created_at,
+      }
+    );
+    operatorCardId = card.card_id;
+  }
   await deps.insertOverseerAction({
     runId: record.runId,
     woId: record.woId,
     class: record.errorClass,
     action: escalation.accepted ? 'fake_escalation_attempt' : 'escalation_denied',
-    result: escalation.reason,
+    result: operatorCardId
+      ? `${escalation.reason}:operator_card:${operatorCardId}`
+      : escalation.reason,
   });
   log.info(
     {

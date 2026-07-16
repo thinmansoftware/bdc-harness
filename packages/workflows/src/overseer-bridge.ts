@@ -26,6 +26,7 @@ import {
   decide,
   permitFromMetadata,
   runAuthorizedEscalation,
+  runEscalation,
   type Decision,
 } from '@archon/overseer';
 import type { WorkflowRun, NodeOutput } from './schemas/workflow-run.ts';
@@ -129,6 +130,8 @@ export async function handleNodeFailure(
     validatorOutput: ctx.validatorOutput,
     woId: ctx.woId,
   });
+  const sourceEventId = `${workflowRun.id}:node_failed:${node.id}:${attempt}`;
+  const sourceEventCreatedAt = new Date(workflowRun.started_at).toISOString();
 
   // Observability -- Mission Control "Workflow Decisions" tab will consume this when
   // persistence lands in v2. For v1 we only emit a structured log line.
@@ -159,6 +162,8 @@ export async function handleNodeFailure(
         error: ctx.errorMsg,
         overseer_class: errorClass,
         overseer_decision: result.decision,
+        overseer_source_event_id: sourceEventId,
+        overseer_source_event_created_at: sourceEventCreatedAt,
         ...(ctx.extraEventData ?? {}),
         // Layer 1 gate_result field (WO-HARNESS-LAYER1-CLIMB-AND-GATE-EVENTS-01).
         // Present only when Phase 5 cascade engine provides gateResult in ctx.
@@ -214,6 +219,26 @@ export async function handleNodeFailure(
           reason: escalation.reason,
         },
         'overseer.escalation_denied'
+      );
+    } else {
+      await runEscalation(
+        workflowRun.id,
+        result,
+        {
+          ...result.escalationContext,
+          errorClass,
+          woId: ctx.woId ?? 'unknown',
+          repository:
+            typeof workflowRun.metadata.targetRepo === 'string'
+              ? workflowRun.metadata.targetRepo
+              : 'bluedevilcollectibles/bdc-harness',
+        },
+        {
+          sourceEventId,
+          eventType: 'node_failed',
+          stepName: node.id,
+          eventCreatedAt: sourceEventCreatedAt,
+        }
       );
     }
   }

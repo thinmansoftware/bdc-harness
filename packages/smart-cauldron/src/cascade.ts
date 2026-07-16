@@ -28,8 +28,9 @@ import { judgeGate, classifyAttemptOutcome } from './judge.js';
 import { createRecord, writeRecord } from './recorder.js';
 import type { CreateCascadeRecordResult } from './recorder.js';
 import { cancelRun } from './cancel.js';
-import { classifyError } from '@archon/overseer/classify';
+import { classifyError, type ErrorClass } from '@archon/overseer/classify';
 import { runAuthorizedEscalation } from '@archon/overseer/authorized-escalation';
+import { runEscalation } from '@archon/overseer';
 import type { M31ActionPermit } from '@archon/overseer/m31-substrate';
 import type {
   CascadeRunRecord,
@@ -88,12 +89,15 @@ export interface SupervisorFailureResult {
 }
 
 export interface EscalationCallContext {
-  errorClass: string;
+  errorClass: ErrorClass;
   woId: string;
   reason: string;
   remediation?: string[];
   runId?: string | null;
   overseerPermit?: M31ActionPermit;
+  sourceEventId: string;
+  sourceEventCreatedAt: string;
+  repository: string;
 }
 
 export interface SpecRepairCallContext {
@@ -215,6 +219,18 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
 
   const cascadeId = dispatchId ?? randomUUID();
   const createdAt = new Date().toISOString();
+  let escalationSequence = 0;
+  const emitEscalation = async (
+    context: Omit<EscalationCallContext, 'sourceEventId' | 'sourceEventCreatedAt' | 'repository'>
+  ): Promise<void> => {
+    escalationSequence += 1;
+    await escalateImpl({
+      ...context,
+      sourceEventId: `${cascadeId}:escalation:${escalationSequence}`,
+      sourceEventCreatedAt: createdAt,
+      repository: project ?? 'bluedevilcollectibles/bdc-harness',
+    });
+  };
 
   // Dry-run: just log and return a stub record
   if (dryRun) {
@@ -378,7 +394,7 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
         // Mode Behavior Matrix row 4: no GitHub issue resolvable -> fall back to the
         // existing escalate/alert path with the spec-repair text in the payload.
         // The escalation must NEVER be silently dropped.
-        await escalateImpl({
+        await emitEscalation({
           errorClass: 'validator_rejected',
           woId,
           reason:
@@ -451,8 +467,8 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
         attempt.infraErrorReason = `lane preflight failed: ${reason}`;
         attempt.completedAt = new Date().toISOString();
         status = 'infra-alert';
-        await escalateImpl({
-          errorClass: 'configuration',
+        await emitEscalation({
+          errorClass: 'invalid_request',
           woId,
           reason: `Lane preflight failed on tier ${tier.name}: ${reason}`,
           overseerPermit: opts.overseerPermit,
@@ -511,7 +527,7 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
         }
       }
 
-      await escalateImpl({
+      await emitEscalation({
         errorClass,
         woId,
         reason: `Infra error on tier ${tier.name}: ${fireResult.infraError ?? 'unknown'}`,
@@ -580,7 +596,7 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
       attempt.infraErrorReason = `poll error: ${errMsg}`;
       attempt.completedAt = new Date().toISOString();
 
-      await escalateImpl({
+      await emitEscalation({
         errorClass: 'service_unavailable',
         woId,
         reason: `Poll timeout/error on tier ${tier.name}: ${errMsg}`,
@@ -706,10 +722,28 @@ function extractStatusCode(infraError: string): number | undefined {
  * Default escalation implementation using the shared persistent M-42 boundary.
  */
 async function defaultEscalate(ctx: EscalationCallContext): Promise<void> {
-  await runAuthorizedEscalation(ctx.runId ?? `cascade-${randomUUID()}`, {
+  const runId = ctx.runId ?? `cascade-${ctx.sourceEventId}`;
+  const authorization = await runAuthorizedEscalation(runId, {
     permit: ctx.overseerPermit ?? null,
     actor: 'smart-cauldron',
   });
+  if (!authorization.accepted) return;
+  await runEscalation(
+    runId,
+    { decision: 'escalate', reason: ctx.reason },
+    {
+      errorClass: ctx.errorClass,
+      woId: ctx.woId,
+      repository: ctx.repository,
+      remediation: ctx.remediation,
+    },
+    {
+      sourceEventId: ctx.sourceEventId,
+      eventType: 'cascade_escalation',
+      stepName: 'smart-cauldron',
+      eventCreatedAt: ctx.sourceEventCreatedAt,
+    }
+  );
 }
 
 /**

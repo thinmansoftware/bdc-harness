@@ -12,17 +12,17 @@
  *   1. classify implement_loop_no_output (stderr alone, no validator context)
  *   2. classify validator_feedback_not_applied (stderr + validator action verbs)
  *   3. classify validator_rejected (validator stdout begins with REJECT)
- *   4. runEscalation side-effects integration (escalation.json + webhook + Notion)
+ *   4. runEscalation durable-card integration (card + three channel jobs)
  *   5. end-to-end: WO-AUTH-SINGLE-PATH-E2E-04 incident replay through decide+escalate
  */
 
 import { describe, test, expect, beforeEach, afterEach, spyOn, mock } from 'bun:test';
-import { mkdtemp, rm, readFile } from 'node:fs/promises';
+import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { classifyError, decide } from '../src/index.ts';
 import { runEscalation } from '../src/escalate.ts';
-import { closeDatabase, resetDatabase } from '@archon/core/db';
+import { closeDatabase, getOperatorCard, resetDatabase } from '@archon/core/db';
 import type { EscalationContext } from '../src/escalate.ts';
 
 // --- Test 1 -- implement_loop_no_output classification ------------------------
@@ -139,9 +139,9 @@ describe('classify: validator_rejected', () => {
   });
 });
 
-// --- Test 4 -- escalation side effects integration ----------------------------
+// --- Test 4 -- durable escalation-card integration ----------------------------
 
-describe('runEscalation: side effects', () => {
+describe('runEscalation: durable operator card', () => {
   let tmpHome: string;
   const originalArchonHome = process.env.ARCHON_HOME;
   const originalNotionKey = process.env.NOTION_API_KEY;
@@ -181,7 +181,7 @@ describe('runEscalation: side effects', () => {
     await rm(tmpHome, { recursive: true, force: true });
   });
 
-  test('runEscalation writes escalation.json AND fires builder-monitor webhook', async () => {
+  test('runEscalation preserves diagnostics and queues all three channel jobs', async () => {
     const runId = 'test-run-123';
     const context: EscalationContext = {
       errorClass: 'validator_feedback_not_applied',
@@ -190,42 +190,34 @@ describe('runEscalation: side effects', () => {
       validatorOutput: 'Add lspro_token to scenario 6b',
       remediation: ['Add lspro_token to scenario 6b'],
     };
-    await runEscalation(
+    const card = await runEscalation(
       runId,
       {
         decision: 'escalate',
         reason: 'test reason',
         escalationContext: context,
       },
-      context
+      context,
+      {
+        sourceEventId: 'event-test-run-123',
+        eventType: 'node_failed',
+        stepName: 'commit-and-push',
+        eventCreatedAt: '2026-07-16T08:00:00.000Z',
+      }
     );
-
-    // 1. escalation.json on disk
-    const jsonPath = join(tmpHome, 'runs', runId, 'escalation.json');
-    const fileBody = await readFile(jsonPath, 'utf8');
-    const parsed = JSON.parse(fileBody);
-    expect(parsed.runId).toBe(runId);
-    expect(parsed.context.errorClass).toBe('validator_feedback_not_applied');
-    expect(parsed.context.woId).toBe('WO-FOO-01');
-    expect(parsed.decision.reason).toBe('test reason');
-    expect(typeof parsed.timestamp).toBe('string');
-
-    // 2. builder-monitor webhook fired with action=needs_human
-    const webhookCall = fetchSpy.mock.calls.find(call =>
-      String(call[0]).includes('builder-monitor')
-    );
-    expect(webhookCall).toBeDefined();
-    const init = webhookCall![1] as RequestInit;
-    expect(init.method).toBe('POST');
-    const body = JSON.parse(String(init.body));
-    expect(body.action).toBe('needs_human');
-    expect(body.wo_id).toBe('WO-FOO-01');
-    expect(body.builder).toBe('Cauldron');
-    expect(typeof body.detail).toBe('string');
-    expect(body.detail).toContain('validator_feedback_not_applied');
+    const view = await getOperatorCard(card.card_id);
+    expect(view?.card.run_id).toBe(runId);
+    expect(view?.card.wo_id).toBe('WO-FOO-01');
+    expect(view?.card.mechanical_evidence.validator_output).toContain('lspro_token');
+    expect(view?.jobs.map(job => job.channel).sort()).toEqual([
+      'builder_monitor',
+      'dispatch',
+      'notion',
+    ]);
+    expect(fetchSpy).toHaveBeenCalledTimes(0);
   });
 
-  test('runEscalation skips Notion gracefully when NOTION_API_KEY is missing (other 2 signals still fire)', async () => {
+  test('runEscalation queues Notion without contacting it when credentials are absent', async () => {
     delete process.env.NOTION_API_KEY;
     const runId = 'test-run-no-notion';
     const context: EscalationContext = {
@@ -233,18 +225,21 @@ describe('runEscalation: side effects', () => {
       nodeId: 'commit-and-push',
       woId: 'WO-FOO-02',
     };
-    await runEscalation(
+    const card = await runEscalation(
       runId,
       { decision: 'escalate', reason: 'no work produced', escalationContext: context },
-      context
+      context,
+      {
+        sourceEventId: 'event-test-run-no-notion',
+        eventType: 'node_failed',
+        stepName: 'commit-and-push',
+        eventCreatedAt: '2026-07-16T08:01:00.000Z',
+      }
     );
-    // escalation.json still written
-    const jsonPath = join(tmpHome, 'runs', runId, 'escalation.json');
-    const body = await readFile(jsonPath, 'utf8');
-    expect(body).toContain('implement_loop_no_output');
-    // No Notion call recorded
-    const notionCall = fetchSpy.mock.calls.find(call => String(call[0]).includes('api.notion.com'));
-    expect(notionCall).toBeUndefined();
+    const view = await getOperatorCard(card.card_id);
+    expect(view?.card.canonical_event_identity.error_class).toBe('implement_loop_no_output');
+    expect(view?.delivery_summary.notion.state).toBe('pending');
+    expect(fetchSpy).toHaveBeenCalledTimes(0);
   });
 });
 
@@ -283,7 +278,7 @@ describe('end-to-end: WO-AUTH-SINGLE-PATH-E2E-04 incident replay', () => {
     await rm(tmpHome, { recursive: true, force: true });
   });
 
-  test('commit-and-push stderr + validator remediation feedback => escalation fires with full context', async () => {
+  test('commit-and-push stderr + validator remediation feedback yields a complete durable card', async () => {
     // Replay the WO-AUTH-SINGLE-PATH-E2E-04 anchor incident: commit-and-push exit 1
     // with the "implement loop did not produce work" stderr, and war-council-validator
     // had emitted a specific 2-item remediation list that the agent never applied.
@@ -319,35 +314,23 @@ describe('end-to-end: WO-AUTH-SINGLE-PATH-E2E-04 incident replay', () => {
 
     // Step 3: escalate
     const runId = 'e2e-incident-run';
-    await runEscalation(runId, decision, decision.escalationContext!);
+    const card = await runEscalation(runId, decision, decision.escalationContext!, {
+      sourceEventId: 'event-e2e-incident-run',
+      eventType: 'node_failed',
+      stepName: 'commit-and-push',
+      eventCreatedAt: '2026-07-16T08:02:00.000Z',
+    });
 
-    // Step 4: verify all 3 operator-visible signals
-    // (a) escalation.json on disk
-    const jsonPath = join(tmpHome, 'runs', runId, 'escalation.json');
-    const fileBody = await readFile(jsonPath, 'utf8');
-    const parsed = JSON.parse(fileBody);
-    expect(parsed.context.errorClass).toBe('validator_feedback_not_applied');
-    expect(parsed.context.woId).toBe('WO-AUTH-SINGLE-PATH-E2E-04');
-    expect(parsed.context.remediation).toEqual([
+    // Step 4: verify the full incident evidence is durable and queued once.
+    const view = await getOperatorCard(card.card_id);
+    expect(view?.card.canonical_event_identity.error_class).toBe('validator_feedback_not_applied');
+    expect(view?.card.wo_id).toBe('WO-AUTH-SINGLE-PATH-E2E-04');
+    expect(view?.card.proposed_remediation.steps).toEqual([
       "Add lspro_token to scenario 6b's addInitScript (currently causes redirect to /login)",
       'PR body must include the local run command per stop condition 5',
     ]);
-
-    // (b) builder-monitor webhook
-    const webhookCalls = fetchSpy.mock.calls.filter(call =>
-      String(call[0]).includes('builder-monitor')
-    );
-    expect(webhookCalls.length).toBe(1);
-    const init = webhookCalls[0][1] as RequestInit;
-    const body = JSON.parse(String(init.body));
-    expect(body.action).toBe('needs_human');
-    expect(body.wo_id).toBe('WO-AUTH-SINGLE-PATH-E2E-04');
-
-    // (c) Notion call skipped gracefully (no NOTION_API_KEY in this test)
-    const notionCalls = fetchSpy.mock.calls.filter(call =>
-      String(call[0]).includes('api.notion.com')
-    );
-    expect(notionCalls.length).toBe(0);
+    expect(view?.jobs).toHaveLength(3);
+    expect(fetchSpy).toHaveBeenCalledTimes(0);
   });
 });
 
