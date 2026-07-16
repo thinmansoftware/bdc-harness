@@ -10,6 +10,8 @@ import {
   type AgentConfig,
 } from './adapters';
 import { resolveOperatorToken } from './credentials';
+import { acquireInstanceLock, type InstanceLockHandle } from './instance-lock';
+import { createWorkerLog, type WorkerLog } from './worker-log';
 
 type DispatchTaskType =
   | 'agent_message'
@@ -69,6 +71,14 @@ type NormalizedWorkerConfig = Required<
 interface WorkerState {
   stopping: boolean;
   activeByAgent: Map<string, number>;
+}
+
+function defaultLockFile(workerId: string): string {
+  return join(homedir(), '.config', 'bdc', `dispatch-worker-${workerId}.lock`);
+}
+
+function defaultLogFile(workerId: string): string {
+  return join(homedir(), '.config', 'bdc', 'logs', `dispatch-worker-${workerId}.log`);
 }
 
 function parseArgs(): string {
@@ -250,6 +260,7 @@ async function processMessage(
   token: string,
   state: WorkerState,
   queued: DispatchMessage,
+  log: WorkerLog,
   deliveryPrincipal?: string
 ): Promise<void> {
   const agent = deliveryPrincipal ?? queued.resolved_recipient ?? queued.recipient;
@@ -287,7 +298,7 @@ async function processMessage(
       }),
     });
   } catch (error) {
-    console.error(`dispatch-worker failed message ${queued.id}:`, error);
+    await log.error(`dispatch-worker failed message ${queued.id}`, error);
   } finally {
     state.activeByAgent.set(agent, Math.max(0, (state.activeByAgent.get(agent) ?? 1) - 1));
   }
@@ -296,7 +307,8 @@ async function processMessage(
 async function poll(
   config: NormalizedWorkerConfig,
   token: string,
-  state: WorkerState
+  state: WorkerState,
+  log: WorkerLog
 ): Promise<void> {
   for (const recipient of Object.keys(config.agents)) {
     const headers = config.board_delivery.allowed_principals.includes(recipient)
@@ -310,7 +322,7 @@ async function poll(
     );
     for (const message of messages) {
       if (state.stopping) return;
-      void processMessage(config, token, state, message, recipient);
+      void processMessage(config, token, state, message, log, recipient);
     }
   }
 }
@@ -337,6 +349,19 @@ function boardDeliveryHeaders(
 
 async function main(): Promise<void> {
   const config = await readConfig(parseArgs());
+  const log = createWorkerLog({ file: defaultLogFile(config.worker_id) });
+
+  let lock: InstanceLockHandle;
+  try {
+    lock = await acquireInstanceLock({ lockFile: defaultLockFile(config.worker_id) });
+  } catch (error) {
+    await log.error('startup refused: another instance appears to be running', error);
+    console.error(String(error));
+    process.exit(1);
+    return;
+  }
+  await log.info(`startup: acquired instance lock for worker_id=${config.worker_id}`);
+
   const token = await resolveOperatorToken({
     envName: config.operator_token_env,
     tokenFile: config.operator_token_file,
@@ -350,19 +375,26 @@ async function main(): Promise<void> {
   process.on('SIGTERM', stop);
 
   await register(config, token);
+  await log.info('registered with drop-box server');
   const heartbeatTimer = setInterval(() => {
     if (!state.stopping)
       void heartbeat(config, token).catch(error => {
-        console.error(error);
+        void log.error('heartbeat failed', error);
       });
   }, config.heartbeat_interval_ms);
   heartbeatTimer.unref?.();
 
-  while (!state.stopping) {
-    await poll(config, token, state).catch(error => {
-      console.error(error);
-    });
-    await Bun.sleep(config.poll_interval_ms);
+  try {
+    while (!state.stopping) {
+      await poll(config, token, state, log).catch(error => {
+        void log.error('poll failed', error);
+      });
+      await Bun.sleep(config.poll_interval_ms);
+    }
+  } finally {
+    clearInterval(heartbeatTimer);
+    await log.info('shutting down: releasing instance lock');
+    await lock.release();
   }
 }
 
