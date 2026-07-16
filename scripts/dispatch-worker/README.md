@@ -67,3 +67,34 @@ probe, then claim and complete a staging-only fixture before disabling the old c
 
 On clean shutdown, the worker stops heartbeats and lets any in-flight leases lapse; v1 has no
 release endpoint.
+
+## Reboot-recovery hardening (M-51 AMEND-9)
+
+The worker enforces single-instance-per-worker-id via a local PID lockfile at
+`~/.config/bdc/dispatch-worker-<worker_id>.lock` (see `instance-lock.ts` for the design rationale
+-- a local PID check rather than a check against the drop-box server's own registration/heartbeat
+state, because the server heartbeat row can look "fresh" for up to `heartbeat_interval_ms` after a
+worker has actually crashed). On startup, if the lock is held by another live PID the worker
+refuses to start and exits non-zero rather than risk double-claiming dispatch messages. A lock left
+by a dead PID is automatically reclaimed by the next start -- no manual cleanup required.
+
+Diagnostics are written to a size-rotating log file at
+`~/.config/bdc/logs/dispatch-worker-<worker_id>.log` (see `worker-log.ts`), 5 MB per file, 5
+rotated files retained. Before this change the Scheduled Task ran with a hidden window and no
+output redirection, so a crash left no trail at all.
+
+The Scheduled Task registered by `install-windows.ps1` restarts on failure up to 5 times, 1 minute
+apart (bounded, not an infinite tight loop), and force-terminates a hung instance after 1 day
+(`ExecutionTimeLimit`) so a wedged process cannot occupy the single-instance slot indefinitely.
+
+`verify-reboot-recovery.ts` simulates the failure modes closest to an unclean worker death without
+touching the real Scheduled Task, the real drop-box server, or rebooting the host: it proves (a) a
+second concurrently-running instance is refused, and (b) a fresh instance can reclaim the lock
+after the lock-holding process is killed. It does **not** and cannot prove that a real Windows
+reboot fires `\BlueDevil-Dispatch-Worker` cleanly, that Task Scheduler's restart-on-failure setting
+actually engages against the real task, or that the SSH tunnel in `start-windows.ps1`
+re-establishes after a cold boot -- those require a live pass from the operator desktop. Run with:
+
+```bash
+bun run scripts/dispatch-worker/verify-reboot-recovery.ts
+```
