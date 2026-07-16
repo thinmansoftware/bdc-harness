@@ -8,17 +8,21 @@ import {
   runIntegratedSuccessChain,
   type ScenarioDeps,
   type ScenarioId,
-} from '../integration-scenarios.ts';
+} from '../integration-scenarios';
+import { createRealCallTracker } from '../integration-fixtures';
 
 function makeDeps(overrides: Partial<ScenarioDeps> = {}): ScenarioDeps {
+  const tracker = createRealCallTracker();
   let realCalls = 0;
   return {
     adapter_mode: 'fake',
+    call_tracker: tracker,
     real_provider_call: () => {
       realCalls += 1;
+      tracker.recordRealCall('test_real_provider');
       throw new Error('real_provider_forbidden');
     },
-    getRealCallCount: () => realCalls,
+    getRealCallCount: () => realCalls + tracker.getRealCallCount(),
     ...overrides,
   };
 }
@@ -117,7 +121,10 @@ describe('integrated success chain', () => {
     expect(result.ok).toBe(true);
     expect(result.real_call_count).toBe(0);
     expect(result.receipts).toHaveLength(4);
-    for (const receipt of result.receipts) {
+    const expectedCaps = ['repair', 'branch', 'lifecycle', 'merge'];
+    for (let i = 0; i < result.receipts.length; i++) {
+      const receipt = result.receipts[i]!;
+      expect(receipt.capability).toBe(expectedCaps[i]);
       expect(receipt.proposal).toBeTruthy();
       expect(receipt.permit_issued).toBe(true);
       expect(receipt.gate).toBe('allowed');
@@ -125,6 +132,10 @@ describe('integrated success chain', () => {
       expect(receipt.primary_outcome).toBe('effect_succeeded');
       expect(receipt.card_id).toBeTruthy();
       expect(receipt.replay).toBe(false);
+      expect(receipt.ordered_calls.length).toBeGreaterThan(0);
+      expect(receipt.ordered_calls.some(c => c.includes('prepare'))).toBe(true);
+      expect(receipt.ordered_calls.some(c => c.includes('reserve'))).toBe(true);
+      expect(receipt.ordered_calls.some(c => c.includes('adapter'))).toBe(true);
     }
   });
 });

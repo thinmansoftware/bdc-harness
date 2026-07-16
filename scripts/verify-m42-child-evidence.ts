@@ -46,6 +46,8 @@ export const S8_OWNED_PATH_PREFIXES = [
   'scripts/staging/staging-m42-up.ps1',
   'scripts/staging/staging-overseer-integration.ps1',
   'scripts/staging/staging-m42-up.contract.test.ts',
+  'packages/overseer/src/m42-integration-runner.ts',
+  'packages/overseer/src/integration-fixtures.ts',
   'docker-compose.m42-staging.yml',
 ] as const;
 

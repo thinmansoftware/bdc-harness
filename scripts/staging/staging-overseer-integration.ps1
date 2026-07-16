@@ -71,16 +71,33 @@ $Docker = Get-DockerCli
 $sha = (git -C $RepoRoot rev-parse --verify "$Ref^{commit}").Trim()
 if (-not $sha) { Write-Error "cannot resolve ref $Ref"; exit 1 }
 
-if (-not (Test-Path $OutputPath)) {
-  New-Item -ItemType Directory -Force -Path $OutputPath | Out-Null
-}
-
-$resolvedOutputPath = [System.IO.Path]::GetFullPath((Resolve-Path $OutputPath).Path)
+# Canonical output path only. Reject traversal, prefix tricks, and non-canonical forms.
 $expectedOutputPath = [System.IO.Path]::GetFullPath((Join-Path $RepoRoot "artifacts\overseer\m42-wave2"))
-if ($resolvedOutputPath -ne $expectedOutputPath) {
-  Write-Error "output_path_rejected: expected $expectedOutputPath"
+$rawOutputFull = if ([System.IO.Path]::IsPathRooted($OutputPath)) {
+  $OutputPath
+} else {
+  Join-Path $RepoRoot $OutputPath
+}
+# Reject parent-directory segments before resolution.
+if ($OutputPath -match '\.\.') {
+  Write-Error "output_path_rejected: parent traversal not allowed"
   exit 1
 }
+if (-not (Test-Path $rawOutputFull)) {
+  New-Item -ItemType Directory -Force -Path $rawOutputFull | Out-Null
+}
+# Reject symlink / reparse-point targets that could escape the canonical path.
+$item = Get-Item -LiteralPath $rawOutputFull -Force
+if ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+  Write-Error "output_path_rejected: symlink/reparse points not allowed"
+  exit 1
+}
+$resolvedOutputPath = [System.IO.Path]::GetFullPath($item.FullName)
+if ($resolvedOutputPath -ne $expectedOutputPath) {
+  Write-Error "output_path_rejected: expected $expectedOutputPath got $resolvedOutputPath"
+  exit 1
+}
+$OutputPath = $resolvedOutputPath
 
 $hostName = $env:COMPUTERNAME
 if ($hostName -ne 'ASUS-ROG-DSK-2T') {
@@ -253,57 +270,25 @@ if ($state -eq "running") {
 }
 
 # ---------------------------------------------------------------------------
-# Path-safe scenario runner: bun -e from RepoRoot (imports resolve correctly).
-# Never writes temp module files under the OS temp directory with relative imports.
+# In-container integration runner against the exact candidate image.
+# Host working-tree bun -e does NOT count as candidate proof.
+# Real-call count is observed by the fake adapter boundary inside the image.
 # ---------------------------------------------------------------------------
-function Invoke-BunFromRepoRoot {
-  param(
-    [Parameter(Mandatory = $true)]
-    [string]$Expression
-  )
-  Push-Location $RepoRoot
-  try {
-    $prev = $ErrorActionPreference
-    $ErrorActionPreference = "Continue"
-    $output = & bun -e $Expression 2>&1
-    $code = $LASTEXITCODE
-    $ErrorActionPreference = $prev
-    return [pscustomobject]@{ ExitCode = $code; Output = ($output | Out-String) }
-  } finally {
-    Pop-Location
+function Invoke-M42IntegrationRunnerInContainer {
+  if ($state -ne "running") {
+    Write-Error "integration_runner_requires_running_container"
+    exit 1
   }
+  $prev = $ErrorActionPreference
+  $ErrorActionPreference = "Continue"
+  # Production Dockerfile copies packages/overseer into the candidate image.
+  $output = & $Docker exec archon-m42-staging bun run /app/packages/overseer/src/m42-integration-runner.ts 2>&1
+  $code = $LASTEXITCODE
+  $ErrorActionPreference = $prev
+  return [pscustomobject]@{ ExitCode = $code; Output = ($output | Out-String) }
 }
 
-$scenarioExpr = @'
-import {
-  runOverseerAdversarialMatrix,
-  runIntegratedSuccessChain,
-  assertOverseerDefaultOff,
-} from "./packages/overseer/src/integration-scenarios.ts";
-
-const deps = { adapter_mode: "fake", getRealCallCount: () => 0 };
-const chain = await runIntegratedSuccessChain(deps);
-const matrix = await runOverseerAdversarialMatrix(deps);
-const def = assertOverseerDefaultOff({
-  capabilities: { escalation: false, repair: false, branch: false, lifecycle: false, merge: false },
-  emergency_stop: true,
-  circuits: { escalation: "closed", repair: "closed", branch: "closed", lifecycle: "closed", merge: "closed" },
-});
-if (!chain.ok || !matrix.ok || !def.ok) {
-  console.error(JSON.stringify({ chain, matrix, def }, null, 2));
-  process.exit(1);
-}
-const receipt_count = chain.receipts.length + matrix.results.filter(r => r.scenario_id === "success").length;
-process.stdout.write(JSON.stringify({
-  receipt_count,
-  real_call_count: chain.real_call_count + matrix.real_call_count,
-  disabled_capabilities: def.disabled_capabilities,
-  emergency_stop: true,
-  adapter_mode: "fake",
-}));
-'@
-
-$scenarioRun = Invoke-BunFromRepoRoot -Expression $scenarioExpr
+$scenarioRun = Invoke-M42IntegrationRunnerInContainer
 if ($scenarioRun.ExitCode -ne 0) {
   Write-Error "scenario runner failed: $($scenarioRun.Output)"
   exit 1
@@ -314,8 +299,16 @@ if (-not $scenarioLine) {
   exit 1
 }
 $scenario = $scenarioLine | ConvertFrom-Json
+if ($null -eq $scenario.real_call_count) {
+  Write-Error "scenario_receipt_missing_real_call_count"
+  exit 1
+}
 if ([int]$scenario.real_call_count -ne 0) {
-  Write-Error "real_call_count must be 0"
+  Write-Error "real_call_count must be 0 (observed by container fake boundary)"
+  exit 1
+}
+if ([string]$scenario.adapter_mode -ne "fake") {
+  Write-Error "scenario_adapter_mode_not_fake"
   exit 1
 }
 
@@ -328,12 +321,21 @@ if ($deployed -ne $sha) {
   exit 1
 }
 
-# Proof fields derived from live health (when container running).
+# Proof fields derived from live health only -- no fabricated emergency_stop/default true.
+if (-not $liveHealth -and -not $InjectHealthFailure) {
+  Write-Error "health_gate_failed: live overseer health required for staging proof"
+  exit 1
+}
 $proofWatcherCount = if ($liveHealth) { [int]$liveHealth.watcher_count } else { 0 }
 $proofAdapterMode  = if ($liveHealth) { [string]$liveHealth.adapter_mode } else { "none" }
-$proofEmergency    = if ($liveHealth) { [bool]$liveHealth.emergency_stop } else { $true }
-$proofDisabled     = if ($liveHealth) { @($liveHealth.disabled_capabilities) } else { @($scenario.disabled_capabilities | Sort-Object) }
-$proofCircuits     = if ($liveHealth) { $liveHealth.circuits } else { @{} }
+# Fail closed: never invent emergency_stop=true when health is unavailable.
+if ($liveHealth) {
+  $proofEmergency = [bool]$liveHealth.emergency_stop
+} else {
+  Write-Error "health_gate_failed: emergency_stop unknown without live health"
+  exit 1
+}
+$proofDisabled = if ($liveHealth) { @($liveHealth.disabled_capabilities) } else { @() }
 
 $proof = [ordered]@{
   schema_version           = "m42-staging-proof-v1"
@@ -372,51 +374,11 @@ function Test-ChildEvidenceSatisfiedForPackets {
   return $false
 }
 
+# Packets require READY parent manifest + real prior SHA + real verifier digest
+# + completed staging/rollback proofs. No zero-SHA or zero-digest placeholders.
 if ((Test-ChildEvidenceSatisfiedForPackets) -and $digest -and $liveHealth) {
-  $priorForPacket = $RollbackTo
-  if (-not $priorForPacket -and (Test-Path $PriorMarker)) {
-    $priorForPacket = (Get-Content $PriorMarker -Raw).Trim()
-  }
-  if (-not $priorForPacket) { $priorForPacket = "0" * 40 }
-
-  $packetExpr = @"
-import {
-  buildUnsignedSandboxProofRequest,
-  buildUnsignedActivationRequest,
-  writeNonGovernanceActivationArtifacts,
-} from "./packages/overseer/src/activation-package.ts";
-const out = process.env.M42_PACKET_OUT;
-if (!out) { console.error("M42_PACKET_OUT missing"); process.exit(1); }
-const input = {
-  candidate_sha: "$sha",
-  image_digest: "$digest",
-  capabilities: { escalation: false, repair: false, branch: false, lifecycle: false, merge: false },
-  emergency_stop: true,
-  allowlists: { repositories: ["bluedevilcollectibles/bdc-harness"], adapters: ["fake"] },
-  rollback: { prior_staging_sha: "$($priorForPacket -replace '"','')", evidence_retained: true },
-  health: { watcher_count: $($liveHealth.watcher_count), adapter_mode: "$($liveHealth.adapter_mode)" },
-  numerical_caps: { max_factory_commitments: 10, max_fusion_usd: 0 },
-  verifier_registry_digest: "0".repeat(64),
-  missing_gate2_approvals: ["sandbox_spend_motion", "fusion_calibration"],
-  missing_gate3_approvals: ["deploy_activation_motion"],
-  operator_notice: "Build-only candidate; no live operator authority.",
-};
-const sandbox = buildUnsignedSandboxProofRequest(input);
-const deploy = buildUnsignedActivationRequest(input);
-writeNonGovernanceActivationArtifacts(
-  { sandbox_proof_request: sandbox, deploy_activation_request: deploy },
-  out
-);
-console.log("PACKETS=written");
-"@
-  $env:M42_PACKET_OUT = (Resolve-Path $OutputPath).Path
-  $packetRun = Invoke-BunFromRepoRoot -Expression $packetExpr
-  Remove-Item Env:M42_PACKET_OUT -ErrorAction SilentlyContinue
-  if ($packetRun.ExitCode -ne 0) {
-    Write-Error "packet write failed: $($packetRun.Output)"
-    exit 1
-  }
-  Write-Host "[m42-integration] $($packetRun.Output.Trim())"
+  Write-Host "[m42-integration] parent READY but in-container packet writer is gated on complete rollback_proof + non-zero verifier registry; skipping host packet fabrication"
+  Write-Host "[m42-integration] unsigned packets not written (require READY+staging+rollback evidence; no placeholder digests)"
 } else {
   Write-Host "[m42-integration] unsigned packets not written (staging/review gate closed)"
 }
@@ -509,13 +471,23 @@ if ($InjectHealthFailure) {
     Write-Error "rollback_image_mismatch: active=$restoredImageDigest retained=$($priorMetaObj.prior_image_digest)"
     exit 1
   }
-  # Candidate is not running as candidate: active_sha is prior, prior image restored.
-  $candidateStillRunning = $false
   if ($containerRunning -and $activeSha -eq $sha) {
-    $candidateStillRunning = $true
-  }
-  if ($candidateStillRunning) {
     Write-Error "rollback_candidate_still_active"
+    exit 1
+  }
+
+  # Derive evidence_retained from actual retained artifacts -- never hardcode true.
+  $priorImageStillPresent = $false
+  $priorImgCheck = (& $Docker image inspect -f "{{.Id}}" $PriorImageTag 2>$null)
+  if ($priorImgCheck) { $priorImageStillPresent = $true }
+  $evidenceRetained = (
+    (Test-Path $PriorMeta) -and
+    (Test-Path $PriorMarker) -and
+    $priorImageStillPresent -and
+    ($restoredImageDigest -eq [string]$priorMetaObj.prior_image_digest)
+  )
+  if (-not $evidenceRetained) {
+    Write-Error "rollback_evidence_not_retained"
     exit 1
   }
 
@@ -526,7 +498,7 @@ if ($InjectHealthFailure) {
     rollback_status     = "restored"
     active_sha          = $activeSha
     candidate_running   = $false
-    evidence_retained   = $true
+    evidence_retained   = [bool]$evidenceRetained
   }
 
   $rbPath = Join-Path $OutputPath "rollback-proof.json"

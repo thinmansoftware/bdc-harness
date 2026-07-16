@@ -22,6 +22,7 @@
     "./adapters/fake-github": "./src/adapters/fake-github.ts",
     "./integration-manifest": "./src/integration-manifest.ts",
     "./integration-scenarios": "./src/integration-scenarios.ts",
+    "./integration-fixtures": "./src/integration-fixtures.ts",
     "./activation-package": "./src/activation-package.ts",
     "./control-plane": "./src/control-plane.ts"
   },

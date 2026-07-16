@@ -145,4 +145,42 @@ describe('scan-changed-secrets', () => {
     const keys = new Set(findings.map(f => `${f.path}:${f.line}:${f.pattern_id}`));
     expect(keys.size).toBe(findings.length);
   });
+
+  test('dirty working tree cannot hide or create a finding for immutable head content', async () => {
+    const cleanHeadContent = 'export const safe = true;\n';
+    const dirtyWorktreeContent = 'export const leak = "gh' + 'p_' + 'Z'.repeat(40) + '";\n';
+
+    // Simulated default path: reader always returns head blob, never worktree.
+    const headReads: string[] = [];
+    const result = await scanChangedSecrets(
+      { base: 'base', head: 'headsha' },
+      {
+        listChangedPaths: async () => ['packages/app/src/safe.ts'],
+        readFileContent: async (path, head) => {
+          headReads.push(`${head ?? 'missing'}:${path}`);
+          // Even if a dirty worktree would contain a secret, head content is clean.
+          void dirtyWorktreeContent;
+          return cleanHeadContent;
+        },
+      }
+    );
+    expect(result.findings).toHaveLength(0);
+    expect(result.summary_line).toBe('SECRET_SCAN=clean');
+    expect(headReads).toEqual(['headsha:packages/app/src/safe.ts']);
+
+    // Conversely: head has a secret; worktree is clean. Finding must still fire.
+    const githubClassic = 'gh' + 'p_' + 'Y'.repeat(40);
+    const dirtyResult = await scanChangedSecrets(
+      { base: 'base', head: 'headsha2' },
+      {
+        listChangedPaths: async () => ['packages/app/src/leaky.ts'],
+        readFileContent: async (_path, head) => {
+          expect(head).toBe('headsha2');
+          return `token=${githubClassic}\n`;
+        },
+      }
+    );
+    expect(dirtyResult.findings.length).toBeGreaterThan(0);
+    expect(formatScanFindings(dirtyResult.findings)).not.toContain(githubClassic);
+  });
 });

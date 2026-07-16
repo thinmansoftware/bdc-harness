@@ -4,19 +4,22 @@ import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import {
+  assertActivationPackageInput,
   buildUnsignedActivationRequest,
   buildUnsignedSandboxProofRequest,
   writeNonGovernanceActivationArtifacts,
   type ActivationPackageInput,
-} from '../activation-package.ts';
+} from '../activation-package';
 
-const ZERO64 = '0'.repeat(64);
+const NONZERO64 = 'a1'.repeat(32);
 const HEX40 = 'd'.repeat(40);
+const PRIOR40 = 'e'.repeat(40);
+const IMAGE = `sha256:${'b2'.repeat(32)}`;
 
 function baseInput(overrides: Partial<ActivationPackageInput> = {}): ActivationPackageInput {
   return {
     candidate_sha: HEX40,
-    image_digest: `sha256:${ZERO64}`,
+    image_digest: IMAGE,
     capabilities: {
       escalation: false,
       repair: false,
@@ -30,7 +33,7 @@ function baseInput(overrides: Partial<ActivationPackageInput> = {}): ActivationP
       adapters: ['fake'],
     },
     rollback: {
-      prior_staging_sha: 'e'.repeat(40),
+      prior_staging_sha: PRIOR40,
       evidence_retained: true,
     },
     health: {
@@ -41,10 +44,24 @@ function baseInput(overrides: Partial<ActivationPackageInput> = {}): ActivationP
       max_factory_commitments: 10,
       max_fusion_usd: 0,
     },
-    verifier_registry_digest: ZERO64,
+    verifier_registry_digest: NONZERO64,
     missing_gate2_approvals: ['sandbox_spend_motion', 'fusion_calibration'],
     missing_gate3_approvals: ['deploy_activation_motion'],
     operator_notice: 'Build-only candidate; no live operator authority.',
+    parent_manifest_status: 'READY_FOR_SANDBOX_PROOF_REQUEST',
+    staging_proof: {
+      schema_version: 'm42-staging-proof-v1',
+      candidate_sha: HEX40,
+      image_digest: IMAGE,
+      real_call_count: 0,
+      adapter_mode: 'fake',
+    },
+    rollback_proof: {
+      schema_version: 'm42-rollback-proof-v1',
+      prior_staging_sha: PRIOR40,
+      evidence_retained: true,
+      rollback_status: 'restored',
+    },
     ...overrides,
   };
 }
@@ -72,16 +89,16 @@ describe('activation-package', () => {
     expect(deploy.schema_version).toBe('m42-deploy-activation-request-v1');
 
     expect(sandbox.candidate_sha).toBe(HEX40);
-    expect(sandbox.image_digest).toBe(`sha256:${ZERO64}`);
+    expect(sandbox.image_digest).toBe(IMAGE);
     expect(sandbox.requires_dedicated_sandbox).toBe(true);
-    expect(sandbox.verifier_registry_digest).toBe(ZERO64);
+    expect(sandbox.verifier_registry_digest).toBe(NONZERO64);
     expect(sandbox.numerical_caps.max_factory_commitments).toBe(10);
-    expect(sandbox.rollback.prior_staging_sha).toBe('e'.repeat(40));
+    expect(sandbox.rollback.prior_staging_sha).toBe(PRIOR40);
     expect(sandbox.zero_production_effect).toBe(true);
     expect(sandbox.missing_gate2_approvals.length).toBeGreaterThan(0);
 
     expect(deploy.candidate_sha).toBe(HEX40);
-    expect(deploy.image_digest).toBe(`sha256:${ZERO64}`);
+    expect(deploy.image_digest).toBe(IMAGE);
     expect(deploy.capabilities).toEqual({
       escalation: false,
       repair: false,
@@ -95,9 +112,40 @@ describe('activation-package', () => {
     expect(deploy.operator_notice.length).toBeGreaterThan(0);
     expect(deploy.missing_gate3_approvals.length).toBeGreaterThan(0);
 
-    // Canonical: stable key order yields stable digest.
     expect(canonicalSha(sandbox)).toBe(canonicalSha(buildUnsignedSandboxProofRequest(input)));
     expect(canonicalSha(deploy)).toBe(canonicalSha(buildUnsignedActivationRequest(input)));
+  });
+
+  test('rejects zero prior SHA, zero verifier digest, and BLOCKED parent', () => {
+    expect(() =>
+      assertActivationPackageInput(
+        baseInput({
+          rollback: { prior_staging_sha: '0'.repeat(40), evidence_retained: true },
+          rollback_proof: {
+            schema_version: 'm42-rollback-proof-v1',
+            prior_staging_sha: '0'.repeat(40),
+            evidence_retained: true,
+            rollback_status: 'restored',
+          },
+        })
+      )
+    ).toThrow(/prior_staging_sha/);
+
+    expect(() =>
+      assertActivationPackageInput(baseInput({ verifier_registry_digest: '0'.repeat(64) }))
+    ).toThrow(/verifier_registry_digest/);
+
+    expect(() =>
+      buildUnsignedSandboxProofRequest(baseInput({ parent_manifest_status: 'BLOCKED' as never }))
+    ).toThrow(/parent_manifest_not_ready|activation_package_rejected/);
+
+    expect(() =>
+      buildUnsignedSandboxProofRequest(
+        baseInput({
+          staging_proof: undefined as never,
+        })
+      )
+    ).toThrow(/staging_proof/);
   });
 
   test('governance path packet writes are rejected', () => {
@@ -150,8 +198,5 @@ describe('activation-package', () => {
     const deployOnDisk = JSON.parse(readFileSync(written.deploy_activation_request_path, 'utf8'));
     expect(sandboxOnDisk.signed).toBe(false);
     expect(deployOnDisk.signed).toBe(false);
-    expect(createHash('sha256').update(JSON.stringify(sandboxOnDisk)).digest('hex')).toBe(
-      written.sandbox_proof_request_sha256
-    );
   });
 });

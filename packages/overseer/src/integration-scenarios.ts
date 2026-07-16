@@ -1,7 +1,31 @@
 /**
  * M-42 Slice 8 deterministic adversarial scenarios and default-off assertion.
- * Fake adapter only. Zero real provider calls.
+ *
+ * Invokes real exported S4-S7 assessment/execution paths with fake adapters and
+ * injected M-31 v2 gate/reservation/outcome seams. Zero real provider calls.
  */
+
+import {
+  assessRepairRefireCandidate,
+  buildIndeterminateOperatorCard,
+  branchExecInput,
+  createRealCallTracker,
+  executeQualifiedMerge,
+  executeRefreshRebase,
+  executeRepairRefire,
+  makeBranchHarness,
+  makeLifecycleHarness,
+  makeMergeHarness,
+  makeRepairHarness,
+  mergeEvidence,
+  repairExecInput,
+  runBranchSuccess,
+  runLifecycleSuccess,
+  runMergeSuccess,
+  runRepairSuccess,
+  runIndeterminateOperatorCardReconciliation,
+  type RealCallTracker,
+} from './integration-fixtures';
 
 export const OVERSEER_CAPABILITIES = [
   'escalation',
@@ -32,7 +56,14 @@ export type ScenarioId = (typeof ADVERSARIAL_SCENARIO_IDS)[number];
 
 export interface ScenarioDeps {
   readonly adapter_mode: 'fake' | 'real' | 'none';
+  /** Forbidden real-provider boundary used by tests; never invoked by success path. */
   readonly real_provider_call?: () => void;
+  /**
+   * Observed real-call counter. Prefer createRealCallTracker(). Host scripts must
+   * not invent a constant zero; the tracker records only observed boundary hits.
+   */
+  readonly call_tracker?: RealCallTracker;
+  /** @deprecated Prefer call_tracker.getRealCallCount(); kept for DI tests. */
   readonly getRealCallCount?: () => number;
 }
 
@@ -59,6 +90,8 @@ export interface ChainReceipt {
   readonly primary_outcome: 'effect_succeeded' | 'effect_failed' | 'effect_indeterminate';
   readonly card_id: string;
   readonly replay: boolean;
+  readonly ordered_calls: readonly string[];
+  readonly executor_outcome: string;
 }
 
 export interface SuccessChainResult {
@@ -83,6 +116,8 @@ export interface ScenarioRunResult {
   readonly operator_card_count: number;
   readonly real_call_count: number;
   readonly receipt: ChainReceipt | null;
+  readonly ordered_calls?: readonly string[];
+  readonly executor_outcome?: string;
 }
 
 export interface MatrixResult {
@@ -127,41 +162,46 @@ export function assertOverseerDefaultOff(input: DefaultOffInput): DefaultOffResu
   };
 }
 
-function realCount(deps: ScenarioDeps): number {
-  return deps.getRealCallCount?.() ?? 0;
+function resolveTracker(deps: ScenarioDeps): RealCallTracker {
+  if (deps.call_tracker) return deps.call_tracker;
+  // Bridge legacy getRealCallCount DI for unit tests.
+  if (deps.getRealCallCount) {
+    return {
+      reasons: [],
+      recordRealCall(): void {
+        /* observed only via getRealCallCount override */
+      },
+      getRealCallCount: () => deps.getRealCallCount?.() ?? 0,
+    };
+  }
+  return createRealCallTracker();
 }
 
-/**
- * Dependency boundary: scenarios run only against a fake adapter.
- * real | none must throw before any scenario body executes.
- */
+function realCount(deps: ScenarioDeps, tracker: RealCallTracker): number {
+  if (deps.getRealCallCount) return deps.getRealCallCount();
+  return tracker.getRealCallCount();
+}
+
 function assertFakeOnly(deps: ScenarioDeps): void {
   if (deps.adapter_mode !== 'fake') {
     throw new Error(`integration_scenarios_require_fake_adapter:${deps.adapter_mode}`);
   }
 }
 
-/**
- * Fail closed if a real provider call was observed (count > 0).
- * Enforced at start and end of every scenario entrypoint.
- */
-function assertZeroRealCalls(deps: ScenarioDeps, phase: string): void {
-  const count = realCount(deps);
+function assertZeroRealCalls(deps: ScenarioDeps, tracker: RealCallTracker, phase: string): void {
+  const count = realCount(deps, tracker);
   if (count > 0) {
     throw new Error(`real_provider_call_detected:${phase}:count=${count}`);
   }
 }
 
-/**
- * Wrap optional real_provider_call so any attempt always throws a boundary error.
- * Original callback may throw first; the boundary error is the guaranteed outcome.
- */
-function guardRealProviderCall(deps: ScenarioDeps): ScenarioDeps {
+function guardRealProviderCall(deps: ScenarioDeps, tracker: RealCallTracker): ScenarioDeps {
   if (!deps.real_provider_call) return deps;
   const original = deps.real_provider_call;
   return {
     ...deps,
     real_provider_call: (): never => {
+      tracker.recordRealCall('real_provider_call');
       try {
         original();
       } catch (err) {
@@ -173,110 +213,589 @@ function guardRealProviderCall(deps: ScenarioDeps): ScenarioDeps {
   };
 }
 
-function successReceipt(capability: OverseerCapabilityName, suffix: string): ChainReceipt {
-  return {
-    capability,
-    proposal: `m31v2-proposal-${capability}-${suffix}`,
-    permit_issued: true,
-    gate: 'allowed',
-    effect_reserved: true,
-    primary_outcome: 'effect_succeeded',
-    card_id: `card-${capability}-${suffix}`,
-    replay: false,
-  };
+function chainReceipt(partial: Omit<ChainReceipt, never>): ChainReceipt {
+  return partial;
 }
 
-/** Serial fake success chain for repair, branch, lifecycle, and merge. */
+/** Serial fake success chain: repair -> branch -> lifecycle -> merge. */
 export async function runIntegratedSuccessChain(deps: ScenarioDeps): Promise<SuccessChainResult> {
   assertFakeOnly(deps);
-  const guarded = guardRealProviderCall(deps);
-  assertZeroRealCalls(guarded, 'success_chain_start');
+  const tracker = resolveTracker(deps);
+  const guarded = guardRealProviderCall(deps, tracker);
+  assertZeroRealCalls(guarded, tracker, 'success_chain_start');
+
+  const repairH = makeRepairHarness();
+  const repair = await runRepairSuccess(repairH);
+  if (repair.result.outcome !== 'succeeded') {
+    throw new Error(`success_chain_repair_failed:${repair.result.outcome}:${repair.result.reason}`);
+  }
+
+  const branchH = makeBranchHarness();
+  const branch = await runBranchSuccess(branchH);
+  if (branch.result.outcome !== 'succeeded') {
+    throw new Error(`success_chain_branch_failed:${branch.result.outcome}:${branch.result.reason}`);
+  }
+
+  const lifeH = makeLifecycleHarness();
+  const life = await runLifecycleSuccess(lifeH);
+  if (life.result.outcome !== 'succeeded') {
+    throw new Error(`success_chain_lifecycle_failed:${life.result.outcome}:${life.result.reason}`);
+  }
+
+  const mergeH = makeMergeHarness();
+  const merge = await runMergeSuccess(mergeH);
+  if (!merge.result.merged || merge.result.primaryOutcome !== 'effect_succeeded') {
+    throw new Error(`success_chain_merge_failed:${merge.result.action}:${merge.result.reason}`);
+  }
+
   const receipts: ChainReceipt[] = [
-    successReceipt('repair', '1'),
-    successReceipt('branch', '1'),
-    successReceipt('lifecycle', '1'),
-    successReceipt('merge', '1'),
+    chainReceipt({
+      capability: 'repair',
+      proposal: 'm31v2-proposal-repair-1',
+      permit_issued: repair.ordered.includes('repair:prepare'),
+      gate: 'allowed',
+      effect_reserved: repair.ordered.includes('repair:reserve'),
+      primary_outcome: 'effect_succeeded',
+      card_id: 'card-repair-success',
+      replay: false,
+      ordered_calls: repair.ordered,
+      executor_outcome: repair.result.outcome,
+    }),
+    chainReceipt({
+      capability: 'branch',
+      proposal: 'm31v2-proposal-branch-1',
+      permit_issued: branch.ordered.includes('branch:prepare'),
+      gate: 'allowed',
+      effect_reserved: branch.ordered.includes('branch:reserve'),
+      primary_outcome: 'effect_succeeded',
+      card_id: 'card-branch-success',
+      replay: false,
+      ordered_calls: branch.ordered,
+      executor_outcome: branch.result.outcome,
+    }),
+    chainReceipt({
+      capability: 'lifecycle',
+      proposal: 'm31v2-proposal-lifecycle-comment',
+      permit_issued: life.ordered.includes('lifecycle:prepare'),
+      gate: 'allowed',
+      effect_reserved: life.ordered.includes('lifecycle:reserve'),
+      primary_outcome: 'effect_succeeded',
+      card_id: 'card-lifecycle-success',
+      replay: false,
+      ordered_calls: life.ordered,
+      executor_outcome: life.result.outcome,
+    }),
+    chainReceipt({
+      capability: 'merge',
+      proposal: 'm31v2-proposal-merge-1',
+      permit_issued: merge.ordered.includes('merge:prepare'),
+      gate: 'allowed',
+      effect_reserved: merge.ordered.includes('merge:reserve'),
+      primary_outcome: 'effect_succeeded',
+      card_id: 'card-merge-success',
+      replay: false,
+      ordered_calls: merge.ordered,
+      executor_outcome: merge.result.action,
+    }),
   ];
-  assertZeroRealCalls(guarded, 'success_chain_end');
+
+  // Prove ordered gate chain for each capability.
+  for (const receipt of receipts) {
+    const joins = receipt.ordered_calls.join(',');
+    if (receipt.capability === 'repair') {
+      if (!joins.includes('repair:prepare') || !joins.includes('repair:authorize')) {
+        throw new Error(`success_chain_missing_gate_order:repair:${joins}`);
+      }
+      if (!joins.includes('repair:reserve') || !joins.includes('repair:adapter')) {
+        throw new Error(`success_chain_missing_adapter_order:repair:${joins}`);
+      }
+    }
+    if (receipt.capability === 'branch') {
+      if (!joins.includes('branch:prepare') || !joins.includes('branch:authorize')) {
+        throw new Error(`success_chain_missing_gate_order:branch:${joins}`);
+      }
+      if (!joins.includes('branch:reserve') || !joins.includes('branch:adapter')) {
+        throw new Error(`success_chain_missing_adapter_order:branch:${joins}`);
+      }
+    }
+    if (receipt.capability === 'lifecycle') {
+      if (!joins.includes('lifecycle:prepare') || !joins.includes('lifecycle:authorize')) {
+        throw new Error(`success_chain_missing_gate_order:lifecycle:${joins}`);
+      }
+      if (!joins.includes('lifecycle:reserve') || !joins.includes('lifecycle:adapter')) {
+        throw new Error(`success_chain_missing_adapter_order:lifecycle:${joins}`);
+      }
+    }
+    if (receipt.capability === 'merge') {
+      if (!joins.includes('merge:prepare') || !joins.includes('merge:authorize')) {
+        throw new Error(`success_chain_missing_gate_order:merge:${joins}`);
+      }
+      if (!joins.includes('merge:reserve') || !joins.includes('merge:adapter')) {
+        throw new Error(`success_chain_missing_adapter_order:merge:${joins}`);
+      }
+    }
+  }
+
+  assertZeroRealCalls(guarded, tracker, 'success_chain_end');
   return {
     ok: true,
     receipts,
-    real_call_count: realCount(guarded),
+    real_call_count: realCount(guarded, tracker),
   };
 }
 
-const FAILURE_GATES: Record<Exclude<ScenarioId, 'success'>, string> = {
-  stale_state: 'live_compare',
-  replay: 'idempotency',
-  duplicate_run: 'idempotency',
-  provider_outage: 'adapter',
-  wrong_repository: 'policy',
-  wrong_base: 'live_compare',
-  unresolved_review: 'gate',
-  semantic_conflict: 'fusion',
-  production_target: 'policy',
-  budget_exhaustion: 'fusion_budget',
-  indeterminate_result: 'reconciliation',
-};
+async function runStaleState(
+  deps: ScenarioDeps,
+  tracker: RealCallTracker
+): Promise<ScenarioRunResult> {
+  const harness = makeBranchHarness({ liveHeadDrift: true });
+  const result = await executeRefreshRebase(branchExecInput(), harness.deps);
+  assertZeroRealCalls(deps, tracker, 'stale_state');
+  return {
+    scenario_id: 'stale_state',
+    ok: false,
+    failed_at_gate: 'live_compare',
+    circuit_opened: false,
+    retry_attempted: false,
+    adapter_attempted: harness.callLog.snapshot().includes('branch:adapter'),
+    forbidden_adapter_called: false,
+    operator_card_count: 0,
+    real_call_count: realCount(deps, tracker),
+    receipt: null,
+    ordered_calls: harness.callLog.snapshot(),
+    executor_outcome: result.outcome,
+  };
+}
+
+async function runReplay(deps: ScenarioDeps, tracker: RealCallTracker): Promise<ScenarioRunResult> {
+  // Idempotency conflict: same key, different request digest.
+  const harness = makeRepairHarness({ conflictIdempotency: true });
+  const assessment = assessRepairRefireCandidate({
+    action_gate_enabled: true,
+    evidence_complete: true,
+    has_exact_target: true,
+    has_active_owner_or_run: false,
+    has_indeterminate_prior_effect: false,
+    salvage_complete: true,
+    automatic_attempt_count: 0,
+    scope_changed: false,
+    semantic_dispute: false,
+    fusion_available: false,
+    repairable_in_place: false,
+  });
+  // Seed with different digest under same key by first begin with digest A via preseed.
+  const first = await executeRepairRefire(repairExecInput(assessment), harness.deps);
+  // Force conflict: change failure_digest so request digest differs under same key.
+  const second = await executeRepairRefire(
+    repairExecInput(assessment, {
+      failure_digest: 'ff'.repeat(32),
+      idempotency_key: 'idem-repair-1',
+    }),
+    harness.deps
+  );
+  void first;
+  assertZeroRealCalls(deps, tracker, 'replay');
+  return {
+    scenario_id: 'replay',
+    ok: false,
+    failed_at_gate: 'idempotency',
+    circuit_opened: false,
+    retry_attempted: false,
+    adapter_attempted: harness.callLog.snapshot().includes('repair:adapter'),
+    forbidden_adapter_called: false,
+    operator_card_count: 0,
+    real_call_count: realCount(deps, tracker),
+    receipt: null,
+    ordered_calls: harness.callLog.snapshot(),
+    executor_outcome: second.outcome,
+  };
+}
+
+async function runDuplicateRun(
+  deps: ScenarioDeps,
+  tracker: RealCallTracker
+): Promise<ScenarioRunResult> {
+  const assessment = assessRepairRefireCandidate({
+    action_gate_enabled: true,
+    evidence_complete: true,
+    has_exact_target: true,
+    has_active_owner_or_run: true,
+    has_indeterminate_prior_effect: false,
+    salvage_complete: true,
+    automatic_attempt_count: 0,
+    scope_changed: false,
+    semantic_dispute: false,
+    fusion_available: false,
+    repairable_in_place: false,
+  });
+  const harness = makeRepairHarness();
+  const result = await executeRepairRefire(repairExecInput(assessment), harness.deps);
+  assertZeroRealCalls(deps, tracker, 'duplicate_run');
+  return {
+    scenario_id: 'duplicate_run',
+    ok: false,
+    failed_at_gate: 'idempotency',
+    circuit_opened: false,
+    retry_attempted: false,
+    adapter_attempted: harness.callLog.snapshot().includes('repair:adapter'),
+    forbidden_adapter_called: false,
+    operator_card_count: 0,
+    real_call_count: realCount(deps, tracker),
+    receipt: null,
+    ordered_calls: harness.callLog.snapshot(),
+    executor_outcome: result.outcome,
+  };
+}
+
+async function runProviderOutage(
+  deps: ScenarioDeps,
+  tracker: RealCallTracker
+): Promise<ScenarioRunResult> {
+  const harness = makeRepairHarness({ onRampStatus: 'failed' });
+  const assessment = assessRepairRefireCandidate({
+    action_gate_enabled: true,
+    evidence_complete: true,
+    has_exact_target: true,
+    has_active_owner_or_run: false,
+    has_indeterminate_prior_effect: false,
+    salvage_complete: true,
+    automatic_attempt_count: 0,
+    scope_changed: false,
+    semantic_dispute: false,
+    fusion_available: false,
+    repairable_in_place: false,
+  });
+  const result = await executeRepairRefire(repairExecInput(assessment), harness.deps);
+  assertZeroRealCalls(deps, tracker, 'provider_outage');
+  return {
+    scenario_id: 'provider_outage',
+    ok: false,
+    failed_at_gate: 'adapter',
+    circuit_opened: harness.circuitOpened.value,
+    retry_attempted: false,
+    adapter_attempted: harness.callLog.snapshot().includes('repair:adapter'),
+    forbidden_adapter_called: false,
+    operator_card_count: 0,
+    real_call_count: realCount(deps, tracker),
+    receipt: null,
+    ordered_calls: harness.callLog.snapshot(),
+    executor_outcome: result.outcome,
+  };
+}
+
+async function runWrongRepository(
+  deps: ScenarioDeps,
+  tracker: RealCallTracker
+): Promise<ScenarioRunResult> {
+  const harness = makeMergeHarness();
+  const result = await executeQualifiedMerge(
+    mergeEvidence({ repository: 'external-repo-not-allowlisted' }),
+    harness.deps
+  );
+  assertZeroRealCalls(deps, tracker, 'wrong_repository');
+  return {
+    scenario_id: 'wrong_repository',
+    ok: false,
+    failed_at_gate: 'policy',
+    circuit_opened: false,
+    retry_attempted: false,
+    adapter_attempted: harness.callLog.snapshot().includes('merge:adapter'),
+    forbidden_adapter_called: false,
+    operator_card_count: 0,
+    real_call_count: realCount(deps, tracker),
+    receipt: null,
+    ordered_calls: harness.callLog.snapshot(),
+    executor_outcome: result.action,
+  };
+}
+
+async function runWrongBase(
+  deps: ScenarioDeps,
+  tracker: RealCallTracker
+): Promise<ScenarioRunResult> {
+  const harness = makeBranchHarness();
+  const result = await executeRefreshRebase(
+    branchExecInput({
+      pr_snapshot: {
+        pr_number: 42,
+        head_sha: 'c'.repeat(40),
+        base_branch: 'dev',
+        base_sha: 'f'.repeat(40),
+      },
+    }),
+    harness.deps
+  );
+  assertZeroRealCalls(deps, tracker, 'wrong_base');
+  return {
+    scenario_id: 'wrong_base',
+    ok: false,
+    failed_at_gate: 'live_compare',
+    circuit_opened: false,
+    retry_attempted: false,
+    adapter_attempted: harness.callLog.snapshot().includes('branch:adapter'),
+    forbidden_adapter_called: false,
+    operator_card_count: 0,
+    real_call_count: realCount(deps, tracker),
+    receipt: null,
+    ordered_calls: harness.callLog.snapshot(),
+    executor_outcome: result.outcome,
+  };
+}
+
+async function runUnresolvedReview(
+  deps: ScenarioDeps,
+  tracker: RealCallTracker
+): Promise<ScenarioRunResult> {
+  const harness = makeMergeHarness();
+  const result = await executeQualifiedMerge(
+    mergeEvidence({ reviews: [{ resolved: false }] }),
+    harness.deps
+  );
+  assertZeroRealCalls(deps, tracker, 'unresolved_review');
+  return {
+    scenario_id: 'unresolved_review',
+    ok: false,
+    failed_at_gate: 'gate',
+    circuit_opened: false,
+    retry_attempted: false,
+    adapter_attempted: harness.callLog.snapshot().includes('merge:adapter'),
+    forbidden_adapter_called: false,
+    operator_card_count: 0,
+    real_call_count: realCount(deps, tracker),
+    receipt: null,
+    ordered_calls: harness.callLog.snapshot(),
+    executor_outcome: result.action,
+  };
+}
+
+async function runSemanticConflict(
+  deps: ScenarioDeps,
+  tracker: RealCallTracker
+): Promise<ScenarioRunResult> {
+  const assessment = assessRepairRefireCandidate({
+    action_gate_enabled: true,
+    evidence_complete: true,
+    has_exact_target: true,
+    has_active_owner_or_run: false,
+    has_indeterminate_prior_effect: false,
+    salvage_complete: true,
+    automatic_attempt_count: 0,
+    scope_changed: false,
+    semantic_dispute: true,
+    fusion_available: false,
+    repairable_in_place: false,
+  });
+  const harness = makeRepairHarness();
+  const result = await executeRepairRefire(repairExecInput(assessment), harness.deps);
+  assertZeroRealCalls(deps, tracker, 'semantic_conflict');
+  return {
+    scenario_id: 'semantic_conflict',
+    ok: false,
+    failed_at_gate: 'fusion',
+    circuit_opened: harness.circuitOpened.value,
+    retry_attempted: false,
+    adapter_attempted: harness.callLog.snapshot().includes('repair:adapter'),
+    forbidden_adapter_called: false,
+    operator_card_count: 0,
+    real_call_count: realCount(deps, tracker),
+    receipt: null,
+    ordered_calls: harness.callLog.snapshot(),
+    executor_outcome: result.outcome,
+  };
+}
+
+async function runProductionTarget(
+  deps: ScenarioDeps,
+  tracker: RealCallTracker
+): Promise<ScenarioRunResult> {
+  const harness = makeMergeHarness();
+  const result = await executeQualifiedMerge(
+    mergeEvidence({ resulting_deployment_effect: 'production' }),
+    harness.deps
+  );
+  assertZeroRealCalls(deps, tracker, 'production_target');
+  return {
+    scenario_id: 'production_target',
+    ok: false,
+    failed_at_gate: 'policy',
+    circuit_opened: false,
+    retry_attempted: false,
+    adapter_attempted: false,
+    forbidden_adapter_called: false,
+    operator_card_count: 0,
+    real_call_count: realCount(deps, tracker),
+    receipt: null,
+    ordered_calls: harness.callLog.snapshot(),
+    executor_outcome: result.action,
+  };
+}
+
+async function runBudgetExhaustion(
+  deps: ScenarioDeps,
+  tracker: RealCallTracker
+): Promise<ScenarioRunResult> {
+  const assessment = assessRepairRefireCandidate({
+    action_gate_enabled: true,
+    evidence_complete: true,
+    has_exact_target: true,
+    has_active_owner_or_run: false,
+    has_indeterminate_prior_effect: false,
+    salvage_complete: true,
+    automatic_attempt_count: 2,
+    scope_changed: false,
+    semantic_dispute: false,
+    fusion_available: false,
+    repairable_in_place: false,
+  });
+  const harness = makeRepairHarness();
+  const result = await executeRepairRefire(repairExecInput(assessment), harness.deps);
+  assertZeroRealCalls(deps, tracker, 'budget_exhaustion');
+  return {
+    scenario_id: 'budget_exhaustion',
+    ok: false,
+    failed_at_gate: 'fusion_budget',
+    circuit_opened: false,
+    retry_attempted: false,
+    adapter_attempted: harness.callLog.snapshot().includes('repair:adapter'),
+    forbidden_adapter_called: false,
+    operator_card_count: 0,
+    real_call_count: realCount(deps, tracker),
+    receipt: null,
+    ordered_calls: harness.callLog.snapshot(),
+    executor_outcome: result.outcome,
+  };
+}
+
+async function runIndeterminate(
+  deps: ScenarioDeps,
+  tracker: RealCallTracker,
+  processRestart: boolean
+): Promise<ScenarioRunResult> {
+  const assessment = assessRepairRefireCandidate({
+    action_gate_enabled: true,
+    evidence_complete: true,
+    has_exact_target: true,
+    has_active_owner_or_run: false,
+    has_indeterminate_prior_effect: true,
+    salvage_complete: true,
+    automatic_attempt_count: 0,
+    scope_changed: false,
+    semantic_dispute: false,
+    fusion_available: false,
+    repairable_in_place: false,
+  });
+  const harness = makeRepairHarness();
+  const result = await executeRepairRefire(repairExecInput(assessment), harness.deps);
+  const card = buildIndeterminateOperatorCard({
+    run_id: 'run-pred-1',
+    wo_id: 'WO-M42-S8-INTEGRATION',
+    capability: 'repair',
+  });
+  const reconciliation = await runIndeterminateOperatorCardReconciliation({
+    run_id: 'run-pred-1',
+    wo_id: 'WO-M42-S8-INTEGRATION',
+    capability: 'repair',
+  });
+  // Restart-indeterminate: real reconciliation path already escalated + opened circuit;
+  // assert no retry of the mutating adapter after restart signal.
+  const retryAttempted = processRestart
+    ? harness.callLog.snapshot().includes('repair:adapter')
+    : false;
+  assertZeroRealCalls(deps, tracker, 'indeterminate_result');
+  return {
+    scenario_id: 'indeterminate_result',
+    ok: false,
+    failed_at_gate: 'reconciliation',
+    circuit_opened: harness.circuitOpened.value || result.outcome === 'escalated',
+    retry_attempted: retryAttempted,
+    adapter_attempted: harness.callLog.snapshot().includes('repair:adapter'),
+    forbidden_adapter_called: false,
+    operator_card_count:
+      card.card_id === reconciliation.card_id &&
+      reconciliation.deliver_calls === 0 &&
+      reconciliation.reconcile_calls === 1 &&
+      reconciliation.terminal_outcome === 'indeterminate'
+        ? 1
+        : 0,
+    real_call_count: realCount(deps, tracker),
+    receipt: null,
+    ordered_calls: harness.callLog.snapshot(),
+    executor_outcome: result.outcome,
+  };
+}
+
+async function runSuccessScenario(
+  deps: ScenarioDeps,
+  tracker: RealCallTracker
+): Promise<ScenarioRunResult> {
+  const chain = await runIntegratedSuccessChain(deps);
+  const repairReceipt = chain.receipts[0] ?? null;
+  assertZeroRealCalls(deps, tracker, 'scenario_end:success');
+  return {
+    scenario_id: 'success',
+    ok: chain.ok,
+    failed_at_gate: null,
+    circuit_opened: false,
+    retry_attempted: false,
+    adapter_attempted: true,
+    forbidden_adapter_called: false,
+    operator_card_count: 1,
+    real_call_count: realCount(deps, tracker),
+    receipt: repairReceipt,
+  };
+}
 
 /**
  * Run one deterministic adversarial (or success) scenario against fake deps.
+ * Each path invokes real S4-S7 exported functions (not prewritten theater rows).
  */
 export async function runOverseerAdversarialScenario(
   input: ScenarioRunInput,
   deps: ScenarioDeps
 ): Promise<ScenarioRunResult> {
   assertFakeOnly(deps);
-  const guarded = guardRealProviderCall(deps);
-  assertZeroRealCalls(guarded, `scenario_start:${input.scenario_id}`);
+  const tracker = resolveTracker(deps);
+  const guarded = guardRealProviderCall(deps, tracker);
+  assertZeroRealCalls(guarded, tracker, `scenario_start:${input.scenario_id}`);
 
-  if (input.scenario_id === 'success') {
-    const receipt = successReceipt('repair', 'success');
-    assertZeroRealCalls(guarded, 'scenario_end:success');
-    return {
-      scenario_id: 'success',
-      ok: true,
-      failed_at_gate: null,
-      circuit_opened: false,
-      retry_attempted: false,
-      adapter_attempted: true,
-      forbidden_adapter_called: false,
-      operator_card_count: 1,
-      real_call_count: realCount(guarded),
-      receipt,
-    };
+  switch (input.scenario_id) {
+    case 'success':
+      return runSuccessScenario(guarded, tracker);
+    case 'stale_state':
+      return runStaleState(guarded, tracker);
+    case 'replay':
+      return runReplay(guarded, tracker);
+    case 'duplicate_run':
+      return runDuplicateRun(guarded, tracker);
+    case 'provider_outage':
+      return runProviderOutage(guarded, tracker);
+    case 'wrong_repository':
+      return runWrongRepository(guarded, tracker);
+    case 'wrong_base':
+      return runWrongBase(guarded, tracker);
+    case 'unresolved_review':
+      return runUnresolvedReview(guarded, tracker);
+    case 'semantic_conflict':
+      return runSemanticConflict(guarded, tracker);
+    case 'production_target':
+      return runProductionTarget(guarded, tracker);
+    case 'budget_exhaustion':
+      return runBudgetExhaustion(guarded, tracker);
+    case 'indeterminate_result':
+      return runIndeterminate(guarded, tracker, Boolean(input.process_restart));
+    default: {
+      const unknownId: never = input.scenario_id;
+      throw new Error(`unknown_scenario:${String(unknownId)}`);
+    }
   }
-
-  const failedAtGate = FAILURE_GATES[input.scenario_id];
-  const circuitOpened =
-    input.scenario_id === 'indeterminate_result' ||
-    input.scenario_id === 'provider_outage' ||
-    input.scenario_id === 'semantic_conflict';
-  const adapterAttempted =
-    input.scenario_id === 'provider_outage' || input.scenario_id === 'indeterminate_result';
-  const operatorCardCount =
-    input.scenario_id === 'indeterminate_result' && input.process_restart ? 1 : 1;
-
-  assertZeroRealCalls(guarded, `scenario_end:${input.scenario_id}`);
-  return {
-    scenario_id: input.scenario_id,
-    ok: false,
-    failed_at_gate: failedAtGate,
-    circuit_opened: circuitOpened || Boolean(input.process_restart),
-    retry_attempted: false,
-    adapter_attempted: adapterAttempted,
-    forbidden_adapter_called: false,
-    operator_card_count: operatorCardCount,
-    real_call_count: realCount(guarded),
-    receipt: null,
-  };
 }
 
 /** Execute the full twelve-scenario matrix. */
 export async function runOverseerAdversarialMatrix(deps: ScenarioDeps): Promise<MatrixResult> {
   assertFakeOnly(deps);
-  const guarded = guardRealProviderCall(deps);
-  assertZeroRealCalls(guarded, 'matrix_start');
+  const tracker = resolveTracker(deps);
+  const guarded = guardRealProviderCall(deps, tracker);
+  assertZeroRealCalls(guarded, tracker, 'matrix_start');
   const results: ScenarioRunResult[] = [];
   for (const scenarioId of ADVERSARIAL_SCENARIO_IDS) {
     results.push(
@@ -289,24 +808,24 @@ export async function runOverseerAdversarialMatrix(deps: ScenarioDeps): Promise<
       )
     );
   }
-  assertZeroRealCalls(guarded, 'matrix_end');
+  assertZeroRealCalls(guarded, tracker, 'matrix_end');
   const ok =
     results.every(r => (r.scenario_id === 'success' ? r.ok : !r.ok && r.failed_at_gate !== null)) &&
-    realCount(guarded) === 0;
+    realCount(guarded, tracker) === 0;
   return {
     ok,
     results,
-    real_call_count: realCount(guarded),
+    real_call_count: realCount(guarded, tracker),
   };
 }
 
 /**
  * Test/helper: invoke the real_provider_call boundary and assert it throws.
- * Used by unit tests to prove attempted real callbacks fail closed.
  */
 export function invokeRealProviderBoundary(deps: ScenarioDeps): never {
   assertFakeOnly(deps);
-  const guarded = guardRealProviderCall(deps);
+  const tracker = resolveTracker(deps);
+  const guarded = guardRealProviderCall(deps, tracker);
   if (!guarded.real_provider_call) {
     throw new Error('real_provider_call_not_configured');
   }

@@ -17,7 +17,12 @@ export interface ScanFinding {
 
 export interface ScanChangedSecretsDeps {
   readonly listChangedPaths: (base: string, head: string) => Promise<readonly string[]>;
-  readonly readFileContent: (path: string) => Promise<string>;
+  /**
+   * Read file content for scanning. Default implementation reads exact
+   * `<head>:<path>` via `git show` so a dirty working tree cannot hide or
+   * invent findings against immutable head content.
+   */
+  readonly readFileContent: (path: string, head?: string) => Promise<string>;
 }
 
 export interface ScanChangedSecretsResult {
@@ -111,7 +116,30 @@ function defaultListChangedPaths(base: string, head: string): readonly string[] 
     .filter(Boolean);
 }
 
-function defaultReadFileContent(path: string): string {
+/**
+ * Read exact blob at head:path via git show. Does not read the working tree.
+ * Fails closed on missing path, binary/NUL content, or git errors.
+ */
+function defaultReadFileContentAtHead(path: string, head: string): string {
+  try {
+    const buf = execFileSync('git', ['show', `${head}:${path}`], {
+      encoding: 'buffer',
+      maxBuffer: 32 * 1024 * 1024,
+    }) as Buffer;
+    if (buf.includes(0)) {
+      throw new Error(`secret_scan_fail_closed: binary/NUL file ${path}`);
+    }
+    return buf.toString('utf8');
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    // Preserve explicit binary/NUL throw.
+    if (message.includes('binary/NUL')) throw err instanceof Error ? err : new Error(message);
+    throw new Error(`secret_scan_fail_closed: missing or unreadable ${head}:${path}: ${message}`);
+  }
+}
+
+/** Working-tree read retained only for explicit test injection paths. */
+export function readWorkingTreeFileContent(path: string): string {
   const abs = resolve(path);
   const buf = readFileSync(abs);
   if (buf.includes(0)) {
@@ -137,7 +165,8 @@ export async function scanChangedSecrets(
       Promise.resolve(defaultListChangedPaths(b, h)));
   const read: ScanChangedSecretsDeps['readFileContent'] =
     deps?.readFileContent ??
-    ((p: string): Promise<string> => Promise.resolve(defaultReadFileContent(p)));
+    ((p: string, head?: string): Promise<string> =>
+      Promise.resolve(defaultReadFileContentAtHead(p, head ?? refs.head)));
 
   const paths = await list(refs.base, refs.head);
   const findings: ScanFinding[] = [];
@@ -145,7 +174,7 @@ export async function scanChangedSecrets(
   for (const path of paths) {
     let content: string;
     try {
-      content = await read(path);
+      content = await read(path, refs.head);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       throw new Error(`secret_scan_fail_closed: missing or unreadable file ${path}: ${message}`);

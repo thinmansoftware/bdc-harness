@@ -139,17 +139,26 @@ describe('staging-overseer-integration contract', () => {
     expect(src.includes('sha256:[0-9a-f]{64}') || src.includes('sha256:')).toBe(true);
   });
 
-  test('path-safe bun -e from RepoRoot; no TEMP relative package imports', () => {
+  test('runs committed in-container integration runner; no host working-tree theater', () => {
     const src = readFileSync(integrationPath, 'utf8');
-    expect(src.includes('bun -e')).toBe(true);
-    expect(src.includes('Invoke-BunFromRepoRoot')).toBe(true);
-    expect(src.includes('Push-Location $RepoRoot')).toBe(true);
+    const runnerPath = join(repoRoot, 'packages', 'overseer', 'src', 'm42-integration-runner.ts');
+    expect(existsSync(runnerPath)).toBe(true);
+    expect(src.includes('m42-integration-runner.ts')).toBe(true);
+    expect(src.includes('Invoke-M42IntegrationRunnerInContainer')).toBe(true);
+    expect(src.includes('docker exec') || src.includes('$Docker exec')).toBe(true);
+    // Host working-tree bun -e must not count as candidate proof
+    expect(src.includes('getRealCallCount: () => 0')).toBe(false);
+    expect(src.includes('getRealCallCount:()=>0')).toBe(false);
+    expect(src.includes('Invoke-BunFromRepoRoot')).toBe(false);
     // Forbidden pattern: write temp modules under OS temp with relative packages imports
     expect(src.includes('Join-Path $env:TEMP')).toBe(false);
     expect(src.includes('m42-scenario-run')).toBe(false);
     expect(src.includes('m42-packets-')).toBe(false);
     expect(src.includes('Set-Content -Path $scenarioFile')).toBe(false);
     expect(src.includes('Set-Content -Path $packetFile')).toBe(false);
+    // No fabricated zero prior SHA / zero verifier digest for packets
+    expect(src.includes('"0" * 40') || src.includes("'0' * 40")).toBe(false);
+    expect(src.includes('0".repeat(64)') || src.includes("0'.repeat(64)")).toBe(false);
   });
 
   test('derives watcher/adapter/emergency/capabilities/circuits from /api/health', () => {

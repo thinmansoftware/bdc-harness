@@ -139,7 +139,10 @@ export type {
   MatrixResult,
   ChainReceipt,
 } from './integration-scenarios';
+export { createRealCallTracker } from './integration-fixtures';
+export type { RealCallTracker } from './integration-fixtures';
 export {
+  assertActivationPackageInput,
   buildUnsignedSandboxProofRequest,
   buildUnsignedActivationRequest,
   writeNonGovernanceActivationArtifacts,
@@ -151,6 +154,8 @@ export type {
   UnsignedSandboxProofRequest,
   UnsignedActivationRequest,
   WrittenActivationArtifacts,
+  StagingProofEvidence,
+  RollbackProofEvidence,
 } from './activation-package';
 export { createOverseerControlPlaneService } from './control-plane';
 export type {

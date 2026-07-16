@@ -1,11 +1,36 @@
 /**
  * M-42 Slice 8 unsigned activation/sandbox request packets and
  * governance-isolated artifact writer.
+ *
+ * Fail closed: no zero/malformed prior SHA, verifier digest, staging proof,
+ * or rollback proof. Packets are not emitted while parent is BLOCKED.
  */
 
 import { createHash } from 'node:crypto';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { isAbsolute, join, normalize, resolve, sep } from 'node:path';
+
+const SHA1_RE = /^[0-9a-f]{40}$/;
+const SHA256_RE = /^[0-9a-f]{64}$/;
+const IMAGE_DIGEST_RE = /^sha256:[0-9a-f]{64}$/;
+const ZERO40 = /^0{40}$/;
+const ZERO64 = /^0{64}$/;
+const ZERO_IMAGE = /^sha256:0{64}$/;
+
+export interface StagingProofEvidence {
+  readonly schema_version: 'm42-staging-proof-v1';
+  readonly candidate_sha: string;
+  readonly image_digest: string;
+  readonly real_call_count: number;
+  readonly adapter_mode: 'fake';
+}
+
+export interface RollbackProofEvidence {
+  readonly schema_version: 'm42-rollback-proof-v1';
+  readonly prior_staging_sha: string;
+  readonly evidence_retained: boolean;
+  readonly rollback_status: 'restored';
+}
 
 export interface ActivationPackageInput {
   readonly candidate_sha: string;
@@ -38,6 +63,10 @@ export interface ActivationPackageInput {
   readonly missing_gate2_approvals: readonly string[];
   readonly missing_gate3_approvals: readonly string[];
   readonly operator_notice: string;
+  /** Required for packet emission; must not be BLOCKED. */
+  readonly parent_manifest_status: 'READY_FOR_SANDBOX_PROOF_REQUEST';
+  readonly staging_proof: StagingProofEvidence;
+  readonly rollback_proof: RollbackProofEvidence;
 }
 
 export interface UnsignedSandboxProofRequest {
@@ -99,9 +128,78 @@ function sortKeys(value: unknown): unknown {
   return value;
 }
 
+function reject(reason: string): never {
+  throw new Error(`activation_package_rejected:${reason}`);
+}
+
+/**
+ * Reject missing/zero/malformed required identities and proofs.
+ * Packets must not be built while parent is BLOCKED.
+ */
+export function assertActivationPackageInput(input: ActivationPackageInput): void {
+  if (input.parent_manifest_status !== 'READY_FOR_SANDBOX_PROOF_REQUEST') {
+    reject('parent_manifest_not_ready');
+  }
+  if (!SHA1_RE.test(input.candidate_sha) || ZERO40.test(input.candidate_sha)) {
+    reject('candidate_sha_invalid_or_zero');
+  }
+  if (!IMAGE_DIGEST_RE.test(input.image_digest) || ZERO_IMAGE.test(input.image_digest)) {
+    reject('image_digest_invalid_or_zero');
+  }
+  if (
+    !SHA1_RE.test(input.rollback.prior_staging_sha) ||
+    ZERO40.test(input.rollback.prior_staging_sha)
+  ) {
+    reject('prior_staging_sha_invalid_or_zero');
+  }
+  if (
+    !SHA256_RE.test(input.verifier_registry_digest) ||
+    ZERO64.test(input.verifier_registry_digest)
+  ) {
+    reject('verifier_registry_digest_invalid_or_zero');
+  }
+  if (input.staging_proof?.schema_version !== 'm42-staging-proof-v1') {
+    reject('staging_proof_missing_or_invalid');
+  }
+  if (input.staging_proof.candidate_sha !== input.candidate_sha) {
+    reject('staging_proof_candidate_mismatch');
+  }
+  if (input.staging_proof.image_digest !== input.image_digest) {
+    reject('staging_proof_image_mismatch');
+  }
+  if (input.staging_proof.adapter_mode !== 'fake') {
+    reject('staging_proof_adapter_not_fake');
+  }
+  if (input.staging_proof.real_call_count !== 0) {
+    reject('staging_proof_real_calls_nonzero');
+  }
+  if (input.rollback_proof?.schema_version !== 'm42-rollback-proof-v1') {
+    reject('rollback_proof_missing_or_invalid');
+  }
+  if (input.rollback_proof.prior_staging_sha !== input.rollback.prior_staging_sha) {
+    reject('rollback_proof_prior_sha_mismatch');
+  }
+  if (input.rollback_proof.rollback_status !== 'restored') {
+    reject('rollback_proof_not_restored');
+  }
+  if (input.rollback.evidence_retained !== input.rollback_proof.evidence_retained) {
+    reject('evidence_retained_mismatch');
+  }
+  if (typeof input.rollback.evidence_retained !== 'boolean') {
+    reject('evidence_retained_missing');
+  }
+  if (!input.emergency_stop) {
+    reject('emergency_stop_required');
+  }
+  if (!input.operator_notice || input.operator_notice.trim().length === 0) {
+    reject('operator_notice_missing');
+  }
+}
+
 export function buildUnsignedSandboxProofRequest(
   input: ActivationPackageInput
 ): UnsignedSandboxProofRequest {
+  assertActivationPackageInput(input);
   return {
     schema_version: 'm42-sandbox-proof-request-v1',
     signed: false,
@@ -121,6 +219,7 @@ export function buildUnsignedSandboxProofRequest(
 export function buildUnsignedActivationRequest(
   input: ActivationPackageInput
 ): UnsignedActivationRequest {
+  assertActivationPackageInput(input);
   return {
     schema_version: 'm42-deploy-activation-request-v1',
     signed: false,
@@ -161,7 +260,6 @@ function assertNonGovernanceOutputDirectory(outputDirectory: string): string {
     }
   }
 
-  // Reject direct writes into the repository source tree root children.
   if (normalized.startsWith(repoRoot + sep) || normalized === repoRoot) {
     const rel = normalized.slice(repoRoot.length).replace(/^[/\\]/, '');
     const first = rel.split(/[/\\]/)[0] ?? '';
@@ -187,13 +285,10 @@ function assertNonGovernanceOutputDirectory(outputDirectory: string): string {
     // relative paths under artifacts/ are allowed when resolved under cwd
   }
 
-  // Explicit allow for artifacts/overseer paths under the repo (staging proof output).
   if (normalized.startsWith(repoRoot + sep)) {
     const rel = normalized.slice(repoRoot.length).replace(/^[/\\]/, '');
     if (!rel.startsWith('artifacts') && !rel.includes(`${sep}tmp`) && !rel.includes('staging-')) {
-      // Allow tmp-style and artifacts only under repo
       if (!rel.startsWith('staging-data') && !rel.startsWith('staging-m42')) {
-        // still reject unknown repo-relative roots
         const first = rel.split(/[/\\]/)[0] ?? '';
         if (
           first &&
@@ -220,6 +315,24 @@ export function writeNonGovernanceActivationArtifacts(
   input: ActivationArtifactBundle,
   outputDirectory: string
 ): WrittenActivationArtifacts {
+  // Refuse writing packets that were not built from a validated READY input path
+  // (bundle schemas already enforce signed:false and required fields).
+  if (input.sandbox_proof_request.signed) {
+    throw new Error('activation_artifact_rejected:sandbox_signed');
+  }
+  if (input.deploy_activation_request.signed) {
+    throw new Error('activation_artifact_rejected:deploy_signed');
+  }
+  if (ZERO40.test(input.sandbox_proof_request.candidate_sha)) {
+    throw new Error('activation_artifact_rejected:zero_candidate_sha');
+  }
+  if (ZERO64.test(input.sandbox_proof_request.verifier_registry_digest)) {
+    throw new Error('activation_artifact_rejected:zero_verifier_digest');
+  }
+  if (ZERO40.test(input.sandbox_proof_request.rollback.prior_staging_sha)) {
+    throw new Error('activation_artifact_rejected:zero_prior_sha');
+  }
+
   const dir = assertNonGovernanceOutputDirectory(outputDirectory);
   mkdirSync(dir, { recursive: true });
 
