@@ -160,7 +160,7 @@ DECLARE
 BEGIN
   SELECT repository INTO repo FROM overseer_m31_snapshots_v2 WHERE snapshot_id = NEW.snapshot_id;
   IF repo IS NULL THEN RAISE EXCEPTION 'discrepancy snapshot missing'; END IF;
-  PERFORM pg_advisory_xact_lock(hashtextextended(repo, 0));
+  PERFORM pg_advisory_xact_lock(hashtextextended('m31v2:' || repo, 0));
   SELECT d.discrepancy_id INTO current_tip
     FROM overseer_m31_discrepancies_v2 d
     JOIN overseer_m31_snapshots_v2 s ON s.snapshot_id = d.snapshot_id

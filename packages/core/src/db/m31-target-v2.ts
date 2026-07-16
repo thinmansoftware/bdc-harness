@@ -826,7 +826,9 @@ export async function appendM31DiscrepancyV2(
     const snapshot = await selectSnapshot(query, input.snapshot_id);
     if (!snapshot) throw new Error('snapshot_invalid');
     if (getDatabase().dialect === 'postgres') {
-      await query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [snapshot.repository]);
+      await query("SELECT pg_advisory_xact_lock(hashtextextended('m31v2:' || $1, 0))", [
+        snapshot.repository,
+      ]);
     }
 
     if (
