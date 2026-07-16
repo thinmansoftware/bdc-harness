@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, mock, test } from 'bun:test';
@@ -84,16 +84,11 @@ function gitSalvageDeps(): SalvageArtifactDepsV1 {
         }
       }
       if (!patch_path) return false;
-      try {
-        execFileSync('test', ['-f', join(worktree_path, patch_path)]);
-        return true;
-      } catch {
-        return false;
-      }
+      return existsSync(join(worktree_path, patch_path));
     },
     async digestPatch({ worktree_path, patch_path }) {
       try {
-        const content = execFileSync('cat', [join(worktree_path, patch_path)]);
+        const content = readFileSync(join(worktree_path, patch_path));
         return createHash('sha256').update(content).digest('hex');
       } catch {
         return null;
@@ -112,7 +107,9 @@ const POLICY_DIGEST = sha256hex('policy');
 const REGISTRY_DIGEST = sha256hex('registry');
 const PARAMS_DIGEST = sha256hex('params');
 
-function targetBinding(overrides: Partial<LifecycleTargetBindingV1> = {}): LifecycleTargetBindingV1 {
+function targetBinding(
+  overrides: Partial<LifecycleTargetBindingV1> = {}
+): LifecycleTargetBindingV1 {
   return {
     repository: 'bluedevilcollectibles/bdc-harness',
     target_kind: 'pull_request',
@@ -292,7 +289,11 @@ function makeGate(
 function makeDeps(
   adapter: LifecycleMutationAdapterV1,
   order: string[],
-  opts: { liveDigest?: string; policy?: InjectedActionPolicyDepsV1; gate?: LifecycleGateDepsV1 } = {}
+  opts: {
+    liveDigest?: string;
+    policy?: InjectedActionPolicyDepsV1;
+    gate?: LifecycleGateDepsV1;
+  } = {}
 ): ExecuteLifecycleActionDepsV1 {
   return {
     policy: opts.policy ?? eligiblePolicy(),
@@ -372,12 +373,16 @@ describe('lifecycle execution', () => {
     });
     const result = await executeLifecycleAction(execInput('CLOSE'), makeDeps(adapter, order));
     expect(result.outcome).toBe('succeeded');
-    expect(result.receipt_types).toEqual([
-      'permit_issued',
-      'effect_reserved',
-      'effect_succeeded',
+    expect(result.receipt_types).toEqual(['permit_issued', 'effect_reserved', 'effect_succeeded']);
+    expect(order).toEqual([
+      'salvage',
+      'prepare',
+      'authorize',
+      'reserve',
+      'observe',
+      'adapter',
+      'outcome:effect_succeeded',
     ]);
-    expect(order).toEqual(['salvage', 'prepare', 'authorize', 'reserve', 'observe', 'adapter', 'outcome:effect_succeeded']);
 
     const reconciled = reconcileLifecycleResult({
       snapshot_id: 'snapshot-1',

@@ -72,7 +72,10 @@ export function createLifecycleMutationAdapter(
   return {
     async perform(request: LifecycleMutationRequestV1): Promise<LifecycleMutationReceiptV1> {
       const bound = { ...request };
-      if (!EXACT_REPOSITORY_RE.test(bound.repository) || !allowedRepositories.has(bound.repository)) {
+      if (
+        !EXACT_REPOSITORY_RE.test(bound.repository) ||
+        !allowedRepositories.has(bound.repository)
+      ) {
         return receipt(bound, false, 'repository_not_allowlisted');
       }
       if (!TARGET_KINDS.has(bound.target_kind)) {

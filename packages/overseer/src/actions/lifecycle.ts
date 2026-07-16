@@ -17,10 +17,7 @@ import type {
   M31TargetV2TypedFailure,
 } from '@archon/core/db/m31-target-v2';
 import type { OverseerCapability } from '@archon/core/db/overseer-capabilities';
-import type {
-  LifecycleMutationAdapterV1,
-  LifecycleMutationRequestV1,
-} from '../adapters/lifecycle';
+import type { LifecycleMutationAdapterV1, LifecycleMutationRequestV1 } from '../adapters/lifecycle';
 
 export type LifecycleActionKindV1 = Extract<
   M31ActionKind,
@@ -189,7 +186,9 @@ export type LifecycleAssessmentResultV1 =
       readonly no_mutation: false;
     };
 
-function isLifecycleAction(action: LifecycleCandidateInputV1['action_kind']): action is LifecycleActionKindV1 {
+function isLifecycleAction(
+  action: LifecycleCandidateInputV1['action_kind']
+): action is LifecycleActionKindV1 {
   return action !== 'READ_ONLY';
 }
 
@@ -218,7 +217,9 @@ function exactLineage(input: LifecycleCandidateInputV1): boolean {
 }
 
 function protectedBoundaryClear(input: LifecycleCandidateInputV1): boolean {
-  return input.protected_boundaries.length === 0 && !input.customer_contact && !input.governance_filing;
+  return (
+    input.protected_boundaries.length === 0 && !input.customer_contact && !input.governance_filing
+  );
 }
 
 /**
@@ -281,7 +282,11 @@ export function assessLifecycleCandidate(
     verifier_registry_digest: input.verifier_registry_digest,
   });
   if (!decision.eligible) {
-    return { disposition: 'denied', reason: `policy_ineligible:${decision.reason}`, no_mutation: true };
+    return {
+      disposition: 'denied',
+      reason: `policy_ineligible:${decision.reason}`,
+      no_mutation: true,
+    };
   }
   if (
     !decision.effect_allowed ||
@@ -451,7 +456,9 @@ export interface ExecuteLifecycleActionInputV1 {
 export interface ExecuteLifecycleActionDepsV1 {
   readonly policy: InjectedActionPolicyDepsV1;
   readonly salvage: SalvageArtifactDepsV1;
-  readonly observeLiveTarget: (target: LifecycleTargetBindingV1) => Promise<LifecycleLiveObservationV1>;
+  readonly observeLiveTarget: (
+    target: LifecycleTargetBindingV1
+  ) => Promise<LifecycleLiveObservationV1>;
   readonly gate: LifecycleGateDepsV1;
   readonly adapter: LifecycleMutationAdapterV1;
 }
