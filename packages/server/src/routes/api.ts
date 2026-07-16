@@ -126,8 +126,10 @@ import * as boardAuthorityDb from '@archon/core/db/board-authority';
 import * as executionClaimsDb from '@archon/core/db/execution-claims';
 import * as mergeStewardDb from '@archon/core/db/merge-steward';
 import * as overseerBriefingDb from '@archon/core/db/overseer-briefing';
+import * as m31TargetV2Db from '@archon/core/db/m31-target-v2';
 import * as m31Substrate from '@archon/overseer/m31-substrate';
 import type { M31LiveStateReader } from '@archon/overseer/m31-substrate';
+import { registerM31TargetV2Routes } from './m31-target-v2.routes';
 import {
   deriveBoardMotionNotificationKey,
   recordBoardPetitionDelivery,
@@ -4018,6 +4020,27 @@ export function registerApiRoutes(
       getLog().error({ err: error }, 'operator_card_get_failed');
       return apiError(c, 500, 'Failed to read operator card');
     }
+  });
+
+  // M-42 Slice 8: mount reviewed isolated M-31 target-v2 route module.
+  // No provider mutation client is injected. Board principal auth required.
+  registerM31TargetV2Routes(app, {
+    authenticatePrincipal: async (request: Request) => {
+      const token = request.headers.get('x-board-principal-token')?.trim();
+      await boardAuthorityDb.authenticateBoardPrincipal({ principal_token: token });
+    },
+    registerSnapshot: input => m31TargetV2Db.registerM31SnapshotV2(input),
+    getSnapshot: id => m31TargetV2Db.getM31SnapshotV2(id),
+    appendDiscrepancy: input => m31TargetV2Db.appendM31DiscrepancyV2(input),
+    resolveDiscrepancy: input => m31TargetV2Db.resolveM31DiscrepancyV2(input),
+    createProposal: input => m31TargetV2Db.createM31ActionProposalV2(input),
+    getProposal: id => m31TargetV2Db.getM31ActionProposalV2(id),
+    preparePermit: async input =>
+      m31TargetV2Db.compareAndConsumeM31ProposalV2({
+        proposal_id: input.proposal_id,
+        observation: input.observation,
+        validity_window_ms: input.validity_window_ms,
+      }),
   });
 
   // GET /api/stream/__dashboard__ -- multiplexed dashboard SSE (all workflow events)

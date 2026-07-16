@@ -102,3 +102,58 @@ export type {
   PullRequestEvidence,
   WatchedRunRecord,
 } from './types';
+
+// M-42 Slice 8 integration, scenarios, and unsigned activation packets.
+export {
+  buildOverseerParentManifest,
+  reduceParentEvidence,
+  REQUIRED_M42_CHILD_WO_IDS,
+} from './integration-manifest';
+export type {
+  ChildEvidenceRecord,
+  ChildReviewEvidence,
+  EvidenceState,
+  OverseerParentManifest,
+  ParentEvidenceInput,
+  ParentReadinessPacket,
+  ReducedParentEvidence,
+  SliceEvidenceSummary,
+} from './integration-manifest';
+export {
+  assertOverseerDefaultOff,
+  runOverseerAdversarialScenario,
+  runOverseerAdversarialMatrix,
+  runIntegratedSuccessChain,
+  invokeRealProviderBoundary,
+  ADVERSARIAL_SCENARIO_IDS,
+  OVERSEER_CAPABILITIES,
+} from './integration-scenarios';
+export type {
+  DefaultOffInput,
+  DefaultOffResult,
+  ScenarioDeps,
+  ScenarioId,
+  ScenarioRunInput,
+  ScenarioRunResult,
+  SuccessChainResult,
+  MatrixResult,
+  ChainReceipt,
+} from './integration-scenarios';
+export {
+  buildUnsignedSandboxProofRequest,
+  buildUnsignedActivationRequest,
+  writeNonGovernanceActivationArtifacts,
+  canonicalJsonStringify,
+} from './activation-package';
+export type {
+  ActivationPackageInput,
+  ActivationArtifactBundle,
+  UnsignedSandboxProofRequest,
+  UnsignedActivationRequest,
+  WrittenActivationArtifacts,
+} from './activation-package';
+export { createOverseerControlPlaneService } from './control-plane';
+export type {
+  OverseerControlPlaneService,
+  OverseerControlPlaneServiceDependencies,
+} from './control-plane';
