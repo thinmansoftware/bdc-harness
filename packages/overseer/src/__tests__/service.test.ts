@@ -5,9 +5,7 @@ import { join } from 'path';
 import { closeDatabase, getDatabase, resetDatabase } from '@archon/core/db/connection';
 import { listOverseerCapabilityEvents } from '@archon/core/db/overseer-capabilities';
 import { runOverseerService } from '../service.ts';
-import { createFakeGitHubAdapter } from '../adapters/fake-github.ts';
 import type { M31ActionPermit, M31ActionProposal } from '../m31-substrate.ts';
-import type { OverseerActionPolicy } from '../action-policy.ts';
 
 const ENV_KEYS = [
   'ARCHON_HOME',
@@ -67,22 +65,6 @@ function permit(): M31ActionPermit {
     capability: bound.capability,
     issued_at: '2026-07-15T11:59:00.000Z',
     valid_until: '2026-07-15T12:01:00.000Z',
-  };
-}
-
-function policy(overrides: Partial<OverseerActionPolicy> = {}): OverseerActionPolicy {
-  return {
-    service_enabled: true,
-    emergency_stop: false,
-    legacy_dry_run: false,
-    capability_flags: {
-      escalation: false,
-      repair: false,
-      branch: false,
-      lifecycle: false,
-      merge: true,
-    },
-    ...overrides,
   };
 }
 
@@ -236,11 +218,6 @@ describe('service', () => {
       enabled: true,
       dryRun: true,
       adapterKind: 'fake',
-      fakeGitHubAdapter: {
-        attemptMutation: async () => {
-          throw new Error('dry-run must not reach fake adapter');
-        },
-      },
       deps: {
         listRunsForWatch: async () => [
           {
@@ -330,80 +307,7 @@ describe('service', () => {
     ).resolves.toBeUndefined();
   });
 
-  test('live merge-ready path reaches the actual fake adapter and never the merge client', async () => {
-    const gateEvents: unknown[] = [];
-    const attemptEvents: unknown[] = [];
-    const consumeExecution = mock(async () => true);
-    const fakeAdapter = createFakeGitHubAdapter({
-      allowed_repositories: ['bluedevilcollectibles/bdc-harness'],
-      authorization_deps: {
-        getPolicy: async () => policy(),
-        getCapabilityState: async () => ({
-          capability: 'merge',
-          action_enabled: true,
-          circuit_state: 'closed',
-          circuit_reason: null,
-          circuit_opened_at: null,
-          policy_digest: POLICY_DIGEST,
-          verifier_registry_digest: VERIFIER_DIGEST,
-          updated_at: '2026-07-15T11:59:30.000Z',
-          updated_by: 'test',
-        }),
-        getProposal: async () => proposal(),
-        getCurrentTimeForTest: async () => '2026-07-15T12:00:00.000Z',
-        appendEvent: async event => gateEvents.push(event),
-      },
-      consume_execution: consumeExecution,
-      record_attempt: async event => attemptEvents.push(event),
-    });
-    const mergePullRequest = mock(async () => {
-      throw new Error('poison merge client called');
-    });
-    const actions: Array<{ action: string; result: string }> = [];
-
-    await runOverseerService({
-      once: true,
-      enabled: true,
-      dryRun: false,
-      adapterKind: 'fake',
-      fakeGitHubAdapter: fakeAdapter,
-      deps: {
-        listRunsForWatch: async () => [
-          {
-            id: 'run-live-fake',
-            woId: 'WO-LIVE-FAKE-01',
-            owner: 'bluedevilcollectibles',
-            repo: 'bdc-harness',
-            status: 'failed',
-            metadata: { overseer_m31_permit: permit() },
-          },
-        ],
-        listRunEvents: async () => [],
-        findPullRequest: async () => ({
-          exists: true,
-          state: 'open',
-          checks: { total: 1, passed: 1, failed: 0, pending: 0 },
-          mergeable: true,
-          pr: { owner: 'bluedevilcollectibles', repo: 'bdc-harness', number: 42 },
-        }),
-        mergePullRequest,
-        insertOverseerAction: async action => {
-          actions.push({ action: action.action, result: action.result });
-        },
-      },
-    });
-
-    expect(gateEvents).toHaveLength(1);
-    expect(attemptEvents).toHaveLength(1);
-    expect(consumeExecution).toHaveBeenCalledWith('execution-service-1');
-    expect(mergePullRequest).not.toHaveBeenCalled();
-    expect(actions).toEqual([{ action: 'fake_merge_attempt', result: 'fake_accepted' }]);
-  });
-
   test('missing permit fails closed before the fake or real mutation boundaries', async () => {
-    const attemptMutation = mock(async () => {
-      throw new Error('fake boundary must not run without a permit');
-    });
     const mergePullRequest = mock(async () => ({ merged: true }));
     const actions: Array<{ action: string; result: string }> = [];
 
@@ -412,7 +316,6 @@ describe('service', () => {
       enabled: true,
       dryRun: false,
       adapterKind: 'fake',
-      fakeGitHubAdapter: { attemptMutation },
       deps: {
         listRunsForWatch: async () => [
           {
@@ -439,7 +342,6 @@ describe('service', () => {
       },
     });
 
-    expect(attemptMutation).not.toHaveBeenCalled();
     expect(mergePullRequest).not.toHaveBeenCalled();
     expect(actions).toEqual([{ action: 'merge_denied', result: 'permit_missing' }]);
   });

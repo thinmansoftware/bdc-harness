@@ -1,55 +1,27 @@
-/**
- * Tests for the authorization boundary in overseer-bridge.ts.
- *
- * Runs in a separate bun test invocation from overseer-bridge.test.ts because
- * mock.module calls must not conflict across test files.
- *
- * Strategy: The bridge calls runAuthorizedEscalation(runId, options) where
- * options.permit comes from permitFromMetadata(workflowRun.metadata).
- * No permit -> accepted=false, reason=permit_missing -> escalation_denied log.
- */
-
 import { afterEach, describe, expect, it, mock } from 'bun:test';
-
-let authorizedEscalationCallCount = 0;
-let lastAuthorizedEscalationOptions: { permit: unknown; actor: string } | undefined;
-
-mock.module('@archon/overseer', () => ({
-  classifyError: (input: { message: string }) => {
-    if (
-      typeof input.message === 'string' &&
-      (input.message.includes('npm') || input.message.includes('yarn'))
-    )
-      return 'npm_not_found';
-    return 'unknown';
-  },
-  decide: (input: { errorClass: string }) => {
-    if (input.errorClass === 'npm_not_found') {
-      return { decision: 'skip', reason: 'tool missing' };
-    }
-    return {
-      decision: 'escalate',
-      reason: 'unknown failure',
-      escalationContext: { errorClass: input.errorClass, woId: 'WO-GATE-TEST' },
-    };
-  },
-  runAuthorizedEscalation: async (_runId: string, options: { permit: unknown; actor: string }) => {
-    authorizedEscalationCallCount++;
-    lastAuthorizedEscalationOptions = options;
-    if (!options.permit) return { accepted: false, reason: 'permit_missing', mutation_sent: false };
-    return { accepted: true, reason: 'fake_accepted', mutation_sent: false };
-  },
-  permitFromMetadata: (metadata: unknown) => {
-    if (!metadata || typeof metadata !== 'object') return null;
-    return (metadata as Record<string, unknown>).overseer_m31_permit ?? null;
-  },
-}));
-
-const { handleNodeFailure } = await import('./overseer-bridge.ts');
+import { mkdtempSync, rmSync } from 'fs';
+import { tmpdir } from 'os';
+import { join } from 'path';
+import { closeDatabase, getDatabase, resetDatabase } from '@archon/core/db/connection';
+import { listOverseerCapabilityEvents } from '@archon/core/db/overseer-capabilities';
+import { handleNodeFailure } from './overseer-bridge.ts';
 import type { DagNode } from './schemas/dag-node.ts';
 import type { IWorkflowStore } from './store.ts';
 import type { WorkflowRun } from './schemas/workflow-run.ts';
 import type { Logger } from '@archon/paths';
+import type { M31ActionPermit } from '@archon/overseer/m31-substrate';
+
+const POLICY_DIGEST = 'a'.repeat(64);
+const VERIFIER_DIGEST = 'b'.repeat(64);
+const ENV_KEYS = [
+  'ARCHON_HOME',
+  'DATABASE_URL',
+  'OVERSEER_ENABLED',
+  'OVERSEER_EMERGENCY_STOP',
+  'OVERSEER_DRY_RUN',
+  'OVERSEER_ESCALATION_ACTIONS_ENABLED',
+] as const;
+const oldEnv = new Map(ENV_KEYS.map(key => [key, process.env[key]]));
 
 function makeMockStore(): IWorkflowStore {
   return {
@@ -122,69 +94,143 @@ function hasDeniedLog(log: Logger): boolean {
   return logInfo.mock.calls.some(call => call[1] === 'overseer.escalation_denied');
 }
 
-describe('handleNodeFailure -- authorization boundary', () => {
-  afterEach(() => {
-    authorizedEscalationCallCount = 0;
-    lastAuthorizedEscalationOptions = undefined;
+async function withPersistentEscalationPermit(
+  work: (permit: M31ActionPermit) => Promise<void>
+): Promise<void> {
+  const home = mkdtempSync(join(tmpdir(), 'archon-workflow-escalation-'));
+  await closeDatabase();
+  resetDatabase();
+  process.env.ARCHON_HOME = home;
+  delete process.env.DATABASE_URL;
+  process.env.OVERSEER_ENABLED = 'true';
+  process.env.OVERSEER_EMERGENCY_STOP = 'false';
+  process.env.OVERSEER_DRY_RUN = 'false';
+  process.env.OVERSEER_ESCALATION_ACTIONS_ENABLED = 'true';
+
+  try {
+    const db = getDatabase();
+    const now = Date.now();
+    const createdAt = new Date(now - 30_000).toISOString();
+    const expiresAt = new Date(now + 300_000).toISOString();
+    await db.query(
+      `INSERT INTO overseer_m31_snapshots (
+        snapshot_id, schema_version, repository, capture_started_at, capture_completed_at,
+        operator_actor, operator_model, read_only_query_method, base_branch, base_sha,
+        artifact_path, git_object_format, evidence_git_blob, mutation_attempted,
+        mutation_succeeded, fusion_calls_attempted, fusion_calls_succeeded
+      ) VALUES ('snapshot-workflow-valid', 'v1', $1, $2, $2, 'test', 'test',
+        'unit-test', 'dev', $3, 'artifacts/workflow-valid.json', 'sha1', $4,
+        0, 0, 0, 0)`,
+      ['bluedevilcollectibles/bdc-harness', createdAt, 'a'.repeat(40), 'b'.repeat(40)]
+    );
+    await db.query(
+      `INSERT INTO overseer_m31_action_proposals (
+        proposal_id, repository, pr_number, head_sha, base_branch, base_sha,
+        snapshot_id, evidence_path, evidence_git_blob, action_kind,
+        action_parameters_json, actor, created_at, expires_at, execution_id,
+        capability, policy_digest, verifier_registry_digest
+      ) VALUES ('proposal-workflow-valid', $1, 42, $2, 'dev', $3,
+        'snapshot-workflow-valid', 'artifacts/workflow-valid.json', $4,
+        'STAGING_MUTATION', '{}', 'test', $5, $6, 'execution-workflow-valid',
+        'overseer.m31.staging_mutation', $7, $8)`,
+      [
+        'bluedevilcollectibles/bdc-harness',
+        'c'.repeat(40),
+        'a'.repeat(40),
+        'b'.repeat(40),
+        createdAt,
+        expiresAt,
+        POLICY_DIGEST,
+        VERIFIER_DIGEST,
+      ]
+    );
+    await db.query(
+      `UPDATE overseer_capability_state
+       SET action_enabled = 1, circuit_state = 'closed', policy_digest = $1,
+         verifier_registry_digest = $2, updated_at = $3, updated_by = 'test'
+       WHERE capability = 'escalation'`,
+      [POLICY_DIGEST, VERIFIER_DIGEST, createdAt]
+    );
+    const permit: M31ActionPermit = {
+      permit_id: 'permit-workflow-valid',
+      proposal_id: 'proposal-workflow-valid',
+      execution_id: 'execution-workflow-valid',
+      repository: 'bluedevilcollectibles/bdc-harness',
+      pr_number: 42,
+      head_sha: 'c'.repeat(40),
+      base_branch: 'dev',
+      base_sha: 'a'.repeat(40),
+      snapshot_id: 'snapshot-workflow-valid',
+      action_kind: 'STAGING_MUTATION',
+      capability: 'overseer.m31.staging_mutation',
+      issued_at: new Date(now - 1_000).toISOString(),
+      valid_until: new Date(now + 60_000).toISOString(),
+    };
+    await work(permit);
+  } finally {
+    await closeDatabase();
+    resetDatabase();
+    rmSync(home, { recursive: true, force: true });
+  }
+}
+
+describe('handleNodeFailure authorization boundary', () => {
+  afterEach(async () => {
+    await closeDatabase();
+    resetDatabase();
+    for (const key of ENV_KEYS) {
+      const value = oldEnv.get(key);
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
   });
 
-  it('no permit -> boundary returns accepted=false/permit_missing -> escalation_denied log', async () => {
+  it('missing permit is denied by the real shared boundary', async () => {
     const deps = makeDeps();
-    await handleNodeFailure(deps, makeWorkflowRun(), makeNode(), {
-      errorMsg: 'something weird',
+    await handleNodeFailure(deps, makeWorkflowRun(), makeNode('war-council-validator'), {
+      errorMsg: 'REJECT missing required implementation evidence',
       logDir: '/tmp/test',
     });
-    expect(authorizedEscalationCallCount).toBe(1);
-    expect(lastAuthorizedEscalationOptions?.permit).toBeNull();
+
     expect(hasDeniedLog(deps.log)).toBe(true);
+    const logInfo = deps.log.info as unknown as { mock: { calls: unknown[][] } };
+    const denialCall = logInfo.mock.calls.find(call => call[1] === 'overseer.escalation_denied');
+    expect((denialCall?.[0] as Record<string, unknown>).reason).toBe('permit_missing');
   });
 
-  it('authorization boundary is always invoked for escalate decisions -- never bypassed', async () => {
-    const deps = makeDeps();
-    await handleNodeFailure(deps, makeWorkflowRun(), makeNode(), {
-      errorMsg: 'something weird',
-      logDir: '/tmp/test',
-    });
-    expect(authorizedEscalationCallCount).toBe(1);
-  });
-
-  it('skip decision never invokes authorization boundary', async () => {
+  it('skip decisions never enter the escalation boundary', async () => {
     const deps = makeDeps();
     await handleNodeFailure(deps, makeWorkflowRun(), makeNode(), {
       errorMsg: 'npm: command not found',
       logDir: '/tmp/test',
     });
-    expect(authorizedEscalationCallCount).toBe(0);
-  });
 
-  it('denial log reason is permit_missing -- boundary ran and rejected, not bypassed', async () => {
-    const deps = makeDeps();
-    await handleNodeFailure(deps, makeWorkflowRun(), makeNode(), {
-      errorMsg: 'something weird',
-      logDir: '/tmp/test',
-    });
-    expect(authorizedEscalationCallCount).toBe(1);
-    expect(hasDeniedLog(deps.log)).toBe(true);
-    const logInfo = deps.log.info as unknown as { mock: { calls: unknown[][] } };
-    const denialCall = logInfo.mock.calls.find(call => call[1] === 'overseer.escalation_denied');
-    expect(denialCall).toBeDefined();
-    const fields = denialCall![0] as Record<string, unknown>;
-    expect(fields.reason).toBe('permit_missing');
-  });
-
-  it('valid permit metadata is passed only to the shared fake-safe boundary', async () => {
-    const permit = { permit_id: 'permit-workflow-valid' };
-    const deps = makeDeps();
-    await handleNodeFailure(deps, makeWorkflowRun({ overseer_m31_permit: permit }), makeNode(), {
-      errorMsg: 'something weird',
-      logDir: '/tmp/test',
-    });
-
-    expect(authorizedEscalationCallCount).toBe(1);
-    expect(lastAuthorizedEscalationOptions).toEqual({
-      permit,
-      actor: 'overseer-workflow-bridge',
-    });
     expect(hasDeniedLog(deps.log)).toBe(false);
+  });
+
+  it('valid permit reaches real persistent authorization and records one inert attempt', async () => {
+    await withPersistentEscalationPermit(async permit => {
+      const deps = makeDeps();
+      await handleNodeFailure(
+        deps,
+        makeWorkflowRun({ overseer_m31_permit: permit }),
+        makeNode('war-council-validator'),
+        {
+          errorMsg: 'REJECT missing required implementation evidence',
+          logDir: '/tmp/test',
+        }
+      );
+
+      const attempts = (await listOverseerCapabilityEvents('escalation')).filter(
+        event => event.event_type === 'adapter_attempt'
+      );
+      expect(hasDeniedLog(deps.log)).toBe(false);
+      expect(attempts).toHaveLength(1);
+      expect(attempts[0]?.details).toMatchObject({
+        adapter: 'fake-escalation',
+        accepted: true,
+        mutation_sent: false,
+      });
+    });
   });
 });

@@ -1,15 +1,14 @@
-import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test';
-import { readFileSync, unlinkSync } from 'fs';
+import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
+import { readFileSync, rmSync, unlinkSync } from 'fs';
 import { join } from 'path';
-import { SqliteAdapter } from './adapters/sqlite';
-import type { IDatabase, QueryResult, SqlDialect } from './adapters/types';
+import type { IDatabase } from './adapters/types';
+import { closeDatabase, getDatabase, resetDatabase } from './connection';
 
 let db: IDatabase;
 let currentDbPath = '';
-
-mock.module('./connection', () => ({
-  getDatabase: () => db,
-}));
+let currentHome = '';
+const oldArchonHome = process.env.ARCHON_HOME;
+const oldDatabaseUrl = process.env.DATABASE_URL;
 
 import {
   OVERSEER_CAPABILITIES,
@@ -17,6 +16,7 @@ import {
   getOverseerCapabilityState,
   listOverseerCapabilityEvents,
   listOverseerCapabilityStates,
+  normalizeOverseerCapabilityTimestamp,
   openOverseerCapabilityCircuit,
 } from './overseer-capabilities';
 
@@ -61,82 +61,6 @@ function eventInput(overrides: Record<string, unknown> = {}): {
   };
 }
 
-function timestampRowDatabase(sqlDialect: SqlDialect): IDatabase {
-  const dateTimestamp = new Date('2026-07-15T12:34:56.789Z');
-  const offsetTimestamp = '2026-07-15T08:34:56.789-04:00';
-  const stateRows: readonly Record<string, unknown>[] = [
-    {
-      capability: 'repair',
-      action_enabled: false,
-      circuit_state: 'open',
-      circuit_reason: 'test',
-      circuit_opened_at: dateTimestamp,
-      policy_digest: POLICY_DIGEST,
-      verifier_registry_digest: VERIFIER_DIGEST,
-      updated_at: offsetTimestamp,
-      updated_by: 'test-operator',
-    },
-    {
-      capability: 'merge',
-      action_enabled: false,
-      circuit_state: 'closed',
-      circuit_reason: null,
-      circuit_opened_at: null,
-      policy_digest: POLICY_DIGEST,
-      verifier_registry_digest: VERIFIER_DIGEST,
-      updated_at: dateTimestamp,
-      updated_by: 'test-operator',
-    },
-  ];
-  const eventRows: readonly Record<string, unknown>[] = [
-    {
-      event_id: 'event-string-time',
-      capability: 'merge',
-      event_type: 'gate_denied',
-      reason: 'test',
-      actor: 'test-operator',
-      correlation_id: 'corr-string-time',
-      proposal_id: null,
-      execution_id: null,
-      policy_digest: POLICY_DIGEST,
-      verifier_registry_digest: VERIFIER_DIGEST,
-      details_json: '{}',
-      created_at: offsetTimestamp,
-    },
-    {
-      event_id: 'event-date-time',
-      capability: 'merge',
-      event_type: 'gate_denied',
-      reason: 'test',
-      actor: 'test-operator',
-      correlation_id: 'corr-date-time',
-      proposal_id: null,
-      execution_id: null,
-      policy_digest: POLICY_DIGEST,
-      verifier_registry_digest: VERIFIER_DIGEST,
-      details_json: '{}',
-      created_at: dateTimestamp,
-    },
-  ];
-
-  return {
-    dialect: 'postgres',
-    sql: sqlDialect,
-    async query<T>(statement: string): Promise<QueryResult<T>> {
-      const source = statement.includes('overseer_capability_state') ? stateRows : eventRows;
-      return { rows: source as readonly T[], rowCount: source.length };
-    },
-    async withTransaction<T>(
-      _fn: (
-        query: <U>(statement: string, params?: unknown[]) => Promise<QueryResult<U>>
-      ) => Promise<T>
-    ): Promise<T> {
-      throw new Error('transaction_not_expected');
-    },
-    async close(): Promise<void> {},
-  };
-}
-
 function createTableDefinition(schema: string, table: string): string {
   const start = schema.indexOf(`CREATE TABLE IF NOT EXISTS ${table}`);
   if (start < 0) throw new Error(`missing_table_definition:${table}`);
@@ -147,17 +71,28 @@ function createTableDefinition(schema: string, table: string): string {
 }
 
 describe('overseer capability persistence (sqlite)', () => {
-  beforeEach(() => {
-    currentDbPath = join(
+  beforeEach(async () => {
+    await closeDatabase();
+    resetDatabase();
+    currentHome = join(
       import.meta.dir,
-      `.test-overseer-capabilities-${Date.now()}-${Math.random().toString(36).slice(2)}.db`
+      `.test-overseer-capabilities-${Date.now()}-${Math.random().toString(36).slice(2)}`
     );
-    db = new SqliteAdapter(currentDbPath);
+    currentDbPath = join(currentHome, 'archon.db');
+    process.env.ARCHON_HOME = currentHome;
+    delete process.env.DATABASE_URL;
+    db = getDatabase();
   });
 
   afterEach(async () => {
-    await db.close();
+    await closeDatabase();
+    resetDatabase();
     cleanupDb(currentDbPath);
+    if (currentHome) rmSync(currentHome, { recursive: true, force: true });
+    if (oldArchonHome === undefined) delete process.env.ARCHON_HOME;
+    else process.env.ARCHON_HOME = oldArchonHome;
+    if (oldDatabaseUrl === undefined) delete process.env.DATABASE_URL;
+    else process.env.DATABASE_URL = oldDatabaseUrl;
   });
 
   test('seeds exactly five disabled and closed capability states in deterministic order', async () => {
@@ -179,24 +114,13 @@ describe('overseer capability persistence (sqlite)', () => {
     expect((await getOverseerCapabilityState('merge'))?.capability).toBe('merge');
   });
 
-  test('normalizes PostgreSQL Date and string timestamps to ISO strings', async () => {
-    const sqlDialect = db.sql;
-    await db.close();
-    cleanupDb(currentDbPath);
-    currentDbPath = '';
-    db = timestampRowDatabase(sqlDialect);
-
-    const states = await listOverseerCapabilityStates();
-    expect(states[0]?.circuit_opened_at).toBe('2026-07-15T12:34:56.789Z');
-    expect(states[0]?.updated_at).toBe('2026-07-15T12:34:56.789Z');
-    expect(states[1]?.circuit_opened_at).toBeNull();
-    expect(states[1]?.updated_at).toBe('2026-07-15T12:34:56.789Z');
-
-    const events = await listOverseerCapabilityEvents('merge');
-    expect(events.map(event => event.created_at)).toEqual([
-      '2026-07-15T12:34:56.789Z',
-      '2026-07-15T12:34:56.789Z',
-    ]);
+  test('normalizes PostgreSQL Date and offset timestamps to ISO strings', () => {
+    expect(normalizeOverseerCapabilityTimestamp(new Date('2026-07-15T12:34:56.789Z'))).toBe(
+      '2026-07-15T12:34:56.789Z'
+    );
+    expect(normalizeOverseerCapabilityTimestamp('2026-07-15T08:34:56.789-04:00')).toBe(
+      '2026-07-15T12:34:56.789Z'
+    );
   });
 
   test('keeps PostgreSQL migration and SQLite schema logically equivalent', async () => {
@@ -377,6 +301,84 @@ describe('overseer capability persistence (sqlite)', () => {
       'message',
       expect.stringContaining('overseer_capability_events.execution_id')
     );
+    expect(
+      (await listOverseerCapabilityEvents('merge')).filter(
+        event => event.event_type === 'adapter_attempt'
+      )
+    ).toHaveLength(1);
+  });
+
+  test('rejects an adapter replay after the database connection restarts', async () => {
+    await db.query(
+      `INSERT INTO overseer_m31_snapshots (
+        snapshot_id, schema_version, repository, capture_started_at, capture_completed_at,
+        operator_actor, operator_model, read_only_query_method, base_branch, base_sha,
+        artifact_path, git_object_format, evidence_git_blob, mutation_attempted,
+        mutation_succeeded, fusion_calls_attempted, fusion_calls_succeeded
+      ) VALUES ($1, $2, $3, $4, $4, $5, $5, $6, $7, $8, $9, $10, $11, 0, 0, 0, 0)`,
+      [
+        'snapshot-adapter-restart',
+        'v1',
+        'bluedevilcollectibles/bdc-harness',
+        '2026-07-15T12:00:00.000Z',
+        'test',
+        'unit-test',
+        'dev',
+        'a'.repeat(40),
+        'artifacts/adapter-restart.json',
+        'sha1',
+        'd'.repeat(40),
+      ]
+    );
+    await db.query(
+      `INSERT INTO overseer_m31_action_proposals (
+        proposal_id, repository, pr_number, head_sha, base_branch, base_sha,
+        snapshot_id, evidence_path, evidence_git_blob, action_kind,
+        action_parameters_json, actor, created_at, expires_at, execution_id,
+        capability, policy_digest, verifier_registry_digest
+      ) VALUES ($1, $2, 42, $3, $4, $5, $6, $7, $8, 'MERGE', '{}', $9,
+        $10, $11, $12, $13, $14, $15)`,
+      [
+        'proposal-adapter-restart',
+        'bluedevilcollectibles/bdc-harness',
+        'c'.repeat(40),
+        'dev',
+        'a'.repeat(40),
+        'snapshot-adapter-restart',
+        'artifacts/adapter-restart.json',
+        'd'.repeat(40),
+        'test',
+        '2026-07-15T12:00:00.000Z',
+        '2026-07-15T12:05:00.000Z',
+        'execution-adapter-restart',
+        'overseer.m31.merge',
+        POLICY_DIGEST,
+        VERIFIER_DIGEST,
+      ]
+    );
+    await appendOverseerCapabilityEvent(
+      eventInput({
+        event_id: 'adapter-restart-first',
+        event_type: 'adapter_attempt',
+        proposal_id: 'proposal-adapter-restart',
+        execution_id: 'execution-adapter-restart',
+      })
+    );
+
+    await closeDatabase();
+    resetDatabase();
+    db = getDatabase();
+
+    await expect(
+      appendOverseerCapabilityEvent(
+        eventInput({
+          event_id: 'adapter-restart-replay',
+          event_type: 'adapter_attempt',
+          proposal_id: 'proposal-adapter-restart',
+          execution_id: 'execution-adapter-restart',
+        })
+      )
+    ).rejects.toThrow(/overseer_capability_events\.execution_id/);
     expect(
       (await listOverseerCapabilityEvents('merge')).filter(
         event => event.event_type === 'adapter_attempt'

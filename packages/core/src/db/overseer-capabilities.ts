@@ -167,7 +167,7 @@ function parseDetails(value: unknown): Record<string, unknown> {
   return parsed as Record<string, unknown>;
 }
 
-function normalizeTimestamp(value: Date | string): string {
+export function normalizeOverseerCapabilityTimestamp(value: Date | string): string {
   const timestamp = value instanceof Date ? value : new Date(value);
   if (Number.isNaN(timestamp.getTime())) {
     throw new Error('invalid_overseer_capability_timestamp');
@@ -182,10 +182,12 @@ function normalizeState(row: CapabilityStateRow): OverseerCapabilityState {
     circuit_state: row.circuit_state === 'open' ? 'open' : 'closed',
     circuit_reason: row.circuit_reason,
     circuit_opened_at:
-      row.circuit_opened_at === null ? null : normalizeTimestamp(row.circuit_opened_at),
+      row.circuit_opened_at === null
+        ? null
+        : normalizeOverseerCapabilityTimestamp(row.circuit_opened_at),
     policy_digest: row.policy_digest,
     verifier_registry_digest: row.verifier_registry_digest,
-    updated_at: normalizeTimestamp(row.updated_at),
+    updated_at: normalizeOverseerCapabilityTimestamp(row.updated_at),
     updated_by: row.updated_by,
   };
 }
@@ -203,7 +205,7 @@ function normalizeEvent(row: CapabilityEventRow): OverseerCapabilityEvent {
     policy_digest: row.policy_digest,
     verifier_registry_digest: row.verifier_registry_digest,
     details: parseDetails(row.details_json),
-    created_at: normalizeTimestamp(row.created_at),
+    created_at: normalizeOverseerCapabilityTimestamp(row.created_at),
   };
 }
 

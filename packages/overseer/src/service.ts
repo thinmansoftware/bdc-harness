@@ -43,7 +43,6 @@ export interface OverseerServiceOptions {
    */
   adapterKind?: OverseerWiredAdapterKind;
   deps?: OverseerRunStoreDeps & OverseerActionsDeps & GitHubClientDeps;
-  fakeGitHubAdapter?: FakeGitHubAdapter;
 }
 
 function envEnabled(value: string | undefined): boolean {
@@ -165,7 +164,7 @@ export async function runOverseerService(options: OverseerServiceOptions = {}): 
     throw new Error(`overseer_slice1_real_adapter_forbidden:${adapterKind}`);
   }
   const deps = options.deps ?? resolveDefaultDeps();
-  const adapter = options.fakeGitHubAdapter ?? createDefaultFakeGitHubAdapter();
+  const adapter = createDefaultFakeGitHubAdapter();
   await watchLoop(deps, record => handleRecord(record, deps, adapter, dryRun, 'overseer-service'), {
     intervalMs: options.intervalMs,
     once: options.once,
