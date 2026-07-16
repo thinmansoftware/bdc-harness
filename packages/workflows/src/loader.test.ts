@@ -384,7 +384,7 @@ nodes:
       expect(result.error?.error).toContain("Unknown failover_provider 'nope'");
     });
 
-    it('should accept + carry through valid failover_provider/failover_model', () => {
+    it('should accept + carry through valid failover provider, model, and agent', () => {
       const yaml = `name: good-failover
 description: Valid failover config at workflow + node level
 provider: claude
@@ -395,19 +395,41 @@ nodes:
     prompt: do it
     failover_provider: codex
     failover_model: gpt-5.5
+    failover_agent: major-build-opr
 `;
       const result = parseWorkflow(yaml, 'good-failover.yaml');
       expect(result.error).toBeNull();
       const wf = result.workflow as unknown as {
         failover_provider?: string;
         failover_model?: string;
-        nodes: Array<{ id: string; failover_provider?: string; failover_model?: string }>;
+        nodes: Array<{
+          id: string;
+          failover_provider?: string;
+          failover_model?: string;
+          failover_agent?: string;
+        }>;
       };
       expect(wf.failover_provider).toBe('codex');
       expect(wf.failover_model).toBe('gpt-5.5');
       const plan = wf.nodes.find(n => n.id === 'plan')!;
       expect(plan.failover_provider).toBe('codex');
       expect(plan.failover_model).toBe('gpt-5.5');
+      expect(plan.failover_agent).toBe('major-build-opr');
+    });
+
+    it('should reject failover_agent when no failover provider is declared', () => {
+      const yaml = `name: bad-failover-agent
+description: failover agent without a provider
+provider: claude
+nodes:
+  - id: plan
+    prompt: do it
+    failover_agent: major-build-opr
+`;
+      const result = parseWorkflow(yaml, 'bad-failover-agent.yaml');
+      expect(result.workflow).toBeNull();
+      expect(result.error?.error).toContain('failover_agent');
+      expect(result.error?.error).toContain('failover_provider');
     });
 
     it('should load a workflow with no failover fields unchanged (byte-identical)', () => {

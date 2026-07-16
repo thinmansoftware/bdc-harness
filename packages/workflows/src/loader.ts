@@ -451,6 +451,17 @@ export function parseWorkflow(content: string, filename: string): ParseResult {
     for (const node of dagNodes) {
       const effectiveFailoverProvider =
         (node as { failover_provider?: string }).failover_provider ?? workflowFailoverProvider;
+      const failoverAgent = (node as { failover_agent?: string }).failover_agent;
+      if (failoverAgent && !effectiveFailoverProvider) {
+        return {
+          workflow: null,
+          error: {
+            filename,
+            error: `Node '${node.id}': failover_agent '${failoverAgent}' requires failover_provider at the node or workflow level`,
+            errorType: 'validation_error',
+          },
+        };
+      }
       if (effectiveFailoverProvider) {
         const required = deriveNodeExecutionRequirements(node);
         const missing = getMissingProviderExecutionCapabilities(

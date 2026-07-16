@@ -513,6 +513,49 @@ describe('validateWorkflowResources -- failover persona-pin conflict', () => {
     expect(err).toBeUndefined();
   });
 
+  test('accepts a model-less failover_agent for a Claude-pinned primary persona', async () => {
+    await createAgentFile('primary-sonnet-builder', { model: 'sonnet' });
+    await createAgentFile('major-build-opr', {});
+    const workflow = makeWorkflow(
+      'test',
+      [
+        {
+          id: 'yaml-author',
+          loop: { prompt: 'p', until: 'COMPLETE', max_iterations: 1 },
+          agent: 'primary-sonnet-builder',
+          failover_provider: 'codex',
+          failover_model: 'sol',
+          failover_agent: 'major-build-opr',
+        } as unknown as DagNode,
+      ],
+      'claude'
+    );
+
+    const issues = await validateWorkflowResources(workflow, tmpDir);
+    expect(issues.filter(i => i.level === 'error')).toEqual([]);
+  });
+
+  test('rejects a missing failover_agent file before dispatch', async () => {
+    await createAgentFile('primary-sonnet-builder', { model: 'sonnet' });
+    const workflow = makeWorkflow(
+      'test',
+      [
+        {
+          id: 'yaml-author',
+          loop: { prompt: 'p', until: 'COMPLETE', max_iterations: 1 },
+          agent: 'primary-sonnet-builder',
+          failover_provider: 'codex',
+          failover_agent: 'missing-builder',
+        } as unknown as DagNode,
+      ],
+      'claude'
+    );
+
+    const issues = await validateWorkflowResources(workflow, tmpDir);
+    const err = issues.find(i => i.level === 'error' && i.field === 'failover_agent');
+    expect(err?.message).toContain('missing-builder');
+  });
+
   test('no conflict when failover_provider is non-codex even if the persona pins a model', async () => {
     await createAgentFile('sonnet-architect-2', { model: 'sonnet' });
     const workflow = makeWorkflow(
