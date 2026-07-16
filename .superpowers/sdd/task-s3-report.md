@@ -43,8 +43,10 @@ Result: READY_FOR_INDEPENDENT_EXACT_HEAD_REVIEW.
 
 ## Contract evidence
 
-- Contract SHA-256:
-  `473f819560b900959478013bdfd271a2783d99dd0b1bd3908d2e52c8874047a3`
+- Contract committed-content SHA-256:
+  `3ac47553c4ccb871d57a685c2e239805ab9c2d650038acecd11059437df0f346`
+- Contract hash command:
+  `git show HEAD:docs/contracts/overseer-briefing-v1.md | sha256sum`
 - Migration SHA-256:
   `bc771293b691209b978a52b43a5dbafec22c55c4823ce7592865f345f2a22bb1`
 - Retry offsets: exactly 0, 30, and 120 seconds from card creation.
