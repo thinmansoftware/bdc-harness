@@ -69,7 +69,7 @@ export type OverseerControlPlaneFailureCode =
   | 'budget_overage_recorded';
 
 export type OverseerControlPlaneResult<T> =
-  | { readonly ok: true; readonly value: T }
+  | { readonly ok: true; readonly value: T; readonly created?: boolean }
   | { readonly ok: false; readonly code: OverseerControlPlaneFailureCode };
 
 export interface AdmitOverseerParentInput {
@@ -575,10 +575,11 @@ async function reconcileExpiredParentsInTransaction(
       [parent.parent_id]
     );
     for (const child of children.rows) {
-      await query(
-        "UPDATE overseer_parent_children SET state='FAILED',terminal_at=$1 WHERE child_id=$2 AND state IN ('PENDING','RUNNING')",
-        [clock.db_now, child.child_id]
+      const changedChild = await query(
+        "UPDATE overseer_parent_children SET state='FAILED',terminal_at=$1 WHERE child_id=$2 AND parent_id=$3 AND state=$4",
+        [clock.db_now, child.child_id, parent.parent_id, child.state]
       );
+      if (changedChild.rowCount !== 1) continue;
       await appendControlEvent(query, {
         resource_kind: 'CHILD',
         resource_key: child.child_id,
@@ -634,7 +635,7 @@ export async function admitOverseerParent(
         existing.correlation_id === input.correlation_id &&
         existing.state === input.state
       ) {
-        return { ok: true, value: existing };
+        return { ok: true, created: false, value: existing };
       }
       return { ok: false, code: 'parent_identity_conflict' };
     }
@@ -674,7 +675,7 @@ export async function admitOverseerParent(
     });
     const value = await rowByParent(query, input.parent_id.trim());
     if (!value) throw new Error('overseer_control_plane_parent_insert_missing');
-    return { ok: true, value };
+    return { ok: true, created: true, value };
   });
 }
 
@@ -695,10 +696,20 @@ export async function heartbeatOverseerParent(
       if (!currentParentFence(parent, input, clock.db_now)) {
         return { ok: false, code: 'parent_lease_stale' };
       }
-      await query(
-        'UPDATE overseer_parent_commitments SET heartbeat_at=$1,lease_expires_at=$2 WHERE parent_id=$3',
-        [clock.db_now, clock.lease_expires_at, input.parent_id]
+      const changed = await query(
+        `UPDATE overseer_parent_commitments SET heartbeat_at=$1,lease_expires_at=$2
+         WHERE parent_id=$3 AND owner_id=$4 AND fencing_token=$5 AND state=$6
+           AND released_at IS NULL AND lease_expires_at > $1`,
+        [
+          clock.db_now,
+          clock.lease_expires_at,
+          input.parent_id,
+          input.owner_id,
+          input.fencing_token,
+          parent.state,
+        ]
       );
+      if (changed.rowCount !== 1) return { ok: false, code: 'parent_lease_stale' };
       await appendControlEvent(query, {
         resource_kind: 'PARENT',
         resource_key: input.parent_id,
@@ -733,10 +744,20 @@ export async function transitionOverseerParentState(
         return { ok: false, code: 'parent_lease_stale' };
       }
       if (parent.state === input.state) return { ok: true, value: parent };
-      await query('UPDATE overseer_parent_commitments SET state=$1 WHERE parent_id=$2', [
-        input.state,
-        input.parent_id,
-      ]);
+      const changed = await query(
+        `UPDATE overseer_parent_commitments SET state=$1
+         WHERE parent_id=$2 AND owner_id=$3 AND fencing_token=$4 AND state=$5
+           AND released_at IS NULL AND lease_expires_at > $6`,
+        [
+          input.state,
+          input.parent_id,
+          input.owner_id,
+          input.fencing_token,
+          parent.state,
+          clock.db_now,
+        ]
+      );
+      if (changed.rowCount !== 1) return { ok: false, code: 'parent_lease_stale' };
       await appendControlEvent(query, {
         resource_kind: 'PARENT',
         resource_key: input.parent_id,
@@ -772,7 +793,7 @@ export async function linkOverseerChild(
       const existing = await rowByChild(query, input.child_id);
       if (existing) {
         return existing.parent_id === input.parent_id
-          ? { ok: true, value: existing }
+          ? { ok: true, created: false, value: existing }
           : { ok: false, code: 'child_identity_conflict' };
       }
       await query(
@@ -789,7 +810,7 @@ export async function linkOverseerChild(
       });
       const value = await rowByChild(query, input.child_id);
       if (!value) throw new Error('overseer_control_plane_child_insert_missing');
-      return { ok: true, value };
+      return { ok: true, created: true, value };
     }
   );
 }
@@ -820,11 +841,18 @@ export async function transitionOverseerChildState(
           (input.state === 'RUNNING' || terminalChildState(input.state))) ||
         (child.state === 'RUNNING' && terminalChildState(input.state));
       if (!valid) return { ok: false, code: 'child_transition_invalid' };
-      await query('UPDATE overseer_parent_children SET state=$1,terminal_at=$2 WHERE child_id=$3', [
-        input.state,
-        terminalChildState(input.state) ? clock.db_now : null,
-        input.child_id,
-      ]);
+      const changed = await query(
+        `UPDATE overseer_parent_children SET state=$1,terminal_at=$2
+         WHERE child_id=$3 AND parent_id=$4 AND state=$5`,
+        [
+          input.state,
+          terminalChildState(input.state) ? clock.db_now : null,
+          input.child_id,
+          input.parent_id,
+          child.state,
+        ]
+      );
+      if (changed.rowCount !== 1) return { ok: false, code: 'child_transition_invalid' };
       await appendControlEvent(query, {
         resource_kind: 'CHILD',
         resource_key: input.child_id,
@@ -878,10 +906,14 @@ export async function releaseOverseerParent(
       if (input.state !== 'COMPLETED') {
         for (const child of activeChildren.rows) {
           const childState: OverseerChildState = input.state;
-          await query(
-            'UPDATE overseer_parent_children SET state=$1,terminal_at=$2 WHERE child_id=$3',
-            [childState, clock.db_now, child.child_id]
+          const changedChild = await query(
+            `UPDATE overseer_parent_children SET state=$1,terminal_at=$2
+             WHERE child_id=$3 AND parent_id=$4 AND state=$5`,
+            [childState, clock.db_now, child.child_id, input.parent_id, child.state]
           );
+          if (changedChild.rowCount !== 1) {
+            return { ok: false, code: 'parent_children_active' };
+          }
           await appendControlEvent(query, {
             resource_kind: 'CHILD',
             resource_key: child.child_id,
@@ -892,10 +924,22 @@ export async function releaseOverseerParent(
           });
         }
       }
-      await query(
-        'UPDATE overseer_parent_commitments SET state=$1,released_at=$2,terminal_reason=$3,fencing_token=fencing_token+1 WHERE parent_id=$4',
-        [input.state, clock.db_now, input.terminal_reason.trim(), input.parent_id]
+      const changedParent = await query(
+        `UPDATE overseer_parent_commitments
+         SET state=$1,released_at=$2,terminal_reason=$3,fencing_token=fencing_token+1
+         WHERE parent_id=$4 AND owner_id=$5 AND fencing_token=$6 AND state=$7
+           AND released_at IS NULL AND lease_expires_at > $2`,
+        [
+          input.state,
+          clock.db_now,
+          input.terminal_reason.trim(),
+          input.parent_id,
+          input.owner_id,
+          input.fencing_token,
+          parent.state,
+        ]
       );
+      if (changedParent.rowCount !== 1) return { ok: false, code: 'parent_lease_stale' };
       await appendControlEvent(query, {
         resource_kind: 'PARENT',
         resource_key: input.parent_id,
@@ -1028,11 +1072,11 @@ export async function acquireRepositoryMutationLease(
         return replay ? { ok: true, value: existing } : { ok: false, code: 'lease_conflict' };
       } else {
         const nextFence = databaseInteger(existing.fencing_token) + 1;
-        await query(
+        const changed = await query(
           `UPDATE overseer_repository_mutation_leases SET
           lease_id=$1,owner_id=$2,execution_id=$3,action_kind=$4,capability=$5,
           fencing_token=$6,state='ACTIVE',acquired_at=$7,heartbeat_at=$7,expires_at=$8,released_at=NULL
-         WHERE repository=$9`,
+         WHERE repository=$9 AND fencing_token=$10 AND state=$11 AND expires_at=$12`,
           [
             input.lease_id.trim(),
             input.owner_id.trim(),
@@ -1043,8 +1087,12 @@ export async function acquireRepositoryMutationLease(
             clock.db_now,
             clock.lease_expires_at,
             input.repository.trim(),
+            existing.fencing_token,
+            existing.state,
+            existing.expires_at,
           ]
         );
+        if (changed.rowCount !== 1) return { ok: false, code: 'lease_conflict' };
         await appendControlEvent(query, {
           resource_kind: 'REPOSITORY_LEASE',
           resource_key: input.repository.trim(),
@@ -1087,10 +1135,21 @@ export async function heartbeatRepositoryMutationLease(
       ) {
         return { ok: false, code: 'lease_stale' };
       }
-      await query(
-        'UPDATE overseer_repository_mutation_leases SET heartbeat_at=$1,expires_at=$2 WHERE repository=$3',
-        [clock.db_now, clock.lease_expires_at, input.repository]
+      const changed = await query(
+        `UPDATE overseer_repository_mutation_leases SET heartbeat_at=$1,expires_at=$2
+         WHERE repository=$3 AND lease_id=$4 AND owner_id=$5 AND execution_id=$6
+           AND fencing_token=$7 AND state='ACTIVE' AND expires_at > $1`,
+        [
+          clock.db_now,
+          clock.lease_expires_at,
+          input.repository,
+          input.lease_id,
+          input.owner_id,
+          input.execution_id,
+          input.fencing_token,
+        ]
       );
+      if (changed.rowCount !== 1) return { ok: false, code: 'lease_stale' };
       await appendControlEvent(query, {
         resource_kind: 'REPOSITORY_LEASE',
         resource_key: input.repository,
@@ -1125,10 +1184,20 @@ export async function releaseRepositoryMutationLease(
       if (lease.state !== 'ACTIVE' || Date.parse(clock.db_now) >= Date.parse(lease.expires_at)) {
         return { ok: false, code: 'lease_stale' };
       }
-      await query(
-        "UPDATE overseer_repository_mutation_leases SET state='RELEASED',released_at=$1 WHERE repository=$2",
-        [clock.db_now, input.repository]
+      const changed = await query(
+        `UPDATE overseer_repository_mutation_leases SET state='RELEASED',released_at=$1
+         WHERE repository=$2 AND lease_id=$3 AND owner_id=$4 AND execution_id=$5
+           AND fencing_token=$6 AND state='ACTIVE' AND expires_at > $1`,
+        [
+          clock.db_now,
+          input.repository,
+          input.lease_id,
+          input.owner_id,
+          input.execution_id,
+          input.fencing_token,
+        ]
       );
+      if (changed.rowCount !== 1) return { ok: false, code: 'lease_stale' };
       await appendControlEvent(query, {
         resource_kind: 'REPOSITORY_LEASE',
         resource_key: input.repository,
@@ -1226,7 +1295,7 @@ export async function registerVerifierRegistry(
             existing.entries.map(({ registry_digest: _registryDigest, ...entry }) => entry)
           ) === canonicalOverseerControlPlaneJson(entries);
         return same
-          ? { ok: true, value: existing }
+          ? { ok: true, created: false, value: existing }
           : { ok: false, code: 'registry_digest_conflict' };
       }
       const clock = await databaseClock(query, database.dialect);
@@ -1271,7 +1340,7 @@ export async function registerVerifierRegistry(
       });
       const value = await loadVerifierRegistry(query, computed);
       if (!value) throw new Error('overseer_control_plane_verifier_registry_insert_missing');
-      return { ok: true, value };
+      return { ok: true, created: true, value };
     }
   );
 }
@@ -1411,7 +1480,7 @@ export async function reserveFusionBudget(
         existing.call_kind === input.call_kind &&
         existing.requested_microusd === input.requested_microusd;
       return replay
-        ? { ok: true, value: existing }
+        ? { ok: true, created: false, value: existing }
         : { ok: false, code: 'budget_reservation_stale' };
     }
     const clock = await databaseClock(query, database.dialect);
@@ -1459,7 +1528,7 @@ export async function reserveFusionBudget(
     });
     const value = await loadFusionReservation(query, input.reservation_id.trim());
     if (!value) throw new Error('overseer_control_plane_fusion_reservation_insert_missing');
-    return { ok: true, value };
+    return { ok: true, created: true, value };
   });
 }
 
@@ -1481,10 +1550,12 @@ export async function markFusionBudgetCallStarted(
       return { ok: false, code: 'budget_transition_invalid' };
     }
     const clock = await databaseClock(query, database.dialect);
-    await query(
-      "UPDATE overseer_fusion_budget_reservations SET status='IN_FLIGHT',call_started_at=$1 WHERE reservation_id=$2",
-      [clock.db_now, input.reservation_id]
+    const changed = await query(
+      `UPDATE overseer_fusion_budget_reservations SET status='IN_FLIGHT',call_started_at=$1
+       WHERE reservation_id=$2 AND call_id=$3 AND status='RESERVED'`,
+      [clock.db_now, input.reservation_id, input.call_id]
     );
+    if (changed.rowCount !== 1) return { ok: false, code: 'budget_transition_invalid' };
     await appendControlEvent(query, {
       resource_kind: 'FUSION_BUDGET',
       resource_key: input.reservation_id,
@@ -1524,10 +1595,13 @@ export async function reconcileFusionBudget(
       return { ok: false, code: 'budget_transition_invalid' };
     }
     const clock = await databaseClock(query, database.dialect);
-    await query(
-      "UPDATE overseer_fusion_budget_reservations SET status='RECONCILED',actual_microusd=$1,reconciled_at=$2 WHERE reservation_id=$3",
-      [input.actual_microusd, clock.db_now, input.reservation_id]
+    const changed = await query(
+      `UPDATE overseer_fusion_budget_reservations
+       SET status='RECONCILED',actual_microusd=$1,reconciled_at=$2
+       WHERE reservation_id=$3 AND call_id=$4 AND status='IN_FLIGHT'`,
+      [input.actual_microusd, clock.db_now, input.reservation_id, input.call_id]
     );
+    if (changed.rowCount !== 1) return { ok: false, code: 'budget_transition_invalid' };
     const overage = input.actual_microusd > reservation.requested_microusd;
     await appendControlEvent(query, {
       resource_kind: 'FUSION_BUDGET',
@@ -1578,10 +1652,13 @@ export async function releaseFusionBudgetReservation(
       return { ok: false, code: 'budget_transition_invalid' };
     }
     const clock = await databaseClock(query, database.dialect);
-    await query(
-      "UPDATE overseer_fusion_budget_reservations SET status='RELEASED',released_at=$1,release_reason=$2 WHERE reservation_id=$3",
-      [clock.db_now, input.release_reason, input.reservation_id]
+    const changed = await query(
+      `UPDATE overseer_fusion_budget_reservations
+       SET status='RELEASED',released_at=$1,release_reason=$2
+       WHERE reservation_id=$3 AND call_id=$4 AND status='RESERVED'`,
+      [clock.db_now, input.release_reason, input.reservation_id, input.call_id]
     );
+    if (changed.rowCount !== 1) return { ok: false, code: 'budget_transition_invalid' };
     await appendControlEvent(query, {
       resource_kind: 'FUSION_BUDGET',
       resource_key: input.reservation_id,

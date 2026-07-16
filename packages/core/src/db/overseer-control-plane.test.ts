@@ -80,6 +80,15 @@ describe('Overseer control-plane persistence', () => {
     ).toHaveLength(10);
     const admitted = admissions.find(result => result.ok);
     if (!admitted?.ok) throw new Error('expected admitted parent');
+    expect(admitted.created).toBe(true);
+    expect(
+      await admitOverseerParent({
+        parent_id: admitted.value.parent_id,
+        owner_id: admitted.value.owner_id,
+        correlation_id: admitted.value.correlation_id,
+        state: admitted.value.state as 'BUILDING',
+      })
+    ).toMatchObject({ ok: true, created: false, value: { parent_id: admitted.value.parent_id } });
 
     const heartbeat = await heartbeatOverseerParent({
       parent_id: admitted.value.parent_id,
@@ -106,7 +115,15 @@ describe('Overseer control-plane persistence', () => {
       owner_id: admitted.value.owner_id,
       fencing_token: admitted.value.fencing_token,
     });
-    expect(linked.ok).toBe(true);
+    expect(linked).toMatchObject({ ok: true, created: true });
+    expect(
+      await linkOverseerChild({
+        parent_id: admitted.value.parent_id,
+        child_id: 'child-1',
+        owner_id: admitted.value.owner_id,
+        fencing_token: admitted.value.fencing_token,
+      })
+    ).toMatchObject({ ok: true, created: false, value: { child_id: 'child-1' } });
     expect(
       await transitionOverseerChildState({
         parent_id: admitted.value.parent_id,
@@ -151,22 +168,15 @@ describe('Overseer control-plane persistence', () => {
       })
     ).toEqual({ ok: false, code: 'parent_lease_stale' });
 
-    const crashed = await admitOverseerParent({
-      parent_id: 'parent-crashed',
-      owner_id: 'owner-crashed',
-      correlation_id: 'correlation-crashed',
-      state: 'RECOVERY',
-    });
-    if (!crashed.ok) throw new Error(crashed.code);
-    await linkOverseerChild({
-      parent_id: crashed.value.parent_id,
-      child_id: 'child-crashed',
-      owner_id: crashed.value.owner_id,
-      fencing_token: crashed.value.fencing_token,
-    });
     await database.query(
-      "UPDATE overseer_parent_commitments SET heartbeat_at='2000-01-01T00:00:00.000Z', lease_expires_at='2000-01-01T00:05:00.000Z' WHERE parent_id=$1",
-      [crashed.value.parent_id]
+      `INSERT INTO overseer_parent_commitments
+       (parent_id,state,owner_id,correlation_id,fencing_token,admitted_at,heartbeat_at,lease_expires_at,released_at,terminal_reason)
+       VALUES ('parent-crashed','RECOVERY','owner-crashed','correlation-crashed',1,
+       '2000-01-01T00:00:00.000Z','2000-01-01T00:00:00.000Z','2000-01-01T00:05:00.000Z',NULL,NULL)`
+    );
+    await database.query(
+      `INSERT INTO overseer_parent_children(parent_id,child_id,state,created_at,terminal_at)
+       VALUES ('parent-crashed','child-crashed','PENDING','2000-01-01T00:00:00.000Z',NULL)`
     );
     const reconciled = await reconcileExpiredParentCommitments();
     expect(reconciled.ok).toBe(true);
@@ -182,7 +192,7 @@ describe('Overseer control-plane persistence', () => {
     );
     expect(crashParent.rows[0]).toEqual({
       state: 'FAILED',
-      fencing_token: crashed.value.fencing_token + 1,
+      fencing_token: 2,
       terminal_reason: 'owner_lease_expired',
     });
     expect(
@@ -260,10 +270,13 @@ describe('Overseer control-plane persistence', () => {
     expect(Number(afterStale.rows[0]?.n)).toBe(Number(beforeStale.rows[0]?.n));
 
     await database.query(
-      "UPDATE overseer_repository_mutation_leases SET heartbeat_at='2000-01-01T00:00:00.000Z', expires_at='2000-01-01T00:05:00.000Z' WHERE repository='org/repo'"
+      `INSERT INTO overseer_repository_mutation_leases
+       (repository,lease_id,owner_id,execution_id,action_kind,capability,fencing_token,state,acquired_at,heartbeat_at,expires_at,released_at)
+       VALUES ('org/expired','lease-expired','owner-expired','execution-expired','REBASE','overseer.branch',7,'ACTIVE',
+       '2000-01-01T00:00:00.000Z','2000-01-01T00:00:00.000Z','2000-01-01T00:05:00.000Z',NULL)`
     );
     const takeover = await acquireRepositoryMutationLease({
-      repository: 'org/repo',
+      repository: 'org/expired',
       lease_id: loser.code === 'lease_conflict' ? 'lease-takeover' : 'impossible',
       owner_id: 'owner-takeover',
       execution_id: 'execution-takeover',
@@ -272,16 +285,16 @@ describe('Overseer control-plane persistence', () => {
     });
     expect(takeover).toMatchObject({
       ok: true,
-      value: { fencing_token: winner.value.fencing_token + 1 },
+      value: { fencing_token: 8 },
     });
     if (!takeover.ok) throw new Error(takeover.code);
     expect(
       await releaseRepositoryMutationLease({
-        repository: winner.value.repository,
-        lease_id: winner.value.lease_id,
-        owner_id: winner.value.owner_id,
-        execution_id: winner.value.execution_id,
-        fencing_token: winner.value.fencing_token,
+        repository: 'org/expired',
+        lease_id: 'lease-expired',
+        owner_id: 'owner-expired',
+        execution_id: 'execution-expired',
+        fencing_token: 7,
       })
     ).toEqual({ ok: false, code: 'lease_stale' });
     const released = await releaseRepositoryMutationLease({
@@ -332,7 +345,11 @@ describe('Overseer control-plane persistence', () => {
       source_artifact_path: 'artifacts/verifiers.json',
       source_git_blob: 'a'.repeat(40),
     });
-    expect(registered).toMatchObject({ ok: true, value: { registry_digest: digest } });
+    expect(registered).toMatchObject({
+      ok: true,
+      created: true,
+      value: { registry_digest: digest },
+    });
     expect(
       await registerVerifierRegistry({
         schema_version: 'overseer-verifier-registry-v1',
@@ -341,7 +358,7 @@ describe('Overseer control-plane persistence', () => {
         source_artifact_path: 'artifacts/verifiers.json',
         source_git_blob: 'a'.repeat(40),
       })
-    ).toEqual(registered);
+    ).toMatchObject({ ok: true, created: false, value: { registry_digest: digest } });
     const eventCount = await database.query<{ n: number }>(
       "SELECT COUNT(*) AS n FROM overseer_control_events WHERE event_kind='REGISTRY_FROZEN'"
     );
@@ -428,7 +445,19 @@ describe('Overseer control-plane persistence', () => {
       call_kind: 'INDIRECT',
       requested_microusd: 500_000,
     });
-    expect(cancellable).toMatchObject({ ok: true, value: { status: 'RESERVED' } });
+    expect(cancellable).toMatchObject({ ok: true, created: true, value: { status: 'RESERVED' } });
+    expect(
+      await reserveFusionBudget({
+        reservation_id: 'reservation-cancel',
+        call_id: 'call-cancel',
+        proposal_id: 'proposal-cancel',
+        execution_id: 'execution-cancel',
+        provider: 'fake',
+        model: 'fake-model',
+        call_kind: 'INDIRECT',
+        requested_microusd: 500_000,
+      })
+    ).toMatchObject({ ok: true, created: false, value: { status: 'RESERVED' } });
     expect(
       await releaseFusionBudgetReservation({
         reservation_id: 'reservation-cancel',
@@ -524,6 +553,84 @@ describe('Overseer control-plane persistence', () => {
       "SELECT COUNT(*) AS n FROM overseer_control_events WHERE event_kind='BUDGET_OVERAGE_RECORDED' AND resource_key='reservation-overage'"
     );
     expect(Number(overageEvents.rows[0]?.n)).toBe(1);
+  });
+
+  test('SQLite rejects direct mutable-row updates while named CAS transitions remain usable', async () => {
+    const parent = await admitOverseerParent({
+      parent_id: 'guard-parent',
+      owner_id: 'guard-owner',
+      correlation_id: 'guard-correlation',
+      state: 'BUILDING',
+    });
+    if (!parent.ok) throw new Error(parent.code);
+    await linkOverseerChild({
+      parent_id: 'guard-parent',
+      child_id: 'guard-child',
+      owner_id: 'guard-owner',
+      fencing_token: parent.value.fencing_token,
+    });
+    const lease = await acquireRepositoryMutationLease({
+      repository: 'guard/repo',
+      lease_id: 'guard-lease',
+      owner_id: 'guard-owner',
+      execution_id: 'guard-execution',
+      action_kind: 'REBASE',
+      capability: 'overseer.branch',
+    });
+    if (!lease.ok) throw new Error(lease.code);
+    const reservation = await reserveFusionBudget({
+      reservation_id: 'guard-reservation',
+      call_id: 'guard-call',
+      proposal_id: 'guard-proposal',
+      execution_id: 'guard-execution',
+      provider: 'fake',
+      model: 'fake-model',
+      call_kind: 'PRIMARY',
+      requested_microusd: 1,
+    });
+    if (!reservation.ok) throw new Error(reservation.code);
+
+    const directUpdates = [
+      "UPDATE overseer_parent_commitments SET owner_id='attacker' WHERE parent_id='guard-parent'",
+      "UPDATE overseer_parent_children SET created_at='2001-01-01T00:00:00.000Z' WHERE child_id='guard-child'",
+      "UPDATE overseer_repository_mutation_leases SET capability='attacker' WHERE repository='guard/repo'",
+      "UPDATE overseer_fusion_budget_reservations SET provider='attacker' WHERE reservation_id='guard-reservation'",
+    ];
+    for (const sql of directUpdates) {
+      await expect(database.query(sql)).rejects.toThrow('rejects non-CAS update');
+    }
+
+    expect(
+      await heartbeatOverseerParent({
+        parent_id: 'guard-parent',
+        owner_id: 'guard-owner',
+        fencing_token: parent.value.fencing_token,
+      })
+    ).toMatchObject({ ok: true });
+    expect(
+      await transitionOverseerChildState({
+        parent_id: 'guard-parent',
+        child_id: 'guard-child',
+        owner_id: 'guard-owner',
+        fencing_token: parent.value.fencing_token,
+        state: 'RUNNING',
+      })
+    ).toMatchObject({ ok: true });
+    expect(
+      await heartbeatRepositoryMutationLease({
+        repository: 'guard/repo',
+        lease_id: 'guard-lease',
+        owner_id: 'guard-owner',
+        execution_id: 'guard-execution',
+        fencing_token: lease.value.fencing_token,
+      })
+    ).toMatchObject({ ok: true });
+    expect(
+      await markFusionBudgetCallStarted({
+        reservation_id: 'guard-reservation',
+        call_id: 'guard-call',
+      })
+    ).toMatchObject({ ok: true });
   });
 
   test('PostgreSQL and SQLite parity uses two file-backed connections and atomic events', async () => {

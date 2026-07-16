@@ -180,6 +180,165 @@ const DELETE_REJECT_TABLES = [
   ...APPEND_ONLY_TABLES,
 ] as const;
 
+function sqliteColumnsUnchanged(columns: readonly string[]): string {
+  return columns.map(column => `NEW.${column} IS OLD.${column}`).join(' AND ');
+}
+
+const MUTABLE_UPDATE_GUARDS = [
+  {
+    table: 'overseer_parent_commitments',
+    allowed: [
+      `${sqliteColumnsUnchanged([
+        'parent_id',
+        'state',
+        'owner_id',
+        'correlation_id',
+        'fencing_token',
+        'admitted_at',
+        'released_at',
+        'terminal_reason',
+      ])} AND OLD.state IN ('BUILDING','REVIEW','STAGING','RECOVERY','ACTION_PENDING')
+       AND NEW.heartbeat_at >= OLD.heartbeat_at
+       AND CAST(strftime('%s',NEW.lease_expires_at) AS INTEGER) =
+         CAST(strftime('%s',NEW.heartbeat_at) AS INTEGER) + 300`,
+      `${sqliteColumnsUnchanged([
+        'parent_id',
+        'owner_id',
+        'correlation_id',
+        'fencing_token',
+        'admitted_at',
+        'heartbeat_at',
+        'lease_expires_at',
+        'released_at',
+        'terminal_reason',
+      ])} AND OLD.state IN ('BUILDING','REVIEW','STAGING','RECOVERY','ACTION_PENDING')
+       AND NEW.state IN ('BUILDING','REVIEW','STAGING','RECOVERY','ACTION_PENDING')`,
+      `${sqliteColumnsUnchanged([
+        'parent_id',
+        'owner_id',
+        'correlation_id',
+        'admitted_at',
+        'heartbeat_at',
+        'lease_expires_at',
+      ])} AND OLD.state IN ('BUILDING','REVIEW','STAGING','RECOVERY','ACTION_PENDING')
+       AND NEW.state IN ('COMPLETED','FAILED','CANCELLED')
+       AND NEW.fencing_token = OLD.fencing_token + 1
+       AND NEW.released_at IS NOT NULL AND NEW.terminal_reason IS NOT NULL`,
+    ],
+  },
+  {
+    table: 'overseer_parent_children',
+    allowed: [
+      `${sqliteColumnsUnchanged(['parent_id', 'child_id', 'created_at', 'terminal_at'])}
+       AND OLD.state = 'PENDING' AND NEW.state = 'RUNNING'`,
+      `${sqliteColumnsUnchanged(['parent_id', 'child_id', 'created_at'])}
+       AND OLD.state IN ('PENDING','RUNNING')
+       AND NEW.state IN ('COMPLETED','FAILED','CANCELLED')
+       AND OLD.terminal_at IS NULL AND NEW.terminal_at IS NOT NULL`,
+    ],
+  },
+  {
+    table: 'overseer_repository_mutation_leases',
+    allowed: [
+      `${sqliteColumnsUnchanged([
+        'repository',
+        'lease_id',
+        'owner_id',
+        'execution_id',
+        'action_kind',
+        'capability',
+        'fencing_token',
+        'state',
+        'acquired_at',
+        'released_at',
+      ])} AND OLD.state = 'ACTIVE'
+       AND NEW.heartbeat_at >= OLD.heartbeat_at
+       AND CAST(strftime('%s',NEW.expires_at) AS INTEGER) =
+         CAST(strftime('%s',NEW.heartbeat_at) AS INTEGER) + 300`,
+      `${sqliteColumnsUnchanged([
+        'repository',
+        'lease_id',
+        'owner_id',
+        'execution_id',
+        'action_kind',
+        'capability',
+        'fencing_token',
+        'acquired_at',
+        'heartbeat_at',
+        'expires_at',
+      ])} AND OLD.state = 'ACTIVE' AND NEW.state = 'RELEASED'
+       AND OLD.released_at IS NULL AND NEW.released_at IS NOT NULL`,
+      `NEW.repository IS OLD.repository
+       AND NEW.fencing_token = OLD.fencing_token + 1
+       AND NEW.state = 'ACTIVE'
+       AND NEW.acquired_at IS NEW.heartbeat_at
+       AND CAST(strftime('%s',NEW.expires_at) AS INTEGER) =
+         CAST(strftime('%s',NEW.heartbeat_at) AS INTEGER) + 300
+       AND NEW.released_at IS NULL
+       AND (OLD.state <> 'ACTIVE' OR
+         CAST(strftime('%s','now') AS INTEGER) >= CAST(strftime('%s',OLD.expires_at) AS INTEGER))`,
+    ],
+  },
+  {
+    table: 'overseer_fusion_budget_reservations',
+    allowed: [
+      `${sqliteColumnsUnchanged([
+        'reservation_id',
+        'call_id',
+        'proposal_id',
+        'execution_id',
+        'provider',
+        'model',
+        'call_kind',
+        'utc_day',
+        'utc_month',
+        'requested_microusd',
+        'actual_microusd',
+        'reserved_at',
+        'reconciled_at',
+        'released_at',
+        'release_reason',
+      ])} AND OLD.status = 'RESERVED' AND NEW.status = 'IN_FLIGHT'
+       AND OLD.call_started_at IS NULL AND NEW.call_started_at IS NOT NULL`,
+      `${sqliteColumnsUnchanged([
+        'reservation_id',
+        'call_id',
+        'proposal_id',
+        'execution_id',
+        'provider',
+        'model',
+        'call_kind',
+        'utc_day',
+        'utc_month',
+        'requested_microusd',
+        'reserved_at',
+        'call_started_at',
+        'released_at',
+        'release_reason',
+      ])} AND OLD.status = 'IN_FLIGHT' AND NEW.status = 'RECONCILED'
+       AND NEW.actual_microusd IS NOT NULL AND NEW.reconciled_at IS NOT NULL`,
+      `${sqliteColumnsUnchanged([
+        'reservation_id',
+        'call_id',
+        'proposal_id',
+        'execution_id',
+        'provider',
+        'model',
+        'call_kind',
+        'utc_day',
+        'utc_month',
+        'requested_microusd',
+        'actual_microusd',
+        'reserved_at',
+        'call_started_at',
+        'reconciled_at',
+      ])} AND OLD.status = 'RESERVED' AND NEW.status = 'RELEASED'
+       AND NEW.released_at IS NOT NULL
+       AND NEW.release_reason IN ('call_cancelled_before_start','authorization_revoked_before_start','provider_unavailable_before_start')`,
+    ],
+  },
+] as const;
+
 export async function installOverseerControlPlaneSqlite(database: IDatabase): Promise<void> {
   if (database.dialect !== 'sqlite') {
     throw new Error('overseer_control_plane_sqlite_installer_wrong_dialect');
@@ -193,6 +352,14 @@ export async function installOverseerControlPlaneSqlite(database: IDatabase): Pr
   for (const table of APPEND_ONLY_TABLES) {
     await database.query(
       `CREATE TRIGGER IF NOT EXISTS ${table}_reject_update BEFORE UPDATE ON ${table} BEGIN SELECT RAISE(ABORT, '${table} is append-only'); END`
+    );
+  }
+  for (const guard of MUTABLE_UPDATE_GUARDS) {
+    await database.query(`DROP TRIGGER IF EXISTS ${guard.table}_validate_update`);
+    await database.query(
+      `CREATE TRIGGER ${guard.table}_validate_update BEFORE UPDATE ON ${guard.table}
+       WHEN NOT ((${guard.allowed.join(') OR (')}))
+       BEGIN SELECT RAISE(ABORT, '${guard.table} rejects non-CAS update'); END`
     );
   }
 }
