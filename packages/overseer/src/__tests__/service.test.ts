@@ -550,4 +550,65 @@ describe('service', () => {
     await task;
     expect(settled).toBe(true);
   });
+
+  test('delivery failure aborts and quiesces the watcher before rejecting', async () => {
+    let watcherPolls = 0;
+    const deps = {
+      listRunsForWatch: async () => {
+        watcherPolls += 1;
+        return [];
+      },
+      listRunEvents: async () => [],
+      findPullRequest: async () => ({ exists: false as const }),
+      mergePullRequest: async () => undefined,
+      insertOverseerAction: async () => undefined,
+    };
+
+    await expect(
+      runOverseerService({
+        enabled: true,
+        adapterKind: 'fake',
+        deps,
+        intervalMs: 1,
+        deliveryEnabled: true,
+        deliveryIntervalMs: 1,
+        deliveryDrain: async () => {
+          throw new Error('delivery_drain_failed');
+        },
+      })
+    ).rejects.toThrow('delivery_drain_failed');
+    const pollsAfterReject = watcherPolls;
+    await new Promise<void>(resolve => setTimeout(resolve, 10));
+    expect(watcherPolls).toBe(pollsAfterReject);
+  });
+
+  test('watcher failure aborts and quiesces the delivery scheduler before rejecting', async () => {
+    let drains = 0;
+    const deps = {
+      listRunsForWatch: async () => {
+        throw new Error('watcher_poll_failed');
+      },
+      listRunEvents: async () => [],
+      findPullRequest: async () => ({ exists: false as const }),
+      mergePullRequest: async () => undefined,
+      insertOverseerAction: async () => undefined,
+    };
+
+    await expect(
+      runOverseerService({
+        enabled: true,
+        adapterKind: 'fake',
+        deps,
+        intervalMs: 1,
+        deliveryEnabled: true,
+        deliveryIntervalMs: 1,
+        deliveryDrain: async () => {
+          drains += 1;
+        },
+      })
+    ).rejects.toThrow('watcher_poll_failed');
+    const drainsAfterReject = drains;
+    await new Promise<void>(resolve => setTimeout(resolve, 10));
+    expect(drains).toBe(drainsAfterReject);
+  });
 });

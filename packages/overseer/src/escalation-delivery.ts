@@ -50,7 +50,14 @@ const DEFAULT_NOTION_DATABASE_ID = 'a6df831c-0b52-449f-8ca4-d77be6b70d0a';
 const DEFAULT_BUILDER_MONITOR_URL = 'https://n8n.bluedevilcollectibles.com/webhook/builder-status';
 
 function classifyHttpFailure(status: number, channel: string): ChannelDeliveryResult {
-  const retrySafe = status === 429 || (status >= 500 && status <= 599);
+  if (status >= 500 && status <= 599) {
+    return {
+      outcome: 'indeterminate',
+      sanitized_status: `${channel}_provider_state_unknown`,
+      error_class: `http_${status}`,
+    };
+  }
+  const retrySafe = status === 429;
   return {
     outcome: retrySafe ? 'transient_failure' : 'permanent_failure',
     sanitized_status: retrySafe ? `${channel}_retryable` : `${channel}_rejected`,

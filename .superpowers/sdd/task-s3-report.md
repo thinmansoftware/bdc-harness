@@ -6,7 +6,7 @@ Result: READY_FOR_INDEPENDENT_EXACT_HEAD_REVIEW.
 
 - Work order: `WO-HARNESS-OVERSEER-ESCALATION-BRIEFING-01`
 - Branch: `feat/m42-s3-escalation-briefing`
-- Exact base: `origin/dev@318aabec46c9248a67c41e3ff7108898aa6c89bd`
+- Exact base: `origin/dev@d10b9cac6c909e2029744a57de2b8529d7714a0f`
 - Production deploy, capability activation, Notion mutation, Board mutation, and
   issue-close mutation: not performed.
 
@@ -26,13 +26,15 @@ Result: READY_FOR_INDEPENDENT_EXACT_HEAD_REVIEW.
 - Response-loss exceptions are indeterminate and never blindly retried; only an
   explicit zero-effect `transient_failure` may consume the fixed retry schedule.
 - Expired attempt-three leases are reclaimed for terminal reconciliation without
-  a fourth provider call. HTTP adapters retry only 429 and 5xx; authentication,
-  validation, and other non-success responses are permanent.
+  a fourth provider call. Mutation adapters retry only 429; 5xx is indeterminate,
+  while authentication, validation, and other 4xx responses are permanent.
 - Stable event identity wired through watcher service, workflow bridge, and
   Smart Cauldron callers. Workflow cards derive exact IDs and timestamps from
   the awaited durable event insert and fail closed when it cannot persist.
 - The server runtime owns the delivery scheduler and drains in-flight work on
-  shutdown. Retry time is anchored to card persistence, not old source time.
+  shutdown. Watcher and delivery failures abort and fully settle the sibling
+  before rejection; the runtime aborts before clearing degraded ownership. Retry
+  time is anchored to card persistence, not old source time.
 - Separate Notion property lookup in frozen order: `Task`, `WO ID`, `Name`,
   `Title`, `WO_ID`.
 - Authenticated read-only list and detail XO feed routes with no write route.
@@ -42,7 +44,7 @@ Result: READY_FOR_INDEPENDENT_EXACT_HEAD_REVIEW.
 ## Contract evidence
 
 - Contract SHA-256:
-  `bff68b9c2a614542a40746860f3f961aa3e1fedb4f1dda691d7440ca90786ed2`
+  `473f819560b900959478013bdfd271a2783d99dd0b1bd3908d2e52c8874047a3`
 - Migration SHA-256:
   `bc771293b691209b978a52b43a5dbafec22c55c4823ce7592865f345f2a22bb1`
 - Retry offsets: exactly 0, 30, and 120 seconds from card creation.
@@ -61,15 +63,19 @@ Result: READY_FOR_INDEPENDENT_EXACT_HEAD_REVIEW.
   propagates failure.
 - Focused workflow-event DB contract: 23 passed.
 - Focused API list/detail and no-write routes: 2 passed.
+- Focused sibling-loop quiescence: 3 passed across service and runtime.
 - `bun --filter @archon/core test`: passed, exit 0.
-- `bun --filter @archon/overseer test`: 159 passed, 0 failed.
+- `bun --filter @archon/overseer test`: 161 passed, 0 failed.
 - `bun --filter @archon/smart-cauldron test`: 59 passed, 0 failed.
-- `bun --filter @archon/server test`: 396 passed, 0 failed. The canonical
+- `bun --filter @archon/server test`: 397 passed, 0 failed. The canonical
   package script now includes `api.overseer-briefing.test.ts`.
 - `bun run type-check`: passed for every package and scripts config.
 - `bun run lint --max-warnings 0`: passed.
 - `bun run format:check`: passed.
-- `bun run check:bundled`: passed, 36 commands, 98 workflows, 1 policy.
+- `bun run check:bundled`: passed, 36 commands, 99 workflows, 1 policy.
+  Rebase onto `d10b9cac` inherited the #469 workflow YAML without its generated
+  registration; the canonical generator added only that workflow to
+  `bundled-defaults.generated.ts`.
 - `bun run check:bundled-skill`: passed, 21 files.
 - Migration 035 applied with `ON_ERROR_STOP=1` to a unique disposable local
   PostgreSQL 15 database. Verification found exactly 3 tables with 28/9/14
@@ -94,7 +100,7 @@ process spawn before its assertions.
 
 1. Confirm thrown provider transport is indeterminate and receives no retry,
    expired attempt three reconciles without attempt four, and HTTP retries are
-   limited to 429 and 5xx responses.
+   limited to 429 while 5xx writes are indeterminate.
 2. Confirm workflow cards use the exact row returned by durable event insertion
    and insert failure creates no downstream side effect.
 3. Confirm the server runtime starts and shutdown-drains the delivery scheduler.
@@ -106,6 +112,8 @@ process spawn before its assertions.
 8. Confirm stale receipt writers fail the transactional lease fence.
 9. Confirm only GET routes exist and escalation modules import no mutation
    adapter.
+10. Confirm failure in either owned runtime loop aborts and settles its sibling
+    before task ownership is cleared.
 
 ## Issue #958 disposition evidence
 

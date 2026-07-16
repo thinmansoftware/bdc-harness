@@ -644,13 +644,14 @@ describe('default informational channel adapters', () => {
     ]);
   });
 
-  test('default builder-monitor adapter retries only 429 and 5xx responses', async () => {
+  test('default builder-monitor adapter retries only 429 and treats 5xx as indeterminate', async () => {
     const view = await defaultCardView();
     for (const [status, outcome] of [
       [401, 'permanent_failure'],
       [422, 'permanent_failure'],
       [429, 'transient_failure'],
-      [503, 'transient_failure'],
+      [500, 'indeterminate'],
+      [503, 'indeterminate'],
     ] as const) {
       const builder = createDefaultOperatorCardChannels({
         fetch: mock(async () => new Response('failure', { status })) as typeof fetch,
@@ -683,13 +684,14 @@ describe('default informational channel adapters', () => {
     expect(calls[1]?.body).toMatchObject({ parent: { page_id: 'notion-page-1' } });
   });
 
-  test('default Notion adapter retries only 429 and 5xx comment responses', async () => {
+  test('default Notion adapter retries only 429 and treats comment 5xx as indeterminate', async () => {
     const view = await defaultCardView();
     for (const [status, outcome] of [
       [401, 'permanent_failure'],
       [422, 'permanent_failure'],
       [429, 'transient_failure'],
-      [503, 'transient_failure'],
+      [500, 'indeterminate'],
+      [503, 'indeterminate'],
     ] as const) {
       const injected = mock(async (input: string | URL | Request) =>
         String(input).includes('/query')

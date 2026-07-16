@@ -66,16 +66,19 @@ writer with the matching fencing token and attempt number. A stale worker cannot
 append evidence after a lease is reclaimed.
 An expired lease remains reclaimable at attempt three for terminal
 reconciliation, but its attempt counter is not incremented and delivery is not
-called a fourth time. HTTP adapters classify only 429 and 5xx responses as
-retryable; authentication, validation, and other non-success responses are
+called a fourth time. Mutation adapters classify only 429 as retryable. A 5xx
+write response is `indeterminate` because the provider may have committed before
+returning the error. Authentication, validation, and other 4xx responses are
 permanent failures.
 Dispatch uses idempotency key `operator-card:<card_id>:dispatch` and the existing
 Dispatch content guard. Provider errors stored in receipts are sanitized.
 
 The server runtime owns the delivery scheduler. It starts with the Overseer
 watcher, polls due jobs on a fixed interval, and drains any in-flight claim before
-shutdown completes. The retry epoch is the card persistence timestamp, not the
-source event timestamp.
+shutdown completes. Watcher and delivery loops share an internal abort domain: a
+failure in either aborts and fully settles the sibling before the service rejects.
+The runtime aborts that owned domain before clearing degraded-task ownership. The
+retry epoch is the card persistence timestamp, not the source event timestamp.
 
 ## XO feed
 

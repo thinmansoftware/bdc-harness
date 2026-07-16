@@ -105,6 +105,7 @@ export function startOverseerRuntime(deps: OverseerRuntimeDeps = {}): void {
       watcherAbort = null;
     },
     (err: unknown) => {
+      controller.abort();
       log.error({ err }, 'overseer_runtime.watcher_exception_degraded');
       watcherState = 'degraded';
       watcherTask = null;

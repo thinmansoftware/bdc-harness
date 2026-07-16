@@ -148,6 +148,22 @@ describe('overseer-runtime', () => {
     expect(status.watcher).toBe('degraded');
   });
 
+  test('watcher exception aborts the owned runtime signal before clearing ownership', async () => {
+    let ownedSignal: AbortSignal | undefined;
+    runOverseerServiceMock.mockImplementation(async (opts?: { signal?: AbortSignal }) => {
+      ownedSignal = opts?.signal;
+      throw new Error('watcher_test_failure');
+    });
+
+    setEnabledEnv();
+    startOverseerRuntime({ runService: runOverseerServiceMock });
+    await new Promise<void>(resolve => setTimeout(resolve, 20));
+
+    expect(ownedSignal?.aborted).toBe(true);
+    expect((await getStatus()).watcher).toBe('degraded');
+    await expect(stopOverseerRuntime()).resolves.toBeUndefined();
+  });
+
   test('stopOverseerRuntime is safe when not started', async () => {
     await expect(stopOverseerRuntime()).resolves.toBeUndefined();
   });

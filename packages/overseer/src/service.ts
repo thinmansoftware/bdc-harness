@@ -53,6 +53,7 @@ export interface OverseerServiceOptions {
   deliveryIntervalMs?: number;
   deliveryOwner?: string;
   deliveryChannels?: OperatorCardChannel[];
+  deliveryDrain?: () => Promise<unknown>;
 }
 
 export async function runOperatorCardDeliveryScheduler(input: {
@@ -251,27 +252,53 @@ export async function runOverseerService(options: OverseerServiceOptions = {}): 
   }
   const deps = options.deps ?? resolveDefaultDeps();
   const adapter = createDefaultFakeGitHubAdapter();
+  const coupledAbort = new AbortController();
+  const abortFromParent = (): void => {
+    coupledAbort.abort();
+  };
+  options.signal?.addEventListener('abort', abortFromParent, { once: true });
+  if (options.signal?.aborted) coupledAbort.abort();
   const watcher = watchLoop(
     deps,
     record => handleRecord(record, deps, adapter, dryRun, 'overseer-service'),
     {
       intervalMs: options.intervalMs,
       once: options.once,
-      signal: options.signal,
+      signal: coupledAbort.signal,
     }
   );
   if (!options.deliveryEnabled) {
-    await watcher;
-    return;
+    try {
+      await watcher;
+      return;
+    } finally {
+      coupledAbort.abort();
+      options.signal?.removeEventListener('abort', abortFromParent);
+    }
   }
   const delivery = runOperatorCardDeliveryScheduler({
-    signal: options.signal,
+    signal: coupledAbort.signal,
     intervalMs: options.deliveryIntervalMs,
     owner: options.deliveryOwner ?? `overseer-delivery-${process.pid}`,
     once: options.once,
     channels: options.deliveryChannels,
+    drain: options.deliveryDrain,
   });
-  await Promise.all([watcher, delivery]);
+  const abortOnFailure = async (task: Promise<void>): Promise<void> => {
+    try {
+      await task;
+    } catch (error) {
+      coupledAbort.abort();
+      throw error;
+    }
+  };
+  try {
+    await Promise.all([abortOnFailure(watcher), abortOnFailure(delivery)]);
+  } finally {
+    coupledAbort.abort();
+    await Promise.allSettled([watcher, delivery]);
+    options.signal?.removeEventListener('abort', abortFromParent);
+  }
 }
 
 /**
