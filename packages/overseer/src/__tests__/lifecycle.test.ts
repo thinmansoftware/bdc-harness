@@ -5,6 +5,10 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, mock, test } from 'bun:test';
 import {
+  assessLifecycleCandidate as exportedAssessLifecycleCandidate,
+  createLifecycleMutationAdapter as exportedCreateLifecycleMutationAdapter,
+} from '..';
+import {
   createLifecycleMutationAdapter,
   reconcileLifecycleResult,
   type LifecycleMutationAdapterV1,
@@ -329,6 +333,11 @@ function execInput(action_kind: LifecycleActionKindV1): ExecuteLifecycleActionIn
 }
 
 describe('lifecycle assessment', () => {
+  test('public package boundary exposes lifecycle action and adapter helpers', () => {
+    expect(exportedAssessLifecycleCandidate).toBe(assessLifecycleCandidate);
+    expect(exportedCreateLifecycleMutationAdapter).toBe(createLifecycleMutationAdapter);
+  });
+
   test('age-only close denied before permit and adapter', async () => {
     const order: string[] = [];
     const adapter = { perform: mock(async () => undefined as never) };

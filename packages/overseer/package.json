@@ -19,7 +19,9 @@
     "./permit": "./src/permit.ts",
     "./operator-card": "./src/operator-card.ts",
     "./escalation-delivery": "./src/escalation-delivery.ts",
-    "./adapters/fake-github": "./src/adapters/fake-github.ts"
+    "./actions/lifecycle": "./src/actions/lifecycle.ts",
+    "./adapters/fake-github": "./src/adapters/fake-github.ts",
+    "./adapters/lifecycle": "./src/adapters/lifecycle.ts"
   },
   "scripts": {
     "test": "bun test src/overseer.test.ts && bun test tests/ && bun test src/__tests__/",

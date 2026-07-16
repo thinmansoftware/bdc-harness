@@ -49,6 +49,53 @@ export type {
   OperatorCardChannel,
   OperatorCardChannelDeps,
 } from './escalation-delivery';
+export {
+  assessLifecycleCandidate,
+  buildReopenRecipe,
+  executeLifecycleAction,
+  verifySalvageArtifact,
+} from './actions/lifecycle';
+export type {
+  AuthorizeLifecycleRequestV1,
+  AuthorizeLifecycleResultV1,
+  BuildReopenRecipeInputV1,
+  ExecuteLifecycleActionDepsV1,
+  ExecuteLifecycleActionInputV1,
+  ExecuteLifecycleActionResultV1,
+  ExecuteLifecycleOutcomeV1,
+  InjectedActionPolicyDepsV1,
+  LifecycleActionKindV1,
+  LifecycleActionPolicyDecisionV1,
+  LifecycleActionPolicyEvaluationInputV1,
+  LifecycleAssessmentResultV1,
+  LifecycleCandidateInputV1,
+  LifecycleFusionEvidenceV1,
+  LifecycleGateDepsV1,
+  LifecycleLineageEvidenceV1,
+  LifecycleLiveObservationV1,
+  LifecycleProtectedBoundaryV1,
+  LifecycleReopenEvidenceV1,
+  LifecycleTargetBindingV1,
+  LifecycleTargetKindV1,
+  LifecycleVerifierEvidenceV1,
+  OverseerSalvageReceiptV1,
+  PreparePermitResultV1,
+  ReceiptResultV1,
+  ReopenRecipeV1,
+  SalvageArtifactDepsV1,
+  SalvageVerificationResultV1,
+} from './actions/lifecycle';
+export { createLifecycleMutationAdapter, reconcileLifecycleResult } from './adapters/lifecycle';
+export type {
+  CreateLifecycleMutationAdapterDepsV1,
+  LifecycleLineageSupportV1,
+  LifecycleMutationAdapterV1,
+  LifecycleMutationReasonV1,
+  LifecycleMutationReceiptV1,
+  LifecycleMutationRequestV1,
+  LifecycleReconciliationReceiptV1,
+  ReconcileLifecycleResultInputV1,
+} from './adapters/lifecycle';
 
 export { watchLoop, watchOnce, DEFAULT_WATCH_INTERVAL_MS } from './watch';
 export { judgePullRequest, isPrGreen, isPrMergeReady } from './judge-pr';
