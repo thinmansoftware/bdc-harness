@@ -10,6 +10,7 @@ import {
   acquireRepositoryMutationLease,
   admitOverseerParent,
   heartbeatOverseerParent,
+  heartbeatRepositoryMutationLease,
   linkOverseerChild,
   listOverseerControlEvents,
   markFusionBudgetCallStarted,
@@ -227,6 +228,15 @@ describe('Overseer control-plane PostgreSQL 17 behavior', () => {
         owner_id: 'pg-guard-owner',
         fencing_token: parent.value.fencing_token,
         state: 'RUNNING',
+      })
+    ).toMatchObject({ ok: true });
+    expect(
+      await heartbeatRepositoryMutationLease({
+        repository: 'pg-guard/repo',
+        lease_id: 'pg-guard-lease',
+        owner_id: 'pg-guard-owner',
+        execution_id: 'pg-guard-execution',
+        fencing_token: lease.value.fencing_token,
       })
     ).toMatchObject({ ok: true });
     expect(
