@@ -19,7 +19,42 @@
  * stored inside the file and never enter an entry tuple digest.
  */
 import { createHash } from 'node:crypto';
-import { M31_ACTION_KINDS, type M31ActionKind } from '@archon/core/db/merge-steward';
+import type { M31ActionKind } from '@archon/core/db/m31-target-v2';
+
+/**
+ * Closed M-31 action-kind vocabulary, mirrored here so the registry loader does
+ * NOT read the v1 `@archon/core/db/merge-steward` runtime module. Per the WO
+ * (Section 3), the v1 merge-steward substrate is prior art only and must never
+ * be read by v2 gate code; the v2 substrate is `@archon/core/db/m31-target-v2`,
+ * which re-exports only the `M31ActionKind` type, not the runtime list. The
+ * `satisfies` clause forces every listed value to be a valid `M31ActionKind`
+ * (typo protection), and the bidirectional exhaustiveness checks below force a
+ * compile-time failure if the upstream vocabulary grows and this mirror drifts.
+ */
+const M31_ACTION_KIND_VOCABULARY = [
+  'MERGE',
+  'CLOSE',
+  'REOPEN',
+  'REFRESH',
+  'REBASE',
+  'PUSH',
+  'RETARGET',
+  'REPAIR',
+  'REFIRE',
+  'COMMENT',
+  'LABEL',
+  'ASSIGN',
+  'REVIEW',
+  'STAGING_MUTATION',
+  'PRODUCTION_MUTATION',
+  'DEPLOY',
+] as const satisfies readonly M31ActionKind[];
+
+// Reverse exhaustiveness: any `M31ActionKind` not mirrored above yields a
+// non-`never` type here and fails the const assignment at compile time.
+type MissingVocabularyKinds = Exclude<M31ActionKind, (typeof M31_ACTION_KIND_VOCABULARY)[number]>;
+const vocabularyExhaustive: [MissingVocabularyKinds] extends [never] ? true : false = true;
+void vocabularyExhaustive;
 
 /** Exact UTF-8 domain separator prepended to the JCS tuple bytes before hashing. */
 export const POLICY_TUPLE_DOMAIN = 'BDC_OVERSEER_ACTION_POLICY_TUPLE_V1\n';
@@ -33,7 +68,9 @@ export const POLICY_REGISTRY_SCHEMA_VERSION = 'overseer-action-policy-v1' as con
 const DEPLOYMENT_EFFECTS = ['none', 'staging', 'production', 'unknown'] as const;
 export type OverseerDeploymentEffect = (typeof DEPLOYMENT_EFFECTS)[number];
 
-const ACTION_KIND_SET: ReadonlySet<string> = new Set(M31_ACTION_KINDS as readonly string[]);
+const ACTION_KIND_SET: ReadonlySet<string> = new Set(
+  M31_ACTION_KIND_VOCABULARY as readonly string[]
+);
 const EFFECT_SET: ReadonlySet<string> = new Set(DEPLOYMENT_EFFECTS as readonly string[]);
 const HEX64_RE = /^[0-9a-f]{64}$/;
 

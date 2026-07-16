@@ -448,6 +448,70 @@ describe('executeQualifiedMerge -- Section 11', () => {
     expect(permitDriftH.deps.attemptFakeMerge).not.toHaveBeenCalled();
   });
 
+  // Finding 1: non-internal repository denial proven at the executor, not just
+  // via the isInternalMergeAllowed() predicate. No permit or adapter is reached.
+  test('a non-internal repository denies before any permit or adapter call', async () => {
+    const h = harness();
+    const result = await executeQualifiedMerge(
+      validEvidence({ repository: 'shopops-storefront' }),
+      h.deps
+    );
+    expect(result.action).toBe('denied');
+    expect(result.reason).toBe('repository_not_internal');
+    expect(result.merged).toBe(false);
+    expect(result.adapterCalled).toBe(false);
+    expect(result.receipts).toEqual([]);
+    expect(h.deps.preparePermit).not.toHaveBeenCalled();
+    expect(h.deps.authorize).not.toHaveBeenCalled();
+    expect(h.deps.reserveEffect).not.toHaveBeenCalled();
+    expect(h.deps.attemptFakeMerge).not.toHaveBeenCalled();
+  });
+
+  // Finding 2: a denied authorization (allowed: false) fails closed after the
+  // permit but before reservation and the adapter.
+  test('a denied authorization stops before reservation and the adapter', async () => {
+    const h = harness({
+      authorize: mock(async () => ({
+        allowed: false as const,
+        reason: 'capability_flag_disabled' as const,
+        capability: 'merge' as const,
+        audit_recorded: true,
+      })),
+    });
+    const result = await executeQualifiedMerge(validEvidence(), h.deps);
+    expect(result.action).toBe('permit_denied');
+    expect(result.reason).toBe('authorization_denied:capability_flag_disabled');
+    expect(result.merged).toBe(false);
+    expect(result.adapterCalled).toBe(false);
+    expect(result.receipts).toEqual([]);
+    expect(h.deps.preparePermit).toHaveBeenCalledTimes(1);
+    expect(h.deps.authorize).toHaveBeenCalledTimes(1);
+    expect(h.deps.reserveEffect).not.toHaveBeenCalled();
+    expect(h.deps.attemptFakeMerge).not.toHaveBeenCalled();
+    expect(h.deps.recordOutcome).not.toHaveBeenCalled();
+  });
+
+  // Finding 3: a failed effect reservation (ok: false) fails closed after
+  // authorization but before the adapter is ever reached.
+  test('a failed effect reservation stops before the adapter', async () => {
+    const h = harness({
+      reserveEffect: mock(async () => ({
+        ok: false as const,
+        failure: 'reservation_conflict',
+      })),
+    });
+    const result = await executeQualifiedMerge(validEvidence(), h.deps);
+    expect(result.action).toBe('reservation_failed');
+    expect(result.reason).toBe('effect_not_reserved:reservation_conflict');
+    expect(result.merged).toBe(false);
+    expect(result.adapterCalled).toBe(false);
+    expect(result.receipts).toEqual([]);
+    expect(h.deps.authorize).toHaveBeenCalledTimes(1);
+    expect(h.deps.reserveEffect).toHaveBeenCalledTimes(1);
+    expect(h.deps.attemptFakeMerge).not.toHaveBeenCalled();
+    expect(h.deps.recordOutcome).not.toHaveBeenCalled();
+  });
+
   // Test 5
   test('missing or correlated Fusion/verifier stops with no adapter call', async () => {
     const cases: Partial<QualifiedMergeEvidence>[] = [
