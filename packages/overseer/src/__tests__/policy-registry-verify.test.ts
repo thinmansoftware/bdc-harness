@@ -1,8 +1,9 @@
 import { afterEach, describe, expect, test } from 'bun:test';
 import { createHash } from 'node:crypto';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import {
   computePolicyTupleDigest,
   loadOverseerActionPolicyRegistry,
@@ -15,13 +16,12 @@ import {
   type PolicyIdentityEvidence,
 } from '../policy-registry-verify';
 
-const SYNTHETIC_PATH = new URL('./fixtures/overseer-action-policy.synthetic.json', import.meta.url);
-const SHIPPED_PATH = new URL(
-  '../../../../.archon/policies/overseer-action-policy.json',
-  import.meta.url
+const SYNTHETIC_FILE = fileURLToPath(
+  new URL('./fixtures/overseer-action-policy.synthetic.json', import.meta.url)
 );
-const SYNTHETIC_FILE = SYNTHETIC_PATH.pathname;
-const SHIPPED_FILE = SHIPPED_PATH.pathname;
+const SHIPPED_FILE = fileURLToPath(
+  new URL('../../../../.archon/policies/overseer-action-policy.json', import.meta.url)
+);
 
 function sha256(bytes: Buffer): string {
   return createHash('sha256').update(bytes).digest('hex');
@@ -64,6 +64,16 @@ function buildEvidence(
 }
 
 describe('verifyPolicyRegistryIdentities', () => {
+  test('fixture paths resolve cross-platform without Windows /C: pathname bug', () => {
+    expect(SYNTHETIC_FILE.includes('/C:')).toBe(false);
+    expect(SHIPPED_FILE.includes('/C:')).toBe(false);
+    expect(existsSync(SYNTHETIC_FILE)).toBe(true);
+    expect(existsSync(SHIPPED_FILE)).toBe(true);
+    // A direct read proves the path is usable on this host OS.
+    expect(readFileSync(SYNTHETIC_FILE).length).toBeGreaterThan(0);
+    expect(readFileSync(SHIPPED_FILE).length).toBeGreaterThan(0);
+  });
+
   test('fake evidence for the synthetic registry is valid', () => {
     const { bytes, evidence } = buildEvidence(SYNTHETIC_FILE, 'fake_policy_evidence');
     const result = verifyPolicyRegistryIdentities({

@@ -1,5 +1,6 @@
 import { describe, expect, mock, test } from 'bun:test';
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import {
   assessQualifiedMerge,
   classifyMergeExclusion,
@@ -7,6 +8,9 @@ import {
   handleMergeReady,
   isInternalMergeAllowed,
   type ExecuteQualifiedMergeDeps,
+  type QualifiedMergeAdapterRequestV2,
+  type QualifiedMergeAdapterResultV2,
+  type QualifiedMergeAdapterV2,
   type QualifiedMergeEvidence,
 } from '../actions/merge-ready.ts';
 import { loadOverseerActionPolicyRegistry } from '../policy-registry';
@@ -16,16 +20,25 @@ import type {
   M31ExecutionReceiptEventV2,
 } from '@archon/core/db/m31-target-v2';
 import type { ActionPolicyV2AuthorizationResult } from '../action-policy-v2';
-import type { AuthorizeOverseerActionInput } from '../action-policy';
-import type { FakeGitHubReceipt } from '../adapters/fake-github';
 import type { PullRequestEvidence, WatchedRunRecord } from '../types.ts';
 
 const HEAD = 'c'.repeat(40);
 const BASE = 'd'.repeat(40);
+const PERMIT_EVENT_DIGEST = 'a1'.repeat(32);
+const RESERVATION_EVENT_DIGEST = 'b2'.repeat(32);
+const POLICY_DIGEST =
+  loadOverseerActionPolicyRegistry({
+    text: readFileSync(
+      fileURLToPath(new URL('./fixtures/overseer-action-policy.synthetic.json', import.meta.url)),
+      'utf8'
+    ),
+  }).entries[0]?.policy_digest ?? '';
+const VERIFIER_DIGEST = 'c3'.repeat(32);
+const TARGET_DIGEST = 'e4'.repeat(32);
 
 const REGISTRY = loadOverseerActionPolicyRegistry({
   text: readFileSync(
-    new URL('./fixtures/overseer-action-policy.synthetic.json', import.meta.url),
+    fileURLToPath(new URL('./fixtures/overseer-action-policy.synthetic.json', import.meta.url)),
     'utf8'
   ),
 });
@@ -122,8 +135,8 @@ const PERMIT: M31ActionPermitV2 = {
   execution_id: 'execution-1',
   repository: 'bluedevilcollectibles/bdc-harness',
   target: TARGET,
-  target_key: 'pull_request:bluedevilcollectibles/bdc-harness:42',
-  target_digest: 'e'.repeat(64),
+  target_key: 'bluedevilcollectibles/bdc-harness#pull_request:42',
+  target_digest: TARGET_DIGEST,
   snapshot_id: 'snapshot-1',
   action_kind: 'MERGE',
   capability: 'overseer.m31.merge',
@@ -131,9 +144,36 @@ const PERMIT: M31ActionPermitV2 = {
   valid_until: '2026-07-15T12:01:00.000Z',
 };
 
-function receiptEvent(): M31ExecutionReceiptEventV2 {
+function permitReceiptEvent(): M31ExecutionReceiptEventV2 {
   return {
-    receipt_event_id: 'receipt-1',
+    receipt_event_id: 'receipt-permit-1',
+    proposal_id: 'proposal-1',
+    execution_id: 'execution-1',
+    event_sequence: 1,
+    event_type: 'permit_issued',
+    target_kind: 'pull_request',
+    target_key: PERMIT.target_key,
+    target_digest: PERMIT.target_digest,
+    live_observation: null,
+    live_observation_digest: null,
+    revalidated_at: null,
+    valid_until: PERMIT.valid_until,
+    adapter_name: null,
+    provider_operation: null,
+    external_effect_reference: null,
+    reason: 'permit_issued',
+    evidence: {},
+    previous_event_digest: null,
+    event_digest: PERMIT_EVENT_DIGEST,
+    created_at: '2026-07-15T11:59:00.000Z',
+  };
+}
+
+function reservationReceiptEvent(
+  previous: string = PERMIT_EVENT_DIGEST
+): M31ExecutionReceiptEventV2 {
+  return {
+    receipt_event_id: 'receipt-reserve-1',
     proposal_id: 'proposal-1',
     execution_id: 'execution-1',
     event_sequence: 2,
@@ -145,14 +185,41 @@ function receiptEvent(): M31ExecutionReceiptEventV2 {
     live_observation_digest: null,
     revalidated_at: null,
     valid_until: PERMIT.valid_until,
-    adapter_name: 'fake-github',
+    adapter_name: 'qualified-merge-adapter-v2',
     provider_operation: 'merge',
     external_effect_reference: null,
     reason: 'effect_reserved',
     evidence: {},
-    previous_event_digest: null,
-    event_digest: 'f'.repeat(64),
+    previous_event_digest: previous,
+    event_digest: RESERVATION_EVENT_DIGEST,
     created_at: '2026-07-15T12:00:00.000Z',
+  };
+}
+
+function outcomeReceiptEvent(
+  type: 'effect_succeeded' | 'effect_failed' | 'effect_indeterminate'
+): M31ExecutionReceiptEventV2 {
+  return {
+    receipt_event_id: `receipt-${type}`,
+    proposal_id: 'proposal-1',
+    execution_id: 'execution-1',
+    event_sequence: 3,
+    event_type: type,
+    target_kind: 'pull_request',
+    target_key: PERMIT.target_key,
+    target_digest: PERMIT.target_digest,
+    live_observation: null,
+    live_observation_digest: null,
+    revalidated_at: null,
+    valid_until: null,
+    adapter_name: 'qualified-merge-adapter-v2',
+    provider_operation: 'merge',
+    external_effect_reference: null,
+    reason: type,
+    evidence: {},
+    previous_event_digest: RESERVATION_EVENT_DIGEST,
+    event_digest: 'd5'.repeat(32),
+    created_at: '2026-07-15T12:00:01.000Z',
   };
 }
 
@@ -170,74 +237,62 @@ function allowedAuthorization(): ActionPolicyV2AuthorizationResult {
     execution_id: 'execution-1',
     action_kind: 'MERGE',
     valid_until: PERMIT.valid_until,
-    policy_digest: 'a'.repeat(64),
-    verifier_registry_digest: 'b'.repeat(64),
+    policy_digest: POLICY_DIGEST,
+    verifier_registry_digest: VERIFIER_DIGEST,
     audit_recorded: true,
   };
 }
 
-function fakeMergeReceipt(accepted: boolean): FakeGitHubReceipt {
+function adapterResult(
+  status: QualifiedMergeAdapterResultV2['status'],
+  reason = status
+): QualifiedMergeAdapterResultV2 {
   return {
-    adapter: 'fake-github',
-    accepted,
-    reason: accepted ? 'fake_accepted' : 'action_identity_mismatch',
-    authorization_reason: null,
-    authorization_audit_recorded: true,
-    audit_recorded: true,
-    permit_id: 'permit-1',
-    repository: 'bluedevilcollectibles/bdc-harness',
-    pr_number: 42,
-    head_sha: HEAD,
-    base_branch: 'dev',
-    base_sha: BASE,
-    snapshot_id: 'snapshot-1',
-    proposal_id: 'proposal-1',
-    execution_id: 'execution-1',
-    action_kind: 'MERGE',
-    mutation_sent: false,
+    schema_version: 'overseer-qualified-merge-adapter-result-v2',
+    status,
+    reason,
+    external_effect_reference: status === 'succeeded' ? 'fake-merge-ref-1' : null,
+    evidence_digest: status === 'succeeded' ? 'f6'.repeat(32) : null,
   };
 }
-
-const FAKE_AUTHORIZATION: AuthorizeOverseerActionInput = {
-  requested_capability: 'merge',
-  permit: {
-    permit_id: 'permit-1',
-    proposal_id: 'proposal-1',
-    execution_id: 'execution-1',
-    repository: 'bluedevilcollectibles/bdc-harness',
-    pr_number: 42,
-    head_sha: HEAD,
-    base_branch: 'dev',
-    base_sha: BASE,
-    snapshot_id: 'snapshot-1',
-    action_kind: 'MERGE',
-    capability: 'overseer.m31.merge',
-    issued_at: '2026-07-15T11:59:00.000Z',
-    valid_until: '2026-07-15T12:01:00.000Z',
-  },
-  actor: 'overseer',
-  correlation_id: 'corr-1',
-};
 
 interface Harness {
   deps: ExecuteQualifiedMergeDeps;
   calls: string[];
-  mergeAccepted: boolean;
+  adapterRequests: QualifiedMergeAdapterRequestV2[];
+  outcomeCalls: Array<{ outcome: string; reason: string }>;
 }
 
 function harness(
   overrides: Partial<ExecuteQualifiedMergeDeps> = {},
-  options: { mergeAccepted?: boolean } = {}
+  options: {
+    adapterStatus?: QualifiedMergeAdapterResultV2['status'];
+    adapterImpl?: QualifiedMergeAdapterV2;
+  } = {}
 ): Harness {
   const calls: string[] = [];
-  const mergeAccepted = options.mergeAccepted ?? true;
+  const adapterRequests: QualifiedMergeAdapterRequestV2[] = [];
+  const outcomeCalls: Array<{ outcome: string; reason: string }> = [];
+  const adapterStatus = options.adapterStatus ?? 'succeeded';
+
+  const defaultAdapter: QualifiedMergeAdapterV2 = {
+    attemptMerge: async (request: QualifiedMergeAdapterRequestV2) => {
+      calls.push('mergeAdapter');
+      adapterRequests.push(request);
+      return adapterResult(
+        adapterStatus,
+        adapterStatus === 'succeeded' ? 'fake_accepted' : 'rejected'
+      );
+    },
+  };
+
   const deps: ExecuteQualifiedMergeDeps = {
     insertOverseerAction: mock(async () => {
       calls.push('insertOverseerAction');
     }),
     preparePermit: mock(async () => {
       calls.push('preparePermit');
-      return { ok: true as const, permit: PERMIT, receipt: receiptEvent() };
+      return { ok: true as const, permit: PERMIT, receipt: permitReceiptEvent() };
     }),
     authorize: mock(async () => {
       calls.push('authorize');
@@ -245,23 +300,23 @@ function harness(
     }),
     reserveEffect: mock(async () => {
       calls.push('reserveEffect');
-      return { ok: true as const, value: receiptEvent() };
+      return { ok: true as const, value: reservationReceiptEvent() };
     }),
-    attemptFakeMerge: mock(async () => {
-      calls.push('attemptFakeMerge');
-      return fakeMergeReceipt(mergeAccepted);
-    }),
-    fakeMergeAuthorization: FAKE_AUTHORIZATION,
-    recordOutcome: mock(async () => {
+    mergeAdapter: options.adapterImpl ?? defaultAdapter,
+    recordOutcome: mock(async input => {
       calls.push('recordOutcome');
-      return { ok: true as const, value: receiptEvent() };
+      outcomeCalls.push({ outcome: input.outcome, reason: input.reason });
+      return {
+        ok: true as const,
+        value: outcomeReceiptEvent(input.outcome),
+      };
     }),
     reconcile: mock(async () => {
       calls.push('reconcile');
     }),
     ...overrides,
   };
-  return { deps, calls, mergeAccepted };
+  return { deps, calls, adapterRequests, outcomeCalls };
 }
 
 describe('classifyMergeExclusion', () => {
@@ -341,11 +396,16 @@ describe('executeQualifiedMerge -- Section 11', () => {
     expect(result.merged).toBe(true);
     expect(result.adapterCalled).toBe(true);
     expect(result.receipts).toEqual(['effect_reserved', 'effect_succeeded']);
-    expect(h.deps.attemptFakeMerge).toHaveBeenCalledTimes(1);
+    expect(result.primaryOutcome).toBe('effect_succeeded');
+    expect(result.permitEventDigest).toBe(PERMIT_EVENT_DIGEST);
+    expect(result.reservationEventDigest).toBe(RESERVATION_EVENT_DIGEST);
+    expect(h.calls.filter(c => c === 'mergeAdapter')).toHaveLength(1);
     expect(h.deps.reconcile).toHaveBeenCalledTimes(1);
-    expect(h.calls.filter(c => c === 'attemptFakeMerge')).toHaveLength(1);
     expect(h.calls).toContain('reserveEffect');
     expect(h.calls).toContain('recordOutcome');
+    expect(h.outcomeCalls).toEqual([
+      { outcome: 'effect_succeeded', reason: 'adapter_accepted:fake_accepted' },
+    ]);
   });
 
   // Stop 3 named test -- exact substring "prepare authorize reserve precede merge adapter"
@@ -356,17 +416,18 @@ describe('executeQualifiedMerge -- Section 11', () => {
     const prepareIdx = h.calls.indexOf('preparePermit');
     const authorizeIdx = h.calls.indexOf('authorize');
     const reserveIdx = h.calls.indexOf('reserveEffect');
-    const adapterIdx = h.calls.indexOf('attemptFakeMerge');
+    const adapterIdx = h.calls.indexOf('mergeAdapter');
+    const outcomeIdx = h.calls.indexOf('recordOutcome');
 
     expect(prepareIdx).toBeGreaterThanOrEqual(0);
     expect(prepareIdx).toBeLessThan(authorizeIdx);
     expect(authorizeIdx).toBeLessThan(reserveIdx);
     expect(reserveIdx).toBeLessThan(adapterIdx);
+    expect(adapterIdx).toBeLessThan(outcomeIdx);
   });
 
   // Test 2
   test('zero required checks is not green and denies before the permit or adapter', async () => {
-    // (a) zero checks in PR evidence -> not green at gate 1.
     const noChecks = harness();
     const zeroCheckEvidence = validEvidence({
       record: record({
@@ -377,9 +438,8 @@ describe('executeQualifiedMerge -- Section 11', () => {
     expect(zeroCheckResult.action).toBe('denied');
     expect(zeroCheckResult.adapterCalled).toBe(false);
     expect(noChecks.deps.preparePermit).not.toHaveBeenCalled();
-    expect(noChecks.deps.attemptFakeMerge).not.toHaveBeenCalled();
+    expect(noChecks.calls).not.toContain('mergeAdapter');
 
-    // (b) green PR but zero required-check records -> denies at required_checks gate.
     const noRequired = harness();
     const result = await executeQualifiedMerge(
       validEvidence({ required_checks: [] }),
@@ -388,7 +448,7 @@ describe('executeQualifiedMerge -- Section 11', () => {
     expect(result.action).toBe('denied');
     expect(result.reason).toBe('zero_required_checks');
     expect(noRequired.deps.preparePermit).not.toHaveBeenCalled();
-    expect(noRequired.deps.attemptFakeMerge).not.toHaveBeenCalled();
+    expect(noRequired.calls).not.toContain('mergeAdapter');
   });
 
   // Test 3
@@ -400,7 +460,7 @@ describe('executeQualifiedMerge -- Section 11', () => {
     );
     expect(production.action).toBe('operator_card');
     expect(production.adapterCalled).toBe(false);
-    expect(productionH.deps.attemptFakeMerge).not.toHaveBeenCalled();
+    expect(productionH.calls).not.toContain('mergeAdapter');
 
     const unknownH = harness();
     const unknown = await executeQualifiedMerge(
@@ -408,7 +468,7 @@ describe('executeQualifiedMerge -- Section 11', () => {
       unknownH.deps
     );
     expect(unknown.action).toBe('circuit_open');
-    expect(unknownH.deps.attemptFakeMerge).not.toHaveBeenCalled();
+    expect(unknownH.calls).not.toContain('mergeAdapter');
 
     for (const path of [
       'docs/board/motions/M-1.md',
@@ -419,13 +479,12 @@ describe('executeQualifiedMerge -- Section 11', () => {
       const h = harness();
       const result = await executeQualifiedMerge(validEvidence({ changed_files: [path] }), h.deps);
       expect(result.action).toBe('denied');
-      expect(h.deps.attemptFakeMerge).not.toHaveBeenCalled();
+      expect(h.calls).not.toContain('mergeAdapter');
     }
   });
 
   // Test 4
   test('exact-state drift stops before the adapter', async () => {
-    // Drift detected by the pure final-compare gate.
     const driftH = harness();
     const drift = await executeQualifiedMerge(
       validEvidence({ final_state_consistent: false }),
@@ -433,9 +492,8 @@ describe('executeQualifiedMerge -- Section 11', () => {
     );
     expect(drift.reason).toBe('exact_state_drift');
     expect(driftH.deps.preparePermit).not.toHaveBeenCalled();
-    expect(driftH.deps.attemptFakeMerge).not.toHaveBeenCalled();
+    expect(driftH.calls).not.toContain('mergeAdapter');
 
-    // Drift detected by the v2 permit chain (compare-and-consume failure).
     const permitDriftH = harness({
       preparePermit: mock(async () => ({
         ok: false as const,
@@ -445,11 +503,9 @@ describe('executeQualifiedMerge -- Section 11', () => {
     const permitDrift = await executeQualifiedMerge(validEvidence(), permitDriftH.deps);
     expect(permitDrift.action).toBe('permit_denied');
     expect(permitDrift.adapterCalled).toBe(false);
-    expect(permitDriftH.deps.attemptFakeMerge).not.toHaveBeenCalled();
+    expect(permitDriftH.calls).not.toContain('mergeAdapter');
   });
 
-  // Finding 1: non-internal repository denial proven at the executor, not just
-  // via the isInternalMergeAllowed() predicate. No permit or adapter is reached.
   test('a non-internal repository denies before any permit or adapter call', async () => {
     const h = harness();
     const result = await executeQualifiedMerge(
@@ -464,11 +520,9 @@ describe('executeQualifiedMerge -- Section 11', () => {
     expect(h.deps.preparePermit).not.toHaveBeenCalled();
     expect(h.deps.authorize).not.toHaveBeenCalled();
     expect(h.deps.reserveEffect).not.toHaveBeenCalled();
-    expect(h.deps.attemptFakeMerge).not.toHaveBeenCalled();
+    expect(h.calls).not.toContain('mergeAdapter');
   });
 
-  // Finding 2: a denied authorization (allowed: false) fails closed after the
-  // permit but before reservation and the adapter.
   test('a denied authorization stops before reservation and the adapter', async () => {
     const h = harness({
       authorize: mock(async () => ({
@@ -487,12 +541,10 @@ describe('executeQualifiedMerge -- Section 11', () => {
     expect(h.deps.preparePermit).toHaveBeenCalledTimes(1);
     expect(h.deps.authorize).toHaveBeenCalledTimes(1);
     expect(h.deps.reserveEffect).not.toHaveBeenCalled();
-    expect(h.deps.attemptFakeMerge).not.toHaveBeenCalled();
+    expect(h.calls).not.toContain('mergeAdapter');
     expect(h.deps.recordOutcome).not.toHaveBeenCalled();
   });
 
-  // Finding 3: a failed effect reservation (ok: false) fails closed after
-  // authorization but before the adapter is ever reached.
   test('a failed effect reservation stops before the adapter', async () => {
     const h = harness({
       reserveEffect: mock(async () => ({
@@ -508,7 +560,7 @@ describe('executeQualifiedMerge -- Section 11', () => {
     expect(result.receipts).toEqual([]);
     expect(h.deps.authorize).toHaveBeenCalledTimes(1);
     expect(h.deps.reserveEffect).toHaveBeenCalledTimes(1);
-    expect(h.deps.attemptFakeMerge).not.toHaveBeenCalled();
+    expect(h.calls).not.toContain('mergeAdapter');
     expect(h.deps.recordOutcome).not.toHaveBeenCalled();
   });
 
@@ -552,7 +604,7 @@ describe('executeQualifiedMerge -- Section 11', () => {
       const result = await executeQualifiedMerge(validEvidence(override), h.deps);
       expect(result.action).toBe('denied');
       expect(result.adapterCalled).toBe(false);
-      expect(h.deps.attemptFakeMerge).not.toHaveBeenCalled();
+      expect(h.calls).not.toContain('mergeAdapter');
     }
   });
 
@@ -574,22 +626,194 @@ describe('executeQualifiedMerge -- Section 11', () => {
       h.deps
     );
     expect(result.action).toBe('denied');
-    expect(h.deps.attemptFakeMerge).not.toHaveBeenCalled();
+    expect(h.calls).not.toContain('mergeAdapter');
   });
 
-  test('a rejected fake merge is recorded and not reported as merged', async () => {
-    const h = harness({}, { mergeAccepted: false });
+  test('a rejected adapter records effect_failed and never reports merged', async () => {
+    const h = harness({}, { adapterStatus: 'failed' });
     const result = await executeQualifiedMerge(validEvidence(), h.deps);
     expect(result.action).toBe('merge_failed');
     expect(result.merged).toBe(false);
     expect(result.adapterCalled).toBe(true);
-    expect(h.deps.recordOutcome).not.toHaveBeenCalled();
+    expect(result.primaryOutcome).toBe('effect_failed');
+    expect(result.receipts).toEqual(['effect_reserved', 'effect_failed']);
+    expect(h.outcomeCalls).toEqual([
+      { outcome: 'effect_failed', reason: 'adapter_rejected:rejected' },
+    ]);
+    expect(h.deps.reconcile).not.toHaveBeenCalled();
   });
 
   test('handleMergeReady delegates to the gated executor', async () => {
     const h = harness();
     const result = await handleMergeReady(validEvidence(), h.deps);
     expect(result.merged).toBe(true);
-    expect(h.deps.attemptFakeMerge).toHaveBeenCalledTimes(1);
+    expect(h.calls.filter(c => c === 'mergeAdapter')).toHaveLength(1);
+  });
+});
+
+describe('adversarial regressions -- Slice 7 repair', () => {
+  test('v1 merge-steward and fake-github paths are unreachable from merge-ready source', async () => {
+    const sourcePath = fileURLToPath(new URL('../actions/merge-ready.ts', import.meta.url));
+    const source = readFileSync(sourcePath, 'utf8');
+    // Only import/require edges count as a direct v1 dependency.
+    expect(source).not.toMatch(/from\s+['"][^'"]*(merge-steward|fake-github)[^'"]*['"]/);
+    expect(source).not.toMatch(
+      /import\s*\(\s*['"][^'"]*(merge-steward|fake-github)[^'"]*['"]\s*\)/
+    );
+    expect(source).not.toMatch(
+      /require\s*\(\s*['"][^'"]*(merge-steward|fake-github)[^'"]*['"]\s*\)/
+    );
+    expect(source).toMatch(/QualifiedMergeAdapterV2/);
+    expect(source).toMatch(/mergeAdapter/);
+    // Test file also must not import the forbidden modules.
+    const testSource = readFileSync(fileURLToPath(import.meta.url), 'utf8');
+    expect(testSource).not.toMatch(/from\s+['"][^'"]*(merge-steward|fake-github)[^'"]*['"]/);
+  });
+
+  test('missing mergeAdapter DI fails closed before permit or adapter', async () => {
+    const h = harness({ mergeAdapter: null });
+    const result = await executeQualifiedMerge(validEvidence(), h.deps);
+    expect(result.merged).toBe(false);
+    expect(result.action).toBe('denied');
+    expect(result.reason).toBe('merge_adapter_missing');
+    expect(result.adapterCalled).toBe(false);
+    expect(h.deps.preparePermit).not.toHaveBeenCalled();
+    expect(h.deps.reserveEffect).not.toHaveBeenCalled();
+    expect(h.deps.recordOutcome).not.toHaveBeenCalled();
+  });
+
+  test('hash-chain binds permit event digest to reservation previous digest', async () => {
+    const h = harness();
+    const result = await executeQualifiedMerge(validEvidence(), h.deps);
+    expect(result.merged).toBe(true);
+    expect(result.permitEventDigest).toBe(PERMIT_EVENT_DIGEST);
+    expect(result.reservationEventDigest).toBe(RESERVATION_EVENT_DIGEST);
+    expect(h.adapterRequests).toHaveLength(1);
+    const request = h.adapterRequests[0];
+    expect(request?.permit_event_digest).toBe(PERMIT_EVENT_DIGEST);
+    expect(request?.reservation_event_digest).toBe(RESERVATION_EVENT_DIGEST);
+    expect(request?.policy_digest).toBe(POLICY_DIGEST);
+    expect(request?.verifier_registry_digest).toBe(VERIFIER_DIGEST);
+    expect(request?.head_sha).toBe(HEAD);
+    expect(request?.base_sha).toBe(BASE);
+    expect(request?.pr_number).toBe(42);
+    expect(request?.execution_id).toBe(PERMIT.execution_id);
+    expect(request?.proposal_id).toBe(PERMIT.proposal_id);
+    expect(request?.target_digest).toBe(TARGET_DIGEST);
+  });
+
+  test('reservation previous digest mismatch fails closed without adapter and records indeterminate', async () => {
+    const h = harness({
+      reserveEffect: mock(async () => ({
+        ok: true as const,
+        value: reservationReceiptEvent('0'.repeat(64)),
+      })),
+    });
+    const result = await executeQualifiedMerge(validEvidence(), h.deps);
+    expect(result.merged).toBe(false);
+    expect(result.action).toBe('indeterminate');
+    expect(result.reason).toBe('reservation_chain_invalid:reservation_previous_digest_mismatch');
+    expect(result.adapterCalled).toBe(false);
+    expect(h.calls).not.toContain('mergeAdapter');
+    expect(result.receipts).toContain('effect_reserved');
+    expect(result.primaryOutcome).toBe('effect_indeterminate');
+    expect(h.outcomeCalls.some(c => c.outcome === 'effect_indeterminate')).toBe(true);
+  });
+
+  test('identity recheck on head drift fails before reservation and adapter', async () => {
+    const driftedPermit: M31ActionPermitV2 = {
+      ...PERMIT,
+      target: { ...TARGET, head_sha: 'f'.repeat(40) },
+    };
+    const h = harness({
+      preparePermit: mock(async () => ({
+        ok: true as const,
+        permit: driftedPermit,
+        receipt: { ...permitReceiptEvent(), target_digest: TARGET_DIGEST },
+      })),
+    });
+    const result = await executeQualifiedMerge(validEvidence(), h.deps);
+    expect(result.merged).toBe(false);
+    expect(result.action).toBe('permit_denied');
+    expect(result.reason).toBe('identity_recheck_failed:permit_head_sha_mismatch');
+    expect(h.deps.reserveEffect).not.toHaveBeenCalled();
+    expect(h.calls).not.toContain('mergeAdapter');
+  });
+
+  test('adapter rejection cannot report merged and must record effect_failed', async () => {
+    const h = harness({}, { adapterStatus: 'failed' });
+    const result = await executeQualifiedMerge(validEvidence(), h.deps);
+    expect(result.merged).toBe(false);
+    expect(result.action).toBe('merge_failed');
+    expect(result.primaryOutcome).toBe('effect_failed');
+    expect(result.receipts).toEqual(['effect_reserved', 'effect_failed']);
+    expect(h.outcomeCalls).toHaveLength(1);
+    expect(h.outcomeCalls[0]?.outcome).toBe('effect_failed');
+  });
+
+  test('outcome-write failure after adapter success cannot report merged', async () => {
+    let outcomeAttempts = 0;
+    const h = harness({
+      recordOutcome: mock(async input => {
+        outcomeAttempts += 1;
+        // First attempt (effect_succeeded) fails; second (indeterminate) succeeds.
+        if (input.outcome === 'effect_succeeded') {
+          return { ok: false as const, failure: 'outcome_append_failed' };
+        }
+        return { ok: true as const, value: outcomeReceiptEvent(input.outcome) };
+      }),
+    });
+    const result = await executeQualifiedMerge(validEvidence(), h.deps);
+    expect(result.merged).toBe(false);
+    expect(result.action).toBe('indeterminate');
+    expect(result.reason).toBe('outcome_write_failed_after_adapter_success');
+    expect(result.primaryOutcome).toBe('effect_indeterminate');
+    expect(outcomeAttempts).toBe(2);
+    // No third attempt / no replay of adapter.
+    expect(h.calls.filter(c => c === 'mergeAdapter')).toHaveLength(1);
+  });
+
+  test('adapter indeterminate cannot report merged and records effect_indeterminate once', async () => {
+    const h = harness({}, { adapterStatus: 'indeterminate' });
+    const result = await executeQualifiedMerge(validEvidence(), h.deps);
+    expect(result.merged).toBe(false);
+    expect(result.action).toBe('indeterminate');
+    expect(result.primaryOutcome).toBe('effect_indeterminate');
+    expect(result.receipts).toEqual(['effect_reserved', 'effect_indeterminate']);
+    expect(h.outcomeCalls).toHaveLength(1);
+    expect(h.deps.reconcile).not.toHaveBeenCalled();
+  });
+
+  test('policy digest identity must match the assessed policy entry', async () => {
+    const h = harness({
+      authorize: mock(async () => ({
+        ...allowedAuthorization(),
+        policy_digest: '0'.repeat(64),
+      })),
+    });
+    const result = await executeQualifiedMerge(validEvidence(), h.deps);
+    expect(result.merged).toBe(false);
+    expect(result.action).toBe('permit_denied');
+    expect(result.reason).toBe('identity_recheck_failed:auth_policy_digest_mismatch');
+    expect(h.deps.reserveEffect).not.toHaveBeenCalled();
+    expect(h.calls).not.toContain('mergeAdapter');
+  });
+
+  test('Windows path construction for fixtures has no /C: pathname bug', () => {
+    const synthetic = fileURLToPath(
+      new URL('./fixtures/overseer-action-policy.synthetic.json', import.meta.url)
+    );
+    const shipped = fileURLToPath(
+      new URL('../../../../.archon/policies/overseer-action-policy.json', import.meta.url)
+    );
+    // fileURLToPath never yields the broken "/C:/..." form on Windows.
+    expect(synthetic.includes('/C:')).toBe(false);
+    expect(shipped.includes('/C:')).toBe(false);
+    expect(existsSync(synthetic)).toBe(true);
+    expect(existsSync(shipped)).toBe(true);
+    const syntheticText = readFileSync(synthetic, 'utf8');
+    const shippedText = readFileSync(shipped, 'utf8');
+    expect(loadOverseerActionPolicyRegistry({ text: syntheticText }).entries).toHaveLength(1);
+    expect(loadOverseerActionPolicyRegistry({ text: shippedText }).entries).toHaveLength(0);
   });
 });

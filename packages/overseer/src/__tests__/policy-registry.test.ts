@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import {
   computePolicyTupleDigest,
   findMergePolicyTuple,
@@ -11,10 +12,11 @@ import {
   type OverseerActionPolicyRegistry,
 } from '../policy-registry';
 
-const SYNTHETIC_PATH = new URL('./fixtures/overseer-action-policy.synthetic.json', import.meta.url);
-const SHIPPED_PATH = new URL(
-  '../../../../.archon/policies/overseer-action-policy.json',
-  import.meta.url
+const SYNTHETIC_PATH = fileURLToPath(
+  new URL('./fixtures/overseer-action-policy.synthetic.json', import.meta.url)
+);
+const SHIPPED_PATH = fileURLToPath(
+  new URL('../../../../.archon/policies/overseer-action-policy.json', import.meta.url)
 );
 
 interface TupleInput {
