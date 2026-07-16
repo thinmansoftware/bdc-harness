@@ -10,10 +10,12 @@ import {
   acquireRepositoryMutationLease,
   admitOverseerParent,
   heartbeatOverseerParent,
+  linkOverseerChild,
   listOverseerControlEvents,
   markFusionBudgetCallStarted,
   reconcileFusionBudget,
   reserveFusionBudget,
+  transitionOverseerChildState,
 } from './overseer-control-plane';
 
 beforeAll(async () => {
@@ -155,5 +157,83 @@ describe('Overseer control-plane PostgreSQL 17 behavior', () => {
     expect(events[0]?.previous_event_digest).toBeNull();
     expect(events[1]?.previous_event_digest).toBe(events[0]?.event_digest);
     expect(events[2]?.previous_event_digest).toBe(events[1]?.event_digest);
+  });
+
+  test('PostgreSQL rejects direct mutable-row updates while named CAS transitions remain usable', async () => {
+    await primary.query(`TRUNCATE TABLE
+      overseer_control_events,
+      overseer_fusion_budget_reservations,
+      overseer_verifier_entries,
+      overseer_verifier_registries,
+      overseer_repository_mutation_leases,
+      overseer_parent_children,
+      overseer_parent_commitments`);
+    activeDatabase = primary;
+    const parent = await admitOverseerParent({
+      parent_id: 'pg-guard-parent',
+      owner_id: 'pg-guard-owner',
+      correlation_id: 'pg-guard-correlation',
+      state: 'BUILDING',
+    });
+    if (!parent.ok) throw new Error(parent.code);
+    await linkOverseerChild({
+      parent_id: 'pg-guard-parent',
+      child_id: 'pg-guard-child',
+      owner_id: 'pg-guard-owner',
+      fencing_token: parent.value.fencing_token,
+    });
+    const lease = await acquireRepositoryMutationLease({
+      repository: 'pg-guard/repo',
+      lease_id: 'pg-guard-lease',
+      owner_id: 'pg-guard-owner',
+      execution_id: 'pg-guard-execution',
+      action_kind: 'REBASE',
+      capability: 'overseer.branch',
+    });
+    if (!lease.ok) throw new Error(lease.code);
+    const reservation = await reserveFusionBudget({
+      reservation_id: 'pg-guard-reservation',
+      call_id: 'pg-guard-call',
+      proposal_id: 'pg-guard-proposal',
+      execution_id: 'pg-guard-execution',
+      provider: 'fake',
+      model: 'fake-model',
+      call_kind: 'PRIMARY',
+      requested_microusd: 1,
+    });
+    if (!reservation.ok) throw new Error(reservation.code);
+
+    const directUpdates = [
+      "UPDATE overseer_parent_commitments SET owner_id='attacker' WHERE parent_id='pg-guard-parent'",
+      "UPDATE overseer_parent_children SET created_at='2001-01-01T00:00:00Z' WHERE child_id='pg-guard-child'",
+      "UPDATE overseer_repository_mutation_leases SET capability='attacker' WHERE repository='pg-guard/repo'",
+      "UPDATE overseer_fusion_budget_reservations SET provider='attacker' WHERE reservation_id='pg-guard-reservation'",
+    ];
+    for (const sql of directUpdates) {
+      await expect(primary.query(sql)).rejects.toThrow('rejects non-CAS update');
+    }
+
+    expect(
+      await heartbeatOverseerParent({
+        parent_id: 'pg-guard-parent',
+        owner_id: 'pg-guard-owner',
+        fencing_token: parent.value.fencing_token,
+      })
+    ).toMatchObject({ ok: true });
+    expect(
+      await transitionOverseerChildState({
+        parent_id: 'pg-guard-parent',
+        child_id: 'pg-guard-child',
+        owner_id: 'pg-guard-owner',
+        fencing_token: parent.value.fencing_token,
+        state: 'RUNNING',
+      })
+    ).toMatchObject({ ok: true });
+    expect(
+      await markFusionBudgetCallStarted({
+        reservation_id: 'pg-guard-reservation',
+        call_id: 'pg-guard-call',
+      })
+    ).toMatchObject({ ok: true });
   });
 });

@@ -146,6 +146,57 @@ describe('registerOverseerControlPlaneRoutes', () => {
     expect(await unexpected.text()).not.toContain('database detail');
   });
 
+  test('maps every exact create-class replay to frozen HTTP 200', async () => {
+    const replay = mock(async () => ({ ok: true as const, created: false as const, value: {} }));
+    const app = new OpenAPIHono();
+    registerOverseerControlPlaneRoutes(
+      app,
+      dependencies({
+        admitOverseerParent: replay as never,
+        linkOverseerChild: replay as never,
+        registerVerifierRegistry: replay as never,
+        reserveFusionBudget: replay as never,
+      })
+    );
+
+    const cases = [
+      ['/internal/overseer/control-plane/parents/admit', validParent],
+      [
+        '/internal/overseer/control-plane/parents/children/link',
+        { parent_id: 'parent-1', child_id: 'child-1', owner_id: 'owner-1', fencing_token: 1 },
+      ],
+      [
+        '/internal/overseer/control-plane/verifier-registries/register',
+        {
+          schema_version: 'overseer-verifier-registry-v1',
+          registry_digest: 'a'.repeat(64),
+          entries: [],
+          source_artifact_path: 'artifacts/verifiers.json',
+          source_git_blob: 'b'.repeat(40),
+        },
+      ],
+      [
+        '/internal/overseer/control-plane/fusion/reserve',
+        {
+          reservation_id: 'reservation-1',
+          call_id: 'call-1',
+          proposal_id: 'proposal-1',
+          execution_id: 'execution-1',
+          provider: 'fake',
+          model: 'fake-model',
+          call_kind: 'PRIMARY',
+          requested_microusd: 1,
+        },
+      ],
+    ] as const;
+
+    for (const [path, body] of cases) {
+      const response = await post(app, path, body);
+      expect(response.status).toBe(200);
+    }
+    expect(replay).toHaveBeenCalledTimes(4);
+  });
+
   test('registers all exact routes and injects authenticated verifier identity', async () => {
     const assertIndependent = mock(ok);
     const listEvents = mock(async () => [{ event_id: 'ocp-event-1' }]);
