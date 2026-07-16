@@ -570,10 +570,36 @@ export async function executeRepairRefire(
     );
   }
 
-  const dispatched =
-    assessment.disposition === 'refire_later'
-      ? await deps.adapter.dispatchLaterAttempt(request)
-      : await deps.adapter.dispatchFirstAttempt(request);
+  // The three dispatch paths are strictly distinct: repair -> in-place
+  // patch on the exact target; refire_first -> direct on-ramp; refire_later
+  // -> conductor cascade. A thrown adapter/conductor dependency after an
+  // effect_reserved receipt must close the reservation with an
+  // effect_indeterminate primary outcome; leaving effect_reserved orphaned
+  // would violate the frozen receipt-chain contract.
+  let dispatched: FirstRefireOnRampResultV1;
+  try {
+    switch (assessment.disposition) {
+      case 'repair':
+        dispatched = await deps.adapter.dispatchInPlaceRepair(request);
+        break;
+      case 'refire_later':
+        dispatched = await deps.adapter.dispatchLaterAttempt(request);
+        break;
+      default:
+        // refire_first
+        dispatched = await deps.adapter.dispatchFirstAttempt(request);
+        break;
+    }
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err);
+    await deps.gate.appendOutcome({
+      execution_id: input.execution_id,
+      outcome: 'effect_indeterminate',
+      reason,
+      external_effect_reference: null,
+    });
+    return record(deps, assessment.disposition, 'indeterminate', null, predecessor, null, reason);
+  }
 
   if (!isValidOnRampResult(dispatched)) {
     // Fail closed on an invalid dependency result; record no primary outcome.

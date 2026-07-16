@@ -3,6 +3,7 @@ import { describe, expect, mock, test } from 'bun:test';
 import {
   createRepairRefireAdapter,
   type RepairRefireConductorDeps,
+  type RepairRefireInPlaceRepairDeps,
 } from '../adapters/repair-refire.ts';
 import {
   assessRepairRefireCandidate,
@@ -115,6 +116,7 @@ interface Harness {
     reserveEffect: ReturnType<typeof mock>;
     appendOutcome: ReturnType<typeof mock>;
     startFirstRefire: ReturnType<typeof mock>;
+    startInPlaceRepair: ReturnType<typeof mock>;
     pickEntryTier: ReturnType<typeof mock>;
     runCascade: ReturnType<typeof mock>;
     openRepairCircuit: ReturnType<typeof mock>;
@@ -128,6 +130,11 @@ function makeHarness(
   opts: {
     onRampResult?: FirstRefireOnRampResultV1;
     conductorResult?: FirstRefireOnRampResultV1;
+    inPlaceRepairResult?: FirstRefireOnRampResultV1;
+    /** When set, the selected dispatch path throws this error instead of
+     * returning a result; used to prove effect-ledger closure after a
+     * thrown adapter/conductor dependency. */
+    dispatchThrows?: Error;
     permitOk?: boolean;
     authAllowed?: boolean;
     reserveOk?: boolean;
@@ -157,19 +164,28 @@ function makeHarness(
 
   const startFirstRefire = mock(async (_request: FirstRefireOnRampRequestV1) => {
     orderLog.push('adapter');
+    if (opts.dispatchThrows) throw opts.dispatchThrows;
     return opts.onRampResult ?? succeededOnRamp();
+  });
+  const startInPlaceRepair = mock(async (_request: FirstRefireOnRampRequestV1) => {
+    orderLog.push('adapter');
+    if (opts.dispatchThrows) throw opts.dispatchThrows;
+    return opts.inPlaceRepairResult ?? succeededOnRamp();
   });
   const pickEntryTier = mock(() => 'tier-fast');
   const runCascade = mock(async (_input: { woId: string; entryTier: string }) => {
     orderLog.push('adapter');
+    if (opts.dispatchThrows) throw opts.dispatchThrows;
     return opts.conductorResult ?? succeededOnRamp();
   });
 
   const onRamp: FirstRefireOnRampDepsV1 = { startFirstRefire };
   const conductor: RepairRefireConductorDeps = { pickEntryTier, runCascade };
+  const inPlaceRepair: RepairRefireInPlaceRepairDeps = { startInPlaceRepair };
   const adapter = createRepairRefireAdapter({
     onRamp,
     conductor,
+    inPlaceRepair,
     woClass: 'CODE',
     tags: ['overseer'],
   });
@@ -213,6 +229,7 @@ function makeHarness(
       reserveEffect,
       appendOutcome,
       startFirstRefire,
+      startInPlaceRepair,
       pickEntryTier,
       runCascade,
       openRepairCircuit,
@@ -529,6 +546,89 @@ describe('Test 5 - semantic repair', () => {
     );
     expect(assessment.disposition).toBe('escalate');
     expect(assessment.escalation_reason).toBe('semantic_or_scope_dispute');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Repair path -- scope-preserving in-place patch (distinct from replacement runs)
+// ---------------------------------------------------------------------------
+
+describe('repair disposition routes through in-place repair only', () => {
+  test('repair uses dispatchInPlaceRepair and never touches on-ramp or conductor', async () => {
+    const harness = makeHarness();
+    const assessment = assessRepairRefireCandidate(baseAssessInput({ repairable_in_place: true }));
+    expect(assessment.disposition).toBe('repair');
+
+    const result = await executeRepairRefire(execInput(assessment), harness.deps);
+
+    expect(result.disposition).toBe('repair');
+    expect(result.outcome).toBe('succeeded');
+    // The distinct in-place repair seam is invoked exactly once.
+    expect(harness.spies.startInPlaceRepair).toHaveBeenCalledTimes(1);
+    // Replacement-run paths are never touched by a repair disposition.
+    expect(harness.spies.startFirstRefire).toHaveBeenCalledTimes(0);
+    expect(harness.spies.pickEntryTier).toHaveBeenCalledTimes(0);
+    expect(harness.spies.runCascade).toHaveBeenCalledTimes(0);
+    // Effect ledger is closed with a primary success outcome.
+    expect(harness.effectLedger.filter(e => e === 'effect_reserved')).toHaveLength(1);
+    expect(harness.effectLedger.filter(e => e === 'effect_succeeded')).toHaveLength(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Thrown adapter dependency -- effect_reserved must never orphan
+// ---------------------------------------------------------------------------
+
+describe('thrown adapter dependency closes the reservation', () => {
+  test('thrown first-refire adapter records effect_indeterminate primary outcome', async () => {
+    const harness = makeHarness({ dispatchThrows: new Error('adapter dependency crashed') });
+    const result = await executeRepairRefire(
+      execInput(assessRepairRefireCandidate(baseAssessInput())),
+      harness.deps
+    );
+
+    expect(result.disposition).toBe('refire_first');
+    expect(result.outcome).toBe('indeterminate');
+    expect(result.successor_run_id).toBeNull();
+    // Reservation is closed with effect_indeterminate; the ledger is not
+    // left with an orphaned effect_reserved.
+    expect(harness.effectLedger).toEqual(['effect_reserved', 'effect_indeterminate']);
+    // A disposition is still recorded exactly once so the audit trail
+    // observes the failed attempt.
+    expect(harness.spies.recordDisposition).toHaveBeenCalledTimes(1);
+    // Idempotency is not committed on a thrown dispatch, so a fresh attempt
+    // with the same key would re-run the gate chain.
+    expect(harness.spies.commitIdem).toHaveBeenCalledTimes(0);
+  });
+
+  test('thrown conductor cascade also records effect_indeterminate primary outcome', async () => {
+    const harness = makeHarness({ dispatchThrows: new Error('conductor cascade crashed') });
+    const result = await executeRepairRefire(
+      execInput(assessRepairRefireCandidate(baseAssessInput({ automatic_attempt_count: 1 }))),
+      harness.deps
+    );
+
+    expect(result.disposition).toBe('refire_later');
+    expect(result.outcome).toBe('indeterminate');
+    expect(harness.effectLedger).toEqual(['effect_reserved', 'effect_indeterminate']);
+    expect(harness.spies.startFirstRefire).toHaveBeenCalledTimes(0);
+    expect(harness.spies.pickEntryTier).toHaveBeenCalledTimes(1);
+    expect(harness.spies.runCascade).toHaveBeenCalledTimes(1);
+  });
+
+  test('thrown in-place repair dependency also records effect_indeterminate primary outcome', async () => {
+    const harness = makeHarness({ dispatchThrows: new Error('in-place repair crashed') });
+    const result = await executeRepairRefire(
+      execInput(assessRepairRefireCandidate(baseAssessInput({ repairable_in_place: true }))),
+      harness.deps
+    );
+
+    expect(result.disposition).toBe('repair');
+    expect(result.outcome).toBe('indeterminate');
+    expect(harness.effectLedger).toEqual(['effect_reserved', 'effect_indeterminate']);
+    expect(harness.spies.startInPlaceRepair).toHaveBeenCalledTimes(1);
+    expect(harness.spies.startFirstRefire).toHaveBeenCalledTimes(0);
+    expect(harness.spies.runCascade).toHaveBeenCalledTimes(0);
   });
 });
 
