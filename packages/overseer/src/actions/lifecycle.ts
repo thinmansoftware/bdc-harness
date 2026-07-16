@@ -582,24 +582,26 @@ function receiptDigestValid(receipt: unknown): boolean {
   return HEX_64.test(eventDigest) && sha256Canonical(event) === eventDigest;
 }
 
-function unboundTerminalReceiptValid(
+function terminalReceiptValid(
   receipt: unknown,
-  permit: M31ActionPermitV2
+  permit: M31ActionPermitV2,
+  request: Parameters<LifecycleGateDepsV1['recordOutcome']>[0],
+  previousEventDigest: string
 ): receipt is M31ExecutionReceiptEventV2 {
   return (
-    receiptBindingValid(
-      receipt,
-      permit,
-      'effect_indeterminate',
-      3,
-      isRecord(receipt) && typeof receipt.previous_event_digest === 'string'
-        ? receipt.previous_event_digest
-        : ''
-    ) &&
+    receiptBindingValid(receipt, permit, request.outcome, 3, previousEventDigest) &&
     isRecord(receipt) &&
-    typeof receipt.previous_event_digest === 'string' &&
-    HEX_64.test(receipt.previous_event_digest)
+    canonicalJsonV2(receipt.evidence) === canonicalJsonV2(request.evidence) &&
+    receipt.external_effect_reference === (request.external_effect_reference ?? null)
   );
+}
+
+function usableReservationDigest(value: unknown): string | null {
+  if (receiptDigestValid(value) && isRecord(value)) return value.event_digest as string;
+  if (isRecord(value) && receiptDigestValid(value.receipt) && isRecord(value.receipt)) {
+    return value.receipt.event_digest as string;
+  }
+  return null;
 }
 
 function mutationReceiptValid(
@@ -773,21 +775,24 @@ export async function executeLifecycleAction(
     reason: string,
     evidence: unknown
   ): Promise<ExecuteLifecycleActionResultV1> => {
+    const expectedPreviousDigest = usableReservationDigest(evidence);
+    const outcomeRequest: Parameters<LifecycleGateDepsV1['recordOutcome']>[0] = {
+      execution_id: permit.execution_id,
+      outcome: 'effect_indeterminate',
+      reason,
+      evidence,
+    };
     let recorded: unknown;
     try {
-      recorded = await deps.gate.recordOutcome({
-        execution_id: permit.execution_id,
-        outcome: 'effect_indeterminate',
-        reason,
-        evidence,
-      });
+      recorded = await deps.gate.recordOutcome(outcomeRequest);
     } catch {
       recorded = null;
     }
     if (
       !isRecord(recorded) ||
       recorded.ok !== true ||
-      !unboundTerminalReceiptValid(recorded.receipt, permit)
+      expectedPreviousDigest === null ||
+      !terminalReceiptValid(recorded.receipt, permit, outcomeRequest, expectedPreviousDigest)
     ) {
       return executionResult({
         outcome: 'outcome_record_failed',
@@ -870,17 +875,11 @@ export async function executeLifecycleAction(
       };
     }
     if (
-      !receiptBindingValid(
-        receiptResult.receipt,
-        permit,
-        request.outcome,
-        3,
-        reservationReceipt.event_digest
-      )
+      !terminalReceiptValid(receiptResult.receipt, permit, request, reservationReceipt.event_digest)
     ) {
       return { ok: false, reason: 'outcome_receipt_invalid' };
     }
-    receipts.push(receiptResult.receipt as M31ExecutionReceiptEventV2);
+    receipts.push(receiptResult.receipt);
     return { ok: true };
   };
 

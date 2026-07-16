@@ -826,6 +826,92 @@ describe('lifecycle execution', () => {
     expect(persistenceFailure.outcome).toBe('outcome_record_failed');
     expect(persistenceFailure.receipt_types).not.toContain('effect_succeeded');
   });
+
+  test('terminal success receipt must bind exact mutation evidence and reference', async () => {
+    const order: string[] = [];
+    const baseGate = makeGate(order, { permitAction: 'COMMENT' });
+    const gate: LifecycleGateDepsV1 = {
+      ...baseGate,
+      async recordOutcome(request) {
+        order.push(`outcome:${request.outcome}`);
+        const boundPermit = permit('COMMENT');
+        const permitReceipt = receipt('permit_issued', 1, boundPermit, null);
+        const reservationReceipt = receipt(
+          'effect_reserved',
+          2,
+          boundPermit,
+          permitReceipt.event_digest
+        );
+        return {
+          ok: true,
+          receipt: receipt(request.outcome, 3, boundPermit, reservationReceipt.event_digest, {
+            evidence: { forged: true },
+            external_effect_reference: 'fake-lifecycle://forged',
+          }),
+        };
+      },
+    };
+    const adapter = createLifecycleMutationAdapter({
+      allowed_repositories: ['bluedevilcollectibles/bdc-harness'],
+      allowed_actions: ['COMMENT'],
+      async consume_execution() {
+        return true;
+      },
+    });
+
+    const result = await executeLifecycleAction(
+      execInput('COMMENT'),
+      makeDeps(adapter, order, { permitAction: 'COMMENT', gate })
+    );
+
+    expect(result.outcome).toBe('outcome_record_failed');
+    expect(result.receipt_types).not.toContain('effect_succeeded');
+    expect(result.external_effect_reference).toBeNull();
+  });
+
+  test('invalid reservation uncertainty receipt must bind returned reservation digest', async () => {
+    const order: string[] = [];
+    const boundPermit = permit('COMMENT');
+    const permitReceipt = receipt('permit_issued', 1, boundPermit, null);
+    const invalidReservationReceipt = receipt(
+      'effect_reserved',
+      2,
+      boundPermit,
+      permitReceipt.event_digest,
+      { provider_operation: 'CLOSE' }
+    );
+    const gate: LifecycleGateDepsV1 = {
+      ...makeGate(order, { permitAction: 'COMMENT' }),
+      async reserveEffect() {
+        order.push('reserve');
+        return { receipt: invalidReservationReceipt } as never;
+      },
+      async recordOutcome(request) {
+        order.push(`outcome:${request.outcome}`);
+        return {
+          ok: true,
+          receipt: receipt('effect_indeterminate', 3, boundPermit, DIGEST_B, {
+            evidence: request.evidence,
+            external_effect_reference: null,
+          }),
+        };
+      },
+    };
+
+    const result = await executeLifecycleAction(
+      execInput('COMMENT'),
+      makeDeps({ perform: mock(async () => undefined as never) }, order, {
+        permitAction: 'COMMENT',
+        gate,
+      })
+    );
+
+    expect(order.filter(item => item.startsWith('outcome:'))).toEqual([
+      'outcome:effect_indeterminate',
+    ]);
+    expect(result.outcome).toBe('outcome_record_failed');
+    expect(result.receipt_types).not.toContain('effect_indeterminate');
+  });
 });
 
 describe('salvage verification and floors', () => {
