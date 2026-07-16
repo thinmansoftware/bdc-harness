@@ -1421,15 +1421,16 @@ nodes:
       printf '{"gate":"%s","binding_ok":"%s"}\n' "$GATE" "${BINDING:-none}"
 
   # Node 11: build-manifest
-  # Builds v2 Captain CI manifest for WO-CAULDRON-ONRAMP-ATOM-01.
+  # Builds v2 Captain CI manifest for the child WO being on-ramped.
   # trigger_rule: all_done so skipped/failed optional nodes do not block manifest.
   - id: build-manifest
     agent: major-build
     trigger_rule: all_done
     depends_on: [verify-binding]
     prompt: |
-      Build the Captain CI v2 completion manifest for WO-CAULDRON-ONRAMP-ATOM-01
-      (the on-ramp's own Work Order - NOT the child product WO).
+      Build the Captain CI v2 completion manifest for the child WO being on-ramped.
+      Extract the child WO_ID and WO_SLUG from Register-yaml and Fire-child below; do not use
+      or invent any on-ramp bookkeeping WO ID.
 
       ## Inputs
       Normalize-spec: $normalize-spec.output
@@ -1445,7 +1446,7 @@ nodes:
       ## Required v2 Manifest Format
 
       ```
-      WO: WO-CAULDRON-ONRAMP-ATOM-01
+      WO: <child WO_ID from Register-yaml/Fire-child>
       Builder: Major Build (bdc-harness-wo-onramp)
       Files modified: (none - on-ramp is orchestration only)
       Files created: .archon/workflows/defaults/<WO_SLUG>.yaml (bdc-harness repo)
@@ -1465,6 +1466,19 @@ nodes:
       Adversarial review scores:
       <paste full SCORES block from adversarial-review>
       ADV_PASS=<from adversarial-review>
+      Substituted run variables:
+        WO_ID=<from Register-yaml/Fire-child>
+        WO_SLUG=<from Register-yaml/Fire-child>
+        REGISTERED_OK=<from Register-yaml>
+        registered_commit_sha=<from Register-yaml commit SHA>
+        RUN_ID=<from Fire-child>
+        BINDING_OK=<from Verify-binding>
+        BOUND_REPO=<from Verify-binding>
+        SCORES=<from Adversarial-review>
+        ADV_PASS=<from Adversarial-review>
+      Regression trail:
+        Event-store anchor: SELECT step_name FROM remote_agent_workflow_events WHERE data LIKE '%hardcoded on-ramp atom WO id%' on runs started 2026-07-15 returned build-manifest rows on every failed run.
+        Affected 2026-07-15 onramp run ids: b0161d7f, 937022a1, e5518145, f62d05ed.
       VALIDATION: PASS
       ```
 
@@ -1480,8 +1494,7 @@ nodes:
       - Otherwise (BINDING_OK=true) -> VALIDATION: PASS.
 
   # Node 12: flip-notion
-  # Flips WO-CAULDRON-ONRAMP-ATOM-01 (this on-ramp's own WO) to REVIEW.
-  # Does NOT flip the child product WO (child run's flip-notion handles that).
+  # Flips the child WO being on-ramped to REVIEW.
   - id: flip-notion
     agent: xo
     depends_on: [build-manifest, binding-gate]
@@ -1501,13 +1514,16 @@ nodes:
     prompt: |
       ## GUARD: Only flip if run succeeded end-to-end
       Check build-manifest output for VALIDATION: PASS.
-      If VALIDATION: BLOCKED or FAIL -> output XO_TODO: do not flip WO-CAULDRON-ONRAMP-ATOM-01 and stop.
+      If VALIDATION: BLOCKED or FAIL -> output XO_TODO: do not flip the child WO_ID from Register-yaml and stop.
 
-      Flip the on-ramp's OWN Work Order (WO-CAULDRON-ONRAMP-ATOM-01) to REVIEW
-      in Notion. Do NOT touch the child product WO - the child run's own flip-notion
-      node will handle that at the end of its execution.
+      Flip the child Work Order identified by the WO_ID in Register-yaml to REVIEW
+      in Notion. Do not re-derive the WO_ID from the spec; use the prior-node output.
 
-      ## Required Notion changes for WO-CAULDRON-ONRAMP-ATOM-01
+      ## Inputs
+      Register-yaml: $register-yaml.output
+      Fire-child: $fire-child.output
+
+      ## Required Notion changes for the child WO_ID
       - Claude Status -> REVIEW
       - Status -> Review
       - Notes -> paste the manifest from build-manifest output verbatim
@@ -1518,9 +1534,9 @@ nodes:
       $build-manifest.output
 
       ## Procedure
-      1. Search Notion DB ${INPUT_NOTION_DB_ID} for page with WO ID = WO-CAULDRON-ONRAMP-ATOM-01.
+      1. Search Notion DB ${INPUT_NOTION_DB_ID} for page with WO ID = the child WO_ID from Register-yaml.
       2. If found: use notion-update-page to set Claude Status=REVIEW, Status=Review,
          and append the manifest to the Notes property.
       3. If Notion MCP is unavailable or search returns no result, output:
-         XO_TODO: Flip WO-CAULDRON-ONRAMP-ATOM-01 to REVIEW; paste the manifest from
+         XO_TODO: Flip the child WO_ID from Register-yaml to REVIEW; paste the manifest from
          build-manifest output into Notes. DB: ${INPUT_NOTION_DB_ID}.
