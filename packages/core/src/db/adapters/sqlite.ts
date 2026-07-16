@@ -237,6 +237,18 @@ export class SqliteAdapter implements IDatabase {
       if (!wfColNames.has('working_path')) {
         this.db.run('ALTER TABLE remote_agent_workflow_runs ADD COLUMN working_path TEXT');
       }
+
+      if (!wfColNames.has('archived_at')) {
+        this.db.run('ALTER TABLE remote_agent_workflow_runs ADD COLUMN archived_at TEXT');
+      }
+
+      if (!wfColNames.has('archived_by')) {
+        this.db.run('ALTER TABLE remote_agent_workflow_runs ADD COLUMN archived_by TEXT');
+      }
+
+      if (!wfColNames.has('archive_reason')) {
+        this.db.run('ALTER TABLE remote_agent_workflow_runs ADD COLUMN archive_reason TEXT');
+      }
     } catch (e: unknown) {
       getLog().warn({ err: e as Error }, 'db.sqlite_migration_workflow_runs_columns_failed');
     }
@@ -408,7 +420,10 @@ export class SqliteAdapter implements IDatabase {
         started_at TEXT DEFAULT (datetime('now')),
         completed_at TEXT,
         last_activity_at TEXT DEFAULT (datetime('now')),
-        working_path TEXT
+        working_path TEXT,
+        archived_at TEXT,
+        archived_by TEXT,
+        archive_reason TEXT
       );
 
       -- Workflow events table
