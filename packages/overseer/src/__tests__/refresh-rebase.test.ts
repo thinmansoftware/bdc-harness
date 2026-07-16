@@ -212,6 +212,7 @@ interface GateOpts {
   prepareDenied?: string;
   authDenied?: string;
   reserveFailure?: string;
+  recordOutcomeFailure?: string;
 }
 
 function makeGate(
@@ -241,6 +242,9 @@ function makeGate(
     },
     async recordOutcome({ outcome }) {
       order.push(`outcome:${outcome}`);
+      if (opts.recordOutcomeFailure) {
+        return { ok: false, failure: opts.recordOutcomeFailure as never };
+      }
       return { ok: true, receipt: makeReceipt(outcome, 3) as never };
     },
   };
@@ -806,6 +810,119 @@ describe('refresh-rebase Test 5 concurrent head or policy change', () => {
 
     expect(result.outcome).toBe('live_state_mismatch');
     expect(performSpy).toHaveBeenCalledTimes(0);
+  });
+
+  test('branch drift after proposal (same head, different checked-out branch) fails closed', async () => {
+    // Live checkout is at the bound head but a DIFFERENT branch is checked out.
+    // The exact controlled-branch binding must still be enforced at compare-and-act,
+    // so the mutating adapter is never reached.
+    let call = 0;
+    const observer: BranchMutationDepsV1 = {
+      async observeWorktree() {
+        // First observation: correct branch. Second (final compare-and-act):
+        // same head but a different branch is now checked out.
+        const current_branch = call === 0 ? 'wo/harness-overseer-refresh-rebase-01' : 'wo/other';
+        call += 1;
+        return {
+          clean: true,
+          current_branch,
+          head_sha: 'head-A',
+          factory_owned: true,
+        };
+      },
+      async countUniqueCommits() {
+        return 0;
+      },
+      async probeRebase() {
+        return { conflicted: false, conflict_paths: [], conflict_signal: 'none' };
+      },
+      async applyRefresh() {
+        throw new Error('adapter must not run on branch drift');
+      },
+      async applyRebase() {
+        throw new Error('adapter must not run on branch drift');
+      },
+      async readTreeSha() {
+        return 'tree';
+      },
+    };
+    const performSpy = mock(async (req: Parameters<BranchMutationAdapterV1['perform']>[0]) =>
+      createBranchMutationAdapter(observer).perform(req)
+    );
+    const order: string[] = [];
+
+    const result = await executeRefreshRebase(
+      {
+        candidate: baseCandidate({
+          worktree_path: '/fixture',
+          run_authority: {
+            run_id: 'run-5c',
+            head_sha: 'head-A',
+            base_branch: 'main',
+            base_sha: 'base',
+            factory_created: true,
+          },
+          pr_snapshot: { pr_number: 11, head_sha: 'head-A', base_branch: 'main', base_sha: 'base' },
+        }),
+        proposal_id: 'p-branch-drift',
+        actor: 'overseer',
+        correlation_id: 'corr-5c',
+      },
+      {
+        policy: eligiblePolicy(),
+        observer,
+        adapter: { perform: performSpy },
+        gate: makeGate(order),
+        fetchPostRewriteEvidence: greenEvidence('unused'),
+      }
+    );
+
+    expect(result.outcome).toBe('live_state_mismatch');
+    expect(performSpy).toHaveBeenCalledTimes(0);
+    expect(order).toContain('outcome:effect_failed');
+  });
+
+  test('failure to write the v2 outcome receipt on a terminal stop surfaces outcome_record_failed', async () => {
+    // Head drift drives live_state_mismatch; the outcome-receipt write then fails.
+    // The action MUST detect that failure rather than silently returning the stop.
+    const observer = stubObserver(['head-A', 'head-B'], null);
+    const performSpy = mock(async (req: Parameters<BranchMutationAdapterV1['perform']>[0]) =>
+      createBranchMutationAdapter(observer).perform(req)
+    );
+    const order: string[] = [];
+
+    const result = await executeRefreshRebase(
+      {
+        candidate: baseCandidate({
+          worktree_path: '/fixture',
+          run_authority: {
+            run_id: 'run-5d',
+            head_sha: 'head-A',
+            base_branch: 'main',
+            base_sha: 'base',
+            factory_created: true,
+          },
+          pr_snapshot: { pr_number: 12, head_sha: 'head-A', base_branch: 'main', base_sha: 'base' },
+        }),
+        proposal_id: 'p-receipt-fail',
+        actor: 'overseer',
+        correlation_id: 'corr-5d',
+      },
+      {
+        policy: eligiblePolicy(),
+        observer,
+        adapter: { perform: performSpy },
+        gate: makeGate(order, { recordOutcomeFailure: 'receipt_write_conflict' }),
+        fetchPostRewriteEvidence: greenEvidence('unused'),
+      }
+    );
+
+    expect(result.outcome).toBe('outcome_record_failed');
+    expect(result.reason).toContain('live_state_mismatch');
+    expect(result.reason).toContain('outcome_record_failed:receipt_write_conflict');
+    expect(performSpy).toHaveBeenCalledTimes(0);
+    // The failed receipt write is NOT appended (only successful receipts are).
+    expect(result.receipt_types).not.toContain('effect_failed');
   });
 });
 

@@ -533,6 +533,19 @@ export async function executeRefreshRebase(
   }
   receipts.push(reservation.receipt);
 
+  // After a reservation exists, every terminal stop MUST append its v2 outcome
+  // receipt and MUST detect a failure to write it. This records the outcome,
+  // pushes the receipt on success, and surfaces a write failure to the caller.
+  const recordTerminalOutcome = async (
+    request: RecordOutcomeRequestV1
+  ): Promise<ReceiptResultV1> => {
+    const receiptResult = await deps.gate.recordOutcome(request);
+    if (receiptResult.ok) {
+      receipts.push(receiptResult.receipt);
+    }
+    return receiptResult;
+  };
+
   // Final compare-and-act: reject any head/base/policy drift since assessment.
   const live = await deps.observer.observeWorktree({
     worktree_path: candidate.worktree_path,
@@ -548,18 +561,37 @@ export async function executeRefreshRebase(
   });
   if (
     live.head_sha !== assessment.bound_head_sha ||
+    live.current_branch !== candidate.branch ||
     !live.clean ||
     !live.factory_owned ||
     !livePolicy.eligible ||
     candidate.policy_digest !== assessment.policy_digest ||
     candidate.verifier_registry_digest !== assessment.verifier_registry_digest
   ) {
-    await deps.gate.recordOutcome({
+    const outcomeReceipt = await recordTerminalOutcome({
       execution_id: permit.execution_id,
       outcome: 'effect_failed',
       reason: 'live_state_mismatch',
-      evidence: { observed_head_sha: live.head_sha, bound_head_sha: assessment.bound_head_sha },
+      evidence: {
+        observed_head_sha: live.head_sha,
+        observed_branch: live.current_branch,
+        bound_head_sha: assessment.bound_head_sha,
+        bound_branch: candidate.branch,
+      },
     });
+    if (!outcomeReceipt.ok) {
+      return result({
+        outcome: 'outcome_record_failed',
+        assessment,
+        reason: `live_state_mismatch;outcome_record_failed:${outcomeReceipt.failure}`,
+        mode,
+        old_head_sha: assessment.bound_head_sha,
+        new_head_sha: null,
+        new_tree_sha: null,
+        conflict_class: null,
+        receipts,
+      });
+    }
     return result({
       outcome: 'live_state_mismatch',
       assessment,
@@ -585,12 +617,25 @@ export async function executeRefreshRebase(
 
   if (mutation.status === 'conflict') {
     const conflictClass = classifyRebaseConflict(mutation.conflict);
-    await deps.gate.recordOutcome({
+    const outcomeReceipt = await recordTerminalOutcome({
       execution_id: permit.execution_id,
       outcome: 'effect_failed',
       reason: `rebase_conflict:${conflictClass}`,
       evidence: { conflict: mutation.conflict },
     });
+    if (!outcomeReceipt.ok) {
+      return result({
+        outcome: 'outcome_record_failed',
+        assessment,
+        reason: `rebase_conflict:${conflictClass};outcome_record_failed:${outcomeReceipt.failure}`,
+        mode,
+        old_head_sha: assessment.bound_head_sha,
+        new_head_sha: null,
+        new_tree_sha: null,
+        conflict_class: conflictClass,
+        receipts,
+      });
+    }
     return result({
       outcome: 'conflict',
       assessment,
@@ -615,12 +660,25 @@ export async function executeRefreshRebase(
     review: evidence.review,
   });
   if (!evidenceResult.satisfied) {
-    await deps.gate.recordOutcome({
+    const outcomeReceipt = await recordTerminalOutcome({
       execution_id: permit.execution_id,
       outcome: 'effect_indeterminate',
       reason: `post_rewrite_evidence:${evidenceResult.reason}`,
       evidence: { new_head_sha: newHeadSha },
     });
+    if (!outcomeReceipt.ok) {
+      return result({
+        outcome: 'outcome_record_failed',
+        assessment,
+        reason: `post_rewrite_evidence:${evidenceResult.reason};outcome_record_failed:${outcomeReceipt.failure}`,
+        mode,
+        old_head_sha: assessment.bound_head_sha,
+        new_head_sha: newHeadSha,
+        new_tree_sha: mutation.new_tree_sha,
+        conflict_class: null,
+        receipts,
+      });
+    }
     return result({
       outcome: 'evidence_required',
       assessment,
