@@ -237,6 +237,13 @@ export interface IWorkflowStore {
     step_name?: string;
     data?: Record<string, unknown>;
   }): Promise<void>;
+  createDurableWorkflowEvent?(data: {
+    workflow_run_id: string;
+    event_type: WorkflowEventType;
+    step_index?: number;
+    step_name?: string;
+    data?: Record<string, unknown>;
+  }): Promise<WorkflowEventRecord>;
   listWorkflowEvents(workflowRunId: string): Promise<WorkflowEventRecord[]>;
 
   /**

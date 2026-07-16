@@ -73,6 +73,7 @@ export interface AppendDeliveryReceiptInput {
   next_attempt_at?: string | null;
   provider_receipt_id?: string | null;
   fencing_token: number;
+  lease_owner: string;
   created_at?: string;
 }
 
@@ -432,33 +433,54 @@ export async function appendDeliveryReceipt(
 ): Promise<DeliveryReceiptRecord> {
   const startedAt = nowIso(input.started_at);
   const createdAt = nowIso(input.created_at ?? input.completed_at ?? input.started_at);
-  const result = await getDatabase().query<DeliveryReceiptRow>(
-    `INSERT INTO overseer_operator_card_delivery_receipts (
-      receipt_id, card_id, channel, attempt_number, phase, started_at, completed_at,
-      outcome, sanitized_status, error_class, next_attempt_at, provider_receipt_id,
-      fencing_token, created_at
-    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
-    RETURNING *`,
-    [
-      input.receipt_id ?? randomUUID(),
-      input.card_id,
-      input.channel,
-      input.attempt_number,
-      input.phase,
-      startedAt,
-      input.completed_at ?? null,
-      input.outcome ?? null,
-      input.sanitized_status ?? null,
-      input.error_class ?? null,
-      input.next_attempt_at ?? null,
-      input.provider_receipt_id ?? null,
-      input.fencing_token,
-      createdAt,
-    ]
-  );
-  const row = result.rows[0];
-  if (!row) throw new Error('delivery_receipt_insert_failed');
-  return normalizeReceipt(row);
+  const database = getDatabase();
+  const lockClause = database.dialect === 'postgres' ? ' FOR UPDATE' : '';
+  return database.withTransaction(async query => {
+    const jobRow = (
+      await query<DeliveryJobRow>(
+        `SELECT * FROM overseer_operator_card_delivery_jobs
+         WHERE card_id = $1 AND channel = $2${lockClause}`,
+        [input.card_id, input.channel]
+      )
+    ).rows[0];
+    if (!jobRow) throw new Error('delivery_job_not_found');
+    const job = normalizeJob(jobRow);
+    if (
+      job.state !== 'leased' ||
+      job.lease_owner !== input.lease_owner ||
+      job.fencing_token !== input.fencing_token ||
+      job.attempts_started !== input.attempt_number
+    ) {
+      throw new Error('delivery_receipt_stale_fence');
+    }
+    const result = await query<DeliveryReceiptRow>(
+      `INSERT INTO overseer_operator_card_delivery_receipts (
+        receipt_id, card_id, channel, attempt_number, phase, started_at, completed_at,
+        outcome, sanitized_status, error_class, next_attempt_at, provider_receipt_id,
+        fencing_token, created_at
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+      RETURNING *`,
+      [
+        input.receipt_id ?? randomUUID(),
+        input.card_id,
+        input.channel,
+        input.attempt_number,
+        input.phase,
+        startedAt,
+        input.completed_at ?? null,
+        input.outcome ?? null,
+        input.sanitized_status ?? null,
+        input.error_class ?? null,
+        input.next_attempt_at ?? null,
+        input.provider_receipt_id ?? null,
+        input.fencing_token,
+        createdAt,
+      ]
+    );
+    const row = result.rows[0];
+    if (!row) throw new Error('delivery_receipt_insert_failed');
+    return normalizeReceipt(row);
+  });
 }
 
 export async function completeDeliveryJob(input: {

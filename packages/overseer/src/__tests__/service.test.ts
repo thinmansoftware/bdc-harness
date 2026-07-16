@@ -5,7 +5,7 @@ import { join } from 'path';
 import { closeDatabase, getDatabase, resetDatabase } from '@archon/core/db/connection';
 import { listOverseerCapabilityEvents } from '@archon/core/db/overseer-capabilities';
 import { listOperatorCards } from '@archon/core/db/overseer-briefing';
-import { runOverseerService } from '../service.ts';
+import { runOperatorCardDeliveryScheduler, runOverseerService } from '../service.ts';
 import type { M31ActionPermit, M31ActionProposal } from '../m31-substrate.ts';
 
 const ENV_KEYS = [
@@ -507,5 +507,47 @@ describe('service', () => {
       })
     ).rejects.toThrow('overseer_slice1_real_adapter_forbidden:real');
     expect(listRunsForWatch).not.toHaveBeenCalled();
+  });
+
+  test('delivery scheduler repeats at the owned interval until aborted', async () => {
+    const controller = new AbortController();
+    let drains = 0;
+    await runOperatorCardDeliveryScheduler({
+      signal: controller.signal,
+      intervalMs: 1,
+      owner: 'test-delivery-scheduler',
+      drain: async () => {
+        drains += 1;
+        if (drains === 3) controller.abort();
+      },
+    });
+    expect(drains).toBe(3);
+  });
+
+  test('delivery scheduler shutdown awaits an in-flight drain', async () => {
+    const controller = new AbortController();
+    let releaseDrain: (() => void) | undefined;
+    let started = false;
+    let settled = false;
+    const task = runOperatorCardDeliveryScheduler({
+      signal: controller.signal,
+      intervalMs: 1,
+      owner: 'test-delivery-shutdown',
+      drain: async () => {
+        started = true;
+        await new Promise<void>(resolve => {
+          releaseDrain = resolve;
+        });
+      },
+    }).then(() => {
+      settled = true;
+    });
+    while (!started) await Promise.resolve();
+    controller.abort();
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    releaseDrain?.();
+    await task;
+    expect(settled).toBe(true);
   });
 });

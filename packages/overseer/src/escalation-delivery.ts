@@ -129,7 +129,8 @@ export function createDefaultOperatorCardChannels(
       const pageId = await lookupNotionPageId(
         deps.notion_api_key,
         deps.notion_database_id,
-        card.card.wo_id
+        card.card.wo_id,
+        deps.fetch
       );
       if (!pageId) {
         return {
@@ -230,6 +231,7 @@ export async function deliverOperatorCard(input: {
       phase: 'started',
       started_at: input.now,
       fencing_token: input.job.fencing_token,
+      lease_owner: input.owner,
     });
   }
 
@@ -251,9 +253,9 @@ export async function deliverOperatorCard(input: {
           error_class: 'reconciliation_failed',
         }
       : {
-          outcome: 'transient_failure',
-          sanitized_status: 'channel_call_failed',
-          error_class: 'channel_call_failed',
+          outcome: 'indeterminate',
+          sanitized_status: 'channel_transport_state_unknown',
+          error_class: 'response_state_unknown',
         };
   }
 
@@ -277,6 +279,7 @@ export async function deliverOperatorCard(input: {
     next_attempt_at: nextAttemptAt,
     provider_receipt_id: result.provider_receipt_id ?? null,
     fencing_token: input.job.fencing_token,
+    lease_owner: input.owner,
   });
   return store.completeDeliveryJob({
     card_id: input.job.card_id,

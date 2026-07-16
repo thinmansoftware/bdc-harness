@@ -218,6 +218,7 @@ describe('overseer briefing persistence', () => {
       phase: 'started',
       started_at: CREATED_AT,
       fencing_token: first?.fencing_token ?? 0,
+      lease_owner: 'worker-a',
     });
     await appendDeliveryReceipt({
       receipt_id: 'receipt-terminal-1',
@@ -232,6 +233,7 @@ describe('overseer briefing persistence', () => {
       error_class: 'service_unavailable',
       next_attempt_at: '2026-07-16T08:00:30.000Z',
       fencing_token: first?.fencing_token ?? 0,
+      lease_owner: 'worker-a',
     });
     await completeDeliveryJob({
       card_id: CARD_ID,
@@ -303,6 +305,7 @@ describe('overseer briefing persistence', () => {
       phase: 'started',
       started_at: CREATED_AT,
       fencing_token: first?.fencing_token ?? 0,
+      lease_owner: 'worker-a',
     });
 
     await closeDatabase();
@@ -328,6 +331,7 @@ describe('overseer briefing persistence', () => {
       sanitized_status: 'provider state unknown',
       error_class: 'indeterminate',
       fencing_token: recovered?.fencing_token ?? 0,
+      lease_owner: 'worker-b',
     });
     await completeDeliveryJob({
       card_id: CARD_ID,
@@ -345,5 +349,46 @@ describe('overseer briefing persistence', () => {
     await expect(
       db.query('UPDATE overseer_operator_card_delivery_receipts SET outcome = $1', ['succeeded'])
     ).rejects.toThrow(/append-only/);
+  });
+
+  test('rejects a stale worker receipt after lease reclaim and accepts the current fence', async () => {
+    await appendOperatorCard(cardInput());
+    const first = await claimDueDeliveryJob({
+      channel: 'dispatch',
+      owner: 'worker-stale',
+      now: CREATED_AT,
+      lease_duration_ms: 1_000,
+    });
+    const reclaimed = await claimDueDeliveryJob({
+      channel: 'dispatch',
+      owner: 'worker-current',
+      now: '2026-07-16T08:00:02.000Z',
+    });
+    type FencedReceipt = Parameters<typeof appendDeliveryReceipt>[0] & { lease_owner: string };
+    const appendFenced = appendDeliveryReceipt as (
+      input: FencedReceipt
+    ) => ReturnType<typeof appendDeliveryReceipt>;
+    await expect(
+      appendFenced({
+        card_id: CARD_ID,
+        channel: 'dispatch',
+        attempt_number: 1,
+        phase: 'started',
+        started_at: CREATED_AT,
+        fencing_token: first?.fencing_token ?? 0,
+        lease_owner: 'worker-stale',
+      })
+    ).rejects.toThrow('delivery_receipt_stale_fence');
+    await expect(
+      appendFenced({
+        card_id: CARD_ID,
+        channel: 'dispatch',
+        attempt_number: 1,
+        phase: 'started',
+        started_at: CREATED_AT,
+        fencing_token: reclaimed?.fencing_token ?? 0,
+        lease_owner: 'worker-current',
+      })
+    ).resolves.toMatchObject({ fencing_token: reclaimed?.fencing_token });
   });
 });

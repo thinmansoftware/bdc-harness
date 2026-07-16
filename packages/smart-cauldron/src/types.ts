@@ -30,6 +30,8 @@ export interface ConductorRuleset {
 }
 
 export interface CascadeAttempt {
+  sourceEventId: string;
+  sourceEventAt: string;
   tier: TierName;
   workflowName: string;
   runId: string | null;

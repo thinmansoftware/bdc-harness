@@ -8,6 +8,11 @@ import { appendOverseerCapabilityEvent } from '@archon/core/db/overseer-capabili
 import { runAuthorizedEscalation } from './authorized-escalation';
 import { runEscalation } from './escalate';
 import {
+  createDefaultOperatorCardChannels,
+  runDueOperatorCardDeliveries,
+  type OperatorCardChannel,
+} from './escalation-delivery';
+import {
   createFakeGitHubAdapter,
   type FakeGitHubAdapter,
   type FakeGitHubMutationRequest,
@@ -44,6 +49,50 @@ export interface OverseerServiceOptions {
    */
   adapterKind?: OverseerWiredAdapterKind;
   deps?: OverseerRunStoreDeps & OverseerActionsDeps & GitHubClientDeps;
+  deliveryEnabled?: boolean;
+  deliveryIntervalMs?: number;
+  deliveryOwner?: string;
+  deliveryChannels?: OperatorCardChannel[];
+}
+
+export async function runOperatorCardDeliveryScheduler(input: {
+  signal?: AbortSignal;
+  intervalMs?: number;
+  owner: string;
+  once?: boolean;
+  drain?: () => Promise<unknown>;
+  channels?: OperatorCardChannel[];
+}): Promise<void> {
+  const drain =
+    input.drain ??
+    ((): Promise<unknown> =>
+      runDueOperatorCardDeliveries({
+        channels: input.channels ?? createDefaultOperatorCardChannels(),
+        owner: input.owner,
+      }));
+  for (;;) {
+    if (input.signal?.aborted) return;
+    await drain();
+    if (input.once || input.signal?.aborted) return;
+    await waitForDeliveryInterval(input.intervalMs ?? 30_000, input.signal);
+  }
+}
+
+async function waitForDeliveryInterval(milliseconds: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) return;
+  await new Promise<void>(resolve => {
+    let settled = false;
+    const finish = (): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      signal?.removeEventListener('abort', finish);
+      resolve();
+    };
+    const timer = setTimeout(finish, milliseconds);
+    signal?.addEventListener('abort', finish, { once: true });
+    if (signal?.aborted) finish();
+  });
 }
 
 function envEnabled(value: string | undefined): boolean {
@@ -202,11 +251,27 @@ export async function runOverseerService(options: OverseerServiceOptions = {}): 
   }
   const deps = options.deps ?? resolveDefaultDeps();
   const adapter = createDefaultFakeGitHubAdapter();
-  await watchLoop(deps, record => handleRecord(record, deps, adapter, dryRun, 'overseer-service'), {
-    intervalMs: options.intervalMs,
-    once: options.once,
+  const watcher = watchLoop(
+    deps,
+    record => handleRecord(record, deps, adapter, dryRun, 'overseer-service'),
+    {
+      intervalMs: options.intervalMs,
+      once: options.once,
+      signal: options.signal,
+    }
+  );
+  if (!options.deliveryEnabled) {
+    await watcher;
+    return;
+  }
+  const delivery = runOperatorCardDeliveryScheduler({
     signal: options.signal,
+    intervalMs: options.deliveryIntervalMs,
+    owner: options.deliveryOwner ?? `overseer-delivery-${process.pid}`,
+    once: options.once,
+    channels: options.deliveryChannels,
   });
+  await Promise.all([watcher, delivery]);
 }
 
 /**

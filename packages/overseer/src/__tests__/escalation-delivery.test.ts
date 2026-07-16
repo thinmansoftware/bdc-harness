@@ -9,6 +9,7 @@ import {
   closeDatabase,
   completeDeliveryJob,
   getOperatorCard,
+  listMessages,
   resetDatabase,
 } from '@archon/core/db';
 import {
@@ -17,8 +18,12 @@ import {
   deriveOperatorCardId,
   type ActionableEventIdentity,
 } from '../operator-card';
-import { runDueOperatorCardDeliveries, type OperatorCardChannel } from '../escalation-delivery';
-import { lookupNotionPageId } from '../escalate';
+import {
+  createDefaultOperatorCardChannels,
+  runDueOperatorCardDeliveries,
+  type OperatorCardChannel,
+} from '../escalation-delivery';
+import { lookupNotionPageId, runEscalation } from '../escalate';
 
 const identity: ActionableEventIdentity = {
   identity_version: 'overseer-actionable-event-v1',
@@ -216,6 +221,7 @@ describe('durable operator-card delivery', () => {
       phase: 'started',
       started_at: '2026-07-16T08:00:00.000Z',
       fencing_token: job!.fencing_token,
+      lease_owner: 'crashed-runner',
     });
     let deliverCalls = 0;
     let reconcileCalls = 0;
@@ -301,6 +307,131 @@ describe('durable operator-card delivery', () => {
     expect(view?.delivery_summary.dispatch.state).toBe('succeeded');
     expect(view?.receipts.filter(receipt => receipt.channel === 'dispatch')).toHaveLength(2);
   });
+
+  test('treats a thrown response-loss transport as indeterminate and never retries', async () => {
+    const cardId = await persistCard();
+    let calls = 0;
+    const channel: OperatorCardChannel = {
+      channel: 'dispatch',
+      deliver: async () => {
+        calls += 1;
+        throw new Error('response_lost_after_post');
+      },
+      reconcile: async () => ({
+        outcome: 'indeterminate',
+        sanitized_status: 'provider_state_unknown',
+      }),
+    };
+    const claimDispatch = (input: Parameters<typeof claimDueDeliveryJob>[0]) =>
+      claimDueDeliveryJob({ ...input, channel: 'dispatch' });
+    const store = {
+      claimDueDeliveryJob: claimDispatch,
+      getOperatorCard,
+      appendDeliveryReceipt,
+      completeDeliveryJob,
+    };
+
+    await runDueOperatorCardDeliveries({
+      channels: [channel],
+      owner: 'response-loss-runner',
+      now: '2026-07-16T08:00:00.000Z',
+      store,
+    });
+    await runDueOperatorCardDeliveries({
+      channels: [channel],
+      owner: 'response-loss-runner',
+      now: '2026-07-16T09:00:00.000Z',
+      store,
+    });
+    const view = await getOperatorCard(cardId);
+    expect(calls).toBe(1);
+    expect(view?.delivery_summary.dispatch.state).toBe('indeterminate');
+    expect(view?.delivery_summary.dispatch.attempts_started).toBe(1);
+    expect(view?.receipts.at(-1)?.outcome).toBe('indeterminate');
+    expect(view?.receipts.at(-1)?.next_attempt_at).toBeNull();
+  });
+
+  test('uses card persistence time as retry epoch for an hours-old source event', async () => {
+    const sourceTime = '2026-07-15T00:00:00.000Z';
+    const card = await runEscalation(
+      'run-old-event',
+      { decision: 'escalate', reason: 'old actionable event' },
+      {
+        errorClass: 'validator_rejected',
+        woId: 'WO-OLD-EVENT-01',
+        repository: 'bluedevilcollectibles/bdc-harness',
+      },
+      {
+        sourceEventId: 'event-old-1',
+        eventType: 'node_failed',
+        stepName: 'verify',
+        eventCreatedAt: sourceTime,
+      }
+    );
+    const view = await getOperatorCard(card.card_id);
+    expect(card.actionable_event_at).toBe(sourceTime);
+    expect(card.created_at).not.toBe(sourceTime);
+    expect(view?.jobs.every(job => job.next_attempt_at === card.created_at)).toBe(true);
+    expect(
+      await claimDueDeliveryJob({
+        channel: 'dispatch',
+        owner: 'too-early-runner',
+        now: '2026-07-15T01:00:00.000Z',
+      })
+    ).toBeNull();
+    const attempt1 = await claimDueDeliveryJob({
+      channel: 'dispatch',
+      owner: 'epoch-runner',
+      now: card.created_at,
+    });
+    expect(attempt1?.attempts_started).toBe(1);
+    if (!attempt1) throw new Error('attempt_1_not_claimed');
+    await completeDeliveryJob({
+      card_id: card.card_id,
+      channel: 'dispatch',
+      owner: 'epoch-runner',
+      fencing_token: attempt1.fencing_token,
+      outcome: 'transient_failure',
+      now: card.created_at,
+    });
+    const plus = (milliseconds: number) =>
+      new Date(new Date(card.created_at).getTime() + milliseconds).toISOString();
+    expect(
+      await claimDueDeliveryJob({
+        channel: 'dispatch',
+        owner: 'epoch-runner',
+        now: plus(29_999),
+      })
+    ).toBeNull();
+    const attempt2 = await claimDueDeliveryJob({
+      channel: 'dispatch',
+      owner: 'epoch-runner',
+      now: plus(30_000),
+    });
+    expect(attempt2?.attempts_started).toBe(2);
+    if (!attempt2) throw new Error('attempt_2_not_claimed');
+    await completeDeliveryJob({
+      card_id: card.card_id,
+      channel: 'dispatch',
+      owner: 'epoch-runner',
+      fencing_token: attempt2.fencing_token,
+      outcome: 'transient_failure',
+      now: plus(30_000),
+    });
+    expect(
+      await claimDueDeliveryJob({
+        channel: 'dispatch',
+        owner: 'epoch-runner',
+        now: plus(119_999),
+      })
+    ).toBeNull();
+    const attempt3 = await claimDueDeliveryJob({
+      channel: 'dispatch',
+      owner: 'epoch-runner',
+      now: plus(120_000),
+    });
+    expect(attempt3?.attempts_started).toBe(3);
+  });
 });
 
 describe('Notion WO lookup', () => {
@@ -335,5 +466,137 @@ describe('Notion WO lookup', () => {
 
     expect(await lookupNotionPageId('test-key', 'db-1', 'WO-1')).toBeNull();
     expect(queried).toEqual(['Task', 'WO ID', 'Name', 'Title', 'WO_ID']);
+  });
+});
+
+describe('default informational channel adapters', () => {
+  let home = '';
+  const oldHome = process.env.ARCHON_HOME;
+  const oldUrl = process.env.DATABASE_URL;
+  const originalFetch = globalThis.fetch;
+
+  beforeEach(async () => {
+    await closeDatabase();
+    resetDatabase();
+    home = join(import.meta.dir, `.test-default-channels-${Date.now()}-${Math.random()}`);
+    process.env.ARCHON_HOME = home;
+    delete process.env.DATABASE_URL;
+    globalThis.fetch = mock(async () => {
+      throw new Error('poison_global_network');
+    }) as typeof fetch;
+  });
+
+  afterEach(async () => {
+    globalThis.fetch = originalFetch;
+    await closeDatabase();
+    resetDatabase();
+    if (oldHome === undefined) delete process.env.ARCHON_HOME;
+    else process.env.ARCHON_HOME = oldHome;
+    if (oldUrl === undefined) delete process.env.DATABASE_URL;
+    else process.env.DATABASE_URL = oldUrl;
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  async function defaultCardView() {
+    const built = buildOperatorCard(identity, {
+      repository: 'bluedevilcollectibles/bdc-harness',
+      branch: 'feat/example',
+      pr_url: null,
+      pr_number: null,
+      head_sha: null,
+      base_branch: 'dev',
+      base_sha: null,
+      checks: {},
+      mergeability: 'unknown',
+      blocker: 'validator rejected',
+      mechanical_evidence: {},
+      recovery_attempted: {},
+      proposed_remediation: {},
+      next_permitted_action: 'await operator ruling',
+      responsible_actor: 'acting-xo',
+      actionable_event_at: identity.event_created_at,
+      required_ruling: null,
+      evidence_links: {},
+      lifecycle_classification: 'recovery',
+      governance_classification: 'information-only',
+    });
+    await appendOperatorCard({
+      ...built,
+      canonical_event_identity: { ...built.canonical_event_identity },
+      payload: { ...built.payload },
+      ...built.payload,
+      run_id: identity.run_id,
+      wo_id: identity.wo_id,
+    });
+    const view = await getOperatorCard(built.card_id);
+    if (!view) throw new Error('default_channel_card_missing');
+    return view;
+  }
+
+  test('default Dispatch adapter writes one guarded idempotent run report', async () => {
+    const view = await defaultCardView();
+    const dispatch = createDefaultOperatorCardChannels({ fetch: globalThis.fetch }).find(
+      channel => channel.channel === 'dispatch'
+    );
+    if (!dispatch) throw new Error('dispatch_channel_missing');
+    const result = await dispatch.deliver(view, `operator-card:${view.card.card_id}:dispatch`);
+    const messages = await listMessages({ recipient: 'operator' });
+    expect(result.outcome).toBe('succeeded');
+    expect(messages).toHaveLength(1);
+    expect(JSON.parse(messages[0]?.body ?? '{}')).toMatchObject({
+      card_id: view.card.card_id,
+      payload_digest: view.card.payload_digest,
+    });
+  });
+
+  test('default builder-monitor adapter uses injected fetch and frozen payload', async () => {
+    const view = await defaultCardView();
+    const calls: Array<{ url: string; body: unknown }> = [];
+    const injected = mock(async (input: string | URL | Request, init?: RequestInit) => {
+      calls.push({ url: String(input), body: JSON.parse(String(init?.body)) });
+      return new Response('ok', { status: 200 });
+    }) as typeof fetch;
+    const builder = createDefaultOperatorCardChannels({
+      fetch: injected,
+      builder_monitor_url: 'https://monitor.test/status',
+    }).find(channel => channel.channel === 'builder_monitor');
+    if (!builder) throw new Error('builder_channel_missing');
+    const result = await builder.deliver(view, 'unused');
+    expect(result.outcome).toBe('succeeded');
+    expect(calls).toEqual([
+      {
+        url: 'https://monitor.test/status',
+        body: {
+          builder: 'Cauldron',
+          wo_id: view.card.wo_id,
+          action: 'needs_human',
+          detail: view.card.blocker,
+          card_id: view.card.card_id,
+        },
+      },
+    ]);
+  });
+
+  test('default Notion adapter uses injected fetch for lookup and comment', async () => {
+    const view = await defaultCardView();
+    const calls: Array<{ url: string; body: Record<string, unknown> }> = [];
+    const injected = mock(async (input: string | URL | Request, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      calls.push({ url: String(input), body });
+      return String(input).includes('/query')
+        ? Response.json({ results: [{ id: 'notion-page-1' }] })
+        : new Response('ok', { status: 200 });
+    }) as typeof fetch;
+    const notion = createDefaultOperatorCardChannels({
+      fetch: injected,
+      notion_api_key: 'test-notion-key',
+      notion_database_id: 'notion-db-1',
+    }).find(channel => channel.channel === 'notion');
+    if (!notion) throw new Error('notion_channel_missing');
+    const result = await notion.deliver(view, 'unused');
+    expect(result.outcome).toBe('succeeded');
+    expect(calls).toHaveLength(2);
+    expect(calls[0]?.body).toMatchObject({ filter: { property: 'Task' } });
+    expect(calls[1]?.body).toMatchObject({ parent: { page_id: 'notion-page-1' } });
   });
 });

@@ -129,7 +129,6 @@ export async function runEscalation(
     ...built.payload,
     run_id: runId,
     wo_id: context.woId,
-    created_at: source.eventCreatedAt,
   });
   return persisted.card;
 }
@@ -187,12 +186,13 @@ export function buildDispatchRunReportBody(
 export async function lookupNotionPageId(
   apiKey: string,
   databaseId: string,
-  woId: string
+  woId: string,
+  fetchImpl: typeof fetch = globalThis.fetch
 ): Promise<string | null> {
   const url = `${NOTION_API_BASE}/databases/${databaseId}/query`;
   const candidateProps = ['Task', 'WO ID', 'Name', 'Title', 'WO_ID'];
   for (const property of candidateProps) {
-    const res = await fetch(url, {
+    const res = await fetchImpl(url, {
       method: 'POST',
       headers: {
         Authorization: `Bearer ${apiKey}`,

@@ -85,10 +85,21 @@ mock.module('../db/workflows', () => ({
 }));
 
 const mockCreateWorkflowEvent = mock(() => Promise.resolve());
+const DURABLE_EVENT = {
+  id: 'event-persisted-1',
+  workflow_run_id: 'run-1',
+  event_type: 'escalation_required',
+  step_index: 2,
+  step_name: 'review',
+  data: { reason: 'blocked' },
+  created_at: '2026-07-16T08:00:00.000Z',
+};
+const mockCreateDurableWorkflowEvent = mock(() => Promise.resolve(DURABLE_EVENT));
 const mockListWorkflowEvents = mock(() => Promise.resolve([]));
 const mockGetCompletedDagNodeOutputs = mock(() => Promise.resolve(new Map<string, string>()));
 mock.module('../db/workflow-events', () => ({
   createWorkflowEvent: mockCreateWorkflowEvent,
+  createDurableWorkflowEvent: mockCreateDurableWorkflowEvent,
   listWorkflowEvents: mockListWorkflowEvents,
   getCompletedDagNodeOutputs: mockGetCompletedDagNodeOutputs,
 }));
@@ -152,6 +163,7 @@ describe('createWorkflowStore', () => {
       'appendSupervisorAction',
       'releaseSupervisorRepairLease',
       'createWorkflowEvent',
+      'createDurableWorkflowEvent',
       'listWorkflowEvents',
       'getCompletedDagNodeOutputs',
       'getCodebase',
@@ -189,6 +201,22 @@ describe('createWorkflowStore', () => {
         step_name: 'test-step',
       })
     ).resolves.toBeUndefined();
+  });
+
+  test('createDurableWorkflowEvent returns the exact persisted row and propagates failure', async () => {
+    const store = createWorkflowStore();
+    const input = {
+      workflow_run_id: 'run-1',
+      event_type: 'escalation_required',
+      step_index: 2,
+      step_name: 'review',
+      data: { reason: 'blocked' },
+    };
+    await expect(store.createDurableWorkflowEvent?.(input)).resolves.toEqual(DURABLE_EVENT);
+    expect(mockCreateDurableWorkflowEvent).toHaveBeenCalledWith(input);
+
+    mockCreateDurableWorkflowEvent.mockRejectedValueOnce(new Error('insert failed'));
+    await expect(store.createDurableWorkflowEvent?.(input)).rejects.toThrow('insert failed');
   });
 
   test('delegates getCompletedDagNodeOutputs to DB', async () => {
@@ -278,6 +306,7 @@ describe('createWorkflowDeps', () => {
     expect(typeof deps.store.createWorkflowRun).toBe('function');
     expect(typeof deps.store.getWorkflowRun).toBe('function');
     expect(typeof deps.store.createWorkflowEvent).toBe('function');
+    expect(typeof deps.store.createDurableWorkflowEvent).toBe('function');
     expect(typeof deps.store.getCodebase).toBe('function');
   });
 });

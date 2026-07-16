@@ -7,9 +7,9 @@ const listCapabilityStatesMock = mock(
 );
 
 // Capture adapterKind passed into runOverseerService for real-wiring assertions.
-let capturedServiceOptions: { adapterKind?: string } | null = null;
+let capturedServiceOptions: { adapterKind?: string; deliveryEnabled?: boolean } | null = null;
 const runOverseerServiceMock = mock(async (opts?: unknown) => {
-  capturedServiceOptions = (opts ?? {}) as { adapterKind?: string };
+  capturedServiceOptions = (opts ?? {}) as { adapterKind?: string; deliveryEnabled?: boolean };
 });
 
 import {
@@ -54,7 +54,10 @@ describe('overseer-runtime', () => {
     runOverseerServiceMock.mockReset();
     // Re-apply base capture impl after reset (mockReset clears implementation).
     runOverseerServiceMock.mockImplementation(async (opts?: unknown) => {
-      capturedServiceOptions = (opts ?? {}) as { adapterKind?: string };
+      capturedServiceOptions = (opts ?? {}) as {
+        adapterKind?: string;
+        deliveryEnabled?: boolean;
+      };
     });
     listCapabilityStatesMock.mockReset();
     listCapabilityStatesMock.mockImplementation(async () => []);
@@ -248,7 +251,10 @@ describe('overseer-runtime', () => {
       (opts?: unknown) =>
         new Promise<void>(resolve => {
           // Capture opts here so we can assert after startOverseerRuntime returns.
-          capturedServiceOptions = (opts ?? {}) as { adapterKind?: string };
+          capturedServiceOptions = (opts ?? {}) as {
+            adapterKind?: string;
+            deliveryEnabled?: boolean;
+          };
           resolveService = resolve;
         })
     );
@@ -260,6 +266,7 @@ describe('overseer-runtime', () => {
     // The runtime must forward adapterKind='fake' into the service so the service
     // wires stub deps instead of constructing a live Octokit client.
     expect(capturedServiceOptions?.adapterKind).toBe('fake');
+    expect(capturedServiceOptions?.deliveryEnabled).toBe(true);
 
     resolveService();
     await stopOverseerRuntime();

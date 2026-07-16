@@ -451,6 +451,7 @@ describe('Test 4: INFRA-ERROR vs GATE-FAIL', () => {
   test('401 fire error -> infra-alert status; poll NOT called; escalate called; outcome != gate-failed', async () => {
     let pollCalled = false;
     let escalateCalled = false;
+    let escalationSource: { id: string; at: string } | null = null;
 
     const deps: CascadeDeps = {
       fire: async _opts => makeFireError('HTTP 401: Unauthorized'),
@@ -459,8 +460,9 @@ describe('Test 4: INFRA-ERROR vs GATE-FAIL', () => {
         return makePollResult();
       },
       judge: _poll => makePassVerdict(),
-      escalate: async _ctx => {
+      escalate: async ctx => {
         escalateCalled = true;
+        escalationSource = { id: ctx.sourceEventId, at: ctx.sourceEventCreatedAt };
       },
       writeRecord: async (record, _dir) => `/tmp/cascade-record-${record.cascadeId}.json`,
     };
@@ -473,6 +475,10 @@ describe('Test 4: INFRA-ERROR vs GATE-FAIL', () => {
     expect(record.attempts[0]?.outcome).not.toBe('gate-failed');
     expect(pollCalled).toBe(false);
     expect(escalateCalled).toBe(true);
+    expect(escalationSource).toEqual({
+      id: `${record.cascadeId}:attempt:1`,
+      at: record.attempts[0]?.startedAt,
+    });
   });
 
   test('network error (ECONNREFUSED) -> infra-alert; not gate-failed', async () => {

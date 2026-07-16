@@ -25,8 +25,10 @@ exact key order:
 
 `card_id` is lowercase hexadecimal SHA-256 of the UTF-8 canonical JSON. Every
 field is required and the source event ID and timestamp must come from durable
-caller state. A caller may not create a new identity while retrying the same
-event.
+caller state. The workflow bridge awaits the durable event insert and derives
+identity only from the returned database row. Insert failure is fail-closed: no
+card, delivery job, or authorization request is created. A caller may not create
+a new identity while retrying the same event.
 
 The payload contains repository and ref evidence, PR evidence, checks,
 mergeability, blocker, mechanical evidence, recovery attempted, proposed
@@ -56,8 +58,19 @@ increasing fencing token.
 
 After restart, an expired lease with STARTED but no TERMINAL is reconciled. An
 unknown provider state becomes `indeterminate` and is never retried blindly.
+Any thrown transport call is response-loss and therefore `indeterminate`, not a
+retryable failure. Retry is permitted only when the adapter returns an explicit
+`transient_failure` proving zero provider effect. Before either receipt is
+inserted, the same transaction validates that the job is still leased to the
+writer with the matching fencing token and attempt number. A stale worker cannot
+append evidence after a lease is reclaimed.
 Dispatch uses idempotency key `operator-card:<card_id>:dispatch` and the existing
 Dispatch content guard. Provider errors stored in receipts are sanitized.
+
+The server runtime owns the delivery scheduler. It starts with the Overseer
+watcher, polls due jobs on a fixed interval, and drains any in-flight claim before
+shutdown completes. The retry epoch is the card persistence timestamp, not the
+source event timestamp.
 
 ## XO feed
 

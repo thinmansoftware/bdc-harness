@@ -219,18 +219,6 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
 
   const cascadeId = dispatchId ?? randomUUID();
   const createdAt = new Date().toISOString();
-  let escalationSequence = 0;
-  const emitEscalation = async (
-    context: Omit<EscalationCallContext, 'sourceEventId' | 'sourceEventCreatedAt' | 'repository'>
-  ): Promise<void> => {
-    escalationSequence += 1;
-    await escalateImpl({
-      ...context,
-      sourceEventId: `${cascadeId}:escalation:${escalationSequence}`,
-      sourceEventCreatedAt: createdAt,
-      repository: project ?? 'bluedevilcollectibles/bdc-harness',
-    });
-  };
 
   // Dry-run: just log and return a stub record
   if (dryRun) {
@@ -276,6 +264,18 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
 
   // Cascade loop
   const attempts: CascadeAttempt[] = [];
+  const emitEscalation = async (
+    context: Omit<EscalationCallContext, 'sourceEventId' | 'sourceEventCreatedAt' | 'repository'>
+  ): Promise<void> => {
+    const sourceAttempt = attempts.at(-1);
+    if (!sourceAttempt) throw new Error('cascade_escalation_source_event_missing');
+    await escalateImpl({
+      ...context,
+      sourceEventId: sourceAttempt.sourceEventId,
+      sourceEventCreatedAt: sourceAttempt.sourceEventAt,
+      repository: project ?? 'bluedevilcollectibles/bdc-harness',
+    });
+  };
   let priorContext: string | null = null;
   let climbCount = 0;
   let status: CascadeStatus = 'running';
@@ -444,6 +444,8 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
     if (!tier) break;
     const attemptStartedAt = new Date().toISOString();
     const attempt: CascadeAttempt = {
+      sourceEventId: `${cascadeId}:attempt:${attempts.length + 1}`,
+      sourceEventAt: attemptStartedAt,
       tier: tier.name,
       workflowName: tier.workflowName,
       runId: null,
