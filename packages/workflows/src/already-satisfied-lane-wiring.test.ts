@@ -41,12 +41,13 @@ async function runGateScript(script: string, checkOutput: string) {
 }
 
 describe('already-satisfied lane wiring', () => {
-  it('discovers the 7 affected feature-development lanes', () => {
+  it('discovers the 8 affected feature-development lanes', () => {
     expect(LANE_FILES).toEqual([
       'bdc-feature-development-codex-only.yaml',
       'bdc-feature-development-codex.yaml',
       'bdc-feature-development-fable.yaml',
       'bdc-feature-development-fusion-cx-qwen.yaml',
+      'bdc-feature-development-grok.yaml',
       'bdc-feature-development-zero-open.yaml',
       'bdc-feature-development-zero.yaml',
       'bdc-feature-development.yaml',

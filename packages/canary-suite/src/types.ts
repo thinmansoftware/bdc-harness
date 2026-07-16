@@ -175,6 +175,7 @@ export const CANARY_LANES = [
   'bdc-feature-development-zero-open',
   'bdc-feature-development-zero',
   'bdc-feature-development-fusion-cx-qwen',
+  'bdc-feature-development-grok',
   'bdc-feature-development-codex-only',
   'bdc-feature-development-codex',
   'bdc-feature-development',

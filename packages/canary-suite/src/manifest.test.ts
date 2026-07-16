@@ -8,6 +8,7 @@ const lanes = [
   'bdc-feature-development-zero-open',
   'bdc-feature-development-zero',
   'bdc-feature-development-fusion-cx-qwen',
+  'bdc-feature-development-grok',
   'bdc-feature-development-codex-only',
   'bdc-feature-development-codex',
   'bdc-feature-development',
@@ -46,7 +47,7 @@ async function writeFixture(value: unknown): Promise<{ dir: string; path: string
 }
 
 describe('loadCanaryManifest', () => {
-  test('loads the exact eight-lane Levels 0/1 contract', async () => {
+  test('loads the exact nine-lane Levels 0/1 contract', async () => {
     const { dir, path } = await writeFixture(validManifest());
     try {
       const manifest = await loadCanaryManifest(path);
@@ -59,7 +60,7 @@ describe('loadCanaryManifest', () => {
   test('rejects duplicate lane names', async () => {
     const fixture = validManifest();
     const fixtureLanes = fixture.lanes as Array<{ name: string; order: number }>;
-    fixtureLanes[7] = { name: fixtureLanes[0]!.name, order: 8 };
+    fixtureLanes[8] = { name: fixtureLanes[0]!.name, order: 9 };
     const { dir, path } = await writeFixture(fixture);
     try {
       await expect(loadCanaryManifest(path)).rejects.toThrow('manifest_lane_duplicate');
@@ -71,7 +72,7 @@ describe('loadCanaryManifest', () => {
   test('rejects lane order values that differ from the reviewed order', async () => {
     const fixture = validManifest();
     const fixtureLanes = fixture.lanes as Array<{ name: string; order: number }>;
-    fixtureLanes[7] = { ...fixtureLanes[7]!, order: 1 };
+    fixtureLanes[8] = { ...fixtureLanes[8]!, order: 1 };
     const { dir, path } = await writeFixture(fixture);
     try {
       await expect(loadCanaryManifest(path)).rejects.toThrow('manifest_lane_order_invalid');

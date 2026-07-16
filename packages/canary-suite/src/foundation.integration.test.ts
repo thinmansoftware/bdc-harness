@@ -40,7 +40,7 @@ test('proves the read-only Levels 0 and 1 foundation end to end', async () => {
       outputRoot: root,
       codebaseId: 'codebase-1',
     });
-    expect(result.plan.directRoutes).toHaveLength(8);
+    expect(result.plan.directRoutes).toHaveLength(9);
     expect(result.plan.conductorRoutes).toHaveLength(4);
     expect(result.report.verdict).toBe('static_only');
     expect(requests).toEqual([{ method: 'GET', path: '/api/admin/canary/snapshot' }]);

@@ -2,10 +2,21 @@ import { expect, test } from 'bun:test';
 import { buildCanaryPlan } from './planner';
 import { baseSnapshot, manifest } from './test-fixtures';
 
-test('plans all eight direct lanes and four conductor probes exactly', () => {
+test('plans all nine direct lanes and four conductor probes exactly', () => {
   const plan = buildCanaryPlan(manifest, baseSnapshot);
-  expect(plan.directRoutes).toHaveLength(8);
+  expect(plan.directRoutes).toHaveLength(9);
   expect(plan.directRoutes.every(route => route.matches.length === 1)).toBe(true);
+  expect(plan.directRoutes.find(route => route.lane === 'bdc-feature-development-grok')).toEqual({
+    lane: 'bdc-feature-development-grok',
+    matches: [
+      {
+        name: 'bdc-feature-development-grok',
+        source: 'project',
+        revision: 'sha256:bdc-feature-development-grok',
+        capabilityIssues: [],
+      },
+    ],
+  });
   expect(plan.conductorRoutes).toEqual([
     {
       probeId: 'mechanical-code',
