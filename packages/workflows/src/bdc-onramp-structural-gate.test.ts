@@ -234,24 +234,34 @@ describe('on-ramp atom structural placeholder gate', () => {
     expect(yamlAuthor?.failover_agent).toBe('major-build-opr');
   });
 
-  it('requires every API-touching node to use an explicit loopback Archon base', () => {
-    const path = join(REPO_ROOT, '.archon/workflows/defaults/bdc-harness-wo-onramp.yaml');
-    const result = parseWorkflow(readFileSync(path, 'utf8'), 'bdc-harness-wo-onramp.yaml');
-    const nodes = new Map(result.workflow?.nodes.map(node => [node.id, node]));
+  // This test intentionally runs 20 real Git Bash processes (4 nodes x 5 guard cases).
+  // Windows CI has taken up to 6937ms, so use a bounded budget above Bun's 5000ms default.
+  const LOOPBACK_GUARD_TEST_TIMEOUT_MS = 15000;
 
-    for (const id of ['prefire-plan', 'register-yaml', 'fire-child', 'verify-binding']) {
-      const bash = String(nodes.get(id)?.bash || '');
-      expect(bash).toContain('API_BASE="${ARCHON_API_BASE:-}"');
-      expect(bash).not.toContain('https://archon.bluedevilcollectibles.com');
-      expect(runApiBaseGuard(bash).exitCode).not.toBe(0);
-      expect(runApiBaseGuard(bash, 'https://archon.bluedevilcollectibles.com').exitCode).not.toBe(
-        0
-      );
-      expect(runApiBaseGuard(bash, 'http://127.0.0.1:3092@external.example').exitCode).not.toBe(0);
-      expect(runApiBaseGuard(bash, 'http://127.0.0.1:3092').exitCode).toBe(0);
-      expect(runApiBaseGuard(bash, 'http://localhost:3092').exitCode).toBe(0);
-    }
-  });
+  it(
+    'requires every API-touching node to use an explicit loopback Archon base',
+    () => {
+      const path = join(REPO_ROOT, '.archon/workflows/defaults/bdc-harness-wo-onramp.yaml');
+      const result = parseWorkflow(readFileSync(path, 'utf8'), 'bdc-harness-wo-onramp.yaml');
+      const nodes = new Map(result.workflow?.nodes.map(node => [node.id, node]));
+
+      for (const id of ['prefire-plan', 'register-yaml', 'fire-child', 'verify-binding']) {
+        const bash = String(nodes.get(id)?.bash || '');
+        expect(bash).toContain('API_BASE="${ARCHON_API_BASE:-}"');
+        expect(bash).not.toContain('https://archon.bluedevilcollectibles.com');
+        expect(runApiBaseGuard(bash).exitCode).not.toBe(0);
+        expect(runApiBaseGuard(bash, 'https://archon.bluedevilcollectibles.com').exitCode).not.toBe(
+          0
+        );
+        expect(runApiBaseGuard(bash, 'http://127.0.0.1:3092@external.example').exitCode).not.toBe(
+          0
+        );
+        expect(runApiBaseGuard(bash, 'http://127.0.0.1:3092').exitCode).toBe(0);
+        expect(runApiBaseGuard(bash, 'http://localhost:3092').exitCode).toBe(0);
+      }
+    },
+    LOOPBACK_GUARD_TEST_TIMEOUT_MS
+  );
 
   it('FAILS a draft with an unfilled inputs.WO_ID.default stub', () => {
     const { failed, detail } = runGate(BROKEN_UNFILLED_WO_ID, dir);
