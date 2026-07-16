@@ -1030,6 +1030,89 @@ export class SqliteAdapter implements IDatabase {
         BEFORE DELETE ON overseer_m31_execution_receipts
         BEGIN SELECT RAISE(ABORT, 'overseer_m31_execution_receipts is append-only'); END;
 
+      -- M-42 Slice 1 capability state (migration 034). Capabilities start
+      -- disabled and closed; capability events are append-only.
+      CREATE TABLE IF NOT EXISTS overseer_capability_state (
+        capability TEXT PRIMARY KEY CHECK (capability IN (
+          'escalation', 'repair', 'branch', 'lifecycle', 'merge'
+        )),
+        action_enabled INTEGER NOT NULL DEFAULT 0 CHECK (action_enabled IN (0, 1)),
+        circuit_state TEXT NOT NULL DEFAULT 'closed' CHECK (circuit_state IN ('closed', 'open')),
+        circuit_reason TEXT,
+        circuit_opened_at TEXT,
+        policy_digest TEXT NOT NULL CHECK (
+          length(policy_digest) = 64 AND policy_digest NOT GLOB '*[^0-9a-f]*'
+        ),
+        verifier_registry_digest TEXT NOT NULL CHECK (
+          length(verifier_registry_digest) = 64
+          AND verifier_registry_digest NOT GLOB '*[^0-9a-f]*'
+        ),
+        updated_at TEXT NOT NULL,
+        updated_by TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS overseer_capability_events (
+        event_id TEXT PRIMARY KEY,
+        capability TEXT NOT NULL CHECK (capability IN (
+          'escalation', 'repair', 'branch', 'lifecycle', 'merge'
+        )),
+        event_type TEXT NOT NULL CHECK (event_type IN (
+          'gate_allowed', 'gate_denied', 'circuit_opened', 'circuit_reset', 'adapter_attempt'
+        )),
+        reason TEXT NOT NULL,
+        actor TEXT NOT NULL,
+        correlation_id TEXT NOT NULL,
+        proposal_id TEXT REFERENCES overseer_m31_action_proposals(proposal_id),
+        execution_id TEXT REFERENCES overseer_m31_action_proposals(execution_id),
+        policy_digest TEXT NOT NULL CHECK (
+          length(policy_digest) = 64 AND policy_digest NOT GLOB '*[^0-9a-f]*'
+        ),
+        verifier_registry_digest TEXT NOT NULL CHECK (
+          length(verifier_registry_digest) = 64
+          AND verifier_registry_digest NOT GLOB '*[^0-9a-f]*'
+        ),
+        details_json TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(details_json)),
+        created_at TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_overseer_capability_events_capability
+        ON overseer_capability_events(capability, created_at);
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_overseer_capability_events_adapter_execution
+        ON overseer_capability_events(execution_id)
+        WHERE event_type = 'adapter_attempt' AND execution_id IS NOT NULL;
+
+      INSERT OR IGNORE INTO overseer_capability_state (
+        capability, action_enabled, circuit_state, circuit_reason, circuit_opened_at,
+        policy_digest, verifier_registry_digest, updated_at, updated_by
+      ) VALUES
+        ('escalation', 0, 'closed', NULL, NULL,
+         '0000000000000000000000000000000000000000000000000000000000000000',
+         '0000000000000000000000000000000000000000000000000000000000000000',
+         strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 'migration-034'),
+        ('repair', 0, 'closed', NULL, NULL,
+         '0000000000000000000000000000000000000000000000000000000000000000',
+         '0000000000000000000000000000000000000000000000000000000000000000',
+         strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 'migration-034'),
+        ('branch', 0, 'closed', NULL, NULL,
+         '0000000000000000000000000000000000000000000000000000000000000000',
+         '0000000000000000000000000000000000000000000000000000000000000000',
+         strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 'migration-034'),
+        ('lifecycle', 0, 'closed', NULL, NULL,
+         '0000000000000000000000000000000000000000000000000000000000000000',
+         '0000000000000000000000000000000000000000000000000000000000000000',
+         strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 'migration-034'),
+        ('merge', 0, 'closed', NULL, NULL,
+         '0000000000000000000000000000000000000000000000000000000000000000',
+         '0000000000000000000000000000000000000000000000000000000000000000',
+         strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 'migration-034');
+
+      CREATE TRIGGER IF NOT EXISTS trg_overseer_capability_events_no_update
+        BEFORE UPDATE ON overseer_capability_events
+        BEGIN SELECT RAISE(ABORT, 'overseer_capability_events is append-only'); END;
+      CREATE TRIGGER IF NOT EXISTS trg_overseer_capability_events_no_delete
+        BEFORE DELETE ON overseer_capability_events
+        BEGIN SELECT RAISE(ABORT, 'overseer_capability_events is append-only'); END;
+
       CREATE TABLE IF NOT EXISTS overseer_actions (
         id TEXT PRIMARY KEY,
         run_id TEXT NOT NULL REFERENCES remote_agent_workflow_runs(id) ON DELETE CASCADE,

@@ -135,6 +135,8 @@ import {
 } from '@archon/core/utils/board-motion-pointer';
 import { assessDispatchMessageBody } from '@archon/core/utils/dispatch-content-guard';
 import { authenticateDispatchWorkerCredential } from '../auth/dispatch-worker-credential';
+import { getOverseerRuntimeStatus } from '../overseer-runtime';
+import { listOverseerCapabilityStates } from '@archon/core/db/overseer-capabilities';
 import { errorSchema } from './schemas/common.schemas';
 import { updateCheckResponseSchema } from './schemas/system.schemas';
 import {
@@ -1876,6 +1878,15 @@ const getHealthRoute = createRoute({
               version: z.string().optional(),
               is_docker: z.boolean(),
               activePlatforms: z.array(z.string()).optional(),
+              overseer: z
+                .object({
+                  watcher: z.string(),
+                  adapter: z.string(),
+                  emergency_stop: z.boolean(),
+                  capability_flags: z.record(z.boolean()),
+                  circuit_states: z.record(z.string()),
+                })
+                .optional(),
             })
             .openapi('HealthResponse'),
         },
@@ -5724,6 +5735,10 @@ export function registerApiRoutes(
       .filter(id => !lockActiveSet.has(id));
     const allActiveIds = [...stats.activeConversationIds, ...backgroundConversationIds];
 
+    const overseerStatus = await getOverseerRuntimeStatus({
+      listCapabilityStates: listOverseerCapabilityStates,
+    });
+
     return c.json({
       status: 'ok',
       adapter: 'web',
@@ -5736,6 +5751,7 @@ export function registerApiRoutes(
       version: appVersion,
       is_docker: isDocker(),
       activePlatforms: activePlatforms ? [...activePlatforms] : ['Web'],
+      overseer: overseerStatus,
     });
   });
 

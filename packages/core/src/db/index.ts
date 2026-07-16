@@ -23,6 +23,7 @@ export * as dispatchDb from './dispatch';
 export * as knownBadBindingsDb from './known-bad-bindings';
 export * as overseerDb from './overseer';
 export * as mergeStewardDb from './merge-steward';
+export * as overseerCapabilityDb from './overseer-capabilities';
 
 // Also export individual functions for direct imports
 export * from './conversations';
@@ -34,3 +35,4 @@ export * from './workflows';
 export * from './dispatch';
 export * from './known-bad-bindings';
 export * from './overseer';
+export * from './overseer-capabilities';

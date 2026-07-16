@@ -1,18 +1,21 @@
-import { Octokit } from '@octokit/rest';
 import { createLogger } from '@archon/paths';
 import {
   insertOverseerAction,
   listRunEventsForOverseer,
   listRunsForOverseerWatch,
 } from '@archon/core/db/overseer';
-import type { ErrorClass } from './classify.ts';
-import { runEscalation } from './escalate';
-import { handleMergeReady } from './actions/merge-ready';
-import { judgeWithGrok } from './judge-second-opinion';
+import { appendOverseerCapabilityEvent } from '@archon/core/db/overseer-capabilities';
+import { runAuthorizedEscalation } from './authorized-escalation';
+import {
+  createFakeGitHubAdapter,
+  type FakeGitHubAdapter,
+  type FakeGitHubMutationRequest,
+} from './adapters/fake-github';
+import { readOverseerActionPolicyFromEnv } from './action-policy';
+import { permitFromMetadata } from './permit';
 import { watchLoop } from './watch';
 import type {
   GitHubClientDeps,
-  GrokJudgeDeps,
   OverseerActionsDeps,
   OverseerRunStoreDeps,
   PullRequestEvidence,
@@ -21,28 +24,37 @@ import type {
 
 const log = createLogger('overseer/service');
 
+/**
+ * Resolved adapter kind for the watcher. Distinct from env-intent: reflects the
+ * adapter that was actually wired when the service started.
+ */
+export type OverseerWiredAdapterKind = 'fake' | 'real' | 'none';
+
 export interface OverseerServiceOptions {
   once?: boolean;
   enabled?: boolean;
   dryRun?: boolean;
   mergeJudge?: 'off' | 'grok';
   intervalMs?: number;
-  deps?: OverseerRunStoreDeps & OverseerActionsDeps & GitHubClientDeps & Partial<GrokJudgeDeps>;
+  signal?: AbortSignal;
+  /**
+   * When set, the service uses this adapter kind instead of calling createDefaultDeps().
+   * Allows the caller (overseer-runtime) to pass fake deps without duplicating logic.
+   */
+  adapterKind?: OverseerWiredAdapterKind;
+  deps?: OverseerRunStoreDeps & OverseerActionsDeps & GitHubClientDeps;
 }
 
 function envEnabled(value: string | undefined): boolean {
   return value === '1' || value === 'true' || value === 'yes';
 }
 
-function envMergeJudge(value: string | undefined): 'off' | 'grok' {
-  return value === 'grok' ? 'grok' : 'off';
-}
-
 async function handleRecord(
   record: WatchedRunRecord,
-  deps: OverseerActionsDeps & GitHubClientDeps & Partial<GrokJudgeDeps>,
+  deps: OverseerActionsDeps & GitHubClientDeps,
+  adapter: FakeGitHubAdapter,
   dryRun: boolean,
-  mergeJudge: 'off' | 'grok'
+  actor: string
 ): Promise<void> {
   if (record.action === 'success' || record.action === 'ignore') {
     log.info(
@@ -74,14 +86,31 @@ async function handleRecord(
   }
 
   if (record.action === 'merge_ready') {
-    const result = await handleMergeReady(record, deps, { mergeJudge });
+    const permit = permitFromMetadata(record.metadata);
+    const result = permit
+      ? await adapter.attemptMutation(mutationRequestFromPermit(permit), {
+          requested_capability: 'merge',
+          permit,
+          actor,
+          correlation_id: record.runId,
+        })
+      : null;
+    const action = result?.accepted ? 'fake_merge_attempt' : 'merge_denied';
+    const reason = result?.reason ?? 'permit_missing';
+    await deps.insertOverseerAction({
+      runId: record.runId,
+      woId: record.woId,
+      class: record.errorClass ?? 'tail_node_false_fail',
+      action,
+      result: reason,
+    });
     log.info(
       {
         runId: record.runId,
         woId: record.woId,
-        action: result.action,
+        action,
         class: record.errorClass ?? 'none',
-        reason: record.reason,
+        reason,
       },
       'overseer.merge_ready_handled'
     );
@@ -102,29 +131,22 @@ async function handleRecord(
     return;
   }
 
-  await runEscalation(record.runId, record.decision, {
-    errorClass: record.errorClass as ErrorClass,
-    nodeId: record.lastEvent?.step_name ?? undefined,
-    woId: record.woId,
-    validatorOutput:
-      typeof record.lastEvent?.data.validatorOutput === 'string'
-        ? record.lastEvent.data.validatorOutput
-        : undefined,
-    repo: record.repo,
-    prEvidence: record.prEvidence,
+  const escalation = await runAuthorizedEscalation(record.runId, {
+    permit: permitFromMetadata(record.metadata),
+    actor,
   });
   await deps.insertOverseerAction({
     runId: record.runId,
     woId: record.woId,
     class: record.errorClass,
-    action: 'escalate',
-    result: record.reason,
+    action: escalation.accepted ? 'fake_escalation_attempt' : 'escalation_denied',
+    result: escalation.reason,
   });
   log.info(
     {
       runId: record.runId,
       woId: record.woId,
-      action: 'escalate',
+      action: escalation.accepted ? 'fake_escalation_attempt' : 'escalation_denied',
       class: record.errorClass,
       reason: record.reason,
     },
@@ -137,101 +159,95 @@ export async function runOverseerService(options: OverseerServiceOptions = {}): 
   if (!enabled) return;
 
   const dryRun = options.dryRun ?? envEnabled(process.env.OVERSEER_DRY_RUN);
-  const mergeJudge = options.mergeJudge ?? envMergeJudge(process.env.OVERSEER_MERGE_JUDGE);
-  const deps = options.deps ?? createDefaultDeps();
-  await watchLoop(deps, record => handleRecord(record, deps, dryRun, mergeJudge), {
+  const adapterKind = options.adapterKind ?? resolveRequestedAdapterKind();
+  if (adapterKind !== 'fake') {
+    throw new Error(`overseer_slice1_real_adapter_forbidden:${adapterKind}`);
+  }
+  const deps = options.deps ?? resolveDefaultDeps();
+  const adapter = createDefaultFakeGitHubAdapter();
+  await watchLoop(deps, record => handleRecord(record, deps, adapter, dryRun, 'overseer-service'), {
     intervalMs: options.intervalMs,
     once: options.once,
+    signal: options.signal,
   });
 }
 
-function createDefaultDeps(): OverseerRunStoreDeps &
-  OverseerActionsDeps &
-  GitHubClientDeps &
-  Partial<GrokJudgeDeps> {
-  const token = process.env.GH_TOKEN ?? process.env.GITHUB_TOKEN;
-  const octokit = new Octokit(token ? { auth: token } : {});
-  return {
+/**
+ * Resolve default deps based on the caller-requested adapterKind (or env if unset).
+ * When fake mode is requested: wires stub findPullRequest/mergePullRequest so no live
+ * Octokit is constructed and no real GitHub network call can be made.
+ */
+function resolveDefaultDeps(): OverseerRunStoreDeps & OverseerActionsDeps & GitHubClientDeps {
+  const storeAndActions = {
     listRunsForWatch: listRunsForOverseerWatch,
     listRunEvents: listRunEventsForOverseer,
-    insertOverseerAction: async (record): Promise<void> => {
+    insertOverseerAction: async (record: {
+      runId: string;
+      woId: string;
+      class: string;
+      action: string;
+      result: string;
+    }): Promise<void> => {
       await insertOverseerAction(record);
     },
-    findPullRequest: input => findPullRequest(octokit, input),
-    mergePullRequest: async (input): Promise<{ merged: boolean; message?: string }> => {
-      const response = await octokit.pulls.merge({
-        owner: input.owner,
-        repo: input.repo,
-        pull_number: input.number,
-        commit_title: input.commitTitle,
-      });
-      return {
-        merged: response.data.merged,
-        message: response.data.message,
-      };
+  };
+
+  log.info('overseer_service.using_fake_github_adapter');
+  const fakePr: PullRequestEvidence = {
+    exists: false,
+    state: 'missing',
+    checks: { total: 0, passed: 0, failed: 0, pending: 0 },
+    mergeable: null,
+  };
+  return {
+    ...storeAndActions,
+    findPullRequest: async (): Promise<PullRequestEvidence> => {
+      log.info('overseer_service.fake_find_pull_request_noop');
+      return fakePr;
     },
-    judgeSecondOpinion: judgeWithGrok,
+    mergePullRequest: async (): Promise<{ merged: boolean; message?: string }> => {
+      throw new Error('overseer_slice1_direct_merge_unreachable');
+    },
   };
 }
 
-async function findPullRequest(
-  octokit: Octokit,
-  input: { owner: string; repo: string; headBranch?: string; woId?: string }
-): Promise<PullRequestEvidence> {
-  const candidates = await octokit.pulls.list({
-    owner: input.owner,
-    repo: input.repo,
-    state: 'all',
-    per_page: 30,
-    head: input.headBranch ? `${input.owner}:${input.headBranch}` : undefined,
-  });
-  const pr =
-    candidates.data.find(candidate => {
-      if (input.headBranch && candidate.head.ref === input.headBranch) return true;
-      return Boolean(
-        input.woId &&
-        (candidate.title.includes(input.woId) || candidate.head.ref.includes(input.woId))
-      );
-    }) ?? null;
+function resolveRequestedAdapterKind(): OverseerWiredAdapterKind {
+  return envEnabled(process.env.OVERSEER_USE_FAKE_GITHUB_ADAPTER) ? 'fake' : 'none';
+}
 
-  if (!pr) {
-    return {
-      exists: false,
-      state: 'missing',
-      checks: { total: 0, passed: 0, failed: 0, pending: 0 },
-      mergeable: null,
-    };
-  }
+function fixtureRepositories(): string[] {
+  return (process.env.OVERSEER_FAKE_GITHUB_REPOSITORIES ?? '')
+    .split(',')
+    .map(value => value.trim())
+    .filter(Boolean);
+}
 
-  const details = await octokit.pulls.get({
-    owner: input.owner,
-    repo: input.repo,
-    pull_number: pr.number,
+function createDefaultFakeGitHubAdapter(): FakeGitHubAdapter {
+  return createFakeGitHubAdapter({
+    allowed_repositories: fixtureRepositories(),
+    authorization_deps: {
+      getPolicy: async () => readOverseerActionPolicyFromEnv(),
+    },
+    // The adapter_attempt insert is the persistent claim. Migration 034 owns a
+    // partial UNIQUE index on execution_id for adapter_attempt rows, so only one
+    // concurrent or post-restart attempt can be accepted and audited.
+    consume_execution: async () => true,
+    record_attempt: appendOverseerCapabilityEvent,
   });
-  const checks = await octokit.checks.listForRef({
-    owner: input.owner,
-    repo: input.repo,
-    ref: pr.head.sha,
-  });
-  const runs = checks.data.check_runs;
-  const failed = runs.filter(run =>
-    ['failure', 'cancelled', 'timed_out', 'action_required'].includes(String(run.conclusion))
-  ).length;
-  const passed = runs.filter(
-    run =>
-      run.conclusion === 'success' || run.conclusion === 'neutral' || run.conclusion === 'skipped'
-  ).length;
-  const pending = runs.length - failed - passed;
+}
+
+function mutationRequestFromPermit(permit: FakeGitHubMutationRequest): FakeGitHubMutationRequest {
   return {
-    exists: true,
-    state: details.data.merged ? 'merged' : details.data.state,
-    checks: { total: runs.length, passed, failed, pending },
-    mergeable: details.data.mergeable,
-    pr: { owner: input.owner, repo: input.repo, number: pr.number },
-    prTitle: details.data.title,
-    filesChangedCount: details.data.changed_files,
-    diffStat: `+${details.data.additions} -${details.data.deletions}`,
-    htmlUrl: pr.html_url,
+    permit_id: permit.permit_id,
+    repository: permit.repository,
+    pr_number: permit.pr_number,
+    head_sha: permit.head_sha,
+    base_branch: permit.base_branch,
+    base_sha: permit.base_sha,
+    snapshot_id: permit.snapshot_id,
+    proposal_id: permit.proposal_id,
+    execution_id: permit.execution_id,
+    action_kind: permit.action_kind,
   };
 }
 

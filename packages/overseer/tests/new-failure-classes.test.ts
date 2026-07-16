@@ -20,7 +20,8 @@ import { describe, test, expect, beforeEach, afterEach, spyOn, mock } from 'bun:
 import { mkdtemp, rm, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { classifyError, decide, runEscalation } from '../src/index.ts';
+import { classifyError, decide } from '../src/index.ts';
+import { runEscalation } from '../src/escalate.ts';
 import { closeDatabase, resetDatabase } from '@archon/core/db';
 import type { EscalationContext } from '../src/escalate.ts';
 

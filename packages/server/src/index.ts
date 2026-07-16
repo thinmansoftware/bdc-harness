@@ -65,6 +65,7 @@ import { SSETransport } from './adapters/web/transport';
 import { WorkflowEventBridge } from './adapters/web/workflow-bridge';
 import { registerApiRoutes, stopProviderWaitScheduler } from './routes/api';
 import { observeStartupRecovery, reconcilePendingRunsAtBoot } from './startup-reconciliation';
+import { startOverseerRuntime, stopOverseerRuntime } from './overseer-runtime';
 import {
   handleMessage,
   pool,
@@ -227,6 +228,8 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     getLog().fatal({ err: error }, 'startup_pending_reconciliation_failed');
     process.exit(1);
   }
+
+  startOverseerRuntime();
 
   const config = await loadConfig();
   logConfig(config);
@@ -691,9 +694,16 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     stopProviderWaitScheduler();
     persistence.stopPeriodicFlush();
 
+    // Await overseer watcher abort before flushing; bounded by the watcher's own
+    // abort-signal handler. If the promise rejects (already-degraded watcher), we
+    // log and continue -- shutdown must not block on an already-failed service.
+    const overseerStop = stopOverseerRuntime().catch((e: unknown) => {
+      getLog().error({ err: e }, 'overseer_runtime_stop_failed');
+    });
+
     // Flush all buffered messages before stopping adapters
-    persistence
-      .flushAll()
+    Promise.resolve(overseerStop)
+      .then(() => persistence.flushAll())
       .catch((e: unknown) => {
         getLog().error({ err: e }, 'shutdown_flush_failed');
       })

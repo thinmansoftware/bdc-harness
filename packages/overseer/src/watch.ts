@@ -43,6 +43,7 @@ async function assessRun(
       owner: run.owner,
       status: run.status,
       headBranch: run.headBranch,
+      metadata: run.metadata,
       action: 'success',
       reason: 'PR is already merged; judging run successful by PR evidence',
       prEvidence,
@@ -57,6 +58,7 @@ async function assessRun(
       owner: run.owner,
       status: run.status,
       headBranch: run.headBranch,
+      metadata: run.metadata,
       action: run.status === 'completed' && isPrGreen(prEvidence) ? 'success' : 'ignore',
       reason: `terminal status ${run.status} does not require failure handling`,
       prEvidence,
@@ -71,6 +73,7 @@ async function assessRun(
       owner: run.owner,
       status: run.status,
       headBranch: run.headBranch,
+      metadata: run.metadata,
       errorClass: 'tail_node_false_fail',
       action: 'merge_ready',
       reason: 'failed run has green, mergeable PR evidence',
@@ -100,6 +103,7 @@ async function assessRun(
     owner: run.owner,
     status: run.status,
     headBranch: run.headBranch,
+    metadata: run.metadata,
     errorClass,
     action: 'escalate',
     reason: decision.reason,
@@ -124,13 +128,37 @@ export async function watchOnce(
 export async function watchLoop(
   deps: OverseerRunStoreDeps & GitHubClientDeps,
   onRecord: (record: WatchedRunRecord) => Promise<void>,
-  options: { intervalMs?: number; once?: boolean } = {}
+  options: { intervalMs?: number; once?: boolean; signal?: AbortSignal } = {}
 ): Promise<void> {
   const intervalMs = options.intervalMs ?? DEFAULT_WATCH_INTERVAL_MS;
   for (;;) {
+    if (options.signal?.aborted) return;
     const records = await watchOnce(deps);
-    for (const record of records) await onRecord(record);
+    for (const record of records) {
+      if (options.signal?.aborted) return;
+      await onRecord(record);
+    }
     if (options.once) return;
-    await new Promise(resolve => setTimeout(resolve, intervalMs));
+    await new Promise<void>(resolve => {
+      const signal = options.signal;
+      let settled = false;
+      const timer = { id: undefined as ReturnType<typeof setTimeout> | undefined };
+      const finish = (): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer.id);
+        signal?.removeEventListener('abort', onAbort);
+        resolve();
+      };
+      const onAbort = (): void => {
+        finish();
+      };
+      timer.id = setTimeout(finish, intervalMs);
+      signal?.addEventListener('abort', onAbort, { once: true });
+      // Close the narrow race where the signal aborts between the loop's
+      // pre-check and listener registration.
+      if (signal?.aborted) onAbort();
+    });
+    if (options.signal?.aborted) return;
   }
 }

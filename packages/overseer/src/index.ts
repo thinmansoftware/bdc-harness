@@ -27,14 +27,14 @@ export type { ErrorClass, ClassifyInput } from './classify';
 export { decide } from './decide';
 export type { Decision, DecideInput, DecisionResult } from './decide';
 
-export { runEscalation } from './escalate';
+export { runAuthorizedEscalation } from './authorized-escalation';
+export { parseM31ActionPermit, permitFromMetadata } from './permit';
 export { buildDispatchRunReportBody } from './escalate';
 export type { EscalationContext } from './escalate';
 
 export { watchLoop, watchOnce, DEFAULT_WATCH_INTERVAL_MS } from './watch';
 export { judgePullRequest, isPrGreen, isPrMergeReady } from './judge-pr';
 export { judgeWithGrok } from './judge-second-opinion';
-export { handleMergeReady, isInternalMergeAllowed } from './actions/merge-ready';
 export { runOverseerService } from './service';
 
 // M-31 merge-steward substrate (M-42 Slice 2): read-only permit preparation.
@@ -55,6 +55,24 @@ export type {
   M31LiveObservation,
   M31TypedFailure,
 } from './m31-substrate';
+
+// M-42 Slice 1 fail-closed action policy and deterministic fixture boundary.
+export { authorizeOverseerAction, evaluateActionPolicy } from './action-policy';
+export type {
+  ActionPolicyDenialReason,
+  ActionPolicyInput,
+  AuthorizeOverseerActionDeps,
+  AuthorizeOverseerActionInput,
+  OverseerActionPolicy,
+} from './action-policy';
+export { createFakeGitHubAdapter } from './adapters/fake-github';
+export type {
+  FakeGitHubAdapter,
+  FakeGitHubAdapterDeps,
+  FakeGitHubMutationRequest,
+  FakeGitHubReceipt,
+  FakeGitHubReceiptReason,
+} from './adapters/fake-github';
 export type {
   GrokJudgeDeps,
   GrokJudgeEvidence,
