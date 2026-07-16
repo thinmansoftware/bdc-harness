@@ -246,6 +246,8 @@ nodes:
   # The loop IS the validate->fix retry. max_iterations is the retry budget.
   - id: yaml-author
     agent: major-build
+    failover_provider: codex
+    failover_agent: major-build-opr
     depends_on: [assert-spec-resolved]
     loop:
       fresh_context: true

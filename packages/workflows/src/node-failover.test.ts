@@ -18,7 +18,7 @@
  * the process-global mock.module() calls here do not pollute sibling test files.
  */
 import { describe, it, expect, beforeEach, afterEach, mock } from 'bun:test';
-import { mkdir, rm } from 'fs/promises';
+import { mkdir, rm, writeFile } from 'fs/promises';
 import { join } from 'path';
 import { tmpdir } from 'os';
 
@@ -276,6 +276,23 @@ afterEach(async () => {
   await rm(testDir, { recursive: true, force: true }).catch(() => {});
 });
 
+async function writeTestAgent(name: string, model?: string): Promise<void> {
+  const agentsDir = join(testDir, '.archon', 'agents');
+  await mkdir(agentsDir, { recursive: true });
+  await writeFile(
+    join(agentsDir, `${name}.md`),
+    [
+      '---',
+      `name: ${name}`,
+      ...(model === undefined ? [] : [`model: ${model}`]),
+      'description: Test builder persona.',
+      '---',
+      'Build the requested artifact.',
+      '',
+    ].join('\n')
+  );
+}
+
 async function runNode(
   node: DagNode,
   behaviors: Record<string, ProviderBehavior>,
@@ -422,6 +439,58 @@ describe('node-level availability failover (prompt node)', () => {
     expect(result.calls.claude).toBe(1);
     expect(result.calls.codex).toBe(1);
     expect(result.events.some(event => event.event_type === 'node_failover')).toBe(true);
+  });
+
+  it('uses a provider-compatible failover agent for a prompt availability failure', async () => {
+    await writeTestAgent('primary-builder', 'opus');
+    await writeTestAgent('major-build-opr');
+    const node = {
+      id: 'author',
+      prompt: 'Author the YAML.',
+      agent: 'primary-builder',
+      provider: 'claude',
+      failover_provider: 'codex',
+      failover_agent: 'major-build-opr',
+    } as DagNode;
+
+    const result = await runNode(node, {
+      claude: availabilityFailure,
+      codex: () => success('authored'),
+    });
+
+    expect(result.calls.claude).toBe(1);
+    expect(result.calls.codex).toBe(1);
+    expect(result.events.filter(event => event.event_type === 'node_failover')).toHaveLength(1);
+  });
+
+  it('uses a provider-compatible failover agent for a loop availability failure', async () => {
+    await writeTestAgent('primary-builder', 'opus');
+    await writeTestAgent('major-build-opr');
+
+    const node = {
+      id: 'yaml-author',
+      agent: 'primary-builder',
+      loop: { prompt: 'Author the YAML.', until: 'COMPLETE', max_iterations: 1 },
+      provider: 'claude',
+      failover_provider: 'codex',
+      failover_agent: 'major-build-opr',
+    } as DagNode;
+    const result = await runNode(node, {
+      claude: availabilityFailure,
+      codex: () => success('COMPLETE'),
+    });
+
+    expect(result.calls.claude).toBe(1);
+    expect(result.calls.codex).toBe(1);
+    // Codex personas must stay model-less; the provider uses its scoped
+    // assistant/account default rather than receiving an Anthropic alias.
+    expect(result.models.codex).toBeUndefined();
+    expect(result.events.filter(event => event.event_type === 'node_failover')).toHaveLength(1);
+    expect(
+      result.events.some(
+        event => event.event_type === 'node_completed' && event.step_name === node.id
+      )
+    ).toBe(true);
   });
 
   it('Scenario 2: auth error -> NO failover, normal failure', async () => {

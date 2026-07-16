@@ -27,7 +27,10 @@ import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
+import { registerBuiltinProviders } from '@archon/providers';
 import { parseWorkflow } from './loader';
+
+registerBuiltinProviders();
 
 const REPO_ROOT = join(import.meta.dir, '..', '..', '..');
 
@@ -216,6 +219,19 @@ describe('on-ramp atom structural placeholder gate', () => {
 
     expect(result.error).toBeNull();
     expect(result.workflow?.name).toBe('bdc-harness-wo-onramp');
+  });
+
+  it('keeps yaml-author on Claude with one provider-compatible Codex failover', () => {
+    const path = join(REPO_ROOT, '.archon/workflows/defaults/bdc-harness-wo-onramp.yaml');
+    const result = parseWorkflow(readFileSync(path, 'utf8'), 'bdc-harness-wo-onramp.yaml');
+    const yamlAuthor = result.workflow?.nodes.find(node => node.id === 'yaml-author') as
+      | (Record<string, unknown> & { agent?: string })
+      | undefined;
+
+    expect(result.error).toBeNull();
+    expect(yamlAuthor?.agent).toBe('major-build');
+    expect(yamlAuthor?.failover_provider).toBe('codex');
+    expect(yamlAuthor?.failover_agent).toBe('major-build-opr');
   });
 
   it('requires every API-touching node to use an explicit loopback Archon base', () => {

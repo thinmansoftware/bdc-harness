@@ -487,6 +487,11 @@ export async function validateWorkflowResources(
     const nodeAgentRef = node as { agent?: string; persona?: string };
     const agentName = nodeAgentRef.agent ?? nodeAgentRef.persona;
     const agentField = nodeAgentRef.agent !== undefined ? 'agent' : 'persona';
+    const failoverAgentName = (node as { failover_agent?: string }).failover_agent;
+    const failoverProvider =
+      'failover_provider' in node && typeof node.failover_provider === 'string'
+        ? node.failover_provider
+        : workflow.failover_provider;
     if (agentName) {
       const agentFilePath = join(cwd, '.archon', 'agents', `${agentName}.md`);
       const agentExists = await fileExists(agentFilePath);
@@ -510,11 +515,11 @@ export async function validateWorkflowResources(
           // provider cannot receive an Anthropic model. Reject at validation time
           // so the operator fixes the YAML/persona rather than discovering it when
           // an availability error actually fires the failover.
-          const failoverProvider =
-            'failover_provider' in node && typeof node.failover_provider === 'string'
-              ? node.failover_provider
-              : workflow.failover_provider;
-          if (failoverProvider === 'codex' && persona.model !== undefined) {
+          if (
+            failoverProvider === 'codex' &&
+            failoverAgentName === undefined &&
+            persona.model !== undefined
+          ) {
             issues.push({
               level: 'error',
               nodeId: node.id,
@@ -531,6 +536,45 @@ export async function validateWorkflowResources(
             field: agentField,
             message: `Agent file '${agentName}' failed validation: ${err.message}`,
             hint: 'Fix the agent file frontmatter (name, model, tools) and ensure the body is non-empty',
+          });
+        }
+      }
+    }
+
+    // A provider failover may select a provider-compatible persona rather than
+    // reusing an Anthropic-pinned primary persona. Validate that alternate
+    // persona eagerly so an availability failure cannot discover a missing or
+    // incompatible agent only after the primary attempt has already failed.
+    if (failoverAgentName) {
+      const failoverAgentPath = join(cwd, '.archon', 'agents', `${failoverAgentName}.md`);
+      if (!(await fileExists(failoverAgentPath))) {
+        issues.push({
+          level: 'error',
+          nodeId: node.id,
+          field: 'failover_agent',
+          message: `Failover agent '${failoverAgentName}' not found: .archon/agents/${failoverAgentName}.md does not exist`,
+          hint: `Create .archon/agents/${failoverAgentName}.md or remove failover_agent from node '${node.id}'.`,
+        });
+      } else {
+        try {
+          const failoverPersona = await loadAgentFile(failoverAgentPath);
+          if (failoverProvider === 'codex' && failoverPersona.model !== undefined) {
+            issues.push({
+              level: 'error',
+              nodeId: node.id,
+              field: 'failover_agent',
+              message: `failover_agent '${failoverAgentName}' pins model: '${failoverPersona.model}', which is incompatible with failover_provider: codex.`,
+              hint: `Remove 'model:' from .archon/agents/${failoverAgentName}.md or choose a provider-compatible failover agent.`,
+            });
+          }
+        } catch (e) {
+          const err = e as Error;
+          issues.push({
+            level: 'error',
+            nodeId: node.id,
+            field: 'failover_agent',
+            message: `Failover agent file '${failoverAgentName}' failed validation: ${err.message}`,
+            hint: 'Fix the failover agent frontmatter and ensure the body is non-empty.',
           });
         }
       }

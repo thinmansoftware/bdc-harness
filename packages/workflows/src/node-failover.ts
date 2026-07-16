@@ -8,7 +8,8 @@
  *
  * When a prompt/loop node's provider call fails with an availability-class error,
  * the DAG executor re-dispatches that ONE node exactly once on a declared
- * `failover_provider`/`failover_model`. This module owns the single question the
+ * `failover_provider`/`failover_model` and optional provider-compatible
+ * `failover_agent`. This module owns the single question the
  * executor asks: "is this error availability-class (safe to fall sideways) or not?"
  *
  * It REUSES the overseer classifier (`@archon/overseer/classify`) rather than

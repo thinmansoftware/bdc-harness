@@ -415,7 +415,8 @@ interface WorkflowLevelOptions {
 /**
  * Resolve a node's declared AVAILABILITY failover target
  * (WO-HARNESS-NODE-PROVIDER-FAILOVER-01): node-level `failover_provider`/
- * `failover_model` win over the workflow-level defaults. Returns null when no
+ * `failover_model` win over the workflow-level defaults. `failover_agent` is
+ * node-only because persona compatibility is specific to each node. Returns null when no
  * failover provider is declared at either level (node behaves as before).
  * These are pure control-plane fields -- the executor uses them to pick the
  * sideways re-dispatch target; they are never forwarded into SDK options.
@@ -423,11 +424,32 @@ interface WorkflowLevelOptions {
 function resolveFailoverTarget(
   node: DagNode,
   workflowLevelOptions: WorkflowLevelOptions
-): { provider: string; model: string | undefined } | null {
-  const ref = node as { failover_provider?: string; failover_model?: string };
+): { provider: string; model: string | undefined; agent: string | undefined } | null {
+  const ref = node as {
+    failover_provider?: string;
+    failover_model?: string;
+    failover_agent?: string;
+  };
   const provider = ref.failover_provider ?? workflowLevelOptions.failoverProvider;
   if (!provider) return null;
-  return { provider, model: ref.failover_model ?? workflowLevelOptions.failoverModel };
+  return {
+    provider,
+    model: ref.failover_model ?? workflowLevelOptions.failoverModel,
+    agent: ref.failover_agent,
+  };
+}
+
+/** Clone an AI node for a provider failover without retaining an incompatible persona. */
+function buildFailoverNode(
+  node: DagNode,
+  target: { provider: string; model: string | undefined; agent?: string }
+): DagNode {
+  return {
+    ...node,
+    provider: target.provider,
+    model: target.model,
+    ...(target.agent !== undefined ? { agent: target.agent, persona: undefined } : {}),
+  } as DagNode;
 }
 
 /**
@@ -4985,7 +5007,11 @@ async function executeDagWorkflowInternal(
               : null;
             const loopFailoverTarget =
               loopQuotaRoute?.kind === 'failover'
-                ? { provider: loopQuotaRoute.provider, model: loopQuotaRoute.model }
+                ? {
+                    provider: loopQuotaRoute.provider,
+                    model: loopQuotaRoute.model,
+                    agent: (node as { failover_agent?: string }).failover_agent,
+                  }
                 : resolveFailoverTarget(node, workflowLevelOptions);
             const loopFailoverErrorClass = output.quotaExhausted ? 'quota' : 'availability';
             if (
@@ -5000,7 +5026,11 @@ async function executeDagWorkflowInternal(
                 loopFailoverTarget.model ??
                 (config.assistants[loopFailoverTarget.provider]?.model as string | undefined);
               try {
-                assertProviderCanExecuteNode(loopFailoverTarget.provider, node);
+                const loopFailoverNode = buildFailoverNode(node, {
+                  ...loopFailoverTarget,
+                  model: loopFailoverModel,
+                });
+                assertProviderCanExecuteNode(loopFailoverTarget.provider, loopFailoverNode);
                 emitNodeFailover(
                   deps,
                   workflowRun.id,
@@ -5021,7 +5051,7 @@ async function executeDagWorkflowInternal(
                   conversationId,
                   cwd,
                   workflowRun,
-                  node,
+                  loopFailoverNode as LoopNode,
                   loopFailoverTarget.provider,
                   loopFailoverModel,
                   artifactsDir,
@@ -5294,7 +5324,11 @@ async function executeDagWorkflowInternal(
             : null;
           const failoverTarget =
             quotaRoute?.kind === 'failover'
-              ? { provider: quotaRoute.provider, model: quotaRoute.model }
+              ? {
+                  provider: quotaRoute.provider,
+                  model: quotaRoute.model,
+                  agent: (node as { failover_agent?: string }).failover_agent,
+                }
               : resolveFailoverTarget(node, workflowLevelOptions);
           const failoverErrorClass = output.quotaExhausted ? 'quota' : 'availability';
           if (
@@ -5305,7 +5339,8 @@ async function executeDagWorkflowInternal(
             (quotaRoute?.kind === 'failover' || isAvailabilityError(output.error))
           ) {
             try {
-              assertProviderCanExecuteNode(failoverTarget.provider, node);
+              const failoverNode = buildFailoverNode(node, failoverTarget);
+              assertProviderCanExecuteNode(failoverTarget.provider, failoverNode);
               // Clone the node with the failover provider/model and re-run the
               // full resolution path. This re-runs persona resolution against the
               // failover provider, so an incompatible pairing (e.g. codex failover
@@ -5319,11 +5354,6 @@ async function executeDagWorkflowInternal(
               // when `failover_model` is omitted. Clearing it lets
               // resolveNodeProviderAndModel fall back to the failover provider's
               // own assistant-config model (mirrors the loop-node path above).
-              const failoverNode = {
-                ...node,
-                provider: failoverTarget.provider,
-                model: failoverTarget.model,
-              };
               const failoverResolved = await resolveNodeProviderAndModel(
                 failoverNode,
                 workflowProvider,
@@ -5355,7 +5385,7 @@ async function executeDagWorkflowInternal(
                 conversationId,
                 cwd,
                 workflowRun,
-                node,
+                failoverNode as CommandNode | PromptNode,
                 failoverResolved.provider,
                 failoverResolved.options,
                 failoverResolved.declaredModelId,
