@@ -183,33 +183,65 @@ export function buildDispatchRunReportBody(
  * on the row -- we try the common ones in order. This is intentionally tolerant:
  * the goal is best-effort discovery, not exact-schema enforcement.
  */
+export interface NotionPageLookupResult {
+  page_id: string | null;
+  failure_outcome: 'transient_failure' | 'permanent_failure' | null;
+}
+
+function isRetrySafeHttpStatus(status: number): boolean {
+  return status === 429 || (status >= 500 && status <= 599);
+}
+
+export async function lookupNotionPage(
+  apiKey: string,
+  databaseId: string,
+  woId: string,
+  fetchImpl: typeof fetch = globalThis.fetch
+): Promise<NotionPageLookupResult> {
+  const url = `${NOTION_API_BASE}/databases/${databaseId}/query`;
+  const candidateProps = ['Task', 'WO ID', 'Name', 'Title', 'WO_ID'];
+  let sawSuccessfulQuery = false;
+  let sawRetrySafeFailure = false;
+  for (const property of candidateProps) {
+    try {
+      const res = await fetchImpl(url, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          'Content-Type': 'application/json',
+          'Notion-Version': NOTION_VERSION,
+        },
+        body: JSON.stringify({
+          filter: { property, title: { equals: woId } },
+          page_size: 1,
+        }),
+      });
+      if (!res.ok) {
+        if (isRetrySafeHttpStatus(res.status)) sawRetrySafeFailure = true;
+        continue;
+      }
+      sawSuccessfulQuery = true;
+      const data = (await res.json()) as { results?: { id?: string }[] };
+      const first = data.results?.[0];
+      if (first?.id) return { page_id: first.id, failure_outcome: null };
+    } catch {
+      sawRetrySafeFailure = true;
+    }
+  }
+  return {
+    page_id: null,
+    failure_outcome:
+      sawSuccessfulQuery || sawRetrySafeFailure ? 'transient_failure' : 'permanent_failure',
+  };
+}
+
 export async function lookupNotionPageId(
   apiKey: string,
   databaseId: string,
   woId: string,
   fetchImpl: typeof fetch = globalThis.fetch
 ): Promise<string | null> {
-  const url = `${NOTION_API_BASE}/databases/${databaseId}/query`;
-  const candidateProps = ['Task', 'WO ID', 'Name', 'Title', 'WO_ID'];
-  for (const property of candidateProps) {
-    const res = await fetchImpl(url, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        'Content-Type': 'application/json',
-        'Notion-Version': NOTION_VERSION,
-      },
-      body: JSON.stringify({
-        filter: { property, title: { equals: woId } },
-        page_size: 1,
-      }),
-    });
-    if (!res.ok) continue;
-    const data = (await res.json()) as { results?: { id?: string }[] };
-    const first = data.results?.[0];
-    if (first?.id) return first.id;
-  }
-  return null;
+  return (await lookupNotionPage(apiKey, databaseId, woId, fetchImpl)).page_id;
 }
 
 function isOperatorCardRecord(

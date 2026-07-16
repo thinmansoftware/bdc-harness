@@ -64,6 +64,11 @@ retryable failure. Retry is permitted only when the adapter returns an explicit
 inserted, the same transaction validates that the job is still leased to the
 writer with the matching fencing token and attempt number. A stale worker cannot
 append evidence after a lease is reclaimed.
+An expired lease remains reclaimable at attempt three for terminal
+reconciliation, but its attempt counter is not incremented and delivery is not
+called a fourth time. HTTP adapters classify only 429 and 5xx responses as
+retryable; authentication, validation, and other non-success responses are
+permanent failures.
 Dispatch uses idempotency key `operator-card:<card_id>:dispatch` and the existing
 Dispatch content guard. Provider errors stored in receipts are sanitized.
 

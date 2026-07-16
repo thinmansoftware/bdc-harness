@@ -256,6 +256,73 @@ describe('durable operator-card delivery', () => {
     expect(view?.receipts.at(-1)?.outcome).toBe('indeterminate');
   });
 
+  test('reclaims an expired third attempt and reconciles without a fourth provider call', async () => {
+    const cardId = await persistCard();
+    let deliverCalls = 0;
+    let reconcileCalls = 0;
+    const channel: OperatorCardChannel = {
+      channel: 'dispatch',
+      deliver: async () => {
+        deliverCalls += 1;
+        return { outcome: 'transient_failure', sanitized_status: 'retry_safe' };
+      },
+      reconcile: async () => {
+        reconcileCalls += 1;
+        return { outcome: 'indeterminate', sanitized_status: 'provider_state_unknown' };
+      },
+    };
+    const claimDispatch = (input: Parameters<typeof claimDueDeliveryJob>[0]) =>
+      claimDueDeliveryJob({ ...input, channel: 'dispatch' });
+    const store = {
+      claimDueDeliveryJob: claimDispatch,
+      getOperatorCard,
+      appendDeliveryReceipt,
+      completeDeliveryJob,
+    };
+
+    await runDueOperatorCardDeliveries({
+      channels: [channel],
+      owner: 'runner-1',
+      now: '2026-07-16T08:00:00.000Z',
+      store,
+    });
+    await runDueOperatorCardDeliveries({
+      channels: [channel],
+      owner: 'runner-2',
+      now: '2026-07-16T08:00:30.000Z',
+      store,
+    });
+    const crashed = await claimDispatch({
+      owner: 'runner-3-crashed',
+      now: '2026-07-16T08:02:00.000Z',
+      lease_duration_ms: 1_000,
+    });
+    expect(crashed?.attempts_started).toBe(3);
+    await appendDeliveryReceipt({
+      card_id: cardId,
+      channel: 'dispatch',
+      attempt_number: 3,
+      phase: 'started',
+      started_at: '2026-07-16T08:02:00.000Z',
+      fencing_token: crashed!.fencing_token,
+      lease_owner: 'runner-3-crashed',
+    });
+
+    await runDueOperatorCardDeliveries({
+      channels: [channel],
+      owner: 'recovery-runner',
+      now: '2026-07-16T08:02:02.000Z',
+      store,
+    });
+
+    const view = await getOperatorCard(cardId);
+    expect(deliverCalls).toBe(2);
+    expect(reconcileCalls).toBe(1);
+    expect(view?.delivery_summary.dispatch.state).toBe('indeterminate');
+    expect(view?.delivery_summary.dispatch.attempts_started).toBe(3);
+    expect(view?.receipts.filter(receipt => receipt.phase === 'started')).toHaveLength(3);
+  });
+
   test('finishes an expired lease from its existing TERMINAL receipt without redelivery', async () => {
     const cardId = await persistCard();
     let deliveries = 0;
@@ -577,6 +644,22 @@ describe('default informational channel adapters', () => {
     ]);
   });
 
+  test('default builder-monitor adapter retries only 429 and 5xx responses', async () => {
+    const view = await defaultCardView();
+    for (const [status, outcome] of [
+      [401, 'permanent_failure'],
+      [422, 'permanent_failure'],
+      [429, 'transient_failure'],
+      [503, 'transient_failure'],
+    ] as const) {
+      const builder = createDefaultOperatorCardChannels({
+        fetch: mock(async () => new Response('failure', { status })) as typeof fetch,
+      }).find(channel => channel.channel === 'builder_monitor');
+      if (!builder) throw new Error('builder_channel_missing');
+      expect((await builder.deliver(view, 'unused')).outcome).toBe(outcome);
+    }
+  });
+
   test('default Notion adapter uses injected fetch for lookup and comment', async () => {
     const view = await defaultCardView();
     const calls: Array<{ url: string; body: Record<string, unknown> }> = [];
@@ -598,5 +681,37 @@ describe('default informational channel adapters', () => {
     expect(calls).toHaveLength(2);
     expect(calls[0]?.body).toMatchObject({ filter: { property: 'Task' } });
     expect(calls[1]?.body).toMatchObject({ parent: { page_id: 'notion-page-1' } });
+  });
+
+  test('default Notion adapter retries only 429 and 5xx comment responses', async () => {
+    const view = await defaultCardView();
+    for (const [status, outcome] of [
+      [401, 'permanent_failure'],
+      [422, 'permanent_failure'],
+      [429, 'transient_failure'],
+      [503, 'transient_failure'],
+    ] as const) {
+      const injected = mock(async (input: string | URL | Request) =>
+        String(input).includes('/query')
+          ? Response.json({ results: [{ id: 'notion-page-1' }] })
+          : new Response('failure', { status })
+      ) as typeof fetch;
+      const notion = createDefaultOperatorCardChannels({
+        fetch: injected,
+        notion_api_key: 'test-notion-key',
+      }).find(channel => channel.channel === 'notion');
+      if (!notion) throw new Error('notion_channel_missing');
+      expect((await notion.deliver(view, 'unused')).outcome).toBe(outcome);
+    }
+  });
+
+  test('default Notion adapter treats exhausted 4xx lookup responses as permanent', async () => {
+    const view = await defaultCardView();
+    const notion = createDefaultOperatorCardChannels({
+      fetch: mock(async () => new Response('unauthorized', { status: 401 })) as typeof fetch,
+      notion_api_key: 'test-notion-key',
+    }).find(channel => channel.channel === 'notion');
+    if (!notion) throw new Error('notion_channel_missing');
+    expect((await notion.deliver(view, 'unused')).outcome).toBe('permanent_failure');
   });
 });

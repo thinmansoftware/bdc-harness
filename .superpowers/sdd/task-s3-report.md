@@ -25,6 +25,9 @@ Result: READY_FOR_INDEPENDENT_EXACT_HEAD_REVIEW.
   existing TERMINAL receipt without provider redelivery.
 - Response-loss exceptions are indeterminate and never blindly retried; only an
   explicit zero-effect `transient_failure` may consume the fixed retry schedule.
+- Expired attempt-three leases are reclaimed for terminal reconciliation without
+  a fourth provider call. HTTP adapters retry only 429 and 5xx; authentication,
+  validation, and other non-success responses are permanent.
 - Stable event identity wired through watcher service, workflow bridge, and
   Smart Cauldron callers. Workflow cards derive exact IDs and timestamps from
   the awaited durable event insert and fail closed when it cannot persist.
@@ -39,7 +42,7 @@ Result: READY_FOR_INDEPENDENT_EXACT_HEAD_REVIEW.
 ## Contract evidence
 
 - Contract SHA-256:
-  `13478afb126aefd4cccd4db04ecf8ddb3995b6da775a51512c031e7b4811104d`
+  `bff68b9c2a614542a40746860f3f961aa3e1fedb4f1dda691d7440ca90786ed2`
 - Migration SHA-256:
   `bc771293b691209b978a52b43a5dbafec22c55c4823ce7592865f345f2a22bb1`
 - Retry offsets: exactly 0, 30, and 120 seconds from card creation.
@@ -49,8 +52,9 @@ Result: READY_FOR_INDEPENDENT_EXACT_HEAD_REVIEW.
 ## Verification
 
 - Focused persistence: 5 passed, including stale-worker receipt rejection.
-- Focused delivery/adapters: 13 passed, including response-loss, old-event retry
-  epoch, and injected Dispatch, builder-monitor, and Notion dependencies.
+- Focused delivery/adapters: 17 passed, including attempt-three crash recovery,
+  response-loss, old-event retry epoch, injected dependencies, and explicit HTTP
+  status classification.
 - Focused durable bridge boundary: 4 passed; failed event insert creates zero
   cards, jobs, or authorization attempts.
 - Focused store adapter: 12 passed; durable insert returns the exact row and
@@ -88,7 +92,9 @@ process spawn before its assertions.
 
 ## Reviewer focus
 
-1. Confirm thrown provider transport is indeterminate and receives no retry.
+1. Confirm thrown provider transport is indeterminate and receives no retry,
+   expired attempt three reconciles without attempt four, and HTTP retries are
+   limited to 429 and 5xx responses.
 2. Confirm workflow cards use the exact row returned by durable event insertion
    and insert failure creates no downstream side effect.
 3. Confirm the server runtime starts and shutdown-drains the delivery scheduler.

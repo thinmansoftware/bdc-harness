@@ -10,7 +10,7 @@ import {
 } from '@archon/core/db/overseer-briefing';
 import { createMessage } from '@archon/core/db/dispatch';
 import { assessDispatchMessageBody } from '@archon/core/utils/dispatch-content-guard';
-import { buildDispatchRunReportBody, lookupNotionPageId } from './escalate';
+import { buildDispatchRunReportBody, lookupNotionPage } from './escalate';
 
 export interface ChannelDeliveryResult {
   outcome: DeliveryOutcome;
@@ -48,6 +48,15 @@ const defaultStore: DeliveryStore = {
 
 const DEFAULT_NOTION_DATABASE_ID = 'a6df831c-0b52-449f-8ca4-d77be6b70d0a';
 const DEFAULT_BUILDER_MONITOR_URL = 'https://n8n.bluedevilcollectibles.com/webhook/builder-status';
+
+function classifyHttpFailure(status: number, channel: string): ChannelDeliveryResult {
+  const retrySafe = status === 429 || (status >= 500 && status <= 599);
+  return {
+    outcome: retrySafe ? 'transient_failure' : 'permanent_failure',
+    sanitized_status: retrySafe ? `${channel}_retryable` : `${channel}_rejected`,
+    error_class: `http_${status}`,
+  };
+}
 
 export function createDefaultOperatorCardChannels(
   overrides: Partial<OperatorCardChannelDeps> = {}
@@ -108,7 +117,7 @@ export function createDefaultOperatorCardChannels(
       });
       return response.ok
         ? { outcome: 'succeeded', sanitized_status: 'builder_monitor_accepted' }
-        : { outcome: 'transient_failure', sanitized_status: 'builder_monitor_unavailable' };
+        : classifyHttpFailure(response.status, 'builder_monitor');
     },
     reconcile: async () => ({
       outcome: 'indeterminate',
@@ -126,15 +135,15 @@ export function createDefaultOperatorCardChannels(
           error_class: 'configuration',
         };
       }
-      const pageId = await lookupNotionPageId(
+      const lookup = await lookupNotionPage(
         deps.notion_api_key,
         deps.notion_database_id,
         card.card.wo_id,
         deps.fetch
       );
-      if (!pageId) {
+      if (!lookup.page_id) {
         return {
-          outcome: 'transient_failure',
+          outcome: lookup.failure_outcome ?? 'permanent_failure',
           sanitized_status: 'notion_page_not_found',
           error_class: 'notion_lookup_failed',
         };
@@ -147,7 +156,7 @@ export function createDefaultOperatorCardChannels(
           'Notion-Version': '2022-06-28',
         },
         body: JSON.stringify({
-          parent: { page_id: pageId },
+          parent: { page_id: lookup.page_id },
           rich_text: [
             {
               type: 'text',
@@ -160,7 +169,7 @@ export function createDefaultOperatorCardChannels(
       });
       return response.ok
         ? { outcome: 'succeeded', sanitized_status: 'notion_comment_created' }
-        : { outcome: 'transient_failure', sanitized_status: 'notion_comment_unavailable' };
+        : classifyHttpFailure(response.status, 'notion_comment');
     },
     reconcile: async () => ({
       outcome: 'indeterminate',

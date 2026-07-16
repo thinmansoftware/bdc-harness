@@ -387,8 +387,7 @@ export async function claimDueDeliveryJob(input: {
     const selected = (
       await query<DeliveryJobRow>(
         `SELECT * FROM overseer_operator_card_delivery_jobs
-         WHERE attempts_started < 3
-           AND ((state = 'pending' AND next_attempt_at <= $1)
+         WHERE ((state = 'pending' AND attempts_started < 3 AND next_attempt_at <= $1)
              OR (state = 'leased' AND lease_expires_at <= $1))
            ${channelClause}
          ORDER BY next_attempt_at, card_id, channel LIMIT 1`,
