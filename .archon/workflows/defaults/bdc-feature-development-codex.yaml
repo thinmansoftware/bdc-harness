@@ -3032,30 +3032,25 @@ nodes:
       esac
       [ -z "$PR_NUMBER" ] && PR_NUMBER="0"
 
-      # -- Bounded poll of PR checks: up to 10 attempts x 60s (10 min cap), per WO
-      #    section 2(a). `gh pr checks` exit codes: 0=all green, 8=pending, other=fail.
-      #    Break early on green or definitive failure. The bdc-xo reconciler RE-VERIFIES
-      #    and is the authoritative green-only gate, so a misclassification here is only
-      #    a hint -- it can never append a non-green PR to the ledger.
+      # -- Single immediate check of PR status (no sleep loop). The previous 10x60s
+      #    poll could exceed the bash node default timeout (120s) and caused the
+      #    "tail-node false-fail" class of misreported run failures. The bdc-xo
+      #    reconciler RE-VERIFIES independently and is the authoritative green-only
+      #    gate, so a misclassification here is only a hint -- polling bought nothing
+      #    the reconciler does not already redo. `gh pr checks` exit codes:
+      #    0=all green, 8=pending, other=fail.
       CHECK_STATUS="pending_checks"
       GREEN_AT=""
-      for attempt in 1 2 3 4 5 6 7 8 9 10; do
-        gh pr checks "$PR_URL" --repo "$REPO" >/dev/null 2>&1
-        RC=$?
-        if [ "$RC" -eq 0 ]; then
-          CHECK_STATUS="green_pending_reconcile"
-          GREEN_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-          break
-        elif [ "$RC" -eq 8 ]; then
-          : # still pending -- keep polling
-        else
-          CHECK_STATUS="failed"
-          break
-        fi
-        if [ "$attempt" -lt 10 ]; then
-          sleep 60
-        fi
-      done
+      gh pr checks "$PR_URL" --repo "$REPO" >/dev/null 2>&1
+      RC=$?
+      if [ "$RC" -eq 0 ]; then
+        CHECK_STATUS="green_pending_reconcile"
+        GREEN_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+      elif [ "$RC" -eq 8 ]; then
+        CHECK_STATUS="pending_checks"
+      else
+        CHECK_STATUS="failed"
+      fi
       echo "record-wo-completion-candidate: WO=${WO_ID} PR=${PR_URL} check_status=${CHECK_STATUS}"
 
       # -- Build the pending JSON. Values are controlled (WO_ID is [A-Z0-9-], REPO is
