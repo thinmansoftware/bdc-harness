@@ -202,6 +202,7 @@ describe('bundled-defaults', () => {
         'bdc-feature-development-codex-only',
         'bdc-feature-development-fable',
         'bdc-feature-development-fusion-cx-qwen',
+        'bdc-feature-development-grok',
         'bdc-feature-development-zero-open',
         'bdc-feature-development-zero',
       ];
@@ -227,6 +228,7 @@ describe('bundled-defaults', () => {
       ];
       const OPEN_MODEL = [
         'bdc-feature-development-fusion-cx-qwen',
+        'bdc-feature-development-grok',
         'bdc-feature-development-zero-open',
         'bdc-feature-development-zero',
       ];

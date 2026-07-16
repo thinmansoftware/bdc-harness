@@ -12,16 +12,18 @@ lanes:
     order: 2
   - name: bdc-feature-development-fusion-cx-qwen
     order: 3
-  - name: bdc-feature-development-codex-only
+  - name: bdc-feature-development-grok
     order: 4
-  - name: bdc-feature-development-codex
+  - name: bdc-feature-development-codex-only
     order: 5
-  - name: bdc-feature-development
+  - name: bdc-feature-development-codex
     order: 6
-  - name: bdc-feature-development-fable
+  - name: bdc-feature-development
     order: 7
-  - name: bdc-multi-stage-development
+  - name: bdc-feature-development-fable
     order: 8
+  - name: bdc-multi-stage-development
+    order: 9
 conductor_probes:
   - id: mechanical-code
     wo_class: CODE
