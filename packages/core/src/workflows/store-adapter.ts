@@ -87,6 +87,7 @@ export function createWorkflowStore(): IWorkflowStore {
         );
       }
     },
+    createDurableWorkflowEvent: workflowEventDb.createDurableWorkflowEvent,
     listWorkflowEvents: workflowEventDb.listWorkflowEvents,
     getCompletedDagNodeOutputs: workflowEventDb.getCompletedDagNodeOutputs,
     getCodebase: codebaseDb.getCodebase,

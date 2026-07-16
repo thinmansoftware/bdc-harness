@@ -4,7 +4,8 @@ import { tmpdir } from 'os';
 import { join } from 'path';
 import { closeDatabase, getDatabase, resetDatabase } from '@archon/core/db/connection';
 import { listOverseerCapabilityEvents } from '@archon/core/db/overseer-capabilities';
-import { runOverseerService } from '../service.ts';
+import { listOperatorCards } from '@archon/core/db/overseer-briefing';
+import { runOperatorCardDeliveryScheduler, runOverseerService } from '../service.ts';
 import type { M31ActionPermit, M31ActionProposal } from '../m31-substrate.ts';
 
 const ENV_KEYS = [
@@ -346,7 +347,7 @@ describe('service', () => {
     expect(actions).toEqual([{ action: 'merge_denied', result: 'permit_missing' }]);
   });
 
-  test('default live escalation path records one inert fake attempt', async () => {
+  test('default live escalation path records one inert attempt and one durable card', async () => {
     await withTempDatabase(async () => {
       enableFakeCapability('escalation');
       const boundPermit = await seedPersistentPermit(
@@ -375,7 +376,16 @@ describe('service', () => {
               metadata: { overseer_m31_permit: boundPermit },
             },
           ],
-          listRunEvents: async () => [],
+          listRunEvents: async () => [
+            {
+              id: 'event-default-escalation',
+              workflow_run_id: 'run-default-escalation',
+              event_type: 'node_failed',
+              step_name: 'verify',
+              data: { error: 'validator rejected' },
+              created_at: '2026-07-16T08:00:00.000Z',
+            },
+          ],
           findPullRequest: async () => ({
             exists: false,
             state: 'missing',
@@ -393,13 +403,19 @@ describe('service', () => {
         event => event.event_type === 'adapter_attempt'
       );
       expect(mergePullRequest).not.toHaveBeenCalled();
-      expect(actions).toEqual([{ action: 'fake_escalation_attempt', result: 'fake_accepted' }]);
+      expect(actions).toHaveLength(1);
+      expect(actions[0]?.action).toBe('fake_escalation_attempt');
+      expect(actions[0]?.result).toMatch(/^fake_accepted:operator_card:[0-9a-f]{64}$/);
       expect(attempts).toHaveLength(1);
       expect(attempts[0]?.details).toMatchObject({
         adapter: 'fake-escalation',
         accepted: true,
         mutation_sent: false,
       });
+      const cards = await listOperatorCards();
+      expect(cards.items).toHaveLength(1);
+      expect(cards.items[0]?.card.run_id).toBe('run-default-escalation');
+      expect(cards.items[0]?.jobs).toHaveLength(3);
     });
   });
 
@@ -491,5 +507,108 @@ describe('service', () => {
       })
     ).rejects.toThrow('overseer_slice1_real_adapter_forbidden:real');
     expect(listRunsForWatch).not.toHaveBeenCalled();
+  });
+
+  test('delivery scheduler repeats at the owned interval until aborted', async () => {
+    const controller = new AbortController();
+    let drains = 0;
+    await runOperatorCardDeliveryScheduler({
+      signal: controller.signal,
+      intervalMs: 1,
+      owner: 'test-delivery-scheduler',
+      drain: async () => {
+        drains += 1;
+        if (drains === 3) controller.abort();
+      },
+    });
+    expect(drains).toBe(3);
+  });
+
+  test('delivery scheduler shutdown awaits an in-flight drain', async () => {
+    const controller = new AbortController();
+    let releaseDrain: (() => void) | undefined;
+    let started = false;
+    let settled = false;
+    const task = runOperatorCardDeliveryScheduler({
+      signal: controller.signal,
+      intervalMs: 1,
+      owner: 'test-delivery-shutdown',
+      drain: async () => {
+        started = true;
+        await new Promise<void>(resolve => {
+          releaseDrain = resolve;
+        });
+      },
+    }).then(() => {
+      settled = true;
+    });
+    while (!started) await Promise.resolve();
+    controller.abort();
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    releaseDrain?.();
+    await task;
+    expect(settled).toBe(true);
+  });
+
+  test('delivery failure aborts and quiesces the watcher before rejecting', async () => {
+    let watcherPolls = 0;
+    const deps = {
+      listRunsForWatch: async () => {
+        watcherPolls += 1;
+        return [];
+      },
+      listRunEvents: async () => [],
+      findPullRequest: async () => ({ exists: false as const }),
+      mergePullRequest: async () => undefined,
+      insertOverseerAction: async () => undefined,
+    };
+
+    await expect(
+      runOverseerService({
+        enabled: true,
+        adapterKind: 'fake',
+        deps,
+        intervalMs: 1,
+        deliveryEnabled: true,
+        deliveryIntervalMs: 1,
+        deliveryDrain: async () => {
+          throw new Error('delivery_drain_failed');
+        },
+      })
+    ).rejects.toThrow('delivery_drain_failed');
+    const pollsAfterReject = watcherPolls;
+    await new Promise<void>(resolve => setTimeout(resolve, 10));
+    expect(watcherPolls).toBe(pollsAfterReject);
+  });
+
+  test('watcher failure aborts and quiesces the delivery scheduler before rejecting', async () => {
+    let drains = 0;
+    const deps = {
+      listRunsForWatch: async () => {
+        throw new Error('watcher_poll_failed');
+      },
+      listRunEvents: async () => [],
+      findPullRequest: async () => ({ exists: false as const }),
+      mergePullRequest: async () => undefined,
+      insertOverseerAction: async () => undefined,
+    };
+
+    await expect(
+      runOverseerService({
+        enabled: true,
+        adapterKind: 'fake',
+        deps,
+        intervalMs: 1,
+        deliveryEnabled: true,
+        deliveryIntervalMs: 1,
+        deliveryDrain: async () => {
+          drains += 1;
+        },
+      })
+    ).rejects.toThrow('watcher_poll_failed');
+    const drainsAfterReject = drains;
+    await new Promise<void>(resolve => setTimeout(resolve, 10));
+    expect(drains).toBe(drainsAfterReject);
   });
 });

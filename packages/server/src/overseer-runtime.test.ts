@@ -7,9 +7,9 @@ const listCapabilityStatesMock = mock(
 );
 
 // Capture adapterKind passed into runOverseerService for real-wiring assertions.
-let capturedServiceOptions: { adapterKind?: string } | null = null;
+let capturedServiceOptions: { adapterKind?: string; deliveryEnabled?: boolean } | null = null;
 const runOverseerServiceMock = mock(async (opts?: unknown) => {
-  capturedServiceOptions = (opts ?? {}) as { adapterKind?: string };
+  capturedServiceOptions = (opts ?? {}) as { adapterKind?: string; deliveryEnabled?: boolean };
 });
 
 import {
@@ -54,7 +54,10 @@ describe('overseer-runtime', () => {
     runOverseerServiceMock.mockReset();
     // Re-apply base capture impl after reset (mockReset clears implementation).
     runOverseerServiceMock.mockImplementation(async (opts?: unknown) => {
-      capturedServiceOptions = (opts ?? {}) as { adapterKind?: string };
+      capturedServiceOptions = (opts ?? {}) as {
+        adapterKind?: string;
+        deliveryEnabled?: boolean;
+      };
     });
     listCapabilityStatesMock.mockReset();
     listCapabilityStatesMock.mockImplementation(async () => []);
@@ -143,6 +146,22 @@ describe('overseer-runtime', () => {
     await new Promise<void>(resolve => setTimeout(resolve, 20));
     const status = await getStatus();
     expect(status.watcher).toBe('degraded');
+  });
+
+  test('watcher exception aborts the owned runtime signal before clearing ownership', async () => {
+    let ownedSignal: AbortSignal | undefined;
+    runOverseerServiceMock.mockImplementation(async (opts?: { signal?: AbortSignal }) => {
+      ownedSignal = opts?.signal;
+      throw new Error('watcher_test_failure');
+    });
+
+    setEnabledEnv();
+    startOverseerRuntime({ runService: runOverseerServiceMock });
+    await new Promise<void>(resolve => setTimeout(resolve, 20));
+
+    expect(ownedSignal?.aborted).toBe(true);
+    expect((await getStatus()).watcher).toBe('degraded');
+    await expect(stopOverseerRuntime()).resolves.toBeUndefined();
   });
 
   test('stopOverseerRuntime is safe when not started', async () => {
@@ -248,7 +267,10 @@ describe('overseer-runtime', () => {
       (opts?: unknown) =>
         new Promise<void>(resolve => {
           // Capture opts here so we can assert after startOverseerRuntime returns.
-          capturedServiceOptions = (opts ?? {}) as { adapterKind?: string };
+          capturedServiceOptions = (opts ?? {}) as {
+            adapterKind?: string;
+            deliveryEnabled?: boolean;
+          };
           resolveService = resolve;
         })
     );
@@ -260,6 +282,7 @@ describe('overseer-runtime', () => {
     // The runtime must forward adapterKind='fake' into the service so the service
     // wires stub deps instead of constructing a live Octokit client.
     expect(capturedServiceOptions?.adapterKind).toBe('fake');
+    expect(capturedServiceOptions?.deliveryEnabled).toBe(true);
 
     resolveService();
     await stopOverseerRuntime();

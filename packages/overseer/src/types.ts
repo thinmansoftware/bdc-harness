@@ -14,6 +14,7 @@ export interface OverseerRunRecord {
 }
 
 export interface OverseerWorkflowEvent {
+  id: string;
   workflow_run_id: string;
   event_type: string;
   step_name: string | null;

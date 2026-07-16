@@ -29,6 +29,55 @@ export interface WorkflowEventRow {
   created_at: string;
 }
 
+function normalizeWorkflowEvent(row: WorkflowEventRow): WorkflowEventRow {
+  return {
+    ...row,
+    data:
+      typeof row.data === 'string'
+        ? ((): Record<string, unknown> => {
+            try {
+              const parsed: unknown = JSON.parse(row.data);
+              return parsed && typeof parsed === 'object'
+                ? (parsed as Record<string, unknown>)
+                : { value: parsed };
+            } catch {
+              return { raw: row.data };
+            }
+          })()
+        : row.data && typeof row.data === 'object'
+          ? row.data
+          : {},
+  };
+}
+
+export async function createDurableWorkflowEvent(data: {
+  workflow_run_id: string;
+  event_type: string;
+  step_index?: number;
+  step_name?: string;
+  data?: Record<string, unknown>;
+}): Promise<WorkflowEventRow> {
+  const dialect = getDialect();
+  const id = dialect.generateUuid();
+  const result = await pool.query<WorkflowEventRow>(
+    `INSERT INTO remote_agent_workflow_events
+       (id, workflow_run_id, event_type, step_index, step_name, data)
+     VALUES ($1, $2, $3, $4, $5, $6)
+     RETURNING *`,
+    [
+      id,
+      data.workflow_run_id,
+      data.event_type,
+      data.step_index ?? null,
+      data.step_name ?? null,
+      JSON.stringify(data.data ?? {}),
+    ]
+  );
+  const row = result.rows[0];
+  if (!row) throw new Error('durable_workflow_event_insert_failed');
+  return normalizeWorkflowEvent(row);
+}
+
 /**
  * Create a workflow event. Fire-and-forget - never throws.
  */
@@ -40,20 +89,7 @@ export async function createWorkflowEvent(data: {
   data?: Record<string, unknown>;
 }): Promise<void> {
   try {
-    const dialect = getDialect();
-    const id = dialect.generateUuid();
-    await pool.query(
-      `INSERT INTO remote_agent_workflow_events (id, workflow_run_id, event_type, step_index, step_name, data)
-       VALUES ($1, $2, $3, $4, $5, $6)`,
-      [
-        id,
-        data.workflow_run_id,
-        data.event_type,
-        data.step_index ?? null,
-        data.step_name ?? null,
-        JSON.stringify(data.data ?? {}),
-      ]
-    );
+    await createDurableWorkflowEvent(data);
   } catch (error) {
     getLog().error(
       { err: error as Error, eventType: data.event_type, runId: data.workflow_run_id },
@@ -74,26 +110,7 @@ export async function listWorkflowEvents(workflowRunId: string): Promise<Workflo
        ORDER BY created_at ASC`,
       [workflowRunId]
     );
-    return [...result.rows].map(row => ({
-      ...row,
-      // Null-safe parse: corrupt JSON must not throw and poison escalation /
-      // dashboard consumers. Fall back to empty object on invalid payload.
-      data:
-        typeof row.data === 'string'
-          ? ((): Record<string, unknown> => {
-              try {
-                const parsed: unknown = JSON.parse(row.data);
-                return parsed && typeof parsed === 'object'
-                  ? (parsed as Record<string, unknown>)
-                  : { value: parsed };
-              } catch {
-                return { raw: row.data };
-              }
-            })()
-          : row.data && typeof row.data === 'object'
-            ? row.data
-            : {},
-    }));
+    return [...result.rows].map(normalizeWorkflowEvent);
   } catch (error) {
     getLog().error({ err: error as Error, runId: workflowRunId }, 'db.workflow_events_list_failed');
     throw new Error(`Failed to list workflow events: ${(error as Error).message}`);

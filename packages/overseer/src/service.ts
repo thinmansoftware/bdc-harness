@@ -6,6 +6,12 @@ import {
 } from '@archon/core/db/overseer';
 import { appendOverseerCapabilityEvent } from '@archon/core/db/overseer-capabilities';
 import { runAuthorizedEscalation } from './authorized-escalation';
+import { runEscalation } from './escalate';
+import {
+  createDefaultOperatorCardChannels,
+  runDueOperatorCardDeliveries,
+  type OperatorCardChannel,
+} from './escalation-delivery';
 import {
   createFakeGitHubAdapter,
   type FakeGitHubAdapter,
@@ -43,6 +49,51 @@ export interface OverseerServiceOptions {
    */
   adapterKind?: OverseerWiredAdapterKind;
   deps?: OverseerRunStoreDeps & OverseerActionsDeps & GitHubClientDeps;
+  deliveryEnabled?: boolean;
+  deliveryIntervalMs?: number;
+  deliveryOwner?: string;
+  deliveryChannels?: OperatorCardChannel[];
+  deliveryDrain?: () => Promise<unknown>;
+}
+
+export async function runOperatorCardDeliveryScheduler(input: {
+  signal?: AbortSignal;
+  intervalMs?: number;
+  owner: string;
+  once?: boolean;
+  drain?: () => Promise<unknown>;
+  channels?: OperatorCardChannel[];
+}): Promise<void> {
+  const drain =
+    input.drain ??
+    ((): Promise<unknown> =>
+      runDueOperatorCardDeliveries({
+        channels: input.channels ?? createDefaultOperatorCardChannels(),
+        owner: input.owner,
+      }));
+  for (;;) {
+    if (input.signal?.aborted) return;
+    await drain();
+    if (input.once || input.signal?.aborted) return;
+    await waitForDeliveryInterval(input.intervalMs ?? 30_000, input.signal);
+  }
+}
+
+async function waitForDeliveryInterval(milliseconds: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) return;
+  await new Promise<void>(resolve => {
+    let settled = false;
+    const finish = (): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      signal?.removeEventListener('abort', finish);
+      resolve();
+    };
+    const timer = setTimeout(finish, milliseconds);
+    signal?.addEventListener('abort', finish, { once: true });
+    if (signal?.aborted) finish();
+  });
 }
 
 function envEnabled(value: string | undefined): boolean {
@@ -130,17 +181,53 @@ async function handleRecord(
     );
     return;
   }
+  if (record.errorClass === 'tail_node_false_fail') {
+    throw new Error('operator_card_non_actionable_error_class');
+  }
 
   const escalation = await runAuthorizedEscalation(record.runId, {
     permit: permitFromMetadata(record.metadata),
     actor,
   });
+  let operatorCardId: string | null = null;
+  if (escalation.accepted) {
+    if (!record.lastEvent?.id || !record.lastEvent.created_at) {
+      throw new Error('operator_card_source_event_identity_missing');
+    }
+    const card = await runEscalation(
+      record.runId,
+      record.decision,
+      {
+        ...(record.decision.escalationContext ?? {}),
+        errorClass: record.errorClass,
+        woId: record.woId,
+        repository: `${record.owner}/${record.repo}`,
+        branch: record.headBranch ?? null,
+        prUrl: record.prEvidence?.htmlUrl ?? null,
+        prNumber: record.prEvidence?.pr?.number ?? null,
+        checks: record.prEvidence?.checks ?? {},
+        mergeability:
+          record.prEvidence?.mergeable === null
+            ? 'unknown'
+            : String(record.prEvidence?.mergeable ?? 'unknown'),
+      },
+      {
+        sourceEventId: record.lastEvent.id,
+        eventType: record.lastEvent.event_type,
+        stepName: record.lastEvent.step_name ?? 'unknown',
+        eventCreatedAt: record.lastEvent.created_at,
+      }
+    );
+    operatorCardId = card.card_id;
+  }
   await deps.insertOverseerAction({
     runId: record.runId,
     woId: record.woId,
     class: record.errorClass,
     action: escalation.accepted ? 'fake_escalation_attempt' : 'escalation_denied',
-    result: escalation.reason,
+    result: operatorCardId
+      ? `${escalation.reason}:operator_card:${operatorCardId}`
+      : escalation.reason,
   });
   log.info(
     {
@@ -165,11 +252,53 @@ export async function runOverseerService(options: OverseerServiceOptions = {}): 
   }
   const deps = options.deps ?? resolveDefaultDeps();
   const adapter = createDefaultFakeGitHubAdapter();
-  await watchLoop(deps, record => handleRecord(record, deps, adapter, dryRun, 'overseer-service'), {
-    intervalMs: options.intervalMs,
+  const coupledAbort = new AbortController();
+  const abortFromParent = (): void => {
+    coupledAbort.abort();
+  };
+  options.signal?.addEventListener('abort', abortFromParent, { once: true });
+  if (options.signal?.aborted) coupledAbort.abort();
+  const watcher = watchLoop(
+    deps,
+    record => handleRecord(record, deps, adapter, dryRun, 'overseer-service'),
+    {
+      intervalMs: options.intervalMs,
+      once: options.once,
+      signal: coupledAbort.signal,
+    }
+  );
+  if (!options.deliveryEnabled) {
+    try {
+      await watcher;
+      return;
+    } finally {
+      coupledAbort.abort();
+      options.signal?.removeEventListener('abort', abortFromParent);
+    }
+  }
+  const delivery = runOperatorCardDeliveryScheduler({
+    signal: coupledAbort.signal,
+    intervalMs: options.deliveryIntervalMs,
+    owner: options.deliveryOwner ?? `overseer-delivery-${process.pid}`,
     once: options.once,
-    signal: options.signal,
+    channels: options.deliveryChannels,
+    drain: options.deliveryDrain,
   });
+  const abortOnFailure = async (task: Promise<void>): Promise<void> => {
+    try {
+      await task;
+    } catch (error) {
+      coupledAbort.abort();
+      throw error;
+    }
+  };
+  try {
+    await Promise.all([abortOnFailure(watcher), abortOnFailure(delivery)]);
+  } finally {
+    coupledAbort.abort();
+    await Promise.allSettled([watcher, delivery]);
+    options.signal?.removeEventListener('abort', abortFromParent);
+  }
 }
 
 /**

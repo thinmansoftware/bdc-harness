@@ -26,6 +26,7 @@ mock.module('./connection', () => ({
 }));
 
 import {
+  createDurableWorkflowEvent,
   createWorkflowEvent,
   listWorkflowEvents,
   listRecentEvents,
@@ -50,7 +51,7 @@ describe('workflow-events', () => {
 
   describe('createWorkflowEvent', () => {
     test('calls pool.query with correct SQL and parameters', async () => {
-      mockQuery.mockResolvedValueOnce(createQueryResult([]));
+      mockQuery.mockResolvedValueOnce(createQueryResult([mockEvent]));
 
       await createWorkflowEvent({
         workflow_run_id: 'run-456',
@@ -61,8 +62,10 @@ describe('workflow-events', () => {
       });
 
       expect(mockQuery).toHaveBeenCalledWith(
-        `INSERT INTO remote_agent_workflow_events (id, workflow_run_id, event_type, step_index, step_name, data)
-       VALUES ($1, $2, $3, $4, $5, $6)`,
+        `INSERT INTO remote_agent_workflow_events
+       (id, workflow_run_id, event_type, step_index, step_name, data)
+     VALUES ($1, $2, $3, $4, $5, $6)
+     RETURNING *`,
         [
           expect.any(String), // generated UUID
           'run-456',
@@ -75,7 +78,7 @@ describe('workflow-events', () => {
     });
 
     test('defaults optional fields to null and empty data', async () => {
-      mockQuery.mockResolvedValueOnce(createQueryResult([]));
+      mockQuery.mockResolvedValueOnce(createQueryResult([mockEvent]));
 
       await createWorkflowEvent({
         workflow_run_id: 'run-456',
@@ -100,6 +103,31 @@ describe('workflow-events', () => {
         workflow_run_id: 'run-456',
         event_type: 'step_started',
       });
+    });
+  });
+
+  describe('createDurableWorkflowEvent', () => {
+    test('returns the inserted database row and normalizes SQLite JSON', async () => {
+      mockQuery.mockResolvedValueOnce(
+        createQueryResult([{ ...mockEvent, data: '{"reason":"blocked"}' } as WorkflowEventRow])
+      );
+
+      await expect(
+        createDurableWorkflowEvent({
+          workflow_run_id: 'run-456',
+          event_type: 'step_started',
+        })
+      ).resolves.toEqual({ ...mockEvent, data: { reason: 'blocked' } });
+    });
+
+    test('throws when the insert does not return a row', async () => {
+      mockQuery.mockResolvedValueOnce(createQueryResult([]));
+      await expect(
+        createDurableWorkflowEvent({
+          workflow_run_id: 'run-456',
+          event_type: 'step_started',
+        })
+      ).rejects.toThrow('durable_workflow_event_insert_failed');
     });
   });
 

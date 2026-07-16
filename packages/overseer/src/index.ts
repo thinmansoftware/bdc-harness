@@ -29,8 +29,26 @@ export type { Decision, DecideInput, DecisionResult } from './decide';
 
 export { runAuthorizedEscalation } from './authorized-escalation';
 export { parseM31ActionPermit, permitFromMetadata } from './permit';
-export { buildDispatchRunReportBody } from './escalate';
-export type { EscalationContext } from './escalate';
+export { buildDispatchRunReportBody, lookupNotionPageId, runEscalation } from './escalate';
+export type { EscalationContext, EscalationSourceEvent } from './escalate';
+export {
+  buildOperatorCard,
+  canonicalizeActionableEvent,
+  deriveOperatorCardId,
+  OPERATOR_CARD_IDENTITY_VERSION,
+} from './operator-card';
+export type { ActionableEventIdentity, OperatorCard, OperatorCardPayload } from './operator-card';
+export {
+  createDefaultOperatorCardChannels,
+  deliverOperatorCard,
+  runDueOperatorCardDeliveries,
+} from './escalation-delivery';
+export type {
+  ChannelDeliveryResult,
+  DeliveryStore,
+  OperatorCardChannel,
+  OperatorCardChannelDeps,
+} from './escalation-delivery';
 
 export { watchLoop, watchOnce, DEFAULT_WATCH_INTERVAL_MS } from './watch';
 export { judgePullRequest, isPrGreen, isPrMergeReady } from './judge-pr';

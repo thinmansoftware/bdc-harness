@@ -4,6 +4,7 @@ import { tmpdir } from 'os';
 import { join } from 'path';
 import { closeDatabase, getDatabase, resetDatabase } from '@archon/core/db/connection';
 import { listOverseerCapabilityEvents } from '@archon/core/db/overseer-capabilities';
+import { listOperatorCards } from '@archon/core/db/overseer-briefing';
 import { handleNodeFailure } from './overseer-bridge.ts';
 import type { DagNode } from './schemas/dag-node.ts';
 import type { IWorkflowStore } from './store.ts';
@@ -23,7 +24,9 @@ const ENV_KEYS = [
 ] as const;
 const oldEnv = new Map(ENV_KEYS.map(key => [key, process.env[key]]));
 
-function makeMockStore(): IWorkflowStore {
+function makeMockStore(): IWorkflowStore & {
+  createDurableWorkflowEvent: ReturnType<typeof mock>;
+} {
   return {
     listWorkflowRuns: mock(() => Promise.resolve([])),
     createWorkflowRun: mock(() => Promise.resolve(undefined as never)),
@@ -35,6 +38,17 @@ function makeMockStore(): IWorkflowStore {
     pauseWorkflowRun: mock(() => Promise.resolve()),
     cancelWorkflowRun: mock(() => Promise.resolve()),
     createWorkflowEvent: mock(() => Promise.resolve()),
+    createDurableWorkflowEvent: mock(() =>
+      Promise.resolve({
+        id: 'persisted-event-1',
+        workflow_run_id: 'gate-test-run',
+        event_type: 'node_failed',
+        step_index: null,
+        step_name: 'war-council-validator',
+        data: { error: 'REJECT missing required implementation evidence' },
+        created_at: '2026-07-16T08:30:00.000Z',
+      })
+    ),
     listWorkflowEvents: mock(() => Promise.resolve([])),
     getCompletedDagNodeOutputs: mock(() => Promise.resolve(new Map<string, string>())),
     getCodebase: mock(() => Promise.resolve(null)),
@@ -208,7 +222,7 @@ describe('handleNodeFailure authorization boundary', () => {
     expect(hasDeniedLog(deps.log)).toBe(false);
   });
 
-  it('valid permit reaches real persistent authorization and records one inert attempt', async () => {
+  it('valid permit derives the card identity from the returned durable event', async () => {
     await withPersistentEscalationPermit(async permit => {
       const deps = makeDeps();
       await handleNodeFailure(
@@ -231,6 +245,41 @@ describe('handleNodeFailure authorization boundary', () => {
         accepted: true,
         mutation_sent: false,
       });
+      const cards = await listOperatorCards();
+      expect(cards.items).toHaveLength(1);
+      expect(cards.items[0]?.card.canonical_event_identity).toMatchObject({
+        source_event_id: 'persisted-event-1',
+        event_created_at: '2026-07-16T08:30:00.000Z',
+        event_type: 'node_failed',
+        step_name: 'war-council-validator',
+      });
+      const durableCreate = deps.store.createDurableWorkflowEvent as ReturnType<typeof mock>;
+      expect(durableCreate).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  it('durable event persistence failure creates no card, jobs, or authorization attempt', async () => {
+    await withPersistentEscalationPermit(async permit => {
+      const deps = makeDeps();
+      deps.store.createDurableWorkflowEvent = mock(async () => {
+        throw new Error('durable_event_insert_failed');
+      });
+
+      await handleNodeFailure(
+        deps,
+        makeWorkflowRun({ overseer_m31_permit: permit }),
+        makeNode('war-council-validator'),
+        {
+          errorMsg: 'REJECT missing required implementation evidence',
+          logDir: '/tmp/test',
+        }
+      );
+
+      expect((await listOperatorCards()).items).toHaveLength(0);
+      const attempts = (await listOverseerCapabilityEvents('escalation')).filter(
+        event => event.event_type === 'adapter_attempt'
+      );
+      expect(attempts).toHaveLength(0);
     });
   });
 });

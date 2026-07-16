@@ -1113,6 +1113,102 @@ export class SqliteAdapter implements IDatabase {
         BEFORE DELETE ON overseer_capability_events
         BEGIN SELECT RAISE(ABORT, 'overseer_capability_events is append-only'); END;
 
+      -- M-42 Slice 3 durable operator cards and delivery evidence (migration 035).
+      CREATE TABLE IF NOT EXISTS overseer_operator_cards (
+        card_id TEXT PRIMARY KEY CHECK (
+          length(card_id) = 64 AND card_id NOT GLOB '*[^0-9a-f]*'
+        ),
+        identity_version TEXT NOT NULL CHECK (
+          identity_version = 'overseer-actionable-event-v1'
+        ),
+        canonical_event_identity TEXT NOT NULL CHECK (json_valid(canonical_event_identity)),
+        payload_digest TEXT NOT NULL CHECK (
+          length(payload_digest) = 64 AND payload_digest NOT GLOB '*[^0-9a-f]*'
+        ),
+        payload TEXT NOT NULL CHECK (json_valid(payload)),
+        run_id TEXT NOT NULL,
+        wo_id TEXT NOT NULL,
+        repository TEXT NOT NULL,
+        branch TEXT,
+        pr_url TEXT,
+        pr_number INTEGER CHECK (pr_number > 0),
+        head_sha TEXT,
+        base_branch TEXT,
+        base_sha TEXT,
+        checks TEXT NOT NULL CHECK (json_valid(checks)),
+        mergeability TEXT NOT NULL,
+        blocker TEXT NOT NULL,
+        mechanical_evidence TEXT NOT NULL CHECK (json_valid(mechanical_evidence)),
+        recovery_attempted TEXT NOT NULL CHECK (json_valid(recovery_attempted)),
+        proposed_remediation TEXT NOT NULL CHECK (json_valid(proposed_remediation)),
+        next_permitted_action TEXT NOT NULL,
+        responsible_actor TEXT NOT NULL,
+        actionable_event_at TEXT NOT NULL,
+        required_ruling TEXT,
+        evidence_links TEXT NOT NULL CHECK (json_valid(evidence_links)),
+        lifecycle_classification TEXT NOT NULL,
+        governance_classification TEXT NOT NULL,
+        created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+      );
+
+      CREATE TABLE IF NOT EXISTS overseer_operator_card_delivery_jobs (
+        card_id TEXT NOT NULL REFERENCES overseer_operator_cards(card_id),
+        channel TEXT NOT NULL CHECK (channel IN ('dispatch', 'builder_monitor', 'notion')),
+        state TEXT NOT NULL CHECK (state IN (
+          'pending', 'leased', 'succeeded', 'exhausted', 'indeterminate'
+        )),
+        attempts_started INTEGER NOT NULL DEFAULT 0 CHECK (attempts_started BETWEEN 0 AND 3),
+        next_attempt_at TEXT NOT NULL,
+        lease_owner TEXT,
+        lease_expires_at TEXT,
+        fencing_token INTEGER NOT NULL DEFAULT 0,
+        updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+        PRIMARY KEY (card_id, channel)
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_overseer_operator_card_jobs_due
+        ON overseer_operator_card_delivery_jobs(state, next_attempt_at, channel);
+
+      CREATE TABLE IF NOT EXISTS overseer_operator_card_delivery_receipts (
+        receipt_id TEXT PRIMARY KEY,
+        card_id TEXT NOT NULL REFERENCES overseer_operator_cards(card_id),
+        channel TEXT NOT NULL CHECK (channel IN ('dispatch', 'builder_monitor', 'notion')),
+        attempt_number INTEGER NOT NULL CHECK (attempt_number BETWEEN 1 AND 3),
+        phase TEXT NOT NULL CHECK (phase IN ('started', 'terminal')),
+        started_at TEXT NOT NULL,
+        completed_at TEXT,
+        outcome TEXT CHECK (outcome IN (
+          'succeeded', 'transient_failure', 'permanent_failure', 'indeterminate'
+        )),
+        sanitized_status TEXT,
+        error_class TEXT,
+        next_attempt_at TEXT,
+        provider_receipt_id TEXT,
+        fencing_token INTEGER NOT NULL,
+        created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+        UNIQUE (card_id, channel, attempt_number, phase),
+        CHECK (
+          (phase = 'started' AND completed_at IS NULL AND outcome IS NULL)
+          OR (phase = 'terminal' AND completed_at IS NOT NULL AND outcome IS NOT NULL)
+        )
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_overseer_operator_card_receipts_card
+        ON overseer_operator_card_delivery_receipts(card_id, channel, attempt_number, phase);
+
+      CREATE TRIGGER IF NOT EXISTS trg_overseer_operator_cards_no_update
+        BEFORE UPDATE ON overseer_operator_cards
+        BEGIN SELECT RAISE(ABORT, 'overseer_operator_cards is append-only'); END;
+      CREATE TRIGGER IF NOT EXISTS trg_overseer_operator_cards_no_delete
+        BEFORE DELETE ON overseer_operator_cards
+        BEGIN SELECT RAISE(ABORT, 'overseer_operator_cards is append-only'); END;
+      CREATE TRIGGER IF NOT EXISTS trg_overseer_operator_card_delivery_receipts_no_update
+        BEFORE UPDATE ON overseer_operator_card_delivery_receipts
+        BEGIN SELECT RAISE(ABORT, 'overseer_operator_card_delivery_receipts is append-only'); END;
+      CREATE TRIGGER IF NOT EXISTS trg_overseer_operator_card_delivery_receipts_no_delete
+        BEFORE DELETE ON overseer_operator_card_delivery_receipts
+        BEGIN SELECT RAISE(ABORT, 'overseer_operator_card_delivery_receipts is append-only'); END;
+
       CREATE TABLE IF NOT EXISTS overseer_actions (
         id TEXT PRIMARY KEY,
         run_id TEXT NOT NULL REFERENCES remote_agent_workflow_runs(id) ON DELETE CASCADE,

@@ -15,6 +15,7 @@ export interface OverseerWatchRun {
 }
 
 export interface OverseerWorkflowEventRow {
+  id: string;
   workflow_run_id: string;
   event_type: string;
   step_name: string | null;
@@ -40,6 +41,7 @@ interface WorkflowRunRow {
 }
 
 interface WorkflowEventRow {
+  id: string;
   workflow_run_id: string;
   event_type: string;
   step_name: string | null;
@@ -112,6 +114,7 @@ function normalizeRun(row: WorkflowRunRow): OverseerWatchRun {
 
 function normalizeEvent(row: WorkflowEventRow): OverseerWorkflowEventRow {
   return {
+    id: row.id,
     workflow_run_id: row.workflow_run_id,
     event_type: row.event_type,
     step_name: row.step_name,
@@ -135,7 +138,7 @@ export async function listRunsForOverseerWatch(): Promise<OverseerWatchRun[]> {
 
 export async function listRunEventsForOverseer(runId: string): Promise<OverseerWorkflowEventRow[]> {
   const result = await getDatabase().query<WorkflowEventRow>(
-    `SELECT workflow_run_id, event_type, step_name, data, created_at
+    `SELECT id, workflow_run_id, event_type, step_name, data, created_at
      FROM remote_agent_workflow_events
      WHERE workflow_run_id = $1
      ORDER BY created_at ASC`,

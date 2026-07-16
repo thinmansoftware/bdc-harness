@@ -26,6 +26,7 @@ import {
   decide,
   permitFromMetadata,
   runAuthorizedEscalation,
+  runEscalation,
   type Decision,
 } from '@archon/overseer';
 import type { WorkflowRun, NodeOutput } from './schemas/workflow-run.ts';
@@ -33,6 +34,7 @@ import type { DagNode } from './schemas/dag-node.ts';
 import { buildGateResultField } from './event-emitter';
 import type { WorkflowEmitterEvent, GateResult } from './event-emitter';
 import type { IWorkflowStore } from './store.ts';
+import type { WorkflowEventRecord } from './store.ts';
 
 export interface HandleNodeFailureDeps {
   store: IWorkflowStore;
@@ -150,27 +152,41 @@ export async function handleNodeFailure(
   // Preserve the existing 4 housekeeping calls.
   await deps.logNodeError(ctx.logDir, workflowRun.id, node.id, ctx.errorMsg);
 
-  deps.store
-    .createWorkflowEvent({
-      workflow_run_id: workflowRun.id,
-      event_type: 'node_failed',
-      step_name: node.id,
-      data: {
-        error: ctx.errorMsg,
-        overseer_class: errorClass,
-        overseer_decision: result.decision,
-        ...(ctx.extraEventData ?? {}),
-        // Layer 1 gate_result field (WO-HARNESS-LAYER1-CLIMB-AND-GATE-EVENTS-01).
-        // Present only when Phase 5 cascade engine provides gateResult in ctx.
-        ...buildGateResultField(ctx.gateResult),
-      },
-    })
-    .catch((err: Error) => {
+  const eventInput = {
+    workflow_run_id: workflowRun.id,
+    event_type: 'node_failed' as const,
+    step_name: node.id,
+    data: {
+      error: ctx.errorMsg,
+      overseer_class: errorClass,
+      overseer_decision: result.decision,
+      ...(ctx.extraEventData ?? {}),
+      // Layer 1 gate_result field (WO-HARNESS-LAYER1-CLIMB-AND-GATE-EVENTS-01).
+      // Present only when Phase 5 cascade engine provides gateResult in ctx.
+      ...buildGateResultField(ctx.gateResult),
+    },
+  };
+  let persistedActionableEvent: WorkflowEventRecord | null = null;
+  if (result.decision === 'escalate' && result.escalationContext) {
+    try {
+      if (!deps.store.createDurableWorkflowEvent) {
+        throw new Error('durable_workflow_event_store_unavailable');
+      }
+      persistedActionableEvent = await deps.store.createDurableWorkflowEvent(eventInput);
+    } catch (err) {
+      deps.log.error(
+        { err, workflowRunId: workflowRun.id, eventType: 'node_failed' },
+        'overseer.escalation_event_persist_failed'
+      );
+    }
+  } else {
+    deps.store.createWorkflowEvent(eventInput).catch((err: Error) => {
       deps.log.error(
         { err, workflowRunId: workflowRun.id, eventType: 'node_failed' },
         'workflow_event_persist_failed'
       );
     });
+  }
 
   // Forward gate_result from ctx.gateResult into the emitted event via buildGateResultField.
   // The persisted event receives it via the buildGateResultField spread in the store call above.
@@ -191,6 +207,14 @@ export async function handleNodeFailure(
   // so existing v1 escalate paths (out_of_credits, auth_failed, etc.) are unaffected.
   //
   if (result.decision === 'escalate' && result.escalationContext) {
+    if (!persistedActionableEvent) {
+      deps.log.info(
+        { runId: workflowRun.id, nodeId: node.id, errorClass },
+        'overseer.escalation_denied_missing_durable_event'
+      );
+      const output = translateDecision(result.decision, ctx.errorMsg, ctx.outputSoFar ?? '');
+      return { output, decision: result.decision, errorClass };
+    }
     const escalation = await runAuthorizedEscalation(workflowRun.id, {
       permit: permitFromMetadata(workflowRun.metadata),
       actor: 'overseer-workflow-bridge',
@@ -214,6 +238,26 @@ export async function handleNodeFailure(
           reason: escalation.reason,
         },
         'overseer.escalation_denied'
+      );
+    } else {
+      await runEscalation(
+        workflowRun.id,
+        result,
+        {
+          ...result.escalationContext,
+          errorClass,
+          woId: ctx.woId ?? 'unknown',
+          repository:
+            typeof workflowRun.metadata.targetRepo === 'string'
+              ? workflowRun.metadata.targetRepo
+              : 'bluedevilcollectibles/bdc-harness',
+        },
+        {
+          sourceEventId: persistedActionableEvent.id,
+          eventType: persistedActionableEvent.event_type,
+          stepName: persistedActionableEvent.step_name ?? node.id,
+          eventCreatedAt: persistedActionableEvent.created_at,
+        }
       );
     }
   }

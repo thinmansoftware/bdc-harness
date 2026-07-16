@@ -125,6 +125,7 @@ import * as knownBadBindingsDb from '@archon/core/db/known-bad-bindings';
 import * as boardAuthorityDb from '@archon/core/db/board-authority';
 import * as executionClaimsDb from '@archon/core/db/execution-claims';
 import * as mergeStewardDb from '@archon/core/db/merge-steward';
+import * as overseerBriefingDb from '@archon/core/db/overseer-briefing';
 import * as m31Substrate from '@archon/overseer/m31-substrate';
 import type { M31LiveStateReader } from '@archon/overseer/m31-substrate';
 import {
@@ -261,6 +262,12 @@ import {
   compareAndConsumeM31BodySchema,
   m31PermitResponseSchema,
 } from './schemas/merge-steward.schemas';
+import {
+  operatorCardListQuerySchema,
+  operatorCardListResponseSchema,
+  operatorCardParamsSchema,
+  operatorCardResponseSchema,
+} from './schemas/overseer-briefing.schemas';
 import { getProviderInfoList, isRegisteredProvider } from '@archon/providers';
 import { claudeProviderThrottle } from '@archon/providers/claude/throttle';
 import { buildProductionCanarySnapshot } from '../services/canary-snapshot';
@@ -1164,6 +1171,39 @@ const compareAndConsumeM31ProposalRoute = createRoute({
     403: jsonError('Capability gate denied'),
     404: jsonError('Proposal not found'),
     409: jsonError('Typed comparison or single-use failure'),
+    500: jsonError('Server error'),
+  },
+});
+
+const listOperatorCardsRoute = createRoute({
+  method: 'get',
+  path: '/api/overseer/operator-cards',
+  tags: ['Overseer Briefing'],
+  summary: 'List immutable operator cards and derived delivery state',
+  request: { query: operatorCardListQuerySchema },
+  responses: {
+    200: {
+      content: { 'application/json': { schema: operatorCardListResponseSchema } },
+      description: 'Operator-card feed',
+    },
+    401: jsonError('Board principal rejected'),
+    500: jsonError('Server error'),
+  },
+});
+
+const getOperatorCardRoute = createRoute({
+  method: 'get',
+  path: '/api/overseer/operator-cards/{card_id}',
+  tags: ['Overseer Briefing'],
+  summary: 'Read one immutable operator card and append-only receipts',
+  request: { params: operatorCardParamsSchema },
+  responses: {
+    200: {
+      content: { 'application/json': { schema: operatorCardResponseSchema } },
+      description: 'Operator card',
+    },
+    401: jsonError('Board principal rejected'),
+    404: jsonError('Operator card not found'),
     500: jsonError('Server error'),
   },
 });
@@ -3948,6 +3988,35 @@ export function registerApiRoutes(
       }
       getLog().error({ err: error }, 'm31_compare_and_consume_failed');
       return apiError(c, 500, 'Failed to compare and consume M-31 proposal');
+    }
+  });
+
+  registerOpenApiRoute(listOperatorCardsRoute, async c => {
+    try {
+      await boardAuthorityDb.authenticateBoardPrincipal(boardPrincipalProofFromHeaders(c));
+      return c.json(
+        await overseerBriefingDb.listOperatorCards({
+          cursor: c.req.query('cursor') || undefined,
+          limit: c.req.query('limit') ? Number(c.req.query('limit')) : undefined,
+        })
+      );
+    } catch (error) {
+      if (isBoardPrincipalAuthError(error)) return apiError(c, 401, (error as Error).message);
+      getLog().error({ err: error }, 'operator_card_list_failed');
+      return apiError(c, 500, 'Failed to list operator cards');
+    }
+  });
+
+  registerOpenApiRoute(getOperatorCardRoute, async c => {
+    try {
+      await boardAuthorityDb.authenticateBoardPrincipal(boardPrincipalProofFromHeaders(c));
+      const card = await overseerBriefingDb.getOperatorCard(c.req.param('card_id') ?? '');
+      if (!card) return apiError(c, 404, 'Operator card not found');
+      return c.json(card);
+    } catch (error) {
+      if (isBoardPrincipalAuthError(error)) return apiError(c, 401, (error as Error).message);
+      getLog().error({ err: error }, 'operator_card_get_failed');
+      return apiError(c, 500, 'Failed to read operator card');
     }
   });
 

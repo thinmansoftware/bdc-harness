@@ -26,11 +26,13 @@
  * mechanism that ensures no Cauldron failure ever exits silently again.
  */
 
-import { mkdir, writeFile } from 'fs/promises';
-import { join } from 'path';
-import { getArchonHome } from '@archon/paths';
-import { createMessage } from '@archon/core/db/dispatch';
-import { assessDispatchMessageBody } from '@archon/core/utils/dispatch-content-guard';
+import { appendOperatorCard, type OperatorCardRecord } from '@archon/core/db/overseer-briefing';
+import {
+  buildOperatorCard,
+  OPERATOR_CARD_IDENTITY_VERSION,
+  type ActionableEventIdentity,
+  type OperatorCardPayload,
+} from './operator-card';
 import type { DecisionResult } from './decide.ts';
 import type { ErrorClass } from './classify.ts';
 
@@ -49,6 +51,13 @@ export interface EscalationContext {
   [key: string]: unknown;
 }
 
+export interface EscalationSourceEvent {
+  sourceEventId: string;
+  eventType: string;
+  stepName: string;
+  eventCreatedAt: string;
+}
+
 /**
  * Default Notion database ID for BDC's main Cauldron / WO board.
  * Used as fallback when NOTION_DB_ID env var is not set. Hardcoding this single
@@ -56,12 +65,8 @@ export interface EscalationContext {
  * and the alternative is failing the escalation silently when the env var drifts.
  * Override via NOTION_DB_ID for non-prod environments.
  */
-const BDC_DEFAULT_NOTION_DB_ID = 'a6df831c-0b52-449f-8ca4-d77be6b70d0a';
 const NOTION_VERSION = '2022-06-28';
 const NOTION_API_BASE = 'https://api.notion.com/v1';
-const DEFAULT_BUILDER_MONITOR_URL = 'https://n8n.bluedevilcollectibles.com/webhook/builder-status';
-const DISPATCH_SENDER = 'overseer';
-const DISPATCH_RECIPIENT = 'operator';
 
 /**
  * Run an escalation for a non-recoverable workflow failure.
@@ -75,192 +80,99 @@ const DISPATCH_RECIPIENT = 'operator';
 export async function runEscalation(
   runId: string,
   decision: DecisionResult,
-  context: EscalationContext
-): Promise<void> {
-  const timestamp = new Date().toISOString();
-
-  // Always start with the on-disk artifact -- it is the most reliable signal
-  // (no network, no auth, no third-party). Even if everything else fails the
-  // operator can grep ARCHON_HOME for escalation.json on the host.
-  const archonHome = getArchonHome();
-  const runDir = join(archonHome, 'runs', runId);
-  const escalationPath = join(runDir, 'escalation.json');
-  const payload = {
-    runId,
-    timestamp,
-    decision: {
-      decision: decision.decision,
-      reason: decision.reason,
-    },
-    context,
+  context: EscalationContext,
+  source: EscalationSourceEvent
+): Promise<OperatorCardRecord> {
+  if (!context.woId) throw new Error('operator_card_identity_invalid:wo_id');
+  const identity: ActionableEventIdentity = {
+    identity_version: OPERATOR_CARD_IDENTITY_VERSION,
+    source_event_id: source.sourceEventId,
+    run_id: runId,
+    wo_id: context.woId,
+    event_type: source.eventType,
+    step_name: source.stepName,
+    event_created_at: source.eventCreatedAt,
+    error_class: context.errorClass,
   };
-  try {
-    await mkdir(runDir, { recursive: true });
-    await writeFile(escalationPath, JSON.stringify(payload, null, 2) + '\n', 'utf8');
-  } catch (err) {
-    // Stderr-only -- no logger in @archon/overseer to keep the package dep-free.
-    // The bridge will see the absence of escalation.json via a fs.stat() check
-    // if it cares; for now we surface to the container log.
-    console.error('[overseer/escalate] failed to write escalation.json:', err);
-  }
-
-  await emitDispatchRunReport(context, decision, runId, timestamp).catch(err => {
-    console.error('[overseer/escalate] dispatch run_report failed:', err);
+  const payload: OperatorCardPayload = {
+    repository: textValue(context.repository) ?? 'bluedevilcollectibles/bdc-harness',
+    branch: textValue(context.branch),
+    pr_url: textValue(context.prUrl),
+    pr_number: numberValue(context.prNumber),
+    head_sha: textValue(context.headSha),
+    base_branch: textValue(context.baseBranch),
+    base_sha: textValue(context.baseSha),
+    checks: objectValue(context.checks),
+    mergeability: textValue(context.mergeability) ?? 'unknown',
+    blocker: decision.reason,
+    mechanical_evidence: {
+      node_id: context.nodeId ?? null,
+      validator_output: context.validatorOutput ?? null,
+    },
+    recovery_attempted: objectValue(context.recoveryAttempted),
+    proposed_remediation: { steps: context.remediation ?? [] },
+    next_permitted_action: textValue(context.nextPermittedAction) ?? 'await operator ruling',
+    responsible_actor: textValue(context.responsibleActor) ?? 'acting-xo',
+    actionable_event_at: source.eventCreatedAt,
+    required_ruling: textValue(context.requiredRuling),
+    evidence_links: objectValue(context.evidenceLinks),
+    lifecycle_classification: textValue(context.lifecycleClassification) ?? 'recovery',
+    governance_classification: textValue(context.governanceClassification) ?? 'information-only',
+  };
+  const built = buildOperatorCard(identity, payload);
+  const persisted = await appendOperatorCard({
+    card_id: built.card_id,
+    identity_version: built.identity_version,
+    canonical_event_identity: { ...built.canonical_event_identity },
+    payload_digest: built.payload_digest,
+    payload: { ...built.payload },
+    ...built.payload,
+    run_id: runId,
+    wo_id: context.woId,
   });
+  return persisted.card;
+}
 
-  // Webhook fires regardless of Notion outcome -- keeps the dashboard the source
-  // of truth even when Notion is degraded.
-  await postBuilderMonitorWebhook(context, decision, runId).catch(err => {
-    console.error('[overseer/escalate] builder-monitor webhook failed:', err);
-  });
+function textValue(value: unknown): string | null {
+  return typeof value === 'string' && value.trim() ? value.trim() : null;
+}
 
-  // Notion is last and most likely to be the bottleneck (API rate limit, key
-  // missing, page-lookup failure). Operator still sees the on-disk and webhook
-  // signals if this fails.
-  await postNotionComment(context, decision, runId, escalationPath, timestamp).catch(err => {
-    console.error('[overseer/escalate] notion comment post failed:', err);
-  });
+function numberValue(value: unknown): number | null {
+  return typeof value === 'number' && Number.isInteger(value) && value > 0 ? value : null;
+}
+
+function objectValue(value: unknown): Record<string, unknown> {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : {};
 }
 
 export function buildDispatchRunReportBody(
-  context: EscalationContext,
-  decision: DecisionResult,
-  runId: string,
+  context: EscalationContext | OperatorCardRecord,
+  decision?: DecisionResult,
+  runId?: string,
   timestamp = new Date().toISOString()
 ): string {
+  if (isOperatorCardRecord(context)) {
+    return JSON.stringify({
+      kind: 'overseer_run_report',
+      card_id: context.card_id,
+      payload_digest: context.payload_digest,
+      ...context.payload,
+      delivery_summary: null,
+    });
+  }
   return JSON.stringify({
     kind: 'overseer_run_report',
-    runId,
+    runId: runId ?? 'unknown',
     woId: context.woId ?? 'unknown',
     class: context.errorClass,
     nodeId: context.nodeId ?? null,
-    decision: decision.decision,
-    reason: decision.reason,
+    decision: decision?.decision ?? 'escalate',
+    reason: decision?.reason ?? context.blocker ?? 'operator card',
     remediation: context.remediation ?? [],
     timestamp,
   });
-}
-
-async function emitDispatchRunReport(
-  context: EscalationContext,
-  decision: DecisionResult,
-  runId: string,
-  timestamp: string
-): Promise<void> {
-  const body = buildDispatchRunReportBody(context, decision, runId, timestamp);
-  const assessment = assessDispatchMessageBody('run_report', body);
-  if (!assessment.allowed) {
-    throw new Error(
-      `dispatch-content-guard rejected run_report: ${assessment.reason ?? 'unknown'}`
-    );
-  }
-  await createMessage({
-    correlation_id: runId,
-    idempotency_key: `overseer:run_report:${runId}:${context.errorClass}`,
-    task_type: 'run_report',
-    sender: DISPATCH_SENDER,
-    recipient: DISPATCH_RECIPIENT,
-    body,
-  });
-}
-
-async function postBuilderMonitorWebhook(
-  context: EscalationContext,
-  decision: DecisionResult,
-  runId: string
-): Promise<void> {
-  const url = process.env.BUILDER_MONITOR_WEBHOOK_URL ?? DEFAULT_BUILDER_MONITOR_URL;
-  const woId = context.woId ?? 'unknown';
-  const detail =
-    `needs_human: ${context.errorClass} on run ${runId}` +
-    (context.nodeId ? ` (node: ${context.nodeId})` : '') +
-    ` -- ${decision.reason}`;
-
-  // The webhook payload field set mirrors Rule 15 from the operating manual
-  // (Major Build / Cauldron status posts). action='needs_human' is the
-  // dedicated escalation tag; n8n routes those to the operator dashboard
-  // separately from started/completed/blocked.
-  const body = {
-    builder: 'Cauldron',
-    wo_id: woId,
-    action: 'needs_human',
-    detail,
-  };
-
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  });
-  if (!res.ok) {
-    const responseText = await res.text();
-    console.error(`[overseer/escalate] builder-monitor responded ${res.status}:`, responseText);
-    throw new Error(`builder-monitor responded ${res.status}: ${responseText}`);
-  }
-}
-
-async function postNotionComment(
-  context: EscalationContext,
-  decision: DecisionResult,
-  runId: string,
-  escalationPath: string,
-  timestamp: string
-): Promise<void> {
-  const apiKey = process.env.NOTION_API_KEY;
-  if (!apiKey) {
-    // Fail-soft: log to stderr and skip. escalation.json + webhook already fired.
-    console.error('[overseer/escalate] NOTION_API_KEY not set -- skipping Notion comment');
-    return;
-  }
-  if (!context.woId) {
-    console.error('[overseer/escalate] no woId in context -- cannot resolve Notion page');
-    return;
-  }
-
-  const databaseId = process.env.NOTION_DB_ID ?? BDC_DEFAULT_NOTION_DB_ID;
-  const pageId = await lookupNotionPageId(apiKey, databaseId, context.woId);
-  if (!pageId) {
-    console.error(
-      `[overseer/escalate] no Notion page found for WO ${context.woId} in db ${databaseId}`
-    );
-    return;
-  }
-
-  const remediationBlock =
-    context.remediation && context.remediation.length > 0
-      ? '\n\nRemediation (from validator):\n' + context.remediation.map(r => `  - ${r}`).join('\n')
-      : '';
-  const validatorBlock =
-    context.validatorOutput && !context.remediation
-      ? `\n\nValidator output:\n${context.validatorOutput}`
-      : '';
-  const commentText =
-    `Cauldron escalation [${timestamp}] runId=${runId} node=${context.nodeId ?? '(none)'} ` +
-    `class=${context.errorClass}.\n\n${decision.reason}` +
-    remediationBlock +
-    validatorBlock +
-    `\n\nFull context: ${escalationPath}`;
-
-  const url = `${NOTION_API_BASE}/comments`;
-  const body = {
-    parent: { page_id: pageId },
-    rich_text: [{ type: 'text', text: { content: commentText } }],
-  };
-
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      'Content-Type': 'application/json',
-      'Notion-Version': NOTION_VERSION,
-    },
-    body: JSON.stringify(body),
-  });
-  if (!res.ok) {
-    const responseText = await res.text();
-    console.error(`[overseer/escalate] Notion comments API responded ${res.status}:`, responseText);
-    throw new Error(`Notion comments API responded ${res.status}: ${responseText}`);
-  }
 }
 
 /**
@@ -271,39 +183,69 @@ async function postNotionComment(
  * on the row -- we try the common ones in order. This is intentionally tolerant:
  * the goal is best-effort discovery, not exact-schema enforcement.
  */
-async function lookupNotionPageId(
+export interface NotionPageLookupResult {
+  page_id: string | null;
+  failure_outcome: 'transient_failure' | 'permanent_failure' | null;
+}
+
+function isRetrySafeHttpStatus(status: number): boolean {
+  return status === 429 || (status >= 500 && status <= 599);
+}
+
+export async function lookupNotionPage(
   apiKey: string,
   databaseId: string,
-  woId: string
-): Promise<string | null> {
+  woId: string,
+  fetchImpl: typeof fetch = globalThis.fetch
+): Promise<NotionPageLookupResult> {
   const url = `${NOTION_API_BASE}/databases/${databaseId}/query`;
-  // Try a small list of likely property names. Notion's API accepts an OR filter
-  // with up to 100 children, which is well within budget here.
-  const candidateProps = ['WO ID', 'Name', 'Title', 'WO_ID'];
-  const body = {
-    filter: {
-      or: candidateProps.flatMap(prop => [
-        { property: prop, title: { equals: woId } },
-        { property: prop, rich_text: { equals: woId } },
-      ]),
-    },
-    page_size: 5,
-  };
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      'Content-Type': 'application/json',
-      'Notion-Version': NOTION_VERSION,
-    },
-    body: JSON.stringify(body),
-  });
-  if (!res.ok) {
-    const responseText = await res.text();
-    console.error(`[overseer/escalate] Notion database query failed ${res.status}:`, responseText);
-    throw new Error(`Notion database query failed ${res.status}: ${responseText}`);
+  const candidateProps = ['Task', 'WO ID', 'Name', 'Title', 'WO_ID'];
+  let sawSuccessfulQuery = false;
+  let sawRetrySafeFailure = false;
+  for (const property of candidateProps) {
+    try {
+      const res = await fetchImpl(url, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          'Content-Type': 'application/json',
+          'Notion-Version': NOTION_VERSION,
+        },
+        body: JSON.stringify({
+          filter: { property, title: { equals: woId } },
+          page_size: 1,
+        }),
+      });
+      if (!res.ok) {
+        if (isRetrySafeHttpStatus(res.status)) sawRetrySafeFailure = true;
+        continue;
+      }
+      sawSuccessfulQuery = true;
+      const data = (await res.json()) as { results?: { id?: string }[] };
+      const first = data.results?.[0];
+      if (first?.id) return { page_id: first.id, failure_outcome: null };
+    } catch {
+      sawRetrySafeFailure = true;
+    }
   }
-  const data = (await res.json()) as { results?: { id?: string }[] };
-  const first = data.results?.[0];
-  return first?.id ?? null;
+  return {
+    page_id: null,
+    failure_outcome:
+      sawSuccessfulQuery || sawRetrySafeFailure ? 'transient_failure' : 'permanent_failure',
+  };
+}
+
+export async function lookupNotionPageId(
+  apiKey: string,
+  databaseId: string,
+  woId: string,
+  fetchImpl: typeof fetch = globalThis.fetch
+): Promise<string | null> {
+  return (await lookupNotionPage(apiKey, databaseId, woId, fetchImpl)).page_id;
+}
+
+function isOperatorCardRecord(
+  value: EscalationContext | OperatorCardRecord
+): value is OperatorCardRecord {
+  return typeof (value as Partial<OperatorCardRecord>).payload_digest === 'string';
 }

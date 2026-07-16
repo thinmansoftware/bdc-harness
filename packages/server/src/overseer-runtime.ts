@@ -93,7 +93,11 @@ export function startOverseerRuntime(deps: OverseerRuntimeDeps = {}): void {
   log.info({ adapterKind }, 'overseer_runtime.watcher_starting');
 
   const runService = deps.runService ?? runOverseerService;
-  watcherTask = runService({ signal: controller.signal, adapterKind }).then(
+  watcherTask = runService({
+    signal: controller.signal,
+    adapterKind,
+    deliveryEnabled: true,
+  }).then(
     () => {
       log.info('overseer_runtime.watcher_stopped');
       watcherState = 'stopped';
@@ -101,6 +105,7 @@ export function startOverseerRuntime(deps: OverseerRuntimeDeps = {}): void {
       watcherAbort = null;
     },
     (err: unknown) => {
+      controller.abort();
       log.error({ err }, 'overseer_runtime.watcher_exception_degraded');
       watcherState = 'degraded';
       watcherTask = null;
