@@ -609,6 +609,32 @@ async function selectParent(
   ).rows[0];
 }
 
+/**
+ * The initial state recorded on the genesis ADMITTED event. The live row's
+ * `state` drifts via transitions, so replay-identity checks must compare the
+ * requested initial state against this admitted value, not the current state.
+ */
+async function selectAdmittedParentState(
+  query: ControlPlaneTxQuery,
+  parentId: string
+): Promise<string | undefined> {
+  const row = (
+    await query<Record<string, unknown>>(
+      `SELECT evidence_json FROM overseer_control_events
+       WHERE resource_kind='PARENT' AND resource_key=$1 AND event_kind='ADMITTED'
+       ORDER BY event_sequence ASC LIMIT 1`,
+      [parentId]
+    )
+  ).rows[0];
+  if (!row) return undefined;
+  const evidence = parseJson(row.evidence_json);
+  if (evidence && typeof evidence === 'object') {
+    const state = (evidence as Record<string, unknown>).state;
+    if (typeof state === 'string') return state;
+  }
+  return undefined;
+}
+
 // ---------------------------------------------------------------------------
 // Parent admission + lifecycle
 // ---------------------------------------------------------------------------
@@ -711,7 +737,15 @@ export async function admitOverseerParent(
     const existing = await selectParent(query, input.parent_id);
     if (existing) {
       const parent = parentFromRow(existing);
-      if (parent.owner_id === input.owner_id && parent.correlation_id === input.correlation_id) {
+      const admittedState = await selectAdmittedParentState(query, input.parent_id);
+      // Exact replay: same owner, correlation, AND the same requested initial
+      // state as the genesis admission. Any drift (including a changed initial
+      // state) is an identity conflict, not an idempotent success.
+      if (
+        parent.owner_id === input.owner_id &&
+        parent.correlation_id === input.correlation_id &&
+        admittedState === input.state
+      ) {
         return ok(parent);
       }
       return fail('parent_identity_conflict');
@@ -882,8 +916,13 @@ export async function linkOverseerChild(
     ).rows[0];
     if (existingChild) {
       const child = childFromRow(existingChild);
-      if (child.parent_id === input.parent_id) return ok(child);
-      return fail('child_identity_conflict');
+      if (child.parent_id !== input.parent_id) return fail('child_identity_conflict');
+      // Even an exact replay must come from the live owner with a valid fence;
+      // a stale or wrong owner fails closed rather than getting idempotent success.
+      if (!verifyLiveOwner(parent, input.owner_id, input.fencing_token, now)) {
+        return fail('parent_lease_stale');
+      }
+      return ok(child);
     }
     if (!verifyLiveOwner(parent, input.owner_id, input.fencing_token, now)) {
       return fail('parent_lease_stale');
@@ -1132,7 +1171,9 @@ export async function acquireRepositoryMutationLease(
       if (
         lease.lease_id === input.lease_id &&
         lease.owner_id === input.owner_id &&
-        lease.execution_id === input.execution_id
+        lease.execution_id === input.execution_id &&
+        lease.action_kind === input.action_kind &&
+        lease.capability === input.capability
       ) {
         return ok(lease); // idempotent re-acquire by the live owner
       }
@@ -1574,6 +1615,8 @@ export async function reserveFusionBudget(
       const reservation = reservationFromRow(existing);
       if (
         reservation.call_id === input.call_id &&
+        reservation.proposal_id === input.proposal_id &&
+        reservation.execution_id === input.execution_id &&
         reservation.provider === input.provider &&
         reservation.model === input.model &&
         reservation.call_kind === input.call_kind &&

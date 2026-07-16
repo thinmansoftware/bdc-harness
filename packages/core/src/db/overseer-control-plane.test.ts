@@ -166,12 +166,47 @@ describe('overseer control plane (SQLite)', () => {
     const eleventh = await admit('p10');
     expect(eleventh).toEqual({ ok: false, code: 'parent_capacity_reached' });
 
+    // Exact admission replay (same owner/correlation AND same initial state) is idempotent.
+    expect((await admit('p0')).ok).toBe(true);
+    // Re-admitting p0 with a drifted requested initial state is an identity conflict,
+    // never a silent idempotent success.
+    expect(
+      await admitOverseerParent(
+        {
+          parent_id: 'p0',
+          owner_id: 'owner-p0',
+          correlation_id: 'corr-p0',
+          state: 'REVIEW',
+          actor: 'xo',
+        },
+        db
+      )
+    ).toEqual({ ok: false, code: 'parent_identity_conflict' });
+
     // Children do not change the active count.
     const link = await linkOverseerChild(
       { parent_id: 'p0', child_id: 'c0', owner_id: 'owner-p0', fencing_token: 1, actor: 'xo' },
       db
     );
     expect(link.ok).toBe(true);
+
+    // Exact link replay by the live owner is idempotent.
+    expect(
+      (
+        await linkOverseerChild(
+          { parent_id: 'p0', child_id: 'c0', owner_id: 'owner-p0', fencing_token: 1, actor: 'xo' },
+          db
+        )
+      ).ok
+    ).toBe(true);
+    // A replay of an existing child from a stale/wrong fence fails closed rather than
+    // returning idempotent success (fencing is validated before the idempotent path).
+    expect(
+      await linkOverseerChild(
+        { parent_id: 'p0', child_id: 'c0', owner_id: 'owner-p0', fencing_token: 2, actor: 'xo' },
+        db
+      )
+    ).toEqual({ ok: false, code: 'parent_lease_stale' });
     const activeAfterChild = await db.query<{ n: number }>(
       "SELECT COUNT(*) AS n FROM overseer_parent_commitments WHERE state IN ('BUILDING','REVIEW','STAGING','RECOVERY','ACTION_PENDING')"
     );
@@ -315,6 +350,40 @@ describe('overseer control plane (SQLite)', () => {
     expect(first.ok).toBe(true);
     if (first.ok) expect(first.value.fencing_token).toBe(1);
 
+    // Exact live re-acquire (same identity, including immutable action/capability) is idempotent.
+    expect((await acquire('org/repo', 'w1')).ok).toBe(true);
+
+    // Live re-acquire by the same owner but with a drifted immutable action_kind or
+    // capability is NOT idempotent -- it is a conflict, never a silent success.
+    expect(
+      await acquireRepositoryMutationLease(
+        {
+          repository: 'org/repo',
+          lease_id: 'lease-w1',
+          owner_id: 'w1',
+          execution_id: 'exec-w1',
+          action_kind: 'REBASE',
+          capability: 'overseer.merge',
+          actor: 'xo',
+        },
+        db
+      )
+    ).toEqual({ ok: false, code: 'lease_conflict' });
+    expect(
+      await acquireRepositoryMutationLease(
+        {
+          repository: 'org/repo',
+          lease_id: 'lease-w1',
+          owner_id: 'w1',
+          execution_id: 'exec-w1',
+          action_kind: 'MERGE',
+          capability: 'overseer.other',
+          actor: 'xo',
+        },
+        db
+      )
+    ).toEqual({ ok: false, code: 'lease_conflict' });
+
     // A second worker on the same repository loses (lease_conflict).
     expect(await acquire('org/repo', 'w2')).toEqual({ ok: false, code: 'lease_conflict' });
 
@@ -437,6 +506,44 @@ describe('overseer control plane (SQLite)', () => {
 
     // Retry/fallback/indirect each require their own reservation and count toward totals.
     expect((await reserve('r1', 3_000_000, 'PRIMARY')).ok).toBe(true);
+
+    // Exact replay of r1 (same identity, including proposal/execution) is idempotent.
+    expect((await reserve('r1', 3_000_000, 'PRIMARY')).ok).toBe(true);
+
+    // A replay reusing r1's reservation_id/call_id but with a drifted proposal_id or
+    // execution_id must NOT inherit r1's budget authority -- it is a hard conflict.
+    expect(
+      await reserveFusionBudget(
+        {
+          reservation_id: 'r1',
+          call_id: 'call-r1',
+          proposal_id: 'prop-OTHER',
+          execution_id: 'exec-1',
+          provider: 'xai',
+          model: 'grok-4',
+          call_kind: 'PRIMARY',
+          requested_microusd: 3_000_000,
+          actor: 'xo',
+        },
+        db
+      )
+    ).toEqual({ ok: false, code: 'budget_transition_invalid' });
+    expect(
+      await reserveFusionBudget(
+        {
+          reservation_id: 'r1',
+          call_id: 'call-r1',
+          proposal_id: 'prop-1',
+          execution_id: 'exec-OTHER',
+          provider: 'xai',
+          model: 'grok-4',
+          call_kind: 'PRIMARY',
+          requested_microusd: 3_000_000,
+          actor: 'xo',
+        },
+        db
+      )
+    ).toEqual({ ok: false, code: 'budget_transition_invalid' });
     expect((await reserve('r2', 3_000_000, 'RETRY')).ok).toBe(true);
     expect((await reserve('r3', 3_000_000, 'FALLBACK')).ok).toBe(true);
     expect((await reserve('r4', 3_000_000, 'INDIRECT')).ok).toBe(true);
