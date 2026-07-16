@@ -376,13 +376,13 @@ nodes:
             visit(id);
             return seen;
           };
-          const requiredWhen = "$business-risk-gate.output.gate == " + String.fromCharCode(39) + "proceed" + String.fromCharCode(39);
+          const requiredWhen = "$" + "business-risk-gate.output.gate == " + String.fromCharCode(39) + "proceed" + String.fromCharCode(39);
           for (const id of ["decide-push-target", "commit-and-push", "open-pr-if-needed", "build-manifest", "flip-notion"]) {
             const node = byId.get(id);
             if (!node) { fails.push(id + " missing"); continue; }
             if (!ancestors(id).has("business-risk-gate")) fails.push(id + " is not downstream of business-risk-gate");
             if (String(node.when || "").trim() !== requiredWhen) {
-              fails.push(id + " must condition on $business-risk-gate.output.gate == proceed");
+              fails.push(id + " must condition on $" + "business-risk-gate.output.gate == proceed");
             }
           }
           if (fails.length) { console.log(fails.join("; ")); }
@@ -444,7 +444,8 @@ nodes:
         {"gate":"proceed"}. The decide-push-target, commit-and-push,
         open-pr-if-needed, build-manifest, and flip-notion nodes MUST each be
         downstream of the gate and carry this condition verbatim:
-          when: "$business-risk-gate.output.gate == 'proceed'"
+          when: "<DOLLAR>business-risk-gate.output.gate == 'proceed'"
+        Replace <DOLLAR> with one literal ASCII dollar sign in the child YAML.
         This condition is required even when a node uses trigger_rule: all_done.
 
         ## Tailoring requirements
@@ -475,7 +476,7 @@ nodes:
         - business-risk-gate includes BUSINESS_RISK_INVARIANT verbatim
         - business-risk-gate emits {"gate":"proceed"} only after all checks pass
         - decide-push-target, commit-and-push, open-pr-if-needed, build-manifest, and
-          flip-notion each condition on $business-risk-gate.output.gate == 'proceed'
+          flip-notion each condition on <DOLLAR>business-risk-gate.output.gate == 'proceed'
         - root name: is the real child slug (NOT "<slug>" / "<bdc-slug>")
         - inputs.WO_ID.default is the real WO_ID (NOT "<WO_ID>" / "<WO_ID from normalize-spec>")
         - no dev-error tokens: TODO, FIXME, TBD, REPLACE_ME, lorem ipsum
@@ -608,13 +609,13 @@ nodes:
           visit(id);
           return seen;
         };
-        const requiredWhen = "$business-risk-gate.output.gate == " + String.fromCharCode(39) + "proceed" + String.fromCharCode(39);
+        const requiredWhen = "$" + "business-risk-gate.output.gate == " + String.fromCharCode(39) + "proceed" + String.fromCharCode(39);
         for (const id of ["decide-push-target", "commit-and-push", "open-pr-if-needed", "build-manifest", "flip-notion"]) {
           const node = byId.get(id);
           if (!node) { fails.push(id + " missing"); continue; }
           if (!ancestors(id).has("business-risk-gate")) fails.push(id + " is not downstream of business-risk-gate");
           if (String(node.when || "").trim() !== requiredWhen) {
-            fails.push(id + " must condition on $business-risk-gate.output.gate == proceed");
+            fails.push(id + " must condition on $" + "business-risk-gate.output.gate == proceed");
           }
         }
         if (fails.length) { console.log(fails.join("; ")); }
@@ -782,7 +783,11 @@ nodes:
       ADV_PASS=$(printf '%s\n' "$ADV_OUT" | sed -n 's/^ADV_PASS=//p' | head -n 1)
       RISK=$(printf '%s\n' "$ADV_OUT" | sed -n 's/^RISK=//p' | head -n 1)
 
-      API_BASE="${ARCHON_API_BASE:-https://archon.bluedevilcollectibles.com}"
+      API_BASE="${ARCHON_API_BASE:-}"
+      if ! API_BASE="$API_BASE" python3 -c 'import os,sys; from urllib.parse import urlsplit; u=urlsplit(os.environ.get("API_BASE", "")); sys.exit(0 if u.scheme == "http" and u.hostname in ("127.0.0.1", "localhost") and u.port is not None and u.username is None and u.password is None and u.path in ("", "/") and not u.query and not u.fragment else 1)'; then
+        echo "ERROR: ARCHON_API_BASE must be an explicit loopback staging URL; refusing external or unset target." >&2
+        exit 1
+      fi
       HARNESS_REPO="bluedevilcollectibles/bdc-harness"
       ARCHON_HEADERS=(-H "x-archon-operator-token: ${ARCHON_OPERATOR_TOKEN}")
       if [ -n "${CF_ACCESS_CLIENT_ID:-}" ] && [ -n "${CF_ACCESS_CLIENT_SECRET:-}" ]; then
@@ -941,7 +946,11 @@ nodes:
       YAML_CONTENT=$(base64 < "$YAML_FILENAME" | tr -d '\n')
       COMMIT_MSG="feat(on-ramp): register ${WO_SLUG} child workflow via bdc-harness-wo-onramp"
       HARNESS_REPO="bluedevilcollectibles/bdc-harness"
-      API_BASE="${ARCHON_API_BASE:-https://archon.bluedevilcollectibles.com}"
+      API_BASE="${ARCHON_API_BASE:-}"
+      if ! API_BASE="$API_BASE" python3 -c 'import os,sys; from urllib.parse import urlsplit; u=urlsplit(os.environ.get("API_BASE", "")); sys.exit(0 if u.scheme == "http" and u.hostname in ("127.0.0.1", "localhost") and u.port is not None and u.username is None and u.password is None and u.path in ("", "/") and not u.query and not u.fragment else 1)'; then
+        echo "ERROR: ARCHON_API_BASE must be an explicit loopback staging URL; refusing external or unset target." >&2
+        exit 1
+      fi
       ARCHON_HEADERS=(-H "x-archon-operator-token: ${ARCHON_OPERATOR_TOKEN}")
       CF_ACCESS_ENABLED=false
       if [ -n "${CF_ACCESS_CLIENT_ID:-}" ] && [ -n "${CF_ACCESS_CLIENT_SECRET:-}" ]; then
@@ -1135,6 +1144,11 @@ nodes:
       set -euo pipefail
       REG_OUT=$register-yaml.output
       APPROVAL=$approval-gate.output
+      API_BASE="${ARCHON_API_BASE:-}"
+      if ! API_BASE="$API_BASE" python3 -c 'import os,sys; from urllib.parse import urlsplit; u=urlsplit(os.environ.get("API_BASE", "")); sys.exit(0 if u.scheme == "http" and u.hostname in ("127.0.0.1", "localhost") and u.port is not None and u.username is None and u.password is None and u.path in ("", "/") and not u.query and not u.fragment else 1)'; then
+        echo "ERROR: ARCHON_API_BASE must be an explicit loopback staging URL; refusing external or unset target." >&2
+        exit 1
+      fi
 
       # Re-check approval in case trigger_rule brings us here unexpectedly
       if ! printf '%s\n' "$APPROVAL" | grep -iqE 'approved|proceed|^yes|fire'; then
@@ -1168,7 +1182,7 @@ nodes:
       # running. If so, SKIP the fire and treat the existing run as ours. Best-effort:
       # a probe failure must NOT block the fire (shell-only parse; no multi-line python
       # heredoc -- that breaks the YAML block scalar, per bun-yaml-parser gotcha).
-      RUNS_JSON=$(curl -fsS --max-time 15 "https://archon.bluedevilcollectibles.com/api/workflows/runs?limit=20" -H "x-archon-operator-token: ${ARCHON_OPERATOR_TOKEN}" 2>/dev/null || true)
+      RUNS_JSON=$(curl -fsS --max-time 15 "${API_BASE}/api/workflows/runs?limit=20" -H "x-archon-operator-token: ${ARCHON_OPERATOR_TOKEN}" 2>/dev/null || true)
       # Compact to one-object-per-line, then keep only entries for THIS slug that are running/pending/started.
       DUP_HIT=$(printf '%s' "$RUNS_JSON" | tr '{' '\n' | grep -F "\"workflow_name\":\"${WO_SLUG}\"" | grep -E '"status":"(running|pending|started)"' | head -n 1 || true)
       if [ -n "$DUP_HIT" ]; then
@@ -1181,7 +1195,7 @@ nodes:
       echo "Firing: workflowSlug=${WO_SLUG} conversationId=${CONV_ID} message='${FIRE_MESSAGE}' repo=${TARGET_REPO_FULL}"
 
       RESPONSE=$(curl -fsS -X POST \
-        "https://archon.bluedevilcollectibles.com/api/workflows/${WO_SLUG}/run" \
+        "${API_BASE}/api/workflows/${WO_SLUG}/run" \
         -H "Content-Type: application/json" \
         -H "x-archon-operator-token: ${ARCHON_OPERATOR_TOKEN}" \
         --max-time 30 \
@@ -1246,7 +1260,11 @@ nodes:
       WO_SLUG=$(printf '%s\n' "$FIRE_OUT" | sed -n 's/^WO_SLUG=//p' | head -n 1)
       EXPECTED_REPO=$(printf '%s\n' "$FIRE_OUT" | sed -n 's/^TARGET_REPO_FULL=//p' | head -n 1)
 
-      API_BASE="https://archon.bluedevilcollectibles.com"
+      API_BASE="${ARCHON_API_BASE:-}"
+      if ! API_BASE="$API_BASE" python3 -c 'import os,sys; from urllib.parse import urlsplit; u=urlsplit(os.environ.get("API_BASE", "")); sys.exit(0 if u.scheme == "http" and u.hostname in ("127.0.0.1", "localhost") and u.port is not None and u.username is None and u.password is None and u.path in ("", "/") and not u.query and not u.fragment else 1)'; then
+        echo "ERROR: ARCHON_API_BASE must be an explicit loopback staging URL; refusing external or unset target." >&2
+        exit 1
+      fi
       echo "=== verify-binding: polling for run (RUN_ID=${RUN_ID} CONV_ID=${CONV_ID} WO_SLUG=${WO_SLUG}) up to 90s ==="
 
       # Resolve the codebase_id -> repo-name map once (so we can compare binding).
