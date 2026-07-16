@@ -1,0 +1,669 @@
+name: bdc-infra-affiliate-n8n-staging-01
+description: |
+  Use when: Executing WO-INFRA-AFFILIATE-N8N-STAGING-01 -- M-47 Child 1 of 9,
+  the mandatory isolated n8n staging stop gate for the affiliate program
+  resuscitation.
+  Input: WO_ID = WO-INFRA-AFFILIATE-N8N-STAGING-01 (baked in below).
+  Does:
+    - Reads the WO spec from bdc-xo docs/work-orders/.
+    - Builds the disposable staging tooling ONLY: docker/affiliate-n8n-staging/
+      docker-compose.yml + .env.example, scripts/affiliate_n8n_staging.py,
+      tests/test_affiliate_n8n_staging.py.
+    - Does NOT SSH into production, does NOT export live n8n workflow JSON, and
+      does NOT write n8n/workflows/affiliate-staging/*.json or
+      docs/evidence/m47/child1/*.json -- those are captured by the acting XO
+      operator on the target host per WO Section 10/12 Stop 4-6, in a SEPARATE
+      manual step AFTER this PR exists. This workflow covers Stop 1-3 (unit
+      tests, static Compose/contract validation, secret-disclosure scan) only.
+    - Runs a business-risk-gate that fails closed if the generated Compose file
+      or scripts reference any production n8n container/network/volume name, or
+      omit the required isolation invariants (internal network, no published
+      ports, non-root worker, exact staging object names).
+    - Commits, pushes a feature branch, opens a PR against bdc-xo main (no Rule
+      20 staging-gate repo), and builds a Captain CI manifest that explicitly
+      flags the pending operator-executed runtime phase.
+  NOT for: production n8n mutation, live workflow export/import, Supabase
+  schema (Child 2), or any workflow business-logic change (Child 3/5).
+
+policyFile: harness/policies/agent-behavior.md
+model: sonnet
+
+inputs:
+  WO_ID:
+    default: "WO-INFRA-AFFILIATE-N8N-STAGING-01"
+
+nodes:
+  - id: preflight-github-auth
+    persona: major-build
+    load_bearing: true
+    bash: |
+      set -euo pipefail
+      if ! git push --dry-run origin "HEAD:refs/heads/preflight-auth-probe-$(date +%s)" 2>&1; then
+        echo "ERROR: GITHUB auth check failed -- container cannot push to origin." >&2
+        echo "Likely cause: GITHUB_TOKEN missing in executor env, or token lacks repo scope." >&2
+        exit 1
+      fi
+      echo "preflight-github-auth PASS"
+
+  - id: read-spec
+    persona: xo
+    depends_on: [preflight-github-auth]
+    bash: |
+      set -euo pipefail
+      WO_ID="${WO_ID:-WO-INFRA-AFFILIATE-N8N-STAGING-01}"
+      SPEC_PATH="docs/work-orders/${WO_ID}.md"
+      SPEC_CONTENT=$(gh api \
+        "repos/bluedevilcollectibles/bdc-xo/contents/${SPEC_PATH}?ref=main" \
+        --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
+      if [ -z "$SPEC_CONTENT" ]; then
+        SPEC_PATH="docs/superpowers/specs/${WO_ID}.md"
+        SPEC_CONTENT=$(gh api \
+          "repos/bluedevilcollectibles/bdc-xo/contents/${SPEC_PATH}?ref=main" \
+          --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
+      fi
+      if [ -z "$SPEC_CONTENT" ]; then
+        GLOB_PATH=$(gh api \
+          "repos/bluedevilcollectibles/bdc-xo/contents/docs/superpowers/specs?ref=main" \
+          --template '{{range .}}{{.path}}{{"\n"}}{{end}}' 2>/dev/null \
+          | grep "${WO_ID}.md$" | head -1 || true)
+        if [ -n "$GLOB_PATH" ]; then
+          SPEC_PATH="$GLOB_PATH"
+          SPEC_CONTENT=$(gh api \
+            "repos/bluedevilcollectibles/bdc-xo/contents/${SPEC_PATH}?ref=main" \
+            --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
+        fi
+      fi
+      if [ -z "$SPEC_CONTENT" ]; then
+        ISSUE_NUM=$(gh issue list --repo bluedevilcollectibles/bdc-xo \
+          --search "${WO_ID} in:title" --json number,title \
+          --jq '.[0].number' 2>/dev/null || true)
+        if [ -n "$ISSUE_NUM" ] && [ "$ISSUE_NUM" != "null" ]; then
+          SPEC_CONTENT=$(gh issue view "$ISSUE_NUM" --repo bluedevilcollectibles/bdc-xo \
+            --json body --jq .body 2>/dev/null || true)
+          [ -n "$SPEC_CONTENT" ] && SPEC_PATH="issues/${ISSUE_NUM}"
+        fi
+      fi
+      if [ -z "$SPEC_CONTENT" ]; then
+        echo "Spec not found for ${WO_ID}" >&2
+        exit 1
+      fi
+      printf 'WO_ID=%s\nSPEC_PATH=bdc-xo:%s\n\n' "$WO_ID" "$SPEC_PATH"
+      printf -- '--- SPEC ---\n%s\n' "$SPEC_CONTENT"
+
+  - id: plan
+    persona: war-council-architect
+    depends_on: [read-spec]
+    agent: war-council-architect
+    task_class: medium_work
+    prompt: |
+      Read the WO-INFRA-AFFILIATE-N8N-STAGING-01 spec below and produce a
+      concise implementation plan for the SOURCE-ONLY portion of this WO.
+
+      ## Hard scope boundary (read this first)
+      This Cauldron run executes ONLY the builder-side deliverables. It MUST
+      NOT attempt SSH to hetzner-prod, MUST NOT export/import any live n8n
+      workflow, and MUST NOT create or populate:
+        - n8n/workflows/affiliate-staging/lspro-affiliate-api.json
+        - n8n/workflows/affiliate-staging/lsp-license-webhook.json
+        - docs/evidence/m47/child1/workflow-source-receipts.json
+        - docs/evidence/m47/child1/staging-runtime-receipt.json
+      Those four files are captured and committed by the acting XO operator
+      on the target host per spec Section 10/12 Stop 4-6, in a SEPARATE commit
+      AFTER this PR exists. Building fake/placeholder content for any of them
+      is an in-scope violation, not a shortcut.
+
+      ## Required Output
+      Return structured Markdown with these headings:
+      - WO ID
+      - Files to create (docker/affiliate-n8n-staging/docker-compose.yml,
+        docker/affiliate-n8n-staging/.env.example,
+        scripts/affiliate_n8n_staging.py, tests/test_affiliate_n8n_staging.py)
+      - Files explicitly out of scope (the four operator-captured files above,
+        any Supabase schema, any workflow business-logic file)
+      - Verification commands (unit tests, ASCII scan, docker compose config +
+        verify --compose)
+      - Commit message
+      - Push policy (feature branch + PR against bdc-xo main, no staging gate)
+      - Staging gate required: false
+
+      ## Compose object-name contract (from spec Section 3/4, verbatim)
+      Containers: m47-affiliate-n8n-staging, m47-affiliate-n8n-staging-db
+      Network (internal, no published ports): m47-affiliate-n8n-staging
+      Volumes: m47-affiliate-n8n-staging-data, m47-affiliate-n8n-staging-db-data
+      Worker identity: fixed non-root UID:GID 1000:1000
+      Must NEVER join network n8n-net, mount the production n8n volume, use the
+      production Postgres service, or publish a host port.
+
+      ## Spec
+      $read-spec.output
+
+  - id: implement
+    persona: major-build
+    depends_on: [plan]
+    agent: major-build
+    task_class: medium_work
+    loop:
+      fresh_context: true
+      until: COMPLETE
+      max_iterations: 5
+      prompt: |
+        Implement the approved plan for WO-INFRA-AFFILIATE-N8N-STAGING-01.
+
+        ## Spec
+        $read-spec.output
+
+        ## Plan
+        $plan.output
+
+        ## Scope -- build ONLY these four files
+        1. docker/affiliate-n8n-staging/docker-compose.yml
+        2. docker/affiliate-n8n-staging/.env.example
+        3. scripts/affiliate_n8n_staging.py
+        4. tests/test_affiliate_n8n_staging.py
+
+        Do NOT create, modify, or stub n8n/workflows/affiliate-staging/*.json
+        or docs/evidence/m47/child1/*.json. Do NOT SSH anywhere. Do NOT attempt
+        `docker compose up` against a real host -- static `config` validation
+        only. These are hard out-of-scope boundaries per spec Section 4/10.
+
+        ## docker-compose.yml requirements (spec Sections 3, 4, 6, 10, Stop 2)
+        - Project-level services named exactly `m47-affiliate-n8n-staging` and
+          `m47-affiliate-n8n-staging-db` (container_name).
+        - Internal network named exactly `m47-affiliate-n8n-staging` with
+          `internal: true`. No `ports:` host-publish mapping anywhere.
+        - Named volumes exactly `m47-affiliate-n8n-staging-data` and
+          `m47-affiliate-n8n-staging-db-data`.
+        - n8n service runs as fixed non-root `user: "1000:1000"`.
+        - Pin `n8nio/n8n:2.13.4` for the n8n service image (per spec Section 10
+          -- reference only; do not attempt to verify this against a live host
+          from this worktree).
+        - All secrets/bootstrap values (Postgres password, N8N encryption key)
+          come from the env file via `env_file:` / `${VAR}` interpolation --
+          never a literal value in the compose file itself.
+        - No dependency on or reference to the production `n8n` or
+          `n8n-postgres` container names, or the `n8n-net` network, anywhere in
+          the file.
+
+        ## .env.example requirements
+        Placeholder values ONLY (e.g. `POSTGRES_PASSWORD=changeme-in-runtime-env`,
+        `N8N_ENCRYPTION_KEY=changeme-in-runtime-env`). No real secret, no
+        production value. This file is committed to git and must pass a
+        gitleaks scan.
+
+        ## scripts/affiliate_n8n_staging.py requirements (spec Section 7)
+        Implement a single-file Python CLI with subcommands `sanitize`,
+        `receipt`, `runtime-receipt`, and `verify` (per spec Section 7's
+        function inventory: sanitize_workflow, build_receipt,
+        build_runtime_receipt, verify_contract, main). Key behavior:
+        - `sanitize`: reads raw workflow JSON from stdin, strips credential
+          values/runtime data, renames to `m47-staging-<source_name>`, prefixes
+          webhook paths with `m47-staging/`, forces inactive, replaces every
+          provider-capable/credential/code-capable node with a deterministic
+          `n8n-nodes-base.set` synthetic-fixture node (output marker
+          `m47_child1_fixture`) EXCEPT a source-derived Supabase database node,
+          which becomes `n8n-nodes-base.stopAndError` with message
+          `child2_supabase_wrapper_unbound`. Writes canonical JSON (sorted
+          keys, compact separators) to stdout. Never echoes raw input.
+        - `receipt` / `runtime-receipt`: build the exact canonical JSON schemas
+          in spec Section 7 (workflow-source-receipts.json and
+          staging-runtime-receipt.json field lists). Never accept or emit a
+          credential value, raw workflow body, execution payload, or
+          customer/affiliate data -- only hashes, counts, names, and
+          PASS/FAIL labels.
+        - `verify --compose <file>`: fails if the rendered Compose config
+          contains a production hostname/container/network/volume name
+          (`n8n`, `n8n-postgres`, `n8n-net` as exact object names), an active
+          workflow marker, a credential value field, a published port, or a
+          non-staging webhook path. Also verify against
+          `--workflow-dir`/`--receipt`/`--runtime-receipt` when those flags are
+          passed (these paths may not exist yet in this worktree -- treat a
+          missing optional target as "nothing to check for that flag", not a
+          crash).
+        - `main`: argparse wiring for the four subcommands. Never print
+          environment values or raw exception payloads (catch and print a
+          short safe message).
+
+        Keep this dependency-free (stdlib only: argparse, json, hashlib, sys,
+        re, datetime) since the runtime image has no guaranteed package
+        install step.
+
+        ## tests/test_affiliate_n8n_staging.py requirements (spec Section 11,
+        Test 1/2/3/5 -- Tests 4/6 are runtime-only and out of scope here)
+        Use unittest (stdlib) against the functions in
+        scripts/affiliate_n8n_staging.py. Cover at minimum:
+        - Deterministic sanitize_workflow(): two runs on the same fixture (same
+          explicit capture timestamp) produce byte-identical canonical JSON;
+          fake credential/production values from the fixture never appear in
+          the output; inactive is forced true.
+        - Provider-capable/credential/code-capable nodes are replaced with the
+          synthetic-fixture node; a Supabase database node fixture becomes the
+          unbound stopAndError node; node/edge topology count is preserved.
+        - build_receipt() output matches the exact required key set (no
+          missing/extra keys) and rejects a fixture containing a raw
+          credential value.
+        - verify_contract() rejects negative fixtures: a real-provider node, a
+          production hostname, an active-workflow flag, and a bound database
+          credential reference must each cause a rejection.
+
+        ## Self-verify before you finish (run these yourself)
+        ```
+        python -m unittest tests/test_affiliate_n8n_staging.py
+        docker compose --env-file docker/affiliate-n8n-staging/.env.example \
+          -p m47-affiliate-n8n-staging \
+          -f docker/affiliate-n8n-staging/docker-compose.yml config \
+          > /tmp/m47-affiliate-n8n-staging.config
+        python scripts/affiliate_n8n_staging.py verify --compose /tmp/m47-affiliate-n8n-staging.config
+        rm -f /tmp/m47-affiliate-n8n-staging.config
+        ```
+        If `docker` is not available in this build container, note that in
+        your commit/PR notes as an environment gap (per the ASCII-only /
+        environment-awareness policy) and rely on the unit tests plus a manual
+        read-through of the compose YAML against the requirements above --
+        do not fabricate a passing compose-config result you did not run.
+
+        ## ASCII gate (Rule 13 -- mandatory)
+        Every byte in every file you write must be ASCII (0x00-0x7F). Before
+        finishing, run:
+        ```
+        grep -nP "[^\x00-\x7F]" docker/affiliate-n8n-staging/docker-compose.yml \
+          docker/affiliate-n8n-staging/.env.example \
+          scripts/affiliate_n8n_staging.py \
+          tests/test_affiliate_n8n_staging.py
+        ```
+        Every invocation must return nothing. Fix any hit before finishing.
+
+        ## Commit-and-push BEFORE exit
+        ```bash
+        BRANCH=$(git rev-parse --abbrev-ref HEAD)
+        WO_ID="${WO_ID:-WO-INFRA-AFFILIATE-N8N-STAGING-01}"
+        git add -A
+        git diff --cached --quiet || git commit -m "feat: implement ${WO_ID}
+
+        Isolated affiliate n8n staging tooling (source-only): Compose stack,
+        env template, sanitizer/receipt/verify CLI, and unit tests. Runtime
+        capture/import/rollback (Stop 4-6) is executed separately by the
+        acting XO operator on the target host.
+
+        Co-Authored-By: Claude (Cauldron major-build) <noreply@anthropic.com>"
+        git push -u origin "$BRANCH" 2>&1 || echo "WARN: push failed - operator must recover from worktree"
+        ```
+
+        ## Completion sentinel
+        Choose exactly one ending:
+        1. REAL BUILD (you made in-scope changes): emit, each on its own line:
+             COMPLETE
+             BUILD_COMPLETE
+             <promise>COMPLETE</promise>
+        2. ALREADY SATISFIED (all four files already exist and pass the
+           self-verify commands, so you made no changes): emit:
+             ALREADY_SATISFIED: <one sentence naming the four files and how verified>
+             COMPLETE
+        3. TRUE BLOCKER (spec ambiguous, docker unavailable AND you cannot
+           reason about correctness, or a needed source of truth is missing):
+             BLOCKED: <one-sentence reason>
+        Never emit case-1 sentinels without real in-scope edits. Never claim a
+        test/compose result you did not actually run.
+
+  - id: war-council-validator
+    provider: claude
+    model: sonnet
+    persona: captain-ci-validator
+    depends_on: [implement]
+    task_class: medium_work
+    prompt: |
+      Validate the WO-INFRA-AFFILIATE-N8N-STAGING-01 source-only build.
+
+      ## Inputs
+      Spec:
+      $read-spec.output
+
+      Plan:
+      $plan.output
+
+      Implementation output:
+      $implement.output
+
+      Git diff:
+      Run `git diff --stat` and `git diff --check` against the merge-base with
+      origin/main, then inspect the four changed/created files.
+
+      ## Checks (fail with needs_revision on any miss)
+      1. Exactly the four in-scope files exist (docker-compose.yml, .env.example,
+         affiliate_n8n_staging.py, test_affiliate_n8n_staging.py) -- and NONE of
+         n8n/workflows/affiliate-staging/*.json or docs/evidence/m47/child1/*.json
+         were created (those are operator-only, per spec Section 4/10).
+      2. docker-compose.yml uses the exact required object names (containers
+         m47-affiliate-n8n-staging / m47-affiliate-n8n-staging-db, network
+         m47-affiliate-n8n-staging with internal: true, volumes
+         m47-affiliate-n8n-staging-data / m47-affiliate-n8n-staging-db-data,
+         non-root user 1000:1000, no published ports) and never references
+         n8n-net, the production n8n container, or n8n-postgres.
+      3. .env.example contains only placeholder values, no real secret.
+      4. affiliate_n8n_staging.py exposes sanitize/receipt/runtime-receipt/verify
+         and never prints raw input, environment values, or credential-shaped
+         literals.
+      5. Unit tests exist and (per implement's self-report) pass.
+      6. ASCII-only: no non-ASCII byte in any of the four files.
+
+      ## Required Output
+      Return either:
+      - satisfied: with evidence for each of the 6 checks above
+      - needs_revision: with exact file/path/behavior findings
+
+  # business-risk-gate: fails closed if the WO's BUSINESS_RISK_INVARIANT is
+  # violated. Success path emits exactly {"gate":"proceed"} as the final
+  # stdout so decide-push-target / commit-and-push / open-pr-if-needed /
+  # build-manifest / flip-notion can each condition on it.
+  - id: business-risk-gate
+    persona: overseer
+    depends_on: [war-council-validator]
+    load_bearing: true
+    bash: |
+      set -uo pipefail
+      # BUSINESS_RISK_INVARIANT (verbatim from spec):
+      # Existing production n8n containers, workflows, credentials, data,
+      # webhooks, networks, volumes, and executions must remain untouched and
+      # undisclosed throughout the isolated staging build and rollback
+      # rehearsal.
+      echo "BUSINESS_RISK_INVARIANT: Existing production n8n containers, workflows, credentials, data, webhooks, networks, volumes, and executions must remain untouched and undisclosed throughout the isolated staging build and rollback rehearsal." >&2
+
+      WT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
+      cd "$WT"
+
+      COMPOSE="docker/affiliate-n8n-staging/docker-compose.yml"
+      ENVFILE="docker/affiliate-n8n-staging/.env.example"
+      SCRIPT="scripts/affiliate_n8n_staging.py"
+
+      VIOLATIONS=0
+
+      for f in "$COMPOSE" "$ENVFILE" "$SCRIPT"; do
+        if [ ! -f "$f" ]; then
+          echo "VIOLATION: required file missing: $f" >&2
+          VIOLATIONS=$((VIOLATIONS + 1))
+        fi
+      done
+
+      # No operator-only files may have been fabricated by the automated build.
+      for f in \
+        n8n/workflows/affiliate-staging/lspro-affiliate-api.json \
+        n8n/workflows/affiliate-staging/lsp-license-webhook.json \
+        docs/evidence/m47/child1/workflow-source-receipts.json \
+        docs/evidence/m47/child1/staging-runtime-receipt.json
+      do
+        if [ -e "$f" ]; then
+          echo "VIOLATION: operator-only file was created by the automated build: $f" >&2
+          VIOLATIONS=$((VIOLATIONS + 1))
+        fi
+      done
+
+      if [ -f "$COMPOSE" ]; then
+        # Forbidden production identifiers as exact object names.
+        if grep -qE '(^|[^-])\bn8n-net\b' "$COMPOSE"; then
+          echo "VIOLATION ($COMPOSE): references production network n8n-net." >&2
+          VIOLATIONS=$((VIOLATIONS + 1))
+        fi
+        if grep -qE 'container_name:[[:space:]]*n8n-postgres[[:space:]]*$' "$COMPOSE"; then
+          echo "VIOLATION ($COMPOSE): references production container n8n-postgres." >&2
+          VIOLATIONS=$((VIOLATIONS + 1))
+        fi
+        if grep -qE 'container_name:[[:space:]]*n8n[[:space:]]*$' "$COMPOSE"; then
+          echo "VIOLATION ($COMPOSE): references production container n8n." >&2
+          VIOLATIONS=$((VIOLATIONS + 1))
+        fi
+        # Required staging object names must be present.
+        for NAME in \
+          m47-affiliate-n8n-staging \
+          m47-affiliate-n8n-staging-db \
+          m47-affiliate-n8n-staging-data \
+          m47-affiliate-n8n-staging-db-data
+        do
+          if ! grep -q "$NAME" "$COMPOSE"; then
+            echo "VIOLATION ($COMPOSE): required staging object name missing: $NAME" >&2
+            VIOLATIONS=$((VIOLATIONS + 1))
+          fi
+        done
+        if ! grep -qE 'internal:[[:space:]]*true' "$COMPOSE"; then
+          echo "VIOLATION ($COMPOSE): staging network is not marked internal: true." >&2
+          VIOLATIONS=$((VIOLATIONS + 1))
+        fi
+        if grep -qE '^\s*ports:\s*$' "$COMPOSE"; then
+          echo "VIOLATION ($COMPOSE): a published 'ports:' host mapping is present." >&2
+          VIOLATIONS=$((VIOLATIONS + 1))
+        fi
+        if ! grep -qE 'user:[[:space:]]*"?1000:1000"?' "$COMPOSE"; then
+          echo "VIOLATION ($COMPOSE): non-root worker identity 1000:1000 not set." >&2
+          VIOLATIONS=$((VIOLATIONS + 1))
+        fi
+      fi
+
+      if [ -f "$ENVFILE" ]; then
+        if grep -qiE '(sk_live|whsec_|AKIA[0-9A-Z]{16}|-----BEGIN)' "$ENVFILE"; then
+          echo "VIOLATION ($ENVFILE): looks like a real secret/credential literal, not a placeholder." >&2
+          VIOLATIONS=$((VIOLATIONS + 1))
+        fi
+      fi
+
+      if [ -f "$SCRIPT" ]; then
+        if grep -qE '\bssh\b|hetzner-prod|docker[[:space:]]+exec[[:space:]]+n8n\b' "$SCRIPT"; then
+          echo "VIOLATION ($SCRIPT): script attempts SSH or production docker exec -- runtime capture is operator-only." >&2
+          VIOLATIONS=$((VIOLATIONS + 1))
+        fi
+      fi
+
+      # ASCII gate (Rule 13) over the exact in-scope files that exist.
+      for f in "$COMPOSE" "$ENVFILE" "$SCRIPT" tests/test_affiliate_n8n_staging.py; do
+        [ -f "$f" ] || continue
+        if grep -nP "[^\x00-\x7F]" "$f" >/dev/null 2>&1; then
+          echo "VIOLATION ($f): contains non-ASCII byte(s) (Rule 13)." >&2
+          VIOLATIONS=$((VIOLATIONS + 1))
+        fi
+      done
+
+      if [ "$VIOLATIONS" -gt 0 ]; then
+        echo "BUSINESS_RISK_GATE=BLOCKED (total violations: $VIOLATIONS)" >&2
+        echo "Refusing to proceed to commit-and-push/PR. Fix the violations above and re-run." >&2
+        exit 1
+      fi
+
+      echo "BUSINESS_RISK_GATE=PASS -- no production n8n identifier found, staging isolation invariants present, no operator-only file fabricated, ASCII clean." >&2
+      echo '{"gate":"proceed"}'
+
+  - id: decide-push-target
+    persona: major-build
+    depends_on: [business-risk-gate]
+    when: "$business-risk-gate.output.gate == 'proceed'"
+    bash: |
+      set -euo pipefail
+      echo "PUSH_TARGET=feature-branch:feat/wo-infra-affiliate-n8n-staging-01"
+      echo "BASE_BRANCH=main"
+      echo "RULE20=false"
+      echo "repo: bluedevilcollectibles/bdc-xo"
+
+  - id: commit-and-push
+    persona: overseer
+    depends_on: [decide-push-target]
+    when: "$business-risk-gate.output.gate == 'proceed'"
+    load_bearing: true
+    bash: |
+      set -euo pipefail
+      BRANCH="$(git rev-parse --abbrev-ref HEAD)"
+      git add -A
+      if git diff --cached --quiet; then
+        echo "No staged changes; implement loop already committed."
+      else
+        git -c user.name="John Ranson" -c user.email="admin@bluedevilcollectibles.com" \
+          commit -m "chore: backstop commit WO-INFRA-AFFILIATE-N8N-STAGING-01"
+      fi
+      PUSH_OK=false
+      for attempt in 1 2 3; do
+        if git push -u origin "$BRANCH" 2>&1; then
+          PUSH_OK=true
+          break
+        fi
+        echo "WARN: push attempt $attempt failed; retrying after $((attempt * 5))s..." >&2
+        sleep $((attempt * 5))
+      done
+      if [ "$PUSH_OK" = "false" ]; then
+        echo "ERROR: git push failed after 3 attempts." >&2
+        exit 1
+      fi
+      echo "unique_branch=${BRANCH}"
+      echo "BRANCH=${BRANCH}"
+      echo "SHA=$(git rev-parse HEAD)"
+
+  - id: open-pr-if-needed
+    persona: major-build
+    depends_on: [commit-and-push]
+    when: "$business-risk-gate.output.gate == 'proceed'"
+    load_bearing: true
+    bash: |
+      set -euo pipefail
+      REPO="bluedevilcollectibles/bdc-xo"
+      COMMIT_PUSH_OUTPUT=$commit-and-push.output
+      UNIQUE_BRANCH=$(printf '%s\n' "$COMMIT_PUSH_OUTPUT" | sed -n 's/^unique_branch=//p' | head -n 1)
+      if [ -z "$UNIQUE_BRANCH" ]; then
+        UNIQUE_BRANCH="$(git rev-parse --abbrev-ref HEAD)"
+      fi
+      REMOTE_HEAD="$(git ls-remote origin "refs/heads/${UNIQUE_BRANCH}" 2>/dev/null | awk '{print $1}')"
+      if [ "$REMOTE_HEAD" != "$(git rev-parse HEAD)" ]; then
+        echo "FATAL: open-pr precondition failed -- ${UNIQUE_BRANCH} not on origin at HEAD (origin=${REMOTE_HEAD:-<absent>})." >&2
+        exit 1
+      fi
+      TITLE="infra(n8n): WO-INFRA-AFFILIATE-N8N-STAGING-01 -- isolated affiliate n8n staging tooling (M-47 Child 1, source-only)"
+      BODY_FILE=$(mktemp)
+      {
+        echo "## Summary"
+        echo "M-47 Child 1 of 9: disposable, internal-only n8n staging tooling for the"
+        echo "two affiliate workflows. This PR covers Stop 1-3 ONLY (unit tests, static"
+        echo "Compose/contract validation, secret-disclosure scan) -- Stops 4-7 (live"
+        echo "workflow capture, runtime isolation proof, rollback rehearsal, exact-head"
+        echo "independent review + parent acceptance) are executed separately by the"
+        echo "acting XO operator on the target host per spec Section 10/12, and land as"
+        echo "a follow-up commit on this branch before the parent M-47 acceptance."
+        echo
+        echo "## Business risk invariant (verified this run)"
+        echo "Existing production n8n containers, workflows, credentials, data, webhooks,"
+        echo "networks, volumes, and executions must remain untouched and undisclosed"
+        echo "throughout the isolated staging build and rollback rehearsal."
+        echo
+        echo "## Plan"
+        echo "$plan.output"
+        echo
+        echo "## Implement output"
+        echo "$implement.output"
+        echo
+        echo "## Validator"
+        echo "$war-council-validator.output"
+        echo
+        echo "## Business risk gate"
+        echo "$business-risk-gate.output"
+      } > "$BODY_FILE"
+      PR_OK=false
+      EXIST=$(gh pr list --repo "$REPO" --head "$UNIQUE_BRANCH" --state open \
+        --json url --jq '.[0].url // empty' 2>/dev/null || true)
+      if [ -n "$EXIST" ]; then
+        echo "PR_URL=$EXIST"
+        echo "PR already exists (no create needed)."
+        PR_OK=true
+      else
+        for attempt in 1 2 3; do
+          if gh pr create --repo "$REPO" --title "$TITLE" --body-file "$BODY_FILE" --head "$UNIQUE_BRANCH" 2>&1; then
+            PR_OK=true
+            break
+          fi
+          EXIST=$(gh pr list --repo "$REPO" --head "$UNIQUE_BRANCH" --state open \
+            --json url --jq '.[0].url // empty' 2>/dev/null || true)
+          if [ -n "$EXIST" ]; then
+            echo "PR_URL=$EXIST"
+            echo "PR created despite non-zero exit (gh CLI quirk; PR confirmed via list)."
+            PR_OK=true
+            break
+          fi
+          echo "WARN: gh pr create attempt $attempt failed AND no PR found on origin; retrying after $((attempt * 5))s..." >&2
+          sleep $((attempt * 5))
+        done
+      fi
+      if [ "$PR_OK" = "false" ]; then
+        echo "PR_CREATE_FAILED_BUT_BRANCH_SAFE: repo=${REPO} branch=${UNIQUE_BRANCH} sha=$(git rev-parse HEAD)" >&2
+        echo "ERROR: gh pr create failed after 3 attempts -- aborting workflow (load_bearing node)." >&2
+        echo "RECOVERY: open the PR manually -> gh pr create --repo ${REPO} --head ${UNIQUE_BRANCH}" >&2
+        exit 1
+      fi
+
+  - id: build-manifest
+    persona: major-build
+    depends_on: [open-pr-if-needed]
+    when: "$business-risk-gate.output.gate == 'proceed'"
+    trigger_rule: all_done
+    task_class: clerical
+    prompt: |
+      Construct the Rule 2 completion manifest for WO-INFRA-AFFILIATE-N8N-STAGING-01.
+
+      This manifest covers the SOURCE-ONLY portion of the WO (spec Stop 1-3).
+      Do NOT claim Stops 4-7 (target-host capture, runtime isolation proof,
+      rollback rehearsal, exact-head independent review, parent acceptance)
+      were completed -- they were not, by design; they require the acting XO
+      operator's SSH access to hetzner-prod, which this Cauldron run never had.
+
+      ## Inputs
+      Spec: $read-spec.output
+      Plan: $plan.output
+      Implementation: $implement.output
+      Commit and push evidence: $commit-and-push.output
+      PR evidence: $open-pr-if-needed.output
+      Validator: $war-council-validator.output
+      Business risk gate: $business-risk-gate.output
+
+      ## Required manifest fields (emit verbatim, one per line)
+        WO: WO-INFRA-AFFILIATE-N8N-STAGING-01
+        Files created: <comma-separated list from the diff, e.g. docker/affiliate-n8n-staging/docker-compose.yml, docker/affiliate-n8n-staging/.env.example, scripts/affiliate_n8n_staging.py, tests/test_affiliate_n8n_staging.py>
+        Files modified: none
+        Routes added: none
+        Migrations added: none
+        Tests: <N passing / N total, taken from implement's self-reported unittest run>
+        Git commit: <SHA from commit-and-push output>
+        PRs: <PR URL from open-pr-if-needed output>
+        VALIDATION: PASS (source-level Stop 1-3: unit tests, static Compose/contract validation, ASCII gate, business-risk-gate; runtime Stop 4-6 and independent-review Stop 7 are PENDING acting-XO target-host execution per spec Section 10/12)
+
+      ## Operator action required (include this block verbatim, filled in)
+        OPERATOR_ACTION_REQUIRED:
+        The acting XO must now execute WO-INFRA-AFFILIATE-N8N-STAGING-01
+        Section 10/12 Stop 4 (protected source capture + governed import + SHA
+        binding), Stop 5 (runtime isolation proof), Stop 6 (rollback rehearsal
+        + final receipt), and Stop 7 (exact-head CI, independent review,
+        manifest completion, M-47 PR #990 parent acceptance comment) on
+        hetzner-prod against PR <PR URL>. Child 2
+        (WO-SHOPOPS-AFFILIATE-SCHEMA-CONTRACT-01) may not dispatch until Stop 7
+        passes.
+
+      Do not invent a test count, PR URL, or commit SHA -- read them from the
+      node outputs above.
+
+  - id: flip-notion
+    persona: xo
+    depends_on: [build-manifest]
+    when: "$business-risk-gate.output.gate == 'proceed'"
+    trigger_rule: all_done
+    task_class: clerical
+    prompt: |
+      Flip Notion WO-INFRA-AFFILIATE-N8N-STAGING-01 to REVIEW.
+      Manifest MUST go in the Notes property (NOT as a page comment -- Captain
+      CI reads Notes). NEVER mark Status as DONE -- only REVIEW. Do NOT mark
+      Ready for Deploy -- Stops 4-7 are still pending the acting XO operator.
+
+      Required Notion updates:
+      - Claude Status -> REVIEW
+      - Status -> Review
+      - Notes -> manifest from $build-manifest.output VERBATIM, including the
+        OPERATOR_ACTION_REQUIRED block
+
+      Search Notion DB a6df831c-0b52-449f-8ca4-d77be6b70d0a for
+      WO-INFRA-AFFILIATE-N8N-STAGING-01. Use notion-update-page to set
+      Claude Status=REVIEW, Status=Review, Notes=manifest.
+
+      If Notion MCP is unavailable, output:
+      XO_MANUAL: flip WO-INFRA-AFFILIATE-N8N-STAGING-01 to REVIEW with manifest
+      above, including the OPERATOR_ACTION_REQUIRED block for the acting XO.
+
+      Manifest: $build-manifest.output
+      PR: $open-pr-if-needed.output
