@@ -109,6 +109,19 @@ export {
   reduceParentEvidence,
   REQUIRED_M42_CHILD_WO_IDS,
 } from './integration-manifest';
+export {
+  assertCandidateIsCurrentHead,
+  INDEPENDENT_REVIEW_SCHEMA_VERSION,
+  validateIndependentReviewEvidence,
+} from './independent-review-evidence';
+export type {
+  ExpectedIndependentReview,
+  IndependentReviewArtifact,
+  IndependentReviewFinding,
+  IndependentReviewValidationResult,
+  IndependentReviewVerdict,
+  ReviewAgentIdentity,
+} from './independent-review-evidence';
 export type {
   ChildEvidenceRecord,
   ChildReviewEvidence,
