@@ -68,8 +68,8 @@ export async function getRemoteUrl(repoPath: RepoPath): Promise<string | null> {
 
 /**
  * Sync workspace with remote origin.
- * Fetches the base branch from origin, then optionally hard-resets the working tree
- * to match `origin/<baseBranch>`.
+ * Fetches the base branch from origin, then optionally checks out and hard-resets
+ * the working tree to match `origin/<baseBranch>`.
  *
  * When `resetAfterFetch` is true (default), the working tree is hard-reset to match
  * the remote. This is safe for Archon-managed clones in `~/.archon/workspaces/` but
@@ -87,7 +87,7 @@ export async function getRemoteUrl(repoPath: RepoPath): Promise<string | null> {
  *
  * @param workspacePath - Path to the workspace (canonical repo, not worktree)
  * @param baseBranch - Optional base branch name (e.g., 'main', 'develop'). If omitted, auto-detects default branch
- * @param options - Optional settings. `resetAfterFetch` (default true) controls whether `git reset --hard` runs after fetch.
+ * @param options - Optional settings. `resetAfterFetch` (default true) controls whether checkout/reset/clean runs after fetch.
  * @returns Branch used plus whether sync was performed
  * @throws Error with actionable message if configured branch doesn't exist
  */
@@ -140,8 +140,25 @@ export async function syncWorkspace(
     // Non-fatal -- fresh clone or detached HEAD edge case
   }
 
-  // Hard-reset local working tree to match origin -- only safe for Archon-managed
-  // clones, never for a user's local working directory.
+  try {
+    await execFileAsync('git', ['-C', workspacePath, 'checkout', branchToSync], {
+      timeout: 30000,
+    });
+  } catch {
+    try {
+      await execFileAsync(
+        'git',
+        ['-C', workspacePath, 'checkout', '-B', branchToSync, `origin/${branchToSync}`],
+        { timeout: 30000 }
+      );
+    } catch (error) {
+      const err = error as Error;
+      throw new Error(`Checkout of ${branchToSync} failed: ${err.message}`);
+    }
+  }
+
+  // Hard-reset and clean local working tree to match origin -- only safe for
+  // Archon-managed clones, never for a user's local working directory.
   try {
     await execFileAsync('git', ['-C', workspacePath, 'reset', '--hard', `origin/${branchToSync}`], {
       timeout: 30000,
@@ -149,6 +166,15 @@ export async function syncWorkspace(
   } catch (error) {
     const err = error as Error;
     throw new Error(`Reset to origin/${branchToSync} failed: ${err.message}`);
+  }
+
+  try {
+    await execFileAsync('git', ['-C', workspacePath, 'clean', '-fd'], {
+      timeout: 30000,
+    });
+  } catch (error) {
+    const err = error as Error;
+    throw new Error(`Clean of ${workspacePath} failed: ${err.message}`);
   }
 
   let newHead = '';

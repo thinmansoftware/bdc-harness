@@ -1368,6 +1368,53 @@ branch refs/heads/feature/auth
       expect(resetCalls[0][1]).toEqual(['-C', '/workspace/repo', 'reset', '--hard', 'origin/main']);
     });
 
+    test('checks out and cleans working tree when resetAfterFetch is true', async () => {
+      execSpy.mockResolvedValue({ stdout: '', stderr: '' });
+
+      await git.syncWorkspace('/workspace/repo', 'main');
+
+      const commandArgs = execSpy.mock.calls.map((call: unknown[]) => call[1] as string[]);
+      expect(commandArgs).toContainEqual(['-C', '/workspace/repo', 'checkout', 'main']);
+      expect(commandArgs).toContainEqual(['-C', '/workspace/repo', 'reset', '--hard', 'origin/main']);
+      expect(commandArgs).toContainEqual(['-C', '/workspace/repo', 'clean', '-fd']);
+    });
+
+    test('falls back to creating base branch from origin when checkout fails', async () => {
+      execSpy.mockImplementation(async (_cmd: string, args: string[]) => {
+        if (args.includes('checkout') && !args.includes('-B')) {
+          throw new Error('pathspec main did not match');
+        }
+        return { stdout: '', stderr: '' };
+      });
+
+      await git.syncWorkspace('/workspace/repo', 'main');
+
+      const commandArgs = execSpy.mock.calls.map((call: unknown[]) => call[1] as string[]);
+      expect(commandArgs).toContainEqual([
+        '-C',
+        '/workspace/repo',
+        'checkout',
+        '-B',
+        'main',
+        'origin/main',
+      ]);
+      expect(commandArgs).toContainEqual(['-C', '/workspace/repo', 'reset', '--hard', 'origin/main']);
+      expect(commandArgs).toContainEqual(['-C', '/workspace/repo', 'clean', '-fd']);
+    });
+
+    test('throws if checkout fallback fails after successful fetch', async () => {
+      execSpy.mockImplementation(async (_cmd: string, args: string[]) => {
+        if (args.includes('checkout')) {
+          throw new Error('fatal: checkout failed');
+        }
+        return { stdout: '', stderr: '' };
+      });
+
+      await expect(git.syncWorkspace('/workspace/repo', 'main')).rejects.toThrow(
+        'Checkout of main failed'
+      );
+    });
+
     test('throws if reset fails after successful fetch', async () => {
       execSpy.mockImplementation(async (_cmd: string, args: string[]) => {
         if (args.includes('reset')) {
@@ -1494,6 +1541,111 @@ branch refs/heads/feature/auth
         return args.includes('reset');
       });
       expect(resetCalls).toHaveLength(0);
+
+      const checkoutCalls = execSpy.mock.calls.filter((call: unknown[]) => {
+        const args = call[1] as string[];
+        return args.includes('checkout');
+      });
+      expect(checkoutCalls).toHaveLength(0);
+
+      const cleanCalls = execSpy.mock.calls.filter((call: unknown[]) => {
+        const args = call[1] as string[];
+        return args.includes('clean');
+      });
+      expect(cleanCalls).toHaveLength(0);
+    });
+  });
+
+  describe('syncWorkspace source clone hygiene', () => {
+    async function runGit(cwd: string, args: string[]): Promise<string> {
+      const { stdout } = await git.execFileAsync('git', args, { cwd, timeout: 60000 });
+      return stdout.trim();
+    }
+
+    async function createClonePair(): Promise<{ clonePath: string; remotePath: string }> {
+      const remotePath = join(testDir, 'remote.git');
+      const seedPath = join(testDir, 'seed');
+      const clonePath = join(testDir, 'clone');
+
+      await runGit(testDir, ['init', '--bare', remotePath]);
+      await realMkdir(seedPath, { recursive: true });
+      await runGit(seedPath, ['init']);
+      await runGit(seedPath, ['config', 'user.email', 'archon@example.com']);
+      await runGit(seedPath, ['config', 'user.name', 'Archon Test']);
+      await writeFile(join(seedPath, 'README.md'), 'base\n');
+      await runGit(seedPath, ['add', 'README.md']);
+      await runGit(seedPath, ['commit', '-m', 'initial']);
+      await runGit(seedPath, ['branch', '-M', 'dev']);
+      await runGit(seedPath, ['remote', 'add', 'origin', remotePath]);
+      await runGit(seedPath, ['push', '-u', 'origin', 'dev']);
+      await runGit(remotePath, ['symbolic-ref', 'HEAD', 'refs/heads/dev']);
+      await runGit(testDir, ['clone', remotePath, clonePath]);
+
+      return { clonePath, remotePath };
+    }
+
+    async function revParse(cwd: string, ref: string): Promise<string> {
+      return runGit(cwd, ['rev-parse', ref]);
+    }
+
+    async function currentBranch(cwd: string): Promise<string> {
+      return runGit(cwd, ['branch', '--show-current']);
+    }
+
+    async function statusPorcelain(cwd: string): Promise<string> {
+      return runGit(cwd, ['status', '--porcelain=v1', '--untracked-files=all']);
+    }
+
+    test('clean-clone-passes', async () => {
+      const { clonePath } = await createClonePair();
+
+      await git.syncWorkspace(clonePath as git.RepoPath, 'dev' as git.BranchName, {
+        resetAfterFetch: true,
+      });
+
+      expect(await currentBranch(clonePath)).toBe('dev');
+      expect(await revParse(clonePath, 'HEAD')).toBe(await revParse(clonePath, 'origin/dev'));
+      expect(await statusPorcelain(clonePath)).toBe('');
+    });
+
+    test('dirty-untracked-clone-heals', async () => {
+      const { clonePath } = await createClonePair();
+      await writeFile(join(clonePath, 'stray.txt'), 'remove me\n');
+
+      await git.syncWorkspace(clonePath as git.RepoPath, 'dev' as git.BranchName, {
+        resetAfterFetch: true,
+      });
+
+      expect(await statusPorcelain(clonePath)).toBe('');
+    });
+
+    test('wrong-branch-clone-repins', async () => {
+      const { clonePath } = await createClonePair();
+      await runGit(clonePath, ['checkout', '-b', 'feature/source-clone-drift']);
+      await writeFile(join(clonePath, 'stray.txt'), 'remove me\n');
+
+      await git.syncWorkspace(clonePath as git.RepoPath, 'dev' as git.BranchName, {
+        resetAfterFetch: true,
+      });
+
+      expect(await currentBranch(clonePath)).toBe('dev');
+      expect(await revParse(clonePath, 'HEAD')).toBe(await revParse(clonePath, 'origin/dev'));
+      expect(await statusPorcelain(clonePath)).toBe('');
+    });
+
+    test('isolated-worktree-untouched', async () => {
+      const { clonePath } = await createClonePair();
+      await runGit(clonePath, ['checkout', '-b', 'feature/isolated-work']);
+      await writeFile(join(clonePath, 'README.md'), 'local work\n');
+      await writeFile(join(clonePath, 'scratch.txt'), 'keep me\n');
+
+      await git.syncWorkspace(clonePath as git.RepoPath, 'dev' as git.BranchName, {
+        resetAfterFetch: false,
+      });
+
+      expect(await currentBranch(clonePath)).toBe('feature/isolated-work');
+      expect(await statusPorcelain(clonePath)).toContain('M README.md');
+      expect(await statusPorcelain(clonePath)).toContain('?? scratch.txt');
     });
   });
 
