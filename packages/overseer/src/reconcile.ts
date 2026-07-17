@@ -343,7 +343,11 @@ function parseRepositoryFromUrl(url?: string): { owner: string; repo: string } |
 
 function isRateLimitError(error: unknown): boolean {
   if (!error || typeof error !== 'object') return false;
-  const candidate = error as { status?: number; message?: string; response?: { headers?: unknown } };
+  const candidate = error as {
+    status?: number;
+    message?: string;
+    response?: { headers?: unknown };
+  };
   if (candidate.status === 403 || candidate.status === 429) {
     const message = candidate.message ?? '';
     if (/rate.limit|rateLimit|rate limit|secondary rate/i.test(message)) return true;
