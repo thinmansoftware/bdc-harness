@@ -88,6 +88,16 @@ Bash node 'capture-run-scope' failed [exit 1]: run_scope_dirty_at_capture
 `derive-run-source-scope`/`ascii-gate` failing with `scope_authority_missing:
 run scope SHA is missing`.)
 
+**Cascade-tail variants (board review 2026-07-17):** the same dirty-scope
+cascade surfaces the `scope_authority_missing:` prefix at MULTIPLE nodes with
+DIFFERENT tails -- `run scope SHA is missing` (derive-run-source-scope),
+`run-authority.json` (read-spec), and `persisted run authority`
+(build-manifest). Do NOT misfile the read-spec `scope_authority_missing:
+run-authority.json` tail as a standalone Class H when it is actually the E
+cascade -- check whether an earlier `run_scope_dirty_at_capture` event exists
+in the SAME run. A standalone string match cannot infer causation; use the
+event sequence.
+
 **Root cause:** the shared source clone
 (`/.archon/workspaces/<owner>/<repo>/source`) has an untracked/dirty file, OR
 its `.git` is root-owned after a host operation ran git as root. The
@@ -179,24 +189,29 @@ repeats on the same node across runs, ESCALATE as a provider/lane health issue
 (check the lane's model capacity, e.g. GPT/Sol at limit). Do NOT treat as a
 content failure of the WO.
 
-### Class J -- Loop node exceeded max iterations / idle timeout (ESCALATE -- capability or infra)
+### Class J -- Loop node exceeded max iterations / idle timeout / WALL timeout (ESCALATE -- capability or infra)
 
-**Error substrings:**
+**Error substrings (THREE sub-signals -- board review 2026-07-17 added wall
+timeout, the MOST COMMON variant, 29 live events vs 22 idle):**
 ```
 Loop node '<implement|plan-review>' exceeded max iterations (<N>) without <completion sentinel>
 ```
-or `Loop '<node>' iteration <N> exceeded idle timeout (<ms>)`.
+or `Loop '<node>' iteration <N> exceeded idle timeout (<ms>)`
+or `Loop '<node>' iteration <N> exceeded wall timeout (<ms>)`.
 
 **Root cause:** the builder/reviewer could not converge -- either the WO is
 genuinely hard (capability failure: climb a tier via the conductor) or the node
-hung (idle timeout: an infra/provider stall, not lack of capability).
-Distinguish by which limit tripped: max-iterations = capability; idle-timeout =
-infra/stall.
+hung/ran long (idle OR wall timeout: an infra/provider stall or a workload that
+overran its time budget, not lack of capability). Distinguish by which limit
+tripped: max-iterations = capability; idle-timeout OR wall-timeout = infra/stall
+or budget overrun.
 
 **Action:** max-iterations -> re-fire THROUGH THE CONDUCTOR so the Smart
 Cauldron rung ladder climbs (direct fire re-enters at the same rung and loops
-again). idle-timeout -> check provider/lane health, then re-fire. ESCALATE if a
-capability climb to the top rung still fails -- the WO may need decomposition.
+again). idle-timeout / wall-timeout -> check provider/lane health and whether
+the workload is simply too large for the node's time budget, then re-fire.
+ESCALATE if a capability climb to the top rung still fails -- the WO may need
+decomposition.
 
 ---
 
