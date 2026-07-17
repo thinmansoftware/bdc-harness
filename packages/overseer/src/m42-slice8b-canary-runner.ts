@@ -110,7 +110,7 @@ export function createFakeM42Slice8BActionExecutor(
   overrides: Partial<Record<M42Slice8BRunnerActionName, Partial<M42Slice8BActionReceipt>>> = {}
 ): M42Slice8BActionExecutor {
   return {
-    async execute({ action, manifest }) {
+    async execute({ action, manifest }): Promise<M42Slice8BActionReceipt> {
       const executionId = `${manifest.execution_id}:${action}`;
       const base: M42Slice8BActionReceipt = {
         action,

@@ -144,7 +144,7 @@ export function verifyM42Slice8BManifest(
   if (manifest.max_window_minutes !== 60) {
     return { ok: false, reason: 'window_limit_mismatch' };
   }
-  if (manifest.no_production_effect !== true) {
+  if (!manifest.no_production_effect) {
     return { ok: false, reason: 'production_effect_not_refused' };
   }
   for (const sibling of M42_SLICE8B_REQUIRED_SIBLING_WOS) {
