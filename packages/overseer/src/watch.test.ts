@@ -23,6 +23,14 @@ const mergedPrEvidence: PullRequestEvidence = {
   pr: { owner: 'bluedevilcollectibles', repo: 'bdc-harness', number: 505 },
 };
 
+const mergeReadyPrEvidence: PullRequestEvidence = {
+  exists: true,
+  state: 'open',
+  checks: { total: 1, passed: 1, failed: 0, pending: 0 },
+  mergeable: true,
+  pr: { owner: 'bluedevilcollectibles', repo: 'bdc-harness', number: 506 },
+};
+
 const failedRun: OverseerRunRecord = {
   id: 'run-417c3299',
   woId: 'WO-HARNESS-PRECOMMIT-LINTSTAGED-YAML-DEP-FIX-01',
@@ -148,6 +156,37 @@ describe('watch selectFailureEvent', () => {
     expect(selectFailureEvent([firstFailed, secondFailed, workflowFailed])).toBe(secondFailed);
   });
 
+  test('multiple_node_failed_without_authoritative_failed_nodes_uses_latest_node_failed', () => {
+    const olderFailed = event('event-1', 'node_failed', 'older-branch', '2026-07-17T19:20:50.000Z', {
+      error: 'older branch failed',
+    });
+    const newerFailed = event('event-2', 'node_failed', 'newer-branch', '2026-07-17T19:20:52.000Z', {
+      error: 'newer branch failed',
+    });
+    const unrelatedCompleted = event(
+      'event-3',
+      'node_completed',
+      'cleanup',
+      '2026-07-17T19:20:53.000Z',
+      { output: 'cleanup complete' }
+    );
+    const workflowFailedWithoutNodes = event(
+      'event-4',
+      'workflow_failed',
+      null,
+      '2026-07-17T19:20:54.000Z',
+      {
+        error: 'DAG workflow failed',
+        failed_nodes: [],
+      }
+    );
+
+    expect(selectFailureEvent([olderFailed, newerFailed, unrelatedCompleted])).toBe(newerFailed);
+    expect(selectFailureEvent([olderFailed, newerFailed, workflowFailedWithoutNodes])).toBe(
+      newerFailed
+    );
+  });
+
   test('node_failed_already_newest_no_regression', () => {
     const nodeCompleted = event(
       'event-1',
@@ -210,5 +249,18 @@ describe('watch selectFailureEvent', () => {
 
     expect(record.action).toBe('success');
     expect(record.errorClass).toBeUndefined();
+
+    const mergeReadyThrowingDeps: OverseerRunStoreDeps & GitHubClientDeps = {
+      ...deps([]),
+      listRunEvents: async () => {
+        throw new Error('listRunEvents should not be called for merge-ready PR evidence');
+      },
+      findPullRequest: async () => mergeReadyPrEvidence,
+    };
+
+    const [mergeReadyRecord] = await watchOnce(mergeReadyThrowingDeps);
+
+    expect(mergeReadyRecord.action).toBe('merge_ready');
+    expect(mergeReadyRecord.errorClass).toBe('tail_node_false_fail');
   });
 });
