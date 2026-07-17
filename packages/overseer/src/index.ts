@@ -51,6 +51,13 @@ export type {
 } from './escalation-delivery';
 
 export { watchLoop, watchOnce, DEFAULT_WATCH_INTERVAL_MS } from './watch';
+export { runReconcileDuty, ReconcileRateLimitError, extractWoStems } from './reconcile';
+export type {
+  ReconcileDeps,
+  ReconcileDutyOptions,
+  ReconcileMergedPullRequest,
+  ReconcileTrackerIssue,
+} from './reconcile';
 export { judgePullRequest, isPrGreen, isPrMergeReady } from './judge-pr';
 export { judgeWithGrok } from './judge-second-opinion';
 export { runOverseerService } from './service';

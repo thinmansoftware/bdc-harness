@@ -19,6 +19,7 @@ import {
 } from './adapters/fake-github';
 import { readOverseerActionPolicyFromEnv } from './action-policy';
 import { permitFromMetadata } from './permit';
+import { runReconcileDuty } from './reconcile';
 import { watchLoop } from './watch';
 import type {
   GitHubClientDeps,
@@ -73,6 +74,7 @@ export interface OverseerServiceOptions {
   deliveryOwner?: string;
   deliveryChannels?: OperatorCardChannel[];
   deliveryDrain?: () => Promise<unknown>;
+  reconcileDuty?: () => Promise<void>;
 }
 
 export async function runOperatorCardDeliveryScheduler(input: {
@@ -113,6 +115,20 @@ async function waitForDeliveryInterval(milliseconds: number, signal?: AbortSigna
     signal?.addEventListener('abort', finish, { once: true });
     if (signal?.aborted) finish();
   });
+}
+
+async function runReconcileScheduler(input: {
+  signal?: AbortSignal;
+  intervalMs?: number;
+  once?: boolean;
+  duty: () => Promise<void>;
+}): Promise<void> {
+  for (;;) {
+    if (input.signal?.aborted) return;
+    await input.duty();
+    if (input.once || input.signal?.aborted) return;
+    await waitForDeliveryInterval(input.intervalMs ?? 30_000, input.signal);
+  }
 }
 
 function envEnabled(value: string | undefined): boolean {
@@ -271,6 +287,7 @@ export async function runOverseerService(options: OverseerServiceOptions = {}): 
   }
   const deps = options.deps ?? resolveDefaultDeps();
   const adapter = createDefaultFakeGitHubAdapter();
+  const reconcileDuty = options.reconcileDuty ?? (options.deps ? undefined : runReconcileDuty);
   const coupledAbort = new AbortController();
   const abortFromParent = (): void => {
     coupledAbort.abort();
@@ -286,12 +303,21 @@ export async function runOverseerService(options: OverseerServiceOptions = {}): 
       signal: coupledAbort.signal,
     }
   );
+  const reconcile = reconcileDuty
+    ? runReconcileScheduler({
+        signal: coupledAbort.signal,
+        intervalMs: options.intervalMs,
+        once: options.once,
+        duty: reconcileDuty,
+      })
+    : undefined;
   if (!options.deliveryEnabled) {
     try {
-      await watcher;
+      await Promise.all([watcher, reconcile].filter(task => task !== undefined));
       return;
     } finally {
       coupledAbort.abort();
+      if (reconcile) await Promise.allSettled([reconcile]);
       options.signal?.removeEventListener('abort', abortFromParent);
     }
   }
@@ -312,10 +338,16 @@ export async function runOverseerService(options: OverseerServiceOptions = {}): 
     }
   };
   try {
-    await Promise.all([abortOnFailure(watcher), abortOnFailure(delivery)]);
+    await Promise.all(
+      [watcher, delivery, reconcile]
+        .filter(task => task !== undefined)
+        .map(task => abortOnFailure(task))
+    );
   } finally {
     coupledAbort.abort();
-    await Promise.allSettled([watcher, delivery]);
+    await Promise.allSettled(
+      [watcher, delivery, reconcile].filter(task => task !== undefined)
+    );
     options.signal?.removeEventListener('abort', abortFromParent);
   }
 }
