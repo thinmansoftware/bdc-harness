@@ -22,7 +22,8 @@ export interface M42Slice8BEvidencePacket {
   readonly schema_version: 'm42-slice8b-evidence-packet-v1';
   readonly status: typeof M42_SLICE8B_PACKET_STATUS;
   readonly runtime_honesty_verdict:
-    'RUNTIME_HEALTHY' | typeof M42_SLICE8B_RUNTIME_NOT_READY_VERDICT;
+    | 'RUNTIME_HEALTHY'
+    | typeof M42_SLICE8B_RUNTIME_NOT_READY_VERDICT;
   readonly candidate_sha: string;
   readonly image_digest: string;
   readonly corrective_wo_merge_ancestors: Readonly<Record<string, string>>;
