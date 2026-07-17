@@ -64,6 +64,16 @@ interface PollOptions {
   timeoutMs?: number;
   /** Poll interval (ms). Default: 30000 (30 seconds). */
   intervalMs?: number;
+  /**
+   * Retries for the PR-URL lookup when a run reports "completed" but no
+   * open-pr node event is visible yet (event feed can lag the status flip --
+   * anchor 2026-07-17 WO-HARNESS-WORKTREE-ORPHAN-QUARANTINE-01: gate declared
+   * "no PR opened" ~6s after completion while PR #488 existed, causing a tier
+   * climb and a duplicate build). Default: 3.
+   */
+  prRetryAttempts?: number;
+  /** Delay between PR-URL lookup retries (ms). Default: 10000 (10 seconds). */
+  prRetryDelayMs?: number;
 }
 
 /**
@@ -79,6 +89,8 @@ export async function pollForTerminal(opts: PollOptions): Promise<PollResult> {
     token: tokenOverride,
     timeoutMs = 1_800_000,
     intervalMs = 30_000,
+    prRetryAttempts = 3,
+    prRetryDelayMs = 10_000,
   } = opts;
   const token = tokenOverride ?? process.env.ARCHON_OPERATOR_TOKEN ?? '';
 
@@ -93,10 +105,29 @@ export async function pollForTerminal(opts: PollOptions): Promise<PollResult> {
         | 'failed'
         | 'escalated'
         | 'cancelled';
-      const events = detail.events ?? [];
+      let events = detail.events ?? [];
 
-      const validatorVerdict = extractValidatorVerdict(events);
-      const prUrl = extractPrUrl(events);
+      let validatorVerdict = extractValidatorVerdict(events);
+      let prUrl = extractPrUrl(events);
+
+      // Race guard: run status can flip to "completed" before the
+      // open-pr-if-needed node event lands in the event feed. A single read
+      // taken in that window sees no PR and the gate false-negatives into a
+      // tier climb. Re-read the run events with backoff before concluding
+      // that no PR was opened.
+      if (terminalStatus === 'completed' && prUrl === null) {
+        for (let attempt = 0; attempt < prRetryAttempts && prUrl === null; attempt++) {
+          await new Promise<void>(resolve => setTimeout(resolve, prRetryDelayMs));
+          const retryDetail = await fetchRunDetail(runId, apiBaseUrl, token);
+          events = retryDetail.events ?? [];
+          prUrl = extractPrUrl(events);
+          // The validator event can lag for the same reason -- refresh it too.
+          if (validatorVerdict === 'unknown') {
+            validatorVerdict = extractValidatorVerdict(events);
+          }
+        }
+      }
+
       const prMergeable = prUrl ? await checkPrMergeable(prUrl) : null;
       const servedModelId = extractServedModelId(detail.run.metadata ?? {});
 
