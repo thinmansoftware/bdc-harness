@@ -104,9 +104,9 @@ describe('Fusion M-42 budget authorization and receipts', () => {
     );
 
     expect(results.filter(result => result.ok)).toHaveLength(6);
-    expect(results.filter(result => !result.ok && result.code === 'budget_cap_exceeded')).toHaveLength(
-      4
-    );
+    expect(
+      results.filter(result => !result.ok && result.code === 'budget_cap_exceeded')
+    ).toHaveLength(4);
     const rows = await ledgerRows();
     expect(rows).toHaveLength(6);
     expect(rows.reduce((sum, row) => sum + row.requested_microusd, 0)).toBe(18_000_000);
