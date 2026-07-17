@@ -51,7 +51,12 @@ export async function closeSandboxPullRequest(
       actionKind: 'CLOSE',
       capability: 'lifecycle',
     });
-    return { ...prepared.result, accepted: false, reason: 'salvage_failed', reopen_recipe: reopenRecipe };
+    return {
+      ...prepared.result,
+      accepted: false,
+      reason: 'salvage_failed',
+      reopen_recipe: reopenRecipe,
+    };
   }
   const prepared = await prepareSandboxMutation(input.context, input.permit, {
     adapter: 'sandbox-close',

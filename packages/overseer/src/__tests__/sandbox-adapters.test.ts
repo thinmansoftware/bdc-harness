@@ -1,7 +1,14 @@
 import { describe, expect, test } from 'bun:test';
 import { createHash } from 'node:crypto';
-import type { OverseerCapability, OverseerCapabilityState } from '@archon/core/db/overseer-capabilities';
-import type { M31ActionKind, M31ActionPermitV2, M31ActionProposalV2 } from '@archon/core/db/m31-target-v2';
+import type {
+  OverseerCapability,
+  OverseerCapabilityState,
+} from '@archon/core/db/overseer-capabilities';
+import type {
+  M31ActionKind,
+  M31ActionPermitV2,
+  M31ActionProposalV2,
+} from '@archon/core/db/m31-target-v2';
 import { closeSandboxPullRequest } from '../adapters/sandbox-close';
 import { mergeSandboxPullRequest } from '../adapters/sandbox-merge';
 import { refreshSandboxPullRequest } from '../adapters/sandbox-refresh';
@@ -31,7 +38,10 @@ function capabilityFor(actionKind: M31ActionKind): OverseerCapability {
   return 'lifecycle';
 }
 
-function registryFor(actionKind: M31ActionKind, repository = REPOSITORY): OverseerActionPolicyRegistry {
+function registryFor(
+  actionKind: M31ActionKind,
+  repository = REPOSITORY
+): OverseerActionPolicyRegistry {
   const tuple = {
     owner: OWNER,
     repository,
@@ -355,7 +365,9 @@ describe('sandbox GitHub mutation adapters', () => {
         },
       },
     });
-    expect((await mergeSandboxPullRequest(duplicate.context, duplicate.permit)).accepted).toBe(true);
+    expect((await mergeSandboxPullRequest(duplicate.context, duplicate.permit)).accepted).toBe(
+      true
+    );
     expect(duplicate.calls()).toBe(1);
     expect((await mergeSandboxPullRequest(duplicate.context, duplicate.permit)).reason).toBe(
       'execution_replayed'
@@ -364,7 +376,9 @@ describe('sandbox GitHub mutation adapters', () => {
 
     const conflicting = context('MERGE');
     const conflictPermit = { ...conflicting.permit, action_kind: 'REFRESH' as const };
-    expect((await mergeSandboxPullRequest(conflicting.context, conflictPermit)).accepted).toBe(false);
+    expect((await mergeSandboxPullRequest(conflicting.context, conflictPermit)).accepted).toBe(
+      false
+    );
     expect(conflicting.calls()).toBe(0);
   });
 

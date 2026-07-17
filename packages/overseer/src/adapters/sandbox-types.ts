@@ -261,7 +261,11 @@ export async function prepareSandboxMutation(
   permit: M31ActionPermitV2,
   options: SandboxAdapterOptionsV1
 ): Promise<
-  | { readonly ok: true; readonly prepared: SandboxPreparedMutationV1; readonly result: SandboxActionResultV1 }
+  | {
+      readonly ok: true;
+      readonly prepared: SandboxPreparedMutationV1;
+      readonly result: SandboxActionResultV1;
+    }
   | { readonly ok: false; readonly result: SandboxActionResultV1 }
 > {
   if (context.mode !== 'sandbox') {
@@ -271,9 +275,14 @@ export async function prepareSandboxMutation(
     return { ok: false, result: baseResult(context, permit, options, 'authorization_not_carried') };
   }
   if (!repositoryIdentityMatches(context)) {
-    return { ok: false, result: baseResult(context, permit, options, 'repository_identity_mismatch') };
+    return {
+      ok: false,
+      result: baseResult(context, permit, options, 'repository_identity_mismatch'),
+    };
   }
-  if (context.target_classifications.some(classification => PROTECTED_TARGETS.has(classification))) {
+  if (
+    context.target_classifications.some(classification => PROTECTED_TARGETS.has(classification))
+  ) {
     return { ok: false, result: baseResult(context, permit, options, 'protected_target') };
   }
   if (context.action_policy_registry_digest !== context.expected_action_policy_registry_digest) {
@@ -302,7 +311,10 @@ export async function prepareSandboxMutation(
     credential_principal: context.credential_principal,
   });
   if (!policyEntry) {
-    return { ok: false, result: baseResult(context, permit, options, 'repository_not_allowlisted') };
+    return {
+      ok: false,
+      result: baseResult(context, permit, options, 'repository_not_allowlisted'),
+    };
   }
   if (policyEntry.policy_digest !== context.expected_policy_digest) {
     return { ok: false, result: baseResult(context, permit, options, 'policy_digest_mismatch') };
@@ -320,7 +332,10 @@ export async function prepareSandboxMutation(
       context.authorization_deps
     );
   } catch {
-    return { ok: false, result: baseResult(context, permit, options, 'authorization_boundary_failed') };
+    return {
+      ok: false,
+      result: baseResult(context, permit, options, 'authorization_boundary_failed'),
+    };
   }
   if (!authorization.allowed) {
     return {
@@ -362,9 +377,7 @@ export async function prepareSandboxMutation(
   };
 }
 
-export function providerIndeterminateResult(
-  result: SandboxActionResultV1
-): SandboxActionResultV1 {
+export function providerIndeterminateResult(result: SandboxActionResultV1): SandboxActionResultV1 {
   return {
     ...result,
     accepted: false,
