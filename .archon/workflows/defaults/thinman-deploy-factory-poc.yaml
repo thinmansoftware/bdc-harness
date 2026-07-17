@@ -1,7 +1,7 @@
 name: bdc-thinman-deploy-factory-poc
 description: Thinman-first Cauldron deployment factory POC with Terraform plan, approval gates, preview deploy, and evidence manifest.
 provider: codex
-model: gpt-5.5
+model: gpt-5.6-sol
 interactive: true
 target_repo: bluedevilcollectibles/thinman-freight
 worktree:

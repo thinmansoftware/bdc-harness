@@ -203,7 +203,7 @@ nodes:
     # glm/qwen (OpenRouter). Model-free -opr persona = safe failover to codex (no
     # Anthropic pin risk). Matches fusion-cx-qwen lane precedent.
     failover_provider: codex
-    failover_model: gpt-5.5
+    failover_model: gpt-5.6-sol
     depends_on: [gate-already-satisfied]
     when: "$gate-already-satisfied.output.ALREADY_SATISFIED != 'true'"
     agent: war-council-architect-opr
@@ -414,7 +414,7 @@ nodes:
     # wired -- a gate that silently switches models undermines gate integrity
     # (spec doctrine, matches fusion-cx-qwen lane precedent).
     failover_provider: codex
-    failover_model: gpt-5.5
+    failover_model: gpt-5.6-sol
     depends_on: [capture-run-scope]
     trigger_rule: all_done
     when: "$gate-already-satisfied.output.ALREADY_SATISFIED != 'true'"
@@ -1153,7 +1153,7 @@ nodes:
     # OpenRouter local-tool-loop provider. Fail sideways to Codex once
     # on availability errors, never on review/judge seats.
     failover_provider: codex
-    failover_model: gpt-5.5
+    failover_model: gpt-5.6-sol
     depends_on: [diff-review, classify-diff-review]
     when: "$classify-diff-review.output.verdict == 'needs_revision'"
     task_class: medium_work
@@ -1393,7 +1393,7 @@ nodes:
     # WO-HARNESS-NODE-PROVIDER-FAILOVER-01: last-chance repair builder on
     # OpenRouter local-tool-loop provider. Same rationale as `implement`/`diff-repair` above.
     failover_provider: codex
-    failover_model: gpt-5.5
+    failover_model: gpt-5.6-sol
     depends_on: [block-classify]
     when: "$block-classify.output.status == 'BLOCKED'"
     prompt: |

@@ -1306,10 +1306,10 @@ describe('CodexProvider', () => {
         'Model "gpt-5.3-codex" is not available for your account'
       );
       // PR #165 repointed CODEX_MODEL_FALLBACKS['gpt-5.3-codex'] to
-      // CODEX_DEFAULT_MODEL ('gpt-5.5'); this assertion was stale and failed
+      // CODEX_DEFAULT_MODEL ('gpt-5.6-sol'); this assertion was stale and failed
       // against live code -- re-aligned by
       // WO-HARNESS-CODEX-THREAD-RESUME-AND-FAILBACK-01 (test file is in scope).
-      await expect(consumeGenerator()).rejects.toThrow('model: gpt-5.5');
+      await expect(consumeGenerator()).rejects.toThrow('model: gpt-5.6-sol');
     });
 
     test('uses generic dashboard guidance when fallback mapping is unknown', async () => {
@@ -1977,15 +1977,15 @@ describe('WO-HARNESS-CODEX-THREAD-RESUME-AND-FAILBACK-01', () => {
     });
 
     const requestOptions = {
-      model: 'gpt-5.5',
-      fallbackModel: 'gpt-5.5',
+      model: 'gpt-5.6-sol',
+      fallbackModel: 'gpt-5.6-sol',
       nodeConfig: {
-        fallbackModel: 'gpt-5.5',
+        fallbackModel: 'gpt-5.6-sol',
         agents: {
           'codex-adversarial-reviewer': {
             description: 'reviewer',
             prompt: 'review the diff',
-            model: 'gpt-5.5',
+            model: 'gpt-5.6-sol',
             tools: ['read'],
           },
         },
@@ -2040,7 +2040,7 @@ describe('WO-HARNESS-CODEX-THREAD-RESUME-AND-FAILBACK-01', () => {
   // Codex review (2026-06-10, needs_revision -> resolved): the failback
   // path used to forward `requestOptions` UNCHANGED to the Claude failback
   // provider. That leaked Codex/OpenAI model ids (e.g. `gpt-5.3-codex`,
-  // `gpt-5.5`) into Claude's option builder, which uses
+  // `gpt-5.6-sol`) into Claude's option builder, which uses
   // `requestOptions?.model ?? assistantDefaults.model` directly -- a Codex
   // model id sent to Claude is rejected by the SDK and the failback
   // collapses into an immediate error, defeating the entire "keep the
@@ -2092,7 +2092,7 @@ describe('WO-HARNESS-CODEX-THREAD-RESUME-AND-FAILBACK-01', () => {
       env: { FOO: 'bar' },
       nodeConfig: { output_format: { type: 'object' } },
       assistantConfig: {
-        model: 'gpt-5.5',
+        model: 'gpt-5.6-sol',
         modelReasoningEffort: 'medium' as const,
         webSearchMode: 'live' as const,
       },
@@ -2126,7 +2126,7 @@ describe('WO-HARNESS-CODEX-THREAD-RESUME-AND-FAILBACK-01', () => {
     const serialized = JSON.stringify(opts);
     expect(serialized).not.toContain('gpt-5.3-codex');
     expect(serialized).not.toContain('gpt-5.2-codex');
-    expect(serialized).not.toContain('gpt-5.5');
+    expect(serialized).not.toContain('gpt-5.6-sol');
 
     // Universal-ish fields MUST survive -- dropping them would degrade the
     // failback further than necessary.

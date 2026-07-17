@@ -82,9 +82,9 @@ async function getCodex(configCodexBinaryPath?: string): Promise<Codex> {
 // The live, API-supported Codex frontier model. Used as the explicit default when
 // no model is resolved from the node/config, so the Codex SDK never falls back to its
 // own stale account default (gpt-5.3-codex), which the ChatGPT-account API rejects (400).
-// Verified live against the container's models_cache.json 2026-06-02 (slug "gpt-5.5",
-// supported_in_api: true). Update this one constant if the account's frontier model changes.
-const CODEX_DEFAULT_MODEL = 'gpt-5.5';
+// Verified live with codex-cli 0.144.5 on 2026-07-17 (slug "gpt-5.6-sol").
+// Update this one constant if the account's frontier model changes.
+const CODEX_DEFAULT_MODEL = 'gpt-5.6-sol';
 
 const ANTHROPIC_MODEL_ALIASES: ReadonlySet<string> = new Set([
   'sonnet',
@@ -125,10 +125,9 @@ function buildThreadOptions(
   // pin a known-good live Codex model EXPLICITLY rather than letting the Codex SDK
   // fall back to its own account default -- that default is the stale `gpt-5.3-codex`,
   // which the ChatGPT-account API now rejects with HTTP 400 ("model is not supported").
-  // CODEX_DEFAULT_MODEL is the live, API-supported frontier model (verified against the
-  // container's models_cache.json 2026-06-02). This is the single chokepoint every
-  // codex call flows through, so fixing it here fixes every workflow lane at once --
-  // no per-node/per-YAML model pin required.
+  // CODEX_DEFAULT_MODEL is the live, API-supported frontier model. This is the
+  // single chokepoint every codex call flows through, so fixing it here fixes
+  // unpinned workflow calls at once.
   const resolvedModel = candidateAfterAliasDrop ?? CODEX_DEFAULT_MODEL;
   return {
     workingDirectory: cwd,
@@ -263,7 +262,7 @@ function classifyCodexError(
  * fields would immediately fail Claude:
  *
  *   - `model`           Codex/OpenAI model id (e.g. `gpt-5.3-codex`,
- *                       `gpt-5.5`). Claude's option builder uses
+ *                       `gpt-5.6-sol`). Claude's option builder uses
  *                       `requestOptions?.model ?? assistantDefaults.model`
  *                       directly, so a Codex model name would be passed
  *                       to the Claude SDK and rejected -- collapsing the
@@ -278,7 +277,7 @@ function classifyCodexError(
  *                       fields but, critically, it ALSO reads `model`
  *                       from `assistantConfig` -- so even after dropping
  *                       the top-level `model`, leaving `assistantConfig`
- *                       intact would let a `codex.model: 'gpt-5.5'` leak
+ *                       intact would let a `codex.model: 'gpt-5.6-sol'` leak
  *                       back in via the Codex config bag. Drop the whole
  *                       config bag so Claude resolves its own defaults
  *                       from its own config section.

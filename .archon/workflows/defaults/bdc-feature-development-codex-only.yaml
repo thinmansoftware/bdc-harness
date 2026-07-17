@@ -1,6 +1,6 @@
 name: bdc-feature-development-codex-only
 description: |
-  ZERO-CLAUDE Codex lane. All prompt seats on Codex (gpt-5.5). Use when Claude
+  ZERO-CLAUDE Codex lane. All prompt seats on Codex (gpt-5.6-sol). Use when Claude
   usage is exhausted but OpenAI/Codex quota remains. Model-free *-opr / *-codex
   personas only (F1 invariant). Not dual-cap (still needs Codex).
 
@@ -14,10 +14,10 @@ run_authority:
     - docs/work-orders/{WO_ID}.md
     - docs/superpowers/specs/{WO_ID}.md
   allow_issue_fallback: true
-# Codex build lane: Codex/gpt-5.5 is the build default. war-council-validator is
+# Codex build lane: Codex/gpt-5.6-sol is the build default. war-council-validator is
 # pinned to claude/sonnet on the node. WO-HARNESS-SMART-CAULDRON-LANE-ROSTER-AND-RESILIENCE-01.
 provider: codex
-model: gpt-5.5
+model: gpt-5.6-sol
 
 nodes:
   # Pre-flight: fail closed if container lacks GITHUB auth (WO-169, 2026-05-16).
@@ -403,7 +403,7 @@ nodes:
   - id: implement
     idle_timeout: 600000
     provider: codex
-    model: gpt-5.5
+    model: gpt-5.6-sol
     depends_on: [capture-run-scope]
     trigger_rule: all_done
     when: "$gate-already-satisfied.output.ALREADY_SATISFIED != 'true'"
@@ -1139,7 +1139,7 @@ nodes:
 
   - id: diff-repair
     provider: codex
-    model: gpt-5.5
+    model: gpt-5.6-sol
     depends_on: [diff-review, classify-diff-review]
     when: "$classify-diff-review.output.verdict == 'needs_revision'"
     task_class: medium_work
@@ -1374,7 +1374,7 @@ nodes:
   # resolve the block, then signals. If it can't fix, the run proceeds to the human pause.
   - id: opus-repair
     provider: codex
-    model: gpt-5.5
+    model: gpt-5.6-sol
     depends_on: [block-classify]
     when: "$block-classify.output.status == 'BLOCKED'"
     prompt: |
