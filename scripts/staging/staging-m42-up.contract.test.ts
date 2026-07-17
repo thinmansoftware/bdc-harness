@@ -152,6 +152,9 @@ describe('staging-overseer-integration contract', () => {
     expect(src.includes('/home/appuser/.grok/auth.json')).toBe(true);
     // Must not only assign empty arrays without probing
     expect(src.includes('credential_env_present   = @()') && !src.includes('printenv')).toBe(false);
+    // PowerShell 5.1 treats `return ,$emptyStringArray` as one array object,
+    // which makes the fail-closed caller report a false credential finding.
+    expect(src.includes('return ,$present.ToArray()')).toBe(false);
   });
 
   test('rejects fabricated m42-image digest fallback; requires real sha256:64', () => {

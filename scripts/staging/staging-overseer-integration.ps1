@@ -214,7 +214,7 @@ function Get-CredentialEnvPresent {
       $present.Add($key) | Out-Null
     }
   }
-  return ,$present.ToArray()
+  return $present.ToArray()
 }
 
 function Get-CredentialFilesPresent {
@@ -225,7 +225,7 @@ function Get-CredentialFilesPresent {
       $present.Add($path) | Out-Null
     }
   }
-  return ,$present.ToArray()
+  return $present.ToArray()
 }
 
 $credEnvPresent = @(Get-CredentialEnvPresent)
