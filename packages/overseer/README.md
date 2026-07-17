@@ -12,10 +12,10 @@ Replaces the pattern of bolting smart-failure-handling into each persona prompt 
 
 ## What this is NOT (yet)
 
-- **No LLM proxy** — Cauldron still calls Anthropic SDK directly. Provider failover deferred to Overseer v2.
-- **No grader integration** — bdc-wo-grader workflow is its own thing.
-- **No persistence** — decisions are not logged to `bdc_harness_events` yet. Add when v2 ships.
-- **No HTTP server** — pure in-process TypeScript, no sidecar.
+- **No LLM proxy** - Cauldron still calls Anthropic SDK directly. Provider failover deferred to Overseer v2.
+- **No grader integration** - bdc-wo-grader workflow is its own thing.
+- **No persistence** - decisions are not logged to `bdc_harness_events` yet. Add when v2 ships.
+- **No HTTP server** - pure in-process TypeScript, no sidecar.
 
 ## API
 
@@ -28,7 +28,7 @@ const errorClass = classifyError({
   nodeId: "verify-build",
   exitCode: 127,
 });
-// → "npm_not_found"
+// -> "npm_not_found"
 
 // 2. Decide what to do
 const result = decide({
@@ -37,7 +37,7 @@ const result = decide({
   hasOutput: false,
   nodeId: "verify-build",
 });
-// → { decision: "skip", reason: "node uses npm/npx/pnpm/yarn but container is bun-only..." }
+// -> { decision: "skip", reason: "node uses npm/npx/pnpm/yarn but container is bun-only..." }
 ```
 
 ## Recognized error classes
@@ -55,7 +55,7 @@ const result = decide({
 | `branch_ref_missing` | git: "couldn't find remote ref" |
 | `spec_lookup_failed` | read-spec node + "Spec not found" |
 | `verify_pre_existing` | verify-* node + non-zero exit |
-| `unknown` | Fallback — escalates by default |
+| `unknown` | Fallback - escalates by default |
 
 ## Decisions
 
@@ -126,14 +126,20 @@ bun test
 - Wire into `dag-executor.ts` per integration shape above
 - Add `bdc_harness_events` Supabase logging (table already exists, see `overlord/migrations/`)
 - Add Mission Control "Workflow Decisions" dashboard tab
-- LLM proxy with provider failover (Anthropic ↔ OpenAI via `routing.yaml` config)
+- LLM proxy with provider failover (Anthropic <-> OpenAI via `routing.yaml` config)
 - Grader integration for WO completion verdicts
 - Per-WO-class override rules (e.g. engine WOs require stricter retries)
 
 ## Why a new TS package vs the existing Python overlord
 
-The existing `overlord/` Python package (router.py, grader/, dispatcher.py) was built 2026-05-09 for a BDC-native harness that never shipped. When BDC adopted Archon (forked as bdc-harness), the Python Overlord became orphaned — it has no integration path into Cauldron's bun-only runtime.
+The existing `overlord/` Python package (router.py, grader/, dispatcher.py) was built 2026-05-09 for a BDC-native harness that never shipped. When BDC adopted Archon (forked as bdc-harness), the Python Overlord became orphaned - it has no integration path into Cauldron's bun-only runtime.
 
 This TS package implements the load-bearing slice (error classification + decisions) in the same runtime, avoiding cross-language friction. The Python Overlord's design authority survives; the implementation is fresh.
 
-Per John 2026-05-16: "we didn't have a harness" — the original Overlord was waiting for its time. This package is that time, scoped down to the minimum that prevents today's failure modes.
+Per John 2026-05-16: "we didn't have a harness" - the original Overlord was waiting for its time. This package is that time, scoped down to the minimum that prevents today's failure modes.
+
+## M-42 Slice 8B real-canary runner
+
+`src/m42-slice8b-canary-runner.ts` is the non-interactive, frozen-manifest-bound runner for the M-42 Slice 8B four-action workload. It is build-ready only: fake execution and negative-path proof are supported here, while sandbox mutation and paid Fusion remain blocked unless a later Gate-2/M-66 authorization artifact is present.
+
+The unsigned packet builder in `src/m42-slice8b-evidence-packet.ts` emits `READY_FOR_SANDBOX_PROOF_REQUEST` and records `BUILD_READY_NOT_RUNTIME_READY` when no healthy audited Overseer process is running. That packet status asserts build readiness only; it is not activation or production readiness.
