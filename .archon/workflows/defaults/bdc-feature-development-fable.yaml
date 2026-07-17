@@ -652,7 +652,7 @@ nodes:
   # Distinguishes three post-implement states from the ASSIGNED worktree's own state:
   #   REAL_BUILD       -- worktree has changes / commits ahead -> proceed to review chain
   #   ALREADY_SATISFIED-- implement said ALREADY_SATISFIED + worktree genuinely clean -> emit
-  #                       BUILD_OUTCOME=ALREADY_SATISFIED so review-issue records verified-no-op
+  #                       BUILD_OUTCOME=ALREADY_SATISFIED so flip-notion records verified-no-op
   #   FALSE_COMPLETE   -- implement emitted COMPLETE/BUILD_COMPLETE but worktree shows ZERO
   #                       real changes (the fraud 04daeafc committed) -> emit
   #                       BUILD_OUTCOME=FALSE_COMPLETE (the commit-and-push gate turns this
@@ -2525,7 +2525,9 @@ nodes:
   # WO-HARNESS-CAULDRON-PR-MANIFEST-AUTOFILL-01: write the v2-label manifest INTO
   # the PR body so the manifest-validate CI gate (bdc-ci/scripts/validate-pr-manifest.sh)
   # finds it. The PR is opened BEFORE the manifest is built, so the stub body must be
-  # patched after build-manifest runs before review-issue updates GitHub WO issue labels.
+  # patched after build-manifest runs. Runs concurrently with flip-notion: both depend
+  # only on build-manifest, so Notion still receives the manifest even if PR-body
+  # patching fails (regression scenario 7 in the WO spec).
   - id: patch-pr-body
     persona: major-build
     depends_on: [build-manifest]

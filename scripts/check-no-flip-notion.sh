@@ -25,16 +25,12 @@ fi
 # intentionally excludes bdc-harness-wo-onramp.yaml and one-off WO archive YAMLs.
 ACTIVE_LANES=(
   bdc-feature-development.yaml
-  bdc-feature-development-codex.yaml
-  bdc-feature-development-codex-only.yaml
-  bdc-feature-development-fable.yaml
+  bdc-feature-development-grok.yaml
   bdc-audit-claude.yaml
   bdc-bug-fix.yaml
   bdc-cleanup-sweep.yaml
   bdc-doctrine-update.yaml
   bdc-author-wo-batch.yaml
-  bdc-multi-stage-development.yaml
-  bdc-feature-development-grok.yaml
 )
 
 VIOLATIONS=""
