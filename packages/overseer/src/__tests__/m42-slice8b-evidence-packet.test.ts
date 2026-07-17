@@ -60,7 +60,7 @@ function runnerReceipt(): M42Slice8BRunnerReceipt {
     provider_call_count: 0,
     fake_provider_call_count: 5,
     fusion_call_count: 0,
-    fake_fusion_logic_count: 15,
+    fake_fusion_logic_count: 10,
     production_mutation_count: 0,
     m31_receipt_count: 5,
     provider_receipt_count: 5,
@@ -121,7 +121,7 @@ describe('M-42 Slice 8B evidence packet', () => {
     expect(packet.no_paid_fusion_call).toBe(true);
     expect(packet.no_paid_fusion_call_observation).toEqual({
       paid_fusion_call_count: 0,
-      fake_fusion_logic_count: 15,
+      fake_fusion_logic_count: 10,
     });
     expect(packet.no_production_mutation).toBe(true);
     expect(packet.no_production_mutation_observation).toEqual({

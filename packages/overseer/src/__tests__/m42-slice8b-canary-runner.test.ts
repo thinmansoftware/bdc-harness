@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test';
 import {
   InMemoryM42Slice8BExecutionStore,
   createFakeM42Slice8BActionExecutor,
+  parseM42Slice8BProcessSnapshot,
   runM42Slice8BCanary,
   type M42Slice8BActionExecutor,
   type M42Slice8BActionReceipt,
@@ -98,7 +99,7 @@ describe('M-42 Slice 8B canary runner scenarios', () => {
     expect(receipt.rollback_verified).toBe(true);
     expect(receipt.provider_call_count).toBe(0);
     expect(receipt.fake_provider_call_count).toBe(5);
-    expect(receipt.fake_fusion_logic_count).toBe(15);
+    expect(receipt.fake_fusion_logic_count).toBe(10);
     expect(receipt.production_mutation_count).toBe(0);
     expect(receipt.m31_receipt_count).toBe(5);
     expect(receipt.provider_receipt_count).toBe(5);
@@ -227,6 +228,40 @@ describe('M-42 Slice 8B canary runner scenarios', () => {
     expect(receipt.fusion_call_count).toBe(0);
     expect(receipt.fake_fusion_logic_count).toBe(3);
     expect(receipt.receipts[0]?.sibling_module).toBe('fusion/authorization');
+  });
+
+  test('unexpected action receipt is counted from observed execution evidence', async () => {
+    const executor = recordingExecutor({ REFRESH: { action: 'REOPEN_ROLLBACK' } });
+    const receipt = await runM42Slice8BCanary(envelope(), deps(executor.actions));
+    expect(receipt.ok).toBe(false);
+    expect(receipt.stop_reason).toBe('action_refused');
+    expect(receipt.unexpected_action_count).toBe(1);
+    expect(receipt.receipts.map(r => r.action)).toEqual(['REFIRE', 'REOPEN_ROLLBACK']);
+  });
+
+  test('process snapshot parser observes running Overseer service commands only', () => {
+    const processes = parseM42Slice8BProcessSnapshot(
+      [
+        '100 30 bun run overseer:serve',
+        '101 40 bun packages/overseer/src/service.ts',
+        '102 50 bun packages/overseer/src/m42-slice8b-canary-runner.ts --manifest fixture.json',
+      ].join('\n'),
+      1_000_000
+    );
+    expect(processes).toEqual([
+      {
+        pid: 100,
+        started_at_ms: 970_000,
+        healthy: true,
+        command: 'bun run overseer:serve',
+      },
+      {
+        pid: 101,
+        started_at_ms: 960_000,
+        healthy: true,
+        command: 'bun packages/overseer/src/service.ts',
+      },
+    ]);
   });
 
   test('Cauldron admission uncertainty does not create a blind second run', async () => {

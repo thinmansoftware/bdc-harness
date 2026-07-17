@@ -1,6 +1,8 @@
 import { readFile } from 'node:fs/promises';
 import { hostname } from 'node:os';
 import { createHash } from 'node:crypto';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import type {
   FusionBudgetReservation,
   OverseerVerifierRegistry,
@@ -53,9 +55,14 @@ import {
   type M42Slice8BPrimaryAction,
 } from './m42-slice8b-manifest';
 import { enforceM42Slice8BGate1 } from './m42-slice8b-gate1';
-import { assessM42Slice8BProcessHealth } from './m42-slice8b-process-health';
+import {
+  assessM42Slice8BProcessHealth,
+  type M42Slice8BProcessSnapshot,
+} from './m42-slice8b-process-health';
 import { computePolicyTupleDigest, type OverseerActionPolicyRegistry } from './policy-registry';
 import type { FusionAuthorizationRequestV1 } from '../../fusion/src/types';
+
+const execFileAsync = promisify(execFile);
 
 export type M42Slice8BRunnerActionName = M42Slice8BPrimaryAction | 'REOPEN_ROLLBACK';
 export type M42Slice8BRunnerStopReason =
@@ -400,9 +407,10 @@ async function exerciseFusionBudgetAuthorizationReceiptPath(
           entries: [],
         } as OverseerVerifierRegistry)
       : { ok: true as const };
+  const invokedAuthorizationLogic = options.fusionRawDissent === '';
   return {
     ok: budget.ok && authorization.ok && receiptDigest.length === 64,
-    logic_count: 3,
+    logic_count: 2 + (invokedAuthorizationLogic ? 1 : 0),
     module: authorization.ok ? 'fusion/budget+receipts+authorization' : 'fusion/authorization',
   };
 }
@@ -776,17 +784,43 @@ export async function runM42Slice8BCanary(
     repository_full_name: deps.expected_repository_full_name,
     provider_repository_id: deps.expected_provider_repository_id,
   });
-  if (!verified.ok) return stopped(null, 'manifest_refused', [], [], [], false);
+  if (!verified.ok) return stopped(null, 'manifest_refused', [], [], [], [], false);
 
   const gate1 = enforceM42Slice8BGate1(verified.manifest, { nowMs: deps.nowMs });
-  if (!gate1.ok) return stopped(verified.manifest.execution_id, 'gate1_refused', [], [], [], false);
+  if (!gate1.ok) {
+    return stopped(
+      verified.manifest.execution_id,
+      'gate1_refused',
+      verified.manifest.expected_primary_actions,
+      [],
+      [],
+      [],
+      false
+    );
+  }
 
   const begin = await deps.executionStore.begin(verified.manifest.execution_id, verified.digest);
   if (begin === 'duplicate') {
-    return stopped(verified.manifest.execution_id, 'execution_duplicate', [], [], [], false);
+    return stopped(
+      verified.manifest.execution_id,
+      'execution_duplicate',
+      verified.manifest.expected_primary_actions,
+      [],
+      [],
+      [],
+      false
+    );
   }
   if (begin === 'conflict') {
-    return stopped(verified.manifest.execution_id, 'execution_conflict', [], [], [], false);
+    return stopped(
+      verified.manifest.execution_id,
+      'execution_conflict',
+      verified.manifest.expected_primary_actions,
+      [],
+      [],
+      [],
+      false
+    );
   }
 
   const startedAt = deps.nowMs();
@@ -800,6 +834,7 @@ export async function runM42Slice8BCanary(
       const receipt = stopped(
         verified.manifest.execution_id,
         'window_exceeded',
+        verified.manifest.expected_primary_actions,
         attempted,
         rollbackActions,
         receipts,
@@ -812,10 +847,24 @@ export async function runM42Slice8BCanary(
     const receipt = await deps.actions.execute({ action, manifest: verified.manifest });
     receipts.push(receipt);
     attempted.push(action);
+    if (receipt.action !== action) {
+      const stoppedReceipt = stopped(
+        verified.manifest.execution_id,
+        'action_refused',
+        verified.manifest.expected_primary_actions,
+        attempted,
+        rollbackActions,
+        receipts,
+        circuitBreakerOpened
+      );
+      await deps.executionStore.commit(verified.manifest.execution_id, stoppedReceipt);
+      return stoppedReceipt;
+    }
     if (hasReceiptFailureAfterProviderResponse(receipt)) {
       const stoppedReceipt = stopped(
         verified.manifest.execution_id,
         'receipt_failure_after_provider_response',
+        verified.manifest.expected_primary_actions,
         attempted,
         rollbackActions,
         receipts,
@@ -829,6 +878,7 @@ export async function runM42Slice8BCanary(
       const stoppedReceipt = stopped(
         verified.manifest.execution_id,
         'action_indeterminate',
+        verified.manifest.expected_primary_actions,
         attempted,
         rollbackActions,
         receipts,
@@ -841,6 +891,7 @@ export async function runM42Slice8BCanary(
       const stoppedReceipt = stopped(
         verified.manifest.execution_id,
         'action_refused',
+        verified.manifest.expected_primary_actions,
         attempted,
         rollbackActions,
         receipts,
@@ -857,10 +908,24 @@ export async function runM42Slice8BCanary(
       });
       receipts.push(rollback);
       rollbackActions.push('REOPEN_ROLLBACK');
+      if (rollback.action !== 'REOPEN_ROLLBACK') {
+        const stoppedReceipt = stopped(
+          verified.manifest.execution_id,
+          'rollback_failed',
+          verified.manifest.expected_primary_actions,
+          attempted,
+          rollbackActions,
+          receipts,
+          true
+        );
+        await deps.executionStore.commit(verified.manifest.execution_id, stoppedReceipt);
+        return stoppedReceipt;
+      }
       if (hasReceiptFailureAfterProviderResponse(rollback)) {
         const stoppedReceipt = stopped(
           verified.manifest.execution_id,
           'receipt_failure_after_provider_response',
+          verified.manifest.expected_primary_actions,
           attempted,
           rollbackActions,
           receipts,
@@ -877,6 +942,7 @@ export async function runM42Slice8BCanary(
         const stoppedReceipt = stopped(
           verified.manifest.execution_id,
           'rollback_failed',
+          verified.manifest.expected_primary_actions,
           attempted,
           rollbackActions,
           receipts,
@@ -891,6 +957,7 @@ export async function runM42Slice8BCanary(
   const completed = stopped(
     verified.manifest.execution_id,
     'completed',
+    verified.manifest.expected_primary_actions,
     attempted,
     rollbackActions,
     receipts,
@@ -913,6 +980,7 @@ function hasReceiptFailureAfterProviderResponse(receipt: M42Slice8BActionReceipt
 function stopped(
   executionId: string | null,
   stopReason: M42Slice8BRunnerStopReason,
+  expectedPrimaryActions: readonly M42Slice8BPrimaryAction[],
   attemptedPrimaryActions: readonly M42Slice8BPrimaryAction[],
   rollbackActions: readonly Extract<M42Slice8BRunnerActionName, 'REOPEN_ROLLBACK'>[],
   receipts: readonly M42Slice8BActionReceipt[],
@@ -942,6 +1010,20 @@ function stopped(
     stopReason === 'completed' &&
     rollbackActions.length === 1 &&
     receipts.some(r => r.action === 'REOPEN_ROLLBACK');
+  const expectedReceiptActions = expectedPrimaryActions.flatMap(action =>
+    action === 'CLOSE' && rollbackActions.includes('REOPEN_ROLLBACK')
+      ? [action, 'REOPEN_ROLLBACK' as const]
+      : [action]
+  );
+  const comparedReceiptCount = Math.min(receipts.length, expectedReceiptActions.length);
+  const unexpectedActionCount =
+    receipts
+      .slice(0, comparedReceiptCount)
+      .reduce(
+        (count, receipt, index) =>
+          count + (receipt.action === expectedReceiptActions[index] ? 0 : 1),
+        0
+      ) + Math.max(0, receipts.length - expectedReceiptActions.length);
   return {
     schema_version: 'm42-slice8b-canary-runner-receipt-v1',
     ok: stopReason === 'completed',
@@ -949,7 +1031,7 @@ function stopped(
     execution_id: executionId,
     attempted_primary_actions: attemptedPrimaryActions,
     rollback_actions: rollbackActions,
-    unexpected_action_count: 0,
+    unexpected_action_count: unexpectedActionCount,
     provider_call_count: providerCalls,
     fake_provider_call_count: fakeProviderCalls,
     fusion_call_count: fusionCalls,
@@ -970,6 +1052,64 @@ function stopped(
   };
 }
 
+async function observeM42Slice8BProcessSnapshot(
+  observedAtMs = Date.now(),
+  ps: () => Promise<string> = async () => {
+    const { stdout } = await execFileAsync('ps', ['-eo', 'pid=,etimes=,args='], {
+      maxBuffer: 1024 * 1024,
+    });
+    return stdout;
+  }
+): Promise<M42Slice8BProcessSnapshot> {
+  try {
+    const output = await ps();
+    return {
+      observed_at_ms: observedAtMs,
+      processes: parseM42Slice8BProcessSnapshot(output, observedAtMs),
+    };
+  } catch {
+    // If host process enumeration is unavailable, record an empty observed snapshot
+    // so the evidence remains build-ready-only instead of inventing runtime health.
+    return { observed_at_ms: observedAtMs, processes: [] };
+  }
+}
+
+export function parseM42Slice8BProcessSnapshot(
+  output: string,
+  observedAtMs: number
+): M42Slice8BProcessSnapshot['processes'] {
+  return output
+    .split('\n')
+    .map(line => line.trim())
+    .filter(Boolean)
+    .map(line => {
+      const match = /^(\d+)\s+(\d+)\s+(.+)$/.exec(line);
+      if (!match) return null;
+      const pid = Number(match[1]);
+      const elapsedSeconds = Number(match[2]);
+      const command = match[3] ?? '';
+      if (!Number.isFinite(pid) || !Number.isFinite(elapsedSeconds)) return null;
+      if (!isM42Slice8BOverseerRuntimeCommand(command)) return null;
+      return {
+        pid,
+        started_at_ms: observedAtMs - elapsedSeconds * 1000,
+        healthy: true,
+        command,
+      };
+    })
+    .filter(
+      (process): process is M42Slice8BProcessSnapshot['processes'][number] => process !== null
+    );
+}
+
+function isM42Slice8BOverseerRuntimeCommand(command: string): boolean {
+  return (
+    command.includes('overseer:serve') ||
+    command.includes('packages/overseer/src/service.ts') ||
+    /\bsrc\/service\.ts\b/.test(command)
+  );
+}
+
 async function main(): Promise<number> {
   try {
     const argv = process.argv.slice(2);
@@ -979,6 +1119,7 @@ async function main(): Promise<number> {
       manifestArg?.slice('--manifest='.length) ?? argv[argv.indexOf('--manifest') + 1];
     if (!manifestPath) throw new Error('manifest_required');
     const envelope = JSON.parse(await readFile(manifestPath, 'utf8')) as M42Slice8BManifestEnvelope;
+    const processHealthBefore = await observeM42Slice8BProcessSnapshot();
     const receipt = await runM42Slice8BCanary(envelope, {
       expected_candidate_sha: envelope.payload.candidate_sha,
       expected_starting_sha: envelope.payload.starting_sha,
@@ -988,6 +1129,7 @@ async function main(): Promise<number> {
       executionStore: new InMemoryM42Slice8BExecutionStore(),
       actions: createSiblingBackedM42Slice8BActionExecutor(),
     });
+    const processHealthAfter = await observeM42Slice8BProcessSnapshot();
     const commandOk: M42Slice8BCommandOutcome = {
       command: 'm42-slice8b:canary-run',
       exit_code: receipt.ok ? 0 : 1,
@@ -995,7 +1137,8 @@ async function main(): Promise<number> {
     };
     const processHealth = assessM42Slice8BProcessHealth({
       audited_host: hostname(),
-      before: { observed_at_ms: Date.now(), processes: [] },
+      before: processHealthBefore,
+      after: processHealthAfter,
       action_execution_ids: receipt.receipts.map(actionReceipt => actionReceipt.execution_id),
     });
     const packet = buildM42Slice8BEvidencePacket({
