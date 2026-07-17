@@ -55,6 +55,10 @@ export interface ReconcileDeps {
     since: string;
   }) => Promise<ReconcileMergedPullRequest[]>;
   findTrackerIssueByStem: (stem: string) => Promise<ReconcileTrackerIssue | null>;
+  hasTrackerEvidenceComment?: (input: {
+    issue: ReconcileTrackerIssue;
+    marker: string;
+  }) => Promise<boolean>;
   addTrackerEvidenceComment: (input: {
     issue: ReconcileTrackerIssue;
     body: string;
@@ -95,6 +99,11 @@ interface OctokitLike {
     }>;
   };
   issues: {
+    listComments(input: Record<string, unknown>): Promise<{
+      data: Array<{
+        body?: string | null;
+      }>;
+    }>;
     createComment(input: Record<string, unknown>): Promise<unknown>;
     addLabels(input: Record<string, unknown>): Promise<unknown>;
     update(input: Record<string, unknown>): Promise<unknown>;
@@ -115,9 +124,10 @@ export interface ReconcileResult {
 }
 
 export async function runReconcileOnce(input: RunReconcileInput = {}): Promise<ReconcileResult> {
-  const deps = input.deps ?? createDefaultReconcileDeps();
-  const logger = deps.log ?? log;
   const org = input.org ?? DEFAULT_ORG;
+  const trackerRepo = input.trackerRepo ?? DEFAULT_TRACKER_REPO;
+  const deps = input.deps ?? createDefaultReconcileDeps({ org, trackerRepo });
+  const logger = deps.log ?? log;
   const since = await resolveSearchSince(input, deps);
 
   let pullRequests: ReconcileMergedPullRequest[];
@@ -146,10 +156,17 @@ export async function runReconcileOnce(input: RunReconcileInput = {}): Promise<R
       if (!tracker) continue;
       if (tracker.state !== 'open') continue;
 
-      await deps.addTrackerEvidenceComment({
+      const marker = buildEvidenceMarker({ pr, stem });
+      const hasEvidence = await (deps.hasTrackerEvidenceComment?.({
         issue: tracker,
-        body: buildEvidenceComment({ pr, stem }),
-      });
+        marker,
+      }) ?? Promise.resolve(false));
+      if (!hasEvidence) {
+        await deps.addTrackerEvidenceComment({
+          issue: tracker,
+          body: buildEvidenceComment({ pr, stem, marker }),
+        });
+      }
       await deps.addTrackerLabel({ issue: tracker, label: DONE_LABEL });
       await deps.closeTrackerIssue({ issue: tracker });
       await (deps.insertAction ?? insertDefaultOverseerAction)({
@@ -174,6 +191,7 @@ export function extractWoStems(input: string): string[] {
 export function buildEvidenceComment(input: {
   pr: ReconcileMergedPullRequest;
   stem: string;
+  marker?: string;
 }): string {
   return [
     `Overseer reconcile closed tracker for ${input.stem}.`,
@@ -181,16 +199,19 @@ export function buildEvidenceComment(input: {
     `Merged PR: ${input.pr.htmlUrl}`,
     `Repository: ${input.pr.owner}/${input.pr.repo}`,
     `Merge SHA: ${input.pr.mergeCommitSha ?? 'unknown'}`,
+    '',
+    `Evidence marker: ${input.marker ?? buildEvidenceMarker(input)}`,
   ].join('\n');
+}
+
+function buildEvidenceMarker(input: { pr: ReconcileMergedPullRequest; stem: string }): string {
+  return `overseer-reconcile:${input.stem}:${input.pr.owner}/${input.pr.repo}#${input.pr.number}`;
 }
 
 export async function readReconcileCursorFromActions(): Promise<string | null> {
   const { getDatabase } = await import('@archon/core/db/connection');
   const db = getDatabase();
-  const sql =
-    db.dialect === 'sqlite'
-      ? 'SELECT MAX(created_at) AS cursor FROM overseer_actions WHERE action = $1'
-      : 'SELECT MAX(created_at) AS cursor FROM overseer_actions WHERE action = $1';
+  const sql = 'SELECT MAX(created_at) AS cursor FROM overseer_actions WHERE action = $1';
   const result = await db.query<{ cursor: string | null }>(sql, [RECONCILE_ACTION]);
   return result.rows[0]?.cursor ?? null;
 }
@@ -200,8 +221,13 @@ async function insertDefaultOverseerAction(record: ReconcileActionRecord): Promi
   return insertOverseerAction(record);
 }
 
-export function createDefaultReconcileDeps(): ReconcileDeps {
+export function createDefaultReconcileDeps(input: {
+  org?: string;
+  trackerRepo?: string;
+} = {}): ReconcileDeps {
   const token = process.env.GITHUB_TOKEN ?? process.env.GH_TOKEN;
+  const trackerOwner = input.org ?? DEFAULT_ORG;
+  const trackerRepo = input.trackerRepo ?? DEFAULT_TRACKER_REPO;
   if (!token) {
     return {
       readCursor: async () => null,
@@ -210,6 +236,7 @@ export function createDefaultReconcileDeps(): ReconcileDeps {
         return [];
       },
       findTrackerIssueByStem: async () => null,
+      hasTrackerEvidenceComment: async () => false,
       addTrackerEvidenceComment: async () => undefined,
       addTrackerLabel: async () => undefined,
       closeTrackerIssue: async () => undefined,
@@ -226,7 +253,18 @@ export function createDefaultReconcileDeps(): ReconcileDeps {
   return {
     readCursor: readReconcileCursorFromActions,
     searchMergedPullRequests: async input => searchMergedPullRequests(await getOctokit(), input),
-    findTrackerIssueByStem: async stem => findTrackerIssueByStem(await getOctokit(), stem),
+    findTrackerIssueByStem: async stem =>
+      findTrackerIssueByStem(await getOctokit(), { owner: trackerOwner, repo: trackerRepo, stem }),
+    hasTrackerEvidenceComment: async input => {
+      const client = await getOctokit();
+      const comments = await client.issues.listComments({
+        owner: input.issue.owner,
+        repo: input.issue.repo,
+        issue_number: input.issue.number,
+        per_page: 100,
+      });
+      return comments.data.some(comment => comment.body?.includes(input.marker));
+    },
     addTrackerEvidenceComment: async input => {
       const client = await getOctokit();
       await client.issues.createComment({
@@ -316,17 +354,17 @@ async function searchMergedPullRequests(
 
 async function findTrackerIssueByStem(
   octokit: OctokitLike,
-  stem: string
+  input: { owner: string; repo: string; stem: string }
 ): Promise<ReconcileTrackerIssue | null> {
   const search = await octokit.search.issuesAndPullRequests({
-    q: `repo:${DEFAULT_ORG}/${DEFAULT_TRACKER_REPO} is:issue ${stem} in:title`,
+    q: `repo:${input.owner}/${input.repo} is:issue ${input.stem} in:title`,
     per_page: 10,
   });
-  const exact = search.data.items.find(item => item.title === stem && !item.pull_request);
+  const exact = search.data.items.find(item => item.title === input.stem && !item.pull_request);
   if (!exact) return null;
   return {
-    owner: DEFAULT_ORG,
-    repo: DEFAULT_TRACKER_REPO,
+    owner: input.owner,
+    repo: input.repo,
     number: exact.number,
     title: exact.title,
     state: exact.state === 'open' ? 'open' : 'closed',

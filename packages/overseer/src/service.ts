@@ -74,6 +74,7 @@ export interface OverseerServiceOptions {
   deliveryOwner?: string;
   deliveryChannels?: OperatorCardChannel[];
   deliveryDrain?: () => Promise<unknown>;
+  reconcileEnabled?: boolean;
   reconcileIntervalMs?: number;
   reconcileRun?: () => Promise<unknown>;
 }
@@ -283,6 +284,8 @@ export async function runOverseerService(options: OverseerServiceOptions = {}): 
   if (!enabled) return;
 
   const dryRun = options.dryRun ?? envEnabled(process.env.OVERSEER_DRY_RUN);
+  const reconcileEnabled =
+    options.reconcileEnabled ?? envEnabled(process.env.OVERSEER_RECONCILE_ENABLED);
   const adapterKind = options.adapterKind ?? resolveRequestedAdapterKind();
   if (adapterKind !== 'fake') {
     throw new Error(`overseer_slice1_real_adapter_forbidden:${adapterKind}`);
@@ -316,13 +319,15 @@ export async function runOverseerService(options: OverseerServiceOptions = {}): 
     });
     tasks.push(delivery);
   }
-  const reconcile = runReconcileScheduler({
-    signal: coupledAbort.signal,
-    intervalMs: options.reconcileIntervalMs,
-    once: options.once,
-    reconcile: options.reconcileRun,
-  });
-  tasks.push(reconcile);
+  if (reconcileEnabled) {
+    const reconcile = runReconcileScheduler({
+      signal: coupledAbort.signal,
+      intervalMs: options.reconcileIntervalMs,
+      once: options.once,
+      reconcile: options.reconcileRun,
+    });
+    tasks.push(reconcile);
+  }
   const abortOnFailure = async (task: Promise<void>): Promise<void> => {
     try {
       await task;
