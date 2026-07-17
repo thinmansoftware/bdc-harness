@@ -27,6 +27,37 @@ function newestEvent(events: OverseerWorkflowEvent[]): OverseerWorkflowEvent | u
   return [...events].sort((a, b) => (a.created_at ?? '').localeCompare(b.created_at ?? '')).at(-1);
 }
 
+function failedNodeIds(event: OverseerWorkflowEvent | undefined): string[] {
+  const failedNodes = event?.data.failed_nodes;
+  return Array.isArray(failedNodes)
+    ? failedNodes.filter((nodeId): nodeId is string => typeof nodeId === 'string')
+    : [];
+}
+
+export function selectFailureEvent(
+  events: OverseerWorkflowEvent[]
+): OverseerWorkflowEvent | undefined {
+  const nodeFailedEvents = events.filter(event => event.event_type === 'node_failed');
+  const workflowFailedEvent = newestEvent(
+    events.filter(event => event.event_type === 'workflow_failed')
+  );
+
+  if (nodeFailedEvents.length > 0) {
+    const [authoritativeFailedNode] = failedNodeIds(workflowFailedEvent);
+    if (authoritativeFailedNode) {
+      const matchingEvent = nodeFailedEvents.find(
+        event => event.step_name === authoritativeFailedNode
+      );
+      if (matchingEvent) return matchingEvent;
+    }
+    return newestEvent(nodeFailedEvents);
+  }
+
+  if (workflowFailedEvent) return workflowFailedEvent;
+
+  return newestEvent(events);
+}
+
 function eventMessage(event: OverseerWorkflowEvent | undefined): string {
   if (!event) return '';
   const data = event.data;
@@ -89,7 +120,7 @@ async function assessRun(
   }
 
   const events = await deps.listRunEvents(run.id);
-  const lastEvent = newestEvent(events);
+  const lastEvent = selectFailureEvent(events);
   const errorClass = classifyError({
     message: eventMessage(lastEvent),
     nodeId: lastEvent?.step_name ?? undefined,
