@@ -45,8 +45,19 @@ export interface M42Slice8BEvidencePacket {
   readonly no_secret_scan: M42Slice8BCommandOutcome;
   readonly ascii_checks: readonly M42Slice8BCommandOutcome[];
   readonly no_real_provider_call: true;
+  readonly no_real_provider_call_observation: {
+    readonly real_provider_call_count: number;
+    readonly fake_provider_call_count: number;
+  };
   readonly no_paid_fusion_call: true;
+  readonly no_paid_fusion_call_observation: {
+    readonly paid_fusion_call_count: number;
+    readonly fake_fusion_logic_count: number;
+  };
   readonly no_production_mutation: true;
+  readonly no_production_mutation_observation: {
+    readonly production_mutation_count: number;
+  };
   readonly no_activation: true;
   readonly no_deployment: true;
   readonly m66_freeze_checklist: readonly string[];
@@ -93,8 +104,19 @@ export function buildM42Slice8BEvidencePacket(input: {
     no_secret_scan: input.no_secret_scan,
     ascii_checks: input.ascii_checks,
     no_real_provider_call: true,
+    no_real_provider_call_observation: {
+      real_provider_call_count: input.runner_receipt.provider_call_count,
+      fake_provider_call_count: input.runner_receipt.fake_provider_call_count,
+    },
     no_paid_fusion_call: true,
+    no_paid_fusion_call_observation: {
+      paid_fusion_call_count: input.runner_receipt.fusion_call_count,
+      fake_fusion_logic_count: input.runner_receipt.fake_fusion_logic_count,
+    },
     no_production_mutation: true,
+    no_production_mutation_observation: {
+      production_mutation_count: input.runner_receipt.production_mutation_count,
+    },
     no_activation: true,
     no_deployment: true,
     m66_freeze_checklist: [

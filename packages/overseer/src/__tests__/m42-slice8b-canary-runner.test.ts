@@ -6,6 +6,7 @@ import {
   type M42Slice8BActionExecutor,
   type M42Slice8BActionReceipt,
   type M42Slice8BRunnerActionName,
+  type M42Slice8BSiblingFakeOptions,
 } from '../m42-slice8b-canary-runner';
 import {
   M42_SLICE8B_MANIFEST_SCHEMA,
@@ -69,7 +70,8 @@ function deps(
 }
 
 function recordingExecutor(
-  overrides: Partial<Record<M42Slice8BRunnerActionName, Partial<M42Slice8BActionReceipt>>> = {}
+  overrides: Partial<Record<M42Slice8BRunnerActionName, Partial<M42Slice8BActionReceipt>>> = {},
+  options: M42Slice8BSiblingFakeOptions = {}
 ): {
   readonly actions: M42Slice8BActionExecutor;
   readonly calls: () => M42Slice8BRunnerActionName[];
@@ -79,7 +81,7 @@ function recordingExecutor(
     actions: {
       async execute(input) {
         calls.push(input.action);
-        return createFakeM42Slice8BActionExecutor(overrides).execute(input);
+        return createFakeM42Slice8BActionExecutor(overrides, options).execute(input);
       },
     },
     calls: () => calls,
@@ -95,11 +97,20 @@ describe('M-42 Slice 8B canary runner scenarios', () => {
     expect(executor.calls()).toEqual(['REFIRE', 'REFRESH', 'CLOSE', 'REOPEN_ROLLBACK', 'MERGE']);
     expect(receipt.rollback_verified).toBe(true);
     expect(receipt.provider_call_count).toBe(0);
+    expect(receipt.fake_provider_call_count).toBe(5);
+    expect(receipt.fake_fusion_logic_count).toBe(15);
     expect(receipt.production_mutation_count).toBe(0);
     expect(receipt.m31_receipt_count).toBe(5);
     expect(receipt.provider_receipt_count).toBe(5);
     expect(receipt.fusion_budget_receipt_count).toBe(5);
     expect(receipt.rollback_receipt_count).toBe(1);
+    expect(receipt.receipts.map(r => r.sibling_module)).toEqual([
+      'actions/cauldron-refire-bridge',
+      'adapters/sandbox-refresh',
+      'adapters/sandbox-close',
+      'adapters/sandbox-reopen',
+      'adapters/sandbox-merge',
+    ]);
   });
 
   test('indeterminate action 2 stops actions 3 and 4 and records circuit state', async () => {
@@ -164,11 +175,13 @@ describe('M-42 Slice 8B canary runner scenarios', () => {
     expect(executor.calls()).toEqual([]);
   });
 
-  test('broader credential reach does not expand the policy allowlist', async () => {
-    const executor = recordingExecutor({ REFIRE: { accepted: false, provider_call_count: 0 } });
+  test('sibling policy allowlist refusal stops before provider dispatch', async () => {
+    const executor = recordingExecutor({}, { sandboxPolicyAllowlisted: false });
     const receipt = await runM42Slice8BCanary(envelope(), deps(executor.actions));
     expect(receipt.stop_reason).toBe('action_refused');
     expect(receipt.provider_call_count).toBe(0);
+    expect(receipt.fake_provider_call_count).toBe(1);
+    expect(receipt.receipts.at(-1)?.sibling_module).toBe('adapters/sandbox-refresh');
   });
 
   test('wrong base, head, candidate, policy digest, registry digest, or principal performs zero calls', async () => {
@@ -188,6 +201,17 @@ describe('M-42 Slice 8B canary runner scenarios', () => {
     expect(replay.receipts).toHaveLength(0);
   });
 
+  test('same execution ID with different manifest digest records execution conflict distinctly', async () => {
+    const executor = recordingExecutor();
+    const sharedDeps = deps(executor.actions);
+    await runM42Slice8BCanary(envelope(), sharedDeps);
+    const changed = envelope(payload({ image_digest: `sha256:${'4'.repeat(64)}` }));
+    const conflict = await runM42Slice8BCanary(changed, sharedDeps);
+    expect(conflict.stop_reason).toBe('execution_conflict');
+    expect(conflict.attempted_primary_actions).toEqual([]);
+    expect(conflict.receipts).toHaveLength(0);
+  });
+
   test('production-effect classification blocks before provider dispatch', async () => {
     const executor = recordingExecutor();
     const bad = payload({ no_production_effect: false as true });
@@ -196,11 +220,13 @@ describe('M-42 Slice 8B canary runner scenarios', () => {
     expect(executor.calls()).toEqual([]);
   });
 
-  test('Fusion-required action with unsafe verifier or cost state blocks', async () => {
-    const executor = recordingExecutor({ REFIRE: { accepted: false, fusion_call_count: 0 } });
+  test('Fusion-required action blocks through real authorization logic on missing dissent', async () => {
+    const executor = recordingExecutor({}, { fusionRawDissent: '' });
     const receipt = await runM42Slice8BCanary(envelope(), deps(executor.actions));
     expect(receipt.stop_reason).toBe('action_refused');
     expect(receipt.fusion_call_count).toBe(0);
+    expect(receipt.fake_fusion_logic_count).toBe(3);
+    expect(receipt.receipts[0]?.sibling_module).toBe('fusion/authorization');
   });
 
   test('Cauldron admission uncertainty does not create a blind second run', async () => {
