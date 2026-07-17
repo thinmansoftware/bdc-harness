@@ -352,6 +352,22 @@ describe('cauldron refire bridge', () => {
     expect(harness.spies.admitRun).toHaveBeenCalledTimes(0);
   });
 
+  test('mixed production target descriptor fails closed before admission', async () => {
+    const harness = makeHarness();
+    const result = await executeCauldronRefireBridge(
+      executeInput({
+        target: stagingTarget({
+          credential: 'production',
+        }),
+      }),
+      harness.deps
+    );
+
+    expect(result.reason).toBe('non_staging_target');
+    expect(result.normalized_outcome).toBe('rejected');
+    expect(harness.spies.admitRun).toHaveBeenCalledTimes(0);
+  });
+
   test('admission timeout returns reconciliation required with one circuit breaker and no second run', async () => {
     const harness = makeHarness({
       status: 'timeout',
@@ -369,6 +385,42 @@ describe('cauldron refire bridge', () => {
     expect(first.reason).toBe('admission_timeout');
     expect(second).toEqual(first);
     expect(harness.spies.admitRun).toHaveBeenCalledTimes(1);
+    expect(harness.spies.openRefireCircuit).toHaveBeenCalledTimes(1);
+  });
+
+  test('admitted result with mismatched binding evidence requires reconciliation', async () => {
+    const harness = makeHarness({
+      status: 'admitted',
+      runId: 'staging-run-1',
+      providerRequestId: 'staging-run-1',
+      admittedAt: '2026-07-17T12:02:00.000Z',
+      bindingEvidence: {
+        execution_id: 'different-execution',
+        proposal_id: 'proposal-cauldron-refire-1',
+        permit_id: 'permit-cauldron-refire-1',
+        repository: 'other-owner/other-repo',
+        provider_repository_id: PROVIDER_REPOSITORY_ID,
+        base_sha: BASE,
+        head_sha: HEAD,
+        candidate_digest: CANDIDATE_DIGEST,
+        policy_digest: POLICY_DIGEST,
+        verifier_registry_digest: VERIFIER_DIGEST,
+        credential_principal: 'sandbox-principal',
+        original_target_key: `${FULL_NAME}#workflow_run:failed-run-1`,
+        original_target_digest: H('target'),
+        original_snapshot_id: 'snapshot-cauldron-refire-1',
+        requested_wo_id: SYNTHETIC_WO,
+        workflow_name: WORKFLOW_NAME,
+      },
+      reason: 'accepted',
+    });
+    const result = await executeCauldronRefireBridge(executeInput(), harness.deps);
+
+    expect(result.normalized_outcome).toBe('reconciliation_required');
+    expect(result.reason).toBe('invalid_admission_result');
+    expect(result.side_effect_count).toBe(0);
+    expect(result.admitted_run_id).toBe('staging-run-1');
+    expect(result.circuit_breaker_opened).toBe(true);
     expect(harness.spies.openRefireCircuit).toHaveBeenCalledTimes(1);
   });
 

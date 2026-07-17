@@ -226,7 +226,7 @@ export async function executeCauldronRefireBridge(
     reason: outcome.reason,
     external_effect_reference: outcome.provider_request_id,
   });
-  if (outcome.normalized_outcome === 'reconciliation_required') {
+  if (outcome.circuit_breaker_opened) {
     await deps.circuit.openRefireCircuit(outcome.reason);
   }
   await deps.idempotency.commit(executionId, outcome);
@@ -256,7 +256,15 @@ function normalizeAdmission(
   if (admitted.status === 'rejected') {
     return fromAdmission(input, deps, startedAt, admitted, 'admission_rejected', false, 'rejected');
   }
-  return fromAdmission(input, deps, startedAt, admitted, 'invalid_admission_result', true);
+  return fromAdmission(
+    input,
+    deps,
+    startedAt,
+    admitted,
+    'invalid_admission_result',
+    true,
+    'reconciliation_required'
+  );
 }
 
 function fromAdmission(
