@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test';
-import { mkdtemp, rm, writeFile, mkdir, utimes } from 'fs/promises';
+import { mkdtemp, rm, writeFile, mkdir, utimes, rename } from 'fs/promises';
 import { existsSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
@@ -199,7 +199,7 @@ describe('sweepTerminalWorkflowWorktrees', () => {
     const quarantinePath = join(quarantineRoot, '2026-07-13', 'owner__repo__thread-old');
     expect(existsSync(worktreePath)).toBe(false);
     expect(existsSync(quarantinePath)).toBe(true);
-    expect(report.orphaned).toEqual([worktreePath]);
+    expect(report.orphaned).toEqual([]);
     expect(report.quarantined).toEqual([quarantinePath]);
     expect(report.quarantinedBytes).toBeGreaterThan(0);
     expect(report.bytesFreed).toBe(0);
@@ -212,6 +212,32 @@ describe('sweepTerminalWorkflowWorktrees', () => {
         reason: 'older_than_orphan_age',
       }),
       'worktree_sweep_quarantined_worktree'
+    );
+  });
+
+  test('reports and preserves unmatched worktrees when quarantine move fails', async () => {
+    const worktreePath = await createWorktree(workspacesRoot, 'owner', 'repo', 'thread-move-fails');
+    await setMtime(worktreePath, '2026-07-01T00:00:00Z');
+
+    const report = await sweepTerminalWorkflowWorktrees({
+      workspacesRoot,
+      quarantineRoot,
+      now: new Date('2026-07-13T00:00:00Z'),
+      orphanAgeMs: 7 * 24 * 60 * 60 * 1000,
+      moveDir: async () => {
+        throw new Error('rename failed');
+      },
+      getCanonicalRepoPathFn: async () => '/repos/owner/repo',
+      pruneWorktree: async () => undefined,
+    });
+
+    expect(existsSync(worktreePath)).toBe(true);
+    expect(report.orphaned).toEqual([worktreePath]);
+    expect(report.quarantined).toEqual([]);
+    expect(report.errors).toEqual([{ path: worktreePath, error: 'rename failed' }]);
+    expect(mockLogger.error).toHaveBeenCalledWith(
+      expect.objectContaining({ worktreePath }),
+      'worktree_sweep_quarantine_failed'
     );
   });
 
@@ -267,6 +293,82 @@ describe('sweepTerminalWorkflowWorktrees', () => {
     expect(existsSync(quarantinePath)).toBe(true);
     expect(report.quarantined).toEqual([quarantinePath]);
     expect(mockUpdateEnvStatus).toHaveBeenCalledWith('env-1', 'destroyed');
+  });
+
+  test('rolls back env-only quarantine when marking the env destroyed fails', async () => {
+    const worktreePath = await createWorktree(workspacesRoot, 'owner', 'repo', 'thread-env');
+    await setMtime(worktreePath, '2026-07-01T00:00:00Z');
+    mockListActiveEnvironmentsForSweep.mockResolvedValueOnce([
+      {
+        id: 'env-1',
+        working_path: worktreePath,
+        created_by_platform: 'web',
+        created_at: new Date('2026-07-01T00:00:00Z'),
+        branch_name: 'thread-env',
+        codebase_id: 'codebase-1',
+      },
+    ]);
+    mockUpdateEnvStatus.mockRejectedValueOnce(new Error('db unavailable'));
+
+    const report = await sweepTerminalWorkflowWorktrees({
+      workspacesRoot,
+      quarantineRoot,
+      now: new Date('2026-07-13T00:00:00Z'),
+      orphanAgeMs: 7 * 24 * 60 * 60 * 1000,
+      moveDir: async (from, to) => {
+        await rename(from, to);
+      },
+      getCanonicalRepoPathFn: async () => '/repos/owner/repo',
+      pruneWorktree: async () => undefined,
+    });
+
+    const quarantinePath = join(quarantineRoot, '2026-07-13', 'owner__repo__thread-env');
+    expect(existsSync(worktreePath)).toBe(true);
+    expect(existsSync(quarantinePath)).toBe(false);
+    expect(report.quarantined).toEqual([]);
+    expect(report.quarantinedBytes).toBe(0);
+    expect(report.errors).toEqual([{ path: worktreePath, error: 'db unavailable' }]);
+    expect(mockUpdateEnvStatus).toHaveBeenCalledWith('env-1', 'destroyed');
+    expect(mockLogger.warn).toHaveBeenCalledWith(
+      expect.objectContaining({ worktreePath, quarantinePath, envId: 'env-1' }),
+      'worktree_sweep_env_quarantine_rolled_back'
+    );
+  });
+
+  test('reports and preserves env-only worktrees when quarantine move fails', async () => {
+    const worktreePath = await createWorktree(workspacesRoot, 'owner', 'repo', 'thread-env');
+    await setMtime(worktreePath, '2026-07-01T00:00:00Z');
+    mockListActiveEnvironmentsForSweep.mockResolvedValueOnce([
+      {
+        id: 'env-1',
+        working_path: worktreePath,
+        created_by_platform: 'web',
+        created_at: new Date('2026-07-01T00:00:00Z'),
+        branch_name: 'thread-env',
+        codebase_id: 'codebase-1',
+      },
+    ]);
+
+    const report = await sweepTerminalWorkflowWorktrees({
+      workspacesRoot,
+      quarantineRoot,
+      now: new Date('2026-07-13T00:00:00Z'),
+      orphanAgeMs: 7 * 24 * 60 * 60 * 1000,
+      moveDir: async () => {
+        throw new Error('rename failed');
+      },
+      getCanonicalRepoPathFn: async () => '/repos/owner/repo',
+      pruneWorktree: async () => undefined,
+    });
+
+    expect(existsSync(worktreePath)).toBe(true);
+    expect(report.quarantined).toEqual([]);
+    expect(report.errors).toEqual([{ path: worktreePath, error: 'rename failed' }]);
+    expect(mockUpdateEnvStatus).not.toHaveBeenCalled();
+    expect(mockLogger.error).toHaveBeenCalledWith(
+      expect.objectContaining({ worktreePath, envId: 'env-1' }),
+      'worktree_sweep_quarantine_failed'
+    );
   });
 
   test('preserves env-only worktrees with active sessions or telegram platform', async () => {
@@ -410,6 +512,7 @@ describe('sweepTerminalWorkflowWorktrees', () => {
         quarantinedBytes: report.quarantinedBytes,
         quarantineDeletedBytes: report.quarantineDeletedBytes,
         errors: 0,
+        orphaned: 0,
       }),
       'worktree_sweep_disk_report'
     );

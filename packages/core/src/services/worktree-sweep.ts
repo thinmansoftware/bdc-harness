@@ -411,21 +411,21 @@ export async function sweepTerminalWorkflowWorktrees(
             getCanonicalRepoPathFn,
             pruneWorktree,
           });
-          report.quarantined.push(quarantine.quarantinePath);
-          report.quarantinedBytes += quarantine.bytes;
-          getLog().info(
-            {
-              worktreePath: worktreeDir,
-              quarantinePath: quarantine.quarantinePath,
-              class: 'env-only',
-              reason: 'older_than_orphan_age',
-              envId: env.id,
-              bytes: quarantine.bytes,
-            },
-            'worktree_sweep_quarantined_worktree'
-          );
           try {
             await updateEnvStatus(env.id, 'destroyed');
+            report.quarantined.push(quarantine.quarantinePath);
+            report.quarantinedBytes += quarantine.bytes;
+            getLog().info(
+              {
+                worktreePath: worktreeDir,
+                quarantinePath: quarantine.quarantinePath,
+                class: 'env-only',
+                reason: 'older_than_orphan_age',
+                envId: env.id,
+                bytes: quarantine.bytes,
+              },
+              'worktree_sweep_quarantined_worktree'
+            );
           } catch (error) {
             const err = error as Error;
             report.errors.push({ path: worktreeDir, error: err.message });
@@ -433,6 +433,31 @@ export async function sweepTerminalWorkflowWorktrees(
               { err, worktreePath: worktreeDir, envId: env.id },
               'worktree_sweep_env_status_update_failed'
             );
+            try {
+              await moveDir(quarantine.quarantinePath, worktreeDir);
+              getLog().warn(
+                {
+                  worktreePath: worktreeDir,
+                  quarantinePath: quarantine.quarantinePath,
+                  envId: env.id,
+                },
+                'worktree_sweep_env_quarantine_rolled_back'
+              );
+            } catch (rollbackError) {
+              const rollbackErr = rollbackError as Error;
+              report.quarantined.push(quarantine.quarantinePath);
+              report.quarantinedBytes += quarantine.bytes;
+              report.errors.push({ path: quarantine.quarantinePath, error: rollbackErr.message });
+              getLog().error(
+                {
+                  err: rollbackErr,
+                  worktreePath: worktreeDir,
+                  quarantinePath: quarantine.quarantinePath,
+                  envId: env.id,
+                },
+                'worktree_sweep_env_quarantine_rollback_failed'
+              );
+            }
           }
         } catch (error) {
           const err = error as Error;
@@ -445,8 +470,8 @@ export async function sweepTerminalWorkflowWorktrees(
         continue;
       }
 
-      report.orphaned.push(worktreeDir);
       if (now.getTime() - dirStat.mtime.getTime() <= orphanAgeMs) {
+        report.orphaned.push(worktreeDir);
         getLog().warn({ worktreePath: worktreeDir }, 'worktree_sweep_orphaned_worktree');
         continue;
       }
@@ -475,6 +500,7 @@ export async function sweepTerminalWorkflowWorktrees(
         );
       } catch (error) {
         const err = error as Error;
+        report.orphaned.push(worktreeDir);
         report.errors.push({ path: worktreeDir, error: err.message });
         getLog().error({ err, worktreePath: worktreeDir }, 'worktree_sweep_quarantine_failed');
       }
