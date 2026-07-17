@@ -110,10 +110,25 @@ export {
   REQUIRED_M42_CHILD_WO_IDS,
 } from './integration-manifest';
 export {
+  assertBuilderMatchesManifest,
   assertCandidateIsCurrentHead,
   INDEPENDENT_REVIEW_SCHEMA_VERSION,
   validateIndependentReviewEvidence,
 } from './independent-review-evidence';
+export {
+  finalizeExternalEvidence,
+  prepareExternalManifest,
+  resolveExternalArtifactInput,
+  resolveExternalArtifactRoot,
+} from './external-finalization';
+export type {
+  CompleteRollbackProof,
+  CompleteStagingProof,
+  ExternalSeedChild,
+  ExternalSeedManifest,
+  FinalizeExternalEvidenceInput,
+  FinalizeExternalEvidenceResult,
+} from './external-finalization';
 export type {
   ExpectedIndependentReview,
   IndependentReviewArtifact,
@@ -158,6 +173,7 @@ export {
   assertActivationPackageInput,
   buildUnsignedSandboxProofRequest,
   buildUnsignedActivationRequest,
+  verifyWrittenActivationArtifactDigests,
   writeNonGovernanceActivationArtifacts,
   canonicalJsonStringify,
 } from './activation-package';

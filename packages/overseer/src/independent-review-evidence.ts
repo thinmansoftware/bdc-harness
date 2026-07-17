@@ -74,6 +74,15 @@ export function assertCandidateIsCurrentHead(candidateSha: string, currentHead: 
   }
 }
 
+export function assertBuilderMatchesManifest(
+  requested: ReviewAgentIdentity,
+  manifest: ReviewAgentIdentity
+): void {
+  if (requested.provider !== manifest.provider || requested.model !== manifest.model) {
+    throw new Error('builder identity must match manifest');
+  }
+}
+
 /**
  * Validate a reviewer-owned, content-addressed M-42 exact-head review artifact.
  * GitHub review rows may be retained as additional evidence, but are not required
@@ -196,6 +205,12 @@ export function validateIndependentReviewEvidence(
       if (finding.scope !== 'parent' && !(finding.scope in expected.child_heads)) {
         errors.push(`finding ${index} has invalid scope`);
       }
+    }
+    if (
+      verdicts?.parent === 'APPROVED' &&
+      artifact.findings.some(finding => record(finding)?.severity === 'blocker')
+    ) {
+      errors.push('APPROVED artifact cannot contain blocker findings');
     }
   }
 

@@ -64,11 +64,16 @@ async function main(): Promise<number> {
 
   const receiptCount =
     chain.receipts.length + matrix.results.filter(r => r.scenario_id === 'success').length;
+  const operatorCardCount = matrix.results.reduce(
+    (count, result) => count + result.operator_card_count,
+    0
+  );
   process.stdout.write(
     JSON.stringify({
       schema_version: 'm42-integration-runner-receipt-v1',
       ok: true,
       receipt_count: receiptCount,
+      operator_card_count: operatorCardCount,
       real_call_count: observedRealCalls,
       disabled_capabilities: def.disabled_capabilities,
       emergency_stop: def.emergency_stop,

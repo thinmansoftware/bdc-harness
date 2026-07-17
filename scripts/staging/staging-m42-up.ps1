@@ -45,6 +45,19 @@ function Get-DockerCli {
 }
 $Docker = Get-DockerCli
 
+function Invoke-DockerAllowingProgressStderr {
+  param([Parameter(Mandatory = $true)][string[]]$Arguments)
+
+  # Docker build/compose writes ordinary progress to stderr. Windows
+  # PowerShell 5.1 promotes that stream to NativeCommandError under Stop.
+  $previousErrorActionPreference = $ErrorActionPreference
+  $ErrorActionPreference = "Continue"
+  & $Docker @Arguments | Out-Host
+  $code = $LASTEXITCODE
+  $ErrorActionPreference = $previousErrorActionPreference
+  return $code
+}
+
 if (-not (Test-Path $Compose)) {
   Write-Error "[m42-up] missing docker-compose.m42-staging.yml"
   exit 1
@@ -97,8 +110,8 @@ function Save-PriorM42Staging {
   # retained backup is transactionally quiescent rather than a live file copy.
   $priorWasRunning = (& $Docker inspect -f "{{.State.Running}}" archon-m42-staging 2>$null) -eq "true"
   if ($priorWasRunning) {
-    & $Docker compose -f $Compose down --remove-orphans 2>$null
-    if ($LASTEXITCODE -ne 0) {
+    $downCode = Invoke-DockerAllowingProgressStderr -Arguments @("compose", "-f", $Compose, "down", "--remove-orphans")
+    if ($downCode -ne 0) {
       Write-Error "[m42-up] failed to stop prior M-42 staging before retention"
       exit 1
     }
@@ -157,16 +170,17 @@ if (Test-Path $BuildDir) {
 }
 git -C $RepoRoot worktree add --detach $BuildDir $sha | Out-Null
 Write-Host "[m42-up] building archon-m42-staging:$short (credential-free)..."
-& $Docker build -t "archon-m42-staging:$short" -t "archon-m42-staging:current" $BuildDir
-if ($LASTEXITCODE -ne 0) { Write-Error "[m42-up] docker build failed"; exit 1 }
+$buildCode = Invoke-DockerAllowingProgressStderr -Arguments @("build", "-t", "archon-m42-staging:$short", "-t", "archon-m42-staging:current", $BuildDir)
+if ($buildCode -ne 0) { Write-Error "[m42-up] docker build failed"; exit 1 }
 git -C $RepoRoot worktree remove --force $BuildDir 2>$null
 
 # Stop any prior m42 container via this compose file only.
-& $Docker compose -f $Compose down --remove-orphans 2>$null
+$downCode = Invoke-DockerAllowingProgressStderr -Arguments @("compose", "-f", $Compose, "down", "--remove-orphans")
+if ($downCode -ne 0) { Write-Error "[m42-up] compose down failed"; exit 1 }
 
 Write-Host "[m42-up] starting archon-m42-staging..."
-& $Docker compose -f $Compose up -d
-if ($LASTEXITCODE -ne 0) { Write-Error "[m42-up] compose up failed"; exit 1 }
+$upCode = Invoke-DockerAllowingProgressStderr -Arguments @("compose", "-f", $Compose, "up", "-d")
+if ($upCode -ne 0) { Write-Error "[m42-up] compose up failed"; exit 1 }
 
 # Exact SHA proof marker (M-42 path, not shared staging-data/DEPLOYED_COMMIT).
 Set-Content -Path $DeployMarker -Value $sha -Encoding ascii -NoNewline

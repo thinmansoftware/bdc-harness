@@ -1,12 +1,21 @@
 import { describe, expect, test, afterEach } from 'bun:test';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import {
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  unlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import {
   assertActivationPackageInput,
   buildUnsignedActivationRequest,
   buildUnsignedSandboxProofRequest,
+  verifyWrittenActivationArtifactDigests,
   writeNonGovernanceActivationArtifacts,
   type ActivationPackageInput,
 } from '../activation-package';
@@ -198,11 +207,15 @@ describe('activation-package', () => {
     );
     expect(written.sandbox_proof_request_sha256).toMatch(/^[0-9a-f]{64}$/);
     expect(written.deploy_activation_request_sha256).toMatch(/^[0-9a-f]{64}$/);
+    expect(verifyWrittenActivationArtifactDigests(written)).toBe(true);
 
     const sandboxOnDisk = JSON.parse(readFileSync(written.sandbox_proof_request_path, 'utf8'));
     const deployOnDisk = JSON.parse(readFileSync(written.deploy_activation_request_path, 'utf8'));
     expect(sandboxOnDisk.signed).toBe(false);
     expect(deployOnDisk.signed).toBe(false);
+
+    writeFileSync(written.sandbox_proof_request_path, '{"tampered":true}\n', 'utf8');
+    expect(verifyWrittenActivationArtifactDigests(written)).toBe(false);
   });
 
   test('rejects missing, repository, and mismatched approved roots', () => {
@@ -235,5 +248,17 @@ describe('activation-package', () => {
     expect(() =>
       writeNonGovernanceActivationArtifacts(bundle, join(otherRoot, 'activation'), root)
     ).toThrow(/outside_approved_external_artifact_root/i);
+
+    const junction = join(otherRoot, 'repo-junction');
+    symlinkSync(process.cwd(), junction, 'junction');
+    try {
+      const escaped = join(junction, 'must-not-exist');
+      expect(() => writeNonGovernanceActivationArtifacts(bundle, escaped, junction)).toThrow(
+        /approved_external_artifact_root_is_repository/i
+      );
+      expect(existsSync(join(process.cwd(), 'must-not-exist'))).toBe(false);
+    } finally {
+      unlinkSync(junction);
+    }
   });
 });

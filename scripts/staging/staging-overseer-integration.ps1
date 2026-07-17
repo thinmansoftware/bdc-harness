@@ -4,7 +4,9 @@
 #
 # Usage:
 #   powershell -NoProfile -ExecutionPolicy Bypass -File scripts/staging/staging-overseer-integration.ps1 `
-#     -Ref <sha> -OutputPath artifacts/overseer/m42-wave2
+#     -Ref <sha> -OutputPath <absolute-external-root> `
+#     -ManifestPath <absolute-external-manifest> `
+#     -ApprovedExternalArtifactRoot <absolute-external-root>
 #   ... -InjectHealthFailure -RollbackTo <prior_sha>
 
 [CmdletBinding()]
@@ -13,6 +15,10 @@ param(
   [string]$Ref,
   [Parameter(Mandatory = $true)]
   [string]$OutputPath,
+  [Parameter(Mandatory = $true)]
+  [string]$ManifestPath,
+  [Parameter(Mandatory = $true)]
+  [string]$ApprovedExternalArtifactRoot,
   [switch]$InjectHealthFailure,
   [string]$RollbackTo = ""
 )
@@ -29,7 +35,6 @@ $PriorHomeDir = Join-Path $PriorDir "user-home"
 $PriorImageTag = "archon-m42-staging:prior"
 $DataDir  = Join-Path $RepoRoot "staging-m42-data"
 $HomeDir  = Join-Path $RepoRoot "staging-m42-user-home"
-$ParentManifestPath = Join-Path $RepoRoot "artifacts\manifests\wo-harness-overseer-integration-activation-01.json"
 $OfficialProofHost = 'LAPTOP-BQ6IEJNC'
 
 $CredentialEnvKeys = @(
@@ -69,36 +74,85 @@ function Get-DockerCli {
 }
 $Docker = Get-DockerCli
 
+function Assert-NoReparseAncestor {
+  param([Parameter(Mandatory = $true)][string]$Path)
+
+  $probe = [System.IO.Path]::GetFullPath($Path)
+  while (-not (Test-Path -LiteralPath $probe)) {
+    $parent = Split-Path -Parent $probe
+    if ([string]::IsNullOrWhiteSpace($parent) -or $parent -eq $probe) { break }
+    $probe = $parent
+  }
+  while (-not [string]::IsNullOrWhiteSpace($probe) -and (Test-Path -LiteralPath $probe)) {
+    $item = Get-Item -LiteralPath $probe -Force
+    if ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+      Write-Error "output_path_rejected: symlink/reparse ancestor not allowed: $probe"
+      exit 1
+    }
+    $parent = Split-Path -Parent $probe
+    if ([string]::IsNullOrWhiteSpace($parent) -or $parent -eq $probe) { break }
+    $probe = $parent
+  }
+}
+
+function Invoke-DockerAllowingProgressStderr {
+  param([Parameter(Mandatory = $true)][string[]]$Arguments)
+
+  $previousErrorActionPreference = $ErrorActionPreference
+  $ErrorActionPreference = "Continue"
+  & $Docker @Arguments | Out-Host
+  $code = $LASTEXITCODE
+  $ErrorActionPreference = $previousErrorActionPreference
+  return $code
+}
+
 $sha = (git -C $RepoRoot rev-parse --verify "$Ref^{commit}").Trim()
 if (-not $sha) { Write-Error "cannot resolve ref $Ref"; exit 1 }
 
-# Canonical output path only. Reject traversal, prefix tricks, and non-canonical forms.
-$expectedOutputPath = [System.IO.Path]::GetFullPath((Join-Path $RepoRoot "artifacts\overseer\m42-wave2"))
-$rawOutputFull = if ([System.IO.Path]::IsPathRooted($OutputPath)) {
-  $OutputPath
-} else {
-  Join-Path $RepoRoot $OutputPath
+# Artifacts are authoritative only under an explicit absolute external root.
+# Never write proof, packets, or the finalized manifest into the repository.
+foreach ($path in @($OutputPath, $ManifestPath, $ApprovedExternalArtifactRoot)) {
+  if ([string]::IsNullOrWhiteSpace($path) -or -not [System.IO.Path]::IsPathRooted($path)) {
+    Write-Error "output_path_rejected: all artifact paths must be absolute"
+    exit 1
+  }
+  if (($path -split '[\\/]') -contains '..') {
+    Write-Error "output_path_rejected: traversal is not allowed"
+    exit 1
+  }
+  Assert-NoReparseAncestor -Path $path
 }
-# Reject parent-directory segments before resolution.
-if ($OutputPath -match '\.\.') {
-  Write-Error "output_path_rejected: parent traversal not allowed"
+$approvedRoot = [System.IO.Path]::GetFullPath($ApprovedExternalArtifactRoot).TrimEnd([char[]]'\/')
+$resolvedOutputPath = [System.IO.Path]::GetFullPath($OutputPath).TrimEnd([char[]]'\/')
+$ParentManifestPath = [System.IO.Path]::GetFullPath($ManifestPath)
+$repoFull = [System.IO.Path]::GetFullPath($RepoRoot).TrimEnd([char[]]'\/')
+$approvedPrefix = $approvedRoot + [System.IO.Path]::DirectorySeparatorChar
+$repoPrefix = $repoFull + [System.IO.Path]::DirectorySeparatorChar
+if (
+  $approvedRoot -eq $repoFull -or
+  $approvedRoot.StartsWith($repoPrefix, [System.StringComparison]::OrdinalIgnoreCase) -or
+  $repoFull.StartsWith($approvedPrefix, [System.StringComparison]::OrdinalIgnoreCase)
+) {
+  Write-Error "output_path_rejected: approved root must be outside repository"
   exit 1
 }
-if (-not (Test-Path $rawOutputFull)) {
-  New-Item -ItemType Directory -Force -Path $rawOutputFull | Out-Null
+foreach ($path in @($resolvedOutputPath, $ParentManifestPath)) {
+  if (
+    $path -ne $approvedRoot -and
+    -not $path.StartsWith($approvedPrefix, [System.StringComparison]::OrdinalIgnoreCase)
+  ) {
+    Write-Error "output_path_rejected: artifact path is outside approved external root"
+    exit 1
+  }
 }
-# Reject symlink / reparse-point targets that could escape the canonical path.
-$item = Get-Item -LiteralPath $rawOutputFull -Force
-if ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
-  Write-Error "output_path_rejected: symlink/reparse points not allowed"
-  exit 1
+if (-not (Test-Path $approvedRoot)) {
+  New-Item -ItemType Directory -Force -Path $approvedRoot | Out-Null
 }
-$resolvedOutputPath = [System.IO.Path]::GetFullPath($item.FullName)
-if ($resolvedOutputPath -ne $expectedOutputPath) {
-  Write-Error "output_path_rejected: expected $expectedOutputPath got $resolvedOutputPath"
-  exit 1
+if (-not (Test-Path $resolvedOutputPath)) {
+  New-Item -ItemType Directory -Force -Path $resolvedOutputPath | Out-Null
 }
-$OutputPath = $resolvedOutputPath
+$item = Get-Item -LiteralPath $resolvedOutputPath -Force
+$OutputPath = [System.IO.Path]::GetFullPath($item.FullName)
 
 $hostName = $env:COMPUTERNAME
 if ($hostName -ne $OfficialProofHost) {
@@ -323,6 +377,7 @@ $proof = [ordered]@{
   emergency_stop           = [bool]$liveHealth.emergency_stop
   disabled_capabilities    = @($liveHealth.disabled_capabilities)
   receipt_count            = [int]$scenario.receipt_count
+  operator_card_count      = [int]$scenario.operator_card_count
   real_call_count          = [int]$scenario.real_call_count
   credential_env_present   = @($credEnvPresent)
   credential_files_present = @($credFilesPresent)
@@ -386,7 +441,11 @@ if ($InjectHealthFailure) {
   }
 
   # Stop candidate container.
-  & $Docker compose -f $Compose down --remove-orphans 2>$null
+  $downCode = Invoke-DockerAllowingProgressStderr -Arguments @("compose", "-f", $Compose, "down", "--remove-orphans")
+  if ($downCode -ne 0) {
+    Write-Error "rollback compose down failed"
+    exit 1
+  }
 
   # Restore prior image as :current and restore data/home + deploy marker.
   & $Docker tag $PriorImageTag "archon-m42-staging:current"
@@ -408,8 +467,8 @@ if ($InjectHealthFailure) {
   New-Item -ItemType Directory -Force -Path (Split-Path $DeployMarker) | Out-Null
   Set-Content -Path $DeployMarker -Value $retainedSha -Encoding ascii -NoNewline
 
-  & $Docker compose -f $Compose up -d
-  if ($LASTEXITCODE -ne 0) {
+  $upCode = Invoke-DockerAllowingProgressStderr -Arguments @("compose", "-f", $Compose, "up", "-d")
+  if ($upCode -ne 0) {
     Write-Error "rollback compose up failed"
     exit 1
   }
@@ -442,7 +501,8 @@ if ($InjectHealthFailure) {
     Write-Error "rollback_image_mismatch: active=$restoredImageDigest retained=$($priorMetaObj.prior_image_digest)"
     exit 1
   }
-  if ($containerRunning -and $activeSha -eq $sha) {
+  $candidateRunning = $containerRunning -and ($activeSha -eq $sha)
+  if ($candidateRunning) {
     Write-Error "rollback_candidate_still_active"
     exit 1
   }
@@ -468,7 +528,7 @@ if ($InjectHealthFailure) {
     prior_staging_sha   = $prior
     rollback_status     = "restored"
     active_sha          = $activeSha
-    candidate_running   = $false
+    candidate_running   = [bool]$candidateRunning
     evidence_retained   = [bool]$evidenceRetained
   }
 

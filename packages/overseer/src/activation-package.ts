@@ -7,8 +7,15 @@
  */
 
 import { createHash } from 'node:crypto';
-import { mkdirSync, realpathSync, writeFileSync } from 'node:fs';
-import { isAbsolute, join, relative, resolve, sep } from 'node:path';
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  realpathSync,
+  renameSync,
+  writeFileSync,
+} from 'node:fs';
+import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 
 const SHA1_RE = /^[0-9a-f]{40}$/;
 const SHA256_RE = /^[0-9a-f]{64}$/;
@@ -108,6 +115,21 @@ export interface WrittenActivationArtifacts {
   readonly deploy_activation_request_path: string;
   readonly sandbox_proof_request_sha256: string;
   readonly deploy_activation_request_sha256: string;
+}
+
+export function verifyWrittenActivationArtifactDigests(
+  written: WrittenActivationArtifacts
+): boolean {
+  const sandboxDigest = createHash('sha256')
+    .update(readFileSync(written.sandbox_proof_request_path))
+    .digest('hex');
+  const deployDigest = createHash('sha256')
+    .update(readFileSync(written.deploy_activation_request_path))
+    .digest('hex');
+  return (
+    sandboxDigest === written.sandbox_proof_request_sha256 &&
+    deployDigest === written.deploy_activation_request_sha256
+  );
 }
 
 /** Stable JSON stringify with sorted object keys (RFC 8785-lite). */
@@ -243,6 +265,20 @@ function isWithinOrEqual(path: string, root: string): boolean {
   return rel === '' || (!rel.startsWith(`..${sep}`) && rel !== '..' && !isAbsolute(rel));
 }
 
+function resolveThroughExistingAncestor(path: string): string {
+  let ancestor = resolve(path);
+  const suffix: string[] = [];
+  while (!existsSync(ancestor)) {
+    const parent = dirname(ancestor);
+    if (parent === ancestor) {
+      throw new Error('activation_artifact_path_rejected: no_existing_ancestor');
+    }
+    suffix.unshift(ancestor.slice(parent.length).replace(/^[/\\]+/, ''));
+    ancestor = parent;
+  }
+  return resolve(realpathSync(ancestor), ...suffix);
+}
+
 function assertApprovedExternalOutputDirectory(
   outputDirectory: string,
   approvedExternalArtifactRoot: string
@@ -254,6 +290,12 @@ function assertApprovedExternalOutputDirectory(
     throw new Error(
       'activation_artifact_path_rejected: approved_external_artifact_root_must_be_absolute'
     );
+  }
+  if (
+    approvedExternalArtifactRoot.split(/[\\/]+/).includes('..') ||
+    outputDirectory.split(/[\\/]+/).includes('..')
+  ) {
+    throw new Error('activation_artifact_path_rejected: traversal');
   }
 
   const requestedRoot = resolve(approvedExternalArtifactRoot);
@@ -272,12 +314,26 @@ function assertApprovedExternalOutputDirectory(
     throw new Error('activation_artifact_path_rejected: outside_approved_external_artifact_root');
   }
 
+  const predictedRoot = resolveThroughExistingAncestor(requestedRoot);
+  const predictedOutput = resolveThroughExistingAncestor(requestedOutput);
+  const actualRepo = realpathSync(requestedRepo);
+  if (isWithinOrEqual(predictedRoot, actualRepo) || isWithinOrEqual(actualRepo, predictedRoot)) {
+    throw new Error(
+      'activation_artifact_path_rejected: approved_external_artifact_root_is_repository'
+    );
+  }
+  if (!isWithinOrEqual(predictedOutput, predictedRoot)) {
+    throw new Error('activation_artifact_path_rejected: outside_approved_external_artifact_root');
+  }
+
   mkdirSync(requestedRoot, { recursive: true });
   mkdirSync(requestedOutput, { recursive: true });
 
   const actualRoot = realpathSync(requestedRoot);
   const actualOutput = realpathSync(requestedOutput);
-  const actualRepo = realpathSync(requestedRepo);
+  if (actualRoot !== predictedRoot || actualOutput !== predictedOutput) {
+    throw new Error('activation_artifact_path_rejected: path_changed_during_creation');
+  }
   if (isWithinOrEqual(actualRoot, actualRepo) || isWithinOrEqual(actualRepo, actualRoot)) {
     throw new Error(
       'activation_artifact_path_rejected: approved_external_artifact_root_is_repository'
@@ -324,14 +380,21 @@ export function writeNonGovernanceActivationArtifacts(
   const deployBody = canonicalJsonStringify(input.deploy_activation_request);
   const sandboxPath = join(dir, 'sandbox-proof-request.json');
   const deployPath = join(dir, 'deploy-activation-request.json');
+  const sandboxTemp = `${sandboxPath}.tmp`;
+  const deployTemp = `${deployPath}.tmp`;
 
-  writeFileSync(sandboxPath, sandboxBody + '\n', 'utf8');
-  writeFileSync(deployPath, deployBody + '\n', 'utf8');
+  writeFileSync(sandboxTemp, sandboxBody + '\n', 'utf8');
+  writeFileSync(deployTemp, deployBody + '\n', 'utf8');
+  renameSync(sandboxTemp, sandboxPath);
+  renameSync(deployTemp, deployPath);
+
+  const sandboxDisk = readFileSync(sandboxPath);
+  const deployDisk = readFileSync(deployPath);
 
   return {
     sandbox_proof_request_path: sandboxPath,
     deploy_activation_request_path: deployPath,
-    sandbox_proof_request_sha256: createHash('sha256').update(sandboxBody).digest('hex'),
-    deploy_activation_request_sha256: createHash('sha256').update(deployBody).digest('hex'),
+    sandbox_proof_request_sha256: createHash('sha256').update(sandboxDisk).digest('hex'),
+    deploy_activation_request_sha256: createHash('sha256').update(deployDisk).digest('hex'),
   };
 }

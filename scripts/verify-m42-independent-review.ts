@@ -2,6 +2,7 @@ import { execFileSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { isAbsolute, relative, resolve } from 'node:path';
 import {
+  assertBuilderMatchesManifest,
   assertCandidateIsCurrentHead,
   validateIndependentReviewEvidence,
   type IndependentReviewArtifact,
@@ -9,6 +10,7 @@ import {
 
 interface ParentManifest {
   readonly children?: readonly { readonly wo_id?: string; readonly pr_head?: string }[];
+  readonly builder?: { readonly provider?: string; readonly model?: string };
 }
 
 function argument(name: string): string {
@@ -45,6 +47,13 @@ function main(): void {
   const artifact = JSON.parse(readFileSync(artifactPath, 'utf8')) as IndependentReviewArtifact;
   const rawTranscript = readFileSync(transcriptPath, 'utf8');
   if (!Array.isArray(manifest.children)) throw new Error('manifest children must be an array');
+  if (!manifest.builder?.provider || !manifest.builder.model) {
+    throw new Error('manifest builder identity is incomplete');
+  }
+  assertBuilderMatchesManifest(
+    { provider: builderProvider, model: builderModel },
+    { provider: manifest.builder.provider, model: manifest.builder.model }
+  );
 
   const childHeads: Record<string, string> = {};
   for (const child of manifest.children) {

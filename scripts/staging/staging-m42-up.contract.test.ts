@@ -69,7 +69,7 @@ describe('staging-m42-up credential-free contract', () => {
     expect(src.includes('Write-Error "[m42-up] health endpoint never became ready')).toBe(true);
     // Always builds exact detached ref
     expect(src.includes('worktree add --detach')).toBe(true);
-    expect(src.includes('$Docker build')).toBe(true);
+    expect(src.includes('Invoke-DockerAllowingProgressStderr -Arguments @("build"')).toBe(true);
   });
 
   test('launcher retains prior M-42 image/config/data before candidate replacement', () => {
@@ -83,6 +83,22 @@ describe('staging-m42-up credential-free contract', () => {
     expect(src.includes('Get-DockerImageIdIfPresent')).toBe(true);
     expect(src.includes('$ErrorActionPreference = "Continue"')).toBe(true);
     expect(src.includes('$ErrorActionPreference = $previousErrorActionPreference')).toBe(true);
+  });
+
+  test('Windows PowerShell 5.1 tolerates expected Docker progress stderr but checks exits', () => {
+    const launcher = readFileSync(launcherPath, 'utf8');
+    const integration = readFileSync(integrationPath, 'utf8');
+    for (const src of [launcher, integration]) {
+      expect(src.includes('Invoke-DockerAllowingProgressStderr')).toBe(true);
+      expect(src.includes('$ErrorActionPreference = "Continue"')).toBe(true);
+      expect(src.includes('$LASTEXITCODE')).toBe(true);
+    }
+    expect(launcher.includes('Invoke-DockerAllowingProgressStderr -Arguments @("build"')).toBe(
+      true
+    );
+    expect(integration.includes('Invoke-DockerAllowingProgressStderr -Arguments @("compose"')).toBe(
+      true
+    );
   });
 
   test('standalone compose has no env_file, credential keys ABSENT, only two M-42 mounts', () => {
@@ -168,6 +184,9 @@ describe('staging-overseer-integration contract', () => {
     // No fabricated zero prior SHA / zero verifier digest for packets
     expect(src.includes('"0" * 40') || src.includes("'0' * 40")).toBe(false);
     expect(src.includes('0".repeat(64)') || src.includes("0'.repeat(64)")).toBe(false);
+    const runner = readFileSync(runnerPath, 'utf8');
+    expect(runner.includes('operatorCardCount')).toBe(true);
+    expect(runner.includes('operator_card_count: operatorCardCount')).toBe(true);
   });
 
   test('derives watcher/adapter/emergency/capabilities/circuits from /api/health', () => {
@@ -192,13 +211,24 @@ describe('staging-overseer-integration contract', () => {
     expect(src.includes('restored')).toBe(true);
     expect(src.includes('prior_health_ok') || src.includes('rollback_health_failed')).toBe(true);
     expect(src.includes('rollback_image_mismatch')).toBe(true);
+    expect(src.includes('$candidateRunning = $containerRunning -and ($activeSha -eq $sha)')).toBe(
+      true
+    );
+    expect(src.includes('candidate_running   = [bool]$candidateRunning')).toBe(true);
     // Must start prior, not only stop candidate
     expect(src.includes('compose up') || src.includes('compose -f $Compose up')).toBe(true);
   });
 
-  test('writes only the frozen proof fields and canonical output path', () => {
+  test('writes only proof fields under an explicit approved external root', () => {
     const src = readFileSync(integrationPath, 'utf8');
     expect(src.includes('output_path_rejected')).toBe(true);
+    expect(src.includes('[string]$ManifestPath')).toBe(true);
+    expect(src.includes('[string]$ApprovedExternalArtifactRoot')).toBe(true);
+    expect(src.includes('approved root must be outside repository')).toBe(true);
+    expect(src.includes('Assert-NoReparseAncestor')).toBe(true);
+    expect(src.includes('symlink/reparse ancestor not allowed')).toBe(true);
+    expect(src.includes('traversal is not allowed')).toBe(true);
+    expect(src.includes('artifacts\\overseer\\m42-wave2')).toBe(false);
     expect(src.includes('circuits                 = $proofCircuits')).toBe(false);
     expect(src.includes('deployed_marker_sha')).toBe(false);
     expect(src.includes('prior_container_up')).toBe(false);

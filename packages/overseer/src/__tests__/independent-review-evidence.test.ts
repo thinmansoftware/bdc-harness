@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { describe, expect, test } from 'bun:test';
 import {
+  assertBuilderMatchesManifest,
   assertCandidateIsCurrentHead,
   validateIndependentReviewEvidence,
   type IndependentReviewArtifact,
@@ -124,5 +125,24 @@ describe('independent review evidence', () => {
     expect(() => assertCandidateIsCurrentHead(CANDIDATE, 'd'.repeat(40))).toThrow(
       'candidate must equal current git HEAD'
     );
+  });
+
+  test('CLI builder identity must match the authoritative manifest identity', () => {
+    expect(() =>
+      assertBuilderMatchesManifest(expected.builder, { provider: 'openai', model: 'codex-gpt-5' })
+    ).toThrow('builder identity must match manifest');
+    expect(() => assertBuilderMatchesManifest(expected.builder, expected.builder)).not.toThrow();
+  });
+
+  test('APPROVED artifact cannot contain a blocker finding', () => {
+    const result = validateIndependentReviewEvidence(
+      artifact({
+        findings: [{ scope: 'parent', severity: 'blocker', summary: 'must repair' }],
+      }),
+      TRANSCRIPT,
+      expected
+    );
+    expect(result.ok).toBe(false);
+    expect(result.errors.join('\n')).toContain('APPROVED artifact cannot contain blocker findings');
   });
 });
