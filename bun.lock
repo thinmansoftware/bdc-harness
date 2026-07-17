@@ -110,6 +110,7 @@
         "fusion": "./src/cli.ts",
       },
       "dependencies": {
+        "@archon/core": "workspace:*",
         "openai": "^6.45.0",
       },
     },

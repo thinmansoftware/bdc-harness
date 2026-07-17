@@ -7,10 +7,11 @@
     "fusion": "./src/cli.ts"
   },
   "scripts": {
-    "test": "bun test src/__tests__/gateway.test.ts && bun test src/__tests__/integrity.test.ts && bun test src/__tests__/redact.test.ts && bun test src/__tests__/full-run.test.ts",
+    "test": "bun test src/__tests__/gateway.test.ts && bun test src/__tests__/integrity.test.ts && bun test src/__tests__/redact.test.ts && bun test src/__tests__/full-run.test.ts && bun test src/__tests__/budget-receipts.test.ts",
     "type-check": "bun x tsc --noEmit"
   },
   "dependencies": {
+    "@archon/core": "workspace:*",
     "openai": "^6.45.0"
   }
 }
