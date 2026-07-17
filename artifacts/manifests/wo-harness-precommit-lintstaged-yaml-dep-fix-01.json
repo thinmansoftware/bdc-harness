@@ -1,0 +1,83 @@
+{
+  "schema_version": "manifest-v2",
+  "wo_id": "WO-HARNESS-PRECOMMIT-LINTSTAGED-YAML-DEP-FIX-01",
+  "status": "COMPLETE",
+  "chosen_option": "A",
+  "rationale": "Option A was chosen because adding yaml as a direct devDependency matching lint-staged's ^2.7.0 range is the smallest change and makes yaml resolve from lint-staged's nested Bun isolated install path.",
+  "base": {
+    "run_start_sha": "15fa811fd5ee46e94722de63078ba77f7ddce56f",
+    "merge_ancestor_origin_dev": "15fa811fd5ee46e94722de63078ba77f7ddce56f"
+  },
+  "changes": [
+    "Added yaml ^2.7.0 to root devDependencies.",
+    "Updated bun.lock root workspace devDependencies with yaml ^2.7.0."
+  ],
+  "runtime_environment_note": "This container has Bun 1.3.11 but no node binary. lint-staged's installed bin uses #!/usr/bin/env node, so fresh-worktree runtime hook checks used a temporary PATH-local node shim that execs /usr/local/bin/bun. No repo files were changed for the shim.",
+  "fresh_worktree": {
+    "path": "/tmp/wo-lintstaged-verify-ec4765bf",
+    "setup_commands": [
+      "git worktree add /tmp/wo-lintstaged-verify-ec4765bf HEAD",
+      "cd /tmp/wo-lintstaged-verify-ec4765bf",
+      "bun install --ignore-scripts"
+    ],
+    "setup_exit": 0
+  },
+  "scenario_1_fresh_worktree_commit_hook": {
+    "description": "Staged a trivial README.md change and ran the same hook command body.",
+    "command": "PATH=/tmp/wo-node-shim-bin:$PATH bun x lint-staged",
+    "exit_code": 0,
+    "output_escaped": "[STARTED] Backing up original state...\\n[COMPLETED] Backed up original state in git stash (f838a0e8)\\n[STARTED] Running tasks for staged files...\\n[STARTED] .lintstagedrc.json \\u2014 1 file\\n[STARTED] *.{ts,tsx} \\u2014 0 files\\n[STARTED] *.{json,md,yaml,yml} \\u2014 1 file\\n[SKIPPED] *.{ts,tsx} \\u2014 no files\\n[STARTED] prettier --write\\n[COMPLETED] prettier --write\\n[COMPLETED] *.{json,md,yaml,yml} \\u2014 1 file\\n[COMPLETED] .lintstagedrc.json \\u2014 1 file\\n[COMPLETED] Running tasks for staged files...\\n[STARTED] Applying modifications from tasks...\\n[COMPLETED] Applying modifications from tasks...\\n[STARTED] Cleaning up temporary files...\\n[COMPLETED] Cleaning up temporary files...\\n"
+  },
+  "scenario_2_yaml_resolves_from_nested_path": {
+    "command": "PATH=/tmp/wo-node-shim-bin:$PATH bun -e \"console.log(require.resolve('yaml', { paths: ['node_modules/.bun/lint-staged@15.5.2/node_modules/lint-staged/lib'] }))\"",
+    "exit_code": 0,
+    "output": "/tmp/wo-lintstaged-verify-ec4765bf/node_modules/.bun/yaml@2.8.2/node_modules/yaml/dist/index.js"
+  },
+  "scenario_3_lint_behavior_unchanged": {
+    "command": "PATH=/tmp/wo-node-shim-bin:$PATH bun x lint-staged",
+    "exit_code": 0,
+    "ts_before": "export function lintstagedProbe( ): string {\\n  return \"ok\"\\n}\\n",
+    "ts_after": "export function lintstagedProbe(): string {\\n  return 'ok';\\n}\\n",
+    "json_before": "{\"probe\":true,\"items\":[1,2]}",
+    "json_after": "{ \"probe\": true, \"items\": [1, 2] }\\n",
+    "output_escaped": "[STARTED] Backing up original state...\\n[COMPLETED] Backed up original state in git stash (059b83e6)\\n[STARTED] Running tasks for staged files...\\n[STARTED] .lintstagedrc.json \\u2014 2 files\\n[STARTED] *.{ts,tsx} \\u2014 1 file\\n[STARTED] *.{json,md,yaml,yml} \\u2014 1 file\\n[STARTED] eslint --fix --max-warnings 0 --no-warn-ignored\\n[STARTED] prettier --write\\n[COMPLETED] prettier --write\\n[COMPLETED] *.{json,md,yaml,yml} \\u2014 1 file\\n[COMPLETED] eslint --fix --max-warnings 0 --no-warn-ignored\\n[STARTED] prettier --write\\n[COMPLETED] prettier --write\\n[COMPLETED] *.{ts,tsx} \\u2014 1 file\\n[COMPLETED] .lintstagedrc.json \\u2014 2 files\\n[COMPLETED] Running tasks for staged files...\\n[STARTED] Applying modifications from tasks...\\n[COMPLETED] Applying modifications from tasks...\\n[STARTED] Cleaning up temporary files...\\n[COMPLETED] Cleaning up temporary files...\\n"
+  },
+  "scenario_4_commit_node_regression": {
+    "status": "covered_by_scenario_1",
+    "rationale": "The commit-and-push node invokes the tracked .husky/pre-commit body, which remains bun x lint-staged. Scenario 1 exercises that same command in a fresh git worktree with a staged markdown change."
+  },
+  "stop_conditions": {
+    "hook_body_nonempty": {
+      "command": "test \"$(cat .husky/pre-commit | tr -d '[:space:]')\" != \"\"",
+      "exit_code": 0
+    },
+    "no_yaml_crash": {
+      "command": "grep -c \"Cannot find package 'yaml'\" /tmp/wo-hook-scenario1-output.txt",
+      "expected_count": 0,
+      "actual_count": 0
+    },
+    "glob_parity": {
+      "status": "N/A",
+      "reason": "Option A was chosen; .husky/pre-commit was not rewritten."
+    },
+    "ascii_scan": {
+      "command": "grep -nP \"[^\\x00-\\x7F]\" .husky/pre-commit package.json bun.lock artifacts/manifests/wo-harness-precommit-lintstaged-yaml-dep-fix-01.json",
+      "exit_code": 1,
+      "matches": 0
+    }
+  },
+  "standard_checks": [
+    {
+      "command": "PATH=/tmp/wo-node-shim-bin:$PATH bun run lint --max-warnings 0",
+      "exit_code": 0
+    },
+    {
+      "command": "PATH=/tmp/wo-node-shim-bin:$PATH bun run format:check",
+      "exit_code": 0
+    },
+    {
+      "command": "PATH=/tmp/wo-node-shim-bin:$PATH bun run type-check",
+      "exit_code": 0
+    }
+  ]
+}
