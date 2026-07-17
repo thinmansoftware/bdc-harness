@@ -8,6 +8,8 @@
  * Design authority: 2026-05-09 WO-HARNESS-OVERLORD-PROVIDER-FAILOVER-01 (Python prior art).
  */
 
+const READ_SPEC_SCOPE_AUTHORITY_MISSING = 'read_spec_scope_authority_missing' as const;
+
 export type ErrorClass =
   // Provider/network errors (ported from router.py)
   | 'rate_limit_exceeded'
@@ -20,6 +22,15 @@ export type ErrorClass =
   | 'npm_not_found' // bun-only container, npm/npx/pnpm/yarn missing
   | 'verify_pre_existing' // verify-* failed on rot unrelated to WO diff
   | 'worktree_collision' // git: branch already used by another worktree
+  // Failure Classes E-J (2026-07-17): six doctrine classes split into eight code values
+  | 'scope_dirty_at_capture'
+  | 'commit_blocked_no_authorization'
+  | 'plan_review_source_unreachable'
+  | typeof READ_SPEC_SCOPE_AUTHORITY_MISSING
+  | 'read_spec_command_not_found'
+  | 'reviewer_no_output'
+  | 'loop_max_iterations'
+  | 'loop_idle_timeout'
   | 'spec_lookup_failed' // read-spec couldn't fetch WO spec from bdc-xo
   | 'branch_ref_missing' // git: fatal: couldn't find remote ref
   // Silent-dead-end classes (new, from 2026-05-18 Wave A anchor incidents)
@@ -138,6 +149,55 @@ export function classifyError(input: ClassifyInput): ErrorClass {
   // Branch ref missing: master/main hardcoded but doesn't exist
   if (/fatal: couldn't find remote ref/i.test(input.message ?? '')) {
     return 'branch_ref_missing';
+  }
+
+  // Failure Classes E-J (2026-07-17). Doctrine names six classes; code splits H and J
+  // into separate operational values for distinct observable failure modes.
+  if (rawMessage.includes('run_scope_dirty_at_capture')) {
+    return 'scope_dirty_at_capture';
+  }
+
+  if (
+    rawMessage.includes(
+      "commit-and-push reached with status='BLOCKED' and no satisfied approve-with-fix or opus-rereview authorization"
+    )
+  ) {
+    return 'commit_blocked_no_authorization';
+  }
+
+  if (
+    /plan-review' escalated at iteration \d+/i.test(rawMessage) &&
+    /(could not be retrieved|unreachable|404|cannot read the design|expected method and format for reading)/i.test(
+      rawMessage
+    )
+  ) {
+    return 'plan_review_source_unreachable';
+  }
+
+  if (input.nodeId === 'read-spec' && exit === 1 && msg.includes('scope_authority_missing')) {
+    return READ_SPEC_SCOPE_AUTHORITY_MISSING;
+  }
+
+  if (
+    input.nodeId === 'read-spec' &&
+    (exit === 127 || /exit 127|command not found/i.test(rawMessage))
+  ) {
+    return 'read_spec_command_not_found';
+  }
+
+  if (
+    msg.includes('produced no assistant output') ||
+    msg.includes('provider stream closed without yielding content')
+  ) {
+    return 'reviewer_no_output';
+  }
+
+  if (/Loop node '[^']+' exceeded max iterations/.test(rawMessage)) {
+    return 'loop_max_iterations';
+  }
+
+  if (/Loop '[^']+' iteration \d+ exceeded (idle|wall) timeout/.test(rawMessage)) {
+    return 'loop_idle_timeout';
   }
 
   // Spec lookup failed

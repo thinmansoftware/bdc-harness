@@ -1,5 +1,7 @@
 import { describe, test, expect } from 'bun:test';
-import { classifyError, decide } from './index.ts';
+import { classifyError } from './classify.ts';
+import { decide } from './decide.ts';
+import type { ErrorClass } from './classify.ts';
 
 describe('classifyError -- workflow-runtime classes (BDC 2026-05-16)', () => {
   test('sentinel_mismatch: loop node + SDK returned success message', () => {
@@ -110,6 +112,160 @@ describe('classifyError -- provider classes (ported from router.py)', () => {
   });
 });
 
+describe('classifyError -- failure classes E-J (BDC 2026-07-17)', () => {
+  test('scope_dirty_at_capture: run_scope_dirty_at_capture primary token', () => {
+    expect(
+      classifyError({
+        message:
+          "DAG workflow 'bdc-feature-development-codex' completed with failures: 'capture-run-scope': Bash node 'capture-run-scope' failed [exit 1]: run_scope_dirty_at_capture: working tree changed before run scope capture",
+        nodeId: 'capture-run-scope',
+        exitCode: 1,
+      })
+    ).toBe('scope_dirty_at_capture');
+  });
+
+  test('commit_blocked_no_authorization: blocked commit without approval authorization', () => {
+    expect(
+      classifyError({
+        message:
+          "DAG workflow 'bdc-feature-development-codex' completed with failures: 'commit-and-push': Bash node 'commit-and-push' failed [exit 1]: commit-and-push reached with status='BLOCKED' and no satisfied approve-with-fix or opus-rereview authorization",
+        nodeId: 'commit-and-push',
+        exitCode: 1,
+      })
+    ).toBe('commit_blocked_no_authorization');
+  });
+
+  test('plan_review_source_unreachable: escalated plan-review source phrases', () => {
+    const phrases = [
+      'could not be retrieved from the source repository',
+      'source repository unreachable',
+      'source returned 404',
+      'cannot read the design reference',
+      'expected method and format for reading the design',
+    ];
+
+    for (const phrase of phrases) {
+      expect(
+        classifyError({
+          message: `DAG workflow 'bdc-feature-development-codex' completed with failures: 'plan-review': Loop node 'plan-review' escalated at iteration 2: SPEC_PATH github:bluedevilcollectibles/bdc-xo:docs/work-orders/WO-MISSING.md ${phrase}`,
+          nodeId: 'plan-review',
+          nodeType: 'loop',
+        })
+      ).toBe('plan_review_source_unreachable');
+    }
+  });
+
+  test('H_shadow_bug: read-spec scope_authority_missing beats spec_lookup_failed', () => {
+    expect(
+      classifyError({
+        message:
+          "DAG workflow 'bdc-feature-development-codex' completed with failures: 'read-spec': Bash node 'read-spec' failed [exit 1]: scope_authority_missing: run-authority.json",
+        nodeId: 'read-spec',
+        exitCode: 1,
+      })
+    ).toBe('read_spec_scope_authority_missing');
+  });
+
+  test('read_spec_command_not_found: read-spec exit 127 missing command', () => {
+    expect(
+      classifyError({
+        message:
+          "DAG workflow 'bdc-feature-development-codex' completed with failures: 'read-spec': Bash node 'read-spec' failed [exit 127]: bash: line 1: read-spec: command not found",
+        nodeId: 'read-spec',
+        exitCode: 127,
+      })
+    ).toBe('read_spec_command_not_found');
+  });
+
+  test('reviewer_no_output: provider stream closed without assistant content', () => {
+    expect(
+      classifyError({
+        message:
+          "DAG workflow 'bdc-feature-development-codex' completed with failures: 'war-council-validator': Prompt node 'war-council-validator' failed: provider stream closed without yielding content",
+        nodeId: 'war-council-validator',
+        nodeType: 'prompt',
+      })
+    ).toBe('reviewer_no_output');
+  });
+
+  test('reviewer_no_output: produced no assistant output', () => {
+    expect(
+      classifyError({
+        message:
+          "DAG workflow 'bdc-feature-development-codex' completed with failures: 'diff-review': Prompt node 'diff-review' failed: produced no assistant output",
+        nodeId: 'diff-review',
+        nodeType: 'prompt',
+      })
+    ).toBe('reviewer_no_output');
+  });
+
+  test('loop_max_iterations: loop exceeded max iterations envelope', () => {
+    expect(
+      classifyError({
+        message:
+          "DAG workflow 'bdc-feature-development-codex' completed with failures: 'implement': Loop node 'implement' exceeded max iterations after 6 iterations",
+        nodeId: 'implement',
+        nodeType: 'loop',
+      })
+    ).toBe('loop_max_iterations');
+  });
+
+  test('loop_idle_timeout: loop iteration exceeded idle timeout envelope', () => {
+    expect(
+      classifyError({
+        message:
+          "DAG workflow 'bdc-feature-development-codex' completed with failures: 'implement': Loop 'implement' iteration 3 exceeded idle timeout (120000ms)",
+        nodeId: 'implement',
+        nodeType: 'loop',
+      })
+    ).toBe('loop_idle_timeout');
+  });
+
+  test('spec_lookup_unchanged: read-spec exit 1 without scope_authority_missing stays spec_lookup_failed', () => {
+    expect(
+      classifyError({
+        message:
+          "DAG workflow 'bdc-feature-development-codex' completed with failures: 'read-spec': Bash node 'read-spec' failed [exit 1]: Spec not found for WO_ID=WO-FOO-BAR-01",
+        nodeId: 'read-spec',
+        exitCode: 1,
+      })
+    ).toBe('spec_lookup_failed');
+  });
+
+  test('I_no_shadow: loop SDK-returned-success stays sentinel_mismatch', () => {
+    expect(
+      classifyError({
+        message:
+          "DAG workflow 'bdc-feature-development-codex' completed with failures: 'implement': Loop 'implement' iteration 1 failed: SDK returned success",
+        nodeId: 'implement',
+        nodeType: 'loop',
+      })
+    ).toBe('sentinel_mismatch');
+  });
+
+  test('G_negative: plan-review design and format words without source phrase stays unknown', () => {
+    expect(
+      classifyError({
+        message:
+          "DAG workflow 'bdc-feature-development-codex' completed with failures: 'plan-review': Loop node 'plan-review' escalated at iteration 1: the design of the output format needs work",
+        nodeId: 'plan-review',
+        nodeType: 'loop',
+      })
+    ).toBe('unknown');
+  });
+
+  test('J_wall_timeout: wall-timeout loop envelope maps to loop_idle_timeout', () => {
+    expect(
+      classifyError({
+        message:
+          "DAG workflow 'bdc-feature-development-codex' completed with failures: 'implement': Loop 'implement' iteration 1 exceeded wall timeout (480000ms)",
+        nodeId: 'implement',
+        nodeType: 'loop',
+      })
+    ).toBe('loop_idle_timeout');
+  });
+});
+
 describe('classifyError -- fallback', () => {
   test('unknown for unrecognized input', () => {
     expect(classifyError({ message: 'something weird happened' })).toBe('unknown');
@@ -172,6 +328,33 @@ describe('decide -- workflow-runtime classes', () => {
   test('spec_lookup_failed retries once then escalates', () => {
     expect(decide({ errorClass: 'spec_lookup_failed', attempt: 1 }).decision).toBe('retry');
     expect(decide({ errorClass: 'spec_lookup_failed', attempt: 2 }).decision).toBe('escalate');
+  });
+});
+
+describe('decide -- failure classes E-J', () => {
+  test('decisions_are_escalate_only: every new class escalates without action command context', () => {
+    const newClasses: ErrorClass[] = [
+      'scope_dirty_at_capture',
+      'commit_blocked_no_authorization',
+      'plan_review_source_unreachable',
+      'read_spec_scope_authority_missing',
+      'read_spec_command_not_found',
+      'reviewer_no_output',
+      'loop_max_iterations',
+      'loop_idle_timeout',
+    ];
+
+    for (const errorClass of newClasses) {
+      const result = decide({ errorClass, attempt: 1 });
+      const rawResult = result as Record<string, unknown>;
+
+      expect(result.decision).toBe('escalate');
+      expect(result.escalationContext).toBeUndefined();
+      expect(rawResult.action).toBeUndefined();
+      expect(rawResult.adapter).toBeUndefined();
+      expect(rawResult.command).toBeUndefined();
+      expect(result.reason).not.toMatch(/\b(re-fire|climb|clean|chown|salvage)\b/i);
+    }
   });
 });
 
