@@ -157,12 +157,24 @@ describe('watch selectFailureEvent', () => {
   });
 
   test('multiple_node_failed_without_authoritative_failed_nodes_uses_latest_node_failed', () => {
-    const olderFailed = event('event-1', 'node_failed', 'older-branch', '2026-07-17T19:20:50.000Z', {
-      error: 'older branch failed',
-    });
-    const newerFailed = event('event-2', 'node_failed', 'newer-branch', '2026-07-17T19:20:52.000Z', {
-      error: 'newer branch failed',
-    });
+    const olderFailed = event(
+      'event-1',
+      'node_failed',
+      'older-branch',
+      '2026-07-17T19:20:50.000Z',
+      {
+        error: 'older branch failed',
+      }
+    );
+    const newerFailed = event(
+      'event-2',
+      'node_failed',
+      'newer-branch',
+      '2026-07-17T19:20:52.000Z',
+      {
+        error: 'newer branch failed',
+      }
+    );
     const unrelatedCompleted = event(
       'event-3',
       'node_completed',
