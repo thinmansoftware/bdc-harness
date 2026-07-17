@@ -27,6 +27,25 @@ import type {
   PullRequestEvidence,
   WatchedRunRecord,
 } from './types.ts';
+// M-42 Slice 8: surface integrated action modules (default-off; no live authority).
+// Child action internals remain owned by S4-S7; this only registers the module surface.
+import { assessRepairRefireCandidate } from './actions/repair-refire';
+import { assessBranchRefreshCandidate } from './actions/refresh-rebase';
+import { assessLifecycleCandidate } from './actions/lifecycle';
+import { assessQualifiedMerge } from './actions/merge-ready';
+import { assertOverseerDefaultOff } from './integration-scenarios';
+
+/**
+ * Integrated S4-S7 assessment surface for Slice 8 wiring.
+ * All capabilities remain default-off; these references prove modules load.
+ */
+export const SLICE8_INTEGRATED_ASSESSORS = Object.freeze({
+  repair_refire: assessRepairRefireCandidate,
+  refresh_rebase: assessBranchRefreshCandidate,
+  lifecycle: assessLifecycleCandidate,
+  merge: assessQualifiedMerge,
+  assert_default_off: assertOverseerDefaultOff,
+});
 
 const log = createLogger('overseer/service');
 

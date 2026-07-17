@@ -6,6 +6,8 @@ import { existsSync, mkdirSync } from 'fs';
 import { dirname } from 'path';
 import type { IDatabase, QueryResult, SqlDialect } from './types';
 import { createLogger } from '@archon/paths';
+import { installM31TargetV2Sqlite } from '../m31-target-v2-sqlite';
+import { installOverseerControlPlaneSqlite } from '../overseer-control-plane-sqlite';
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
 let cachedLog: ReturnType<typeof createLogger> | undefined;
@@ -18,6 +20,10 @@ export class SqliteAdapter implements IDatabase {
   private db: Database;
   readonly dialect = 'sqlite' as const;
   readonly sql: SqlDialect = sqliteDialect;
+  /** M-42 Slice 8: registration of reviewed isolated Wave 2 schema installers. */
+  private wave2SchemaPromise: Promise<void> | null = null;
+  /** Re-entrancy guard while installers call this.query(). */
+  private wave2Installing = false;
 
   constructor(dbPath: string) {
     // Ensure directory exists
@@ -41,7 +47,34 @@ export class SqliteAdapter implements IDatabase {
     this.initSchema();
   }
 
+  /**
+   * Await central registration of M-31 target-v2 and control-plane SQLite schemas.
+   * Slice 8 alone registers these reviewed isolated installers.
+   * Installers are idempotent (IF NOT EXISTS). Invoked on first query so
+   * constructor teardown races in tests cannot hit a closed database handle.
+   */
+  async ensureWave2Schemas(): Promise<void> {
+    if (!this.wave2SchemaPromise) {
+      this.wave2SchemaPromise = (async (): Promise<void> => {
+        this.wave2Installing = true;
+        try {
+          await installM31TargetV2Sqlite(this);
+          await installOverseerControlPlaneSqlite(this);
+        } finally {
+          this.wave2Installing = false;
+        }
+      })();
+    }
+    await this.wave2SchemaPromise;
+  }
+
   async query<T>(sql: string, params?: unknown[]): Promise<QueryResult<T>> {
+    // Register Wave 2 isolated schemas before any application query.
+    // Skip while installers themselves are issuing CREATE statements.
+    if (!this.wave2Installing) {
+      await this.ensureWave2Schemas();
+    }
+
     // Convert $1, $2, etc. to ? placeholders and reorder params to match
     const { sql: convertedSql, params: reorderedParams } = this.convertPlaceholders(
       sql,

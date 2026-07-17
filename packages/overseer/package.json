@@ -19,7 +19,14 @@
     "./permit": "./src/permit.ts",
     "./operator-card": "./src/operator-card.ts",
     "./escalation-delivery": "./src/escalation-delivery.ts",
-    "./adapters/fake-github": "./src/adapters/fake-github.ts"
+    "./adapters/fake-github": "./src/adapters/fake-github.ts",
+    "./integration-manifest": "./src/integration-manifest.ts",
+    "./independent-review-evidence": "./src/independent-review-evidence.ts",
+    "./external-finalization": "./src/external-finalization.ts",
+    "./integration-scenarios": "./src/integration-scenarios.ts",
+    "./integration-fixtures": "./src/integration-fixtures.ts",
+    "./activation-package": "./src/activation-package.ts",
+    "./control-plane": "./src/control-plane.ts"
   },
   "scripts": {
     "test": "bun test src/overseer.test.ts && bun test tests/ && bun test src/__tests__/",

@@ -13,6 +13,12 @@ import type {
 
 export const DEFAULT_WATCH_INTERVAL_MS = 60_000;
 
+/**
+ * M-42 Slice 8 integration marker: single-watcher ownership for the
+ * integrated candidate. Runtime still starts at most one watcher task.
+ */
+export const SLICE8_WATCHER_OWNERSHIP = 'single_watcher_fail_closed' as const;
+
 function isTerminalStatus(status: string): status is WorkflowRunStatus {
   return (TERMINAL_WORKFLOW_STATUSES as readonly string[]).includes(status);
 }

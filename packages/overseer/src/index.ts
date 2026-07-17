@@ -102,3 +102,92 @@ export type {
   PullRequestEvidence,
   WatchedRunRecord,
 } from './types';
+
+// M-42 Slice 8 integration, scenarios, and unsigned activation packets.
+export {
+  buildOverseerParentManifest,
+  reduceParentEvidence,
+  REQUIRED_M42_CHILD_WO_IDS,
+} from './integration-manifest';
+export {
+  assertBuilderMatchesManifest,
+  assertCandidateIsCurrentHead,
+  INDEPENDENT_REVIEW_SCHEMA_VERSION,
+  validateIndependentReviewEvidence,
+} from './independent-review-evidence';
+export {
+  finalizeExternalEvidence,
+  prepareExternalManifest,
+  resolveExternalArtifactInput,
+  resolveExternalArtifactRoot,
+} from './external-finalization';
+export type {
+  CompleteRollbackProof,
+  CompleteStagingProof,
+  ExternalSeedChild,
+  ExternalSeedManifest,
+  FinalizeExternalEvidenceInput,
+  FinalizeExternalEvidenceResult,
+} from './external-finalization';
+export type {
+  ExpectedIndependentReview,
+  IndependentReviewArtifact,
+  IndependentReviewFinding,
+  IndependentReviewValidationResult,
+  IndependentReviewVerdict,
+  ReviewAgentIdentity,
+} from './independent-review-evidence';
+export type {
+  ChildEvidenceRecord,
+  ChildReviewEvidence,
+  EvidenceState,
+  OverseerParentManifest,
+  ParentEvidenceInput,
+  ParentReadinessPacket,
+  ReducedParentEvidence,
+  SliceEvidenceSummary,
+} from './integration-manifest';
+export {
+  assertOverseerDefaultOff,
+  runOverseerAdversarialScenario,
+  runOverseerAdversarialMatrix,
+  runIntegratedSuccessChain,
+  invokeRealProviderBoundary,
+  ADVERSARIAL_SCENARIO_IDS,
+  OVERSEER_CAPABILITIES,
+} from './integration-scenarios';
+export type {
+  DefaultOffInput,
+  DefaultOffResult,
+  ScenarioDeps,
+  ScenarioId,
+  ScenarioRunInput,
+  ScenarioRunResult,
+  SuccessChainResult,
+  MatrixResult,
+  ChainReceipt,
+} from './integration-scenarios';
+export { createRealCallTracker } from './integration-fixtures';
+export type { RealCallTracker } from './integration-fixtures';
+export {
+  assertActivationPackageInput,
+  buildUnsignedSandboxProofRequest,
+  buildUnsignedActivationRequest,
+  verifyWrittenActivationArtifactDigests,
+  writeNonGovernanceActivationArtifacts,
+  canonicalJsonStringify,
+} from './activation-package';
+export type {
+  ActivationPackageInput,
+  ActivationArtifactBundle,
+  UnsignedSandboxProofRequest,
+  UnsignedActivationRequest,
+  WrittenActivationArtifacts,
+  StagingProofEvidence,
+  RollbackProofEvidence,
+} from './activation-package';
+export { createOverseerControlPlaneService } from './control-plane';
+export type {
+  OverseerControlPlaneService,
+  OverseerControlPlaneServiceDependencies,
+} from './control-plane';
