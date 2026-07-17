@@ -216,7 +216,7 @@ nodes:
         - `policyFile: harness/policies/agent-behavior.md` at root
         - All file paths RELATIVE TO REPO ROOT (no repo-name prefix)
         - Every `loop:` node declares ALL FOUR fields: `prompt:`, `until:`, `max_iterations:`, `fresh_context:`
-        - Final node MUST be `flip-notion` (Archon does not auto-update Notion)
+        - Final node MUST be `review-issue` (Archon records completion on the GitHub WO issue)
         - NO `curl` to n8n.bluedevilcollectibles.com in bash nodes (hangs in executor subprocess)
         - Bash: use `$WORKFLOW_ID` NOT `${run.id}` (token substituted at YAML-parse time)
         - Bash: NO `set -u` if block references `$WORKFLOW_ID` inline (it's not a runtime env var)
@@ -611,22 +611,25 @@ nodes:
       $open-pr.output
       $file-notion.output
 
-  - id: flip-notion-meta
+  - id: review-issue
     depends_on: [build-manifest]
     task_class: clerical
-    prompt: |
-      Flip Notion WO-HARNESS-AUTHOR-WO-BATCH-META-01 to REVIEW with manifest in Notes property.
+    bash: |
+      set -euo pipefail
 
-      Notion page ID: 35fef4c9-ce00-81f1-aaaa-ded673d03082
-      Required changes:
-      - Claude Status -> REVIEW
-      - Status -> Review
-      - Notes -> $build-manifest.output verbatim
-      - claimed_by: Major Build (bdc-author-wo-batch)
-      - claimed_at: 2026-05-13
+      ISSUE_REPO="${ISSUE_REPO:-bluedevilcollectibles/bdc-xo}"
+      WO_ID="WO-HARNESS-AUTHOR-WO-BATCH-META-01"
+      ISSUE_NUM=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'issue=[0-9]+' | head -1 | cut -d= -f2 || true)
+      if [ -z "$ISSUE_NUM" ]; then
+        ISSUE_NUM=$(gh issue list --repo "$ISSUE_REPO" --search "$WO_ID in:title" --json number --jq '.[0].number // empty' 2>/dev/null || true)
+      fi
+      if [ -z "$ISSUE_NUM" ]; then
+        echo "review-issue: no GitHub issue resolved for $WO_ID; skipping status:review label."
+        exit 0
+      fi
 
-      If Notion MCP unavailable, output:
-        XO_TODO: Flip WO-HARNESS-AUTHOR-WO-BATCH-META-01 to REVIEW; paste manifest into Notes property.
-
-      Manifest:
-      $build-manifest.output
+      gh label create status:review --repo "$ISSUE_REPO" --color 0E8A16 --description "BDC workflow is ready for review" 2>/dev/null || true
+      gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --remove-label status:building 2>/dev/null || true
+      gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --remove-label status:blocked 2>/dev/null || true
+      gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --add-label status:review
+      echo "review-issue: $ISSUE_REPO#$ISSUE_NUM -> status:review"
