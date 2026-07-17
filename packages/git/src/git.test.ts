@@ -1375,7 +1375,13 @@ branch refs/heads/feature/auth
 
       const commandArgs = execSpy.mock.calls.map((call: unknown[]) => call[1] as string[]);
       expect(commandArgs).toContainEqual(['-C', '/workspace/repo', 'checkout', 'main']);
-      expect(commandArgs).toContainEqual(['-C', '/workspace/repo', 'reset', '--hard', 'origin/main']);
+      expect(commandArgs).toContainEqual([
+        '-C',
+        '/workspace/repo',
+        'reset',
+        '--hard',
+        'origin/main',
+      ]);
       expect(commandArgs).toContainEqual(['-C', '/workspace/repo', 'clean', '-fd']);
     });
 
@@ -1398,7 +1404,13 @@ branch refs/heads/feature/auth
         'main',
         'origin/main',
       ]);
-      expect(commandArgs).toContainEqual(['-C', '/workspace/repo', 'reset', '--hard', 'origin/main']);
+      expect(commandArgs).toContainEqual([
+        '-C',
+        '/workspace/repo',
+        'reset',
+        '--hard',
+        'origin/main',
+      ]);
       expect(commandArgs).toContainEqual(['-C', '/workspace/repo', 'clean', '-fd']);
     });
 
