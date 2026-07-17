@@ -23,6 +23,7 @@ export {
   findWorktreeByBranch,
   isWorktreePath,
   removeWorktree,
+  pruneWorktrees,
   getCanonicalRepoPath,
   verifyWorktreeOwnership,
 } from './worktree';

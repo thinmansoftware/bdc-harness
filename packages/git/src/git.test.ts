@@ -1881,6 +1881,68 @@ branch refs/heads/feature/auth
     });
   });
 
+  describe('pruneWorktrees', () => {
+    let execSpy: Mock<typeof git.execFileAsync>;
+
+    beforeEach(() => {
+      execSpy = spyOn(git, 'execFileAsync');
+    });
+
+    afterEach(() => {
+      execSpy.mockRestore();
+    });
+
+    test('calls git worktree prune with correct arguments', async () => {
+      execSpy.mockResolvedValue({ stdout: '', stderr: '' });
+
+      await git.pruneWorktrees('/workspace/repo');
+
+      expect(execSpy).toHaveBeenCalledWith('git', ['-C', '/workspace/repo', 'worktree', 'prune'], {
+        timeout: 30000,
+      });
+    });
+
+    test('logs and continues (does not throw) for "not a git repository" error', async () => {
+      mockLogger.warn.mockClear();
+      execSpy.mockRejectedValue(new Error('fatal: not a git repository'));
+
+      await expect(git.pruneWorktrees('/workspace/repo')).resolves.toBeUndefined();
+      expect(mockLogger.warn).toHaveBeenCalledWith(
+        expect.objectContaining({ repoPath: '/workspace/repo' }),
+        'worktree.prune_repo_missing'
+      );
+    });
+
+    test('logs and continues for "No such file or directory" error', async () => {
+      mockLogger.warn.mockClear();
+      execSpy.mockRejectedValue(new Error('No such file or directory'));
+
+      await expect(git.pruneWorktrees('/workspace/repo')).resolves.toBeUndefined();
+      expect(mockLogger.warn).toHaveBeenCalledWith(
+        expect.objectContaining({ repoPath: '/workspace/repo' }),
+        'worktree.prune_repo_missing'
+      );
+    });
+
+    test('throws and logs for unexpected errors', async () => {
+      mockLogger.error.mockClear();
+      const mockError = new Error('permission denied') as Error & { stderr?: string };
+      mockError.stderr = 'fatal: permission denied';
+      execSpy.mockRejectedValue(mockError);
+
+      await expect(git.pruneWorktrees('/workspace/repo')).rejects.toThrow(
+        'Failed to prune worktrees for /workspace/repo: permission denied'
+      );
+      expect(mockLogger.error).toHaveBeenCalledWith(
+        expect.objectContaining({
+          repoPath: '/workspace/repo',
+          stderr: 'fatal: permission denied',
+        }),
+        'worktree.prune_failed'
+      );
+    });
+  });
+
   describe('addSafeDirectory error handling', () => {
     let execSpy: Mock<typeof git.execFileAsync>;
 

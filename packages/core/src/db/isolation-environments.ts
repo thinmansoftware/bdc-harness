@@ -231,6 +231,36 @@ export async function findActiveByBranchName(
 }
 
 /**
+ * Minimal projection of an active isolation environment keyed by working path.
+ * Used by the worktree sweep to cross-reference on-disk dirs against
+ * env-tracked (but possibly run-less) worktrees.
+ */
+export interface ActiveEnvironmentWithWorkingPath {
+  id: string;
+  working_path: string;
+  created_by_platform: string | null;
+  created_at: Date;
+}
+
+/**
+ * List all non-destroyed isolation environments with just the fields the
+ * worktree sweep needs (id, working_path, created_by_platform, created_at).
+ *
+ * Kept as a narrow projection (not SELECT *) so the sweep does not depend on
+ * the full row shape and the query stays cheap.
+ */
+export async function listActiveEnvironmentsWithWorkingPath(): Promise<
+  ActiveEnvironmentWithWorkingPath[]
+> {
+  const result = await pool.query<ActiveEnvironmentWithWorkingPath>(
+    `SELECT id, working_path, created_by_platform, created_at
+     FROM remote_agent_isolation_environments
+     WHERE status != 'destroyed'`
+  );
+  return [...result.rows];
+}
+
+/**
  * List all active environments with their codebase info (for cleanup)
  */
 export async function listAllActiveWithCodebase(): Promise<

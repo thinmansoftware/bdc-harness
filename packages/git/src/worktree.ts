@@ -276,6 +276,37 @@ export async function removeWorktree(
 }
 
 /**
+ * Prune stale worktree administrative metadata from a repository.
+ *
+ * A worktree that is moved or deleted without `git worktree remove` leaves a
+ * dangling entry under the canonical repo's `.git/worktrees/`. Running
+ * `git worktree prune` clears those stale entries.
+ *
+ * Log-and-continue for expected "not a git repository" / missing-repo errors
+ * (the canonical clone may be absent or unregistered) -- prune is best-effort
+ * hygiene, not a critical-path operation. Throws for unexpected errors.
+ */
+export async function pruneWorktrees(repoPath: RepoPath): Promise<void> {
+  try {
+    await execFileAsync('git', ['-C', repoPath, 'worktree', 'prune'], { timeout: 30000 });
+  } catch (error) {
+    const err = error as Error & { code?: string; stderr?: string };
+    const errorText = `${err.message} ${err.stderr ?? ''}`;
+
+    if (
+      errorText.includes('not a git repository') ||
+      errorText.includes('No such file or directory')
+    ) {
+      getLog().warn({ repoPath }, 'worktree.prune_repo_missing');
+      return;
+    }
+
+    getLog().error({ repoPath, err, code: err.code, stderr: err.stderr }, 'worktree.prune_failed');
+    throw new Error(`Failed to prune worktrees for ${repoPath}: ${err.message}`);
+  }
+}
+
+/**
  * Get canonical repo path from a worktree path
  * If already canonical, returns the same path
  */

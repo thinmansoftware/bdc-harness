@@ -22,6 +22,7 @@ import {
   getConversationsUsingEnv,
   findStaleEnvironments,
   listAllActiveWithCodebase,
+  listActiveEnvironmentsWithWorkingPath,
 } from './isolation-environments';
 
 describe('isolation-environments', () => {
@@ -344,6 +345,44 @@ describe('isolation-environments', () => {
 
       const result = await listAllActiveWithCodebase();
 
+      expect(result).toEqual([]);
+    });
+  });
+
+  describe('listActiveEnvironmentsWithWorkingPath', () => {
+    test('selects narrow projection filtered on non-destroyed status', async () => {
+      const rows = [
+        {
+          id: 'env-1',
+          working_path: '/workspace/worktrees/archon/thread-1',
+          created_by_platform: 'web',
+          created_at: new Date(),
+        },
+        {
+          id: 'env-2',
+          working_path: '/workspace/worktrees/archon/thread-2',
+          created_by_platform: 'telegram',
+          created_at: new Date(),
+        },
+      ];
+      mockQuery.mockResolvedValueOnce(createQueryResult(rows));
+
+      const result = await listActiveEnvironmentsWithWorkingPath();
+
+      expect(result).toEqual(rows);
+      const [query] = mockQuery.mock.calls[0] as [string, unknown[]];
+      expect(query).toContain('id, working_path, created_by_platform, created_at');
+      expect(query).toContain("status != 'destroyed'");
+      // Narrow projection -- must NOT SELECT *.
+      expect(query).not.toContain('SELECT *');
+    });
+
+    test('returns a mutable array (not the readonly result rows)', async () => {
+      mockQuery.mockResolvedValueOnce(createQueryResult([]));
+
+      const result = await listActiveEnvironmentsWithWorkingPath();
+
+      expect(Array.isArray(result)).toBe(true);
       expect(result).toEqual([]);
     });
   });
