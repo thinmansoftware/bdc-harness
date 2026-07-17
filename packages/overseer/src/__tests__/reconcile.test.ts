@@ -102,6 +102,18 @@ describe('reconcile duty', () => {
     ]);
   });
 
+  test('merged fixture PR still closes tracker without recording action when no run matches', async () => {
+    const fake = deps({ runId: null });
+
+    await runReconcileDuty(fake, { now: new Date('2026-07-17T12:00:00.000Z') });
+
+    expect(fake.resolveRunId).toHaveBeenCalledWith('WO-HARNESS-OVERSEER-V1B-TRACKER-RECONCILE-01');
+    expect(fake.calls.comments).toHaveLength(1);
+    expect(fake.calls.labels).toEqual([876]);
+    expect(fake.calls.closes).toEqual([876]);
+    expect(fake.calls.records).toHaveLength(0);
+  });
+
   test('same input second run no-ops once tracker is already closed', async () => {
     const fake = deps({ trackerIssue: tracker({ state: 'CLOSED' }) });
 
@@ -154,4 +166,3 @@ describe('reconcile duty', () => {
     expect(fake.calls.closes).toHaveLength(0);
   });
 });
-
