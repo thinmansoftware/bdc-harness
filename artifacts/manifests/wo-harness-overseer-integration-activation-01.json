@@ -1,11 +1,11 @@
 {
   "schema_version": "m42-parent-manifest-v1",
   "wo_id": "WO-HARNESS-OVERSEER-INTEGRATION-ACTIVATION-01",
-  "builder_login": "grok-slice8-builder",
+  "builder_login": "codex-slice8-repair-builder",
   "reviewer_login": "pending-independent-reviewer",
   "builder": {
-    "provider": "xai",
-    "model": "grok-code-fast-1"
+    "provider": "openai",
+    "model": "codex-gpt-5"
   },
   "independent_review": {
     "state": "pending",
@@ -152,6 +152,7 @@
     "Unsigned packets withheld while status=BLOCKED; packet builders reject zero prior SHA and zero verifier digests.",
     "Official proof host corrected to Docker-capable LAPTOP-BQ6IEJNC; Stops 3-4 remain pending external execution at this committed head.",
     "No provider canary, paid Fusion, production deploy, capability enablement, or live operator authority.",
-    "The committed BLOCKED manifest intentionally does not self-claim its containing commit SHA."
+    "The committed BLOCKED manifest intentionally does not self-claim its containing commit SHA.",
+    "The original Slice 8 implementation was produced on a Grok lane; the exact-head repair candidate was modified by Codex and therefore uses the Codex repairer identity for Stop 7 independence."
   ]
 }
