@@ -262,6 +262,59 @@ export function decide(input: DecideInput): DecisionResult {
         },
       };
 
+    // --- Failure Classes E-J (BDC-specific 2026-07-17) ---
+    //
+    // These are dry-run observer classifications only. The decision layer returns
+    // escalation diagnostics and does not emit adapter or executor commands.
+
+    case 'scope_dirty_at_capture':
+      return {
+        decision: 'escalate',
+        reason: 'run scope was dirty at capture; infra ownership review needed',
+      };
+
+    case 'commit_blocked_no_authorization':
+      return {
+        decision: 'escalate',
+        reason: 'commit-and-push blocked without required authorization; harness review needed',
+      };
+
+    case 'plan_review_source_unreachable':
+      return {
+        decision: 'escalate',
+        reason: 'plan-review could not access the source material; spec-source review needed',
+      };
+
+    case 'read_spec_scope_authority_missing':
+      return {
+        decision: 'escalate',
+        reason: 'read-spec lacked run scope authority; infra ownership review needed',
+      };
+
+    case 'read_spec_command_not_found':
+      return {
+        decision: 'escalate',
+        reason: 'read-spec command was unavailable in the runtime image; infra ownership review needed',
+      };
+
+    case 'reviewer_no_output':
+      return {
+        decision: 'escalate',
+        reason: 'reviewer provider returned no assistant content; provider stability review needed',
+      };
+
+    case 'loop_max_iterations':
+      return {
+        decision: 'escalate',
+        reason: 'loop exceeded max iterations; capability review needed',
+      };
+
+    case 'loop_idle_timeout':
+      return {
+        decision: 'escalate',
+        reason: 'loop iteration exceeded idle or wall timeout; runtime budget review needed',
+      };
+
     case 'unknown':
     default:
       return {
