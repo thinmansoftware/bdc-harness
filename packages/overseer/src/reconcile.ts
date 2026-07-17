@@ -220,7 +220,9 @@ export function createDefaultReconcileDeps(): ReconcileDeps {
 
   let octokit: Promise<OctokitLike> | null = null;
   const getOctokit = async (): Promise<OctokitLike> => {
-    octokit ??= import('@octokit/rest').then(module => new module.Octokit({ auth: token }));
+    octokit ??= import('@octokit/rest').then(
+      module => new module.Octokit({ auth: token }) as unknown as OctokitLike
+    );
     return octokit;
   };
   return {
