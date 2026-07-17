@@ -29,6 +29,8 @@ function manifest(): M42Slice8BManifestPayload {
     repository_full_name: 'bluedevilcollectibles/bdc-harness',
     provider_repository_id: 'R_sandbox_123',
     credential_principal_id: 'principal-sandbox-only-1234',
+    image_digest: DIGEST,
+    fusion_caps_digest: DIGEST,
     verifier_registry_digest: DIGEST,
     action_policy_digest: DIGEST,
     expected_primary_actions: ['REFIRE', 'REFRESH', 'CLOSE', 'MERGE'],
@@ -114,6 +116,14 @@ describe('M-42 Slice 8B evidence packet', () => {
     expect(packet.no_production_mutation).toBe(true);
     expect(packet.no_activation).toBe(true);
     expect(packet.no_deployment).toBe(true);
+    expect(packet.image_digest).toBe(DIGEST);
+    expect(packet.redacted_principal_identifier).toBe('prin...1234');
+    expect(packet.corrective_wo_merge_ancestors).toEqual({
+      'S8B-SANDBOX-GH-ADAPTERS-01': SHA_A,
+      'S8B-CAULDRON-REFIRE-BRIDGE-01': SHA_B,
+      'S8B-FUSION-BUDGET-RECEIPTS-01': 'c'.repeat(40),
+      'WO-HARNESS-OVERSEER-S8B-REAL-CANARY-RUNNER-01': SHA_A,
+    });
     expect(packet.independent_acceptance.fusion_red_team_tiebreak_panel_verdict).toBe('pending');
     expect(packet.independent_acceptance.john_countersign).toBe('pending');
     expect(packet.m66_freeze_checklist).toContain('candidate_sha');

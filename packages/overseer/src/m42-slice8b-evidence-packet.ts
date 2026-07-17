@@ -73,7 +73,7 @@ export function buildM42Slice8BEvidencePacket(input: {
     status: M42_SLICE8B_PACKET_STATUS,
     runtime_honesty_verdict: input.process_health.verdict,
     candidate_sha: input.manifest.candidate_sha,
-    image_digest: input.image_digest,
+    image_digest: input.manifest.image_digest,
     corrective_wo_merge_ancestors: {
       ...input.manifest.sibling_merge_ancestor_shas,
       'WO-HARNESS-OVERSEER-S8B-REAL-CANARY-RUNNER-01': input.manifest.candidate_sha,

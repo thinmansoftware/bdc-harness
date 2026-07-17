@@ -23,6 +23,8 @@ function payload(overrides: Partial<M42Slice8BManifestPayload> = {}): M42Slice8B
     repository_full_name: 'bluedevilcollectibles/bdc-harness',
     provider_repository_id: 'R_sandbox_123',
     credential_principal_id: 'principal-sandbox-only-1234',
+    image_digest: DIGEST,
+    fusion_caps_digest: DIGEST,
     verifier_registry_digest: DIGEST,
     action_policy_digest: DIGEST,
     expected_primary_actions: ['REFIRE', 'REFRESH', 'CLOSE', 'MERGE'],
@@ -110,9 +112,78 @@ describe('M-42 Slice 8B manifest v2 integrity gate', () => {
         expires_at: '2026-07-17T14:00:00.000Z',
       },
     });
-    expect(enforceM42Slice8BGate1(manifest)).toEqual({
+    expect(
+      enforceM42Slice8BGate1(manifest, {
+        nowMs: () => Date.parse('2026-07-17T13:00:00.000Z'),
+      })
+    ).toEqual({
       ok: false,
       reason: 'gate2_authorization_artifact_binding_mismatch',
     });
+  });
+
+  test('sandbox Gate-2 artifact must bind image and Fusion cap digests', () => {
+    const artifact = {
+      artifact_id: 'artifact-1',
+      carried_motion_id: 'M-66-sandbox-proof',
+      candidate_sha: SHA_A,
+      image_digest: DIGEST,
+      repository_full_name: 'bluedevilcollectibles/bdc-harness',
+      provider_repository_id: 'R_sandbox_123',
+      credential_principal_id: 'principal-sandbox-only-1234',
+      action_policy_digest: DIGEST,
+      verifier_registry_digest: DIGEST,
+      fusion_caps_digest: DIGEST,
+      expires_at: '2026-07-17T14:00:00.000Z',
+    };
+    const nowMs = () => Date.parse('2026-07-17T13:00:00.000Z');
+    expect(
+      enforceM42Slice8BGate1(
+        payload({
+          mode: 'sandbox',
+          gate2_authorization_artifact: {
+            ...artifact,
+            image_digest: `sha256:${'4'.repeat(64)}`,
+          },
+        }),
+        { nowMs }
+      )
+    ).toEqual({ ok: false, reason: 'gate2_authorization_artifact_binding_mismatch' });
+    expect(
+      enforceM42Slice8BGate1(
+        payload({
+          mode: 'sandbox',
+          gate2_authorization_artifact: {
+            ...artifact,
+            fusion_caps_digest: `sha256:${'5'.repeat(64)}`,
+          },
+        }),
+        { nowMs }
+      )
+    ).toEqual({ ok: false, reason: 'gate2_authorization_artifact_binding_mismatch' });
+  });
+
+  test('sandbox Gate-2 artifact expires against the runner clock', () => {
+    const manifest = payload({
+      mode: 'sandbox',
+      gate2_authorization_artifact: {
+        artifact_id: 'artifact-1',
+        carried_motion_id: 'M-66-sandbox-proof',
+        candidate_sha: SHA_A,
+        image_digest: DIGEST,
+        repository_full_name: 'bluedevilcollectibles/bdc-harness',
+        provider_repository_id: 'R_sandbox_123',
+        credential_principal_id: 'principal-sandbox-only-1234',
+        action_policy_digest: DIGEST,
+        verifier_registry_digest: DIGEST,
+        fusion_caps_digest: DIGEST,
+        expires_at: '2026-07-17T14:00:00.000Z',
+      },
+    });
+    expect(
+      enforceM42Slice8BGate1(manifest, {
+        nowMs: () => Date.parse('2026-07-17T14:00:00.000Z'),
+      })
+    ).toEqual({ ok: false, reason: 'gate2_authorization_artifact_expired' });
   });
 });

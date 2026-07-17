@@ -36,6 +36,8 @@ export interface M42Slice8BManifestPayload {
   readonly repository_full_name: string;
   readonly provider_repository_id: string;
   readonly credential_principal_id: string;
+  readonly image_digest: string;
+  readonly fusion_caps_digest: string;
   readonly verifier_registry_digest: string;
   readonly action_policy_digest: string;
   readonly expected_primary_actions: readonly M42Slice8BPrimaryAction[];
@@ -117,6 +119,8 @@ export function verifyM42Slice8BManifest(
     return { ok: false, reason: 'invalid_sha' };
   }
   if (
+    !SHA256_RE.test(manifest.image_digest) ||
+    !SHA256_RE.test(manifest.fusion_caps_digest) ||
     !SHA256_RE.test(manifest.verifier_registry_digest) ||
     !SHA256_RE.test(manifest.action_policy_digest) ||
     !SHA256_RE.test(manifest.declared_rollback_state_digest)
