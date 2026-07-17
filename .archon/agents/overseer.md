@@ -65,6 +65,156 @@ No feature branch target found in decide-push-target output
 
 **Frequency (2026-05-17 sortie):** Component of the Class B failures above.
 
+---
+
+## Failure Classes E-J (2026-07-17 corpus -- runtime-observed, event-store-labeled)
+
+Classes A-D are the 2026-05-17 commit-and-push false-negative family. The
+classes below were labeled 2026-07-17 from the live event store
+(`/opt/bdc/archon-data/archon.db`) after the observer classified 79/79 real
+failures as `unknown` -- because these classes were not yet written down. Each
+carries the exact error substring the `node_failed` event's `error` field
+contains, the root cause we diagnosed live, and whether the correct action is
+SALVAGE (work exists, push it), INFRA-FIX (environment problem, not the WO's
+fault -- flag, do not re-fire blindly), or ESCALATE (needs a human/build fix).
+
+### Class E -- Dirty source clone at scope capture (INFRA-FIX)
+
+**Error substring:**
+```
+Bash node 'capture-run-scope' failed [exit 1]: run_scope_dirty_at_capture
+```
+(usually followed by `?? <untracked path>`, and cascades to
+`derive-run-source-scope`/`ascii-gate` failing with `scope_authority_missing:
+run scope SHA is missing`.)
+
+**Cascade-tail variants (board review 2026-07-17):** the same dirty-scope
+cascade surfaces the `scope_authority_missing:` prefix at MULTIPLE nodes with
+DIFFERENT tails -- `run scope SHA is missing` (derive-run-source-scope),
+`run-authority.json` (read-spec), and `persisted run authority`
+(build-manifest). Do NOT misfile the read-spec `scope_authority_missing:
+run-authority.json` tail as a standalone Class H when it is actually the E
+cascade -- check whether an earlier `run_scope_dirty_at_capture` event exists
+in the SAME run. A standalone string match cannot infer causation; use the
+event sequence.
+
+**Root cause:** the shared source clone
+(`/.archon/workspaces/<owner>/<repo>/source`) has an untracked/dirty file, OR
+its `.git` is root-owned after a host operation ran git as root. The
+`capture-run-scope` guard fail-closes on a dirty tree, so no base SHA is
+established and every downstream node cascades. The BUILD frequently SUCCEEDED
+before this guard trips -- do NOT read this as a build failure. Anchor:
+2026-07-17 S8B runs; also a chown-to-root-of-.git incident that stalled every
+run until ownership was restored.
+
+**Action:** INFRA-FIX, not salvage. Inspect the source clone: if a stray
+untracked file, verify it is not real work (diff vs the merged copy) then
+remove it; if `.git` is root-owned, `chown` back to the app uid. If a real PR
+was already opened by the run despite the stamp, treat the run as effectively
+succeeded (judge by the PR). Frequency: high this session (killed WO-1/WO-2
+S8B fires before the source clone was cleaned).
+
+### Class F -- Commit-and-push BLOCKED without authorization (ESCALATE -- harness bug)
+
+**Error substring:**
+```
+commit-and-push reached with status='BLOCKED' and no satisfied approve-with-fix or opus-rereview authorization. Refusing to commit.
+```
+
+**Root cause:** the build and review actually PASSED (e.g.
+`OPUS_REREVIEW=satisfied`, clean diff) but the review-pass authorization token
+is not wired through to the `commit-and-push` node's gate check on that lane
+(observed on `bdc-feature-development-fable`). A good, reviewed build is
+stranded at the final commit step. Same family as tail-node-strands-good-build.
+
+**Action:** ESCALATE as a harness defect (the authorization plumbing, not the
+WO). The work exists on the run's worktree -- Class A/B/C salvage may push it,
+but the real fix is wiring the review-pass token to the commit gate. Do NOT
+re-fire the WO blindly; it will strand again. Anchor: run 417c3299
+(WO-HARNESS-PRECOMMIT-LINTSTAGED-YAML-DEP-FIX-01), 2026-07-17.
+
+### Class G -- Plan-review escalated: unreachable behavior source of truth (ESCALATE -- spec defect)
+
+**Error substring:**
+```
+Loop node 'plan-review' escalated at iteration <N>: <question about a spec/design the planner could not read>
+```
+(e.g. asks for the expected method/format to read a design doc or PR manifest
+the builder container cannot fetch.)
+
+**Root cause:** the WO spec named its behavior source of truth as a document
+OUTSIDE the target repo (commonly a design doc in private bdc-xo while
+target_repo is bdc-harness); the builder container cannot read it (WebFetch
+404 / git show fails), so plan-review cannot produce an exact-shape plan
+without guessing and escalates. This is a SPEC defect, not a build failure.
+
+**Action:** ESCALATE to spec authoring: the governing sections must be inlined
+verbatim into the WO spec with a pinned commit SHA + file sha256 (the WO
+template system's self-containment rule). Re-fire only after the spec is fixed.
+Anchor: run ee4ae81d (WO-2 S8B), 2026-07-17.
+
+### Class H -- Read-spec scope-authority missing (INFRA-FIX / re-fire)
+
+**Error substrings:**
+```
+Bash node 'read-spec' failed [exit 1]: scope_authority_missing: run-authority.json
+```
+or `read-spec ... [exit 127]` (a missing binary / bad path in the run
+workspace).
+
+**Root cause:** the run's authority artifact (`run-authority.json`) was not
+produced or not readable, OR the read-spec node hit a missing command. Often
+downstream of a Class E dirty-scope cascade, sometimes a transient workspace
+setup miss.
+
+**Action:** INFRA-FIX. If downstream of Class E, fix the source clone first. If
+standalone and the spec exists on `bdc-xo:main`, a clean re-fire usually
+succeeds. Do not escalate as a WO defect unless it repeats on a clean engine.
+
+### Class I -- Validator/reviewer produced no output (ESCALATE / re-fire -- provider stream)
+
+**Error substring:**
+```
+Node '<war-council-validator|diff-review|plan>' produced no assistant output. The provider stream closed without yielding content
+```
+(often `-- likely a silent provider rejection or stream interruption`; `plan`
+node may show `SDK returned success` then a downstream repair node fails.)
+
+**Root cause:** the model provider stream closed without yielding content --
+a silent provider rejection, capacity limit, or stream interruption at a
+review/plan node. Not the WO's fault; not a code defect.
+
+**Action:** transient -- a single clean re-fire usually clears it. If it
+repeats on the same node across runs, ESCALATE as a provider/lane health issue
+(check the lane's model capacity, e.g. GPT/Sol at limit). Do NOT treat as a
+content failure of the WO.
+
+### Class J -- Loop node exceeded max iterations / idle timeout / WALL timeout (ESCALATE -- capability or infra)
+
+**Error substrings (THREE sub-signals -- board review 2026-07-17 added wall
+timeout, the MOST COMMON variant, 29 live events vs 22 idle):**
+```
+Loop node '<implement|plan-review>' exceeded max iterations (<N>) without <completion sentinel>
+```
+or `Loop '<node>' iteration <N> exceeded idle timeout (<ms>)`
+or `Loop '<node>' iteration <N> exceeded wall timeout (<ms>)`.
+
+**Root cause:** the builder/reviewer could not converge -- either the WO is
+genuinely hard (capability failure: climb a tier via the conductor) or the node
+hung/ran long (idle OR wall timeout: an infra/provider stall or a workload that
+overran its time budget, not lack of capability). Distinguish by which limit
+tripped: max-iterations = capability; idle-timeout OR wall-timeout = infra/stall
+or budget overrun.
+
+**Action:** max-iterations -> re-fire THROUGH THE CONDUCTOR so the Smart
+Cauldron rung ladder climbs (direct fire re-enters at the same rung and loops
+again). idle-timeout / wall-timeout -> check provider/lane health and whether
+the workload is simply too large for the node's time budget, then re-fire.
+ESCALATE if a capability climb to the top rung still fails -- the WO may need
+decomposition.
+
+---
+
 ## Salvage Playbook
 
 Run these commands inside the `archon-app-1` container unless stated otherwise. Replace placeholders:
