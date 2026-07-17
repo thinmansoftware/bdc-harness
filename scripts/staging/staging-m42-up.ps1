@@ -60,8 +60,25 @@ Write-Host "[m42-up] ref $Ref -> $sha"
 # Retain prior M-42 staging image/config/data BEFORE candidate replacement.
 # Credential-free only: image tag + data dirs + deploy marker. No secrets.
 # ---------------------------------------------------------------------------
+function Get-DockerImageIdIfPresent {
+  param([Parameter(Mandatory = $true)][string]$ImageRef)
+
+  # A missing first-run image is expected. Windows PowerShell 5.1 otherwise
+  # promotes docker's stderr to a terminating NativeCommandError under Stop.
+  $previousErrorActionPreference = $ErrorActionPreference
+  $ErrorActionPreference = "Continue"
+  $rawId = (& $Docker image inspect -f "{{.Id}}" $ImageRef 2>$null)
+  $inspectExitCode = $LASTEXITCODE
+  $ErrorActionPreference = $previousErrorActionPreference
+
+  if ($inspectExitCode -eq 0) { return $rawId }
+  if ($inspectExitCode -eq 1) { return $null }
+  Write-Error "[m42-up] docker image inspect failed for $ImageRef (exit $inspectExitCode)"
+  exit 1
+}
+
 function Save-PriorM42Staging {
-  $existingId = (& $Docker image inspect -f "{{.Id}}" "archon-m42-staging:current" 2>$null)
+  $existingId = Get-DockerImageIdIfPresent -ImageRef "archon-m42-staging:current"
   if (-not $existingId) {
     Write-Host "[m42-up] no prior archon-m42-staging:current image; skip retention"
     return

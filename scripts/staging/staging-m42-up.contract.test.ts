@@ -80,6 +80,9 @@ describe('staging-m42-up credential-free contract', () => {
     expect(src.includes('Save-PriorM42Staging') || src.includes('retained prior')).toBe(true);
     expect(src.includes('failed to stop prior M-42 staging before retention')).toBe(true);
     expect(src.includes('prior image exists but DEPLOYED_COMMIT is missing or invalid')).toBe(true);
+    expect(src.includes('Get-DockerImageIdIfPresent')).toBe(true);
+    expect(src.includes('$ErrorActionPreference = "Continue"')).toBe(true);
+    expect(src.includes('$ErrorActionPreference = $previousErrorActionPreference')).toBe(true);
   });
 
   test('standalone compose has no env_file, credential keys ABSENT, only two M-42 mounts', () => {
@@ -115,6 +118,12 @@ describe('staging-m42-up credential-free contract', () => {
 });
 
 describe('staging-overseer-integration contract', () => {
+  test('official proof host is the Docker-capable laptop', () => {
+    const src = readFileSync(integrationPath, 'utf8');
+    expect(src.includes("$OfficialProofHost = 'LAPTOP-BQ6IEJNC'")).toBe(true);
+    expect(src.includes('ASUS-ROG-DSK-2T')).toBe(false);
+  });
+
   test('probes credential env keys and files; never hardcodes empty present arrays as sole check', () => {
     const src = readFileSync(integrationPath, 'utf8');
     expect(src.includes('printenv')).toBe(true);

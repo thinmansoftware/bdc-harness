@@ -30,6 +30,7 @@ $PriorImageTag = "archon-m42-staging:prior"
 $DataDir  = Join-Path $RepoRoot "staging-m42-data"
 $HomeDir  = Join-Path $RepoRoot "staging-m42-user-home"
 $ParentManifestPath = Join-Path $RepoRoot "artifacts\manifests\wo-harness-overseer-integration-activation-01.json"
+$OfficialProofHost = 'LAPTOP-BQ6IEJNC'
 
 $CredentialEnvKeys = @(
   "GITHUB_TOKEN",
@@ -100,8 +101,8 @@ if ($resolvedOutputPath -ne $expectedOutputPath) {
 $OutputPath = $resolvedOutputPath
 
 $hostName = $env:COMPUTERNAME
-if ($hostName -ne 'ASUS-ROG-DSK-2T') {
-  Write-Warning "HOST is $hostName (expected ASUS-ROG-DSK-2T for official proof)"
+if ($hostName -ne $OfficialProofHost) {
+  Write-Warning "HOST is $hostName (expected $OfficialProofHost for official proof)"
 }
 
 # Ensure container surface exists (caller normally ran staging-m42-up first).

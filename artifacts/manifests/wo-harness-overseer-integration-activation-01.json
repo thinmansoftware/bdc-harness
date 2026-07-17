@@ -138,7 +138,7 @@
     "S3-S7 review_state remains indeterminate pending independent exact-head reviews.",
     "Stop 7 exact-head independent review of this Slice 8 PR is NOT claimed complete by the builder.",
     "Unsigned packets withheld while status=BLOCKED; packet builders reject zero prior SHA and zero verifier digests.",
-    "Named host has no Docker/Podman/nerdctl/WSL engine in this session; Stops 3-4 cannot execute here.",
+    "Official proof host corrected to Docker-capable LAPTOP-BQ6IEJNC; Stops 3-4 remain pending external execution at this committed head.",
     "No provider canary, paid Fusion, production deploy, capability enablement, or live operator authority.",
     "The committed BLOCKED manifest intentionally does not self-claim its containing commit SHA."
   ]
