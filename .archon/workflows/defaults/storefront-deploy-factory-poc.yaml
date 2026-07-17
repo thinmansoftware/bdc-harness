@@ -1,7 +1,7 @@
 name: bdc-thinman-storefront-deploy-factory-poc
 description: Storefront deployment factory stub using the shared deployment-request contract. Does not perform production storefront mutation.
 provider: codex
-model: gpt-5.5
+model: gpt-5.6-sol
 interactive: true
 target_repo: bluedevilcollectibles/thinman-freight
 worktree:

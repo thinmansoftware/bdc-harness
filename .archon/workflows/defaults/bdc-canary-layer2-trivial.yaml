@@ -1,7 +1,7 @@
 name: bdc-canary-layer2-trivial
 description: Event-triggered build-through fixture for Cauldron Layer 2.
 provider: codex
-model: gpt-5.5
+model: gpt-5.6-sol
 target_repo: bluedevilcollectibles/bdc-harness
 mutates_checkout: true
 nodes:
@@ -11,4 +11,4 @@ nodes:
       Write or update packages/canary-fixture/layer2-trivial.txt with exactly one line:
       bdc-canary-layer2-trivial
     provider: codex
-    model: gpt-5.5
+    model: gpt-5.6-sol

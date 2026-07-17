@@ -1306,10 +1306,10 @@ describe('CodexProvider', () => {
         'Model "gpt-5.3-codex" is not available for your account'
       );
       // PR #165 repointed CODEX_MODEL_FALLBACKS['gpt-5.3-codex'] to
-      // CODEX_DEFAULT_MODEL ('gpt-5.5'); this assertion was stale and failed
+      // CODEX_DEFAULT_MODEL; this assertion was stale and failed
       // against live code -- re-aligned by
       // WO-HARNESS-CODEX-THREAD-RESUME-AND-FAILBACK-01 (test file is in scope).
-      await expect(consumeGenerator()).rejects.toThrow('model: gpt-5.5');
+      await expect(consumeGenerator()).rejects.toThrow('model: gpt-5.6-sol');
     });
 
     test('uses generic dashboard guidance when fallback mapping is unknown', async () => {

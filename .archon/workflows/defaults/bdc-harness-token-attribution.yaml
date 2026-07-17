@@ -516,7 +516,7 @@ nodes:
 
   - id: diff-review
     provider: codex
-    model: gpt-5.5
+    model: gpt-5.6-sol
     agent: codex-adversarial-reviewer
     depends_on: [capture-diff]
     task_class: medium_work
@@ -722,7 +722,7 @@ nodes:
         perform it, state that plainly; do NOT claim a runtime proof that did not happen.
       Vercel deployment: N/A (bdc-harness is server tooling, not a Vercel app)
       In-run review evidence: plan-review verdict (PLAN_REVIEW_PASS + RISK); diff-review-final
-        verdict from $diff-review.output / $diff-repair.output; cross-model reviewer = codex gpt-5.5.
+        verdict from $diff-review.output / $diff-repair.output; cross-model reviewer = codex gpt-5.6-sol.
       VALIDATION: PASS
 
       If any in-run review ended needs_revision or was skipped, VALIDATION cannot be PASS -- say so.

@@ -80,11 +80,10 @@ async function getCodex(configCodexBinaryPath?: string): Promise<Codex> {
  * the model internally.  Non-Anthropic models (gpt-5-codex, o3, etc.) are passed through.
  */
 // The live, API-supported Codex frontier model. Used as the explicit default when
-// no model is resolved from the node/config, so the Codex SDK never falls back to its
-// own stale account default (gpt-5.3-codex), which the ChatGPT-account API rejects (400).
-// Verified live against the container's models_cache.json 2026-06-02 (slug "gpt-5.5",
-// supported_in_api: true). Update this one constant if the account's frontier model changes.
-const CODEX_DEFAULT_MODEL = 'gpt-5.5';
+// no model is resolved from the node/config, so the Codex SDK never falls back to a
+// stale account default. Verified with @openai/codex@0.144.5 debug models and a
+// short ChatGPT-account inference on 2026-07-17.
+const CODEX_DEFAULT_MODEL = 'gpt-5.6-sol';
 
 const ANTHROPIC_MODEL_ALIASES: ReadonlySet<string> = new Set([
   'sonnet',
@@ -263,7 +262,7 @@ function classifyCodexError(
  * fields would immediately fail Claude:
  *
  *   - `model`           Codex/OpenAI model id (e.g. `gpt-5.3-codex`,
- *                       `gpt-5.5`). Claude's option builder uses
+ *                       `gpt-5.6-sol`). Claude's option builder uses
  *                       `requestOptions?.model ?? assistantDefaults.model`
  *                       directly, so a Codex model name would be passed
  *                       to the Claude SDK and rejected -- collapsing the
@@ -278,7 +277,7 @@ function classifyCodexError(
  *                       fields but, critically, it ALSO reads `model`
  *                       from `assistantConfig` -- so even after dropping
  *                       the top-level `model`, leaving `assistantConfig`
- *                       intact would let a `codex.model: 'gpt-5.5'` leak
+ *                       intact would let a `codex.model: 'gpt-5.6-sol'` leak
  *                       back in via the Codex config bag. Drop the whole
  *                       config bag so Claude resolves its own defaults
  *                       from its own config section.
@@ -620,7 +619,7 @@ async function* streamCodexEvents(
       }
 
       // Layer 1 served-model capture (WO-HARNESS-LAYER1-SERVED-MODEL-CAPTURE-01):
-      // TurnCompletedEvent in @openai/codex-sdk@0.125.0 carries no `model`
+      // TurnCompletedEvent in @openai/codex-sdk@0.144.5 carries no `model`
       // field, and neither do Thread/ThreadOptions/TurnOptions. Emit explicit
       // null + machine-readable reason so the dag-executor can persist
       // "provider could not tell us" without fabricating a value.
