@@ -70,14 +70,14 @@ interface OctokitLike {
   search: {
     issuesAndPullRequests(input: Record<string, unknown>): Promise<{
       data: {
-        items: Array<{
+        items: {
           number: number;
           title: string;
           body?: string | null;
           state: string;
           pull_request?: unknown;
           repository_url?: string;
-        }>;
+        }[];
       };
     }>;
   };
@@ -205,7 +205,7 @@ export function createDefaultReconcileDeps(): ReconcileDeps {
   if (!token) {
     return {
       readCursor: async () => null,
-      searchMergedPullRequests: async () => {
+      searchMergedPullRequests: async (): Promise<ReconcileMergedPullRequest[]> => {
         log.warn({ rateLimit: false }, 'overseer.reconcile.github_token_missing');
         return [];
       },
@@ -229,7 +229,7 @@ export function createDefaultReconcileDeps(): ReconcileDeps {
     readCursor: readReconcileCursorFromActions,
     searchMergedPullRequests: async input => searchMergedPullRequests(await getOctokit(), input),
     findTrackerIssueByStem: async stem => findTrackerIssueByStem(await getOctokit(), stem),
-    addTrackerEvidenceComment: async input => {
+    addTrackerEvidenceComment: async (input): Promise<void> => {
       const client = await getOctokit();
       await client.issues.createComment({
         owner: input.issue.owner,
@@ -238,7 +238,7 @@ export function createDefaultReconcileDeps(): ReconcileDeps {
         body: input.body,
       });
     },
-    addTrackerLabel: async input => {
+    addTrackerLabel: async (input): Promise<void> => {
       const client = await getOctokit();
       await client.issues.addLabels({
         owner: input.issue.owner,
@@ -247,7 +247,7 @@ export function createDefaultReconcileDeps(): ReconcileDeps {
         labels: [input.label],
       });
     },
-    closeTrackerIssue: async input => {
+    closeTrackerIssue: async (input): Promise<void> => {
       const client = await getOctokit();
       await client.issues.update({
         owner: input.issue.owner,
