@@ -255,6 +255,31 @@ export async function listAllActiveWithCodebase(): Promise<
 }
 
 /**
+ * List active environments for worktree sweep reconciliation.
+ * This intentionally avoids joining codebases so orphan cleanup can still see
+ * env rows whose codebase record was removed.
+ */
+export async function listActiveEnvironmentsForSweep(): Promise<
+  readonly Pick<
+    IsolationEnvironmentRow,
+    'id' | 'working_path' | 'created_by_platform' | 'created_at' | 'branch_name' | 'codebase_id'
+  >[]
+> {
+  const result = await pool.query<
+    Pick<
+      IsolationEnvironmentRow,
+      'id' | 'working_path' | 'created_by_platform' | 'created_at' | 'branch_name' | 'codebase_id'
+    >
+  >(
+    `SELECT id, working_path, created_by_platform, created_at, branch_name, codebase_id
+     FROM remote_agent_isolation_environments
+     WHERE status != 'destroyed' AND working_path IS NOT NULL
+     ORDER BY created_at DESC`
+  );
+  return result.rows;
+}
+
+/**
  * List active environments for a codebase with days since last activity
  * Used for worktree breakdown and limit messaging
  */
