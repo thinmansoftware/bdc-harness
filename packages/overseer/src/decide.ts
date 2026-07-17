@@ -199,6 +199,53 @@ export function decide(input: DecideInput): DecisionResult {
           'spec lookup failed on retry -- WO_ID may not exist on bdc-xo main, operator must check',
       };
 
+    // --- Failure classes E-J (BDC-specific 2026-07-17) ---
+
+    case 'scope_dirty_at_capture':
+      return {
+        decision: 'escalate',
+        reason:
+          'scope_dirty_at_capture -- INFRA-FIX; run build may have already succeeded, not a WO failure',
+      };
+
+    case 'commit_blocked_no_authorization':
+      return {
+        decision: 'escalate',
+        reason:
+          'commit_blocked_no_authorization -- harness bug; work exists but commit authorization was not satisfied',
+      };
+
+    case 'plan_review_source_unreachable':
+      return {
+        decision: 'escalate',
+        reason: 'plan_review_source_unreachable -- spec defect; plan-review could not read source material',
+      };
+
+    case 'read_spec_scope_authority_missing':
+      return {
+        decision: 'escalate',
+        reason:
+          'read_spec_scope_authority_missing -- INFRA-FIX / re-fire; read-spec lacks run scope authority',
+      };
+
+    case 'reviewer_no_output':
+      return {
+        decision: 'escalate',
+        reason: 'reviewer_no_output -- transient provider issue; single re-fire',
+      };
+
+    case 'loop_max_iterations':
+      return {
+        decision: 'escalate',
+        reason: 'loop_max_iterations -- capability issue; conductor climb required',
+      };
+
+    case 'loop_idle_timeout':
+      return {
+        decision: 'escalate',
+        reason: 'loop_idle_timeout -- infra stall',
+      };
+
     // --- Silent-dead-end classes (BDC-specific 2026-05-18 Wave A anchor incidents) ---
     //
     // All four escalate with a populated `escalationContext`. The executor wires this

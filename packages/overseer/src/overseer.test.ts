@@ -1,5 +1,6 @@
 import { describe, test, expect } from 'bun:test';
-import { classifyError, decide } from './index.ts';
+import { classifyError } from './classify.ts';
+import { decide } from './decide.ts';
 
 describe('classifyError -- workflow-runtime classes (BDC 2026-05-16)', () => {
   test('sentinel_mismatch: loop node + SDK returned success message', () => {
@@ -70,6 +71,65 @@ describe('classifyError -- workflow-runtime classes (BDC 2026-05-16)', () => {
         exitCode: 1,
       })
     ).toBe('verify_pre_existing');
+  });
+});
+
+describe('classifyError -- failure classes E-J (2026-07-17)', () => {
+  test("scope_dirty_at_capture: 'run_scope_dirty_at_capture'", () => {
+    expect(
+      classifyError({
+        message: 'node failed: run_scope_dirty_at_capture',
+      })
+    ).toBe('scope_dirty_at_capture');
+  });
+
+  test("commit_blocked_no_authorization: blocked without approve-with-fix or opus-rereview", () => {
+    expect(
+      classifyError({
+        message:
+          "commit-and-push reached with status='BLOCKED' and no satisfied approve-with-fix or opus-rereview authorization",
+      })
+    ).toBe('commit_blocked_no_authorization');
+  });
+
+  test("plan_review_source_unreachable: plan-review escalated with design/manifest/format signal", () => {
+    expect(
+      classifyError({
+        message: "plan-review' escalated at iteration 2: manifest has expected method format mismatch",
+      })
+    ).toBe('plan_review_source_unreachable');
+  });
+
+  test("read_spec_scope_authority_missing: read-spec with scope_authority_missing", () => {
+    expect(
+      classifyError({
+        message: 'read-spec failed: scope_authority_missing',
+      })
+    ).toBe('read_spec_scope_authority_missing');
+  });
+
+  test("reviewer_no_output: 'produced no assistant output'", () => {
+    expect(
+      classifyError({
+        message: 'reviewer produced no assistant output',
+      })
+    ).toBe('reviewer_no_output');
+  });
+
+  test('loop_max_iterations: loop node exceeded max iterations', () => {
+    expect(
+      classifyError({
+        message: "Loop node 'implement' exceeded max iterations (5)",
+      })
+    ).toBe('loop_max_iterations');
+  });
+
+  test('loop_idle_timeout: loop iteration exceeded idle timeout', () => {
+    expect(
+      classifyError({
+        message: "Loop 'plan-review' iteration 1 exceeded idle timeout (18000)",
+      })
+    ).toBe('loop_idle_timeout');
   });
 });
 
@@ -172,6 +232,26 @@ describe('decide -- workflow-runtime classes', () => {
   test('spec_lookup_failed retries once then escalates', () => {
     expect(decide({ errorClass: 'spec_lookup_failed', attempt: 1 }).decision).toBe('retry');
     expect(decide({ errorClass: 'spec_lookup_failed', attempt: 2 }).decision).toBe('escalate');
+  });
+});
+
+describe('decide -- failure classes E-J', () => {
+  test('all failure classes E-J escalate', () => {
+    const classes = [
+      'scope_dirty_at_capture',
+      'commit_blocked_no_authorization',
+      'plan_review_source_unreachable',
+      'read_spec_scope_authority_missing',
+      'reviewer_no_output',
+      'loop_max_iterations',
+      'loop_idle_timeout',
+    ] as const;
+
+    for (const errorClass of classes) {
+      const r = decide({ errorClass, attempt: 1 });
+      expect(r.decision).toBe('escalate');
+      expect(r.reason).toContain(errorClass);
+    }
   });
 });
 

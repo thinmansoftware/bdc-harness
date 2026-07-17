@@ -22,6 +22,13 @@ export type ErrorClass =
   | 'worktree_collision' // git: branch already used by another worktree
   | 'spec_lookup_failed' // read-spec couldn't fetch WO spec from bdc-xo
   | 'branch_ref_missing' // git: fatal: couldn't find remote ref
+  | 'scope_dirty_at_capture' // run scope dirty/missing SHA at capture
+  | 'commit_blocked_no_authorization' // commit-and-push blocked without review authorization
+  | 'plan_review_source_unreachable' // plan-review escalated on unreadable design/manifest/spec format
+  | 'read_spec_scope_authority_missing' // read-spec lacks run scope authority
+  | 'reviewer_no_output' // reviewer/provider produced no assistant content
+  | 'loop_max_iterations' // loop node exceeded max iterations
+  | 'loop_idle_timeout' // loop iteration exceeded idle timeout
   // Silent-dead-end classes (new, from 2026-05-18 Wave A anchor incidents)
   | 'implement_loop_no_output' // commit-and-push: no diff, no validator feedback
   | 'validator_feedback_not_applied' // commit-and-push: validator emitted actionable feedback but agent did not iterate
@@ -113,6 +120,54 @@ export function classifyError(input: ClassifyInput): ErrorClass {
   }
 
   // --- Workflow-runtime classes (BDC-specific, 2026-05-16) ---
+
+  // Failure classes E-J (BDC-specific, 2026-07-17)
+  if (
+    msg.includes('run_scope_dirty_at_capture') ||
+    msg.includes('scope_authority_missing: run scope sha is missing')
+  ) {
+    return 'scope_dirty_at_capture';
+  }
+
+  if (
+    msg.includes(
+      "commit-and-push reached with status='blocked' and no satisfied approve-with-fix or opus-rereview authorization"
+    )
+  ) {
+    return 'commit_blocked_no_authorization';
+  }
+
+  if (
+    /plan-review' escalated at iteration \d+/i.test(rawMessage) &&
+    (msg.includes('design') ||
+      msg.includes('manifest') ||
+      msg.includes('expected method') ||
+      msg.includes('format'))
+  ) {
+    return 'plan_review_source_unreachable';
+  }
+
+  if (
+    msg.includes('read-spec') &&
+    (msg.includes('scope_authority_missing') || msg.includes('exit 127'))
+  ) {
+    return 'read_spec_scope_authority_missing';
+  }
+
+  if (
+    msg.includes('produced no assistant output') ||
+    msg.includes('provider stream closed without yielding content')
+  ) {
+    return 'reviewer_no_output';
+  }
+
+  if (/Loop node '[^']+' exceeded max iterations/i.test(rawMessage)) {
+    return 'loop_max_iterations';
+  }
+
+  if (/exceeded idle timeout/i.test(rawMessage)) {
+    return 'loop_idle_timeout';
+  }
 
   // Sentinel mismatch: implement loop iteration ended without finding `until:` string
   if (msg.includes('sdk returned success') && input.nodeType === 'loop') {
