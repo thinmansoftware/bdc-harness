@@ -135,15 +135,24 @@ describe('classifyError -- failure classes E-J (BDC 2026-07-17)', () => {
     ).toBe('commit_blocked_no_authorization');
   });
 
-  test('plan_review_source_unreachable: escalated plan-review with unreachable source phrase', () => {
-    expect(
-      classifyError({
-        message:
-          "DAG workflow 'bdc-feature-development-codex' completed with failures: 'plan-review': Loop node 'plan-review' escalated at iteration 2: SPEC_PATH github:bluedevilcollectibles/bdc-xo:docs/work-orders/WO-MISSING.md could not be retrieved from the source repository",
-        nodeId: 'plan-review',
-        nodeType: 'loop',
-      })
-    ).toBe('plan_review_source_unreachable');
+  test('plan_review_source_unreachable: escalated plan-review source phrases', () => {
+    const phrases = [
+      'could not be retrieved from the source repository',
+      'source repository unreachable',
+      'source returned 404',
+      'cannot read the design reference',
+      'expected method and format for reading the design',
+    ];
+
+    for (const phrase of phrases) {
+      expect(
+        classifyError({
+          message: `DAG workflow 'bdc-feature-development-codex' completed with failures: 'plan-review': Loop node 'plan-review' escalated at iteration 2: SPEC_PATH github:bluedevilcollectibles/bdc-xo:docs/work-orders/WO-MISSING.md ${phrase}`,
+          nodeId: 'plan-review',
+          nodeType: 'loop',
+        })
+      ).toBe('plan_review_source_unreachable');
+    }
   });
 
   test('H_shadow_bug: read-spec scope_authority_missing beats spec_lookup_failed', () => {
@@ -174,6 +183,17 @@ describe('classifyError -- failure classes E-J (BDC 2026-07-17)', () => {
         message:
           "DAG workflow 'bdc-feature-development-codex' completed with failures: 'war-council-validator': Prompt node 'war-council-validator' failed: provider stream closed without yielding content",
         nodeId: 'war-council-validator',
+        nodeType: 'prompt',
+      })
+    ).toBe('reviewer_no_output');
+  });
+
+  test('reviewer_no_output: produced no assistant output', () => {
+    expect(
+      classifyError({
+        message:
+          "DAG workflow 'bdc-feature-development-codex' completed with failures: 'diff-review': Prompt node 'diff-review' failed: produced no assistant output",
+        nodeId: 'diff-review',
         nodeType: 'prompt',
       })
     ).toBe('reviewer_no_output');
