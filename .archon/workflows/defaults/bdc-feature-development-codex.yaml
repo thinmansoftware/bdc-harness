@@ -617,7 +617,7 @@ nodes:
   # Distinguishes three post-implement states from the ASSIGNED worktree's own state:
   #   REAL_BUILD       -- worktree has changes / commits ahead -> proceed to review chain
   #   ALREADY_SATISFIED-- implement said ALREADY_SATISFIED + worktree genuinely clean -> emit
-  #                       BUILD_OUTCOME=ALREADY_SATISFIED so flip-notion records verified-no-op
+  #                       BUILD_OUTCOME=ALREADY_SATISFIED so review-issue records verified-no-op
   #   FALSE_COMPLETE   -- implement emitted COMPLETE/BUILD_COMPLETE but worktree shows ZERO
   #                       real changes (the fraud 04daeafc committed) -> emit
   #                       BUILD_OUTCOME=FALSE_COMPLETE (the commit-and-push gate turns this
