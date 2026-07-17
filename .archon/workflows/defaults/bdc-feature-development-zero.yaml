@@ -1283,7 +1283,10 @@ nodes:
         NOT a failure. Re-inspect the captured diff once more to confirm no new unsafe
         behavior was introduced between the original review and now (e.g., scope creep,
         unrelated edits). If the diff is still clean, emit DIFF_REVIEW_FINAL=satisfied
-        with UNRESOLVED: (none). Do NOT treat the skipped repair as failed repair.
+        with UNRESOLVED: (none). If DIFF_FINAL_BYTES is under 200, also emit
+        NO_OP_JUSTIFICATION=<specific evidence that the spec was already implemented and
+        the near-empty diff is legitimate, or (none)>. Do NOT treat the skipped repair
+        as failed repair.
       - If the original verdict was needs_revision AND diff-repair FAILED or exhausted
         iterations (its output is empty, shows ESCALATION_REQUIRED=true, or the done.flag
         was never written): do NOT certify. Emit DIFF_REVIEW_FINAL=needs_revision,
@@ -1298,6 +1301,7 @@ nodes:
         UNRESOLVED:
         - <file:line> <finding still open>   (repeat; or "(none)")
         SEMANTIC_RISK=<LOW|MEDIUM|HIGH>
+        NO_OP_JUSTIFICATION=<reason or (none)>
       DIFF_REVIEW_FINAL=satisfied ONLY if every original finding is genuinely resolved and
       no new unsafe behavior was introduced by the repair.
 
@@ -1319,6 +1323,7 @@ nodes:
     bash: |
       set -uo pipefail
       DIFF_FINAL=$diff-review-final.output
+      DIFF_META=$capture-diff-final.output
       BUILD=$assert-implement-produced-work.output
       PRECHECK=$gate-already-satisfied.output
 
@@ -1329,6 +1334,22 @@ nodes:
         | grep -oE 'DIFF_REVIEW_FINAL=(satisfied|needs_revision)' \
         | tail -n 1)
       if [ "$final_verdict" = "DIFF_REVIEW_FINAL=satisfied" ]; then final_ok=true; fi
+
+      diff_final_bytes=$(printf '%s\n' "$DIFF_META" | sed -n 's/^DIFF_FINAL_BYTES=//p' | tail -n 1)
+      case "${diff_final_bytes:-}" in
+        ''|*[!0-9]*) diff_final_bytes=0 ;;
+      esac
+      no_op_justification=$(printf '%s\n' "$DIFF_FINAL" | sed -n 's/^NO_OP_JUSTIFICATION=//p' | tail -n 1)
+      has_no_op_justification=false
+      if [ -n "$no_op_justification" ] && ! printf '%s\n' "$no_op_justification" | grep -Eiq '^\(?none\)?$'; then
+        has_no_op_justification=true
+      fi
+      near_empty_without_justification=false
+      if [ "$final_ok" = "true" ] && [ "$diff_final_bytes" -lt 200 ] && [ "$has_no_op_justification" != "true" ]; then
+        near_empty_without_justification=true
+        final_ok=false
+      fi
+
       outcome=$(printf '%s\n' "$BUILD" | sed -n 's/^BUILD_OUTCOME=//p' | head -1)
 
       # Codex FINDING_2: PROCEED requires BOTH a real build AND a satisfied final review.
@@ -1342,7 +1363,7 @@ nodes:
         STATUS=BLOCKED
       fi
       # single JSON line = the entire stdout, so $block-classify.output.status parses
-      printf '{"status":"%s","final_satisfied":%s,"build_outcome":"%s"}\n' "$STATUS" "$final_ok" "${outcome:-unknown}"
+      printf '{"status":"%s","final_satisfied":%s,"build_outcome":"%s","diff_final_bytes":%s,"near_empty_without_justification":%s}\n' "$STATUS" "$final_ok" "${outcome:-unknown}" "$diff_final_bytes" "$near_empty_without_justification"
 
   # opus-repair: one harder AUTONOMOUS fix pass by the Opus overseer when BLOCKED, BEFORE
   # bothering a human (autonomy ladder step 2). Read-only-ish: it may edit in-scope files to
@@ -2337,7 +2358,7 @@ nodes:
   - id: manifest-consistency-check
     persona: major-build
     load_bearing: true
-    depends_on: [build-manifest, stamp-manifest-pr, open-pr-if-needed, block-reclassify]
+    depends_on: [build-manifest, stamp-manifest-pr, open-pr-if-needed, block-reclassify, opus-repair]
     trigger_rule: all_done
     task_class: clerical
     bash: |
@@ -2366,10 +2387,27 @@ nodes:
       $stamp-manifest-pr.output
       BDC_NODE_OUTPUT_MANIFEST
       )
+      OPUS_OUT=$(capture_node_output <<'BDC_NODE_OUTPUT_OPUS_REPAIR'
+      $opus-repair.output
+      BDC_NODE_OUTPUT_OPUS_REPAIR
+      )
       extract() {
         { printf '%s\n' "$MANIFEST_OUT" | grep -E "^${1}:" | head -1 | sed "s/^${1}:[[:space:]]*//"; } || true
       }
       PRS_LINE=$(extract "PRs")
+      WO_ID=$(extract "WO")
+      if [ -z "$WO_ID" ]; then
+        WO_ID=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'WO-[A-Z0-9-]+' | head -1 || true)
+      fi
+
+      # ---- BEGIN manifest-validation-truthfulness ----
+      if printf '%s\n' "$MANIFEST_OUT" | grep -Eq '^VALIDATION:[[:space:]]*PASS([[:space:]]|$)'; then
+        if [ "$STATUS" != "PROCEED" ] && [ "$STATUS" != "ALREADY_SATISFIED" ]; then
+          echo "MANIFEST_VALIDATION_ERROR: manifest claims VALIDATION: PASS but block-reclassify status is ${STATUS:-unknown}" >&2
+          exit 1
+        fi
+      fi
+      # ---- END manifest-validation-truthfulness ----
 
       if [ "$STATUS" = "PROCEED" ] && [ -n "$PR_URL" ]; then
         PRS_LOWER=$(printf '%s\n' "$PRS_LINE" | tr '[:upper:]' '[:lower:]')
@@ -2385,6 +2423,51 @@ nodes:
           exit 1
         fi
       fi
+
+      # ---- BEGIN pr-citation-verification ----
+      # Any PR citation outside this run's own resolved PR_URL must prove it belongs
+      # to this WO. This fail-closes fabricated plausible citations such as an
+      # unrelated already-merged PR number in a PASS manifest.
+      CITATIONS=$(printf '%s\n%s\n' "$MANIFEST_OUT" "$OPUS_OUT" \
+        | grep -Eo 'https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pull/[0-9]+' \
+        | sort -u || true)
+      for cited_url in $CITATIONS; do
+        if [ -n "$PR_URL" ]; then
+          cited_repo=$(printf '%s\n' "$cited_url" | sed -n 's|https://github.com/\([^/]*/[^/]*\)/pull/.*|\1|p' | head -1)
+          cited_num=$(printf '%s\n' "$cited_url" | sed -n 's|.*/pull/\([0-9][0-9]*\).*|\1|p' | head -1)
+          own_repo=$(printf '%s\n' "$PR_URL" | sed -n 's|https://github.com/\([^/]*/[^/]*\)/pull/.*|\1|p' | head -1)
+          own_num=$(printf '%s\n' "$PR_URL" | sed -n 's|.*/pull/\([0-9][0-9]*\).*|\1|p' | head -1)
+          if [ "$cited_repo" = "$own_repo" ] && [ "$cited_num" = "$own_num" ]; then
+            continue
+          fi
+        fi
+        REPO=$(printf '%s\n' "$cited_url" | sed -n 's|https://github.com/\([^/]*/[^/]*\)/pull/.*|\1|p' | head -1)
+        PR_NUM=$(printf '%s\n' "$cited_url" | sed -n 's|.*/pull/\([0-9][0-9]*\).*|\1|p' | head -1)
+        if [ -z "$REPO" ] || [ -z "$PR_NUM" ]; then
+          echo "PR_CITATION_ERROR: could not parse cited PR URL: $cited_url" >&2
+          exit 1
+        fi
+        PR_RECORD=$(gh pr view "$PR_NUM" --repo "$REPO" --json number,state,headRefName,url,title,body,files --jq '.url + "\nSTATE=" + .state + "\nHEAD=" + .headRefName + "\nTITLE=" + (.title // "") + "\nBODY=" + (.body // "") + "\nFILES=" + ([.files[].path] | join(","))' 2>/dev/null || true)
+        if [ -z "$PR_RECORD" ]; then
+          echo "PR_CITATION_ERROR: cited PR is unverifiable: $cited_url" >&2
+          exit 1
+        fi
+        PR_STATE=$(printf '%s\n' "$PR_RECORD" | sed -n 's/^STATE=//p' | head -1)
+        PR_FILES=$(printf '%s\n' "$PR_RECORD" | sed -n 's/^FILES=//p' | head -1)
+        if [ "$PR_STATE" = "MERGED" ]; then
+          echo "PR_CITATION_ERROR: cited PR is already merged and is not this run's PR: $cited_url" >&2
+          exit 1
+        fi
+        if [ -n "$WO_ID" ] && ! printf '%s\n' "$PR_RECORD" | grep -Fq "$WO_ID"; then
+          echo "PR_CITATION_ERROR: cited PR does not match WO_ID ${WO_ID}: $cited_url" >&2
+          exit 1
+        fi
+        if [ -z "$PR_FILES" ]; then
+          echo "PR_CITATION_ERROR: cited PR has no file diff evidence: $cited_url" >&2
+          exit 1
+        fi
+      done
+      # ---- END pr-citation-verification ----
 
       # ---- BEGIN manifest-pr-content-check ----
       # WO-HARNESS-ZERO-OPEN-IMPLEMENT-MANIFEST-CHECKPOINT-TRUTH-01

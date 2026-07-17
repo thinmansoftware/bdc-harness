@@ -1264,7 +1264,10 @@ nodes:
         NOT a failure. Re-inspect the captured diff once more to confirm no new unsafe
         behavior was introduced between the original review and now (e.g., scope creep,
         unrelated edits). If the diff is still clean, emit DIFF_REVIEW_FINAL=satisfied
-        with UNRESOLVED: (none). Do NOT treat the skipped repair as failed repair.
+        with UNRESOLVED: (none). If DIFF_FINAL_BYTES is under 200, also emit
+        NO_OP_JUSTIFICATION=<specific evidence that the spec was already implemented and
+        the near-empty diff is legitimate, or (none)>. Do NOT treat the skipped repair
+        as failed repair.
       - If the original verdict was needs_revision AND diff-repair FAILED or exhausted
         iterations (its output is empty, shows ESCALATION_REQUIRED=true, or the done.flag
         was never written): do NOT certify. Emit DIFF_REVIEW_FINAL=needs_revision,
@@ -1279,6 +1282,7 @@ nodes:
         UNRESOLVED:
         - <file:line> <finding still open>   (repeat; or "(none)")
         SEMANTIC_RISK=<LOW|MEDIUM|HIGH>
+        NO_OP_JUSTIFICATION=<reason or (none)>
       DIFF_REVIEW_FINAL=satisfied ONLY if every original finding is genuinely resolved and
       no new unsafe behavior was introduced by the repair.
 
@@ -1300,6 +1304,7 @@ nodes:
     bash: |
       set -uo pipefail
       DIFF_FINAL=$diff-review-final.output
+      DIFF_META=$capture-diff-final.output
       BUILD=$assert-implement-produced-work.output
       PRECHECK=$gate-already-satisfied.output
 
@@ -1310,6 +1315,22 @@ nodes:
         | grep -oE 'DIFF_REVIEW_FINAL=(satisfied|needs_revision)' \
         | tail -n 1)
       if [ "$final_verdict" = "DIFF_REVIEW_FINAL=satisfied" ]; then final_ok=true; fi
+
+      diff_final_bytes=$(printf '%s\n' "$DIFF_META" | sed -n 's/^DIFF_FINAL_BYTES=//p' | tail -n 1)
+      case "${diff_final_bytes:-}" in
+        ''|*[!0-9]*) diff_final_bytes=0 ;;
+      esac
+      no_op_justification=$(printf '%s\n' "$DIFF_FINAL" | sed -n 's/^NO_OP_JUSTIFICATION=//p' | tail -n 1)
+      has_no_op_justification=false
+      if [ -n "$no_op_justification" ] && ! printf '%s\n' "$no_op_justification" | grep -Eiq '^\(?none\)?$'; then
+        has_no_op_justification=true
+      fi
+      near_empty_without_justification=false
+      if [ "$final_ok" = "true" ] && [ "$diff_final_bytes" -lt 200 ] && [ "$has_no_op_justification" != "true" ]; then
+        near_empty_without_justification=true
+        final_ok=false
+      fi
+
       outcome=$(printf '%s\n' "$BUILD" | sed -n 's/^BUILD_OUTCOME=//p' | head -1)
 
       # Codex FINDING_2: PROCEED requires BOTH a real build AND a satisfied final review.
@@ -1323,7 +1344,7 @@ nodes:
         STATUS=BLOCKED
       fi
       # single JSON line = the entire stdout, so $block-classify.output.status parses
-      printf '{"status":"%s","final_satisfied":%s,"build_outcome":"%s"}\n' "$STATUS" "$final_ok" "${outcome:-unknown}"
+      printf '{"status":"%s","final_satisfied":%s,"build_outcome":"%s","diff_final_bytes":%s,"near_empty_without_justification":%s}\n' "$STATUS" "$final_ok" "${outcome:-unknown}" "$diff_final_bytes" "$near_empty_without_justification"
 
   # opus-repair: one harder AUTONOMOUS fix pass by the Opus overseer when BLOCKED, BEFORE
   # bothering a human (autonomy ladder step 2). Read-only-ish: it may edit in-scope files to

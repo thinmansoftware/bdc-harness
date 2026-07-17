@@ -2,7 +2,7 @@
 # manifest-pr-content-check.sh -- T1 fixture for PR-file vs manifest claim check
 # WO-HARNESS-ZERO-OPEN-IMPLEMENT-MANIFEST-CHECKPOINT-TRUTH-01
 #
-# Scoped to the 6 lanes with manifest-consistency-check.
+# Scoped to the 7 lanes with manifest-consistency-check.
 # Run: bash .archon/workflows/defaults/__tests__/manifest-pr-content-check.sh
 
 set -uo pipefail
@@ -42,6 +42,7 @@ MCC_SISTER=(
   bdc-feature-development-codex.yaml
   bdc-feature-development-codex-only.yaml
   bdc-feature-development-fusion-cx-qwen.yaml
+  bdc-feature-development-grok.yaml
   bdc-feature-development-zero.yaml
   bdc-feature-development-zero-open.yaml
 )
@@ -54,7 +55,7 @@ extract_pr_block() {
   ' "$1" | sed 's/^      //'
 }
 
-echo "--- Parity: 6 manifest-pr-content-check blocks byte-identical ---"
+echo "--- Parity: 7 manifest-pr-content-check blocks byte-identical ---"
 REF=""
 REF_NAME=""
 for f in "${MCC_SISTER[@]}"; do
