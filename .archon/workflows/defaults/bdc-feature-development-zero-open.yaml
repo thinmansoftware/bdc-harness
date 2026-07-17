@@ -1321,7 +1321,7 @@ nodes:
     provider: codex-opr
     model: gpt-5.6-sol
     agent: codex-adversarial-reviewer
-    depends_on: [capture-diff-final]
+    depends_on: [diff-review, classify-diff-review, diff-repair, capture-diff-final]
     trigger_rule: all_done
     task_class: medium_work
     prompt: |
@@ -2417,7 +2417,7 @@ nodes:
         PRs: <PR URL> or N/A (ALREADY_SATISFIED or BLOCKED)
         Merge ancestors: <merge-base SHA>...<HEAD SHA> (behind_by=<N>) or N/A
         Grep assertions: <command> => <N> lines; or N/A (manifest auto-generated; see Tests)
-        Runtime verification: <evidence> or N/A (<reason>)
+        Runtime verification: <evidence> or N/A (<reason>); for model-access or live-model probe stop conditions, include the exact in-container probe output or an explicit [UNVERIFIED-DEFERRED] note with the deferral reason
         VALIDATION: PASS   <- only when all in-run reviews passed
       NOTE: derive Files created/modified from the git diff -- do NOT list preserved/unchanged
       files. If no files changed (ALREADY_SATISFIED), emit "Files created: none" only.
