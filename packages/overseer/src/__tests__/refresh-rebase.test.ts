@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -63,7 +63,7 @@ function writeAndCommit(repo: string, file: string, content: string, message: st
   const abs = join(repo, file);
   const parts = file.split('/');
   if (parts.length > 1) {
-    execFileSync('mkdir', ['-p', join(repo, parts.slice(0, -1).join('/'))]);
+    mkdirSync(join(repo, parts.slice(0, -1).join('/')), { recursive: true });
   }
   writeFileSync(abs, content);
   git(repo, ['add', '-A']);
