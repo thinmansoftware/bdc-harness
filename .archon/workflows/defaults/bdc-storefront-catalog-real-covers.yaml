@@ -555,7 +555,8 @@ nodes:
 
   # ---------------------------------------------------------------------------
   # 11. VERCEL-VERIFY -- best-effort Vercel preview deployment check.
-  #     Vercel needs ~60-120s to build after PR open. Polls up to 4 minutes.
+  #     Polls ~60s max (3x20s) to stay inside the 120s bash node timeout
+  #     (PR #482 precedent). Slow builds fall through to skipped_still_building.
   # ---------------------------------------------------------------------------
   - id: vercel-verify
     depends_on: [open-pr]
@@ -571,8 +572,9 @@ nodes:
         exit 0
       fi
 
-      # Poll Vercel API for latest deployment on this branch (4 min budget)
-      for attempt in 1 2 3 4 5 6 7 8; do
+      # Poll Vercel API for latest deployment on this branch (~60s budget,
+      # must stay under the DAG executor 120s subprocess timeout)
+      for attempt in 1 2 3; do
         DEPLOY=$(curl -sf \
           "https://api.vercel.com/v6/deployments?projectId=${PROJECT}&meta-githubCommitRef=${BRANCH}&limit=1" \
           -H "Authorization: Bearer ${VERCEL_TOKEN}" 2>&1)
@@ -595,11 +597,11 @@ nodes:
           echo "DETAIL=Vercel deployment state=${STATE}"
           exit 0
         fi
-        sleep 30
+        sleep 20
       done
 
       echo "STATUS=skipped_still_building"
-      echo "DETAIL=Vercel did not reach READY within 4 min poll. Last state: ${STATE}"
+      echo "DETAIL=Vercel did not reach READY within 60s poll. Last state: ${STATE}"
       echo "OPERATOR: Re-check manually at https://vercel.com/bluedevilcollectibles/${PROJECT}/deployments"
       exit 0
 
