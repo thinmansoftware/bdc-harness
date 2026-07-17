@@ -1,0 +1,29 @@
+{
+  "payload": {
+    "schema_version": "m42-slice8b-frozen-manifest-v2",
+    "execution_id": "exec-s8b-synthetic",
+    "mode": "fake",
+    "candidate_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "starting_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "repository_full_name": "bluedevilcollectibles/bdc-harness",
+    "provider_repository_id": "R_sandbox_123",
+    "credential_principal_id": "principal-sandbox-only-1234",
+    "image_digest": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+    "fusion_caps_digest": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+    "verifier_registry_digest": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+    "action_policy_digest": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+    "expected_primary_actions": ["REFIRE", "REFRESH", "CLOSE", "MERGE"],
+    "expected_unexpected_actions": 0,
+    "max_window_minutes": 60,
+    "no_production_effect": true,
+    "declared_rollback_state_digest": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+    "sibling_merge_ancestor_shas": {
+      "S8B-SANDBOX-GH-ADAPTERS-01": "4b21f9b2c832d76b73db0ce009f217ce3615e1d1",
+      "S8B-CAULDRON-REFIRE-BRIDGE-01": "15fa811fd5ee46e94722de63078ba77f7ddce56f",
+      "S8B-FUSION-BUDGET-RECEIPTS-01": "8e7c4fbe9821689389ed744f32811bce99f7f4ec"
+    },
+    "issued_at": "2026-07-17T12:00:00.000Z",
+    "expires_at": "2026-07-17T13:00:00.000Z"
+  },
+  "payload_sha256": "sha256:be135ded2cdaaee5527c61a33768b4d3882aac714376191d5a4deda7fb52c39c"
+}
