@@ -43,7 +43,12 @@ jobs:
         run: bun run format:check
 
       - name: Run tests
+        if: runner.os != 'Windows'
         run: bun run test
+
+      - name: Run tests (Windows package-serial)
+        if: runner.os == 'Windows'
+        run: bun run --sequential --filter '*' test
 
   docker-build:
     runs-on: ubuntu-latest
