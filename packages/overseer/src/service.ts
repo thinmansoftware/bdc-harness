@@ -107,7 +107,7 @@ export async function runReconcileScheduler(input: {
   once?: boolean;
   reconcile?: () => Promise<unknown>;
 }): Promise<void> {
-  const reconcile = input.reconcile ?? (() => runReconcileOnce());
+  const reconcile = input.reconcile ?? ((): Promise<unknown> => runReconcileOnce());
   for (;;) {
     if (input.signal?.aborted) return;
     await reconcile();
