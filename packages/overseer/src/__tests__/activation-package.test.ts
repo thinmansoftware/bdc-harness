@@ -156,35 +156,40 @@ describe('activation-package', () => {
     expect(() =>
       writeNonGovernanceActivationArtifacts(
         { sandbox_proof_request: sandbox, deploy_activation_request: deploy },
-        join(process.cwd(), 'docs', 'board', 'packets')
+        join(process.cwd(), 'docs', 'board', 'packets'),
+        process.cwd()
       )
     ).toThrow(/governance|docs\/board|rejected/i);
 
     expect(() =>
       writeNonGovernanceActivationArtifacts(
         { sandbox_proof_request: sandbox, deploy_activation_request: deploy },
-        join(process.cwd(), '.github', 'workflows')
+        join(process.cwd(), '.github', 'workflows'),
+        process.cwd()
       )
     ).toThrow(/governance|\.github|rejected/i);
 
     expect(() =>
       writeNonGovernanceActivationArtifacts(
         { sandbox_proof_request: sandbox, deploy_activation_request: deploy },
-        join(process.cwd(), 'packages', 'overseer', 'src')
+        join(process.cwd(), 'packages', 'overseer', 'src'),
+        process.cwd()
       )
     ).toThrow(/source|rejected/i);
   });
 
-  test('caller-supplied external artifact directory succeeds with digests', () => {
-    const dir = mkdtempSync(join(tmpdir(), 'm42-activation-'));
-    temps.push(dir);
+  test('explicit approved external artifact root succeeds even when its name contains source-like words', () => {
+    const root = mkdtempSync(join(tmpdir(), 'm42-packages-approved-'));
+    const dir = join(root, 'activation');
+    temps.push(root);
     const input = baseInput();
     const sandbox = buildUnsignedSandboxProofRequest(input);
     const deploy = buildUnsignedActivationRequest(input);
 
     const written = writeNonGovernanceActivationArtifacts(
       { sandbox_proof_request: sandbox, deploy_activation_request: deploy },
-      dir
+      dir,
+      root
     );
 
     expect(written.sandbox_proof_request_path).toBe(join(dir, 'sandbox-proof-request.json'));
@@ -198,5 +203,37 @@ describe('activation-package', () => {
     const deployOnDisk = JSON.parse(readFileSync(written.deploy_activation_request_path, 'utf8'));
     expect(sandboxOnDisk.signed).toBe(false);
     expect(deployOnDisk.signed).toBe(false);
+  });
+
+  test('rejects missing, repository, and mismatched approved roots', () => {
+    const root = mkdtempSync(join(tmpdir(), 'm42-approved-root-'));
+    const otherRoot = mkdtempSync(join(tmpdir(), 'm42-unapproved-root-'));
+    temps.push(root, otherRoot);
+    const input = baseInput();
+    const bundle = {
+      sandbox_proof_request: buildUnsignedSandboxProofRequest(input),
+      deploy_activation_request: buildUnsignedActivationRequest(input),
+    };
+
+    expect(() =>
+      (
+        writeNonGovernanceActivationArtifacts as unknown as (
+          input: typeof bundle,
+          outputDirectory: string
+        ) => unknown
+      )(bundle, join(root, 'activation'))
+    ).toThrow(/approved_external_artifact_root/i);
+
+    expect(() =>
+      writeNonGovernanceActivationArtifacts(
+        bundle,
+        join(process.cwd(), 'artifacts', 'overseer', 'm42-wave2'),
+        process.cwd()
+      )
+    ).toThrow(/approved_external_artifact_root|repository/i);
+
+    expect(() =>
+      writeNonGovernanceActivationArtifacts(bundle, join(otherRoot, 'activation'), root)
+    ).toThrow(/outside_approved_external_artifact_root/i);
   });
 });

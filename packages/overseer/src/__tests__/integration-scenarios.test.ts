@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test';
 import {
   ADVERSARIAL_SCENARIO_IDS,
   assertOverseerDefaultOff,
+  deriveScenarioOutput,
   invokeRealProviderBoundary,
   runOverseerAdversarialScenario,
   runOverseerAdversarialMatrix,
@@ -166,26 +167,30 @@ describe('adversarial matrix', () => {
 
   test('each scenario fails closed at its specified gate', async () => {
     const deps = makeDeps();
-    const expectations: Record<ScenarioId, string> = {
-      success: 'none',
-      stale_state: 'live_compare',
-      replay: 'idempotency',
-      duplicate_run: 'idempotency',
-      provider_outage: 'adapter',
-      wrong_repository: 'policy',
-      wrong_base: 'live_compare',
-      unresolved_review: 'gate',
-      semantic_conflict: 'fusion',
-      production_target: 'policy',
-      budget_exhaustion: 'fusion_budget',
-      indeterminate_result: 'reconciliation',
+    const expectations: Record<ScenarioId, { readonly gate: string; readonly outcome: string }> = {
+      success: { gate: 'none', outcome: 'succeeded' },
+      stale_state: { gate: 'live_compare', outcome: 'live_state_mismatch' },
+      replay: { gate: 'idempotency', outcome: 'idempotency_conflict' },
+      duplicate_run: { gate: 'idempotency', outcome: 'escalated' },
+      provider_outage: { gate: 'adapter', outcome: 'failed' },
+      wrong_repository: { gate: 'policy', outcome: 'denied' },
+      wrong_base: { gate: 'live_compare', outcome: 'ineligible' },
+      unresolved_review: { gate: 'gate', outcome: 'denied' },
+      semantic_conflict: { gate: 'fusion', outcome: 'escalated' },
+      production_target: { gate: 'policy', outcome: 'operator_card' },
+      budget_exhaustion: { gate: 'fusion_budget', outcome: 'escalated' },
+      indeterminate_result: { gate: 'reconciliation', outcome: 'escalated' },
     };
 
-    for (const [scenario_id, gate] of Object.entries(expectations) as [ScenarioId, string][]) {
+    for (const [scenario_id, expected] of Object.entries(expectations) as [
+      ScenarioId,
+      { readonly gate: string; readonly outcome: string },
+    ][]) {
       if (scenario_id === 'success') continue;
       const result = await runOverseerAdversarialScenario({ scenario_id }, deps);
       expect(result.ok).toBe(false);
-      expect(result.failed_at_gate).toBe(gate);
+      expect(result.failed_at_gate).toBe(expected.gate);
+      expect(result.executor_outcome).toBe(expected.outcome);
       expect(result.real_call_count).toBe(0);
     }
   });
@@ -210,6 +215,102 @@ describe('adversarial matrix', () => {
     expect(result.failed_at_gate).toBe('policy');
     expect(result.adapter_attempted).toBe(false);
   });
+
+  const negativeCases: ReadonlyArray<{
+    readonly scenario_id: Exclude<ScenarioId, 'success'>;
+    readonly successful_outcome: string;
+    readonly injected_forbidden_call: string;
+  }> = [
+    {
+      scenario_id: 'stale_state',
+      successful_outcome: 'succeeded',
+      injected_forbidden_call: 'branch:adapter',
+    },
+    {
+      scenario_id: 'replay',
+      successful_outcome: 'succeeded',
+      injected_forbidden_call: 'repair:adapter',
+    },
+    {
+      scenario_id: 'duplicate_run',
+      successful_outcome: 'succeeded',
+      injected_forbidden_call: 'repair:adapter',
+    },
+    {
+      scenario_id: 'provider_outage',
+      successful_outcome: 'succeeded',
+      injected_forbidden_call: 'merge:adapter',
+    },
+    {
+      scenario_id: 'wrong_repository',
+      successful_outcome: 'merged',
+      injected_forbidden_call: 'merge:adapter',
+    },
+    {
+      scenario_id: 'wrong_base',
+      successful_outcome: 'succeeded',
+      injected_forbidden_call: 'branch:adapter',
+    },
+    {
+      scenario_id: 'unresolved_review',
+      successful_outcome: 'merged',
+      injected_forbidden_call: 'merge:adapter',
+    },
+    {
+      scenario_id: 'semantic_conflict',
+      successful_outcome: 'succeeded',
+      injected_forbidden_call: 'repair:adapter',
+    },
+    {
+      scenario_id: 'production_target',
+      successful_outcome: 'merged',
+      injected_forbidden_call: 'merge:adapter',
+    },
+    {
+      scenario_id: 'budget_exhaustion',
+      successful_outcome: 'succeeded',
+      injected_forbidden_call: 'repair:adapter',
+    },
+    {
+      scenario_id: 'indeterminate_result',
+      successful_outcome: 'succeeded',
+      injected_forbidden_call: 'repair:adapter',
+    },
+  ];
+
+  for (const testCase of negativeCases) {
+    test(`${testCase.scenario_id} output is invalidated by a success outcome or forbidden call`, async () => {
+      const actual = await runOverseerAdversarialScenario(
+        { scenario_id: testCase.scenario_id, process_restart: true },
+        makeDeps()
+      );
+      const orderedCalls = actual.ordered_calls ?? [];
+
+      const falseSuccess = deriveScenarioOutput({
+        scenario_id: testCase.scenario_id,
+        executor_outcome: testCase.successful_outcome,
+        ordered_calls: orderedCalls,
+      });
+      expect(falseSuccess.ok).toBe(true);
+      expect(falseSuccess.failed_at_gate).toBeNull();
+
+      const missingExecutionEvidence = deriveScenarioOutput({
+        scenario_id: testCase.scenario_id,
+        executor_outcome: actual.executor_outcome ?? '',
+        ordered_calls: [],
+      });
+      expect(missingExecutionEvidence.failed_at_gate).toBeNull();
+
+      const forbiddenCall = deriveScenarioOutput({
+        scenario_id: testCase.scenario_id,
+        executor_outcome: actual.executor_outcome ?? '',
+        ordered_calls: [...orderedCalls, testCase.injected_forbidden_call],
+        executor_adapter_called: testCase.scenario_id === 'production_target' ? true : undefined,
+      });
+      expect(forbiddenCall.forbidden_adapter_called).toBe(true);
+      expect(forbiddenCall.failed_at_gate).toBeNull();
+    });
+  }
 });
 
 describe('real-call dependency boundary (anti-theater)', () => {

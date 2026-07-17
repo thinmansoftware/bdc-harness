@@ -126,6 +126,180 @@ export interface MatrixResult {
   readonly real_call_count: number;
 }
 
+export interface ScenarioExecutionEvidence {
+  readonly scenario_id: ScenarioId;
+  readonly executor_outcome: string;
+  readonly ordered_calls: readonly string[];
+  /** Executor-returned adapter evidence, when the action exposes it directly. */
+  readonly executor_adapter_called?: boolean;
+}
+
+export interface DerivedScenarioOutput {
+  readonly ok: boolean;
+  readonly failed_at_gate: string | null;
+  readonly adapter_attempted: boolean;
+  readonly forbidden_adapter_called: boolean;
+}
+
+interface AdversarialEvidenceContract {
+  readonly executor_outcomes: readonly string[];
+  readonly failed_at_gate: string;
+  readonly required_ordered_calls: readonly string[];
+}
+
+const ADVERSARIAL_EVIDENCE_CONTRACTS: Readonly<
+  Record<Exclude<ScenarioId, 'success'>, AdversarialEvidenceContract>
+> = {
+  stale_state: {
+    executor_outcomes: ['live_state_mismatch'],
+    failed_at_gate: 'live_compare',
+    required_ordered_calls: [
+      'branch:prepare',
+      'branch:authorize',
+      'branch:reserve',
+      'branch:outcome:effect_failed',
+    ],
+  },
+  replay: {
+    executor_outcomes: ['idempotency_conflict'],
+    failed_at_gate: 'idempotency',
+    required_ordered_calls: [
+      'repair:outcome:effect_succeeded',
+      'repair:idempotency_commit',
+      'repair:record',
+      'repair:idempotency_begin',
+    ],
+  },
+  duplicate_run: {
+    executor_outcomes: ['escalated'],
+    failed_at_gate: 'idempotency',
+    required_ordered_calls: ['repair:record'],
+  },
+  provider_outage: {
+    executor_outcomes: ['failed'],
+    failed_at_gate: 'adapter',
+    required_ordered_calls: [
+      'repair:prepare',
+      'repair:authorize',
+      'repair:reserve',
+      'repair:adapter',
+      'repair:outcome:effect_failed',
+      'repair:idempotency_commit',
+      'repair:record',
+    ],
+  },
+  wrong_repository: {
+    executor_outcomes: ['denied'],
+    failed_at_gate: 'policy',
+    required_ordered_calls: ['merge:record_action'],
+  },
+  wrong_base: {
+    executor_outcomes: ['ineligible'],
+    failed_at_gate: 'live_compare',
+    required_ordered_calls: ['branch:observe', 'branch:count_unique'],
+  },
+  unresolved_review: {
+    executor_outcomes: ['denied'],
+    failed_at_gate: 'gate',
+    required_ordered_calls: ['merge:record_action'],
+  },
+  semantic_conflict: {
+    executor_outcomes: ['escalated'],
+    failed_at_gate: 'fusion',
+    required_ordered_calls: ['repair:record'],
+  },
+  production_target: {
+    executor_outcomes: ['operator_card'],
+    failed_at_gate: 'policy',
+    required_ordered_calls: ['merge:record_action'],
+  },
+  budget_exhaustion: {
+    executor_outcomes: ['escalated'],
+    failed_at_gate: 'fusion_budget',
+    required_ordered_calls: ['repair:record'],
+  },
+  indeterminate_result: {
+    executor_outcomes: ['escalated'],
+    failed_at_gate: 'reconciliation',
+    required_ordered_calls: ['repair:circuit_open', 'repair:record'],
+  },
+};
+
+const SUCCESS_EXECUTOR_OUTCOMES = new Set(['succeeded', 'merged']);
+
+function containsOrderedSubsequence(
+  calls: readonly string[],
+  required: readonly string[]
+): boolean {
+  let cursor = 0;
+  for (const call of calls) {
+    if (call === required[cursor]) cursor += 1;
+    if (cursor === required.length) return true;
+  }
+  return required.length === 0;
+}
+
+function isForbiddenAdapterCall(input: ScenarioExecutionEvidence): boolean {
+  const adapterCalls = input.ordered_calls
+    .map((call, index) => ({ call, index }))
+    .filter(entry => entry.call.endsWith(':adapter'));
+
+  if (input.scenario_id === 'success') return false;
+
+  if (input.scenario_id === 'provider_outage') {
+    return (
+      adapterCalls.some(entry => entry.call !== 'repair:adapter') ||
+      (Boolean(input.executor_adapter_called) && adapterCalls.length === 0)
+    );
+  }
+
+  if (input.scenario_id === 'replay') {
+    const finalBegin = input.ordered_calls.lastIndexOf('repair:idempotency_begin');
+    return (
+      Boolean(input.executor_adapter_called) ||
+      finalBegin < 0 ||
+      adapterCalls.some(entry => entry.call !== 'repair:adapter' || entry.index > finalBegin)
+    );
+  }
+
+  return Boolean(input.executor_adapter_called) || adapterCalls.length > 0;
+}
+
+/**
+ * Derive published scenario fields from executor output and observed call order.
+ * A named failure gate is emitted only when both the expected executor outcome
+ * and its ordered execution evidence are present, with no forbidden adapter.
+ */
+export function deriveScenarioOutput(input: ScenarioExecutionEvidence): DerivedScenarioOutput {
+  const adapterAttempted =
+    Boolean(input.executor_adapter_called) ||
+    input.ordered_calls.some(call => call.endsWith(':adapter'));
+  const forbiddenAdapterCalled = isForbiddenAdapterCall(input);
+  const ok = SUCCESS_EXECUTOR_OUTCOMES.has(input.executor_outcome) && !forbiddenAdapterCalled;
+
+  if (input.scenario_id === 'success') {
+    return {
+      ok,
+      failed_at_gate: null,
+      adapter_attempted: adapterAttempted,
+      forbidden_adapter_called: forbiddenAdapterCalled,
+    };
+  }
+
+  const contract = ADVERSARIAL_EVIDENCE_CONTRACTS[input.scenario_id];
+  const failureProven =
+    contract.executor_outcomes.includes(input.executor_outcome) &&
+    containsOrderedSubsequence(input.ordered_calls, contract.required_ordered_calls) &&
+    !forbiddenAdapterCalled;
+
+  return {
+    ok,
+    failed_at_gate: failureProven ? contract.failed_at_gate : null,
+    adapter_attempted: adapterAttempted,
+    forbidden_adapter_called: forbiddenAdapterCalled,
+  };
+}
+
 /**
  * Assert all five capabilities are off, emergency stop is on, and circuits
  * are reported exactly (never silently mapped to closed).
@@ -350,19 +524,22 @@ async function runStaleState(
 ): Promise<ScenarioRunResult> {
   const harness = makeBranchHarness({ liveHeadDrift: true });
   const result = await executeRefreshRebase(branchExecInput(), harness.deps);
+  const orderedCalls = harness.callLog.snapshot();
+  const derived = deriveScenarioOutput({
+    scenario_id: 'stale_state',
+    executor_outcome: result.outcome,
+    ordered_calls: orderedCalls,
+  });
   assertZeroRealCalls(deps, tracker, 'stale_state');
   return {
     scenario_id: 'stale_state',
-    ok: false,
-    failed_at_gate: 'live_compare',
+    ...derived,
     circuit_opened: false,
     retry_attempted: false,
-    adapter_attempted: harness.callLog.snapshot().includes('branch:adapter'),
-    forbidden_adapter_called: false,
     operator_card_count: 0,
     real_call_count: realCount(deps, tracker),
     receipt: null,
-    ordered_calls: harness.callLog.snapshot(),
+    ordered_calls: orderedCalls,
     executor_outcome: result.outcome,
   };
 }
@@ -394,19 +571,22 @@ async function runReplay(deps: ScenarioDeps, tracker: RealCallTracker): Promise<
     harness.deps
   );
   void first;
+  const orderedCalls = harness.callLog.snapshot();
+  const derived = deriveScenarioOutput({
+    scenario_id: 'replay',
+    executor_outcome: second.outcome,
+    ordered_calls: orderedCalls,
+  });
   assertZeroRealCalls(deps, tracker, 'replay');
   return {
     scenario_id: 'replay',
-    ok: false,
-    failed_at_gate: 'idempotency',
+    ...derived,
     circuit_opened: false,
     retry_attempted: false,
-    adapter_attempted: harness.callLog.snapshot().includes('repair:adapter'),
-    forbidden_adapter_called: false,
     operator_card_count: 0,
     real_call_count: realCount(deps, tracker),
     receipt: null,
-    ordered_calls: harness.callLog.snapshot(),
+    ordered_calls: orderedCalls,
     executor_outcome: second.outcome,
   };
 }
@@ -430,19 +610,22 @@ async function runDuplicateRun(
   });
   const harness = makeRepairHarness();
   const result = await executeRepairRefire(repairExecInput(assessment), harness.deps);
+  const orderedCalls = harness.callLog.snapshot();
+  const derived = deriveScenarioOutput({
+    scenario_id: 'duplicate_run',
+    executor_outcome: result.outcome,
+    ordered_calls: orderedCalls,
+  });
   assertZeroRealCalls(deps, tracker, 'duplicate_run');
   return {
     scenario_id: 'duplicate_run',
-    ok: false,
-    failed_at_gate: 'idempotency',
+    ...derived,
     circuit_opened: false,
     retry_attempted: false,
-    adapter_attempted: harness.callLog.snapshot().includes('repair:adapter'),
-    forbidden_adapter_called: false,
     operator_card_count: 0,
     real_call_count: realCount(deps, tracker),
     receipt: null,
-    ordered_calls: harness.callLog.snapshot(),
+    ordered_calls: orderedCalls,
     executor_outcome: result.outcome,
   };
 }
@@ -466,19 +649,22 @@ async function runProviderOutage(
     repairable_in_place: false,
   });
   const result = await executeRepairRefire(repairExecInput(assessment), harness.deps);
+  const orderedCalls = harness.callLog.snapshot();
+  const derived = deriveScenarioOutput({
+    scenario_id: 'provider_outage',
+    executor_outcome: result.outcome,
+    ordered_calls: orderedCalls,
+  });
   assertZeroRealCalls(deps, tracker, 'provider_outage');
   return {
     scenario_id: 'provider_outage',
-    ok: false,
-    failed_at_gate: 'adapter',
+    ...derived,
     circuit_opened: harness.circuitOpened.value,
     retry_attempted: false,
-    adapter_attempted: harness.callLog.snapshot().includes('repair:adapter'),
-    forbidden_adapter_called: false,
     operator_card_count: 0,
     real_call_count: realCount(deps, tracker),
     receipt: null,
-    ordered_calls: harness.callLog.snapshot(),
+    ordered_calls: orderedCalls,
     executor_outcome: result.outcome,
   };
 }
@@ -492,19 +678,23 @@ async function runWrongRepository(
     mergeEvidence({ repository: 'external-repo-not-allowlisted' }),
     harness.deps
   );
+  const orderedCalls = harness.callLog.snapshot();
+  const derived = deriveScenarioOutput({
+    scenario_id: 'wrong_repository',
+    executor_outcome: result.action,
+    ordered_calls: orderedCalls,
+    executor_adapter_called: result.adapterCalled,
+  });
   assertZeroRealCalls(deps, tracker, 'wrong_repository');
   return {
     scenario_id: 'wrong_repository',
-    ok: false,
-    failed_at_gate: 'policy',
+    ...derived,
     circuit_opened: false,
     retry_attempted: false,
-    adapter_attempted: harness.callLog.snapshot().includes('merge:adapter'),
-    forbidden_adapter_called: false,
     operator_card_count: 0,
     real_call_count: realCount(deps, tracker),
     receipt: null,
-    ordered_calls: harness.callLog.snapshot(),
+    ordered_calls: orderedCalls,
     executor_outcome: result.action,
   };
 }
@@ -525,19 +715,22 @@ async function runWrongBase(
     }),
     harness.deps
   );
+  const orderedCalls = harness.callLog.snapshot();
+  const derived = deriveScenarioOutput({
+    scenario_id: 'wrong_base',
+    executor_outcome: result.outcome,
+    ordered_calls: orderedCalls,
+  });
   assertZeroRealCalls(deps, tracker, 'wrong_base');
   return {
     scenario_id: 'wrong_base',
-    ok: false,
-    failed_at_gate: 'live_compare',
+    ...derived,
     circuit_opened: false,
     retry_attempted: false,
-    adapter_attempted: harness.callLog.snapshot().includes('branch:adapter'),
-    forbidden_adapter_called: false,
     operator_card_count: 0,
     real_call_count: realCount(deps, tracker),
     receipt: null,
-    ordered_calls: harness.callLog.snapshot(),
+    ordered_calls: orderedCalls,
     executor_outcome: result.outcome,
   };
 }
@@ -551,19 +744,23 @@ async function runUnresolvedReview(
     mergeEvidence({ reviews: [{ resolved: false }] }),
     harness.deps
   );
+  const orderedCalls = harness.callLog.snapshot();
+  const derived = deriveScenarioOutput({
+    scenario_id: 'unresolved_review',
+    executor_outcome: result.action,
+    ordered_calls: orderedCalls,
+    executor_adapter_called: result.adapterCalled,
+  });
   assertZeroRealCalls(deps, tracker, 'unresolved_review');
   return {
     scenario_id: 'unresolved_review',
-    ok: false,
-    failed_at_gate: 'gate',
+    ...derived,
     circuit_opened: false,
     retry_attempted: false,
-    adapter_attempted: harness.callLog.snapshot().includes('merge:adapter'),
-    forbidden_adapter_called: false,
     operator_card_count: 0,
     real_call_count: realCount(deps, tracker),
     receipt: null,
-    ordered_calls: harness.callLog.snapshot(),
+    ordered_calls: orderedCalls,
     executor_outcome: result.action,
   };
 }
@@ -587,19 +784,22 @@ async function runSemanticConflict(
   });
   const harness = makeRepairHarness();
   const result = await executeRepairRefire(repairExecInput(assessment), harness.deps);
+  const orderedCalls = harness.callLog.snapshot();
+  const derived = deriveScenarioOutput({
+    scenario_id: 'semantic_conflict',
+    executor_outcome: result.outcome,
+    ordered_calls: orderedCalls,
+  });
   assertZeroRealCalls(deps, tracker, 'semantic_conflict');
   return {
     scenario_id: 'semantic_conflict',
-    ok: false,
-    failed_at_gate: 'fusion',
+    ...derived,
     circuit_opened: harness.circuitOpened.value,
     retry_attempted: false,
-    adapter_attempted: harness.callLog.snapshot().includes('repair:adapter'),
-    forbidden_adapter_called: false,
     operator_card_count: 0,
     real_call_count: realCount(deps, tracker),
     receipt: null,
-    ordered_calls: harness.callLog.snapshot(),
+    ordered_calls: orderedCalls,
     executor_outcome: result.outcome,
   };
 }
@@ -613,19 +813,23 @@ async function runProductionTarget(
     mergeEvidence({ resulting_deployment_effect: 'production' }),
     harness.deps
   );
+  const orderedCalls = harness.callLog.snapshot();
+  const derived = deriveScenarioOutput({
+    scenario_id: 'production_target',
+    executor_outcome: result.action,
+    ordered_calls: orderedCalls,
+    executor_adapter_called: result.adapterCalled,
+  });
   assertZeroRealCalls(deps, tracker, 'production_target');
   return {
     scenario_id: 'production_target',
-    ok: false,
-    failed_at_gate: 'policy',
+    ...derived,
     circuit_opened: false,
     retry_attempted: false,
-    adapter_attempted: false,
-    forbidden_adapter_called: false,
     operator_card_count: 0,
     real_call_count: realCount(deps, tracker),
     receipt: null,
-    ordered_calls: harness.callLog.snapshot(),
+    ordered_calls: orderedCalls,
     executor_outcome: result.action,
   };
 }
@@ -649,19 +853,22 @@ async function runBudgetExhaustion(
   });
   const harness = makeRepairHarness();
   const result = await executeRepairRefire(repairExecInput(assessment), harness.deps);
+  const orderedCalls = harness.callLog.snapshot();
+  const derived = deriveScenarioOutput({
+    scenario_id: 'budget_exhaustion',
+    executor_outcome: result.outcome,
+    ordered_calls: orderedCalls,
+  });
   assertZeroRealCalls(deps, tracker, 'budget_exhaustion');
   return {
     scenario_id: 'budget_exhaustion',
-    ok: false,
-    failed_at_gate: 'fusion_budget',
+    ...derived,
     circuit_opened: false,
     retry_attempted: false,
-    adapter_attempted: harness.callLog.snapshot().includes('repair:adapter'),
-    forbidden_adapter_called: false,
     operator_card_count: 0,
     real_call_count: realCount(deps, tracker),
     receipt: null,
-    ordered_calls: harness.callLog.snapshot(),
+    ordered_calls: orderedCalls,
     executor_outcome: result.outcome,
   };
 }
@@ -701,15 +908,18 @@ async function runIndeterminate(
   const retryAttempted = processRestart
     ? harness.callLog.snapshot().includes('repair:adapter')
     : false;
+  const orderedCalls = harness.callLog.snapshot();
+  const derived = deriveScenarioOutput({
+    scenario_id: 'indeterminate_result',
+    executor_outcome: result.outcome,
+    ordered_calls: orderedCalls,
+  });
   assertZeroRealCalls(deps, tracker, 'indeterminate_result');
   return {
     scenario_id: 'indeterminate_result',
-    ok: false,
-    failed_at_gate: 'reconciliation',
+    ...derived,
     circuit_opened: harness.circuitOpened.value || result.outcome === 'escalated',
     retry_attempted: retryAttempted,
-    adapter_attempted: harness.callLog.snapshot().includes('repair:adapter'),
-    forbidden_adapter_called: false,
     operator_card_count:
       card.card_id === reconciliation.card_id &&
       reconciliation.deliver_calls === 0 &&
@@ -719,7 +929,7 @@ async function runIndeterminate(
         : 0,
     real_call_count: realCount(deps, tracker),
     receipt: null,
-    ordered_calls: harness.callLog.snapshot(),
+    ordered_calls: orderedCalls,
     executor_outcome: result.outcome,
   };
 }
@@ -730,18 +940,23 @@ async function runSuccessScenario(
 ): Promise<ScenarioRunResult> {
   const chain = await runIntegratedSuccessChain(deps);
   const repairReceipt = chain.receipts[0] ?? null;
+  const orderedCalls = chain.receipts.flatMap(receipt => receipt.ordered_calls);
+  const derived = deriveScenarioOutput({
+    scenario_id: 'success',
+    executor_outcome: chain.ok ? 'succeeded' : 'failed',
+    ordered_calls: orderedCalls,
+  });
   assertZeroRealCalls(deps, tracker, 'scenario_end:success');
   return {
     scenario_id: 'success',
-    ok: chain.ok,
-    failed_at_gate: null,
+    ...derived,
     circuit_opened: false,
     retry_attempted: false,
-    adapter_attempted: true,
-    forbidden_adapter_called: false,
     operator_card_count: 1,
     real_call_count: realCount(deps, tracker),
     receipt: repairReceipt,
+    ordered_calls: orderedCalls,
+    executor_outcome: chain.ok ? 'succeeded' : 'failed',
   };
 }
 
@@ -810,8 +1025,11 @@ export async function runOverseerAdversarialMatrix(deps: ScenarioDeps): Promise<
   }
   assertZeroRealCalls(guarded, tracker, 'matrix_end');
   const ok =
-    results.every(r => (r.scenario_id === 'success' ? r.ok : !r.ok && r.failed_at_gate !== null)) &&
-    realCount(guarded, tracker) === 0;
+    results.every(r =>
+      r.scenario_id === 'success'
+        ? r.ok && !r.forbidden_adapter_called
+        : !r.ok && r.failed_at_gate !== null && !r.forbidden_adapter_called
+    ) && realCount(guarded, tracker) === 0;
   return {
     ok,
     results,

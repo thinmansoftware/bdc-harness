@@ -591,7 +591,6 @@ export interface BranchHarness {
 export function makeBranchHarness(
   opts: {
     readonly liveHeadDrift?: boolean;
-    readonly baseMismatch?: boolean;
     readonly dirty?: boolean;
     readonly policyEligible?: boolean;
   } = {}
@@ -737,8 +736,6 @@ export function makeBranchHarness(
 export function branchExecInput(
   overrides: Partial<ExecuteRefreshRebaseInputV1['candidate']> = {}
 ): ExecuteRefreshRebaseInputV1 {
-  const baseMismatch = overrides.pr_snapshot?.base_sha !== undefined;
-  void baseMismatch;
   return {
     candidate: {
       repository: 'bluedevilcollectibles/bdc-harness',

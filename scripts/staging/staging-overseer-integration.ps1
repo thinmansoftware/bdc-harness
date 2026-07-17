@@ -106,7 +106,7 @@ if ($hostName -ne 'ASUS-ROG-DSK-2T') {
 
 # Ensure container surface exists (caller normally ran staging-m42-up first).
 $state = (& $Docker inspect -f "{{.State.Status}}" archon-m42-staging 2>$null)
-if ($state -ne "running" -and -not $InjectHealthFailure) {
+if ($state -ne "running") {
   Write-Error "archon-m42-staging is not running; run staging-m42-up.ps1 first"
   exit 1
 }
@@ -128,20 +128,18 @@ function Get-RealImageDigest {
 }
 
 $digest = $null
-if ($state -eq "running") {
-  $imageId = (& $Docker inspect -f "{{.Image}}" archon-m42-staging 2>$null)
-  if ($imageId) {
-    $digest = Get-RealImageDigest -ImageRef $imageId
-  }
-  if (-not $digest) {
-    $digest = Get-RealImageDigest -ImageRef "archon-m42-staging:current"
-  }
+$imageId = (& $Docker inspect -f "{{.Image}}" archon-m42-staging 2>$null)
+if ($imageId) {
+  $digest = Get-RealImageDigest -ImageRef $imageId
 }
-if (-not $digest -and -not $InjectHealthFailure) {
+if (-not $digest) {
+  $digest = Get-RealImageDigest -ImageRef "archon-m42-staging:current"
+}
+if (-not $digest) {
   Write-Error "image_digest_unavailable: docker image inspect did not return sha256:<64>"
   exit 1
 }
-if ($digest -and $digest -notmatch '^sha256:[0-9a-f]{64}$') {
+if ($digest -notmatch '^sha256:[0-9a-f]{64}$') {
   Write-Error "image_digest_invalid: expected sha256:<64>, got non-conforming value"
   exit 1
 }
@@ -152,7 +150,6 @@ if ($digest -and $digest -notmatch '^sha256:[0-9a-f]{64}$') {
 # ---------------------------------------------------------------------------
 function Get-CredentialEnvPresent {
   $present = New-Object System.Collections.Generic.List[string]
-  if ($state -ne "running") { return @() }
   foreach ($key in $CredentialEnvKeys) {
     # printenv KEY exits nonzero when absent; present-but-empty also reports the key.
     $out = & $Docker exec archon-m42-staging printenv $key 2>$null
@@ -167,7 +164,6 @@ function Get-CredentialEnvPresent {
 
 function Get-CredentialFilesPresent {
   $present = New-Object System.Collections.Generic.List[string]
-  if ($state -ne "running") { return @() }
   foreach ($path in $CredentialFilePaths) {
     & $Docker exec archon-m42-staging test -e $path 2>$null | Out-Null
     if ($LASTEXITCODE -eq 0) {
@@ -248,25 +244,22 @@ function Get-LiveOverseerHealth {
   }
 }
 
-$liveHealth = $null
-if ($state -eq "running") {
-  $liveHealth = Get-LiveOverseerHealth
-  if ($liveHealth.watcher_count -ne 1) {
-    Write-Error "health_gate_failed: expected exactly one running watcher, got watcher_state=$($liveHealth.watcher_state) count=$($liveHealth.watcher_count)"
-    exit 1
-  }
-  if ($liveHealth.adapter_mode -ne "fake") {
-    Write-Error "health_gate_failed: expected adapter_mode=fake, got $($liveHealth.adapter_mode)"
-    exit 1
-  }
-  if (-not $liveHealth.emergency_stop) {
-    Write-Error "health_gate_failed: emergency_stop must be true"
-    exit 1
-  }
-  if (-not $liveHealth.all_caps_false) {
-    Write-Error "health_gate_failed: all five capability flags must be false"
-    exit 1
-  }
+$liveHealth = Get-LiveOverseerHealth
+if ($liveHealth.watcher_count -ne 1) {
+  Write-Error "health_gate_failed: expected exactly one running watcher, got watcher_state=$($liveHealth.watcher_state) count=$($liveHealth.watcher_count)"
+  exit 1
+}
+if ($liveHealth.adapter_mode -ne "fake") {
+  Write-Error "health_gate_failed: expected adapter_mode=fake, got $($liveHealth.adapter_mode)"
+  exit 1
+}
+if (-not $liveHealth.emergency_stop) {
+  Write-Error "health_gate_failed: emergency_stop must be true"
+  exit 1
+}
+if (-not $liveHealth.all_caps_false) {
+  Write-Error "health_gate_failed: all five capability flags must be false"
+  exit 1
 }
 
 # ---------------------------------------------------------------------------
@@ -275,10 +268,6 @@ if ($state -eq "running") {
 # Real-call count is observed by the fake adapter boundary inside the image.
 # ---------------------------------------------------------------------------
 function Invoke-M42IntegrationRunnerInContainer {
-  if ($state -ne "running") {
-    Write-Error "integration_runner_requires_running_container"
-    exit 1
-  }
   $prev = $ErrorActionPreference
   $ErrorActionPreference = "Continue"
   # Production Dockerfile copies packages/overseer into the candidate image.
@@ -322,31 +311,16 @@ if ($deployed -ne $sha) {
 }
 
 # Proof fields derived from live health only -- no fabricated emergency_stop/default true.
-if (-not $liveHealth -and -not $InjectHealthFailure) {
-  Write-Error "health_gate_failed: live overseer health required for staging proof"
-  exit 1
-}
-$proofWatcherCount = if ($liveHealth) { [int]$liveHealth.watcher_count } else { 0 }
-$proofAdapterMode  = if ($liveHealth) { [string]$liveHealth.adapter_mode } else { "none" }
-# Fail closed: never invent emergency_stop=true when health is unavailable.
-if ($liveHealth) {
-  $proofEmergency = [bool]$liveHealth.emergency_stop
-} else {
-  Write-Error "health_gate_failed: emergency_stop unknown without live health"
-  exit 1
-}
-$proofDisabled = if ($liveHealth) { @($liveHealth.disabled_capabilities) } else { @() }
-
 $proof = [ordered]@{
   schema_version           = "m42-staging-proof-v1"
   candidate_sha            = $sha
   image_digest             = $digest
   container_name           = "archon-m42-staging"
   host                     = $hostName
-  watcher_count            = $proofWatcherCount
-  adapter_mode             = $proofAdapterMode
-  emergency_stop           = $proofEmergency
-  disabled_capabilities    = $proofDisabled
+  watcher_count            = [int]$liveHealth.watcher_count
+  adapter_mode             = [string]$liveHealth.adapter_mode
+  emergency_stop           = [bool]$liveHealth.emergency_stop
+  disabled_capabilities    = @($liveHealth.disabled_capabilities)
   receipt_count            = [int]$scenario.receipt_count
   real_call_count          = [int]$scenario.real_call_count
   credential_env_present   = @($credEnvPresent)
@@ -376,7 +350,7 @@ function Test-ChildEvidenceSatisfiedForPackets {
 
 # Packets require READY parent manifest + real prior SHA + real verifier digest
 # + completed staging/rollback proofs. No zero-SHA or zero-digest placeholders.
-if ((Test-ChildEvidenceSatisfiedForPackets) -and $digest -and $liveHealth) {
+if (Test-ChildEvidenceSatisfiedForPackets) {
   Write-Host "[m42-integration] parent READY but in-container packet writer is gated on complete rollback_proof + non-zero verifier registry; skipping host packet fabrication"
   Write-Host "[m42-integration] unsigned packets not written (require READY+staging+rollback evidence; no placeholder digests)"
 } else {
@@ -412,10 +386,6 @@ if ($InjectHealthFailure) {
 
   # Stop candidate container.
   & $Docker compose -f $Compose down --remove-orphans 2>$null
-
-  $candidateRunning = $false
-  $running = (& $Docker inspect -f "{{.State.Running}}" archon-m42-staging 2>$null)
-  if ($running -eq "true") { $candidateRunning = $true }
 
   # Restore prior image as :current and restore data/home + deploy marker.
   & $Docker tag $PriorImageTag "archon-m42-staging:current"

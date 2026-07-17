@@ -7,8 +7,8 @@
  */
 
 import { createHash } from 'node:crypto';
-import { mkdirSync, writeFileSync } from 'node:fs';
-import { isAbsolute, join, normalize, resolve, sep } from 'node:path';
+import { mkdirSync, realpathSync, writeFileSync } from 'node:fs';
+import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 
 const SHA1_RE = /^[0-9a-f]{40}$/;
 const SHA256_RE = /^[0-9a-f]{64}$/;
@@ -238,82 +238,67 @@ export function buildUnsignedActivationRequest(
   };
 }
 
-const FORBIDDEN_PATH_MARKERS = [
-  `${sep}docs${sep}board`,
-  `${sep}.github`,
-  `${sep}packages${sep}`,
-  `${sep}migrations${sep}`,
-  `${sep}scripts${sep}`,
-  `${sep}src${sep}`,
-];
+function isWithinOrEqual(path: string, root: string): boolean {
+  const rel = relative(root, path);
+  return rel === '' || (!rel.startsWith(`..${sep}`) && rel !== '..' && !isAbsolute(rel));
+}
 
-function assertNonGovernanceOutputDirectory(outputDirectory: string): string {
-  const resolved = resolve(outputDirectory);
-  const normalized = normalize(resolved).toLowerCase();
-  const repoRoot = resolve(process.cwd()).toLowerCase();
-
-  for (const marker of FORBIDDEN_PATH_MARKERS) {
-    if (normalized.includes(marker.toLowerCase())) {
-      throw new Error(
-        `activation_artifact_path_rejected: path under forbidden governance/source tree (${marker})`
-      );
-    }
+function assertApprovedExternalOutputDirectory(
+  outputDirectory: string,
+  approvedExternalArtifactRoot: string
+): string {
+  if (!approvedExternalArtifactRoot?.trim()) {
+    throw new Error('activation_artifact_path_rejected: approved_external_artifact_root_required');
+  }
+  if (!isAbsolute(approvedExternalArtifactRoot) || !isAbsolute(outputDirectory)) {
+    throw new Error(
+      'activation_artifact_path_rejected: approved_external_artifact_root_must_be_absolute'
+    );
   }
 
-  if (normalized.startsWith(repoRoot + sep) || normalized === repoRoot) {
-    const rel = normalized.slice(repoRoot.length).replace(/^[/\\]/, '');
-    const first = rel.split(/[/\\]/)[0] ?? '';
-    const forbiddenRoots = new Set([
-      'docs',
-      '.github',
-      'packages',
-      'migrations',
-      'scripts',
-      'src',
-      'deploy',
-      'config',
-      'harness',
-    ]);
-    if (forbiddenRoots.has(first)) {
-      throw new Error(
-        `activation_artifact_path_rejected: refuses repository source tree path '${first}'`
-      );
-    }
+  const requestedRoot = resolve(approvedExternalArtifactRoot);
+  const requestedOutput = resolve(outputDirectory);
+  const requestedRepo = resolve(process.cwd());
+
+  if (
+    isWithinOrEqual(requestedRoot, requestedRepo) ||
+    isWithinOrEqual(requestedRepo, requestedRoot)
+  ) {
+    throw new Error(
+      'activation_artifact_path_rejected: approved_external_artifact_root_is_repository'
+    );
+  }
+  if (!isWithinOrEqual(requestedOutput, requestedRoot)) {
+    throw new Error('activation_artifact_path_rejected: outside_approved_external_artifact_root');
   }
 
-  if (!isAbsolute(resolved) && !outputDirectory.includes('artifacts')) {
-    // relative paths under artifacts/ are allowed when resolved under cwd
+  mkdirSync(requestedRoot, { recursive: true });
+  mkdirSync(requestedOutput, { recursive: true });
+
+  const actualRoot = realpathSync(requestedRoot);
+  const actualOutput = realpathSync(requestedOutput);
+  const actualRepo = realpathSync(requestedRepo);
+  if (isWithinOrEqual(actualRoot, actualRepo) || isWithinOrEqual(actualRepo, actualRoot)) {
+    throw new Error(
+      'activation_artifact_path_rejected: approved_external_artifact_root_is_repository'
+    );
+  }
+  if (!isWithinOrEqual(actualOutput, actualRoot)) {
+    throw new Error('activation_artifact_path_rejected: outside_approved_external_artifact_root');
   }
 
-  if (normalized.startsWith(repoRoot + sep)) {
-    const rel = normalized.slice(repoRoot.length).replace(/^[/\\]/, '');
-    if (!rel.startsWith('artifacts') && !rel.includes(`${sep}tmp`) && !rel.includes('staging-')) {
-      if (!rel.startsWith('staging-data') && !rel.startsWith('staging-m42')) {
-        const first = rel.split(/[/\\]/)[0] ?? '';
-        if (
-          first &&
-          first !== 'artifacts' &&
-          first !== 'staging-data' &&
-          first !== 'staging-m42-data'
-        ) {
-          throw new Error(
-            `activation_artifact_path_rejected: refuses non-artifact repo path '${first}'`
-          );
-        }
-      }
-    }
-  }
-
-  return resolved;
+  return actualOutput;
 }
 
 /**
  * Write unsigned canonical JSON packets plus SHA-256 digests to a
- * caller-supplied directory. Rejects docs/board, .github, and source trees.
+ * caller-supplied directory under an explicit approved external artifact root.
+ * Both paths must be absolute, and the approved root must be outside the repo.
  */
 export function writeNonGovernanceActivationArtifacts(
   input: ActivationArtifactBundle,
-  outputDirectory: string
+  outputDirectory: string,
+  approvedExternalArtifactRoot: string
 ): WrittenActivationArtifacts {
   // Refuse writing packets that were not built from a validated READY input path
   // (bundle schemas already enforce signed:false and required fields).
@@ -333,8 +318,7 @@ export function writeNonGovernanceActivationArtifacts(
     throw new Error('activation_artifact_rejected:zero_prior_sha');
   }
 
-  const dir = assertNonGovernanceOutputDirectory(outputDirectory);
-  mkdirSync(dir, { recursive: true });
+  const dir = assertApprovedExternalOutputDirectory(outputDirectory, approvedExternalArtifactRoot);
 
   const sandboxBody = canonicalJsonStringify(input.sandbox_proof_request);
   const deployBody = canonicalJsonStringify(input.deploy_activation_request);
