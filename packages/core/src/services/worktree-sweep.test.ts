@@ -365,6 +365,83 @@ describe('sweepTerminalWorkflowWorktrees', () => {
     expect(mockPruneWorktrees).toHaveBeenCalledWith(sourcePath);
   });
 
+  // Scenario 4b: the quarantine log carries the required structured fields --
+  // path, class, reason, and bytes (WO contract).
+  test('scenario 4b: quarantine log includes path, class, reason, and bytes', async () => {
+    const worktreePath = await createWorktree(workspacesRoot, 'owner', 'repo', 'thread-reason');
+    await setMtime(worktreePath, OLD);
+    mockListWorkflowRunsWithWorkingPath.mockResolvedValueOnce([]);
+    mockListActiveEnvs.mockResolvedValueOnce([
+      { id: 'env-reason', working_path: worktreePath, created_by_platform: 'web', created_at: OLD },
+    ]);
+    mockGetConversationsUsingEnv.mockResolvedValue([]);
+
+    const report = await sweepTerminalWorkflowWorktrees({
+      workspacesRoot,
+      quarantineRoot,
+      now: NOW,
+      orphanAgeMs: ORPHAN_AGE_MS,
+    });
+
+    const expectedDest = join(quarantineRoot, '2026-07-13', 'owner__repo__thread-reason');
+    expect(report.quarantined).toHaveLength(1);
+    const quarantineLog = mockLogger.info.mock.calls.find(
+      ([, event]) => event === 'worktree_sweep_quarantined'
+    );
+    expect(quarantineLog).toBeDefined();
+    const [fields] = quarantineLog as [Record<string, unknown>, string];
+    expect(fields.worktreePath).toBe(worktreePath);
+    expect(fields.quarantinePath).toBe(expectedDest);
+    expect(fields.class).toBe('env-only');
+    expect(typeof fields.reason).toBe('string');
+    expect((fields.reason as string).length).toBeGreaterThan(0);
+    expect(typeof fields.bytes).toBe('number');
+  });
+
+  // Scenario 4c: DB status update fails AFTER the dir has already been moved to
+  // quarantine. The move must stand, the failure must be retried, and the
+  // stranded env row must be surfaced via report.errors (not misreported as a
+  // quarantine failure).
+  test('scenario 4c: mark-destroyed failure after quarantine is retried and surfaced', async () => {
+    const worktreePath = await createWorktree(workspacesRoot, 'owner', 'repo', 'thread-dbfail');
+    await setMtime(worktreePath, OLD);
+    mockListWorkflowRunsWithWorkingPath.mockResolvedValueOnce([]);
+    mockListActiveEnvs.mockResolvedValueOnce([
+      { id: 'env-dbfail', working_path: worktreePath, created_by_platform: 'web', created_at: OLD },
+    ]);
+    mockGetConversationsUsingEnv.mockResolvedValue([]);
+    // Every attempt to mark the env destroyed fails.
+    mockUpdateEnvStatus.mockRejectedValue(new Error('db unavailable'));
+
+    const report = await sweepTerminalWorkflowWorktrees({
+      workspacesRoot,
+      quarantineRoot,
+      now: NOW,
+      orphanAgeMs: ORPHAN_AGE_MS,
+    });
+
+    const expectedDest = join(quarantineRoot, '2026-07-13', 'owner__repo__thread-dbfail');
+    // The move still stands -- we do NOT roll back a successful quarantine.
+    expect(existsSync(worktreePath)).toBe(false);
+    expect(existsSync(expectedDest)).toBe(true);
+    expect(report.quarantined).toHaveLength(1);
+    expect(report.quarantined[0].class).toBe('env-only');
+    // Retried the max number of attempts.
+    expect(mockUpdateEnvStatus).toHaveBeenCalledTimes(3);
+    // The stranded env row is surfaced as an error referencing the env id.
+    expect(report.errors).toHaveLength(1);
+    expect(report.errors[0].path).toBe(worktreePath);
+    expect(report.errors[0].error).toContain('env-dbfail');
+    expect(report.errors[0].error).toContain('db unavailable');
+    expect(mockLogger.error).toHaveBeenCalledWith(
+      expect.objectContaining({ envId: 'env-dbfail', worktreePath }),
+      'worktree_sweep_mark_destroyed_failed'
+    );
+    // Reset for other tests (mockRejectedValue is sticky).
+    mockUpdateEnvStatus.mockReset();
+    mockUpdateEnvStatus.mockResolvedValue(undefined);
+  });
+
   // Scenario 5a: ENV-ONLY with an active session -> untouched, skip logged.
   test('scenario 5a: env-only dir with an active session is left alone', async () => {
     const worktreePath = await createWorktree(workspacesRoot, 'owner', 'repo', 'thread-live');

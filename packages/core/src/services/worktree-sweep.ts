@@ -56,6 +56,21 @@ export interface WorktreeSweepEnv {
 
 export type QuarantineClass = 'env-only' | 'unmatched';
 
+// Human-readable explanation of WHY a dir crossed into quarantine, keyed by
+// classification. Surfaced in the structured quarantine log alongside class so
+// an operator reading the log knows the cause, not just the bucket.
+const QUARANTINE_REASONS: Record<QuarantineClass, string> = {
+  'env-only':
+    'active isolation env row with no matching workflow run, older than orphan age, and no active session',
+  unmatched: 'no matching workflow run or isolation env row, older than orphan age',
+};
+
+// How many times to retry marking an env destroyed AFTER its dir has already
+// been moved to quarantine. The move is irreversible from the scanner's view,
+// so a stuck DB update must not silently strand the env row pointing at a moved
+// path -- retry, then surface the failure loudly via report.errors.
+const MARK_DESTROYED_MAX_ATTEMPTS = 3;
+
 export interface WorktreeSweepReport {
   scanned: number;
   removed: string[];
@@ -510,9 +525,10 @@ async function quarantineOrphan(
   try {
     const bytes = await directorySize(dir.path);
     const quarantinePath = await moveToQuarantine(dir, quarantineRoot, now);
+    const reason = QUARANTINE_REASONS[cls];
     report.quarantined.push({ path: dir.path, quarantinePath, class: cls, bytes });
     getLog().info(
-      { worktreePath: dir.path, quarantinePath, class: cls, bytes },
+      { worktreePath: dir.path, quarantinePath, class: cls, reason, bytes },
       'worktree_sweep_quarantined'
     );
 
@@ -533,9 +549,39 @@ async function quarantineOrphan(
       );
     }
 
-    // ENV-ONLY: stop the DB pointing at a path that no longer exists.
+    // ENV-ONLY: stop the DB pointing at a path that no longer exists. The dir
+    // has already left the live tree, so a failed status update would strand
+    // the env row as active pointing at a moved path the scanner can no longer
+    // reach. Retry a few times; if it still fails, surface it via report.errors
+    // (NOT the outer catch, which would mislabel a successful move as a
+    // quarantine failure) so the stale row is visible instead of leaking.
     if (cls === 'env-only' && ctx.envId && ctx.markEnvDestroyed) {
-      await ctx.markEnvDestroyed(ctx.envId);
+      const envId = ctx.envId;
+      const markEnvDestroyed = ctx.markEnvDestroyed;
+      let markErr: Error | undefined;
+      for (let attempt = 1; attempt <= MARK_DESTROYED_MAX_ATTEMPTS; attempt++) {
+        try {
+          await markEnvDestroyed(envId);
+          markErr = undefined;
+          break;
+        } catch (error) {
+          markErr = error as Error;
+          getLog().warn(
+            { err: markErr, envId, worktreePath: dir.path, quarantinePath, attempt },
+            'worktree_sweep_mark_destroyed_retry'
+          );
+        }
+      }
+      if (markErr) {
+        report.errors.push({
+          path: dir.path,
+          error: `env ${envId} quarantined to ${quarantinePath} but mark-destroyed failed after ${MARK_DESTROYED_MAX_ATTEMPTS} attempts: ${markErr.message}`,
+        });
+        getLog().error(
+          { err: markErr, envId, worktreePath: dir.path, quarantinePath },
+          'worktree_sweep_mark_destroyed_failed'
+        );
+      }
     }
   } catch (error) {
     const err = error as Error;
