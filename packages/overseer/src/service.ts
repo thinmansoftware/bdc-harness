@@ -19,6 +19,7 @@ import {
 } from './adapters/fake-github';
 import { readOverseerActionPolicyFromEnv } from './action-policy';
 import { permitFromMetadata } from './permit';
+import { runReconcileOnce } from './reconcile';
 import { watchLoop } from './watch';
 import type {
   GitHubClientDeps,
@@ -73,6 +74,8 @@ export interface OverseerServiceOptions {
   deliveryOwner?: string;
   deliveryChannels?: OperatorCardChannel[];
   deliveryDrain?: () => Promise<unknown>;
+  reconcileIntervalMs?: number;
+  reconcileRun?: () => Promise<unknown>;
 }
 
 export async function runOperatorCardDeliveryScheduler(input: {
@@ -93,6 +96,21 @@ export async function runOperatorCardDeliveryScheduler(input: {
   for (;;) {
     if (input.signal?.aborted) return;
     await drain();
+    if (input.once || input.signal?.aborted) return;
+    await waitForDeliveryInterval(input.intervalMs ?? 30_000, input.signal);
+  }
+}
+
+export async function runReconcileScheduler(input: {
+  signal?: AbortSignal;
+  intervalMs?: number;
+  once?: boolean;
+  reconcile?: () => Promise<unknown>;
+}): Promise<void> {
+  const reconcile = input.reconcile ?? (() => runReconcileOnce());
+  for (;;) {
+    if (input.signal?.aborted) return;
+    await reconcile();
     if (input.once || input.signal?.aborted) return;
     await waitForDeliveryInterval(input.intervalMs ?? 30_000, input.signal);
   }
@@ -286,23 +304,25 @@ export async function runOverseerService(options: OverseerServiceOptions = {}): 
       signal: coupledAbort.signal,
     }
   );
-  if (!options.deliveryEnabled) {
-    try {
-      await watcher;
-      return;
-    } finally {
-      coupledAbort.abort();
-      options.signal?.removeEventListener('abort', abortFromParent);
-    }
+  const tasks: Promise<void>[] = [watcher];
+  if (options.deliveryEnabled) {
+    const delivery = runOperatorCardDeliveryScheduler({
+      signal: coupledAbort.signal,
+      intervalMs: options.deliveryIntervalMs,
+      owner: options.deliveryOwner ?? `overseer-delivery-${process.pid}`,
+      once: options.once,
+      channels: options.deliveryChannels,
+      drain: options.deliveryDrain,
+    });
+    tasks.push(delivery);
   }
-  const delivery = runOperatorCardDeliveryScheduler({
+  const reconcile = runReconcileScheduler({
     signal: coupledAbort.signal,
-    intervalMs: options.deliveryIntervalMs,
-    owner: options.deliveryOwner ?? `overseer-delivery-${process.pid}`,
+    intervalMs: options.reconcileIntervalMs,
     once: options.once,
-    channels: options.deliveryChannels,
-    drain: options.deliveryDrain,
+    reconcile: options.reconcileRun,
   });
+  tasks.push(reconcile);
   const abortOnFailure = async (task: Promise<void>): Promise<void> => {
     try {
       await task;
@@ -312,10 +332,10 @@ export async function runOverseerService(options: OverseerServiceOptions = {}): 
     }
   };
   try {
-    await Promise.all([abortOnFailure(watcher), abortOnFailure(delivery)]);
+    await Promise.all(tasks.map(task => abortOnFailure(task)));
   } finally {
     coupledAbort.abort();
-    await Promise.allSettled([watcher, delivery]);
+    await Promise.allSettled(tasks);
     options.signal?.removeEventListener('abort', abortFromParent);
   }
 }

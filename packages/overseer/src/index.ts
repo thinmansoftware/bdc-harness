@@ -54,6 +54,23 @@ export { watchLoop, watchOnce, DEFAULT_WATCH_INTERVAL_MS } from './watch';
 export { judgePullRequest, isPrGreen, isPrMergeReady } from './judge-pr';
 export { judgeWithGrok } from './judge-second-opinion';
 export { runOverseerService } from './service';
+export {
+  buildEvidenceComment,
+  createDefaultReconcileDeps,
+  extractWoStems,
+  readReconcileCursorFromActions,
+  RECONCILE_ACTION,
+  runReconcileOnce,
+} from './reconcile';
+export type {
+  ReconcileActionRecord,
+  ReconcileDeps,
+  ReconcileLogger,
+  ReconcileMergedPullRequest,
+  ReconcileResult,
+  ReconcileTrackerIssue,
+  RunReconcileInput,
+} from './reconcile';
 
 // M-31 merge-steward substrate (M-42 Slice 2): read-only permit preparation.
 export { prepareM31ActionPermit, createFailClosedM31CapabilityGate } from './m31-substrate';
