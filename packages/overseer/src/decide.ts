@@ -294,7 +294,8 @@ export function decide(input: DecideInput): DecisionResult {
     case 'read_spec_command_not_found':
       return {
         decision: 'escalate',
-        reason: 'read-spec command was unavailable in the runtime image; infra ownership review needed',
+        reason:
+          'read-spec command was unavailable in the runtime image; infra ownership review needed',
       };
 
     case 'reviewer_no_output':
