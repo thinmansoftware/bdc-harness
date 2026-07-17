@@ -22,6 +22,7 @@ import {
   getConversationsUsingEnv,
   findStaleEnvironments,
   listAllActiveWithCodebase,
+  listActiveEnvironmentsForSweep,
 } from './isolation-environments';
 
 describe('isolation-environments', () => {
@@ -345,6 +346,23 @@ describe('isolation-environments', () => {
       const result = await listAllActiveWithCodebase();
 
       expect(result).toEqual([]);
+    });
+  });
+
+  describe('listActiveEnvironmentsForSweep', () => {
+    test('returns active environments with working paths without joining codebases', async () => {
+      mockQuery.mockResolvedValueOnce(createQueryResult([sampleEnv]));
+
+      const result = await listActiveEnvironmentsForSweep();
+
+      expect(result).toEqual([sampleEnv]);
+      expect(mockQuery).toHaveBeenCalledWith(
+        expect.stringContaining('FROM remote_agent_isolation_environments')
+      );
+      const [query] = mockQuery.mock.calls[0] as [string];
+      expect(query).toContain("status != 'destroyed'");
+      expect(query).toContain('working_path IS NOT NULL');
+      expect(query).not.toContain('JOIN remote_agent_codebases');
     });
   });
 });
