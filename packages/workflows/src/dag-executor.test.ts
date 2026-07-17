@@ -634,6 +634,29 @@ describe('executeDagWorkflow -- plan-review terminal safety', () => {
     expect(packet.iteration).toBe(1);
     expect(packet.maxIterations).toBe(3);
     expect(packet.singleDecisionNeeded).toBe('Which source path contains the prior logic?');
+
+    const events = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls.map(
+      call => call[0] as { event_type: string; step_name?: string; data?: Record<string, unknown> }
+    );
+    const planReviewIterationsStarted = events.filter(
+      event => event.event_type === 'loop_iteration_started' && event.step_name === 'plan-review'
+    );
+    const planReviewIterationsCompleted = events.filter(
+      event => event.event_type === 'loop_iteration_completed' && event.step_name === 'plan-review'
+    );
+    expect(planReviewIterationsStarted.map(event => event.data?.iteration)).toEqual([1]);
+    expect(planReviewIterationsCompleted.map(event => event.data?.iteration)).toEqual([1]);
+    expect(
+      events.some(event => event.event_type === 'node_completed' && event.step_name === 'implement')
+    ).toBe(false);
+    expect(
+      events.some(
+        event =>
+          event.event_type === 'node_skipped' &&
+          event.step_name === 'implement' &&
+          event.data?.reason === 'upstream_plan_review_not_approved'
+      )
+    ).toBe(true);
   });
 
   // WO-HARNESS-LOOP-OUTPUT-NEWLINE-AND-ITERATION-TIMEOUT-01
