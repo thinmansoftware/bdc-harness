@@ -8,6 +8,8 @@
     "repository_full_name": "bluedevilcollectibles/bdc-harness",
     "provider_repository_id": "R_sandbox_123",
     "credential_principal_id": "principal-sandbox-only-1234",
+    "image_digest": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+    "fusion_caps_digest": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
     "verifier_registry_digest": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
     "action_policy_digest": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
     "expected_primary_actions": ["REFIRE", "REFRESH", "CLOSE", "MERGE"],
@@ -23,5 +25,5 @@
     "issued_at": "2026-07-17T12:00:00.000Z",
     "expires_at": "2026-07-17T13:00:00.000Z"
   },
-  "payload_sha256": "sha256:c23931fd6550d34cb550d8c4ef6708b825fe646b951d077e274306cd8d3e1e04"
+  "payload_sha256": "sha256:be135ded2cdaaee5527c61a33768b4d3882aac714376191d5a4deda7fb52c39c"
 }

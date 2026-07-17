@@ -28,6 +28,8 @@ function payload(overrides: Partial<M42Slice8BManifestPayload> = {}): M42Slice8B
     repository_full_name: 'bluedevilcollectibles/bdc-harness',
     provider_repository_id: 'R_sandbox_123',
     credential_principal_id: 'principal-sandbox-only-1234',
+    image_digest: DIGEST,
+    fusion_caps_digest: DIGEST,
     verifier_registry_digest: DIGEST,
     action_policy_digest: DIGEST,
     expected_primary_actions: ['REFIRE', 'REFRESH', 'CLOSE', 'MERGE'],
@@ -221,8 +223,9 @@ describe('M-42 Slice 8B canary runner scenarios', () => {
   test('receipt failure after a provider response stops workload and requires reconciliation', async () => {
     const executor = recordingExecutor({ MERGE: { accepted: false, provider_call_count: 1 } });
     const receipt = await runM42Slice8BCanary(envelope(), deps(executor.actions));
-    expect(receipt.stop_reason).toBe('action_refused');
+    expect(receipt.stop_reason).toBe('receipt_failure_after_provider_response');
     expect(receipt.provider_call_count).toBe(1);
+    expect(receipt.circuit_breaker_opened).toBe(true);
     expect(receipt.xo_briefing_reconciled).toBe(false);
   });
 

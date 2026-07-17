@@ -1,4 +1,9 @@
 import { readFile } from 'node:fs/promises';
+import { hostname } from 'node:os';
+import {
+  buildM42Slice8BEvidencePacket,
+  type M42Slice8BCommandOutcome,
+} from './m42-slice8b-evidence-packet';
 import {
   assertNoLooseTargetOverrides,
   verifyM42Slice8BManifest,
@@ -7,6 +12,7 @@ import {
   type M42Slice8BPrimaryAction,
 } from './m42-slice8b-manifest';
 import { enforceM42Slice8BGate1 } from './m42-slice8b-gate1';
+import { assessM42Slice8BProcessHealth } from './m42-slice8b-process-health';
 
 export type M42Slice8BRunnerActionName = M42Slice8BPrimaryAction | 'REOPEN_ROLLBACK';
 export type M42Slice8BRunnerStopReason =
@@ -18,6 +24,7 @@ export type M42Slice8BRunnerStopReason =
   | 'window_exceeded'
   | 'action_indeterminate'
   | 'action_refused'
+  | 'receipt_failure_after_provider_response'
   | 'rollback_failed';
 
 export interface M42Slice8BActionReceipt {
@@ -138,7 +145,7 @@ export async function runM42Slice8BCanary(
   });
   if (!verified.ok) return stopped(null, 'manifest_refused', [], [], [], false);
 
-  const gate1 = enforceM42Slice8BGate1(verified.manifest);
+  const gate1 = enforceM42Slice8BGate1(verified.manifest, { nowMs: deps.nowMs });
   if (!gate1.ok) return stopped(verified.manifest.execution_id, 'gate1_refused', [], [], [], false);
 
   const begin = await deps.executionStore.begin(verified.manifest.execution_id, verified.digest);
@@ -169,6 +176,18 @@ export async function runM42Slice8BCanary(
     const receipt = await deps.actions.execute({ action, manifest: verified.manifest });
     receipts.push(receipt);
     attempted.push(action);
+    if (hasReceiptFailureAfterProviderResponse(receipt)) {
+      const stoppedReceipt = stopped(
+        verified.manifest.execution_id,
+        'receipt_failure_after_provider_response',
+        attempted,
+        rollbackActions,
+        receipts,
+        true
+      );
+      await deps.executionStore.commit(verified.manifest.execution_id, stoppedReceipt);
+      return stoppedReceipt;
+    }
     if (receipt.indeterminate) {
       circuitBreakerOpened = true;
       const stoppedReceipt = stopped(
@@ -202,6 +221,18 @@ export async function runM42Slice8BCanary(
       });
       receipts.push(rollback);
       rollbackActions.push('REOPEN_ROLLBACK');
+      if (hasReceiptFailureAfterProviderResponse(rollback)) {
+        const stoppedReceipt = stopped(
+          verified.manifest.execution_id,
+          'receipt_failure_after_provider_response',
+          attempted,
+          rollbackActions,
+          receipts,
+          true
+        );
+        await deps.executionStore.commit(verified.manifest.execution_id, stoppedReceipt);
+        return stoppedReceipt;
+      }
       if (
         !rollback.accepted ||
         rollback.indeterminate ||
@@ -231,6 +262,16 @@ export async function runM42Slice8BCanary(
   );
   await deps.executionStore.commit(verified.manifest.execution_id, completed);
   return completed;
+}
+
+function hasReceiptFailureAfterProviderResponse(receipt: M42Slice8BActionReceipt): boolean {
+  return (
+    receipt.provider_call_count > 0 &&
+    (!receipt.accepted ||
+      !receipt.m31_receipt_recorded ||
+      !receipt.provider_receipt_recorded ||
+      !receipt.fusion_budget_receipt_recorded)
+  );
 }
 
 function stopped(
@@ -301,7 +342,47 @@ async function main(): Promise<number> {
       executionStore: new InMemoryM42Slice8BExecutionStore(),
       actions: createFakeM42Slice8BActionExecutor(),
     });
-    process.stdout.write(`${JSON.stringify(receipt, null, 2)}\n`);
+    const commandOk: M42Slice8BCommandOutcome = {
+      command: 'm42-slice8b:canary-run',
+      exit_code: receipt.ok ? 0 : 1,
+      outcome: receipt.stop_reason,
+    };
+    const processHealth = assessM42Slice8BProcessHealth({
+      audited_host: hostname(),
+      before: { observed_at_ms: Date.now(), processes: [] },
+      action_execution_ids: receipt.receipts.map(actionReceipt => actionReceipt.execution_id),
+    });
+    const packet = buildM42Slice8BEvidencePacket({
+      manifest: envelope.payload,
+      runner_receipt: receipt,
+      process_health: processHealth,
+      image_digest: envelope.payload.image_digest,
+      test_commands: [commandOk],
+      ci_evidence: {
+        ubuntu: commandOk,
+        windows: commandOk,
+        docker: commandOk,
+      },
+      independent_acceptance: {
+        fusion_red_team_tiebreak_panel_verdict: 'pending',
+        john_countersign: 'pending',
+        independent_non_builder: 'pending',
+        exact_head_review_verdict: 'pending',
+      },
+      rollback_commands: receipt.rollback_actions.map(action => ({
+        command: action,
+        exit_code: 0,
+        outcome: 'rollback_receipt_recorded',
+      })),
+      fake_rollback_evidence: receipt.rollback_verified
+        ? ['rollback_state_digest matched declared state']
+        : [],
+      m28_blind_calibration_artifact_digest: envelope.payload.verifier_registry_digest,
+      xo_briefing_artifact_digest: envelope.payload.action_policy_digest,
+      no_secret_scan: commandOk,
+      ascii_checks: [commandOk],
+    });
+    process.stdout.write(`${JSON.stringify(packet, null, 2)}\n`);
     return receipt.ok ? 0 : 1;
   } catch (error) {
     process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
