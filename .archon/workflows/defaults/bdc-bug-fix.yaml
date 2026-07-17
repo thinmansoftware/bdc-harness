@@ -663,8 +663,7 @@ nodes:
         -H "Content-Type: application/json" \
         -d "{\"action\":\"completed\",\"wo_id\":\"${WO_ID}\",\"builder\":\"Builder-4\",\"detail\":${DETAIL}}"
 
-  - id: flip-notion
-    persona: xo
+  - id: review-issue
     depends_on: [post-completed]
     task_class: clerical
     bash: |
@@ -673,11 +672,6 @@ nodes:
       capture_node_output() {
         python3 -c 'import shlex, sys; s=sys.stdin.read(); sys.stdout.write((lambda p: p[0] if len(p)==1 else s)(shlex.split(s)) if len(s)>=2 and s[0]=="'"'"'" and s.rstrip("\n").endswith("'"'"'") else s)'
       }
-
-      MANIFEST=$(capture_node_output <<'BDC_NODE_OUTPUT_MANIFEST'
-      $post-completed.output
-      BDC_NODE_OUTPUT_MANIFEST
-      )
 
       READ_SPEC_OUT=$(capture_node_output <<'BDC_NODE_OUTPUT_READ_SPEC'
       $read-spec.output
@@ -695,7 +689,7 @@ nodes:
         fi
       fi
       if [ -z "$ISSUE_NUM" ]; then
-        echo "flip-notion: no GitHub issue resolved; skipping status:review label + manifest comment."
+        echo "review-issue: no GitHub issue resolved; skipping status:review label."
         exit 0
       fi
 
@@ -703,7 +697,50 @@ nodes:
       gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --remove-label status:building 2>/dev/null || true
       gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --remove-label status:blocked 2>/dev/null || true
       gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --add-label status:review
-      COMMENT_FILE=$(mktemp)
-      printf '%s\n' "$MANIFEST" > "$COMMENT_FILE"
-      gh issue comment "$ISSUE_NUM" --repo "$ISSUE_REPO" --body-file "$COMMENT_FILE"
-      echo "flip-notion: $ISSUE_REPO#$ISSUE_NUM -> status:review (manifest posted as comment)"
+      echo "review-issue: $ISSUE_REPO#$ISSUE_NUM -> status:review"
+
+  - id: blocked-issue
+    depends_on: [implement]
+    trigger_rule: all_done
+    task_class: clerical
+    bash: |
+      set -euo pipefail
+
+      capture_node_output() {
+        python3 -c 'import shlex, sys; s=sys.stdin.read(); sys.stdout.write((lambda p: p[0] if len(p)==1 else s)(shlex.split(s)) if len(s)>=2 and s[0]=="'"'"'" and s.rstrip("\n").endswith("'"'"'") else s)'
+      }
+
+      IMPLEMENT_OUT=$(capture_node_output <<'BDC_NODE_OUTPUT_IMPLEMENT'
+      $implement.output
+      BDC_NODE_OUTPUT_IMPLEMENT
+      )
+      if ! printf '%s\n' "$IMPLEMENT_OUT" | grep -q '^BLOCKED:'; then
+        echo "blocked-issue: implement did not emit BLOCKED; not marking issue status:blocked."
+        exit 0
+      fi
+
+      READ_SPEC_OUT=$(capture_node_output <<'BDC_NODE_OUTPUT_READ_SPEC'
+      $read-spec.output
+      BDC_NODE_OUTPUT_READ_SPEC
+      )
+      ISSUE_REPO="${ISSUE_REPO:-bluedevilcollectibles/bdc-xo}"
+      ISSUE_NUM=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'issue=[0-9]+' | head -1 | cut -d= -f2 || true)
+      if [ -z "$ISSUE_NUM" ]; then
+        ISSUE_NUM=$(printf '%s\n' "$READ_SPEC_OUT" | sed -n 's/^SPEC_PATH=.*issues\/\([0-9][0-9]*\).*/\1/p' | head -1)
+      fi
+      if [ -z "$ISSUE_NUM" ]; then
+        WO_ID_FROM_SPEC=$(printf '%s\n' "$READ_SPEC_OUT" | sed -n 's/^WO_ID=//p' | head -1)
+        if [ -n "$WO_ID_FROM_SPEC" ]; then
+          ISSUE_NUM=$(gh issue list --repo "$ISSUE_REPO" --search "$WO_ID_FROM_SPEC in:title" --json number --jq '.[0].number // empty' 2>/dev/null || true)
+        fi
+      fi
+      if [ -z "$ISSUE_NUM" ]; then
+        echo "blocked-issue: no GitHub issue resolved; skipping status:blocked label."
+        exit 0
+      fi
+
+      gh label create status:blocked --repo "$ISSUE_REPO" --color B60205 --description "BDC workflow is blocked before commit" 2>/dev/null || true
+      gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --remove-label status:building 2>/dev/null || true
+      gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --remove-label status:review 2>/dev/null || true
+      gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --add-label status:blocked
+      echo "blocked-issue: $ISSUE_REPO#$ISSUE_NUM -> status:blocked"

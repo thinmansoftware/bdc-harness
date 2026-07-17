@@ -859,11 +859,10 @@ nodes:
       test -s "$OUT"
 
   # ---------------------------------------------------------------------------
-  # flip-notion: REVIEW only when ALL stages PASS. ANY blocked stage -> BLOCKED.
-  # Never partial REVIEW. Never claim a PR where one was not opened.
+  # GitHub issue completion: REVIEW only when ALL stages PASS. ANY blocked stage
+  # marks the WO issue BLOCKED. Never partial REVIEW.
   # ---------------------------------------------------------------------------
-  - id: flip-notion
-    persona: xo
+  - id: review-issue
     depends_on: [consolidated-manifest]
     task_class: clerical
     bash: |
@@ -875,12 +874,15 @@ nodes:
 
       MANIFEST_FILE="$ARTIFACTS_DIR/pipeline-manifest.json"
       if [ ! -s "$MANIFEST_FILE" ]; then
-        echo "flip-notion: pipeline manifest missing; refusing status mutation" >&2
+        echo "review-issue: pipeline manifest missing; refusing status mutation" >&2
         exit 1
       fi
-      MANIFEST=$(cat "$MANIFEST_FILE")
       OVERALL_STATUS=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["overallStatus"])' "$MANIFEST_FILE")
       PARENT_PROJECTION=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["parentProjection"])' "$MANIFEST_FILE")
+      if [ "$OVERALL_STATUS" != "PASS" ] || [ "$PARENT_PROJECTION" != "completed" ]; then
+        echo "review-issue: overallStatus=$OVERALL_STATUS parentProjection=$PARENT_PROJECTION -- not marking issue status:review."
+        exit 0
+      fi
 
       READ_SPEC_OUT=$(capture_node_output <<'BDC_NODE_OUTPUT_READ_SPEC'
       $read-spec.output
@@ -898,19 +900,7 @@ nodes:
         fi
       fi
       if [ -z "$ISSUE_NUM" ]; then
-        echo "flip-notion: no GitHub issue resolved; skipping status:review label + manifest comment."
-        exit 0
-      fi
-
-      COMMENT_FILE=$(mktemp)
-      printf '%s\n' "$MANIFEST" > "$COMMENT_FILE"
-      if [ "$OVERALL_STATUS" != "PASS" ] || [ "$PARENT_PROJECTION" != "completed" ]; then
-        gh label create status:blocked --repo "$ISSUE_REPO" --color B60205 --description "BDC workflow is blocked" 2>/dev/null || true
-        gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --remove-label status:building 2>/dev/null || true
-        gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --remove-label status:review 2>/dev/null || true
-        gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --add-label status:blocked
-        gh issue comment "$ISSUE_NUM" --repo "$ISSUE_REPO" --body-file "$COMMENT_FILE"
-        echo "flip-notion: $ISSUE_REPO#$ISSUE_NUM -> status:blocked (parent reducer refused REVIEW)"
+        echo "review-issue: no GitHub issue resolved; skipping status:review label."
         exit 0
       fi
 
@@ -918,5 +908,53 @@ nodes:
       gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --remove-label status:building 2>/dev/null || true
       gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --remove-label status:blocked 2>/dev/null || true
       gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --add-label status:review
-      gh issue comment "$ISSUE_NUM" --repo "$ISSUE_REPO" --body-file "$COMMENT_FILE"
-      echo "flip-notion: $ISSUE_REPO#$ISSUE_NUM -> status:review (manifest posted as comment)"
+      echo "review-issue: $ISSUE_REPO#$ISSUE_NUM -> status:review"
+
+  - id: blocked-issue
+    depends_on: [consolidated-manifest]
+    trigger_rule: all_done
+    task_class: clerical
+    bash: |
+      set -euo pipefail
+
+      capture_node_output() {
+        python3 -c 'import shlex, sys; s=sys.stdin.read(); sys.stdout.write((lambda p: p[0] if len(p)==1 else s)(shlex.split(s)) if len(s)>=2 and s[0]=="'"'"'" and s.rstrip("\n").endswith("'"'"'") else s)'
+      }
+
+      MANIFEST_FILE="$ARTIFACTS_DIR/pipeline-manifest.json"
+      if [ ! -s "$MANIFEST_FILE" ]; then
+        echo "blocked-issue: pipeline manifest missing; refusing status mutation" >&2
+        exit 1
+      fi
+      OVERALL_STATUS=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["overallStatus"])' "$MANIFEST_FILE")
+      PARENT_PROJECTION=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["parentProjection"])' "$MANIFEST_FILE")
+      if [ "$OVERALL_STATUS" != "PASS" ] || [ "$PARENT_PROJECTION" != "completed" ]; then
+        READ_SPEC_OUT=$(capture_node_output <<'BDC_NODE_OUTPUT_READ_SPEC'
+      $read-spec.output
+      BDC_NODE_OUTPUT_READ_SPEC
+      )
+        ISSUE_REPO="${ISSUE_REPO:-bluedevilcollectibles/bdc-xo}"
+        ISSUE_NUM=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'issue=[0-9]+' | head -1 | cut -d= -f2 || true)
+        if [ -z "$ISSUE_NUM" ]; then
+          ISSUE_NUM=$(printf '%s\n' "$READ_SPEC_OUT" | sed -n 's/^SPEC_PATH=.*issues\/\([0-9][0-9]*\).*/\1/p' | head -1)
+        fi
+        if [ -z "$ISSUE_NUM" ]; then
+          WO_ID_FROM_SPEC=$(printf '%s\n' "$READ_SPEC_OUT" | sed -n 's/^WO_ID=//p' | head -1)
+          if [ -n "$WO_ID_FROM_SPEC" ]; then
+            ISSUE_NUM=$(gh issue list --repo "$ISSUE_REPO" --search "$WO_ID_FROM_SPEC in:title" --json number --jq '.[0].number // empty' 2>/dev/null || true)
+          fi
+        fi
+        if [ -z "$ISSUE_NUM" ]; then
+          echo "blocked-issue: no GitHub issue resolved; skipping status:blocked label."
+          exit 0
+        fi
+
+        gh label create status:blocked --repo "$ISSUE_REPO" --color B60205 --description "BDC workflow is blocked" 2>/dev/null || true
+        gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --remove-label status:building 2>/dev/null || true
+        gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --remove-label status:review 2>/dev/null || true
+        gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --add-label status:blocked
+        echo "blocked-issue: $ISSUE_REPO#$ISSUE_NUM -> status:blocked (parent reducer refused REVIEW)"
+        exit 0
+      fi
+
+      echo "blocked-issue: overallStatus=$OVERALL_STATUS parentProjection=$PARENT_PROJECTION -- not marking issue status:blocked."
