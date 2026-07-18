@@ -13,6 +13,32 @@ describe('classifyError -- workflow-runtime classes (BDC 2026-05-16)', () => {
     ).toBe('sentinel_mismatch');
   });
 
+  test('validator_sdk_contradiction: non-loop node + SDK returned success, no nodeType', () => {
+    expect(
+      classifyError({
+        message: "Node 'war-council-validator' failed: SDK returned success",
+      })
+    ).toBe('validator_sdk_contradiction');
+  });
+
+  test('validator_sdk_contradiction: loop case is unchanged (zero regression)', () => {
+    expect(
+      classifyError({
+        message: "Loop 'implement' iteration 1 failed: SDK returned success",
+        nodeType: 'loop',
+      })
+    ).toBe('sentinel_mismatch');
+  });
+
+  test('validator_sdk_contradiction: Node prefix wins over a mistaken nodeType', () => {
+    expect(
+      classifyError({
+        message: "Node 'war-council-validator' failed: SDK returned success",
+        nodeType: 'loop',
+      })
+    ).toBe('validator_sdk_contradiction');
+  });
+
   test("npm_not_found: bash 'command not found: npm'", () => {
     expect(
       classifyError({
@@ -328,6 +354,25 @@ describe('decide -- workflow-runtime classes', () => {
   test('spec_lookup_failed retries once then escalates', () => {
     expect(decide({ errorClass: 'spec_lookup_failed', attempt: 1 }).decision).toBe('retry');
     expect(decide({ errorClass: 'spec_lookup_failed', attempt: 2 }).decision).toBe('escalate');
+  });
+
+  test('validator_sdk_contradiction -> escalate even with output (never auto-recovers)', () => {
+    const r = decide({ errorClass: 'validator_sdk_contradiction', attempt: 1, hasOutput: true });
+    expect(r.decision).toBe('escalate');
+  });
+
+  test('validator_sdk_contradiction -> populates escalationContext for operator evidence', () => {
+    const r = decide({
+      errorClass: 'validator_sdk_contradiction',
+      attempt: 1,
+      nodeId: 'war-council-validator',
+      woId: 'WO-TEST-01',
+      validatorOutput: 'some output',
+    });
+    expect(r.escalationContext).toBeDefined();
+    expect(r.escalationContext?.errorClass).toBe('validator_sdk_contradiction');
+    expect(r.escalationContext?.nodeId).toBe('war-council-validator');
+    expect(r.escalationContext?.woId).toBe('WO-TEST-01');
   });
 });
 

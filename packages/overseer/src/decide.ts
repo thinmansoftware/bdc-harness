@@ -262,6 +262,23 @@ export function decide(input: DecideInput): DecisionResult {
         },
       };
 
+    case 'validator_sdk_contradiction':
+      // Non-loop node (e.g. war-council-validator) crashed with the Anthropic SDK
+      // isError=true + errorSubtype='success' contradiction. ALWAYS escalate -- never
+      // commit_and_push_anyway -- so a validator glitch can never silently bypass the QA gate.
+      return {
+        decision: 'escalate',
+        reason:
+          'Anthropic SDK returned a success/error contradiction on a non-loop node -- provider-side glitch (bdc-harness#344), not a defect in the WO diff',
+        escalationContext: {
+          errorClass: 'validator_sdk_contradiction',
+          nodeId,
+          woId,
+          validatorOutput,
+          remediation: extractRemediation(validatorOutput),
+        },
+      };
+
     // --- Failure Classes E-J (BDC-specific 2026-07-17) ---
     //
     // These are dry-run observer classifications only. The decision layer returns

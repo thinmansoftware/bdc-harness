@@ -38,6 +38,7 @@ export type ErrorClass =
   | 'validator_feedback_not_applied' // commit-and-push: validator emitted actionable feedback but agent did not iterate
   | 'validator_rejected' // war-council-validator stdout begins with REJECT/BLOCK/FAIL
   | 'implement_loop_skipped' // commit-and-push: thread branch HEAD-only, agent never wrote to disk
+  | 'validator_sdk_contradiction' // non-loop node (e.g. war-council-validator): Anthropic SDK returned isError=true + errorSubtype='success' (bdc-harness#344), previously fell through to unknown with no escalation
   // Fallback
   | 'unknown';
 
@@ -124,6 +125,19 @@ export function classifyError(input: ClassifyInput): ErrorClass {
   }
 
   // --- Workflow-runtime classes (BDC-specific, 2026-05-16) ---
+
+  // Validator SDK contradiction: the Anthropic SDK returned isError=true +
+  // errorSubtype='success' on a NON-loop node (e.g. war-council-validator), a
+  // provider-side glitch (bdc-harness#344). Checked BEFORE sentinel_mismatch so the
+  // `Node '` message prefix wins even against a malformed nodeType (Test 3). The
+  // `Node '` vs `Loop '` message prefix is the primary and sufficient discriminator:
+  // the regex already excludes `Loop '...` messages, so no nodeType gate is applied
+  // here (gating on nodeType !== 'loop' would wrongly re-route the malformed
+  // Node-prefix + nodeType='loop' case back to sentinel_mismatch, violating Test 3).
+  const validatorSdkContradiction = /^Node '.+' failed: SDK returned success\b/;
+  if (validatorSdkContradiction.test(rawMessage)) {
+    return 'validator_sdk_contradiction';
+  }
 
   // Sentinel mismatch: implement loop iteration ended without finding `until:` string
   if (msg.includes('sdk returned success') && input.nodeType === 'loop') {
