@@ -238,7 +238,13 @@ export function classifyError(input: ClassifyInput): ErrorClass {
     msg.includes('out_of_credits') ||
     msg.includes('credit balance is too low') ||
     msg.includes('credit exhaustion detected') ||
-    msg.includes('insufficient_quota')
+    msg.includes('insufficient_quota') ||
+    // OpenRouter/Grok 402 phrasing (verified live 2026-07-18, run db45cdbf --
+    // real failure previously misclassified as 'unknown'):
+    // "402 This request requires more credits, or fewer max_tokens... add more credits"
+    (status === 402 && msg.includes('credit')) ||
+    /requires more credits/i.test(rawMessage) ||
+    /add more credits/i.test(rawMessage)
   ) {
     return 'out_of_credits';
   }

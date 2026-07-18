@@ -419,6 +419,114 @@ describe('service', () => {
     });
   });
 
+  test('escalation runs and delivers a card even when dryRun is true (2026-07-18 fix)', async () => {
+    // Root cause fixed 2026-07-18: dryRun previously short-circuited handleRecord
+    // before escalation logic ran at all, so zero escalation.json/operator-card
+    // receipts were ever produced in production despite Overseer correctly
+    // classifying and deciding to escalate every failed run. Escalation is
+    // notification/audit only (never a repo or production mutation -- see
+    // authorized-escalation.ts, which always reports mutation_sent: false), so
+    // it must run under dryRun; only merge_ready (a real mutation path) may be
+    // gated by it.
+    await withTempDatabase(async () => {
+      enableFakeCapability('escalation');
+      const boundPermit = await seedPersistentPermit(
+        'service-escalation-dryrun',
+        'STAGING_MUTATION',
+        'escalation'
+      );
+      const mergePullRequest = mock(async () => {
+        throw new Error('poison merge client called');
+      });
+      const actions: Array<{ action: string; result: string }> = [];
+
+      await runOverseerService({
+        once: true,
+        enabled: true,
+        dryRun: true,
+        adapterKind: 'fake',
+        deps: {
+          listRunsForWatch: async () => [
+            {
+              id: 'run-dryrun-escalation',
+              woId: 'WO-DRYRUN-ESCALATION-01',
+              owner: 'bluedevilcollectibles',
+              repo: 'bdc-harness',
+              status: 'failed',
+              metadata: { overseer_m31_permit: boundPermit },
+            },
+          ],
+          listRunEvents: async () => [
+            {
+              id: 'event-dryrun-escalation',
+              workflow_run_id: 'run-dryrun-escalation',
+              event_type: 'node_failed',
+              step_name: 'verify',
+              data: { error: 'validator rejected' },
+              created_at: '2026-07-18T08:00:00.000Z',
+            },
+          ],
+          findPullRequest: async () => ({
+            exists: false,
+            state: 'missing',
+            checks: { total: 0, passed: 0, failed: 0, pending: 0 },
+            mergeable: null,
+          }),
+          mergePullRequest,
+          insertOverseerAction: async action => {
+            actions.push({ action: action.action, result: action.result });
+          },
+        },
+      });
+
+      expect(mergePullRequest).not.toHaveBeenCalled();
+      expect(actions).toHaveLength(1);
+      expect(actions[0]?.action).toBe('fake_escalation_attempt');
+      const cards = await listOperatorCards();
+      expect(cards.items).toHaveLength(1);
+      expect(cards.items[0]?.card.run_id).toBe('run-dryrun-escalation');
+    });
+  });
+
+  test('merge_ready stays fully gated by dryRun (no regression)', async () => {
+    await withTempDatabase(async () => {
+      const insertOverseerAction = mock(async () => undefined);
+      const mergePullRequest = mock(async () => ({ merged: true }));
+
+      await runOverseerService({
+        once: true,
+        enabled: true,
+        dryRun: true,
+        adapterKind: 'fake',
+        deps: {
+          listRunsForWatch: async () => [
+            {
+              id: 'run-dry-merge',
+              woId: 'WO-DRY-MERGE-01',
+              owner: 'bluedevilcollectibles',
+              repo: 'bdc-harness',
+              status: 'failed',
+              headBranch: 'wo/dry-merge',
+            },
+          ],
+          listRunEvents: async () => [],
+          findPullRequest: async () => ({
+            exists: true,
+            state: 'open',
+            checks: { total: 1, passed: 1, failed: 0, pending: 0 },
+            mergeable: true,
+            pr: { owner: 'bluedevilcollectibles', repo: 'bdc-harness', number: 4 },
+          }),
+          mergePullRequest,
+          insertOverseerAction,
+        },
+      });
+
+      expect(mergePullRequest).not.toHaveBeenCalled();
+      expect(insertOverseerAction).not.toHaveBeenCalled();
+    });
+  });
+
   test('concurrent default fake adapters persist exactly one accepted attempt', async () => {
     await withTempDatabase(async () => {
       enableFakeCapability('merge');
