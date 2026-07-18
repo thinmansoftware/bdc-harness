@@ -118,6 +118,15 @@ describe('classifyError -- provider classes (ported from router.py)', () => {
     ).toBe('out_of_credits');
   });
 
+  test('out_of_credits: OpenRouter 402 real live failure (2026-07-18, run db45cdbf, previously unknown)', () => {
+    expect(
+      classifyError({
+        message:
+          'Loop iteration 1 failed: Grok/OpenRouter request failed: 402 This request requires more credits, or fewer max_tokens. You requested up to 65536 tokens, but can only afford 60709. To increase, visit https://openrouter.ai/settings/credits and add more credits',
+      })
+    ).toBe('out_of_credits');
+  });
+
   test('service_unavailable: 5xx status', () => {
     expect(classifyError({ statusCode: 503, message: 'Service unavailable' })).toBe(
       'service_unavailable'
