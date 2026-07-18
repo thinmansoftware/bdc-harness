@@ -1494,6 +1494,112 @@ branch refs/heads/feature/auth
         return args.includes('reset');
       });
       expect(resetCalls).toHaveLength(0);
+
+      // Test 4 (isolated-worktree-untouched): checkout and clean must NOT run in
+      // fetch-only mode -- the shared-clone pin-and-clean must never touch an
+      // isolated per-run worktree with legitimate uncommitted work.
+      const checkoutCalls = execSpy.mock.calls.filter((call: unknown[]) => {
+        const args = call[1] as string[];
+        return args.includes('checkout');
+      });
+      expect(checkoutCalls).toHaveLength(0);
+
+      const cleanCalls = execSpy.mock.calls.filter((call: unknown[]) => {
+        const args = call[1] as string[];
+        return args.includes('clean');
+      });
+      expect(cleanCalls).toHaveLength(0);
+    });
+
+    test('Test 1 (clean-clone-passes): runs fetch, checkout, reset, clean in order', async () => {
+      execSpy.mockResolvedValue({ stdout: 'abc12345', stderr: '' });
+
+      await expect(git.syncWorkspace('/workspace/repo', 'main')).resolves.toMatchObject({
+        branch: 'main',
+        synced: true,
+      });
+
+      // Extract the ordered sequence of git subcommands (arg index 3 in the -C form:
+      // ['-C', path, <subcommand>, ...]).
+      const subcommands = execSpy.mock.calls.map((call: unknown[]) => (call[1] as string[])[2]);
+      const fetchIdx = subcommands.indexOf('fetch');
+      const checkoutIdx = subcommands.indexOf('checkout');
+      const resetIdx = subcommands.indexOf('reset');
+      const cleanIdx = subcommands.indexOf('clean');
+
+      expect(fetchIdx).toBeGreaterThanOrEqual(0);
+      expect(checkoutIdx).toBeGreaterThan(fetchIdx);
+      expect(resetIdx).toBeGreaterThan(checkoutIdx);
+      expect(cleanIdx).toBeGreaterThan(resetIdx);
+    });
+
+    test('Test 3 (wrong-branch-clone-repins): checks out base branch before reset', async () => {
+      execSpy.mockResolvedValue({ stdout: '', stderr: '' });
+
+      await git.syncWorkspace('/workspace/repo', 'main');
+
+      const checkoutCalls = execSpy.mock.calls.filter((call: unknown[]) => {
+        const args = call[1] as string[];
+        return args.includes('checkout');
+      });
+      expect(checkoutCalls).toHaveLength(1);
+      expect(checkoutCalls[0][1]).toEqual([
+        '-C',
+        '/workspace/repo',
+        'checkout',
+        '-f',
+        '-B',
+        'main',
+        'origin/main',
+      ]);
+
+      // Checkout must run before reset so the reset rewrites the base branch tip,
+      // not whatever feature branch HEAD started on.
+      const subcommands = execSpy.mock.calls.map((call: unknown[]) => (call[1] as string[])[2]);
+      expect(subcommands.indexOf('checkout')).toBeLessThan(subcommands.indexOf('reset'));
+    });
+
+    test('Test 2 (dirty-untracked-clone-heals): runs git clean -fd after reset', async () => {
+      execSpy.mockResolvedValue({ stdout: '', stderr: '' });
+
+      await git.syncWorkspace('/workspace/repo', 'main');
+
+      const cleanCalls = execSpy.mock.calls.filter((call: unknown[]) => {
+        const args = call[1] as string[];
+        return args.includes('clean');
+      });
+      expect(cleanCalls).toHaveLength(1);
+      expect(cleanCalls[0][1]).toEqual(['-C', '/workspace/repo', 'clean', '-fd']);
+
+      // Clean must run after reset (reset --hard does not remove untracked files).
+      const subcommands = execSpy.mock.calls.map((call: unknown[]) => (call[1] as string[])[2]);
+      expect(subcommands.indexOf('clean')).toBeGreaterThan(subcommands.indexOf('reset'));
+    });
+
+    test('throws if checkout fails after successful fetch', async () => {
+      execSpy.mockImplementation(async (_cmd: string, args: string[]) => {
+        if (args.includes('checkout')) {
+          throw new Error('fatal: unable to update HEAD');
+        }
+        return { stdout: '', stderr: '' };
+      });
+
+      await expect(git.syncWorkspace('/workspace/repo', 'main')).rejects.toThrow(
+        'Checkout to origin/main failed'
+      );
+    });
+
+    test('throws if clean fails after successful reset', async () => {
+      execSpy.mockImplementation(async (_cmd: string, args: string[]) => {
+        if (args.includes('clean')) {
+          throw new Error('fatal: could not remove untracked file');
+        }
+        return { stdout: '', stderr: '' };
+      });
+
+      await expect(git.syncWorkspace('/workspace/repo', 'main')).rejects.toThrow(
+        'Clean untracked files in main workspace failed'
+      );
     });
   });
 
