@@ -488,6 +488,77 @@ describe('service', () => {
     });
   });
 
+  test('canary: real validator_sdk_contradiction failure delivers a determined-outcome operator card under dryRun', async () => {
+    // The determined-outcome canary requested 2026-07-18: a synthetic run
+    // carrying the EXACT real error text this session's fix targeted
+    // (war-council-validator SDK success-contradiction), proving the full
+    // classify -> decide -> escalate -> deliver chain end to end with a known,
+    // predictable result, without needing to wait for or manufacture a real
+    // Cauldron failure. Confirms both fixes together: classification lands on
+    // 'validator_sdk_contradiction' (not 'unknown'), and escalation delivers a
+    // real operator card even though dryRun is true.
+    await withTempDatabase(async () => {
+      enableFakeCapability('escalation');
+      const boundPermit = await seedPersistentPermit(
+        'canary-determined-outcome',
+        'STAGING_MUTATION',
+        'escalation'
+      );
+      const actions: Array<{ action: string; result: string }> = [];
+
+      await runOverseerService({
+        once: true,
+        enabled: true,
+        dryRun: true,
+        adapterKind: 'fake',
+        deps: {
+          listRunsForWatch: async () => [
+            {
+              id: 'run-canary-determined-outcome',
+              woId: 'WO-CANARY-DETERMINED-01',
+              owner: 'bluedevilcollectibles',
+              repo: 'bdc-harness',
+              status: 'failed',
+              metadata: { overseer_m31_permit: boundPermit },
+            },
+          ],
+          listRunEvents: async () => [
+            {
+              id: 'event-canary',
+              workflow_run_id: 'run-canary-determined-outcome',
+              event_type: 'node_failed',
+              step_name: 'war-council-validator',
+              data: { error: "Node 'war-council-validator' failed: SDK returned success" },
+              created_at: '2026-07-18T13:49:55.233Z',
+            },
+          ],
+          findPullRequest: async () => ({
+            exists: false,
+            state: 'missing',
+            checks: { total: 0, passed: 0, failed: 0, pending: 0 },
+            mergeable: null,
+          }),
+          mergePullRequest: async () => {
+            throw new Error('canary: merge must never be called on an escalation-only path');
+          },
+          insertOverseerAction: async action => {
+            actions.push({ action: action.action, result: action.result });
+          },
+        },
+      });
+
+      expect(actions).toHaveLength(1);
+      expect(actions[0]?.action).toBe('fake_escalation_attempt');
+      const cards = await listOperatorCards();
+      expect(cards.items).toHaveLength(1);
+      const card = cards.items[0]?.card;
+      expect(card?.run_id).toBe('run-canary-determined-outcome');
+      expect(card?.canonical_event_identity?.error_class).toBe('validator_sdk_contradiction');
+      expect(card?.payload?.blocker).toContain('SDK returned a success/error contradiction');
+      expect(card?.payload?.next_permitted_action).toBe('await operator ruling');
+    });
+  });
+
   test('merge_ready stays fully gated by dryRun (no regression)', async () => {
     await withTempDatabase(async () => {
       const insertOverseerAction = mock(async () => undefined);
