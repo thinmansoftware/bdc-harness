@@ -1502,7 +1502,6 @@ nodes:
   # Marks the child WO's GitHub issue ready for review and posts the manifest once.
   - id: review-issue
     depends_on: [build-manifest, binding-gate]
-    task_class: clerical
     trigger_rule: all_done
     bash: |
       set -euo pipefail
