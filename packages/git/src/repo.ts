@@ -127,7 +127,10 @@ export async function syncWorkspace(
     return { branch: branchToSync, synced: true, previousHead: '', newHead: '', updated: false };
   }
 
-  // Capture HEAD before reset so we can report whether anything changed
+  // Capture HEAD BEFORE any mutation so `updated` reflects the true pre-sync
+  // state. Capturing after the checkout below would move HEAD to
+  // origin/<branchToSync> first, making previousHead === newHead and falsely
+  // reporting updated=false whenever the clone was behind or on the wrong branch.
   let previousHead = '';
   try {
     const { stdout } = await execFileAsync(
@@ -140,6 +143,23 @@ export async function syncWorkspace(
     // Non-fatal -- fresh clone or detached HEAD edge case
   }
 
+  // Pin the managed clone onto the base branch. reset --hard alone only rewrites
+  // the currently checked-out branch tip; if an overseer op left HEAD on a feature
+  // branch, reset would leave HEAD on the wrong branch with the base branch's
+  // *content* rather than the base branch itself. -B force-creates-or-resets the
+  // local branch to origin/<branchToSync>; -f discards local modifications while
+  // switching.
+  try {
+    await execFileAsync(
+      'git',
+      ['-C', workspacePath, 'checkout', '-f', '-B', branchToSync, `origin/${branchToSync}`],
+      { timeout: 30000 }
+    );
+  } catch (error) {
+    const err = error as Error;
+    throw new Error(`Checkout to origin/${branchToSync} failed: ${err.message}`);
+  }
+
   // Hard-reset local working tree to match origin -- only safe for Archon-managed
   // clones, never for a user's local working directory.
   try {
@@ -149,6 +169,17 @@ export async function syncWorkspace(
   } catch (error) {
     const err = error as Error;
     throw new Error(`Reset to origin/${branchToSync} failed: ${err.message}`);
+  }
+
+  // Remove untracked files/dirs left behind by an overseer op. reset --hard does
+  // NOT delete untracked files, so a stray file would still leave the tree dirty
+  // and fail capture-run-scope. Deliberately no -x: gitignored build artifacts
+  // (node_modules, dist) are preserved to avoid costly rebuilds.
+  try {
+    await execFileAsync('git', ['-C', workspacePath, 'clean', '-fd'], { timeout: 30000 });
+  } catch (error) {
+    const err = error as Error;
+    throw new Error(`Clean untracked files in ${branchToSync} workspace failed: ${err.message}`);
   }
 
   let newHead = '';
