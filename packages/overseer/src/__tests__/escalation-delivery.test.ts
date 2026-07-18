@@ -523,6 +523,21 @@ describe('Notion WO lookup', () => {
     expect(queried).toEqual(['Task', 'WO ID', 'Name']);
   });
 
+  test('resolves on the "Task" title property as the first candidate', async () => {
+    const queried: string[] = [];
+    globalThis.fetch = mock(async (_url, init) => {
+      const body = JSON.parse(String(init?.body)) as { filter: { property: string } };
+      queried.push(body.filter.property);
+      if (body.filter.property === 'Task') {
+        return Response.json({ results: [{ id: 'task-page' }] });
+      }
+      return new Response('unknown property', { status: 400 });
+    }) as typeof fetch;
+
+    expect(await lookupNotionPageId('test-key', 'db-1', 'WO-1')).toBe('task-page');
+    expect(queried).toEqual(['Task']);
+  });
+
   test('fails soft after all candidate queries fail', async () => {
     const queried: string[] = [];
     globalThis.fetch = mock(async (_url, init) => {

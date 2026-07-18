@@ -26,6 +26,7 @@
  * mechanism that ensures no Cauldron failure ever exits silently again.
  */
 
+import { createLogger } from '@archon/paths';
 import { appendOperatorCard, type OperatorCardRecord } from '@archon/core/db/overseer-briefing';
 import {
   buildOperatorCard,
@@ -35,6 +36,8 @@ import {
 } from './operator-card';
 import type { DecisionResult } from './decide.ts';
 import type { ErrorClass } from './classify.ts';
+
+const log = createLogger('overseer/escalate');
 
 /**
  * Structured payload accepted by runEscalation. Mirrors the loose shape of
@@ -223,15 +226,23 @@ export async function lookupNotionPage(
       sawSuccessfulQuery = true;
       const data = (await res.json()) as { results?: { id?: string }[] };
       const first = data.results?.[0];
-      if (first?.id) return { page_id: first.id, failure_outcome: null };
+      if (first?.id) {
+        log.info({ property, databaseId, woId }, 'overseer.notion_lookup_matched');
+        return { page_id: first.id, failure_outcome: null };
+      }
     } catch {
       sawRetrySafeFailure = true;
     }
   }
+  const failureOutcome =
+    sawSuccessfulQuery || sawRetrySafeFailure ? 'transient_failure' : 'permanent_failure';
+  log.info(
+    { candidateProps, databaseId, woId, failureOutcome },
+    'overseer.notion_lookup_exhausted'
+  );
   return {
     page_id: null,
-    failure_outcome:
-      sawSuccessfulQuery || sawRetrySafeFailure ? 'transient_failure' : 'permanent_failure',
+    failure_outcome: failureOutcome,
   };
 }
 
