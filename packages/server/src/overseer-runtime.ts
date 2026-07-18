@@ -44,6 +44,11 @@ function readEmergencyStop(): boolean {
   return v !== '0' && v !== 'false' && v !== 'no';
 }
 
+function resolveMergeJudge(): 'off' | 'grok' {
+  const v = process.env.OVERSEER_MERGE_JUDGE;
+  return v === 'grok' ? 'grok' : 'off';
+}
+
 function resolveAdapterKind(): OverseerAdapterKind {
   if (
     process.env.OVERSEER_USE_FAKE_GITHUB_ADAPTER === '1' ||
@@ -97,6 +102,7 @@ export function startOverseerRuntime(deps: OverseerRuntimeDeps = {}): void {
     signal: controller.signal,
     adapterKind,
     deliveryEnabled: true,
+    mergeJudge: resolveMergeJudge(),
   }).then(
     () => {
       log.info('overseer_runtime.watcher_stopped');

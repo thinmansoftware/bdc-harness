@@ -17,6 +17,7 @@ import {
   type FakeGitHubAdapter,
   type FakeGitHubMutationRequest,
 } from './adapters/fake-github';
+import { judgeWithGrok } from './judge-second-opinion';
 import { readOverseerActionPolicyFromEnv } from './action-policy';
 import { permitFromMetadata } from './permit';
 import { watchLoop } from './watch';
@@ -124,7 +125,8 @@ async function handleRecord(
   deps: OverseerActionsDeps & GitHubClientDeps,
   adapter: FakeGitHubAdapter,
   dryRun: boolean,
-  actor: string
+  actor: string,
+  mergeJudge: 'off' | 'grok' = 'off'
 ): Promise<void> {
   if (record.action === 'success' || record.action === 'ignore') {
     log.info(
@@ -162,6 +164,42 @@ async function handleRecord(
   }
 
   if (record.action === 'merge_ready') {
+    // Second-opinion gate (charter Section 8: APPROVE only advances toward
+    // merge-ready candidate, never a substitute for a real evidence pack; on
+    // judge timeout/error/ambiguous output default to HOLD -- silence is never
+    // approval). This runs BEFORE the permit/mutation attempt: a HOLD verdict
+    // must block the mutation path entirely, not just get logged alongside it.
+    if (mergeJudge === 'grok' && record.prEvidence?.pr) {
+      const verdict = await judgeWithGrok({
+        woId: record.woId,
+        prNumber: record.prEvidence.pr.number,
+        prTitle: record.prEvidence.prTitle ?? '',
+        checksSummary: record.prEvidence.checks,
+        filesChangedCount: record.prEvidence.filesChangedCount ?? 0,
+        diffStat: record.prEvidence.diffStat ?? '',
+      });
+      if (verdict === 'hold') {
+        await deps.insertOverseerAction({
+          runId: record.runId,
+          woId: record.woId,
+          class: record.errorClass ?? 'tail_node_false_fail',
+          action: 'merge_denied',
+          result: 'grok_judge_hold',
+        });
+        log.info(
+          {
+            runId: record.runId,
+            woId: record.woId,
+            action: 'merge_denied',
+            class: record.errorClass ?? 'none',
+            reason: 'grok_judge_hold',
+          },
+          'overseer.merge_ready_handled'
+        );
+        return;
+      }
+    }
+
     const permit = permitFromMetadata(record.metadata);
     const result = permit
       ? await adapter.attemptMutation(mutationRequestFromPermit(permit), {
@@ -285,7 +323,8 @@ export async function runOverseerService(options: OverseerServiceOptions = {}): 
   if (options.signal?.aborted) coupledAbort.abort();
   const watcher = watchLoop(
     deps,
-    record => handleRecord(record, deps, adapter, dryRun, 'overseer-service'),
+    record =>
+      handleRecord(record, deps, adapter, dryRun, 'overseer-service', options.mergeJudge ?? 'off'),
     {
       intervalMs: options.intervalMs,
       once: options.once,
