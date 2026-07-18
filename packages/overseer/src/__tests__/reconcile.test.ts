@@ -35,11 +35,13 @@ function trackerIssue(state: 'open' | 'closed' = 'open'): ReconcileTrackerIssue 
   };
 }
 
-function fakeDeps(input: {
-  prs?: ReconcileMergedPullRequest[];
-  tracker?: ReconcileTrackerIssue | null;
-  searchError?: unknown;
-} = {}): ReconcileDeps & {
+function fakeDeps(
+  input: {
+    prs?: ReconcileMergedPullRequest[];
+    tracker?: ReconcileTrackerIssue | null;
+    searchError?: unknown;
+  } = {}
+): ReconcileDeps & {
   comments: string[];
   labels: string[];
   closes: number[];
@@ -95,7 +97,9 @@ describe('reconcile', () => {
 
     expect(result).toEqual({ scanned: 1, closed: 1, skipped: false });
     expect(deps.comments).toHaveLength(1);
-    expect(deps.comments[0]).toContain('https://github.com/bluedevilcollectibles/bdc-harness/pull/404');
+    expect(deps.comments[0]).toContain(
+      'https://github.com/bluedevilcollectibles/bdc-harness/pull/404'
+    );
     expect(deps.comments[0]).toContain('abc123merge');
     expect(deps.comments[0]).toContain('bluedevilcollectibles/bdc-harness');
     expect(deps.labels).toEqual(['wo:done']);
