@@ -140,7 +140,13 @@ async function handleRecord(
     return;
   }
 
-  if (dryRun) {
+  // Dry-run gates MUTATION only (merge_ready is the sole mutating path today).
+  // Escalation is notification/audit, never a repo or production mutation --
+  // it must run regardless of dry-run, or the operator is never told Overseer
+  // is stuck. Root-caused 2026-07-18: prior code gated escalation here too,
+  // which is why zero escalation.json receipts were ever written in production
+  // despite Overseer correctly classifying and deciding to escalate every time.
+  if (dryRun && record.action === 'merge_ready') {
     log.info(
       {
         runId: record.runId,
