@@ -60,9 +60,23 @@ fi
 PASS=$((PASS + 1))
 echo "PASS: markers present in zero-open assert body"
 
-# Build a minimal runnable script from the body: stub implement.output via IMPL env
-# The live body starts with IMPL=$implement.output -- replace with fixture.
-RUNNABLE=$(printf '%s\n' "$BODY" | sed 's/^IMPL=\$implement\.output$/IMPL="${IMPL_FIXTURE:-}"/')
+# Build a minimal runnable script from the body: stub implement.output via IMPL env.
+RUNNABLE=$(printf '%s\n' "$BODY" | awk '
+  index($0, "IMPL=$(cat <<") == 1 && index($0, "BDC_FEATURE_DEV_IMPL_IMPLEMENT_20260719_") > 0 {
+    print "IMPL=\"${IMPL_FIXTURE:-}\""
+    skip = 1
+    next
+  }
+  skip {
+    if ($0 == ")") skip = 0
+    next
+  }
+  { print }
+')
+if printf '%s\n' "$RUNNABLE" | grep -Fxq '$implement.output'; then
+  echo "FATAL: could not replace implement output heredoc with fixture"
+  exit 1
+fi
 
 run_assert() {
   local wt="$1" impl="$2" base="$3"
