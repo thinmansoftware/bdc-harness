@@ -344,7 +344,9 @@ describe('service', () => {
     });
 
     expect(mergePullRequest).not.toHaveBeenCalled();
-    expect(actions).toEqual([{ action: 'merge_denied', result: 'permit_missing' }]);
+    expect(actions).toEqual([
+      { action: 'merge_denied', result: 'qualified_merge_coordinator_missing' },
+    ]);
   });
 
   test('default live escalation path records one inert attempt and one durable card', async () => {
@@ -598,7 +600,46 @@ describe('service', () => {
     });
   });
 
-  test('concurrent default fake adapters persist exactly one accepted attempt', async () => {
+  test('non-dry-run merge_ready is reachable only through the qualified coordinator', async () => {
+    const mergeCoordinator = mock(async () => undefined);
+    const actions: Array<{ action: string; result: string }> = [];
+    await runOverseerService({
+      once: true,
+      enabled: true,
+      dryRun: false,
+      adapterKind: 'fake',
+      mergeCoordinator,
+      deps: {
+        listRunsForWatch: async () => [
+          {
+            id: 'run-coordinated',
+            woId: 'WO-COORDINATED-01',
+            owner: 'bluedevilcollectibles',
+            repo: 'bdc-harness',
+            status: 'failed',
+          },
+        ],
+        listRunEvents: async () => [],
+        findPullRequest: async () => ({
+          exists: true,
+          state: 'open',
+          checks: { total: 1, passed: 1, failed: 0, pending: 0 },
+          mergeable: true,
+          pr: { owner: 'bluedevilcollectibles', repo: 'bdc-harness', number: 42 },
+        }),
+        mergePullRequest: async () => {
+          throw new Error('legacy merge boundary must be unreachable');
+        },
+        insertOverseerAction: async action => {
+          actions.push({ action: action.action, result: action.result });
+        },
+      },
+    });
+    expect(mergeCoordinator).toHaveBeenCalledTimes(1);
+    expect(actions).toEqual([]);
+  });
+
+  test('legacy fake merge adapter is unreachable even with concurrent valid v1 permits', async () => {
     await withTempDatabase(async () => {
       enableFakeCapability('merge');
       const boundPermit = await seedPersistentPermit('service-concurrent', 'MERGE', 'merge');
@@ -652,16 +693,12 @@ describe('service', () => {
         event => event.event_type === 'adapter_attempt'
       );
       expect(mergePullRequest).not.toHaveBeenCalled();
-      expect(actions.filter(action => action.action === 'fake_merge_attempt')).toHaveLength(1);
+      expect(actions.filter(action => action.action === 'fake_merge_attempt')).toHaveLength(0);
       expect(actions.filter(action => action.action === 'merge_denied')).toEqual([
-        { action: 'merge_denied', result: 'attempt_audit_failed' },
+        { action: 'merge_denied', result: 'qualified_merge_coordinator_missing' },
+        { action: 'merge_denied', result: 'qualified_merge_coordinator_missing' },
       ]);
-      expect(attempts).toHaveLength(1);
-      expect(attempts[0]?.details).toMatchObject({
-        adapter: 'fake-github',
-        accepted: true,
-        mutation_sent: false,
-      });
+      expect(attempts).toHaveLength(0);
     });
   });
 
@@ -684,7 +721,7 @@ describe('service', () => {
           insertOverseerAction: async () => undefined,
         },
       })
-    ).rejects.toThrow('overseer_slice1_real_adapter_forbidden:real');
+    ).rejects.toThrow('overseer_real_adapter_requires_qualified_coordinator');
     expect(listRunsForWatch).not.toHaveBeenCalled();
   });
 

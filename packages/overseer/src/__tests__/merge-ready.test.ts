@@ -104,6 +104,11 @@ function validEvidence(overrides: Partial<QualifiedMergeEvidence> = {}): Qualifi
       reviewer_model_family: 'gpt',
       builder_model_family: 'claude',
     },
+    operator: {
+      identity: 'grok-overseer',
+      provider: 'xai',
+      model_family: 'grok',
+    },
     manifest: { valid: true },
     proposal_id: 'proposal-1',
     proposal_present: true,
@@ -651,6 +656,22 @@ describe('executeQualifiedMerge -- Section 11', () => {
     );
     expect(result.action).toBe('denied');
     expect(h.calls).not.toContain('mergeAdapter');
+  });
+
+  test('operator recuses when identity, provider, or model family matches the builder', async () => {
+    const cases = [
+      { identity: 'builder-model', provider: 'xai', model_family: 'grok' },
+      { identity: 'grok-overseer', provider: 'anthropic', model_family: 'grok' },
+      { identity: 'grok-overseer', provider: 'xai', model_family: 'claude' },
+    ];
+    for (const operator of cases) {
+      const h = harness();
+      const result = await executeQualifiedMerge(validEvidence({ operator }), h.deps);
+      expect(result.action).toBe('denied');
+      expect(result.reason).toBe('operator_builder_correlated');
+      expect(h.deps.preparePermit).not.toHaveBeenCalled();
+      expect(h.calls).not.toContain('mergeAdapter');
+    }
   });
 
   test('a rejected adapter records effect_failed and never reports merged', async () => {

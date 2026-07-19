@@ -53,6 +53,8 @@ export type {
 export { watchLoop, watchOnce, DEFAULT_WATCH_INTERVAL_MS } from './watch';
 export { judgePullRequest, isPrGreen, isPrMergeReady } from './judge-pr';
 export { judgeWithGrok } from './judge-second-opinion';
+export { assembleQualifiedMergeEvidence, coordinateMergeReady } from './merge-coordinator';
+export { createGitHubQualifiedMergeAdapter } from './adapters/github-qualified-merge';
 export { runOverseerService } from './service';
 
 // M-31 merge-steward substrate (M-42 Slice 2): read-only permit preparation.
@@ -94,6 +96,8 @@ export type {
 export type {
   GrokJudgeDeps,
   GrokJudgeEvidence,
+  GrokDispositionReceipt,
+  MergeOperatorIdentity,
   GitHubClientDeps,
   OverseerActionsDeps,
   OverseerRunRecord,
