@@ -1,6 +1,6 @@
 import { createLogger } from '@archon/paths';
 import { runOverseerService } from '@archon/overseer/service';
-import type { OverseerWiredAdapterKind } from '@archon/overseer/service';
+import type { OverseerServiceOptions, OverseerWiredAdapterKind } from '@archon/overseer/service';
 
 const log = createLogger('server/overseer-runtime');
 
@@ -27,6 +27,7 @@ interface OverseerRuntimeStatusDeps {
 
 interface OverseerRuntimeDeps {
   readonly runService?: typeof runOverseerService;
+  readonly serviceOptions?: Pick<OverseerServiceOptions, 'deps' | 'mergeCoordinator'>;
 }
 
 let watcherTask: Promise<void> | null = null;
@@ -80,9 +81,17 @@ export function startOverseerRuntime(deps: OverseerRuntimeDeps = {}): void {
     return;
   }
 
-  if (adapterKind !== 'fake') {
+  if (
+    adapterKind === 'real' &&
+    (!deps.serviceOptions?.deps || !deps.serviceOptions.mergeCoordinator)
+  ) {
     watcherState = 'degraded';
-    log.error({ adapterKind }, 'overseer_runtime.real_adapter_forbidden_in_slice1');
+    log.error({ adapterKind }, 'overseer_runtime.real_adapter_missing_qualified_coordinator');
+    return;
+  }
+  if (adapterKind === 'none') {
+    watcherState = 'degraded';
+    log.error({ adapterKind }, 'overseer_runtime.adapter_missing');
     return;
   }
 
@@ -94,6 +103,7 @@ export function startOverseerRuntime(deps: OverseerRuntimeDeps = {}): void {
 
   const runService = deps.runService ?? runOverseerService;
   watcherTask = runService({
+    ...deps.serviceOptions,
     signal: controller.signal,
     adapterKind,
     deliveryEnabled: true,

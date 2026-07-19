@@ -261,6 +261,28 @@ describe('overseer-runtime', () => {
     expect(status.watcher).toBe('degraded');
   });
 
+  test('real adapter starts only when a qualified coordinator composition is injected', async () => {
+    process.env.OVERSEER_ENABLED = 'true';
+    process.env.OVERSEER_USE_FAKE_GITHUB_ADAPTER = 'false';
+    process.env.GITHUB_TOKEN = 'poison-token';
+    const mergeCoordinator = mock(async () => undefined);
+    const deps = {
+      listRunsForWatch: async () => [],
+      listRunEvents: async () => [],
+      findPullRequest: async () => ({ exists: false as const }),
+      mergePullRequest: async () => ({ merged: false }),
+      insertOverseerAction: async () => undefined,
+    };
+
+    startOverseerRuntime({
+      runService: runOverseerServiceMock,
+      serviceOptions: { deps, mergeCoordinator },
+    });
+    expect(runOverseerServiceMock).toHaveBeenCalledTimes(1);
+    expect(capturedServiceOptions?.adapterKind).toBe('real');
+    await stopOverseerRuntime();
+  });
+
   test('fake adapterKind is forwarded to runOverseerService -- no live Octokit wired', async () => {
     let resolveService!: () => void;
     runOverseerServiceMock.mockImplementation(

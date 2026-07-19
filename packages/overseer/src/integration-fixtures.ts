@@ -1082,6 +1082,11 @@ export function mergeEvidence(
       reviewer_model_family: 'gpt',
       builder_model_family: 'claude',
     },
+    operator: {
+      identity: 'grok-overseer',
+      provider: 'xai',
+      model_family: 'grok',
+    },
     manifest: { valid: true },
     proposal_id: 'm31v2-proposal-merge-1',
     proposal_present: true,

@@ -4,7 +4,6 @@ import {
   listRunEventsForOverseer,
   listRunsForOverseerWatch,
 } from '@archon/core/db/overseer';
-import { appendOverseerCapabilityEvent } from '@archon/core/db/overseer-capabilities';
 import { runAuthorizedEscalation } from './authorized-escalation';
 import { runEscalation } from './escalate';
 import {
@@ -12,12 +11,6 @@ import {
   runDueOperatorCardDeliveries,
   type OperatorCardChannel,
 } from './escalation-delivery';
-import {
-  createFakeGitHubAdapter,
-  type FakeGitHubAdapter,
-  type FakeGitHubMutationRequest,
-} from './adapters/fake-github';
-import { readOverseerActionPolicyFromEnv } from './action-policy';
 import { permitFromMetadata } from './permit';
 import { watchLoop } from './watch';
 import type {
@@ -54,12 +47,13 @@ const log = createLogger('overseer/service');
  * adapter that was actually wired when the service started.
  */
 export type OverseerWiredAdapterKind = 'fake' | 'real' | 'none';
+export type MergeReadyCoordinator = (record: WatchedRunRecord) => Promise<unknown>;
 
 export interface OverseerServiceOptions {
   once?: boolean;
   enabled?: boolean;
   dryRun?: boolean;
-  mergeJudge?: 'off' | 'grok';
+  mergeCoordinator?: MergeReadyCoordinator;
   intervalMs?: number;
   signal?: AbortSignal;
   /**
@@ -122,9 +116,9 @@ function envEnabled(value: string | undefined): boolean {
 async function handleRecord(
   record: WatchedRunRecord,
   deps: OverseerActionsDeps & GitHubClientDeps,
-  adapter: FakeGitHubAdapter,
   dryRun: boolean,
-  actor: string
+  actor: string,
+  mergeCoordinator?: MergeReadyCoordinator
 ): Promise<void> {
   if (record.action === 'success' || record.action === 'ignore') {
     log.info(
@@ -162,34 +156,21 @@ async function handleRecord(
   }
 
   if (record.action === 'merge_ready') {
-    const permit = permitFromMetadata(record.metadata);
-    const result = permit
-      ? await adapter.attemptMutation(mutationRequestFromPermit(permit), {
-          requested_capability: 'merge',
-          permit,
-          actor,
-          correlation_id: record.runId,
-        })
-      : null;
-    const action = result?.accepted ? 'fake_merge_attempt' : 'merge_denied';
-    const reason = result?.reason ?? 'permit_missing';
-    await deps.insertOverseerAction({
-      runId: record.runId,
-      woId: record.woId,
-      class: record.errorClass ?? 'tail_node_false_fail',
-      action,
-      result: reason,
-    });
-    log.info(
-      {
+    if (!mergeCoordinator) {
+      await deps.insertOverseerAction({
         runId: record.runId,
         woId: record.woId,
-        action,
-        class: record.errorClass ?? 'none',
-        reason,
-      },
-      'overseer.merge_ready_handled'
-    );
+        class: record.errorClass ?? 'tail_node_false_fail',
+        action: 'merge_denied',
+        result: 'qualified_merge_coordinator_missing',
+      });
+      log.info(
+        { runId: record.runId, woId: record.woId, action: 'merge_denied' },
+        'overseer.merge_ready_coordinator_missing'
+      );
+      return;
+    }
+    await mergeCoordinator(record);
     return;
   }
 
@@ -272,11 +253,13 @@ export async function runOverseerService(options: OverseerServiceOptions = {}): 
 
   const dryRun = options.dryRun ?? envEnabled(process.env.OVERSEER_DRY_RUN);
   const adapterKind = options.adapterKind ?? resolveRequestedAdapterKind();
-  if (adapterKind !== 'fake') {
-    throw new Error(`overseer_slice1_real_adapter_forbidden:${adapterKind}`);
+  if (adapterKind === 'none') {
+    throw new Error('overseer_adapter_missing');
+  }
+  if (adapterKind === 'real' && (!options.deps || !options.mergeCoordinator)) {
+    throw new Error('overseer_real_adapter_requires_qualified_coordinator');
   }
   const deps = options.deps ?? resolveDefaultDeps();
-  const adapter = createDefaultFakeGitHubAdapter();
   const coupledAbort = new AbortController();
   const abortFromParent = (): void => {
     coupledAbort.abort();
@@ -285,7 +268,7 @@ export async function runOverseerService(options: OverseerServiceOptions = {}): 
   if (options.signal?.aborted) coupledAbort.abort();
   const watcher = watchLoop(
     deps,
-    record => handleRecord(record, deps, adapter, dryRun, 'overseer-service'),
+    record => handleRecord(record, deps, dryRun, 'overseer-service', options.mergeCoordinator),
     {
       intervalMs: options.intervalMs,
       once: options.once,
@@ -367,42 +350,6 @@ function resolveDefaultDeps(): OverseerRunStoreDeps & OverseerActionsDeps & GitH
 
 function resolveRequestedAdapterKind(): OverseerWiredAdapterKind {
   return envEnabled(process.env.OVERSEER_USE_FAKE_GITHUB_ADAPTER) ? 'fake' : 'none';
-}
-
-function fixtureRepositories(): string[] {
-  return (process.env.OVERSEER_FAKE_GITHUB_REPOSITORIES ?? '')
-    .split(',')
-    .map(value => value.trim())
-    .filter(Boolean);
-}
-
-function createDefaultFakeGitHubAdapter(): FakeGitHubAdapter {
-  return createFakeGitHubAdapter({
-    allowed_repositories: fixtureRepositories(),
-    authorization_deps: {
-      getPolicy: async () => readOverseerActionPolicyFromEnv(),
-    },
-    // The adapter_attempt insert is the persistent claim. Migration 034 owns a
-    // partial UNIQUE index on execution_id for adapter_attempt rows, so only one
-    // concurrent or post-restart attempt can be accepted and audited.
-    consume_execution: async () => true,
-    record_attempt: appendOverseerCapabilityEvent,
-  });
-}
-
-function mutationRequestFromPermit(permit: FakeGitHubMutationRequest): FakeGitHubMutationRequest {
-  return {
-    permit_id: permit.permit_id,
-    repository: permit.repository,
-    pr_number: permit.pr_number,
-    head_sha: permit.head_sha,
-    base_branch: permit.base_branch,
-    base_sha: permit.base_sha,
-    snapshot_id: permit.snapshot_id,
-    proposal_id: permit.proposal_id,
-    execution_id: permit.execution_id,
-    action_kind: permit.action_kind,
-  };
 }
 
 if (import.meta.main) {

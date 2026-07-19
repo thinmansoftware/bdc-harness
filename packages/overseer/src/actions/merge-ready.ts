@@ -166,6 +166,11 @@ export interface QualifiedMergeEvidence {
   readonly required_checks: readonly RequiredCheckEvidence[];
   readonly reviews: readonly { readonly resolved: boolean }[];
   readonly independent_review: IndependentReviewEvidence | null;
+  readonly operator: {
+    readonly identity: string;
+    readonly provider: string;
+    readonly model_family: string;
+  };
   readonly manifest: { readonly valid: boolean } | null;
   readonly proposal_id: string | null;
   readonly proposal_present: boolean;
@@ -278,6 +283,13 @@ export function assessQualifiedMerge(evidence: QualifiedMergeEvidence): Qualifie
     review.reviewer_model_family === review.builder_model_family
   ) {
     return deny('independent_review', 'independent_review_correlated');
+  }
+  if (
+    evidence.operator.identity === review.builder_identity ||
+    evidence.operator.provider === review.builder_provider ||
+    evidence.operator.model_family === review.builder_model_family
+  ) {
+    return deny('operator_recusal', 'operator_builder_correlated');
   }
 
   // 7. Valid manifest v2 and a current M-31 proposal.

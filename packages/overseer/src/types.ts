@@ -54,9 +54,37 @@ export interface GrokJudgeEvidence {
   woId: string;
   prNumber: number;
   prTitle: string;
+  headSha: string;
+  baseSha: string;
+  evidenceDigest: string;
+  operator: MergeOperatorIdentity;
   checksSummary: PullRequestCheckSummary;
   filesChangedCount: number;
   diffStat: string;
+}
+
+export interface MergeOperatorIdentity {
+  identity: string;
+  provider: string;
+  modelFamily: string;
+}
+
+export interface GrokDispositionReceipt {
+  schemaVersion: 'overseer-grok-merge-disposition-v1';
+  disposition: 'approve' | 'hold';
+  reason:
+    | 'judge_approve'
+    | 'judge_hold'
+    | 'judge_output_invalid'
+    | 'judge_timeout'
+    | 'judge_exit_nonzero'
+    | 'judge_error';
+  woId: string;
+  prNumber: number;
+  headSha: string;
+  baseSha: string;
+  evidenceDigest: string;
+  operator: MergeOperatorIdentity;
 }
 
 export interface WatchedRunRecord {
@@ -91,7 +119,7 @@ export interface OverseerActionsDeps {
 }
 
 export interface GrokJudgeDeps {
-  judgeSecondOpinion?(evidence: GrokJudgeEvidence): Promise<'approve' | 'hold'>;
+  judgeSecondOpinion?(evidence: GrokJudgeEvidence): Promise<GrokDispositionReceipt>;
 }
 
 export interface GitHubPullRequestSearchInput {
