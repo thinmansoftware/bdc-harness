@@ -79,7 +79,7 @@ STRUCT_ERR=$(DRAFT="$DRAFT" bun -e '
     return seen;
   };
   const requiredWhen = "$" + "business-risk-gate.output.gate == " + String.fromCharCode(39) + "proceed" + String.fromCharCode(39);
-  for (const id of ["decide-push-target", "commit-and-push", "open-pr-if-needed", "build-manifest", "flip-notion"]) {
+  for (const id of ["decide-push-target", "commit-and-push", "open-pr-if-needed", "build-manifest", "review-issue"]) {
     const node = byId.get(id);
     if (!node) { fails.push(id + " missing"); continue; }
     if (!ancestors(id).has("business-risk-gate")) fails.push(id + " is not downstream of business-risk-gate");
@@ -168,11 +168,11 @@ nodes:
     trigger_rule: all_done
     when: "$business-risk-gate.output.gate == 'proceed'"
     prompt: Build a truthful manifest.
-  - id: flip-notion
+  - id: review-issue
     depends_on: [build-manifest]
     when: "$business-risk-gate.output.gate == 'proceed'"
     prompt: |
-      Flip the WO to REVIEW.
+      Mark the WO GitHub issue ready for review.
 `;
 
 const BROKEN_UNGATED_SIDE_EFFECTS = HEALTHY_CHILD.replace(
@@ -287,13 +287,13 @@ describe('on-ramp atom structural placeholder gate', () => {
     expect(detail).toContain('parse');
   });
 
-  it('FAILS a child whose push, PR, and Notion nodes are not conditioned on risk PASS', () => {
+  it('FAILS a child whose push, PR, and GitHub review nodes are not conditioned on risk PASS', () => {
     const { failed, detail } = runGate(BROKEN_UNGATED_SIDE_EFFECTS, dir);
     expect(failed).toBe(true);
     expect(detail).toContain('commit-and-push');
     expect(detail).toContain('open-pr-if-needed');
     expect(detail).toContain('build-manifest');
-    expect(detail).toContain('flip-notion');
+    expect(detail).toContain('review-issue');
   });
 
   it('FAILS a child whose risk condition is inverted', () => {
@@ -310,6 +310,29 @@ describe('on-ramp atom structural placeholder gate', () => {
     expect(
       source.match(/must condition on \$" \+ "business-risk-gate\.output\.gate == proceed/g)?.length
     ).toBe(2);
+    expect(source).toContain(
+      'for (const id of ["decide-push-target", "commit-and-push", "open-pr-if-needed", "build-manifest", "review-issue"])'
+    );
+  });
+
+  it('uses GitHub issue review completion with an idempotent manifest sentinel', () => {
+    const path = join(REPO_ROOT, '.archon/workflows/defaults/bdc-harness-wo-onramp.yaml');
+    const result = parseWorkflow(readFileSync(path, 'utf8'), 'bdc-harness-wo-onramp.yaml');
+    const nodes = new Map(result.workflow?.nodes.map(node => [node.id, node]));
+    const reviewIssue = nodes.get('review-issue') as
+      | (Record<string, unknown> & { depends_on?: string[]; bash?: string; when?: string })
+      | undefined;
+
+    expect(result.error).toBeNull();
+    expect(reviewIssue).toBeDefined();
+    expect(reviewIssue?.depends_on).toEqual(['build-manifest', 'binding-gate']);
+    expect(reviewIssue?.when).toBe("$binding-gate.output.gate == 'proceed'");
+    expect(String(reviewIssue?.bash || '')).toContain('gh issue edit "$ISSUE_NUM"');
+    expect(String(reviewIssue?.bash || '')).toContain('--add-label status:review');
+    expect(String(reviewIssue?.bash || '')).toContain(
+      'SENTINEL="<!-- onramp-manifest ${WO_ID} -->"'
+    );
+    expect(String(reviewIssue?.bash || '')).toContain('grep -Fq "$SENTINEL"');
   });
 
   it('does NOT false-fire on a bare <one sentence> token inside a prompt body', () => {

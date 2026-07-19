@@ -10,7 +10,7 @@ description: |
                   --project <repo> override. WO spec must exist on bdc-xo/main.
   Does: preflight -> normalize-spec -> generate-yaml (loop) -> validate-yaml ->
         adversarial-review -> prefire-plan -> approval-gate -> register-yaml ->
-        fire-child -> verify-binding -> build-manifest -> flip-notion.
+        fire-child -> verify-binding -> build-manifest -> review-issue.
   NOT for: Doctrine-only WOs (use bdc-doctrine-update). Batch authoring
         (use bdc-author-wo-batch). WO authoring from scratch (use bdc-wo-author).
   parallel_ok: false
@@ -21,8 +21,8 @@ model: sonnet
 interactive: true
 
 inputs:
-  NOTION_DB_ID:
-    default: "a6df831c-0b52-449f-8ca4-d77be6b70d0a"
+  ISSUE_REPO:
+    default: "bluedevilcollectibles/bdc-xo"
 
 nodes:
 
@@ -294,8 +294,8 @@ nodes:
           fi
         fi
 
-        # Rule 7: flip-notion node present
-        grep -q 'id: flip-notion' "$DRAFT" || { echo "FAIL Rule 7: flip-notion node not found" >> "$FEEDBACK"; ERRORS=$((ERRORS+1)); }
+        # Rule 7: review-issue node present
+        grep -q 'id: review-issue' "$DRAFT" || { echo "FAIL Rule 7: review-issue GitHub completion node not found" >> "$FEEDBACK"; ERRORS=$((ERRORS+1)); }
 
         # business-risk-gate present
         grep -q 'id: business-risk-gate' "$DRAFT" || { echo "FAIL: business-risk-gate node not found (required)" >> "$FEEDBACK"; ERRORS=$((ERRORS+1)); }
@@ -379,7 +379,7 @@ nodes:
             return seen;
           };
           const requiredWhen = "$" + "business-risk-gate.output.gate == " + String.fromCharCode(39) + "proceed" + String.fromCharCode(39);
-          for (const id of ["decide-push-target", "commit-and-push", "open-pr-if-needed", "build-manifest", "flip-notion"]) {
+          for (const id of ["decide-push-target", "commit-and-push", "open-pr-if-needed", "build-manifest", "review-issue"]) {
             const node = byId.get(id);
             if (!node) { fails.push(id + " missing"); continue; }
             if (!ancestors(id).has("business-risk-gate")) fails.push(id + " is not downstream of business-risk-gate");
@@ -440,11 +440,11 @@ nodes:
         (loop, major-build, fresh_context: true, until: COMPLETE, max_iterations: 5)
         -> war-council-validator -> business-risk-gate -> decide-push-target ->
         commit-and-push (load_bearing) -> open-pr-if-needed (load_bearing) ->
-        build-manifest (trigger_rule: all_done) -> flip-notion.
+        build-manifest (trigger_rule: all_done) -> review-issue.
 
         The business-risk-gate success path MUST end by emitting exactly
         {"gate":"proceed"}. The decide-push-target, commit-and-push,
-        open-pr-if-needed, build-manifest, and flip-notion nodes MUST each be
+        open-pr-if-needed, build-manifest, and review-issue nodes MUST each be
         downstream of the gate and carry this condition verbatim:
           when: "<DOLLAR>business-risk-gate.output.gate == 'proceed'"
         Replace <DOLLAR> with one literal ASCII dollar sign in the child YAML.
@@ -474,11 +474,11 @@ nodes:
         - every loop: has prompt + until + max_iterations + fresh_context
         - paths repo-root-relative (no BDC_XO/ prefix)
         - no n8n webhook calls
-        - flip-notion final node; business-risk-gate present and load_bearing: true
+        - review-issue final node flips the GITHUB ISSUE with a completion comment and status:review label; business-risk-gate present and load_bearing: true
         - business-risk-gate includes BUSINESS_RISK_INVARIANT verbatim
         - business-risk-gate emits {"gate":"proceed"} only after all checks pass
         - decide-push-target, commit-and-push, open-pr-if-needed, build-manifest, and
-          flip-notion each condition on <DOLLAR>business-risk-gate.output.gate == 'proceed'
+          review-issue each condition on <DOLLAR>business-risk-gate.output.gate == 'proceed'
         - root name: is the real child slug (NOT "<slug>" / "<bdc-slug>")
         - inputs.WO_ID.default is the real WO_ID (NOT "<WO_ID>" / "<WO_ID from normalize-spec>")
         - no dev-error tokens: TODO, FIXME, TBD, REPLACE_ME, lorem ipsum
@@ -563,7 +563,7 @@ nodes:
 
       # Hard re-check: node-presence musts (key-name presence -- reliable substring check)
       grep -q 'id: business-risk-gate' "$YAML_FILENAME" || { echo "ERROR: business-risk-gate missing" >&2; exit 1; }
-      grep -q 'id: flip-notion' "$YAML_FILENAME" || { echo "ERROR: flip-notion missing" >&2; exit 1; }
+      grep -q 'id: review-issue' "$YAML_FILENAME" || { echo "ERROR: review-issue missing" >&2; exit 1; }
 
       # Structural placeholder + YAML-parse check -- SAME logic as the loop until_bash (Finding-A parity).
       # Parses the draft and validates FILLED STRUCTURAL POSITIONS (root scalars + inputs.WO_ID.default).
@@ -612,7 +612,7 @@ nodes:
           return seen;
         };
         const requiredWhen = "$" + "business-risk-gate.output.gate == " + String.fromCharCode(39) + "proceed" + String.fromCharCode(39);
-        for (const id of ["decide-push-target", "commit-and-push", "open-pr-if-needed", "build-manifest", "flip-notion"]) {
+        for (const id of ["decide-push-target", "commit-and-push", "open-pr-if-needed", "build-manifest", "review-issue"]) {
           const node = byId.get(id);
           if (!node) { fails.push(id + " missing"); continue; }
           if (!ancestors(id).has("business-risk-gate")) fails.push(id + " is not downstream of business-risk-gate");
@@ -666,7 +666,7 @@ nodes:
       3. Is the business-risk-gate placed where it actually guards the risk surface
          (before the push, not after)?
       4. Rule 20: if the target repo is customer-facing, is staging enforced correctly?
-      5. Does flip-notion target the CHILD product WO (not the on-ramp's own WO)?
+      5. Does review-issue target the CHILD product WO's GitHub issue (not the on-ramp's own WO)?
 
       ## Output
       === WAR-COUNCIL-REVIEW ===
@@ -708,9 +708,9 @@ nodes:
          match BUSINESS_RISK_INVARIANT from the spec exactly (or closely)? Is it load_bearing: true?
          Does it fail closed (set -euo pipefail; exit 1 path exists), emit {"gate":"proceed"}
          only after passing, and mechanically condition decide-push-target, commit-and-push,
-         open-pr-if-needed, build-manifest, and flip-notion on that proceed verdict?
+         open-pr-if-needed, build-manifest, and review-issue on that proceed verdict?
          Score <7 if invariant is generic/wrong, the node lacks fail-closed logic, or any
-         push/PR/Notion chain node can run without the proceed condition.
+         push/PR/GitHub-completion chain node can run without the proceed condition.
 
       3. **Rule 20 compliance** (1-10): If RULE20_STAGING_GATE=true, does the child YAML enforce
          staging branch as PR base? If false, does it correctly skip that gate?
@@ -729,12 +729,14 @@ nodes:
          No n8n webhook URLs. No absolute paths unless in `/host-artifacts/`.
          Score <7 if any violation found.
 
-      7. **Flip-notion correctness** (1-10): flip-notion is the final node, depends on build-manifest,
-         flips the product WO (not the on-ramp's own WO), and includes manifest paste.
-         Score <7 if flip-notion targets the wrong WO or is not final.
+      7. **GitHub-flip correctness** (1-10): review-issue is the final node, depends on build-manifest,
+         targets the child WO's GitHub issue (not the on-ramp's own WO), applies status:review,
+         and includes manifest delivery.
+         Score <7 if review-issue targets the wrong WO, targets the wrong system, or is not final.
 
       8. **Idempotency** (1-10): Running the child YAML twice on the same WO produces no duplicate
-         commits, no duplicate Notion pages, no duplicate PRs. The implement loop has a
+         commits, no duplicate issue comments/labels, no duplicate PRs. The GitHub completion
+         node uses a manifest-sentinel guard before posting comments. The implement loop has a
          "spec already implemented?" guard or uses git diff to detect no-op.
          Score <7 if second run would create duplicates without guards.
 
@@ -748,7 +750,7 @@ nodes:
       4. Loop correctness: <score>/10 - <one-line finding>
       5. Load-bearing correctness: <score>/10 - <one-line finding>
       6. Path hygiene: <score>/10 - <one-line finding>
-      7. Flip-notion correctness: <score>/10 - <one-line finding>
+      7. GitHub-flip correctness: <score>/10 - <one-line finding>
       8. Idempotency: <score>/10 - <one-line finding>
 
       RISK=<LOW|MEDIUM|HIGH>
@@ -1236,7 +1238,7 @@ nodes:
   # the whole on-ramp run. Only a CONFIRMED binding MISMATCH (run found, bound to
   # the wrong repo) is a hard fail. Run-not-found / API-unreachable / repo
   # unresolvable => WARN and emit BINDING_OK=unverified (exit 0), letting
-  # build-manifest + flip-notion proceed.
+  # build-manifest + review-issue proceed.
   #
   # Root cause of the original false-fail (run 032da37 / WO-CAULDRON-MULTI-STAGE-PIPELINE-01,
   # 2026-06-09): the fire endpoint returns only {"accepted":true,"status":"started"}
@@ -1372,7 +1374,7 @@ nodes:
 
       # Run not found within 90s: register + fire already SUCCEEDED, so this is a
       # verification soft-miss, NOT a failure. WARN + skip (exit 0) so build-manifest
-      # and flip-notion proceed. (false-fail fix: do not kill a post-success tail.)
+      # and review-issue proceed. (false-fail fix: do not kill a post-success tail.)
       if [ "$BINDING_STATE" = "not_found" ]; then
         echo "WARN: child run not found in /api/workflows/runs after 90s (RUN_ID=${RUN_ID} CONV_ID=${CONV_ID} WO_SLUG=${WO_SLUG})." >&2
         echo "WARN: register-yaml and fire-child both succeeded, so the child fire is presumed live; verification is best-effort and is being SKIPPED rather than failing the run." >&2
@@ -1400,7 +1402,7 @@ nodes:
   # emits many chatty lines, so neither "$verify-binding.output == 'BINDING_OK=true'" nor a
   # regex can ever match. The proven house pattern (block-classify in bdc-feature-development)
   # is a tiny classifier whose ENTIRE stdout is ONE JSON line, gated downstream with
-  # $node.output.field == 'VALUE'. This node IS that classifier for the flip-notion gate.
+  # $node.output.field == 'VALUE'. This node IS that classifier for the review-issue gate.
   # verify-binding has 3 settled states: BINDING_OK=true (matched_ok), BINDING_OK=unverified
   # (soft-miss after a successful fire), and exit 1 (confirmed wrong-repo mismatch -- which
   # fails the node, so this gate never evaluates). Both true and unverified are on-ramp
@@ -1458,7 +1460,7 @@ nodes:
         bdc-harness: grep -c "^model:[ ]sonnet$" .archon/workflows/defaults/<WO_SLUG>.yaml -> 1
         bdc-harness: grep -c "^policyFile:" .archon/workflows/defaults/<WO_SLUG>.yaml -> 1
         bdc-harness: grep -c "id: business-risk-gate" .archon/workflows/defaults/<WO_SLUG>.yaml -> 1
-        bdc-harness: grep -c "id: flip-notion" .archon/workflows/defaults/<WO_SLUG>.yaml -> 1
+        bdc-harness: grep -c "id: review-issue" .archon/workflows/defaults/<WO_SLUG>.yaml -> 1
       Runtime verification:
         Archon API: curl -s https://archon.bluedevilcollectibles.com/api/workflows | python3 -c "import sys,json; ws=[w for w in json.load(sys.stdin).get('workflows',[]) if (w.get('workflow',w)).get('name')=='<WO_SLUG>']; print('FOUND' if ws else 'MISSING')" -> FOUND
         Fire: RUN_ID=<from fire-child> BINDING_OK=<from verify-binding> BOUND_REPO=<from verify-binding>
@@ -1493,10 +1495,9 @@ nodes:
         fire-child both succeeded.
       - Otherwise (BINDING_OK=true) -> VALIDATION: PASS.
 
-  # Node 12: flip-notion
-  # Flips the child WO being on-ramped to REVIEW.
-  - id: flip-notion
-    agent: xo
+  # Node 12: review-issue
+  # Marks the child WO GitHub issue ready for review and delivers the manifest.
+  - id: review-issue
     depends_on: [build-manifest, binding-gate]
     # Defect 7 fix (2026-06-09): the when: expression used =~ (regex) AND compared against
     # verify-binding's whole multi-line output -- the condition-evaluator supports NEITHER.
@@ -1511,32 +1512,60 @@ nodes:
     # wrong-repo mismatch makes verify-binding exit 1 (node fails; this gate never evaluates).
     # build-manifest's own VALIDATION guard still independently gates the actual flip.
     when: "$binding-gate.output.gate == 'proceed'"
-    prompt: |
-      ## GUARD: Only flip if run succeeded end-to-end
-      Check build-manifest output for VALIDATION: PASS.
-      If VALIDATION: BLOCKED or FAIL -> output XO_TODO: do not flip the child WO_ID from Register-yaml and stop.
+    bash: |
+      set -euo pipefail
 
-      Flip the child Work Order identified by the WO_ID in Register-yaml to REVIEW
-      in Notion. Do not re-derive the WO_ID from the spec; use the prior-node output.
+      capture_node_output() {
+        python3 -c 'import shlex, sys; s=sys.stdin.read(); sys.stdout.write((lambda p: p[0] if len(p)==1 else s)(shlex.split(s)) if len(s)>=2 and s[0]=="'"'"'" and s.rstrip("\n").endswith("'"'"'") else s)'
+      }
 
-      ## Inputs
-      Register-yaml: $register-yaml.output
-      Fire-child: $fire-child.output
-
-      ## Required Notion changes for the child WO_ID
-      - Claude Status -> REVIEW
-      - Status -> Review
-      - Notes -> paste the manifest from build-manifest output verbatim
-      - claimed_by: Major Build (bdc-harness-wo-onramp)
-      - claimed_at: today's date (2026-05-29)
-
-      ## Manifest
+      MANIFEST=$(capture_node_output <<'BDC_NODE_OUTPUT_BUILD_MANIFEST'
       $build-manifest.output
+      BDC_NODE_OUTPUT_BUILD_MANIFEST
+      )
+      if ! printf '%s\n' "$MANIFEST" | grep -q 'VALIDATION: PASS'; then
+        echo "review-issue: build-manifest is not VALIDATION: PASS -- skipping issue review flip."
+        exit 0
+      fi
 
-      ## Procedure
-      1. Search Notion DB ${INPUT_NOTION_DB_ID} for page with WO ID = the child WO_ID from Register-yaml.
-      2. If found: use notion-update-page to set Claude Status=REVIEW, Status=Review,
-         and append the manifest to the Notes property.
-      3. If Notion MCP is unavailable or search returns no result, output:
-         XO_TODO: Flip the child WO_ID from Register-yaml to REVIEW; paste the manifest from
-         build-manifest output into Notes. DB: ${INPUT_NOTION_DB_ID}.
+      REGISTER_OUT=$(capture_node_output <<'BDC_NODE_OUTPUT_REGISTER_YAML'
+      $register-yaml.output
+      BDC_NODE_OUTPUT_REGISTER_YAML
+      )
+      FIRE_OUT=$(capture_node_output <<'BDC_NODE_OUTPUT_FIRE_CHILD'
+      $fire-child.output
+      BDC_NODE_OUTPUT_FIRE_CHILD
+      )
+      WO_ID=$(printf '%s\n%s\n' "$REGISTER_OUT" "$FIRE_OUT" | sed -n 's/^WO_ID=//p' | head -n 1)
+      if [ -z "$WO_ID" ]; then
+        echo "review-issue: child WO_ID not found in register-yaml/fire-child output; skipping issue review flip."
+        exit 0
+      fi
+
+      ISSUE_REPO="${INPUT_ISSUE_REPO:-${ISSUE_REPO:-bluedevilcollectibles/bdc-xo}}"
+      ISSUE_NUM=$(gh issue list --repo "$ISSUE_REPO" --search "$WO_ID in:title" --json number --jq '.[0].number // empty' 2>/dev/null || true)
+      if [ -z "$ISSUE_NUM" ]; then
+        echo "review-issue: no GitHub issue found for ${WO_ID} in ${ISSUE_REPO}; skipping status:review label and manifest comment."
+        exit 0
+      fi
+
+      gh label create status:review --repo "$ISSUE_REPO" --color 0E8A16 --description "BDC workflow is ready for review" 2>/dev/null || true
+      gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --remove-label status:building 2>/dev/null || true
+      gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --remove-label status:blocked 2>/dev/null || true
+      gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --add-label status:review
+
+      SENTINEL="<!-- onramp-manifest ${WO_ID} -->"
+      if gh issue view "$ISSUE_NUM" --repo "$ISSUE_REPO" --json comments --jq '.comments[].body' 2>/dev/null | grep -Fq "$SENTINEL"; then
+        echo "review-issue: $ISSUE_REPO#$ISSUE_NUM already has manifest sentinel for $WO_ID; skipping comment."
+      else
+        COMMENT_FILE=$(mktemp)
+        {
+          printf '%s\n' "$SENTINEL"
+          printf '%s\n' "$MANIFEST"
+        } > "$COMMENT_FILE"
+        gh issue comment "$ISSUE_NUM" --repo "$ISSUE_REPO" --body-file "$COMMENT_FILE"
+        rm -f "$COMMENT_FILE"
+        echo "review-issue: posted manifest comment to $ISSUE_REPO#$ISSUE_NUM"
+      fi
+
+      echo "review-issue: $ISSUE_REPO#$ISSUE_NUM -> status:review"
