@@ -95,7 +95,7 @@ async function registeredRegistry() {
   return registerFrozenFusionVerifierRegistry(registryFixture);
 }
 
-describe('Fusion M-42 budget authorization and receipts', () => {
+describe('fusion-budget-receipt: Fusion M-42 budget authorization and receipts', () => {
   test('reservation is atomic under concurrent workers with no oversubscription', async () => {
     const results = await Promise.all(
       Array.from({ length: 10 }, (_, index) =>
