@@ -32,6 +32,7 @@
     "./control-plane": "./src/control-plane.ts",
     "./m42-slice8b-manifest": "./src/m42-slice8b-manifest.ts",
     "./m42-slice8b-canary-runner": "./src/m42-slice8b-canary-runner.ts",
+    "./staging-refire-bridge": "./src/staging-refire-bridge.ts",
     "./m42-slice8b-process-health": "./src/m42-slice8b-process-health.ts",
     "./m42-slice8b-gate1": "./src/m42-slice8b-gate1.ts",
     "./m42-slice8b-evidence-packet": "./src/m42-slice8b-evidence-packet.ts"

@@ -22,16 +22,7 @@ import { sha256Digest } from '../../fusion/src/receipts';
 import type { FusionComponentModelV1 } from '../../fusion/src/types';
 import type { OverseerActionPolicy } from './action-policy';
 import type { AuthorizeOverseerActionV2Deps } from './action-policy-v2';
-import { executeCauldronRefireBridge } from './actions/cauldron-refire-bridge';
 import type { OverseerSalvageReceiptV1 } from './actions/lifecycle';
-import { createCauldronRefireBridgeAdapter } from './adapters/cauldron-refire-bridge';
-import type {
-  CauldronAdmissionRequestV1,
-  CauldronAdmissionResultV1,
-  CauldronAdmissionTargetV1,
-  CauldronRegisteredWorkloadV1,
-} from './adapters/cauldron-refire-bridge';
-import type { CauldronRefireBridgeReceiptV1 } from './actions/cauldron-refire-bridge';
 import { closeSandboxPullRequest } from './adapters/sandbox-close';
 import { mergeSandboxPullRequest } from './adapters/sandbox-merge';
 import { refreshSandboxPullRequest } from './adapters/sandbox-refresh';
@@ -61,6 +52,7 @@ import {
 } from './m42-slice8b-process-health';
 import { computePolicyTupleDigest, type OverseerActionPolicyRegistry } from './policy-registry';
 import type { FusionAuthorizationRequestV1 } from '../../fusion/src/types';
+import { executeM42Slice8BStagingRefireBridge } from './staging-refire-bridge';
 
 const execFileAsync = promisify(execFile);
 
@@ -331,54 +323,8 @@ async function executeSiblingSandboxAction(
 async function executeSiblingRefire(
   manifest: M42Slice8BManifestPayload,
   executionId: string
-): Promise<CauldronRefireBridgeReceiptV1> {
-  const fixture = cauldronFixture(manifest, executionId);
-  const admissionRequests: CauldronAdmissionRequestV1[] = [];
-  const adapter = createCauldronRefireBridgeAdapter({
-    admitRun: async request => {
-      admissionRequests.push(request);
-      return {
-        status: 'admitted',
-        runId: 'fake-staging-refire-1',
-        providerRequestId: 'fake-staging-refire-1',
-        admittedAt: '2026-07-17T12:02:00.000Z',
-        bindingEvidence: request.inputs,
-        reason: 'accepted',
-      } satisfies CauldronAdmissionResultV1;
-    },
-    getAdmissionByExecutionId: async () => null,
-  });
-  void admissionRequests;
-  return executeCauldronRefireBridge(
-    {
-      context: fixture.context,
-      permit: fixture.permit,
-      registered_workload: registeredWorkload(),
-      target: stagingTarget(),
-      requested_wo_id: 'WO-SYNTHETIC-M42-SLICE8B-REFIRE',
-      requested_workflow_name: 'overseer-sandbox-refire',
-      conversation_id: 'conversation-m42-slice8b-refire',
-      message: 'Fake-mode M-42 Slice 8B staging refire admission',
-      actor: 'xo',
-      correlation_id: `corr-${executionId}`,
-    },
-    {
-      gate: {
-        preparePermit: async () => ({ ok: true, reason: 'ok' }),
-        authorizeAction: async () => ({ allowed: true, reason: 'allowed' }),
-        reserveEffect: async () => ({ ok: true, reason: 'ok' }),
-        appendOutcome: async () => ({ ok: true }),
-      },
-      adapter,
-      idempotency: {
-        begin: async () => ({ status: 'fresh' as const }),
-        commit: async () => undefined,
-      },
-      circuit: { openRefireCircuit: async () => undefined },
-      sha256hex: hex,
-      now: () => '2026-07-17T12:02:30.000Z',
-    }
-  );
+): ReturnType<typeof executeM42Slice8BStagingRefireBridge> {
+  return executeM42Slice8BStagingRefireBridge(manifest, executionId);
 }
 
 async function exerciseFusionBudgetAuthorizationReceiptPath(
@@ -495,54 +441,6 @@ function sandboxFixture(
     correlation_id: `corr-${executionId}`,
     replay: { replay_key: executionId, consume: async () => true },
     provider,
-  };
-  return { context, permit };
-}
-
-function cauldronFixture(
-  manifest: M42Slice8BManifestPayload,
-  executionId: string
-): { readonly context: SandboxExecutionContextV1; readonly permit: M31ActionPermitV2 } {
-  const { proposal, permit } = proposalAndPermit(manifest, 'REFIRE', executionId, 'workflow_run');
-  const context: SandboxExecutionContextV1 = {
-    schema_version: 'overseer-sandbox-execution-context-v1',
-    mode: 'sandbox',
-    frozen_authorization_carried: true,
-    repository: repositoryIdentity(manifest),
-    action_policy_registry: { schema_version: 'overseer-action-policy-v1', entries: [] },
-    action_policy_registry_digest: manifest.action_policy_digest,
-    expected_action_policy_registry_digest: manifest.action_policy_digest,
-    credential_principal: manifest.credential_principal_id,
-    resulting_deployment_effect: 'none',
-    target_classifications: ['sandbox'],
-    pull_request_number: 0,
-    base_branch: 'dev',
-    base_sha: manifest.starting_sha,
-    head_sha: manifest.candidate_sha,
-    candidate_digest: manifest.image_digest,
-    expected_policy_digest: proposal.policy_digest,
-    expected_verifier_registry_digest: hexDigest(manifest.verifier_registry_digest),
-    expected_principal: manifest.credential_principal_id,
-    expected_repository_full_name: manifest.repository_full_name,
-    expected_provider_repository_id: manifest.provider_repository_id,
-    observation: {
-      provider_repository_id: manifest.provider_repository_id,
-      repository_full_name: manifest.repository_full_name,
-      pull_request_number: 0,
-      base_branch: 'dev',
-      base_sha: manifest.starting_sha,
-      head_sha: manifest.candidate_sha,
-      candidate_digest: manifest.image_digest,
-      policy_digest: proposal.policy_digest,
-      verifier_registry_digest: hexDigest(manifest.verifier_registry_digest),
-      observed_at: '2026-07-17T12:01:00.000Z',
-    },
-    proposal,
-    authorization_deps: authorizationDeps('repair', proposal),
-    actor: 'xo',
-    correlation_id: `corr-${executionId}`,
-    replay: { replay_key: executionId, consume: async () => true },
-    provider: fakeSandboxProvider(),
   };
   return { context, permit };
 }
@@ -724,23 +622,6 @@ function salvageReceipt(context: SandboxExecutionContextV1): OverseerSalvageRece
     scope_digest: hex('m42-slice8b-salvage-scope'),
     captured_at: '2026-07-17T12:00:00.000Z',
     verified_at: '2026-07-17T12:00:00.000Z',
-  };
-}
-
-function registeredWorkload(): CauldronRegisteredWorkloadV1 {
-  return {
-    synthetic_wo_id: 'WO-SYNTHETIC-M42-SLICE8B-REFIRE',
-    workflow_name: 'overseer-sandbox-refire',
-  };
-}
-
-function stagingTarget(): CauldronAdmissionTargetV1 {
-  return {
-    environment: 'staging',
-    archon: 'staging',
-    event_store: 'staging',
-    worktree: 'staging',
-    credential: 'staging',
   };
 }
 
