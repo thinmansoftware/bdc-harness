@@ -688,6 +688,29 @@ describe('service', () => {
     expect(listRunsForWatch).not.toHaveBeenCalled();
   });
 
+  test('enabled sandbox adapter rejects before watcher or mutation dependencies run', async () => {
+    const listRunsForWatch = mock(async () => []);
+    await expect(
+      runOverseerService({
+        once: true,
+        enabled: true,
+        adapterKind: 'sandbox',
+        deps: {
+          listRunsForWatch,
+          listRunEvents: async () => [],
+          findPullRequest: async () => {
+            throw new Error('read client must not run');
+          },
+          mergePullRequest: async () => {
+            throw new Error('merge client must not run');
+          },
+          insertOverseerAction: async () => undefined,
+        },
+      })
+    ).rejects.toThrow('overseer_slice1_real_adapter_forbidden:sandbox');
+    expect(listRunsForWatch).not.toHaveBeenCalled();
+  });
+
   test('delivery scheduler repeats at the owned interval until aborted', async () => {
     const controller = new AbortController();
     let drains = 0;

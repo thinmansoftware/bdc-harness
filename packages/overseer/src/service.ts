@@ -53,7 +53,7 @@ const log = createLogger('overseer/service');
  * Resolved adapter kind for the watcher. Distinct from env-intent: reflects the
  * adapter that was actually wired when the service started.
  */
-export type OverseerWiredAdapterKind = 'fake' | 'real' | 'none';
+export type OverseerWiredAdapterKind = 'fake' | 'real' | 'sandbox' | 'none';
 
 export interface OverseerServiceOptions {
   once?: boolean;

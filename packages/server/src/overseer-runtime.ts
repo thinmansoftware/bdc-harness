@@ -44,6 +44,16 @@ function readEmergencyStop(): boolean {
   return v !== '0' && v !== 'false' && v !== 'no';
 }
 
+function readSandboxModeRequested(): boolean {
+  return process.env.OVERSEER_SANDBOX_MODE_REQUESTED === '1';
+}
+
+function isSandboxGateSatisfied(): boolean {
+  // Gate-2 frozen authorization artifacts are produced by a future WO;
+  // env intent alone cannot promote sandbox.
+  return false;
+}
+
 function resolveAdapterKind(): OverseerAdapterKind {
   if (
     process.env.OVERSEER_USE_FAKE_GITHUB_ADAPTER === '1' ||
@@ -52,7 +62,8 @@ function resolveAdapterKind(): OverseerAdapterKind {
     return 'fake';
   }
   const token = process.env.GH_TOKEN ?? process.env.GITHUB_TOKEN ?? '';
-  return token.length > 0 ? 'real' : 'none';
+  if (token.length === 0) return 'none';
+  return readSandboxModeRequested() && isSandboxGateSatisfied() ? 'sandbox' : 'real';
 }
 
 /**

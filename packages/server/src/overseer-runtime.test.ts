@@ -24,6 +24,7 @@ const getStatus = () =>
 const oldEnabled = process.env.OVERSEER_ENABLED;
 const oldEmergencyStop = process.env.OVERSEER_EMERGENCY_STOP;
 const oldFakeAdapter = process.env.OVERSEER_USE_FAKE_GITHUB_ADAPTER;
+const oldSandboxModeRequested = process.env.OVERSEER_SANDBOX_MODE_REQUESTED;
 const oldGhToken = process.env.GH_TOKEN;
 const oldGithubToken = process.env.GITHUB_TOKEN;
 
@@ -31,6 +32,7 @@ function setDisabledEnv(): void {
   process.env.OVERSEER_ENABLED = 'false';
   process.env.OVERSEER_EMERGENCY_STOP = 'true';
   process.env.OVERSEER_USE_FAKE_GITHUB_ADAPTER = '1';
+  delete process.env.OVERSEER_SANDBOX_MODE_REQUESTED;
   delete process.env.GH_TOKEN;
   delete process.env.GITHUB_TOKEN;
   for (const cap of ['ESCALATION', 'REPAIR', 'BRANCH', 'LIFECYCLE', 'MERGE']) {
@@ -42,6 +44,7 @@ function setEnabledEnv(): void {
   process.env.OVERSEER_ENABLED = 'true';
   process.env.OVERSEER_EMERGENCY_STOP = 'true';
   process.env.OVERSEER_USE_FAKE_GITHUB_ADAPTER = '1';
+  delete process.env.OVERSEER_SANDBOX_MODE_REQUESTED;
   delete process.env.GH_TOKEN;
   delete process.env.GITHUB_TOKEN;
   for (const cap of ['ESCALATION', 'REPAIR', 'BRANCH', 'LIFECYCLE', 'MERGE']) {
@@ -70,6 +73,11 @@ describe('overseer-runtime', () => {
     process.env.OVERSEER_ENABLED = oldEnabled;
     process.env.OVERSEER_EMERGENCY_STOP = oldEmergencyStop;
     process.env.OVERSEER_USE_FAKE_GITHUB_ADAPTER = oldFakeAdapter;
+    if (oldSandboxModeRequested !== undefined) {
+      process.env.OVERSEER_SANDBOX_MODE_REQUESTED = oldSandboxModeRequested;
+    } else {
+      delete process.env.OVERSEER_SANDBOX_MODE_REQUESTED;
+    }
     if (oldGhToken !== undefined) process.env.GH_TOKEN = oldGhToken;
     else delete process.env.GH_TOKEN;
     if (oldGithubToken !== undefined) process.env.GITHUB_TOKEN = oldGithubToken;
@@ -251,6 +259,20 @@ describe('overseer-runtime', () => {
   test('enabled real adapter is rejected before watcher construction', async () => {
     process.env.OVERSEER_ENABLED = 'true';
     process.env.OVERSEER_USE_FAKE_GITHUB_ADAPTER = 'false';
+    process.env.GITHUB_TOKEN = 'poison-token';
+
+    startOverseerRuntime({ runService: runOverseerServiceMock });
+    const status = await getOverseerRuntimeStatus({ listCapabilityStates: async () => [] });
+
+    expect(runOverseerServiceMock).not.toHaveBeenCalled();
+    expect(status.adapter).toBe('real');
+    expect(status.watcher).toBe('degraded');
+  });
+
+  test('sandbox env request alone does not promote a real token to sandbox', async () => {
+    process.env.OVERSEER_ENABLED = 'true';
+    process.env.OVERSEER_USE_FAKE_GITHUB_ADAPTER = 'false';
+    process.env.OVERSEER_SANDBOX_MODE_REQUESTED = '1';
     process.env.GITHUB_TOKEN = 'poison-token';
 
     startOverseerRuntime({ runService: runOverseerServiceMock });
