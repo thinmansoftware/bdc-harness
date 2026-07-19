@@ -638,7 +638,10 @@ nodes:
     load_bearing: true
     bash: |
       set -uo pipefail
-      IMPL=$implement.output
+      IMPL=$(cat <<'BDC_FEATURE_DEV_IMPL_IMPLEMENT_20260719_001'
+      $implement.output
+      BDC_FEATURE_DEV_IMPL_IMPLEMENT_20260719_001
+      )
       WT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
       # Codex FINDING_1 fix: compare against the IMMUTABLE run-start SHA (captured by
       # read-spec BEFORE checkpoint-push committed+pushed), NOT post-push upstream state.
@@ -1106,7 +1109,10 @@ nodes:
     trigger_rule: all_done
     bash: |
       set -uo pipefail
-      REVIEW=$diff-review.output
+      REVIEW=$(cat <<'BDC_FEATURE_DEV_REVIEW_DIFF_REVIEW_20260719_002'
+      $diff-review.output
+      BDC_FEATURE_DEV_REVIEW_DIFF_REVIEW_20260719_002
+      )
       verdict=$(printf '%s\n' "$REVIEW" | grep -oE 'DIFF_REVIEW=(satisfied|needs_revision)' | tail -n 1 | sed 's/DIFF_REVIEW=//')
       # Fail OPEN to needs_revision: if the sentinel is missing/unparseable, run the repair
       # loop (safer to over-repair than to skip a real finding). This is the OPPOSITE of the
@@ -1318,10 +1324,18 @@ nodes:
     trigger_rule: all_done
     bash: |
       set -uo pipefail
-      DIFF_FINAL=$diff-review-final.output
-      BUILD=$assert-implement-produced-work.output
-      PRECHECK=$gate-already-satisfied.output
-
+      DIFF_FINAL=$(cat <<'BDC_FEATURE_DEV_DIFF_FINAL_DIFF_REVIEW_FINAL_20260719_003'
+      $diff-review-final.output
+      BDC_FEATURE_DEV_DIFF_FINAL_DIFF_REVIEW_FINAL_20260719_003
+      )
+      BUILD=$(cat <<'BDC_FEATURE_DEV_BUILD_ASSERT_IMPLEMENT_PRODUCED_WORK_20260719_004'
+      $assert-implement-produced-work.output
+      BDC_FEATURE_DEV_BUILD_ASSERT_IMPLEMENT_PRODUCED_WORK_20260719_004
+      )
+      PRECHECK=$(cat <<'BDC_FEATURE_DEV_PRECHECK_GATE_ALREADY_SATISFIED_20260719_005'
+      $gate-already-satisfied.output
+      BDC_FEATURE_DEV_PRECHECK_GATE_ALREADY_SATISFIED_20260719_005
+      )
       final_ok=false
       # Anchor-free parse: diff-review-final is Codex prose; sentinel appears inline,
       # not at column 0. Take LAST occurrence so the final verdict always wins.
@@ -1396,7 +1410,10 @@ nodes:
     trigger_rule: all_done
     bash: |
       set -uo pipefail
-      OPUS=$opus-repair.output
+      OPUS=$(cat <<'BDC_FEATURE_DEV_OPUS_OPUS_REPAIR_20260719_006'
+      $opus-repair.output
+      BDC_FEATURE_DEV_OPUS_OPUS_REPAIR_20260719_006
+      )
       if printf '%s\n' "$OPUS" | grep -q '^OPUS_REPAIR=fixed'; then
         printf '{"fixed":"true"}\n'
       else
@@ -1444,7 +1461,10 @@ nodes:
     trigger_rule: all_done
     bash: |
       set -uo pipefail
-      REVIEW=$opus-rereview.output
+      REVIEW=$(cat <<'BDC_FEATURE_DEV_REVIEW_OPUS_REREVIEW_20260719_007'
+      $opus-rereview.output
+      BDC_FEATURE_DEV_REVIEW_OPUS_REREVIEW_20260719_007
+      )
       verdict=$(printf '%s\n' "$REVIEW" \
         | grep -oE 'OPUS_REREVIEW=(satisfied|needs_revision)' \
         | tail -n 1 \
@@ -1465,9 +1485,18 @@ nodes:
     trigger_rule: all_done
     bash: |
       set -uo pipefail
-      PRIOR=$block-classify.output
-      OPUS=$opus-repair.output
-      REREVIEW=$classify-opus-rereview.output
+      PRIOR=$(cat <<'BDC_FEATURE_DEV_PRIOR_BLOCK_CLASSIFY_20260719_008'
+      $block-classify.output
+      BDC_FEATURE_DEV_PRIOR_BLOCK_CLASSIFY_20260719_008
+      )
+      OPUS=$(cat <<'BDC_FEATURE_DEV_OPUS_OPUS_REPAIR_20260719_009'
+      $opus-repair.output
+      BDC_FEATURE_DEV_OPUS_OPUS_REPAIR_20260719_009
+      )
+      REREVIEW=$(cat <<'BDC_FEATURE_DEV_REREVIEW_CLASSIFY_OPUS_REREVIEW_20260719_010'
+      $classify-opus-rereview.output
+      BDC_FEATURE_DEV_REREVIEW_CLASSIFY_OPUS_REREVIEW_20260719_010
+      )
       prior_status=$(printf '%s\n' "$PRIOR" | sed -n 's/.*"status":"\([A-Z_]*\)".*/\1/p' | head -1)
 
       # If it wasn't blocked, keep the prior status unchanged.
@@ -1530,7 +1559,10 @@ nodes:
     trigger_rule: all_done
     bash: |
       set -uo pipefail
-      RECLASS=$block-reclassify.output
+      RECLASS=$(cat <<'BDC_FEATURE_DEV_RECLASS_BLOCK_RECLASSIFY_20260719_011'
+      $block-reclassify.output
+      BDC_FEATURE_DEV_RECLASS_BLOCK_RECLASSIFY_20260719_011
+      )
       STATUS=$(printf '%s\n' "$RECLASS" | sed -n 's/.*"status":"\([A-Z_]*\)".*/\1/p' | head -1)
       # Only act on a BLOCKED status.
       [ "$STATUS" = "BLOCKED" ] || { echo "SALVAGE=skip (status=$STATUS)"; exit 0; }
@@ -1745,7 +1777,10 @@ nodes:
     when: "$pause-gate.output.decision_verb == 'approve_with_fix'"
     bash: |
       set -uo pipefail
-      REVIEW=$apply-diff-review-final.output
+      REVIEW=$(cat <<'BDC_FEATURE_DEV_REVIEW_APPLY_DIFF_REVIEW_FINAL_20260719_012'
+      $apply-diff-review-final.output
+      BDC_FEATURE_DEV_REVIEW_APPLY_DIFF_REVIEW_FINAL_20260719_012
+      )
       verdict=$(printf '%s\n' "$REVIEW" \
         | grep -oE 'APPLY_DIFF_REVIEW_FINAL=(satisfied|needs_revision)' \
         | tail -n 1 \
@@ -1845,13 +1880,19 @@ nodes:
       # creates `"'multiline\nagent\noutput'"` which bash mis-tokenizes - line 2+ of
       # the agent output becomes bare commands. Assign directly to bash vars, then
       # quote the var reference. Engine-level fix tracked in WO-HARNESS-NODE-OUTPUT-BASH-QUOTING-01.
-      DECIDE_OUTPUT=$decide-push-target.output
+      DECIDE_OUTPUT=$(cat <<'BDC_FEATURE_DEV_DECIDE_OUTPUT_DECIDE_PUSH_TARGET_20260719_013'
+      $decide-push-target.output
+      BDC_FEATURE_DEV_DECIDE_OUTPUT_DECIDE_PUSH_TARGET_20260719_013
+      )
       # plan-review emits a fenced output. Extract ONLY the approved-plan block so the
       # changed-file allowlist + commit message never ingest reviewer critique (F8 fix).
       # Must be the revised plan (not pre-review) or a plan-review scope change would be
       # rejected by the allowlist. FAIL CLOSED if the fence is absent (NF1): never fall
       # back to raw output, or PLAN_REVIEW_FINDINGS critique would poison the allowlist.
-      PLAN_REVIEW_RAW=$plan-review.output
+      PLAN_REVIEW_RAW=$(cat <<'BDC_FEATURE_DEV_PLAN_REVIEW_RAW_PLAN_REVIEW_20260719_014'
+      $plan-review.output
+      BDC_FEATURE_DEV_PLAN_REVIEW_RAW_PLAN_REVIEW_20260719_014
+      )
       # Extract APPROVED_PLAN (single-line-safe; open-model canary 3604d5bcc7b2).
       PLAN_OUTPUT=$(printf '%s\n' "$PLAN_REVIEW_RAW" | python3 -c 'import sys,re;t=sys.stdin.read();m=re.search(r"===\s*APPROVED_PLAN_BEGIN\s*===(.*?)===\s*APPROVED_PLAN_END\s*===",t,re.S|re.I);body=(m.group(1).strip() if m else "");body=re.sub(r"(?<!\n)(##)",r"\n\1",body);body=re.sub(r"(?<!\n)(```)",r"\n\1",body);print(body)')
       if [ -z "$PLAN_OUTPUT" ]; then
@@ -1860,11 +1901,26 @@ nodes:
         printf '%s\n' "$PLAN_REVIEW_RAW" >&2
         exit 1
       fi
-      DIFF_FINAL=$diff-review-final.output
-      RECLASS=$block-reclassify.output
-      PAUSE_GATE=$pause-gate.output
-      APPLY_REVIEW=$classify-apply-review.output
-      OPUS_REREVIEW_CLASS=$classify-opus-rereview.output
+      DIFF_FINAL=$(cat <<'BDC_FEATURE_DEV_DIFF_FINAL_DIFF_REVIEW_FINAL_20260719_015'
+      $diff-review-final.output
+      BDC_FEATURE_DEV_DIFF_FINAL_DIFF_REVIEW_FINAL_20260719_015
+      )
+      RECLASS=$(cat <<'BDC_FEATURE_DEV_RECLASS_BLOCK_RECLASSIFY_20260719_016'
+      $block-reclassify.output
+      BDC_FEATURE_DEV_RECLASS_BLOCK_RECLASSIFY_20260719_016
+      )
+      PAUSE_GATE=$(cat <<'BDC_FEATURE_DEV_PAUSE_GATE_PAUSE_GATE_20260719_017'
+      $pause-gate.output
+      BDC_FEATURE_DEV_PAUSE_GATE_PAUSE_GATE_20260719_017
+      )
+      APPLY_REVIEW=$(cat <<'BDC_FEATURE_DEV_APPLY_REVIEW_CLASSIFY_APPLY_REVIEW_20260719_018'
+      $classify-apply-review.output
+      BDC_FEATURE_DEV_APPLY_REVIEW_CLASSIFY_APPLY_REVIEW_20260719_018
+      )
+      OPUS_REREVIEW_CLASS=$(cat <<'BDC_FEATURE_DEV_OPUS_REREVIEW_CLASS_CLASSIFY_OPUS_REREVIEW_20260719_019'
+      $classify-opus-rereview.output
+      BDC_FEATURE_DEV_OPUS_REREVIEW_CLASS_CLASSIFY_OPUS_REREVIEW_20260719_019
+      )
       echo "$DECIDE_OUTPUT"
       if printf '%s\n' "$DECIDE_OUTPUT" | grep -q '^out_of_scope: true'; then
         echo "Out of scope for bdc-feature-development; failing closed." >&2
@@ -2069,20 +2125,35 @@ nodes:
     bash: |
       set -euo pipefail
       # 2026-05-16 quote-fix: see commit-and-push for rationale.
-      DECIDE_OUTPUT=$decide-push-target.output
+      DECIDE_OUTPUT=$(cat <<'BDC_FEATURE_DEV_DECIDE_OUTPUT_DECIDE_PUSH_TARGET_20260719_020'
+      $decide-push-target.output
+      BDC_FEATURE_DEV_DECIDE_OUTPUT_DECIDE_PUSH_TARGET_20260719_020
+      )
       # Extract ONLY the approved-plan block for the PR title/body (F8 fix) -- keep
       # reviewer critique out of the customer-visible PR. FAIL CLOSED if the fence is
       # absent (NF1): never put raw critique-bearing output in the PR body.
-      PLAN_REVIEW_RAW=$plan-review.output
+      PLAN_REVIEW_RAW=$(cat <<'BDC_FEATURE_DEV_PLAN_REVIEW_RAW_PLAN_REVIEW_20260719_021'
+      $plan-review.output
+      BDC_FEATURE_DEV_PLAN_REVIEW_RAW_PLAN_REVIEW_20260719_021
+      )
       # Extract APPROVED_PLAN (single-line-safe; open-model canary 3604d5bcc7b2).
       PLAN_OUTPUT=$(printf '%s\n' "$PLAN_REVIEW_RAW" | python3 -c 'import sys,re;t=sys.stdin.read();m=re.search(r"===\s*APPROVED_PLAN_BEGIN\s*===(.*?)===\s*APPROVED_PLAN_END\s*===",t,re.S|re.I);body=(m.group(1).strip() if m else "");body=re.sub(r"(?<!\n)(##)",r"\n\1",body);body=re.sub(r"(?<!\n)(```)",r"\n\1",body);print(body)')
       if [ -z "$PLAN_OUTPUT" ]; then
         echo "ERROR: plan-review output missing the APPROVED_PLAN fence -- cannot build PR body (NF1 fail-closed)." >&2
         exit 1
       fi
-      IMPLEMENT_OUTPUT=$implement.output
-      VALIDATOR_OUTPUT=$war-council-validator.output
-      COMMIT_PUSH_OUTPUT=$commit-and-push.output
+      IMPLEMENT_OUTPUT=$(cat <<'BDC_FEATURE_DEV_IMPLEMENT_OUTPUT_IMPLEMENT_20260719_022'
+      $implement.output
+      BDC_FEATURE_DEV_IMPLEMENT_OUTPUT_IMPLEMENT_20260719_022
+      )
+      VALIDATOR_OUTPUT=$(cat <<'BDC_FEATURE_DEV_VALIDATOR_OUTPUT_WAR_COUNCIL_VALIDATOR_20260719_023'
+      $war-council-validator.output
+      BDC_FEATURE_DEV_VALIDATOR_OUTPUT_WAR_COUNCIL_VALIDATOR_20260719_023
+      )
+      COMMIT_PUSH_OUTPUT=$(cat <<'BDC_FEATURE_DEV_COMMIT_PUSH_OUTPUT_COMMIT_AND_PUSH_20260719_024'
+      $commit-and-push.output
+      BDC_FEATURE_DEV_COMMIT_PUSH_OUTPUT_COMMIT_AND_PUSH_20260719_024
+      )
       if ! printf '%s\n' "$DECIDE_OUTPUT" | grep -q '^pr_required: true'; then
         echo "PR not required; skipping."
         exit 0
