@@ -127,6 +127,25 @@ export async function syncWorkspace(
     return { branch: branchToSync, synced: true, previousHead: '', newHead: '', updated: false };
   }
 
+  // Pin the managed clone onto the base branch BEFORE capturing previousHead.
+  // reset --hard alone only rewrites the currently checked-out branch tip; if an
+  // overseer op left HEAD on a feature branch, reset would leave HEAD on the wrong
+  // branch with the base branch's *content* rather than the base branch itself.
+  // -B force-creates-or-resets the local branch to origin/<branchToSync>; -f
+  // discards local modifications while switching. Run before the previousHead
+  // capture so previousHead still reflects the true pre-sync HEAD (possibly the
+  // wrong branch), keeping the `updated` boolean's meaning correct.
+  try {
+    await execFileAsync(
+      'git',
+      ['-C', workspacePath, 'checkout', '-f', '-B', branchToSync, `origin/${branchToSync}`],
+      { timeout: 30000 }
+    );
+  } catch (error) {
+    const err = error as Error;
+    throw new Error(`Checkout to origin/${branchToSync} failed: ${err.message}`);
+  }
+
   // Capture HEAD before reset so we can report whether anything changed
   let previousHead = '';
   try {
@@ -149,6 +168,17 @@ export async function syncWorkspace(
   } catch (error) {
     const err = error as Error;
     throw new Error(`Reset to origin/${branchToSync} failed: ${err.message}`);
+  }
+
+  // Remove untracked files/dirs left behind by an overseer op. reset --hard does
+  // NOT delete untracked files, so a stray file would still leave the tree dirty
+  // and fail capture-run-scope. Deliberately no -x: gitignored build artifacts
+  // (node_modules, dist) are preserved to avoid costly rebuilds.
+  try {
+    await execFileAsync('git', ['-C', workspacePath, 'clean', '-fd'], { timeout: 30000 });
+  } catch (error) {
+    const err = error as Error;
+    throw new Error(`Clean untracked files in ${branchToSync} workspace failed: ${err.message}`);
   }
 
   let newHead = '';
