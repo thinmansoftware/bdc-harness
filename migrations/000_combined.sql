@@ -646,9 +646,9 @@ CREATE TRIGGER trg_board_audit_events_no_delete
 CREATE TABLE IF NOT EXISTS board_execution_claims (
   claim_id TEXT PRIMARY KEY,
   motion_id TEXT NOT NULL,
-  action_kind TEXT NOT NULL CHECK (action_kind = 'production_deploy'),
-  environment TEXT NOT NULL CHECK (environment = 'production'),
-  target_sha TEXT NOT NULL CHECK (target_sha ~ '^[0-9a-f]{40}$'),
+  action_kind TEXT NOT NULL CHECK (action_kind IN ('production_deploy', 'overseer_repair_refire')),
+  environment TEXT NOT NULL CHECK (environment IN ('production', 'recovery')),
+  target_sha TEXT NOT NULL CHECK (target_sha ~ '^[0-9a-f]{40}([0-9a-f]{24})?$'),
   action_key TEXT NOT NULL UNIQUE,
   idempotency_key TEXT NOT NULL UNIQUE,
   motion_file_path TEXT NOT NULL,
