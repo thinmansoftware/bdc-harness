@@ -4,8 +4,11 @@
  * The merge-ready action never reaches a merge adapter unless an exact,
  * independently verified, policy-allowed tuple clears every ordered gate.
  * Assessment is a pure ordered predicate over exact evidence; execution runs
- * the M-31 v2 permit -> authorize -> reserve chain BEFORE the injected adapter
- * and only then appends a primary outcome. Every excluded or indeterminate
+ * the M-31 v2 permit -> authorize -> identity recheck -> Grok judge -> reserve
+ * chain BEFORE the injected adapter and only then appends a primary outcome.
+ * The Grok second-opinion judge gate fails closed on any hold/timeout/error and
+ * recuses entirely on Grok-built work (M-42, 2026-07-16). Every excluded or
+ * indeterminate
  * target fails closed before any provider mutation.
  *
  * Slice 7 ships an empty live registry and leaves the merge capability disabled;
@@ -17,8 +20,16 @@
  * legacy fake mutation adapter. The merge boundary is a local
  * QualifiedMergeAdapterV2 contract injected by the caller.
  */
+import { createHash } from 'node:crypto';
 import { isPrGreen, isPrMergeReady } from '../judge-pr';
-import type { OverseerActionsDeps, WatchedRunRecord } from '../types.ts';
+import { judgeWithGrok } from '../judge-second-opinion';
+import type {
+  GrokDispositionReceipt,
+  GrokJudgeDeps,
+  GrokJudgeEvidence,
+  OverseerActionsDeps,
+  WatchedRunRecord,
+} from '../types.ts';
 import {
   findMergePolicyTuple,
   type OverseerActionPolicyEntry,
@@ -37,6 +48,30 @@ import type { ActionPolicyV2AuthorizationResult } from '../action-policy-v2';
 const INTERNAL_REPO_ALLOWLIST = new Set(['bdc-harness', 'bdc-xo']);
 
 const HEX64_RE = /^[0-9a-f]{64}$/;
+
+/**
+ * Grok/Provost family indicators. Verified against the canonical Grok operator
+ * identity used throughout this package (provider 'xai', model_family 'grok';
+ * see integration-fixtures.ts and merge-ready.test.ts). The Grok judge may not
+ * review, verify, approve, or merge Grok-built work (M-42 board amendment
+ * 2026-07-16), so a Grok-family builder recuses the judge entirely.
+ */
+const GROK_FAMILY_PROVIDERS = new Set(['xai']);
+const GROK_FAMILY_MODEL_FAMILIES = new Set(['grok']);
+
+/**
+ * True when the independent-review builder of the work being merged is a Grok
+ * family identity. Complements assessQualifiedMerge step 6's operator_recusal
+ * gate (which compares operator vs. builder) -- this instead protects the Grok
+ * judge from reviewing its own family's build.
+ */
+function isGrokFamilyBuilder(review: IndependentReviewEvidence | null): boolean {
+  if (!review) return false;
+  return (
+    GROK_FAMILY_PROVIDERS.has(review.builder_provider.trim().toLowerCase()) ||
+    GROK_FAMILY_MODEL_FAMILIES.has(review.builder_model_family.trim().toLowerCase())
+  );
+}
 
 /** Deterministic disposition for a denied or excluded target. */
 export type MergeExclusionDisposition = 'operator_card' | 'circuit_open' | 'deny';
@@ -396,7 +431,7 @@ export interface ReconcileQualifiedMergeInput {
   readonly external_effect_reference?: string | null;
 }
 
-export interface ExecuteQualifiedMergeDeps extends OverseerActionsDeps {
+export interface ExecuteQualifiedMergeDeps extends OverseerActionsDeps, GrokJudgeDeps {
   readonly preparePermit: (proposalId: string) => Promise<PrepareM31ActionPermitV2Result>;
   readonly authorize: (permit: M31ActionPermitV2) => Promise<ActionPolicyV2AuthorizationResult>;
   readonly reserveEffect: (permit: M31ActionPermitV2) => Promise<ReserveEffectResult>;
@@ -418,6 +453,7 @@ export interface QualifiedMergeExecution {
     | 'operator_card'
     | 'circuit_open'
     | 'permit_denied'
+    | 'judge_denied'
     | 'reservation_failed'
     | 'indeterminate';
   readonly merged: boolean;
@@ -481,6 +517,54 @@ function isAllowedAuthorization(
   authorization: ActionPolicyV2AuthorizationResult
 ): authorization is Extract<ActionPolicyV2AuthorizationResult, { allowed: true }> {
   return authorization.allowed;
+}
+
+/**
+ * Build the Grok judge evidence from data already present on
+ * QualifiedMergeEvidence. No new evidence-gathering I/O. The evidence digest is
+ * a local sha256 over the deterministic already-present subset (documented
+ * deviation from the WO's "digest already present" assumption -- this evidence
+ * shape carries no digest field); it is only consumed by the judge prompt and
+ * stamped onto the receipt, never round-trip-validated here.
+ */
+function buildGrokJudgeEvidence(evidence: QualifiedMergeEvidence): GrokJudgeEvidence {
+  const pr = evidence.record.prEvidence;
+  const checksSummary = pr.checks;
+  const filesChangedCount = pr.filesChangedCount ?? 0;
+  const diffStat = pr.diffStat ?? '';
+  const evidenceDigest = createHash('sha256')
+    .update(
+      JSON.stringify([
+        evidence.record.woId,
+        evidence.pr_number,
+        evidence.head_sha,
+        evidence.base_sha,
+        checksSummary.total,
+        checksSummary.passed,
+        checksSummary.failed,
+        checksSummary.pending,
+        checksSummary.conclusion ?? '',
+        filesChangedCount,
+        diffStat,
+      ])
+    )
+    .digest('hex');
+  return {
+    woId: evidence.record.woId,
+    prNumber: evidence.pr_number,
+    prTitle: pr.prTitle ?? '',
+    headSha: evidence.head_sha,
+    baseSha: evidence.base_sha,
+    evidenceDigest,
+    operator: {
+      identity: evidence.operator.identity,
+      provider: evidence.operator.provider,
+      modelFamily: evidence.operator.model_family,
+    },
+    checksSummary,
+    filesChangedCount,
+    diffStat,
+  };
 }
 
 /**
@@ -970,7 +1054,10 @@ export async function executeQualifiedMerge(
     return closed(assessment, 'denied', 'merge_adapter_missing');
   }
 
-  // Strict order: v2 prepare -> v2 authorize -> v2 reserve -> adapter -> outcome.
+  // Strict order: v2 prepare -> v2 authorize -> identity recheck -> judge ->
+  // v2 reserve -> adapter -> outcome. The Grok second-opinion judge gate sits
+  // between the identity recheck and reservation so the merge decision is gated
+  // before any reservation/execution side effect.
   const permitResult = await deps.preparePermit(assessment.proposal_id);
   if (!permitResult.ok) {
     await recordAction(deps, record, 'permit_denied', 'permit_not_issued');
@@ -1002,6 +1089,42 @@ export async function executeQualifiedMerge(
   if (identityFailure) {
     await recordAction(deps, record, 'permit_denied', `identity_recheck_failed:${identityFailure}`);
     return closed(assessment, 'permit_denied', `identity_recheck_failed:${identityFailure}`, {
+      permitEventDigest: permitReceipt.event_digest,
+    });
+  }
+
+  // Grok-family recusal (M-42 board amendment 2026-07-16): the Grok judge may
+  // not review, verify, approve, or merge Grok-built work. When the
+  // independent-review builder is a Grok family identity, skip the judge call
+  // entirely and deny before any reservation -- an operator must take over.
+  // Complements assessQualifiedMerge step 6's operator_recusal gate.
+  if (isGrokFamilyBuilder(evidence.independent_review)) {
+    await recordAction(deps, record, 'judge_denied', 'grok_family_builder_recusal');
+    return closed(assessment, 'judge_denied', 'grok_family_builder_recusal', {
+      permitEventDigest: permitReceipt.event_digest,
+    });
+  }
+
+  // Grok second-opinion judge gate: fail closed. Any hold disposition (explicit
+  // hold, invalid output, timeout, non-zero exit, judge error) OR a thrown judge
+  // stops the merge before reserveEffect -- no reservation, no adapter call. Only
+  // an explicit approve falls through to the reservation chain unchanged.
+  const judgeEvidence = buildGrokJudgeEvidence(evidence);
+  let disposition: GrokDispositionReceipt;
+  try {
+    disposition = deps.judgeSecondOpinion
+      ? await deps.judgeSecondOpinion(judgeEvidence)
+      : await judgeWithGrok(judgeEvidence);
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : 'judge_threw';
+    await recordAction(deps, record, 'judge_denied', `judge_threw:${reason}`);
+    return closed(assessment, 'judge_denied', `judge_threw:${reason}`, {
+      permitEventDigest: permitReceipt.event_digest,
+    });
+  }
+  if (disposition.disposition !== 'approve') {
+    await recordAction(deps, record, 'judge_denied', `judge_hold:${disposition.reason}`);
+    return closed(assessment, 'judge_denied', `judge_hold:${disposition.reason}`, {
       permitEventDigest: permitReceipt.event_digest,
     });
   }
