@@ -1805,6 +1805,44 @@ nodes:
 
       The target repo is where the PR must be opened (NOT the worktree's git origin - Rule 29).
 
+      ## Spec-Declared Base Branch Override (M-73 interim unblock)
+      BEFORE consulting the hardcoded staging-gate list further below, check whether
+      the spec explicitly declares a base branch. Look for any of these patterns (in
+      priority order), mirroring the target_repo extraction above:
+      1. `Base branch: <branch-name>` (plain header)
+      2. `**Base branch:** \`<branch-name>\`` (Markdown bold)
+      3. `base_branch: <branch-name>` (YAML field)
+
+      If NONE of those patterns is present in the spec, do NOT emit
+      base_branch_override; skip this whole subsection and continue with the normal
+      repo resolution and staging-gate logic below (existing behavior is preserved
+      exactly for the no-override case).
+
+      If a Base branch line IS present, you MUST verify the named branch exists on
+      the target repo's remote before honoring it. Use the SAME git ls-remote
+      mechanism this workflow already uses for branch verification, parameterized
+      to the target repo (the override branch may live on a repo other than this
+      worktree's origin -- Rule 29):
+        Run: git ls-remote https://github.com/<owner>/<repo>.git "refs/heads/<branch-name>"
+      where <owner>/<repo> is the target repo determined by this Required Repo Policy
+      (from the target_repo patterns above, or from the git remote origin fallback
+      described below when no target_repo pattern is present). If that command prints
+      a matching ref line (non-empty output), the branch exists.
+
+      - If the branch EXISTS, output (and do NOT consult the staging-gate list):
+        push_target: feature-branch:<spec-derived-branch-name>
+        pr_required: true
+        staging_gate_required: false
+        base_branch_override: <the declared branch>
+        repo: <owner>/<repo>
+
+      - If the branch does NOT exist (git ls-remote output empty), FAIL CLOSED --
+        do NOT fall through to the staging-gate list or to the repo default (main).
+        Output, reusing the existing out_of_scope mechanism:
+        out_of_scope: true
+        reason: declared Base branch <branch-name> does not exist on <owner>/<repo>
+        repo: <owner>/<repo>
+
       If none of those patterns are present in the spec, determine the repo from the git
       remote origin URL of the current working directory:
         Run: git remote get-url origin
@@ -2170,7 +2208,14 @@ nodes:
       # WO-HARNESS-PUSH-CORRECTNESS-HARDENING-01 (closes Rule 20 bypass hole 2026-05-18).
       STAGING_GATE=$(printf '%s\n' "$DECIDE_OUTPUT" | grep -c '^staging_gate_required: true' 2>/dev/null || true)
       STAGING_GATE="${STAGING_GATE:-0}"
-      if [ "$STAGING_GATE" -ge 1 ] 2>/dev/null; then
+      # WO-HARNESS-CAULDRON-SPEC-BASE-BRANCH-OVERRIDE-01 (M-73 interim unblock):
+      # a spec-declared Base branch override, verified to exist by decide-push-target,
+      # takes priority over the staging_gate_required-derived base. This is how the
+      # M-41 CE serial chain targets release/ce instead of the (nonexistent) staging.
+      OVERRIDE_BRANCH=$(printf '%s\n' "$DECIDE_OUTPUT" | sed -n 's/^base_branch_override: //p' | head -n 1)
+      if [ -n "$OVERRIDE_BRANCH" ]; then
+        BASE_BRANCH="$OVERRIDE_BRANCH"
+      elif [ "$STAGING_GATE" -ge 1 ] 2>/dev/null; then
         BASE_BRANCH="staging"
       else
         BASE_BRANCH=""
@@ -2184,6 +2229,15 @@ nodes:
         echo "## Summary"
         echo "$PLAN_OUTPUT"
         echo
+        # WO-HARNESS-CAULDRON-SPEC-BASE-BRANCH-OVERRIDE-01 (M-73): when a spec-declared
+        # Base branch override is in effect, make it visible in the PR/manifest body.
+        if [ -n "$OVERRIDE_BRANCH" ]; then
+          echo "## Base branch override"
+          echo "This PR targets base branch \`${OVERRIDE_BRANCH}\` via a spec-declared"
+          echo "\`Base branch:\` override (Motion M-73 interim unblock), not the repo default"
+          echo "or the staging gate."
+          echo
+        fi
         echo "## Validation"
         echo "Workflow-time verify-* nodes were removed 2026-05-16 (Patch 1) - agent self-verifies in implement loop;"
         echo "real validation gates run at PR time (codex-review + claude-review + Gitleaks + e2e-smoke + Captain CI)."
