@@ -66,6 +66,7 @@ import { WorkflowEventBridge } from './adapters/web/workflow-bridge';
 import { registerApiRoutes, stopProviderWaitScheduler } from './routes/api';
 import { observeStartupRecovery, reconcilePendingRunsAtBoot } from './startup-reconciliation';
 import { startOverseerRuntime, stopOverseerRuntime } from './overseer-runtime';
+import { createMergeCoordinatorRuntimeDeps } from '@archon/overseer';
 import {
   handleMessage,
   pool,
@@ -91,6 +92,10 @@ let cachedLog: ReturnType<typeof createLogger> | undefined;
 function getLog(): ReturnType<typeof createLogger> {
   if (!cachedLog) cachedLog = createLogger('server');
   return cachedLog;
+}
+
+function envEnabled(value: string | undefined): boolean {
+  return value === '1' || value === 'true' || value === 'yes';
 }
 
 /**
@@ -229,7 +234,13 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     process.exit(1);
   }
 
-  startOverseerRuntime();
+  const mergeCoordinatorEnabled = envEnabled(process.env.OVERSEER_MERGE_COORDINATOR_ENABLED);
+  const mergeCoordinatorOptions = mergeCoordinatorEnabled
+    ? await createMergeCoordinatorRuntimeDeps()
+    : undefined;
+  startOverseerRuntime(
+    mergeCoordinatorOptions ? { serviceOptions: mergeCoordinatorOptions } : undefined
+  );
 
   const config = await loadConfig();
   logConfig(config);

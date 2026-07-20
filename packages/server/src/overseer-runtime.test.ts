@@ -26,6 +26,7 @@ const oldEmergencyStop = process.env.OVERSEER_EMERGENCY_STOP;
 const oldFakeAdapter = process.env.OVERSEER_USE_FAKE_GITHUB_ADAPTER;
 const oldGhToken = process.env.GH_TOKEN;
 const oldGithubToken = process.env.GITHUB_TOKEN;
+const oldMergeCoordinatorEnabled = process.env.OVERSEER_MERGE_COORDINATOR_ENABLED;
 
 function setDisabledEnv(): void {
   process.env.OVERSEER_ENABLED = 'false';
@@ -74,6 +75,11 @@ describe('overseer-runtime', () => {
     else delete process.env.GH_TOKEN;
     if (oldGithubToken !== undefined) process.env.GITHUB_TOKEN = oldGithubToken;
     else delete process.env.GITHUB_TOKEN;
+    if (oldMergeCoordinatorEnabled !== undefined) {
+      process.env.OVERSEER_MERGE_COORDINATOR_ENABLED = oldMergeCoordinatorEnabled;
+    } else {
+      delete process.env.OVERSEER_MERGE_COORDINATOR_ENABLED;
+    }
   });
 
   test('disabled service starts no watcher and makes no db reads', () => {
@@ -87,6 +93,7 @@ describe('overseer-runtime', () => {
     startOverseerRuntime({ runService: runOverseerServiceMock });
     const status = await getStatus();
     expect(status.watcher).toBe('stopped');
+    expect(status.coordinator).toBe('absent');
   });
 
   test('second start call while running is a no-op -- one watcher only', async () => {
@@ -259,6 +266,7 @@ describe('overseer-runtime', () => {
     expect(runOverseerServiceMock).not.toHaveBeenCalled();
     expect(status.adapter).toBe('real');
     expect(status.watcher).toBe('degraded');
+    expect(status.coordinator).toBe('absent');
   });
 
   test('real adapter starts only when a qualified coordinator composition is injected', async () => {
@@ -280,7 +288,24 @@ describe('overseer-runtime', () => {
     });
     expect(runOverseerServiceMock).toHaveBeenCalledTimes(1);
     expect(capturedServiceOptions?.adapterKind).toBe('real');
+    const status = await getStatus();
+    expect(status.coordinator).toBe('present');
     await stopOverseerRuntime();
+  });
+
+  test('real adapter still degrades without coordinator when new flag is off', async () => {
+    process.env.OVERSEER_ENABLED = 'true';
+    process.env.OVERSEER_USE_FAKE_GITHUB_ADAPTER = 'false';
+    process.env.GITHUB_TOKEN = 'poison-token';
+    delete process.env.OVERSEER_MERGE_COORDINATOR_ENABLED;
+
+    startOverseerRuntime({ runService: runOverseerServiceMock });
+    const status = await getStatus();
+
+    expect(runOverseerServiceMock).not.toHaveBeenCalled();
+    expect(status.adapter).toBe('real');
+    expect(status.watcher).toBe('degraded');
+    expect(status.coordinator).toBe('absent');
   });
 
   test('fake adapterKind is forwarded to runOverseerService -- no live Octokit wired', async () => {
