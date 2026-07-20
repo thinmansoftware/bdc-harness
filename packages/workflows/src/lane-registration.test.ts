@@ -66,13 +66,15 @@ function loadLane(filename: string): LaneDef {
 }
 
 describe('lane registration and war-council-validator pin', () => {
-  it('S4: enumerates exactly the eight governed feature lanes', () => {
+  it('S4: enumerates exactly the 10 governed feature lanes', () => {
     expect(LANE_FILES).toEqual([
       'bdc-feature-development-codex-only.yaml',
       'bdc-feature-development-codex.yaml',
       'bdc-feature-development-fable.yaml',
+      'bdc-feature-development-fusion-cx-kimi.yaml',
       'bdc-feature-development-fusion-cx-qwen.yaml',
       'bdc-feature-development-grok.yaml',
+      'bdc-feature-development-kimi-k3.yaml',
       'bdc-feature-development-zero-open.yaml',
       'bdc-feature-development-zero.yaml',
       'bdc-feature-development.yaml',
@@ -109,7 +111,11 @@ describe('lane registration and war-council-validator pin', () => {
         return;
       }
 
-      if (file === 'bdc-feature-development-fusion-cx-qwen.yaml') {
+      if (
+        file === 'bdc-feature-development-fusion-cx-qwen.yaml' ||
+        file === 'bdc-feature-development-fusion-cx-kimi.yaml' ||
+        file === 'bdc-feature-development-kimi-k3.yaml'
+      ) {
         // DeepSeek judge through the repository-capable OpenRouter tool loop.
         expect(wcv.provider).toBe('codex-opr');
         return;
