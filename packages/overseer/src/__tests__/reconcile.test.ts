@@ -183,6 +183,19 @@ describe('reconcile', () => {
     expect(deps.actions).toEqual([]);
   });
 
+  test('non-auth non-rate-limit search error still rejects', async () => {
+    const deps = fakeDeps({
+      searchError: Object.assign(new Error('network timeout'), { code: 'ETIMEDOUT' }),
+    });
+
+    await expect(runReconcileOnce({ deps })).rejects.toThrow('network timeout');
+    expect(deps.warnings).toEqual([]);
+    expect(deps.findTrackerIssueByStem).not.toHaveBeenCalled();
+    expect(deps.comments).toEqual([]);
+    expect(deps.closes).toEqual([]);
+    expect(deps.actions).toEqual([]);
+  });
+
   test('tracker already closed no-ops with no duplicate comment', async () => {
     const deps = fakeDeps({ tracker: trackerIssue('closed') });
 
