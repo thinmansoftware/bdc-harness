@@ -26,6 +26,11 @@ import {
   type RepairRefireExecutionClaimDeps,
   type RepairRefireIdempotencyState,
 } from './actions/repair-refire';
+import type {
+  AcquireRecoveryExecutionClaimResult,
+  ClaimMutationResult,
+  PreEffectResult,
+} from '@archon/core/db/execution-claims';
 import {
   executeRefreshRebase,
   type ExecuteRefreshRebaseDepsV1,
@@ -365,7 +370,7 @@ function fakeRepairClaimDeps(
   callLog: ReturnType<typeof createCallLog>
 ): RepairRefireExecutionClaimDeps {
   return {
-    async acquire(input) {
+    async acquire(input): Promise<AcquireRecoveryExecutionClaimResult> {
       callLog.push('repair:claim_acquire');
       return {
         ok: true,
@@ -401,7 +406,7 @@ function fakeRepairClaimDeps(
         },
       };
     },
-    async validate(input) {
+    async validate(input): Promise<PreEffectResult> {
       callLog.push('repair:claim_validate');
       return {
         ok: true,
@@ -412,11 +417,11 @@ function fakeRepairClaimDeps(
         motion_revision_sha: '0'.repeat(40),
       };
     },
-    async complete() {
+    async complete(): Promise<ClaimMutationResult> {
       callLog.push('repair:claim_complete');
       return { ok: true, claim: null as never };
     },
-    async release() {
+    async release(): Promise<ClaimMutationResult> {
       callLog.push('repair:claim_release');
       return { ok: true, claim: null as never };
     },
