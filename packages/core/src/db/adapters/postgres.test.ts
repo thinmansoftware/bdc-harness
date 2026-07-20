@@ -209,6 +209,37 @@ describe('PostgresAdapter', () => {
     });
   });
 
+  describe('Recovery execution claims schema', () => {
+    test('numbered migration, combined schema, and SQLite bootstrap define claim tables', () => {
+      const migration = readFileSync(
+        resolve(import.meta.dir, '../../../../../migrations', '038_recovery_execution_claims.sql'),
+        'utf8'
+      );
+      const combined = readFileSync(
+        resolve(import.meta.dir, '../../../../../migrations', '000_combined.sql'),
+        'utf8'
+      );
+      const sqlite = readFileSync(resolve(import.meta.dir, 'sqlite.ts'), 'utf8');
+
+      for (const schema of [migration, combined, sqlite]) {
+        expect(schema).toContain('CREATE TABLE IF NOT EXISTS remote_agent_recovery_execution_claims');
+        expect(schema).toContain(
+          'CREATE TABLE IF NOT EXISTS remote_agent_recovery_execution_claim_events'
+        );
+        expect(schema).toContain('idx_recovery_execution_claims_active');
+        expect(schema).toContain('idx_recovery_execution_claim_events_claim');
+        expect(schema).toContain('trg_recovery_execution_claim_events_no_update');
+        expect(schema).toContain('trg_recovery_execution_claim_events_no_delete');
+        expect(schema).toContain('recovery_execution_claims_identity_unique');
+        expect(schema).toContain('recovery_execution_claim_events_sequence_unique');
+        expect(schema).toContain("actor_kind IN ('overseer', 'conductor', 'manual')");
+        expect(schema).toContain("status IN ('active', 'released', 'completed')");
+        expect(schema).toContain('execution_fencing_token');
+        expect(schema).toContain('effect_attempt_state');
+      }
+    });
+  });
+
   // -------------------------------------------------------------------------
   // Static properties
   // -------------------------------------------------------------------------
