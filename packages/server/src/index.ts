@@ -49,6 +49,11 @@ if (
 
 import { registerBuiltinProviders, registerCommunityProviders } from '@archon/providers';
 import { loadAgentRegistry } from '@archon/workflows/agents/registry';
+import {
+  createMergeCoordinatorComposition,
+  isMergeCoordinatorEnabledFromEnv,
+} from '@archon/overseer';
+import type { OverseerServiceOptions } from '@archon/overseer/service';
 
 // Bootstrap provider registry before any provider lookups
 registerBuiltinProviders();
@@ -148,6 +153,35 @@ export interface ServerOptions {
   skipPlatformAdapters?: boolean;
 }
 
+function buildMergeCoordinatorServiceOptions():
+  | Pick<OverseerServiceOptions, 'deps' | 'mergeCoordinator'>
+  | undefined {
+  if (!isMergeCoordinatorEnabledFromEnv()) return undefined;
+
+  const githubToken = process.env.GH_TOKEN ?? process.env.GITHUB_TOKEN ?? '';
+  const xaiApiKey = process.env.XAI_API_KEY ?? '';
+  if (!githubToken || !xaiApiKey) {
+    getLog().warn(
+      {
+        flag: 'OVERSEER_MERGE_COORDINATOR_ENABLED',
+        missing: [
+          ...(!githubToken ? ['GH_TOKEN_OR_GITHUB_TOKEN'] : []),
+          ...(!xaiApiKey ? ['XAI_API_KEY'] : []),
+        ],
+      },
+      'overseer_merge_coordinator.composition_skipped_missing_inputs'
+    );
+    return undefined;
+  }
+
+  const composition = createMergeCoordinatorComposition({ githubToken, xaiApiKey });
+  getLog().info('overseer_merge_coordinator.composed_default_off_capability_enabled');
+  return {
+    deps: composition.deps,
+    mergeCoordinator: composition.mergeCoordinator,
+  };
+}
+
 export async function startServer(opts: ServerOptions = {}): Promise<void> {
   getLog().info('server_starting');
 
@@ -229,7 +263,11 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     process.exit(1);
   }
 
-  startOverseerRuntime();
+  const mergeCoordinatorServiceOptions = buildMergeCoordinatorServiceOptions();
+
+  startOverseerRuntime(
+    mergeCoordinatorServiceOptions ? { serviceOptions: mergeCoordinatorServiceOptions } : undefined
+  );
 
   const config = await loadConfig();
   logConfig(config);

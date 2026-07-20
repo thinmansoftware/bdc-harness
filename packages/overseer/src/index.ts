@@ -52,8 +52,16 @@ export type {
 
 export { watchLoop, watchOnce, DEFAULT_WATCH_INTERVAL_MS } from './watch';
 export { judgePullRequest, isPrGreen, isPrMergeReady } from './judge-pr';
-export { judgeWithGrok } from './judge-second-opinion';
 export { assembleQualifiedMergeEvidence, coordinateMergeReady } from './merge-coordinator';
+export {
+  createMergeCoordinatorComposition,
+  isMergeCoordinatorEnabledFromEnv,
+} from './merge-coordinator-composition';
+export type {
+  MergeCoordinatorComposition,
+  MergeCoordinatorCompositionOptions,
+} from './merge-coordinator-composition';
+export { createXaiGrokJudge, parseXaiGrokVerdict } from './adapters/grok-xai-judge';
 export { createGitHubQualifiedMergeAdapter } from './adapters/github-qualified-merge';
 export { runOverseerService } from './service';
 

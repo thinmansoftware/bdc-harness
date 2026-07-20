@@ -10,6 +10,7 @@ type OverseerWatcherState = 'stopped' | 'running' | 'degraded';
 interface OverseerRuntimeStatus {
   readonly watcher: OverseerWatcherState;
   readonly adapter: OverseerAdapterKind;
+  readonly merge_coordinator_composed: boolean;
   readonly emergency_stop: boolean;
   readonly capability_flags: Readonly<Record<string, boolean>>;
   readonly circuit_states: Readonly<Record<string, string>>;
@@ -34,6 +35,7 @@ let watcherTask: Promise<void> | null = null;
 let watcherAbort: AbortController | null = null;
 let watcherState: OverseerWatcherState = 'stopped';
 let adapterKind: OverseerAdapterKind = 'none';
+let mergeCoordinatorComposed = false;
 
 function readCapabilityFlag(name: string): boolean {
   const v = process.env[`OVERSEER_${name}_ACTIONS_ENABLED`];
@@ -67,6 +69,8 @@ export function startOverseerRuntime(deps: OverseerRuntimeDeps = {}): void {
     log.info('overseer_runtime.start_skipped_already_running');
     return;
   }
+
+  mergeCoordinatorComposed = deps.serviceOptions?.mergeCoordinator !== undefined;
 
   const enabled =
     process.env.OVERSEER_ENABLED === '1' ||
@@ -179,6 +183,7 @@ export async function getOverseerRuntimeStatus(
   return {
     watcher: watcherState,
     adapter: adapterKind,
+    merge_coordinator_composed: mergeCoordinatorComposed,
     emergency_stop: readEmergencyStop(),
     capability_flags: capabilityFlags,
     circuit_states: circuitStates,

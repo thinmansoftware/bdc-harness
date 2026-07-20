@@ -87,6 +87,7 @@ describe('overseer-runtime', () => {
     startOverseerRuntime({ runService: runOverseerServiceMock });
     const status = await getStatus();
     expect(status.watcher).toBe('stopped');
+    expect(status.merge_coordinator_composed).toBe(false);
   });
 
   test('second start call while running is a no-op -- one watcher only', async () => {
@@ -259,6 +260,7 @@ describe('overseer-runtime', () => {
     expect(runOverseerServiceMock).not.toHaveBeenCalled();
     expect(status.adapter).toBe('real');
     expect(status.watcher).toBe('degraded');
+    expect(status.merge_coordinator_composed).toBe(false);
   });
 
   test('real adapter starts only when a qualified coordinator composition is injected', async () => {
@@ -280,6 +282,8 @@ describe('overseer-runtime', () => {
     });
     expect(runOverseerServiceMock).toHaveBeenCalledTimes(1);
     expect(capturedServiceOptions?.adapterKind).toBe('real');
+    const status = await getStatus();
+    expect(status.merge_coordinator_composed).toBe(true);
     await stopOverseerRuntime();
   });
 
