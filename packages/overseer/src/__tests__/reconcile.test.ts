@@ -168,6 +168,21 @@ describe('reconcile', () => {
     expect(deps.actions).toEqual([]);
   });
 
+  test('401 auth-error response skips cycle with warn log and does not throw', async () => {
+    const deps = fakeDeps({
+      searchError: Object.assign(new Error('Bad credentials'), { status: 401 }),
+    });
+
+    const result = await runReconcileOnce({ deps });
+
+    expect(result).toEqual({ scanned: 0, closed: 0, skipped: true });
+    expect(deps.warnings).toEqual(['overseer.reconcile.auth_error_skip']);
+    expect(deps.findTrackerIssueByStem).not.toHaveBeenCalled();
+    expect(deps.comments).toEqual([]);
+    expect(deps.closes).toEqual([]);
+    expect(deps.actions).toEqual([]);
+  });
+
   test('tracker already closed no-ops with no duplicate comment', async () => {
     const deps = fakeDeps({ tracker: trackerIssue('closed') });
 

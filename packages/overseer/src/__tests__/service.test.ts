@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, mock, test } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test';
 import { mkdtempSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
@@ -21,6 +21,8 @@ const ENV_KEYS = [
   'OVERSEER_BRANCH_ACTIONS_ENABLED',
   'OVERSEER_LIFECYCLE_ACTIONS_ENABLED',
   'OVERSEER_MERGE_ACTIONS_ENABLED',
+  'GITHUB_TOKEN',
+  'GH_TOKEN',
 ] as const;
 const oldEnv = new Map(ENV_KEYS.map(key => [key, process.env[key]]));
 
@@ -179,6 +181,11 @@ function enableFakeCapability(capability: 'merge' | 'escalation'): void {
 }
 
 describe('service', () => {
+  beforeEach(() => {
+    process.env.GITHUB_TOKEN = '';
+    process.env.GH_TOKEN = '';
+  });
+
   afterEach(async () => {
     await closeDatabase();
     resetDatabase();
