@@ -1089,6 +1089,29 @@ describe('executeQualifiedMerge -- Grok judge gate', () => {
     expect(judgeIdx).toBeLessThan(reserveIdx);
   });
 
+  // Scenario 1 variant: when PR evidence omits filesChangedCount, the judge
+  // evidence must fall back to the mandatory changed_files count -- never a
+  // false "0 files changed" scope. Anchors the digest input too.
+  test('judge evidence falls back to changed_files.length when filesChangedCount is absent', async () => {
+    const h = harness();
+    const changed = ['packages/app/src/a.ts', 'packages/app/src/b.ts', 'packages/app/src/c.ts'];
+    const result = await executeQualifiedMerge(
+      validEvidence({
+        changed_files: changed,
+        record: record({ prEvidence: prEvidence({ filesChangedCount: undefined }) }),
+      }),
+      h.deps
+    );
+
+    expect(result.action).toBe('merged');
+    expect(h.judgeCalls).toHaveLength(1);
+    const judged = h.judgeCalls[0];
+    // Fallback uses the mandatory changed_files count, not 0.
+    expect(judged?.filesChangedCount).toBe(changed.length);
+    expect(judged?.filesChangedCount).not.toBe(0);
+    expect(judged?.evidenceDigest).toMatch(/^[0-9a-f]{64}$/);
+  });
+
   // Scenario 2: judge hold (any reason) -> reserveEffect never called, denied.
   test('judge hold denies before reservation and records the hold reason', async () => {
     const h = harness({

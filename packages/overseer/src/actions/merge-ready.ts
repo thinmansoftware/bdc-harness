@@ -530,7 +530,7 @@ function isAllowedAuthorization(
 function buildGrokJudgeEvidence(evidence: QualifiedMergeEvidence): GrokJudgeEvidence {
   const pr = evidence.record.prEvidence;
   const checksSummary = pr.checks;
-  const filesChangedCount = pr.filesChangedCount ?? 0;
+  const filesChangedCount = pr.filesChangedCount ?? evidence.changed_files.length;
   const diffStat = pr.diffStat ?? '';
   const evidenceDigest = createHash('sha256')
     .update(
