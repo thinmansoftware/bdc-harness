@@ -182,8 +182,11 @@ const ADVERSARIAL_EVIDENCE_CONTRACTS: Readonly<
       'repair:prepare',
       'repair:authorize',
       'repair:reserve',
+      'repair:claim',
+      'repair:fence',
       'repair:adapter',
       'repair:outcome:effect_failed',
+      'repair:claim_complete',
       'repair:idempotency_commit',
       'repair:record',
     ],
@@ -480,7 +483,12 @@ export async function runIntegratedSuccessChain(deps: ScenarioDeps): Promise<Suc
       if (!joins.includes('repair:prepare') || !joins.includes('repair:authorize')) {
         throw new Error(`success_chain_missing_gate_order:repair:${joins}`);
       }
-      if (!joins.includes('repair:reserve') || !joins.includes('repair:adapter')) {
+      if (
+        !joins.includes('repair:reserve') ||
+        !joins.includes('repair:claim') ||
+        !joins.includes('repair:fence') ||
+        !joins.includes('repair:adapter')
+      ) {
         throw new Error(`success_chain_missing_adapter_order:repair:${joins}`);
       }
     }

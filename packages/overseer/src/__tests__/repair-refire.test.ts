@@ -121,6 +121,10 @@ interface Harness {
     runCascade: ReturnType<typeof mock>;
     openRepairCircuit: ReturnType<typeof mock>;
     recordDisposition: ReturnType<typeof mock>;
+    acquireExecutionClaim: ReturnType<typeof mock>;
+    validateExecutionFence: ReturnType<typeof mock>;
+    completeExecutionClaim: ReturnType<typeof mock>;
+    releaseExecutionClaim: ReturnType<typeof mock>;
     beginIdem: ReturnType<typeof mock>;
     commitIdem: ReturnType<typeof mock>;
   };
@@ -192,6 +196,37 @@ function makeHarness(
 
   const openRepairCircuit = mock(async () => undefined);
   const recordDisposition = mock(async () => undefined);
+  const acquireExecutionClaim = mock(async () => {
+    orderLog.push('claim');
+    return {
+      ok: true as const,
+      claim: {
+        claim_id: 'claim-1',
+        actor_id: 'overseer',
+        actor_kind: 'overseer' as const,
+        execution_fencing_token: 1,
+      },
+    };
+  });
+  const validateExecutionFence = mock(async () => {
+    orderLog.push('fence');
+    return {
+      ok: true as const,
+      fence: {
+        claim_id: 'claim-1',
+        effect_attempt_id: 'effect-claim-1',
+        execution_fencing_token: 1,
+      },
+    };
+  });
+  const completeExecutionClaim = mock(async () => {
+    orderLog.push('claim_complete');
+    return { ok: true };
+  });
+  const releaseExecutionClaim = mock(async () => {
+    orderLog.push('claim_release');
+    return { ok: true };
+  });
 
   const beginIdem = mock(
     async (key: string, digest: string): Promise<RepairRefireIdempotencyState> => {
@@ -213,6 +248,12 @@ function makeHarness(
   const deps: RepairRefireExecutionDeps = {
     gate: { preparePermit, authorizeAction, reserveEffect, appendOutcome },
     adapter,
+    claim: {
+      acquireExecutionClaim,
+      validateExecutionFence,
+      completeExecutionClaim,
+      releaseExecutionClaim,
+    },
     idempotency: { begin: beginIdem, commit: commitIdem },
     circuit: { openRepairCircuit },
     recorder: { recordDisposition },
@@ -234,6 +275,10 @@ function makeHarness(
       runCascade,
       openRepairCircuit,
       recordDisposition,
+      acquireExecutionClaim,
+      validateExecutionFence,
+      completeExecutionClaim,
+      releaseExecutionClaim,
       beginIdem,
       commitIdem,
     },
@@ -295,11 +340,21 @@ describe('executeRepairRefire ordering', () => {
     );
 
     expect(result.outcome).toBe('succeeded');
-    expect(harness.orderLog).toEqual(['prepare', 'authorize', 'reserve', 'adapter']);
+    expect(harness.orderLog).toEqual([
+      'prepare',
+      'authorize',
+      'reserve',
+      'claim',
+      'fence',
+      'adapter',
+      'claim_complete',
+    ]);
     const order = harness.orderLog;
     expect(order.indexOf('prepare')).toBeLessThan(order.indexOf('authorize'));
     expect(order.indexOf('authorize')).toBeLessThan(order.indexOf('reserve'));
-    expect(order.indexOf('reserve')).toBeLessThan(order.indexOf('adapter'));
+    expect(order.indexOf('reserve')).toBeLessThan(order.indexOf('claim'));
+    expect(order.indexOf('claim')).toBeLessThan(order.indexOf('fence'));
+    expect(order.indexOf('fence')).toBeLessThan(order.indexOf('adapter'));
   });
 });
 

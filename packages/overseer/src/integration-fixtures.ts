@@ -465,6 +465,39 @@ export function makeRepairHarness(
       woClass: 'CODE',
       tags: ['overseer-integration'],
     }),
+    claim: {
+      async acquireExecutionClaim() {
+        callLog.push('repair:claim');
+        return {
+          ok: true,
+          claim: {
+            claim_id: 'repair-claim-1',
+            actor_id: 'overseer-integration',
+            actor_kind: 'overseer',
+            execution_fencing_token: 1,
+          },
+        };
+      },
+      async validateExecutionFence() {
+        callLog.push('repair:fence');
+        return {
+          ok: true,
+          fence: {
+            claim_id: 'repair-claim-1',
+            effect_attempt_id: 'repair-effect-claim-1',
+            execution_fencing_token: 1,
+          },
+        };
+      },
+      async completeExecutionClaim() {
+        callLog.push('repair:claim_complete');
+        return { ok: true };
+      },
+      async releaseExecutionClaim() {
+        callLog.push('repair:claim_release');
+        return { ok: true };
+      },
+    },
     idempotency: {
       async begin(key, digest): Promise<RepairRefireIdempotencyState> {
         callLog.push('repair:idempotency_begin');

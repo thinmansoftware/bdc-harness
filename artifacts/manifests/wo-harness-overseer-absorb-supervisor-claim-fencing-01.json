@@ -1,0 +1,98 @@
+{
+  "wo": "WO-HARNESS-OVERSEER-ABSORB-SUPERVISOR-CLAIM-FENCING-01",
+  "builder": "Major Build",
+  "files_modified": [
+    "packages/core/package.json",
+    "packages/core/src/db/adapters/sqlite.ts",
+    "packages/overseer/src/__tests__/repair-refire.test.ts",
+    "packages/overseer/src/actions/repair-refire.ts",
+    "packages/overseer/src/integration-fixtures.ts",
+    "packages/overseer/src/integration-scenarios.ts"
+  ],
+  "files_created": [
+    "artifacts/manifests/wo-harness-overseer-absorb-supervisor-claim-fencing-01.json",
+    "migrations/038_recovery_execution_claims.sql",
+    "packages/core/src/db/recovery-execution-claims.test.ts",
+    "packages/core/src/db/recovery-execution-claims.ts",
+    "packages/overseer/src/__tests__/no-third-claim-implementation.test.ts",
+    "packages/overseer/src/__tests__/repair-refire-claim-fencing.test.ts",
+    "packages/overseer/src/adapters/repair-refire-claim.ts"
+  ],
+  "files_deleted": [
+    "packages/workflows/src/reliability/supervisor.ts",
+    "packages/workflows/src/reliability/supervisor.test.ts"
+  ],
+  "already_absent": [
+    "packages/web/src/components/dashboard/RecoveryStatusBadge.tsx"
+  ],
+  "decisions": {
+    "claim_ledger_schema": "extended with additive recovery-execution-claims ledger; production-deploy execution-claims.ts was not generalized because it is bound to production_deploy, production, XO lease, and canonical board-motion authority",
+    "conductor_seam": "deferred to follow-up WO-HARNESS-CONDUCTOR-CLAIM-FENCING-SEAM-01 because smart-cauldron has no clean in-repo DB seam and would require new server routes plus HTTP integration",
+    "supervisor_persistence_cleanup": "deferred to follow-up WO-HARNESS-SUPERVISOR-PERSISTENCE-CLEANUP-01; optional IWorkflowStore/store-adapter/db functions and migrations 026/027 are dependencies of the deleted module, not exports of it",
+    "activation_state": "claim fencing is reachable-from-refire-path but the capability flag remains off"
+  },
+  "decision_log_note": "Overseer absorbed M-26 supervisor's claim-before-act mechanism by reusing the PR #445 execution-claim ledger's fencing and expiry-takeover algorithm shape in an additive recovery-scoped ledger. The standalone supervisor module and its test are superseded and removed; RecoveryStatusBadge.tsx was already absent; git history preserves the original.",
+  "grep_assertions": {
+    "stop_1": {
+      "command": "grep -c \"ExecutionClaim\\|acquireExecutionClaim\\|validateExecutionFence\" packages/overseer/src/actions/repair-refire.ts",
+      "output": "18"
+    },
+    "stop_2": {
+      "command": "test -f packages/workflows/src/reliability/supervisor.ts && echo STILL_EXISTS || echo DELETED",
+      "output": "DELETED"
+    },
+    "stop_3": {
+      "command": "test -f packages/web/src/components/dashboard/RecoveryStatusBadge.tsx && echo STILL_EXISTS || echo DELETED",
+      "output": "DELETED"
+    },
+    "stop_4": {
+      "command": "grep -rn \"coordinateSupervisorRecovery\\|RecoveryStatusBadge\" packages/ --include=\"*.ts\" --include=\"*.tsx\"",
+      "output": ""
+    }
+  },
+  "tests": [
+    {
+      "command": "cd packages/overseer && bun test src/__tests__/repair-refire.test.ts src/__tests__/repair-refire-claim-fencing.test.ts src/__tests__/no-third-claim-implementation.test.ts",
+      "result": "PASS",
+      "passed": 28,
+      "failed": 0
+    },
+    {
+      "command": "bun test packages/core/src/db/recovery-execution-claims.test.ts",
+      "result": "PASS",
+      "passed": 3,
+      "failed": 0
+    },
+    {
+      "command": "cd packages/overseer && bun run test",
+      "result": "BLOCKED_BY_ENV",
+      "details": "46 tests passed before src/watch.test.ts failed to resolve @archon/workflows/schemas/workflow-run; root node_modules is absent."
+    },
+    {
+      "command": "cd packages/core && bun run test",
+      "result": "BLOCKED_BY_ENV",
+      "details": "Failed before first test because @archon/workflows/test-utils could not resolve; root node_modules is absent."
+    },
+    {
+      "command": "cd packages/workflows && bun run test",
+      "result": "BLOCKED_BY_ENV",
+      "details": "28 tests passed before src/bdc-onramp-structural-gate.test.ts failed to resolve @archon/providers; root node_modules is absent."
+    },
+    {
+      "command": "cd packages/web && bun run test",
+      "result": "BLOCKED_BY_ENV",
+      "details": "143 tests passed before dependency-resolution failures including missing @dagrejs/dagre; root node_modules is absent."
+    }
+  ],
+  "runtime_verification": "N/A for live behavior; repair/refire capability remains default-off.",
+  "vercel_deployment": "N/A",
+  "prs": [
+    "https://github.com/bluedevilcollectibles/bdc-harness/pull/550"
+  ],
+  "merge_ancestors": {
+    "bluedevilcollectibles/bdc-harness_dev_head": "48612999e105ef9f239153827b0fccc497e70820",
+    "manifest_commit": "66e1d42cba99ab98b75255deb9f59365907f83bb",
+    "behind_by": 0
+  },
+  "validation": "PASS"
+}
