@@ -82,6 +82,58 @@ echo "CMD=$CMD"
 `;
 
 // ---------------------------------------------------------------------------
+// Snippet 4: base_branch_override validation/precedence + PR body text from
+// open-pr-if-needed. Mirrors the deterministic bash guard added around
+// bdc-feature-development.yaml lines 2208-2236. REPO_REMOTE_URL is a test-only
+// injection so the branch-existence check can run against a local bare remote.
+// ---------------------------------------------------------------------------
+const BASE_BRANCH_OVERRIDE_SELECTION_AND_BODY = `
+set -euo pipefail
+REPO="\${REPO:-bluedevilcollectibles/bdc-xo}"
+REMOTE_URL="\${REPO_REMOTE_URL:-https://github.com/\${REPO}.git}"
+STAGING_GATE=$(printf '%s\\n' "$DECIDE_OUTPUT" | grep -c '^staging_gate_required: true' 2>/dev/null || true)
+BASE_BRANCH_OVERRIDE=$(printf '%s\\n' "$DECIDE_OUTPUT" | sed -n 's/^base_branch_override: //p' | head -n 1 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+STAGING_GATE="\${STAGING_GATE:-0}"
+if [ -n "$BASE_BRANCH_OVERRIDE" ]; then
+  case "$BASE_BRANCH_OVERRIDE" in
+    unknown|UNKNOWN|"<"*">"*|*"e.g."*|*" "*|*$'\\t'*|*$'\\r'*|*$'\\n'*)
+      echo "ERROR: decide-push-target emitted an invalid 'base_branch_override: <branch>' value: \${BASE_BRANCH_OVERRIDE}" >&2
+      exit 1
+      ;;
+  esac
+  if ! git check-ref-format --branch "$BASE_BRANCH_OVERRIDE" >/dev/null 2>&1; then
+    echo "ERROR: decide-push-target emitted an invalid base branch override ref name: \${BASE_BRANCH_OVERRIDE}" >&2
+    exit 1
+  fi
+  if ! git ls-remote --exit-code "$REMOTE_URL" "refs/heads/\${BASE_BRANCH_OVERRIDE}" >/dev/null 2>&1; then
+    echo "ERROR: base branch override '\${BASE_BRANCH_OVERRIDE}' does not exist on \${REPO}; refusing to open PR against an unverified base." >&2
+    exit 1
+  fi
+  BASE_BRANCH="$BASE_BRANCH_OVERRIDE"
+elif [ "$STAGING_GATE" -ge 1 ] 2>/dev/null; then
+  BASE_BRANCH="staging"
+else
+  BASE_BRANCH=""
+fi
+BODY_FILE=$(mktemp)
+{
+  echo "## Summary"
+  echo "$PLAN_OUTPUT"
+  echo
+  if [ -n "$BASE_BRANCH_OVERRIDE" ]; then
+    echo "## Base branch override"
+    echo "Base branch override applied: PR targets \\\`$BASE_BRANCH_OVERRIDE\\\` per spec-declared \\\`Base branch:\\\` field (not the default staging gate)."
+    echo
+  fi
+  echo "## Implement output"
+  echo "$IMPLEMENT_OUTPUT"
+} > "$BODY_FILE"
+echo "BASE_BRANCH=$BASE_BRANCH"
+echo "CMD=gh pr create --repo $REPO --title T --body-file BF --head $UNIQUE_BRANCH \${BASE_BRANCH:+--base "$BASE_BRANCH"}"
+cat "$BODY_FILE"
+`;
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 function bash(
@@ -260,6 +312,109 @@ describe('F-8C: staging-gate base-branch selection for gh pr create', () => {
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toMatch(/^BASE_BRANCH=\s*$/m);
     expect(result.stdout).not.toContain('--base');
+  });
+});
+
+describe('Base branch override: deterministic open-pr-if-needed handling', () => {
+  it('honors an existing override branch over staging-gate selection and documents it in the PR body', () => {
+    git(['checkout', '-b', 'release/ce'], worktreeDir);
+    git(['push', 'origin', 'release/ce'], worktreeDir);
+
+    const decideOutput = [
+      'push_target: feature-branch:feat/wo-foo-01',
+      'pr_required: true',
+      'staging_gate_required: true',
+      'base_branch_override: release/ce',
+      'repo: bluedevilcollectibles/bdc-xo',
+    ].join('\n');
+
+    const result = bash(BASE_BRANCH_OVERRIDE_SELECTION_AND_BODY, worktreeDir, {
+      DECIDE_OUTPUT: decideOutput,
+      IMPLEMENT_OUTPUT: 'implemented',
+      PLAN_OUTPUT: 'Commit message: feat: work',
+      REPO_REMOTE_URL: originDir,
+      UNIQUE_BRANCH: 'feat/wo-foo-01-thread-abc',
+    });
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain('BASE_BRANCH=release/ce');
+    expect(result.stdout).toContain('--base release/ce');
+    expect(result.stdout).toContain('## Base branch override');
+    expect(result.stdout).toContain(
+      'Base branch override applied: PR targets `release/ce` per spec-declared `Base branch:` field'
+    );
+    expect(result.stdout).not.toContain('BASE_BRANCH=staging');
+  });
+
+  it('fails closed when the override branch is missing on the resolved repo remote', () => {
+    const decideOutput = [
+      'push_target: feature-branch:feat/wo-foo-01',
+      'pr_required: true',
+      'staging_gate_required: false',
+      'base_branch_override: release/missing',
+      'repo: bluedevilcollectibles/bdc-xo',
+    ].join('\n');
+
+    const result = bash(BASE_BRANCH_OVERRIDE_SELECTION_AND_BODY, worktreeDir, {
+      DECIDE_OUTPUT: decideOutput,
+      IMPLEMENT_OUTPUT: 'implemented',
+      PLAN_OUTPUT: 'Commit message: feat: work',
+      REPO_REMOTE_URL: originDir,
+      UNIQUE_BRANCH: 'feat/wo-foo-01-thread-abc',
+    });
+
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain(
+      "ERROR: base branch override 'release/missing' does not exist on bluedevilcollectibles/bdc-xo"
+    );
+    expect(result.stdout).not.toContain('CMD=gh pr create');
+  });
+
+  it('fails before remote lookup when the model emits the illustrative placeholder text', () => {
+    const illustrativePlaceholder = `<the declared override branch, ${'e.g.'} release/ce>`;
+    const decideOutput = [
+      'push_target: feature-branch:feat/wo-foo-01',
+      'pr_required: true',
+      'staging_gate_required: false',
+      `base_branch_override: ${illustrativePlaceholder}`,
+      'repo: bluedevilcollectibles/bdc-xo',
+    ].join('\n');
+
+    const result = bash(BASE_BRANCH_OVERRIDE_SELECTION_AND_BODY, worktreeDir, {
+      DECIDE_OUTPUT: decideOutput,
+      IMPLEMENT_OUTPUT: 'implemented',
+      PLAN_OUTPUT: 'Commit message: feat: work',
+      REPO_REMOTE_URL: originDir,
+      UNIQUE_BRANCH: 'feat/wo-foo-01-thread-abc',
+    });
+
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain(
+      "ERROR: decide-push-target emitted an invalid 'base_branch_override: <branch>' value"
+    );
+    expect(result.stdout).not.toContain('CMD=gh pr create');
+  });
+
+  it('leaves the no-override staging-gate path unchanged and omits the override body section', () => {
+    const decideOutput = [
+      'push_target: feature-branch:feat/wo-foo-01',
+      'pr_required: true',
+      'staging_gate_required: true',
+      'repo: bluedevilcollectibles/shopops',
+    ].join('\n');
+
+    const result = bash(BASE_BRANCH_OVERRIDE_SELECTION_AND_BODY, worktreeDir, {
+      DECIDE_OUTPUT: decideOutput,
+      IMPLEMENT_OUTPUT: 'implemented',
+      PLAN_OUTPUT: 'Commit message: feat: work',
+      REPO_REMOTE_URL: originDir,
+      UNIQUE_BRANCH: 'feat/wo-foo-01-thread-abc',
+    });
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain('BASE_BRANCH=staging');
+    expect(result.stdout).toContain('--base staging');
+    expect(result.stdout).not.toContain('## Base branch override');
   });
 });
 

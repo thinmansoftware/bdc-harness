@@ -1803,6 +1803,43 @@ nodes:
       3. `Target repo: <owner>/<repo>` (plain header)
       4. `**Target Repo:** \`<owner>/<repo>\`` (Markdown bold, capital R)
 
+      ## Base Branch Override
+      Before consulting the hardcoded staging-gate list below, check whether the spec
+      declares an explicit PR base branch override. Look for any of these patterns
+      (in priority order):
+      1. `Base branch: <branch-name>` (plain header, canonical form)
+      2. `**Base branch:** \`<branch-name>\`` (Markdown bold)
+      3. `base_branch: <branch-name>` (YAML field)
+
+      If a Base branch override is declared, first finish resolving the target repo
+      using the Required Repo Policy above, including the origin fallback below when
+      needed. Then verify that the named branch exists on the resolved target repo's
+      remote, not the worktree's origin. Use the same git ls-remote mechanism used
+      elsewhere in this workflow, pointed at the explicit repo URL:
+        git ls-remote https://github.com/<owner>/<repo>.git refs/heads/<branch-name>
+
+      If the branch exists, output exactly:
+      push_target: feature-branch:<spec-derived-branch-name>
+      pr_required: true
+      staging_gate_required: false
+      base_branch_override: <declared-override-branch>
+      repo: <owner>/<repo>
+
+      In this success case, stop there and do not continue into the staging-gate
+      list. The push_target branch is the WO feature branch derived by the Branch
+      Name Derivation Rules above; base_branch_override is the PR target/base branch
+      declared by the spec. These are distinct values and must not be conflated.
+
+      If the spec declares a Base branch override but the named branch does not
+      exist on the target repo's remote, fail closed and output exactly:
+      out_of_scope: true
+      reason: Base branch override '<branch-name>' declared in spec does not exist on <owner>/<repo>
+      repo: <owner>/<repo>
+
+      Do not fall through to the staging-gate list or to main when a declared
+      override branch is missing. If no `Base branch:` line is present, fall through
+      to the staging-gate list below unchanged.
+
       The target repo is where the PR must be opened (NOT the worktree's git origin - Rule 29).
 
       If none of those patterns are present in the spec, determine the repo from the git
@@ -2169,8 +2206,25 @@ nodes:
       # and lets gh use the repo default).
       # WO-HARNESS-PUSH-CORRECTNESS-HARDENING-01 (closes Rule 20 bypass hole 2026-05-18).
       STAGING_GATE=$(printf '%s\n' "$DECIDE_OUTPUT" | grep -c '^staging_gate_required: true' 2>/dev/null || true)
+      BASE_BRANCH_OVERRIDE=$(printf '%s\n' "$DECIDE_OUTPUT" | sed -n 's/^base_branch_override: //p' | head -n 1 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
       STAGING_GATE="${STAGING_GATE:-0}"
-      if [ "$STAGING_GATE" -ge 1 ] 2>/dev/null; then
+      if [ -n "$BASE_BRANCH_OVERRIDE" ]; then
+        case "$BASE_BRANCH_OVERRIDE" in
+          unknown|UNKNOWN|"<"*">"*|*"e.g."*|*" "*|*$'\t'*|*$'\r'*|*$'\n'*)
+            echo "ERROR: decide-push-target emitted an invalid 'base_branch_override: <branch>' value: ${BASE_BRANCH_OVERRIDE}" >&2
+            exit 1
+            ;;
+        esac
+        if ! git check-ref-format --branch "$BASE_BRANCH_OVERRIDE" >/dev/null 2>&1; then
+          echo "ERROR: decide-push-target emitted an invalid base branch override ref name: ${BASE_BRANCH_OVERRIDE}" >&2
+          exit 1
+        fi
+        if ! git ls-remote --exit-code "https://github.com/${REPO}.git" "refs/heads/${BASE_BRANCH_OVERRIDE}" >/dev/null 2>&1; then
+          echo "ERROR: base branch override '${BASE_BRANCH_OVERRIDE}' does not exist on ${REPO}; refusing to open PR against an unverified base." >&2
+          exit 1
+        fi
+        BASE_BRANCH="$BASE_BRANCH_OVERRIDE"
+      elif [ "$STAGING_GATE" -ge 1 ] 2>/dev/null; then
         BASE_BRANCH="staging"
       else
         BASE_BRANCH=""
@@ -2189,6 +2243,11 @@ nodes:
         echo "real validation gates run at PR time (codex-review + claude-review + Gitleaks + e2e-smoke + Captain CI)."
         echo "See implement output below for what the builder verified locally."
         echo
+        if [ -n "$BASE_BRANCH_OVERRIDE" ]; then
+          echo "## Base branch override"
+          echo "Base branch override applied: PR targets \`$BASE_BRANCH_OVERRIDE\` per spec-declared \`Base branch:\` field (not the default staging gate)."
+          echo
+        fi
         echo "## Implement output"
         echo "$IMPLEMENT_OUTPUT"
         echo
