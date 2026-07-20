@@ -11,6 +11,8 @@ import type { M31ActionPermit, M31ActionProposal } from '../m31-substrate.ts';
 const ENV_KEYS = [
   'ARCHON_HOME',
   'DATABASE_URL',
+  'GITHUB_TOKEN',
+  'GH_TOKEN',
   'OVERSEER_ENABLED',
   'OVERSEER_EMERGENCY_STOP',
   'OVERSEER_DRY_RUN',
