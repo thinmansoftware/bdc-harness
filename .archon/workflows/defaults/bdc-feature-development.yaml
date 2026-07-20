@@ -2259,9 +2259,38 @@ nodes:
       # re-check after each create attempt so a non-zero-exit-but-created PR is
       # caught instead of triggering a spurious failure.
       PR_OK=false
+      # WO-HARNESS-CAULDRON-SPEC-BASE-BRANCH-OVERRIDE-01 (M-73) base-integrity guard:
+      # an existing/racing open PR for this head must actually target the required
+      # BASE_BRANCH. Codex finding (2026): the existing-PR fast path accepted ANY open
+      # PR without checking baseRefName, so with base_branch_override: release/ce a
+      # pre-existing PR against main/staging would be treated as success (Rule 20 base
+      # drift). Enforce it: when BASE_BRANCH is set (staging gate OR spec override), a
+      # mismatched existing PR is retargeted via `gh pr edit --base` (self-heals a race
+      # where a parallel worktree opened against the wrong base); if the base cannot be
+      # read or retargeted, fail closed (load_bearing node -- never silently accept).
+      ensure_pr_base() {
+        pr_url="$1"
+        if [ -z "$BASE_BRANCH" ]; then
+          return 0
+        fi
+        cur_base=$(gh pr view "$pr_url" --json baseRefName --jq '.baseRefName // empty' 2>/dev/null || true)
+        if [ -z "$cur_base" ]; then
+          echo "ERROR: could not read baseRefName for existing PR $pr_url -- cannot confirm it targets '$BASE_BRANCH'; aborting (fail closed)." >&2
+          exit 1
+        fi
+        if [ "$cur_base" != "$BASE_BRANCH" ]; then
+          echo "WARN: existing PR $pr_url targets base '$cur_base' but required base is '$BASE_BRANCH'; retargeting..." >&2
+          if ! gh pr edit "$pr_url" --base "$BASE_BRANCH" 2>&1; then
+            echo "ERROR: failed to retarget existing PR $pr_url from '$cur_base' to '$BASE_BRANCH' -- aborting (load_bearing, fail closed)." >&2
+            exit 1
+          fi
+          echo "Retargeted PR $pr_url base -> '$BASE_BRANCH'."
+        fi
+      }
       EXIST=$(gh pr list --repo "$REPO" --head "$UNIQUE_BRANCH" --state open \
         --json url --jq '.[0].url // empty' 2>/dev/null || true)
       if [ -n "$EXIST" ]; then
+        ensure_pr_base "$EXIST"
         echo "PR_URL=$EXIST"
         echo "PR already exists (no create needed)."
         PR_OK=true
@@ -2275,6 +2304,7 @@ nodes:
           EXIST=$(gh pr list --repo "$REPO" --head "$UNIQUE_BRANCH" --state open \
             --json url --jq '.[0].url // empty' 2>/dev/null || true)
           if [ -n "$EXIST" ]; then
+            ensure_pr_base "$EXIST"
             echo "PR_URL=$EXIST"
             echo "PR created despite non-zero exit (gh CLI quirk; PR confirmed via list)."
             PR_OK=true
