@@ -1822,7 +1822,7 @@ nodes:
       push_target: feature-branch:<spec-derived-branch-name>
       pr_required: true
       staging_gate_required: false
-      base_branch_override: <the declared override branch, e.g. release/ce>
+      base_branch_override: <declared-override-branch>
       repo: <owner>/<repo>
 
       In this success case, stop there and do not continue into the staging-gate
@@ -2206,9 +2206,23 @@ nodes:
       # and lets gh use the repo default).
       # WO-HARNESS-PUSH-CORRECTNESS-HARDENING-01 (closes Rule 20 bypass hole 2026-05-18).
       STAGING_GATE=$(printf '%s\n' "$DECIDE_OUTPUT" | grep -c '^staging_gate_required: true' 2>/dev/null || true)
-      BASE_BRANCH_OVERRIDE=$(printf '%s\n' "$DECIDE_OUTPUT" | sed -n 's/^base_branch_override: //p' | head -n 1)
+      BASE_BRANCH_OVERRIDE=$(printf '%s\n' "$DECIDE_OUTPUT" | sed -n 's/^base_branch_override: //p' | head -n 1 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
       STAGING_GATE="${STAGING_GATE:-0}"
       if [ -n "$BASE_BRANCH_OVERRIDE" ]; then
+        case "$BASE_BRANCH_OVERRIDE" in
+          unknown|UNKNOWN|"<"*">"*|*"e.g."*|*" "*|*$'\t'*|*$'\r'*|*$'\n'*)
+            echo "ERROR: decide-push-target emitted an invalid 'base_branch_override: <branch>' value: ${BASE_BRANCH_OVERRIDE}" >&2
+            exit 1
+            ;;
+        esac
+        if ! git check-ref-format --branch "$BASE_BRANCH_OVERRIDE" >/dev/null 2>&1; then
+          echo "ERROR: decide-push-target emitted an invalid base branch override ref name: ${BASE_BRANCH_OVERRIDE}" >&2
+          exit 1
+        fi
+        if ! git ls-remote --exit-code "https://github.com/${REPO}.git" "refs/heads/${BASE_BRANCH_OVERRIDE}" >/dev/null 2>&1; then
+          echo "ERROR: base branch override '${BASE_BRANCH_OVERRIDE}' does not exist on ${REPO}; refusing to open PR against an unverified base." >&2
+          exit 1
+        fi
         BASE_BRANCH="$BASE_BRANCH_OVERRIDE"
       elif [ "$STAGING_GATE" -ge 1 ] 2>/dev/null; then
         BASE_BRANCH="staging"
