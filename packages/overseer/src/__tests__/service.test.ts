@@ -5,8 +5,9 @@ import { join } from 'path';
 import { closeDatabase, getDatabase, resetDatabase } from '@archon/core/db/connection';
 import { listOverseerCapabilityEvents } from '@archon/core/db/overseer-capabilities';
 import { listOperatorCards } from '@archon/core/db/overseer-briefing';
-import { runOperatorCardDeliveryScheduler, runOverseerService } from '../service.ts';
+import { handleRecord, runOperatorCardDeliveryScheduler, runOverseerService } from '../service.ts';
 import type { M31ActionPermit, M31ActionProposal } from '../m31-substrate.ts';
+import type { GitHubClientDeps, OverseerActionsDeps, WatchedRunRecord } from '../types.ts';
 
 const ENV_KEYS = [
   'ARCHON_HOME',
@@ -826,5 +827,124 @@ describe('service', () => {
     const drainsAfterReject = drains;
     await new Promise<void>(resolve => setTimeout(resolve, 10));
     expect(drains).toBe(drainsAfterReject);
+  });
+});
+
+// WO-HARNESS-OVERSEER-SLICE8-LIVE-WIRING-01: the Slice 4-7 dispatch branches in
+// handleRecord. assessRun cannot classify a run to these actions today (no
+// salvage/worktree/lifecycle evidence on the watch path), so the branches are
+// exercised with a pre-classified record -- the reachable path a follow-on
+// per-capability evidence-assembly WO will produce. Each branch copies
+// merge_ready's gate-check-then-dispatch-or-deny shape.
+describe('service slice8 dispatch', () => {
+  const SLICE8_CASES = [
+    {
+      action: 'repair_refire',
+      coordKey: 'repairRefire',
+      deniedResult: 'repair_refire_executor_missing',
+    },
+    {
+      action: 'refresh_rebase',
+      coordKey: 'refreshRebase',
+      deniedResult: 'refresh_rebase_executor_missing',
+    },
+    { action: 'lifecycle', coordKey: 'lifecycle', deniedResult: 'lifecycle_executor_missing' },
+  ] as const;
+
+  function slice8Record(action: WatchedRunRecord['action']): WatchedRunRecord {
+    return {
+      runId: `run-${action}`,
+      woId: `WO-${action.toUpperCase()}-01`,
+      repo: 'bdc-harness',
+      owner: 'bluedevilcollectibles',
+      status: 'failed',
+      action,
+      reason: `${action}:test`,
+      prEvidence: {
+        exists: false,
+        state: 'missing',
+        checks: { total: 0, passed: 0, failed: 0, pending: 0 },
+        mergeable: null,
+      },
+    };
+  }
+
+  function actionDeps(
+    actions: Array<{ action: string; result: string; class: string }>
+  ): OverseerActionsDeps & GitHubClientDeps {
+    return {
+      insertOverseerAction: async action => {
+        actions.push({ action: action.action, result: action.result, class: action.class });
+      },
+      findPullRequest: async () => {
+        throw new Error('findPullRequest must not run on the slice8 dispatch path');
+      },
+      mergePullRequest: async () => {
+        throw new Error('mergePullRequest must not run on the slice8 dispatch path');
+      },
+    };
+  }
+
+  for (const testCase of SLICE8_CASES) {
+    test(`${testCase.action} without a coordinator records an executor_missing denial`, async () => {
+      const actions: Array<{ action: string; result: string; class: string }> = [];
+      await handleRecord(slice8Record(testCase.action), actionDeps(actions), false, 'test');
+      expect(actions).toEqual([
+        {
+          action: `${testCase.action}_denied`,
+          result: testCase.deniedResult,
+          class: 'tail_node_false_fail',
+        },
+      ]);
+    });
+
+    test(`${testCase.action} with a coordinator dispatches and records no denial`, async () => {
+      const actions: Array<{ action: string; result: string; class: string }> = [];
+      const coordinator = mock(async () => undefined);
+      await handleRecord(
+        slice8Record(testCase.action),
+        actionDeps(actions),
+        false,
+        'test',
+        undefined,
+        {
+          [testCase.coordKey]: coordinator,
+        }
+      );
+      expect(coordinator).toHaveBeenCalledTimes(1);
+      expect(actions).toEqual([]);
+    });
+
+    test(`${testCase.action} is gated by dryRun -- no dispatch, no denial`, async () => {
+      const actions: Array<{ action: string; result: string; class: string }> = [];
+      const coordinator = mock(async () => undefined);
+      await handleRecord(
+        slice8Record(testCase.action),
+        actionDeps(actions),
+        true,
+        'test',
+        undefined,
+        {
+          [testCase.coordKey]: coordinator,
+        }
+      );
+      expect(coordinator).not.toHaveBeenCalled();
+      expect(actions).toEqual([]);
+    });
+  }
+
+  test('an unclassified escalate record is unaffected by the slice8 branches', async () => {
+    // Regression guard: a record that does not match any slice8 action must not be
+    // swallowed by the new branches (it proceeds to the existing escalation path,
+    // which for a record with no decision/errorClass logs decision_skipped).
+    const actions: Array<{ action: string; result: string; class: string }> = [];
+    const coordinator = mock(async () => undefined);
+    await handleRecord(slice8Record('escalate'), actionDeps(actions), false, 'test', undefined, {
+      repairRefire: coordinator,
+      refreshRebase: coordinator,
+      lifecycle: coordinator,
+    });
+    expect(coordinator).not.toHaveBeenCalled();
+    expect(actions).toEqual([]);
   });
 });

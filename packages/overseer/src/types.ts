@@ -96,7 +96,17 @@ export interface WatchedRunRecord {
   headBranch?: string;
   metadata?: Record<string, unknown>;
   errorClass?: ErrorClass | 'tail_node_false_fail';
-  action: 'success' | 'merge_ready' | 'escalate' | 'ignore';
+  // 'repair_refire' | 'refresh_rebase' | 'lifecycle' added by
+  // WO-HARNESS-OVERSEER-SLICE8-LIVE-WIRING-01: dispatch targets for the shipped
+  // M-42 Slice 4-7 assessors once a per-capability executor/coordinator is wired.
+  action:
+    | 'success'
+    | 'merge_ready'
+    | 'repair_refire'
+    | 'refresh_rebase'
+    | 'lifecycle'
+    | 'escalate'
+    | 'ignore';
   reason: string;
   prEvidence: PullRequestEvidence;
   decision?: DecisionResult;

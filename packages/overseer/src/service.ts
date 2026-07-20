@@ -49,12 +49,29 @@ const log = createLogger('overseer/service');
  */
 export type OverseerWiredAdapterKind = 'fake' | 'real' | 'none';
 export type MergeReadyCoordinator = (record: WatchedRunRecord) => Promise<unknown>;
+// WO-HARNESS-OVERSEER-SLICE8-LIVE-WIRING-01: per-capability dispatch coordinators
+// for the shipped M-42 Slice 4-7 assessors. All default to undefined -- no
+// coordinator is composed in overseer-runtime today, so every new dispatch branch
+// denies with a clear *_executor_missing reason (mirroring merge_ready).
+export type RepairRefireCoordinator = (record: WatchedRunRecord) => Promise<unknown>;
+export type BranchRefreshCoordinator = (record: WatchedRunRecord) => Promise<unknown>;
+export type LifecycleCoordinator = (record: WatchedRunRecord) => Promise<unknown>;
+
+/** Optional Slice 4-7 executor/coordinator dependencies (default-off when absent). */
+export interface Slice8Coordinators {
+  repairRefire?: RepairRefireCoordinator;
+  refreshRebase?: BranchRefreshCoordinator;
+  lifecycle?: LifecycleCoordinator;
+}
 
 export interface OverseerServiceOptions {
   once?: boolean;
   enabled?: boolean;
   dryRun?: boolean;
   mergeCoordinator?: MergeReadyCoordinator;
+  repairRefireCoordinator?: RepairRefireCoordinator;
+  branchRefreshCoordinator?: BranchRefreshCoordinator;
+  lifecycleCoordinator?: LifecycleCoordinator;
   intervalMs?: number;
   signal?: AbortSignal;
   /**
@@ -131,12 +148,46 @@ function envEnabled(value: string | undefined): boolean {
   return value === '1' || value === 'true' || value === 'yes';
 }
 
-async function handleRecord(
+/** Dispatch a Slice 4-7 action to its coordinator, or deny when none is wired. */
+async function dispatchSlice8OrDeny(
+  record: WatchedRunRecord,
+  deps: OverseerActionsDeps,
+  coordinator:
+    | RepairRefireCoordinator
+    | BranchRefreshCoordinator
+    | LifecycleCoordinator
+    | undefined,
+  deniedResult: string,
+  logEvent: string
+): Promise<void> {
+  if (!coordinator) {
+    await deps.insertOverseerAction({
+      runId: record.runId,
+      woId: record.woId,
+      class: record.errorClass ?? 'tail_node_false_fail',
+      action: `${record.action}_denied`,
+      result: deniedResult,
+    });
+    log.info(
+      { runId: record.runId, woId: record.woId, action: `${record.action}_denied` },
+      logEvent
+    );
+    return;
+  }
+  await coordinator(record);
+}
+
+// Exported for unit tests: the Slice 4-7 dispatch branches
+// (WO-HARNESS-OVERSEER-SLICE8-LIVE-WIRING-01) are only reachable with a
+// pre-classified record (assessRun cannot classify to them today -- no evidence
+// on the watch path), so they are exercised by constructing the record directly.
+export async function handleRecord(
   record: WatchedRunRecord,
   deps: OverseerActionsDeps & GitHubClientDeps,
   dryRun: boolean,
   actor: string,
-  mergeCoordinator?: MergeReadyCoordinator
+  mergeCoordinator?: MergeReadyCoordinator,
+  slice8Coordinators?: Slice8Coordinators
 ): Promise<void> {
   if (record.action === 'success' || record.action === 'ignore') {
     log.info(
@@ -152,13 +203,22 @@ async function handleRecord(
     return;
   }
 
-  // Dry-run gates MUTATION only (merge_ready is the sole mutating path today).
+  // Dry-run gates MUTATION dispatch only. merge_ready is joined here by the
+  // Slice 4-7 dispatch actions (repair_refire/refresh_rebase/lifecycle) added by
+  // WO-HARNESS-OVERSEER-SLICE8-LIVE-WIRING-01 -- all four route to a mutating
+  // coordinator when one is wired, so all four must respect dry-run.
   // Escalation is notification/audit, never a repo or production mutation --
   // it must run regardless of dry-run, or the operator is never told Overseer
   // is stuck. Root-caused 2026-07-18: prior code gated escalation here too,
   // which is why zero escalation.json receipts were ever written in production
   // despite Overseer correctly classifying and deciding to escalate every time.
-  if (dryRun && record.action === 'merge_ready') {
+  if (
+    dryRun &&
+    (record.action === 'merge_ready' ||
+      record.action === 'repair_refire' ||
+      record.action === 'refresh_rebase' ||
+      record.action === 'lifecycle')
+  ) {
     log.info(
       {
         runId: record.runId,
@@ -189,6 +249,41 @@ async function handleRecord(
       return;
     }
     await mergeCoordinator(record);
+    return;
+  }
+
+  // WO-HARNESS-OVERSEER-SLICE8-LIVE-WIRING-01: Slice 4-7 dispatch branches, each
+  // copying merge_ready's gate-check-then-dispatch-or-deny shape. No coordinator
+  // is composed in overseer-runtime today, so each denies with a clear
+  // *_executor_missing reason and never mutates.
+  if (record.action === 'repair_refire') {
+    await dispatchSlice8OrDeny(
+      record,
+      deps,
+      slice8Coordinators?.repairRefire,
+      'repair_refire_executor_missing',
+      'overseer.repair_refire_executor_missing'
+    );
+    return;
+  }
+  if (record.action === 'refresh_rebase') {
+    await dispatchSlice8OrDeny(
+      record,
+      deps,
+      slice8Coordinators?.refreshRebase,
+      'refresh_rebase_executor_missing',
+      'overseer.refresh_rebase_executor_missing'
+    );
+    return;
+  }
+  if (record.action === 'lifecycle') {
+    await dispatchSlice8OrDeny(
+      record,
+      deps,
+      slice8Coordinators?.lifecycle,
+      'lifecycle_executor_missing',
+      'overseer.lifecycle_executor_missing'
+    );
     return;
   }
 
@@ -284,9 +379,22 @@ export async function runOverseerService(options: OverseerServiceOptions = {}): 
   };
   options.signal?.addEventListener('abort', abortFromParent, { once: true });
   if (options.signal?.aborted) coupledAbort.abort();
+  const slice8Coordinators: Slice8Coordinators = {
+    repairRefire: options.repairRefireCoordinator,
+    refreshRebase: options.branchRefreshCoordinator,
+    lifecycle: options.lifecycleCoordinator,
+  };
   const watcher = watchLoop(
     deps,
-    record => handleRecord(record, deps, dryRun, 'overseer-service', options.mergeCoordinator),
+    record =>
+      handleRecord(
+        record,
+        deps,
+        dryRun,
+        'overseer-service',
+        options.mergeCoordinator,
+        slice8Coordinators
+      ),
     {
       intervalMs: options.intervalMs,
       once: options.once,

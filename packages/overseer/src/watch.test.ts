@@ -1,4 +1,4 @@
-import { describe, expect, test } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { selectFailureEvent, watchOnce } from './watch.ts';
 import type {
   GitHubClientDeps,
@@ -274,5 +274,62 @@ describe('watch selectFailureEvent', () => {
 
     expect(mergeReadyRecord.action).toBe('merge_ready');
     expect(mergeReadyRecord.errorClass).toBe('tail_node_false_fail');
+  });
+});
+
+// WO-HARNESS-OVERSEER-SLICE8-LIVE-WIRING-01: the shipped M-42 Slice 4-7 assessors
+// are now consulted on the live watch path before escalation. Because assessRun
+// carries no salvage/worktree/lifecycle evidence, every assessor short-circuits to
+// an inert disposition, so a genuinely-unclassifiable failed run still escalates
+// whether the per-capability gate flags are on or off (honest default-off; the
+// modules are reachable, not active). The dispatchable classify->dispatch path is
+// exercised at the handleRecord level in __tests__/service.test.ts.
+describe('watch slice8 wiring', () => {
+  const SLICE8_FLAGS = [
+    'OVERSEER_REPAIR_ACTIONS_ENABLED',
+    'OVERSEER_BRANCH_ACTIONS_ENABLED',
+    'OVERSEER_LIFECYCLE_ACTIONS_ENABLED',
+  ] as const;
+  const savedEnv = new Map<string, string | undefined>();
+
+  beforeEach(() => {
+    for (const key of SLICE8_FLAGS) {
+      savedEnv.set(key, process.env[key]);
+      delete process.env[key];
+    }
+  });
+
+  afterEach(() => {
+    for (const key of SLICE8_FLAGS) {
+      const value = savedEnv.get(key);
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  });
+
+  const failureEvents: OverseerWorkflowEvent[] = [
+    event('event-1', 'node_failed', 'verify', '2026-07-20T10:00:00.000Z', {
+      error: 'validator rejected',
+    }),
+  ];
+
+  test('slice8_gates_off_unclassified_failure_still_escalates', async () => {
+    const [record] = await watchOnce(deps(failureEvents));
+    expect(record.action).toBe('escalate');
+  });
+
+  test('slice8_gates_on_still_escalate_because_no_evidence_on_watch_path', async () => {
+    for (const key of SLICE8_FLAGS) process.env[key] = 'true';
+    const [record] = await watchOnce(deps(failureEvents));
+    // Assessors run (gate flags read), but the watch path has no salvage/worktree/
+    // lifecycle evidence, so each returns an inert disposition and the run still
+    // escalates. Proves the wiring is reachable yet default-off.
+    expect(record.action).toBe('escalate');
+  });
+
+  test('slice8_gates_on_do_not_disturb_merge_ready_routing', async () => {
+    for (const key of SLICE8_FLAGS) process.env[key] = 'true';
+    const [record] = await watchOnce(deps([], mergeReadyPrEvidence));
+    expect(record.action).toBe('merge_ready');
   });
 });
