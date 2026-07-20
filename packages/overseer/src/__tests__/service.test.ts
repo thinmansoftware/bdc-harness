@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, mock, test } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test';
 import { mkdtempSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
@@ -179,6 +179,11 @@ function enableFakeCapability(capability: 'merge' | 'escalation'): void {
 }
 
 describe('service', () => {
+  beforeEach(() => {
+    process.env.GITHUB_TOKEN = '';
+    process.env.GH_TOKEN = '';
+  });
+
   afterEach(async () => {
     await closeDatabase();
     resetDatabase();

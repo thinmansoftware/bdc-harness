@@ -128,6 +128,10 @@ export async function runReconcileOnce(input: RunReconcileInput = {}): Promise<R
       logger.warn({ err: error as Error, rateLimit: true }, 'overseer.reconcile.rate_limit_skip');
       return { scanned: 0, closed: 0, skipped: true };
     }
+    if (isAuthError(error)) {
+      logger.warn({ err: error as Error, auth: true }, 'overseer.reconcile.auth_error_skip');
+      return { scanned: 0, closed: 0, skipped: true };
+    }
     throw error;
   }
 
@@ -353,4 +357,11 @@ function isRateLimitError(error: unknown): boolean {
     if (/rate.limit|rateLimit|rate limit|secondary rate/i.test(message)) return true;
   }
   return false;
+}
+
+function isAuthError(error: unknown): boolean {
+  if (!error || typeof error !== 'object') return false;
+  const candidate = error as { status?: number };
+  if (candidate.status === 401) return true;
+  return candidate.status === 403 && !isRateLimitError(error);
 }
