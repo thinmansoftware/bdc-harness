@@ -67,11 +67,20 @@ function reasonOf(fn: () => unknown): string {
 }
 
 describe('policy-registry loader', () => {
-  test('shipped registry loads with zero entries', () => {
+  test('shipped registry loads and validates its one live entry', () => {
     const text = readFileSync(SHIPPED_PATH, 'utf8');
     const registry = loadOverseerActionPolicyRegistry({ text });
     expect(registry.schema_version).toBe('overseer-action-policy-v1');
-    expect(registry.entries).toHaveLength(0);
+    // Populated 2026-07-20 with the first real entry (bdc-harness/dev, MERGE,
+    // staging effect only) -- the registry is no longer intentionally empty.
+    // If this assertion needs to change again, verify the new entry validates
+    // (schema, digest, effect scope) rather than just bumping the count.
+    expect(registry.entries).toHaveLength(1);
+    const only = registry.entries[0];
+    expect(only?.owner).toBe('bluedevilcollectibles');
+    expect(only?.repository).toBe('bdc-harness');
+    expect(only?.resulting_deployment_effect).toBe('staging');
+    expect(only?.allowed_action_kinds).toEqual(['MERGE']);
   });
 
   test('valid synthetic registry resolves exactly one allowed tuple', () => {
