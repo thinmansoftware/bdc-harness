@@ -69,6 +69,14 @@ function octokit() {
   };
 }
 
+function octokitWithCheckConclusion(conclusion: string) {
+  const client = octokit();
+  client.checks.listForRef.mockImplementation(async () => ({
+    data: { check_runs: [{ name: 'ci', conclusion, head_sha: 'a'.repeat(40) }] },
+  }));
+  return client;
+}
+
 describe('merge coordinator composition', () => {
   test('constructs complete coordinator deps with injected fake transports', async () => {
     const judge = mock(
@@ -136,5 +144,27 @@ describe('merge coordinator composition', () => {
     expect(typeof runtime.deps.listRunsForWatch).toBe('function');
     expect(typeof runtime.deps.insertOverseerAction).toBe('function');
     expect(typeof runtime.mergeCoordinator).toBe('function');
+  });
+
+  test('summarizes pending live checks without double-counting them as failed', async () => {
+    const deps = await createRealMergeCoordinatorDeps({
+      octokit: octokitWithCheckConclusion('in_progress'),
+      readM31Proposal: async () => ({
+        proposalId: 'proposal-1',
+        present: true,
+        verifierRegistryDigest: '3'.repeat(64),
+      }),
+      compareFinalState: async () => true,
+    });
+
+    const result = await deps.assembleEvidence(record);
+
+    expect(result.evidence.record.prEvidence.checks).toEqual({
+      total: 1,
+      passed: 0,
+      failed: 0,
+      pending: 1,
+      conclusion: 'pending',
+    });
   });
 });

@@ -504,11 +504,13 @@ function prNumberFromBranchOrWo(branch?: string, woId?: string): number | null {
 }
 
 function summarizeChecks(checks: readonly RequiredCheckEvidence[]): PullRequestEvidence['checks'] {
-  const failed = checks.filter(
-    check => !['success', 'passed', 'neutral_ok'].includes(check.conclusion)
-  ).length;
   const pending = checks.filter(check =>
     ['queued', 'in_progress', 'pending'].includes(check.conclusion)
+  ).length;
+  const failed = checks.filter(
+    check =>
+      !['success', 'passed', 'neutral_ok'].includes(check.conclusion) &&
+      !['queued', 'in_progress', 'pending'].includes(check.conclusion)
   ).length;
   return {
     total: checks.length,
