@@ -20,7 +20,12 @@ import type {
   M31ExecutionReceiptEventV2,
 } from '@archon/core/db/m31-target-v2';
 import type { ActionPolicyV2AuthorizationResult } from '../action-policy-v2';
-import type { PullRequestEvidence, WatchedRunRecord } from '../types.ts';
+import type {
+  GrokDispositionReceipt,
+  GrokJudgeEvidence,
+  PullRequestEvidence,
+  WatchedRunRecord,
+} from '../types.ts';
 
 const HEAD = 'c'.repeat(40);
 const BASE = 'd'.repeat(40);
@@ -267,11 +272,30 @@ function adapterResult(
   };
 }
 
+function judgeReceipt(
+  evidence: GrokJudgeEvidence,
+  disposition: GrokDispositionReceipt['disposition'],
+  reason: GrokDispositionReceipt['reason']
+): GrokDispositionReceipt {
+  return {
+    schemaVersion: 'overseer-grok-merge-disposition-v1',
+    disposition,
+    reason,
+    woId: evidence.woId,
+    prNumber: evidence.prNumber,
+    headSha: evidence.headSha,
+    baseSha: evidence.baseSha,
+    evidenceDigest: evidence.evidenceDigest,
+    operator: evidence.operator,
+  };
+}
+
 interface Harness {
   deps: ExecuteQualifiedMergeDeps;
   calls: string[];
   adapterRequests: QualifiedMergeAdapterRequestV2[];
   outcomeCalls: Array<{ outcome: string; reason: string }>;
+  judgeCalls: GrokJudgeEvidence[];
 }
 
 function harness(
@@ -284,6 +308,7 @@ function harness(
   const calls: string[] = [];
   const adapterRequests: QualifiedMergeAdapterRequestV2[] = [];
   const outcomeCalls: Array<{ outcome: string; reason: string }> = [];
+  const judgeCalls: GrokJudgeEvidence[] = [];
   const adapterStatus = options.adapterStatus ?? 'succeeded';
 
   const defaultAdapter: QualifiedMergeAdapterV2 = {
@@ -313,6 +338,13 @@ function harness(
       calls.push('reserveEffect');
       return { ok: true as const, value: reservationReceiptEvent() };
     }),
+    // Default judge approves so pre-existing pass-through tests reach the
+    // adapter. Never falls through to the real judgeWithGrok (no live grok CLI).
+    judgeSecondOpinion: mock(async (evidence: GrokJudgeEvidence) => {
+      calls.push('judgeSecondOpinion');
+      judgeCalls.push(evidence);
+      return judgeReceipt(evidence, 'approve', 'judge_approve');
+    }),
     mergeAdapter: options.adapterImpl ?? defaultAdapter,
     recordOutcome: mock(async input => {
       calls.push('recordOutcome');
@@ -327,7 +359,7 @@ function harness(
     }),
     ...overrides,
   };
-  return { deps, calls, adapterRequests, outcomeCalls };
+  return { deps, calls, adapterRequests, outcomeCalls, judgeCalls };
 }
 
 describe('classifyMergeExclusion', () => {
@@ -1025,5 +1057,156 @@ describe('adversarial regressions -- Slice 7 repair', () => {
     expect(result.reason).toBe('expected_verifier_registry_digest_malformed');
     expect(h.deps.preparePermit).not.toHaveBeenCalled();
     expect(h.calls).not.toContain('mergeAdapter');
+  });
+});
+
+describe('executeQualifiedMerge -- Grok judge gate', () => {
+  // Scenario 1: judge approve -> reserveEffect/adapter called, merge proceeds.
+  test('judge approve reserves and merges after identity recheck', async () => {
+    const h = harness();
+    const result = await executeQualifiedMerge(validEvidence(), h.deps);
+
+    expect(result.action).toBe('merged');
+    expect(result.merged).toBe(true);
+    expect(result.adapterCalled).toBe(true);
+    expect(h.deps.judgeSecondOpinion).toHaveBeenCalledTimes(1);
+    expect(h.judgeCalls).toHaveLength(1);
+    // Evidence maps from the already-present QualifiedMergeEvidence fields.
+    const judged = h.judgeCalls[0];
+    expect(judged?.woId).toBe('WO-TEST-01');
+    expect(judged?.prNumber).toBe(42);
+    expect(judged?.headSha).toBe(HEAD);
+    expect(judged?.baseSha).toBe(BASE);
+    expect(judged?.prTitle).toBe('Add feature');
+    expect(judged?.operator.modelFamily).toBe('grok');
+    expect(judged?.evidenceDigest).toMatch(/^[0-9a-f]{64}$/);
+    // Judge runs after identity recheck (authorize) and before reservation.
+    const judgeIdx = h.calls.indexOf('judgeSecondOpinion');
+    const authorizeIdx = h.calls.indexOf('authorize');
+    const reserveIdx = h.calls.indexOf('reserveEffect');
+    expect(authorizeIdx).toBeGreaterThanOrEqual(0);
+    expect(authorizeIdx).toBeLessThan(judgeIdx);
+    expect(judgeIdx).toBeLessThan(reserveIdx);
+  });
+
+  // Scenario 2: judge hold (any reason) -> reserveEffect never called, denied.
+  test('judge hold denies before reservation and records the hold reason', async () => {
+    const h = harness({
+      judgeSecondOpinion: mock(async (evidence: GrokJudgeEvidence) => {
+        return judgeReceipt(evidence, 'hold', 'judge_hold');
+      }),
+    });
+    const result = await executeQualifiedMerge(validEvidence(), h.deps);
+
+    expect(result.action).toBe('judge_denied');
+    expect(result.merged).toBe(false);
+    expect(result.adapterCalled).toBe(false);
+    expect(result.reason).toBe('judge_hold:judge_hold');
+    expect(h.deps.reserveEffect).not.toHaveBeenCalled();
+    expect(h.calls).not.toContain('reserveEffect');
+    expect(h.calls).not.toContain('mergeAdapter');
+    expect(h.deps.recordOutcome).not.toHaveBeenCalled();
+    expect(h.deps.insertOverseerAction).toHaveBeenCalledWith(
+      expect.objectContaining({ action: 'judge_denied', result: 'judge_hold:judge_hold' })
+    );
+  });
+
+  // Scenario 2 variant: timeout-style hold reason is treated identically.
+  test('judge hold with a timeout reason also denies fail-closed', async () => {
+    const h = harness({
+      judgeSecondOpinion: mock(async (evidence: GrokJudgeEvidence) => {
+        return judgeReceipt(evidence, 'hold', 'judge_timeout');
+      }),
+    });
+    const result = await executeQualifiedMerge(validEvidence(), h.deps);
+    expect(result.action).toBe('judge_denied');
+    expect(result.reason).toBe('judge_hold:judge_timeout');
+    expect(h.deps.reserveEffect).not.toHaveBeenCalled();
+    expect(h.calls).not.toContain('mergeAdapter');
+  });
+
+  // Scenario 3: judge throws -> fail-closed, treated identically to a hold.
+  test('judge throw fails closed with no reservation or adapter call', async () => {
+    const h = harness({
+      judgeSecondOpinion: mock(async () => {
+        throw new Error('spawn_failure');
+      }),
+    });
+    const result = await executeQualifiedMerge(validEvidence(), h.deps);
+
+    expect(result.action).toBe('judge_denied');
+    expect(result.merged).toBe(false);
+    expect(result.adapterCalled).toBe(false);
+    expect(result.reason).toBe('judge_threw:spawn_failure');
+    expect(h.deps.reserveEffect).not.toHaveBeenCalled();
+    expect(h.calls).not.toContain('mergeAdapter');
+    expect(h.deps.insertOverseerAction).toHaveBeenCalledWith(
+      expect.objectContaining({ action: 'judge_denied', result: 'judge_threw:spawn_failure' })
+    );
+  });
+
+  // Scenario 4: Grok-family builder -> judge never invoked, recused/denied.
+  test('grok-family builder recuses the judge and denies before it runs', async () => {
+    const judgeSpy = mock(async () => {
+      throw new Error('judge_should_not_run');
+    });
+    const h = harness({ judgeSecondOpinion: judgeSpy });
+    const result = await executeQualifiedMerge(
+      validEvidence({
+        // Non-grok operator so assessQualifiedMerge step 6 (operator vs builder)
+        // passes and the judge gate is actually reached; the builder is grok.
+        operator: { identity: 'claude-overseer', provider: 'anthropic', model_family: 'claude' },
+        independent_review: {
+          present: true,
+          reviewed_head_sha: HEAD,
+          reviewer_identity: 'reviewer-model',
+          builder_identity: 'grok-builder',
+          reviewer_provider: 'openai',
+          builder_provider: 'xai',
+          reviewer_model_family: 'gpt',
+          builder_model_family: 'grok',
+        },
+      }),
+      h.deps
+    );
+
+    expect(result.action).toBe('judge_denied');
+    expect(result.merged).toBe(false);
+    expect(result.adapterCalled).toBe(false);
+    expect(result.reason).toBe('grok_family_builder_recusal');
+    expect(judgeSpy).not.toHaveBeenCalled();
+    expect(h.calls).not.toContain('judgeSecondOpinion');
+    expect(h.deps.reserveEffect).not.toHaveBeenCalled();
+    expect(h.calls).not.toContain('mergeAdapter');
+    expect(h.deps.insertOverseerAction).toHaveBeenCalledWith(
+      expect.objectContaining({ action: 'judge_denied', result: 'grok_family_builder_recusal' })
+    );
+  });
+
+  // Recusal keys off provider OR model_family independently.
+  test('grok-family builder detected by model_family alone still recuses', async () => {
+    const judgeSpy = mock(async () => {
+      throw new Error('judge_should_not_run');
+    });
+    const h = harness({ judgeSecondOpinion: judgeSpy });
+    const result = await executeQualifiedMerge(
+      validEvidence({
+        operator: { identity: 'claude-overseer', provider: 'anthropic', model_family: 'claude' },
+        independent_review: {
+          present: true,
+          reviewed_head_sha: HEAD,
+          reviewer_identity: 'reviewer-model',
+          builder_identity: 'grok-builder',
+          reviewer_provider: 'openai',
+          builder_provider: 'some-router',
+          reviewer_model_family: 'gpt',
+          builder_model_family: 'Grok',
+        },
+      }),
+      h.deps
+    );
+    expect(result.action).toBe('judge_denied');
+    expect(result.reason).toBe('grok_family_builder_recusal');
+    expect(judgeSpy).not.toHaveBeenCalled();
   });
 });

@@ -1227,6 +1227,23 @@ export function makeMergeHarness(
       callLog.push('merge:reserve');
       return { ok: true as const, value: reservationReceipt };
     },
+    // Injected Grok judge stub: always approves so the qualified success path
+    // reaches the adapter without a live grok CLI call (zero real calls). Assessment
+    // -level failure scenarios deny before this gate and never invoke it. Not
+    // logged so pre-existing ordered_calls assertions are unchanged.
+    async judgeSecondOpinion(judgeEvidence) {
+      return {
+        schemaVersion: 'overseer-grok-merge-disposition-v1' as const,
+        disposition: 'approve' as const,
+        reason: 'judge_approve' as const,
+        woId: judgeEvidence.woId,
+        prNumber: judgeEvidence.prNumber,
+        headSha: judgeEvidence.headSha,
+        baseSha: judgeEvidence.baseSha,
+        evidenceDigest: judgeEvidence.evidenceDigest,
+        operator: judgeEvidence.operator,
+      };
+    },
     mergeAdapter: {
       async attemptMerge() {
         callLog.push('merge:adapter');
