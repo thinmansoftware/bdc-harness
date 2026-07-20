@@ -861,7 +861,8 @@ describe('adversarial regressions -- Slice 7 repair', () => {
     const syntheticText = readFileSync(synthetic, 'utf8');
     const shippedText = readFileSync(shipped, 'utf8');
     expect(loadOverseerActionPolicyRegistry({ text: syntheticText }).entries).toHaveLength(1);
-    expect(loadOverseerActionPolicyRegistry({ text: shippedText }).entries).toHaveLength(0);
+    // Shipped registry populated 2026-07-20 with its first real entry.
+    expect(loadOverseerActionPolicyRegistry({ text: shippedText }).entries).toHaveLength(1);
   });
 
   test('adapter throw records effect_indeterminate once and never reports merged', async () => {

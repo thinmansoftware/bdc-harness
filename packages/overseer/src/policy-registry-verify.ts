@@ -24,6 +24,23 @@ import {
 const HEX64_RE = /^[0-9a-f]{64}$/;
 export type GitObjectFormat = 'sha1' | 'sha256';
 
+/**
+ * Tuple digests explicitly authorized to appear in the SHIPPED (production)
+ * policy registry. Add an entry here ONLY when a recorded Board motion (or
+ * John's direct authorization) approves that exact tuple -- this list is the
+ * enforcement point for "the registry may only contain what was authorized."
+ *
+ * - bluedevilcollectibles/bdc-harness, base dev, MERGE only, staging effect,
+ *   credential_principal "overseer-merge-manager-v1". Authorized: John,
+ *   2026-07-20 ("put it in place with merge manager"), pilot scope --
+ *   staging-effect merge authority on bdc-harness only, as the first real
+ *   Overseer merge-capability grant. See M-42 completion-evidence table,
+ *   docs/board/motions/M-20260714-42-overseer-operational-merge-steward.md.
+ */
+export const SHIPPED_POLICY_AUTHORIZED_DIGESTS: ReadonlySet<string> = new Set([
+  '34f7ba1e17c3821d46ee834564ac6b8d2f910e32349ab68b9d1a2e42e4179c93',
+]);
+
 export interface PolicyIdentityEvidence {
   readonly registry_path: string;
   readonly policy_tuple_algorithm: string;
@@ -156,8 +173,21 @@ export function verifyPolicyRegistryIdentities(
     if ('proposal_policy_tuple_digest' in evidence || 'receipt_policy_tuple_digest' in evidence) {
       reasons.push('shipped_policy_unexpected_fake_fields');
     }
-    if (recomputedDigests.length !== 0) {
-      reasons.push('shipped_policy_expected_empty');
+    // The shipped registry may only ever contain tuples explicitly authorized
+    // by a recorded Board motion (see SHIPPED_POLICY_AUTHORIZED_DIGESTS below).
+    // This is NOT "must be empty" -- it is "must exactly match what was
+    // authorized," which is empty until the first authorization lands and
+    // stays exact thereafter. Any unauthorized addition, removal, or
+    // modification fails closed here.
+    const unauthorized = recomputedDigests.filter(d => !SHIPPED_POLICY_AUTHORIZED_DIGESTS.has(d));
+    const missingAuthorized = [...SHIPPED_POLICY_AUTHORIZED_DIGESTS].filter(
+      d => !recomputedDigests.includes(d)
+    );
+    if (unauthorized.length > 0) {
+      reasons.push('shipped_policy_unauthorized_tuple');
+    }
+    if (missingAuthorized.length > 0) {
+      reasons.push('shipped_policy_missing_authorized_tuple');
     }
   }
 

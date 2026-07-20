@@ -1,4 +1,14 @@
 {
   "schema_version": "overseer-action-policy-v1",
-  "entries": []
+  "entries": [
+    {
+      "owner": "bluedevilcollectibles",
+      "repository": "bdc-harness",
+      "base_branch": "dev",
+      "resulting_deployment_effect": "staging",
+      "allowed_action_kinds": ["MERGE"],
+      "credential_principal": "overseer-merge-manager-v1",
+      "policy_digest": "34f7ba1e17c3821d46ee834564ac6b8d2f910e32349ab68b9d1a2e42e4179c93"
+    }
+  ]
 }

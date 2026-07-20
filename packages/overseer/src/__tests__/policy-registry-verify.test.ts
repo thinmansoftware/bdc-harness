@@ -86,9 +86,10 @@ describe('verifyPolicyRegistryIdentities', () => {
     expect(result.reasons).toHaveLength(0);
   });
 
-  test('shipped evidence for the empty registry is valid', () => {
+  test('shipped evidence for the live registry is valid', () => {
     const { bytes, evidence } = buildEvidence(SHIPPED_FILE, 'shipped_policy_evidence');
-    expect(evidence.policy_tuple_digests).toHaveLength(0);
+    // Populated 2026-07-20 with the first real entry -- one tuple digest now.
+    expect(evidence.policy_tuple_digests).toHaveLength(1);
     const result = verifyPolicyRegistryIdentities({
       registryBytes: bytes,
       evidence,
