@@ -130,6 +130,45 @@ describe('merge manager', () => {
     );
   });
 
+  test('default evidence assembly holds feature branches targeting production for John', async () => {
+    const productionTargetRecord: WatchedRunRecord = {
+      ...record,
+      headBranch: 'archon/thread-x',
+      metadata: {
+        base_branch: 'main',
+        head_sha: 'f'.repeat(40),
+        base_sha: '1'.repeat(40),
+        changed_files: 'packages/overseer/src/merge-manager.ts',
+      },
+    };
+    const insertOverseerAction = mock(async () => undefined);
+    const judge = mock(async input => approveReceipt(input));
+    const execute = mock(async () => ({ merged: true }));
+    const manager = createMergeManager({
+      judge,
+      execute,
+      insertOverseerAction,
+      findPullRequest: async () => productionTargetRecord.prEvidence,
+      mergePullRequest: async () => ({ merged: false }),
+    });
+
+    const result = await manager(productionTargetRecord);
+
+    expect(result).toMatchObject({
+      status: 'held',
+      reason: 'production_effect_held_for_john',
+      execution: null,
+    });
+    expect(judge).not.toHaveBeenCalled();
+    expect(execute).not.toHaveBeenCalled();
+    expect(insertOverseerAction).toHaveBeenCalledWith(
+      expect.objectContaining({
+        action: 'merge_denied',
+        result: 'production_effect_held_for_john',
+      })
+    );
+  });
+
   test('a merge candidate from another repo is not denied for registry scope', async () => {
     const otherRecord = {
       ...record,
@@ -165,13 +204,5 @@ describe('merge manager', () => {
     expect(insertOverseerAction).toHaveBeenCalledWith(
       expect.objectContaining({ action: 'merged', result: 'other_repo_merged' })
     );
-  });
-
-  test('when no manager is constructed, no manager side effects occur', () => {
-    const insertOverseerAction = mock(async () => undefined);
-    const execute = mock(async () => ({ merged: true }));
-
-    expect(insertOverseerAction).not.toHaveBeenCalled();
-    expect(execute).not.toHaveBeenCalled();
   });
 });

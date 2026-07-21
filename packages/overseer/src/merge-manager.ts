@@ -1,3 +1,4 @@
+import { createLogger } from '@archon/paths';
 import {
   assembleQualifiedMergeEvidence,
   type AssembledQualifiedMergeEvidence,
@@ -21,6 +22,7 @@ const DEFAULT_OPERATOR: MergeOperatorIdentity = {
   provider: 'overseer',
   modelFamily: 'merge-manager',
 };
+const log = createLogger('overseer/merge-manager');
 
 export interface MergeManagerDeps extends OverseerActionsDeps, GitHubClientDeps {
   readonly assembleEvidence?: (
@@ -65,7 +67,10 @@ function normalizeEffect(value: string | null | undefined): OverseerDeploymentEf
   return 'none';
 }
 
-function determineDeploymentEffect(record: WatchedRunRecord): OverseerDeploymentEffect {
+function determineDeploymentEffect(
+  record: WatchedRunRecord,
+  baseBranch: string | null
+): OverseerDeploymentEffect {
   const explicit = metadataString(record, [
     'resulting_deployment_effect',
     'resultingDeploymentEffect',
@@ -74,7 +79,7 @@ function determineDeploymentEffect(record: WatchedRunRecord): OverseerDeployment
     'environment',
   ]);
   if (explicit) return normalizeEffect(explicit);
-  const branch = record.headBranch?.toLowerCase() ?? '';
+  const branch = baseBranch?.toLowerCase() ?? '';
   if (/^(main|master|release|prod|production)(\/|-|$)/.test(branch)) return 'production';
   return 'none';
 }
@@ -105,7 +110,7 @@ async function defaultAssembleEvidence(
     readPolicy: async () => ({
       registry: { schema_version: 'overseer-action-policy-v1', entries: [] },
       credentialPrincipal: deps.operator?.identity ?? MERGE_MANAGER_IDENTITY,
-      resultingDeploymentEffect: determineDeploymentEffect(record),
+      resultingDeploymentEffect: determineDeploymentEffect(record, baseBranch),
     }),
     readPullRequest: async () => ({
       owner: pr?.owner ?? record.owner,
@@ -253,7 +258,7 @@ export function createMergeManager(
 
     if (evidence.resulting_deployment_effect === 'production') {
       await recordManagerAction(deps, record, 'merge_denied', 'production_effect_held_for_john');
-      console.warn(
+      log.warn(
         { runId: record.runId, woId: record.woId, effect: 'production' },
         'merge_manager.production_effect_held_for_john'
       );
