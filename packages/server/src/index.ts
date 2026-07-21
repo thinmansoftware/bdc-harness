@@ -66,6 +66,8 @@ import { WorkflowEventBridge } from './adapters/web/workflow-bridge';
 import { registerApiRoutes, stopProviderWaitScheduler } from './routes/api';
 import { observeStartupRecovery, reconcilePendingRunsAtBoot } from './startup-reconciliation';
 import { startOverseerRuntime, stopOverseerRuntime } from './overseer-runtime';
+import { createMergeManager } from '@archon/overseer/merge-manager';
+import { resolveDefaultDeps } from '@archon/overseer/service';
 import {
   handleMessage,
   pool,
@@ -146,6 +148,20 @@ export interface ServerOptions {
   port?: number;
   /** Run in standalone web-only mode (no Telegram/Slack/GitHub/Discord adapters). */
   skipPlatformAdapters?: boolean;
+}
+
+function envEnabled(value: string | undefined): boolean {
+  return value === '1' || value === 'true' || value === 'yes';
+}
+
+function startOverseerRuntimeWithOptionalMergeManager(): void {
+  if (!envEnabled(process.env.OVERSEER_MERGE_MANAGER_ENABLED)) {
+    startOverseerRuntime();
+    return;
+  }
+  const deps = resolveDefaultDeps();
+  const mergeManager = createMergeManager(deps);
+  startOverseerRuntime({ serviceOptions: { deps, mergeCoordinator: mergeManager } });
 }
 
 export async function startServer(opts: ServerOptions = {}): Promise<void> {
@@ -229,7 +245,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     process.exit(1);
   }
 
-  startOverseerRuntime();
+  startOverseerRuntimeWithOptionalMergeManager();
 
   const config = await loadConfig();
   logConfig(config);

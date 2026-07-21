@@ -334,7 +334,9 @@ export async function runOverseerService(options: OverseerServiceOptions = {}): 
  * When fake mode is requested: wires stub findPullRequest/mergePullRequest so no live
  * Octokit is constructed and no real GitHub network call can be made.
  */
-function resolveDefaultDeps(): OverseerRunStoreDeps & OverseerActionsDeps & GitHubClientDeps {
+export function resolveDefaultDeps(): OverseerRunStoreDeps &
+  OverseerActionsDeps &
+  GitHubClientDeps {
   const storeAndActions = {
     listRunsForWatch: listRunsForOverseerWatch,
     listRunEvents: listRunEventsForOverseer,
