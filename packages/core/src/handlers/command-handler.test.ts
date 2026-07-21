@@ -26,6 +26,13 @@ const mockCreateCodebase = mock(() => Promise.resolve(null));
 const mockGetCodebaseCommands = mock(() => Promise.resolve({}));
 const mockUpdateCodebaseCommands = mock(() => Promise.resolve());
 const mockDeleteCodebase = mock(() => Promise.resolve());
+// Anchor 2026-07-21: this was never mocked, so /status's listCodebases() call
+// silently fell through to the REAL db/codebases module. That was masked
+// pre-fix because CI's default (Docker) ARCHON_HOME pointed at an already-
+// warm archon.db; once test isolation forces a fresh per-process temp home
+// (see packages/core/src/test/setup.ts), the real call pays full schema-init
+// cost on every run and can time out on slower (Windows) CI runners.
+const mockListCodebases = mock(() => Promise.resolve([]));
 const mockGetActiveSession = mock(() => Promise.resolve(null));
 const mockDeactivateSession = mock(() => Promise.resolve());
 
@@ -73,6 +80,7 @@ mock.module('../db/codebases', () => ({
   getCodebaseCommands: mockGetCodebaseCommands,
   updateCodebaseCommands: mockUpdateCodebaseCommands,
   deleteCodebase: mockDeleteCodebase,
+  listCodebases: mockListCodebases,
 }));
 
 mock.module('../db/sessions', () => ({
