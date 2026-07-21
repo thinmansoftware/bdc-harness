@@ -54,10 +54,6 @@ export function isDocker(): boolean {
  * - Local: ~/.archon (or ARCHON_HOME env var)
  */
 export function getArchonHome(): string {
-  if (isDocker()) {
-    return '/.archon';
-  }
-
   const envHome = process.env.ARCHON_HOME;
   if (envHome) {
     if (envHome === 'undefined') {
@@ -67,7 +63,18 @@ export function getArchonHome(): string {
           'Unset ARCHON_HOME or provide a valid path.'
       );
     }
+    // ARCHON_HOME always wins, even in Docker. This is load-bearing for test
+    // isolation: a WO's test suite runs inside the production container, so
+    // without this override every test process resolves the SAME /.archon as
+    // the live Archon server -- including its production archon.db. See
+    // packages/core/src/test/setup.ts, which sets ARCHON_HOME to a per-process
+    // temp dir before any test file's imports run. Anchor: 2026-07-21, two
+    // separate production DB wipes traced to this exact fallthrough.
     return expandTilde(envHome);
+  }
+
+  if (isDocker()) {
+    return '/.archon';
   }
 
   return join(homedir(), '.archon');

@@ -105,9 +105,19 @@ describe('archon-paths', () => {
   });
 
   describe('getArchonHome', () => {
-    test('returns /.archon in Docker', () => {
+    test('returns /.archon in Docker when ARCHON_HOME is not set', () => {
+      delete process.env.ARCHON_HOME;
       process.env.WORKSPACE_PATH = '/workspace';
       expect(getArchonHome()).toBe('/.archon');
+    });
+
+    test('ARCHON_HOME override wins even in Docker (test-isolation guard)', () => {
+      // Anchor: 2026-07-21 -- ARCHON_HOME must win over the Docker /.archon
+      // default so a test process (running inside the production container)
+      // can be pointed at an isolated temp dir instead of the live archon.db.
+      process.env.WORKSPACE_PATH = '/workspace';
+      process.env.ARCHON_HOME = '/custom/isolated-test-home';
+      expect(getArchonHome()).toBe('/custom/isolated-test-home');
     });
 
     test('returns ARCHON_HOME when set (local)', () => {
@@ -141,6 +151,7 @@ describe('archon-paths', () => {
     });
 
     test('returns /.archon/workspaces in Docker', () => {
+      delete process.env.ARCHON_HOME;
       process.env.ARCHON_DOCKER = 'true';
       expect(getArchonWorkspacesPath()).toBe(join('/', '.archon', 'workspaces'));
     });
@@ -163,6 +174,7 @@ describe('archon-paths', () => {
     });
 
     test('returns /.archon/worktrees in Docker', () => {
+      delete process.env.ARCHON_HOME;
       process.env.ARCHON_DOCKER = 'true';
       expect(getArchonWorktreesPath()).toBe(join('/', '.archon', 'worktrees'));
     });
@@ -236,6 +248,7 @@ describe('archon-paths', () => {
     });
 
     test('returns /.archon/workflows in Docker', () => {
+      delete process.env.ARCHON_HOME;
       process.env.ARCHON_DOCKER = 'true';
       expect(getHomeWorkflowsPath()).toBe(join('/', '.archon', 'workflows'));
     });
@@ -263,6 +276,7 @@ describe('archon-paths', () => {
     });
 
     test('returns /.archon/commands in Docker', () => {
+      delete process.env.ARCHON_HOME;
       process.env.ARCHON_DOCKER = 'true';
       expect(getHomeCommandsPath()).toBe(join('/', '.archon', 'commands'));
     });
@@ -282,6 +296,7 @@ describe('archon-paths', () => {
     });
 
     test('returns /.archon/scripts in Docker', () => {
+      delete process.env.ARCHON_HOME;
       process.env.ARCHON_DOCKER = 'true';
       expect(getHomeScriptsPath()).toBe(join('/', '.archon', 'scripts'));
     });
@@ -435,6 +450,7 @@ describe('archon-paths', () => {
     });
 
     test('works in Docker', () => {
+      delete process.env.ARCHON_HOME;
       process.env.ARCHON_DOCKER = 'true';
       expect(getProjectRoot('acme', 'widget')).toBe(
         join('/', '.archon', 'workspaces', 'acme', 'widget')
