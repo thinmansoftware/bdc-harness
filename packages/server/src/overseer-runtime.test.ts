@@ -17,6 +17,7 @@ import {
   stopOverseerRuntime,
   getOverseerRuntimeStatus,
 } from './overseer-runtime';
+import { createMergeManager } from '../../overseer/src/merge-manager.ts';
 
 const getStatus = () =>
   getOverseerRuntimeStatus({ listCapabilityStates: listCapabilityStatesMock });
@@ -279,6 +280,37 @@ describe('overseer-runtime', () => {
       serviceOptions: { deps, mergeCoordinator },
     });
     expect(runOverseerServiceMock).toHaveBeenCalledTimes(1);
+    expect(capturedServiceOptions?.adapterKind).toBe('real');
+    await stopOverseerRuntime();
+  });
+
+  test('real adapter accepts a constructed merge manager without missing-coordinator degrade', async () => {
+    process.env.OVERSEER_ENABLED = 'true';
+    process.env.OVERSEER_USE_FAKE_GITHUB_ADAPTER = 'false';
+    process.env.GITHUB_TOKEN = 'poison-token';
+    const deps = {
+      listRunsForWatch: async () => [],
+      listRunEvents: async () => [],
+      findPullRequest: async () => ({
+        exists: false as const,
+        state: 'missing',
+        checks: { total: 0, passed: 0, failed: 0, pending: 0 },
+        mergeable: null,
+      }),
+      mergePullRequest: async () => ({ merged: false }),
+      insertOverseerAction: async () => undefined,
+    };
+    const mergeManager = createMergeManager(deps);
+
+    startOverseerRuntime({
+      runService: runOverseerServiceMock,
+      serviceOptions: { deps, mergeCoordinator: mergeManager },
+    });
+    const status = await getOverseerRuntimeStatus({ listCapabilityStates: async () => [] });
+
+    expect(runOverseerServiceMock).toHaveBeenCalledTimes(1);
+    expect(status.adapter).toBe('real');
+    expect(status.watcher).toBe('stopped');
     expect(capturedServiceOptions?.adapterKind).toBe('real');
     await stopOverseerRuntime();
   });

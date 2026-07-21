@@ -54,8 +54,9 @@ export { watchLoop, watchOnce, DEFAULT_WATCH_INTERVAL_MS } from './watch';
 export { judgePullRequest, isPrGreen, isPrMergeReady } from './judge-pr';
 export { judgeWithGrok } from './judge-second-opinion';
 export { assembleQualifiedMergeEvidence, coordinateMergeReady } from './merge-coordinator';
+export { MERGE_MANAGER_IDENTITY, createMergeManager } from './merge-manager';
 export { createGitHubQualifiedMergeAdapter } from './adapters/github-qualified-merge';
-export { runOverseerService } from './service';
+export { resolveDefaultDeps, runOverseerService } from './service';
 export {
   buildEvidenceComment,
   createDefaultReconcileDeps,
