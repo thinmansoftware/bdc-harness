@@ -222,7 +222,7 @@ export function extractWoStems(input: string): string[] {
 
 export function extractReconcileSkipStems(input: string): Set<string> {
   const stems = new Set<string>();
-  for (const match of input.matchAll(RECONCILE_SKIP_PATTERN)) {
+  for (const match of input.replace(/\r\n/g, '\n').matchAll(RECONCILE_SKIP_PATTERN)) {
     const stem = match[1];
     if (stem) stems.add(stem);
   }
