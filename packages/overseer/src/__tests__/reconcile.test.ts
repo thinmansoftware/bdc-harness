@@ -7,9 +7,11 @@ import {
   type ReconcileTrackerIssue,
 } from '../reconcile';
 
-const stem = 'WO-HARNESS-OVERSEER-V1B-TRACKER-RECONCILE-01';
+export const stem = 'WO-HARNESS-OVERSEER-V1B-TRACKER-RECONCILE-01';
 
-function mergedPr(overrides: Partial<ReconcileMergedPullRequest> = {}): ReconcileMergedPullRequest {
+export function mergedPr(
+  overrides: Partial<ReconcileMergedPullRequest> = {}
+): ReconcileMergedPullRequest {
   return {
     owner: 'bluedevilcollectibles',
     repo: 'bdc-harness',
@@ -25,7 +27,7 @@ function mergedPr(overrides: Partial<ReconcileMergedPullRequest> = {}): Reconcil
   };
 }
 
-function trackerIssue(state: 'open' | 'closed' = 'open'): ReconcileTrackerIssue {
+export function trackerIssue(state: 'open' | 'closed' = 'open'): ReconcileTrackerIssue {
   return {
     owner: 'bluedevilcollectibles',
     repo: 'bdc-xo',
@@ -35,12 +37,13 @@ function trackerIssue(state: 'open' | 'closed' = 'open'): ReconcileTrackerIssue 
   };
 }
 
-function fakeDeps(
+export function fakeDeps(
   input: {
     prs?: ReconcileMergedPullRequest[];
     tracker?: ReconcileTrackerIssue | null;
     searchError?: unknown;
     trackerLookupError?: unknown;
+    skipAlreadyNoted?: boolean;
   } = {}
 ): ReconcileDeps & {
   comments: string[];
@@ -80,6 +83,7 @@ function fakeDeps(
     closeTrackerIssue: mock(async request => {
       closes.push(request.issue.number);
     }),
+    hasSkipBeenNoted: mock(async () => Boolean(input.skipAlreadyNoted)),
     insertAction: mock(async record => {
       actions.push(record);
     }),

@@ -210,3 +210,18 @@ export async function insertReconcileAction(record: {
   if (!row) throw new Error('Failed to insert overseer reconcile action');
   return row;
 }
+
+export async function hasReconcileActionForPr(input: {
+  prRef: string;
+  woId: string;
+  action: string;
+}): Promise<boolean> {
+  const result = await getDatabase().query<{ found: number }>(
+    `SELECT 1 AS found
+     FROM overseer_reconcile_actions
+     WHERE pr_ref = $1 AND wo_id = $2 AND action = $3
+     LIMIT 1`,
+    [input.prRef, input.woId, input.action]
+  );
+  return result.rows.length > 0;
+}

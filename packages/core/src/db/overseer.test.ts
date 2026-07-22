@@ -12,6 +12,7 @@ mock.module('./connection', () => ({
 
 import {
   getOverseerActionsForRun,
+  hasReconcileActionForPr,
   insertOverseerAction,
   insertReconcileAction,
   listRunEventsForOverseer,
@@ -124,5 +125,37 @@ describe('overseer db', () => {
       'SELECT COUNT(*) as count FROM overseer_actions'
     );
     expect(Number(runScoped.rows[0]?.count)).toBe(0);
+  });
+
+  test('hasReconcileActionForPr finds only the matching PR, WO, and action', async () => {
+    await insertReconcileAction({
+      prRef: 'bluedevilcollectibles/bdc-harness#404',
+      woId: 'WO-HARNESS-OVERSEER-V1B-TRACKER-RECONCILE-01',
+      class: 'tracker_reconcile',
+      action: 'reconcile_skip_noted',
+      result: 'https://github.com/bluedevilcollectibles/bdc-harness/pull/404:abc123merge',
+    });
+
+    expect(
+      await hasReconcileActionForPr({
+        prRef: 'bluedevilcollectibles/bdc-harness#404',
+        woId: 'WO-HARNESS-OVERSEER-V1B-TRACKER-RECONCILE-01',
+        action: 'reconcile_skip_noted',
+      })
+    ).toBe(true);
+    expect(
+      await hasReconcileActionForPr({
+        prRef: 'bluedevilcollectibles/bdc-harness#404',
+        woId: 'WO-HARNESS-OVERSEER-V1B-TRACKER-RECONCILE-01',
+        action: 'reconcile_close',
+      })
+    ).toBe(false);
+    expect(
+      await hasReconcileActionForPr({
+        prRef: 'bluedevilcollectibles/bdc-harness#405',
+        woId: 'WO-HARNESS-OVERSEER-V1B-TRACKER-RECONCILE-01',
+        action: 'reconcile_skip_noted',
+      })
+    ).toBe(false);
   });
 });
