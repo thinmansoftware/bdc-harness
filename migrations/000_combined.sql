@@ -756,3 +756,19 @@ CREATE TABLE IF NOT EXISTS overseer_actions (
 
 CREATE INDEX IF NOT EXISTS idx_overseer_actions_run_id
   ON overseer_actions(run_id);
+
+-- overseer_reconcile_actions (migration 038)
+CREATE TABLE IF NOT EXISTS overseer_reconcile_actions (
+  id UUID PRIMARY KEY,
+  pr_ref TEXT NOT NULL,
+  wo_id TEXT NOT NULL,
+  class TEXT NOT NULL,
+  action TEXT NOT NULL,
+  result TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_overseer_reconcile_actions_pr_ref
+  ON overseer_reconcile_actions(pr_ref);
+CREATE INDEX IF NOT EXISTS idx_overseer_reconcile_actions_action
+  ON overseer_reconcile_actions(action);
