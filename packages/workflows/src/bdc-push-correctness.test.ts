@@ -142,7 +142,7 @@ const RESOLVE_REVIEW_BASE = `
 set -uo pipefail
 DECLARED=$(printf '%s\\n' "$SPEC_TEXT" | grep -m1 -E '^Base branch:[[:space:]]*[A-Za-z0-9_./-]+' | sed -E 's/^Base branch:[[:space:]]*//')
 if [ -z "$DECLARED" ]; then
-  DECLARED=$(printf '%s\\n' "$SPEC_TEXT" | grep -m1 -E '\\*\\*Base branch:\\*\\*[[:space:]]*\\\`[A-Za-z0-9_./-]+\\\`' | sed -E 's/.*\\\`([A-Za-z0-9_./-]+)\\\`.*/\\1/')
+  DECLARED=$(printf '%s\\n' "$SPEC_TEXT" | grep -m1 -E '\\*\\*Base branch:\\*\\*[[:space:]]*\`[A-Za-z0-9_./-]+\`' | sed -E 's/.*\`([A-Za-z0-9_./-]+)\`.*/\\1/')
 fi
 if [ -z "$DECLARED" ]; then
   DECLARED=$(printf '%s\\n' "$SPEC_TEXT" | grep -m1 -E '^base_branch:[[:space:]]*[A-Za-z0-9_./-]+' | sed -E 's/^base_branch:[[:space:]]*//')
@@ -157,6 +157,20 @@ else
   echo "REVIEW_BASE=master"
   echo "REVIEW_BASE_SOURCE=fallback-master"
 fi
+`;
+
+// ---------------------------------------------------------------------------
+// Snippet 6: review-base consumer extraction used by capture-diff,
+// diff-repair, and capture-diff-final before constructing BASE_REF.
+// ---------------------------------------------------------------------------
+const REVIEW_BASE_CONSUMER = `
+set -uo pipefail
+REVIEW_BASE_OUTPUT="$RESOLVE_REVIEW_BASE_OUTPUT"
+REVIEW_BASE=$(printf '%s\\n' "$REVIEW_BASE_OUTPUT" | sed -n 's/^REVIEW_BASE=//p' | head -n 1)
+[ -n "$REVIEW_BASE" ] || REVIEW_BASE="\${BASE_BRANCH:-master}"
+BASE_REF="origin/$REVIEW_BASE"
+echo "REVIEW_BASE=$REVIEW_BASE"
+echo "BASE_REF=$BASE_REF"
 `;
 
 const FEATURE_DEV_LANES = [
@@ -469,6 +483,54 @@ describe('Review diff-base resolution from declared Base branch', () => {
     expect(result.stdout).toContain('REVIEW_BASE=staging');
     expect(result.stdout).toContain('REVIEW_BASE_SOURCE=declared');
     expect(result.stdout).not.toContain('REVIEW_BASE=master');
+  });
+
+  it('uses markdown-bold and YAML Base branch declarations before the default', () => {
+    git(['push', 'origin', 'HEAD:release/md-base'], worktreeDir);
+    git(['push', 'origin', 'HEAD:release/yaml-base'], worktreeDir);
+
+    const cases = [
+      {
+        specText: ['WO: WO-TEST', '**Base branch:** `release/md-base`'].join('\n'),
+        expectedBase: 'release/md-base',
+      },
+      {
+        specText: ['WO: WO-TEST', 'base_branch: release/yaml-base'].join('\n'),
+        expectedBase: 'release/yaml-base',
+      },
+    ];
+
+    for (const testCase of cases) {
+      const result = bash(RESOLVE_REVIEW_BASE, worktreeDir, {
+        SPEC_TEXT: testCase.specText,
+        BASE_BRANCH: 'master',
+      });
+
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout).toContain(`REVIEW_BASE=${testCase.expectedBase}`);
+      expect(result.stdout).toContain('REVIEW_BASE_SOURCE=declared');
+      expect(result.stdout).not.toContain('REVIEW_BASE=master');
+    }
+  });
+
+  it('consumer extraction turns declared REVIEW_BASE output into origin/base ref', () => {
+    git(['push', 'origin', 'HEAD:staging'], worktreeDir);
+
+    const resolver = bash(RESOLVE_REVIEW_BASE, worktreeDir, {
+      SPEC_TEXT: ['WO: WO-TEST', 'Base branch: staging'].join('\n'),
+      BASE_BRANCH: 'master',
+    });
+    expect(resolver.exitCode).toBe(0);
+
+    const consumer = bash(REVIEW_BASE_CONSUMER, worktreeDir, {
+      RESOLVE_REVIEW_BASE_OUTPUT: resolver.stdout,
+      BASE_BRANCH: 'master',
+    });
+
+    expect(consumer.exitCode).toBe(0);
+    expect(consumer.stdout).toContain('REVIEW_BASE=staging');
+    expect(consumer.stdout).toContain('BASE_REF=origin/staging');
+    expect(consumer.stdout).not.toContain('BASE_REF=origin/master');
   });
 
   it('falls back to env default, then master, when no Base branch is declared', () => {
