@@ -146,7 +146,26 @@ export async function runReconcileOnce(input: RunReconcileInput = {}): Promise<R
     if (stems.length === 0) continue;
 
     for (const stem of stems) {
-      const tracker = await deps.findTrackerIssueByStem(stem);
+      let tracker: ReconcileTrackerIssue | null;
+      try {
+        tracker = await deps.findTrackerIssueByStem(stem);
+      } catch (error) {
+        if (isRateLimitError(error)) {
+          logger.warn(
+            { err: error as Error, rateLimit: true, stem },
+            'overseer.reconcile.rate_limit_skip'
+          );
+          return { scanned: seen.size, closed, skipped: true };
+        }
+        if (isAuthError(error)) {
+          logger.warn(
+            { err: error as Error, authError: true, stem },
+            'overseer.reconcile.auth_error_skip'
+          );
+          return { scanned: seen.size, closed, skipped: true };
+        }
+        throw error;
+      }
       if (!tracker) continue;
       if (tracker.state !== 'open') continue;
 
