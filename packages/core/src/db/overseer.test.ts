@@ -13,6 +13,7 @@ mock.module('./connection', () => ({
 import {
   getOverseerActionsForRun,
   insertOverseerAction,
+  insertReconcileAction,
   listRunEventsForOverseer,
   listRunsForOverseerWatch,
 } from './overseer';
@@ -93,5 +94,35 @@ describe('overseer db', () => {
     expect(actions).toHaveLength(1);
     expect(actions[0].action).toBe('merge_ready');
     expect(await listRunsForOverseerWatch()).toHaveLength(0);
+  });
+
+  test('insertReconcileAction succeeds for a merged PR with no corresponding run row (regression: overseer_actions.run_id NOT NULL FK crash)', async () => {
+    // No seedRun() call here -- this is the exact live-incident condition:
+    // a merged PR (shopops-comic-theme#89) reconciling a tracker with no
+    // remote_agent_workflow_runs row. Routing this through insertOverseerAction's
+    // run_id NOT NULL FK threw SQLITE_CONSTRAINT_FOREIGNKEY and degraded the
+    // whole watcher (overseer_runtime.watcher_exception_degraded).
+    const action = await insertReconcileAction({
+      prRef: 'bluedevilcollectibles/shopops-comic-theme#89',
+      woId: 'WO-COMICTHEME-WORDMARK-MASTER-PACK-COMPLETION-01',
+      class: 'tracker_reconcile',
+      action: 'reconcile_close',
+      result: 'https://github.com/bluedevilcollectibles/shopops-comic-theme/pull/89:2a28cc9',
+    });
+
+    expect(action.pr_ref).toBe('bluedevilcollectibles/shopops-comic-theme#89');
+    expect(action.action).toBe('reconcile_close');
+
+    const rows = await db.query<{ pr_ref: string }>(
+      'SELECT pr_ref FROM overseer_reconcile_actions WHERE id = $1',
+      [action.id]
+    );
+    expect(rows.rows).toHaveLength(1);
+
+    // overseer_actions (the run-scoped table) must remain untouched by reconcile.
+    const runScoped = await db.query<{ count: number }>(
+      'SELECT COUNT(*) as count FROM overseer_actions'
+    );
+    expect(Number(runScoped.rows[0]?.count)).toBe(0);
   });
 });

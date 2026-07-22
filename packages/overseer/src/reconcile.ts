@@ -36,7 +36,7 @@ export interface ReconcileTrackerIssue {
 }
 
 export interface ReconcileActionRecord {
-  runId: string;
+  prRef: string;
   woId: string;
   class: string;
   action: string;
@@ -157,7 +157,7 @@ export async function runReconcileOnce(input: RunReconcileInput = {}): Promise<R
       await deps.addTrackerLabel({ issue: tracker, label: DONE_LABEL });
       await deps.closeTrackerIssue({ issue: tracker });
       await (deps.insertAction ?? insertDefaultOverseerAction)({
-        runId: `reconcile:${pr.owner}/${pr.repo}#${pr.number}`,
+        prRef: `${pr.owner}/${pr.repo}#${pr.number}`,
         woId: stem,
         class: 'tracker_reconcile',
         action: RECONCILE_ACTION,
@@ -191,17 +191,16 @@ export function buildEvidenceComment(input: {
 export async function readReconcileCursorFromActions(): Promise<string | null> {
   const { getDatabase } = await import('@archon/core/db/connection');
   const db = getDatabase();
-  const sql =
-    db.dialect === 'sqlite'
-      ? 'SELECT MAX(created_at) AS cursor FROM overseer_actions WHERE action = $1'
-      : 'SELECT MAX(created_at) AS cursor FROM overseer_actions WHERE action = $1';
-  const result = await db.query<{ cursor: string | null }>(sql, [RECONCILE_ACTION]);
+  const result = await db.query<{ cursor: string | null }>(
+    'SELECT MAX(created_at) AS cursor FROM overseer_reconcile_actions WHERE action = $1',
+    [RECONCILE_ACTION]
+  );
   return result.rows[0]?.cursor ?? null;
 }
 
 async function insertDefaultOverseerAction(record: ReconcileActionRecord): Promise<unknown> {
-  const { insertOverseerAction } = await import('@archon/core/db/overseer');
-  return insertOverseerAction(record);
+  const { insertReconcileAction } = await import('@archon/core/db/overseer');
+  return insertReconcileAction(record);
 }
 
 export function createDefaultReconcileDeps(): ReconcileDeps {

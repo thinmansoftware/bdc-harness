@@ -174,3 +174,39 @@ export async function getOverseerActionsForRun(runId: string): Promise<OverseerA
   );
   return [...result.rows];
 }
+
+export interface OverseerReconcileAction {
+  id: string;
+  pr_ref: string;
+  wo_id: string;
+  class: string;
+  action: string;
+  result: string;
+  created_at: string;
+}
+
+/**
+ * Records a reconcile duty (V1B) action. Reconcile actions fire off a merged
+ * PR, not a remote_agent_workflow_runs row, so they cannot honor
+ * overseer_actions.run_id's NOT NULL FK -- see overseer_reconcile_actions.
+ * Do NOT route reconcile writes through insertOverseerAction.
+ */
+export async function insertReconcileAction(record: {
+  prRef: string;
+  woId: string;
+  class: string;
+  action: string;
+  result: string;
+}): Promise<OverseerReconcileAction> {
+  const db = getDatabase();
+  const id = randomUUID();
+  const inserted = await db.query<OverseerReconcileAction>(
+    `INSERT INTO overseer_reconcile_actions (id, pr_ref, wo_id, class, action, result)
+     VALUES ($1, $2, $3, $4, $5, $6)
+     RETURNING *`,
+    [id, record.prRef, record.woId, record.class, record.action, record.result]
+  );
+  const row = inserted.rows[0];
+  if (!row) throw new Error('Failed to insert overseer reconcile action');
+  return row;
+}
