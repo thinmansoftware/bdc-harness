@@ -139,7 +139,10 @@ import {
 import { assessDispatchMessageBody } from '@archon/core/utils/dispatch-content-guard';
 import { authenticateDispatchWorkerCredential } from '../auth/dispatch-worker-credential';
 import { getOverseerRuntimeStatus } from '../overseer-runtime';
-import { listOverseerCapabilityStates } from '@archon/core/db/overseer-capabilities';
+import {
+  listOverseerCapabilityStates,
+  resetOverseerCapabilityCircuit,
+} from '@archon/core/db/overseer-capabilities';
 import { errorSchema } from './schemas/common.schemas';
 import { updateCheckResponseSchema } from './schemas/system.schemas';
 import {
@@ -209,6 +212,8 @@ import { canarySnapshotQuerySchema, canarySnapshotResponseSchema } from './schem
 import {
   drainBodySchema,
   drainResponseSchema,
+  resetOverseerCapabilityCircuitBodySchema,
+  resetOverseerCapabilityCircuitResponseSchema,
   throttleBodySchema,
   throttleResponseSchema,
 } from './schemas/admin.schemas';
@@ -1589,6 +1594,27 @@ const getAdminDrainRoute = createRoute({
       content: { 'application/json': { schema: drainResponseSchema } },
       description: 'Current drain state',
     },
+    500: jsonError('Server error'),
+  },
+});
+
+const adminResetOverseerCapabilityRoute = createRoute({
+  method: 'post',
+  path: '/api/admin/overseer/capabilities/reset',
+  tags: ['Admin'],
+  summary: 'Reset an Overseer capability circuit and enable actions',
+  request: {
+    body: {
+      content: { 'application/json': { schema: resetOverseerCapabilityCircuitBodySchema } },
+    },
+  },
+  responses: {
+    200: {
+      content: { 'application/json': { schema: resetOverseerCapabilityCircuitResponseSchema } },
+      description: 'Overseer capability reset',
+    },
+    400: jsonError('Bad request'),
+    404: jsonError('Capability state not found'),
     500: jsonError('Server error'),
   },
 });
@@ -4808,6 +4834,30 @@ export function registerApiRoutes(
     } catch (error) {
       getLog().error({ err: error }, 'admin_drain_api_failed');
       return apiError(c, 500, 'Failed to update drain state');
+    }
+  });
+
+  registerOpenApiRoute(adminResetOverseerCapabilityRoute, async c => {
+    try {
+      const body = getValidatedBody(c, resetOverseerCapabilityCircuitBodySchema);
+      const result = await resetOverseerCapabilityCircuit({
+        ...body,
+        actor: body.actor ?? 'operator',
+      });
+      return c.json({ success: true, ...result });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (
+        message.startsWith('unknown_overseer_capability:') ||
+        message.includes('_must_be_lower_case_64-hex')
+      ) {
+        return apiError(c, 400, message);
+      }
+      if (message.startsWith('overseer_capability_state_missing:')) {
+        return apiError(c, 404, message);
+      }
+      getLog().error({ err: error }, 'admin_reset_overseer_capability_api_failed');
+      return apiError(c, 500, 'Failed to reset Overseer capability circuit');
     }
   });
 
