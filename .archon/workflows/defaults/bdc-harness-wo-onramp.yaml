@@ -294,7 +294,7 @@ nodes:
           fi
         fi
 
-        # Rule 7: review-issue node present
+        # Rule 7: review-issue GitHub completion node present
         grep -q 'id: review-issue' "$DRAFT" || { echo "FAIL Rule 7: review-issue GitHub completion node not found" >> "$FEEDBACK"; ERRORS=$((ERRORS+1)); }
 
         # business-risk-gate present
@@ -474,7 +474,9 @@ nodes:
         - every loop: has prompt + until + max_iterations + fresh_context
         - paths repo-root-relative (no BDC_XO/ prefix)
         - no n8n webhook calls
-        - review-issue final node flips the GITHUB ISSUE with a completion comment and status:review label; business-risk-gate present and load_bearing: true
+        - review-issue final node; business-risk-gate present and load_bearing: true
+        - review-issue targets the child WO GitHub issue, adds status:review, and posts
+          one sentinel-guarded manifest comment so repeat runs do not duplicate comments
         - business-risk-gate includes BUSINESS_RISK_INVARIANT verbatim
         - business-risk-gate emits {"gate":"proceed"} only after all checks pass
         - decide-push-target, commit-and-push, open-pr-if-needed, build-manifest, and
@@ -710,7 +712,7 @@ nodes:
          only after passing, and mechanically condition decide-push-target, commit-and-push,
          open-pr-if-needed, build-manifest, and review-issue on that proceed verdict?
          Score <7 if invariant is generic/wrong, the node lacks fail-closed logic, or any
-         push/PR/GitHub-completion chain node can run without the proceed condition.
+         push/PR/GitHub completion chain node can run without the proceed condition.
 
       3. **Rule 20 compliance** (1-10): If RULE20_STAGING_GATE=true, does the child YAML enforce
          staging branch as PR base? If false, does it correctly skip that gate?
@@ -1510,8 +1512,9 @@ nodes:
     # binding-gate emits gate=proceed for BOTH BINDING_OK=true (matched) AND BINDING_OK=unverified
     # (soft-miss after a successful fire) -- both are on-ramp success states. A confirmed
     # wrong-repo mismatch makes verify-binding exit 1 (node fails; this gate never evaluates).
-    # build-manifest's own VALIDATION guard still independently gates the actual flip.
+    # build-manifest's own VALIDATION guard still independently gates the actual review mark.
     when: "$binding-gate.output.gate == 'proceed'"
+    task_class: clerical
     bash: |
       set -euo pipefail
 
@@ -1523,7 +1526,7 @@ nodes:
       $build-manifest.output
       BDC_NODE_OUTPUT_BUILD_MANIFEST
       )
-      if ! printf '%s\n' "$MANIFEST" | grep -q 'VALIDATION: PASS'; then
+      if ! printf '%s\n' "$MANIFEST" | grep -q '^VALIDATION: PASS$'; then
         echo "review-issue: build-manifest is not VALIDATION: PASS -- skipping issue review flip."
         exit 0
       fi
@@ -1555,7 +1558,8 @@ nodes:
       gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --add-label status:review
 
       SENTINEL="<!-- onramp-manifest ${WO_ID} -->"
-      if gh issue view "$ISSUE_NUM" --repo "$ISSUE_REPO" --json comments --jq '.comments[].body' 2>/dev/null | grep -Fq "$SENTINEL"; then
+      EXISTING_COMMENTS=$(gh issue view "$ISSUE_NUM" --repo "$ISSUE_REPO" --json comments --jq '.comments[].body' 2>/dev/null || true)
+      if printf '%s\n' "$EXISTING_COMMENTS" | grep -Fq "$SENTINEL"; then
         echo "review-issue: $ISSUE_REPO#$ISSUE_NUM already has manifest sentinel for $WO_ID; skipping comment."
       else
         COMMENT_FILE=$(mktemp)
