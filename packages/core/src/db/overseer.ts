@@ -210,3 +210,25 @@ export async function insertReconcileAction(record: {
   if (!row) throw new Error('Failed to insert overseer reconcile action');
   return row;
 }
+
+/**
+ * Returns true if a reconcile action already exists for the given
+ * pr_ref + wo_id + action triple. Used by the reconcile skip path for
+ * per-PR/stem idempotency: the skip path intentionally leaves the tracker
+ * issue OPEN, so GitHub issue state cannot serve as the "already handled"
+ * dedup signal that the close path relies on (tracker.state !== 'open').
+ */
+export async function hasReconcileActionFor(input: {
+  prRef: string;
+  woId: string;
+  action: string;
+}): Promise<boolean> {
+  const db = getDatabase();
+  const result = await db.query<{ id: string }>(
+    `SELECT id FROM overseer_reconcile_actions
+     WHERE pr_ref = $1 AND wo_id = $2 AND action = $3
+     LIMIT 1`,
+    [input.prRef, input.woId, input.action]
+  );
+  return result.rows.length > 0;
+}

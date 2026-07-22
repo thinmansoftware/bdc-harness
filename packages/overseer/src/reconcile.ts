@@ -8,7 +8,12 @@ const log: ReconcileLogger = {
 };
 
 export const RECONCILE_ACTION = 'reconcile_close';
+export const RECONCILE_SKIP_ACTION = 'reconcile_skip_noted';
 export const WO_STEM_PATTERN = /\bWO-[A-Z0-9]+(?:-[A-Z0-9]+)*-[0-9]{2}\b/g;
+// Matches an explicit opt-out line in a PR body: `Reconcile-Skip: <stem>`.
+// One stem per line (case-sensitive stem), multiple lines supported. The
+// optional trailing \r tolerates CRLF-encoded PR bodies from the GitHub API.
+const RECONCILE_SKIP_PATTERN = /^[ \t]*Reconcile-Skip:[ \t]*(\S+)[ \t]*\r?$/gm;
 const DEFAULT_ORG = 'bluedevilcollectibles';
 const DEFAULT_TRACKER_REPO = 'bdc-xo';
 const DEFAULT_LOOKBACK_DAYS = 14;
@@ -62,6 +67,11 @@ export interface ReconcileDeps {
   addTrackerLabel: (input: { issue: ReconcileTrackerIssue; label: string }) => Promise<void>;
   closeTrackerIssue: (input: { issue: ReconcileTrackerIssue }) => Promise<void>;
   insertAction?: (record: ReconcileActionRecord) => Promise<unknown>;
+  hasReconcileAction?: (input: {
+    prRef: string;
+    woId: string;
+    action: string;
+  }) => Promise<boolean>;
   now?: () => Date;
   log?: ReconcileLogger;
 }
@@ -144,6 +154,7 @@ export async function runReconcileOnce(input: RunReconcileInput = {}): Promise<R
     if (!pr.merged || pr.state !== 'closed') continue;
     const stems = extractWoStems(`${pr.title}\n${pr.body ?? ''}`);
     if (stems.length === 0) continue;
+    const skipStems = new Set(extractReconcileSkipStems(pr.body ?? ''));
 
     for (const stem of stems) {
       let tracker: ReconcileTrackerIssue | null;
@@ -169,6 +180,34 @@ export async function runReconcileOnce(input: RunReconcileInput = {}): Promise<R
       if (!tracker) continue;
       if (tracker.state !== 'open') continue;
 
+      const prRef = `${pr.owner}/${pr.repo}#${pr.number}`;
+
+      if (skipStems.has(stem)) {
+        // Explicit opt-out: the PR author declared this PR does not fully
+        // complete the WO. Leave the tracker OPEN. Because the tracker state
+        // never changes, GitHub state cannot serve as the idempotency signal
+        // the close path uses -- so dedup against the reconcile action log
+        // for this exact PR/stem/action triple instead.
+        const alreadyNoted = await (deps.hasReconcileAction ?? defaultHasReconcileAction)({
+          prRef,
+          woId: stem,
+          action: RECONCILE_SKIP_ACTION,
+        });
+        if (alreadyNoted) continue;
+        await deps.addTrackerEvidenceComment({
+          issue: tracker,
+          body: buildEvidenceComment({ pr, stem, skipped: true }),
+        });
+        await (deps.insertAction ?? insertDefaultOverseerAction)({
+          prRef,
+          woId: stem,
+          class: 'tracker_reconcile',
+          action: RECONCILE_SKIP_ACTION,
+          result: `${pr.htmlUrl}:${pr.mergeCommitSha ?? 'merge_sha_unknown'}`,
+        });
+        continue;
+      }
+
       await deps.addTrackerEvidenceComment({
         issue: tracker,
         body: buildEvidenceComment({ pr, stem }),
@@ -176,7 +215,7 @@ export async function runReconcileOnce(input: RunReconcileInput = {}): Promise<R
       await deps.addTrackerLabel({ issue: tracker, label: DONE_LABEL });
       await deps.closeTrackerIssue({ issue: tracker });
       await (deps.insertAction ?? insertDefaultOverseerAction)({
-        prRef: `${pr.owner}/${pr.repo}#${pr.number}`,
+        prRef,
         woId: stem,
         class: 'tracker_reconcile',
         action: RECONCILE_ACTION,
@@ -194,12 +233,25 @@ export function extractWoStems(input: string): string[] {
   return [...new Set(matches)];
 }
 
+export function extractReconcileSkipStems(input: string): string[] {
+  const stems: string[] = [];
+  for (const match of input.matchAll(RECONCILE_SKIP_PATTERN)) {
+    const stem = match[1];
+    if (stem) stems.push(stem);
+  }
+  return [...new Set(stems)];
+}
+
 export function buildEvidenceComment(input: {
   pr: ReconcileMergedPullRequest;
   stem: string;
+  skipped?: boolean;
 }): string {
+  const header = input.skipped
+    ? `Overseer reconcile noted the merge for ${input.stem} but left this tracker intentionally OPEN (Reconcile-Skip marker present in the PR body; the WO is not fully completed by this PR).`
+    : `Overseer reconcile closed tracker for ${input.stem}.`;
   return [
-    `Overseer reconcile closed tracker for ${input.stem}.`,
+    header,
     '',
     `Merged PR: ${input.pr.htmlUrl}`,
     `Repository: ${input.pr.owner}/${input.pr.repo}`,
@@ -222,6 +274,15 @@ async function insertDefaultOverseerAction(record: ReconcileActionRecord): Promi
   return insertReconcileAction(record);
 }
 
+async function defaultHasReconcileAction(input: {
+  prRef: string;
+  woId: string;
+  action: string;
+}): Promise<boolean> {
+  const { hasReconcileActionFor } = await import('@archon/core/db/overseer');
+  return hasReconcileActionFor(input);
+}
+
 export function createDefaultReconcileDeps(): ReconcileDeps {
   const token = process.env.GITHUB_TOKEN ?? process.env.GH_TOKEN;
   if (!token) {
@@ -236,6 +297,7 @@ export function createDefaultReconcileDeps(): ReconcileDeps {
       addTrackerLabel: async () => undefined,
       closeTrackerIssue: async () => undefined,
       insertAction: insertDefaultOverseerAction,
+      hasReconcileAction: defaultHasReconcileAction,
       log,
     };
   }
@@ -280,6 +342,7 @@ export function createDefaultReconcileDeps(): ReconcileDeps {
       });
     },
     insertAction: insertDefaultOverseerAction,
+    hasReconcileAction: defaultHasReconcileAction,
     log,
   };
 }

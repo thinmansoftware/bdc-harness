@@ -83,6 +83,11 @@ function fakeDeps(
     insertAction: mock(async record => {
       actions.push(record);
     }),
+    hasReconcileAction: mock(async (query: { prRef: string; woId: string; action: string }) =>
+      actions.some(
+        a => a.prRef === query.prRef && a.woId === query.woId && a.action === query.action
+      )
+    ),
     log: {
       warn: (_fields, message) => {
         warnings.push(message);
@@ -226,5 +231,63 @@ describe('reconcile', () => {
     expect(deps.labels).toEqual([]);
     expect(deps.closes).toEqual([]);
     expect(deps.actions).toEqual([]);
+  });
+
+  test('Reconcile-Skip marker suppresses close, posts left-open evidence, records action=reconcile_skip_noted', async () => {
+    const deps = fakeDeps({
+      prs: [mergedPr({ body: `Implements ${stem}.\nReconcile-Skip: ${stem}` })],
+    });
+
+    const result = await runReconcileOnce({ deps });
+
+    expect(result).toEqual({ scanned: 1, closed: 0, skipped: false });
+    // Tracker must NOT be closed and must NOT be labeled wo:done.
+    expect(deps.closes).toEqual([]);
+    expect(deps.labels).toEqual([]);
+    // Evidence comment IS still posted, noting the tracker was left open.
+    expect(deps.comments).toHaveLength(1);
+    expect(deps.comments[0]).toContain('intentionally OPEN');
+    expect(deps.comments[0]).toContain(
+      'https://github.com/bluedevilcollectibles/bdc-harness/pull/404'
+    );
+    // Audit row recorded with the exact literal action string.
+    expect(deps.actions).toMatchObject([
+      {
+        woId: stem,
+        action: 'reconcile_skip_noted',
+        result: 'https://github.com/bluedevilcollectibles/bdc-harness/pull/404:abc123merge',
+      },
+    ]);
+  });
+
+  test('no Reconcile-Skip marker leaves the existing close path unchanged (regression guard)', async () => {
+    const deps = fakeDeps();
+
+    const result = await runReconcileOnce({ deps });
+
+    expect(result).toEqual({ scanned: 1, closed: 1, skipped: false });
+    expect(deps.closes).toEqual([1044]);
+    expect(deps.labels).toEqual(['wo:done']);
+    expect(deps.actions).toMatchObject([{ woId: stem, action: 'reconcile_close' }]);
+    // Skip-path idempotency dep must never be consulted for a non-skip PR.
+    expect(deps.hasReconcileAction).not.toHaveBeenCalled();
+  });
+
+  test('second reconcile run against the same skip-marked PR does not double-post comment or action row', async () => {
+    const deps = fakeDeps({
+      prs: [mergedPr({ body: `Implements ${stem}.\nReconcile-Skip: ${stem}` })],
+    });
+
+    await runReconcileOnce({ deps });
+    expect(deps.comments).toHaveLength(1);
+    expect(deps.actions).toHaveLength(1);
+
+    const result = await runReconcileOnce({ deps });
+
+    expect(result).toEqual({ scanned: 1, closed: 0, skipped: false });
+    // No duplicate comment and no duplicate action row on the second cycle.
+    expect(deps.comments).toHaveLength(1);
+    expect(deps.actions).toHaveLength(1);
+    expect(deps.closes).toEqual([]);
   });
 });
