@@ -40,6 +40,7 @@ function fakeDeps(
     prs?: ReconcileMergedPullRequest[];
     tracker?: ReconcileTrackerIssue | null;
     searchError?: unknown;
+    trackerLookupError?: unknown;
   } = {}
 ): ReconcileDeps & {
   comments: string[];
@@ -66,6 +67,7 @@ function fakeDeps(
       return input.prs ?? [mergedPr()];
     }),
     findTrackerIssueByStem: mock(async (candidate: string) => {
+      if (input.trackerLookupError) throw input.trackerLookupError;
       if (candidate !== stem) return null;
       return input.tracker === undefined ? trackerIssue() : input.tracker;
     }),
@@ -178,6 +180,37 @@ describe('reconcile', () => {
     expect(result).toEqual({ scanned: 0, closed: 0, skipped: true });
     expect(deps.warnings).toEqual(['overseer.reconcile.auth_error_skip']);
     expect(deps.findTrackerIssueByStem).not.toHaveBeenCalled();
+    expect(deps.comments).toEqual([]);
+    expect(deps.closes).toEqual([]);
+    expect(deps.actions).toEqual([]);
+  });
+
+  test('rate-limit response from findTrackerIssueByStem (per-stem search, not the merged-PR search) skips cleanly instead of crashing the watcher (regression: live incident 2026-07-22, overseer_runtime.watcher_exception_degraded)', async () => {
+    const deps = fakeDeps({
+      trackerLookupError: Object.assign(new Error('API rate limit exceeded'), {
+        status: 403,
+        response: { headers: { 'x-ratelimit-resource': 'search' } },
+      }),
+    });
+
+    const result = await runReconcileOnce({ deps });
+
+    expect(result).toEqual({ scanned: 1, closed: 0, skipped: true });
+    expect(deps.warnings).toEqual(['overseer.reconcile.rate_limit_skip']);
+    expect(deps.comments).toEqual([]);
+    expect(deps.closes).toEqual([]);
+    expect(deps.actions).toEqual([]);
+  });
+
+  test('401 auth-error response from findTrackerIssueByStem skips cleanly instead of crashing the watcher', async () => {
+    const deps = fakeDeps({
+      trackerLookupError: Object.assign(new Error('Bad credentials'), { status: 401 }),
+    });
+
+    const result = await runReconcileOnce({ deps });
+
+    expect(result).toEqual({ scanned: 1, closed: 0, skipped: true });
+    expect(deps.warnings).toEqual(['overseer.reconcile.auth_error_skip']);
     expect(deps.comments).toEqual([]);
     expect(deps.closes).toEqual([]);
     expect(deps.actions).toEqual([]);
