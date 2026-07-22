@@ -807,8 +807,33 @@ nodes:
         exit 1
       fi
       if ! git merge-base --is-ancestor "$SCOPE_SHA" HEAD; then
-        echo "scope_authority_missing: run scope SHA is not an ancestor of HEAD" >&2
-        exit 1
+        BASE_REF="${BASE_BRANCH:-dev}"
+        RECOVERED_SCOPE_SHA=""
+        for CANDIDATE_REF in "origin/$BASE_REF" "$BASE_REF"; do
+          if git rev-parse --verify "${CANDIDATE_REF}^{commit}" >/dev/null 2>&1; then
+            RECOVERED_SCOPE_SHA=$(git merge-base "$CANDIDATE_REF" HEAD 2>/dev/null || true)
+            if [ -n "$RECOVERED_SCOPE_SHA" ] && git cat-file -e "${RECOVERED_SCOPE_SHA}^{commit}" 2>/dev/null; then
+              break
+            fi
+          fi
+        done
+        if [ -z "$RECOVERED_SCOPE_SHA" ]; then
+          echo "scope_authority_missing: run scope SHA is not an ancestor of HEAD" >&2
+          exit 1
+        fi
+        WORK_CHECK=$(mktemp)
+        git diff --name-only --diff-filter=ACMRT "$RECOVERED_SCOPE_SHA"..HEAD > "$WORK_CHECK"
+        git diff --name-only --diff-filter=ACMRT HEAD >> "$WORK_CHECK"
+        git ls-files --others --exclude-standard >> "$WORK_CHECK"
+        if [ ! -s "$WORK_CHECK" ]; then
+          rm -f "$WORK_CHECK"
+          echo "scope_authority_missing: run scope SHA is not an ancestor of HEAD" >&2
+          exit 1
+        fi
+        rm -f "$WORK_CHECK"
+        SCOPE_SHA="$RECOVERED_SCOPE_SHA"
+        printf '%s\n' "$SCOPE_SHA" > "$SCOPE_SHA_FILE"
+        echo "scope_authority_recovered: run scope SHA replaced with worktree merge-base $SCOPE_SHA"
       fi
       RAW_FILE=$(mktemp)
       LIST_TMP=$(mktemp)

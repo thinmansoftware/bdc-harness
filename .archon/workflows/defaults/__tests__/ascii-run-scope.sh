@@ -5,6 +5,7 @@ set -uo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)
 AUTOFIX="$ROOT/harness/scripts/ascii-autofix.py"
+PYTHON_BIN=$(command -v python3 || command -v python || true)
 LANES=(
   bdc-feature-development.yaml
   bdc-feature-development-codex.yaml
@@ -12,6 +13,7 @@ LANES=(
   bdc-feature-development-zero.yaml
   bdc-feature-development-zero-open.yaml
   bdc-feature-development-fusion-cx-qwen.yaml
+  bdc-feature-development-grok.yaml
   bdc-feature-development-fable.yaml
 )
 
@@ -83,7 +85,7 @@ printf '%s\n' '.github/workflows/ce-change-scope-gate.yml' \
   > "$ARTIFACTS/run-changed-source-files.txt"
 printf 'decoy \342\200\224 must stay untouched\n' > "$REPO/untouched.ts"
 
-OUT=$(cd "$REPO" && python "$AUTOFIX" --files-from "$ARTIFACTS/run-changed-source-files.txt" 2>&1)
+OUT=$(cd "$REPO" && "$PYTHON_BIN" "$AUTOFIX" --files-from "$ARTIFACTS/run-changed-source-files.txt" 2>&1)
 RC=$?
 if [ "$RC" -eq 0 ] \
   && ! has_non_ascii "$REPO/.github/workflows/ce-change-scope-gate.yml" \
@@ -96,7 +98,7 @@ else
 fi
 
 printf '%s\n' '../outside.ts' > "$ARTIFACTS/invalid-files.txt"
-OUT=$(cd "$REPO" && python "$AUTOFIX" --files-from "$ARTIFACTS/invalid-files.txt" 2>&1)
+OUT=$(cd "$REPO" && "$PYTHON_BIN" "$AUTOFIX" --files-from "$ARTIFACTS/invalid-files.txt" 2>&1)
 RC=$?
 if [ "$RC" -ne 0 ] && grep -q 'outside repository' <<< "$OUT"; then
   pass "autofix rejects a path outside the repository"
@@ -105,7 +107,7 @@ else
 fi
 
 printf '%s\n' 'missing.ts' > "$ARTIFACTS/missing-files.txt"
-OUT=$(cd "$REPO" && python "$AUTOFIX" --files-from "$ARTIFACTS/missing-files.txt" 2>&1)
+OUT=$(cd "$REPO" && "$PYTHON_BIN" "$AUTOFIX" --files-from "$ARTIFACTS/missing-files.txt" 2>&1)
 RC=$?
 if [ "$RC" -ne 0 ] && grep -q 'missing scope file' <<< "$OUT"; then
   pass "autofix rejects a missing listed file"
@@ -190,6 +192,87 @@ else
   fail "actual capture node rejects a dirty worktree" "rc=$RC output=[$OUT]"
 fi
 
+MISSING_SCOPE_REPO="$TMP/missing-scope-repo"
+MISSING_SCOPE_ARTIFACTS="$TMP/missing-scope-artifacts"
+mkdir -p "$MISSING_SCOPE_REPO" "$MISSING_SCOPE_ARTIFACTS"
+git -C "$MISSING_SCOPE_REPO" init -q
+git -C "$MISSING_SCOPE_REPO" config user.email test@example.com
+git -C "$MISSING_SCOPE_REPO" config user.name test
+printf 'baseline\n' > "$MISSING_SCOPE_REPO/README.md"
+git -C "$MISSING_SCOPE_REPO" add README.md
+git -C "$MISSING_SCOPE_REPO" commit -qm baseline
+
+OUT=$(cd "$MISSING_SCOPE_REPO" && ARTIFACTS_DIR="$MISSING_SCOPE_ARTIFACTS" bash "$DERIVE_SCRIPT" 2>&1)
+RC=$?
+if [ "$RC" -ne 0 ] && grep -q 'scope_authority_missing: run scope SHA is missing' <<< "$OUT"; then
+  pass "true-missing-scope-still-fails"
+else
+  fail "true-missing-scope-still-fails" "rc=$RC output=[$OUT]"
+fi
+
+printf 'not-a-commit\n' > "$MISSING_SCOPE_ARTIFACTS/run-scope-sha.txt"
+OUT=$(cd "$MISSING_SCOPE_REPO" && ARTIFACTS_DIR="$MISSING_SCOPE_ARTIFACTS" bash "$DERIVE_SCRIPT" 2>&1)
+RC=$?
+if [ "$RC" -ne 0 ] && grep -q 'scope_authority_missing: run scope SHA is invalid' <<< "$OUT"; then
+  pass "invalid-scope-still-fails"
+else
+  fail "invalid-scope-still-fails" "rc=$RC output=[$OUT]"
+fi
+
+DRIFT_ORIGIN="$TMP/drift-origin.git"
+DRIFT_SEED="$TMP/drift-seed"
+DRIFT_SHARED="$TMP/drift-shared"
+DRIFT_RUN="$TMP/drift-run"
+DRIFT_ARTIFACTS="$TMP/drift-artifacts"
+git init --bare -q "$DRIFT_ORIGIN"
+git clone -q "$DRIFT_ORIGIN" "$DRIFT_SEED"
+git -C "$DRIFT_SEED" config user.email test@example.com
+git -C "$DRIFT_SEED" config user.name test
+git -C "$DRIFT_SEED" checkout -qb dev
+printf 'baseline\n' > "$DRIFT_SEED/README.md"
+git -C "$DRIFT_SEED" add README.md
+git -C "$DRIFT_SEED" commit -qm baseline
+git -C "$DRIFT_SEED" push -q origin dev
+git clone -q --branch dev "$DRIFT_ORIGIN" "$DRIFT_SHARED"
+git -C "$DRIFT_SHARED" config user.email test@example.com
+git -C "$DRIFT_SHARED" config user.name test
+git -C "$DRIFT_SHARED" worktree add -q -b run "$DRIFT_RUN" dev
+git -C "$DRIFT_RUN" config user.email test@example.com
+git -C "$DRIFT_RUN" config user.name test
+mkdir -p "$DRIFT_ARTIFACTS"
+
+OUT=$(cd "$DRIFT_RUN" && ARTIFACTS_DIR="$DRIFT_ARTIFACTS" bash "$CAPTURE_SCRIPT" 2>&1)
+RC=$?
+DRIFT_SCOPE=$(cat "$DRIFT_ARTIFACTS/run-scope-sha.txt" 2>/dev/null || true)
+printf 'export const feature = true;\n' > "$DRIFT_RUN/feature.ts"
+git -C "$DRIFT_RUN" add feature.ts
+git -C "$DRIFT_RUN" commit -qm 'implement feature'
+
+git -C "$DRIFT_SEED" checkout -q --orphan rewritten-dev
+git -C "$DRIFT_SEED" rm -qr . >/dev/null 2>&1 || true
+printf 'rewritten baseline\n' > "$DRIFT_SEED/README.md"
+git -C "$DRIFT_SEED" add README.md
+git -C "$DRIFT_SEED" commit -qm 'rewrite dev'
+git -C "$DRIFT_SEED" push -q --force origin HEAD:dev
+git -C "$DRIFT_SHARED" fetch -q origin dev
+git -C "$DRIFT_SHARED" checkout -q -f -B dev origin/dev
+git -C "$DRIFT_SHARED" reset -q --hard origin/dev
+git -C "$DRIFT_RUN" fetch -q origin dev
+git -C "$DRIFT_RUN" rebase -q --onto origin/dev "$DRIFT_SCOPE"
+
+OUT=$(cd "$DRIFT_RUN" && BASE_BRANCH=dev ARTIFACTS_DIR="$DRIFT_ARTIFACTS" bash "$DERIVE_SCRIPT" 2>&1)
+RC=$?
+DRIFT_LIST=$(cat "$DRIFT_ARTIFACTS/run-changed-source-files.txt" 2>/dev/null || true)
+DRIFT_NEW_SCOPE=$(cat "$DRIFT_ARTIFACTS/run-scope-sha.txt" 2>/dev/null || true)
+if [ "$RC" -eq 0 ] \
+  && grep -qx 'feature.ts' <<< "$DRIFT_LIST" \
+  && [ "$DRIFT_NEW_SCOPE" != "$DRIFT_SCOPE" ] \
+  && git -C "$DRIFT_RUN" merge-base --is-ancestor "$DRIFT_NEW_SCOPE" HEAD; then
+  pass "mid-run-shared-clone-head-move-still-passes"
+else
+  fail "mid-run-shared-clone-head-move-still-passes" "rc=$RC output=[$OUT] list=[$DRIFT_LIST] old=[$DRIFT_SCOPE] new=[$DRIFT_NEW_SCOPE]"
+fi
+
 OUT=$(cd "$RUNTIME_REPO" && ARTIFACTS_DIR="$RUNTIME_ARTIFACTS" bash "$DERIVE_SCRIPT" 2>&1)
 RC=$?
 RUNTIME_LIST=$(cat "$RUNTIME_ARTIFACTS/run-changed-source-files.txt" 2>/dev/null || true)
@@ -207,7 +290,7 @@ else
   fail "actual gate rejects run-authored non-ASCII" "rc=$RC output=[$OUT]"
 fi
 
-(cd "$RUNTIME_REPO" && python "$AUTOFIX" --files-from "$RUNTIME_ARTIFACTS/run-changed-source-files.txt" >/dev/null)
+(cd "$RUNTIME_REPO" && "$PYTHON_BIN" "$AUTOFIX" --files-from "$RUNTIME_ARTIFACTS/run-changed-source-files.txt" >/dev/null)
 OUT=$(cd "$RUNTIME_REPO" && ARTIFACTS_DIR="$RUNTIME_ARTIFACTS" bash "$GATE_SCRIPT" 2>&1)
 RC=$?
 if [ "$RC" -eq 0 ] && grep -q 'scanned 1 changed source file' <<< "$OUT"; then
