@@ -2130,6 +2130,7 @@ nodes:
     depends_on: [commit-and-push]
     task_class: clerical
     load_bearing: true
+    timeout: 300000
     bash: |
       set -euo pipefail
       # 2026-05-16 quote-fix: see commit-and-push for rationale.

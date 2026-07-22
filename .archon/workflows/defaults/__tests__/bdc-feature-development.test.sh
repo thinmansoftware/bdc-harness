@@ -6,10 +6,10 @@
 #
 # Test matrix maps 1:1 to defects:
 #   Tests 1-3  -> Defect 1 (commit-and-push push_target regex tolerance)
-#   Tests 4-7  -> Defect 2 (open-pr-if-needed check-first)
-#   Test  8    -> Defect 3 DAG-executor capability check (recorded; was run live during build)
-#   Tests 9-10 -> Defect 3 integration smoke fires (manual via Cauldron; documented, not unit-runnable)
-#   Tests 11-12 -> Defect 4 (fire-wo-local.sh token resolution)
+#   Tests 4-8  -> Defect 2 (open-pr-if-needed check-first + retry timeout budget)
+#   Test  9    -> Defect 3 DAG-executor capability check (recorded; was run live during build)
+#   Tests 10-11 -> Defect 3 integration smoke fires (manual via Cauldron; documented, not unit-runnable)
+#   Tests 12-13 -> Defect 4 (fire-wo-local.sh token resolution)
 #
 # The extractor + PR logic under test are lifted VERBATIM from the live YAML / script
 # so these tests exercise the real shipped code, not a re-typed copy.
@@ -162,23 +162,61 @@ fi
 unset -f gh
 rm -f "$GH_CREATE_COUNT_FILE" "$GH_LIST_COUNT_FILE"
 
+# Test 8 -- open-pr-if-needed has enough subprocess timeout for combined precondition + gh retry budget.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+WORKFLOW_DIR="${SCRIPT_DIR}/.."
+FEATURE_WORKFLOWS=(
+  bdc-feature-development.yaml
+  bdc-feature-development-codex.yaml
+  bdc-feature-development-codex-only.yaml
+  bdc-feature-development-fable.yaml
+  bdc-feature-development-fusion-cx-qwen.yaml
+  bdc-feature-development-grok.yaml
+  bdc-feature-development-zero.yaml
+  bdc-feature-development-zero-open.yaml
+)
+MIN_OPEN_PR_TIMEOUT_MS=240000
+BAD_TIMEOUTS=""
+for workflow in "${FEATURE_WORKFLOWS[@]}"; do
+  timeout_ms=$(
+    awk '
+      /^[[:space:]]*-[[:space:]]id:[[:space:]]open-pr-if-needed[[:space:]]*$/ { in_node=1; next }
+      in_node && /^[[:space:]]*-[[:space:]]id:/ { exit }
+      in_node && /^[[:space:]]*timeout:[[:space:]]*[0-9]+[[:space:]]*$/ {
+        sub(/^[[:space:]]*timeout:[[:space:]]*/, "")
+        sub(/[[:space:]]*$/, "")
+        print
+        exit
+      }
+    ' "${WORKFLOW_DIR}/${workflow}"
+  )
+  if [ -z "$timeout_ms" ] || [ "$timeout_ms" -lt "$MIN_OPEN_PR_TIMEOUT_MS" ]; then
+    BAD_TIMEOUTS="${BAD_TIMEOUTS}${workflow}:${timeout_ms:-missing} "
+  fi
+done
+if [ -z "$BAD_TIMEOUTS" ]; then
+  _ok "Test 8: all feature open-pr-if-needed nodes cover combined retry timeout budget"
+else
+  _no "Test 8: all feature open-pr-if-needed nodes cover combined retry timeout budget" "timeout >= ${MIN_OPEN_PR_TIMEOUT_MS}ms" "$BAD_TIMEOUTS"
+fi
+
 # ---------------------------------------------------------------------------
 # Defect 3 -- capability check + integration smoke fires.
 # ---------------------------------------------------------------------------
-# Test 8 -- DAG-executor capability check (CAPABILITY check, run live during build).
+# Test 9 -- DAG-executor capability check (CAPABILITY check, run live during build).
 # Result recorded: the spec's `on_workflow_status: failed` trigger is NOT supported,
 # but the supported primitives `trigger_rule: all_done` + `when:` (verified live in
 # schemas/dag-node.ts + condition-evaluator.ts) provide an equivalent fallback path.
 # The flip-notion-on-failure node was authored using those supported primitives, so
 # Defect 3 ships in THIS WO (no sub-WO needed). This assertion documents that the
 # capability gate was satisfied before authoring.
-_ok "Test 8: Defect 3 capability gate satisfied (all_done + when supported; on_workflow_status not needed)"
+_ok "Test 9: Defect 3 capability gate satisfied (all_done + when supported; on_workflow_status not needed)"
 
-# Test 9 / Test 10 -- integration smoke fires through Cauldron (require a live run).
+# Test 10 / Test 11 -- integration smoke fires through Cauldron (require a live run).
 # Not unit-runnable: they need the YAML deployed + a fire. Documented in the WO stop
-# conditions; recorded here as SKIP so the 12-test matrix stays 1:1 and visible.
-_skip "Test 9: flip-notion-on-failure fires on failure w/ satisfied validator" "integration; run via Cauldron smoke fire"
-_skip "Test 10: flip-notion-on-failure does NOT fire on real (validator) failure" "integration; run via Cauldron smoke fire"
+# conditions; recorded here as SKIP so the 13-test matrix stays 1:1 and visible.
+_skip "Test 10: flip-notion-on-failure fires on failure w/ satisfied validator" "integration; run via Cauldron smoke fire"
+_skip "Test 11: flip-notion-on-failure does NOT fire on real (validator) failure" "integration; run via Cauldron smoke fire"
 
 # ---------------------------------------------------------------------------
 # Defect 4 -- fire-wo-local.sh token resolution. We test the _resolve_archon_token
@@ -208,24 +246,24 @@ _resolve_archon_token() {
 TMPHOME=$(mktemp -d)
 mkdir -p "$TMPHOME/.claude/reference"
 
-# Test 11 -- resolves token from credentials file when env unset
+# Test 12 -- resolves token from credentials file when env unset
 printf 'ARCHON_OPERATOR_TOKEN=test-token-123\n' > "$TMPHOME/.claude/reference/credentials-archon.env"
 OUT=$( HOME="$TMPHOME" bash -c "$(declare -f _resolve_archon_token); unset ARCHON_OPERATOR_TOKEN; _resolve_archon_token; echo TOKEN=\$ARCHON_OPERATOR_TOKEN" 2>&1 )
 RC=$?
 if [ $RC -eq 0 ] && echo "$OUT" | grep -q "Resolved ARCHON_OPERATOR_TOKEN from credentials file" && echo "$OUT" | grep -q "TOKEN=test-token-123"; then
-  _ok "Test 11: token resolved from credentials file"
+  _ok "Test 12: token resolved from credentials file"
 else
-  _no "Test 11: token resolved from credentials file" "rc=0 resolved + TOKEN=test-token-123" "rc=$RC out=$OUT"
+  _no "Test 12: token resolved from credentials file" "rc=0 resolved + TOKEN=test-token-123" "rc=$RC out=$OUT"
 fi
 
-# Test 12 -- clear error when token absent everywhere
+# Test 13 -- clear error when token absent everywhere
 rm -f "$TMPHOME/.claude/reference/credentials-archon.env"
 OUT=$( HOME="$TMPHOME" bash -c "$(declare -f _resolve_archon_token); unset ARCHON_OPERATOR_TOKEN; _resolve_archon_token" 2>&1 )
 RC=$?
 if [ $RC -ne 0 ] && echo "$OUT" | grep -q "ARCHON_OPERATOR_TOKEN is not set and no credentials file found"; then
-  _ok "Test 12: clear error when token absent everywhere"
+  _ok "Test 13: clear error when token absent everywhere"
 else
-  _no "Test 12: clear error when token absent everywhere" "rc!=0 + clear error" "rc=$RC out=$OUT"
+  _no "Test 13: clear error when token absent everywhere" "rc!=0 + clear error" "rc=$RC out=$OUT"
 fi
 rm -rf "$TMPHOME"
 
