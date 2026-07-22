@@ -496,7 +496,9 @@ describe('Lane consistency: all feature-development lanes share review-base wiri
       const yaml = readFileSync(lane, 'utf8');
       expect(yaml).toContain('  - id: resolve-review-base\n');
       expect(yaml).toContain('depends_on: [war-council-validator, resolve-review-base]');
-      expect(yaml).toContain('depends_on: [diff-review, classify-diff-review, resolve-review-base]');
+      expect(yaml).toContain(
+        'depends_on: [diff-review, classify-diff-review, resolve-review-base]'
+      );
       expect(yaml).toContain('depends_on: [diff-repair, resolve-review-base]');
       expect(yaml).not.toContain('BASE_REF="origin/${BASE_BRANCH:-main}"');
       expect(yaml).toContain('base_branch_override');
