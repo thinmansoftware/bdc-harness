@@ -2139,14 +2139,44 @@ nodes:
         echo "UNIQUE_BRANCH not found in commit-and-push output." >&2
         exit 1
       fi
-      # WO-HARNESS-COMMIT-AND-PUSH-ORIGIN-VERIFY-02: precondition guard. Re-verify
-      # the canonical branch is on origin at local HEAD BEFORE attempting any PR.
-      # If commit-and-push's verify passed this should always hold; failing here
-      # means the branch was lost between nodes -- abort before wasting gh retries.
-      REMOTE_HEAD="$(git ls-remote origin "refs/heads/${UNIQUE_BRANCH}" 2>/dev/null | awk '{print $1}')"
-      if [ "$REMOTE_HEAD" != "$(git rev-parse HEAD)" ]; then
-        echo "FATAL: open-pr precondition failed -- ${UNIQUE_BRANCH} not on origin at HEAD (origin=${REMOTE_HEAD:-<absent>})." >&2
-        exit 1
+      # WO-HARNESS-OPEN-PR-ORIGIN-WAIT-01: tolerate delayed origin visibility,
+      # then re-push and re-verify before failing the PR-open precondition.
+      LOCAL_HEAD="$(git rev-parse HEAD)"
+
+      wait_match() {
+        local attempt remote
+        for attempt in 1 2 3 4 5 6; do
+          remote="$(git ls-remote origin "refs/heads/${UNIQUE_BRANCH}" 2>/dev/null | awk '{print $1}')"
+          if [ -n "$remote" ] && [ "$remote" = "$LOCAL_HEAD" ]; then
+            echo "ORIGIN_PRECONDITION_OK: origin/${UNIQUE_BRANCH} == ${LOCAL_HEAD} (attempt ${attempt})"
+            return 0
+          fi
+          echo "WARN: origin precondition miss attempt ${attempt} (origin=${remote:-<absent>} local=${LOCAL_HEAD}); waiting..." >&2
+          sleep $((attempt * 2))
+        done
+        return 1
+      }
+
+      if ! wait_match; then
+        echo "WARN: origin still missing/mismatched after wait -- re-pushing HEAD:${UNIQUE_BRANCH}" >&2
+        PUSH_OK=false
+        for attempt in 1 2 3; do
+          if git push origin "HEAD:${UNIQUE_BRANCH}" 2>&1; then
+            PUSH_OK=true
+            break
+          fi
+          echo "WARN: re-push attempt ${attempt} failed; retrying..." >&2
+          sleep $((attempt * 5))
+        done
+        if [ "$PUSH_OK" = "false" ]; then
+          echo "FATAL: open-pr re-push failed -- ${UNIQUE_BRANCH} not durable on origin (local=${LOCAL_HEAD})" >&2
+          exit 1
+        fi
+        if ! wait_match; then
+          REMOTE_HEAD="$(git ls-remote origin "refs/heads/${UNIQUE_BRANCH}" 2>/dev/null | awk '{print $1}')"
+          echo "FATAL: open-pr precondition failed after wait+re-push -- ${UNIQUE_BRANCH} not on origin at HEAD (origin=${REMOTE_HEAD:-<absent>} local=${LOCAL_HEAD})." >&2
+          exit 1
+        fi
       fi
       # Rule 29: extract explicit repo from decide-push-target output.
       # Never let gh default to the worktree's origin -- it may be bdc-harness
