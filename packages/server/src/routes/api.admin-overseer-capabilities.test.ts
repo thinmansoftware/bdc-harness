@@ -314,7 +314,10 @@ describe('POST /api/admin/overseer/capabilities/reset', () => {
     process.env.ARCHON_OPERATOR_TOKEN = 'secret-token';
     const app = makeApp();
 
-    for (const capability of ['branch', 'merge', 'lifecycle', 'repair']) {
+    const capabilities = ['branch', 'merge', 'lifecycle', 'repair'] as const;
+    for (const [index, capability] of capabilities.entries()) {
+      const policyDigest = String(index + 1).repeat(64);
+      const verifierDigest = ['a', 'b', 'c', 'd'][index].repeat(64);
       const response = await app.request('/api/admin/overseer/capabilities/reset', {
         method: 'POST',
         headers: {
@@ -325,20 +328,28 @@ describe('POST /api/admin/overseer/capabilities/reset', () => {
           capability,
           reason: 'john-activation',
           correlation_id: `corr-${capability}-reset`,
-          policy_digest: POLICY_DIGEST,
-          verifier_registry_digest: VERIFIER_DIGEST,
+          policy_digest: policyDigest,
+          verifier_registry_digest: verifierDigest,
         }),
       });
 
       expect(response.status).toBe(200);
       const body = (await response.json()) as {
         success: boolean;
-        state: { action_enabled: boolean; circuit_state: string; updated_by: string };
+        state: {
+          action_enabled: boolean;
+          circuit_state: string;
+          policy_digest: string;
+          verifier_registry_digest: string;
+          updated_by: string;
+        };
         event: { event_type: string; actor: string };
       };
       expect(body.success).toBe(true);
       expect(body.state.action_enabled).toBe(true);
       expect(body.state.circuit_state).toBe('closed');
+      expect(body.state.policy_digest).toBe(policyDigest);
+      expect(body.state.verifier_registry_digest).toBe(verifierDigest);
       expect(body.state.updated_by).toBe('operator');
       expect(body.event.event_type).toBe('circuit_reset');
       expect(body.event.actor).toBe('operator');
@@ -346,6 +357,8 @@ describe('POST /api/admin/overseer/capabilities/reset', () => {
       const state = await getOverseerCapabilityState(capability);
       expect(state?.action_enabled).toBe(true);
       expect(state?.circuit_state).toBe('closed');
+      expect(state?.policy_digest).toBe(policyDigest);
+      expect(state?.verifier_registry_digest).toBe(verifierDigest);
     }
   });
 });

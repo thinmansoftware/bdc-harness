@@ -25,6 +25,10 @@ const POLICY_DIGEST = 'a'.repeat(64);
 const VERIFIER_DIGEST = 'b'.repeat(64);
 const ZERO_DIGEST = '0'.repeat(64);
 
+function delay(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
 function cleanupDb(path: string): void {
   if (!path) return;
   for (const suffix of ['', '-wal', '-shm']) {
@@ -452,6 +456,8 @@ describe('overseer capability persistence (sqlite)', () => {
     expect(reset.state.circuit_state).toBe('closed');
     expect(reset.state.circuit_reason).toBeNull();
     expect(reset.state.circuit_opened_at).toBeNull();
+    expect(reset.state.policy_digest).toBe(POLICY_DIGEST);
+    expect(reset.state.verifier_registry_digest).toBe(VERIFIER_DIGEST);
     expect(reset.state.updated_by).toBe('xo-activation');
     expect(reset.event.event_type).toBe('circuit_reset');
     expect(reset.event.capability).toBe('merge');
@@ -494,10 +500,53 @@ describe('overseer capability persistence (sqlite)', () => {
     expect(reset.state.circuit_state).toBe('closed');
     expect(reset.state.circuit_reason).toBeNull();
     expect(reset.state.circuit_opened_at).toBeNull();
+    expect(reset.state.policy_digest).toBe(POLICY_DIGEST);
+    expect(reset.state.verifier_registry_digest).toBe(VERIFIER_DIGEST);
     expect(reset.event.event_type).toBe('circuit_reset');
 
     const events = await listOverseerCapabilityEvents('repair');
     expect(events.map(event => event.event_type)).toEqual(['circuit_opened', 'circuit_reset']);
+  });
+
+  test('reset is idempotent for an already-enabled closed capability', async () => {
+    const first = await resetOverseerCapabilityCircuit({
+      event_id: 'reset-branch-1',
+      capability: 'branch',
+      reason: 'john-activation',
+      actor: 'xo-activation',
+      correlation_id: 'corr-reset-branch-1',
+      policy_digest: POLICY_DIGEST,
+      verifier_registry_digest: VERIFIER_DIGEST,
+    });
+
+    await delay(5);
+
+    const secondPolicyDigest = 'c'.repeat(64);
+    const secondVerifierDigest = 'd'.repeat(64);
+    const second = await resetOverseerCapabilityCircuit({
+      event_id: 'reset-branch-2',
+      capability: 'branch',
+      reason: 'john-activation-refresh',
+      actor: 'xo-activation-refresh',
+      correlation_id: 'corr-reset-branch-2',
+      policy_digest: secondPolicyDigest,
+      verifier_registry_digest: secondVerifierDigest,
+    });
+
+    expect(first.state.action_enabled).toBe(true);
+    expect(first.state.circuit_state).toBe('closed');
+    expect(second.state.action_enabled).toBe(true);
+    expect(second.state.circuit_state).toBe('closed');
+    expect(second.state.policy_digest).toBe(secondPolicyDigest);
+    expect(second.state.verifier_registry_digest).toBe(secondVerifierDigest);
+    expect(second.state.updated_by).toBe('xo-activation-refresh');
+    expect(second.state.updated_at).not.toBe(first.state.updated_at);
+    expect(second.event.event_type).toBe('circuit_reset');
+    expect(second.event.event_id).toBe('reset-branch-2');
+
+    const events = await listOverseerCapabilityEvents('branch');
+    expect(events.map(event => event.event_id)).toEqual(['reset-branch-1', 'reset-branch-2']);
+    expect(events.map(event => event.event_type)).toEqual(['circuit_reset', 'circuit_reset']);
   });
 
   test('rolls back circuit state when its event append fails', async () => {
