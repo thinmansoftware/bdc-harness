@@ -28,6 +28,7 @@ import { assessBranchRefreshCandidate } from './actions/refresh-rebase';
 import { assessLifecycleCandidate } from './actions/lifecycle';
 import { assessQualifiedMerge } from './actions/merge-ready';
 import { assertOverseerDefaultOff } from './integration-scenarios';
+import { createRealGitHubClientDeps } from './adapters/github-real-deps';
 
 /**
  * Integrated S4-S7 assessment surface for Slice 8 wiring.
@@ -334,9 +335,9 @@ export async function runOverseerService(options: OverseerServiceOptions = {}): 
  * When fake mode is requested: wires stub findPullRequest/mergePullRequest so no live
  * Octokit is constructed and no real GitHub network call can be made.
  */
-export function resolveDefaultDeps(): OverseerRunStoreDeps &
-  OverseerActionsDeps &
-  GitHubClientDeps {
+export function resolveDefaultDeps(
+  realGitHubDepsFactory: () => GitHubClientDeps = createRealGitHubClientDeps
+): OverseerRunStoreDeps & OverseerActionsDeps & GitHubClientDeps {
   const storeAndActions = {
     listRunsForWatch: listRunsForOverseerWatch,
     listRunEvents: listRunEventsForOverseer,
@@ -351,27 +352,35 @@ export function resolveDefaultDeps(): OverseerRunStoreDeps &
     },
   };
 
-  log.info('overseer_service.using_fake_github_adapter');
-  const fakePr: PullRequestEvidence = {
-    exists: false,
-    state: 'missing',
-    checks: { total: 0, passed: 0, failed: 0, pending: 0 },
-    mergeable: null,
-  };
+  const requestedAdapterKind = resolveRequestedAdapterKind();
+  if (requestedAdapterKind === 'fake') {
+    log.info('overseer_service.using_fake_github_adapter');
+    const fakePr: PullRequestEvidence = {
+      exists: false,
+      state: 'missing',
+      checks: { total: 0, passed: 0, failed: 0, pending: 0 },
+      mergeable: null,
+    };
+    return {
+      ...storeAndActions,
+      findPullRequest: async (): Promise<PullRequestEvidence> => {
+        log.info('overseer_service.fake_find_pull_request_noop');
+        return fakePr;
+      },
+      mergePullRequest: async (): Promise<{ merged: boolean; message?: string }> => {
+        throw new Error('overseer_slice1_direct_merge_unreachable');
+      },
+    };
+  }
+
   return {
     ...storeAndActions,
-    findPullRequest: async (): Promise<PullRequestEvidence> => {
-      log.info('overseer_service.fake_find_pull_request_noop');
-      return fakePr;
-    },
-    mergePullRequest: async (): Promise<{ merged: boolean; message?: string }> => {
-      throw new Error('overseer_slice1_direct_merge_unreachable');
-    },
+    ...realGitHubDepsFactory(),
   };
 }
 
 function resolveRequestedAdapterKind(): OverseerWiredAdapterKind {
-  return envEnabled(process.env.OVERSEER_USE_FAKE_GITHUB_ADAPTER) ? 'fake' : 'none';
+  return envEnabled(process.env.OVERSEER_USE_FAKE_GITHUB_ADAPTER) ? 'fake' : 'real';
 }
 
 if (import.meta.main) {

@@ -154,8 +154,11 @@ function envEnabled(value: string | undefined): boolean {
   return value === '1' || value === 'true' || value === 'yes';
 }
 
-function startOverseerRuntimeWithOptionalMergeManager(): void {
-  if (!envEnabled(process.env.OVERSEER_MERGE_MANAGER_ENABLED)) {
+function startOverseerRuntimeWithRealMergeManager(): void {
+  const token = process.env.GH_TOKEN ?? process.env.GITHUB_TOKEN ?? '';
+  const realAdapterRequested =
+    !envEnabled(process.env.OVERSEER_USE_FAKE_GITHUB_ADAPTER) && token.length > 0;
+  if (!realAdapterRequested) {
     startOverseerRuntime();
     return;
   }
@@ -245,7 +248,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     process.exit(1);
   }
 
-  startOverseerRuntimeWithOptionalMergeManager();
+  startOverseerRuntimeWithRealMergeManager();
 
   const config = await loadConfig();
   logConfig(config);
