@@ -5,7 +5,11 @@ import { join } from 'path';
 import { closeDatabase, getDatabase, resetDatabase } from '@archon/core/db/connection';
 import { listOverseerCapabilityEvents } from '@archon/core/db/overseer-capabilities';
 import { listOperatorCards } from '@archon/core/db/overseer-briefing';
-import { runOperatorCardDeliveryScheduler, runOverseerService } from '../service.ts';
+import {
+  resolveDefaultDeps,
+  runOperatorCardDeliveryScheduler,
+  runOverseerService,
+} from '../service.ts';
 import type { M31ActionPermit, M31ActionProposal } from '../m31-substrate.ts';
 
 const ENV_KEYS = [
@@ -181,6 +185,67 @@ function enableFakeCapability(capability: 'merge' | 'escalation'): void {
 }
 
 describe('service', () => {
+  test('resolveDefaultDeps preserves the fake GitHub adapter behavior', async () => {
+    process.env.OVERSEER_USE_FAKE_GITHUB_ADAPTER = 'true';
+    const realFactory = mock(() => {
+      throw new Error('real factory must not run');
+    });
+    const deps = resolveDefaultDeps(realFactory);
+
+    await expect(
+      deps.findPullRequest({
+        owner: 'bluedevilcollectibles',
+        repo: 'bdc-harness',
+        headBranch: 'fix/fake',
+        woId: 'WO-FAKE',
+      })
+    ).resolves.toEqual({
+      exists: false,
+      state: 'missing',
+      checks: { total: 0, passed: 0, failed: 0, pending: 0 },
+      mergeable: null,
+    });
+    await expect(
+      deps.mergePullRequest({
+        owner: 'bluedevilcollectibles',
+        repo: 'bdc-harness',
+        number: 42,
+      })
+    ).rejects.toThrow('overseer_slice1_direct_merge_unreachable');
+    expect(realFactory).not.toHaveBeenCalled();
+  });
+
+  test('resolveDefaultDeps uses real GitHub deps when fake mode is not requested', async () => {
+    process.env.OVERSEER_USE_FAKE_GITHUB_ADAPTER = 'false';
+    const findPullRequest = mock(async () => ({
+      exists: true as const,
+      state: 'open',
+      checks: { total: 1, passed: 1, failed: 0, pending: 0 },
+      mergeable: true,
+      pr: { owner: 'bluedevilcollectibles', repo: 'bdc-harness', number: 42 },
+    }));
+    const mergePullRequest = mock(async () => ({ merged: true, message: 'merged' }));
+    const realFactory = mock(() => ({ findPullRequest, mergePullRequest }));
+    const deps = resolveDefaultDeps(realFactory);
+
+    await expect(
+      deps.findPullRequest({
+        owner: 'bluedevilcollectibles',
+        repo: 'bdc-harness',
+        headBranch: 'fix/real',
+        woId: 'WO-REAL',
+      })
+    ).resolves.toMatchObject({ exists: true, pr: { number: 42 } });
+    await expect(
+      deps.mergePullRequest({
+        owner: 'bluedevilcollectibles',
+        repo: 'bdc-harness',
+        number: 42,
+      })
+    ).resolves.toEqual({ merged: true, message: 'merged' });
+    expect(realFactory).toHaveBeenCalledTimes(1);
+  });
+
   beforeEach(() => {
     process.env.GITHUB_TOKEN = '';
     process.env.GH_TOKEN = '';

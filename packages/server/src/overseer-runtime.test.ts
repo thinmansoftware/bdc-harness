@@ -7,9 +7,14 @@ const listCapabilityStatesMock = mock(
 );
 
 // Capture adapterKind passed into runOverseerService for real-wiring assertions.
-let capturedServiceOptions: { adapterKind?: string; deliveryEnabled?: boolean } | null = null;
+let capturedServiceOptions: {
+  adapterKind?: string;
+  deliveryEnabled?: boolean;
+  deps?: unknown;
+  mergeCoordinator?: unknown;
+} | null = null;
 const runOverseerServiceMock = mock(async (opts?: unknown) => {
-  capturedServiceOptions = (opts ?? {}) as { adapterKind?: string; deliveryEnabled?: boolean };
+  capturedServiceOptions = (opts ?? {}) as NonNullable<typeof capturedServiceOptions>;
 });
 
 import {
@@ -58,6 +63,8 @@ describe('overseer-runtime', () => {
       capturedServiceOptions = (opts ?? {}) as {
         adapterKind?: string;
         deliveryEnabled?: boolean;
+        deps?: unknown;
+        mergeCoordinator?: unknown;
       };
     });
     listCapabilityStatesMock.mockReset();
@@ -312,6 +319,8 @@ describe('overseer-runtime', () => {
     expect(status.adapter).toBe('real');
     expect(status.watcher).toBe('stopped');
     expect(capturedServiceOptions?.adapterKind).toBe('real');
+    expect(capturedServiceOptions?.deps).toBe(deps);
+    expect(capturedServiceOptions?.mergeCoordinator).toBe(mergeManager);
     await stopOverseerRuntime();
   });
 

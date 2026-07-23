@@ -1,5 +1,10 @@
 import { describe, expect, mock, test } from 'bun:test';
 import { createGitHubQualifiedMergeAdapter } from '../adapters/github-qualified-merge.ts';
+import {
+  createRealFindPullRequest,
+  createRealMergePullRequest,
+  type RealGitHubOctokitLike,
+} from '../adapters/github-real-deps.ts';
 import type { QualifiedMergeAdapterRequestV2 } from '../actions/merge-ready.ts';
 
 const request: QualifiedMergeAdapterRequestV2 = {
@@ -59,6 +64,202 @@ describe('GitHub qualified merge adapter', () => {
     await expect(adapter.attemptMerge(request)).resolves.toMatchObject({
       status: 'indeterminate',
       reason: 'github_merge_transport_ambiguous',
+    });
+  });
+});
+
+function createOctokitMock(overrides: Partial<RealGitHubOctokitLike> = {}): RealGitHubOctokitLike {
+  return {
+    pulls: {
+      list: async () => ({ data: [] }),
+      get: async () => ({
+        data: {
+          number: 42,
+          title: 'WO-42 real merge',
+          state: 'open',
+          mergeable: true,
+          html_url: 'https://github.test/pull/42',
+          changed_files: 3,
+          head: { sha: 'a'.repeat(40) },
+        },
+      }),
+      merge: async () => ({ data: { merged: true, sha: 'a'.repeat(40) } }),
+      ...overrides.pulls,
+    },
+    search: {
+      issuesAndPullRequests: async () => ({ data: { items: [] } }),
+      ...overrides.search,
+    },
+    checks: {
+      listForRef: async () => ({ data: { check_runs: [] } }),
+      ...overrides.checks,
+    },
+  };
+}
+
+describe('real GitHub deps', () => {
+  test('finds a pull request by head branch and summarizes check runs', async () => {
+    const list = mock(async () => ({
+      data: [
+        {
+          number: 42,
+          title: 'WO-42 real merge',
+          state: 'open',
+          html_url: 'https://github.test/pull/42',
+          head: { sha: 'a'.repeat(40) },
+        },
+      ],
+    }));
+    const search = mock(async () => ({ data: { items: [] } }));
+    const octokit = createOctokitMock({
+      pulls: { ...createOctokitMock().pulls, list },
+      search: { issuesAndPullRequests: search },
+      checks: {
+        listForRef: async () => ({
+          data: {
+            check_runs: [
+              { status: 'completed', conclusion: 'success' },
+              { status: 'completed', conclusion: 'neutral' },
+              { status: 'completed', conclusion: 'failure' },
+              { status: 'in_progress', conclusion: null },
+            ],
+          },
+        }),
+      },
+    });
+
+    const result = await createRealFindPullRequest(octokit)({
+      owner: 'bluedevilcollectibles',
+      repo: 'bdc-harness',
+      headBranch: 'fix/wo-42',
+      woId: 'WO-42',
+    });
+
+    expect(list).toHaveBeenCalledWith({
+      owner: 'bluedevilcollectibles',
+      repo: 'bdc-harness',
+      head: 'bluedevilcollectibles:fix/wo-42',
+      state: 'all',
+      per_page: 5,
+    });
+    expect(search).not.toHaveBeenCalled();
+    expect(result).toMatchObject({
+      exists: true,
+      state: 'open',
+      checks: { total: 4, passed: 2, failed: 1, pending: 1 },
+      pr: { owner: 'bluedevilcollectibles', repo: 'bdc-harness', number: 42 },
+    });
+  });
+
+  test('falls back to WO-ID search when the head branch has no pull request', async () => {
+    const search = mock(async () => ({
+      data: { items: [{ number: 77, pull_request: {} }] },
+    }));
+    const get = mock(async () => ({
+      data: {
+        number: 77,
+        title: 'WO-FALLBACK-77',
+        state: 'open',
+        mergeable: true,
+        html_url: 'https://github.test/pull/77',
+        changed_files: 1,
+        head: { sha: 'b'.repeat(40) },
+      },
+    }));
+    const octokit = createOctokitMock({
+      pulls: { ...createOctokitMock().pulls, get },
+      search: { issuesAndPullRequests: search },
+    });
+
+    const result = await createRealFindPullRequest(octokit)({
+      owner: 'bluedevilcollectibles',
+      repo: 'bdc-harness',
+      headBranch: 'fix/missing-head',
+      woId: 'WO-FALLBACK-77',
+    });
+
+    expect(search).toHaveBeenCalledWith({
+      q: 'repo:bluedevilcollectibles/bdc-harness is:pr WO-FALLBACK-77 in:title',
+      per_page: 5,
+    });
+    expect(get).toHaveBeenCalledWith({
+      owner: 'bluedevilcollectibles',
+      repo: 'bdc-harness',
+      pull_number: 77,
+    });
+    expect(result.pr?.number).toBe(77);
+  });
+
+  test('returns missing evidence when no pull request matches', async () => {
+    const result = await createRealFindPullRequest(createOctokitMock())({
+      owner: 'bluedevilcollectibles',
+      repo: 'bdc-harness',
+      headBranch: 'fix/not-found',
+      woId: 'WO-NOT-FOUND',
+    });
+
+    expect(result).toEqual({
+      exists: false,
+      state: 'missing',
+      checks: { total: 0, passed: 0, failed: 0, pending: 0 },
+      mergeable: null,
+    });
+  });
+
+  test('merges with the current pull request head SHA', async () => {
+    const merge = mock(async () => ({ data: { merged: true, sha: 'a'.repeat(40) } }));
+    const result = await createRealMergePullRequest(
+      createOctokitMock({ pulls: { ...createOctokitMock().pulls, merge } })
+    )({
+      owner: 'bluedevilcollectibles',
+      repo: 'bdc-harness',
+      number: 42,
+      commitTitle: 'Overseer merge WO-42',
+    });
+
+    expect(merge).toHaveBeenCalledWith({
+      owner: 'bluedevilcollectibles',
+      repo: 'bdc-harness',
+      pull_number: 42,
+      sha: 'a'.repeat(40),
+    });
+    expect(result).toEqual({ merged: true, message: 'Overseer merge WO-42' });
+  });
+
+  test('maps 409 and 422 merge rejections', async () => {
+    for (const status of [409, 422]) {
+      const octokit = createOctokitMock({
+        pulls: {
+          ...createOctokitMock().pulls,
+          merge: async () => Promise.reject({ status }),
+        },
+      });
+      await expect(
+        createRealMergePullRequest(octokit)({
+          owner: 'bluedevilcollectibles',
+          repo: 'bdc-harness',
+          number: 42,
+        })
+      ).resolves.toEqual({ merged: false, message: `github_merge_rejected_${status}` });
+    }
+  });
+
+  test('maps other merge errors as transport ambiguous', async () => {
+    const octokit = createOctokitMock({
+      pulls: {
+        ...createOctokitMock().pulls,
+        merge: async () => Promise.reject(new Error('socket closed')),
+      },
+    });
+    await expect(
+      createRealMergePullRequest(octokit)({
+        owner: 'bluedevilcollectibles',
+        repo: 'bdc-harness',
+        number: 42,
+      })
+    ).resolves.toEqual({
+      merged: false,
+      message: 'github_merge_transport_ambiguous',
     });
   });
 });
