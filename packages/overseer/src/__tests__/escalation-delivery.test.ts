@@ -615,20 +615,32 @@ describe('default informational channel adapters', () => {
     return view;
   }
 
-  test('default Dispatch adapter writes one guarded idempotent run report', async () => {
+  test('default Dispatch adapter routes a guarded run report to the resolved owner', async () => {
     const view = await defaultCardView();
-    const dispatch = createDefaultOperatorCardChannels({ fetch: globalThis.fetch }).find(
-      channel => channel.channel === 'dispatch'
-    );
+    const dispatch = createDefaultOperatorCardChannels({
+      fetch: globalThis.fetch,
+      resolve_owner: mock(async () => 'Grok'),
+    }).find(channel => channel.channel === 'dispatch');
     if (!dispatch) throw new Error('dispatch_channel_missing');
     const result = await dispatch.deliver(view, `operator-card:${view.card.card_id}:dispatch`);
-    const messages = await listMessages({ recipient: 'operator' });
+    const messages = await listMessages({ recipient: 'Grok' });
     expect(result.outcome).toBe('succeeded');
     expect(messages).toHaveLength(1);
     expect(JSON.parse(messages[0]?.body ?? '{}')).toMatchObject({
       card_id: view.card.card_id,
       payload_digest: view.card.payload_digest,
     });
+  });
+
+  test('default Dispatch adapter falls back to operator when owner resolution returns null', async () => {
+    const view = await defaultCardView();
+    const dispatch = createDefaultOperatorCardChannels({
+      fetch: globalThis.fetch,
+      resolve_owner: mock(async () => null),
+    }).find(channel => channel.channel === 'dispatch');
+    if (!dispatch) throw new Error('dispatch_channel_missing');
+    await dispatch.deliver(view, `operator-card:${view.card.card_id}:dispatch`);
+    expect(await listMessages({ recipient: 'operator' })).toHaveLength(1);
   });
 
   test('default builder-monitor adapter uses injected fetch and frozen payload', async () => {

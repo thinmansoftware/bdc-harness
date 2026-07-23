@@ -43,6 +43,12 @@ export {
   deliverOperatorCard,
   runDueOperatorCardDeliveries,
 } from './escalation-delivery';
+export {
+  extractBoardSeat,
+  resolveWoBoardSeatOwner,
+  type BoardSeat,
+  type OwnerResolutionOctokitLike,
+} from './owner-resolution';
 export type {
   ChannelDeliveryResult,
   DeliveryStore,
