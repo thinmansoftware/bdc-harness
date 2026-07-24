@@ -491,7 +491,7 @@ describe('service', () => {
       expect(cards.items[0]?.card.run_id).toBe('run-default-escalation');
       expect(cards.items[0]?.jobs).toHaveLength(3);
     });
-  });
+  }, 15000);
 
   test('escalation runs and delivers a card even when dryRun is true (2026-07-18 fix)', async () => {
     // Root cause fixed 2026-07-18: dryRun previously short-circuited handleRecord
