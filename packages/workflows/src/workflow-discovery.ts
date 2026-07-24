@@ -329,6 +329,16 @@ export async function discoverWorkflows(
     for (const [filename, workflow] of repoResult.workflows) {
       const existing = workflowsByFile.get(filename);
       if (repoResult.directWorkflows.has(filename)) {
+        // A root-level project workflow file with the same name as a bundled
+        // default silently shadows it. This is a documented, intentional
+        // override surface for consumers of Archon -- but for a repo whose
+        // own defaults/ IS the source of truth (e.g. bdc-harness authoring its
+        // own bundled workflows), it can only be an accidental leak (a run
+        // artifact committed by mistake) freezing all future defaults/ fixes.
+        // WARN (not debug) so this is visible without LOG_LEVEL=debug.
+        if (existing?.source === 'bundled') {
+          getLog().warn({ filename }, 'repo_workflow_shadows_bundled_default_by_filename');
+        }
         workflowsByFile.set(filename, { workflow, source: 'project' });
       } else if (existing?.source === 'bundled') {
         // This file was already loaded as a bundled default -- the repo's defaults/
