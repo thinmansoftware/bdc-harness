@@ -11,6 +11,7 @@ import {
 import { createMessage } from '@archon/core/db/dispatch';
 import { assessDispatchMessageBody } from '@archon/core/utils/dispatch-content-guard';
 import { buildDispatchRunReportBody, lookupNotionPage } from './escalate';
+import { resolveWoBoardSeatOwner } from './owner-resolution';
 
 export interface ChannelDeliveryResult {
   outcome: DeliveryOutcome;
@@ -37,6 +38,7 @@ export interface OperatorCardChannelDeps {
   notion_api_key?: string;
   notion_database_id: string;
   builder_monitor_url: string;
+  resolve_owner: (woId: string) => Promise<string | null>;
 }
 
 const defaultStore: DeliveryStore = {
@@ -77,6 +79,7 @@ export function createDefaultOperatorCardChannels(
       overrides.builder_monitor_url ??
       process.env.BUILDER_MONITOR_WEBHOOK_URL ??
       DEFAULT_BUILDER_MONITOR_URL,
+    resolve_owner: overrides.resolve_owner ?? resolveWoBoardSeatOwner,
   };
 
   const dispatch: OperatorCardChannel = {
@@ -96,7 +99,7 @@ export function createDefaultOperatorCardChannels(
         idempotency_key: idempotencyKey,
         task_type: 'run_report',
         sender: 'overseer',
-        recipient: 'operator',
+        recipient: (await deps.resolve_owner(card.card.wo_id)) ?? 'operator',
         body,
       });
       return {
