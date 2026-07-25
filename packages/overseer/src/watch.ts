@@ -88,6 +88,40 @@ async function assessRun(
     };
   }
 
+  // A CANCELLED run is not nothing. The conductor cancels a run when it stalls or
+  // hits the runaway ceiling, then exits -- so any work the run had already pushed
+  // is left with no owner. Before 2026-07-25 this branch returned `ignore` with
+  // "does not require failure handling", and the commit died in its worktree.
+  //
+  // Anchor: run 3ff3f773 (WO-HARNESS-DISPATCH-SYNC-BEFORE-RESOLVE-01) was cancelled
+  // on a progress-timeout having produced a real commit; the live container log shows
+  // Overseer reading it and returning action:"ignore". Salvage is precisely Overseer's
+  // job -- it is the persistent watcher, while the conductor is a CLI process that has
+  // already exited by then.
+  //
+  // Detection stays with the conductor (it is already polling and holds tier/attempt
+  // context). Overseer picks the run up at the terminal-state boundary. Clean handoff,
+  // no duplicated polling, no race.
+  if (run.status === 'cancelled' && isPrMergeReady(prEvidence)) {
+    return {
+      runId: run.id,
+      woId: run.woId,
+      repo: run.repo,
+      owner: run.owner,
+      status: run.status,
+      headBranch: run.headBranch,
+      metadata: run.metadata,
+      errorClass: 'tail_node_false_fail',
+      action: 'merge_ready',
+      reason: 'cancelled run left a green, mergeable PR -- salvaging orphaned work',
+      prEvidence,
+      decision: {
+        decision: 'merge_ready',
+        reason: 'cancelled run left a green, mergeable PR -- salvaging orphaned work',
+      },
+    };
+  }
+
   if (run.status !== 'failed') {
     return {
       runId: run.id,
