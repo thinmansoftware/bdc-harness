@@ -49,6 +49,7 @@ function makePassVerdict(): GateVerdict {
   return {
     pass: true,
     reason: 'all gate conditions passed',
+    cancelled: false,
     validatorVerdict: 'satisfied',
     prOpened: true,
     prMergeable: true,
@@ -60,6 +61,7 @@ function makeFailVerdict(reason: string): GateVerdict {
   return {
     pass: false,
     reason,
+    cancelled: false,
     validatorVerdict: 'needs_revision',
     prOpened: false,
     prMergeable: null,
@@ -811,5 +813,159 @@ describe('config file smoke tests', () => {
     expect(ruleset.defaultEntry).toBe('codex');
     expect(Array.isArray(ruleset.rules)).toBe(true);
     expect(ruleset.rules.length).toBeGreaterThan(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Motion M-86: cancelled STOPS the cascade instead of climbing.
+//
+// These tests OMIT `deps.judge` so `judgeImpl` resolves to the REAL judgeGate +
+// classifyAttemptOutcome (cascade.ts: judgeImpl = opts.deps?.judge ?? judgeGate).
+// Prior coverage stubbed judge entirely and never exercised terminal-status
+// branching, so failed/escalated climb behavior was never actually proven.
+// ---------------------------------------------------------------------------
+
+describe('Test: cancelled stops the cascade (real gate)', () => {
+  test('cancelled on a non-frontier tier stops -- never climbs, never a win', async () => {
+    const fireCalls: string[] = [];
+    let capturedRecord: CascadeRunRecord | null = null;
+
+    const deps: CascadeDeps = {
+      fire: async opts => {
+        fireCalls.push(opts.workflowName);
+        return makeFireOk(`run-${fireCalls.length}`);
+      },
+      // Realistic cancelled PollResult: no PR, unknown validator verdict.
+      poll: async _opts =>
+        makePollResult({
+          terminalStatus: 'cancelled',
+          prUrl: null,
+          prMergeable: null,
+          validatorVerdict: 'unknown',
+        }),
+      escalate: async _ctx => {
+        /* no-op */
+      },
+      writeRecord: async (record, _dir) => {
+        capturedRecord = record;
+        return `/tmp/cascade-record-${record.cascadeId}.json`;
+      },
+      cancel: async _opts => ({ ok: true, error: null }),
+    };
+
+    const record = await runCascade(baseOpts({ deps }));
+
+    // Only the entry (non-frontier) tier fired -- no climb.
+    expect(fireCalls.length).toBe(1);
+    const tiers = loadLadder();
+    expect(fireCalls[0]).toBe(tiers[0]?.workflowName);
+    expect(tiers[0]?.isFrontier).toBe(false);
+
+    // Cascade stopped as cancelled -- not won, not blocked.
+    expect(record.status).toBe('cancelled');
+    expect(record.status).not.toBe('won');
+    expect(record.attempts.length).toBe(1);
+    expect(record.attempts[0]?.outcome).toBe('cancelled');
+    // Reason is truthful and does not claim a win.
+    expect(record.attempts[0]?.gateFailReason).toContain('cancelled externally');
+
+    // Record honesty (spec scenario 6): the SERIALIZED record -- not just the
+    // in-memory return value -- carries status: 'cancelled'.
+    expect(capturedRecord).not.toBeNull();
+    expect((capturedRecord as unknown as CascadeRunRecord).status).toBe('cancelled');
+  });
+
+  test('cancelled is never pass:true under the real gate (otherwise-clean fields)', async () => {
+    // Even with validator satisfied + PR mergeable, cancelled must fail the gate.
+    const deps: CascadeDeps = {
+      fire: async () => makeFireOk('run-1'),
+      poll: async _opts =>
+        makePollResult({
+          terminalStatus: 'cancelled',
+          validatorVerdict: 'satisfied',
+          prUrl: 'https://github.com/org/repo/pull/9',
+          prMergeable: true,
+        }),
+      escalate: async _ctx => {
+        /* no-op */
+      },
+      writeRecord: async (record, _dir) => `/tmp/cascade-record-${record.cascadeId}.json`,
+      cancel: async _opts => ({ ok: true, error: null }),
+    };
+
+    const record = await runCascade(baseOpts({ deps }));
+
+    expect(record.status).toBe('cancelled');
+    expect(record.status).not.toBe('won');
+    expect(record.attempts[0]?.outcome).toBe('cancelled');
+  });
+
+  test('failed still climbs under the real gate (regression: scenario 4)', async () => {
+    const fireCalls: string[] = [];
+    let pollCallIndex = 0;
+
+    const deps: CascadeDeps = {
+      fire: async opts => {
+        fireCalls.push(opts.workflowName);
+        return makeFireOk(`run-${fireCalls.length}`);
+      },
+      poll: async _opts => {
+        pollCallIndex++;
+        // Tier 0 fails (real gate -> gate-failed -> climb); tier 1 passes.
+        if (pollCallIndex === 1) {
+          return makePollResult({
+            terminalStatus: 'failed',
+            prUrl: null,
+            prMergeable: null,
+            validatorVerdict: 'unknown',
+          });
+        }
+        return makePollResult();
+      },
+      escalate: async _ctx => {
+        /* no-op */
+      },
+      writeRecord: async (record, _dir) => `/tmp/cascade-record-${record.cascadeId}.json`,
+    };
+
+    const record = await runCascade(baseOpts({ deps }));
+
+    expect(fireCalls.length).toBe(2);
+    expect(record.attempts[0]?.outcome).toBe('gate-failed');
+    expect(record.status).toBe('won');
+  });
+
+  test('escalated still climbs under the real gate (regression: scenario 5)', async () => {
+    const fireCalls: string[] = [];
+    let pollCallIndex = 0;
+
+    const deps: CascadeDeps = {
+      fire: async opts => {
+        fireCalls.push(opts.workflowName);
+        return makeFireOk(`run-${fireCalls.length}`);
+      },
+      poll: async _opts => {
+        pollCallIndex++;
+        if (pollCallIndex === 1) {
+          return makePollResult({
+            terminalStatus: 'escalated',
+            prUrl: null,
+            prMergeable: null,
+            validatorVerdict: 'unknown',
+          });
+        }
+        return makePollResult();
+      },
+      escalate: async _ctx => {
+        /* no-op */
+      },
+      writeRecord: async (record, _dir) => `/tmp/cascade-record-${record.cascadeId}.json`,
+    };
+
+    const record = await runCascade(baseOpts({ deps }));
+
+    expect(fireCalls.length).toBe(2);
+    expect(record.attempts[0]?.outcome).toBe('gate-failed');
+    expect(record.status).toBe('won');
   });
 });

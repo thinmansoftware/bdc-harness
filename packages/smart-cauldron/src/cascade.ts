@@ -646,6 +646,16 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
       break;
     }
 
+    if (outcome === 'cancelled') {
+      // Externally cancelled (Motion M-86): a human deliberately stopped this
+      // run. STOP the cascade -- do NOT call climbOrStop. Record the truth:
+      // status/outcome are 'cancelled', never a false win, never spec-repair.
+      status = 'cancelled';
+      console.log(`[smart-cauldron] CANCELLED on tier=${tier.name}: ${verdict.reason}`);
+      await checkpoint();
+      break;
+    }
+
     // Gate failed
     console.log(`[smart-cauldron] Gate failed on tier=${tier.name}: ${verdict.reason}`);
 

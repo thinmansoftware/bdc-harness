@@ -62,6 +62,19 @@ describe('statusToExitCode', () => {
     expect(statusToExitCode('spec-repair')).not.toBe(statusToExitCode('won'));
   });
 
+  test('cancelled maps to a distinct non-zero code', () => {
+    const code = statusToExitCode('cancelled');
+    // A cancelled cascade must not collapse to won (0) or reuse any other
+    // assigned code -- otherwise an operator's cancel is indistinguishable
+    // from a win or a climb outcome.
+    expect(Number.isInteger(code)).toBe(true);
+    expect(code).not.toBe(0);
+    expect(code).not.toBe(statusToExitCode('blocked'));
+    expect(code).not.toBe(statusToExitCode('infra-alert'));
+    expect(code).not.toBe(statusToExitCode('spec-repair'));
+    expect(code).not.toBe(statusToExitCode('running'));
+  });
+
   test('every CascadeStatus maps to an integer exit code', () => {
     const statuses: CascadeStatus[] = [
       'planned',
@@ -70,6 +83,7 @@ describe('statusToExitCode', () => {
       'blocked',
       'spec-repair',
       'infra-alert',
+      'cancelled',
     ];
     for (const status of statuses) {
       expect(Number.isInteger(statusToExitCode(status))).toBe(true);

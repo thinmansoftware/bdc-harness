@@ -12,7 +12,8 @@ export type TierOutcome =
   | 'won' // gate passed -- cascade stops
   | 'gate-failed' // ran, built, gate failed -- climb
   | 'infra-error' // auth/transport failure -- alert, do not count as "too hard"
-  | 'progress-timeout'; // poll watchdog kill -- run never reached terminal; climb like gate-failed
+  | 'progress-timeout' // poll watchdog kill -- run never reached terminal; climb like gate-failed
+  | 'cancelled'; // externally cancelled; stop, do not climb
 
 export interface LadderTier {
   name: TierName;
@@ -51,7 +52,8 @@ export type CascadeStatus =
   | 'blocked' // all tiers exhausted without a frontier (defensive; should not happen)
   | 'spec-repair' // frontier (fable) tier gate-failed -> SPEC-REPAIR escalation, not a dead end
   | 'recovery-delegated' // an explicitly injected fenced supervisor accepted recovery ownership
-  | 'infra-alert'; // infra-error on a tier (escalate/alert, not climb silently)
+  | 'infra-alert' // infra-error on a tier (escalate/alert, not climb silently)
+  | 'cancelled'; // an attempt was externally cancelled; cascade stopped
 
 export interface CascadeRunRecord {
   cascadeId: string; // randomUUID
@@ -99,6 +101,7 @@ export interface CascadeRunRecord {
 export interface GateVerdict {
   pass: boolean;
   reason: string; // human-readable -- which condition failed
+  cancelled: boolean; // run was externally cancelled -- stop the cascade, never a win, never a climb
   validatorVerdict: 'satisfied' | 'needs_revision' | 'unknown';
   prOpened: boolean;
   prMergeable: boolean | null;
