@@ -3,6 +3,8 @@ import { createMergeManager } from '../merge-manager.ts';
 import type { QualifiedMergeEvidence } from '../actions/merge-ready.ts';
 import type { GrokDispositionReceipt, WatchedRunRecord } from '../types.ts';
 
+const RUN_HEAD_SHA = 'a'.repeat(40);
+
 const record: WatchedRunRecord = {
   runId: 'run-merge-manager-1',
   woId: 'WO-MERGE-MANAGER-01',
@@ -12,6 +14,8 @@ const record: WatchedRunRecord = {
   action: 'merge_ready',
   reason: 'green PR',
   errorClass: 'tail_node_false_fail',
+  // Engine-written worktree path -- required for merge provenance.
+  workingPath: '/archon/worktrees/run-merge-manager-1',
   prEvidence: {
     exists: true,
     state: 'open',
@@ -21,8 +25,12 @@ const record: WatchedRunRecord = {
     prTitle: 'Ready to merge',
     filesChangedCount: 1,
     diffStat: '+1 -0',
+    headSha: RUN_HEAD_SHA,
   },
 };
+
+/** Stand-in for git: the run's worktree tip matches the PR head. */
+const readWorktreeHeadSha = async (): Promise<string | null> => RUN_HEAD_SHA;
 
 function evidence(overrides: Partial<QualifiedMergeEvidence> = {}): QualifiedMergeEvidence {
   return {
@@ -85,6 +93,7 @@ describe('merge manager', () => {
       insertOverseerAction,
       findPullRequest: async () => record.prEvidence,
       mergePullRequest: async () => ({ merged: false }),
+      readWorktreeHeadSha,
     });
 
     const result = await manager(record);
@@ -111,6 +120,7 @@ describe('merge manager', () => {
       insertOverseerAction,
       findPullRequest: async () => record.prEvidence,
       mergePullRequest: async () => ({ merged: false }),
+      readWorktreeHeadSha,
     });
 
     const result = await manager(record);
@@ -150,6 +160,7 @@ describe('merge manager', () => {
       insertOverseerAction,
       findPullRequest: async () => productionTargetRecord.prEvidence,
       mergePullRequest: async () => ({ merged: false }),
+      readWorktreeHeadSha,
     });
 
     const result = await manager(productionTargetRecord);
@@ -195,6 +206,7 @@ describe('merge manager', () => {
       insertOverseerAction,
       findPullRequest: async () => otherRecord.prEvidence,
       mergePullRequest: async () => ({ merged: false }),
+      readWorktreeHeadSha,
     });
 
     const result = await manager(otherRecord);

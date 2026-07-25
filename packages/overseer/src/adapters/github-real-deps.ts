@@ -168,6 +168,8 @@ export function createRealFindPullRequest(
         prTitle: pr.data.title,
         filesChangedCount: pr.data.changed_files,
         htmlUrl: pr.data.html_url,
+        // Provenance anchor: GitHub's own view of the PR head, not run metadata.
+        headSha: pr.data.head.sha,
       };
     } catch (error) {
       log.error({ err: error, input }, 'overseer.github_real_deps.find_pull_request_failed');
