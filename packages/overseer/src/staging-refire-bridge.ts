@@ -1,8 +1,5 @@
 import { createHash } from 'node:crypto';
-import type {
-  M31ActionPermitV2,
-  M31ActionProposalV2,
-} from '@archon/core/db/m31-target-v2';
+import type { M31ActionPermitV2, M31ActionProposalV2 } from '@archon/core/db/m31-target-v2';
 import type { OverseerCapabilityState } from '@archon/core/db/overseer-capabilities';
 import type { OverseerActionPolicy } from './action-policy';
 import type { AuthorizeOverseerActionV2Deps } from './action-policy-v2';
@@ -55,7 +52,7 @@ export async function executeM42Slice8BStagingRefireBridge(
   const adapter = createCauldronRefireBridgeAdapter({
     admitRun:
       options.admitRun ??
-      (async request => ({
+      (async (request): Promise<CauldronAdmissionResultV1> => ({
         status: 'admitted',
         runId: 'fake-staging-refire-1',
         providerRequestId: 'fake-staging-refire-1',
@@ -63,7 +60,9 @@ export async function executeM42Slice8BStagingRefireBridge(
         bindingEvidence: request.inputs,
         reason: 'accepted',
       })),
-    getAdmissionByExecutionId: options.getAdmissionByExecutionId ?? (async () => null),
+    getAdmissionByExecutionId:
+      options.getAdmissionByExecutionId ??
+      (async (): Promise<CauldronAdmissionResultV1 | null> => null),
   });
 
   return executeCauldronRefireBridge(
@@ -81,22 +80,34 @@ export async function executeM42Slice8BStagingRefireBridge(
     },
     {
       gate: {
-        preparePermit: options.gate?.preparePermit ?? (async () => ({ ok: true, reason: 'ok' })),
+        preparePermit:
+          options.gate?.preparePermit ??
+          (async (): Promise<{ ok: boolean; reason: string }> => ({ ok: true, reason: 'ok' })),
         authorizeAction:
-          options.gate?.authorizeAction ?? (async () => ({ allowed: true, reason: 'allowed' })),
-        reserveEffect: options.gate?.reserveEffect ?? (async () => ({ ok: true, reason: 'ok' })),
-        appendOutcome: options.gate?.appendOutcome ?? (async () => ({ ok: true })),
+          options.gate?.authorizeAction ??
+          (async (): Promise<{ allowed: boolean; reason: string }> => ({
+            allowed: true,
+            reason: 'allowed',
+          })),
+        reserveEffect:
+          options.gate?.reserveEffect ??
+          (async (): Promise<{ ok: boolean; reason: string }> => ({ ok: true, reason: 'ok' })),
+        appendOutcome:
+          options.gate?.appendOutcome ?? (async (): Promise<{ ok: boolean }> => ({ ok: true })),
       },
       adapter,
       idempotency: {
-        begin: options.idempotency?.begin ?? (async () => ({ status: 'fresh' as const })),
-        commit: options.idempotency?.commit ?? (async () => undefined),
+        begin:
+          options.idempotency?.begin ??
+          (async (): Promise<{ status: 'fresh' }> => ({ status: 'fresh' as const })),
+        commit: options.idempotency?.commit ?? (async (): Promise<void> => undefined),
       },
       circuit: {
-        openRefireCircuit: options.circuit?.openRefireCircuit ?? (async () => undefined),
+        openRefireCircuit:
+          options.circuit?.openRefireCircuit ?? (async (): Promise<void> => undefined),
       },
       sha256hex: options.sha256hex ?? hex,
-      now: options.now ?? (() => '2026-07-17T12:02:30.000Z'),
+      now: options.now ?? ((): string => '2026-07-17T12:02:30.000Z'),
     }
   );
 }
