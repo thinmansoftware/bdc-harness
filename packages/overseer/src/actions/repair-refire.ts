@@ -15,6 +15,16 @@
 //   - FirstRefireOnRampDepsV1         -- audit Section 7.5
 
 import type { RepairRefireAdapter } from '../adapters/repair-refire.ts';
+import {
+  acquireRecoveryExecutionClaim,
+  completeRecoveryExecutionClaim,
+  releaseRecoveryExecutionClaim,
+  validateRecoveryExecutionFence,
+  type AcquireRecoveryExecutionClaimResult,
+  type ClaimMutationResult,
+  type ExecutionClaimResponse,
+  type PreEffectResult,
+} from '@archon/core/db/execution-claims';
 
 // ---------------------------------------------------------------------------
 // Frozen structural contracts (audit Sections 7.4 and 7.5)
@@ -362,6 +372,8 @@ export type RepairRefireOutcome =
   | 'permit_failed'
   | 'denied'
   | 'reservation_failed'
+  | 'skipped_duplicate'
+  | 'claim_failed'
   | 'invalid_dependency_result';
 
 export interface RepairRefireExecutionResult {
@@ -440,17 +452,53 @@ export interface RepairRefireDispositionRecorder {
   }): Promise<void>;
 }
 
+export interface RepairRefireExecutionClaimDeps {
+  acquire(input: {
+    readonly repository: string;
+    readonly wo_id: string;
+    readonly execution_id: string;
+    readonly target_digest: string;
+    readonly actor_principal: string;
+  }): Promise<AcquireRecoveryExecutionClaimResult>;
+  validate(input: {
+    readonly claim_id: string;
+    readonly execution_fencing_token: number;
+    readonly actor_principal: string;
+  }): Promise<PreEffectResult>;
+  complete(input: {
+    readonly claim_id: string;
+    readonly execution_fencing_token: number;
+    readonly effect_attempt_id: string;
+    readonly actor_principal: string;
+    readonly external_effect_reference: string;
+    readonly evidence: Record<string, unknown>;
+  }): Promise<ClaimMutationResult>;
+  release(input: {
+    readonly claim_id: string;
+    readonly execution_fencing_token: number;
+    readonly actor_principal: string;
+  }): Promise<ClaimMutationResult>;
+}
+
 export interface RepairRefireExecutionDeps {
   readonly gate: RepairRefireGateDeps;
   readonly adapter: RepairRefireAdapter;
   readonly idempotency: RepairRefireIdempotencyStore;
   readonly circuit: RepairRefireCircuitDeps;
   readonly recorder: RepairRefireDispositionRecorder;
+  readonly executionClaim?: RepairRefireExecutionClaimDeps;
   /** Injected lower-case 64-hex SHA-256 over a canonical string. */
   readonly sha256hex: (input: string) => string;
 }
 
 const ADAPTER_NAME = 'fake-repair-refire';
+
+const ledgerExecutionClaimDeps: RepairRefireExecutionClaimDeps = {
+  acquire: acquireRecoveryExecutionClaim,
+  validate: validateRecoveryExecutionFence,
+  complete: completeRecoveryExecutionClaim,
+  release: releaseRecoveryExecutionClaim,
+};
 
 /**
  * Execute one authorized recovery action. Gate order is frozen:
@@ -570,6 +618,54 @@ export async function executeRepairRefire(
     );
   }
 
+  const claimDeps = deps.executionClaim ?? ledgerExecutionClaimDeps;
+  const claim = await claimDeps.acquire({
+    repository: input.repository,
+    wo_id: input.wo_id,
+    execution_id: input.execution_id,
+    target_digest: input.target_digest,
+    actor_principal: input.actor,
+  });
+  if (!claim.ok) {
+    if (claim.code === 'claim_conflict' || claim.code === 'reconciliation_required') {
+      return record(
+        deps,
+        assessment.disposition,
+        'skipped_duplicate',
+        null,
+        predecessor,
+        null,
+        duplicateClaimReason(claim.holder)
+      );
+    }
+    return record(
+      deps,
+      assessment.disposition,
+      'claim_failed',
+      null,
+      predecessor,
+      null,
+      claim.message
+    );
+  }
+
+  const fence = await claimDeps.validate({
+    claim_id: claim.claim.claim_id,
+    execution_fencing_token: claim.claim.execution_fencing_token,
+    actor_principal: input.actor,
+  });
+  if (!fence.ok) {
+    return record(
+      deps,
+      assessment.disposition,
+      fence.code === 'stale_fence' ? 'skipped_duplicate' : 'claim_failed',
+      null,
+      predecessor,
+      null,
+      fence.message
+    );
+  }
+
   // The three dispatch paths are strictly distinct: repair -> in-place
   // patch on the exact target; refire_first -> direct on-ramp; refire_later
   // -> conductor cascade. A thrown adapter/conductor dependency after an
@@ -598,11 +694,21 @@ export async function executeRepairRefire(
       reason,
       external_effect_reference: null,
     });
+    await claimDeps.release({
+      claim_id: claim.claim.claim_id,
+      execution_fencing_token: claim.claim.execution_fencing_token,
+      actor_principal: input.actor,
+    });
     return record(deps, assessment.disposition, 'indeterminate', null, predecessor, null, reason);
   }
 
   if (!isValidOnRampResult(dispatched)) {
     // Fail closed on an invalid dependency result; record no primary outcome.
+    await claimDeps.release({
+      claim_id: claim.claim.claim_id,
+      execution_fencing_token: claim.claim.execution_fencing_token,
+      actor_principal: input.actor,
+    });
     return record(
       deps,
       assessment.disposition,
@@ -620,6 +726,27 @@ export async function executeRepairRefire(
     reason: dispatched.reason,
     external_effect_reference: dispatched.external_effect_reference,
   });
+  if (dispatched.external_effect_reference) {
+    await claimDeps.complete({
+      claim_id: claim.claim.claim_id,
+      execution_fencing_token: claim.claim.execution_fencing_token,
+      effect_attempt_id: fence.effect_attempt_id,
+      actor_principal: input.actor,
+      external_effect_reference: dispatched.external_effect_reference,
+      evidence: {
+        status: dispatched.status,
+        successor_run_id: dispatched.successor_run_id,
+        reason: dispatched.reason,
+        evidence_digest: dispatched.evidence_digest,
+      },
+    });
+  } else {
+    await claimDeps.release({
+      claim_id: claim.claim.claim_id,
+      execution_fencing_token: claim.claim.execution_fencing_token,
+      actor_principal: input.actor,
+    });
+  }
   await deps.idempotency.commit(input.idempotency_key, dispatched);
 
   return record(
@@ -631,6 +758,11 @@ export async function executeRepairRefire(
     dispatched.external_effect_reference,
     dispatched.reason
   );
+}
+
+function duplicateClaimReason(holder: ExecutionClaimResponse | null): string {
+  if (!holder) return 'skipped_duplicate: holder unavailable';
+  return `skipped_duplicate: holder=${holder.claimant_principal} claim=${holder.claim_id}`;
 }
 
 function buildOnRampRequest(

@@ -23,6 +23,8 @@ import {
 const DEFAULT_LEASE_DURATION_MS = 5 * 60 * 1000;
 const ACTION_KIND = 'production_deploy';
 const ENVIRONMENT = 'production';
+export const RECOVERY_ACTION_KIND = 'overseer_repair_refire';
+export const RECOVERY_ENVIRONMENT = 'recovery';
 
 type TxQuery = Parameters<Parameters<IDatabase['withTransaction']>[0]>[0];
 
@@ -178,6 +180,44 @@ export type AcquireResult =
       readonly outcome: AcquireOutcome;
     }
   | { readonly ok: false; readonly code: ClaimFailureCode; readonly message: string };
+
+export interface RecoveryClaimIdentity {
+  readonly repository: string;
+  readonly wo_id: string;
+  readonly execution_id: string;
+  readonly target_digest: string;
+}
+
+export interface AcquireRecoveryExecutionClaimInput extends RecoveryClaimIdentity {
+  readonly actor_principal: string;
+  readonly lease_duration_ms?: number;
+}
+
+export type AcquireRecoveryExecutionClaimResult =
+  | {
+      readonly ok: true;
+      readonly claim: ExecutionClaimResponse;
+      readonly created: boolean;
+      readonly outcome: AcquireOutcome;
+    }
+  | {
+      readonly ok: false;
+      readonly code: ClaimFailureCode;
+      readonly message: string;
+      readonly holder: ExecutionClaimResponse | null;
+    };
+
+export interface RecoveryFenceInput {
+  readonly claim_id: string;
+  readonly execution_fencing_token: number;
+  readonly actor_principal: string;
+}
+
+export interface CompleteRecoveryExecutionClaimInput extends RecoveryFenceInput {
+  readonly effect_attempt_id: string;
+  readonly external_effect_reference: string;
+  readonly evidence: Record<string, unknown>;
+}
 
 export type ClaimMutationResult =
   | { readonly ok: true; readonly claim: ExecutionClaimResponse }
@@ -1284,6 +1324,388 @@ export async function completeExecutionClaim(input: CompleteInput): Promise<Clai
         details: {
           effect_attempt_id: input.effect_attempt_id,
           external_effect_reference: input.external_effect_reference,
+        },
+      },
+      now
+    );
+    return { ok: true, claim: normalizeClaim(row) };
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Recovery-scoped claims (Overseer repair/refire)
+// ---------------------------------------------------------------------------
+
+function recoveryActionIdentity(input: RecoveryClaimIdentity): ActionIdentity {
+  return {
+    motion_id: `overseer:${input.repository}:${input.wo_id}:${input.execution_id}`,
+    action_kind: RECOVERY_ACTION_KIND,
+    environment: RECOVERY_ENVIRONMENT,
+    target_sha: input.target_digest,
+  };
+}
+
+function assertRecoveryClaimInput(input: RecoveryClaimIdentity): void {
+  if (input.repository.length === 0) throw new Error('repository is required');
+  if (input.wo_id.length === 0) throw new Error('wo_id is required');
+  if (input.execution_id.length === 0) throw new Error('execution_id is required');
+  if (!/^[0-9a-f]{64}$/.test(input.target_digest)) {
+    throw new Error('target_digest must be lower-case 64-hex');
+  }
+}
+
+export function computeRecoveryExecutionActionKey(input: RecoveryClaimIdentity): string {
+  assertRecoveryClaimInput(input);
+  return computeActionKey(recoveryActionIdentity(input));
+}
+
+export async function acquireRecoveryExecutionClaim(
+  input: AcquireRecoveryExecutionClaimInput
+): Promise<AcquireRecoveryExecutionClaimResult> {
+  assertRecoveryClaimInput(input);
+  if (input.actor_principal.length === 0) throw new Error('actor_principal is required');
+
+  const identity = recoveryActionIdentity(input);
+  const actionKey = computeActionKey(identity);
+  const db = getDatabase();
+
+  return db.withTransaction(async query => {
+    const now = await txNow(query);
+    const expiresAt = addMillisecondsIso(now, input.lease_duration_ms ?? DEFAULT_LEASE_DURATION_MS);
+    const existing = await selectClaimByActionKey(query, actionKey);
+
+    if (existing) {
+      if (existing.status === 'completed') {
+        return {
+          ok: true,
+          claim: normalizeClaim(existing),
+          created: false,
+          outcome: 'existing_completed',
+        };
+      }
+
+      if (existing.status === 'active') {
+        if (existing.reconciliation_status === 'required') {
+          return {
+            ok: false,
+            code: 'reconciliation_required',
+            message: 'reconciliation_required',
+            holder: normalizeClaim(existing),
+          };
+        }
+        if (existing.expires_at > now) {
+          return {
+            ok: false,
+            code: 'claim_conflict',
+            message: 'claim_conflict',
+            holder: normalizeClaim(existing),
+          };
+        }
+
+        const nextToken = toNumber(existing.execution_fencing_token) + 1;
+        await query(
+          `UPDATE board_execution_claims
+             SET claimant_principal = $1, claimant_xo_holder_id = $2, claimant_xo_lease_id = $3,
+                 claimant_xo_fencing_token = $4, execution_fencing_token = $5,
+                 status = 'active', reconciliation_status = 'clear',
+                 effect_attempt_id = NULL, effect_attempt_state = 'none', effect_armed_at = NULL,
+                 acquired_at = $6, renewed_at = NULL, expires_at = $7,
+                 released_at = NULL, completed_at = NULL, external_effect_reference = NULL,
+                 completion_evidence_json = NULL, reconciliation_evidence_json = NULL
+           WHERE action_key = $8 AND status = 'active'
+             AND expires_at <= $6 AND reconciliation_status <> 'required'`,
+          [input.actor_principal, 'recovery', 'recovery', 1, nextToken, now, expiresAt, actionKey]
+        );
+        const row = await selectClaimByActionKey(query, actionKey);
+        if (
+          row?.claimant_principal !== input.actor_principal ||
+          toNumber(row.execution_fencing_token) !== nextToken
+        ) {
+          return {
+            ok: false,
+            code: 'claim_conflict',
+            message: 'claim_conflict',
+            holder: row ? normalizeClaim(row) : null,
+          };
+        }
+        await appendClaimEventWithQuery(
+          query,
+          {
+            claim_id: row.claim_id,
+            event_type: 'claim_taken_over',
+            actor_principal: input.actor_principal,
+            actor_kind: 'system',
+            execution_fencing_token: nextToken,
+            details: { outcome: 'taken_over', action_kind: RECOVERY_ACTION_KIND },
+          },
+          now
+        );
+        return { ok: true, claim: normalizeClaim(row), created: true, outcome: 'taken_over' };
+      }
+
+      const nextToken = toNumber(existing.execution_fencing_token) + 1;
+      await query(
+        `UPDATE board_execution_claims
+           SET claimant_principal = $1, claimant_xo_holder_id = $2, claimant_xo_lease_id = $3,
+               claimant_xo_fencing_token = $4, execution_fencing_token = $5,
+               status = 'active', reconciliation_status = 'clear',
+               effect_attempt_id = NULL, effect_attempt_state = 'none', effect_armed_at = NULL,
+               acquired_at = $6, renewed_at = NULL, expires_at = $7,
+               released_at = NULL, completed_at = NULL, external_effect_reference = NULL,
+               completion_evidence_json = NULL, reconciliation_evidence_json = NULL
+         WHERE action_key = $8 AND status = 'released'`,
+        [input.actor_principal, 'recovery', 'recovery', 1, nextToken, now, expiresAt, actionKey]
+      );
+      const row = await selectClaimByActionKey(query, actionKey);
+      if (
+        row?.claimant_principal !== input.actor_principal ||
+        toNumber(row.execution_fencing_token) !== nextToken
+      ) {
+        return {
+          ok: false,
+          code: 'claim_conflict',
+          message: 'claim_conflict',
+          holder: row ? normalizeClaim(row) : null,
+        };
+      }
+      await appendClaimEventWithQuery(
+        query,
+        {
+          claim_id: row.claim_id,
+          event_type: 'claim_acquired',
+          actor_principal: input.actor_principal,
+          actor_kind: 'system',
+          execution_fencing_token: nextToken,
+          details: { outcome: 'reactivated', action_kind: RECOVERY_ACTION_KIND },
+        },
+        now
+      );
+      return { ok: true, claim: normalizeClaim(row), created: true, outcome: 'reactivated' };
+    }
+
+    const claimId = randomUUID();
+    await query(
+      `INSERT INTO board_execution_claims (
+         claim_id, motion_id, action_kind, environment, target_sha, action_key, idempotency_key,
+         motion_file_path, motion_revision_sha, claimant_principal, claimant_xo_holder_id,
+         claimant_xo_lease_id, claimant_xo_fencing_token, execution_fencing_token,
+         status, reconciliation_status, effect_attempt_id, effect_attempt_state, effect_armed_at,
+         acquired_at, renewed_at, expires_at, released_at, completed_at, external_effect_reference,
+         completion_evidence_json, reconciliation_evidence_json
+       )
+       VALUES (
+         $1, $2, $3, $4, $5, $6, $6, $7, $8, $9, 'recovery', 'recovery', 1, 1,
+         'active', 'clear', NULL, 'none', NULL, $10, NULL, $11, NULL, NULL, NULL, NULL, NULL
+       )
+       ON CONFLICT (action_key) DO NOTHING`,
+      [
+        claimId,
+        identity.motion_id,
+        identity.action_kind,
+        identity.environment,
+        identity.target_sha,
+        actionKey,
+        `overseer://${input.repository}/${input.wo_id}/${input.execution_id}`,
+        '0'.repeat(40),
+        input.actor_principal,
+        now,
+        expiresAt,
+      ]
+    );
+    const row = await selectClaimByActionKey(query, actionKey);
+    if (row?.claim_id !== claimId) {
+      return {
+        ok: false,
+        code: 'claim_conflict',
+        message: 'claim_conflict',
+        holder: row ? normalizeClaim(row) : null,
+      };
+    }
+    await appendClaimEventWithQuery(
+      query,
+      {
+        claim_id: claimId,
+        event_type: 'claim_acquired',
+        actor_principal: input.actor_principal,
+        actor_kind: 'system',
+        execution_fencing_token: 1,
+        details: { outcome: 'acquired', action_kind: RECOVERY_ACTION_KIND },
+      },
+      now
+    );
+    return { ok: true, claim: normalizeClaim(row), created: true, outcome: 'acquired' };
+  });
+}
+
+export async function validateRecoveryExecutionFence(
+  input: RecoveryFenceInput
+): Promise<PreEffectResult> {
+  const db = getDatabase();
+  return db.withTransaction(async query => {
+    const now = await txNow(query);
+    const claim = await selectClaimById(query, input.claim_id);
+    if (!claim) return { ok: false, code: 'not_found', message: 'claim_not_found' };
+    if (claim.action_kind !== RECOVERY_ACTION_KIND || claim.environment !== RECOVERY_ENVIRONMENT) {
+      return { ok: false, code: 'authority_rejected', message: 'not_recovery_claim' };
+    }
+    if (claim.status !== 'active')
+      return { ok: false, code: 'stale_fence', message: 'claim_not_active' };
+    if (claim.claimant_principal !== input.actor_principal) {
+      return { ok: false, code: 'authority_rejected', message: 'claimant_mismatch' };
+    }
+    if (toNumber(claim.execution_fencing_token) !== input.execution_fencing_token) {
+      return { ok: false, code: 'stale_fence', message: 'stale_execution_fence' };
+    }
+    if (claim.expires_at <= now) {
+      return { ok: false, code: 'stale_fence', message: 'claim_expired' };
+    }
+    if (claim.reconciliation_status === 'required' || claim.effect_attempt_state !== 'none') {
+      return { ok: false, code: 'reconciliation_required', message: 'reconciliation_required' };
+    }
+
+    const effectAttemptId = randomUUID();
+    await query(
+      `UPDATE board_execution_claims
+         SET effect_attempt_id = $1, effect_attempt_state = 'armed', effect_armed_at = $2,
+             reconciliation_status = 'required'
+       WHERE claim_id = $3 AND status = 'active' AND execution_fencing_token = $4
+         AND effect_attempt_state = 'none'`,
+      [effectAttemptId, now, input.claim_id, input.execution_fencing_token]
+    );
+    const row = await selectClaimById(query, input.claim_id);
+    if (row?.effect_attempt_id !== effectAttemptId || row.effect_attempt_state !== 'armed') {
+      return { ok: false, code: 'reconciliation_required', message: 'arm_conflict' };
+    }
+    await appendClaimEventWithQuery(
+      query,
+      {
+        claim_id: input.claim_id,
+        event_type: 'claim_effect_armed',
+        actor_principal: input.actor_principal,
+        actor_kind: 'system',
+        execution_fencing_token: input.execution_fencing_token,
+        details: { effect_attempt_id: effectAttemptId, action_kind: RECOVERY_ACTION_KIND },
+      },
+      now
+    );
+    return {
+      ok: true,
+      claim_id: input.claim_id,
+      permitted: true,
+      effect_attempt_id: effectAttemptId,
+      execution_fencing_token: input.execution_fencing_token,
+      motion_revision_sha: row.motion_revision_sha,
+    };
+  });
+}
+
+export async function releaseRecoveryExecutionClaim(
+  input: RecoveryFenceInput
+): Promise<ClaimMutationResult> {
+  const db = getDatabase();
+  return db.withTransaction(async query => {
+    const now = await txNow(query);
+    const claim = await selectClaimById(query, input.claim_id);
+    if (!claim) return { ok: false, code: 'not_found', message: 'claim_not_found' };
+    if (claim.action_kind !== RECOVERY_ACTION_KIND || claim.environment !== RECOVERY_ENVIRONMENT) {
+      return { ok: false, code: 'authority_rejected', message: 'not_recovery_claim' };
+    }
+    if (claim.status !== 'active')
+      return { ok: false, code: 'stale_fence', message: 'claim_not_active' };
+    if (claim.claimant_principal !== input.actor_principal) {
+      return { ok: false, code: 'authority_rejected', message: 'claimant_mismatch' };
+    }
+    if (toNumber(claim.execution_fencing_token) !== input.execution_fencing_token) {
+      return { ok: false, code: 'stale_fence', message: 'stale_execution_fence' };
+    }
+    await query(
+      `UPDATE board_execution_claims
+         SET status = 'released', reconciliation_status = 'clear',
+             effect_attempt_state = 'none', effect_attempt_id = NULL, effect_armed_at = NULL,
+             released_at = $1
+       WHERE claim_id = $2 AND status = 'active' AND execution_fencing_token = $3`,
+      [now, input.claim_id, input.execution_fencing_token]
+    );
+    const row = await selectClaimById(query, input.claim_id);
+    if (!row) return { ok: false, code: 'not_found', message: 'claim_not_found' };
+    await appendClaimEventWithQuery(
+      query,
+      {
+        claim_id: input.claim_id,
+        event_type: 'claim_released',
+        actor_principal: input.actor_principal,
+        actor_kind: 'system',
+        execution_fencing_token: input.execution_fencing_token,
+        details: { released_at: now, action_kind: RECOVERY_ACTION_KIND },
+      },
+      now
+    );
+    return { ok: true, claim: normalizeClaim(row) };
+  });
+}
+
+export async function completeRecoveryExecutionClaim(
+  input: CompleteRecoveryExecutionClaimInput
+): Promise<ClaimMutationResult> {
+  const db = getDatabase();
+  return db.withTransaction(async query => {
+    const now = await txNow(query);
+    const claim = await selectClaimById(query, input.claim_id);
+    if (!claim) return { ok: false, code: 'not_found', message: 'claim_not_found' };
+    if (claim.action_kind !== RECOVERY_ACTION_KIND || claim.environment !== RECOVERY_ENVIRONMENT) {
+      return { ok: false, code: 'authority_rejected', message: 'not_recovery_claim' };
+    }
+    if (claim.status !== 'active' || claim.effect_attempt_state !== 'armed') {
+      return { ok: false, code: 'effect_attempt_mismatch', message: 'claim_not_armed' };
+    }
+    if (claim.claimant_principal !== input.actor_principal) {
+      return { ok: false, code: 'authority_rejected', message: 'claimant_mismatch' };
+    }
+    if (claim.effect_attempt_id !== input.effect_attempt_id) {
+      return { ok: false, code: 'effect_attempt_mismatch', message: 'effect_attempt_mismatch' };
+    }
+    if (toNumber(claim.execution_fencing_token) !== input.execution_fencing_token) {
+      return { ok: false, code: 'stale_fence', message: 'stale_execution_fence' };
+    }
+    if (!input.external_effect_reference) {
+      return {
+        ok: false,
+        code: 'validation_failed',
+        message: 'external_effect_reference_required',
+      };
+    }
+    await query(
+      `UPDATE board_execution_claims
+         SET status = 'completed', reconciliation_status = 'clear',
+             effect_attempt_state = 'completed', completed_at = $1,
+             external_effect_reference = $2, completion_evidence_json = $3
+       WHERE claim_id = $4 AND status = 'active' AND effect_attempt_state = 'armed'
+         AND execution_fencing_token = $5 AND effect_attempt_id = $6`,
+      [
+        now,
+        input.external_effect_reference,
+        JSON.stringify(input.evidence),
+        input.claim_id,
+        input.execution_fencing_token,
+        input.effect_attempt_id,
+      ]
+    );
+    const row = await selectClaimById(query, input.claim_id);
+    if (row?.status !== 'completed') {
+      return { ok: false, code: 'effect_attempt_mismatch', message: 'complete_conflict' };
+    }
+    await appendClaimEventWithQuery(
+      query,
+      {
+        claim_id: input.claim_id,
+        event_type: 'claim_completed',
+        actor_principal: input.actor_principal,
+        actor_kind: 'system',
+        execution_fencing_token: input.execution_fencing_token,
+        details: {
+          effect_attempt_id: input.effect_attempt_id,
+          external_effect_reference: input.external_effect_reference,
+          action_kind: RECOVERY_ACTION_KIND,
         },
       },
       now

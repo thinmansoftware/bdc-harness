@@ -768,10 +768,12 @@ export class SqliteAdapter implements IDatabase {
       CREATE TABLE IF NOT EXISTS board_execution_claims (
         claim_id TEXT PRIMARY KEY,
         motion_id TEXT NOT NULL,
-        action_kind TEXT NOT NULL CHECK (action_kind = 'production_deploy'),
-        environment TEXT NOT NULL CHECK (environment = 'production'),
+        action_kind TEXT NOT NULL CHECK (
+          action_kind IN ('production_deploy', 'overseer_repair_refire')
+        ),
+        environment TEXT NOT NULL CHECK (environment IN ('production', 'recovery')),
         target_sha TEXT NOT NULL CHECK (
-          length(target_sha) = 40 AND target_sha NOT GLOB '*[^0-9a-f]*'
+          length(target_sha) IN (40, 64) AND target_sha NOT GLOB '*[^0-9a-f]*'
         ),
         action_key TEXT NOT NULL UNIQUE,
         idempotency_key TEXT NOT NULL UNIQUE,

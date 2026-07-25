@@ -14,10 +14,12 @@ mock.module('./connection', () => ({
 import { acquireXoLease, type BoardPrincipal } from './board-authority';
 import {
   acquireExecutionClaim,
+  acquireRecoveryExecutionClaim,
   completeExecutionClaim,
   computeActionKey,
   getExecutionClaim,
   markExecutionReconciliationRequired,
+  validateRecoveryExecutionFence,
   releaseExecutionClaim,
   renewExecutionClaim,
   resolveExecutionReconciliation,
@@ -556,6 +558,63 @@ describe('execution claims db', () => {
     });
     expect(completed.ok).toBe(true);
     if (completed.ok) expect(completed.claim.status).toBe('completed');
+  });
+
+  test('recovery execution claims conflict while active and allow expired takeover', async () => {
+    const identity = {
+      repository: 'bluedevilcollectibles/bdc-harness',
+      wo_id: 'WO-RECOVERY-CLAIM',
+      execution_id: 'exec-recovery-1',
+      target_digest: sha256('target-recovery'),
+    };
+
+    const first = await acquireRecoveryExecutionClaim({
+      ...identity,
+      actor_principal: 'overseer-a',
+      lease_duration_ms: 60_000,
+    });
+    expect(first.ok).toBe(true);
+    if (!first.ok) throw new Error(first.message);
+
+    const conflicted = await acquireRecoveryExecutionClaim({
+      ...identity,
+      actor_principal: 'overseer-b',
+      lease_duration_ms: 60_000,
+    });
+    expect(conflicted.ok).toBe(false);
+    if (!conflicted.ok) {
+      expect(conflicted.code).toBe('claim_conflict');
+      expect(conflicted.holder?.claimant_principal).toBe('overseer-a');
+    }
+
+    const expired = await acquireRecoveryExecutionClaim({
+      ...identity,
+      execution_id: 'exec-recovery-expired',
+      actor_principal: 'overseer-a',
+      lease_duration_ms: -1,
+    });
+    expect(expired.ok).toBe(true);
+    if (!expired.ok) throw new Error(expired.message);
+
+    const takeover = await acquireRecoveryExecutionClaim({
+      ...identity,
+      execution_id: 'exec-recovery-expired',
+      actor_principal: 'overseer-b',
+      lease_duration_ms: 60_000,
+    });
+    expect(takeover.ok).toBe(true);
+    if (!takeover.ok) throw new Error(takeover.message);
+    expect(takeover.outcome).toBe('taken_over');
+    expect(takeover.claim.claimant_principal).toBe('overseer-b');
+    expect(takeover.claim.execution_fencing_token).toBe(expired.claim.execution_fencing_token + 1);
+
+    const staleFence = await validateRecoveryExecutionFence({
+      claim_id: expired.claim.claim_id,
+      execution_fencing_token: expired.claim.execution_fencing_token,
+      actor_principal: 'overseer-a',
+    });
+    expect(staleFence.ok).toBe(false);
+    if (!staleFence.ok) expect(staleFence.code).toBe('authority_rejected');
   });
 
   // Test 10 -- Pre-claim rejection dedup and manual initiation writer

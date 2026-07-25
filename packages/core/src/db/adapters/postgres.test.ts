@@ -192,8 +192,10 @@ describe('PostgresAdapter', () => {
         expect(schema).toContain('board_execution_claims_action_identity_unique');
         expect(schema).toContain('board_execution_claim_events_sequence_unique');
         // Closed enums.
-        expect(schema).toContain("action_kind = 'production_deploy'");
-        expect(schema).toContain("environment = 'production'");
+        expect(schema).toContain('production_deploy');
+        expect(schema).toContain('overseer_repair_refire');
+        expect(schema).toContain('production');
+        expect(schema).toContain('recovery');
         expect(schema).toContain("status IN ('active', 'released', 'completed')");
         expect(schema).toContain('execution_fencing_token');
         expect(schema).toContain('effect_attempt_state');

@@ -23,8 +23,14 @@ import {
   type OverseerSalvageReceiptV1,
   type RepairRefireExecutionDeps,
   type RepairRefireExecutionInput,
+  type RepairRefireExecutionClaimDeps,
   type RepairRefireIdempotencyState,
 } from './actions/repair-refire';
+import type {
+  AcquireRecoveryExecutionClaimResult,
+  ClaimMutationResult,
+  PreEffectResult,
+} from '@archon/core/db/execution-claims';
 import {
   executeRefreshRebase,
   type ExecuteRefreshRebaseDepsV1,
@@ -360,6 +366,68 @@ function succeededOnRamp(suffix: string): FirstRefireOnRampResultV1 {
   };
 }
 
+function fakeRepairClaimDeps(
+  callLog: ReturnType<typeof createCallLog>
+): RepairRefireExecutionClaimDeps {
+  return {
+    async acquire(input): Promise<AcquireRecoveryExecutionClaimResult> {
+      callLog.push('repair:claim_acquire');
+      return {
+        ok: true,
+        created: true,
+        outcome: 'acquired',
+        claim: {
+          claim_id: `claim-${input.execution_id}`,
+          motion_id: `overseer:${input.repository}:${input.wo_id}:${input.execution_id}`,
+          action_kind: 'overseer_repair_refire',
+          environment: 'recovery',
+          target_sha: input.target_digest,
+          action_key: sha256hex(input.execution_id),
+          motion_file_path: 'overseer://integration',
+          motion_revision_sha: '0'.repeat(40),
+          claimant_principal: input.actor_principal,
+          claimant_xo_holder_id: 'recovery',
+          claimant_xo_lease_id: 'recovery',
+          claimant_xo_fencing_token: 1,
+          execution_fencing_token: 1,
+          status: 'active',
+          reconciliation_status: 'clear',
+          effect_attempt_id: null,
+          effect_attempt_state: 'none',
+          effect_armed_at: null,
+          acquired_at: '2026-07-16T00:00:00.000Z',
+          renewed_at: null,
+          expires_at: '2999-01-01T00:00:00.000Z',
+          released_at: null,
+          completed_at: null,
+          external_effect_reference: null,
+          completion_evidence: null,
+          reconciliation_evidence: null,
+        },
+      };
+    },
+    async validate(input): Promise<PreEffectResult> {
+      callLog.push('repair:claim_validate');
+      return {
+        ok: true,
+        claim_id: input.claim_id,
+        permitted: true,
+        effect_attempt_id: `effect-${input.claim_id}`,
+        execution_fencing_token: input.execution_fencing_token,
+        motion_revision_sha: '0'.repeat(40),
+      };
+    },
+    async complete(): Promise<ClaimMutationResult> {
+      callLog.push('repair:claim_complete');
+      return { ok: true, claim: null as never };
+    },
+    async release(): Promise<ClaimMutationResult> {
+      callLog.push('repair:claim_release');
+      return { ok: true, claim: null as never };
+    },
+  };
+}
+
 export interface RepairHarness {
   readonly deps: RepairRefireExecutionDeps;
   readonly callLog: ReturnType<typeof createCallLog>;
@@ -498,6 +566,7 @@ export function makeRepairHarness(
         callLog.push('repair:record');
       },
     },
+    executionClaim: fakeRepairClaimDeps(callLog),
     sha256hex,
   };
 
