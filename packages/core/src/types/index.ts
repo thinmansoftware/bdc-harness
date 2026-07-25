@@ -96,6 +96,13 @@ export interface CommandResult {
     // If set, orchestrator should execute this workflow
     definition: WorkflowDefinition;
     args: string;
+    /**
+     * Full HEAD sha of the codebase source clone the definition was resolved
+     * from, set when the dispatch path synced the clone before discovery
+     * (WO-HARNESS-DISPATCH-SYNC-BEFORE-RESOLVE-01). Recorded in the run's
+     * workflow_started event for definition-staleness detection.
+     */
+    definitionHeadSha?: string;
   };
 }
 

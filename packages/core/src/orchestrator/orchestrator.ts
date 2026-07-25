@@ -247,6 +247,13 @@ export interface WorkflowRoutingContext {
    * Hints for isolation environment (PR review context, etc.)
    */
   readonly isolationHints?: IsolationHints;
+  /**
+   * Full HEAD sha of the codebase source clone the workflow definition was
+   * resolved from (WO-HARNESS-DISPATCH-SYNC-BEFORE-RESOLVE-01). Recorded in
+   * the run's workflow_started event so DAG-vs-RUN_START_SHA divergence is
+   * detectable.
+   */
+  readonly definitionHeadSha?: string;
 }
 
 /**
@@ -434,7 +441,8 @@ export async function dispatchBackgroundWorkflow(
           isolationContext,
           ctx.conversationDbId,
           preCreatedRun,
-          authoritySource
+          authoritySource,
+          ctx.definitionHeadSha
         );
         // Surface workflow output to parent conversation as a result card
         if ('paused' in result) {

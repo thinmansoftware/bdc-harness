@@ -34,6 +34,7 @@ import {
   abandonWorkflow,
 } from '../operations/workflow-operations';
 import { getTriggerForCommand, type DeactivatingCommand } from '../state/session-transitions';
+import { syncSourceCloneBeforeResolve } from '../utils/source-clone-sync';
 import { SessionNotFoundError } from '../db/sessions';
 import { createLogger } from '@archon/paths';
 
@@ -800,6 +801,27 @@ async function handleWorkflowCommand(
         'cmd.workflow_run_invoked'
       );
 
+      // Sync the persistent source clone BEFORE resolving workflow definitions
+      // so the dispatched DAG comes from the same commit the worktree will be
+      // created from (WO-HARNESS-DISPATCH-SYNC-BEFORE-RESOLVE-01). Guard: only
+      // the canonical clone is synced -- never a conversation-scoped worktree
+      // path. Fail-open: a sync failure never blocks dispatch.
+      let definitionHeadSha: string | undefined;
+      if (codebase?.default_cwd === workflowCwd) {
+        const syncOutcome = await syncSourceCloneBeforeResolve(codebase);
+        definitionHeadSha = syncOutcome.headSha;
+        if (syncOutcome.syncError) {
+          getLog().warn(
+            {
+              codebaseId: codebase.id,
+              headSha: definitionHeadSha,
+              syncError: syncOutcome.syncError,
+            },
+            'cmd.workflow_run_sync_failed'
+          );
+        }
+      }
+
       // Discover workflows with error handling
       let workflowEntries: readonly WorkflowWithSource[];
       let loadErrors: readonly WorkflowLoadError[];
@@ -874,6 +896,7 @@ async function handleWorkflowCommand(
         workflow: {
           definition: workflow,
           args: workflowArgs,
+          definitionHeadSha,
         },
       };
     }

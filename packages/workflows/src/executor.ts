@@ -444,6 +444,10 @@ export async function resolveExecutorLane(opts: {
  *   - Used to substitute $CONTEXT, $EXTERNAL_CONTEXT, $ISSUE_CONTEXT variables in prompts
  *   - Appended to prompts if no context variables are present (to ensure AI receives context)
  *   Expected format: Markdown with issue title, author, labels, and body
+ * @param definitionHeadSha - Optional full HEAD sha of the codebase source clone the
+ *   workflow definition was resolved from (WO-HARNESS-DISPATCH-SYNC-BEFORE-RESOLVE-01).
+ *   Persisted in the workflow_started event data so DAG-vs-RUN_START_SHA divergence
+ *   is detectable from run events.
  */
 export async function executeWorkflow(
   deps: WorkflowDeps,
@@ -463,7 +467,8 @@ export async function executeWorkflow(
   },
   parentConversationId?: string,
   preCreatedRun?: WorkflowRun,
-  authoritySource?: RunAuthorityDispatch
+  authoritySource?: RunAuthorityDispatch,
+  definitionHeadSha?: string
 ): Promise<WorkflowExecutionResult> {
   // Load config once for the entire workflow execution
   const fileConfig = await deps.loadConfig(cwd);
@@ -1025,7 +1030,12 @@ export async function executeWorkflow(
       .createWorkflowEvent({
         workflow_run_id: workflowRun.id,
         event_type: 'workflow_started',
-        data: { workflowName: executableWorkflow.name },
+        // definitionHeadSha: clone HEAD the DAG was resolved from -- omitted
+        // when the dispatch path did not sync a codebase clone (e.g. global
+        // workflows). WO-HARNESS-DISPATCH-SYNC-BEFORE-RESOLVE-01.
+        data: definitionHeadSha
+          ? { workflowName: executableWorkflow.name, definitionHeadSha }
+          : { workflowName: executableWorkflow.name },
       })
       .catch((err: Error) => {
         getLog().error(

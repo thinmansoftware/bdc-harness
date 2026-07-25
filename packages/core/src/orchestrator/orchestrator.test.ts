@@ -1135,7 +1135,10 @@ describe('orchestrator-agent handleMessage', () => {
         expect.anything(), // codebase.id
         undefined, // issueContext
         undefined, // isolationContext
-        expect.anything() // parentConversationId -- web approval auto-resume
+        expect.anything(), // parentConversationId -- web approval auto-resume
+        undefined, // preCreatedRun
+        undefined, // authoritySource
+        undefined // definitionHeadSha -- AI-routing path does not sync a clone
       );
     });
 
@@ -1163,7 +1166,10 @@ describe('orchestrator-agent handleMessage', () => {
         expect.anything(),
         undefined, // issueContext
         undefined, // isolationContext
-        expect.anything() // parentConversationId -- web approval auto-resume
+        expect.anything(), // parentConversationId -- web approval auto-resume
+        undefined, // preCreatedRun
+        undefined, // authoritySource
+        undefined // definitionHeadSha -- AI-routing path does not sync a clone
       );
     });
 

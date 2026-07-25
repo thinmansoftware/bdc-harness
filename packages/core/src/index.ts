@@ -158,3 +158,9 @@ export { getPort } from './utils/port-allocation';
 
 // Worktree sync
 export { syncArchonToWorktree } from './utils/worktree-sync';
+
+// Source clone sync-before-resolve (WO-HARNESS-DISPATCH-SYNC-BEFORE-RESOLVE-01)
+export {
+  syncSourceCloneBeforeResolve,
+  type SourceCloneSyncOutcome,
+} from './utils/source-clone-sync';
