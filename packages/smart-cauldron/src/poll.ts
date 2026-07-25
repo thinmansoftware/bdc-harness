@@ -52,6 +52,8 @@ interface RunApiResponse {
     event_type: string;
     step_name: string | null;
     data: Record<string, unknown>;
+    /** Server-side emit time. Drives liveness/stall detection. */
+    created_at?: string | null;
   }[];
 }
 
@@ -60,8 +62,31 @@ interface PollOptions {
   apiBaseUrl: string;
   /** Operator token for Archon API auth. Defaults to ARCHON_OPERATOR_TOKEN env. */
   token?: string;
-  /** How long to wait before giving up (ms). Default: 1800000 (30 minutes). */
+  /**
+   * HARD CEILING on total run duration (ms). Default: 14400000 (4 hours).
+   *
+   * This is a backstop against true runaways, NOT the normal stop condition --
+   * see `stallTimeoutMs`. Measured 2026-07-25 against 252 real runs since
+   * 2026-07-01: SUCCESSFUL runs average 24.6 min and reach 74.3 min, while the
+   * cancelled cohort averaged 77.9 min and reached 730.9 min (12+ hours). The
+   * old 30-minute default sat BELOW the observed success range, so it was
+   * killing healthy work -- WO-HARNESS-DISPATCH-SYNC-BEFORE-RESOLVE-01 was
+   * actively emitting tool events 56 seconds before it was cut at exactly
+   * 30:00.000.
+   */
   timeoutMs?: number;
+  /**
+   * STALL DETECTION (ms of silence). Default: 1200000 (20 minutes).
+   *
+   * The real stop condition. A run is stuck when it stops EMITTING, not when it
+   * takes a while -- "has this taken too long?" is unanswerable because WOs
+   * cannot be estimated and are getting harder; "is it still doing anything?"
+   * is directly observable. If no new event arrives within this window, the run
+   * is treated as stalled and the cascade climbs.
+   *
+   * Set to 0 to disable stall detection and fall back to duration-only.
+   */
+  stallTimeoutMs?: number;
   /** Poll interval (ms). Default: 30000 (30 seconds). */
   intervalMs?: number;
   /**
@@ -87,7 +112,8 @@ export async function pollForTerminal(opts: PollOptions): Promise<PollResult> {
     runId,
     apiBaseUrl,
     token: tokenOverride,
-    timeoutMs = 1_800_000,
+    timeoutMs = 14_400_000,
+    stallTimeoutMs = 1_200_000,
     intervalMs = 30_000,
     prRetryAttempts = 3,
     prRetryDelayMs = 10_000,
@@ -96,8 +122,21 @@ export async function pollForTerminal(opts: PollOptions): Promise<PollResult> {
 
   const deadline = Date.now() + timeoutMs;
 
+  // Liveness tracking. `lastActivityAt` is wall-clock time on OUR side, advanced
+  // whenever the run's newest event timestamp moves -- so clock skew between this
+  // process and the container cannot make a healthy run look stalled. We only
+  // compare the server's timestamps to each other, never to our own clock.
+  let newestEventSeen: number | null = null;
+  let lastActivityAt = Date.now();
+
   while (Date.now() < deadline) {
     const detail = await fetchRunDetail(runId, apiBaseUrl, token);
+
+    const newestNow = newestEventTimestamp(detail.events ?? []);
+    if (newestNow !== null && (newestEventSeen === null || newestNow > newestEventSeen)) {
+      newestEventSeen = newestNow;
+      lastActivityAt = Date.now();
+    }
 
     if (TERMINAL_STATUSES.has(detail.run.status)) {
       const terminalStatus = detail.run.status as
@@ -142,6 +181,18 @@ export async function pollForTerminal(opts: PollOptions): Promise<PollResult> {
       };
     }
 
+    // Stall check: silence, not duration, is what indicates a stuck run.
+    if (stallTimeoutMs > 0) {
+      const silentFor = Date.now() - lastActivityAt;
+      if (silentFor >= stallTimeoutMs) {
+        throw new TimeoutError(
+          `[smart-cauldron/poll] Run ${runId} stalled: no new events for ${String(silentFor)}ms ` +
+            `(stall budget ${String(stallTimeoutMs)}ms). Last activity was at ` +
+            `${newestEventSeen === null ? 'no events observed' : new Date(newestEventSeen).toISOString()}.`
+        );
+      }
+    }
+
     // Not terminal yet -- wait before next poll
     const remaining = deadline - Date.now();
     const waitMs = Math.min(intervalMs, remaining);
@@ -150,8 +201,33 @@ export async function pollForTerminal(opts: PollOptions): Promise<PollResult> {
   }
 
   throw new TimeoutError(
-    `[smart-cauldron/poll] Run ${runId} did not reach terminal state within ${timeoutMs}ms`
+    `[smart-cauldron/poll] Run ${runId} exceeded the ${String(timeoutMs)}ms hard ceiling ` +
+      'without reaching a terminal state (it was still emitting events -- this is the runaway ' +
+      'backstop, not a stall)'
   );
+}
+
+/**
+ * Newest event timestamp in ms, or null when there are no parseable timestamps.
+ *
+ * Events are ordered by the API, but this does not assume that -- it takes the max
+ * so an out-of-order or backfilled event cannot make liveness go backwards.
+ */
+function newestEventTimestamp(events: { created_at?: string | null }[]): number | null {
+  let newest: number | null = null;
+  for (const ev of events) {
+    if (!ev.created_at) continue;
+    // SQLite emits "YYYY-MM-DD HH:MM:SS" (space-separated, UTC, no zone marker).
+    // Date.parse treats that as LOCAL time on some runtimes, which would skew
+    // every comparison. Normalize to ISO-8601 UTC before parsing.
+    const raw = ev.created_at.trim();
+    const iso = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/.test(raw)
+      ? `${raw.replace(' ', 'T')}Z`
+      : raw;
+    const parsed = Date.parse(iso);
+    if (!Number.isNaN(parsed) && (newest === null || parsed > newest)) newest = parsed;
+  }
+  return newest;
 }
 
 async function fetchRunDetail(

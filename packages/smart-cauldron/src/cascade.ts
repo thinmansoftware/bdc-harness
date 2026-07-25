@@ -146,8 +146,16 @@ export interface RunCascadeOptions {
   overseerPermit?: M31ActionPermit;
   /** Dependency injection (for testing). */
   deps?: CascadeDeps;
-  /** Poll timeout per attempt in ms. Default: 1800000 (30 minutes). */
+  /**
+   * Hard ceiling per attempt in ms. Default: 14400000 (4 hours). Runaway backstop
+   * only -- the normal stop condition is `pollStallTimeoutMs`.
+   */
   pollTimeoutMs?: number;
+  /**
+   * Stall budget per attempt in ms -- how long a run may emit NOTHING before it
+   * is judged stuck and the cascade climbs. Default: 1200000 (20 minutes).
+   */
+  pollStallTimeoutMs?: number;
   /** Poll interval per attempt in ms. Default: 30000 (30 seconds). */
   pollIntervalMs?: number;
 }
@@ -172,7 +180,8 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
     entryOverride,
     dryRun = false,
     outDir = './cascade-runs',
-    pollTimeoutMs = 1_800_000,
+    pollTimeoutMs = 14_400_000,
+    pollStallTimeoutMs = 1_200_000,
     pollIntervalMs = 30_000,
     token,
     project,
@@ -554,6 +563,7 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
         apiBaseUrl,
         token,
         timeoutMs: pollTimeoutMs,
+        stallTimeoutMs: pollStallTimeoutMs,
         intervalMs: pollIntervalMs,
       });
     } catch (pollErr) {
@@ -577,13 +587,20 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
           );
         }
 
-        const timeoutReason = `progress-timeout: no terminal state within ${pollTimeoutMs}ms poll budget`;
+        // Carry the poll's own message through: it distinguishes a STALL (run went
+        // silent) from the hard-ceiling backstop (run was still emitting but ran
+        // past the runaway limit). Those are different diagnoses and the operator
+        // reading this line needs to know which one fired.
+        const timeoutReason =
+          pollErr instanceof TimeoutError
+            ? pollErr.message
+            : `progress-timeout: no terminal state within ${pollTimeoutMs}ms`;
         attempt.outcome = 'progress-timeout';
         attempt.gateFailReason = timeoutReason;
         attempt.completedAt = new Date().toISOString();
 
         console.log(`[smart-cauldron] Progress-timeout on tier=${tier.name}: ${timeoutReason}`);
-        priorContext = buildTimeoutPriorContext(tier.name, pollTimeoutMs);
+        priorContext = buildTimeoutPriorContext(tier.name, pollStallTimeoutMs);
 
         const shouldStop = await climbOrStop(tier, timeoutReason, fireResult.runId);
         await checkpoint();

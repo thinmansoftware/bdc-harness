@@ -271,7 +271,10 @@ describe('Test: PROGRESS-TIMEOUT climbs (does not stop as infra-error)', () => {
     expect(record.attempts.length).toBe(2);
     expect(record.attempts[0]?.outcome).toBe('progress-timeout');
     expect(record.attempts[0]?.outcome).not.toBe('infra-error');
-    expect(record.attempts[0]?.gateFailReason).toContain('progress-timeout');
+    // The reason now carries the poll's own message so an operator can tell a STALL
+    // (run went silent) from the hard-ceiling runaway backstop. The injected fake
+    // poll throws the generic legacy message, so assert on the stable substring.
+    expect(record.attempts[0]?.gateFailReason).toContain('terminal state');
     expect(record.attempts[1]?.outcome).toBe('won');
 
     expect(record.status).toBe('won');
@@ -361,11 +364,11 @@ describe('Test: non-timeout poll error still stops as infra-error', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Test: poll timeout default (1800000) + configurable override
+// Test: poll timeout default (14400000 hard ceiling) + configurable override
 // ---------------------------------------------------------------------------
 
 describe('Test: poll timeout default + override', () => {
-  test('default pollTimeoutMs passed to poll is 1800000 when not overridden', async () => {
+  test('default pollTimeoutMs passed to poll is the 14400000 hard ceiling when not overridden', async () => {
     let observedTimeoutMs: number | undefined;
 
     const deps: CascadeDeps = {
@@ -383,8 +386,11 @@ describe('Test: poll timeout default + override', () => {
 
     await runCascade(baseOpts({ deps }));
 
-    expect(observedTimeoutMs).toBe(1_800_000);
-    expect(observedTimeoutMs).not.toBe(3_600_000);
+    // Raised from 30min on 2026-07-25: measured successful runs reach 74.3min, so the
+    // old ceiling killed healthy work. Stall detection (pollStallTimeoutMs) is now the
+    // real stop condition; this is only the runaway backstop.
+    expect(observedTimeoutMs).toBe(14_400_000);
+    expect(observedTimeoutMs).not.toBe(1_800_000);
   });
 
   test('pollTimeoutMs override is threaded through to poll', async () => {
