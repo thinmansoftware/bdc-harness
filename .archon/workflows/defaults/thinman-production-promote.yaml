@@ -1,7 +1,7 @@
 name: bdc-thinman-production-promote
 description: Thinman Freight production promotion dry run. Captures current production state and writes promote/rollback evidence without aliasing.
 provider: codex
-model: gpt-5.5
+model: gpt-5.6-sol
 interactive: true
 target_repo: bluedevilcollectibles/thinman-freight
 worktree:

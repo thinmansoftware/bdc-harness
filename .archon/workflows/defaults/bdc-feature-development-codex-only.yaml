@@ -1,6 +1,6 @@
 name: bdc-feature-development-codex-only
 description: |
-  ZERO-CLAUDE Codex lane. All prompt seats on Codex (gpt-5.5). Use when Claude
+  ZERO-CLAUDE Codex lane. All prompt seats on Codex (gpt-5.6-sol). Use when Claude
   usage is exhausted but OpenAI/Codex quota remains. Model-free *-opr / *-codex
   personas only (F1 invariant). Not dual-cap (still needs Codex).
 
@@ -14,10 +14,10 @@ run_authority:
     - docs/work-orders/{WO_ID}.md
     - docs/superpowers/specs/{WO_ID}.md
   allow_issue_fallback: true
-# Codex build lane: Codex/gpt-5.5 is the build default. war-council-validator is
+# Codex build lane: Codex/gpt-5.6-sol is the build default. war-council-validator is
 # pinned to claude/sonnet on the node. WO-HARNESS-SMART-CAULDRON-LANE-ROSTER-AND-RESILIENCE-01.
 provider: codex
-model: gpt-5.5
+model: gpt-5.6-sol
 
 nodes:
   # Pre-flight: fail closed if container lacks GITHUB auth (WO-169, 2026-05-16).
@@ -403,7 +403,7 @@ nodes:
   - id: implement
     idle_timeout: 600000
     provider: codex
-    model: gpt-5.5
+    model: gpt-5.6-sol
     depends_on: [capture-run-scope]
     trigger_rule: all_done
     when: "$gate-already-satisfied.output.ALREADY_SATISFIED != 'true'"
@@ -1139,7 +1139,7 @@ nodes:
 
   - id: diff-repair
     provider: codex
-    model: gpt-5.5
+    model: gpt-5.6-sol
     depends_on: [diff-review, classify-diff-review]
     when: "$classify-diff-review.output.verdict == 'needs_revision'"
     task_class: medium_work
@@ -1271,7 +1271,7 @@ nodes:
     persona: codex-adversarial-reviewer
     provider: codex
     agent: codex-adversarial-reviewer
-    depends_on: [capture-diff-final]
+    depends_on: [diff-review, classify-diff-review, diff-repair, capture-diff-final]
     trigger_rule: all_done
     task_class: medium_work
     prompt: |
@@ -1374,7 +1374,7 @@ nodes:
   # resolve the block, then signals. If it can't fix, the run proceeds to the human pause.
   - id: opus-repair
     provider: codex
-    model: gpt-5.5
+    model: gpt-5.6-sol
     depends_on: [block-classify]
     when: "$block-classify.output.status == 'BLOCKED'"
     prompt: |
@@ -2369,7 +2369,7 @@ nodes:
         PRs: <PR URL> or N/A (ALREADY_SATISFIED or BLOCKED)
         Merge ancestors: <merge-base SHA>...<HEAD SHA> (behind_by=<N>) or N/A
         Grep assertions: one line; value is a ';'-separated list of sub-assertions, each EXACTLY "<command> => <count>" with a bare integer count -- NO prose after the count, and NO assertion about pre-change state (never write "=> 0" for a path this diff creates -- it is false by construction once the file exists); or "N/A (<reason>)". Each <command> MUST be a single read-only inspection built only from grep/egrep/fgrep/rg/wc/find/cat/head/tail/sort/uniq/test, optionally piped ('|') to one of those; it MUST NOT contain a literal ';' or any shell chaining/redirection/substitution metacharacter (';' '&' '`' '$(' '>' '<') -- verify-manifest-assertions splits the value on ';' and DROPS (unexecuted) any command not on that read-only allowlist. verify-manifest-assertions executes each surviving sub-assertion and rewrites wrong counts, so emit your best honest count.
-        Runtime verification: <evidence> or N/A (<reason>)
+        Runtime verification: <evidence> or N/A (<reason>); for model-access or live-model probe stop conditions, include the exact in-container probe output or an explicit [UNVERIFIED-DEFERRED] note with the deferral reason
         VALIDATION: PASS   <- only when all in-run reviews passed
       NOTE: derive Files created/modified from the git diff -- do NOT list preserved/unchanged
       files. If no files changed (ALREADY_SATISFIED), emit "Files created: none" only.

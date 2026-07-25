@@ -1071,7 +1071,7 @@ nodes:
 
   - id: diff-review
     provider: codex
-    model: gpt-5.5
+    model: gpt-5.6-sol
     agent: codex-adversarial-reviewer
     depends_on: [capture-diff]
     task_class: medium_work
@@ -1257,9 +1257,9 @@ nodes:
 
   - id: diff-review-final
     provider: codex
-    model: gpt-5.5
+    model: gpt-5.6-sol
     agent: codex-adversarial-reviewer
-    depends_on: [capture-diff-final]
+    depends_on: [diff-review, classify-diff-review, diff-repair, capture-diff-final]
     trigger_rule: all_done
     task_class: medium_work
     prompt: |
@@ -1423,7 +1423,7 @@ nodes:
   # terminal-BLOCKED on a non-interactive run.
   - id: opus-rereview
     provider: codex
-    model: gpt-5.5
+    model: gpt-5.6-sol
     agent: codex-adversarial-reviewer
     depends_on: [classify-opus-repair]
     trigger_rule: all_done
@@ -1736,7 +1736,7 @@ nodes:
   # Distinct id (diff-review-final already ran upstream). Only meaningful on the APPROVE-WITH-FIX path.
   - id: apply-diff-review-final
     provider: codex
-    model: gpt-5.5
+    model: gpt-5.6-sol
     agent: codex-adversarial-reviewer
     depends_on: [apply-suggested-fix]
     trigger_rule: all_done
@@ -2422,7 +2422,7 @@ nodes:
         PRs: <PR URL> or N/A (ALREADY_SATISFIED or BLOCKED)
         Merge ancestors: <merge-base SHA>...<HEAD SHA> (behind_by=<N>) or N/A
         Grep assertions: one line; value is a ';'-separated list of sub-assertions, each EXACTLY "<command> => <count>" with a bare integer count -- NO prose after the count, and NO assertion about pre-change state (never write "=> 0" for a path this diff creates -- it is false by construction once the file exists); or "N/A (<reason>)". Each <command> MUST be a single read-only inspection built only from grep/egrep/fgrep/rg/wc/find/cat/head/tail/sort/uniq/test, optionally piped ('|') to one of those; it MUST NOT contain a literal ';' or any shell chaining/redirection/substitution metacharacter (';' '&' '`' '$(' '>' '<') -- verify-manifest-assertions splits the value on ';' and DROPS (unexecuted) any command not on that read-only allowlist. verify-manifest-assertions executes each surviving sub-assertion and rewrites wrong counts, so emit your best honest count.
-        Runtime verification: <evidence> or N/A (<reason>)
+        Runtime verification: <evidence> or N/A (<reason>); for model-access or live-model probe stop conditions, include the exact in-container probe output or an explicit [UNVERIFIED-DEFERRED] note with the deferral reason
         VALIDATION: PASS   <- only when all in-run reviews passed
       NOTE: derive Files created/modified from the git diff -- do NOT list preserved/unchanged
       files. If no files changed (ALREADY_SATISFIED), emit "Files created: none" only.
