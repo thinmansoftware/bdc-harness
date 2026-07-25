@@ -66,13 +66,19 @@ function loadLane(filename: string): LaneDef {
 }
 
 describe('lane registration and war-council-validator pin', () => {
-  it('S4: enumerates exactly the nine governed feature lanes', () => {
+  it('S4: enumerates exactly the eleven governed feature lanes', () => {
+    // Kimi canary lanes added 2026-07-20 (WO-HARNESS-KIMI-QWEN-CANARY-LANES-01).
+    // This enumeration is deliberately hardcoded: it is the tripwire that forces a
+    // new lane to be acknowledged here AND given an explicit validator-pin branch
+    // in S4b below, rather than silently inheriting a default.
     expect(LANE_FILES).toEqual([
       'bdc-feature-development-codex-only.yaml',
       'bdc-feature-development-codex.yaml',
       'bdc-feature-development-fable.yaml',
+      'bdc-feature-development-fusion-cx-kimi.yaml',
       'bdc-feature-development-fusion-cx-qwen.yaml',
       'bdc-feature-development-grok.yaml',
+      'bdc-feature-development-kimi-k3.yaml',
       'bdc-feature-development-zero-claude.yaml',
       'bdc-feature-development-zero-open.yaml',
       'bdc-feature-development-zero.yaml',
@@ -118,6 +124,20 @@ describe('lane registration and war-council-validator pin', () => {
 
       if (file === 'bdc-feature-development-fusion-cx-qwen.yaml') {
         // DeepSeek judge through the repository-capable OpenRouter tool loop.
+        expect(wcv.provider).toBe('codex-opr');
+        return;
+      }
+
+      if (
+        file === 'bdc-feature-development-fusion-cx-kimi.yaml' ||
+        file === 'bdc-feature-development-kimi-k3.yaml'
+      ) {
+        // Kimi canary lanes (WO-HARNESS-KIMI-QWEN-CANARY-LANES-01, 2026-07-20).
+        // Both are clones of fusion-cx-qwen with the BUILDER seats swapped to
+        // Kimi K3; the judge seat is deliberately unchanged, so they inherit the
+        // same DeepSeek-via-OpenRouter validator pin. Keeping the judge off the
+        // builder model is the point -- a lane must not grade its own work.
+        // Dispatchable canaries only; NOT ladder-wired until John reviews results.
         expect(wcv.provider).toBe('codex-opr');
         return;
       }
