@@ -65,6 +65,13 @@ export interface ReconcileDeps {
   closeTrackerIssue: (input: { issue: ReconcileTrackerIssue }) => Promise<void>;
   hasSkipBeenNoted?: (input: { prRef: string; woId: string }) => Promise<boolean>;
   insertAction?: (record: ReconcileActionRecord) => Promise<unknown>;
+  /**
+   * Changed-file paths for a merged PR. Used to refuse closing a tracker on a
+   * SPEC-ONLY merge (see isSpecOnlyChangeSet). Optional: when absent, reconcile
+   * falls back to prior behavior rather than blocking, so a deps object that
+   * predates this guard still works.
+   */
+  listPullRequestFiles?: (pr: ReconcileMergedPullRequest) => Promise<string[]>;
   now?: () => Date;
   log?: ReconcileLogger;
 }
@@ -85,6 +92,9 @@ interface OctokitLike {
     }>;
   };
   pulls: {
+    listFiles(input: Record<string, unknown>): Promise<{
+      data: { filename: string }[];
+    }>;
     get(input: Record<string, unknown>): Promise<{
       data: {
         title?: string;
@@ -195,6 +205,40 @@ export async function runReconcileOnce(input: RunReconcileInput = {}): Promise<R
         continue;
       }
 
+      // SPEC-ONLY GUARD. author-wo.sh lands the WO spec document via its own PR,
+      // which mentions the WO stem -- so without this, a WO is closed as done by
+      // the very PR that CREATED it. See isSpecOnlyChangeSet for the anchor.
+      const listFiles = deps.listPullRequestFiles;
+      if (listFiles) {
+        let changedPaths: string[] | null = null;
+        try {
+          changedPaths = await listFiles(pr);
+        } catch (error) {
+          // Fail OPEN on a file-listing error: leave the tracker alone rather
+          // than closing on unverified evidence. A tracker left open is visible
+          // and fixable; one falsely closed is invisible.
+          logger.warn(
+            { err: error as Error, prRef, stem },
+            'overseer.reconcile.file_list_failed_leaving_tracker_open'
+          );
+          continue;
+        }
+        if (isSpecOnlyChangeSet(changedPaths)) {
+          // warn, not info: `info` is optional on ReconcileLogger while `warn` is
+          // guaranteed, and a spec-only merge that LOOKS like completion is worth
+          // surfacing rather than burying at info level.
+          logger.warn(
+            { prRef, stem, changedPaths },
+            'overseer.reconcile.spec_only_merge_tracker_left_open'
+          );
+          // Silent by design. Reconcile re-scans a lookback window, so commenting
+          // here would re-post on every pass for the life of the window. The log
+          // line above is the record; the tracker simply stays open, which is the
+          // correct and visible outcome.
+          continue;
+        }
+      }
+
       await deps.addTrackerEvidenceComment({
         issue: tracker,
         body: buildEvidenceComment({ pr, stem }),
@@ -213,6 +257,35 @@ export async function runReconcileOnce(input: RunReconcileInput = {}): Promise<R
   }
 
   return { scanned: seen.size, closed, skipped: false };
+}
+
+/**
+ * True when a merged PR contains ONLY the WO spec document (and adjacent
+ * governance paperwork) -- no implementation.
+ *
+ * Why this exists: `author-wo.sh` lands `docs/work-orders/<WO-ID>.md` on bdc-xo
+ * main via its own PR. That PR mentions the WO stem, so reconcile matched it and
+ * closed the tracker as `wo:done` -- while zero code had been written.
+ *
+ * Anchor (2026-07-25): four WOs authored in one session were all closed within
+ * minutes by their own spec PRs. For WO-XO-CRM-MINIMUM-COMPLETE-JOURNEY-01 the
+ * target repository `bdc-crm` did not exist at all -- `gh repo view` returned
+ * "Could not resolve to a Repository" -- so the WO could not possibly have been
+ * done. Prior anchors: bdc-xo #1128, #1149.
+ *
+ * Deliberately conservative: it only returns true when EVERY changed path is
+ * paperwork. One source file anywhere in the PR means this is a real build and
+ * reconcile proceeds as before. False negatives (a real build we fail to
+ * recognise as spec-only) are harmless; false positives would re-open the hole.
+ */
+export function isSpecOnlyChangeSet(paths: readonly string[]): boolean {
+  if (paths.length === 0) return false; // no information -- do not assume spec-only
+  return paths.every(
+    path =>
+      path.startsWith('docs/work-orders/') ||
+      path.startsWith('docs/board/motions/') ||
+      path.startsWith('docs/superpowers/specs/')
+  );
 }
 
 export function extractWoStems(input: string): string[] {
@@ -305,6 +378,19 @@ export function createDefaultReconcileDeps(): ReconcileDeps {
     readCursor: readReconcileCursorFromActions,
     searchMergedPullRequests: async input => searchMergedPullRequests(await getOctokit(), input),
     findTrackerIssueByStem: async stem => findTrackerIssueByStem(await getOctokit(), stem),
+    listPullRequestFiles: async (pr): Promise<string[]> => {
+      const client = await getOctokit();
+      // per_page 100: a spec-only PR is 1-2 files, so the first page is always
+      // enough to prove NOT-spec-only. A large PR truncated at 100 still contains
+      // a source file, so isSpecOnlyChangeSet correctly returns false.
+      const res = await client.pulls.listFiles({
+        owner: pr.owner,
+        repo: pr.repo,
+        pull_number: pr.number,
+        per_page: 100,
+      });
+      return res.data.map(f => f.filename);
+    },
     addTrackerEvidenceComment: async (input): Promise<void> => {
       const client = await getOctokit();
       await client.issues.createComment({
