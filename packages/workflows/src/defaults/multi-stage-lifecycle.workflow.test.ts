@@ -18,17 +18,17 @@ describe('multi-stage workflow lifecycle guards', () => {
   test('uses the mechanical lifecycle reducer before status mutation', () => {
     const workflow = readFileSync(workflowPath, 'utf8');
     const reducerIndex = workflow.indexOf('multi-stage-lifecycle.ts');
-    const flipIndex = workflow.indexOf('  - id: flip-notion');
+    const statusMutationIndex = workflow.indexOf('  - id: review-issue');
 
     expect(reducerIndex).toBeGreaterThan(0);
-    expect(flipIndex).toBeGreaterThan(reducerIndex);
+    expect(statusMutationIndex).toBeGreaterThan(reducerIndex);
     expect(workflow).toContain('depends_on: [consolidated-manifest]');
     expect(workflow).toContain('PARENT_PROJECTION');
   });
 
   test('cannot promote a blocked parent to REVIEW through the tail', () => {
     const workflow = readFileSync(workflowPath, 'utf8');
-    const blockedGate = workflow.indexOf('parent reducer refused REVIEW');
+    const blockedGate = workflow.indexOf('not marking issue status:review');
     const reviewMutation = workflow.indexOf('gh label create status:review');
 
     expect(blockedGate).toBeGreaterThan(0);
