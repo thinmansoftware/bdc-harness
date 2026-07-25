@@ -1137,6 +1137,7 @@ nodes:
       printf '{"verdict":"%s"}\n' "$verdict"
 
   - id: diff-repair
+    idle_timeout: 600000
     # FABLE APEX: persona/agent dropped so model: claude-fable-5 is actually served
     # (persona major-build would pin opus[1m] and shadow fable). See header.
     depends_on: [diff-review, classify-diff-review]
