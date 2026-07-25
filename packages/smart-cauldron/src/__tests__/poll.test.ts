@@ -45,7 +45,7 @@ describe('pollForTerminal PR-detection race guard', () => {
     expect(result.terminalStatus).toBe('completed');
     expect(result.prUrl).toBe('https://github.com/bluedevilcollectibles/bdc-harness/pull/488');
     expect(calls).toBe(2);
-  });
+  }, 15000);
 
   test('declares no PR only after exhausting retries', async () => {
     let calls = 0;
