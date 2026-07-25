@@ -88,21 +88,34 @@ async function assessRun(
     };
   }
 
-  // A CANCELLED run is not nothing. The conductor cancels a run when it stalls or
-  // hits the runaway ceiling, then exits -- so any work the run had already pushed
-  // is left with no owner. Before 2026-07-25 this branch returned `ignore` with
-  // "does not require failure handling", and the commit died in its worktree.
+  // THE MERGE DOOR. Any terminal run whose PR is green, open and mergeable is a
+  // merge candidate -- regardless of the run's own status.
   //
-  // Anchor: run 3ff3f773 (WO-HARNESS-DISPATCH-SYNC-BEFORE-RESOLVE-01) was cancelled
-  // on a progress-timeout having produced a real commit; the live container log shows
-  // Overseer reading it and returning action:"ignore". Salvage is precisely Overseer's
-  // job -- it is the persistent watcher, while the conductor is a CLI process that has
-  // already exited by then.
+  // This used to be gated on `status === 'failed'` alone, because the merge path was
+  // built for exactly ONE scenario: the tail-node false-fail (run reports failure, PR
+  // is actually fine). That scope assumption was never revisited when Overseer became
+  // the merge steward, and it is why Overseer had merged NOTHING, ever -- verified
+  // 2026-07-25 against the live event store: 57 overseer_actions, zero merge-class,
+  // while 468 terminal runs sat in the watch queue (388 completed, 58 cancelled,
+  // 22 escalated, ZERO failed). Every one of them walked past a door marked
+  // "failed runs only".
   //
-  // Detection stays with the conductor (it is already polling and holds tier/attempt
-  // context). Overseer picks the run up at the terminal-state boundary. Clean handoff,
-  // no duplicated polling, no race.
-  if (run.status === 'cancelled' && isPrMergeReady(prEvidence)) {
+  // The status is not what makes a PR safe to merge -- the PR evidence is. So the
+  // gate is isPrMergeReady (exists && open && mergeable && green), applied uniformly.
+  // Every downstream guard still applies: merge provenance binds the PR to the run
+  // that produced it, Grok judges the diff, and production-effect merges stay held
+  // for John.
+  //
+  // On CANCELLED specifically: the conductor cancels on stall/runaway and then EXITS
+  // (it is a CLI process), so work it already pushed has no owner. Anchor: run
+  // 3ff3f773 was cancelled having produced a real commit, and the live log shows
+  // Overseer reading it and returning action:"ignore". Detection stays with the
+  // conductor; salvage belongs to Overseer, the persistent watcher.
+  if (isPrMergeReady(prEvidence)) {
+    const reason =
+      run.status === 'cancelled'
+        ? 'cancelled run left a green, mergeable PR -- salvaging orphaned work'
+        : `terminal status ${run.status} with a green, mergeable PR -- merge candidate`;
     return {
       runId: run.id,
       woId: run.woId,
@@ -110,15 +123,13 @@ async function assessRun(
       owner: run.owner,
       status: run.status,
       headBranch: run.headBranch,
+      workingPath: run.workingPath,
       metadata: run.metadata,
-      errorClass: 'tail_node_false_fail',
+      errorClass: run.status === 'failed' ? 'tail_node_false_fail' : undefined,
       action: 'merge_ready',
-      reason: 'cancelled run left a green, mergeable PR -- salvaging orphaned work',
+      reason,
       prEvidence,
-      decision: {
-        decision: 'merge_ready',
-        reason: 'cancelled run left a green, mergeable PR -- salvaging orphaned work',
-      },
+      decision: { decision: 'merge_ready', reason },
     };
   }
 
@@ -132,29 +143,22 @@ async function assessRun(
       headBranch: run.headBranch,
       workingPath: run.workingPath,
       metadata: run.metadata,
+      // Reached only when the PR is NOT merge-ready (the door above already took
+      // every green+mergeable case). A completed run with a green-but-unmergeable PR
+      // -- e.g. conflicting, or draft -- is still a success; anything else is noise.
       action: run.status === 'completed' && isPrGreen(prEvidence) ? 'success' : 'ignore',
-      reason: `terminal status ${run.status} does not require failure handling`,
+      reason:
+        run.status === 'completed'
+          ? `completed run; PR not merge-ready (${prEvidence.exists ? `state=${prEvidence.state} mergeable=${String(prEvidence.mergeable)}` : 'no PR'})`
+          : `terminal status ${run.status} with no merge-ready PR`,
       prEvidence,
     };
   }
 
-  if (isPrMergeReady(prEvidence)) {
-    return {
-      runId: run.id,
-      woId: run.woId,
-      repo: run.repo,
-      owner: run.owner,
-      status: run.status,
-      headBranch: run.headBranch,
-      workingPath: run.workingPath,
-      metadata: run.metadata,
-      errorClass: 'tail_node_false_fail',
-      action: 'merge_ready',
-      reason: 'failed run has green, mergeable PR evidence',
-      prEvidence,
-      decision: { decision: 'merge_ready', reason: 'failed run has green, mergeable PR evidence' },
-    };
-  }
+  // (The former failed-only merge_ready block lived here. It is now redundant: the
+  // merge door above handles every terminal status uniformly, including failed runs
+  // with green PRs -- the original tail-node false-fail case -- and still tags them
+  // errorClass: 'tail_node_false_fail'.)
 
   const events = await deps.listRunEvents(run.id);
   const lastEvent = selectFailureEvent(events);

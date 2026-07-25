@@ -135,3 +135,103 @@ describe('watch -- cancelled-run salvage', () => {
     expect(record.action).not.toBe('merge_ready');
   });
 });
+
+/**
+ * THE MERGE DOOR -- completed runs.
+ *
+ * This is the regression guard for why Overseer had merged NOTHING, ever. The merge
+ * path was gated on `status === 'failed'` because it was built for one scenario (the
+ * tail-node false-fail). Verified against the live event store 2026-07-25: 57
+ * overseer_actions, ZERO merge-class, while 468 terminal runs sat in the watch queue
+ * -- 388 completed, 58 cancelled, 22 escalated, and ZERO failed. Every candidate
+ * walked past a door marked "failed runs only".
+ *
+ * If someone ever re-narrows this to a status allowlist, these tests fail.
+ */
+describe('watch -- completed-run merge candidates', () => {
+  function statusDeps(
+    status: string,
+    evidence: PullRequestEvidence
+  ): OverseerRunStoreDeps & GitHubClientDeps {
+    return {
+      listRunsForWatch: async () => [
+        {
+          id: `run-${status}-1`,
+          woId: 'WO-MERGE-DOOR-01',
+          owner: 'bluedevilcollectibles',
+          repo: 'bdc-harness',
+          status,
+          headBranch: 'archon/thread-xyz',
+        },
+      ],
+      listRunEvents: async () => [],
+      findPullRequest: async () => evidence,
+      mergePullRequest: async () => ({ merged: true }),
+    };
+  }
+
+  test('a COMPLETED run with a green mergeable PR is a merge candidate', async () => {
+    const [record] = await watchOnce(statusDeps('completed', greenPr));
+
+    expect(record.action).toBe('merge_ready');
+    expect(record.action).not.toBe('success');
+    expect(record.decision?.decision).toBe('merge_ready');
+  });
+
+  test('an ESCALATED run with a green mergeable PR is a merge candidate', async () => {
+    const [record] = await watchOnce(statusDeps('escalated', greenPr));
+
+    expect(record.action).toBe('merge_ready');
+  });
+
+  test('a FAILED run with a green PR still merges and keeps the false-fail class', async () => {
+    // The original tail-node false-fail case must survive the generalization.
+    const [record] = await watchOnce(statusDeps('failed', greenPr));
+
+    expect(record.action).toBe('merge_ready');
+    expect(record.errorClass).toBe('tail_node_false_fail');
+  });
+
+  test('a completed run with a RED PR is NOT a merge candidate', async () => {
+    const [record] = await watchOnce(
+      statusDeps('completed', {
+        ...greenPr,
+        checks: { total: 2, passed: 1, failed: 1, pending: 0 },
+      })
+    );
+
+    expect(record.action).not.toBe('merge_ready');
+  });
+
+  test('a completed run with PENDING checks is NOT a merge candidate', async () => {
+    // Merge-if-green means green, not "not yet red".
+    const [record] = await watchOnce(
+      statusDeps('completed', {
+        ...greenPr,
+        checks: { total: 2, passed: 1, failed: 0, pending: 1 },
+      })
+    );
+
+    expect(record.action).not.toBe('merge_ready');
+  });
+
+  test('a completed run with an UNMERGEABLE (conflicting) PR is not a merge candidate', async () => {
+    const [record] = await watchOnce(statusDeps('completed', { ...greenPr, mergeable: false }));
+
+    expect(record.action).not.toBe('merge_ready');
+    expect(record.action).toBe('success');
+  });
+
+  test('a completed run with no PR at all is not a merge candidate', async () => {
+    const [record] = await watchOnce(
+      statusDeps('completed', {
+        exists: false,
+        state: 'missing',
+        checks: { total: 0, passed: 0, failed: 0, pending: 0 },
+        mergeable: null,
+      })
+    );
+
+    expect(record.action).not.toBe('merge_ready');
+  });
+});
