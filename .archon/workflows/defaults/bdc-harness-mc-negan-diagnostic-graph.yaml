@@ -135,8 +135,9 @@ nodes:
       stop-condition checks against origin/${BASE_BRANCH:-dev} instead of the
       worktree (e.g. git show origin/<base>:<path>, git grep <token> origin/<base>).
       If deliverables are absent locally but present and satisfying on
-      origin/<base>, emit ALREADY_SATISFIED=true and set SATISFIED_EVIDENCE= to
-      note the evidence was found on origin/<base>, not locally. Do NOT rebase and
+      origin/<base>, emit ALREADY_SATISFIED=true, emit SATISFIED_ON_BASE=true on
+      its own output line, and set SATISFIED_EVIDENCE= to note the evidence was
+      found on origin/<base>, not locally. Do NOT rebase and
       do NOT merge -- only report the verdict; the existing when: skip logic
       short-circuits plan/plan-review/implement.
 
@@ -166,7 +167,12 @@ nodes:
       CAS=$check-already-satisfied.output
       if printf '%s\n' "$CAS" | grep -qE '^ALREADY_SATISFIED=true'; then
         echo "ALREADY_SATISFIED=true"
-        echo "PRECHECK_VERDICT=already-satisfied"
+        if printf '%s\n' "$CAS" | grep -qE '^SATISFIED_ON_BASE=true'; then
+          echo "PRECHECK_VERDICT=already-merged-on-base"
+          echo "SATISFIED_ON_BASE=true"
+        else
+          echo "PRECHECK_VERDICT=already-satisfied"
+        fi
         printf '%s\n' "$CAS" | grep '^SATISFIED_EVIDENCE=' | head -1 || true
       else
         echo "ALREADY_SATISFIED=false"

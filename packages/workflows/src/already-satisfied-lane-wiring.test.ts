@@ -2,6 +2,7 @@ import { describe, expect, it } from 'bun:test';
 import { readFileSync, readdirSync } from 'fs';
 import { join } from 'path';
 import { parseWorkflow } from './loader';
+import { substituteNodeOutputRefs } from './dag-executor';
 import {
   clearRegistry,
   registerBuiltinProviders,
@@ -26,7 +27,14 @@ const ALL_GATE_FILES = readdirSync(LANES_DIR)
 const LANE_FILES = ALL_GATE_FILES.filter(file => file.startsWith('bdc-feature-development'));
 
 async function runGateScript(script: string, checkOutput: string) {
-  const rendered = script.replace('$check-already-satisfied.output', checkOutput);
+  // Mirror the production executor's bash-node substitution (see
+  // dag-executor.ts substituteNodeOutputRefs with escapedForBash=true). A naive
+  // String.prototype.replace here would hide the shellQuote wrapping that broke
+  // the previous heredoc-based gate at runtime.
+  const nodeOutputs = new Map([
+    ['check-already-satisfied', { state: 'completed' as const, output: checkOutput }],
+  ]);
+  const rendered = substituteNodeOutputRefs(script, nodeOutputs, true);
   const proc = Bun.spawn(['bash', '-c', rendered], {
     stdout: 'pipe',
     stderr: 'pipe',
