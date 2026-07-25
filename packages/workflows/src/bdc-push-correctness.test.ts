@@ -17,7 +17,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
-import { mkdtempSync, rmSync, writeFileSync } from 'fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 
@@ -132,6 +132,46 @@ echo "BASE_BRANCH=$BASE_BRANCH"
 echo "CMD=gh pr create --repo $REPO --title T --body-file BF --head $UNIQUE_BRANCH \${BASE_BRANCH:+--base "$BASE_BRANCH"}"
 cat "$BODY_FILE"
 `;
+
+// ---------------------------------------------------------------------------
+// Snippet 5: review diff-base resolution used by resolve-review-base.
+// Mirrors the bash node added to every bdc-feature-development*.yaml lane.
+// SPEC_TEXT is injected by the test harness instead of read from read-spec.
+// ---------------------------------------------------------------------------
+const RESOLVE_REVIEW_BASE = `
+set -uo pipefail
+DECLARED=$(printf '%s\\n' "$SPEC_TEXT" | grep -m1 -E '^Base branch:[[:space:]]*[A-Za-z0-9_./-]+' | sed -E 's/^Base branch:[[:space:]]*//')
+if [ -z "$DECLARED" ]; then
+  DECLARED=$(printf '%s\\n' "$SPEC_TEXT" | grep -m1 -E '\\*\\*Base branch:\\*\\*[[:space:]]*\\\`[A-Za-z0-9_./-]+\\\`' | sed -E 's/.*\\\`([A-Za-z0-9_./-]+)\\\`.*/\\1/')
+fi
+if [ -z "$DECLARED" ]; then
+  DECLARED=$(printf '%s\\n' "$SPEC_TEXT" | grep -m1 -E '^base_branch:[[:space:]]*[A-Za-z0-9_./-]+' | sed -E 's/^base_branch:[[:space:]]*//')
+fi
+if [ -n "$DECLARED" ] && git ls-remote --exit-code origin "refs/heads/\${DECLARED}" >/dev/null 2>&1; then
+  echo "REVIEW_BASE=$DECLARED"
+  echo "REVIEW_BASE_SOURCE=declared"
+elif [ -n "\${BASE_BRANCH:-}" ]; then
+  echo "REVIEW_BASE=$BASE_BRANCH"
+  echo "REVIEW_BASE_SOURCE=env-default"
+else
+  echo "REVIEW_BASE=master"
+  echo "REVIEW_BASE_SOURCE=fallback-master"
+fi
+`;
+
+// Anchor on import.meta.dir, not CWD: turbo runs package tests with cwd at the
+// package dir, so bare repo-root-relative paths ENOENT in CI.
+const DEFAULTS_DIR = join(import.meta.dir, '..', '..', '..', '.archon', 'workflows', 'defaults');
+const FEATURE_DEV_LANES = [
+  join(DEFAULTS_DIR, 'bdc-feature-development.yaml'),
+  join(DEFAULTS_DIR, 'bdc-feature-development-codex-only.yaml'),
+  join(DEFAULTS_DIR, 'bdc-feature-development-codex.yaml'),
+  join(DEFAULTS_DIR, 'bdc-feature-development-fable.yaml'),
+  join(DEFAULTS_DIR, 'bdc-feature-development-fusion-cx-qwen.yaml'),
+  join(DEFAULTS_DIR, 'bdc-feature-development-grok.yaml'),
+  join(DEFAULTS_DIR, 'bdc-feature-development-zero-open.yaml'),
+  join(DEFAULTS_DIR, 'bdc-feature-development-zero.yaml'),
+];
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -415,6 +455,58 @@ describe('Base branch override: deterministic open-pr-if-needed handling', () =>
     expect(result.stdout).toContain('BASE_BRANCH=staging');
     expect(result.stdout).toContain('--base staging');
     expect(result.stdout).not.toContain('## Base branch override');
+  });
+});
+
+describe('Review diff-base resolution from declared Base branch', () => {
+  it('uses a declared staging base before the run/codebase default', () => {
+    git(['checkout', '-b', 'staging'], worktreeDir);
+    git(['push', 'origin', 'staging'], worktreeDir);
+
+    const result = bash(RESOLVE_REVIEW_BASE, worktreeDir, {
+      SPEC_TEXT: ['WO: WO-TEST', 'Base branch: staging'].join('\n'),
+      BASE_BRANCH: 'master',
+    });
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain('REVIEW_BASE=staging');
+    expect(result.stdout).toContain('REVIEW_BASE_SOURCE=declared');
+    expect(result.stdout).not.toContain('REVIEW_BASE=master');
+  });
+
+  it('falls back to env default, then master, when no Base branch is declared', () => {
+    const envDefault = bash(RESOLVE_REVIEW_BASE, worktreeDir, {
+      SPEC_TEXT: 'WO: WO-TEST\nObjective: no declared base',
+      BASE_BRANCH: 'release/ce',
+    });
+    expect(envDefault.exitCode).toBe(0);
+    expect(envDefault.stdout).toContain('REVIEW_BASE=release/ce');
+    expect(envDefault.stdout).toContain('REVIEW_BASE_SOURCE=env-default');
+
+    const lastResort = bash(RESOLVE_REVIEW_BASE, worktreeDir, {
+      SPEC_TEXT: 'WO: WO-TEST\nObjective: no declared base',
+      BASE_BRANCH: '',
+    });
+    expect(lastResort.exitCode).toBe(0);
+    expect(lastResort.stdout).toContain('REVIEW_BASE=master');
+    expect(lastResort.stdout).toContain('REVIEW_BASE_SOURCE=fallback-master');
+  });
+});
+
+describe('Lane consistency: all feature-development lanes share review-base wiring', () => {
+  it('has no env-only review BASE_REF one-liner and has base_branch_override in every lane', () => {
+    for (const lane of FEATURE_DEV_LANES) {
+      // Normalize CRLF so a Windows checkout does not break '\n'-suffixed assertions.
+      const yaml = readFileSync(lane, 'utf8').replace(/\r\n/g, '\n');
+      expect(yaml).toContain('  - id: resolve-review-base\n');
+      expect(yaml).toContain('depends_on: [war-council-validator, resolve-review-base]');
+      expect(yaml).toContain(
+        'depends_on: [diff-review, classify-diff-review, resolve-review-base]'
+      );
+      expect(yaml).toContain('depends_on: [diff-repair, resolve-review-base]');
+      expect(yaml).not.toContain('BASE_REF="origin/${BASE_BRANCH:-main}"');
+      expect(yaml).toContain('base_branch_override');
+    }
   });
 });
 

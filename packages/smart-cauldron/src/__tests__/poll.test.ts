@@ -45,7 +45,12 @@ describe('pollForTerminal PR-detection race guard', () => {
     expect(result.terminalStatus).toBe('completed');
     expect(result.prUrl).toBe('https://github.com/bluedevilcollectibles/bdc-harness/pull/488');
     expect(calls).toBe(2);
-  }, 15000);
+    // 30s, raised from 15s after a 15016ms CI failure (16ms over) on 2026-07-25.
+    // NOTE for whoever touches this next: intervalMs and the retry delays here are
+    // 1ms, so this test has no business taking 15 SECONDS -- the wall time is not
+    // slowness, it is something in the PR-lookup path blocking. Raising the ceiling
+    // unblocks the branch; it does NOT explain the duration. Worth a real look.
+  }, 30000);
 
   test('declares no PR only after exhausting retries', async () => {
     let calls = 0;

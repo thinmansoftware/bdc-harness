@@ -1053,13 +1053,47 @@ nodes:
   # so it cannot run `git diff` itself (F5 fix). This bash node captures the full feature
   # diff (merge-base..HEAD plus any unstaged working-tree changes) to an artifact the
   # Codex review prompts read. Emits provenance so the reviewer knows exactly what it saw.
+  - id: resolve-review-base
+    depends_on: [read-spec]
+    bash: |
+      set -uo pipefail
+      SPEC_TEXT=$(cat <<'RESOLVE_REVIEW_BASE_READ_SPEC_SENTINEL'
+      $read-spec.output
+      RESOLVE_REVIEW_BASE_READ_SPEC_SENTINEL
+      )
+      # Same 3 patterns decide-push-target's Base Branch Override section already
+      # documents (plain header, markdown-bold, YAML field), in priority order.
+      DECLARED=$(printf '%s\n' "$SPEC_TEXT" | grep -m1 -E '^Base branch:[[:space:]]*[A-Za-z0-9_./-]+' | sed -E 's/^Base branch:[[:space:]]*//')
+      if [ -z "$DECLARED" ]; then
+        DECLARED=$(printf '%s\n' "$SPEC_TEXT" | grep -m1 -E '\*\*Base branch:\*\*[[:space:]]*`[A-Za-z0-9_./-]+`' | sed -E 's/.*`([A-Za-z0-9_./-]+)`.*/\1/')
+      fi
+      if [ -z "$DECLARED" ]; then
+        DECLARED=$(printf '%s\n' "$SPEC_TEXT" | grep -m1 -E '^base_branch:[[:space:]]*[A-Za-z0-9_./-]+' | sed -E 's/^base_branch:[[:space:]]*//')
+      fi
+      if [ -n "$DECLARED" ] && git ls-remote --exit-code origin "refs/heads/${DECLARED}" >/dev/null 2>&1; then
+        echo "REVIEW_BASE=$DECLARED"
+        echo "REVIEW_BASE_SOURCE=declared"
+      elif [ -n "${BASE_BRANCH:-}" ]; then
+        echo "REVIEW_BASE=$BASE_BRANCH"
+        echo "REVIEW_BASE_SOURCE=env-default"
+      else
+        echo "REVIEW_BASE=master"
+        echo "REVIEW_BASE_SOURCE=fallback-master"
+      fi
+
   - id: capture-diff
-    depends_on: [war-council-validator]
+    depends_on: [war-council-validator, resolve-review-base]
     bash: |
       set -uo pipefail
       mkdir -p "$ARTIFACTS_DIR"
       OUT="$ARTIFACTS_DIR/diff.patch"
-      BASE_REF="origin/${BASE_BRANCH:-main}"
+      REVIEW_BASE_OUTPUT=$(cat <<'RESOLVE_REVIEW_BASE_OUTPUT_SENTINEL'
+      $resolve-review-base.output
+      RESOLVE_REVIEW_BASE_OUTPUT_SENTINEL
+      )
+      REVIEW_BASE=$(printf '%s\n' "$REVIEW_BASE_OUTPUT" | sed -n 's/^REVIEW_BASE=//p' | head -n 1)
+      [ -n "$REVIEW_BASE" ] || REVIEW_BASE="${BASE_BRANCH:-master}"
+      BASE_REF="origin/$REVIEW_BASE"
       # NF2: when there is no merge-base and no HEAD~1 (single-commit / no-base repo),
       # fall back to the empty-tree hash, NOT HEAD. HEAD..HEAD is an EMPTY diff (reviewer
       # sees nothing); empty-tree..HEAD shows all committed content as added (meaningful).
@@ -1143,7 +1177,7 @@ nodes:
   - id: diff-repair
     provider: codex
     model: gpt-5.6-sol
-    depends_on: [diff-review, classify-diff-review]
+    depends_on: [diff-review, classify-diff-review, resolve-review-base]
     when: "$classify-diff-review.output.verdict == 'needs_revision'"
     task_class: medium_work
     loop:
@@ -1169,7 +1203,13 @@ nodes:
         # real feature diff: merge-base..HEAD (committed) PLUS HEAD..worktree (unstaged).
         # NF2: empty-tree fallback (not HEAD) so a single-commit/no-base repo still
         # produces a non-empty committed diff to scan for debug prints.
-        BASE_REF="origin/${BASE_BRANCH:-main}"
+        REVIEW_BASE_OUTPUT=$(cat <<'RESOLVE_REVIEW_BASE_OUTPUT_SENTINEL'
+        $resolve-review-base.output
+        RESOLVE_REVIEW_BASE_OUTPUT_SENTINEL
+        )
+        REVIEW_BASE=$(printf '%s\n' "$REVIEW_BASE_OUTPUT" | sed -n 's/^REVIEW_BASE=//p' | head -n 1)
+        [ -n "$REVIEW_BASE" ] || REVIEW_BASE="${BASE_BRANCH:-master}"
+        BASE_REF="origin/$REVIEW_BASE"
         EMPTY_TREE=$(git hash-object -t tree /dev/null 2>/dev/null || echo 4b825dc642cb6eb9a060e54bf8d69288fbee4904)
         MB=$(git merge-base HEAD "$BASE_REF" 2>/dev/null || git rev-parse HEAD~1 2>/dev/null || echo "$EMPTY_TREE")
         [ -n "$MB" ] || MB="$EMPTY_TREE"
@@ -1246,13 +1286,19 @@ nodes:
   # the repaired tree, not the pre-repair diff. trigger_rule all_done so it runs even if
   # diff-repair failed/exhausted (F6) -- the final reviewer must still adjudicate.
   - id: capture-diff-final
-    depends_on: [diff-repair]
+    depends_on: [diff-repair, resolve-review-base]
     trigger_rule: all_done
     bash: |
       set -uo pipefail
       mkdir -p "$ARTIFACTS_DIR"
       OUT="$ARTIFACTS_DIR/diff-final.patch"
-      BASE_REF="origin/${BASE_BRANCH:-main}"
+      REVIEW_BASE_OUTPUT=$(cat <<'RESOLVE_REVIEW_BASE_OUTPUT_SENTINEL'
+      $resolve-review-base.output
+      RESOLVE_REVIEW_BASE_OUTPUT_SENTINEL
+      )
+      REVIEW_BASE=$(printf '%s\n' "$REVIEW_BASE_OUTPUT" | sed -n 's/^REVIEW_BASE=//p' | head -n 1)
+      [ -n "$REVIEW_BASE" ] || REVIEW_BASE="${BASE_BRANCH:-master}"
+      BASE_REF="origin/$REVIEW_BASE"
       # NF2: when there is no merge-base and no HEAD~1 (single-commit / no-base repo),
       # fall back to the empty-tree hash, NOT HEAD. HEAD..HEAD is an EMPTY diff (reviewer
       # sees nothing); empty-tree..HEAD shows all committed content as added (meaningful).
@@ -1848,6 +1894,43 @@ nodes:
       3. `Target repo: <owner>/<repo>` (plain header)
       4. `**Target Repo:** \`<owner>/<repo>\`` (Markdown bold, capital R)
 
+      ## Base Branch Override
+      Before consulting the hardcoded staging-gate list below, check whether the spec
+      declares an explicit PR base branch override. Look for any of these patterns
+      (in priority order):
+      1. `Base branch: <branch-name>` (plain header, canonical form)
+      2. `**Base branch:** `<branch-name>`` (Markdown bold)
+      3. `base_branch: <branch-name>` (YAML field)
+
+      If a Base branch override is declared, first finish resolving the target repo
+      using the Required Repo Policy above, including the origin fallback below when
+      needed. Then verify that the named branch exists on the resolved target repo's
+      remote, not the worktree's origin. Use the same git ls-remote mechanism used
+      elsewhere in this workflow, pointed at the explicit repo URL:
+        git ls-remote https://github.com/<owner>/<repo>.git refs/heads/<branch-name>
+
+      If the branch exists, output exactly:
+      push_target: feature-branch:<spec-derived-branch-name>
+      pr_required: true
+      staging_gate_required: false
+      base_branch_override: <declared-override-branch>
+      repo: <owner>/<repo>
+
+      In this success case, stop there and do not continue into the staging-gate
+      list. The push_target branch is the WO feature branch derived by the Branch
+      Name Derivation Rules above; base_branch_override is the PR target/base branch
+      declared by the spec. These are distinct values and must not be conflated.
+
+      If the spec declares a Base branch override but the named branch does not
+      exist on the target repo's remote, fail closed and output exactly:
+      out_of_scope: true
+      reason: Base branch override '<branch-name>' declared in spec does not exist on <owner>/<repo>
+      repo: <owner>/<repo>
+
+      Do not fall through to the staging-gate list or to main when a declared
+      override branch is missing. If no `Base branch:` line is present, fall through
+      to the staging-gate list below unchanged.
+
       The target repo is where the PR must be opened (NOT the worktree's git origin - Rule 29).
 
       Match the extracted repo against this hardcoded staging-gate list:
@@ -2234,8 +2317,29 @@ nodes:
       # and lets gh use the repo default).
       # WO-HARNESS-PUSH-CORRECTNESS-HARDENING-01 (closes Rule 20 bypass hole 2026-05-18).
       STAGING_GATE=$(printf '%s\n' "$DECIDE_OUTPUT" | grep -c '^staging_gate_required: true' 2>/dev/null || true)
+      BASE_BRANCH_OVERRIDE=$(printf '%s\n' "$DECIDE_OUTPUT" | sed -n 's/^base_branch_override: //p' | head -n 1 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
       STAGING_GATE="${STAGING_GATE:-0}"
-      if [ "$STAGING_GATE" -ge 1 ] 2>/dev/null; then
+      if [ -n "$BASE_BRANCH_OVERRIDE" ]; then
+        case "$BASE_BRANCH_OVERRIDE" in
+          unknown|UNKNOWN|"<"*">"*|*"e.g."*)
+            echo "ERROR: decide-push-target emitted an invalid base_branch_override value: ${BASE_BRANCH_OVERRIDE}" >&2
+            exit 1
+            ;;
+        esac
+        if printf '%s' "$BASE_BRANCH_OVERRIDE" | grep -q '[[:space:]]'; then
+          echo "ERROR: decide-push-target emitted an invalid base_branch_override value with whitespace: ${BASE_BRANCH_OVERRIDE}" >&2
+          exit 1
+        fi
+        if ! git check-ref-format --branch "$BASE_BRANCH_OVERRIDE" >/dev/null 2>&1; then
+          echo "ERROR: decide-push-target emitted an invalid base branch override ref name: ${BASE_BRANCH_OVERRIDE}" >&2
+          exit 1
+        fi
+        if ! git ls-remote --exit-code "https://github.com/${REPO}.git" "refs/heads/${BASE_BRANCH_OVERRIDE}" >/dev/null 2>&1; then
+          echo "ERROR: base branch override ${BASE_BRANCH_OVERRIDE} does not exist on ${REPO}; refusing to open PR against an unverified base." >&2
+          exit 1
+        fi
+        BASE_BRANCH="$BASE_BRANCH_OVERRIDE"
+      elif [ "$STAGING_GATE" -ge 1 ] 2>/dev/null; then
         BASE_BRANCH="staging"
       else
         BASE_BRANCH=""
@@ -2254,6 +2358,11 @@ nodes:
         echo "real validation gates run at PR time (codex-review + claude-review + Gitleaks + e2e-smoke + Captain CI)."
         echo "See implement output below for what the builder verified locally."
         echo
+        if [ -n "$BASE_BRANCH_OVERRIDE" ]; then
+          echo "## Base branch override"
+          echo "Base branch override applied: PR targets \`$BASE_BRANCH_OVERRIDE\` per spec-declared \`Base branch:\` field (not the default staging gate)."
+          echo
+        fi
         echo "## Implement output"
         echo "$IMPLEMENT_OUTPUT"
         echo
