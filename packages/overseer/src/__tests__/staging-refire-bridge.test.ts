@@ -9,9 +9,7 @@ const SHA_A = 'a'.repeat(40);
 const SHA_B = 'b'.repeat(40);
 const DIGEST = `sha256:${'2'.repeat(64)}`;
 
-function payload(
-  overrides: Partial<M42Slice8BManifestPayload> = {}
-): M42Slice8BManifestPayload {
+function payload(overrides: Partial<M42Slice8BManifestPayload> = {}): M42Slice8BManifestPayload {
   return {
     schema_version: M42_SLICE8B_MANIFEST_SCHEMA,
     execution_id: 'exec-s8b-staging-refire',
