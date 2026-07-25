@@ -137,10 +137,25 @@ nodes:
     depends_on: [read-spec]
     task_class: clerical
     prompt: |
-      You decide ONE thing: are this WO's deliverables ALREADY fully present in the
-      CURRENT worktree's HEAD, such that a build would produce no changes? You are
-      READ-ONLY. Judge ONLY against this worktree (you are cd'd into it; use plain git
-      and Read/Grep/Glob on local files). Do NOT consult origin/main or other worktrees.
+      You decide ONE thing: are this WO's deliverables ALREADY fully present, such
+      that a build would produce no changes? You are READ-ONLY. First judge against
+      THIS worktree's HEAD (you are cd'd into it; use plain git and Read/Grep/Glob on
+      local files).
+
+      BASE_CHECK: if the deliverables are NOT present in this worktree, a concurrent
+      sibling run may already have merged them. Run:
+        git fetch origin ${BASE_BRANCH:-dev} --quiet
+      If the fetch fails, emit BASE_CHECK=unavailable on its own output line and fall
+      back to ALREADY_SATISFIED=false (do not hard-fail this node -- this matches
+      today's behavior). If the fetch succeeds, re-run the SAME spec-derived
+      stop-condition checks against origin/${BASE_BRANCH:-dev} instead of the
+      worktree (e.g. git show origin/<base>:<path>, git grep <token> origin/<base>).
+      If deliverables are absent locally but present and satisfying on
+      origin/<base>, emit ALREADY_SATISFIED=true, emit SATISFIED_ON_BASE=true on
+      its own output line, and set SATISFIED_EVIDENCE= to note the evidence was
+      found on origin/<base>, not locally. Do NOT rebase and
+      do NOT merge -- only report the verdict; the existing when: skip logic
+      short-circuits plan/plan-review/implement.
 
       ## Spec
       $read-spec.output
@@ -169,13 +184,34 @@ nodes:
     depends_on: [check-already-satisfied]
     bash: |
       set -uo pipefail
-      CAS=$(cat <<'BDC_FEATURE_DEV_CHECK_ALREADY_SATISFIED_20260713_F9C2A1'
-      $check-already-satisfied.output
-      BDC_FEATURE_DEV_CHECK_ALREADY_SATISFIED_20260713_F9C2A1
-      )
+      # Direct assignment (not heredoc). The executor's substituteNodeOutputRefs
+      # wraps the multi-line node output in single quotes via shellQuote, producing
+      # a valid multi-line bash assignment: CAS='line1\nline2\n...'. The previous
+      # heredoc pattern silently broke at runtime because the substituted value
+      # ARRIVED already single-quoted, embedding literal apostrophes at the start
+      # and end of the heredoc content. That made the first line
+      #   'ALREADY_SATISFIED=true
+      # which never matched grep -qE '^ALREADY_SATISFIED=true', so this gate
+      # always fell through to PRECHECK_VERDICT=needs-build and no skip ever
+      # happened. Mirrors the direct-assignment pattern that already works in
+      # the bdc-harness-*.yaml lanes.
+      CAS=$check-already-satisfied.output
       if printf '%s\n' "$CAS" | grep -qE '^ALREADY_SATISFIED=true'; then
         SATISFIED_EVIDENCE=$(printf '%s\n' "$CAS" | sed -n 's/^SATISFIED_EVIDENCE=//p' | head -1)
-        ALREADY_VALUE=true PRECHECK_VERDICT=already-satisfied SATISFIED_EVIDENCE="$SATISFIED_EVIDENCE" python3 - <<'PY'
+        if printf '%s\n' "$CAS" | grep -qE '^SATISFIED_ON_BASE=true'; then
+          ALREADY_VALUE=true PRECHECK_VERDICT=already-merged-on-base SATISFIED_ON_BASE=true SATISFIED_EVIDENCE="$SATISFIED_EVIDENCE" python3 - <<'PY'
+      import json
+      import os
+      print(json.dumps({
+          "ALREADY_SATISFIED": os.environ.get("ALREADY_VALUE") == "true",
+          "PRECHECK_VERDICT": os.environ.get("PRECHECK_VERDICT", "already-merged-on-base"),
+          "SATISFIED_EVIDENCE": os.environ.get("SATISFIED_EVIDENCE", ""),
+          "SATISFIED_ON_BASE": os.environ.get("SATISFIED_ON_BASE") == "true",
+      }, separators=(",", ":")))
+      PY
+          echo "gate-already-satisfied: WO appears already merged on origin/<base> (not in this worktree); build-only nodes will be skipped." >&2
+        else
+          ALREADY_VALUE=true PRECHECK_VERDICT=already-satisfied SATISFIED_EVIDENCE="$SATISFIED_EVIDENCE" python3 - <<'PY'
       import json
       import os
       print(json.dumps({
@@ -184,7 +220,8 @@ nodes:
           "SATISFIED_EVIDENCE": os.environ.get("SATISFIED_EVIDENCE", ""),
       }, separators=(",", ":")))
       PY
-        echo "gate-already-satisfied: WO appears already implemented in this worktree; build-only nodes will be skipped." >&2
+          echo "gate-already-satisfied: WO appears already implemented in this worktree; build-only nodes will be skipped." >&2
+        fi
       else
         ALREADY_VALUE=false PRECHECK_VERDICT=needs-build python3 - <<'PY'
       import json

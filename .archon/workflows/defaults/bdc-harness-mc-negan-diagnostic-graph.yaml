@@ -121,10 +121,25 @@ nodes:
     depends_on: [read-spec]
     task_class: clerical
     prompt: |
-      You decide ONE thing: are this WO's deliverables ALREADY fully present in the CURRENT
-      worktree's HEAD, such that a build would produce no changes? You are READ-ONLY. Judge
-      ONLY against this worktree (you are cd'd into it; use plain git + Read/Grep/Glob on
-      local files). Do NOT consult origin/main or other worktrees.
+      You decide ONE thing: are this WO's deliverables ALREADY fully present, such
+      that a build would produce no changes? You are READ-ONLY. First judge against
+      THIS worktree's HEAD (you are cd'd into it; use plain git and Read/Grep/Glob on
+      local files).
+
+      BASE_CHECK: if the deliverables are NOT present in this worktree, a concurrent
+      sibling run may already have merged them. Run:
+        git fetch origin ${BASE_BRANCH:-dev} --quiet
+      If the fetch fails, emit BASE_CHECK=unavailable on its own output line and fall
+      back to ALREADY_SATISFIED=false (do not hard-fail this node -- this matches
+      today's behavior). If the fetch succeeds, re-run the SAME spec-derived
+      stop-condition checks against origin/${BASE_BRANCH:-dev} instead of the
+      worktree (e.g. git show origin/<base>:<path>, git grep <token> origin/<base>).
+      If deliverables are absent locally but present and satisfying on
+      origin/<base>, emit ALREADY_SATISFIED=true, emit SATISFIED_ON_BASE=true on
+      its own output line, and set SATISFIED_EVIDENCE= to note the evidence was
+      found on origin/<base>, not locally. Do NOT rebase and
+      do NOT merge -- only report the verdict; the existing when: skip logic
+      short-circuits plan/plan-review/implement.
 
       ## This WO is an EXTENSION, not a rebuild
       The Mission Control graph already exists (ExecutionDagNode.tsx, dag-layout.ts,
@@ -152,7 +167,12 @@ nodes:
       CAS=$check-already-satisfied.output
       if printf '%s\n' "$CAS" | grep -qE '^ALREADY_SATISFIED=true'; then
         echo "ALREADY_SATISFIED=true"
-        echo "PRECHECK_VERDICT=already-satisfied"
+        if printf '%s\n' "$CAS" | grep -qE '^SATISFIED_ON_BASE=true'; then
+          echo "PRECHECK_VERDICT=already-merged-on-base"
+          echo "SATISFIED_ON_BASE=true"
+        else
+          echo "PRECHECK_VERDICT=already-satisfied"
+        fi
         printf '%s\n' "$CAS" | grep '^SATISFIED_EVIDENCE=' | head -1 || true
       else
         echo "ALREADY_SATISFIED=false"
