@@ -10,6 +10,8 @@ export interface OverseerRunRecord {
   owner: string;
   status: WatchedRunStatus;
   headBranch?: string;
+  /** Engine-written worktree path. Provenance anchor -- not agent-authored. */
+  workingPath?: string;
   metadata?: Record<string, unknown>;
 }
 
@@ -48,6 +50,11 @@ export interface PullRequestEvidence {
   filesChangedCount?: number;
   diffStat?: string;
   htmlUrl?: string;
+  /**
+   * Head SHA as reported by the GitHub API for this PR. Independent of run metadata --
+   * merge provenance compares this against the run's own worktree tip.
+   */
+  headSha?: string;
 }
 
 export interface GrokJudgeEvidence {
@@ -94,6 +101,8 @@ export interface WatchedRunRecord {
   owner: string;
   status: WatchedRunStatus;
   headBranch?: string;
+  /** Engine-written worktree path. Provenance anchor -- not agent-authored. */
+  workingPath?: string;
   metadata?: Record<string, unknown>;
   errorClass?: ErrorClass | 'tail_node_false_fail';
   action: 'success' | 'merge_ready' | 'escalate' | 'ignore';

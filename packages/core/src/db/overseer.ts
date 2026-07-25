@@ -11,6 +11,11 @@ export interface OverseerWatchRun {
   owner: string;
   status: string;
   headBranch?: string;
+  /**
+   * Engine-written worktree path for this run. Trustworthy provenance anchor:
+   * agents author `metadata` (including headBranch), but not this column.
+   */
+  workingPath?: string;
   metadata: Record<string, unknown>;
 }
 
@@ -38,6 +43,9 @@ interface WorkflowRunRow {
   status: string;
   metadata: unknown;
   user_message: string;
+  // Engine-written (see workflows.ts createRun). Unlike `metadata`, an agent cannot
+  // author this -- which is why merge provenance binds to it and not to metadata.
+  working_path: string | null;
 }
 
 interface WorkflowEventRow {
@@ -108,6 +116,7 @@ function normalizeRun(row: WorkflowRunRow): OverseerWatchRun {
     repo: repo.repo,
     status: row.status,
     headBranch: stringField(metadata, ['headBranch', 'head_branch', 'branch']),
+    workingPath: row.working_path ?? undefined,
     metadata,
   };
 }
@@ -125,7 +134,7 @@ function normalizeEvent(row: WorkflowEventRow): OverseerWorkflowEventRow {
 
 export async function listRunsForOverseerWatch(): Promise<OverseerWatchRun[]> {
   const result = await getDatabase().query<WorkflowRunRow>(
-    `SELECT id, status, metadata, user_message
+    `SELECT id, status, metadata, user_message, working_path
      FROM remote_agent_workflow_runs
      WHERE status IN ('completed', 'failed', 'escalated', 'cancelled')
        AND NOT EXISTS (
