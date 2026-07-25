@@ -1126,7 +1126,6 @@ nodes:
       printf '{"verdict":"%s"}\n' "$verdict"
 
   - id: diff-repair
-    idle_timeout: 600000
     persona: major-build
     agent: major-build
     depends_on: [diff-review, classify-diff-review]

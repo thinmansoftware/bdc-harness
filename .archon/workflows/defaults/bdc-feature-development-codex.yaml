@@ -1141,7 +1141,6 @@ nodes:
       printf '{"verdict":"%s"}\n' "$verdict"
 
   - id: diff-repair
-    idle_timeout: 600000
     provider: codex
     model: gpt-5.5
     depends_on: [diff-review, classify-diff-review]
