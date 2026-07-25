@@ -82,11 +82,26 @@ RUN apt-get update && apt-get install -y \
     # jq is load-bearing: lane read-spec bash nodes parse GitHub API JSON with it
     # (2026-07-10 outage #2: image shipped without jq -> read-spec exit 127)
     jq \
+    # ripgrep + fd-find: agent code search. Both respect .gitignore, so searches
+    # skip node_modules by default. The win is CONTEXT, not wall-clock -- plain
+    # `grep -rn` returns node_modules noise that lands in the agent's context
+    # window and costs tokens on every search, on every node, on every run.
+    # fd-find installs the binary as `fdfind` on Debian; symlinked to `fd` below.
+    ripgrep \
+    fd-find \
+    # shellcheck: Cauldron lanes are mostly bash nodes, and our recorded failure
+    # modes are bash-shaped (unquoted expansions, E2BIG spawn, heredoc quoting,
+    # `|| echo` swallowing real errors). Static-check that class before a run
+    # spends 20 minutes discovering it.
+    shellcheck \
     postgresql-client \
     unzip \
     # Chromium for agent-browser E2E testing (drives browser via CDP)
     chromium \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    # Debian ships fd-find's binary as `fdfind` (name clash with an unrelated
+    # package). Agents and docs say `fd`, so expose it under the expected name.
+    && ln -sf "$(command -v fdfind)" /usr/local/bin/fd
 
 # Install GitHub CLI
 RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg \
