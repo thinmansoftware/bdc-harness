@@ -24,12 +24,20 @@ const REPO_ROOT = join(import.meta.dir, '..', '..', '..');
 const LANES_DIR = join(REPO_ROOT, '.archon/workflows/defaults');
 
 // The 12 lanes that carry the check-already-satisfied precheck node (spec Section 5).
+// Hardcoded on purpose: this is the tripwire that forces a NEW lane to be given the
+// base-ref precheck rather than silently inheriting the old worktree-only prompt.
+// Kimi canary lanes added here 2026-07-25 -- they were cloned from fusion-cx-qwen
+// BEFORE the M-85 fix landed, so they arrived carrying the forbidding
+// "Do NOT consult origin/main" instruction and no BASE_CHECK. This test caught that
+// before merge; the fix was ported into both.
 const EXPECTED_PRECHECK_LANES = [
   'bdc-feature-development-codex-only.yaml',
   'bdc-feature-development-codex.yaml',
   'bdc-feature-development-fable.yaml',
+  'bdc-feature-development-fusion-cx-kimi.yaml',
   'bdc-feature-development-fusion-cx-qwen.yaml',
   'bdc-feature-development-grok.yaml',
+  'bdc-feature-development-kimi-k3.yaml',
   'bdc-feature-development-zero-claude.yaml',
   'bdc-feature-development-zero-open.yaml',
   'bdc-feature-development-zero.yaml',
@@ -63,7 +71,7 @@ function precheckPrompt(file: string): string {
 }
 
 describe('already-satisfied base-ref visibility (WO-HARNESS-PRECHECK-BASE-REF-VISIBILITY-01)', () => {
-  it('discovers exactly the 12 expected precheck lanes', () => {
+  it('discovers exactly the 14 expected precheck lanes', () => {
     expect(PRECHECK_LANE_FILES).toEqual(EXPECTED_PRECHECK_LANES);
   });
 
@@ -198,13 +206,20 @@ async function runGate(file: string, checkOutput: string) {
 }
 
 describe('gate-already-satisfied disposition (behavioral)', () => {
-  it('executes exactly the 9 JSON-gate feature-development lanes', () => {
+  it('executes exactly the 11 JSON-gate feature-development lanes', () => {
+    // The two Kimi canary lanes appear here only because they now carry the MODERN
+    // gate node. They were cloned from fusion-cx-qwen before both the M-85 base-ref
+    // fix AND the heredoc-to-shellQuote gate fix landed, so on arrival they had the
+    // old broken gate and were correctly excluded by the filter above. Their
+    // presence in this list is the evidence that both ports took.
     expect(JSON_GATE_FEATURE_LANES).toEqual([
       'bdc-feature-development-codex-only.yaml',
       'bdc-feature-development-codex.yaml',
       'bdc-feature-development-fable.yaml',
+      'bdc-feature-development-fusion-cx-kimi.yaml',
       'bdc-feature-development-fusion-cx-qwen.yaml',
       'bdc-feature-development-grok.yaml',
+      'bdc-feature-development-kimi-k3.yaml',
       'bdc-feature-development-zero-claude.yaml',
       'bdc-feature-development-zero-open.yaml',
       'bdc-feature-development-zero.yaml',
