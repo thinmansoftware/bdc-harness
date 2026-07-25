@@ -159,15 +159,18 @@ else
 fi
 `;
 
+// Anchor on import.meta.dir, not CWD: turbo runs package tests with cwd at the
+// package dir, so bare repo-root-relative paths ENOENT in CI.
+const DEFAULTS_DIR = join(import.meta.dir, '..', '..', '..', '.archon', 'workflows', 'defaults');
 const FEATURE_DEV_LANES = [
-  '.archon/workflows/defaults/bdc-feature-development.yaml',
-  '.archon/workflows/defaults/bdc-feature-development-codex-only.yaml',
-  '.archon/workflows/defaults/bdc-feature-development-codex.yaml',
-  '.archon/workflows/defaults/bdc-feature-development-fable.yaml',
-  '.archon/workflows/defaults/bdc-feature-development-fusion-cx-qwen.yaml',
-  '.archon/workflows/defaults/bdc-feature-development-grok.yaml',
-  '.archon/workflows/defaults/bdc-feature-development-zero-open.yaml',
-  '.archon/workflows/defaults/bdc-feature-development-zero.yaml',
+  join(DEFAULTS_DIR, 'bdc-feature-development.yaml'),
+  join(DEFAULTS_DIR, 'bdc-feature-development-codex-only.yaml'),
+  join(DEFAULTS_DIR, 'bdc-feature-development-codex.yaml'),
+  join(DEFAULTS_DIR, 'bdc-feature-development-fable.yaml'),
+  join(DEFAULTS_DIR, 'bdc-feature-development-fusion-cx-qwen.yaml'),
+  join(DEFAULTS_DIR, 'bdc-feature-development-grok.yaml'),
+  join(DEFAULTS_DIR, 'bdc-feature-development-zero-open.yaml'),
+  join(DEFAULTS_DIR, 'bdc-feature-development-zero.yaml'),
 ];
 
 // ---------------------------------------------------------------------------
@@ -493,7 +496,8 @@ describe('Review diff-base resolution from declared Base branch', () => {
 describe('Lane consistency: all feature-development lanes share review-base wiring', () => {
   it('has no env-only review BASE_REF one-liner and has base_branch_override in every lane', () => {
     for (const lane of FEATURE_DEV_LANES) {
-      const yaml = readFileSync(lane, 'utf8');
+      // Normalize CRLF so a Windows checkout does not break '\n'-suffixed assertions.
+      const yaml = readFileSync(lane, 'utf8').replace(/\r\n/g, '\n');
       expect(yaml).toContain('  - id: resolve-review-base\n');
       expect(yaml).toContain('depends_on: [war-council-validator, resolve-review-base]');
       expect(yaml).toContain(
