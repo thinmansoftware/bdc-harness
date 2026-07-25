@@ -79,3 +79,10 @@ Select the correct codebase (`bluedevilcollectibles/bdc-xo`) and retry.
 - `packages/workflows/src/store.ts` — `dag_workflow_failed` event type
 - `packages/workflows/src/schemas/workflow.ts` — `target_repo` field on `workflowBaseSchema`
 - `xo-wiki/wiki/doctrine/archon-yaml-authoring/_index.md` — Rule 28 doctrine entry
+
+## Reusable Lane Tail Guard
+
+`scripts/check-no-flip-notion.sh` scans the maintained allowlist of active reusable
+BDC lane YAMLs and fails if any reintroduce the retired `flip-notion` tail. The
+guard intentionally excludes `bdc-harness-wo-onramp.yaml`, which is covered by its
+own work order, and the one-off archived WO YAMLs that no longer fire.
