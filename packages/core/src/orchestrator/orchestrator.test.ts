@@ -633,8 +633,13 @@ describe('orchestrator-agent handleMessage', () => {
 
       await handleMessage(platform, 'chat-456', 'help');
 
+      // WO-HARNESS-SESSION-WORKTREE-ISOLATION-01: a codebase-scoped session is
+      // launched in its own worktree (validateAndResolveIsolation resolves cwd
+      // '/workspace/project' here), and the project-scoped prompt must describe
+      // that isolated worktree, NOT the shared primary checkout
+      // (default_cwd '/workspace/test-project').
       expect(mockBuildProjectScopedPrompt).toHaveBeenCalledWith(
-        mockCodebase,
+        { ...mockCodebase, default_cwd: '/workspace/project' },
         [mockCodebase],
         expect.any(Array)
       );

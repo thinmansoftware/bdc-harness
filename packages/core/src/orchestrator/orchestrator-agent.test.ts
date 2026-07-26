@@ -157,14 +157,28 @@ mock.module('../services/title-generator', () => ({
 }));
 
 const mockDispatchBackgroundWorkflow = mock(() => Promise.resolve());
+const mockValidateAndResolveIsolation = mock((..._args: unknown[]) =>
+  Promise.resolve({ status: 'new', cwd: '/test/cwd' })
+);
 mock.module('./orchestrator', () => ({
-  validateAndResolveIsolation: mock(() => Promise.resolve({ cwd: '/test/cwd' })),
+  validateAndResolveIsolation: mockValidateAndResolveIsolation,
   dispatchBackgroundWorkflow: mockDispatchBackgroundWorkflow,
 }));
 
+// Per-session worktree launcher (WO-HARNESS-SESSION-WORKTREE-ISOLATION-01).
+// Default: allocate a worktree keyed by conversation id so scoped conversations
+// resolve to a distinct cwd. Individual tests override to assert refusal etc.
+const mockLaunchSession = mock((conversation: { id: string }) =>
+  Promise.resolve({ refused: false as const, cwd: `/worktrees/${conversation.id}` })
+);
+mock.module('./session-launcher', () => ({
+  launchSession: mockLaunchSession,
+}));
+
+const mockBuildProjectScopedPrompt = mock((..._args: unknown[]) => 'project scoped system prompt');
 mock.module('./prompt-builder', () => ({
   buildOrchestratorPrompt: mock(() => 'orchestrator system prompt'),
-  buildProjectScopedPrompt: mock(() => 'project scoped system prompt'),
+  buildProjectScopedPrompt: mockBuildProjectScopedPrompt,
   formatWorkflowContextSection: mock((results: unknown[]) =>
     results.length > 0 ? '## Recent Workflow Results\n\n...' : ''
   ),
@@ -1987,4 +2001,165 @@ describe('stale session ID clearing on error_during_execution', () => {
 
     expect(mockUpdateSession).toHaveBeenCalledWith('session-1', null);
   });
+});
+
+// --- Per-session worktree isolation (WO-HARNESS-SESSION-WORKTREE-ISOLATION-01) --
+
+describe('handleMessage -- per-session worktree isolation', () => {
+  beforeEach(() => {
+    mockGetOrCreateConversation.mockReset();
+    mockGetCodebase.mockReset();
+    mockListCodebases.mockReset();
+    mockDiscoverWorkflowsWithConfig.mockReset();
+    mockSendQuery.mockClear();
+    mockLaunchSession.mockClear();
+    mockBuildProjectScopedPrompt.mockClear();
+    mockValidateAndResolveIsolation.mockClear();
+    mockLogger.warn.mockClear();
+
+    mockGetCodebase.mockImplementation(() => Promise.resolve(null));
+    mockDiscoverWorkflowsWithConfig.mockImplementation(() =>
+      Promise.resolve({ workflows: [], errors: [] })
+    );
+    // Default: allocate a distinct worktree keyed by conversation id.
+    mockLaunchSession.mockImplementation((conversation: { id: string }) =>
+      Promise.resolve({ refused: false as const, cwd: `/worktrees/${conversation.id}` })
+    );
+  });
+
+  // Given/When/Then anchor: two sessions on the SAME codebase get DIFFERENT cwds.
+  // Reproduces the 2026-07-26 incident shape at the direct-chat entry point.
+  test('two conversations on the same codebase are launched in distinct worktrees', async () => {
+    const codebase = makeCodebase('shared', 'cb-shared');
+    const convA = makeConversation({ id: 'conv-A', codebase_id: 'cb-shared' });
+    const convB = makeConversation({ id: 'conv-B', codebase_id: 'cb-shared' });
+    mockListCodebases.mockImplementation(() => Promise.resolve([codebase]));
+    mockGetCodebase.mockImplementation(() => Promise.resolve(codebase));
+
+    const platform = makePlatform();
+
+    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(convA));
+    await handleMessage(platform, 'conv-A', 'What does this repo do?');
+
+    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(convB));
+    await handleMessage(platform, 'conv-B', 'What does this repo do?');
+
+    // launchSession invoked once per session, each keyed on its own conversation.
+    expect(mockLaunchSession).toHaveBeenCalledTimes(2);
+    expect((mockLaunchSession.mock.calls[0][0] as { id: string }).id).toBe('conv-A');
+    expect((mockLaunchSession.mock.calls[1][0] as { id: string }).id).toBe('conv-B');
+
+    // The AI subprocess cwd differs between the two sessions -- neither shares a
+    // checkout, so a branch switch in one cannot disturb the other.
+    expect(mockSendQuery.mock.calls[0][1]).toBe('/worktrees/conv-A');
+    expect(mockSendQuery.mock.calls[1][1]).toBe('/worktrees/conv-B');
+    expect(mockSendQuery.mock.calls[0][1]).not.toBe(mockSendQuery.mock.calls[1][1]);
+  }, 15000);
+
+  // Refusal fails closed: the user is told, and the AI is NEVER invoked in the
+  // shared checkout as a fallback.
+  test('refuses to run the session when launchSession fails closed', async () => {
+    const codebase = makeCodebase('shared', 'cb-shared');
+    const conversation = makeConversation({ id: 'conv-1', codebase_id: 'cb-shared' });
+    mockListCodebases.mockImplementation(() => Promise.resolve([codebase]));
+    mockGetCodebase.mockImplementation(() => Promise.resolve(codebase));
+    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(conversation));
+
+    const refusalMessage =
+      'Refusing to start this session in the primary checkout for "shared"; worktree allocation failed.';
+    mockLaunchSession.mockImplementationOnce(() =>
+      Promise.resolve({ refused: true as const, message: refusalMessage })
+    );
+
+    const platform = makePlatform();
+    await handleMessage(platform, 'conv-1', 'do some work');
+
+    expect(platform.sendMessage).toHaveBeenCalledWith('conv-1', refusalMessage);
+    // Fail closed -- no fallback to ensureArchonWorkspacesPath()/the shared clone.
+    expect(mockSendQuery).not.toHaveBeenCalled();
+  }, 15000);
+
+  // The system prompt must describe the isolated worktree, not the primary checkout.
+  test('project-scoped prompt uses the resolved worktree cwd, not codebase.default_cwd', async () => {
+    const codebase = makeCodebase('shared', 'cb-shared'); // default_cwd = /repos/shared
+    const conversation = makeConversation({ id: 'conv-prompt', codebase_id: 'cb-shared' });
+    mockListCodebases.mockImplementation(() => Promise.resolve([codebase]));
+    mockGetCodebase.mockImplementation(() => Promise.resolve(codebase));
+    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(conversation));
+
+    const platform = makePlatform();
+    await handleMessage(platform, 'conv-prompt', 'explain the layout');
+
+    expect(mockBuildProjectScopedPrompt).toHaveBeenCalled();
+    const scopedArg = mockBuildProjectScopedPrompt.mock.calls[0][0] as { default_cwd: string };
+    expect(scopedArg.default_cwd).toBe('/worktrees/conv-prompt');
+    expect(scopedArg.default_cwd).not.toBe('/repos/shared');
+  }, 15000);
+
+  // Conversations with no codebase attached keep today's behavior -- no isolation.
+  test('does not allocate a worktree for a conversation with no codebase', async () => {
+    const conversation = makeConversation({ id: 'conv-none', codebase_id: null });
+    mockListCodebases.mockImplementation(() => Promise.resolve([]));
+    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(conversation));
+
+    const platform = makePlatform();
+    await handleMessage(platform, 'conv-none', 'hi there');
+
+    expect(mockLaunchSession).not.toHaveBeenCalled();
+    // Falls back to the workspaces root (unchanged behavior).
+    expect(mockSendQuery.mock.calls[0][1]).toBe('/home/test/.archon/workspaces');
+  }, 15000);
+});
+
+// --- Gap #2: chat-triggered workflow dispatch keys on conversation id ----------
+
+describe('dispatchOrchestratorWorkflow -- default isolation key (Gap #2)', () => {
+  beforeEach(() => {
+    mockGetOrCreateConversation.mockReset();
+    mockGetCodebase.mockReset();
+    mockListCodebases.mockReset();
+    mockParseCommand.mockReset();
+    mockHandleCommand.mockReset();
+    mockDiscoverWorkflowsWithConfig.mockReset();
+    mockValidateAndResolveIsolation.mockClear();
+    mockDispatchBackgroundWorkflow.mockClear();
+    mockLogger.warn.mockClear();
+
+    mockGetOrCreateConversation.mockImplementation(() => Promise.resolve(null));
+    mockGetCodebase.mockImplementation(() => Promise.resolve(null));
+    mockListCodebases.mockImplementation(() => Promise.resolve([]));
+    mockDiscoverWorkflowsWithConfig.mockImplementation(() =>
+      Promise.resolve({ workflows: [], errors: [] })
+    );
+    mockValidateAndResolveIsolation.mockImplementation(() =>
+      Promise.resolve({ status: 'new', cwd: '/worktrees/conv-1' })
+    );
+  });
+
+  test('resolves isolation with workflowId = conversation.id when no forge hints are supplied', async () => {
+    const conversation = makeConversation({ id: 'conv-1', codebase_id: null });
+    const codebase = makeCodebaseForSync();
+    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(conversation));
+    mockParseCommand.mockReturnValueOnce({ command: 'workflow', args: ['run', 'assist', 'WO-9'] });
+    mockListCodebases.mockReturnValueOnce(Promise.resolve([codebase]));
+    mockDiscoverWorkflowsWithConfig.mockReturnValueOnce(
+      Promise.resolve({
+        workflows: [makeTestWorkflowWithSource({ name: 'assist' })],
+        errors: [],
+      })
+    );
+
+    const platform = makePlatform();
+    // No HandleMessageContext -> isolationHints is undefined (chat default path).
+    await handleMessage(platform, 'conv-1', '/workflow run assist WO-9');
+
+    expect(mockValidateAndResolveIsolation).toHaveBeenCalled();
+    const hints = mockValidateAndResolveIsolation.mock.calls[0][4] as {
+      workflowType: string;
+      workflowId: string;
+    };
+    // Previously this defaulted to workflowId '' -- every conversation collided.
+    expect(hints.workflowType).toBe('thread');
+    expect(hints.workflowId).toBe('conv-1');
+  }, 15000);
 });
