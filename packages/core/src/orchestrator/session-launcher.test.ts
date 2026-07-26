@@ -1,4 +1,7 @@
-import { mock, describe, test, expect, beforeEach } from 'bun:test';
+import { mock, describe, test, expect, beforeEach, afterEach } from 'bun:test';
+import { mkdtemp, mkdir, symlink, rm } from 'fs/promises';
+import { tmpdir } from 'os';
+import { join } from 'path';
 import { createMockLogger } from '../test/mocks/logger';
 import { MockPlatformAdapter } from '../test/mocks/platform';
 import type { Conversation, Codebase } from '../types';
@@ -165,6 +168,92 @@ describe('launchSession', () => {
       expect(result.message).toContain('/repos/test-repo');
     }
   }, 15000);
+
+  // Scenario 3, case B (alias): the resolver hands back a SYMLINK alias that
+  // resolves to the primary checkout. A lexical string compare would treat the
+  // alias path and the primary path as different and let the session run in the
+  // shared clone; filesystem-identity comparison (realpath) must catch it.
+  describe('filesystem-identity guard (Case B aliases)', () => {
+    let realDir: string;
+
+    beforeEach(async () => {
+      realDir = await mkdtemp(join(tmpdir(), 'session-launcher-alias-'));
+    });
+
+    afterEach(async () => {
+      await rm(realDir, { recursive: true, force: true });
+    });
+
+    test('refuses when the resolved cwd is a symlink alias of the primary checkout', async () => {
+      const primary = join(realDir, 'primary-checkout');
+      const alias = join(realDir, 'primary-alias');
+      await mkdir(primary, { recursive: true });
+      // Alias -> primary; realpath(alias) === realpath(primary).
+      await symlink(primary, alias, process.platform === 'win32' ? 'junction' : 'dir');
+
+      const conversation = makeConversation();
+      const codebase = makeCodebase({ default_cwd: primary });
+
+      // Resolver (contract-violating) returns the alias, which is really primary.
+      mockValidateAndResolveIsolation.mockImplementation(() =>
+        Promise.resolve({ status: 'new', cwd: alias })
+      );
+
+      const result = await launchSession(conversation, codebase, platform, 'web-conv-1');
+
+      expect(result.refused).toBe(true);
+      if (result.refused) {
+        expect(result.message).toContain('primary checkout');
+        expect(result.message).toContain(primary);
+      }
+    }, 15000);
+
+    test('allows a genuinely distinct worktree that is not an alias of the primary', async () => {
+      const primary = join(realDir, 'primary-checkout');
+      const worktree = join(realDir, 'worktree-1');
+      await mkdir(primary, { recursive: true });
+      await mkdir(worktree, { recursive: true });
+
+      const conversation = makeConversation();
+      const codebase = makeCodebase({ default_cwd: primary });
+
+      mockValidateAndResolveIsolation.mockImplementation(() =>
+        Promise.resolve({ status: 'new', cwd: worktree })
+      );
+
+      const result = await launchSession(conversation, codebase, platform, 'web-conv-1');
+
+      expect(result.refused).toBe(false);
+      if (!result.refused) {
+        expect(result.cwd).toBe(worktree);
+      }
+    }, 15000);
+
+    // Case-insensitive-filesystem guard. On win32 a differently cased spelling
+    // of the same directory is the SAME directory, so it must be refused. On
+    // case-sensitive filesystems (Linux CI) the two are genuinely distinct
+    // directories, so this assertion is win32-only.
+    test.if(process.platform === 'win32')(
+      'refuses when the resolved cwd differs only by case from the primary checkout',
+      async () => {
+        const primary = join(realDir, 'PrimaryCheckout');
+        await mkdir(primary, { recursive: true });
+        const casedAlias = join(realDir, 'primarycheckout');
+
+        const conversation = makeConversation();
+        const codebase = makeCodebase({ default_cwd: primary });
+
+        mockValidateAndResolveIsolation.mockImplementation(() =>
+          Promise.resolve({ status: 'new', cwd: casedAlias })
+        );
+
+        const result = await launchSession(conversation, codebase, platform, 'web-conv-1');
+
+        expect(result.refused).toBe(true);
+      },
+      15000
+    );
+  });
 
   // Scenario 4: Concurrency -- two distinct sessions pass distinct keys and get
   // distinct worktrees. (This verifies OUR code forwards distinct keys; the

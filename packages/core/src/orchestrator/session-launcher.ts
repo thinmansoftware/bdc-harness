@@ -16,6 +16,7 @@
  *     checkout when isolation cannot be established.
  */
 import { resolve as resolvePath } from 'path';
+import { realpath } from 'fs/promises';
 import { createLogger } from '@archon/paths';
 import type { Conversation, Codebase, IPlatformAdapter } from '../types';
 import { IsolationBlockedError } from '@archon/isolation';
@@ -37,6 +38,35 @@ function getLog(): ReturnType<typeof createLogger> {
 export type SessionLaunchResult =
   | { refused: false; cwd: string }
   | { refused: true; message: string };
+
+/**
+ * Reduce a path to a stable filesystem identity for equality comparison.
+ *
+ * `resolve()` alone is a LEXICAL fold -- it collapses trailing slashes and
+ * relative components but treats a symlink/junction alias, or a differently
+ * cased spelling on a case-insensitive filesystem, as a distinct path. Either
+ * would make the primary checkout compare UNEQUAL to a resolved cwd that is
+ * really the same directory, defeating the Case B invariant and letting a
+ * session run in the shared clone.
+ *
+ * So we canonicalize with `realpath` first (expands symlinks, junctions, and
+ * Windows 8.3 short names), then `resolve`, then lower-case on win32 where the
+ * filesystem is case-insensitive. This mirrors `normalizeIdentity` in
+ * `@archon/git`'s `verifyWorktreeOwnership`. A nonexistent path (ENOENT) falls
+ * back to the lexical form; any other fs error propagates (fail closed).
+ */
+async function normalizePathIdentity(path: string): Promise<string> {
+  let canonical: string;
+  try {
+    canonical = await realpath(path);
+  } catch (error) {
+    const err = error as NodeJS.ErrnoException;
+    if (err.code !== 'ENOENT') throw error;
+    canonical = resolvePath(path);
+  }
+  const resolved = resolvePath(canonical);
+  return process.platform === 'win32' ? resolved.toLowerCase() : resolved;
+}
 
 /**
  * Allocate (or reuse) a per-session worktree and return it as the session cwd.
@@ -87,11 +117,20 @@ export async function launchSession(
 
   // Case B (defense-in-depth invariant): the resolver's contract is to hand
   // back a dedicated worktree for a codebase-scoped request, never the primary
-  // checkout itself. Verify that invariant rather than trusting it blindly. A
-  // direct normalized-path comparison is used (NOT getCanonicalRepoPath, which
-  // maps a worktree back to its parent repo and would false-positive on every
-  // legitimate worktree -- see PR notes for the deviation from the drafted plan).
-  if (resolvePath(resolvedCwd) === resolvePath(codebase.default_cwd)) {
+  // checkout itself. Verify that invariant rather than trusting it blindly.
+  //
+  // The comparison uses filesystem IDENTITY (realpath + resolve + win32 case
+  // fold via normalizePathIdentity), NOT a lexical resolve(): a symlink/junction
+  // alias or a case-different spelling of the primary checkout would otherwise
+  // compare unequal and slip past this guard into the shared clone. We do NOT
+  // use getCanonicalRepoPath, which maps a worktree back to its parent repo and
+  // would false-positive on every legitimate worktree -- see PR notes for the
+  // deviation from the drafted plan.
+  const [resolvedIdentity, primaryIdentity] = await Promise.all([
+    normalizePathIdentity(resolvedCwd),
+    normalizePathIdentity(codebase.default_cwd),
+  ]);
+  if (resolvedIdentity === primaryIdentity) {
     getLog().error(
       { conversationId, codebaseId: codebase.id, resolvedCwd, primaryCwd: codebase.default_cwd },
       'session_launch_resolved_to_primary_checkout'
