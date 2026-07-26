@@ -617,6 +617,15 @@ nodes:
     bash: |
       set -euo pipefail
 
+      capture_node_output() {
+        python3 -c 'import shlex, sys; s=sys.stdin.read(); sys.stdout.write((lambda p: p[0] if len(p)==1 else s)(shlex.split(s)) if len(s)>=2 and s[0]=="'"'"'" and s.rstrip("\n").endswith("'"'"'") else s)'
+      }
+
+      MANIFEST=$(capture_node_output <<'BDC_NODE_OUTPUT_MANIFEST'
+      $build-manifest.output
+      BDC_NODE_OUTPUT_MANIFEST
+      )
+
       ISSUE_REPO="${ISSUE_REPO:-bluedevilcollectibles/bdc-xo}"
       WO_ID="WO-HARNESS-AUTHOR-WO-BATCH-META-01"
       ISSUE_NUM=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'issue=[0-9]+' | head -1 | cut -d= -f2 || true)
@@ -632,4 +641,7 @@ nodes:
       gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --remove-label status:building 2>/dev/null || true
       gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --remove-label status:blocked 2>/dev/null || true
       gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --add-label status:review
-      echo "review-issue: $ISSUE_REPO#$ISSUE_NUM -> status:review"
+      COMMENT_FILE=$(mktemp)
+      printf '%s\n' "$MANIFEST" > "$COMMENT_FILE"
+      gh issue comment "$ISSUE_NUM" --repo "$ISSUE_REPO" --body-file "$COMMENT_FILE"
+      echo "review-issue: $ISSUE_REPO#$ISSUE_NUM -> status:review (manifest posted as comment)"
