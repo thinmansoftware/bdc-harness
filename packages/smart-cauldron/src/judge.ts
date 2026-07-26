@@ -28,6 +28,25 @@ export function judgeGate(poll: PollResult): GateVerdict {
   const { terminalStatus, validatorVerdict, prUrl, prMergeable } = poll;
 
   const prOpened = prUrl !== null;
+
+  // Cancelled is NOT a climb signal (Motion M-86). A human deliberately stopped
+  // this run -- climbing to a more expensive tier is the opposite of intent.
+  // Early-return before any other condition so the verdict can NEVER compute
+  // pass:true for a cancelled run (a realistic cancelled PollResult -- prUrl:null,
+  // prMergeable:null, validatorVerdict:'unknown' -- would otherwise fall through
+  // conditions 2/3/4 with an empty failingReasons list and be judged a WIN).
+  if (terminalStatus === 'cancelled') {
+    return {
+      pass: false,
+      reason: 'run was cancelled externally (not a climb signal)',
+      cancelled: true,
+      validatorVerdict,
+      prOpened,
+      prMergeable: prMergeable ?? null,
+      terminalStatus,
+    };
+  }
+
   const failingReasons: string[] = [];
 
   // Condition 1: terminal status.
@@ -38,8 +57,6 @@ export function judgeGate(poll: PollResult): GateVerdict {
     failingReasons.push('terminal status: failed');
   } else if (terminalStatus === 'escalated') {
     failingReasons.push('terminal status: escalated');
-  } else if (terminalStatus === 'cancelled') {
-    failingReasons.push('terminal status: cancelled');
   }
 
   // Condition 2: validator verdict (only if it has an opinion)
@@ -63,6 +80,7 @@ export function judgeGate(poll: PollResult): GateVerdict {
   return {
     pass,
     reason,
+    cancelled: false,
     validatorVerdict,
     prOpened,
     prMergeable: prMergeable ?? null,
@@ -78,7 +96,7 @@ export function judgeGate(poll: PollResult): GateVerdict {
  *
  * @param fireResult Result from fireTier.
  * @param gateVerdict Gate verdict (null if fire failed before polling).
- * @returns TierOutcome: "infra-error", "gate-failed", or "won".
+ * @returns TierOutcome: "infra-error", "cancelled", "gate-failed", or "won".
  */
 export function classifyAttemptOutcome(
   fireResult: FireResult,
@@ -113,6 +131,14 @@ export function classifyAttemptOutcome(
   if (gateVerdict === null) {
     // This should not happen in normal flow (fire ok but no verdict)
     return 'gate-failed';
+  }
+
+  // Cancelled is checked before pass so it is never derived indirectly via
+  // !pass (which would misclassify it as 'gate-failed' and lose the honesty
+  // distinction Motion M-86 requires). Defense-in-depth: judgeGate already
+  // guarantees pass:false for a cancelled verdict.
+  if (gateVerdict.cancelled) {
+    return 'cancelled';
   }
 
   return gateVerdict.pass ? 'won' : 'gate-failed';

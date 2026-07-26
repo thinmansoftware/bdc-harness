@@ -32,11 +32,15 @@ import type { CascadeStatus } from './types.js';
  *
  *   won         -> 0 (success; gate passed)
  *   blocked     -> 2 (all tiers exhausted without a frontier; defensive)
- *   spec-repair -> 4 (frontier gate-failed; WO needs authoring-layer repair)
  *   infra-alert -> 3 (infra-error on a tier; escalate/alert)
+ *   spec-repair -> 4 (frontier gate-failed; WO needs authoring-layer repair)
+ *   running     -> 5 (non-terminal; should not be observed as a final status)
+ *   cancelled   -> 6 (externally cancelled; distinct from won=0 and from all
+ *                     climb-triggering codes)
  *
  * spec-repair MUST NOT collapse to 0 -- it is a distinct, visible outcome
- * (frontier tier gate-failed) and callers key off the exit code.
+ * (frontier tier gate-failed) and callers key off the exit code. cancelled
+ * likewise MUST NOT collapse to 0 -- an operator's cancel is not a success.
  */
 export function statusToExitCode(status: CascadeStatus): number {
   switch (status) {
@@ -48,6 +52,8 @@ export function statusToExitCode(status: CascadeStatus): number {
       return 3;
     case 'spec-repair':
       return 4;
+    case 'cancelled':
+      return 6;
     default:
       return 0;
   }
