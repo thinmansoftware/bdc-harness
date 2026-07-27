@@ -1162,7 +1162,18 @@ nodes:
             | head -1)
           if [ -n "$RECOVERED" ]; then
             echo "Recovered push target from remote: $RECOVERED"
-            UNIQUE_BRANCH="$RECOVERED"
+            # DEFECT FIX 2026-07-27 (anchor: bdc-crm PR #4, run f8ef4b92).
+            # This recovery block adopts ANY remote ref whose HEAD SHA matches local HEAD.
+            # If a PRIOR run pushed a malformed branch name, this block finds it, adopts it,
+            # and pushes to it again -- propagating the corruption forward and opening a new
+            # spurious PR each time. The bug feeds on its own output. Observed names:
+            #   feat/wo-crm-supabase-convergence-01-thread-wo-crm-supabase-convergence-01'
+            # (note the nested WO id AND the trailing quote). Validate before adopting.
+            if printf '%s\n' "$RECOVERED" | grep -Eq '^(feat|fix|wip)/[A-Za-z0-9_-]+-thread-[A-Za-z0-9_-]+$'; then
+              UNIQUE_BRANCH="$RECOVERED"
+            else
+              echo "WARN: recovered remote ref '${RECOVERED}' is malformed -- refusing to adopt it; keeping ${UNIQUE_BRANCH}" >&2
+            fi
           else
             echo "No changed files and no commits ahead of origin/${UNIQUE_BRANCH} -- implement loop did not produce work" >&2
             exit 1
