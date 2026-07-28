@@ -5,6 +5,19 @@ const missingEvidence: PullRequestEvidence = {
   state: 'missing',
   checks: { total: 0, passed: 0, failed: 0, pending: 0 },
   mergeable: null,
+  lookupFailed: false,
+};
+
+/**
+ * The run carries no identity to look a PR up by, so no lookup was performed and
+ * nothing about PR existence was established. Reported as unknown, not as "no PR".
+ */
+const unresolvableEvidence: PullRequestEvidence = {
+  exists: false,
+  state: 'lookup_failed',
+  checks: { total: 0, passed: 0, failed: 0, pending: 0 },
+  mergeable: null,
+  lookupFailed: true,
 };
 
 export async function judgePullRequest(
@@ -12,6 +25,10 @@ export async function judgePullRequest(
   deps: GitHubClientDeps
 ): Promise<PullRequestEvidence> {
   if (!run.headBranch && !run.woId) return missingEvidence;
+  // Without a repo we cannot search anywhere. Previously the repo was defaulted
+  // upstream, so this searched bluedevilcollectibles/bdc-harness for every run --
+  // wrong repo, confident answer. Fail loud instead of guessing.
+  if (!run.owner || !run.repo) return unresolvableEvidence;
   return deps.findPullRequest({
     owner: run.owner,
     repo: run.repo,

@@ -8,6 +8,7 @@ import type {
   OverseerRunRecord,
   OverseerRunStoreDeps,
   OverseerWorkflowEvent,
+  PullRequestEvidence,
   WatchedRunRecord,
 } from './types.ts';
 
@@ -66,10 +67,50 @@ function eventMessage(event: OverseerWorkflowEvent | undefined): string {
   return typeof found === 'string' ? found : JSON.stringify(data);
 }
 
+/**
+ * Say why a PR is not merge-ready without claiming more than was established.
+ * "no PR" is only honest when the lookup actually ran and found nothing; when the
+ * lookup broke, or the run carries no branch/WO identity to look it up by, the
+ * truthful answer is that we do not know.
+ */
+function prNotMergeReadyDetail(evidence: PullRequestEvidence): string {
+  if (evidence.exists) {
+    return `state=${evidence.state} mergeable=${String(evidence.mergeable)}`;
+  }
+  if (evidence.lookupFailed) return 'PR lookup failed -- existence unknown';
+  return 'no PR';
+}
+
+/**
+ * Recover a run's head branch from its own events.
+ *
+ * Runs do not record their git identity: the engine writes only cost/token telemetry
+ * into run metadata, so `headBranch` is absent on every terminal run in the live store.
+ * The commit-and-push node does report its final target as `unique_branch=<name>`, which
+ * makes the branch recoverable after the fact. Same signal smart-cauldron's
+ * findExistingPrForBranch reads (poll.ts). Last writer wins -- a run may push more than
+ * once, and the final push is the one a PR would be open against.
+ *
+ * Returns undefined when no event reports a branch. Absent stays absent.
+ */
+export function recoverHeadBranchFromEvents(events: OverseerWorkflowEvent[]): string | undefined {
+  let branch: string | undefined;
+  for (const event of events) {
+    const output = typeof event.data.output === 'string' ? event.data.output : '';
+    const match = /unique_branch=(\S+)/.exec(output);
+    if (match?.[1]) branch = match[1];
+  }
+  return branch;
+}
+
 async function assessRun(
   run: OverseerRunRecord,
   deps: OverseerRunStoreDeps & GitHubClientDeps
 ): Promise<WatchedRunRecord> {
+  if (!run.headBranch) {
+    const recovered = recoverHeadBranchFromEvents(await deps.listRunEvents(run.id));
+    if (recovered) run = { ...run, headBranch: recovered };
+  }
   const prEvidence = await judgePullRequest(run, deps);
 
   if (prEvidence.state === 'merged') {
@@ -149,7 +190,7 @@ async function assessRun(
       action: run.status === 'completed' && isPrGreen(prEvidence) ? 'success' : 'ignore',
       reason:
         run.status === 'completed'
-          ? `completed run; PR not merge-ready (${prEvidence.exists ? `state=${prEvidence.state} mergeable=${String(prEvidence.mergeable)}` : 'no PR'})`
+          ? `completed run; PR not merge-ready (${prNotMergeReadyDetail(prEvidence)})`
           : `terminal status ${run.status} with no merge-ready PR`,
       prEvidence,
     };

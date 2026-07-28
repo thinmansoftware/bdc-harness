@@ -203,7 +203,34 @@ describe('real GitHub deps', () => {
       state: 'missing',
       checks: { total: 0, passed: 0, failed: 0, pending: 0 },
       mergeable: null,
+      lookupFailed: false,
     });
+  });
+
+  // A genuine "this PR does not exist" and "the lookup itself broke" used to collapse
+  // into the same MISSING_EVIDENCE shape, so the watcher reported "no PR" for API
+  // failures too. Both still keep the merge door shut (exists: false); they must be
+  // distinguishable in the evidence so the reason string can tell the truth.
+  test('distinguishes a failed lookup from a genuine missing pull request', async () => {
+    const octokit = createOctokitMock({
+      pulls: {
+        ...createOctokitMock().pulls,
+        list: async () => {
+          throw new Error('secondary rate limit');
+        },
+      },
+    });
+
+    const result = await createRealFindPullRequest(octokit)({
+      owner: 'bluedevilcollectibles',
+      repo: 'bdc-harness',
+      headBranch: 'fix/api-down',
+      woId: 'WO-API-DOWN',
+    });
+
+    expect(result.exists).toBe(false);
+    expect(result.lookupFailed).toBe(true);
+    expect(result.state).toBe('lookup_failed');
   });
 
   test('merges with the current pull request head SHA', async () => {

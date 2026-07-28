@@ -70,6 +70,74 @@ function deps(
   };
 }
 
+describe('watch head-branch recovery', () => {
+  // Arc B break (c): zero of 563 live terminal runs carry a headBranch in metadata --
+  // the engine writes only telemetry -- so the PR lookup had nothing to search by and
+  // every one of them was dismissed as "no PR". The commit-and-push node DOES report
+  // its target as unique_branch=<name>, and 338 such events are in the live store, so
+  // the branch is recoverable from the run's own events.
+  test('recovers the head branch from commit-and-push events when metadata has none', async () => {
+    const runWithoutBranch: OverseerRunRecord = {
+      id: 'run-no-branch',
+      woId: 'WO-RECOVER-01',
+      owner: 'bluedevilcollectibles',
+      repo: 'bdc-harness',
+      status: 'completed',
+      // No headBranch -- the real-world shape.
+    };
+    const events = [
+      event('event-1', 'node_completed', 'commit-and-push', '2026-07-28T10:00:00.000Z', {
+        output: 'pushed 3 commits\nunique_branch=feat/wo-recover-01-thread-abc\n',
+      }),
+    ];
+
+    let searched: { headBranch?: string } | undefined;
+    const recoveringDeps: OverseerRunStoreDeps & GitHubClientDeps = {
+      listRunsForWatch: async () => [runWithoutBranch],
+      listRunEvents: async () => events,
+      findPullRequest: async input => {
+        searched = input;
+        return mergeReadyPrEvidence;
+      },
+      mergePullRequest: async () => ({ merged: true }),
+    };
+
+    const [record] = await watchOnce(recoveringDeps);
+
+    expect(searched?.headBranch).toBe('feat/wo-recover-01-thread-abc');
+    expect(record.action).toBe('merge_ready');
+  });
+
+  test('does not invent a branch when no commit-and-push event reports one', async () => {
+    const runWithoutBranch: OverseerRunRecord = {
+      id: 'run-no-branch-no-event',
+      woId: 'WO-NO-RECOVER-01',
+      owner: 'bluedevilcollectibles',
+      repo: 'bdc-harness',
+      status: 'completed',
+    };
+
+    let searched: { headBranch?: string } | undefined;
+    const noBranchDeps: OverseerRunStoreDeps & GitHubClientDeps = {
+      listRunsForWatch: async () => [runWithoutBranch],
+      listRunEvents: async () => [
+        event('event-1', 'node_completed', 'plan', '2026-07-28T10:00:00.000Z', {
+          output: 'planning complete',
+        }),
+      ],
+      findPullRequest: async input => {
+        searched = input;
+        return failedPrEvidence;
+      },
+      mergePullRequest: async () => ({ merged: true }),
+    };
+
+    await watchOnce(noBranchDeps);
+
+    expect(searched?.headBranch).toBeUndefined();
+  });
+});
+
 describe('watch selectFailureEvent', () => {
   test('prefers_node_failed_over_later_node_completed', () => {
     const nodeFailed = event(

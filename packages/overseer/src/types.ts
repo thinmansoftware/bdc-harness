@@ -6,8 +6,13 @@ export type WatchedRunStatus = string;
 export interface OverseerRunRecord {
   id: string;
   woId: string;
-  repo: string;
-  owner: string;
+  /**
+   * Repo identity as recorded by the run. OPTIONAL -- most runs carry none, and an
+   * absent repo must stay absent rather than defaulting to a guess (see parseRepo in
+   * @archon/core/db/overseer).
+   */
+  repo?: string;
+  owner?: string;
   status: WatchedRunStatus;
   headBranch?: string;
   /** Engine-written worktree path. Provenance anchor -- not agent-authored. */
@@ -55,6 +60,12 @@ export interface PullRequestEvidence {
    * merge provenance compares this against the run's own worktree tip.
    */
   headSha?: string;
+  /**
+   * True when the lookup itself failed, so `exists: false` means "unknown", not
+   * "no PR". Never widens the merge gate (both cases stay `exists: false`); it
+   * exists so the watcher stops reporting an unverified absence as a fact.
+   */
+  lookupFailed?: boolean;
 }
 
 export interface GrokJudgeEvidence {
@@ -97,8 +108,9 @@ export interface GrokDispositionReceipt {
 export interface WatchedRunRecord {
   runId: string;
   woId: string;
-  repo: string;
-  owner: string;
+  /** Carried through from the run; absent when the run recorded no repo identity. */
+  repo?: string;
+  owner?: string;
   status: WatchedRunStatus;
   headBranch?: string;
   /** Engine-written worktree path. Provenance anchor -- not agent-authored. */

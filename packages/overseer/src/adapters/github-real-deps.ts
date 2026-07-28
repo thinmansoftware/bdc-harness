@@ -10,11 +10,27 @@ import type {
 
 const log = createLogger('overseer/github-real-deps');
 
+/** The lookup ran and found nothing. A genuine "this PR does not exist". */
 const MISSING_EVIDENCE: PullRequestEvidence = {
   exists: false,
   state: 'missing',
   checks: { total: 0, passed: 0, failed: 0, pending: 0 },
   mergeable: null,
+  lookupFailed: false,
+};
+
+/**
+ * The lookup itself broke (API error, rate limit, bad credentials) so we learned
+ * NOTHING about whether a PR exists. Distinct from MISSING_EVIDENCE: both keep the
+ * merge door shut, but only this one means "ask again", and conflating them is what
+ * let 493 unactioned runs report a confident "no PR" that was never established.
+ */
+const LOOKUP_FAILED_EVIDENCE: PullRequestEvidence = {
+  exists: false,
+  state: 'lookup_failed',
+  checks: { total: 0, passed: 0, failed: 0, pending: 0 },
+  mergeable: null,
+  lookupFailed: true,
 };
 
 /**
@@ -173,7 +189,7 @@ export function createRealFindPullRequest(
       };
     } catch (error) {
       log.error({ err: error, input }, 'overseer.github_real_deps.find_pull_request_failed');
-      return MISSING_EVIDENCE;
+      return LOOKUP_FAILED_EVIDENCE;
     }
   };
 }
