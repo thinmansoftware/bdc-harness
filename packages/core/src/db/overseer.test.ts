@@ -97,6 +97,40 @@ describe('overseer db', () => {
     expect(await listRunsForOverseerWatch()).toHaveLength(0);
   });
 
+  // Regression (Arc B break (c), 2026-07-28): every seeded run in this suite carried
+  // woId + targetRepo + headBranch, but ZERO of 563 real terminal runs in the live event
+  // store carry any of them -- the engine writes only cost/token telemetry into run
+  // metadata. parseRepo silently defaulted the repo to bluedevilcollectibles/bdc-harness,
+  // so a run against any other repo was looked up in the WRONG repo and the resulting
+  // "no PR" was indistinguishable from a real one. Absent identity must be absent, not
+  // invented.
+  test('does not invent a repo when run metadata carries no repo identity', async () => {
+    await db.query(
+      `INSERT INTO remote_agent_conversations (id, platform_type, platform_conversation_id, title)
+       VALUES ($1, 'test', $1, 'Test')`,
+      ['conv-run-no-identity']
+    );
+    await db.query(
+      `INSERT INTO remote_agent_workflow_runs
+       (id, conversation_id, workflow_name, user_message, status, metadata)
+       VALUES ($1, $2, 'bdc-feature-development', $3, 'completed', $4)`,
+      [
+        'run-no-identity',
+        'conv-run-no-identity',
+        'do some work',
+        // Shape taken from a real production run: telemetry only, no git identity.
+        JSON.stringify({ total_cost_usd: 5.69, node_counts: { completed: 40, failed: 0 } }),
+      ]
+    );
+
+    const runs = await listRunsForOverseerWatch();
+    const run = runs.find(r => r.id === 'run-no-identity');
+    expect(run).toBeDefined();
+    expect(run?.headBranch).toBeUndefined();
+    expect(run?.repo).toBeUndefined();
+    expect(run?.owner).toBeUndefined();
+  });
+
   test('insertReconcileAction succeeds for a merged PR with no corresponding run row (regression: overseer_actions.run_id NOT NULL FK crash)', async () => {
     // No seedRun() call here -- this is the exact live-incident condition:
     // a merged PR (shopops-comic-theme#89) reconciling a tracker with no

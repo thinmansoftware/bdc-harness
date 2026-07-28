@@ -129,9 +129,17 @@ async function defaultAssembleEvidence(
   if (deps.evidenceAssemblyDeps) {
     return assembleQualifiedMergeEvidence(record, deps.evidenceAssemblyDeps);
   }
+  // Fail closed on unknown identity: a merge is the one action that must never run
+  // against a repository we inferred. The repo used to be silently defaulted upstream,
+  // which meant "no repo recorded" and "bdc-harness" were the same value here.
+  if (!record.owner || !record.repo) {
+    throw new Error('merge_manager_run_repo_identity_missing');
+  }
+  const owner = record.owner;
+  const repository = record.repo;
   const prEvidence = await deps.findPullRequest({
-    owner: record.owner,
-    repo: record.repo,
+    owner,
+    repo: repository,
     headBranch: record.headBranch,
     woId: record.woId,
   });
@@ -151,8 +159,8 @@ async function defaultAssembleEvidence(
       resultingDeploymentEffect: determineDeploymentEffect(record, baseBranch),
     }),
     readPullRequest: async () => ({
-      owner: pr?.owner ?? record.owner,
-      repository: pr?.repo ?? record.repo,
+      owner: pr?.owner ?? owner,
+      repository: pr?.repo ?? repository,
       baseBranch,
       changedFiles: changedFiles ?? [],
       prNumber: pr?.number ?? 0,

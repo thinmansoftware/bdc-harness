@@ -7,8 +7,14 @@ const log = createLogger('db/overseer');
 export interface OverseerWatchRun {
   id: string;
   woId: string;
-  repo: string;
-  owner: string;
+  /**
+   * Repo identity as recorded by the run itself. OPTIONAL and frequently absent:
+   * the engine writes only telemetry into run metadata, so most runs carry no repo
+   * at all. Undefined means unknown -- never substitute a default, or the PR lookup
+   * silently searches the wrong repository.
+   */
+  repo?: string;
+  owner?: string;
   status: string;
   headBranch?: string;
   /**
@@ -95,15 +101,25 @@ function parseWoId(metadata: Record<string, unknown>, userMessage: string): stri
   );
 }
 
-function parseRepo(metadata: Record<string, unknown>): { owner: string; repo: string } {
-  const target = stringField(metadata, ['targetRepo', 'target_repo', 'repository', 'repo']) ?? '';
-  const [owner, repo] = target.includes('/')
-    ? target.split('/').slice(-2)
-    : ['bluedevilcollectibles', target];
-  return {
-    owner: owner || 'bluedevilcollectibles',
-    repo: repo || 'bdc-harness',
-  };
+/**
+ * Read the run's repo identity, or report that it has none.
+ *
+ * This used to default to `bluedevilcollectibles/bdc-harness` whenever metadata was
+ * silent -- which is the common case, not the rare one (zero of 563 live terminal runs
+ * carried a repo key on 2026-07-28). A run against any other repo was therefore looked
+ * up in the WRONG repo, and the resulting "no PR" was indistinguishable from a true
+ * negative. Unknown identity is now unknown.
+ *
+ * A bare (slashless) value is still treated as a repo under the BDC org, which is the
+ * one place a default is safe: the value was explicitly written by the run.
+ */
+function parseRepo(metadata: Record<string, unknown>): { owner?: string; repo?: string } {
+  const target = stringField(metadata, ['targetRepo', 'target_repo', 'repository', 'repo'])?.trim();
+  if (!target) return {};
+  if (!target.includes('/')) return { owner: 'bluedevilcollectibles', repo: target };
+  const [owner, repo] = target.split('/').slice(-2);
+  if (!owner || !repo) return {};
+  return { owner, repo };
 }
 
 function normalizeRun(row: WorkflowRunRow): OverseerWatchRun {

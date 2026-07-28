@@ -8,6 +8,7 @@ import type {
   OverseerRunRecord,
   OverseerRunStoreDeps,
   OverseerWorkflowEvent,
+  PullRequestEvidence,
   WatchedRunRecord,
 } from './types.ts';
 
@@ -64,6 +65,20 @@ function eventMessage(event: OverseerWorkflowEvent | undefined): string {
   const candidates = [data.error, data.message, data.stderr, data.output, data.reason];
   const found = candidates.find(value => typeof value === 'string');
   return typeof found === 'string' ? found : JSON.stringify(data);
+}
+
+/**
+ * Say why a PR is not merge-ready without claiming more than was established.
+ * "no PR" is only honest when the lookup actually ran and found nothing; when the
+ * lookup broke, or the run carries no branch/WO identity to look it up by, the
+ * truthful answer is that we do not know.
+ */
+function prNotMergeReadyDetail(evidence: PullRequestEvidence): string {
+  if (evidence.exists) {
+    return `state=${evidence.state} mergeable=${String(evidence.mergeable)}`;
+  }
+  if (evidence.lookupFailed) return 'PR lookup failed -- existence unknown';
+  return 'no PR';
 }
 
 async function assessRun(
@@ -149,7 +164,7 @@ async function assessRun(
       action: run.status === 'completed' && isPrGreen(prEvidence) ? 'success' : 'ignore',
       reason:
         run.status === 'completed'
-          ? `completed run; PR not merge-ready (${prEvidence.exists ? `state=${prEvidence.state} mergeable=${String(prEvidence.mergeable)}` : 'no PR'})`
+          ? `completed run; PR not merge-ready (${prNotMergeReadyDetail(prEvidence)})`
           : `terminal status ${run.status} with no merge-ready PR`,
       prEvidence,
     };
