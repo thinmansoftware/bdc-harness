@@ -68,7 +68,8 @@ clearRegistry();
 registerBuiltinProviders();
 
 // --- Import after mocks ---
-import { executeWorkflow } from './executor';
+import { executeWorkflow, resolveExecutorLane, LaneAvailabilityRefusedError } from './executor';
+import { markEngineDarkIfZeroUsage, resetEngineAvailabilityForTests } from './engine-availability';
 import type { WorkflowDeps, IWorkflowPlatform, WorkflowConfig } from './deps';
 import type { IWorkflowStore } from './store';
 import type { WorkflowDefinition, WorkflowRun } from './schemas';
@@ -1757,5 +1758,117 @@ describe('target_repo pre-flight guard', () => {
 
     expect(mockGetRemoteUrl).not.toHaveBeenCalled();
     expect(mockExecuteDagWorkflow).toHaveBeenCalled();
+  });
+});
+
+describe('resolveExecutorLane -- M-20260726-87 Cause 2 (explicit-fire availability refusal)', () => {
+  const ROUTER_OPTS = {
+    routerYamlPath: '/fixture/router.yaml',
+    routerYamlContent: `version: 1
+tiers:
+  "4":
+    name: workhorse-subscription
+    engines:
+      - sonnet-subscription
+      - codex-subscription
+  "5":
+    name: fable-opus
+    engines:
+      - fable-session
+      - opus-api
+defaults:
+  fallback_tier: "4"
+task_classes:
+  spec-authoring:
+    starting_tier: "5"
+`,
+  };
+
+  beforeEach(() => {
+    resetEngineAvailabilityForTests();
+  });
+
+  it('explicit workflowName still wins and fires when its engines are healthy', async () => {
+    const lane = await resolveExecutorLane({
+      workflowName: 'bdc-feature-development-fable',
+      ...ROUTER_OPTS,
+    });
+    expect(lane).toBe('bdc-feature-development-fable');
+  });
+
+  it('explicit workflowName for a lane not wired to any router engine is never refused (no mapping != dark)', async () => {
+    const lane = await resolveExecutorLane({
+      workflowName: 'bdc-feature-development-fusion-cx-qwen',
+      ...ROUTER_OPTS,
+    });
+    expect(lane).toBe('bdc-feature-development-fusion-cx-qwen');
+  });
+
+  it('refuses an explicit fire when the ONLY engine wired to that lane is dark', async () => {
+    markEngineDarkIfZeroUsage('codex-subscription', { input: 0, output: 0 }, 0, {
+      runId: 'sim-run',
+      nodeId: 'implement',
+    });
+
+    await expect(
+      resolveExecutorLane({
+        workflowName: 'bdc-feature-development-codex',
+        ...ROUTER_OPTS,
+      })
+    ).rejects.toThrow(LaneAvailabilityRefusedError);
+  });
+
+  it('does NOT refuse when only ONE of several engines wired to the lane is dark (fable lane has two: fable-session, opus-api)', async () => {
+    markEngineDarkIfZeroUsage('fable-session', { input: 0, output: 0 }, 0, {
+      runId: 'sim-run',
+      nodeId: 'plan',
+    });
+
+    // opus-api (also wired to the fable lane) is still healthy -- the lane
+    // is not FULLY dark, so the explicit fire proceeds.
+    const lane = await resolveExecutorLane({
+      workflowName: 'bdc-feature-development-fable',
+      ...ROUTER_OPTS,
+    });
+    expect(lane).toBe('bdc-feature-development-fable');
+  });
+
+  it('refuses an explicit fire when BOTH engines wired to the fable lane are dark', async () => {
+    markEngineDarkIfZeroUsage('fable-session', { input: 0, output: 0 }, 0, {
+      runId: 'sim-run',
+      nodeId: 'plan',
+    });
+    markEngineDarkIfZeroUsage('opus-api', { input: 0, output: 0 }, 0, {
+      runId: 'sim-run',
+      nodeId: 'plan',
+    });
+
+    let caught: unknown;
+    try {
+      await resolveExecutorLane({ workflowName: 'bdc-feature-development-fable', ...ROUTER_OPTS });
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(LaneAvailabilityRefusedError);
+    const refusal = caught as LaneAvailabilityRefusedError;
+    expect(refusal.workflowName).toBe('bdc-feature-development-fable');
+    expect(refusal.darkEngines.sort()).toEqual(['fable-session', 'opus-api']);
+  });
+
+  it('taskClass path (no explicit workflowName) is unaffected by dark marks -- it climbs via resolveEntryLane as before', async () => {
+    markEngineDarkIfZeroUsage('fable-session', { input: 0, output: 0 }, 0, {
+      runId: 'sim-run',
+      nodeId: 'plan',
+    });
+    markEngineDarkIfZeroUsage('opus-api', { input: 0, output: 0 }, 0, {
+      runId: 'sim-run',
+      nodeId: 'plan',
+    });
+
+    // spec-authoring starts at Tier 5; both its engines are dark, so the
+    // ladder walk (already exercised in router-dispatcher.test.ts) falls
+    // back down to Tier 4 -- no throw, just a different resolved lane.
+    const lane = await resolveExecutorLane({ taskClass: 'spec-authoring', ...ROUTER_OPTS });
+    expect(lane).toBe('bdc-feature-development');
   });
 });

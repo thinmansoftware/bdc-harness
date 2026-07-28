@@ -1,13 +1,18 @@
 ---
 name: captain-ci-validator-fable
-model: claude-fable-5
+model: claude-opus-5
 tools: [Read, Grep, Glob, Bash]
 description: Manifest-against-reality validator. Verifies files exist, tests pass, manifest is complete.
 ---
 
 <!-- FABLE TEST SEAT (John 2026-07-02: "add fable in to one for testing for now").
-     Identical to captain-ci-validator except model: claude-fable-5. The apex-rung
-     WO (bdc-xo issue #575) supersedes this test wiring when it lands. -->
+     Identical to captain-ci-validator except for its model. Was claude-fable-5;
+     swept to claude-opus-5 by M-20260726-87 (this exact node, on fusion-cx-qwen's
+     sole Claude binding, was the war-council-validator that hard-failed both
+     WO #1284 and #1274 the week Fable ran out of subscription quota -- zero
+     tokens, zero cost, six runs, zero code). The fable SEAT survives as a role;
+     only the model behind it changed. The apex-rung WO (bdc-xo issue #575)
+     supersedes this test wiring when it lands. -->
 
 You are Captain CI for Blue Devil Collectibles.
 

@@ -16,7 +16,8 @@ import { getWorkflowEventEmitter } from './event-emitter';
 import { isRegisteredProvider, getRegisteredProviders } from '@archon/providers';
 import { classifyError } from './executor-shared';
 import { BUNDLED_POLICIES } from './defaults/bundled-defaults';
-import { resolveEntryLane } from './router-dispatcher';
+import { resolveEntryLane, DEFAULT_ENGINE_TO_LANE } from './router-dispatcher';
+import { isLaneFullyDark, listDarkEngines } from './engine-availability';
 import {
   persistRunAuthority,
   type RunAuthorityDispatch,
@@ -390,19 +391,51 @@ function normalizeRemoteToOwnerRepo(url: string): string | null {
 }
 
 /**
+ * Thrown by resolveExecutorLane when an explicit `-Workflow` fire targets a
+ * lane whose entire engine set is currently marked dark by the runtime
+ * availability signal (M-20260726-87 Cause 2). The explicit-fire bypass
+ * itself is preserved -- operators can still force a lane by name -- this
+ * only stops that fire from silently burning a run against a lane known to
+ * produce zero-token failures right now. Callers should surface `message`
+ * to the operator and may retry after `darkEngines` clear.
+ */
+export class LaneAvailabilityRefusedError extends Error {
+  constructor(
+    public readonly workflowName: string,
+    public readonly darkEngines: readonly string[]
+  ) {
+    super(
+      `Refusing to fire '${workflowName}': every engine wired to this lane is currently marked ` +
+        `unavailable (${darkEngines.join(', ')}). This is the M-87 explicit-fire availability ` +
+        'check -- it exists so a known-dark lane does not burn a run producing zero code, exactly ' +
+        'the failure this motion fixes. Wait for the cooling-off window to expire, or fire a ' +
+        'different lane / taskClass explicitly if you need to proceed now.'
+    );
+    this.name = 'LaneAvailabilityRefusedError';
+  }
+}
+
+/**
  * Resolve which workflow name to fire, applying Layer 2 dispatcher precedence.
  * Cauldron 2.0 fire paths (web bridge, n8n hooks) call this before
  * selecting a WorkflowDefinition to pass to executeWorkflow.
  *
  * Precedence (highest to lowest):
- *   1. workflowName (explicit caller override) -- wins always.
+ *   1. workflowName (explicit caller override) -- wins always, UNLESS every
+ *      engine wired to that lane is currently dark (M-87 Cause 2), in which
+ *      case this throws LaneAvailabilityRefusedError rather than firing.
+ *      The bypass itself is not removed -- explicit still skips
+ *      resolveEntryLane and task_class routing entirely -- this is strictly
+ *      an added refuse-when-known-dark guard on top of it.
  *   2. taskClass -> resolveEntryLane() -> laneName when non-null.
  *   3. Falls back to undefined (caller must handle no-workflow case).
  *
  * The duplicate of pickLane() in router-dispatcher.ts is intentional: pickLane
  * exists for test ergonomics (no executor import overhead in tests); this export
  * satisfies SC-2 (resolveEntryLane must be called from executor.ts) and serves
- * as the canonical live-path symbol for Cauldron 2.0 callers.
+ * as the canonical live-path symbol for Cauldron 2.0 callers. pickLane()
+ * deliberately does NOT carry the availability-refusal check -- it stays a
+ * pure precedence helper for tests; the live-fire guard lives only here.
  *
  * WO-HARNESS-LAYER2-DISPATCHER-FIRES-RESOLVED-LANE-01.
  */
@@ -413,6 +446,16 @@ export async function resolveExecutorLane(opts: {
   routerYamlContent?: string;
 }): Promise<string | undefined> {
   if (opts.workflowName !== undefined) {
+    if (isLaneFullyDark(opts.workflowName, DEFAULT_ENGINE_TO_LANE)) {
+      const dark = listDarkEngines().filter(
+        engine => DEFAULT_ENGINE_TO_LANE[engine] === opts.workflowName
+      );
+      getLog().warn(
+        { workflowName: opts.workflowName, darkEngines: dark },
+        'workflow.explicit_fire_refused_lane_dark'
+      );
+      throw new LaneAvailabilityRefusedError(opts.workflowName, dark);
+    }
     return opts.workflowName;
   }
   if (opts.taskClass) {

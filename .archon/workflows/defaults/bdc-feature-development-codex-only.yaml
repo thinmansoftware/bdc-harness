@@ -1045,7 +1045,7 @@ nodes:
       exit 0
   - id: war-council-validator
     # FABLE TEST SEAT (John 2026-07-02: "add fable in to one for testing for now").
-    # Trusted judge upgraded sonnet -> claude-fable-5 on this lane. Persona VARIANT
+    # Trusted judge upgraded sonnet -> claude-opus-5 on this lane. Persona VARIANT
     # required because persona model WINS over node model on provider claude
     # (persona pin law, wiki doctrine/archon-yaml-authoring 2026-07-02).
     # Superseded by the apex-rung WO (bdc-xo issue #575) when it lands.
