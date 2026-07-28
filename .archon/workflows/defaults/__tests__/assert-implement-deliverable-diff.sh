@@ -60,32 +60,24 @@ fi
 PASS=$((PASS + 1))
 echo "PASS: markers present in zero-open assert body"
 
-# Build a minimal runnable script from the body: stub implement.output via IMPL env.
-RUNNABLE=$(printf '%s\n' "$BODY" | awk '
-  index($0, "IMPL=$(cat <<") == 1 && index($0, "BDC_FEATURE_DEV_IMPL_IMPLEMENT_20260719_") > 0 {
-    print "IMPL=\"${IMPL_FIXTURE:-}\""
-    skip = 1
-    next
-  }
-  skip {
-    if ($0 == ")") skip = 0
-    next
-  }
-  { print }
-')
-if printf '%s\n' "$RUNNABLE" | grep -Fxq '$implement.output'; then
-  echo "FATAL: could not replace implement output heredoc with fixture"
+# Mailbox pattern (WO-HARNESS-NODE-OUTPUT-MAILBOX-ASSERT-01): the assert body reads
+# $ARTIFACTS_DIR/implement.env and never interpolates raw narration. Fixture feeds
+# the mailbox file, not an IMPL stub.
+RUNNABLE="$BODY"
+if printf '%s\n' "$RUNNABLE" | grep -Fq '$implement.output'; then
+  echo "FATAL: assert body still interpolates raw \$implement.output"
   exit 1
 fi
 
 run_assert() {
-  local wt="$1" impl="$2" base="$3"
+  # $2 = CLAIMED_DELIVERABLES value for the mailbox (space-separated paths, may be empty)
+  local wt="$1" claimed="$2" base="$3"
   local script out code
+  printf 'COMPLETE=true\nALREADY_SATISFIED=no\nCLAIMED_DELIVERABLES=%s\n' "$claimed" > "$wt/artifacts/implement.env"
   script=$(mktemp)
   {
     echo 'set -uo pipefail'
     echo "export ARTIFACTS_DIR=$(printf '%q' "$wt/artifacts")"
-    echo "export IMPL_FIXTURE=$(printf '%q' "$impl")"
     # git rev-parse will use wt after cd
     echo "cd $(printf '%q' "$wt")"
     printf '%s\n' "$RUNNABLE"
@@ -125,7 +117,7 @@ git -C "$FIX" commit -q -m "thrash"
 mkdir -p "$FIX/docs/canary"
 echo "on-disk-only" > "$FIX/docs/canary/foo.md"
 # do not git-add the canary -- disk check passes, committed-truth must fail
-IMPL=$'COMPLETE\nCreated docs/canary/foo.md for the canary.\nBUILD_COMPLETE'
+IMPL='docs/canary/foo.md'
 set +e
 OUT=$(run_assert "$FIX" "$IMPL" "$BASE")
 CODE=$?
@@ -148,7 +140,7 @@ mkdir -p "$FIX/docs/canary"
 echo "ZERO_OPEN_LANE_CANARY_OK" > "$FIX/docs/canary/foo.md"
 git -C "$FIX" add docs/canary/foo.md
 git -C "$FIX" commit -q -m "canary"
-IMPL=$'COMPLETE\nCreated docs/canary/foo.md\nBUILD_COMPLETE'
+IMPL='docs/canary/foo.md'
 set +e
 OUT=$(run_assert "$FIX" "$IMPL" "$BASE")
 CODE=$?
