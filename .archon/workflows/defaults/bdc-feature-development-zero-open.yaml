@@ -516,6 +516,23 @@ nodes:
         Worst case: the downstream commit-and-push node runs and is a no-op because HEAD is
         already pushed. Best case: your work is on origin even if everything else fails.
 
+        ## Completion mailbox -- REQUIRED before your sentinel (WO-HARNESS-NODE-OUTPUT-MAILBOX-ASSERT-01)
+        Downstream bash gates NEVER read your narration; they read ONLY the file
+        $ARTIFACTS_DIR/implement.env. Immediately before emitting your completion
+        sentinel, write EXACTLY three KEY=VALUE lines to that file, for example:
+          printf 'COMPLETE=true\nALREADY_SATISFIED=no\nCLAIMED_DELIVERABLES=docs/canary/foo.md\n' > "$ARTIFACTS_DIR/implement.env"
+        CLAIMED_DELIVERABLES is a single space-separated line of the repo-relative
+        file paths you created or modified as deliverables (empty value if none).
+        The gate verifies each claimed docs/ path against disk AND the committed
+        diff -- claim only what you actually committed.
+        Values by outcome:
+        - REAL BUILD (you made in-scope changes): COMPLETE=true, ALREADY_SATISFIED=no
+        - ALREADY SATISFIED (verified no-op): COMPLETE=true, ALREADY_SATISFIED=yes
+        - BLOCKED (cannot proceed): COMPLETE=false, ALREADY_SATISFIED=no
+        No other content, no prose, no code fences inside that file. If the file is
+        missing, assert-implement-produced-work treats your completion claim as
+        unproven and a clean worktree is classified FALSE_COMPLETE.
+
         ## Completion Criteria + Sentinel Emission (Patch 3, 2026-05-16; Fix A 2026-05-30)
         Before emitting any completion sentinel, run this self-check IN THIS WORKTREE:
           WT=$(git rev-parse --show-toplevel)
@@ -660,10 +677,12 @@ nodes:
     load_bearing: true
     bash: |
       set -uo pipefail
-      IMPL=$(cat <<'BDC_FEATURE_DEV_IMPL_IMPLEMENT_20260719_001'
-      $implement.output
-      BDC_FEATURE_DEV_IMPL_IMPLEMENT_20260719_001
-      )
+      # Artifact-mailbox (WO-HARNESS-NODE-OUTPUT-MAILBOX-ASSERT-01): implement writes
+      # KEY=VALUE lines to implement.env in the artifacts dir; this gate parses ONLY
+      # that file and never interpolates raw agent narration into shell. Anchor runs:
+      # 4fdc8d95 (exit 127, manifest lines executed as commands), 474afb2c (exit 2,
+      # apostrophes in narration).
+      IMPL_ENV="$ARTIFACTS_DIR/implement.env"
       WT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
       # Codex FINDING_1 fix: compare against the IMMUTABLE run-start SHA (captured by
       # read-spec BEFORE checkpoint-push committed+pushed), NOT post-push upstream state.
@@ -707,7 +726,12 @@ nodes:
       # ---- BEGIN assert-implement-deliverable-diff ----
       # WO-HARNESS-ZERO-OPEN-IMPLEMENT-MANIFEST-CHECKPOINT-TRUTH-01
       # Disk-truth + committed-truth for claimed canary paths; scope-thrash guard.
-      CLAIMED_CANARY=$(printf '%s\n' "$IMPL" | grep -Eo 'docs/canary/[A-Za-z0-9._/-]+\.md' | head -1 || true)
+      # Claims come from the mailbox (CLAIMED_DELIVERABLES key), never raw narration.
+      CLAIMED_DELIVERABLES=""
+      if [ -f "$IMPL_ENV" ]; then
+        CLAIMED_DELIVERABLES=$(sed -n 's/^CLAIMED_DELIVERABLES=//p' "$IMPL_ENV" | head -1)
+      fi
+      CLAIMED_CANARY=$(printf '%s\n' "$CLAIMED_DELIVERABLES" | tr ' ' '\n' | grep -E '^docs/canary/[A-Za-z0-9._/-]+\.md$' | head -1 || true)
       if [ -n "$CLAIMED_CANARY" ] && [ ! -f "$WT/$CLAIMED_CANARY" ]; then
         echo "BUILD_OUTCOME=FALSE_COMPLETE"
         echo "ERROR: implement claimed $CLAIMED_CANARY but file is missing after checkpoint (tool-theater)." >&2
@@ -734,7 +758,7 @@ nodes:
           ONLY_ARCHON=false
           if [ -z "$NON_ARCHON" ]; then ONLY_ARCHON=true; fi
           CLAIMS_DOCS=false
-          if printf '%s\n' "$IMPL" | grep -qE 'docs/canary/|docs/[A-Za-z0-9._/-]+\.md'; then CLAIMS_DOCS=true; fi
+          if printf '%s\n' "$CLAIMED_DELIVERABLES" | tr ' ' '\n' | grep -qE '^docs/canary/|^docs/[A-Za-z0-9._/-]+\.md$'; then CLAIMS_DOCS=true; fi
           if [ "$ONLY_ARCHON" = "true" ] && [ "$CLAIMS_DOCS" = "true" ]; then
             echo "BUILD_OUTCOME=FALSE_COMPLETE"
             echo "ERROR: scope thrash -- only .archon/workflows/** committed since ${BASE} while implement claimed docs/** deliverable." >&2
@@ -747,9 +771,11 @@ nodes:
       # ---- END assert-implement-deliverable-diff ----
 
       SAID_COMPLETE=false
-      if printf '%s\n' "$IMPL" | grep -qE '^(COMPLETE|BUILD_COMPLETE)$|<promise>COMPLETE</promise>'; then SAID_COMPLETE=true; fi
       SAID_ALREADY=false
-      if printf '%s\n' "$IMPL" | grep -qE '^ALREADY_SATISFIED:'; then SAID_ALREADY=true; fi
+      if [ -f "$IMPL_ENV" ]; then
+        case "$(sed -n 's/^COMPLETE=//p' "$IMPL_ENV" | head -1)" in true) SAID_COMPLETE=true ;; esac
+        case "$(sed -n 's/^ALREADY_SATISFIED=//p' "$IMPL_ENV" | head -1)" in yes) SAID_ALREADY=true ;; esac
+      fi
       GATE_ALREADY=false
       GATE_JSON=$(cat <<'BDC_FEATURE_DEV_GATE_ALREADY_SATISFIED_20260713_A8E4D3'
       $gate-already-satisfied.output
@@ -781,7 +807,7 @@ nodes:
         exit 0
       fi
 
-      # No work in this worktree. A true node-level skip leaves $implement.output empty,
+      # No work in this worktree. A true node-level skip leaves the mailbox file absent,
       # so classify the already-satisfied path directly from gate-already-satisfied JSON.
       if [ "$GATE_ALREADY" = "true" ]; then
         echo "BUILD_OUTCOME=ALREADY_SATISFIED"

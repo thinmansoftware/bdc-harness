@@ -241,6 +241,19 @@ nodes:
         git push -u origin "$BRANCH" 2>&1 || echo "WARN: push failed - operator must recover from worktree"
         ```
 
+        ## Completion mailbox -- REQUIRED before your sentinel (WO-HARNESS-NODE-OUTPUT-MAILBOX-ASSERT-01)
+        Downstream bash gates NEVER read your narration; they read ONLY the file
+        $ARTIFACTS_DIR/implement.env. Immediately before emitting your completion
+        sentinel, write EXACTLY two KEY=VALUE lines to that file, for example:
+          printf 'COMPLETE=true\nALREADY_SATISFIED=no\n' > "$ARTIFACTS_DIR/implement.env"
+        Values by outcome:
+        - REAL BUILD (you made in-scope changes): COMPLETE=true, ALREADY_SATISFIED=no
+        - ALREADY SATISFIED (verified no-op): COMPLETE=true, ALREADY_SATISFIED=yes
+        - BLOCKED (cannot proceed): COMPLETE=false, ALREADY_SATISFIED=no
+        No other content, no prose, no code fences inside that file. If the file is
+        missing, assert-implement-produced-work treats your completion claim as
+        unproven and a clean worktree is classified FALSE_COMPLETE.
+
         ## Completion Criteria + Sentinel Emission
         Before emitting any completion sentinel, run this self-check IN THIS WORKTREE:
           WT=$(git rev-parse --show-toplevel)
@@ -271,7 +284,12 @@ nodes:
     load_bearing: true
     bash: |
       set -uo pipefail
-      IMPL=$implement.output
+      # Artifact-mailbox (WO-HARNESS-NODE-OUTPUT-MAILBOX-ASSERT-01): implement writes
+      # KEY=VALUE lines to implement.env in the artifacts dir; this gate parses ONLY
+      # that file and never interpolates raw agent narration into shell. Anchor runs:
+      # 4fdc8d95 (exit 127, manifest lines executed as commands), 474afb2c (exit 2,
+      # apostrophes in narration).
+      IMPL_ENV="$ARTIFACTS_DIR/implement.env"
       WT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
       BASE=$(cat "$ARTIFACTS_DIR/run-start-sha.txt" 2>/dev/null || echo "")
       HEAD_NOW=$(git -C "$WT" rev-parse HEAD 2>/dev/null || echo "")
@@ -285,9 +303,11 @@ nodes:
       if [ "${CHANGED:-0}" -gt 0 ] || [ "${AHEAD:-0}" -gt 0 ]; then HAS_WORK=true; fi
 
       SAID_COMPLETE=false
-      if printf '%s\n' "$IMPL" | grep -qE '^(COMPLETE|BUILD_COMPLETE)$|<promise>COMPLETE</promise>'; then SAID_COMPLETE=true; fi
       SAID_ALREADY=false
-      if printf '%s\n' "$IMPL" | grep -qE '^ALREADY_SATISFIED:'; then SAID_ALREADY=true; fi
+      if [ -f "$IMPL_ENV" ]; then
+        case "$(sed -n 's/^COMPLETE=//p' "$IMPL_ENV" | head -1)" in true) SAID_COMPLETE=true ;; esac
+        case "$(sed -n 's/^ALREADY_SATISFIED=//p' "$IMPL_ENV" | head -1)" in yes) SAID_ALREADY=true ;; esac
+      fi
 
       echo "WORKTREE=$WT"
       echo "CHANGED_FILES=$CHANGED"
