@@ -2,15 +2,26 @@
 // WO-HARNESS-LAYER1-TIER-AND-COUNTERFACTUAL-COST-01
 //
 // FRONTIER_MODEL_ID identifies the top rung for counterfactual calculations.
-// Update these constants when the frontier model or published rates change.
-// Rates are in USD per single token (not per million).
+// Update the default below (and rates, if they changed) when the frontier
+// model changes -- ARCHON_FRONTIER_MODEL_ID lets an operator override
+// without a code change/deploy in the interim (M-20260726-87: this was
+// previously hardcoded with no override path, forcing a full sweep+rebuild
+// every time the frontier model changed). Rates are in USD per single token
+// (not per million) and are NOT read from the env override -- if the
+// override model's rates differ meaningfully from Opus's, update the rate
+// constants too.
 //
-// Claude Opus 4 (claude-opus-4-7) list rates as of 2026-06-29:
+// Claude Opus 5 (claude-opus-5) list rates as of 2026-07-28 (swept from
+// claude-opus-4-7 per M-20260726-87; rates carried forward from Opus 4 --
+// update when Opus 5 pricing is confirmed published):
 //   Input:  $15.00 per million tokens = 0.000015 USD/token
 //   Output: $75.00 per million tokens = 0.000075 USD/token
 // Source: https://www.anthropic.com/pricing
 
-export const FRONTIER_MODEL_ID = 'claude-opus-4-7';
+const DEFAULT_FRONTIER_MODEL_ID = 'claude-opus-5';
+
+export const FRONTIER_MODEL_ID: string =
+  process.env.ARCHON_FRONTIER_MODEL_ID ?? DEFAULT_FRONTIER_MODEL_ID;
 export const FRONTIER_INPUT_RATE_PER_TOKEN = 0.000015; // USD
 export const FRONTIER_OUTPUT_RATE_PER_TOKEN = 0.000075; // USD
 

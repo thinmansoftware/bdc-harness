@@ -855,7 +855,7 @@ describe('hasPushArtifact', () => {
   });
 });
 
-describe('fable apex lane -- build-critical nodes serve claude-fable-5', () => {
+describe('fable apex lane -- build-critical nodes serve claude-opus-5 (M-20260726-87 sweep)', () => {
   const REPO_ROOT = join(import.meta.dir, '..', '..', '..');
   const FABLE_LANE = join(
     REPO_ROOT,
@@ -892,18 +892,21 @@ describe('fable apex lane -- build-critical nodes serve claude-fable-5', () => {
     'war-council-validator',
   ];
 
-  it('the lane is the fable variant with top-level model claude-fable-5', () => {
+  it('the lane is the fable variant with top-level model claude-opus-5', () => {
     expect(lane.name).toBe('bdc-feature-development-fable');
-    expect(lane.model).toBe('claude-fable-5');
+    // Swept from claude-fable-5 by M-20260726-87. The lane NAME and the
+    // "fable apex" persona-drop mechanism (described above) are unchanged --
+    // the fable seat survives as a role; only the served model changed.
+    expect(lane.model).toBe('claude-opus-5');
   });
 
   for (const id of buildCriticalNodes) {
-    it(`${id}: carries no persona or agent and resolves to claude-fable-5`, () => {
+    it(`${id}: carries no persona or agent and resolves to claude-opus-5`, () => {
       const node = byId(id);
       expect(node).toBeDefined();
       expect(node!.agent).toBeUndefined();
       expect(node!.persona).toBeUndefined();
-      expect(effectiveModel(node!)).toBe('claude-fable-5');
+      expect(effectiveModel(node!)).toBe('claude-opus-5');
     });
   }
 

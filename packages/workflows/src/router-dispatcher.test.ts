@@ -10,7 +10,7 @@
  * Pattern mirrors condition-evaluator.test.ts -- mock @archon/paths BEFORE
  * importing the module under test so the cached logger picks up the mock.
  */
-import { describe, it, expect, mock } from 'bun:test';
+import { describe, it, expect, mock, beforeEach } from 'bun:test';
 
 // --- Mock logger (MUST come before imports of modules under test) ---
 
@@ -36,6 +36,7 @@ import {
   DEFAULT_ENGINE_TO_LANE,
   UNREACHABLE_ENGINES,
 } from './router-dispatcher';
+import { markEngineDarkIfZeroUsage, resetEngineAvailabilityForTests } from './engine-availability';
 
 const LIVE_GOVERNED_LANES: readonly string[] = [
   // Keep in sync with lane-registration.test.ts S4's governed lane fixture.
@@ -319,6 +320,81 @@ describe('router-dispatcher resolveEntryLane', () => {
   });
 });
 
+describe('M-20260726-87: runtime engine-dark signal actually changes routing (shown, not asserted)', () => {
+  beforeEach(() => {
+    resetEngineAvailabilityForTests();
+  });
+
+  it('a live fable-session dark mark makes the ladder walk fall through to opus-api at the SAME Tier 5, not skip the tier entirely (both engines share the wired fable lane)', async () => {
+    // Simulate exactly the proven production failure: Fable returns
+    // tokens.input==0, tokens.output==0, cost==0 on a spec-authoring node.
+    markEngineDarkIfZeroUsage('fable-session', { input: 0, output: 0 }, 0, {
+      runId: 'sim-run',
+      nodeId: 'plan',
+    });
+
+    const result = await resolveEntryLane({ taskClass: 'spec-authoring', ...FIXTURE_OPTS });
+
+    // fable-session is dark -- the walk must select opus-api instead, not
+    // silently keep resolving to the dark engine.
+    expect(result.tier).toBe('5');
+    expect(result.engineHint).toBe('opus-api');
+    expect(result.laneName).toBe('bdc-feature-development-fable');
+  });
+
+  it('darkening BOTH Tier 5 engines forces the ladder to fall back to the highest reachable lower tier (Tier 5 is terminal, per router.yaml)', async () => {
+    markEngineDarkIfZeroUsage('fable-session', { input: 0, output: 0 }, 0, {
+      runId: 'sim-run',
+      nodeId: 'plan',
+    });
+    markEngineDarkIfZeroUsage('opus-api', { input: 0, output: 0 }, 0, {
+      runId: 'sim-run',
+      nodeId: 'plan',
+    });
+
+    const result = await resolveEntryLane({ taskClass: 'spec-authoring', ...FIXTURE_OPTS });
+
+    // Both Tier 5 engines dark -- fall back down, never escalate past Tier 5.
+    expect(result.tier).not.toBe('5');
+    expect(result.laneName).toBe('bdc-feature-development');
+  });
+
+  it('a dark mark that has expired no longer affects routing (mandatory auto-expiry)', async () => {
+    // resolveEntryLane -> isEngineDark uses real Date.now() internally (no
+    // injectable clock at that layer -- router-dispatcher.ts stays a pure
+    // table lookup with no test-only clock parameter threaded through its
+    // public API). Mark with the REAL current time and a 0ms cooldown so the
+    // mark is simultaneously "just marked" and "already past its window" --
+    // this exercises the actual isEngineDark(engine) call resolveEntryLane
+    // makes (no injected `now`), proving the wiring reads real time and
+    // expiry is honored end-to-end.
+    markEngineDarkIfZeroUsage(
+      'fable-session',
+      { input: 0, output: 0 },
+      0,
+      { runId: 'sim-run', nodeId: 'plan' },
+      0
+    );
+
+    const result = await resolveEntryLane({ taskClass: 'spec-authoring', ...FIXTURE_OPTS });
+    expect(result.engineHint).toBe('fable-session');
+    expect(result.tier).toBe('5');
+  });
+
+  it('an engine dark on Tier 5 does NOT affect an unrelated tier (per-ENGINE scope, not global)', async () => {
+    markEngineDarkIfZeroUsage('fable-session', { input: 0, output: 0 }, 0, {
+      runId: 'sim-run',
+      nodeId: 'plan',
+    });
+
+    const buildCode = await resolveEntryLane({ taskClass: 'build-code', ...FIXTURE_OPTS });
+    // build-code starts at Tier 2 and never touches fable-session -- must be
+    // completely unaffected by the Tier 5 dark mark.
+    expect(buildCode.tier).toBe('2');
+    expect(buildCode.engineHint).toBe('glm-5.2');
+  });
+});
+
 describe('pickLane -- Layer 2 dispatcher precedence', () => {
   it('Scenario A -- task_class resolving to a null lane returns undefined', async () => {
     const lane = await pickLane({ taskClass: 'build-code', ...FIXTURE_OPTS });
@@ -365,13 +441,16 @@ describe('pickLane -- Layer 2 dispatcher precedence', () => {
     expect(lane).toBeUndefined();
   });
 
-  it('Scenario E -- fable-session engine (Tier 4, null lane) returns undefined', async () => {
-    // spec-authoring starts at Tier 4 whose engines are fable-session and opus-api,
-    // both mapped to null in DEFAULT_ENGINE_TO_LANE. No workflowName provided.
+  it('Scenario E -- fable-session engine (Tier 5) resolves to the wired fable lane (M-87 Cause 3)', async () => {
+    // spec-authoring starts at Tier 5 whose engines are fable-session and
+    // opus-api. Both are wired to bdc-feature-development-fable as of
+    // M-20260726-87 (previously both mapped to null -- Tier 5 could never
+    // fire a lane even with a working availability signal; see the motion's
+    // post-vote design round). No workflowName provided.
     const lane = await pickLane({
       taskClass: 'spec-authoring',
       ...FIXTURE_OPTS,
     });
-    expect(lane).toBeUndefined();
+    expect(lane).toBe('bdc-feature-development-fable');
   });
 });

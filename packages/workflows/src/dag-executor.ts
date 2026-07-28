@@ -113,6 +113,11 @@ import { loadAgentRegistry, resolveAgent } from './agents/registry';
 import type { AgentRegistry } from './agents/registry';
 import { loadContext } from '@archon/persona-context-loader';
 import { deriveEntryRung, computeFrontierCost } from './model-rates';
+import {
+  markEngineDarkIfZeroUsage,
+  resolveRouterEngine,
+  sweepExpiredMarks,
+} from './engine-availability';
 import { isDeclaredServedMatch } from './model-alias';
 import { emitRunTokenTotals } from './token-rollup';
 import type {
@@ -1591,6 +1596,28 @@ async function executeNodeInternal(
     nodeName: node.command ?? node.id,
   });
 
+  // M-20260726-87: opportunistically sweep expired engine-dark marks on each
+  // node dispatch (no background timer -- a permanently-poisoned engine is
+  // worse than the failure being fixed, so expiry must not depend on a
+  // future failure ever happening on that same engine again). Persist each
+  // expiry so "why did this run pick that model" stays reconstructable.
+  for (const expiry of sweepExpiredMarks()) {
+    getLog().info({ ...expiry }, 'dag.engine_mark_expired');
+    await deps.store
+      .createWorkflowEvent({
+        workflow_run_id: workflowRun.id,
+        event_type: 'engine_availability_changed',
+        step_name: node.id,
+        data: { ...expiry },
+      })
+      .catch((err: Error) => {
+        getLog().error(
+          { err, workflowRunId: workflowRun.id, eventType: 'engine_availability_changed' },
+          'workflow_event_persist_failed'
+        );
+      });
+  }
+
   // Load prompt
   let rawPrompt: string;
   if (node.command !== undefined) {
@@ -2467,6 +2494,34 @@ async function executeNodeInternal(
 
     getLog().error({ err, nodeId: node.id }, 'dag_node_failed');
     await logNodeError(logDir, workflowRun.id, node.id, err.message);
+
+    // M-20260726-87 Cause 1: mark the engine dark ONLY on the binding
+    // zero-usage token signature (never derived from err.message). No-op
+    // when tokens flowed (a real failure, not a quota/availability wall) or
+    // when this provider+model has no corresponding router.yaml engine.
+    const failedEngine = resolveRouterEngine(provider, declaredModelId);
+    if (failedEngine !== undefined) {
+      const availabilityEvent = markEngineDarkIfZeroUsage(failedEngine, nodeTokens, nodeCostUsd, {
+        runId: workflowRun.id,
+        nodeId: node.id,
+      });
+      if (availabilityEvent !== null) {
+        getLog().warn({ nodeId: node.id, ...availabilityEvent }, 'dag.engine_marked_dark');
+        await deps.store
+          .createWorkflowEvent({
+            workflow_run_id: workflowRun.id,
+            event_type: 'engine_availability_changed',
+            step_name: node.id,
+            data: { ...availabilityEvent },
+          })
+          .catch((err: Error) => {
+            getLog().error(
+              { err, workflowRunId: workflowRun.id, eventType: 'engine_availability_changed' },
+              'workflow_event_persist_failed'
+            );
+          });
+      }
+    }
 
     await deps.store
       .createWorkflowEvent({

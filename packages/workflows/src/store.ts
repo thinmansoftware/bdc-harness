@@ -62,6 +62,12 @@ export const WORKFLOW_EVENT_TYPES = [
   // WO-HARNESS-IMPLEMENT-WALL-TIMEOUT-HONEST-01: emitted for each loop
   // iteration wall breach before the retry/final failure decision.
   'node_wall_breach',
+  // Runtime engine-availability marks (M-20260726-87). Emitted when a node
+  // failure matches the binding zero-usage token signature (never the error
+  // string) and the router-dispatcher's ladder walk marks that engine dark
+  // for its cooldown window, and again when the mark auto-expires. See
+  // engine-availability.ts for the full detection/cooldown contract.
+  'engine_availability_changed',
 ] as const;
 
 export type WorkflowEventType = (typeof WORKFLOW_EVENT_TYPES)[number];

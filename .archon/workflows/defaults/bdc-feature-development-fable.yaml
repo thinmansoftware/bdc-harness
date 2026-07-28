@@ -5,7 +5,7 @@ description: |
     packages/smart-cauldron/config/ladder.config.json.
   Input: WO_ID in the environment or user message, plus repo context from Overlord.
   Does: Same DAG as bdc-feature-development, but the build-critical nodes serve
-    claude-fable-5 (the strongest model) instead of sonnet/opus. If this rung
+    claude-opus-5 (the strongest model) instead of sonnet/opus. If this rung
     gate-fails, the cascade emits a SPEC-REPAIR escalation (a WO must never
     terminally fail -- it re-enters at the authoring layer). See
     WO-HARNESS-CASCADE-FABLE-APEX-RUNG-01 and John's 2026-07-02 doctrine ruling.
@@ -21,15 +21,15 @@ run_authority:
     - docs/superpowers/specs/{WO_ID}.md
   allow_issue_fallback: true
 # FABLE APEX RUNG (WO-HARNESS-CASCADE-FABLE-APEX-RUNG-01):
-# Top-level model is claude-fable-5. The six build-critical nodes (plan, plan-review,
+# Top-level model is claude-opus-5. The six build-critical nodes (plan, plan-review,
 # implement, diff-repair, opus-repair, war-council-validator) intentionally DROP their
 # persona:/agent: bindings so this model is actually served -- on provider: claude a
 # persona model WINS over the node/workflow model (executor-shared.ts resolveAgentPersona),
 # and every existing persona is pinned (sonnet/opus), which would silently shadow fable.
 # All OTHER nodes keep their persona bindings unchanged. war-council-validator keeps
-# provider: claude (trusted judge is always Claude) but serves claude-fable-5 here.
+# provider: claude (trusted judge is always Claude) but serves claude-opus-5 here.
 provider: claude
-model: claude-fable-5
+model: claude-opus-5
 
 nodes:
   # Pre-flight: fail closed if container lacks GITHUB auth (WO-169, 2026-05-16).
@@ -270,7 +270,7 @@ nodes:
       exit 0
 
   - id: plan
-    # FABLE APEX: persona/agent dropped so model: claude-fable-5 is actually served
+    # FABLE APEX: persona/agent dropped so model: claude-opus-5 is actually served
     # (persona war-council-architect would pin sonnet and shadow fable). See header.
     depends_on: [gate-already-satisfied]
     when: "$gate-already-satisfied.output.ALREADY_SATISFIED != 'true'"
@@ -317,7 +317,7 @@ nodes:
   # async escalation payload, and only at the irreversible-action boundary downstream.
   - id: plan-review
     idle_timeout: 600000
-    # FABLE APEX: persona/agent dropped so model: claude-fable-5 is actually served. See header.
+    # FABLE APEX: persona/agent dropped so model: claude-opus-5 is actually served. See header.
     depends_on: [plan]
     trigger_rule: all_done
     when: "$gate-already-satisfied.output.ALREADY_SATISFIED != 'true'"
@@ -439,7 +439,7 @@ nodes:
 
   - id: implement
     idle_timeout: 600000
-    # FABLE APEX: persona/agent dropped so model: claude-fable-5 is actually served
+    # FABLE APEX: persona/agent dropped so model: claude-opus-5 is actually served
     # (persona major-build would pin opus[1m] and shadow fable). See header.
     depends_on: [capture-run-scope]
     trigger_rule: all_done
@@ -1045,11 +1045,11 @@ nodes:
       exit 0
   - id: war-council-validator
     # FABLE APEX: trusted judge stays provider: claude (always Claude, regardless of the
-    # lane default) but serves claude-fable-5 -- this lane's judge is the apex model too.
+    # lane default) but serves claude-opus-5 -- this lane's judge is the apex model too.
     # persona captain-ci-validator dropped so the fable model is actually served (the
     # persona pins sonnet and would shadow it). See header + WO-HARNESS-CASCADE-FABLE-APEX-RUNG-01.
     provider: claude
-    model: claude-fable-5
+    model: claude-opus-5
     depends_on: [ascii-gate]
     task_class: medium_work
     prompt: |
@@ -1208,7 +1208,7 @@ nodes:
       printf '{"verdict":"%s"}\n' "$verdict"
 
   - id: diff-repair
-    # FABLE APEX: persona/agent dropped so model: claude-fable-5 is actually served
+    # FABLE APEX: persona/agent dropped so model: claude-opus-5 is actually served
     # (persona major-build would pin opus[1m] and shadow fable). See header.
     depends_on: [diff-review, classify-diff-review, resolve-review-base]
     when: "$classify-diff-review.output.verdict == 'needs_revision'"
@@ -1451,7 +1451,7 @@ nodes:
   # bothering a human (autonomy ladder step 2). Read-only-ish: it may edit in-scope files to
   # resolve the block, then signals. If it can't fix, the run proceeds to the human pause.
   - id: opus-repair
-    # FABLE APEX: agent dropped so model: claude-fable-5 is actually served
+    # FABLE APEX: agent dropped so model: claude-opus-5 is actually served
     # (agent overseer-opus would pin opus and shadow fable). effort/context kept. See header.
     effort: xhigh
     context: fresh
