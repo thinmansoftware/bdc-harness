@@ -487,7 +487,29 @@ nodes:
       # WO-HARNESS-YAML-USE-THREAD-BRANCH-NOT-FEATURE-BRANCH-01
       # Engine already provides a unique archon/thread-<hash> branch per run.
       # Derive a unique remote push target from it instead of clobbering a shared name.
-      THREAD_ID=$(git rev-parse --abbrev-ref HEAD | sed 's|archon/thread-||')
+      # DEFECT FIX 2026-07-27 (anchor: WO-CRM-SUPABASE-CONVERGENCE-01, run d982e84e).
+      # The old line was:
+      #   THREAD_ID=$(git rev-parse --abbrev-ref HEAD | sed 's|archon/thread-||')
+      # That sed only strips a PREFIX. When HEAD is NOT archon/thread-<hash> -- e.g. a run
+      # resumed on an existing feature branch, as happens when a WO converges an existing
+      # PR -- nothing is stripped and THREAD_ID becomes the ENTIRE branch name, producing
+      # a nested double-suffix ref like:
+      #   feat/wo-crm-supabase-convergence-01-thread-feat/wo-xo-crm-minimum-complete-journey-01
+      # which then opened a SECOND, spurious PR. BRANCH is validated; THREAD_ID never was.
+      CURRENT_REF=$(git rev-parse --abbrev-ref HEAD)
+      case "$CURRENT_REF" in
+        archon/thread-*)
+          THREAD_ID=${CURRENT_REF#archon/thread-}
+          ;;
+        *)
+          THREAD_ID=$(git rev-parse --short=8 HEAD 2>/dev/null || echo "nohead")
+          echo "commit-and-push: HEAD is '${CURRENT_REF}' (not archon/thread-*); using commit-derived THREAD_ID=${THREAD_ID}" >&2
+          ;;
+      esac
+      if ! printf '%s\n' "$THREAD_ID" | grep -Eq '^[A-Za-z0-9_-]+$'; then
+        echo "ERROR: refusing to push -- derived THREAD_ID '${THREAD_ID}' is not a bare [A-Za-z0-9_-] token (would create a malformed branch)." >&2
+        exit 1
+      fi
       UNIQUE_BRANCH="${BRANCH}-thread-${THREAD_ID}"
       git status --short
       DIRTY=$(git status --porcelain)

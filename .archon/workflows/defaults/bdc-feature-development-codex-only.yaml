@@ -2121,7 +2121,29 @@ nodes:
       # WO-HARNESS-YAML-USE-THREAD-BRANCH-NOT-FEATURE-BRANCH-01
       # Engine already provides a unique archon/thread-<hash> branch per run.
       # Derive a unique remote push target from it instead of clobbering a shared name.
-      THREAD_ID=$(git rev-parse --abbrev-ref HEAD | sed 's|archon/thread-||')
+      # DEFECT FIX 2026-07-27 (anchor: WO-CRM-SUPABASE-CONVERGENCE-01, run d982e84e).
+      # The old line was:
+      #   THREAD_ID=$(git rev-parse --abbrev-ref HEAD | sed 's|archon/thread-||')
+      # That sed only strips a PREFIX. When HEAD is NOT archon/thread-<hash> -- e.g. a run
+      # resumed on an existing feature branch, as happens when a WO converges an existing
+      # PR -- nothing is stripped and THREAD_ID becomes the ENTIRE branch name, producing
+      # a nested double-suffix ref like:
+      #   feat/wo-crm-supabase-convergence-01-thread-feat/wo-xo-crm-minimum-complete-journey-01
+      # which then opened a SECOND, spurious PR. BRANCH is validated; THREAD_ID never was.
+      CURRENT_REF=$(git rev-parse --abbrev-ref HEAD)
+      case "$CURRENT_REF" in
+        archon/thread-*)
+          THREAD_ID=${CURRENT_REF#archon/thread-}
+          ;;
+        *)
+          THREAD_ID=$(git rev-parse --short=8 HEAD 2>/dev/null || echo "nohead")
+          echo "commit-and-push: HEAD is '${CURRENT_REF}' (not archon/thread-*); using commit-derived THREAD_ID=${THREAD_ID}" >&2
+          ;;
+      esac
+      if ! printf '%s\n' "$THREAD_ID" | grep -Eq '^[A-Za-z0-9_-]+$'; then
+        echo "ERROR: refusing to push -- derived THREAD_ID '${THREAD_ID}' is not a bare [A-Za-z0-9_-] token (would create a malformed branch)." >&2
+        exit 1
+      fi
       UNIQUE_BRANCH="${BRANCH}-thread-${THREAD_ID}"
       git status --short
       DIRTY=$(git status --porcelain)
@@ -2157,7 +2179,18 @@ nodes:
             | head -1)
           if [ -n "$RECOVERED" ]; then
             echo "Recovered push target from remote: $RECOVERED"
-            UNIQUE_BRANCH="$RECOVERED"
+            # DEFECT FIX 2026-07-27 (anchor: bdc-crm PR #4, run f8ef4b92).
+            # This recovery block adopts ANY remote ref whose HEAD SHA matches local HEAD.
+            # If a PRIOR run pushed a malformed branch name, this block finds it, adopts it,
+            # and pushes to it again -- propagating the corruption forward and opening a new
+            # spurious PR each time. The bug feeds on its own output. Observed names:
+            #   feat/wo-crm-supabase-convergence-01-thread-wo-crm-supabase-convergence-01'
+            # (note the nested WO id AND the trailing quote). Validate before adopting.
+            if printf '%s\n' "$RECOVERED" | grep -Eq '^(feat|fix|wip)/[A-Za-z0-9_-]+-thread-[A-Za-z0-9_-]+$'; then
+              UNIQUE_BRANCH="$RECOVERED"
+            else
+              echo "WARN: recovered remote ref '${RECOVERED}' is malformed -- refusing to adopt it; keeping ${UNIQUE_BRANCH}" >&2
+            fi
           else
             echo "No changed files and no commits ahead of origin/${UNIQUE_BRANCH} -- implement loop did not produce work" >&2
             exit 1

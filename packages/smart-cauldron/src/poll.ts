@@ -165,6 +165,20 @@ export async function pollForTerminal(opts: PollOptions): Promise<PollResult> {
             validatorVerdict = extractValidatorVerdict(events);
           }
         }
+
+        // DEFECT FIX 2026-07-27: the retries above only cover the RACE where an
+        // open-pr event lands late. They do not cover the legitimate case where
+        // the run was told to converge an existing PR and correctly opened
+        // NOTHING. Before failing the gate, ask GitHub whether the branch this
+        // run pushed already has an open PR. See findExistingPrForBranch.
+        if (prUrl === null) {
+          prUrl = await findExistingPrForBranch(events);
+          if (prUrl !== null) {
+            console.log(
+              `[poll] run ${runId} opened no PR, but its pushed branch already has one: ${prUrl} -- treating as satisfied (converge-existing-PR WO)`
+            );
+          }
+        }
       }
 
       const prMergeable = prUrl ? await checkPrMergeable(prUrl) : null;
@@ -300,6 +314,55 @@ function extractPrUrl(
   }
 
   return null;
+}
+
+/**
+ * Find an ALREADY-OPEN PR for the branch this run pushed to.
+ *
+ * DEFECT FIX 2026-07-27 (anchor: WO-CRM-SUPABASE-CONVERGENCE-01, cascade
+ * dispatch-e252e3db). The gate asks "did this run open a PR?" and treats no
+ * for an answer as failure. But a WO can legitimately instruct the builder to
+ * CONVERGE AN EXISTING PR ("do NOT open a competing PR"). The builder obeys,
+ * pushes to the existing branch, opens nothing -- and the gate reads that
+ * correct behavior as "no PR opened after completed run", fails the tier, and
+ * climbs. Observed cost: three runs (codex -> claude -> frontier), two useless
+ * tier climbs, and two spurious salvage PRs opened against work that was
+ * already correct and already green.
+ *
+ * So before concluding no PR exists, ASK GITHUB whether the pushed branch
+ * already has one. Returns null when gh is unavailable or nothing is found --
+ * callers must treat null as "unknown", never as "confirmed absent".
+ */
+async function findExistingPrForBranch(
+  events: { event_type: string; step_name: string | null; data: Record<string, unknown> }[]
+): Promise<string | null> {
+  // The commit-and-push node reports its final target as unique_branch=<name>.
+  let branch: string | null = null;
+  for (const ev of events) {
+    const output = typeof ev.data.output === 'string' ? ev.data.output : '';
+    const m = /unique_branch=(\S+)/.exec(output);
+    if (m?.[1]) branch = m[1];
+  }
+  if (!branch) return null;
+
+  try {
+    const { stdout } = await execFileAsync('gh', [
+      'pr',
+      'list',
+      '--head',
+      branch,
+      '--state',
+      'open',
+      '--json',
+      'url',
+      '--jq',
+      '.[0].url // empty',
+    ]);
+    const url = stdout.trim();
+    return url.length > 0 ? url : null;
+  } catch {
+    return null;
+  }
 }
 
 /**
