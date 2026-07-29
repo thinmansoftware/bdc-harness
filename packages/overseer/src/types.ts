@@ -159,4 +159,43 @@ export interface GitHubClientDeps {
   mergePullRequest(
     input: GitHubPullRequestMergeInput
   ): Promise<{ merged: boolean; message?: string }>;
+  /**
+   * Tier 0 comment_findings channel (judge-first path). Optional: when absent
+   * the pipeline records a loud 'comment_channel_unavailable' receipt rather
+   * than silently skipping.
+   */
+  commentOnPullRequest?(
+    input: PullRequestRef & { body: string }
+  ): Promise<{ commented: boolean; url?: string }>;
+}
+
+/**
+ * Verdict store dependencies for the judge-first pipeline (M-99). Mirrors the
+ * claim/finalize functions in @archon/core/db/overseer; injected so tests need
+ * no live database.
+ */
+export interface OverseerVerdictStoreDeps {
+  claimVerdict(input: {
+    runId: string;
+    woId: string;
+    headSha?: string;
+    hintAction?: string;
+    hintErrorClass?: string;
+    maxRetries?: number;
+  }): Promise<{ claimed: boolean; verdictId?: string; retryCount?: number }>;
+  finalizeVerdict(input: {
+    verdictId: string;
+    status: string;
+    verdict?: string;
+    confidence?: number;
+    model?: string;
+    modelRung?: number;
+    proposedAction?: string;
+    proposedTier?: number;
+    requiredTier?: number;
+    effectiveTier?: number;
+    reason?: string;
+    evidenceDigest?: string;
+    evidence?: string;
+  }): Promise<unknown>;
 }

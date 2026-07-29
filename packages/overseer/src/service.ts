@@ -1,9 +1,14 @@
 import { createLogger } from '@archon/paths';
 import {
+  claimOverseerVerdict,
+  finalizeOverseerVerdict,
   insertOverseerAction,
   listRunEventsForOverseer,
   listRunsForOverseerWatch,
 } from '@archon/core/db/overseer';
+import { handleRecordJudgeFirst } from './judge-first-pipeline';
+import { JudgeBudgetCircuit } from './judge-first';
+import type { OverseerVerdictStoreDeps } from './types.ts';
 import { runAuthorizedEscalation } from './authorized-escalation';
 import { runEscalation } from './escalate';
 import {
@@ -132,13 +137,52 @@ function envEnabled(value: string | undefined): boolean {
   return value === '1' || value === 'true' || value === 'yes';
 }
 
+/**
+ * Judge-first feature flag (M-99, OVERSEER_JUDGE_FIRST). Default OFF: with the
+ * flag unset the v1 classifier-decided path below runs byte-identically.
+ */
+export function judgeFirstEnabled(): boolean {
+  return envEnabled(process.env.OVERSEER_JUDGE_FIRST);
+}
+
+/**
+ * Emergency stop (M-94 control surface): halts ALL record handling -- judging
+ * and actions alike -- while leaving the watch loop alive so recovery is a
+ * single env flip, not a restart.
+ */
+export function emergencyStopEngaged(): boolean {
+  return envEnabled(process.env.OVERSEER_EMERGENCY_STOP);
+}
+
+const defaultVerdictStore: OverseerVerdictStoreDeps = {
+  claimVerdict: claimOverseerVerdict,
+  finalizeVerdict: finalizeOverseerVerdict,
+};
+
+/** One budget circuit per service process; injectable in tests via pipeline options. */
+const serviceBudgetCircuit = new JudgeBudgetCircuit();
+
 async function handleRecord(
   record: WatchedRunRecord,
-  deps: OverseerActionsDeps & GitHubClientDeps,
+  deps: OverseerRunStoreDeps & OverseerActionsDeps & GitHubClientDeps,
   dryRun: boolean,
   actor: string,
   mergeCoordinator?: MergeReadyCoordinator
 ): Promise<void> {
+  if (emergencyStopEngaged()) {
+    log.warn({ runId: record.runId }, 'overseer.emergency_stop_engaged');
+    return;
+  }
+  if (judgeFirstEnabled()) {
+    await handleRecordJudgeFirst(record, deps, {
+      dryRun,
+      actor,
+      mergeCoordinator,
+      verdictStore: defaultVerdictStore,
+      judgeOptions: { budget: serviceBudgetCircuit },
+    });
+    return;
+  }
   if (record.action === 'success' || record.action === 'ignore') {
     log.info(
       {

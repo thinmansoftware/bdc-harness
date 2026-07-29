@@ -74,6 +74,14 @@ export interface RealGitHubOctokitLike {
       data: { items: { number: number; pull_request?: unknown; repository_url?: string }[] };
     }>;
   };
+  issues?: {
+    createComment(input: {
+      owner: string;
+      repo: string;
+      issue_number: number;
+      body: string;
+    }): Promise<{ data: { html_url?: string } }>;
+  };
   checks: {
     listForRef(input: Record<string, unknown>): Promise<{
       data: {
@@ -257,5 +265,17 @@ export function createRealGitHubClientDeps(
   return {
     findPullRequest: createRealFindPullRequest(octokit),
     mergePullRequest: createRealMergePullRequest(octokit),
+    commentOnPullRequest: async (input): Promise<{ commented: boolean; url?: string }> => {
+      if (!octokit.issues) {
+        throw new Error('overseer_real_adapter_missing_issues_api');
+      }
+      const response = await octokit.issues.createComment({
+        owner: input.owner,
+        repo: input.repo,
+        issue_number: input.number,
+        body: input.body,
+      });
+      return { commented: true, url: response.data.html_url };
+    },
   };
 }

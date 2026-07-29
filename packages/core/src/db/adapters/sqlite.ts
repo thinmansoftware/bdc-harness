@@ -1268,7 +1268,38 @@ export class SqliteAdapter implements IDatabase {
         created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
       );
 
+      -- overseer_verdicts: judge-first verdict store (Motion M-99, migration 039).
+      -- One PRIMARY verdict per (run_id, head_sha); claim row inserted BEFORE the
+      -- model call so the watch loop never double-bills. status is row lifecycle
+      -- (claimed|verdict|judge_unavailable|judge_invalid_output|evidence_unavailable);
+      -- health states are retryable ALARMS, never semantic verdicts.
+      CREATE TABLE IF NOT EXISTS overseer_verdicts (
+        id TEXT PRIMARY KEY,
+        run_id TEXT NOT NULL REFERENCES remote_agent_workflow_runs(id) ON DELETE CASCADE,
+        wo_id TEXT NOT NULL,
+        head_sha TEXT NOT NULL DEFAULT '',
+        evidence_digest TEXT NOT NULL DEFAULT '',
+        status TEXT NOT NULL DEFAULT 'claimed',
+        verdict TEXT,
+        confidence REAL,
+        model TEXT,
+        model_rung INTEGER,
+        proposed_action TEXT,
+        proposed_tier INTEGER,
+        required_tier INTEGER,
+        effective_tier INTEGER,
+        hint_action TEXT,
+        hint_error_class TEXT,
+        reason TEXT,
+        evidence TEXT,
+        retry_count INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+        updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+      );
+
       -- Indexes
+      CREATE UNIQUE INDEX IF NOT EXISTS uq_overseer_verdicts_run_head ON overseer_verdicts(run_id, head_sha);
+      CREATE INDEX IF NOT EXISTS idx_overseer_verdicts_status ON overseer_verdicts(status, created_at);
       CREATE INDEX IF NOT EXISTS idx_codebase_env_vars_codebase_id ON remote_agent_codebase_env_vars(codebase_id);
       CREATE INDEX IF NOT EXISTS idx_conversations_platform ON remote_agent_conversations(platform_type, platform_conversation_id);
       CREATE INDEX IF NOT EXISTS idx_sessions_conversation ON remote_agent_sessions(conversation_id);
