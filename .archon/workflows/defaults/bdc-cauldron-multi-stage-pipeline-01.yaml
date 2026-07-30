@@ -10,6 +10,7 @@ description: |
   NOT for: doctrine-only WOs, single-repo feature WOs, bug-fix WOs.
 
 policyFile: harness/policies/agent-behavior.md
+provider: claude
 model: sonnet
 
 inputs:

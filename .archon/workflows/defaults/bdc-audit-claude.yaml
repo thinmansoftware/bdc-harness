@@ -31,6 +31,7 @@ description: |
   bdc-feature-development(-codex) for those; the review chain this lane cuts exists to catch
   code-correctness bugs that a report cannot have.
 policyFile: harness/policies/agent-behavior.md
+provider: claude
 model: sonnet
 
 nodes:

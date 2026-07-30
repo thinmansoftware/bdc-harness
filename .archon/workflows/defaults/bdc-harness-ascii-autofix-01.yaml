@@ -7,6 +7,7 @@ description: |
   Class: INFRA. No Rule 20 staging gate.
 
 policyFile: harness/policies/agent-behavior.md
+provider: claude
 model: sonnet
 
 inputs:

@@ -39,6 +39,7 @@ description: |
   parallel_ok: false
 
 policyFile: harness/policies/agent-behavior.md
+provider: claude
 model: sonnet
 
 inputs:
