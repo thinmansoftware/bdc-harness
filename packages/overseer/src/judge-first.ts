@@ -239,14 +239,54 @@ interface ParsedJudgeVerdict {
   reason: string;
 }
 
-/** Strict parse: first JSON object in stdout, validated field by field. */
-export function parseJudgeOutput(stdout: string): ParsedJudgeVerdict | null {
+/**
+ * Extract the FIRST complete JSON object from stdout by balancing braces.
+ *
+ * A `lastIndexOf('}')` scan spans everything between the first `{` and the last
+ * `}`, which is only correct when exactly one object is present. Grok emits its
+ * verdict object TWICE, concatenated (verified 2026-07-30 against the live
+ * container: 197 bytes, the same object back to back), so the naive span
+ * produced `{...}{...}` -- invalid JSON, and every real verdict was discarded as
+ * judge_invalid_output while the model was answering correctly. String-aware so
+ * a brace inside `reason` cannot end the scan early.
+ */
+function firstJsonObject(stdout: string): string | null {
   const start = stdout.indexOf('{');
-  const end = stdout.lastIndexOf('}');
-  if (start < 0 || end <= start) return null;
+  if (start < 0) return null;
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let i = start; i < stdout.length; i += 1) {
+    const char = stdout[i];
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (char === '\\') {
+      if (inString) escaped = true;
+      continue;
+    }
+    if (char === '"') {
+      inString = !inString;
+      continue;
+    }
+    if (inString) continue;
+    if (char === '{') depth += 1;
+    else if (char === '}') {
+      depth -= 1;
+      if (depth === 0) return stdout.slice(start, i + 1);
+    }
+  }
+  return null;
+}
+
+/** Strict parse: first complete JSON object in stdout, validated field by field. */
+export function parseJudgeOutput(stdout: string): ParsedJudgeVerdict | null {
+  const candidate = firstJsonObject(stdout);
+  if (!candidate) return null;
   let parsed: unknown;
   try {
-    parsed = JSON.parse(stdout.slice(start, end + 1));
+    parsed = JSON.parse(candidate);
   } catch {
     return null;
   }

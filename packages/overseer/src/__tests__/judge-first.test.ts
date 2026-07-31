@@ -161,6 +161,37 @@ describe('parseJudgeOutput: strict structured parsing', () => {
     expect(parsed?.proposedAction).toBe('flag_merge_ready');
   });
 
+  // Regression (2026-07-30, live container): Grok emits its verdict object TWICE,
+  // concatenated. The old scan took indexOf('{') .. lastIndexOf('}'), which spans
+  // BOTH objects and yields invalid JSON, so every correct real verdict was
+  // discarded as judge_invalid_output while the model was answering perfectly.
+  // These are the exact 197 bytes captured from `docker exec archon-app-1 grok -p`.
+  test('parses the FIRST object when the model emits its verdict twice', () => {
+    const one =
+      '{"verdict":"healthy","confidence":0.75,"proposed_action":"none","proposed_tier":0,"reason":"test"}';
+    const parsed = parseJudgeOutput(one + one);
+    expect(parsed).not.toBeNull();
+    expect(parsed?.verdict).toBe('healthy');
+    expect(parsed?.confidence).toBe(0.75);
+    expect(parsed?.proposedAction).toBe('none');
+  });
+
+  test('parses duplicated pretty-printed output (the shape seen in the 7/30 logs)', () => {
+    const pretty =
+      '{\n  "verdict": "healthy",\n  "confidence": 0.75,\n  "proposed_action": "none",\n  "proposed_tier": 0,\n  "reason": "Workflow reached completed state"\n}';
+    const parsed = parseJudgeOutput(`${pretty}\n${pretty}`);
+    expect(parsed?.verdict).toBe('healthy');
+    expect(parsed?.reason).toContain('completed state');
+  });
+
+  test('a brace inside a string value does not truncate the scan', () => {
+    const parsed = parseJudgeOutput(
+      '{"verdict":"needs_human","confidence":0.4,"proposed_action":"escalate_with_evidence","proposed_tier":0,"reason":"saw a literal } and { in the log tail"}'
+    );
+    expect(parsed?.verdict).toBe('needs_human');
+    expect(parsed?.reason).toContain('literal }');
+  });
+
   test('rejects non-JSON, unknown verdicts, and out-of-range confidence', () => {
     expect(parseJudgeOutput('VERDICT: APPROVE')).toBeNull();
     expect(parseJudgeOutput('{"verdict":"maybe","confidence":0.5}')).toBeNull();
