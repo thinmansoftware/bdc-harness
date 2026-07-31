@@ -273,18 +273,30 @@ export async function claimOverseerVerdict(input: {
     return { claimed: true, verdictId: inserted.rows[0].id, retryCount: 0 };
   }
   const maxRetries = input.maxRetries ?? 3;
-  const reclaimed = await db.query<{ id: string; retry_count: number }>(
-    `UPDATE overseer_verdicts
-     SET status = 'claimed', retry_count = retry_count + 1, updated_at = $4
+  // SELECT-then-UPDATE rather than UPDATE ... RETURNING: the SQLite adapter
+  // rejects RETURNING on UPDATE/DELETE, and production runs SQLite. The UPDATE
+  // repeats the status/retry predicates so a concurrent re-claim cannot double
+  // it -- rowCount 0 means another pass won, and we report the claim as lost.
+  const existing = await db.query<{ id: string; retry_count: number }>(
+    `SELECT id, retry_count FROM overseer_verdicts
      WHERE run_id = $1 AND head_sha = $2
        AND status IN ('judge_unavailable', 'judge_invalid_output', 'evidence_unavailable')
        AND retry_count < $3
-     RETURNING id, retry_count`,
-    [input.runId, headSha, maxRetries, new Date().toISOString()]
+     LIMIT 1`,
+    [input.runId, headSha, maxRetries]
   );
-  const row = reclaimed.rows[0];
-  if (row) return { claimed: true, verdictId: row.id, retryCount: row.retry_count };
-  return { claimed: false };
+  const row = existing.rows[0];
+  if (!row) return { claimed: false };
+  const nextRetry = row.retry_count + 1;
+  const claimResult = await db.query(
+    `UPDATE overseer_verdicts
+     SET status = 'claimed', retry_count = $2, updated_at = $3
+     WHERE id = $1 AND retry_count = $4
+       AND status IN ('judge_unavailable', 'judge_invalid_output', 'evidence_unavailable')`,
+    [row.id, nextRetry, new Date().toISOString(), row.retry_count]
+  );
+  if (claimResult.rowCount === 0) return { claimed: false };
+  return { claimed: true, verdictId: row.id, retryCount: nextRetry };
 }
 
 /** Finalize a claimed verdict row with either a semantic verdict or a health-alarm state. */
@@ -304,14 +316,17 @@ export async function finalizeOverseerVerdict(input: {
   evidence?: string;
 }): Promise<OverseerVerdictRow> {
   const db = getDatabase();
-  const updated = await db.query<OverseerVerdictRow>(
+  // No RETURNING: the SQLite adapter rejects it on UPDATE, and this throw took
+  // the whole watcher down in production on 2026-07-30 (the exception escaped
+  // watchLoop and runOverseerService aborted every task). Read the row back
+  // with a SELECT instead.
+  await db.query(
     `UPDATE overseer_verdicts
      SET status = $2, verdict = $3, confidence = $4, model = $5, model_rung = $6,
          proposed_action = $7, proposed_tier = $8, required_tier = $9, effective_tier = $10,
          reason = $11, evidence_digest = COALESCE($12, evidence_digest),
          evidence = $13, updated_at = $14
-     WHERE id = $1
-     RETURNING *`,
+     WHERE id = $1`,
     [
       input.verdictId,
       input.status,
@@ -329,7 +344,11 @@ export async function finalizeOverseerVerdict(input: {
       new Date().toISOString(),
     ]
   );
-  const row = updated.rows[0];
+  const readBack = await db.query<OverseerVerdictRow>(
+    'SELECT * FROM overseer_verdicts WHERE id = $1',
+    [input.verdictId]
+  );
+  const row = readBack.rows[0];
   if (!row) throw new Error(`overseer_verdict_finalize_missing_row:${input.verdictId}`);
   return row;
 }

@@ -174,13 +174,25 @@ async function handleRecord(
     return;
   }
   if (judgeFirstEnabled()) {
-    await handleRecordJudgeFirst(record, deps, {
-      dryRun,
-      actor,
-      mergeCoordinator,
-      verdictStore: defaultVerdictStore,
-      judgeOptions: { budget: serviceBudgetCircuit },
-    });
+    // Per-record isolation. On 2026-07-30 a single verdict-store query error
+    // escaped this call, propagated out of watchLoop, and runOverseerService
+    // aborted every task -- the watcher stayed dead for 28 hours while runs
+    // went terminal unseen. One bad record must never take down the watcher:
+    // log it loudly and move to the next record.
+    try {
+      await handleRecordJudgeFirst(record, deps, {
+        dryRun,
+        actor,
+        mergeCoordinator,
+        verdictStore: defaultVerdictStore,
+        judgeOptions: { budget: serviceBudgetCircuit },
+      });
+    } catch (error) {
+      log.error(
+        { err: error as Error, runId: record.runId, woId: record.woId },
+        'overseer.judge_first.record_failed_isolated'
+      );
+    }
     return;
   }
   if (record.action === 'success' || record.action === 'ignore') {
