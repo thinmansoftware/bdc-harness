@@ -11,7 +11,10 @@ mock.module('./connection', () => ({
 }));
 
 import {
+  claimOverseerVerdict,
+  finalizeOverseerVerdict,
   getOverseerActionsForRun,
+  getOverseerVerdictsForRun,
   hasReconcileActionForPr,
   insertOverseerAction,
   insertReconcileAction,
@@ -95,6 +98,103 @@ describe('overseer db', () => {
     expect(actions).toHaveLength(1);
     expect(actions[0].action).toBe('merge_ready');
     expect(await listRunsForOverseerWatch()).toHaveLength(0);
+  });
+
+  // Regression (2026-07-30, PRODUCTION OUTAGE): finalizeOverseerVerdict used
+  // `UPDATE ... RETURNING *`. Postgres supports it; the SQLite adapter rejects it,
+  // and production runs SQLite. The throw escaped watchLoop and runOverseerService
+  // aborted every task -- the watcher died 12 seconds after the judge-first flip and
+  // stayed dead 28 hours while runs went terminal unseen. The judge-first unit tests
+  // injected a fake verdict store, so 540 green tests never executed this SQL. These
+  // tests run the REAL query against the REAL adapter.
+  test('claims and finalizes a verdict against the real SQLite adapter', async () => {
+    await seedRun('run-verdict', 'completed');
+
+    const claim = await claimOverseerVerdict({
+      runId: 'run-verdict',
+      woId: 'WO-TEST-OVERSEER-01',
+      headSha: 'abc123',
+      hintAction: 'ignore',
+    });
+    expect(claim.claimed).toBe(true);
+    expect(claim.verdictId).toBeTruthy();
+
+    const finalized = await finalizeOverseerVerdict({
+      verdictId: claim.verdictId!,
+      status: 'verdict',
+      verdict: 'healthy',
+      confidence: 0.75,
+      model: 'grok',
+      modelRung: 0,
+      proposedAction: 'none',
+      proposedTier: 0,
+      requiredTier: 0,
+      effectiveTier: 0,
+      reason: 'run completed cleanly',
+      evidenceDigest: 'digest-1',
+    });
+    expect(finalized.status).toBe('verdict');
+    expect(finalized.verdict).toBe('healthy');
+    expect(finalized.confidence).toBe(0.75);
+
+    const rows = await getOverseerVerdictsForRun('run-verdict');
+    expect(rows).toHaveLength(1);
+    expect(rows[0].status).toBe('verdict');
+  });
+
+  test('claim is idempotent per (run_id, head_sha) -- replay never wins a second claim', async () => {
+    await seedRun('run-idem', 'completed');
+    const first = await claimOverseerVerdict({
+      runId: 'run-idem',
+      woId: 'WO-TEST-OVERSEER-01',
+      headSha: 'sha-1',
+    });
+    const second = await claimOverseerVerdict({
+      runId: 'run-idem',
+      woId: 'WO-TEST-OVERSEER-01',
+      headSha: 'sha-1',
+    });
+    expect(first.claimed).toBe(true);
+    expect(second.claimed).toBe(false);
+    expect(await getOverseerVerdictsForRun('run-idem')).toHaveLength(1);
+  });
+
+  // The retry path had the SAME RETURNING defect and would have killed the watcher
+  // the first time a health-alarm row was re-claimed.
+  test('re-claims a health-alarm row up to the retry cap, then refuses', async () => {
+    await seedRun('run-retry', 'failed');
+    const first = await claimOverseerVerdict({
+      runId: 'run-retry',
+      woId: 'WO-TEST-OVERSEER-01',
+      headSha: '',
+    });
+    await finalizeOverseerVerdict({
+      verdictId: first.verdictId!,
+      status: 'judge_unavailable',
+      reason: 'ladder dead',
+    });
+
+    const retry = await claimOverseerVerdict({
+      runId: 'run-retry',
+      woId: 'WO-TEST-OVERSEER-01',
+      headSha: '',
+      maxRetries: 1,
+    });
+    expect(retry.claimed).toBe(true);
+    expect(retry.retryCount).toBe(1);
+
+    await finalizeOverseerVerdict({
+      verdictId: retry.verdictId!,
+      status: 'judge_unavailable',
+      reason: 'ladder dead again',
+    });
+    const exhausted = await claimOverseerVerdict({
+      runId: 'run-retry',
+      woId: 'WO-TEST-OVERSEER-01',
+      headSha: '',
+      maxRetries: 1,
+    });
+    expect(exhausted.claimed).toBe(false);
   });
 
   // Regression (Arc B break (c), 2026-07-28): every seeded run in this suite carried
