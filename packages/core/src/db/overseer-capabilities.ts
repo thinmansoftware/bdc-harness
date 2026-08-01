@@ -84,6 +84,13 @@ export interface OpenOverseerCapabilityCircuitResult {
   readonly event: OverseerCapabilityEvent;
 }
 
+export type ResetOverseerCapabilityCircuitInput = OpenOverseerCapabilityCircuitInput;
+
+export interface ResetOverseerCapabilityCircuitResult {
+  readonly state: OverseerCapabilityState;
+  readonly event: OverseerCapabilityEvent;
+}
+
 interface CapabilityStateRow {
   readonly capability: string;
   readonly action_enabled: boolean | number | string;
@@ -349,6 +356,43 @@ export async function openOverseerCapabilityCircuit(
         ...input,
         capability,
         event_type: 'circuit_opened',
+      },
+      now
+    );
+    const state = await selectState(query, capability);
+    if (!state) throw new Error(`overseer_capability_state_missing:${capability}`);
+    return { state, event };
+  });
+}
+
+export async function resetOverseerCapabilityCircuit(
+  input: ResetOverseerCapabilityCircuitInput
+): Promise<ResetOverseerCapabilityCircuitResult> {
+  const capability = requireCapability(input.capability);
+  requireDigest('policy_digest', input.policy_digest);
+  requireDigest('verifier_registry_digest', input.verifier_registry_digest);
+
+  const db = getDatabase();
+  return db.withTransaction(async query => {
+    const now = await txNow(query);
+    const updated = await query(
+      `UPDATE overseer_capability_state
+       SET action_enabled = TRUE, circuit_state = 'closed', circuit_reason = NULL,
+           circuit_opened_at = NULL, policy_digest = $1, verifier_registry_digest = $2,
+           updated_at = $3, updated_by = $4
+       WHERE capability = $5`,
+      [input.policy_digest, input.verifier_registry_digest, now, input.actor, capability]
+    );
+    if (updated.rowCount !== 1) {
+      throw new Error(`overseer_capability_state_missing:${capability}`);
+    }
+
+    const event = await appendEventWithQuery(
+      query,
+      {
+        ...input,
+        capability,
+        event_type: 'circuit_reset',
       },
       now
     );

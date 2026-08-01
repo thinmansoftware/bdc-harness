@@ -18,6 +18,7 @@ import {
   listOverseerCapabilityStates,
   normalizeOverseerCapabilityTimestamp,
   openOverseerCapabilityCircuit,
+  resetOverseerCapabilityCircuit,
 } from './overseer-capabilities';
 
 const POLICY_DIGEST = 'a'.repeat(64);
@@ -435,6 +436,70 @@ describe('overseer capability persistence (sqlite)', () => {
     expect(await listOverseerCapabilityEvents('merge')).toHaveLength(0);
   });
 
+  test('reset enables a disabled closed capability and appends its circuit_reset event', async () => {
+    const reset = await resetOverseerCapabilityCircuit({
+      event_id: 'reset-merge-1',
+      capability: 'merge',
+      reason: 'john-activation',
+      actor: 'xo-activation',
+      correlation_id: 'corr-enable-1',
+      policy_digest: POLICY_DIGEST,
+      verifier_registry_digest: VERIFIER_DIGEST,
+      details: { source: 'unit-test' },
+    });
+
+    expect(reset.state.action_enabled).toBe(true);
+    expect(reset.state.circuit_state).toBe('closed');
+    expect(reset.state.circuit_reason).toBeNull();
+    expect(reset.state.circuit_opened_at).toBeNull();
+    expect(reset.state.updated_by).toBe('xo-activation');
+    expect(reset.event.event_type).toBe('circuit_reset');
+    expect(reset.event.capability).toBe('merge');
+    expect(reset.event.reason).toBe('john-activation');
+
+    const mergeEvents = await listOverseerCapabilityEvents('merge');
+    expect(mergeEvents).toHaveLength(1);
+    expect(mergeEvents[0]?.event_id).toBe('reset-merge-1');
+
+    const states = await listOverseerCapabilityStates();
+    expect(
+      states
+        .filter(state => state.capability !== 'merge')
+        .every(state => state.action_enabled === false && state.circuit_state === 'closed')
+    ).toBe(true);
+  });
+
+  test('reset closes an open repair circuit and clears circuit metadata', async () => {
+    await openOverseerCapabilityCircuit({
+      event_id: 'open-repair-before-reset',
+      capability: 'repair',
+      reason: 'verifier-failure',
+      actor: 'verifier',
+      correlation_id: 'corr-open-repair',
+      policy_digest: POLICY_DIGEST,
+      verifier_registry_digest: VERIFIER_DIGEST,
+    });
+
+    const reset = await resetOverseerCapabilityCircuit({
+      event_id: 'reset-repair-1',
+      capability: 'repair',
+      reason: 'john-activation',
+      actor: 'xo-activation',
+      correlation_id: 'corr-reset-repair',
+      policy_digest: POLICY_DIGEST,
+      verifier_registry_digest: VERIFIER_DIGEST,
+    });
+
+    expect(reset.state.action_enabled).toBe(true);
+    expect(reset.state.circuit_state).toBe('closed');
+    expect(reset.state.circuit_reason).toBeNull();
+    expect(reset.state.circuit_opened_at).toBeNull();
+    expect(reset.event.event_type).toBe('circuit_reset');
+
+    const events = await listOverseerCapabilityEvents('repair');
+    expect(events.map(event => event.event_type)).toEqual(['circuit_opened', 'circuit_reset']);
+  });
+
   test('rolls back circuit state when its event append fails', async () => {
     await appendOverseerCapabilityEvent(eventInput({ event_id: 'duplicate-event' }));
 
@@ -454,6 +519,26 @@ describe('overseer capability persistence (sqlite)', () => {
     expect(state?.circuit_state).toBe('closed');
     expect(state?.circuit_reason).toBeNull();
     expect(state?.updated_by).toBe('migration-034');
+    expect(await listOverseerCapabilityEvents('merge')).toHaveLength(1);
+  });
+
+  test('rolls back reset state when its event append fails', async () => {
+    await appendOverseerCapabilityEvent(eventInput({ event_id: 'duplicate-reset-event' }));
+    const before = await getOverseerCapabilityState('merge');
+
+    await expect(
+      resetOverseerCapabilityCircuit({
+        event_id: 'duplicate-reset-event',
+        capability: 'merge',
+        reason: 'must-roll-back',
+        actor: 'test-operator',
+        correlation_id: 'corr-reset-fail',
+        policy_digest: POLICY_DIGEST,
+        verifier_registry_digest: VERIFIER_DIGEST,
+      })
+    ).rejects.toThrow();
+
+    expect(await getOverseerCapabilityState('merge')).toEqual(before);
     expect(await listOverseerCapabilityEvents('merge')).toHaveLength(1);
   });
 
@@ -478,8 +563,29 @@ describe('overseer capability persistence (sqlite)', () => {
         verifier_registry_digest: 'short',
       })
     ).rejects.toThrow(/verifier_registry_digest.*64-hex/i);
+    await expect(
+      resetOverseerCapabilityCircuit({
+        capability: 'unknown',
+        reason: 'bad-capability',
+        actor: 'test-operator',
+        correlation_id: 'corr-reset-bad-capability',
+        policy_digest: POLICY_DIGEST,
+        verifier_registry_digest: VERIFIER_DIGEST,
+      })
+    ).rejects.toThrow(/unknown.*capability/i);
+    await expect(
+      resetOverseerCapabilityCircuit({
+        capability: 'merge',
+        reason: 'bad-digest',
+        actor: 'test-operator',
+        correlation_id: 'corr-reset-bad-digest',
+        policy_digest: POLICY_DIGEST,
+        verifier_registry_digest: 'short',
+      })
+    ).rejects.toThrow(/verifier_registry_digest.*64-hex/i);
 
     expect(await listOverseerCapabilityEvents('merge')).toHaveLength(0);
     expect((await getOverseerCapabilityState('merge'))?.circuit_state).toBe('closed');
+    expect((await getOverseerCapabilityState('merge'))?.action_enabled).toBe(false);
   });
 });
