@@ -270,6 +270,10 @@ import {
   operatorCardParamsSchema,
   operatorCardResponseSchema,
 } from './schemas/overseer-briefing.schemas';
+import {
+  providerAttemptsQuerySchema,
+  providerAttemptsResponseSchema,
+} from './schemas/provider-attempts.schemas';
 import { getProviderInfoList, isRegisteredProvider } from '@archon/providers';
 import { claudeProviderThrottle } from '@archon/providers/claude/throttle';
 import { buildProductionCanarySnapshot } from '../services/canary-snapshot';
@@ -1994,6 +1998,26 @@ const getHostMetricsRoute = createRoute({
       },
       description: 'Host metrics snapshot, stale flag, or no-data placeholder',
     },
+  },
+});
+
+const listProviderAttemptsRoute = createRoute({
+  method: 'get',
+  path: '/api/dashboard/provider-attempts',
+  tags: ['Dashboard'],
+  summary: 'Read-only feed of provider-attempt outcomes for engine reliability',
+  request: { query: providerAttemptsQuerySchema },
+  responses: {
+    200: {
+      content: {
+        'application/json': {
+          schema: providerAttemptsResponseSchema.openapi('ProviderAttemptsResponse'),
+        },
+      },
+      description: 'Raw provider-attempt rows (no server-side aggregation)',
+    },
+    401: jsonError('Missing or invalid operator token'),
+    500: jsonError('Server error'),
   },
 });
 
@@ -4019,6 +4043,22 @@ export function registerApiRoutes(
       if (isBoardPrincipalAuthError(error)) return apiError(c, 401, (error as Error).message);
       getLog().error({ err: error }, 'operator_card_get_failed');
       return apiError(c, 500, 'Failed to read operator card');
+    }
+  });
+
+  // GET /api/dashboard/provider-attempts -- read-only reliability feed.
+  // Auth is covered by the global /api/* operator-token middleware above;
+  // no per-route auth code needed. Returns raw rows; the cockpit aggregates.
+  registerOpenApiRoute(listProviderAttemptsRoute, async c => {
+    try {
+      const since = c.req.query('since') || undefined;
+      const limitRaw = c.req.query('limit');
+      const limit = limitRaw ? Number(limitRaw) : undefined;
+      const items = await workflowDb.listProviderAttemptsFeed({ since, limit });
+      return c.json({ items });
+    } catch (error) {
+      getLog().error({ err: error }, 'provider_attempts_feed_failed');
+      return apiError(c, 500, 'Failed to list provider attempts');
     }
   });
 

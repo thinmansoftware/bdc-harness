@@ -1221,6 +1221,69 @@ export async function listProviderAttempts(
   return result.rows.map(normalizeProviderAttempt);
 }
 
+interface ProviderAttemptFeedRow {
+  provider: string;
+  model: string;
+  outcome_class: string | null;
+  reason_code: string | null;
+  started_at: DbTimestamp;
+  completed_at: DbTimestamp | null;
+  served_model_id: string | null;
+}
+
+export interface ProviderAttemptFeedEntry {
+  provider: string;
+  model: string;
+  outcome_class: string | null;
+  reason_code: string | null;
+  started_at: string;
+  completed_at: string | null;
+  served_model_id: string | null;
+}
+
+// Default/max row counts for the read-only provider-attempts dashboard feed.
+// Kept in sync with the request-schema bounds in
+// packages/server/src/routes/schemas/provider-attempts.schemas.ts.
+const PROVIDER_ATTEMPTS_FEED_DEFAULT_LIMIT = 200;
+const PROVIDER_ATTEMPTS_FEED_MAX_LIMIT = 1000;
+
+/**
+ * Read-only feed of provider attempts for the reliability dashboard
+ * (bdc-xo#1312). Returns RAW rows (no aggregation) ordered newest-first; the
+ * cockpit aggregates downstream. Rows with a NULL outcome_class are
+ * intentionally NOT filtered -- they are real attempts and dropping them would
+ * silently under-count the dashboard.
+ */
+export async function listProviderAttemptsFeed(opts: {
+  since?: string;
+  limit?: number;
+}): Promise<ProviderAttemptFeedEntry[]> {
+  const requested = opts.limit ?? PROVIDER_ATTEMPTS_FEED_DEFAULT_LIMIT;
+  const limit = Math.max(1, Math.min(requested, PROVIDER_ATTEMPTS_FEED_MAX_LIMIT));
+  const columns =
+    'provider, model, outcome_class, reason_code, started_at, completed_at, served_model_id';
+  const result = opts.since
+    ? await pool.query<ProviderAttemptFeedRow>(
+        `SELECT ${columns} FROM remote_agent_provider_attempts
+         WHERE started_at >= $1 ORDER BY started_at DESC LIMIT $2`,
+        [opts.since, limit]
+      )
+    : await pool.query<ProviderAttemptFeedRow>(
+        `SELECT ${columns} FROM remote_agent_provider_attempts
+         ORDER BY started_at DESC LIMIT $1`,
+        [limit]
+      );
+  return result.rows.map(row => ({
+    provider: row.provider,
+    model: row.model,
+    outcome_class: row.outcome_class,
+    reason_code: row.reason_code,
+    started_at: normalizeTimestamp(row.started_at),
+    completed_at: normalizeNullableTimestamp(row.completed_at),
+    served_model_id: row.served_model_id,
+  }));
+}
+
 export async function upsertRunOutcome(
   runId: string,
   outcome: RunOutcome,
