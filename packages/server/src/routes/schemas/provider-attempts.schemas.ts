@@ -11,7 +11,18 @@ export const PROVIDER_ATTEMPTS_MAX_LIMIT = 1000;
 
 export const providerAttemptsQuerySchema = z.object({
   since: z.string().optional(),
-  limit: z.coerce.number().int().min(1).max(PROVIDER_ATTEMPTS_MAX_LIMIT).optional(),
+  // Oversized positive integers are CLAMPED to the max, not rejected. The
+  // cockpit is a read-only dashboard; a caller asking for more rows than the
+  // cap gets the cap (the DB layer clamps identically as defense-in-depth),
+  // never a 400. Only non-positive / non-integer values are rejected.
+  limit: z.coerce
+    .number()
+    .int()
+    .min(1)
+    .optional()
+    .transform(value =>
+      value === undefined ? undefined : Math.min(value, PROVIDER_ATTEMPTS_MAX_LIMIT)
+    ),
 });
 
 // One raw row from remote_agent_provider_attempts. Field names are snake_case

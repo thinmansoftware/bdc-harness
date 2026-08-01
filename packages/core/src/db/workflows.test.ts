@@ -68,6 +68,7 @@ import {
   createProviderAttempt,
   completeProviderAttempt,
   listProviderAttempts,
+  listProviderAttemptsFeed,
   upsertRunOutcome,
   getRunOutcome,
   scheduleProviderWait,
@@ -1045,6 +1046,85 @@ describe('workflows database', () => {
       await expect(sumWorkflowTokensInWindow({ sinceMs: Date.now() - 1000 })).rejects.toThrow(
         'Failed to sum workflow tokens in window: Connection lost'
       );
+    });
+  });
+
+  describe('listProviderAttemptsFeed', () => {
+    // A raw table row as remote_agent_provider_attempts would return it. ISO
+    // string timestamps pass through normalizeTimestamp unchanged.
+    const feedRow = (overrides: Record<string, unknown> = {}) => ({
+      provider: 'claude',
+      model: 'sonnet',
+      outcome_class: 'success',
+      reason_code: 'execution_completed',
+      started_at: '2026-08-01T12:00:00.000Z',
+      completed_at: '2026-08-01T12:01:00.000Z',
+      served_model_id: 'claude-sonnet-4-5',
+      ...overrides,
+    });
+
+    test('binds the default limit (200) and omits a WHERE clause when since is absent', async () => {
+      mockQuery.mockResolvedValueOnce(createQueryResult([feedRow()]));
+
+      await listProviderAttemptsFeed({});
+
+      const [query, params] = mockQuery.mock.calls[0] as [string, unknown[]];
+      // No since -> no filter, LIMIT is the only bound parameter ($1).
+      expect(query).not.toContain('WHERE');
+      expect(query).toContain('ORDER BY started_at DESC');
+      expect(query).toContain('LIMIT $1');
+      expect(params).toEqual([200]);
+    });
+
+    test('filters by since with started_at >= $1 and binds [since, limit]', async () => {
+      mockQuery.mockResolvedValueOnce(createQueryResult([feedRow()]));
+
+      const since = '2026-07-01T00:00:00.000Z';
+      await listProviderAttemptsFeed({ since, limit: 50 });
+
+      const [query, params] = mockQuery.mock.calls[0] as [string, unknown[]];
+      expect(query).toContain('WHERE started_at >= $1');
+      expect(query).toContain('ORDER BY started_at DESC');
+      expect(query).toContain('LIMIT $2');
+      // since is the first bound param, clamped limit the second.
+      expect(params).toEqual([since, 50]);
+    });
+
+    test('clamps an oversized limit down to the max (1000) before binding', async () => {
+      mockQuery.mockResolvedValueOnce(createQueryResult([feedRow()]));
+
+      await listProviderAttemptsFeed({ limit: 999999 });
+
+      const [, params] = mockQuery.mock.calls[0] as [string, unknown[]];
+      expect(params).toEqual([1000]);
+    });
+
+    test('clamps a non-positive limit up to 1 before binding', async () => {
+      mockQuery.mockResolvedValueOnce(createQueryResult([feedRow()]));
+
+      await listProviderAttemptsFeed({ limit: 0 });
+
+      const [, params] = mockQuery.mock.calls[0] as [string, unknown[]];
+      expect(params).toEqual([1]);
+    });
+
+    test('returns rows with a NULL outcome_class instead of filtering them out', async () => {
+      mockQuery.mockResolvedValueOnce(
+        createQueryResult([
+          feedRow({ outcome_class: null, reason_code: null, completed_at: null }),
+          feedRow({ outcome_class: 'success' }),
+        ])
+      );
+
+      const rows = await listProviderAttemptsFeed({});
+
+      expect(rows.length).toBe(2);
+      const nullRow = rows.find(r => r.outcome_class === null);
+      expect(nullRow).toBeDefined();
+      expect(nullRow!.reason_code).toBeNull();
+      expect(nullRow!.completed_at).toBeNull();
+      // Non-null timestamp passes through unchanged.
+      expect(nullRow!.started_at).toBe('2026-08-01T12:00:00.000Z');
     });
   });
 
