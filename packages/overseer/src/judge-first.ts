@@ -216,8 +216,11 @@ export function buildJudgePrompt(envelope: JudgeEvidenceEnvelope): string {
     '{"verdict":"healthy|merge_candidate|failed_genuine|duplicate_work|needs_human|observe",',
     ' "confidence":0.0-1.0,',
     ' "proposed_action":"verdict_write|comment_findings|flag_merge_ready|escalate_with_evidence|none",',
-    ' "proposed_tier":0,',
     ' "reason":"one or two sentences citing the load-bearing evidence"}',
+    '',
+    'Do NOT emit an authority tier. Every action in the list above is a notify-class',
+    'action that requires no elevated authority, and the code assigns the required tier',
+    'independently. Judge WHAT is true; the tier is not yours to set.',
     '',
     'Guidance: merge_candidate ONLY when a green, open, mergeable PR exists for this',
     'run; failed_genuine when the run failed and no salvageable work exists;',
@@ -299,11 +302,19 @@ export function parseJudgeOutput(stdout: string): ParsedJudgeVerdict | null {
   const confidence = obj.confidence;
   if (typeof confidence !== 'number' || confidence < 0 || confidence > 1) return null;
   const proposedAction = typeof obj.proposed_action === 'string' ? obj.proposed_action : 'none';
-  const proposedTierRaw = obj.proposed_tier;
-  const proposedTier =
-    typeof proposedTierRaw === 'number' && Number.isInteger(proposedTierRaw) && proposedTierRaw >= 0
-      ? proposedTierRaw
-      : 0;
+  // The model is no longer asked for a tier, and any tier it volunteers is IGNORED.
+  //
+  // Live evidence 2026-07-31: of 194 verdicts, 80 proposed tier 1 and 8 proposed tier 2
+  // on notify-class actions, and stricter-of-two correctly refused 88 Tier 0 actions --
+  // including all 27 flag_merge_ready on 47 real merge candidates. The tier law was
+  // right; asking a model "how sensitive is this?" and then treating the answer as an
+  // authority floor was not. Direction of the failure was safe (inflation can only
+  // suppress, never widen), but it silently suppressed correct action.
+  //
+  // Code owns the floor via requiredTierForAction, which still fails closed to MAX_TIER
+  // for unknown action kinds -- so dropping this field cannot widen authority. M-99
+  // binding term 4's "stricter wins" is preserved with the model's side pinned at 0.
+  const proposedTier = 0;
   const reason = typeof obj.reason === 'string' ? obj.reason : '';
   return { verdict: verdict as SemanticVerdict, confidence, proposedAction, proposedTier, reason };
 }

@@ -12,6 +12,7 @@ import { describe, expect, test } from 'bun:test';
 import {
   JudgeBudgetCircuit,
   buildEvidenceEnvelope,
+  buildJudgePrompt,
   judgeTerminalRun,
   parseJudgeOutput,
   type JudgeOutcome,
@@ -190,6 +191,36 @@ describe('parseJudgeOutput: strict structured parsing', () => {
     );
     expect(parsed?.verdict).toBe('needs_human');
     expect(parsed?.reason).toContain('literal }');
+  });
+
+  // Regression (2026-07-31, live): the model self-assigned proposed_tier 1 or 2 on
+  // notify-class actions (80 of 194 verdicts at tier 1, 8 at tier 2). Stricter-of-two
+  // then correctly refused 88 Tier 0 actions -- including ALL 27 flag_merge_ready on
+  // 47 genuine merge candidates. The tier law was right; soliciting a tier from the
+  // model and treating it as an authority floor was not. Any volunteered tier is now
+  // ignored; code owns the floor.
+  test('ignores a model-volunteered tier so it cannot suppress a Tier 0 action', () => {
+    const parsed = parseJudgeOutput(
+      '{"verdict":"merge_candidate","confidence":0.75,"proposed_action":"flag_merge_ready","proposed_tier":1,"reason":"green mergeable PR"}'
+    );
+    expect(parsed?.proposedAction).toBe('flag_merge_ready');
+    expect(parsed?.proposedTier).toBe(0);
+    expect(ruleOnAction(parsed!.proposedAction, parsed!.proposedTier).executableInV1).toBe(true);
+  });
+
+  test('an inflated tier cannot widen authority either -- merge still refused', () => {
+    const parsed = parseJudgeOutput(
+      '{"verdict":"merge_candidate","confidence":0.9,"proposed_action":"merge","proposed_tier":0,"reason":"looks fine"}'
+    );
+    const ruling = ruleOnAction(parsed!.proposedAction, parsed!.proposedTier);
+    expect(ruling.requiredTier).toBeGreaterThanOrEqual(1);
+    expect(ruling.executableInV1).toBe(false);
+  });
+
+  test('the prompt no longer solicits a tier', () => {
+    const prompt = buildJudgePrompt(buildEvidenceEnvelope(makeRecord(), []));
+    expect(prompt).not.toContain('"proposed_tier"');
+    expect(prompt).toContain('Do NOT emit an authority tier');
   });
 
   test('rejects non-JSON, unknown verdicts, and out-of-range confidence', () => {
