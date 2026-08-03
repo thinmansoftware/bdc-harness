@@ -1133,9 +1133,38 @@ nodes:
         echo "ERROR: diff-review-final not satisfied despite PROCEED status -- refusing commit (defense in depth)." >&2
         exit 1
       fi
-      BRANCH=$(printf '%s\n' "$DECIDE_OUTPUT" | sed -n 's/^push_target: feature-branch://p' | head -n 1)
+      # WO-HARNESS-PUSH-TARGET-EXTRACTION-HARDENING-01: tolerant multi-strategy
+      # push_target extraction. The old line-anchored sed broke a 2nd time
+      # (run e5110df1, fable tier, 2026-08-01) after PR #165's first whitespace
+      # patch -- the ^...$ anchor requires the WHOLE line to be exactly
+      # "push_target: feature-branch: <token>", so any markdown fence, list
+      # bullet, blockquote, backtick, or trailing prose a model tier adds makes
+      # BRANCH come back empty and the node exit 1 with a message that lied
+      # ("absent" when the field was present but merely styled differently).
+      # Fix: pre-strip backticks, then (1) fast path -- the exact
+      # whitespace-tolerant anchor (unchanged behavior for well-formed output,
+      # zero regression); (2) fallback -- scan ANYWHERE for
+      # "push_target: feature-branch: <token>", stopping at the first whitespace
+      # so trailing prose is tolerated. Failure now distinguishes "field absent"
+      # from "field present but unparseable". Extraction is a pure read of the
+      # decide output (no state mutation), so re-running the node is
+      # side-effect-free. BRANCH_PATTERN validation below is unchanged and still
+      # runs after extraction.
+      DECIDE_OUTPUT_CLEAN=$(printf '%s\n' "$DECIDE_OUTPUT" | tr -d '`')
+      BRANCH=$(printf '%s\n' "$DECIDE_OUTPUT_CLEAN" | sed -n 's/^[[:space:]]*push_target:[[:space:]]*feature-branch:[[:space:]]*\([^[:space:]]*\)[[:space:]]*$/\1/p' | head -n 1)
       if [ -z "$BRANCH" ]; then
-        echo "No feature branch target found in decide-push-target output." >&2
+        BRANCH=$(printf '%s\n' "$DECIDE_OUTPUT_CLEAN" \
+          | { grep -oE 'push_target:[[:space:]]*feature-branch:[[:space:]]*[^[:space:]]+' || true; } \
+          | head -n 1 \
+          | sed -E 's/^.*feature-branch:[[:space:]]*//')
+      fi
+      if [ -z "$BRANCH" ]; then
+        if printf '%s\n' "$DECIDE_OUTPUT_CLEAN" | grep -q 'push_target'; then
+          PUSH_TARGET_EXCERPT=$(printf '%s\n' "$DECIDE_OUTPUT_CLEAN" | grep 'push_target' | head -n 1 | cut -c1-200)
+          echo "push_target field present but unparseable: ${PUSH_TARGET_EXCERPT}" >&2
+        else
+          echo "push_target field absent from decide-push-target output." >&2
+        fi
         exit 1
       fi
       BRANCH_PATTERN='^(feat/[A-Za-z0-9_-]+|fix/[A-Za-z0-9_-]+|wip/[A-Za-z0-9_-]+)$'
