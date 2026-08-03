@@ -521,6 +521,55 @@ export async function postResult(data: {
   return getMessage(data.id);
 }
 
+/**
+ * Extends the lease on a claimed message without changing its fencing token.
+ *
+ * WO-HARNESS-ACP-DISPATCH-SLICE-01 (M-118 ruling order 4): lease renewal is a
+ * mandatory acceptance criterion. Before this, a lease was set once at claim
+ * time and never extended, so any agent run longer than the lease duration
+ * became silently reclaimable by another worker while still executing.
+ *
+ * Guards are deliberately identical to postResult: only the current lease
+ * owner, holding the current fencing token, on a message still in 'claimed',
+ * may renew. The fencing token is NOT incremented -- renewal is not a new
+ * claim, and bumping it would invalidate the caller's own in-flight token.
+ */
+export async function renewMessageLease(data: {
+  id: string;
+  worker_id: string;
+  fencing_token: number;
+  leaseDurationMs?: number;
+}): Promise<DispatchMessage | null> {
+  const db = getDatabase();
+  const leaseExpiresAt = addMillisecondsIso(data.leaseDurationMs ?? DEFAULT_LEASE_DURATION_MS);
+  if (db.dialect === 'postgres') {
+    const result = await db.query<DispatchMessageRow>(
+      `UPDATE agent_dispatch_messages
+       SET lease_expires_at = $4
+       WHERE id = $1
+         AND lease_owner = $2
+         AND fencing_token = $3
+         AND status = 'claimed'
+       RETURNING *`,
+      [data.id, data.worker_id, data.fencing_token, leaseExpiresAt]
+    );
+    const row = result.rows[0];
+    return row ? normalizeMessage(row) : null;
+  }
+
+  const result = await db.query(
+    `UPDATE agent_dispatch_messages
+     SET lease_expires_at = $4
+     WHERE id = $1
+       AND lease_owner = $2
+       AND fencing_token = $3
+       AND status = 'claimed'`,
+    [data.id, data.worker_id, data.fencing_token, leaseExpiresAt]
+  );
+  if (result.rowCount !== 1) return null;
+  return getMessage(data.id);
+}
+
 export async function cancelMessage(id: string): Promise<DispatchMessage | null> {
   const db = getDatabase();
   const now = nowIso();
