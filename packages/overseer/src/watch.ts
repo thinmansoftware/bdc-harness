@@ -1,5 +1,6 @@
 import type { WorkflowRunStatus } from '@archon/workflows/schemas/workflow-run';
 import { TERMINAL_WORKFLOW_STATUSES } from '@archon/workflows/schemas/workflow-run';
+import { createLogger } from '@archon/paths';
 import { classifyError } from './classify';
 import { decide } from './decide';
 import { isPrMergeReady, isPrGreen, judgePullRequest } from './judge-pr';
@@ -11,6 +12,8 @@ import type {
   PullRequestEvidence,
   WatchedRunRecord,
 } from './types.ts';
+
+const log = createLogger('overseer/watch');
 
 export const DEFAULT_WATCH_INTERVAL_MS = 60_000;
 
@@ -240,7 +243,20 @@ export async function watchOnce(
   const terminalRuns = runs.filter(run => isTerminalStatus(run.status));
   const outcomes: WatchedRunRecord[] = [];
   for (const run of terminalRuns) {
-    outcomes.push(await assessRun(run, deps));
+    // Per-run isolation (bdc-xo#1366): assessRun calls out to GitHub (judgePullRequest)
+    // and that call can throw (timeout, HttpError) instead of returning evidence. Before
+    // this try/catch, that exception propagated out of watchOnce, out of watchLoop's
+    // for(;;) body, and killed the entire watcher for every other run in the batch and
+    // every future tick -- exactly the failure class #1348 already fixed one level
+    // downstream in handleRecord. One bad run's lookup must never take down the watcher.
+    try {
+      outcomes.push(await assessRun(run, deps));
+    } catch (error) {
+      log.error(
+        { err: error as Error, runId: run.id, woId: run.woId },
+        'overseer.watch.assess_run_failed_isolated'
+      );
+    }
   }
   return outcomes;
 }
