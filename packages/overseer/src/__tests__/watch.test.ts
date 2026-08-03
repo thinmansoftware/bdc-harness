@@ -65,6 +65,63 @@ describe('watch', () => {
 });
 
 /**
+ * Per-run isolation (bdc-xo#1366).
+ *
+ * Anchor (2026-08-01 13:52:30 UTC): a GitHub search API call inside judgePullRequest
+ * threw an unhandled HttpError ("operation timed out"). Before this isolation, that
+ * exception propagated out of watchOnce's loop, out of watchLoop's for(;;) body, and
+ * killed the entire watcher process -- overseer_verdicts saw zero new rows for 62+
+ * hours until a human found it and manually restarted the container. This is the same
+ * defect class #1348 already fixed one level downstream in handleRecord (a bad
+ * verdict-store query killed the watcher for 28 hours on 2026-07-30); this closes the
+ * matching gap one level upstream, in the run-assessment step itself.
+ */
+describe('watch -- per-run exception isolation', () => {
+  test('one run whose PR lookup throws does not stop the rest of the batch from being assessed', async () => {
+    // findPullRequest doesn't receive the run id directly, so the throw is keyed on
+    // call order: first call (run-throws) rejects, second call (run-ok) succeeds.
+    let call = 0;
+    const deps: OverseerRunStoreDeps & GitHubClientDeps = {
+      listRunsForWatch: async () => [
+        {
+          id: 'run-throws',
+          woId: 'WO-THROWS-01',
+          owner: 'bluedevilcollectibles',
+          repo: 'bdc-harness',
+          status: 'failed',
+          headBranch: 'archon/thread-throws',
+        },
+        {
+          id: 'run-ok',
+          woId: 'WO-OK-01',
+          owner: 'bluedevilcollectibles',
+          repo: 'bdc-harness',
+          status: 'failed',
+          headBranch: 'archon/thread-ok',
+        },
+      ],
+      listRunEvents: async () => [],
+      findPullRequest: async () => {
+        call += 1;
+        if (call === 1) {
+          throw new Error('operation timed out');
+        }
+        return greenPr;
+      },
+      mergePullRequest: async () => ({ merged: true }),
+    };
+
+    const outcomes = await watchOnce(deps);
+
+    // The throwing run is dropped from the batch (logged, not returned); the healthy
+    // run right after it is still assessed normally -- the watcher survives.
+    expect(outcomes).toHaveLength(1);
+    expect(outcomes[0]?.runId).toBe('run-ok');
+    expect(outcomes[0]?.action).toBe('merge_ready');
+  });
+});
+
+/**
  * Salvage of CANCELLED runs.
  *
  * The conductor cancels a run on stall/runaway and then EXITS -- it is a CLI
