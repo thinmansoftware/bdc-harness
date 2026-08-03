@@ -9,11 +9,12 @@
 # Test matrix:
 #   Tests 1-9  -> push_target extraction (hardened tolerant contract):
 #                   1  regression: well-formed single line (unchanged behavior)
-#                   2  real run e5110df1 shape (fable tier, 2026-08-01)
-#                   3  fenced + indented (the failure CLASS run e5110df1 hit)
-#                   4  list bullet / blockquote decoration
-#                   5  trailing prose on the same line
-#                   6  inline backtick-wrapped token
+#                   2  REAL run e5110df1 event-store payload -- zero-regression
+#                      (parses under BOTH old and new; see EVIDENCE NOTE at Test 2)
+#                   3  fenced + indented -- PR #165 tolerance preserved (both pass)
+#                   4  list bullet          -- DISCRIMINATOR (old empty, new ok)
+#                   5  trailing prose       -- DISCRIMINATOR (old empty, new ok)
+#                   6  inline backticks     -- DISCRIMINATOR (old corrupt, new ok)
 #                   7  genuine absence -> "field absent" message, rc 1
 #                   8  present-but-unparseable -> distinct message, rc 1
 #                   9  idempotency: same input parses identically twice
@@ -70,38 +71,113 @@ extract_branch() {
   return 0
 }
 
+# ---------------------------------------------------------------------------
+# extract_branch_OLD -- the PRE-FIX extractor, lifted VERBATIM from the line this
+# WO removes. Verify with:
+#   git show 337be94e -- .archon/workflows/defaults/bdc-feature-development-fable.yaml
+# The removed line is:
+#   BRANCH=$(printf '%s\n' "$DECIDE_OUTPUT" | sed -n 's/^[[:space:]]*push_target:[[:space:]]*feature-branch:[[:space:]]*\([^[:space:]]*\)[[:space:]]*$/\1/p' | head -n 1)
+# NOTE: it is ALREADY leading-whitespace tolerant (PR #165 / Defect 1, landed in
+# the fable lane 2026-07-08 via ec0e3176 -- before run e5110df1 on 2026-08-01).
+# What it still cannot do: tolerate a non-whitespace line prefix (list bullet,
+# blockquote), tolerate trailing prose after the token (the $ anchor), or strip
+# backticks. Those three -- and ONLY those three -- are the genuine regressions
+# this WO fixes. Tests 4, 5 and 6 assert that discriminator.
+# ---------------------------------------------------------------------------
+extract_branch_OLD() {
+  local DECIDE_OUTPUT="$1"
+  printf '%s\n' "$DECIDE_OUTPUT" | sed -n 's/^[[:space:]]*push_target:[[:space:]]*feature-branch:[[:space:]]*\([^[:space:]]*\)[[:space:]]*$/\1/p' | head -n 1
+}
+
 # Test 1 -- regression: well-formed single line extracts unchanged
 BRANCH=$(extract_branch "push_target: feature-branch: feat/wo-clean-01")
 if [ "$BRANCH" = "feat/wo-clean-01" ]; then _ok "Test 1: well-formed -> feat/wo-clean-01"; else _no "Test 1: well-formed" "feat/wo-clean-01" "$BRANCH"; fi
 
-# Test 2 -- real run e5110df1 shape (fable tier: no space after feature-branch:,
-# push_target as first line of a multi-line YAML-ish block). Reconstructed from
-# the event store node_output for that run.
+# Test 2 -- ZERO-REGRESSION against run e5110df1's REAL decide-push-target output.
+# Fixture is the canonical event-store payload, copied verbatim from
+#   /.archon/workspaces/bluedevilcollectibles/shopops/logs/e5110df1277ec6a9b899468f8e030b76.jsonl
+# (the sole assistant event whose content starts "push_target:", emitted between
+# node_start and node_complete for step decide-push-target). Only the prose tail
+# is ASCII-normalized (one em-dash -> "--") to satisfy Rule 13; the four
+# structured lines are byte-for-byte verbatim.
+#
+# EVIDENCE NOTE -- read before trusting any "e5110df1 proves tolerance" claim:
+# this real output parses CLEANLY under the pre-fix extractor (it is an
+# unindented, undecorated line, and the anchor already tolerated the missing
+# space after "feature-branch:"). So run e5110df1's "No feature branch target
+# found" failure was NOT caused by extractor whitespace/decoration intolerance,
+# and NO fixture can honestly be labelled "the e5110df1 shape the old extractor
+# could not parse." Its root cause lies upstream in what commit-and-push
+# received as $DECIDE_OUTPUT (see the artifact-mailbox change d90b2bbc,
+# 2026-07-28), not in this regex. This test therefore asserts the only thing the
+# real payload can prove: the hardened extractor does not regress on it.
 E5110_OUT=$(printf '%s\n' \
-  "push_target: feature-branch:feat/wo-shopops-pick-pull-pack-scan-wiring-01" \
-  "pr_required: true" \
-  "staging_gate_required: true" \
-  "repo: bluedevilcollectibles/shopops")
+  'push_target: feature-branch:feat/wo-shopops-pick-pull-pack-scan-wiring-01' \
+  'pr_required: true' \
+  'staging_gate_required: true' \
+  'repo: bluedevilcollectibles/shopops' \
+  '' \
+  'Derivation:' \
+  '- **Repo**: `target_repo: bluedevilcollectibles/shopops` (YAML field, priority 1) -- no origin fallback needed.' \
+  '- **Staging gate**: `bluedevilcollectibles/shopops` matches the hardcoded list -> `staging_gate_required: true`.')
+OLD_BRANCH=$(extract_branch_OLD "$E5110_OUT")
 BRANCH=$(extract_branch "$E5110_OUT")
-if [ "$BRANCH" = "feat/wo-shopops-pick-pull-pack-scan-wiring-01" ]; then _ok "Test 2: e5110df1 shape -> feat/wo-shopops-pick-pull-pack-scan-wiring-01"; else _no "Test 2: e5110df1 shape" "feat/wo-shopops-pick-pull-pack-scan-wiring-01" "$BRANCH"; fi
+if [ "$OLD_BRANCH" = "feat/wo-shopops-pick-pull-pack-scan-wiring-01" ] && [ "$BRANCH" = "feat/wo-shopops-pick-pull-pack-scan-wiring-01" ]; then
+  _ok "Test 2: real e5110df1 payload -- OLD and NEW both extract feat/wo-shopops-pick-pull-pack-scan-wiring-01 (zero regression; prose tail ignored)"
+else
+  _no "Test 2: real e5110df1 payload (zero regression)" "old=[feat/wo-shopops-pick-pull-pack-scan-wiring-01] new=[feat/wo-shopops-pick-pull-pack-scan-wiring-01]" "old=[$OLD_BRANCH] new=[$BRANCH]"
+fi
 
-# Test 3 -- fenced + indented (the decoration class run e5110df1's raw output hit;
-# the old ^...$ anchor returned empty here and mislabeled it "absent")
+# Test 3 -- fenced + indented. The pre-fix extractor ALREADY handled this (PR #165
+# made the anchor whitespace-tolerant), so this is a tolerance-preservation test,
+# NOT a discriminator. Assert both succeed so a future "simplification" that drops
+# leading-whitespace tolerance is caught.
 FENCED=$(printf '%s\n' '```text' '    push_target: feature-branch: feat/wo-foo-03' '```')
+OLD_BRANCH=$(extract_branch_OLD "$FENCED")
 BRANCH=$(extract_branch "$FENCED")
-if [ "$BRANCH" = "feat/wo-foo-03" ]; then _ok "Test 3: fenced+indented -> feat/wo-foo-03"; else _no "Test 3: fenced+indented" "feat/wo-foo-03" "$BRANCH"; fi
+if [ "$OLD_BRANCH" = "feat/wo-foo-03" ] && [ "$BRANCH" = "feat/wo-foo-03" ]; then
+  _ok "Test 3: fenced+indented -- OLD and NEW both extract feat/wo-foo-03 (PR #165 tolerance preserved)"
+else
+  _no "Test 3: fenced+indented (both succeed)" "old=[feat/wo-foo-03] new=[feat/wo-foo-03]" "old=[$OLD_BRANCH] new=[$BRANCH]"
+fi
 
-# Test 4 -- list bullet / blockquote decoration
-BRANCH=$(extract_branch "- push_target: feature-branch: fix/wo-bar-04")
-if [ "$BRANCH" = "fix/wo-bar-04" ]; then _ok "Test 4: bullet -> fix/wo-bar-04"; else _no "Test 4: bullet" "fix/wo-bar-04" "$BRANCH"; fi
+# Test 4 -- DISCRIMINATOR: list-bullet prefix. "^[[:space:]]*" cannot match the
+# "-" bullet, so the pre-fix extractor returns EMPTY and the node mislabels a
+# present field as "absent". The hardened fallback scan extracts it.
+BULLET="- push_target: feature-branch: fix/wo-bar-04"
+OLD_BRANCH=$(extract_branch_OLD "$BULLET")
+BRANCH=$(extract_branch "$BULLET")
+if [ -z "$OLD_BRANCH" ] && [ "$BRANCH" = "fix/wo-bar-04" ]; then
+  _ok "Test 4: bullet -- OLD fails (empty), NEW extracts fix/wo-bar-04"
+else
+  _no "Test 4: bullet (old fails empty, new succeeds)" "old=[] new=[fix/wo-bar-04]" "old=[$OLD_BRANCH] new=[$BRANCH]"
+fi
 
-# Test 5 -- trailing prose on the same line (token stops at first whitespace)
-BRANCH=$(extract_branch "push_target: feature-branch: feat/wo-baz-05 (chosen because X)")
-if [ "$BRANCH" = "feat/wo-baz-05" ]; then _ok "Test 5: trailing prose -> feat/wo-baz-05"; else _no "Test 5: trailing prose" "feat/wo-baz-05" "$BRANCH"; fi
+# Test 5 -- DISCRIMINATOR: trailing prose on the same line. The pre-fix "$" anchor
+# requires the token to end the line, so trailing prose returns EMPTY. The
+# hardened scan stops at the first whitespace and tolerates the prose.
+PROSE="push_target: feature-branch: feat/wo-baz-05 (chosen because X)"
+OLD_BRANCH=$(extract_branch_OLD "$PROSE")
+BRANCH=$(extract_branch "$PROSE")
+if [ -z "$OLD_BRANCH" ] && [ "$BRANCH" = "feat/wo-baz-05" ]; then
+  _ok "Test 5: trailing prose -- OLD fails (empty), NEW extracts feat/wo-baz-05"
+else
+  _no "Test 5: trailing prose (old fails empty, new succeeds)" "old=[] new=[feat/wo-baz-05]" "old=[$OLD_BRANCH] new=[$BRANCH]"
+fi
 
-# Test 6 -- inline backtick-wrapped token (backticks pre-stripped)
-BRANCH=$(extract_branch 'push_target: feature-branch: `wip/wo-qux-06`')
-if [ "$BRANCH" = "wip/wo-qux-06" ]; then _ok "Test 6: inline backticks -> wip/wo-qux-06"; else _no "Test 6: inline backticks" "wip/wo-qux-06" "$BRANCH"; fi
+# Test 6 -- DISCRIMINATOR: inline backtick-wrapped token. Distinct failure MODE --
+# the pre-fix extractor does not strip backticks, so it returns a NON-EMPTY but
+# corrupt token ("`wip/wo-qux-06`") that then fails BRANCH_PATTERN validation
+# downstream. The hardened extractor pre-strips backticks. Assert the old value is
+# corrupt (not merely different) so the regression cannot silently return.
+TICKS='push_target: feature-branch: `wip/wo-qux-06`'
+OLD_BRANCH=$(extract_branch_OLD "$TICKS")
+BRANCH=$(extract_branch "$TICKS")
+if [ "$OLD_BRANCH" != "wip/wo-qux-06" ] && case "$OLD_BRANCH" in *'`'*) true;; *) false;; esac && [ "$BRANCH" = "wip/wo-qux-06" ]; then
+  _ok "Test 6: inline backticks -- OLD returns corrupt [$OLD_BRANCH], NEW extracts wip/wo-qux-06"
+else
+  _no "Test 6: inline backticks (old corrupt w/ backticks, new clean)" "old=[\`wip/wo-qux-06\`] new=[wip/wo-qux-06]" "old=[$OLD_BRANCH] new=[$BRANCH]"
+fi
 
 # Test 7 -- genuine absence: field never appears -> "field absent" message, rc 1
 OUT=$(extract_branch "$(printf '%s\n' 'pr_required: true' 'repo: foo/bar')"); RC=$?
@@ -112,7 +188,8 @@ else
 fi
 
 # Test 8 -- present-but-unparseable: field appears but no valid token -> distinct
-# message, rc 1 (this is what run e5110df1 actually hit; old message lied)
+# message, rc 1. The old single message said "No feature branch target found"
+# for BOTH cases, so a present-but-styled field was reported as absent.
 OUT=$(extract_branch "$(printf '%s\n' 'push_target: not-feature-branch: weird' 'notes: could not decide')"); RC=$?
 if [ $RC -ne 0 ] && echo "$OUT" | grep -q "push_target field present but unparseable:"; then
   _ok "Test 8: present-but-unparseable -> distinct message + excerpt, rc 1"
