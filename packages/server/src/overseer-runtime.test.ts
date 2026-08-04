@@ -237,6 +237,43 @@ describe('overseer-runtime', () => {
     }
   });
 
+  test('blocking_reasons is an array naming every gate able to stop a merge', async () => {
+    // setDisabledEnv() (beforeEach): emergency stop engaged, all caps disabled.
+    listCapabilityStatesMock.mockImplementation(async () => []);
+    const status = await getStatus();
+    expect(Array.isArray(status.blocking_reasons)).toBe(true);
+    expect(status.blocking_reasons).toContain('emergency_stop_engaged');
+    for (const cap of ['escalation', 'repair', 'branch', 'lifecycle', 'merge']) {
+      expect(status.blocking_reasons).toContain(`${cap}_capability_disabled`);
+    }
+    // Invariant 2: the production-effect hard-hold is a standing, always-armed
+    // gate and MUST be discoverable here with merge-manager's exact reason string.
+    expect(status.blocking_reasons).toContain('production_effect_held_for_john');
+  });
+
+  test('blocking_reasons surfaces an open circuit as ${cap}_circuit_open', async () => {
+    process.env.OVERSEER_EMERGENCY_STOP = '0';
+    process.env.OVERSEER_MERGE_ACTIONS_ENABLED = 'true';
+    listCapabilityStatesMock.mockImplementation(async () => [
+      {
+        capability: 'merge',
+        action_enabled: true,
+        circuit_state: 'open',
+        circuit_reason: 'test',
+        circuit_opened_at: null,
+        policy_digest: '0'.repeat(64),
+        verifier_registry_digest: '0'.repeat(64),
+        updated_at: '',
+        updated_by: '',
+      },
+    ]);
+    const status = await getStatus();
+    expect(status.blocking_reasons).not.toContain('emergency_stop_engaged');
+    expect(status.blocking_reasons).not.toContain('merge_capability_disabled');
+    expect(status.blocking_reasons).toContain('merge_circuit_open');
+    expect(status.blocking_reasons).toContain('production_effect_held_for_john');
+  });
+
   test('fake adapter is selected when OVERSEER_USE_FAKE_GITHUB_ADAPTER is set', async () => {
     let resolveService!: () => void;
     runOverseerServiceMock.mockImplementation(

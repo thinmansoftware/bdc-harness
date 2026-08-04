@@ -4,13 +4,11 @@
  * All dependencies are injected -- no mock.module, no live database, no real
  * subprocess spawns. Covers the WO's Section 7 scenarios at the unit level:
  * mandatory verdict rows, fail-loud judge health, claim/replay idempotency,
- * stricter-of-two tier law, permit-free Tier 0 escalation, and the budget
- * circuit degrading loudly.
+ * stricter-of-two tier law, and permit-free Tier 0 escalation.
  */
 
 import { describe, expect, test } from 'bun:test';
 import {
-  JudgeBudgetCircuit,
   buildEvidenceEnvelope,
   buildJudgePrompt,
   judgeTerminalRun,
@@ -265,31 +263,6 @@ describe('judgeTerminalRun: model ladder + fail-loud health', () => {
       expect(outcome.model).toBe('strong');
       expect(outcome.modelRung).toBe(1);
     }
-  });
-
-  test('budget circuit exhaustion degrades loudly to evidence_unavailable (Test 7)', async () => {
-    const budget = new JudgeBudgetCircuit(0);
-    let spawned = 0;
-    const outcome = await judgeTerminalRun(envelope, {
-      ladder: ['grok'],
-      budget,
-      spawn: async () => {
-        spawned += 1;
-        return { exitCode: 0, stdout: '{}', timedOut: false };
-      },
-    });
-    expect(outcome.kind).toBe('evidence_unavailable');
-    if (outcome.kind !== 'verdict') expect(outcome.reason).toContain('budget');
-    expect(spawned).toBe(0);
-  });
-
-  test('budget circuit rolls over by day', () => {
-    let now = new Date('2026-07-28T23:59:00Z');
-    const budget = new JudgeBudgetCircuit(1, () => now);
-    expect(budget.tryConsume()).toBe(true);
-    expect(budget.tryConsume()).toBe(false);
-    now = new Date('2026-07-29T00:01:00Z');
-    expect(budget.tryConsume()).toBe(true);
   });
 });
 

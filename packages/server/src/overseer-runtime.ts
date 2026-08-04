@@ -13,6 +13,51 @@ interface OverseerRuntimeStatus {
   readonly emergency_stop: boolean;
   readonly capability_flags: Readonly<Record<string, boolean>>;
   readonly circuit_states: Readonly<Record<string, string>>;
+  /**
+   * Every gate currently able to stop a merge, named so a caller can discover
+   * it without a DB query (WO-HARNESS-OVERSEER-UNBURY-GATES-01). Computed
+   * per-request from live state -- not accumulated. See computeBlockingReasons.
+   */
+  readonly blocking_reasons: readonly string[];
+}
+
+/**
+ * Standing production-effect hard-hold reason (merge-manager.ts:306-318). This
+ * gate is UNCONDITIONAL code -- it is evaluated on every merge candidate and
+ * cannot be turned off -- so it is always "able to stop a merge" and is surfaced
+ * as a standing entry per WO Invariant 2 ("KEEP it; make it VISIBLE via
+ * blocking_reasons"). The string matches merge-manager's held reason exactly so
+ * the same reason a blocked candidate sees is discoverable on /api/health.
+ */
+const PRODUCTION_EFFECT_HARD_HOLD_REASON = 'production_effect_held_for_john';
+
+/**
+ * Derive the list of gates currently able to stop a merge from already-computed
+ * live state (env + persisted capability/circuit rows). No new DB query is
+ * issued -- this reads the same values getOverseerRuntimeStatus already loaded.
+ */
+function computeBlockingReasons(
+  emergencyStop: boolean,
+  capabilityFlags: Readonly<Record<string, boolean>>,
+  circuitStates: Readonly<Record<string, string>>
+): string[] {
+  const reasons: string[] = [];
+  if (emergencyStop) {
+    reasons.push('emergency_stop_engaged');
+  }
+  for (const [cap, enabled] of Object.entries(capabilityFlags)) {
+    if (!enabled) {
+      reasons.push(`${cap}_capability_disabled`);
+    }
+  }
+  for (const [cap, state] of Object.entries(circuitStates)) {
+    if (state === 'open') {
+      reasons.push(`${cap}_circuit_open`);
+    }
+  }
+  // The production-effect hard-hold is always armed -- see the constant above.
+  reasons.push(PRODUCTION_EFFECT_HARD_HOLD_REASON);
+  return reasons;
 }
 
 interface OverseerCapabilityRow {
@@ -176,11 +221,13 @@ export async function getOverseerRuntimeStatus(
     log.warn('overseer_runtime.capability_state_read_failed');
   }
 
+  const emergencyStop = readEmergencyStop();
   return {
     watcher: watcherState,
     adapter: adapterKind,
-    emergency_stop: readEmergencyStop(),
+    emergency_stop: emergencyStop,
     capability_flags: capabilityFlags,
     circuit_states: circuitStates,
+    blocking_reasons: computeBlockingReasons(emergencyStop, capabilityFlags, circuitStates),
   };
 }

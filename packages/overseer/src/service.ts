@@ -7,7 +7,6 @@ import {
   listRunsForOverseerWatch,
 } from '@archon/core/db/overseer';
 import { handleRecordJudgeFirst } from './judge-first-pipeline';
-import { JudgeBudgetCircuit } from './judge-first';
 import type { OverseerVerdictStoreDeps } from './types.ts';
 import { runAuthorizedEscalation } from './authorized-escalation';
 import { runEscalation } from './escalate';
@@ -110,7 +109,17 @@ export async function runReconcileScheduler(input: {
   const reconcile = input.reconcile ?? ((): Promise<unknown> => runReconcileOnce());
   for (;;) {
     if (input.signal?.aborted) return;
-    await reconcile();
+    // Reconcile failures MUST NOT abort the watcher. This scheduler shares the
+    // service's Promise.all/abortOnFailure with the watcher, so an uncaught
+    // throw here (e.g. a bare Octokit transport error in searchMergedPullRequests)
+    // would abort the coupled signal and kill the watcher. Root cause of the
+    // 2026-08-04 00:00:43Z watcher death. Catch, log loudly, and continue --
+    // reconcile is a best-effort backstop, never a watcher dependency.
+    try {
+      await reconcile();
+    } catch (error) {
+      log.error({ err: error as Error }, 'overseer.reconcile.scheduler_error_isolated');
+    }
     if (input.once || input.signal?.aborted) return;
     await waitForDeliveryInterval(input.intervalMs ?? 30_000, input.signal);
   }
@@ -159,9 +168,6 @@ const defaultVerdictStore: OverseerVerdictStoreDeps = {
   finalizeVerdict: finalizeOverseerVerdict,
 };
 
-/** One budget circuit per service process; injectable in tests via pipeline options. */
-const serviceBudgetCircuit = new JudgeBudgetCircuit();
-
 async function handleRecord(
   record: WatchedRunRecord,
   deps: OverseerRunStoreDeps & OverseerActionsDeps & GitHubClientDeps,
@@ -185,7 +191,6 @@ async function handleRecord(
         actor,
         mergeCoordinator,
         verdictStore: defaultVerdictStore,
-        judgeOptions: { budget: serviceBudgetCircuit },
       });
     } catch (error) {
       log.error(
@@ -305,7 +310,7 @@ async function handleRecord(
     runId: record.runId,
     woId: record.woId,
     class: record.errorClass,
-    action: escalation.accepted ? 'fake_escalation_attempt' : 'escalation_denied',
+    action: escalation.accepted ? 'escalation_attempt' : 'escalation_denied',
     result: operatorCardId
       ? `${escalation.reason}:operator_card:${operatorCardId}`
       : escalation.reason,
@@ -314,7 +319,7 @@ async function handleRecord(
     {
       runId: record.runId,
       woId: record.woId,
-      action: escalation.accepted ? 'fake_escalation_attempt' : 'escalation_denied',
+      action: escalation.accepted ? 'escalation_attempt' : 'escalation_denied',
       class: record.errorClass,
       reason: record.reason,
     },

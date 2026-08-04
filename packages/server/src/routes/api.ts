@@ -1954,6 +1954,7 @@ const getHealthRoute = createRoute({
                   emergency_stop: z.boolean(),
                   capability_flags: z.record(z.boolean()),
                   circuit_states: z.record(z.string()),
+                  blocking_reasons: z.array(z.string()),
                 })
                 .optional(),
             })
@@ -5915,8 +5916,16 @@ export function registerApiRoutes(
       listCapabilityStates: listOverseerCapabilityStates,
     });
 
+    // A dead Overseer watcher must NOT read green. When the watcher task has
+    // crashed (state 'degraded'), top-level status reflects the outage so a
+    // caller reading only `status` can detect it without inspecting the nested
+    // overseer object (WO-HARNESS-OVERSEER-UNBURY-GATES-01, section 11 edge
+    // case). 'stopped' (disabled / never started) stays 'ok' -- that is a
+    // configured-off state, not an outage.
+    const status = overseerStatus.watcher === 'degraded' ? 'degraded' : 'ok';
+
     return c.json({
-      status: 'ok',
+      status,
       adapter: 'web',
       concurrency: {
         ...stats,

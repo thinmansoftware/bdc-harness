@@ -174,6 +174,35 @@ mock.module('@archon/core/utils/commands', () => ({
   findMarkdownFilesRecursive: mock(async () => []),
 }));
 
+// Controllable Overseer runtime status so the health handler's status-derivation
+// and overseer passthrough can be exercised directly. The full derivation of
+// blocking_reasons is covered in overseer-runtime.test.ts; here we verify the
+// handler maps a degraded watcher to a non-ok top-level status and passes
+// blocking_reasons through unchanged. Safe to mock.module this path: the server
+// test script runs each test file in its own `bun test` process.
+const defaultOverseerStatus = (): {
+  watcher: string;
+  adapter: string;
+  emergency_stop: boolean;
+  capability_flags: Record<string, boolean>;
+  circuit_states: Record<string, string>;
+  blocking_reasons: string[];
+} => ({
+  watcher: 'stopped',
+  adapter: 'none',
+  emergency_stop: true,
+  capability_flags: {},
+  circuit_states: {},
+  blocking_reasons: ['merge_capability_disabled', 'production_effect_held_for_john'],
+});
+let overseerRuntimeStatus = defaultOverseerStatus();
+
+mock.module('../overseer-runtime', () => ({
+  getOverseerRuntimeStatus: mock(async () => overseerRuntimeStatus),
+  startOverseerRuntime: mock(() => {}),
+  stopOverseerRuntime: mock(async () => {}),
+}));
+
 import { registerApiRoutes } from './api';
 
 // ---------------------------------------------------------------------------
@@ -207,6 +236,7 @@ describe('GET /api/health', () => {
     mockGetStats.mockReset();
     mockGetRunningWorkflows.mockReset();
     mockIsDocker.mockClear(); // preserve base () => false implementation; only clear call records
+    overseerRuntimeStatus = defaultOverseerStatus();
   });
 
   test('returns status ok with adapter and concurrency info', async () => {
@@ -240,6 +270,57 @@ describe('GET /api/health', () => {
     expect(body.runningWorkflows).toBe(1);
     expect(typeof body.version).toBe('string');
     expect(body.version.length).toBeGreaterThan(0);
+  });
+
+  test('overseer.blocking_reasons is an array present on the health response', async () => {
+    mockGetStats.mockImplementationOnce(() => ({
+      active: 0,
+      queuedTotal: 0,
+      queuedByConversation: [],
+      maxConcurrent: 10,
+      activeConversationIds: [],
+    }));
+    mockGetRunningWorkflows.mockImplementationOnce(async () => []);
+
+    const app = makeApp();
+    const response = await app.request('/api/health');
+    expect(response.status).toBe(200);
+
+    const body = (await response.json()) as {
+      status: string;
+      overseer?: { blocking_reasons?: unknown };
+    };
+    // A stopped (disabled / never-started) watcher is a configured-off state,
+    // not an outage -- it must still read green.
+    expect(body.status).toBe('ok');
+    expect(body.overseer).toBeDefined();
+    expect(Array.isArray(body.overseer?.blocking_reasons)).toBe(true);
+    expect(body.overseer?.blocking_reasons).toContain('production_effect_held_for_john');
+  });
+
+  test('a degraded (dead) Overseer watcher does not read green at top-level status', async () => {
+    overseerRuntimeStatus = { ...defaultOverseerStatus(), watcher: 'degraded' };
+    mockGetStats.mockImplementationOnce(() => ({
+      active: 0,
+      queuedTotal: 0,
+      queuedByConversation: [],
+      maxConcurrent: 10,
+      activeConversationIds: [],
+    }));
+    mockGetRunningWorkflows.mockImplementationOnce(async () => []);
+
+    const app = makeApp();
+    const response = await app.request('/api/health');
+    expect(response.status).toBe(200);
+
+    const body = (await response.json()) as {
+      status: string;
+      overseer?: { watcher?: string };
+    };
+    // Section 11 edge case: a caller reading only `status` must be able to
+    // detect the outage.
+    expect(body.status).not.toBe('ok');
+    expect(body.overseer?.watcher).toBe('degraded');
   });
 
   test('includes running background workflows in concurrency.active count', async () => {

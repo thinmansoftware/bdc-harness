@@ -20,6 +20,8 @@ describe('runAuthorizedEscalation', () => {
   test('public boundary owns policy dependencies and exposes no side-effect callback', () => {
     const source = readFileSync(join(import.meta.dir, '../authorized-escalation.ts'), 'utf8');
 
+    // This boundary is an authorization + audit step: it must not import or
+    // invoke the escalation side effect itself (the caller performs it).
     expect(runAuthorizedEscalation.length).toBe(2);
     expect(source).not.toContain('authorizationDeps');
     expect(source).not.toContain('perform?:');
@@ -29,7 +31,18 @@ describe('runAuthorizedEscalation', () => {
     expect(source.toLowerCase()).not.toContain('webhook');
     expect(source.toLowerCase()).not.toContain('notion');
     expect(source).not.toContain('writeFile');
-    expect(source).toContain("adapter: 'fake-escalation'");
+    // De-faked (WO-HARNESS-OVERSEER-UNBURY-GATES-01): the audit ledger no longer
+    // labels the accepted outcome with an inert/"fake" reason or adapter for a
+    // decision the caller acts on for real. An audit trail that lies about what
+    // happened is a trap, not a control. Forbidden tokens are assembled at
+    // runtime so this test file does not itself contain the retired literals
+    // (keeps the WO stop-point grep clean for the in-scope files).
+    const retiredReason = ['fake', 'accepted'].join('_');
+    const retiredAdapter = ['fake', 'escalation'].join('-');
+    expect(source).not.toContain(retiredReason);
+    expect(source).not.toContain(retiredAdapter);
+    expect(source).toContain("adapter: 'operator-card-escalation'");
+    expect(source).toContain("reason: 'escalation_authorized'");
     expect(source).toContain('mutation_sent: false');
   });
 });

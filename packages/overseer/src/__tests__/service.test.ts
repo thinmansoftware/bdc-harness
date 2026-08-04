@@ -9,6 +9,7 @@ import {
   resolveDefaultDeps,
   runOperatorCardDeliveryScheduler,
   runOverseerService,
+  runReconcileScheduler,
 } from '../service.ts';
 import type { M31ActionPermit, M31ActionProposal } from '../m31-substrate.ts';
 
@@ -478,11 +479,11 @@ describe('service', () => {
       );
       expect(mergePullRequest).not.toHaveBeenCalled();
       expect(actions).toHaveLength(1);
-      expect(actions[0]?.action).toBe('fake_escalation_attempt');
-      expect(actions[0]?.result).toMatch(/^fake_accepted:operator_card:[0-9a-f]{64}$/);
+      expect(actions[0]?.action).toBe('escalation_attempt');
+      expect(actions[0]?.result).toMatch(/^escalation_authorized:operator_card:[0-9a-f]{64}$/);
       expect(attempts).toHaveLength(1);
       expect(attempts[0]?.details).toMatchObject({
-        adapter: 'fake-escalation',
+        adapter: 'operator-card-escalation',
         accepted: true,
         mutation_sent: false,
       });
@@ -555,7 +556,7 @@ describe('service', () => {
 
       expect(mergePullRequest).not.toHaveBeenCalled();
       expect(actions).toHaveLength(1);
-      expect(actions[0]?.action).toBe('fake_escalation_attempt');
+      expect(actions[0]?.action).toBe('escalation_attempt');
       const cards = await listOperatorCards();
       expect(cards.items).toHaveLength(1);
       expect(cards.items[0]?.card.run_id).toBe('run-dryrun-escalation');
@@ -622,7 +623,7 @@ describe('service', () => {
       });
 
       expect(actions).toHaveLength(1);
-      expect(actions[0]?.action).toBe('fake_escalation_attempt');
+      expect(actions[0]?.action).toBe('escalation_attempt');
       const cards = await listOperatorCards();
       expect(cards.items).toHaveLength(1);
       const card = cards.items[0]?.card;
@@ -898,5 +899,51 @@ describe('service', () => {
     const drainsAfterReject = drains;
     await new Promise<void>(resolve => setTimeout(resolve, 10));
     expect(drains).toBe(drainsAfterReject);
+  });
+
+  test('reconcile scheduler isolates a throwing reconcile: the error does not propagate', async () => {
+    // Section 11 Negative case: a transport error thrown by the reconcile pass
+    // (e.g. a bare Octokit call in searchMergedPullRequests) must be caught and
+    // logged, never rethrown -- otherwise it aborts the coupled watcher signal.
+    let calls = 0;
+    await expect(
+      runReconcileScheduler({
+        once: true,
+        reconcile: async () => {
+          calls += 1;
+          throw new Error('simulated_octokit_transport_error');
+        },
+      })
+    ).resolves.toBeUndefined();
+    expect(calls).toBe(1);
+  });
+
+  test('a reconcile transport failure does not abort the watcher (service stays up)', async () => {
+    // Wire the service with a throwing reconcileRun and a once:true watcher. The
+    // watcher must complete normally -- the reconcile throw is isolated and does
+    // NOT reject runOverseerService via the shared Promise.all/abortOnFailure.
+    let reconcileCalls = 0;
+    const deps = {
+      listRunsForWatch: async () => [],
+      listRunEvents: async () => [],
+      findPullRequest: async () => ({ exists: false as const }),
+      mergePullRequest: async () => undefined,
+      insertOverseerAction: async () => undefined,
+    };
+    await expect(
+      runOverseerService({
+        enabled: true,
+        adapterKind: 'fake',
+        deps,
+        once: true,
+        intervalMs: 1,
+        reconcileIntervalMs: 1,
+        reconcileRun: async () => {
+          reconcileCalls += 1;
+          throw new Error('simulated_octokit_transport_error');
+        },
+      })
+    ).resolves.toBeUndefined();
+    expect(reconcileCalls).toBe(1);
   });
 });
