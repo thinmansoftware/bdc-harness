@@ -140,7 +140,7 @@ describe('cascade default escalation boundary', () => {
       expect(result.status).toBe('infra-alert');
       expect(attempts).toHaveLength(1);
       expect(attempts[0]?.details).toMatchObject({
-        adapter: 'fake-escalation',
+        adapter: 'escalation-notify-only',
         accepted: true,
         mutation_sent: false,
       });

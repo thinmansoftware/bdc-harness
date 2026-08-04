@@ -872,13 +872,13 @@ describe('service', () => {
     expect(watcherPolls).toBe(pollsAfterReject);
   });
 
-  test('reconcile failure is isolated and does not abort the watcher', async () => {
+  test('reconcile failure is isolated and the scheduler retries', async () => {
     const controller = new AbortController();
     let watcherPolls = 0;
+    let reconcileAttempts = 0;
     const deps = {
       listRunsForWatch: async () => {
         watcherPolls += 1;
-        if (watcherPolls === 3) controller.abort();
         return [];
       },
       listRunEvents: async () => [],
@@ -896,11 +896,14 @@ describe('service', () => {
         intervalMs: 1,
         reconcileIntervalMs: 1,
         reconcileRun: async () => {
+          reconcileAttempts += 1;
+          if (reconcileAttempts === 2) controller.abort();
           throw new Error('reconcile_transport_failed');
         },
       })
     ).resolves.toBeUndefined();
-    expect(watcherPolls).toBe(3);
+    expect(reconcileAttempts).toBe(2);
+    expect(watcherPolls).toBeGreaterThan(0);
   });
 
   test('watcher failure aborts and quiesces the delivery scheduler before rejecting', async () => {

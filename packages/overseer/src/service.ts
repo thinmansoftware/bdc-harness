@@ -109,7 +109,11 @@ export async function runReconcileScheduler(input: {
   const reconcile = input.reconcile ?? ((): Promise<unknown> => runReconcileOnce());
   for (;;) {
     if (input.signal?.aborted) return;
-    await reconcile();
+    try {
+      await reconcile();
+    } catch (error) {
+      log.error({ err: error as Error }, 'overseer.reconcile.iteration_failed_isolated');
+    }
     if (input.once || input.signal?.aborted) return;
     await waitForDeliveryInterval(input.intervalMs ?? 30_000, input.signal);
   }
@@ -362,8 +366,6 @@ export async function runOverseerService(options: OverseerServiceOptions = {}): 
     intervalMs: options.reconcileIntervalMs,
     once: options.once,
     reconcile: options.reconcileRun,
-  }).catch(error => {
-    log.error({ err: error as Error }, 'overseer.reconcile.scheduler_failed_isolated');
   });
   tasks.push(reconcile);
   const abortOnFailure = async (task: Promise<void>): Promise<void> => {
