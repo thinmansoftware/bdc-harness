@@ -2539,6 +2539,27 @@ async function executeNodeInternal(
             : {}),
           ...(nodeModelUsage ? { model_usage: nodeModelUsage } : {}),
           ...(nodeTokens ? { tokens: nodeTokens } : {}),
+          // Model attribution on the failure path (WO-HARNESS-MODEL-ATTRIBUTION-01).
+          // Mirrors the node_completed contract (see the sibling block above) so a
+          // per-model, per-seat scoreboard can compute failure rates -- not just
+          // success rates -- without a join gap. provider and entry_rung are always
+          // present (provider is a required non-optional param at this call site;
+          // deriveEntryRung is total). declared_model_id / requested_model_id follow
+          // the exact same omit-when-absent guard as the success path. served_model_*
+          // fields are usually ABSENT here because the provider often throws before
+          // any response chunk arrives -- that is correct: omit-when-absent (never
+          // null, never ""), same convention as node_completed.
+          ...(declaredModelId !== undefined ? { declared_model_id: declaredModelId } : {}),
+          ...(nodeOptions?.model !== undefined ? { requested_model_id: nodeOptions.model } : {}),
+          provider,
+          ...(nodeServedModelId !== undefined ? { served_model_id: nodeServedModelId } : {}),
+          ...(nodeServedMissingReason !== undefined
+            ? { served_model_missing_reason: nodeServedMissingReason }
+            : {}),
+          ...(typeof nodeServedModelId === 'string' && declaredModelId !== undefined
+            ? { served_model_mismatch: !isDeclaredServedMatch(declaredModelId, nodeServedModelId) }
+            : {}),
+          entry_rung: deriveEntryRung(provider, nodeOptions?.model),
           // Layer 1 gate_result field: present when Phase 5 registered a gate
           // outcome before the SDK threw (e.g. gate check fired then SDK errored).
           ...buildGateResultField(failureGateResult),
