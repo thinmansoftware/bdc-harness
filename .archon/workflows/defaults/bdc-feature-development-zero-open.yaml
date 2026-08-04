@@ -5,9 +5,9 @@ description: |
   "fusion combines open models AS the war council"). The council is composed
   of DIFFERENT open models attacking each other's work -- cross-model
   diversity is the quality mechanism that replaces the always-expensive judge:
-    plan (architect seat)        = Qwen qwen/qwen3-coder (root default)
+    plan (architect seat)        = Qwen qwen/qwen3-coder-next (root default)
     plan-review (attack seat)    = DeepSeek deepseek-chat-v3.1
-    implement + repairs (builder)= Qwen qwen/qwen3-coder (proven 2026-07-07)
+    implement + repairs (builder)= Qwen qwen/qwen3-coder-next
     diff reviews (attack seats)  = DeepSeek deepseek-chat-v3.1
     war-council-validator (judge)= DeepSeek via opr-zero (true dual-cap; no Claude, no Codex)
   No model ever grades its own output; NO node consumes the expensive review seat. All
@@ -30,8 +30,27 @@ run_authority:
 # provider: opr-zero is REQUIRED here so unpinned nodes do not inherit the default
 # provider while holding an OpenRouter model ID.
 # war-council-validator: DeepSeek on opr-zero (dual-cap 2026-07-09).
+# RUNG 1 of the M-121 ladder (John, 2026-08-04). This is the ladder's ENTRY
+# rung: it plans and attempts cheaply, and what it cannot finish escalates UP
+# (codex -> claude/opus5 -> apex Sol+Fable). Escalation from here is a NORMAL
+# disposition, not a failure -- a rung-1 run that fails cheaply and hands up
+# has done its job.
+#
+# Model swept qwen/qwen3-coder -> qwen/qwen3-coder-next by M-121. Same 262K
+# context, strictly cheaper ($0.12/$0.80 per 1M vs $0.30/$1.00), and the
+# release specifically targets agentic editing -- the ONE seat Qwen lost here
+# (see the 2026-07-07 implement swap note further down).
+#
+# WHY THIS LANE CAME BACK (M-121 amends John's 2026-07-06 "Claude+Codex only"
+# ruling): the 7/06 retirement cited lane-level "0/19, 0/21 lifetime" figures.
+# Node-level event-store data (2026-08-04) shows those deaths were HARNESS
+# PLUMBING, not the models -- 14 of fusion-cx-qwen's 27 run deaths were a
+# plan-review provider bug (codex-opr could not serve qwen, HTTP 400) fixed
+# 2026-07-11, five days AFTER the ruling. Qwen's plan seat was 25/25. GLM's
+# implement seat was 29/29. Judge a seat by its node record, never a lane by
+# its aggregate.
 provider: opr-zero
-model: qwen/qwen3-coder
+model: qwen/qwen3-coder-next
 
 nodes:
   # Pre-flight: fail closed if container lacks GITHUB auth (WO-169, 2026-05-16).
