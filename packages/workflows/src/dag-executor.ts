@@ -2534,6 +2534,19 @@ async function executeNodeInternal(
         // node_completed contract.
         data: {
           error: err.message,
+          provider,
+          ...(declaredModelId !== undefined ? { declared_model_id: declaredModelId } : {}),
+          ...(nodeOptions?.model !== undefined ? { requested_model_id: nodeOptions.model } : {}),
+          ...(nodeServedModelId !== undefined ? { served_model_id: nodeServedModelId } : {}),
+          ...(nodeServedMissingReason !== undefined
+            ? { served_model_missing_reason: nodeServedMissingReason }
+            : {}),
+          ...(typeof nodeServedModelId === 'string' && declaredModelId !== undefined
+            ? {
+                served_model_mismatch: !isDeclaredServedMatch(declaredModelId, nodeServedModelId),
+              }
+            : {}),
+          entry_rung: deriveEntryRung(provider, nodeOptions?.model),
           ...(err.message.startsWith('resource_exhausted_timeout')
             ? { reason: 'resource_exhausted_timeout' }
             : {}),

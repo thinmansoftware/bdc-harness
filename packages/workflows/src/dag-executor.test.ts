@@ -10761,13 +10761,92 @@ describe('executeDagWorkflow -- token telemetry persistence and rollup', () => {
     );
 
     const failedCall = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls.find(
-      ([arg]) => (arg as { event_type: string }).event_type === 'node_failed'
+      ([arg]) =>
+        (arg as { event_type: string }).event_type === 'node_failed' &&
+        (arg as { step_name?: string }).step_name === 'n'
     );
     expect(failedCall).toBeDefined();
     const data = (failedCall![0] as { data: Record<string, unknown> }).data;
     expect(data.model_usage).toEqual({
       'claude-sonnet-5': { input_tokens: 25, output_tokens: 10, total_tokens: 35 },
     });
+  });
+
+  it('persists model attribution on agent node failure', async () => {
+    mockSendQueryDag.mockImplementation(function* () {
+      yield {
+        type: 'result',
+        sessionId: 'failed-attribution-session',
+        isError: true,
+        errorSubtype: 'provider_error',
+        errors: ['boom'],
+      };
+    });
+
+    const store = createEventBackedStore();
+    await executeDagWorkflow(
+      createMockDeps(store),
+      createMockPlatform(),
+      'conv-failed-attribution',
+      testDir,
+      {
+        name: 'attribution-failed',
+        nodes: [{ id: 'work', prompt: 'do work', model: 'qwen/qwen3-coder-next' }],
+      },
+      makeWorkflowRun('attribution-failed-run'),
+      'claude',
+      'qwen/qwen3-coder-next',
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    const failedCall = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls.find(
+      ([arg]) =>
+        (arg as { event_type: string }).event_type === 'node_failed' &&
+        (arg as { step_name?: string }).step_name === 'work'
+    );
+    expect(failedCall).toBeDefined();
+    const data = (failedCall![0] as { data: Record<string, unknown> }).data;
+    expect(data.declared_model_id).toBe('qwen/qwen3-coder-next');
+    expect(data.requested_model_id).toBe('qwen/qwen3-coder-next');
+    expect(data.provider).toBe('claude');
+    expect(data.entry_rung).toBe('claude:qwen/qwen3-coder-next');
+  });
+
+  it('omits unavailable served-model attribution on agent node failure', async () => {
+    mockSendQueryDag.mockImplementation(function* () {
+      throw new Error('provider failed before response');
+    });
+
+    const store = createEventBackedStore();
+    await executeDagWorkflow(
+      createMockDeps(store),
+      createMockPlatform(),
+      'conv-failed-before-response',
+      testDir,
+      { name: 'early-failure', nodes: [{ id: 'work', prompt: 'do work' }] },
+      makeWorkflowRun('early-failure-run'),
+      'claude',
+      'qwen/qwen3-coder-next',
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    const failedCall = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls.find(
+      ([arg]) =>
+        (arg as { event_type: string }).event_type === 'node_failed' &&
+        (arg as { step_name?: string }).step_name === 'work'
+    );
+    expect(failedCall).toBeDefined();
+    const data = (failedCall![0] as { data: Record<string, unknown> }).data;
+    expect('served_model_id' in data).toBe(false);
+    expect('served_model_mismatch' in data).toBe(false);
   });
 
   it('emits exactly one terminal run_token_totals event with summed totals', async () => {
@@ -11191,6 +11270,10 @@ describe('gate_result field in node_failed events', () => {
     expect(persistedGr.nodeType).toBe('script');
     expect(persistedGr.exitCode).toBe(2);
     expect(persistedGr.isTimeout).toBe(false);
+    expect('provider' in persistedData).toBe(false);
+    expect('declared_model_id' in persistedData).toBe(false);
+    expect('requested_model_id' in persistedData).toBe(false);
+    expect('entry_rung' in persistedData).toBe(false);
 
     // Assert emitted event carries gate_result.
     expect(emittedFailedEvents.length).toBe(1);
