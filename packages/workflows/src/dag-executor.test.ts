@@ -10407,6 +10407,164 @@ describe('executeDagWorkflow -- served-model capture on node_completed.data', ()
 });
 
 // ---------------------------------------------------------------------------
+// Model attribution on node_failed.data
+// WO-HARNESS-MODEL-ATTRIBUTION-01
+// ---------------------------------------------------------------------------
+//
+// Parity: node_failed now carries the same model-attribution fields that
+//   node_completed already carries, so a per-model/per-seat scoreboard can
+//   compute failure rates -- not just success rates -- without a join gap.
+//
+// Omit-when-absent: when the provider throws before any served-model signal
+//   arrives, served_model_id / served_model_mismatch are ABSENT (not null,
+//   not ""), mirroring the success-path contract exactly.
+describe('executeDagWorkflow -- model attribution on node_failed.data (WO-HARNESS-MODEL-ATTRIBUTION-01)', () => {
+  let testDir: string;
+
+  beforeEach(async () => {
+    testDir = join(
+      tmpdir(),
+      `dag-failed-model-${Date.now()}-${Math.random().toString(36).slice(2)}`
+    );
+    await mkdir(testDir, { recursive: true });
+    mockSendQueryDag.mockClear();
+    mockGetAgentProviderDag.mockClear();
+  });
+
+  afterEach(async () => {
+    // Restore default claude client so other test files are unaffected.
+    mockGetAgentProviderDag.mockImplementation(() => ({
+      sendQuery: mockSendQueryDag,
+      getType: () => 'claude',
+      getCapabilities: mockClaudeCapabilities,
+    }));
+    try {
+      await rm(testDir, { recursive: true, force: true });
+    } catch {
+      /* ignore cleanup errors */
+    }
+  });
+
+  /** Pull the (single) node_failed event payload from a mocked store. */
+  function getNodeFailedData(store: IWorkflowStore): Record<string, unknown> {
+    const calls = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls as Array<
+      [{ event_type: string; data?: Record<string, unknown> }]
+    >;
+    const failedCalls = calls.filter(([arg]) => arg.event_type === 'node_failed');
+    expect(failedCalls.length).toBe(1);
+    const data = failedCalls[0][0].data;
+    expect(data).toBeDefined();
+    return data as Record<string, unknown>;
+  }
+
+  it('parity: node_failed carries declared/requested/provider/entry_rung and served fields when a served model was reported before the error', async () => {
+    // The SDK forwards servedModelId on a result chunk, THEN signals isError.
+    // servedModelId is captured (dag-executor.ts:1932) before the isError throw
+    // (dag-executor.ts:1950), so the failure path can attribute it -- exactly
+    // what node_completed would have recorded had the call succeeded.
+    mockSendQueryDag.mockImplementation(function* () {
+      yield { type: 'assistant', content: 'x' };
+      yield {
+        type: 'result',
+        isError: true,
+        errorSubtype: 'error_during_execution',
+        errors: ['provider failed after emitting served model'],
+        sessionId: 'failed-served-session',
+        servedModelId: 'other-model-actually-served',
+      };
+    });
+
+    const store = createMockStore();
+    const mockDeps = createMockDeps(store);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('failed-served-run');
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-failed-served',
+      testDir,
+      {
+        name: 'failed-served-test',
+        nodes: [{ id: 'work', prompt: 'do work', model: 'my-requested-model' }],
+      },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    const data = getNodeFailedData(store);
+    // Same values node_completed would have written for these inputs.
+    expect(data.declared_model_id).toBe('my-requested-model');
+    expect(data.requested_model_id).toBe('my-requested-model');
+    // provider is always present on the failure path (non-optional param).
+    expect(data.provider).toBe('claude');
+    // entry_rung is always present (deriveEntryRung is total).
+    expect(typeof data.entry_rung).toBe('string');
+    // served model was reported before the throw -> attributed + mismatch computed.
+    expect(data.served_model_id).toBe('other-model-actually-served');
+    expect(data.served_model_mismatch).toBe(true);
+    // Existing failure-path contract still intact.
+    expect(typeof data.error).toBe('string');
+  });
+
+  it('omit-when-absent: served_model_id and served_model_mismatch are ABSENT when the provider errored before reporting a served model', async () => {
+    // No servedModelId ever flows -> nodeServedModelId stays undefined. The
+    // served-model keys must be omitted entirely (not null, not ""), mirroring
+    // the node_completed omit-when-absent contract.
+    mockSendQueryDag.mockImplementation(function* () {
+      yield {
+        type: 'result',
+        isError: true,
+        errorSubtype: 'error_during_execution',
+        errors: ['provider failed before any served-model signal'],
+        sessionId: 'failed-no-served-session',
+      };
+    });
+
+    const store = createMockStore();
+    const mockDeps = createMockDeps(store);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('failed-no-served-run');
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-failed-no-served',
+      testDir,
+      {
+        name: 'failed-no-served-test',
+        nodes: [{ id: 'work', prompt: 'do work', model: 'my-requested-model' }],
+      },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    const data = getNodeFailedData(store);
+    // Attribution that does NOT depend on a served model is still present.
+    expect(data.declared_model_id).toBe('my-requested-model');
+    expect(data.requested_model_id).toBe('my-requested-model');
+    expect(data.provider).toBe('claude');
+    expect(typeof data.entry_rung).toBe('string');
+    // Absent, not null -- downstream readers distinguish absent from known-null.
+    expect(data).not.toHaveProperty('served_model_id');
+    expect(data).not.toHaveProperty('served_model_mismatch');
+    expect(data).not.toHaveProperty('served_model_missing_reason');
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Layer 1 tier + counterfactual cost on node_completed.data + run metadata
 // WO-HARNESS-LAYER1-TIER-AND-COUNTERFACTUAL-COST-01
 // ---------------------------------------------------------------------------
@@ -11191,6 +11349,14 @@ describe('gate_result field in node_failed events', () => {
     expect(persistedGr.nodeType).toBe('script');
     expect(persistedGr.exitCode).toBe(2);
     expect(persistedGr.isTimeout).toBe(false);
+
+    // WO-HARNESS-MODEL-ATTRIBUTION-01: script-node failures NEVER resolve a
+    // model, so the model-attribution fields must NOT appear on their
+    // node_failed payload (that write site is out of scope and unchanged).
+    expect(persistedData).not.toHaveProperty('declared_model_id');
+    expect(persistedData).not.toHaveProperty('requested_model_id');
+    expect(persistedData).not.toHaveProperty('provider');
+    expect(persistedData).not.toHaveProperty('entry_rung');
 
     // Assert emitted event carries gate_result.
     expect(emittedFailedEvents.length).toBe(1);
