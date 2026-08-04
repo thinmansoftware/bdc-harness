@@ -264,7 +264,6 @@ describe('judgeTerminalRun: model ladder + fail-loud health', () => {
       expect(outcome.modelRung).toBe(1);
     }
   });
-
 });
 
 describe('handleRecordJudgeFirst: pipeline', () => {

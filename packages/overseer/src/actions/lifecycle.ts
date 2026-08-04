@@ -633,7 +633,10 @@ function mutationReceiptValid(
       mutation.external_effect_reference.length > 0
     );
   }
-  return mutation.reason !== 'simulated_accepted_no_mutation' && mutation.external_effect_reference === null;
+  return (
+    mutation.reason !== 'simulated_accepted_no_mutation' &&
+    mutation.external_effect_reference === null
+  );
 }
 
 function executionResult(
