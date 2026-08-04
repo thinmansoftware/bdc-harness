@@ -21,15 +21,33 @@ run_authority:
     - docs/superpowers/specs/{WO_ID}.md
   allow_issue_fallback: true
 # FABLE APEX RUNG (WO-HARNESS-CASCADE-FABLE-APEX-RUNG-01):
-# Top-level model is claude-opus-5. The six build-critical nodes (plan, plan-review,
-# implement, diff-repair, opus-repair, war-council-validator) intentionally DROP their
-# persona:/agent: bindings so this model is actually served -- on provider: claude a
-# persona model WINS over the node/workflow model (executor-shared.ts resolveAgentPersona),
-# and every existing persona is pinned (sonnet/opus), which would silently shadow fable.
-# All OTHER nodes keep their persona bindings unchanged. war-council-validator keeps
-# provider: claude (trusted judge is always Claude) but serves claude-opus-5 here.
+# The six build-critical nodes (plan, plan-review, implement, diff-repair, opus-repair,
+# war-council-validator) intentionally DROP their persona:/agent: bindings so this
+# model is actually served -- on provider: claude a persona model WINS over the
+# node/workflow model (executor-shared.ts resolveAgentPersona), and every existing
+# persona is pinned (sonnet/opus), which would silently shadow fable.
+# All OTHER nodes keep their persona bindings unchanged.
+#
+# APEX COMPOSITION -- M-121 (John, 2026-08-04): this lane is the ladder's TOP. It
+# holds BOTH apex models: gpt-5.6-sol (codex seats below) and real claude-fable-5
+# (this root + war-council-validator). Sol attempts first at the seats it holds;
+# Fable is the genuine last resort, which keeps Fable usage rare BY CONSTRUCTION
+# rather than by policy. "If these two models cant do it it cant be done" (John).
+# Opus 5 is the CHEAP FABLE-SUBSTITUTE and belongs on the CLOSER rung below this
+# one -- it is deliberately NOT an apex model.
+#
+# Why this reads as a revert of M-87 but is not: M-87 (2026-07-26) repointed every
+# claude-fable-5 pin to claude-opus-5 because Fable had gone DARK ON QUOTA (two WOs,
+# six runs, zero code). That was an OUTAGE workaround, never a ruling on what apex
+# should be -- and it left all the Fable-enabling scaffolding above intact. The
+# outage has passed (Fable live, ~23% weekly usage, John 2026-08-04). M-87's real
+# deliverable -- live dark-engine detection + refusal to fire a lane with known-dead
+# models (engine-availability.ts) -- is RETAINED and is what makes this safe. A
+# future Fable outage MUST trip that detector; it must never again be answered by
+# silently repinning apex to a lesser model, which converts a visible outage into an
+# invisible capability downgrade (it did, undetected, for 8 days).
 provider: claude
-model: claude-opus-5
+model: claude-fable-5
 
 nodes:
   # Pre-flight: fail closed if container lacks GITHUB auth (WO-169, 2026-05-16).
@@ -1062,11 +1080,12 @@ nodes:
       exit 0
   - id: war-council-validator
     # FABLE APEX: trusted judge stays provider: claude (always Claude, regardless of the
-    # lane default) but serves claude-opus-5 -- this lane's judge is the apex model too.
+    # lane default) and serves claude-fable-5 -- this lane's judge is the apex model too.
     # persona captain-ci-validator dropped so the fable model is actually served (the
     # persona pins sonnet and would shadow it). See header + WO-HARNESS-CASCADE-FABLE-APEX-RUNG-01.
+    # Repinned opus-5 -> fable-5 by M-121 (John 2026-08-04); see header for the M-87 relationship.
     provider: claude
-    model: claude-opus-5
+    model: claude-fable-5
     depends_on: [ascii-gate]
     task_class: medium_work
     prompt: |
