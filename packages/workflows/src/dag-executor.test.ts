@@ -11286,6 +11286,14 @@ describe('gate_result field in node_failed events', () => {
     expect(persistedGr.exitCode).toBe(1);
     expect(persistedGr.isTimeout).toBe(false);
 
+    // WO-HARNESS-MODEL-ATTRIBUTION-01: bash-node failures NEVER resolve a
+    // model, so the model-attribution fields must NOT appear on their
+    // node_failed payload (that write site is out of scope and unchanged).
+    expect(persistedData).not.toHaveProperty('declared_model_id');
+    expect(persistedData).not.toHaveProperty('requested_model_id');
+    expect(persistedData).not.toHaveProperty('provider');
+    expect(persistedData).not.toHaveProperty('entry_rung');
+
     // Assert emitted event carries gate_result.
     expect(emittedFailedEvents.length).toBe(1);
     const emittedGr = (emittedFailedEvents[0] as { gate_result?: GateResult }).gate_result;
