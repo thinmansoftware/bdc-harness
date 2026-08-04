@@ -2,6 +2,24 @@ import { appendOverseerCapabilityEvent } from '@archon/core/db/overseer-capabili
 import type { M31ActionPermit } from './m31-substrate';
 import { authorizeOverseerAction, readOverseerActionPolicyFromEnv } from './action-policy';
 
+/**
+ * Result of the escalation authorization boundary.
+ *
+ * `mutation_sent` is ALWAYS false in BOTH branches, by design. This is not a
+ * stubbed-out success path: the field describes the effect of THIS function,
+ * which is authorization + audit and nothing else. The caller performs the
+ * escalation side effect (a real, durable operator card) after this returns
+ * accepted. Escalation is deliberately notification/audit only and is never a
+ * repository or production mutation, which is why it must still run when
+ * OVERSEER_DRY_RUN is set.
+ *
+ * Do not confuse this with the sandbox action contract in
+ * `adapters/sandbox-types.ts`, where `providerAcceptedResult` sets
+ * `mutation_sent: true` together with an `external_effect_reference`. That
+ * type (`SandboxActionResultV1`) covers real provider mutations such as a
+ * merge. This type does not, and never has -- there has never been a
+ * `mutation_sent: true` variant here to regress.
+ */
 export type AuthorizedEscalationResult =
   | {
       readonly accepted: true;
