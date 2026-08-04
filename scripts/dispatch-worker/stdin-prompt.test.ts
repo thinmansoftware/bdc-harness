@@ -36,6 +36,13 @@ async function stdinHashConfig(seat: string): Promise<AgentConfig> {
   return { command: process.execPath, args: [script] };
 }
 
+async function earlyExitConfig(): Promise<AgentConfig> {
+  const dir = await mkdtemp(join(tmpdir(), 'stdin-prompt-early-exit-'));
+  const script = join(dir, 'exit-immediately.cjs');
+  await writeFile(script, 'process.exit(0);\n', 'utf8');
+  return { command: process.execPath, args: [script] };
+}
+
 function promptOfExactly65536Bytes(): string {
   const unicodeAndCrlf = '\u2014\u4e2d\u6587\r\n';
   const prefixBytes = Buffer.byteLength(unicodeAndCrlf, 'utf8');
@@ -83,4 +90,21 @@ describe('prompt stdin delivery', () => {
       createHash('sha256').update('small prompt', 'utf8').digest('hex')
     );
   }, 10_000);
+
+  test('reports an early stdin close without taking down later dispatches', async () => {
+    const failed = await runAgent(
+      await earlyExitConfig(),
+      message('x'.repeat(MAX_PROMPT_STDIN_BYTES), 'early-exit')
+    );
+
+    expect(failed.status).toBe('failed');
+    expect(failed.resultBody).toContain('Failed to deliver prompt over stdin');
+
+    const prompt = 'worker still alive';
+    const survived = await runAgent(await stdinHashConfig('survived'), message(prompt, 'survived'));
+    expect(survived.status).toBe('done');
+    expect(survived.resultBody).toContain(
+      createHash('sha256').update(prompt, 'utf8').digest('hex')
+    );
+  }, 15_000);
 });

@@ -323,8 +323,16 @@ export async function runAgent(
   if (promptBody !== undefined) {
     const stdin = proc.stdin;
     if (!stdin) throw new Error('prompt_stdin_pipe_unavailable');
-    stdin.write(promptBody);
-    stdin.end();
+    try {
+      stdin.write(promptBody);
+      await stdin.end();
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      return {
+        status: 'failed',
+        resultBody: `Failed to deliver prompt over stdin: ${detail}`,
+      };
+    }
   }
   const [stdout, stderr, exitCode] = await Promise.all([
     new Response(proc.stdout).text(),
