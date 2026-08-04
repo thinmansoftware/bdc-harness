@@ -3,18 +3,32 @@ import { buildAgentInvocation, defaultAgentConfigs, parseFusionReviewBody } from
 
 describe('dispatch worker adapters', () => {
   test('ships read-only invocation contracts for installed desktop agents', () => {
-    const prompt = 'Reply with exactly: ROUND_TRIP_OK';
-    expect(buildAgentInvocation(defaultAgentConfigs.claude, prompt).args).toContain('plan');
-    expect(buildAgentInvocation(defaultAgentConfigs.codex, prompt).args).toContain('read-only');
-    expect(buildAgentInvocation(defaultAgentConfigs.grok, prompt).args).toContain('plan');
-    expect(buildAgentInvocation(defaultAgentConfigs.cursor, prompt).args).toContain('ask');
+    expect(buildAgentInvocation(defaultAgentConfigs.claude).args).toContain('plan');
+    expect(buildAgentInvocation(defaultAgentConfigs.codex).args).toContain('read-only');
+    expect(buildAgentInvocation(defaultAgentConfigs.grok).args).toContain('plan');
+    expect(buildAgentInvocation(defaultAgentConfigs.cursor).args).toContain('ask');
   });
 
-  test('substitutes prompt as one argv element without shell interpolation', () => {
-    const prompt = 'summarize; git push && deploy';
-    const invocation = buildAgentInvocation(defaultAgentConfigs.codex, prompt);
-    expect(invocation.args.at(-1)).toBe(prompt);
-    expect(invocation.command).toBe('codex');
+  test('never places prompt text into argv for prompt-kind seats', () => {
+    // WO-HARNESS-DISPATCH-STDIN-PROMPT-01 (M-126 Q2): argv delivery of the
+    // prompt was removed outright. The prompt now travels over stdin, so no
+    // seat config may carry a substitution placeholder and buildAgentInvocation
+    // must never inject prompt text into argv.
+    const promptSamples = ['summarize; git push && deploy', 'Reply with exactly: ROUND_TRIP_OK'];
+    for (const name of ['claude', 'codex', 'grok', 'cursor']) {
+      const config = defaultAgentConfigs[name];
+      const invocation = buildAgentInvocation(config);
+      // No leftover placeholder in the static config...
+      expect(config.args, `${name} args must not carry {{prompt}}`).not.toContain('{{prompt}}');
+      // ...and the built argv is exactly the static flags, with no prompt text.
+      expect(invocation.args, `${name} argv must equal static flags`).toEqual(config.args);
+      for (const sample of promptSamples) {
+        for (const arg of invocation.args) {
+          expect(arg, `${name} argv element must not contain prompt text`).not.toContain(sample);
+        }
+      }
+    }
+    expect(buildAgentInvocation(defaultAgentConfigs.codex).command).toBe('codex');
   });
 
   test('registers ACP seats without removing the CLI fallback (M-118 order 5)', () => {

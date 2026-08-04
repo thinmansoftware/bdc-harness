@@ -36,10 +36,46 @@ export interface FusionReviewRequest {
   ci?: boolean;
 }
 
+/**
+ * Maximum prompt payload delivered over stdin to a prompt-kind agent child.
+ *
+ * WO-HARNESS-DISPATCH-STDIN-PROMPT-01 / M-126 disposition Q1 (RATIFIED 3-0,
+ * 2026-08-04): cap at 1 MiB of UTF-8 bytes, checked before spawn. Oversize
+ * prompts fail durably with the measured byte count instead of hanging or
+ * truncating silently.
+ */
+export const MAX_PROMPT_STDIN_BYTES = 1_048_576;
+
+/**
+ * Pure, side-effect-free size guard for prompt-kind stdin delivery. Returns an
+ * honest failure reason (including the measured byte count and the limit) when
+ * the rendered prompt exceeds MAX_PROMPT_STDIN_BYTES.
+ */
+export function checkPromptStdinSize(
+  byteLength: number
+): { ok: true } | { ok: false; reason: string } {
+  if (byteLength > MAX_PROMPT_STDIN_BYTES) {
+    return {
+      ok: false,
+      reason:
+        `prompt payload is ${byteLength} bytes, which exceeds the stdin ` +
+        `delivery cap of ${MAX_PROMPT_STDIN_BYTES} bytes (1 MiB); refusing to spawn`,
+    };
+  }
+  return { ok: true };
+}
+
+/**
+ * Prompt-kind seats (claude, codex, grok, cursor) receive the rendered prompt
+ * over stdin, NOT as an argv element. Their default `args` therefore carry only
+ * flags -- no `{{prompt}}` placeholder. Argv delivery of the prompt was removed
+ * outright (M-126 disposition Q2): a config opt-in is how the Windows argv size
+ * cliff and the process-list leak would return via config drift.
+ */
 export const defaultAgentConfigs: Record<string, AgentConfig> = {
   claude: {
     command: 'claude',
-    args: ['--permission-mode', 'plan', '-p', '{{prompt}}'],
+    args: ['--permission-mode', 'plan', '-p'],
   },
   codex: {
     command: 'codex',
@@ -50,16 +86,15 @@ export const defaultAgentConfigs: Record<string, AgentConfig> = {
       'read-only',
       '--ephemeral',
       '--ignore-user-config',
-      '{{prompt}}',
     ],
   },
   grok: {
     command: 'grok',
-    args: ['--permission-mode', 'plan', '--no-subagents', '-p', '{{prompt}}'],
+    args: ['--permission-mode', 'plan', '--no-subagents', '-p'],
   },
   cursor: {
     command: 'cursor-agent',
-    args: ['--print', '--mode', 'ask', '--trust', '{{prompt}}'],
+    args: ['--print', '--mode', 'ask', '--trust'],
   },
   fusion: {
     kind: 'fusion',
@@ -93,13 +128,20 @@ export const defaultAgentConfigs: Record<string, AgentConfig> = {
   },
 };
 
-export function buildAgentInvocation(
-  config: AgentConfig,
-  prompt: string
-): { command: string; args: string[] } {
+/**
+ * Builds the spawn command/args for a prompt-kind seat. The rendered prompt is
+ * NOT part of argv -- it is delivered over stdin by the caller
+ * (WO-HARNESS-DISPATCH-STDIN-PROMPT-01). This function is now a thin, stable
+ * seam that returns the seat's static invocation flags (a defensive copy of
+ * `args` so callers cannot mutate the shared config).
+ */
+export function buildAgentInvocation(config: AgentConfig): {
+  command: string;
+  args: string[];
+} {
   return {
     command: config.command,
-    args: config.args.map(arg => (arg === '{{prompt}}' ? prompt : arg)),
+    args: [...config.args],
   };
 }
 

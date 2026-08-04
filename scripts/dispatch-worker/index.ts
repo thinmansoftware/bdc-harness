@@ -8,6 +8,7 @@ import {
   ACP_DEFAULT_KILL_GRACE_MS,
   ACP_DEFAULT_WALL_CLOCK_MS,
   buildAgentInvocation,
+  checkPromptStdinSize,
   defaultAgentConfigs,
   parseFusionReviewBody,
   type AgentConfig,
@@ -17,15 +18,15 @@ import { resolveOperatorToken } from './credentials';
 import { acquireInstanceLock, type InstanceLockHandle } from './instance-lock';
 import { createWorkerLog, type WorkerLog } from './worker-log';
 
-type DispatchTaskType =
+export type DispatchTaskType =
   | 'agent_message'
   | 'run_review'
   | 'draft_spec'
   | 'run_report'
   | 'board_motion';
-type DispatchStatus = 'queued' | 'claimed' | 'done' | 'failed' | 'cancelled';
+export type DispatchStatus = 'queued' | 'claimed' | 'done' | 'failed' | 'cancelled';
 
-interface DispatchMessage {
+export interface DispatchMessage {
   id: string;
   task_type: DispatchTaskType;
   sender: string;
@@ -270,7 +271,7 @@ async function runAcpLeg(
   };
 }
 
-async function runAgent(
+export async function runAgent(
   config: AgentConfig,
   message: DispatchMessage
 ): Promise<{
@@ -278,12 +279,20 @@ async function runAgent(
   status: 'done' | 'failed';
 }> {
   const cwd = await mkdtemp(join(tmpdir(), `bdc-dispatch-${message.recipient}-`));
-  let command = config.command;
+  let command: string;
   let args: string[];
+  let stdout: string;
+  let stderr: string;
+  let exitCode: number;
+
   if (config.kind === 'fusion') {
+    // Fusion is not a prompt payload -- it passes structured review artifact
+    // PATHS as argv flags, so stdin stays 'ignore' here (M-126 disposition Q2:
+    // only prompt-kind seats move to stdin).
     if (message.task_type !== 'run_review') throw new Error('fusion_review_task_type_required');
     const review = parseFusionReviewBody(message.body);
     const fusionCli = resolve(import.meta.dir, '..', '..', 'packages', 'fusion', 'src', 'cli.ts');
+    command = config.command;
     args = [
       'run',
       fusionCli,
@@ -298,23 +307,52 @@ async function runAgent(
       review.manifest,
       ...(review.ci ? ['--ci'] : []),
     ];
+    const proc = spawn({
+      cmd: [command, ...args],
+      cwd,
+      stdout: 'pipe',
+      stderr: 'pipe',
+      stdin: 'ignore',
+    });
+    [stdout, stderr, exitCode] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+      proc.exited,
+    ]);
   } else {
-    const invocation = buildAgentInvocation(config, promptFor(message));
+    // Prompt-kind seats (claude, codex, grok, cursor): deliver the rendered
+    // prompt over stdin, never as an argv element. Cap the payload at 1 MiB of
+    // UTF-8 bytes BEFORE spawning; oversize fails honestly with the measured
+    // size (M-126 disposition Q1). Windows argv size cliff, 2026-08-04.
+    const prompt = promptFor(message);
+    const promptBytes = Buffer.byteLength(prompt, 'utf8');
+    const sizeCheck = checkPromptStdinSize(promptBytes);
+    if (!sizeCheck.ok) {
+      return { resultBody: sizeCheck.reason, status: 'failed' };
+    }
+    const invocation = buildAgentInvocation(config);
     command = invocation.command;
     args = invocation.args;
+    const proc = spawn({
+      cmd: [command, ...args],
+      cwd,
+      stdout: 'pipe',
+      stderr: 'pipe',
+      stdin: 'pipe',
+    });
+    // Write the exact UTF-8 bytes, then CLOSE stdin so the child sees EOF. The
+    // codex banner "Reading additional input from stdin..." is also the hang
+    // banner -- closing stdin is what turns a hang into a completed read
+    // (M-126 disposition Q3).
+    await proc.stdin.write(Buffer.from(prompt, 'utf8'));
+    await proc.stdin.end();
+    [stdout, stderr, exitCode] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+      proc.exited,
+    ]);
   }
-  const proc = spawn({
-    cmd: [command, ...args],
-    cwd,
-    stdout: 'pipe',
-    stderr: 'pipe',
-    stdin: 'ignore',
-  });
-  const [stdout, stderr, exitCode] = await Promise.all([
-    new Response(proc.stdout).text(),
-    new Response(proc.stderr).text(),
-    proc.exited,
-  ]);
+
   const transcript = await writeTranscript({
     message,
     command,
@@ -504,7 +542,9 @@ async function main(): Promise<void> {
   }
 }
 
-main().catch(error => {
-  console.error(error);
-  process.exit(1);
-});
+if (import.meta.main) {
+  main().catch(error => {
+    console.error(error);
+    process.exit(1);
+  });
+}
