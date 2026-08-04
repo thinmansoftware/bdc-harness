@@ -84,9 +84,13 @@ function promptMessage(id: string, body: string): DispatchMessage {
 }
 
 function stubConfig(script: string): AgentConfig {
-  // kind is undefined => prompt-kind seat => stdin delivery path.
+  // kind is undefined => prompt-kind seat. Transport is keyed on the SEAT NAME,
+  // so these tests drive the stdin path via STDIN_SEAT below.
   return { command: process.execPath, args: [script] };
 }
+
+/** A Scope IN seat name -- guarantees the stdin delivery path in runAgent. */
+const STDIN_SEAT = 'claude';
 
 describe('prompt-over-stdin delivery (runAgent)', () => {
   test('large unicode+CRLF prompt round-trips byte-identical over stdin', async () => {
@@ -103,7 +107,7 @@ describe('prompt-over-stdin delivery (runAgent)', () => {
     const expectedHash = createHash('sha256').update(Buffer.from(prompt, 'utf8')).digest('hex');
     const config = stubConfig(script);
 
-    const result = await runAgent(config, promptMessage('large', prompt));
+    const result = await runAgent(STDIN_SEAT, config, promptMessage('large', prompt));
 
     expect(result.status).toBe('done');
     expect(result.resultBody).toContain(`SHA256:${expectedHash}`);
@@ -121,7 +125,7 @@ describe('prompt-over-stdin delivery (runAgent)', () => {
     const byteLength = Buffer.byteLength(body, 'utf8');
     expect(byteLength).toBe(MAX_PROMPT_STDIN_BYTES + 1);
 
-    const result = await runAgent(stubConfig(script), promptMessage('oversize', body));
+    const result = await runAgent(STDIN_SEAT, stubConfig(script), promptMessage('oversize', body));
 
     expect(result.status).toBe('failed');
     // Honest reason includes the measured byte count AND the 1 MiB limit.
@@ -135,7 +139,7 @@ describe('prompt-over-stdin delivery (runAgent)', () => {
     const { script } = await writeStub(EOF_STUB);
     // A small prompt; if stdin were left open the child never reaches 'end' and
     // this test blows past the bounded timeout instead of passing quietly.
-    const result = await runAgent(stubConfig(script), promptMessage('eof', 'ping'));
+    const result = await runAgent(STDIN_SEAT, stubConfig(script), promptMessage('eof', 'ping'));
     expect(result.status).toBe('done');
     expect(result.resultBody).toContain('EOF_SEEN');
   }, 15_000);

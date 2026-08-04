@@ -66,11 +66,73 @@ export function checkPromptStdinSize(
 }
 
 /**
- * Prompt-kind seats (claude, codex, grok, cursor) receive the rendered prompt
- * over stdin, NOT as an argv element. Their default `args` therefore carry only
- * flags -- no `{{prompt}}` placeholder. Argv delivery of the prompt was removed
- * outright (M-126 disposition Q2): a config opt-in is how the Windows argv size
- * cliff and the process-list leak would return via config drift.
+ * Argv placeholder used by LEGACY argv-delivery seats: the rendered prompt is
+ * substituted into this exact argv element. It is meaningful ONLY for seats
+ * that are argv seats by identity (see STDIN_PROMPT_SEATS below). It is NOT a
+ * transport switch -- its presence can never move an argv-hard-removed seat
+ * back onto argv.
+ */
+export const PROMPT_ARGV_PLACEHOLDER = '{{prompt}}';
+
+/**
+ * Seats whose argv prompt delivery is HARD-REMOVED
+ * (WO-HARNESS-DISPATCH-STDIN-PROMPT-01 / M-126 disposition Q2, Scope IN).
+ *
+ * Transport for these seats is a property of the SEAT IDENTITY, not of its
+ * config. This is deliberate: `readConfig` merges operator config over the
+ * defaults wholesale, so if transport were inferred from `args` content, a
+ * config that re-added `{{prompt}}` to claude/codex would silently restore
+ * argv delivery -- resurrecting the process-list leak and the Windows argv
+ * size cliff via config drift. That opt-in is exactly what Q2 forbids, so a
+ * stdin seat is stdin under every possible config.
+ */
+export const STDIN_PROMPT_SEATS: ReadonlySet<string> = new Set(['claude', 'codex']);
+
+/**
+ * Prompt delivery transport for a seat, decided purely by seat NAME:
+ *  - 'stdin' -> claude/codex (Scope IN). The prompt is written to the child's
+ *               stdin and never enters argv. Not config-overridable.
+ *  - 'argv'  -> every other prompt-kind seat (grok/cursor and any
+ *               operator-defined seat, Scope OUT). Their CLIs are not proven
+ *               stdin-capable, so their transport is intentionally UNCHANGED
+ *               from the pre-WO baseline (board Q3 residual).
+ */
+export function seatPromptDelivery(seat: string): 'argv' | 'stdin' {
+  return STDIN_PROMPT_SEATS.has(seat) ? 'stdin' : 'argv';
+}
+
+/**
+ * Fail-closed guard for config drift on argv-hard-removed seats.
+ *
+ * A stdin seat carrying `{{prompt}}` in its configured args is rejected loudly
+ * rather than (a) silently restoring argv delivery or (b) passing the literal
+ * `{{prompt}}` string through to the CLI as a real argument. Both of those are
+ * regressions this WO exists to prevent, so the misconfiguration is surfaced to
+ * the operator instead of being absorbed.
+ */
+export function assertNoLegacyPromptPlaceholder(seat: string, config: AgentConfig): void {
+  if (!STDIN_PROMPT_SEATS.has(seat)) return;
+  if (config.args.includes(PROMPT_ARGV_PLACEHOLDER)) {
+    throw new Error(
+      `agent seat "${seat}" delivers its prompt over stdin; remove the legacy ` +
+        `"${PROMPT_ARGV_PLACEHOLDER}" element from its configured args ` +
+        '(argv prompt delivery was removed for this seat and cannot be re-enabled by config)'
+    );
+  }
+}
+
+/**
+ * Default seat configs, split by prompt-delivery transport
+ * (WO-HARNESS-DISPATCH-STDIN-PROMPT-01 / M-126 disposition Q2):
+ *
+ *  - claude, codex (Scope IN): stdin delivery. Their `args` carry only flags --
+ *    no `{{prompt}}` placeholder -- so the prompt never appears in argv or the
+ *    process list. Argv delivery is hard-removed by seat identity: re-adding
+ *    the placeholder in config does NOT restore it, it is rejected.
+ *  - grok, cursor (Scope OUT): their CLIs are NOT proven stdin-capable, so this
+ *    WO must NOT change their transport. They retain the `{{prompt}}`
+ *    placeholder and stay argv-cliffed (explicit residual, board Q3). A future
+ *    stdin conversion for them is a separate WO with its own tests.
  */
 export const defaultAgentConfigs: Record<string, AgentConfig> = {
   claude: {
@@ -90,11 +152,11 @@ export const defaultAgentConfigs: Record<string, AgentConfig> = {
   },
   grok: {
     command: 'grok',
-    args: ['--permission-mode', 'plan', '--no-subagents', '-p'],
+    args: ['--permission-mode', 'plan', '--no-subagents', '-p', PROMPT_ARGV_PLACEHOLDER],
   },
   cursor: {
     command: 'cursor-agent',
-    args: ['--print', '--mode', 'ask', '--trust'],
+    args: ['--print', '--mode', 'ask', '--trust', PROMPT_ARGV_PLACEHOLDER],
   },
   fusion: {
     kind: 'fusion',
@@ -129,20 +191,35 @@ export const defaultAgentConfigs: Record<string, AgentConfig> = {
 };
 
 /**
- * Builds the spawn command/args for a prompt-kind seat. The rendered prompt is
- * NOT part of argv -- it is delivered over stdin by the caller
- * (WO-HARNESS-DISPATCH-STDIN-PROMPT-01). This function is now a thin, stable
- * seam that returns the seat's static invocation flags (a defensive copy of
- * `args` so callers cannot mutate the shared config).
+ * Builds the spawn command/args for a prompt-kind seat and reports how the
+ * prompt is delivered (WO-HARNESS-DISPATCH-STDIN-PROMPT-01). Transport is
+ * chosen by `seat` NAME via seatPromptDelivery -- never by args content:
+ *
+ *  - stdin seats (claude/codex): the returned `args` are the seat's static
+ *    flags (a defensive copy so callers cannot mutate the shared config) and
+ *    `delivery` is 'stdin'. The caller writes the prompt to the child's stdin;
+ *    it never enters argv. A configured `{{prompt}}` here is rejected.
+ *  - argv seats (grok/cursor and operator-defined seats): the placeholder
+ *    element is replaced by `prompt` and `delivery` is 'argv'. `prompt` is
+ *    required for these seats; omitting it is a programming error.
  */
-export function buildAgentInvocation(config: AgentConfig): {
-  command: string;
-  args: string[];
-} {
-  return {
-    command: config.command,
-    args: [...config.args],
-  };
+export function buildAgentInvocation(
+  seat: string,
+  config: AgentConfig,
+  prompt?: string
+): { command: string; args: string[]; delivery: 'argv' | 'stdin' } {
+  const delivery = seatPromptDelivery(seat);
+  if (delivery === 'stdin') {
+    assertNoLegacyPromptPlaceholder(seat, config);
+    return { command: config.command, args: [...config.args], delivery };
+  }
+  if (prompt === undefined) {
+    throw new Error('argv_delivery_seat_requires_prompt');
+  }
+  const rendered = config.args.map(argValue =>
+    argValue === PROMPT_ARGV_PLACEHOLDER ? prompt : argValue
+  );
+  return { command: config.command, args: rendered, delivery };
 }
 
 export function parseFusionReviewBody(body: string): FusionReviewRequest {

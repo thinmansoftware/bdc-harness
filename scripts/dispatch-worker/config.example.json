@@ -28,7 +28,7 @@
   "agents": {
     "claude": {
       "command": "claude",
-      "args": ["--permission-mode", "plan", "-p", "{{prompt}}"]
+      "args": ["--permission-mode", "plan", "-p"]
     },
     "codex": {
       "command": "codex",
@@ -38,8 +38,7 @@
         "--sandbox",
         "read-only",
         "--ephemeral",
-        "--ignore-user-config",
-        "{{prompt}}"
+        "--ignore-user-config"
       ]
     },
     "grok": {

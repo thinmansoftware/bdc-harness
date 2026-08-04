@@ -1,25 +1,38 @@
 import { describe, expect, test } from 'bun:test';
-import { buildAgentInvocation, defaultAgentConfigs, parseFusionReviewBody } from './adapters';
+import {
+  assertNoLegacyPromptPlaceholder,
+  buildAgentInvocation,
+  defaultAgentConfigs,
+  parseFusionReviewBody,
+  seatPromptDelivery,
+  STDIN_PROMPT_SEATS,
+  type AgentConfig,
+} from './adapters';
 
 describe('dispatch worker adapters', () => {
   test('ships read-only invocation contracts for installed desktop agents', () => {
-    expect(buildAgentInvocation(defaultAgentConfigs.claude).args).toContain('plan');
-    expect(buildAgentInvocation(defaultAgentConfigs.codex).args).toContain('read-only');
-    expect(buildAgentInvocation(defaultAgentConfigs.grok).args).toContain('plan');
-    expect(buildAgentInvocation(defaultAgentConfigs.cursor).args).toContain('ask');
+    // stdin seats need no prompt; argv seats (grok/cursor) require one to
+    // substitute into the {{prompt}} placeholder.
+    expect(buildAgentInvocation('claude', defaultAgentConfigs.claude).args).toContain('plan');
+    expect(buildAgentInvocation('codex', defaultAgentConfigs.codex).args).toContain('read-only');
+    expect(buildAgentInvocation('grok', defaultAgentConfigs.grok, 'ping').args).toContain('plan');
+    expect(buildAgentInvocation('cursor', defaultAgentConfigs.cursor, 'ping').args).toContain(
+      'ask'
+    );
   });
 
-  test('never places prompt text into argv for prompt-kind seats', () => {
-    // WO-HARNESS-DISPATCH-STDIN-PROMPT-01 (M-126 Q2): argv delivery of the
-    // prompt was removed outright. The prompt now travels over stdin, so no
-    // seat config may carry a substitution placeholder and buildAgentInvocation
-    // must never inject prompt text into argv.
+  test('claude and codex deliver the prompt over stdin, never in argv', () => {
+    // WO-HARNESS-DISPATCH-STDIN-PROMPT-01 Scope IN (M-126 Q2): argv delivery is
+    // hard-removed for the claude/codex seats. Their static args carry no
+    // {{prompt}} placeholder and the prompt never enters argv.
     const promptSamples = ['summarize; git push && deploy', 'Reply with exactly: ROUND_TRIP_OK'];
-    for (const name of ['claude', 'codex', 'grok', 'cursor']) {
+    for (const name of ['claude', 'codex']) {
       const config = defaultAgentConfigs[name];
-      const invocation = buildAgentInvocation(config);
-      // No leftover placeholder in the static config...
+      // No placeholder in the static config...
       expect(config.args, `${name} args must not carry {{prompt}}`).not.toContain('{{prompt}}');
+      expect(seatPromptDelivery(name), `${name} must use stdin delivery`).toBe('stdin');
+      const invocation = buildAgentInvocation(name, config);
+      expect(invocation.delivery, `${name} invocation delivery`).toBe('stdin');
       // ...and the built argv is exactly the static flags, with no prompt text.
       expect(invocation.args, `${name} argv must equal static flags`).toEqual(config.args);
       for (const sample of promptSamples) {
@@ -28,7 +41,86 @@ describe('dispatch worker adapters', () => {
         }
       }
     }
-    expect(buildAgentInvocation(defaultAgentConfigs.codex).command).toBe('codex');
+    expect(buildAgentInvocation('codex', defaultAgentConfigs.codex).command).toBe('codex');
+  });
+
+  test('grok and cursor remain argv-cliffed: prompt is one substituted argv element', () => {
+    // WO-HARNESS-DISPATCH-STDIN-PROMPT-01 Scope OUT (board Q3): grok/cursor CLIs
+    // are not proven stdin-capable, so their transport is intentionally
+    // UNCHANGED. They retain the {{prompt}} placeholder and receive the prompt
+    // via argv as one element (no shell interpolation / splitting).
+    const prompt = 'summarize; git push && deploy';
+    for (const name of ['grok', 'cursor']) {
+      const config = defaultAgentConfigs[name];
+      expect(config.args, `${name} must retain the argv placeholder`).toContain('{{prompt}}');
+      expect(seatPromptDelivery(name), `${name} must use argv delivery`).toBe('argv');
+      const invocation = buildAgentInvocation(name, config, prompt);
+      expect(invocation.delivery, `${name} invocation delivery`).toBe('argv');
+      // The raw placeholder is fully replaced -- none survives in argv.
+      expect(invocation.args, `${name} argv must not keep the raw placeholder`).not.toContain(
+        '{{prompt}}'
+      );
+      // The prompt appears exactly once, as a single argv element.
+      const hits = invocation.args.filter(arg => arg === prompt);
+      expect(hits.length, `${name} must place the prompt as one argv element`).toBe(1);
+    }
+    // An argv-delivery seat with no prompt supplied is a programming error.
+    expect(() => buildAgentInvocation('grok', defaultAgentConfigs.grok)).toThrow(
+      'argv_delivery_seat_requires_prompt'
+    );
+  });
+
+  test('argv delivery is hard-removed for claude/codex -- config cannot re-enable it', () => {
+    // Final-review regression (M-126 Q2): transport must be a property of the
+    // SEAT IDENTITY, not of config content. readConfig merges operator config
+    // over the defaults wholesale, so if the {{prompt}} placeholder acted as a
+    // transport switch, a drifted config could silently put the prompt back in
+    // argv and resurrect the process-list leak + Windows argv size cliff.
+    const prompt = 'summarize; git push && deploy';
+
+    for (const seat of ['claude', 'codex']) {
+      // A drifted config that re-adds the legacy placeholder...
+      const drifted: AgentConfig = {
+        command: seat,
+        args: ['--flag', '{{prompt}}'],
+      };
+      // ...must NOT flip the seat to argv.
+      expect(seatPromptDelivery(seat), `${seat} stays stdin under any config`).toBe('stdin');
+      // ...and must be rejected outright rather than absorbed. This covers both
+      // failure modes: silent argv restore AND leaking the literal placeholder.
+      expect(
+        () => buildAgentInvocation(seat, drifted, prompt),
+        `${seat} must reject a configured {{prompt}}`
+      ).toThrow(/stdin/);
+      expect(() => assertNoLegacyPromptPlaceholder(seat, drifted)).toThrow(/stdin/);
+
+      // A clean override still works and never carries prompt text in argv.
+      const clean: AgentConfig = { command: seat, args: ['--flag'] };
+      const inv = buildAgentInvocation(seat, clean, prompt);
+      expect(inv.delivery).toBe('stdin');
+      expect(inv.args).toEqual(['--flag']);
+      expect(inv.args).not.toContain(prompt);
+    }
+
+    // The hard-removal set is exactly the Scope IN seats -- out-of-scope seats
+    // keep their pre-WO argv transport.
+    expect([...STDIN_PROMPT_SEATS].sort()).toEqual(['claude', 'codex']);
+    for (const seat of ['grok', 'cursor']) {
+      expect(seatPromptDelivery(seat)).toBe('argv');
+      expect(() => assertNoLegacyPromptPlaceholder(seat, defaultAgentConfigs[seat])).not.toThrow();
+    }
+  });
+
+  test('operator-defined seats keep the pre-WO argv behavior (scope wall)', () => {
+    // Scope OUT: an unknown/custom CLI is not proven stdin-capable, so it must
+    // behave exactly as before this WO -- argv substitution, no literal
+    // placeholder surviving.
+    const prompt = 'do the thing';
+    const legacy: AgentConfig = { command: 'legacy-cli', args: ['--go', '{{prompt}}'] };
+    const inv = buildAgentInvocation('legacy-cli', legacy, prompt);
+    expect(inv.delivery).toBe('argv');
+    expect(inv.args).toEqual(['--go', prompt]);
+    expect(inv.args, 'literal placeholder must never survive').not.toContain('{{prompt}}');
   });
 
   test('registers ACP seats without removing the CLI fallback (M-118 order 5)', () => {

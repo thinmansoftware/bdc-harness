@@ -7,6 +7,7 @@ import {
   ACP_DEFAULT_IDLE_TIMEOUT_MS,
   ACP_DEFAULT_KILL_GRACE_MS,
   ACP_DEFAULT_WALL_CLOCK_MS,
+  assertNoLegacyPromptPlaceholder,
   buildAgentInvocation,
   checkPromptStdinSize,
   defaultAgentConfigs,
@@ -101,6 +102,14 @@ async function readConfig(path: string): Promise<NormalizedWorkerConfig> {
   const parsed = JSON.parse(raw) as WorkerConfig;
   if (!parsed.server_url) throw new Error('config.server_url is required');
   const agents = { ...defaultAgentConfigs, ...(parsed.agents ?? {}) };
+  // Fail fast on config drift: a stdin-only seat (claude/codex) that still
+  // carries the legacy {{prompt}} argv placeholder is rejected at startup
+  // rather than silently restoring argv delivery or leaking the literal
+  // placeholder to the CLI (WO-HARNESS-DISPATCH-STDIN-PROMPT-01 / M-126 Q2).
+  for (const [seat, agentConfig] of Object.entries(agents)) {
+    if ((agentConfig.kind ?? 'prompt') !== 'prompt') continue;
+    assertNoLegacyPromptPlaceholder(seat, agentConfig);
+  }
 
   return {
     worker_id: parsed.worker_id ?? `dispatch-worker-${hostname()}`,
@@ -272,6 +281,7 @@ async function runAcpLeg(
 }
 
 export async function runAgent(
+  seat: string,
   config: AgentConfig,
   message: DispatchMessage
 ): Promise<{
@@ -320,37 +330,63 @@ export async function runAgent(
       proc.exited,
     ]);
   } else {
-    // Prompt-kind seats (claude, codex, grok, cursor): deliver the rendered
-    // prompt over stdin, never as an argv element. Cap the payload at 1 MiB of
-    // UTF-8 bytes BEFORE spawning; oversize fails honestly with the measured
-    // size (M-126 disposition Q1). Windows argv size cliff, 2026-08-04.
+    // Prompt-kind seats. Delivery transport is decided by the seat NAME (not by
+    // its config args) in buildAgentInvocation (WO-HARNESS-DISPATCH-STDIN-PROMPT-01):
+    //   - claude/codex (Scope IN): stdin delivery -- the rendered prompt is
+    //     written to the child's stdin and never appears in argv. Config cannot
+    //     move these seats back to argv.
+    //   - grok/cursor (Scope OUT): argv delivery -- their CLIs are not proven
+    //     stdin-capable, so their transport is intentionally UNCHANGED. They
+    //     retain the {{prompt}} placeholder and stay argv-cliffed (board Q3).
     const prompt = promptFor(message);
-    const promptBytes = Buffer.byteLength(prompt, 'utf8');
-    const sizeCheck = checkPromptStdinSize(promptBytes);
-    if (!sizeCheck.ok) {
-      return { resultBody: sizeCheck.reason, status: 'failed' };
-    }
-    const invocation = buildAgentInvocation(config);
+    const invocation = buildAgentInvocation(seat, config, prompt);
     command = invocation.command;
     args = invocation.args;
-    const proc = spawn({
-      cmd: [command, ...args],
-      cwd,
-      stdout: 'pipe',
-      stderr: 'pipe',
-      stdin: 'pipe',
-    });
-    // Write the exact UTF-8 bytes, then CLOSE stdin so the child sees EOF. The
-    // codex banner "Reading additional input from stdin..." is also the hang
-    // banner -- closing stdin is what turns a hang into a completed read
-    // (M-126 disposition Q3).
-    await proc.stdin.write(Buffer.from(prompt, 'utf8'));
-    await proc.stdin.end();
-    [stdout, stderr, exitCode] = await Promise.all([
-      new Response(proc.stdout).text(),
-      new Response(proc.stderr).text(),
-      proc.exited,
-    ]);
+    if (invocation.delivery === 'stdin') {
+      // Cap the payload at 1 MiB of UTF-8 bytes BEFORE spawning; oversize fails
+      // honestly with the measured size (M-126 disposition Q1). Windows argv
+      // size cliff, 2026-08-04.
+      const promptBytes = Buffer.byteLength(prompt, 'utf8');
+      const sizeCheck = checkPromptStdinSize(promptBytes);
+      if (!sizeCheck.ok) {
+        return { resultBody: sizeCheck.reason, status: 'failed' };
+      }
+      const proc = spawn({
+        cmd: [command, ...args],
+        cwd,
+        stdout: 'pipe',
+        stderr: 'pipe',
+        stdin: 'pipe',
+      });
+      // Write the exact UTF-8 bytes, then CLOSE stdin so the child sees EOF. The
+      // codex banner "Reading additional input from stdin..." is also the hang
+      // banner -- closing stdin is what turns a hang into a completed read
+      // (M-126 disposition Q3).
+      await proc.stdin.write(Buffer.from(prompt, 'utf8'));
+      await proc.stdin.end();
+      [stdout, stderr, exitCode] = await Promise.all([
+        new Response(proc.stdout).text(),
+        new Response(proc.stderr).text(),
+        proc.exited,
+      ]);
+    } else {
+      // Legacy argv delivery (grok/cursor): the prompt is substituted into argv
+      // and stdin is ignored, exactly as before this WO. These seats remain
+      // subject to the OS argv size cliff (explicit residual, Scope OUT); a
+      // future stdin conversion for them is a separate WO.
+      const proc = spawn({
+        cmd: [command, ...args],
+        cwd,
+        stdout: 'pipe',
+        stderr: 'pipe',
+        stdin: 'ignore',
+      });
+      [stdout, stderr, exitCode] = await Promise.all([
+        new Response(proc.stdout).text(),
+        new Response(proc.stderr).text(),
+        proc.exited,
+      ]);
+    }
   }
 
   const transcript = await writeTranscript({
@@ -427,7 +463,7 @@ async function processMessage(
       result =
         agentConfig.kind === 'acp'
           ? await runAcpLeg(agentConfig, claimed, cancel)
-          : await runAgent(agentConfig, claimed);
+          : await runAgent(agent, agentConfig, claimed);
     } finally {
       clearInterval(renewTimer);
     }
