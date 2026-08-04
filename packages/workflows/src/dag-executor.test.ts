@@ -10859,6 +10859,166 @@ describe('executeDagWorkflow -- token telemetry persistence and rollup', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Model attribution on the FAILURE path
+// WO-HARNESS-MODEL-ATTRIBUTION-01, Section 11 Test Scenarios
+//
+// node_completed already carried declared/requested/served/entry_rung. These
+// cover the node_failed half so a per-model scoreboard can compute failure
+// rates, not just success rates.
+//   1. A failing agent node stamps declared_model_id, requested_model_id,
+//      provider and entry_rung.
+//   2. When the provider throws before any served-model signal, the served_*
+//      keys are ABSENT -- not null. Asserted via not.toHaveProperty, because
+//      "never observed" and "provider-declared null" are different facts.
+//   3. Script-node failures stay model-less (they never resolve a provider or
+//      model, so stamping one would be inventing data).
+// ---------------------------------------------------------------------------
+describe('executeDagWorkflow -- model attribution on node_failed', () => {
+  let testDir: string;
+
+  beforeEach(async () => {
+    testDir = join(tmpdir(), `dag-fail-attr-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    await mkdir(testDir, { recursive: true });
+    mockSendQueryDag.mockClear();
+    mockGetAgentProviderDag.mockClear();
+  });
+
+  afterEach(async () => {
+    try {
+      await rm(testDir, { recursive: true, force: true });
+    } catch {
+      /* ignore cleanup errors */
+    }
+  });
+
+  // Drive the agent node into the failure path: the SDK reports a result with
+  // isError, which the executor converts into a thrown node failure.
+  function mockProviderError(): void {
+    mockSendQueryDag.mockImplementation(function* () {
+      yield {
+        type: 'result',
+        sessionId: 'attr-failed-session',
+        isError: true,
+        errorSubtype: 'provider_error',
+        errors: ['boom'],
+      };
+    });
+  }
+
+  function getNodeFailedData(store: IWorkflowStore, stepName: string): Record<string, unknown> {
+    const failedCall = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls.find(
+      ([arg]) =>
+        (arg as { event_type: string }).event_type === 'node_failed' &&
+        (arg as { step_name: string }).step_name === stepName
+    );
+    expect(failedCall).toBeDefined();
+    return (failedCall![0] as { data: Record<string, unknown> }).data;
+  }
+
+  it('stamps declared/requested/provider/entry_rung on a failing agent node', async () => {
+    mockProviderError();
+    const store = createMockStore();
+
+    await executeDagWorkflow(
+      createMockDeps(store),
+      createMockPlatform(),
+      'conv-attr-fail',
+      testDir,
+      {
+        name: 'attr-fail-test',
+        nodes: [{ id: 'work', prompt: 'do work', model: 'qwen/qwen3-coder-next' }],
+      },
+      makeWorkflowRun('attr-fail-run'),
+      'codex',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    const data = getNodeFailedData(store, 'work');
+    expect(data.declared_model_id).toBe('qwen/qwen3-coder-next');
+    expect(data.requested_model_id).toBe('qwen/qwen3-coder-next');
+    expect(data.provider).toBe('codex');
+    expect(data.entry_rung).toBe('codex:qwen/qwen3-coder-next');
+    // The pre-existing failure-path fields must survive unchanged.
+    expect(data.error).toBeDefined();
+  });
+
+  it('omits served_* keys entirely when no served-model signal ever arrived', async () => {
+    // The provider errors before reporting a served model, so there is nothing
+    // to attribute. The keys must be absent rather than written as null --
+    // writing null would be indistinguishable from a provider that explicitly
+    // declared it has no served-model field (the Codex contract).
+    mockProviderError();
+    const store = createMockStore();
+
+    await executeDagWorkflow(
+      createMockDeps(store),
+      createMockPlatform(),
+      'conv-attr-served',
+      testDir,
+      {
+        name: 'attr-served-test',
+        nodes: [{ id: 'work', prompt: 'do work', model: 'qwen/qwen3-coder-next' }],
+      },
+      makeWorkflowRun('attr-served-run'),
+      'codex',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    const data = getNodeFailedData(store, 'work');
+    // Guard: prove we reached the AGENT failure path before asserting absence.
+    // Without this, an unrelated early throw (e.g. an unregistered provider,
+    // which fails in resolveNodeProviderAndModel before any model is resolved)
+    // would land on a different node_failed site and pass every not.toHaveProperty
+    // assertion below vacuously.
+    expect(data.declared_model_id).toBe('qwen/qwen3-coder-next');
+    expect(data).not.toHaveProperty('served_model_id');
+    expect(data).not.toHaveProperty('served_model_mismatch');
+    expect(data).not.toHaveProperty('served_model_missing_reason');
+  });
+
+  it('leaves script-node failure payloads model-less', async () => {
+    // Script nodes never resolve a provider or model, so no model attribution
+    // may appear on their failures. A change that adds fields here is a bug.
+    const store = createMockStore();
+
+    await executeDagWorkflow(
+      createMockDeps(store),
+      createMockPlatform(),
+      'conv-attr-script',
+      testDir,
+      {
+        name: 'attr-script-test',
+        nodes: [{ id: 'fail-script', script: 'process.exit(2)', runtime: 'bun' }],
+      },
+      makeWorkflowRun('attr-script-run'),
+      'codex',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    const data = getNodeFailedData(store, 'fail-script');
+    expect(data).not.toHaveProperty('declared_model_id');
+    expect(data).not.toHaveProperty('requested_model_id');
+    expect(data).not.toHaveProperty('provider');
+    expect(data).not.toHaveProperty('entry_rung');
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Declared-model capture (loop nodes) + per-run model rollup
 // WO-HARNESS-TELEMETRY-DECLARED-MODEL-AND-COST-01, Section 11 Test Scenarios
 // 3 (loop-node declared reflects the parsed YAML pin) and 4 (rollup exists on

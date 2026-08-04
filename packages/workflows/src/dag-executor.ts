@@ -2539,6 +2539,27 @@ async function executeNodeInternal(
             : {}),
           ...(nodeModelUsage ? { model_usage: nodeModelUsage } : {}),
           ...(nodeTokens ? { tokens: nodeTokens } : {}),
+          // Model attribution on the failure path (WO-HARNESS-MODEL-ATTRIBUTION-01).
+          // Mirrors the node_completed payload above so a per-model scoreboard can
+          // compute failure rates, not just success rates, without a join gap.
+          // declared/requested/provider/entry_rung are always resolvable here (they
+          // are executeNodeInternal parameters, fixed before the SDK call). The
+          // served-* fields usually will NOT be: if the provider threw before any
+          // response chunk arrived, nothing ever reported a served model, so they
+          // are omitted entirely rather than written as null. Omit-when-absent is
+          // the contract -- a reader must be able to tell "never observed" from a
+          // provider-declared null.
+          ...(declaredModelId !== undefined ? { declared_model_id: declaredModelId } : {}),
+          ...(nodeOptions?.model !== undefined ? { requested_model_id: nodeOptions.model } : {}),
+          provider,
+          ...(nodeServedModelId !== undefined ? { served_model_id: nodeServedModelId } : {}),
+          ...(nodeServedMissingReason !== undefined
+            ? { served_model_missing_reason: nodeServedMissingReason }
+            : {}),
+          ...(typeof nodeServedModelId === 'string' && declaredModelId !== undefined
+            ? { served_model_mismatch: !isDeclaredServedMatch(declaredModelId, nodeServedModelId) }
+            : {}),
+          entry_rung: deriveEntryRung(provider, nodeOptions?.model),
           // Layer 1 gate_result field: present when Phase 5 registered a gate
           // outcome before the SDK threw (e.g. gate check fired then SDK errored).
           ...buildGateResultField(failureGateResult),
