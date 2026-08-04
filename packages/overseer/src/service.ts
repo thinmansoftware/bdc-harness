@@ -7,7 +7,6 @@ import {
   listRunsForOverseerWatch,
 } from '@archon/core/db/overseer';
 import { handleRecordJudgeFirst } from './judge-first-pipeline';
-import { JudgeBudgetCircuit } from './judge-first';
 import type { OverseerVerdictStoreDeps } from './types.ts';
 import { runAuthorizedEscalation } from './authorized-escalation';
 import { runEscalation } from './escalate';
@@ -159,9 +158,6 @@ const defaultVerdictStore: OverseerVerdictStoreDeps = {
   finalizeVerdict: finalizeOverseerVerdict,
 };
 
-/** One budget circuit per service process; injectable in tests via pipeline options. */
-const serviceBudgetCircuit = new JudgeBudgetCircuit();
-
 async function handleRecord(
   record: WatchedRunRecord,
   deps: OverseerRunStoreDeps & OverseerActionsDeps & GitHubClientDeps,
@@ -185,7 +181,6 @@ async function handleRecord(
         actor,
         mergeCoordinator,
         verdictStore: defaultVerdictStore,
-        judgeOptions: { budget: serviceBudgetCircuit },
       });
     } catch (error) {
       log.error(
@@ -367,6 +362,8 @@ export async function runOverseerService(options: OverseerServiceOptions = {}): 
     intervalMs: options.reconcileIntervalMs,
     once: options.once,
     reconcile: options.reconcileRun,
+  }).catch(error => {
+    log.error({ err: error as Error }, 'overseer.reconcile.scheduler_failed_isolated');
   });
   tasks.push(reconcile);
   const abortOnFailure = async (task: Promise<void>): Promise<void> => {

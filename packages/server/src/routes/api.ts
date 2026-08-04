@@ -1954,6 +1954,7 @@ const getHealthRoute = createRoute({
                   emergency_stop: z.boolean(),
                   capability_flags: z.record(z.boolean()),
                   circuit_states: z.record(z.string()),
+                  blocking_reasons: z.array(z.string()),
                 })
                 .optional(),
             })
@@ -5916,7 +5917,7 @@ export function registerApiRoutes(
     });
 
     return c.json({
-      status: 'ok',
+      status: overseerStatus.watcher === 'degraded' ? 'degraded' : 'ok',
       adapter: 'web',
       concurrency: {
         ...stats,

@@ -199,7 +199,7 @@ describe('fake GitHub mutation adapter', () => {
     const receipt = await h.adapter.attemptMutation(request(), h.authorization);
 
     expect(receipt.accepted).toBe(true);
-    expect(receipt.reason).toBe('fake_accepted');
+    expect(receipt.reason).toBe('simulated_accepted_no_mutation');
     expect(receipt.mutation_sent).toBe(false);
     expect(receipt.audit_recorded).toBe(true);
     expect(receipt.authorization_audit_recorded).toBe(true);

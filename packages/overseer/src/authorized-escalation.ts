@@ -3,7 +3,11 @@ import type { M31ActionPermit } from './m31-substrate';
 import { authorizeOverseerAction, readOverseerActionPolicyFromEnv } from './action-policy';
 
 export type AuthorizedEscalationResult =
-  | { readonly accepted: true; readonly reason: 'fake_accepted'; readonly mutation_sent: false }
+  | {
+      readonly accepted: true;
+      readonly reason: 'notification_only_no_mutation';
+      readonly mutation_sent: false;
+    }
   | { readonly accepted: false; readonly reason: string; readonly mutation_sent: false };
 
 export interface AuthorizedEscalationOptions {
@@ -12,9 +16,9 @@ export interface AuthorizedEscalationOptions {
 }
 
 /**
- * Shared Slice 1 fake-only boundary for watcher, workflow, and cascade callers.
- * It records an inert adapter attempt after persistent authorization and never
- * invokes the legacy escalation side effects.
+ * Shared authorization boundary for watcher, workflow, and cascade callers.
+ * It records the authorized notification attempt; the caller remains responsible
+ * for sending the operator notification after this check succeeds.
  */
 export async function runAuthorizedEscalation(
   runId: string,
@@ -44,7 +48,7 @@ export async function runAuthorizedEscalation(
     await appendOverseerCapabilityEvent({
       capability: 'escalation',
       event_type: 'adapter_attempt',
-      reason: 'fake_accepted',
+      reason: 'notification_only_no_mutation',
       actor: options.actor,
       correlation_id: runId,
       proposal_id: options.permit.proposal_id,
@@ -52,7 +56,7 @@ export async function runAuthorizedEscalation(
       policy_digest: authorization.policy_digest,
       verifier_registry_digest: authorization.verifier_registry_digest,
       details: {
-        adapter: 'fake-escalation',
+        adapter: 'escalation-notify-only',
         accepted: true,
         mutation_sent: false,
         permit_id: options.permit.permit_id,
@@ -63,5 +67,5 @@ export async function runAuthorizedEscalation(
   } catch {
     return { accepted: false, reason: 'attempt_audit_failed', mutation_sent: false };
   }
-  return { accepted: true, reason: 'fake_accepted', mutation_sent: false };
+  return { accepted: true, reason: 'notification_only_no_mutation', mutation_sent: false };
 }

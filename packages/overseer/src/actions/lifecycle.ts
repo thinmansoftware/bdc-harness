@@ -628,12 +628,12 @@ function mutationReceiptValid(
   }
   if (mutation.accepted) {
     return (
-      mutation.reason === 'fake_accepted' &&
+      mutation.reason === 'simulated_accepted_no_mutation' &&
       typeof mutation.external_effect_reference === 'string' &&
       mutation.external_effect_reference.length > 0
     );
   }
-  return mutation.reason !== 'fake_accepted' && mutation.external_effect_reference === null;
+  return mutation.reason !== 'simulated_accepted_no_mutation' && mutation.external_effect_reference === null;
 }
 
 function executionResult(

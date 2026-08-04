@@ -189,6 +189,16 @@ describe('reconcile', () => {
     expect(deps.actions).toEqual([]);
   });
 
+  test('generic search transport error skips cycle with warn log and does not throw', async () => {
+    const deps = fakeDeps({ searchError: new Error('socket reset') });
+
+    const result = await runReconcileOnce({ deps });
+
+    expect(result).toEqual({ scanned: 0, closed: 0, skipped: true });
+    expect(deps.warnings).toEqual(['overseer.reconcile.transport_error_skip']);
+    expect(deps.findTrackerIssueByStem).not.toHaveBeenCalled();
+  });
+
   test('rate-limit response from findTrackerIssueByStem (per-stem search, not the merged-PR search) skips cleanly instead of crashing the watcher (regression: live incident 2026-07-22, overseer_runtime.watcher_exception_degraded)', async () => {
     const deps = fakeDeps({
       trackerLookupError: Object.assign(new Error('API rate limit exceeded'), {

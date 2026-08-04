@@ -534,7 +534,7 @@ describe('lifecycle execution', () => {
     const reconciliationMutation = {
       adapter: 'fake-lifecycle',
       accepted: true,
-      reason: 'fake_accepted',
+      reason: 'simulated_accepted_no_mutation',
       mutation_sent: false,
       external_effect_reference: result.external_effect_reference,
       permit_id: boundPermit.permit_id,
@@ -687,7 +687,7 @@ describe('lifecycle execution', () => {
     const mutation = {
       adapter: 'fake-lifecycle' as const,
       accepted: true,
-      reason: 'fake_accepted' as const,
+      reason: 'simulated_accepted_no_mutation' as const,
       mutation_sent: false as const,
       external_effect_reference: externalReference,
       permit_id: boundPermit.permit_id,
@@ -962,7 +962,7 @@ describe('salvage verification and floors', () => {
     const reconciliationMutation = {
       adapter: 'fake-lifecycle',
       accepted: true,
-      reason: 'fake_accepted',
+      reason: 'simulated_accepted_no_mutation',
       mutation_sent: false,
       external_effect_reference: 'fake://close',
       permit_id: boundPermit.permit_id,

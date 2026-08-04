@@ -175,6 +175,7 @@ mock.module('@archon/core/utils/commands', () => ({
 }));
 
 import { registerApiRoutes } from './api';
+import { startOverseerRuntime } from '../overseer-runtime';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -231,6 +232,7 @@ describe('GET /api/health', () => {
       concurrency: { active: number; activeConversationIds: string[] };
       runningWorkflows: number;
       version: string;
+      overseer: { blocking_reasons: string[] };
     };
     expect(body.status).toBe('ok');
     expect(body.adapter).toBe('web');
@@ -240,6 +242,7 @@ describe('GET /api/health', () => {
     expect(body.runningWorkflows).toBe(1);
     expect(typeof body.version).toBe('string');
     expect(body.version.length).toBeGreaterThan(0);
+    expect(Array.isArray(body.overseer.blocking_reasons)).toBe(true);
   });
 
   test('includes running background workflows in concurrency.active count', async () => {
@@ -266,6 +269,28 @@ describe('GET /api/health', () => {
     expect(body.concurrency.active).toBe(2);
     expect(body.concurrency.activeConversationIds).toEqual(['conv-1', 'conv-2']);
     expect(body.runningWorkflows).toBe(2);
+  });
+
+  test('degraded watcher makes top-level health status non-ok', async () => {
+    mockGetStats.mockImplementationOnce(() => ({
+      active: 0,
+      queuedTotal: 0,
+      queuedByConversation: [],
+      maxConcurrent: 10,
+      activeConversationIds: [],
+    }));
+    mockGetRunningWorkflows.mockImplementationOnce(async () => []);
+    process.env.OVERSEER_ENABLED = 'true';
+    process.env.OVERSEER_USE_FAKE_GITHUB_ADAPTER = 'false';
+    delete process.env.GH_TOKEN;
+    delete process.env.GITHUB_TOKEN;
+    startOverseerRuntime();
+
+    const response = await makeApp().request('/api/health');
+    const body = (await response.json()) as { status: string; overseer: { watcher: string } };
+
+    expect(body.overseer.watcher).toBe('degraded');
+    expect(body.status).not.toBe('ok');
   });
 
   test('deduplicates conversation IDs tracked by both lock manager and DB', async () => {

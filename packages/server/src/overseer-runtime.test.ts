@@ -23,6 +23,7 @@ import {
   getOverseerRuntimeStatus,
 } from './overseer-runtime';
 import { createMergeManager } from '../../overseer/src/merge-manager.ts';
+import { PRODUCTION_EFFECT_HOLD_REASON } from '../../overseer/src/merge-manager.ts';
 
 const getStatus = () =>
   getOverseerRuntimeStatus({ listCapabilityStates: listCapabilityStatesMock });
@@ -182,6 +183,21 @@ describe('overseer-runtime', () => {
     expect(status.emergency_stop).toBe(true);
     expect(Object.keys(status).includes('token')).toBe(false);
     expect(JSON.stringify(status)).not.toContain('REPLACE_WITH');
+  });
+
+  test('blocking_reasons names active merge gates', async () => {
+    listCapabilityStatesMock.mockImplementation(async () => [
+      { capability: 'escalation', action_enabled: true, circuit_state: 'open' },
+      { capability: 'merge', action_enabled: false, circuit_state: 'closed' },
+    ]);
+
+    const status = await getStatus();
+
+    expect(status.blocking_reasons).toContain(PRODUCTION_EFFECT_HOLD_REASON);
+    expect(status.blocking_reasons).toContain('escalation:circuit_open');
+    expect(status.blocking_reasons).toContain('merge:capability_flag_disabled');
+    expect(status.blocking_reasons).toContain('emergency_stop');
+    expect(status.blocking_reasons).not.toContain('escalation:capability_flag_disabled');
   });
 
   test('circuit_states default to unknown when DB returns empty (not closed)', async () => {

@@ -29,7 +29,7 @@ describe('runAuthorizedEscalation', () => {
     expect(source.toLowerCase()).not.toContain('webhook');
     expect(source.toLowerCase()).not.toContain('notion');
     expect(source).not.toContain('writeFile');
-    expect(source).toContain("adapter: 'fake-escalation'");
+    expect(source).toContain("adapter: 'escalation-notify-only'");
     expect(source).toContain('mutation_sent: false');
   });
 });

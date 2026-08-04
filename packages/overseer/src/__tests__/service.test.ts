@@ -479,10 +479,12 @@ describe('service', () => {
       expect(mergePullRequest).not.toHaveBeenCalled();
       expect(actions).toHaveLength(1);
       expect(actions[0]?.action).toBe('fake_escalation_attempt');
-      expect(actions[0]?.result).toMatch(/^fake_accepted:operator_card:[0-9a-f]{64}$/);
+      expect(actions[0]?.result).toMatch(
+        /^notification_only_no_mutation:operator_card:[0-9a-f]{64}$/
+      );
       expect(attempts).toHaveLength(1);
       expect(attempts[0]?.details).toMatchObject({
-        adapter: 'fake-escalation',
+        adapter: 'escalation-notify-only',
         accepted: true,
         mutation_sent: false,
       });
@@ -868,6 +870,37 @@ describe('service', () => {
     const pollsAfterReject = watcherPolls;
     await new Promise<void>(resolve => setTimeout(resolve, 10));
     expect(watcherPolls).toBe(pollsAfterReject);
+  });
+
+  test('reconcile failure is isolated and does not abort the watcher', async () => {
+    const controller = new AbortController();
+    let watcherPolls = 0;
+    const deps = {
+      listRunsForWatch: async () => {
+        watcherPolls += 1;
+        if (watcherPolls === 3) controller.abort();
+        return [];
+      },
+      listRunEvents: async () => [],
+      findPullRequest: async () => ({ exists: false as const }),
+      mergePullRequest: async () => undefined,
+      insertOverseerAction: async () => undefined,
+    };
+
+    await expect(
+      runOverseerService({
+        enabled: true,
+        adapterKind: 'fake',
+        deps,
+        signal: controller.signal,
+        intervalMs: 1,
+        reconcileIntervalMs: 1,
+        reconcileRun: async () => {
+          throw new Error('reconcile_transport_failed');
+        },
+      })
+    ).resolves.toBeUndefined();
+    expect(watcherPolls).toBe(3);
   });
 
   test('watcher failure aborts and quiesces the delivery scheduler before rejecting', async () => {
