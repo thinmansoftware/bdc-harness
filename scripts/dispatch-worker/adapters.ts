@@ -1,10 +1,32 @@
-export type AgentKind = 'prompt' | 'fusion';
+export type AgentKind = 'prompt' | 'fusion' | 'acp';
 
 export interface AgentConfig {
   kind?: AgentKind;
   command: string;
   args: string[];
+  /**
+   * ACP-only (kind: 'acp'), all optional with safe defaults.
+   *
+   * WO-HARNESS-ACP-DISPATCH-SLICE-01 / M-118: an ACP agent is spawned once per
+   * dispatch message and driven over a live stdio session instead of a
+   * one-shot CLI call. The `prompt` kind remains the compatibility fallback
+   * the ruling requires us to keep (order 5).
+   */
+  acp?: {
+    /** authMethodId sent in `authenticate`; omit to skip the call entirely. */
+    authMethodId?: string;
+    /** No session/update for this long -> cancel. */
+    idleTimeoutMs?: number;
+    /** Total run longer than this -> cancel. */
+    wallClockMs?: number;
+    /** Grace between session/cancel and the process-tree kill. */
+    killGraceMs?: number;
+  };
 }
+
+export const ACP_DEFAULT_IDLE_TIMEOUT_MS = 120_000;
+export const ACP_DEFAULT_WALL_CLOCK_MS = 1_800_000;
+export const ACP_DEFAULT_KILL_GRACE_MS = 5_000;
 
 export interface FusionReviewRequest {
   wo: string;
@@ -43,6 +65,31 @@ export const defaultAgentConfigs: Record<string, AgentConfig> = {
     kind: 'fusion',
     command: 'bun',
     args: [],
+  },
+  /**
+   * ACP seats (M-118 vertical slice). Registered alongside -- not instead of --
+   * the CLI entries above, which remain the ruling-mandated fallback.
+   *
+   * grok-acp: proven live on this machine (grok 0.2.118, cached_token auth,
+   * full initialize/authenticate/session-new/session-prompt handshake) per
+   * M-20260802-118.acp-compatibility-proof.md.
+   *
+   * claude-acp: @zed-industries/claude-code-acp, run via npx so the wrapper
+   * does not have to be globally installed. Rides the existing Claude Code
+   * login; if it ever demands a raw API key that is a finding to report, not
+   * something to work around (WO scope wall).
+   */
+  'grok-acp': {
+    kind: 'acp',
+    command: 'grok',
+    args: ['agent', 'stdio'],
+    acp: { authMethodId: 'cached_token' },
+  },
+  'claude-acp': {
+    kind: 'acp',
+    command: 'npx',
+    args: ['-y', '@zed-industries/claude-code-acp'],
+    acp: {},
   },
 };
 

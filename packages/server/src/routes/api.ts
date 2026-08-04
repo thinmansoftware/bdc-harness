@@ -225,6 +225,7 @@ import {
   heartbeatDispatchWorkerBodySchema,
   listDispatchMessagesQuerySchema,
   postDispatchResultBodySchema,
+  renewDispatchLeaseBodySchema,
   registerDispatchWorkerBodySchema,
 } from './schemas/dispatch.schemas';
 import {
@@ -661,6 +662,28 @@ const postDispatchResultRoute = createRoute({
       description: 'Completed dispatch message',
     },
     409: jsonError('Stale fencing token or cancelled message'),
+    500: jsonError('Server error'),
+  },
+});
+
+const renewDispatchLeaseRoute = createRoute({
+  method: 'post',
+  path: '/api/dispatch/messages/{id}/renew-lease',
+  tags: ['Dispatch'],
+  summary: 'Extend the lease on a claimed dispatch message',
+  request: {
+    params: dispatchMessageIdParamsSchema,
+    body: {
+      content: { 'application/json': { schema: renewDispatchLeaseBodySchema } },
+      required: true,
+    },
+  },
+  responses: {
+    200: {
+      content: { 'application/json': { schema: dispatchMessageSchema } },
+      description: 'Renewed dispatch message lease',
+    },
+    409: jsonError('Stale fencing token, not lease owner, or not claimed'),
     500: jsonError('Server error'),
   },
 });
@@ -3411,6 +3434,27 @@ export function registerApiRoutes(
     } catch (error) {
       getLog().error({ err: error }, 'dispatch_post_result_failed');
       return apiError(c, 500, 'Failed to post dispatch result');
+    }
+  });
+
+  registerOpenApiRoute(renewDispatchLeaseRoute, async c => {
+    try {
+      const body = getValidatedBody(c, renewDispatchLeaseBodySchema);
+      const message = await dispatchDb.renewMessageLease({
+        id: c.req.param('id') ?? '',
+        worker_id: body.worker_id,
+        fencing_token: body.fencing_token,
+        ...(body.lease_duration_ms !== undefined
+          ? { leaseDurationMs: body.lease_duration_ms }
+          : {}),
+      });
+      if (!message) {
+        return apiError(c, 409, 'Stale fencing token, not lease owner, or message not claimed');
+      }
+      return c.json(message);
+    } catch (error) {
+      getLog().error({ err: error }, 'dispatch_renew_lease_failed');
+      return apiError(c, 500, 'Failed to renew dispatch lease');
     }
   });
 

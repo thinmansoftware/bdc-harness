@@ -4,11 +4,15 @@ import { join, resolve } from 'path';
 import { spawn } from 'bun';
 import { isBoardAliasMessage, renderBoardMotionPrompt } from './board-motion';
 import {
+  ACP_DEFAULT_IDLE_TIMEOUT_MS,
+  ACP_DEFAULT_KILL_GRACE_MS,
+  ACP_DEFAULT_WALL_CLOCK_MS,
   buildAgentInvocation,
   defaultAgentConfigs,
   parseFusionReviewBody,
   type AgentConfig,
 } from './adapters';
+import { createCancelController, runAcpAgent, type AcpRunResult } from './acp/session';
 import { resolveOperatorToken } from './credentials';
 import { acquireInstanceLock, type InstanceLockHandle } from './instance-lock';
 import { createWorkerLog, type WorkerLog } from './worker-log';
@@ -49,6 +53,8 @@ interface WorkerConfig {
   poll_interval_ms?: number;
   heartbeat_interval_ms?: number;
   lease_duration_ms?: number;
+  /** How often to extend the lease while an agent leg is running. */
+  lease_renew_interval_ms?: number;
   capabilities?: Record<string, unknown>;
   max_concurrency?: Record<string, number>;
   board_delivery?: {
@@ -105,6 +111,10 @@ async function readConfig(path: string): Promise<NormalizedWorkerConfig> {
     poll_interval_ms: parsed.poll_interval_ms ?? 5_000,
     heartbeat_interval_ms: parsed.heartbeat_interval_ms ?? 30_000,
     lease_duration_ms: parsed.lease_duration_ms ?? 300_000,
+    // Renew at ~1/3 of the lease so two consecutive failures still leave time
+    // to react before the lease actually lapses.
+    lease_renew_interval_ms:
+      parsed.lease_renew_interval_ms ?? Math.max(10_000, (parsed.lease_duration_ms ?? 300_000) / 3),
     capabilities: parsed.capabilities ?? { providers: Object.keys(agents) },
     max_concurrency: parsed.max_concurrency ?? {},
     board_delivery: {
@@ -178,20 +188,86 @@ function promptFor(message: DispatchMessage): string {
   }
 }
 
-async function writeTranscript(data: {
-  message: DispatchMessage;
-  command: string;
-  args: string[];
-  cwd: string;
-  stdout: string;
-  stderr: string;
-  exitCode: number;
-}): Promise<string> {
+async function writeTranscript(data: Record<string, unknown>): Promise<string> {
   const dir = join(import.meta.dir, 'transcripts');
   await mkdir(dir, { recursive: true });
-  const path = join(dir, `${Date.now()}-${data.message.id}.json`);
+  const messageId = (data.message as DispatchMessage | undefined)?.id ?? 'unknown';
+  const path = join(dir, `${Date.now()}-${messageId}.json`);
   await writeFile(path, JSON.stringify(data, null, 2), 'utf8');
   return path;
+}
+
+/**
+ * Runs one ACP agent leg and converts its result into a dispatch outcome.
+ *
+ * WO-HARNESS-ACP-DISPATCH-SLICE-01 / M-118 order 4. Honest completion is
+ * enforced here: `runAcpAgent` only reports ok=true for stopReason 'end_turn'
+ * WITH non-empty output, so a clean-but-empty exit, a timeout, or a
+ * cancellation all land as 'failed' with the reason stated in the result body
+ * rather than being reported as completed work.
+ */
+async function runAcpLeg(
+  agentConfig: AgentConfig,
+  message: DispatchMessage,
+  cancel: ReturnType<typeof createCancelController>
+): Promise<{ resultBody: string; status: 'done' | 'failed'; run: AcpRunResult }> {
+  const cwd = await mkdtemp(join(tmpdir(), `bdc-dispatch-acp-${message.recipient}-`));
+  const run = await runAcpAgent(
+    {
+      command: agentConfig.command,
+      args: agentConfig.args,
+      cwd,
+      ...(agentConfig.acp?.authMethodId !== undefined
+        ? { authMethodId: agentConfig.acp.authMethodId }
+        : {}),
+      idleTimeoutMs: agentConfig.acp?.idleTimeoutMs ?? ACP_DEFAULT_IDLE_TIMEOUT_MS,
+      wallClockMs: agentConfig.acp?.wallClockMs ?? ACP_DEFAULT_WALL_CLOCK_MS,
+      killGraceMs: agentConfig.acp?.killGraceMs ?? ACP_DEFAULT_KILL_GRACE_MS,
+    },
+    promptFor(message),
+    cancel
+  );
+
+  const transcript = await writeTranscript({
+    message,
+    transport: 'acp',
+    command: agentConfig.command,
+    args: agentConfig.args,
+    cwd,
+    stopReason: run.stopReason,
+    timedOut: run.timedOut,
+    cancelled: run.cancelled,
+    exitCode: run.exitCode,
+    agentPid: run.agentPid,
+    treeBeforeKill: run.treeBeforeKill,
+    treeAfterKill: run.treeAfterKill,
+    durationMs: run.durationMs,
+    error: run.error ?? null,
+    finalText: run.finalText,
+    updates: run.updates,
+  });
+
+  const summary = run.ok
+    ? run.finalText.trim()
+    : [
+        'ACP leg did not complete honestly.',
+        `stopReason=${run.stopReason ?? 'none'}`,
+        run.timedOut ? `timeout=${run.timedOut}` : '',
+        run.cancelled ? 'cancelled=true' : '',
+        run.error ? `error=${run.error}` : '',
+        run.treeAfterKill.length > 0
+          ? `WARNING descendants survived kill: ${run.treeAfterKill.join(',')}`
+          : '',
+        run.finalText.trim() ? `partial output:\n${run.finalText.trim()}` : '',
+      ]
+        .filter(Boolean)
+        .join('\n');
+
+  return {
+    resultBody: `${summary}\n\nTranscript: ${transcript}`,
+    status: run.ok ? 'done' : 'failed',
+    run,
+  };
 }
 
 async function runAgent(
@@ -287,7 +363,37 @@ async function processMessage(
         }),
       }
     );
-    const result = await runAgent(agentConfig, claimed);
+
+    // M-118 order 4: renew the lease while the agent leg runs. A cancelled or
+    // stolen message stops renewing and signals the ACP leg to stand down, so
+    // an operator `cancel` reaches a live agent instead of being discovered
+    // only at result time.
+    const cancel = createCancelController();
+    const renewTimer = setInterval(() => {
+      void requestJson(config, token, `/api/dispatch/messages/${claimed.id}/renew-lease`, {
+        method: 'POST',
+        body: JSON.stringify({
+          worker_id: config.worker_id,
+          fencing_token: claimed.fencing_token,
+          lease_duration_ms: config.lease_duration_ms,
+        }),
+      }).catch(error => {
+        cancel.cancel();
+        void log.error(`lease renewal failed for ${claimed.id}; cancelling leg`, error);
+      });
+    }, config.lease_renew_interval_ms);
+    renewTimer.unref?.();
+
+    let result: { resultBody: string; status: 'done' | 'failed' };
+    try {
+      result =
+        agentConfig.kind === 'acp'
+          ? await runAcpLeg(agentConfig, claimed, cancel)
+          : await runAgent(agentConfig, claimed);
+    } finally {
+      clearInterval(renewTimer);
+    }
+
     await requestJson(config, token, `/api/dispatch/messages/${claimed.id}/result`, {
       method: 'POST',
       body: JSON.stringify({

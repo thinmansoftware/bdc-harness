@@ -19,6 +19,7 @@ import {
   listWorkers,
   postResult,
   registerWorker,
+  renewMessageLease,
   resolveDispatchRecipient,
 } from './dispatch';
 
@@ -114,6 +115,107 @@ describe('dispatch db', () => {
       result_body: 'late',
     });
     expect(staleResult).toBeNull();
+  });
+
+  test('renewMessageLease keeps a long run claimed past its original lease', async () => {
+    // WO-HARNESS-ACP-DISPATCH-SLICE-01 / M-118 order 4. Regression target: an
+    // agent leg running longer than lease_duration_ms used to become silently
+    // reclaimable by another worker mid-run.
+    await registerWorker({
+      worker_id: 'worker-a',
+      host: 'host-a',
+      capabilities: { providers: ['grok'] },
+      max_concurrency: 1,
+    });
+    await registerWorker({
+      worker_id: 'worker-b',
+      host: 'host-b',
+      capabilities: { providers: ['grok'] },
+      max_concurrency: 1,
+    });
+    const message = await createMessage({
+      correlation_id: 'corr-renew',
+      idempotency_key: 'idem-renew',
+      task_type: 'agent_message',
+      sender: 'xo',
+      recipient: 'grok',
+      body: 'Long ACP run.',
+    });
+
+    const claim = await claimMessage({
+      id: message.id,
+      worker_id: 'worker-a',
+      leaseDurationMs: 30,
+    });
+    expect(claim?.fencing_token).toBe(1);
+
+    const renewed = await renewMessageLease({
+      id: message.id,
+      worker_id: 'worker-a',
+      fencing_token: claim?.fencing_token ?? 0,
+      leaseDurationMs: 60_000,
+    });
+    // Renewal must NOT bump the token -- it is not a new claim.
+    expect(renewed?.fencing_token).toBe(1);
+    expect(renewed?.status).toBe('claimed');
+
+    await Bun.sleep(50);
+    // Past the ORIGINAL 30ms lease: without renewal worker-b would steal it.
+    const steal = await claimMessage({
+      id: message.id,
+      worker_id: 'worker-b',
+      leaseDurationMs: 60_000,
+    });
+    expect(steal).toBeNull();
+
+    // The original owner still completes with its original token.
+    const done = await postResult({
+      id: message.id,
+      worker_id: 'worker-a',
+      fencing_token: 1,
+      result_body: 'finished after renewal',
+    });
+    expect(done?.status).toBe('done');
+  });
+
+  test('renewMessageLease rejects non-owner, stale token, and unclaimed messages', async () => {
+    await registerWorker({
+      worker_id: 'worker-a',
+      host: 'host-a',
+      capabilities: { providers: ['grok'] },
+      max_concurrency: 1,
+    });
+    const message = await createMessage({
+      correlation_id: 'corr-renew-guard',
+      idempotency_key: 'idem-renew-guard',
+      task_type: 'agent_message',
+      sender: 'xo',
+      recipient: 'grok',
+      body: 'Guarded.',
+    });
+
+    // Not claimed yet -> nothing to renew.
+    expect(
+      await renewMessageLease({ id: message.id, worker_id: 'worker-a', fencing_token: 1 })
+    ).toBeNull();
+
+    const claim = await claimMessage({ id: message.id, worker_id: 'worker-a' });
+    expect(claim?.status).toBe('claimed');
+
+    // Wrong owner.
+    expect(
+      await renewMessageLease({ id: message.id, worker_id: 'worker-b', fencing_token: 1 })
+    ).toBeNull();
+    // Stale token.
+    expect(
+      await renewMessageLease({ id: message.id, worker_id: 'worker-a', fencing_token: 99 })
+    ).toBeNull();
+
+    // Cancelled message is no longer renewable.
+    await cancelMessage(message.id);
+    expect(
+      await renewMessageLease({ id: message.id, worker_id: 'worker-a', fencing_token: 1 })
+    ).toBeNull();
   });
 
   test('cancel wins over late claimant result', async () => {

@@ -1,5 +1,9 @@
 import { createHash, randomUUID } from 'crypto';
 import { getDatabase } from './connection';
+import {
+  createBoardPrincipalResolver,
+  isBoardPrincipalRegistryConfigured,
+} from './board-principal-registry';
 
 const DEFAULT_LEASE_DURATION_MS = 5 * 60 * 1000;
 
@@ -73,7 +77,16 @@ export async function authenticateBoardPrincipal(
   proof: BoardPrincipalProof,
   dependencies: BoardPrincipalDependencies = {}
 ): Promise<BoardPrincipal> {
-  const resolver = dependencies.resolvePrincipal ?? defaultPrincipalResolver;
+  // WO-HARNESS-ACP-DISPATCH-SLICE-01 criterion C: fall back to the
+  // env-configured production registry when no explicit/test resolver is
+  // installed. Previously this threw board_principal_auth_unconfigured on
+  // every production call, leaving board_xo_leases permanently empty and all
+  // board-authority routes dead. Still fails CLOSED when BOARD_PRINCIPALS_JSON
+  // is absent -- the error just names the missing configuration.
+  const resolver =
+    dependencies.resolvePrincipal ??
+    defaultPrincipalResolver ??
+    (isBoardPrincipalRegistryConfigured() ? createBoardPrincipalResolver() : undefined);
   if (!resolver) {
     throw new Error('board_principal_auth_unconfigured');
   }

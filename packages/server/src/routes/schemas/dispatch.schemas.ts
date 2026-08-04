@@ -84,6 +84,20 @@ export const postDispatchResultBodySchema = z
   .strict()
   .openapi('PostDispatchResultBody');
 
+/**
+ * WO-HARNESS-ACP-DISPATCH-SLICE-01: lease renewal for long-running ACP legs.
+ * Same fencing discipline as the result body -- the caller proves it is the
+ * current lease owner holding the current token.
+ */
+export const renewDispatchLeaseBodySchema = z
+  .object({
+    worker_id: z.string().min(1),
+    fencing_token: z.number().int().nonnegative(),
+    lease_duration_ms: z.number().int().positive().max(3_600_000).optional(),
+  })
+  .strict()
+  .openapi('RenewDispatchLeaseBody');
+
 export const dispatchWorkerStatusSchema = z.enum(['available', 'unavailable']);
 
 export const dispatchWorkerSchema = z

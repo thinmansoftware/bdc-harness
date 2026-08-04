@@ -17,6 +17,36 @@ describe('dispatch worker adapters', () => {
     expect(invocation.command).toBe('codex');
   });
 
+  test('registers ACP seats without removing the CLI fallback (M-118 order 5)', () => {
+    // The ruling forbids removing a working CLI/SDK fallback before its ACP
+    // path proves equivalent auth and capabilities. Both must coexist.
+    expect(defaultAgentConfigs.grok.kind ?? 'prompt').toBe('prompt');
+    expect(defaultAgentConfigs.claude.kind ?? 'prompt').toBe('prompt');
+    expect(defaultAgentConfigs['grok-acp']?.kind).toBe('acp');
+    expect(defaultAgentConfigs['claude-acp']?.kind).toBe('acp');
+  });
+
+  test('grok ACP seat uses the proven stdio command and cached-token auth', () => {
+    // Anchored to M-20260802-118.acp-compatibility-proof.md: `grok agent stdio`
+    // authenticated via cached_token with no API key passed.
+    const seat = defaultAgentConfigs['grok-acp'];
+    expect(seat?.command).toBe('grok');
+    expect(seat?.args).toEqual(['agent', 'stdio']);
+    expect(seat?.acp?.authMethodId).toBe('cached_token');
+  });
+
+  test('ACP seats carry no inline credential material', () => {
+    // Rule 6: a wrapper demanding a raw key is a finding to report, never a
+    // secret to embed in argv or config.
+    for (const [name, seat] of Object.entries(defaultAgentConfigs)) {
+      if (seat.kind !== 'acp') continue;
+      const argv = [seat.command, ...seat.args].join(' ');
+      expect(argv, `${name} argv must not contain key-like material`).not.toMatch(
+        /sk-|api[-_]?key|token=|Bearer /i
+      );
+    }
+  });
+
   test('fusion accepts only a structured advisory review artifact set', () => {
     expect(
       parseFusionReviewBody(
