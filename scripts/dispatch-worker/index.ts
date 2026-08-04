@@ -7,6 +7,7 @@ import {
   ACP_DEFAULT_IDLE_TIMEOUT_MS,
   ACP_DEFAULT_KILL_GRACE_MS,
   ACP_DEFAULT_WALL_CLOCK_MS,
+  MAX_PROMPT_STDIN_BYTES,
   buildAgentInvocation,
   defaultAgentConfigs,
   parseFusionReviewBody,
@@ -270,7 +271,7 @@ async function runAcpLeg(
   };
 }
 
-async function runAgent(
+export async function runAgent(
   config: AgentConfig,
   message: DispatchMessage
 ): Promise<{
@@ -280,6 +281,7 @@ async function runAgent(
   const cwd = await mkdtemp(join(tmpdir(), `bdc-dispatch-${message.recipient}-`));
   let command = config.command;
   let args: string[];
+  let promptBody: string | undefined;
   if (config.kind === 'fusion') {
     if (message.task_type !== 'run_review') throw new Error('fusion_review_task_type_required');
     const review = parseFusionReviewBody(message.body);
@@ -299,7 +301,15 @@ async function runAgent(
       ...(review.ci ? ['--ci'] : []),
     ];
   } else {
-    const invocation = buildAgentInvocation(config, promptFor(message));
+    promptBody = promptFor(message);
+    const promptBytes = Buffer.byteLength(promptBody, 'utf8');
+    if (promptBytes > MAX_PROMPT_STDIN_BYTES) {
+      return {
+        status: 'failed',
+        resultBody: `Prompt payload is ${promptBytes} UTF-8 bytes; limit is ${MAX_PROMPT_STDIN_BYTES} bytes.`,
+      };
+    }
+    const invocation = buildAgentInvocation(config, promptBody);
     command = invocation.command;
     args = invocation.args;
   }
@@ -308,8 +318,14 @@ async function runAgent(
     cwd,
     stdout: 'pipe',
     stderr: 'pipe',
-    stdin: 'ignore',
+    stdin: config.kind === 'fusion' ? 'ignore' : 'pipe',
   });
+  if (promptBody !== undefined) {
+    const stdin = proc.stdin;
+    if (!stdin) throw new Error('prompt_stdin_pipe_unavailable');
+    stdin.write(promptBody);
+    stdin.end();
+  }
   const [stdout, stderr, exitCode] = await Promise.all([
     new Response(proc.stdout).text(),
     new Response(proc.stderr).text(),
@@ -504,7 +520,9 @@ async function main(): Promise<void> {
   }
 }
 
-main().catch(error => {
-  console.error(error);
-  process.exit(1);
-});
+if (import.meta.main) {
+  main().catch(error => {
+    console.error(error);
+    process.exit(1);
+  });
+}

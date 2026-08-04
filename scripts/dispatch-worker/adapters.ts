@@ -27,6 +27,7 @@ export interface AgentConfig {
 export const ACP_DEFAULT_IDLE_TIMEOUT_MS = 120_000;
 export const ACP_DEFAULT_WALL_CLOCK_MS = 1_800_000;
 export const ACP_DEFAULT_KILL_GRACE_MS = 5_000;
+export const MAX_PROMPT_STDIN_BYTES = 1_048_576;
 
 export interface FusionReviewRequest {
   wo: string;
@@ -39,7 +40,7 @@ export interface FusionReviewRequest {
 export const defaultAgentConfigs: Record<string, AgentConfig> = {
   claude: {
     command: 'claude',
-    args: ['--permission-mode', 'plan', '-p', '{{prompt}}'],
+    args: ['--permission-mode', 'plan', '-p'],
   },
   codex: {
     command: 'codex',
@@ -50,16 +51,15 @@ export const defaultAgentConfigs: Record<string, AgentConfig> = {
       'read-only',
       '--ephemeral',
       '--ignore-user-config',
-      '{{prompt}}',
     ],
   },
   grok: {
     command: 'grok',
-    args: ['--permission-mode', 'plan', '--no-subagents', '-p', '{{prompt}}'],
+    args: ['--permission-mode', 'plan', '--no-subagents', '-p'],
   },
   cursor: {
     command: 'cursor-agent',
-    args: ['--print', '--mode', 'ask', '--trust', '{{prompt}}'],
+    args: ['--print', '--mode', 'ask', '--trust'],
   },
   fusion: {
     kind: 'fusion',
@@ -95,11 +95,12 @@ export const defaultAgentConfigs: Record<string, AgentConfig> = {
 
 export function buildAgentInvocation(
   config: AgentConfig,
-  prompt: string
+  // Retained for call-site/test compatibility; no longer used for argv substitution.
+  _prompt: string
 ): { command: string; args: string[] } {
   return {
     command: config.command,
-    args: config.args.map(arg => (arg === '{{prompt}}' ? prompt : arg)),
+    args: [...config.args],
   };
 }
 

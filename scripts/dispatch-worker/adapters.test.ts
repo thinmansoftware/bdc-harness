@@ -10,11 +10,13 @@ describe('dispatch worker adapters', () => {
     expect(buildAgentInvocation(defaultAgentConfigs.cursor, prompt).args).toContain('ask');
   });
 
-  test('substitutes prompt as one argv element without shell interpolation', () => {
+  test('keeps prompt text out of argv for every prompt-kind seat', () => {
     const prompt = 'summarize; git push && deploy';
-    const invocation = buildAgentInvocation(defaultAgentConfigs.codex, prompt);
-    expect(invocation.args.at(-1)).toBe(prompt);
-    expect(invocation.command).toBe('codex');
+    for (const seat of Object.values(defaultAgentConfigs)) {
+      if ((seat.kind ?? 'prompt') !== 'prompt') continue;
+      const invocation = buildAgentInvocation(seat, prompt);
+      expect(invocation.args.every(arg => !arg.includes(prompt))).toBe(true);
+    }
   });
 
   test('registers ACP seats without removing the CLI fallback (M-118 order 5)', () => {
