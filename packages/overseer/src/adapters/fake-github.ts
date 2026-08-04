@@ -24,7 +24,7 @@ export interface FakeGitHubMutationRequest {
 }
 
 export type FakeGitHubReceiptReason =
-  | 'fake_accepted'
+  | 'simulated_accepted_no_mutation'
   | 'authorization_denied'
   | 'authorization_boundary_failed'
   | 'repository_not_allowlisted'
@@ -143,7 +143,7 @@ export function createFakeGitHubAdapter(deps: FakeGitHubAdapterDeps): FakeGitHub
     ): Promise<FakeGitHubReceipt> {
       const boundRequest = snapshotRequest(request);
       const boundAuthorization = snapshotAuthorization(authorizationInput);
-      let reason: FakeGitHubReceiptReason = 'fake_accepted';
+      let reason: FakeGitHubReceiptReason = 'simulated_accepted_no_mutation';
       let authorizationReason: ActionPolicyDenialReason | null = null;
       let authorizationAuditRecorded = false;
       let policyDigest = UNKNOWN_DIGEST;
@@ -167,7 +167,7 @@ export function createFakeGitHubAdapter(deps: FakeGitHubAdapterDeps): FakeGitHub
         authorizationReason = 'policy_evaluation_failed';
       }
 
-      if (reason === 'fake_accepted') {
+      if (reason === 'simulated_accepted_no_mutation') {
         if (
           !EXACT_REPOSITORY_RE.test(boundRequest.repository) ||
           !allowedRepositories.has(boundRequest.repository)
@@ -185,7 +185,7 @@ export function createFakeGitHubAdapter(deps: FakeGitHubAdapterDeps): FakeGitHub
         }
       }
 
-      const accepted = reason === 'fake_accepted';
+      const accepted = reason === 'simulated_accepted_no_mutation';
       const attemptEvent: AppendOverseerCapabilityEventInput = {
         capability: boundAuthorization.requested_capability,
         event_type: 'adapter_attempt',

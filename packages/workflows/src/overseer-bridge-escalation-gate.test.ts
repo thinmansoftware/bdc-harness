@@ -241,7 +241,7 @@ describe('handleNodeFailure authorization boundary', () => {
       expect(hasDeniedLog(deps.log)).toBe(false);
       expect(attempts).toHaveLength(1);
       expect(attempts[0]?.details).toMatchObject({
-        adapter: 'fake-escalation',
+        adapter: 'escalation-notify-only',
         accepted: true,
         mutation_sent: false,
       });

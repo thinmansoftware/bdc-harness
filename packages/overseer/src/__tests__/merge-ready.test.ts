@@ -317,7 +317,7 @@ function harness(
       adapterRequests.push(request);
       return adapterResult(
         adapterStatus,
-        adapterStatus === 'succeeded' ? 'fake_accepted' : 'rejected'
+        adapterStatus === 'succeeded' ? 'simulated_accepted_no_mutation' : 'rejected'
       );
     },
   };
@@ -449,7 +449,7 @@ describe('executeQualifiedMerge -- Section 11', () => {
     expect(h.calls).toContain('reserveEffect');
     expect(h.calls).toContain('recordOutcome');
     expect(h.outcomeCalls).toEqual([
-      { outcome: 'effect_succeeded', reason: 'adapter_accepted:fake_accepted' },
+      { outcome: 'effect_succeeded', reason: 'adapter_accepted:simulated_accepted_no_mutation' },
     ]);
   });
 

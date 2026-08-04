@@ -18,7 +18,7 @@ export interface LifecycleMutationRequestV1 {
 }
 
 export type LifecycleMutationReasonV1 =
-  | 'fake_accepted'
+  | 'simulated_accepted_no_mutation'
   | 'repository_not_allowlisted'
   | 'action_not_allowlisted'
   | 'target_kind_not_allowlisted'
@@ -92,7 +92,7 @@ export function createLifecycleMutationAdapter(
       }
       const consumed = await deps.consume_execution(bound.execution_id);
       if (!consumed) return receipt(bound, false, 'execution_replayed');
-      return receipt(bound, true, 'fake_accepted');
+      return receipt(bound, true, 'simulated_accepted_no_mutation');
     },
   };
 }
@@ -209,7 +209,7 @@ export function reconcileLifecycleResult(
   }
   if (
     !mutation.accepted ||
-    mutation.reason !== 'fake_accepted' ||
+    mutation.reason !== 'simulated_accepted_no_mutation' ||
     !mutation.external_effect_reference ||
     outcomeReceipt.external_effect_reference !== mutation.external_effect_reference ||
     canonicalJsonV2(outcomeReceipt.evidence) !== canonicalJsonV2(mutation)

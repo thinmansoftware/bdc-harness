@@ -1,6 +1,7 @@
 import { createLogger } from '@archon/paths';
 import { runOverseerService } from '@archon/overseer/service';
 import type { OverseerServiceOptions, OverseerWiredAdapterKind } from '@archon/overseer/service';
+import { PRODUCTION_EFFECT_HOLD_REASON } from '@archon/overseer/merge-manager';
 
 const log = createLogger('server/overseer-runtime');
 
@@ -13,6 +14,7 @@ interface OverseerRuntimeStatus {
   readonly emergency_stop: boolean;
   readonly capability_flags: Readonly<Record<string, boolean>>;
   readonly circuit_states: Readonly<Record<string, string>>;
+  readonly blocking_reasons: readonly string[];
 }
 
 interface OverseerCapabilityRow {
@@ -176,11 +178,20 @@ export async function getOverseerRuntimeStatus(
     log.warn('overseer_runtime.capability_state_read_failed');
   }
 
+  const emergencyStop = readEmergencyStop();
+  const blockingReasons: string[] = [PRODUCTION_EFFECT_HOLD_REASON];
+  for (const cap of capabilities) {
+    if (!capabilityFlags[cap]) blockingReasons.push(`${cap}:capability_flag_disabled`);
+    if (circuitStates[cap] === 'open') blockingReasons.push(`${cap}:circuit_open`);
+  }
+  if (emergencyStop) blockingReasons.push('emergency_stop');
+
   return {
     watcher: watcherState,
     adapter: adapterKind,
-    emergency_stop: readEmergencyStop(),
+    emergency_stop: emergencyStop,
     capability_flags: capabilityFlags,
     circuit_states: circuitStates,
+    blocking_reasons: blockingReasons,
   };
 }

@@ -22,6 +22,7 @@ import type {
 } from './types.ts';
 
 export const MERGE_MANAGER_IDENTITY = 'overseer-merge-manager-v1';
+export const PRODUCTION_EFFECT_HOLD_REASON = 'production_effect_held_for_john' as const;
 const DEFAULT_OPERATOR: MergeOperatorIdentity = {
   identity: MERGE_MANAGER_IDENTITY,
   provider: 'overseer',
@@ -304,7 +305,7 @@ export function createMergeManager(
     const { evidence, evidenceDigest } = assembled;
 
     if (evidence.resulting_deployment_effect === 'production') {
-      await recordManagerAction(deps, record, 'merge_denied', 'production_effect_held_for_john');
+      await recordManagerAction(deps, record, 'merge_denied', PRODUCTION_EFFECT_HOLD_REASON);
       log.warn(
         { runId: record.runId, woId: record.woId, effect: 'production' },
         'merge_manager.production_effect_held_for_john'
@@ -313,7 +314,7 @@ export function createMergeManager(
         status: 'held',
         receipt: null,
         execution: null,
-        reason: 'production_effect_held_for_john',
+        reason: PRODUCTION_EFFECT_HOLD_REASON,
       };
     }
 

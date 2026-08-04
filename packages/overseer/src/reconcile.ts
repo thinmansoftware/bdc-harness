@@ -145,7 +145,8 @@ export async function runReconcileOnce(input: RunReconcileInput = {}): Promise<R
       logger.warn({ err: error as Error, authError: true }, 'overseer.reconcile.auth_error_skip');
       return { scanned: 0, closed: 0, skipped: true };
     }
-    throw error;
+    logger.warn({ err: error as Error }, 'overseer.reconcile.transport_error_skip');
+    return { scanned: 0, closed: 0, skipped: true };
   }
 
   let closed = 0;

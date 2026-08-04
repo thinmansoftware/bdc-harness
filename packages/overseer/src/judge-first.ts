@@ -12,9 +12,8 @@
  * seats independently identified as the killer.
  *
  * Cost containment (design round, binding): bounded envelope (fixed schema,
- * capped event tail), terminal-only judging, claim-before-call idempotency
- * (db layer), and a daily budget circuit that degrades LOUDLY to an alarm
- * state -- never a silent stop.
+ * capped event tail), terminal-only judging, and claim-before-call idempotency
+ * (db layer).
  */
 
 import { createHash } from 'crypto';
@@ -26,7 +25,6 @@ const log = createLogger('overseer/judge-first');
 const DEFAULT_TIMEOUT_MS = 120_000;
 const EVENT_TAIL_LIMIT = 20;
 const EVENT_MESSAGE_CAP = 400;
-const DEFAULT_DAILY_BUDGET_CALLS = 200;
 
 export const SEMANTIC_VERDICTS = [
   'healthy',
@@ -94,51 +92,6 @@ export interface JudgeFirstOptions {
   ladder?: string[];
   timeoutMs?: number;
   spawn?: (binary: string, prompt: string) => Promise<JudgeSpawnResult>;
-  budget?: JudgeBudgetCircuit;
-}
-
-/**
- * Daily budget circuit. Breach does NOT silently stop the watcher: the caller
- * receives an evidence_unavailable alarm and escalates (design-round rule:
- * degrade to R0-only + escalate-to-human, never silent stop). In-memory state
- * resets on process restart; the persistent backstop is the claim table, which
- * caps total calls at (runs x retries) regardless of this circuit. Recorded as
- * an open condition in the M-94 control-surface record.
- */
-export class JudgeBudgetCircuit {
-  private day: string;
-  private calls = 0;
-  constructor(
-    private readonly dailyLimit: number = readDailyBudget(),
-    private readonly clock: () => Date = () => new Date()
-  ) {
-    this.day = this.today();
-  }
-  private today(): string {
-    return this.clock().toISOString().slice(0, 10);
-  }
-  private roll(): void {
-    const today = this.today();
-    if (today !== this.day) {
-      this.day = today;
-      this.calls = 0;
-    }
-  }
-  tryConsume(): boolean {
-    this.roll();
-    if (this.calls >= this.dailyLimit) return false;
-    this.calls += 1;
-    return true;
-  }
-  get spentToday(): number {
-    this.roll();
-    return this.calls;
-  }
-}
-
-function readDailyBudget(): number {
-  const raw = Number(process.env.OVERSEER_JUDGE_DAILY_BUDGET_CALLS ?? '');
-  return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_DAILY_BUDGET_CALLS;
 }
 
 export function defaultJudgeLadder(): string[] {
@@ -363,7 +316,6 @@ export async function judgeTerminalRun(
     options.spawn ??
     ((binary: string, prompt: string): Promise<JudgeSpawnResult> =>
       spawnJudgeBinary(binary, prompt, timeoutMs));
-  const budget = options.budget;
 
   const prompt = buildJudgePrompt(envelope);
   let sawInvalidOutput = false;
@@ -375,18 +327,6 @@ export async function judgeTerminalRun(
     if (!binary) continue;
     lastModel = binary;
     lastRung = rung;
-    if (budget && !budget.tryConsume()) {
-      log.error(
-        { runId: envelope.runId, rung, binary, spentToday: budget.spentToday },
-        'overseer.judge_first.budget_circuit_open'
-      );
-      return {
-        kind: 'evidence_unavailable',
-        reason: 'judge_daily_budget_exhausted',
-        model: binary,
-        modelRung: rung,
-      };
-    }
     try {
       const result = await spawn(binary, prompt);
       if (result.timedOut || result.exitCode !== 0) {

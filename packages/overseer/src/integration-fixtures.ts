@@ -1319,7 +1319,7 @@ export function makeMergeHarness(
         return {
           schema_version: 'overseer-qualified-merge-adapter-result-v2',
           status: adapterStatus,
-          reason: adapterStatus === 'succeeded' ? 'fake_accepted' : adapterStatus,
+          reason: adapterStatus === 'succeeded' ? 'simulated_accepted_no_mutation' : adapterStatus,
           external_effect_reference: adapterStatus === 'succeeded' ? 'fake-merge-ref-1' : null,
           evidence_digest: adapterStatus === 'succeeded' ? 'f6'.repeat(32) : null,
         };

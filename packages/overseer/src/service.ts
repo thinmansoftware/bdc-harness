@@ -7,7 +7,6 @@ import {
   listRunsForOverseerWatch,
 } from '@archon/core/db/overseer';
 import { handleRecordJudgeFirst } from './judge-first-pipeline';
-import { JudgeBudgetCircuit } from './judge-first';
 import type { OverseerVerdictStoreDeps } from './types.ts';
 import { runAuthorizedEscalation } from './authorized-escalation';
 import { runEscalation } from './escalate';
@@ -110,7 +109,11 @@ export async function runReconcileScheduler(input: {
   const reconcile = input.reconcile ?? ((): Promise<unknown> => runReconcileOnce());
   for (;;) {
     if (input.signal?.aborted) return;
-    await reconcile();
+    try {
+      await reconcile();
+    } catch (error) {
+      log.error({ err: error as Error }, 'overseer.reconcile.iteration_failed_isolated');
+    }
     if (input.once || input.signal?.aborted) return;
     await waitForDeliveryInterval(input.intervalMs ?? 30_000, input.signal);
   }
@@ -159,9 +162,6 @@ const defaultVerdictStore: OverseerVerdictStoreDeps = {
   finalizeVerdict: finalizeOverseerVerdict,
 };
 
-/** One budget circuit per service process; injectable in tests via pipeline options. */
-const serviceBudgetCircuit = new JudgeBudgetCircuit();
-
 async function handleRecord(
   record: WatchedRunRecord,
   deps: OverseerRunStoreDeps & OverseerActionsDeps & GitHubClientDeps,
@@ -185,7 +185,6 @@ async function handleRecord(
         actor,
         mergeCoordinator,
         verdictStore: defaultVerdictStore,
-        judgeOptions: { budget: serviceBudgetCircuit },
       });
     } catch (error) {
       log.error(
