@@ -50,7 +50,9 @@ import { loadConfig } from '../config/config-loader';
 import type { MergedConfig } from '../config/config-types';
 import { generateAndSetTitle } from '../services/title-generator';
 import { validateAndResolveIsolation, dispatchBackgroundWorkflow } from './orchestrator';
+import { launchSession } from './session-launcher';
 import { IsolationBlockedError } from '@archon/isolation';
+import type { IsolationHints } from '@archon/isolation';
 import {
   buildOrchestratorPrompt,
   buildProjectScopedPrompt,
@@ -264,13 +266,24 @@ async function dispatchOrchestratorWorkflow(
     );
     cwd = codebase.default_cwd;
   } else {
+    // Ensure a stable, per-session isolation key even when no forge webhook
+    // supplied hints. Chat-triggered dispatch (Slack/Telegram/Discord/Web/CLI)
+    // arrives with `isolationHints` undefined; the resolver would then default
+    // to workflowId '' and every conversation on this codebase would collide on
+    // the SAME worktree ('thread', ''). Key on conversation.id so each session
+    // gets its own worktree -- the same defect class this WO fixes.
+    const effectiveHints: IsolationHints = {
+      ...isolationHints,
+      workflowType: isolationHints?.workflowType ?? 'thread',
+      workflowId: isolationHints?.workflowId ?? conversation.id,
+    };
     try {
       const result = await validateAndResolveIsolation(
         { ...conversation, codebase_id: codebase.id },
         codebase,
         platform,
         conversationId,
-        isolationHints
+        effectiveHints
       );
       cwd = result.cwd;
     } catch (error) {
@@ -506,11 +519,21 @@ function buildFullPrompt(
   issueContext: string | undefined,
   threadContext: string | undefined,
   attachedFiles?: AttachedFile[],
-  workflowContext?: string
+  workflowContext?: string,
+  resolvedCwd?: string
 ): string {
-  const scopedCodebase = conversation.codebase_id
+  const rawScopedCodebase = conversation.codebase_id
     ? codebases.find(c => c.id === conversation.codebase_id)
     : undefined;
+
+  // When the session was allocated an isolated worktree, tell the AI to work
+  // THERE, not in the shared primary checkout. The project-scoped system prompt
+  // prints `default_cwd` as the working directory, so override it on a shallow
+  // clone before delegating -- the raw codebase list is left untouched.
+  const scopedCodebase =
+    rawScopedCodebase && resolvedCwd
+      ? { ...rawScopedCodebase, default_cwd: resolvedCwd }
+      : rawScopedCodebase;
 
   const systemPrompt = scopedCodebase
     ? buildProjectScopedPrompt(scopedCodebase, codebases, workflows)
@@ -781,6 +804,28 @@ export async function handleMessage(
 
     // 3. Load codebases, discover workflows, build prompt
     const codebases = await codebaseDb.listCodebases();
+
+    // 3a. Per-session worktree isolation (WO-HARNESS-SESSION-WORKTREE-ISOLATION-01).
+    // A codebase-scoped conversation must run in its OWN worktree, never the
+    // shared primary checkout -- otherwise a branch switch in one session
+    // destroys another session's uncommitted work. Allocate (or reuse, keyed on
+    // the stable conversation id) via the existing isolation machinery. Fail
+    // CLOSED on refusal -- do not fall through to the shared clone.
+    // Conversations with no codebase attached need no isolation and keep the
+    // pre-existing behavior below.
+    const scopedCodebase = conversation.codebase_id
+      ? codebases.find(c => c.id === conversation.codebase_id)
+      : undefined;
+    let resolvedCwd: string | undefined;
+    if (scopedCodebase) {
+      const launch = await launchSession(conversation, scopedCodebase, platform, conversationId);
+      if (launch.refused) {
+        await platform.sendMessage(conversationId, launch.message);
+        return;
+      }
+      resolvedCwd = launch.cwd;
+    }
+
     const {
       workflows: workflowsWithSource,
       errors: workflowErrors,
@@ -856,9 +901,12 @@ export async function handleMessage(
       issueContext,
       threadContext,
       attachedFiles,
-      workflowContext
+      workflowContext,
+      resolvedCwd
     );
-    const cwd = await ensureArchonWorkspacesPath();
+    // Codebase-scoped conversations run in their allocated worktree; unscoped
+    // conversations keep today's behavior (workspaces root, no isolation).
+    const cwd = resolvedCwd ?? (await ensureArchonWorkspacesPath());
 
     // 4. Update activity and get/create session
     await db.touchConversation(conversation.id);
