@@ -11206,6 +11206,10 @@ describe('gate_result field in node_failed events', () => {
     expect(persistedGr.nodeType).toBe('bash');
     expect(persistedGr.exitCode).toBe(1);
     expect(persistedGr.isTimeout).toBe(false);
+    expect('provider' in persistedData).toBe(false);
+    expect('declared_model_id' in persistedData).toBe(false);
+    expect('requested_model_id' in persistedData).toBe(false);
+    expect('entry_rung' in persistedData).toBe(false);
 
     // Assert emitted event carries gate_result.
     expect(emittedFailedEvents.length).toBe(1);
@@ -11292,6 +11296,7 @@ describe('gate_result field in node_failed events', () => {
         isError: true,
         errorSubtype: 'validation_error',
         errors: ['validator rejected output'],
+        servedModelId: 'different-served-model',
       };
     });
     mockGetAgentProviderDag.mockReturnValue({
@@ -11323,7 +11328,10 @@ describe('gate_result field in node_failed events', () => {
       platform,
       'conv-gate-ai',
       testDir,
-      { name: 'gate-ai-test', nodes: [{ id: 'ai-node', prompt: 'do something' }] },
+      {
+        name: 'gate-ai-test',
+        nodes: [{ id: 'ai-node', prompt: 'do something', model: 'declared-model' }],
+      },
       workflowRun,
       'claude',
       undefined,
@@ -11348,6 +11356,8 @@ describe('gate_result field in node_failed events', () => {
     const persistedGr = persistedData.gate_result as GateResult;
     expect(persistedGr.passed).toBe(false);
     expect(persistedGr.nodeType).toBe('ai');
+    expect(persistedData.served_model_id).toBe('different-served-model');
+    expect(persistedData.served_model_mismatch).toBe(true);
 
     // Assert emitted event carries gate_result.
     expect(emittedFailedEvents.length).toBe(1);
@@ -11355,6 +11365,98 @@ describe('gate_result field in node_failed events', () => {
     expect(emittedGr).toBeDefined();
     expect(emittedGr!.passed).toBe(false);
     expect(emittedGr!.nodeType).toBe('ai');
+  });
+
+  it('AI node SDK failure records a matching served model without a mismatch', async () => {
+    const failedQuery = mock(function* () {
+      yield {
+        type: 'result',
+        isError: true,
+        errorSubtype: 'validation_error',
+        errors: ['validator rejected output'],
+        servedModelId: 'declared-model',
+      };
+    });
+    mockGetAgentProviderDag.mockReturnValue({
+      sendQuery: failedQuery,
+      getType: () => 'claude',
+      getCapabilities: mockClaudeCapabilities,
+    });
+
+    const store = createMockStore();
+    await executeDagWorkflow(
+      createMockDeps(store),
+      createMockPlatform(),
+      'conv-gate-ai-served-match',
+      testDir,
+      {
+        name: 'gate-ai-served-match-test',
+        nodes: [{ id: 'ai-node', prompt: 'do something', model: 'declared-model' }],
+      },
+      makeWorkflowRun('gate-ai-served-match-run-id'),
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    const failedEventCall = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls.find(
+      (call: unknown[]) => (call[0] as { event_type: string }).event_type === 'node_failed'
+    );
+    expect(failedEventCall).toBeDefined();
+    const persistedData = (failedEventCall![0] as { data: Record<string, unknown> }).data;
+    expect(persistedData.served_model_id).toBe('declared-model');
+    expect(persistedData.served_model_mismatch).toBe(false);
+  });
+
+  it('AI node SDK failure records the served-model missing reason', async () => {
+    const failedQuery = mock(function* () {
+      yield {
+        type: 'result',
+        isError: true,
+        errorSubtype: 'validation_error',
+        errors: ['validator rejected output'],
+        servedModelId: null,
+        servedModelMissingReason: 'sdk_does_not_expose_served_model',
+      };
+    });
+    mockGetAgentProviderDag.mockReturnValue({
+      sendQuery: failedQuery,
+      getType: () => 'claude',
+      getCapabilities: mockClaudeCapabilities,
+    });
+
+    const store = createMockStore();
+    await executeDagWorkflow(
+      createMockDeps(store),
+      createMockPlatform(),
+      'conv-gate-ai-served-missing',
+      testDir,
+      {
+        name: 'gate-ai-served-missing-test',
+        nodes: [{ id: 'ai-node', prompt: 'do something', model: 'declared-model' }],
+      },
+      makeWorkflowRun('gate-ai-served-missing-run-id'),
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    const failedEventCall = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls.find(
+      (call: unknown[]) => (call[0] as { event_type: string }).event_type === 'node_failed'
+    );
+    expect(failedEventCall).toBeDefined();
+    const persistedData = (failedEventCall![0] as { data: Record<string, unknown> }).data;
+    expect(persistedData.served_model_id).toBeNull();
+    expect(persistedData.served_model_missing_reason).toBe('sdk_does_not_expose_served_model');
+    expect(persistedData).not.toHaveProperty('served_model_mismatch');
   });
 
   it('AI node failure (command-load) carries gate_result in persisted and emitted node_failed event', async () => {
