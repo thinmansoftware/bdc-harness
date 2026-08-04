@@ -167,8 +167,13 @@ describe('lane registration and war-council-validator pin', () => {
         return;
       }
 
+      // M-121 (John, 2026-08-04): the apex lane's judge serves real
+      // claude-fable-5 again. M-87's sweep to claude-opus-5 was an outage
+      // workaround, not an apex ruling; Opus 5 is the cheap Fable-substitute
+      // and stays on the CLOSER rung (see the codex-lane branch above, which
+      // is correct and unchanged).
       const expectedModel =
-        file === 'bdc-feature-development-fable.yaml' ? 'claude-opus-5' : 'sonnet';
+        file === 'bdc-feature-development-fable.yaml' ? 'claude-fable-5' : 'sonnet';
       expect(wcv.provider).toBe('claude');
       expect(wcv.model).toBe(expectedModel);
     });

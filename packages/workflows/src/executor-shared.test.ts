@@ -855,7 +855,7 @@ describe('hasPushArtifact', () => {
   });
 });
 
-describe('fable apex lane -- build-critical nodes serve claude-opus-5 (M-20260726-87 sweep)', () => {
+describe('fable apex lane -- build-critical nodes serve claude-fable-5 (M-121 apex ruling)', () => {
   const REPO_ROOT = join(import.meta.dir, '..', '..', '..');
   const FABLE_LANE = join(
     REPO_ROOT,
@@ -892,21 +892,27 @@ describe('fable apex lane -- build-critical nodes serve claude-opus-5 (M-2026072
     'war-council-validator',
   ];
 
-  it('the lane is the fable variant with top-level model claude-opus-5', () => {
+  it('the lane is the fable variant with top-level model claude-fable-5', () => {
     expect(lane.name).toBe('bdc-feature-development-fable');
-    // Swept from claude-fable-5 by M-20260726-87. The lane NAME and the
-    // "fable apex" persona-drop mechanism (described above) are unchanged --
-    // the fable seat survives as a role; only the served model changed.
-    expect(lane.model).toBe('claude-opus-5');
+    // M-121 (John, 2026-08-04) RESTORED real claude-fable-5 here. M-20260726-87
+    // had swept this pin to claude-opus-5, but that sweep was an OUTAGE
+    // workaround (Fable went dark on quota -- two WOs, six runs, zero code),
+    // never a ruling on apex composition. Outage passed; Fable live again.
+    // Opus 5 is the CHEAP FABLE-SUBSTITUTE and belongs on the CLOSER rung
+    // below apex, NOT here. M-87's real deliverable -- dark-engine detection
+    // + refusal to fire a lane with known-dead models -- is retained and is
+    // what makes this safe. The lane NAME and the persona-drop mechanism
+    // (described above) are unchanged.
+    expect(lane.model).toBe('claude-fable-5');
   });
 
   for (const id of buildCriticalNodes) {
-    it(`${id}: carries no persona or agent and resolves to claude-opus-5`, () => {
+    it(`${id}: carries no persona or agent and resolves to claude-fable-5`, () => {
       const node = byId(id);
       expect(node).toBeDefined();
       expect(node!.agent).toBeUndefined();
       expect(node!.persona).toBeUndefined();
-      expect(effectiveModel(node!)).toBe('claude-opus-5');
+      expect(effectiveModel(node!)).toBe('claude-fable-5');
     });
   }
 
