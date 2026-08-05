@@ -16,6 +16,10 @@ export const dispatchMessageStatusSchema = z.enum([
   'cancelled',
 ]);
 
+export const dispatchMessagePrioritySchema = z.enum(['blocker', 'normal', 'heartbeat']);
+export const dispatchTaskOutcomeSchema = z.enum(['succeeded', 'failed', 'blocked']);
+export const dispatchRouteDispositionSchema = z.enum(['unroutable', 'superseded']);
+
 export const dispatchMessageSchema = z
   .object({
     id: z.string(),
@@ -41,6 +45,17 @@ export const dispatchMessageSchema = z
     resolved_xo_lease_id: z.string().nullable().optional(),
     resolved_xo_fencing_token: z.number().nullable().optional(),
     resolved_at: z.string().nullable().optional(),
+    priority: dispatchMessagePrioritySchema,
+    task_outcome: dispatchTaskOutcomeSchema.nullable(),
+    acknowledged_at: z.string().nullable(),
+    acknowledged_by: z.string().nullable(),
+    addressed_at: z.string().nullable(),
+    addressed_by: z.string().nullable(),
+    escalated_tg_at: z.string().nullable(),
+    escalated_sms_at: z.string().nullable(),
+    subject_key: z.string().nullable(),
+    route_disposition: dispatchRouteDispositionSchema.nullable(),
+    supersedes_id: z.string().nullable(),
   })
   .openapi('DispatchMessage');
 
@@ -53,11 +68,19 @@ export const createDispatchMessageBodySchema = z
     recipient: z.string().min(1),
     body: z.string().min(1),
     not_before: z.string().optional(),
+    priority: dispatchMessagePrioritySchema.optional(),
   })
   .strict()
   .openapi('CreateDispatchMessageBody');
 
 export const dispatchMessageIdParamsSchema = z.object({ id: z.string().min(1) });
+
+export const dispatchMailboxPrincipalBodySchema = z
+  .object({
+    principal_id: z.string().trim().toLowerCase().min(1),
+  })
+  .strict()
+  .openapi('DispatchMailboxPrincipalBody');
 
 export const listDispatchMessagesQuerySchema = z.object({
   recipient: z.string().optional(),
