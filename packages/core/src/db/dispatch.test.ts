@@ -11,16 +11,22 @@ mock.module('./connection', () => ({
 }));
 
 import {
+  acknowledgeMessage,
+  addressMessage,
   cancelMessage,
   claimMessage,
   createMessage,
   evaluateWorkerStaleness,
+  getMessage,
   heartbeatWorker,
+  listMessages,
+  listUnroutableQueuedMessages,
   listWorkers,
   postResult,
   registerWorker,
   renewMessageLease,
   resolveDispatchRecipient,
+  assessDispatchRecipient,
 } from './dispatch';
 
 function cleanupDb(path: string): void {
@@ -69,6 +75,408 @@ describe('dispatch db', () => {
     expect(second.correlation_id).toBe('corr-1');
     const rows = await db.query('SELECT id FROM agent_dispatch_messages');
     expect(rows.rowCount).toBe(1);
+  });
+
+  test('assesses canonical recipients and rejects missing or inactive principals', async () => {
+    await expect(assessDispatchRecipient(' Operator ')).resolves.toEqual({
+      ok: true,
+      canonical_principal: 'operator',
+      delivery_mode: 'drain_on_start',
+      reason: null,
+    });
+    await expect(assessDispatchRecipient(' john ')).resolves.toEqual({
+      ok: false,
+      canonical_principal: 'john',
+      delivery_mode: 'notify_only',
+      reason: 'inactive_principal',
+    });
+    await expect(assessDispatchRecipient(' Missing ')).resolves.toEqual({
+      ok: false,
+      canonical_principal: 'missing',
+      delivery_mode: null,
+      reason: 'missing_principal',
+    });
+  });
+
+  test('guards new recipients while retaining idempotent creates and board metadata', async () => {
+    const original = await createMessage({
+      correlation_id: 'corr-idempotent-active',
+      idempotency_key: 'idem-idempotent-active',
+      task_type: 'agent_message',
+      sender: 'xo',
+      recipient: 'operator',
+      body: 'Original mailbox message.',
+    });
+    await db.query("UPDATE dispatch_principals SET active = 0 WHERE principal_id = 'operator'");
+
+    const retry = await createMessage({
+      correlation_id: 'corr-idempotent-inactive',
+      idempotency_key: 'idem-idempotent-active',
+      task_type: 'agent_message',
+      sender: 'xo',
+      recipient: 'operator',
+      body: 'Must return original before recipient assessment.',
+    });
+    expect(retry.id).toBe(original.id);
+    await expect(
+      createMessage({
+        correlation_id: 'corr-inactive',
+        idempotency_key: 'idem-inactive',
+        task_type: 'agent_message',
+        sender: 'xo',
+        recipient: 'operator',
+        body: 'New inactive recipient message.',
+      })
+    ).rejects.toThrow('inactive_principal');
+    await expect(
+      createMessage({
+        correlation_id: 'corr-missing',
+        idempotency_key: 'idem-missing',
+        task_type: 'agent_message',
+        sender: 'xo',
+        recipient: 'missing',
+        body: 'Unknown recipient message.',
+      })
+    ).rejects.toThrow('missing_principal');
+    await expect(
+      createMessage({
+        correlation_id: 'corr-board-without-metadata',
+        idempotency_key: 'idem-board-without-metadata',
+        task_type: 'board_motion',
+        sender: 'xo',
+        recipient: ' Board ',
+        body: 'Board message without alias metadata.',
+      })
+    ).rejects.toThrow('board_alias_metadata_required');
+    const board = await createMessage({
+      correlation_id: 'corr-board-with-metadata',
+      idempotency_key: 'idem-board-with-metadata',
+      task_type: 'board_motion',
+      sender: 'xo',
+      recipient: ' Board ',
+      body: 'Board message with alias metadata.',
+      recipient_alias: 'board',
+    });
+    expect(board.recipient).toBe('board');
+  });
+
+  test('keeps worker polling claimable and rejects mailbox delivery modes', async () => {
+    await registerWorker({
+      worker_id: 'worker-mode-guard',
+      host: 'host',
+      capabilities: {},
+      max_concurrency: 1,
+    });
+    const workerMessage = await createMessage({
+      correlation_id: 'corr-worker-mode',
+      idempotency_key: 'idem-worker-mode',
+      task_type: 'agent_message',
+      sender: 'xo',
+      recipient: 'codex',
+      body: 'Worker poll message.',
+    });
+    const mailboxMessage = await createMessage({
+      correlation_id: 'corr-mailbox-mode',
+      idempotency_key: 'idem-mailbox-mode',
+      task_type: 'agent_message',
+      sender: 'xo',
+      recipient: 'overseer',
+      body: 'Notify-only mailbox message.',
+    });
+
+    expect(
+      (await claimMessage({ id: workerMessage.id, worker_id: 'worker-mode-guard' }))?.status
+    ).toBe('claimed');
+    expect(
+      await claimMessage({ id: mailboxMessage.id, worker_id: 'worker-mode-guard' })
+    ).toBeNull();
+  });
+
+  test('acknowledges mailbox messages once without changing queue or address state', async () => {
+    const message = await createMessage({
+      correlation_id: 'corr-ack',
+      idempotency_key: 'idem-ack',
+      task_type: 'agent_message',
+      sender: 'xo',
+      recipient: 'operator',
+      body: 'Acknowledge me.',
+      priority: 'blocker',
+    });
+
+    const results = await Promise.all(
+      Array.from({ length: 3 }, () =>
+        acknowledgeMessage({ id: message.id, principal_id: 'operator' })
+      )
+    );
+    expect(results.every(result => result.ok)).toBe(true);
+    const stored = await getMessage(message.id);
+    expect(stored).toMatchObject({
+      status: 'queued',
+      acknowledged_by: 'operator',
+      addressed_at: null,
+      addressed_by: null,
+    });
+    expect(stored?.acknowledged_at).not.toBeNull();
+    expect((await acknowledgeMessage({ id: message.id, principal_id: 'operator' })).ok).toBe(true);
+  });
+
+  test('returns every acknowledgement conflict outcome', async () => {
+    const mailbox = await createMessage({
+      correlation_id: 'corr-ack-conflicts',
+      idempotency_key: 'idem-ack-conflicts',
+      task_type: 'agent_message',
+      sender: 'xo',
+      recipient: 'xo',
+      body: 'Mailbox conflict target.',
+    });
+    const worker = await createMessage({
+      correlation_id: 'corr-ack-worker',
+      idempotency_key: 'idem-ack-worker',
+      task_type: 'agent_message',
+      sender: 'xo',
+      recipient: 'codex',
+      body: 'Worker conflict target.',
+    });
+    const nonQueued = await createMessage({
+      correlation_id: 'corr-ack-nonqueued',
+      idempotency_key: 'idem-ack-nonqueued',
+      task_type: 'agent_message',
+      sender: 'xo',
+      recipient: 'operator',
+      body: 'Non-queued conflict target.',
+    });
+    await db.query("UPDATE agent_dispatch_messages SET status = 'done' WHERE id = $1", [
+      nonQueued.id,
+    ]);
+
+    await expect(acknowledgeMessage({ id: 'missing', principal_id: 'operator' })).resolves.toEqual({
+      ok: false,
+      reason: 'not_found',
+    });
+    await expect(acknowledgeMessage({ id: mailbox.id, principal_id: 'operator' })).resolves.toEqual(
+      {
+        ok: false,
+        reason: 'wrong_recipient',
+      }
+    );
+    await expect(acknowledgeMessage({ id: worker.id, principal_id: 'codex' })).resolves.toEqual({
+      ok: false,
+      reason: 'wrong_mode',
+    });
+    await expect(
+      acknowledgeMessage({ id: nonQueued.id, principal_id: 'operator' })
+    ).resolves.toEqual({
+      ok: false,
+      reason: 'not_queued',
+    });
+    expect((await acknowledgeMessage({ id: mailbox.id, principal_id: 'xo' })).ok).toBe(true);
+    await expect(acknowledgeMessage({ id: mailbox.id, principal_id: 'xo-fable' })).resolves.toEqual(
+      {
+        ok: false,
+        reason: 'wrong_recipient',
+      }
+    );
+  });
+
+  test('addresses only acknowledged mail by its acknowledger and is idempotent', async () => {
+    const message = await createMessage({
+      correlation_id: 'corr-address',
+      idempotency_key: 'idem-address',
+      task_type: 'agent_message',
+      sender: 'xo',
+      recipient: 'operator',
+      body: 'Address me.',
+    });
+    await expect(addressMessage({ id: message.id, principal_id: 'operator' })).resolves.toEqual({
+      ok: false,
+      reason: 'address_before_ack',
+    });
+    expect((await acknowledgeMessage({ id: message.id, principal_id: 'operator' })).ok).toBe(true);
+    await expect(addressMessage({ id: message.id, principal_id: 'xo' })).resolves.toEqual({
+      ok: false,
+      reason: 'wrong_recipient',
+    });
+    await expect(
+      addressMessage({ id: message.id, principal_id: 'operator' })
+    ).resolves.toMatchObject({
+      ok: true,
+    });
+    const repeats = await Promise.all(
+      Array.from({ length: 3 }, () => addressMessage({ id: message.id, principal_id: 'operator' }))
+    );
+    expect(repeats.every(result => result.ok)).toBe(true);
+    const stored = await getMessage(message.id);
+    expect(stored).toMatchObject({
+      status: 'queued',
+      acknowledged_by: 'operator',
+      addressed_by: 'operator',
+    });
+    expect(stored?.addressed_at).not.toBeNull();
+  });
+
+  test('returns address actor, mode, state, and existence conflict outcomes', async () => {
+    const mailbox = await createMessage({
+      correlation_id: 'corr-address-conflicts',
+      idempotency_key: 'idem-address-conflicts',
+      task_type: 'agent_message',
+      sender: 'xo',
+      recipient: 'operator',
+      body: 'Address conflict target.',
+    });
+    const worker = await createMessage({
+      correlation_id: 'corr-address-worker',
+      idempotency_key: 'idem-address-worker',
+      task_type: 'agent_message',
+      sender: 'xo',
+      recipient: 'codex',
+      body: 'Address worker target.',
+    });
+    const nonQueued = await createMessage({
+      correlation_id: 'corr-address-nonqueued',
+      idempotency_key: 'idem-address-nonqueued',
+      task_type: 'agent_message',
+      sender: 'xo',
+      recipient: 'operator',
+      body: 'Address non-queued target.',
+    });
+    await db.query("UPDATE agent_dispatch_messages SET status = 'done' WHERE id = $1", [
+      nonQueued.id,
+    ]);
+    expect((await acknowledgeMessage({ id: mailbox.id, principal_id: 'operator' })).ok).toBe(true);
+
+    await expect(addressMessage({ id: 'missing', principal_id: 'operator' })).resolves.toEqual({
+      ok: false,
+      reason: 'not_found',
+    });
+    await expect(addressMessage({ id: worker.id, principal_id: 'codex' })).resolves.toEqual({
+      ok: false,
+      reason: 'wrong_mode',
+    });
+    await expect(addressMessage({ id: nonQueued.id, principal_id: 'operator' })).resolves.toEqual({
+      ok: false,
+      reason: 'not_queued',
+    });
+    await expect(addressMessage({ id: mailbox.id, principal_id: 'xo' })).resolves.toEqual({
+      ok: false,
+      reason: 'wrong_recipient',
+    });
+    await db.query("UPDATE agent_dispatch_messages SET acknowledged_by = 'xo' WHERE id = $1", [
+      mailbox.id,
+    ]);
+    await expect(addressMessage({ id: mailbox.id, principal_id: 'operator' })).resolves.toEqual({
+      ok: false,
+      reason: 'actor_mismatch',
+    });
+  });
+
+  test('lists only due unaddressed queued work by priority while retaining historical queries', async () => {
+    const blocker = await createMessage({
+      correlation_id: 'corr-list-blocker',
+      idempotency_key: 'idem-list-blocker',
+      task_type: 'agent_message',
+      sender: 'xo',
+      recipient: 'operator',
+      body: 'Blocker.',
+      priority: 'blocker',
+    });
+    const normal = await createMessage({
+      correlation_id: 'corr-list-normal',
+      idempotency_key: 'idem-list-normal',
+      task_type: 'agent_message',
+      sender: 'xo',
+      recipient: 'operator',
+      body: 'Normal.',
+      priority: 'normal',
+    });
+    const heartbeat = await createMessage({
+      correlation_id: 'corr-list-heartbeat',
+      idempotency_key: 'idem-list-heartbeat',
+      task_type: 'run_report',
+      sender: 'xo',
+      recipient: 'operator',
+      body: 'Heartbeat.',
+      priority: 'heartbeat',
+    });
+    const future = await createMessage({
+      correlation_id: 'corr-list-future',
+      idempotency_key: 'idem-list-future',
+      task_type: 'agent_message',
+      sender: 'xo',
+      recipient: 'operator',
+      body: 'Future.',
+      not_before: new Date(Date.now() + 60_000).toISOString(),
+      priority: 'blocker',
+    });
+    const addressed = await createMessage({
+      correlation_id: 'corr-list-addressed',
+      idempotency_key: 'idem-list-addressed',
+      task_type: 'agent_message',
+      sender: 'xo',
+      recipient: 'operator',
+      body: 'Addressed.',
+      priority: 'blocker',
+    });
+    await acknowledgeMessage({ id: addressed.id, principal_id: 'operator' });
+    await addressMessage({ id: addressed.id, principal_id: 'operator' });
+    await acknowledgeMessage({ id: blocker.id, principal_id: 'operator' });
+    const historical = await createMessage({
+      correlation_id: 'corr-list-historical',
+      idempotency_key: 'idem-list-historical',
+      task_type: 'agent_message',
+      sender: 'xo',
+      recipient: 'operator',
+      body: 'Historical.',
+    });
+    await db.query("UPDATE agent_dispatch_messages SET status = 'done' WHERE id = $1", [
+      historical.id,
+    ]);
+
+    const queued = await listMessages({ recipient: 'operator', status: 'queued' });
+    expect(queued.map(message => message.id)).toEqual([blocker.id, normal.id, heartbeat.id]);
+    expect(queued.map(message => message.id)).not.toContain(future.id);
+    expect(queued.map(message => message.id)).not.toContain(addressed.id);
+    expect(
+      (await listMessages({ recipient: 'operator', status: 'done' })).map(message => message.id)
+    ).toContain(historical.id);
+  });
+
+  test('reports only queued concrete recipients that are missing or inactive without mutation', async () => {
+    const inactive = await createMessage({
+      correlation_id: 'corr-unroutable-inactive',
+      idempotency_key: 'idem-unroutable-inactive',
+      task_type: 'agent_message',
+      sender: 'xo',
+      recipient: 'operator',
+      body: 'Become inactive after enqueue.',
+      priority: 'blocker',
+    });
+    await db.query("UPDATE dispatch_principals SET active = 0 WHERE principal_id = 'operator'");
+    await db.query(
+      `INSERT INTO agent_dispatch_messages
+       (id, correlation_id, idempotency_key, task_type, sender, recipient, body, status, priority, created_at, fencing_token)
+       VALUES ('missing-recipient', 'corr-unroutable-missing', 'idem-unroutable-missing', 'agent_message', 'xo', 'missing', 'No body in report.', 'queued', 'normal', $1, 0)`,
+      [new Date().toISOString()]
+    );
+    const writes: string[] = [];
+    const query = async <T>(sql: string, params?: unknown[]) => {
+      writes.push(sql);
+      return db.query<T>(sql, params);
+    };
+
+    const rows = await listUnroutableQueuedMessages(query);
+
+    expect(rows).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ id: inactive.id, recipient: 'operator', priority: 'blocker' }),
+        expect.objectContaining({
+          id: 'missing-recipient',
+          recipient: 'missing',
+          priority: 'normal',
+        }),
+      ])
+    );
+    expect(writes).toHaveLength(1);
+    expect(writes[0]).toStartWith('SELECT');
   });
 
   test('rejects stale fencing token result after lease expiry and reclaim', async () => {
