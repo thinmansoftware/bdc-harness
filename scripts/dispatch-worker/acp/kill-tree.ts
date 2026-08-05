@@ -135,12 +135,28 @@ export async function waitForTreeDeath(pids: number[], timeoutMs: number): Promi
       // branch is unchanged.
       const states = await Promise.all(
         alive.map(async pid => {
-          const { stdout } = await runCapture('ps', ['-o', 'stat=', '-p', String(pid)]);
-          return { pid, stat: stdout.trim() };
+          const { stdout, code } = await runCapture('ps', ['-o', 'stat=', '-p', String(pid)]);
+          return { pid, code, stat: stdout.trim() };
         })
       );
       alive = states
-        .filter(entry => entry.stat !== '' && !entry.stat.startsWith('Z'))
+        .filter(entry => {
+          if (entry.code === 0 && entry.stat !== '') {
+            // ps positively reported a state: drop only confirmed zombies.
+            return !entry.stat.startsWith('Z');
+          }
+          // ps exited nonzero or printed nothing. "pid vanished" and "ps
+          // execution/permission failure" are indistinguishable from output
+          // alone, so positively confirm with signal 0: ESRCH = gone (drop);
+          // anything else (including EPERM) = process still exists (retain).
+          // Never classify a live process as dead on a failed check.
+          try {
+            process.kill(entry.pid, 0);
+            return true;
+          } catch (err) {
+            return (err as NodeJS.ErrnoException).code !== 'ESRCH';
+          }
+        })
         .map(entry => entry.pid);
     }
     if (alive.length === 0) return [];
