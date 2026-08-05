@@ -220,6 +220,79 @@ describe('dispatch db', () => {
     expect((await acknowledgeMessage({ id: message.id, principal_id: 'operator' })).ok).toBe(true);
   });
 
+  test('acknowledgement revalidates stale recipient state after a guarded update loses', async () => {
+    const message = await createMessage({
+      correlation_id: 'corr-ack-stale-recipient',
+      idempotency_key: 'idem-ack-stale-recipient',
+      task_type: 'agent_message',
+      sender: 'xo',
+      recipient: 'operator',
+      body: 'Stale recipient target.',
+    });
+    const staleMessage = { ...message, recipient: 'codex' };
+    const originalDb = db;
+    const updateSql: string[] = [];
+    let readCount = 0;
+    const query = async <T>(sql: string): Promise<{ rows: readonly T[]; rowCount: number }> => {
+      if (sql.startsWith('SELECT * FROM agent_dispatch_messages')) {
+        readCount += 1;
+        const row = readCount === 1 ? message : staleMessage;
+        return { rows: [row as T], rowCount: 1 };
+      }
+      if (sql.startsWith('SELECT principal_id, delivery_mode, active')) {
+        return {
+          rows: [{ principal_id: 'operator', delivery_mode: 'drain_on_start', active: 1 } as T],
+          rowCount: 1,
+        };
+      }
+      if (sql.startsWith('UPDATE agent_dispatch_messages')) {
+        updateSql.push(sql);
+        return { rows: [], rowCount: 0 };
+      }
+      throw new Error(`Unexpected SQL: ${sql}`);
+    };
+    db = {
+      ...originalDb,
+      query,
+      withTransaction: async fn => fn(query),
+    } as SqliteAdapter;
+
+    try {
+      await expect(
+        acknowledgeMessage({ id: message.id, principal_id: 'operator' })
+      ).resolves.toEqual({ ok: false, reason: 'wrong_recipient' });
+      expect(updateSql[0]).toContain('LOWER(TRIM(COALESCE(resolved_recipient, recipient))) = $3');
+      expect(updateSql[0]).toContain("delivery_mode IN ('drain_on_start', 'notify_only')");
+    } finally {
+      db = originalDb;
+    }
+  });
+
+  test('concurrent acknowledgement through independent SQLite connections is idempotent', async () => {
+    const message = await createMessage({
+      correlation_id: 'corr-ack-independent-connections',
+      idempotency_key: 'idem-ack-independent-connections',
+      task_type: 'agent_message',
+      sender: 'xo',
+      recipient: 'operator',
+      body: 'Independent connection target.',
+    });
+    const primaryDb = db;
+    const independentDb = new SqliteAdapter(currentDbPath);
+    try {
+      db = primaryDb;
+      const first = acknowledgeMessage({ id: message.id, principal_id: 'operator' });
+      db = independentDb;
+      const second = acknowledgeMessage({ id: message.id, principal_id: 'operator' });
+      const results = await Promise.all([first, second]);
+
+      expect(results.every(result => result.ok)).toBe(true);
+    } finally {
+      db = primaryDb;
+      await independentDb.close();
+    }
+  });
+
   test('returns every acknowledgement conflict outcome', async () => {
     const mailbox = await createMessage({
       correlation_id: 'corr-ack-conflicts',
@@ -312,6 +385,60 @@ describe('dispatch db', () => {
       addressed_by: 'operator',
     });
     expect(stored?.addressed_at).not.toBeNull();
+  });
+
+  test('addressing revalidates final status when a guarded update loses to cancellation', async () => {
+    const message = await createMessage({
+      correlation_id: 'corr-address-stale-status',
+      idempotency_key: 'idem-address-stale-status',
+      task_type: 'agent_message',
+      sender: 'xo',
+      recipient: 'operator',
+      body: 'Stale status target.',
+    });
+    const acknowledged = {
+      ...message,
+      acknowledged_at: new Date().toISOString(),
+      acknowledged_by: 'operator',
+    };
+    const cancelled = { ...acknowledged, status: 'cancelled' as const };
+    const originalDb = db;
+    const updateSql: string[] = [];
+    let readCount = 0;
+    const query = async <T>(sql: string): Promise<{ rows: readonly T[]; rowCount: number }> => {
+      if (sql.startsWith('SELECT * FROM agent_dispatch_messages')) {
+        readCount += 1;
+        const row = readCount === 1 ? acknowledged : cancelled;
+        return { rows: [row as T], rowCount: 1 };
+      }
+      if (sql.startsWith('SELECT principal_id, delivery_mode, active')) {
+        return {
+          rows: [{ principal_id: 'operator', delivery_mode: 'drain_on_start', active: 1 } as T],
+          rowCount: 1,
+        };
+      }
+      if (sql.startsWith('UPDATE agent_dispatch_messages')) {
+        updateSql.push(sql);
+        return { rows: [], rowCount: 0 };
+      }
+      throw new Error(`Unexpected SQL: ${sql}`);
+    };
+    db = {
+      ...originalDb,
+      query,
+      withTransaction: async fn => fn(query),
+    } as SqliteAdapter;
+
+    try {
+      await expect(addressMessage({ id: message.id, principal_id: 'operator' })).resolves.toEqual({
+        ok: false,
+        reason: 'not_queued',
+      });
+      expect(updateSql[0]).toContain('LOWER(TRIM(COALESCE(resolved_recipient, recipient))) = $3');
+      expect(updateSql[0]).toContain("delivery_mode IN ('drain_on_start', 'notify_only')");
+    } finally {
+      db = originalDb;
+    }
   });
 
   test('returns address actor, mode, state, and existence conflict outcomes', async () => {
@@ -477,6 +604,17 @@ describe('dispatch db', () => {
     );
     expect(writes).toHaveLength(1);
     expect(writes[0]).toStartWith('SELECT');
+  });
+
+  test('uses a PostgreSQL-compatible inactive-principal predicate for unroutable reporting', async () => {
+    const queries: string[] = [];
+    const rows = await listUnroutableQueuedMessages(async <T>(sql: string) => {
+      queries.push(sql);
+      return { rows: [], rowCount: 0 } as { rows: readonly T[]; rowCount: number };
+    });
+
+    expect(rows).toEqual([]);
+    expect(queries[0]).toContain("CAST(principal.active AS TEXT) IN ('0', 'false')");
   });
 
   test('rejects stale fencing token result after lease expiry and reclaim', async () => {

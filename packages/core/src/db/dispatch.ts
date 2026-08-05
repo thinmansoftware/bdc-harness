@@ -5,7 +5,6 @@ import { appendBoardAuditEvent, resolveBoardRecipient } from './board-authority'
 import type { QueryResult } from './adapters/types';
 
 const log = createLogger('db/dispatch');
-let mailboxTransactionTail: Promise<void> = Promise.resolve();
 
 export type DispatchTaskType =
   | 'agent_message'
@@ -664,19 +663,26 @@ async function validateMailboxActor(
   return null;
 }
 
-async function withSerializedMailboxTransaction<T>(fn: () => Promise<T>): Promise<T> {
-  const prior = mailboxTransactionTail;
-  let release!: () => void;
-  const current = new Promise<void>(resolve => {
-    release = resolve;
-  });
-  mailboxTransactionTail = prior.then(() => current);
-  await prior;
-  try {
-    return await fn();
-  } finally {
-    release();
+function isRetriableMailboxTransactionError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  return (
+    error.message.includes('cannot start a transaction within a transaction') ||
+    error.message.includes('database is locked') ||
+    error.message.includes('SQLITE_BUSY')
+  );
+}
+
+async function withRetriedMailboxTransaction<T>(fn: () => Promise<T>): Promise<T> {
+  const maxAttempts = 3;
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      return await fn();
+    } catch (error) {
+      if (!isRetriableMailboxTransactionError(error) || attempt === maxAttempts) throw error;
+      await Bun.sleep(attempt * 10);
+    }
   }
+  throw new Error('mailbox_transaction_retry_exhausted');
 }
 
 export async function acknowledgeMessage(data: {
@@ -686,7 +692,7 @@ export async function acknowledgeMessage(data: {
   const db = getDatabase();
   const principalId = canonicalizePrincipal(data.principal_id);
   const now = nowIso();
-  return withSerializedMailboxTransaction(() =>
+  return withRetriedMailboxTransaction(() =>
     db.withTransaction(async txQuery => {
       const message = await readMessageInTransaction(txQuery, data.id);
       if (!message) return { ok: false, reason: 'not_found' };
@@ -698,19 +704,31 @@ export async function acknowledgeMessage(data: {
           : { ok: false, reason: 'actor_mismatch' };
       }
 
-      await txQuery(
+      const update = await txQuery(
         `UPDATE agent_dispatch_messages
        SET acknowledged_at = $2,
            acknowledged_by = $3
        WHERE id = $1
          AND status = 'queued'
          AND acknowledged_at IS NULL
-         AND acknowledged_by IS NULL`,
+         AND acknowledged_by IS NULL
+         AND LOWER(TRIM(COALESCE(resolved_recipient, recipient))) = $3
+         AND EXISTS (
+           SELECT 1
+           FROM dispatch_principals AS recipient_principal
+           WHERE recipient_principal.principal_id = LOWER(TRIM(COALESCE(resolved_recipient, recipient)))
+             AND recipient_principal.delivery_mode IN ('drain_on_start', 'notify_only')
+         )`,
         [data.id, now, principalId]
       );
       const finalMessage = await readMessageInTransaction(txQuery, data.id);
       if (!finalMessage) return { ok: false, reason: 'not_found' };
+      const finalInvalid = await validateMailboxActor(txQuery, finalMessage, principalId);
+      if (finalInvalid) return finalInvalid;
       if (finalMessage.acknowledged_by === principalId) return { ok: true, message: finalMessage };
+      if (update.rowCount === 0 && finalMessage.acknowledged_by === null) {
+        return { ok: false, reason: 'actor_mismatch' };
+      }
       return { ok: false, reason: 'actor_mismatch' };
     })
   );
@@ -723,7 +741,7 @@ export async function addressMessage(data: {
   const db = getDatabase();
   const principalId = canonicalizePrincipal(data.principal_id);
   const now = nowIso();
-  return withSerializedMailboxTransaction(() =>
+  return withRetriedMailboxTransaction(() =>
     db.withTransaction(async txQuery => {
       const message = await readMessageInTransaction(txQuery, data.id);
       if (!message) return { ok: false, reason: 'not_found' };
@@ -737,7 +755,7 @@ export async function addressMessage(data: {
           : { ok: false, reason: 'actor_mismatch' };
       }
 
-      await txQuery(
+      const update = await txQuery(
         `UPDATE agent_dispatch_messages
        SET addressed_at = $2,
            addressed_by = $3
@@ -745,15 +763,27 @@ export async function addressMessage(data: {
          AND status = 'queued'
          AND acknowledged_by = $3
          AND addressed_at IS NULL
-         AND addressed_by IS NULL`,
+         AND addressed_by IS NULL
+         AND LOWER(TRIM(COALESCE(resolved_recipient, recipient))) = $3
+         AND EXISTS (
+           SELECT 1
+           FROM dispatch_principals AS recipient_principal
+           WHERE recipient_principal.principal_id = LOWER(TRIM(COALESCE(resolved_recipient, recipient)))
+             AND recipient_principal.delivery_mode IN ('drain_on_start', 'notify_only')
+         )`,
         [data.id, now, principalId]
       );
       const finalMessage = await readMessageInTransaction(txQuery, data.id);
       if (!finalMessage) return { ok: false, reason: 'not_found' };
+      const finalInvalid = await validateMailboxActor(txQuery, finalMessage, principalId);
+      if (finalInvalid) return finalInvalid;
       if (finalMessage.acknowledged_by !== principalId) {
         return { ok: false, reason: 'actor_mismatch' };
       }
       if (finalMessage.addressed_by === principalId) return { ok: true, message: finalMessage };
+      if (update.rowCount === 0 && finalMessage.addressed_by === null) {
+        return { ok: false, reason: 'actor_mismatch' };
+      }
       return { ok: false, reason: 'actor_mismatch' };
     })
   );
@@ -780,7 +810,7 @@ export async function listUnroutableQueuedMessages(
        ON principal.principal_id = LOWER(TRIM(message.recipient))
      WHERE message.status = 'queued'
        AND message.recipient_alias IS NULL
-       AND (principal.principal_id IS NULL OR principal.active = 0)
+       AND (principal.principal_id IS NULL OR CAST(principal.active AS TEXT) IN ('0', 'false'))
      ORDER BY message.created_at ASC`
   );
   return result.rows.map(row => ({
