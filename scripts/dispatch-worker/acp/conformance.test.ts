@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test';
 import type { AgentConfig } from '../adapters';
 import { runConformanceMatrix, type ConformanceOptions, type SeatUnderTest } from './conformance';
 import { writeStub, type StubAgentMode } from './session.test';
+import { writeMcpStub, type McpStubMode } from '../mcp/session.test';
 
 async function stubSeat(mode: StubAgentMode, id = `stub-${mode}`): Promise<SeatUnderTest> {
   const { script, cwd } = await writeStub(mode);
@@ -25,6 +26,24 @@ async function conformingOptions(): Promise<ConformanceOptions> {
     forcedFailureSeat: await stubSeat('auth-reject'),
     timeoutSeat: await stubSeat('hang'),
     cancelAfterMs: 500,
+  };
+}
+
+async function mcpSeat(mode: McpStubMode, id = `mcp-${mode}`): Promise<SeatUnderTest> {
+  const { script, cwd } = await writeMcpStub(mode);
+  return {
+    id,
+    cwd,
+    config: {
+      kind: 'mcp',
+      command: process.execPath,
+      args: [script],
+      mcp: {
+        idleTimeoutMs: mode === 'hang' ? 300 : 2_000,
+        wallClockMs: 3_000,
+        killGraceMs: 1_000,
+      },
+    },
   };
 }
 
@@ -100,5 +119,23 @@ describe('ACP evidence-contract conformance matrix', () => {
     expect(evidence.result.ok).toBe(false);
     expect(evidence.insideTimeout).toBe(true);
     expect(evidence.result.error ?? '').toMatch(/auth|token/i);
+  }, 30_000);
+});
+
+describe('MCP evidence-contract conformance matrix', () => {
+  test('evaluates a kind mcp seat end-to-end with all four gates', async () => {
+    const report = await runConformanceMatrix(await mcpSeat('ok', 'codex-mcp-stub'), {
+      cancellationSeat: await mcpSeat('spawn-child'),
+      forcedFailureSeat: await mcpSeat('error'),
+      timeoutSeat: await mcpSeat('hang'),
+      cancelAfterMs: 500,
+    });
+    expect(report.seatId).toBe('codex-mcp-stub');
+    expect(Object.keys(report.tests)).toHaveLength(4);
+    expect(report.tests.largePayload.pass).toBe(true);
+    expect(report.tests.cancellation.pass).toBe(true);
+    expect(report.tests.forcedFailure.pass).toBe(true);
+    expect(report.tests.receiptAudit.pass).toBe(true);
+    expect(report.allGreen).toBe(true);
   }, 30_000);
 });

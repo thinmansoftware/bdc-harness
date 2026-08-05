@@ -14,6 +14,7 @@ import {
   type AgentConfig,
 } from './adapters';
 import { createCancelController, runAcpAgent, type AcpRunResult } from './acp/session';
+import { createMcpCancelController, runMcpAgent, type McpRunResult } from './mcp/session';
 import { resolveOperatorToken } from './credentials';
 import { acquireInstanceLock, type InstanceLockHandle } from './instance-lock';
 import { createWorkerLog, type WorkerLog } from './worker-log';
@@ -271,6 +272,64 @@ async function runAcpLeg(
   };
 }
 
+async function runMcpLeg(
+  agentConfig: AgentConfig,
+  message: DispatchMessage,
+  cancel: ReturnType<typeof createMcpCancelController>
+): Promise<{ resultBody: string; status: 'done' | 'failed'; run: McpRunResult }> {
+  const cwd = await mkdtemp(join(tmpdir(), `bdc-dispatch-mcp-${message.recipient}-`));
+  const run = await runMcpAgent(
+    {
+      command: agentConfig.command,
+      args: agentConfig.args,
+      cwd,
+      idleTimeoutMs: agentConfig.mcp?.idleTimeoutMs ?? ACP_DEFAULT_IDLE_TIMEOUT_MS,
+      wallClockMs: agentConfig.mcp?.wallClockMs ?? ACP_DEFAULT_WALL_CLOCK_MS,
+      killGraceMs: agentConfig.mcp?.killGraceMs ?? ACP_DEFAULT_KILL_GRACE_MS,
+      ...(agentConfig.mcp?.toolName ? { toolName: agentConfig.mcp.toolName } : {}),
+    },
+    promptFor(message),
+    cancel
+  );
+  const transcript = await writeTranscript({
+    message,
+    transport: 'mcp',
+    command: agentConfig.command,
+    args: agentConfig.args,
+    cwd,
+    stopReason: run.stopReason,
+    timedOut: run.timedOut,
+    cancelled: run.cancelled,
+    exitCode: run.exitCode,
+    agentPid: run.agentPid,
+    treeBeforeKill: run.treeBeforeKill,
+    treeAfterKill: run.treeAfterKill,
+    durationMs: run.durationMs,
+    error: run.error ?? null,
+    finalText: run.finalText,
+    updates: run.updates,
+  });
+  const summary = run.ok
+    ? run.finalText.trim()
+    : [
+        'MCP leg did not complete honestly.',
+        run.timedOut ? `timeout=${run.timedOut}` : '',
+        run.cancelled ? 'cancelled=true' : '',
+        run.error ? `error=${run.error}` : '',
+        run.treeAfterKill.length > 0
+          ? `WARNING descendants survived kill: ${run.treeAfterKill.join(',')}`
+          : '',
+        run.finalText.trim() ? `partial output:\n${run.finalText.trim()}` : '',
+      ]
+        .filter(Boolean)
+        .join('\n');
+  return {
+    resultBody: `${summary}\n\nTranscript: ${transcript}`,
+    status: run.ok ? 'done' : 'failed',
+    run,
+  };
+}
+
 export async function runAgent(
   config: AgentConfig,
   message: DispatchMessage
@@ -413,7 +472,9 @@ async function processMessage(
       result =
         agentConfig.kind === 'acp'
           ? await runAcpLeg(agentConfig, claimed, cancel)
-          : await runAgent(agentConfig, claimed);
+          : agentConfig.kind === 'mcp'
+            ? await runMcpLeg(agentConfig, claimed, cancel)
+            : await runAgent(agentConfig, claimed);
     } finally {
       clearInterval(renewTimer);
     }

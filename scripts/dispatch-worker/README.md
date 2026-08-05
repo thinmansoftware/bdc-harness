@@ -41,6 +41,12 @@ interactive operator session and ignores duplicate starts.
 
 ## ACP conformance and promotion
 
+The worker also owns a native MCP client leg for Codex. The `codex-mcp` seat runs
+`codex mcp-server` over stdio, discovers the live `codex` tool schema, and keeps prompts out of
+process arguments. It is registered dark: no shipped provider configuration advertises it live.
+Promotion follows the same operator-host four-test matrix and config-only rollback discipline as
+`grok-acp`; real Codex authentication and binary verification are intentionally operator steps.
+
 Run the reusable evidence-contract matrix against an ACP seat before advertising it:
 
 ```bash

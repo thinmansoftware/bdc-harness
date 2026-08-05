@@ -1,4 +1,4 @@
-export type AgentKind = 'prompt' | 'fusion' | 'acp';
+export type AgentKind = 'prompt' | 'fusion' | 'acp' | 'mcp';
 
 export interface AgentConfig {
   kind?: AgentKind;
@@ -21,6 +21,13 @@ export interface AgentConfig {
     wallClockMs?: number;
     /** Grace between session/cancel and the process-tree kill. */
     killGraceMs?: number;
+  };
+  /** MCP-only (kind: 'mcp'), all optional with the ACP reliability defaults. */
+  mcp?: {
+    idleTimeoutMs?: number;
+    wallClockMs?: number;
+    killGraceMs?: number;
+    toolName?: string;
   };
 }
 
@@ -90,6 +97,12 @@ export const defaultAgentConfigs: Record<string, AgentConfig> = {
     command: 'npx',
     args: ['-y', '@zed-industries/claude-code-acp'],
     acp: {},
+  },
+  'codex-mcp': {
+    kind: 'mcp',
+    command: 'codex',
+    args: ['mcp-server'],
+    mcp: {},
   },
 };
 
