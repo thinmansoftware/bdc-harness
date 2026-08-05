@@ -18,9 +18,18 @@ import { enumerateProcessTree } from './kill-tree';
  * Minimal ACP agent over stdio: answers initialize/session/new/session/prompt
  * with newline-delimited JSON-RPC. `mode` controls the misbehavior under test.
  */
-function stubAgentSource(mode: 'ok' | 'empty' | 'hang' | 'spawn-child'): string {
+export type StubAgentMode =
+  | 'ok'
+  | 'wrong-byte-count'
+  | 'empty'
+  | 'hang'
+  | 'spawn-child'
+  | 'auth-reject';
+
+export function stubAgentSource(mode: StubAgentMode): string {
   return `
 const send = (msg) => process.stdout.write(JSON.stringify(msg) + '\\n');
+const STUB_MODE = ${JSON.stringify(mode)};
 let buf = '';
 process.stdin.on('data', (chunk) => {
   buf += chunk;
@@ -32,11 +41,16 @@ process.stdin.on('data', (chunk) => {
     let msg;
     try { msg = JSON.parse(line); } catch { continue; }
     if (msg.method === 'initialize') {
-      send({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: 1, agentCapabilities: {}, authMethods: [] } });
+      const authMethods = STUB_MODE === 'auth-reject'
+        ? [{ id: 'cached_token', name: 'Cached token' }]
+        : [];
+      send({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: 1, agentCapabilities: {}, authMethods } });
+    } else if (msg.method === 'authenticate') {
+      send({ jsonrpc: '2.0', id: msg.id, error: { code: -32001, message: 'authentication failed: cached token expired' } });
     } else if (msg.method === 'session/new') {
       send({ jsonrpc: '2.0', id: msg.id, result: { sessionId: 'sess-1' } });
     } else if (msg.method === 'session/prompt') {
-      const mode = ${JSON.stringify(mode)};
+      const mode = STUB_MODE;
       if (mode === 'spawn-child') {
         const { spawn } = require('child_process');
         // Long-lived grandchild that must be killed with the tree.
@@ -49,12 +63,16 @@ process.stdin.on('data', (chunk) => {
         send({ jsonrpc: '2.0', id: msg.id, result: { stopReason: 'end_turn' } });
         return;
       }
+      const prompt = msg.params && Array.isArray(msg.params.prompt)
+        ? msg.params.prompt.map((part) => part.text || '').join('')
+        : '';
       send({ jsonrpc: '2.0', method: 'session/update', params: {
         sessionId: 'sess-1',
-        update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'ACP_STUB_OK' } },
+        update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'ACP_STUB_OK bytes=' + (mode === 'wrong-byte-count' ? 1 : Buffer.byteLength(prompt)) } },
       }});
       send({ jsonrpc: '2.0', id: msg.id, result: { stopReason: 'end_turn' } });
     } else if (msg.method === 'session/cancel') {
+      if (STUB_MODE === 'spawn-child') return;
       process.exit(0);
     }
   }
@@ -63,7 +81,7 @@ setInterval(() => {}, 1e9);
 `;
 }
 
-async function writeStub(mode: 'ok' | 'empty' | 'hang' | 'spawn-child'): Promise<{
+export async function writeStub(mode: StubAgentMode): Promise<{
   script: string;
   cwd: string;
 }> {

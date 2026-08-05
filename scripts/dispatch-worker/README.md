@@ -39,6 +39,23 @@ interactive operator session and ignores duplicate starts.
 
 `config.local.json` and `scripts/dispatch-worker/transcripts/` are intentionally gitignored.
 
+## ACP conformance and promotion
+
+Run the reusable evidence-contract matrix against an ACP seat before advertising it:
+
+```bash
+bun run scripts/dispatch-worker/run-acp-conformance.ts --seat grok-acp --failure-command definitely-not-a-real-binary-bdc
+```
+
+The command prints a recordable JSON report and exits non-zero unless all four tests are green:
+the 60KB payload round-trip, bounded cancellation and descendant cleanup, honest forced failure,
+and receipt audit. Run it on the Windows operator host with the real binary and credentials. The
+optional `--timeout-ms`, `--cancel-after-ms`, and `--cwd` arguments tune the controlled probes.
+
+Only after all four verdicts are green should the seat be added to `capabilities.providers` in
+`config.local.json`. Promotion is not performed by this repository change. Rollback is config-only:
+remove the seat from `capabilities.providers`; its CLI fallback remains configured.
+
 ## Scope
 
 The worker only claims messages addressed to configured local agents.
