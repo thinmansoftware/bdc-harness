@@ -4,7 +4,7 @@ import { join } from 'path';
 import { describe, expect, test } from 'bun:test';
 import { createMcpCancelController, runMcpAgent } from './session';
 
-export type McpStubMode = 'ok' | 'empty' | 'error' | 'hang' | 'spawn-child';
+export type McpStubMode = 'ok' | 'renamed-prompt' | 'empty' | 'error' | 'hang' | 'spawn-child';
 
 function stubSource(mode: McpStubMode): string {
   return `
@@ -25,16 +25,17 @@ process.stdin.on('data', chunk => {
         serverInfo: { name: 'codex-mcp-server', version: '0.144.1' }
       }});
     } else if (msg.method === 'tools/list') {
+      const promptName = MODE === 'renamed-prompt' ? 'task' : 'prompt';
       send({ jsonrpc: '2.0', id: msg.id, result: { tools: [{
         name: 'codex', description: 'stub',
-        inputSchema: { type: 'object', properties: { prompt: { type: 'string' } }, required: ['prompt'] }
+        inputSchema: { type: 'object', properties: { [promptName]: { type: 'string' } }, required: [promptName] }
       }, { name: 'codex-reply', description: 'stub', inputSchema: { type: 'object' } }] }});
     } else if (msg.method === 'tools/call') {
       if (MODE === 'spawn-child') {
         require('child_process').spawn(process.execPath, ['-e', 'setInterval(()=>{},1e9)'], { stdio: 'ignore' });
       }
       if (MODE === 'hang' || MODE === 'spawn-child') continue;
-      const prompt = msg.params.arguments.prompt;
+      const prompt = msg.params.arguments[MODE === 'renamed-prompt' ? 'task' : 'prompt'];
       send({ jsonrpc: '2.0', method: 'notifications/message', params: { level: 'info', data: 'receipt' } });
       if (MODE === 'empty') send({ jsonrpc: '2.0', id: msg.id, result: { content: [] } });
       else if (MODE === 'error') send({ jsonrpc: '2.0', id: msg.id, result: { isError: true, content: [{ type: 'text', text: 'server reported failure' }] } });
@@ -76,6 +77,13 @@ describe('runMcpAgent reliability contract', () => {
     expect(result.finalText).toContain('ACP_STUB_OK');
     expect(result.finalText).not.toContain(prompt);
     expect(result.updates.length).toBeGreaterThan(0);
+  });
+
+  test('uses the required string field when the live schema has no prompt property', async () => {
+    const prompt = 'schema-selected task';
+    const result = await run('renamed-prompt', prompt);
+    expect(result.ok).toBe(true);
+    expect(result.finalText).toContain(`bytes=${Buffer.byteLength(prompt)}`);
   });
 
   test('empty content is not success', async () => {
