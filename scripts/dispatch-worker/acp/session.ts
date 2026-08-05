@@ -171,12 +171,27 @@ export async function runAcpAgent(
     }
   );
 
-  const boundedKill = async (): Promise<void> => {
-    if (agentPid === null) return;
-    const tree = await enumerateProcessTree(agentPid);
-    treeBeforeKill = tree.map(node => node.pid);
-    await killProcessTree(agentPid);
-    treeAfterKill = await waitForTreeDeath(treeBeforeKill, config.killGraceMs);
+  // boundedKill can legitimately run twice: the scheduled post-grace kill from
+  // requestCancel, and the post-connection safety kill below. Two things make
+  // the resulting evidence trustworthy rather than racy:
+  //   1. Runs are SERIALIZED on killChain, so the two passes never interleave
+  //      their writes to treeBeforeKill/treeAfterKill.
+  //   2. treeBeforeKill ACCUMULATES (union) instead of overwriting. The second
+  //      pass observes an already-dead, empty tree; overwriting would erase the
+  //      proof that a live tree ever existed and would silently gut the
+  //      descendant-cleanup gate. treeAfterKill is always recomputed against
+  //      the full accumulated set, so it stays the honest "who survived".
+  let killChain: Promise<void> = Promise.resolve();
+  const boundedKill = (): Promise<void> => {
+    killChain = killChain.then(async () => {
+      if (agentPid === null) return;
+      const tree = await enumerateProcessTree(agentPid);
+      const observed = tree.map(node => node.pid);
+      treeBeforeKill = [...new Set([...treeBeforeKill, ...observed])];
+      await killProcessTree(agentPid);
+      treeAfterKill = await waitForTreeDeath(treeBeforeKill, config.killGraceMs);
+    });
+    return killChain;
   };
 
   try {
@@ -284,6 +299,10 @@ export async function runAcpAgent(
   if (child.exitCode === null && !child.killed) {
     await boundedKill();
   }
+  // Drain any kill scheduled by requestCancel that is still in flight, so the
+  // returned treeBeforeKill/treeAfterKill are the settled result of every kill
+  // pass rather than a snapshot read mid-kill.
+  await killChain;
   const exitCode = await Promise.race([
     exited,
     new Promise<number | null>(resolve =>

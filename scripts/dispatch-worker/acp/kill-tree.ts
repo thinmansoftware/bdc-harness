@@ -53,16 +53,33 @@ async function listAllProcesses(): Promise<ProcessNode[]> {
       return [];
     }
   }
-  const { stdout } = await runCapture('ps', ['-eo', 'pid=,ppid=,comm=']);
-  return stdout
-    .split('\n')
-    .map(line => line.trim())
-    .filter(Boolean)
-    .map(line => {
-      const [pid, ppid, ...name] = line.split(/\s+/);
-      return { pid: Number(pid), ppid: Number(ppid), name: name.join(' ') };
-    })
-    .filter(node => Number.isFinite(node.pid) && Number.isFinite(node.ppid));
+  // `stat` is requested so zombies can be excluded below.
+  const { stdout } = await runCapture('ps', ['-eo', 'pid=,ppid=,stat=,comm=']);
+  return (
+    stdout
+      .split('\n')
+      .map(line => line.trim())
+      .filter(Boolean)
+      .map(line => {
+        const [pid, ppid, stat, ...name] = line.split(/\s+/);
+        return {
+          pid: Number(pid),
+          ppid: Number(ppid),
+          stat: stat ?? '',
+          name: name.join(' '),
+        };
+      })
+      .filter(node => Number.isFinite(node.pid) && Number.isFinite(node.ppid))
+      // A zombie has ALREADY exited: it executes no code, holds no handles, and
+      // its entry lingers only until a parent reaps it. When the tree kill takes
+      // out both a child and its parent, the child is reparented to PID 1 -- and
+      // in a container whose PID 1 is not a reaping init, that zombie entry never
+      // clears. Counting it as a surviving descendant would fail the Order-4
+      // cleanup proof for a process that is, in fact, dead. Live descendants
+      // (R/S/D) are unaffected, so a genuine leak still fails the gate.
+      .filter(node => !node.stat.startsWith('Z') && !node.name.includes('<defunct>'))
+      .map(node => ({ pid: node.pid, ppid: node.ppid, name: node.name }))
+  );
 }
 
 /**

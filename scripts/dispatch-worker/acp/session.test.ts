@@ -20,14 +20,17 @@ import { enumerateProcessTree } from './kill-tree';
  * ONE stub implementation rather than forking a second one
  * (WO-HARNESS-GROK-ACP-PROMOTION-01, spec section 4).
  *
- * - 'ok'          completes a real prompt turn with non-empty output.
+ * - 'ok'          completes a real prompt turn with non-empty output, echoing
+ *                 back any ACP_ECHO_<hex> token found in the payload (the
+ *                 conformance harness's tail-delivery proof).
  * - 'empty'       clean end_turn with no output (honest-completion failure).
  * - 'hang'        never answers -- the idle timeout must fire.
  * - 'spawn-child' spawns a grandchild then hangs; on session/cancel it EXITS
  *                 itself (the original slice test relies on this exit).
- * - 'cancel-tree' hangs and DELIBERATELY IGNORES session/cancel, so Dispatch's
- *                 bounded tree-kill (not a cooperative agent exit) is what
- *                 removes it -- the Order-4 force-kill path for a
+ * - 'cancel-tree' spawns a grandchild, hangs, and DELIBERATELY IGNORES
+ *                 session/cancel, so Dispatch's bounded tree-kill (not a
+ *                 cooperative agent exit) is what removes BOTH it and its
+ *                 descendant -- the Order-4 force-kill path for a
  *                 non-cooperative agent.
  * - 'auth-reject' advertises the cached_token auth method then rejects the
  *                 `authenticate` RPC, simulating an expired cached_token
@@ -66,9 +69,12 @@ process.stdin.on('data', (chunk) => {
     } else if (msg.method === 'session/new') {
       send({ jsonrpc: '2.0', id: msg.id, result: { sessionId: 'sess-1' } });
     } else if (msg.method === 'session/prompt') {
-      if (mode === 'spawn-child') {
+      if (mode === 'spawn-child' || mode === 'cancel-tree') {
         const { spawn } = require('child_process');
-        // Long-lived grandchild that must be killed with the tree.
+        // Long-lived grandchild that must be killed with the tree. BOTH modes
+        // spawn it: 'spawn-child' exits cooperatively on session/cancel, while
+        // 'cancel-tree' ignores cancel so Dispatch's bounded tree-kill is the
+        // only thing that can reap the descendant.
         spawn(process.execPath, ['-e', 'setInterval(()=>{},1e9)'], { stdio: 'ignore' });
       }
       if (mode === 'hang' || mode === 'spawn-child' || mode === 'cancel-tree') {
@@ -78,15 +84,23 @@ process.stdin.on('data', (chunk) => {
         send({ jsonrpc: '2.0', id: msg.id, result: { stopReason: 'end_turn' } });
         return;
       }
+      // Echo any ACP_ECHO_ token carried by the payload. The conformance
+      // harness puts that token ONLY at the tail of its >= 60KB round-trip
+      // prompt, so echoing it is the stub's proof that the COMPLETE payload
+      // arrived (and that this receipt belongs to that run).
+      const rawParams = JSON.stringify(msg.params === undefined ? null : msg.params);
+      const echoMatch = rawParams.match(/ACP_ECHO_[0-9a-f]+/);
+      const replyText = echoMatch ? 'ACP_STUB_OK ' + echoMatch[0] : 'ACP_STUB_OK';
       send({ jsonrpc: '2.0', method: 'session/update', params: {
         sessionId: 'sess-1',
-        update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'ACP_STUB_OK' } },
+        update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: replyText } },
       }});
       send({ jsonrpc: '2.0', id: msg.id, result: { stopReason: 'end_turn' } });
     } else if (msg.method === 'session/cancel') {
       if (mode === 'cancel-tree') {
         // Do NOT exit: force Dispatch's bounded tree-kill to remove this
-        // process and its grandchild (Order-4 descendant-cleanup proof).
+        // process AND the grandchild spawned in session/prompt above
+        // (Order-4 descendant-cleanup proof).
         return;
       }
       process.exit(0);
@@ -187,6 +201,42 @@ describe('runAcpAgent reliability contract', () => {
     );
     expect(result.cancelled).toBe(true);
     expect(result.ok).toBe(false);
+    expect(result.treeAfterKill).toEqual([]);
+    if (result.agentPid !== null) {
+      const survivors = await enumerateProcessTree(result.agentPid);
+      expect(survivors.length).toBe(0);
+    }
+  }, 60_000);
+
+  test('bounded tree-kill reaps the descendant of an agent that IGNORES session/cancel', async () => {
+    // This is the mode the conformance matrix's cancel test drives, so this
+    // test is what makes that matrix's descendant-cleanup claim real.
+    //
+    // Unlike 'spawn-child' (which exits cooperatively on session/cancel),
+    // 'cancel-tree' ignores session/cancel entirely: ONLY Dispatch's bounded
+    // tree-kill can remove the agent and the grandchild it spawned. The
+    // before-snapshot must show a LIVE tree with at least one descendant --
+    // an empty-before / empty-after pair would prove cleanup of nothing.
+    const { script, cwd } = await writeStub('cancel-tree');
+    const cancel = createCancelController();
+    setTimeout(() => cancel.cancel(), 1_000);
+    const result = await runAcpAgent(
+      {
+        command: process.execPath,
+        args: [script],
+        cwd,
+        idleTimeoutMs: 30_000,
+        wallClockMs: 60_000,
+        killGraceMs: 2_000,
+      },
+      'spawn a child and refuse to cancel',
+      cancel
+    );
+    expect(result.cancelled).toBe(true);
+    expect(result.ok).toBe(false);
+    // A live tree was observed: the agent process PLUS its grandchild.
+    expect(result.treeBeforeKill.length).toBeGreaterThan(1);
+    // And nothing from it survived.
     expect(result.treeAfterKill).toEqual([]);
     if (result.agentPid !== null) {
       const survivors = await enumerateProcessTree(result.agentPid);

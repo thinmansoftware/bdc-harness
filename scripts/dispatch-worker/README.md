@@ -104,11 +104,18 @@ bun run scripts/dispatch-worker/verify-reboot-recovery.ts
 Before an ACP seat is advertised live, it must pass the ratified four-test acceptance matrix
 (M-126 disposition T3/T4/T5, RATIFIED 3-0 2026-08-04):
 
-1. **Large payload round-trip** -- a >= 60KB dispatch reaches the agent and is receipted.
+1. **Large payload round-trip** -- a >= 60KB dispatch reaches the agent IN FULL and is receipted.
+   Proof is a run-unique token placed at the *tail* of the payload coming back in the receipt: the
+   agent can only echo it if the whole payload arrived, and the token is unique per run so the
+   receipt cannot be a cached or replayed transcript. Payload size alone is not accepted.
 2. **Cancel mid-generation** -- cancellation stops work with no orphan descendants
-   (`treeBeforeKill` non-empty, `treeAfterKill` empty), and the receipt says cancelled.
-3. **Forced failure** -- a seat that fails auth or dies mid-run is marked failed with a reason
-   inside the timeout, never stuck queued and never `ok`.
+   (`treeBeforeKill` non-empty, `treeAfterKill` empty), and the receipt says cancelled. The
+   non-empty `treeBeforeKill` is load-bearing: without it, a run where no process tree was ever
+   observed would score an empty `treeAfterKill` as clean cleanup of nothing.
+3. **Forced failure** -- the seat's OWN declared failure leg (expired auth, or an agent that dies
+   or hangs mid-run) is marked failed with a reason, attributably classified as either a fast fail
+   or a bounded idle/wall timeout, and returns inside a budget derived from its configured
+   timeouts. Never stuck queued, never `ok`.
 4. **Receipt audit** -- every run above has a durable receipt matching what actually happened.
 
 The matrix is implemented once, seat-parameterized, in `acp/conformance.ts` (`runConformanceMatrix`
@@ -117,15 +124,26 @@ codex/claude leg -- runs through the same harness. `acp/conformance.test.ts` pro
 itself against stub seats in CI, including Gate B (an expired `cached_token` rejecting the
 `authenticate` RPC must fail loud rather than leave a dispatch stuck queued).
 
-Run the real-binary matrix against a configured seat on the operator host:
+Run the real-binary matrix against a configured seat on the operator host. `--failure` is
+**required**: the harness will not invent a failure leg for you, because substituting a
+guaranteed-missing binary would only prove that the runtime reports a spawn error -- never that
+*this* seat fails honestly when its auth expires or its agent dies mid-run.
 
 ```bash
-bun run scripts/dispatch-worker/run-acp-conformance.ts grok-acp
+# Gate B on the real leg: invalidate/expire the seat's cached credential FIRST, out of band.
+bun run scripts/dispatch-worker/run-acp-conformance.ts grok-acp --failure=auth
+
+# Or: same binary, replacement args chosen so the real agent dies or hangs mid-run.
+bun run scripts/dispatch-worker/run-acp-conformance.ts grok-acp --failure=args:agent-bogus-subcommand
+
+# Or: use another configured ACP seat as the failure leg.
+bun run scripts/dispatch-worker/run-acp-conformance.ts grok-acp --failure=seat:claude-acp
 ```
 
 The script prints a recordable PASS/FAIL line per test plus an overall `allGreen`, and exits 0 only
-when all four are green. This CANNOT run in CI or the Cauldron container (no grok binary, no cached
-credential); it is the operator's promotion step.
+when all four are green. It exits 2 with usage if `--failure` is missing or unrecognized. This
+CANNOT run in CI or the Cauldron container (no grok binary, no cached credential); it is the
+operator's promotion step.
 
 **Promotion is config-only and gated on green.** All four tests must be green against the real binary
 before a seat id is added to `capabilities.providers` in `config.local.json`. Only after a green,
