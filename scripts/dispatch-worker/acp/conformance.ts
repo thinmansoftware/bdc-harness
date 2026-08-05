@@ -118,7 +118,9 @@ async function safelyRun(
   try {
     if (cancelAfterMs === undefined) return await runAcpAgent(runConfig(seat), prompt);
     const controller = createCancelController();
-    const timer = setTimeout(() => controller.cancel(), cancelAfterMs);
+    const timer = setTimeout(() => {
+      controller.cancel();
+    }, cancelAfterMs);
     try {
       return await runAcpAgent(runConfig(seat), prompt, controller);
     } finally {
@@ -159,7 +161,7 @@ export async function runConformanceMatrix(
   const timeoutReceipt = receipt(timeoutSeat, timeoutResult);
   const receipts = [largeReceipt, cancelReceipt, forcedReceipt, timeoutReceipt];
   const largePromptBytes = Buffer.byteLength(largePrompt);
-  const receivedPromptBytesMatch = largeResult.finalText.match(/\bACP_STUB_OK bytes=(\d+)\b/);
+  const receivedPromptBytesMatch = /\bACP_STUB_OK bytes=(\d+)\b/.exec(largeResult.finalText);
   const receivedPromptBytes = receivedPromptBytesMatch ? Number(receivedPromptBytesMatch[1]) : null;
 
   const largePass =

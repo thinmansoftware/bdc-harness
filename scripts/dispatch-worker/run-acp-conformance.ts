@@ -14,7 +14,7 @@ function argument(name: string): string | undefined {
 
 const seatId = argument('--seat') ?? 'grok-acp';
 const configured = defaultAgentConfigs[seatId];
-if (!configured || configured.kind !== 'acp') {
+if (configured?.kind !== 'acp') {
   throw new Error(`unknown_or_non_acp_seat: ${seatId}`);
 }
 
