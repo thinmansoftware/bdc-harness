@@ -178,6 +178,57 @@ describe('runAcpAgent reliability contract', () => {
     }
   }, 60_000);
 
+  test('cancellation preserves descendant-cleanup evidence (kill is idempotent)', async () => {
+    // WO-HARNESS-ACP-KILL-EVIDENCE-FIX-01: the post-connect cleanup used to
+    // invoke boundedKill a SECOND time against an already-dead pid (killed
+    // via the tree-kill path, so child.killed stays false and a signal death
+    // leaves exitCode null). That pass enumerated an empty tree and
+    // clobbered treeBeforeKill with []. The evidence captured by the FIRST
+    // kill must survive: treeBeforeKill reflects the tree that existed at
+    // kill time, treeAfterKill proves no survivors.
+    const { script, cwd } = await writeStub('spawn-child');
+    const cancel = createCancelController();
+    setTimeout(() => cancel.cancel(), 1_500);
+    const result = await runAcpAgent(
+      {
+        command: process.execPath,
+        args: [script],
+        cwd,
+        idleTimeoutMs: 30_000,
+        wallClockMs: 60_000,
+        killGraceMs: 4_000,
+      },
+      'spawn and hang',
+      cancel
+    );
+    expect(result.cancelled).toBe(true);
+    expect(result.ok).toBe(false);
+    expect(result.treeBeforeKill.length).toBeGreaterThan(0);
+    expect(result.treeAfterKill).toEqual([]);
+  }, 60_000);
+
+  test('idle timeout preserves descendant-cleanup evidence', async () => {
+    // Same evidence contract on the timeout path: spawn-child never answers
+    // the prompt and ignores session/cancel, so a live descendant tree
+    // exists when the bounded kill fires.
+    const { script, cwd } = await writeStub('spawn-child');
+    const result = await runAcpAgent(
+      {
+        command: process.execPath,
+        args: [script],
+        cwd,
+        idleTimeoutMs: 1_000,
+        wallClockMs: 60_000,
+        killGraceMs: 4_000,
+      },
+      'spawn and time out'
+    );
+    expect(result.timedOut).not.toBeNull();
+    expect(result.ok).toBe(false);
+    expect(result.treeBeforeKill.length).toBeGreaterThan(0);
+    expect(result.treeAfterKill).toEqual([]);
+  }, 60_000);
+
   test('reports a spawn failure instead of pretending the leg ran', async () => {
     const result = await runAcpAgent(
       {

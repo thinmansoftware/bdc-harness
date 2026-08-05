@@ -126,6 +126,23 @@ export async function waitForTreeDeath(pids: number[], timeoutMs: number): Promi
     const snapshot = await listAllProcesses();
     const livePids = new Set(snapshot.map(node => node.pid));
     alive = pids.filter(pid => livePids.has(pid));
+    if (alive.length > 0 && process.platform !== 'win32') {
+      // WO-HARNESS-ACP-KILL-EVIDENCE-FIX-01: a POSIX zombie (state 'Z...')
+      // is killed-but-unreaped -- it can never run again; only its parent's
+      // wait() is pending. Counting it as a survivor falsely fails the
+      // cleanup proof, so drop zombies (and pids that vanished between the
+      // snapshot and the state read). Windows has no zombie state; that
+      // branch is unchanged.
+      const states = await Promise.all(
+        alive.map(async pid => {
+          const { stdout } = await runCapture('ps', ['-o', 'stat=', '-p', String(pid)]);
+          return { pid, stat: stdout.trim() };
+        })
+      );
+      alive = states
+        .filter(entry => entry.stat !== '' && !entry.stat.startsWith('Z'))
+        .map(entry => entry.pid);
+    }
     if (alive.length === 0) return [];
     await new Promise(resolve => setTimeout(resolve, 250));
   }

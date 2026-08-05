@@ -171,12 +171,24 @@ export async function runAcpAgent(
     }
   );
 
-  const boundedKill = async (): Promise<void> => {
-    if (agentPid === null) return;
-    const tree = await enumerateProcessTree(agentPid);
-    treeBeforeKill = tree.map(node => node.pid);
-    await killProcessTree(agentPid);
-    treeAfterKill = await waitForTreeDeath(treeBeforeKill, config.killGraceMs);
+  // WO-HARNESS-ACP-KILL-EVIDENCE-FIX-01: the kill is memoized so it runs at
+  // most once. The first invocation captures treeBeforeKill/treeAfterKill --
+  // the Order-4 cleanup evidence -- and every later or CONCURRENT caller
+  // (the post-connect cleanup can race the timer-scheduled kill) awaits the
+  // same in-flight promise instead of re-enumerating an already-dead tree
+  // and clobbering the evidence with []. killPromise is assigned
+  // synchronously, before the first await, so the race window is closed.
+  let killPromise: Promise<void> | null = null;
+  const boundedKill = (): Promise<void> => {
+    if (killPromise !== null) return killPromise;
+    killPromise = (async (): Promise<void> => {
+      if (agentPid === null) return;
+      const tree = await enumerateProcessTree(agentPid);
+      treeBeforeKill = tree.map(node => node.pid);
+      await killProcessTree(agentPid);
+      treeAfterKill = await waitForTreeDeath(treeBeforeKill, config.killGraceMs);
+    })();
+    return killPromise;
   };
 
   try {

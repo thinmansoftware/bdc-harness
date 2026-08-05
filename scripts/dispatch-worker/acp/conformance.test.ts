@@ -30,26 +30,48 @@ async function conformingOptions(): Promise<ConformanceOptions> {
 
 describe('ACP evidence-contract conformance matrix', () => {
   test('fails loud when raw cancellation cleanup evidence is absent', async () => {
-    const report = await runConformanceMatrix(
+    // WO-HARNESS-ACP-KILL-EVIDENCE-FIX-01 Amendment 01: this test previously
+    // asserted treeBeforeKill toEqual([]) on the spawn-child cancellation
+    // seat -- an assertion that ENCODED the session.ts evidence-wipe defect.
+    // Post-fix, the conforming seat legitimately records the tree that
+    // existed at kill time (Arm A), and the test's fail-loud PURPOSE is
+    // preserved by a seat that genuinely cannot demonstrate cleanup
+    // evidence (Arm B). The conformance.ts gate itself is unchanged.
+
+    // Arm A (post-fix truth): a conforming spawn-child cancellation seat
+    // proves bounded cleanup -- non-empty treeBeforeKill, empty
+    // treeAfterKill -- so the strict gate passes honestly.
+    const conforming = await runConformanceMatrix(
       await stubSeat('ok', 'future-acp-seat'),
       await conformingOptions()
     );
-    expect(report.allGreen).toBe(false);
-    expect(Object.keys(report.tests)).toHaveLength(4);
-    expect(report.tests.largePayload.pass).toBe(true);
-    expect(report.tests.forcedFailure.pass).toBe(true);
-    expect(report.tests.receiptAudit.pass).toBe(true);
-    expect(report.tests.cancellation.pass).toBe(false);
-    expect(report.tests.largePayload.evidence.promptBytes).toBeGreaterThanOrEqual(61_440);
-    expect(report.tests.largePayload.evidence.receivedPromptBytes).toBe(
-      report.tests.largePayload.evidence.promptBytes
+    expect(Object.keys(conforming.tests)).toHaveLength(4);
+    expect(conforming.tests.largePayload.pass).toBe(true);
+    expect(conforming.tests.forcedFailure.pass).toBe(true);
+    expect(conforming.tests.receiptAudit.pass).toBe(true);
+    expect(conforming.tests.cancellation.pass).toBe(true);
+    expect(conforming.tests.largePayload.evidence.promptBytes).toBeGreaterThanOrEqual(61_440);
+    expect(conforming.tests.largePayload.evidence.receivedPromptBytes).toBe(
+      conforming.tests.largePayload.evidence.promptBytes
     );
-    expect(report.tests.cancellation.evidence.treeBeforeKill).toEqual([]);
-    expect(report.tests.cancellation.evidence.treeBeforeKill).toEqual(
-      report.tests.cancellation.evidence.result.treeBeforeKill
+    expect(conforming.tests.cancellation.evidence.treeBeforeKill.length).toBeGreaterThan(0);
+    expect(conforming.tests.cancellation.evidence.treeBeforeKill).toEqual(
+      conforming.tests.cancellation.evidence.result.treeBeforeKill
     );
-    expect(report.tests.cancellation.evidence.treeAfterKill).toEqual([]);
-  }, 30_000);
+    expect(conforming.tests.cancellation.evidence.treeAfterKill).toEqual([]);
+    expect(conforming.allGreen).toBe(true);
+
+    // Arm B (fail loud): a 'hang' cancellation seat exits on session/cancel
+    // and spawns no descendants, so no tree exists at kill time -- the raw
+    // cleanup evidence is absent. The strict gate MUST fail that seat, and
+    // allGreen with it.
+    const noEvidence = await conformingOptions();
+    noEvidence.cancellationSeat = await stubSeat('hang', 'no-cleanup-evidence-seat');
+    const absent = await runConformanceMatrix(await stubSeat('ok'), noEvidence);
+    expect(absent.tests.cancellation.evidence.treeBeforeKill).toEqual([]);
+    expect(absent.tests.cancellation.pass).toBe(false);
+    expect(absent.allGreen).toBe(false);
+  }, 60_000);
 
   test('a large-payload failure makes allGreen false without hiding other verdicts', async () => {
     const report = await runConformanceMatrix(await stubSeat('empty'), await conformingOptions());
