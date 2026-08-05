@@ -184,9 +184,15 @@ export async function runAcpAgent(
   // unchanged -- waitForTreeDeath still bounds on config.killGraceMs.
   let killPromise: Promise<void> | null = null;
   const boundedKill = (): Promise<void> => {
+    // Validate BEFORE memoizing so a no-op kill can never be cached. Today this
+    // guard cannot latch: agentPid is a const bound at spawn and the spawn-failure
+    // path returns before this closure exists, so agentPid is always non-null here.
+    // Checking first keeps that true if agentPid ever becomes reassignable
+    // (re-spawn / reconnect), where memoizing first would permanently cache a
+    // no-op and strand a live process tree.
+    if (agentPid === null) return Promise.resolve();
     if (killPromise) return killPromise;
     killPromise = (async (): Promise<void> => {
-      if (agentPid === null) return;
       const tree = await enumerateProcessTree(agentPid);
       treeBeforeKill = tree.map(node => node.pid);
       await killProcessTree(agentPid);
