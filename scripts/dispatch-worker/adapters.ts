@@ -92,7 +92,7 @@ export const defaultAgentConfigs: Record<string, AgentConfig> = {
    *
    * claude-acp: the BDC-OWNED adapter at ./claude-acp/adapter.ts, run via
    * `bun run <entry>`. M-126 disposition T1 (RATIFIED 3-0, 2026-08-04)
-   * REJECTED Zed's third-party claude-code-acp npx wrapper for carrying
+   * REJECTED Zed's third-party claude-code-acp wrapper for carrying
    * board-credential traffic -- unaudited third-party code in the highest-trust
    * lane, contrary to Rule 6's supply-chain posture. The replacement speaks the
    * agent side of ACP over stdio and executes prompts in-process via the
