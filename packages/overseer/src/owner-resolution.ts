@@ -3,7 +3,7 @@ const BDC_XO_REPO = 'bdc-xo';
 const BDC_XO_REF = 'main';
 const MOTIONS_PATH = 'docs/board/motions';
 
-export type BoardSeat = 'Claude' | 'GPT' | 'Grok';
+export type BoardSeat = 'Claude' | 'Codex' | 'Grok';
 
 interface GitHubContentFile {
   type: 'file';
@@ -46,7 +46,7 @@ function decodeFile(data: GitHubContentFile | GitHubContentDirectoryEntry[]): st
 function seatFromText(value: string): BoardSeat | null {
   const seats = new Set<BoardSeat>();
   if (/\b(?:claude|opus|fable|acting xo)\b/i.test(value)) seats.add('Claude');
-  if (/\b(?:gpt|codex|sol)\b/i.test(value)) seats.add('GPT');
+  if (/\b(?:gpt|codex|sol)\b/i.test(value)) seats.add('Codex');
   if (/\bgrok\b/i.test(value)) seats.add('Grok');
   return seats.size === 1 ? ([...seats][0] ?? null) : null;
 }

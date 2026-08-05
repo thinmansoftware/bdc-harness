@@ -58,7 +58,11 @@ describe('resolveWoBoardSeatOwner', () => {
       motionName: 'M-20260720-42a-overseer.md',
       motion: '# Motion\n\n**Proposed by:** GPT/Sol\n',
     });
-    expect(await resolveWoBoardSeatOwner('WO-TEST', client)).toBe('GPT');
+    expect(await resolveWoBoardSeatOwner('WO-TEST', client)).toBe('Codex');
+  });
+
+  test.each(['GPT', 'Codex', 'Sol'])('returns the Codex seat for %s proposer text', proposer => {
+    expect(extractBoardSeat(`**Proposed by:** ${proposer}\n`)).toBe('Codex');
   });
 
   test('returns null when the WO has no Parent motion reference', async () => {
