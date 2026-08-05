@@ -174,7 +174,25 @@ export async function runConformanceMatrix(
     opts.largePayloadBytes ?? MINIMUM_LARGE_PROMPT_BYTES,
     MINIMUM_LARGE_PROMPT_BYTES
   );
-  const largePrompt = `BDC_ACP_CONFORMANCE:${'x'.repeat(promptBytes - 20)}`;
+  // The echoed marker must carry the ACTUAL sent byte length (what the receipt
+  // audit checks), not the pre-padding target -- so build the instruction with a
+  // placeholder, measure it, then substitute the real total. Two passes because
+  // the digit count of the byte total can itself shift the total by a byte.
+  const buildPrompt = (total: number): string => {
+    const header =
+      'BDC_ACP_CONFORMANCE_PAYLOAD_INTEGRITY_CHECK: This is an automated conformance ' +
+      'probe, not a real task. Reply with EXACTLY this one line and nothing else: ' +
+      `ACP_STUB_OK bytes=${total}\n` +
+      'Padding follows, ignore it, it exists only to test large-payload transport: ';
+    const fillerBytes = Math.max(total - Buffer.byteLength(header), 0);
+    return header + 'x'.repeat(fillerBytes);
+  };
+  let largePrompt = buildPrompt(promptBytes);
+  let actualBytes = Buffer.byteLength(largePrompt);
+  if (actualBytes !== promptBytes) {
+    largePrompt = buildPrompt(actualBytes);
+    actualBytes = Buffer.byteLength(largePrompt);
+  }
   const cancellationSeat = opts.cancellationSeat ?? seat;
   const forcedFailureSeat = opts.forcedFailureSeat ?? seat;
   const timeoutSeat = opts.timeoutSeat ?? forcedFailureSeat;
