@@ -81,10 +81,9 @@ export const defaultAgentConfigs: Record<string, AgentConfig> = {
    * full initialize/authenticate/session-new/session-prompt handshake) per
    * M-20260802-118.acp-compatibility-proof.md.
    *
-   * claude-acp: @zed-industries/claude-code-acp, run via npx so the wrapper
-   * does not have to be globally installed. Rides the existing Claude Code
-   * login; if it ever demands a raw API key that is a finding to report, not
-   * something to work around (WO scope wall).
+   * claude-acp: M-126 T1 rejected the third-party wrapper for the credential
+   * lane. This dark seat uses the BDC-owned adapter and official Claude Agent
+   * SDK; operator conformance still gates promotion.
    */
   'grok-acp': {
     kind: 'acp',
@@ -94,8 +93,8 @@ export const defaultAgentConfigs: Record<string, AgentConfig> = {
   },
   'claude-acp': {
     kind: 'acp',
-    command: 'npx',
-    args: ['-y', '@zed-industries/claude-code-acp'],
+    command: 'bun',
+    args: ['scripts/dispatch-worker/claude-acp/main.ts'],
     acp: {},
   },
   'codex-mcp': {
