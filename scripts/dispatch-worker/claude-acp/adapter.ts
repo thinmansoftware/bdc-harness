@@ -83,7 +83,9 @@ function fakeExecutor(mode: string): ClaudeExecutor {
       if (selected !== 'ok') throw new Error(`unknown fake executor mode: ${selected}`);
       const bytes = Buffer.byteLength(prompt);
       const sha256 = createHash('sha256').update(prompt).digest('hex');
-      await onText(`ACP_STUB_OK bytes=${bytes} sha256=${sha256}`);
+      await onText(
+        `ACP_STUB_OK bytes=${bytes} sha256=${sha256} argv=${JSON.stringify(process.argv.slice(2))}`
+      );
     },
   };
 }

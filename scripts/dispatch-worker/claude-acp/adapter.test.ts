@@ -45,13 +45,13 @@ describe('BDC Claude ACP adapter', () => {
     const unit = `line\r\n\u2014\u4e2d\u6587`;
     const prompt = unit.repeat(Math.ceil(61_440 / Buffer.byteLength(unit)) + 1);
     const expectedHash = createHash('sha256').update(prompt).digest('hex');
-    const runConfig = config('ok');
     expect(Buffer.byteLength(prompt)).toBeGreaterThanOrEqual(61_440);
-    expect(runConfig.args.some(arg => arg.includes(prompt))).toBe(false);
-    const result = await runAcpAgent(runConfig, prompt);
+    const result = await runAcpAgent(config('ok'), prompt);
     expect(result.ok).toBe(true);
     expect(result.finalText).toContain(`bytes=${Buffer.byteLength(prompt)}`);
     expect(result.finalText).toContain(`sha256=${expectedHash}`);
+    expect(result.finalText).toContain('argv=[]');
+    expect(result.finalText).not.toContain(prompt);
   });
 
   test('cancellation is bounded and leaves no adapter process alive', async () => {
