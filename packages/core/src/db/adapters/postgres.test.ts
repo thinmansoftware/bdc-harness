@@ -167,6 +167,44 @@ describe('PostgresAdapter', () => {
     });
   });
 
+  describe('agent messaging Phase 0 schema', () => {
+    test('numbered migration and combined schema define the complete Postgres message contract', () => {
+      const migration = readFileSync(
+        resolve(import.meta.dir, '../../../../../migrations', '040_agent_messaging_phase0.sql'),
+        'utf8'
+      );
+      const combined = readFileSync(
+        resolve(import.meta.dir, '../../../../../migrations', '000_combined.sql'),
+        'utf8'
+      );
+
+      for (const schema of [migration, combined]) {
+        expect(schema).toContain("priority TEXT NOT NULL DEFAULT 'normal'");
+        expect(schema).toContain("priority IN ('blocker', 'normal', 'heartbeat')");
+        expect(schema).toContain('task_outcome TEXT');
+        expect(schema).toContain("task_outcome IN ('succeeded', 'failed', 'blocked')");
+        expect(schema).toContain('acknowledged_at TIMESTAMPTZ');
+        expect(schema).toContain('acknowledged_by TEXT');
+        expect(schema).toContain('addressed_at TIMESTAMPTZ');
+        expect(schema).toContain('addressed_by TEXT');
+        expect(schema).toContain('escalated_tg_at TIMESTAMPTZ');
+        expect(schema).toContain('escalated_sms_at TIMESTAMPTZ');
+        expect(schema).toContain('subject_key TEXT');
+        expect(schema).toContain('route_disposition TEXT');
+        expect(schema).toContain("route_disposition IN ('unroutable', 'superseded')");
+        expect(schema).toContain('supersedes_id UUID REFERENCES agent_dispatch_messages(id)');
+        expect(schema).toContain('CREATE TABLE IF NOT EXISTS dispatch_principals');
+        expect(schema).toContain(
+          "delivery_mode IN ('worker_poll', 'drain_on_start', 'alias_resolved', 'notify_only')"
+        );
+        expect(schema).toContain("('claude', 'Claude', 'worker_poll', TRUE)");
+        expect(schema).toContain("('merge-manager', 'Merge Manager', 'notify_only', FALSE)");
+        expect(schema).toContain('LOWER(BTRIM(recipient))');
+      }
+      expect(migration).toContain("task_type = 'run_report'");
+    });
+  });
+
   describe('Board execution claims schema', () => {
     test('numbered migration, combined schema, and SQLite bootstrap define claim tables', () => {
       const migration = readFileSync(

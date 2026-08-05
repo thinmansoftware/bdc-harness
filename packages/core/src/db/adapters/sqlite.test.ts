@@ -88,6 +88,140 @@ describe('SqliteAdapter', () => {
     });
   });
 
+  describe('agent messaging Phase 0 schema', () => {
+    const phase0Columns = [
+      'priority',
+      'task_outcome',
+      'acknowledged_at',
+      'acknowledged_by',
+      'addressed_at',
+      'addressed_by',
+      'escalated_tg_at',
+      'escalated_sms_at',
+      'subject_key',
+      'route_disposition',
+      'supersedes_id',
+    ];
+
+    test('fresh databases expose Phase 0 message columns and the canonical principal registry', async () => {
+      db = createTestDb();
+
+      const columns = await db.query<{ name: string }>(
+        `SELECT name FROM pragma_table_info('agent_dispatch_messages')`
+      );
+      const columnNames = new Set(columns.rows.map(column => column.name));
+      for (const column of phase0Columns) {
+        expect(columnNames.has(column)).toBe(true);
+      }
+
+      const principals = await db.query<{
+        principal_id: string;
+        delivery_mode: string;
+        active: number;
+      }>(
+        `SELECT principal_id, delivery_mode, active
+         FROM dispatch_principals
+         ORDER BY principal_id`
+      );
+      expect(principals.rows).toEqual([
+        { principal_id: 'board', delivery_mode: 'alias_resolved', active: 1 },
+        { principal_id: 'cauldron', delivery_mode: 'notify_only', active: 1 },
+        { principal_id: 'claude', delivery_mode: 'worker_poll', active: 1 },
+        { principal_id: 'claude-acp', delivery_mode: 'worker_poll', active: 1 },
+        { principal_id: 'codex', delivery_mode: 'worker_poll', active: 1 },
+        { principal_id: 'codex-mcp', delivery_mode: 'worker_poll', active: 1 },
+        { principal_id: 'cursor', delivery_mode: 'worker_poll', active: 1 },
+        { principal_id: 'fusion', delivery_mode: 'worker_poll', active: 1 },
+        { principal_id: 'grok', delivery_mode: 'worker_poll', active: 1 },
+        { principal_id: 'grok-acp', delivery_mode: 'worker_poll', active: 1 },
+        { principal_id: 'john', delivery_mode: 'notify_only', active: 0 },
+        { principal_id: 'merge-manager', delivery_mode: 'notify_only', active: 0 },
+        { principal_id: 'operator', delivery_mode: 'drain_on_start', active: 1 },
+        { principal_id: 'overseer', delivery_mode: 'notify_only', active: 1 },
+        { principal_id: 'xo', delivery_mode: 'drain_on_start', active: 1 },
+      ]);
+    });
+
+    test('existing databases add Phase 0 columns, backfill queued run reports once, and seed live-only recipients', async () => {
+      currentDbPath = join(
+        import.meta.dir,
+        `.test-sqlite-adapter-${Date.now()}-${Math.random().toString(36).slice(2)}.db`
+      );
+      const legacy = new Database(currentDbPath);
+      legacy.run(`
+        CREATE TABLE agent_dispatch_messages (
+          id TEXT PRIMARY KEY,
+          correlation_id TEXT NOT NULL,
+          idempotency_key TEXT NOT NULL UNIQUE,
+          task_type TEXT NOT NULL,
+          sender TEXT NOT NULL,
+          recipient TEXT NOT NULL,
+          body TEXT NOT NULL,
+          status TEXT NOT NULL DEFAULT 'queued',
+          result_body TEXT,
+          created_at TEXT NOT NULL
+          ,claimed_at TEXT
+          ,completed_at TEXT
+          ,not_before TEXT
+          ,lease_owner TEXT
+          ,lease_expires_at TEXT
+          ,fencing_token INTEGER NOT NULL DEFAULT 0
+        )
+      `);
+      legacy.run(`
+        INSERT INTO agent_dispatch_messages
+          (id, correlation_id, idempotency_key, task_type, sender, recipient, body, status, created_at)
+        VALUES
+          ('legacy-heartbeat', 'c1', 'k1', 'run_report', 'unexpected-sender', '  Live-Only  ', 'report', 'queued', '2026-08-05T00:00:00.000Z'),
+          ('legacy-complete', 'c2', 'k2', 'run_report', 'unexpected-sender', 'operator', 'report', 'done', '2026-08-05T00:00:00.000Z')
+      `);
+      legacy.close();
+
+      db = new SqliteAdapter(currentDbPath);
+      const columns = await db.query<{ name: string }>(
+        `SELECT name FROM pragma_table_info('agent_dispatch_messages')`
+      );
+      const columnNames = new Set(columns.rows.map(column => column.name));
+      for (const column of phase0Columns) {
+        expect(columnNames.has(column)).toBe(true);
+      }
+
+      const priorities = await db.query<{ id: string; priority: string }>(
+        `SELECT id, priority FROM agent_dispatch_messages ORDER BY id`
+      );
+      expect(priorities.rows).toEqual([
+        { id: 'legacy-complete', priority: 'normal' },
+        { id: 'legacy-heartbeat', priority: 'heartbeat' },
+      ]);
+
+      const livePrincipal = await db.query<{
+        principal_id: string;
+        delivery_mode: string;
+        active: number;
+      }>(
+        `SELECT principal_id, delivery_mode, active
+         FROM dispatch_principals
+         WHERE principal_id = 'live-only'`
+      );
+      expect(livePrincipal.rows).toEqual([
+        { principal_id: 'live-only', delivery_mode: 'drain_on_start', active: 1 },
+      ]);
+
+      await db.query(`
+        INSERT INTO agent_dispatch_messages
+          (id, correlation_id, idempotency_key, task_type, sender, recipient, body, status, priority, created_at)
+        VALUES ('new-blocker', 'c3', 'k3', 'run_report', 'unexpected-sender', 'operator', 'new report', 'queued', 'blocker', '2026-08-05T00:00:00.000Z')
+      `);
+      await db.close();
+
+      db = new SqliteAdapter(currentDbPath);
+      const reopened = await db.query<{ id: string; priority: string }>(
+        `SELECT id, priority FROM agent_dispatch_messages WHERE id = 'new-blocker'`
+      );
+      expect(reopened.rows).toEqual([{ id: 'new-blocker', priority: 'blocker' }]);
+    });
+  });
+
   describe('workflow run archive schema', () => {
     const expectedArchiveColumns = ['archived_at', 'archived_by', 'archive_reason'];
 
