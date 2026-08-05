@@ -62,6 +62,31 @@ Only after all four verdicts are green should the seat be added to `capabilities
 `config.local.json`. Promotion is not performed by this repository change. Rollback is config-only:
 remove the seat from `capabilities.providers`; its CLI fallback remains configured.
 
+### BDC-owned Claude ACP adapter (`claude-acp`)
+
+The `claude-acp` seat runs a BDC-owned ACP adapter at `scripts/dispatch-worker/claude-acp/adapter.ts`
+(entry `claude-acp/main.ts`, invoked as `bun run <entry>`). It speaks the agent side of the same
+ACP protocol that `acp/session.ts` drives and executes each prompt in-process through the official
+`@anthropic-ai/claude-agent-sdk`. The prompt flows only over the ACP stream, never through a child
+process argument.
+
+This adapter REPLACES the previously registered `@zed-industries/claude-code-acp` npx wrapper.
+M-126 disposition T1 (RATIFIED 3-0, 2026-08-04) rejected that third-party wrapper for carrying
+board-credential traffic: unaudited third-party code in the highest-trust lane is contrary to
+Rule 6's supply-chain posture. The BDC adapter is small, in-repo, and composes two already-adopted
+SDKs (the ACP SDK and the Claude Agent SDK), the same posture as the `codex-mcp` leg.
+
+Honest completion is enforced at the adapter: a non-empty result answers `stopReason: 'end_turn'`;
+an SDK error, an internal failure, or an empty result answers with a JSON-RPC error carrying a
+reason -- never a silent stream close. `session/cancel` aborts the in-flight execution, and the
+client tree-kills after its grace regardless, so correctness never depends on graceful shutdown.
+
+The seat is registered DARK. Promotion follows the same operator-host four-test matrix and
+config-only rollback discipline as `grok-acp` and `codex-mcp`: the real Claude Agent SDK path with a
+live Claude Code login is verified on the operator host, not by this repository change. CI proves the
+adapter with an injectable fake executor (env var `BDC_CLAUDE_ACP_EXECUTOR_MODULE`), never a live
+model.
+
 ## Scope
 
 The worker only claims messages addressed to configured local agents.

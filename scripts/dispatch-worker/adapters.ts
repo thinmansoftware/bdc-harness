@@ -1,4 +1,13 @@
+import { fileURLToPath } from 'node:url';
+
 export type AgentKind = 'prompt' | 'fusion' | 'acp' | 'mcp';
+
+/**
+ * Absolute path to the in-repo BDC Claude ACP adapter entry. Resolved from this
+ * module's location so the seat works regardless of the worker's cwd (dispatch
+ * tasks run in arbitrary temp workdirs).
+ */
+const CLAUDE_ACP_ADAPTER_ENTRY = fileURLToPath(new URL('./claude-acp/main.ts', import.meta.url));
 
 export interface AgentConfig {
   kind?: AgentKind;
@@ -81,10 +90,16 @@ export const defaultAgentConfigs: Record<string, AgentConfig> = {
    * full initialize/authenticate/session-new/session-prompt handshake) per
    * M-20260802-118.acp-compatibility-proof.md.
    *
-   * claude-acp: @zed-industries/claude-code-acp, run via npx so the wrapper
-   * does not have to be globally installed. Rides the existing Claude Code
-   * login; if it ever demands a raw API key that is a finding to report, not
-   * something to work around (WO scope wall).
+   * claude-acp: the BDC-OWNED adapter at ./claude-acp/adapter.ts, run via
+   * `bun run <entry>`. M-126 disposition T1 (RATIFIED 3-0, 2026-08-04)
+   * REJECTED Zed's third-party claude-code-acp npx wrapper for carrying
+   * board-credential traffic -- unaudited third-party code in the highest-trust
+   * lane, contrary to Rule 6's supply-chain posture. The replacement speaks the
+   * agent side of ACP over stdio and executes prompts in-process via the
+   * official @anthropic-ai/claude-agent-sdk. It rides the existing Claude Code
+   * login; if the SDK ever demands a raw API key that is an honest failure to
+   * report, not something to work around. Registered DARK: promotion follows
+   * the same operator four-test matrix as grok-acp.
    */
   'grok-acp': {
     kind: 'acp',
@@ -94,8 +109,8 @@ export const defaultAgentConfigs: Record<string, AgentConfig> = {
   },
   'claude-acp': {
     kind: 'acp',
-    command: 'npx',
-    args: ['-y', '@zed-industries/claude-code-acp'],
+    command: 'bun',
+    args: ['run', CLAUDE_ACP_ADAPTER_ENTRY],
     acp: {},
   },
   'codex-mcp': {
