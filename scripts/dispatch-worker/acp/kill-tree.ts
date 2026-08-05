@@ -66,6 +66,11 @@ async function listAllProcesses(): Promise<ProcessNode[]> {
     .filter(node => Number.isFinite(node.pid) && Number.isFinite(node.ppid));
 }
 
+/** Returns the pids that represent running rather than defunct processes. */
+export function liveProcessPids(snapshot: ProcessNode[]): Set<number> {
+  return new Set(snapshot.filter(node => !node.state?.startsWith('Z')).map(node => node.pid));
+}
+
 /**
  * Returns the full descendant tree of `rootPid` (root included when alive),
  * computed from a point-in-time process snapshot.
@@ -125,9 +130,7 @@ export async function waitForTreeDeath(pids: number[], timeoutMs: number): Promi
   let alive = pids;
   while (Date.now() < deadline) {
     const snapshot = await listAllProcesses();
-    const livePids = new Set(
-      snapshot.filter(node => !node.state?.startsWith('Z')).map(node => node.pid)
-    );
+    const livePids = liveProcessPids(snapshot);
     alive = pids.filter(pid => livePids.has(pid));
     if (alive.length === 0) return [];
     await new Promise(resolve => setTimeout(resolve, 250));
