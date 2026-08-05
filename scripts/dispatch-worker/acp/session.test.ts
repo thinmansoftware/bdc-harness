@@ -15,12 +15,35 @@ import { runAcpAgent, createCancelController } from './session';
 import { enumerateProcessTree } from './kill-tree';
 
 /**
- * Minimal ACP agent over stdio: answers initialize/session/new/session/prompt
- * with newline-delimited JSON-RPC. `mode` controls the misbehavior under test.
+ * Stub-agent misbehavior modes. Exported so the seat-parameterized
+ * conformance harness (acp/conformance.ts + acp/conformance.test.ts) reuses
+ * ONE stub implementation rather than forking a second one
+ * (WO-HARNESS-GROK-ACP-PROMOTION-01, spec section 4).
+ *
+ * - 'ok'          completes a real prompt turn with non-empty output.
+ * - 'empty'       clean end_turn with no output (honest-completion failure).
+ * - 'hang'        never answers -- the idle timeout must fire.
+ * - 'spawn-child' spawns a grandchild then hangs; on session/cancel it EXITS
+ *                 itself (the original slice test relies on this exit).
+ * - 'cancel-tree' hangs and DELIBERATELY IGNORES session/cancel, so Dispatch's
+ *                 bounded tree-kill (not a cooperative agent exit) is what
+ *                 removes it -- the Order-4 force-kill path for a
+ *                 non-cooperative agent.
+ * - 'auth-reject' advertises the cached_token auth method then rejects the
+ *                 `authenticate` RPC, simulating an expired cached_token
+ *                 (Gate B: the leg must fail loud, never leave a stuck queue).
  */
-function stubAgentSource(mode: 'ok' | 'empty' | 'hang' | 'spawn-child'): string {
+export type StubMode = 'ok' | 'empty' | 'hang' | 'spawn-child' | 'cancel-tree' | 'auth-reject';
+
+/**
+ * Minimal ACP agent over stdio: answers initialize/authenticate/session/new/
+ * session/prompt with newline-delimited JSON-RPC. `mode` controls the
+ * misbehavior under test.
+ */
+export function stubAgentSource(mode: StubMode): string {
   return `
 const send = (msg) => process.stdout.write(JSON.stringify(msg) + '\\n');
+const mode = ${JSON.stringify(mode)};
 let buf = '';
 process.stdin.on('data', (chunk) => {
   buf += chunk;
@@ -32,18 +55,24 @@ process.stdin.on('data', (chunk) => {
     let msg;
     try { msg = JSON.parse(line); } catch { continue; }
     if (msg.method === 'initialize') {
-      send({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: 1, agentCapabilities: {}, authMethods: [] } });
+      const authMethods = mode === 'auth-reject'
+        ? [{ id: 'cached_token', name: 'Cached Token' }]
+        : [];
+      send({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: 1, agentCapabilities: {}, authMethods } });
+    } else if (msg.method === 'authenticate') {
+      // Gate B: an expired cached_token must fail loud. Reject the RPC with an
+      // auth-related message so the dispatch result carries an honest reason.
+      send({ jsonrpc: '2.0', id: msg.id, error: { code: -32000, message: 'cached_token expired: authentication rejected' } });
     } else if (msg.method === 'session/new') {
       send({ jsonrpc: '2.0', id: msg.id, result: { sessionId: 'sess-1' } });
     } else if (msg.method === 'session/prompt') {
-      const mode = ${JSON.stringify(mode)};
       if (mode === 'spawn-child') {
         const { spawn } = require('child_process');
         // Long-lived grandchild that must be killed with the tree.
         spawn(process.execPath, ['-e', 'setInterval(()=>{},1e9)'], { stdio: 'ignore' });
       }
-      if (mode === 'hang' || mode === 'spawn-child') {
-        return; // never answers -- idle timeout must fire
+      if (mode === 'hang' || mode === 'spawn-child' || mode === 'cancel-tree') {
+        return; // never answers -- idle timeout or cancellation must fire
       }
       if (mode === 'empty') {
         send({ jsonrpc: '2.0', id: msg.id, result: { stopReason: 'end_turn' } });
@@ -55,6 +84,11 @@ process.stdin.on('data', (chunk) => {
       }});
       send({ jsonrpc: '2.0', id: msg.id, result: { stopReason: 'end_turn' } });
     } else if (msg.method === 'session/cancel') {
+      if (mode === 'cancel-tree') {
+        // Do NOT exit: force Dispatch's bounded tree-kill to remove this
+        // process and its grandchild (Order-4 descendant-cleanup proof).
+        return;
+      }
       process.exit(0);
     }
   }
@@ -63,7 +97,7 @@ setInterval(() => {}, 1e9);
 `;
 }
 
-async function writeStub(mode: 'ok' | 'empty' | 'hang' | 'spawn-child'): Promise<{
+export async function writeStub(mode: StubMode): Promise<{
   script: string;
   cwd: string;
 }> {

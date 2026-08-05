@@ -98,3 +98,37 @@ re-establishes after a cold boot -- those require a live pass from the operator 
 ```bash
 bun run scripts/dispatch-worker/verify-reboot-recovery.ts
 ```
+
+## ACP evidence-contract conformance (M-126 T5)
+
+Before an ACP seat is advertised live, it must pass the ratified four-test acceptance matrix
+(M-126 disposition T3/T4/T5, RATIFIED 3-0 2026-08-04):
+
+1. **Large payload round-trip** -- a >= 60KB dispatch reaches the agent and is receipted.
+2. **Cancel mid-generation** -- cancellation stops work with no orphan descendants
+   (`treeBeforeKill` non-empty, `treeAfterKill` empty), and the receipt says cancelled.
+3. **Forced failure** -- a seat that fails auth or dies mid-run is marked failed with a reason
+   inside the timeout, never stuck queued and never `ok`.
+4. **Receipt audit** -- every run above has a durable receipt matching what actually happened.
+
+The matrix is implemented once, seat-parameterized, in `acp/conformance.ts` (`runConformanceMatrix`
+against a `SeatUnderTest`). It is not grok-specific: any ACP seat -- a stub, `grok-acp`, or a future
+codex/claude leg -- runs through the same harness. `acp/conformance.test.ts` proves the harness
+itself against stub seats in CI, including Gate B (an expired `cached_token` rejecting the
+`authenticate` RPC must fail loud rather than leave a dispatch stuck queued).
+
+Run the real-binary matrix against a configured seat on the operator host:
+
+```bash
+bun run scripts/dispatch-worker/run-acp-conformance.ts grok-acp
+```
+
+The script prints a recordable PASS/FAIL line per test plus an overall `allGreen`, and exits 0 only
+when all four are green. This CANNOT run in CI or the Cauldron container (no grok binary, no cached
+credential); it is the operator's promotion step.
+
+**Promotion is config-only and gated on green.** All four tests must be green against the real binary
+before a seat id is added to `capabilities.providers` in `config.local.json`. Only after a green,
+recorded run does the operator add the seat to that list. **Rollback is removing the seat id from
+`capabilities.providers`** -- no code change, no redeploy. Until then the seat stays registered but
+dark: nothing advertises it.
