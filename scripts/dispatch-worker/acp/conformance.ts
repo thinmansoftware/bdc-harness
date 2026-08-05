@@ -46,6 +46,7 @@ export interface ConformanceReport {
   tests: {
     largePayload: TestVerdict<{
       promptBytes: number;
+      receivedPromptBytes: number | null;
       result: AcpRunResult;
       receipt: DurableReceipt;
     }>;
@@ -157,16 +158,19 @@ export async function runConformanceMatrix(
   const forcedReceipt = receipt(forcedFailureSeat, forcedResult);
   const timeoutReceipt = receipt(timeoutSeat, timeoutResult);
   const receipts = [largeReceipt, cancelReceipt, forcedReceipt, timeoutReceipt];
+  const largePromptBytes = Buffer.byteLength(largePrompt);
+  const receivedPromptBytesMatch = largeResult.finalText.match(/\bACP_STUB_OK bytes=(\d+)\b/);
+  const receivedPromptBytes = receivedPromptBytesMatch ? Number(receivedPromptBytesMatch[1]) : null;
 
   const largePass =
-    Buffer.byteLength(largePrompt) >= MINIMUM_LARGE_PROMPT_BYTES &&
+    largePromptBytes >= MINIMUM_LARGE_PROMPT_BYTES &&
     largeResult.ok &&
     largeResult.updates.length > 0 &&
-    JSON.stringify(largeResult.updates).includes(largeResult.finalText);
+    receivedPromptBytes === largePromptBytes;
   const cancelPass =
     cancelResult.cancelled &&
     !cancelResult.ok &&
-    (cancelResult.treeBeforeKill.length > 0 || cancelResult.agentPid !== null) &&
+    cancelResult.treeBeforeKill.length > 0 &&
     cancelResult.treeAfterKill.length === 0;
   const forcedReason = forcedResult.error ?? '';
   const forcedLimit =
@@ -185,7 +189,8 @@ export async function runConformanceMatrix(
     largePayload: {
       pass: largePass,
       evidence: {
-        promptBytes: Buffer.byteLength(largePrompt),
+        promptBytes: largePromptBytes,
+        receivedPromptBytes,
         result: largeResult,
         receipt: largeReceipt,
       },
@@ -198,12 +203,7 @@ export async function runConformanceMatrix(
       evidence: {
         result: cancelResult,
         receipt: cancelReceipt,
-        treeBeforeKill:
-          cancelResult.treeBeforeKill.length > 0
-            ? cancelResult.treeBeforeKill
-            : cancelResult.agentPid === null
-              ? []
-              : [cancelResult.agentPid],
+        treeBeforeKill: cancelResult.treeBeforeKill,
         treeAfterKill: cancelResult.treeAfterKill,
       },
       ...(!cancelPass ? { error: 'cancellation did not prove bounded process-tree cleanup' } : {}),

@@ -18,7 +18,13 @@ import { enumerateProcessTree } from './kill-tree';
  * Minimal ACP agent over stdio: answers initialize/session/new/session/prompt
  * with newline-delimited JSON-RPC. `mode` controls the misbehavior under test.
  */
-export type StubAgentMode = 'ok' | 'empty' | 'hang' | 'spawn-child' | 'auth-reject';
+export type StubAgentMode =
+  | 'ok'
+  | 'wrong-byte-count'
+  | 'empty'
+  | 'hang'
+  | 'spawn-child'
+  | 'auth-reject';
 
 export function stubAgentSource(mode: StubAgentMode): string {
   return `
@@ -62,7 +68,7 @@ process.stdin.on('data', (chunk) => {
         : '';
       send({ jsonrpc: '2.0', method: 'session/update', params: {
         sessionId: 'sess-1',
-        update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'ACP_STUB_OK bytes=' + Buffer.byteLength(prompt) } },
+        update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'ACP_STUB_OK bytes=' + (mode === 'wrong-byte-count' ? 1 : Buffer.byteLength(prompt)) } },
       }});
       send({ jsonrpc: '2.0', id: msg.id, result: { stopReason: 'end_turn' } });
     } else if (msg.method === 'session/cancel') {

@@ -29,19 +29,25 @@ async function conformingOptions(): Promise<ConformanceOptions> {
 }
 
 describe('ACP evidence-contract conformance matrix', () => {
-  test('reports all four green with evidence for a conforming non-grok seat', async () => {
+  test('fails loud when raw cancellation cleanup evidence is absent', async () => {
     const report = await runConformanceMatrix(
       await stubSeat('ok', 'future-acp-seat'),
       await conformingOptions()
     );
-    expect(report.allGreen).toBe(true);
+    expect(report.allGreen).toBe(false);
     expect(Object.keys(report.tests)).toHaveLength(4);
-    for (const verdict of Object.values(report.tests)) {
-      expect(verdict.pass).toBe(true);
-      expect(verdict.evidence).toBeDefined();
-    }
+    expect(report.tests.largePayload.pass).toBe(true);
+    expect(report.tests.forcedFailure.pass).toBe(true);
+    expect(report.tests.receiptAudit.pass).toBe(true);
+    expect(report.tests.cancellation.pass).toBe(false);
     expect(report.tests.largePayload.evidence.promptBytes).toBeGreaterThanOrEqual(61_440);
-    expect(report.tests.cancellation.evidence.treeBeforeKill.length).toBeGreaterThan(0);
+    expect(report.tests.largePayload.evidence.receivedPromptBytes).toBe(
+      report.tests.largePayload.evidence.promptBytes
+    );
+    expect(report.tests.cancellation.evidence.treeBeforeKill).toEqual([]);
+    expect(report.tests.cancellation.evidence.treeBeforeKill).toEqual(
+      report.tests.cancellation.evidence.result.treeBeforeKill
+    );
     expect(report.tests.cancellation.evidence.treeAfterKill).toEqual([]);
   }, 30_000);
 
@@ -50,6 +56,16 @@ describe('ACP evidence-contract conformance matrix', () => {
     expect(report.tests.largePayload.pass).toBe(false);
     expect(report.allGreen).toBe(false);
     expect(Object.keys(report.tests)).toHaveLength(4);
+  }, 30_000);
+
+  test('a mismatched agent byte-count receipt fails the large-payload gate', async () => {
+    const report = await runConformanceMatrix(
+      await stubSeat('wrong-byte-count'),
+      await conformingOptions()
+    );
+    expect(report.tests.largePayload.evidence.receivedPromptBytes).toBe(1);
+    expect(report.tests.largePayload.pass).toBe(false);
+    expect(report.allGreen).toBe(false);
   }, 30_000);
 
   test('a cancellation failure makes allGreen false', async () => {
