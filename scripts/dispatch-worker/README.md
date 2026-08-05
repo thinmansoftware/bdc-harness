@@ -41,6 +41,14 @@ interactive operator session and ignores duplicate starts.
 
 ## ACP conformance and promotion
 
+The dark `claude-acp` seat runs the BDC-owned adapter in `claude-acp/main.ts`.
+It implements M-126 T1's rejection of the unaudited third-party wrapper and
+executes prompts in-process through the official Claude Agent SDK. Adapter tests
+can select the minimal fake executor seam with `BDC_CLAUDE_ACP_TEST_EXECUTOR`;
+the variable is test-only and its absence always selects the real SDK path.
+Promotion requires the same operator-host four-test matrix used by `grok-acp`
+and `codex-mcp`; this registration does not advertise the seat live.
+
 The worker also owns a native MCP client leg for Codex. The `codex-mcp` seat runs
 `codex mcp-server` over stdio, discovers the live `codex` tool schema, and keeps prompts out of
 process arguments. It is registered dark: no shipped provider configuration advertises it live.
