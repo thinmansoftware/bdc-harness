@@ -178,6 +178,59 @@ describe('runAcpAgent reliability contract', () => {
     }
   }, 60_000);
 
+  test('cancellation preserves descendant-cleanup evidence (a second kill pass cannot clobber it)', async () => {
+    // WO-HARNESS-ACP-KILL-EVIDENCE-FIX-01 regression. The post-connect cleanup
+    // guard calls boundedKill() a SECOND time against an already-dead pid;
+    // before the idempotency fix that second pass enumerated an empty tree and
+    // overwrote treeBeforeKill with []. This test proves the FIRST kill pass's
+    // evidence survives: a cancelled run whose agent spawned a descendant must
+    // report a non-empty treeBeforeKill (the tree that existed at kill time)
+    // AND an empty treeAfterKill (no survivor). This test FAILS against the
+    // unfixed session.ts (treeBeforeKill comes back []).
+    const { script, cwd } = await writeStub('spawn-child');
+    const cancel = createCancelController();
+    setTimeout(() => cancel.cancel(), 1_500);
+    const result = await runAcpAgent(
+      {
+        command: process.execPath,
+        args: [script],
+        cwd,
+        idleTimeoutMs: 30_000,
+        wallClockMs: 60_000,
+        killGraceMs: 4_000,
+      },
+      'spawn and hang',
+      cancel
+    );
+    expect(result.cancelled).toBe(true);
+    expect(result.ok).toBe(false);
+    expect(result.treeBeforeKill.length).toBeGreaterThan(0);
+    expect(result.treeAfterKill).toEqual([]);
+  }, 60_000);
+
+  test('idle timeout preserves the same descendant-cleanup evidence', async () => {
+    // Section 7 Test 2: the timeout path fires the same boundedKill and must
+    // preserve the same evidence -- a live descendant tree recorded in
+    // treeBeforeKill, an empty treeAfterKill, and an honest non-ok result.
+    // Also fails against the unfixed session.ts for the same double-kill reason.
+    const { script, cwd } = await writeStub('spawn-child');
+    const result = await runAcpAgent(
+      {
+        command: process.execPath,
+        args: [script],
+        cwd,
+        idleTimeoutMs: 1_000,
+        wallClockMs: 60_000,
+        killGraceMs: 4_000,
+      },
+      'spawn and hang'
+    );
+    expect(result.timedOut).toBe('idle');
+    expect(result.ok).toBe(false);
+    expect(result.treeBeforeKill.length).toBeGreaterThan(0);
+    expect(result.treeAfterKill).toEqual([]);
+  }, 60_000);
+
   test('reports a spawn failure instead of pretending the leg ran', async () => {
     const result = await runAcpAgent(
       {

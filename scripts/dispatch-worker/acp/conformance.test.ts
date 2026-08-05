@@ -30,10 +30,22 @@ async function conformingOptions(): Promise<ConformanceOptions> {
 
 describe('ACP evidence-contract conformance matrix', () => {
   test('fails loud when raw cancellation cleanup evidence is absent', async () => {
-    const report = await runConformanceMatrix(
-      await stubSeat('ok', 'future-acp-seat'),
-      await conformingOptions()
-    );
+    // WO-HARNESS-ACP-KILL-EVIDENCE-FIX-01, Amendment 01 carve-out.
+    // Pre-fix this test used a 'spawn-child' cancellation seat, and the
+    // session.ts double-kill defect wiped treeBeforeKill to [] -- so the gate
+    // failed loud only BECAUSE of the bug (the assertion encoded the defect).
+    // Post-fix, a spawn-child seat legitimately records a non-empty
+    // treeBeforeKill and PASSES the gate, which would silently invert this
+    // test's purpose. To keep the PURPOSE intact -- proving a seat that cannot
+    // demonstrate bounded cleanup fails loud -- the cancellation seat is a
+    // 'hang' seat: it spawns no descendant tree and exits on session/cancel,
+    // so at kill time the process is already gone and treeBeforeKill is
+    // genuinely empty. The strict gate in conformance.ts (frozen, unchanged:
+    // treeBeforeKill.length > 0 && treeAfterKill.length === 0) therefore still
+    // fails loud, honestly, and every original assertion below still holds.
+    const opts = await conformingOptions();
+    opts.cancellationSeat = await stubSeat('hang');
+    const report = await runConformanceMatrix(await stubSeat('ok', 'future-acp-seat'), opts);
     expect(report.allGreen).toBe(false);
     expect(Object.keys(report.tests)).toHaveLength(4);
     expect(report.tests.largePayload.pass).toBe(true);

@@ -171,12 +171,28 @@ export async function runAcpAgent(
     }
   );
 
-  const boundedKill = async (): Promise<void> => {
-    if (agentPid === null) return;
-    const tree = await enumerateProcessTree(agentPid);
-    treeBeforeKill = tree.map(node => node.pid);
-    await killProcessTree(agentPid);
-    treeAfterKill = await waitForTreeDeath(treeBeforeKill, config.killGraceMs);
+  // Idempotent process-tree kill (WO-HARNESS-ACP-KILL-EVIDENCE-FIX-01):
+  // the first invocation enumerates the tree that actually existed at kill
+  // time and records it in treeBeforeKill/treeAfterKill. The grace-timer path
+  // and the post-connect cleanup guard both call this, and killProcessTree
+  // uses taskkill/process.kill (never child.kill), so child.killed stays false
+  // and a signal death leaves exitCode null -- the post-connect guard would
+  // therefore fire a SECOND time against an already-dead pid, enumerate an
+  // empty tree, and clobber the evidence. Memoizing the kill promise makes any
+  // call after the first a no-op that returns the in-flight/settled result, so
+  // the first pass's evidence survives. The killGraceMs timing contract is
+  // unchanged -- waitForTreeDeath still bounds on config.killGraceMs.
+  let killPromise: Promise<void> | null = null;
+  const boundedKill = (): Promise<void> => {
+    if (killPromise) return killPromise;
+    killPromise = (async (): Promise<void> => {
+      if (agentPid === null) return;
+      const tree = await enumerateProcessTree(agentPid);
+      treeBeforeKill = tree.map(node => node.pid);
+      await killProcessTree(agentPid);
+      treeAfterKill = await waitForTreeDeath(treeBeforeKill, config.killGraceMs);
+    })();
+    return killPromise;
   };
 
   try {

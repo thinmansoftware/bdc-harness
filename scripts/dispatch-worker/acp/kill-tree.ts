@@ -14,6 +14,12 @@ export interface ProcessNode {
   pid: number;
   ppid: number;
   name: string;
+  /**
+   * POSIX process state code from `ps` (e.g. 'S', 'R', 'Z'); empty string when
+   * unknown (Windows, where CIM does not expose an equivalent single-letter
+   * state). Used by waitForTreeDeath to treat zombie/defunct processes as dead.
+   */
+  state: string;
 }
 
 function runCapture(command: string, args: string[]): Promise<{ stdout: string; code: number }> {
@@ -48,19 +54,23 @@ async function listAllProcesses(): Promise<ProcessNode[]> {
         pid: row.ProcessId,
         ppid: row.ParentProcessId,
         name: row.Name ?? '',
+        state: '',
       }));
     } catch {
       return [];
     }
   }
-  const { stdout } = await runCapture('ps', ['-eo', 'pid=,ppid=,comm=']);
+  // stat= is placed before comm= because a process name can contain spaces;
+  // keeping the (single-token) state column ahead of the name keeps the split
+  // unambiguous: [pid, ppid, state, ...name].
+  const { stdout } = await runCapture('ps', ['-eo', 'pid=,ppid=,stat=,comm=']);
   return stdout
     .split('\n')
     .map(line => line.trim())
     .filter(Boolean)
     .map(line => {
-      const [pid, ppid, ...name] = line.split(/\s+/);
-      return { pid: Number(pid), ppid: Number(ppid), name: name.join(' ') };
+      const [pid, ppid, state, ...name] = line.split(/\s+/);
+      return { pid: Number(pid), ppid: Number(ppid), state: state ?? '', name: name.join(' ') };
     })
     .filter(node => Number.isFinite(node.pid) && Number.isFinite(node.ppid));
 }
@@ -124,7 +134,15 @@ export async function waitForTreeDeath(pids: number[], timeoutMs: number): Promi
   let alive = pids;
   while (Date.now() < deadline) {
     const snapshot = await listAllProcesses();
-    const livePids = new Set(snapshot.map(node => node.pid));
+    // A zombie/defunct process (POSIX state starting with 'Z') has already been
+    // killed but not yet reaped by its parent; it is DEAD for cleanup purposes
+    // and MUST NOT be counted as a survivor, or a killed-but-unreaped child on
+    // POSIX CI would make treeAfterKill spuriously non-empty. Windows rows
+    // carry an empty state, so startsWith('Z') is always false there and the
+    // Windows liveness check is unchanged.
+    const livePids = new Set(
+      snapshot.filter(node => !node.state.startsWith('Z')).map(node => node.pid)
+    );
     alive = pids.filter(pid => livePids.has(pid));
     if (alive.length === 0) return [];
     await new Promise(resolve => setTimeout(resolve, 250));
