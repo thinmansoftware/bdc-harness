@@ -66,11 +66,74 @@ export interface ClaudeExecutorInput {
 export type ClaudeExecutor = (input: ClaudeExecutorInput) => AsyncIterable<string>;
 
 /**
+ * Consumes a raw Claude Agent SDK message stream: yields assistant text blocks
+ * in order and THROWS on any terminal failure signal. Terminal failures are:
+ *  - a `result` message whose subtype is anything other than 'success'
+ *    (error_during_execution, error_max_turns, error_max_budget_usd,
+ *    error_max_structured_output_retries -- i.e. an `SDKResultError`); and
+ *  - an `assistant` message carrying an `error` field
+ *    (authentication_failed, billing_error, rate_limit, overloaded, ... --
+ *    i.e. `SDKAssistantMessage.error`).
+ *
+ * Crucially, a failure is propagated even when assistant text was already
+ * yielded earlier in the stream: a run that streamed text and THEN hit a
+ * terminal error is a failure, never an end_turn. Extracted from
+ * realClaudeExecutor so the terminal-message inspection is unit-testable
+ * without a live model (see adapter.test.ts).
+ */
+export async function* streamAssistantText(
+  messages: AsyncIterable<unknown>,
+  signal: AbortSignal
+): AsyncIterable<string> {
+  for await (const message of messages) {
+    if (signal.aborted) break;
+    const event = message as {
+      type?: string;
+      subtype?: string;
+      errors?: unknown;
+      error?: unknown;
+      message?: { content?: unknown };
+    };
+    // Terminal result message. A non-success subtype is a hard failure even if
+    // text was already produced; surface it as a thrown error so the adapter
+    // never reports end_turn on a failed run.
+    if (event.type === 'result') {
+      if (event.subtype !== undefined && event.subtype !== 'success') {
+        const detail =
+          Array.isArray(event.errors) && event.errors.length > 0
+            ? event.errors.filter((e): e is string => typeof e === 'string').join('; ') ||
+              event.subtype
+            : event.subtype;
+        throw new Error(`claude_sdk_result_error: ${detail}`);
+      }
+      continue;
+    }
+    if (event.type !== 'assistant') continue;
+    // An assistant message can carry a terminal error (auth, billing, rate
+    // limit, overloaded, model_not_found, ...) alongside or instead of text.
+    // Treat it as an honest failure rather than a completion.
+    if (typeof event.error === 'string' && event.error.length > 0) {
+      throw new Error(`claude_sdk_assistant_error: ${event.error}`);
+    }
+    const content = event.message?.content;
+    if (!Array.isArray(content)) continue;
+    for (const raw of content) {
+      const block = raw as { type?: string; text?: string };
+      if (block.type === 'text' && typeof block.text === 'string' && block.text.length > 0) {
+        yield block.text;
+      }
+    }
+  }
+}
+
+/**
  * Default executor: runs the prompt through the official Claude Agent SDK
  * in-process and streams assistant text. Mirrors the read-oriented `plan`
  * permission mode the `claude` CLI seat uses; it rides the existing Claude
  * Code login. If the SDK demands a raw API key at runtime that surfaces as an
  * honest failure (a thrown error), not something this adapter works around.
+ * Terminal SDK failure signals (result errors, assistant errors) are propagated
+ * as thrown errors via streamAssistantText -- never silently completed.
  */
 export async function* realClaudeExecutor(input: ClaudeExecutorInput): AsyncIterable<string> {
   const options: Options = { cwd: input.cwd, permissionMode: 'plan' };
@@ -86,19 +149,7 @@ export async function* realClaudeExecutor(input: ClaudeExecutorInput): AsyncIter
   }
   input.signal.addEventListener('abort', onAbort, { once: true });
   try {
-    for await (const message of stream) {
-      if (input.signal.aborted) break;
-      const event = message as { type?: string; message?: { content?: unknown } };
-      if (event.type !== 'assistant') continue;
-      const content = event.message?.content;
-      if (!Array.isArray(content)) continue;
-      for (const raw of content) {
-        const block = raw as { type?: string; text?: string };
-        if (block.type === 'text' && typeof block.text === 'string' && block.text.length > 0) {
-          yield block.text;
-        }
-      }
-    }
+    yield* streamAssistantText(stream, input.signal);
   } finally {
     input.signal.removeEventListener('abort', onAbort);
   }

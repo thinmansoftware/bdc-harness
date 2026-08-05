@@ -20,7 +20,7 @@ import { tmpdir } from 'os';
 import { join } from 'path';
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { runAcpAgent, createCancelController } from '../acp/session';
-import { EXECUTOR_MODULE_ENV } from './adapter';
+import { EXECUTOR_MODULE_ENV, streamAssistantText } from './adapter';
 import {
   runConformanceMatrix,
   type SeatUnderTest,
@@ -120,6 +120,88 @@ describe('BDC claude-acp adapter (real client, real adapter, fake executor)', ()
     expect(result.treeBeforeKill.length).toBeGreaterThan(0);
     expect(result.treeAfterKill).toEqual([]);
   }, 60_000);
+
+  describe('Test 6: the real executor propagates terminal SDK failures, not end_turn', () => {
+    // Drives realClaudeExecutor's actual SDK-message parser (streamAssistantText)
+    // with scripted SDK frames -- no live model, no mocks. Guards the case Codex
+    // flagged: assistant text emitted BEFORE a terminal failure must still fail.
+    async function* scripted(items: unknown[]): AsyncIterable<unknown> {
+      for (const item of items) {
+        yield item;
+      }
+    }
+
+    async function collect(
+      source: AsyncIterable<string>
+    ): Promise<{ text: string; error?: Error }> {
+      let text = '';
+      try {
+        for await (const chunk of source) {
+          text += chunk;
+        }
+      } catch (e) {
+        return { text, error: e instanceof Error ? e : new Error(String(e)) };
+      }
+      return { text };
+    }
+
+    test('assistant text followed by a result error yields the text then throws', async () => {
+      const signal = new AbortController().signal;
+      const { text, error } = await collect(
+        streamAssistantText(
+          scripted([
+            {
+              type: 'assistant',
+              message: { content: [{ type: 'text', text: 'partial answer ' }] },
+            },
+            {
+              type: 'result',
+              subtype: 'error_max_turns',
+              is_error: true,
+              errors: ['hit max turns'],
+            },
+          ]),
+          signal
+        )
+      );
+      expect(text).toBe('partial answer ');
+      expect(error).toBeInstanceOf(Error);
+      expect(error?.message).toContain('claude_sdk_result_error');
+      expect(error?.message).toContain('hit max turns');
+    });
+
+    test('assistant text followed by an assistant error frame throws', async () => {
+      const signal = new AbortController().signal;
+      const { text, error } = await collect(
+        streamAssistantText(
+          scripted([
+            { type: 'assistant', message: { content: [{ type: 'text', text: 'hello' }] } },
+            { type: 'assistant', message: { content: [] }, error: 'rate_limit' },
+          ]),
+          signal
+        )
+      );
+      expect(text).toBe('hello');
+      expect(error).toBeInstanceOf(Error);
+      expect(error?.message).toContain('claude_sdk_assistant_error');
+      expect(error?.message).toContain('rate_limit');
+    });
+
+    test('assistant text followed by a success result completes normally', async () => {
+      const signal = new AbortController().signal;
+      const { text, error } = await collect(
+        streamAssistantText(
+          scripted([
+            { type: 'assistant', message: { content: [{ type: 'text', text: 'done' }] } },
+            { type: 'result', subtype: 'success', is_error: false },
+          ]),
+          signal
+        )
+      );
+      expect(text).toBe('done');
+      expect(error).toBeUndefined();
+    });
+  });
 
   describe('Test 5: the reused conformance matrix evaluates the adapter unchanged', () => {
     let previousEnv: string | undefined;
