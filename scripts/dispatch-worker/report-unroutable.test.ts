@@ -98,7 +98,7 @@ async function makeFixture(): Promise<{ dir: string; dbPath: string }> {
 
 async function runCli(args: string[]): Promise<CliResult> {
   const child = Bun.spawn({
-    cmd: [process.execPath, 'run', scriptPath, ...args],
+    cmd: [process.execPath, scriptPath, ...args],
     cwd: join(import.meta.dir, '..', '..'),
     stdout: 'pipe',
     stderr: 'pipe',
@@ -177,5 +177,17 @@ describe('report-unroutable CLI', () => {
     }
 
     expect(await sha256(dbPath)).toBe(beforeHash);
+  });
+
+  test('does not disclose a sensitive database path on open failure', async () => {
+    const sensitivePath = join(tmpdir(), 'CUSTOMER-SECRET-NAME', 'missing.db');
+
+    const result = await runCli(['--db', sensitivePath, '--format', 'json']);
+
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stdout).toBe('');
+    expect(result.stderr).toContain('report_unroutable_failed');
+    expect(result.stderr).not.toContain(sensitivePath);
+    expect(result.stderr).not.toContain('CUSTOMER-SECRET-NAME');
   });
 });

@@ -72,9 +72,8 @@ if (import.meta.main) {
     .then(output => {
       process.stdout.write(`${output}\n`);
     })
-    .catch((error: unknown) => {
-      const message = error instanceof Error ? error.message : String(error);
-      process.stderr.write(`${message}\n`);
+    .catch(() => {
+      process.stderr.write('report_unroutable_failed\n');
       process.exitCode = 1;
     });
 }
