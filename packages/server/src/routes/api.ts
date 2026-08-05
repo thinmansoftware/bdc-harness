@@ -3318,11 +3318,7 @@ export function registerApiRoutes(
       if (!assessment.allowed) {
         return apiError(c, 400, assessment.reason ?? 'dispatch_message_body_rejected');
       }
-      const recipientAssessment = await dispatchDb.assessDispatchRecipient(body.recipient);
-      if (!recipientAssessment.ok) {
-        return apiError(c, 400, `dispatch_recipient_rejected:${recipientAssessment.reason}`);
-      }
-      const canonicalBody = { ...body, recipient: recipientAssessment.canonical_principal };
+      const canonicalBody = { ...body, recipient: body.recipient.trim().toLowerCase() };
       if (canonicalBody.task_type === 'board_motion') {
         const principal = await boardAuthorityDb.authenticateBoardPrincipal(
           boardPrincipalProofFromHeaders(c)

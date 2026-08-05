@@ -736,6 +736,12 @@ export async function runDispatchMigrationSmoke(args: string[]): Promise<string>
     if (typeof Bun.gc === 'function') Bun.gc(true);
     for (let attempt = 0; attempt < 3; attempt += 1) {
       try {
+        if (
+          process.env.NODE_ENV === 'test' &&
+          process.env.BDC_DISPATCH_MIGRATION_SMOKE_TEST_FAIL_CLEANUP === '1'
+        ) {
+          throw new Error('induced_cleanup_failure');
+        }
         await rm(tempDirectory, { recursive: true, force: true });
         cleanupFailed = false;
         break;
@@ -744,6 +750,9 @@ export async function runDispatchMigrationSmoke(args: string[]): Promise<string>
         if (attempt < 2) await Bun.sleep(25);
       }
     }
+  }
+  if (primaryError && cleanupFailed) {
+    throw new SmokeFailure(`${primaryError.code};temporary_cleanup_failed`);
   }
   if (primaryError) throw primaryError;
   if (cleanupFailed) throw new SmokeFailure('temporary_cleanup_failed');

@@ -1,10 +1,13 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test';
-import { unlinkSync } from 'fs';
-import { join } from 'path';
+import { existsSync, mkdtempSync, rmSync, unlinkSync } from 'fs';
+import { tmpdir } from 'os';
+import { join, resolve } from 'path';
+import { pathToFileURL } from 'url';
 import { SqliteAdapter } from './adapters/sqlite';
 
 let db: SqliteAdapter;
 let currentDbPath = '';
+const raceHomes: string[] = [];
 
 mock.module('./connection', () => ({
   getDatabase: () => db,
@@ -39,6 +42,110 @@ function cleanupDb(path: string): void {
   }
 }
 
+interface MailboxProcessResult {
+  exitCode: number;
+  stdout: string;
+  stderr: string;
+}
+
+async function runMailboxRace(
+  archonHome: string,
+  action: 'acknowledge' | 'address',
+  messageId: string
+): Promise<MailboxProcessResult[]> {
+  const dispatchUrl = pathToFileURL(resolve(import.meta.dir, 'dispatch.ts')).href;
+  const connectionUrl = pathToFileURL(resolve(import.meta.dir, 'connection.ts')).href;
+  const startFile = join(archonHome, `${action}.start`);
+  const childScript = `
+    const { acknowledgeMessage, addressMessage } = await import(${JSON.stringify(dispatchUrl)});
+    const { closeDatabase, getDatabase } = await import(${JSON.stringify(connectionUrl)});
+    getDatabase();
+    await Bun.write(process.env.READY_FILE, 'ready');
+    while (!(await Bun.file(process.env.START_FILE).exists())) await Bun.sleep(2);
+    try {
+      const result = process.env.MAILBOX_ACTION === 'acknowledge'
+        ? await acknowledgeMessage({ id: process.env.MESSAGE_ID, principal_id: 'operator' })
+        : await addressMessage({ id: process.env.MESSAGE_ID, principal_id: 'operator' });
+      process.stdout.write(JSON.stringify(result));
+    } catch (error) {
+      process.stderr.write(error instanceof Error ? error.message : 'mailbox_process_failed');
+      process.exitCode = 1;
+    } finally {
+      await closeDatabase();
+    }
+  `;
+  const children: Array<{
+    child: ReturnType<typeof Bun.spawn>;
+    readyFile: string;
+  }> = [];
+  for (const index of [0, 1]) {
+    const readyFile = join(archonHome, `${action}-${index}.ready`);
+    const child = Bun.spawn({
+      cmd: [process.execPath, '-e', childScript],
+      cwd: resolve(import.meta.dir, '..', '..', '..'),
+      stdout: 'pipe',
+      stderr: 'pipe',
+      env: {
+        ...process.env,
+        ARCHON_HOME: archonHome,
+        LOG_LEVEL: 'fatal',
+        MAILBOX_ACTION: action,
+        MESSAGE_ID: messageId,
+        READY_FILE: readyFile,
+        START_FILE: startFile,
+      },
+    });
+    children.push({ child, readyFile });
+    for (let attempt = 0; attempt < 1000; attempt += 1) {
+      if (existsSync(readyFile)) break;
+      if (attempt === 999) throw new Error('mailbox_race_process_ready_timeout');
+      await Bun.sleep(5);
+    }
+  }
+  await Bun.write(startFile, 'start');
+
+  return Promise.all(
+    children.map(async ({ child }) => {
+      const [exitCode, stdout, stderr] = await Promise.all([
+        child.exited,
+        new Response(child.stdout).text(),
+        new Response(child.stderr).text(),
+      ]);
+      return { exitCode, stdout, stderr };
+    })
+  );
+}
+
+async function makeSeparateProcessMailboxFixture(
+  idempotencyKey: string,
+  acknowledged: boolean
+): Promise<{ archonHome: string; messageId: string }> {
+  const archonHome = mkdtempSync(join(tmpdir(), 'archon-dispatch-race-'));
+  raceHomes.push(archonHome);
+  const raceDb = new SqliteAdapter(join(archonHome, 'archon.db'));
+  const primaryDb = db;
+  db = raceDb;
+  try {
+    const message = await createMessage({
+      correlation_id: `${idempotencyKey}-correlation`,
+      idempotency_key: idempotencyKey,
+      task_type: 'agent_message',
+      sender: 'xo',
+      recipient: 'operator',
+      body: 'Separate process mailbox race.',
+    });
+    if (acknowledged) {
+      expect((await acknowledgeMessage({ id: message.id, principal_id: 'operator' })).ok).toBe(
+        true
+      );
+    }
+    return { archonHome, messageId: message.id };
+  } finally {
+    db = primaryDb;
+    await raceDb.close();
+  }
+}
+
 describe('dispatch db', () => {
   beforeEach(() => {
     currentDbPath = join(
@@ -51,6 +158,10 @@ describe('dispatch db', () => {
   afterEach(async () => {
     await db.close();
     cleanupDb(currentDbPath);
+    while (raceHomes.length > 0) {
+      const raceHome = raceHomes.pop();
+      if (raceHome) rmSync(raceHome, { recursive: true, force: true });
+    }
   });
 
   test('deduplicates repeated idempotency_key posts', async () => {
@@ -293,6 +404,49 @@ describe('dispatch db', () => {
     }
   });
 
+  test('concurrent acknowledgement in separate processes against one SQLite file is idempotent', async () => {
+    const { archonHome, messageId } = await makeSeparateProcessMailboxFixture(
+      'idem-ack-separate-processes',
+      false
+    );
+
+    const results = await runMailboxRace(archonHome, 'acknowledge', messageId);
+
+    expect(results.filter(result => result.exitCode !== 0)).toEqual([]);
+    const processResults = results.map(
+      result =>
+        JSON.parse(result.stdout) as {
+          ok: boolean;
+          message: { acknowledged_at: string | null };
+        }
+    );
+    expect(processResults).toEqual([
+      expect.objectContaining({ ok: true }),
+      expect.objectContaining({ ok: true }),
+    ]);
+    expect(new Set(processResults.map(result => result.message.acknowledged_at)).size).toBe(1);
+    expect(results.every(result => !result.stderr.includes('database is locked'))).toBe(true);
+    const inspectionDb = new SqliteAdapter(join(archonHome, 'archon.db'));
+    try {
+      const stored = await inspectionDb.query<{
+        status: string;
+        acknowledged_at: string | null;
+        acknowledged_by: string | null;
+      }>(
+        'SELECT status, acknowledged_at, acknowledged_by FROM agent_dispatch_messages WHERE id = $1',
+        [messageId]
+      );
+      expect(stored.rows[0]).toMatchObject({
+        status: 'queued',
+        acknowledged_by: 'operator',
+      });
+      expect(stored.rows[0]?.acknowledged_at).not.toBeNull();
+      expect(stored.rows[0]?.acknowledged_at).toBe(processResults[0]?.message.acknowledged_at);
+    } finally {
+      await inspectionDb.close();
+    }
+  });
+
   test('returns every acknowledgement conflict outcome', async () => {
     const mailbox = await createMessage({
       correlation_id: 'corr-ack-conflicts',
@@ -385,6 +539,51 @@ describe('dispatch db', () => {
       addressed_by: 'operator',
     });
     expect(stored?.addressed_at).not.toBeNull();
+  });
+
+  test('concurrent address in separate processes against one SQLite file is idempotent', async () => {
+    const { archonHome, messageId } = await makeSeparateProcessMailboxFixture(
+      'idem-address-separate-processes',
+      true
+    );
+
+    const results = await runMailboxRace(archonHome, 'address', messageId);
+
+    expect(results.filter(result => result.exitCode !== 0)).toEqual([]);
+    const processResults = results.map(
+      result =>
+        JSON.parse(result.stdout) as {
+          ok: boolean;
+          message: { addressed_at: string | null };
+        }
+    );
+    expect(processResults).toEqual([
+      expect.objectContaining({ ok: true }),
+      expect.objectContaining({ ok: true }),
+    ]);
+    expect(new Set(processResults.map(result => result.message.addressed_at)).size).toBe(1);
+    expect(results.every(result => !result.stderr.includes('database is locked'))).toBe(true);
+    const inspectionDb = new SqliteAdapter(join(archonHome, 'archon.db'));
+    try {
+      const stored = await inspectionDb.query<{
+        status: string;
+        acknowledged_by: string | null;
+        addressed_at: string | null;
+        addressed_by: string | null;
+      }>(
+        'SELECT status, acknowledged_by, addressed_at, addressed_by FROM agent_dispatch_messages WHERE id = $1',
+        [messageId]
+      );
+      expect(stored.rows[0]).toMatchObject({
+        status: 'queued',
+        acknowledged_by: 'operator',
+        addressed_by: 'operator',
+      });
+      expect(stored.rows[0]?.addressed_at).not.toBeNull();
+      expect(stored.rows[0]?.addressed_at).toBe(processResults[0]?.message.addressed_at);
+    } finally {
+      await inspectionDb.close();
+    }
   });
 
   test('addressing revalidates final status when a guarded update loses to cancellation', async () => {

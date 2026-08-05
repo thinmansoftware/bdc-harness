@@ -266,6 +266,33 @@ describe('dispatch API', () => {
     expect(((await second.json()) as { body: string }).body).toBe('Please summarize this.');
   });
 
+  test('returns an existing HTTP idempotency row after its recipient becomes inactive', async () => {
+    const app = makeApp('secret-token');
+    const first = await app.request('/api/dispatch/messages', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-archon-operator-token': 'secret-token' },
+      body: JSON.stringify({ ...VALID_BODY, recipient: ' Operator ' }),
+    });
+    expect(first.status).toBe(200);
+    const original = (await first.json()) as { id: string; body: string };
+    await db.query("UPDATE dispatch_principals SET active = 0 WHERE principal_id = 'operator'");
+
+    const retry = await app.request('/api/dispatch/messages', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-archon-operator-token': 'secret-token' },
+      body: JSON.stringify({
+        ...VALID_BODY,
+        correlation_id: 'retry-correlation',
+        recipient: 'operator',
+        body: 'This retry must return the original row.',
+      }),
+    });
+
+    expect(retry.status).toBe(200);
+    expect((await retry.json()) as { id: string; body: string }).toMatchObject(original);
+    expect((await db.query('SELECT id FROM agent_dispatch_messages')).rowCount).toBe(1);
+  });
+
   test('publishes Phase 0 dispatch priority and mailbox fields in OpenAPI schemas', async () => {
     const response = await makeApp().request('/api/openapi.json');
     expect(response.status).toBe(200);
@@ -384,6 +411,38 @@ describe('dispatch API', () => {
     });
     expect(response.status).toBe(200);
     expect((await response.json()) as { recipient: string }).toMatchObject({ recipient: 'board' });
+  });
+
+  test('does not let a canonicalized board idempotency retry bypass board authorization', async () => {
+    const app = makeApp();
+    const body = {
+      ...VALID_BODY,
+      recipient: ' BOARD ',
+      body: JSON.stringify({
+        motion_id: 'M-27',
+        file_path: 'docs/board/motions/M-27.md',
+        requested_action: 'open discussion',
+      }),
+    };
+    const first = await app.request('/api/dispatch/messages', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-board-principal-token': 'board-token' },
+      body: JSON.stringify(body),
+    });
+    expect(first.status).toBe(200);
+
+    principal = { principal_id: 'john-ranson', seat_id: 'john', roles: [] };
+    const retry = await app.request('/api/dispatch/messages', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-board-principal-token': 'board-token' },
+      body: JSON.stringify(body),
+    });
+
+    expect(retry.status).toBe(403);
+    expect(((await retry.json()) as { error: string }).error).toBe(
+      'board_petition_principal_required'
+    );
+    expect((await db.query('SELECT id FROM agent_dispatch_messages')).rowCount).toBe(1);
   });
 
   test('records board petition evidence without approval side effects', async () => {

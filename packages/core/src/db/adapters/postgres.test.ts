@@ -168,7 +168,7 @@ describe('PostgresAdapter', () => {
   });
 
   describe('agent messaging Phase 0 schema', () => {
-    test('numbered migration and combined schema define the complete Postgres message contract', () => {
+    test('numbered migration and combined schema define the complete Postgres Phase 0 contract', () => {
       const migration = readFileSync(
         resolve(import.meta.dir, '../../../../../migrations', '040_agent_messaging_phase0.sql'),
         'utf8'
@@ -178,30 +178,69 @@ describe('PostgresAdapter', () => {
         'utf8'
       );
 
+      const phase0ColumnDefinitions = [
+        "priority TEXT NOT NULL DEFAULT 'normal'",
+        "CHECK (priority IN ('blocker', 'normal', 'heartbeat'))",
+        'task_outcome TEXT',
+        "CHECK (task_outcome IS NULL OR task_outcome IN ('succeeded', 'failed', 'blocked'))",
+        'acknowledged_at TIMESTAMPTZ',
+        'acknowledged_by TEXT',
+        'addressed_at TIMESTAMPTZ',
+        'addressed_by TEXT',
+        'escalated_tg_at TIMESTAMPTZ',
+        'escalated_sms_at TIMESTAMPTZ',
+        'subject_key TEXT',
+        'route_disposition TEXT',
+        "CHECK (route_disposition IS NULL OR route_disposition IN ('unroutable', 'superseded'))",
+        'supersedes_id UUID REFERENCES agent_dispatch_messages(id)',
+      ];
+      const principalDefinitions = [
+        'principal_id TEXT PRIMARY KEY',
+        'display_name TEXT NOT NULL',
+        'delivery_mode TEXT NOT NULL CHECK',
+        "delivery_mode IN ('worker_poll', 'drain_on_start', 'alias_resolved', 'notify_only')",
+        'active BOOLEAN NOT NULL DEFAULT TRUE',
+        'created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()',
+        'updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()',
+      ];
+      const knownPrincipals = [
+        ['claude', 'Claude', 'worker_poll', 'TRUE'],
+        ['codex', 'Codex', 'worker_poll', 'TRUE'],
+        ['grok', 'Grok', 'worker_poll', 'TRUE'],
+        ['cursor', 'Cursor', 'worker_poll', 'TRUE'],
+        ['fusion', 'Fusion', 'worker_poll', 'TRUE'],
+        ['claude-acp', 'Claude ACP', 'worker_poll', 'TRUE'],
+        ['codex-mcp', 'Codex MCP', 'worker_poll', 'TRUE'],
+        ['grok-acp', 'Grok ACP', 'worker_poll', 'TRUE'],
+        ['operator', 'Operator', 'drain_on_start', 'TRUE'],
+        ['xo', 'XO', 'drain_on_start', 'TRUE'],
+        ['board', 'Board', 'alias_resolved', 'TRUE'],
+        ['overseer', 'Overseer', 'notify_only', 'TRUE'],
+        ['cauldron', 'Cauldron', 'notify_only', 'TRUE'],
+        ['john', 'John', 'notify_only', 'FALSE'],
+        ['merge-manager', 'Merge Manager', 'notify_only', 'FALSE'],
+      ] as const;
+
       for (const schema of [migration, combined]) {
-        expect(schema).toContain("priority TEXT NOT NULL DEFAULT 'normal'");
-        expect(schema).toContain("priority IN ('blocker', 'normal', 'heartbeat')");
-        expect(schema).toContain('task_outcome TEXT');
-        expect(schema).toContain("task_outcome IN ('succeeded', 'failed', 'blocked')");
-        expect(schema).toContain('acknowledged_at TIMESTAMPTZ');
-        expect(schema).toContain('acknowledged_by TEXT');
-        expect(schema).toContain('addressed_at TIMESTAMPTZ');
-        expect(schema).toContain('addressed_by TEXT');
-        expect(schema).toContain('escalated_tg_at TIMESTAMPTZ');
-        expect(schema).toContain('escalated_sms_at TIMESTAMPTZ');
-        expect(schema).toContain('subject_key TEXT');
-        expect(schema).toContain('route_disposition TEXT');
-        expect(schema).toContain("route_disposition IN ('unroutable', 'superseded')");
-        expect(schema).toContain('supersedes_id UUID REFERENCES agent_dispatch_messages(id)');
-        expect(schema).toContain('CREATE TABLE IF NOT EXISTS dispatch_principals');
-        expect(schema).toContain(
-          "delivery_mode IN ('worker_poll', 'drain_on_start', 'alias_resolved', 'notify_only')"
+        const normalizedSchema = schema.replace(/\s+/g, ' ');
+        for (const definition of [...phase0ColumnDefinitions, ...principalDefinitions]) {
+          expect(schema).toContain(definition);
+        }
+        const knownSeedBlock = schema.match(
+          /INSERT INTO dispatch_principals \(principal_id, display_name, delivery_mode, active\)\s+VALUES([\s\S]*?)ON CONFLICT \(principal_id\) DO NOTHING;/
+        )?.[1];
+        expect(knownSeedBlock).toBeDefined();
+        const actualKnownPrincipals = [
+          ...(knownSeedBlock?.matchAll(/\('([^']+)', '([^']+)', '([^']+)', (TRUE|FALSE)\)/g) ?? []),
+        ].map(match => match.slice(1));
+        expect(actualKnownPrincipals).toEqual(knownPrincipals.map(principal => [...principal]));
+        expect(normalizedSchema).toContain(
+          "INSERT INTO dispatch_principals (principal_id, display_name, delivery_mode, active) SELECT DISTINCT LOWER(BTRIM(recipient)), LOWER(BTRIM(recipient)), 'drain_on_start', TRUE FROM agent_dispatch_messages WHERE BTRIM(recipient) <> '' ON CONFLICT (principal_id) DO NOTHING;"
         );
-        expect(schema).toContain("('claude', 'Claude', 'worker_poll', TRUE)");
-        expect(schema).toContain("('merge-manager', 'Merge Manager', 'notify_only', FALSE)");
-        expect(schema).toContain('LOWER(BTRIM(recipient))');
       }
+      expect(migration.match(/ADD COLUMN IF NOT EXISTS/g)?.length).toBe(11);
       expect(migration).toContain("task_type = 'run_report'");
+      expect(migration).toContain("status = 'queued'");
     });
   });
 

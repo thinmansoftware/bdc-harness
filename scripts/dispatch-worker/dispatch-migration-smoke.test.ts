@@ -298,4 +298,28 @@ describe('dispatch-migration-smoke CLI', () => {
     expect(result.stderr).not.toContain(tempParent);
     expect(await readdir(tempParent)).toEqual([]);
   });
+
+  test('surfaces cleanup failure together with a primary migration failure', async () => {
+    const { dbPath } = await makeLegacyFixture();
+    const source = new Database(dbPath);
+    source.run('CREATE TABLE dispatch_principals (principal_id TEXT PRIMARY KEY)');
+    source.close();
+    const tempParent = await mkdtemp(join(tmpdir(), 'CUSTOMER-SECRET-DISPATCH-SMOKE-'));
+    temporaryDirectories.push(tempParent);
+
+    const result = await runCli(['--source-copy', dbPath, '--expected-heartbeats', '2'], {
+      BDC_DISPATCH_MIGRATION_SMOKE_TEST_TEMP_PARENT: tempParent,
+      BDC_DISPATCH_MIGRATION_SMOKE_TEST_FAIL_CLEANUP: '1',
+    });
+
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stdout).toBe('');
+    expect(result.stderr.trim().split(/\r?\n/).at(-1)).toBe(
+      'migration_initialization_failed;temporary_cleanup_failed'
+    );
+    expect(result.stderr).not.toContain(dbPath);
+    expect(result.stderr).not.toContain(tempParent);
+    expect(result.stderr).not.toContain('CUSTOMER-SECRET-DISPATCH-SMOKE');
+    expect(result.stderr).not.toContain('SECRET-');
+  });
 });
