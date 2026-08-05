@@ -10,6 +10,14 @@ import {
   type AcpRunConfig,
   type AcpRunResult,
 } from './session';
+import {
+  createMcpCancelController,
+  runMcpAgent,
+  type McpRunConfig,
+  type McpRunResult,
+} from '../mcp/session';
+
+type ConformanceRunResult = AcpRunResult | McpRunResult;
 
 const MINIMUM_LARGE_PROMPT_BYTES = 61_440;
 
@@ -47,29 +55,41 @@ export interface ConformanceReport {
     largePayload: TestVerdict<{
       promptBytes: number;
       receivedPromptBytes: number | null;
-      result: AcpRunResult;
+      result: ConformanceRunResult;
       receipt: DurableReceipt;
     }>;
     cancellation: TestVerdict<{
-      result: AcpRunResult;
+      result: ConformanceRunResult;
       receipt: DurableReceipt;
       treeBeforeKill: number[];
       treeAfterKill: number[];
     }>;
     forcedFailure: TestVerdict<{
-      result: AcpRunResult;
+      result: ConformanceRunResult;
       receipt: DurableReceipt;
       insideTimeout: boolean;
     }>;
     receiptAudit: TestVerdict<{
       receipts: DurableReceipt[];
-      timeoutResult: AcpRunResult;
+      timeoutResult: ConformanceRunResult;
     }>;
   };
   allGreen: boolean;
 }
 
-function runConfig(seat: SeatUnderTest): AcpRunConfig {
+function runConfig(seat: SeatUnderTest): AcpRunConfig | McpRunConfig {
+  if (seat.config.kind === 'mcp') {
+    const mcp = seat.config.mcp ?? {};
+    return {
+      command: seat.config.command,
+      args: [...seat.config.args],
+      cwd: seat.cwd ?? process.cwd(),
+      idleTimeoutMs: mcp.idleTimeoutMs ?? ACP_DEFAULT_IDLE_TIMEOUT_MS,
+      wallClockMs: mcp.wallClockMs ?? ACP_DEFAULT_WALL_CLOCK_MS,
+      killGraceMs: mcp.killGraceMs ?? ACP_DEFAULT_KILL_GRACE_MS,
+      ...(mcp.toolName ? { toolName: mcp.toolName } : {}),
+    };
+  }
   const acp = seat.config.acp ?? {};
   return {
     command: seat.config.command,
@@ -82,7 +102,7 @@ function runConfig(seat: SeatUnderTest): AcpRunConfig {
   };
 }
 
-function receipt(seat: SeatUnderTest, result: AcpRunResult): DurableReceipt {
+function receipt(seat: SeatUnderTest, result: ConformanceRunResult): DurableReceipt {
   const outcome = result.ok ? 'completed' : result.cancelled ? 'cancelled' : 'failed';
   return {
     seatId: seat.id,
@@ -93,7 +113,7 @@ function receipt(seat: SeatUnderTest, result: AcpRunResult): DurableReceipt {
   };
 }
 
-function failure(message: string): AcpRunResult {
+function failure(message: string): ConformanceRunResult {
   return {
     ok: false,
     stopReason: null,
@@ -114,15 +134,30 @@ async function safelyRun(
   seat: SeatUnderTest,
   prompt: string,
   cancelAfterMs?: number
-): Promise<AcpRunResult> {
+): Promise<ConformanceRunResult> {
   try {
-    if (cancelAfterMs === undefined) return await runAcpAgent(runConfig(seat), prompt);
+    const config = runConfig(seat);
+    if (seat.config.kind === 'mcp') {
+      const mcpConfig = config as McpRunConfig;
+      if (cancelAfterMs === undefined) return await runMcpAgent(mcpConfig, prompt);
+      const controller = createMcpCancelController();
+      const timer = setTimeout(() => {
+        controller.cancel();
+      }, cancelAfterMs);
+      try {
+        return await runMcpAgent(mcpConfig, prompt, controller);
+      } finally {
+        clearTimeout(timer);
+      }
+    }
+    const acpConfig = config as AcpRunConfig;
+    if (cancelAfterMs === undefined) return await runAcpAgent(acpConfig, prompt);
     const controller = createCancelController();
     const timer = setTimeout(() => {
       controller.cancel();
     }, cancelAfterMs);
     try {
-      return await runAcpAgent(runConfig(seat), prompt, controller);
+      return await runAcpAgent(acpConfig, prompt, controller);
     } finally {
       clearTimeout(timer);
     }
