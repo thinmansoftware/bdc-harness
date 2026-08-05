@@ -30,10 +30,9 @@ async function conformingOptions(): Promise<ConformanceOptions> {
 
 describe('ACP evidence-contract conformance matrix', () => {
   test('fails loud when raw cancellation cleanup evidence is absent', async () => {
-    const report = await runConformanceMatrix(
-      await stubSeat('ok', 'future-acp-seat'),
-      await conformingOptions()
-    );
+    const options = await conformingOptions();
+    options.cancellationSeat = await stubSeat('cancel-clean', 'no-cleanup-evidence-seat');
+    const report = await runConformanceMatrix(await stubSeat('ok', 'future-acp-seat'), options);
     expect(report.allGreen).toBe(false);
     expect(Object.keys(report.tests)).toHaveLength(4);
     expect(report.tests.largePayload.pass).toBe(true);
@@ -44,11 +43,9 @@ describe('ACP evidence-contract conformance matrix', () => {
     expect(report.tests.largePayload.evidence.receivedPromptBytes).toBe(
       report.tests.largePayload.evidence.promptBytes
     );
-    expect(report.tests.cancellation.evidence.treeBeforeKill).toEqual([]);
-    expect(report.tests.cancellation.evidence.treeBeforeKill).toEqual(
-      report.tests.cancellation.evidence.result.treeBeforeKill
-    );
-    expect(report.tests.cancellation.evidence.treeAfterKill).toEqual([]);
+    expect(report.tests.cancellation.evidence.treeBeforeKill).toHaveLength(0);
+    expect(report.tests.cancellation.evidence.result.treeBeforeKill).toHaveLength(0);
+    expect(report.tests.cancellation.evidence.treeAfterKill).toHaveLength(0);
   }, 30_000);
 
   test('a large-payload failure makes allGreen false without hiding other verdicts', async () => {

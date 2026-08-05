@@ -23,6 +23,7 @@ export type StubAgentMode =
   | 'wrong-byte-count'
   | 'empty'
   | 'hang'
+  | 'cancel-clean'
   | 'spawn-child'
   | 'auth-reject';
 
@@ -56,7 +57,7 @@ process.stdin.on('data', (chunk) => {
         // Long-lived grandchild that must be killed with the tree.
         spawn(process.execPath, ['-e', 'setInterval(()=>{},1e9)'], { stdio: 'ignore' });
       }
-      if (mode === 'hang' || mode === 'spawn-child') {
+      if (mode === 'hang' || mode === 'cancel-clean' || mode === 'spawn-child') {
         return; // never answers -- idle timeout must fire
       }
       if (mode === 'empty') {
@@ -176,6 +177,27 @@ describe('runAcpAgent reliability contract', () => {
       const survivors = await enumerateProcessTree(result.agentPid);
       expect(survivors.length).toBe(0);
     }
+  }, 60_000);
+
+  test('external cancellation preserves descendant cleanup evidence', async () => {
+    const { script, cwd } = await writeStub('spawn-child');
+    const cancel = createCancelController();
+    setTimeout(() => cancel.cancel(), 1_500);
+    const result = await runAcpAgent(
+      {
+        command: process.execPath,
+        args: [script],
+        cwd,
+        idleTimeoutMs: 30_000,
+        wallClockMs: 60_000,
+        killGraceMs: 4_000,
+      },
+      'spawn and preserve kill evidence',
+      cancel
+    );
+    expect(result.cancelled).toBe(true);
+    expect(result.treeBeforeKill.length).toBeGreaterThan(0);
+    expect(result.treeAfterKill).toEqual([]);
   }, 60_000);
 
   test('reports a spawn failure instead of pretending the leg ran', async () => {

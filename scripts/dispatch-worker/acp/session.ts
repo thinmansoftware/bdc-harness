@@ -171,12 +171,16 @@ export async function runAcpAgent(
     }
   );
 
-  const boundedKill = async (): Promise<void> => {
-    if (agentPid === null) return;
-    const tree = await enumerateProcessTree(agentPid);
-    treeBeforeKill = tree.map(node => node.pid);
-    await killProcessTree(agentPid);
-    treeAfterKill = await waitForTreeDeath(treeBeforeKill, config.killGraceMs);
+  let killPromise: Promise<void> | undefined;
+  const boundedKill = (): Promise<void> => {
+    killPromise ??= (async (): Promise<void> => {
+      if (agentPid === null) return;
+      const tree = await enumerateProcessTree(agentPid);
+      treeBeforeKill = tree.map(node => node.pid);
+      await killProcessTree(agentPid);
+      treeAfterKill = await waitForTreeDeath(treeBeforeKill, config.killGraceMs);
+    })();
+    return killPromise;
   };
 
   try {

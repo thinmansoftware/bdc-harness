@@ -14,6 +14,7 @@ export interface ProcessNode {
   pid: number;
   ppid: number;
   name: string;
+  state?: string;
 }
 
 function runCapture(command: string, args: string[]): Promise<{ stdout: string; code: number }> {
@@ -53,16 +54,21 @@ async function listAllProcesses(): Promise<ProcessNode[]> {
       return [];
     }
   }
-  const { stdout } = await runCapture('ps', ['-eo', 'pid=,ppid=,comm=']);
+  const { stdout } = await runCapture('ps', ['-eo', 'pid=,ppid=,stat=,comm=']);
   return stdout
     .split('\n')
     .map(line => line.trim())
     .filter(Boolean)
     .map(line => {
-      const [pid, ppid, ...name] = line.split(/\s+/);
-      return { pid: Number(pid), ppid: Number(ppid), name: name.join(' ') };
+      const [pid, ppid, state, ...name] = line.split(/\s+/);
+      return { pid: Number(pid), ppid: Number(ppid), name: name.join(' '), state };
     })
     .filter(node => Number.isFinite(node.pid) && Number.isFinite(node.ppid));
+}
+
+/** Returns the pids that represent running rather than defunct processes. */
+export function liveProcessPids(snapshot: ProcessNode[]): Set<number> {
+  return new Set(snapshot.filter(node => !node.state?.startsWith('Z')).map(node => node.pid));
 }
 
 /**
@@ -124,7 +130,7 @@ export async function waitForTreeDeath(pids: number[], timeoutMs: number): Promi
   let alive = pids;
   while (Date.now() < deadline) {
     const snapshot = await listAllProcesses();
-    const livePids = new Set(snapshot.map(node => node.pid));
+    const livePids = liveProcessPids(snapshot);
     alive = pids.filter(pid => livePids.has(pid));
     if (alive.length === 0) return [];
     await new Promise(resolve => setTimeout(resolve, 250));
