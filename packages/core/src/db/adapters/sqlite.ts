@@ -303,12 +303,7 @@ export class SqliteAdapter implements IDatabase {
 
     // Dispatch board-motion and agent messaging columns
     try {
-      const dispatchCols = this.db
-        .prepare("PRAGMA table_info('agent_dispatch_messages')")
-        .all() as { name: string }[];
-      const dispatchColNames = new Set(dispatchCols.map(c => c.name));
-      const isPhase0Migration = !dispatchColNames.has('priority');
-      const columns: [string, string][] = [
+      const boardColumns: [string, string][] = [
         ['recipient_alias', "TEXT CHECK (recipient_alias IS NULL OR recipient_alias = 'board')"],
         ['motion_id', 'TEXT'],
         [
@@ -322,6 +317,8 @@ export class SqliteAdapter implements IDatabase {
           'INTEGER CHECK (resolved_xo_fencing_token IS NULL OR resolved_xo_fencing_token > 0)',
         ],
         ['resolved_at', 'TEXT'],
+      ];
+      const phase0Columns: [string, string][] = [
         [
           'priority',
           "TEXT NOT NULL DEFAULT 'normal' CHECK (priority IN ('blocker', 'normal', 'heartbeat'))",
@@ -343,15 +340,44 @@ export class SqliteAdapter implements IDatabase {
         ],
         ['supersedes_id', 'TEXT REFERENCES agent_dispatch_messages(id)'],
       ];
-      for (const [name, definition] of columns) {
-        if (!dispatchColNames.has(name)) {
+      const boardDispatchCols = this.db
+        .prepare("PRAGMA table_info('agent_dispatch_messages')")
+        .all() as { name: string }[];
+      const boardDispatchColNames = new Set(boardDispatchCols.map(c => c.name));
+      for (const [name, definition] of boardColumns) {
+        if (!boardDispatchColNames.has(name)) {
           this.db.run(`ALTER TABLE agent_dispatch_messages ADD COLUMN ${name} ${definition}`);
         }
       }
-      if (isPhase0Migration) {
-        this.db.run(
-          "UPDATE agent_dispatch_messages SET priority = 'heartbeat' WHERE status = 'queued' AND task_type = 'run_report'"
-        );
+
+      this.db.run('BEGIN');
+      try {
+        const dispatchCols = this.db
+          .prepare("PRAGMA table_info('agent_dispatch_messages')")
+          .all() as { name: string }[];
+        const dispatchColNames = new Set(dispatchCols.map(c => c.name));
+        const priorityNeedsBackfill = !dispatchColNames.has('priority');
+        for (const [name, definition] of [...boardColumns, ...phase0Columns]) {
+          if (!dispatchColNames.has(name)) {
+            this.db.run(`ALTER TABLE agent_dispatch_messages ADD COLUMN ${name} ${definition}`);
+          }
+        }
+        if (priorityNeedsBackfill) {
+          this.db.run(
+            "UPDATE agent_dispatch_messages SET priority = 'heartbeat' WHERE status = 'queued' AND task_type = 'run_report'"
+          );
+        }
+        this.db.run('COMMIT');
+      } catch (error: unknown) {
+        try {
+          this.db.run('ROLLBACK');
+        } catch (rollbackError: unknown) {
+          getLog().error(
+            { err: rollbackError as Error },
+            'db.sqlite_migration_dispatch_columns_rollback_failed'
+          );
+        }
+        throw error;
       }
     } catch (e: unknown) {
       getLog().warn({ err: e as Error }, 'db.sqlite_migration_dispatch_columns_failed');

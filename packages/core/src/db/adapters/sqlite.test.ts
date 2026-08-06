@@ -220,6 +220,98 @@ describe('SqliteAdapter', () => {
       );
       expect(reopened.rows).toEqual([{ id: 'new-blocker', priority: 'blocker' }]);
     });
+
+    test('rolls back a failed Phase 0 backfill and recovers exactly once on reopen', async () => {
+      currentDbPath = join(
+        import.meta.dir,
+        `.test-sqlite-adapter-${Date.now()}-${Math.random().toString(36).slice(2)}.db`
+      );
+      const legacy = new Database(currentDbPath);
+      legacy.run(`
+        CREATE TABLE agent_dispatch_messages (
+          id TEXT PRIMARY KEY,
+          correlation_id TEXT NOT NULL,
+          idempotency_key TEXT NOT NULL UNIQUE,
+          task_type TEXT NOT NULL CHECK (task_type IN ('agent_message', 'run_review', 'draft_spec', 'run_report')),
+          sender TEXT NOT NULL,
+          recipient TEXT NOT NULL,
+          body TEXT NOT NULL,
+          status TEXT NOT NULL DEFAULT 'queued' CHECK (status IN ('queued', 'claimed', 'done', 'failed', 'cancelled')),
+          result_body TEXT,
+          created_at TEXT NOT NULL,
+          claimed_at TEXT,
+          completed_at TEXT,
+          not_before TEXT,
+          lease_owner TEXT,
+          lease_expires_at TEXT,
+          fencing_token INTEGER NOT NULL DEFAULT 0
+        )
+      `);
+      legacy.run(`
+        INSERT INTO agent_dispatch_messages
+          (id, correlation_id, idempotency_key, task_type, sender, recipient, body, status, created_at)
+        VALUES
+          ('legacy-heartbeat', 'c1', 'k1', 'run_report', 'unexpected-sender', 'operator', 'report', 'queued', '2026-08-05T00:00:00.000Z')
+      `);
+      legacy.run(`
+        CREATE TRIGGER fail_phase0_heartbeat_backfill
+        BEFORE UPDATE OF priority ON agent_dispatch_messages
+        WHEN NEW.priority = 'heartbeat'
+        BEGIN
+          SELECT RAISE(ABORT, 'induced_phase0_backfill_failure');
+        END
+      `);
+      legacy.close();
+
+      db = new SqliteAdapter(currentDbPath);
+      const failedColumns = await db.query<{ name: string }>(
+        `SELECT name FROM pragma_table_info('agent_dispatch_messages')`
+      );
+      const failedColumnNames = new Set(failedColumns.rows.map(column => column.name));
+      for (const column of phase0Columns) {
+        expect(failedColumnNames.has(column)).toBe(false);
+      }
+      const unchangedLegacyRow = await db.query<{ status: string; task_type: string }>(
+        `SELECT status, task_type FROM agent_dispatch_messages WHERE id = 'legacy-heartbeat'`
+      );
+      expect(unchangedLegacyRow.rows).toEqual([{ status: 'queued', task_type: 'run_report' }]);
+
+      await db.query('DROP TRIGGER fail_phase0_heartbeat_backfill');
+      await db.close();
+      db = new SqliteAdapter(currentDbPath);
+
+      const recoveredColumns = await db.query<{ name: string }>(
+        `SELECT name FROM pragma_table_info('agent_dispatch_messages')`
+      );
+      const recoveredColumnNames = new Set(recoveredColumns.rows.map(column => column.name));
+      for (const column of phase0Columns) {
+        expect(recoveredColumnNames.has(column)).toBe(true);
+      }
+      const recoveredHeartbeat = await db.query<{ priority: string }>(
+        `SELECT priority FROM agent_dispatch_messages WHERE id = 'legacy-heartbeat'`
+      );
+      expect(recoveredHeartbeat.rows).toEqual([{ priority: 'heartbeat' }]);
+
+      await db.query(`
+        INSERT INTO agent_dispatch_messages
+          (id, correlation_id, idempotency_key, task_type, sender, recipient, body, status, priority, created_at)
+        VALUES
+          ('post-recovery-blocker', 'c2', 'k2', 'run_report', 'unexpected-sender', 'operator', 'blocker report', 'queued', 'blocker', '2026-08-05T00:01:00.000Z')
+      `);
+      await db.close();
+      db = new SqliteAdapter(currentDbPath);
+
+      const reopened = await db.query<{ id: string; priority: string }>(
+        `SELECT id, priority
+         FROM agent_dispatch_messages
+         WHERE id IN ('legacy-heartbeat', 'post-recovery-blocker')
+         ORDER BY id`
+      );
+      expect(reopened.rows).toEqual([
+        { id: 'legacy-heartbeat', priority: 'heartbeat' },
+        { id: 'post-recovery-blocker', priority: 'blocker' },
+      ]);
+    });
   });
 
   describe('workflow run archive schema', () => {

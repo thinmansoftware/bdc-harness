@@ -318,6 +318,192 @@ describe('dispatch db', () => {
     ).toBeNull();
   });
 
+  test('rejects missing and inactive concrete principals before claim', async () => {
+    await registerWorker({
+      worker_id: 'worker-registry-guard',
+      host: 'host',
+      capabilities: {},
+      max_concurrency: 1,
+    });
+    const missingPrincipalMessage = await createMessage({
+      correlation_id: 'corr-claim-missing-principal',
+      idempotency_key: 'idem-claim-missing-principal',
+      task_type: 'agent_message',
+      sender: 'xo',
+      recipient: 'codex',
+      body: 'Missing principal claim guard.',
+    });
+    const inactivePrincipalMessage = await createMessage({
+      correlation_id: 'corr-claim-inactive-principal',
+      idempotency_key: 'idem-claim-inactive-principal',
+      task_type: 'agent_message',
+      sender: 'xo',
+      recipient: 'grok',
+      body: 'Inactive principal claim guard.',
+    });
+    const wrongModePrincipalMessage = await createMessage({
+      correlation_id: 'corr-claim-wrong-mode-principal',
+      idempotency_key: 'idem-claim-wrong-mode-principal',
+      task_type: 'agent_message',
+      sender: 'xo',
+      recipient: 'fusion',
+      body: 'Wrong mode principal claim guard.',
+    });
+    await db.query("DELETE FROM dispatch_principals WHERE principal_id = 'codex'");
+    await db.query("UPDATE dispatch_principals SET active = 0 WHERE principal_id = 'grok'");
+    await db.query(
+      "UPDATE dispatch_principals SET delivery_mode = 'alias_resolved' WHERE principal_id = 'fusion'"
+    );
+
+    await expect(
+      claimMessage({ id: missingPrincipalMessage.id, worker_id: 'worker-registry-guard' })
+    ).resolves.toBeNull();
+    await expect(
+      claimMessage({ id: inactivePrincipalMessage.id, worker_id: 'worker-registry-guard' })
+    ).resolves.toBeNull();
+    await expect(
+      claimMessage({ id: wrongModePrincipalMessage.id, worker_id: 'worker-registry-guard' })
+    ).resolves.toBeNull();
+    for (const message of [
+      missingPrincipalMessage,
+      inactivePrincipalMessage,
+      wrongModePrincipalMessage,
+    ]) {
+      expect(await getMessage(message.id)).toMatchObject({
+        status: 'queued',
+        fencing_token: 0,
+        lease_owner: null,
+        lease_expires_at: null,
+      });
+    }
+  });
+
+  test('rejects inactive board aliases and inactive resolved board principals before claim', async () => {
+    await registerWorker({
+      worker_id: 'worker-board-registry-guard',
+      host: 'host',
+      capabilities: {},
+      max_concurrency: 1,
+    });
+    const boardMessage = await createMessage({
+      correlation_id: 'corr-claim-inactive-board-principal',
+      idempotency_key:
+        'board-motion:M-claim-registry:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:board',
+      task_type: 'board_motion',
+      sender: 'xo',
+      recipient: 'board',
+      body: '{"motion_id":"M-claim-registry","title":"T","file_path":"docs/board/motions/M.md"}',
+      recipient_alias: 'board',
+      motion_id: 'M-claim-registry',
+      motion_revision_sha: 'a'.repeat(40),
+    });
+    const now = new Date();
+    await db.query(
+      `INSERT INTO board_xo_leases (
+         id, lease_id, principal_id, seat_id, holder_id, holder_token_hash,
+         fencing_token, acquired_at, renewed_at, expires_at, released_at
+       )
+       VALUES (1, $1, 'claude', 'xo', 'holder', $2, 13, $3, NULL, $4, NULL)`,
+      [
+        'lease-registry-guard',
+        'c'.repeat(64),
+        now.toISOString(),
+        new Date(now.getTime() + 60_000).toISOString(),
+      ]
+    );
+    await db.query("UPDATE dispatch_principals SET active = 0 WHERE principal_id = 'claude'");
+
+    await expect(
+      claimMessage({
+        id: boardMessage.id,
+        worker_id: 'worker-board-registry-guard',
+        delivery_principal: 'claude',
+      })
+    ).resolves.toBeNull();
+    await db.query("UPDATE dispatch_principals SET active = 1 WHERE principal_id = 'claude'");
+    await db.query("UPDATE dispatch_principals SET active = 0 WHERE principal_id = 'board'");
+    await expect(
+      claimMessage({
+        id: boardMessage.id,
+        worker_id: 'worker-board-registry-guard',
+        delivery_principal: 'claude',
+      })
+    ).resolves.toBeNull();
+    await db.query(
+      "UPDATE dispatch_principals SET active = 1, delivery_mode = 'worker_poll' WHERE principal_id = 'board'"
+    );
+    await expect(
+      claimMessage({
+        id: boardMessage.id,
+        worker_id: 'worker-board-registry-guard',
+        delivery_principal: 'claude',
+      })
+    ).resolves.toBeNull();
+    await db.query(
+      "UPDATE dispatch_principals SET delivery_mode = 'alias_resolved' WHERE principal_id = 'board'"
+    );
+    await db.query("DELETE FROM dispatch_principals WHERE principal_id = 'board'");
+    await expect(
+      claimMessage({
+        id: boardMessage.id,
+        worker_id: 'worker-board-registry-guard',
+        delivery_principal: 'claude',
+      })
+    ).resolves.toBeNull();
+    await db.query(
+      `INSERT INTO dispatch_principals (principal_id, display_name, delivery_mode, active)
+       VALUES ('board', 'Board', 'alias_resolved', 1)`
+    );
+    await db.query("DELETE FROM dispatch_principals WHERE principal_id = 'claude'");
+    await expect(
+      claimMessage({
+        id: boardMessage.id,
+        worker_id: 'worker-board-registry-guard',
+        delivery_principal: 'claude',
+      })
+    ).resolves.toBeNull();
+    expect((await getMessage(boardMessage.id))?.status).toBe('queued');
+  });
+
+  test('rejects acknowledgement and addressing after a mailbox principal becomes inactive', async () => {
+    const acknowledgeTarget = await createMessage({
+      correlation_id: 'corr-ack-inactive-principal',
+      idempotency_key: 'idem-ack-inactive-principal',
+      task_type: 'agent_message',
+      sender: 'xo',
+      recipient: 'operator',
+      body: 'Inactive acknowledgement guard.',
+    });
+    const addressTarget = await createMessage({
+      correlation_id: 'corr-address-inactive-principal',
+      idempotency_key: 'idem-address-inactive-principal',
+      task_type: 'agent_message',
+      sender: 'xo',
+      recipient: 'operator',
+      body: 'Inactive address guard.',
+    });
+    expect((await acknowledgeMessage({ id: addressTarget.id, principal_id: 'operator' })).ok).toBe(
+      true
+    );
+    await db.query("UPDATE dispatch_principals SET active = 0 WHERE principal_id = 'operator'");
+
+    await expect(
+      acknowledgeMessage({ id: acknowledgeTarget.id, principal_id: 'operator' })
+    ).resolves.toEqual({ ok: false, reason: 'wrong_mode' });
+    await expect(
+      addressMessage({ id: addressTarget.id, principal_id: 'operator' })
+    ).resolves.toEqual({ ok: false, reason: 'wrong_mode' });
+    await db.query("DELETE FROM dispatch_principals WHERE principal_id = 'operator'");
+    await expect(
+      acknowledgeMessage({ id: acknowledgeTarget.id, principal_id: 'operator' })
+    ).resolves.toEqual({ ok: false, reason: 'wrong_mode' });
+    await expect(
+      addressMessage({ id: addressTarget.id, principal_id: 'operator' })
+    ).resolves.toEqual({ ok: false, reason: 'wrong_mode' });
+    expect((await getMessage(acknowledgeTarget.id))?.acknowledged_at).toBeNull();
+    expect((await getMessage(addressTarget.id))?.addressed_at).toBeNull();
+  });
+
   test('acknowledges mailbox messages once without changing queue or address state', async () => {
     const message = await createMessage({
       correlation_id: 'corr-ack',
@@ -388,7 +574,59 @@ describe('dispatch db', () => {
         acknowledgeMessage({ id: message.id, principal_id: 'operator' })
       ).resolves.toEqual({ ok: false, reason: 'wrong_recipient' });
       expect(updateSql[0]).toContain('LOWER(TRIM(COALESCE(resolved_recipient, recipient))) = $3');
+      expect(updateSql[0]).toContain("CAST(recipient_principal.active AS TEXT) IN ('1', 'true')");
       expect(updateSql[0]).toContain("delivery_mode IN ('drain_on_start', 'notify_only')");
+    } finally {
+      db = originalDb;
+    }
+  });
+
+  test('acknowledgement maps a registry deactivation after a lost update to wrong_mode', async () => {
+    const message = await createMessage({
+      correlation_id: 'corr-ack-registry-deactivation',
+      idempotency_key: 'idem-ack-registry-deactivation',
+      task_type: 'agent_message',
+      sender: 'xo',
+      recipient: 'operator',
+      body: 'Registry deactivation race target.',
+    });
+    const originalDb = db;
+    const updateSql: string[] = [];
+    let principalReadCount = 0;
+    const query = async <T>(sql: string): Promise<{ rows: readonly T[]; rowCount: number }> => {
+      if (sql.startsWith('SELECT * FROM agent_dispatch_messages')) {
+        return { rows: [message as T], rowCount: 1 };
+      }
+      if (sql.startsWith('SELECT principal_id, delivery_mode, active')) {
+        principalReadCount += 1;
+        return {
+          rows: [
+            {
+              principal_id: 'operator',
+              delivery_mode: 'drain_on_start',
+              active: principalReadCount === 1 ? 1 : 0,
+            } as T,
+          ],
+          rowCount: 1,
+        };
+      }
+      if (sql.startsWith('UPDATE agent_dispatch_messages')) {
+        updateSql.push(sql);
+        return { rows: [], rowCount: 0 };
+      }
+      throw new Error(`Unexpected SQL: ${sql}`);
+    };
+    db = {
+      ...originalDb,
+      query,
+      withTransaction: async fn => fn(query),
+    } as SqliteAdapter;
+
+    try {
+      await expect(
+        acknowledgeMessage({ id: message.id, principal_id: 'operator' })
+      ).resolves.toEqual({ ok: false, reason: 'wrong_mode' });
+      expect(updateSql[0]).toContain("CAST(recipient_principal.active AS TEXT) IN ('1', 'true')");
     } finally {
       db = originalDb;
     }
@@ -649,6 +887,7 @@ describe('dispatch db', () => {
         reason: 'not_queued',
       });
       expect(updateSql[0]).toContain('LOWER(TRIM(COALESCE(resolved_recipient, recipient))) = $3');
+      expect(updateSql[0]).toContain("CAST(recipient_principal.active AS TEXT) IN ('1', 'true')");
       expect(updateSql[0]).toContain("delivery_mode IN ('drain_on_start', 'notify_only')");
     } finally {
       db = originalDb;

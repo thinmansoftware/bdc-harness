@@ -567,13 +567,27 @@ export async function claimMessage(data: {
       };
     }
 
-    const recipientPrincipal = await getDispatchPrincipal(
-      txQuery,
-      canonicalizePrincipal(current.resolved_recipient ?? current.recipient)
-    );
+    const addressedPrincipalId = canonicalizePrincipal(current.recipient);
+    const addressedPrincipal = await getDispatchPrincipal(txQuery, addressedPrincipalId);
+    const addressedMode = current.recipient_alias === 'board' ? 'alias_resolved' : 'worker_poll';
     if (
-      recipientPrincipal?.delivery_mode === 'drain_on_start' ||
-      recipientPrincipal?.delivery_mode === 'notify_only'
+      !addressedPrincipal ||
+      !isActivePrincipal(addressedPrincipal) ||
+      addressedPrincipal.delivery_mode !== addressedMode
+    ) {
+      return null;
+    }
+    const effectivePrincipalId = canonicalizePrincipal(
+      resolvedRecipient?.principal_id ?? current.resolved_recipient ?? current.recipient
+    );
+    const effectivePrincipal =
+      effectivePrincipalId === addressedPrincipalId
+        ? addressedPrincipal
+        : await getDispatchPrincipal(txQuery, effectivePrincipalId);
+    if (
+      !effectivePrincipal ||
+      !isActivePrincipal(effectivePrincipal) ||
+      effectivePrincipal.delivery_mode !== 'worker_poll'
     ) {
       return null;
     }
@@ -657,7 +671,11 @@ async function validateMailboxActor(
   const resolvedRecipient = canonicalizePrincipal(message.resolved_recipient ?? message.recipient);
   if (resolvedRecipient !== principalId) return { ok: false, reason: 'wrong_recipient' };
   const recipientPrincipal = await getDispatchPrincipal(query, resolvedRecipient);
-  if (!recipientPrincipal || !isMailboxDeliveryMode(recipientPrincipal.delivery_mode)) {
+  if (
+    !recipientPrincipal ||
+    !isActivePrincipal(recipientPrincipal) ||
+    !isMailboxDeliveryMode(recipientPrincipal.delivery_mode)
+  ) {
     return { ok: false, reason: 'wrong_mode' };
   }
   if (message.status !== 'queued') return { ok: false, reason: 'not_queued' };
@@ -718,6 +736,7 @@ export async function acknowledgeMessage(data: {
            SELECT 1
            FROM dispatch_principals AS recipient_principal
            WHERE recipient_principal.principal_id = LOWER(TRIM(COALESCE(resolved_recipient, recipient)))
+             AND CAST(recipient_principal.active AS TEXT) IN ('1', 'true')
              AND recipient_principal.delivery_mode IN ('drain_on_start', 'notify_only')
          )`,
         [data.id, now, principalId]
@@ -770,6 +789,7 @@ export async function addressMessage(data: {
            SELECT 1
            FROM dispatch_principals AS recipient_principal
            WHERE recipient_principal.principal_id = LOWER(TRIM(COALESCE(resolved_recipient, recipient)))
+             AND CAST(recipient_principal.active AS TEXT) IN ('1', 'true')
              AND recipient_principal.delivery_mode IN ('drain_on_start', 'notify_only')
          )`,
         [data.id, now, principalId]

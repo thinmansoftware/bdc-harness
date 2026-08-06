@@ -1,7 +1,7 @@
 import { Database, constants } from 'bun:sqlite';
 import { afterEach, describe, expect, test } from 'bun:test';
 import { createHash } from 'crypto';
-import { link, mkdtemp, readFile, readdir, rm, symlink } from 'fs/promises';
+import { link, lstat, mkdtemp, readFile, readdir, rm, symlink } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { pathToFileURL } from 'url';
@@ -474,6 +474,208 @@ describe('dispatch-migration-smoke CLI', () => {
     expect(result.stdout).toBe('');
     expect(result.stderr).toContain('migrated_copy_output_forbidden');
     expect(result.stderr).not.toContain(livePath);
+  });
+
+  test('rejects source and known-live database sidecar namespaces as outputs', async () => {
+    const { dbPath } = await makeLegacyFixture();
+    const { dbPath: livePath } = await makeLegacyFixture();
+    const beforeHash = await sha256(dbPath);
+    const environment = {
+      BDC_DISPATCH_MIGRATION_SMOKE_TEST_KNOWN_LIVE_PATHS: JSON.stringify([livePath]),
+    };
+
+    for (const suffix of ['-wal', '-shm']) {
+      for (const [outputPath, expectedCode] of [
+        [`${dbPath}${suffix}`, 'migrated_copy_output_source_alias'],
+        [`${livePath}${suffix}`, 'migrated_copy_output_forbidden'],
+      ] as const) {
+        const result = await runCli(
+          [
+            '--source-copy',
+            dbPath,
+            '--expected-heartbeats',
+            '2',
+            '--migrated-copy-output',
+            outputPath,
+          ],
+          environment
+        );
+
+        expect(result.exitCode).not.toBe(0);
+        expect(result.stdout).toBe('');
+        expect(result.stderr).toContain(expectedCode);
+        expect(result.stderr).not.toContain(dbPath);
+        expect(result.stderr).not.toContain(livePath);
+        expect(await Bun.file(outputPath).exists()).toBe(false);
+        expect(await sha256(dbPath)).toBe(beforeHash);
+      }
+    }
+  });
+
+  test('rejects sidecar outputs reached through aliased source and known-live parents', async () => {
+    const { dir, dbPath } = await makeLegacyFixture();
+    const { dir: liveDir, dbPath: livePath } = await makeLegacyFixture();
+    const aliasRoot = await mkdtemp(join(tmpdir(), 'dispatch-sidecar-alias-test-'));
+    temporaryDirectories.push(aliasRoot);
+    const sourceParentAlias = join(aliasRoot, 'source-parent');
+    const liveParentAlias = join(aliasRoot, 'live-parent');
+    const directoryLinkType = process.platform === 'win32' ? 'junction' : 'dir';
+    await symlink(dir, sourceParentAlias, directoryLinkType);
+    await symlink(liveDir, liveParentAlias, directoryLinkType);
+    const beforeHash = await sha256(dbPath);
+    const environment = {
+      BDC_DISPATCH_MIGRATION_SMOKE_TEST_KNOWN_LIVE_PATHS: JSON.stringify([livePath]),
+    };
+
+    for (const [outputPath, expectedCode] of [
+      [join(sourceParentAlias, 'source-copy.db-wal'), 'migrated_copy_output_source_alias'],
+      [join(liveParentAlias, 'source-copy.db-shm'), 'migrated_copy_output_forbidden'],
+    ] as const) {
+      const result = await runCli(
+        [
+          '--source-copy',
+          dbPath,
+          '--expected-heartbeats',
+          '2',
+          '--migrated-copy-output',
+          outputPath,
+        ],
+        environment
+      );
+
+      expect(result.exitCode).not.toBe(0);
+      expect(result.stdout).toBe('');
+      expect(result.stderr).toContain(expectedCode);
+      expect(result.stderr).not.toContain(outputPath);
+      expect(result.stderr).not.toContain(dbPath);
+      expect(result.stderr).not.toContain(livePath);
+      expect(await Bun.file(outputPath).exists()).toBe(false);
+      expect(await sha256(dbPath)).toBe(beforeHash);
+    }
+  });
+
+  test('rejects a sidecar output beside a supplied source file alias', async () => {
+    const { dir, dbPath } = await makeLegacyFixture();
+    const sourceAliasPath = join(dir, 'source-file-alias.db');
+    const outputPath = `${sourceAliasPath}-wal`;
+    await symlink(dbPath, sourceAliasPath, 'file');
+    const beforeHash = await sha256(dbPath);
+
+    const result = await runCli([
+      '--source-copy',
+      sourceAliasPath,
+      '--expected-heartbeats',
+      '2',
+      '--migrated-copy-output',
+      outputPath,
+    ]);
+
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stdout).toBe('');
+    expect(result.stderr).toContain('migrated_copy_output_source_alias');
+    expect(result.stderr).not.toContain(sourceAliasPath);
+    expect(result.stderr).not.toContain(outputPath);
+    expect(await Bun.file(outputPath).exists()).toBe(false);
+    expect(await sha256(dbPath)).toBe(beforeHash);
+  });
+
+  test('rejects supplied raw copies with source WAL or SHM sidecars before export', async () => {
+    for (const suffix of ['-wal', '-shm']) {
+      const { dir, dbPath } = await makeLegacyFixture();
+      const sidecarPath = `${dbPath}${suffix}`;
+      const outputPath = join(dir, `must-not-export${suffix}.db`);
+      const sidecarSentinel = `SECRET-SOURCE-SIDECAR${suffix}`;
+      await Bun.write(sidecarPath, sidecarSentinel);
+      const beforeHash = await sha256(dbPath);
+
+      const result = await runCli([
+        '--source-copy',
+        dbPath,
+        '--expected-heartbeats',
+        '2',
+        '--migrated-copy-output',
+        outputPath,
+      ]);
+
+      expect(result.exitCode).not.toBe(0);
+      expect(result.stdout).toBe('');
+      expect(result.stderr).toContain('source_copy_sidecar_present');
+      expect(result.stderr).not.toContain(dbPath);
+      expect(result.stderr).not.toContain(sidecarPath);
+      expect(result.stderr).not.toContain(outputPath);
+      expect(result.stderr).not.toContain(sidecarSentinel);
+      expect(await sha256(dbPath)).toBe(beforeHash);
+      expect(await readFile(sidecarPath, 'utf8')).toBe(sidecarSentinel);
+      expect(await Bun.file(outputPath).exists()).toBe(false);
+    }
+  });
+
+  test('rejects a sidecar beside the supplied lexical source alias', async () => {
+    const { dir, dbPath } = await makeLegacyFixture();
+    const sourceAliasPath = join(dir, 'source-alias-input.db');
+    const aliasSidecarPath = `${sourceAliasPath}-wal`;
+    const outputPath = join(dir, 'must-not-export-alias-source.db');
+    const sidecarSentinel = 'SECRET-LEXICAL-SOURCE-SIDECAR';
+    await symlink(dbPath, sourceAliasPath, 'file');
+    await Bun.write(aliasSidecarPath, sidecarSentinel);
+    const beforeHash = await sha256(dbPath);
+
+    const result = await runCli([
+      '--source-copy',
+      sourceAliasPath,
+      '--expected-heartbeats',
+      '2',
+      '--migrated-copy-output',
+      outputPath,
+    ]);
+
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stdout).toBe('');
+    expect(result.stderr).toContain('source_copy_sidecar_present');
+    expect(result.stderr).not.toContain(sourceAliasPath);
+    expect(result.stderr).not.toContain(aliasSidecarPath);
+    expect(result.stderr).not.toContain(outputPath);
+    expect(result.stderr).not.toContain(sidecarSentinel);
+    expect(await sha256(dbPath)).toBe(beforeHash);
+    expect(await readFile(aliasSidecarPath, 'utf8')).toBe(sidecarSentinel);
+    expect(await Bun.file(outputPath).exists()).toBe(false);
+  });
+
+  test('rejects missing output parents and dangling output aliases before migration', async () => {
+    const { dir, dbPath } = await makeLegacyFixture();
+    const beforeHash = await sha256(dbPath);
+    const missingParentOutput = join(dir, 'missing-parent', 'output.db');
+    const danglingOutput = join(dir, 'dangling-output.db');
+    await symlink(join(dir, 'missing-target.db'), danglingOutput, 'file');
+
+    const missingParent = await runCli([
+      '--source-copy',
+      dbPath,
+      '--expected-heartbeats',
+      '2',
+      '--migrated-copy-output',
+      missingParentOutput,
+    ]);
+    const dangling = await runCli([
+      '--source-copy',
+      dbPath,
+      '--expected-heartbeats',
+      '2',
+      '--migrated-copy-output',
+      danglingOutput,
+    ]);
+
+    expect(missingParent.exitCode).not.toBe(0);
+    expect(missingParent.stdout).toBe('');
+    expect(missingParent.stderr).toContain('migrated_copy_output_unavailable');
+    expect(missingParent.stderr).not.toContain(missingParentOutput);
+    expect(dangling.exitCode).not.toBe(0);
+    expect(dangling.stdout).toBe('');
+    expect(dangling.stderr).toContain('migrated_copy_output_exists');
+    expect(dangling.stderr).not.toContain(danglingOutput);
+    expect((await lstat(danglingOutput)).isSymbolicLink()).toBe(true);
+    expect(await sha256(dbPath)).toBe(beforeHash);
+    expect(await Bun.file(missingParentOutput).exists()).toBe(false);
   });
 
   test('does not export when migration validation fails', async () => {

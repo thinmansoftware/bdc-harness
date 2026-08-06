@@ -1,12 +1,23 @@
 import { Database, constants } from 'bun:sqlite';
 import { createHash, randomUUID } from 'crypto';
 import { constants as fileSystemConstants } from 'fs';
-import { copyFile, link, mkdtemp, readFile, realpath, rm, stat, writeFile } from 'fs/promises';
+import {
+  copyFile,
+  link,
+  lstat,
+  mkdtemp,
+  readFile,
+  realpath,
+  rm,
+  stat,
+  writeFile,
+} from 'fs/promises';
 import { tmpdir } from 'os';
 import { basename, dirname, join, resolve } from 'path';
 import { pathToFileURL } from 'url';
 
 const BUILT_IN_LIVE_PATHS = ['/.archon/archon.db', '/opt/bdc/archon-data/archon.db'] as const;
+const SQLITE_SIDECAR_SUFFIXES = ['-wal', '-shm'] as const;
 const PHASE_0_NULLABLE_COLUMNS = [
   'task_outcome',
   'acknowledged_at',
@@ -281,6 +292,61 @@ function isNotFoundError(error: unknown): boolean {
   );
 }
 
+function sqliteDatabaseNamespace(path: string): string[] {
+  return [path, ...SQLITE_SIDECAR_SUFFIXES.map(suffix => `${path}${suffix}`)];
+}
+
+async function canonicalPathThroughExistingParent(path: string): Promise<string> {
+  let existingPath = resolve(path);
+  const missingSegments: string[] = [];
+  while (true) {
+    try {
+      return join(await realpath(existingPath), ...missingSegments);
+    } catch (error: unknown) {
+      if (!isNotFoundError(error)) {
+        throw new SmokeFailure('migrated_copy_output_unavailable');
+      }
+    }
+
+    const parent = dirname(existingPath);
+    if (parent === existingPath) {
+      throw new SmokeFailure('migrated_copy_output_unavailable');
+    }
+    missingSegments.unshift(basename(existingPath));
+    existingPath = parent;
+  }
+}
+
+async function canonicalOutputCandidate(outputPath: string): Promise<string> {
+  const resolvedOutput = resolve(outputPath);
+  try {
+    return join(await realpath(dirname(resolvedOutput)), basename(resolvedOutput));
+  } catch {
+    throw new SmokeFailure('migrated_copy_output_unavailable');
+  }
+}
+
+async function assertSourceCopyHasNoSidecars(
+  suppliedSource: string,
+  canonicalSource: string
+): Promise<void> {
+  const sourcePaths = [resolve(suppliedSource), canonicalSource].filter(
+    (path, index, paths) =>
+      paths.findIndex(candidate => comparisonPath(candidate) === comparisonPath(path)) === index
+  );
+  for (const sourcePath of sourcePaths) {
+    for (const sidecarPath of sqliteDatabaseNamespace(sourcePath).slice(1)) {
+      try {
+        await lstat(sidecarPath);
+      } catch (error: unknown) {
+        if (isNotFoundError(error)) continue;
+        throw new SmokeFailure('source_copy_sidecar_present');
+      }
+      throw new SmokeFailure('source_copy_sidecar_present');
+    }
+  }
+}
+
 async function sameFileIdentity(left: string, right: string): Promise<boolean> {
   try {
     const [leftInfo, rightInfo] = await Promise.all([stat(left), stat(right)]);
@@ -292,6 +358,7 @@ async function sameFileIdentity(left: string, right: string): Promise<boolean> {
 
 async function validateMigratedCopyOutputPath(
   outputPath: string,
+  suppliedSource: string,
   canonicalSource: string
 ): Promise<string> {
   const knownPaths = configuredKnownLivePaths();
@@ -299,19 +366,37 @@ async function validateMigratedCopyOutputPath(
     throw new SmokeFailure('migrated_copy_output_forbidden');
   }
 
-  const resolvedOutput = comparisonPath(outputPath);
-  if (resolvedOutput === comparisonPath(canonicalSource)) {
+  const canonicalCandidate = await canonicalOutputCandidate(outputPath);
+  const outputCandidates = [comparisonPath(outputPath), comparisonPath(canonicalCandidate)];
+  const sourceNamespace = [resolve(suppliedSource), canonicalSource]
+    .flatMap(sqliteDatabaseNamespace)
+    .map(comparisonPath);
+  if (outputCandidates.some(candidate => sourceNamespace.includes(candidate))) {
     throw new SmokeFailure('migrated_copy_output_source_alias');
   }
-  if (knownPaths.map(comparisonPath).includes(resolvedOutput)) {
-    throw new SmokeFailure('migrated_copy_output_forbidden');
+
+  for (const knownPath of knownPaths) {
+    const canonicalKnownPath = await canonicalPathThroughExistingParent(knownPath);
+    const knownNamespace = [knownPath, canonicalKnownPath]
+      .flatMap(sqliteDatabaseNamespace)
+      .map(comparisonPath);
+    if (outputCandidates.some(candidate => knownNamespace.includes(candidate))) {
+      throw new SmokeFailure('migrated_copy_output_forbidden');
+    }
+  }
+
+  try {
+    await lstat(canonicalCandidate);
+  } catch (error: unknown) {
+    if (isNotFoundError(error)) return canonicalCandidate;
+    throw new SmokeFailure('migrated_copy_output_unavailable');
   }
 
   let canonicalOutput: string;
   try {
-    canonicalOutput = await realpath(outputPath);
+    canonicalOutput = await realpath(canonicalCandidate);
   } catch (error: unknown) {
-    if (isNotFoundError(error)) return outputPath;
+    if (isNotFoundError(error)) throw new SmokeFailure('migrated_copy_output_exists');
     throw new SmokeFailure('migrated_copy_output_unavailable');
   }
 
@@ -322,7 +407,7 @@ async function validateMigratedCopyOutputPath(
     throw new SmokeFailure('migrated_copy_output_source_alias');
   }
 
-  for (const knownPath of knownPaths) {
+  for (const knownPath of knownPaths.flatMap(sqliteDatabaseNamespace)) {
     try {
       const canonicalKnownPath = await realpath(knownPath);
       if (
@@ -840,8 +925,13 @@ function publicFailure(error: unknown): SmokeFailure {
 export async function runDispatchMigrationSmoke(args: string[]): Promise<string> {
   const options = parseArguments(args);
   const canonicalSource = await canonicalSafeSourcePath(options.sourceCopy);
+  await assertSourceCopyHasNoSidecars(options.sourceCopy, canonicalSource);
   const migratedCopyOutput = options.migratedCopyOutput
-    ? await validateMigratedCopyOutputPath(options.migratedCopyOutput, canonicalSource)
+    ? await validateMigratedCopyOutputPath(
+        options.migratedCopyOutput,
+        options.sourceCopy,
+        canonicalSource
+      )
     : null;
   const sourceHashBefore = await sha256File(canonicalSource);
   let tempDirectory: string | null = null;
@@ -856,8 +946,11 @@ export async function runDispatchMigrationSmoke(args: string[]): Promise<string>
     }
     const tempPath = join(tempDirectory, 'migration-copy.db');
     try {
+      await assertSourceCopyHasNoSidecars(options.sourceCopy, canonicalSource);
       await copyFile(canonicalSource, tempPath);
-    } catch {
+      await assertSourceCopyHasNoSidecars(options.sourceCopy, canonicalSource);
+    } catch (error: unknown) {
+      if (error instanceof SmokeFailure) throw error;
       throw new SmokeFailure('temporary_copy_failed');
     }
 
@@ -890,10 +983,12 @@ export async function runDispatchMigrationSmoke(args: string[]): Promise<string>
       throw new SmokeFailure('migration_second_run_not_idempotent');
     }
 
+    await assertSourceCopyHasNoSidecars(options.sourceCopy, canonicalSource);
     const sourceHashAfter = await sha256File(canonicalSource);
     if (sourceHashAfter !== sourceHashBefore) throw new SmokeFailure('source_copy_changed');
     if (migratedCopyOutput) {
       await checkpointValidatedCopy(tempPath);
+      await assertSourceCopyHasNoSidecars(options.sourceCopy, canonicalSource);
       await exportMigratedCopy(tempPath, migratedCopyOutput);
     }
     output =
