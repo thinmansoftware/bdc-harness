@@ -1,9 +1,9 @@
 import { Database, constants } from 'bun:sqlite';
-import { createHash } from 'crypto';
+import { createHash, randomUUID } from 'crypto';
 import { constants as fileSystemConstants } from 'fs';
-import { copyFile, mkdtemp, readFile, realpath, rm, stat } from 'fs/promises';
+import { copyFile, link, mkdtemp, readFile, realpath, rm, stat, writeFile } from 'fs/promises';
 import { tmpdir } from 'os';
-import { join, resolve } from 'path';
+import { basename, dirname, join, resolve } from 'path';
 import { pathToFileURL } from 'url';
 
 const BUILT_IN_LIVE_PATHS = ['/.archon/archon.db', '/opt/bdc/archon-data/archon.db'] as const;
@@ -50,6 +50,12 @@ interface SmokeArguments {
 
 interface CountRow {
   count: number;
+}
+
+interface WalCheckpointRow {
+  busy: number;
+  log: number;
+  checkpointed: number;
 }
 
 interface TableInfoRow {
@@ -745,6 +751,88 @@ function induceTestDrift(path: string): void {
   }
 }
 
+async function checkpointValidatedCopy(path: string): Promise<void> {
+  if (
+    process.env.NODE_ENV === 'test' &&
+    process.env.BDC_DISPATCH_MIGRATION_SMOKE_TEST_FAIL_CHECKPOINT === '1'
+  ) {
+    throw new SmokeFailure('migrated_copy_checkpoint_failed');
+  }
+  const database = new Database(path);
+  try {
+    const row = database.query<WalCheckpointRow, []>('PRAGMA wal_checkpoint(TRUNCATE)').get();
+    if (row?.busy !== 0 || (row?.log !== -1 && row?.log !== row?.checkpointed)) {
+      throw new SmokeFailure('migrated_copy_checkpoint_failed');
+    }
+  } catch (error: unknown) {
+    throw error instanceof SmokeFailure
+      ? error
+      : new SmokeFailure('migrated_copy_checkpoint_failed');
+  } finally {
+    database.close();
+  }
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    if (typeof Bun.gc === 'function') Bun.gc(true);
+    try {
+      await Promise.all([rm(`${path}-wal`, { force: true }), rm(`${path}-shm`, { force: true })]);
+    } catch {
+      // Retry after SQLite resources have had a chance to release file handles.
+    }
+    if (!(await Bun.file(`${path}-wal`).exists()) && !(await Bun.file(`${path}-shm`).exists())) {
+      return;
+    }
+    if (attempt < 2) await Bun.sleep(25);
+  }
+  throw new SmokeFailure('migrated_copy_checkpoint_failed');
+}
+
+function exportStagingPath(outputPath: string): string {
+  return join(dirname(outputPath), `.${basename(outputPath)}.${randomUUID()}.partial`);
+}
+
+async function exportMigratedCopy(tempPath: string, outputPath: string): Promise<void> {
+  const stagingPath = exportStagingPath(outputPath);
+  let outputLinked = false;
+  try {
+    if (
+      process.env.NODE_ENV === 'test' &&
+      process.env.BDC_DISPATCH_MIGRATION_SMOKE_TEST_FAIL_EXPORT_DURING_COPY === '1'
+    ) {
+      await writeFile(stagingPath, 'partial', { flag: 'wx' });
+      throw new Error('induced_partial_export_failure');
+    }
+    await copyFile(tempPath, stagingPath, fileSystemConstants.COPYFILE_EXCL);
+    await link(stagingPath, outputPath);
+    outputLinked = true;
+    if (
+      process.env.NODE_ENV === 'test' &&
+      process.env.BDC_DISPATCH_MIGRATION_SMOKE_TEST_FAIL_EXPORT_AFTER_COPY === '1'
+    ) {
+      throw new Error('induced_export_failure');
+    }
+    await rm(stagingPath, { force: false });
+  } catch {
+    let cleanupFailed = false;
+    if (outputLinked) {
+      try {
+        await rm(outputPath, { force: false });
+      } catch {
+        cleanupFailed = true;
+      }
+    }
+    try {
+      await rm(stagingPath, { force: true });
+    } catch {
+      cleanupFailed = true;
+    }
+    throw new SmokeFailure(
+      cleanupFailed
+        ? 'migrated_copy_export_failed;migrated_copy_cleanup_failed'
+        : 'migrated_copy_export_failed'
+    );
+  }
+}
+
 function publicFailure(error: unknown): SmokeFailure {
   return error instanceof SmokeFailure ? error : new SmokeFailure('migration_smoke_failed');
 }
@@ -757,7 +845,6 @@ export async function runDispatchMigrationSmoke(args: string[]): Promise<string>
     : null;
   const sourceHashBefore = await sha256File(canonicalSource);
   let tempDirectory: string | null = null;
-  let migratedCopyCreated = false;
   let output: string | null = null;
   let primaryError: SmokeFailure | null = null;
 
@@ -806,18 +893,8 @@ export async function runDispatchMigrationSmoke(args: string[]): Promise<string>
     const sourceHashAfter = await sha256File(canonicalSource);
     if (sourceHashAfter !== sourceHashBefore) throw new SmokeFailure('source_copy_changed');
     if (migratedCopyOutput) {
-      try {
-        await copyFile(tempPath, migratedCopyOutput, fileSystemConstants.COPYFILE_EXCL);
-        migratedCopyCreated = true;
-        if (
-          process.env.NODE_ENV === 'test' &&
-          process.env.BDC_DISPATCH_MIGRATION_SMOKE_TEST_FAIL_EXPORT_AFTER_COPY === '1'
-        ) {
-          throw new Error('induced_export_failure');
-        }
-      } catch {
-        throw new SmokeFailure('migrated_copy_export_failed');
-      }
+      await checkpointValidatedCopy(tempPath);
+      await exportMigratedCopy(tempPath, migratedCopyOutput);
     }
     output =
       `PASS rows_before=${before.rows} rows_after=${first.rows} ` +
@@ -825,15 +902,6 @@ export async function runDispatchMigrationSmoke(args: string[]): Promise<string>
       (migratedCopyOutput ? ' migrated_copy_ready=true' : '');
   } catch (error: unknown) {
     primaryError = publicFailure(error);
-  }
-
-  let migratedCopyCleanupFailed = false;
-  if (primaryError && migratedCopyCreated && migratedCopyOutput) {
-    try {
-      await rm(migratedCopyOutput, { force: false });
-    } catch {
-      migratedCopyCleanupFailed = true;
-    }
   }
 
   let cleanupFailed = false;
@@ -856,15 +924,10 @@ export async function runDispatchMigrationSmoke(args: string[]): Promise<string>
       }
     }
   }
-  if (primaryError && (migratedCopyCleanupFailed || cleanupFailed)) {
-    const cleanupFailures = [
-      migratedCopyCleanupFailed ? 'migrated_copy_cleanup_failed' : null,
-      cleanupFailed ? 'temporary_cleanup_failed' : null,
-    ].filter((value): value is string => value !== null);
-    throw new SmokeFailure(`${primaryError.code};${cleanupFailures.join(';')}`);
+  if (primaryError && cleanupFailed) {
+    throw new SmokeFailure(`${primaryError.code};temporary_cleanup_failed`);
   }
   if (primaryError) throw primaryError;
-  if (migratedCopyCleanupFailed) throw new SmokeFailure('migrated_copy_cleanup_failed');
   if (cleanupFailed) throw new SmokeFailure('temporary_cleanup_failed');
   if (!output) throw new SmokeFailure('migration_smoke_failed');
   return output;

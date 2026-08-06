@@ -495,6 +495,35 @@ describe('dispatch-migration-smoke CLI', () => {
     expect(await Bun.file(outputPath).exists()).toBe(false);
   });
 
+  test('does not export when the validated copy cannot checkpoint WAL state', async () => {
+    const { dir, dbPath } = await makeLegacyFixture();
+    const outputPath = join(dir, 'checkpoint-must-not-export.db');
+    const result = await runCli(
+      ['--source-copy', dbPath, '--expected-heartbeats', '2', '--migrated-copy-output', outputPath],
+      { BDC_DISPATCH_MIGRATION_SMOKE_TEST_FAIL_CHECKPOINT: '1' }
+    );
+
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stdout).toBe('');
+    expect(result.stderr).toContain('migrated_copy_checkpoint_failed');
+    expect(await Bun.file(outputPath).exists()).toBe(false);
+  });
+
+  test('removes an in-progress partial export when copy creation fails', async () => {
+    const { dir, dbPath } = await makeLegacyFixture();
+    const outputPath = join(dir, 'partial-during-copy.db');
+    const result = await runCli(
+      ['--source-copy', dbPath, '--expected-heartbeats', '2', '--migrated-copy-output', outputPath],
+      { BDC_DISPATCH_MIGRATION_SMOKE_TEST_FAIL_EXPORT_DURING_COPY: '1' }
+    );
+
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stdout).toBe('');
+    expect(result.stderr).toContain('migrated_copy_export_failed');
+    expect(await Bun.file(outputPath).exists()).toBe(false);
+    expect(await readdir(dir)).toEqual(['source-copy.db']);
+  });
+
   test('removes a partial migrated-copy output when export fails after the copy', async () => {
     const { dir, dbPath } = await makeLegacyFixture();
     const outputPath = join(dir, 'partial-output.db');
