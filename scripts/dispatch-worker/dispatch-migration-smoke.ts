@@ -1,5 +1,6 @@
 import { Database, constants } from 'bun:sqlite';
 import { createHash } from 'crypto';
+import { constants as fileSystemConstants } from 'fs';
 import { copyFile, mkdtemp, readFile, realpath, rm, stat } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join, resolve } from 'path';
@@ -44,6 +45,7 @@ const KNOWN_PRINCIPALS = [
 interface SmokeArguments {
   sourceCopy: string;
   expectedHeartbeats: number;
+  migratedCopyOutput: string | null;
 }
 
 interface CountRow {
@@ -140,6 +142,7 @@ class SmokeFailure extends Error {
 function parseArguments(args: string[]): SmokeArguments {
   let sourceCopy: string | null = null;
   let expectedHeartbeatsText: string | null = null;
+  let migratedCopyOutput: string | null = null;
 
   for (let index = 0; index < args.length; index += 1) {
     const argument = args[index];
@@ -151,6 +154,14 @@ function parseArguments(args: string[]): SmokeArguments {
     }
     if (argument === '--expected-heartbeats' && value) {
       expectedHeartbeatsText = value;
+      index += 1;
+      continue;
+    }
+    if (argument === '--migrated-copy-output') {
+      if (!value || value.startsWith('--')) {
+        throw new SmokeFailure('--migrated-copy-output requires a path');
+      }
+      migratedCopyOutput = value;
       index += 1;
       continue;
     }
@@ -168,7 +179,7 @@ function parseArguments(args: string[]): SmokeArguments {
   if (!Number.isSafeInteger(expectedHeartbeats) || expectedHeartbeats < 0) {
     throw new SmokeFailure('--expected-heartbeats must be a non-negative integer');
   }
-  return { sourceCopy, expectedHeartbeats };
+  return { sourceCopy, expectedHeartbeats, migratedCopyOutput };
 }
 
 function normalizeLiteralPath(path: string): string {
@@ -253,6 +264,72 @@ async function canonicalSafeSourcePath(source: string): Promise<string> {
     }
   }
   return canonicalSource;
+}
+
+function isNotFoundError(error: unknown): boolean {
+  return (
+    typeof error === 'object' &&
+    error !== null &&
+    'code' in error &&
+    (error as { code?: unknown }).code === 'ENOENT'
+  );
+}
+
+async function sameFileIdentity(left: string, right: string): Promise<boolean> {
+  try {
+    const [leftInfo, rightInfo] = await Promise.all([stat(left), stat(right)]);
+    return leftInfo.dev === rightInfo.dev && leftInfo.ino === rightInfo.ino;
+  } catch {
+    return false;
+  }
+}
+
+async function validateMigratedCopyOutputPath(
+  outputPath: string,
+  canonicalSource: string
+): Promise<string> {
+  const knownPaths = configuredKnownLivePaths();
+  if (isImmediateLivePath(outputPath, knownPaths)) {
+    throw new SmokeFailure('migrated_copy_output_forbidden');
+  }
+
+  const resolvedOutput = comparisonPath(outputPath);
+  if (resolvedOutput === comparisonPath(canonicalSource)) {
+    throw new SmokeFailure('migrated_copy_output_source_alias');
+  }
+  if (knownPaths.map(comparisonPath).includes(resolvedOutput)) {
+    throw new SmokeFailure('migrated_copy_output_forbidden');
+  }
+
+  let canonicalOutput: string;
+  try {
+    canonicalOutput = await realpath(outputPath);
+  } catch (error: unknown) {
+    if (isNotFoundError(error)) return outputPath;
+    throw new SmokeFailure('migrated_copy_output_unavailable');
+  }
+
+  if (comparisonPath(canonicalOutput) === comparisonPath(canonicalSource)) {
+    throw new SmokeFailure('migrated_copy_output_source_alias');
+  }
+  if (await sameFileIdentity(canonicalOutput, canonicalSource)) {
+    throw new SmokeFailure('migrated_copy_output_source_alias');
+  }
+
+  for (const knownPath of knownPaths) {
+    try {
+      const canonicalKnownPath = await realpath(knownPath);
+      if (
+        comparisonPath(canonicalOutput) === comparisonPath(canonicalKnownPath) ||
+        (await sameFileIdentity(canonicalOutput, canonicalKnownPath))
+      ) {
+        throw new SmokeFailure('migrated_copy_output_forbidden');
+      }
+    } catch (error: unknown) {
+      if (error instanceof SmokeFailure) throw error;
+    }
+  }
+  throw new SmokeFailure('migrated_copy_output_exists');
 }
 
 async function sha256File(path: string): Promise<string> {
@@ -675,8 +752,12 @@ function publicFailure(error: unknown): SmokeFailure {
 export async function runDispatchMigrationSmoke(args: string[]): Promise<string> {
   const options = parseArguments(args);
   const canonicalSource = await canonicalSafeSourcePath(options.sourceCopy);
+  const migratedCopyOutput = options.migratedCopyOutput
+    ? await validateMigratedCopyOutputPath(options.migratedCopyOutput, canonicalSource)
+    : null;
   const sourceHashBefore = await sha256File(canonicalSource);
   let tempDirectory: string | null = null;
+  let migratedCopyCreated = false;
   let output: string | null = null;
   let primaryError: SmokeFailure | null = null;
 
@@ -724,11 +805,35 @@ export async function runDispatchMigrationSmoke(args: string[]): Promise<string>
 
     const sourceHashAfter = await sha256File(canonicalSource);
     if (sourceHashAfter !== sourceHashBefore) throw new SmokeFailure('source_copy_changed');
+    if (migratedCopyOutput) {
+      try {
+        await copyFile(tempPath, migratedCopyOutput, fileSystemConstants.COPYFILE_EXCL);
+        migratedCopyCreated = true;
+        if (
+          process.env.NODE_ENV === 'test' &&
+          process.env.BDC_DISPATCH_MIGRATION_SMOKE_TEST_FAIL_EXPORT_AFTER_COPY === '1'
+        ) {
+          throw new Error('induced_export_failure');
+        }
+      } catch {
+        throw new SmokeFailure('migrated_copy_export_failed');
+      }
+    }
     output =
       `PASS rows_before=${before.rows} rows_after=${first.rows} ` +
-      `heartbeat_rows=${first.heartbeatRows} source_unchanged=true second_run_idempotent=true`;
+      `heartbeat_rows=${first.heartbeatRows} source_unchanged=true second_run_idempotent=true` +
+      (migratedCopyOutput ? ' migrated_copy_ready=true' : '');
   } catch (error: unknown) {
     primaryError = publicFailure(error);
+  }
+
+  let migratedCopyCleanupFailed = false;
+  if (primaryError && migratedCopyCreated && migratedCopyOutput) {
+    try {
+      await rm(migratedCopyOutput, { force: false });
+    } catch {
+      migratedCopyCleanupFailed = true;
+    }
   }
 
   let cleanupFailed = false;
@@ -751,10 +856,15 @@ export async function runDispatchMigrationSmoke(args: string[]): Promise<string>
       }
     }
   }
-  if (primaryError && cleanupFailed) {
-    throw new SmokeFailure(`${primaryError.code};temporary_cleanup_failed`);
+  if (primaryError && (migratedCopyCleanupFailed || cleanupFailed)) {
+    const cleanupFailures = [
+      migratedCopyCleanupFailed ? 'migrated_copy_cleanup_failed' : null,
+      cleanupFailed ? 'temporary_cleanup_failed' : null,
+    ].filter((value): value is string => value !== null);
+    throw new SmokeFailure(`${primaryError.code};${cleanupFailures.join(';')}`);
   }
   if (primaryError) throw primaryError;
+  if (migratedCopyCleanupFailed) throw new SmokeFailure('migrated_copy_cleanup_failed');
   if (cleanupFailed) throw new SmokeFailure('temporary_cleanup_failed');
   if (!output) throw new SmokeFailure('migration_smoke_failed');
   return output;

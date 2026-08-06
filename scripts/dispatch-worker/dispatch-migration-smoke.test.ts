@@ -1,12 +1,14 @@
-import { Database } from 'bun:sqlite';
+import { Database, constants } from 'bun:sqlite';
 import { afterEach, describe, expect, test } from 'bun:test';
 import { createHash } from 'crypto';
 import { link, mkdtemp, readFile, readdir, rm, symlink } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join } from 'path';
+import { pathToFileURL } from 'url';
 
 const temporaryDirectories: string[] = [];
 const scriptPath = join(import.meta.dir, 'dispatch-migration-smoke.ts');
+const reportScriptPath = join(import.meta.dir, 'report-unroutable.ts');
 
 interface CliResult {
   exitCode: number;
@@ -123,6 +125,22 @@ async function sha256(path: string): Promise<string> {
   return createHash('sha256')
     .update(await readFile(path))
     .digest('hex');
+}
+
+async function runReport(dbPath: string): Promise<CliResult> {
+  const child = Bun.spawn({
+    cmd: [process.execPath, reportScriptPath, '--db', dbPath, '--format', 'json'],
+    cwd: join(import.meta.dir, '..', '..'),
+    stdout: 'pipe',
+    stderr: 'pipe',
+    env: { ...process.env, LOG_LEVEL: 'fatal', NODE_ENV: 'test' },
+  });
+  const [exitCode, stdout, stderr] = await Promise.all([
+    child.exited,
+    new Response(child.stdout).text(),
+    new Response(child.stderr).text(),
+  ]);
+  return { exitCode, stdout, stderr };
 }
 
 afterEach(async () => {
@@ -321,5 +339,174 @@ describe('dispatch-migration-smoke CLI', () => {
     expect(result.stderr).not.toContain(tempParent);
     expect(result.stderr).not.toContain('CUSTOMER-SECRET-DISPATCH-SMOKE');
     expect(result.stderr).not.toContain('SECRET-');
+  });
+
+  test('exports a validated migrated copy without changing the source or leaving sidecars', async () => {
+    const { dir, dbPath } = await makeLegacyFixture();
+    const outputPath = join(dir, 'migrated-report-copy.db');
+    const beforeHash = await sha256(dbPath);
+
+    const result = await runCli([
+      '--source-copy',
+      dbPath,
+      '--expected-heartbeats',
+      '2',
+      '--migrated-copy-output',
+      outputPath,
+    ]);
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stderr).not.toContain('SECRET-');
+    expect(result.stdout.trim()).toBe(
+      'PASS rows_before=4 rows_after=4 heartbeat_rows=2 source_unchanged=true second_run_idempotent=true migrated_copy_ready=true'
+    );
+    expect(await sha256(dbPath)).toBe(beforeHash);
+    const outputUrl = pathToFileURL(outputPath);
+    outputUrl.searchParams.set('mode', 'ro');
+    outputUrl.searchParams.set('immutable', '1');
+    const output = new Database(
+      outputUrl.href,
+      constants.SQLITE_OPEN_READONLY | constants.SQLITE_OPEN_URI
+    );
+    expect(
+      output
+        .query<{ name: string }, []>("PRAGMA table_info('agent_dispatch_messages')")
+        .all()
+        .map(row => row.name)
+    ).toContain('priority');
+    expect(
+      output
+        .query<
+          { count: number },
+          []
+        >("SELECT COUNT(*) AS count FROM sqlite_master WHERE type = 'table' AND name = 'dispatch_principals'")
+        .get()?.count
+    ).toBe(1);
+    output.close();
+    const entries = await readdir(dir);
+    expect(entries).not.toContain('migrated-report-copy.db-wal');
+    expect(entries).not.toContain('migrated-report-copy.db-shm');
+  });
+
+  test('exports a database that report-unroutable can read without writing sidecars', async () => {
+    const { dir, dbPath } = await makeLegacyFixture();
+    const outputPath = join(dir, 'report-compatible-copy.db');
+
+    const smoke = await runCli([
+      '--source-copy',
+      dbPath,
+      '--expected-heartbeats',
+      '2',
+      '--migrated-copy-output',
+      outputPath,
+    ]);
+    const report = await runReport(outputPath);
+
+    expect(smoke.exitCode).toBe(0);
+    expect(report.exitCode).toBe(0);
+    expect(report.stderr).not.toContain('SECRET-');
+    expect(JSON.parse(report.stdout)).toEqual({ count: 0, findings: [] });
+    const entries = await readdir(dir);
+    expect(entries).not.toContain('report-compatible-copy.db-wal');
+    expect(entries).not.toContain('report-compatible-copy.db-shm');
+  });
+
+  test('rejects a missing migrated-copy output value and preserves a colliding output', async () => {
+    const { dir, dbPath } = await makeLegacyFixture();
+    const missing = await runCli([
+      '--source-copy',
+      dbPath,
+      '--expected-heartbeats',
+      '2',
+      '--migrated-copy-output',
+    ]);
+    const outputPath = join(dir, 'already-there.db');
+    await Bun.write(outputPath, 'existing-output');
+
+    const collision = await runCli([
+      '--source-copy',
+      dbPath,
+      '--expected-heartbeats',
+      '2',
+      '--migrated-copy-output',
+      outputPath,
+    ]);
+
+    expect(missing.exitCode).not.toBe(0);
+    expect(missing.stdout).toBe('');
+    expect(missing.stderr).toContain('--migrated-copy-output requires a path');
+    expect(collision.exitCode).not.toBe(0);
+    expect(collision.stdout).toBe('');
+    expect(collision.stderr).toContain('migrated_copy_output_exists');
+    expect(await readFile(outputPath, 'utf8')).toBe('existing-output');
+  });
+
+  test('rejects the source database and a hardlink alias as migrated-copy outputs', async () => {
+    const { dir, dbPath } = await makeLegacyFixture();
+    const sourceAliasPath = join(dir, 'source-alias.db');
+    await link(dbPath, sourceAliasPath);
+
+    for (const outputPath of [dbPath, sourceAliasPath]) {
+      const result = await runCli([
+        '--source-copy',
+        dbPath,
+        '--expected-heartbeats',
+        '2',
+        '--migrated-copy-output',
+        outputPath,
+      ]);
+      expect(result.exitCode).not.toBe(0);
+      expect(result.stdout).toBe('');
+      expect(result.stderr).toContain('migrated_copy_output_source_alias');
+      expect(result.stderr).not.toContain(outputPath);
+    }
+  });
+
+  test('rejects a configured live database path as the migrated-copy output', async () => {
+    const { dbPath } = await makeLegacyFixture();
+    const { dbPath: livePath } = await makeLegacyFixture();
+    const result = await runCli(
+      ['--source-copy', dbPath, '--expected-heartbeats', '2', '--migrated-copy-output', livePath],
+      { BDC_DISPATCH_MIGRATION_SMOKE_TEST_KNOWN_LIVE_PATHS: JSON.stringify([livePath]) }
+    );
+
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stdout).toBe('');
+    expect(result.stderr).toContain('migrated_copy_output_forbidden');
+    expect(result.stderr).not.toContain(livePath);
+  });
+
+  test('does not export when migration validation fails', async () => {
+    const { dir, dbPath } = await makeLegacyFixture();
+    const outputPath = join(dir, 'must-not-exist.db');
+
+    const result = await runCli([
+      '--source-copy',
+      dbPath,
+      '--expected-heartbeats',
+      '3',
+      '--migrated-copy-output',
+      outputPath,
+    ]);
+
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stdout).toBe('');
+    expect(result.stderr).toContain('expected 3 heartbeat rows, found 2');
+    expect(await Bun.file(outputPath).exists()).toBe(false);
+  });
+
+  test('removes a partial migrated-copy output when export fails after the copy', async () => {
+    const { dir, dbPath } = await makeLegacyFixture();
+    const outputPath = join(dir, 'partial-output.db');
+    const result = await runCli(
+      ['--source-copy', dbPath, '--expected-heartbeats', '2', '--migrated-copy-output', outputPath],
+      { BDC_DISPATCH_MIGRATION_SMOKE_TEST_FAIL_EXPORT_AFTER_COPY: '1' }
+    );
+
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stdout).toBe('');
+    expect(result.stderr).toContain('migrated_copy_export_failed');
+    expect(result.stderr).not.toContain(outputPath);
+    expect(await Bun.file(outputPath).exists()).toBe(false);
   });
 });
