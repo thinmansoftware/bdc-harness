@@ -329,11 +329,12 @@ export async function listMessages(filters: {
   const clauses: string[] = [];
   const params: unknown[] = [];
   if (filters.recipient) {
-    params.push(filters.recipient);
+    const canonicalRecipient = canonicalizePrincipal(filters.recipient);
+    params.push(canonicalRecipient);
     const recipientParam = `$${params.length}`;
     if (filters.allowBoardAlias) {
       const resolved = await resolveDispatchRecipient('board');
-      if (resolved.ok && resolved.recipient === filters.recipient) {
+      if (resolved.ok && resolved.recipient === canonicalRecipient) {
         clauses.push(
           `(recipient = ${recipientParam} OR (recipient_alias = 'board' AND status = 'queued'))`
         );

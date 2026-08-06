@@ -209,6 +209,21 @@ describe('dispatch db', () => {
     });
   });
 
+  test('canonicalizes concrete recipient filters before listing messages', async () => {
+    const message = await createMessage({
+      correlation_id: 'corr-canonical-list-filter',
+      idempotency_key: 'idem-canonical-list-filter',
+      task_type: 'agent_message',
+      sender: 'xo',
+      recipient: 'grok',
+      body: 'Canonical list filter message.',
+    });
+
+    const listed = await listMessages({ recipient: ' Grok ' });
+
+    expect(listed.map(item => item.id)).toEqual([message.id]);
+  });
+
   test('guards new recipients while retaining idempotent creates and board metadata', async () => {
     const original = await createMessage({
       correlation_id: 'corr-idempotent-active',
@@ -1126,7 +1141,7 @@ describe('dispatch db', () => {
     });
 
     const listed = await import('./dispatch').then(module =>
-      module.listMessages({ recipient: 'claude', status: 'queued', allowBoardAlias: true })
+      module.listMessages({ recipient: ' Claude ', status: 'queued', allowBoardAlias: true })
     );
     expect(listed.map(item => item.id)).toContain(message.id);
 
