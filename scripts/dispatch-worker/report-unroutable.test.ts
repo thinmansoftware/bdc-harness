@@ -14,7 +14,10 @@ interface CliResult {
   stderr: string;
 }
 
-async function makeFixture(): Promise<{ dir: string; dbPath: string }> {
+async function makeFixture(options: { walMode?: boolean } = {}): Promise<{
+  dir: string;
+  dbPath: string;
+}> {
   const dir = await mkdtemp(join(tmpdir(), 'report-unroutable-test-'));
   temporaryDirectories.push(dir);
   const dbPath = join(dir, 'dispatch.db');
@@ -92,6 +95,7 @@ async function makeFixture(): Promise<{ dir: string; dbPath: string }> {
     'SECRET-board-body'
   );
   insert.finalize();
+  if (options.walMode) db.run('PRAGMA journal_mode = WAL');
   db.close();
   return { dir, dbPath };
 }
@@ -157,6 +161,18 @@ describe('report-unroutable CLI', () => {
 
   test('leaves database bytes unchanged and creates no WAL or SHM sidecars', async () => {
     const { dir, dbPath } = await makeFixture();
+    const beforeHash = await sha256(dbPath);
+
+    const result = await runCli(['--db', dbPath, '--format', 'json']);
+
+    expect(result.exitCode).toBe(0);
+    expect(await sha256(dbPath)).toBe(beforeHash);
+    expect(await readdir(dir)).toEqual(['dispatch.db']);
+  });
+
+  test('does not create sidecars when the source database retains WAL journal mode', async () => {
+    const { dir, dbPath } = await makeFixture({ walMode: true });
+    expect(await readdir(dir)).toEqual(['dispatch.db']);
     const beforeHash = await sha256(dbPath);
 
     const result = await runCli(['--db', dbPath, '--format', 'json']);

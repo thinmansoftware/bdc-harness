@@ -1,4 +1,5 @@
 import { Database, constants, type SQLQueryBindings } from 'bun:sqlite';
+import { pathToFileURL } from 'node:url';
 import {
   listUnroutableQueuedMessages,
   type DispatchQueryExecutor,
@@ -58,7 +59,13 @@ function createReadOnlyQuery(database: Database): DispatchQueryExecutor {
 
 export async function runReportUnroutable(args: string[]): Promise<string> {
   const options = parseArguments(args);
-  const database = new Database(options.dbPath, constants.SQLITE_OPEN_READONLY);
+  const databaseUrl = pathToFileURL(options.dbPath);
+  databaseUrl.searchParams.set('mode', 'ro');
+  databaseUrl.searchParams.set('immutable', '1');
+  const database = new Database(
+    databaseUrl.href,
+    constants.SQLITE_OPEN_READONLY | constants.SQLITE_OPEN_URI
+  );
   try {
     const findings = await listUnroutableQueuedMessages(createReadOnlyQuery(database));
     return JSON.stringify({ count: findings.length, findings });
