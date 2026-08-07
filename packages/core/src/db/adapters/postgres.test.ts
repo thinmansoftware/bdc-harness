@@ -244,6 +244,29 @@ describe('PostgresAdapter', () => {
     });
   });
 
+  describe('agent messaging Phase 1 schema', () => {
+    test('fresh-install and upgrade migrations have matching repeat-history fields and partial index', () => {
+      const upgrade = readFileSync(
+        resolve(import.meta.dir, '../../../../../migrations', '042_agent_messaging_phase1.sql'),
+        'utf8'
+      );
+      const fresh = readFileSync(
+        resolve(import.meta.dir, '../../../../../migrations', '000_combined.sql'),
+        'utf8'
+      );
+
+      for (const schema of [upgrade, fresh]) {
+        expect(schema).toContain('subject_key TEXT');
+        expect(schema).toContain('repeat_reason TEXT');
+        expect(schema).toContain('idx_agent_dispatch_messages_subject_history');
+        expect(schema).toContain('subject_key, created_at DESC, id DESC');
+        expect(schema).toContain('WHERE subject_key IS NOT NULL');
+      }
+      expect(upgrade).toContain('ADD COLUMN IF NOT EXISTS subject_key TEXT');
+      expect(upgrade).toContain('ADD COLUMN IF NOT EXISTS repeat_reason TEXT');
+    });
+  });
+
   describe('Board execution claims schema', () => {
     test('numbered migration, combined schema, and SQLite bootstrap define claim tables', () => {
       const migration = readFileSync(

@@ -226,6 +226,14 @@ export class SqliteAdapter implements IDatabase {
     this.db.run(
       'CREATE INDEX IF NOT EXISTS idx_dispatch_board_pending ON agent_dispatch_messages(recipient_alias, status, created_at)'
     );
+    const dispatchColumns = this.pragmaAll("PRAGMA table_info('agent_dispatch_messages')") as {
+      name: string;
+    }[];
+    if (dispatchColumns.some(column => column.name === 'subject_key')) {
+      this.db.run(
+        'CREATE INDEX IF NOT EXISTS idx_agent_dispatch_messages_subject_history ON agent_dispatch_messages(subject_key, created_at DESC, id DESC) WHERE subject_key IS NOT NULL'
+      );
+    }
     // Taskmaster Slice 1 indexes (migration 041) -- after migrateColumns()
     // per the established pattern.
     this.db.run(
@@ -344,6 +352,7 @@ export class SqliteAdapter implements IDatabase {
         ['escalated_tg_at', 'TEXT'],
         ['escalated_sms_at', 'TEXT'],
         ['subject_key', 'TEXT'],
+        ['repeat_reason', 'TEXT'],
         [
           'route_disposition',
           "TEXT CHECK (route_disposition IS NULL OR route_disposition IN ('unroutable', 'superseded'))",
@@ -779,6 +788,7 @@ export class SqliteAdapter implements IDatabase {
         escalated_tg_at TEXT,
         escalated_sms_at TEXT,
         subject_key TEXT,
+        repeat_reason TEXT,
         route_disposition TEXT CHECK (route_disposition IS NULL OR route_disposition IN ('unroutable', 'superseded')),
         supersedes_id TEXT REFERENCES agent_dispatch_messages(id)
       );
