@@ -14,14 +14,24 @@ afterEach(() => {
 });
 
 describe('dispatch notifiers', () => {
-  test('rejects secrets outside the mounted secret directory', async () => {
-    expect(readDispatchSecretFile('/tmp/token')).rejects.toThrow('dispatch_secret_file_required');
+  test('reads a POSIX mounted-secret path independently of the host path semantics', async () => {
+    await expect(readDispatchSecretFile('/run/bdc-secrets/telegram')).resolves.toBe('file-token');
   });
 
-  test('rejects traversal out of the mounted secret directory', async () => {
-    expect(readDispatchSecretFile('/run/bdc-secrets/../../etc/passwd')).rejects.toThrow(
-      'dispatch_secret_file_required'
-    );
+  test.each([
+    undefined,
+    '',
+    'run/bdc-secrets/telegram',
+    '/tmp/token',
+    '/run/bdc-secrets',
+    '/run/bdc-secrets/',
+    '/run/bdc-secrets/nested/telegram',
+    '/run/bdc-secrets-other/telegram',
+    '/run/bdc-secrets/../../etc/passwd',
+    '/run/bdc-secrets/../bdc-secrets/telegram',
+    '/run/bdc-secrets/./telegram',
+  ])('rejects an invalid mounted-secret path: %p', async (path) => {
+    await expect(readDispatchSecretFile(path)).rejects.toThrow('dispatch_secret_file_required');
   });
 
   test('reads file credentials and sends both configured legs', async () => {

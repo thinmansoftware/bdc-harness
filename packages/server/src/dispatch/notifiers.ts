@@ -1,12 +1,19 @@
 import { readFile } from 'fs/promises';
-import { dirname, resolve } from 'path';
+import { posix } from 'path';
 
 const DISPATCH_SECRETS_DIRECTORY = '/run/bdc-secrets';
 
 export async function readDispatchSecretFile(path: string | undefined): Promise<string> {
-  if (!path) throw new Error('dispatch_secret_file_required');
-  const resolvedPath = resolve(path);
-  if (dirname(resolvedPath) !== DISPATCH_SECRETS_DIRECTORY) {
+  if (!path || !posix.isAbsolute(path)) throw new Error('dispatch_secret_file_required');
+  const pathSegments = path.split('/');
+  if (pathSegments.some((segment) => segment === '.' || segment === '..')) {
+    throw new Error('dispatch_secret_file_required');
+  }
+  const resolvedPath = posix.normalize(path);
+  if (
+    posix.dirname(resolvedPath) !== DISPATCH_SECRETS_DIRECTORY ||
+    !posix.basename(resolvedPath)
+  ) {
     throw new Error('dispatch_secret_file_required');
   }
   const value = (await readFile(resolvedPath, 'utf8')).trim();
