@@ -2,6 +2,7 @@ import { createLogger } from '@archon/paths';
 import { runOverseerService } from '@archon/overseer/service';
 import type { OverseerServiceOptions, OverseerWiredAdapterKind } from '@archon/overseer/service';
 import { PRODUCTION_EFFECT_HOLD_REASON } from '@archon/overseer/merge-manager';
+import { DEFAULT_WATCH_INTERVAL_MS } from '@archon/overseer/watch';
 
 const log = createLogger('server/overseer-runtime');
 
@@ -9,11 +10,14 @@ type OverseerAdapterKind = OverseerWiredAdapterKind;
 type OverseerWatcherState = 'stopped' | 'running' | 'degraded';
 
 interface OverseerRuntimeStatus {
+  readonly status: 'ok' | 'degraded' | 'unknown';
   readonly watcher: OverseerWatcherState;
   readonly adapter: OverseerAdapterKind;
   readonly emergency_stop: boolean;
   readonly capability_flags: Readonly<Record<string, boolean>>;
   readonly circuit_states: Readonly<Record<string, string>>;
+  readonly last_action_at: string | null;
+  readonly last_verdict_at: string | null;
   readonly blocking_reasons: readonly string[];
 }
 
@@ -25,6 +29,10 @@ interface OverseerCapabilityRow {
 
 interface OverseerRuntimeStatusDeps {
   readonly listCapabilityStates: () => Promise<OverseerCapabilityRow[]>;
+  readonly getLastActionAt: () => Promise<string | null>;
+  readonly getLastVerdictAt: () => Promise<string | null>;
+  readonly countPendingJudgments: () => Promise<number>;
+  readonly now?: () => Date;
 }
 
 interface OverseerRuntimeDeps {
@@ -162,6 +170,7 @@ export async function getOverseerRuntimeStatus(
   const capabilities = ['escalation', 'repair', 'branch', 'lifecycle', 'merge'] as const;
   const capabilityFlags: Record<string, boolean> = {};
   const circuitStates: Record<string, string> = {};
+  let dependencyReadFailed = false;
 
   for (const cap of capabilities) {
     capabilityFlags[cap] = readCapabilityFlag(cap.toUpperCase());
@@ -176,6 +185,21 @@ export async function getOverseerRuntimeStatus(
     }
   } catch {
     log.warn('overseer_runtime.capability_state_read_failed');
+    dependencyReadFailed = true;
+  }
+
+  let lastActionAt: string | null = null;
+  let lastVerdictAt: string | null = null;
+  let pendingJudgments = 0;
+  try {
+    [lastActionAt, lastVerdictAt, pendingJudgments] = await Promise.all([
+      deps.getLastActionAt(),
+      deps.getLastVerdictAt(),
+      deps.countPendingJudgments(),
+    ]);
+  } catch {
+    log.warn('overseer_runtime.effect_status_read_failed');
+    dependencyReadFailed = true;
   }
 
   const emergencyStop = readEmergencyStop();
@@ -186,12 +210,35 @@ export async function getOverseerRuntimeStatus(
   }
   if (emergencyStop) blockingReasons.push('emergency_stop');
 
+  // The watcher polls every minute. Three missed intervals with work waiting is
+  // a stall, while an empty backlog is legitimate idle time and must not page.
+  const staleThresholdMs = 3 * DEFAULT_WATCH_INTERVAL_MS;
+  const effectTimes = [lastActionAt, lastVerdictAt]
+    .filter((value): value is string => value !== null)
+    .map(value => Date.parse(value))
+    .filter(Number.isFinite);
+  const lastEffectMs = effectTimes.length > 0 ? Math.max(...effectTimes) : null;
+  const effectClockStale =
+    pendingJudgments > 0 &&
+    (lastEffectMs === null ||
+      (deps.now?.().getTime() ?? Date.now()) - lastEffectMs > staleThresholdMs);
+  if (effectClockStale) blockingReasons.push('effect_clock_stale_with_pending_judgments');
+
+  const status = dependencyReadFailed
+    ? 'unknown'
+    : watcherState === 'degraded' || effectClockStale
+      ? 'degraded'
+      : 'ok';
+
   return {
+    status,
     watcher: watcherState,
     adapter: adapterKind,
     emergency_stop: emergencyStop,
     capability_flags: capabilityFlags,
     circuit_states: circuitStates,
+    last_action_at: lastActionAt,
+    last_verdict_at: lastVerdictAt,
     blocking_reasons: blockingReasons,
   };
 }

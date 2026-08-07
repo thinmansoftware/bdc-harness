@@ -149,6 +149,11 @@ import { assessDispatchMessageBody } from '@archon/core/utils/dispatch-content-g
 import { authenticateDispatchWorkerCredential } from '../auth/dispatch-worker-credential';
 import { getOverseerRuntimeStatus } from '../overseer-runtime';
 import { listOverseerCapabilityStates } from '@archon/core/db/overseer-capabilities';
+import {
+  countRunsPendingOverseerJudgment,
+  getOverseerLastActionAt,
+  getOverseerLastVerdictAt,
+} from '@archon/core/db/overseer';
 import { errorSchema } from './schemas/common.schemas';
 import { updateCheckResponseSchema } from './schemas/system.schemas';
 import {
@@ -2005,11 +2010,14 @@ const getHealthRoute = createRoute({
               activePlatforms: z.array(z.string()).optional(),
               overseer: z
                 .object({
+                  status: z.string(),
                   watcher: z.string(),
                   adapter: z.string(),
                   emergency_stop: z.boolean(),
                   capability_flags: z.record(z.boolean()),
                   circuit_states: z.record(z.string()),
+                  last_action_at: z.string().nullable(),
+                  last_verdict_at: z.string().nullable(),
                   blocking_reasons: z.array(z.string()),
                 })
                 .optional(),
@@ -6159,10 +6167,13 @@ export function registerApiRoutes(
 
     const overseerStatus = await getOverseerRuntimeStatus({
       listCapabilityStates: listOverseerCapabilityStates,
+      getLastActionAt: getOverseerLastActionAt,
+      getLastVerdictAt: getOverseerLastVerdictAt,
+      countPendingJudgments: countRunsPendingOverseerJudgment,
     });
 
     return c.json({
-      status: overseerStatus.watcher === 'degraded' ? 'degraded' : 'ok',
+      status: overseerStatus.status,
       adapter: 'web',
       concurrency: {
         ...stats,
