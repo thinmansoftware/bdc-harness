@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, mock, test } from 'bun:test';
 import { OpenAPIHono } from '@hono/zod-openapi';
 import type { ConversationLockManager } from '@archon/core';
 import type { WebAdapter } from '../adapters/web';
@@ -158,6 +158,18 @@ function makeApp(): OpenAPIHono {
 }
 
 describe('read-only overseer briefing feed', () => {
+  const priorOperatorAuthDisabled = process.env.ARCHON_OPERATOR_AUTH_DISABLED;
+  beforeAll(() => {
+    process.env.ARCHON_OPERATOR_AUTH_DISABLED = 'true';
+  });
+  afterAll(() => {
+    if (priorOperatorAuthDisabled === undefined) {
+      delete process.env.ARCHON_OPERATOR_AUTH_DISABLED;
+    } else {
+      process.env.ARCHON_OPERATOR_AUTH_DISABLED = priorOperatorAuthDisabled;
+    }
+    expect(process.env.ARCHON_OPERATOR_AUTH_DISABLED).toBe(priorOperatorAuthDisabled);
+  });
   beforeEach(() => {
     setBoardPrincipalResolverForTests(async proof => {
       if (proof.principal_token !== 'valid') throw new Error('board_principal_auth_rejected');
