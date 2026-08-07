@@ -64,6 +64,14 @@ import {
 } from '@archon/workflows/schemas/workflow-run';
 import type { ApprovalContext, WorkflowRun } from '@archon/workflows/schemas/workflow-run';
 import { findMarkdownFilesRecursive } from '@archon/core/utils/commands';
+import { startTaskmaster, getTaskmasterRuntime, getTickHealth } from '../taskmaster/loop';
+import { startTaskmasterDeadmanChecker } from '@archon/overseer/taskmaster-deadman-check';
+import {
+  taskmasterStatusResponseSchema,
+  taskmasterPauseBodySchema,
+  taskmasterResumeBodySchema,
+  taskmasterControlResponseSchema,
+} from './schemas/taskmaster.schemas';
 
 let providerWaitSchedulerTimer: ReturnType<typeof setInterval> | undefined;
 
@@ -118,6 +126,7 @@ import * as codebaseDb from '@archon/core/db/codebases';
 import * as envVarDb from '@archon/core/db/env-vars';
 import * as isolationEnvDb from '@archon/core/db/isolation-environments';
 import * as workflowDb from '@archon/core/db/workflows';
+import * as taskmasterDb from '@archon/core/db/taskmaster';
 import * as workflowEventDb from '@archon/core/db/workflow-events';
 import * as messageDb from '@archon/core/db/messages';
 import * as dispatchDb from '@archon/core/db/dispatch';
@@ -2109,6 +2118,65 @@ const getUpdateCheckRoute = createRoute({
   },
 });
 
+// Taskmaster Slice 1 operator routes (WO-HARNESS-TASKMASTER-SLICE1-01).
+// Auth is covered by the global /api/* operator-token middleware.
+const getTaskmasterStatusRoute = createRoute({
+  method: 'get',
+  path: '/api/taskmaster/status',
+  tags: ['Taskmaster'],
+  summary: 'Taskmaster pause state, epoch, and tick health',
+  responses: {
+    200: {
+      content: { 'application/json': { schema: taskmasterStatusResponseSchema } },
+      description: 'Taskmaster status incl. tick_health for the external dead-man checker',
+    },
+    401: jsonError('Missing or invalid operator token'),
+    500: jsonError('Server error'),
+  },
+});
+
+const postTaskmasterPauseRoute = createRoute({
+  method: 'post',
+  path: '/api/taskmaster/pause',
+  tags: ['Taskmaster'],
+  summary: 'Pause taskmaster effects (monitoring, P0 escalation, digest stay alive)',
+  request: {
+    body: {
+      content: { 'application/json': { schema: taskmasterPauseBodySchema } },
+      required: false,
+    },
+  },
+  responses: {
+    200: {
+      content: { 'application/json': { schema: taskmasterControlResponseSchema } },
+      description: 'Updated control state',
+    },
+    401: jsonError('Missing or invalid operator token'),
+    500: jsonError('Server error'),
+  },
+});
+
+const postTaskmasterResumeRoute = createRoute({
+  method: 'post',
+  path: '/api/taskmaster/resume',
+  tags: ['Taskmaster'],
+  summary: 'Resume taskmaster (John-authorized): epoch increments, stale proposals expire',
+  request: {
+    body: {
+      content: { 'application/json': { schema: taskmasterResumeBodySchema } },
+      required: false,
+    },
+  },
+  responses: {
+    200: {
+      content: { 'application/json': { schema: taskmasterControlResponseSchema } },
+      description: 'Updated control state with expired-proposal count',
+    },
+    401: jsonError('Missing or invalid operator token'),
+    500: jsonError('Server error'),
+  },
+});
+
 /**
  * Register all /api/* routes on the Hono app.
  */
@@ -2943,6 +3011,97 @@ export function registerApiRoutes(
     providerWaitSchedulerTimer.unref?.();
     void tick();
   }
+
+  // Taskmaster Slice 1 loop (WO-HARNESS-TASKMASTER-SLICE1-01, M-133).
+  // Skeleton cloned from the provider-wait scheduler above; the timer
+  // singleton, inFlight guard, and TASKMASTER_INTERVAL_MS handling
+  // (default 60000, 0 = off) live in ../taskmaster/loop.ts.
+  if (process.env.NODE_ENV !== 'test') {
+    startTaskmaster(randomUUID());
+    // External dead-man checker (binding condition 5 / Q4): lives in the
+    // Overseer package and observes the taskmaster ONLY via
+    // GET /api/taskmaster/status over HTTP -- never via in-process state.
+    // Started alongside the taskmaster (not inside startOverseerRuntime,
+    // which is gated on OVERSEER_ENABLED) so the watcher is always on when
+    // the taskmaster ships scheduled ON. Persistent episode state lives in
+    // the checker's module-scope runtime; TASKMASTER_DEADMAN_INTERVAL_MS=0
+    // disables (default 60000).
+    startTaskmasterDeadmanChecker();
+  }
+
+  // GET /api/taskmaster/status - pause state, epoch, tick health
+  registerOpenApiRoute(getTaskmasterStatusRoute, async c => {
+    try {
+      const control = await taskmasterDb.getPauseState();
+      const runtime = getTaskmasterRuntime();
+      const dayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+      const actions = await taskmasterDb.getActionsSince(dayAgo);
+      const lastTickAtMs = runtime?.state.deadman.lastTickAtMs ?? null;
+      return c.json({
+        pause_state: control.pause_state,
+        pause_scope: control.pause_scope,
+        pause_reason: control.pause_reason,
+        pause_actor: control.pause_actor,
+        epoch: control.epoch,
+        tick_health: getTickHealth(),
+        interval_ms: runtime?.intervalMs ?? 0,
+        last_tick_at: lastTickAtMs === null ? null : new Date(lastTickAtMs).toISOString(),
+        headroom_state: runtime?.lastTickResult?.headroomState ?? null,
+        effects_last_24h: actions.filter(a => a.outcome === 'sent').length,
+      });
+    } catch (error) {
+      getLog().error({ err: error }, 'taskmaster_status_failed');
+      return apiError(c, 500, 'Failed to read taskmaster status');
+    }
+  });
+
+  // POST /api/taskmaster/pause - operator/John pauses effects
+  registerOpenApiRoute(postTaskmasterPauseRoute, async c => {
+    try {
+      const body: { reason?: string; scope?: string; actor: string } = (getValidatedBody(
+        c,
+        taskmasterPauseBodySchema
+      ) as { reason?: string; scope?: string; actor: string } | undefined) ?? { actor: 'operator' };
+      const control = await taskmasterDb.setPauseState({
+        pause_state: 'PAUSED',
+        pause_scope: body.scope ?? 'effects',
+        pause_reason: body.reason ?? null,
+        pause_actor: body.actor,
+      });
+      return c.json({ pause_state: control.pause_state, epoch: control.epoch });
+    } catch (error) {
+      getLog().error({ err: error }, 'taskmaster_pause_failed');
+      return apiError(c, 500, 'Failed to pause taskmaster');
+    }
+  });
+
+  // POST /api/taskmaster/resume - John-authorized; epoch increments and
+  // stale proposals are EXPIRED, never replayed.
+  registerOpenApiRoute(postTaskmasterResumeRoute, async c => {
+    try {
+      const body: { actor: string } = (getValidatedBody(c, taskmasterResumeBodySchema) as
+        | { actor: string }
+        | undefined) ?? {
+        actor: 'john',
+      };
+      const expired = await taskmasterDb.expireParkedActions();
+      const control = await taskmasterDb.setPauseState({
+        pause_state: 'RUNNING',
+        pause_scope: null,
+        pause_reason: null,
+        pause_actor: body.actor,
+        incrementEpoch: true,
+      });
+      return c.json({
+        pause_state: control.pause_state,
+        epoch: control.epoch,
+        expired_proposals: expired,
+      });
+    } catch (error) {
+      getLog().error({ err: error }, 'taskmaster_resume_failed');
+      return apiError(c, 500, 'Failed to resume taskmaster');
+    }
+  });
 
   // GET /api/conversations - List conversations
   registerOpenApiRoute(getConversationsRoute, async c => {
