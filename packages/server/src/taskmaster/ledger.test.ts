@@ -73,13 +73,18 @@ describe('currentHeadroom -- Section 11 scenario 2: meter failure never becomes 
 describe('currentHeadroom -- successful readings', () => {
   test('local artifact reading wins and persists with high confidence', async () => {
     const persist = makePersist();
+    // Anchor cadence NOT due (recent attempt) so this test isolates value
+    // precedence. Cadence-due passes DO sample the anchor even when
+    // artifacts answer -- proven in the Section 8 cadence suite below.
+    const cadence = createAnchorCadence();
+    cadence.lastAttemptAtMs = Date.now();
     const reading = await currentHeadroom({
       readLocalArtifacts: async () => 200_000,
       sampleCliAnchor: async () => {
-        throw new Error('should not be called when artifacts answer');
+        throw new Error('should not be called when the anchor is not due');
       },
       persistSample: persist.fn,
-      anchorCadence: createAnchorCadence(),
+      anchorCadence: cadence,
     });
     expect(reading.state).toBe('OK');
     expect(reading.tokensRemaining).toBe(200_000);
@@ -207,6 +212,58 @@ describe('currentHeadroom -- CLI anchor cadence (spec Section 8: startup, every 
     const third = await currentHeadroom(deps);
     expect(anchor.calls.length).toBe(2);
     expect(third.source).toBe('cli_anchor');
+  });
+
+  test('a typed-limit transition re-samples the anchor even when local artifacts remain available', async () => {
+    const persist = makePersist();
+    const cadence = createAnchorCadence();
+    const anchor = makeAnchor(120_000);
+    let nowMs = T0;
+    let artifactValue: number | null = 200_000;
+    const deps: LedgerDeps = {
+      readLocalArtifacts: async () => artifactValue,
+      sampleCliAnchor: anchor.fn,
+      persistSample: persist.fn,
+      anchorCadence: cadence,
+      now: () => new Date(nowMs),
+      lowWatermark: 50_000,
+    };
+
+    // Startup: the anchor is sampled even though a fresh artifact answers;
+    // the artifact keeps VALUE precedence for the reading.
+    const first = await currentHeadroom(deps);
+    expect(first.state).toBe('OK');
+    expect(first.source).toBe('local_artifacts');
+    expect(first.tokensRemaining).toBe(200_000);
+    expect(anchor.calls.length).toBe(1);
+
+    // Artifact drops LOW: typed-limit transition OK -> LOW. Anchor not due
+    // on this tick (inside the 30-minute window, transition arms AFTER the
+    // reading), so no probe spawn here.
+    nowMs = T0 + 60_000;
+    artifactValue = 10_000;
+    const second = await currentHeadroom(deps);
+    expect(second.state).toBe('LOW');
+    expect(second.source).toBe('local_artifacts');
+    expect(anchor.calls.length).toBe(1);
+
+    // Next tick with the artifact STILL available: the armed transition
+    // must force an anchor re-sample anyway (spec Section 8 cadence is
+    // independent of artifact availability). The artifact still wins the
+    // reading; the probe result refreshes the cadence cache.
+    nowMs = T0 + 120_000;
+    const third = await currentHeadroom(deps);
+    expect(anchor.calls.length).toBe(2);
+    expect(third.source).toBe('local_artifacts');
+    expect(third.tokensRemaining).toBe(10_000);
+    expect(cadence.lastValue).toBe(120_000);
+
+    // The transition was consumed: the following tick (no new transition,
+    // still inside the window) does not spawn the probe again.
+    nowMs = T0 + 180_000;
+    const fourth = await currentHeadroom(deps);
+    expect(fourth.source).toBe('local_artifacts');
+    expect(anchor.calls.length).toBe(2);
   });
 
   test('an un-due UNKNOWN (cached probe failure) does not spam duplicate is_unknown sample rows every tick', async () => {

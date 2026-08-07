@@ -140,12 +140,16 @@ export async function sampleCliAnchor(): Promise<number | null> {
 
 /**
  * Compute current headroom. Precedence: local artifacts, then CLI anchor.
- * The anchor probe runs ONLY when due (startup, every 30 minutes, or after a
- * typed-limit transition -- spec Section 8); between due samples the cached
- * anchor observation is served. When both readers fail (or throw), the
- * reading is UNKNOWN -- never 0-as-capacity -- and a FRESH failure is
- * persisted as a usage sample with is_unknown=1 (cache-served readings do
- * not persist duplicate observation rows).
+ * The anchor probe runs when due (startup, every 30 minutes, or after a
+ * typed-limit transition -- spec Section 8) INDEPENDENTLY of local-artifact
+ * availability: a fresh artifact wins VALUE precedence for the reading, but
+ * it does not suppress a due anchor sample -- otherwise the cadence would
+ * silently stop (and forceNext would never be consumed) for as long as
+ * artifacts keep answering. Between due samples the cached anchor
+ * observation is served. When both readers fail (or throw), the reading is
+ * UNKNOWN -- never 0-as-capacity -- and a FRESH failure is persisted as a
+ * usage sample with is_unknown=1 (cache-served readings do not persist
+ * duplicate observation rows).
  */
 export async function currentHeadroom(deps: LedgerDeps = {}): Promise<HeadroomReading> {
   const now = deps.now ?? ((): Date => new Date());
@@ -172,31 +176,34 @@ export async function currentHeadroom(deps: LedgerDeps = {}): Promise<HeadroomRe
     log.warn({ err: error as Error }, 'taskmaster.ledger_local_artifacts_failed');
   }
 
-  if (tokens === null) {
-    const anchorDue =
-      cadence.lastAttemptAtMs === null || // startup
-      cadence.forceNext || // typed-limit transition
-      nowMs - cadence.lastAttemptAtMs >= ANCHOR_SAMPLE_INTERVAL_MS; // 30min
-    if (anchorDue) {
-      cadence.lastAttemptAtMs = nowMs;
-      cadence.forceNext = false;
-      freshObservation = true;
-      try {
-        const anchor = await (deps.sampleCliAnchor ?? sampleCliAnchor)();
-        cadence.lastValue = anchor;
-        if (anchor !== null) {
-          tokens = anchor;
-          source = 'cli_anchor';
-        }
-      } catch (error) {
-        cadence.lastValue = null;
-        log.warn({ err: error as Error }, 'taskmaster.ledger_cli_anchor_failed');
+  // Anchor cadence is evaluated UNCONDITIONALLY -- not only when the local
+  // artifact failed. Startup, the 30-minute clock, and an armed typed-limit
+  // transition each force a probe run even while artifacts serve the
+  // reading; the sampled value refreshes the cadence cache so it is current
+  // if artifacts later vanish.
+  const anchorDue =
+    cadence.lastAttemptAtMs === null || // startup
+    cadence.forceNext || // typed-limit transition
+    nowMs - cadence.lastAttemptAtMs >= ANCHOR_SAMPLE_INTERVAL_MS; // 30min
+  if (anchorDue) {
+    cadence.lastAttemptAtMs = nowMs;
+    cadence.forceNext = false;
+    freshObservation = true;
+    try {
+      const anchor = await (deps.sampleCliAnchor ?? sampleCliAnchor)();
+      cadence.lastValue = anchor;
+      if (tokens === null && anchor !== null) {
+        tokens = anchor;
+        source = 'cli_anchor';
       }
-    } else if (cadence.lastValue !== null) {
-      // Not due: serve the cached anchor observation.
-      tokens = cadence.lastValue;
-      source = 'cli_anchor';
+    } catch (error) {
+      cadence.lastValue = null;
+      log.warn({ err: error as Error }, 'taskmaster.ledger_cli_anchor_failed');
     }
+  } else if (tokens === null && cadence.lastValue !== null) {
+    // Not due: serve the cached anchor observation.
+    tokens = cadence.lastValue;
+    source = 'cli_anchor';
   }
 
   if (tokens === null) {
