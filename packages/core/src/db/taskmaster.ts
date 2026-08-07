@@ -16,7 +16,13 @@ export async function recordAction(action: TaskmasterAction): Promise<Taskmaster
     (id,created_at,thread_ref,action_type,proposal_json,idempotency_key,before_hash,proof_predicate,proof_deadline_at,outcome,graded_at,grade)
     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) ON CONFLICT(idempotency_key) DO NOTHING RETURNING *`,
     [id,created,action.thread_ref,action.action_type,action.proposal_json,action.idempotency_key,action.before_hash??null,action.proof_predicate??null,action.proof_deadline_at??null,action.outcome,action.graded_at??null,action.grade??null]);
-  return result.rows[0] ?? { ...action, id, created_at: created };
+  if (result.rows[0]) return result.rows[0];
+  const existing = await getDatabase().query<TaskmasterAction>(
+    'SELECT * FROM tm_journal WHERE idempotency_key = $1',
+    [action.idempotency_key]
+  );
+  if (!existing.rows[0]) throw new Error('taskmaster_journal_conflict_row_missing');
+  return existing.rows[0];
 }
 export async function getActionsSince(since: string, threadRef?: string): Promise<TaskmasterAction[]> {
   const result = await getDatabase().query<TaskmasterAction>(`SELECT * FROM tm_journal WHERE created_at >= $1${threadRef?' AND thread_ref = $2':''} ORDER BY created_at`, threadRef?[since,threadRef]:[since]); return result.rows;

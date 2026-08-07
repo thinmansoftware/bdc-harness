@@ -215,6 +215,29 @@ describe('dispatch API', () => {
     cleanupDb(currentDbPath);
   });
 
+  test('taskmaster status is readable but pause and resume require John operator authority', async () => {
+    const unauthenticated = makeApp();
+    expect((await unauthenticated.request('/api/taskmaster/status')).status).toBe(200);
+    expect((await unauthenticated.request('/api/taskmaster/pause', { method: 'POST' })).status).toBe(401);
+    expect((await unauthenticated.request('/api/taskmaster/resume', { method: 'POST' })).status).toBe(401);
+
+    const authenticated = makeApp('john-secret');
+    const headers = {
+      'Content-Type': 'application/json',
+      'x-archon-operator-token': 'john-secret',
+    };
+    const paused = await authenticated.request('/api/taskmaster/pause', {
+      method: 'POST', headers, body: JSON.stringify({ reason: 'maintenance' }),
+    });
+    expect(paused.status).toBe(200);
+    expect(((await paused.json()) as { pause_actor: string }).pause_actor).toBe('john');
+    const resumed = await authenticated.request('/api/taskmaster/resume', {
+      method: 'POST', headers, body: JSON.stringify({ reason: 'maintenance complete' }),
+    });
+    expect(resumed.status).toBe(200);
+    expect(((await resumed.json()) as { epoch: number }).epoch).toBe(1);
+  });
+
   test('rejects unsupported task_type with named validation error', async () => {
     const response = await makeApp().request('/api/dispatch/messages', {
       method: 'POST',

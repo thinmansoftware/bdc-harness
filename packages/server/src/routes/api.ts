@@ -2948,8 +2948,9 @@ export function registerApiRoutes(
   }
   startTaskmaster();
   app.get('/api/taskmaster/status',async c=>{const control=await getPauseState();const parsed=Number.parseInt(process.env.TASKMASTER_INTERVAL_MS??'',10);const interval=Number.isInteger(parsed)&&parsed>0?parsed:60000;return c.json({...control,tick_health:isTickStale(interval)?'degraded':'healthy'});});
-  app.post('/api/taskmaster/pause',async c=>{const body=await c.req.json<{reason?:string;hard?:boolean}>().catch(()=>({}));return c.json(await setPauseState(body.hard?'HARD_PAUSE':'PAUSED','john',body.reason??'operator pause'));});
-  app.post('/api/taskmaster/resume',async c=>{const body=await c.req.json<{reason?:string}>().catch(()=>({}));return c.json(await setPauseState('RUNNING','john',body.reason??'operator resume'));});
+  const taskmasterOperatorAuthorized=(c:Context)=>Boolean(process.env.ARCHON_OPERATOR_TOKEN)&&getPresentedOperatorToken(c)===process.env.ARCHON_OPERATOR_TOKEN;
+  app.post('/api/taskmaster/pause',async c=>{if(!taskmasterOperatorAuthorized(c))return apiError(c,401,'Missing or invalid operator token');const body=await c.req.json<{reason?:string;hard?:boolean}>().catch(()=>({}));return c.json(await setPauseState(body.hard?'HARD_PAUSE':'PAUSED','john',body.reason??'operator pause'));});
+  app.post('/api/taskmaster/resume',async c=>{if(!taskmasterOperatorAuthorized(c))return apiError(c,401,'Missing or invalid operator token');const body=await c.req.json<{reason?:string}>().catch(()=>({}));return c.json(await setPauseState('RUNNING','john',body.reason??'operator resume'));});
 
   // GET /api/conversations - List conversations
   registerOpenApiRoute(getConversationsRoute, async c => {
