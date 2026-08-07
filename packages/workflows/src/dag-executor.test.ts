@@ -2411,6 +2411,275 @@ describe('executeDagWorkflow -- bash nodes', () => {
   });
 });
 
+/**
+ * bdc-xo#1368: file handoff for node output consumed by bash nodes.
+ *
+ * substituteNodeOutputRefs (escapedForBash=true) single-quote-wraps output for inline
+ * substitution into a bash script -- correct for a bare `$node.output` reference, but
+ * lane YAMLs that consume output inside a quoted heredoc turn the wrap bytes into DATA:
+ * a leading `'` on the first line, a trailing `'` on the last line. This killed two
+ * production cascades (run e5110df1, run 1462ce37) because the corruption happens after
+ * the real NodeOutput is already recorded -- invisible in every log/event surface.
+ *
+ * These tests assert the file each bash node can read (ARCHON_NODE_OUT/<nodeId>.out) is
+ * byte-identical to the producing node's real output, reproducing the exact e5110df1 and
+ * 1462ce37 failure shapes.
+ */
+describe('executeDagWorkflow -- node output file handoff (ARCHON_NODE_OUT)', () => {
+  let testDir: string;
+
+  beforeEach(async () => {
+    testDir = join(
+      tmpdir(),
+      `dag-node-out-test-${Date.now()}-${Math.random().toString(36).slice(2)}`
+    );
+    await mkdir(testDir, { recursive: true });
+  });
+
+  afterEach(async () => {
+    try {
+      await rm(testDir, { recursive: true, force: true });
+    } catch {
+      // ignore cleanup errors
+    }
+  });
+
+  it('writes a producing node output to ARCHON_NODE_OUT byte-identical, apostrophes and all', async () => {
+    const mockDeps = createMockDeps();
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('node-out-fidelity-run-id');
+
+    // Models the real 1462ce37 shape: apostrophes plus a trailing structured field, the
+    // exact content class that gets a stray quote byte injected under the old transport.
+    const producedOutput =
+      "it's a multi-line output\nwith apostrophes it's got\nunique_branch=feat/x-thread-abc";
+
+    const nodes: DagNode[] = [
+      { id: 'producer', bash: `printf '%s' ${JSON.stringify(producedOutput)}` },
+      {
+        id: 'consumer',
+        bash: 'cat "$ARCHON_NODE_OUT/producer.out"',
+        depends_on: ['producer'],
+      },
+    ];
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-node-out',
+      testDir,
+      { name: 'node-out-fidelity-test', nodes },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    const fileContent = await readFile(
+      join(testDir, 'artifacts', 'node-out', 'producer.out'),
+      'utf-8'
+    );
+    expect(fileContent).toBe(producedOutput);
+
+    const eventCalls = (mockDeps.store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls;
+    const consumerCompleted = eventCalls.find(
+      (call: unknown[]) =>
+        (call[0] as { event_type: string }).event_type === 'node_completed' &&
+        (call[0] as { step_name: string }).step_name === 'consumer'
+    );
+    expect(consumerCompleted).toBeDefined();
+    // The consumer's own output (cat'ing the file) must equal the producer's output
+    // exactly -- no wrap-quote bytes on the first or last line.
+    expect((consumerCompleted![0] as { data: { node_output: string } }).data.node_output).toBe(
+      producedOutput
+    );
+  });
+
+  it('reproduces the e5110df1 kill-shape: leading structured field survives the round trip', async () => {
+    const mockDeps = createMockDeps();
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('node-out-e5110df1-run-id');
+
+    const decideOutput = 'push_target: feature-branch:feat/x\nreason: clean gate pass';
+
+    const nodes: DagNode[] = [
+      { id: 'decide-push-target', bash: `printf '%s' ${JSON.stringify(decideOutput)}` },
+      {
+        id: 'commit-and-push',
+        // Mirrors the real lane's extraction shape: grep the leading field out of the file.
+        bash: 'grep "^push_target:" "$ARCHON_NODE_OUT/decide-push-target.out"',
+        depends_on: ['decide-push-target'],
+      },
+    ];
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-e5110df1',
+      testDir,
+      { name: 'node-out-e5110df1-test', nodes },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    const eventCalls = (mockDeps.store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls;
+    const completed = eventCalls.find(
+      (call: unknown[]) =>
+        (call[0] as { event_type: string }).event_type === 'node_completed' &&
+        (call[0] as { step_name: string }).step_name === 'commit-and-push'
+    );
+    expect(completed).toBeDefined();
+    // Old transport: a leading wrap-quote on the substituted copy made this grep fail
+    // (the line began with `'push_target:`, not `push_target:`). File handoff: exact.
+    expect((completed![0] as { data: { node_output: string } }).data.node_output).toBe(
+      'push_target: feature-branch:feat/x'
+    );
+  });
+
+  it('an empty producing output still gets a zero-byte file -- no engine crash, no missing-file error', async () => {
+    const mockDeps = createMockDeps();
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('node-out-empty-run-id');
+
+    const nodes: DagNode[] = [
+      { id: 'producer', bash: 'true' }, // exit 0, empty stdout
+      {
+        id: 'consumer',
+        bash: '[ -f "$ARCHON_NODE_OUT/producer.out" ] && [ ! -s "$ARCHON_NODE_OUT/producer.out" ] && echo file_empty_and_present',
+        depends_on: ['producer'],
+      },
+    ];
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-node-out-empty',
+      testDir,
+      { name: 'node-out-empty-test', nodes },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    const eventCalls = (mockDeps.store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls;
+    const completed = eventCalls.find(
+      (call: unknown[]) =>
+        (call[0] as { event_type: string }).event_type === 'node_completed' &&
+        (call[0] as { step_name: string }).step_name === 'consumer'
+    );
+    expect(completed).toBeDefined();
+    expect((completed![0] as { data: { node_output: string } }).data.node_output).toBe(
+      'file_empty_and_present'
+    );
+  });
+
+  it('legacy $nodeId.output substitution keeps working unchanged alongside the new files (no flag-day)', async () => {
+    const mockDeps = createMockDeps();
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('node-out-legacy-run-id');
+
+    const nodes: DagNode[] = [
+      { id: 'stats', bash: 'echo "42 files"' },
+      // Un-migrated consumption pattern -- still substituted inline, same as before this WO.
+      { id: 'legacy-consumer', bash: 'echo $stats.output', depends_on: ['stats'] },
+    ];
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-node-out-legacy',
+      testDir,
+      { name: 'node-out-legacy-test', nodes },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    const eventCalls = (mockDeps.store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls;
+    const completed = eventCalls.find(
+      (call: unknown[]) =>
+        (call[0] as { event_type: string }).event_type === 'node_completed' &&
+        (call[0] as { step_name: string }).step_name === 'legacy-consumer'
+    );
+    expect(completed).toBeDefined();
+    expect((completed![0] as { data: { node_output: string } }).data.node_output).toBe('42 files');
+
+    // And the file is written too -- both transports are live simultaneously.
+    const fileContent = await readFile(
+      join(testDir, 'artifacts', 'node-out', 'stats.out'),
+      'utf-8'
+    );
+    expect(fileContent).toBe('42 files');
+  });
+
+  it('a retried/re-executed producer writes identical content -- no append or duplication', async () => {
+    const mockDeps = createMockDeps();
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('node-out-idempotent-run-id');
+    const artifactsDir = join(testDir, 'artifacts');
+
+    const nodes: DagNode[] = [{ id: 'producer', bash: 'echo "stable output"' }];
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-node-out-idem-1',
+      testDir,
+      { name: 'node-out-idempotent-test-1', nodes },
+      workflowRun,
+      'claude',
+      undefined,
+      artifactsDir,
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+    const firstWrite = await readFile(join(artifactsDir, 'node-out', 'producer.out'), 'utf-8');
+
+    // Re-execute the same node against the same artifact dir (models a retry/resume).
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-node-out-idem-2',
+      testDir,
+      { name: 'node-out-idempotent-test-2', nodes },
+      makeWorkflowRun('node-out-idempotent-run-id-2'),
+      'claude',
+      undefined,
+      artifactsDir,
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+    const secondWrite = await readFile(join(artifactsDir, 'node-out', 'producer.out'), 'utf-8');
+
+    expect(firstWrite).toBe('stable output');
+    expect(secondWrite).toBe('stable output');
+  });
+});
+
 describe('executeDagWorkflow -- output_format structured output', () => {
   let testDir: string;
 
@@ -4726,6 +4995,212 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
       expect(
         (mockDeps.store.failWorkflowRun as Mock<(id: string, error: string) => Promise<void>>).mock
           .calls.length
+      ).toBe(1);
+    });
+
+    // WO-HARNESS-BLOCKED-BUILDER-STOPS-01 / bdc-xo#1349
+    // Baseline on untouched tree: BLOCKED is not terminal, so the loop burns
+    // all max_iterations. After the fix: exactly one iteration, reason on run.
+    it('terminal-blocks on first-iteration BLOCKED: reason (no retry to cap)', async () => {
+      mockSendQueryDag.mockImplementation(function* () {
+        yield {
+          type: 'assistant',
+          content:
+            'Checked environment.\nBLOCKED: The required BDC_XO_PHASE1 paired bdc-xo worktree was not supplied\n',
+        };
+        yield { type: 'result', sessionId: 'loop-blocked-1' };
+      });
+
+      const mockDeps = createMockDeps();
+      const platform = createMockPlatform();
+      const workflowRun = makeWorkflowRun('blocked-run-1');
+      const artifactsDir = join(testDir, 'artifacts-blocked');
+
+      await executeDagWorkflow(
+        mockDeps,
+        platform,
+        'conv-dag',
+        testDir,
+        {
+          name: 'dag-loop-blocked',
+          nodes: [
+            {
+              id: 'implement',
+              loop: {
+                prompt: 'Implement. Emit BLOCKED: reason if hard-blocked.',
+                until: 'COMPLETE',
+                max_iterations: 5,
+              },
+            },
+          ],
+        },
+        workflowRun,
+        'claude',
+        undefined,
+        artifactsDir,
+        join(testDir, 'logs-blocked'),
+        'main',
+        'docs/',
+        minimalConfig
+      );
+
+      // Exactly ONE iteration -- not 5. This is the load-bearing stop.
+      expect(mockSendQueryDag.mock.calls.length).toBe(1);
+
+      // Workflow must fail (not complete, not burn to cap).
+      expect(
+        (mockDeps.store.failWorkflowRun as Mock<(id: string, error: string) => Promise<void>>).mock
+          .calls.length
+      ).toBe(1);
+
+      // Reason must be queryable on the node_failed event (not only in logs).
+      type FailedEvent = {
+        event_type: string;
+        data?: {
+          error?: string;
+          terminal_blocked?: boolean;
+          blocked_reason?: string;
+          iteration?: number;
+        };
+      };
+      const eventCalls = (
+        mockDeps.store.createWorkflowEvent as Mock<(event: FailedEvent) => Promise<void>>
+      ).mock.calls;
+      const blockedEvents = eventCalls
+        .map(call => call[0])
+        .filter(
+          ev =>
+            ev.event_type === 'node_failed' &&
+            ev.data?.terminal_blocked === true &&
+            typeof ev.data?.blocked_reason === 'string'
+        );
+      expect(blockedEvents.length).toBeGreaterThanOrEqual(1);
+      expect(blockedEvents[0]?.data?.blocked_reason).toContain('BDC_XO_PHASE1');
+      expect(blockedEvents[0]?.data?.iteration).toBe(1);
+      expect(String(blockedEvents[0]?.data?.error ?? '')).toContain('terminal-blocked');
+      expect(String(blockedEvents[0]?.data?.error ?? '')).not.toContain('exceeded max iterations');
+
+      // Work-preservation artifact directory exists (reason + last output at minimum).
+      const reasonFile = join(
+        artifactsDir,
+        'blocked-preserve',
+        'implement-iter-1',
+        'blocked-reason.txt'
+      );
+      const reasonText = await readFile(reasonFile, 'utf8');
+      expect(reasonText).toContain('BDC_XO_PHASE1');
+    });
+
+    it('runaway with no COMPLETE and no BLOCKED still hits the iteration cap', async () => {
+      mockSendQueryDag.mockImplementation(function* () {
+        yield { type: 'assistant', content: 'Still thrashing with no terminal signal.' };
+        yield { type: 'result', sessionId: 'loop-runaway' };
+      });
+
+      const mockDeps = createMockDeps();
+      const platform = createMockPlatform();
+      const workflowRun = makeWorkflowRun('runaway-run-1');
+
+      await executeDagWorkflow(
+        mockDeps,
+        platform,
+        'conv-dag',
+        testDir,
+        {
+          name: 'dag-loop-runaway',
+          nodes: [
+            {
+              id: 'implement',
+              loop: {
+                prompt: 'Do task.',
+                until: 'COMPLETE',
+                max_iterations: 3,
+              },
+            },
+          ],
+        },
+        workflowRun,
+        'claude',
+        undefined,
+        join(testDir, 'artifacts-runaway'),
+        join(testDir, 'logs-runaway'),
+        'main',
+        'docs/',
+        minimalConfig
+      );
+
+      // Cap still fires for genuine runaways (must not be removed by the BLOCKED fix).
+      expect(mockSendQueryDag.mock.calls.length).toBe(3);
+      expect(
+        (mockDeps.store.failWorkflowRun as Mock<(id: string, error: string) => Promise<void>>).mock
+          .calls.length
+      ).toBe(1);
+
+      type FailedEvent = {
+        event_type: string;
+        data?: { error?: string; terminal_blocked?: boolean };
+      };
+      const eventCalls = (
+        mockDeps.store.createWorkflowEvent as Mock<(event: FailedEvent) => Promise<void>>
+      ).mock.calls;
+      const failedEvents = eventCalls
+        .map(call => call[0])
+        .filter(ev => ev.event_type === 'node_failed');
+      expect(
+        failedEvents.some(ev => String(ev.data?.error ?? '').includes('exceeded max iterations'))
+      ).toBe(true);
+      expect(failedEvents.some(ev => ev.data?.terminal_blocked === true)).toBe(false);
+    });
+
+    it('COMPLETE still wins when both COMPLETE and BLOCKED appear', async () => {
+      mockSendQueryDag.mockImplementation(function* () {
+        yield {
+          type: 'assistant',
+          content: 'BLOCKED: should not matter\nCOMPLETE\n',
+        };
+        yield { type: 'result', sessionId: 'loop-complete-wins' };
+      });
+
+      const mockDeps = createMockDeps();
+      const platform = createMockPlatform();
+      const workflowRun = makeWorkflowRun('complete-wins-run');
+
+      await executeDagWorkflow(
+        mockDeps,
+        platform,
+        'conv-dag',
+        testDir,
+        {
+          name: 'dag-loop-complete-wins',
+          nodes: [
+            {
+              id: 'implement',
+              loop: {
+                prompt: 'Do task.',
+                until: 'COMPLETE',
+                max_iterations: 5,
+              },
+            },
+          ],
+        },
+        workflowRun,
+        'claude',
+        undefined,
+        join(testDir, 'artifacts-complete-wins'),
+        join(testDir, 'logs-complete-wins'),
+        'main',
+        'docs/',
+        minimalConfig
+      );
+
+      expect(mockSendQueryDag.mock.calls.length).toBe(1);
+      expect(
+        (mockDeps.store.failWorkflowRun as Mock<(id: string, error: string) => Promise<void>>).mock
+          .calls.length
+      ).toBe(0);
+      expect(
+        (mockDeps.store.completeWorkflowRun as Mock<(id: string) => Promise<void>>).mock.calls
+          .length
       ).toBe(1);
     });
 

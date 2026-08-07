@@ -26,6 +26,7 @@ import {
   buildPromptWithContext,
   detectCreditExhaustion,
   detectCompletionSignal,
+  detectBlockedSignal,
   detectPlanReviewApproval,
   stripCompletionTags,
   isInlineScript,
@@ -471,6 +472,37 @@ describe('detectCompletionSignal', () => {
 
   it('detects signal when tag names match case-insensitively', () => {
     expect(detectCompletionSignal('<Complete>ALL_CLEAN</complete>', 'ALL_CLEAN')).toBe(true);
+  });
+});
+
+describe('detectBlockedSignal (WO-HARNESS-BLOCKED-BUILDER-STOPS-01)', () => {
+  it('detects live-shape BLOCKED: reason on its own line', () => {
+    const output =
+      'Checked the worktree.\nBLOCKED: The required BDC_XO_PHASE1 paired bdc-xo worktree was not supplied\n';
+    const result = detectBlockedSignal(output);
+    expect(result.blocked).toBe(true);
+    expect(result.reason).toContain('BDC_XO_PHASE1');
+  });
+
+  it('detects BLOCKED=true with BLOCKED_REASON=', () => {
+    const output = 'COMPLETE=false\nBLOCKED=true\nBLOCKED_REASON=missing staging ref\n';
+    const result = detectBlockedSignal(output);
+    expect(result.blocked).toBe(true);
+    expect(result.reason).toBe('missing staging ref');
+  });
+
+  it('detects XML-wrapped BLOCKED token', () => {
+    const result = detectBlockedSignal('Hard stop.\n<promise>BLOCKED</promise>\n');
+    expect(result.blocked).toBe(true);
+    expect(result.reason.length).toBeGreaterThan(0);
+  });
+
+  it('does not treat prose "not blocked yet" as a terminal block', () => {
+    expect(detectBlockedSignal('The run is not blocked yet; keep going.').blocked).toBe(false);
+  });
+
+  it('does not treat COMPLETE=false alone as BLOCKED', () => {
+    expect(detectBlockedSignal('Still working\nCOMPLETE=false\n').blocked).toBe(false);
   });
 });
 
