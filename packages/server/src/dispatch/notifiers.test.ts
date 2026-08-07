@@ -18,6 +18,12 @@ describe('dispatch notifiers', () => {
     expect(readDispatchSecretFile('/tmp/token')).rejects.toThrow('dispatch_secret_file_required');
   });
 
+  test('rejects traversal out of the mounted secret directory', async () => {
+    expect(readDispatchSecretFile('/run/bdc-secrets/../../etc/passwd')).rejects.toThrow(
+      'dispatch_secret_file_required'
+    );
+  });
+
   test('reads file credentials and sends both configured legs', async () => {
     process.env.DISPATCH_TELEGRAM_TOKEN_FILE = '/run/bdc-secrets/telegram';
     process.env.DISPATCH_TELEGRAM_CHAT_ID = '123';
