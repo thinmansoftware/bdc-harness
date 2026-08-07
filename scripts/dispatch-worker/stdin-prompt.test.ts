@@ -107,4 +107,10 @@ describe('prompt stdin delivery', () => {
       createHash('sha256').update(prompt, 'utf8').digest('hex')
     );
   }, 15_000);
+
+  test('accepts the shared cancellation controller contract', async () => {
+    const cancel = { cancelled: false, cancel() { this.cancelled = true; } };
+    const result = await runAgent(await stdinHashConfig('cancelled'), message('cancel me', 'cancelled'), cancel);
+    expect(result.status).toBe('done');
+  }, 10_000);
 });

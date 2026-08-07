@@ -56,6 +56,7 @@ export const dispatchMessageSchema = z
     subject_key: z.string().nullable(),
     route_disposition: dispatchRouteDispositionSchema.nullable(),
     supersedes_id: z.string().nullable(),
+    repeat_reason: z.string().nullable(),
   })
   .openapi('DispatchMessage');
 
@@ -69,6 +70,8 @@ export const createDispatchMessageBodySchema = z
     body: z.string().min(1),
     not_before: z.string().optional(),
     priority: dispatchMessagePrioritySchema.optional(),
+    subject_key: z.string().min(1).nullable().optional(),
+    repeat_reason: z.string().min(1).nullable().optional(),
   })
   .strict()
   .openapi('CreateDispatchMessageBody');
@@ -86,6 +89,7 @@ export const listDispatchMessagesQuerySchema = z.object({
   recipient: z.string().optional(),
   status: dispatchMessageStatusSchema.optional(),
   limit: z.string().optional(),
+  subject_key: z.string().optional(),
 });
 
 export const claimDispatchMessageBodySchema = z
@@ -103,6 +107,7 @@ export const postDispatchResultBodySchema = z
     fencing_token: z.number().int().nonnegative(),
     result_body: z.string(),
     status: z.enum(['done', 'failed']).optional(),
+    task_outcome: dispatchTaskOutcomeSchema.nullable().optional(),
   })
   .strict()
   .openapi('PostDispatchResultBody');
@@ -120,6 +125,21 @@ export const renewDispatchLeaseBodySchema = z
   })
   .strict()
   .openapi('RenewDispatchLeaseBody');
+
+export const cancelDispatchMessageBodySchema = z
+  .object({ sender: z.string().min(1) })
+  .strict()
+  .openapi('CancelDispatchMessageBody');
+
+export const supersedeDispatchMessageBodySchema = z
+  .object({
+    sender: z.string().min(1),
+    body: z.string().min(1),
+    idempotency_key: z.string().min(1),
+    repeat_reason: z.string().trim().min(1),
+  })
+  .strict()
+  .openapi('SupersedeDispatchMessageBody');
 
 export const dispatchWorkerStatusSchema = z.enum(['available', 'unavailable']);
 

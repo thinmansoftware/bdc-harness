@@ -101,6 +101,7 @@ describe('SqliteAdapter', () => {
       'subject_key',
       'route_disposition',
       'supersedes_id',
+      'repeat_reason',
     ];
 
     test('fresh databases expose Phase 0 message columns and the canonical principal registry', async () => {
@@ -113,6 +114,10 @@ describe('SqliteAdapter', () => {
       for (const column of phase0Columns) {
         expect(columnNames.has(column)).toBe(true);
       }
+      const indexes = await db.query<{ name: string }>(
+        `SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_agent_dispatch_messages_subject_history'`
+      );
+      expect(indexes.rows).toEqual([{ name: 'idx_agent_dispatch_messages_subject_history' }]);
 
       const principals = await db.query<{
         principal_id: string;

@@ -30,7 +30,17 @@ import {
   renewMessageLease,
   resolveDispatchRecipient,
   assessDispatchRecipient,
+  normalizeDispatchSubjectKey,
 } from './dispatch';
+
+describe('Phase 1 subject identity', () => {
+  test('canonicalizes supported durable subjects and rejects whitespace or invalid shapes', () => {
+    expect(normalizeDispatchSubjectKey('wo:Wo-Harness-1')).toBe('wo:WO-HARNESS-1');
+    expect(normalizeDispatchSubjectKey('gh:OpenAI/CoDex#00042')).toBe('gh:openai/codex#42');
+    expect(() => normalizeDispatchSubjectKey(' wo:ONE')).toThrow('surrounding_whitespace');
+    expect(() => normalizeDispatchSubjectKey('motion:M-1')).toThrow('shape');
+  });
+});
 
 function cleanupDb(path: string): void {
   for (const suffix of ['', '-wal', '-shm']) {
@@ -1211,7 +1221,7 @@ describe('dispatch db', () => {
     ).toBeNull();
 
     // Cancelled message is no longer renewable.
-    await cancelMessage(message.id);
+    await cancelMessage({ id: message.id, sender: message.sender });
     expect(
       await renewMessageLease({ id: message.id, worker_id: 'worker-a', fencing_token: 1 })
     ).toBeNull();
@@ -1235,8 +1245,8 @@ describe('dispatch db', () => {
     const claim = await claimMessage({ id: message.id, worker_id: 'worker-a' });
     expect(claim?.status).toBe('claimed');
 
-    const cancelled = await cancelMessage(message.id);
-    expect(cancelled?.status).toBe('cancelled');
+    const cancelled = await cancelMessage({ id: message.id, sender: message.sender });
+    expect(cancelled.ok && cancelled.message.status).toBe('cancelled');
     const late = await postResult({
       id: message.id,
       worker_id: 'worker-a',

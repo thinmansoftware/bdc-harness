@@ -222,6 +222,7 @@ import {
   throttleResponseSchema,
 } from './schemas/admin.schemas';
 import {
+  cancelDispatchMessageBodySchema,
   claimDispatchMessageBodySchema,
   createDispatchMessageBodySchema,
   dispatchMailboxPrincipalBodySchema,
@@ -237,6 +238,7 @@ import {
   postDispatchResultBodySchema,
   renewDispatchLeaseBodySchema,
   registerDispatchWorkerBodySchema,
+  supersedeDispatchMessageBodySchema,
 } from './schemas/dispatch.schemas';
 import {
   boardRecipientResponseSchema,
@@ -749,7 +751,13 @@ const cancelDispatchMessageRoute = createRoute({
   path: '/api/dispatch/messages/{id}/cancel',
   tags: ['Dispatch'],
   summary: 'Cancel an agent dispatch message',
-  request: { params: dispatchMessageIdParamsSchema },
+  request: {
+    params: dispatchMessageIdParamsSchema,
+    body: {
+      content: { 'application/json': { schema: cancelDispatchMessageBodySchema } },
+      required: true,
+    },
+  },
   responses: {
     200: {
       content: { 'application/json': { schema: dispatchMessageSchema } },
@@ -758,6 +766,18 @@ const cancelDispatchMessageRoute = createRoute({
     404: jsonError('Not found'),
     500: jsonError('Server error'),
   },
+});
+
+const supersedeDispatchMessageRoute = createRoute({
+  method: 'post',
+  path: '/api/dispatch/messages/{id}/supersede',
+  tags: ['Dispatch'],
+  summary: 'Atomically replace a sender-owned dispatch message',
+  request: { params: dispatchMessageIdParamsSchema, body: {
+    content: { 'application/json': { schema: supersedeDispatchMessageBodySchema } }, required: true,
+  } },
+  responses: { 200: { content: { 'application/json': { schema: dispatchMessageSchema } }, description: 'Replacement message' },
+    404: jsonError('Not found'), 409: jsonError('Dispatch conflict'), 500: jsonError('Server error') },
 });
 
 const registerDispatchWorkerRoute = createRoute({
@@ -3576,6 +3596,7 @@ export function registerApiRoutes(
         recipient: c.req.query('recipient') ?? undefined,
         status: c.req.query('status') as dispatchDb.DispatchMessageStatus | undefined,
         limit: Number.isFinite(rawLimit) ? rawLimit : 100,
+        subject_key: c.req.query('subject_key') ?? undefined,
         allowBoardAlias:
           c.req.query('recipient') !== undefined &&
           c.req.query('status') === 'queued' &&
@@ -3594,6 +3615,7 @@ export function registerApiRoutes(
           recipient: c.req.query('recipient') ?? undefined,
           status: c.req.query('status') as dispatchDb.DispatchMessageStatus | undefined,
           limit: Number.isFinite(rawLimit) ? rawLimit : 100,
+          subject_key: c.req.query('subject_key') ?? undefined,
           allowBoardAlias: false,
         });
         return c.json(messages);
@@ -3674,6 +3696,7 @@ export function registerApiRoutes(
         fencing_token: body.fencing_token,
         result_body: body.result_body,
         status: body.status,
+        task_outcome: body.task_outcome,
       });
       if (!message) return apiError(c, 409, 'Stale fencing token or cancelled dispatch message');
       return c.json(message);
@@ -3706,12 +3729,30 @@ export function registerApiRoutes(
 
   registerOpenApiRoute(cancelDispatchMessageRoute, async c => {
     try {
-      const message = await dispatchDb.cancelMessage(c.req.param('id') ?? '');
-      if (!message) return apiError(c, 404, 'Dispatch message not found');
-      return c.json(message);
+      const body = getValidatedBody(c, cancelDispatchMessageBodySchema);
+      const result = await dispatchDb.cancelMessage({
+        id: c.req.param('id') ?? '',
+        sender: body.sender,
+      });
+      if (!result.ok) {
+        return apiError(c, result.reason === 'not_found' ? 404 : 409, result.reason);
+      }
+      return c.json(result.message);
     } catch (error) {
       getLog().error({ err: error }, 'dispatch_cancel_message_failed');
       return apiError(c, 500, 'Failed to cancel dispatch message');
+    }
+  });
+
+  registerOpenApiRoute(supersedeDispatchMessageRoute, async c => {
+    try {
+      const body = getValidatedBody(c, supersedeDispatchMessageBodySchema);
+      const result = await dispatchDb.supersedeMessage({ id: c.req.param('id') ?? '', ...body });
+      if (!result.ok) return apiError(c, result.reason === 'not_found' ? 404 : 409, result.reason);
+      return c.json(result.message);
+    } catch (error) {
+      getLog().error({ err: error }, 'dispatch_supersede_message_failed');
+      return apiError(c, 409, 'Failed to supersede dispatch message');
     }
   });
 

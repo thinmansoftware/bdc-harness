@@ -73,6 +73,14 @@ describe('PostgresAdapter', () => {
     adapter = new PostgresAdapter('postgresql://localhost:5432/testdb');
   });
 
+  test('Phase 1 migration includes repeat reason and subject history index', () => {
+    const migration = readFileSync(
+      resolve(import.meta.dir, '../../../../../migrations/042_agent_messaging_phase1.sql'), 'utf8'
+    );
+    expect(migration).toContain('repeat_reason TEXT');
+    expect(migration).toContain('idx_agent_dispatch_messages_subject_history');
+  });
+
   describe('Smart Cauldron reliability schema', () => {
     test('numbered migration defines the same additive tables and indexes as SQLite', () => {
       const migration = ['024_smart_cauldron_reliability.sql', '026_supervisor_incidents.sql']

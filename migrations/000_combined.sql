@@ -550,12 +550,17 @@ CREATE TABLE IF NOT EXISTS agent_dispatch_messages (
   escalated_tg_at TIMESTAMPTZ,
   escalated_sms_at TIMESTAMPTZ,
   subject_key TEXT,
+  repeat_reason TEXT,
   route_disposition TEXT CHECK (route_disposition IS NULL OR route_disposition IN ('unroutable', 'superseded')),
   supersedes_id UUID REFERENCES agent_dispatch_messages(id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_agent_dispatch_messages_recipient_status
   ON agent_dispatch_messages(recipient, status);
+
+CREATE INDEX IF NOT EXISTS idx_agent_dispatch_messages_subject_history
+  ON agent_dispatch_messages(subject_key, created_at DESC, id DESC)
+  WHERE subject_key IS NOT NULL;
 
 CREATE INDEX IF NOT EXISTS idx_agent_dispatch_messages_lease_expiry
   ON agent_dispatch_messages(lease_expires_at)

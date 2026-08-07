@@ -2,6 +2,7 @@ import { mkdir, mkdtemp, writeFile } from 'fs/promises';
 import { tmpdir, hostname, homedir } from 'os';
 import { join, resolve } from 'path';
 import { spawn } from 'bun';
+import { createHash } from 'crypto';
 import { isBoardAliasMessage, renderBoardMotionPrompt } from './board-motion';
 import {
   ACP_DEFAULT_IDLE_TIMEOUT_MS,
@@ -14,6 +15,7 @@ import {
   type AgentConfig,
 } from './adapters';
 import { createCancelController, runAcpAgent, type AcpRunResult } from './acp/session';
+import { killProcessTree } from './acp/kill-tree';
 import { createMcpCancelController, runMcpAgent, type McpRunResult } from './mcp/session';
 import { resolveOperatorToken } from './credentials';
 import { acquireInstanceLock, type InstanceLockHandle } from './instance-lock';
@@ -195,8 +197,53 @@ async function writeTranscript(data: Record<string, unknown>): Promise<string> {
   await mkdir(dir, { recursive: true });
   const messageId = (data.message as DispatchMessage | undefined)?.id ?? 'unknown';
   const path = join(dir, `${Date.now()}-${messageId}.json`);
-  await writeFile(path, JSON.stringify(data, null, 2), 'utf8');
+  await writeFile(path, JSON.stringify(summarizeTranscriptPayload(data), null, 2), 'utf8');
   return path;
+}
+
+const TRANSCRIPT_PREVIEW_BYTES = 256;
+
+export function summarizeTranscriptPayload(value: unknown): unknown {
+  if (typeof value === 'string') {
+    const bytes = Buffer.from(value, 'utf8');
+    return {
+      sha256: createHash('sha256').update(bytes).digest('hex'),
+      utf8_bytes: bytes.length,
+      preview: bytes.subarray(0, TRANSCRIPT_PREVIEW_BYTES).toString('utf8'),
+      truncated: bytes.length > TRANSCRIPT_PREVIEW_BYTES,
+    };
+  }
+  if (Array.isArray(value)) {
+    return { count: value.length, items: value.map(summarizeTranscriptPayload) };
+  }
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>).map(([key, item]) => [
+        key,
+        key === 'message' && item && typeof item === 'object'
+          ? { id: (item as DispatchMessage).id, task_type: (item as DispatchMessage).task_type }
+          : summarizeTranscriptPayload(item),
+      ])
+    );
+  }
+  return value;
+}
+
+export function classifyDispatchOutcome(exitCode: number, output: string): {
+  resultBody: string;
+  status: 'done' | 'failed';
+  taskOutcome: 'succeeded' | 'failed' | 'blocked' | null;
+} {
+  const lines = output.replace(/\r\n/g, '\n').split('\n');
+  const sentinel = /^DISPATCH_OUTCOME: (blocked|failed)$/i.exec(lines.at(-1)?.trim() ?? '');
+  if (sentinel) lines.pop();
+  const resultBody = lines.join('\n').trim();
+  if (exitCode !== 0) return { resultBody, status: 'failed', taskOutcome: 'failed' };
+  if (sentinel) {
+    const taskOutcome = sentinel[1]!.toLowerCase() as 'blocked' | 'failed';
+    return { resultBody, status: 'failed', taskOutcome };
+  }
+  return { resultBody, status: 'done', taskOutcome: resultBody ? 'succeeded' : null };
 }
 
 /**
@@ -332,10 +379,12 @@ async function runMcpLeg(
 
 export async function runAgent(
   config: AgentConfig,
-  message: DispatchMessage
+  message: DispatchMessage,
+  cancel?: ReturnType<typeof createCancelController>
 ): Promise<{
   resultBody: string;
   status: 'done' | 'failed';
+  taskOutcome: 'succeeded' | 'failed' | 'blocked' | null;
 }> {
   const cwd = await mkdtemp(join(tmpdir(), `bdc-dispatch-${message.recipient}-`));
   let command = config.command;
@@ -365,6 +414,7 @@ export async function runAgent(
     if (promptBytes > MAX_PROMPT_STDIN_BYTES) {
       return {
         status: 'failed',
+        taskOutcome: 'failed',
         resultBody: `Prompt payload is ${promptBytes} UTF-8 bytes; limit is ${MAX_PROMPT_STDIN_BYTES} bytes.`,
       };
     }
@@ -379,6 +429,11 @@ export async function runAgent(
     stderr: 'pipe',
     stdin: config.kind === 'fusion' ? 'ignore' : 'pipe',
   });
+  let killPromise: Promise<void> | undefined;
+  const cancellationPoll = setInterval(() => {
+    if (cancel?.cancelled && !killPromise) killPromise = killProcessTree(proc.pid);
+  }, 25);
+  cancellationPoll.unref?.();
   if (promptBody !== undefined) {
     const stdin = proc.stdin;
     if (!stdin) throw new Error('prompt_stdin_pipe_unavailable');
@@ -389,15 +444,17 @@ export async function runAgent(
       const detail = error instanceof Error ? error.message : String(error);
       return {
         status: 'failed',
+        taskOutcome: 'failed',
         resultBody: `Failed to deliver prompt over stdin: ${detail}`,
       };
     }
   }
   const [stdout, stderr, exitCode] = await Promise.all([
-    new Response(proc.stdout).text(),
-    new Response(proc.stderr).text(),
-    proc.exited,
-  ]);
+    new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited,
+  ]).finally(async () => {
+    clearInterval(cancellationPoll);
+    await killPromise;
+  });
   const transcript = await writeTranscript({
     message,
     command,
@@ -407,10 +464,12 @@ export async function runAgent(
     stderr,
     exitCode,
   });
-  const finalText = stdout.trim() || stderr.trim() || `No output. See transcript: ${transcript}`;
+  const classified = classifyDispatchOutcome(exitCode, stdout.trim() || stderr.trim());
+  const finalText = classified.resultBody || `No output. See transcript: ${transcript}`;
   return {
     resultBody: `${finalText}\n\nTranscript: ${transcript}`,
-    status: exitCode === 0 ? 'done' : 'failed',
+    status: classified.status,
+    taskOutcome: classified.taskOutcome,
   };
 }
 
@@ -467,14 +526,18 @@ async function processMessage(
     }, config.lease_renew_interval_ms);
     renewTimer.unref?.();
 
-    let result: { resultBody: string; status: 'done' | 'failed' };
+    let result: {
+      resultBody: string;
+      status: 'done' | 'failed';
+      taskOutcome?: 'succeeded' | 'failed' | 'blocked' | null;
+    };
     try {
       result =
         agentConfig.kind === 'acp'
           ? await runAcpLeg(agentConfig, claimed, cancel)
           : agentConfig.kind === 'mcp'
             ? await runMcpLeg(agentConfig, claimed, cancel)
-            : await runAgent(agentConfig, claimed);
+            : await runAgent(agentConfig, claimed, cancel);
     } finally {
       clearInterval(renewTimer);
     }
@@ -486,6 +549,7 @@ async function processMessage(
         fencing_token: claimed.fencing_token,
         result_body: result.resultBody,
         status: result.status,
+        task_outcome: result.taskOutcome ?? (result.status === 'failed' ? 'failed' : null),
       }),
     });
   } catch (error) {

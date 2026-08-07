@@ -2,6 +2,27 @@
 
 Operator-run watcher for `WO-HARNESS-DISPATCH-DROPBOX-V1-01`.
 
+## Phase 1 outcome and privacy contract
+
+The worker posts `task_outcome` independently of queue status. A clean exit with
+non-empty output succeeds; clean empty output remains `done` with an unknown
+outcome; a non-zero exit fails. Agents may put `DISPATCH_OUTCOME: blocked` or
+`DISPATCH_OUTCOME: failed` on the final line. The worker strips that line, and a
+non-zero exit always takes precedence.
+
+Lease-renewal failure and external cancellation cancel the running transport;
+CLI transports must terminate and verify the complete process tree before a
+result can be posted. Phase 1 notices and escalation reconciliation apply only
+at or after a valid `DISPATCH_PHASE1_ACTIVATED_AT`; an absent or invalid value
+keeps them dark. Telegram and SMS additionally require sender authentication in
+`enforce` mode and their individual enable flags. Credentials are read from
+configured secret-file paths, never from environment secret values.
+
+On-disk transcripts contain SHA-256 digests, UTF-8 byte counts, bounded
+previews, structural counts, transport state, timing, and process evidence.
+They never contain full prompts, message bodies, model output, headers, or
+tokens. The database result body remains the durable result.
+
 ## Setup
 
 1. Copy `scripts/dispatch-worker/config.example.json` to `scripts/dispatch-worker/config.local.json`.
