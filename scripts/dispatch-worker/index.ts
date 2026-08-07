@@ -2,6 +2,7 @@ import { mkdir, mkdtemp, writeFile } from 'fs/promises';
 import { tmpdir, hostname, homedir } from 'os';
 import { join, resolve } from 'path';
 import { spawn } from 'bun';
+import { createHash } from 'crypto';
 import { isBoardAliasMessage, renderBoardMotionPrompt } from './board-motion';
 import {
   ACP_DEFAULT_IDLE_TIMEOUT_MS,
@@ -37,6 +38,30 @@ interface DispatchMessage {
   fencing_token: number;
   recipient_alias?: 'board' | null;
   resolved_recipient?: string | null;
+}
+
+type DispatchTaskOutcome = 'succeeded' | 'failed' | 'blocked';
+const TRANSCRIPT_PREVIEW_BYTES = 512;
+
+export function classifyDispatchOutcome(exitCode: number, output: string, refusal = false): {
+  resultBody: string; status: 'done' | 'failed'; taskOutcome: DispatchTaskOutcome | null;
+} {
+  const lines = output.replace(/\r\n/g, '\n').split('\n');
+  while (lines.at(-1) === '') lines.pop();
+  const sentinel = /^DISPATCH_OUTCOME: (blocked|failed)$/.exec(lines.at(-1) ?? '');
+  if (sentinel) lines.pop();
+  const resultBody = lines.join('\n').trim();
+  if (exitCode !== 0) return { resultBody, status: 'failed', taskOutcome: 'failed' };
+  if (refusal || sentinel?.[1] === 'blocked') return { resultBody, status: 'failed', taskOutcome: 'blocked' };
+  if (sentinel?.[1] === 'failed') return { resultBody, status: 'failed', taskOutcome: 'failed' };
+  return { resultBody, status: 'done', taskOutcome: resultBody ? 'succeeded' : null };
+}
+
+export function summarizeTranscriptPayload(value: unknown): { sha256: string; utf8Bytes: number; preview: string } {
+  const text = typeof value === 'string' ? value : JSON.stringify(value);
+  const bytes = Buffer.from(text, 'utf8');
+  return { sha256: createHash('sha256').update(bytes).digest('hex'), utf8Bytes: bytes.length,
+    preview: bytes.subarray(0, TRANSCRIPT_PREVIEW_BYTES).toString('utf8') };
 }
 
 interface BoardDeliveryConfig {
@@ -195,7 +220,19 @@ async function writeTranscript(data: Record<string, unknown>): Promise<string> {
   await mkdir(dir, { recursive: true });
   const messageId = (data.message as DispatchMessage | undefined)?.id ?? 'unknown';
   const path = join(dir, `${Date.now()}-${messageId}.json`);
-  await writeFile(path, JSON.stringify(data, null, 2), 'utf8');
+  const safe = Object.fromEntries(Object.entries(data).map(([key, value]) => {
+    if (key === 'message') {
+      const message = value as DispatchMessage;
+      return [key, { id: message.id, task_type: message.task_type, sender: message.sender,
+        recipient: message.recipient, body: summarizeTranscriptPayload(message.body) }];
+    }
+    if (key === 'updates' && Array.isArray(value)) return [key, { count: value.length,
+      types: [...new Set(value.map(item => typeof item === 'object' && item ? String((item as Record<string, unknown>).type ?? 'unknown') : typeof item))] }];
+    if (['stdout', 'stderr', 'finalText', 'error', 'args', 'command', 'cwd'].includes(key))
+      return [key, summarizeTranscriptPayload(value)];
+    return [key, value];
+  }));
+  await writeFile(path, JSON.stringify(safe, null, 2), 'utf8');
   return path;
 }
 
@@ -336,6 +373,7 @@ export async function runAgent(
 ): Promise<{
   resultBody: string;
   status: 'done' | 'failed';
+  taskOutcome: DispatchTaskOutcome | null;
 }> {
   const cwd = await mkdtemp(join(tmpdir(), `bdc-dispatch-${message.recipient}-`));
   let command = config.command;
@@ -365,6 +403,7 @@ export async function runAgent(
     if (promptBytes > MAX_PROMPT_STDIN_BYTES) {
       return {
         status: 'failed',
+        taskOutcome: 'failed',
         resultBody: `Prompt payload is ${promptBytes} UTF-8 bytes; limit is ${MAX_PROMPT_STDIN_BYTES} bytes.`,
       };
     }
@@ -389,6 +428,7 @@ export async function runAgent(
       const detail = error instanceof Error ? error.message : String(error);
       return {
         status: 'failed',
+        taskOutcome: 'failed',
         resultBody: `Failed to deliver prompt over stdin: ${detail}`,
       };
     }
@@ -407,10 +447,12 @@ export async function runAgent(
     stderr,
     exitCode,
   });
-  const finalText = stdout.trim() || stderr.trim() || `No output. See transcript: ${transcript}`;
+  const classified = classifyDispatchOutcome(exitCode, stdout.trim() || stderr.trim());
+  const finalText = classified.resultBody || `No output. See transcript: ${transcript}`;
   return {
     resultBody: `${finalText}\n\nTranscript: ${transcript}`,
-    status: exitCode === 0 ? 'done' : 'failed',
+    status: classified.status,
+    taskOutcome: classified.taskOutcome,
   };
 }
 
@@ -467,7 +509,7 @@ async function processMessage(
     }, config.lease_renew_interval_ms);
     renewTimer.unref?.();
 
-    let result: { resultBody: string; status: 'done' | 'failed' };
+    let result: { resultBody: string; status: 'done' | 'failed'; taskOutcome?: DispatchTaskOutcome | null };
     try {
       result =
         agentConfig.kind === 'acp'
@@ -486,6 +528,7 @@ async function processMessage(
         fencing_token: claimed.fencing_token,
         result_body: result.resultBody,
         status: result.status,
+        task_outcome: result.taskOutcome,
       }),
     });
   } catch (error) {

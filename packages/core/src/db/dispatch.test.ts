@@ -1211,7 +1211,7 @@ describe('dispatch db', () => {
     ).toBeNull();
 
     // Cancelled message is no longer renewable.
-    await cancelMessage(message.id);
+    await cancelMessage({ id: message.id, sender: message.sender });
     expect(
       await renewMessageLease({ id: message.id, worker_id: 'worker-a', fencing_token: 1 })
     ).toBeNull();
@@ -1235,8 +1235,8 @@ describe('dispatch db', () => {
     const claim = await claimMessage({ id: message.id, worker_id: 'worker-a' });
     expect(claim?.status).toBe('claimed');
 
-    const cancelled = await cancelMessage(message.id);
-    expect(cancelled?.status).toBe('cancelled');
+    const cancelled = await cancelMessage({ id: message.id, sender: message.sender });
+    expect(cancelled.ok && cancelled.message.status).toBe('cancelled');
     const late = await postResult({
       id: message.id,
       worker_id: 'worker-a',

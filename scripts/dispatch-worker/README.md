@@ -129,3 +129,32 @@ re-establishes after a cold boot -- those require a live pass from the operator 
 ```bash
 bun run scripts/dispatch-worker/verify-reboot-recovery.ts
 ```
+# Phase 1 honest messaging
+
+Workers may place `DISPATCH_OUTCOME: blocked` or `DISPATCH_OUTCOME: failed` on
+the final output line. The worker strips that line; a nonzero process exit
+always wins and is recorded as failed. Empty exit-zero output remains an
+unknown outcome, never a successful one.
+
+`DISPATCH_PHASE1_ACTIVATED_AT` is an ISO timestamp boundary. When absent or
+invalid, outcome notices and escalation reconciliation are disabled so legacy
+mail cannot create a storm. Failed, blocked, and unknown post-boundary results
+receive a bounded, idempotent blocker notice.
+
+Cancellation reaches every transport controller. CLI cancellation enumerates,
+kills, and verifies the process tree; a cancelled run cannot post success.
+Transcripts contain hashes, UTF-8 byte counts, bounded previews, structural
+update metadata, transport state, duration, and kill evidence. They never
+contain complete prompts, output, request headers, or tokens.
+
+The escalation chain is seat blocker -> internal XO handoff -> John-facing
+Telegram at 4h and SMS at 24h. Both external legs default off and remain off
+unless `DISPATCH_SENDER_AUTH_MODE=enforce` and the matching enable flag is
+explicit. Credentials are read only through configured files below
+`/run/bdc-secrets/`; secret values are never environment variables.
+
+Run focused proof with:
+
+```sh
+bun test ./scripts/dispatch-worker/stdin-prompt.test.ts ./scripts/dispatch-worker/acp/kill-tree.test.ts ./scripts/dispatch-worker/acp/session.test.ts ./scripts/dispatch-worker/mcp/session.test.ts ./scripts/dispatch-worker/outcome-transcript.test.ts
+```

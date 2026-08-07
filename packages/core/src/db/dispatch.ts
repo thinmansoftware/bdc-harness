@@ -58,6 +58,7 @@ export interface DispatchMessage {
   subject_key: string | null;
   route_disposition: DispatchRouteDisposition | null;
   supersedes_id: string | null;
+  repeat_reason: string | null;
 }
 
 export interface DispatchWorker {
@@ -165,6 +166,15 @@ function canonicalizePrincipal(principal: string): string {
   return principal.trim().toLowerCase();
 }
 
+export function normalizeDispatchSubjectKey(value: string): string {
+  if (value !== value.trim()) throw new Error('dispatch_subject_key_invalid:whitespace');
+  const wo = /^wo:(WO-[A-Z0-9]+(?:-[A-Z0-9]+)*)$/.exec(value);
+  if (wo) return `wo:${wo[1]}`;
+  const gh = /^gh:([A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?)\/([A-Za-z0-9_.-]+)#([1-9][0-9]*)$/.exec(value);
+  if (gh) return `gh:${gh[1]!.toLowerCase()}/${gh[2]!.toLowerCase()}#${BigInt(gh[3]!).toString()}`;
+  throw new Error('dispatch_subject_key_invalid:shape');
+}
+
 function isActivePrincipal(row: DispatchPrincipalRow): boolean {
   return row.active === true || row.active === 1;
 }
@@ -265,6 +275,9 @@ export async function createMessage(data: {
   recipient_alias?: 'board' | null;
   motion_id?: string | null;
   motion_revision_sha?: string | null;
+  subject_key?: string | null;
+  repeat_reason?: string | null;
+  supersedes_id?: string | null;
 }): Promise<DispatchMessage> {
   const db = getDatabase();
   const existing = await db.query<DispatchMessageRow>(
@@ -273,6 +286,16 @@ export async function createMessage(data: {
   );
   const existingRow = existing.rows[0];
   if (existingRow) return normalizeMessage(existingRow);
+
+  const subjectKey = data.subject_key == null ? null : normalizeDispatchSubjectKey(data.subject_key);
+  const repeatReason = data.repeat_reason?.trim() || null;
+  if (subjectKey) {
+    const prior = await db.query<{ id: string }>(
+      `SELECT id FROM agent_dispatch_messages WHERE subject_key = $1
+       AND (status IN ('done', 'failed') OR task_outcome = 'blocked'
+         OR acknowledged_at IS NOT NULL OR addressed_at IS NOT NULL) LIMIT 1`, [subjectKey]);
+    if (prior.rowCount > 0 && !repeatReason) throw new Error('repeat_reason_required');
+  }
 
   const recipientAssessment = await assessDispatchRecipient(data.recipient);
   if (!recipientAssessment.ok) {
@@ -286,8 +309,8 @@ export async function createMessage(data: {
   const result = await db.query<DispatchMessageRow>(
     `INSERT INTO agent_dispatch_messages
      (id, correlation_id, idempotency_key, task_type, sender, recipient, body, status, created_at, not_before, priority, fencing_token,
-      recipient_alias, motion_id, motion_revision_sha)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, 'queued', $8, $9, $10, 0, $11, $12, $13)
+      recipient_alias, motion_id, motion_revision_sha, subject_key, repeat_reason, supersedes_id)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, 'queued', $8, $9, $10, 0, $11, $12, $13, $14, $15, $16)
      ON CONFLICT (idempotency_key) DO UPDATE SET idempotency_key = EXCLUDED.idempotency_key
      RETURNING *`,
     [
@@ -304,6 +327,9 @@ export async function createMessage(data: {
       data.recipient_alias ?? null,
       data.motion_id ?? null,
       data.motion_revision_sha ?? null,
+      subjectKey,
+      repeatReason,
+      data.supersedes_id ?? null,
     ]
   );
   const row = result.rows[0];
@@ -325,6 +351,7 @@ export async function listMessages(filters: {
   status?: DispatchMessageStatus;
   limit?: number;
   allowBoardAlias?: boolean;
+  subject_key?: string;
 }): Promise<DispatchMessage[]> {
   const clauses: string[] = [];
   const params: unknown[] = [];
@@ -352,6 +379,10 @@ export async function listMessages(filters: {
     params.push(filters.status);
     clauses.push(`status = $${params.length}`);
   }
+  if (filters.subject_key !== undefined) {
+    params.push(normalizeDispatchSubjectKey(filters.subject_key));
+    clauses.push(`subject_key = $${params.length}`);
+  }
   if (filters.status === 'queued') {
     params.push(nowIso());
     clauses.push(`(not_before IS NULL OR not_before <= $${params.length})`);
@@ -360,7 +391,9 @@ export async function listMessages(filters: {
   params.push(Math.max(1, Math.min(filters.limit ?? 100, 500)));
   const where = clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : '';
   const order =
-    filters.status === 'queued'
+    filters.subject_key !== undefined
+      ? 'ORDER BY created_at DESC, id DESC'
+      : filters.status === 'queued'
       ? "ORDER BY CASE priority WHEN 'blocker' THEN 0 WHEN 'normal' THEN 1 ELSE 2 END, created_at ASC"
       : 'ORDER BY created_at ASC';
   const result = await getDatabase().query<DispatchMessageRow>(
@@ -592,7 +625,8 @@ export async function claimMessage(data: {
       return null;
     }
 
-    await txQuery(
+    const expectedFence = current.fencing_token + 1;
+    const claimUpdate = await txQuery(
       `UPDATE agent_dispatch_messages
        SET status = 'claimed',
            claimed_at = $2,
@@ -608,7 +642,12 @@ export async function claimMessage(data: {
            status = 'queued'
            OR (status = 'claimed' AND lease_expires_at <= $2)
          )
-         AND (not_before IS NULL OR not_before <= $2)`,
+         AND (not_before IS NULL OR not_before <= $2)
+         AND NOT EXISTS (
+           SELECT 1 FROM agent_dispatch_messages replacement
+           WHERE replacement.supersedes_id = agent_dispatch_messages.id
+             AND replacement.status <> 'cancelled'
+         )`,
       [
         data.id,
         now,
@@ -619,9 +658,11 @@ export async function claimMessage(data: {
         resolvedRecipient?.fencing_token ?? null,
       ]
     );
+    if (claimUpdate.rowCount !== 1) return null;
     const claimed = await txQuery<DispatchMessageRow>(
-      'SELECT * FROM agent_dispatch_messages WHERE id = $1 AND lease_owner = $2',
-      [data.id, data.worker_id]
+      `SELECT * FROM agent_dispatch_messages
+       WHERE id = $1 AND status = 'claimed' AND lease_owner = $2 AND fencing_token = $3`,
+      [data.id, data.worker_id, expectedFence]
     );
     const claimedRow = claimed.rows[0];
     if (claimedRow?.recipient_alias === 'board' && resolvedRecipient) {
@@ -846,23 +887,30 @@ export async function postResult(data: {
   fencing_token: number;
   result_body: string;
   status?: 'done' | 'failed';
+  task_outcome?: DispatchTaskOutcome | null;
 }): Promise<DispatchMessage | null> {
   const db = getDatabase();
   const now = nowIso();
-  const status = data.status ?? 'done';
+  let status = data.status ?? 'done';
+  let outcome: DispatchTaskOutcome | null = data.task_outcome === undefined
+    ? (status === 'failed' ? 'failed' : null) : data.task_outcome;
+  if (outcome === 'failed' || outcome === 'blocked') status = 'failed';
+  if (outcome === 'succeeded' && (status !== 'done' || data.result_body.trim() === ''))
+    outcome = status === 'failed' ? 'failed' : null;
   if (db.dialect === 'postgres') {
     const result = await db.query<DispatchMessageRow>(
       `UPDATE agent_dispatch_messages
        SET status = $4,
            result_body = $5,
            completed_at = $6,
-           lease_expires_at = NULL
+           lease_expires_at = NULL,
+           task_outcome = $7
        WHERE id = $1
          AND lease_owner = $2
          AND fencing_token = $3
          AND status = 'claimed'
        RETURNING *`,
-      [data.id, data.worker_id, data.fencing_token, status, data.result_body, now]
+      [data.id, data.worker_id, data.fencing_token, status, data.result_body, now, outcome]
     );
     const row = result.rows[0];
     return row ? normalizeMessage(row) : null;
@@ -873,12 +921,13 @@ export async function postResult(data: {
      SET status = $4,
          result_body = $5,
          completed_at = $6,
-         lease_expires_at = NULL
+         lease_expires_at = NULL,
+         task_outcome = $7
      WHERE id = $1
        AND lease_owner = $2
        AND fencing_token = $3
        AND status = 'claimed'`,
-    [data.id, data.worker_id, data.fencing_token, status, data.result_body, now]
+    [data.id, data.worker_id, data.fencing_token, status, data.result_body, now, outcome]
   );
   if (result.rowCount !== 1) return null;
   return getMessage(data.id);
@@ -933,30 +982,101 @@ export async function renewMessageLease(data: {
   return getMessage(data.id);
 }
 
-export async function cancelMessage(id: string): Promise<DispatchMessage | null> {
+export type DispatchMutationResult = { ok: true; message: DispatchMessage } | {
+  ok: false; reason: 'not_found' | 'actor_mismatch' | 'terminal' | 'superseded' | 'not_queued';
+};
+
+export async function cancelMessage(data: { id: string; sender: string }): Promise<DispatchMutationResult> {
   const db = getDatabase();
   const now = nowIso();
-  if (db.dialect === 'postgres') {
-    const result = await db.query<DispatchMessageRow>(
+  return db.withTransaction(async query => {
+    const found = await query<DispatchMessageRow>('SELECT * FROM agent_dispatch_messages WHERE id = $1', [data.id]);
+    if (!found.rows[0]) return { ok: false, reason: 'not_found' };
+    const current = normalizeMessage(found.rows[0]);
+    if (canonicalizePrincipal(current.sender) !== canonicalizePrincipal(data.sender)) return { ok: false, reason: 'actor_mismatch' };
+    if (current.route_disposition === 'superseded') return { ok: false, reason: 'superseded' };
+    if (current.status === 'cancelled') return { ok: true, message: current };
+    if (current.status !== 'queued' && current.status !== 'claimed') return { ok: false, reason: 'terminal' };
+    await query(
       `UPDATE agent_dispatch_messages
        SET status = 'cancelled',
            completed_at = $2,
-           lease_expires_at = NULL
-       WHERE id = $1 AND status IN ('queued', 'claimed')
-       RETURNING *`,
-      [id, now]
+           lease_expires_at = NULL, lease_owner = NULL
+       WHERE id = $1 AND status IN ('queued', 'claimed')`,
+      [data.id, now]
     );
-    const row = result.rows[0];
-    return row ? normalizeMessage(row) : getMessage(id);
-  }
+    const final = await query<DispatchMessageRow>('SELECT * FROM agent_dispatch_messages WHERE id = $1', [data.id]);
+    return { ok: true, message: normalizeMessage(final.rows[0]!) };
+  });
+}
 
-  await db.query(
-    `UPDATE agent_dispatch_messages
-     SET status = 'cancelled',
-         completed_at = $2,
-         lease_expires_at = NULL
-     WHERE id = $1 AND status IN ('queued', 'claimed')`,
-    [id, now]
-  );
-  return getMessage(id);
+export async function supersedeMessage(data: {
+  id: string; sender: string; replacement: Omit<Parameters<typeof createMessage>[0], 'sender' | 'supersedes_id'>;
+}): Promise<DispatchMutationResult> {
+  const db = getDatabase();
+  return db.withTransaction(async query => {
+    const found = await query<DispatchMessageRow>('SELECT * FROM agent_dispatch_messages WHERE id = $1', [data.id]);
+    if (!found.rows[0]) return { ok: false, reason: 'not_found' };
+    const source = normalizeMessage(found.rows[0]);
+    if (canonicalizePrincipal(source.sender) !== canonicalizePrincipal(data.sender)) return { ok: false, reason: 'actor_mismatch' };
+    if (source.status !== 'queued' || source.claimed_at || source.acknowledged_at) return { ok: false, reason: 'not_queued' };
+    const existingReplacement = await query<DispatchMessageRow>('SELECT * FROM agent_dispatch_messages WHERE supersedes_id = $1', [data.id]);
+    if (existingReplacement.rows[0]) return { ok: true, message: normalizeMessage(existingReplacement.rows[0]) };
+    const replacement = await createMessage({ ...data.replacement, sender: data.sender, supersedes_id: data.id });
+    await query(`UPDATE agent_dispatch_messages SET status = 'cancelled', route_disposition = 'superseded',
+      completed_at = $2 WHERE id = $1 AND status = 'queued'`, [data.id, nowIso()]);
+    return { ok: true, message: replacement };
+  });
+}
+
+export type DispatchEscalationLeg = 'telegram' | 'sms';
+
+export async function claimDispatchEscalation(data: {
+  id: string; leg: DispatchEscalationLeg; now?: string;
+}): Promise<DispatchMessage | null> {
+  const column = data.leg === 'telegram' ? 'escalated_tg_at' : 'escalated_sms_at';
+  const threshold = data.leg === 'telegram' ? 4 * 60 * 60 * 1000 : 24 * 60 * 60 * 1000;
+  const now = data.now ?? nowIso();
+  const cutoff = new Date(new Date(now).getTime() - threshold).toISOString();
+  const result = await getDatabase().query(
+    `UPDATE agent_dispatch_messages SET ${column} = $2 WHERE id = $1 AND ${column} IS NULL
+     AND priority = 'blocker' AND COALESCE(resolved_recipient, recipient) = 'xo'
+     AND addressed_at IS NULL AND status <> 'cancelled'
+     AND (route_disposition IS NULL OR route_disposition <> 'superseded')
+     AND created_at <= $3`, [data.id, now, cutoff]);
+  return result.rowCount === 1 ? getMessage(data.id) : null;
+}
+
+export async function releaseDispatchEscalationClaim(data: {
+  id: string; leg: DispatchEscalationLeg; claimed_at: string;
+}): Promise<boolean> {
+  const column = data.leg === 'telegram' ? 'escalated_tg_at' : 'escalated_sms_at';
+  const result = await getDatabase().query(
+    `UPDATE agent_dispatch_messages SET ${column} = NULL WHERE id = $1 AND ${column} = $2`,
+    [data.id, data.claimed_at]);
+  return result.rowCount === 1;
+}
+
+/** Deterministic crash-gap owner; `outcome-notice:<id>` prevents duplicate notices. */
+export async function reconcileDispatchOutcomeNotices(activatedAt: string): Promise<number> {
+  if (!Number.isFinite(Date.parse(activatedAt))) return 0;
+  const candidates = await getDatabase().query<DispatchMessageRow>(
+    `SELECT source.* FROM agent_dispatch_messages source WHERE source.created_at >= $1
+     AND source.sender <> 'dispatch' AND source.status IN ('done', 'failed')
+     AND (source.task_outcome IS NULL OR source.task_outcome IN ('failed', 'blocked'))
+     AND NOT EXISTS (SELECT 1 FROM agent_dispatch_messages notice
+       WHERE notice.idempotency_key = 'outcome-notice:' || source.id) LIMIT 100`, [activatedAt]);
+  let created = 0;
+  for (const row of candidates.rows) {
+    const source = normalizeMessage(row);
+    try {
+      await createMessage({ correlation_id: source.correlation_id,
+        idempotency_key: `outcome-notice:${source.id}`, task_type: 'agent_message', sender: 'dispatch',
+        recipient: source.sender, priority: 'blocker', subject_key: source.subject_key,
+        repeat_reason: source.subject_key ? 'system outcome notice' : null,
+        body: JSON.stringify({ source_id: source.id, status: source.status, task_outcome: source.task_outcome }) });
+      created++;
+    } catch (error) { log.warn({ sourceId: source.id, error: error instanceof Error ? error.message : 'unknown' }, 'dispatch_outcome_notice_failed'); }
+  }
+  return created;
 }

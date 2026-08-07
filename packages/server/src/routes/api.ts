@@ -234,6 +234,7 @@ import {
   dispatchMessageIdParamsSchema,
   dispatchMessageListResponseSchema,
   dispatchMessageSchema,
+  dispatchSenderBodySchema,
   dispatchWorkerSchema,
   dispatchStatusQuerySchema,
   dispatchStatusResponseSchema,
@@ -755,7 +756,9 @@ const cancelDispatchMessageRoute = createRoute({
   path: '/api/dispatch/messages/{id}/cancel',
   tags: ['Dispatch'],
   summary: 'Cancel an agent dispatch message',
-  request: { params: dispatchMessageIdParamsSchema },
+  request: { params: dispatchMessageIdParamsSchema, body: {
+    content: { 'application/json': { schema: dispatchSenderBodySchema } }, required: true,
+  } },
   responses: {
     200: {
       content: { 'application/json': { schema: dispatchMessageSchema } },
@@ -3577,6 +3580,9 @@ export function registerApiRoutes(
       if (error instanceof Error && error.message.startsWith('dispatch_recipient_rejected:')) {
         return apiError(c, 400, error.message);
       }
+      if (error instanceof Error && error.message === 'repeat_reason_required') {
+        return apiError(c, 409, error.message);
+      }
       if (error instanceof Error && error.message.includes('invalid')) {
         return apiError(c, 400, error.message);
       }
@@ -3591,6 +3597,7 @@ export function registerApiRoutes(
       const messages = await dispatchDb.listMessages({
         recipient: c.req.query('recipient') ?? undefined,
         status: c.req.query('status') as dispatchDb.DispatchMessageStatus | undefined,
+        subject_key: c.req.query('subject_key') ?? undefined,
         limit: Number.isFinite(rawLimit) ? rawLimit : 100,
         allowBoardAlias:
           c.req.query('recipient') !== undefined &&
@@ -3609,6 +3616,7 @@ export function registerApiRoutes(
         const messages = await dispatchDb.listMessages({
           recipient: c.req.query('recipient') ?? undefined,
           status: c.req.query('status') as dispatchDb.DispatchMessageStatus | undefined,
+          subject_key: c.req.query('subject_key') ?? undefined,
           limit: Number.isFinite(rawLimit) ? rawLimit : 100,
           allowBoardAlias: false,
         });
@@ -3690,8 +3698,14 @@ export function registerApiRoutes(
         fencing_token: body.fencing_token,
         result_body: body.result_body,
         status: body.status,
+        task_outcome: body.task_outcome,
       });
       if (!message) return apiError(c, 409, 'Stale fencing token or cancelled dispatch message');
+      const activatedAt = process.env.DISPATCH_PHASE1_ACTIVATED_AT;
+      if (activatedAt) {
+        void dispatchDb.reconcileDispatchOutcomeNotices(activatedAt).catch(error =>
+          getLog().warn({ messageId: message.id, err: error }, 'dispatch_outcome_notice_reconcile_failed'));
+      }
       return c.json(message);
     } catch (error) {
       getLog().error({ err: error }, 'dispatch_post_result_failed');
@@ -3722,9 +3736,10 @@ export function registerApiRoutes(
 
   registerOpenApiRoute(cancelDispatchMessageRoute, async c => {
     try {
-      const message = await dispatchDb.cancelMessage(c.req.param('id') ?? '');
-      if (!message) return apiError(c, 404, 'Dispatch message not found');
-      return c.json(message);
+      const body = getValidatedBody(c, dispatchSenderBodySchema);
+      const result = await dispatchDb.cancelMessage({ id: c.req.param('id') ?? '', sender: body.sender });
+      if (!result.ok) return apiError(c, result.reason === 'not_found' ? 404 : 409, result.reason);
+      return c.json(result.message);
     } catch (error) {
       getLog().error({ err: error }, 'dispatch_cancel_message_failed');
       return apiError(c, 500, 'Failed to cancel dispatch message');

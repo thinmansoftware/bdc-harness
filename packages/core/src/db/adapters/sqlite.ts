@@ -344,6 +344,7 @@ export class SqliteAdapter implements IDatabase {
         ['escalated_tg_at', 'TEXT'],
         ['escalated_sms_at', 'TEXT'],
         ['subject_key', 'TEXT'],
+        ['repeat_reason', 'TEXT'],
         [
           'route_disposition',
           "TEXT CHECK (route_disposition IS NULL OR route_disposition IN ('unroutable', 'superseded'))",
@@ -779,6 +780,7 @@ export class SqliteAdapter implements IDatabase {
         escalated_tg_at TEXT,
         escalated_sms_at TEXT,
         subject_key TEXT,
+        repeat_reason TEXT,
         route_disposition TEXT CHECK (route_disposition IS NULL OR route_disposition IN ('unroutable', 'superseded')),
         supersedes_id TEXT REFERENCES agent_dispatch_messages(id)
       );
@@ -1448,6 +1450,7 @@ export class SqliteAdapter implements IDatabase {
       CREATE INDEX IF NOT EXISTS idx_messages_conversation_id ON remote_agent_messages(conversation_id, created_at ASC);
       CREATE INDEX IF NOT EXISTS idx_agent_dispatch_messages_recipient_status ON agent_dispatch_messages(recipient, status);
       CREATE INDEX IF NOT EXISTS idx_agent_dispatch_messages_lease_expiry ON agent_dispatch_messages(lease_expires_at) WHERE status = 'claimed';
+      CREATE INDEX IF NOT EXISTS idx_agent_dispatch_messages_subject_history ON agent_dispatch_messages(subject_key, created_at DESC, id DESC) WHERE subject_key IS NOT NULL;
       CREATE INDEX IF NOT EXISTS idx_agent_dispatch_workers_status_heartbeat ON agent_dispatch_workers(status, last_heartbeat_at);
       CREATE INDEX IF NOT EXISTS idx_known_bad_bindings_provider_model ON known_bad_bindings(provider_id, model_id);
       CREATE INDEX IF NOT EXISTS idx_known_bad_bindings_active ON known_bad_bindings(binding_key) WHERE cleared_at IS NULL;
