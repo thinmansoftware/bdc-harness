@@ -4935,6 +4935,294 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
       ).toBe(1);
     });
 
+    // WO-HARNESS-REPAIR-NODE-ESCALATION-OVERRIDE-01 / bdc-xo#1460
+    // Live incident (run 87e9a3d8): diff-repair escalated correctly 3 times
+    // (ESCALATION_REQUIRED, do-not-invent Phase 1 files), then a LATER
+    // invocation in the same run overrode that escalation and fabricated
+    // broken code. Root cause: escalation short-circuit was plan-review-only
+    // and the escalation artifact was never re-read before re-invoke.
+    //
+    // Baseline on untouched tree: later iterations still call the provider
+    // (and can fabricate). After the fix: first escalation is terminal;
+    // later invocations never fire.
+    it('terminal-escalates diff-repair on first ESCALATION_REQUIRED (no later fabrication)', async () => {
+      let callCount = 0;
+      mockSendQueryDag.mockImplementation(function* () {
+        callCount++;
+        if (callCount === 1) {
+          // Live-shape attempt 1: correct escalation, refuse to invent files.
+          yield {
+            type: 'assistant',
+            content: [
+              'Escalated with ESCALATION_REASON=ambiguous-spec.',
+              'The required Phase 1 source files and APIs are absent from the pinned worktree,',
+              'so safe repair and baseline testing are impossible without inventing contracts.',
+              'Do NOT invent notifiers.ts / escalation-clock.ts from the spec snippet.',
+              'ESCALATION_REQUIRED=true',
+              'ESCALATION_REASON=ambiguous-spec',
+              'WO_ID=WO-HARNESS-DISPATCH-ESCALATION-DARK-GATE-01',
+              'NODE=diff-repair',
+              'ATTEMPTS=1/3',
+              'WHAT_FAILED=Phase 1 notifiers.ts and escalation-clock.ts absent from pinned worktree',
+              'WHAT_WAS_TRIED=- inspected worktree for Phase 1 sources',
+              'LAST_REVIEW_FINDINGS=- missing Phase 1 APIs',
+              'SINGLE_DECISION_NEEDED=Provide a pinned base/worktree containing the Phase 1 implementation (or explicitly authorize greenfield contracts)',
+              'SAFE_STATE=no source changes, fabricated diff, commit, push, or done flag were created',
+            ].join('\n'),
+          };
+        } else {
+          // THE FORBIDDEN OVERRIDE -- later attempt fabricates missing files.
+          // Untouched tree reaches this branch; fixed tree must never call it.
+          yield {
+            type: 'assistant',
+            content: [
+              'Fabricated notifiers.ts and escalation-clock.ts despite prior escalation.',
+              'OPUS_REPAIR=fixed',
+              'COMPLETE',
+            ].join('\n'),
+          };
+        }
+        yield { type: 'result', sessionId: `diff-repair-esc-${String(callCount)}` };
+      });
+
+      const mockDeps = createMockDeps();
+      const platform = createMockPlatform();
+      const workflowRun = makeWorkflowRun('diff-repair-esc-override-run', {
+        user_message: 'Run WO-HARNESS-DISPATCH-ESCALATION-DARK-GATE-01',
+      });
+      const artifactsDir = join(testDir, 'artifacts-diff-repair-esc');
+
+      await executeDagWorkflow(
+        mockDeps,
+        platform,
+        'conv-dag',
+        testDir,
+        {
+          name: 'dag-diff-repair-escalation-binding',
+          nodes: [
+            {
+              id: 'diff-repair',
+              loop: {
+                prompt:
+                  'Repair findings. If Phase 1 files are missing do NOT invent them; escalate.',
+                until: 'COMPLETE',
+                // Match the live failure shape: many iterations allowed so a
+                // later attempt can override if binding is missing.
+                max_iterations: 8,
+              },
+            },
+          ],
+        },
+        workflowRun,
+        'claude',
+        undefined,
+        artifactsDir,
+        join(testDir, 'logs-diff-repair-esc'),
+        'main',
+        'docs/',
+        minimalConfig
+      );
+
+      // Load-bearing: exactly ONE provider call. Later fabrication must never run.
+      expect(mockSendQueryDag.mock.calls.length).toBe(1);
+
+      // Workflow fails closed (not complete, not burn to max iterations).
+      expect(
+        (mockDeps.store.failWorkflowRun as Mock<(id: string, error: string) => Promise<void>>).mock
+          .calls.length
+      ).toBe(1);
+      expect(
+        (mockDeps.store.completeWorkflowRun as Mock<(id: string) => Promise<void>>).mock.calls
+          .length
+      ).toBe(0);
+
+      type FailedEvent = {
+        event_type: string;
+        data?: {
+          error?: string;
+          terminal_escalation?: boolean;
+          escalation_reason?: string;
+          iteration?: number;
+        };
+      };
+      const eventCalls = (
+        mockDeps.store.createWorkflowEvent as Mock<(event: FailedEvent) => Promise<void>>
+      ).mock.calls;
+      const escEvents = eventCalls
+        .map(call => call[0])
+        .filter(
+          ev =>
+            ev.event_type === 'node_failed' &&
+            ev.data?.terminal_escalation === true &&
+            typeof ev.data?.escalation_reason === 'string'
+        );
+      expect(escEvents.length).toBeGreaterThanOrEqual(1);
+      expect(escEvents[0]?.data?.escalation_reason).toContain('ambiguous-spec');
+      expect(escEvents[0]?.data?.iteration).toBe(1);
+      expect(String(escEvents[0]?.data?.error ?? '')).toContain('escalat');
+      expect(String(escEvents[0]?.data?.error ?? '')).not.toContain('exceeded max iterations');
+      // Distinguish escalated-and-stopped from attempted-and-caught fabrication.
+      expect(String(escEvents[0]?.data?.error ?? '').toLowerCase()).not.toContain('fabricat');
+
+      // Escalation packet written (plan-review path reused for all loop nodes).
+      const packetPath = join(
+        artifactsDir,
+        'escalations',
+        'WO-HARNESS-DISPATCH-ESCALATION-DARK-GATE-01-diff-repair-escalation.json'
+      );
+      const packet = JSON.parse(await readFile(packetPath, 'utf8')) as Record<string, unknown>;
+      expect(packet.escalationRequired).toBe(true);
+      expect(packet.escalationReason).toBe('ambiguous-spec');
+      expect(String(packet.singleDecisionNeeded ?? '')).toContain('Phase 1');
+    });
+
+    it('honors prior within-run escalation artifact without re-invoking the provider', async () => {
+      // Simulate: earlier iteration already wrote diff-repair-escalation.txt
+      // (agent correctly escalated and stopped). A later re-entry into the
+      // same node within the same run must NOT call the model again.
+      mockSendQueryDag.mockImplementation(function* () {
+        yield {
+          type: 'assistant',
+          content: 'FABRICATION ATTEMPT -- should never be reached\nCOMPLETE\n',
+        };
+        yield { type: 'result', sessionId: 'should-not-run' };
+      });
+
+      const mockDeps = createMockDeps();
+      const platform = createMockPlatform();
+      const workflowRun = makeWorkflowRun('prior-esc-artifact-run');
+      const artifactsDir = join(testDir, 'artifacts-prior-esc');
+      await mkdir(artifactsDir, { recursive: true });
+      await writeFile(
+        join(artifactsDir, 'diff-repair-escalation.txt'),
+        [
+          'ESCALATION_REQUIRED=true',
+          'ESCALATION_REASON=loop-exhausted',
+          'WO_ID=WO-HARNESS-DISPATCH-ESCALATION-DARK-GATE-01',
+          'NODE=diff-repair',
+          'ATTEMPTS=3/3',
+          'WHAT_FAILED=Phase 1 files still absent; prior escalation unbound',
+          'WHAT_WAS_TRIED=- escalated three times; no human decision supplied',
+          'LAST_REVIEW_FINDINGS=- missing Phase 1 APIs',
+          'SINGLE_DECISION_NEEDED=Provide a pinned base/worktree containing the Phase 1 implementation',
+          'SAFE_STATE=diff-repair-done.flag remains absent; no fabrication',
+          '',
+        ].join('\n'),
+        'utf8'
+      );
+
+      await executeDagWorkflow(
+        mockDeps,
+        platform,
+        'conv-dag',
+        testDir,
+        {
+          name: 'dag-prior-esc-artifact',
+          nodes: [
+            {
+              id: 'diff-repair',
+              loop: {
+                prompt: 'Repair. Honor prior escalation.',
+                until: 'COMPLETE',
+                max_iterations: 5,
+              },
+            },
+          ],
+        },
+        workflowRun,
+        'claude',
+        undefined,
+        artifactsDir,
+        join(testDir, 'logs-prior-esc'),
+        'main',
+        'docs/',
+        minimalConfig
+      );
+
+      // Zero provider calls -- prior artifact is binding within the run.
+      expect(mockSendQueryDag.mock.calls.length).toBe(0);
+      expect(
+        (mockDeps.store.failWorkflowRun as Mock<(id: string, error: string) => Promise<void>>).mock
+          .calls.length
+      ).toBe(1);
+
+      type FailedEvent = {
+        event_type: string;
+        data?: {
+          error?: string;
+          terminal_escalation?: boolean;
+          escalation_binding?: boolean;
+          escalation_reason?: string;
+        };
+      };
+      const eventCalls = (
+        mockDeps.store.createWorkflowEvent as Mock<(event: FailedEvent) => Promise<void>>
+      ).mock.calls;
+      const boundEvents = eventCalls
+        .map(call => call[0])
+        .filter(
+          ev =>
+            ev.event_type === 'node_failed' &&
+            ev.data?.terminal_escalation === true &&
+            ev.data?.escalation_binding === true
+        );
+      expect(boundEvents.length).toBeGreaterThanOrEqual(1);
+      expect(String(boundEvents[0]?.data?.escalation_reason ?? '')).toContain('loop-exhausted');
+      expect(String(boundEvents[0]?.data?.error ?? '')).toMatch(/prior|bound|binding/i);
+    });
+
+    it('legitimate diff-repair COMPLETE still works when no prior escalation exists', async () => {
+      mockSendQueryDag.mockImplementation(function* () {
+        yield {
+          type: 'assistant',
+          content: 'Fixed the real finding in-scope.\nCOMPLETE\n',
+        };
+        yield { type: 'result', sessionId: 'legit-repair' };
+      });
+
+      const mockDeps = createMockDeps();
+      const platform = createMockPlatform();
+      const workflowRun = makeWorkflowRun('legit-repair-run');
+
+      await executeDagWorkflow(
+        mockDeps,
+        platform,
+        'conv-dag',
+        testDir,
+        {
+          name: 'dag-legit-repair',
+          nodes: [
+            {
+              id: 'diff-repair',
+              loop: {
+                prompt: 'Repair findings normally.',
+                until: 'COMPLETE',
+                max_iterations: 5,
+              },
+            },
+          ],
+        },
+        workflowRun,
+        'claude',
+        undefined,
+        join(testDir, 'artifacts-legit-repair'),
+        join(testDir, 'logs-legit-repair'),
+        'main',
+        'docs/',
+        minimalConfig
+      );
+
+      expect(mockSendQueryDag.mock.calls.length).toBe(1);
+      expect(
+        (mockDeps.store.completeWorkflowRun as Mock<(id: string) => Promise<void>>).mock.calls
+          .length
+      ).toBe(1);
+      expect(
+        (mockDeps.store.failWorkflowRun as Mock<(id: string, error: string) => Promise<void>>).mock
+          .calls.length
+      ).toBe(0);
+    });
+
     it('completes on final iteration with XML-wrapped signal (<COMPLETE>SIGNAL</COMPLETE>)', async () => {
       let callCount = 0;
       mockSendQueryDag.mockImplementation(function* () {
