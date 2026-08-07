@@ -96,6 +96,8 @@ import {
   buildPromptWithContext,
   detectCompletionSignal,
   detectBlockedSignal,
+  detectEscalationRequired,
+  nodeEscalationArtifactPath,
   detectPlanReviewApproval,
   stripCompletionTags,
   isInlineScript,
@@ -261,7 +263,64 @@ function containsPlanReviewApproval(output: string): boolean {
 }
 
 function containsPlanReviewEscalation(output: string): boolean {
-  return /^[ \t]*ESCALATION_REQUIRED[ \t]*=[ \t]*true[ \t]*$/im.test(output);
+  // Shared detector (WO-1460): same protocol for plan-review AND repair loops.
+  return detectEscalationRequired(output).required;
+}
+
+/**
+ * Read within-run escalation artifact for a loop node
+ * (`$ARTIFACTS_DIR/${nodeId}-escalation.txt`). Binding is artifactsDir-scoped
+ * so a new run with a fresh artifacts dir is not permanently bound.
+ */
+async function readNodeEscalationArtifact(
+  artifactsDir: string,
+  nodeId: string
+): Promise<{ path: string; raw: string; signal: ReturnType<typeof detectEscalationRequired> }> {
+  const path = nodeEscalationArtifactPath(artifactsDir, nodeId);
+  if (!existsSync(path)) {
+    return {
+      path,
+      raw: '',
+      signal: { required: false, reason: '', singleDecisionNeeded: null },
+    };
+  }
+  try {
+    const raw = await readFile(path, 'utf8');
+    return { path, raw, signal: detectEscalationRequired(raw) };
+  } catch {
+    return {
+      path,
+      raw: '',
+      signal: { required: false, reason: '', singleDecisionNeeded: null },
+    };
+  }
+}
+
+/**
+ * Ensure the within-run escalation artifact exists so later iterations (or a
+ * re-entry of the same node in this run) honor the prior decision without
+ * depending solely on model stdout.
+ */
+async function ensureNodeEscalationArtifact(
+  artifactsDir: string,
+  nodeId: string,
+  output: string
+): Promise<string> {
+  const path = nodeEscalationArtifactPath(artifactsDir, nodeId);
+  await mkdir(artifactsDir, { recursive: true });
+  // Prefer existing file contents if already written by the agent.
+  if (existsSync(path)) {
+    try {
+      const existing = await readFile(path, 'utf8');
+      if (detectEscalationRequired(existing).required) {
+        return path;
+      }
+    } catch {
+      // fall through to rewrite from output
+    }
+  }
+  await writeFile(path, output.endsWith('\n') ? output : `${output}\n`, 'utf8');
+  return path;
 }
 
 function extractPlanReviewField(output: string, key: string): string | undefined {
@@ -3505,6 +3564,133 @@ async function executeLoopNode(
   // next iteration cannot "un-detect" a signal the agent already emitted.
   let stickySignalDetected = false;
 
+  // Within-run escalation binding (WO-HARNESS-REPAIR-NODE-ESCALATION-OVERRIDE-01 /
+  // bdc-xo#1460). Once this loop (or a prior attempt in the same run) recorded
+  // ESCALATION_REQUIRED, later iterations must not re-invoke the provider and
+  // silently override that decision. Binding is artifactsDir-scoped only -- a
+  // new run gets a fresh artifacts dir and is not permanently bound.
+  const terminalEscalateFromPriorBinding = async (
+    iteration: number,
+    source: 'prior_artifact' | 'output' | 'post_completion_guard',
+    reason: string,
+    decision: string | null,
+    rawOutput: string
+  ): Promise<NodeExecutionResult> => {
+    const packetPath = await writePlanReviewEscalationPacket(
+      artifactsDir,
+      workflowRun,
+      node.id,
+      iteration,
+      loop.max_iterations,
+      rawOutput || `ESCALATION_REQUIRED=true\nESCALATION_REASON=${reason}\n`
+    ).catch((err: Error) => {
+      getLog().error(
+        { err, workflowRunId: workflowRun.id, nodeId: node.id, iteration },
+        'loop_node.plan_review_escalation_packet_failed'
+      );
+      return undefined;
+    });
+    await ensureNodeEscalationArtifact(
+      artifactsDir,
+      node.id,
+      rawOutput ||
+        [
+          'ESCALATION_REQUIRED=true',
+          `ESCALATION_REASON=${reason}`,
+          decision ? `SINGLE_DECISION_NEEDED=${decision}` : '',
+          '',
+        ]
+          .filter(Boolean)
+          .join('\n')
+    ).catch((err: Error) => {
+      getLog().error(
+        { err, workflowRunId: workflowRun.id, nodeId: node.id },
+        'loop_node.escalation_artifact_write_failed'
+      );
+      return '';
+    });
+
+    const decisionText = decision ?? reason;
+    const errorMsg =
+      source === 'prior_artifact'
+        ? `Loop node '${node.id}' terminal-escalated at iteration ${String(iteration)}: prior escalation binding honored (${reason}); SINGLE_DECISION_NEEDED=${decisionText}`
+        : source === 'post_completion_guard'
+          ? `Loop node '${node.id}' terminal-escalated at iteration ${String(iteration)}: completion rejected because prior escalation is still binding (${reason})`
+          : `Loop node '${node.id}' escalated at iteration ${String(iteration)}: ${decisionText}`;
+
+    getLog().warn(
+      {
+        nodeId: node.id,
+        workflowRunId: workflowRun.id,
+        iteration,
+        escalationReason: reason,
+        escalationSource: source,
+      },
+      'loop_node.terminal_escalation'
+    );
+
+    if (packetPath) {
+      await deps.store
+        .createWorkflowEvent({
+          workflow_run_id: workflowRun.id,
+          event_type: 'workflow_artifact',
+          step_name: node.id,
+          data: {
+            artifact_type: 'file_created',
+            path: packetPath,
+            nodeId: node.id,
+            reason: 'plan_review_escalation',
+            terminal_escalation: true,
+            escalation_binding: source === 'prior_artifact' || source === 'post_completion_guard',
+          },
+        })
+        .catch((err: Error) => {
+          getLog().error(
+            { err, workflowRunId: workflowRun.id, eventType: 'workflow_artifact' },
+            'workflow_event_persist_failed'
+          );
+        });
+    }
+
+    await deps.store
+      .createWorkflowEvent({
+        workflow_run_id: workflowRun.id,
+        event_type: 'node_failed',
+        step_name: node.id,
+        data: {
+          error: errorMsg,
+          terminal_escalation: true,
+          escalation_binding: source === 'prior_artifact' || source === 'post_completion_guard',
+          escalation_reason: reason,
+          escalation_source: source,
+          iteration,
+          ...(loopTotalTokens ? { tokens: loopTotalTokens } : {}),
+          ...(workflowModel !== undefined ? { declared_model_id: workflowModel } : {}),
+          ...(resolvedOptions.model !== undefined
+            ? { requested_model_id: resolvedOptions.model }
+            : {}),
+          ...(loopServedModelId !== undefined ? { served_model_id: loopServedModelId } : {}),
+          entry_rung: deriveEntryRung(workflowProvider, workflowModel),
+          ...(loopTotalTokens ? { frontier_cost_usd: computeFrontierCost(loopTotalTokens) } : {}),
+        },
+      })
+      .catch((err: Error) => {
+        getLog().error(
+          { err, workflowRunId: workflowRun.id, eventType: 'node_failed' },
+          'workflow_event_persist_failed'
+        );
+      });
+
+    await safeSendMessage(platform, conversationId, errorMsg, msgContext);
+    return {
+      state: 'failed',
+      output: rawOutput || lastIterationOutput,
+      error: errorMsg,
+      costUsd: loopTotalCostUsd,
+      ...(loopTotalTokens ? { tokens: loopTotalTokens } : {}),
+    };
+  };
+
   for (let i = startIteration; i <= loop.max_iterations; i++) {
     const iterationStart = Date.now();
 
@@ -3527,6 +3713,20 @@ async function executeLoopNode(
         msgContext
       );
       return { state: 'failed', output: '', error: `Workflow ${effectiveStatus}` };
+    }
+
+    // Prior within-run escalation artifact is binding: do NOT re-invoke the
+    // provider (live: run 87e9a3d8 re-invoked after 3 correct escalations and
+    // fabricated Phase 1 files the plan forbade inventing).
+    const priorEscalation = await readNodeEscalationArtifact(artifactsDir, node.id);
+    if (priorEscalation.signal.required) {
+      return terminalEscalateFromPriorBinding(
+        i,
+        'prior_artifact',
+        priorEscalation.signal.reason,
+        priorEscalation.signal.singleDecisionNeeded,
+        priorEscalation.raw
+      );
     }
 
     // Emit iteration started
@@ -4177,8 +4377,14 @@ async function executeLoopNode(
     }
 
     const duration = Date.now() - iterationStart;
+    // Escalation is binding for ANY loop node that emits the protocol block
+    // (plan-review historically; diff-repair / repair loops as of WO-1460).
+    // Also re-read the within-run artifact in case the agent wrote the file
+    // without echoing ESCALATION_REQUIRED=true on stdout.
+    const postOutputEscalationArtifact = await readNodeEscalationArtifact(artifactsDir, node.id);
     const planReviewEscalationDetected =
-      node.id === PLAN_REVIEW_NODE_ID && containsPlanReviewEscalation(lastIterationOutput);
+      containsPlanReviewEscalation(lastIterationOutput) ||
+      postOutputEscalationArtifact.signal.required;
     const completionDetected =
       !planReviewEscalationDetected && (stickySignalDetected || bashComplete);
     // Debug hints for mashed/flattened open-model output (WO loop-newline).
@@ -4225,53 +4431,24 @@ async function executeLoopNode(
     });
 
     if (planReviewEscalationDetected) {
-      const packetPath = await writePlanReviewEscalationPacket(
-        artifactsDir,
-        workflowRun,
-        node.id,
+      // Bind within-run: write/refresh the node escalation artifact so any
+      // later re-entry in this run honors the decision without re-invoking
+      // the model (WO-1460 -- live override on run 87e9a3d8).
+      const escFromOutput = detectEscalationRequired(lastIterationOutput);
+      const escSignal = escFromOutput.required
+        ? escFromOutput
+        : postOutputEscalationArtifact.signal;
+      return terminalEscalateFromPriorBinding(
         i,
-        loop.max_iterations,
-        lastIterationOutput
-      ).catch((err: Error) => {
-        getLog().error(
-          { err, workflowRunId: workflowRun.id, nodeId: node.id, iteration: i },
-          'loop_node.plan_review_escalation_packet_failed'
-        );
-        return undefined;
-      });
-      if (packetPath) {
-        await deps.store
-          .createWorkflowEvent({
-            workflow_run_id: workflowRun.id,
-            event_type: 'workflow_artifact',
-            step_name: node.id,
-            data: {
-              artifact_type: 'file_created',
-              path: packetPath,
-              nodeId: node.id,
-              reason: 'plan_review_escalation',
-            },
-          })
-          .catch((err: Error) => {
-            getLog().error(
-              { err, workflowRunId: workflowRun.id, eventType: 'workflow_artifact' },
-              'workflow_event_persist_failed'
-            );
-          });
-      }
-      const decision =
-        extractPlanReviewField(lastIterationOutput, 'SINGLE_DECISION_NEEDED') ??
-        'plan-review requested human escalation';
-      const errorMsg = `Loop node '${node.id}' escalated at iteration ${String(i)}: ${decision}`;
-      await safeSendMessage(platform, conversationId, errorMsg, msgContext);
-      await persistLoopNodeFailed(errorMsg);
-      return {
-        state: 'failed',
-        output: lastIterationOutput,
-        error: errorMsg,
-        costUsd: loopTotalCostUsd,
-        ...(loopTotalTokens ? { tokens: loopTotalTokens } : {}),
-      };
+        'output',
+        escSignal.reason ||
+          extractPlanReviewField(lastIterationOutput, 'ESCALATION_REASON') ||
+          'ESCALATION_REQUIRED=true',
+        escSignal.singleDecisionNeeded ??
+          extractPlanReviewField(lastIterationOutput, 'SINGLE_DECISION_NEEDED') ??
+          null,
+        lastIterationOutput || postOutputEscalationArtifact.raw
+      );
     }
 
     // Terminal BLOCKED (WO-HARNESS-BLOCKED-BUILDER-STOPS-01 / bdc-xo#1349).

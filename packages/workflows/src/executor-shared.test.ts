@@ -27,6 +27,8 @@ import {
   detectCreditExhaustion,
   detectCompletionSignal,
   detectBlockedSignal,
+  detectEscalationRequired,
+  nodeEscalationArtifactPath,
   detectPlanReviewApproval,
   stripCompletionTags,
   isInlineScript,
@@ -503,6 +505,41 @@ describe('detectBlockedSignal (WO-HARNESS-BLOCKED-BUILDER-STOPS-01)', () => {
 
   it('does not treat COMPLETE=false alone as BLOCKED', () => {
     expect(detectBlockedSignal('Still working\nCOMPLETE=false\n').blocked).toBe(false);
+  });
+});
+
+describe('detectEscalationRequired (WO-HARNESS-REPAIR-NODE-ESCALATION-OVERRIDE-01)', () => {
+  it('detects live-shape ESCALATION_REQUIRED=true with reason + decision', () => {
+    const output = [
+      'Escalated with ESCALATION_REASON=ambiguous-spec.',
+      'ESCALATION_REQUIRED=true',
+      'ESCALATION_REASON=ambiguous-spec',
+      'SINGLE_DECISION_NEEDED=Provide a pinned base/worktree containing the Phase 1 implementation',
+      'SAFE_STATE=no fabrication',
+    ].join('\n');
+    const result = detectEscalationRequired(output);
+    expect(result.required).toBe(true);
+    expect(result.reason).toBe('ambiguous-spec');
+    expect(result.singleDecisionNeeded).toContain('Phase 1');
+  });
+
+  it('does not treat prose-only "Escalated with ESCALATION_REASON" as binding', () => {
+    // Live incident often echoed prose without the protocol key; binding
+    // then relies on the escalation artifact file, not this detector.
+    const proseOnly =
+      'Escalated with ESCALATION_REASON=ambiguous-spec. The required Phase 1 ' +
+      'source files are absent, so safe repair is impossible without inventing contracts.';
+    expect(detectEscalationRequired(proseOnly).required).toBe(false);
+  });
+
+  it('does not treat ESCALATION_REQUIRED=false as escalation', () => {
+    expect(detectEscalationRequired('ESCALATION_REQUIRED=false\n').required).toBe(false);
+  });
+
+  it('nodeEscalationArtifactPath is within-run artifacts-scoped', () => {
+    expect(nodeEscalationArtifactPath('/tmp/run-artifacts', 'diff-repair')).toBe(
+      join('/tmp/run-artifacts', 'diff-repair-escalation.txt')
+    );
   });
 });
 

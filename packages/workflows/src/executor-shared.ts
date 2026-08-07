@@ -624,6 +624,60 @@ export function detectBlockedSignal(output: string): BlockedSignal {
 }
 
 /**
+ * Result of ESCALATION_REQUIRED detection for loop terminal stops
+ * (WO-HARNESS-REPAIR-NODE-ESCALATION-OVERRIDE-01 / bdc-xo#1460).
+ *
+ * Once a loop node (plan-review, diff-repair, ...) records escalation, later
+ * invocations in the SAME run must not silently override that decision and
+ * attempt the previously-forbidden work. Distinct from BLOCKED (#1349): this
+ * is the repair/review escalation protocol (key=value block), not the
+ * implement-loop BLOCKED: reason form.
+ */
+export interface EscalationSignal {
+  required: boolean;
+  reason: string;
+  singleDecisionNeeded: string | null;
+}
+
+/**
+ * Detect an explicit ESCALATION_REQUIRED=true protocol block.
+ *
+ * Restrictive own-line key=value form only -- prose like "Escalated with
+ * ESCALATION_REASON=..." without the required key does NOT match. Callers
+ * that need file-artifact binding should also read
+ * `$ARTIFACTS_DIR/${nodeId}-escalation.txt` (see dag-executor).
+ */
+export function detectEscalationRequired(output: string): EscalationSignal {
+  if (!output?.trim()) {
+    return { required: false, reason: '', singleDecisionNeeded: null };
+  }
+
+  const required = /^[ \t]*ESCALATION_REQUIRED[ \t]*=[ \t]*true[ \t]*$/im.test(output);
+  if (!required) {
+    return { required: false, reason: '', singleDecisionNeeded: null };
+  }
+
+  const reasonMatch = /^[ \t]*ESCALATION_REASON[ \t]*=[ \t]*(.+?)\s*$/im.exec(output);
+  const decisionMatch = /^[ \t]*SINGLE_DECISION_NEEDED[ \t]*=[ \t]*(.+?)\s*$/im.exec(output);
+  return {
+    required: true,
+    reason: reasonMatch?.[1]?.trim()
+      ? reasonMatch[1].trim()
+      : 'ESCALATION_REQUIRED=true without ESCALATION_REASON',
+    singleDecisionNeeded: decisionMatch?.[1]?.trim() ?? null,
+  };
+}
+
+/**
+ * Canonical within-run escalation artifact path written by repair/review
+ * nodes (e.g. `$ARTIFACTS_DIR/diff-repair-escalation.txt`). Binding is
+ * within-run only: a new run gets a fresh artifactsDir.
+ */
+export function nodeEscalationArtifactPath(artifactsDir: string, nodeId: string): string {
+  return join(artifactsDir, `${nodeId}-escalation.txt`);
+}
+
+/**
  * Normalize loop/open-model plan-review output for signal detection only.
  * Open models and some stream paths emit multi-field output on one line
  * (anchor: zero-open canary 3604d5 / re-fire 42ee6575, Fable diagnosis).
