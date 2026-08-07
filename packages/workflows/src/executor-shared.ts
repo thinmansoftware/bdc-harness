@@ -564,6 +564,66 @@ export function detectCompletionSignal(output: string, signal: string): boolean 
 }
 
 /**
+ * Result of BLOCKED-signal detection for implement-loop terminal stops
+ * (WO-HARNESS-BLOCKED-BUILDER-STOPS-01 / bdc-xo#1349).
+ *
+ * A correct BLOCKED is a terminal outcome -- not a retryable failure. Without
+ * this detector the loop only accepts COMPLETE and retries honest blockers
+ * until the iteration cap burns the budget.
+ */
+export interface BlockedSignal {
+  blocked: boolean;
+  reason: string;
+}
+
+/**
+ * Detect an explicit builder BLOCKED signal.
+ *
+ * Accepted forms (restrictive -- prose like "not blocked yet" must NOT match):
+ * 1. Own-line / end-of-output `BLOCKED: <reason>` (live shape on run 630ac7ea)
+ * 2. Own-line `BLOCKED=true` with optional own-line `BLOCKED_REASON=<text>`
+ * 3. XML-wrapped `<promise>BLOCKED</promise>` / `<blocked>BLOCKED</blocked>`
+ *
+ * When COMPLETE (or the loop's `until` signal) is also present, callers should
+ * prefer COMPLETE -- this helper does not rank signals.
+ */
+export function detectBlockedSignal(output: string): BlockedSignal {
+  if (!output?.trim()) {
+    return { blocked: false, reason: '' };
+  }
+
+  // Form 1: BLOCKED: reason (own line or at end). Capture the rest of the line.
+  const colonLine = /^[ \t]*BLOCKED:[ \t]*(.+?)\s*$/im.exec(output);
+  if (colonLine?.[1]?.trim()) {
+    return { blocked: true, reason: colonLine[1].trim() };
+  }
+
+  // Form 2: BLOCKED=true (+ optional BLOCKED_REASON=)
+  const blockedTrue = /^[ \t]*BLOCKED[ \t]*=[ \t]*true[ \t]*$/im.test(output);
+  if (blockedTrue) {
+    const reasonMatch = /^[ \t]*BLOCKED_REASON[ \t]*=[ \t]*(.+?)\s*$/im.exec(output);
+    const reason = reasonMatch?.[1]?.trim()
+      ? reasonMatch[1].trim()
+      : 'builder reported BLOCKED=true without BLOCKED_REASON';
+    return { blocked: true, reason };
+  }
+
+  // Form 3: XML-wrapped BLOCKED token (same matching rules as completion)
+  if (detectCompletionSignal(output, 'BLOCKED')) {
+    // Prefer an accompanying BLOCKED_REASON / BLOCKED: line if present
+    const reasonMatch =
+      /^[ \t]*BLOCKED_REASON[ \t]*=[ \t]*(.+?)\s*$/im.exec(output) ??
+      /^[ \t]*BLOCKED:[ \t]*(.+?)\s*$/im.exec(output);
+    const reason = reasonMatch?.[1]?.trim()
+      ? reasonMatch[1].trim()
+      : 'builder emitted BLOCKED completion token';
+    return { blocked: true, reason };
+  }
+
+  return { blocked: false, reason: '' };
+}
+
+/**
  * Normalize loop/open-model plan-review output for signal detection only.
  * Open models and some stream paths emit multi-field output on one line
  * (anchor: zero-open canary 3604d5 / re-fire 42ee6575, Fable diagnosis).

@@ -4729,6 +4729,212 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
       ).toBe(1);
     });
 
+    // WO-HARNESS-BLOCKED-BUILDER-STOPS-01 / bdc-xo#1349
+    // Baseline on untouched tree: BLOCKED is not terminal, so the loop burns
+    // all max_iterations. After the fix: exactly one iteration, reason on run.
+    it('terminal-blocks on first-iteration BLOCKED: reason (no retry to cap)', async () => {
+      mockSendQueryDag.mockImplementation(function* () {
+        yield {
+          type: 'assistant',
+          content:
+            'Checked environment.\nBLOCKED: The required BDC_XO_PHASE1 paired bdc-xo worktree was not supplied\n',
+        };
+        yield { type: 'result', sessionId: 'loop-blocked-1' };
+      });
+
+      const mockDeps = createMockDeps();
+      const platform = createMockPlatform();
+      const workflowRun = makeWorkflowRun('blocked-run-1');
+      const artifactsDir = join(testDir, 'artifacts-blocked');
+
+      await executeDagWorkflow(
+        mockDeps,
+        platform,
+        'conv-dag',
+        testDir,
+        {
+          name: 'dag-loop-blocked',
+          nodes: [
+            {
+              id: 'implement',
+              loop: {
+                prompt: 'Implement. Emit BLOCKED: reason if hard-blocked.',
+                until: 'COMPLETE',
+                max_iterations: 5,
+              },
+            },
+          ],
+        },
+        workflowRun,
+        'claude',
+        undefined,
+        artifactsDir,
+        join(testDir, 'logs-blocked'),
+        'main',
+        'docs/',
+        minimalConfig
+      );
+
+      // Exactly ONE iteration -- not 5. This is the load-bearing stop.
+      expect(mockSendQueryDag.mock.calls.length).toBe(1);
+
+      // Workflow must fail (not complete, not burn to cap).
+      expect(
+        (mockDeps.store.failWorkflowRun as Mock<(id: string, error: string) => Promise<void>>).mock
+          .calls.length
+      ).toBe(1);
+
+      // Reason must be queryable on the node_failed event (not only in logs).
+      type FailedEvent = {
+        event_type: string;
+        data?: {
+          error?: string;
+          terminal_blocked?: boolean;
+          blocked_reason?: string;
+          iteration?: number;
+        };
+      };
+      const eventCalls = (
+        mockDeps.store.createWorkflowEvent as Mock<(event: FailedEvent) => Promise<void>>
+      ).mock.calls;
+      const blockedEvents = eventCalls
+        .map(call => call[0])
+        .filter(
+          ev =>
+            ev.event_type === 'node_failed' &&
+            ev.data?.terminal_blocked === true &&
+            typeof ev.data?.blocked_reason === 'string'
+        );
+      expect(blockedEvents.length).toBeGreaterThanOrEqual(1);
+      expect(blockedEvents[0]?.data?.blocked_reason).toContain('BDC_XO_PHASE1');
+      expect(blockedEvents[0]?.data?.iteration).toBe(1);
+      expect(String(blockedEvents[0]?.data?.error ?? '')).toContain('terminal-blocked');
+      expect(String(blockedEvents[0]?.data?.error ?? '')).not.toContain('exceeded max iterations');
+
+      // Work-preservation artifact directory exists (reason + last output at minimum).
+      const reasonFile = join(
+        artifactsDir,
+        'blocked-preserve',
+        'implement-iter-1',
+        'blocked-reason.txt'
+      );
+      const reasonText = await readFile(reasonFile, 'utf8');
+      expect(reasonText).toContain('BDC_XO_PHASE1');
+    });
+
+    it('runaway with no COMPLETE and no BLOCKED still hits the iteration cap', async () => {
+      mockSendQueryDag.mockImplementation(function* () {
+        yield { type: 'assistant', content: 'Still thrashing with no terminal signal.' };
+        yield { type: 'result', sessionId: 'loop-runaway' };
+      });
+
+      const mockDeps = createMockDeps();
+      const platform = createMockPlatform();
+      const workflowRun = makeWorkflowRun('runaway-run-1');
+
+      await executeDagWorkflow(
+        mockDeps,
+        platform,
+        'conv-dag',
+        testDir,
+        {
+          name: 'dag-loop-runaway',
+          nodes: [
+            {
+              id: 'implement',
+              loop: {
+                prompt: 'Do task.',
+                until: 'COMPLETE',
+                max_iterations: 3,
+              },
+            },
+          ],
+        },
+        workflowRun,
+        'claude',
+        undefined,
+        join(testDir, 'artifacts-runaway'),
+        join(testDir, 'logs-runaway'),
+        'main',
+        'docs/',
+        minimalConfig
+      );
+
+      // Cap still fires for genuine runaways (must not be removed by the BLOCKED fix).
+      expect(mockSendQueryDag.mock.calls.length).toBe(3);
+      expect(
+        (mockDeps.store.failWorkflowRun as Mock<(id: string, error: string) => Promise<void>>).mock
+          .calls.length
+      ).toBe(1);
+
+      type FailedEvent = {
+        event_type: string;
+        data?: { error?: string; terminal_blocked?: boolean };
+      };
+      const eventCalls = (
+        mockDeps.store.createWorkflowEvent as Mock<(event: FailedEvent) => Promise<void>>
+      ).mock.calls;
+      const failedEvents = eventCalls
+        .map(call => call[0])
+        .filter(ev => ev.event_type === 'node_failed');
+      expect(
+        failedEvents.some(ev => String(ev.data?.error ?? '').includes('exceeded max iterations'))
+      ).toBe(true);
+      expect(failedEvents.some(ev => ev.data?.terminal_blocked === true)).toBe(false);
+    });
+
+    it('COMPLETE still wins when both COMPLETE and BLOCKED appear', async () => {
+      mockSendQueryDag.mockImplementation(function* () {
+        yield {
+          type: 'assistant',
+          content: 'BLOCKED: should not matter\nCOMPLETE\n',
+        };
+        yield { type: 'result', sessionId: 'loop-complete-wins' };
+      });
+
+      const mockDeps = createMockDeps();
+      const platform = createMockPlatform();
+      const workflowRun = makeWorkflowRun('complete-wins-run');
+
+      await executeDagWorkflow(
+        mockDeps,
+        platform,
+        'conv-dag',
+        testDir,
+        {
+          name: 'dag-loop-complete-wins',
+          nodes: [
+            {
+              id: 'implement',
+              loop: {
+                prompt: 'Do task.',
+                until: 'COMPLETE',
+                max_iterations: 5,
+              },
+            },
+          ],
+        },
+        workflowRun,
+        'claude',
+        undefined,
+        join(testDir, 'artifacts-complete-wins'),
+        join(testDir, 'logs-complete-wins'),
+        'main',
+        'docs/',
+        minimalConfig
+      );
+
+      expect(mockSendQueryDag.mock.calls.length).toBe(1);
+      expect(
+        (mockDeps.store.failWorkflowRun as Mock<(id: string, error: string) => Promise<void>>).mock
+          .calls.length
+      ).toBe(0);
+      expect(
+        (mockDeps.store.completeWorkflowRun as Mock<(id: string) => Promise<void>>).mock.calls
+          .length
+      ).toBe(1);
+    });
+
     it('completes on final iteration with XML-wrapped signal (<COMPLETE>SIGNAL</COMPLETE>)', async () => {
       let callCount = 0;
       mockSendQueryDag.mockImplementation(function* () {

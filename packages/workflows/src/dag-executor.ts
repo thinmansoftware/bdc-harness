@@ -95,6 +95,7 @@ import {
   substituteInputRefs,
   buildPromptWithContext,
   detectCompletionSignal,
+  detectBlockedSignal,
   detectPlanReviewApproval,
   stripCompletionTags,
   isInlineScript,
@@ -272,6 +273,76 @@ function extractPlanReviewField(output: string, key: string): string | undefined
 function sanitizeArtifactKey(value: string): string {
   const cleaned = value.replace(/[^A-Za-z0-9._-]/g, '_').replace(/^_+|_+$/g, '');
   return cleaned || 'unknown';
+}
+
+/**
+ * Snapshot worktree + builder output when a loop terminal-blocks so uncommitted
+ * work is discoverable after the run fails (bdc-xo#1349).
+ *
+ * Best-effort: never throws past the caller; empty/missing git is still a
+ * successful preserve of the reason + last output.
+ */
+async function preserveWorktreeOnBlocked(
+  cwd: string,
+  artifactsDir: string,
+  workflowRunId: string,
+  nodeId: string,
+  iteration: number,
+  blockedReason: string,
+  lastOutput: string
+): Promise<string> {
+  const preserveDir = join(
+    artifactsDir,
+    'blocked-preserve',
+    `${sanitizeArtifactKey(nodeId)}-iter-${String(iteration)}`
+  );
+  await mkdir(preserveDir, { recursive: true });
+  await writeFile(
+    join(preserveDir, 'blocked-reason.txt'),
+    [
+      `workflow_run_id=${workflowRunId}`,
+      `node_id=${nodeId}`,
+      `iteration=${String(iteration)}`,
+      `blocked_reason=${blockedReason}`,
+      `preserved_at=${new Date().toISOString()}`,
+      '',
+    ].join('\n'),
+    'utf8'
+  );
+  await writeFile(join(preserveDir, 'last-output.txt'), lastOutput ?? '', 'utf8');
+
+  // Capture porcelain status + unstaged/staged diffs. Failures are non-fatal
+  // (worktree may not be a git repo in unit tests).
+  try {
+    const { stdout: statusOut } = await execFileAsync('git', ['status', '--porcelain', '-uall'], {
+      cwd,
+      timeout: 15_000,
+    });
+    await writeFile(join(preserveDir, 'git-status.porcelain'), statusOut ?? '', 'utf8');
+  } catch {
+    await writeFile(join(preserveDir, 'git-status.porcelain'), '', 'utf8');
+  }
+  try {
+    const { stdout: diffOut } = await execFileAsync('git', ['diff', 'HEAD'], {
+      cwd,
+      timeout: 30_000,
+    });
+    await writeFile(join(preserveDir, 'git-diff-HEAD.patch'), diffOut ?? '', 'utf8');
+  } catch {
+    await writeFile(join(preserveDir, 'git-diff-HEAD.patch'), '', 'utf8');
+  }
+  try {
+    const { stdout: untrackedList } = await execFileAsync(
+      'git',
+      ['ls-files', '--others', '--exclude-standard'],
+      { cwd, timeout: 15_000 }
+    );
+    await writeFile(join(preserveDir, 'git-untracked.txt'), untrackedList ?? '', 'utf8');
+  } catch {
+    await writeFile(join(preserveDir, 'git-untracked.txt'), '', 'utf8');
+  }
+
+  return preserveDir;
 }
 
 async function writePlanReviewEscalationPacket(
@@ -4194,6 +4265,102 @@ async function executeLoopNode(
       const errorMsg = `Loop node '${node.id}' escalated at iteration ${String(i)}: ${decision}`;
       await safeSendMessage(platform, conversationId, errorMsg, msgContext);
       await persistLoopNodeFailed(errorMsg);
+      return {
+        state: 'failed',
+        output: lastIterationOutput,
+        error: errorMsg,
+        costUsd: loopTotalCostUsd,
+        ...(loopTotalTokens ? { tokens: loopTotalTokens } : {}),
+      };
+    }
+
+    // Terminal BLOCKED (WO-HARNESS-BLOCKED-BUILDER-STOPS-01 / bdc-xo#1349).
+    // A correct BLOCKED is not a retryable failure. Without this branch the loop
+    // only accepts COMPLETE and re-invokes the builder until the iteration cap
+    // (live: run 630ac7ea re-emitted the same blocker 5 times for $9+).
+    // COMPLETE still wins when both signals appear (handled above).
+    const blockedSignal = detectBlockedSignal(fullOutput);
+    if (blockedSignal.blocked && !completionDetected) {
+      const errorMsg = `Loop node '${node.id}' terminal-blocked at iteration ${String(i)}: ${blockedSignal.reason}`;
+      getLog().warn(
+        {
+          nodeId: node.id,
+          workflowRunId: workflowRun.id,
+          iteration: i,
+          blockedReason: blockedSignal.reason,
+        },
+        'loop_node.terminal_blocked'
+      );
+
+      // Preserve worktree state so untracked/uncommitted work is not lost when
+      // the loop exits (issue #1349: "work it DID produce was left untracked").
+      const preserveDir = await preserveWorktreeOnBlocked(
+        cwd,
+        artifactsDir,
+        workflowRun.id,
+        node.id,
+        i,
+        blockedSignal.reason,
+        lastIterationOutput
+      ).catch((err: Error) => {
+        getLog().error(
+          { err, workflowRunId: workflowRun.id, nodeId: node.id },
+          'loop_node.blocked_preserve_failed'
+        );
+        return undefined;
+      });
+
+      await deps.store
+        .createWorkflowEvent({
+          workflow_run_id: workflowRun.id,
+          event_type: 'node_failed',
+          step_name: node.id,
+          data: {
+            error: errorMsg,
+            terminal_blocked: true,
+            blocked_reason: blockedSignal.reason,
+            iteration: i,
+            ...(preserveDir ? { preserved_work_dir: preserveDir } : {}),
+            ...(loopTotalTokens ? { tokens: loopTotalTokens } : {}),
+            ...(workflowModel !== undefined ? { declared_model_id: workflowModel } : {}),
+            ...(resolvedOptions.model !== undefined
+              ? { requested_model_id: resolvedOptions.model }
+              : {}),
+            ...(loopServedModelId !== undefined ? { served_model_id: loopServedModelId } : {}),
+            entry_rung: deriveEntryRung(workflowProvider, workflowModel),
+            ...(loopTotalTokens ? { frontier_cost_usd: computeFrontierCost(loopTotalTokens) } : {}),
+          },
+        })
+        .catch((err: Error) => {
+          getLog().error(
+            { err, workflowRunId: workflowRun.id, eventType: 'node_failed' },
+            'workflow_event_persist_failed'
+          );
+        });
+
+      if (preserveDir) {
+        await deps.store
+          .createWorkflowEvent({
+            workflow_run_id: workflowRun.id,
+            event_type: 'workflow_artifact',
+            step_name: node.id,
+            data: {
+              artifact_type: 'file_created',
+              path: preserveDir,
+              nodeId: node.id,
+              reason: 'terminal_blocked_work_preserve',
+              blocked_reason: blockedSignal.reason,
+            },
+          })
+          .catch((err: Error) => {
+            getLog().error(
+              { err, workflowRunId: workflowRun.id, eventType: 'workflow_artifact' },
+              'workflow_event_persist_failed'
+            );
+          });
+      }
+
+      await safeSendMessage(platform, conversationId, errorMsg, msgContext);
       return {
         state: 'failed',
         output: lastIterationOutput,
