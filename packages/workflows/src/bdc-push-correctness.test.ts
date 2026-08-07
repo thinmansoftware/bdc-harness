@@ -356,6 +356,37 @@ describe('F-8C: staging-gate base-branch selection for gh pr create', () => {
 });
 
 describe('Base branch override: deterministic open-pr-if-needed handling', () => {
+  it('extracts exact base and unique branch values from node-output handoff files', () => {
+    const nodeOutDir = worktreeDir;
+    writeFileSync(
+      join(nodeOutDir, 'decide-push-target.out'),
+      'push_target: feature-branch:feat/wo-foo-01\nbase_branch_override: release/ce'
+    );
+    writeFileSync(
+      join(nodeOutDir, 'commit-and-push.out'),
+      'VERIFIED: origin branch is durable\nunique_branch=feat/wo-foo-01-thread-abc'
+    );
+
+    const result = bash(
+      `
+set -euo pipefail
+DECIDE_OUTPUT=$(cat "$ARCHON_NODE_OUT/decide-push-target.out")
+COMMIT_PUSH_OUTPUT=$(cat "$ARCHON_NODE_OUT/commit-and-push.out")
+BASE_BRANCH_OVERRIDE=$(printf '%s\\n' "$DECIDE_OUTPUT" | sed -n 's/^base_branch_override: //p' | head -n 1)
+UNIQUE_BRANCH=$(printf '%s\\n' "$COMMIT_PUSH_OUTPUT" | sed -n 's/^unique_branch=//p' | head -n 1)
+printf 'BASE_BRANCH_OVERRIDE=<%s>\\nUNIQUE_BRANCH=<%s>\\n' "$BASE_BRANCH_OVERRIDE" "$UNIQUE_BRANCH"
+`,
+      worktreeDir,
+      { ARCHON_NODE_OUT: nodeOutDir }
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain('BASE_BRANCH_OVERRIDE=<release/ce>');
+    expect(result.stdout).toContain('UNIQUE_BRANCH=<feat/wo-foo-01-thread-abc>');
+    expect(result.stdout).not.toContain("release/ce'");
+    expect(result.stdout).not.toContain("thread-abc'");
+  });
+
   it('honors an existing override branch over staging-gate selection and documents it in the PR body', () => {
     git(['checkout', '-b', 'release/ce'], worktreeDir);
     git(['push', 'origin', 'release/ce'], worktreeDir);
@@ -494,6 +525,21 @@ describe('Review diff-base resolution from declared Base branch', () => {
 });
 
 describe('Lane consistency: all feature-development lanes share review-base wiring', () => {
+  it('feeds open-pr-if-needed from the byte-identical decide-push-target handoff file', () => {
+    for (const lane of FEATURE_DEV_LANES) {
+      const yaml = readFileSync(lane, 'utf8').replace(/\r\n/g, '\n');
+      const openPr = yaml.split('  - id: open-pr-if-needed\n')[1]?.split('\n  - id: ')[0] ?? '';
+      expect(openPr).toContain('DECIDE_OUTPUT=$(cat "$ARCHON_NODE_OUT/decide-push-target.out")');
+      expect(openPr).toContain('COMMIT_PUSH_OUTPUT=$(cat "$ARCHON_NODE_OUT/commit-and-push.out")');
+      expect(openPr).not.toMatch(
+        /DECIDE_OUTPUT=\$\(cat <<'[^']+'\n\s*\$decide-push-target\.output\n/
+      );
+      expect(openPr).not.toMatch(
+        /COMMIT_PUSH_OUTPUT=\$\(cat <<'[^']+'\n\s*\$commit-and-push\.output\n/
+      );
+    }
+  });
+
   it('has no env-only review BASE_REF one-liner and has base_branch_override in every lane', () => {
     for (const lane of FEATURE_DEV_LANES) {
       // Normalize CRLF so a Windows checkout does not break '\n'-suffixed assertions.

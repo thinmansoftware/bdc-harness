@@ -13094,6 +13094,102 @@ describe('executeDagWorkflow -- node output file handoff (ARCHON_NODE_OUT)', () 
     }
   });
 
+  it('writes AI node output before a dependent bash node reads the handoff file', async () => {
+    const mockDeps = createMockDeps();
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('node-out-ai-producer-run-id');
+
+    const nodes: DagNode[] = [
+      { id: 'decide-push-target', prompt: 'Choose the push target.' },
+      {
+        id: 'open-pr-if-needed',
+        bash: 'cat "$ARCHON_NODE_OUT/decide-push-target.out"',
+        depends_on: ['decide-push-target'],
+      },
+    ];
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-node-out-ai-producer',
+      testDir,
+      { name: 'node-out-ai-producer-test', nodes },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    const fileContent = await readFile(
+      join(testDir, 'artifacts', 'node-out', 'decide-push-target.out'),
+      'utf-8'
+    );
+    expect(fileContent).toBe('DAG AI response');
+
+    const eventCalls = (mockDeps.store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls;
+    const consumerCompleted = eventCalls.find(
+      (call: unknown[]) =>
+        (call[0] as { event_type: string }).event_type === 'node_completed' &&
+        (call[0] as { step_name: string }).step_name === 'open-pr-if-needed'
+    );
+    expect(consumerCompleted).toBeDefined();
+    expect((consumerCompleted![0] as { data: { node_output: string } }).data.node_output).toBe(
+      'DAG AI response'
+    );
+  });
+
+  it('materializes resumed node output before a dependent bash node reads the handoff file', async () => {
+    const mockDeps = createMockDeps();
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('node-out-resumed-producer-run-id');
+    const priorCompletedNodes = new Map([
+      ['decide-push-target', 'base_branch_override: dev\nrepo: bluedevilcollectibles/bdc-harness'],
+    ]);
+
+    const nodes: DagNode[] = [
+      { id: 'decide-push-target', prompt: 'Choose the push target.' },
+      {
+        id: 'open-pr-if-needed',
+        bash: 'cat "$ARCHON_NODE_OUT/decide-push-target.out"',
+        depends_on: ['decide-push-target'],
+      },
+    ];
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-node-out-resumed-producer',
+      testDir,
+      { name: 'node-out-resumed-producer-test', nodes },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig,
+      undefined,
+      undefined,
+      priorCompletedNodes
+    );
+
+    const eventCalls = (mockDeps.store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls;
+    const consumerCompleted = eventCalls.find(
+      (call: unknown[]) =>
+        (call[0] as { event_type: string }).event_type === 'node_completed' &&
+        (call[0] as { step_name: string }).step_name === 'open-pr-if-needed'
+    );
+    expect(consumerCompleted).toBeDefined();
+    expect((consumerCompleted![0] as { data: { node_output: string } }).data.node_output).toBe(
+      'base_branch_override: dev\nrepo: bluedevilcollectibles/bdc-harness'
+    );
+  });
+
   it('writes a producing node output to ARCHON_NODE_OUT byte-identical, apostrophes and all', async () => {
     const mockDeps = createMockDeps();
     const platform = createMockPlatform();

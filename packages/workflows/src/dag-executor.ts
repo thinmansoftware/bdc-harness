@@ -1271,7 +1271,7 @@ function shellQuote(value: string): string {
 }
 
 /**
- * bdc-xo#1368: write a bash node's real output, byte-identical, to
+ * bdc-xo#1368: write a completed node's real output, byte-identical, to
  * <artifactsDir>/node-out/<nodeId>.out. Consuming nodes read it directly
  * (`cat "$ARCHON_NODE_OUT/<nodeId>.out"`), sidestepping the inline
  * shellQuote-wrap substitution entirely -- no quote bytes are ever
@@ -2889,11 +2889,6 @@ async function executeBashNode(
 
     // Trim trailing newline from stdout (common shell behavior)
     const output = stdout.replace(/\n$/, '');
-
-    // bdc-xo#1368: write byte-identical output to node-out/<nodeId>.out so bash
-    // consumers can `cat "$ARCHON_NODE_OUT/<nodeId>.out"` instead of relying on the
-    // quote-wrapped inline substitution, which a quoted-heredoc consumer can corrupt.
-    await writeNodeOutputFile(artifactsDir, node.id, output);
 
     if (stderr.trim()) {
       getLog().warn({ nodeId: node.id, stderr: stderr.trim() }, 'bash_node_stderr');
@@ -5963,6 +5958,11 @@ async function executeDagWorkflowInternal(
           if (output.modelMismatch === true) modelMismatchCount++;
         }
         nodeOutputs.set(nodeId, output);
+        if (output.state === 'completed') {
+          // Materialize every provider/node type at the common completion boundary.
+          // This includes AI/loop outputs and prior-success outputs returned on resume.
+          await writeNodeOutputFile(artifactsDir, nodeId, output.output);
+        }
         if (output.state === 'completed' && !isParallelLayer && output.sessionId !== undefined) {
           lastSequentialSessionId = output.sessionId;
         }
