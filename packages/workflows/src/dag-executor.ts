@@ -1212,6 +1212,32 @@ function shellQuote(value: string): string {
 }
 
 /**
+ * bdc-xo#1368: write a bash node's real output, byte-identical, to
+ * <artifactsDir>/node-out/<nodeId>.out. Consuming nodes read it directly
+ * (`cat "$ARCHON_NODE_OUT/<nodeId>.out"`), sidestepping the inline
+ * shellQuote-wrap substitution entirely -- no quote bytes are ever
+ * introduced, so there is nothing for a quoted-heredoc consumer to corrupt.
+ * Empty output still produces a zero-byte file (never skipped), so a
+ * consumer can distinguish "ran, produced nothing" from "never ran."
+ */
+async function writeNodeOutputFile(
+  artifactsDir: string,
+  nodeId: string,
+  output: string
+): Promise<void> {
+  const safeNodeId = nodeId.replace(/[^A-Za-z0-9._-]/g, '_');
+  const nodeOutDir = join(artifactsDir || tmpdir(), 'node-out');
+  try {
+    await mkdir(nodeOutDir, { recursive: true });
+    await writeFile(join(nodeOutDir, `${safeNodeId}.out`), output, 'utf8');
+  } catch (error) {
+    // Best-effort: a file-handoff write failure must not fail the node itself --
+    // the legacy inline-substitution transport still carries the value.
+    getLog().warn({ err: error as Error, nodeId }, 'dag_node_output_file_write_failed');
+  }
+}
+
+/**
  * Substitute $node_id.output and $node_id.output.field references in a prompt.
  * Called AFTER the standard substituteWorkflowVariables pass.
  *
@@ -2758,6 +2784,10 @@ async function executeBashNode(
     // WORKFLOW_ID and WORKTREE_PATH as actual env vars (complement the $WORKFLOW_ID template token).
     WORKFLOW_ID: workflowRun.id,
     WORKTREE_PATH: cwd,
+    // bdc-xo#1368: directory of byte-identical per-node output files. A dependent node
+    // reads a prior node's real output via `cat "$ARCHON_NODE_OUT/<nodeId>.out"` instead
+    // of the quote-wrapped inline substitution.
+    ARCHON_NODE_OUT: join(artifactsDir || tmpdir(), 'node-out'),
     ...inputEnvVars,
     ...(envVars ?? {}),
   };
@@ -2800,6 +2830,11 @@ async function executeBashNode(
 
     // Trim trailing newline from stdout (common shell behavior)
     const output = stdout.replace(/\n$/, '');
+
+    // bdc-xo#1368: write byte-identical output to node-out/<nodeId>.out so bash
+    // consumers can `cat "$ARCHON_NODE_OUT/<nodeId>.out"` instead of relying on the
+    // quote-wrapped inline substitution, which a quoted-heredoc consumer can corrupt.
+    await writeNodeOutputFile(artifactsDir, node.id, output);
 
     if (stderr.trim()) {
       getLog().warn({ nodeId: node.id, stderr: stderr.trim() }, 'bash_node_stderr');
