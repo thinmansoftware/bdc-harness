@@ -11,7 +11,8 @@ opens. Nothing on this list is flipped autonomously, ever.
 | `OVERSEER_EMERGENCY_STOP` | env (emergency stop) | off | Human-set only. Halts ALL record handling (judging AND actions) while the watch loop stays alive; recovery is unsetting the var. |
 | `OVERSEER_DRY_RUN` | env | off | Suppresses external mutations (steward handoff, PR comments) on both paths. Verdict rows, receipts, and escalation cards still write -- thinking and audit are never gated. |
 | `OVERSEER_JUDGE_LADDER` | env (config) | `grok` | Comma-separated judge binaries, cheapest first (each invoked as `<bin> -p <prompt>`). Change = ops decision, announce on #1315. |
-| `OVERSEER_JUDGE_DAILY_BUDGET_CALLS` | env (config) | `200` | Daily judge-call cap. Breach degrades LOUDLY: `evidence_unavailable` alarm + escalation, never a silent stop. In-memory counter resets on process restart (open condition: persistence is a later slice; the claim table caps total calls at runs x retries regardless). |
+| `OVERSEER_JUDGE_MAX_RETRIES` | env (config) | `3` | Per-run routine judge-health retry ceiling. Not a daily call cap (daily circuit deleted -- it killed 60% of verdicts; see #1390 / #602). Sized for transient ladder failures without permanent re-queue. |
+| `OVERSEER_JUDGE_P0_MAX_RETRIES` | env (config) | `0` | Per-run P0 judge-health retry ceiling. Default 0 = escalate on first health failure (mode matrix: P0 must not wait the routine budget). Detected via `metadata.priority`/`prio`/`labels` or `WO-P0-*` id marker. |
 | `OVERSEER_USE_FAKE_GITHUB_ADAPTER` | env (legacy) | off (real) | Test/dev only. Fake adapter cannot reach GitHub. |
 | `overseer_capability_state.merge.action_enabled` | DB row | `0` (writer `migration-034`) | JOHN ONLY, on the Arc B evidence package ((a)+(b) proven separately). The judge-first path never reads or writes it; the steward path keeps all its guards. |
 | `overseer_capability_state.{escalation,repair,branch,lifecycle}` | DB rows | per migration-034 | Legacy v1 capability rows. Preserved read-only for history; the judge-first path does not consult them. Tier >= 1 execution tickets are a later M-99 slice. |
@@ -31,11 +32,14 @@ M-15 tiers, implemented in `packages/overseer/src/tier-map.ts`:
 ## Judge health (fail-loud)
 
 `judge_unavailable`, `judge_invalid_output`, and `evidence_unavailable` are
-operational alarm states on the verdict row -- never semantic verdicts. Each is
-retryable up to 3 times via the model ladder; exhaustion escalates with evidence
-to the operator card rail. The legacy fail-closed collapse in
-`judge-second-opinion.ts` survives ONLY on the merge-steward path, where
-fail-closed remains correct.
+operational alarm states on the verdict row -- never semantic verdicts. There is
+no `judge_daily_budget_exhausted` outcome kind (daily call circuit removed).
+Routine runs retry health failures up to `OVERSEER_JUDGE_MAX_RETRIES` (default 3);
+P0 runs use `OVERSEER_JUDGE_P0_MAX_RETRIES` (default 0 = escalate immediately).
+Exhaustion escalates with evidence to the operator card rail
+(`overseer.judge_first.judge_health_alarm` at error level). The legacy
+fail-closed collapse in `judge-second-opinion.ts` survives ONLY on the
+merge-steward path, where fail-closed remains correct.
 
 ## Idempotency
 
