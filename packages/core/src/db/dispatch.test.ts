@@ -24,6 +24,7 @@ import {
   ensureXoEscalationHandoffs,
   getMessage,
   heartbeatWorker,
+  listEligibleXoEscalations,
   listMessages,
   listUnroutableQueuedMessages,
   listWorkers,
@@ -1404,7 +1405,7 @@ describe('dispatch db', () => {
     expect(claim?.resolved_xo_fencing_token).toBe(11);
   });
 
-  test('enforces exact escalation boundaries, once-only claims, and acknowledgement suppression', async () => {
+  test('acknowledged XO blockers escalate at exact boundaries with fire-once and retryable claims', async () => {
     const created = '2026-08-07T00:00:00.000Z';
     const message = await createMessage({
       correlation_id: 'corr-escalation',
@@ -1419,6 +1420,12 @@ describe('dispatch db', () => {
       message.id,
       created,
     ]);
+    await db.query('UPDATE agent_dispatch_messages SET acknowledged_at = $2 WHERE id = $1', [
+      message.id,
+      '2026-08-07T01:00:00.000Z',
+    ]);
+
+    expect((await listEligibleXoEscalations(created)).map(item => item.id)).toContain(message.id);
 
     expect(
       await claimDispatchEscalation({
@@ -1461,16 +1468,52 @@ describe('dispatch db', () => {
     expect(
       await releaseDispatchEscalationClaim({ id: message.id, leg: 'sms', claimed_at: smsClaimedAt })
     ).toBeTrue();
-    await db.query(
-      'UPDATE agent_dispatch_messages SET acknowledged_at = $2, escalated_sms_at = NULL WHERE id = $1',
-      [message.id, smsClaimedAt]
-    );
+    expect(
+      await claimDispatchEscalation({ id: message.id, leg: 'sms', now: smsClaimedAt })
+    ).not.toBeNull();
     expect(
       await claimDispatchEscalation({ id: message.id, leg: 'sms', now: smsClaimedAt })
     ).toBeNull();
   });
 
-  test('creates only non-XO-to-XO handoffs with deterministic idempotency', async () => {
+  test('addressing suppresses both escalation legs even after acknowledgement', async () => {
+    const created = '2026-08-07T00:00:00.000Z';
+    const message = await createMessage({
+      correlation_id: 'corr-addressed-escalation',
+      idempotency_key: 'addressed-escalation',
+      task_type: 'agent_message',
+      sender: 'codex',
+      recipient: 'xo',
+      priority: 'blocker',
+      body: 'addressed escalation payload',
+    });
+    await db.query(
+      `UPDATE agent_dispatch_messages
+       SET created_at = $2, acknowledged_at = $3, addressed_at = $4 WHERE id = $1`,
+      [message.id, created, '2026-08-07T01:00:00.000Z', '2026-08-07T02:00:00.000Z']
+    );
+
+    expect((await listEligibleXoEscalations(created)).map(item => item.id)).not.toContain(
+      message.id
+    );
+    expect(
+      await claimDispatchEscalation({
+        id: message.id,
+        leg: 'telegram',
+        now: '2026-08-07T04:00:00.000Z',
+      })
+    ).toBeNull();
+    expect(
+      await claimDispatchEscalation({
+        id: message.id,
+        leg: 'sms',
+        now: '2026-08-08T00:00:00.000Z',
+      })
+    ).toBeNull();
+  });
+
+  test('acknowledged non-XO blockers create one deterministic handoff but never page directly', async () => {
+    const created = '2026-08-07T00:00:00.000Z';
     const source = await createMessage({
       correlation_id: 'corr-handoff',
       idempotency_key: 'handoff-source',
@@ -1480,10 +1523,34 @@ describe('dispatch db', () => {
       priority: 'blocker',
       body: 'handoff source',
     });
-    const activatedAt = new Date(Date.now() - 60_000).toISOString();
-    expect(await ensureXoEscalationHandoffs(activatedAt)).toBe(1);
-    expect(await ensureXoEscalationHandoffs(activatedAt)).toBe(0);
+    await db.query(
+      'UPDATE agent_dispatch_messages SET created_at = $2, acknowledged_at = $3 WHERE id = $1',
+      [source.id, created, '2026-08-07T01:00:00.000Z']
+    );
+
+    expect(
+      await claimDispatchEscalation({
+        id: source.id,
+        leg: 'telegram',
+        now: '2026-08-07T04:00:00.000Z',
+      })
+    ).toBeNull();
+    expect(
+      await claimDispatchEscalation({
+        id: source.id,
+        leg: 'sms',
+        now: '2026-08-08T00:00:00.000Z',
+      })
+    ).toBeNull();
+
+    expect(await ensureXoEscalationHandoffs(created)).toBe(1);
+    expect(await ensureXoEscalationHandoffs(created)).toBe(0);
     const handoffs = await listMessages({ recipient: 'xo', status: 'queued' });
-    expect(handoffs.find(item => item.idempotency_key === `xo-handoff:${source.id}`)).toBeDefined();
+    const matching = handoffs.filter(item => item.idempotency_key === `xo-handoff:${source.id}`);
+    expect(matching).toHaveLength(1);
+    expect(matching[0]?.correlation_id).toBe(source.correlation_id);
+    expect(matching[0]?.body).toBe(
+      JSON.stringify({ source_id: source.id, kind: 'xo_escalation_handoff' })
+    );
   });
 });
