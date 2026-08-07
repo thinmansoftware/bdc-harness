@@ -300,6 +300,17 @@ describe('overseer-runtime', () => {
     expect(status.blocking_reasons).toContain('effect_clock_stale_with_pending_judgments');
   });
 
+  test('missing effect clock with pending judgments degrades status', async () => {
+    getLastActionAtMock.mockImplementation(async () => null);
+    getLastVerdictAtMock.mockImplementation(async () => null);
+    countPendingJudgmentsMock.mockImplementation(async () => 2);
+
+    const status = await getStatus(() => new Date('2026-08-07T12:00:00.000Z'));
+
+    expect(status.status).toBe('degraded');
+    expect(status.blocking_reasons).toContain('effect_clock_stale_with_pending_judgments');
+  });
+
   test('stale effect clock with an empty backlog does not page', async () => {
     getLastActionAtMock.mockImplementation(async () => '2026-08-01T00:00:00.000Z');
     getLastVerdictAtMock.mockImplementation(async () => '2026-08-01T00:00:00.000Z');

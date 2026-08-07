@@ -298,6 +298,18 @@ describe('GET /api/health', () => {
     );
   });
 
+  test('effect status read failure makes top-level health unknown', async () => {
+    mockGetOverseerLastActionAt.mockImplementationOnce(async () => {
+      throw new Error('missing_overseer_actions');
+    });
+
+    const response = await makeApp().request('/api/health');
+    const body = (await response.json()) as { status: string };
+
+    expect(response.status).toBe(200);
+    expect(body.status).toBe('unknown');
+  });
+
   test('stale effect clock with pending work makes top-level health non-ok', async () => {
     mockGetOverseerLastActionAt.mockImplementationOnce(async () => '2026-07-31T00:00:00.000Z');
     mockGetOverseerLastVerdictAt.mockImplementationOnce(async () => '2026-07-31T00:01:00.000Z');
