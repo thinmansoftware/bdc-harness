@@ -2327,10 +2327,7 @@ nodes:
     bash: |
       set -euo pipefail
       # 2026-05-16 quote-fix: see commit-and-push for rationale.
-      DECIDE_OUTPUT=$(cat <<'BDC_FEATURE_DEV_DECIDE_OUTPUT_DECIDE_PUSH_TARGET_20260719_020'
-      $decide-push-target.output
-      BDC_FEATURE_DEV_DECIDE_OUTPUT_DECIDE_PUSH_TARGET_20260719_020
-      )
+      DECIDE_OUTPUT=$(cat "$ARCHON_NODE_OUT/decide-push-target.out")
       # Extract ONLY the approved-plan block for the PR title/body (F8 fix) -- keep
       # reviewer critique out of the customer-visible PR. FAIL CLOSED if the fence is
       # absent (NF1): never put raw critique-bearing output in the PR body.
@@ -2352,10 +2349,7 @@ nodes:
       $war-council-validator.output
       BDC_FEATURE_DEV_VALIDATOR_OUTPUT_WAR_COUNCIL_VALIDATOR_20260719_023
       )
-      COMMIT_PUSH_OUTPUT=$(cat <<'BDC_FEATURE_DEV_COMMIT_PUSH_OUTPUT_COMMIT_AND_PUSH_20260719_024'
-      $commit-and-push.output
-      BDC_FEATURE_DEV_COMMIT_PUSH_OUTPUT_COMMIT_AND_PUSH_20260719_024
-      )
+      COMMIT_PUSH_OUTPUT=$(cat "$ARCHON_NODE_OUT/commit-and-push.out")
       if ! printf '%s\n' "$DECIDE_OUTPUT" | grep -q '^pr_required: true'; then
         echo "PR not required; skipping."
         exit 0
