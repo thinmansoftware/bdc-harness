@@ -1162,9 +1162,9 @@ export async function ensureXoEscalationHandoffs(activatedAt: string): Promise<n
         body: JSON.stringify({ source_id: source.id, kind: 'xo_escalation_handoff' }),
       });
       created++;
-    } catch (error) {
+    } catch {
       log.warn(
-        { sourceId: source.id, error: error instanceof Error ? error.message : 'unknown' },
+        { sourceId: source.id, failureClass: 'handoff_create_rejected' },
         'dispatch_xo_handoff_failed'
       );
     }
@@ -1216,9 +1216,9 @@ async function attemptDispatchOutcomeNotice(
       }),
     });
     return true;
-  } catch (error) {
+  } catch {
     log.warn(
-      { sourceId: source.id, error: error instanceof Error ? error.message : 'unknown' },
+      { sourceId: source.id, failureClass: 'outcome_notice_create_rejected' },
       'dispatch_outcome_notice_failed'
     );
     return false;
