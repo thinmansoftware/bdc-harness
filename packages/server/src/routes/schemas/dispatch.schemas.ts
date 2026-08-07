@@ -78,6 +78,13 @@ export const createDispatchMessageBodySchema = z
 
 export const dispatchMessageIdParamsSchema = z.object({ id: z.string().min(1) });
 export const dispatchSenderBodySchema = z.object({ sender: z.string().min(1) }).strict();
+export const supersedeDispatchMessageBodySchema = z
+  .object({
+    sender: z.string().min(1),
+    replacement: createDispatchMessageBodySchema.omit({ sender: true }),
+  })
+  .strict()
+  .openapi('SupersedeDispatchMessageBody');
 
 export const dispatchMailboxPrincipalBodySchema = z
   .object({

@@ -19,6 +19,7 @@ import { createMcpCancelController, runMcpAgent, type McpRunResult } from './mcp
 import { resolveOperatorToken } from './credentials';
 import { acquireInstanceLock, type InstanceLockHandle } from './instance-lock';
 import { createWorkerLog, type WorkerLog } from './worker-log';
+import { enumerateProcessTree, killProcessTree, waitForTreeDeath } from './acp/kill-tree';
 
 type DispatchTaskType =
   | 'agent_message'
@@ -43,8 +44,14 @@ interface DispatchMessage {
 type DispatchTaskOutcome = 'succeeded' | 'failed' | 'blocked';
 const TRANSCRIPT_PREVIEW_BYTES = 512;
 
-export function classifyDispatchOutcome(exitCode: number, output: string, refusal = false): {
-  resultBody: string; status: 'done' | 'failed'; taskOutcome: DispatchTaskOutcome | null;
+export function classifyDispatchOutcome(
+  exitCode: number,
+  output: string,
+  refusal = false
+): {
+  resultBody: string;
+  status: 'done' | 'failed';
+  taskOutcome: DispatchTaskOutcome | null;
 } {
   const lines = output.replace(/\r\n/g, '\n').split('\n');
   while (lines.at(-1) === '') lines.pop();
@@ -52,16 +59,24 @@ export function classifyDispatchOutcome(exitCode: number, output: string, refusa
   if (sentinel) lines.pop();
   const resultBody = lines.join('\n').trim();
   if (exitCode !== 0) return { resultBody, status: 'failed', taskOutcome: 'failed' };
-  if (refusal || sentinel?.[1] === 'blocked') return { resultBody, status: 'failed', taskOutcome: 'blocked' };
+  if (refusal || sentinel?.[1] === 'blocked')
+    return { resultBody, status: 'failed', taskOutcome: 'blocked' };
   if (sentinel?.[1] === 'failed') return { resultBody, status: 'failed', taskOutcome: 'failed' };
   return { resultBody, status: 'done', taskOutcome: resultBody ? 'succeeded' : null };
 }
 
-export function summarizeTranscriptPayload(value: unknown): { sha256: string; utf8Bytes: number; preview: string } {
+export function summarizeTranscriptPayload(value: unknown): {
+  sha256: string;
+  utf8Bytes: number;
+  preview: string;
+} {
   const text = typeof value === 'string' ? value : JSON.stringify(value);
   const bytes = Buffer.from(text, 'utf8');
-  return { sha256: createHash('sha256').update(bytes).digest('hex'), utf8Bytes: bytes.length,
-    preview: bytes.subarray(0, TRANSCRIPT_PREVIEW_BYTES).toString('utf8') };
+  return {
+    sha256: createHash('sha256').update(bytes).digest('hex'),
+    utf8Bytes: bytes.length,
+    preview: bytes.subarray(0, TRANSCRIPT_PREVIEW_BYTES).toString('utf8'),
+  };
 }
 
 interface BoardDeliveryConfig {
@@ -215,23 +230,47 @@ function promptFor(message: DispatchMessage): string {
   }
 }
 
-async function writeTranscript(data: Record<string, unknown>): Promise<string> {
+export async function writeTranscript(data: Record<string, unknown>): Promise<string> {
   const dir = join(import.meta.dir, 'transcripts');
   await mkdir(dir, { recursive: true });
   const messageId = (data.message as DispatchMessage | undefined)?.id ?? 'unknown';
   const path = join(dir, `${Date.now()}-${messageId}.json`);
-  const safe = Object.fromEntries(Object.entries(data).map(([key, value]) => {
-    if (key === 'message') {
-      const message = value as DispatchMessage;
-      return [key, { id: message.id, task_type: message.task_type, sender: message.sender,
-        recipient: message.recipient, body: summarizeTranscriptPayload(message.body) }];
-    }
-    if (key === 'updates' && Array.isArray(value)) return [key, { count: value.length,
-      types: [...new Set(value.map(item => typeof item === 'object' && item ? String((item as Record<string, unknown>).type ?? 'unknown') : typeof item))] }];
-    if (['stdout', 'stderr', 'finalText', 'error', 'args', 'command', 'cwd'].includes(key))
-      return [key, summarizeTranscriptPayload(value)];
-    return [key, value];
-  }));
+  const safe = Object.fromEntries(
+    Object.entries(data).map(([key, value]) => {
+      if (key === 'message') {
+        const message = value as DispatchMessage;
+        return [
+          key,
+          {
+            id: message.id,
+            task_type: message.task_type,
+            sender: message.sender,
+            recipient: message.recipient,
+            body: summarizeTranscriptPayload(message.body),
+          },
+        ];
+      }
+      if (key === 'updates' && Array.isArray(value))
+        return [
+          key,
+          {
+            count: value.length,
+            types: [
+              ...new Set(
+                value.map(item =>
+                  typeof item === 'object' && item
+                    ? String((item as Record<string, unknown>).type ?? 'unknown')
+                    : typeof item
+                )
+              ),
+            ],
+          },
+        ];
+      if (['stdout', 'stderr', 'finalText', 'error', 'args', 'command', 'cwd'].includes(key))
+        return [key, summarizeTranscriptPayload(value)];
+      return [key, value];
+    })
+  );
   await writeFile(path, JSON.stringify(safe, null, 2), 'utf8');
   return path;
 }
@@ -249,7 +288,12 @@ async function runAcpLeg(
   agentConfig: AgentConfig,
   message: DispatchMessage,
   cancel: ReturnType<typeof createCancelController>
-): Promise<{ resultBody: string; status: 'done' | 'failed'; run: AcpRunResult }> {
+): Promise<{
+  resultBody: string;
+  status: 'done' | 'failed';
+  taskOutcome: DispatchTaskOutcome | null;
+  run: AcpRunResult;
+}> {
   const cwd = await mkdtemp(join(tmpdir(), `bdc-dispatch-acp-${message.recipient}-`));
   const run = await runAcpAgent(
     {
@@ -302,9 +346,16 @@ async function runAcpLeg(
         .filter(Boolean)
         .join('\n');
 
+  const refusal = run.stopReason === 'refusal';
+  const classified = classifyDispatchOutcome(
+    refusal ? 0 : run.ok ? (run.exitCode ?? 0) : 1,
+    summary,
+    refusal
+  );
   return {
-    resultBody: `${summary}\n\nTranscript: ${transcript}`,
-    status: run.ok ? 'done' : 'failed',
+    resultBody: `${classified.resultBody}\n\nTranscript: ${transcript}`,
+    status: classified.status,
+    taskOutcome: classified.taskOutcome,
     run,
   };
 }
@@ -313,7 +364,12 @@ async function runMcpLeg(
   agentConfig: AgentConfig,
   message: DispatchMessage,
   cancel: ReturnType<typeof createMcpCancelController>
-): Promise<{ resultBody: string; status: 'done' | 'failed'; run: McpRunResult }> {
+): Promise<{
+  resultBody: string;
+  status: 'done' | 'failed';
+  taskOutcome: DispatchTaskOutcome | null;
+  run: McpRunResult;
+}> {
   const cwd = await mkdtemp(join(tmpdir(), `bdc-dispatch-mcp-${message.recipient}-`));
   const run = await runMcpAgent(
     {
@@ -360,16 +416,24 @@ async function runMcpLeg(
       ]
         .filter(Boolean)
         .join('\n');
+  const refusal = run.stopReason === 'refusal';
+  const classified = classifyDispatchOutcome(
+    refusal ? 0 : run.ok ? (run.exitCode ?? 0) : 1,
+    summary,
+    refusal
+  );
   return {
-    resultBody: `${summary}\n\nTranscript: ${transcript}`,
-    status: run.ok ? 'done' : 'failed',
+    resultBody: `${classified.resultBody}\n\nTranscript: ${transcript}`,
+    status: classified.status,
+    taskOutcome: classified.taskOutcome,
     run,
   };
 }
 
 export async function runAgent(
   config: AgentConfig,
-  message: DispatchMessage
+  message: DispatchMessage,
+  cancel?: ReturnType<typeof createCancelController>
 ): Promise<{
   resultBody: string;
   status: 'done' | 'failed';
@@ -418,6 +482,25 @@ export async function runAgent(
     stderr: 'pipe',
     stdin: config.kind === 'fusion' ? 'ignore' : 'pipe',
   });
+  let treeBeforeKill: number[] = [];
+  let treeAfterKill: number[] = [];
+  let cancellationStarted = false;
+  let cancellationPromise: Promise<void> | undefined;
+  const beginCancellation = (): Promise<void> => {
+    if (cancellationPromise) return cancellationPromise;
+    cancellationStarted = true;
+    cancellationPromise = (async () => {
+      const tree = await enumerateProcessTree(proc.pid);
+      treeBeforeKill = tree.map(node => node.pid);
+      await killProcessTree(proc.pid);
+      treeAfterKill = await waitForTreeDeath(treeBeforeKill, ACP_DEFAULT_KILL_GRACE_MS);
+    })();
+    return cancellationPromise;
+  };
+  const cancelTimer = setInterval(() => {
+    if (cancel?.cancelled) void beginCancellation();
+  }, 50);
+  cancelTimer.unref?.();
   if (promptBody !== undefined) {
     const stdin = proc.stdin;
     if (!stdin) throw new Error('prompt_stdin_pipe_unavailable');
@@ -437,7 +520,12 @@ export async function runAgent(
     new Response(proc.stdout).text(),
     new Response(proc.stderr).text(),
     proc.exited,
-  ]);
+  ]).finally(() => clearInterval(cancelTimer));
+  // The process can exit between polling ticks. Re-read the synchronous
+  // controller state and await the entire kill/verification operation before
+  // classifying or posting a result.
+  if (cancel?.cancelled) await beginCancellation();
+  else if (cancellationPromise) await cancellationPromise;
   const transcript = await writeTranscript({
     message,
     command,
@@ -446,8 +534,17 @@ export async function runAgent(
     stdout,
     stderr,
     exitCode,
+    cancelled: cancellationStarted,
+    treeBeforeKill,
+    treeAfterKill,
   });
-  const classified = classifyDispatchOutcome(exitCode, stdout.trim() || stderr.trim());
+  const classified = cancellationStarted
+    ? {
+        resultBody: `CLI leg cancelled; survivors=${treeAfterKill.join(',') || 'none'}`,
+        status: 'failed' as const,
+        taskOutcome: 'failed' as const,
+      }
+    : classifyDispatchOutcome(exitCode, stdout.trim() || stderr.trim());
   const finalText = classified.resultBody || `No output. See transcript: ${transcript}`;
   return {
     resultBody: `${finalText}\n\nTranscript: ${transcript}`,
@@ -509,14 +606,18 @@ async function processMessage(
     }, config.lease_renew_interval_ms);
     renewTimer.unref?.();
 
-    let result: { resultBody: string; status: 'done' | 'failed'; taskOutcome?: DispatchTaskOutcome | null };
+    let result: {
+      resultBody: string;
+      status: 'done' | 'failed';
+      taskOutcome?: DispatchTaskOutcome | null;
+    };
     try {
       result =
         agentConfig.kind === 'acp'
           ? await runAcpLeg(agentConfig, claimed, cancel)
           : agentConfig.kind === 'mcp'
             ? await runMcpLeg(agentConfig, claimed, cancel)
-            : await runAgent(agentConfig, claimed);
+            : await runAgent(agentConfig, claimed, cancel);
     } finally {
       clearInterval(renewTimer);
     }
