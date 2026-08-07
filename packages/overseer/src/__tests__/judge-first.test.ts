@@ -16,7 +16,13 @@ import {
   type JudgeOutcome,
   type JudgeSpawnResult,
 } from '../judge-first';
-import { handleRecordJudgeFirst } from '../judge-first-pipeline';
+import {
+  DEFAULT_P0_MAX_RETRIES,
+  DEFAULT_ROUTINE_MAX_RETRIES,
+  handleRecordJudgeFirst,
+  isP0Run,
+  resolveJudgeMaxRetries,
+} from '../judge-first-pipeline';
 import { MAX_TIER, effectiveTier, requiredTierForAction, ruleOnAction } from '../tier-map';
 import type {
   OverseerVerdictStoreDeps,
@@ -315,6 +321,88 @@ describe('handleRecordJudgeFirst: pipeline', () => {
     expect(actions[0]?.result).toContain('operator_card:card-fake-1');
   });
 
+  // WO-HARNESS-OVERSEER-JUDGE-BUDGET-CIRCUIT-01 (narrowed): P0 must escalate on the
+  // FIRST judge health failure, not after the routine 3-retry wait. Outcome kinds are
+  // judge_unavailable | judge_invalid_output | evidence_unavailable -- there is no
+  // literal judge_daily_budget_exhausted value (daily circuit deleted in #602).
+  test('Test 2c: P0 run escalates on first judge health failure (no retry wait)', async () => {
+    const state: FakeStoreState = { claims: [], finalized: [] };
+    const { actions, deps } = makeDeps([makeEvent('e1', 'boom')]);
+    await handleRecordJudgeFirst(
+      makeRecord({
+        status: 'failed',
+        action: 'escalate',
+        woId: 'WO-HARNESS-CRITICAL-01',
+        metadata: { priority: 'P0' },
+      }),
+      deps,
+      {
+        dryRun: false,
+        actor: 'test',
+        // Deliberately omit maxRetries so the pipeline must derive P0 sizing itself.
+        verdictStore: makeVerdictStore({ claimed: true, verdictId: 'v-p0', retryCount: 0 }, state),
+        judge: async () => ({
+          kind: 'judge_unavailable',
+          reason: 'all ladder rung(s) unavailable (spawn failure, timeout, or nonzero exit)',
+        }),
+        escalate: fakeEscalate,
+      }
+    );
+    expect(state.finalized[0]?.status).toBe('judge_unavailable');
+    expect(actions).toHaveLength(1);
+    expect(actions[0]?.action).toBe('escalate_with_evidence');
+    expect(actions[0]?.result).toContain('operator_card:card-fake-1');
+    expect(actions[0]?.result).toMatch(/judge_health_judge_unavailable|p0/i);
+  });
+
+  test('Test 2d: routine run still does not escalate at retryCount 0', async () => {
+    const state: FakeStoreState = { claims: [], finalized: [] };
+    const { actions, deps } = makeDeps([makeEvent('e1', 'boom')]);
+    await handleRecordJudgeFirst(
+      makeRecord({ status: 'failed', action: 'escalate', woId: 'WO-ROUTINE-01' }),
+      deps,
+      {
+        dryRun: false,
+        actor: 'test',
+        verdictStore: makeVerdictStore({ claimed: true, verdictId: 'v-r0', retryCount: 0 }, state),
+        judge: async () => ({ kind: 'judge_unavailable', reason: 'all rungs dead' }),
+        escalate: fakeEscalate,
+      }
+    );
+    expect(state.finalized[0]?.status).toBe('judge_unavailable');
+    expect(actions).toHaveLength(0);
+  });
+});
+
+describe('judge retry budget sizing (WO-HARNESS-OVERSEER-JUDGE-BUDGET-CIRCUIT-01)', () => {
+  test('routine default is 3 retries; P0 default is 0 (immediate escalate)', () => {
+    // Sized against #1390 volume (~533 verdicts sample): daily CALL cap was deleted
+    // because it killed 60% of verdicts. Per-run retry ceiling remains so a dead
+    // judge cannot re-queue forever. P0 skips the wait.
+    expect(DEFAULT_ROUTINE_MAX_RETRIES).toBe(3);
+    expect(DEFAULT_P0_MAX_RETRIES).toBe(0);
+  });
+
+  test('isP0Run detects metadata.priority, metadata.prio, labels, and woId markers', () => {
+    expect(isP0Run(makeRecord({ metadata: { priority: 'P0' } }))).toBe(true);
+    expect(isP0Run(makeRecord({ metadata: { prio: 'p0' } }))).toBe(true);
+    expect(isP0Run(makeRecord({ metadata: { labels: ['wo', 'prio:P0'] } }))).toBe(true);
+    expect(isP0Run(makeRecord({ woId: 'WO-P0-AUTH-01' }))).toBe(true);
+    expect(isP0Run(makeRecord({ woId: 'WO-HARNESS-FOO-01' }))).toBe(false);
+    expect(isP0Run(makeRecord({ metadata: { priority: 'P1' } }))).toBe(false);
+  });
+
+  test('resolveJudgeMaxRetries prefers explicit option, then P0, then routine', () => {
+    const p0 = makeRecord({ metadata: { priority: 'P0' } });
+    const routine = makeRecord({ woId: 'WO-ROUTINE-01' });
+    expect(resolveJudgeMaxRetries(p0, {})).toBe(DEFAULT_P0_MAX_RETRIES);
+    expect(resolveJudgeMaxRetries(routine, {})).toBe(DEFAULT_ROUTINE_MAX_RETRIES);
+    expect(resolveJudgeMaxRetries(p0, { maxRetries: 7 })).toBe(7);
+    expect(resolveJudgeMaxRetries(routine, { maxRetries: 1 })).toBe(1);
+  });
+});
+
+describe('handleRecordJudgeFirst: pipeline (continued)', () => {
   test('Test 3: lost claim means replay -- no model call, no duplicate action', async () => {
     const state: FakeStoreState = { claims: [], finalized: [] };
     const { actions, deps } = makeDeps();
