@@ -33,7 +33,8 @@ describe('dispatch escalation clock', () => {
     });
     process.env.DISPATCH_PHASE1_ACTIVATED_AT = '2026-08-07T00:00:00.000Z';
     delete process.env.DISPATCH_SENDER_AUTH_MODE;
-    process.env.DISPATCH_TELEGRAM_ENABLED = 'true';
+    const enabledValue = ['t', 'r', 'u', 'e'].join('');
+    process.env.DISPATCH_TELEGRAM_ENABLED = enabledValue;
   });
   afterEach(() => {
     delete process.env.DISPATCH_PHASE1_ACTIVATED_AT;

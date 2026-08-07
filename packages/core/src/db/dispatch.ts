@@ -172,7 +172,11 @@ export function normalizeDispatchSubjectKey(value: string): string {
   if (wo) return `wo:${wo[1]}`;
   const gh =
     /^gh:([A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?)\/([A-Za-z0-9_.-]+)#([1-9][0-9]*)$/.exec(value);
-  if (gh) return `gh:${gh[1]!.toLowerCase()}/${gh[2]!.toLowerCase()}#${BigInt(gh[3]!).toString()}`;
+  const owner = gh?.[1];
+  const repo = gh?.[2];
+  const issue = gh?.[3];
+  if (owner && repo && issue)
+    return `gh:${owner.toLowerCase()}/${repo.toLowerCase()}#${BigInt(issue).toString()}`;
   throw new Error('dispatch_subject_key_invalid:shape');
 }
 
@@ -1108,7 +1112,7 @@ export async function claimDispatchEscalation(data: {
   const result = await getDatabase().query(
     `UPDATE agent_dispatch_messages SET ${column} = $2 WHERE id = $1 AND ${column} IS NULL
      AND priority = 'blocker' AND COALESCE(resolved_recipient, recipient) = 'xo'
-     AND addressed_at IS NULL AND status <> 'cancelled'
+     AND acknowledged_at IS NULL AND addressed_at IS NULL AND status <> 'cancelled'
      AND (route_disposition IS NULL OR route_disposition <> 'superseded')
      AND created_at <= $3`,
     [data.id, now, cutoff]
@@ -1135,7 +1139,8 @@ export async function ensureXoEscalationHandoffs(activatedAt: string): Promise<n
     `SELECT source.* FROM agent_dispatch_messages source
      WHERE source.created_at >= $1 AND source.priority = 'blocker'
        AND LOWER(TRIM(COALESCE(source.resolved_recipient, source.recipient))) <> 'xo'
-       AND source.addressed_at IS NULL AND source.status <> 'cancelled'
+       AND source.acknowledged_at IS NULL AND source.addressed_at IS NULL
+       AND source.status <> 'cancelled'
        AND (source.route_disposition IS NULL OR source.route_disposition <> 'superseded')
        AND NOT EXISTS (SELECT 1 FROM agent_dispatch_messages handoff
          WHERE handoff.idempotency_key = 'xo-handoff:' || source.id) LIMIT 100`,
@@ -1172,7 +1177,7 @@ export async function listEligibleXoEscalations(activatedAt: string): Promise<Di
   const result = await getDatabase().query<DispatchMessageRow>(
     `SELECT * FROM agent_dispatch_messages WHERE created_at >= $1 AND priority = 'blocker'
        AND LOWER(TRIM(COALESCE(resolved_recipient, recipient))) = 'xo'
-       AND addressed_at IS NULL AND status <> 'cancelled'
+       AND acknowledged_at IS NULL AND addressed_at IS NULL AND status <> 'cancelled'
        AND (route_disposition IS NULL OR route_disposition <> 'superseded')
      ORDER BY created_at ASC LIMIT 100`,
     [activatedAt]

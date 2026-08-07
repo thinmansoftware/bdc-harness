@@ -1,8 +1,7 @@
 import { readFile } from 'fs/promises';
 
 export async function readDispatchSecretFile(path: string | undefined): Promise<string> {
-  if (!path || !path.startsWith('/run/bdc-secrets/'))
-    throw new Error('dispatch_secret_file_required');
+  if (!path?.startsWith('/run/bdc-secrets/')) throw new Error('dispatch_secret_file_required');
   const value = (await readFile(path, 'utf8')).trim();
   if (!value) throw new Error('dispatch_secret_file_empty');
   return value;

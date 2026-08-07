@@ -26,13 +26,36 @@ describe('dispatch outcome and transcript contract', () => {
     }
   );
 
-  test('bounds transcript content while retaining hash and byte count', async () => {
-    const marker = `visible-${'x'.repeat(600)}-SECRET-BEYOND-PREVIEW`;
+  test('redacts transcript content while retaining hash and byte count', async () => {
+    const marker = `SECRET-BEFORE-PREVIEW-${'x'.repeat(600)}-SECRET-BEYOND-PREVIEW`;
     const summary = summarizeTranscriptPayload(marker);
     expect(summary.utf8Bytes).toBe(Buffer.byteLength(marker));
+    expect(summary.preview).toBe('[redacted]');
+    expect(summary.preview).not.toContain('SECRET-BEFORE-PREVIEW');
     expect(summary.preview).not.toContain('SECRET-BEYOND-PREVIEW');
-    const path = await writeTranscript({ stdout: marker });
-    expect(await readFile(path, 'utf8')).not.toContain('SECRET-BEYOND-PREVIEW');
+    const path = await writeTranscript({
+      stdout: marker,
+      stderr: 'stderr-secret',
+      prompt: 'prompt-secret',
+      command: 'command-secret',
+      args: ['argument-secret'],
+      error: new Error('error-secret'),
+      authMethodId: 'token-secret',
+    });
+    const persisted = await readFile(path, 'utf8');
+    for (const forbidden of [
+      'SECRET-BEFORE-PREVIEW',
+      'SECRET-BEYOND-PREVIEW',
+      'stderr-secret',
+      'prompt-secret',
+      'command-secret',
+      'argument-secret',
+      'error-secret',
+      'token-secret',
+    ])
+      expect(persisted).not.toContain(forbidden);
+    expect(persisted).toContain('sha256');
+    expect(persisted).toContain('utf8Bytes');
   });
 
   test('kills a real CLI descendant tree and proves death', async () => {

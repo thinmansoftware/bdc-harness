@@ -42,7 +42,6 @@ interface DispatchMessage {
 }
 
 type DispatchTaskOutcome = 'succeeded' | 'failed' | 'blocked';
-const TRANSCRIPT_PREVIEW_BYTES = 512;
 
 export function classifyDispatchOutcome(
   exitCode: number,
@@ -70,12 +69,13 @@ export function summarizeTranscriptPayload(value: unknown): {
   utf8Bytes: number;
   preview: string;
 } {
-  const text = typeof value === 'string' ? value : JSON.stringify(value);
+  const encoded = typeof value === 'string' ? value : JSON.stringify(value);
+  const text = encoded ?? String(value);
   const bytes = Buffer.from(text, 'utf8');
   return {
     sha256: createHash('sha256').update(bytes).digest('hex'),
     utf8Bytes: bytes.length,
-    preview: bytes.subarray(0, TRANSCRIPT_PREVIEW_BYTES).toString('utf8'),
+    preview: '[redacted]',
   };
 }
 
@@ -257,18 +257,29 @@ export async function writeTranscript(data: Record<string, unknown>): Promise<st
             count: value.length,
             types: [
               ...new Set(
-                value.map(item =>
-                  typeof item === 'object' && item
-                    ? String((item as Record<string, unknown>).type ?? 'unknown')
-                    : typeof item
-                )
+                value.map(item => {
+                  if (typeof item !== 'object' || !item) return typeof item;
+                  const type = (item as Record<string, unknown>).type;
+                  return typeof type === 'string' ? type : 'unknown';
+                })
               ),
             ],
           },
         ];
-      if (['stdout', 'stderr', 'finalText', 'error', 'args', 'command', 'cwd'].includes(key))
-        return [key, summarizeTranscriptPayload(value)];
-      return [key, value];
+      if (
+        [
+          'transport',
+          'stopReason',
+          'timedOut',
+          'cancelled',
+          'exitCode',
+          'agentPid',
+          'treeBeforeKill',
+          'treeAfterKill',
+        ].includes(key)
+      )
+        return [key, value];
+      return [key, summarizeTranscriptPayload(value)];
     })
   );
   await writeFile(path, JSON.stringify(safe, null, 2), 'utf8');
@@ -489,7 +500,7 @@ export async function runAgent(
   const beginCancellation = (): Promise<void> => {
     if (cancellationPromise) return cancellationPromise;
     cancellationStarted = true;
-    cancellationPromise = (async () => {
+    cancellationPromise = (async (): Promise<void> => {
       const tree = await enumerateProcessTree(proc.pid);
       treeBeforeKill = tree.map(node => node.pid);
       await killProcessTree(proc.pid);
@@ -520,7 +531,9 @@ export async function runAgent(
     new Response(proc.stdout).text(),
     new Response(proc.stderr).text(),
     proc.exited,
-  ]).finally(() => clearInterval(cancelTimer));
+  ]).finally(() => {
+    clearInterval(cancelTimer);
+  });
   // The process can exit between polling ticks. Re-read the synchronous
   // controller state and await the entire kill/verification operation before
   // classifying or posting a result.

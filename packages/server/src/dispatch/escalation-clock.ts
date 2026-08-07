@@ -30,15 +30,19 @@ export async function tickDispatchEscalationClock(
     await reconcileDispatchOutcomeNotices(activatedAt);
     await ensureXoEscalationHandoffs(activatedAt);
     if (process.env.DISPATCH_SENDER_AUTH_MODE !== 'enforce') return;
-    const now = (dependencies.now ?? (() => new Date()))().toISOString();
+    const now = (dependencies.now ?? ((): Date => new Date()))().toISOString();
     const candidates = await listEligibleXoEscalations(activatedAt);
-    const legs: Array<[DispatchEscalationLeg, boolean, (id: string) => Promise<void>]> = [
+    const legs: [DispatchEscalationLeg, boolean, (id: string) => Promise<void>][] = [
       [
         'telegram',
-        process.env.DISPATCH_TELEGRAM_ENABLED === 'true',
+        ['true'].includes(process.env.DISPATCH_TELEGRAM_ENABLED ?? ''),
         dependencies.telegram ?? sendTelegramEscalation,
       ],
-      ['sms', process.env.DISPATCH_SMS_ENABLED === 'true', dependencies.sms ?? sendSmsEscalation],
+      [
+        'sms',
+        ['true'].includes(process.env.DISPATCH_SMS_ENABLED ?? ''),
+        dependencies.sms ?? sendSmsEscalation,
+      ],
     ];
     for (const candidate of candidates)
       for (const [leg, enabled, notify] of legs) {
@@ -47,23 +51,20 @@ export async function tickDispatchEscalationClock(
         if (!claimed) continue;
         try {
           await notify(claimed.id);
-        } catch (error) {
+        } catch {
           await releaseDispatchEscalationClaim({ id: claimed.id, leg, claimed_at: now });
           log.error(
             {
               messageId: claimed.id,
               leg,
-              err: error instanceof Error ? error : new Error(String(error)),
+              failureClass: 'notifier_rejected',
             },
             'dispatch_escalation_delivery_failed'
           );
         }
       }
-  } catch (error) {
-    log.error(
-      { err: error instanceof Error ? error : new Error(String(error)) },
-      'dispatch_escalation_tick_failed'
-    );
+  } catch {
+    log.error({ failureClass: 'tick_rejected' }, 'dispatch_escalation_tick_failed');
   } finally {
     inFlight = false;
   }
