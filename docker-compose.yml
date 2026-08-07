@@ -66,6 +66,15 @@ services:
       # scheduled ON at 60s. Set TASKMASTER_INTERVAL_MS=0 to KILL the loop (zero
       # effects) as the rollback path. Non-secret; override via .env if desired.
       TASKMASTER_INTERVAL_MS: ${TASKMASTER_INTERVAL_MS:-60000}
+      # External dead-man polling (M-133 binding condition 5). The Overseer runs
+      # in-process in this container (startOverseerRuntime) and polls the
+      # Taskmaster's OWN HTTP status endpoint -- an independent observation, not a
+      # self-reported health row. Without this URL the checker self-skips
+      # ("taskmaster.deadman_scheduler_unconfigured") and a stalled Taskmaster is
+      # never escalated, so it MUST ship configured. Operator token (if any) is
+      # read from ARCHON_OPERATOR_TOKEN via env_file -- never hardcode it here.
+      TASKMASTER_STATUS_URL: ${TASKMASTER_STATUS_URL:-http://localhost:${PORT:-3000}/api/taskmaster/status}
+      TASKMASTER_ESCALATION_RECIPIENT: ${TASKMASTER_ESCALATION_RECIPIENT:-operator}
     ports:
       - "${PORT:-3000}:${PORT:-3000}"
     volumes:

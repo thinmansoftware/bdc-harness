@@ -104,6 +104,16 @@ export interface TickResult {
   headroom: Headroom['state'];
 }
 
+/** A P0 escalation: stays alive while PAUSED, and is ordered first within a tick. */
+function isP0EscalationProposal(proposal: TaskmasterProposal): boolean {
+  return proposal.actionType === 'escalate' && proposal.priority === 'P0';
+}
+
+/** Sort key: P0 escalations (0) are evaluated before everything else (1). */
+function escalationRank(proposal: TaskmasterProposal): number {
+  return isP0EscalationProposal(proposal) ? 0 : 1;
+}
+
 /**
  * One decision pass. Enforces, in order: two-tick eligibility (except
  * act-immediately proposals), 1-effect-per-item-per-tick, max-effects-per-tick
@@ -111,6 +121,11 @@ export interface TickResult {
  * per-item 24h intervention budget, row-first journaling, pause (sends blocked
  * except P0 escalation), and a pre-effect epoch re-check (resume expires stale
  * proposals rather than replaying them).
+ *
+ * The per-tick effect ceiling is ABSOLUTE (M-133: "max 10 effects/tick") -- no
+ * verb, including a P0 escalation and the daily digest, may exceed it. P0
+ * escalation is kept alive by ORDERING (P0 escalations are evaluated first) and
+ * by counting outbound SENDS only, never by exempting it from the budget.
  */
 export async function tick(ctx: TickContext): Promise<TickResult> {
   const pause = await ctx.readPause();
@@ -133,6 +148,11 @@ export async function tick(ctx: TickContext): Promise<TickResult> {
     headroom: headroom.state,
   };
 
+  // Compute every proposal up front so P0 escalations can be ORDERED FIRST.
+  // The ceiling is absolute, so a burst of lower-priority sends must never
+  // consume the budget ahead of a P0 escalation. Ordering -- not exemption --
+  // is what keeps P0 escalation alive within the adopted budget.
+  const pending: { thread: TaskmasterThread; proposal: TaskmasterProposal }[] = [];
   for (const thread of threads) {
     const proposal = computeNextAction(thread, ctx.now, epoch);
     if (!proposal) {
@@ -140,7 +160,13 @@ export async function tick(ctx: TickContext): Promise<TickResult> {
       result.noop++;
       continue;
     }
+    pending.push({ thread, proposal });
+  }
+  // Array.prototype.sort is stable (ES2019+), so equal-rank items keep the
+  // order readThreads() returned them in.
+  pending.sort((a, b) => escalationRank(a.proposal) - escalationRank(b.proposal));
 
+  for (const { thread, proposal } of pending) {
     // Two-consecutive-tick eligibility, EXCEPT undelivered rulings + unclaimed P0s.
     if (!proposal.actImmediately) {
       const prev = ctx.eligibility.get(thread.ref);
@@ -154,16 +180,17 @@ export async function tick(ctx: TickContext): Promise<TickResult> {
     // Budget: at most one effect per item per tick.
     if (touchedThisTick.has(thread.ref)) continue;
 
-    // P0 escalation must remain active while paused (Mode Behavior Matrix). It
-    // is exempt from the per-tick effect ceiling so a burst of parked/deferred
-    // items can never starve it.
-    const isP0Escalation = proposal.actionType === 'escalate' && proposal.priority === 'P0';
+    // P0 escalation must remain active while PAUSED (Mode Behavior Matrix). That
+    // is a pause exemption ONLY -- it is NOT an exemption from the effect ceiling.
+    const isP0Escalation = isP0EscalationProposal(proposal);
 
     // Budget: max effects per tick counts OUTBOUND SENDS only. parked/deferred/
     // rejected are journal-only (no send), so they must NOT consume the ceiling
     // -- otherwise ten items parked during PAUSE would defer a later P0
-    // escalation that must stay alive. Remainder is journalled deferred, not dropped.
-    if (!isP0Escalation && result.sent >= maxEffects) {
+    // escalation that must stay alive. The ceiling itself is ABSOLUTE and binds
+    // every verb including P0 escalation; P0 is protected by being ordered first,
+    // not by being exempt. Remainder is journalled deferred, not dropped.
+    if (result.sent >= maxEffects) {
       await ctx.recordAction({
         thread_ref: proposal.threadRef,
         action_type: proposal.actionType,
@@ -252,7 +279,7 @@ export async function tick(ctx: TickContext): Promise<TickResult> {
     touchedThisTick.add(thread.ref);
   }
 
-  await maybeSendDigest(ctx, epoch, result);
+  await maybeSendDigest(ctx, epoch, result, maxEffects);
 
   ctx.recordHeartbeat(ctx.now);
   return result;
@@ -263,8 +290,14 @@ export async function tick(ctx: TickContext): Promise<TickResult> {
  * same row-first -> guard -> dispatch -> proof path as the verbs. The digest
  * sends even while PAUSED/HARD_PAUSE (Mode Behavior Matrix); the idempotency key
  * carries only the day-bucket so pause/resume never produces a second digest.
+ * It is bound by the absolute per-tick effect ceiling like every other verb.
  */
-async function maybeSendDigest(ctx: TickContext, epoch: number, result: TickResult): Promise<void> {
+async function maybeSendDigest(
+  ctx: TickContext,
+  epoch: number,
+  result: TickResult,
+  maxEffects: number
+): Promise<void> {
   if (!ctx.digest) return;
 
   const dayBucket = Math.floor(ctx.now / DAY);
@@ -274,6 +307,22 @@ async function maybeSendDigest(ctx: TickContext, epoch: number, result: TickResu
     body: await ctx.digest.buildBody(),
     dayBucket,
   });
+
+  // The digest is an OUTBOUND effect and is bound by the same absolute per-tick
+  // ceiling as the verbs -- it must never be an 11th effect. Journalled deferred
+  // (not dropped); the day-bucket idempotency key means a later tick the same day
+  // still delivers exactly one digest.
+  if (result.sent >= maxEffects) {
+    await ctx.recordAction({
+      thread_ref: proposal.threadRef,
+      action_type: proposal.actionType,
+      proposal_json: JSON.stringify(proposal),
+      idempotency_key: proposal.idempotencyKey,
+      outcome: 'deferred',
+    });
+    result.deferred++;
+    return;
+  }
 
   const guard = ctx.validate(proposal);
   if (!guard.allowed) {

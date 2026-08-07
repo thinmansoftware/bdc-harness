@@ -305,4 +305,82 @@ describe('taskmaster tick', () => {
     expect(journal.byThread('digest').length).toBe(1);
     expect(sent.filter(k => k.startsWith('tm:digest:')).length).toBe(1);
   });
+  test('P0 escalations are BOUND by the absolute per-tick ceiling (no exemption)', async () => {
+    const journal = makeJournal();
+    const sent: string[] = [];
+    // 15 unclaimed P0s past their 30-minute clock, all act-immediately. The
+    // ceiling is absolute (M-133: max 10 effects/tick) -- an exemption here would
+    // let a P0 burst emit unbounded effects in a single tick.
+    const threads: TaskmasterThread[] = [];
+    for (let i = 0; i < 15; i++) {
+      threads.push({
+        ref: `wo/p0-burst-${i}`,
+        priority: 'P0',
+        lastActivityAt: NOW - 40 * MIN,
+        claimed: false,
+        recipient: 'john',
+        subject: `wo/p0-burst-${i}`,
+      });
+    }
+
+    const res = await tick(baseCtx({ journal, threads, sent, eligibility: new Map() }));
+
+    expect(res.sent).toBe(10); // ceiling holds for P0 too
+    expect(sent.length).toBe(10);
+    expect(res.deferred).toBe(5); // remainder journalled, not dropped
+    expect(res.sent + res.deferred).toBe(15);
+  });
+
+  test('a P0 escalation is ordered first, so lower-priority sends cannot starve it', async () => {
+    const journal = makeJournal();
+    const sent: string[] = [];
+    const eligibility = new Map();
+
+    // 12 stale P1s (over the ceiling) are eligible this tick under RUNNING, and
+    // the P0 is LAST in readThreads() order. Ordering -- not exemption -- must
+    // keep the P0 escalation inside the 10-effect budget.
+    const threads: TaskmasterThread[] = [];
+    for (let i = 0; i < 12; i++) {
+      const ref = `wo/noise-${i}`;
+      threads.push(staleP1(ref));
+      eligibility.set(ref, { count: 1, epoch: 0 });
+    }
+    threads.push({
+      ref: 'wo/p0-last',
+      priority: 'P0',
+      lastActivityAt: NOW - 40 * MIN,
+      claimed: false,
+      recipient: 'john',
+      subject: 'wo/p0-last',
+    });
+
+    const res = await tick(baseCtx({ journal, threads, sent, eligibility }));
+
+    expect(res.sent).toBe(10); // absolute ceiling still respected
+    expect(journal.byThread('wo/p0-last')[0]?.outcome).toBe('sent'); // and P0 got through
+    expect(sent[0]).toBe(`tm:escalate:wo/p0-last:0:${Math.floor(NOW / (24 * 60 * MIN))}`);
+  });
+
+  test('the daily digest cannot become an 11th effect (deferred at the ceiling)', async () => {
+    const journal = makeJournal();
+    const sent: string[] = [];
+    const eligibility = new Map();
+    const digest = { recipient: 'john', buildBody: async () => 'digest body' };
+
+    // Exactly fill the ceiling with verb sends, then the digest must defer.
+    const threads: TaskmasterThread[] = [];
+    for (let i = 0; i < 10; i++) {
+      const ref = `wo/fill-${i}`;
+      threads.push(staleP1(ref));
+      eligibility.set(ref, { count: 1, epoch: 0 });
+    }
+
+    const res = await tick(baseCtx({ journal, threads, sent, eligibility, digest }));
+
+    expect(res.sent).toBe(10); // never 11
+    expect(res.digest).toBe(false);
+    expect(sent.filter(k => k.startsWith('tm:digest:')).length).toBe(0);
+    // Deferred, not dropped: the day-bucket key lets a later tick still deliver it.
+    expect(journal.byThread('digest')[0]?.outcome).toBe('deferred');
+  });
 });
