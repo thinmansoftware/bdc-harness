@@ -59,7 +59,12 @@ describe('prompt stdin delivery', () => {
 
       expect(Buffer.byteLength(prompt, 'utf8')).toBe(65_536);
       expect(result.status).toBe('done');
-      expect(result.resultBody).toContain(expectedHash);
+      expect(JSON.parse(result.resultBody)).toMatchObject({
+        classification: 'succeeded',
+        sha256: createHash('sha256').update(expectedHash, 'utf8').digest('hex'),
+        utf8Bytes: Buffer.byteLength(expectedHash),
+        preview: '[redacted]',
+      });
       expect(buildAgentInvocation(config, prompt).args.every(arg => !arg.includes(prompt))).toBe(
         true
       );
@@ -86,8 +91,9 @@ describe('prompt stdin delivery', () => {
     ]);
 
     expect(result.status).toBe('done');
-    expect(result.resultBody).toContain(
-      createHash('sha256').update('small prompt', 'utf8').digest('hex')
+    const childHash = createHash('sha256').update('small prompt', 'utf8').digest('hex');
+    expect(JSON.parse(result.resultBody).sha256).toBe(
+      createHash('sha256').update(childHash, 'utf8').digest('hex')
     );
   }, 10_000);
 
@@ -98,13 +104,15 @@ describe('prompt stdin delivery', () => {
     );
 
     expect(failed.status).toBe('failed');
-    expect(failed.resultBody).toContain('Failed to deliver prompt over stdin');
+    expect(JSON.parse(failed.resultBody)).toMatchObject({ classification: 'failed' });
+    expect(failed.resultBody).not.toContain('Failed to deliver prompt over stdin');
 
     const prompt = 'worker still alive';
     const survived = await runAgent(await stdinHashConfig('survived'), message(prompt, 'survived'));
     expect(survived.status).toBe('done');
-    expect(survived.resultBody).toContain(
-      createHash('sha256').update(prompt, 'utf8').digest('hex')
+    const survivedHash = createHash('sha256').update(prompt, 'utf8').digest('hex');
+    expect(JSON.parse(survived.resultBody).sha256).toBe(
+      createHash('sha256').update(survivedHash, 'utf8').digest('hex')
     );
   }, 15_000);
 });

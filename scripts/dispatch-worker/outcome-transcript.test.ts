@@ -4,6 +4,7 @@ import { spawn } from 'node:child_process';
 import {
   classifyDispatchOutcome,
   runAgent,
+  summarizePersistedOutcome,
   summarizeTranscriptPayload,
   writeTranscript,
 } from './index';
@@ -58,6 +59,19 @@ describe('dispatch outcome and transcript contract', () => {
     expect(persisted).toContain('utf8Bytes');
   });
 
+  test('redacts database outcome content while retaining classification, hash, and byte count', () => {
+    const forbidden = 'stdout-secret command-secret token-secret';
+    const persisted = summarizePersistedOutcome('failed', forbidden);
+    expect(persisted).not.toContain(forbidden);
+    expect(persisted).not.toContain('stdout-secret');
+    expect(JSON.parse(persisted)).toMatchObject({
+      classification: 'failed',
+      utf8Bytes: Buffer.byteLength(forbidden),
+      preview: '[redacted]',
+    });
+    expect(JSON.parse(persisted).sha256).toHaveLength(64);
+  });
+
   test('kills a real CLI descendant tree and proves death', async () => {
     if (process.platform === 'win32') return;
     const child = spawn('sh', ['-c', 'sleep 30 & wait']);
@@ -93,6 +107,7 @@ describe('dispatch outcome and transcript contract', () => {
     cancel.cancel();
     const result = await resultPromise;
     expect(result.status).toBe('failed');
-    expect(result.resultBody).toContain('CLI leg cancelled; survivors=none');
+    expect(result.resultBody).not.toContain('CLI leg cancelled');
+    expect(JSON.parse(result.resultBody)).toMatchObject({ classification: 'failed' });
   });
 });

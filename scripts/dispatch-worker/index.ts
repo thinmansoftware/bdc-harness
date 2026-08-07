@@ -79,6 +79,19 @@ export function summarizeTranscriptPayload(value: unknown): {
   };
 }
 
+export function summarizePersistedOutcome(
+  classification: DispatchTaskOutcome | null,
+  value: unknown
+): string {
+  const summary = summarizeTranscriptPayload(value);
+  return JSON.stringify({
+    classification,
+    sha256: summary.sha256,
+    utf8Bytes: summary.utf8Bytes,
+    preview: summary.preview,
+  });
+}
+
 interface BoardDeliveryConfig {
   enabled: boolean;
   credential_id: string;
@@ -322,7 +335,7 @@ async function runAcpLeg(
     cancel
   );
 
-  const transcript = await writeTranscript({
+  await writeTranscript({
     message,
     transport: 'acp',
     command: agentConfig.command,
@@ -364,7 +377,7 @@ async function runAcpLeg(
     refusal
   );
   return {
-    resultBody: `${classified.resultBody}\n\nTranscript: ${transcript}`,
+    resultBody: summarizePersistedOutcome(classified.taskOutcome, classified.resultBody),
     status: classified.status,
     taskOutcome: classified.taskOutcome,
     run,
@@ -395,7 +408,7 @@ async function runMcpLeg(
     promptFor(message),
     cancel
   );
-  const transcript = await writeTranscript({
+  await writeTranscript({
     message,
     transport: 'mcp',
     command: agentConfig.command,
@@ -434,7 +447,7 @@ async function runMcpLeg(
     refusal
   );
   return {
-    resultBody: `${classified.resultBody}\n\nTranscript: ${transcript}`,
+    resultBody: summarizePersistedOutcome(classified.taskOutcome, classified.resultBody),
     status: classified.status,
     taskOutcome: classified.taskOutcome,
     run,
@@ -523,7 +536,7 @@ export async function runAgent(
       return {
         status: 'failed',
         taskOutcome: 'failed',
-        resultBody: `Failed to deliver prompt over stdin: ${detail}`,
+        resultBody: summarizePersistedOutcome('failed', detail),
       };
     }
   }
@@ -539,7 +552,7 @@ export async function runAgent(
   // classifying or posting a result.
   if (cancel?.cancelled) await beginCancellation();
   else if (cancellationPromise) await cancellationPromise;
-  const transcript = await writeTranscript({
+  await writeTranscript({
     message,
     command,
     args,
@@ -558,9 +571,8 @@ export async function runAgent(
         taskOutcome: 'failed' as const,
       }
     : classifyDispatchOutcome(exitCode, stdout.trim() || stderr.trim());
-  const finalText = classified.resultBody || `No output. See transcript: ${transcript}`;
   return {
-    resultBody: `${finalText}\n\nTranscript: ${transcript}`,
+    resultBody: summarizePersistedOutcome(classified.taskOutcome, classified.resultBody),
     status: classified.status,
     taskOutcome: classified.taskOutcome,
   };
