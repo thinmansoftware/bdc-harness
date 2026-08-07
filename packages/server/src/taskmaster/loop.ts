@@ -18,6 +18,8 @@ import { createLogger } from '@archon/paths';
 import {
   countInterventionsSince,
   createMessage,
+  getActionsSince,
+  getMessage,
   getPauseState,
   recordAction,
   recordUsageSample,
@@ -28,7 +30,12 @@ import {
 import { currentHeadroom, type Headroom } from './ledger';
 import { recordTickHeartbeat } from './deadman';
 import { validate as guardValidate } from './guard';
-import { computeNextAction, type TaskmasterProposal, type TaskmasterThread } from './rules';
+import {
+  computeDigestProposal,
+  computeNextAction,
+  type TaskmasterProposal,
+  type TaskmasterThread,
+} from './rules';
 
 const HOUR = 60 * 60 * 1000;
 const DAY = 24 * HOUR;
@@ -63,12 +70,28 @@ export interface TickContext {
   updateActionOutcome: (id: string, outcome: string, grade?: string | null) => Promise<void>;
   countInterventionsSince: (threadRef: string, sinceIso: string) => Promise<number>;
   sendMessage: (proposal: TaskmasterProposal) => Promise<{ id: string }>;
+  /**
+   * Independently confirm the sent effect landed in the SOR (satisfies the
+   * proposal's proof_predicate). SC7 forbids grading `useful` on self-report --
+   * the grade is applied ONLY when this returns true; otherwise the row stays
+   * ungraded (outcome='sent', grade=null) until a later tick re-verifies.
+   */
+  verifyDelivered: (proposal: TaskmasterProposal, sentId: string) => Promise<boolean>;
   validate: (proposal: TaskmasterProposal) => { allowed: boolean; reason?: string };
   recordHeartbeat: (now: number) => void;
   /** Persisted between ticks (module-scope in production; injected in tests). */
   eligibility: Map<string, EligibilityEntry>;
   maxEffectsPerTick?: number;
   maxInterventionsPer24h?: number;
+  /**
+   * Daily digest to John (Section 8b.3). When present, tick() emits at most one
+   * digest per day-bucket through the same dispatch path; the digest sends even
+   * while paused. Absent in most unit tests.
+   */
+  digest?: {
+    recipient: string;
+    buildBody: () => Promise<string>;
+  };
 }
 
 export interface TickResult {
@@ -77,6 +100,7 @@ export interface TickResult {
   deferred: number;
   rejected: number;
   noop: number;
+  digest: boolean;
   headroom: Headroom['state'];
 }
 
@@ -105,6 +129,7 @@ export async function tick(ctx: TickContext): Promise<TickResult> {
     deferred: 0,
     rejected: 0,
     noop: 0,
+    digest: false,
     headroom: headroom.state,
   };
 
@@ -129,8 +154,16 @@ export async function tick(ctx: TickContext): Promise<TickResult> {
     // Budget: at most one effect per item per tick.
     if (touchedThisTick.has(thread.ref)) continue;
 
-    // Budget: max effects per tick. Remainder is journalled deferred, not dropped.
-    if (result.sent + result.parked >= maxEffects) {
+    // P0 escalation must remain active while paused (Mode Behavior Matrix). It
+    // is exempt from the per-tick effect ceiling so a burst of parked/deferred
+    // items can never starve it.
+    const isP0Escalation = proposal.actionType === 'escalate' && proposal.priority === 'P0';
+
+    // Budget: max effects per tick counts OUTBOUND SENDS only. parked/deferred/
+    // rejected are journal-only (no send), so they must NOT consume the ceiling
+    // -- otherwise ten items parked during PAUSE would defer a later P0
+    // escalation that must stay alive. Remainder is journalled deferred, not dropped.
+    if (!isP0Escalation && result.sent >= maxEffects) {
       await ctx.recordAction({
         thread_ref: proposal.threadRef,
         action_type: proposal.actionType,
@@ -192,7 +225,6 @@ export async function tick(ctx: TickContext): Promise<TickResult> {
 
     // Pause: sends are blocked EXCEPT P0 escalation. Monitoring + escalation stay alive.
     const sendsBlocked = pause.pause_state !== 'RUNNING';
-    const isP0Escalation = proposal.actionType === 'escalate' && proposal.priority === 'P0';
     if (sendsBlocked && !isP0Escalation) {
       await ctx.updateActionOutcome(row.id, 'parked');
       result.parked++;
@@ -209,14 +241,76 @@ export async function tick(ctx: TickContext): Promise<TickResult> {
       continue;
     }
 
-    await ctx.sendMessage(proposal);
-    await ctx.updateActionOutcome(row.id, 'sent', 'useful');
+    const sentMsg = await ctx.sendMessage(proposal);
+    // SC7: the 48h activation proof requires an INDEPENDENTLY verified external
+    // effect, not a self-report. Grade `useful` only when the SOR confirms the
+    // dispatch row landed (the proof_predicate holds); otherwise leave the row
+    // ungraded so a later tick can re-verify against the proof deadline.
+    const delivered = await ctx.verifyDelivered(proposal, sentMsg.id);
+    await ctx.updateActionOutcome(row.id, 'sent', delivered ? 'useful' : null);
     result.sent++;
     touchedThisTick.add(thread.ref);
   }
 
+  await maybeSendDigest(ctx, epoch, result);
+
   ctx.recordHeartbeat(ctx.now);
   return result;
+}
+
+/**
+ * Emit the daily digest (Section 8b.3) at most once per day-bucket, through the
+ * same row-first -> guard -> dispatch -> proof path as the verbs. The digest
+ * sends even while PAUSED/HARD_PAUSE (Mode Behavior Matrix); the idempotency key
+ * carries only the day-bucket so pause/resume never produces a second digest.
+ */
+async function maybeSendDigest(ctx: TickContext, epoch: number, result: TickResult): Promise<void> {
+  if (!ctx.digest) return;
+
+  const dayBucket = Math.floor(ctx.now / DAY);
+  const proposal = computeDigestProposal({
+    now: ctx.now,
+    recipient: ctx.digest.recipient,
+    body: await ctx.digest.buildBody(),
+    dayBucket,
+  });
+
+  const guard = ctx.validate(proposal);
+  if (!guard.allowed) {
+    await ctx.recordAction({
+      thread_ref: proposal.threadRef,
+      action_type: proposal.actionType,
+      proposal_json: JSON.stringify({ proposal, reason: guard.reason }),
+      idempotency_key: proposal.idempotencyKey,
+      outcome: 'rejected',
+    });
+    result.rejected++;
+    return;
+  }
+
+  const row = await ctx.recordAction({
+    thread_ref: proposal.threadRef,
+    action_type: proposal.actionType,
+    proposal_json: JSON.stringify(proposal),
+    idempotency_key: proposal.idempotencyKey,
+    outcome: 'proposed',
+    proof_predicate: `delivered:${proposal.idempotencyKey}`,
+    proof_deadline_at: new Date(ctx.now + 48 * HOUR).toISOString(),
+  });
+  if (row.outcome === 'sent') return; // already delivered today -- dedupe.
+
+  // Re-check the epoch immediately before the effect (same discipline as verbs).
+  const fresh = await ctx.readPause();
+  if (fresh.epoch !== epoch) {
+    await ctx.updateActionOutcome(row.id, 'expired');
+    return;
+  }
+
+  const sentMsg = await ctx.sendMessage(proposal);
+  const delivered = await ctx.verifyDelivered(proposal, sentMsg.id);
+  await ctx.updateActionOutcome(row.id, 'sent', delivered ? 'useful' : null);
+  result.sent++;
+  result.digest = true;
 }
 
 // ---------------------------------------------------------------------------
@@ -227,31 +321,72 @@ let taskmasterTimer: ReturnType<typeof setInterval> | undefined;
 const productionEligibility = new Map<string, EligibilityEntry>();
 
 /**
- * Build the current stalled-thread set for real wiring. Slice 1 sources threads
- * from the dispatch mailbox (the sanctioned SOR path): queued-but-unaddressed
- * ratified rulings become deliver_ruling threads. The GitHub-issue SOR reader
- * (nudge/escalate of wo/arc-labelled issues) is a follow-up -- no issue-LISTING
- * client exists in-repo today (only webhook receipt + work-order freeze), and
- * inventing one is out of Slice 1 scope. See manifest.
+ * Build the current thread set for real wiring from the dispatch mailbox -- the
+ * sanctioned SOR path (Section 3). Two thread kinds are sourced so all three
+ * verbs are live in production:
+ *   - Queued ratified rulings (motion_id present) -> undelivered-ruling threads
+ *     (deliver_ruling).
+ *   - Other queued work -> stalled-work threads. Idle past the nudge clock these
+ *     become `nudge`; an unclaimed blocker (P0) past its clock becomes `escalate`.
+ *
+ * The GitHub-issue SOR reader named in the spec is NOT used: no issue-LISTING
+ * client exists in-repo (only single-issue freeze in work-order-source.ts +
+ * webhook receipt), and inventing one is out of Slice 1 scope. Sourcing stalled
+ * work from the mailbox keeps nudge + escalate operating in production without it.
+ * See manifest.
  */
 async function buildThreadsFromMailbox(now: number): Promise<TaskmasterThread[]> {
   const queued = await listMessages({ status: 'queued', limit: 200 });
   const threads: TaskmasterThread[] = [];
   for (const msg of queued) {
-    const isRuling = Boolean(msg.motion_id);
-    if (!isRuling) continue;
-    const createdMs = Date.parse(msg.created_at);
+    if (msg.motion_id) {
+      const createdMs = Date.parse(msg.created_at);
+      threads.push({
+        ref: `ruling/${msg.motion_id}`,
+        priority: msg.priority === 'blocker' ? 'P0' : 'P1',
+        lastActivityAt: Number.isNaN(createdMs) ? now : createdMs,
+        claimed: false,
+        undeliveredRuling: true,
+        recipient: msg.recipient,
+        subject: msg.motion_id,
+      });
+      continue;
+    }
+    // Non-ruling queued work is a stalled thread: nudge the recipient once it is
+    // idle past its clock, or escalate an unclaimed P0 blocker.
+    const activityMs = Date.parse(msg.claimed_at ?? msg.created_at);
     threads.push({
-      ref: `ruling/${msg.motion_id}`,
+      ref: `msg/${msg.id}`,
       priority: msg.priority === 'blocker' ? 'P0' : 'P1',
-      lastActivityAt: Number.isNaN(createdMs) ? now : createdMs,
-      claimed: false,
-      undeliveredRuling: true,
+      lastActivityAt: Number.isNaN(activityMs) ? now : activityMs,
+      claimed: Boolean(msg.claimed_at),
       recipient: msg.recipient,
-      subject: msg.motion_id ?? msg.id,
+      subject: msg.correlation_id || msg.id,
     });
   }
   return threads;
+}
+
+/**
+ * Summarize the last 24h of journalled actions for the daily digest to John.
+ * A cheap read of the append-only journal -- no side effects.
+ */
+async function buildDigestBody(now: number): Promise<string> {
+  const since = new Date(now - DAY).toISOString();
+  const actions = await getActionsSince(since);
+  const counts: Record<string, number> = {};
+  for (const action of actions) {
+    counts[action.outcome] = (counts[action.outcome] ?? 0) + 1;
+  }
+  const sent = counts.sent ?? 0;
+  const parked = counts.parked ?? 0;
+  const deferred = counts.deferred ?? 0;
+  const rejected = counts.rejected ?? 0;
+  return [
+    'Taskmaster daily digest (last 24h):',
+    `sent=${sent} parked=${parked} deferred=${deferred} rejected=${rejected};`,
+    `total actions journalled: ${actions.length}.`,
+  ].join(' ');
 }
 
 /** Real sender: routes a Taskmaster proposal through the dispatch DAL. */
@@ -334,9 +469,20 @@ export function startTaskmaster(): void {
           updateActionOutcome(id, outcome as 'sent', grade ?? null),
         countInterventionsSince,
         sendMessage: sendViaDispatch,
+        verifyDelivered: async (proposal, sentId) => {
+          // Independently confirm the mailbox row exists in the SOR before the
+          // action is graded `useful` (SC7). Re-reading the persisted dispatch
+          // row is the external check -- not the send's own return value.
+          const msg = await getMessage(sentId);
+          return msg !== null && msg.idempotency_key === proposal.idempotencyKey;
+        },
         validate: guardValidate,
         recordHeartbeat: recordTickHeartbeat,
         eligibility: productionEligibility,
+        digest: {
+          recipient: process.env.TASKMASTER_DIGEST_RECIPIENT ?? 'john',
+          buildBody: () => buildDigestBody(now),
+        },
       });
       if (result.sent > 0 || result.parked > 0 || result.deferred > 0) {
         getLog().info({ ...result, ownerId }, 'taskmaster.tick');

@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import { TaskmasterDeadmanChecker, type TaskmasterStatus } from '../taskmaster-deadman-check';
+import { runTaskmasterDeadmanScheduler } from '../service';
 
 /**
  * SC8 (binding condition 5, Q4): with the tick suspended for 3 intervals the
@@ -69,5 +70,36 @@ describe('TaskmasterDeadmanChecker', () => {
     expect(result.health).toBe('unknown');
     expect(result.escalated).toBe(false);
     expect(escalations.length).toBe(0);
+  });
+});
+
+/**
+ * Production wiring: the scheduler must actually INSTANTIATE + POLL the checker
+ * and route escalation. Without this, the factory is dead code and no dead-man
+ * polling occurs in production.
+ */
+describe('runTaskmasterDeadmanScheduler', () => {
+  test('polls the injected checker and routes escalation on degraded (once mode)', async () => {
+    const escalations: TaskmasterStatus[] = [];
+    const checker = new TaskmasterDeadmanChecker({
+      fetchStatus: async () => ({ tick_health: 'degraded', last_heartbeat_at: 0 }),
+      emitEscalation: async status => {
+        escalations.push(status);
+      },
+    });
+    await runTaskmasterDeadmanScheduler({ once: true, checker });
+    expect(escalations.length).toBe(1);
+    expect(checker.isArmed).toBe(false);
+  });
+
+  test('unconfigured (no checker, no status URL) is a safe no-op', async () => {
+    const priorUrl = process.env.TASKMASTER_STATUS_URL;
+    delete process.env.TASKMASTER_STATUS_URL;
+    try {
+      await runTaskmasterDeadmanScheduler({ once: true });
+    } finally {
+      if (priorUrl !== undefined) process.env.TASKMASTER_STATUS_URL = priorUrl;
+    }
+    expect(true).toBe(true); // returned without throwing / hanging
   });
 });

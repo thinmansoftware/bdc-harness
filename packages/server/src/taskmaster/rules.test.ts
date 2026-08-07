@@ -1,5 +1,11 @@
 import { describe, expect, test } from 'bun:test';
-import { classifyThread, computeNextAction, nudgeClockMs, type TaskmasterThread } from './rules';
+import {
+  classifyThread,
+  computeDigestProposal,
+  computeNextAction,
+  nudgeClockMs,
+  type TaskmasterThread,
+} from './rules';
 
 const NOW = 1_800_000_000_000; // fixed fake clock
 const MIN = 60_000;
@@ -90,5 +96,21 @@ describe('computeNextAction', () => {
     const a = computeNextAction(thread({ lastActivityAt: NOW - 5 * HOUR }), NOW, 0);
     const b = computeNextAction(thread({ lastActivityAt: NOW - 5 * HOUR }), NOW, 1);
     expect(a?.idempotencyKey).not.toBe(b?.idempotencyKey);
+  });
+});
+
+describe('computeDigestProposal', () => {
+  test('builds a digest action keyed on the day-bucket (one per day, epoch-free)', () => {
+    const p = computeDigestProposal({ now: NOW, recipient: 'john', body: 'x', dayBucket: 42 });
+    expect(p.actionType).toBe('digest');
+    expect(p.recipient).toBe('john');
+    expect(p.actImmediately).toBe(true);
+    expect(p.idempotencyKey).toBe('tm:digest:42');
+  });
+
+  test('same day-bucket yields the same key (dedupe) across pause/resume epochs', () => {
+    const a = computeDigestProposal({ now: NOW, recipient: 'john', body: 'a', dayBucket: 7 });
+    const b = computeDigestProposal({ now: NOW + 1, recipient: 'john', body: 'b', dayBucket: 7 });
+    expect(a.idempotencyKey).toBe(b.idempotencyKey);
   });
 });

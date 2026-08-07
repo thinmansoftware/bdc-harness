@@ -11,11 +11,13 @@
 import { assessDispatchMessageBody } from '@archon/core/utils/dispatch-content-guard';
 import type { TaskmasterProposal } from './rules';
 
-/** The only effect verbs authorized in Slice 1 (M-133). */
+/** The only effect verbs authorized in Slice 1 (M-133): three verbs + the
+ * ratified daily digest (Section 8b.3 -- narrowed to a single summary message). */
 export const ALLOWED_EFFECTS: ReadonlySet<string> = new Set([
   'deliver_ruling',
   'nudge',
   'escalate',
+  'digest',
 ]);
 
 export interface GuardResult {

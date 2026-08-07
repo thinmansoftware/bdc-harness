@@ -12,7 +12,7 @@
 
 export type ThreadPriority = 'P0' | 'P1' | 'P2' | 'P3' | 'customer';
 export type ThreadClass = 'ready' | 'stale' | 'blocked' | 'healthy';
-export type TaskmasterActionType = 'deliver_ruling' | 'nudge' | 'escalate';
+export type TaskmasterActionType = 'deliver_ruling' | 'nudge' | 'escalate' | 'digest';
 
 export interface TaskmasterThread {
   /** Stable reference for journaling + dedupe (e.g. "wo/42", "ruling/M-133"). */
@@ -151,4 +151,28 @@ export function computeNextAction(
   }
 
   return null;
+}
+
+/**
+ * Build the daily-digest proposal (Section 8b.3 -- NARROWED, not dropped). One
+ * summary message per day-bucket routed to John through the SAME dispatch path as
+ * the three verbs. The idempotency key carries ONLY the day-bucket (no epoch): the
+ * digest is exactly one per day regardless of pause/resume, and the row-first
+ * journal dedupes it. Digest sends even while paused (Mode Behavior Matrix).
+ */
+export function computeDigestProposal(input: {
+  now: number;
+  recipient: string;
+  body: string;
+  dayBucket: number;
+}): TaskmasterProposal {
+  return {
+    threadRef: 'digest',
+    actionType: 'digest',
+    recipient: input.recipient,
+    body: input.body,
+    idempotencyKey: `tm:digest:${input.dayBucket}`,
+    actImmediately: true,
+    priority: 'P1',
+  };
 }

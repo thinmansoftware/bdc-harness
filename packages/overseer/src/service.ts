@@ -6,6 +6,13 @@ import {
   listRunEventsForOverseer,
   listRunsForOverseerWatch,
 } from '@archon/core/db/overseer';
+import { createMessage } from '@archon/core/db/dispatch';
+import { assessDispatchMessageBody } from '@archon/core/utils/dispatch-content-guard';
+import {
+  createTaskmasterDeadmanChecker,
+  type TaskmasterDeadmanChecker,
+  type TaskmasterStatus,
+} from './taskmaster-deadman-check';
 import { handleRecordJudgeFirst } from './judge-first-pipeline';
 import type { OverseerVerdictStoreDeps } from './types.ts';
 import { runAuthorizedEscalation } from './authorized-escalation';
@@ -75,6 +82,10 @@ export interface OverseerServiceOptions {
   deliveryDrain?: () => Promise<unknown>;
   reconcileIntervalMs?: number;
   reconcileRun?: () => Promise<unknown>;
+  /** Poll interval (ms) for the external Taskmaster dead-man checker. */
+  deadmanIntervalMs?: number;
+  /** Inject a pre-built dead-man checker (tests); production builds from env. */
+  deadmanChecker?: TaskmasterDeadmanChecker;
 }
 
 export async function runOperatorCardDeliveryScheduler(input: {
@@ -116,6 +127,80 @@ export async function runReconcileScheduler(input: {
     }
     if (input.once || input.signal?.aborted) return;
     await waitForDeliveryInterval(input.intervalMs ?? 30_000, input.signal);
+  }
+}
+
+/**
+ * Default escalation path for the Taskmaster dead-man checker: route a degraded-
+ * tick alert to the operator through the dispatch bus -- the same escalation
+ * channel the Overseer's operator-card `dispatch` delivery uses. Content-guarded
+ * like every outbound body.
+ */
+async function emitTaskmasterDeadmanEscalation(status: TaskmasterStatus): Promise<void> {
+  const recipient = process.env.TASKMASTER_ESCALATION_RECIPIENT ?? 'operator';
+  const body = [
+    'Taskmaster dead-man alert: tick_health=degraded.',
+    `Last heartbeat: ${String(status.last_heartbeat_at ?? 'unknown')}.`,
+    `Pause state: ${status.pause_state ?? 'unknown'}.`,
+    'The always-on loop has missed its heartbeat window and may be stalled --',
+    'check the container and the Taskmaster status endpoint.',
+  ].join(' ');
+  const assessment = assessDispatchMessageBody('run_report', body);
+  if (!assessment.allowed) {
+    log.error({ reason: assessment.reason }, 'taskmaster.deadman_escalation_content_rejected');
+    return;
+  }
+  const message = await createMessage({
+    correlation_id: 'taskmaster:deadman',
+    idempotency_key: `taskmaster-deadman:${String(status.last_heartbeat_at ?? 'unknown')}`,
+    task_type: 'run_report',
+    sender: 'overseer',
+    recipient,
+    body,
+  });
+  log.error({ messageId: message.id, recipient }, 'taskmaster.deadman_escalation_dispatched');
+}
+
+/**
+ * Poll the Taskmaster status endpoint on an interval via the EXTERNAL dead-man
+ * checker (binding condition 5 / Q4). Instantiated + scheduled here so real
+ * production polling and escalation occur -- the checker's own logic (exactly-one
+ * escalation, re-arm on recovery) is unit-tested separately. Unconfigured (no
+ * status URL and no injected checker) it is a no-op so the Overseer still boots.
+ */
+export async function runTaskmasterDeadmanScheduler(input: {
+  signal?: AbortSignal;
+  intervalMs?: number;
+  once?: boolean;
+  checker?: TaskmasterDeadmanChecker;
+  statusUrl?: string;
+  operatorToken?: string;
+  emitEscalation?: (status: TaskmasterStatus) => Promise<void>;
+}): Promise<void> {
+  const statusUrl = input.statusUrl ?? process.env.TASKMASTER_STATUS_URL;
+  const checker =
+    input.checker ??
+    (statusUrl
+      ? createTaskmasterDeadmanChecker({
+          statusUrl,
+          operatorToken: input.operatorToken ?? process.env.ARCHON_OPERATOR_TOKEN,
+          emitEscalation: input.emitEscalation ?? emitTaskmasterDeadmanEscalation,
+        })
+      : undefined);
+  if (!checker) {
+    log.warn('taskmaster.deadman_scheduler_unconfigured');
+    return;
+  }
+  for (;;) {
+    if (input.signal?.aborted) return;
+    try {
+      await checker.poll();
+    } catch (error) {
+      // Isolation: a poll/escalation error must never take down the Overseer.
+      log.error({ err: error as Error }, 'taskmaster.deadman_poll_failed_isolated');
+    }
+    if (input.once || input.signal?.aborted) return;
+    await waitForDeliveryInterval(input.intervalMs ?? 60_000, input.signal);
   }
 }
 
@@ -368,6 +453,17 @@ export async function runOverseerService(options: OverseerServiceOptions = {}): 
     reconcile: options.reconcileRun,
   });
   tasks.push(reconcile);
+  // External Taskmaster dead-man polling (binding condition 5). Runs when a
+  // status URL is configured or a checker is injected; otherwise it self-skips.
+  if (options.deadmanChecker || process.env.TASKMASTER_STATUS_URL) {
+    const deadman = runTaskmasterDeadmanScheduler({
+      signal: coupledAbort.signal,
+      intervalMs: options.deadmanIntervalMs,
+      once: options.once,
+      checker: options.deadmanChecker,
+    });
+    tasks.push(deadman);
+  }
   const abortOnFailure = async (task: Promise<void>): Promise<void> => {
     try {
       await task;

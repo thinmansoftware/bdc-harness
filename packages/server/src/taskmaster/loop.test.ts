@@ -11,6 +11,7 @@ interface JournalRow {
   id: string;
   outcome: string;
   thread_ref: string;
+  grade: string | null;
 }
 
 /** In-memory tm_journal: idempotent on key, restart-safe like the real DAL. */
@@ -18,7 +19,12 @@ function makeJournal(seed: Array<{ key: string; outcome: string; thread_ref: str
   const rows = new Map<string, JournalRow>();
   let n = 0;
   for (const s of seed) {
-    rows.set(s.key, { id: `seed-${++n}`, outcome: s.outcome, thread_ref: s.thread_ref });
+    rows.set(s.key, {
+      id: `seed-${++n}`,
+      outcome: s.outcome,
+      thread_ref: s.thread_ref,
+      grade: null,
+    });
   }
   return {
     rows,
@@ -30,12 +36,25 @@ function makeJournal(seed: Array<{ key: string; outcome: string; thread_ref: str
       const existing = rows.get(input.idempotency_key);
       if (existing) return { id: existing.id, outcome: existing.outcome };
       const id = `row-${++n}`;
-      const row = { id, outcome: input.outcome ?? 'proposed', thread_ref: input.thread_ref };
+      const row = {
+        id,
+        outcome: input.outcome ?? 'proposed',
+        thread_ref: input.thread_ref,
+        grade: null,
+      };
       rows.set(input.idempotency_key, row);
       return { id, outcome: row.outcome };
     },
-    updateActionOutcome: async (id: string, outcome: string): Promise<void> => {
-      for (const r of rows.values()) if (r.id === id) r.outcome = outcome;
+    updateActionOutcome: async (
+      id: string,
+      outcome: string,
+      grade?: string | null
+    ): Promise<void> => {
+      for (const r of rows.values())
+        if (r.id === id) {
+          r.outcome = outcome;
+          r.grade = grade ?? null;
+        }
     },
     countInterventionsSince: async (threadRef: string): Promise<number> => {
       let count = 0;
@@ -70,6 +89,8 @@ function baseCtx(
       sent.push(proposal.idempotencyKey);
       return { id: `msg-${sent.length}` };
     },
+    // Default: external effect verified -> actions may be graded 'useful'.
+    verifyDelivered: async () => true,
     validate: guardValidate,
     recordHeartbeat: () => {},
     eligibility: new Map(),
@@ -202,5 +223,86 @@ describe('taskmaster tick', () => {
     expect(Math.max(...perThreadRows)).toBe(1);
     // Nothing silently vanished: every thread is accounted for.
     expect(res.sent + res.deferred).toBe(25);
+  });
+
+  test('grades useful ONLY when the external effect is independently verified (SC7)', async () => {
+    // A delivered ruling whose SOR proof holds -> graded 'useful'.
+    const okJournal = makeJournal();
+    await tick(
+      baseCtx({ journal: okJournal, threads: [ruling('ruling/ok')], eligibility: new Map() })
+    );
+    expect(okJournal.byThread('ruling/ok')[0]?.grade).toBe('useful');
+
+    // Same send, but the SOR cannot confirm the row -> outcome 'sent', grade NULL.
+    // A self-report must never satisfy the 48h activation proof.
+    const unverifiedJournal = makeJournal();
+    await tick(
+      baseCtx({
+        journal: unverifiedJournal,
+        threads: [ruling('ruling/no-proof')],
+        eligibility: new Map(),
+        verifyDelivered: async () => false,
+      })
+    );
+    const row = unverifiedJournal.byThread('ruling/no-proof')[0];
+    expect(row?.outcome).toBe('sent');
+    expect(row?.grade).toBeNull();
+  });
+
+  test('parked items during pause never defer a P0 escalation (ceiling counts sends only)', async () => {
+    const journal = makeJournal();
+    const sent: string[] = [];
+    const eligibility = new Map();
+    const pauseState = { pause_state: 'PAUSED' as const, epoch: 0 };
+
+    // 12 stale P1s (> the 10-effect ceiling) all reach their confirming tick, plus
+    // one unclaimed P0. Under pause every P1 parks; the P0 must still escalate.
+    const threads: TaskmasterThread[] = [];
+    for (let i = 0; i < 12; i++) {
+      const ref = `wo/park-${i}`;
+      threads.push(staleP1(ref));
+      eligibility.set(ref, { count: 1, epoch: 0 });
+    }
+    const p0: TaskmasterThread = {
+      ref: 'wo/p0-late',
+      priority: 'P0',
+      lastActivityAt: NOW - 40 * MIN,
+      claimed: false,
+      recipient: 'john',
+      subject: 'wo/p0-late',
+    };
+    threads.push(p0);
+
+    const res = await tick(baseCtx({ journal, threads, sent, eligibility, pause: pauseState }));
+
+    expect(res.parked).toBe(12); // every P1 parked (sends blocked)
+    expect(res.sent).toBe(1); // the P0 escalation still went out
+    expect(journal.byThread('wo/p0-late')[0]?.outcome).toBe('sent');
+    expect(sent.length).toBe(1);
+  });
+
+  test('daily digest sends exactly once per day (deduped), even while paused', async () => {
+    const journal = makeJournal();
+    const sent: string[] = [];
+    const digest = { recipient: 'john', buildBody: async () => 'digest body' };
+    const pauseState = { pause_state: 'PAUSED' as const, epoch: 0 };
+
+    // Paused tick with no threads: the digest must still be delivered.
+    const first = await tick(
+      baseCtx({ journal, threads: [], sent, eligibility: new Map(), pause: pauseState, digest })
+    );
+    expect(first.digest).toBe(true);
+    expect(journal.byThread('digest')[0]?.outcome).toBe('sent');
+    expect(journal.byThread('digest')[0]?.grade).toBe('useful');
+    expect(sent.filter(k => k.startsWith('tm:digest:')).length).toBe(1);
+
+    // A later tick the SAME day re-proposes but the row-first dedupe blocks a
+    // second send.
+    const second = await tick(
+      baseCtx({ journal, threads: [], sent, eligibility: new Map(), pause: pauseState, digest })
+    );
+    expect(second.digest).toBe(false);
+    expect(journal.byThread('digest').length).toBe(1);
+    expect(sent.filter(k => k.startsWith('tm:digest:')).length).toBe(1);
   });
 });

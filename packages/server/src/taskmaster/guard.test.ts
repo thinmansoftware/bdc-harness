@@ -16,12 +16,22 @@ function proposal(overrides: Partial<TaskmasterProposal>): TaskmasterProposal {
 }
 
 describe('guard.validate', () => {
-  test('allowlist contains exactly the three Slice 1 verbs', () => {
-    expect([...ALLOWED_EFFECTS].sort()).toEqual(['deliver_ruling', 'escalate', 'nudge']);
+  test('allowlist contains exactly the three Slice 1 verbs plus the ratified digest', () => {
+    expect([...ALLOWED_EFFECTS].sort()).toEqual(['deliver_ruling', 'digest', 'escalate', 'nudge']);
   });
 
   test('a well-formed nudge is allowed', () => {
     expect(validate(proposal({})).allowed).toBe(true);
+  });
+
+  test('the daily digest verb is allowed', () => {
+    const p = proposal({
+      actionType: 'digest',
+      threadRef: 'digest',
+      body: 'Taskmaster daily digest (last 24h): sent=1 parked=0 deferred=0 rejected=0.',
+      idempotencyKey: 'tm:digest:42',
+    });
+    expect(validate(p).allowed).toBe(true);
   });
 
   test('a forbidden (excluded) effect type is rejected', () => {
