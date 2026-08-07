@@ -2,6 +2,7 @@ import { mkdir, mkdtemp, writeFile } from 'fs/promises';
 import { tmpdir, hostname, homedir } from 'os';
 import { join, resolve } from 'path';
 import { spawn } from 'bun';
+import { createHash } from 'crypto';
 import { isBoardAliasMessage, renderBoardMotionPrompt } from './board-motion';
 import {
   ACP_DEFAULT_IDLE_TIMEOUT_MS,
@@ -18,6 +19,7 @@ import { createMcpCancelController, runMcpAgent, type McpRunResult } from './mcp
 import { resolveOperatorToken } from './credentials';
 import { acquireInstanceLock, type InstanceLockHandle } from './instance-lock';
 import { createWorkerLog, type WorkerLog } from './worker-log';
+import { enumerateProcessTree, killProcessTree, waitForTreeDeath } from './acp/kill-tree';
 
 type DispatchTaskType =
   | 'agent_message'
@@ -37,6 +39,57 @@ interface DispatchMessage {
   fencing_token: number;
   recipient_alias?: 'board' | null;
   resolved_recipient?: string | null;
+}
+
+type DispatchTaskOutcome = 'succeeded' | 'failed' | 'blocked';
+
+export function classifyDispatchOutcome(
+  exitCode: number,
+  output: string,
+  refusal = false
+): {
+  resultBody: string;
+  status: 'done' | 'failed';
+  taskOutcome: DispatchTaskOutcome | null;
+} {
+  const lines = output.replace(/\r\n/g, '\n').split('\n');
+  while (lines.at(-1) === '') lines.pop();
+  const sentinel = /^DISPATCH_OUTCOME: (blocked|failed)$/.exec(lines.at(-1) ?? '');
+  if (sentinel) lines.pop();
+  const resultBody = lines.join('\n').trim();
+  if (exitCode !== 0) return { resultBody, status: 'failed', taskOutcome: 'failed' };
+  if (refusal || sentinel?.[1] === 'blocked')
+    return { resultBody, status: 'failed', taskOutcome: 'blocked' };
+  if (sentinel?.[1] === 'failed') return { resultBody, status: 'failed', taskOutcome: 'failed' };
+  return { resultBody, status: 'done', taskOutcome: resultBody ? 'succeeded' : null };
+}
+
+export function summarizeTranscriptPayload(value: unknown): {
+  sha256: string;
+  utf8Bytes: number;
+  preview: string;
+} {
+  const encoded = typeof value === 'string' ? value : JSON.stringify(value);
+  const text = encoded ?? String(value);
+  const bytes = Buffer.from(text, 'utf8');
+  return {
+    sha256: createHash('sha256').update(bytes).digest('hex'),
+    utf8Bytes: bytes.length,
+    preview: '[redacted]',
+  };
+}
+
+export function summarizePersistedOutcome(
+  classification: DispatchTaskOutcome | null,
+  value: unknown
+): string {
+  const summary = summarizeTranscriptPayload(value);
+  return JSON.stringify({
+    classification,
+    sha256: summary.sha256,
+    utf8Bytes: summary.utf8Bytes,
+    preview: summary.preview,
+  });
 }
 
 interface BoardDeliveryConfig {
@@ -190,12 +243,59 @@ function promptFor(message: DispatchMessage): string {
   }
 }
 
-async function writeTranscript(data: Record<string, unknown>): Promise<string> {
+export async function writeTranscript(data: Record<string, unknown>): Promise<string> {
   const dir = join(import.meta.dir, 'transcripts');
   await mkdir(dir, { recursive: true });
   const messageId = (data.message as DispatchMessage | undefined)?.id ?? 'unknown';
   const path = join(dir, `${Date.now()}-${messageId}.json`);
-  await writeFile(path, JSON.stringify(data, null, 2), 'utf8');
+  const safe = Object.fromEntries(
+    Object.entries(data).map(([key, value]) => {
+      if (key === 'message') {
+        const message = value as DispatchMessage;
+        return [
+          key,
+          {
+            id: message.id,
+            task_type: message.task_type,
+            sender: message.sender,
+            recipient: message.recipient,
+            body: summarizeTranscriptPayload(message.body),
+          },
+        ];
+      }
+      if (key === 'updates' && Array.isArray(value))
+        return [
+          key,
+          {
+            count: value.length,
+            types: [
+              ...new Set(
+                value.map(item => {
+                  if (typeof item !== 'object' || !item) return typeof item;
+                  const type = (item as Record<string, unknown>).type;
+                  return typeof type === 'string' ? type : 'unknown';
+                })
+              ),
+            ],
+          },
+        ];
+      if (
+        [
+          'transport',
+          'stopReason',
+          'timedOut',
+          'cancelled',
+          'exitCode',
+          'agentPid',
+          'treeBeforeKill',
+          'treeAfterKill',
+        ].includes(key)
+      )
+        return [key, value];
+      return [key, summarizeTranscriptPayload(value)];
+    })
+  );
+  await writeFile(path, JSON.stringify(safe, null, 2), 'utf8');
   return path;
 }
 
@@ -212,7 +312,12 @@ async function runAcpLeg(
   agentConfig: AgentConfig,
   message: DispatchMessage,
   cancel: ReturnType<typeof createCancelController>
-): Promise<{ resultBody: string; status: 'done' | 'failed'; run: AcpRunResult }> {
+): Promise<{
+  resultBody: string;
+  status: 'done' | 'failed';
+  taskOutcome: DispatchTaskOutcome | null;
+  run: AcpRunResult;
+}> {
   const cwd = await mkdtemp(join(tmpdir(), `bdc-dispatch-acp-${message.recipient}-`));
   const run = await runAcpAgent(
     {
@@ -230,7 +335,7 @@ async function runAcpLeg(
     cancel
   );
 
-  const transcript = await writeTranscript({
+  await writeTranscript({
     message,
     transport: 'acp',
     command: agentConfig.command,
@@ -265,9 +370,16 @@ async function runAcpLeg(
         .filter(Boolean)
         .join('\n');
 
+  const refusal = run.stopReason === 'refusal';
+  const classified = classifyDispatchOutcome(
+    refusal ? 0 : run.ok ? (run.exitCode ?? 0) : 1,
+    summary,
+    refusal
+  );
   return {
-    resultBody: `${summary}\n\nTranscript: ${transcript}`,
-    status: run.ok ? 'done' : 'failed',
+    resultBody: summarizePersistedOutcome(classified.taskOutcome, classified.resultBody),
+    status: classified.status,
+    taskOutcome: classified.taskOutcome,
     run,
   };
 }
@@ -276,7 +388,12 @@ async function runMcpLeg(
   agentConfig: AgentConfig,
   message: DispatchMessage,
   cancel: ReturnType<typeof createMcpCancelController>
-): Promise<{ resultBody: string; status: 'done' | 'failed'; run: McpRunResult }> {
+): Promise<{
+  resultBody: string;
+  status: 'done' | 'failed';
+  taskOutcome: DispatchTaskOutcome | null;
+  run: McpRunResult;
+}> {
   const cwd = await mkdtemp(join(tmpdir(), `bdc-dispatch-mcp-${message.recipient}-`));
   const run = await runMcpAgent(
     {
@@ -291,7 +408,7 @@ async function runMcpLeg(
     promptFor(message),
     cancel
   );
-  const transcript = await writeTranscript({
+  await writeTranscript({
     message,
     transport: 'mcp',
     command: agentConfig.command,
@@ -323,19 +440,28 @@ async function runMcpLeg(
       ]
         .filter(Boolean)
         .join('\n');
+  const refusal = run.stopReason === 'refusal';
+  const classified = classifyDispatchOutcome(
+    refusal ? 0 : run.ok ? (run.exitCode ?? 0) : 1,
+    summary,
+    refusal
+  );
   return {
-    resultBody: `${summary}\n\nTranscript: ${transcript}`,
-    status: run.ok ? 'done' : 'failed',
+    resultBody: summarizePersistedOutcome(classified.taskOutcome, classified.resultBody),
+    status: classified.status,
+    taskOutcome: classified.taskOutcome,
     run,
   };
 }
 
 export async function runAgent(
   config: AgentConfig,
-  message: DispatchMessage
+  message: DispatchMessage,
+  cancel?: ReturnType<typeof createCancelController>
 ): Promise<{
   resultBody: string;
   status: 'done' | 'failed';
+  taskOutcome: DispatchTaskOutcome | null;
 }> {
   const cwd = await mkdtemp(join(tmpdir(), `bdc-dispatch-${message.recipient}-`));
   let command = config.command;
@@ -365,6 +491,7 @@ export async function runAgent(
     if (promptBytes > MAX_PROMPT_STDIN_BYTES) {
       return {
         status: 'failed',
+        taskOutcome: 'failed',
         resultBody: `Prompt payload is ${promptBytes} UTF-8 bytes; limit is ${MAX_PROMPT_STDIN_BYTES} bytes.`,
       };
     }
@@ -379,6 +506,25 @@ export async function runAgent(
     stderr: 'pipe',
     stdin: config.kind === 'fusion' ? 'ignore' : 'pipe',
   });
+  let treeBeforeKill: number[] = [];
+  let treeAfterKill: number[] = [];
+  let cancellationStarted = false;
+  let cancellationPromise: Promise<void> | undefined;
+  const beginCancellation = (): Promise<void> => {
+    if (cancellationPromise) return cancellationPromise;
+    cancellationStarted = true;
+    cancellationPromise = (async (): Promise<void> => {
+      const tree = await enumerateProcessTree(proc.pid);
+      treeBeforeKill = tree.map(node => node.pid);
+      await killProcessTree(proc.pid);
+      treeAfterKill = await waitForTreeDeath(treeBeforeKill, ACP_DEFAULT_KILL_GRACE_MS);
+    })();
+    return cancellationPromise;
+  };
+  const cancelTimer = setInterval(() => {
+    if (cancel?.cancelled) void beginCancellation();
+  }, 50);
+  cancelTimer.unref?.();
   if (promptBody !== undefined) {
     const stdin = proc.stdin;
     if (!stdin) throw new Error('prompt_stdin_pipe_unavailable');
@@ -389,7 +535,8 @@ export async function runAgent(
       const detail = error instanceof Error ? error.message : String(error);
       return {
         status: 'failed',
-        resultBody: `Failed to deliver prompt over stdin: ${detail}`,
+        taskOutcome: 'failed',
+        resultBody: summarizePersistedOutcome('failed', detail),
       };
     }
   }
@@ -397,8 +544,15 @@ export async function runAgent(
     new Response(proc.stdout).text(),
     new Response(proc.stderr).text(),
     proc.exited,
-  ]);
-  const transcript = await writeTranscript({
+  ]).finally(() => {
+    clearInterval(cancelTimer);
+  });
+  // The process can exit between polling ticks. Re-read the synchronous
+  // controller state and await the entire kill/verification operation before
+  // classifying or posting a result.
+  if (cancel?.cancelled) await beginCancellation();
+  else if (cancellationPromise) await cancellationPromise;
+  await writeTranscript({
     message,
     command,
     args,
@@ -406,11 +560,21 @@ export async function runAgent(
     stdout,
     stderr,
     exitCode,
+    cancelled: cancellationStarted,
+    treeBeforeKill,
+    treeAfterKill,
   });
-  const finalText = stdout.trim() || stderr.trim() || `No output. See transcript: ${transcript}`;
+  const classified = cancellationStarted
+    ? {
+        resultBody: `CLI leg cancelled; survivors=${treeAfterKill.join(',') || 'none'}`,
+        status: 'failed' as const,
+        taskOutcome: 'failed' as const,
+      }
+    : classifyDispatchOutcome(exitCode, stdout.trim() || stderr.trim());
   return {
-    resultBody: `${finalText}\n\nTranscript: ${transcript}`,
-    status: exitCode === 0 ? 'done' : 'failed',
+    resultBody: summarizePersistedOutcome(classified.taskOutcome, classified.resultBody),
+    status: classified.status,
+    taskOutcome: classified.taskOutcome,
   };
 }
 
@@ -467,14 +631,18 @@ async function processMessage(
     }, config.lease_renew_interval_ms);
     renewTimer.unref?.();
 
-    let result: { resultBody: string; status: 'done' | 'failed' };
+    let result: {
+      resultBody: string;
+      status: 'done' | 'failed';
+      taskOutcome?: DispatchTaskOutcome | null;
+    };
     try {
       result =
         agentConfig.kind === 'acp'
           ? await runAcpLeg(agentConfig, claimed, cancel)
           : agentConfig.kind === 'mcp'
             ? await runMcpLeg(agentConfig, claimed, cancel)
-            : await runAgent(agentConfig, claimed);
+            : await runAgent(agentConfig, claimed, cancel);
     } finally {
       clearInterval(renewTimer);
     }
@@ -486,6 +654,7 @@ async function processMessage(
         fencing_token: claimed.fencing_token,
         result_body: result.resultBody,
         status: result.status,
+        task_outcome: result.taskOutcome,
       }),
     });
   } catch (error) {

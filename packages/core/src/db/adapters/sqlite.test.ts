@@ -99,6 +99,7 @@ describe('SqliteAdapter', () => {
       'escalated_tg_at',
       'escalated_sms_at',
       'subject_key',
+      'repeat_reason',
       'route_disposition',
       'supersedes_id',
     ];
@@ -113,6 +114,12 @@ describe('SqliteAdapter', () => {
       for (const column of phase0Columns) {
         expect(columnNames.has(column)).toBe(true);
       }
+      const phase1Index = await db.query<{ sql: string }>(
+        `SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_agent_dispatch_messages_subject_history'`
+      );
+      expect(phase1Index.rows[0]?.sql).toContain(
+        'ON agent_dispatch_messages(subject_key, created_at DESC, id DESC) WHERE subject_key IS NOT NULL'
+      );
 
       const principals = await db.query<{
         principal_id: string;
@@ -185,6 +192,10 @@ describe('SqliteAdapter', () => {
       for (const column of phase0Columns) {
         expect(columnNames.has(column)).toBe(true);
       }
+      const phase1Index = await db.query<{ sql: string }>(
+        `SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_agent_dispatch_messages_subject_history'`
+      );
+      expect(phase1Index.rows[0]?.sql).toContain('WHERE subject_key IS NOT NULL');
 
       const priorities = await db.query<{ id: string; priority: string }>(
         `SELECT id, priority FROM agent_dispatch_messages ORDER BY id`

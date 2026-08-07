@@ -64,6 +64,10 @@ import { MessagePersistence } from './adapters/web/persistence';
 import { SSETransport } from './adapters/web/transport';
 import { WorkflowEventBridge } from './adapters/web/workflow-bridge';
 import { registerApiRoutes, stopProviderWaitScheduler } from './routes/api';
+import {
+  startDispatchEscalationClock,
+  stopDispatchEscalationClock,
+} from './dispatch/escalation-clock';
 import { observeStartupRecovery, reconcilePendingRunsAtBoot } from './startup-reconciliation';
 import { startOverseerRuntime, stopOverseerRuntime } from './overseer-runtime';
 import { createMergeManager } from '@archon/overseer/merge-manager';
@@ -674,6 +678,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     idleTimeout: 255, // Max value (seconds) - prevents SSE connections from being killed
   });
   getLog().info({ port: server.port, hostname }, 'server_listening');
+  startDispatchEscalationClock();
 
   // Initialize Telegram adapter (conditional, skipped in CLI serve mode)
   let telegram: TelegramAdapter | null = null;
@@ -711,6 +716,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     getLog().info('server_shutting_down');
     stopCleanupScheduler();
     stopProviderWaitScheduler();
+    stopDispatchEscalationClock();
     persistence.stopPeriodicFlush();
 
     // Await overseer watcher abort before flushing; bounded by the watcher's own
