@@ -5,6 +5,9 @@ const listCapabilityStatesMock = mock(
     Array<{ capability: string; action_enabled: boolean; circuit_state: string }>
   > => []
 );
+const getLastActionAtMock = mock(async (): Promise<string | null> => null);
+const getLastVerdictAtMock = mock(async (): Promise<string | null> => null);
+const countPendingJudgmentsMock = mock(async (): Promise<number> => 0);
 
 // Capture adapterKind passed into runOverseerService for real-wiring assertions.
 let capturedServiceOptions: {
@@ -25,8 +28,14 @@ import {
 import { createMergeManager } from '../../overseer/src/merge-manager.ts';
 import { PRODUCTION_EFFECT_HOLD_REASON } from '../../overseer/src/merge-manager.ts';
 
-const getStatus = () =>
-  getOverseerRuntimeStatus({ listCapabilityStates: listCapabilityStatesMock });
+const getStatus = (now?: () => Date) =>
+  getOverseerRuntimeStatus({
+    listCapabilityStates: listCapabilityStatesMock,
+    getLastActionAt: getLastActionAtMock,
+    getLastVerdictAt: getLastVerdictAtMock,
+    countPendingJudgments: countPendingJudgmentsMock,
+    now,
+  });
 
 const oldEnabled = process.env.OVERSEER_ENABLED;
 const oldEmergencyStop = process.env.OVERSEER_EMERGENCY_STOP;
@@ -70,6 +79,12 @@ describe('overseer-runtime', () => {
     });
     listCapabilityStatesMock.mockReset();
     listCapabilityStatesMock.mockImplementation(async () => []);
+    getLastActionAtMock.mockReset();
+    getLastActionAtMock.mockImplementation(async () => null);
+    getLastVerdictAtMock.mockReset();
+    getLastVerdictAtMock.mockImplementation(async () => null);
+    countPendingJudgmentsMock.mockReset();
+    countPendingJudgmentsMock.mockImplementation(async () => 0);
     capturedServiceOptions = null;
     setDisabledEnv();
   });
@@ -251,6 +266,64 @@ describe('overseer-runtime', () => {
     for (const cap of caps) {
       expect(status.circuit_states[cap]).toBe('unknown');
     }
+    expect(status.status).toBe('unknown');
+  });
+
+  test('healthy watcher with recent effect activity stays ok', async () => {
+    let resolveService!: () => void;
+    runOverseerServiceMock.mockImplementation(
+      () =>
+        new Promise<void>(resolve => {
+          resolveService = resolve;
+        })
+    );
+    setEnabledEnv();
+    startOverseerRuntime({ runService: runOverseerServiceMock });
+    getLastActionAtMock.mockImplementation(async () => '2026-08-07T11:59:00.000Z');
+    getLastVerdictAtMock.mockImplementation(async () => '2026-08-07T11:59:30.000Z');
+
+    expect((await getStatus(() => new Date('2026-08-07T12:00:00.000Z'))).status).toBe('ok');
+    resolveService();
+    await stopOverseerRuntime();
+  });
+
+  test('stale effect clock with pending judgments degrades status', async () => {
+    getLastActionAtMock.mockImplementation(async () => '2026-08-07T11:55:00.000Z');
+    getLastVerdictAtMock.mockImplementation(async () => '2026-08-07T11:56:00.000Z');
+    countPendingJudgmentsMock.mockImplementation(async () => 2);
+
+    const status = await getStatus(() => new Date('2026-08-07T12:00:00.000Z'));
+
+    expect(status.status).toBe('degraded');
+    expect(status.last_action_at).toBe('2026-08-07T11:55:00.000Z');
+    expect(status.last_verdict_at).toBe('2026-08-07T11:56:00.000Z');
+    expect(status.blocking_reasons).toContain('effect_clock_stale_with_pending_judgments');
+  });
+
+  test('missing effect clock with pending judgments degrades status', async () => {
+    getLastActionAtMock.mockImplementation(async () => null);
+    getLastVerdictAtMock.mockImplementation(async () => null);
+    countPendingJudgmentsMock.mockImplementation(async () => 2);
+
+    const status = await getStatus(() => new Date('2026-08-07T12:00:00.000Z'));
+
+    expect(status.status).toBe('degraded');
+    expect(status.blocking_reasons).toContain('effect_clock_stale_with_pending_judgments');
+  });
+
+  test('stale effect clock with an empty backlog does not page', async () => {
+    getLastActionAtMock.mockImplementation(async () => '2026-08-01T00:00:00.000Z');
+    getLastVerdictAtMock.mockImplementation(async () => '2026-08-01T00:00:00.000Z');
+
+    expect((await getStatus(() => new Date('2026-08-07T12:00:00.000Z'))).status).toBe('ok');
+  });
+
+  test('effect status read failure is unknown rather than green', async () => {
+    getLastActionAtMock.mockImplementation(async () => {
+      throw new Error('missing_overseer_actions');
+    });
+
+    expect((await getStatus()).status).toBe('unknown');
   });
 
   test('fake adapter is selected when OVERSEER_USE_FAKE_GITHUB_ADAPTER is set', async () => {
@@ -278,7 +351,7 @@ describe('overseer-runtime', () => {
     process.env.GITHUB_TOKEN = 'poison-token';
 
     startOverseerRuntime({ runService: runOverseerServiceMock });
-    const status = await getOverseerRuntimeStatus({ listCapabilityStates: async () => [] });
+    const status = await getStatus();
 
     expect(runOverseerServiceMock).not.toHaveBeenCalled();
     expect(status.adapter).toBe('real');
@@ -329,7 +402,7 @@ describe('overseer-runtime', () => {
       runService: runOverseerServiceMock,
       serviceOptions: { deps, mergeCoordinator: mergeManager },
     });
-    const status = await getOverseerRuntimeStatus({ listCapabilityStates: async () => [] });
+    const status = await getStatus();
 
     expect(runOverseerServiceMock).toHaveBeenCalledTimes(1);
     expect(status.adapter).toBe('real');

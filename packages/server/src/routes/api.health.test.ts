@@ -140,6 +140,20 @@ const mockGetRunningWorkflows = mock(
   async () =>
     [] as { id: string; conversation_id: string; workflow_name: string; started_at: string }[]
 );
+const mockListOverseerCapabilityStates = mock(async () => []);
+const mockGetOverseerLastActionAt = mock(async (): Promise<string | null> => null);
+const mockGetOverseerLastVerdictAt = mock(async (): Promise<string | null> => null);
+const mockCountRunsPendingOverseerJudgment = mock(async () => 0);
+
+mock.module('@archon/core/db/overseer-capabilities', () => ({
+  listOverseerCapabilityStates: mockListOverseerCapabilityStates,
+}));
+
+mock.module('@archon/core/db/overseer', () => ({
+  getOverseerLastActionAt: mockGetOverseerLastActionAt,
+  getOverseerLastVerdictAt: mockGetOverseerLastVerdictAt,
+  countRunsPendingOverseerJudgment: mockCountRunsPendingOverseerJudgment,
+}));
 
 mock.module('@archon/core/db/workflows', () => ({
   listWorkflowRuns: mock(async () => []),
@@ -206,7 +220,23 @@ function makeApp(): Hono {
 describe('GET /api/health', () => {
   beforeEach(() => {
     mockGetStats.mockReset();
+    mockGetStats.mockImplementation(() => ({
+      active: 0,
+      queuedTotal: 0,
+      queuedByConversation: [],
+      maxConcurrent: 10,
+      activeConversationIds: [],
+    }));
     mockGetRunningWorkflows.mockReset();
+    mockGetRunningWorkflows.mockImplementation(async () => []);
+    mockListOverseerCapabilityStates.mockReset();
+    mockListOverseerCapabilityStates.mockImplementation(async () => []);
+    mockGetOverseerLastActionAt.mockReset();
+    mockGetOverseerLastActionAt.mockImplementation(async () => null);
+    mockGetOverseerLastVerdictAt.mockReset();
+    mockGetOverseerLastVerdictAt.mockImplementation(async () => null);
+    mockCountRunsPendingOverseerJudgment.mockReset();
+    mockCountRunsPendingOverseerJudgment.mockImplementation(async () => 0);
     mockIsDocker.mockClear(); // preserve base () => false implementation; only clear call records
   });
 
@@ -232,7 +262,11 @@ describe('GET /api/health', () => {
       concurrency: { active: number; activeConversationIds: string[] };
       runningWorkflows: number;
       version: string;
-      overseer: { blocking_reasons: string[] };
+      overseer: {
+        blocking_reasons: string[];
+        last_action_at: string | null;
+        last_verdict_at: string | null;
+      };
     };
     expect(body.status).toBe('ok');
     expect(body.adapter).toBe('web');
@@ -243,6 +277,53 @@ describe('GET /api/health', () => {
     expect(typeof body.version).toBe('string');
     expect(body.version.length).toBeGreaterThan(0);
     expect(Array.isArray(body.overseer.blocking_reasons)).toBe(true);
+    expect(body.overseer.last_action_at).toBeNull();
+    expect(body.overseer.last_verdict_at).toBeNull();
+  });
+
+  test('capability-state read failure makes top-level health unknown', async () => {
+    mockListOverseerCapabilityStates.mockImplementationOnce(async () => {
+      throw new Error('missing_overseer_capability_state');
+    });
+
+    const response = await makeApp().request('/api/health');
+    const body = (await response.json()) as {
+      status: string;
+      overseer: { circuit_states: Record<string, string> };
+    };
+
+    expect(body.status).toBe('unknown');
+    expect(Object.values(body.overseer.circuit_states).every(value => value === 'unknown')).toBe(
+      true
+    );
+  });
+
+  test('effect status read failure makes top-level health unknown', async () => {
+    mockGetOverseerLastActionAt.mockImplementationOnce(async () => {
+      throw new Error('missing_overseer_actions');
+    });
+
+    const response = await makeApp().request('/api/health');
+    const body = (await response.json()) as { status: string };
+
+    expect(response.status).toBe(200);
+    expect(body.status).toBe('unknown');
+  });
+
+  test('stale effect clock with pending work makes top-level health non-ok', async () => {
+    mockGetOverseerLastActionAt.mockImplementationOnce(async () => '2026-07-31T00:00:00.000Z');
+    mockGetOverseerLastVerdictAt.mockImplementationOnce(async () => '2026-07-31T00:01:00.000Z');
+    mockCountRunsPendingOverseerJudgment.mockImplementationOnce(async () => 99);
+
+    const response = await makeApp().request('/api/health');
+    const body = (await response.json()) as {
+      status: string;
+      overseer: { last_action_at: string | null; last_verdict_at: string | null };
+    };
+
+    expect(body.status).not.toBe('ok');
+    expect(body.overseer.last_action_at).toBe('2026-07-31T00:00:00.000Z');
+    expect(body.overseer.last_verdict_at).toBe('2026-07-31T00:01:00.000Z');
   });
 
   test('includes running background workflows in concurrency.active count', async () => {

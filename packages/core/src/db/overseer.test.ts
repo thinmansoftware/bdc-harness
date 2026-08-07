@@ -12,8 +12,11 @@ mock.module('./connection', () => ({
 
 import {
   claimOverseerVerdict,
+  countRunsPendingOverseerJudgment,
   finalizeOverseerVerdict,
   getOverseerActionsForRun,
+  getOverseerLastActionAt,
+  getOverseerLastVerdictAt,
   getOverseerVerdictsForRun,
   hasReconcileActionForPr,
   insertOverseerAction,
@@ -98,6 +101,44 @@ describe('overseer db', () => {
     expect(actions).toHaveLength(1);
     expect(actions[0].action).toBe('merge_ready');
     expect(await listRunsForOverseerWatch()).toHaveLength(0);
+  });
+
+  test('reads latest action/verdict effect timestamps and pending judgment count', async () => {
+    await seedRun('run-effect-old');
+    await seedRun('run-effect-new');
+    await db.query(
+      `INSERT INTO overseer_actions (id, run_id, wo_id, class, action, result, created_at)
+       VALUES ('action-old', 'run-effect-old', 'WO-TEST-OVERSEER-01', 'test', 'observe', 'ok', $1),
+              ('action-new', 'run-effect-new', 'WO-TEST-OVERSEER-01', 'test', 'observe', 'ok', $2)`,
+      ['2026-08-07T10:00:00.000Z', '2026-08-07T11:00:00.000Z']
+    );
+    await db.query(
+      `INSERT INTO overseer_verdicts (id, run_id, wo_id, head_sha, created_at)
+       VALUES ('verdict-old', 'run-effect-old', 'WO-TEST-OVERSEER-01', 'old', $1),
+              ('verdict-new', 'run-effect-new', 'WO-TEST-OVERSEER-01', 'new', $2)`,
+      ['2026-08-07T10:30:00.000Z', '2026-08-07T11:30:00.000Z']
+    );
+    await seedRun('run-pending');
+
+    expect(await getOverseerLastActionAt()).toBe('2026-08-07T11:00:00.000Z');
+    expect(await getOverseerLastVerdictAt()).toBe('2026-08-07T11:30:00.000Z');
+    expect(await countRunsPendingOverseerJudgment()).toBe(1);
+  });
+
+  test('empty effect tables return null timestamps and zero pending judgments', async () => {
+    expect(await getOverseerLastActionAt()).toBeNull();
+    expect(await getOverseerLastVerdictAt()).toBeNull();
+    expect(await countRunsPendingOverseerJudgment()).toBe(0);
+  });
+
+  test('effect and backlog read failures propagate', async () => {
+    await db.query('DROP TABLE overseer_actions');
+    await db.query('DROP TABLE overseer_verdicts');
+    await db.query('DROP TABLE remote_agent_workflow_runs');
+
+    await expect(getOverseerLastActionAt()).rejects.toThrow();
+    await expect(getOverseerLastVerdictAt()).rejects.toThrow();
+    await expect(countRunsPendingOverseerJudgment()).rejects.toThrow();
   });
 
   // Regression (2026-07-30, PRODUCTION OUTAGE): finalizeOverseerVerdict used

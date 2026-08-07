@@ -161,6 +161,40 @@ export async function listRunsForOverseerWatch(): Promise<OverseerWatchRun[]> {
   return result.rows.map(normalizeRun);
 }
 
+interface OverseerEffectTimestampRow {
+  last_effect_at: string | null;
+}
+
+interface OverseerPendingCountRow {
+  pending_count: number | string;
+}
+
+export async function getOverseerLastActionAt(): Promise<string | null> {
+  const result = await getDatabase().query<OverseerEffectTimestampRow>(
+    'SELECT MAX(created_at) AS last_effect_at FROM overseer_actions'
+  );
+  return result.rows[0]?.last_effect_at ?? null;
+}
+
+export async function getOverseerLastVerdictAt(): Promise<string | null> {
+  const result = await getDatabase().query<OverseerEffectTimestampRow>(
+    'SELECT MAX(created_at) AS last_effect_at FROM overseer_verdicts'
+  );
+  return result.rows[0]?.last_effect_at ?? null;
+}
+
+export async function countRunsPendingOverseerJudgment(): Promise<number> {
+  const result = await getDatabase().query<OverseerPendingCountRow>(
+    `SELECT COUNT(*) AS pending_count
+     FROM remote_agent_workflow_runs
+     WHERE status IN ('completed', 'failed', 'escalated', 'cancelled')
+       AND NOT EXISTS (
+         SELECT 1 FROM overseer_actions oa WHERE oa.run_id = remote_agent_workflow_runs.id
+       )`
+  );
+  return Number(result.rows[0]?.pending_count ?? 0);
+}
+
 export async function listRunEventsForOverseer(runId: string): Promise<OverseerWorkflowEventRow[]> {
   const result = await getDatabase().query<WorkflowEventRow>(
     `SELECT id, workflow_run_id, event_type, step_name, data, created_at
