@@ -355,12 +355,22 @@ export async function installOverseerControlPlaneSqlite(database: IDatabase): Pr
     );
   }
   for (const guard of MUTABLE_UPDATE_GUARDS) {
+    // DROP+CREATE (rather than CREATE IF NOT EXISTS) so a changed WHEN clause
+    // replaces the installed trigger on redeploy. Two processes initializing
+    // the same file can both pass the DROP and race the CREATE; the loser's
+    // "already exists" is benign because same-version processes create an
+    // identical trigger (bdc-xo#1451).
     await database.query(`DROP TRIGGER IF EXISTS ${guard.table}_validate_update`);
-    await database.query(
-      `CREATE TRIGGER ${guard.table}_validate_update BEFORE UPDATE ON ${guard.table}
-       WHEN NOT ((${guard.allowed.join(') OR (')}))
-       BEGIN SELECT RAISE(ABORT, '${guard.table} rejects non-CAS update'); END`
-    );
+    try {
+      await database.query(
+        `CREATE TRIGGER ${guard.table}_validate_update BEFORE UPDATE ON ${guard.table}
+         WHEN NOT ((${guard.allowed.join(') OR (')}))
+         BEGIN SELECT RAISE(ABORT, '${guard.table} rejects non-CAS update'); END`
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (!message.includes('already exists')) throw error;
+    }
   }
 }
 
