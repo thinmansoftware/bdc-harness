@@ -167,6 +167,83 @@ describe('PostgresAdapter', () => {
     });
   });
 
+  describe('agent messaging Phase 0 schema', () => {
+    test('numbered migration and combined schema define the complete Postgres Phase 0 contract', () => {
+      const migration = readFileSync(
+        resolve(import.meta.dir, '../../../../../migrations', '040_agent_messaging_phase0.sql'),
+        'utf8'
+      );
+      const combined = readFileSync(
+        resolve(import.meta.dir, '../../../../../migrations', '000_combined.sql'),
+        'utf8'
+      );
+
+      const phase0ColumnDefinitions = [
+        "priority TEXT NOT NULL DEFAULT 'normal'",
+        "CHECK (priority IN ('blocker', 'normal', 'heartbeat'))",
+        'task_outcome TEXT',
+        "CHECK (task_outcome IS NULL OR task_outcome IN ('succeeded', 'failed', 'blocked'))",
+        'acknowledged_at TIMESTAMPTZ',
+        'acknowledged_by TEXT',
+        'addressed_at TIMESTAMPTZ',
+        'addressed_by TEXT',
+        'escalated_tg_at TIMESTAMPTZ',
+        'escalated_sms_at TIMESTAMPTZ',
+        'subject_key TEXT',
+        'route_disposition TEXT',
+        "CHECK (route_disposition IS NULL OR route_disposition IN ('unroutable', 'superseded'))",
+        'supersedes_id UUID REFERENCES agent_dispatch_messages(id)',
+      ];
+      const principalDefinitions = [
+        'principal_id TEXT PRIMARY KEY',
+        'display_name TEXT NOT NULL',
+        'delivery_mode TEXT NOT NULL CHECK',
+        "delivery_mode IN ('worker_poll', 'drain_on_start', 'alias_resolved', 'notify_only')",
+        'active BOOLEAN NOT NULL DEFAULT TRUE',
+        'created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()',
+        'updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()',
+      ];
+      const knownPrincipals = [
+        ['claude', 'Claude', 'worker_poll', 'TRUE'],
+        ['codex', 'Codex', 'worker_poll', 'TRUE'],
+        ['grok', 'Grok', 'worker_poll', 'TRUE'],
+        ['cursor', 'Cursor', 'worker_poll', 'TRUE'],
+        ['fusion', 'Fusion', 'worker_poll', 'TRUE'],
+        ['claude-acp', 'Claude ACP', 'worker_poll', 'TRUE'],
+        ['codex-mcp', 'Codex MCP', 'worker_poll', 'TRUE'],
+        ['grok-acp', 'Grok ACP', 'worker_poll', 'TRUE'],
+        ['operator', 'Operator', 'drain_on_start', 'TRUE'],
+        ['xo', 'XO', 'drain_on_start', 'TRUE'],
+        ['board', 'Board', 'alias_resolved', 'TRUE'],
+        ['overseer', 'Overseer', 'notify_only', 'TRUE'],
+        ['cauldron', 'Cauldron', 'notify_only', 'TRUE'],
+        ['john', 'John', 'notify_only', 'FALSE'],
+        ['merge-manager', 'Merge Manager', 'notify_only', 'FALSE'],
+      ] as const;
+
+      for (const schema of [migration, combined]) {
+        const normalizedSchema = schema.replace(/\s+/g, ' ');
+        for (const definition of [...phase0ColumnDefinitions, ...principalDefinitions]) {
+          expect(schema).toContain(definition);
+        }
+        const knownSeedBlock = schema.match(
+          /INSERT INTO dispatch_principals \(principal_id, display_name, delivery_mode, active\)\s+VALUES([\s\S]*?)ON CONFLICT \(principal_id\) DO NOTHING;/
+        )?.[1];
+        expect(knownSeedBlock).toBeDefined();
+        const actualKnownPrincipals = [
+          ...(knownSeedBlock?.matchAll(/\('([^']+)', '([^']+)', '([^']+)', (TRUE|FALSE)\)/g) ?? []),
+        ].map(match => match.slice(1));
+        expect(actualKnownPrincipals).toEqual(knownPrincipals.map(principal => [...principal]));
+        expect(normalizedSchema).toContain(
+          "INSERT INTO dispatch_principals (principal_id, display_name, delivery_mode, active) SELECT DISTINCT LOWER(BTRIM(recipient)), LOWER(BTRIM(recipient)), 'drain_on_start', TRUE FROM agent_dispatch_messages WHERE BTRIM(recipient) <> '' ON CONFLICT (principal_id) DO NOTHING;"
+        );
+      }
+      expect(migration.match(/ADD COLUMN IF NOT EXISTS/g)?.length).toBe(11);
+      expect(migration).toContain("task_type = 'run_report'");
+      expect(migration).toContain("status = 'queued'");
+    });
+  });
+
   describe('Board execution claims schema', () => {
     test('numbered migration, combined schema, and SQLite bootstrap define claim tables', () => {
       const migration = readFileSync(

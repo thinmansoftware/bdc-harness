@@ -222,6 +222,7 @@ export class SqliteAdapter implements IDatabase {
   private initSchema(): void {
     this.createSchema();
     this.migrateColumns();
+    this.seedDispatchPrincipals();
     this.db.run(
       'CREATE INDEX IF NOT EXISTS idx_dispatch_board_pending ON agent_dispatch_messages(recipient_alias, status, created_at)'
     );
@@ -300,13 +301,9 @@ export class SqliteAdapter implements IDatabase {
       getLog().warn({ err: e as Error }, 'db.sqlite_migration_session_columns_failed');
     }
 
-    // Dispatch board-motion columns
+    // Dispatch board-motion and agent messaging columns
     try {
-      const dispatchCols = this.db
-        .prepare("PRAGMA table_info('agent_dispatch_messages')")
-        .all() as { name: string }[];
-      const dispatchColNames = new Set(dispatchCols.map(c => c.name));
-      const columns: [string, string][] = [
+      const boardColumns: [string, string][] = [
         ['recipient_alias', "TEXT CHECK (recipient_alias IS NULL OR recipient_alias = 'board')"],
         ['motion_id', 'TEXT'],
         [
@@ -321,10 +318,66 @@ export class SqliteAdapter implements IDatabase {
         ],
         ['resolved_at', 'TEXT'],
       ];
-      for (const [name, definition] of columns) {
-        if (!dispatchColNames.has(name)) {
+      const phase0Columns: [string, string][] = [
+        [
+          'priority',
+          "TEXT NOT NULL DEFAULT 'normal' CHECK (priority IN ('blocker', 'normal', 'heartbeat'))",
+        ],
+        [
+          'task_outcome',
+          "TEXT CHECK (task_outcome IS NULL OR task_outcome IN ('succeeded', 'failed', 'blocked'))",
+        ],
+        ['acknowledged_at', 'TEXT'],
+        ['acknowledged_by', 'TEXT'],
+        ['addressed_at', 'TEXT'],
+        ['addressed_by', 'TEXT'],
+        ['escalated_tg_at', 'TEXT'],
+        ['escalated_sms_at', 'TEXT'],
+        ['subject_key', 'TEXT'],
+        [
+          'route_disposition',
+          "TEXT CHECK (route_disposition IS NULL OR route_disposition IN ('unroutable', 'superseded'))",
+        ],
+        ['supersedes_id', 'TEXT REFERENCES agent_dispatch_messages(id)'],
+      ];
+      const boardDispatchCols = this.db
+        .prepare("PRAGMA table_info('agent_dispatch_messages')")
+        .all() as { name: string }[];
+      const boardDispatchColNames = new Set(boardDispatchCols.map(c => c.name));
+      for (const [name, definition] of boardColumns) {
+        if (!boardDispatchColNames.has(name)) {
           this.db.run(`ALTER TABLE agent_dispatch_messages ADD COLUMN ${name} ${definition}`);
         }
+      }
+
+      this.db.run('BEGIN');
+      try {
+        const dispatchCols = this.db
+          .prepare("PRAGMA table_info('agent_dispatch_messages')")
+          .all() as { name: string }[];
+        const dispatchColNames = new Set(dispatchCols.map(c => c.name));
+        const priorityNeedsBackfill = !dispatchColNames.has('priority');
+        for (const [name, definition] of [...boardColumns, ...phase0Columns]) {
+          if (!dispatchColNames.has(name)) {
+            this.db.run(`ALTER TABLE agent_dispatch_messages ADD COLUMN ${name} ${definition}`);
+          }
+        }
+        if (priorityNeedsBackfill) {
+          this.db.run(
+            "UPDATE agent_dispatch_messages SET priority = 'heartbeat' WHERE status = 'queued' AND task_type = 'run_report'"
+          );
+        }
+        this.db.run('COMMIT');
+      } catch (error: unknown) {
+        try {
+          this.db.run('ROLLBACK');
+        } catch (rollbackError: unknown) {
+          getLog().error(
+            { err: rollbackError as Error },
+            'db.sqlite_migration_dispatch_columns_rollback_failed'
+          );
+        }
+        throw error;
       }
     } catch (e: unknown) {
       getLog().warn({ err: e as Error }, 'db.sqlite_migration_dispatch_columns_failed');
@@ -346,6 +399,40 @@ export class SqliteAdapter implements IDatabase {
     } catch (e: unknown) {
       getLog().warn({ err: e as Error }, 'db.sqlite_migration_supervisor_action_columns_failed');
     }
+  }
+
+  private seedDispatchPrincipals(): void {
+    this.db.run(`
+      INSERT INTO dispatch_principals (principal_id, display_name, delivery_mode, active)
+      VALUES
+        ('claude', 'Claude', 'worker_poll', 1),
+        ('codex', 'Codex', 'worker_poll', 1),
+        ('grok', 'Grok', 'worker_poll', 1),
+        ('cursor', 'Cursor', 'worker_poll', 1),
+        ('fusion', 'Fusion', 'worker_poll', 1),
+        ('claude-acp', 'Claude ACP', 'worker_poll', 1),
+        ('codex-mcp', 'Codex MCP', 'worker_poll', 1),
+        ('grok-acp', 'Grok ACP', 'worker_poll', 1),
+        ('operator', 'Operator', 'drain_on_start', 1),
+        ('xo', 'XO', 'drain_on_start', 1),
+        ('board', 'Board', 'alias_resolved', 1),
+        ('overseer', 'Overseer', 'notify_only', 1),
+        ('cauldron', 'Cauldron', 'notify_only', 1),
+        ('john', 'John', 'notify_only', 0),
+        ('merge-manager', 'Merge Manager', 'notify_only', 0)
+      ON CONFLICT (principal_id) DO NOTHING
+    `);
+    this.db.run(`
+      INSERT INTO dispatch_principals (principal_id, display_name, delivery_mode, active)
+      SELECT DISTINCT
+        LOWER(TRIM(recipient)),
+        LOWER(TRIM(recipient)),
+        'drain_on_start',
+        1
+      FROM agent_dispatch_messages
+      WHERE TRIM(recipient) <> ''
+      ON CONFLICT (principal_id) DO NOTHING
+    `);
   }
 
   /**
@@ -672,7 +759,27 @@ export class SqliteAdapter implements IDatabase {
         resolved_recipient TEXT,
         resolved_xo_lease_id TEXT,
         resolved_xo_fencing_token INTEGER CHECK (resolved_xo_fencing_token IS NULL OR resolved_xo_fencing_token > 0),
-        resolved_at TEXT
+        resolved_at TEXT,
+        priority TEXT NOT NULL DEFAULT 'normal' CHECK (priority IN ('blocker', 'normal', 'heartbeat')),
+        task_outcome TEXT CHECK (task_outcome IS NULL OR task_outcome IN ('succeeded', 'failed', 'blocked')),
+        acknowledged_at TEXT,
+        acknowledged_by TEXT,
+        addressed_at TEXT,
+        addressed_by TEXT,
+        escalated_tg_at TEXT,
+        escalated_sms_at TEXT,
+        subject_key TEXT,
+        route_disposition TEXT CHECK (route_disposition IS NULL OR route_disposition IN ('unroutable', 'superseded')),
+        supersedes_id TEXT REFERENCES agent_dispatch_messages(id)
+      );
+
+      CREATE TABLE IF NOT EXISTS dispatch_principals (
+        principal_id TEXT PRIMARY KEY,
+        display_name TEXT NOT NULL,
+        delivery_mode TEXT NOT NULL CHECK (delivery_mode IN ('worker_poll', 'drain_on_start', 'alias_resolved', 'notify_only')),
+        active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1)),
+        created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+        updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
       );
 
       CREATE TABLE IF NOT EXISTS agent_dispatch_workers (

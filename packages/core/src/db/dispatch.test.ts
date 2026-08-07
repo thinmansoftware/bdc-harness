@@ -1,26 +1,35 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test';
-import { unlinkSync } from 'fs';
-import { join } from 'path';
+import { existsSync, mkdtempSync, rmSync, unlinkSync } from 'fs';
+import { tmpdir } from 'os';
+import { join, resolve } from 'path';
+import { pathToFileURL } from 'url';
 import { SqliteAdapter } from './adapters/sqlite';
 
 let db: SqliteAdapter;
 let currentDbPath = '';
+const raceHomes: string[] = [];
 
 mock.module('./connection', () => ({
   getDatabase: () => db,
 }));
 
 import {
+  acknowledgeMessage,
+  addressMessage,
   cancelMessage,
   claimMessage,
   createMessage,
   evaluateWorkerStaleness,
+  getMessage,
   heartbeatWorker,
+  listMessages,
+  listUnroutableQueuedMessages,
   listWorkers,
   postResult,
   registerWorker,
   renewMessageLease,
   resolveDispatchRecipient,
+  assessDispatchRecipient,
 } from './dispatch';
 
 function cleanupDb(path: string): void {
@@ -30,6 +39,110 @@ function cleanupDb(path: string): void {
     } catch {
       /* file may not exist */
     }
+  }
+}
+
+interface MailboxProcessResult {
+  exitCode: number;
+  stdout: string;
+  stderr: string;
+}
+
+async function runMailboxRace(
+  archonHome: string,
+  action: 'acknowledge' | 'address',
+  messageId: string
+): Promise<MailboxProcessResult[]> {
+  const dispatchUrl = pathToFileURL(resolve(import.meta.dir, 'dispatch.ts')).href;
+  const connectionUrl = pathToFileURL(resolve(import.meta.dir, 'connection.ts')).href;
+  const startFile = join(archonHome, `${action}.start`);
+  const childScript = `
+    const { acknowledgeMessage, addressMessage } = await import(${JSON.stringify(dispatchUrl)});
+    const { closeDatabase, getDatabase } = await import(${JSON.stringify(connectionUrl)});
+    getDatabase();
+    await Bun.write(process.env.READY_FILE, 'ready');
+    while (!(await Bun.file(process.env.START_FILE).exists())) await Bun.sleep(2);
+    try {
+      const result = process.env.MAILBOX_ACTION === 'acknowledge'
+        ? await acknowledgeMessage({ id: process.env.MESSAGE_ID, principal_id: 'operator' })
+        : await addressMessage({ id: process.env.MESSAGE_ID, principal_id: 'operator' });
+      process.stdout.write(JSON.stringify(result));
+    } catch (error) {
+      process.stderr.write(error instanceof Error ? error.message : 'mailbox_process_failed');
+      process.exitCode = 1;
+    } finally {
+      await closeDatabase();
+    }
+  `;
+  const children: Array<{
+    child: ReturnType<typeof Bun.spawn>;
+    readyFile: string;
+  }> = [];
+  for (const index of [0, 1]) {
+    const readyFile = join(archonHome, `${action}-${index}.ready`);
+    const child = Bun.spawn({
+      cmd: [process.execPath, '-e', childScript],
+      cwd: resolve(import.meta.dir, '..', '..', '..'),
+      stdout: 'pipe',
+      stderr: 'pipe',
+      env: {
+        ...process.env,
+        ARCHON_HOME: archonHome,
+        LOG_LEVEL: 'fatal',
+        MAILBOX_ACTION: action,
+        MESSAGE_ID: messageId,
+        READY_FILE: readyFile,
+        START_FILE: startFile,
+      },
+    });
+    children.push({ child, readyFile });
+    for (let attempt = 0; attempt < 1000; attempt += 1) {
+      if (existsSync(readyFile)) break;
+      if (attempt === 999) throw new Error('mailbox_race_process_ready_timeout');
+      await Bun.sleep(5);
+    }
+  }
+  await Bun.write(startFile, 'start');
+
+  return Promise.all(
+    children.map(async ({ child }) => {
+      const [exitCode, stdout, stderr] = await Promise.all([
+        child.exited,
+        new Response(child.stdout).text(),
+        new Response(child.stderr).text(),
+      ]);
+      return { exitCode, stdout, stderr };
+    })
+  );
+}
+
+async function makeSeparateProcessMailboxFixture(
+  idempotencyKey: string,
+  acknowledged: boolean
+): Promise<{ archonHome: string; messageId: string }> {
+  const archonHome = mkdtempSync(join(tmpdir(), 'archon-dispatch-race-'));
+  raceHomes.push(archonHome);
+  const raceDb = new SqliteAdapter(join(archonHome, 'archon.db'));
+  const primaryDb = db;
+  db = raceDb;
+  try {
+    const message = await createMessage({
+      correlation_id: `${idempotencyKey}-correlation`,
+      idempotency_key: idempotencyKey,
+      task_type: 'agent_message',
+      sender: 'xo',
+      recipient: 'operator',
+      body: 'Separate process mailbox race.',
+    });
+    if (acknowledged) {
+      expect((await acknowledgeMessage({ id: message.id, principal_id: 'operator' })).ok).toBe(
+        true
+      );
+    }
+    return { archonHome, messageId: message.id };
+  } finally {
+    db = primaryDb;
+    await raceDb.close();
   }
 }
 
@@ -45,6 +158,10 @@ describe('dispatch db', () => {
   afterEach(async () => {
     await db.close();
     cleanupDb(currentDbPath);
+    while (raceHomes.length > 0) {
+      const raceHome = raceHomes.pop();
+      if (raceHome) rmSync(raceHome, { recursive: true, force: true });
+    }
   });
 
   test('deduplicates repeated idempotency_key posts', async () => {
@@ -69,6 +186,888 @@ describe('dispatch db', () => {
     expect(second.correlation_id).toBe('corr-1');
     const rows = await db.query('SELECT id FROM agent_dispatch_messages');
     expect(rows.rowCount).toBe(1);
+  });
+
+  test('assesses canonical recipients and rejects missing or inactive principals', async () => {
+    await expect(assessDispatchRecipient(' Operator ')).resolves.toEqual({
+      ok: true,
+      canonical_principal: 'operator',
+      delivery_mode: 'drain_on_start',
+      reason: null,
+    });
+    await expect(assessDispatchRecipient(' john ')).resolves.toEqual({
+      ok: false,
+      canonical_principal: 'john',
+      delivery_mode: 'notify_only',
+      reason: 'inactive_principal',
+    });
+    await expect(assessDispatchRecipient(' Missing ')).resolves.toEqual({
+      ok: false,
+      canonical_principal: 'missing',
+      delivery_mode: null,
+      reason: 'missing_principal',
+    });
+  });
+
+  test('canonicalizes concrete recipient filters before listing messages', async () => {
+    const message = await createMessage({
+      correlation_id: 'corr-canonical-list-filter',
+      idempotency_key: 'idem-canonical-list-filter',
+      task_type: 'agent_message',
+      sender: 'xo',
+      recipient: 'grok',
+      body: 'Canonical list filter message.',
+    });
+
+    const listed = await listMessages({ recipient: ' Grok ' });
+
+    expect(listed.map(item => item.id)).toEqual([message.id]);
+  });
+
+  test('guards new recipients while retaining idempotent creates and board metadata', async () => {
+    const original = await createMessage({
+      correlation_id: 'corr-idempotent-active',
+      idempotency_key: 'idem-idempotent-active',
+      task_type: 'agent_message',
+      sender: 'xo',
+      recipient: 'operator',
+      body: 'Original mailbox message.',
+    });
+    await db.query("UPDATE dispatch_principals SET active = 0 WHERE principal_id = 'operator'");
+
+    const retry = await createMessage({
+      correlation_id: 'corr-idempotent-inactive',
+      idempotency_key: 'idem-idempotent-active',
+      task_type: 'agent_message',
+      sender: 'xo',
+      recipient: 'operator',
+      body: 'Must return original before recipient assessment.',
+    });
+    expect(retry.id).toBe(original.id);
+    await expect(
+      createMessage({
+        correlation_id: 'corr-inactive',
+        idempotency_key: 'idem-inactive',
+        task_type: 'agent_message',
+        sender: 'xo',
+        recipient: 'operator',
+        body: 'New inactive recipient message.',
+      })
+    ).rejects.toThrow('inactive_principal');
+    await expect(
+      createMessage({
+        correlation_id: 'corr-missing',
+        idempotency_key: 'idem-missing',
+        task_type: 'agent_message',
+        sender: 'xo',
+        recipient: 'missing',
+        body: 'Unknown recipient message.',
+      })
+    ).rejects.toThrow('missing_principal');
+    await expect(
+      createMessage({
+        correlation_id: 'corr-board-without-metadata',
+        idempotency_key: 'idem-board-without-metadata',
+        task_type: 'board_motion',
+        sender: 'xo',
+        recipient: ' Board ',
+        body: 'Board message without alias metadata.',
+      })
+    ).rejects.toThrow('board_alias_metadata_required');
+    const board = await createMessage({
+      correlation_id: 'corr-board-with-metadata',
+      idempotency_key: 'idem-board-with-metadata',
+      task_type: 'board_motion',
+      sender: 'xo',
+      recipient: ' Board ',
+      body: 'Board message with alias metadata.',
+      recipient_alias: 'board',
+    });
+    expect(board.recipient).toBe('board');
+  });
+
+  test('keeps worker polling claimable and rejects mailbox delivery modes', async () => {
+    await registerWorker({
+      worker_id: 'worker-mode-guard',
+      host: 'host',
+      capabilities: {},
+      max_concurrency: 1,
+    });
+    const workerMessage = await createMessage({
+      correlation_id: 'corr-worker-mode',
+      idempotency_key: 'idem-worker-mode',
+      task_type: 'agent_message',
+      sender: 'xo',
+      recipient: 'codex',
+      body: 'Worker poll message.',
+    });
+    const mailboxMessage = await createMessage({
+      correlation_id: 'corr-mailbox-mode',
+      idempotency_key: 'idem-mailbox-mode',
+      task_type: 'agent_message',
+      sender: 'xo',
+      recipient: 'overseer',
+      body: 'Notify-only mailbox message.',
+    });
+
+    expect(
+      (await claimMessage({ id: workerMessage.id, worker_id: 'worker-mode-guard' }))?.status
+    ).toBe('claimed');
+    expect(
+      await claimMessage({ id: mailboxMessage.id, worker_id: 'worker-mode-guard' })
+    ).toBeNull();
+  });
+
+  test('rejects missing and inactive concrete principals before claim', async () => {
+    await registerWorker({
+      worker_id: 'worker-registry-guard',
+      host: 'host',
+      capabilities: {},
+      max_concurrency: 1,
+    });
+    const missingPrincipalMessage = await createMessage({
+      correlation_id: 'corr-claim-missing-principal',
+      idempotency_key: 'idem-claim-missing-principal',
+      task_type: 'agent_message',
+      sender: 'xo',
+      recipient: 'codex',
+      body: 'Missing principal claim guard.',
+    });
+    const inactivePrincipalMessage = await createMessage({
+      correlation_id: 'corr-claim-inactive-principal',
+      idempotency_key: 'idem-claim-inactive-principal',
+      task_type: 'agent_message',
+      sender: 'xo',
+      recipient: 'grok',
+      body: 'Inactive principal claim guard.',
+    });
+    const wrongModePrincipalMessage = await createMessage({
+      correlation_id: 'corr-claim-wrong-mode-principal',
+      idempotency_key: 'idem-claim-wrong-mode-principal',
+      task_type: 'agent_message',
+      sender: 'xo',
+      recipient: 'fusion',
+      body: 'Wrong mode principal claim guard.',
+    });
+    await db.query("DELETE FROM dispatch_principals WHERE principal_id = 'codex'");
+    await db.query("UPDATE dispatch_principals SET active = 0 WHERE principal_id = 'grok'");
+    await db.query(
+      "UPDATE dispatch_principals SET delivery_mode = 'alias_resolved' WHERE principal_id = 'fusion'"
+    );
+
+    await expect(
+      claimMessage({ id: missingPrincipalMessage.id, worker_id: 'worker-registry-guard' })
+    ).resolves.toBeNull();
+    await expect(
+      claimMessage({ id: inactivePrincipalMessage.id, worker_id: 'worker-registry-guard' })
+    ).resolves.toBeNull();
+    await expect(
+      claimMessage({ id: wrongModePrincipalMessage.id, worker_id: 'worker-registry-guard' })
+    ).resolves.toBeNull();
+    for (const message of [
+      missingPrincipalMessage,
+      inactivePrincipalMessage,
+      wrongModePrincipalMessage,
+    ]) {
+      expect(await getMessage(message.id)).toMatchObject({
+        status: 'queued',
+        fencing_token: 0,
+        lease_owner: null,
+        lease_expires_at: null,
+      });
+    }
+  });
+
+  test('rejects inactive board aliases and inactive resolved board principals before claim', async () => {
+    await registerWorker({
+      worker_id: 'worker-board-registry-guard',
+      host: 'host',
+      capabilities: {},
+      max_concurrency: 1,
+    });
+    const boardMessage = await createMessage({
+      correlation_id: 'corr-claim-inactive-board-principal',
+      idempotency_key:
+        'board-motion:M-claim-registry:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:board',
+      task_type: 'board_motion',
+      sender: 'xo',
+      recipient: 'board',
+      body: '{"motion_id":"M-claim-registry","title":"T","file_path":"docs/board/motions/M.md"}',
+      recipient_alias: 'board',
+      motion_id: 'M-claim-registry',
+      motion_revision_sha: 'a'.repeat(40),
+    });
+    const now = new Date();
+    await db.query(
+      `INSERT INTO board_xo_leases (
+         id, lease_id, principal_id, seat_id, holder_id, holder_token_hash,
+         fencing_token, acquired_at, renewed_at, expires_at, released_at
+       )
+       VALUES (1, $1, 'claude', 'xo', 'holder', $2, 13, $3, NULL, $4, NULL)`,
+      [
+        'lease-registry-guard',
+        'c'.repeat(64),
+        now.toISOString(),
+        new Date(now.getTime() + 60_000).toISOString(),
+      ]
+    );
+    await db.query("UPDATE dispatch_principals SET active = 0 WHERE principal_id = 'claude'");
+
+    await expect(
+      claimMessage({
+        id: boardMessage.id,
+        worker_id: 'worker-board-registry-guard',
+        delivery_principal: 'claude',
+      })
+    ).resolves.toBeNull();
+    await db.query("UPDATE dispatch_principals SET active = 1 WHERE principal_id = 'claude'");
+    await db.query("UPDATE dispatch_principals SET active = 0 WHERE principal_id = 'board'");
+    await expect(
+      claimMessage({
+        id: boardMessage.id,
+        worker_id: 'worker-board-registry-guard',
+        delivery_principal: 'claude',
+      })
+    ).resolves.toBeNull();
+    await db.query(
+      "UPDATE dispatch_principals SET active = 1, delivery_mode = 'worker_poll' WHERE principal_id = 'board'"
+    );
+    await expect(
+      claimMessage({
+        id: boardMessage.id,
+        worker_id: 'worker-board-registry-guard',
+        delivery_principal: 'claude',
+      })
+    ).resolves.toBeNull();
+    await db.query(
+      "UPDATE dispatch_principals SET delivery_mode = 'alias_resolved' WHERE principal_id = 'board'"
+    );
+    await db.query("DELETE FROM dispatch_principals WHERE principal_id = 'board'");
+    await expect(
+      claimMessage({
+        id: boardMessage.id,
+        worker_id: 'worker-board-registry-guard',
+        delivery_principal: 'claude',
+      })
+    ).resolves.toBeNull();
+    await db.query(
+      `INSERT INTO dispatch_principals (principal_id, display_name, delivery_mode, active)
+       VALUES ('board', 'Board', 'alias_resolved', 1)`
+    );
+    await db.query("DELETE FROM dispatch_principals WHERE principal_id = 'claude'");
+    await expect(
+      claimMessage({
+        id: boardMessage.id,
+        worker_id: 'worker-board-registry-guard',
+        delivery_principal: 'claude',
+      })
+    ).resolves.toBeNull();
+    expect((await getMessage(boardMessage.id))?.status).toBe('queued');
+  });
+
+  test('rejects acknowledgement and addressing after a mailbox principal becomes inactive', async () => {
+    const acknowledgeTarget = await createMessage({
+      correlation_id: 'corr-ack-inactive-principal',
+      idempotency_key: 'idem-ack-inactive-principal',
+      task_type: 'agent_message',
+      sender: 'xo',
+      recipient: 'operator',
+      body: 'Inactive acknowledgement guard.',
+    });
+    const addressTarget = await createMessage({
+      correlation_id: 'corr-address-inactive-principal',
+      idempotency_key: 'idem-address-inactive-principal',
+      task_type: 'agent_message',
+      sender: 'xo',
+      recipient: 'operator',
+      body: 'Inactive address guard.',
+    });
+    expect((await acknowledgeMessage({ id: addressTarget.id, principal_id: 'operator' })).ok).toBe(
+      true
+    );
+    await db.query("UPDATE dispatch_principals SET active = 0 WHERE principal_id = 'operator'");
+
+    await expect(
+      acknowledgeMessage({ id: acknowledgeTarget.id, principal_id: 'operator' })
+    ).resolves.toEqual({ ok: false, reason: 'wrong_mode' });
+    await expect(
+      addressMessage({ id: addressTarget.id, principal_id: 'operator' })
+    ).resolves.toEqual({ ok: false, reason: 'wrong_mode' });
+    await db.query("DELETE FROM dispatch_principals WHERE principal_id = 'operator'");
+    await expect(
+      acknowledgeMessage({ id: acknowledgeTarget.id, principal_id: 'operator' })
+    ).resolves.toEqual({ ok: false, reason: 'wrong_mode' });
+    await expect(
+      addressMessage({ id: addressTarget.id, principal_id: 'operator' })
+    ).resolves.toEqual({ ok: false, reason: 'wrong_mode' });
+    expect((await getMessage(acknowledgeTarget.id))?.acknowledged_at).toBeNull();
+    expect((await getMessage(addressTarget.id))?.addressed_at).toBeNull();
+  });
+
+  test('acknowledges mailbox messages once without changing queue or address state', async () => {
+    const message = await createMessage({
+      correlation_id: 'corr-ack',
+      idempotency_key: 'idem-ack',
+      task_type: 'agent_message',
+      sender: 'xo',
+      recipient: 'operator',
+      body: 'Acknowledge me.',
+      priority: 'blocker',
+    });
+
+    const results = await Promise.all(
+      Array.from({ length: 3 }, () =>
+        acknowledgeMessage({ id: message.id, principal_id: 'operator' })
+      )
+    );
+    expect(results.every(result => result.ok)).toBe(true);
+    const stored = await getMessage(message.id);
+    expect(stored).toMatchObject({
+      status: 'queued',
+      acknowledged_by: 'operator',
+      addressed_at: null,
+      addressed_by: null,
+    });
+    expect(stored?.acknowledged_at).not.toBeNull();
+    expect((await acknowledgeMessage({ id: message.id, principal_id: 'operator' })).ok).toBe(true);
+  });
+
+  test('acknowledgement revalidates stale recipient state after a guarded update loses', async () => {
+    const message = await createMessage({
+      correlation_id: 'corr-ack-stale-recipient',
+      idempotency_key: 'idem-ack-stale-recipient',
+      task_type: 'agent_message',
+      sender: 'xo',
+      recipient: 'operator',
+      body: 'Stale recipient target.',
+    });
+    const staleMessage = { ...message, recipient: 'codex' };
+    const originalDb = db;
+    const updateSql: string[] = [];
+    let readCount = 0;
+    const query = async <T>(sql: string): Promise<{ rows: readonly T[]; rowCount: number }> => {
+      if (sql.startsWith('SELECT * FROM agent_dispatch_messages')) {
+        readCount += 1;
+        const row = readCount === 1 ? message : staleMessage;
+        return { rows: [row as T], rowCount: 1 };
+      }
+      if (sql.startsWith('SELECT principal_id, delivery_mode, active')) {
+        return {
+          rows: [{ principal_id: 'operator', delivery_mode: 'drain_on_start', active: 1 } as T],
+          rowCount: 1,
+        };
+      }
+      if (sql.startsWith('UPDATE agent_dispatch_messages')) {
+        updateSql.push(sql);
+        return { rows: [], rowCount: 0 };
+      }
+      throw new Error(`Unexpected SQL: ${sql}`);
+    };
+    db = {
+      ...originalDb,
+      query,
+      withTransaction: async fn => fn(query),
+    } as SqliteAdapter;
+
+    try {
+      await expect(
+        acknowledgeMessage({ id: message.id, principal_id: 'operator' })
+      ).resolves.toEqual({ ok: false, reason: 'wrong_recipient' });
+      expect(updateSql[0]).toContain('LOWER(TRIM(COALESCE(resolved_recipient, recipient))) = $3');
+      expect(updateSql[0]).toContain("CAST(recipient_principal.active AS TEXT) IN ('1', 'true')");
+      expect(updateSql[0]).toContain("delivery_mode IN ('drain_on_start', 'notify_only')");
+    } finally {
+      db = originalDb;
+    }
+  });
+
+  test('acknowledgement maps a registry deactivation after a lost update to wrong_mode', async () => {
+    const message = await createMessage({
+      correlation_id: 'corr-ack-registry-deactivation',
+      idempotency_key: 'idem-ack-registry-deactivation',
+      task_type: 'agent_message',
+      sender: 'xo',
+      recipient: 'operator',
+      body: 'Registry deactivation race target.',
+    });
+    const originalDb = db;
+    const updateSql: string[] = [];
+    let principalReadCount = 0;
+    const query = async <T>(sql: string): Promise<{ rows: readonly T[]; rowCount: number }> => {
+      if (sql.startsWith('SELECT * FROM agent_dispatch_messages')) {
+        return { rows: [message as T], rowCount: 1 };
+      }
+      if (sql.startsWith('SELECT principal_id, delivery_mode, active')) {
+        principalReadCount += 1;
+        return {
+          rows: [
+            {
+              principal_id: 'operator',
+              delivery_mode: 'drain_on_start',
+              active: principalReadCount === 1 ? 1 : 0,
+            } as T,
+          ],
+          rowCount: 1,
+        };
+      }
+      if (sql.startsWith('UPDATE agent_dispatch_messages')) {
+        updateSql.push(sql);
+        return { rows: [], rowCount: 0 };
+      }
+      throw new Error(`Unexpected SQL: ${sql}`);
+    };
+    db = {
+      ...originalDb,
+      query,
+      withTransaction: async fn => fn(query),
+    } as SqliteAdapter;
+
+    try {
+      await expect(
+        acknowledgeMessage({ id: message.id, principal_id: 'operator' })
+      ).resolves.toEqual({ ok: false, reason: 'wrong_mode' });
+      expect(updateSql[0]).toContain("CAST(recipient_principal.active AS TEXT) IN ('1', 'true')");
+    } finally {
+      db = originalDb;
+    }
+  });
+
+  test('concurrent acknowledgement through independent SQLite connections is idempotent', async () => {
+    const message = await createMessage({
+      correlation_id: 'corr-ack-independent-connections',
+      idempotency_key: 'idem-ack-independent-connections',
+      task_type: 'agent_message',
+      sender: 'xo',
+      recipient: 'operator',
+      body: 'Independent connection target.',
+    });
+    const primaryDb = db;
+    const independentDb = new SqliteAdapter(currentDbPath);
+    try {
+      db = primaryDb;
+      const first = acknowledgeMessage({ id: message.id, principal_id: 'operator' });
+      db = independentDb;
+      const second = acknowledgeMessage({ id: message.id, principal_id: 'operator' });
+      const results = await Promise.all([first, second]);
+
+      expect(results.every(result => result.ok)).toBe(true);
+    } finally {
+      db = primaryDb;
+      await independentDb.close();
+    }
+  });
+
+  test('concurrent acknowledgement in separate processes against one SQLite file is idempotent', async () => {
+    const { archonHome, messageId } = await makeSeparateProcessMailboxFixture(
+      'idem-ack-separate-processes',
+      false
+    );
+
+    const results = await runMailboxRace(archonHome, 'acknowledge', messageId);
+
+    expect(results.filter(result => result.exitCode !== 0)).toEqual([]);
+    const processResults = results.map(
+      result =>
+        JSON.parse(result.stdout) as {
+          ok: boolean;
+          message: { acknowledged_at: string | null };
+        }
+    );
+    expect(processResults).toEqual([
+      expect.objectContaining({ ok: true }),
+      expect.objectContaining({ ok: true }),
+    ]);
+    expect(new Set(processResults.map(result => result.message.acknowledged_at)).size).toBe(1);
+    expect(results.every(result => !result.stderr.includes('database is locked'))).toBe(true);
+    const inspectionDb = new SqliteAdapter(join(archonHome, 'archon.db'));
+    try {
+      const stored = await inspectionDb.query<{
+        status: string;
+        acknowledged_at: string | null;
+        acknowledged_by: string | null;
+      }>(
+        'SELECT status, acknowledged_at, acknowledged_by FROM agent_dispatch_messages WHERE id = $1',
+        [messageId]
+      );
+      expect(stored.rows[0]).toMatchObject({
+        status: 'queued',
+        acknowledged_by: 'operator',
+      });
+      expect(stored.rows[0]?.acknowledged_at).not.toBeNull();
+      expect(stored.rows[0]?.acknowledged_at).toBe(processResults[0]?.message.acknowledged_at);
+    } finally {
+      await inspectionDb.close();
+    }
+  });
+
+  test('returns every acknowledgement conflict outcome', async () => {
+    const mailbox = await createMessage({
+      correlation_id: 'corr-ack-conflicts',
+      idempotency_key: 'idem-ack-conflicts',
+      task_type: 'agent_message',
+      sender: 'xo',
+      recipient: 'xo',
+      body: 'Mailbox conflict target.',
+    });
+    const worker = await createMessage({
+      correlation_id: 'corr-ack-worker',
+      idempotency_key: 'idem-ack-worker',
+      task_type: 'agent_message',
+      sender: 'xo',
+      recipient: 'codex',
+      body: 'Worker conflict target.',
+    });
+    const nonQueued = await createMessage({
+      correlation_id: 'corr-ack-nonqueued',
+      idempotency_key: 'idem-ack-nonqueued',
+      task_type: 'agent_message',
+      sender: 'xo',
+      recipient: 'operator',
+      body: 'Non-queued conflict target.',
+    });
+    await db.query("UPDATE agent_dispatch_messages SET status = 'done' WHERE id = $1", [
+      nonQueued.id,
+    ]);
+
+    await expect(acknowledgeMessage({ id: 'missing', principal_id: 'operator' })).resolves.toEqual({
+      ok: false,
+      reason: 'not_found',
+    });
+    await expect(acknowledgeMessage({ id: mailbox.id, principal_id: 'operator' })).resolves.toEqual(
+      {
+        ok: false,
+        reason: 'wrong_recipient',
+      }
+    );
+    await expect(acknowledgeMessage({ id: worker.id, principal_id: 'codex' })).resolves.toEqual({
+      ok: false,
+      reason: 'wrong_mode',
+    });
+    await expect(
+      acknowledgeMessage({ id: nonQueued.id, principal_id: 'operator' })
+    ).resolves.toEqual({
+      ok: false,
+      reason: 'not_queued',
+    });
+    expect((await acknowledgeMessage({ id: mailbox.id, principal_id: 'xo' })).ok).toBe(true);
+    await expect(acknowledgeMessage({ id: mailbox.id, principal_id: 'xo-fable' })).resolves.toEqual(
+      {
+        ok: false,
+        reason: 'wrong_recipient',
+      }
+    );
+  });
+
+  test('addresses only acknowledged mail by its acknowledger and is idempotent', async () => {
+    const message = await createMessage({
+      correlation_id: 'corr-address',
+      idempotency_key: 'idem-address',
+      task_type: 'agent_message',
+      sender: 'xo',
+      recipient: 'operator',
+      body: 'Address me.',
+    });
+    await expect(addressMessage({ id: message.id, principal_id: 'operator' })).resolves.toEqual({
+      ok: false,
+      reason: 'address_before_ack',
+    });
+    expect((await acknowledgeMessage({ id: message.id, principal_id: 'operator' })).ok).toBe(true);
+    await expect(addressMessage({ id: message.id, principal_id: 'xo' })).resolves.toEqual({
+      ok: false,
+      reason: 'wrong_recipient',
+    });
+    await expect(
+      addressMessage({ id: message.id, principal_id: 'operator' })
+    ).resolves.toMatchObject({
+      ok: true,
+    });
+    const repeats = await Promise.all(
+      Array.from({ length: 3 }, () => addressMessage({ id: message.id, principal_id: 'operator' }))
+    );
+    expect(repeats.every(result => result.ok)).toBe(true);
+    const stored = await getMessage(message.id);
+    expect(stored).toMatchObject({
+      status: 'queued',
+      acknowledged_by: 'operator',
+      addressed_by: 'operator',
+    });
+    expect(stored?.addressed_at).not.toBeNull();
+  });
+
+  test('concurrent address in separate processes against one SQLite file is idempotent', async () => {
+    const { archonHome, messageId } = await makeSeparateProcessMailboxFixture(
+      'idem-address-separate-processes',
+      true
+    );
+
+    const results = await runMailboxRace(archonHome, 'address', messageId);
+
+    expect(results.filter(result => result.exitCode !== 0)).toEqual([]);
+    const processResults = results.map(
+      result =>
+        JSON.parse(result.stdout) as {
+          ok: boolean;
+          message: { addressed_at: string | null };
+        }
+    );
+    expect(processResults).toEqual([
+      expect.objectContaining({ ok: true }),
+      expect.objectContaining({ ok: true }),
+    ]);
+    expect(new Set(processResults.map(result => result.message.addressed_at)).size).toBe(1);
+    expect(results.every(result => !result.stderr.includes('database is locked'))).toBe(true);
+    const inspectionDb = new SqliteAdapter(join(archonHome, 'archon.db'));
+    try {
+      const stored = await inspectionDb.query<{
+        status: string;
+        acknowledged_by: string | null;
+        addressed_at: string | null;
+        addressed_by: string | null;
+      }>(
+        'SELECT status, acknowledged_by, addressed_at, addressed_by FROM agent_dispatch_messages WHERE id = $1',
+        [messageId]
+      );
+      expect(stored.rows[0]).toMatchObject({
+        status: 'queued',
+        acknowledged_by: 'operator',
+        addressed_by: 'operator',
+      });
+      expect(stored.rows[0]?.addressed_at).not.toBeNull();
+      expect(stored.rows[0]?.addressed_at).toBe(processResults[0]?.message.addressed_at);
+    } finally {
+      await inspectionDb.close();
+    }
+  });
+
+  test('addressing revalidates final status when a guarded update loses to cancellation', async () => {
+    const message = await createMessage({
+      correlation_id: 'corr-address-stale-status',
+      idempotency_key: 'idem-address-stale-status',
+      task_type: 'agent_message',
+      sender: 'xo',
+      recipient: 'operator',
+      body: 'Stale status target.',
+    });
+    const acknowledged = {
+      ...message,
+      acknowledged_at: new Date().toISOString(),
+      acknowledged_by: 'operator',
+    };
+    const cancelled = { ...acknowledged, status: 'cancelled' as const };
+    const originalDb = db;
+    const updateSql: string[] = [];
+    let readCount = 0;
+    const query = async <T>(sql: string): Promise<{ rows: readonly T[]; rowCount: number }> => {
+      if (sql.startsWith('SELECT * FROM agent_dispatch_messages')) {
+        readCount += 1;
+        const row = readCount === 1 ? acknowledged : cancelled;
+        return { rows: [row as T], rowCount: 1 };
+      }
+      if (sql.startsWith('SELECT principal_id, delivery_mode, active')) {
+        return {
+          rows: [{ principal_id: 'operator', delivery_mode: 'drain_on_start', active: 1 } as T],
+          rowCount: 1,
+        };
+      }
+      if (sql.startsWith('UPDATE agent_dispatch_messages')) {
+        updateSql.push(sql);
+        return { rows: [], rowCount: 0 };
+      }
+      throw new Error(`Unexpected SQL: ${sql}`);
+    };
+    db = {
+      ...originalDb,
+      query,
+      withTransaction: async fn => fn(query),
+    } as SqliteAdapter;
+
+    try {
+      await expect(addressMessage({ id: message.id, principal_id: 'operator' })).resolves.toEqual({
+        ok: false,
+        reason: 'not_queued',
+      });
+      expect(updateSql[0]).toContain('LOWER(TRIM(COALESCE(resolved_recipient, recipient))) = $3');
+      expect(updateSql[0]).toContain("CAST(recipient_principal.active AS TEXT) IN ('1', 'true')");
+      expect(updateSql[0]).toContain("delivery_mode IN ('drain_on_start', 'notify_only')");
+    } finally {
+      db = originalDb;
+    }
+  });
+
+  test('returns address actor, mode, state, and existence conflict outcomes', async () => {
+    const mailbox = await createMessage({
+      correlation_id: 'corr-address-conflicts',
+      idempotency_key: 'idem-address-conflicts',
+      task_type: 'agent_message',
+      sender: 'xo',
+      recipient: 'operator',
+      body: 'Address conflict target.',
+    });
+    const worker = await createMessage({
+      correlation_id: 'corr-address-worker',
+      idempotency_key: 'idem-address-worker',
+      task_type: 'agent_message',
+      sender: 'xo',
+      recipient: 'codex',
+      body: 'Address worker target.',
+    });
+    const nonQueued = await createMessage({
+      correlation_id: 'corr-address-nonqueued',
+      idempotency_key: 'idem-address-nonqueued',
+      task_type: 'agent_message',
+      sender: 'xo',
+      recipient: 'operator',
+      body: 'Address non-queued target.',
+    });
+    await db.query("UPDATE agent_dispatch_messages SET status = 'done' WHERE id = $1", [
+      nonQueued.id,
+    ]);
+    expect((await acknowledgeMessage({ id: mailbox.id, principal_id: 'operator' })).ok).toBe(true);
+
+    await expect(addressMessage({ id: 'missing', principal_id: 'operator' })).resolves.toEqual({
+      ok: false,
+      reason: 'not_found',
+    });
+    await expect(addressMessage({ id: worker.id, principal_id: 'codex' })).resolves.toEqual({
+      ok: false,
+      reason: 'wrong_mode',
+    });
+    await expect(addressMessage({ id: nonQueued.id, principal_id: 'operator' })).resolves.toEqual({
+      ok: false,
+      reason: 'not_queued',
+    });
+    await expect(addressMessage({ id: mailbox.id, principal_id: 'xo' })).resolves.toEqual({
+      ok: false,
+      reason: 'wrong_recipient',
+    });
+    await db.query("UPDATE agent_dispatch_messages SET acknowledged_by = 'xo' WHERE id = $1", [
+      mailbox.id,
+    ]);
+    await expect(addressMessage({ id: mailbox.id, principal_id: 'operator' })).resolves.toEqual({
+      ok: false,
+      reason: 'actor_mismatch',
+    });
+  });
+
+  test('lists only due unaddressed queued work by priority while retaining historical queries', async () => {
+    const blocker = await createMessage({
+      correlation_id: 'corr-list-blocker',
+      idempotency_key: 'idem-list-blocker',
+      task_type: 'agent_message',
+      sender: 'xo',
+      recipient: 'operator',
+      body: 'Blocker.',
+      priority: 'blocker',
+    });
+    const normal = await createMessage({
+      correlation_id: 'corr-list-normal',
+      idempotency_key: 'idem-list-normal',
+      task_type: 'agent_message',
+      sender: 'xo',
+      recipient: 'operator',
+      body: 'Normal.',
+      priority: 'normal',
+    });
+    const heartbeat = await createMessage({
+      correlation_id: 'corr-list-heartbeat',
+      idempotency_key: 'idem-list-heartbeat',
+      task_type: 'run_report',
+      sender: 'xo',
+      recipient: 'operator',
+      body: 'Heartbeat.',
+      priority: 'heartbeat',
+    });
+    const future = await createMessage({
+      correlation_id: 'corr-list-future',
+      idempotency_key: 'idem-list-future',
+      task_type: 'agent_message',
+      sender: 'xo',
+      recipient: 'operator',
+      body: 'Future.',
+      not_before: new Date(Date.now() + 60_000).toISOString(),
+      priority: 'blocker',
+    });
+    const addressed = await createMessage({
+      correlation_id: 'corr-list-addressed',
+      idempotency_key: 'idem-list-addressed',
+      task_type: 'agent_message',
+      sender: 'xo',
+      recipient: 'operator',
+      body: 'Addressed.',
+      priority: 'blocker',
+    });
+    await acknowledgeMessage({ id: addressed.id, principal_id: 'operator' });
+    await addressMessage({ id: addressed.id, principal_id: 'operator' });
+    await acknowledgeMessage({ id: blocker.id, principal_id: 'operator' });
+    const historical = await createMessage({
+      correlation_id: 'corr-list-historical',
+      idempotency_key: 'idem-list-historical',
+      task_type: 'agent_message',
+      sender: 'xo',
+      recipient: 'operator',
+      body: 'Historical.',
+    });
+    await db.query("UPDATE agent_dispatch_messages SET status = 'done' WHERE id = $1", [
+      historical.id,
+    ]);
+
+    const queued = await listMessages({ recipient: 'operator', status: 'queued' });
+    expect(queued.map(message => message.id)).toEqual([blocker.id, normal.id, heartbeat.id]);
+    expect(queued.map(message => message.id)).not.toContain(future.id);
+    expect(queued.map(message => message.id)).not.toContain(addressed.id);
+    expect(
+      (await listMessages({ recipient: 'operator', status: 'done' })).map(message => message.id)
+    ).toContain(historical.id);
+  });
+
+  test('reports only queued concrete recipients that are missing or inactive without mutation', async () => {
+    const inactive = await createMessage({
+      correlation_id: 'corr-unroutable-inactive',
+      idempotency_key: 'idem-unroutable-inactive',
+      task_type: 'agent_message',
+      sender: 'xo',
+      recipient: 'operator',
+      body: 'Become inactive after enqueue.',
+      priority: 'blocker',
+    });
+    await db.query("UPDATE dispatch_principals SET active = 0 WHERE principal_id = 'operator'");
+    await db.query(
+      `INSERT INTO agent_dispatch_messages
+       (id, correlation_id, idempotency_key, task_type, sender, recipient, body, status, priority, created_at, fencing_token)
+       VALUES ('missing-recipient', 'corr-unroutable-missing', 'idem-unroutable-missing', 'agent_message', 'xo', 'missing', 'No body in report.', 'queued', 'normal', $1, 0)`,
+      [new Date().toISOString()]
+    );
+    const writes: string[] = [];
+    const query = async <T>(sql: string, params?: unknown[]) => {
+      writes.push(sql);
+      return db.query<T>(sql, params);
+    };
+
+    const rows = await listUnroutableQueuedMessages(query);
+
+    expect(rows).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ id: inactive.id, recipient: 'operator', priority: 'blocker' }),
+        expect.objectContaining({
+          id: 'missing-recipient',
+          recipient: 'missing',
+          priority: 'normal',
+        }),
+      ])
+    );
+    expect(writes).toHaveLength(1);
+    expect(writes[0]).toStartWith('SELECT');
+  });
+
+  test('uses a PostgreSQL-compatible inactive-principal predicate for unroutable reporting', async () => {
+    const queries: string[] = [];
+    const rows = await listUnroutableQueuedMessages(async <T>(sql: string) => {
+      queries.push(sql);
+      return { rows: [], rowCount: 0 } as { rows: readonly T[]; rowCount: number };
+    });
+
+    expect(rows).toEqual([]);
+    expect(queries[0]).toContain("CAST(principal.active AS TEXT) IN ('0', 'false')");
   });
 
   test('rejects stale fencing token result after lease expiry and reclaim', async () => {
@@ -381,7 +1380,7 @@ describe('dispatch db', () => {
     });
 
     const listed = await import('./dispatch').then(module =>
-      module.listMessages({ recipient: 'claude', status: 'queued', allowBoardAlias: true })
+      module.listMessages({ recipient: ' Claude ', status: 'queued', allowBoardAlias: true })
     );
     expect(listed.map(item => item.id)).toContain(message.id);
 

@@ -215,6 +215,7 @@ import {
 import {
   claimDispatchMessageBodySchema,
   createDispatchMessageBodySchema,
+  dispatchMailboxPrincipalBodySchema,
   dispatchMessageIdParamsSchema,
   dispatchMessageListResponseSchema,
   dispatchMessageSchema,
@@ -662,6 +663,52 @@ const postDispatchResultRoute = createRoute({
       description: 'Completed dispatch message',
     },
     409: jsonError('Stale fencing token or cancelled message'),
+    500: jsonError('Server error'),
+  },
+});
+
+const acknowledgeDispatchMessageRoute = createRoute({
+  method: 'post',
+  path: '/api/dispatch/messages/{id}/ack',
+  tags: ['Dispatch'],
+  summary: 'Acknowledge a mailbox dispatch message',
+  request: {
+    params: dispatchMessageIdParamsSchema,
+    body: {
+      content: { 'application/json': { schema: dispatchMailboxPrincipalBodySchema } },
+      required: true,
+    },
+  },
+  responses: {
+    200: {
+      content: { 'application/json': { schema: dispatchMessageSchema } },
+      description: 'Acknowledged dispatch message',
+    },
+    404: jsonError('Dispatch message not found'),
+    409: jsonError('Dispatch mailbox lifecycle conflict'),
+    500: jsonError('Server error'),
+  },
+});
+
+const addressDispatchMessageRoute = createRoute({
+  method: 'post',
+  path: '/api/dispatch/messages/{id}/address',
+  tags: ['Dispatch'],
+  summary: 'Address an acknowledged mailbox dispatch message',
+  request: {
+    params: dispatchMessageIdParamsSchema,
+    body: {
+      content: { 'application/json': { schema: dispatchMailboxPrincipalBodySchema } },
+      required: true,
+    },
+  },
+  responses: {
+    200: {
+      content: { 'application/json': { schema: dispatchMessageSchema } },
+      description: 'Addressed dispatch message',
+    },
+    404: jsonError('Dispatch message not found'),
+    409: jsonError('Dispatch mailbox lifecycle conflict'),
     500: jsonError('Server error'),
   },
 });
@@ -3271,7 +3318,8 @@ export function registerApiRoutes(
       if (!assessment.allowed) {
         return apiError(c, 400, assessment.reason ?? 'dispatch_message_body_rejected');
       }
-      if (body.task_type === 'board_motion') {
+      const canonicalBody = { ...body, recipient: body.recipient.trim().toLowerCase() };
+      if (canonicalBody.task_type === 'board_motion') {
         const principal = await boardAuthorityDb.authenticateBoardPrincipal(
           boardPrincipalProofFromHeaders(c)
         );
@@ -3279,9 +3327,9 @@ export function registerApiRoutes(
           return apiError(c, 403, 'board_motion_notifier_required');
         }
         const pointer = await validateBoardMotionPointer(parseDispatchJsonBody(body.body));
-        const canonicalBody = JSON.stringify(pointer.payload);
+        const canonicalMotionBody = JSON.stringify(pointer.payload);
         const message = await dispatchDb.createMessage({
-          correlation_id: body.correlation_id,
+          correlation_id: canonicalBody.correlation_id,
           idempotency_key: deriveBoardMotionNotificationKey({
             motion_id: pointer.payload.motion_id,
             motion_revision_sha: pointer.motion_revision_sha,
@@ -3289,8 +3337,9 @@ export function registerApiRoutes(
           task_type: 'board_motion',
           sender: principal.principal_id,
           recipient: 'board',
-          body: canonicalBody,
-          not_before: body.not_before ?? null,
+          body: canonicalMotionBody,
+          not_before: canonicalBody.not_before ?? null,
+          priority: canonicalBody.priority,
           recipient_alias: 'board',
           motion_id: pointer.payload.motion_id,
           motion_revision_sha: pointer.motion_revision_sha,
@@ -3310,7 +3359,7 @@ export function registerApiRoutes(
         });
         return c.json(message);
       }
-      if (body.task_type === 'agent_message' && body.recipient === 'board') {
+      if (canonicalBody.task_type === 'agent_message' && canonicalBody.recipient === 'board') {
         const principal = await boardAuthorityDb.authenticateBoardPrincipal(
           boardPrincipalProofFromHeaders(c)
         );
@@ -3320,14 +3369,14 @@ export function registerApiRoutes(
         const petitionBody = parseDispatchJsonBody(body.body);
         const petition = await validateBoardPetitionPointer(petitionBody);
         const message = await dispatchDb.createMessage({
-          ...body,
+          ...canonicalBody,
           sender: principal.principal_id,
           body: JSON.stringify({
             motion_id: petition.motion_id,
             file_path: petition.file_path,
             requested_action: petition.requested_action,
           }),
-          not_before: body.not_before ?? null,
+          not_before: canonicalBody.not_before ?? null,
           recipient_alias: 'board',
           motion_id: petition.motion_id,
           motion_revision_sha: petition.motion_revision_sha,
@@ -3341,13 +3390,16 @@ export function registerApiRoutes(
         return c.json(message);
       }
       const message = await dispatchDb.createMessage({
-        ...body,
-        not_before: body.not_before ?? null,
+        ...canonicalBody,
+        not_before: canonicalBody.not_before ?? null,
       });
       return c.json(message);
     } catch (error) {
       if (isBoardPrincipalAuthError(error)) return apiError(c, 401, (error as Error).message);
       if (error instanceof Error && error.message.startsWith('dispatch_json_body_invalid')) {
+        return apiError(c, 400, error.message);
+      }
+      if (error instanceof Error && error.message.startsWith('dispatch_recipient_rejected:')) {
         return apiError(c, 400, error.message);
       }
       if (error instanceof Error && error.message.includes('invalid')) {
@@ -3417,6 +3469,40 @@ export function registerApiRoutes(
       }
       getLog().error({ err: error }, 'dispatch_claim_message_failed');
       return apiError(c, 500, 'Failed to claim dispatch message');
+    }
+  });
+
+  registerOpenApiRoute(acknowledgeDispatchMessageRoute, async c => {
+    try {
+      const body = getValidatedBody(c, dispatchMailboxPrincipalBodySchema);
+      const result = await dispatchDb.acknowledgeMessage({
+        id: c.req.param('id') ?? '',
+        principal_id: body.principal_id,
+      });
+      if (!result.ok) {
+        return apiError(c, result.reason === 'not_found' ? 404 : 409, result.reason);
+      }
+      return c.json(result.message);
+    } catch (error) {
+      getLog().error({ err: error }, 'dispatch_acknowledge_message_failed');
+      return apiError(c, 500, 'Failed to acknowledge dispatch message');
+    }
+  });
+
+  registerOpenApiRoute(addressDispatchMessageRoute, async c => {
+    try {
+      const body = getValidatedBody(c, dispatchMailboxPrincipalBodySchema);
+      const result = await dispatchDb.addressMessage({
+        id: c.req.param('id') ?? '',
+        principal_id: body.principal_id,
+      });
+      if (!result.ok) {
+        return apiError(c, result.reason === 'not_found' ? 404 : 409, result.reason);
+      }
+      return c.json(result.message);
+    } catch (error) {
+      getLog().error({ err: error }, 'dispatch_address_message_failed');
+      return apiError(c, 500, 'Failed to address dispatch message');
     }
   });
 

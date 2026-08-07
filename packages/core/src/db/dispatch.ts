@@ -2,6 +2,7 @@ import { randomUUID } from 'crypto';
 import { createLogger } from '@archon/paths';
 import { getDatabase } from './connection';
 import { appendBoardAuditEvent, resolveBoardRecipient } from './board-authority';
+import type { QueryResult } from './adapters/types';
 
 const log = createLogger('db/dispatch');
 
@@ -13,6 +14,14 @@ export type DispatchTaskType =
   | 'board_motion';
 export type DispatchMessageStatus = 'queued' | 'claimed' | 'done' | 'failed' | 'cancelled';
 export type DispatchWorkerStatus = 'available' | 'unavailable';
+export type DispatchMessagePriority = 'blocker' | 'normal' | 'heartbeat';
+export type DispatchTaskOutcome = 'succeeded' | 'failed' | 'blocked';
+export type DispatchRouteDisposition = 'unroutable' | 'superseded';
+export type DispatchDeliveryMode =
+  | 'worker_poll'
+  | 'drain_on_start'
+  | 'alias_resolved'
+  | 'notify_only';
 
 export interface DispatchMessage {
   id: string;
@@ -38,6 +47,17 @@ export interface DispatchMessage {
   resolved_xo_lease_id: string | null;
   resolved_xo_fencing_token: number | null;
   resolved_at: string | null;
+  priority: DispatchMessagePriority;
+  task_outcome: DispatchTaskOutcome | null;
+  acknowledged_at: string | null;
+  acknowledged_by: string | null;
+  addressed_at: string | null;
+  addressed_by: string | null;
+  escalated_tg_at: string | null;
+  escalated_sms_at: string | null;
+  subject_key: string | null;
+  route_disposition: DispatchRouteDisposition | null;
+  supersedes_id: string | null;
 }
 
 export interface DispatchWorker {
@@ -61,6 +81,49 @@ interface DispatchMessageRow extends Omit<
 interface DispatchWorkerRow extends Omit<DispatchWorker, 'capabilities'> {
   capabilities: unknown;
 }
+
+interface DispatchPrincipalRow {
+  principal_id: string;
+  delivery_mode: DispatchDeliveryMode;
+  active: boolean | number;
+}
+
+export type DispatchRecipientAssessment =
+  | {
+      ok: true;
+      canonical_principal: string;
+      delivery_mode: DispatchDeliveryMode;
+      reason: null;
+    }
+  | {
+      ok: false;
+      canonical_principal: string;
+      delivery_mode: DispatchDeliveryMode | null;
+      reason: 'missing_principal' | 'inactive_principal';
+    };
+
+export type DispatchMailboxResult =
+  | { ok: true; message: DispatchMessage }
+  | {
+      ok: false;
+      reason:
+        | 'not_found'
+        | 'wrong_mode'
+        | 'wrong_recipient'
+        | 'not_queued'
+        | 'address_before_ack'
+        | 'actor_mismatch';
+    };
+
+export interface UnroutableQueuedDispatchMessage {
+  id: string;
+  recipient: string;
+  task_type: DispatchTaskType;
+  priority: DispatchMessagePriority;
+  created_at: string;
+}
+
+export type DispatchQueryExecutor = <T>(sql: string, params?: unknown[]) => Promise<QueryResult<T>>;
 
 export const DEFAULT_WORKER_STALE_AFTER_MS = 120_000;
 const DEFAULT_LEASE_DURATION_MS = 300_000;
@@ -91,6 +154,61 @@ function normalizeMessage(row: DispatchMessageRow): DispatchMessage {
         ? null
         : Number(row.resolved_xo_fencing_token),
     resolved_at: normalizeNullableTimestamp(row.resolved_at),
+    acknowledged_at: normalizeNullableTimestamp(row.acknowledged_at),
+    addressed_at: normalizeNullableTimestamp(row.addressed_at),
+    escalated_tg_at: normalizeNullableTimestamp(row.escalated_tg_at),
+    escalated_sms_at: normalizeNullableTimestamp(row.escalated_sms_at),
+  };
+}
+
+function canonicalizePrincipal(principal: string): string {
+  return principal.trim().toLowerCase();
+}
+
+function isActivePrincipal(row: DispatchPrincipalRow): boolean {
+  return row.active === true || row.active === 1;
+}
+
+async function getDispatchPrincipal(
+  query: DispatchQueryExecutor,
+  principalId: string
+): Promise<DispatchPrincipalRow | null> {
+  const result = await query<DispatchPrincipalRow>(
+    'SELECT principal_id, delivery_mode, active FROM dispatch_principals WHERE principal_id = $1',
+    [principalId]
+  );
+  return result.rows[0] ?? null;
+}
+
+export async function assessDispatchRecipient(
+  recipient: string
+): Promise<DispatchRecipientAssessment> {
+  const canonicalPrincipal = canonicalizePrincipal(recipient);
+  const principal = await getDispatchPrincipal(
+    (sql, params) => getDatabase().query(sql, params),
+    canonicalPrincipal
+  );
+  if (!principal) {
+    return {
+      ok: false,
+      canonical_principal: canonicalPrincipal,
+      delivery_mode: null,
+      reason: 'missing_principal',
+    };
+  }
+  if (!isActivePrincipal(principal)) {
+    return {
+      ok: false,
+      canonical_principal: canonicalPrincipal,
+      delivery_mode: principal.delivery_mode,
+      reason: 'inactive_principal',
+    };
+  }
+  return {
+    ok: true,
+    canonical_principal: canonicalPrincipal,
+    delivery_mode: principal.delivery_mode,
+    reason: null,
   };
 }
 
@@ -143,17 +261,33 @@ export async function createMessage(data: {
   recipient: string;
   body: string;
   not_before?: string | null;
+  priority?: DispatchMessagePriority;
   recipient_alias?: 'board' | null;
   motion_id?: string | null;
   motion_revision_sha?: string | null;
 }): Promise<DispatchMessage> {
   const db = getDatabase();
+  const existing = await db.query<DispatchMessageRow>(
+    'SELECT * FROM agent_dispatch_messages WHERE idempotency_key = $1',
+    [data.idempotency_key]
+  );
+  const existingRow = existing.rows[0];
+  if (existingRow) return normalizeMessage(existingRow);
+
+  const recipientAssessment = await assessDispatchRecipient(data.recipient);
+  if (!recipientAssessment.ok) {
+    throw new Error(`dispatch_recipient_rejected:${recipientAssessment.reason}`);
+  }
+  if (recipientAssessment.canonical_principal === 'board' && data.recipient_alias !== 'board') {
+    throw new Error('dispatch_recipient_rejected:board_alias_metadata_required');
+  }
+
   const now = nowIso();
   const result = await db.query<DispatchMessageRow>(
     `INSERT INTO agent_dispatch_messages
-     (id, correlation_id, idempotency_key, task_type, sender, recipient, body, status, created_at, not_before, fencing_token,
+     (id, correlation_id, idempotency_key, task_type, sender, recipient, body, status, created_at, not_before, priority, fencing_token,
       recipient_alias, motion_id, motion_revision_sha)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, 'queued', $8, $9, 0, $10, $11, $12)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, 'queued', $8, $9, $10, 0, $11, $12, $13)
      ON CONFLICT (idempotency_key) DO UPDATE SET idempotency_key = EXCLUDED.idempotency_key
      RETURNING *`,
     [
@@ -162,10 +296,11 @@ export async function createMessage(data: {
       data.idempotency_key,
       data.task_type,
       data.sender,
-      data.recipient,
+      recipientAssessment.canonical_principal,
       data.body,
       now,
       data.not_before ?? null,
+      data.priority ?? 'normal',
       data.recipient_alias ?? null,
       data.motion_id ?? null,
       data.motion_revision_sha ?? null,
@@ -194,11 +329,12 @@ export async function listMessages(filters: {
   const clauses: string[] = [];
   const params: unknown[] = [];
   if (filters.recipient) {
-    params.push(filters.recipient);
+    const canonicalRecipient = canonicalizePrincipal(filters.recipient);
+    params.push(canonicalRecipient);
     const recipientParam = `$${params.length}`;
     if (filters.allowBoardAlias) {
       const resolved = await resolveDispatchRecipient('board');
-      if (resolved.ok && resolved.recipient === filters.recipient) {
+      if (resolved.ok && resolved.recipient === canonicalRecipient) {
         clauses.push(
           `(recipient = ${recipientParam} OR (recipient_alias = 'board' AND status = 'queued'))`
         );
@@ -216,10 +352,19 @@ export async function listMessages(filters: {
     params.push(filters.status);
     clauses.push(`status = $${params.length}`);
   }
+  if (filters.status === 'queued') {
+    params.push(nowIso());
+    clauses.push(`(not_before IS NULL OR not_before <= $${params.length})`);
+    clauses.push('addressed_at IS NULL');
+  }
   params.push(Math.max(1, Math.min(filters.limit ?? 100, 500)));
   const where = clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : '';
+  const order =
+    filters.status === 'queued'
+      ? "ORDER BY CASE priority WHEN 'blocker' THEN 0 WHEN 'normal' THEN 1 ELSE 2 END, created_at ASC"
+      : 'ORDER BY created_at ASC';
   const result = await getDatabase().query<DispatchMessageRow>(
-    `SELECT * FROM agent_dispatch_messages ${where} ORDER BY created_at ASC LIMIT $${params.length}`,
+    `SELECT * FROM agent_dispatch_messages ${where} ${order} LIMIT $${params.length}`,
     params
   );
   return result.rows.map(normalizeMessage);
@@ -422,6 +567,31 @@ export async function claimMessage(data: {
       };
     }
 
+    const addressedPrincipalId = canonicalizePrincipal(current.recipient);
+    const addressedPrincipal = await getDispatchPrincipal(txQuery, addressedPrincipalId);
+    const addressedMode = current.recipient_alias === 'board' ? 'alias_resolved' : 'worker_poll';
+    if (
+      !addressedPrincipal ||
+      !isActivePrincipal(addressedPrincipal) ||
+      addressedPrincipal.delivery_mode !== addressedMode
+    ) {
+      return null;
+    }
+    const effectivePrincipalId = canonicalizePrincipal(
+      resolvedRecipient?.principal_id ?? current.resolved_recipient ?? current.recipient
+    );
+    const effectivePrincipal =
+      effectivePrincipalId === addressedPrincipalId
+        ? addressedPrincipal
+        : await getDispatchPrincipal(txQuery, effectivePrincipalId);
+    if (
+      !effectivePrincipal ||
+      !isActivePrincipal(effectivePrincipal) ||
+      effectivePrincipal.delivery_mode !== 'worker_poll'
+    ) {
+      return null;
+    }
+
     await txQuery(
       `UPDATE agent_dispatch_messages
        SET status = 'claimed',
@@ -475,6 +645,199 @@ export async function claimMessage(data: {
     }
     return claimedRow ? normalizeMessage(claimedRow) : null;
   });
+}
+
+function isMailboxDeliveryMode(mode: DispatchDeliveryMode | undefined): boolean {
+  return mode === 'drain_on_start' || mode === 'notify_only';
+}
+
+async function readMessageInTransaction(
+  query: DispatchQueryExecutor,
+  id: string
+): Promise<DispatchMessage | null> {
+  const result = await query<DispatchMessageRow>(
+    'SELECT * FROM agent_dispatch_messages WHERE id = $1',
+    [id]
+  );
+  const row = result.rows[0];
+  return row ? normalizeMessage(row) : null;
+}
+
+async function validateMailboxActor(
+  query: DispatchQueryExecutor,
+  message: DispatchMessage,
+  principalId: string
+): Promise<Exclude<DispatchMailboxResult, { ok: true }> | null> {
+  const resolvedRecipient = canonicalizePrincipal(message.resolved_recipient ?? message.recipient);
+  if (resolvedRecipient !== principalId) return { ok: false, reason: 'wrong_recipient' };
+  const recipientPrincipal = await getDispatchPrincipal(query, resolvedRecipient);
+  if (
+    !recipientPrincipal ||
+    !isActivePrincipal(recipientPrincipal) ||
+    !isMailboxDeliveryMode(recipientPrincipal.delivery_mode)
+  ) {
+    return { ok: false, reason: 'wrong_mode' };
+  }
+  if (message.status !== 'queued') return { ok: false, reason: 'not_queued' };
+  return null;
+}
+
+function isRetriableMailboxTransactionError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  return (
+    error.message.includes('cannot start a transaction within a transaction') ||
+    error.message.includes('database is locked') ||
+    error.message.includes('SQLITE_BUSY')
+  );
+}
+
+async function withRetriedMailboxTransaction<T>(fn: () => Promise<T>): Promise<T> {
+  const maxAttempts = 3;
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      return await fn();
+    } catch (error) {
+      if (!isRetriableMailboxTransactionError(error) || attempt === maxAttempts) throw error;
+      await Bun.sleep(attempt * 10);
+    }
+  }
+  throw new Error('mailbox_transaction_retry_exhausted');
+}
+
+export async function acknowledgeMessage(data: {
+  id: string;
+  principal_id: string;
+}): Promise<DispatchMailboxResult> {
+  const db = getDatabase();
+  const principalId = canonicalizePrincipal(data.principal_id);
+  const now = nowIso();
+  return withRetriedMailboxTransaction(() =>
+    db.withTransaction(async txQuery => {
+      const message = await readMessageInTransaction(txQuery, data.id);
+      if (!message) return { ok: false, reason: 'not_found' };
+      const invalid = await validateMailboxActor(txQuery, message, principalId);
+      if (invalid) return invalid;
+      if (message.acknowledged_by !== null) {
+        return message.acknowledged_by === principalId
+          ? { ok: true, message }
+          : { ok: false, reason: 'actor_mismatch' };
+      }
+
+      const update = await txQuery(
+        `UPDATE agent_dispatch_messages
+       SET acknowledged_at = $2,
+           acknowledged_by = $3
+       WHERE id = $1
+         AND status = 'queued'
+         AND acknowledged_at IS NULL
+         AND acknowledged_by IS NULL
+         AND LOWER(TRIM(COALESCE(resolved_recipient, recipient))) = $3
+         AND EXISTS (
+           SELECT 1
+           FROM dispatch_principals AS recipient_principal
+           WHERE recipient_principal.principal_id = LOWER(TRIM(COALESCE(resolved_recipient, recipient)))
+             AND CAST(recipient_principal.active AS TEXT) IN ('1', 'true')
+             AND recipient_principal.delivery_mode IN ('drain_on_start', 'notify_only')
+         )`,
+        [data.id, now, principalId]
+      );
+      const finalMessage = await readMessageInTransaction(txQuery, data.id);
+      if (!finalMessage) return { ok: false, reason: 'not_found' };
+      const finalInvalid = await validateMailboxActor(txQuery, finalMessage, principalId);
+      if (finalInvalid) return finalInvalid;
+      if (finalMessage.acknowledged_by === principalId) return { ok: true, message: finalMessage };
+      if (update.rowCount === 0 && finalMessage.acknowledged_by === null) {
+        return { ok: false, reason: 'actor_mismatch' };
+      }
+      return { ok: false, reason: 'actor_mismatch' };
+    })
+  );
+}
+
+export async function addressMessage(data: {
+  id: string;
+  principal_id: string;
+}): Promise<DispatchMailboxResult> {
+  const db = getDatabase();
+  const principalId = canonicalizePrincipal(data.principal_id);
+  const now = nowIso();
+  return withRetriedMailboxTransaction(() =>
+    db.withTransaction(async txQuery => {
+      const message = await readMessageInTransaction(txQuery, data.id);
+      if (!message) return { ok: false, reason: 'not_found' };
+      const invalid = await validateMailboxActor(txQuery, message, principalId);
+      if (invalid) return invalid;
+      if (message.acknowledged_by === null) return { ok: false, reason: 'address_before_ack' };
+      if (message.acknowledged_by !== principalId) return { ok: false, reason: 'actor_mismatch' };
+      if (message.addressed_by !== null) {
+        return message.addressed_by === principalId
+          ? { ok: true, message }
+          : { ok: false, reason: 'actor_mismatch' };
+      }
+
+      const update = await txQuery(
+        `UPDATE agent_dispatch_messages
+       SET addressed_at = $2,
+           addressed_by = $3
+       WHERE id = $1
+         AND status = 'queued'
+         AND acknowledged_by = $3
+         AND addressed_at IS NULL
+         AND addressed_by IS NULL
+         AND LOWER(TRIM(COALESCE(resolved_recipient, recipient))) = $3
+         AND EXISTS (
+           SELECT 1
+           FROM dispatch_principals AS recipient_principal
+           WHERE recipient_principal.principal_id = LOWER(TRIM(COALESCE(resolved_recipient, recipient)))
+             AND CAST(recipient_principal.active AS TEXT) IN ('1', 'true')
+             AND recipient_principal.delivery_mode IN ('drain_on_start', 'notify_only')
+         )`,
+        [data.id, now, principalId]
+      );
+      const finalMessage = await readMessageInTransaction(txQuery, data.id);
+      if (!finalMessage) return { ok: false, reason: 'not_found' };
+      const finalInvalid = await validateMailboxActor(txQuery, finalMessage, principalId);
+      if (finalInvalid) return finalInvalid;
+      if (finalMessage.acknowledged_by !== principalId) {
+        return { ok: false, reason: 'actor_mismatch' };
+      }
+      if (finalMessage.addressed_by === principalId) return { ok: true, message: finalMessage };
+      if (update.rowCount === 0 && finalMessage.addressed_by === null) {
+        return { ok: false, reason: 'actor_mismatch' };
+      }
+      return { ok: false, reason: 'actor_mismatch' };
+    })
+  );
+}
+
+interface UnroutableQueuedDispatchMessageRow extends Omit<
+  UnroutableQueuedDispatchMessage,
+  'created_at'
+> {
+  created_at: unknown;
+}
+
+export async function listUnroutableQueuedMessages(
+  query?: DispatchQueryExecutor
+): Promise<UnroutableQueuedDispatchMessage[]> {
+  const execute =
+    query ??
+    (<T>(sql: string, params?: unknown[]): Promise<QueryResult<T>> =>
+      getDatabase().query<T>(sql, params));
+  const result = await execute<UnroutableQueuedDispatchMessageRow>(
+    `SELECT message.id, message.recipient, message.task_type, message.priority, message.created_at
+     FROM agent_dispatch_messages AS message
+     LEFT JOIN dispatch_principals AS principal
+       ON principal.principal_id = LOWER(TRIM(message.recipient))
+     WHERE message.status = 'queued'
+       AND message.recipient_alias IS NULL
+       AND (principal.principal_id IS NULL OR CAST(principal.active AS TEXT) IN ('0', 'false'))
+     ORDER BY message.created_at ASC`
+  );
+  return result.rows.map(row => ({
+    ...row,
+    created_at: normalizeTimestamp(row.created_at),
+  }));
 }
 
 export async function postResult(data: {
