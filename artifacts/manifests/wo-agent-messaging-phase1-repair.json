@@ -1,0 +1,34 @@
+{
+  "wo": "agent-messaging-phase1-repair",
+  "builder": "Opus autonomous repair pass",
+  "branch_prerequisite": {
+    "branch": "archon/thread-bef905f9",
+    "starting_sha": "bf26f8b9e6f093333c5b0c15545139793e2ac7cd",
+    "phase_0_present": true,
+    "phase_1_present_before_repair": false,
+    "evidence": "migrations/040_agent_messaging_phase0.sql and packages/core/src/db/dispatch.ts exist; packages/server/src/dispatch did not exist"
+  },
+  "baseline_failure": "The pre-repair worktree had no notifiers.ts, escalation-clock.ts, related tests, or repair manifest; the prior captured diff was empty.",
+  "files_created": [
+    "packages/server/src/dispatch/notifiers.ts",
+    "packages/server/src/dispatch/notifiers.test.ts",
+    "packages/server/src/dispatch/escalation-clock.ts",
+    "packages/server/src/dispatch/escalation-clock.test.ts",
+    "artifacts/manifests/wo-agent-messaging-phase1-repair.json"
+  ],
+  "tests": {
+    "command": "bun test packages/server/src/dispatch/notifiers.test.ts packages/server/src/dispatch/escalation-clock.test.ts",
+    "result": "5 passed, 0 failed, 100% line and function coverage for both new source modules",
+    "required_scenarios": [
+      "success",
+      "flag-alone-insufficient",
+      "auth-mode-alone-insufficient",
+      "non-XO-blocker-never-pages-John",
+      "4h/24h-regression"
+    ]
+  },
+  "runtime_verification": "N/A - pure gate and clock logic; no server startup wiring or external notification send is introduced by this repair.",
+  "vercel_deployment": "N/A",
+  "typecheck": "Not run: the repository's tsc launcher requires node, which is absent from this build image. Bun successfully compiled and executed both TypeScript test modules.",
+  "validation": "PASS"
+}
