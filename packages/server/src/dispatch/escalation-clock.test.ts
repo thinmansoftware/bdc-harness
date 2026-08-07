@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test';
+import * as dispatchDb from '@archon/core/db/dispatch';
 
 type Candidate = {
   id: string;
@@ -12,6 +13,7 @@ const calls = { notices: 0, handoffs: 0, list: 0, claim: 0, release: 0 };
 let candidates: Candidate[] = [];
 let listBarrier: Promise<void> | null = null;
 mock.module('@archon/core/db/dispatch', () => ({
+  ...dispatchDb,
   reconcileDispatchOutcomeNotices: async () => {
     calls.notices++;
     return 0;
