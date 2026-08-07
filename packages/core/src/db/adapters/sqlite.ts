@@ -1404,7 +1404,60 @@ export class SqliteAdapter implements IDatabase {
         updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
       );
 
+      -- Taskmaster Slice 1 (WO-HARNESS-TASKMASTER-SLICE1-01, M-133). Additive.
+      -- Postgres companion: migrations/041_taskmaster_slice1.sql.
+      CREATE TABLE IF NOT EXISTS tm_journal (
+        id TEXT PRIMARY KEY,
+        created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+        thread_ref TEXT NOT NULL,
+        action_type TEXT NOT NULL,
+        proposal_json TEXT NOT NULL,
+        idempotency_key TEXT NOT NULL UNIQUE,
+        before_hash TEXT,
+        proof_predicate TEXT,
+        proof_deadline_at TEXT,
+        outcome TEXT NOT NULL DEFAULT 'proposed',
+        graded_at TEXT,
+        grade TEXT
+      );
+
+      CREATE TABLE IF NOT EXISTS tm_control (
+        id INTEGER PRIMARY KEY,
+        pause_state TEXT NOT NULL DEFAULT 'RUNNING',
+        pause_scope TEXT,
+        pause_reason TEXT,
+        pause_actor TEXT,
+        epoch INTEGER NOT NULL DEFAULT 0,
+        updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+      );
+
+      INSERT OR IGNORE INTO tm_control (id, pause_state, epoch) VALUES (1, 'RUNNING', 0);
+
+      CREATE TABLE IF NOT EXISTS tm_health (
+        provider TEXT NOT NULL,
+        state TEXT NOT NULL,
+        sampled_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+        expires_at TEXT,
+        evidence TEXT,
+        PRIMARY KEY (provider, sampled_at)
+      );
+
+      CREATE TABLE IF NOT EXISTS tm_usage_sample (
+        id TEXT PRIMARY KEY,
+        provider TEXT,
+        window_kind TEXT,
+        source TEXT,
+        observed_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+        value_json TEXT,
+        confidence TEXT,
+        is_unknown INTEGER NOT NULL DEFAULT 0
+      );
+
       -- Indexes
+      CREATE INDEX IF NOT EXISTS idx_tm_journal_thread_created ON tm_journal(thread_ref, created_at);
+      CREATE INDEX IF NOT EXISTS idx_tm_journal_outcome ON tm_journal(outcome, created_at);
+      CREATE INDEX IF NOT EXISTS idx_tm_health_provider_sampled ON tm_health(provider, sampled_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_tm_usage_sample_observed ON tm_usage_sample(observed_at DESC);
       CREATE UNIQUE INDEX IF NOT EXISTS uq_overseer_verdicts_run_head ON overseer_verdicts(run_id, head_sha);
       CREATE INDEX IF NOT EXISTS idx_overseer_verdicts_status ON overseer_verdicts(status, created_at);
       CREATE INDEX IF NOT EXISTS idx_codebase_env_vars_codebase_id ON remote_agent_codebase_env_vars(codebase_id);

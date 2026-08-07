@@ -25,6 +25,7 @@ export * as overseerDb from './overseer';
 export * as mergeStewardDb from './merge-steward';
 export * as overseerCapabilityDb from './overseer-capabilities';
 export * as overseerBriefingDb from './overseer-briefing';
+export * as taskmasterDb from './taskmaster';
 
 // Also export individual functions for direct imports
 export * from './conversations';
@@ -38,3 +39,4 @@ export * from './known-bad-bindings';
 export * from './overseer';
 export * from './overseer-capabilities';
 export * from './overseer-briefing';
+export * from './taskmaster';

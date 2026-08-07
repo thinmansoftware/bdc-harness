@@ -53,6 +53,12 @@ import type { WorkflowDefinition } from '@archon/workflows/schemas/workflow';
 import { executeWorkflow } from '@archon/workflows/executor';
 import { checkCodexDispatchGate } from '@archon/providers/auth-refresh/dispatch-gate';
 import { processDueProviderWaits } from '@archon/workflows/reliability/wait-scheduler';
+import {
+  getPauseState as getTaskmasterPauseState,
+  setPauseState as setTaskmasterPauseState,
+} from '@archon/core/db';
+import { startTaskmaster } from '../taskmaster/loop';
+import { getLastHeartbeat, tickHealth } from '../taskmaster/deadman';
 import { resolveWorkflowProbeBindings } from '@archon/workflows/reliability/resolve-binding';
 import { getLoaderErrors, parseWorkflow } from '@archon/workflows/loader';
 import { isValidCommandName } from '@archon/workflows/command-validation';
@@ -1635,6 +1641,67 @@ const getAdminThrottleRoute = createRoute({
   },
 });
 
+const taskmasterStatusResponseSchema = z.object({
+  success: z.boolean(),
+  tick_health: z.enum(['healthy', 'degraded']),
+  pause_state: z.enum(['RUNNING', 'PAUSED', 'HARD_PAUSE']),
+  epoch: z.number(),
+  last_heartbeat_at: z.number().nullable(),
+  interval_ms: z.number(),
+});
+
+const taskmasterPauseBodySchema = z
+  .object({ reason: z.string().optional(), scope: z.string().optional() })
+  .optional();
+
+const getTaskmasterStatusRoute = createRoute({
+  method: 'get',
+  path: '/api/taskmaster/status',
+  tags: ['Taskmaster'],
+  summary: 'Read Taskmaster loop status (tick health, pause state, epoch)',
+  responses: {
+    200: {
+      content: { 'application/json': { schema: taskmasterStatusResponseSchema } },
+      description: 'Taskmaster status',
+    },
+    500: jsonError('Server error'),
+  },
+});
+
+const pauseTaskmasterRoute = createRoute({
+  method: 'post',
+  path: '/api/taskmaster/pause',
+  tags: ['Taskmaster'],
+  summary: 'Pause Taskmaster effects (operator-triggered; monitoring + P0 escalation stay alive)',
+  request: {
+    body: {
+      content: { 'application/json': { schema: taskmasterPauseBodySchema } },
+      required: false,
+    },
+  },
+  responses: {
+    200: {
+      content: { 'application/json': { schema: taskmasterStatusResponseSchema } },
+      description: 'Paused',
+    },
+    500: jsonError('Server error'),
+  },
+});
+
+const resumeTaskmasterRoute = createRoute({
+  method: 'post',
+  path: '/api/taskmaster/resume',
+  tags: ['Taskmaster'],
+  summary: 'Resume Taskmaster (operator-only; increments pause epoch, expiring stale proposals)',
+  responses: {
+    200: {
+      content: { 'application/json': { schema: taskmasterStatusResponseSchema } },
+      description: 'Resumed',
+    },
+    500: jsonError('Server error'),
+  },
+});
+
 const adminDrainRoute = createRoute({
   method: 'post',
   path: '/api/admin/drain',
@@ -2943,6 +3010,10 @@ export function registerApiRoutes(
     providerWaitSchedulerTimer.unref?.();
     void tick();
   }
+
+  // Always-on Taskmaster loop (WO-HARNESS-TASKMASTER-SLICE1-01, M-133). Clones the
+  // provider-wait scheduler pattern; TASKMASTER_INTERVAL_MS=0 keeps it KILLED.
+  startTaskmaster();
 
   // GET /api/conversations - List conversations
   registerOpenApiRoute(getConversationsRoute, async c => {
@@ -4944,6 +5015,80 @@ export function registerApiRoutes(
     } catch (error) {
       getLog().error({ err: error }, 'get_admin_drain_api_failed');
       return apiError(c, 500, 'Failed to read drain state');
+    }
+  });
+
+  // Taskmaster control surface (operator-token authed via the /api/* middleware).
+  function taskmasterIntervalMs(): number {
+    const parsed = Number.parseInt(process.env.TASKMASTER_INTERVAL_MS ?? '', 10);
+    return Number.isInteger(parsed) && parsed > 0 ? parsed : 60_000;
+  }
+
+  // GET /api/taskmaster/status - tick health + pause state + epoch.
+  registerOpenApiRoute(getTaskmasterStatusRoute, async c => {
+    try {
+      const state = await getTaskmasterPauseState();
+      const lastHeartbeat = getLastHeartbeat();
+      const intervalMs = taskmasterIntervalMs();
+      return c.json({
+        success: true,
+        tick_health: tickHealth(lastHeartbeat, Date.now(), intervalMs),
+        pause_state: state.pause_state,
+        epoch: state.epoch,
+        last_heartbeat_at: lastHeartbeat,
+        interval_ms: intervalMs,
+      });
+    } catch (error) {
+      getLog().error({ err: error }, 'taskmaster_status_api_failed');
+      return apiError(c, 500, 'Failed to read Taskmaster status');
+    }
+  });
+
+  // POST /api/taskmaster/pause - stop effects; monitoring + P0 escalation stay alive.
+  registerOpenApiRoute(pauseTaskmasterRoute, async c => {
+    try {
+      const body = (await c.req.json().catch(() => null)) as {
+        reason?: unknown;
+        scope?: unknown;
+      } | null;
+      const state = await setTaskmasterPauseState({
+        pause_state: 'PAUSED',
+        pause_actor: 'operator',
+        pause_reason: typeof body?.reason === 'string' ? body.reason : null,
+        pause_scope: typeof body?.scope === 'string' ? body.scope : null,
+      });
+      return c.json({
+        success: true,
+        tick_health: tickHealth(getLastHeartbeat(), Date.now(), taskmasterIntervalMs()),
+        pause_state: state.pause_state,
+        epoch: state.epoch,
+        last_heartbeat_at: getLastHeartbeat(),
+        interval_ms: taskmasterIntervalMs(),
+      });
+    } catch (error) {
+      getLog().error({ err: error }, 'taskmaster_pause_api_failed');
+      return apiError(c, 500, 'Failed to pause Taskmaster');
+    }
+  });
+
+  // POST /api/taskmaster/resume - operator-only; increments epoch (expires stale proposals).
+  registerOpenApiRoute(resumeTaskmasterRoute, async c => {
+    try {
+      const state = await setTaskmasterPauseState({
+        pause_state: 'RUNNING',
+        pause_actor: 'operator',
+      });
+      return c.json({
+        success: true,
+        tick_health: tickHealth(getLastHeartbeat(), Date.now(), taskmasterIntervalMs()),
+        pause_state: state.pause_state,
+        epoch: state.epoch,
+        last_heartbeat_at: getLastHeartbeat(),
+        interval_ms: taskmasterIntervalMs(),
+      });
+    } catch (error) {
+      getLog().error({ err: error }, 'taskmaster_resume_api_failed');
+      return apiError(c, 500, 'Failed to resume Taskmaster');
     }
   });
 

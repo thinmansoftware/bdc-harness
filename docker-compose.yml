@@ -62,6 +62,10 @@ services:
       # gitignored) or the host shell env. See docs/operations/container-github-auth.md.
       GITHUB_TOKEN: ${GITHUB_TOKEN:-}
       GH_TOKEN: ${GH_TOKEN:-${GITHUB_TOKEN:-}}
+      # WO-HARNESS-TASKMASTER-SLICE1-01 (M-133): always-on Taskmaster loop. Ships
+      # scheduled ON at 60s. Set TASKMASTER_INTERVAL_MS=0 to KILL the loop (zero
+      # effects) as the rollback path. Non-secret; override via .env if desired.
+      TASKMASTER_INTERVAL_MS: ${TASKMASTER_INTERVAL_MS:-60000}
     ports:
       - "${PORT:-3000}:${PORT:-3000}"
     volumes:
