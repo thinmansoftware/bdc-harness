@@ -3,9 +3,10 @@
  * auto-circuit. Everything is dependency-injected (fake clock, fake DAL,
  * fake dispatch); no mock.module.
  */
-import { describe, expect, test } from 'bun:test';
+import { afterAll, describe, expect, test } from 'bun:test';
 import {
   createTaskmasterState,
+  defaultListThreads,
   tick,
   resolveTaskmasterIntervalMs,
   type TaskmasterDeps,
@@ -399,5 +400,85 @@ describe('interval env parsing', () => {
     expect(resolveTaskmasterIntervalMs('0')).toBe(0);
     expect(resolveTaskmasterIntervalMs('banana')).toBe(60_000);
     expect(resolveTaskmasterIntervalMs('-5')).toBe(60_000);
+  });
+});
+
+describe('defaultListThreads -- GitHub work-SOR read covers BOTH work labels (spec Section 8: "label wo/arc")', () => {
+  // Pin the repo list so an operator env var cannot skew the assertions.
+  const priorRepos = process.env.TASKMASTER_GH_REPOS;
+  process.env.TASKMASTER_GH_REPOS = 'bluedevilcollectibles/bdc-harness';
+  afterAll(() => {
+    if (priorRepos === undefined) delete process.env.TASKMASTER_GH_REPOS;
+    else process.env.TASKMASTER_GH_REPOS = priorRepos;
+  });
+
+  function ghIssue(
+    number: number,
+    labels: string[],
+    overrides: Record<string, unknown> = {}
+  ): Record<string, unknown> {
+    return {
+      number,
+      updated_at: new Date(T0).toISOString(),
+      labels: labels.map(name => ({ name })),
+      assignees: [],
+      ...overrides,
+    };
+  }
+
+  function fakeGithubFetch(byLabel: Record<string, Record<string, unknown>[]>): {
+    urls: string[];
+    fetchImpl: typeof fetch;
+  } {
+    const urls: string[] = [];
+    const fetchImpl = (async (input: string | URL | Request) => {
+      const url = String(input);
+      urls.push(url);
+      const label = new URL(url).searchParams.get('labels') ?? '';
+      return new Response(JSON.stringify(byLabel[label] ?? []), {
+        status: 200,
+        headers: {
+          'content-type': 'application/json',
+          'x-ratelimit-remaining': '100',
+        },
+      });
+    }) as typeof fetch;
+    return { urls, fetchImpl };
+  }
+
+  test('queries wo AND arc labels separately (OR semantics) and dedupes an issue carrying both', async () => {
+    const { urls, fetchImpl } = fakeGithubFetch({
+      wo: [ghIssue(1, ['wo', 'P1']), ghIssue(3, ['wo', 'arc', 'P0'])],
+      arc: [ghIssue(2, ['arc', 'P2']), ghIssue(3, ['wo', 'arc', 'P0'])],
+    });
+
+    const threads = await defaultListThreads(fetchImpl);
+
+    // One request per work label -- never a single labels=wo,arc request,
+    // which GitHub treats as AND (both labels required).
+    const labelParams = urls.map(u => new URL(u).searchParams.get('labels'));
+    expect(labelParams).toContain('wo');
+    expect(labelParams).toContain('arc');
+    expect(labelParams.every(l => l === 'wo' || l === 'arc')).toBe(true);
+
+    // arc-only work IS observed; both-label work appears exactly once.
+    const refs = threads.map(t => t.ref).sort();
+    expect(refs).toEqual([
+      'gh:bluedevilcollectibles/bdc-harness#1',
+      'gh:bluedevilcollectibles/bdc-harness#2',
+      'gh:bluedevilcollectibles/bdc-harness#3',
+    ]);
+    const p0 = threads.find(t => t.ref.endsWith('#3'));
+    expect(p0?.priority).toBe('P0');
+    expect(p0?.isUnclaimedP0).toBe(true);
+  });
+
+  test('pull requests are skipped and a failed label read never crashes the tick', async () => {
+    const { fetchImpl } = fakeGithubFetch({
+      wo: [ghIssue(4, ['wo'], { pull_request: { url: 'x' } })],
+      // 'arc' key absent -> empty list
+    });
+    const threads = await defaultListThreads(fetchImpl);
+    expect(threads.length).toBe(0);
   });
 });

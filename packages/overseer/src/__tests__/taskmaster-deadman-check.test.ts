@@ -3,10 +3,14 @@
  * SC8): exactly one escalation per degradation episode, re-arm on recovery.
  * Injected clock + fake fetch; no real network, no real database.
  */
-import { describe, expect, test } from 'bun:test';
+import { afterEach, describe, expect, test } from 'bun:test';
 import {
   createDeadmanCheckerState,
+  getDeadmanCheckerRuntime,
   pollTaskmasterDeadman,
+  resolveDeadmanIntervalMs,
+  startTaskmasterDeadmanChecker,
+  stopTaskmasterDeadmanChecker,
   type DeadmanCheckerDeps,
   type TaskmasterStatusView,
 } from '../taskmaster-deadman-check';
@@ -162,5 +166,63 @@ describe('taskmaster dead-man external checker (SC8)', () => {
     const second = await pollTaskmasterDeadman(state, { ...deps, createTask: failingCreate });
     expect(second.escalationSent).toBe(true);
     expect(escalations.length).toBe(1);
+  });
+});
+
+describe('taskmaster dead-man scheduler -- production wiring (singleton timer + persistent episode state)', () => {
+  afterEach(() => {
+    stopTaskmasterDeadmanChecker();
+  });
+
+  test('interval env parsing: default 60000, explicit value honored, 0 = off, garbage falls back', () => {
+    expect(resolveDeadmanIntervalMs(undefined)).toBe(60_000);
+    expect(resolveDeadmanIntervalMs('30000')).toBe(30_000);
+    expect(resolveDeadmanIntervalMs('0')).toBe(0);
+    expect(resolveDeadmanIntervalMs('banana')).toBe(60_000);
+    expect(resolveDeadmanIntervalMs('-5')).toBe(60_000);
+  });
+
+  test('scheduled polls share ONE persistent state: a sustained degradation escalates exactly once across many polls', async () => {
+    const degraded = statusView({ tick_health: 'degraded' });
+    // Every poll sees the same degraded episode.
+    const { deps, escalations } = makeDeps([degraded]);
+    startTaskmasterDeadmanChecker(deps, 5);
+
+    // Wait until the timer has demonstrably polled several times.
+    const deadline = Date.now() + 2_000;
+    while (Date.now() < deadline) {
+      const runtime = getDeadmanCheckerRuntime();
+      if (runtime && runtime.polls >= 3) break;
+      await new Promise(resolve => setTimeout(resolve, 5));
+    }
+
+    const runtime = getDeadmanCheckerRuntime();
+    expect(runtime).toBeDefined();
+    expect(runtime!.polls).toBeGreaterThanOrEqual(3);
+    // Persistent episode state: many polls, ONE escalation.
+    expect(escalations.length).toBe(1);
+    expect(runtime!.state.escalated).toBe(true);
+    expect(runtime!.lastPollResult?.tickHealth).toBe('degraded');
+  });
+
+  test('start is a module-scope singleton and stop tears the runtime down', async () => {
+    const { deps } = makeDeps([statusView({ tick_health: 'healthy' })]);
+    startTaskmasterDeadmanChecker(deps, 60_000);
+    const runtime = getDeadmanCheckerRuntime();
+    expect(runtime).toBeDefined();
+
+    // Second start while running is a no-op: same runtime object survives.
+    startTaskmasterDeadmanChecker(deps, 60_000);
+    expect(getDeadmanCheckerRuntime()).toBe(runtime);
+
+    stopTaskmasterDeadmanChecker();
+    expect(getDeadmanCheckerRuntime()).toBeUndefined();
+  });
+
+  test('interval 0 disables the checker entirely (no runtime, no polls)', () => {
+    const { deps, escalations } = makeDeps([statusView({ tick_health: 'degraded' })]);
+    startTaskmasterDeadmanChecker(deps, 0);
+    expect(getDeadmanCheckerRuntime()).toBeUndefined();
+    expect(escalations.length).toBe(0);
   });
 });

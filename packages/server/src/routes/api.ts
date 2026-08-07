@@ -65,6 +65,7 @@ import {
 import type { ApprovalContext, WorkflowRun } from '@archon/workflows/schemas/workflow-run';
 import { findMarkdownFilesRecursive } from '@archon/core/utils/commands';
 import { startTaskmaster, getTaskmasterRuntime, getTickHealth } from '../taskmaster/loop';
+import { startTaskmasterDeadmanChecker } from '@archon/overseer/taskmaster-deadman-check';
 import {
   taskmasterStatusResponseSchema,
   taskmasterPauseBodySchema,
@@ -3017,6 +3018,15 @@ export function registerApiRoutes(
   // (default 60000, 0 = off) live in ../taskmaster/loop.ts.
   if (process.env.NODE_ENV !== 'test') {
     startTaskmaster(randomUUID());
+    // External dead-man checker (binding condition 5 / Q4): lives in the
+    // Overseer package and observes the taskmaster ONLY via
+    // GET /api/taskmaster/status over HTTP -- never via in-process state.
+    // Started alongside the taskmaster (not inside startOverseerRuntime,
+    // which is gated on OVERSEER_ENABLED) so the watcher is always on when
+    // the taskmaster ships scheduled ON. Persistent episode state lives in
+    // the checker's module-scope runtime; TASKMASTER_DEADMAN_INTERVAL_MS=0
+    // disables (default 60000).
+    startTaskmasterDeadmanChecker();
   }
 
   // GET /api/taskmaster/status - pause state, epoch, tick health

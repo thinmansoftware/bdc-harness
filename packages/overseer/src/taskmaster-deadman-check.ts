@@ -130,3 +130,87 @@ export async function pollTaskmasterDeadman(
     return { tickHealth: 'degraded', escalationSent: false };
   }
 }
+
+// ---------------------------------------------------------------------------
+// Scheduler singleton (same skeleton as the taskmaster loop scheduler in
+// packages/server/src/taskmaster/loop.ts): module-scope timer, inFlight
+// guard, env interval with 0 = off, persistent checker state so the
+// exactly-one-escalation-per-episode contract holds across polls.
+// ---------------------------------------------------------------------------
+
+export interface DeadmanCheckerRuntime {
+  /** Persistent episode state shared by every scheduled poll. */
+  state: DeadmanCheckerState;
+  intervalMs: number;
+  lastPollResult: DeadmanPollResult | null;
+  /** Number of completed polls since start (observability + tests). */
+  polls: number;
+}
+
+let deadmanTimer: ReturnType<typeof setInterval> | undefined;
+let deadmanRuntime: DeadmanCheckerRuntime | undefined;
+
+/**
+ * Parse TASKMASTER_DEADMAN_INTERVAL_MS: integer > 0 polls at that interval;
+ * 0 disables the checker; anything else falls back to 60000.
+ */
+export function resolveDeadmanIntervalMs(raw: string | undefined): number {
+  const parsed = Number.parseInt(raw ?? '', 10);
+  if (Number.isInteger(parsed) && parsed >= 0) return parsed;
+  return 60_000;
+}
+
+export function stopTaskmasterDeadmanChecker(): void {
+  if (deadmanTimer) clearInterval(deadmanTimer);
+  deadmanTimer = undefined;
+  deadmanRuntime = undefined;
+}
+
+export function getDeadmanCheckerRuntime(): DeadmanCheckerRuntime | undefined {
+  return deadmanRuntime;
+}
+
+/**
+ * Start the external dead-man checker. Module-scope singleton: subsequent
+ * calls while a timer exists are no-ops. The SAME DeadmanCheckerState object
+ * is threaded through every poll, so an episode escalates exactly once and
+ * re-arms only on observed recovery. TASKMASTER_DEADMAN_INTERVAL_MS=0
+ * disables; `intervalMsOverride` exists for tests only.
+ */
+export function startTaskmasterDeadmanChecker(
+  deps: DeadmanCheckerDeps = {},
+  intervalMsOverride?: number
+): void {
+  if (deadmanTimer !== undefined) return;
+  const intervalMs =
+    intervalMsOverride ?? resolveDeadmanIntervalMs(process.env.TASKMASTER_DEADMAN_INTERVAL_MS);
+  if (intervalMs === 0) {
+    log.info({}, 'overseer.taskmaster_deadman_disabled_by_interval_env');
+    return;
+  }
+  const state = createDeadmanCheckerState();
+  const runtime: DeadmanCheckerRuntime = {
+    state,
+    intervalMs,
+    lastPollResult: null,
+    polls: 0,
+  };
+  deadmanRuntime = runtime;
+  let inFlight = false;
+  const runPoll = async (): Promise<void> => {
+    if (inFlight) return;
+    inFlight = true;
+    try {
+      const result = await pollTaskmasterDeadman(state, deps);
+      runtime.lastPollResult = result;
+      runtime.polls += 1;
+    } catch (error) {
+      log.error({ err: error as Error }, 'overseer.taskmaster_deadman_poll_failed');
+    } finally {
+      inFlight = false;
+    }
+  };
+  deadmanTimer = setInterval(() => void runPoll(), intervalMs);
+  deadmanTimer.unref?.();
+  void runPoll();
+}

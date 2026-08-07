@@ -142,56 +142,76 @@ interface GithubIssue {
 }
 
 /**
- * Work-SOR read: open GitHub issues labeled wo/arc across the configured
- * repos. Rate-limit-aware (Claude seat amendment): honors
- * x-ratelimit-remaining and backs off rather than spinning. A failed read
- * yields an empty list (no nudges this tick) -- never a crash.
+ * Both work labels the spec names (Section 8: "gh issues (label wo/arc)").
+ * The GitHub issues API treats `labels=a,b` as AND (issues carrying BOTH
+ * labels), so each label is queried separately and results are deduped by
+ * issue number -- OR semantics, never requiring both simultaneously.
  */
-async function defaultListThreads(): Promise<ThreadSnapshot[]> {
+const WORK_LABELS = ['wo', 'arc'] as const;
+
+/**
+ * Work-SOR read: open GitHub issues labeled wo OR arc across the configured
+ * repos (one request per label -- see WORK_LABELS). Rate-limit-aware (Claude
+ * seat amendment): honors x-ratelimit-remaining and backs off rather than
+ * spinning. A failed read yields an empty list (no nudges this tick) --
+ * never a crash. Exported for tests; production callers use the tick()
+ * default. `fetchImpl` is injectable for tests only.
+ */
+export async function defaultListThreads(
+  fetchImpl: typeof fetch = fetch
+): Promise<ThreadSnapshot[]> {
   const repos = (process.env.TASKMASTER_GH_REPOS ?? 'bluedevilcollectibles/bdc-harness')
     .split(',')
     .map(r => r.trim())
     .filter(Boolean);
   const token = process.env.GITHUB_TOKEN ?? process.env.GH_TOKEN;
   const threads: ThreadSnapshot[] = [];
+  let rateLimited = false;
 
   for (const repo of repos) {
-    try {
-      const response = await fetch(
-        `https://api.github.com/repos/${repo}/issues?state=open&labels=wo&per_page=100`,
-        {
-          headers: {
-            accept: 'application/vnd.github+json',
-            ...(token ? { authorization: `Bearer ${token}` } : {}),
-          },
+    if (rateLimited) break; // back off: stop reading further repos this tick
+    const seen = new Set<number>();
+    for (const label of WORK_LABELS) {
+      try {
+        const response = await fetchImpl(
+          `https://api.github.com/repos/${repo}/issues?state=open&labels=${label}&per_page=100`,
+          {
+            headers: {
+              accept: 'application/vnd.github+json',
+              ...(token ? { authorization: `Bearer ${token}` } : {}),
+            },
+          }
+        );
+        const remaining = Number.parseInt(response.headers.get('x-ratelimit-remaining') ?? '', 10);
+        if (Number.isInteger(remaining) && remaining < 5) {
+          log.warn({ repo, label, remaining }, 'taskmaster.github_rate_limit_backoff');
+          rateLimited = true;
+          break; // stop reading further labels and repos this tick
         }
-      );
-      const remaining = Number.parseInt(response.headers.get('x-ratelimit-remaining') ?? '', 10);
-      if (Number.isInteger(remaining) && remaining < 5) {
-        log.warn({ repo, remaining }, 'taskmaster.github_rate_limit_backoff');
-        break; // back off: stop reading further repos this tick
+        if (!response.ok) {
+          log.warn({ repo, label, status: response.status }, 'taskmaster.github_read_failed');
+          continue;
+        }
+        const issues = (await response.json()) as GithubIssue[];
+        for (const issue of issues) {
+          if (issue.pull_request) continue;
+          if (seen.has(issue.number)) continue; // carried both labels
+          seen.add(issue.number);
+          const labels = issue.labels.map(l => (typeof l === 'string' ? l : (l.name ?? '')));
+          const priority = priorityFromLabels(labels);
+          threads.push({
+            ref: `gh:${repo}#${issue.number}`,
+            priority,
+            isCustomerFacing: labels.some(l => l.toLowerCase() === 'customer'),
+            lastActivityAt: issue.updated_at,
+            isBlocked: labels.some(l => l.toLowerCase() === 'blocked'),
+            isUnclaimedP0: priority === 'P0' && (issue.assignees ?? []).length === 0,
+            recipient: 'xo',
+          });
+        }
+      } catch (error) {
+        log.warn({ err: error as Error, repo, label }, 'taskmaster.github_read_error');
       }
-      if (!response.ok) {
-        log.warn({ repo, status: response.status }, 'taskmaster.github_read_failed');
-        continue;
-      }
-      const issues = (await response.json()) as GithubIssue[];
-      for (const issue of issues) {
-        if (issue.pull_request) continue;
-        const labels = issue.labels.map(l => (typeof l === 'string' ? l : (l.name ?? '')));
-        const priority = priorityFromLabels(labels);
-        threads.push({
-          ref: `gh:${repo}#${issue.number}`,
-          priority,
-          isCustomerFacing: labels.some(l => l.toLowerCase() === 'customer'),
-          lastActivityAt: issue.updated_at,
-          isBlocked: labels.some(l => l.toLowerCase() === 'blocked'),
-          isUnclaimedP0: priority === 'P0' && (issue.assignees ?? []).length === 0,
-          recipient: 'xo',
-        });
-      }
-    } catch (error) {
-      log.warn({ err: error as Error, repo }, 'taskmaster.github_read_error');
     }
   }
   return threads;

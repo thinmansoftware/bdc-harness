@@ -38,11 +38,51 @@ export interface LedgerDeps {
   now?: () => Date;
   /** Tokens below which state is LOW rather than OK. */
   lowWatermark?: number;
+  /** Anchor cadence state; defaults to the process-scoped singleton. */
+  anchorCadence?: AnchorCadence;
 }
 
 /** Age beyond which a local artifact reading is stale and unusable. */
 const ARTIFACT_MAX_AGE_MS = 30 * 60_000;
 const DEFAULT_LOW_WATERMARK = 50_000;
+
+/**
+ * CLI anchor sampling cadence (spec Section 8): "CLI anchors sampled at
+ * startup, every 30min, and after a typed-limit transition." The 60s tick
+ * must NOT spawn the anchor probe every pass -- between due samples the last
+ * anchor observation is served from cache.
+ */
+export const ANCHOR_SAMPLE_INTERVAL_MS = 30 * 60_000;
+
+export interface AnchorCadence {
+  /** Epoch ms of the last anchor sample ATTEMPT; null = never (startup due). */
+  lastAttemptAtMs: number | null;
+  /** Last anchor observation (null when the probe failed or is unconfigured). */
+  lastValue: number | null;
+  /** Last computed headroom state, for typed-limit transition detection. */
+  lastState: HeadroomState | null;
+  /** Set when a typed-limit transition occurred; forces the next sample. */
+  forceNext: boolean;
+}
+
+export function createAnchorCadence(): AnchorCadence {
+  return { lastAttemptAtMs: null, lastValue: null, lastState: null, forceNext: false };
+}
+
+/** Process-scoped cadence used when the caller does not inject one. */
+const processAnchorCadence = createAnchorCadence();
+
+/**
+ * Record the computed headroom state; a typed-limit transition (OK -> LOW,
+ * LOW -> UNKNOWN, ...) arms the cadence so the NEXT reading re-samples the
+ * anchor regardless of the 30-minute clock.
+ */
+function noteHeadroomState(cadence: AnchorCadence, state: HeadroomState): void {
+  if (cadence.lastState !== null && cadence.lastState !== state) {
+    cadence.forceNext = true;
+  }
+  cadence.lastState = state;
+}
 
 interface UsageArtifact {
   tokensRemaining: number;
@@ -100,74 +140,104 @@ export async function sampleCliAnchor(): Promise<number | null> {
 
 /**
  * Compute current headroom. Precedence: local artifacts, then CLI anchor.
- * When both fail (or throw), the reading is UNKNOWN -- never 0-as-capacity
- * -- and the failure is persisted as a usage sample with is_unknown=1.
+ * The anchor probe runs ONLY when due (startup, every 30 minutes, or after a
+ * typed-limit transition -- spec Section 8); between due samples the cached
+ * anchor observation is served. When both readers fail (or throw), the
+ * reading is UNKNOWN -- never 0-as-capacity -- and a FRESH failure is
+ * persisted as a usage sample with is_unknown=1 (cache-served readings do
+ * not persist duplicate observation rows).
  */
 export async function currentHeadroom(deps: LedgerDeps = {}): Promise<HeadroomReading> {
   const now = deps.now ?? ((): Date => new Date());
   const persist = deps.persistSample ?? recordUsageSample;
   const lowWatermark = deps.lowWatermark ?? DEFAULT_LOW_WATERMARK;
-  const observedAt = now().toISOString();
+  const cadence = deps.anchorCadence ?? processAnchorCadence;
+  const nowMs = now().getTime();
+  const observedAt = new Date(nowMs).toISOString();
 
   let tokens: number | null = null;
   let source: HeadroomReading['source'] = 'none';
+  let freshObservation = false;
 
   try {
     const local = await (
-      deps.readLocalArtifacts ?? ((): Promise<number | null> => readLocalArtifacts(now().getTime()))
+      deps.readLocalArtifacts ?? ((): Promise<number | null> => readLocalArtifacts(nowMs))
     )();
     if (local !== null) {
       tokens = local;
       source = 'local_artifacts';
+      freshObservation = true;
     }
   } catch (error) {
     log.warn({ err: error as Error }, 'taskmaster.ledger_local_artifacts_failed');
   }
 
   if (tokens === null) {
-    try {
-      const anchor = await (deps.sampleCliAnchor ?? sampleCliAnchor)();
-      if (anchor !== null) {
-        tokens = anchor;
-        source = 'cli_anchor';
+    const anchorDue =
+      cadence.lastAttemptAtMs === null || // startup
+      cadence.forceNext || // typed-limit transition
+      nowMs - cadence.lastAttemptAtMs >= ANCHOR_SAMPLE_INTERVAL_MS; // 30min
+    if (anchorDue) {
+      cadence.lastAttemptAtMs = nowMs;
+      cadence.forceNext = false;
+      freshObservation = true;
+      try {
+        const anchor = await (deps.sampleCliAnchor ?? sampleCliAnchor)();
+        cadence.lastValue = anchor;
+        if (anchor !== null) {
+          tokens = anchor;
+          source = 'cli_anchor';
+        }
+      } catch (error) {
+        cadence.lastValue = null;
+        log.warn({ err: error as Error }, 'taskmaster.ledger_cli_anchor_failed');
       }
-    } catch (error) {
-      log.warn({ err: error as Error }, 'taskmaster.ledger_cli_anchor_failed');
+    } else if (cadence.lastValue !== null) {
+      // Not due: serve the cached anchor observation.
+      tokens = cadence.lastValue;
+      source = 'cli_anchor';
     }
   }
 
   if (tokens === null) {
     // Failure is UNKNOWN, never zero-as-capacity.
+    if (freshObservation) {
+      try {
+        await persist({
+          provider: 'claude',
+          window_kind: 'rolling',
+          source: 'none',
+          value_json: null,
+          confidence: 'none',
+          is_unknown: true,
+        });
+      } catch (error) {
+        log.warn({ err: error as Error }, 'taskmaster.ledger_unknown_sample_persist_failed');
+      }
+    }
+    noteHeadroomState(cadence, 'UNKNOWN');
+    return { state: 'UNKNOWN', tokensRemaining: null, isUnknown: true, source: 'none', observedAt };
+  }
+
+  if (freshObservation) {
     try {
       await persist({
         provider: 'claude',
         window_kind: 'rolling',
-        source: 'none',
-        value_json: null,
-        confidence: 'none',
-        is_unknown: true,
+        source,
+        value_json: JSON.stringify({ tokensRemaining: tokens }),
+        confidence: source === 'local_artifacts' ? 'high' : 'low',
+        is_unknown: false,
       });
     } catch (error) {
-      log.warn({ err: error as Error }, 'taskmaster.ledger_unknown_sample_persist_failed');
+      log.warn({ err: error as Error }, 'taskmaster.ledger_sample_persist_failed');
     }
-    return { state: 'UNKNOWN', tokensRemaining: null, isUnknown: true, source: 'none', observedAt };
   }
 
-  try {
-    await persist({
-      provider: 'claude',
-      window_kind: 'rolling',
-      source,
-      value_json: JSON.stringify({ tokensRemaining: tokens }),
-      confidence: source === 'local_artifacts' ? 'high' : 'low',
-      is_unknown: false,
-    });
-  } catch (error) {
-    log.warn({ err: error as Error }, 'taskmaster.ledger_sample_persist_failed');
-  }
-
+  const state: HeadroomState = tokens < lowWatermark ? 'LOW' : 'OK';
+  noteHeadroomState(cadence, state);
   return {
-    state: tokens < lowWatermark ? 'LOW' : 'OK',
+    state,
     tokensRemaining: tokens,
     isUnknown: false,
     source,
