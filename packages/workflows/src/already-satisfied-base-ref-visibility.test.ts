@@ -233,6 +233,9 @@ describe('gate-already-satisfied disposition (behavioral)', () => {
       // build skip guards still fire, but the disposition is the distinct
       // already-merged-on-base and the diagnostic must NOT claim local satisfaction.
       it('local-absent/base-present -> skip with already-merged-on-base', async () => {
+        const forceBuild =
+          file === 'bdc-feature-development-zero.yaml' ||
+          file === 'bdc-feature-development-zero-open.yaml';
         const { stdout, stderr, exitCode } = await runGate(
           file,
           [
@@ -243,6 +246,13 @@ describe('gate-already-satisfied disposition (behavioral)', () => {
         );
         expect(exitCode).toBe(0);
         const doc = JSON.parse(stdout);
+        if (forceBuild) {
+          // Zero-lane recovery: advisory base-present cannot skip plan/build.
+          expect(doc.ALREADY_SATISFIED).toBe(false);
+          expect(doc.PRECHECK_VERDICT).toBe('needs-build');
+          expect(stderr).toContain('zero-lane forces needs-build');
+          return;
+        }
         expect(doc.ALREADY_SATISFIED).toBe(true); // skip guard: != 'true' is false -> build skipped
         expect(doc.PRECHECK_VERDICT).toBe('already-merged-on-base');
         expect(doc.SATISFIED_ON_BASE).toBe(true);
@@ -256,24 +266,41 @@ describe('gate-already-satisfied disposition (behavioral)', () => {
 
       // Outcome 2: both-absent -> the run must build.
       it('both-absent -> needs-build', async () => {
+        const forceBuild =
+          file === 'bdc-feature-development-zero.yaml' ||
+          file === 'bdc-feature-development-zero-open.yaml';
         const { stdout, stderr, exitCode } = await runGate(file, 'ALREADY_SATISFIED=false');
         expect(exitCode).toBe(0);
         expect(JSON.parse(stdout)).toEqual({
           ALREADY_SATISFIED: false,
           PRECHECK_VERDICT: 'needs-build',
         });
-        expect(stderr).toBe('');
+        if (forceBuild) {
+          expect(stderr).toContain('zero-lane forces needs-build');
+        } else {
+          expect(stderr).toBe('');
+        }
       });
 
       // Outcome 3: local-present -> the pre-existing fast path is preserved verbatim
       // (already-satisfied, no SATISFIED_ON_BASE key, worktree diagnostic).
       it('local-present -> retains the already-satisfied fast path', async () => {
+        const forceBuild =
+          file === 'bdc-feature-development-zero.yaml' ||
+          file === 'bdc-feature-development-zero-open.yaml';
         const { stdout, stderr, exitCode } = await runGate(
           file,
           ['ALREADY_SATISFIED=true', 'SATISFIED_EVIDENCE=present in this worktree HEAD'].join('\n')
         );
         expect(exitCode).toBe(0);
         const doc = JSON.parse(stdout);
+        if (forceBuild) {
+          // Zero-lane recovery: advisory local-present cannot skip plan/build.
+          expect(doc.ALREADY_SATISFIED).toBe(false);
+          expect(doc.PRECHECK_VERDICT).toBe('needs-build');
+          expect(stderr).toContain('zero-lane forces needs-build');
+          return;
+        }
         expect(doc.ALREADY_SATISFIED).toBe(true);
         expect(doc.PRECHECK_VERDICT).toBe('already-satisfied');
         expect(doc).not.toHaveProperty('SATISFIED_ON_BASE');
