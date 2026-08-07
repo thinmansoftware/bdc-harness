@@ -4,6 +4,8 @@
   "type": "module",
   "main": "./src/index.ts",
   "scripts": {
+    "pretest": "bun run test:taskmaster",
+    "test:taskmaster": "bun test src/taskmaster/rules.test.ts && bun test src/taskmaster/ledger.test.ts && bun test src/taskmaster/loop.test.ts && bun test src/taskmaster/guard.test.ts && bun test src/taskmaster/deadman.test.ts",
     "dev": "bun --watch src/index.ts",
     "start": "bun src/index.ts",
     "test": "bun test src/services/canary-telegram-alert.test.ts && bun test src/docker-packaging.test.ts && bun test src/routes/api.workflows.test.ts && bun test src/routes/api.conversations.test.ts && bun test src/routes/workflow-run-branch-override.test.ts && bun test src/routes/api.codebases.test.ts && bun test src/routes/api.messages.test.ts && bun test src/routes/api.dispatch.test.ts && bun test src/routes/api.board-authority.test.ts && bun test src/routes/api.execution-claims.test.ts && bun test src/routes/api.merge-steward.test.ts && bun test src/routes/api.overseer-briefing.test.ts && bun test src/auth/dispatch-worker-credential.test.ts && bun test src/routes/api.health.test.ts && bun test src/routes/api.workflow-runs.test.ts && bun test src/routes/api.providers.test.ts && bun test src/routes/api.cancel-run.test.ts && bun test src/routes/api.pause-run.test.ts && bun test src/routes/api.host-metrics.test.ts && bun test src/routes/api.provider-attempts.test.ts && bun test src/adapters/web/transport.test.ts && bun test src/adapters/web/persistence.test.ts && bun test src/adapters/web/workflow-bridge.test.ts && bun test src/scripts/verify-auth.test.ts && bun test src/index.test.ts && bun test src/startup-reconciliation.test.ts && bun test src/overseer-runtime.test.ts && bun test src/routes/overseer-control-plane.routes.test.ts",

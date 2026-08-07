@@ -1,0 +1,2 @@
+import {describe,expect,test} from 'bun:test';import{createTaskmasterDeadmanCheck}from'../taskmaster-deadman-check';
+describe('taskmaster external deadman',()=>{test('escalates exactly once and re-arms after recovery',async()=>{let health:'healthy'|'degraded'='degraded',calls=0;const check=createTaskmasterDeadmanCheck({fetchStatus:async()=>({tick_health:health}),escalate:async()=>{calls++;}});await check();await check();expect(calls).toBe(1);health='healthy';await check();health='degraded';await check();expect(calls).toBe(2);});});

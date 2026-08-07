@@ -1,0 +1,4 @@
+export interface TaskmasterStatus { tick_health:'healthy'|'degraded' }
+export interface DeadmanOptions { fetchStatus:()=>Promise<TaskmasterStatus>; escalate:(message:string)=>Promise<void>; now?:()=>number }
+export function createTaskmasterDeadmanCheck(options:DeadmanOptions){let escalated=false;return async()=>{const status=await options.fetchStatus();if(status.tick_health==='degraded'&&!escalated){await options.escalate('taskmaster tick_health degraded: three intervals missed');escalated=true;}else if(status.tick_health==='healthy'){escalated=false;}return{tick_health:status.tick_health,escalated};};}
+export function httpTaskmasterStatus(url:string,fetcher:typeof fetch=fetch):Promise<TaskmasterStatus>{return fetcher(`${url.replace(/\/$/,'')}/api/taskmaster/status`).then(async r=>{if(!r.ok)throw new Error(`taskmaster_status_http_${r.status}`);return await r.json() as TaskmasterStatus;});}

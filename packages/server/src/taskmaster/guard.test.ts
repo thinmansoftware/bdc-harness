@@ -1,0 +1,1 @@
+import{expect,test}from'bun:test';import{validateProposal}from'./guard';test('content guard rejects forbidden external effects',()=>expect(validateProposal({threadRef:'x',actionType:'nudge',recipient:'xo',body:'deploy to production',priority:'normal'}).allowed).toBe(false));

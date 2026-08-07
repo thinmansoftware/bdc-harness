@@ -64,6 +64,9 @@ import {
 } from '@archon/workflows/schemas/workflow-run';
 import type { ApprovalContext, WorkflowRun } from '@archon/workflows/schemas/workflow-run';
 import { findMarkdownFilesRecursive } from '@archon/core/utils/commands';
+import { getPauseState, setPauseState } from '@archon/core/db';
+import { isTickStale } from '../taskmaster/deadman';
+import { startTaskmaster } from '../taskmaster/loop';
 
 let providerWaitSchedulerTimer: ReturnType<typeof setInterval> | undefined;
 
@@ -2943,6 +2946,10 @@ export function registerApiRoutes(
     providerWaitSchedulerTimer.unref?.();
     void tick();
   }
+  startTaskmaster();
+  app.get('/api/taskmaster/status',async c=>{const control=await getPauseState();const parsed=Number.parseInt(process.env.TASKMASTER_INTERVAL_MS??'',10);const interval=Number.isInteger(parsed)&&parsed>0?parsed:60000;return c.json({...control,tick_health:isTickStale(interval)?'degraded':'healthy'});});
+  app.post('/api/taskmaster/pause',async c=>{const body=await c.req.json<{reason?:string;hard?:boolean}>().catch(()=>({}));return c.json(await setPauseState(body.hard?'HARD_PAUSE':'PAUSED','john',body.reason??'operator pause'));});
+  app.post('/api/taskmaster/resume',async c=>{const body=await c.req.json<{reason?:string}>().catch(()=>({}));return c.json(await setPauseState('RUNNING','john',body.reason??'operator resume'));});
 
   // GET /api/conversations - List conversations
   registerOpenApiRoute(getConversationsRoute, async c => {
