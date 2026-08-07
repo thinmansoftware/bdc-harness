@@ -30,7 +30,7 @@ describe('dispatch notifiers', () => {
     '/run/bdc-secrets/../../etc/passwd',
     '/run/bdc-secrets/../bdc-secrets/telegram',
     '/run/bdc-secrets/./telegram',
-  ])('rejects an invalid mounted-secret path: %p', async (path) => {
+  ])('rejects an invalid mounted-secret path: %p', async path => {
     await expect(readDispatchSecretFile(path)).rejects.toThrow('dispatch_secret_file_required');
   });
 
