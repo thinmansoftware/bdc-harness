@@ -66,6 +66,7 @@ import type { ApprovalContext, WorkflowRun } from '@archon/workflows/schemas/wor
 import { findMarkdownFilesRecursive } from '@archon/core/utils/commands';
 import { startTaskmaster, getTaskmasterRuntime, getTickHealth } from '../taskmaster/loop';
 import { startTaskmasterDeadmanChecker } from '@archon/overseer/taskmaster-deadman-check';
+import { startOperatorInboxConsumer } from '../dispatch/operator-inbox-consumer';
 import {
   taskmasterStatusResponseSchema,
   taskmasterPauseBodySchema,
@@ -3035,6 +3036,13 @@ export function registerApiRoutes(
     // the checker's module-scope runtime; TASKMASTER_DEADMAN_INTERVAL_MS=0
     // disables (default 60000).
     startTaskmasterDeadmanChecker();
+    // Operator inbox consumer (WO-HARNESS-OPERATOR-INBOX-CONSUMER-01 / #1455).
+    // Drains recipient=operator queued dispatch messages that producers already
+    // write (Overseer run_report, Taskmaster digests, dead-man escalations).
+    // Same scheduler skeleton (singleton + inFlight + env interval 0=off);
+    // human surface is durable JSONL under ARCHON_HOME/operator-inbox/ --
+    // Telegram/SMS stay dark per #1456. OPERATOR_INBOX_INTERVAL_MS default 60000.
+    startOperatorInboxConsumer();
   }
 
   // GET /api/taskmaster/status - pause state, epoch, tick health
