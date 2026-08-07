@@ -226,6 +226,16 @@ export class SqliteAdapter implements IDatabase {
     this.db.run(
       'CREATE INDEX IF NOT EXISTS idx_dispatch_board_pending ON agent_dispatch_messages(recipient_alias, status, created_at)'
     );
+    // Taskmaster Slice 1 indexes (migration 041) -- after migrateColumns()
+    // per the established pattern.
+    this.db.run(
+      'CREATE INDEX IF NOT EXISTS idx_tm_journal_thread ON tm_journal(thread_ref, created_at)'
+    );
+    this.db.run('CREATE INDEX IF NOT EXISTS idx_tm_journal_idem ON tm_journal(idempotency_key)');
+    this.db.run('CREATE INDEX IF NOT EXISTS idx_tm_journal_created ON tm_journal(created_at)');
+    this.db.run(
+      'CREATE INDEX IF NOT EXISTS idx_tm_usage_provider ON tm_usage_sample(provider, observed_at)'
+    );
   }
 
   /**
@@ -1467,6 +1477,60 @@ export class SqliteAdapter implements IDatabase {
         ON remote_agent_sessions(parent_session_id);
       CREATE INDEX IF NOT EXISTS idx_sessions_conversation_started
         ON remote_agent_sessions(conversation_id, started_at DESC);
+
+      -- Taskmaster Slice 1 (migration 041, WO-HARNESS-TASKMASTER-SLICE1-01).
+      -- Additive only; agent_dispatch_messages is migration 040's surface.
+      CREATE TABLE IF NOT EXISTS tm_journal (
+        id TEXT PRIMARY KEY,
+        created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+        thread_ref TEXT NOT NULL,
+        action_type TEXT NOT NULL CHECK (
+          action_type IN ('deliver_ruling', 'nudge', 'escalate_p0', 'digest')
+        ),
+        proposal_json TEXT NOT NULL,
+        idempotency_key TEXT,
+        before_hash TEXT,
+        proof_predicate TEXT,
+        proof_deadline_at TEXT,
+        outcome TEXT NOT NULL CHECK (
+          outcome IN ('pending', 'sent', 'parked', 'deferred', 'rejected', 'expired', 'failed')
+        ),
+        graded_at TEXT,
+        grade TEXT CHECK (grade IS NULL OR grade IN ('useful', 'noise', 'harmful'))
+      );
+
+      CREATE TABLE IF NOT EXISTS tm_control (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        pause_state TEXT NOT NULL DEFAULT 'RUNNING' CHECK (
+          pause_state IN ('RUNNING', 'PAUSED', 'HARD_PAUSE')
+        ),
+        pause_scope TEXT,
+        pause_reason TEXT,
+        pause_actor TEXT,
+        epoch INTEGER NOT NULL DEFAULT 0,
+        updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+      );
+
+      CREATE TABLE IF NOT EXISTS tm_health (
+        provider TEXT PRIMARY KEY,
+        state TEXT NOT NULL,
+        sampled_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        evidence TEXT
+      );
+
+      CREATE TABLE IF NOT EXISTS tm_usage_sample (
+        id TEXT PRIMARY KEY,
+        provider TEXT NOT NULL,
+        window_kind TEXT NOT NULL,
+        source TEXT NOT NULL,
+        observed_at TEXT NOT NULL,
+        value_json TEXT,
+        confidence TEXT,
+        is_unknown INTEGER NOT NULL DEFAULT 0 CHECK (is_unknown IN (0, 1))
+      );
+
+      INSERT OR IGNORE INTO tm_control (id, pause_state, epoch) VALUES (1, 'RUNNING', 0);
     `);
     getLog().info('db.sqlite_schema_initialized');
   }
