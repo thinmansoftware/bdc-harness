@@ -29,6 +29,7 @@ interface FakeWorld {
   control: TmControlState;
   sentMessages: Array<{ idempotency_key: string; recipient: string; body: string }>;
   nowMs: number;
+  recordCalls: number;
 }
 
 function makeWorld(): FakeWorld {
@@ -44,6 +45,7 @@ function makeWorld(): FakeWorld {
     },
     sentMessages: [],
     nowMs: T0,
+    recordCalls: 0,
   };
 }
 
@@ -60,6 +62,7 @@ function makeDeps(world: FakeWorld, overrides: Partial<TaskmasterDeps> = {}): Ta
       proof_deadline_at?: string | null;
       outcome: TmActionOutcome;
     }): Promise<TmJournalEntry> => {
+      world.recordCalls += 1;
       journalSeq += 1;
       const row: TmJournalEntry = {
         id: `journal-${journalSeq}`,
@@ -93,6 +96,8 @@ function makeDeps(world: FakeWorld, overrides: Partial<TaskmasterDeps> = {}): Ta
     },
     getActionsSince: async (sinceIso: string) =>
       world.journal.filter(j => j.created_at >= sinceIso),
+    getActionByIdempotencyKey: async (key: string) =>
+      world.journal.find(j => j.idempotency_key === key) ?? null,
     getPauseState: async () => world.control,
     setPauseState: async (data: {
       pause_state: TmControlState['pause_state'];
@@ -338,6 +343,374 @@ describe('scenario 4: restart produces no double effect', () => {
   });
 });
 
+describe('failed effect reuse and successful-tick health', () => {
+  test('a failed effect retries on the same journal row and recovers on the next tick', async () => {
+    const world = makeWorld();
+    let attempts = 0;
+    const deps = makeDeps(world, {
+      createTask: (async () => {
+        attempts += 1;
+        if (attempts === 1) throw new Error('synthetic dispatch failure');
+        return { id: 'digest-message', status: 'queued' };
+      }) as unknown as TaskmasterDeps['createTask'],
+    });
+    const state = createTaskmasterState(60_000);
+
+    const failed = await tick(state, deps);
+    expect(failed.successful).toBe(false);
+    expect(failed.failed).toBe(1);
+    expect(world.journal.filter(row => row.action_type === 'digest')).toHaveLength(1);
+    expect(world.journal[0]?.outcome).toBe('failed');
+    expect(state.deadman.lastTickAtMs).toBeNull();
+
+    world.nowMs += 60_000;
+    const recovered = await tick(state, deps);
+    expect(recovered.successful).toBe(true);
+    expect(attempts).toBe(2);
+    expect(world.journal.filter(row => row.action_type === 'digest')).toHaveLength(1);
+    expect(world.journal[0]?.outcome).toBe('sent');
+    expect(state.deadman.lastTickAtMs).toBe(world.nowMs);
+  });
+
+  test('an expired failed effect is not retried or inserted again', async () => {
+    const world = makeWorld();
+    world.journal.push({
+      id: 'expired-digest-attempt',
+      created_at: new Date(T0 - 60_000).toISOString(),
+      thread_ref: `digest:${TODAY_KEY}`,
+      action_type: 'digest',
+      proposal_json: '{}',
+      idempotency_key: `tm:digest:${TODAY_KEY}`,
+      before_hash: null,
+      proof_predicate: 'digest delivery only',
+      proof_deadline_at: new Date(T0 - 1).toISOString(),
+      outcome: 'failed',
+      graded_at: null,
+      grade: null,
+    });
+    const deps = makeDeps(world);
+    const state = createTaskmasterState(60_000);
+
+    const result = await tick(state, deps);
+
+    expect(result.successful).toBe(true);
+    expect(world.sentMessages).toHaveLength(0);
+    expect(world.journal).toHaveLength(1);
+    expect(world.journal[0]?.outcome).toBe('expired');
+  });
+
+  test('repeated failures attempt once per tick and keep one failed row', async () => {
+    const world = makeWorld();
+    let attempts = 0;
+    const deps = makeDeps(world, {
+      createTask: (async () => {
+        attempts += 1;
+        throw new Error('persistent dispatch failure');
+      }) as unknown as TaskmasterDeps['createTask'],
+    });
+    const state = createTaskmasterState(60_000);
+
+    for (let tickNumber = 0; tickNumber < 3; tickNumber += 1) {
+      const result = await tick(state, deps);
+      expect(result.successful).toBe(false);
+      world.nowMs += 60_000;
+    }
+
+    expect(attempts).toBe(3);
+    expect(world.journal.filter(row => row.action_type === 'digest')).toHaveLength(1);
+    expect(world.journal[0]?.outcome).toBe('failed');
+  });
+
+  test('a deferred row is reused when the next tick has budget', async () => {
+    const world = makeWorld();
+    seedDigestSent(world);
+    const staleThread: ThreadSnapshot = {
+      ref: 'gh:bluedevilcollectibles/bdc-xo#1500',
+      priority: 'P1',
+      lastActivityAt: new Date(T0 - 5 * 3_600_000).toISOString(),
+      recipient: 'xo',
+    };
+    world.journal.push({
+      id: 'deferred-nudge',
+      created_at: new Date(T0 - 60_000).toISOString(),
+      thread_ref: staleThread.ref,
+      action_type: 'nudge',
+      proposal_json: '{}',
+      idempotency_key: `tm:nudge:${staleThread.ref}:${Math.floor(T0 / (4 * 3_600_000))}`,
+      before_hash: null,
+      proof_predicate: 'source issue progress after send',
+      proof_deadline_at: new Date(T0 + 60_000).toISOString(),
+      outcome: 'deferred',
+      graded_at: null,
+      grade: null,
+    });
+
+    const result = await tick(
+      createTaskmasterState(60_000),
+      makeDeps(world, { listThreads: async () => [staleThread] })
+    );
+
+    expect(result.effects).toBe(1);
+    expect(world.journal.filter(row => row.id === 'deferred-nudge')).toHaveLength(1);
+    expect(world.journal.find(row => row.id === 'deferred-nudge')?.outcome).toBe('sent');
+  });
+
+  test('a successful no-op tick records the successful heartbeat', async () => {
+    const world = makeWorld();
+    seedDigestSent(world);
+    const state = createTaskmasterState(60_000);
+
+    const result = await tick(state, makeDeps(world));
+
+    expect(result.successful).toBe(true);
+    expect(result.failed).toBe(0);
+    expect(state.deadman.lastTickAtMs).toBe(T0);
+  });
+
+  test('a failed source read does not advance the successful heartbeat', async () => {
+    const world = makeWorld();
+    seedDigestSent(world);
+    const state = createTaskmasterState(60_000);
+
+    const result = await tick(
+      state,
+      makeDeps(world, {
+        listThreads: async () => {
+          throw new Error('synthetic GitHub read failure');
+        },
+      })
+    );
+
+    expect(result.successful).toBe(false);
+    expect(result.failed).toBe(1);
+    expect(state.deadman.lastTickAtMs).toBeNull();
+  });
+});
+
+describe('SC7 grading requires external source progress', () => {
+  test('a queued outbound reminder row alone remains ungraded', async () => {
+    const world = makeWorld();
+    seedDigestSent(world);
+    world.journal.push({
+      id: 'sent-nudge',
+      created_at: new Date(T0 - 60_000).toISOString(),
+      thread_ref: 'gh:bluedevilcollectibles/bdc-xo#1450',
+      action_type: 'nudge',
+      proposal_json: '{}',
+      idempotency_key: 'tm:nudge:gh:bluedevilcollectibles/bdc-xo#1450:1',
+      before_hash: null,
+      proof_predicate: 'source issue progress after send',
+      proof_deadline_at: new Date(T0 + 60_000).toISOString(),
+      outcome: 'sent',
+      graded_at: null,
+      grade: null,
+    });
+    world.sentMessages.push({
+      idempotency_key: 'tm:nudge:gh:bluedevilcollectibles/bdc-xo#1450:1',
+      recipient: 'xo',
+      body: 'reminder',
+    });
+    world.sentMessages.push({
+      idempotency_key: `tm:digest:${TODAY_KEY}`,
+      recipient: 'operator',
+      body: 'digest',
+    });
+
+    await tick(createTaskmasterState(60_000), makeDeps(world));
+
+    expect(world.journal.find(row => row.id === 'sent-nudge')?.grade).toBeNull();
+    expect(world.journal.find(row => row.action_type === 'digest')?.grade).toBeNull();
+  });
+
+  test('the original ruling addressed by its recipient makes delivery useful', async () => {
+    const world = makeWorld();
+    seedDigestSent(world);
+    world.journal.push({
+      id: 'sent-ruling-reminder',
+      created_at: new Date(T0 - 60_000).toISOString(),
+      thread_ref: 'dispatch:ruling-original',
+      action_type: 'deliver_ruling',
+      proposal_json: '{}',
+      idempotency_key: 'tm:deliver_ruling:ruling-original',
+      before_hash: null,
+      proof_predicate: 'original ruling addressed after send',
+      proof_deadline_at: new Date(T0 + 60_000).toISOString(),
+      outcome: 'sent',
+      graded_at: null,
+      grade: null,
+    });
+    world.sentMessages.push({
+      idempotency_key: 'tm:deliver_ruling:ruling-original',
+      recipient: 'xo',
+      body: 'ruling reminder',
+    });
+    const deps = makeDeps(world, {
+      getDispatchMessageById: (async () => ({
+        id: 'ruling-original',
+        recipient: 'xo',
+        resolved_recipient: 'xo',
+        addressed_at: new Date(T0 - 30_000).toISOString(),
+        addressed_by: 'xo',
+      })) as unknown as TaskmasterDeps['getDispatchMessageById'],
+    });
+
+    await tick(createTaskmasterState(60_000), deps);
+
+    expect(world.journal.find(row => row.id === 'sent-ruling-reminder')?.grade).toBe('useful');
+  });
+
+  test('a post-send source progress marker makes a nudge useful', async () => {
+    const world = makeWorld();
+    seedDigestSent(world);
+    const key = 'tm:nudge:gh:bluedevilcollectibles/bdc-xo#1450:1';
+    world.journal.push({
+      id: 'progress-nudge',
+      created_at: new Date(T0 - 60_000).toISOString(),
+      thread_ref: 'gh:bluedevilcollectibles/bdc-xo#1450',
+      action_type: 'nudge',
+      proposal_json: '{}',
+      idempotency_key: key,
+      before_hash: null,
+      proof_predicate: 'post-send source progress',
+      proof_deadline_at: new Date(T0 + 60_000).toISOString(),
+      outcome: 'sent',
+      graded_at: null,
+      grade: null,
+    });
+    world.sentMessages.push({ idempotency_key: key, recipient: 'xo', body: 'nudge' });
+    const deps = makeDeps(world, {
+      getGithubIssueEvidence: async () => ({
+        state: 'open',
+        updatedAt: new Date(T0 - 30_000).toISOString(),
+        labels: ['wo', 'prio:P1', 'status:building'],
+        assigneeCount: 0,
+        closedAt: null,
+        assignedAt: null,
+        activeStatusAt: null,
+        progressRecordedAt: new Date(T0 - 30_000).toISOString(),
+      }),
+    });
+
+    await tick(createTaskmasterState(60_000), deps);
+
+    expect(world.journal.find(row => row.id === 'progress-nudge')?.grade).toBe('useful');
+  });
+
+  test('a cancelled effect is noise and an unchanged P0 source is not useful', async () => {
+    const world = makeWorld();
+    seedDigestSent(world);
+    const key = 'tm:escalate_p0:gh:bluedevilcollectibles/bdc-xo#1600:1';
+    world.journal.push({
+      id: 'cancelled-escalation',
+      created_at: new Date(T0 - 60_000).toISOString(),
+      thread_ref: 'gh:bluedevilcollectibles/bdc-xo#1600',
+      action_type: 'escalate_p0',
+      proposal_json: '{}',
+      idempotency_key: key,
+      before_hash: null,
+      proof_predicate: 'P0 source claim after send',
+      proof_deadline_at: new Date(T0 + 60_000).toISOString(),
+      outcome: 'sent',
+      graded_at: null,
+      grade: null,
+    });
+    const deps = makeDeps(world, {
+      findEffectByIdempotencyKey: async effectKey =>
+        effectKey === key ? { id: 'cancelled-effect', status: 'cancelled' } : null,
+      getGithubIssueEvidence: async () => ({
+        state: 'open',
+        updatedAt: new Date(T0 - 60_000).toISOString(),
+        labels: ['wo', 'P0'],
+        assigneeCount: 0,
+        closedAt: null,
+        assignedAt: null,
+        activeStatusAt: null,
+        progressRecordedAt: null,
+      }),
+    });
+
+    await tick(createTaskmasterState(60_000), deps);
+
+    expect(world.journal.find(row => row.id === 'cancelled-escalation')?.grade).toBe('noise');
+  });
+
+  test('a post-send assignment event makes a P0 escalation useful', async () => {
+    const world = makeWorld();
+    seedDigestSent(world);
+    const key = 'tm:escalate_p0:gh:bluedevilcollectibles/bdc-xo#1601:1';
+    world.journal.push({
+      id: 'assigned-escalation',
+      created_at: new Date(T0 - 60_000).toISOString(),
+      thread_ref: 'gh:bluedevilcollectibles/bdc-xo#1601',
+      action_type: 'escalate_p0',
+      proposal_json: '{}',
+      idempotency_key: key,
+      before_hash: null,
+      proof_predicate: 'P0 source claim after send',
+      proof_deadline_at: new Date(T0 + 60_000).toISOString(),
+      outcome: 'sent',
+      graded_at: null,
+      grade: null,
+    });
+    world.sentMessages.push({ idempotency_key: key, recipient: 'operator', body: 'escalate' });
+    const deps = makeDeps(world, {
+      getGithubIssueEvidence: async () => ({
+        state: 'open',
+        updatedAt: new Date(T0 - 30_000).toISOString(),
+        labels: ['wo', 'P0'],
+        assigneeCount: 1,
+        closedAt: null,
+        assignedAt: new Date(T0 - 30_000).toISOString(),
+        activeStatusAt: null,
+        progressRecordedAt: null,
+      }),
+    });
+
+    await tick(createTaskmasterState(60_000), deps);
+
+    expect(world.journal.find(row => row.id === 'assigned-escalation')?.grade).toBe('useful');
+  });
+
+  test('a pre-existing assignee without a post-send event is not useful proof', async () => {
+    const world = makeWorld();
+    seedDigestSent(world);
+    const key = 'tm:escalate_p0:gh:bluedevilcollectibles/bdc-xo#1602:1';
+    world.journal.push({
+      id: 'preexisting-assignee-escalation',
+      created_at: new Date(T0 - 60_000).toISOString(),
+      thread_ref: 'gh:bluedevilcollectibles/bdc-xo#1602',
+      action_type: 'escalate_p0',
+      proposal_json: '{}',
+      idempotency_key: key,
+      before_hash: null,
+      proof_predicate: 'P0 source claim after send',
+      proof_deadline_at: new Date(T0 + 60_000).toISOString(),
+      outcome: 'sent',
+      graded_at: null,
+      grade: null,
+    });
+    world.sentMessages.push({ idempotency_key: key, recipient: 'operator', body: 'escalate' });
+    const deps = makeDeps(world, {
+      getGithubIssueEvidence: async () => ({
+        state: 'open',
+        updatedAt: new Date(T0 - 30_000).toISOString(),
+        labels: ['wo', 'P0'],
+        assigneeCount: 1,
+        closedAt: null,
+        assignedAt: null,
+        activeStatusAt: null,
+        progressRecordedAt: null,
+      }),
+    });
+
+    await tick(createTaskmasterState(60_000), deps);
+
+    expect(
+      world.journal.find(row => row.id === 'preexisting-assignee-escalation')?.grade
+    ).toBeNull();
+  });
+});
+
 describe('scenario 5: budget ceiling holds', () => {
   test('25 eligible stale threads: at most 10 effects, 1 per item, remainder journaled deferred', async () => {
     const world = makeWorld();
@@ -357,6 +730,8 @@ describe('scenario 5: budget ceiling holds', () => {
 
     expect(result.effects).toBe(10);
     expect(world.sentMessages.length).toBe(10);
+    expect(world.sentMessages.every(message => message.body.includes('[PROGRESS]'))).toBe(true);
+    expect(world.sentMessages.every(message => message.body.includes('[BLOCKED]'))).toBe(true);
 
     // No item receives 2 effects in the tick.
     const perThread = new Map<string, number>();
@@ -368,6 +743,8 @@ describe('scenario 5: budget ceiling holds', () => {
     // Remainder journaled as deferred, not dropped.
     const deferred = world.journal.filter(j => j.outcome === 'deferred');
     expect(deferred.length).toBe(15);
+    expect(deferred.every(row => row.proof_predicate !== null)).toBe(true);
+    expect(deferred.every(row => row.proof_deadline_at !== null)).toBe(true);
   });
 });
 
@@ -403,7 +780,7 @@ describe('interval env parsing', () => {
   });
 });
 
-describe('defaultListThreads -- GitHub work-SOR read covers BOTH work labels (spec Section 8: "label wo/arc")', () => {
+describe('defaultListThreads -- GitHub work-SOR read', () => {
   // Pin the repo list so an operator env var cannot skew the assertions.
   const priorRepos = process.env.TASKMASTER_GH_REPOS;
   process.env.TASKMASTER_GH_REPOS = 'bluedevilcollectibles/bdc-harness';
@@ -446,10 +823,11 @@ describe('defaultListThreads -- GitHub work-SOR read covers BOTH work labels (sp
     return { urls, fetchImpl };
   }
 
-  test('queries wo AND arc labels separately (OR semantics) and dedupes an issue carrying both', async () => {
+  test('queries wo, project, and arc separately while preserving an explicit repo override', async () => {
     const { urls, fetchImpl } = fakeGithubFetch({
       wo: [ghIssue(1, ['wo', 'P1']), ghIssue(3, ['wo', 'arc', 'P0'])],
       arc: [ghIssue(2, ['arc', 'P2']), ghIssue(3, ['wo', 'arc', 'P0'])],
+      project: [ghIssue(5, ['project', 'prio:P1'])],
     });
 
     const threads = await defaultListThreads(fetchImpl);
@@ -459,7 +837,8 @@ describe('defaultListThreads -- GitHub work-SOR read covers BOTH work labels (sp
     const labelParams = urls.map(u => new URL(u).searchParams.get('labels'));
     expect(labelParams).toContain('wo');
     expect(labelParams).toContain('arc');
-    expect(labelParams.every(l => l === 'wo' || l === 'arc')).toBe(true);
+    expect(labelParams).toContain('project');
+    expect(labelParams.every(l => l === 'wo' || l === 'project' || l === 'arc')).toBe(true);
 
     // arc-only work IS observed; both-label work appears exactly once.
     const refs = threads.map(t => t.ref).sort();
@@ -467,10 +846,47 @@ describe('defaultListThreads -- GitHub work-SOR read covers BOTH work labels (sp
       'gh:bluedevilcollectibles/bdc-harness#1',
       'gh:bluedevilcollectibles/bdc-harness#2',
       'gh:bluedevilcollectibles/bdc-harness#3',
+      'gh:bluedevilcollectibles/bdc-harness#5',
     ]);
     const p0 = threads.find(t => t.ref.endsWith('#3'));
     expect(p0?.priority).toBe('P0');
     expect(p0?.isUnclaimedP0).toBe(true);
+  });
+
+  test('normalizes exact priority label families and status-prefixed blocked labels', async () => {
+    const { fetchImpl } = fakeGithubFetch({
+      wo: [
+        ghIssue(10, ['wo', 'P1']),
+        ghIssue(11, ['wo', 'prio:P1']),
+        ghIssue(12, ['wo', 'priority:p1']),
+        ghIssue(13, ['wo', 'not-p0', 'P3', 'prio:P0']),
+        ghIssue(14, ['wo', 'priority-ish:p1']),
+        ghIssue(15, ['wo', 'P0', 'status:blocked']),
+        ghIssue(16, ['wo', 'P0', 'status:review']),
+      ],
+    });
+
+    const threads = await defaultListThreads(fetchImpl);
+    const byNumber = new Map(threads.map(thread => [Number(thread.ref.split('#')[1]), thread]));
+    expect([10, 11, 12].map(number => byNumber.get(number)?.priority)).toEqual(['P1', 'P1', 'P1']);
+    expect(byNumber.get(13)?.priority).toBe('P0');
+    expect(byNumber.get(14)?.priority).toBe('P2');
+    expect(byNumber.get(15)?.isBlocked).toBe(true);
+    expect(byNumber.get(16)?.isUnclaimedP0).toBe(false);
+  });
+
+  test('defaults to bdc-xo when TASKMASTER_GH_REPOS is unset', async () => {
+    delete process.env.TASKMASTER_GH_REPOS;
+    try {
+      const { urls, fetchImpl } = fakeGithubFetch({});
+      await defaultListThreads(fetchImpl);
+      expect(urls.length).toBeGreaterThan(0);
+      expect(urls.every(url => url.includes('/repos/bluedevilcollectibles/bdc-xo/issues'))).toBe(
+        true
+      );
+    } finally {
+      process.env.TASKMASTER_GH_REPOS = 'bluedevilcollectibles/bdc-harness';
+    }
   });
 
   test('pull requests are skipped and a failed label read never crashes the tick', async () => {

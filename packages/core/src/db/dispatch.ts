@@ -79,6 +79,10 @@ interface DispatchMessageRow extends Omit<
   resolved_xo_fencing_token: number | string | null;
 }
 
+type CompatibleDispatchMessageRow = DispatchMessageRow & {
+  sender_principal_id?: string | null;
+};
+
 interface DispatchWorkerRow extends Omit<DispatchWorker, 'capabilities'> {
   capabilities: unknown;
 }
@@ -301,11 +305,13 @@ async function createMessageWithQuery(
   query: DispatchQueryExecutor,
   data: CreateDispatchMessageData
 ): Promise<DispatchMessage> {
-  const existing = await query<DispatchMessageRow>(
+  const existing = await query<CompatibleDispatchMessageRow>(
     'SELECT * FROM agent_dispatch_messages WHERE idempotency_key = $1',
     [data.idempotency_key]
   );
-  const existingRow = existing.rows[0];
+  const existingRow = existing.rows.find(
+    row => row.sender_principal_id === undefined || row.sender_principal_id === null
+  );
   if (existingRow) return normalizeMessage(existingRow);
 
   const subjectKey =
@@ -330,12 +336,12 @@ async function createMessageWithQuery(
   }
 
   const now = nowIso();
-  const result = await query<DispatchMessageRow>(
+  const result = await query<CompatibleDispatchMessageRow>(
     `INSERT INTO agent_dispatch_messages
      (id, correlation_id, idempotency_key, task_type, sender, recipient, body, status, created_at, not_before, priority, fencing_token,
       recipient_alias, motion_id, motion_revision_sha, subject_key, repeat_reason, supersedes_id)
      VALUES ($1, $2, $3, $4, $5, $6, $7, 'queued', $8, $9, $10, 0, $11, $12, $13, $14, $15, $16)
-     ON CONFLICT (idempotency_key) DO UPDATE SET idempotency_key = EXCLUDED.idempotency_key
+     ON CONFLICT DO NOTHING
      RETURNING *`,
     [
       randomUUID(),
@@ -357,8 +363,18 @@ async function createMessageWithQuery(
     ]
   );
   const row = result.rows[0];
-  if (!row) throw new Error('Failed to create dispatch message');
-  return normalizeMessage(row);
+  if (row) return normalizeMessage(row);
+
+  const conflict = await query<CompatibleDispatchMessageRow>(
+    'SELECT * FROM agent_dispatch_messages WHERE idempotency_key = $1',
+    [data.idempotency_key]
+  );
+  const legacyConflict = conflict.rows.find(
+    candidate =>
+      candidate.sender_principal_id === undefined || candidate.sender_principal_id === null
+  );
+  if (!legacyConflict) throw new Error('dispatch_idempotency_namespace_conflict');
+  return normalizeMessage(legacyConflict);
 }
 
 export async function getMessage(id: string): Promise<DispatchMessage | null> {
