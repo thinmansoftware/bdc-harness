@@ -2145,6 +2145,14 @@ nodes:
           | sed -E 's/^.*feature-branch:[[:space:]]*//')
       fi
       if [ -z "$BRANCH" ]; then
+        # Bare-form fallback (anchor run ce394492, zero-open tier, 2026-08-07):
+        # open-tier models emit "push_target: feat/<name>" WITHOUT the
+        # feature-branch: prefix. Accept the bare form LAST. Safe: the extracted
+        # token still must pass BRANCH_PATTERN below, so this admits nothing the
+        # strict form would not.
+        BRANCH=$(printf '%s\n' "$DECIDE_OUTPUT_CLEAN" | { grep -oE 'push_target:[[:space:]]*(feat|fix|wip)/[A-Za-z0-9_-]+' || true; } | head -n 1 | sed -E 's/^push_target:[[:space:]]*//')
+      fi
+      if [ -z "$BRANCH" ]; then
         if printf '%s\n' "$DECIDE_OUTPUT_CLEAN" | grep -q 'push_target'; then
           PUSH_TARGET_EXCERPT=$(printf '%s\n' "$DECIDE_OUTPUT_CLEAN" | grep 'push_target' | head -n 1 | cut -c1-200)
           echo "push_target field present but unparseable: ${PUSH_TARGET_EXCERPT}" >&2
