@@ -20,6 +20,7 @@ enumerate_refs() {
 
 main() {
   local offenders
+  local refs
 
   if [[ ${1:-} == "--stdin" ]]; then
     if (( $# != 1 )); then
@@ -32,7 +33,12 @@ main() {
       printf 'usage: %s [repo-slug]\n       %s --stdin\n' "$0" "$0" >&2
       return 2
     fi
-    offenders=$(enumerate_refs "${1:-bluedevilcollectibles/bdc-harness}" | filter_phantom_refs)
+    if ! refs=$(enumerate_refs "${1:-bluedevilcollectibles/bdc-harness}"); then
+      printf 'error: failed to enumerate refs for %s\n' \
+        "${1:-bluedevilcollectibles/bdc-harness}" >&2
+      return 2
+    fi
+    offenders=$(printf '%s\n' "$refs" | filter_phantom_refs)
   fi
 
   if [[ -n $offenders ]]; then
