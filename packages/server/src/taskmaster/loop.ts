@@ -187,6 +187,17 @@ interface GithubIssue {
  * issue number -- OR semantics, never requiring both simultaneously.
  */
 const WORK_LABELS = ['wo', 'project', 'arc'] as const;
+const GITHUB_RATE_LIMIT_FLOOR = 5;
+
+class GithubRateLimitBackoffError extends Error {}
+
+function assertGithubRateLimit(response: Response, context: string): void {
+  const remaining = Number.parseInt(response.headers.get('x-ratelimit-remaining') ?? '', 10);
+  if (Number.isInteger(remaining) && remaining < GITHUB_RATE_LIMIT_FLOOR) {
+    log.warn({ context, remaining }, 'taskmaster.github_rate_limit_backoff');
+    throw new GithubRateLimitBackoffError(`taskmaster_github_rate_limit_backoff:${remaining}`);
+  }
+}
 
 /**
  * Work-SOR read: open GitHub issues labeled wo, project, or arc across the configured
@@ -219,11 +230,7 @@ export async function defaultListThreads(
             },
           }
         );
-        const remaining = Number.parseInt(response.headers.get('x-ratelimit-remaining') ?? '', 10);
-        if (Number.isInteger(remaining) && remaining < 5) {
-          log.warn({ repo, label, remaining }, 'taskmaster.github_rate_limit_backoff');
-          throw new Error(`taskmaster_github_rate_limit_backoff:${remaining}`);
-        }
+        assertGithubRateLimit(response, `work-sor:${repo}:${label}`);
         if (!response.ok) {
           log.warn({ repo, label, status: response.status }, 'taskmaster.github_read_failed');
           throw new Error(`taskmaster_github_work_sor_read_failed:${response.status}`);
@@ -299,25 +306,30 @@ export async function defaultGetGithubIssueEvidence(
     `https://api.github.com/repos/${repo}/issues/${issueNumber}`,
     { headers: githubHeaders() }
   );
+  assertGithubRateLimit(issueResponse, `evidence:issue:${repo}#${issueNumber}`);
   if (!issueResponse.ok) {
     throw new Error(`taskmaster_github_issue_evidence_read_failed:${issueResponse.status}`);
   }
   const issue = (await issueResponse.json()) as GithubIssueDetail;
-  const [commentsResponse, eventsResponse] = await Promise.all([
-    fetchImpl(
-      `https://api.github.com/repos/${repo}/issues/${issueNumber}/comments?since=${encodeURIComponent(sinceIso)}&per_page=100`,
-      { headers: githubHeaders() }
-    ),
-    fetchImpl(`https://api.github.com/repos/${repo}/issues/${issueNumber}/events?per_page=100`, {
-      headers: githubHeaders(),
-    }),
-  ]);
-  if (!commentsResponse.ok || !eventsResponse.ok) {
+  const commentsResponse = await fetchImpl(
+    `https://api.github.com/repos/${repo}/issues/${issueNumber}/comments?since=${encodeURIComponent(sinceIso)}&per_page=100`,
+    { headers: githubHeaders() }
+  );
+  assertGithubRateLimit(commentsResponse, `evidence:comments:${repo}#${issueNumber}`);
+  if (!commentsResponse.ok) {
     throw new Error(
-      `taskmaster_github_issue_evidence_read_failed:${commentsResponse.status}:${eventsResponse.status}`
+      `taskmaster_github_issue_evidence_read_failed:comments:${commentsResponse.status}`
     );
   }
   const comments = (await commentsResponse.json()) as GithubIssueComment[];
+  const eventsResponse = await fetchImpl(
+    `https://api.github.com/repos/${repo}/issues/${issueNumber}/events?per_page=100`,
+    { headers: githubHeaders() }
+  );
+  assertGithubRateLimit(eventsResponse, `evidence:events:${repo}#${issueNumber}`);
+  if (!eventsResponse.ok) {
+    throw new Error(`taskmaster_github_issue_evidence_read_failed:events:${eventsResponse.status}`);
+  }
   const events = (await eventsResponse.json()) as GithubIssueEvent[];
   const progress = comments
     .filter(comment => {
@@ -490,6 +502,7 @@ async function gradeSentActions(
     } catch (error) {
       failures += 1;
       log.warn({ err: error as Error, journalId: action.id }, 'taskmaster.grade_failed');
+      if (error instanceof GithubRateLimitBackoffError) break;
     }
   }
   return failures;

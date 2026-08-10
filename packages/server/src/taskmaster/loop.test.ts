@@ -1146,4 +1146,70 @@ describe('defaultListThreads -- GitHub work-SOR read', () => {
       )
     ).rejects.toThrow('synthetic evidence network failure');
   });
+
+  test('low evidence quota stops later evidence calls and the successful heartbeat', async () => {
+    const world = makeWorld();
+    seedDigestSent(world);
+    for (const issueNumber of [1453, 1454]) {
+      const key = `tm:nudge:gh:bluedevilcollectibles/bdc-xo#${issueNumber}:1`;
+      world.journal.push({
+        id: `low-quota-${issueNumber}`,
+        created_at: new Date(T0 - 60_000).toISOString(),
+        thread_ref: `gh:bluedevilcollectibles/bdc-xo#${issueNumber}`,
+        action_type: 'nudge',
+        proposal_json: '{}',
+        idempotency_key: key,
+        before_hash: null,
+        proof_predicate: 'post-send source progress',
+        proof_deadline_at: new Date(T0 + 60_000).toISOString(),
+        outcome: 'sent',
+        graded_at: null,
+        grade: null,
+      });
+      world.sentMessages.push({
+        idempotency_key: key,
+        recipient: 'xo',
+        body: 'nudge',
+        createdAt: new Date(T0 - 30_000).toISOString(),
+      });
+    }
+    const urls: string[] = [];
+    const fetchImpl = (async (input: string | URL | Request) => {
+      const url = String(input);
+      urls.push(url);
+      if (urls.length === 1) {
+        return new Response(
+          JSON.stringify({
+            number: 1453,
+            state: 'open',
+            updated_at: new Date(T0).toISOString(),
+            labels: [{ name: 'wo' }],
+            assignees: [],
+          }),
+          { status: 200, headers: { 'x-ratelimit-remaining': '100' } }
+        );
+      }
+      return new Response('[]', {
+        status: 200,
+        headers: { 'x-ratelimit-remaining': '4' },
+      });
+    }) as typeof fetch;
+    const state = createTaskmasterState(60_000);
+
+    const result = await tick(
+      state,
+      makeDeps(world, {
+        getGithubIssueEvidence: (ref, sinceIso) =>
+          defaultGetGithubIssueEvidence(ref, sinceIso, fetchImpl),
+      })
+    );
+
+    expect(result.successful).toBe(false);
+    expect(state.deadman.lastTickAtMs).toBeNull();
+    expect(urls).toHaveLength(2);
+    expect(urls[0]).toContain('/issues/1453');
+    expect(urls[1]).toContain('/issues/1453/comments');
+    expect(urls.some(url => url.includes('/events'))).toBe(false);
+    expect(urls.some(url => url.includes('/issues/1454'))).toBe(false);
+  });
 });
