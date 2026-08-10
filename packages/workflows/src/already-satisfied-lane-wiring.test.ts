@@ -131,6 +131,9 @@ describe('already-satisfied lane wiring', () => {
 
       const gate = result.workflow.nodes.find(node => node.id === 'gate-already-satisfied');
       expect(gate?.bash).toBeString();
+      const forceBuild =
+        file === 'bdc-feature-development-zero.yaml' ||
+        file === 'bdc-feature-development-zero-open.yaml';
 
       const already = await runGateScript(
         gate?.bash ?? '',
@@ -141,12 +144,21 @@ describe('already-satisfied lane wiring', () => {
       );
       expect(already.exitCode).toBe(0);
       expect(already.stdout.trim().split('\n')).toHaveLength(1);
-      expect(JSON.parse(already.stdout)).toEqual({
-        ALREADY_SATISFIED: true,
-        PRECHECK_VERDICT: 'already-satisfied',
-        SATISFIED_EVIDENCE: 'branch already contains required harness change',
-      });
-      expect(already.stderr).toContain('build-only nodes will be skipped');
+      if (forceBuild) {
+        // WO-HARNESS-CLAUDE-FREE-LANE-RECOVERY-01: advisory true cannot skip zero lanes.
+        expect(JSON.parse(already.stdout)).toEqual({
+          ALREADY_SATISFIED: false,
+          PRECHECK_VERDICT: 'needs-build',
+        });
+        expect(already.stderr).toContain('zero-lane forces needs-build');
+      } else {
+        expect(JSON.parse(already.stdout)).toEqual({
+          ALREADY_SATISFIED: true,
+          PRECHECK_VERDICT: 'already-satisfied',
+          SATISFIED_EVIDENCE: 'branch already contains required harness change',
+        });
+        expect(already.stderr).toContain('build-only nodes will be skipped');
+      }
 
       const needsBuild = await runGateScript(gate?.bash ?? '', 'ALREADY_SATISFIED=false');
       expect(needsBuild.exitCode).toBe(0);
@@ -155,7 +167,11 @@ describe('already-satisfied lane wiring', () => {
         ALREADY_SATISFIED: false,
         PRECHECK_VERDICT: 'needs-build',
       });
-      expect(needsBuild.stderr).toBe('');
+      if (forceBuild) {
+        expect(needsBuild.stderr).toContain('zero-lane forces needs-build');
+      } else {
+        expect(needsBuild.stderr).toBe('');
+      }
     }, 15000);
 
     it(`${file} preserves adversarial already-satisfied evidence through shell embedding`, async () => {
@@ -166,6 +182,9 @@ describe('already-satisfied lane wiring', () => {
       const gate = result.workflow.nodes.find(node => node.id === 'gate-already-satisfied');
       expect(gate?.bash).toBeString();
       expect(gate?.bash).not.toContain('BDC_CHECK_ALREADY_SATISFIED_OUTPUT');
+      const forceBuild =
+        file === 'bdc-feature-development-zero.yaml' ||
+        file === 'bdc-feature-development-zero-open.yaml';
 
       const evidence = [
         "branch contains quoted value 'already done'",
@@ -183,12 +202,20 @@ describe('already-satisfied lane wiring', () => {
 
       expect(already.exitCode).toBe(0);
       expect(already.stdout.trim().split('\n')).toHaveLength(1);
-      expect(JSON.parse(already.stdout)).toEqual({
-        ALREADY_SATISFIED: true,
-        PRECHECK_VERDICT: 'already-satisfied',
-        SATISFIED_EVIDENCE: evidence,
-      });
-      expect(already.stderr).toContain('build-only nodes will be skipped');
+      if (forceBuild) {
+        expect(JSON.parse(already.stdout)).toEqual({
+          ALREADY_SATISFIED: false,
+          PRECHECK_VERDICT: 'needs-build',
+        });
+        expect(already.stderr).toContain('zero-lane forces needs-build');
+      } else {
+        expect(JSON.parse(already.stdout)).toEqual({
+          ALREADY_SATISFIED: true,
+          PRECHECK_VERDICT: 'already-satisfied',
+          SATISFIED_EVIDENCE: evidence,
+        });
+        expect(already.stderr).toContain('build-only nodes will be skipped');
+      }
     });
   }
 });

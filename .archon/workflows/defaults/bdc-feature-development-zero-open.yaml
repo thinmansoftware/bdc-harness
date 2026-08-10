@@ -6,10 +6,10 @@ description: |
   of DIFFERENT open models attacking each other's work -- cross-model
   diversity is the quality mechanism that replaces the always-expensive judge:
     plan (architect seat)        = Qwen qwen/qwen3-coder-next (root default)
-    plan-review (attack seat)    = DeepSeek deepseek-chat-v3.1
-    implement + repairs (builder)= Qwen qwen/qwen3-coder-next
+    plan-review (attack seat)    = Grok x-ai/grok-4.5
+    implement + repairs (builder)= Grok x-ai/grok-4.5
     diff reviews (attack seats)  = DeepSeek deepseek-chat-v3.1
-    war-council-validator (judge)= DeepSeek via opr-zero (true dual-cap; no Claude, no Codex)
+    war-council-validator (judge)= DeepSeek via OpenRouter (dual-cap; no Claude execution)
   No model ever grades its own output; NO node consumes the expensive review seat. All
   persona-bearing prompt nodes use model-free -opr/-codex persona variants
   (persona model wins over node model; an incompatible alias on a no-paid-seat
@@ -199,60 +199,29 @@ nodes:
   # gate-already-satisfied: bash gate that reads check-already-satisfied's verdict and
   # emits a single JSON document on stdout for downstream when: conditions. Human-readable
   # diagnostics go to stderr so condition-evaluator can parse $gate-already-satisfied.output.
+  # WO-HARNESS-CLAUDE-FREE-LANE-RECOVERY-01: on zero lanes the advisory precheck may
+  # inspect and log, but MUST NOT skip build-only nodes. A real no-op is decided later
+  # by the implementation mailbox plus real-diff guard.
   - id: gate-already-satisfied
     depends_on: [check-already-satisfied]
     bash: |
       set -uo pipefail
       # Direct assignment (not heredoc). The executor's substituteNodeOutputRefs
       # wraps the multi-line node output in single quotes via shellQuote, producing
-      # a valid multi-line bash assignment: CAS='line1\nline2\n...'. The previous
-      # heredoc pattern silently broke at runtime because the substituted value
-      # ARRIVED already single-quoted, embedding literal apostrophes at the start
-      # and end of the heredoc content. That made the first line
-      #   'ALREADY_SATISFIED=true
-      # which never matched grep -qE '^ALREADY_SATISFIED=true', so this gate
-      # always fell through to PRECHECK_VERDICT=needs-build and no skip ever
-      # happened. Mirrors the direct-assignment pattern that already works in
-      # the bdc-harness-*.yaml lanes.
+      # a valid multi-line bash assignment: CAS='line1\nline2\n...'.
+      # Force-build policy (zero-lane recovery): keep the advisory text for
+      # diagnostics only; machine output consumed by when: is always needs-build.
       CAS=$check-already-satisfied.output
-      if printf '%s\n' "$CAS" | grep -qE '^ALREADY_SATISFIED=true'; then
-        SATISFIED_EVIDENCE=$(printf '%s\n' "$CAS" | sed -n 's/^SATISFIED_EVIDENCE=//p' | head -1)
-        if printf '%s\n' "$CAS" | grep -qE '^SATISFIED_ON_BASE=true'; then
-          ALREADY_VALUE=true PRECHECK_VERDICT=already-merged-on-base SATISFIED_ON_BASE=true SATISFIED_EVIDENCE="$SATISFIED_EVIDENCE" python3 - <<'PY'
+      echo "gate-already-satisfied: advisory precheck (diagnostics only; zero-lane forces needs-build):" >&2
+      printf '%s\n' "$CAS" | head -n 20 >&2
+      python3 - <<'PY'
       import json
-      import os
       print(json.dumps({
-          "ALREADY_SATISFIED": os.environ.get("ALREADY_VALUE") == "true",
-          "PRECHECK_VERDICT": os.environ.get("PRECHECK_VERDICT", "already-merged-on-base"),
-          "SATISFIED_EVIDENCE": os.environ.get("SATISFIED_EVIDENCE", ""),
-          "SATISFIED_ON_BASE": os.environ.get("SATISFIED_ON_BASE") == "true",
+          "ALREADY_SATISFIED": False,
+          "PRECHECK_VERDICT": "needs-build",
       }, separators=(",", ":")))
       PY
-          echo "gate-already-satisfied: WO appears already merged on origin/<base> (not in this worktree); build-only nodes will be skipped." >&2
-        else
-          ALREADY_VALUE=true PRECHECK_VERDICT=already-satisfied SATISFIED_EVIDENCE="$SATISFIED_EVIDENCE" python3 - <<'PY'
-      import json
-      import os
-      print(json.dumps({
-          "ALREADY_SATISFIED": os.environ.get("ALREADY_VALUE") == "true",
-          "PRECHECK_VERDICT": os.environ.get("PRECHECK_VERDICT", "already-satisfied"),
-          "SATISFIED_EVIDENCE": os.environ.get("SATISFIED_EVIDENCE", ""),
-      }, separators=(",", ":")))
-      PY
-          echo "gate-already-satisfied: WO appears already implemented in this worktree; build-only nodes will be skipped." >&2
-        fi
-      else
-        ALREADY_VALUE=false PRECHECK_VERDICT=needs-build python3 - <<'PY'
-      import json
-      import os
-      print(json.dumps({
-          "ALREADY_SATISFIED": os.environ.get("ALREADY_VALUE") == "true",
-          "PRECHECK_VERDICT": os.environ.get("PRECHECK_VERDICT", "needs-build"),
-      }, separators=(",", ":")))
-      PY
-      fi
       exit 0
-
   - id: plan
     persona: war-council-architect-opr
     depends_on: [gate-already-satisfied]
@@ -299,14 +268,13 @@ nodes:
   # plan that `implement` consumes. NOT a human gate -- humans are reached only via the
   # async escalation payload, and only at the irreversible-action boundary downstream.
   - id: plan-review
-    provider: codex-opr
+    provider: grok
     persona: war-council-architect-opr
     agent: war-council-architect-opr
-    # FUSION war council (John 2026-07-07): every council seat is a DIFFERENT open
-    # model attacking the others' work. The plan authored by qwen (root default)
-    # is reviewed by DeepSeek here -- never self-graded. Cross-model diversity IS
-    # the quality mechanism replacing the paid-seat judge on this lane.
-    model: deepseek/deepseek-chat-v3.1
+    # Claude-free recovery (WO-HARNESS-CLAUDE-FREE-LANE-RECOVERY-01): Qwen authors
+    # the plan; Grok 4.5 holds the blocking plan-review seat. DeepSeek remains the
+    # independent post-implementation reviewer. Never self-graded.
+    model: x-ai/grok-4.5
     depends_on: [plan]
     trigger_rule: all_done
     when: "$gate-already-satisfied.output.ALREADY_SATISFIED != 'true'"
@@ -523,7 +491,7 @@ nodes:
         Implementation per WO spec. Self-verified within implement loop.
         Workflow-time verify-* removed 2026-05-16 (Patch 1); PR-time gates handle validation.
 
-        Co-Authored-By: paid-seat (Cauldron major-build) <noreply@paid-seat-vendor.com>"
+        Co-Authored-By: Cauldron major-build <noreply@bluedevilcollectibles.com>"
         git push -u origin "$BRANCH" 2>&1 || echo "WARN: push failed - operator must recover from worktree"
         ```
 
@@ -668,7 +636,7 @@ nodes:
       Cauldron resilience checkpoint. Not the final commit.
       Will be superseded by backstop commit-and-push node.
 
-      Co-Authored-By: paid-seat Sonnet 4.6 <noreply@paid-seat-vendor.com>" \
+      Co-Authored-By: Cauldron major-build <noreply@bluedevilcollectibles.com>" \
         2>/dev/null || { echo "WARN: checkpoint commit failed -- continuing" >&2; exit 0; }
 
       if git push -u origin "HEAD:${WIP_BRANCH}" 2>/dev/null; then
@@ -1233,7 +1201,7 @@ nodes:
 
   - id: diff-review
     provider: codex-opr
-    model: gpt-5.6-sol
+    model: deepseek/deepseek-chat-v3.1
     agent: codex-adversarial-reviewer
     depends_on: [capture-diff]
     task_class: medium_work
@@ -1447,7 +1415,7 @@ nodes:
 
   - id: diff-review-final
     provider: codex-opr
-    model: gpt-5.6-sol
+    model: deepseek/deepseek-chat-v3.1
     agent: codex-adversarial-reviewer
     depends_on: [diff-review, classify-diff-review, diff-repair, capture-diff-final]
     trigger_rule: all_done
@@ -1613,7 +1581,7 @@ nodes:
   # terminal-BLOCKED on a non-interactive run.
   - id: opus-rereview
     provider: codex-opr
-    model: gpt-5.6-sol
+    model: deepseek/deepseek-chat-v3.1
     agent: codex-adversarial-reviewer
     depends_on: [classify-opus-repair]
     trigger_rule: all_done
@@ -1887,13 +1855,13 @@ nodes:
         max_attempts: 2
 
   # apply-suggested-fix: runs ONLY when the operator chose APPROVE-WITH-FIX at the gate.
-  # Authorizes overseer-opus to apply the named suggested fix(es) -- including writing a NEW
+  # Authorizes the model-free major-build-opr agent to apply the named suggested fix(es) -- including writing a NEW
   # schema migration the self-repair loop deferred -- but ONLY for the authorized_fix_ids.
   # trigger_rule all_done so an APPROVE-AS-IS run (which skips this) does not hang the DAG.
   - id: apply-suggested-fix
     provider: grok
     model: x-ai/grok-4.5
-    agent: overseer-opus
+    agent: major-build-opr
     effort: xhigh
     context: fresh
     depends_on: [pause-gate]
@@ -1929,7 +1897,7 @@ nodes:
   # Distinct id (diff-review-final already ran upstream). Only meaningful on the APPROVE-WITH-FIX path.
   - id: apply-diff-review-final
     provider: codex-opr
-    model: gpt-5.6-sol
+    model: deepseek/deepseek-chat-v3.1
     agent: codex-adversarial-reviewer
     depends_on: [apply-suggested-fix]
     trigger_rule: all_done

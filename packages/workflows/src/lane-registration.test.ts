@@ -179,6 +179,86 @@ describe('lane registration and war-council-validator pin', () => {
     });
   }
 
+  it('S4j: zero and zero-open Claude-free recovery roster', () => {
+    // WO-HARNESS-CLAUDE-FREE-LANE-RECOVERY-01: Qwen plans, Grok plan-reviews and
+    // builds/repairs, DeepSeek independently reviews implementation. No Anthropic
+    // executable binding, no overseer-opus persona, no false Claude/paid-seat trailer.
+    for (const file of [
+      'bdc-feature-development-zero.yaml',
+      'bdc-feature-development-zero-open.yaml',
+    ]) {
+      const lane = loadLane(file);
+      const content = readFileSync(join(LANES_DIR, file), 'utf-8');
+      const nodes = lane.nodes ?? [];
+      const node = (id: string) => nodes.find(candidate => candidate.id === id);
+
+      // Plan author remains the root Qwen provider/model.
+      expect(lane.provider === 'glm' || lane.provider === 'opr-zero').toBe(true);
+      expect(lane.model?.startsWith('qwen/')).toBe(true);
+
+      const planReview = node('plan-review');
+      expect(planReview?.provider, `${file}:plan-review:provider`).toBe('grok');
+      expect(planReview?.model, `${file}:plan-review:model`).toBe('x-ai/grok-4.5');
+
+      for (const id of ['implement', 'diff-repair', 'opus-repair', 'apply-suggested-fix']) {
+        const executionNode = node(id);
+        expect(executionNode?.provider, `${file}:${id}:provider`).toBe('grok');
+        expect(executionNode?.model, `${file}:${id}:model`).toBe('x-ai/grok-4.5');
+      }
+
+      expect(node('apply-suggested-fix')?.agent, `${file}:apply-suggested-fix:agent`).toBe(
+        'major-build-opr'
+      );
+
+      // Independent DeepSeek implementation review seats.
+      const deepseekSeats =
+        file === 'bdc-feature-development-zero-open.yaml'
+          ? [
+              'war-council-validator',
+              'diff-review',
+              'diff-review-final',
+              'opus-rereview',
+              'apply-diff-review-final',
+            ]
+          : [
+              'war-council-validator',
+              'diff-review',
+              'diff-review-final',
+              'opus-rereview',
+              'apply-diff-review-final',
+            ];
+      for (const id of deepseekSeats) {
+        const reviewNode = node(id) as NodeDef & { agent?: string };
+        expect(reviewNode?.provider, `${file}:${id}:provider`).toBe('codex-opr');
+        expect(reviewNode?.model, `${file}:${id}:model`).toBe('deepseek/deepseek-chat-v3.1');
+        expect(reviewNode?.model, `${file}:${id}:not-gpt`).not.toMatch(/^gpt-/);
+        expect(reviewNode?.model, `${file}:${id}:not-claude`).not.toMatch(/claude/i);
+        expect(reviewNode?.model, `${file}:${id}:not-grok`).not.toBe('x-ai/grok-4.5');
+      }
+
+      // Executable Claude/Anthropic and overseer-opus exclusions.
+      expect(content).not.toMatch(/^\s*provider:\s*claude\b/m);
+      expect(content).not.toMatch(/^\s*model:\s*claude/m);
+      expect(content).not.toContain('agent: overseer-opus');
+      expect(content).not.toMatch(/^\s*failover_provider:\s*claude\b/m);
+      expect(content).not.toMatch(/noreply@(anthropic|paid-seat-vendor)\.com/);
+      expect(content).not.toMatch(/Co-Authored-By:\s*(Claude|paid-seat)/i);
+    }
+  });
+
+  it('S4k: grok/zero/zero-open contain no false Claude or paid-seat commit trailers', () => {
+    for (const file of [
+      'bdc-feature-development-zero.yaml',
+      'bdc-feature-development-zero-open.yaml',
+      'bdc-feature-development-grok.yaml',
+    ]) {
+      const content = readFileSync(join(LANES_DIR, file), 'utf-8');
+      expect(content, file).not.toMatch(/noreply@(anthropic|paid-seat-vendor)\.com/);
+      expect(content, file).not.toMatch(/Co-Authored-By:\s*(Claude|paid-seat)/i);
+      expect(content, file).not.toContain('agent: overseer-opus');
+    }
+  });
+
   it('S4i: the dedicated Grok lane pins execution to Grok and review to non-Grok seats', () => {
     const file = 'bdc-feature-development-grok.yaml';
     const lane = loadLane(file);

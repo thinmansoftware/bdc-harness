@@ -471,7 +471,7 @@ nodes:
         Implementation per WO spec. Self-verified within implement loop.
         Workflow-time verify-* removed 2026-05-16 (Patch 1); PR-time gates handle validation.
 
-        Co-Authored-By: paid-seat (Cauldron major-build) <noreply@paid-seat-vendor.com>"
+        Co-Authored-By: Cauldron major-build <noreply@bluedevilcollectibles.com>"
         git push -u origin "$BRANCH" 2>&1 || echo "WARN: push failed - operator must recover from worktree"
         ```
 
@@ -612,7 +612,7 @@ nodes:
       Cauldron resilience checkpoint. Not the final commit.
       Will be superseded by backstop commit-and-push node.
 
-      Co-Authored-By: paid-seat Sonnet 4.6 <noreply@paid-seat-vendor.com>" \
+      Co-Authored-By: Cauldron major-build <noreply@bluedevilcollectibles.com>" \
         2>/dev/null || { echo "WARN: checkpoint commit failed -- continuing" >&2; exit 0; }
 
       if git push -u origin "HEAD:${WIP_BRANCH}" 2>/dev/null; then
