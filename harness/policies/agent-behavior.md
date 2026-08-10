@@ -32,6 +32,21 @@ source: BDC_XO/memory/project_universal-agent-behavior-policy.md
 - **PowerShell (`.ps1`) is operator-side tooling and is NOT available in the builder.** Files like `consume-inbox.ps1`, `publish-wo-spec.ps1`, `fire-wo.ps1`, `Test-CauldronYaml.ps1`, `register-yaml.ps1` run on the operator's Windows machine to DRIVE Cauldron from outside -- they are never executed inside a build. If your WO has you AUTHOR a `.ps1`, write it and rely on **static review + operator-side testing** (per the WO's stop conditions); do NOT attempt to run it, do NOT look for `pwsh`/`powershell`, and do NOT treat its absence as a blocker. Note "PS deliverable authored; operator-side test required" and continue.
 - **General rule:** a missing tool that the WO never asked you to execute is not a failure. Adapt (static-check instead of run) and proceed; surface the limitation rather than burning the build chasing it.
 
+## Builders NEVER merge (bdc-xo#1491, 2026-08-10)
+
+**Opening the PR is a builder's terminal act. You MUST NOT merge any pull
+request -- not your own, not anyone's.** No `gh pr merge`, no merge REST/GraphQL
+API calls, no auto-merge enablement. Merging is reserved for the Overseer
+merge-steward, the operator, or a human -- review layers you are not.
+
+Anchor: on 2026-08-10 a build-lane implement agent ran
+`gh pr merge --squash --auto` on its own PR and landed unreviewed code on dev,
+bypassing the same diff-review gate that had caught a real defect in the same
+WO an hour earlier. A container-level `gh` guard now denies merge verbs
+mechanically (exit 86); attempting one is a policy violation even where the
+guard is absent. If you believe a merge is genuinely needed, say so in your
+output and stop -- do not attempt it.
+
 ## Canonical Placement
 
 `BDC_XO/harness/policies/agent-behavior.md` -- single source of truth. Every runtime vendors/symlinks/adapts it:
