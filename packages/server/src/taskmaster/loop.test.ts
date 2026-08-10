@@ -6,6 +6,7 @@
 import { afterAll, describe, expect, test } from 'bun:test';
 import {
   createTaskmasterState,
+  defaultGetGithubIssueEvidence,
   defaultListThreads,
   tick,
   resolveTaskmasterIntervalMs,
@@ -27,7 +28,12 @@ const TODAY_KEY = new Date(T0).toISOString().slice(0, 10);
 interface FakeWorld {
   journal: TmJournalEntry[];
   control: TmControlState;
-  sentMessages: Array<{ idempotency_key: string; recipient: string; body: string }>;
+  sentMessages: Array<{
+    idempotency_key: string;
+    recipient: string;
+    body: string;
+    createdAt: string;
+  }>;
   nowMs: number;
   recordCalls: number;
 }
@@ -145,12 +151,13 @@ function makeDeps(world: FakeWorld, overrides: Partial<TaskmasterDeps> = {}): Ta
         idempotency_key: data.idempotency_key,
         recipient: data.recipient,
         body: data.body,
+        createdAt: new Date(world.nowMs).toISOString(),
       });
       return { id: `msg-${world.sentMessages.length}`, status: 'queued' };
     }) as unknown as TaskmasterDeps['createTask'],
     findEffectByIdempotencyKey: async (key: string) => {
       const found = world.sentMessages.find(m => m.idempotency_key === key);
-      return found ? { id: 'existing', status: 'queued' } : null;
+      return found ? { id: 'existing', status: 'queued', createdAt: found.createdAt } : null;
     },
     listUndeliveredRulings: async () => [],
     listThreads: async () => [],
@@ -302,7 +309,12 @@ describe('scenario 4: restart produces no double effect', () => {
       grade: null,
     });
     // The effect DID land in the SOR before the crash.
-    world.sentMessages.push({ idempotency_key: key, recipient: 'xo', body: 'ruling' });
+    world.sentMessages.push({
+      idempotency_key: key,
+      recipient: 'xo',
+      body: 'ruling',
+      createdAt: new Date(T0 - 30_000).toISOString(),
+    });
     const sendsBefore = world.sentMessages.length;
 
     const deps = makeDeps(world, { listUndeliveredRulings: async () => [ruling()] });
@@ -455,6 +467,41 @@ describe('failed effect reuse and successful-tick health', () => {
     expect(world.journal.find(row => row.id === 'deferred-nudge')?.outcome).toBe('sent');
   });
 
+  test('an expired deferred row is terminal and is not sent', async () => {
+    const world = makeWorld();
+    seedDigestSent(world);
+    const staleThread: ThreadSnapshot = {
+      ref: 'gh:bluedevilcollectibles/bdc-xo#1501',
+      priority: 'P1',
+      lastActivityAt: new Date(T0 - 5 * 3_600_000).toISOString(),
+      recipient: 'xo',
+    };
+    world.journal.push({
+      id: 'expired-deferred-nudge',
+      created_at: new Date(T0 - 60_000).toISOString(),
+      thread_ref: staleThread.ref,
+      action_type: 'nudge',
+      proposal_json: '{}',
+      idempotency_key: `tm:nudge:${staleThread.ref}:${Math.floor(T0 / (4 * 3_600_000))}`,
+      before_hash: null,
+      proof_predicate: 'source issue progress after send',
+      proof_deadline_at: new Date(T0 - 1).toISOString(),
+      outcome: 'deferred',
+      graded_at: null,
+      grade: null,
+    });
+
+    const result = await tick(
+      createTaskmasterState(60_000),
+      makeDeps(world, { listThreads: async () => [staleThread] })
+    );
+
+    expect(result.effects).toBe(0);
+    expect(world.sentMessages).toHaveLength(0);
+    expect(world.journal).toHaveLength(2);
+    expect(world.journal.find(row => row.id === 'expired-deferred-nudge')?.outcome).toBe('expired');
+  });
+
   test('a successful no-op tick records the successful heartbeat', async () => {
     const world = makeWorld();
     seedDigestSent(world);
@@ -509,11 +556,13 @@ describe('SC7 grading requires external source progress', () => {
       idempotency_key: 'tm:nudge:gh:bluedevilcollectibles/bdc-xo#1450:1',
       recipient: 'xo',
       body: 'reminder',
+      createdAt: new Date(T0 - 45_000).toISOString(),
     });
     world.sentMessages.push({
       idempotency_key: `tm:digest:${TODAY_KEY}`,
       recipient: 'operator',
       body: 'digest',
+      createdAt: new Date(T0 - 45_000).toISOString(),
     });
 
     await tick(createTaskmasterState(60_000), makeDeps(world));
@@ -543,6 +592,7 @@ describe('SC7 grading requires external source progress', () => {
       idempotency_key: 'tm:deliver_ruling:ruling-original',
       recipient: 'xo',
       body: 'ruling reminder',
+      createdAt: new Date(T0 - 45_000).toISOString(),
     });
     const deps = makeDeps(world, {
       getDispatchMessageById: (async () => ({
@@ -577,7 +627,12 @@ describe('SC7 grading requires external source progress', () => {
       graded_at: null,
       grade: null,
     });
-    world.sentMessages.push({ idempotency_key: key, recipient: 'xo', body: 'nudge' });
+    world.sentMessages.push({
+      idempotency_key: key,
+      recipient: 'xo',
+      body: 'nudge',
+      createdAt: new Date(T0 - 45_000).toISOString(),
+    });
     const deps = makeDeps(world, {
       getGithubIssueEvidence: async () => ({
         state: 'open',
@@ -594,6 +649,107 @@ describe('SC7 grading requires external source progress', () => {
     await tick(createTaskmasterState(60_000), deps);
 
     expect(world.journal.find(row => row.id === 'progress-nudge')?.grade).toBe('useful');
+  });
+
+  test('source progress after journal creation but before the actual send is not useful', async () => {
+    const world = makeWorld();
+    seedDigestSent(world);
+    const key = 'tm:nudge:gh:bluedevilcollectibles/bdc-xo#1451:1';
+    world.journal.push({
+      id: 'pre-send-progress-nudge',
+      created_at: new Date(T0 - 60_000).toISOString(),
+      thread_ref: 'gh:bluedevilcollectibles/bdc-xo#1451',
+      action_type: 'nudge',
+      proposal_json: '{}',
+      idempotency_key: key,
+      before_hash: null,
+      proof_predicate: 'post-send source progress',
+      proof_deadline_at: new Date(T0 + 60_000).toISOString(),
+      outcome: 'sent',
+      graded_at: null,
+      grade: null,
+    });
+    world.sentMessages.push({
+      idempotency_key: key,
+      recipient: 'xo',
+      body: 'nudge',
+      createdAt: new Date(T0 - 30_000).toISOString(),
+    });
+    const deps = makeDeps(world, {
+      getGithubIssueEvidence: async () => ({
+        state: 'open',
+        updatedAt: new Date(T0 - 45_000).toISOString(),
+        labels: ['wo', 'prio:P1'],
+        assigneeCount: 0,
+        closedAt: null,
+        assignedAt: null,
+        activeStatusAt: null,
+        progressRecordedAt: new Date(T0 - 45_000).toISOString(),
+      }),
+    });
+
+    await tick(createTaskmasterState(60_000), deps);
+
+    expect(world.journal.find(row => row.id === 'pre-send-progress-nudge')?.grade).toBeNull();
+  });
+
+  test('unacknowledged, acknowledged-only, and auto-addressed rulings are not useful', async () => {
+    const cases = [
+      { name: 'unacknowledged', acknowledged_at: null, addressed_at: null, addressed_by: null },
+      {
+        name: 'acknowledged-only',
+        acknowledged_at: new Date(T0 - 20_000).toISOString(),
+        addressed_at: null,
+        addressed_by: null,
+      },
+      {
+        name: 'auto-addressed',
+        acknowledged_at: new Date(T0 - 20_000).toISOString(),
+        addressed_at: new Date(T0 - 10_000).toISOString(),
+        addressed_by: 'taskmaster:auto',
+      },
+    ];
+
+    for (const testCase of cases) {
+      const world = makeWorld();
+      seedDigestSent(world);
+      const rulingId = `ruling-${testCase.name}`;
+      const key = `tm:deliver_ruling:${rulingId}`;
+      world.journal.push({
+        id: `journal-${testCase.name}`,
+        created_at: new Date(T0 - 60_000).toISOString(),
+        thread_ref: `dispatch:${rulingId}`,
+        action_type: 'deliver_ruling',
+        proposal_json: '{}',
+        idempotency_key: key,
+        before_hash: null,
+        proof_predicate: 'original ruling addressed after send',
+        proof_deadline_at: new Date(T0 + 60_000).toISOString(),
+        outcome: 'sent',
+        graded_at: null,
+        grade: null,
+      });
+      world.sentMessages.push({
+        idempotency_key: key,
+        recipient: 'xo',
+        body: 'ruling reminder',
+        createdAt: new Date(T0 - 30_000).toISOString(),
+      });
+      const deps = makeDeps(world, {
+        getDispatchMessageById: (async () => ({
+          id: rulingId,
+          recipient: 'xo',
+          resolved_recipient: 'xo',
+          acknowledged_at: testCase.acknowledged_at,
+          addressed_at: testCase.addressed_at,
+          addressed_by: testCase.addressed_by,
+        })) as unknown as TaskmasterDeps['getDispatchMessageById'],
+      });
+
+      await tick(createTaskmasterState(60_000), deps);
+
+      expect(world.journal.find(row => row.id === `journal-${testCase.name}`)?.grade).toBeNull();
+    }
   });
 
   test('a cancelled effect is noise and an unchanged P0 source is not useful', async () => {
@@ -616,7 +772,13 @@ describe('SC7 grading requires external source progress', () => {
     });
     const deps = makeDeps(world, {
       findEffectByIdempotencyKey: async effectKey =>
-        effectKey === key ? { id: 'cancelled-effect', status: 'cancelled' } : null,
+        effectKey === key
+          ? {
+              id: 'cancelled-effect',
+              status: 'cancelled',
+              createdAt: new Date(T0 - 45_000).toISOString(),
+            }
+          : null,
       getGithubIssueEvidence: async () => ({
         state: 'open',
         updatedAt: new Date(T0 - 60_000).toISOString(),
@@ -652,7 +814,12 @@ describe('SC7 grading requires external source progress', () => {
       graded_at: null,
       grade: null,
     });
-    world.sentMessages.push({ idempotency_key: key, recipient: 'operator', body: 'escalate' });
+    world.sentMessages.push({
+      idempotency_key: key,
+      recipient: 'operator',
+      body: 'escalate',
+      createdAt: new Date(T0 - 45_000).toISOString(),
+    });
     const deps = makeDeps(world, {
       getGithubIssueEvidence: async () => ({
         state: 'open',
@@ -689,7 +856,12 @@ describe('SC7 grading requires external source progress', () => {
       graded_at: null,
       grade: null,
     });
-    world.sentMessages.push({ idempotency_key: key, recipient: 'operator', body: 'escalate' });
+    world.sentMessages.push({
+      idempotency_key: key,
+      recipient: 'operator',
+      body: 'escalate',
+      createdAt: new Date(T0 - 45_000).toISOString(),
+    });
     const deps = makeDeps(world, {
       getGithubIssueEvidence: async () => ({
         state: 'open',
@@ -889,12 +1061,89 @@ describe('defaultListThreads -- GitHub work-SOR read', () => {
     }
   });
 
-  test('pull requests are skipped and a failed label read never crashes the tick', async () => {
+  test('pull requests are skipped', async () => {
     const { fetchImpl } = fakeGithubFetch({
       wo: [ghIssue(4, ['wo'], { pull_request: { url: 'x' } })],
       // 'arc' key absent -> empty list
     });
     const threads = await defaultListThreads(fetchImpl);
     expect(threads.length).toBe(0);
+  });
+
+  test('a non-OK work-SOR response makes the production adapter fail closed', async () => {
+    const fetchImpl = (async () => new Response('unavailable', { status: 503 })) as typeof fetch;
+    await expect(defaultListThreads(fetchImpl)).rejects.toThrow(
+      'taskmaster_github_work_sor_read_failed:503'
+    );
+  });
+
+  test('a thrown work-SOR fetch makes the tick unsuccessful', async () => {
+    const world = makeWorld();
+    seedDigestSent(world);
+    const fetchImpl = (async () => {
+      throw new Error('synthetic network failure');
+    }) as typeof fetch;
+    const state = createTaskmasterState(60_000);
+
+    const result = await tick(
+      state,
+      makeDeps(world, { listThreads: () => defaultListThreads(fetchImpl) })
+    );
+
+    expect(result.successful).toBe(false);
+    expect(state.deadman.lastTickAtMs).toBeNull();
+  });
+
+  test('a non-OK evidence response makes the tick unsuccessful', async () => {
+    const world = makeWorld();
+    seedDigestSent(world);
+    const key = 'tm:nudge:gh:bluedevilcollectibles/bdc-xo#1452:1';
+    world.journal.push({
+      id: 'evidence-read-failure',
+      created_at: new Date(T0 - 60_000).toISOString(),
+      thread_ref: 'gh:bluedevilcollectibles/bdc-xo#1452',
+      action_type: 'nudge',
+      proposal_json: '{}',
+      idempotency_key: key,
+      before_hash: null,
+      proof_predicate: 'post-send source progress',
+      proof_deadline_at: new Date(T0 + 60_000).toISOString(),
+      outcome: 'sent',
+      graded_at: null,
+      grade: null,
+    });
+    world.sentMessages.push({
+      idempotency_key: key,
+      recipient: 'xo',
+      body: 'nudge',
+      createdAt: new Date(T0 - 30_000).toISOString(),
+    });
+    const fetchImpl = (async () => new Response('unavailable', { status: 503 })) as typeof fetch;
+    const state = createTaskmasterState(60_000);
+
+    const result = await tick(
+      state,
+      makeDeps(world, {
+        getGithubIssueEvidence: (ref, sinceIso) =>
+          defaultGetGithubIssueEvidence(ref, sinceIso, fetchImpl),
+      })
+    );
+
+    expect(result.successful).toBe(false);
+    expect(state.deadman.lastTickAtMs).toBeNull();
+  });
+
+  test('a thrown evidence fetch makes the production adapter fail closed', async () => {
+    const fetchImpl = (async () => {
+      throw new Error('synthetic evidence network failure');
+    }) as typeof fetch;
+
+    await expect(
+      defaultGetGithubIssueEvidence(
+        'gh:bluedevilcollectibles/bdc-xo#1452',
+        new Date(T0 - 30_000).toISOString(),
+        fetchImpl
+      )
+    ).rejects.toThrow('synthetic evidence network failure');
   });
 });

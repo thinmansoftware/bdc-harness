@@ -99,8 +99,10 @@ export interface TaskmasterDeps {
   listUndeliveredRulings?: () => Promise<ThreadSnapshot[]>;
   listThreads?: () => Promise<ThreadSnapshot[]>;
   headroom?: () => Promise<HeadroomReading>;
-  /** External-SOR check: does a dispatch row exist for this key? */
-  findEffectByIdempotencyKey?: (key: string) => Promise<{ id: string; status: string } | null>;
+  /** External-SOR check: does a dispatch row exist for this key, and when was it sent? */
+  findEffectByIdempotencyKey?: (
+    key: string
+  ) => Promise<{ id: string; status: string; createdAt: string } | null>;
   getDispatchMessageById?: (id: string) => Promise<DispatchMessage | null>;
   getGithubIssueEvidence?: (
     threadRef: string,
@@ -129,12 +131,18 @@ function sha256(text: string): string {
 
 async function defaultFindEffectByIdempotencyKey(
   key: string
-): Promise<{ id: string; status: string } | null> {
-  const result = await getDatabase().query<{ id: string; status: string }>(
-    'SELECT id, status FROM agent_dispatch_messages WHERE idempotency_key = $1',
-    [key]
+): Promise<{ id: string; status: string; createdAt: string } | null> {
+  const result = await getDatabase().query<{
+    id: string;
+    status: string;
+    created_at: string;
+    sender_principal_id?: string | null;
+  }>('SELECT * FROM agent_dispatch_messages WHERE idempotency_key = $1', [key]);
+  const row = result.rows.find(
+    candidate =>
+      candidate.sender_principal_id === undefined || candidate.sender_principal_id === null
   );
-  return result.rows[0] ?? null;
+  return row ? { id: row.id, status: row.status, createdAt: row.created_at } : null;
 }
 
 /** Undelivered ratified rulings: queued board-motion mailbox rows not yet acknowledged. */
@@ -184,9 +192,10 @@ const WORK_LABELS = ['wo', 'project', 'arc'] as const;
  * Work-SOR read: open GitHub issues labeled wo, project, or arc across the configured
  * repos (one request per label -- see WORK_LABELS). Rate-limit-aware (Claude
  * seat amendment): honors x-ratelimit-remaining and backs off rather than
- * spinning. A failed read yields an empty list (no nudges this tick) --
- * never a crash. Exported for tests; production callers use the tick()
- * default. `fetchImpl` is injectable for tests only.
+ * spinning. An incomplete or failed read throws so the tick cannot advance its
+ * success heartbeat on a partial source snapshot. Exported for tests;
+ * production callers use the tick() default. `fetchImpl` is injectable for
+ * tests only.
  */
 export async function defaultListThreads(
   fetchImpl: typeof fetch = fetch
@@ -197,10 +206,7 @@ export async function defaultListThreads(
     .filter(Boolean);
   const token = process.env.GITHUB_TOKEN ?? process.env.GH_TOKEN;
   const threads: ThreadSnapshot[] = [];
-  let rateLimited = false;
-
   for (const repo of repos) {
-    if (rateLimited) break; // back off: stop reading further repos this tick
     const seen = new Set<number>();
     for (const label of WORK_LABELS) {
       try {
@@ -216,12 +222,11 @@ export async function defaultListThreads(
         const remaining = Number.parseInt(response.headers.get('x-ratelimit-remaining') ?? '', 10);
         if (Number.isInteger(remaining) && remaining < 5) {
           log.warn({ repo, label, remaining }, 'taskmaster.github_rate_limit_backoff');
-          rateLimited = true;
-          break; // stop reading further labels and repos this tick
+          throw new Error(`taskmaster_github_rate_limit_backoff:${remaining}`);
         }
         if (!response.ok) {
           log.warn({ repo, label, status: response.status }, 'taskmaster.github_read_failed');
-          continue;
+          throw new Error(`taskmaster_github_work_sor_read_failed:${response.status}`);
         }
         const issues = (await response.json()) as GithubIssue[];
         for (const issue of issues) {
@@ -249,6 +254,7 @@ export async function defaultListThreads(
         }
       } catch (error) {
         log.warn({ err: error as Error, repo, label }, 'taskmaster.github_read_error');
+        throw error;
       }
     }
   }
@@ -280,32 +286,39 @@ function githubHeaders(): Record<string, string> {
   };
 }
 
-async function defaultGetGithubIssueEvidence(
+export async function defaultGetGithubIssueEvidence(
   threadRef: string,
-  sinceIso: string
+  sinceIso: string,
+  fetchImpl: typeof fetch = fetch
 ): Promise<GithubIssueEvidence | null> {
   const match = /^gh:([^#]+)#(\d+)$/.exec(threadRef);
   if (!match) return null;
   const repo = match[1];
   const issueNumber = match[2];
-  const issueResponse = await fetch(`https://api.github.com/repos/${repo}/issues/${issueNumber}`, {
-    headers: githubHeaders(),
-  });
-  if (!issueResponse.ok) return null;
+  const issueResponse = await fetchImpl(
+    `https://api.github.com/repos/${repo}/issues/${issueNumber}`,
+    { headers: githubHeaders() }
+  );
+  if (!issueResponse.ok) {
+    throw new Error(`taskmaster_github_issue_evidence_read_failed:${issueResponse.status}`);
+  }
   const issue = (await issueResponse.json()) as GithubIssueDetail;
   const [commentsResponse, eventsResponse] = await Promise.all([
-    fetch(
+    fetchImpl(
       `https://api.github.com/repos/${repo}/issues/${issueNumber}/comments?since=${encodeURIComponent(sinceIso)}&per_page=100`,
       { headers: githubHeaders() }
     ),
-    fetch(`https://api.github.com/repos/${repo}/issues/${issueNumber}/events?per_page=100`, {
+    fetchImpl(`https://api.github.com/repos/${repo}/issues/${issueNumber}/events?per_page=100`, {
       headers: githubHeaders(),
     }),
   ]);
-  const comments = commentsResponse.ok
-    ? ((await commentsResponse.json()) as GithubIssueComment[])
-    : [];
-  const events = eventsResponse.ok ? ((await eventsResponse.json()) as GithubIssueEvent[]) : [];
+  if (!commentsResponse.ok || !eventsResponse.ok) {
+    throw new Error(
+      `taskmaster_github_issue_evidence_read_failed:${commentsResponse.status}:${eventsResponse.status}`
+    );
+  }
+  const comments = (await commentsResponse.json()) as GithubIssueComment[];
+  const events = (await eventsResponse.json()) as GithubIssueEvent[];
   const progress = comments
     .filter(comment => {
       const login = comment.user?.login?.toLowerCase() ?? '';
@@ -398,9 +411,9 @@ async function reconcilePendingActions(
 }
 
 /**
- * Grade sent actions against the external SOR: a sent action whose dispatch
- * row exists (and was not cancelled) is graded 'useful'. Grading is a read
- * of the SOR, not a self-report.
+ * Grade sent actions against action-specific external SOR evidence recorded
+ * after the outbound dispatch send. The outbound row alone never proves
+ * usefulness.
  */
 async function gradeSentActions(
   actions: taskmasterDb.TmJournalEntry[],
@@ -422,7 +435,12 @@ async function gradeSentActions(
       }
       if (action.action_type === 'digest') continue;
 
-      const createdAtMs = Date.parse(action.created_at);
+      const sentAtMs = Date.parse(effect.createdAt);
+      if (!Number.isFinite(sentAtMs)) {
+        failures += 1;
+        log.warn({ journalId: action.id }, 'taskmaster.effect_send_time_missing');
+        continue;
+      }
       const deadlineMs = action.proof_deadline_at ? Date.parse(action.proof_deadline_at) : NaN;
       let usefulAtMs: number | null = null;
       if (action.action_type === 'deliver_ruling') {
@@ -436,12 +454,12 @@ async function gradeSentActions(
           ruling &&
           ruling.addressed_by === expectedRecipient &&
           Number.isFinite(addressedAtMs) &&
-          addressedAtMs >= createdAtMs
+          addressedAtMs >= sentAtMs
         ) {
           usefulAtMs = addressedAtMs;
         }
       } else {
-        const issue = await getIssueEvidence(action.thread_ref, action.created_at);
+        const issue = await getIssueEvidence(action.thread_ref, effect.createdAt);
         if (issue) {
           const closedAtMs = issue.closedAt ? Date.parse(issue.closedAt) : NaN;
           const assignedAtMs = issue.assignedAt ? Date.parse(issue.assignedAt) : NaN;
@@ -449,15 +467,15 @@ async function gradeSentActions(
           const progressAtMs = issue.progressRecordedAt
             ? Date.parse(issue.progressRecordedAt)
             : NaN;
-          if (Number.isFinite(closedAtMs) && closedAtMs >= createdAtMs) usefulAtMs = closedAtMs;
-          if (Number.isFinite(progressAtMs) && progressAtMs >= createdAtMs) {
+          if (Number.isFinite(closedAtMs) && closedAtMs >= sentAtMs) usefulAtMs = closedAtMs;
+          if (Number.isFinite(progressAtMs) && progressAtMs >= sentAtMs) {
             usefulAtMs = progressAtMs;
           }
           if (action.action_type === 'escalate_p0') {
-            if (Number.isFinite(assignedAtMs) && assignedAtMs >= createdAtMs) {
+            if (Number.isFinite(assignedAtMs) && assignedAtMs >= sentAtMs) {
               usefulAtMs = assignedAtMs;
             }
-            if (Number.isFinite(activeStatusAtMs) && activeStatusAtMs >= createdAtMs) {
+            if (Number.isFinite(activeStatusAtMs) && activeStatusAtMs >= sentAtMs) {
               usefulAtMs = activeStatusAtMs;
             }
           }
@@ -479,7 +497,7 @@ async function gradeSentActions(
 
 function proofPredicate(proposal: ActionProposal): string {
   if (proposal.type === 'deliver_ruling') {
-    return 'original ruling row is addressed by its resolved recipient after this journal row';
+    return 'original ruling row is addressed by its resolved recipient after the reminder dispatch send';
   }
   if (proposal.type === 'nudge') {
     return 'source issue closes or records a post-send [PROGRESS] or [BLOCKED] comment by a non-bot';
@@ -631,7 +649,7 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
     ) {
       continue;
     }
-    if (existingAction?.outcome === 'failed') {
+    if (existingAction && ['failed', 'deferred'].includes(existingAction.outcome)) {
       const deadlineMs = existingAction.proof_deadline_at
         ? Date.parse(existingAction.proof_deadline_at)
         : NaN;
