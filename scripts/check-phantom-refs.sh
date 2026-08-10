@@ -18,7 +18,8 @@
 #
 # --stdin mode reads ref lines from stdin (one per line; accepts bare branch
 # names or full refs/heads/* forms) and never touches a remote. Used by
-# fixture tests so no real phantom refs need to be created.
+# fixture tests so no real phantom refs need to be created. Bare names are
+# preserved exactly in output (e.g. feat/x-thread-abc' lists as-is).
 #
 # --cleanup deletes each detected phantom ref via:
 #   git push "https://github.com/<slug>.git" --delete "<branch>"
@@ -90,31 +91,33 @@ is_phantom() {
   esac
 }
 
-# Normalize a ref line to the full refs/heads/<name> form for display,
-# accepting either "refs/heads/foo" or "foo" or "sha\trefs/heads/foo".
+# Normalize a ref line for display/filter.
+# Accepts "refs/heads/foo", bare "foo", or "sha<TAB>refs/heads/foo".
+# Bare branch names are preserved exactly so fixture Test 1 lists
+# feat/x-thread-abc' as-is (not rewritten to refs/heads/...).
 normalize_ref() {
   local line="$1"
   local ref
 
   # git ls-remote lines are "<sha><TAB>refs/heads/..."
-  if printf '%s' "$line" | grep -q $'\t'; then
-    ref=$(printf '%s' "$line" | awk -F'\t' '{print $2}')
-  else
-    ref="$line"
-  fi
+  case "$line" in
+    *$'\t'*)
+      ref="${line#*$'\t'}"
+      ;;
+    *)
+      ref="$line"
+      ;;
+  esac
 
   # Strip CR if present
-  ref=$(printf '%s' "$ref" | tr -d '\r')
+  ref="${ref//$'\r'/}"
 
   if [ -z "$ref" ]; then
     return 0
   fi
 
-  case "$ref" in
-    refs/heads/*) printf '%s\n' "$ref" ;;
-    refs/*)       printf '%s\n' "$ref" ;; # leave other ref namespaces alone
-    *)            printf 'refs/heads/%s\n' "$ref" ;;
-  esac
+  # Preserve input form: full refs stay full; bare names stay bare.
+  printf '%s\n' "$ref"
 }
 
 # Branch name without refs/heads/ prefix (for git push --delete).
@@ -139,18 +142,26 @@ collect_phantoms_from_lines() {
 
 enumerate_remote_refs() {
   local slug="$1"
+  local out
   # Prefer gh api matching-refs (works without a local clone of the target).
   # Fall back to git ls-remote against the public HTTPS URL.
+  # Both paths must surface failure: never return 0 after a failed enumeration
+  # (that would falsely report the repository as clean).
   if command -v gh >/dev/null 2>&1; then
-    if gh api "repos/${slug}/git/matching-refs/heads" --paginate \
-        -q '.[].ref' 2>/dev/null; then
+    if out=$(gh api "repos/${slug}/git/matching-refs/heads" --paginate \
+        -q '.[].ref' 2>/dev/null); then
+      printf '%s\n' "$out"
       return 0
     fi
   fi
 
   if command -v git >/dev/null 2>&1; then
-    git ls-remote --heads "https://github.com/${slug}.git" 2>/dev/null \
-      | awk -F'\t' '{print $2}'
+    # Capture first so a failed ls-remote is not masked by awk/pipe success.
+    if ! out=$(git ls-remote --heads "https://github.com/${slug}.git" 2>/dev/null); then
+      echo "ERROR: git ls-remote failed for ${slug}" >&2
+      return 1
+    fi
+    printf '%s\n' "$out" | awk -F'\t' '{print $2}'
     return 0
   fi
 
