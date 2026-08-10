@@ -111,6 +111,14 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | d
     && apt-get install -y gh \
     && rm -rf /var/lib/apt/lists/*
 
+# gh merge guard (bdc-xo#1491): shim ahead of /usr/bin/gh in PATH denies merge
+# verbs to every container subprocess (build agents included). The Overseer
+# merge-steward is unaffected -- it merges via octokit in-process, not gh.
+COPY scripts/container/gh-merge-guard.sh /usr/local/bin/gh
+RUN chmod 755 /usr/local/bin/gh \
+    && gh --version \
+    && if ARCHON_TEST_OUT=$(gh pr merge 1 2>&1); then echo "gh-merge-guard failed to block" && exit 1; else echo "$ARCHON_TEST_OUT" | grep -q 'gh-merge-guard: BLOCKED'; fi
+
 # Install Terraform for deployment-factory planning workflows.
 RUN curl -fsSLo /tmp/terraform.zip "https://releases.hashicorp.com/terraform/${TERRAFORM_VERSION}/terraform_${TERRAFORM_VERSION}_linux_amd64.zip" \
     && unzip -o /tmp/terraform.zip -d /usr/local/bin \
