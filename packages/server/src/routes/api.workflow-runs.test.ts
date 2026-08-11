@@ -469,6 +469,7 @@ function makeApp(): { app: OpenAPIHono; mockWebAdapter: WebAdapter } {
 
 describe('POST /api/workflows/:name/run', () => {
   beforeEach(() => {
+    process.env.ARCHON_OPERATOR_FIRE_APPROVERS = 'test-suite';
     mockFindConversationByPlatformId.mockReset();
     mockHandleMessage.mockReset();
     mockAddMessage.mockReset();
@@ -503,6 +504,7 @@ describe('POST /api/workflows/:name/run', () => {
   });
 
   afterEach(() => {
+    delete process.env.ARCHON_OPERATOR_FIRE_APPROVERS;
     delete process.env.ARCHON_SMART_CAULDRON_DISPATCH_ENABLED;
     // Restore the factory default ([] workflows) for other describes.
     mockDiscoverWorkflowsWithConfig.mockReset();
@@ -530,7 +532,12 @@ describe('POST /api/workflows/:name/run', () => {
     const response = await app.request('/api/workflows/no-such-lane/run', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ conversationId: 'web-test-abc', message: 'Go' }),
+      body: JSON.stringify({
+        conversationId: 'web-test-abc',
+        message: 'Go',
+        approved_by: 'test-suite',
+        approval_reason: 'route test',
+      }),
     });
     expect(response.status).toBe(400);
     const body = (await response.json()) as { accepted: boolean; error: string };
@@ -555,7 +562,12 @@ describe('POST /api/workflows/:name/run', () => {
     const response = await app.request('/api/workflows/deploy/run', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ conversationId: 'web-test-abc', message: 'Deploy to staging' }),
+      body: JSON.stringify({
+        conversationId: 'web-test-abc',
+        message: 'Deploy to staging',
+        approved_by: 'test-suite',
+        approval_reason: 'route test',
+      }),
     });
     expect(response.status).toBe(200);
 
@@ -577,6 +589,8 @@ describe('POST /api/workflows/:name/run', () => {
       body: JSON.stringify({
         conversationId: 'web-test-abc',
         message: 'WO-HARNESS-CODEX-AUTH-SYNC-AND-FRESHNESS-GATE-01',
+        approved_by: 'test-suite',
+        approval_reason: 'route test',
         conductor: {
           enabled: true,
           woId: 'WO-HARNESS-CODEX-AUTH-SYNC-AND-FRESHNESS-GATE-01',
@@ -612,7 +626,12 @@ describe('POST /api/workflows/:name/run', () => {
     const codexResponse = await app.request('/api/workflows/codex-lane/run', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ conversationId: 'web-test-abc', message: 'Run codex lane' }),
+      body: JSON.stringify({
+        conversationId: 'web-test-abc',
+        message: 'Run codex lane',
+        approved_by: 'test-suite',
+        approval_reason: 'route test',
+      }),
     });
 
     expect(codexResponse.status).toBe(200);
@@ -622,7 +641,12 @@ describe('POST /api/workflows/:name/run', () => {
     const claudeResponse = await app.request('/api/workflows/claude-lane/run', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ conversationId: 'web-test-def', message: 'Run claude lane' }),
+      body: JSON.stringify({
+        conversationId: 'web-test-def',
+        message: 'Run claude lane',
+        approved_by: 'test-suite',
+        approval_reason: 'route test',
+      }),
     });
 
     expect(claudeResponse.status).toBe(200);
@@ -637,6 +661,8 @@ describe('POST /api/workflows/:name/run', () => {
       body: JSON.stringify({
         conversationId: 'web-test-abc',
         message: 'WO-TEST-001',
+        approved_by: 'test-suite',
+        approval_reason: 'route test',
         conductor: {
           enabled: true,
           woId: 'WO-TEST-001',
@@ -662,6 +688,8 @@ describe('POST /api/workflows/:name/run', () => {
       body: JSON.stringify({
         conversationId: 'web-test-abc',
         message: 'WO-TEST-001',
+        approved_by: 'test-suite',
+        approval_reason: 'route test',
         conductor: {
           enabled: true,
           woId: 'WO-TEST-001',
@@ -702,6 +730,7 @@ describe('POST /api/workflows/:name/run', () => {
 
   test('queues an enabled live conductor request with stable idempotency and no direct dispatch', async () => {
     process.env.ARCHON_SMART_CAULDRON_DISPATCH_ENABLED = 'true';
+    process.env.ARCHON_OPERATOR_TOKEN = 'test-token';
     const { app } = makeApp();
     const response = await app.request('/api/workflows/deploy/run', {
       method: 'POST',
@@ -712,6 +741,8 @@ describe('POST /api/workflows/:name/run', () => {
       body: JSON.stringify({
         conversationId: 'web-test-abc',
         message: 'WO-TEST-001',
+        approved_by: 'test-suite',
+        approval_reason: 'route test',
         conductor: {
           enabled: true,
           woId: 'WO-TEST-001',
@@ -744,6 +775,7 @@ describe('POST /api/workflows/:name/run', () => {
         dryRun: false,
       })
     );
+    delete process.env.ARCHON_OPERATOR_TOKEN;
   });
 
   test('rejects new workflow dispatch while draining without touching in-flight work', async () => {
@@ -793,7 +825,12 @@ describe('POST /api/workflows/:name/run', () => {
     await app.request('/api/workflows/test-suite/run', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ conversationId: 'web-test-abc', message: 'Run tests' }),
+      body: JSON.stringify({
+        conversationId: 'web-test-abc',
+        message: 'Run tests',
+        approved_by: 'test-suite',
+        approval_reason: 'route test',
+      }),
     });
 
     expect(mockHandleMessage).toHaveBeenCalledWith(
@@ -822,7 +859,12 @@ describe('POST /api/workflows/:name/run', () => {
     await app.request('/api/workflows/deploy/run', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ conversationId: 'web-test-abc', message: 'Deploy' }),
+      body: JSON.stringify({
+        conversationId: 'web-test-abc',
+        message: 'Deploy',
+        approved_by: 'test-suite',
+        approval_reason: 'route test',
+      }),
     });
 
     expect(mockAddMessage).toHaveBeenCalledWith(MOCK_CONV.id, 'user', 'Deploy');
@@ -847,7 +889,12 @@ describe('POST /api/workflows/:name/run', () => {
     await app.request('/api/workflows/deploy/run', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ conversationId: 'web-test-abc', message: 'Deploy' }),
+      body: JSON.stringify({
+        conversationId: 'web-test-abc',
+        message: 'Deploy',
+        approved_by: 'test-suite',
+        approval_reason: 'route test',
+      }),
     });
 
     // generateAndSetTitle is fire-and-forget; just verify it was called
@@ -868,6 +915,18 @@ describe('POST /api/workflows/:name/run', () => {
 
     const body = (await response.json()) as { error: string };
     expect(body.error).toContain('conversationId');
+  });
+
+  test('returns 403 without server-side fire approval and does not dispatch', async () => {
+    const { app } = makeApp();
+    const response = await app.request('/api/workflows/deploy/run', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ conversationId: 'web-test-abc', message: 'Deploy' }),
+    });
+    expect(response.status).toBe(403);
+    expect(mockHandleMessage).not.toHaveBeenCalled();
+    expect(mockAddMessage).not.toHaveBeenCalled();
   });
 
   test('returns 400 when message is missing', async () => {

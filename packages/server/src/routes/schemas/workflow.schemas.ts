@@ -365,6 +365,8 @@ export const runWorkflowBodySchema = z
     conversationId: z.string(),
     message: z.string(),
     conductor: conductorDispatchSchema.optional(),
+    approved_by: z.string().min(1).optional(),
+    approval_reason: z.string().min(1).optional(),
   })
   .openapi('RunWorkflowBody');
 
