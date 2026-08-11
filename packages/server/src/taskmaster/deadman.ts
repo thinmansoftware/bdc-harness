@@ -14,6 +14,7 @@ export type TickHealth = 'healthy' | 'degraded' | 'not_running';
 
 export interface DeadmanState {
   intervalMs: number;
+  startedAtMs: number | null;
   lastTickAtMs: number | null;
 }
 
@@ -21,11 +22,17 @@ export interface DeadmanState {
 export const DEADMAN_MISSED_INTERVALS = 3;
 
 export function createDeadmanState(intervalMs: number): DeadmanState {
-  return { intervalMs, lastTickAtMs: null };
+  return { intervalMs, startedAtMs: null, lastTickAtMs: null };
+}
+
+/** Record scheduler activity without claiming that the tick succeeded. */
+export function recordTickAttempt(state: DeadmanState, nowMs: number): void {
+  if (state.startedAtMs === null) state.startedAtMs = nowMs;
 }
 
 /** Record a tick heartbeat. Recovery re-arms automatically. */
 export function recordTickHeartbeat(state: DeadmanState, nowMs: number): void {
+  if (state.startedAtMs === null) state.startedAtMs = nowMs;
   state.lastTickAtMs = nowMs;
 }
 
@@ -34,12 +41,13 @@ export function recordTickHeartbeat(state: DeadmanState, nowMs: number): void {
  * intervals old. Two missed intervals are still healthy; three are stale.
  */
 export function isTickStale(state: DeadmanState, nowMs: number): boolean {
-  if (state.lastTickAtMs === null) return false; // never started ticking yet
   if (state.intervalMs <= 0) return false; // KILLED: no tick expected
-  return nowMs - state.lastTickAtMs >= DEADMAN_MISSED_INTERVALS * state.intervalMs;
+  const anchor = state.lastTickAtMs ?? state.startedAtMs;
+  if (anchor === null) return false;
+  return nowMs - anchor >= DEADMAN_MISSED_INTERVALS * state.intervalMs;
 }
 
 export function tickHealth(state: DeadmanState, nowMs: number): TickHealth {
-  if (state.intervalMs <= 0 || state.lastTickAtMs === null) return 'not_running';
+  if (state.intervalMs <= 0 || state.startedAtMs === null) return 'not_running';
   return isTickStale(state, nowMs) ? 'degraded' : 'healthy';
 }

@@ -20,7 +20,7 @@ merge, assignment, or WO-authoring authority (Slice 1 exclusions, ratified).
 | Variable                    | Meaning                                                                                                             |
 | --------------------------- | ------------------------------------------------------------------------------------------------------------------- |
 | `TASKMASTER_INTERVAL_MS`    | Tick interval. `60000` in production compose. `0` = KILLED (loop off, zero effects) -- this is the rollback switch. |
-| `TASKMASTER_GH_REPOS`       | Comma-separated GitHub repos read as the work SOR (default `bluedevilcollectibles/bdc-harness`).                    |
+| `TASKMASTER_GH_REPOS`       | Comma-separated GitHub repos read as the work SOR (default `bluedevilcollectibles/bdc-xo`).                         |
 | `TASKMASTER_USAGE_ARTIFACT` | Optional path to a local usage-anchor JSON (`{"tokensRemaining": N, "observedAt": ISO}`).                           |
 | `TASKMASTER_CLI_ANCHOR_CMD` | Optional shell probe printing tokens-remaining; failure reads as UNKNOWN, never 0.                                  |
 
@@ -35,10 +35,22 @@ Returns `pause_state` (RUNNING | PAUSED | HARD_PAUSE), `epoch`,
 `tick_health` (healthy | degraded | not_running), `interval_ms`,
 `last_tick_at`, `headroom_state` (OK | LOW | UNKNOWN), `effects_last_24h`.
 
-`tick_health` flips to `degraded` after 3 missed intervals; the EXTERNAL
+`last_tick_at` is the last successfully completed tick, not merely the last
+attempt. A failed startup or failed tick therefore cannot report a false-green
+heartbeat. `tick_health` flips to `degraded` after 3 missed intervals; the EXTERNAL
 dead-man checker in the Overseer package
 (`packages/overseer/src/taskmaster-deadman-check.ts`) escalates exactly once
 per degradation episode and re-arms on recovery.
+
+GitHub work discovery accepts the `wo`, `project`, or `arc` label. Priorities
+may be written as `P0` through `P3`, `prio:P0` through `prio:P3`, or
+`priority:P0` through `priority:P3` (case-insensitive). `blocked` and
+`status:blocked` are blocked states; `status:building` and `status:review` are
+active states and prevent an item from being treated as an unclaimed P0.
+
+When a nudge causes progress, record that evidence on the source GitHub issue
+with an exact first-line marker of `[PROGRESS]` or `[BLOCKED]`. Taskmaster ignores
+its own outbound dispatch row as proof of progress.
 
 ## Pause (John or operator)
 
@@ -73,8 +85,14 @@ Activation-proof query (SC7 kill test -- binding condition 4):
 
 ```bash
 sqlite3 /opt/bdc/archon-data/archon.db \
-  "SELECT count(*) FROM tm_journal WHERE outcome='sent' AND grade='useful'"
+  "SELECT count(*) FROM tm_journal WHERE outcome='sent' AND grade='useful' AND action_type <> 'digest'"
 ```
+
+This count is necessary but not sufficient for SC7. Each qualifying row must
+also be correlated to action-specific evidence in the source SOR after the send:
+a delivered ruling was addressed by its recipient, a nudge produced a source
+issue close or marker, or a P0 escalation produced a close, assignee, active
+status, or marker. Digests never qualify as useful SC7 actions.
 
 Recent actions:
 
@@ -103,3 +121,6 @@ existing table was altered.
 - Max 3 automated interventions per item per 24h.
 - Ordinary nudges require eligibility on two consecutive ticks; undelivered
   rulings and unclaimed P0s act on the confirming tick.
+- Each logical effect has one journal row. A failed or deferred attempt reuses
+  that row on the next eligible tick; retries are bounded by the original
+  deadline, and expired rows are terminal.

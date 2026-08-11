@@ -140,7 +140,8 @@ export function computeNextAction(
       body:
         `Nudge: ${thread.ref} (${thread.priority}) has had no activity past its ` +
         `${Math.round(clock / MINUTE_MS)}min clock. Please post a status update, ` +
-        'progress the item, or mark it blocked with a reason.',
+        'progress the item, or mark it blocked with a reason. Begin the update with ' +
+        '[PROGRESS] or [BLOCKED] so the source-of-truth change can be verified.',
       idempotencyKey: `tm:nudge:${thread.ref}:${bucket}`,
       actsImmediately: false,
     };

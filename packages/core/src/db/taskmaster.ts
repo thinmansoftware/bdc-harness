@@ -12,6 +12,7 @@
 import { randomUUID } from 'crypto';
 import { createLogger } from '@archon/paths';
 import { getDatabase } from './connection';
+import type { QueryResult } from './adapters/types';
 
 const log = createLogger('db/taskmaster');
 
@@ -129,28 +130,60 @@ export async function recordAction(data: {
   proof_deadline_at?: string | null;
   outcome: TmActionOutcome;
 }): Promise<TmJournalEntry> {
-  const result = await getDatabase().query<TmJournalRow>(
-    `INSERT INTO tm_journal
-     (id, created_at, thread_ref, action_type, proposal_json, idempotency_key,
-      before_hash, proof_predicate, proof_deadline_at, outcome)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-     RETURNING *`,
-    [
-      randomUUID(),
-      new Date().toISOString(),
-      data.thread_ref,
-      data.action_type,
-      data.proposal_json,
-      data.idempotency_key ?? null,
-      data.before_hash ?? null,
-      data.proof_predicate ?? null,
-      data.proof_deadline_at ?? null,
-      data.outcome,
-    ]
-  );
+  const db = getDatabase();
+  const idempotencyKey = data.idempotency_key ?? null;
+  if (idempotencyKey) {
+    const existing = await getActionByIdempotencyKey(idempotencyKey);
+    if (existing) return existing;
+  }
+
+  let result: QueryResult<TmJournalRow>;
+  try {
+    result = await db.query<TmJournalRow>(
+      `INSERT INTO tm_journal
+       (id, created_at, thread_ref, action_type, proposal_json, idempotency_key,
+        before_hash, proof_predicate, proof_deadline_at, outcome)
+       SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10
+       WHERE $6 IS NULL OR NOT EXISTS (
+         SELECT 1 FROM tm_journal WHERE idempotency_key = $6
+       )
+       RETURNING *`,
+      [
+        randomUUID(),
+        new Date().toISOString(),
+        data.thread_ref,
+        data.action_type,
+        data.proposal_json,
+        idempotencyKey,
+        data.before_hash ?? null,
+        data.proof_predicate ?? null,
+        data.proof_deadline_at ?? null,
+        data.outcome,
+      ]
+    );
+  } catch (error) {
+    if (!idempotencyKey) throw error;
+    const raced = await getActionByIdempotencyKey(idempotencyKey);
+    if (raced) return raced;
+    throw error;
+  }
   const row = result.rows[0];
+  if (!row && idempotencyKey) {
+    const existing = await getActionByIdempotencyKey(idempotencyKey);
+    if (existing) return existing;
+  }
   if (!row) throw new Error('Failed to record taskmaster action');
   return normalizeJournal(row);
+}
+
+/** Read one logical action by stable idempotency key without a time window. */
+export async function getActionByIdempotencyKey(key: string): Promise<TmJournalEntry | null> {
+  const result = await getDatabase().query<TmJournalRow>(
+    'SELECT * FROM tm_journal WHERE idempotency_key = $1 ORDER BY created_at ASC LIMIT 1',
+    [key]
+  );
+  const row = result.rows[0];
+  return row ? normalizeJournal(row) : null;
 }
 
 /** Update the outcome of a previously recorded action (post-effect). */

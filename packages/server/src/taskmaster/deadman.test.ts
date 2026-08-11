@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test';
 import {
   createDeadmanState,
   isTickStale,
+  recordTickAttempt,
   recordTickHeartbeat,
   tickHealth,
   DEADMAN_MISSED_INTERVALS,
@@ -15,6 +16,15 @@ describe('taskmaster deadman', () => {
     const state = createDeadmanState(INTERVAL_MS);
     expect(isTickStale(state, T0)).toBe(false);
     expect(tickHealth(state, T0)).toBe('not_running');
+  });
+
+  test('failed startup ticks receive three intervals of grace and then degrade', () => {
+    const state = createDeadmanState(INTERVAL_MS);
+    recordTickAttempt(state, T0);
+
+    expect(state.lastTickAtMs).toBeNull();
+    expect(tickHealth(state, T0 + 2 * INTERVAL_MS)).toBe('healthy');
+    expect(tickHealth(state, T0 + 3 * INTERVAL_MS)).toBe('degraded');
   });
 
   test('2 missed intervals = healthy (fake clock)', () => {

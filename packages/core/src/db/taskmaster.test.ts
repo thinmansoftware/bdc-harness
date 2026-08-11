@@ -13,6 +13,7 @@ mock.module('./connection', () => ({
 
 import {
   expireParkedActions,
+  getActionByIdempotencyKey,
   getActionsSince,
   getHealthSample,
   getPauseState,
@@ -62,6 +63,66 @@ describe('tm_journal DAL', () => {
 
     const updated = await updateActionOutcome(row.id, 'sent');
     expect(updated?.outcome).toBe('sent');
+  });
+
+  test('recordAction returns one logical row for repeated idempotency keys', async () => {
+    const input = {
+      thread_ref: 'digest:2026-08-09',
+      action_type: 'digest' as const,
+      proposal_json: '{"type":"digest"}',
+      idempotency_key: 'tm:digest:2026-08-09',
+      proof_deadline_at: new Date(Date.now() + 86_400_000).toISOString(),
+      outcome: 'pending' as const,
+    };
+
+    const first = await recordAction(input);
+    const second = await recordAction(input);
+
+    expect(second.id).toBe(first.id);
+    expect(
+      (await getActionsSince(new Date(0).toISOString())).filter(
+        row => row.idempotency_key === input.idempotency_key
+      )
+    ).toHaveLength(1);
+  });
+
+  test('recordAction remains compatible with a live-style unique idempotency index', async () => {
+    await db.query(
+      'CREATE UNIQUE INDEX uq_tm_journal_idempotency_test ON tm_journal(idempotency_key) WHERE idempotency_key IS NOT NULL'
+    );
+    const input = {
+      thread_ref: 'gh:bluedevilcollectibles/bdc-xo#1450',
+      action_type: 'nudge' as const,
+      proposal_json: '{"type":"nudge"}',
+      idempotency_key: 'tm:nudge:gh:bluedevilcollectibles/bdc-xo#1450:1',
+      outcome: 'pending' as const,
+    };
+
+    const first = await recordAction(input);
+    const second = await recordAction(input);
+
+    expect(second.id).toBe(first.id);
+    expect(
+      (await getActionsSince(new Date(0).toISOString())).filter(
+        row => row.idempotency_key === input.idempotency_key
+      )
+    ).toHaveLength(1);
+  });
+
+  test('getActionByIdempotencyKey is not limited by journal lookback time', async () => {
+    const row = await recordAction({
+      thread_ref: 'dispatch:old-ruling',
+      action_type: 'deliver_ruling',
+      proposal_json: '{}',
+      idempotency_key: 'tm:deliver_ruling:old-ruling',
+      outcome: 'sent',
+    });
+    await db.query('UPDATE tm_journal SET created_at = $1 WHERE id = $2', [
+      '2020-01-01T00:00:00.000Z',
+      row.id,
+    ]);
+
+    expect((await getActionByIdempotencyKey('tm:deliver_ruling:old-ruling'))?.id).toBe(row.id);
   });
 
   test('getActionsSince filters by time and optionally by thread_ref', async () => {

@@ -192,6 +192,69 @@ describe('dispatch db', () => {
     expect(rows.rowCount).toBe(1);
   });
 
+  test('deduplicates legacy creates against Phase 1.5 partial indexes', async () => {
+    await db.query(
+      'CREATE TABLE agent_dispatch_messages_phase15 AS SELECT * FROM agent_dispatch_messages WHERE 0'
+    );
+    await db.query(
+      'ALTER TABLE agent_dispatch_messages_phase15 ADD COLUMN sender_principal_id TEXT'
+    );
+    await db.query('DROP TABLE agent_dispatch_messages');
+    await db.query('ALTER TABLE agent_dispatch_messages_phase15 RENAME TO agent_dispatch_messages');
+    await db.query(
+      `CREATE UNIQUE INDEX uq_dispatch_authenticated_fixture
+       ON agent_dispatch_messages(sender_principal_id, idempotency_key)
+       WHERE sender_principal_id IS NOT NULL`
+    );
+    await db.query(
+      `CREATE UNIQUE INDEX uq_dispatch_legacy_fixture
+       ON agent_dispatch_messages(idempotency_key)
+       WHERE sender_principal_id IS NULL`
+    );
+
+    await db.query(
+      `INSERT INTO agent_dispatch_messages
+       (id, correlation_id, idempotency_key, task_type, sender, sender_principal_id,
+        recipient, body, status, created_at, priority, fencing_token)
+       VALUES ($1, $2, $3, 'agent_message', 'authenticated-sender', 'board:authenticated',
+        'operator', 'authenticated namespace row', 'queued', $4, 'normal', 0)`,
+      [
+        'authenticated-row',
+        'authenticated-correlation',
+        'shared-partial-key',
+        new Date().toISOString(),
+      ]
+    );
+
+    const [first, second] = await Promise.all([
+      createMessage({
+        correlation_id: 'legacy-correlation-1',
+        idempotency_key: 'shared-partial-key',
+        task_type: 'agent_message',
+        sender: 'taskmaster',
+        recipient: 'operator',
+        body: 'legacy namespace row',
+      }),
+      createMessage({
+        correlation_id: 'legacy-correlation-2',
+        idempotency_key: 'shared-partial-key',
+        task_type: 'agent_message',
+        sender: 'taskmaster',
+        recipient: 'operator',
+        body: 'duplicate legacy namespace row',
+      }),
+    ]);
+
+    expect(first.id).toBe(second.id);
+    expect(first.id).not.toBe('authenticated-row');
+    const rows = await db.query<{ sender_principal_id: string | null }>(
+      'SELECT sender_principal_id FROM agent_dispatch_messages WHERE idempotency_key = $1',
+      ['shared-partial-key']
+    );
+    expect(rows.rows).toHaveLength(2);
+    expect(rows.rows.filter(row => row.sender_principal_id === null)).toHaveLength(1);
+  });
+
   test('assesses canonical recipients and rejects missing or inactive principals', async () => {
     await expect(assessDispatchRecipient(' Operator ')).resolves.toEqual({
       ok: true,
