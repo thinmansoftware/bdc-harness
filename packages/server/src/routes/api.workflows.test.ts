@@ -11,6 +11,10 @@ import { tmpdir } from 'os';
 // ARCHON_OPERATOR_TOKEN is set. Clear it at module level so these tests run
 // deterministically in container envs (Cauldron build image exports this var).
 delete process.env.ARCHON_OPERATOR_TOKEN;
+delete process.env.ARCHON_OPERATOR_TOKEN_INSPECT;
+delete process.env.ARCHON_OPERATOR_TOKEN_MESSAGE;
+delete process.env.ARCHON_OPERATOR_TOKEN_FIRE;
+delete process.env.ARCHON_OPERATOR_FIRE_APPROVERS;
 delete process.env.ARCHON_OPERATOR_ACCESS_HOSTS;
 delete process.env.ARCHON_OPERATOR_EMAILS;
 
@@ -150,7 +154,60 @@ mock.module('@archon/core/db/codebases', () => ({
   listCodebases: mockListCodebases,
 }));
 
-import { registerApiRoutes } from './api';
+import { registerApiRoutes, requireScopeForPath } from './api';
+
+describe('operator MCP route scopes', () => {
+  test('classifies only the approved operator surface', () => {
+    expect(requireScopeForPath('/api/workflows/major-build/run', 'POST')).toBe('fire');
+    expect(requireScopeForPath('/api/workflows/runs/run-1', 'GET')).toBe('inspect');
+    expect(requireScopeForPath('/api/workflows/runs/run-1/nodes/build/events', 'GET')).toBe(
+      'inspect'
+    );
+    expect(requireScopeForPath('/api/dashboard/runs', 'GET')).toBe('inspect');
+    expect(requireScopeForPath('/api/dispatch/messages', 'GET')).toBe('inspect');
+    expect(requireScopeForPath('/api/dispatch/messages', 'POST')).toBe('message');
+    expect(requireScopeForPath('/api/dispatch/messages/m1/claim', 'POST')).toBe('message');
+    expect(requireScopeForPath('/api/codebases', 'GET')).toBeNull();
+  });
+
+  test('rejects an inspect token on the fire route', async () => {
+    process.env.ARCHON_OPERATOR_TOKEN_INSPECT = 'inspect-token';
+    process.env.ARCHON_OPERATOR_TOKEN_FIRE = 'fire-token';
+    try {
+      const app = createTestApp();
+      registerApiRoutes(app, {} as WebAdapter, {} as ConversationLockManager);
+      const response = await app.request('/api/workflows/major-build/run', {
+        method: 'POST',
+        headers: { 'x-archon-operator-token': 'inspect-token', 'content-type': 'application/json' },
+        body: JSON.stringify({ conversationId: 'test', message: 'test' }),
+      });
+      expect(response.status).toBe(403);
+      expect(await response.json()).toMatchObject({ error: 'Operator scope denied' });
+    } finally {
+      delete process.env.ARCHON_OPERATOR_TOKEN_INSPECT;
+      delete process.env.ARCHON_OPERATOR_TOKEN_FIRE;
+    }
+  });
+
+  test('requires an allowlisted approval for a fire token', async () => {
+    process.env.ARCHON_OPERATOR_TOKEN_FIRE = 'fire-token';
+    process.env.ARCHON_OPERATOR_FIRE_APPROVERS = 'john';
+    try {
+      const app = createTestApp();
+      registerApiRoutes(app, {} as WebAdapter, {} as ConversationLockManager);
+      const response = await app.request('/api/workflows/major-build/run', {
+        method: 'POST',
+        headers: { 'x-archon-operator-token': 'fire-token', 'content-type': 'application/json' },
+        body: JSON.stringify({ conversationId: 'test', message: 'test' }),
+      });
+      expect(response.status).toBe(403);
+      expect(await response.json()).toMatchObject({ error: 'Fire approval is missing or invalid' });
+    } finally {
+      delete process.env.ARCHON_OPERATOR_TOKEN_FIRE;
+      delete process.env.ARCHON_OPERATOR_FIRE_APPROVERS;
+    }
+  });
+});
 
 describe('GET /api/workflows', () => {
   test('requires operator token when ARCHON_OPERATOR_TOKEN is configured', async () => {

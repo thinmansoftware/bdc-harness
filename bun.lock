@@ -139,6 +139,17 @@
         "typescript": "^5.0.0",
       },
     },
+    "packages/mcp-operator": {
+      "name": "@archon/mcp-operator",
+      "version": "0.3.10",
+      "bin": {
+        "archon-mcp-operator": "./src/server.ts",
+      },
+      "dependencies": {
+        "@modelcontextprotocol/sdk": "^1.29.0",
+        "zod": "^4.0.0",
+      },
+    },
     "packages/overseer": {
       "name": "@archon/overseer",
       "version": "0.1.0",
@@ -361,6 +372,8 @@
     "@archon/git": ["@archon/git@workspace:packages/git"],
 
     "@archon/isolation": ["@archon/isolation@workspace:packages/isolation"],
+
+    "@archon/mcp-operator": ["@archon/mcp-operator@workspace:packages/mcp-operator"],
 
     "@archon/overseer": ["@archon/overseer@workspace:packages/overseer"],
 
@@ -2905,6 +2918,8 @@
     "@antfu/ni/tinyexec": ["tinyexec@1.0.2", "", {}, "sha512-W/KYk+NFhkmsYpuHq5JykngiOCnxeVL8v8dFnqxSD8qEEdRfXk1SDM6JzNqcERbcGYj9tMrDQBYV9cjgnunFIg=="],
 
     "@anthropic-ai/claude-agent-sdk/zod": ["zod@4.3.6", "", {}, "sha512-rftlrkhHZOcjDwkGlnUtZZkvaPHCsDATp4pGpuOOMDaTdDDXF91wuVDJoWoPsKX/3YPQ5fHuF3STjcYyKr+Qhg=="],
+
+    "@archon/mcp-operator/zod": ["zod@4.3.6", "", {}, "sha512-rftlrkhHZOcjDwkGlnUtZZkvaPHCsDATp4pGpuOOMDaTdDDXF91wuVDJoWoPsKX/3YPQ5fHuF3STjcYyKr+Qhg=="],
 
     "@astrojs/markdown-remark/remark-parse": ["remark-parse@11.0.0", "", { "dependencies": { "@types/mdast": "^4.0.0", "mdast-util-from-markdown": "^2.0.0", "micromark-util-types": "^2.0.0", "unified": "^11.0.0" } }, "sha512-FCxlKLNGknS5ba/1lmpYijMUzX2esxW5xQqjWxw2eHFfS2MSdaHVINFmhjo+qN1WhZhNimq0dZATN9pH0IDrpA=="],
 

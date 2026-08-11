@@ -76,6 +76,31 @@ import {
 
 let providerWaitSchedulerTimer: ReturnType<typeof setInterval> | undefined;
 
+export type OperatorScope = 'inspect' | 'message' | 'fire';
+
+/** Classify only the operator MCP routes; all other private routes remain master-token only. */
+export function requireScopeForPath(pathname: string, method: string): OperatorScope | null {
+  const normalizedMethod = method.toUpperCase();
+  if (normalizedMethod === 'POST' && /^\/api\/workflows\/[^/]+\/run$/.test(pathname)) {
+    return 'fire';
+  }
+  if (pathname === '/api/dispatch/messages' && normalizedMethod === 'GET') return 'inspect';
+  if (pathname === '/api/dispatch/messages' && normalizedMethod === 'POST') return 'message';
+  if (
+    normalizedMethod === 'POST' &&
+    /^\/api\/dispatch\/messages\/[^/]+\/(claim|result|ack|address|renew-lease|cancel|supersede)$/.test(
+      pathname
+    )
+  ) {
+    return 'message';
+  }
+  if (normalizedMethod !== 'GET') return null;
+  if (pathname === '/api/dashboard/runs') return 'inspect';
+  if (/^\/api\/workflows\/runs\/[^/]+$/.test(pathname)) return 'inspect';
+  if (/^\/api\/workflows\/runs\/[^/]+\/nodes\/[^/]+\/events$/.test(pathname)) return 'inspect';
+  return null;
+}
+
 export function stopProviderWaitScheduler(): void {
   if (providerWaitSchedulerTimer) clearInterval(providerWaitSchedulerTimer);
   providerWaitSchedulerTimer = undefined;
@@ -1479,6 +1504,7 @@ const runWorkflowRoute = createRoute({
       description: 'Accepted',
     },
     400: jsonError('Bad request'),
+    403: jsonError('Fire approval required'),
     500: jsonError('Server error'),
     503: jsonError('Cauldron draining'),
   },
@@ -2283,7 +2309,14 @@ export function registerApiRoutes(
   }
 
   function privateApiRequiresOperatorToken(): boolean {
-    return Boolean(process.env.ARCHON_OPERATOR_TOKEN) || process.env.NODE_ENV === 'production';
+    return (
+      Boolean(
+        process.env.ARCHON_OPERATOR_TOKEN ||
+        process.env.ARCHON_OPERATOR_TOKEN_INSPECT ||
+        process.env.ARCHON_OPERATOR_TOKEN_MESSAGE ||
+        process.env.ARCHON_OPERATOR_TOKEN_FIRE
+      ) || process.env.NODE_ENV === 'production'
+    );
   }
 
   function isPublicApiPath(pathname: string): boolean {
@@ -2486,17 +2519,30 @@ export function registerApiRoutes(
       return next();
     }
 
-    const expectedToken = process.env.ARCHON_OPERATOR_TOKEN;
-    if (!expectedToken) {
+    const masterToken = process.env.ARCHON_OPERATOR_TOKEN;
+    const requiredScope = requireScopeForPath(c.req.path, c.req.method);
+    const scopedToken = requiredScope
+      ? process.env[`ARCHON_OPERATOR_TOKEN_${requiredScope.toUpperCase()}`]
+      : undefined;
+    if (!masterToken && !scopedToken) {
       return apiError(
         c,
         503,
-        'Operator token is required but ARCHON_OPERATOR_TOKEN is not configured'
+        requiredScope
+          ? `Operator ${requiredScope} token is required but not configured`
+          : 'Operator token is required but ARCHON_OPERATOR_TOKEN is not configured'
       );
     }
 
-    if (getPresentedOperatorToken(c) !== expectedToken) {
-      return apiError(c, 401, 'Missing or invalid operator token');
+    const presentedToken = getPresentedOperatorToken(c);
+    const authorizedByMaster = Boolean(masterToken && presentedToken === masterToken);
+    const authorizedByScope = Boolean(scopedToken && presentedToken === scopedToken);
+    if (!authorizedByMaster && !authorizedByScope) {
+      return apiError(
+        c,
+        requiredScope ? 403 : 401,
+        requiredScope ? 'Operator scope denied' : 'Missing or invalid operator token'
+      );
     }
 
     return next();
@@ -4840,6 +4886,25 @@ export function registerApiRoutes(
       return apiError(c, 400, 'Invalid workflow name');
     }
     try {
+      const presentedToken = getPresentedOperatorToken(c);
+      const fireToken = process.env.ARCHON_OPERATOR_TOKEN_FIRE;
+      if (
+        fireToken &&
+        presentedToken === fireToken &&
+        presentedToken !== process.env.ARCHON_OPERATOR_TOKEN
+      ) {
+        const { approved_by: approvedBy, approval_reason: approvalReason } = getValidatedBody(
+          c,
+          runWorkflowBodySchema
+        );
+        const approvers = (process.env.ARCHON_OPERATOR_FIRE_APPROVERS ?? '')
+          .split(',')
+          .map(value => value.trim())
+          .filter(Boolean);
+        if (!approvedBy || !approvalReason || !approvers.includes(approvedBy)) {
+          return apiError(c, 403, 'Fire approval is missing or invalid');
+        }
+      }
       const drainRejection = await rejectNewDispatchIfDraining(c);
       if (drainRejection) return drainRejection;
       const { conversationId, message, conductor } = getValidatedBody(c, runWorkflowBodySchema);
@@ -4887,7 +4952,8 @@ export function registerApiRoutes(
           dispatchId: conductor.idempotencyKey,
           dryRun: conductor.dryRun ?? false,
           project: conductor.project,
-          token: c.req.header('x-archon-operator-token') ?? process.env.ARCHON_OPERATOR_TOKEN ?? '',
+          // Cascades re-enter private API routes; use the backward-compatible wildcard token.
+          token: process.env.ARCHON_OPERATOR_TOKEN ?? '',
         };
         if (cascadeOptions.dryRun) {
           const record = await runCascade(cascadeOptions);

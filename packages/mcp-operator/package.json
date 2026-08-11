@@ -1,0 +1,19 @@
+{
+  "name": "@archon/mcp-operator",
+  "version": "0.3.10",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "archon-mcp-operator": "./src/server.ts"
+  },
+  "scripts": {
+    "start": "bun src/server.ts",
+    "build": "bun build src/server.ts --target=bun --outdir=dist",
+    "type-check": "bun x tsc --noEmit",
+    "test": "bun test src"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "zod": "^4.0.0"
+  }
+}
