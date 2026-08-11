@@ -1,9 +1,27 @@
 export type AgentKind = 'prompt' | 'fusion' | 'acp' | 'mcp';
 
+/**
+ * How the prompt body reaches a 'prompt'-kind CLI.
+ *
+ * 'stdin' (default): the CLI reads the prompt from stdin when no inline
+ * prompt argument is given (claude -p, codex exec, cursor-agent --print).
+ *
+ * 'prompt-file': the CLI has no stdin-prompt mode and requires the prompt
+ * as a file path argument (grok's `-p/--single <PROMPT>` is argv-only; its
+ * `--prompt-file <PATH>` flag is the documented equivalent). When set,
+ * PROMPT_FILE_PLACEHOLDER in `args` is replaced with a real temp file path
+ * containing the prompt body, written before spawn, and nothing is piped
+ * to stdin.
+ */
+export type PromptDelivery = 'stdin' | 'prompt-file';
+export const PROMPT_FILE_PLACEHOLDER = '__DISPATCH_PROMPT_FILE__';
+
 export interface AgentConfig {
   kind?: AgentKind;
   command: string;
   args: string[];
+  /** Defaults to 'stdin'. Set to 'prompt-file' for CLIs with no stdin prompt mode. */
+  promptDelivery?: PromptDelivery;
   /**
    * ACP-only (kind: 'acp'), all optional with safe defaults.
    *
@@ -62,7 +80,12 @@ export const defaultAgentConfigs: Record<string, AgentConfig> = {
   },
   grok: {
     command: 'grok',
-    args: ['--permission-mode', 'plan', '--no-subagents', '-p'],
+    // grok's `-p/--single <PROMPT>` is argv-only with no stdin-prompt mode
+    // (confirmed via `grok --help`, 2026-08-11). Deliver via `--prompt-file`
+    // instead; runAgent substitutes PROMPT_FILE_PLACEHOLDER with a real temp
+    // file path written before spawn.
+    args: ['--permission-mode', 'plan', '--no-subagents', '--prompt-file', PROMPT_FILE_PLACEHOLDER],
+    promptDelivery: 'prompt-file',
   },
   cursor: {
     command: 'cursor-agent',

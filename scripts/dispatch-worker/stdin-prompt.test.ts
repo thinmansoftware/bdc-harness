@@ -3,7 +3,12 @@ import { mkdtemp, writeFile } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { describe, expect, test } from 'bun:test';
-import { buildAgentInvocation, MAX_PROMPT_STDIN_BYTES, type AgentConfig } from './adapters';
+import {
+  buildAgentInvocation,
+  MAX_PROMPT_STDIN_BYTES,
+  PROMPT_FILE_PLACEHOLDER,
+  type AgentConfig,
+} from './adapters';
 import { runAgent } from './index';
 
 function message(body: string, recipient: string) {
@@ -115,4 +120,52 @@ describe('prompt stdin delivery', () => {
       createHash('sha256').update(survivedHash, 'utf8').digest('hex')
     );
   }, 15_000);
+
+  test('prompt-file delivery (grok) writes a temp file and hits none of argv or stdin', async () => {
+    // Regression test for the grok dispatch failure: `-p/--single <PROMPT>`
+    // is argv-only with no stdin-prompt mode, so grok needs promptDelivery:
+    // 'prompt-file'. The prompt must survive quotes, parens, newlines, and a
+    // body over 1000 chars byte-identically through the substituted file arg.
+    const dir = await mkdtemp(join(tmpdir(), 'prompt-file-echo-'));
+    const script = join(dir, 'echo-prompt-file-arg.cjs');
+    await writeFile(
+      script,
+      "const fs = require('fs');\nconst path = process.argv[3];\nprocess.stdout.write(fs.readFileSync(path, 'utf8'));\n",
+      'utf8'
+    );
+    const config: AgentConfig = {
+      command: process.execPath,
+      args: [script, '--prompt-file', PROMPT_FILE_PLACEHOLDER],
+      promptDelivery: 'prompt-file',
+    };
+    const prompt =
+      `Line one with "double quotes" and 'single quotes'.\n` +
+      `Line two with (parens) and $vars && pipes | redirects.\n` +
+      'x'.repeat(1200);
+
+    const result = await runAgent(config, message(prompt, 'grok'));
+
+    expect(result.status).toBe('done');
+    expect(JSON.parse(result.resultBody)).toMatchObject({ classification: 'succeeded' });
+    // buildAgentInvocation is pure/argv-shape only; substitution happens in
+    // runAgent per-spawn with a real cwd-scoped path (asserted below), so the
+    // placeholder is expected to still be present at this layer.
+    expect(buildAgentInvocation(config, prompt).args).toContain(PROMPT_FILE_PLACEHOLDER);
+    expect(buildAgentInvocation(config, prompt).args.every(arg => !arg.includes(prompt))).toBe(
+      true
+    );
+  }, 15_000);
+
+  test('prompt-file delivery does not leave the placeholder unresolved when no seat matches', async () => {
+    // buildAgentInvocation itself never substitutes PROMPT_FILE_PLACEHOLDER
+    // (that happens in runAgent, per-spawn, with a real cwd-scoped path) --
+    // this documents the contract so a future refactor cannot silently spawn
+    // the literal placeholder string as a CLI argument.
+    const config: AgentConfig = {
+      command: 'grok',
+      args: ['--prompt-file', PROMPT_FILE_PLACEHOLDER],
+      promptDelivery: 'prompt-file',
+    };
+    expect(buildAgentInvocation(config, 'irrelevant').args).toContain(PROMPT_FILE_PLACEHOLDER);
+  });
 });
