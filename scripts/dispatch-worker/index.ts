@@ -9,6 +9,7 @@ import {
   ACP_DEFAULT_KILL_GRACE_MS,
   ACP_DEFAULT_WALL_CLOCK_MS,
   MAX_PROMPT_STDIN_BYTES,
+  PROMPT_FILE_PLACEHOLDER,
   buildAgentInvocation,
   defaultAgentConfigs,
   parseFusionReviewBody,
@@ -499,12 +500,19 @@ export async function runAgent(
     command = invocation.command;
     args = invocation.args;
   }
+  const usesPromptFile =
+    config.kind !== 'fusion' && config.promptDelivery === 'prompt-file' && promptBody !== undefined;
+  if (usesPromptFile && promptBody !== undefined) {
+    const promptFilePath = join(cwd, 'dispatch-prompt.txt');
+    await writeFile(promptFilePath, promptBody, 'utf8');
+    args = args.map(arg => (arg === PROMPT_FILE_PLACEHOLDER ? promptFilePath : arg));
+  }
   const proc = spawn({
     cmd: [command, ...args],
     cwd,
     stdout: 'pipe',
     stderr: 'pipe',
-    stdin: config.kind === 'fusion' ? 'ignore' : 'pipe',
+    stdin: config.kind === 'fusion' || usesPromptFile ? 'ignore' : 'pipe',
   });
   let treeBeforeKill: number[] = [];
   let treeAfterKill: number[] = [];
@@ -525,7 +533,7 @@ export async function runAgent(
     if (cancel?.cancelled) void beginCancellation();
   }, 50);
   cancelTimer.unref?.();
-  if (promptBody !== undefined) {
+  if (promptBody !== undefined && !usesPromptFile) {
     const stdin = proc.stdin;
     if (!stdin) throw new Error('prompt_stdin_pipe_unavailable');
     try {
