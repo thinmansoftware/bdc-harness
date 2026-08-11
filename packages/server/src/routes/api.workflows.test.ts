@@ -207,6 +207,44 @@ describe('operator MCP route scopes', () => {
       delete process.env.ARCHON_OPERATOR_FIRE_APPROVERS;
     }
   });
+
+  test('keeps legacy master-token workflow callers backward compatible', async () => {
+    process.env.ARCHON_OPERATOR_TOKEN = 'master-token';
+    process.env.ARCHON_OPERATOR_FIRE_APPROVERS = 'john';
+    try {
+      const app = createTestApp();
+      registerApiRoutes(app, {} as WebAdapter, {} as ConversationLockManager);
+      const response = await app.request('/api/workflows/major-build/run', {
+        method: 'POST',
+        headers: { 'x-archon-operator-token': 'master-token', 'content-type': 'application/json' },
+        body: JSON.stringify({ conversationId: 'test', message: 'test' }),
+      });
+      expect(response.status).not.toBe(403);
+      expect(await response.json()).not.toMatchObject({
+        error: 'Fire approval is missing or invalid',
+      });
+    } finally {
+      delete process.env.ARCHON_OPERATOR_TOKEN;
+      delete process.env.ARCHON_OPERATOR_FIRE_APPROVERS;
+    }
+  });
+
+  test('requires an allowlisted approval when the fire token is not configured', async () => {
+    process.env.ARCHON_OPERATOR_FIRE_APPROVERS = 'john';
+    try {
+      const app = createTestApp();
+      registerApiRoutes(app, {} as WebAdapter, {} as ConversationLockManager);
+      const response = await app.request('/api/workflows/major-build/run', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ conversationId: 'test', message: 'test' }),
+      });
+      expect(response.status).toBe(403);
+      expect(await response.json()).toMatchObject({ error: 'Fire approval is missing or invalid' });
+    } finally {
+      delete process.env.ARCHON_OPERATOR_FIRE_APPROVERS;
+    }
+  });
 });
 
 describe('GET /api/workflows', () => {

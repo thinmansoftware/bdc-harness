@@ -1,8 +1,15 @@
 import { describe, expect, test } from 'bun:test';
-import { ackMessage, addressMessage, claimMessage, postResult, sendMessage } from './dispatch.js';
+import {
+  ackMessage,
+  addressMessage,
+  cancelMessage,
+  claimMessage,
+  postResult,
+  sendMessage,
+} from './dispatch.js';
 
 describe('dispatch tools', () => {
-  test('preserves the send-claim-result-ack-address REST sequence', async () => {
+  test('preserves the send-claim-result-ack-address-cancel REST sequence', async () => {
     const paths: string[] = [];
     const options = {
       token: 'message-token',
@@ -16,12 +23,14 @@ describe('dispatch tools', () => {
     await postResult({ id: 'm1', body: { fencing_token: 1 } }, options);
     await ackMessage({ id: 'm1', body: { principal_id: 'p1' } }, options);
     await addressMessage({ id: 'm1', body: { principal_id: 'p1' } }, options);
+    await cancelMessage({ id: 'm1', body: { principal_id: 'p1' } }, options);
     expect(paths).toEqual([
       '/api/dispatch/messages',
       '/api/dispatch/messages/m1/claim',
       '/api/dispatch/messages/m1/result',
       '/api/dispatch/messages/m1/ack',
       '/api/dispatch/messages/m1/address',
+      '/api/dispatch/messages/m1/cancel',
     ]);
   });
 

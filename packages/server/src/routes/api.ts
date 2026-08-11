@@ -4887,12 +4887,9 @@ export function registerApiRoutes(
     }
     try {
       const presentedToken = getPresentedOperatorToken(c);
-      const fireToken = process.env.ARCHON_OPERATOR_TOKEN_FIRE;
-      if (
-        fireToken &&
-        presentedToken === fireToken &&
-        presentedToken !== process.env.ARCHON_OPERATOR_TOKEN
-      ) {
+      const masterToken = process.env.ARCHON_OPERATOR_TOKEN;
+      const authorizedByLegacyMaster = Boolean(masterToken && presentedToken === masterToken);
+      if (!authorizedByLegacyMaster) {
         const { approved_by: approvedBy, approval_reason: approvalReason } = getValidatedBody(
           c,
           runWorkflowBodySchema
