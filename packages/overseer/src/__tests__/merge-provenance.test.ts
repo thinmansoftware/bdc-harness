@@ -20,7 +20,7 @@ function makeRecord(overrides: Partial<WatchedRunRecord> = {}): WatchedRunRecord
   return {
     runId: 'run-provenance-1',
     woId: 'WO-PROVENANCE-01',
-    owner: 'bluedevilcollectibles',
+    owner: 'thinmansoftware',
     repo: 'bdc-harness',
     status: 'failed',
     action: 'merge_ready',
@@ -32,7 +32,7 @@ function makeRecord(overrides: Partial<WatchedRunRecord> = {}): WatchedRunRecord
       state: 'open',
       checks: { total: 1, passed: 1, failed: 0, pending: 0 },
       mergeable: true,
-      pr: { owner: 'bluedevilcollectibles', repo: 'bdc-harness', number: 42 },
+      pr: { owner: 'thinmansoftware', repo: 'bdc-harness', number: 42 },
       prTitle: 'Ready to merge',
       filesChangedCount: 1,
       diffStat: '+1 -0',

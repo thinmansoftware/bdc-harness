@@ -1096,7 +1096,7 @@ function prEvidence(overrides: Partial<PullRequestEvidence> = {}): PullRequestEv
     state: 'open',
     checks: { total: 2, passed: 2, failed: 0, pending: 0 },
     mergeable: true,
-    pr: { owner: 'bluedevilcollectibles', repo: 'bdc-harness', number: 42 },
+    pr: { owner: 'thinmansoftware', repo: 'bdc-harness', number: 42 },
     prTitle: 'Add feature',
     filesChangedCount: 1,
     diffStat: '+10 -1',
@@ -1108,7 +1108,7 @@ function record(overrides: Partial<WatchedRunRecord> = {}): WatchedRunRecord {
   return {
     runId: 'run-merge-1',
     woId: 'WO-M42-S8-INTEGRATION',
-    owner: 'bluedevilcollectibles',
+    owner: 'thinmansoftware',
     repo: 'bdc-harness',
     status: 'failed',
     errorClass: 'tail_node_false_fail',
@@ -1126,7 +1126,7 @@ export function mergeEvidence(
   const base: QualifiedMergeEvidence = {
     record: record(),
     registry,
-    owner: 'bluedevilcollectibles',
+    owner: 'thinmansoftware',
     repository: 'bdc-harness',
     base_branch: 'dev',
     resulting_deployment_effect: 'none',

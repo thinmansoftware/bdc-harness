@@ -2,13 +2,15 @@
   "schema_version": "overseer-action-policy-v1",
   "entries": [
     {
-      "owner": "bluedevilcollectibles",
+      "owner": "thinmansoftware",
       "repository": "bdc-harness",
       "base_branch": "dev",
       "resulting_deployment_effect": "staging",
-      "allowed_action_kinds": ["MERGE"],
+      "allowed_action_kinds": [
+        "MERGE"
+      ],
       "credential_principal": "overseer-merge-manager-v1",
-      "policy_digest": "34f7ba1e17c3821d46ee834564ac6b8d2f910e32349ab68b9d1a2e42e4179c93"
+      "policy_digest": "297609b5438bf0804402526a7d368d9aab6ef8a78f15aecae9b6d133615c32b4"
     }
   ]
 }

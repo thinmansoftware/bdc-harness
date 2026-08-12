@@ -170,7 +170,7 @@ describe('M-42 Slice 8B canary runner scenarios', () => {
 
   test('wrong repository name or immutable ID performs zero calls', async () => {
     const executor = recordingExecutor();
-    const bad = envelope(payload({ repository_full_name: 'bluedevilcollectibles/other' }));
+    const bad = envelope(payload({ repository_full_name: 'thinmansoftware/other' }));
     const receipt = await runM42Slice8BCanary(bad, deps(executor.actions));
     expect(receipt.stop_reason).toBe('manifest_refused');
     expect(executor.calls()).toEqual([]);

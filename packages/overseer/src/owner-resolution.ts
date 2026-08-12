@@ -1,4 +1,4 @@
-const BDC_OWNER = 'bluedevilcollectibles';
+const BDC_OWNER = 'thinmansoftware';
 const BDC_XO_REPO = 'bdc-xo';
 const BDC_XO_REF = 'main';
 const MOTIONS_PATH = 'docs/board/motions';

@@ -13,7 +13,7 @@ export function mergedPr(
   overrides: Partial<ReconcileMergedPullRequest> = {}
 ): ReconcileMergedPullRequest {
   return {
-    owner: 'bluedevilcollectibles',
+    owner: 'thinmansoftware',
     repo: 'bdc-harness',
     number: 404,
     title: 'BDC feature Work Order implementation',
@@ -29,7 +29,7 @@ export function mergedPr(
 
 export function trackerIssue(state: 'open' | 'closed' = 'open'): ReconcileTrackerIssue {
   return {
-    owner: 'bluedevilcollectibles',
+    owner: 'thinmansoftware',
     repo: 'bdc-xo',
     number: 1044,
     title: stem,

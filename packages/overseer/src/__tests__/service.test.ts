@@ -194,7 +194,7 @@ describe('service', () => {
 
     await expect(
       deps.findPullRequest({
-        owner: 'bluedevilcollectibles',
+        owner: 'thinmansoftware',
         repo: 'bdc-harness',
         headBranch: 'fix/fake',
         woId: 'WO-FAKE',
@@ -207,7 +207,7 @@ describe('service', () => {
     });
     await expect(
       deps.mergePullRequest({
-        owner: 'bluedevilcollectibles',
+        owner: 'thinmansoftware',
         repo: 'bdc-harness',
         number: 42,
       })
@@ -222,7 +222,7 @@ describe('service', () => {
       state: 'open',
       checks: { total: 1, passed: 1, failed: 0, pending: 0 },
       mergeable: true,
-      pr: { owner: 'bluedevilcollectibles', repo: 'bdc-harness', number: 42 },
+      pr: { owner: 'thinmansoftware', repo: 'bdc-harness', number: 42 },
     }));
     const mergePullRequest = mock(async () => ({ merged: true, message: 'merged' }));
     const realFactory = mock(() => ({ findPullRequest, mergePullRequest }));
@@ -230,7 +230,7 @@ describe('service', () => {
 
     await expect(
       deps.findPullRequest({
-        owner: 'bluedevilcollectibles',
+        owner: 'thinmansoftware',
         repo: 'bdc-harness',
         headBranch: 'fix/real',
         woId: 'WO-REAL',
@@ -238,7 +238,7 @@ describe('service', () => {
     ).resolves.toMatchObject({ exists: true, pr: { number: 42 } });
     await expect(
       deps.mergePullRequest({
-        owner: 'bluedevilcollectibles',
+        owner: 'thinmansoftware',
         repo: 'bdc-harness',
         number: 42,
       })
@@ -296,7 +296,7 @@ describe('service', () => {
           {
             id: 'run-dry',
             woId: 'WO-DRY-01',
-            owner: 'bluedevilcollectibles',
+            owner: 'thinmansoftware',
             repo: 'bdc-harness',
             status: 'failed',
             headBranch: 'wo/dry',
@@ -308,7 +308,7 @@ describe('service', () => {
           state: 'open',
           checks: { total: 1, passed: 1, failed: 0, pending: 0 },
           mergeable: true,
-          pr: { owner: 'bluedevilcollectibles', repo: 'bdc-harness', number: 3 },
+          pr: { owner: 'thinmansoftware', repo: 'bdc-harness', number: 3 },
         }),
         mergePullRequest,
         insertOverseerAction,
@@ -337,7 +337,7 @@ describe('service', () => {
           {
             id: 'run-fake-adapter',
             woId: 'WO-FAKE-01',
-            owner: 'bluedevilcollectibles',
+            owner: 'thinmansoftware',
             repo: 'bdc-harness',
             status: 'failed',
             headBranch: 'wo/fake',
@@ -394,7 +394,7 @@ describe('service', () => {
           {
             id: 'run-no-permit',
             woId: 'WO-NO-PERMIT-01',
-            owner: 'bluedevilcollectibles',
+            owner: 'thinmansoftware',
             repo: 'bdc-harness',
             status: 'failed',
             metadata: {},
@@ -406,7 +406,7 @@ describe('service', () => {
           state: 'open',
           checks: { total: 1, passed: 1, failed: 0, pending: 0 },
           mergeable: true,
-          pr: { owner: 'bluedevilcollectibles', repo: 'bdc-harness', number: 42 },
+          pr: { owner: 'thinmansoftware', repo: 'bdc-harness', number: 42 },
         }),
         mergePullRequest,
         insertOverseerAction: async action => {
@@ -444,7 +444,7 @@ describe('service', () => {
             {
               id: 'run-default-escalation',
               woId: 'WO-DEFAULT-ESCALATION-01',
-              owner: 'bluedevilcollectibles',
+              owner: 'thinmansoftware',
               repo: 'bdc-harness',
               status: 'failed',
               metadata: { overseer_m31_permit: boundPermit },
@@ -526,7 +526,7 @@ describe('service', () => {
             {
               id: 'run-dryrun-escalation',
               woId: 'WO-DRYRUN-ESCALATION-01',
-              owner: 'bluedevilcollectibles',
+              owner: 'thinmansoftware',
               repo: 'bdc-harness',
               status: 'failed',
               metadata: { overseer_m31_permit: boundPermit },
@@ -592,7 +592,7 @@ describe('service', () => {
             {
               id: 'run-canary-determined-outcome',
               woId: 'WO-CANARY-DETERMINED-01',
-              owner: 'bluedevilcollectibles',
+              owner: 'thinmansoftware',
               repo: 'bdc-harness',
               status: 'failed',
               metadata: { overseer_m31_permit: boundPermit },
@@ -650,7 +650,7 @@ describe('service', () => {
             {
               id: 'run-dry-merge',
               woId: 'WO-DRY-MERGE-01',
-              owner: 'bluedevilcollectibles',
+              owner: 'thinmansoftware',
               repo: 'bdc-harness',
               status: 'failed',
               headBranch: 'wo/dry-merge',
@@ -662,7 +662,7 @@ describe('service', () => {
             state: 'open',
             checks: { total: 1, passed: 1, failed: 0, pending: 0 },
             mergeable: true,
-            pr: { owner: 'bluedevilcollectibles', repo: 'bdc-harness', number: 4 },
+            pr: { owner: 'thinmansoftware', repo: 'bdc-harness', number: 4 },
           }),
           mergePullRequest,
           insertOverseerAction,
@@ -688,7 +688,7 @@ describe('service', () => {
           {
             id: 'run-coordinated',
             woId: 'WO-COORDINATED-01',
-            owner: 'bluedevilcollectibles',
+            owner: 'thinmansoftware',
             repo: 'bdc-harness',
             status: 'failed',
           },
@@ -699,7 +699,7 @@ describe('service', () => {
           state: 'open',
           checks: { total: 1, passed: 1, failed: 0, pending: 0 },
           mergeable: true,
-          pr: { owner: 'bluedevilcollectibles', repo: 'bdc-harness', number: 42 },
+          pr: { owner: 'thinmansoftware', repo: 'bdc-harness', number: 42 },
         }),
         mergePullRequest: async () => {
           throw new Error('legacy merge boundary must be unreachable');
@@ -726,7 +726,7 @@ describe('service', () => {
           {
             id: 'run-concurrent',
             woId: 'WO-CONCURRENT-01',
-            owner: 'bluedevilcollectibles',
+            owner: 'thinmansoftware',
             repo: 'bdc-harness',
             status: 'failed' as const,
             metadata: { overseer_m31_permit: boundPermit },
@@ -738,7 +738,7 @@ describe('service', () => {
           state: 'open' as const,
           checks: { total: 1, passed: 1, failed: 0, pending: 0 },
           mergeable: true,
-          pr: { owner: 'bluedevilcollectibles', repo: 'bdc-harness', number: 42 },
+          pr: { owner: 'thinmansoftware', repo: 'bdc-harness', number: 42 },
         }),
         mergePullRequest,
         insertOverseerAction: async (action: { action: string; result: string }): Promise<void> => {

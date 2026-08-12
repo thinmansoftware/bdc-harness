@@ -8,7 +8,7 @@ const RUN_HEAD_SHA = 'a'.repeat(40);
 const record: WatchedRunRecord = {
   runId: 'run-merge-manager-1',
   woId: 'WO-MERGE-MANAGER-01',
-  owner: 'bluedevilcollectibles',
+  owner: 'thinmansoftware',
   repo: 'bdc-harness',
   status: 'failed',
   action: 'merge_ready',
@@ -21,7 +21,7 @@ const record: WatchedRunRecord = {
     state: 'open',
     checks: { total: 1, passed: 1, failed: 0, pending: 0 },
     mergeable: true,
-    pr: { owner: 'bluedevilcollectibles', repo: 'bdc-harness', number: 42 },
+    pr: { owner: 'thinmansoftware', repo: 'bdc-harness', number: 42 },
     prTitle: 'Ready to merge',
     filesChangedCount: 1,
     diffStat: '+1 -0',
@@ -186,7 +186,7 @@ describe('merge manager', () => {
       repo: 'bdc-public-site',
       prEvidence: {
         ...record.prEvidence,
-        pr: { owner: 'bluedevilcollectibles', repo: 'bdc-public-site', number: 77 },
+        pr: { owner: 'thinmansoftware', repo: 'bdc-public-site', number: 77 },
       },
     };
     const insertOverseerAction = mock(async () => undefined);

@@ -5,7 +5,7 @@ describe('judge-pr', () => {
   test('detects green mergeable PR evidence', async () => {
     const evidence = await judgePullRequest(
       {
-        owner: 'bluedevilcollectibles',
+        owner: 'thinmansoftware',
         repo: 'bdc-harness',
         headBranch: 'wo/test',
         woId: 'WO-TEST-01',
@@ -16,7 +16,7 @@ describe('judge-pr', () => {
           state: 'open',
           checks: { total: 2, passed: 2, failed: 0, pending: 0 },
           mergeable: true,
-          pr: { owner: 'bluedevilcollectibles', repo: 'bdc-harness', number: 7 },
+          pr: { owner: 'thinmansoftware', repo: 'bdc-harness', number: 7 },
         }),
         mergePullRequest: async () => ({ merged: true }),
       }
