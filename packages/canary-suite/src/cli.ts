@@ -1,12 +1,22 @@
 import { readFile } from 'fs/promises';
 import { runCanary, type RunCanaryOptions } from './runner';
 import type { RunCanaryResult } from './types';
-import { runTaskmasterCanarySuite } from './taskmaster-canary';
+import {
+  runTaskmasterCanarySuite,
+  writeTaskmasterCanaryArtifacts,
+  type TaskmasterCanaryDeps,
+  type TaskmasterCanaryResult,
+} from './taskmaster-canary';
 
 interface CanaryCliDeps {
   readonly runner: (options: RunCanaryOptions) => Promise<RunCanaryResult>;
   readonly stdout: (value: string) => void;
   readonly stderr: (value: string) => void;
+  readonly taskmasterRunner?: (options: TaskmasterCanaryDeps) => Promise<TaskmasterCanaryResult>;
+  readonly taskmasterArtifactWriter?: (
+    outputRoot: string,
+    report: TaskmasterCanaryResult
+  ) => Promise<readonly string[]>;
 }
 
 function flag(args: readonly string[], name: string): string | undefined {
@@ -41,6 +51,7 @@ export async function runCanaryCli(
     const dbPath = flag(args, '--db-path');
     const statusUrl = flag(args, '--status-url');
     const githubRepo = flag(args, '--github-repo');
+    const outputRoot = flag(args, '--output-root');
     const issueValue = flag(args, '--github-issue');
     const intervalValue = flag(args, '--interval-ms') ?? env.TASKMASTER_INTERVAL_MS;
     const githubIssue = issueValue === undefined ? NaN : Number(issueValue);
@@ -49,14 +60,15 @@ export async function runCanaryCli(
       !dbPath ||
       !statusUrl ||
       !githubRepo ||
+      !outputRoot ||
       !Number.isSafeInteger(githubIssue) ||
       githubIssue <= 0 ||
-      (intervalMs !== undefined && (!Number.isFinite(intervalMs) || intervalMs <= 0))
+      (intervalMs !== undefined && (!Number.isFinite(intervalMs) || intervalMs < 0))
     ) {
       deps.stderr('taskmaster_canary_missing_or_invalid_required_argument');
       return 3;
     }
-    const report = await runTaskmasterCanarySuite({
+    const report = await (deps.taskmasterRunner ?? runTaskmasterCanarySuite)({
       dbPath,
       statusUrl,
       githubRepo,
@@ -64,6 +76,7 @@ export async function runCanaryCli(
       intervalMs,
       operatorToken: env.ARCHON_OPERATOR_TOKEN,
     });
+    await (deps.taskmasterArtifactWriter ?? writeTaskmasterCanaryArtifacts)(outputRoot, report);
     deps.stdout(JSON.stringify(report, null, 2));
     return exitFor(report.verdict);
   }

@@ -1,7 +1,12 @@
 import { Database } from 'bun:sqlite';
+import { randomUUID } from 'crypto';
+import { link, mkdir, readFile, rm, writeFile } from 'fs/promises';
+import { join } from 'path';
 import type { CanaryVerdict } from './types';
 
 const DEFAULT_INTERVAL_MS = 60_000;
+// Mirrors NUDGE_CLOCK_MS.P2 in packages/server/src/taskmaster/rules.ts.
+// Kept local so the canary package does not acquire a production dependency on @archon/server.
 export const TASKMASTER_CANARY_P2_NUDGE_CLOCK_MS = 24 * 60 * 60 * 1_000;
 
 interface Query<T> {
@@ -78,7 +83,7 @@ async function statusEvidence(deps: TaskmasterCanaryDeps): Promise<{
       tick_health?: unknown;
     };
     const intervalMs =
-      typeof body.interval_ms === 'number' && body.interval_ms > 0 ? body.interval_ms : undefined;
+      typeof body.interval_ms === 'number' && body.interval_ms >= 0 ? body.interval_ms : undefined;
     const tickHealth = typeof body.tick_health === 'string' ? body.tick_health : 'unknown';
     const lastTickAt = typeof body.last_tick_at === 'string' ? body.last_tick_at : 'unknown';
     return {
@@ -214,4 +219,35 @@ export async function runTaskmasterCanarySuite(
     evidenceRefs: checks.flatMap(check => check.evidenceRefs),
     checks,
   };
+}
+
+async function readIfPresent(path: string): Promise<string | null> {
+  try {
+    return await readFile(path, 'utf8');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    throw error;
+  }
+}
+
+export async function writeTaskmasterCanaryArtifacts(
+  outputRoot: string,
+  report: TaskmasterCanaryResult
+): Promise<string[]> {
+  const directory = join(outputRoot, `taskmaster-${randomUUID()}`);
+  const path = join(directory, 'summary.json');
+  const content = `${JSON.stringify(report, null, 2)}\n`;
+  await mkdir(directory, { recursive: true });
+  const temporary = `${path}.tmp-${randomUUID()}`;
+  try {
+    await writeFile(temporary, content, { flag: 'wx' });
+    try {
+      await link(temporary, path);
+    } catch (error) {
+      if ((await readIfPresent(path)) !== content) throw error;
+    }
+  } finally {
+    await rm(temporary, { force: true });
+  }
+  return [path];
 }

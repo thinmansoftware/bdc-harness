@@ -1,9 +1,13 @@
 import { afterEach, describe, expect, test } from 'bun:test';
 import { Database } from 'bun:sqlite';
+import { mkdtemp, readFile, rm } from 'fs/promises';
+import { tmpdir } from 'os';
+import { join } from 'path';
 import {
   runTaskmasterCanarySuite,
   runTaskmasterHeartbeatCheck,
   runTaskmasterSyntheticIdempotencyCheck,
+  writeTaskmasterCanaryArtifacts,
 } from './taskmaster-canary';
 
 const NOW = Date.parse('2026-08-11T12:00:00.000Z');
@@ -63,6 +67,14 @@ describe('Taskmaster Level 0 canaries', () => {
     expect(result.evidenceRefs).toContain('age_ms=300000');
   });
 
+  test('heartbeat treats interval zero as the killed sentinel', async () => {
+    const db = fixture();
+    insert(db, 'pre-kill', NOW - 1);
+    const result = await runTaskmasterHeartbeatCheck({ ...baseDeps, intervalMs: 0, db });
+    expect(result.verdict).toBe('failed');
+    expect(result.evidenceRefs).toContain('threshold_ms=0');
+  });
+
   test('heartbeat fails closed when tm_journal is empty', async () => {
     const result = await runTaskmasterHeartbeatCheck({ ...baseDeps, db: fixture() });
     expect(result.verdict).toBe('failed');
@@ -100,5 +112,22 @@ describe('Taskmaster Level 0 canaries', () => {
 
     const after = db.query<{ 'COUNT(*)': number }, []>('SELECT COUNT(*) FROM tm_journal').get()!;
     expect(after['COUNT(*)']).toBe(before['COUNT(*)']);
+  });
+
+  test('writes the suite report beneath the canary artifact root', async () => {
+    const outputRoot = await mkdtemp(join(tmpdir(), 'taskmaster-canary-'));
+    const report = {
+      verdict: 'failed' as const,
+      reasonCodes: ['tick_heartbeat_stale'],
+      evidenceRefs: ['threshold_ms=0'],
+    };
+    try {
+      const paths = await writeTaskmasterCanaryArtifacts(outputRoot, report);
+      expect(paths).toHaveLength(1);
+      expect(paths[0]?.startsWith(outputRoot)).toBe(true);
+      expect(JSON.parse(await readFile(paths[0]!, 'utf8'))).toEqual(report);
+    } finally {
+      await rm(outputRoot, { recursive: true, force: true });
+    }
   });
 });
