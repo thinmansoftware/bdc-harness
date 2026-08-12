@@ -1,11 +1,22 @@
 import { readFile } from 'fs/promises';
 import { runCanary, type RunCanaryOptions } from './runner';
 import type { RunCanaryResult } from './types';
+import {
+  runTaskmasterCanarySuite,
+  writeTaskmasterCanaryArtifacts,
+  type TaskmasterCanaryDeps,
+  type TaskmasterCanaryResult,
+} from './taskmaster-canary';
 
 interface CanaryCliDeps {
   readonly runner: (options: RunCanaryOptions) => Promise<RunCanaryResult>;
   readonly stdout: (value: string) => void;
   readonly stderr: (value: string) => void;
+  readonly taskmasterRunner?: (options: TaskmasterCanaryDeps) => Promise<TaskmasterCanaryResult>;
+  readonly taskmasterArtifactWriter?: (
+    outputRoot: string,
+    report: TaskmasterCanaryResult
+  ) => Promise<readonly string[]>;
 }
 
 function flag(args: readonly string[], name: string): string | undefined {
@@ -36,11 +47,42 @@ export async function runCanaryCli(
   }
 ): Promise<number> {
   const command = args[0];
+  if (command === 'taskmaster') {
+    const dbPath = flag(args, '--db-path');
+    const statusUrl = flag(args, '--status-url');
+    const githubRepo = flag(args, '--github-repo');
+    const outputRoot = flag(args, '--output-root');
+    const issueValue = flag(args, '--github-issue');
+    const intervalValue = flag(args, '--interval-ms') ?? env.TASKMASTER_INTERVAL_MS;
+    const githubIssue = issueValue === undefined ? NaN : Number(issueValue);
+    const intervalMs = intervalValue === undefined ? undefined : Number(intervalValue);
+    if (
+      !dbPath ||
+      !statusUrl ||
+      !githubRepo ||
+      !outputRoot ||
+      !Number.isSafeInteger(githubIssue) ||
+      githubIssue <= 0 ||
+      (intervalMs !== undefined && (!Number.isFinite(intervalMs) || intervalMs < 0))
+    ) {
+      deps.stderr('taskmaster_canary_missing_or_invalid_required_argument');
+      return 3;
+    }
+    const report = await (deps.taskmasterRunner ?? runTaskmasterCanarySuite)({
+      dbPath,
+      statusUrl,
+      githubRepo,
+      githubIssue,
+      intervalMs,
+      operatorToken: env.ARCHON_OPERATOR_TOKEN,
+    });
+    await (deps.taskmasterArtifactWriter ?? writeTaskmasterCanaryArtifacts)(outputRoot, report);
+    deps.stdout(JSON.stringify(report, null, 2));
+    return exitFor(report.verdict);
+  }
   const level = command === 'check' ? 0 : command === 'plan' ? 1 : null;
   if (level === null) {
-    deps.stderr(
-      'Usage: archon-canary <check|plan> --manifest PATH --api-base URL --codebase-id ID --output-root PATH'
-    );
+    deps.stderr('Usage: archon-canary <check|plan|taskmaster> [options]');
     return 3;
   }
   const manifestPath = flag(args, '--manifest');
