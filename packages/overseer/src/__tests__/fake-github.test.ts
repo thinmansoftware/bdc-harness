@@ -36,7 +36,7 @@ function currentPolicy(): OverseerActionPolicy {
 function proposal(overrides: Partial<M31ActionProposal> = {}): M31ActionProposal {
   return {
     proposal_id: 'proposal-1',
-    repository: 'bluedevilcollectibles/bdc-harness',
+    repository: 'thinmansoftware/bdc-harness',
     pr_number: 42,
     head_sha: 'c'.repeat(40),
     base_branch: 'dev',
@@ -95,7 +95,7 @@ function capabilityState(
 function request(overrides: Record<string, unknown> = {}) {
   return {
     permit_id: 'permit-1',
-    repository: 'bluedevilcollectibles/bdc-harness',
+    repository: 'thinmansoftware/bdc-harness',
     pr_number: 42,
     head_sha: 'c'.repeat(40),
     base_branch: 'dev',
@@ -134,7 +134,7 @@ function harness(options: HarnessOptions = {}) {
     return true;
   });
   const adapter = createFakeGitHubAdapter({
-    allowed_repositories: ['bluedevilcollectibles/bdc-harness'],
+    allowed_repositories: ['thinmansoftware/bdc-harness'],
     authorization_deps: {
       getPolicy: async () => {
         if (options.fail_dependency === 'policy') throw new Error('policy-failed');

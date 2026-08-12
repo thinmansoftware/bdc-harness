@@ -1,7 +1,7 @@
 # @archon/overseer
 
 **Status:** Skeleton (v0.1.0, 2026-05-16)
-**Design authority:** [BDC_XO/docs/superpowers/specs/2026-05-09-WO-HARNESS-OVERLORD-ROUTING-INTEGRATION-01.md](https://github.com/bluedevilcollectibles/bdc-xo)
+**Design authority:** [BDC_XO/docs/superpowers/specs/2026-05-09-WO-HARNESS-OVERLORD-ROUTING-INTEGRATION-01.md](https://github.com/thinmansoftware/bdc-xo)
 **Python prior art:** `overlord/overlord/router.py` at https://github.com/bluedevilcollectibles/overlord
 
 ## What this is

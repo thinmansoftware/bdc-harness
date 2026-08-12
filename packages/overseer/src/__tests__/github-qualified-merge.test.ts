@@ -12,9 +12,9 @@ const request: QualifiedMergeAdapterRequestV2 = {
   permit_id: 'permit-1',
   proposal_id: 'proposal-1',
   execution_id: 'execution-1',
-  repository: 'bluedevilcollectibles/bdc-harness',
+  repository: 'thinmansoftware/bdc-harness',
   target_kind: 'pull_request',
-  target_key: 'bluedevilcollectibles/bdc-harness#pull_request:42',
+  target_key: 'thinmansoftware/bdc-harness#pull_request:42',
   target_digest: '1'.repeat(64),
   pr_number: 42,
   head_sha: 'a'.repeat(40),
@@ -179,7 +179,7 @@ describe('real GitHub deps', () => {
     });
 
     expect(search).toHaveBeenCalledWith({
-      q: 'repo:bluedevilcollectibles/bdc-harness is:pr WO-FALLBACK-77 in:title',
+      q: 'repo:thinmansoftware/bdc-harness is:pr WO-FALLBACK-77 in:title',
       per_page: 5,
     });
     expect(get).toHaveBeenCalledWith({

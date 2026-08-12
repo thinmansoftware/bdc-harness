@@ -136,13 +136,13 @@ describe('workflowDefinitionSchema', () => {
     const result = workflowDefinitionSchema.safeParse({
       name: 'repo-scoped-workflow',
       description: 'Workflow with target_repo',
-      target_repo: 'bluedevilcollectibles/bdc-xo',
+      target_repo: 'thinmansoftware/bdc-xo',
       nodes: [{ id: 'n', prompt: 'Do something' }],
     });
 
     expect(result.success).toBe(true);
     if (result.success) {
-      expect(result.data.target_repo).toBe('bluedevilcollectibles/bdc-xo');
+      expect(result.data.target_repo).toBe('thinmansoftware/bdc-xo');
     }
   });
 

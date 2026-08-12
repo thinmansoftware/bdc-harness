@@ -13,7 +13,7 @@ const NOW_MS = Date.parse('2026-08-07T12:00:00.000Z');
 
 function thread(overrides: Partial<ThreadSnapshot> = {}): ThreadSnapshot {
   return {
-    ref: 'gh:bluedevilcollectibles/bdc-harness#1',
+    ref: 'gh:thinmansoftware/bdc-harness#1',
     priority: 'P1',
     lastActivityAt: new Date(NOW_MS - 60_000).toISOString(),
     recipient: 'xo',

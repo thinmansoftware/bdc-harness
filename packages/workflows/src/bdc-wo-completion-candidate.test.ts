@@ -131,7 +131,7 @@ describe('record-wo-completion-candidate: PR_NUMBER derivation (Finding #4)', ()
   it('derives the number from the PR_URL tail without calling gh', () => {
     const r = runBash(
       PR_NUMBER_DERIVE,
-      { PR_URL: 'https://github.com/bluedevilcollectibles/bdc-harness/pull/334', REPO: 'x/y' },
+      { PR_URL: 'https://github.com/thinmansoftware/bdc-harness/pull/334', REPO: 'x/y' },
       stubDir
     );
     expect(r.code).toBe(0);
@@ -196,8 +196,8 @@ describe('record-wo-completion-candidate: JSON shape', () => {
   const baseEnv = {
     WO_ID: 'WO-HARNESS-WO-COMPLETION-COUNTER-01',
     CANDIDATE_ID: 'WO-HARNESS-WO-COMPLETION-COUNTER-01',
-    REPO: 'bluedevilcollectibles/bdc-harness',
-    PR_URL: 'https://github.com/bluedevilcollectibles/bdc-harness/pull/334',
+    REPO: 'thinmansoftware/bdc-harness',
+    PR_URL: 'https://github.com/thinmansoftware/bdc-harness/pull/334',
     PR_NUMBER: '334',
     LANE: 'bdc-feature-development',
     RUN_ID: '1c0eb2787f738ee04be9f305f9221992',

@@ -98,7 +98,7 @@ export async function runEscalation(
     error_class: context.errorClass,
   };
   const payload: OperatorCardPayload = {
-    repository: textValue(context.repository) ?? 'bluedevilcollectibles/bdc-harness',
+    repository: textValue(context.repository) ?? 'thinmansoftware/bdc-harness',
     branch: textValue(context.branch),
     pr_url: textValue(context.prUrl),
     pr_number: numberValue(context.prNumber),

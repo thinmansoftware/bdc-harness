@@ -11,7 +11,7 @@ const authority: RunAuthorityRecord = {
   runId: 'run-1',
   dispatchId: 'dispatch-1',
   woId: 'WO-TEST-01',
-  specSource: 'github:bluedevilcollectibles/bdc-xo:docs/work-orders/WO-TEST-01.md',
+  specSource: 'github:thinmansoftware/bdc-xo:docs/work-orders/WO-TEST-01.md',
   specRevision: '1'.repeat(40),
   specHash: `sha256:${'2'.repeat(64)}`,
   workflowName: 'bdc-feature-development',

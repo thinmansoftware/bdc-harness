@@ -3,7 +3,7 @@ description: |
   Tailored child workflow for WO-CAULDRON-MULTI-STAGE-PIPELINE-01.
   Use when: executing the approved spec that adds a multi-stage Cauldron pipeline
   (an ordered list of N stages, each pinned to a repo/target, run sequentially with a gate
-  between) to bdc-harness. Target repo is bluedevilcollectibles/bdc-harness (dev branch).
+  between) to bdc-harness. Target repo is thinmansoftware/bdc-harness (dev branch).
   Class: INFRA. Builds and pushes the new workflow YAML + the multi-stage code substrate
   change (per-stage worktree allocation, stage gate, stage data-passing, pre-flight
   registration guard, consolidated multi-stage manifest).
@@ -48,16 +48,16 @@ nodes:
         exit 1
       fi
       SPEC_PATH="docs/work-orders/${WO_ID}.md"
-      SPEC_CONTENT=$(gh api "repos/bluedevilcollectibles/bdc-xo/contents/${SPEC_PATH}?ref=main" --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
+      SPEC_CONTENT=$(gh api "repos/thinmansoftware/bdc-xo/contents/${SPEC_PATH}?ref=main" --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
       if [ -z "$SPEC_CONTENT" ]; then
         SPEC_PATH="docs/superpowers/specs/${WO_ID}.md"
-        SPEC_CONTENT=$(gh api "repos/bluedevilcollectibles/bdc-xo/contents/${SPEC_PATH}?ref=main" --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
+        SPEC_CONTENT=$(gh api "repos/thinmansoftware/bdc-xo/contents/${SPEC_PATH}?ref=main" --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
       fi
       if [ -z "$SPEC_CONTENT" ]; then
-        MATCH=$(gh api "repos/bluedevilcollectibles/bdc-xo/contents/docs/superpowers/specs?ref=main" --template '{{range .}}{{.path}}{{"\n"}}{{end}}' 2>/dev/null | grep "${WO_ID}.md$" | head -n 1)
+        MATCH=$(gh api "repos/thinmansoftware/bdc-xo/contents/docs/superpowers/specs?ref=main" --template '{{range .}}{{.path}}{{"\n"}}{{end}}' 2>/dev/null | grep "${WO_ID}.md$" | head -n 1)
         if [ -n "$MATCH" ]; then
           SPEC_PATH="$MATCH"
-          SPEC_CONTENT=$(gh api "repos/bluedevilcollectibles/bdc-xo/contents/${SPEC_PATH}?ref=main" --template '{{.content}}' | tr -d '\n' | base64 -d || true)
+          SPEC_CONTENT=$(gh api "repos/thinmansoftware/bdc-xo/contents/${SPEC_PATH}?ref=main" --template '{{.content}}' | tr -d '\n' | base64 -d || true)
         fi
       fi
       if [ -z "$SPEC_CONTENT" ]; then
@@ -68,7 +68,7 @@ nodes:
       RUN_START_SHA=$(git -C "$WT" rev-parse HEAD 2>/dev/null || echo unknown)
       mkdir -p "$ARTIFACTS_DIR" 2>/dev/null || true
       printf '%s\n' "$RUN_START_SHA" > "$ARTIFACTS_DIR/run-start-sha.txt" 2>/dev/null || true
-      printf 'WO_ID=%s\nSPEC_PATH=bdc-xo:%s\nRUN_START_SHA=%s\nTARGET_REPO=bluedevilcollectibles/bdc-harness\nWO_CLASS=INFRA\n\n' "$WO_ID" "$SPEC_PATH" "$RUN_START_SHA"
+      printf 'WO_ID=%s\nSPEC_PATH=bdc-xo:%s\nRUN_START_SHA=%s\nTARGET_REPO=thinmansoftware/bdc-harness\nWO_CLASS=INFRA\n\n' "$WO_ID" "$SPEC_PATH" "$RUN_START_SHA"
       printf '%s\n' "$SPEC_CONTENT"
 
   # plan: war-council-architect produces a surgical implementation plan.
@@ -104,7 +104,7 @@ nodes:
       - Staging gate required
 
       ## BDC Push Policy
-      Target repo for THIS WO: bluedevilcollectibles/bdc-harness.
+      Target repo for THIS WO: thinmansoftware/bdc-harness.
       bdc-harness is NOT in the Rule 20 staging-gate list (lspro-react, shopops-storefront, shopops).
       Push policy: feature branch + PR to bdc-harness dev branch. Staging gate NOT required.
 
@@ -564,7 +564,7 @@ nodes:
       Validator: $war-council-validator.output
 
       ## Target repo
-      The target repo for this WO is bluedevilcollectibles/bdc-harness (harness change).
+      The target repo for this WO is thinmansoftware/bdc-harness (harness change).
       bdc-harness is NOT in the Rule 20 staging-gate list. PRs target the bdc-harness
       default branch (dev). Staging gate is NOT required.
 
@@ -579,7 +579,7 @@ nodes:
       push_target: feature-branch:feat/wo-cauldron-multi-stage-pipeline-01
       pr_required: true
       staging_gate_required: false
-      repo: bluedevilcollectibles/bdc-harness
+      repo: thinmansoftware/bdc-harness
 
   - id: commit-and-push
     persona: overseer
@@ -900,7 +900,7 @@ nodes:
       $read-spec.output
       BDC_NODE_OUTPUT_READ_SPEC
       )
-      ISSUE_REPO="${ISSUE_REPO:-bluedevilcollectibles/bdc-xo}"
+      ISSUE_REPO="${ISSUE_REPO:-thinmansoftware/bdc-xo}"
       ISSUE_NUM=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'issue=[0-9]+' | head -1 | cut -d= -f2 || true)
       if [ -z "$ISSUE_NUM" ]; then
         ISSUE_NUM=$(printf '%s\n' "$READ_SPEC_OUT" | sed -n 's/^SPEC_PATH=.*issues\/\([0-9][0-9]*\).*/\1/p' | head -1)

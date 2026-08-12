@@ -251,7 +251,7 @@ nodes:
     bash: |
       set -euo pipefail
       BRANCH="$(git rev-parse --abbrev-ref HEAD)"
-      REPO="bluedevilcollectibles/model-tier-advisor"
+      REPO="thinmansoftware/model-tier-advisor"
       EXIST=$(gh pr list --repo "$REPO" --head "$BRANCH" --state open \
         --json url --template '{{range .}}{{.url}}{{end}}' 2>/dev/null || true)
       if [ -n "$EXIST" ]; then echo "PR=$EXIST"; exit 0; fi
@@ -284,7 +284,7 @@ nodes:
       $read-spec.output
       BDC_NODE_OUTPUT_READ_SPEC
       )
-      ISSUE_REPO="${ISSUE_REPO:-bluedevilcollectibles/bdc-xo}"
+      ISSUE_REPO="${ISSUE_REPO:-thinmansoftware/bdc-xo}"
       ISSUE_NUM=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'issue=[0-9]+' | head -1 | cut -d= -f2 || true)
       if [ -z "$ISSUE_NUM" ]; then
         ISSUE_NUM=$(printf '%s\n' "$READ_SPEC_OUT" | sed -n 's/^SPEC_PATH=.*issues\/\([0-9][0-9]*\).*/\1/p' | head -1)

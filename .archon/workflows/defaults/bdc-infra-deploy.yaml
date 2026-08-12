@@ -34,13 +34,13 @@ nodes:
         # Fallback 3: GitHub issue body (WO-HARNESS-READ-SPEC-ISSUE-BODY-FALLBACK-01)
         ISSUE_NUM=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'issue=[0-9]+' | head -n 1 | cut -d= -f2 || true)
         if [ -z "$ISSUE_NUM" ]; then
-          ISSUE_NUM=$(gh issue list --repo bluedevilcollectibles/bdc-xo \
+          ISSUE_NUM=$(gh issue list --repo thinmansoftware/bdc-xo \
             --search "${WO_ID} in:title" --json number,title \
             --jq '.[0].number' 2>/dev/null || true)
         fi
         SPEC_CONTENT=""
         if [ -n "$ISSUE_NUM" ] && [ "$ISSUE_NUM" != "null" ]; then
-          SPEC_CONTENT=$(gh issue view "$ISSUE_NUM" --repo bluedevilcollectibles/bdc-xo \
+          SPEC_CONTENT=$(gh issue view "$ISSUE_NUM" --repo thinmansoftware/bdc-xo \
             --json body --jq .body 2>/dev/null || true)
         fi
         if [ -z "$SPEC_CONTENT" ]; then
@@ -380,7 +380,7 @@ nodes:
       BODY="Infra deployment WO. See manifest in Notion for evidence."
 
       # Rule 29: infra-deploy PRs always target bdc-harness (source file changes only).
-      gh pr create --repo bluedevilcollectibles/bdc-harness --title "$TITLE" --body "$BODY" --head "$UNIQUE_BRANCH" || true
+      gh pr create --repo thinmansoftware/bdc-harness --title "$TITLE" --body "$BODY" --head "$UNIQUE_BRANCH" || true
 
   - id: build-manifest
     depends_on: [open-pr-if-needed]
@@ -442,7 +442,7 @@ nodes:
       $read-spec.output
       BDC_NODE_OUTPUT_READ_SPEC
       )
-      ISSUE_REPO="${ISSUE_REPO:-bluedevilcollectibles/bdc-xo}"
+      ISSUE_REPO="${ISSUE_REPO:-thinmansoftware/bdc-xo}"
       ISSUE_NUM=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'issue=[0-9]+' | head -1 | cut -d= -f2 || true)
       if [ -z "$ISSUE_NUM" ]; then
         ISSUE_NUM=$(printf '%s\n' "$READ_SPEC_OUT" | sed -n 's/^SPEC_PATH=.*issues\/\([0-9][0-9]*\).*/\1/p' | head -1)

@@ -239,11 +239,11 @@ function makeCodebase(name: string, id = `id-${name}`): Codebase {
 }
 
 describe('resolveBoundCodebase', () => {
-  const bdcHarness = makeCodebase('bluedevilcollectibles/bdc-harness', 'harness-id');
-  const shopops = makeCodebase('bluedevilcollectibles/shopops', 'shopops-id');
-  const lspro = makeCodebase('bluedevilcollectibles/lspro-react', 'lspro-id');
-  const storefront = makeCodebase('bluedevilcollectibles/shopops-storefront', 'storefront-id');
-  const bdcXo = makeCodebase('bluedevilcollectibles/bdc-xo', 'bdc-xo-id');
+  const bdcHarness = makeCodebase('thinmansoftware/bdc-harness', 'harness-id');
+  const shopops = makeCodebase('thinmansoftware/shopops', 'shopops-id');
+  const lspro = makeCodebase('thinmansoftware/lspro-react', 'lspro-id');
+  const storefront = makeCodebase('thinmansoftware/shopops-storefront', 'storefront-id');
+  const bdcXo = makeCodebase('thinmansoftware/bdc-xo', 'bdc-xo-id');
   const thinman = makeCodebase('bluedevilcollectibles/thinman-freight', 'thinman-id');
   const codebases = [bdcHarness, shopops, lspro, storefront, bdcXo, thinman];
 
@@ -1638,8 +1638,8 @@ describe('handleWorkflowRunCommand -- E2 single codebase auto-select', () => {
 
   test('dispatches app-default /workflow run to prefix-bound codebase', async () => {
     const conversation = makeConversation({ codebase_id: null });
-    const harness = makeCodebase('bluedevilcollectibles/bdc-harness', 'harness-id');
-    const shopops = makeCodebase('bluedevilcollectibles/shopops', 'shopops-id');
+    const harness = makeCodebase('thinmansoftware/bdc-harness', 'harness-id');
+    const shopops = makeCodebase('thinmansoftware/shopops', 'shopops-id');
     mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(conversation));
     mockParseCommand.mockReturnValueOnce({
       command: 'workflow',
@@ -1679,8 +1679,8 @@ describe('handleWorkflowRunCommand -- E2 single codebase auto-select', () => {
 
   test('strips --project flag from app-default /workflow run before dispatch', async () => {
     const conversation = makeConversation({ codebase_id: null });
-    const harness = makeCodebase('bluedevilcollectibles/bdc-harness', 'harness-id');
-    const storefront = makeCodebase('bluedevilcollectibles/shopops-storefront', 'storefront-id');
+    const harness = makeCodebase('thinmansoftware/bdc-harness', 'harness-id');
+    const storefront = makeCodebase('thinmansoftware/shopops-storefront', 'storefront-id');
     mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(conversation));
     mockParseCommand.mockReturnValueOnce({
       command: 'workflow',

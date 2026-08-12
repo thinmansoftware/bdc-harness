@@ -5,7 +5,7 @@
 #   1. YAML exists: this file
 #   2. Spec exists: BDC_XO/docs/work-orders/WO-HARNESS-AUTHOR-WO-BATCH-META-01.md
 #   3. CWD scope: bdc-xo (WO specs + YAMLs live there -- select bdc-xo when firing)
-#   4. Codebase registered: bluedevilcollectibles/bdc-xo (verify in Archon DB)
+#   4. Codebase registered: thinmansoftware/bdc-xo (verify in Archon DB)
 #
 # Deploy: BDC_XO/scripts/archon-bridge/sync-workflows.sh bdc-author-wo-batch.yaml
 #
@@ -30,13 +30,13 @@ description: |
     DRY_RUN: 'true' = write files + skip Notion filing and PR
   Does: For each WO concept, adversarially reviews spec+YAML via WO-Lifecycle:Validate 12-check gate,
         iterates up to 8 times, commits passing WOs to bdc-xo, files to Notion, fails shut on exhaustion.
-  Repo: bluedevilcollectibles/bdc-xo (operator selects bdc-xo codebase when firing).
+  Repo: thinmansoftware/bdc-xo (operator selects bdc-xo codebase when firing).
   parallel_ok: true
 
 policyFile: harness/policies/agent-behavior.md
 provider: claude
 model: sonnet
-target_repo: bluedevilcollectibles/bdc-xo
+target_repo: thinmansoftware/bdc-xo
 
 # 2026-05-16 fix v2: Cauldron API ONLY accepts conversationId + message -- the
 # `inputs` field in API payloads is silently dropped. Engine injects only the
@@ -106,7 +106,7 @@ nodes:
         PLAN_CONTENT=$(cat "$PLAN_DOC_PATH")
       else
         PLAN_CONTENT=$(gh api \
-          "repos/bluedevilcollectibles/bdc-xo/contents/${PLAN_DOC_PATH}?ref=main" \
+          "repos/thinmansoftware/bdc-xo/contents/${PLAN_DOC_PATH}?ref=main" \
           --jq .content 2>/dev/null | base64 -d 2>/dev/null || true)
       fi
       [ -z "$PLAN_CONTENT" ] && { echo "ERROR: Plan doc not found at $PLAN_DOC_PATH" >&2; exit 1; }
@@ -117,7 +117,7 @@ nodes:
         WO_CONCEPTS=$(cat "$WO_CONCEPTS_FILE")
       else
         WO_CONCEPTS=$(gh api \
-          "repos/bluedevilcollectibles/bdc-xo/contents/${WO_CONCEPTS_FILE}?ref=main" \
+          "repos/thinmansoftware/bdc-xo/contents/${WO_CONCEPTS_FILE}?ref=main" \
           --jq .content 2>/dev/null | base64 -d 2>/dev/null || true)
       fi
       [ -z "$WO_CONCEPTS" ] && { echo "ERROR: WO_CONCEPTS_FILE not found: $WO_CONCEPTS_FILE" >&2; exit 1; }
@@ -139,7 +139,7 @@ nodes:
           CALIBRATION=$(cat "$CALIBRATION_DOC")
         else
           CALIBRATION=$(gh api \
-            "repos/bluedevilcollectibles/bdc-xo/contents/${CALIBRATION_DOC}?ref=main" \
+            "repos/thinmansoftware/bdc-xo/contents/${CALIBRATION_DOC}?ref=main" \
             --jq .content 2>/dev/null | base64 -d 2>/dev/null || echo "(calibration not found)")
         fi
       fi
@@ -328,7 +328,7 @@ nodes:
       ")
       else
         CONCEPTS_JSON=$(gh api \
-          "repos/bluedevilcollectibles/bdc-xo/contents/${WO_CONCEPTS_FILE}?ref=main" \
+          "repos/thinmansoftware/bdc-xo/contents/${WO_CONCEPTS_FILE}?ref=main" \
           --jq .content 2>/dev/null | base64 -d 2>/dev/null || echo "[]")
         WO_IDS=$(echo "$CONCEPTS_JSON" | python3 -c "
       import json, sys
@@ -488,7 +488,7 @@ nodes:
         exit 1
       fi
 
-      REPO="bluedevilcollectibles/bdc-xo"
+      REPO="thinmansoftware/bdc-xo"
       EXIST=$(gh pr list --repo "$REPO" --head "$BRANCH" --state open \
         --json url --jq '.[0].url // empty' 2>/dev/null || true)
       if [ -n "$EXIST" ]; then
@@ -627,7 +627,7 @@ nodes:
       BDC_NODE_OUTPUT_MANIFEST
       )
 
-      ISSUE_REPO="${ISSUE_REPO:-bluedevilcollectibles/bdc-xo}"
+      ISSUE_REPO="${ISSUE_REPO:-thinmansoftware/bdc-xo}"
       WO_ID="WO-HARNESS-AUTHOR-WO-BATCH-META-01"
       ISSUE_NUM=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'issue=[0-9]+' | head -1 | cut -d= -f2 || true)
       if [ -z "$ISSUE_NUM" ]; then

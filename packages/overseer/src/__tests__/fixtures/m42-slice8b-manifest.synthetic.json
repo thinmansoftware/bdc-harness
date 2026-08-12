@@ -5,7 +5,7 @@
     "mode": "fake",
     "candidate_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
     "starting_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-    "repository_full_name": "bluedevilcollectibles/bdc-harness",
+    "repository_full_name": "thinmansoftware/bdc-harness",
     "provider_repository_id": "R_sandbox_123",
     "credential_principal_id": "principal-sandbox-only-1234",
     "image_digest": "sha256:4444444444444444444444444444444444444444444444444444444444444444",

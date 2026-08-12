@@ -18,7 +18,7 @@ description: |
     DRY_RUN: true means read and grade only; do not mutate Notion.
   Does: Reads the Notes-field manifest, verifies PR state, grep assertions, runtime evidence,
         and Vercel evidence, then flips REVIEW to DONE or back to IN_PROGRESS with critique.
-  Repo: normally fired from bluedevilcollectibles/bdc-harness.
+  Repo: normally fired from thinmansoftware/bdc-harness.
   parallel_ok: true
 
 policyFile: harness/policies/agent-behavior.md

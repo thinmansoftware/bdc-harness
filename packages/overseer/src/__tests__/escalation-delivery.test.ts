@@ -59,7 +59,7 @@ describe('operator card identity', () => {
 
   test('builds a deterministic full payload digest independent of nested object key order', () => {
     const first = buildOperatorCard(identity, {
-      repository: 'bluedevilcollectibles/bdc-harness',
+      repository: 'thinmansoftware/bdc-harness',
       branch: 'feat/example',
       pr_url: null,
       pr_number: null,
@@ -122,7 +122,7 @@ describe('durable operator-card delivery', () => {
 
   async function persistCard(): Promise<string> {
     const built = buildOperatorCard(identity, {
-      repository: 'bluedevilcollectibles/bdc-harness',
+      repository: 'thinmansoftware/bdc-harness',
       branch: 'feat/example',
       pr_url: null,
       pr_number: null,
@@ -426,7 +426,7 @@ describe('durable operator-card delivery', () => {
       {
         errorClass: 'validator_rejected',
         woId: 'WO-OLD-EVENT-01',
-        repository: 'bluedevilcollectibles/bdc-harness',
+        repository: 'thinmansoftware/bdc-harness',
       },
       {
         sourceEventId: 'event-old-1',
@@ -581,7 +581,7 @@ describe('default informational channel adapters', () => {
 
   async function defaultCardView() {
     const built = buildOperatorCard(identity, {
-      repository: 'bluedevilcollectibles/bdc-harness',
+      repository: 'thinmansoftware/bdc-harness',
       branch: 'feat/example',
       pr_url: null,
       pr_number: null,

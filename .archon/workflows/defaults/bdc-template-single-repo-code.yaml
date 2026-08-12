@@ -45,24 +45,24 @@ nodes:
       set -euo pipefail
       WO_ID="${WO_ID:-[WO-ID]}"
       SPEC_CONTENT=$(gh api \
-        "repos/bluedevilcollectibles/bdc-xo/contents/docs/work-orders/${WO_ID}.md?ref=main" \
+        "repos/thinmansoftware/bdc-xo/contents/docs/work-orders/${WO_ID}.md?ref=main" \
         --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
       if [ -z "$SPEC_CONTENT" ]; then
         GLOB_PATH=$(gh api \
-          "repos/bluedevilcollectibles/bdc-xo/contents/docs/superpowers/specs?ref=main" \
+          "repos/thinmansoftware/bdc-xo/contents/docs/superpowers/specs?ref=main" \
           --template '{{range .}}{{.path}}{{"\n"}}{{end}}' 2>/dev/null \
           | grep "${WO_ID}.md$" | head -1 || true)
         if [ -n "$GLOB_PATH" ]; then
           SPEC_CONTENT=$(gh api \
-            "repos/bluedevilcollectibles/bdc-xo/contents/${GLOB_PATH}?ref=main" \
+            "repos/thinmansoftware/bdc-xo/contents/${GLOB_PATH}?ref=main" \
             --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
         fi
       fi
       if [ -z "$SPEC_CONTENT" ]; then
-        ISSUE_NUM=$(gh issue list --repo bluedevilcollectibles/bdc-xo \
+        ISSUE_NUM=$(gh issue list --repo thinmansoftware/bdc-xo \
           --search "${WO_ID} in:title" --json number --jq '.[0].number' 2>/dev/null || true)
         if [ -n "$ISSUE_NUM" ] && [ "$ISSUE_NUM" != "null" ]; then
-          SPEC_CONTENT=$(gh issue view "$ISSUE_NUM" --repo bluedevilcollectibles/bdc-xo \
+          SPEC_CONTENT=$(gh issue view "$ISSUE_NUM" --repo thinmansoftware/bdc-xo \
             --json body --jq .body 2>/dev/null || true)
         fi
       fi
@@ -299,7 +299,7 @@ nodes:
       $read-spec.output
       BDC_NODE_OUTPUT_READ_SPEC
       )
-      ISSUE_REPO="${ISSUE_REPO:-bluedevilcollectibles/bdc-xo}"
+      ISSUE_REPO="${ISSUE_REPO:-thinmansoftware/bdc-xo}"
       ISSUE_NUM=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'issue=[0-9]+' | head -1 | cut -d= -f2 || true)
       if [ -z "$ISSUE_NUM" ]; then
         ISSUE_NUM=$(printf '%s\n' "$READ_SPEC_OUT" | sed -n 's/^SPEC_PATH=.*issues\/\([0-9][0-9]*\).*/\1/p' | head -1)

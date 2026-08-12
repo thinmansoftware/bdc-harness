@@ -56,7 +56,7 @@ describe('gh-merge-guard (bdc-xo#1491)', () => {
   it('blocks the REST merge endpoint form', async () => {
     const { exitCode } = await runGuard([
       'api',
-      'repos/bluedevilcollectibles/bdc-harness/pulls/639/merge',
+      'repos/thinmansoftware/bdc-harness/pulls/639/merge',
       '-X',
       'PUT',
     ]);

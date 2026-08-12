@@ -2,7 +2,7 @@
 # Source pattern: bdc-ce-regression-suite.yaml + WO-SHOPOPS-COMMERCE-SPINE-01.yaml
 # Doctrine compliance: 13 hard rules of archon-yaml-authoring (verified at draft time)
 #
-# Pre-flight: codebases bluedevilcollectibles/shopops + bluedevilcollectibles/lspro-react
+# Pre-flight: codebases thinmansoftware/shopops + thinmansoftware/lspro-react
 #   must both be registered in Archon. Verify:
 #     sqlite3 /opt/bdc/archon-data/archon.db "SELECT name FROM remote_agent_codebases"
 #   This WO is cross-repo. The workflow operates against the shopops repo as primary
@@ -25,7 +25,7 @@ description: |
         PaymentPanel) in a sibling worktree and opens a second PR. Runs Rule 19
         runtime-verify against shopops-api container. Builds MIXED manifest and flips
         Notion to REVIEW.
-  Repo: bluedevilcollectibles/shopops (primary CWD), bluedevilcollectibles/lspro-react
+  Repo: thinmansoftware/shopops (primary CWD), thinmansoftware/lspro-react
         (sibling via gh + git in /tmp clone).
   parallel_ok: true (POS-lane WO; no schema conflicts with other lanes).
 
@@ -44,17 +44,17 @@ nodes:
 
       # gh --template uses Go templates (built-in to gh, no external jq dependency)
       SPEC_CONTENT=$(gh api \
-        "repos/bluedevilcollectibles/bdc-xo/contents/docs/work-orders/${WO_ID}.md?ref=main" \
+        "repos/thinmansoftware/bdc-xo/contents/docs/work-orders/${WO_ID}.md?ref=main" \
         --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
 
       if [ -z "$SPEC_CONTENT" ]; then
         GLOB_PATH=$(gh api \
-          "repos/bluedevilcollectibles/bdc-xo/contents/docs/superpowers/specs?ref=main" \
+          "repos/thinmansoftware/bdc-xo/contents/docs/superpowers/specs?ref=main" \
           --template "{{range .}}{{if (or (hasPrefix .name \"${WO_ID}\") (and (hasPrefix .name \"2\") (contains .name \"${WO_ID}\")))}}{{.path}}{{\"\\n\"}}{{end}}{{end}}" \
           2>/dev/null | head -1 || true)
         if [ -n "$GLOB_PATH" ]; then
           SPEC_CONTENT=$(gh api \
-            "repos/bluedevilcollectibles/bdc-xo/contents/${GLOB_PATH}?ref=main" \
+            "repos/thinmansoftware/bdc-xo/contents/${GLOB_PATH}?ref=main" \
             --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
         fi
       fi
@@ -63,12 +63,12 @@ nodes:
         # Fallback 4: GitHub issue body (WO-HARNESS-READ-SPEC-ISSUE-BODY-FALLBACK-01)
         ISSUE_NUM=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'issue=[0-9]+' | head -n 1 | cut -d= -f2 || true)
         if [ -z "$ISSUE_NUM" ]; then
-          ISSUE_NUM=$(gh issue list --repo bluedevilcollectibles/bdc-xo \
+          ISSUE_NUM=$(gh issue list --repo thinmansoftware/bdc-xo \
             --search "${WO_ID} in:title" --json number,title \
             --jq '.[0].number' 2>/dev/null || true)
         fi
         if [ -n "$ISSUE_NUM" ] && [ "$ISSUE_NUM" != "null" ]; then
-          SPEC_CONTENT=$(gh issue view "$ISSUE_NUM" --repo bluedevilcollectibles/bdc-xo \
+          SPEC_CONTENT=$(gh issue view "$ISSUE_NUM" --repo thinmansoftware/bdc-xo \
             --json body --jq .body 2>/dev/null || true)
           [ -n "$SPEC_CONTENT" ] && SPEC_PATH="issues/${ISSUE_NUM}"
         fi
@@ -229,7 +229,7 @@ nodes:
         The shopops CWD is your primary worktree. Clone lspro-react into a sibling
         path and operate there:
 
-          git -C /tmp clone --depth=10 https://github.com/bluedevilcollectibles/lspro-react.git lspro-react
+          git -C /tmp clone --depth=10 https://github.com/thinmansoftware/lspro-react.git lspro-react
           cd /tmp/lspro-react
           git checkout -b wo/pos-terminal-sdk-01-ui
 
@@ -331,7 +331,7 @@ nodes:
     bash: |
       set -euo pipefail
       BRANCH="wo/pos-terminal-sdk-01"
-      REPO="bluedevilcollectibles/shopops"
+      REPO="thinmansoftware/shopops"
       BODY=$(mktemp)
       {
         echo "## Summary"
@@ -388,11 +388,11 @@ nodes:
         echo ""
         echo "Vercel staging URL: https://staging.livesellerpro.app/pos"
       } > "$BODY"
-      EXIST=$(gh pr list --repo bluedevilcollectibles/lspro-react --head "$BRANCH" --state open \
+      EXIST=$(gh pr list --repo thinmansoftware/lspro-react --head "$BRANCH" --state open \
         --json url --template '{{range .}}{{.url}}{{end}}' 2>/dev/null || true)
       if [ -n "$EXIST" ]; then echo "LSPRO_PR=$EXIST"; exit 0; fi
       for i in 1 2 3; do
-        if URL=$(gh pr create --repo bluedevilcollectibles/lspro-react --base main --head "$BRANCH" \
+        if URL=$(gh pr create --repo thinmansoftware/lspro-react --base main --head "$BRANCH" \
             --title "feat(pos): WO-POS-TERMINAL-SDK-01 -- Terminal SDK UI" --body-file "$BODY" 2>&1); then
           echo "LSPRO_PR=$URL"; exit 0
         fi
@@ -498,7 +498,7 @@ nodes:
       $read-spec.output
       BDC_NODE_OUTPUT_READ_SPEC
       )
-      ISSUE_REPO="${ISSUE_REPO:-bluedevilcollectibles/bdc-xo}"
+      ISSUE_REPO="${ISSUE_REPO:-thinmansoftware/bdc-xo}"
       ISSUE_NUM=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'issue=[0-9]+' | head -1 | cut -d= -f2 || true)
       if [ -z "$ISSUE_NUM" ]; then
         ISSUE_NUM=$(printf '%s\n' "$READ_SPEC_OUT" | sed -n 's/^SPEC_PATH=.*issues\/\([0-9][0-9]*\).*/\1/p' | head -1)

@@ -32,7 +32,7 @@ main() {
       printf 'usage: %s [repo-slug]\n       %s --stdin\n' "$0" "$0" >&2
       return 2
     fi
-    offenders=$(enumerate_refs "${1:-bluedevilcollectibles/bdc-harness}" | filter_phantom_refs)
+    offenders=$(enumerate_refs "${1:-thinmansoftware/bdc-harness}" | filter_phantom_refs)
   fi
 
   if [[ -n $offenders ]]; then

@@ -27,13 +27,13 @@ HARNESS_REPO_LOCAL_FILE="harness/policies/agent-behavior.md"
 # Repos registered for the Devil's Cauldron build queue, per
 # bdc-xo:docs/operations/devils-cauldron/README.md.
 REPOS=(
-  "bluedevilcollectibles/bdc-xo"
-  "bluedevilcollectibles/bdc-harness"
-  "bluedevilcollectibles/shopops"
-  "bluedevilcollectibles/shopops-storefront"
-  "bluedevilcollectibles/lspro-react"
-  "bluedevilcollectibles/model-tier-advisor"
-  "bluedevilcollectibles/scout-service"
+  "thinmansoftware/bdc-xo"
+  "thinmansoftware/bdc-harness"
+  "thinmansoftware/shopops"
+  "thinmansoftware/shopops-storefront"
+  "thinmansoftware/lspro-react"
+  "thinmansoftware/model-tier-advisor"
+  "thinmansoftware/scout-service"
 )
 
 # Determine whether the bundled fallback is available in THIS repo's checkout.

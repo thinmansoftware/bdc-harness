@@ -81,7 +81,7 @@ describe('buildCanarySnapshot', () => {
     const result = await buildCanarySnapshot('codebase-1', 'dev', deps());
     expect(result.codebase).toEqual({
       id: 'codebase-1',
-      canonicalRemote: 'bluedevilcollectibles/bdc-harness',
+      canonicalRemote: 'thinmansoftware/bdc-harness',
       defaultCwd: '/workspace/bdc-harness',
       baseBranch: 'dev',
       baseSha: sha,

@@ -52,7 +52,7 @@ async function seedRun(id: string, status = 'failed'): Promise<void> {
       status,
       JSON.stringify({
         woId: 'WO-TEST-OVERSEER-01',
-        targetRepo: 'bluedevilcollectibles/bdc-harness',
+        targetRepo: 'thinmansoftware/bdc-harness',
         headBranch: 'wo/test',
       }),
     ]
@@ -241,7 +241,7 @@ describe('overseer db', () => {
   // Regression (Arc B break (c), 2026-07-28): every seeded run in this suite carried
   // woId + targetRepo + headBranch, but ZERO of 563 real terminal runs in the live event
   // store carry any of them -- the engine writes only cost/token telemetry into run
-  // metadata. parseRepo silently defaulted the repo to bluedevilcollectibles/bdc-harness,
+  // metadata. parseRepo silently defaulted the repo to thinmansoftware/bdc-harness,
   // so a run against any other repo was looked up in the WRONG repo and the resulting
   // "no PR" was indistinguishable from a real one. Absent identity must be absent, not
   // invented.
@@ -279,14 +279,14 @@ describe('overseer db', () => {
     // run_id NOT NULL FK threw SQLITE_CONSTRAINT_FOREIGNKEY and degraded the
     // whole watcher (overseer_runtime.watcher_exception_degraded).
     const action = await insertReconcileAction({
-      prRef: 'bluedevilcollectibles/shopops-comic-theme#89',
+      prRef: 'thinmansoftware/shopops-comic-theme#89',
       woId: 'WO-COMICTHEME-WORDMARK-MASTER-PACK-COMPLETION-01',
       class: 'tracker_reconcile',
       action: 'reconcile_close',
-      result: 'https://github.com/bluedevilcollectibles/shopops-comic-theme/pull/89:2a28cc9',
+      result: 'https://github.com/thinmansoftware/shopops-comic-theme/pull/89:2a28cc9',
     });
 
-    expect(action.pr_ref).toBe('bluedevilcollectibles/shopops-comic-theme#89');
+    expect(action.pr_ref).toBe('thinmansoftware/shopops-comic-theme#89');
     expect(action.action).toBe('reconcile_close');
 
     const rows = await db.query<{ pr_ref: string }>(
@@ -304,30 +304,30 @@ describe('overseer db', () => {
 
   test('hasReconcileActionForPr finds only the matching PR, WO, and action', async () => {
     await insertReconcileAction({
-      prRef: 'bluedevilcollectibles/bdc-harness#404',
+      prRef: 'thinmansoftware/bdc-harness#404',
       woId: 'WO-HARNESS-OVERSEER-V1B-TRACKER-RECONCILE-01',
       class: 'tracker_reconcile',
       action: 'reconcile_skip_noted',
-      result: 'https://github.com/bluedevilcollectibles/bdc-harness/pull/404:abc123merge',
+      result: 'https://github.com/thinmansoftware/bdc-harness/pull/404:abc123merge',
     });
 
     expect(
       await hasReconcileActionForPr({
-        prRef: 'bluedevilcollectibles/bdc-harness#404',
+        prRef: 'thinmansoftware/bdc-harness#404',
         woId: 'WO-HARNESS-OVERSEER-V1B-TRACKER-RECONCILE-01',
         action: 'reconcile_skip_noted',
       })
     ).toBe(true);
     expect(
       await hasReconcileActionForPr({
-        prRef: 'bluedevilcollectibles/bdc-harness#404',
+        prRef: 'thinmansoftware/bdc-harness#404',
         woId: 'WO-HARNESS-OVERSEER-V1B-TRACKER-RECONCILE-01',
         action: 'reconcile_close',
       })
     ).toBe(false);
     expect(
       await hasReconcileActionForPr({
-        prRef: 'bluedevilcollectibles/bdc-harness#405',
+        prRef: 'thinmansoftware/bdc-harness#405',
         woId: 'WO-HARNESS-OVERSEER-V1B-TRACKER-RECONCILE-01',
         action: 'reconcile_skip_noted',
       })

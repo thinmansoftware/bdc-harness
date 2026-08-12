@@ -24,7 +24,7 @@ description: |
         invalid channel). Extends lspro-react ChannelsConfigPage with StatusPill,
         ConnectModal, DisconnectConfirm. Opens 2 PRs (shopops master + lspro-react staging).
         Rule 19 docker exec verify. MIXED manifest. flip-notion REVIEW.
-  Repo: bluedevilcollectibles/shopops PRIMARY, bluedevilcollectibles/lspro-react SIBLING.
+  Repo: thinmansoftware/shopops PRIMARY, thinmansoftware/lspro-react SIBLING.
   parallel_ok: true -- no migration; idempotent route additions.
   Polish bar: ROUGH OK -- v1 limitations explicit (no token refresh, no validation ping).
 
@@ -40,17 +40,17 @@ nodes:
 
       # gh --template uses Go templates (built-in, no jq dependency).
       SPEC_CONTENT=$(gh api \
-        "repos/bluedevilcollectibles/bdc-xo/contents/docs/work-orders/${WO_ID}.md?ref=main" \
+        "repos/thinmansoftware/bdc-xo/contents/docs/work-orders/${WO_ID}.md?ref=main" \
         --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
 
       if [ -z "$SPEC_CONTENT" ]; then
         GLOB_PATH=$(gh api \
-          "repos/bluedevilcollectibles/bdc-xo/contents/docs/superpowers/specs?ref=main" \
+          "repos/thinmansoftware/bdc-xo/contents/docs/superpowers/specs?ref=main" \
           --template '{{range .}}{{.path}}{{"\n"}}{{end}}' 2>/dev/null \
           | grep "${WO_ID}.md$" | head -1 || true)
         if [ -n "$GLOB_PATH" ]; then
           SPEC_CONTENT=$(gh api \
-            "repos/bluedevilcollectibles/bdc-xo/contents/${GLOB_PATH}?ref=main" \
+            "repos/thinmansoftware/bdc-xo/contents/${GLOB_PATH}?ref=main" \
             --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
         fi
       fi
@@ -59,12 +59,12 @@ nodes:
         # Fallback 4: GitHub issue body (WO-HARNESS-READ-SPEC-ISSUE-BODY-FALLBACK-01)
         ISSUE_NUM=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'issue=[0-9]+' | head -n 1 | cut -d= -f2 || true)
         if [ -z "$ISSUE_NUM" ]; then
-          ISSUE_NUM=$(gh issue list --repo bluedevilcollectibles/bdc-xo \
+          ISSUE_NUM=$(gh issue list --repo thinmansoftware/bdc-xo \
             --search "${WO_ID} in:title" --json number,title \
             --jq '.[0].number' 2>/dev/null || true)
         fi
         if [ -n "$ISSUE_NUM" ] && [ "$ISSUE_NUM" != "null" ]; then
-          SPEC_CONTENT=$(gh issue view "$ISSUE_NUM" --repo bluedevilcollectibles/bdc-xo \
+          SPEC_CONTENT=$(gh issue view "$ISSUE_NUM" --repo thinmansoftware/bdc-xo \
             --json body --jq .body 2>/dev/null || true)
           [ -n "$SPEC_CONTENT" ] && SPEC_PATH="issues/${ISSUE_NUM}"
         fi
@@ -226,7 +226,7 @@ nodes:
 
         Steps:
         1. Clone lspro-react staging branch into /tmp/lspro-react-channels-$WORKFLOW_ID:
-             git clone --depth=20 https://github.com/bluedevilcollectibles/lspro-react.git \
+             git clone --depth=20 https://github.com/thinmansoftware/lspro-react.git \
                /tmp/lspro-react-channels-$WORKFLOW_ID
              cd /tmp/lspro-react-channels-$WORKFLOW_ID
              git checkout staging && git pull origin staging
@@ -257,7 +257,7 @@ nodes:
              git -c user.name="John Ranson" -c user.email="admin@bluedevilcollectibles.com" \
                commit -m "$(printf 'feat(ui): WO-CHANNELS-OAUTH-WRITE-FLOWS-01 -- Connect/Disconnect buttons on ChannelsConfigPage\n\nAdds StatusPill, ActionButton, ConnectModal, DisconnectConfirm. Wires to\nshopops-api /channels/connect + /channels/disconnect. ROUGH OK polish -- toast-only errors.\n\nCo-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>')"
              git push -u origin wo/channels-oauth-write-flows-01-ui
-             gh pr create --repo bluedevilcollectibles/lspro-react --base staging \
+             gh pr create --repo thinmansoftware/lspro-react --base staging \
                --head wo/channels-oauth-write-flows-01-ui \
                --title "feat(ui): WO-CHANNELS-OAUTH-WRITE-FLOWS-01 -- Connect/Disconnect buttons" \
                --body "Implements UI side of WO-CHANNELS-OAUTH-WRITE-FLOWS-01. Plan: A. ROUGH OK polish -- v1 limitations: no token validation/ping, no refresh worker, toast-only errors."
@@ -277,7 +277,7 @@ nodes:
         echo "No staged changes"
       else
         git -c user.name="John Ranson" -c user.email="admin@bluedevilcollectibles.com" \
-          commit -m "$(printf 'feat(api): WO-CHANNELS-OAUTH-WRITE-FLOWS-01 -- channel connect/disconnect routes\n\nExtends routes/channels.js (preserves all existing routes):\n  - PATCH /channels/connect/:channel -- channel-specific body, upserts channel_connections\n  - DELETE /channels/disconnect/:channel -- flips status to not_connected\n  - GET /channels/ebay/oauth-start -- returns placeholder OAuth URL\n\n4 bun tests (connect, disconnect, reconnect round-trip, invalid channel, portal disconnect).\n\nPlan: A (P1 extension for Mutant Market 2026-06-15)\nPolish bar: ROUGH OK -- v1 limitations: no token refresh, no validation ping, toast-only errors.\n\nUI side: bluedevilcollectibles/lspro-react PR\n\nCo-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>')"
+          commit -m "$(printf 'feat(api): WO-CHANNELS-OAUTH-WRITE-FLOWS-01 -- channel connect/disconnect routes\n\nExtends routes/channels.js (preserves all existing routes):\n  - PATCH /channels/connect/:channel -- channel-specific body, upserts channel_connections\n  - DELETE /channels/disconnect/:channel -- flips status to not_connected\n  - GET /channels/ebay/oauth-start -- returns placeholder OAuth URL\n\n4 bun tests (connect, disconnect, reconnect round-trip, invalid channel, portal disconnect).\n\nPlan: A (P1 extension for Mutant Market 2026-06-15)\nPolish bar: ROUGH OK -- v1 limitations: no token refresh, no validation ping, toast-only errors.\n\nUI side: thinmansoftware/lspro-react PR\n\nCo-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>')"
       fi
       git push -u origin "$BRANCH"
       echo "BRANCH=${BRANCH}"
@@ -288,11 +288,11 @@ nodes:
     bash: |
       set -euo pipefail
       BRANCH="$(git rev-parse --abbrev-ref HEAD)"
-      REPO="bluedevilcollectibles/shopops"
+      REPO="thinmansoftware/shopops"
       BASE="master"
       TITLE="feat(api): WO-CHANNELS-OAUTH-WRITE-FLOWS-01 -- channel connect/disconnect"
       BODY_FILE=$(mktemp)
-      printf '## Summary\nImplements WO-CHANNELS-OAUTH-WRITE-FLOWS-01 -- backend connect/disconnect routes.\n\n## Plan: A (P1 Mutant Market 2026-06-15)\n\n## Polish bar: ROUGH OK\nv1 limitations explicit: no token refresh, no validation ping, toast-only errors.\nManual disconnect-then-reconnect is acceptable recovery path.\n\nUI companion PR: bluedevilcollectibles/lspro-react.\n' > "$BODY_FILE"
+      printf '## Summary\nImplements WO-CHANNELS-OAUTH-WRITE-FLOWS-01 -- backend connect/disconnect routes.\n\n## Plan: A (P1 Mutant Market 2026-06-15)\n\n## Polish bar: ROUGH OK\nv1 limitations explicit: no token refresh, no validation ping, toast-only errors.\nManual disconnect-then-reconnect is acceptable recovery path.\n\nUI companion PR: thinmansoftware/lspro-react.\n' > "$BODY_FILE"
       existing_pr_url() {
         gh pr list --repo "$REPO" --head "$BRANCH" --state open \
           --json url --template '{{range .}}{{.url}}{{"\n"}}{{end}}' 2>/dev/null | head -1
@@ -389,7 +389,7 @@ nodes:
       $read-spec.output
       BDC_NODE_OUTPUT_READ_SPEC
       )
-      ISSUE_REPO="${ISSUE_REPO:-bluedevilcollectibles/bdc-xo}"
+      ISSUE_REPO="${ISSUE_REPO:-thinmansoftware/bdc-xo}"
       ISSUE_NUM=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'issue=[0-9]+' | head -1 | cut -d= -f2 || true)
       if [ -z "$ISSUE_NUM" ]; then
         ISSUE_NUM=$(printf '%s\n' "$READ_SPEC_OUT" | sed -n 's/^SPEC_PATH=.*issues\/\([0-9][0-9]*\).*/\1/p' | head -1)

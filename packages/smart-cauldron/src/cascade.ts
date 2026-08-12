@@ -282,7 +282,7 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
       ...context,
       sourceEventId: sourceAttempt.sourceEventId,
       sourceEventCreatedAt: sourceAttempt.sourceEventAt,
-      repository: project ?? 'bluedevilcollectibles/bdc-harness',
+      repository: project ?? 'thinmansoftware/bdc-harness',
     });
   };
   let priorContext: string | null = null;
@@ -832,7 +832,7 @@ function buildWhatMustChange(tier: LadderTier, failReason: string): string {
  * in bdc-feature-development.yaml.
  */
 async function defaultSpecRepair(ctx: SpecRepairCallContext): Promise<SpecRepairResult> {
-  const issueRepo = process.env.ISSUE_REPO ?? 'bluedevilcollectibles/bdc-xo';
+  const issueRepo = process.env.ISSUE_REPO ?? 'thinmansoftware/bdc-xo';
 
   // Resolve the issue number by searching the WO ID in the issue title.
   let issueNumber: number | null = null;

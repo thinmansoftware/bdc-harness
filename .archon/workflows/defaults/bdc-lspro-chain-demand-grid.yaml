@@ -5,7 +5,7 @@
 # Pre-flight (OPERATOR MUST VERIFY BEFORE FIRING):
 #   1. lspro-react + shopops registered in Archon
 #   2. WO-SHOPOPS-MULTI-LOCATION-SCOPE-01 MUST be MERGED -- location_id column on pull_list_allocations
-#      Verify: gh pr list --repo bluedevilcollectibles/shopops --search 'WO-SHOPOPS-MULTI-LOCATION-SCOPE-01' --state merged
+#      Verify: gh pr list --repo thinmansoftware/shopops --search 'WO-SHOPOPS-MULTI-LOCATION-SCOPE-01' --state merged
 #      AND ssh hetzner-prod 'docker exec shopops-api psql -c "\d pull_list_allocations"' shows location_id
 #   3. Spec at bdc-xo:docs/work-orders/WO-LSPRO-CHAIN-DEMAND-GRID-01.md
 #   4. Notion page ID -- fill in 35fef4c9-ce00-81f7-8c60-ebed44513508 before firing
@@ -26,7 +26,7 @@ description: |
         + grid components + reallocation modal in lspro-react. Vitest + bun tests.
         UI screenshot loop N=3 (grid load, reallocation modal, 13-location scroll).
         Manifest v2 + Notion flip.
-  Repos: bluedevilcollectibles/lspro-react (Archon CWD) + bluedevilcollectibles/shopops
+  Repos: thinmansoftware/lspro-react (Archon CWD) + thinmansoftware/shopops
          (cloned to /tmp).
   Depends on: WO-SHOPOPS-MULTI-LOCATION-SCOPE-01 (location_id column).
   parallel_ok: true (single-repo for UI side; shopops side small + isolated)
@@ -41,14 +41,14 @@ nodes:
       set -euo pipefail
       WO_ID="${WO_ID:-WO-LSPRO-CHAIN-DEMAND-GRID-01}"
       # Primary path (gh --template, no jq dependency)
-      SPEC=$(gh api "repos/bluedevilcollectibles/bdc-xo/contents/docs/work-orders/${WO_ID}.md?ref=main" \
+      SPEC=$(gh api "repos/thinmansoftware/bdc-xo/contents/docs/work-orders/${WO_ID}.md?ref=main" \
         --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
       if [ -z "$SPEC" ]; then
-        GLOB=$(gh api "repos/bluedevilcollectibles/bdc-xo/contents/docs/superpowers/specs?ref=main" \
+        GLOB=$(gh api "repos/thinmansoftware/bdc-xo/contents/docs/superpowers/specs?ref=main" \
           --template '{{range .}}{{.path}}{{"\n"}}{{end}}' 2>/dev/null \
           | grep "${WO_ID}.md$" | head -1 || true)
         if [ -n "$GLOB" ]; then
-          SPEC=$(gh api "repos/bluedevilcollectibles/bdc-xo/contents/${GLOB}?ref=main" \
+          SPEC=$(gh api "repos/thinmansoftware/bdc-xo/contents/${GLOB}?ref=main" \
             --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
         fi
       fi
@@ -56,12 +56,12 @@ nodes:
         # Fallback 4: GitHub issue body (WO-HARNESS-READ-SPEC-ISSUE-BODY-FALLBACK-01)
         ISSUE_NUM=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'issue=[0-9]+' | head -n 1 | cut -d= -f2 || true)
         if [ -z "$ISSUE_NUM" ]; then
-          ISSUE_NUM=$(gh issue list --repo bluedevilcollectibles/bdc-xo \
+          ISSUE_NUM=$(gh issue list --repo thinmansoftware/bdc-xo \
             --search "${WO_ID} in:title" --json number,title \
             --jq '.[0].number' 2>/dev/null || true)
         fi
         if [ -n "$ISSUE_NUM" ] && [ "$ISSUE_NUM" != "null" ]; then
-          SPEC=$(gh issue view "$ISSUE_NUM" --repo bluedevilcollectibles/bdc-xo \
+          SPEC=$(gh issue view "$ISSUE_NUM" --repo thinmansoftware/bdc-xo \
             --json body --jq .body 2>/dev/null || true)
           [ -n "$SPEC" ] && SPEC_PATH="issues/${ISSUE_NUM}"
         fi
@@ -138,7 +138,7 @@ nodes:
         fi
         git reset --hard "origin/$SHOPOPS_DEFAULT" 2>/dev/null || true
       else
-        git clone "https://github.com/bluedevilcollectibles/shopops.git" "$DIR" --depth=50
+        git clone "https://github.com/thinmansoftware/shopops.git" "$DIR" --depth=50
       fi
       echo "SHOPOPS_DIR=$DIR"
 
@@ -418,7 +418,7 @@ nodes:
     bash: |
       set -euo pipefail
       BRANCH="$(git rev-parse --abbrev-ref HEAD)"
-      REPO="bluedevilcollectibles/lspro-react"
+      REPO="thinmansoftware/lspro-react"
       BODY=$(mktemp)
       {
         echo "## Summary"
@@ -456,7 +456,7 @@ nodes:
       set -euo pipefail
       cd /tmp/shopops-work-$WORKFLOW_ID
       BRANCH="$(git rev-parse --abbrev-ref HEAD)"
-      REPO="bluedevilcollectibles/shopops"
+      REPO="thinmansoftware/shopops"
       BODY=$(mktemp)
       {
         echo "## Summary"
@@ -502,7 +502,7 @@ nodes:
       # set -e DELIBERATELY OMITTED -- best-effort
       BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
       sleep 30
-      RESULT=$(gh pr list --repo bluedevilcollectibles/lspro-react --head "$BRANCH" --state open --json url 2>&1)
+      RESULT=$(gh pr list --repo thinmansoftware/lspro-react --head "$BRANCH" --state open --json url 2>&1)
       if echo "$RESULT" | grep -q "url"; then
         echo "STATUS=pr_open_preview_pending"
       else
@@ -591,7 +591,7 @@ nodes:
       $read-spec.output
       BDC_NODE_OUTPUT_READ_SPEC
       )
-      ISSUE_REPO="${ISSUE_REPO:-bluedevilcollectibles/bdc-xo}"
+      ISSUE_REPO="${ISSUE_REPO:-thinmansoftware/bdc-xo}"
       ISSUE_NUM=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'issue=[0-9]+' | head -1 | cut -d= -f2 || true)
       if [ -z "$ISSUE_NUM" ]; then
         ISSUE_NUM=$(printf '%s\n' "$READ_SPEC_OUT" | sed -n 's/^SPEC_PATH=.*issues\/\([0-9][0-9]*\).*/\1/p' | head -1)

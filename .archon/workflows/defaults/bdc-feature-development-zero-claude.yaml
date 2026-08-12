@@ -13,7 +13,7 @@ description: |
 policyFile: harness/policies/agent-behavior.md
 run_authority:
   required: true
-  spec_repository: bluedevilcollectibles/bdc-xo
+  spec_repository: thinmansoftware/bdc-xo
   spec_revision: main
   spec_paths:
     - docs/work-orders/{WO_ID}.md
@@ -71,30 +71,30 @@ nodes:
       # Specs live in bdc-xo (NOT the target codebase). Cross-repo fetch via gh api.
       # Per YAML Recipe v1 Section 4 / Rule 5: try docs/work-orders/ then docs/superpowers/specs/ glob.
       SPEC_PATH="docs/work-orders/${WO_ID}.md"
-      SPEC_CONTENT=$(gh api "repos/bluedevilcollectibles/bdc-xo/contents/${SPEC_PATH}?ref=main" --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
+      SPEC_CONTENT=$(gh api "repos/thinmansoftware/bdc-xo/contents/${SPEC_PATH}?ref=main" --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
       if [ -z "$SPEC_CONTENT" ]; then
         # Fallback 1: docs/superpowers/specs/${WO_ID}.md direct
         SPEC_PATH="docs/superpowers/specs/${WO_ID}.md"
-        SPEC_CONTENT=$(gh api "repos/bluedevilcollectibles/bdc-xo/contents/${SPEC_PATH}?ref=main" --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
+        SPEC_CONTENT=$(gh api "repos/thinmansoftware/bdc-xo/contents/${SPEC_PATH}?ref=main" --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
       fi
       if [ -z "$SPEC_CONTENT" ]; then
         # Fallback 2: date-prefix glob in docs/superpowers/specs/
-        MATCH=$(gh api "repos/bluedevilcollectibles/bdc-xo/contents/docs/superpowers/specs?ref=main" --template '{{range .}}{{.path}}{{"\n"}}{{end}}' 2>/dev/null | grep "${WO_ID}.md$" | head -n 1)
+        MATCH=$(gh api "repos/thinmansoftware/bdc-xo/contents/docs/superpowers/specs?ref=main" --template '{{range .}}{{.path}}{{"\n"}}{{end}}' 2>/dev/null | grep "${WO_ID}.md$" | head -n 1)
         if [ -n "$MATCH" ]; then
           SPEC_PATH="$MATCH"
-          SPEC_CONTENT=$(gh api "repos/bluedevilcollectibles/bdc-xo/contents/${SPEC_PATH}?ref=main" --template '{{.content}}' | tr -d '\n' | base64 -d || true)
+          SPEC_CONTENT=$(gh api "repos/thinmansoftware/bdc-xo/contents/${SPEC_PATH}?ref=main" --template '{{.content}}' | tr -d '\n' | base64 -d || true)
         fi
       fi
       if [ -z "$SPEC_CONTENT" ]; then
         # Fallback 4: GitHub issue body (WO-HARNESS-READ-SPEC-ISSUE-BODY-FALLBACK-01)
         ISSUE_NUM=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'issue=[0-9]+' | head -n 1 | cut -d= -f2 || true)
         if [ -z "$ISSUE_NUM" ]; then
-          ISSUE_NUM=$(gh issue list --repo bluedevilcollectibles/bdc-xo \
+          ISSUE_NUM=$(gh issue list --repo thinmansoftware/bdc-xo \
             --search "${WO_ID} in:title" --json number,title \
             --jq '.[0].number' 2>/dev/null || true)
         fi
         if [ -n "$ISSUE_NUM" ] && [ "$ISSUE_NUM" != "null" ]; then
-          SPEC_CONTENT=$(gh issue view "$ISSUE_NUM" --repo bluedevilcollectibles/bdc-xo \
+          SPEC_CONTENT=$(gh issue view "$ISSUE_NUM" --repo thinmansoftware/bdc-xo \
             --json body --jq .body 2>/dev/null || true)
           [ -n "$SPEC_CONTENT" ] && SPEC_PATH="issues/${ISSUE_NUM}"
         fi
@@ -262,9 +262,9 @@ nodes:
 
       ## BDC Push Policy
       Hardcoded Rule 20 staging-gate repos:
-      - bluedevilcollectibles/lspro-react
-      - bluedevilcollectibles/shopops-storefront
-      - bluedevilcollectibles/shopops
+      - thinmansoftware/lspro-react
+      - thinmansoftware/shopops-storefront
+      - thinmansoftware/shopops
 
       For those repos, use a feature branch plus PR and require the staging gate.
       For bdc-xo non-doctrine code and any other repo, use feature branch plus PR without staging gate.
@@ -1830,9 +1830,9 @@ nodes:
       The target repo is where the PR must be opened (NOT the worktree's git origin - Rule 29).
 
       Match the extracted repo against this hardcoded staging-gate list:
-      - bluedevilcollectibles/lspro-react
-      - bluedevilcollectibles/shopops-storefront
-      - bluedevilcollectibles/shopops
+      - thinmansoftware/lspro-react
+      - thinmansoftware/shopops-storefront
+      - thinmansoftware/shopops
 
       If the repo matches one of those entries, output:
       push_target: feature-branch:<spec-derived-branch-name>
@@ -2773,7 +2773,7 @@ nodes:
       $read-spec.output
       BDC_NODE_OUTPUT_READ_SPEC
       )
-      ISSUE_REPO="${ISSUE_REPO:-bluedevilcollectibles/bdc-xo}"
+      ISSUE_REPO="${ISSUE_REPO:-thinmansoftware/bdc-xo}"
       ISSUE_NUM=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'issue=[0-9]+' | head -1 | cut -d= -f2 || true)
       if [ -z "$ISSUE_NUM" ]; then
         ISSUE_NUM=$(printf '%s\n' "$READ_SPEC_OUT" | sed -n 's/^SPEC_PATH=.*issues\/\([0-9][0-9]*\).*/\1/p' | head -1)
@@ -2853,7 +2853,7 @@ nodes:
       $read-spec.output
       BDC_NODE_OUTPUT_READ_SPEC
       )
-      ISSUE_REPO="${ISSUE_REPO:-bluedevilcollectibles/bdc-xo}"
+      ISSUE_REPO="${ISSUE_REPO:-thinmansoftware/bdc-xo}"
       ISSUE_NUM=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'issue=[0-9]+' | head -1 | cut -d= -f2 || true)
       if [ -z "$ISSUE_NUM" ]; then
         ISSUE_NUM=$(printf '%s\n' "$READ_SPEC_OUT" | sed -n 's/^SPEC_PATH=.*issues\/\([0-9][0-9]*\).*/\1/p' | head -1)

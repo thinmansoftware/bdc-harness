@@ -29,7 +29,7 @@ const EVIDENCE = hex(40, 'evidence-101');
 const sampleSnapshot = {
   snapshot_id: 'snapshot-1',
   schema_version: 'm31-substrate-v1',
-  repository: 'bluedevilcollectibles/bdc-harness',
+  repository: 'thinmansoftware/bdc-harness',
   capture_started_at: '2026-07-14T00:00:00.000Z',
   capture_completed_at: '2026-07-14T00:00:00.000Z',
   operator_actor: 'xo-model',
@@ -73,7 +73,7 @@ const sampleSnapshot = {
 
 const sampleProposal = {
   proposal_id: 'proposal-1',
-  repository: 'bluedevilcollectibles/bdc-harness',
+  repository: 'thinmansoftware/bdc-harness',
   pr_number: 101,
   head_sha: HEAD,
   base_branch: 'dev',
@@ -96,7 +96,7 @@ const samplePermit = {
   permit_id: 'receipt-1',
   proposal_id: 'proposal-1',
   execution_id: 'exec-1',
-  repository: 'bluedevilcollectibles/bdc-harness',
+  repository: 'thinmansoftware/bdc-harness',
   pr_number: 101,
   head_sha: HEAD,
   base_branch: 'dev',
@@ -332,7 +332,7 @@ const authHeaders = {
 
 function snapshotBody(over: Record<string, unknown> = {}): string {
   return JSON.stringify({
-    repository: 'bluedevilcollectibles/bdc-harness',
+    repository: 'thinmansoftware/bdc-harness',
     capture_started_at: '2026-07-14T00:00:00.000Z',
     capture_completed_at: '2026-07-14T00:00:00.000Z',
     operator_actor: 'xo-model',
@@ -369,7 +369,7 @@ function snapshotBody(over: Record<string, unknown> = {}): string {
 
 function proposalBody(over: Record<string, unknown> = {}): string {
   return JSON.stringify({
-    repository: 'bluedevilcollectibles/bdc-harness',
+    repository: 'thinmansoftware/bdc-harness',
     pr_number: 101,
     head_sha: HEAD,
     base_branch: 'dev',
@@ -389,7 +389,7 @@ function observationBody(over: Record<string, unknown> = {}): string {
   return JSON.stringify({
     observation: {
       known: true,
-      repository: 'bluedevilcollectibles/bdc-harness',
+      repository: 'thinmansoftware/bdc-harness',
       pr_number: 101,
       head_sha: HEAD,
       base_branch: 'dev',

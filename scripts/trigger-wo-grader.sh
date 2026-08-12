@@ -37,8 +37,8 @@ if [ ! -d "$ARCHON_DIR" ]; then
 fi
 
 if [ "$REQUIRE_BDC_HARNESS_CODEBASE" = "true" ] && [ -f "$ARCHON_DB" ] && command -v sqlite3 >/dev/null 2>&1; then
-  if ! sqlite3 "$ARCHON_DB" "SELECT name FROM remote_agent_codebases WHERE name='bluedevilcollectibles/bdc-harness'" | grep -qx 'bluedevilcollectibles/bdc-harness'; then
-    echo "ERROR: bluedevilcollectibles/bdc-harness is not registered in remote_agent_codebases" >&2
+  if ! sqlite3 "$ARCHON_DB" "SELECT name FROM remote_agent_codebases WHERE name='thinmansoftware/bdc-harness'" | grep -qx 'thinmansoftware/bdc-harness'; then
+    echo "ERROR: thinmansoftware/bdc-harness is not registered in remote_agent_codebases" >&2
     echo "Run WO-HARNESS-SELF-REGISTRATION-01 before enabling the grader timer." >&2
     exit 1
   fi

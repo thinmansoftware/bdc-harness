@@ -5,10 +5,10 @@ import type { ActionProposal } from './rules';
 function proposal(overrides: Partial<ActionProposal> = {}): ActionProposal {
   return {
     type: 'nudge',
-    threadRef: 'gh:bluedevilcollectibles/bdc-harness#7',
+    threadRef: 'gh:thinmansoftware/bdc-harness#7',
     recipient: 'xo',
     body: 'Nudge: please post a status update on this thread.',
-    idempotencyKey: 'tm:nudge:gh:bluedevilcollectibles/bdc-harness#7:100',
+    idempotencyKey: 'tm:nudge:gh:thinmansoftware/bdc-harness#7:100',
     actsImmediately: false,
     ...overrides,
   };

@@ -6,7 +6,7 @@
 #   1. YAML exists: this file
 #   2. Spec exists: docs/work-orders/WO-SHOPOPS-SHIPMENT-RECONCILIATION-UI-01.md in bdc-xo
 #   3. CWD scope: MIXED cross-repo (shopops primary CWD + lspro-react sibling /tmp clone)
-#   4. Codebases registered: bluedevilcollectibles/shopops AND bluedevilcollectibles/lspro-react
+#   4. Codebases registered: thinmansoftware/shopops AND thinmansoftware/lspro-react
 #
 # Deploy: BDC_XO/scripts/archon-bridge/sync-workflows.sh WO-SHOPOPS-SHIPMENT-RECONCILIATION-UI-01.yaml
 # REVIEW BEFORE DEPLOY -- operator confirms shopops-api has read access to shipment_items
@@ -38,16 +38,16 @@ nodes:
       WO_ID="${WO_ID:-WO-SHOPOPS-SHIPMENT-RECONCILIATION-UI-01}"
       # gh --template uses Go templates (built-in, no jq dependency).
       SPEC_CONTENT=$(gh api \
-        "repos/bluedevilcollectibles/bdc-xo/contents/docs/work-orders/${WO_ID}.md?ref=main" \
+        "repos/thinmansoftware/bdc-xo/contents/docs/work-orders/${WO_ID}.md?ref=main" \
         --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
       if [ -z "$SPEC_CONTENT" ]; then
         GLOB_PATH=$(gh api \
-          "repos/bluedevilcollectibles/bdc-xo/contents/docs/superpowers/specs?ref=main" \
+          "repos/thinmansoftware/bdc-xo/contents/docs/superpowers/specs?ref=main" \
           --template '{{range .}}{{.path}}{{"\n"}}{{end}}' 2>/dev/null \
           | grep "${WO_ID}.md$" | head -1 || true)
         if [ -n "$GLOB_PATH" ]; then
           SPEC_CONTENT=$(gh api \
-            "repos/bluedevilcollectibles/bdc-xo/contents/${GLOB_PATH}?ref=main" \
+            "repos/thinmansoftware/bdc-xo/contents/${GLOB_PATH}?ref=main" \
             --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
         fi
       fi
@@ -55,12 +55,12 @@ nodes:
         # Fallback 4: GitHub issue body (WO-HARNESS-READ-SPEC-ISSUE-BODY-FALLBACK-01)
         ISSUE_NUM=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'issue=[0-9]+' | head -n 1 | cut -d= -f2 || true)
         if [ -z "$ISSUE_NUM" ]; then
-          ISSUE_NUM=$(gh issue list --repo bluedevilcollectibles/bdc-xo \
+          ISSUE_NUM=$(gh issue list --repo thinmansoftware/bdc-xo \
             --search "${WO_ID} in:title" --json number,title \
             --jq '.[0].number' 2>/dev/null || true)
         fi
         if [ -n "$ISSUE_NUM" ] && [ "$ISSUE_NUM" != "null" ]; then
-          SPEC_CONTENT=$(gh issue view "$ISSUE_NUM" --repo bluedevilcollectibles/bdc-xo \
+          SPEC_CONTENT=$(gh issue view "$ISSUE_NUM" --repo thinmansoftware/bdc-xo \
             --json body --jq .body 2>/dev/null || true)
           [ -n "$SPEC_CONTENT" ] && SPEC_PATH="issues/${ISSUE_NUM}"
         fi
@@ -189,7 +189,7 @@ nodes:
         Implement lspro-react half of WO-SHOPOPS-SHIPMENT-RECONCILIATION-UI-01.
 
         Clone lspro-react into sibling path:
-          git -C /tmp clone --depth=10 https://github.com/bluedevilcollectibles/lspro-react.git lspro-react
+          git -C /tmp clone --depth=10 https://github.com/thinmansoftware/lspro-react.git lspro-react
           cd /tmp/lspro-react
           git checkout -b wo/shopops-shipment-reconciliation-ui-01-ui
 
@@ -259,7 +259,7 @@ nodes:
     bash: |
       set -euo pipefail
       BRANCH="$(git rev-parse --abbrev-ref HEAD)"
-      REPO="bluedevilcollectibles/shopops"
+      REPO="thinmansoftware/shopops"
       EXIST=$(gh pr list --repo "$REPO" --head "$BRANCH" --state open \
         --json url --template '{{range .}}{{.url}}{{"\n"}}{{end}}' 2>/dev/null | head -1 || true)
       if [ -n "$EXIST" ]; then echo "SHOPOPS_PR=$EXIST"; exit 0; fi
@@ -287,11 +287,11 @@ nodes:
           commit -m "$(printf 'feat(admin): WO-SHOPOPS-SHIPMENT-RECONCILIATION-UI-01 -- CSV reconcile page\n\nAdds /admin/receiving/reconcile page (CSV upload + discrepancy table).\nAdds src/lib/csv-parse-distributor.ts pure parser.\n\nROUGH-OK polish bar.\n\nCo-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>')"
       fi
       git push -u origin wo/shopops-shipment-reconciliation-ui-01-ui
-      EXIST=$(gh pr list --repo bluedevilcollectibles/lspro-react --head wo/shopops-shipment-reconciliation-ui-01-ui --state open \
+      EXIST=$(gh pr list --repo thinmansoftware/lspro-react --head wo/shopops-shipment-reconciliation-ui-01-ui --state open \
         --json url --template '{{range .}}{{.url}}{{"\n"}}{{end}}' 2>/dev/null | head -1 || true)
       if [ -n "$EXIST" ]; then echo "LSPRO_PR=$EXIST"; exit 0; fi
       for i in 1 2 3; do
-        if URL=$(gh pr create --repo bluedevilcollectibles/lspro-react --base main --head wo/shopops-shipment-reconciliation-ui-01-ui \
+        if URL=$(gh pr create --repo thinmansoftware/lspro-react --base main --head wo/shopops-shipment-reconciliation-ui-01-ui \
             --title "feat(admin): WO-SHOPOPS-SHIPMENT-RECONCILIATION-UI-01 -- CSV reconcile page" \
             --body "ROUGH-OK polish bar. Staging URL: https://staging.livesellerpro.app/admin/receiving/reconcile" 2>&1); then
           echo "LSPRO_PR=$URL"; exit 0
@@ -391,7 +391,7 @@ nodes:
       $read-spec.output
       BDC_NODE_OUTPUT_READ_SPEC
       )
-      ISSUE_REPO="${ISSUE_REPO:-bluedevilcollectibles/bdc-xo}"
+      ISSUE_REPO="${ISSUE_REPO:-thinmansoftware/bdc-xo}"
       ISSUE_NUM=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'issue=[0-9]+' | head -1 | cut -d= -f2 || true)
       if [ -z "$ISSUE_NUM" ]; then
         ISSUE_NUM=$(printf '%s\n' "$READ_SPEC_OUT" | sed -n 's/^SPEC_PATH=.*issues\/\([0-9][0-9]*\).*/\1/p' | head -1)

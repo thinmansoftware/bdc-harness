@@ -269,7 +269,7 @@ function baseCandidate(
   over: Partial<BranchCandidateInputV1>
 ): ExecuteRefreshRebaseInputV1['candidate'] {
   return {
-    repository: 'bluedevilcollectibles/bdc-harness',
+    repository: 'thinmansoftware/bdc-harness',
     branch: 'wo/harness-overseer-refresh-rebase-01',
     worktree_path: '/fixture',
     branch_gate_enabled: true,

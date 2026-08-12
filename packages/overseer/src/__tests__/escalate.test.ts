@@ -36,7 +36,7 @@ describe.serial('durable escalation card', () => {
         errorClass: 'validator_rejected',
         woId: 'WO-RPT-01',
         nodeId: 'gate',
-        repository: 'bluedevilcollectibles/bdc-harness',
+        repository: 'thinmansoftware/bdc-harness',
       },
       {
         sourceEventId: 'event-report-1',
@@ -59,7 +59,7 @@ describe.serial('durable escalation card', () => {
       {
         errorClass: 'unknown' as const,
         woId: 'WO-DEDUPE-01',
-        repository: 'bluedevilcollectibles/bdc-harness',
+        repository: 'thinmansoftware/bdc-harness',
       },
       {
         sourceEventId: 'event-dedupe-1',

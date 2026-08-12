@@ -2,7 +2,7 @@ name: bdc-canary-layer2-trivial
 description: Event-triggered build-through fixture for Cauldron Layer 2.
 provider: codex
 model: gpt-5.6-sol
-target_repo: bluedevilcollectibles/bdc-harness
+target_repo: thinmansoftware/bdc-harness
 mutates_checkout: true
 nodes:
   - id: trivial-build

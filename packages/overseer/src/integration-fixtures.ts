@@ -157,7 +157,7 @@ export function buildIndeterminateOperatorCard(input: {
     error_class: 'indeterminate_prior_effect',
   };
   const payload: OperatorCardPayload = {
-    repository: 'bluedevilcollectibles/bdc-harness',
+    repository: 'thinmansoftware/bdc-harness',
     branch: null,
     pr_url: null,
     pr_number: null,
@@ -337,7 +337,7 @@ export async function runIndeterminateOperatorCardReconciliation(input: {
 function sampleSalvage(): OverseerSalvageReceiptV1 {
   return {
     schema_version: 'overseer-salvage-receipt-v1',
-    repository: 'bluedevilcollectibles/bdc-harness',
+    repository: 'thinmansoftware/bdc-harness',
     wo_id: 'WO-M42-S8-INTEGRATION',
     source_target_kind: 'workflow_run',
     source_target_key: 'run-pred-1',
@@ -582,7 +582,7 @@ export function repairExecInput(
     proposal_id: 'm31v2-proposal-repair-1',
     execution_id: 'm31v2-exec-repair-1',
     idempotency_key: 'idem-repair-1',
-    repository: 'bluedevilcollectibles/bdc-harness',
+    repository: 'thinmansoftware/bdc-harness',
     wo_id: 'WO-M42-S8-INTEGRATION',
     workflow_name: 'implement',
     target_digest: sha256hex('target'),
@@ -674,10 +674,10 @@ export function makeBranchHarness(
     permit_id: 'permit-branch-1',
     proposal_id: 'm31v2-proposal-branch-1',
     execution_id: 'm31v2-exec-branch-1',
-    repository: 'bluedevilcollectibles/bdc-harness',
+    repository: 'thinmansoftware/bdc-harness',
     target: {
       target_kind: 'pull_request',
-      repository: 'bluedevilcollectibles/bdc-harness',
+      repository: 'thinmansoftware/bdc-harness',
       pr_number: 42,
       provider_node_id: 'PR_node',
       head_sha: head,
@@ -807,7 +807,7 @@ export function branchExecInput(
 ): ExecuteRefreshRebaseInputV1 {
   return {
     candidate: {
-      repository: 'bluedevilcollectibles/bdc-harness',
+      repository: 'thinmansoftware/bdc-harness',
       branch: 'wo/fixture-branch',
       worktree_path: '/fixture/worktree',
       branch_gate_enabled: true,
@@ -851,10 +851,10 @@ function lifecyclePermit(actionKind: 'COMMENT' | 'CLOSE' | 'REOPEN'): M31ActionP
     permit_id: `permit-lifecycle-${actionKind.toLowerCase()}`,
     proposal_id: `m31v2-proposal-lifecycle-${actionKind.toLowerCase()}`,
     execution_id: `m31v2-exec-lifecycle-${actionKind.toLowerCase()}`,
-    repository: 'bluedevilcollectibles/bdc-harness',
+    repository: 'thinmansoftware/bdc-harness',
     target: {
       target_kind: 'pull_request',
-      repository: 'bluedevilcollectibles/bdc-harness',
+      repository: 'thinmansoftware/bdc-harness',
       pr_number: 101,
       provider_node_id: 'PR_node_101',
       head_sha: HEAD_SHA,
@@ -1010,7 +1010,7 @@ export function makeLifecycleHarness(): LifecycleHarness {
       },
     },
     adapter: createLifecycleMutationAdapter({
-      allowed_repositories: ['bluedevilcollectibles/bdc-harness'],
+      allowed_repositories: ['thinmansoftware/bdc-harness'],
       allowed_actions: ['COMMENT'],
       async consume_execution() {
         callLog.push('lifecycle:adapter');
@@ -1027,14 +1027,14 @@ export function lifecycleExecInput(): ExecuteLifecycleActionInputV1 {
     lifecycle_gate_enabled: true,
     evidence_complete: true,
     target: {
-      repository: 'bluedevilcollectibles/bdc-harness',
+      repository: 'thinmansoftware/bdc-harness',
       target_kind: 'pull_request',
       target_key: 'pr:101',
       target_digest: TARGET_DIGEST,
       snapshot_id: 'snapshot-lifecycle-1',
       target: {
         target_kind: 'pull_request',
-        repository: 'bluedevilcollectibles/bdc-harness',
+        repository: 'thinmansoftware/bdc-harness',
         pr_number: 101,
         provider_node_id: 'PR_node_101',
         head_sha: HEAD_SHA,
@@ -1188,7 +1188,7 @@ export function makeMergeHarness(
   const callLog = createCallLog();
   const target: M31ActionPermitV2['target'] = {
     target_kind: 'pull_request',
-    repository: 'bluedevilcollectibles/bdc-harness',
+    repository: 'thinmansoftware/bdc-harness',
     pr_number: 42,
     provider_node_id: 'PR_node',
     head_sha: HEAD_SHA,
@@ -1201,9 +1201,9 @@ export function makeMergeHarness(
     permit_id: 'permit-merge-1',
     proposal_id: 'm31v2-proposal-merge-1',
     execution_id: 'm31v2-exec-merge-1',
-    repository: 'bluedevilcollectibles/bdc-harness',
+    repository: 'thinmansoftware/bdc-harness',
     target,
-    target_key: 'bluedevilcollectibles/bdc-harness#pull_request:42',
+    target_key: 'thinmansoftware/bdc-harness#pull_request:42',
     target_digest: TARGET_DIGEST,
     snapshot_id: 'snapshot-merge-1',
     action_kind: 'MERGE',
@@ -1262,7 +1262,7 @@ export function makeMergeHarness(
     allowed: true,
     reason: 'allowed',
     capability: 'merge',
-    repository: 'bluedevilcollectibles/bdc-harness',
+    repository: 'thinmansoftware/bdc-harness',
     target_kind: 'pull_request',
     target_key: permit.target_key,
     target_digest: permit.target_digest,

@@ -91,18 +91,18 @@ extract_status() {
 echo "--- Test 1: PROCEED + PR_URL overwrites AI N/A ---"
 MANIFEST=$'WO: WO-X\nBuilder: Codex\nPRs: N/A (committed)\nVALIDATION: PASS'
 RECLASSIFY='{"status":"PROCEED"}'
-OPEN_PR_OUT='PR_URL=https://github.com/bluedevilcollectibles/bdc-harness/pull/409'
+OPEN_PR_OUT='PR_URL=https://github.com/thinmansoftware/bdc-harness/pull/409'
 STATUS="$(extract_status "$RECLASSIFY")"
 PR_URL="$(extract_pr_url "$OPEN_PR_OUT")"
 OUT="$(printf '%s\n' "$MANIFEST" | smp_process "$STATUS" "$PR_URL")"
 PRS_LINE="$(printf '%s\n' "$OUT" | grep -E '^PRs:' | head -1)"
-assert_eq "PRs line stamped with exact PR_URL" "PRs: https://github.com/bluedevilcollectibles/bdc-harness/pull/409" "$PRS_LINE"
+assert_eq "PRs line stamped with exact PR_URL" "PRs: https://github.com/thinmansoftware/bdc-harness/pull/409" "$PRS_LINE"
 assert_contains "other manifest line preserved" "VALIDATION: PASS" "$OUT"
 
 echo "--- Test 2: ALREADY_SATISFIED manifest unchanged ---"
 MANIFEST=$'WO: WO-X\nBuilder: Codex\nOUTCOME: ALREADY_SATISFIED\nPRs: N/A (ALREADY_SATISFIED)\nVALIDATION: PASS'
 STATUS="$(extract_status '{"status":"ALREADY_SATISFIED"}')"
-PR_URL="$(extract_pr_url 'PR_URL=https://github.com/bluedevilcollectibles/bdc-harness/pull/409')"
+PR_URL="$(extract_pr_url 'PR_URL=https://github.com/thinmansoftware/bdc-harness/pull/409')"
 OUT="$(printf '%s\n' "$MANIFEST" | smp_process "$STATUS" "$PR_URL")"
 assert_eq "ALREADY_SATISFIED passthrough" "$MANIFEST" "$OUT"
 
@@ -115,22 +115,22 @@ assert_eq "PROCEED without PR_URL does not fabricate PR" "$MANIFEST" "$OUT"
 
 echo "--- Test 4: bare URL fallback is stamped ---"
 MANIFEST=$'WO: WO-X\nBuilder: Codex\nPRs: no PR opened\nVALIDATION: PASS'
-OPEN_PR_OUT='https://github.com/bluedevilcollectibles/bdc-harness/pull/410'
+OPEN_PR_OUT='https://github.com/thinmansoftware/bdc-harness/pull/410'
 PR_URL="$(extract_pr_url "$OPEN_PR_OUT")"
 OUT="$(printf '%s\n' "$MANIFEST" | smp_process "PROCEED" "$PR_URL")"
 PRS_LINE="$(printf '%s\n' "$OUT" | grep -E '^PRs:' | head -1)"
-assert_eq "bare URL fallback stamped" "PRs: https://github.com/bluedevilcollectibles/bdc-harness/pull/410" "$PRS_LINE"
+assert_eq "bare URL fallback stamped" "PRs: https://github.com/thinmansoftware/bdc-harness/pull/410" "$PRS_LINE"
 
 echo "--- Test 5: PROCEED with no PRs line appends one ---"
 MANIFEST=$'WO: WO-X\nBuilder: Codex\nVALIDATION: PASS'
-OUT="$(printf '%s\n' "$MANIFEST" | smp_process "PROCEED" "https://github.com/bluedevilcollectibles/bdc-harness/pull/411")"
+OUT="$(printf '%s\n' "$MANIFEST" | smp_process "PROCEED" "https://github.com/thinmansoftware/bdc-harness/pull/411")"
 PRS_LINE="$(printf '%s\n' "$OUT" | grep -E '^PRs:' | head -1)"
-assert_eq "missing PRs line appended" "PRs: https://github.com/bluedevilcollectibles/bdc-harness/pull/411" "$PRS_LINE"
+assert_eq "missing PRs line appended" "PRs: https://github.com/thinmansoftware/bdc-harness/pull/411" "$PRS_LINE"
 assert_contains "original short manifest preserved" "VALIDATION: PASS" "$OUT"
 
 echo "--- Test 6: BLOCKED short manifest with no PRs line unchanged ---"
 MANIFEST=$'WO: WO-X\nOUTCOME: BLOCKED\nVALIDATION: FAIL (blocked)'
-OUT="$(printf '%s\n' "$MANIFEST" | smp_process "BLOCKED" "https://github.com/bluedevilcollectibles/bdc-harness/pull/412")"
+OUT="$(printf '%s\n' "$MANIFEST" | smp_process "BLOCKED" "https://github.com/thinmansoftware/bdc-harness/pull/412")"
 assert_eq "BLOCKED no-PRs passthrough" "$MANIFEST" "$OUT"
 
 echo "--- Test 7: six-lane stamp core parity ---"

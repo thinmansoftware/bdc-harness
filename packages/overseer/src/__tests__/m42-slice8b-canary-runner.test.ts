@@ -27,7 +27,7 @@ function payload(overrides: Partial<M42Slice8BManifestPayload> = {}): M42Slice8B
     mode: 'fake',
     candidate_sha: SHA_A,
     starting_sha: SHA_B,
-    repository_full_name: 'bluedevilcollectibles/bdc-harness',
+    repository_full_name: 'thinmansoftware/bdc-harness',
     provider_repository_id: 'R_sandbox_123',
     credential_principal_id: 'principal-sandbox-only-1234',
     image_digest: DIGEST,
@@ -62,7 +62,7 @@ function deps(
   return {
     expected_candidate_sha: SHA_A,
     expected_starting_sha: SHA_B,
-    expected_repository_full_name: 'bluedevilcollectibles/bdc-harness',
+    expected_repository_full_name: 'thinmansoftware/bdc-harness',
     expected_provider_repository_id: 'R_sandbox_123',
     nowMs: () => nowValues[Math.min(nowIndex++, nowValues.length - 1)] ?? 0,
     executionStore: new InMemoryM42Slice8BExecutionStore(),

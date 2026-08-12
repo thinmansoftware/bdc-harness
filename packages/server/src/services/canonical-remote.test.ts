@@ -2,20 +2,17 @@ import { expect, test } from 'bun:test';
 import { normalizeGitHubRemote } from './canonical-remote';
 
 test.each([
-  ['git@github.com:BlueDevilCollectibles/bdc-harness.git', 'bluedevilcollectibles/bdc-harness'],
-  ['https://github.com/BlueDevilCollectibles/bdc-harness.git', 'bluedevilcollectibles/bdc-harness'],
-  [
-    'ssh://git@github.com/BlueDevilCollectibles/bdc-harness.git',
-    'bluedevilcollectibles/bdc-harness',
-  ],
-  ['BlueDevilCollectibles/bdc-harness', 'bluedevilcollectibles/bdc-harness'],
+  ['git@github.com:BlueDevilCollectibles/bdc-harness.git', 'thinmansoftware/bdc-harness'],
+  ['https://github.com/BlueDevilCollectibles/bdc-harness.git', 'thinmansoftware/bdc-harness'],
+  ['ssh://git@github.com/BlueDevilCollectibles/bdc-harness.git', 'thinmansoftware/bdc-harness'],
+  ['BlueDevilCollectibles/bdc-harness', 'thinmansoftware/bdc-harness'],
   [
     'https://x-access-token:ghs_FAKETOKEN123@github.com/BlueDevilCollectibles/bdc-harness.git',
-    'bluedevilcollectibles/bdc-harness',
+    'thinmansoftware/bdc-harness',
   ],
   [
     'https://ghp_FAKETOKEN456@github.com/BlueDevilCollectibles/bdc-harness.git',
-    'bluedevilcollectibles/bdc-harness',
+    'thinmansoftware/bdc-harness',
   ],
 ])('normalizes %s', (remote, expected) => {
   expect(normalizeGitHubRemote(remote)).toBe(expected);

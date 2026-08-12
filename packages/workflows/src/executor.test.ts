@@ -395,7 +395,7 @@ describe('executeWorkflow', () => {
         makeWorkflow({
           run_authority: {
             required: true,
-            spec_repository: 'bluedevilcollectibles/bdc-xo',
+            spec_repository: 'thinmansoftware/bdc-xo',
             spec_revision: 'main',
             spec_paths: ['docs/work-orders/{WO_ID}.md'],
           },
@@ -419,7 +419,7 @@ describe('executeWorkflow', () => {
         const deps = makeDeps(store);
         const freezeWorkOrderSource = mock(async () => ({
           woId: 'WO-TEST-01',
-          specSource: 'github:bluedevilcollectibles/bdc-xo:docs/work-orders/WO-TEST-01.md',
+          specSource: 'github:thinmansoftware/bdc-xo:docs/work-orders/WO-TEST-01.md',
           specRevision: 'a'.repeat(40),
           specBytes: Buffer.from('# Exact\n', 'utf8'),
         }));
@@ -458,7 +458,7 @@ describe('executeWorkflow', () => {
           makeWorkflow({
             run_authority: {
               required: true,
-              spec_repository: 'bluedevilcollectibles/bdc-xo',
+              spec_repository: 'thinmansoftware/bdc-xo',
               spec_revision: 'main',
               spec_paths: ['docs/work-orders/{WO_ID}.md'],
             },
@@ -511,7 +511,7 @@ describe('executeWorkflow', () => {
           makeWorkflow({
             run_authority: {
               required: true,
-              spec_repository: 'bluedevilcollectibles/bdc-xo',
+              spec_repository: 'thinmansoftware/bdc-xo',
               spec_revision: 'main',
               spec_paths: ['docs/work-orders/{WO_ID}.md'],
             },
@@ -526,7 +526,7 @@ describe('executeWorkflow', () => {
           {
             dispatchId: 'dispatch-frozen',
             woId: 'WO-TEST-01',
-            specSource: 'github:bluedevilcollectibles/bdc-xo:docs/work-orders/WO-TEST-01.md',
+            specSource: 'github:thinmansoftware/bdc-xo:docs/work-orders/WO-TEST-01.md',
             specRevision: 'a'.repeat(40),
             specBytes: Buffer.from('# Exact\n', 'utf8'),
           }
@@ -547,7 +547,7 @@ describe('executeWorkflow', () => {
         runId: resumedRun.id,
         dispatchId: 'dispatch-original',
         woId: 'WO-TEST-01',
-        specSource: 'github:bluedevilcollectibles/bdc-xo:docs/work-orders/WO-TEST-01.md',
+        specSource: 'github:thinmansoftware/bdc-xo:docs/work-orders/WO-TEST-01.md',
         specRevision: 'a'.repeat(40),
         specHash: `sha256:${'1'.repeat(64)}`,
         workflowName: 'test-workflow',
@@ -585,7 +585,7 @@ describe('executeWorkflow', () => {
         makeWorkflow({
           run_authority: {
             required: true,
-            spec_repository: 'bluedevilcollectibles/bdc-xo',
+            spec_repository: 'thinmansoftware/bdc-xo',
             spec_revision: 'main',
             spec_paths: ['docs/work-orders/{WO_ID}.md'],
           },
@@ -1664,7 +1664,7 @@ describe('target_repo pre-flight guard', () => {
 
   it('blocks workflow when target_repo does not match origin remote', async () => {
     mockGetRemoteUrl.mockImplementation(
-      async () => 'https://github.com/bluedevilcollectibles/bdc-harness.git'
+      async () => 'https://github.com/thinmansoftware/bdc-harness.git'
     );
     const failWorkflowRunSpy = mock(async () => {});
     const createEventSpy = mock(async () => {});
@@ -1679,7 +1679,7 @@ describe('target_repo pre-flight guard', () => {
       makePlatform(),
       'conv-1',
       '/tmp',
-      makeWorkflow({ target_repo: 'bluedevilcollectibles/bdc-xo' }),
+      makeWorkflow({ target_repo: 'thinmansoftware/bdc-xo' }),
       'test message',
       'db-conv-1'
     );
@@ -1701,7 +1701,7 @@ describe('target_repo pre-flight guard', () => {
 
   it('proceeds when target_repo matches origin remote (HTTPS)', async () => {
     mockGetRemoteUrl.mockImplementation(
-      async () => 'https://github.com/bluedevilcollectibles/bdc-xo.git'
+      async () => 'https://github.com/thinmansoftware/bdc-xo.git'
     );
     const store = makeStore();
     const deps = makeDeps(store);
@@ -1711,7 +1711,7 @@ describe('target_repo pre-flight guard', () => {
       makePlatform(),
       'conv-1',
       '/tmp',
-      makeWorkflow({ target_repo: 'bluedevilcollectibles/bdc-xo' }),
+      makeWorkflow({ target_repo: 'thinmansoftware/bdc-xo' }),
       'test message',
       'db-conv-1'
     );
@@ -1721,9 +1721,7 @@ describe('target_repo pre-flight guard', () => {
   });
 
   it('proceeds when target_repo matches origin remote (SSH)', async () => {
-    mockGetRemoteUrl.mockImplementation(
-      async () => 'git@github.com:bluedevilcollectibles/bdc-xo.git'
-    );
+    mockGetRemoteUrl.mockImplementation(async () => 'git@github.com:thinmansoftware/bdc-xo.git');
     const store = makeStore();
     const deps = makeDeps(store);
 
@@ -1732,7 +1730,7 @@ describe('target_repo pre-flight guard', () => {
       makePlatform(),
       'conv-1',
       '/tmp',
-      makeWorkflow({ target_repo: 'bluedevilcollectibles/bdc-xo' }),
+      makeWorkflow({ target_repo: 'thinmansoftware/bdc-xo' }),
       'test message',
       'db-conv-1'
     );

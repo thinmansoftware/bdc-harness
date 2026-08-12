@@ -21,7 +21,7 @@ describe('pollForTerminal PR-detection race guard', () => {
   const openPrEvent = {
     event_type: 'node_completed',
     step_name: 'open-pr-if-needed',
-    data: { output: 'PR_URL=https://github.com/bluedevilcollectibles/bdc-harness/pull/488' },
+    data: { output: 'PR_URL=https://github.com/thinmansoftware/bdc-harness/pull/488' },
   };
 
   test('retries the event read when the PR event lands after run-complete (2026-07-17 false-negative race)', async () => {
@@ -43,7 +43,7 @@ describe('pollForTerminal PR-detection race guard', () => {
     });
 
     expect(result.terminalStatus).toBe('completed');
-    expect(result.prUrl).toBe('https://github.com/bluedevilcollectibles/bdc-harness/pull/488');
+    expect(result.prUrl).toBe('https://github.com/thinmansoftware/bdc-harness/pull/488');
     expect(calls).toBe(2);
     // 30s, raised from 15s after a 15016ms CI failure (16ms over) on 2026-07-25.
     // NOTE for whoever touches this next: intervalMs and the retry delays here are
@@ -89,7 +89,7 @@ describe('pollForTerminal PR-detection race guard', () => {
       prRetryDelayMs: 1,
     });
 
-    expect(result.prUrl).toBe('https://github.com/bluedevilcollectibles/bdc-harness/pull/488');
+    expect(result.prUrl).toBe('https://github.com/thinmansoftware/bdc-harness/pull/488');
     expect(calls).toBe(1);
   });
 });

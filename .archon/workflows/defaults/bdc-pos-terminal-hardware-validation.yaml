@@ -2,7 +2,7 @@
 # Source pattern: WO-SHOPOPS-COMMERCE-SPINE-01.yaml (single-repo) + INFRA wrapper
 # Doctrine compliance: 13 hard rules of archon-yaml-authoring
 #
-# Pre-flight: codebase bluedevilcollectibles/shopops registered in Archon.
+# Pre-flight: codebase thinmansoftware/shopops registered in Archon.
 # Pre-flight: WO-POS-TERMINAL-SDK-01 must be MERGED + DEPLOYED before this fires.
 #   Operator verifies: curl https://api.livesellerpro.app/pos/terminal/mode -> 200.
 # Pre-flight (4-block): YAML exists, spec exists, CWD = shopops single-repo, codebase registered.
@@ -23,7 +23,7 @@ description: |
         .env.example with LIVE keys + STRIPE_TERMINAL_MODE. PR + build INFRA manifest
         with the operator runbook (script invocation + ssh evidence capture). Flips
         Notion to REVIEW.
-  Repo: bluedevilcollectibles/shopops.
+  Repo: thinmansoftware/shopops.
   parallel_ok: false (operator hardware gate).
 
 policyFile: harness/policies/agent-behavior.md
@@ -37,15 +37,15 @@ nodes:
       WO_ID="${WO_ID:-WO-POS-TERMINAL-HARDWARE-VALIDATION-01}"
       # gh --template uses Go templates (built-in to gh, no external jq dependency)
       SPEC=$(gh api \
-        "repos/bluedevilcollectibles/bdc-xo/contents/docs/work-orders/${WO_ID}.md?ref=main" \
+        "repos/thinmansoftware/bdc-xo/contents/docs/work-orders/${WO_ID}.md?ref=main" \
         --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
       if [ -z "$SPEC" ]; then
         GLOB=$(gh api \
-          "repos/bluedevilcollectibles/bdc-xo/contents/docs/superpowers/specs?ref=main" \
+          "repos/thinmansoftware/bdc-xo/contents/docs/superpowers/specs?ref=main" \
           --template "{{range .}}{{if (or (hasPrefix .name \"${WO_ID}\") (and (hasPrefix .name \"2\") (contains .name \"${WO_ID}\")))}}{{.path}}{{\"\\n\"}}{{end}}{{end}}" \
           2>/dev/null | head -1 || true)
         if [ -n "$GLOB" ]; then
-          SPEC=$(gh api "repos/bluedevilcollectibles/bdc-xo/contents/${GLOB}?ref=main" \
+          SPEC=$(gh api "repos/thinmansoftware/bdc-xo/contents/${GLOB}?ref=main" \
             --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
         fi
       fi
@@ -53,12 +53,12 @@ nodes:
         # Fallback 4: GitHub issue body (WO-HARNESS-READ-SPEC-ISSUE-BODY-FALLBACK-01)
         ISSUE_NUM=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'issue=[0-9]+' | head -n 1 | cut -d= -f2 || true)
         if [ -z "$ISSUE_NUM" ]; then
-          ISSUE_NUM=$(gh issue list --repo bluedevilcollectibles/bdc-xo \
+          ISSUE_NUM=$(gh issue list --repo thinmansoftware/bdc-xo \
             --search "${WO_ID} in:title" --json number,title \
             --jq '.[0].number' 2>/dev/null || true)
         fi
         if [ -n "$ISSUE_NUM" ] && [ "$ISSUE_NUM" != "null" ]; then
-          SPEC=$(gh issue view "$ISSUE_NUM" --repo bluedevilcollectibles/bdc-xo \
+          SPEC=$(gh issue view "$ISSUE_NUM" --repo thinmansoftware/bdc-xo \
             --json body --jq .body 2>/dev/null || true)
           [ -n "$SPEC" ] && SPEC_PATH="issues/${ISSUE_NUM}"
         fi
@@ -71,7 +71,7 @@ nodes:
     bash: |
       # best-effort: WO-POS-TERMINAL-SDK-01 must be merged
       EXISTS=$(gh api \
-        "repos/bluedevilcollectibles/shopops/contents/shopops-api/routes/pos-terminal.js?ref=master" \
+        "repos/thinmansoftware/shopops/contents/shopops-api/routes/pos-terminal.js?ref=master" \
         --template '{{.name}}' 2>/dev/null || true)
       if [ -n "$EXISTS" ]; then
         echo "STATUS=ok"
@@ -254,11 +254,11 @@ nodes:
         echo "## Depends on"
         echo "- WO-POS-TERMINAL-SDK-01 (merged + deployed)"
       } > "$BODY"
-      EXIST=$(gh pr list --repo bluedevilcollectibles/shopops --head "$BRANCH" --state open \
+      EXIST=$(gh pr list --repo thinmansoftware/shopops --head "$BRANCH" --state open \
         --json url --template '{{range .}}{{.url}}{{end}}' 2>/dev/null || true)
       if [ -n "$EXIST" ]; then echo "PR_URL=$EXIST"; exit 0; fi
       for i in 1 2 3; do
-        if URL=$(gh pr create --repo bluedevilcollectibles/shopops --base master --head "$BRANCH" \
+        if URL=$(gh pr create --repo thinmansoftware/shopops --base master --head "$BRANCH" \
             --title "feat(infra): WO-POS-TERMINAL-HARDWARE-VALIDATION-01 -- hardware validation scaffold" \
             --body-file "$BODY" 2>&1); then
           echo "PR_URL=$URL"; exit 0
@@ -347,7 +347,7 @@ nodes:
       $read-spec.output
       BDC_NODE_OUTPUT_READ_SPEC
       )
-      ISSUE_REPO="${ISSUE_REPO:-bluedevilcollectibles/bdc-xo}"
+      ISSUE_REPO="${ISSUE_REPO:-thinmansoftware/bdc-xo}"
       ISSUE_NUM=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'issue=[0-9]+' | head -1 | cut -d= -f2 || true)
       if [ -z "$ISSUE_NUM" ]; then
         ISSUE_NUM=$(printf '%s\n' "$READ_SPEC_OUT" | sed -n 's/^SPEC_PATH=.*issues\/\([0-9][0-9]*\).*/\1/p' | head -1)

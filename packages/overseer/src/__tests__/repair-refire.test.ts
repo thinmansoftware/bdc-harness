@@ -55,7 +55,7 @@ function baseAssessInput(
 function sampleSalvage(): OverseerSalvageReceiptV1 {
   return {
     schema_version: 'overseer-salvage-receipt-v1',
-    repository: 'bluedevilcollectibles/bdc-harness',
+    repository: 'thinmansoftware/bdc-harness',
     wo_id: 'WO-TEST-01',
     source_target_kind: 'workflow_run',
     source_target_key: 'run-pred-1',
@@ -201,7 +201,7 @@ function execInput(
     proposal_id: 'prop-1',
     execution_id: 'exec-1',
     idempotency_key: 'idem-1',
-    repository: 'bluedevilcollectibles/bdc-harness',
+    repository: 'thinmansoftware/bdc-harness',
     wo_id: 'WO-TEST-01',
     workflow_name: 'implement',
     target_digest: sha256hex('target'),
@@ -440,7 +440,7 @@ describe('Test 1 - salvage and first refire', () => {
   test('captures salvage before cleanup and runs one successor via startFirstRefire', async () => {
     const orderLog: string[] = [];
     const capInput: CaptureRepairSalvageInput = {
-      repository: 'bluedevilcollectibles/bdc-harness',
+      repository: 'thinmansoftware/bdc-harness',
       wo_id: 'WO-TEST-01',
       source_target_kind: 'workflow_run',
       source_target_key: 'run-pred-1',
@@ -486,7 +486,7 @@ describe('Test 1 - salvage and first refire', () => {
     // Original scope and repository binding are unchanged in the on-ramp request.
     const sentRequest = harness.spies.startFirstRefire.mock
       .calls[0][0] as FirstRefireOnRampRequestV1;
-    expect(sentRequest.repository).toBe('bluedevilcollectibles/bdc-harness');
+    expect(sentRequest.repository).toBe('thinmansoftware/bdc-harness');
     expect(sentRequest.scope_digest).toBe(sha256hex('scope'));
     expect(sentRequest.target_digest).toBe(sha256hex('target'));
     expect(harness.effectLedger.filter(e => e === 'effect_succeeded')).toHaveLength(1);
@@ -753,7 +753,7 @@ describe('salvage receipt and on-ramp result invariants', () => {
     const persistSalvageReceipt = mock(async () => undefined);
 
     const patchInput: CaptureRepairSalvageInput = {
-      repository: 'bluedevilcollectibles/bdc-harness',
+      repository: 'thinmansoftware/bdc-harness',
       wo_id: 'WO-TEST-01',
       source_target_kind: 'workflow_run',
       source_target_key: 'run-pred-1',
@@ -791,7 +791,7 @@ describe('salvage receipt and on-ramp result invariants', () => {
     await expect(
       captureRepairSalvage(
         {
-          repository: 'bluedevilcollectibles/bdc-harness',
+          repository: 'thinmansoftware/bdc-harness',
           wo_id: 'WO-TEST-01',
           source_target_kind: 'workflow_run',
           source_target_key: 'run-pred-1',

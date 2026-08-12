@@ -53,32 +53,32 @@ nodes:
       WO_ID="${WO_ID:-WO-INFRA-AFFILIATE-N8N-STAGING-01}"
       SPEC_PATH="docs/work-orders/${WO_ID}.md"
       SPEC_CONTENT=$(gh api \
-        "repos/bluedevilcollectibles/bdc-xo/contents/${SPEC_PATH}?ref=main" \
+        "repos/thinmansoftware/bdc-xo/contents/${SPEC_PATH}?ref=main" \
         --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
       if [ -z "$SPEC_CONTENT" ]; then
         SPEC_PATH="docs/superpowers/specs/${WO_ID}.md"
         SPEC_CONTENT=$(gh api \
-          "repos/bluedevilcollectibles/bdc-xo/contents/${SPEC_PATH}?ref=main" \
+          "repos/thinmansoftware/bdc-xo/contents/${SPEC_PATH}?ref=main" \
           --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
       fi
       if [ -z "$SPEC_CONTENT" ]; then
         GLOB_PATH=$(gh api \
-          "repos/bluedevilcollectibles/bdc-xo/contents/docs/superpowers/specs?ref=main" \
+          "repos/thinmansoftware/bdc-xo/contents/docs/superpowers/specs?ref=main" \
           --template '{{range .}}{{.path}}{{"\n"}}{{end}}' 2>/dev/null \
           | grep "${WO_ID}.md$" | head -1 || true)
         if [ -n "$GLOB_PATH" ]; then
           SPEC_PATH="$GLOB_PATH"
           SPEC_CONTENT=$(gh api \
-            "repos/bluedevilcollectibles/bdc-xo/contents/${SPEC_PATH}?ref=main" \
+            "repos/thinmansoftware/bdc-xo/contents/${SPEC_PATH}?ref=main" \
             --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
         fi
       fi
       if [ -z "$SPEC_CONTENT" ]; then
-        ISSUE_NUM=$(gh issue list --repo bluedevilcollectibles/bdc-xo \
+        ISSUE_NUM=$(gh issue list --repo thinmansoftware/bdc-xo \
           --search "${WO_ID} in:title" --json number,title \
           --jq '.[0].number' 2>/dev/null || true)
         if [ -n "$ISSUE_NUM" ] && [ "$ISSUE_NUM" != "null" ]; then
-          SPEC_CONTENT=$(gh issue view "$ISSUE_NUM" --repo bluedevilcollectibles/bdc-xo \
+          SPEC_CONTENT=$(gh issue view "$ISSUE_NUM" --repo thinmansoftware/bdc-xo \
             --json body --jq .body 2>/dev/null || true)
           [ -n "$SPEC_CONTENT" ] && SPEC_PATH="issues/${ISSUE_NUM}"
         fi
@@ -477,7 +477,7 @@ nodes:
       echo "PUSH_TARGET=feature-branch:feat/wo-infra-affiliate-n8n-staging-01"
       echo "BASE_BRANCH=main"
       echo "RULE20=false"
-      echo "repo: bluedevilcollectibles/bdc-xo"
+      echo "repo: thinmansoftware/bdc-xo"
 
   - id: commit-and-push
     persona: overseer
@@ -518,7 +518,7 @@ nodes:
     load_bearing: true
     bash: |
       set -euo pipefail
-      REPO="bluedevilcollectibles/bdc-xo"
+      REPO="thinmansoftware/bdc-xo"
       COMMIT_PUSH_OUTPUT=$commit-and-push.output
       UNIQUE_BRANCH=$(printf '%s\n' "$COMMIT_PUSH_OUTPUT" | sed -n 's/^unique_branch=//p' | head -n 1)
       if [ -z "$UNIQUE_BRANCH" ]; then

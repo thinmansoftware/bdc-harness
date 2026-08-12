@@ -24,8 +24,8 @@ function headerValue(init: RequestInit | undefined, name: string): string | null
 
 function codebasesResponse(): Response {
   return Response.json([
-    { id: 'cb-shopops', name: 'bluedevilcollectibles/shopops' },
-    { id: 'cb-harness', name: 'bluedevilcollectibles/bdc-harness' },
+    { id: 'cb-shopops', name: 'thinmansoftware/shopops' },
+    { id: 'cb-harness', name: 'thinmansoftware/bdc-harness' },
   ]);
 }
 

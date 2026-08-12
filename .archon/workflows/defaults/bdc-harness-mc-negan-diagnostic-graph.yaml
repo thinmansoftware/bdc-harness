@@ -15,7 +15,7 @@
 #   R8 codebase pre-flight note below; R9 lives in .archon/workflows/defaults/;
 #   R10 both loops declare prompt+until+max_iterations+fresh_context;
 #   R11 NO n8n webhook nodes; R12 deploy via sync-workflows.sh; R13 ASCII-only no BOM.
-# Pre-flight: codebase bluedevilcollectibles/bdc-harness must be registered in Archon
+# Pre-flight: codebase thinmansoftware/bdc-harness must be registered in Archon
 #   (verify: ssh hetzner-prod "sqlite3 /opt/bdc/archon-data/archon.db \"SELECT name FROM remote_agent_codebases\"")
 #   AND the WO spec must be on bdc-xo origin/main at docs/work-orders/WO-MC-NEGAN-DIAGNOSTIC-GRAPH-01.md
 #   (confirmed present 2026-06-03). Set inputs.NOTION_PAGE_ID before firing (default is a placeholder).
@@ -39,7 +39,7 @@ description: |
 policyFile: harness/policies/agent-behavior.md
 provider: claude
 model: sonnet
-target_repo: bluedevilcollectibles/bdc-harness
+target_repo: thinmansoftware/bdc-harness
 
 # Rule 12 (inputs block): no `type:` field; quote any numeric default.
 # NOTION_PAGE_ID default is a placeholder -- flip-notion fails OPEN (emits XO_ACTION) if
@@ -80,27 +80,27 @@ nodes:
       # Spec lives in bdc-xo (NOT the target codebase). Cross-repo fetch via gh api ?ref=main.
       # Rule 5: docs/work-orders/ direct -> docs/superpowers/specs/ direct -> date-prefix glob -> issue body.
       SPEC_PATH="docs/work-orders/${WO_ID}.md"
-      SPEC_CONTENT=$(gh api "repos/bluedevilcollectibles/bdc-xo/contents/${SPEC_PATH}?ref=main" --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
+      SPEC_CONTENT=$(gh api "repos/thinmansoftware/bdc-xo/contents/${SPEC_PATH}?ref=main" --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
       if [ -z "$SPEC_CONTENT" ]; then
         SPEC_PATH="docs/superpowers/specs/${WO_ID}.md"
-        SPEC_CONTENT=$(gh api "repos/bluedevilcollectibles/bdc-xo/contents/${SPEC_PATH}?ref=main" --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
+        SPEC_CONTENT=$(gh api "repos/thinmansoftware/bdc-xo/contents/${SPEC_PATH}?ref=main" --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
       fi
       if [ -z "$SPEC_CONTENT" ]; then
-        MATCH=$(gh api "repos/bluedevilcollectibles/bdc-xo/contents/docs/superpowers/specs?ref=main" --template '{{range .}}{{.path}}{{"\n"}}{{end}}' 2>/dev/null | grep "${WO_ID}.md$" | head -n 1)
+        MATCH=$(gh api "repos/thinmansoftware/bdc-xo/contents/docs/superpowers/specs?ref=main" --template '{{range .}}{{.path}}{{"\n"}}{{end}}' 2>/dev/null | grep "${WO_ID}.md$" | head -n 1)
         if [ -n "$MATCH" ]; then
           SPEC_PATH="$MATCH"
-          SPEC_CONTENT=$(gh api "repos/bluedevilcollectibles/bdc-xo/contents/${SPEC_PATH}?ref=main" --template '{{.content}}' | tr -d '\n' | base64 -d || true)
+          SPEC_CONTENT=$(gh api "repos/thinmansoftware/bdc-xo/contents/${SPEC_PATH}?ref=main" --template '{{.content}}' | tr -d '\n' | base64 -d || true)
         fi
       fi
       if [ -z "$SPEC_CONTENT" ]; then
         ISSUE_NUM=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'issue=[0-9]+' | head -n 1 | cut -d= -f2 || true)
         if [ -z "$ISSUE_NUM" ]; then
-          ISSUE_NUM=$(gh issue list --repo bluedevilcollectibles/bdc-xo \
+          ISSUE_NUM=$(gh issue list --repo thinmansoftware/bdc-xo \
             --search "${WO_ID} in:title" --json number,title \
             --jq '.[0].number' 2>/dev/null || true)
         fi
         if [ -n "$ISSUE_NUM" ] && [ "$ISSUE_NUM" != "null" ]; then
-          SPEC_CONTENT=$(gh issue view "$ISSUE_NUM" --repo bluedevilcollectibles/bdc-xo \
+          SPEC_CONTENT=$(gh issue view "$ISSUE_NUM" --repo thinmansoftware/bdc-xo \
             --json body --jq .body 2>/dev/null || true)
           [ -n "$SPEC_CONTENT" ] && SPEC_PATH="issues/${ISSUE_NUM}"
         fi
@@ -906,13 +906,13 @@ nodes:
       - Allowlist regex (commit-and-push enforces): ^(feat/[A-Za-z0-9_-]+|fix/[A-Za-z0-9_-]+|wip/[A-Za-z0-9_-]+)$
 
       ## Required Repo Policy
-      Target repo is bluedevilcollectibles/bdc-harness (from the spec target_repo). bdc-harness
+      Target repo is thinmansoftware/bdc-harness (from the spec target_repo). bdc-harness
       is NOT a Rule 20 staging-gate repo, and its integration branch is `dev` (NOT main).
       Output exactly:
       push_target: feature-branch:<spec-derived-branch-name>
       pr_required: true
       staging_gate_required: false
-      repo: bluedevilcollectibles/bdc-harness
+      repo: thinmansoftware/bdc-harness
       base_branch: dev
 
       CRITICAL: emit a `repo:` line and a `base_branch: dev` line in your output.
@@ -1259,7 +1259,7 @@ nodes:
       $read-spec.output
       BDC_NODE_OUTPUT_READ_SPEC
       )
-      ISSUE_REPO="${ISSUE_REPO:-bluedevilcollectibles/bdc-xo}"
+      ISSUE_REPO="${ISSUE_REPO:-thinmansoftware/bdc-xo}"
       ISSUE_NUM=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'issue=[0-9]+' | head -1 | cut -d= -f2 || true)
       if [ -z "$ISSUE_NUM" ]; then
         ISSUE_NUM=$(printf '%s\n' "$READ_SPEC_OUT" | sed -n 's/^SPEC_PATH=.*issues\/\([0-9][0-9]*\).*/\1/p' | head -1)

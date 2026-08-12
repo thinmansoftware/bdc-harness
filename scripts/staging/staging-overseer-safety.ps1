@@ -250,7 +250,7 @@ try {
       mutation_succeeded, fusion_calls_attempted, fusion_calls_succeeded
     ) VALUES ($1, 'v1', $2, $3, $3, 'staging-canary', 'bun', 'local-fixture',
       'dev', $4, $5, 'sha1', $6, 0, 0, 0, 0)`,
-    [snapshotId, "bluedevilcollectibles/bdc-harness", createdAt, "c".repeat(40),
+    [snapshotId, "thinmansoftware/bdc-harness", createdAt, "c".repeat(40),
       "artifacts/" + suffix + ".json", evidenceBlob]
   );
   await db.query(
@@ -261,7 +261,7 @@ try {
       capability, policy_digest, verifier_registry_digest
     ) VALUES ($1, $2, 42, $3, 'dev', $4, $5, $6, $7, 'MERGE', '{}',
       'staging-canary', $8, $9, $10, 'overseer.m31.merge', $11, $12)`,
-    [proposalId, "bluedevilcollectibles/bdc-harness", "d".repeat(40), "c".repeat(40),
+    [proposalId, "thinmansoftware/bdc-harness", "d".repeat(40), "c".repeat(40),
       snapshotId, "artifacts/" + suffix + ".json", evidenceBlob, createdAt, expiresAt,
       executionId, policyDigest, verifierDigest]
   );
@@ -278,7 +278,7 @@ try {
     permit_id: permitId,
     proposal_id: proposalId,
     execution_id: executionId,
-    repository: "bluedevilcollectibles/bdc-harness",
+    repository: "thinmansoftware/bdc-harness",
     pr_number: 42,
     head_sha: "d".repeat(40),
     base_branch: "dev",
@@ -353,7 +353,7 @@ try {
       -e OVERSEER_EMERGENCY_STOP=false `
       -e OVERSEER_DRY_RUN=false `
       -e OVERSEER_USE_FAKE_GITHUB_ADAPTER=1 `
-      -e OVERSEER_FAKE_GITHUB_REPOSITORIES=bluedevilcollectibles/bdc-harness `
+      -e OVERSEER_FAKE_GITHUB_REPOSITORIES=thinmansoftware/bdc-harness `
       -e OVERSEER_MERGE_ACTIONS_ENABLED=true `
       archon-staging bun -e $serviceCanaryJs 2>$null
     if ($serviceCanary -match "LIVE_SERVICE_CANARY_OK:attempts=1:mutation_sent=false:real_calls=0") {

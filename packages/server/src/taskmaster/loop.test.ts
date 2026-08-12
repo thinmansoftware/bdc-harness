@@ -228,13 +228,13 @@ describe('scenario 3: pause stops sends, never watching', () => {
     world.control.pause_actor = 'john';
 
     const staleP1: ThreadSnapshot = {
-      ref: 'gh:bluedevilcollectibles/bdc-harness#11',
+      ref: 'gh:thinmansoftware/bdc-harness#11',
       priority: 'P1',
       lastActivityAt: new Date(T0 - 5 * 3_600_000).toISOString(),
       recipient: 'xo',
     };
     const unclaimedP0: ThreadSnapshot = {
-      ref: 'gh:bluedevilcollectibles/bdc-harness#12',
+      ref: 'gh:thinmansoftware/bdc-harness#12',
       priority: 'P0',
       lastActivityAt: new Date(T0 - 3_600_000).toISOString(),
       isUnclaimedP0: true,
@@ -437,7 +437,7 @@ describe('failed effect reuse and successful-tick health', () => {
     const world = makeWorld();
     seedDigestSent(world);
     const staleThread: ThreadSnapshot = {
-      ref: 'gh:bluedevilcollectibles/bdc-xo#1500',
+      ref: 'gh:thinmansoftware/bdc-xo#1500',
       priority: 'P1',
       lastActivityAt: new Date(T0 - 5 * 3_600_000).toISOString(),
       recipient: 'xo',
@@ -471,7 +471,7 @@ describe('failed effect reuse and successful-tick health', () => {
     const world = makeWorld();
     seedDigestSent(world);
     const staleThread: ThreadSnapshot = {
-      ref: 'gh:bluedevilcollectibles/bdc-xo#1501',
+      ref: 'gh:thinmansoftware/bdc-xo#1501',
       priority: 'P1',
       lastActivityAt: new Date(T0 - 5 * 3_600_000).toISOString(),
       recipient: 'xo',
@@ -541,10 +541,10 @@ describe('SC7 grading requires external source progress', () => {
     world.journal.push({
       id: 'sent-nudge',
       created_at: new Date(T0 - 60_000).toISOString(),
-      thread_ref: 'gh:bluedevilcollectibles/bdc-xo#1450',
+      thread_ref: 'gh:thinmansoftware/bdc-xo#1450',
       action_type: 'nudge',
       proposal_json: '{}',
-      idempotency_key: 'tm:nudge:gh:bluedevilcollectibles/bdc-xo#1450:1',
+      idempotency_key: 'tm:nudge:gh:thinmansoftware/bdc-xo#1450:1',
       before_hash: null,
       proof_predicate: 'source issue progress after send',
       proof_deadline_at: new Date(T0 + 60_000).toISOString(),
@@ -553,7 +553,7 @@ describe('SC7 grading requires external source progress', () => {
       grade: null,
     });
     world.sentMessages.push({
-      idempotency_key: 'tm:nudge:gh:bluedevilcollectibles/bdc-xo#1450:1',
+      idempotency_key: 'tm:nudge:gh:thinmansoftware/bdc-xo#1450:1',
       recipient: 'xo',
       body: 'reminder',
       createdAt: new Date(T0 - 45_000).toISOString(),
@@ -612,11 +612,11 @@ describe('SC7 grading requires external source progress', () => {
   test('a post-send source progress marker makes a nudge useful', async () => {
     const world = makeWorld();
     seedDigestSent(world);
-    const key = 'tm:nudge:gh:bluedevilcollectibles/bdc-xo#1450:1';
+    const key = 'tm:nudge:gh:thinmansoftware/bdc-xo#1450:1';
     world.journal.push({
       id: 'progress-nudge',
       created_at: new Date(T0 - 60_000).toISOString(),
-      thread_ref: 'gh:bluedevilcollectibles/bdc-xo#1450',
+      thread_ref: 'gh:thinmansoftware/bdc-xo#1450',
       action_type: 'nudge',
       proposal_json: '{}',
       idempotency_key: key,
@@ -654,11 +654,11 @@ describe('SC7 grading requires external source progress', () => {
   test('source progress after journal creation but before the actual send is not useful', async () => {
     const world = makeWorld();
     seedDigestSent(world);
-    const key = 'tm:nudge:gh:bluedevilcollectibles/bdc-xo#1451:1';
+    const key = 'tm:nudge:gh:thinmansoftware/bdc-xo#1451:1';
     world.journal.push({
       id: 'pre-send-progress-nudge',
       created_at: new Date(T0 - 60_000).toISOString(),
-      thread_ref: 'gh:bluedevilcollectibles/bdc-xo#1451',
+      thread_ref: 'gh:thinmansoftware/bdc-xo#1451',
       action_type: 'nudge',
       proposal_json: '{}',
       idempotency_key: key,
@@ -755,11 +755,11 @@ describe('SC7 grading requires external source progress', () => {
   test('a cancelled effect is noise and an unchanged P0 source is not useful', async () => {
     const world = makeWorld();
     seedDigestSent(world);
-    const key = 'tm:escalate_p0:gh:bluedevilcollectibles/bdc-xo#1600:1';
+    const key = 'tm:escalate_p0:gh:thinmansoftware/bdc-xo#1600:1';
     world.journal.push({
       id: 'cancelled-escalation',
       created_at: new Date(T0 - 60_000).toISOString(),
-      thread_ref: 'gh:bluedevilcollectibles/bdc-xo#1600',
+      thread_ref: 'gh:thinmansoftware/bdc-xo#1600',
       action_type: 'escalate_p0',
       proposal_json: '{}',
       idempotency_key: key,
@@ -799,11 +799,11 @@ describe('SC7 grading requires external source progress', () => {
   test('a post-send assignment event makes a P0 escalation useful', async () => {
     const world = makeWorld();
     seedDigestSent(world);
-    const key = 'tm:escalate_p0:gh:bluedevilcollectibles/bdc-xo#1601:1';
+    const key = 'tm:escalate_p0:gh:thinmansoftware/bdc-xo#1601:1';
     world.journal.push({
       id: 'assigned-escalation',
       created_at: new Date(T0 - 60_000).toISOString(),
-      thread_ref: 'gh:bluedevilcollectibles/bdc-xo#1601',
+      thread_ref: 'gh:thinmansoftware/bdc-xo#1601',
       action_type: 'escalate_p0',
       proposal_json: '{}',
       idempotency_key: key,
@@ -841,11 +841,11 @@ describe('SC7 grading requires external source progress', () => {
   test('a pre-existing assignee without a post-send event is not useful proof', async () => {
     const world = makeWorld();
     seedDigestSent(world);
-    const key = 'tm:escalate_p0:gh:bluedevilcollectibles/bdc-xo#1602:1';
+    const key = 'tm:escalate_p0:gh:thinmansoftware/bdc-xo#1602:1';
     world.journal.push({
       id: 'preexisting-assignee-escalation',
       created_at: new Date(T0 - 60_000).toISOString(),
-      thread_ref: 'gh:bluedevilcollectibles/bdc-xo#1602',
+      thread_ref: 'gh:thinmansoftware/bdc-xo#1602',
       action_type: 'escalate_p0',
       proposal_json: '{}',
       idempotency_key: key,
@@ -888,7 +888,7 @@ describe('scenario 5: budget ceiling holds', () => {
     const world = makeWorld();
     seedDigestSent(world);
     const threads: ThreadSnapshot[] = Array.from({ length: 25 }, (_, i) => ({
-      ref: `gh:bluedevilcollectibles/bdc-harness#${100 + i}`,
+      ref: `gh:thinmansoftware/bdc-harness#${100 + i}`,
       priority: 'P1' as const,
       lastActivityAt: new Date(T0 - 6 * 3_600_000).toISOString(),
       recipient: 'xo',
@@ -955,7 +955,7 @@ describe('interval env parsing', () => {
 describe('defaultListThreads -- GitHub work-SOR read', () => {
   // Pin the repo list so an operator env var cannot skew the assertions.
   const priorRepos = process.env.TASKMASTER_GH_REPOS;
-  process.env.TASKMASTER_GH_REPOS = 'bluedevilcollectibles/bdc-harness';
+  process.env.TASKMASTER_GH_REPOS = 'thinmansoftware/bdc-harness';
   afterAll(() => {
     if (priorRepos === undefined) delete process.env.TASKMASTER_GH_REPOS;
     else process.env.TASKMASTER_GH_REPOS = priorRepos;
@@ -1015,10 +1015,10 @@ describe('defaultListThreads -- GitHub work-SOR read', () => {
     // arc-only work IS observed; both-label work appears exactly once.
     const refs = threads.map(t => t.ref).sort();
     expect(refs).toEqual([
-      'gh:bluedevilcollectibles/bdc-harness#1',
-      'gh:bluedevilcollectibles/bdc-harness#2',
-      'gh:bluedevilcollectibles/bdc-harness#3',
-      'gh:bluedevilcollectibles/bdc-harness#5',
+      'gh:thinmansoftware/bdc-harness#1',
+      'gh:thinmansoftware/bdc-harness#2',
+      'gh:thinmansoftware/bdc-harness#3',
+      'gh:thinmansoftware/bdc-harness#5',
     ]);
     const p0 = threads.find(t => t.ref.endsWith('#3'));
     expect(p0?.priority).toBe('P0');
@@ -1053,11 +1053,9 @@ describe('defaultListThreads -- GitHub work-SOR read', () => {
       const { urls, fetchImpl } = fakeGithubFetch({});
       await defaultListThreads(fetchImpl);
       expect(urls.length).toBeGreaterThan(0);
-      expect(urls.every(url => url.includes('/repos/bluedevilcollectibles/bdc-xo/issues'))).toBe(
-        true
-      );
+      expect(urls.every(url => url.includes('/repos/thinmansoftware/bdc-xo/issues'))).toBe(true);
     } finally {
-      process.env.TASKMASTER_GH_REPOS = 'bluedevilcollectibles/bdc-harness';
+      process.env.TASKMASTER_GH_REPOS = 'thinmansoftware/bdc-harness';
     }
   });
 
@@ -1097,11 +1095,11 @@ describe('defaultListThreads -- GitHub work-SOR read', () => {
   test('a non-OK evidence response makes the tick unsuccessful', async () => {
     const world = makeWorld();
     seedDigestSent(world);
-    const key = 'tm:nudge:gh:bluedevilcollectibles/bdc-xo#1452:1';
+    const key = 'tm:nudge:gh:thinmansoftware/bdc-xo#1452:1';
     world.journal.push({
       id: 'evidence-read-failure',
       created_at: new Date(T0 - 60_000).toISOString(),
-      thread_ref: 'gh:bluedevilcollectibles/bdc-xo#1452',
+      thread_ref: 'gh:thinmansoftware/bdc-xo#1452',
       action_type: 'nudge',
       proposal_json: '{}',
       idempotency_key: key,
@@ -1140,7 +1138,7 @@ describe('defaultListThreads -- GitHub work-SOR read', () => {
 
     await expect(
       defaultGetGithubIssueEvidence(
-        'gh:bluedevilcollectibles/bdc-xo#1452',
+        'gh:thinmansoftware/bdc-xo#1452',
         new Date(T0 - 30_000).toISOString(),
         fetchImpl
       )
@@ -1151,11 +1149,11 @@ describe('defaultListThreads -- GitHub work-SOR read', () => {
     const world = makeWorld();
     seedDigestSent(world);
     for (const issueNumber of [1453, 1454]) {
-      const key = `tm:nudge:gh:bluedevilcollectibles/bdc-xo#${issueNumber}:1`;
+      const key = `tm:nudge:gh:thinmansoftware/bdc-xo#${issueNumber}:1`;
       world.journal.push({
         id: `low-quota-${issueNumber}`,
         created_at: new Date(T0 - 60_000).toISOString(),
-        thread_ref: `gh:bluedevilcollectibles/bdc-xo#${issueNumber}`,
+        thread_ref: `gh:thinmansoftware/bdc-xo#${issueNumber}`,
         action_type: 'nudge',
         proposal_json: '{}',
         idempotency_key: key,

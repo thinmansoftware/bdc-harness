@@ -1,6 +1,6 @@
 import { z } from 'zod';
 
-const BDC_XO_REPOSITORY = 'bluedevilcollectibles/bdc-xo';
+const BDC_XO_REPOSITORY = 'thinmansoftware/bdc-xo';
 const BDC_XO_BRANCH = 'main';
 const BOARD_MOTION_PREFIX = 'docs/board/motions/';
 const BOARD_APPROVAL_FENCE = 'board-approval-v1';

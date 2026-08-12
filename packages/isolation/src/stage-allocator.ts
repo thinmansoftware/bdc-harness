@@ -89,7 +89,7 @@ export interface StageWorktreeOpts {
   stageId: string;
   /** Codebase database ID (informational; threaded into result) */
   codebaseId: string;
-  /** owner/repo string (e.g. "bluedevilcollectibles/shopops") */
+  /** owner/repo string (e.g. "thinmansoftware/shopops") */
   codebaseName: string;
   /** Absolute, resolved path to the main repo checkout */
   canonicalRepoPath: string;

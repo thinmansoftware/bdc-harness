@@ -7,11 +7,11 @@
 #
 # Usage:
 #   powershell -File scripts/staging/register-codebases.ps1
-#   powershell -File scripts/staging/register-codebases.ps1 -Repos bluedevilcollectibles/shopops
+#   powershell -File scripts/staging/register-codebases.ps1 -Repos thinmansoftware/shopops
 
 [CmdletBinding()]
 param(
-  [string[]]$Repos = @("bluedevilcollectibles/bdc-harness", "bluedevilcollectibles/bdc-xo")
+  [string[]]$Repos = @("thinmansoftware/bdc-harness", "thinmansoftware/bdc-xo")
 )
 
 $ErrorActionPreference = "Stop"

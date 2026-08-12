@@ -48,10 +48,10 @@ afterEach(async () => {
 describe('tm_journal DAL', () => {
   test('recordAction writes a row-first pending entry and updateActionOutcome flips it', async () => {
     const row = await recordAction({
-      thread_ref: 'gh:bluedevilcollectibles/bdc-harness#1',
+      thread_ref: 'gh:thinmansoftware/bdc-harness#1',
       action_type: 'nudge',
       proposal_json: '{"type":"nudge"}',
-      idempotency_key: 'tm:nudge:gh:bluedevilcollectibles/bdc-harness#1:1',
+      idempotency_key: 'tm:nudge:gh:thinmansoftware/bdc-harness#1:1',
       before_hash: 'abc',
       proof_predicate: 'dispatch row exists',
       proof_deadline_at: new Date(Date.now() + 86_400_000).toISOString(),
@@ -91,10 +91,10 @@ describe('tm_journal DAL', () => {
       'CREATE UNIQUE INDEX uq_tm_journal_idempotency_test ON tm_journal(idempotency_key) WHERE idempotency_key IS NOT NULL'
     );
     const input = {
-      thread_ref: 'gh:bluedevilcollectibles/bdc-xo#1450',
+      thread_ref: 'gh:thinmansoftware/bdc-xo#1450',
       action_type: 'nudge' as const,
       proposal_json: '{"type":"nudge"}',
-      idempotency_key: 'tm:nudge:gh:bluedevilcollectibles/bdc-xo#1450:1',
+      idempotency_key: 'tm:nudge:gh:thinmansoftware/bdc-xo#1450:1',
       outcome: 'pending' as const,
     };
 

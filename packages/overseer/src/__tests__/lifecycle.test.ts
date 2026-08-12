@@ -117,14 +117,14 @@ function targetBinding(
   overrides: Partial<LifecycleTargetBindingV1> = {}
 ): LifecycleTargetBindingV1 {
   return {
-    repository: 'bluedevilcollectibles/bdc-harness',
+    repository: 'thinmansoftware/bdc-harness',
     target_kind: 'pull_request',
     target_key: 'pr:101',
     target_digest: DIGEST_A,
     snapshot_id: 'snapshot-1',
     target: {
       target_kind: 'pull_request',
-      repository: 'bluedevilcollectibles/bdc-harness',
+      repository: 'thinmansoftware/bdc-harness',
       pr_number: 101,
       provider_node_id: 'PR_node_101',
       head_sha: 'a'.repeat(40),
@@ -153,7 +153,7 @@ function lineage(overrides: Partial<LifecycleLineageEvidenceV1> = {}): Lifecycle
 function salvage(overrides: Partial<OverseerSalvageReceiptV1> = {}): OverseerSalvageReceiptV1 {
   return {
     schema_version: 'overseer-salvage-receipt-v1',
-    repository: 'bluedevilcollectibles/bdc-harness',
+    repository: 'thinmansoftware/bdc-harness',
     wo_id: 'WO-TEST-LIFECYCLE',
     source_target_kind: 'pull_request',
     source_target_key: 'pr:100',
@@ -240,7 +240,7 @@ function permit(
     permit_id: `permit-${proposalId}`,
     proposal_id: proposalId,
     execution_id: `exec-${proposalId}`,
-    repository: 'bluedevilcollectibles/bdc-harness',
+    repository: 'thinmansoftware/bdc-harness',
     target: targetBinding().target,
     target_key: 'pr:101',
     target_digest: DIGEST_A,
@@ -441,7 +441,7 @@ describe('lifecycle execution', () => {
     const order: string[] = [];
     const requests: unknown[] = [];
     const adapter = createLifecycleMutationAdapter({
-      allowed_repositories: ['bluedevilcollectibles/bdc-harness'],
+      allowed_repositories: ['thinmansoftware/bdc-harness'],
       allowed_actions: ['COMMENT'],
       async consume_execution() {
         return true;
@@ -471,7 +471,7 @@ describe('lifecycle execution', () => {
         schema_version: 'overseer-injected-action-policy-request-v1',
         proposal_id: 'proposal-comment',
         execution_id: 'exec-proposal-comment',
-        repository: 'bluedevilcollectibles/bdc-harness',
+        repository: 'thinmansoftware/bdc-harness',
         target_kind: 'pull_request',
         target_key: 'pr:101',
         target_digest: DIGEST_A,
@@ -503,7 +503,7 @@ describe('lifecycle execution', () => {
   test('verified duplicate close preserves membership evidence and emits one result receipt', async () => {
     const order: string[] = [];
     const adapter = createLifecycleMutationAdapter({
-      allowed_repositories: ['bluedevilcollectibles/bdc-harness'],
+      allowed_repositories: ['thinmansoftware/bdc-harness'],
       allowed_actions: ['CLOSE'],
       async consume_execution() {
         order.push('adapter');
@@ -539,7 +539,7 @@ describe('lifecycle execution', () => {
       external_effect_reference: result.external_effect_reference,
       permit_id: boundPermit.permit_id,
       execution_id: boundPermit.execution_id,
-      repository: 'bluedevilcollectibles/bdc-harness',
+      repository: 'thinmansoftware/bdc-harness',
       target_kind: 'pull_request',
       target_key: 'pr:101',
       target_digest: DIGEST_A,
@@ -591,7 +591,7 @@ describe('lifecycle execution', () => {
   test('mistaken close reopens same fake target and links corrective evidence', async () => {
     const order: string[] = [];
     const adapter = createLifecycleMutationAdapter({
-      allowed_repositories: ['bluedevilcollectibles/bdc-harness'],
+      allowed_repositories: ['thinmansoftware/bdc-harness'],
       allowed_actions: ['REOPEN'],
       async consume_execution() {
         order.push('adapter');
@@ -613,7 +613,7 @@ describe('lifecycle execution', () => {
   test('comment label and assign execute through one allowlisted fake mutation each', async () => {
     for (const action of ['COMMENT', 'LABEL', 'ASSIGN'] as const) {
       const adapter = createLifecycleMutationAdapter({
-        allowed_repositories: ['bluedevilcollectibles/bdc-harness'],
+        allowed_repositories: ['thinmansoftware/bdc-harness'],
         allowed_actions: [action],
         async consume_execution() {
           return true;
@@ -807,7 +807,7 @@ describe('lifecycle execution', () => {
 
     const persistenceOrder: string[] = [];
     const acceptedAdapter = createLifecycleMutationAdapter({
-      allowed_repositories: ['bluedevilcollectibles/bdc-harness'],
+      allowed_repositories: ['thinmansoftware/bdc-harness'],
       allowed_actions: ['COMMENT'],
       async consume_execution() {
         return true;
@@ -852,7 +852,7 @@ describe('lifecycle execution', () => {
       },
     };
     const adapter = createLifecycleMutationAdapter({
-      allowed_repositories: ['bluedevilcollectibles/bdc-harness'],
+      allowed_repositories: ['thinmansoftware/bdc-harness'],
       allowed_actions: ['COMMENT'],
       async consume_execution() {
         return true;
@@ -967,7 +967,7 @@ describe('salvage verification and floors', () => {
       external_effect_reference: 'fake://close',
       permit_id: boundPermit.permit_id,
       execution_id: boundPermit.execution_id,
-      repository: 'bluedevilcollectibles/bdc-harness',
+      repository: 'thinmansoftware/bdc-harness',
       target_kind: 'pull_request',
       target_key: 'pr:101',
       target_digest: DIGEST_A,

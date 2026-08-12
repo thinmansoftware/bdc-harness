@@ -3,7 +3,7 @@ description: |
   Tailored child workflow for WO-HARNESS-ASCII-AUTOFIX-01.
   Use when: implementing the ascii-autofix node that mechanically normalizes deterministic
   non-ASCII (em-dash, smart quotes, ellipsis, nbsp, unicode minus, arrows) before the gate.
-  Target repo: bluedevilcollectibles/bdc-harness (dev branch).
+  Target repo: thinmansoftware/bdc-harness (dev branch).
   Class: INFRA. No Rule 20 staging gate.
 
 policyFile: harness/policies/agent-behavior.md
@@ -42,27 +42,27 @@ nodes:
         exit 1
       fi
       SPEC_PATH="docs/work-orders/${WO_ID}.md"
-      SPEC_CONTENT=$(gh api "repos/bluedevilcollectibles/bdc-xo/contents/${SPEC_PATH}?ref=main" --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
+      SPEC_CONTENT=$(gh api "repos/thinmansoftware/bdc-xo/contents/${SPEC_PATH}?ref=main" --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
       if [ -z "$SPEC_CONTENT" ]; then
         SPEC_PATH="docs/superpowers/specs/${WO_ID}.md"
-        SPEC_CONTENT=$(gh api "repos/bluedevilcollectibles/bdc-xo/contents/${SPEC_PATH}?ref=main" --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
+        SPEC_CONTENT=$(gh api "repos/thinmansoftware/bdc-xo/contents/${SPEC_PATH}?ref=main" --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
       fi
       if [ -z "$SPEC_CONTENT" ]; then
-        MATCH=$(gh api "repos/bluedevilcollectibles/bdc-xo/contents/docs/superpowers/specs?ref=main" --template '{{range .}}{{.path}}{{"\n"}}{{end}}' 2>/dev/null | grep "${WO_ID}.md$" | head -n 1)
+        MATCH=$(gh api "repos/thinmansoftware/bdc-xo/contents/docs/superpowers/specs?ref=main" --template '{{range .}}{{.path}}{{"\n"}}{{end}}' 2>/dev/null | grep "${WO_ID}.md$" | head -n 1)
         if [ -n "$MATCH" ]; then
           SPEC_PATH="$MATCH"
-          SPEC_CONTENT=$(gh api "repos/bluedevilcollectibles/bdc-xo/contents/${SPEC_PATH}?ref=main" --template '{{.content}}' | tr -d '\n' | base64 -d || true)
+          SPEC_CONTENT=$(gh api "repos/thinmansoftware/bdc-xo/contents/${SPEC_PATH}?ref=main" --template '{{.content}}' | tr -d '\n' | base64 -d || true)
         fi
       fi
       if [ -z "$SPEC_CONTENT" ]; then
         ISSUE_NUM=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'issue=[0-9]+' | head -n 1 | cut -d= -f2 || true)
         if [ -z "$ISSUE_NUM" ]; then
-          ISSUE_NUM=$(gh issue list --repo bluedevilcollectibles/bdc-xo \
+          ISSUE_NUM=$(gh issue list --repo thinmansoftware/bdc-xo \
             --search "${WO_ID} in:title" --json number,title \
             --jq '.[0].number' 2>/dev/null || true)
         fi
         if [ -n "$ISSUE_NUM" ] && [ "$ISSUE_NUM" != "null" ]; then
-          SPEC_CONTENT=$(gh issue view "$ISSUE_NUM" --repo bluedevilcollectibles/bdc-xo \
+          SPEC_CONTENT=$(gh issue view "$ISSUE_NUM" --repo thinmansoftware/bdc-xo \
             --json body --jq .body 2>/dev/null || true)
           [ -n "$SPEC_CONTENT" ] && SPEC_PATH="issues/${ISSUE_NUM}"
         fi
@@ -172,7 +172,7 @@ nodes:
       - Staging gate required
 
       ## BDC Push Policy
-      Target repo: bluedevilcollectibles/bdc-harness (NOT a Rule 20 staging-gate repo).
+      Target repo: thinmansoftware/bdc-harness (NOT a Rule 20 staging-gate repo).
       Use a feature branch plus PR, base branch dev, no staging gate.
 
       ## Spec
@@ -1080,12 +1080,12 @@ nodes:
       - Valid pattern: ^(feat/[A-Za-z0-9_-]+|fix/[A-Za-z0-9_-]+|wip/[A-Za-z0-9_-]+)$
 
       ## Required Repo Policy
-      Target repo: bluedevilcollectibles/bdc-harness. This is NOT a Rule 20 staging-gate
+      Target repo: thinmansoftware/bdc-harness. This is NOT a Rule 20 staging-gate
       repo. Output:
         push_target: feature-branch:feat/wo-harness-ascii-autofix-01
         pr_required: true
         staging_gate_required: false
-        repo: bluedevilcollectibles/bdc-harness
+        repo: thinmansoftware/bdc-harness
 
       CRITICAL: You MUST emit a `repo:` line in every output case.
 
@@ -1443,7 +1443,7 @@ nodes:
       $read-spec.output
       BDC_NODE_OUTPUT_READ_SPEC
       )
-      ISSUE_REPO="${ISSUE_REPO:-bluedevilcollectibles/bdc-xo}"
+      ISSUE_REPO="${ISSUE_REPO:-thinmansoftware/bdc-xo}"
       ISSUE_NUM=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'issue=[0-9]+' | head -1 | cut -d= -f2 || true)
       if [ -z "$ISSUE_NUM" ]; then
         ISSUE_NUM=$(printf '%s\n' "$READ_SPEC_OUT" | sed -n 's/^SPEC_PATH=.*issues\/\([0-9][0-9]*\).*/\1/p' | head -1)

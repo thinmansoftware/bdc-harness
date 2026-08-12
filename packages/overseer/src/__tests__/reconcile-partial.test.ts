@@ -26,7 +26,7 @@ Reconcile-Skip: ${stem}`,
       {
         woId: stem,
         action: RECONCILE_SKIP_ACTION,
-        result: 'https://github.com/bluedevilcollectibles/bdc-harness/pull/404:abc123merge',
+        result: 'https://github.com/thinmansoftware/bdc-harness/pull/404:abc123merge',
       },
     ]);
   });
@@ -45,7 +45,7 @@ Reconcile-Skip: ${stem}`,
       {
         woId: stem,
         action: RECONCILE_ACTION,
-        result: 'https://github.com/bluedevilcollectibles/bdc-harness/pull/404:abc123merge',
+        result: 'https://github.com/thinmansoftware/bdc-harness/pull/404:abc123merge',
       },
     ]);
   });

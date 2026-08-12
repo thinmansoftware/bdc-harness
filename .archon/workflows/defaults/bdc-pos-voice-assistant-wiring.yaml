@@ -2,7 +2,7 @@
 # Source pattern: bdc-ce-regression-suite.yaml + WO-POS-TERMINAL-SDK-01.yaml
 # Doctrine compliance: 13 hard rules of archon-yaml-authoring
 #
-# Pre-flight: codebases bluedevilcollectibles/shopops + bluedevilcollectibles/lspro-react
+# Pre-flight: codebases thinmansoftware/shopops + thinmansoftware/lspro-react
 #   registered in Archon. VOICE_BRIDGE is local-machine deploy (G10 box, no CI) --
 #   VOICE_BRIDGE patches are produced as a diff file in the manifest for John to
 #   apply manually.
@@ -23,7 +23,7 @@ description: |
         VOICE_BRIDGE patch file (pos-context.ts + prompt composer) as manifest artifact
         for John to apply locally. Rule 19 runtime-verify. Builds MIXED manifest.
         Flips Notion to REVIEW.
-  Repo: bluedevilcollectibles/shopops (primary CWD), bluedevilcollectibles/lspro-react
+  Repo: thinmansoftware/shopops (primary CWD), thinmansoftware/lspro-react
         (sibling clone). VOICE_BRIDGE = manual deploy via patch file.
   parallel_ok: true (pos_voice_log is isolated new table).
 
@@ -38,15 +38,15 @@ nodes:
       WO_ID="${WO_ID:-WO-POS-VOICE-ASSISTANT-WIRING-01}"
       # gh --template uses Go templates (built-in to gh, no external jq dependency)
       SPEC=$(gh api \
-        "repos/bluedevilcollectibles/bdc-xo/contents/docs/work-orders/${WO_ID}.md?ref=main" \
+        "repos/thinmansoftware/bdc-xo/contents/docs/work-orders/${WO_ID}.md?ref=main" \
         --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
       if [ -z "$SPEC" ]; then
         GLOB=$(gh api \
-          "repos/bluedevilcollectibles/bdc-xo/contents/docs/superpowers/specs?ref=main" \
+          "repos/thinmansoftware/bdc-xo/contents/docs/superpowers/specs?ref=main" \
           --template "{{range .}}{{if (or (hasPrefix .name \"${WO_ID}\") (and (hasPrefix .name \"2\") (contains .name \"${WO_ID}\")))}}{{.path}}{{\"\\n\"}}{{end}}{{end}}" \
           2>/dev/null | head -1 || true)
         if [ -n "$GLOB" ]; then
-          SPEC=$(gh api "repos/bluedevilcollectibles/bdc-xo/contents/${GLOB}?ref=main" \
+          SPEC=$(gh api "repos/thinmansoftware/bdc-xo/contents/${GLOB}?ref=main" \
             --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
         fi
       fi
@@ -54,12 +54,12 @@ nodes:
         # Fallback 4: GitHub issue body (WO-HARNESS-READ-SPEC-ISSUE-BODY-FALLBACK-01)
         ISSUE_NUM=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'issue=[0-9]+' | head -n 1 | cut -d= -f2 || true)
         if [ -z "$ISSUE_NUM" ]; then
-          ISSUE_NUM=$(gh issue list --repo bluedevilcollectibles/bdc-xo \
+          ISSUE_NUM=$(gh issue list --repo thinmansoftware/bdc-xo \
             --search "${WO_ID} in:title" --json number,title \
             --jq '.[0].number' 2>/dev/null || true)
         fi
         if [ -n "$ISSUE_NUM" ] && [ "$ISSUE_NUM" != "null" ]; then
-          SPEC=$(gh issue view "$ISSUE_NUM" --repo bluedevilcollectibles/bdc-xo \
+          SPEC=$(gh issue view "$ISSUE_NUM" --repo thinmansoftware/bdc-xo \
             --json body --jq .body 2>/dev/null || true)
           [ -n "$SPEC" ] && SPEC_PATH="issues/${ISSUE_NUM}"
         fi
@@ -177,7 +177,7 @@ nodes:
       prompt: |
         Implement lspro-react half of WO-POS-VOICE-ASSISTANT-WIRING-01.
 
-          git -C /tmp clone --depth=10 https://github.com/bluedevilcollectibles/lspro-react.git lspro-react
+          git -C /tmp clone --depth=10 https://github.com/thinmansoftware/lspro-react.git lspro-react
           cd /tmp/lspro-react
           git checkout -b wo/pos-voice-assistant-wiring-01-ui
 
@@ -284,11 +284,11 @@ nodes:
         echo "- Modified: index.js (mount /pos/voice)"
         echo "- Manifest artifact: voice-bridge-patch.diff (apply on G10 manually)"
       } > "$BODY"
-      EXIST=$(gh pr list --repo bluedevilcollectibles/shopops --head "$BRANCH" --state open \
+      EXIST=$(gh pr list --repo thinmansoftware/shopops --head "$BRANCH" --state open \
         --json url --template '{{range .}}{{.url}}{{end}}' 2>/dev/null || true)
       if [ -n "$EXIST" ]; then echo "SHOPOPS_PR=$EXIST"; exit 0; fi
       for i in 1 2 3; do
-        if URL=$(gh pr create --repo bluedevilcollectibles/shopops --base master --head "$BRANCH" \
+        if URL=$(gh pr create --repo thinmansoftware/shopops --base master --head "$BRANCH" \
             --title "feat(api): WO-POS-VOICE-ASSISTANT-WIRING-01 -- pos-voice + SSE" \
             --body-file "$BODY" 2>&1); then
           echo "SHOPOPS_PR=$URL"; exit 0
@@ -313,11 +313,11 @@ nodes:
       git push -u origin "$BRANCH"
       BODY=$(mktemp)
       printf '## Summary\nImplements WO-POS-VOICE-ASSISTANT-WIRING-01 (lspro-react half).\n\nVercel staging: https://staging.livesellerpro.app/pos\n' > "$BODY"
-      EXIST=$(gh pr list --repo bluedevilcollectibles/lspro-react --head "$BRANCH" --state open \
+      EXIST=$(gh pr list --repo thinmansoftware/lspro-react --head "$BRANCH" --state open \
         --json url --template '{{range .}}{{.url}}{{end}}' 2>/dev/null || true)
       if [ -n "$EXIST" ]; then echo "LSPRO_PR=$EXIST"; exit 0; fi
       for i in 1 2 3; do
-        if URL=$(gh pr create --repo bluedevilcollectibles/lspro-react --base main --head "$BRANCH" \
+        if URL=$(gh pr create --repo thinmansoftware/lspro-react --base main --head "$BRANCH" \
             --title "feat(pos): WO-POS-VOICE-ASSISTANT-WIRING-01 -- voice state UI" \
             --body-file "$BODY" 2>&1); then
           echo "LSPRO_PR=$URL"; exit 0
@@ -405,7 +405,7 @@ nodes:
       $read-spec.output
       BDC_NODE_OUTPUT_READ_SPEC
       )
-      ISSUE_REPO="${ISSUE_REPO:-bluedevilcollectibles/bdc-xo}"
+      ISSUE_REPO="${ISSUE_REPO:-thinmansoftware/bdc-xo}"
       ISSUE_NUM=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'issue=[0-9]+' | head -1 | cut -d= -f2 || true)
       if [ -z "$ISSUE_NUM" ]; then
         ISSUE_NUM=$(printf '%s\n' "$READ_SPEC_OUT" | sed -n 's/^SPEC_PATH=.*issues\/\([0-9][0-9]*\).*/\1/p' | head -1)

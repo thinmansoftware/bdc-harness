@@ -36,7 +36,7 @@ const VERIFIER_DIGEST = 'b'.repeat(64);
 function proposal(): M31ActionProposal {
   return {
     proposal_id: 'proposal-service-1',
-    repository: 'bluedevilcollectibles/bdc-harness',
+    repository: 'thinmansoftware/bdc-harness',
     pr_number: 42,
     head_sha: 'c'.repeat(40),
     base_branch: 'dev',
@@ -114,7 +114,7 @@ async function seedPersistentPermit(
       $5, 'sha1', $6, 0, 0, 0, 0)`,
     [
       snapshotId,
-      'bluedevilcollectibles/bdc-harness',
+      'thinmansoftware/bdc-harness',
       createdAt,
       'a'.repeat(40),
       `artifacts/${suffix}.json`,
@@ -131,7 +131,7 @@ async function seedPersistentPermit(
       $9, $10, $11, $12, $13, $14)`,
     [
       proposalId,
-      'bluedevilcollectibles/bdc-harness',
+      'thinmansoftware/bdc-harness',
       'c'.repeat(40),
       'a'.repeat(40),
       snapshotId,
@@ -159,7 +159,7 @@ async function seedPersistentPermit(
     permit_id: `permit-${suffix}`,
     proposal_id: proposalId,
     execution_id: executionId,
-    repository: 'bluedevilcollectibles/bdc-harness',
+    repository: 'thinmansoftware/bdc-harness',
     pr_number: 42,
     head_sha: 'c'.repeat(40),
     base_branch: 'dev',
@@ -177,7 +177,7 @@ function enableFakeCapability(capability: 'merge' | 'escalation'): void {
   process.env.OVERSEER_EMERGENCY_STOP = 'false';
   process.env.OVERSEER_DRY_RUN = 'false';
   process.env.OVERSEER_USE_FAKE_GITHUB_ADAPTER = '1';
-  process.env.OVERSEER_FAKE_GITHUB_REPOSITORIES = 'bluedevilcollectibles/bdc-harness';
+  process.env.OVERSEER_FAKE_GITHUB_REPOSITORIES = 'thinmansoftware/bdc-harness';
   for (const name of ['ESCALATION', 'REPAIR', 'BRANCH', 'LIFECYCLE', 'MERGE']) {
     process.env[`OVERSEER_${name}_ACTIONS_ENABLED`] = 'false';
   }

@@ -118,7 +118,7 @@ const snapshot: CanarySnapshotResponse = {
   observedAt: '2026-07-10T12:00:00.000Z',
   codebase: {
     id: 'codebase-1',
-    canonicalRemote: 'bluedevilcollectibles/bdc-harness',
+    canonicalRemote: 'thinmansoftware/bdc-harness',
     defaultCwd: '/workspace/bdc-harness',
     baseBranch: 'dev',
     baseSha: 'a'.repeat(40),

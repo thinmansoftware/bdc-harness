@@ -38,7 +38,7 @@ function baseInput(overrides: Partial<ActivationPackageInput> = {}): ActivationP
     },
     emergency_stop: true,
     allowlists: {
-      repositories: ['bluedevilcollectibles/bdc-harness'],
+      repositories: ['thinmansoftware/bdc-harness'],
       adapters: ['fake'],
     },
     rollback: {
@@ -115,7 +115,7 @@ describe('activation-package', () => {
       lifecycle: false,
       merge: false,
     });
-    expect(deploy.allowlists.repositories).toContain('bluedevilcollectibles/bdc-harness');
+    expect(deploy.allowlists.repositories).toContain('thinmansoftware/bdc-harness');
     expect(deploy.backup_and_rollback.evidence_retained).toBe(true);
     expect(deploy.health.watcher_count).toBe(1);
     expect(deploy.operator_notice.length).toBeGreaterThan(0);

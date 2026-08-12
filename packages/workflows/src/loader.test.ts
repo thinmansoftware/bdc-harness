@@ -2860,11 +2860,11 @@ nodes:
     it('parseWorkflow round-trips target_repo', async () => {
       const workflowDir = join(testDir, '.archon', 'workflows');
       await mkdir(workflowDir, { recursive: true });
-      const yaml = `name: repo-guard\ndescription: Cross-repo guard test\ntarget_repo: bluedevilcollectibles/bdc-xo\nnodes:\n  - id: n\n    prompt: Do something\n`;
+      const yaml = `name: repo-guard\ndescription: Cross-repo guard test\ntarget_repo: thinmansoftware/bdc-xo\nnodes:\n  - id: n\n    prompt: Do something\n`;
       await writeFile(join(workflowDir, 'repo-guard.yaml'), yaml);
       const result = await discoverWorkflows(testDir, { loadDefaults: false });
       expect(result.workflows).toHaveLength(1);
-      expect(result.workflows[0].workflow.target_repo).toBe('bluedevilcollectibles/bdc-xo');
+      expect(result.workflows[0].workflow.target_repo).toBe('thinmansoftware/bdc-xo');
     });
 
     it('parseWorkflow without target_repo leaves field undefined', async () => {
@@ -2925,7 +2925,7 @@ nodes:
     const runAuthorityYaml = [
       'run_authority:',
       '  required: true',
-      '  spec_repository: bluedevilcollectibles/bdc-xo',
+      '  spec_repository: thinmansoftware/bdc-xo',
       '  spec_revision: main',
       '  spec_paths:',
       '    - docs/work-orders/{WO_ID}.md',
@@ -2941,7 +2941,7 @@ nodes:
       expect(result.workflows).toHaveLength(1);
       expect(result.workflows[0].workflow.run_authority).toEqual({
         required: true,
-        spec_repository: 'bluedevilcollectibles/bdc-xo',
+        spec_repository: 'thinmansoftware/bdc-xo',
         spec_revision: 'main',
         spec_paths: ['docs/work-orders/{WO_ID}.md'],
         allow_issue_fallback: true,
