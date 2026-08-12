@@ -23,10 +23,12 @@
 import type { Logger } from '@archon/paths';
 import {
   classifyError,
+  classifyUsageCapSignature,
   decide,
   permitFromMetadata,
   runAuthorizedEscalation,
   runEscalation,
+  scheduleUsageCapRequeue,
   type Decision,
 } from '@archon/overseer';
 import type { WorkflowRun, NodeOutput } from './schemas/workflow-run.ts';
@@ -122,6 +124,12 @@ export async function handleNodeFailure(
     threadCommitsAhead: ctx.threadCommitsAhead,
     hasOriginBranch: ctx.hasOriginBranch,
   });
+  const usageCapDetected =
+    errorClass === 'validator_sdk_contradiction' &&
+    classifyUsageCapSignature({
+      message: ctx.errorMsg,
+      validatorOutput: ctx.validatorOutput,
+    });
 
   const result = decide({
     errorClass,
@@ -130,6 +138,7 @@ export async function handleNodeFailure(
     nodeId: node.id,
     validatorOutput: ctx.validatorOutput,
     woId: ctx.woId,
+    usageCapDetected,
   });
 
   // Observability -- Mission Control "Workflow Decisions" tab will consume this when
@@ -207,6 +216,21 @@ export async function handleNodeFailure(
   // so existing v1 escalate paths (out_of_credits, auth_failed, etc.) are unaffected.
   //
   if (result.decision === 'escalate' && result.escalationContext) {
+    if (usageCapDetected && ctx.woId) {
+      scheduleUsageCapRequeue({
+        woId: ctx.woId,
+        runId: workflowRun.id,
+        repository:
+          typeof workflowRun.metadata.targetRepo === 'string'
+            ? workflowRun.metadata.targetRepo
+            : 'bluedevilcollectibles/bdc-harness',
+      }).catch((err: Error) => {
+        deps.log.error(
+          { err, workflowRunId: workflowRun.id, nodeId: node.id },
+          'overseer.usage_cap_requeue_schedule_failed'
+        );
+      });
+    }
     if (!persistedActionableEvent) {
       deps.log.info(
         { runId: workflowRun.id, nodeId: node.id, errorClass },

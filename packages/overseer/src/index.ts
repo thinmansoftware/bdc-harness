@@ -21,7 +21,7 @@
  * logic so future workflows don't bolt that intelligence into each persona prompt.
  */
 
-export { classifyError } from './classify';
+export { classifyError, classifyUsageCapSignature } from './classify';
 export type { ErrorClass, ClassifyInput } from './classify';
 
 export { decide } from './decide';
@@ -29,7 +29,18 @@ export type { Decision, DecideInput, DecisionResult } from './decide';
 
 export { runAuthorizedEscalation } from './authorized-escalation';
 export { parseM31ActionPermit, permitFromMetadata } from './permit';
-export { buildDispatchRunReportBody, lookupNotionPageId, runEscalation } from './escalate';
+export {
+  buildDispatchRunReportBody,
+  lookupNotionPageId,
+  runEscalation,
+  USAGE_CAP_RECOVERABLE_CLASSIFICATION,
+} from './escalate';
+export { scheduleUsageCapRequeue } from './actions/usage-cap-requeue';
+export type {
+  UsageCapRequeueDeps,
+  UsageCapRequeueInput,
+  UsageCapRequeueResult,
+} from './actions/usage-cap-requeue';
 export type { EscalationContext, EscalationSourceEvent } from './escalate';
 export {
   buildOperatorCard,

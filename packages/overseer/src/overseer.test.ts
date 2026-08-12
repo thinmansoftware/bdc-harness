@@ -1,9 +1,16 @@
 import { describe, test, expect } from 'bun:test';
-import { classifyError } from './classify.ts';
+import { classifyError, classifyUsageCapSignature } from './classify.ts';
 import { decide } from './decide.ts';
 import type { ErrorClass } from './classify.ts';
 
 describe('classifyError -- workflow-runtime classes (BDC 2026-05-16)', () => {
+  test('usage-cap SDK contradiction is detected from failure evidence', () => {
+    const input = {
+      message: "Node 'opus-rereview' failed: SDK returned success; You've hit your session limit",
+    };
+    expect(classifyError(input)).toBe('validator_sdk_contradiction');
+    expect(classifyUsageCapSignature(input)).toBe(true);
+  });
   test('sentinel_mismatch: loop node + SDK returned success message', () => {
     expect(
       classifyError({
@@ -382,6 +389,18 @@ describe('decide -- workflow-runtime classes', () => {
     expect(r.escalationContext?.errorClass).toBe('validator_sdk_contradiction');
     expect(r.escalationContext?.nodeId).toBe('war-council-validator');
     expect(r.escalationContext?.woId).toBe('WO-TEST-01');
+    expect(r.escalationContext?.governanceClassification).toBeUndefined();
+  });
+
+  test('usage-cap contradiction receives a distinct recoverable governance classification', () => {
+    const r = decide({
+      errorClass: 'validator_sdk_contradiction',
+      attempt: 1,
+      woId: 'WO-USAGE-01',
+      usageCapDetected: true,
+    });
+    expect(r.decision).toBe('escalate');
+    expect(r.escalationContext?.governanceClassification).toBe('usage-cap-recoverable');
   });
 });
 

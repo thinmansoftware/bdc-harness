@@ -39,6 +39,8 @@ import type { ErrorClass } from './classify.ts';
 
 const log = createLogger('overseer/escalate');
 
+export const USAGE_CAP_RECOVERABLE_CLASSIFICATION = 'usage-cap-recoverable' as const;
+
 /**
  * Structured payload accepted by runEscalation. Mirrors the loose shape of
  * DecisionResult.escalationContext but adds runtime-only fields (runId, timestamp,

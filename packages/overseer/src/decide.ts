@@ -13,6 +13,7 @@
  */
 
 import type { ErrorClass } from './classify.ts';
+import { USAGE_CAP_RECOVERABLE_CLASSIFICATION } from './escalate';
 
 export type Decision = 'retry' | 'skip' | 'commit_and_push_anyway' | 'escalate' | 'merge_ready';
 
@@ -32,6 +33,8 @@ export interface DecideInput {
   validatorOutput?: string;
   /** Optional WO ID parsed from the user message -- surfaced into escalationContext. */
   woId?: string;
+  /** The SDK contradiction also carried the confirmed Claude session-limit marker. */
+  usageCapDetected?: boolean;
 }
 
 export interface DecisionResult {
@@ -84,7 +87,7 @@ function extractRemediation(validatorOutput: string | undefined): string[] | und
  * Returns "escalate" for unknown classes (preserve old behavior -- don't auto-recover unknowns).
  */
 export function decide(input: DecideInput): DecisionResult {
-  const { errorClass, attempt, hasOutput, validatorOutput, woId, nodeId } = input;
+  const { errorClass, attempt, hasOutput, validatorOutput, woId, nodeId, usageCapDetected } = input;
 
   switch (errorClass) {
     case 'rate_limit_exceeded':
@@ -268,14 +271,18 @@ export function decide(input: DecideInput): DecisionResult {
       // commit_and_push_anyway -- so a validator glitch can never silently bypass the QA gate.
       return {
         decision: 'escalate',
-        reason:
-          'Anthropic SDK returned a success/error contradiction on a non-loop node -- provider-side glitch (bdc-harness#344), not a defect in the WO diff',
+        reason: usageCapDetected
+          ? 'Claude session usage cap caused an SDK success/error contradiction -- record a headroom-gated requeue for operator action'
+          : 'Anthropic SDK returned a success/error contradiction on a non-loop node -- provider-side glitch (bdc-harness#344), not a defect in the WO diff',
         escalationContext: {
           errorClass: 'validator_sdk_contradiction',
           nodeId,
           woId,
           validatorOutput,
           remediation: extractRemediation(validatorOutput),
+          ...(usageCapDetected
+            ? { governanceClassification: USAGE_CAP_RECOVERABLE_CLASSIFICATION }
+            : {}),
         },
       };
 

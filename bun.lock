@@ -145,6 +145,7 @@
       "dependencies": {
         "@archon/core": "workspace:*",
         "@archon/fusion": "workspace:*",
+        "@archon/git": "workspace:*",
         "@archon/paths": "workspace:*",
         "@archon/workflows": "workspace:*",
         "@octokit/rest": "^22.0.0",

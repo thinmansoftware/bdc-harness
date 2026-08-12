@@ -73,6 +73,12 @@ export interface ClassifyInput {
   hasOriginBranch?: boolean;
 }
 
+/** Detect the session-limit marker that makes an SDK contradiction usage-cap recoverable. */
+export function classifyUsageCapSignature(input: ClassifyInput): boolean {
+  const evidence = `${input.message ?? ''}\n${input.validatorOutput ?? ''}`;
+  return /you(?:'|’)?ve hit your session limit/i.test(evidence);
+}
+
 /**
  * Classify a workflow failure into a known error class.
  * Returns "unknown" for unrecognized errors (caller decides what to do -- usually escalate).
