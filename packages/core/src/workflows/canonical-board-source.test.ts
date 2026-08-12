@@ -43,7 +43,7 @@ function motionWithApproval(extra = ''): string {
 
 function frozen(text: string): FrozenCanonicalBoardMotion {
   return {
-    repository: 'bluedevilcollectibles/bdc-xo',
+    repository: 'thinmansoftware/bdc-xo',
     path: 'docs/board/motions/M-20260712-27-dispatch-board-motion-and-execution-claim.md',
     commit_sha: 'abcdefabcdefabcdefabcdefabcdefabcdefabcd',
     blob_sha: 'blob-sha',

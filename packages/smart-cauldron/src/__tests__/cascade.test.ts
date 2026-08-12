@@ -586,7 +586,7 @@ describe('Test 5: FRONTIER gate-fail -> SPEC-REPAIR (not plain blocked)', () => 
           evidence: ctx.evidence,
           failReason: ctx.failReason,
         });
-        return { posted: true, issueRepo: 'bluedevilcollectibles/bdc-xo', issueNumber: 42 };
+        return { posted: true, issueRepo: 'thinmansoftware/bdc-xo', issueNumber: 42 };
       },
       writeRecord: async (record, _dir) => `/tmp/cascade-record-${record.cascadeId}.json`,
     };

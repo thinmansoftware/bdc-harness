@@ -32,7 +32,7 @@ import {
   type RegisterM31SnapshotInput,
 } from './merge-steward';
 
-const REPO = 'bluedevilcollectibles/bdc-harness';
+const REPO = 'thinmansoftware/bdc-harness';
 const T0 = '2026-07-14T00:00:00.000Z';
 
 function hex(len: number, seed: string): string {

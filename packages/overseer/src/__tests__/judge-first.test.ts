@@ -34,7 +34,7 @@ function makeRecord(overrides: Partial<WatchedRunRecord> = {}): WatchedRunRecord
   return {
     runId: 'run-1',
     woId: 'WO-TEST-01',
-    owner: 'bluedevilcollectibles',
+    owner: 'thinmansoftware',
     repo: 'bdc-harness',
     status: 'completed',
     headBranch: 'feat/test-branch',
@@ -475,7 +475,7 @@ describe('handleRecordJudgeFirst: pipeline (continued)', () => {
         checks: { total: 3, passed: 3, failed: 0, pending: 0 },
         mergeable: true,
         headSha: 'abc123',
-        pr: { owner: 'bluedevilcollectibles', repo: 'bdc-harness', number: 42 },
+        pr: { owner: 'thinmansoftware', repo: 'bdc-harness', number: 42 },
       },
     });
     await handleRecordJudgeFirst(record, deps, {
@@ -506,7 +506,7 @@ describe('handleRecordJudgeFirst: pipeline (continued)', () => {
         checks: { total: 1, passed: 1, failed: 0, pending: 0 },
         mergeable: true,
         headSha: 'def456',
-        pr: { owner: 'bluedevilcollectibles', repo: 'bdc-harness', number: 43 },
+        pr: { owner: 'thinmansoftware', repo: 'bdc-harness', number: 43 },
       },
     });
     await handleRecordJudgeFirst(record, deps, {
@@ -548,7 +548,7 @@ describe('handleRecordJudgeFirst: pipeline (continued)', () => {
         state: 'open',
         checks: { total: 1, passed: 1, failed: 0, pending: 0 },
         mergeable: false,
-        pr: { owner: 'bluedevilcollectibles', repo: 'bdc-harness', number: 44 },
+        pr: { owner: 'thinmansoftware', repo: 'bdc-harness', number: 44 },
       },
     });
     await handleRecordJudgeFirst(record, deps, {
@@ -577,7 +577,7 @@ describe('handleRecordJudgeFirst: pipeline (continued)', () => {
         state: 'open',
         checks: { total: 1, passed: 1, failed: 0, pending: 0 },
         mergeable: false,
-        pr: { owner: 'bluedevilcollectibles', repo: 'bdc-harness', number: 44 },
+        pr: { owner: 'thinmansoftware', repo: 'bdc-harness', number: 44 },
       },
     });
     await handleRecordJudgeFirst(record, deps, {

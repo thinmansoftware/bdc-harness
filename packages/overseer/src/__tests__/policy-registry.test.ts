@@ -29,7 +29,7 @@ interface TupleInput {
 }
 
 const BASE_TUPLE: TupleInput = {
-  owner: 'bluedevilcollectibles',
+  owner: 'thinmansoftware',
   repository: 'bdc-harness',
   base_branch: 'dev',
   resulting_deployment_effect: 'none',
@@ -77,7 +77,7 @@ describe('policy-registry loader', () => {
     // (schema, digest, effect scope) rather than just bumping the count.
     expect(registry.entries).toHaveLength(1);
     const only = registry.entries[0];
-    expect(only?.owner).toBe('bluedevilcollectibles');
+    expect(only?.owner).toBe('thinmansoftware');
     expect(only?.repository).toBe('bdc-harness');
     expect(only?.resulting_deployment_effect).toBe('staging');
     expect(only?.allowed_action_kinds).toEqual(['MERGE']);
@@ -258,7 +258,7 @@ describe('findMergePolicyTuple', () => {
     const registry = loadSynthetic();
     const found = findMergePolicyTuple({
       registry,
-      owner: 'bluedevilcollectibles',
+      owner: 'thinmansoftware',
       repository: 'bdc-harness',
       base_branch: 'dev',
       resulting_deployment_effect: 'none',
@@ -280,7 +280,7 @@ describe('findMergePolicyTuple', () => {
     ]) {
       const found = findMergePolicyTuple({
         registry,
-        owner: 'bluedevilcollectibles',
+        owner: 'thinmansoftware',
         repository: 'bdc-harness',
         base_branch: 'dev',
         resulting_deployment_effect: 'none',
@@ -296,7 +296,7 @@ describe('findMergePolicyTuple', () => {
     const registry = loadOverseerActionPolicyRegistry({ text: registryText([]) });
     const found = findMergePolicyTuple({
       registry,
-      owner: 'bluedevilcollectibles',
+      owner: 'thinmansoftware',
       repository: 'bdc-harness',
       base_branch: 'dev',
       resulting_deployment_effect: 'none',

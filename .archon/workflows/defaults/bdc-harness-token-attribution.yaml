@@ -8,14 +8,14 @@
 #   plus live-article Rule 15 (target_repo authoritative).
 #
 # CODEBASE BINDING (Rule 15 -- target_repo is authoritative):
-#   target_repo: bluedevilcollectibles/bdc-harness is declared at root and binds the worktree.
+#   target_repo: thinmansoftware/bdc-harness is declared at root and binds the worktree.
 #   The name prefix bdc-harness- ALSO maps to bdc-harness (WORKFLOW_CODEBASE_PREFIXES), so
 #   prefix and target_repo agree -- no Rule 28 mismatch. This is a SELF-TARGETING workflow
 #   (the harness builds the harness). The worktree IS the bdc-harness clone; CWD = repo root;
 #   packages/workflows and packages/server are relative to it (Rule 4).
 #
 # Pre-flight (operator verifies BEFORE fire):
-#   1. Codebase bluedevilcollectibles/bdc-harness registered in Archon:
+#   1. Codebase thinmansoftware/bdc-harness registered in Archon:
 #      ssh hetzner-prod "sqlite3 /opt/bdc/archon-data/archon.db \"SELECT name FROM remote_agent_codebases;\""
 #   2. WO spec committed + pushed to bdc-xo main BEFORE fire (read-spec fetches via gh api ?ref=main).
 #      Spec lives at docs/work-orders/WO-HARNESS-TOKEN-ATTRIBUTION-01.md -- verified on disk 2026-06-03;
@@ -53,14 +53,14 @@ description: |
     - Cross-model diff-review (Codex) before the irreversible commit.
     - Commits, pushes a feature branch, opens a PR to bdc-harness dev.
     - Flips Notion to REVIEW (NEVER DONE) with the v2 manifest in Notes.
-  Repo: bluedevilcollectibles/bdc-harness (binds via target_repo + bdc-harness- name prefix).
+  Repo: thinmansoftware/bdc-harness (binds via target_repo + bdc-harness- name prefix).
   WO Class: CODE. NO migration. NO web/UI. provider.ts MUST stay untouched.
   parallel_ok: false (touches the shared execution layer of the harness itself).
 
 policyFile: harness/policies/agent-behavior.md
 provider: claude
 model: sonnet
-target_repo: bluedevilcollectibles/bdc-harness
+target_repo: thinmansoftware/bdc-harness
 
 inputs:
   WO_ID:
@@ -90,29 +90,29 @@ nodes:
       # Specs live in bdc-xo on main (NOT the worktree, which is bdc-harness). Cross-repo via gh api.
       # Rule 5: try docs/work-orders/ direct, then date-prefix glob in docs/superpowers/specs/.
       SPEC_CONTENT=$(gh api \
-        "repos/bluedevilcollectibles/bdc-xo/contents/docs/work-orders/${WO_ID}.md?ref=main" \
+        "repos/thinmansoftware/bdc-xo/contents/docs/work-orders/${WO_ID}.md?ref=main" \
         --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
       if [ -z "$SPEC_CONTENT" ]; then
         SPEC_CONTENT=$(gh api \
-          "repos/bluedevilcollectibles/bdc-xo/contents/docs/superpowers/specs/${WO_ID}.md?ref=main" \
+          "repos/thinmansoftware/bdc-xo/contents/docs/superpowers/specs/${WO_ID}.md?ref=main" \
           --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
       fi
       if [ -z "$SPEC_CONTENT" ]; then
         GLOB_PATH=$(gh api \
-          "repos/bluedevilcollectibles/bdc-xo/contents/docs/superpowers/specs?ref=main" \
+          "repos/thinmansoftware/bdc-xo/contents/docs/superpowers/specs?ref=main" \
           --template '{{range .}}{{.path}}{{"\n"}}{{end}}' 2>/dev/null \
           | grep "${WO_ID}.md$" | head -1 || true)
         if [ -n "$GLOB_PATH" ]; then
           SPEC_CONTENT=$(gh api \
-            "repos/bluedevilcollectibles/bdc-xo/contents/${GLOB_PATH}?ref=main" \
+            "repos/thinmansoftware/bdc-xo/contents/${GLOB_PATH}?ref=main" \
             --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
         fi
       fi
       if [ -z "$SPEC_CONTENT" ]; then
-        ISSUE_NUM=$(gh issue list --repo bluedevilcollectibles/bdc-xo \
+        ISSUE_NUM=$(gh issue list --repo thinmansoftware/bdc-xo \
           --search "${WO_ID} in:title" --json number --jq '.[0].number' 2>/dev/null || true)
         if [ -n "$ISSUE_NUM" ] && [ "$ISSUE_NUM" != "null" ]; then
-          SPEC_CONTENT=$(gh issue view "$ISSUE_NUM" --repo bluedevilcollectibles/bdc-xo \
+          SPEC_CONTENT=$(gh issue view "$ISSUE_NUM" --repo thinmansoftware/bdc-xo \
             --json body --jq .body 2>/dev/null || true)
         fi
       fi
@@ -306,7 +306,7 @@ nodes:
       until: COMPLETE
       max_iterations: 5
       prompt: |
-        Implement WO-HARNESS-TOKEN-ATTRIBUTION-01 in bluedevilcollectibles/bdc-harness.
+        Implement WO-HARNESS-TOKEN-ATTRIBUTION-01 in thinmansoftware/bdc-harness.
         CWD = repo root (the bdc-harness worktree). This is a CODE WO that EXTENDS the existing
         cost-persistence path to ALSO persist TOKENS. It is NOT a rewrite.
 
@@ -666,7 +666,7 @@ nodes:
     bash: |
       set -euo pipefail
       WO_ID="${WO_ID:-WO-HARNESS-TOKEN-ATTRIBUTION-01}"
-      REPO="bluedevilcollectibles/bdc-harness"
+      REPO="thinmansoftware/bdc-harness"
       BRANCH="$(git rev-parse --abbrev-ref HEAD)"
       # bdc-harness INTEGRATION branch is dev (NOT main). PR base = dev.
       BASE="dev"
@@ -748,7 +748,7 @@ nodes:
       $read-spec.output
       BDC_NODE_OUTPUT_READ_SPEC
       )
-      ISSUE_REPO="${ISSUE_REPO:-bluedevilcollectibles/bdc-xo}"
+      ISSUE_REPO="${ISSUE_REPO:-thinmansoftware/bdc-xo}"
       ISSUE_NUM=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'issue=[0-9]+' | head -1 | cut -d= -f2 || true)
       if [ -z "$ISSUE_NUM" ]; then
         ISSUE_NUM=$(printf '%s\n' "$READ_SPEC_OUT" | sed -n 's/^SPEC_PATH=.*issues\/\([0-9][0-9]*\).*/\1/p' | head -1)

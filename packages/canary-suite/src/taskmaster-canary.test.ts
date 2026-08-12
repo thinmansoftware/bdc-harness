@@ -11,7 +11,7 @@ import {
 } from './taskmaster-canary';
 
 const NOW = Date.parse('2026-08-11T12:00:00.000Z');
-const REPO = 'bluedevilcollectibles/bdc-xo';
+const REPO = 'thinmansoftware/bdc-xo';
 const ISSUE = 777;
 const PREFIX = `tm:nudge:gh:${REPO}#${ISSUE}:`;
 const databases: Database[] = [];

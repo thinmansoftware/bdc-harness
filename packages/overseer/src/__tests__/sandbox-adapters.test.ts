@@ -22,7 +22,7 @@ import type { OverseerActionPolicy } from '../action-policy';
 import type { OverseerSalvageReceiptV1 } from '../actions/lifecycle';
 
 const H = (value: string): string => createHash('sha256').update(value).digest('hex');
-const OWNER = 'bluedevilcollectibles';
+const OWNER = 'thinmansoftware';
 const REPOSITORY = 'bdc-harness';
 const FULL_NAME = `${OWNER}/${REPOSITORY}`;
 const PROVIDER_REPOSITORY_ID = 'R_sandbox_123';

@@ -8,7 +8,7 @@ const rawManifestSchema = z.object({
   environment: z.object({
     id: z.literal('hetzner-production'),
     project: z.literal('bdc-harness'),
-    canonical_remote: z.literal('bluedevilcollectibles/bdc-harness'),
+    canonical_remote: z.literal('thinmansoftware/bdc-harness'),
     base_branch: z.literal('dev'),
   }),
   artifact_root: z.string().trim().min(1),

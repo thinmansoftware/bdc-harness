@@ -250,7 +250,7 @@ export async function handleNodeFailure(
           repository:
             typeof workflowRun.metadata.targetRepo === 'string'
               ? workflowRun.metadata.targetRepo
-              : 'bluedevilcollectibles/bdc-harness',
+              : 'thinmansoftware/bdc-harness',
         },
         {
           sourceEventId: persistedActionableEvent.id,

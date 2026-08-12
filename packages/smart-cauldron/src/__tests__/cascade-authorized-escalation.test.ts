@@ -46,7 +46,7 @@ async function withPersistentPermit(
       ) VALUES ('snapshot-cascade-valid', 'v1', $1, $2, $2, 'test', 'test',
         'unit-test', 'dev', $3, 'artifacts/cascade-valid.json', 'sha1', $4,
         0, 0, 0, 0)`,
-      ['bluedevilcollectibles/bdc-harness', createdAt, 'a'.repeat(40), 'b'.repeat(40)]
+      ['thinmansoftware/bdc-harness', createdAt, 'a'.repeat(40), 'b'.repeat(40)]
     );
     await db.query(
       `INSERT INTO overseer_m31_action_proposals (
@@ -59,7 +59,7 @@ async function withPersistentPermit(
         'STAGING_MUTATION', '{}', 'test', $5, $6, 'execution-cascade-valid',
         'overseer.m31.staging_mutation', $7, $8)`,
       [
-        'bluedevilcollectibles/bdc-harness',
+        'thinmansoftware/bdc-harness',
         'c'.repeat(40),
         'a'.repeat(40),
         'b'.repeat(40),
@@ -80,7 +80,7 @@ async function withPersistentPermit(
       permit_id: 'permit-cascade-valid',
       proposal_id: 'proposal-cascade-valid',
       execution_id: 'execution-cascade-valid',
-      repository: 'bluedevilcollectibles/bdc-harness',
+      repository: 'thinmansoftware/bdc-harness',
       pr_number: 42,
       head_sha: 'c'.repeat(40),
       base_branch: 'dev',

@@ -41,7 +41,7 @@ function policy(overrides: Partial<OverseerActionPolicy> = {}): OverseerActionPo
 function proposal(overrides: Partial<M31ActionProposal> = {}): M31ActionProposal {
   return {
     proposal_id: 'proposal-1',
-    repository: 'bluedevilcollectibles/bdc-harness',
+    repository: 'thinmansoftware/bdc-harness',
     pr_number: 42,
     head_sha: 'c'.repeat(40),
     base_branch: 'dev',
@@ -398,7 +398,7 @@ describe('evaluateActionPolicy', () => {
       allowed: true,
       reason: 'allowed',
       capability: 'merge',
-      repository: 'bluedevilcollectibles/bdc-harness',
+      repository: 'thinmansoftware/bdc-harness',
       pr_number: 42,
       head_sha: 'c'.repeat(40),
       base_branch: 'dev',

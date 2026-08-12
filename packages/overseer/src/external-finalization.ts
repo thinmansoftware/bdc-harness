@@ -237,7 +237,7 @@ export function finalizeExternalEvidence(
     },
     emergency_stop: true,
     allowlists: {
-      repositories: ['bluedevilcollectibles/bdc-harness'],
+      repositories: ['thinmansoftware/bdc-harness'],
       adapters: ['fake-github'],
     },
     rollback: {

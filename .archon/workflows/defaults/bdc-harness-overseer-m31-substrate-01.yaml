@@ -1,7 +1,7 @@
 name: bdc-harness-overseer-m31-substrate-01
 description: |
   Use when: Executing WO-HARNESS-OVERSEER-M31-SUBSTRATE-01 (M-42 Slice 2) in
-  bluedevilcollectibles/bdc-harness -- the immutable M-31 evidence, proposal, and
+  thinmansoftware/bdc-harness -- the immutable M-31 evidence, proposal, and
   single-use permit substrate.
   Input: WO_ID is baked in at root; no user message required at fire time.
   Does: Reads the WO spec, plans a surgical implementation, implements + self-verifies,
@@ -50,16 +50,16 @@ nodes:
       fi
       # Specs live in bdc-xo (NOT the target codebase). Cross-repo fetch via gh api.
       SPEC_PATH="docs/work-orders/${WO_ID}.md"
-      SPEC_CONTENT=$(gh api "repos/bluedevilcollectibles/bdc-xo/contents/${SPEC_PATH}?ref=main" --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
+      SPEC_CONTENT=$(gh api "repos/thinmansoftware/bdc-xo/contents/${SPEC_PATH}?ref=main" --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
       if [ -z "$SPEC_CONTENT" ]; then
         SPEC_PATH="docs/superpowers/specs/${WO_ID}.md"
-        SPEC_CONTENT=$(gh api "repos/bluedevilcollectibles/bdc-xo/contents/${SPEC_PATH}?ref=main" --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
+        SPEC_CONTENT=$(gh api "repos/thinmansoftware/bdc-xo/contents/${SPEC_PATH}?ref=main" --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
       fi
       if [ -z "$SPEC_CONTENT" ]; then
-        MATCH=$(gh api "repos/bluedevilcollectibles/bdc-xo/contents/docs/superpowers/specs?ref=main" --template '{{range .}}{{.path}}{{"\n"}}{{end}}' 2>/dev/null | grep "${WO_ID}.md$" | head -n 1 || true)
+        MATCH=$(gh api "repos/thinmansoftware/bdc-xo/contents/docs/superpowers/specs?ref=main" --template '{{range .}}{{.path}}{{"\n"}}{{end}}' 2>/dev/null | grep "${WO_ID}.md$" | head -n 1 || true)
         if [ -n "$MATCH" ]; then
           SPEC_PATH="$MATCH"
-          SPEC_CONTENT=$(gh api "repos/bluedevilcollectibles/bdc-xo/contents/${SPEC_PATH}?ref=main" --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
+          SPEC_CONTENT=$(gh api "repos/thinmansoftware/bdc-xo/contents/${SPEC_PATH}?ref=main" --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
         fi
       fi
       if [ -z "$SPEC_CONTENT" ]; then
@@ -95,10 +95,10 @@ nodes:
 
       ## BDC Push Policy
       Hardcoded Rule 20 staging-gate repos:
-      - bluedevilcollectibles/lspro-react
-      - bluedevilcollectibles/shopops-storefront
-      - bluedevilcollectibles/shopops
-      The target of this WO is bluedevilcollectibles/bdc-harness, which is NOT a
+      - thinmansoftware/lspro-react
+      - thinmansoftware/shopops-storefront
+      - thinmansoftware/shopops
+      The target of this WO is thinmansoftware/bdc-harness, which is NOT a
       staging-gate repo: use a feature branch plus PR WITHOUT the staging gate.
 
       ## Scope discipline (M-42 Slice 2)
@@ -293,7 +293,7 @@ nodes:
       The engine appends a unique -thread-<hash> suffix at push time; emit the BASE name only.
 
       ## Repo policy
-      Target repository: bluedevilcollectibles/bdc-harness. This repo is NOT in the Rule 20
+      Target repository: thinmansoftware/bdc-harness. This repo is NOT in the Rule 20
       staging-gate list (lspro-react, shopops-storefront, shopops), so the PR targets the
       repo default branch (no --base staging).
 
@@ -301,7 +301,7 @@ nodes:
         push_target: feature-branch:feat/wo-harness-overseer-m31-substrate-01
         pr_required: true
         staging_gate_required: false
-        repo: bluedevilcollectibles/bdc-harness
+        repo: thinmansoftware/bdc-harness
 
   - id: commit-and-push
     persona: overseer

@@ -17,7 +17,7 @@ import {
 import type { OverseerActionPolicyRegistry } from '../policy-registry';
 import type { SandboxExecutionContextV1 } from '../adapters/sandbox-types';
 
-const OWNER = 'bluedevilcollectibles';
+const OWNER = 'thinmansoftware';
 const REPOSITORY = 'bdc-harness';
 const FULL_NAME = `${OWNER}/${REPOSITORY}`;
 const PROVIDER_REPOSITORY_ID = 'R_sandbox_cauldron_refire';

@@ -27,7 +27,7 @@ function payload(overrides: Partial<M42Slice8BManifestPayload> = {}): M42Slice8B
     mode: 'fake',
     candidate_sha: SHA_A,
     starting_sha: SHA_B,
-    repository_full_name: 'bluedevilcollectibles/bdc-harness',
+    repository_full_name: 'thinmansoftware/bdc-harness',
     provider_repository_id: 'R_sandbox_123',
     credential_principal_id: 'principal-sandbox-only-1234',
     image_digest: DIGEST,
@@ -62,7 +62,7 @@ function deps(
   return {
     expected_candidate_sha: SHA_A,
     expected_starting_sha: SHA_B,
-    expected_repository_full_name: 'bluedevilcollectibles/bdc-harness',
+    expected_repository_full_name: 'thinmansoftware/bdc-harness',
     expected_provider_repository_id: 'R_sandbox_123',
     nowMs: () => nowValues[Math.min(nowIndex++, nowValues.length - 1)] ?? 0,
     executionStore: new InMemoryM42Slice8BExecutionStore(),
@@ -170,7 +170,7 @@ describe('M-42 Slice 8B canary runner scenarios', () => {
 
   test('wrong repository name or immutable ID performs zero calls', async () => {
     const executor = recordingExecutor();
-    const bad = envelope(payload({ repository_full_name: 'bluedevilcollectibles/other' }));
+    const bad = envelope(payload({ repository_full_name: 'thinmansoftware/other' }));
     const receipt = await runM42Slice8BCanary(bad, deps(executor.actions));
     expect(receipt.stop_reason).toBe('manifest_refused');
     expect(executor.calls()).toEqual([]);

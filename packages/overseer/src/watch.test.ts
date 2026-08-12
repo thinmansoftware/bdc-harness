@@ -20,7 +20,7 @@ const mergedPrEvidence: PullRequestEvidence = {
   state: 'merged',
   checks: { total: 1, passed: 1, failed: 0, pending: 0 },
   mergeable: false,
-  pr: { owner: 'bluedevilcollectibles', repo: 'bdc-harness', number: 505 },
+  pr: { owner: 'thinmansoftware', repo: 'bdc-harness', number: 505 },
 };
 
 const mergeReadyPrEvidence: PullRequestEvidence = {
@@ -28,13 +28,13 @@ const mergeReadyPrEvidence: PullRequestEvidence = {
   state: 'open',
   checks: { total: 1, passed: 1, failed: 0, pending: 0 },
   mergeable: true,
-  pr: { owner: 'bluedevilcollectibles', repo: 'bdc-harness', number: 506 },
+  pr: { owner: 'thinmansoftware', repo: 'bdc-harness', number: 506 },
 };
 
 const failedRun: OverseerRunRecord = {
   id: 'run-417c3299',
   woId: 'WO-HARNESS-PRECOMMIT-LINTSTAGED-YAML-DEP-FIX-01',
-  owner: 'bluedevilcollectibles',
+  owner: 'thinmansoftware',
   repo: 'bdc-harness',
   status: 'failed',
   headBranch: 'wo/precommit-lintstaged-yaml-dep-fix-01',
@@ -80,7 +80,7 @@ describe('watch head-branch recovery', () => {
     const runWithoutBranch: OverseerRunRecord = {
       id: 'run-no-branch',
       woId: 'WO-RECOVER-01',
-      owner: 'bluedevilcollectibles',
+      owner: 'thinmansoftware',
       repo: 'bdc-harness',
       status: 'completed',
       // No headBranch -- the real-world shape.
@@ -112,7 +112,7 @@ describe('watch head-branch recovery', () => {
     const runWithoutBranch: OverseerRunRecord = {
       id: 'run-no-branch-no-event',
       woId: 'WO-NO-RECOVER-01',
-      owner: 'bluedevilcollectibles',
+      owner: 'thinmansoftware',
       repo: 'bdc-harness',
       status: 'completed',
     };

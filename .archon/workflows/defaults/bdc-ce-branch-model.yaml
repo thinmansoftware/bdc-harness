@@ -6,7 +6,7 @@ description: |
         adds GitHub branch protection (PRs required + CE regression check placeholder),
         commits CE governance doc references + PR templates, opens nothing (this is an infra WO),
         flips Notion to REVIEW with manifest.
-  Repo: bluedevilcollectibles/lspro-react (target). Spec lives in bluedevilcollectibles/bdc-xo (cross-repo read).
+  Repo: thinmansoftware/lspro-react (target). Spec lives in thinmansoftware/bdc-xo (cross-repo read).
   NOT for: any other WO. This workflow is bound to WO-RELEASE-CE-BRANCH-MODEL-01.
 
 policyFile: harness/policies/agent-behavior.md
@@ -26,33 +26,33 @@ nodes:
       fi
       # Spec lives in bdc-xo at docs/superpowers/specs/ce-release-branch/work-orders/<WO_ID>.md
       SPEC_PATH="docs/superpowers/specs/ce-release-branch/work-orders/${WO_ID}.md"
-      SPEC_CONTENT=$(gh api "repos/bluedevilcollectibles/bdc-xo/contents/${SPEC_PATH}?ref=main" --jq .content 2>/dev/null | base64 -d 2>/dev/null || true)
+      SPEC_CONTENT=$(gh api "repos/thinmansoftware/bdc-xo/contents/${SPEC_PATH}?ref=main" --jq .content 2>/dev/null | base64 -d 2>/dev/null || true)
       if [ -z "$SPEC_CONTENT" ]; then
         # Fallback: look for date-prefixed file in flat specs dir
-        MATCH=$(gh api "repos/bluedevilcollectibles/bdc-xo/contents/docs/superpowers/specs?ref=main" --jq ".[] | select(.name | endswith(\"${WO_ID}.md\")) | .path" | head -n 1)
+        MATCH=$(gh api "repos/thinmansoftware/bdc-xo/contents/docs/superpowers/specs?ref=main" --jq ".[] | select(.name | endswith(\"${WO_ID}.md\")) | .path" | head -n 1)
         if [ -n "$MATCH" ]; then
           SPEC_PATH="$MATCH"
-          SPEC_CONTENT=$(gh api "repos/bluedevilcollectibles/bdc-xo/contents/${SPEC_PATH}?ref=main" --jq .content 2>/dev/null | base64 -d 2>/dev/null || true)
+          SPEC_CONTENT=$(gh api "repos/thinmansoftware/bdc-xo/contents/${SPEC_PATH}?ref=main" --jq .content 2>/dev/null | base64 -d 2>/dev/null || true)
         fi
       fi
       if [ -z "$SPEC_CONTENT" ]; then
         # Fallback 4: GitHub issue body (WO-HARNESS-READ-SPEC-ISSUE-BODY-FALLBACK-01)
         ISSUE_NUM=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'issue=[0-9]+' | head -n 1 | cut -d= -f2 || true)
         if [ -z "$ISSUE_NUM" ]; then
-          ISSUE_NUM=$(gh issue list --repo bluedevilcollectibles/bdc-xo \
+          ISSUE_NUM=$(gh issue list --repo thinmansoftware/bdc-xo \
             --search "${WO_ID} in:title" --json number,title \
             --jq '.[0].number' 2>/dev/null || true)
         fi
         if [ -n "$ISSUE_NUM" ] && [ "$ISSUE_NUM" != "null" ]; then
-          SPEC_CONTENT=$(gh issue view "$ISSUE_NUM" --repo bluedevilcollectibles/bdc-xo \
+          SPEC_CONTENT=$(gh issue view "$ISSUE_NUM" --repo thinmansoftware/bdc-xo \
             --json body --jq .body 2>/dev/null || true)
           [ -n "$SPEC_CONTENT" ] && SPEC_PATH="issues/${ISSUE_NUM}"
         fi
       fi
       if [ -z "$SPEC_CONTENT" ]; then echo "Spec not found (tried docs/work-orders/, docs/superpowers/specs/ direct, date-prefix glob, and GitHub issue search)" >&2; exit 1; fi
       # Also fetch the architecture + governance docs (single source of truth for branch policy)
-      ARCH_CONTENT=$(gh api "repos/bluedevilcollectibles/bdc-xo/contents/docs/superpowers/specs/ce-release-branch/docs/CE-RELEASE-BRANCH-ARCHITECTURE-v1.md?ref=main" --jq .content 2>/dev/null | base64 -d 2>/dev/null || true)
-      GOV_CONTENT=$(gh api "repos/bluedevilcollectibles/bdc-xo/contents/docs/superpowers/specs/ce-release-branch/docs/CE-BRANCH-GOVERNANCE.md?ref=main" --jq .content 2>/dev/null | base64 -d 2>/dev/null || true)
+      ARCH_CONTENT=$(gh api "repos/thinmansoftware/bdc-xo/contents/docs/superpowers/specs/ce-release-branch/docs/CE-RELEASE-BRANCH-ARCHITECTURE-v1.md?ref=main" --jq .content 2>/dev/null | base64 -d 2>/dev/null || true)
+      GOV_CONTENT=$(gh api "repos/thinmansoftware/bdc-xo/contents/docs/superpowers/specs/ce-release-branch/docs/CE-BRANCH-GOVERNANCE.md?ref=main" --jq .content 2>/dev/null | base64 -d 2>/dev/null || true)
       printf 'WO_ID=%s\nSPEC_PATH=bdc-xo:%s\nWORKFLOW_ID=%s\n\n' "$WO_ID" "$SPEC_PATH" "$WORKFLOW_ID"
       printf -- '--- SPEC ---\n%s\n\n' "$SPEC_CONTENT"
       printf -- '--- ARCHITECTURE v1 ---\n%s\n\n' "$ARCH_CONTENT"
@@ -73,7 +73,7 @@ nodes:
       # Sanity check: current commit message + author
       git log -1 --pretty=format:'%h %s%n%an %ad' --date=short
       # Get the canonical lspro-react repo info from gh
-      gh repo view bluedevilcollectibles/lspro-react --json defaultBranchRef,sshUrl --jq '"defaultBranch=\(.defaultBranchRef.name)"'
+      gh repo view thinmansoftware/lspro-react --json defaultBranchRef,sshUrl --jq '"defaultBranch=\(.defaultBranchRef.name)"'
 
   - id: create-release-ce-branch
     depends_on: [verify-baseline-commit]
@@ -85,12 +85,12 @@ nodes:
         exit 1
       fi
       # Check if release/ce already exists (idempotency)
-      if gh api "repos/bluedevilcollectibles/lspro-react/branches/release/ce" --jq .name 2>/dev/null | grep -q "release/ce"; then
+      if gh api "repos/thinmansoftware/lspro-react/branches/release/ce" --jq .name 2>/dev/null | grep -q "release/ce"; then
         echo "release/ce already exists. Will verify protections, not recreate."
-        gh api "repos/bluedevilcollectibles/lspro-react/branches/release/ce" --jq '"existing_sha=\(.commit.sha)"'
+        gh api "repos/thinmansoftware/lspro-react/branches/release/ce" --jq '"existing_sha=\(.commit.sha)"'
       else
         # Create release/ce from main HEAD via GitHub Git Refs API
-        gh api -X POST "repos/bluedevilcollectibles/lspro-react/git/refs" \
+        gh api -X POST "repos/thinmansoftware/lspro-react/git/refs" \
           -f ref="refs/heads/release/ce" \
           -f sha="${MAIN_HEAD}"
         echo "Created release/ce at ${MAIN_HEAD}"
@@ -104,7 +104,7 @@ nodes:
       # the API returns 403 and we record PROTECTION_STATUS=skipped_free_plan so the
       # rest of the workflow can proceed. CE regression check (WO #2) + promotion gate
       # (WO #8) provide CI-level enforcement that's plan-independent.
-      PROTECTION_RESULT=$(gh api -X PUT "repos/bluedevilcollectibles/lspro-react/branches/release/ce/protection" \
+      PROTECTION_RESULT=$(gh api -X PUT "repos/thinmansoftware/lspro-react/branches/release/ce/protection" \
         -H "Accept: application/vnd.github+json" \
         --input - 2>&1 <<'PROT_EOF'
       {
@@ -144,8 +144,8 @@ nodes:
       # Add CE-specific PR templates to lspro-react .github/ from bdc-xo source
       mkdir -p .github/PULL_REQUEST_TEMPLATE
       # Copy promotion + hotfix PR templates from bdc-xo via gh api (cross-repo content fetch)
-      gh api "repos/bluedevilcollectibles/bdc-xo/contents/docs/superpowers/specs/ce-release-branch/templates/ce-promotion-pr-template.md?ref=main" --jq .content | base64 -d > .github/PULL_REQUEST_TEMPLATE/ce-promotion.md
-      gh api "repos/bluedevilcollectibles/bdc-xo/contents/docs/superpowers/specs/ce-release-branch/templates/ce-hotfix-pr-template.md?ref=main" --jq .content | base64 -d > .github/PULL_REQUEST_TEMPLATE/ce-hotfix.md
+      gh api "repos/thinmansoftware/bdc-xo/contents/docs/superpowers/specs/ce-release-branch/templates/ce-promotion-pr-template.md?ref=main" --jq .content | base64 -d > .github/PULL_REQUEST_TEMPLATE/ce-promotion.md
+      gh api "repos/thinmansoftware/bdc-xo/contents/docs/superpowers/specs/ce-release-branch/templates/ce-hotfix-pr-template.md?ref=main" --jq .content | base64 -d > .github/PULL_REQUEST_TEMPLATE/ce-hotfix.md
       # Add a CE branch policy reference doc inline (one-pager pointing back to bdc-xo wiki)
       mkdir -p docs
       cat > docs/CE-BRANCH-POLICY.md <<'POLICY_EOF'
@@ -280,7 +280,7 @@ nodes:
         echo ""
         echo " Generated with [Claude Code](https://claude.com/claude-code)"
       } > "$BODY_FILE"
-      REPO="bluedevilcollectibles/lspro-react"
+      REPO="thinmansoftware/lspro-react"
       BASE="main"
       TITLE="feat(ce): WO-RELEASE-CE-BRANCH-MODEL-01 -- release/ce branch + PR templates"
       # Idempotent PR creation. See WO-HARNESS-OPEN-PR-GRAPHQL-NO-COMMITS-FIX-01.
@@ -328,8 +328,8 @@ nodes:
       - PR opened: <feature-branch PR URL>
       - Merge ancestors: lspro-react main HEAD = <SHA>, behind_by: 0
       - Grep assertions (rerun-able):
-        - gh api repos/bluedevilcollectibles/lspro-react/branches/release/ce --jq .name returns release/ce
-        - gh api repos/bluedevilcollectibles/lspro-react/branches/release/ce/protection returns 200
+        - gh api repos/thinmansoftware/lspro-react/branches/release/ce --jq .name returns release/ce
+        - gh api repos/thinmansoftware/lspro-react/branches/release/ce/protection returns 200
       - Runtime verification: branch + protection visible in GitHub UI
       - Vercel deployment: N/A (release/ce deploys covered by WO-RELEASE-CE-DEPLOY-LANE-01)
       - VALIDATION: PASS
@@ -366,7 +366,7 @@ nodes:
       $read-spec.output
       BDC_NODE_OUTPUT_READ_SPEC
       )
-      ISSUE_REPO="${ISSUE_REPO:-bluedevilcollectibles/bdc-xo}"
+      ISSUE_REPO="${ISSUE_REPO:-thinmansoftware/bdc-xo}"
       ISSUE_NUM=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'issue=[0-9]+' | head -1 | cut -d= -f2 || true)
       if [ -z "$ISSUE_NUM" ]; then
         ISSUE_NUM=$(printf '%s\n' "$READ_SPEC_OUT" | sed -n 's/^SPEC_PATH=.*issues\/\([0-9][0-9]*\).*/\1/p' | head -1)

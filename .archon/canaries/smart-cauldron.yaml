@@ -2,7 +2,7 @@ schema_version: 1
 environment:
   id: hetzner-production
   project: bdc-harness
-  canonical_remote: bluedevilcollectibles/bdc-harness
+  canonical_remote: thinmansoftware/bdc-harness
   base_branch: dev
 artifact_root: harness-artifacts/canaries
 lanes:

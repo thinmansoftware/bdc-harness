@@ -16,7 +16,7 @@ function payload(overrides: Partial<M42Slice8BManifestPayload> = {}): M42Slice8B
     mode: 'fake',
     candidate_sha: SHA_A,
     starting_sha: SHA_B,
-    repository_full_name: 'bluedevilcollectibles/bdc-harness',
+    repository_full_name: 'thinmansoftware/bdc-harness',
     provider_repository_id: 'R_sandbox_123',
     credential_principal_id: 'principal-sandbox-only-1234',
     image_digest: DIGEST,
@@ -59,7 +59,7 @@ describe('M-42 Slice 8B staging refire bridge', () => {
     expect(receipt.normalized_outcome).toBe('admitted');
     expect(receipt.side_effect_count).toBe(1);
     expect(receipt.admitted_run_id).toBe('staging-refire-run-1');
-    expect(receipt.binding_evidence?.repository).toBe('bluedevilcollectibles/bdc-harness');
+    expect(receipt.binding_evidence?.repository).toBe('thinmansoftware/bdc-harness');
     expect(receipt.binding_evidence?.execution_id).toBe('exec-refire-1');
     expect(requests).toHaveLength(1);
   });

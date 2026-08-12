@@ -6,7 +6,7 @@ import type { GrokDispositionReceipt, WatchedRunRecord } from '../types.ts';
 const record: WatchedRunRecord = {
   runId: 'run-1',
   woId: 'WO-REAL-01',
-  owner: 'bluedevilcollectibles',
+  owner: 'thinmansoftware',
   repo: 'bdc-harness',
   status: 'failed',
   action: 'merge_ready',
@@ -16,7 +16,7 @@ const record: WatchedRunRecord = {
     state: 'open',
     checks: { total: 1, passed: 1, failed: 0, pending: 0 },
     mergeable: true,
-    pr: { owner: 'bluedevilcollectibles', repo: 'bdc-harness', number: 42 },
+    pr: { owner: 'thinmansoftware', repo: 'bdc-harness', number: 42 },
   },
 };
 
@@ -47,7 +47,7 @@ describe('merge coordinator', () => {
       readPullRequest: async () => {
         calls.push('pr');
         return {
-          owner: 'bluedevilcollectibles',
+          owner: 'thinmansoftware',
           repository: 'bdc-harness',
           baseBranch: 'dev',
           changedFiles: ['src/index.ts'],
@@ -59,7 +59,7 @@ describe('merge coordinator', () => {
             state: 'open',
             checks: { total: 1, passed: 0, failed: 1, pending: 0 },
             mergeable: false,
-            pr: { owner: 'bluedevilcollectibles', repo: 'bdc-harness', number: 42 },
+            pr: { owner: 'thinmansoftware', repo: 'bdc-harness', number: 42 },
             prTitle: 'Exact live PR',
             filesChangedCount: 1,
             diffStat: '+1 -0',

@@ -30,15 +30,20 @@ export type GitObjectFormat = 'sha1' | 'sha256';
  * John's direct authorization) approves that exact tuple -- this list is the
  * enforcement point for "the registry may only contain what was authorized."
  *
- * - bluedevilcollectibles/bdc-harness, base dev, MERGE only, staging effect,
+ * - thinmansoftware/bdc-harness, base dev, MERGE only, staging effect,
  *   credential_principal "overseer-merge-manager-v1". Authorized: John,
  *   2026-07-20 ("put it in place with merge manager"), pilot scope --
  *   staging-effect merge authority on bdc-harness only, as the first real
  *   Overseer merge-capability grant. See M-42 completion-evidence table,
  *   docs/board/motions/M-20260714-42-overseer-operational-merge-steward.md.
+ *   Digest re-stamped 2026-08-12 for the M-141 org migration (owner renamed
+ *   bluedevilcollectibles -> thinmansoftware; the repo, branch, scope, and
+ *   principal -- i.e. the AUTHORITY GRANTED -- are byte-identical otherwise).
+ *   This is the SAME grant tracking a rename, not a new authorization. Old
+ *   digest 34f7ba1e17c3821d46ee834564ac6b8d2f910e32349ab68b9d1a2e42e4179c93.
  */
 export const SHIPPED_POLICY_AUTHORIZED_DIGESTS: ReadonlySet<string> = new Set([
-  '34f7ba1e17c3821d46ee834564ac6b8d2f910e32349ab68b9d1a2e42e4179c93',
+  '297609b5438bf0804402526a7d368d9aab6ef8a78f15aecae9b6d133615c32b4',
 ]);
 
 export interface PolicyIdentityEvidence {

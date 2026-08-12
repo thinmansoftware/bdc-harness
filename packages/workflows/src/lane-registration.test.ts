@@ -323,7 +323,7 @@ describe('lane registration and war-council-validator pin', () => {
       const lane = loadLane(file);
       expect(lane.run_authority).toEqual({
         required: true,
-        spec_repository: 'bluedevilcollectibles/bdc-xo',
+        spec_repository: 'thinmansoftware/bdc-xo',
         spec_revision: 'main',
         spec_paths: ['docs/work-orders/{WO_ID}.md', 'docs/superpowers/specs/{WO_ID}.md'],
         allow_issue_fallback: true,
@@ -348,7 +348,7 @@ describe('lane registration and war-council-validator pin', () => {
       if (!result.workflow) throw new Error(`${file}: ${result.error?.error ?? 'failed to parse'}`);
       expect(result.workflow.run_authority).toEqual({
         required: true,
-        spec_repository: 'bluedevilcollectibles/bdc-xo',
+        spec_repository: 'thinmansoftware/bdc-xo',
         spec_revision: 'main',
         spec_paths: ['docs/work-orders/{WO_ID}.md', 'docs/superpowers/specs/{WO_ID}.md'],
         allow_issue_fallback: true,

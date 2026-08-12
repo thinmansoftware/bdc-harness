@@ -95,7 +95,7 @@ if [ "$BRANCH" = "feat/wo-clean-01" ]; then _ok "Test 1: well-formed -> feat/wo-
 
 # Test 2 -- ZERO-REGRESSION against run e5110df1's REAL decide-push-target output.
 # Fixture is the canonical event-store payload, copied verbatim from
-#   /.archon/workspaces/bluedevilcollectibles/shopops/logs/e5110df1277ec6a9b899468f8e030b76.jsonl
+#   /.archon/workspaces/thinmansoftware/shopops/logs/e5110df1277ec6a9b899468f8e030b76.jsonl
 # (the sole assistant event whose content starts "push_target:", emitted between
 # node_start and node_complete for step decide-push-target). Only the prose tail
 # is ASCII-normalized (one em-dash -> "--") to satisfy Rule 13; the four
@@ -115,11 +115,11 @@ E5110_OUT=$(printf '%s\n' \
   'push_target: feature-branch:feat/wo-shopops-pick-pull-pack-scan-wiring-01' \
   'pr_required: true' \
   'staging_gate_required: true' \
-  'repo: bluedevilcollectibles/shopops' \
+  'repo: thinmansoftware/shopops' \
   '' \
   'Derivation:' \
-  '- **Repo**: `target_repo: bluedevilcollectibles/shopops` (YAML field, priority 1) -- no origin fallback needed.' \
-  '- **Staging gate**: `bluedevilcollectibles/shopops` matches the hardcoded list -> `staging_gate_required: true`.')
+  '- **Repo**: `target_repo: thinmansoftware/shopops` (YAML field, priority 1) -- no origin fallback needed.' \
+  '- **Staging gate**: `thinmansoftware/shopops` matches the hardcoded list -> `staging_gate_required: true`.')
 OLD_BRANCH=$(extract_branch_OLD "$E5110_OUT")
 BRANCH=$(extract_branch "$E5110_OUT")
 if [ "$OLD_BRANCH" = "feat/wo-shopops-pick-pull-pack-scan-wiring-01" ] && [ "$BRANCH" = "feat/wo-shopops-pick-pull-pack-scan-wiring-01" ]; then

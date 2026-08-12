@@ -237,7 +237,7 @@ describe('overseer capability persistence (sqlite)', () => {
       [
         'snapshot-adapter-claim',
         'v1',
-        'bluedevilcollectibles/bdc-harness',
+        'thinmansoftware/bdc-harness',
         '2026-07-15T12:00:00.000Z',
         'test',
         'unit-test',
@@ -258,7 +258,7 @@ describe('overseer capability persistence (sqlite)', () => {
         $10, $11, $12, $13, $14, $15)`,
       [
         'proposal-adapter-claim',
-        'bluedevilcollectibles/bdc-harness',
+        'thinmansoftware/bdc-harness',
         'c'.repeat(40),
         'dev',
         'a'.repeat(40),
@@ -319,7 +319,7 @@ describe('overseer capability persistence (sqlite)', () => {
       [
         'snapshot-adapter-restart',
         'v1',
-        'bluedevilcollectibles/bdc-harness',
+        'thinmansoftware/bdc-harness',
         '2026-07-15T12:00:00.000Z',
         'test',
         'unit-test',
@@ -340,7 +340,7 @@ describe('overseer capability persistence (sqlite)', () => {
         $10, $11, $12, $13, $14, $15)`,
       [
         'proposal-adapter-restart',
-        'bluedevilcollectibles/bdc-harness',
+        'thinmansoftware/bdc-harness',
         'c'.repeat(40),
         'dev',
         'a'.repeat(40),

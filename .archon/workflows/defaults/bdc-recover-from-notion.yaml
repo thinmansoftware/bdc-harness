@@ -39,7 +39,7 @@ description: |
     DRY_RUN: 'true' writes files locally but skips commit/push/PR.
   Does: Fetches Notion pages -> writes MD specs (idempotent, skips existing) ->
         commits -> pushes (load-bearing, real retry) -> opens PR (load-bearing).
-  Repo: bluedevilcollectibles/bdc-xo (select bdc-xo codebase when firing).
+  Repo: thinmansoftware/bdc-xo (select bdc-xo codebase when firing).
   NOT for: authoring new specs from scratch (use bdc-author-wo-batch).
   parallel_ok: false
 

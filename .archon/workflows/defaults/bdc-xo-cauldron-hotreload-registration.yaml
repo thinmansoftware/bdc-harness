@@ -3,15 +3,15 @@
 # Doctrine compliance: 13 hard rules of archon-yaml-authoring (verified at draft time)
 #
 # CODEBASE BINDING (IMPORTANT - verified against bdc-harness orchestrator-agent.ts:80-87):
-#   Workflow name MUST start with `bdc-xo-` to bind to bluedevilcollectibles/bdc-xo.
-#   The WO-suggested name `bdc-harness-...` would bind to bluedevilcollectibles/bdc-harness
+#   Workflow name MUST start with `bdc-xo-` to bind to thinmansoftware/bdc-xo.
+#   The WO-suggested name `bdc-harness-...` would bind to thinmansoftware/bdc-harness
 #   (WRONG repo) because `bdc-harness-` is in WORKFLOW_CODEBASE_PREFIXES -> bdc-harness.
 #   The change lives in BDC_XO/scripts/archon-bridge/sync-workflows.sh = a bdc-xo file,
 #   so the workflow is named bdc-xo-cauldron-hotreload-registration. DO NOT rename to
 #   the bdc-harness- form or it will clone + PR the wrong repo.
 #
 # Pre-flight (operator verifies BEFORE fire):
-#   1. Codebase bluedevilcollectibles/bdc-xo registered in Archon:
+#   1. Codebase thinmansoftware/bdc-xo registered in Archon:
 #      ssh hetzner-prod "sqlite3 /opt/bdc/archon-data/archon.db \"SELECT name FROM remote_agent_codebases;\""
 #      (verified present 2026-05-09 per archon-yaml-authoring Rule 8 anchor; re-confirm.)
 #   2. WO spec committed + pushed to bdc-xo main BEFORE fire (read-spec fetches via
@@ -42,7 +42,7 @@ description: |
       --hot sync + GET /api/workflows lists the hot-registered workflow.
     - Commits, pushes a feature branch, opens a PR to bdc-xo main.
     - Flips Notion to REVIEW (NEVER DONE) with the manifest in Notes.
-  Repo: bluedevilcollectibles/bdc-xo (binds via bdc-xo- name prefix).
+  Repo: thinmansoftware/bdc-xo (binds via bdc-xo- name prefix).
   WO Class: INFRA. parallel_ok: false (touches the deploy script for the shared container).
 
 policyFile: harness/policies/agent-behavior.md
@@ -75,29 +75,29 @@ nodes:
       # Specs live in bdc-xo on main (NOT the worktree). Cross-repo fetch via gh api.
       # Rule 5: try docs/work-orders/ direct, then date-prefix glob in docs/superpowers/specs/.
       SPEC_CONTENT=$(gh api \
-        "repos/bluedevilcollectibles/bdc-xo/contents/docs/work-orders/${WO_ID}.md?ref=main" \
+        "repos/thinmansoftware/bdc-xo/contents/docs/work-orders/${WO_ID}.md?ref=main" \
         --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
       if [ -z "$SPEC_CONTENT" ]; then
         SPEC_CONTENT=$(gh api \
-          "repos/bluedevilcollectibles/bdc-xo/contents/docs/superpowers/specs/${WO_ID}.md?ref=main" \
+          "repos/thinmansoftware/bdc-xo/contents/docs/superpowers/specs/${WO_ID}.md?ref=main" \
           --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
       fi
       if [ -z "$SPEC_CONTENT" ]; then
         GLOB_PATH=$(gh api \
-          "repos/bluedevilcollectibles/bdc-xo/contents/docs/superpowers/specs?ref=main" \
+          "repos/thinmansoftware/bdc-xo/contents/docs/superpowers/specs?ref=main" \
           --template '{{range .}}{{.path}}{{"\n"}}{{end}}' 2>/dev/null \
           | grep "${WO_ID}.md$" | head -1 || true)
         if [ -n "$GLOB_PATH" ]; then
           SPEC_CONTENT=$(gh api \
-            "repos/bluedevilcollectibles/bdc-xo/contents/${GLOB_PATH}?ref=main" \
+            "repos/thinmansoftware/bdc-xo/contents/${GLOB_PATH}?ref=main" \
             --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
         fi
       fi
       if [ -z "$SPEC_CONTENT" ]; then
-        ISSUE_NUM=$(gh issue list --repo bluedevilcollectibles/bdc-xo \
+        ISSUE_NUM=$(gh issue list --repo thinmansoftware/bdc-xo \
           --search "${WO_ID} in:title" --json number --jq '.[0].number' 2>/dev/null || true)
         if [ -n "$ISSUE_NUM" ] && [ "$ISSUE_NUM" != "null" ]; then
-          SPEC_CONTENT=$(gh issue view "$ISSUE_NUM" --repo bluedevilcollectibles/bdc-xo \
+          SPEC_CONTENT=$(gh issue view "$ISSUE_NUM" --repo thinmansoftware/bdc-xo \
             --json body --jq .body 2>/dev/null || true)
         fi
       fi
@@ -126,7 +126,7 @@ nodes:
       until: COMPLETE
       max_iterations: 5
       prompt: |
-        Implement WO-HARNESS-CAULDRON-HOTRELOAD-REGISTRATION-01 in bluedevilcollectibles/bdc-xo.
+        Implement WO-HARNESS-CAULDRON-HOTRELOAD-REGISTRATION-01 in thinmansoftware/bdc-xo.
         CWD = repo root (the bdc-xo worktree).
 
         ## Spec
@@ -298,7 +298,7 @@ nodes:
     bash: |
       set -euo pipefail
       WO_ID="${WO_ID:-WO-HARNESS-CAULDRON-HOTRELOAD-REGISTRATION-01}"
-      REPO="bluedevilcollectibles/bdc-xo"
+      REPO="thinmansoftware/bdc-xo"
       BRANCH="$(git rev-parse --abbrev-ref HEAD)"
       # bdc-xo default branch is main (master retired 2026-05-31). Non-staging repo -> --base main.
       BASE="main"
@@ -372,7 +372,7 @@ nodes:
       $read-spec.output
       BDC_NODE_OUTPUT_READ_SPEC
       )
-      ISSUE_REPO="${ISSUE_REPO:-bluedevilcollectibles/bdc-xo}"
+      ISSUE_REPO="${ISSUE_REPO:-thinmansoftware/bdc-xo}"
       ISSUE_NUM=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'issue=[0-9]+' | head -1 | cut -d= -f2 || true)
       if [ -z "$ISSUE_NUM" ]; then
         ISSUE_NUM=$(printf '%s\n' "$READ_SPEC_OUT" | sed -n 's/^SPEC_PATH=.*issues\/\([0-9][0-9]*\).*/\1/p' | head -1)

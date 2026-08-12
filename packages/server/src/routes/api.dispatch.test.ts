@@ -765,7 +765,7 @@ describe('dispatch API', () => {
       target: 'cauldron',
       work_order_id: 'WO-HARNESS-DISPATCH-RESTORE-01',
       environment: 'staging',
-      target_repo: 'bluedevilcollectibles/bdc-harness',
+      target_repo: 'thinmansoftware/bdc-harness',
       target_ref: 'c8ee059de5a5aecf550e5298db8a24aba46809cd',
       approved: true,
       approved_by: 'john-ranson',

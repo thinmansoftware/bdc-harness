@@ -562,7 +562,7 @@ describe('execution claims db', () => {
 
   test('recovery execution claims conflict while active and allow expired takeover', async () => {
     const identity = {
-      repository: 'bluedevilcollectibles/bdc-harness',
+      repository: 'thinmansoftware/bdc-harness',
       wo_id: 'WO-RECOVERY-CLAIM',
       execution_id: 'exec-recovery-1',
       target_digest: sha256('target-recovery'),

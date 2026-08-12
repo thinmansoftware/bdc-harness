@@ -5,7 +5,7 @@ const VALID = {
   permit_id: 'permit-1',
   proposal_id: 'proposal-1',
   execution_id: 'execution-1',
-  repository: 'bluedevilcollectibles/bdc-harness',
+  repository: 'thinmansoftware/bdc-harness',
   pr_number: 42,
   head_sha: 'a'.repeat(40),
   base_branch: 'dev',

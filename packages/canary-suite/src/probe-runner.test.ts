@@ -40,7 +40,7 @@ test('Layer 2 runs fire-time probe and requires real PR evidence when Layer 1 is
   const dispatch = async () => {
     calls.push('dispatch');
     return {
-      prUrl: 'https://github.com/bluedevilcollectibles/bdc-harness/pull/123',
+      prUrl: 'https://github.com/thinmansoftware/bdc-harness/pull/123',
       headSha: 'a'.repeat(40),
     };
   };
@@ -56,7 +56,7 @@ test('Layer 2 runs fire-time probe and requires real PR evidence when Layer 1 is
     })
   ).resolves.toEqual({
     verdict: 'passed',
-    prUrl: 'https://github.com/bluedevilcollectibles/bdc-harness/pull/123',
+    prUrl: 'https://github.com/thinmansoftware/bdc-harness/pull/123',
     headSha: 'a'.repeat(40),
   });
   expect(calls).toEqual(['probe', 'dispatch']);

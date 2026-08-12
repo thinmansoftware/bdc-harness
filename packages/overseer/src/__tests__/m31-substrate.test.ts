@@ -32,7 +32,7 @@ function hex(len: number, seed: string): string {
 function fakeProposal(over: Partial<M31ActionProposal> = {}): M31ActionProposal {
   return {
     proposal_id: 'proposal-1',
-    repository: 'bluedevilcollectibles/bdc-harness',
+    repository: 'thinmansoftware/bdc-harness',
     pr_number: 101,
     head_sha: hex(40, 'head'),
     base_branch: 'dev',

@@ -143,7 +143,7 @@ inputs:
 nodes:
   - id: fetch-spec
     bash: |
-      SPEC=$(gh api "repos/bluedevilcollectibles/bdc-xo/contents/x.md" --template '{{.content}}' | base64 -d)
+      SPEC=$(gh api "repos/thinmansoftware/bdc-xo/contents/x.md" --template '{{.content}}' | base64 -d)
       echo "fetched from template"
   - id: business-risk-gate
     load_bearing: true

@@ -80,12 +80,12 @@ const MAX_BATCH_ASSISTANT_CHUNKS = 20;
 const MAX_BATCH_TOTAL_CHUNKS = 200;
 
 const WORKFLOW_CODEBASE_PREFIXES: readonly { prefix: string; codebaseName: string }[] = [
-  { prefix: 'bdc-shopops-', codebaseName: 'bluedevilcollectibles/shopops' },
-  { prefix: 'bdc-lspro-', codebaseName: 'bluedevilcollectibles/lspro-react' },
-  { prefix: 'bdc-storefront-', codebaseName: 'bluedevilcollectibles/shopops-storefront' },
-  { prefix: 'bdc-xo-', codebaseName: 'bluedevilcollectibles/bdc-xo' },
-  { prefix: 'bdc-harness-', codebaseName: 'bluedevilcollectibles/bdc-harness' },
-  { prefix: 'bdc-auth-', codebaseName: 'bluedevilcollectibles/lspro-react' },
+  { prefix: 'bdc-shopops-', codebaseName: 'thinmansoftware/shopops' },
+  { prefix: 'bdc-lspro-', codebaseName: 'thinmansoftware/lspro-react' },
+  { prefix: 'bdc-storefront-', codebaseName: 'thinmansoftware/shopops-storefront' },
+  { prefix: 'bdc-xo-', codebaseName: 'thinmansoftware/bdc-xo' },
+  { prefix: 'bdc-harness-', codebaseName: 'thinmansoftware/bdc-harness' },
+  { prefix: 'bdc-auth-', codebaseName: 'thinmansoftware/lspro-react' },
 ] as const;
 
 // --- Types ------------------------------------------------------------------

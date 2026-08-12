@@ -6,7 +6,7 @@
 #   1. YAML exists: this file
 #   2. Spec exists: docs/work-orders/WO-INFRA-BDC-SUBDOMAIN-CNAME-01.md in bdc-xo
 #   3. CWD scope: MIXED -- bdc-xo (decision doc) + shopops-storefront (marketing page footer)
-#   4. Codebases registered: bluedevilcollectibles/bdc-xo + bluedevilcollectibles/shopops-storefront
+#   4. Codebases registered: thinmansoftware/bdc-xo + thinmansoftware/shopops-storefront
 #
 # DEPENDS ON: WO-INFRA-VERCEL-PASSWORD-DECISION-01 (Option C unblocks
 # bluedevilcollectibles.comicstoreos.com if that's the canonical chosen here).
@@ -46,18 +46,18 @@ nodes:
       # Try canonical path first: docs/work-orders/<WO_ID>.md
       # gh --template uses Go templates (built-in to gh, no external jq dependency)
       SPEC_CONTENT=$(gh api \
-        "repos/bluedevilcollectibles/bdc-xo/contents/docs/work-orders/${WO_ID}.md?ref=main" \
+        "repos/thinmansoftware/bdc-xo/contents/docs/work-orders/${WO_ID}.md?ref=main" \
         --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
 
       # Fallback: glob docs/superpowers/specs/*<WO_ID>*.md
       if [ -z "$SPEC_CONTENT" ]; then
         GLOB_PATH=$(gh api \
-          "repos/bluedevilcollectibles/bdc-xo/contents/docs/superpowers/specs?ref=main" \
+          "repos/thinmansoftware/bdc-xo/contents/docs/superpowers/specs?ref=main" \
           --template '{{range .}}{{.path}}{{"\n"}}{{end}}' 2>/dev/null \
           | grep "${WO_ID}.md$" | head -1 || true)
         if [ -n "$GLOB_PATH" ]; then
           SPEC_CONTENT=$(gh api \
-            "repos/bluedevilcollectibles/bdc-xo/contents/${GLOB_PATH}?ref=main" \
+            "repos/thinmansoftware/bdc-xo/contents/${GLOB_PATH}?ref=main" \
             --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
         fi
       fi
@@ -66,12 +66,12 @@ nodes:
         # Fallback 4: GitHub issue body (WO-HARNESS-READ-SPEC-ISSUE-BODY-FALLBACK-01)
         ISSUE_NUM=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'issue=[0-9]+' | head -n 1 | cut -d= -f2 || true)
         if [ -z "$ISSUE_NUM" ]; then
-          ISSUE_NUM=$(gh issue list --repo bluedevilcollectibles/bdc-xo \
+          ISSUE_NUM=$(gh issue list --repo thinmansoftware/bdc-xo \
             --search "${WO_ID} in:title" --json number,title \
             --jq '.[0].number' 2>/dev/null || true)
         fi
         if [ -n "$ISSUE_NUM" ] && [ "$ISSUE_NUM" != "null" ]; then
-          SPEC_CONTENT=$(gh issue view "$ISSUE_NUM" --repo bluedevilcollectibles/bdc-xo \
+          SPEC_CONTENT=$(gh issue view "$ISSUE_NUM" --repo thinmansoftware/bdc-xo \
             --json body --jq .body 2>/dev/null || true)
           [ -n "$SPEC_CONTENT" ] && SPEC_PATH="issues/${ISSUE_NUM}"
         fi
@@ -182,7 +182,7 @@ nodes:
         Update shopops-storefront marketing page to use canonical BDC subdomain.
 
         Clone shopops-storefront into sibling path:
-          git -C /tmp clone --depth=10 https://github.com/bluedevilcollectibles/shopops-storefront.git shopops-storefront
+          git -C /tmp clone --depth=10 https://github.com/thinmansoftware/shopops-storefront.git shopops-storefront
           cd /tmp/shopops-storefront
           git checkout -b wo/infra-bdc-subdomain-cname-01-marketing
 
@@ -278,7 +278,7 @@ nodes:
     bash: |
       set -euo pipefail
       BRANCH="wo/infra-bdc-subdomain-cname-01"
-      REPO="bluedevilcollectibles/bdc-xo"
+      REPO="thinmansoftware/bdc-xo"
       EXIST=$(gh pr list --repo "$REPO" --head "$BRANCH" --state open \
         --json url --template '{{range .}}{{.url}}{{end}}' 2>/dev/null || true)
       if [ -n "$EXIST" ]; then echo "BDCXO_PR=$EXIST"; exit 0; fi
@@ -296,7 +296,7 @@ nodes:
     depends_on: [update-marketing-storefront]
     bash: |
       set -euo pipefail
-      REPO="bluedevilcollectibles/shopops-storefront"
+      REPO="thinmansoftware/shopops-storefront"
       BRANCH="wo/infra-bdc-subdomain-cname-01-marketing"
       EXIST=$(gh pr list --repo "$REPO" --head "$BRANCH" --state open \
         --json url --template '{{range .}}{{.url}}{{end}}' 2>/dev/null || true)
@@ -384,7 +384,7 @@ nodes:
       $read-spec.output
       BDC_NODE_OUTPUT_READ_SPEC
       )
-      ISSUE_REPO="${ISSUE_REPO:-bluedevilcollectibles/bdc-xo}"
+      ISSUE_REPO="${ISSUE_REPO:-thinmansoftware/bdc-xo}"
       ISSUE_NUM=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'issue=[0-9]+' | head -1 | cut -d= -f2 || true)
       if [ -z "$ISSUE_NUM" ]; then
         ISSUE_NUM=$(printf '%s\n' "$READ_SPEC_OUT" | sed -n 's/^SPEC_PATH=.*issues\/\([0-9][0-9]*\).*/\1/p' | head -1)

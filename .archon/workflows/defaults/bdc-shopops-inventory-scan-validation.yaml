@@ -6,7 +6,7 @@
 #   1. YAML exists.
 #   2. Spec: bdc-xo:docs/work-orders/WO-SHOPOPS-INVENTORY-SCAN-VALIDATION-01.md
 #   3. CWD scope = shopops repo (subdir shopops-api/) -- single-repo MIXED, no UI.
-#   4. Codebase bluedevilcollectibles/shopops registered.
+#   4. Codebase thinmansoftware/shopops registered.
 #
 # parallel_ok: YES (new table only; no shared-table writes; no FK to multi-location migration).
 # Polish bar: ROUGH OK (P1; detection-only v1; manual SQL resolution acceptable).
@@ -24,7 +24,7 @@ description: |
         validateShipmentLines orchestrator. Extends shipments.js ingest path
         to call validator and emit exceptions array in response. 6+ bun tests.
         Commits, opens PR, Rule 19 docker exec verify, MIXED manifest, flip-notion REVIEW.
-  Repo: bluedevilcollectibles/shopops (single-repo, no UI).
+  Repo: thinmansoftware/shopops (single-repo, no UI).
   parallel_ok: true -- new table only.
   Polish bar: ROUGH OK -- detection-only v1; no auto-resolution; no UI; manual SQL fix
               by staff is acceptable.
@@ -41,17 +41,17 @@ nodes:
 
       # gh --template uses Go templates (built into gh, no external jq dependency)
       SPEC_CONTENT=$(gh api \
-        "repos/bluedevilcollectibles/bdc-xo/contents/docs/work-orders/${WO_ID}.md?ref=main" \
+        "repos/thinmansoftware/bdc-xo/contents/docs/work-orders/${WO_ID}.md?ref=main" \
         --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
 
       if [ -z "$SPEC_CONTENT" ]; then
         GLOB_PATH=$(gh api \
-          "repos/bluedevilcollectibles/bdc-xo/contents/docs/superpowers/specs?ref=main" \
+          "repos/thinmansoftware/bdc-xo/contents/docs/superpowers/specs?ref=main" \
           --template '{{range .}}{{.path}}{{"\n"}}{{end}}' \
           2>/dev/null | grep "${WO_ID}.md$" | head -1 || true)
         if [ -n "$GLOB_PATH" ]; then
           SPEC_CONTENT=$(gh api \
-            "repos/bluedevilcollectibles/bdc-xo/contents/${GLOB_PATH}?ref=main" \
+            "repos/thinmansoftware/bdc-xo/contents/${GLOB_PATH}?ref=main" \
             --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
         fi
       fi
@@ -60,12 +60,12 @@ nodes:
         # Fallback 4: GitHub issue body (WO-HARNESS-READ-SPEC-ISSUE-BODY-FALLBACK-01)
         ISSUE_NUM=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'issue=[0-9]+' | head -n 1 | cut -d= -f2 || true)
         if [ -z "$ISSUE_NUM" ]; then
-          ISSUE_NUM=$(gh issue list --repo bluedevilcollectibles/bdc-xo \
+          ISSUE_NUM=$(gh issue list --repo thinmansoftware/bdc-xo \
             --search "${WO_ID} in:title" --json number,title \
             --jq '.[0].number' 2>/dev/null || true)
         fi
         if [ -n "$ISSUE_NUM" ] && [ "$ISSUE_NUM" != "null" ]; then
-          SPEC_CONTENT=$(gh issue view "$ISSUE_NUM" --repo bluedevilcollectibles/bdc-xo \
+          SPEC_CONTENT=$(gh issue view "$ISSUE_NUM" --repo thinmansoftware/bdc-xo \
             --json body --jq .body 2>/dev/null || true)
           [ -n "$SPEC_CONTENT" ] && SPEC_PATH="issues/${ISSUE_NUM}"
         fi
@@ -267,7 +267,7 @@ nodes:
     bash: |
       set -euo pipefail
       BRANCH="$(git rev-parse --abbrev-ref HEAD)"
-      REPO="bluedevilcollectibles/shopops"
+      REPO="thinmansoftware/shopops"
       BASE="master"
       TITLE="feat(api): WO-SHOPOPS-INVENTORY-SCAN-VALIDATION-01 -- shipment exception detection"
       BODY_FILE=$(mktemp)
@@ -359,7 +359,7 @@ nodes:
       $read-spec.output
       BDC_NODE_OUTPUT_READ_SPEC
       )
-      ISSUE_REPO="${ISSUE_REPO:-bluedevilcollectibles/bdc-xo}"
+      ISSUE_REPO="${ISSUE_REPO:-thinmansoftware/bdc-xo}"
       ISSUE_NUM=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'issue=[0-9]+' | head -1 | cut -d= -f2 || true)
       if [ -z "$ISSUE_NUM" ]; then
         ISSUE_NUM=$(printf '%s\n' "$READ_SPEC_OUT" | sed -n 's/^SPEC_PATH=.*issues\/\([0-9][0-9]*\).*/\1/p' | head -1)

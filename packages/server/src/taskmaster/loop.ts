@@ -211,7 +211,7 @@ function assertGithubRateLimit(response: Response, context: string): void {
 export async function defaultListThreads(
   fetchImpl: typeof fetch = fetch
 ): Promise<ThreadSnapshot[]> {
-  const repos = (process.env.TASKMASTER_GH_REPOS ?? 'bluedevilcollectibles/bdc-xo')
+  const repos = (process.env.TASKMASTER_GH_REPOS ?? 'thinmansoftware/bdc-xo')
     .split(',')
     .map(r => r.trim())
     .filter(Boolean);

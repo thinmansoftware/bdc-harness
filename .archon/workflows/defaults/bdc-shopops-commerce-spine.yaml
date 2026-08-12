@@ -4,14 +4,14 @@
 #                 bdc-feature-development.yaml (loop + verify + commit pattern)
 # Doctrine compliance: 13 hard rules of archon-yaml-authoring (verified at draft time)
 #
-# Pre-flight: codebase bluedevilcollectibles/shopops must be registered in Archon.
+# Pre-flight: codebase thinmansoftware/shopops must be registered in Archon.
 #   Verify: sqlite3 /opt/bdc/archon-data/archon.db "SELECT name FROM remote_agent_codebases"
 #   If missing, register via Archon Dashboard or:
 #     curl -X POST https://archon.bluedevilcollectibles.com/api/codebases \
 #       -H "Content-Type: application/json" \
-#       -d '{"name":"bluedevilcollectibles/shopops","repositoryUrl":"https://github.com/bluedevilcollectibles/shopops","defaultBranch":"master","defaultCwd":"/.archon/workspaces/bluedevilcollectibles/shopops/source"}'
+#       -d '{"name":"thinmansoftware/shopops","repositoryUrl":"https://github.com/thinmansoftware/shopops","defaultBranch":"master","defaultCwd":"/.archon/workspaces/thinmansoftware/shopops/source"}'
 #
-# NOTE ON CWD: Archon clones bluedevilcollectibles/shopops into its worktree.
+# NOTE ON CWD: Archon clones thinmansoftware/shopops into its worktree.
 #   CWD = shopops repo root. shopops-api/ is a subdirectory. All paths below are
 #   relative to shopops repo root (e.g., shopops-api/routes/channels.js).
 #   The WO spec lives in bdc-xo, fetched via gh api cross-repo.
@@ -36,8 +36,8 @@ description: |
         adds services/channelAvailability.js, runs bun tests (idempotency +
         tenant isolation), commits + opens PR, does docker exec Rule 19 runtime
         verification, builds MIXED manifest, flips Notion to REVIEW.
-  Repo: bluedevilcollectibles/shopops (shopops-api/ subdir).
-        Spec lives in bluedevilcollectibles/bdc-xo.
+  Repo: thinmansoftware/shopops (shopops-api/ subdir).
+        Spec lives in thinmansoftware/bdc-xo.
   parallel_ok: false -- schema migration, serial only.
   NOT for: any other WO.
 
@@ -57,18 +57,18 @@ nodes:
       # Primary: docs/work-orders/<WO_ID>.md in bdc-xo
       # gh --template uses Go templates (built into gh, no external jq dependency)
       SPEC_CONTENT=$(gh api \
-        "repos/bluedevilcollectibles/bdc-xo/contents/docs/work-orders/${WO_ID}.md?ref=main" \
+        "repos/thinmansoftware/bdc-xo/contents/docs/work-orders/${WO_ID}.md?ref=main" \
         --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
 
       # Fallback: glob docs/superpowers/specs/*<WO_ID>*.md
       if [ -z "$SPEC_CONTENT" ]; then
         GLOB_PATH=$(gh api \
-          "repos/bluedevilcollectibles/bdc-xo/contents/docs/superpowers/specs?ref=main" \
+          "repos/thinmansoftware/bdc-xo/contents/docs/superpowers/specs?ref=main" \
           --template '{{range .}}{{.path}}{{"\n"}}{{end}}' \
           2>/dev/null | grep "${WO_ID}.md$" | head -1 || true)
         if [ -n "$GLOB_PATH" ]; then
           SPEC_CONTENT=$(gh api \
-            "repos/bluedevilcollectibles/bdc-xo/contents/${GLOB_PATH}?ref=main" \
+            "repos/thinmansoftware/bdc-xo/contents/${GLOB_PATH}?ref=main" \
             --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
         fi
       fi
@@ -77,12 +77,12 @@ nodes:
         # Fallback 4: GitHub issue body (WO-HARNESS-READ-SPEC-ISSUE-BODY-FALLBACK-01)
         ISSUE_NUM=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'issue=[0-9]+' | head -n 1 | cut -d= -f2 || true)
         if [ -z "$ISSUE_NUM" ]; then
-          ISSUE_NUM=$(gh issue list --repo bluedevilcollectibles/bdc-xo \
+          ISSUE_NUM=$(gh issue list --repo thinmansoftware/bdc-xo \
             --search "${WO_ID} in:title" --json number,title \
             --jq '.[0].number' 2>/dev/null || true)
         fi
         if [ -n "$ISSUE_NUM" ] && [ "$ISSUE_NUM" != "null" ]; then
-          SPEC_CONTENT=$(gh issue view "$ISSUE_NUM" --repo bluedevilcollectibles/bdc-xo \
+          SPEC_CONTENT=$(gh issue view "$ISSUE_NUM" --repo thinmansoftware/bdc-xo \
             --json body --jq .body 2>/dev/null || true)
           [ -n "$SPEC_CONTENT" ] && SPEC_PATH="issues/${ISSUE_NUM}"
         fi
@@ -91,7 +91,7 @@ nodes:
 
       # Also fetch behavior spec for context
       BEHAVIOR_SPEC=$(gh api \
-        "repos/bluedevilcollectibles/bdc-xo/contents/docs/behavior-specs/COMMERCE_CHANNEL_SPINE_BEHAVIOR.md?ref=main" \
+        "repos/thinmansoftware/bdc-xo/contents/docs/behavior-specs/COMMERCE_CHANNEL_SPINE_BEHAVIOR.md?ref=main" \
         --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
 
       printf 'WO_ID=%s\nSPEC_PATH=bdc-xo:docs/work-orders/%s.md\nWORKFLOW_ID=%s\n\n' \
@@ -373,7 +373,7 @@ nodes:
       set -euo pipefail
       # Use current HEAD branch (set by commit-and-push -- may be timestamped variant)
       BRANCH="$(git rev-parse --abbrev-ref HEAD)"
-      REPO="bluedevilcollectibles/shopops"
+      REPO="thinmansoftware/shopops"
       BASE="master"
       TITLE="feat(api): WO-SHOPOPS-COMMERCE-SPINE-01 -- commerce channel spine"
 
@@ -560,7 +560,7 @@ nodes:
       $read-spec.output
       BDC_NODE_OUTPUT_READ_SPEC
       )
-      ISSUE_REPO="${ISSUE_REPO:-bluedevilcollectibles/bdc-xo}"
+      ISSUE_REPO="${ISSUE_REPO:-thinmansoftware/bdc-xo}"
       ISSUE_NUM=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'issue=[0-9]+' | head -1 | cut -d= -f2 || true)
       if [ -z "$ISSUE_NUM" ]; then
         ISSUE_NUM=$(printf '%s\n' "$READ_SPEC_OUT" | sed -n 's/^SPEC_PATH=.*issues\/\([0-9][0-9]*\).*/\1/p' | head -1)

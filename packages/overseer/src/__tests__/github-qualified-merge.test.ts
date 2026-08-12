@@ -12,9 +12,9 @@ const request: QualifiedMergeAdapterRequestV2 = {
   permit_id: 'permit-1',
   proposal_id: 'proposal-1',
   execution_id: 'execution-1',
-  repository: 'bluedevilcollectibles/bdc-harness',
+  repository: 'thinmansoftware/bdc-harness',
   target_kind: 'pull_request',
-  target_key: 'bluedevilcollectibles/bdc-harness#pull_request:42',
+  target_key: 'thinmansoftware/bdc-harness#pull_request:42',
   target_digest: '1'.repeat(64),
   pr_number: 42,
   head_sha: 'a'.repeat(40),
@@ -37,7 +37,7 @@ describe('GitHub qualified merge adapter', () => {
       request
     );
     expect(merge).toHaveBeenCalledWith({
-      owner: 'bluedevilcollectibles',
+      owner: 'thinmansoftware',
       repo: 'bdc-harness',
       pull_number: 42,
       sha: request.head_sha,
@@ -129,16 +129,16 @@ describe('real GitHub deps', () => {
     });
 
     const result = await createRealFindPullRequest(octokit)({
-      owner: 'bluedevilcollectibles',
+      owner: 'thinmansoftware',
       repo: 'bdc-harness',
       headBranch: 'fix/wo-42',
       woId: 'WO-42',
     });
 
     expect(list).toHaveBeenCalledWith({
-      owner: 'bluedevilcollectibles',
+      owner: 'thinmansoftware',
       repo: 'bdc-harness',
-      head: 'bluedevilcollectibles:fix/wo-42',
+      head: 'thinmansoftware:fix/wo-42',
       state: 'all',
       per_page: 5,
     });
@@ -147,7 +147,7 @@ describe('real GitHub deps', () => {
       exists: true,
       state: 'open',
       checks: { total: 4, passed: 2, failed: 1, pending: 1 },
-      pr: { owner: 'bluedevilcollectibles', repo: 'bdc-harness', number: 42 },
+      pr: { owner: 'thinmansoftware', repo: 'bdc-harness', number: 42 },
     });
   });
 
@@ -172,18 +172,18 @@ describe('real GitHub deps', () => {
     });
 
     const result = await createRealFindPullRequest(octokit)({
-      owner: 'bluedevilcollectibles',
+      owner: 'thinmansoftware',
       repo: 'bdc-harness',
       headBranch: 'fix/missing-head',
       woId: 'WO-FALLBACK-77',
     });
 
     expect(search).toHaveBeenCalledWith({
-      q: 'repo:bluedevilcollectibles/bdc-harness is:pr WO-FALLBACK-77 in:title',
+      q: 'repo:thinmansoftware/bdc-harness is:pr WO-FALLBACK-77 in:title',
       per_page: 5,
     });
     expect(get).toHaveBeenCalledWith({
-      owner: 'bluedevilcollectibles',
+      owner: 'thinmansoftware',
       repo: 'bdc-harness',
       pull_number: 77,
     });
@@ -192,7 +192,7 @@ describe('real GitHub deps', () => {
 
   test('returns missing evidence when no pull request matches', async () => {
     const result = await createRealFindPullRequest(createOctokitMock())({
-      owner: 'bluedevilcollectibles',
+      owner: 'thinmansoftware',
       repo: 'bdc-harness',
       headBranch: 'fix/not-found',
       woId: 'WO-NOT-FOUND',
@@ -222,7 +222,7 @@ describe('real GitHub deps', () => {
     });
 
     const result = await createRealFindPullRequest(octokit)({
-      owner: 'bluedevilcollectibles',
+      owner: 'thinmansoftware',
       repo: 'bdc-harness',
       headBranch: 'fix/api-down',
       woId: 'WO-API-DOWN',
@@ -238,14 +238,14 @@ describe('real GitHub deps', () => {
     const result = await createRealMergePullRequest(
       createOctokitMock({ pulls: { ...createOctokitMock().pulls, merge } })
     )({
-      owner: 'bluedevilcollectibles',
+      owner: 'thinmansoftware',
       repo: 'bdc-harness',
       number: 42,
       commitTitle: 'Overseer merge WO-42',
     });
 
     expect(merge).toHaveBeenCalledWith({
-      owner: 'bluedevilcollectibles',
+      owner: 'thinmansoftware',
       repo: 'bdc-harness',
       pull_number: 42,
       sha: 'a'.repeat(40),
@@ -263,7 +263,7 @@ describe('real GitHub deps', () => {
       });
       await expect(
         createRealMergePullRequest(octokit)({
-          owner: 'bluedevilcollectibles',
+          owner: 'thinmansoftware',
           repo: 'bdc-harness',
           number: 42,
         })
@@ -280,7 +280,7 @@ describe('real GitHub deps', () => {
     });
     await expect(
       createRealMergePullRequest(octokit)({
-        owner: 'bluedevilcollectibles',
+        owner: 'thinmansoftware',
         repo: 'bdc-harness',
         number: 42,
       })

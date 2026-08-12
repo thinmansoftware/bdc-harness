@@ -6,7 +6,7 @@
 #   1. YAML exists: this file
 #   2. Spec exists: BDC_XO/docs/work-orders/WO-HARNESS-WO-AUTHOR-WORKFLOW-01.md
 #   3. CWD scope: bdc-xo (WO specs + YAMLs live there -- select bdc-xo when firing)
-#   4. Codebase registered: bluedevilcollectibles/bdc-xo (verify in Archon DB)
+#   4. Codebase registered: thinmansoftware/bdc-xo (verify in Archon DB)
 #
 # Deploy: BDC_XO/scripts/archon-bridge/sync-workflows.sh bdc-wo-author.yaml
 #
@@ -39,7 +39,7 @@ description: |
         --fire mode (unless auto-approve), commits spec to bdc-xo feature
         branch, files Notion page (unless --draft-only), fires
         bdc-feature-development against the target repo (--fire only).
-  Repo: bluedevilcollectibles/bdc-xo (operator selects bdc-xo codebase when firing).
+  Repo: thinmansoftware/bdc-xo (operator selects bdc-xo codebase when firing).
   NOT for: Doctrine-only WOs (use bdc-doctrine-update). Existing WOs already in
         REVIEW status. Batch authoring (use bdc-author-wo-batch).
   parallel_ok: false
@@ -100,7 +100,7 @@ nodes:
 
       ## Intake Detection (priority order)
 
-      1. **--spec <path>** in USER_MESSAGE: fetch via `gh api repos/bluedevilcollectibles/bdc-xo/contents/<path>?ref=main`,
+      1. **--spec <path>** in USER_MESSAGE: fetch via `gh api repos/thinmansoftware/bdc-xo/contents/<path>?ref=main`,
          base64-decode .content. intake_source=spec_file
       2. **--notion <page-id>** in USER_MESSAGE: use Notion MCP `notion-fetch` against the page ID.
          Extract title + body as the description. intake_source=notion_stub
@@ -189,7 +189,7 @@ nodes:
       # Cross-repo: bdc-xo holds all WO specs.
       SIBLINGS=""
       if [ -n "$PREFIX" ]; then
-        SIBLINGS=$(gh api "repos/bluedevilcollectibles/bdc-xo/contents/docs/work-orders?ref=main" \
+        SIBLINGS=$(gh api "repos/thinmansoftware/bdc-xo/contents/docs/work-orders?ref=main" \
           --template '{{range .}}{{.name}}{{"\n"}}{{end}}' 2>/dev/null \
           | grep -E "^WO-${PREFIX}-" | head -20 || true)
       fi
@@ -204,7 +204,7 @@ nodes:
       fi
 
       # Read wo-recipe.md doctrine reference if available (best-effort)
-      RECIPE_HEAD=$(gh api "repos/bluedevilcollectibles/bdc-xo/contents/xo-wiki/wiki/doctrine/wo-recipe/_index.md?ref=main" \
+      RECIPE_HEAD=$(gh api "repos/thinmansoftware/bdc-xo/contents/xo-wiki/wiki/doctrine/wo-recipe/_index.md?ref=main" \
         --jq .content 2>/dev/null | base64 -d 2>/dev/null | head -60 || true)
       if [ -n "$RECIPE_HEAD" ]; then
         echo ""
@@ -757,7 +757,7 @@ nodes:
         - bdc-harness: count of workflow name string in this YAML -> >= 1
         - bdc-harness: count of `^model[:][ ]sonnet$` (regex, root-level only) -> 1
         - bdc-harness: count of `^policyFile[:]` (regex, root-level only) -> 1
-        - bdc-xo: gh api repos/bluedevilcollectibles/bdc-xo/contents/docs/work-orders/<WO_ID>.md --jq .size -> > 0
+        - bdc-xo: gh api repos/thinmansoftware/bdc-xo/contents/docs/work-orders/<WO_ID>.md --jq .size -> > 0
       - VALIDATION: PASS
 
       Run summary:

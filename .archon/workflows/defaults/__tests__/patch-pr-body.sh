@@ -100,12 +100,12 @@ parse_pr_url() {
   printf '%s' "$url"
 }
 # Bare-URL form (gh pr create stdout)
-OPEN1=$'Creating pull request for...\nhttps://github.com/bluedevilcollectibles/bdc-harness/pull/420'
-assert_eq "bare URL extracted" "https://github.com/bluedevilcollectibles/bdc-harness/pull/420" \
+OPEN1=$'Creating pull request for...\nhttps://github.com/thinmansoftware/bdc-harness/pull/420'
+assert_eq "bare URL extracted" "https://github.com/thinmansoftware/bdc-harness/pull/420" \
   "$(parse_pr_url "$OPEN1")"
 # PR_URL= form (race-recovery)
-OPEN2=$'WARN: gh pr create attempt 1 failed\nPR_URL=https://github.com/bluedevilcollectibles/bdc-harness/pull/421'
-assert_eq "PR_URL= extracted" "https://github.com/bluedevilcollectibles/bdc-harness/pull/421" \
+OPEN2=$'WARN: gh pr create attempt 1 failed\nPR_URL=https://github.com/thinmansoftware/bdc-harness/pull/421'
+assert_eq "PR_URL= extracted" "https://github.com/thinmansoftware/bdc-harness/pull/421" \
   "$(parse_pr_url "$OPEN2")"
 # Empty case
 assert_eq "no URL returns empty" "" "$(parse_pr_url "no urls here")"
@@ -120,10 +120,10 @@ echo "--- Test 3: REPO + PR baseRefName derivation ---"
 parse_repo() {
   printf '%s\n' "$1" | sed -n 's/^repo: //p' | head -1
 }
-DECIDE_NON_STAGING=$'push_target: feature-branch:feat/wo-foo-01\npr_required: true\nstaging_gate_required: false\nrepo: bluedevilcollectibles/bdc-harness'
-DECIDE_STAGING=$'push_target: feature-branch:feat/wo-bar-01\npr_required: true\nstaging_gate_required: true\nrepo: bluedevilcollectibles/lspro-react'
-assert_eq "repo (non-staging)" "bluedevilcollectibles/bdc-harness" "$(parse_repo "$DECIDE_NON_STAGING")"
-assert_eq "repo (staging)" "bluedevilcollectibles/lspro-react" "$(parse_repo "$DECIDE_STAGING")"
+DECIDE_NON_STAGING=$'push_target: feature-branch:feat/wo-foo-01\npr_required: true\nstaging_gate_required: false\nrepo: thinmansoftware/bdc-harness'
+DECIDE_STAGING=$'push_target: feature-branch:feat/wo-bar-01\npr_required: true\nstaging_gate_required: true\nrepo: thinmansoftware/lspro-react'
+assert_eq "repo (non-staging)" "thinmansoftware/bdc-harness" "$(parse_repo "$DECIDE_NON_STAGING")"
+assert_eq "repo (staging)" "thinmansoftware/lspro-react" "$(parse_repo "$DECIDE_STAGING")"
 
 # BASE_REF now derives from the PR's baseRefName, NOT from a guessed branch.
 # Simulate the post-pr-view step: PR_BASE is the JSON baseRefName from
@@ -488,7 +488,7 @@ manifest_consistency_check() (
   eval "$MANIFEST_CONSISTENCY_GUARD"
 )
 
-PR_URL_FIXTURE="https://github.com/bluedevilcollectibles/bdc-harness/pull/405"
+PR_URL_FIXTURE="https://github.com/thinmansoftware/bdc-harness/pull/405"
 MF_FALSE_NEGATIVE=$'WO: WO-X\nPRs: N/A (no commit was made; HEAD still equals RUN_START_SHA a00f47d; no PR opened)\nVALIDATION: FAIL'
 set +e
 GUARD_FALSE_STDERR=$(manifest_consistency_check "PROCEED" "$PR_URL_FIXTURE" "$MF_FALSE_NEGATIVE" 2>&1 >/dev/null)
@@ -498,7 +498,7 @@ assert_eq "guard rejects PROCEED + PR URL contradicted by N/A PRs line" "1" "$GU
 assert_contains "guard error names SELF_CONSISTENCY_ERROR" "SELF_CONSISTENCY_ERROR" "$GUARD_FALSE_STDERR"
 assert_contains "guard error includes real PR URL" "$PR_URL_FIXTURE" "$GUARD_FALSE_STDERR"
 
-MF_HONEST_PROCEED=$'WO: WO-X\nPRs: https://github.com/bluedevilcollectibles/bdc-harness/pull/405\nVALIDATION: PASS'
+MF_HONEST_PROCEED=$'WO: WO-X\nPRs: https://github.com/thinmansoftware/bdc-harness/pull/405\nVALIDATION: PASS'
 assert_eq "guard passes honest PROCEED manifest" "OK" \
   "$(manifest_consistency_check "PROCEED" "$PR_URL_FIXTURE" "$MF_HONEST_PROCEED" 2>/dev/null)"
 

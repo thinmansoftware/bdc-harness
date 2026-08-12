@@ -89,7 +89,7 @@ echo "CMD=$CMD"
 // ---------------------------------------------------------------------------
 const BASE_BRANCH_OVERRIDE_SELECTION_AND_BODY = `
 set -euo pipefail
-REPO="\${REPO:-bluedevilcollectibles/bdc-xo}"
+REPO="\${REPO:-thinmansoftware/bdc-xo}"
 REMOTE_URL="\${REPO_REMOTE_URL:-https://github.com/\${REPO}.git}"
 STAGING_GATE=$(printf '%s\\n' "$DECIDE_OUTPUT" | grep -c '^staging_gate_required: true' 2>/dev/null || true)
 BASE_BRANCH_OVERRIDE=$(printf '%s\\n' "$DECIDE_OUTPUT" | sed -n 's/^base_branch_override: //p' | head -n 1 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
@@ -396,7 +396,7 @@ printf 'BASE_BRANCH_OVERRIDE=<%s>\\nUNIQUE_BRANCH=<%s>\\n' "$BASE_BRANCH_OVERRID
       'pr_required: true',
       'staging_gate_required: true',
       'base_branch_override: release/ce',
-      'repo: bluedevilcollectibles/bdc-xo',
+      'repo: thinmansoftware/bdc-xo',
     ].join('\n');
 
     const result = bash(BASE_BRANCH_OVERRIDE_SELECTION_AND_BODY, worktreeDir, {
@@ -423,7 +423,7 @@ printf 'BASE_BRANCH_OVERRIDE=<%s>\\nUNIQUE_BRANCH=<%s>\\n' "$BASE_BRANCH_OVERRID
       'pr_required: true',
       'staging_gate_required: false',
       'base_branch_override: release/missing',
-      'repo: bluedevilcollectibles/bdc-xo',
+      'repo: thinmansoftware/bdc-xo',
     ].join('\n');
 
     const result = bash(BASE_BRANCH_OVERRIDE_SELECTION_AND_BODY, worktreeDir, {
@@ -436,7 +436,7 @@ printf 'BASE_BRANCH_OVERRIDE=<%s>\\nUNIQUE_BRANCH=<%s>\\n' "$BASE_BRANCH_OVERRID
 
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toContain(
-      "ERROR: base branch override 'release/missing' does not exist on bluedevilcollectibles/bdc-xo"
+      "ERROR: base branch override 'release/missing' does not exist on thinmansoftware/bdc-xo"
     );
     expect(result.stdout).not.toContain('CMD=gh pr create');
   });
@@ -448,7 +448,7 @@ printf 'BASE_BRANCH_OVERRIDE=<%s>\\nUNIQUE_BRANCH=<%s>\\n' "$BASE_BRANCH_OVERRID
       'pr_required: true',
       'staging_gate_required: false',
       `base_branch_override: ${illustrativePlaceholder}`,
-      'repo: bluedevilcollectibles/bdc-xo',
+      'repo: thinmansoftware/bdc-xo',
     ].join('\n');
 
     const result = bash(BASE_BRANCH_OVERRIDE_SELECTION_AND_BODY, worktreeDir, {
@@ -471,7 +471,7 @@ printf 'BASE_BRANCH_OVERRIDE=<%s>\\nUNIQUE_BRANCH=<%s>\\n' "$BASE_BRANCH_OVERRID
       'push_target: feature-branch:feat/wo-foo-01',
       'pr_required: true',
       'staging_gate_required: true',
-      'repo: bluedevilcollectibles/shopops',
+      'repo: thinmansoftware/shopops',
     ].join('\n');
 
     const result = bash(BASE_BRANCH_OVERRIDE_SELECTION_AND_BODY, worktreeDir, {

@@ -5,7 +5,7 @@ import { freezeWorkOrderSource } from './work-order-source';
 
 const policy: RunAuthorityPolicy = {
   required: true,
-  spec_repository: 'bluedevilcollectibles/bdc-xo',
+  spec_repository: 'thinmansoftware/bdc-xo',
   spec_revision: 'main',
   spec_paths: ['docs/work-orders/{WO_ID}.md', 'docs/superpowers/specs/{WO_ID}.md'],
 };
@@ -87,12 +87,12 @@ describe('freezeWorkOrderSource', () => {
     );
 
     expect(frozen.woId).toBe('WO-ISSUE-FALLBACK-01');
-    expect(frozen.specSource).toBe('github:bluedevilcollectibles/bdc-xo:issues/42');
+    expect(frozen.specSource).toBe('github:thinmansoftware/bdc-xo:issues/42');
     expect(frozen.specRevision).toBe('issue:42:2026-07-10T12:00:00Z');
     expect(Buffer.from(frozen.specBytes).toString('utf8')).toContain('Exact issue-backed spec');
     expect(calls).toEqual([
       {
-        url: 'https://api.github.com/repos/bluedevilcollectibles/bdc-xo/issues/42',
+        url: 'https://api.github.com/repos/thinmansoftware/bdc-xo/issues/42',
         authorization: 'Bearer gh-token',
       },
     ]);

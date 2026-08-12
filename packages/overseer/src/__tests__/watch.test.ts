@@ -7,7 +7,7 @@ const greenPr: PullRequestEvidence = {
   state: 'open',
   checks: { total: 1, passed: 1, failed: 0, pending: 0 },
   mergeable: true,
-  pr: { owner: 'bluedevilcollectibles', repo: 'bdc-harness', number: 1 },
+  pr: { owner: 'thinmansoftware', repo: 'bdc-harness', number: 1 },
 };
 
 function deps(evidence: PullRequestEvidence): OverseerRunStoreDeps & GitHubClientDeps {
@@ -16,7 +16,7 @@ function deps(evidence: PullRequestEvidence): OverseerRunStoreDeps & GitHubClien
       {
         id: 'run-1',
         woId: 'WO-TEST-01',
-        owner: 'bluedevilcollectibles',
+        owner: 'thinmansoftware',
         repo: 'bdc-harness',
         status: 'failed',
         headBranch: 'wo/test',
@@ -86,7 +86,7 @@ describe('watch -- per-run exception isolation', () => {
         {
           id: 'run-throws',
           woId: 'WO-THROWS-01',
-          owner: 'bluedevilcollectibles',
+          owner: 'thinmansoftware',
           repo: 'bdc-harness',
           status: 'failed',
           headBranch: 'archon/thread-throws',
@@ -94,7 +94,7 @@ describe('watch -- per-run exception isolation', () => {
         {
           id: 'run-ok',
           woId: 'WO-OK-01',
-          owner: 'bluedevilcollectibles',
+          owner: 'thinmansoftware',
           repo: 'bdc-harness',
           status: 'failed',
           headBranch: 'archon/thread-ok',
@@ -140,7 +140,7 @@ describe('watch -- cancelled-run salvage', () => {
         {
           id: 'run-cancelled-1',
           woId: 'WO-SALVAGE-01',
-          owner: 'bluedevilcollectibles',
+          owner: 'thinmansoftware',
           repo: 'bdc-harness',
           status: 'cancelled',
           headBranch: 'archon/thread-abc',
@@ -215,7 +215,7 @@ describe('watch -- completed-run merge candidates', () => {
         {
           id: `run-${status}-1`,
           woId: 'WO-MERGE-DOOR-01',
-          owner: 'bluedevilcollectibles',
+          owner: 'thinmansoftware',
           repo: 'bdc-harness',
           status,
           headBranch: 'archon/thread-xyz',

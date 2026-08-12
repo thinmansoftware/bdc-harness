@@ -4,15 +4,15 @@
 #                                                  Rule 19 runtime grep)
 # Doctrine compliance: 13 hard rules of archon-yaml-authoring (verified at draft time)
 #
-# Pre-flight: codebase bluedevilcollectibles/shopops must be registered in Archon.
+# Pre-flight: codebase thinmansoftware/shopops must be registered in Archon.
 #   Verify: ssh hetzner-prod 'sqlite3 /opt/bdc/archon-data/archon.db "SELECT name FROM remote_agent_codebases"'
 #   Default branch is `master` (NOT main) for shopops.
 #
 # Pre-flight: WO spec MUST exist + be committed in bdc-xo at:
 #   docs/work-orders/WO-SHOPOPS-COVER-CASCADE-PRH-VISIBILITY-01.md
-#   Verify: gh api "repos/bluedevilcollectibles/bdc-xo/contents/docs/work-orders/WO-SHOPOPS-COVER-CASCADE-PRH-VISIBILITY-01.md?ref=main" --template '{{.name}}'
+#   Verify: gh api "repos/thinmansoftware/bdc-xo/contents/docs/work-orders/WO-SHOPOPS-COVER-CASCADE-PRH-VISIBILITY-01.md?ref=main" --template '{{.name}}'
 #
-# NOTE ON CWD: Archon clones bluedevilcollectibles/shopops into its worktree.
+# NOTE ON CWD: Archon clones thinmansoftware/shopops into its worktree.
 #   CWD = shopops repo root. shopops-api/ is a SUBDIRECTORY. All paths below are
 #   relative to shopops repo root (e.g., shopops-api/services/coverResolver.js).
 #   The WO spec lives in bdc-xo, fetched via gh api cross-repo at read-spec.
@@ -62,8 +62,8 @@ description: |
         (10) curls /api/covers/resolve to confirm cascade returns real cover for test UPC;
         (11) builds MIXED-class manifest (CODE + schema migration);
         (12) flips Notion to REVIEW (NEVER DONE -- Cauldron grader closes both fields).
-  Repo: bluedevilcollectibles/shopops (master branch). shopops-api/ subdir.
-        Spec lives in bluedevilcollectibles/bdc-xo (docs/work-orders/).
+  Repo: thinmansoftware/shopops (master branch). shopops-api/ subdir.
+        Spec lives in thinmansoftware/bdc-xo (docs/work-orders/).
   parallel_ok: false -- production view DDL, serial only.
   NOT for: any other WO.
 
@@ -83,18 +83,18 @@ nodes:
       # Primary: docs/work-orders/<WO_ID>.md in bdc-xo
       # gh --template uses Go templates (built-in, no jq dependency).
       SPEC_CONTENT=$(gh api \
-        "repos/bluedevilcollectibles/bdc-xo/contents/docs/work-orders/${WO_ID}.md?ref=main" \
+        "repos/thinmansoftware/bdc-xo/contents/docs/work-orders/${WO_ID}.md?ref=main" \
         --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
 
       # Fallback: glob in docs/superpowers/specs/
       if [ -z "$SPEC_CONTENT" ]; then
         GLOB_PATH=$(gh api \
-          "repos/bluedevilcollectibles/bdc-xo/contents/docs/superpowers/specs?ref=main" \
+          "repos/thinmansoftware/bdc-xo/contents/docs/superpowers/specs?ref=main" \
           --template '{{range .}}{{.path}}{{"\n"}}{{end}}' 2>/dev/null \
           | grep "${WO_ID}.md$" | head -1 || true)
         if [ -n "$GLOB_PATH" ]; then
           SPEC_CONTENT=$(gh api \
-            "repos/bluedevilcollectibles/bdc-xo/contents/${GLOB_PATH}?ref=main" \
+            "repos/thinmansoftware/bdc-xo/contents/${GLOB_PATH}?ref=main" \
             --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
         fi
       fi
@@ -103,12 +103,12 @@ nodes:
         # Fallback 4: GitHub issue body (WO-HARNESS-READ-SPEC-ISSUE-BODY-FALLBACK-01)
         ISSUE_NUM=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'issue=[0-9]+' | head -n 1 | cut -d= -f2 || true)
         if [ -z "$ISSUE_NUM" ]; then
-          ISSUE_NUM=$(gh issue list --repo bluedevilcollectibles/bdc-xo \
+          ISSUE_NUM=$(gh issue list --repo thinmansoftware/bdc-xo \
             --search "${WO_ID} in:title" --json number,title \
             --jq '.[0].number' 2>/dev/null || true)
         fi
         if [ -n "$ISSUE_NUM" ] && [ "$ISSUE_NUM" != "null" ]; then
-          SPEC_CONTENT=$(gh issue view "$ISSUE_NUM" --repo bluedevilcollectibles/bdc-xo \
+          SPEC_CONTENT=$(gh issue view "$ISSUE_NUM" --repo thinmansoftware/bdc-xo \
             --json body --jq .body 2>/dev/null || true)
           [ -n "$SPEC_CONTENT" ] && SPEC_PATH="issues/${ISSUE_NUM}"
         fi
@@ -384,7 +384,7 @@ nodes:
       set -euo pipefail
       # Read actual branch from current HEAD (commit-and-push may have used unique suffix).
       BRANCH="$(git rev-parse --abbrev-ref HEAD)"
-      REPO="bluedevilcollectibles/shopops"
+      REPO="thinmansoftware/shopops"
       BASE="master"
       TITLE="fix(cover): WO-SHOPOPS-COVER-CASCADE-PRH-VISIBILITY-01 -- PRH cascade 6 publishers + view filter drop"
       BODY_FILE=$(mktemp)
@@ -656,7 +656,7 @@ nodes:
       $read-spec.output
       BDC_NODE_OUTPUT_READ_SPEC
       )
-      ISSUE_REPO="${ISSUE_REPO:-bluedevilcollectibles/bdc-xo}"
+      ISSUE_REPO="${ISSUE_REPO:-thinmansoftware/bdc-xo}"
       ISSUE_NUM=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'issue=[0-9]+' | head -1 | cut -d= -f2 || true)
       if [ -z "$ISSUE_NUM" ]; then
         ISSUE_NUM=$(printf '%s\n' "$READ_SPEC_OUT" | sed -n 's/^SPEC_PATH=.*issues\/\([0-9][0-9]*\).*/\1/p' | head -1)

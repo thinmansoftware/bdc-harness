@@ -78,7 +78,7 @@ const taskmasterArgs = [
   '--status-url',
   'http://127.0.0.1:3090/api/taskmaster/status',
   '--github-repo',
-  'bluedevilcollectibles/bdc-xo',
+  'thinmansoftware/bdc-xo',
   '--github-issue',
   '777',
   '--output-root',
@@ -140,7 +140,7 @@ test('taskmaster accepts TASKMASTER_INTERVAL_MS=0 and wires token and artifacts'
   expect(deps.taskmasterRunner).toHaveBeenCalledWith({
     dbPath: 'archon.db',
     statusUrl: 'http://127.0.0.1:3090/api/taskmaster/status',
-    githubRepo: 'bluedevilcollectibles/bdc-xo',
+    githubRepo: 'thinmansoftware/bdc-xo',
     githubIssue: 777,
     intervalMs: 0,
     operatorToken: 'operator-token',

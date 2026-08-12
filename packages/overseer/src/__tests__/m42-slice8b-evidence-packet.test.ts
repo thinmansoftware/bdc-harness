@@ -26,7 +26,7 @@ function manifest(): M42Slice8BManifestPayload {
     mode: 'fake',
     candidate_sha: SHA_A,
     starting_sha: SHA_B,
-    repository_full_name: 'bluedevilcollectibles/bdc-harness',
+    repository_full_name: 'thinmansoftware/bdc-harness',
     provider_repository_id: 'R_sandbox_123',
     credential_principal_id: 'principal-sandbox-only-1234',
     image_digest: DIGEST,

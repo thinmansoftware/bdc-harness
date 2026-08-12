@@ -13,12 +13,12 @@ export function mergedPr(
   overrides: Partial<ReconcileMergedPullRequest> = {}
 ): ReconcileMergedPullRequest {
   return {
-    owner: 'bluedevilcollectibles',
+    owner: 'thinmansoftware',
     repo: 'bdc-harness',
     number: 404,
     title: 'BDC feature Work Order implementation',
     body: `Implements ${stem}.`,
-    htmlUrl: 'https://github.com/bluedevilcollectibles/bdc-harness/pull/404',
+    htmlUrl: 'https://github.com/thinmansoftware/bdc-harness/pull/404',
     state: 'closed',
     merged: true,
     mergeCommitSha: 'abc123merge',
@@ -29,7 +29,7 @@ export function mergedPr(
 
 export function trackerIssue(state: 'open' | 'closed' = 'open'): ReconcileTrackerIssue {
   return {
-    owner: 'bluedevilcollectibles',
+    owner: 'thinmansoftware',
     repo: 'bdc-xo',
     number: 1044,
     title: stem,
@@ -103,18 +103,16 @@ describe('reconcile', () => {
 
     expect(result).toEqual({ scanned: 1, closed: 1, skipped: false });
     expect(deps.comments).toHaveLength(1);
-    expect(deps.comments[0]).toContain(
-      'https://github.com/bluedevilcollectibles/bdc-harness/pull/404'
-    );
+    expect(deps.comments[0]).toContain('https://github.com/thinmansoftware/bdc-harness/pull/404');
     expect(deps.comments[0]).toContain('abc123merge');
-    expect(deps.comments[0]).toContain('bluedevilcollectibles/bdc-harness');
+    expect(deps.comments[0]).toContain('thinmansoftware/bdc-harness');
     expect(deps.labels).toEqual(['wo:done']);
     expect(deps.closes).toEqual([1044]);
     expect(deps.actions).toMatchObject([
       {
         woId: stem,
         action: 'reconcile_close',
-        result: 'https://github.com/bluedevilcollectibles/bdc-harness/pull/404:abc123merge',
+        result: 'https://github.com/thinmansoftware/bdc-harness/pull/404:abc123merge',
       },
     ]);
   });

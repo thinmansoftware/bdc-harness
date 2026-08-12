@@ -140,9 +140,9 @@ GHEOF
 }
 
 echo "--- Test: claimed path absent from PR files -> fail ---"
-MANIFEST=$'Files created: docs/canary/zero-open-lane-canary-01.md\nFiles modified: none\nPRs: https://github.com/bluedevilcollectibles/bdc-harness/pull/999'
+MANIFEST=$'Files created: docs/canary/zero-open-lane-canary-01.md\nFiles modified: none\nPRs: https://github.com/thinmansoftware/bdc-harness/pull/999'
 set +e
-OUT=$(run_pr_check "https://github.com/bluedevilcollectibles/bdc-harness/pull/999" "$MANIFEST" ".archon/workflows/x.yaml")
+OUT=$(run_pr_check "https://github.com/thinmansoftware/bdc-harness/pull/999" "$MANIFEST" ".archon/workflows/x.yaml")
 CODE=$?
 set -e
 assert_nonzero "wrong content non-zero" "$CODE"
@@ -156,9 +156,9 @@ else
 fi
 
 echo "--- Test: claimed path present in PR files -> OK ---"
-MANIFEST=$'Files created: docs/canary/zero-open-lane-canary-01.md\nFiles modified: none\nPRs: https://github.com/bluedevilcollectibles/bdc-harness/pull/999'
+MANIFEST=$'Files created: docs/canary/zero-open-lane-canary-01.md\nFiles modified: none\nPRs: https://github.com/thinmansoftware/bdc-harness/pull/999'
 set +e
-OUT=$(run_pr_check "https://github.com/bluedevilcollectibles/bdc-harness/pull/999" "$MANIFEST" "docs/canary/zero-open-lane-canary-01.md")
+OUT=$(run_pr_check "https://github.com/thinmansoftware/bdc-harness/pull/999" "$MANIFEST" "docs/canary/zero-open-lane-canary-01.md")
 CODE=$?
 set -e
 assert_eq "match exit 0" "0" "$CODE"

@@ -28,7 +28,7 @@ function succeededOnRamp(actor: string): FirstRefireOnRampResultV1 {
 function salvage(): OverseerSalvageReceiptV1 {
   return {
     schema_version: 'overseer-salvage-receipt-v1',
-    repository: 'bluedevilcollectibles/bdc-harness',
+    repository: 'thinmansoftware/bdc-harness',
     wo_id: 'WO-CLAIM-RACE',
     source_target_kind: 'workflow_run',
     source_target_key: 'run-source',
@@ -54,7 +54,7 @@ function claimResponse(input: {
 }): ExecutionClaimResponse {
   return {
     claim_id: input.claimId,
-    motion_id: 'overseer:bluedevilcollectibles/bdc-harness:WO-CLAIM-RACE:exec-race',
+    motion_id: 'overseer:thinmansoftware/bdc-harness:WO-CLAIM-RACE:exec-race',
     action_kind: 'overseer_repair_refire',
     environment: 'recovery',
     target_sha: input.targetDigest,
@@ -200,7 +200,7 @@ function inputFor(actor: string): RepairRefireExecutionInput {
     proposal_id: `proposal-${actor}`,
     execution_id: 'exec-race',
     idempotency_key: `idem-${actor}`,
-    repository: 'bluedevilcollectibles/bdc-harness',
+    repository: 'thinmansoftware/bdc-harness',
     wo_id: 'WO-CLAIM-RACE',
     workflow_name: 'implement',
     target_digest: sha256hex('target'),

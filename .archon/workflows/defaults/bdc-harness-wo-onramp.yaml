@@ -22,7 +22,7 @@ interactive: true
 
 inputs:
   ISSUE_REPO:
-    default: "bluedevilcollectibles/bdc-xo"
+    default: "thinmansoftware/bdc-xo"
 
 nodes:
 
@@ -41,8 +41,8 @@ nodes:
       echo "gh auth: OK"
 
       echo "=== preflight: checking bdc-xo reachability ==="
-      if ! gh api repos/bluedevilcollectibles/bdc-xo --jq .id >/dev/null 2>&1; then
-        echo "ERROR: cannot reach bluedevilcollectibles/bdc-xo via gh api." >&2
+      if ! gh api repos/thinmansoftware/bdc-xo --jq .id >/dev/null 2>&1; then
+        echo "ERROR: cannot reach thinmansoftware/bdc-xo via gh api." >&2
         echo "Check GITHUB_TOKEN scope (needs repo read on bdc-xo)." >&2
         exit 1
       fi
@@ -95,28 +95,28 @@ nodes:
 
       # 1) docs/work-orders/<WO_ID>.md
       SPEC_PATH="docs/work-orders/${WO_ID}.md"
-      SPEC_CONTENT=$(gh api "repos/bluedevilcollectibles/bdc-xo/contents/${SPEC_PATH}?ref=main" --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
+      SPEC_CONTENT=$(gh api "repos/thinmansoftware/bdc-xo/contents/${SPEC_PATH}?ref=main" --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
 
       # 2) docs/superpowers/specs/<WO_ID>.md
       if [ -z "$SPEC_CONTENT" ]; then
         SPEC_PATH="docs/superpowers/specs/${WO_ID}.md"
-        SPEC_CONTENT=$(gh api "repos/bluedevilcollectibles/bdc-xo/contents/${SPEC_PATH}?ref=main" --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
+        SPEC_CONTENT=$(gh api "repos/thinmansoftware/bdc-xo/contents/${SPEC_PATH}?ref=main" --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
       fi
 
       # 3) date-prefix glob in docs/superpowers/specs/
       if [ -z "$SPEC_CONTENT" ]; then
-        MATCH=$(gh api "repos/bluedevilcollectibles/bdc-xo/contents/docs/superpowers/specs?ref=main" --template '{{range .}}{{.path}}{{"\n"}}{{end}}' 2>/dev/null | grep "${WO_ID}.md$" | head -n 1 || true)
+        MATCH=$(gh api "repos/thinmansoftware/bdc-xo/contents/docs/superpowers/specs?ref=main" --template '{{range .}}{{.path}}{{"\n"}}{{end}}' 2>/dev/null | grep "${WO_ID}.md$" | head -n 1 || true)
         if [ -n "$MATCH" ]; then
           SPEC_PATH="$MATCH"
-          SPEC_CONTENT=$(gh api "repos/bluedevilcollectibles/bdc-xo/contents/${SPEC_PATH}?ref=main" --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
+          SPEC_CONTENT=$(gh api "repos/thinmansoftware/bdc-xo/contents/${SPEC_PATH}?ref=main" --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
         fi
       fi
 
       # 4) GitHub issue body fallback
       if [ -z "$SPEC_CONTENT" ]; then
-        ISSUE_NUM=$(gh issue list --repo bluedevilcollectibles/bdc-xo --search "${WO_ID} in:title" --json number --jq '.[0].number' 2>/dev/null || true)
+        ISSUE_NUM=$(gh issue list --repo thinmansoftware/bdc-xo --search "${WO_ID} in:title" --json number --jq '.[0].number' 2>/dev/null || true)
         if [ -n "$ISSUE_NUM" ] && [ "$ISSUE_NUM" != "null" ]; then
-          SPEC_CONTENT=$(gh issue view "$ISSUE_NUM" --repo bluedevilcollectibles/bdc-xo --json body --jq .body 2>/dev/null || true)
+          SPEC_CONTENT=$(gh issue view "$ISSUE_NUM" --repo thinmansoftware/bdc-xo --json body --jq .body 2>/dev/null || true)
           [ -n "$SPEC_CONTENT" ] && SPEC_PATH="bdc-xo:issues/${ISSUE_NUM}"
         fi
       fi
@@ -173,8 +173,8 @@ nodes:
       - TARGET_REPO: short repo name (e.g. shopops)
       - TARGET_REPO_FULL: bluedevilcollectibles/<TARGET_REPO> (add org prefix if missing)
       - RULE20_STAGING_GATE: true if TARGET_REPO_FULL is one of:
-        bluedevilcollectibles/lspro-react, bluedevilcollectibles/shopops-storefront,
-        bluedevilcollectibles/shopops. Otherwise false.
+        thinmansoftware/lspro-react, thinmansoftware/shopops-storefront,
+        thinmansoftware/shopops. Otherwise false.
       - WO_CLASS: CODE, INFRA, or MIXED (from spec Class field; default CODE)
       - BUSINESS_RISK_INVARIANT: the single most critical must-not-break invariant.
         Derive from the Stop Point / Behavior Source of Truth / any "MUST NEVER break"
@@ -794,7 +794,7 @@ nodes:
         echo "ERROR: ARCHON_API_BASE must be an explicit loopback staging URL; refusing external or unset target." >&2
         exit 1
       fi
-      HARNESS_REPO="bluedevilcollectibles/bdc-harness"
+      HARNESS_REPO="thinmansoftware/bdc-harness"
       ARCHON_HEADERS=(-H "x-archon-operator-token: ${ARCHON_OPERATOR_TOKEN}")
       if [ -n "${CF_ACCESS_CLIENT_ID:-}" ] && [ -n "${CF_ACCESS_CLIENT_SECRET:-}" ]; then
         ARCHON_HEADERS+=(-H "CF-Access-Client-Id: ${CF_ACCESS_CLIENT_ID}")
@@ -951,7 +951,7 @@ nodes:
       DEST_PATH=".archon/workflows/defaults/${WO_SLUG}.yaml"
       YAML_CONTENT=$(base64 < "$YAML_FILENAME" | tr -d '\n')
       COMMIT_MSG="feat(on-ramp): register ${WO_SLUG} child workflow via bdc-harness-wo-onramp"
-      HARNESS_REPO="bluedevilcollectibles/bdc-harness"
+      HARNESS_REPO="thinmansoftware/bdc-harness"
       API_BASE="${ARCHON_API_BASE:-}"
       if ! API_BASE="$API_BASE" python3 -c 'import os,sys; from urllib.parse import urlsplit; u=urlsplit(os.environ.get("API_BASE", "")); sys.exit(0 if u.scheme == "http" and u.hostname in ("127.0.0.1", "localhost") and u.port is not None and u.username is None and u.password is None and u.path in ("", "/") and not u.query and not u.fragment else 1)'; then
         echo "ERROR: ARCHON_API_BASE must be an explicit loopback staging URL; refusing external or unset target." >&2
@@ -984,7 +984,7 @@ nodes:
         "${ARCHON_HEADERS[@]}" \
         "${API_BASE}/api/codebases" 2>/dev/null || echo '{}')
       DEFAULT_CWD=$(printf '%s\n' "$CODEBASES" \
-        | python3 -c "import sys,json; data=json.load(sys.stdin); cbs=data if isinstance(data,list) else data.get('codebases',[]); [print(cb.get('default_cwd',cb.get('cwd',''))) for cb in cbs if 'bdc-harness' in (cb.get('name','') or '') or (cb.get('name','') or '')==('bluedevilcollectibles/bdc-harness')]" \
+        | python3 -c "import sys,json; data=json.load(sys.stdin); cbs=data if isinstance(data,list) else data.get('codebases',[]); [print(cb.get('default_cwd',cb.get('cwd',''))) for cb in cbs if 'bdc-harness' in (cb.get('name','') or '') or (cb.get('name','') or '')==('thinmansoftware/bdc-harness')]" \
         2>/dev/null || echo "")
       echo "DEFAULT_CWD=${DEFAULT_CWD:-<not found>}"
 
@@ -1458,7 +1458,7 @@ nodes:
       PRs: (register-yaml commits directly to bdc-harness dev; no PR for YAML registration)
       Merge ancestors: (bdc-harness dev HEAD after register-yaml PUT; child product WO PR TBD by child run)
       Grep assertions:
-        bdc-harness: gh api repos/bluedevilcollectibles/bdc-harness/contents/.archon/workflows/defaults/<WO_SLUG>.yaml?ref=dev --jq .size -> > 0
+        bdc-harness: gh api repos/thinmansoftware/bdc-harness/contents/.archon/workflows/defaults/<WO_SLUG>.yaml?ref=dev --jq .size -> > 0
         bdc-harness: grep -c "^model:[ ]sonnet$" .archon/workflows/defaults/<WO_SLUG>.yaml -> 1
         bdc-harness: grep -c "^policyFile:" .archon/workflows/defaults/<WO_SLUG>.yaml -> 1
         bdc-harness: grep -c "id: business-risk-gate" .archon/workflows/defaults/<WO_SLUG>.yaml -> 1
@@ -1545,7 +1545,7 @@ nodes:
         exit 0
       fi
 
-      ISSUE_REPO="${INPUT_ISSUE_REPO:-${ISSUE_REPO:-bluedevilcollectibles/bdc-xo}}"
+      ISSUE_REPO="${INPUT_ISSUE_REPO:-${ISSUE_REPO:-thinmansoftware/bdc-xo}}"
       ISSUE_NUM=$(gh issue list --repo "$ISSUE_REPO" --search "$WO_ID in:title" --json number --jq '.[0].number // empty' 2>/dev/null || true)
       if [ -z "$ISSUE_NUM" ]; then
         echo "review-issue: no GitHub issue found for ${WO_ID} in ${ISSUE_REPO}; skipping status:review label and manifest comment."

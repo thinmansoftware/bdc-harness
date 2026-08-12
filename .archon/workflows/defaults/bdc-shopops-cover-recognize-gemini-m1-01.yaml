@@ -12,7 +12,7 @@
 #  [x] Rule 5:  spec lookup tries docs/work-orders/ then docs/superpowers/specs/ direct, date-prefix glob, GitHub issue search
 #  [x] Rule 6:  policyFile: harness/policies/agent-behavior.md (no prefix)
 #  [x] Rule 7:  flip-notion final node present; manifest goes in Notes property, not comment; flips to REVIEW (NEVER DONE)
-#  [x] Rule 8:  codebase bluedevilcollectibles/shopops MUST be registered -- verify in Pre-flight below
+#  [x] Rule 8:  codebase thinmansoftware/shopops MUST be registered -- verify in Pre-flight below
 #  [x] Rule 9:  YAML must land in bdc-harness/.archon/workflows/defaults/ (flat or one subdir)
 #  [x] Rule 10: implement loop declares ALL FOUR siblings: prompt, until, max_iterations, fresh_context
 #  [x] Rule 11: NO n8n webhook calls (no post-started / post-completed nodes)
@@ -23,11 +23,11 @@
 # Pre-flight (operator verifies BEFORE firing):
 #   1. Codebase registered:
 #      ssh hetzner-prod "sqlite3 /opt/bdc/archon-data/archon.db \"SELECT name FROM remote_agent_codebases;\""
-#      Expected: bluedevilcollectibles/shopops appears in output. Default branch: master.
+#      Expected: thinmansoftware/shopops appears in output. Default branch: master.
 #   2. WO spec exists on bdc-xo main:
-#      gh api "repos/bluedevilcollectibles/bdc-xo/contents/docs/work-orders/WO-SHOPOPS-COVER-RECOGNIZE-GEMINI-M1-01.md?ref=main" --jq .name
+#      gh api "repos/thinmansoftware/bdc-xo/contents/docs/work-orders/WO-SHOPOPS-COVER-RECOGNIZE-GEMINI-M1-01.md?ref=main" --jq .name
 #      Expected: "WO-SHOPOPS-COVER-RECOGNIZE-GEMINI-M1-01.md" (commit + push the spec to bdc-xo main BEFORE firing).
-#   3. GITHUB_TOKEN in Archon executor has push scope to bluedevilcollectibles/shopops.
+#   3. GITHUB_TOKEN in Archon executor has push scope to thinmansoftware/shopops.
 #   4. GEMINI_API_KEY MUST be present in the shopops-api container env BEFORE the runtime grep can pass.
 #      The build does NOT provision it; operator sets it on Hetzner (docker compose env / .env) before deploy.
 #   5. NOTION_PAGE_ID placeholder below is 371ef4c9-ce00-8112-a7cd-d9155f155d2f. Substitute the real
@@ -72,7 +72,7 @@ description: |
     - Provides Rule 19 docker exec grep evidence in manifest.
     - Flips Notion WO-SHOPOPS-COVER-RECOGNIZE-GEMINI-M1-01 to REVIEW with manifest in Notes.
       NEVER DONE -- the Cauldron grader / Captain CI closes both fields after a VALIDATED verdict.
-  Repo: bluedevilcollectibles/shopops (master branch -- Rule 20 staging-gate repo).
+  Repo: thinmansoftware/shopops (master branch -- Rule 20 staging-gate repo).
   WO class: CODE (single-repo, single Cauldron fire -- NOT a battlegroup). NO migration.
   Security: LIVE cross-tenant inventory leak fix in prod -- capable builder + verify/review DAG.
   parallel_ok: true ONLY while no other active WO touches coverRecognition.js / externalCoverSearch.js.
@@ -95,12 +95,12 @@ nodes:
     bash: |
       set -euo pipefail
       if ! git push --dry-run origin "HEAD:refs/heads/preflight-auth-probe-$(date +%s)" 2>&1; then
-        echo "ERROR: GITHUB auth check failed -- container cannot push to bluedevilcollectibles/shopops." >&2
+        echo "ERROR: GITHUB auth check failed -- container cannot push to thinmansoftware/shopops." >&2
         echo "Check: GITHUB_TOKEN in executor env has repo push scope." >&2
         exit 1
       fi
       echo "preflight-github-auth PASS"
-      echo "TARGET_REPO=bluedevilcollectibles/shopops"
+      echo "TARGET_REPO=thinmansoftware/shopops"
       echo "TARGET_BRANCH=master"
 
   # --- Node 2: Read spec (cross-repo via gh api from bdc-xo) ------------------
@@ -115,7 +115,7 @@ nodes:
 
       # Primary: docs/work-orders/<WO_ID>.md on bdc-xo main
       SPEC_CONTENT=$(gh api \
-        "repos/bluedevilcollectibles/bdc-xo/contents/docs/work-orders/${WO_ID}.md?ref=main" \
+        "repos/thinmansoftware/bdc-xo/contents/docs/work-orders/${WO_ID}.md?ref=main" \
         --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
       SPEC_PATH="docs/work-orders/${WO_ID}.md"
 
@@ -123,31 +123,31 @@ nodes:
       if [ -z "$SPEC_CONTENT" ]; then
         SPEC_PATH="docs/superpowers/specs/${WO_ID}.md"
         SPEC_CONTENT=$(gh api \
-          "repos/bluedevilcollectibles/bdc-xo/contents/${SPEC_PATH}?ref=main" \
+          "repos/thinmansoftware/bdc-xo/contents/${SPEC_PATH}?ref=main" \
           --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
       fi
 
       # Fallback 2: date-prefix glob in docs/superpowers/specs/
       if [ -z "$SPEC_CONTENT" ]; then
         GLOB_PATH=$(gh api \
-          "repos/bluedevilcollectibles/bdc-xo/contents/docs/superpowers/specs?ref=main" \
+          "repos/thinmansoftware/bdc-xo/contents/docs/superpowers/specs?ref=main" \
           --template '{{range .}}{{.path}}{{"\n"}}{{end}}' 2>/dev/null \
           | grep "${WO_ID}.md$" | head -1 || true)
         if [ -n "$GLOB_PATH" ]; then
           SPEC_PATH="$GLOB_PATH"
           SPEC_CONTENT=$(gh api \
-            "repos/bluedevilcollectibles/bdc-xo/contents/${SPEC_PATH}?ref=main" \
+            "repos/thinmansoftware/bdc-xo/contents/${SPEC_PATH}?ref=main" \
             --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
         fi
       fi
 
       # Fallback 3: GitHub issue search (WO-HARNESS-READ-SPEC-ISSUE-BODY-FALLBACK-01)
       if [ -z "$SPEC_CONTENT" ]; then
-        ISSUE_NUM=$(gh issue list --repo bluedevilcollectibles/bdc-xo \
+        ISSUE_NUM=$(gh issue list --repo thinmansoftware/bdc-xo \
           --search "${WO_ID} in:title" --json number,title \
           --jq '.[0].number' 2>/dev/null || true)
         if [ -n "$ISSUE_NUM" ] && [ "$ISSUE_NUM" != "null" ]; then
-          SPEC_CONTENT=$(gh issue view "$ISSUE_NUM" --repo bluedevilcollectibles/bdc-xo \
+          SPEC_CONTENT=$(gh issue view "$ISSUE_NUM" --repo thinmansoftware/bdc-xo \
             --json body --jq .body 2>/dev/null || true)
           [ -n "$SPEC_CONTENT" ] && SPEC_PATH="issues/${ISSUE_NUM}"
         fi
@@ -175,7 +175,7 @@ nodes:
       git checkout -b "$BRANCH"
       echo "BRANCH=${BRANCH}"
       echo "BASE=master"
-      echo "REPO=bluedevilcollectibles/shopops"
+      echo "REPO=thinmansoftware/shopops"
 
   # --- Node 4: Implement (self-review loop) -----------------------------------
   # Rule 3: fresh_context: true (required for self-review loops).
@@ -421,7 +421,7 @@ nodes:
     bash: |
       set -euo pipefail
       WO_ID="WO-SHOPOPS-COVER-RECOGNIZE-GEMINI-M1-01"
-      REPO="bluedevilcollectibles/shopops"
+      REPO="thinmansoftware/shopops"
       BRANCH="$(git rev-parse --abbrev-ref HEAD)"
       BASE="master"
       TITLE="feat(shopops-api): WO-SHOPOPS-COVER-RECOGNIZE-GEMINI-M1-01 -- Gemini cover recognition + cross-tenant leak fix"
@@ -588,7 +588,7 @@ nodes:
       $read-spec.output
       BDC_NODE_OUTPUT_READ_SPEC
       )
-      ISSUE_REPO="${ISSUE_REPO:-bluedevilcollectibles/bdc-xo}"
+      ISSUE_REPO="${ISSUE_REPO:-thinmansoftware/bdc-xo}"
       ISSUE_NUM=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'issue=[0-9]+' | head -1 | cut -d= -f2 || true)
       if [ -z "$ISSUE_NUM" ]; then
         ISSUE_NUM=$(printf '%s\n' "$READ_SPEC_OUT" | sed -n 's/^SPEC_PATH=.*issues\/\([0-9][0-9]*\).*/\1/p' | head -1)

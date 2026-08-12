@@ -5,9 +5,9 @@
 # Doctrine compliance: 13 hard rules of archon-yaml-authoring (verified at draft time)
 #
 # Pre-flight (OPERATOR MUST VERIFY BEFORE FIRING):
-#   1. bluedevilcollectibles/lspro-react registered in Archon AND default_cwd = lspro-react repo root:
+#   1. thinmansoftware/lspro-react registered in Archon AND default_cwd = lspro-react repo root:
 #      sqlite3 /opt/bdc/archon-data/archon.db "SELECT name, default_cwd FROM remote_agent_codebases WHERE name LIKE '%lspro%'"
-#   2. bluedevilcollectibles/shopops registered in Archon (this WO touches BOTH repos via /tmp clone)
+#   2. thinmansoftware/shopops registered in Archon (this WO touches BOTH repos via /tmp clone)
 #   3. WO spec committed + pushed to bdc-xo main: docs/work-orders/WO-CHEERS-DASHBOARD-01.md
 #   4. GH_TOKEN with push to both lspro-react + shopops in Archon env
 #   5. Notion page ID for WO-CHEERS-DASHBOARD-01 -- fill in 35fef4c9-ce00-81e8-a80d-d32a989e33e6 before firing
@@ -31,8 +31,8 @@ description: |
         Opens 2 PRs (lspro-react main + shopops master). UI build-time verification
         loop N=3. Rule 19 runtime grep against shopops-api container. Builds MIXED
         manifest. Flips Notion to REVIEW.
-  Repos: bluedevilcollectibles/lspro-react (Archon CWD) + bluedevilcollectibles/shopops
-         (cloned to /tmp). WO spec in bluedevilcollectibles/bdc-xo.
+  Repos: thinmansoftware/lspro-react (Archon CWD) + thinmansoftware/shopops
+         (cloned to /tmp). WO spec in thinmansoftware/bdc-xo.
   parallel_ok: false -- touches 2 repos.
   NOT for: any other WO.
 
@@ -47,17 +47,17 @@ nodes:
       WO_ID="${WO_ID:-WO-CHEERS-DASHBOARD-01}"
 
       SPEC_CONTENT=$(gh api \
-        "repos/bluedevilcollectibles/bdc-xo/contents/docs/work-orders/${WO_ID}.md?ref=main" \
+        "repos/thinmansoftware/bdc-xo/contents/docs/work-orders/${WO_ID}.md?ref=main" \
         --jq .content 2>/dev/null | base64 -d 2>/dev/null || true)
 
       if [ -z "$SPEC_CONTENT" ]; then
         GLOB_PATH=$(gh api \
-          "repos/bluedevilcollectibles/bdc-xo/contents/docs/superpowers/specs?ref=main" \
+          "repos/thinmansoftware/bdc-xo/contents/docs/superpowers/specs?ref=main" \
           --jq '[.[] | select(.name | test("'"${WO_ID}"'")) | .path] | .[0]' \
           2>/dev/null || true)
         if [ -n "$GLOB_PATH" ] && [ "$GLOB_PATH" != "null" ]; then
           SPEC_CONTENT=$(gh api \
-            "repos/bluedevilcollectibles/bdc-xo/contents/${GLOB_PATH}?ref=main" \
+            "repos/thinmansoftware/bdc-xo/contents/${GLOB_PATH}?ref=main" \
             --jq .content 2>/dev/null | base64 -d 2>/dev/null || true)
         fi
       fi
@@ -66,12 +66,12 @@ nodes:
         # Fallback 4: GitHub issue body (WO-HARNESS-READ-SPEC-ISSUE-BODY-FALLBACK-01)
         ISSUE_NUM=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'issue=[0-9]+' | head -n 1 | cut -d= -f2 || true)
         if [ -z "$ISSUE_NUM" ]; then
-          ISSUE_NUM=$(gh issue list --repo bluedevilcollectibles/bdc-xo \
+          ISSUE_NUM=$(gh issue list --repo thinmansoftware/bdc-xo \
             --search "${WO_ID} in:title" --json number,title \
             --jq '.[0].number' 2>/dev/null || true)
         fi
         if [ -n "$ISSUE_NUM" ] && [ "$ISSUE_NUM" != "null" ]; then
-          SPEC_CONTENT=$(gh issue view "$ISSUE_NUM" --repo bluedevilcollectibles/bdc-xo \
+          SPEC_CONTENT=$(gh issue view "$ISSUE_NUM" --repo thinmansoftware/bdc-xo \
             --json body --jq .body 2>/dev/null || true)
           [ -n "$SPEC_CONTENT" ] && SPEC_PATH="issues/${ISSUE_NUM}"
         fi
@@ -79,7 +79,7 @@ nodes:
       if [ -z "$SPEC_CONTENT" ]; then echo "Spec not found (tried docs/work-orders/, docs/superpowers/specs/ direct, date-prefix glob, and GitHub issue search)" >&2; exit 1; fi
 
       DESIGN_DOC=$(gh api \
-        "repos/bluedevilcollectibles/bdc-xo/contents/docs/superpowers/specs/2026-04-16-cheers-platform-design.md?ref=main" \
+        "repos/thinmansoftware/bdc-xo/contents/docs/superpowers/specs/2026-04-16-cheers-platform-design.md?ref=main" \
         --jq .content 2>/dev/null | base64 -d 2>/dev/null | head -250 || true)
 
       printf 'WO_ID=%s\nWORKFLOW_ID=%s\n\n' "$WO_ID" "$WORKFLOW_ID"
@@ -146,7 +146,7 @@ nodes:
         git reset --hard "origin/$DEFAULT_BRANCH" 2>/dev/null || git reset --hard "origin/$DEFAULT_BRANCH"
         echo "STATUS=reused"
       else
-        git clone "https://github.com/bluedevilcollectibles/shopops.git" "$SHOPOPS_DIR" --depth=50
+        git clone "https://github.com/thinmansoftware/shopops.git" "$SHOPOPS_DIR" --depth=50
         echo "STATUS=fresh"
       fi
       echo "SHOPOPS_DIR=${SHOPOPS_DIR}"
@@ -464,7 +464,7 @@ nodes:
     bash: |
       set -euo pipefail
       BRANCH="wo/cheers-dashboard-01"
-      REPO="bluedevilcollectibles/lspro-react"
+      REPO="thinmansoftware/lspro-react"
       BODY=$(mktemp)
       {
         echo "## Summary"
@@ -504,7 +504,7 @@ nodes:
       set -euo pipefail
       cd /tmp/shopops-work-$WORKFLOW_ID
       BRANCH="wo/cheers-dashboard-01"
-      REPO="bluedevilcollectibles/shopops"
+      REPO="thinmansoftware/shopops"
       BODY=$(mktemp)
       {
         echo "## Summary"
@@ -560,7 +560,7 @@ nodes:
     bash: |
       # set -e DELIBERATELY OMITTED -- Vercel may be in-flight
       sleep 30
-      RESULT=$(gh pr list --repo "bluedevilcollectibles/lspro-react" --head "wo/cheers-dashboard-01" \
+      RESULT=$(gh pr list --repo "thinmansoftware/lspro-react" --head "wo/cheers-dashboard-01" \
         --state open --json url,headRefName 2>&1)
       if echo "$RESULT" | grep -q "url"; then
         echo "STATUS=pr_open_preview_pending"
@@ -663,7 +663,7 @@ nodes:
       $read-spec.output
       BDC_NODE_OUTPUT_READ_SPEC
       )
-      ISSUE_REPO="${ISSUE_REPO:-bluedevilcollectibles/bdc-xo}"
+      ISSUE_REPO="${ISSUE_REPO:-thinmansoftware/bdc-xo}"
       ISSUE_NUM=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'issue=[0-9]+' | head -1 | cut -d= -f2 || true)
       if [ -z "$ISSUE_NUM" ]; then
         ISSUE_NUM=$(printf '%s\n' "$READ_SPEC_OUT" | sed -n 's/^SPEC_PATH=.*issues\/\([0-9][0-9]*\).*/\1/p' | head -1)

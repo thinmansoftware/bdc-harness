@@ -15,7 +15,7 @@ description: |
         direct for staging), classifies PASS/FAIL/BLOCKED/NOT_TESTED with captured proof +
         provenance, commits a durable evidence report to bdc-xo, re-marks the checklist, and
         auto-files a fix WO per FAIL. Read-only probes; NEVER mutates prod billing.
-  Repo: bluedevilcollectibles/bdc-xo (operator selects bdc-xo codebase when firing).
+  Repo: thinmansoftware/bdc-xo (operator selects bdc-xo codebase when firing).
   Spec: docs/work-orders/WO-HARNESS-VERIFY-GATE-WORKFLOW-01.md
   parallel_ok: false
 
@@ -30,7 +30,7 @@ description: |
 
 policyFile: harness/policies/agent-behavior.md
 model: sonnet
-target_repo: bluedevilcollectibles/bdc-xo
+target_repo: thinmansoftware/bdc-xo
 
 inputs:
   CHECKLIST_PATH:
@@ -89,7 +89,7 @@ nodes:
         CHECKLIST_CONTENT=$(cat "$CHECKLIST_PATH")
       else
         CHECKLIST_CONTENT=$(gh api \
-          "repos/bluedevilcollectibles/bdc-xo/contents/${CHECKLIST_PATH}?ref=main" \
+          "repos/thinmansoftware/bdc-xo/contents/${CHECKLIST_PATH}?ref=main" \
           --jq .content 2>/dev/null | base64 -d 2>/dev/null || true)
       fi
       if [ -z "$CHECKLIST_CONTENT" ]; then
@@ -151,7 +151,7 @@ nodes:
            "CF Access token not in container env"). STAGING probes need no CF headers.
         3. Capture the actual HTTP status and a short response-shape note as proof.
         4. For code/route provenance, read source via:
-             gh api "repos/bluedevilcollectibles/shopops/contents/<path>?ref=$CLEAN_BASELINE_REF"
+             gh api "repos/thinmansoftware/shopops/contents/<path>?ref=$CLEAN_BASELINE_REF"
            NEVER read /opt/bdc/shopops (dirty checkout). State the baseline ref per row.
         5. Classify each item:
              PASS        -- probe succeeded with expected status/shape (proof captured)
@@ -274,21 +274,21 @@ nodes:
       fi
       PR_OK=false
       for attempt in 1 2 3; do
-        if gh pr create --repo bluedevilcollectibles/bdc-xo \
+        if gh pr create --repo thinmansoftware/bdc-xo \
              --title "evidence(verify-gate): ${GATE_NAME} verification report" \
              --body "Automated gate-evidence report from bdc-verify-gate. Read-only probes; no prod billing mutation. Review the evidence table + re-marked checklist." \
              --head "$UNIQUE_BRANCH" 2>&1; then
           PR_OK=true; break
         fi
-        EXIST=$(gh pr list --repo bluedevilcollectibles/bdc-xo --head "$UNIQUE_BRANCH" --state open --json url --jq '.[0].url // empty' 2>/dev/null || true)
+        EXIST=$(gh pr list --repo thinmansoftware/bdc-xo --head "$UNIQUE_BRANCH" --state open --json url --jq '.[0].url // empty' 2>/dev/null || true)
         if [ -n "$EXIST" ]; then echo "PR_URL=$EXIST"; PR_OK=true; break; fi
         echo "WARN: gh pr create attempt $attempt failed; retrying after $((attempt * 5))s..." >&2
         sleep $((attempt * 5))
       done
       if [ "$PR_OK" = "false" ]; then
         # Branch is verified on origin above -- work is SAFE, salvageable manually.
-        echo "PR_CREATE_FAILED_BUT_BRANCH_SAFE: repo=bluedevilcollectibles/bdc-xo branch=${UNIQUE_BRANCH} sha=$(git rev-parse HEAD)" >&2
-        echo "RECOVERY: gh pr create --repo bluedevilcollectibles/bdc-xo --head ${UNIQUE_BRANCH}" >&2
+        echo "PR_CREATE_FAILED_BUT_BRANCH_SAFE: repo=thinmansoftware/bdc-xo branch=${UNIQUE_BRANCH} sha=$(git rev-parse HEAD)" >&2
+        echo "RECOVERY: gh pr create --repo thinmansoftware/bdc-xo --head ${UNIQUE_BRANCH}" >&2
         echo "ERROR: gh pr create failed after 3 attempts." >&2
         exit 1
       fi

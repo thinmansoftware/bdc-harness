@@ -182,7 +182,7 @@ describe('classifyError -- failure classes E-J (BDC 2026-07-17)', () => {
     for (const phrase of phrases) {
       expect(
         classifyError({
-          message: `DAG workflow 'bdc-feature-development-codex' completed with failures: 'plan-review': Loop node 'plan-review' escalated at iteration 2: SPEC_PATH github:bluedevilcollectibles/bdc-xo:docs/work-orders/WO-MISSING.md ${phrase}`,
+          message: `DAG workflow 'bdc-feature-development-codex' completed with failures: 'plan-review': Loop node 'plan-review' escalated at iteration 2: SPEC_PATH github:thinmansoftware/bdc-xo:docs/work-orders/WO-MISSING.md ${phrase}`,
           nodeId: 'plan-review',
           nodeType: 'loop',
         })

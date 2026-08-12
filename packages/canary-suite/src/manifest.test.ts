@@ -22,7 +22,7 @@ function validManifest(): Record<string, unknown> {
     environment: {
       id: 'hetzner-production',
       project: 'bdc-harness',
-      canonical_remote: 'bluedevilcollectibles/bdc-harness',
+      canonical_remote: 'thinmansoftware/bdc-harness',
       base_branch: 'dev',
     },
     artifact_root: 'harness-artifacts/canaries',
@@ -83,7 +83,7 @@ describe('loadCanaryManifest', () => {
 
   test('rejects a non-production environment or wrong repository', async () => {
     for (const change of [
-      { id: 'local', canonical_remote: 'bluedevilcollectibles/bdc-harness' },
+      { id: 'local', canonical_remote: 'thinmansoftware/bdc-harness' },
       { id: 'hetzner-production', canonical_remote: 'other/repository' },
     ]) {
       const fixture = validManifest();

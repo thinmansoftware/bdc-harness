@@ -135,7 +135,7 @@ async function withPersistentEscalationPermit(
       ) VALUES ('snapshot-workflow-valid', 'v1', $1, $2, $2, 'test', 'test',
         'unit-test', 'dev', $3, 'artifacts/workflow-valid.json', 'sha1', $4,
         0, 0, 0, 0)`,
-      ['bluedevilcollectibles/bdc-harness', createdAt, 'a'.repeat(40), 'b'.repeat(40)]
+      ['thinmansoftware/bdc-harness', createdAt, 'a'.repeat(40), 'b'.repeat(40)]
     );
     await db.query(
       `INSERT INTO overseer_m31_action_proposals (
@@ -148,7 +148,7 @@ async function withPersistentEscalationPermit(
         'STAGING_MUTATION', '{}', 'test', $5, $6, 'execution-workflow-valid',
         'overseer.m31.staging_mutation', $7, $8)`,
       [
-        'bluedevilcollectibles/bdc-harness',
+        'thinmansoftware/bdc-harness',
         'c'.repeat(40),
         'a'.repeat(40),
         'b'.repeat(40),
@@ -169,7 +169,7 @@ async function withPersistentEscalationPermit(
       permit_id: 'permit-workflow-valid',
       proposal_id: 'proposal-workflow-valid',
       execution_id: 'execution-workflow-valid',
-      repository: 'bluedevilcollectibles/bdc-harness',
+      repository: 'thinmansoftware/bdc-harness',
       pr_number: 42,
       head_sha: 'c'.repeat(40),
       base_branch: 'dev',

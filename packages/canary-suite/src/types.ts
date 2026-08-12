@@ -26,7 +26,7 @@ export interface CanaryManifest {
   readonly environment: {
     readonly id: 'hetzner-production';
     readonly project: 'bdc-harness';
-    readonly canonicalRemote: 'bluedevilcollectibles/bdc-harness';
+    readonly canonicalRemote: 'thinmansoftware/bdc-harness';
     readonly baseBranch: 'dev';
   };
   readonly artifactRoot: string;

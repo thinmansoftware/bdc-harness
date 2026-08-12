@@ -50,7 +50,7 @@ function cardInput(overrides: Record<string, unknown> = {}) {
     payload: { blocker: 'validator rejected' },
     run_id: 'run-1',
     wo_id: 'WO-TEST-1',
-    repository: 'bluedevilcollectibles/bdc-harness',
+    repository: 'thinmansoftware/bdc-harness',
     branch: 'feat/test',
     pr_url: null,
     pr_number: null,

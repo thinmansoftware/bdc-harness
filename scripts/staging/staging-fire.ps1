@@ -49,7 +49,7 @@ Write-Host "[staging-fire] codebaseId: $($cb.id) (project: $Project)"
 if (-not $SkipSpecCheck) {
   $specOk = $false
   try {
-    $name = gh api "repos/bluedevilcollectibles/bdc-xo/contents/docs/work-orders/$Wo.md?ref=main" --jq .name 2>$null
+    $name = gh api "repos/thinmansoftware/bdc-xo/contents/docs/work-orders/$Wo.md?ref=main" --jq .name 2>$null
     if ($name) { $specOk = $true }
   } catch {}
   if (-not $specOk) {

@@ -1,7 +1,7 @@
 name: bdc-lspro-pulllist-scout-locg-import
 description: |
   Use when: Executing WO-LSPRO-PULLLIST-SCOUT-LOCG-IMPORT-01.
-  Repo: bluedevilcollectibles/lspro-react (branch: promotion/v2)
+  Repo: thinmansoftware/lspro-react (branch: promotion/v2)
   Does: Wires Scout-first LOCG import for pull list subscribers in
   PullListCommandCenter.tsx SubscribersTab. Reads source files before planning
   to ensure correct component tree hierarchy. Commits, pushes, opens a PR
@@ -33,20 +33,20 @@ nodes:
       set -euo pipefail
       WO_ID="WO-LSPRO-PULLLIST-SCOUT-LOCG-IMPORT-01"
       SPEC_PATH="docs/work-orders/${WO_ID}.md"
-      SPEC_CONTENT=$(gh api "repos/bluedevilcollectibles/bdc-xo/contents/${SPEC_PATH}?ref=main" --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
+      SPEC_CONTENT=$(gh api "repos/thinmansoftware/bdc-xo/contents/${SPEC_PATH}?ref=main" --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
       if [ -z "$SPEC_CONTENT" ]; then
-        MATCH=$(gh api "repos/bluedevilcollectibles/bdc-xo/contents/docs/superpowers/specs?ref=main" --template '{{range .}}{{.path}}{{"\n"}}{{end}}' 2>/dev/null | grep "${WO_ID}.md$" | head -n 1)
+        MATCH=$(gh api "repos/thinmansoftware/bdc-xo/contents/docs/superpowers/specs?ref=main" --template '{{range .}}{{.path}}{{"\n"}}{{end}}' 2>/dev/null | grep "${WO_ID}.md$" | head -n 1)
         if [ -n "$MATCH" ]; then
           SPEC_PATH="$MATCH"
-          SPEC_CONTENT=$(gh api "repos/bluedevilcollectibles/bdc-xo/contents/${SPEC_PATH}?ref=main" --template '{{.content}}' | tr -d '\n' | base64 -d || true)
+          SPEC_CONTENT=$(gh api "repos/thinmansoftware/bdc-xo/contents/${SPEC_PATH}?ref=main" --template '{{.content}}' | tr -d '\n' | base64 -d || true)
         fi
       fi
       if [ -z "$SPEC_CONTENT" ]; then
-        ISSUE_NUM=$(gh issue list --repo bluedevilcollectibles/bdc-xo \
+        ISSUE_NUM=$(gh issue list --repo thinmansoftware/bdc-xo \
           --search "${WO_ID} in:title" --json number,title \
           --jq '.[0].number' 2>/dev/null || true)
         if [ -n "$ISSUE_NUM" ] && [ "$ISSUE_NUM" != "null" ]; then
-          SPEC_CONTENT=$(gh issue view "$ISSUE_NUM" --repo bluedevilcollectibles/bdc-xo \
+          SPEC_CONTENT=$(gh issue view "$ISSUE_NUM" --repo thinmansoftware/bdc-xo \
             --json body --jq .body 2>/dev/null || true)
           [ -n "$SPEC_CONTENT" ] && SPEC_PATH="issues/${ISSUE_NUM}"
         fi
@@ -64,7 +64,7 @@ nodes:
     task_class: medium_work
     prompt: |
       Read the source files relevant to WO-LSPRO-PULLLIST-SCOUT-LOCG-IMPORT-01 before planning.
-      This WO is in the bluedevilcollectibles/lspro-react repo. CWD is the lspro-react worktree root.
+      This WO is in the thinmansoftware/lspro-react repo. CWD is the lspro-react worktree root.
 
       ## Files to read (find exact paths first)
       Run these discovery commands:
@@ -224,14 +224,14 @@ nodes:
       The branch MUST NOT start with archon/thread- or contain -thread- anywhere.
 
       ## Repo Policy
-      Target repo: bluedevilcollectibles/lspro-react
+      Target repo: thinmansoftware/lspro-react
       This repo is in the Rule 20 staging-gate list.
 
       Output:
       push_target: feature-branch:feat/wo-lspro-pulllist-scout-locg-import-01
       pr_required: true
       staging_gate_required: true
-      repo: bluedevilcollectibles/lspro-react
+      repo: thinmansoftware/lspro-react
 
       CRITICAL: emit a `repo:` line in every output case.
 
@@ -528,7 +528,7 @@ nodes:
       $read-spec.output
       BDC_NODE_OUTPUT_READ_SPEC
       )
-      ISSUE_REPO="${ISSUE_REPO:-bluedevilcollectibles/bdc-xo}"
+      ISSUE_REPO="${ISSUE_REPO:-thinmansoftware/bdc-xo}"
       ISSUE_NUM=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'issue=[0-9]+' | head -1 | cut -d= -f2 || true)
       if [ -z "$ISSUE_NUM" ]; then
         ISSUE_NUM=$(printf '%s\n' "$READ_SPEC_OUT" | sed -n 's/^SPEC_PATH=.*issues\/\([0-9][0-9]*\).*/\1/p' | head -1)

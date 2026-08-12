@@ -1,7 +1,7 @@
 import { execFileAsync } from '@archon/git';
 
 const FORBIDDEN_PATH_PATTERNS = /deploy|secrets|credentials/i;
-const OWNER_REPO = 'bluedevilcollectibles/bdc-xo';
+const OWNER_REPO = 'thinmansoftware/bdc-xo';
 const REF = 'main';
 
 export class WikiFetchError extends Error {

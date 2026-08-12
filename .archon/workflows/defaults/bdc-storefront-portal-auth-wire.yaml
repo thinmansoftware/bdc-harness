@@ -5,10 +5,10 @@
 # Doctrine compliance: 13 hard rules of archon-yaml-authoring (verified at draft time)
 #
 # Pre-flight (OPERATOR MUST VERIFY BEFORE FIRING):
-#   1. bluedevilcollectibles/shopops registered in Archon:
+#   1. thinmansoftware/shopops registered in Archon:
 #      sqlite3 /opt/bdc/archon-data/archon.db "SELECT name FROM remote_agent_codebases"
 #      CWD when fired = shopops repo root (shopops-api/ is a subdir inside it).
-#   2. bluedevilcollectibles/shopops-storefront NOT required to be an Archon codebase --
+#   2. thinmansoftware/shopops-storefront NOT required to be an Archon codebase --
 #      storefront work is done via git clone into /tmp in the shopops worktree context.
 #      GH_TOKEN (GITHUB_TOKEN) must be set in Archon env with push access to both repos.
 #   3. This WO is parallel_ok=NO. Do NOT fire while another shopops-api WO is in-flight.
@@ -53,10 +53,10 @@ description: |
         separate PR for shopops-storefront (base: main). Runs Rule 19 docker exec grep
         to prove source is live in shopops-api container. Builds MIXED manifest.
         Flips Notion WO to REVIEW.
-  Repos: bluedevilcollectibles/shopops (primary, Archon CWD = shopops repo root,
-         shopops-api/ is a subdir) + bluedevilcollectibles/shopops-storefront (cloned
+  Repos: thinmansoftware/shopops (primary, Archon CWD = shopops repo root,
+         shopops-api/ is a subdir) + thinmansoftware/shopops-storefront (cloned
          to /tmp/storefront-work in the bash nodes).
-         WO spec lives in bluedevilcollectibles/bdc-xo.
+         WO spec lives in thinmansoftware/bdc-xo.
   parallel_ok: false -- touches 2 repos, serial only.
   NOT for: any other WO.
 
@@ -76,18 +76,18 @@ nodes:
 
       # Primary path: docs/work-orders/<WO_ID>.md (gh --template, no jq dependency)
       SPEC_CONTENT=$(gh api \
-        "repos/bluedevilcollectibles/bdc-xo/contents/docs/work-orders/${WO_ID}.md?ref=main" \
+        "repos/thinmansoftware/bdc-xo/contents/docs/work-orders/${WO_ID}.md?ref=main" \
         --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
 
       # Fallback: glob docs/superpowers/specs/*<WO_ID>*.md (Rule 5)
       if [ -z "$SPEC_CONTENT" ]; then
         GLOB_PATH=$(gh api \
-          "repos/bluedevilcollectibles/bdc-xo/contents/docs/superpowers/specs?ref=main" \
+          "repos/thinmansoftware/bdc-xo/contents/docs/superpowers/specs?ref=main" \
           --template '{{range .}}{{.path}}{{"\n"}}{{end}}' 2>/dev/null \
           | grep "${WO_ID}.md$" | head -1 || true)
         if [ -n "$GLOB_PATH" ]; then
           SPEC_CONTENT=$(gh api \
-            "repos/bluedevilcollectibles/bdc-xo/contents/${GLOB_PATH}?ref=main" \
+            "repos/thinmansoftware/bdc-xo/contents/${GLOB_PATH}?ref=main" \
             --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
         fi
       fi
@@ -96,12 +96,12 @@ nodes:
         # Fallback 4: GitHub issue body (WO-HARNESS-READ-SPEC-ISSUE-BODY-FALLBACK-01)
         ISSUE_NUM=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'issue=[0-9]+' | head -n 1 | cut -d= -f2 || true)
         if [ -z "$ISSUE_NUM" ]; then
-          ISSUE_NUM=$(gh issue list --repo bluedevilcollectibles/bdc-xo \
+          ISSUE_NUM=$(gh issue list --repo thinmansoftware/bdc-xo \
             --search "${WO_ID} in:title" --json number,title \
             --jq '.[0].number' 2>/dev/null || true)
         fi
         if [ -n "$ISSUE_NUM" ] && [ "$ISSUE_NUM" != "null" ]; then
-          SPEC_CONTENT=$(gh issue view "$ISSUE_NUM" --repo bluedevilcollectibles/bdc-xo \
+          SPEC_CONTENT=$(gh issue view "$ISSUE_NUM" --repo thinmansoftware/bdc-xo \
             --json body --jq .body 2>/dev/null || true)
           [ -n "$SPEC_CONTENT" ] && SPEC_PATH="issues/${ISSUE_NUM}"
         fi
@@ -110,7 +110,7 @@ nodes:
 
       # Fetch behavior spec section for status vocab reference
       BEHAVIOR_SPEC=$(gh api \
-        "repos/bluedevilcollectibles/bdc-xo/contents/docs/behavior-specs/COMMERCE_CHANNEL_SPINE_BEHAVIOR.md?ref=main" \
+        "repos/thinmansoftware/bdc-xo/contents/docs/behavior-specs/COMMERCE_CHANNEL_SPINE_BEHAVIOR.md?ref=main" \
         --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
 
       printf 'WO_ID=%s\nSPEC_PATH=bdc-xo:docs/work-orders/%s.md\nWORKFLOW_ID=%s\n\n' \
@@ -188,7 +188,7 @@ nodes:
 
       ## Required Output (Markdown, exact headings)
 
-      ### shopops-api (repo: bluedevilcollectibles/shopops, subdir: shopops-api/)
+      ### shopops-api (repo: thinmansoftware/shopops, subdir: shopops-api/)
       - File to modify: shopops-api/routes/storefront-portal-data.js
       - Existing routes NOT to touch: GET /purchases (lines 312-326), GET /statements (lines 77-95), GET /statements/:id (lines 101-126)
       - New routes to add (all behind requirePortalAuth middleware, already applied router-wide):
@@ -225,7 +225,7 @@ nodes:
       - Branch: wo/storefront-portal-auth-wire-01 (off master)
       - PR base: master
 
-      ### shopops-storefront (repo: bluedevilcollectibles/shopops-storefront)
+      ### shopops-storefront (repo: thinmansoftware/shopops-storefront)
       - File to modify: lib/storefront-api.ts
       - Change: fetchOrders(), fetchOrder(), fetchStatements(), fetchStatement() already call
         the correct /storefront/portal/me/* URLs. Add portal_jwt cookie forwarding so the
@@ -400,7 +400,7 @@ nodes:
         exit 0
       fi
 
-      git clone "https://github.com/bluedevilcollectibles/shopops-storefront.git" \
+      git clone "https://github.com/thinmansoftware/shopops-storefront.git" \
         "$STOREFRONT_DIR" --depth=50
       echo "STOREFRONT_DIR=${STOREFRONT_DIR}"
       echo "STATUS=fresh_clone"
@@ -707,7 +707,7 @@ nodes:
       set -euo pipefail
       # Read branch from current HEAD (commit-and-push-api set the unique run-suffixed branch in shopops CWD)
       BRANCH="$(git rev-parse --abbrev-ref HEAD)"
-      REPO="bluedevilcollectibles/shopops"
+      REPO="thinmansoftware/shopops"
       BASE="master"
       TITLE="feat(api): WO-STOREFRONT-PORTAL-AUTH-WIRE-01 -- /me/orders + /me/statements portal routes"
 
@@ -792,7 +792,7 @@ nodes:
       STOREFRONT_DIR="/tmp/storefront-work-$WORKFLOW_ID"
       cd "$STOREFRONT_DIR"
       BRANCH="$(git rev-parse --abbrev-ref HEAD)"
-      REPO="bluedevilcollectibles/shopops-storefront"
+      REPO="thinmansoftware/shopops-storefront"
       BASE="main"
       TITLE="feat(storefront): WO-STOREFRONT-PORTAL-AUTH-WIRE-01 -- portal_jwt cookie forwarding"
 
@@ -983,7 +983,7 @@ nodes:
       $read-spec.output
       BDC_NODE_OUTPUT_READ_SPEC
       )
-      ISSUE_REPO="${ISSUE_REPO:-bluedevilcollectibles/bdc-xo}"
+      ISSUE_REPO="${ISSUE_REPO:-thinmansoftware/bdc-xo}"
       ISSUE_NUM=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'issue=[0-9]+' | head -1 | cut -d= -f2 || true)
       if [ -z "$ISSUE_NUM" ]; then
         ISSUE_NUM=$(printf '%s\n' "$READ_SPEC_OUT" | sed -n 's/^SPEC_PATH=.*issues\/\([0-9][0-9]*\).*/\1/p' | head -1)

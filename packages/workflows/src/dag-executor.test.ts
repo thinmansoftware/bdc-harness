@@ -878,7 +878,7 @@ describe('executeDagWorkflow -- mechanical evidence node', () => {
       runId: 'evidence-run',
       dispatchId: 'dispatch-1',
       woId: 'WO-TEST-01',
-      specSource: 'github:bluedevilcollectibles/bdc-xo:docs/work-orders/WO-TEST-01.md',
+      specSource: 'github:thinmansoftware/bdc-xo:docs/work-orders/WO-TEST-01.md',
       specRevision: '1'.repeat(40),
       specHash: `sha256:${'2'.repeat(64)}`,
       workflowName: 'evidence-workflow',
@@ -13147,7 +13147,7 @@ describe('executeDagWorkflow -- node output file handoff (ARCHON_NODE_OUT)', () 
     const platform = createMockPlatform();
     const workflowRun = makeWorkflowRun('node-out-resumed-producer-run-id');
     const priorCompletedNodes = new Map([
-      ['decide-push-target', 'base_branch_override: dev\nrepo: bluedevilcollectibles/bdc-harness'],
+      ['decide-push-target', 'base_branch_override: dev\nrepo: thinmansoftware/bdc-harness'],
     ]);
 
     const nodes: DagNode[] = [
@@ -13186,7 +13186,7 @@ describe('executeDagWorkflow -- node output file handoff (ARCHON_NODE_OUT)', () 
     );
     expect(consumerCompleted).toBeDefined();
     expect((consumerCompleted![0] as { data: { node_output: string } }).data.node_output).toBe(
-      'base_branch_override: dev\nrepo: bluedevilcollectibles/bdc-harness'
+      'base_branch_override: dev\nrepo: thinmansoftware/bdc-harness'
     );
   });
 
