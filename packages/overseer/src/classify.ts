@@ -76,7 +76,7 @@ export interface ClassifyInput {
 /** Detect the session-limit marker that makes an SDK contradiction usage-cap recoverable. */
 export function classifyUsageCapSignature(input: ClassifyInput): boolean {
   const evidence = `${input.message ?? ''}\n${input.validatorOutput ?? ''}`;
-  return /you(?:'|’)?ve hit your session limit/i.test(evidence);
+  return /you(?:'|\u2019)?ve hit your session limit/i.test(evidence);
 }
 
 /**

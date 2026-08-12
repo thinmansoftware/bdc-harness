@@ -11,6 +11,13 @@ describe('classifyError -- workflow-runtime classes (BDC 2026-05-16)', () => {
     expect(classifyError(input)).toBe('validator_sdk_contradiction');
     expect(classifyUsageCapSignature(input)).toBe(true);
   });
+  test('usage-cap signature accepts the SDK curly apostrophe', () => {
+    expect(
+      classifyUsageCapSignature({
+        message: 'SDK returned success; You\u2019ve hit your session limit',
+      })
+    ).toBe(true);
+  });
   test('sentinel_mismatch: loop node + SDK returned success message', () => {
     expect(
       classifyError({

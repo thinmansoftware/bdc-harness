@@ -48,6 +48,7 @@ export interface HandleNodeFailureDeps {
     nodeId: string,
     errorMsg: string
   ) => Promise<void>;
+  scheduleUsageCapRequeue?: typeof scheduleUsageCapRequeue;
 }
 
 export interface HandleNodeFailureContext {
@@ -217,11 +218,11 @@ export async function handleNodeFailure(
   //
   if (result.decision === 'escalate' && result.escalationContext) {
     if (usageCapDetected && ctx.woId) {
-      scheduleUsageCapRequeue({
+      (deps.scheduleUsageCapRequeue ?? scheduleUsageCapRequeue)({
         woId: ctx.woId,
         runId: workflowRun.id,
         repository:
-          typeof workflowRun.metadata.targetRepo === 'string'
+          typeof workflowRun.metadata?.targetRepo === 'string'
             ? workflowRun.metadata.targetRepo
             : 'bluedevilcollectibles/bdc-harness',
       }).catch((err: Error) => {
@@ -230,6 +231,11 @@ export async function handleNodeFailure(
           'overseer.usage_cap_requeue_schedule_failed'
         );
       });
+    } else if (usageCapDetected) {
+      deps.log.warn(
+        { runId: workflowRun.id, nodeId: node.id },
+        'overseer.usage_cap_requeue_skipped_missing_wo_id'
+      );
     }
     if (!persistedActionableEvent) {
       deps.log.info(

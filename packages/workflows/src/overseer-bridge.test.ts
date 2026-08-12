@@ -8,7 +8,7 @@
  */
 
 import { describe, it, expect, mock } from 'bun:test';
-import { handleNodeFailure } from './overseer-bridge.ts';
+import { handleNodeFailure, type HandleNodeFailureDeps } from './overseer-bridge.ts';
 import type { WorkflowRun } from './schemas/workflow-run.ts';
 import type { DagNode } from './schemas/dag-node.ts';
 import type { IWorkflowStore } from './store.ts';
@@ -179,6 +179,66 @@ describe('handleNodeFailure -- decision routing', () => {
 });
 
 describe('handleNodeFailure -- side effects', () => {
+  it('schedules a usage-cap requeue with the WO, run, and repository', async () => {
+    const deps = makeDeps();
+    const scheduleUsageCapRequeue = mock<
+      NonNullable<HandleNodeFailureDeps['scheduleUsageCapRequeue']>
+    >(async () => ({
+      outcome: 'deferred',
+      headroomState: 'UNKNOWN',
+      message: undefined as never,
+    }));
+    const workflowRun = makeWorkflowRun();
+    workflowRun.metadata = { targetRepo: 'acme/widgets' };
+
+    await handleNodeFailure(
+      { ...deps, scheduleUsageCapRequeue },
+      workflowRun,
+      makeNode('usage-cap-node'),
+      {
+        ...baseCtx,
+        errorMsg:
+          "Node 'war-council-validator' failed: SDK returned success; You've hit your session limit",
+        woId: 'WO-123',
+      }
+    );
+
+    expect(scheduleUsageCapRequeue).toHaveBeenCalledTimes(1);
+    expect(scheduleUsageCapRequeue).toHaveBeenCalledWith({
+      woId: 'WO-123',
+      runId: 'test-run',
+      repository: 'acme/widgets',
+    });
+  });
+
+  it('logs and abstains from usage-cap requeue when the WO ID is missing', async () => {
+    const deps = makeDeps();
+    const scheduleUsageCapRequeue = mock<
+      NonNullable<HandleNodeFailureDeps['scheduleUsageCapRequeue']>
+    >(async () => ({
+      outcome: 'deferred',
+      headroomState: 'UNKNOWN',
+      message: undefined as never,
+    }));
+
+    await handleNodeFailure(
+      { ...deps, scheduleUsageCapRequeue },
+      makeWorkflowRun(),
+      makeNode('usage-cap-without-wo'),
+      {
+        ...baseCtx,
+        errorMsg:
+          "Node 'war-council-validator' failed: SDK returned success; You've hit your session limit",
+      }
+    );
+
+    expect(scheduleUsageCapRequeue).not.toHaveBeenCalled();
+    expect(deps.log.warn).toHaveBeenCalledWith(
+      { runId: 'test-run', nodeId: 'usage-cap-without-wo' },
+      'overseer.usage_cap_requeue_skipped_missing_wo_id'
+    );
+  });
+
   it('emits overseer.decision log line with structured fields', async () => {
     const deps = makeDeps();
     await handleNodeFailure(deps, makeWorkflowRun(), makeNode('node-x'), {
