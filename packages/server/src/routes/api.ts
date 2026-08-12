@@ -681,6 +681,7 @@ const createDispatchMessageRoute = createRoute({
       description: 'Dispatch message',
     },
     400: jsonError('Bad request'),
+    403: jsonError('Operator token requires message scope'),
     500: jsonError('Server error'),
   },
 });
@@ -696,6 +697,7 @@ const listDispatchMessagesRoute = createRoute({
       content: { 'application/json': { schema: dispatchMessageListResponseSchema } },
       description: 'Dispatch messages',
     },
+    403: jsonError('Operator token requires inspect scope'),
     500: jsonError('Server error'),
   },
 });
@@ -717,6 +719,7 @@ const claimDispatchMessageRoute = createRoute({
       content: { 'application/json': { schema: dispatchMessageSchema } },
       description: 'Claimed dispatch message',
     },
+    403: jsonError('Operator token requires message scope'),
     404: jsonError('Not claimable'),
     500: jsonError('Server error'),
   },
@@ -739,6 +742,7 @@ const postDispatchResultRoute = createRoute({
       content: { 'application/json': { schema: dispatchMessageSchema } },
       description: 'Completed dispatch message',
     },
+    403: jsonError('Operator token requires message scope'),
     409: jsonError('Stale fencing token or cancelled message'),
     500: jsonError('Server error'),
   },
@@ -761,6 +765,7 @@ const acknowledgeDispatchMessageRoute = createRoute({
       content: { 'application/json': { schema: dispatchMessageSchema } },
       description: 'Acknowledged dispatch message',
     },
+    403: jsonError('Operator token requires message scope'),
     404: jsonError('Dispatch message not found'),
     409: jsonError('Dispatch mailbox lifecycle conflict'),
     500: jsonError('Server error'),
@@ -784,6 +789,7 @@ const addressDispatchMessageRoute = createRoute({
       content: { 'application/json': { schema: dispatchMessageSchema } },
       description: 'Addressed dispatch message',
     },
+    403: jsonError('Operator token requires message scope'),
     404: jsonError('Dispatch message not found'),
     409: jsonError('Dispatch mailbox lifecycle conflict'),
     500: jsonError('Server error'),
@@ -807,6 +813,7 @@ const renewDispatchLeaseRoute = createRoute({
       content: { 'application/json': { schema: dispatchMessageSchema } },
       description: 'Renewed dispatch message lease',
     },
+    403: jsonError('Operator token requires message scope'),
     409: jsonError('Stale fencing token, not lease owner, or not claimed'),
     500: jsonError('Server error'),
   },
@@ -829,6 +836,7 @@ const cancelDispatchMessageRoute = createRoute({
       content: { 'application/json': { schema: dispatchMessageSchema } },
       description: 'Cancelled dispatch message',
     },
+    403: jsonError('Operator token requires message scope'),
     404: jsonError('Not found'),
     500: jsonError('Server error'),
   },
@@ -851,6 +859,7 @@ const supersedeDispatchMessageRoute = createRoute({
       content: { 'application/json': { schema: dispatchMessageSchema } },
       description: 'Replacement dispatch message',
     },
+    403: jsonError('Operator token requires message scope'),
     404: jsonError('Not found'),
     409: jsonError('Dispatch message cannot be superseded'),
     500: jsonError('Server error'),
@@ -1556,6 +1565,7 @@ const getDashboardRunsRoute = createRoute({
       content: { 'application/json': { schema: dashboardRunsResponseSchema } },
       description: 'OK',
     },
+    403: jsonError('Operator token requires inspect scope'),
     500: jsonError('Server error'),
   },
 });
@@ -1906,6 +1916,7 @@ const getWorkflowRunRoute = createRoute({
       content: { 'application/json': { schema: workflowRunDetailSchema } },
       description: 'Workflow run detail',
     },
+    403: jsonError('Operator token requires inspect scope'),
     404: jsonError('Not found'),
     500: jsonError('Server error'),
   },
@@ -1925,6 +1936,7 @@ const getNodeEventsRoute = createRoute({
       content: { 'application/json': { schema: nodeEventsResponseSchema } },
       description: 'Recent events for the node (newest first)',
     },
+    403: jsonError('Operator token requires inspect scope'),
     404: jsonError('Not found'),
     500: jsonError('Server error'),
   },
@@ -4912,7 +4924,11 @@ export function registerApiRoutes(
       if (drainRejection) return drainRejection;
       const body = getValidatedBody(c, runWorkflowBodySchema);
       const { conversationId, message, conductor } = body;
-      if (!isValidFireApproval(body.approved_by, body.approval_reason)) {
+      const operatorScope = resolveScopeForToken(getPresentedOperatorToken(c));
+      if (
+        operatorScope !== 'master' &&
+        !isValidFireApproval(body.approved_by, body.approval_reason)
+      ) {
         return apiError(c, 403, 'Workflow fire approval is missing or invalid');
       }
       // Persist user message and register DB ID (same as message endpoint).

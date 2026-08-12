@@ -365,6 +365,8 @@ export const runWorkflowBodySchema = z
     conversationId: z.string(),
     message: z.string(),
     conductor: conductorDispatchSchema.optional(),
+    // Fire-scoped tokens must provide approval metadata. These remain optional
+    // here because the legacy master token is explicitly approval-compatible.
     approved_by: z.string().min(1).optional(),
     approval_reason: z.string().min(1).optional(),
   })
