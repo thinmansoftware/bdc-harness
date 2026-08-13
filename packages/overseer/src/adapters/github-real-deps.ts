@@ -1,4 +1,7 @@
+import { readFileSync } from 'node:fs';
+import { createPrivateKey } from 'node:crypto';
 import { Octokit } from '@octokit/rest';
+import { createAppAuth } from '@octokit/auth-app';
 import { createLogger } from '@archon/paths';
 import type {
   GitHubClientDeps,
@@ -6,6 +9,7 @@ import type {
   GitHubPullRequestSearchInput,
   PullRequestCheckSummary,
   PullRequestEvidence,
+  PullRequestRef,
 } from '../types.ts';
 
 const log = createLogger('overseer/github-real-deps');
@@ -68,6 +72,17 @@ export interface RealGitHubOctokitLike {
       pull_number: number;
       sha: string;
     }): Promise<{ data: { merged: boolean; sha?: string | null } }>;
+    /**
+     * Optional so unrelated mocks (e.g. github-qualified-merge.test.ts's
+     * createOctokitMock) that never approve keep type-checking. The real
+     * approve path guards for its absence and throws loudly.
+     */
+    createReview?(input: {
+      owner: string;
+      repo: string;
+      pull_number: number;
+      event: 'APPROVE';
+    }): Promise<{ data: { id: number; state: string } }>;
   };
   search: {
     issuesAndPullRequests(input: Record<string, unknown>): Promise<{
@@ -102,10 +117,130 @@ export function resolveGitHubToken(): string {
   return token;
 }
 
-/** Construct a real Octokit client from the standard env token. */
+/** Resolved GitHub App installation-auth configuration. */
+export interface GitHubAppAuthConfig {
+  appId: string;
+  installationId: string;
+  privateKey: string;
+}
+
+/**
+ * Resolve GitHub App (installation) auth from env, or null when no App vars are
+ * set at all.
+ *
+ * Precedence contract (see WO-HARNESS-OVERSEER-APP-AUTH-01 sec 4.2 + risk 10):
+ * - NONE of the App vars set  -> return null. Caller falls back to the PAT path.
+ *   This is the "absent" case, and it is the ONLY case that falls back.
+ * - App auth requested but incomplete/broken (any App var set, but the trio does
+ *   not fully resolve to a real PEM) -> THROW naming the offending var. We never
+ *   silently degrade to the PAT here: a half-configured App downgrading to John's
+ *   PAT identity is the exact failure this WO exists to prevent.
+ *
+ * Private key may come from GITHUB_APP_PRIVATE_KEY (raw PEM contents, with
+ * literal "\n" sequences from single-line env packing normalized to newlines) or
+ * GITHUB_APP_PRIVATE_KEY_PATH (a file read at resolution time). Inline contents
+ * win when both are set.
+ */
+export function resolveGitHubAppAuth(): GitHubAppAuthConfig | null {
+  const appId = (process.env.GITHUB_APP_ID ?? '').trim();
+  const installationId = (process.env.GITHUB_APP_INSTALLATION_ID ?? '').trim();
+  const privateKeyInline = process.env.GITHUB_APP_PRIVATE_KEY ?? '';
+  const privateKeyPath = (process.env.GITHUB_APP_PRIVATE_KEY_PATH ?? '').trim();
+
+  const anyAppVarPresent =
+    appId !== '' ||
+    installationId !== '' ||
+    privateKeyInline.trim() !== '' ||
+    privateKeyPath !== '';
+  if (!anyAppVarPresent) {
+    return null; // Absent -> PAT fallback (the only fallback path).
+  }
+
+  // From here App auth was requested; any gap is a loud failure, never a PAT downgrade.
+  if (appId === '') {
+    throw new Error(
+      'overseer_github_app_auth_incomplete: GITHUB_APP_ID is missing but other GITHUB_APP_* vars are set'
+    );
+  }
+  if (installationId === '') {
+    throw new Error(
+      'overseer_github_app_auth_incomplete: GITHUB_APP_INSTALLATION_ID is missing but other GITHUB_APP_* vars are set'
+    );
+  }
+
+  let privateKey = privateKeyInline;
+  if (privateKey.trim() === '' && privateKeyPath !== '') {
+    try {
+      privateKey = readFileSync(privateKeyPath, 'utf8');
+    } catch (error) {
+      throw new Error(
+        `overseer_github_app_auth_private_key_unreadable: could not read GITHUB_APP_PRIVATE_KEY_PATH (${privateKeyPath}): ${(error as Error).message}`
+      );
+    }
+  }
+
+  // Normalize single-line "\n"-packed PEMs back to real newlines. A PEM already
+  // carrying real newlines (the file-path case) is unaffected by this replace.
+  privateKey = privateKey.replace(/\\n/g, '\n').trim();
+
+  if (privateKey === '') {
+    throw new Error(
+      'overseer_github_app_auth_private_key_missing: set GITHUB_APP_PRIVATE_KEY (PEM contents) or GITHUB_APP_PRIVATE_KEY_PATH'
+    );
+  }
+  // Validate by actually parsing the key material, not just sniffing for a
+  // "-----BEGIN" substring. A substring check passes truncated/garbage PEM bodies
+  // (or a stray marker inside otherwise-invalid content) that then fail on the
+  // FIRST signed API call -- far from this construction site and much harder to
+  // diagnose. createPrivateKey throws synchronously on any malformed PEM (missing
+  // marker, corrupted base64, truncated body, unsupported format), so a config
+  // that resolves here is a key the auth strategy can actually sign JWTs with.
+  try {
+    createPrivateKey(privateKey);
+  } catch (error) {
+    throw new Error(
+      `overseer_github_app_auth_private_key_malformed: GITHUB_APP_PRIVATE_KEY is not a valid PEM private key (${(error as Error).message})`
+    );
+  }
+
+  return { appId, installationId, privateKey };
+}
+
+/**
+ * Octokit constructor options for real mode. App installation auth wins when App
+ * vars are complete; otherwise the PAT path. Exposed as a network-free seam so
+ * tests can assert which identity was selected without constructing a live
+ * client or making an API call.
+ */
+export type RealOctokitAuthOptions =
+  | {
+      authStrategy: typeof createAppAuth;
+      auth: { appId: string; privateKey: string; installationId: string };
+    }
+  | { auth: string };
+
+export function resolveRealOctokitAuthOptions(): RealOctokitAuthOptions {
+  const appAuth = resolveGitHubAppAuth();
+  if (appAuth) {
+    return {
+      authStrategy: createAppAuth,
+      auth: {
+        appId: appAuth.appId,
+        privateKey: appAuth.privateKey,
+        installationId: appAuth.installationId,
+      },
+    };
+  }
+  return { auth: resolveGitHubToken() };
+}
+
+/**
+ * Construct a real Octokit client. Uses GitHub App installation auth when the
+ * App env vars are complete (attributing API calls to thinman-overseer[bot]),
+ * otherwise falls back to the GH_TOKEN/GITHUB_TOKEN PAT path unchanged.
+ */
 export function createRealOctokitClient(): RealGitHubOctokitLike {
-  const auth = resolveGitHubToken();
-  return new Octokit({ auth }) as unknown as RealGitHubOctokitLike;
+  return new Octokit(resolveRealOctokitAuthOptions()) as unknown as RealGitHubOctokitLike;
 }
 
 function summarizeChecks(
@@ -255,6 +390,61 @@ export function createRealMergePullRequest(
 }
 
 /**
+ * Real approvePullRequest: submits an APPROVE review via octokit.pulls.createReview.
+ *
+ * This is the capability the App identity unlocks -- GitHub forbids a user from
+ * approving their own PR, and John is the only human in the org, so only a second
+ * identity (thinman-overseer[bot]) can record a required-review approval.
+ *
+ * Self-approval is still rejected by GitHub regardless of identity (an App cannot
+ * approve a PR it authored). GitHub returns 422 with a body message containing
+ * "own pull request"; we surface that as a stable, usable code
+ * ('github_review_self_approval_rejected') rather than letting a raw Octokit
+ * error escape -- mirroring createRealMergePullRequest's httpStatus classification.
+ */
+export function createRealApprovePullRequest(
+  octokit: RealGitHubOctokitLike
+): (input: PullRequestRef) => Promise<{ approved: boolean; message?: string }> {
+  return async (input: PullRequestRef): Promise<{ approved: boolean; message?: string }> => {
+    if (!octokit.pulls.createReview) {
+      throw new Error('overseer_real_adapter_missing_review_api');
+    }
+    try {
+      const response = await octokit.pulls.createReview({
+        owner: input.owner,
+        repo: input.repo,
+        pull_number: input.number,
+        event: 'APPROVE',
+      });
+      if (response.data.state !== 'APPROVED') {
+        return {
+          approved: false,
+          message: `github_review_unexpected_state_${response.data.state}`,
+        };
+      }
+      return { approved: true };
+    } catch (error) {
+      const status =
+        typeof error === 'object' && error !== null && 'status' in error
+          ? (error as { status?: number }).status
+          : undefined;
+      const messageValue =
+        typeof error === 'object' && error !== null && 'message' in error
+          ? (error as { message?: unknown }).message
+          : undefined;
+      const rawMessage = typeof messageValue === 'string' ? messageValue : '';
+      if (status === 422 && /own pull request/i.test(rawMessage)) {
+        return { approved: false, message: 'github_review_self_approval_rejected' };
+      }
+      if (status === 422) {
+        return { approved: false, message: 'github_review_unprocessable' };
+      }
+      return { approved: false, message: 'github_review_transport_ambiguous' };
+    }
+  };
+}
+
+/**
  * Build the real (non-fake) GitHubClientDeps composition for Overseer. Fails
  * loudly at construction time if the token is missing -- never silently
  * degrades to a stub in real mode.
@@ -277,5 +467,6 @@ export function createRealGitHubClientDeps(
       });
       return { commented: true, url: response.data.html_url };
     },
+    approvePullRequest: createRealApprovePullRequest(octokit),
   };
 }

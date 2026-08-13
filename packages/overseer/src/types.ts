@@ -167,6 +167,14 @@ export interface GitHubClientDeps {
   commentOnPullRequest?(
     input: PullRequestRef & { body: string }
   ): Promise<{ commented: boolean; url?: string }>;
+  /**
+   * Approve a pull request as the configured identity (the Thinman Overseer
+   * GitHub App when App auth is active; otherwise the PAT identity). Optional so
+   * existing GitHubClientDeps implementers (fakes, legacy compositions) keep
+   * compiling. GitHub rejects self-approval regardless of identity -- the real
+   * implementation surfaces a usable message rather than throwing in that case.
+   */
+  approvePullRequest?(input: PullRequestRef): Promise<{ approved: boolean; message?: string }>;
 }
 
 /**
