@@ -11,7 +11,8 @@ export type DispatchTaskType =
   | 'run_review'
   | 'draft_spec'
   | 'run_report'
-  | 'board_motion';
+  | 'board_motion'
+  | 'run_work';
 export type DispatchMessageStatus = 'queued' | 'claimed' | 'done' | 'failed' | 'cancelled';
 export type DispatchWorkerStatus = 'available' | 'unavailable';
 export type DispatchMessagePriority = 'blocker' | 'normal' | 'heartbeat';

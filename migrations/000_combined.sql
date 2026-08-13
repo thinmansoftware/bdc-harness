@@ -520,7 +520,7 @@ CREATE TABLE IF NOT EXISTS agent_dispatch_messages (
   correlation_id TEXT NOT NULL,
   idempotency_key TEXT NOT NULL UNIQUE,
   task_type TEXT NOT NULL CHECK (
-    task_type IN ('agent_message', 'run_review', 'draft_spec', 'run_report', 'board_motion')
+    task_type IN ('agent_message', 'run_review', 'draft_spec', 'run_report', 'board_motion', 'run_work')
   ),
   sender TEXT NOT NULL,
   recipient TEXT NOT NULL,

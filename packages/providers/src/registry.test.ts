@@ -84,10 +84,24 @@ describe('registry', () => {
       expect(typeof provider.sendQuery).toBe('function');
     });
 
+    test('returns a strict native Codex provider with no failback registration', () => {
+      const registration = getRegistration('codex-native-strict');
+      const provider = registration.factory();
+
+      expect(registration.displayName).toBe('Codex Native Strict');
+      expect(provider.getType()).toBe('codex');
+      expect(typeof provider.sendQuery).toBe('function');
+    });
+
+    test('returns the Cursor Desktop Grok dispatch provider', () => {
+      const provider = getAgentProvider('cursor-grok-dispatch');
+      expect(provider.getType()).toBe('cursor-grok-dispatch');
+    });
+
     test('throws UnknownProviderError for unknown type', () => {
       expect(() => getAgentProvider('unknown')).toThrow(UnknownProviderError);
       expect(() => getAgentProvider('unknown')).toThrow(
-        "Unknown provider: 'unknown'. Available: claude, codex"
+        "Unknown provider: 'unknown'. Available: claude, codex, codex-native-strict, cursor-grok-dispatch, codex-opr"
       );
     });
 
@@ -165,7 +179,13 @@ describe('registry', () => {
     });
 
     test('declares Claude and Codex as repository execution providers', () => {
-      for (const id of ['claude', 'codex', 'codex-opr']) {
+      for (const id of [
+        'claude',
+        'codex',
+        'codex-native-strict',
+        'cursor-grok-dispatch',
+        'codex-opr',
+      ]) {
         expect(getProviderCapabilities(id).execution).toEqual({
           text: true,
           repositoryRead: true,
@@ -244,24 +264,26 @@ describe('registry', () => {
   describe('getRegisteredProviders', () => {
     test('returns all registered providers', () => {
       const all = getRegisteredProviders();
-      expect(all.length).toBe(3);
+      expect(all.length).toBe(5);
       const ids = all.map(r => r.id);
       expect(ids).toContain('claude');
       expect(ids).toContain('codex');
+      expect(ids).toContain('codex-native-strict');
+      expect(ids).toContain('cursor-grok-dispatch');
       expect(ids).toContain('codex-opr');
     });
 
     test('includes community providers after registration', () => {
       registerProvider(makeMockRegistration('my-llm'));
       const all = getRegisteredProviders();
-      expect(all.length).toBe(4);
+      expect(all.length).toBe(6);
     });
   });
 
   describe('getProviderInfoList', () => {
     test('returns API-safe projection without factory', () => {
       const infos = getProviderInfoList();
-      expect(infos.length).toBe(3);
+      expect(infos.length).toBe(5);
       for (const info of infos) {
         expect(info).toHaveProperty('id');
         expect(info).toHaveProperty('displayName');
@@ -290,7 +312,7 @@ describe('registry', () => {
       registerBuiltinProviders();
       registerBuiltinProviders();
       const all = getRegisteredProviders();
-      expect(all.length).toBe(3);
+      expect(all.length).toBe(5);
     });
   });
 
@@ -376,7 +398,14 @@ describe('registry', () => {
       const ids = getRegisteredProviders()
         .map(p => p.id)
         .sort();
-      expect(ids).toEqual(['claude', 'codex', 'codex-opr', 'pi']);
+      expect(ids).toEqual([
+        'claude',
+        'codex',
+        'codex-native-strict',
+        'codex-opr',
+        'cursor-grok-dispatch',
+        'pi',
+      ]);
     });
   });
 
@@ -434,7 +463,15 @@ describe('registry', () => {
       const ids = getRegisteredProviders()
         .map(p => p.id)
         .sort();
-      expect(ids).toEqual(['claude', 'codex', 'codex-opr', 'glm', 'opr']);
+      expect(ids).toEqual([
+        'claude',
+        'codex',
+        'codex-native-strict',
+        'codex-opr',
+        'cursor-grok-dispatch',
+        'glm',
+        'opr',
+      ]);
     });
   });
 

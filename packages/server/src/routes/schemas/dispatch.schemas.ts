@@ -1,11 +1,20 @@
 import { z } from '@hono/zod-openapi';
 
+export const createDispatchTaskTypeSchema = z.enum([
+  'agent_message',
+  'run_review',
+  'draft_spec',
+  'run_report',
+  'board_motion',
+]);
+
 export const dispatchTaskTypeSchema = z.enum([
   'agent_message',
   'run_review',
   'draft_spec',
   'run_report',
   'board_motion',
+  'run_work',
 ]);
 
 export const dispatchMessageStatusSchema = z.enum([
@@ -64,7 +73,7 @@ export const createDispatchMessageBodySchema = z
   .object({
     correlation_id: z.string().min(1),
     idempotency_key: z.string().min(1),
-    task_type: dispatchTaskTypeSchema,
+    task_type: createDispatchTaskTypeSchema,
     sender: z.string().min(1),
     recipient: z.string().min(1),
     body: z.string().min(1),
@@ -75,6 +84,101 @@ export const createDispatchMessageBodySchema = z
   })
   .strict()
   .openapi('CreateDispatchMessageBody');
+
+const gitShaSchema = z.string().regex(/^[0-9a-f]{40}$/i);
+const sha256Schema = z.string().regex(/^[0-9a-f]{64}$/i);
+const safeRelativeArtifactPathSchema = z
+  .string()
+  .min(1)
+  .max(240)
+  .refine(path => {
+    if (path.includes('\\') || path.startsWith('/') || /^[A-Za-z]:/.test(path)) return false;
+    const segments = path.split('/');
+    return segments.every(segment => segment.length > 0 && segment !== '.' && segment !== '..');
+  }, 'artifact path must be a safe relative POSIX path');
+
+const transferredArtifactSchema = z
+  .object({
+    path: safeRelativeArtifactPathSchema,
+    sha256: sha256Schema,
+    content_base64: z.string().min(1),
+    size_bytes: z.number().int().nonnegative(),
+  })
+  .strict()
+  .superRefine((artifact, ctx) => {
+    let decoded: Buffer;
+    try {
+      decoded = Buffer.from(artifact.content_base64, 'base64');
+    } catch {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'invalid base64 payload' });
+      return;
+    }
+    if (
+      decoded.toString('base64') !== artifact.content_base64 ||
+      decoded.length !== artifact.size_bytes
+    ) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'artifact size or base64 mismatch' });
+    }
+  });
+
+export const runWorkRequestBodySchema = z
+  .object({
+    version: z.literal('v1'),
+    correlation_id: z.string().min(1).max(200),
+    idempotency_key: z.string().min(1).max(300),
+    workflow_run_id: z.string().min(1).max(200),
+    node_id: z.string().min(1).max(200),
+    provider_attempt_id: z.string().min(1).max(200),
+    provider_attempt_number: z.number().int().positive(),
+    execution_mode: z.enum(['read_only', 'repository_write']),
+    repository: z
+      .object({
+        remote_url: z.string().url().max(1_000),
+        branch: z.string().min(1).max(240),
+        requested_sha: gitShaSchema,
+      })
+      .strict(),
+    model: z.literal('cursor-grok-4.5-high'),
+    prompt: z.string().min(1).max(2_000_000),
+    artifacts: z
+      .object({
+        source_root: z.string().min(1).max(1_000),
+        inputs: z.array(transferredArtifactSchema).max(64),
+        outputs: z.array(safeRelativeArtifactPathSchema).max(64),
+        max_file_bytes: z.number().int().positive().max(16_777_216),
+        max_total_bytes: z.number().int().positive().max(67_108_864),
+      })
+      .strict(),
+  })
+  .strict()
+  .superRefine((request, ctx) => {
+    const totalBytes = request.artifacts.inputs.reduce((sum, item) => sum + item.size_bytes, 0);
+    if (totalBytes > request.artifacts.max_total_bytes) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'artifact total exceeds limit' });
+    }
+    if (request.artifacts.inputs.some(item => item.size_bytes > request.artifacts.max_file_bytes)) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'artifact file exceeds limit' });
+    }
+  })
+  .openapi('RunWorkRequestBody');
+
+export const runWorkResultBodySchema = z
+  .object({
+    version: z.literal('v1'),
+    worker_id: z.string().min(1).max(200),
+    fencing_token: z.number().int().nonnegative(),
+    outcome: z.enum(['succeeded', 'failed', 'timed_out', 'blocked']),
+    requested_sha: gitShaSchema,
+    resulting_sha: gitShaSchema.nullable(),
+    output: z.string().max(2_000_000),
+    model: z.literal('cursor-grok-4.5-high'),
+    artifacts: z.object({ outputs: z.array(transferredArtifactSchema).max(64) }).strict(),
+  })
+  .strict()
+  .openapi('RunWorkResultBody');
+
+export type RunWorkRequestBody = z.infer<typeof runWorkRequestBodySchema>;
+export type RunWorkResultBody = z.infer<typeof runWorkResultBodySchema>;
 
 export const dispatchMessageIdParamsSchema = z.object({ id: z.string().min(1) });
 export const dispatchSenderBodySchema = z.object({ sender: z.string().min(1) }).strict();

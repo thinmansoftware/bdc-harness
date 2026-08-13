@@ -16,8 +16,10 @@ import type {
 } from './types';
 import { ClaudeProvider } from './claude/provider';
 import { CodexProvider } from './codex/provider';
+import { CursorGrokDispatchProvider } from './cursor-grok-dispatch/provider';
 import { CLAUDE_CAPABILITIES } from './claude/capabilities';
 import { CODEX_CAPABILITIES } from './codex/capabilities';
+import { CURSOR_GROK_DISPATCH_CAPABILITIES } from './cursor-grok-dispatch/capabilities';
 import { registerPiProvider } from './community/pi/registration';
 import {
   registerGlmProvider,
@@ -141,6 +143,20 @@ export function registerBuiltinProviders(): void {
       // sendQuery so the Claude instance is constructed only when actually needed.
       factory: () => new CodexProvider({ failbackProviderFactory: () => new ClaudeProvider() }),
       capabilities: CODEX_CAPABILITIES,
+      builtIn: true,
+    },
+    {
+      id: 'codex-native-strict',
+      displayName: 'Codex Native Strict',
+      factory: () => new CodexProvider({ failbackProviderFactory: null }),
+      capabilities: CODEX_CAPABILITIES,
+      builtIn: true,
+    },
+    {
+      id: 'cursor-grok-dispatch',
+      displayName: 'Cursor Desktop Grok Dispatch',
+      factory: () => new CursorGrokDispatchProvider(),
+      capabilities: CURSOR_GROK_DISPATCH_CAPABILITIES,
       builtIn: true,
     },
     {

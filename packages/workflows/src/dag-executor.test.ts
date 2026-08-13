@@ -1679,6 +1679,62 @@ describe('executeDagWorkflow -- tool restrictions', () => {
     expect(nodeConfig?.allowed_tools).toEqual(['Read', 'Grep']);
   });
 
+  it('passes fenced provider-attempt identity, execution mode, and artifact contract', async () => {
+    const mockDeps = createMockDeps();
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun();
+    const artifactsDir = join(testDir, 'artifacts');
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-dag',
+      testDir,
+      {
+        name: 'dag-desktop-execution-context',
+        nodes: [
+          {
+            id: 'remote-review',
+            command: 'my-cmd',
+            execution_mode: 'read_only',
+            artifact_contract: {
+              inputs: ['diff.patch'],
+              outputs: [],
+              max_file_bytes: 1_000_000,
+              max_total_bytes: 2_000_000,
+            },
+          },
+        ],
+      },
+      workflowRun,
+      'claude',
+      undefined,
+      artifactsDir,
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    const optionsArg = mockSendQueryDag.mock.calls[0][3] as Record<string, unknown>;
+    expect(optionsArg.executionContext).toMatchObject({
+      workflowRunId: workflowRun.id,
+      nodeId: 'remote-review',
+      providerAttemptNumber: 1,
+      executionMode: 'read_only',
+      artifactsDir,
+      artifactContract: {
+        inputs: ['diff.patch'],
+        outputs: [],
+        maxFileBytes: 1_000_000,
+        maxTotalBytes: 2_000_000,
+      },
+    });
+    expect(
+      (optionsArg.executionContext as { providerAttemptId?: string }).providerAttemptId
+    ).toMatch(/^[0-9a-f-]{36}$/);
+  });
+
   it('warns user when Codex DAG node has denied_tools only', async () => {
     mockGetAgentProviderDag.mockReturnValue({
       sendQuery: mockSendQueryDag,

@@ -279,6 +279,25 @@ export interface NodeConfig {
   [key: string]: unknown;
 }
 
+export type DesktopExecutionMode = 'read_only' | 'repository_write';
+
+export interface ArtifactTransferContract {
+  inputs: string[];
+  outputs: string[];
+  maxFileBytes: number;
+  maxTotalBytes: number;
+}
+
+export interface ProviderExecutionContext {
+  workflowRunId: string;
+  nodeId: string;
+  providerAttemptId: string;
+  providerAttemptNumber: number;
+  executionMode: DesktopExecutionMode;
+  artifactsDir: string;
+  artifactContract: ArtifactTransferContract;
+}
+
 /**
  * Extended options for sendQuery, adding workflow-specific context.
  * The orchestrator path uses base AgentRequestOptions fields only.
@@ -289,6 +308,8 @@ export interface SendQueryOptions extends AgentRequestOptions {
   nodeConfig?: NodeConfig;
   /** Per-provider defaults from .archon/config.yaml assistants section. */
   assistantConfig?: Record<string, unknown>;
+  /** Fenced workflow identity required by remote execution providers. */
+  executionContext?: ProviderExecutionContext;
 }
 
 /**

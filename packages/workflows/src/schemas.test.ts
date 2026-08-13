@@ -160,6 +160,53 @@ describe('workflowDefinitionSchema', () => {
   });
 });
 
+describe('dagNodeSchema -- desktop execution contract', () => {
+  test('accepts explicit execution mode and bounded artifact allowlists', () => {
+    const result = dagNodeSchema.safeParse({
+      id: 'remote-review',
+      provider: 'cursor-grok-dispatch',
+      model: 'cursor-grok-4.5-high',
+      execution_mode: 'read_only',
+      artifact_contract: {
+        inputs: ['diff.patch'],
+        outputs: [],
+        max_file_bytes: 1_000_000,
+        max_total_bytes: 2_000_000,
+      },
+      prompt: 'Review the diff.',
+    });
+
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.execution_mode).toBe('read_only');
+      expect(result.data.artifact_contract).toEqual({
+        inputs: ['diff.patch'],
+        outputs: [],
+        max_file_bytes: 1_000_000,
+        max_total_bytes: 2_000_000,
+      });
+    }
+  });
+
+  test('rejects invalid execution modes and unsafe artifact names', () => {
+    expect(
+      dagNodeSchema.safeParse({
+        id: 'bad-mode',
+        execution_mode: 'write_everywhere',
+        prompt: 'No.',
+      }).success
+    ).toBe(false);
+    expect(
+      dagNodeSchema.safeParse({
+        id: 'bad-artifact',
+        execution_mode: 'read_only',
+        artifact_contract: { inputs: ['../secret.txt'], outputs: [] },
+        prompt: 'No.',
+      }).success
+    ).toBe(false);
+  });
+});
+
 // ---------------------------------------------------------------------------
 // isBashNode
 // ---------------------------------------------------------------------------

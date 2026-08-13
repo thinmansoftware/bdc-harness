@@ -21,13 +21,21 @@ import { resolveOperatorToken } from './credentials';
 import { acquireInstanceLock, type InstanceLockHandle } from './instance-lock';
 import { createWorkerLog, type WorkerLog } from './worker-log';
 import { enumerateProcessTree, killProcessTree, waitForTreeDeath } from './acp/kill-tree';
+import {
+  CURSOR_GROK_MODEL,
+  executeRunWork,
+  parseRunWorkRequest,
+  type RunWorkConfig,
+  type RunWorkResult,
+} from './run-work';
 
 type DispatchTaskType =
   | 'agent_message'
   | 'run_review'
   | 'draft_spec'
   | 'run_report'
-  | 'board_motion';
+  | 'board_motion'
+  | 'run_work';
 type DispatchStatus = 'queued' | 'claimed' | 'done' | 'failed' | 'cancelled';
 
 interface DispatchMessage {
@@ -120,14 +128,16 @@ interface WorkerConfig {
     allowed_principals?: string[];
   };
   agents?: Record<string, AgentConfig>;
+  run_work?: Partial<RunWorkConfig>;
 }
 
 type NormalizedWorkerConfig = Required<
-  Omit<WorkerConfig, 'board_delivery' | 'operator_token_file' | 'agents'>
+  Omit<WorkerConfig, 'board_delivery' | 'operator_token_file' | 'agents' | 'run_work'>
 > & {
   operator_token_file: string;
   agents: Record<string, AgentConfig>;
   board_delivery: BoardDeliveryConfig;
+  run_work: RunWorkConfig;
 };
 
 interface WorkerState {
@@ -178,6 +188,13 @@ async function readConfig(path: string): Promise<NormalizedWorkerConfig> {
       credential_id: parsed.board_delivery?.credential_id ?? '',
       token_env: parsed.board_delivery?.token_env ?? 'DISPATCH_WORKER_TOKEN',
       allowed_principals: parsed.board_delivery?.allowed_principals ?? [],
+    },
+    run_work: {
+      enabled: parsed.run_work?.enabled ?? false,
+      cursor_binary: parsed.run_work?.cursor_binary ?? 'cursor-agent',
+      repository_allowlist: parsed.run_work?.repository_allowlist ?? [],
+      worktree_root: parsed.run_work?.worktree_root ?? join(tmpdir(), 'bdc-cursor-run-work'),
+      wall_clock_ms: parsed.run_work?.wall_clock_ms ?? 7_200_000,
     },
     agents,
   };
@@ -241,6 +258,8 @@ function promptFor(message: DispatchMessage): string {
       return `Prepare a concise report for ${message.sender}:\n\n${message.body}`;
     case 'board_motion':
       return renderBoardMotionPrompt(message.body);
+    case 'run_work':
+      throw new Error('run_work_requires_dedicated_processor');
   }
 }
 
@@ -599,7 +618,9 @@ async function processMessage(
   const cap = config.max_concurrency[agent] ?? 1;
   if (active >= cap) return;
   const agentConfig = config.agents[agent];
-  if (!agentConfig) return;
+  if (queued.task_type === 'run_work') {
+    if (!config.run_work.enabled || agent !== 'grok') return;
+  } else if (!agentConfig) return;
 
   state.activeByAgent.set(agent, active + 1);
   try {
@@ -644,27 +665,69 @@ async function processMessage(
       status: 'done' | 'failed';
       taskOutcome?: DispatchTaskOutcome | null;
     };
+    let runWorkResult: RunWorkResult | undefined;
     try {
-      result =
-        agentConfig.kind === 'acp'
-          ? await runAcpLeg(agentConfig, claimed, cancel)
-          : agentConfig.kind === 'mcp'
-            ? await runMcpLeg(agentConfig, claimed, cancel)
-            : await runAgent(agentConfig, claimed, cancel);
+      if (claimed.task_type === 'run_work') {
+        const request = parseRunWorkRequest(claimed.body, config.run_work);
+        try {
+          runWorkResult = await executeRunWork(
+            request,
+            config.run_work,
+            {
+              worker_id: config.worker_id,
+              fencing_token: claimed.fencing_token,
+            },
+            { isCancelled: () => cancel.cancelled }
+          );
+        } catch (error) {
+          const detail = error instanceof Error ? error.message : String(error);
+          runWorkResult = {
+            version: 'v1',
+            worker_id: config.worker_id,
+            fencing_token: claimed.fencing_token,
+            outcome: detail.includes('timed_out') ? 'timed_out' : 'failed',
+            requested_sha: request.repository.requested_sha,
+            resulting_sha: null,
+            output: detail,
+            model: CURSOR_GROK_MODEL,
+            artifacts: { outputs: [] },
+          };
+        }
+        result = {
+          resultBody: runWorkResult.output,
+          status: runWorkResult.outcome === 'succeeded' ? 'done' : 'failed',
+          taskOutcome: runWorkResult.outcome === 'succeeded' ? 'succeeded' : 'failed',
+        };
+      } else {
+        if (!agentConfig) throw new Error(`agent_config_missing:${agent}`);
+        result =
+          agentConfig.kind === 'acp'
+            ? await runAcpLeg(agentConfig, claimed, cancel)
+            : agentConfig.kind === 'mcp'
+              ? await runMcpLeg(agentConfig, claimed, cancel)
+              : await runAgent(agentConfig, claimed, cancel);
+      }
     } finally {
       clearInterval(renewTimer);
     }
 
-    await requestJson(config, token, `/api/dispatch/messages/${claimed.id}/result`, {
-      method: 'POST',
-      body: JSON.stringify({
-        worker_id: config.worker_id,
-        fencing_token: claimed.fencing_token,
-        result_body: result.resultBody,
-        status: result.status,
-        task_outcome: result.taskOutcome,
-      }),
-    });
+    if (runWorkResult) {
+      await requestJson(config, token, `/api/dispatch/work-requests/${claimed.id}/result`, {
+        method: 'POST',
+        body: JSON.stringify(runWorkResult),
+      });
+    } else {
+      await requestJson(config, token, `/api/dispatch/messages/${claimed.id}/result`, {
+        method: 'POST',
+        body: JSON.stringify({
+          worker_id: config.worker_id,
+          fencing_token: claimed.fencing_token,
+          result_body: result.resultBody,
+          status: result.status,
+          task_outcome: result.taskOutcome,
+        }),
+      });
+    }
   } catch (error) {
     await log.error(`dispatch-worker failed message ${queued.id}`, error);
   } finally {
@@ -678,7 +741,9 @@ async function poll(
   state: WorkerState,
   log: WorkerLog
 ): Promise<void> {
-  for (const recipient of Object.keys(config.agents)) {
+  const recipients = new Set(Object.keys(config.agents));
+  if (config.run_work.enabled) recipients.add('grok');
+  for (const recipient of recipients) {
     const headers = config.board_delivery.allowed_principals.includes(recipient)
       ? boardDeliveryHeaders(config, recipient)
       : {};
