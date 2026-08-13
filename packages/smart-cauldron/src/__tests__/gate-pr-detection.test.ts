@@ -263,6 +263,10 @@ describe('Scenario 4: true negative -- no PR anywhere, retries exhausted', () =>
           infraError: null,
         };
       },
+      // Repo RESOLVED: the gate's repo-scoped lookup ran and confirmed no PR.
+      // Only a confirmed negative is a climb signal (an unresolved repo is
+      // infra-error instead -- see the next describe block).
+      resolveRepo: async () => TARGET_REPO,
       poll: async _opts => noPrPoll,
       // deps.judge omitted -- the REAL judgeGate decides the climb.
       escalate: async _ctx => undefined,
@@ -292,6 +296,137 @@ describe('Scenario 4: true negative -- no PR anywhere, retries exhausted', () =>
     // Frontier gate-fail escalated to spec-repair, as before the fix.
     expect(record.status).toBe('spec-repair');
     expect(specRepairCalled).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Unresolved repo: a no-PR verdict without attribution is infra-error, not a
+// climb (diff-review fix: never convert an attribution failure into a no-PR
+// ladder climb, and never fall back to an unscoped gh lookup).
+// ---------------------------------------------------------------------------
+
+describe('Unresolved target repo: no-PR verdict is infra-error, never a climb', () => {
+  test('completed run, no PR event, repo never resolved -> infra-alert, single attempt, escalated', async () => {
+    const fireCalls: string[] = [];
+    const escalations: { errorClass: string; reason: string }[] = [];
+
+    const noPrPoll: PollResult = {
+      runId: 'run-unattributable',
+      terminalStatus: 'completed',
+      validatorVerdict: 'unknown',
+      prUrl: null,
+      prMergeable: null,
+      servedModelId: null,
+      rawMetadata: {},
+    };
+
+    const deps: CascadeDeps = {
+      fire: async opts => {
+        fireCalls.push(opts.workflowName);
+        return {
+          ok: true,
+          runId: `run-${fireCalls.length}`,
+          conversationId: 'c',
+          infraError: null,
+        };
+      },
+      // Repo resolution FAILS: attribution is impossible for this cascade.
+      resolveRepo: async () => null,
+      poll: async _opts => noPrPoll,
+      // deps.judge omitted -- the REAL judgeGate produces the no-PR failure.
+      escalate: async ctx => {
+        escalations.push({ errorClass: ctx.errorClass, reason: ctx.reason });
+      },
+      writeRecord: async (record, _dir) => `/tmp/cascade-record-${record.cascadeId}.json`,
+    };
+
+    const record = await runCascade({
+      woId: 'WO-TEST-UNRESOLVED-REPO-01',
+      woClass: 'CODE',
+      tags: ['mechanical'],
+      outDir: '/tmp/smart-cauldron-test-runs',
+      token: 'test-token',
+      project: 'test-project',
+      deps,
+    } satisfies RunCascadeOptions);
+
+    // NO ladder climb on the unknown: exactly one tier fired.
+    expect(fireCalls.length).toBe(1);
+    expect(record.attempts.length).toBe(1);
+    expect(record.telemetry.climbed).toBe(false);
+
+    // The attempt is an infra-error (attribution unavailable), not gate-failed.
+    expect(record.status).toBe('infra-alert');
+    expect(record.attempts[0]?.outcome).toBe('infra-error');
+    expect(record.attempts[0]?.infraErrorReason).toContain('PR attribution unavailable');
+    expect(record.attempts[0]?.gateFailReason).toBeNull();
+
+    // The operator was alerted with the attribution failure.
+    expect(escalations.length).toBe(1);
+    expect(escalations[0]?.reason).toContain('never resolved');
+  });
+
+  test('failures independent of PR attribution still climb with an unresolved repo', async () => {
+    const fireCalls: string[] = [];
+    let pollCallIndex = 0;
+
+    const deps: CascadeDeps = {
+      fire: async opts => {
+        fireCalls.push(opts.workflowName);
+        return {
+          ok: true,
+          runId: `run-${fireCalls.length}`,
+          conversationId: 'c',
+          infraError: null,
+        };
+      },
+      resolveRepo: async () => null,
+      poll: async _opts => {
+        pollCallIndex++;
+        // Tier 0: validator says needs_revision -- a climb signal that does
+        // NOT depend on PR attribution. Tier 1: clean win.
+        if (pollCallIndex === 1) {
+          return {
+            runId: 'run-1',
+            terminalStatus: 'completed',
+            validatorVerdict: 'needs_revision',
+            prUrl: null,
+            prMergeable: null,
+            servedModelId: null,
+            rawMetadata: {},
+          } satisfies PollResult;
+        }
+        return {
+          runId: 'run-2',
+          terminalStatus: 'completed',
+          validatorVerdict: 'satisfied',
+          prUrl: 'https://github.com/thinmansoftware/lspro-react/pull/518',
+          prMergeable: true,
+          servedModelId: null,
+          rawMetadata: {},
+        } satisfies PollResult;
+      },
+      // deps.judge omitted -- the REAL judgeGate decides.
+      escalate: async _ctx => undefined,
+      writeRecord: async (record, _dir) => `/tmp/cascade-record-${record.cascadeId}.json`,
+    };
+
+    const record = await runCascade({
+      woId: 'WO-TEST-UNRESOLVED-REPO-02',
+      woClass: 'CODE',
+      tags: ['mechanical'],
+      outDir: '/tmp/smart-cauldron-test-runs',
+      token: 'test-token',
+      project: 'test-project',
+      deps,
+    } satisfies RunCascadeOptions);
+
+    // needs_revision climbed normally despite the unresolved repo, and the
+    // next rung won on its PR event.
+    expect(fireCalls.length).toBe(2);
+    expect(record.attempts[0]?.outcome).toBe('gate-failed');
+    expect(record.attempts[0]?.gateFailReason).toContain('needs_revision');
+    expect(record.status).toBe('won');
   });
 });
 

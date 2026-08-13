@@ -105,8 +105,11 @@ interface PollOptions {
    * even when the conductor's cwd is a DIFFERENT repo than the WO's target.
    * Anchor incident 2026-08-11 (bdc-xo#1502): lspro-react PRs #513/#515 were
    * invisible to a gate whose gh resolved the repo from the bdc-harness cwd,
-   * so the ladder climbed to apex on finished work. When absent, gh falls back
-   * to its cwd-derived repo (legacy behavior).
+   * so the ladder climbed to apex on finished work. When absent, the
+   * branch-based GitHub fallback is SKIPPED entirely -- an unscoped gh lookup
+   * would recreate the incident's cwd-derived wrong-repo query -- and a
+   * missing PR event yields prUrl null, which callers must treat as UNKNOWN
+   * attribution, never confirmed-absent (see cascade.ts infra-error handling).
    */
   repo?: string;
   /**
@@ -427,7 +430,10 @@ function collectCandidateBranches(
  * bdc-xo#1502): two attribution gaps closed.
  *   (a) The gh query carried no --repo, so gh resolved the repo from the
  *       CONDUCTOR'S cwd -- PRs on any other repo (lspro-react #513/#515) were
- *       invisible at every rung. `repo` ("owner/name") now scopes the lookup.
+ *       invisible at every rung. `repo` ("owner/name") now scopes the lookup,
+ *       and when `repo` is ABSENT the lookup is skipped outright: an unscoped
+ *       query is exactly the incident's wrong-repository lookup, so it is
+ *       never issued. A skipped lookup returns null (UNKNOWN).
  *   (b) Only the last `unique_branch=` marker was checked. Runs that push the
  *       engine's `archon/thread-*` branch without emitting the marker, or that
  *       dual-push `archon/thread-*` + `feat/wo-*`, were unattributable. All
@@ -445,10 +451,26 @@ async function findExistingPrForBranch(
   execGh: GhRunner = defaultGhRunner
 ): Promise<string | null> {
   const candidates = collectCandidateBranches(events);
+  if (candidates.length === 0) return null;
+
+  // DIFF-REVIEW FIX 2026-08-13: NEVER query gh without --repo. An unscoped
+  // `gh pr list` resolves the repo from the CONDUCTOR'S cwd -- the exact
+  // wrong-repository lookup of anchor bdc-xo#1502. When the target repo is
+  // unresolved, skip the lookup and return null (UNKNOWN); the cascade
+  // classifies a no-PR conclusion reached without attribution as an
+  // infra-error, not a climb signal (see cascade.ts).
+  if (!repo) {
+    console.log(
+      '[poll] target repo unresolved: skipping branch-based PR lookup for ' +
+        `${String(candidates.length)} candidate branch(es) -- an unscoped gh query would ` +
+        "resolve the conductor's cwd repo (anchor bdc-xo#1502); result is UNKNOWN, " +
+        'not confirmed-absent'
+    );
+    return null;
+  }
 
   for (const branch of candidates) {
-    const args = ['pr', 'list'];
-    if (repo) args.push('--repo', repo);
+    const args = ['pr', 'list', '--repo', repo];
     args.push('--head', branch, '--state', 'open', '--json', 'url', '--jq', '.[0].url // empty');
     try {
       const { stdout } = await execGh(args);
@@ -456,7 +478,7 @@ async function findExistingPrForBranch(
       if (url.length > 0) return url;
     } catch (err) {
       console.log(
-        `[poll] gh pr list --head ${branch}${repo ? ` --repo ${repo}` : ''} failed: ` +
+        `[poll] gh pr list --head ${branch} --repo ${repo} failed: ` +
           `${(err as Error).message} (result is UNKNOWN, not confirmed-absent)`
       );
     }

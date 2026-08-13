@@ -154,7 +154,8 @@ export function parseOwnerRepo(url: string): string | null {
  * Resolution chain:
  *   1. The matching codebase record's repository_url (GET /api/codebases).
  *   2. `gh repo view --json nameWithOwner` run inside the record's default_cwd.
- *   3. null -- callers treat null as "unscoped" and log it; they never guess.
+ *   3. null -- callers treat null as "attribution unavailable" and log it;
+ *      they never guess and never fall back to an unscoped cwd-derived lookup.
  */
 export async function resolveProjectRepo(
   project: string,
@@ -195,7 +196,7 @@ export async function resolveProjectRepo(
   }
 
   console.log(
-    `[smart-cauldron/fire] repo resolution: no GitHub repo resolved for project ${project} (PR attribution will fall back to gh's cwd-derived repo)`
+    `[smart-cauldron/fire] repo resolution: no GitHub repo resolved for project ${project} (PR attribution unavailable -- branch-based gh lookups will be skipped, never run unscoped)`
   );
   return null;
 }

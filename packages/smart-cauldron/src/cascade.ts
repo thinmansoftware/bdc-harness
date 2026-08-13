@@ -58,7 +58,10 @@ export interface CascadeDeps {
   /**
    * Resolve the GitHub "owner/name" repo behind the frozen project SHORTNAME
    * (WO-HARNESS-CASCADE-GATE-PR-DETECTION-01). Used to scope the gate's PR
-   * attribution queries; null = unresolved (gate lookups run unscoped).
+   * attribution queries; null = unresolved. Unresolved NEVER falls back to an
+   * unscoped gh lookup (anchor bdc-xo#1502) -- a completed run with no PR
+   * event is then classified as infra-error (attribution unknown), not a
+   * gate-fail climb.
    */
   resolveRepo?: (project: string, apiBaseUrl: string, token?: string) => Promise<string | null>;
   escalate?: (context: EscalationCallContext) => Promise<void>;
@@ -286,14 +289,20 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
   // front. The gate's PR-attribution queries are scoped to this repo (anchor
   // bdc-xo#1502: unscoped gh resolved the CONDUCTOR'S cwd repo, so PRs on the
   // WO's actual target repo were invisible at every rung). Resolution failure
-  // is non-fatal: the gate falls back to unscoped lookups, never to a guess.
+  // leaves targetRepo null. The gate NEVER falls back to an unscoped lookup
+  // (that recreates the incident's wrong-repository query -- poll.ts skips
+  // the branch-based gh fallback entirely without a repo). Instead, a
+  // completed run whose ONLY failing gate condition would be "no PR opened"
+  // is classified below as an infra-error (attribution unknown), not a climb
+  // signal.
   let targetRepo: string | null = null;
   try {
     targetRepo = await resolveRepoImpl(project, apiBaseUrl, token);
   } catch (repoErr) {
     console.log(
       `[smart-cauldron] Warning: repo resolution threw for project ${project}: ` +
-        `${(repoErr as Error).message} (gate PR lookups will run unscoped)`
+        `${(repoErr as Error).message} (gate PR attribution UNAVAILABLE -- a no-PR ` +
+        'verdict on a completed run will be treated as infra-error, not a climb)'
     );
   }
   if (targetRepo !== null) {
@@ -685,6 +694,44 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
       // status/outcome are 'cancelled', never a false win, never spec-repair.
       status = 'cancelled';
       console.log(`[smart-cauldron] CANCELLED on tier=${tier.name}: ${verdict.reason}`);
+      await checkpoint();
+      break;
+    }
+
+    // DIFF-REVIEW FIX 2026-08-13 (WO-HARNESS-CASCADE-GATE-PR-DETECTION-01): a
+    // "no PR opened" gate failure is only a trustworthy climb signal when the
+    // gate could actually ATTRIBUTE PRs -- i.e. the target repo resolved and
+    // the branch-based GitHub fallback ran repo-scoped. With targetRepo null
+    // that fallback was skipped (poll.ts never queries gh unscoped -- anchor
+    // bdc-xo#1502), so "no PR" is UNKNOWN, not a confirmed negative. Climbing
+    // on unknown burns rungs on possibly-finished work (the incident's exact
+    // cost). Classify the attempt as infra-error and alert instead. Failures
+    // independent of PR attribution (failed/escalated terminal status,
+    // validator needs_revision) still climb normally.
+    const noPrWasOnlyGateFailure =
+      pollResult.terminalStatus === 'completed' &&
+      pollResult.prUrl === null &&
+      pollResult.validatorVerdict !== 'needs_revision';
+    if (targetRepo === null && noPrWasOnlyGateFailure) {
+      const attributionReason =
+        `PR attribution unavailable on tier ${tier.name}: target repo for project ` +
+        `${project} never resolved, so the gate cannot distinguish "no PR opened" ` +
+        'from "PR invisible without --repo scoping"';
+      attempt.outcome = 'infra-error';
+      attempt.infraErrorReason = attributionReason;
+      attempt.gateFailReason = null;
+
+      console.log(`[smart-cauldron] ${attributionReason}`);
+
+      await emitEscalation({
+        errorClass: 'service_unavailable',
+        woId,
+        reason: attributionReason,
+        overseerPermit: opts.overseerPermit,
+        runId: fireResult.runId,
+      });
+
+      status = 'infra-alert';
       await checkpoint();
       break;
     }

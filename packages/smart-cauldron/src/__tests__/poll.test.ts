@@ -218,7 +218,11 @@ describe('pollForTerminal branch-based PR attribution (WO-HARNESS-CASCADE-GATE-P
     expect(ghAttempts).toBe(3);
   });
 
-  test('omits --repo when no target repo is provided (legacy cwd-derived behavior)', async () => {
+  test('skips the branch-based gh lookup entirely when no target repo is provided (never unscoped)', async () => {
+    // DIFF-REVIEW FIX 2026-08-13: an unscoped `gh pr list` resolves the repo
+    // from the CONDUCTOR'S cwd -- the exact wrong-repository lookup of anchor
+    // bdc-xo#1502. Without a resolved repo the fallback must not run at all;
+    // the result is null (UNKNOWN attribution), never a cwd-derived answer.
     globalThis.fetch = (async () =>
       completedRun([
         {
@@ -229,7 +233,7 @@ describe('pollForTerminal branch-based PR attribution (WO-HARNESS-CASCADE-GATE-P
       ])) as unknown as typeof fetch;
 
     const ghCalls: string[][] = [];
-    await pollForTerminal({
+    const result = await pollForTerminal({
       runId: 'run-no-repo',
       apiBaseUrl: 'http://archon.test',
       timeoutMs: 60_000,
@@ -239,15 +243,18 @@ describe('pollForTerminal branch-based PR attribution (WO-HARNESS-CASCADE-GATE-P
       execGh: async args => {
         ghCalls.push(args);
         if (args[0] === 'pr' && args[1] === 'list') {
+          // Would-be answer from the WRONG (cwd-derived) repo -- must never be
+          // reached, let alone attributed.
           return { stdout: 'https://github.com/thinmansoftware/bdc-harness/pull/1\n' };
         }
         return { stdout: 'MERGEABLE\n' };
       },
     });
 
+    // No `gh pr list` was issued at all, and no PR was attributed.
     const listCall = ghCalls.find(args => args[0] === 'pr' && args[1] === 'list');
-    expect(listCall).toBeDefined();
-    expect(listCall).not.toContain('--repo');
+    expect(listCall).toBeUndefined();
+    expect(result.prUrl).toBeNull();
   });
 });
 
