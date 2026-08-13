@@ -143,9 +143,9 @@ describe('lane registration and war-council-validator pin', () => {
       }
 
       if (file === 'bdc-feature-development-grok.yaml') {
-        // Grok builds; a repository-capable non-Grok judge validates.
-        expect(wcv.provider).toBe('codex-opr');
-        expect(wcv.model).not.toBe('x-ai/grok-4.5');
+        // Cursor Grok builds; strict native Codex validates without failback.
+        expect(wcv.provider).toBe('codex-native-strict');
+        expect(wcv.model).toBe('gpt-5.6-sol');
         return;
       }
 
@@ -156,14 +156,9 @@ describe('lane registration and war-council-validator pin', () => {
       }
 
       if (file === 'bdc-feature-development-codex.yaml') {
-        // Fable test seat (John 2026-07-02: "add fable in to one for testing for
-        // now"). Model swept claude-fable-5 -> claude-opus-5 by M-20260726-87
-        // (this exact node, fusion-cx-qwen's sole Claude binding, was the
-        // validator that hard-failed WO #1284 and #1274 the week Fable ran out
-        // of subscription quota). Superseded by the apex-rung WO (bdc-xo issue
-        // #575) when it lands.
-        expect(wcv.provider).toBe('claude');
-        expect(wcv.model).toBe('claude-opus-5');
+        // Strict native Codex builds; Cursor Grok provides independent review.
+        expect(wcv.provider).toBe('cursor-grok-dispatch');
+        expect(wcv.model).toBe('cursor-grok-4.5-high');
         return;
       }
 
@@ -259,15 +254,15 @@ describe('lane registration and war-council-validator pin', () => {
     }
   });
 
-  it('S4i: the dedicated Grok lane pins execution to Grok and review to non-Grok seats', () => {
+  it('S4i: the desktop Grok lane pins execution to Cursor Grok and review to strict Codex', () => {
     const file = 'bdc-feature-development-grok.yaml';
     const lane = loadLane(file);
     const content = readFileSync(join(LANES_DIR, file), 'utf-8');
     const nodes = lane.nodes ?? [];
     const node = (id: string) => nodes.find(candidate => candidate.id === id);
 
-    expect(lane.provider).toBe('grok');
-    expect(lane.model).toBe('x-ai/grok-4.5');
+    expect(lane.provider).toBe('cursor-grok-dispatch');
+    expect(lane.model).toBe('cursor-grok-4.5-high');
     expect(content).not.toContain('provider: claude');
     expect(content).not.toContain('model: claude');
     expect(content).not.toContain('agent: overseer-opus');
@@ -281,8 +276,8 @@ describe('lane registration and war-council-validator pin', () => {
       'apply-suggested-fix',
     ]) {
       const executionNode = node(id);
-      expect(executionNode?.provider, `${file}:${id}:provider`).toBe('grok');
-      expect(executionNode?.model, `${file}:${id}:model`).toBe('x-ai/grok-4.5');
+      expect(executionNode?.provider, `${file}:${id}:provider`).toBe('cursor-grok-dispatch');
+      expect(executionNode?.model, `${file}:${id}:model`).toBe('cursor-grok-4.5-high');
       expect(executionNode?.fallbackModel, `${file}:${id}:fallbackModel`).toBeUndefined();
     }
 
@@ -296,8 +291,8 @@ describe('lane registration and war-council-validator pin', () => {
       'apply-diff-review-final',
     ]) {
       const reviewNode = node(id);
-      expect(reviewNode?.provider, `${file}:${id}:provider`).toBe('codex-opr');
-      expect(reviewNode?.model, `${file}:${id}:model`).not.toBe('x-ai/grok-4.5');
+      expect(reviewNode?.provider, `${file}:${id}:provider`).toBe('codex-native-strict');
+      expect(reviewNode?.model, `${file}:${id}:model`).toBe('gpt-5.6-sol');
       expect(reviewNode?.fallbackModel, `${file}:${id}:fallbackModel`).toBeUndefined();
     }
   });
