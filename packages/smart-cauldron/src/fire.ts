@@ -9,7 +9,11 @@
  * Secret boundary: apiBaseUrl and token come from the caller or environment.
  */
 
+import { execFile } from 'child_process';
+import { promisify } from 'util';
 import type { FireResult } from './types.js';
+
+const execFileAsync = promisify(execFile);
 
 interface FireTierOptions {
   workflowName: string;
@@ -31,6 +35,10 @@ interface FireTierOptions {
 interface CodebaseSummary {
   id: string;
   name: string;
+  /** Git remote URL from the codebase record (nullable in the API schema). */
+  repository_url?: string | null;
+  /** Local source checkout path; fallback surface for gh repo view. */
+  default_cwd?: string | null;
 }
 
 interface AtomicConversationResponse {
@@ -66,11 +74,11 @@ function matchesProject(codebaseName: string, project: string): boolean {
   return normalizedName === normalizedProject || shortName === normalizedProject;
 }
 
-async function resolveCodebaseId(
+async function resolveProjectCodebase(
   project: string,
   apiBaseUrl: string,
   token: string
-): Promise<{ codebaseId: string | null; error: string | null }> {
+): Promise<{ codebase: CodebaseSummary | null; error: string | null }> {
   let response: Response;
   try {
     response = await fetch(`${apiBaseUrl}/api/codebases`, {
@@ -78,14 +86,14 @@ async function resolveCodebaseId(
     });
   } catch (error) {
     return {
-      codebaseId: null,
+      codebase: null,
       error: `[smart-cauldron/fire] network error resolving project ${project}: ${(error as Error).message}`,
     };
   }
 
   if (!response.ok) {
     return {
-      codebaseId: null,
+      codebase: null,
       error: `HTTP ${response.status} resolving project ${project}: ${await responseSummary(response)}`,
     };
   }
@@ -95,7 +103,7 @@ async function resolveCodebaseId(
     codebases = (await response.json()) as CodebaseSummary[];
   } catch (error) {
     return {
-      codebaseId: null,
+      codebase: null,
       error: `invalid codebase response while resolving project ${project}: ${(error as Error).message}`,
     };
   }
@@ -111,12 +119,85 @@ async function resolveCodebaseId(
 
   if (matches.length !== 1) {
     return {
-      codebaseId: null,
+      codebase: null,
       error: `project ${project} resolved to ${String(matches.length)} codebases; exactly one is required`,
     };
   }
 
-  return { codebaseId: matches[0]?.id ?? null, error: null };
+  return { codebase: matches[0] ?? null, error: null };
+}
+
+async function resolveCodebaseId(
+  project: string,
+  apiBaseUrl: string,
+  token: string
+): Promise<{ codebaseId: string | null; error: string | null }> {
+  const { codebase, error } = await resolveProjectCodebase(project, apiBaseUrl, token);
+  return { codebaseId: codebase?.id ?? null, error };
+}
+
+/** Parse "owner/name" from a GitHub remote URL (https, ssh, or git@ form). */
+export function parseOwnerRepo(url: string): string | null {
+  const m = /github\.com[/:]([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+?)(?:\.git)?\/?$/.exec(url.trim());
+  return m?.[1] && m[2] ? `${m[1]}/${m[2]}` : null;
+}
+
+/**
+ * Resolve the GitHub "owner/name" repository behind a codebase SHORTNAME.
+ *
+ * WO-HARNESS-CASCADE-GATE-PR-DETECTION-01: the cascade's `project` binding is
+ * a shortname (e.g. "harness", "lspro-react"), NOT an owner/name pair -- it
+ * must never be passed to gh --repo as-is, and the target repo must never be
+ * guessed from the conductor's cwd or defaulted to bdc-harness (anchor
+ * bdc-xo#1502: cwd-derived repo made lspro-react PRs invisible to the gate).
+ *
+ * Resolution chain:
+ *   1. The matching codebase record's repository_url (GET /api/codebases).
+ *   2. `gh repo view --json nameWithOwner` run inside the record's default_cwd.
+ *   3. null -- callers treat null as "unscoped" and log it; they never guess.
+ */
+export async function resolveProjectRepo(
+  project: string,
+  apiBaseUrl: string,
+  token?: string
+): Promise<string | null> {
+  const resolvedToken = token ?? process.env.ARCHON_OPERATOR_TOKEN ?? '';
+  const { codebase, error } = await resolveProjectCodebase(project, apiBaseUrl, resolvedToken);
+  if (codebase === null) {
+    console.log(
+      `[smart-cauldron/fire] repo resolution: no codebase record for project ${project}: ${error ?? 'unknown error'}`
+    );
+    return null;
+  }
+
+  if (typeof codebase.repository_url === 'string' && codebase.repository_url.length > 0) {
+    const parsed = parseOwnerRepo(codebase.repository_url);
+    if (parsed !== null) return parsed;
+    console.log(
+      `[smart-cauldron/fire] repo resolution: could not parse owner/name from repository_url "${codebase.repository_url}" for project ${project}; trying gh repo view`
+    );
+  }
+
+  if (typeof codebase.default_cwd === 'string' && codebase.default_cwd.length > 0) {
+    try {
+      const { stdout } = await execFileAsync(
+        'gh',
+        ['repo', 'view', '--json', 'nameWithOwner', '--jq', '.nameWithOwner'],
+        { cwd: codebase.default_cwd }
+      );
+      const nameWithOwner = stdout.trim();
+      if (nameWithOwner.length > 0) return nameWithOwner;
+    } catch (err) {
+      console.log(
+        `[smart-cauldron/fire] repo resolution: gh repo view failed in ${codebase.default_cwd} for project ${project}: ${(err as Error).message}`
+      );
+    }
+  }
+
+  console.log(
+    `[smart-cauldron/fire] repo resolution: no GitHub repo resolved for project ${project} (PR attribution will fall back to gh's cwd-derived repo)`
+  );
+  return null;
 }
 
 /** Fire a WO and return only after its workflow run row is discoverable. */

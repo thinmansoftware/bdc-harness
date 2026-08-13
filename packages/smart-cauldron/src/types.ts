@@ -40,6 +40,13 @@ export interface CascadeAttempt {
   gateFailReason: string | null; // which condition failed (terminal/validator/pr)
   infraErrorReason: string | null; // HTTP status + message on infra-error
   servedModelId: string | null; // from run metadata when available
+  /**
+   * PR attributed to this attempt's run (head-branch attribution). ADDITIVE
+   * field (WO-HARNESS-CASCADE-GATE-PR-DETECTION-01): consumers of the cascade
+   * log (W2 rung-burn dial) must tolerate its absence on older records. No
+   * existing field names changed.
+   */
+  prUrl?: string | null;
   costUsd: number | null;
   startedAt: string;
   completedAt: string | null;

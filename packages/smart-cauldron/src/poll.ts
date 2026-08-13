@@ -99,7 +99,30 @@ interface PollOptions {
   prRetryAttempts?: number;
   /** Delay between PR-URL lookup retries (ms). Default: 10000 (10 seconds). */
   prRetryDelayMs?: number;
+  /**
+   * Target GitHub repository ("owner/name") the run's PR would be opened on.
+   * When set, branch-based PR lookups pass `--repo` to gh so attribution works
+   * even when the conductor's cwd is a DIFFERENT repo than the WO's target.
+   * Anchor incident 2026-08-11 (bdc-xo#1502): lspro-react PRs #513/#515 were
+   * invisible to a gate whose gh resolved the repo from the bdc-harness cwd,
+   * so the ladder climbed to apex on finished work. When absent, gh falls back
+   * to its cwd-derived repo (legacy behavior).
+   */
+  repo?: string;
+  /**
+   * Injectable gh CLI runner (tests). Defaults to execFile('gh', args).
+   * Keeps PR-lookup tests hermetic -- no live GitHub calls.
+   */
+  execGh?: GhRunner;
 }
+
+/** Runs the gh CLI with the given args and resolves with its stdout. */
+export type GhRunner = (args: string[]) => Promise<{ stdout: string }>;
+
+const defaultGhRunner: GhRunner = async args => {
+  const { stdout } = await execFileAsync('gh', args);
+  return { stdout };
+};
 
 /**
  * Poll a workflow run until it reaches a terminal state (completed/failed/cancelled).
@@ -117,6 +140,8 @@ export async function pollForTerminal(opts: PollOptions): Promise<PollResult> {
     intervalMs = 30_000,
     prRetryAttempts = 3,
     prRetryDelayMs = 10_000,
+    repo,
+    execGh = defaultGhRunner,
   } = opts;
   const token = tokenOverride ?? process.env.ARCHON_OPERATOR_TOKEN ?? '';
 
@@ -154,7 +179,20 @@ export async function pollForTerminal(opts: PollOptions): Promise<PollResult> {
       // taken in that window sees no PR and the gate false-negatives into a
       // tier climb. Re-read the run events with backoff before concluding
       // that no PR was opened.
+      //
+      // DEFECT FIX 2026-08-13 (WO-HARNESS-CASCADE-GATE-PR-DETECTION-01, anchor
+      // bdc-xo#1502): the branch-based GitHub lookup used to run ONCE, only
+      // after the event-feed retries were exhausted. GitHub's PR list is itself
+      // eventually consistent right after a run completes, so a single query in
+      // that window returned empty and the gate false-negatived at EVERY rung
+      // (lspro-react PRs #513-#518, apex burned on finished work). The lookup
+      // now runs on the initial read AND inside each bounded retry, so a
+      // briefly-empty PR list gets re-asked before the gate concludes no-PR.
+      // Retries stay bounded and the whole path is read-only/idempotent.
       if (terminalStatus === 'completed' && prUrl === null) {
+        let foundViaGitHub = false;
+        prUrl = await findExistingPrForBranch(events, repo, execGh);
+        foundViaGitHub = prUrl !== null;
         for (let attempt = 0; attempt < prRetryAttempts && prUrl === null; attempt++) {
           await new Promise<void>(resolve => setTimeout(resolve, prRetryDelayMs));
           const retryDetail = await fetchRunDetail(runId, apiBaseUrl, token);
@@ -164,24 +202,25 @@ export async function pollForTerminal(opts: PollOptions): Promise<PollResult> {
           if (validatorVerdict === 'unknown') {
             validatorVerdict = extractValidatorVerdict(events);
           }
-        }
-
-        // DEFECT FIX 2026-07-27: the retries above only cover the RACE where an
-        // open-pr event lands late. They do not cover the legitimate case where
-        // the run was told to converge an existing PR and correctly opened
-        // NOTHING. Before failing the gate, ask GitHub whether the branch this
-        // run pushed already has an open PR. See findExistingPrForBranch.
-        if (prUrl === null) {
-          prUrl = await findExistingPrForBranch(events);
-          if (prUrl !== null) {
-            console.log(
-              `[poll] run ${runId} opened no PR, but its pushed branch already has one: ${prUrl} -- treating as satisfied (converge-existing-PR WO)`
-            );
+          // DEFECT FIX 2026-07-27: the event retries only cover the RACE where
+          // an open-pr event lands late. They do not cover the legitimate case
+          // where the run was told to converge an existing PR and correctly
+          // opened NOTHING, nor a run whose PR event output lacks a URL. Before
+          // failing the gate, ask GitHub whether a branch this run pushed
+          // already has an open PR. See findExistingPrForBranch.
+          if (prUrl === null) {
+            prUrl = await findExistingPrForBranch(events, repo, execGh);
+            foundViaGitHub = prUrl !== null;
           }
+        }
+        if (foundViaGitHub && prUrl !== null) {
+          console.log(
+            `[poll] run ${runId} reported no PR event, but a branch it pushed has an open PR: ${prUrl} -- treating as satisfied`
+          );
         }
       }
 
-      const prMergeable = prUrl ? await checkPrMergeable(prUrl) : null;
+      const prMergeable = prUrl ? await checkPrMergeable(prUrl, execGh) : null;
       const servedModelId = extractServedModelId(detail.run.metadata ?? {});
 
       return {
@@ -317,7 +356,62 @@ function extractPrUrl(
 }
 
 /**
- * Find an ALREADY-OPEN PR for the branch this run pushed to.
+ * Upper bound on branch candidates queried per fallback invocation. Keeps the
+ * gh call count bounded (idempotency requirement: retries are bounded).
+ */
+const MAX_BRANCH_CANDIDATES = 8;
+
+/**
+ * Collect every branch this run plausibly pushed, from its event outputs.
+ *
+ * Two sources, in attribution-priority order:
+ *   1. `unique_branch=<name>` markers emitted by the commit-and-push node --
+ *      the canonical PR branch. Later markers win (a retry may retarget), so
+ *      they are returned newest-first.
+ *   2. Branch tokens matching the push patterns a run can actually produce
+ *      (verified against the active bdc-feature-development-* workflow YAMLs):
+ *      `(feat|fix|wip)/wo-*` feature branches and the engine's per-run
+ *      `archon/thread-<hash>` worktree branch, which the implement loop pushes
+ *      directly (Patch 2 commit-and-push) even when the marker is never
+ *      emitted. Anchor bdc-xo#1502: matching ONLY the marker missed both.
+ *
+ * Deduplicated, capped at MAX_BRANCH_CANDIDATES.
+ */
+function collectCandidateBranches(
+  events: { event_type: string; step_name: string | null; data: Record<string, unknown> }[]
+): string[] {
+  const candidates: string[] = [];
+  const add = (branch: string): void => {
+    if (branch.length > 0 && !candidates.includes(branch)) candidates.push(branch);
+  };
+
+  // Source 1: unique_branch= markers, newest-first.
+  const markers: string[] = [];
+  for (const ev of events) {
+    const output = typeof ev.data.output === 'string' ? ev.data.output : '';
+    const markerPattern = /unique_branch=(\S+)/g;
+    let m: RegExpExecArray | null;
+    while ((m = markerPattern.exec(output)) !== null) {
+      if (m[1]) markers.push(m[1]);
+    }
+  }
+  for (const marker of markers.reverse()) add(marker);
+
+  // Source 2: push-pattern branch tokens anywhere in event outputs.
+  const tokenPattern = /\b(?:archon\/thread-[A-Za-z0-9_-]+|(?:feat|fix|wip)\/wo-[A-Za-z0-9_-]+)\b/g;
+  for (const ev of events) {
+    const output = typeof ev.data.output === 'string' ? ev.data.output : '';
+    let m: RegExpExecArray | null;
+    while ((m = tokenPattern.exec(output)) !== null) {
+      add(m[0]);
+    }
+  }
+
+  return candidates.slice(0, MAX_BRANCH_CANDIDATES);
+}
+
+/**
+ * Find an ALREADY-OPEN PR for a branch this run pushed.
  *
  * DEFECT FIX 2026-07-27 (anchor: WO-CRM-SUPABASE-CONVERGENCE-01, cascade
  * dispatch-e252e3db). The gate asks "did this run open a PR?" and treats no
@@ -329,40 +423,46 @@ function extractPrUrl(
  * tier climbs, and two spurious salvage PRs opened against work that was
  * already correct and already green.
  *
- * So before concluding no PR exists, ASK GITHUB whether the pushed branch
+ * DEFECT FIX 2026-08-13 (WO-HARNESS-CASCADE-GATE-PR-DETECTION-01, anchor
+ * bdc-xo#1502): two attribution gaps closed.
+ *   (a) The gh query carried no --repo, so gh resolved the repo from the
+ *       CONDUCTOR'S cwd -- PRs on any other repo (lspro-react #513/#515) were
+ *       invisible at every rung. `repo` ("owner/name") now scopes the lookup.
+ *   (b) Only the last `unique_branch=` marker was checked. Runs that push the
+ *       engine's `archon/thread-*` branch without emitting the marker, or that
+ *       dual-push `archon/thread-*` + `feat/wo-*`, were unattributable. All
+ *       candidate branches are now queried (see collectCandidateBranches).
+ *
+ * So before concluding no PR exists, ASK GITHUB whether a pushed branch
  * already has one. Returns null when gh is unavailable or nothing is found --
- * callers must treat null as "unknown", never as "confirmed absent".
+ * callers must treat null as "unknown", never as "confirmed absent". gh
+ * failures are logged (not swallowed) so a broken lookup is visible in the
+ * cascade output.
  */
 async function findExistingPrForBranch(
-  events: { event_type: string; step_name: string | null; data: Record<string, unknown> }[]
+  events: { event_type: string; step_name: string | null; data: Record<string, unknown> }[],
+  repo?: string,
+  execGh: GhRunner = defaultGhRunner
 ): Promise<string | null> {
-  // The commit-and-push node reports its final target as unique_branch=<name>.
-  let branch: string | null = null;
-  for (const ev of events) {
-    const output = typeof ev.data.output === 'string' ? ev.data.output : '';
-    const m = /unique_branch=(\S+)/.exec(output);
-    if (m?.[1]) branch = m[1];
-  }
-  if (!branch) return null;
+  const candidates = collectCandidateBranches(events);
 
-  try {
-    const { stdout } = await execFileAsync('gh', [
-      'pr',
-      'list',
-      '--head',
-      branch,
-      '--state',
-      'open',
-      '--json',
-      'url',
-      '--jq',
-      '.[0].url // empty',
-    ]);
-    const url = stdout.trim();
-    return url.length > 0 ? url : null;
-  } catch {
-    return null;
+  for (const branch of candidates) {
+    const args = ['pr', 'list'];
+    if (repo) args.push('--repo', repo);
+    args.push('--head', branch, '--state', 'open', '--json', 'url', '--jq', '.[0].url // empty');
+    try {
+      const { stdout } = await execGh(args);
+      const url = stdout.trim();
+      if (url.length > 0) return url;
+    } catch (err) {
+      console.log(
+        `[poll] gh pr list --head ${branch}${repo ? ` --repo ${repo}` : ''} failed: ` +
+          `${(err as Error).message} (result is UNKNOWN, not confirmed-absent)`
+      );
+    }
   }
+
+  return null;
 }
 
 /**
@@ -378,9 +478,12 @@ function extractServedModelId(metadata: Record<string, unknown>): string | null 
  * Check if a PR is mergeable via the gh CLI.
  * Returns null if gh is unavailable or returns non-zero.
  */
-async function checkPrMergeable(prUrl: string): Promise<boolean | null> {
+async function checkPrMergeable(
+  prUrl: string,
+  execGh: GhRunner = defaultGhRunner
+): Promise<boolean | null> {
   try {
-    const { stdout } = await execFileAsync('gh', [
+    const { stdout } = await execGh([
       'pr',
       'view',
       prUrl,

@@ -94,6 +94,163 @@ describe('pollForTerminal PR-detection race guard', () => {
   });
 });
 
+describe('pollForTerminal branch-based PR attribution (WO-HARNESS-CASCADE-GATE-PR-DETECTION-01)', () => {
+  const completedRun = (events: unknown[]) =>
+    new Response(
+      JSON.stringify({
+        run: { id: 'run-attr', status: 'completed', metadata: {} },
+        events,
+      }),
+      { status: 200, headers: { 'content-type': 'application/json' } }
+    );
+
+  test('scopes the gh lookup with --repo and matches an archon/thread-* push without a unique_branch marker', async () => {
+    globalThis.fetch = (async () =>
+      completedRun([
+        {
+          event_type: 'node_completed',
+          step_name: 'implement',
+          data: {
+            output:
+              "branch 'archon/thread-2d0f2f8a' set up to track 'origin/archon/thread-2d0f2f8a'.",
+          },
+        },
+      ])) as unknown as typeof fetch;
+
+    const ghCalls: string[][] = [];
+    const result = await pollForTerminal({
+      runId: 'run-attr',
+      apiBaseUrl: 'http://archon.test',
+      timeoutMs: 60_000,
+      intervalMs: 1,
+      prRetryAttempts: 1,
+      prRetryDelayMs: 1,
+      repo: 'thinmansoftware/lspro-react',
+      execGh: async args => {
+        ghCalls.push(args);
+        if (args[0] === 'pr' && args[1] === 'list') {
+          return { stdout: 'https://github.com/thinmansoftware/lspro-react/pull/513\n' };
+        }
+        return { stdout: 'MERGEABLE\n' };
+      },
+    });
+
+    expect(result.prUrl).toBe('https://github.com/thinmansoftware/lspro-react/pull/513');
+    const listCall = ghCalls.find(args => args[0] === 'pr' && args[1] === 'list');
+    expect(listCall).toBeDefined();
+    expect(listCall).toContain('--repo');
+    expect(listCall).toContain('thinmansoftware/lspro-react');
+    expect(listCall).toContain('archon/thread-2d0f2f8a');
+  });
+
+  test('queries every candidate branch on a dual-branch push (archon/thread-* + feat/wo-*)', async () => {
+    globalThis.fetch = (async () =>
+      completedRun([
+        {
+          event_type: 'node_completed',
+          step_name: 'implement',
+          data: { output: 'pushed archon/thread-9772643d' },
+        },
+        {
+          event_type: 'node_completed',
+          step_name: 'commit-and-push',
+          data: { output: 'unique_branch=feat/wo-cover-picker-scroll-01-thread-9772643d' },
+        },
+      ])) as unknown as typeof fetch;
+
+    const headsQueried: string[] = [];
+    const result = await pollForTerminal({
+      runId: 'run-attr-dual',
+      apiBaseUrl: 'http://archon.test',
+      timeoutMs: 60_000,
+      intervalMs: 1,
+      prRetryAttempts: 1,
+      prRetryDelayMs: 1,
+      repo: 'thinmansoftware/lspro-react',
+      execGh: async args => {
+        if (args[0] === 'pr' && args[1] === 'list') {
+          const head = args[args.indexOf('--head') + 1] ?? '';
+          headsQueried.push(head);
+          // Only the SECOND branch (the engine thread branch) has the PR.
+          if (head === 'archon/thread-9772643d') {
+            return { stdout: 'https://github.com/thinmansoftware/lspro-react/pull/515\n' };
+          }
+          return { stdout: '' };
+        }
+        return { stdout: 'MERGEABLE\n' };
+      },
+    });
+
+    expect(result.prUrl).toBe('https://github.com/thinmansoftware/lspro-react/pull/515');
+    // unique_branch marker is queried first (canonical PR branch), then tokens.
+    expect(headsQueried[0]).toBe('feat/wo-cover-picker-scroll-01-thread-9772643d');
+    expect(headsQueried).toContain('archon/thread-9772643d');
+  });
+
+  test('a gh failure is unknown-not-absent: logged, other candidates still queried, null when all fail', async () => {
+    globalThis.fetch = (async () =>
+      completedRun([
+        {
+          event_type: 'node_completed',
+          step_name: 'commit-and-push',
+          data: { output: 'unique_branch=feat/wo-gh-down-01-thread-aa11bb22' },
+        },
+      ])) as unknown as typeof fetch;
+
+    let ghAttempts = 0;
+    const result = await pollForTerminal({
+      runId: 'run-gh-down',
+      apiBaseUrl: 'http://archon.test',
+      timeoutMs: 60_000,
+      intervalMs: 1,
+      prRetryAttempts: 2,
+      prRetryDelayMs: 1,
+      repo: 'thinmansoftware/bdc-harness',
+      execGh: async () => {
+        ghAttempts++;
+        throw new Error('gh: connection refused');
+      },
+    });
+
+    // gh errored on every attempt: verdict stays "unknown/no PR" (null), and
+    // the lookup was actually attempted (1 initial + 2 retries).
+    expect(result.prUrl).toBeNull();
+    expect(ghAttempts).toBe(3);
+  });
+
+  test('omits --repo when no target repo is provided (legacy cwd-derived behavior)', async () => {
+    globalThis.fetch = (async () =>
+      completedRun([
+        {
+          event_type: 'node_completed',
+          step_name: 'commit-and-push',
+          data: { output: 'unique_branch=feat/wo-legacy-01-thread-cc33dd44' },
+        },
+      ])) as unknown as typeof fetch;
+
+    const ghCalls: string[][] = [];
+    await pollForTerminal({
+      runId: 'run-no-repo',
+      apiBaseUrl: 'http://archon.test',
+      timeoutMs: 60_000,
+      intervalMs: 1,
+      prRetryAttempts: 1,
+      prRetryDelayMs: 1,
+      execGh: async args => {
+        ghCalls.push(args);
+        if (args[0] === 'pr' && args[1] === 'list') {
+          return { stdout: 'https://github.com/thinmansoftware/bdc-harness/pull/1\n' };
+        }
+        return { stdout: 'MERGEABLE\n' };
+      },
+    });
+
+    const listCall = ghCalls.find(args => args[0] === 'pr' && args[1] === 'list');
+    expect(listCall).toBeDefined();
+    expect(listCall).not.toContain('--repo');
+  });
+});
+
 describe('pollForTerminal transport truth', () => {
   test('surfaces an HTTP transport failure instead of converting it into a timeout', async () => {
     globalThis.fetch = (async () =>

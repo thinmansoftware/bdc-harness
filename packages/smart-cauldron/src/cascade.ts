@@ -22,7 +22,7 @@ import { execFile } from 'child_process';
 import { promisify } from 'util';
 import { loadLadder } from './ladder.js';
 import { loadRuleset, pickEntryTier } from './conductor.js';
-import { fireTier, buildFireMessage } from './fire.js';
+import { fireTier, buildFireMessage, resolveProjectRepo } from './fire.js';
 import { pollForTerminal, TimeoutError } from './poll.js';
 import { judgeGate, classifyAttemptOutcome } from './judge.js';
 import { createRecord, writeRecord } from './recorder.js';
@@ -55,6 +55,12 @@ export interface CascadeDeps {
   fire?: typeof fireTier;
   poll?: typeof pollForTerminal;
   judge?: typeof judgeGate;
+  /**
+   * Resolve the GitHub "owner/name" repo behind the frozen project SHORTNAME
+   * (WO-HARNESS-CASCADE-GATE-PR-DETECTION-01). Used to scope the gate's PR
+   * attribution queries; null = unresolved (gate lookups run unscoped).
+   */
+  resolveRepo?: (project: string, apiBaseUrl: string, token?: string) => Promise<string | null>;
   escalate?: (context: EscalationCallContext) => Promise<void>;
   writeRecord?: typeof writeRecord;
   /** Exclusive admission writer used to make dispatch idempotent across processes. */
@@ -209,6 +215,11 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
         })
       : createRecord);
   const cancelImpl = opts.deps?.cancel ?? cancelRun;
+  // Mirror the createRecord pattern above: when a poll stub is injected (tests),
+  // default to a no-op resolver so a stubbed cascade never makes live API calls.
+  const resolveRepoImpl =
+    opts.deps?.resolveRepo ??
+    (opts.deps?.poll ? async (): Promise<string | null> => null : resolveProjectRepo);
   const specRepairImpl = opts.deps?.specRepair ?? defaultSpecRepair;
   const superviseFailureImpl = opts.deps?.superviseFailure;
 
@@ -269,6 +280,24 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
     throw new Error(
       '[smart-cauldron/cascade] --project is required for cascade fires (explicit codebase binding; no silent fallback allowed).'
     );
+  }
+
+  // Resolve the GitHub owner/name repo behind the project SHORTNAME once, up
+  // front. The gate's PR-attribution queries are scoped to this repo (anchor
+  // bdc-xo#1502: unscoped gh resolved the CONDUCTOR'S cwd repo, so PRs on the
+  // WO's actual target repo were invisible at every rung). Resolution failure
+  // is non-fatal: the gate falls back to unscoped lookups, never to a guess.
+  let targetRepo: string | null = null;
+  try {
+    targetRepo = await resolveRepoImpl(project, apiBaseUrl, token);
+  } catch (repoErr) {
+    console.log(
+      `[smart-cauldron] Warning: repo resolution threw for project ${project}: ` +
+        `${(repoErr as Error).message} (gate PR lookups will run unscoped)`
+    );
+  }
+  if (targetRepo !== null) {
+    console.log(`[smart-cauldron] Gate PR attribution scoped to repo=${targetRepo}`);
   }
 
   // Cascade loop
@@ -562,6 +591,7 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
         runId: resolvedRunId,
         apiBaseUrl,
         token,
+        repo: targetRepo ?? undefined,
         timeoutMs: pollTimeoutMs,
         stallTimeoutMs: pollStallTimeoutMs,
         intervalMs: pollIntervalMs,
@@ -635,6 +665,9 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
     attempt.outcome = outcome;
     attempt.gateFailReason = verdict.pass ? null : verdict.reason;
     attempt.servedModelId = pollResult.servedModelId;
+    // Record the attributed PR in the cascade log (additive prUrl field --
+    // scenario 1 of WO-HARNESS-CASCADE-GATE-PR-DETECTION-01; no field renames).
+    attempt.prUrl = pollResult.prUrl;
     attempt.completedAt = new Date().toISOString();
 
     if (verdict.pass) {
