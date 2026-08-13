@@ -99,6 +99,30 @@ interface PollOptions {
   prRetryAttempts?: number;
   /** Delay between PR-URL lookup retries (ms). Default: 10000 (10 seconds). */
   prRetryDelayMs?: number;
+  /**
+   * Retries for the ALREADY-OPEN-PR branch lookup (findExistingPrForBranch's
+   * `gh pr list --head <branch>` call). Default: 3.
+   *
+   * DEFECT FIX 2026-08-13 WO-HARNESS-CASCADE-GATE-PR-DETECTION-01 (anchor: issue
+   * thinmansoftware/bdc-xo#1502). The event-feed retries above (prRetryAttempts)
+   * cover the race where an open-pr NODE EVENT lands late. They do NOT cover the
+   * separate GitHub eventual-consistency window on the `gh pr list --head` REST
+   * path: a run can push its branch and open a PR, yet `gh pr list --head` return
+   * an empty list for several seconds after the run status flips to completed.
+   * A single-shot lookup in that window false-negatives -> gate reads "no PR
+   * opened" -> ladder climbs on already-landed work (incident #1502: lspro-react
+   * PRs #513/#515 existed while the conductor climbed to apex). Retry the branch
+   * lookup with backoff before concluding the branch has no PR.
+   */
+  prBranchLookupAttempts?: number;
+  /** Delay between findExistingPrForBranch `gh pr list` retries (ms). Default: 10000. */
+  prBranchLookupDelayMs?: number;
+  /**
+   * Injectable seam for the `gh pr list --head <branch>` lookup. Test-only:
+   * production always uses the real gh CLI (ghPrListForBranchDefault). Returns
+   * the PR URL for the branch, or null when gh is unavailable / no PR is found.
+   */
+  ghPrListForBranch?: (branch: string) => Promise<string | null>;
 }
 
 /**
@@ -117,6 +141,9 @@ export async function pollForTerminal(opts: PollOptions): Promise<PollResult> {
     intervalMs = 30_000,
     prRetryAttempts = 3,
     prRetryDelayMs = 10_000,
+    prBranchLookupAttempts = 3,
+    prBranchLookupDelayMs = 10_000,
+    ghPrListForBranch = ghPrListForBranchDefault,
   } = opts;
   const token = tokenOverride ?? process.env.ARCHON_OPERATOR_TOKEN ?? '';
 
@@ -172,7 +199,12 @@ export async function pollForTerminal(opts: PollOptions): Promise<PollResult> {
         // NOTHING. Before failing the gate, ask GitHub whether the branch this
         // run pushed already has an open PR. See findExistingPrForBranch.
         if (prUrl === null) {
-          prUrl = await findExistingPrForBranch(events);
+          prUrl = await findExistingPrForBranch(
+            events,
+            ghPrListForBranch,
+            prBranchLookupAttempts,
+            prBranchLookupDelayMs
+          );
           if (prUrl !== null) {
             console.log(
               `[poll] run ${runId} opened no PR, but its pushed branch already has one: ${prUrl} -- treating as satisfied (converge-existing-PR WO)`
@@ -332,9 +364,27 @@ function extractPrUrl(
  * So before concluding no PR exists, ASK GITHUB whether the pushed branch
  * already has one. Returns null when gh is unavailable or nothing is found --
  * callers must treat null as "unknown", never as "confirmed absent".
+ *
+ * The pushed / PR-head branch is ALWAYS the workflow's UNIQUE_BRANCH
+ * ("${BRANCH}-thread-${THREAD_ID}", BRANCH validated ^(feat|fix|wip)/...),
+ * emitted by the commit-and-push node as `unique_branch=<name>` (verified in
+ * bdc-feature-development-zero.yaml:2316 and siblings). `archon/thread-<hash>`
+ * is only the LOCAL worktree ref used to derive THREAD_ID -- it is never the
+ * pushed branch -- so matching on the parsed `unique_branch=` value and passing
+ * it to `gh pr list --head` is the correct attribution for every ladder rung.
+ *
+ * RETRY (2026-08-13 WO-HARNESS-CASCADE-GATE-PR-DETECTION-01, issue #1502): the
+ * `gh pr list --head` REST path has its own GitHub eventual-consistency window
+ * that is independent of the caller's event-feed re-read loop. A single-shot
+ * lookup can return an empty list for several seconds after a PR was opened,
+ * false-negativing the gate and climbing the ladder on already-landed work.
+ * Retry the lookup with backoff before returning null.
  */
 async function findExistingPrForBranch(
-  events: { event_type: string; step_name: string | null; data: Record<string, unknown> }[]
+  events: { event_type: string; step_name: string | null; data: Record<string, unknown> }[],
+  lookup: (branch: string) => Promise<string | null>,
+  attempts: number,
+  delayMs: number
 ): Promise<string | null> {
   // The commit-and-push node reports its final target as unique_branch=<name>.
   let branch: string | null = null;
@@ -345,6 +395,24 @@ async function findExistingPrForBranch(
   }
   if (!branch) return null;
 
+  // At least one attempt regardless of a zero/negative attempts value.
+  const totalAttempts = attempts > 0 ? attempts : 1;
+  for (let attempt = 0; attempt < totalAttempts; attempt++) {
+    if (attempt > 0) {
+      await new Promise<void>(resolve => setTimeout(resolve, delayMs));
+    }
+    const url = await lookup(branch);
+    if (url !== null) return url;
+  }
+  return null;
+}
+
+/**
+ * Default `gh pr list --head <branch>` lookup used in production. Returns the
+ * open PR URL for the branch, or null when gh is unavailable or nothing matches.
+ * Callers must treat null as "unknown", never as "confirmed absent".
+ */
+async function ghPrListForBranchDefault(branch: string): Promise<string | null> {
   try {
     const { stdout } = await execFileAsync('gh', [
       'pr',
