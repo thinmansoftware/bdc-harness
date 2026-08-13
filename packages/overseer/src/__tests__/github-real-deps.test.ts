@@ -1,5 +1,8 @@
 import { afterEach, describe, expect, mock, test } from 'bun:test';
 import { generateKeyPairSync } from 'node:crypto';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import {
   createRealApprovePullRequest,
   resolveGitHubAppAuth,
@@ -109,6 +112,42 @@ describe('real GitHub App authentication', () => {
 
     expect(resolveGitHubAppAuth()?.privateKey).toBe(key);
   });
+
+  test('App private key can be read from the configured file path', () => {
+    const directory = mkdtempSync(join(tmpdir(), 'overseer-github-app-key-'));
+    const keyPath = join(directory, 'private-key.pem');
+    const key = fixturePrivateKey();
+    writeFileSync(keyPath, key, 'utf8');
+
+    try {
+      clearAuthEnvironment();
+      process.env.GITHUB_APP_ID = '4574893';
+      process.env.GITHUB_APP_INSTALLATION_ID = '153295654';
+      process.env.GITHUB_APP_PRIVATE_KEY_PATH = keyPath;
+
+      expect(resolveGitHubAppAuth()).toEqual({
+        appId: '4574893',
+        installationId: '153295654',
+        privateKey: key,
+      });
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test('unreadable App private key path names the broken variable', () => {
+    clearAuthEnvironment();
+    process.env.GITHUB_APP_ID = '4574893';
+    process.env.GITHUB_APP_INSTALLATION_ID = '153295654';
+    process.env.GITHUB_APP_PRIVATE_KEY_PATH = join(
+      tmpdir(),
+      'overseer-github-app-key-does-not-exist.pem'
+    );
+
+    expect(() => resolveGitHubAppAuth()).toThrow(
+      'overseer_real_adapter_broken_GITHUB_APP_PRIVATE_KEY_PATH'
+    );
+  });
 });
 
 describe('real GitHub pull request approval', () => {
@@ -143,6 +182,40 @@ describe('real GitHub pull request approval', () => {
     ).resolves.toEqual({
       approved: false,
       message: 'github_review_self_approval_rejected',
+    });
+  });
+
+  test('approvePullRequest classifies other 422 responses as review rejections', async () => {
+    const createReview = mock(async () =>
+      Promise.reject({ status: 422, message: 'Validation Failed' })
+    );
+
+    await expect(
+      createRealApprovePullRequest(octokitWithCreateReview(createReview))({
+        owner: 'thinmansoftware',
+        repo: 'bdc-harness',
+        number: 42,
+      })
+    ).resolves.toEqual({
+      approved: false,
+      message: 'github_review_rejected_422',
+    });
+  });
+
+  test('approvePullRequest classifies non-422 failures as transport-ambiguous', async () => {
+    const createReview = mock(async () =>
+      Promise.reject({ status: 503, message: 'Service Unavailable' })
+    );
+
+    await expect(
+      createRealApprovePullRequest(octokitWithCreateReview(createReview))({
+        owner: 'thinmansoftware',
+        repo: 'bdc-harness',
+        number: 42,
+      })
+    ).resolves.toEqual({
+      approved: false,
+      message: 'github_review_transport_ambiguous',
     });
   });
 });
