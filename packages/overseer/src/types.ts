@@ -159,6 +159,7 @@ export interface GitHubClientDeps {
   mergePullRequest(
     input: GitHubPullRequestMergeInput
   ): Promise<{ merged: boolean; message?: string }>;
+  approvePullRequest?(input: PullRequestRef): Promise<{ approved: boolean; message?: string }>;
   /**
    * Tier 0 comment_findings channel (judge-first path). Optional: when absent
    * the pipeline records a loud 'comment_channel_unavailable' receipt rather

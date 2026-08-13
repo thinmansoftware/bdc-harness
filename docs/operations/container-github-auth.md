@@ -61,6 +61,31 @@ The token VALUE still comes from `.env` (or the host shell). The compose file ne
 6. Smoke test: fire `bdc-sync-workflows` from the web UI and confirm the PR opens.
 7. Revoke the old token on github.com.
 
+## Thinman Overseer GitHub App (not yet deployed)
+
+This is the intended configuration for Overseer's App identity in `archon-app-1`.
+It is documentation only: this work order does not edit `/opt/bdc/archon/.env`,
+recreate the container, or enable required pull-request reviews.
+
+| Variable | Intended value |
+|----------|----------------|
+| `GITHUB_APP_ID` | `4574893` |
+| `GITHUB_APP_INSTALLATION_ID` | `153295654` |
+| `GITHUB_APP_PRIVATE_KEY_PATH` | `/run/secrets/thinman-overseer.pem` |
+
+Mount the operator-managed PEM read-only into the container at
+`/run/secrets/thinman-overseer.pem`, using a bind mount or Docker secret, then put
+the three variables above in `/opt/bdc/archon/.env`. The actual key location is
+recorded outside this repository in `~/.claude/reference/credentials.md` under
+“GitHub App: Thinman Overseer”; never copy the PEM into this repository.
+
+Alternatively, set `GITHUB_APP_PRIVATE_KEY` to the PEM contents instead of using
+`GITHUB_APP_PRIVATE_KEY_PATH`. Preserve real newlines; literal `\\n` sequences are
+also accepted for env-file mechanisms that escape them. Complete App credentials
+take precedence over `GH_TOKEN`/`GITHUB_TOKEN`. Partial or malformed App credentials
+stop startup rather than silently using the PAT. Keep the PAT configured as the
+fallback when all App variables are absent; this procedure does not rotate or revoke it.
+
 ## Pre-flight check semantics
 
 The entrypoint runs `gh auth status` after configuring the credential helper. Possible states written to `/tmp/github-auth-preflight.status`:

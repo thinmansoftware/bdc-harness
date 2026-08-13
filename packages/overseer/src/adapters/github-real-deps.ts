@@ -1,4 +1,7 @@
 import { Octokit } from '@octokit/rest';
+import { createAppAuth } from '@octokit/auth-app';
+import { readFileSync } from 'node:fs';
+import { createPrivateKey } from 'node:crypto';
 import { createLogger } from '@archon/paths';
 import type {
   GitHubClientDeps,
@@ -68,6 +71,12 @@ export interface RealGitHubOctokitLike {
       pull_number: number;
       sha: string;
     }): Promise<{ data: { merged: boolean; sha?: string | null } }>;
+    createReview(input: {
+      owner: string;
+      repo: string;
+      pull_number: number;
+      event: 'APPROVE';
+    }): Promise<{ data: { id: number; state: string } }>;
   };
   search: {
     issuesAndPullRequests(input: Record<string, unknown>): Promise<{
@@ -102,10 +111,105 @@ export function resolveGitHubToken(): string {
   return token;
 }
 
-/** Construct a real Octokit client from the standard env token. */
+export interface GitHubAppAuthConfig {
+  appId: string;
+  installationId: string;
+  privateKey: string;
+}
+
+/**
+ * Resolve installation-scoped App credentials before considering PAT auth.
+ * WO-HARNESS-OVERSEER-APP-AUTH-01 requires partial or broken App configuration
+ * to fail loudly so Overseer can never silently downgrade to a human identity.
+ */
+export function resolveGitHubAppAuth(): GitHubAppAuthConfig | null {
+  const appId = process.env.GITHUB_APP_ID;
+  const installationId = process.env.GITHUB_APP_INSTALLATION_ID;
+  const inlineKey = process.env.GITHUB_APP_PRIVATE_KEY;
+  const keyPath = process.env.GITHUB_APP_PRIVATE_KEY_PATH;
+  const anyAppVariable = appId || installationId || inlineKey || keyPath;
+
+  if (!anyAppVariable) return null;
+  if (!appId) throw new Error('overseer_real_adapter_missing_GITHUB_APP_ID');
+  if (!installationId) {
+    throw new Error('overseer_real_adapter_missing_GITHUB_APP_INSTALLATION_ID');
+  }
+  if (!inlineKey && !keyPath) {
+    throw new Error(
+      'overseer_real_adapter_missing_GITHUB_APP_PRIVATE_KEY_or_GITHUB_APP_PRIVATE_KEY_PATH'
+    );
+  }
+
+  let privateKey: string;
+  if (inlineKey) {
+    privateKey = inlineKey.replace(/\\n/g, '\n');
+  } else if (keyPath) {
+    try {
+      privateKey = readFileSync(keyPath, 'utf8');
+    } catch (error) {
+      throw new Error(`overseer_real_adapter_broken_GITHUB_APP_PRIVATE_KEY_PATH: ${String(error)}`);
+    }
+  } else {
+    throw new Error('overseer_real_adapter_missing_GITHUB_APP_PRIVATE_KEY_PATH');
+  }
+
+  try {
+    createPrivateKey(privateKey);
+  } catch (error) {
+    const source = inlineKey ? 'GITHUB_APP_PRIVATE_KEY' : 'GITHUB_APP_PRIVATE_KEY_PATH';
+    throw new Error(`overseer_real_adapter_malformed_${source}: ${String(error)}`);
+  }
+
+  return { appId, installationId, privateKey };
+}
+
+/** Construct a real Octokit client, preferring installation-scoped App auth. */
 export function createRealOctokitClient(): RealGitHubOctokitLike {
+  const appAuth = resolveGitHubAppAuth();
+  if (appAuth) {
+    return new Octokit({
+      authStrategy: createAppAuth,
+      auth: appAuth,
+    }) as unknown as RealGitHubOctokitLike;
+  }
   const auth = resolveGitHubToken();
   return new Octokit({ auth }) as unknown as RealGitHubOctokitLike;
+}
+
+/** Build the PR-review capability without changing when Overseer chooses to merge. */
+export function createRealApprovePullRequest(octokit: RealGitHubOctokitLike): (input: {
+  owner: string;
+  repo: string;
+  number: number;
+}) => Promise<{
+  approved: boolean;
+  message?: string;
+}> {
+  return async input => {
+    try {
+      await octokit.pulls.createReview({
+        owner: input.owner,
+        repo: input.repo,
+        pull_number: input.number,
+        event: 'APPROVE',
+      });
+      return { approved: true };
+    } catch (error) {
+      const status =
+        typeof error === 'object' && error !== null && 'status' in error
+          ? (error as { status?: number }).status
+          : undefined;
+      const providerMessage =
+        typeof error === 'object' && error !== null && 'message' in error
+          ? String((error as { message?: unknown }).message)
+          : '';
+      if (status === 422 && /approve your own pull request|self.?approv/i.test(providerMessage)) {
+        return { approved: false, message: 'github_review_self_approval_rejected' };
+      }
+      if (status === 422) return { approved: false, message: 'github_review_rejected_422' };
+      return { approved: false, message: 'github_review_transport_ambiguous' };
+    }
+  };
 }
 
 function summarizeChecks(
@@ -265,6 +369,7 @@ export function createRealGitHubClientDeps(
   return {
     findPullRequest: createRealFindPullRequest(octokit),
     mergePullRequest: createRealMergePullRequest(octokit),
+    approvePullRequest: createRealApprovePullRequest(octokit),
     commentOnPullRequest: async (input): Promise<{ commented: boolean; url?: string }> => {
       if (!octokit.issues) {
         throw new Error('overseer_real_adapter_missing_issues_api');
