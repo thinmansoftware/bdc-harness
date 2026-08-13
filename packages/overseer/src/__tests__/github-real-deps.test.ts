@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { generateKeyPairSync } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -19,8 +20,13 @@ const APP_ENV_VARS = [
   'GITHUB_TOKEN',
 ] as const;
 
-const FAKE_PEM =
-  '-----BEGIN RSA PRIVATE KEY-----\nMIIEfakekeymaterialfortests\n-----END RSA PRIVATE KEY-----\n';
+// A REAL (throwaway, test-only) RSA key: resolveGitHubAppAuth now parses the
+// PEM cryptographically at construction, so a garbage-body fixture would be
+// (correctly) rejected. PKCS#1 matches the format GitHub App keys ship in.
+const TEST_PEM = generateKeyPairSync('rsa', { modulusLength: 2048 }).privateKey.export({
+  type: 'pkcs1',
+  format: 'pem',
+}) as string;
 
 let savedEnv: Record<string, string | undefined>;
 
@@ -47,7 +53,7 @@ describe('resolveGitHubAppAuth', () => {
   test('app vars complete -> App auth config resolved (App path chosen)', () => {
     process.env.GITHUB_APP_ID = '4574893';
     process.env.GITHUB_APP_INSTALLATION_ID = '153295654';
-    process.env.GITHUB_APP_PRIVATE_KEY = FAKE_PEM;
+    process.env.GITHUB_APP_PRIVATE_KEY = TEST_PEM;
 
     const config = resolveGitHubAppAuth();
     expect(config).not.toBeNull();
@@ -84,8 +90,7 @@ describe('resolveGitHubAppAuth', () => {
   test('inline key with literal backslash-n escapes is normalized; garbage key throws', () => {
     process.env.GITHUB_APP_ID = '4574893';
     process.env.GITHUB_APP_INSTALLATION_ID = '153295654';
-    process.env.GITHUB_APP_PRIVATE_KEY =
-      '-----BEGIN RSA PRIVATE KEY-----\\nMIIEfake\\n-----END RSA PRIVATE KEY-----\\n';
+    process.env.GITHUB_APP_PRIVATE_KEY = TEST_PEM.replace(/\n/g, '\\n');
 
     const config = resolveGitHubAppAuth();
     expect(config?.privateKey).toContain('\n');
@@ -96,18 +101,43 @@ describe('resolveGitHubAppAuth', () => {
     expect(() => resolveGitHubAppAuth()).toThrow(/overseer_real_adapter_app_auth_malformed.*BEGIN/);
   });
 
+  test('header-shaped but cryptographically invalid key throws at construction', () => {
+    process.env.GITHUB_APP_ID = '4574893';
+    process.env.GITHUB_APP_INSTALLATION_ID = '153295654';
+    process.env.GH_TOKEN = 'pat-token-that-must-not-be-used';
+
+    // Garbage body behind a valid-looking header: passes a header-only check,
+    // must fail the cryptographic parse.
+    process.env.GITHUB_APP_PRIVATE_KEY =
+      '-----BEGIN RSA PRIVATE KEY-----\\nMIIEfakekeymaterialfortests\\n-----END RSA PRIVATE KEY-----\\n';
+    expect(() => resolveGitHubAppAuth()).toThrow(
+      /overseer_real_adapter_app_auth_malformed.*not a parseable private key/
+    );
+    // Construction must fail loudly too, not defer to the first lazy App
+    // token exchange (and never fall back to the PAT).
+    expect(() => createRealOctokitClient()).toThrow(
+      /overseer_real_adapter_app_auth_malformed.*not a parseable private key/
+    );
+
+    // Truncated header-only key: same construction-time rejection.
+    process.env.GITHUB_APP_PRIVATE_KEY = '-----BEGIN RSA PRIVATE KEY-----\\n';
+    expect(() => resolveGitHubAppAuth()).toThrow(
+      /overseer_real_adapter_app_auth_malformed.*not a parseable private key/
+    );
+  });
+
   test('private key path is read from disk; unreadable path throws, no PAT fallback', () => {
     const dir = mkdtempSync(join(tmpdir(), 'overseer-app-auth-'));
     try {
       const pemPath = join(dir, 'app.pem');
-      writeFileSync(pemPath, FAKE_PEM, 'utf8');
+      writeFileSync(pemPath, TEST_PEM, 'utf8');
       process.env.GITHUB_APP_ID = '4574893';
       process.env.GITHUB_APP_INSTALLATION_ID = '153295654';
       process.env.GITHUB_APP_PRIVATE_KEY_PATH = pemPath;
       process.env.GH_TOKEN = 'pat-token-that-must-not-be-used';
 
       const config = resolveGitHubAppAuth();
-      expect(config?.privateKey).toBe(FAKE_PEM);
+      expect(config?.privateKey).toBe(TEST_PEM);
 
       process.env.GITHUB_APP_PRIVATE_KEY_PATH = join(dir, 'missing.pem');
       expect(() => resolveGitHubAppAuth()).toThrow(
@@ -121,7 +151,7 @@ describe('resolveGitHubAppAuth', () => {
   test('malformed numeric ids throw naming the variable', () => {
     process.env.GITHUB_APP_ID = 'not-a-number';
     process.env.GITHUB_APP_INSTALLATION_ID = '153295654';
-    process.env.GITHUB_APP_PRIVATE_KEY = FAKE_PEM;
+    process.env.GITHUB_APP_PRIVATE_KEY = TEST_PEM;
     expect(() => resolveGitHubAppAuth()).toThrow(/GITHUB_APP_ID/);
 
     process.env.GITHUB_APP_ID = '4574893';
@@ -189,6 +219,41 @@ describe('createRealApprovePullRequest', () => {
     await expect(approve(ref)).rejects.toThrow(
       /overseer_real_adapter_self_approval_rejected.*Can not approve your own pull request/
     );
+  });
+
+  test('self-approval detected from response error details when top-level message is generic', async () => {
+    const createReview = mock(async () =>
+      Promise.reject(
+        Object.assign(new Error('Validation Failed'), {
+          status: 422,
+          response: {
+            data: {
+              message: 'Validation Failed',
+              errors: ['Can not approve your own pull request'],
+            },
+          },
+        })
+      )
+    );
+    const approve = createRealApprovePullRequest(createOctokitMock(createReview));
+
+    await expect(approve(ref)).rejects.toThrow(/overseer_real_adapter_self_approval_rejected/);
+  });
+
+  test('non-self-approval 422 is rethrown unaltered, NOT mislabeled as self-approval', async () => {
+    const original = Object.assign(new Error('Commit id is not part of the pull request'), {
+      status: 422,
+      response: {
+        data: {
+          message: 'Validation Failed',
+          errors: [{ message: 'Commit id is not part of the pull request' }],
+        },
+      },
+    });
+    const createReview = mock(async () => Promise.reject(original));
+    const approve = createRealApprovePullRequest(createOctokitMock(createReview));
+
+    await expect(approve(ref)).rejects.toBe(original);
   });
 
   test('missing createReview API on the client throws loudly', async () => {

@@ -1,4 +1,5 @@
 import { readFileSync } from 'node:fs';
+import { createPrivateKey } from 'node:crypto';
 import { Octokit } from '@octokit/rest';
 import { createAppAuth } from '@octokit/auth-app';
 import { createLogger } from '@archon/paths';
@@ -185,12 +186,23 @@ export function resolveGitHubAppAuth(): GitHubAppAuthConfig | null {
       );
     }
   }
+  const keySource = inlineKey
+    ? 'GITHUB_APP_PRIVATE_KEY'
+    : `GITHUB_APP_PRIVATE_KEY_PATH (${keyPath})`;
   if (!privateKey.includes('-----BEGIN')) {
-    const source = inlineKey
-      ? 'GITHUB_APP_PRIVATE_KEY'
-      : `GITHUB_APP_PRIVATE_KEY_PATH (${keyPath})`;
     throw new Error(
-      `overseer_real_adapter_app_auth_malformed: ${source} does not contain a PEM (missing -----BEGIN header)`
+      `overseer_real_adapter_app_auth_malformed: ${keySource} does not contain a PEM (missing -----BEGIN header)`
+    );
+  }
+  // Header check alone is not enough: a truncated or header-only PEM would pass
+  // it and then fail at the first (lazy) App token exchange, long after
+  // construction. Parse the key cryptographically NOW so a malformed key fails
+  // loudly at construction time -- never a deferred auth surprise.
+  try {
+    createPrivateKey(privateKey);
+  } catch (error) {
+    throw new Error(
+      `overseer_real_adapter_app_auth_malformed: ${keySource} has a PEM header but is not a parseable private key: ${(error as Error).message}`
     );
   }
 
@@ -368,11 +380,57 @@ export function createRealMergePullRequest(
   };
 }
 
+/** Structural shape of an Octokit RequestError, as far as classification needs. */
+interface GitHubApiErrorLike {
+  status?: number;
+  message?: string;
+  response?: {
+    data?: {
+      message?: unknown;
+      errors?: unknown;
+    };
+  };
+}
+
+/**
+ * True ONLY for GitHub's self-approval rejection ("Can not approve your own
+ * pull request"). GitHub returns 422 for many createReview validation
+ * failures (bad commit_id, pending review exists, invalid event, ...), so
+ * status alone must not be treated as self-approval -- classify from the
+ * error message and the response error details instead.
+ */
+function isSelfApprovalRejection(err: GitHubApiErrorLike): boolean {
+  if (err.status !== 422) return false;
+  const texts: string[] = [];
+  if (typeof err.message === 'string') texts.push(err.message);
+  const data = err.response?.data;
+  if (data) {
+    if (typeof data.message === 'string') texts.push(data.message);
+    if (Array.isArray(data.errors)) {
+      for (const detail of data.errors) {
+        if (typeof detail === 'string') {
+          texts.push(detail);
+        } else if (
+          detail !== null &&
+          typeof detail === 'object' &&
+          typeof (detail as { message?: unknown }).message === 'string'
+        ) {
+          texts.push((detail as { message: string }).message);
+        }
+      }
+    }
+  }
+  return texts.some(text => /approv\w*\s+your\s+own\s+pull\s+request/i.test(text));
+}
+
 /**
  * Real approvePullRequest: submits an APPROVED review via
  * octokit.pulls.createReview. GitHub rejects self-approval (a PR author
- * cannot approve its own PR, App identity or not) with a 422; that rejection
- * is surfaced with a named, actionable message instead of a raw API error.
+ * cannot approve its own PR, App identity or not) with a 422 whose error
+ * detail says "Can not approve your own pull request"; that specific
+ * rejection is surfaced with a named, actionable message. Other 422s (bad
+ * commit_id, pending review, invalid event, ...) are NOT self-approval and
+ * are rethrown unaltered so their real cause stays visible.
  */
 export function createRealApprovePullRequest(
   octokit: RealGitHubOctokitLike
@@ -390,8 +448,8 @@ export function createRealApprovePullRequest(
       });
       return { approved: true, message: response.data.state };
     } catch (error) {
-      const err = error as { status?: number; message?: string };
-      if (err.status === 422) {
+      const err = error as GitHubApiErrorLike;
+      if (isSelfApprovalRejection(err)) {
         throw new Error(
           `overseer_real_adapter_self_approval_rejected: GitHub refused the APPROVE review (a PR author cannot approve its own PR): ${err.message ?? 'unprocessable'}`
         );
