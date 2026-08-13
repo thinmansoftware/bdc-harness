@@ -270,7 +270,7 @@ nodes:
     artifact_contract: { inputs: [], outputs: [] }
     depends_on: [gate-already-satisfied]
     when: "$gate-already-satisfied.output.ALREADY_SATISFIED != 'true'"
-    agent: war-council-architect
+    agent: war-council-architect-opr
     task_class: medium_work
     prompt: |
       Read the BDC Work Order spec below and produce a concise implementation plan.
