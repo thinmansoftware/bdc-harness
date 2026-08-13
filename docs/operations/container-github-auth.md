@@ -81,6 +81,61 @@ The WO suggested `git ls-remote origin HEAD`. Against a public repo (bdc-xo is p
 - It would require a known-writable test repo, adding setup overhead.
 - The scope (`repo`) implied by a passing `gh auth status` with `workflow` and `repo` scopes is sufficient evidence — there is no class of token that passes `gh auth status` but fails `git push`.
 
+## GitHub App auth: Thinman Overseer (WO-HARNESS-OVERSEER-APP-AUTH-01)
+
+**Status: documented, NOT deployed.** Deploy is a separate gated action; do not
+add these vars to the running container without that gate.
+
+Overseer's real GitHub adapter (`packages/overseer/src/adapters/github-real-deps.ts`)
+supports authenticating as the **Thinman Overseer** GitHub App instead of the PAT
+above. App identity is what allows Overseer to APPROVE pull requests that
+`bluedevilcollectibles` opened (GitHub forbids self-approval, and John is the only
+human account in the org). App coordinates and key location are documented at
+`~/.claude/reference/credentials.md` under "GitHub App: Thinman Overseer".
+
+### Env vars (add to `/opt/bdc/archon/.env` for `archon-app-1` when deploy is approved)
+
+| Var | Value | Notes |
+|-----|-------|-------|
+| `GITHUB_APP_ID` | `4574893` | App "Thinman Overseer", owner `@thinmansoftware` |
+| `GITHUB_APP_INSTALLATION_ID` | `153295654` | Org-wide installation, "All repositories" |
+| `GITHUB_APP_PRIVATE_KEY_PATH` | `/secrets/thinman-overseer-app.private-key.pem` (container path) | Recommended PEM delivery -- see below |
+| `GITHUB_APP_PRIVATE_KEY` | PEM contents with literal `\n` escapes | Alternative to `_PATH`; the adapter normalizes literal `\n` to real newlines |
+
+### PEM delivery
+
+Recommended: bind-mount the key file (host source:
+`~/.claude/reference/thinman-overseer-app.private-key.pem` on the operator
+machine; place it on the Hetzner host OUTSIDE any git repo, e.g.
+`/opt/bdc/secrets/`) into the container and point `GITHUB_APP_PRIVATE_KEY_PATH`
+at the mounted path:
+
+```yaml
+# docker-compose.yml (deploy-time change, NOT part of this WO)
+volumes:
+  - /opt/bdc/secrets/thinman-overseer-app.private-key.pem:/secrets/thinman-overseer-app.private-key.pem:ro
+```
+
+Alternative: inline the PEM in `.env` as `GITHUB_APP_PRIVATE_KEY` with literal
+`\n` escapes on one line. The adapter converts them back to real newlines; this
+is tested explicitly because a PEM whose newlines do not survive the env
+boundary fails JWT signing.
+
+The private key NEVER enters git in either form.
+
+### Behavior contract
+
+- All three App vars present and valid -> Octokit authenticates as installation
+  `153295654`; API calls are attributed to `thinman-overseer[bot]`.
+- All App vars absent -> existing `GH_TOKEN`/`GITHUB_TOKEN` PAT path, unchanged.
+- App vars partial or malformed -> the adapter THROWS naming the broken
+  variable and does NOT fall back to the PAT. A silent downgrade to the PAT
+  identity is the failure mode this seam exists to prevent (M-141).
+- Known-and-expected: `GET /user` as the installation token returns "Resource
+  not accessible by integration". Apps are not users; this is not a failure.
+- The existing PAT stays live as the fallback path -- do not rotate or revoke
+  it as part of enabling App auth.
+
 ## Related WOs
 
 - bdc-xo#132 (persona schema): same root cause, recovered manually. This WO closes the prevention loop.

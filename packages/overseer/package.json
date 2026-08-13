@@ -48,6 +48,7 @@
     "@archon/core": "workspace:*",
     "@archon/fusion": "workspace:*",
     "@archon/workflows": "workspace:*",
+    "@octokit/auth-app": "^8.0.0",
     "@octokit/rest": "^22.0.0",
     "@archon/paths": "workspace:*"
   },

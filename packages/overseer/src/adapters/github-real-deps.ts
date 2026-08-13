@@ -1,4 +1,6 @@
+import { readFileSync } from 'node:fs';
 import { Octokit } from '@octokit/rest';
+import { createAppAuth } from '@octokit/auth-app';
 import { createLogger } from '@archon/paths';
 import type {
   GitHubClientDeps,
@@ -6,6 +8,7 @@ import type {
   GitHubPullRequestSearchInput,
   PullRequestCheckSummary,
   PullRequestEvidence,
+  PullRequestRef,
 } from '../types.ts';
 
 const log = createLogger('overseer/github-real-deps');
@@ -68,6 +71,16 @@ export interface RealGitHubOctokitLike {
       pull_number: number;
       sha: string;
     }): Promise<{ data: { merged: boolean; sha?: string | null } }>;
+    /**
+     * Optional (like `issues` below) so existing structural mocks keep
+     * compiling; createRealApprovePullRequest throws loudly when absent.
+     */
+    createReview?(input: {
+      owner: string;
+      repo: string;
+      pull_number: number;
+      event: string;
+    }): Promise<{ data: { id?: number; state?: string; html_url?: string } }>;
   };
   search: {
     issuesAndPullRequests(input: Record<string, unknown>): Promise<{
@@ -102,8 +115,109 @@ export function resolveGitHubToken(): string {
   return token;
 }
 
-/** Construct a real Octokit client from the standard env token. */
+/** Resolved GitHub App installation auth config (Thinman Overseer App). */
+export interface GitHubAppAuthConfig {
+  appId: number;
+  installationId: number;
+  privateKey: string;
+}
+
+/**
+ * Resolve GitHub App auth from env (WO-HARNESS-OVERSEER-APP-AUTH-01).
+ *
+ * Returns null ONLY when ALL App vars are absent (caller falls back to the
+ * PAT path). If ANY App var is set but the set is incomplete or malformed,
+ * this THROWS naming the broken variable. It must NEVER fall back to the PAT
+ * in that case: a silent downgrade would keep Overseer acting as John's
+ * personal token instead of thinman-overseer[bot], which is the exact
+ * failure this seam exists to prevent (M-141).
+ */
+export function resolveGitHubAppAuth(): GitHubAppAuthConfig | null {
+  const appIdRaw = process.env.GITHUB_APP_ID ?? '';
+  const installationIdRaw = process.env.GITHUB_APP_INSTALLATION_ID ?? '';
+  const inlineKey = process.env.GITHUB_APP_PRIVATE_KEY ?? '';
+  const keyPath = process.env.GITHUB_APP_PRIVATE_KEY_PATH ?? '';
+
+  if (!appIdRaw && !installationIdRaw && !inlineKey && !keyPath) {
+    return null;
+  }
+
+  if (!appIdRaw) {
+    throw new Error(
+      'overseer_real_adapter_app_auth_incomplete: GITHUB_APP_ID missing while other GITHUB_APP_* vars are set'
+    );
+  }
+  if (!installationIdRaw) {
+    throw new Error(
+      'overseer_real_adapter_app_auth_incomplete: GITHUB_APP_INSTALLATION_ID missing while other GITHUB_APP_* vars are set'
+    );
+  }
+  if (!inlineKey && !keyPath) {
+    throw new Error(
+      'overseer_real_adapter_app_auth_incomplete: set GITHUB_APP_PRIVATE_KEY (PEM contents) or GITHUB_APP_PRIVATE_KEY_PATH'
+    );
+  }
+
+  const appId = Number(appIdRaw);
+  if (!Number.isInteger(appId) || appId <= 0) {
+    throw new Error(
+      `overseer_real_adapter_app_auth_malformed: GITHUB_APP_ID must be a positive integer, got "${appIdRaw}"`
+    );
+  }
+  const installationId = Number(installationIdRaw);
+  if (!Number.isInteger(installationId) || installationId <= 0) {
+    throw new Error(
+      `overseer_real_adapter_app_auth_malformed: GITHUB_APP_INSTALLATION_ID must be a positive integer, got "${installationIdRaw}"`
+    );
+  }
+
+  let privateKey: string;
+  if (inlineKey) {
+    // Env-var-passed PEMs commonly arrive with literal backslash-n escapes;
+    // normalize them so the RSA key survives the env boundary.
+    privateKey = inlineKey.replace(/\\n/g, '\n');
+  } else {
+    try {
+      privateKey = readFileSync(keyPath, 'utf8');
+    } catch (error) {
+      throw new Error(
+        `overseer_real_adapter_app_auth_malformed: GITHUB_APP_PRIVATE_KEY_PATH not readable (${keyPath}): ${(error as Error).message}`
+      );
+    }
+  }
+  if (!privateKey.includes('-----BEGIN')) {
+    const source = inlineKey
+      ? 'GITHUB_APP_PRIVATE_KEY'
+      : `GITHUB_APP_PRIVATE_KEY_PATH (${keyPath})`;
+    throw new Error(
+      `overseer_real_adapter_app_auth_malformed: ${source} does not contain a PEM (missing -----BEGIN header)`
+    );
+  }
+
+  return { appId, installationId, privateKey };
+}
+
+/**
+ * Construct a real Octokit client. Prefers GitHub App installation auth
+ * (attributed to thinman-overseer[bot]) when the App env vars are present;
+ * otherwise uses the standard PAT env token exactly as before.
+ */
 export function createRealOctokitClient(): RealGitHubOctokitLike {
+  const appAuth = resolveGitHubAppAuth();
+  if (appAuth) {
+    log.info(
+      { appId: appAuth.appId, installationId: appAuth.installationId },
+      'overseer.github_real_deps.app_auth_selected'
+    );
+    return new Octokit({
+      authStrategy: createAppAuth,
+      auth: {
+        appId: appAuth.appId,
+        installationId: appAuth.installationId,
+        privateKey: appAuth.privateKey,
+      },
+    }) as unknown as RealGitHubOctokitLike;
+  }
   const auth = resolveGitHubToken();
   return new Octokit({ auth }) as unknown as RealGitHubOctokitLike;
 }
@@ -255,6 +369,40 @@ export function createRealMergePullRequest(
 }
 
 /**
+ * Real approvePullRequest: submits an APPROVED review via
+ * octokit.pulls.createReview. GitHub rejects self-approval (a PR author
+ * cannot approve its own PR, App identity or not) with a 422; that rejection
+ * is surfaced with a named, actionable message instead of a raw API error.
+ */
+export function createRealApprovePullRequest(
+  octokit: RealGitHubOctokitLike
+): (input: PullRequestRef) => Promise<{ approved: boolean; message?: string }> {
+  return async (input: PullRequestRef): Promise<{ approved: boolean; message?: string }> => {
+    if (!octokit.pulls.createReview) {
+      throw new Error('overseer_real_adapter_missing_create_review_api');
+    }
+    try {
+      const response = await octokit.pulls.createReview({
+        owner: input.owner,
+        repo: input.repo,
+        pull_number: input.number,
+        event: 'APPROVE',
+      });
+      return { approved: true, message: response.data.state };
+    } catch (error) {
+      const err = error as { status?: number; message?: string };
+      if (err.status === 422) {
+        throw new Error(
+          `overseer_real_adapter_self_approval_rejected: GitHub refused the APPROVE review (a PR author cannot approve its own PR): ${err.message ?? 'unprocessable'}`
+        );
+      }
+      log.error({ err: error, input }, 'overseer.github_real_deps.approve_pull_request_failed');
+      throw error;
+    }
+  };
+}
+
+/**
  * Build the real (non-fake) GitHubClientDeps composition for Overseer. Fails
  * loudly at construction time if the token is missing -- never silently
  * degrades to a stub in real mode.
@@ -265,6 +413,7 @@ export function createRealGitHubClientDeps(
   return {
     findPullRequest: createRealFindPullRequest(octokit),
     mergePullRequest: createRealMergePullRequest(octokit),
+    approvePullRequest: createRealApprovePullRequest(octokit),
     commentOnPullRequest: async (input): Promise<{ commented: boolean; url?: string }> => {
       if (!octokit.issues) {
         throw new Error('overseer_real_adapter_missing_issues_api');

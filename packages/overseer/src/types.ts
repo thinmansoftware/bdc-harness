@@ -167,6 +167,14 @@ export interface GitHubClientDeps {
   commentOnPullRequest?(
     input: PullRequestRef & { body: string }
   ): Promise<{ commented: boolean; url?: string }>;
+  /**
+   * Submit an APPROVED review on a PR (WO-HARNESS-OVERSEER-APP-AUTH-01).
+   * Only meaningful under GitHub App auth (thinman-overseer[bot]) -- GitHub
+   * forbids a PR author approving its own PR regardless of identity, and the
+   * real adapter surfaces that rejection loudly. Optional so fakes and older
+   * compositions need no change.
+   */
+  approvePullRequest?(input: PullRequestRef): Promise<{ approved: boolean; message?: string }>;
 }
 
 /**
