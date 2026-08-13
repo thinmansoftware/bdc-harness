@@ -1,4 +1,5 @@
 import { readFileSync } from 'node:fs';
+import { createPrivateKey } from 'node:crypto';
 import { Octokit } from '@octokit/rest';
 import { createAppAuth } from '@octokit/auth-app';
 import { createLogger } from '@archon/paths';
@@ -187,9 +188,18 @@ export function resolveGitHubAppAuth(): GitHubAppAuthConfig | null {
       'overseer_github_app_auth_private_key_missing: set GITHUB_APP_PRIVATE_KEY (PEM contents) or GITHUB_APP_PRIVATE_KEY_PATH'
     );
   }
-  if (!privateKey.includes('-----BEGIN')) {
+  // Validate by actually parsing the key material, not just sniffing for a
+  // "-----BEGIN" substring. A substring check passes truncated/garbage PEM bodies
+  // (or a stray marker inside otherwise-invalid content) that then fail on the
+  // FIRST signed API call -- far from this construction site and much harder to
+  // diagnose. createPrivateKey throws synchronously on any malformed PEM (missing
+  // marker, corrupted base64, truncated body, unsupported format), so a config
+  // that resolves here is a key the auth strategy can actually sign JWTs with.
+  try {
+    createPrivateKey(privateKey);
+  } catch (error) {
     throw new Error(
-      'overseer_github_app_auth_private_key_malformed: GITHUB_APP_PRIVATE_KEY does not look like a PEM (missing -----BEGIN marker)'
+      `overseer_github_app_auth_private_key_malformed: GITHUB_APP_PRIVATE_KEY is not a valid PEM private key (${(error as Error).message})`
     );
   }
 

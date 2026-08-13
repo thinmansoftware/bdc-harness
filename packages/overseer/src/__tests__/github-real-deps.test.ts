@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { generateKeyPairSync } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createAppAuth } from '@octokit/auth-app';
@@ -17,9 +18,22 @@ import type { PullRequestRef } from '../types.ts';
 // precedence contract (App-if-complete / PAT-if-absent / throw-if-broken) and the
 // approve path, all network-free.
 
-// A syntactically PEM-shaped placeholder. resolveGitHubAppAuth only checks for the
-// -----BEGIN marker, not RSA validity, so no real key material is needed here.
-const FAKE_PEM = [
+// A REAL, cryptographically valid RSA private key (PKCS#1 PEM, -----BEGIN RSA
+// PRIVATE KEY-----). resolveGitHubAppAuth now parses the key with
+// crypto.createPrivateKey at construction time, so success-path fixtures must be
+// keys that actually parse -- not a "-----BEGIN"-shaped placeholder. Generated
+// once per test process; RSA-2048 is the GitHub App key size.
+const FAKE_PEM = generateKeyPairSync('rsa', {
+  modulusLength: 2048,
+  publicKeyEncoding: { type: 'spki', format: 'pem' },
+  privateKeyEncoding: { type: 'pkcs1', format: 'pem' },
+}).privateKey;
+
+// PEM-SHAPED but cryptographically INVALID: it carries the -----BEGIN marker (so
+// the old substring check accepted it) yet the base64 body is garbage, so
+// createPrivateKey rejects it. Proves construction-time validation catches a
+// truncated/corrupt key instead of deferring the failure to the first API call.
+const PEM_SHAPED_INVALID = [
   '-----BEGIN RSA PRIVATE KEY-----',
   'MIIFAKEKEYCONTENTNOTAREALKEY0000000000000000000000000000000000',
   '-----END RSA PRIVATE KEY-----',
@@ -121,6 +135,19 @@ describe('resolveGitHubAppAuth / auth precedence', () => {
     expect(() => resolveRealOctokitAuthOptions()).toThrow(/private_key_malformed/);
   });
 
+  test('PEM-shaped but cryptographically invalid key -> throws malformed, does NOT fall back to PAT', () => {
+    // Regression guard: a substring "-----BEGIN" check would accept this (the marker
+    // is present) but the base64 body is garbage. Construction-time parsing must
+    // reject it here rather than letting it fail on the first signed API call.
+    process.env.GITHUB_APP_ID = '4574893';
+    process.env.GITHUB_APP_INSTALLATION_ID = '153295654';
+    process.env.GITHUB_APP_PRIVATE_KEY = PEM_SHAPED_INVALID;
+    process.env.GH_TOKEN = 'ghp_pat_token_value';
+
+    expect(() => resolveGitHubAppAuth()).toThrow(/private_key_malformed/);
+    expect(() => resolveRealOctokitAuthOptions()).toThrow(/private_key_malformed/);
+  });
+
   test('private key from GITHUB_APP_PRIVATE_KEY_PATH -> newlines survive (Risk 11)', () => {
     const dir = mkdtempSync(join(tmpdir(), 'overseer-app-pem-'));
     const pemPath = join(dir, 'thinman-overseer.pem');
@@ -153,8 +180,8 @@ describe('resolveGitHubAppAuth / auth precedence', () => {
     process.env.GITHUB_APP_ID = '4574893';
     process.env.GITHUB_APP_INSTALLATION_ID = '153295654';
     // Env managers commonly pack the PEM onto one line with literal backslash-n.
-    process.env.GITHUB_APP_PRIVATE_KEY =
-      '-----BEGIN RSA PRIVATE KEY-----\\nMIIFAKE\\n-----END RSA PRIVATE KEY-----\\n';
+    // Pack a REAL key so that, after normalization, it parses as a valid PEM.
+    process.env.GITHUB_APP_PRIVATE_KEY = FAKE_PEM.replace(/\n/g, '\\n');
 
     const config = resolveGitHubAppAuth();
     expect(config?.privateKey.includes('\\n')).toBe(false);
