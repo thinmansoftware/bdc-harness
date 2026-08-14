@@ -98,7 +98,12 @@ export function createRepairRefireAdapter(deps: RepairRefireAdapterDeps): Repair
     async dispatchLaterAttempt(
       request: FirstRefireOnRampRequestV1
     ): Promise<FirstRefireOnRampResultV1> {
-      const entryTier = deps.conductor.pickEntryTier({ woClass: deps.woClass, tags: deps.tags });
+      // An explicit workflow/lane override on the request always wins over
+      // class/tag-based ruleset routing -- see repair-refire.ts:61
+      // (workflow_name, frozen contract, audit Section 7.5).
+      const entryTier =
+        request.workflow_name ||
+        deps.conductor.pickEntryTier({ woClass: deps.woClass, tags: deps.tags });
       return deps.conductor.runCascade({ woId: request.wo_id, entryTier, request });
     },
   };

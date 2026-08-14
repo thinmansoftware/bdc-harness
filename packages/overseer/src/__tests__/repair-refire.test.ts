@@ -540,10 +540,32 @@ describe('Test 2 - later attempt uses conductor', () => {
 
     expect(result.disposition).toBe('refire_later');
     expect(result.outcome).toBe('succeeded');
-    expect(harness.spies.pickEntryTier).toHaveBeenCalledTimes(1);
+    // execInput's default workflow_name ('implement') is an explicit
+    // override, so it wins over the class/tag ruleset -- pickEntryTier is
+    // not consulted.
+    expect(harness.spies.pickEntryTier).toHaveBeenCalledTimes(0);
     expect(harness.spies.runCascade).toHaveBeenCalledTimes(1);
     // The direct on-ramp (first-attempt) dependency is never called.
     expect(harness.spies.startFirstRefire).toHaveBeenCalledTimes(0);
+  });
+
+  test('explicit workflow_name override wins over class/tag ruleset routing', async () => {
+    const harness = makeHarness();
+    const input = execInput(
+      assessRepairRefireCandidate(baseAssessInput({ automatic_attempt_count: 1 })),
+      { workflow_name: 'qwen' }
+    );
+    const result = await executeRepairRefire(input, harness.deps);
+
+    expect(result.disposition).toBe('refire_later');
+    expect(result.outcome).toBe('succeeded');
+    // The explicit override must be forwarded as entryTier without
+    // consulting the class/tag ruleset fallback at all.
+    expect(harness.spies.pickEntryTier).toHaveBeenCalledTimes(0);
+    expect(harness.spies.runCascade).toHaveBeenCalledTimes(1);
+    expect(harness.spies.runCascade.mock.calls[0]?.[0]).toMatchObject({
+      entryTier: 'qwen',
+    });
   });
 
   test('public attempt counter accepts only woId; forged time cannot enter the query', async () => {
@@ -722,7 +744,10 @@ describe('thrown adapter dependency closes the reservation', () => {
     expect(result.outcome).toBe('indeterminate');
     expect(harness.effectLedger).toEqual(['effect_reserved', 'effect_indeterminate']);
     expect(harness.spies.startFirstRefire).toHaveBeenCalledTimes(0);
-    expect(harness.spies.pickEntryTier).toHaveBeenCalledTimes(1);
+    // execInput's default workflow_name ('implement') is an explicit
+    // override, so it wins over the class/tag ruleset -- pickEntryTier is
+    // not consulted.
+    expect(harness.spies.pickEntryTier).toHaveBeenCalledTimes(0);
     expect(harness.spies.runCascade).toHaveBeenCalledTimes(1);
   });
 
