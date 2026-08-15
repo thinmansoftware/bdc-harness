@@ -28,6 +28,8 @@ import { judgeGate, classifyAttemptOutcome } from './judge.js';
 import { createRecord, writeRecord } from './recorder.js';
 import type { CreateCascadeRecordResult } from './recorder.js';
 import { cancelRun } from './cancel.js';
+import { findWoClaim, type WoClaim } from './already-satisfied.js';
+import { acquireWoLock, releaseWoLock } from './wo-lock.js';
 import { classifyError, type ErrorClass } from '@archon/overseer/classify';
 import { runAuthorizedEscalation } from '@archon/overseer/authorized-escalation';
 import { runEscalation } from '@archon/overseer';
@@ -70,6 +72,14 @@ export interface CascadeDeps {
   specRepair?: (context: SpecRepairCallContext) => Promise<SpecRepairResult>;
   /** Optional dual-supervisor control plane. Absent by default; never starts a live worker. */
   superviseFailure?: (context: SupervisorFailureContext) => Promise<SupervisorFailureResult>;
+  /**
+   * Already-satisfied / claim check (bdc-xo#1546, M-123 Q5). Returns an open or
+   * merged PR that already owns this WO, or null when none / unknown.
+   */
+  findWoClaim?: (woId: string, project: string) => Promise<WoClaim | null>;
+  /** Exclusive active-cascade lock per woId+project. */
+  acquireWoLock?: typeof acquireWoLock;
+  releaseWoLock?: typeof releaseWoLock;
 }
 
 export interface SupervisorFailureContext {
@@ -211,6 +221,15 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
   const cancelImpl = opts.deps?.cancel ?? cancelRun;
   const specRepairImpl = opts.deps?.specRepair ?? defaultSpecRepair;
   const superviseFailureImpl = opts.deps?.superviseFailure;
+  const findWoClaimImpl =
+    opts.deps?.findWoClaim ??
+    ((id: string, proj: string): Promise<WoClaim | null> =>
+      findWoClaim({ woId: id, project: proj }));
+  const acquireWoLockImpl = opts.deps?.acquireWoLock ?? acquireWoLock;
+  const releaseWoLockImpl = opts.deps?.releaseWoLock ?? releaseWoLock;
+  const allowClaimed =
+    process.env.SMART_CAULDRON_ALLOW_CLAIMED === '1' ||
+    process.env.SMART_CAULDRON_ALLOW_CLAIMED === 'true';
 
   // Load config from files (never from inline constants)
   const tiers = loadLadder();
@@ -271,34 +290,18 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
     );
   }
 
-  // Cascade loop
-  const attempts: CascadeAttempt[] = [];
-  const emitEscalation = async (
-    context: Omit<EscalationCallContext, 'sourceEventId' | 'sourceEventCreatedAt' | 'repository'>
-  ): Promise<void> => {
-    const sourceAttempt = attempts.at(-1);
-    if (!sourceAttempt) throw new Error('cascade_escalation_source_event_missing');
-    await escalateImpl({
-      ...context,
-      sourceEventId: sourceAttempt.sourceEventId,
-      sourceEventCreatedAt: sourceAttempt.sourceEventAt,
-      repository: project ?? 'thinmansoftware/bdc-harness',
-    });
-  };
-  let priorContext: string | null = null;
-  let climbCount = 0;
-  let status: CascadeStatus = 'running';
-  let winningTier: TierName | null = null;
-  let specRepairRecord: CascadeRunRecord['specRepair'];
-  let supervisorRecoveryRecord: CascadeRunRecord['supervisorRecovery'];
-
-  function buildCurrentRecord(): CascadeRunRecord {
-    const entryTier: TierName = attempts[0]?.tier ?? entryTierName;
-    const climbed = climbCount > 0;
-    return {
+  // WO-level exclusive lock (bdc-xo#1546): cascadeId admission alone does not
+  // stop two different cascades from racing the same WO.
+  const woLock = await acquireWoLockImpl(woId, project, cascadeId, outDir);
+  if (!woLock.acquired) {
+    console.log(
+      `[smart-cauldron] REFUSING duplicate cascade for woId=${woId} project=${project}: ` +
+        `active cascadeId=${woLock.record.cascadeId}`
+    );
+    const blocked: CascadeRunRecord = {
       cascadeId,
       woId,
-      project: project ?? null,
+      project,
       request: {
         woClass: woClass ?? null,
         tags: [...(tags ?? [])].sort(),
@@ -306,374 +309,503 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
         dryRun: false,
       },
       createdAt,
-      status,
-      winningTier,
-      attempts,
-      totalCostUsd: computeTotalCost(attempts),
+      status: 'blocked',
+      winningTier: null,
+      attempts: [],
+      totalCostUsd: null,
       telemetry: {
-        entryTier,
-        climbed,
-        climbCount,
-        wonCheap: status === 'won' && !climbed,
+        entryTier: entryTierName,
+        climbed: false,
+        climbCount: 0,
+        wonCheap: false,
       },
-      ...(specRepairRecord ? { specRepair: specRepairRecord } : {}),
-      ...(supervisorRecoveryRecord ? { supervisorRecovery: supervisorRecoveryRecord } : {}),
     };
+    onAdmission?.(blocked, false);
+    return blocked;
   }
 
-  async function checkpoint(): Promise<string> {
-    return writeRecordImpl(buildCurrentRecord(), outDir);
-  }
-
-  // Persist admission before any provider lane can be fired. A duplicate dispatch
-  // returns the existing record and cannot create a second provider attempt.
-  const admission = await createRecordImpl(buildCurrentRecord(), outDir);
-  onAdmission?.(admission.record, admission.created);
-  if (!admission.created) return admission.record;
-
-  /**
-   * Shared climb/frontier logic for both the gate-fail path and the
-   * progress-timeout path (see the poll try/catch below). Escalates + marks
-   * BLOCKED if the failing tier is the frontier or tiers are exhausted;
-   * otherwise advances currentIndex/climbCount to the next tier.
-   *
-   * @param currentTier The tier that just failed (gate-fail or progress-timeout).
-   * @param failReason  Human-readable reason (verdict.reason, or the fixed
-   *                    progress-timeout message -- there is no GateVerdict for
-   *                    a run that never reached a terminal state).
-   * @param runId       runId for the escalation context (may be null).
-   * @returns true if the cascade loop should stop (caller must break), false
-   *          to keep climbing.
-   */
-  async function climbOrStop(
-    currentTier: LadderTier,
-    failReason: string,
-    runId: string | null
-  ): Promise<boolean> {
-    if (currentTier.isFrontier) {
-      if (superviseFailureImpl) {
-        const recovery = await superviseFailureImpl({
-          woId,
-          cascadeId,
-          tierName: currentTier.name,
-          runId,
-          reason: failReason,
-          failureKind: 'frontier-gate',
-        });
-        if (recovery.handled && recovery.ownerId !== null && recovery.fencingToken !== null) {
-          supervisorRecoveryRecord = {
-            ownerId: recovery.ownerId,
-            fencingToken: recovery.fencingToken,
-            evidenceRefs: recovery.evidenceRefs,
-          };
-          status = 'recovery-delegated';
-          return true;
-        }
-      }
-      // Top rung (fable) failed the gate. Per John's 2026-07-02 doctrine ruling
-      // ("Fable is the last escalation before failure -- a WO should never fail,
-      // it should be able to be fixed"), this is NOT a terminal BLOCKED dead end.
-      // Emit a SPEC-REPAIR escalation: post the failure evidence + a concrete
-      // "what must change in the spec" statement to the WO's GitHub issue (comment
-      // + status:blocked label) so the WO re-enters at the authoring layer.
-      const evidence = buildSpecRepairEvidence(currentTier, failReason, runId, attempts);
-      const whatMustChange = buildWhatMustChange(currentTier, failReason);
-
-      let result: SpecRepairResult;
-      try {
-        result = await specRepairImpl({
-          woId,
-          tierName: currentTier.name,
-          failReason,
-          runId,
-          evidence,
-          whatMustChange,
-        });
-      } catch (specErr) {
-        // A thrown spec-repair impl (e.g. gh totally unavailable) must not swallow
-        // the escalation -- treat as "not posted" and fall through to the alert.
-        console.log(
-          `[smart-cauldron] SPEC-REPAIR impl threw for woId=${woId}: ` +
-            `${(specErr as Error).message} (falling back to escalate/alert)`
-        );
-        result = { posted: false, issueRepo: null, issueNumber: null };
-      }
-
-      if (!result.posted) {
-        // Mode Behavior Matrix row 4: no GitHub issue resolvable -> fall back to the
-        // existing escalate/alert path with the spec-repair text in the payload.
-        // The escalation must NEVER be silently dropped.
-        await emitEscalation({
-          errorClass: 'validator_rejected',
-          woId,
-          reason:
-            `SPEC-REPAIR (no GitHub issue resolved) -- frontier tier ${currentTier.name} ` +
-            `gate-failed: ${failReason}`,
-          remediation: [whatMustChange, evidence],
-          runId,
-          overseerPermit: opts.overseerPermit,
-        });
-      }
-
-      specRepairRecord = {
-        issueRepo: result.issueRepo,
-        issueNumber: result.issueNumber,
-        posted: result.posted,
-        whatMustChange,
-        evidence,
-      };
-      status = 'spec-repair';
+  // Already-satisfied / claim check before any provider spend (M-123 Q5 / #1546).
+  if (!allowClaimed) {
+    const existingClaim = await findWoClaimImpl(woId, project);
+    if (existingClaim) {
       console.log(
-        `[smart-cauldron] SPEC-REPAIR: frontier tier gate-failed for woId=${woId} ` +
-          `(issue posted=${result.posted})`
+        `[smart-cauldron] ALREADY SATISFIED woId=${woId}: PR #${existingClaim.number} ` +
+          `[${existingClaim.state}] ${existingClaim.url} -- skipping cascade`
       );
-      return true;
+      const won: CascadeRunRecord = {
+        cascadeId,
+        woId,
+        project,
+        request: {
+          woClass: woClass ?? null,
+          tags: [...(tags ?? [])].sort(),
+          entryOverride: entryOverride ?? null,
+          dryRun: false,
+        },
+        createdAt,
+        status: 'won',
+        winningTier: entryTierName,
+        attempts: [],
+        totalCostUsd: null,
+        telemetry: {
+          entryTier: entryTierName,
+          climbed: false,
+          climbCount: 0,
+          wonCheap: true,
+        },
+      };
+      const admissionEarly = await createRecordImpl(won, outDir);
+      onAdmission?.(admissionEarly.record, admissionEarly.created);
+      await releaseWoLockImpl(woId, project, cascadeId, outDir);
+      return admissionEarly.record;
     }
-
-    // Climb to next tier
-    currentIndex++;
-    climbCount++;
-
-    if (currentIndex >= tiers.length) {
-      // Exhausted all tiers without a win -- should not happen if frontier is marked
-      status = 'blocked';
-      console.log(`[smart-cauldron] BLOCKED: all tiers exhausted for woId=${woId}`);
-      return true;
-    }
-
-    const nextTier = tiers[currentIndex];
-    console.log(
-      `[smart-cauldron] Climbing to tier=${nextTier?.name ?? 'unknown'} (climb #${climbCount})`
-    );
-    return false;
   }
 
-  while (currentIndex < tiers.length) {
-    const tier = tiers[currentIndex];
-    if (!tier) break;
-    const attemptStartedAt = new Date().toISOString();
-    const attempt: CascadeAttempt = {
-      sourceEventId: `${cascadeId}:attempt:${attempts.length + 1}`,
-      sourceEventAt: attemptStartedAt,
-      tier: tier.name,
-      workflowName: tier.workflowName,
-      runId: null,
-      outcome: 'running',
-      gateFailReason: null,
-      infraErrorReason: null,
-      servedModelId: null,
-      costUsd: null,
-      startedAt: attemptStartedAt,
-      completedAt: null,
+  // Cascade loop
+  const attempts: CascadeAttempt[] = [];
+  try {
+    const emitEscalation = async (
+      context: Omit<EscalationCallContext, 'sourceEventId' | 'sourceEventCreatedAt' | 'repository'>
+    ): Promise<void> => {
+      const sourceAttempt = attempts.at(-1);
+      if (!sourceAttempt) throw new Error('cascade_escalation_source_event_missing');
+      await escalateImpl({
+        ...context,
+        sourceEventId: sourceAttempt.sourceEventId,
+        sourceEventCreatedAt: sourceAttempt.sourceEventAt,
+        repository: project ?? 'thinmansoftware/bdc-harness',
+      });
     };
-    attempts.push(attempt);
-    await checkpoint();
+    let priorContext: string | null = null;
+    let climbCount = 0;
+    let status: CascadeStatus = 'running';
+    let winningTier: TierName | null = null;
+    let specRepairRecord: CascadeRunRecord['specRepair'];
+    let supervisorRecoveryRecord: CascadeRunRecord['supervisorRecovery'];
 
-    if (preflightImpl) {
-      try {
-        await preflightImpl(tier);
-      } catch (error) {
-        const reason = error instanceof Error ? error.message : String(error);
-        attempt.outcome = 'infra-error';
-        attempt.infraErrorReason = `lane preflight failed: ${reason}`;
-        attempt.completedAt = new Date().toISOString();
-        status = 'infra-alert';
-        await emitEscalation({
-          errorClass: 'invalid_request',
-          woId,
-          reason: `Lane preflight failed on tier ${tier.name}: ${reason}`,
-          overseerPermit: opts.overseerPermit,
-          runId: null,
-        });
-        await checkpoint();
-        break;
-      }
+    function buildCurrentRecord(): CascadeRunRecord {
+      const entryTier: TierName = attempts[0]?.tier ?? entryTierName;
+      const climbed = climbCount > 0;
+      return {
+        cascadeId,
+        woId,
+        project: project ?? null,
+        request: {
+          woClass: woClass ?? null,
+          tags: [...(tags ?? [])].sort(),
+          entryOverride: entryOverride ?? null,
+          dryRun: false,
+        },
+        createdAt,
+        status,
+        winningTier,
+        attempts,
+        totalCostUsd: computeTotalCost(attempts),
+        telemetry: {
+          entryTier,
+          climbed,
+          climbCount,
+          wonCheap: status === 'won' && !climbed,
+        },
+        ...(specRepairRecord ? { specRepair: specRepairRecord } : {}),
+        ...(supervisorRecoveryRecord ? { supervisorRecovery: supervisorRecoveryRecord } : {}),
+      };
     }
 
-    console.log(
-      `[smart-cauldron] Firing woId=${woId} on tier=${tier.name} ` +
-        `workflow=${tier.workflowName} (attempt ${attempts.length})`
-    );
+    async function checkpoint(): Promise<string> {
+      return writeRecordImpl(buildCurrentRecord(), outDir);
+    }
 
-    // Fire the WO on this tier
-    const fireResult: FireResult = await fireImpl({
-      workflowName: tier.workflowName,
-      woId,
-      project,
-      message: buildFireMessage(woId, project, priorContext ?? undefined),
-      apiBaseUrl,
-      token,
-    });
-    attempt.runId = fireResult.runId;
+    // Persist admission before any provider lane can be fired. A duplicate dispatch
+    // returns the existing record and cannot create a second provider attempt.
+    const admission = await createRecordImpl(buildCurrentRecord(), outDir);
+    onAdmission?.(admission.record, admission.created);
+    if (!admission.created) return admission.record;
 
-    // Infra error: alert + stop (do NOT count as "too hard")
-    if (!fireResult.ok) {
-      const errorClass = classifyError({
-        message: fireResult.infraError ?? '',
-        statusCode: extractStatusCode(fireResult.infraError ?? ''),
-      });
+    /**
+     * Shared climb/frontier logic for both the gate-fail path and the
+     * progress-timeout path (see the poll try/catch below). Escalates + marks
+     * BLOCKED if the failing tier is the frontier or tiers are exhausted;
+     * otherwise advances currentIndex/climbCount to the next tier.
+     *
+     * @param currentTier The tier that just failed (gate-fail or progress-timeout).
+     * @param failReason  Human-readable reason (verdict.reason, or the fixed
+     *                    progress-timeout message -- there is no GateVerdict for
+     *                    a run that never reached a terminal state).
+     * @param runId       runId for the escalation context (may be null).
+     * @returns true if the cascade loop should stop (caller must break), false
+     *          to keep climbing.
+     */
+    async function climbOrStop(
+      currentTier: LadderTier,
+      failReason: string,
+      runId: string | null
+    ): Promise<boolean> {
+      if (currentTier.isFrontier) {
+        if (superviseFailureImpl) {
+          const recovery = await superviseFailureImpl({
+            woId,
+            cascadeId,
+            tierName: currentTier.name,
+            runId,
+            reason: failReason,
+            failureKind: 'frontier-gate',
+          });
+          if (recovery.handled && recovery.ownerId !== null && recovery.fencingToken !== null) {
+            supervisorRecoveryRecord = {
+              ownerId: recovery.ownerId,
+              fencingToken: recovery.fencingToken,
+              evidenceRefs: recovery.evidenceRefs,
+            };
+            status = 'recovery-delegated';
+            return true;
+          }
+        }
+        // Top rung (fable) failed the gate. Per John's 2026-07-02 doctrine ruling
+        // ("Fable is the last escalation before failure -- a WO should never fail,
+        // it should be able to be fixed"), this is NOT a terminal BLOCKED dead end.
+        // Emit a SPEC-REPAIR escalation: post the failure evidence + a concrete
+        // "what must change in the spec" statement to the WO's GitHub issue (comment
+        // + status:blocked label) so the WO re-enters at the authoring layer.
+        const evidence = buildSpecRepairEvidence(currentTier, failReason, runId, attempts);
+        const whatMustChange = buildWhatMustChange(currentTier, failReason);
 
-      attempt.outcome = 'infra-error';
-      attempt.infraErrorReason = fireResult.infraError;
-      attempt.completedAt = new Date().toISOString();
+        let result: SpecRepairResult;
+        try {
+          result = await specRepairImpl({
+            woId,
+            tierName: currentTier.name,
+            failReason,
+            runId,
+            evidence,
+            whatMustChange,
+          });
+        } catch (specErr) {
+          // A thrown spec-repair impl (e.g. gh totally unavailable) must not swallow
+          // the escalation -- treat as "not posted" and fall through to the alert.
+          console.log(
+            `[smart-cauldron] SPEC-REPAIR impl threw for woId=${woId}: ` +
+              `${(specErr as Error).message} (falling back to escalate/alert)`
+          );
+          result = { posted: false, issueRepo: null, issueNumber: null };
+        }
 
-      if (superviseFailureImpl) {
-        const recovery = await superviseFailureImpl({
-          woId,
-          cascadeId,
-          tierName: tier.name,
-          runId: fireResult.runId,
-          reason: fireResult.infraError ?? 'unknown infrastructure failure',
-          failureKind: 'infrastructure',
-        });
-        if (recovery.handled && recovery.ownerId !== null && recovery.fencingToken !== null) {
-          supervisorRecoveryRecord = {
-            ownerId: recovery.ownerId,
-            fencingToken: recovery.fencingToken,
-            evidenceRefs: recovery.evidenceRefs,
-          };
-          status = 'recovery-delegated';
+        if (!result.posted) {
+          // Mode Behavior Matrix row 4: no GitHub issue resolvable -> fall back to the
+          // existing escalate/alert path with the spec-repair text in the payload.
+          // The escalation must NEVER be silently dropped.
+          await emitEscalation({
+            errorClass: 'validator_rejected',
+            woId,
+            reason:
+              `SPEC-REPAIR (no GitHub issue resolved) -- frontier tier ${currentTier.name} ` +
+              `gate-failed: ${failReason}`,
+            remediation: [whatMustChange, evidence],
+            runId,
+            overseerPermit: opts.overseerPermit,
+          });
+        }
+
+        specRepairRecord = {
+          issueRepo: result.issueRepo,
+          issueNumber: result.issueNumber,
+          posted: result.posted,
+          whatMustChange,
+          evidence,
+        };
+        status = 'spec-repair';
+        console.log(
+          `[smart-cauldron] SPEC-REPAIR: frontier tier gate-failed for woId=${woId} ` +
+            `(issue posted=${result.posted})`
+        );
+        return true;
+      }
+
+      // Climb to next tier
+      currentIndex++;
+      climbCount++;
+
+      if (currentIndex >= tiers.length) {
+        // Exhausted all tiers without a win -- should not happen if frontier is marked
+        status = 'blocked';
+        console.log(`[smart-cauldron] BLOCKED: all tiers exhausted for woId=${woId}`);
+        return true;
+      }
+
+      const nextTier = tiers[currentIndex];
+      console.log(
+        `[smart-cauldron] Climbing to tier=${nextTier?.name ?? 'unknown'} (climb #${climbCount})`
+      );
+      return false;
+    }
+
+    while (currentIndex < tiers.length) {
+      const tier = tiers[currentIndex];
+      if (!tier) break;
+      const attemptStartedAt = new Date().toISOString();
+      const attempt: CascadeAttempt = {
+        sourceEventId: `${cascadeId}:attempt:${attempts.length + 1}`,
+        sourceEventAt: attemptStartedAt,
+        tier: tier.name,
+        workflowName: tier.workflowName,
+        runId: null,
+        outcome: 'running',
+        gateFailReason: null,
+        infraErrorReason: null,
+        servedModelId: null,
+        costUsd: null,
+        startedAt: attemptStartedAt,
+        completedAt: null,
+      };
+      attempts.push(attempt);
+      await checkpoint();
+
+      if (preflightImpl) {
+        try {
+          await preflightImpl(tier);
+        } catch (error) {
+          const reason = error instanceof Error ? error.message : String(error);
+          attempt.outcome = 'infra-error';
+          attempt.infraErrorReason = `lane preflight failed: ${reason}`;
+          attempt.completedAt = new Date().toISOString();
+          status = 'infra-alert';
+          await emitEscalation({
+            errorClass: 'invalid_request',
+            woId,
+            reason: `Lane preflight failed on tier ${tier.name}: ${reason}`,
+            overseerPermit: opts.overseerPermit,
+            runId: null,
+          });
           await checkpoint();
           break;
         }
       }
 
-      await emitEscalation({
-        errorClass,
-        woId,
-        reason: `Infra error on tier ${tier.name}: ${fireResult.infraError ?? 'unknown'}`,
-        overseerPermit: opts.overseerPermit,
-        runId: null,
-      });
+      console.log(
+        `[smart-cauldron] Firing woId=${woId} on tier=${tier.name} ` +
+          `workflow=${tier.workflowName} (attempt ${attempts.length})`
+      );
 
-      status = 'infra-alert';
-      await checkpoint();
-      break;
-    }
-
-    // The workflow run identity is durable before polling begins.
-    await checkpoint();
-
-    // Poll for terminal state (runId is guaranteed non-null since fireResult.ok is true)
-    const resolvedRunId = fireResult.runId ?? '';
-    let pollResult: PollResult;
-    try {
-      pollResult = await pollImpl({
-        runId: resolvedRunId,
-        apiBaseUrl,
-        token,
-        timeoutMs: pollTimeoutMs,
-        stallTimeoutMs: pollStallTimeoutMs,
-        intervalMs: pollIntervalMs,
-      });
-    } catch (pollErr) {
-      if (pollErr instanceof TimeoutError) {
-        // Progress-timeout: the model responded and burned tokens but never
-        // reached a terminal state within budget. Per the three-failure-class
-        // design (v1.1 amendment 2), this is a QUALITY failure, not an infra
-        // failure -- cancel the hung run (best-effort; must not block the
-        // climb) and climb via the same logic used for gate-fail.
-        const cancelResult = await cancelImpl({ runId: resolvedRunId, apiBaseUrl, token }).catch(
-          (cancelErr: unknown) => ({
-            ok: false,
-            error: `cancel threw: ${(cancelErr as Error).message}`,
-          })
-        );
-        if (!cancelResult.ok) {
+      // Re-check claim before each provider fire (another cascade or human may
+      // have landed a PR while we were climbing).
+      if (!allowClaimed) {
+        const claimBeforeFire = await findWoClaimImpl(woId, project);
+        if (claimBeforeFire) {
           console.log(
-            `[smart-cauldron] Warning: cancel failed for run ${resolvedRunId} on tier ` +
-              `${tier.name}: ${cancelResult.error ?? 'unknown'} (continuing climb -- ` +
-              'cancellation is best-effort)'
+            `[smart-cauldron] ALREADY SATISFIED before tier=${tier.name}: PR #${claimBeforeFire.number} ` +
+              `[${claimBeforeFire.state}] ${claimBeforeFire.url} -- stopping cascade`
           );
+          status = 'won';
+          winningTier = tier.name;
+          attempt.outcome = 'won';
+          attempt.gateFailReason = null;
+          attempt.completedAt = new Date().toISOString();
+          await checkpoint();
+          break;
         }
-
-        // Carry the poll's own message through: it distinguishes a STALL (run went
-        // silent) from the hard-ceiling backstop (run was still emitting but ran
-        // past the runaway limit). Those are different diagnoses and the operator
-        // reading this line needs to know which one fired.
-        const timeoutReason =
-          pollErr instanceof TimeoutError
-            ? pollErr.message
-            : `progress-timeout: no terminal state within ${pollTimeoutMs}ms`;
-        attempt.outcome = 'progress-timeout';
-        attempt.gateFailReason = timeoutReason;
-        attempt.completedAt = new Date().toISOString();
-
-        console.log(`[smart-cauldron] Progress-timeout on tier=${tier.name}: ${timeoutReason}`);
-        priorContext = buildTimeoutPriorContext(tier.name, pollStallTimeoutMs);
-
-        const shouldStop = await climbOrStop(tier, timeoutReason, fireResult.runId);
-        await checkpoint();
-        if (shouldStop) break;
-        continue;
       }
 
-      // Non-timeout poll errors (network, API unreachable/5xx) keep the exact
-      // existing infra-error handling -- unchanged.
-      const errMsg = (pollErr as Error).message;
-      attempt.outcome = 'infra-error';
-      attempt.infraErrorReason = `poll error: ${errMsg}`;
+      // Fire the WO on this tier
+      const fireResult: FireResult = await fireImpl({
+        workflowName: tier.workflowName,
+        woId,
+        project,
+        message: buildFireMessage(woId, project, priorContext ?? undefined),
+        apiBaseUrl,
+        token,
+      });
+      attempt.runId = fireResult.runId;
+
+      // Infra error: alert + stop (do NOT count as "too hard")
+      if (!fireResult.ok) {
+        const errorClass = classifyError({
+          message: fireResult.infraError ?? '',
+          statusCode: extractStatusCode(fireResult.infraError ?? ''),
+        });
+
+        attempt.outcome = 'infra-error';
+        attempt.infraErrorReason = fireResult.infraError;
+        attempt.completedAt = new Date().toISOString();
+
+        if (superviseFailureImpl) {
+          const recovery = await superviseFailureImpl({
+            woId,
+            cascadeId,
+            tierName: tier.name,
+            runId: fireResult.runId,
+            reason: fireResult.infraError ?? 'unknown infrastructure failure',
+            failureKind: 'infrastructure',
+          });
+          if (recovery.handled && recovery.ownerId !== null && recovery.fencingToken !== null) {
+            supervisorRecoveryRecord = {
+              ownerId: recovery.ownerId,
+              fencingToken: recovery.fencingToken,
+              evidenceRefs: recovery.evidenceRefs,
+            };
+            status = 'recovery-delegated';
+            await checkpoint();
+            break;
+          }
+        }
+
+        await emitEscalation({
+          errorClass,
+          woId,
+          reason: `Infra error on tier ${tier.name}: ${fireResult.infraError ?? 'unknown'}`,
+          overseerPermit: opts.overseerPermit,
+          runId: null,
+        });
+
+        status = 'infra-alert';
+        await checkpoint();
+        break;
+      }
+
+      // The workflow run identity is durable before polling begins.
+      await checkpoint();
+
+      // Poll for terminal state (runId is guaranteed non-null since fireResult.ok is true)
+      const resolvedRunId = fireResult.runId ?? '';
+      let pollResult: PollResult;
+      try {
+        pollResult = await pollImpl({
+          runId: resolvedRunId,
+          apiBaseUrl,
+          token,
+          timeoutMs: pollTimeoutMs,
+          stallTimeoutMs: pollStallTimeoutMs,
+          intervalMs: pollIntervalMs,
+        });
+      } catch (pollErr) {
+        if (pollErr instanceof TimeoutError) {
+          // Progress-timeout: the model responded and burned tokens but never
+          // reached a terminal state within budget. Per the three-failure-class
+          // design (v1.1 amendment 2), this is a QUALITY failure, not an infra
+          // failure -- cancel the hung run (best-effort; must not block the
+          // climb) and climb via the same logic used for gate-fail.
+          const cancelResult = await cancelImpl({ runId: resolvedRunId, apiBaseUrl, token }).catch(
+            (cancelErr: unknown) => ({
+              ok: false,
+              error: `cancel threw: ${(cancelErr as Error).message}`,
+            })
+          );
+          if (!cancelResult.ok) {
+            console.log(
+              `[smart-cauldron] Warning: cancel failed for run ${resolvedRunId} on tier ` +
+                `${tier.name}: ${cancelResult.error ?? 'unknown'} (continuing climb -- ` +
+                'cancellation is best-effort)'
+            );
+          }
+
+          // Carry the poll's own message through: it distinguishes a STALL (run went
+          // silent) from the hard-ceiling backstop (run was still emitting but ran
+          // past the runaway limit). Those are different diagnoses and the operator
+          // reading this line needs to know which one fired.
+          const timeoutReason =
+            pollErr instanceof TimeoutError
+              ? pollErr.message
+              : `progress-timeout: no terminal state within ${pollTimeoutMs}ms`;
+          attempt.outcome = 'progress-timeout';
+          attempt.gateFailReason = timeoutReason;
+          attempt.completedAt = new Date().toISOString();
+
+          console.log(`[smart-cauldron] Progress-timeout on tier=${tier.name}: ${timeoutReason}`);
+          priorContext = buildTimeoutPriorContext(tier.name, pollStallTimeoutMs);
+
+          const shouldStop = await climbOrStop(tier, timeoutReason, fireResult.runId);
+          await checkpoint();
+          if (shouldStop) break;
+          continue;
+        }
+
+        // Non-timeout poll errors (network, API unreachable/5xx) keep the exact
+        // existing infra-error handling -- unchanged.
+        const errMsg = (pollErr as Error).message;
+        attempt.outcome = 'infra-error';
+        attempt.infraErrorReason = `poll error: ${errMsg}`;
+        attempt.completedAt = new Date().toISOString();
+
+        await emitEscalation({
+          errorClass: 'service_unavailable',
+          woId,
+          reason: `Poll timeout/error on tier ${tier.name}: ${errMsg}`,
+          overseerPermit: opts.overseerPermit,
+          runId: fireResult.runId,
+        });
+
+        status = 'infra-alert';
+        await checkpoint();
+        break;
+      }
+
+      // Judge the gate
+      const verdict: GateVerdict = judgeImpl(pollResult);
+      const outcome = classifyAttemptOutcome(fireResult, verdict);
+
+      attempt.outcome = outcome;
+      attempt.gateFailReason = verdict.pass ? null : verdict.reason;
+      attempt.servedModelId = pollResult.servedModelId;
       attempt.completedAt = new Date().toISOString();
 
-      await emitEscalation({
-        errorClass: 'service_unavailable',
-        woId,
-        reason: `Poll timeout/error on tier ${tier.name}: ${errMsg}`,
-        overseerPermit: opts.overseerPermit,
-        runId: fireResult.runId,
-      });
+      if (verdict.pass) {
+        // Gate passed -- cascade stops
+        status = 'won';
+        winningTier = tier.name;
+        await checkpoint();
+        console.log(
+          `[smart-cauldron] WON on tier=${tier.name} after ${attempts.length} attempt(s)`
+        );
+        break;
+      }
 
-      status = 'infra-alert';
+      if (outcome === 'cancelled') {
+        // Externally cancelled (Motion M-86): a human deliberately stopped this
+        // run. STOP the cascade -- do NOT call climbOrStop. Record the truth:
+        // status/outcome are 'cancelled', never a false win, never spec-repair.
+        status = 'cancelled';
+        console.log(`[smart-cauldron] CANCELLED on tier=${tier.name}: ${verdict.reason}`);
+        await checkpoint();
+        break;
+      }
+
+      // Gate failed
+      console.log(`[smart-cauldron] Gate failed on tier=${tier.name}: ${verdict.reason}`);
+
+      // Before climbing, re-check whether the work already landed under another
+      // branch/PR the per-run event feed missed (the classic 5-tier burn).
+      if (!allowClaimed) {
+        const claimBeforeClimb = await findWoClaimImpl(woId, project);
+        if (claimBeforeClimb) {
+          console.log(
+            `[smart-cauldron] ALREADY SATISFIED after gate-fail on tier=${tier.name}: ` +
+              `PR #${claimBeforeClimb.number} [${claimBeforeClimb.state}] ${claimBeforeClimb.url} ` +
+              '-- NOT climbing'
+          );
+          status = 'won';
+          winningTier = tier.name;
+          await checkpoint();
+          break;
+        }
+      }
+
+      // Build informed-climb context for the next tier
+      priorContext = buildPriorContext(tier.name, verdict, pollResult);
+
+      const shouldStop = await climbOrStop(tier, verdict.reason, fireResult.runId);
       await checkpoint();
-      break;
+      if (shouldStop) break;
     }
 
-    // Judge the gate
-    const verdict: GateVerdict = judgeImpl(pollResult);
-    const outcome = classifyAttemptOutcome(fireResult, verdict);
+    const record = buildCurrentRecord();
 
-    attempt.outcome = outcome;
-    attempt.gateFailReason = verdict.pass ? null : verdict.reason;
-    attempt.servedModelId = pollResult.servedModelId;
-    attempt.completedAt = new Date().toISOString();
+    // Write local telemetry record
+    const recordPath = await writeRecordImpl(record, outDir);
+    console.log(`[smart-cauldron] Cascade record written: ${recordPath}`);
 
-    if (verdict.pass) {
-      // Gate passed -- cascade stops
-      status = 'won';
-      winningTier = tier.name;
-      await checkpoint();
-      console.log(`[smart-cauldron] WON on tier=${tier.name} after ${attempts.length} attempt(s)`);
-      break;
-    }
-
-    if (outcome === 'cancelled') {
-      // Externally cancelled (Motion M-86): a human deliberately stopped this
-      // run. STOP the cascade -- do NOT call climbOrStop. Record the truth:
-      // status/outcome are 'cancelled', never a false win, never spec-repair.
-      status = 'cancelled';
-      console.log(`[smart-cauldron] CANCELLED on tier=${tier.name}: ${verdict.reason}`);
-      await checkpoint();
-      break;
-    }
-
-    // Gate failed
-    console.log(`[smart-cauldron] Gate failed on tier=${tier.name}: ${verdict.reason}`);
-
-    // Build informed-climb context for the next tier
-    priorContext = buildPriorContext(tier.name, verdict, pollResult);
-
-    const shouldStop = await climbOrStop(tier, verdict.reason, fireResult.runId);
-    await checkpoint();
-    if (shouldStop) break;
+    return record;
+  } finally {
+    await releaseWoLockImpl(woId, project, cascadeId, outDir);
   }
-
-  const record = buildCurrentRecord();
-
-  // Write local telemetry record
-  const recordPath = await writeRecordImpl(record, outDir);
-  console.log(`[smart-cauldron] Cascade record written: ${recordPath}`);
-
-  return record;
 }
 
 // ---------------------------------------------------------------------------

@@ -9,13 +9,15 @@
     "./cascade": "./src/cascade.ts",
     "./conductor": "./src/conductor.ts",
     "./ladder": "./src/ladder.ts",
-    "./types": "./src/types.ts"
+    "./types": "./src/types.ts",
+    "./already-satisfied": "./src/already-satisfied.ts",
+    "./wo-lock": "./src/wo-lock.ts"
   },
   "bin": {
     "smart-cauldron": "./src/cli.ts"
   },
   "scripts": {
-    "test": "bun test src/__tests__/conductor.test.ts && bun test src/__tests__/cascade.test.ts && bun test src/__tests__/cascade-authorized-escalation.test.ts && bun test src/__tests__/fire.test.ts && bun test src/__tests__/poll.test.ts && bun test src/__tests__/pr-detection-gate-regression.test.ts && bun test src/__tests__/recorder.test.ts && bun test src/__tests__/reliability-integration.test.ts && bun test src/__tests__/cli.test.ts",
+    "test": "bun test src/__tests__/conductor.test.ts && bun test src/__tests__/cascade.test.ts && bun test src/__tests__/cascade-authorized-escalation.test.ts && bun test src/__tests__/fire.test.ts && bun test src/__tests__/poll.test.ts && bun test src/__tests__/pr-detection-gate-regression.test.ts && bun test src/__tests__/recorder.test.ts && bun test src/__tests__/reliability-integration.test.ts && bun test src/__tests__/cli.test.ts && bun test src/__tests__/already-satisfied.test.ts && bun test src/__tests__/wo-lock.test.ts",
     "type-check": "bun x tsc --noEmit"
   },
   "dependencies": {
