@@ -40,8 +40,10 @@ describe('capability census slice 1', () => {
     expect(census.capabilities).toHaveLength(10);
     for (const entry of census.capabilities) {
       expect(entry.capability_id).toMatch(/^(overseer|merge-manager|taskmaster)\./);
-      expect(entry.tier).toBeGreaterThanOrEqual(0);
-      expect(entry.tier).toBeLessThanOrEqual(MAX_TIER);
+      if (entry.tier !== null) {
+        expect(entry.tier).toBeGreaterThanOrEqual(0);
+        expect(entry.tier).toBeLessThanOrEqual(MAX_TIER);
+      }
       expect(['on', 'off', 'deferred']).toContain(entry.live_flag_state);
       expect(entry.owner).toMatch(/^packages\//);
       expect(entry.deferral_expiry).toBeNull();
@@ -54,7 +56,7 @@ describe('capability census slice 1', () => {
     expect(
       census.capabilities.find(row => row.capability_id === 'taskmaster.digest')
     ).toMatchObject({
-      tier: 0,
+      tier: null,
       live_flag_state: 'on',
     });
   });
@@ -77,19 +79,38 @@ describe('capability census slice 1', () => {
     ).toBe('deferred');
   });
 
-  test('matches the checked-in golden artifact under a controlled environment', async () => {
-    process.env.OVERSEER_ENABLED = 'true';
-    process.env.OVERSEER_EMERGENCY_STOP = 'false';
-    process.env.OVERSEER_ESCALATION_ACTIONS_ENABLED = 'true';
-    process.env.OVERSEER_REPAIR_ACTIONS_ENABLED = 'true';
-    process.env.OVERSEER_BRANCH_ACTIONS_ENABLED = 'true';
-    process.env.OVERSEER_LIFECYCLE_ACTIONS_ENABLED = 'true';
-    process.env.OVERSEER_MERGE_ACTIONS_ENABLED = 'true';
-    process.env.TASKMASTER_INTERVAL_MS = '3600000';
+  test('matches the checked-in golden artifact against code-defined defaults', async () => {
     const path = join(
       resolve(import.meta.dir, '..'),
       'docs/operations/capability-census-slice1.json'
     );
-    expect(await readFile(path, 'utf8')).toBe(renderCapabilityCensus(buildCapabilityCensus()));
+    const defaults = buildCapabilityCensus({});
+    const overseerDefaults = defaults.capabilities.filter(
+      row => !row.capability_id.startsWith('taskmaster.')
+    );
+    expect(overseerDefaults).toHaveLength(6);
+    for (const row of overseerDefaults) {
+      expect(row).toMatchObject({
+        live_flag_state: 'off',
+        flags: {
+          OVERSEER_ENABLED: false,
+          OVERSEER_EMERGENCY_STOP: true,
+        },
+      });
+      const actionFlag = Object.entries(row.flags).find(([key]) =>
+        key.endsWith('_ACTIONS_ENABLED')
+      );
+      expect(actionFlag?.[1]).toBe(false);
+    }
+    expect(await readFile(path, 'utf8')).toBe(renderCapabilityCensus(defaults));
+  });
+
+  test('repository defaults do not inherit ambient process flags', () => {
+    process.env.OVERSEER_ENABLED = 'true';
+    process.env.OVERSEER_EMERGENCY_STOP = 'false';
+    process.env.OVERSEER_MERGE_ACTIONS_ENABLED = 'true';
+    expect(
+      buildCapabilityCensus({}).capabilities.find(row => row.capability_id === 'overseer.merge')
+    ).toMatchObject({ live_flag_state: 'off' });
   });
 });

@@ -22,7 +22,7 @@ export type LiveFlagState = 'on' | 'off' | 'deferred';
 
 export interface CapabilityCensusEntry {
   capability_id: string;
-  tier: number;
+  tier: number | null;
   live_flag_state: LiveFlagState;
   owner: string;
   deferral_expiry: string | null;
@@ -47,63 +47,67 @@ function envTrue(value: string | undefined): boolean {
   return value === '1' || value === 'true' || value === 'yes';
 }
 
-function overseerState(capabilityEnabled: boolean): LiveFlagState {
-  const serviceEnabled = envTrue(process.env.OVERSEER_ENABLED);
-  const emergencyStop = !['0', 'false', 'no'].includes(process.env.OVERSEER_EMERGENCY_STOP ?? '');
-  const dryRun = envTrue(process.env.OVERSEER_DRY_RUN);
+function overseerState(
+  env: Readonly<Record<string, string | undefined>>,
+  capabilityEnabled: boolean
+): LiveFlagState {
+  const serviceEnabled = envTrue(env.OVERSEER_ENABLED);
+  const emergencyStop = !['0', 'false', 'no'].includes(env.OVERSEER_EMERGENCY_STOP ?? '');
+  const dryRun = envTrue(env.OVERSEER_DRY_RUN);
   if (!capabilityEnabled || !serviceEnabled) return 'off';
   return emergencyStop || dryRun ? 'deferred' : 'on';
 }
 
 function overseerFlags(
-  capability: (typeof OVERSEER_CAPABILITIES)[number]
+  capability: (typeof OVERSEER_CAPABILITIES)[number],
+  env: Readonly<Record<string, string | undefined>>
 ): Readonly<Record<string, boolean>> {
   const capabilityFlag = `OVERSEER_${capability.toUpperCase()}_ACTIONS_ENABLED`;
   return {
-    OVERSEER_ENABLED: envTrue(process.env.OVERSEER_ENABLED),
-    OVERSEER_EMERGENCY_STOP: !['0', 'false', 'no'].includes(
-      process.env.OVERSEER_EMERGENCY_STOP ?? ''
-    ),
-    OVERSEER_DRY_RUN: envTrue(process.env.OVERSEER_DRY_RUN),
-    [capabilityFlag]: envTrue(process.env[capabilityFlag]),
+    OVERSEER_ENABLED: envTrue(env.OVERSEER_ENABLED),
+    OVERSEER_EMERGENCY_STOP: !['0', 'false', 'no'].includes(env.OVERSEER_EMERGENCY_STOP ?? ''),
+    OVERSEER_DRY_RUN: envTrue(env.OVERSEER_DRY_RUN),
+    [capabilityFlag]: envTrue(env[capabilityFlag]),
   };
 }
 
-export function buildCapabilityCensus(): CapabilityCensus {
+export function buildCapabilityCensus(
+  env: Readonly<Record<string, string | undefined>> = process.env
+): CapabilityCensus {
   const overseer = OVERSEER_CAPABILITIES.map(capability => {
-    const flags = overseerFlags(capability);
+    const flags = overseerFlags(capability, env);
     const capabilityFlag = `OVERSEER_${capability.toUpperCase()}_ACTIONS_ENABLED`;
     return {
       capability_id: `overseer.${capability}`,
       tier: requiredTierForAction(OVERSEER_ACTIONS[capability]),
-      live_flag_state: overseerState(flags[capabilityFlag] ?? false),
+      live_flag_state: overseerState(env, flags[capabilityFlag] ?? false),
       owner: 'packages/overseer',
       deferral_expiry: null,
       flags,
     } satisfies CapabilityCensusEntry;
   });
 
-  const mergeFlags = overseerFlags('merge');
+  const mergeFlags = overseerFlags('merge', env);
   const mergeManager: CapabilityCensusEntry = {
     capability_id: `merge-manager.${MERGE_MANAGER_IDENTITY}`,
     tier: requiredTierForAction('merge'),
-    live_flag_state: overseerState(mergeFlags.OVERSEER_MERGE_ACTIONS_ENABLED ?? false),
+    live_flag_state: overseerState(env, mergeFlags.OVERSEER_MERGE_ACTIONS_ENABLED ?? false),
     owner: 'packages/overseer',
     deferral_expiry: null,
     flags: mergeFlags,
   };
 
-  const taskmasterEnabled = process.env.TASKMASTER_INTERVAL_MS !== '0';
+  const taskmasterEnabled = env.TASKMASTER_INTERVAL_MS !== '0';
   const taskmaster = TM_ALLOWED_ACTION_TYPES.map(action => ({
     capability_id: `taskmaster.${action}`,
-    tier: 0,
+    tier: null,
     live_flag_state: taskmasterEnabled ? ('on' as const) : ('off' as const),
     owner: 'packages/server/src/taskmaster',
     deferral_expiry: null,
     flags: {
-      TASKMASTER_INTERVAL_MS: process.env.TASKMASTER_INTERVAL_MS ?? null,
-      TASKMASTER_DEADMAN_INTERVAL_MS: process.env.TASKMASTER_DEADMAN_INTERVAL_MS ?? null,
-      TASKMASTER_GH_REPOS: process.env.TASKMASTER_GH_REPOS ?? null,
+      TASKMASTER_INTERVAL_MS: env.TASKMASTER_INTERVAL_MS ?? null,
+      TASKMASTER_DEADMAN_INTERVAL_MS: env.TASKMASTER_DEADMAN_INTERVAL_MS ?? null,
+      TASKMASTER_GH_REPOS: env.TASKMASTER_GH_REPOS ?? null,
       allowed_recipients: TM_ALLOWED_RECIPIENTS.join(','),
     },
   }));
@@ -120,7 +124,8 @@ export function renderCapabilityCensus(census: CapabilityCensus): string {
 }
 
 async function main(): Promise<void> {
-  const rendered = renderCapabilityCensus(buildCapabilityCensus());
+  // The checked-in artifact records code-defined defaults, never ambient shell state.
+  const rendered = renderCapabilityCensus(buildCapabilityCensus({}));
   if (process.argv.includes('--check')) {
     const current = await readFile(OUTPUT_PATH, 'utf8').catch(() => '');
     if (current !== rendered) {
