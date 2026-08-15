@@ -23,6 +23,11 @@ import type {
 
 export const MERGE_MANAGER_IDENTITY = 'overseer-merge-manager-v1';
 export const PRODUCTION_EFFECT_HOLD_REASON = 'production_effect_held_for_john' as const;
+export const MERGE_MANAGER_MODE_ENV = 'OVERSEER_MERGE_MANAGER_MODE' as const;
+export const MERGE_MANAGER_MODES = ['hold-canary', 'comment_findings', 'execute'] as const;
+export type MergeManagerMode = (typeof MERGE_MANAGER_MODES)[number];
+export const DEFAULT_MERGE_MANAGER_MODE: MergeManagerMode = 'hold-canary';
+
 const DEFAULT_OPERATOR: MergeOperatorIdentity = {
   identity: MERGE_MANAGER_IDENTITY,
   provider: 'overseer',
@@ -45,6 +50,11 @@ export interface MergeManagerDeps extends OverseerActionsDeps, GitHubClientDeps 
     evidence: QualifiedMergeEvidence
   ) => Promise<{ readonly merged: boolean; readonly message?: string }>;
   readonly operator?: MergeOperatorIdentity;
+  /**
+   * Explicit Merge Manager mode. When set, overrides OVERSEER_MERGE_MANAGER_MODE.
+   * Unset/unknown env values fail closed to hold-canary (no GitHub write).
+   */
+  readonly mode?: MergeManagerMode | string;
 }
 
 export type MergeManagerResult =
@@ -60,7 +70,65 @@ export type MergeManagerResult =
       readonly reason: string;
       /** Present when the hold came from the provenance gate. */
       readonly provenance?: MergeProvenanceResult;
+      /** Mode active when the hold/canary path ran. */
+      readonly mode?: MergeManagerMode;
     };
+
+/**
+ * Resolve Merge Manager mode. Precedence: deps.mode -> env -> hold-canary.
+ * Unknown / empty values fail closed to hold-canary (zero GitHub writes).
+ * Accepts alias `comment-findings` -> `comment_findings`.
+ */
+export function resolveMergeManagerMode(
+  raw: string | null | undefined = process.env[MERGE_MANAGER_MODE_ENV]
+): MergeManagerMode {
+  const normalized = (raw ?? '').trim().toLowerCase().replace(/-/g, '_');
+  if (!normalized) return DEFAULT_MERGE_MANAGER_MODE;
+  if (normalized === 'hold_canary') return 'hold-canary';
+  if (normalized === 'comment_findings') return 'comment_findings';
+  if (normalized === 'execute') return 'execute';
+  return DEFAULT_MERGE_MANAGER_MODE;
+}
+
+function associationFields(
+  record: WatchedRunRecord,
+  evidence: QualifiedMergeEvidence,
+  evidenceDigest: string,
+  mode: MergeManagerMode
+): Record<string, string | number> {
+  return {
+    runId: record.runId,
+    woId: record.woId,
+    owner: evidence.owner,
+    repo: evidence.repository,
+    prNumber: evidence.pr_number,
+    headSha: evidence.head_sha,
+    baseSha: evidence.base_sha,
+    evidenceDigest,
+    mode,
+  };
+}
+
+function buildCanaryCommentBody(
+  record: WatchedRunRecord,
+  evidence: QualifiedMergeEvidence,
+  evidenceDigest: string,
+  mode: MergeManagerMode,
+  disposition: string
+): string {
+  return [
+    'Overseer Merge Manager canary (comment_findings).',
+    `mode=${mode}`,
+    `disposition=${disposition}`,
+    `runId=${record.runId}`,
+    `woId=${record.woId}`,
+    `pr=${evidence.owner}/${evidence.repository}#${evidence.pr_number}`,
+    `headSha=${evidence.head_sha}`,
+    `baseSha=${evidence.base_sha}`,
+    `evidenceDigest=${evidenceDigest}`,
+    'merge=hard_off',
+  ].join('\n');
+}
 
 function metadataString(record: WatchedRunRecord, keys: readonly string[]): string | null {
   const metadata = record.metadata ?? {};
@@ -299,6 +367,10 @@ export function createMergeManager(
       evidence: QualifiedMergeEvidence
     ): Promise<{ readonly merged: boolean; readonly message?: string }> =>
       defaultExecute(deps, evidence));
+  // deps.mode wins for tests/DI; else env; else hold-canary (fail closed).
+  const mode = resolveMergeManagerMode(
+    deps.mode !== undefined ? String(deps.mode) : process.env[MERGE_MANAGER_MODE_ENV]
+  );
 
   return async (record: WatchedRunRecord): Promise<MergeManagerResult> => {
     const assembled = await assembleEvidence(record);
@@ -307,7 +379,7 @@ export function createMergeManager(
     if (evidence.resulting_deployment_effect === 'production') {
       await recordManagerAction(deps, record, 'merge_denied', PRODUCTION_EFFECT_HOLD_REASON);
       log.warn(
-        { runId: record.runId, woId: record.woId, effect: 'production' },
+        { runId: record.runId, woId: record.woId, effect: 'production', mode },
         'merge_manager.production_effect_held_for_john'
       );
       return {
@@ -315,6 +387,7 @@ export function createMergeManager(
         receipt: null,
         execution: null,
         reason: PRODUCTION_EFFECT_HOLD_REASON,
+        mode,
       };
     }
 
@@ -333,6 +406,7 @@ export function createMergeManager(
           reason: provenance.reason,
           runHeadSha: provenance.runHeadSha,
           prHeadSha: provenance.prHeadSha,
+          mode,
         },
         'merge_manager.provenance_unverified'
       );
@@ -342,6 +416,7 @@ export function createMergeManager(
         execution: null,
         reason: `provenance_${provenance.reason}`,
         provenance,
+        mode,
       };
     }
 
@@ -356,9 +431,99 @@ export function createMergeManager(
     }
     if (receipt.disposition !== 'approve') {
       await recordManagerAction(deps, record, 'merge_denied', receipt.reason);
-      return { status: 'held', receipt, execution: null, reason: receipt.reason };
+      return { status: 'held', receipt, execution: null, reason: receipt.reason, mode };
     }
 
+    const association = associationFields(record, evidence, evidenceDigest, mode);
+
+    // hold-canary (default): log would-comment / would-merge with association proof;
+    // never call comment or merge APIs.
+    if (mode === 'hold-canary') {
+      log.info(association, 'merge_manager.would_comment');
+      log.info(association, 'merge_manager.would_merge');
+      await recordManagerAction(
+        deps,
+        record,
+        'would_comment',
+        JSON.stringify({ ...association, disposition: receipt.disposition })
+      );
+      await recordManagerAction(
+        deps,
+        record,
+        'would_merge',
+        JSON.stringify({ ...association, disposition: receipt.disposition, hold: 'hold_canary' })
+      );
+      return {
+        status: 'held',
+        receipt,
+        execution: null,
+        reason: 'hold_canary',
+        mode,
+      };
+    }
+
+    // comment_findings: may post one PR comment; merge stays hard-off.
+    if (mode === 'comment_findings') {
+      const body = buildCanaryCommentBody(
+        record,
+        evidence,
+        evidenceDigest,
+        mode,
+        receipt.disposition
+      );
+      if (!deps.commentOnPullRequest) {
+        log.warn(association, 'merge_manager.comment_channel_unavailable');
+        await recordManagerAction(deps, record, 'comment_channel_unavailable', JSON.stringify(association));
+        return {
+          status: 'held',
+          receipt,
+          execution: null,
+          reason: 'comment_channel_unavailable',
+          mode,
+        };
+      }
+      try {
+        const commentResult = await deps.commentOnPullRequest({
+          owner: evidence.owner,
+          repo: evidence.repository,
+          number: evidence.pr_number,
+          body,
+        });
+        log.info(
+          { ...association, commented: commentResult.commented, url: commentResult.url },
+          'merge_manager.comment_findings'
+        );
+        await recordManagerAction(
+          deps,
+          record,
+          'comment_findings',
+          JSON.stringify({
+            ...association,
+            commented: commentResult.commented,
+            url: commentResult.url ?? null,
+            merge: 'hard_off',
+          })
+        );
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        log.warn({ ...association, error: message }, 'merge_manager.comment_findings_failed');
+        await recordManagerAction(
+          deps,
+          record,
+          'comment_findings_failed',
+          JSON.stringify({ ...association, error: message, merge: 'hard_off' })
+        );
+      }
+      return {
+        status: 'held',
+        receipt,
+        execution: null,
+        reason: 'comment_findings_merge_hard_off',
+        mode,
+      };
+    }
+
+    // execute: explicit opt-in only. Still subject to production-effect + provenance above.
     const execution = await execute(evidence);
     await recordManagerAction(
       deps,

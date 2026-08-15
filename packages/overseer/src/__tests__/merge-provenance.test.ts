@@ -172,6 +172,8 @@ describe('merge manager provenance gate', () => {
     const insertOverseerAction = mock(async () => undefined);
 
     const manager = createMergeManager({
+      // Explicit execute so this test would fail loud if provenance short-circuit broke.
+      mode: 'execute',
       assembleEvidence: async () => ({
         evidence: evidenceFor(record),
         evidenceDigest: 'c'.repeat(64),
