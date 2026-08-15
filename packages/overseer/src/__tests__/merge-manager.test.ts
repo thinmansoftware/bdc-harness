@@ -163,7 +163,9 @@ describe('merge manager', () => {
     expect(mergePullRequest).not.toHaveBeenCalled();
     expect(commentOnPullRequest).not.toHaveBeenCalled();
 
-    const actions = insertOverseerAction.mock.calls.map(call => call[0] as { action: string; result: string });
+    const actions = insertOverseerAction.mock.calls.map(
+      call => call[0] as { action: string; result: string }
+    );
     expect(actions.some(a => a.action === 'would_comment')).toBe(true);
     expect(actions.some(a => a.action === 'would_merge')).toBe(true);
     const wouldMerge = actions.find(a => a.action === 'would_merge');
