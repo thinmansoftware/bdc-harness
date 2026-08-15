@@ -985,3 +985,146 @@ describe('Test: cancelled stops the cascade (real gate)', () => {
     expect(record.status).toBe('won');
   });
 });
+
+// ---------------------------------------------------------------------------
+// WO claim / single-flight (bdc-xo#1546)
+// ---------------------------------------------------------------------------
+
+describe('wo claim + single-flight (#1546)', () => {
+  test('refuses cascade when WO already has an OPEN claim (no fire)', async () => {
+    let fireCalled = false;
+    const deps: CascadeDeps = {
+      findWoClaim: async () => ({
+        number: 99,
+        state: 'OPEN',
+        title: 'WO-TEST-001 open',
+        url: 'https://github.com/org/repo/pull/99',
+        repo: 'thinmansoftware/test-project',
+      }),
+      fire: async () => {
+        fireCalled = true;
+        return makeFireOk('should-not-fire');
+      },
+      escalate: async () => undefined,
+      writeRecord: async (record, _dir) => `/tmp/cascade-record-${record.cascadeId}.json`,
+    };
+
+    const result = await runCascade(baseOpts({ deps }));
+
+    expect(fireCalled).toBe(false);
+    expect(result.status).toBe('won');
+    expect(result.attempts.length).toBe(0);
+  });
+
+  test('second concurrent cascade for same WO is blocked', async () => {
+    const outDir = await mkdtemp(join(tmpdir(), 'sc-wo-lock-'));
+    try {
+      let heldBy: string | null = null;
+      const acquireCalls: string[] = [];
+
+      const makeLockDeps = (cascadeLabel: string, onFire?: () => void): CascadeDeps => ({
+        findWoClaim: async () => null,
+        acquireWoLock: async (woId, project, cascadeId) => {
+          acquireCalls.push(cascadeLabel);
+          const path = join(outDir, 'wo-locks', `${woId}.json`);
+          if (heldBy && heldBy !== cascadeId) {
+            return {
+              acquired: false,
+              path,
+              record: {
+                woId,
+                project,
+                cascadeId: heldBy,
+                status: 'running',
+                createdAt: new Date().toISOString(),
+                updatedAt: new Date().toISOString(),
+              },
+            };
+          }
+          heldBy = cascadeId;
+          return {
+            acquired: true,
+            path,
+            record: {
+              woId,
+              project,
+              cascadeId,
+              status: 'running',
+              createdAt: new Date().toISOString(),
+              updatedAt: new Date().toISOString(),
+            },
+          };
+        },
+        releaseWoLock: async (_woId, _project, cascadeId) => {
+          if (heldBy === cascadeId) heldBy = null;
+        },
+        fire: async () => {
+          onFire?.();
+          return makeFireOk(`run-${cascadeLabel}`);
+        },
+        poll: async () => makePollResult(),
+        judge: () => makePassVerdict(),
+        escalate: async () => undefined,
+        writeRecord: async (record, _dir) => join(outDir, `${record.cascadeId}.json`),
+      });
+
+      let secondFire = false;
+      // Hold the lock via injected acquire -- first cascade keeps heldBy set
+      // until release, so second must see acquired:false.
+      heldBy = 'cascade-first';
+      const second = await runCascade(
+        baseOpts({
+          outDir,
+          dispatchId: 'cascade-second',
+          deps: makeLockDeps('second', () => {
+            secondFire = true;
+          }),
+        })
+      );
+
+      expect(second.status).toBe('blocked');
+      expect(secondFire).toBe(false);
+      expect(acquireCalls).toEqual(['second']);
+    } finally {
+      await rm(outDir, { recursive: true, force: true });
+    }
+  });
+
+  test('stops climb when claim appears after gate-fail', async () => {
+    let claimCalls = 0;
+    const fireCalls: string[] = [];
+    const deps: CascadeDeps = {
+      findWoClaim: async () => {
+        claimCalls++;
+        // First check (pre-cascade) empty; claim appears before climb after gate-fail.
+        if (claimCalls <= 2) return null;
+        return {
+          number: 42,
+          state: 'OPEN',
+          title: 'WO-TEST-001 landed elsewhere',
+          url: 'https://github.com/org/repo/pull/42',
+          repo: 'thinmansoftware/test-project',
+        };
+      },
+      fire: async opts => {
+        fireCalls.push(opts.workflowName);
+        return makeFireOk(`run-${fireCalls.length}`);
+      },
+      poll: async () =>
+        makePollResult({
+          terminalStatus: 'completed',
+          prUrl: null,
+          prMergeable: null,
+          validatorVerdict: 'needs_revision',
+        }),
+      judge: () => makeFailVerdict('no PR opened'),
+      escalate: async () => undefined,
+      writeRecord: async (record, _dir) => `/tmp/cascade-record-${record.cascadeId}.json`,
+    };
+
+    const record = await runCascade(baseOpts({ deps }));
+
+    expect(fireCalls.length).toBe(1);
+    expect(record.status).toBe('won');
+  });
+});

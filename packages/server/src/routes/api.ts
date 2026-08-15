@@ -49,6 +49,7 @@ import {
 import { discoverWorkflowsWithConfig } from '@archon/workflows/workflow-discovery';
 import { resolveWorkflowName } from '@archon/workflows/router';
 import { parseWorkflowRunBranchOverride } from './workflow-run-branch-override';
+import { extractWoIdFromMessage, findLiveRunsForWo, isCascadeClimbMessage } from './wo-fire-guard';
 import type { WorkflowDefinition } from '@archon/workflows/schemas/workflow';
 import { executeWorkflow } from '@archon/workflows/executor';
 import { checkCodexDispatchGate } from '@archon/providers/auth-refresh/dispatch-gate';
@@ -4949,6 +4950,36 @@ export function registerApiRoutes(
         }
         return c.json({ accepted: false, error: check.error }, 400);
       }
+
+      // Duplicate-fire guard (bdc-xo#1546): refuse a NEW independent fire while
+      // another run for the same WO is still live. Cascade climbs carry prior-
+      // attempt context and only fire after the prior run is terminal.
+      const allowConcurrent =
+        c.req.header('x-archon-allow-concurrent') === '1' ||
+        c.req.header('x-archon-allow-concurrent') === 'true';
+      if (!allowConcurrent && !isCascadeClimbMessage(message)) {
+        const woId = conductor?.woId ?? extractWoIdFromMessage(message);
+        if (woId) {
+          const live = await findLiveRunsForWo(woId);
+          if (live.length > 0) {
+            getLog().warn(
+              { woId, liveRunIds: live.map(r => r.id), workflowName },
+              'wo_duplicate_fire_refused'
+            );
+            return c.json(
+              {
+                accepted: false,
+                error: 'duplicate_wo_live',
+                woId,
+                liveRuns: live,
+                hint: 'Cancel the live run or pass x-archon-allow-concurrent: 1 if you own the race',
+              },
+              409
+            );
+          }
+        }
+      }
+
       const result = await dispatchToOrchestrator(conversationId, fullMessage);
       return c.json(result);
     } catch (error) {
