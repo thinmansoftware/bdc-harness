@@ -94,6 +94,40 @@ describe('resolveGitHubAppAuth / auth precedence', () => {
     }
   });
 
+  test('installation-token mint failure rejects loudly', async () => {
+    process.env.GITHUB_APP_ID = '4574893';
+    process.env.GITHUB_APP_INSTALLATION_ID = '153295654';
+    process.env.GITHUB_APP_PRIVATE_KEY = FAKE_PEM;
+
+    const options = resolveRealOctokitAuthOptions();
+    if (!('authStrategy' in options)) throw new Error('expected App auth strategy');
+    const request = mock(async () => {
+      throw new Error('installation token mint refused');
+    });
+    const auth = options.authStrategy({ ...options.auth, request: request as never });
+
+    await expect(auth({ type: 'installation' })).rejects.toThrow(/installation token mint refused/);
+    expect(request).toHaveBeenCalledTimes(1);
+  });
+
+  test('forced installation-token refresh failure rejects loudly', async () => {
+    process.env.GITHUB_APP_ID = '4574893';
+    process.env.GITHUB_APP_INSTALLATION_ID = '153295654';
+    process.env.GITHUB_APP_PRIVATE_KEY = FAKE_PEM;
+
+    const options = resolveRealOctokitAuthOptions();
+    if (!('authStrategy' in options)) throw new Error('expected App auth strategy');
+    const request = mock(async () => {
+      throw new Error('installation token refresh refused');
+    });
+    const auth = options.authStrategy({ ...options.auth, request: request as never });
+
+    await expect(auth({ type: 'installation', refresh: true })).rejects.toThrow(
+      /installation token refresh refused/
+    );
+    expect(request).toHaveBeenCalledTimes(1);
+  });
+
   test('App vars absent -> PAT path chosen (no behavior change)', () => {
     process.env.GH_TOKEN = 'ghp_pat_token_value';
 

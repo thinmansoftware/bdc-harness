@@ -1,3 +1,5 @@
+import { createRealGitHubOctokit } from './adapters/github-real-deps';
+
 const BDC_OWNER = 'thinmansoftware';
 const BDC_XO_REPO = 'bdc-xo';
 const BDC_XO_REF = 'main';
@@ -30,10 +32,7 @@ export interface OwnerResolutionOctokitLike {
 let octokit: Promise<OwnerResolutionOctokitLike> | null = null;
 
 async function getOctokit(): Promise<OwnerResolutionOctokitLike> {
-  const token = process.env.GITHUB_TOKEN ?? process.env.GH_TOKEN;
-  octokit ??= import('@octokit/rest').then(
-    module => new module.Octokit({ auth: token }) as unknown as OwnerResolutionOctokitLike
-  );
+  octokit ??= Promise.resolve(createRealGitHubOctokit() as unknown as OwnerResolutionOctokitLike);
   return octokit;
 }
 

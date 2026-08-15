@@ -243,6 +243,9 @@ export function createRealOctokitClient(): RealGitHubOctokitLike {
   return new Octokit(resolveRealOctokitAuthOptions()) as unknown as RealGitHubOctokitLike;
 }
 
+/** Canonical App-aware constructor for all Overseer and Merge Manager GitHub calls. */
+export const createRealGitHubOctokit = createRealOctokitClient;
+
 function summarizeChecks(
   checkRuns: { status: string; conclusion: string | null }[]
 ): PullRequestCheckSummary {

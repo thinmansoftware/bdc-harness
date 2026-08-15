@@ -1,3 +1,5 @@
+import { createRealGitHubOctokit, resolveGitHubAppAuth } from './adapters/github-real-deps';
+
 const log: ReconcileLogger = {
   warn(fields, message) {
     console.warn('[overseer/reconcile]', message, fields);
@@ -351,7 +353,8 @@ async function hasDefaultSkipBeenNoted(input: { prRef: string; woId: string }): 
 
 export function createDefaultReconcileDeps(): ReconcileDeps {
   const token = process.env.GITHUB_TOKEN ?? process.env.GH_TOKEN;
-  if (!token) {
+  const appAuthConfigured = resolveGitHubAppAuth() !== null;
+  if (!token && !appAuthConfigured) {
     return {
       readCursor: async () => null,
       searchMergedPullRequests: async (): Promise<ReconcileMergedPullRequest[]> => {
@@ -370,9 +373,7 @@ export function createDefaultReconcileDeps(): ReconcileDeps {
 
   let octokit: Promise<OctokitLike> | null = null;
   const getOctokit = async (): Promise<OctokitLike> => {
-    octokit ??= import('@octokit/rest').then(
-      module => new module.Octokit({ auth: token }) as unknown as OctokitLike
-    );
+    octokit ??= Promise.resolve(createRealGitHubOctokit() as unknown as OctokitLike);
     return octokit;
   };
   return {
