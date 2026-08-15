@@ -1,5 +1,6 @@
 {
-  "_comment": "Smart Cauldron v1.2 ordered tier ladder. Edit this file to change tier order or workflow bindings. GLM tier REMOVED 2026-07-07 (John, zero-lane incident: $15.47/day burned, zero shipped code). Zero added 2026-07-07 for exhaustion/mechanical WOs: qwen builder + DeepSeek review + Codex with OpenRouter failback, no paid review seat. Keep money/auth/infra off this lane.",
+  "_comment": "CANONICAL LADDER SOR for Smart Cauldron conductor fires. Ordered tier ladder: zero -> qwen -> codex -> claude -> frontier. Edit this file to change tier order or workflow bindings. refusedTiers lists dark/retired lanes that must NEVER be live entry points (cascade refuses them even under --entry). GLM tier REMOVED 2026-07-07 (John, zero-lane incident: $15.47/day burned, zero shipped code). Zero added 2026-07-07 for exhaustion/mechanical WOs: qwen builder + DeepSeek review + Codex with OpenRouter failback, no paid review seat. Keep money/auth/infra off this lane. Multi-tier vision retained; broken router lanes are not reconnected as live entry.",
+  "refusedTiers": ["glm"],
   "tiers": [
     {
       "name": "zero",

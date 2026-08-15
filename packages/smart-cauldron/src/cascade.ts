@@ -20,7 +20,7 @@
 import { randomUUID } from 'crypto';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
-import { loadLadder } from './ladder.js';
+import { loadLadder, loadRefusedTiers } from './ladder.js';
 import { loadRuleset, pickEntryTier } from './conductor.js';
 import { fireTier, buildFireMessage } from './fire.js';
 import { pollForTerminal, TimeoutError } from './poll.js';
@@ -234,9 +234,21 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
   // Load config from files (never from inline constants)
   const tiers = loadLadder();
   const ruleset = loadRuleset();
+  const refusedTiers = loadRefusedTiers();
 
-  // Conductor: pick entry tier
+  // Conductor: pick entry tier (ruleset), or honor explicit --entry override
   const entryTierName = entryOverride ?? pickEntryTier({ woClass, tags }, ruleset);
+
+  // Dark/retired lanes are never live entry points (even under --entry).
+  if (refusedTiers.includes(entryTierName)) {
+    throw new Error(
+      `[smart-cauldron/cascade] Refused dark/retired entry tier "${entryTierName}". ` +
+        `This lane is listed in refusedTiers and cannot be selected as a live entry point. ` +
+        `Canonical ladder: ${tiers.map(t => t.name).join(' -> ')}. ` +
+        `Refused: ${refusedTiers.join(', ')}`
+    );
+  }
+
   let currentIndex = tiers.findIndex(t => t.name === entryTierName);
   if (currentIndex === -1) {
     throw new Error(

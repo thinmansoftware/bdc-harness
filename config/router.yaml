@@ -63,17 +63,23 @@ tiers:
   "2":
     name: openrouter-cheap
     engines:
+      # RETIRED/REFUSED 2026-07-07 -- glm-5.2 is a dark lane. Kept in the multi-tier
+      # vision table for history only. NOT wired in DEFAULT_ENGINE_TO_LANE (lane=null
+      # fail-closed). Do NOT reconnect as a live entry. Smart Cauldron refuses "glm"
+      # via packages/smart-cauldron/config/ladder.config.json refusedTiers.
       - glm-5.2
       - qwen3-coder
       - deepseek-v4-pro
     marginal_cost: cheap-api
     work_shape: >-
       Build agents, code generation, PR tasks via OpenRouter cheap models.
-      All three engines route through the bdc-feature-development-glm lane.
-      Escalates to haiku on gate failure.
+      Live engines: qwen3-coder and deepseek-v4-pro. glm-5.2 is retired/refused
+      and is not a live lane entry (see notes). Escalates to haiku on gate failure.
     notes: >-
-      Uses GLM_API_KEY env var (openrouter.ai/api/v1). Provider: glm passes
-      model ids with slashes unchanged to OpenRouter. No new provider needed.
+      glm-5.2 RETIRED/REFUSED (2026-07-07 zero-lane incident). Do not reconnect
+      bdc-feature-development-glm as a live entry. Dispatcher maps glm-5.2 to
+      null lane (fail-closed). Remaining engines use OpenRouter cheap models
+      (GLM_API_KEY / openrouter.ai/api/v1 where applicable).
 
   "3":
     name: haiku

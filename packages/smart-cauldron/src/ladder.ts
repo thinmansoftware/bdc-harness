@@ -4,6 +4,9 @@
  * The ladder defines which workflow lanes exist and their order (cheapest first).
  * Edit config/ladder.config.json to change tier order or workflow bindings --
  * never hardcode these values in orchestrator source.
+ *
+ * This config file is the CANONICAL LADDER SOR for Smart Cauldron conductor fires.
+ * refusedTiers lists dark/retired lanes that must never be selected as live entry.
  */
 
 import { readFileSync } from 'fs';
@@ -19,18 +22,15 @@ interface RawTier {
 
 interface RawLadderConfig {
   tiers: RawTier[];
+  refusedTiers?: string[];
 }
 
-/**
- * Load the ordered tier ladder from config.
- *
- * @param configPath Optional path override; defaults to config/ladder.config.json
- *                   relative to this file's directory.
- * @returns Ordered array of LadderTier (cheapest first).
- * @throws If config is missing or malformed.
- */
-export function loadLadder(configPath?: string): LadderTier[] {
-  const resolved = configPath ?? join(import.meta.dir, '..', 'config', 'ladder.config.json');
+function resolveLadderPath(configPath?: string): string {
+  return configPath ?? join(import.meta.dir, '..', 'config', 'ladder.config.json');
+}
+
+function readLadderConfig(configPath?: string): RawLadderConfig {
+  const resolved = resolveLadderPath(configPath);
   let raw: string;
   try {
     raw = readFileSync(resolved, 'utf8');
@@ -48,6 +48,20 @@ export function loadLadder(configPath?: string): LadderTier[] {
       `[smart-cauldron/ladder] Failed to parse ladder config at ${resolved}: ${(err as Error).message}`
     );
   }
+
+  return config;
+}
+
+/**
+ * Load the ordered tier ladder from config.
+ *
+ * @param configPath Optional path override; defaults to config/ladder.config.json
+ *                   relative to this file's directory.
+ * @returns Ordered array of LadderTier (cheapest first).
+ * @throws If config is missing or malformed.
+ */
+export function loadLadder(configPath?: string): LadderTier[] {
+  const config = readLadderConfig(configPath);
 
   if (!Array.isArray(config.tiers) || config.tiers.length === 0) {
     throw new Error('[smart-cauldron/ladder] ladder config must contain a non-empty "tiers" array');
@@ -75,4 +89,23 @@ export function loadLadder(configPath?: string): LadderTier[] {
     isFrontier: t.isFrontier,
     costPerRunUsd: t.costPerRunUsdEstimate ?? null,
   }));
+}
+
+/**
+ * Load the refused/dark tier names from the canonical ladder SOR.
+ *
+ * Missing or empty refusedTiers returns [] (backward compatible).
+ * Callers must refuse these names as cascade entry even under --entry override.
+ *
+ * @param configPath Optional path override; defaults to config/ladder.config.json
+ *                   relative to this file's directory.
+ */
+export function loadRefusedTiers(configPath?: string): string[] {
+  const config = readLadderConfig(configPath);
+  if (!Array.isArray(config.refusedTiers)) {
+    return [];
+  }
+  return config.refusedTiers.filter(
+    (name): name is string => typeof name === 'string' && name.length > 0
+  );
 }
