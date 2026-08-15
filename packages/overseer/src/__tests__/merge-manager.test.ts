@@ -1,5 +1,9 @@
 import { describe, expect, mock, test } from 'bun:test';
-import { createMergeManager } from '../merge-manager.ts';
+import {
+  createMergeManager,
+  resolveMergeManagerMode,
+  DEFAULT_MERGE_MANAGER_MODE,
+} from '../merge-manager.ts';
 import type { QualifiedMergeEvidence } from '../actions/merge-ready.ts';
 import type { GrokDispositionReceipt, WatchedRunRecord } from '../types.ts';
 
@@ -80,19 +84,40 @@ function approveReceipt(
   };
 }
 
+describe('merge manager mode resolution', () => {
+  test('unset / empty / unknown values fail closed to hold-canary', () => {
+    expect(resolveMergeManagerMode(undefined)).toBe(DEFAULT_MERGE_MANAGER_MODE);
+    expect(resolveMergeManagerMode('')).toBe('hold-canary');
+    expect(resolveMergeManagerMode('   ')).toBe('hold-canary');
+    expect(resolveMergeManagerMode('soft-merge')).toBe('hold-canary');
+    expect(resolveMergeManagerMode('not-a-mode')).toBe('hold-canary');
+  });
+
+  test('accepts hold-canary, comment_findings, execute and hyphen alias', () => {
+    expect(resolveMergeManagerMode('hold-canary')).toBe('hold-canary');
+    expect(resolveMergeManagerMode('hold_canary')).toBe('hold-canary');
+    expect(resolveMergeManagerMode('comment_findings')).toBe('comment_findings');
+    expect(resolveMergeManagerMode('comment-findings')).toBe('comment_findings');
+    expect(resolveMergeManagerMode('execute')).toBe('execute');
+    expect(resolveMergeManagerMode('EXECUTE')).toBe('execute');
+  });
+});
+
 describe('merge manager', () => {
   test('staging and dev-effect merge candidates are judged, executed, and recorded', async () => {
     const assembled = evidence({ resulting_deployment_effect: 'none' });
     const insertOverseerAction = mock(async () => undefined);
     const judge = mock(async input => approveReceipt(input));
     const execute = mock(async () => ({ merged: true, message: 'fake_merge_accepted' }));
+    const mergePullRequest = mock(async () => ({ merged: false }));
     const manager = createMergeManager({
+      mode: 'execute',
       assembleEvidence: async () => ({ evidence: assembled, evidenceDigest: 'c'.repeat(64) }),
       judge,
       execute,
       insertOverseerAction,
       findPullRequest: async () => record.prEvidence,
-      mergePullRequest: async () => ({ merged: false }),
+      mergePullRequest,
       readWorktreeHeadSha,
     });
 
@@ -101,16 +126,201 @@ describe('merge manager', () => {
     expect(result.status).toBe('executed');
     expect(judge).toHaveBeenCalledTimes(1);
     expect(execute).toHaveBeenCalledWith(assembled);
+    expect(mergePullRequest).not.toHaveBeenCalled();
     expect(insertOverseerAction).toHaveBeenCalledWith(
       expect.objectContaining({ action: 'merged', result: 'fake_merge_accepted' })
     );
+  });
+
+  test('hold-canary + judge approve logs would_comment/would_merge and never merges', async () => {
+    const assembled = evidence({ resulting_deployment_effect: 'none' });
+    const digest = 'c'.repeat(64);
+    const insertOverseerAction = mock(async () => undefined);
+    const execute = mock(async () => ({ merged: true, message: 'should_not_run' }));
+    const mergePullRequest = mock(async () => ({ merged: true }));
+    const commentOnPullRequest = mock(async () => ({ commented: true }));
+    const manager = createMergeManager({
+      mode: 'hold-canary',
+      assembleEvidence: async () => ({ evidence: assembled, evidenceDigest: digest }),
+      judge: async input => approveReceipt(input),
+      execute,
+      insertOverseerAction,
+      findPullRequest: async () => record.prEvidence,
+      mergePullRequest,
+      commentOnPullRequest,
+      readWorktreeHeadSha,
+    });
+
+    const result = await manager(record);
+
+    expect(result).toMatchObject({
+      status: 'held',
+      reason: 'hold_canary',
+      execution: null,
+      mode: 'hold-canary',
+    });
+    expect(execute).not.toHaveBeenCalled();
+    expect(mergePullRequest).not.toHaveBeenCalled();
+    expect(commentOnPullRequest).not.toHaveBeenCalled();
+
+    const actions = insertOverseerAction.mock.calls.map(
+      call => call[0] as { action: string; result: string }
+    );
+    expect(actions.some(a => a.action === 'would_comment')).toBe(true);
+    expect(actions.some(a => a.action === 'would_merge')).toBe(true);
+    const wouldMerge = actions.find(a => a.action === 'would_merge');
+    expect(wouldMerge?.result).toContain(record.runId);
+    expect(wouldMerge?.result).toContain(record.woId);
+    expect(wouldMerge?.result).toContain(String(assembled.pr_number));
+    expect(wouldMerge?.result).toContain(assembled.head_sha);
+    expect(wouldMerge?.result).toContain(digest);
+    expect(wouldMerge?.result).toContain('hold_canary');
+  });
+
+  test('default mode is hold-canary so approve never merges without explicit execute', async () => {
+    const insertOverseerAction = mock(async () => undefined);
+    const execute = mock(async () => ({ merged: true }));
+    const mergePullRequest = mock(async () => ({ merged: true }));
+    const manager = createMergeManager({
+      assembleEvidence: async () => ({
+        evidence: evidence({ resulting_deployment_effect: 'none' }),
+        evidenceDigest: 'c'.repeat(64),
+      }),
+      judge: async input => approveReceipt(input),
+      execute,
+      insertOverseerAction,
+      findPullRequest: async () => record.prEvidence,
+      mergePullRequest,
+      readWorktreeHeadSha,
+    });
+
+    const result = await manager(record);
+
+    expect(result.status).toBe('held');
+    expect(result.reason).toBe('hold_canary');
+    expect(execute).not.toHaveBeenCalled();
+    expect(mergePullRequest).not.toHaveBeenCalled();
+  });
+
+  test('comment_findings + judge approve posts one comment and never merges', async () => {
+    const assembled = evidence({ resulting_deployment_effect: 'none' });
+    const digest = 'f'.repeat(64);
+    const insertOverseerAction = mock(async () => undefined);
+    const execute = mock(async () => ({ merged: true }));
+    const mergePullRequest = mock(async () => ({ merged: true }));
+    const commentOnPullRequest = mock(async () => ({
+      commented: true,
+      url: 'https://example.test/comment/1',
+    }));
+    const manager = createMergeManager({
+      mode: 'comment_findings',
+      assembleEvidence: async () => ({ evidence: assembled, evidenceDigest: digest }),
+      judge: async input => approveReceipt(input),
+      execute,
+      insertOverseerAction,
+      findPullRequest: async () => record.prEvidence,
+      mergePullRequest,
+      commentOnPullRequest,
+      readWorktreeHeadSha,
+    });
+
+    const result = await manager(record);
+
+    expect(result).toMatchObject({
+      status: 'held',
+      reason: 'comment_findings_merge_hard_off',
+      execution: null,
+      mode: 'comment_findings',
+    });
+    expect(execute).not.toHaveBeenCalled();
+    expect(mergePullRequest).not.toHaveBeenCalled();
+    expect(commentOnPullRequest).toHaveBeenCalledTimes(1);
+    const commentInput = commentOnPullRequest.mock.calls[0]?.[0] as {
+      owner: string;
+      repo: string;
+      number: number;
+      body: string;
+    };
+    expect(commentInput.owner).toBe(assembled.owner);
+    expect(commentInput.repo).toBe(assembled.repository);
+    expect(commentInput.number).toBe(assembled.pr_number);
+    expect(commentInput.body).toContain(`runId=${record.runId}`);
+    expect(commentInput.body).toContain(`woId=${record.woId}`);
+    expect(commentInput.body).toContain(`headSha=${assembled.head_sha}`);
+    expect(commentInput.body).toContain('mode=comment_findings');
+    expect(commentInput.body).toContain('merge=hard_off');
+    expect(insertOverseerAction).toHaveBeenCalledWith(
+      expect.objectContaining({ action: 'comment_findings' })
+    );
+  });
+
+  test('comment_findings without comment channel records unavailable and never merges', async () => {
+    const insertOverseerAction = mock(async () => undefined);
+    const execute = mock(async () => ({ merged: true }));
+    const mergePullRequest = mock(async () => ({ merged: true }));
+    const manager = createMergeManager({
+      mode: 'comment_findings',
+      assembleEvidence: async () => ({
+        evidence: evidence({ resulting_deployment_effect: 'none' }),
+        evidenceDigest: 'd'.repeat(64),
+      }),
+      judge: async input => approveReceipt(input),
+      execute,
+      insertOverseerAction,
+      findPullRequest: async () => record.prEvidence,
+      mergePullRequest,
+      readWorktreeHeadSha,
+    });
+
+    const result = await manager(record);
+
+    expect(result).toMatchObject({
+      status: 'held',
+      reason: 'comment_channel_unavailable',
+      execution: null,
+    });
+    expect(execute).not.toHaveBeenCalled();
+    expect(mergePullRequest).not.toHaveBeenCalled();
+    expect(insertOverseerAction).toHaveBeenCalledWith(
+      expect.objectContaining({ action: 'comment_channel_unavailable' })
+    );
+  });
+
+  test('unknown mode fails closed to hold-canary and never merges', async () => {
+    const execute = mock(async () => ({ merged: true }));
+    const mergePullRequest = mock(async () => ({ merged: true }));
+    const commentOnPullRequest = mock(async () => ({ commented: true }));
+    const insertOverseerAction = mock(async () => undefined);
+    const manager = createMergeManager({
+      mode: 'soft-merge-please',
+      assembleEvidence: async () => ({
+        evidence: evidence({ resulting_deployment_effect: 'none' }),
+        evidenceDigest: 'e'.repeat(64),
+      }),
+      judge: async input => approveReceipt(input),
+      execute,
+      insertOverseerAction,
+      findPullRequest: async () => record.prEvidence,
+      mergePullRequest,
+      commentOnPullRequest,
+      readWorktreeHeadSha,
+    });
+
+    const result = await manager(record);
+
+    expect(result).toMatchObject({ status: 'held', reason: 'hold_canary', mode: 'hold-canary' });
+    expect(execute).not.toHaveBeenCalled();
+    expect(mergePullRequest).not.toHaveBeenCalled();
+    expect(commentOnPullRequest).not.toHaveBeenCalled();
   });
 
   test('production-effect merge candidates are held for John and never executed', async () => {
     const insertOverseerAction = mock(async () => undefined);
     const judge = mock(async input => approveReceipt(input));
     const execute = mock(async () => ({ merged: true }));
+    const commentOnPullRequest = mock(async () => ({ commented: true }));
     const manager = createMergeManager({
+      mode: 'comment_findings',
       assembleEvidence: async () => ({
         evidence: evidence({ resulting_deployment_effect: 'production' }),
         evidenceDigest: 'd'.repeat(64),
@@ -120,6 +330,7 @@ describe('merge manager', () => {
       insertOverseerAction,
       findPullRequest: async () => record.prEvidence,
       mergePullRequest: async () => ({ merged: false }),
+      commentOnPullRequest,
       readWorktreeHeadSha,
     });
 
@@ -132,6 +343,7 @@ describe('merge manager', () => {
     });
     expect(judge).not.toHaveBeenCalled();
     expect(execute).not.toHaveBeenCalled();
+    expect(commentOnPullRequest).not.toHaveBeenCalled();
     expect(insertOverseerAction).toHaveBeenCalledWith(
       expect.objectContaining({
         action: 'merge_denied',
@@ -155,6 +367,7 @@ describe('merge manager', () => {
     const judge = mock(async input => approveReceipt(input));
     const execute = mock(async () => ({ merged: true }));
     const manager = createMergeManager({
+      mode: 'execute',
       judge,
       execute,
       insertOverseerAction,
@@ -192,6 +405,7 @@ describe('merge manager', () => {
     const insertOverseerAction = mock(async () => undefined);
     const execute = mock(async () => ({ merged: true, message: 'other_repo_merged' }));
     const manager = createMergeManager({
+      mode: 'execute',
       assembleEvidence: async () => ({
         evidence: evidence({
           record: otherRecord,
@@ -215,6 +429,42 @@ describe('merge manager', () => {
     expect(execute).toHaveBeenCalledTimes(1);
     expect(insertOverseerAction).toHaveBeenCalledWith(
       expect.objectContaining({ action: 'merged', result: 'other_repo_merged' })
+    );
+  });
+
+  test('provenance hold short-circuits before comment/merge in all modes', async () => {
+    const execute = mock(async () => ({ merged: true }));
+    const mergePullRequest = mock(async () => ({ merged: true }));
+    const commentOnPullRequest = mock(async () => ({ commented: true }));
+    const insertOverseerAction = mock(async () => undefined);
+    const manager = createMergeManager({
+      mode: 'comment_findings',
+      assembleEvidence: async () => ({
+        evidence: evidence({ resulting_deployment_effect: 'none' }),
+        evidenceDigest: 'a'.repeat(64),
+      }),
+      judge: async input => approveReceipt(input),
+      execute,
+      insertOverseerAction,
+      findPullRequest: async () => record.prEvidence,
+      mergePullRequest,
+      commentOnPullRequest,
+      // Worktree tip does not match PR head -- association proof fails.
+      readWorktreeHeadSha: async () => '9'.repeat(40),
+    });
+
+    const result = await manager(record);
+
+    expect(result.status).toBe('held');
+    expect(result.reason).toBe('provenance_head_sha_mismatch');
+    expect(execute).not.toHaveBeenCalled();
+    expect(mergePullRequest).not.toHaveBeenCalled();
+    expect(commentOnPullRequest).not.toHaveBeenCalled();
+    expect(insertOverseerAction).toHaveBeenCalledWith(
+      expect.objectContaining({
+        action: 'merge_denied',
+        result: 'provenance_head_sha_mismatch',
+      })
     );
   });
 });
