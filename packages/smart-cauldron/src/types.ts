@@ -5,7 +5,7 @@
  * WO: WO-HARNESS-SMART-CAULDRON-V1-PER-RUN-CASCADE-01
  */
 
-export type TierName = string; // e.g. "glm", "codex", "claude", "frontier"
+export type TierName = string; // e.g. "zero", "qwen", "codex", "claude", "frontier"
 
 export type TierOutcome =
   | 'running' // attempt intent persisted before the workflow lane is fired
@@ -17,7 +17,7 @@ export type TierOutcome =
 
 export interface LadderTier {
   name: TierName;
-  workflowName: string; // e.g. "bdc-feature-development-glm"
+  workflowName: string; // e.g. "bdc-feature-development-codex"
   isFrontier: boolean; // true = top rung; gate-fail here = BLOCKED
   costPerRunUsd: number | null; // null = unknown; populated from run metadata post-hoc
 }
