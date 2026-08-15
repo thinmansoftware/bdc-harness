@@ -243,7 +243,7 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
   if (refusedTiers.includes(entryTierName)) {
     throw new Error(
       `[smart-cauldron/cascade] Refused dark/retired entry tier "${entryTierName}". ` +
-        `This lane is listed in refusedTiers and cannot be selected as a live entry point. ` +
+        'This lane is listed in refusedTiers and cannot be selected as a live entry point. ' +
         `Canonical ladder: ${tiers.map(t => t.name).join(' -> ')}. ` +
         `Refused: ${refusedTiers.join(', ')}`
     );
