@@ -1,0 +1,136 @@
+{
+  "schema_version": "capability-census-slice1-v1",
+  "read_only": true,
+  "capabilities": [
+    {
+      "capability_id": "overseer.escalation",
+      "tier": 0,
+      "live_flag_state": "on",
+      "owner": "packages/overseer",
+      "deferral_expiry": null,
+      "flags": {
+        "OVERSEER_ENABLED": true,
+        "OVERSEER_EMERGENCY_STOP": false,
+        "OVERSEER_DRY_RUN": false,
+        "OVERSEER_ESCALATION_ACTIONS_ENABLED": true
+      }
+    },
+    {
+      "capability_id": "overseer.repair",
+      "tier": 1,
+      "live_flag_state": "on",
+      "owner": "packages/overseer",
+      "deferral_expiry": null,
+      "flags": {
+        "OVERSEER_ENABLED": true,
+        "OVERSEER_EMERGENCY_STOP": false,
+        "OVERSEER_DRY_RUN": false,
+        "OVERSEER_REPAIR_ACTIONS_ENABLED": true
+      }
+    },
+    {
+      "capability_id": "overseer.branch",
+      "tier": 1,
+      "live_flag_state": "on",
+      "owner": "packages/overseer",
+      "deferral_expiry": null,
+      "flags": {
+        "OVERSEER_ENABLED": true,
+        "OVERSEER_EMERGENCY_STOP": false,
+        "OVERSEER_DRY_RUN": false,
+        "OVERSEER_BRANCH_ACTIONS_ENABLED": true
+      }
+    },
+    {
+      "capability_id": "overseer.lifecycle",
+      "tier": 1,
+      "live_flag_state": "on",
+      "owner": "packages/overseer",
+      "deferral_expiry": null,
+      "flags": {
+        "OVERSEER_ENABLED": true,
+        "OVERSEER_EMERGENCY_STOP": false,
+        "OVERSEER_DRY_RUN": false,
+        "OVERSEER_LIFECYCLE_ACTIONS_ENABLED": true
+      }
+    },
+    {
+      "capability_id": "overseer.merge",
+      "tier": 1,
+      "live_flag_state": "on",
+      "owner": "packages/overseer",
+      "deferral_expiry": null,
+      "flags": {
+        "OVERSEER_ENABLED": true,
+        "OVERSEER_EMERGENCY_STOP": false,
+        "OVERSEER_DRY_RUN": false,
+        "OVERSEER_MERGE_ACTIONS_ENABLED": true
+      }
+    },
+    {
+      "capability_id": "merge-manager.overseer-merge-manager-v1",
+      "tier": 1,
+      "live_flag_state": "on",
+      "owner": "packages/overseer",
+      "deferral_expiry": null,
+      "flags": {
+        "OVERSEER_ENABLED": true,
+        "OVERSEER_EMERGENCY_STOP": false,
+        "OVERSEER_DRY_RUN": false,
+        "OVERSEER_MERGE_ACTIONS_ENABLED": true
+      }
+    },
+    {
+      "capability_id": "taskmaster.deliver_ruling",
+      "tier": 0,
+      "live_flag_state": "on",
+      "owner": "packages/server/src/taskmaster",
+      "deferral_expiry": null,
+      "flags": {
+        "TASKMASTER_INTERVAL_MS": "3600000",
+        "TASKMASTER_DEADMAN_INTERVAL_MS": null,
+        "TASKMASTER_GH_REPOS": null,
+        "allowed_recipients": "xo,major-build,captain-ci,operator"
+      }
+    },
+    {
+      "capability_id": "taskmaster.nudge",
+      "tier": 0,
+      "live_flag_state": "on",
+      "owner": "packages/server/src/taskmaster",
+      "deferral_expiry": null,
+      "flags": {
+        "TASKMASTER_INTERVAL_MS": "3600000",
+        "TASKMASTER_DEADMAN_INTERVAL_MS": null,
+        "TASKMASTER_GH_REPOS": null,
+        "allowed_recipients": "xo,major-build,captain-ci,operator"
+      }
+    },
+    {
+      "capability_id": "taskmaster.escalate_p0",
+      "tier": 0,
+      "live_flag_state": "on",
+      "owner": "packages/server/src/taskmaster",
+      "deferral_expiry": null,
+      "flags": {
+        "TASKMASTER_INTERVAL_MS": "3600000",
+        "TASKMASTER_DEADMAN_INTERVAL_MS": null,
+        "TASKMASTER_GH_REPOS": null,
+        "allowed_recipients": "xo,major-build,captain-ci,operator"
+      }
+    },
+    {
+      "capability_id": "taskmaster.digest",
+      "tier": 0,
+      "live_flag_state": "on",
+      "owner": "packages/server/src/taskmaster",
+      "deferral_expiry": null,
+      "flags": {
+        "TASKMASTER_INTERVAL_MS": "3600000",
+        "TASKMASTER_DEADMAN_INTERVAL_MS": null,
+        "TASKMASTER_GH_REPOS": null,
+        "allowed_recipients": "xo,major-build,captain-ci,operator"
+      }
+    }
+  ]
+}
