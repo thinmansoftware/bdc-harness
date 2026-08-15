@@ -54,7 +54,8 @@ export interface MergeManagerDeps extends OverseerActionsDeps, GitHubClientDeps 
    * Explicit Merge Manager mode. When set, overrides OVERSEER_MERGE_MANAGER_MODE.
    * Unset/unknown env values fail closed to hold-canary (no GitHub write).
    */
-  readonly mode?: MergeManagerMode | string;
+  /** Explicit mode override for tests/DI. Unknown values fail closed via resolveMergeManagerMode. */
+  readonly mode?: string;
 }
 
 export type MergeManagerResult =
@@ -369,7 +370,7 @@ export function createMergeManager(
       defaultExecute(deps, evidence));
   // deps.mode wins for tests/DI; else env; else hold-canary (fail closed).
   const mode = resolveMergeManagerMode(
-    deps.mode !== undefined ? String(deps.mode) : process.env[MERGE_MANAGER_MODE_ENV]
+    deps.mode !== undefined ? deps.mode : process.env[MERGE_MANAGER_MODE_ENV]
   );
 
   return async (record: WatchedRunRecord): Promise<MergeManagerResult> => {
@@ -473,7 +474,12 @@ export function createMergeManager(
       );
       if (!deps.commentOnPullRequest) {
         log.warn(association, 'merge_manager.comment_channel_unavailable');
-        await recordManagerAction(deps, record, 'comment_channel_unavailable', JSON.stringify(association));
+        await recordManagerAction(
+          deps,
+          record,
+          'comment_channel_unavailable',
+          JSON.stringify(association)
+        );
         return {
           status: 'held',
           receipt,
