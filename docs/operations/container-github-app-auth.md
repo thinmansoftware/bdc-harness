@@ -61,9 +61,14 @@ NOT duplicated into this repo.
 > Note: an installation token returning "Resource not accessible by integration"
 > from `GET /user` is expected -- Apps are not users. Do not treat it as a failure.
 
-## Container env vars (three new, all optional)
+## Merge Manager required container env vars
 
-Add to `/opt/bdc/archon/.env` for `archon-app-1`. Provide the private key by
+Merge Manager and every Overseer GitHub client use the shared App-aware Octokit
+constructor. Before enabling soft merge, `archon-app-1` must receive
+`GITHUB_APP_ID`, `GITHUB_APP_INSTALLATION_ID`, and at least one of
+`GITHUB_APP_PRIVATE_KEY` or `GITHUB_APP_PRIVATE_KEY_PATH`. `docker-compose.yml`
+passes all four names through from `/opt/bdc/archon/.env`; it contains no secret
+values. Provide the private key by
 **either** inline contents **or** a mounted file path (inline wins if both set):
 
 ```
@@ -76,7 +81,11 @@ GITHUB_APP_PRIVATE_KEY_PATH=/opt/bdc/archon/secrets/thinman-overseer-app.private
 # GITHUB_APP_PRIVATE_KEY=-----BEGIN RSA PRIVATE KEY-----\n...\n-----END RSA PRIVATE KEY-----\n
 ```
 
-When all three App vars are unset, Overseer uses the existing PAT path unchanged.
+The PAT variables `GH_TOKEN` and `GITHUB_TOKEN` remain available to git and `gh`
+workflows, but are off the Merge Manager / Overseer GitHub path whenever the App
+variables are configured. A partial or broken App configuration fails loudly and
+never downgrades that path to the PAT. The all-App-vars-absent PAT fallback is for
+pre-activation compatibility only and must not be used when soft merge is enabled.
 
 ## Mounting the PEM (Option A, recommended)
 
@@ -85,7 +94,9 @@ The private key must never be committed to git and must never appear in
 
 1. Place the PEM on the host outside any git repo, e.g.
    `/opt/bdc/archon/secrets/thinman-overseer-app.private-key.pem`, mode `0600`.
-2. In `docker-compose.yml`, add a read-only bind mount for the app service:
+2. The committed `docker-compose.yml` mounts `${GITHUB_APP_SECRETS_DIR:-./secrets}`
+   read-only at `/opt/bdc/archon/secrets`. The production default resolves to
+   `/opt/bdc/archon/secrets` because Compose runs from `/opt/bdc/archon`:
    ```yaml
    volumes:
      - /opt/bdc/archon/secrets:/opt/bdc/archon/secrets:ro
