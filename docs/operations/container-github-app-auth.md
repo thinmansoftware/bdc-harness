@@ -113,8 +113,16 @@ same App-preferred chain described above (`resolveGitHubAppAuth` ->
 (`packages/overseer/src/service.ts`). No merge-path code change is needed to use
 the App identity; the wiring already routes real-mode GitHub calls through it.
 
-**Env vars Merge Manager requires** (set in `/opt/bdc/archon/.env` for
-`archon-app-1`):
+**Startup wiring lives in git; only the secret VALUES are operator-supplied.**
+The `app` service in `docker-compose.yml` (and `docker-compose.staging.yml`)
+passes these vars into the container `environment:` explicitly via `${VAR:-}`
+interpolation -- the same pattern used for `GH_TOKEN` -- so they are present in
+the container startup environment and visible to bash subprocesses, not only the
+app process. The compose file NEVER holds a literal: the operator sets the values
+in the gitignored `.env` (`/opt/bdc/archon/.env` for `archon-app-1`). Option A
+(mounted PEM) additionally uses the commented `:ro` volume + a host path in `.env`.
+
+**Env vars Merge Manager requires** (wired in compose, valued in `.env`):
 
 | Var | Required | Notes |
 |-----|----------|-------|

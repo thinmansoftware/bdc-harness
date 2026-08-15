@@ -38,6 +38,14 @@ services:
       # (GH_TOKEN). Values come from .env.staging (gitignored) -- never literals here.
       GITHUB_TOKEN: ${GITHUB_TOKEN:-}
       GH_TOKEN: ${GH_TOKEN:-${GITHUB_TOKEN:-}}
+      # WO-HARNESS-MM-THINMAN-APP-WIRE-01 (#1575): same Thinman Overseer GitHub App
+      # passthrough as prod compose so staging exercises the identical startup
+      # wiring. Values come from .env.staging (gitignored) -- never literals here;
+      # empty defaults are harmless (overseer falls back to the PAT path).
+      GITHUB_APP_ID: ${GITHUB_APP_ID:-}
+      GITHUB_APP_INSTALLATION_ID: ${GITHUB_APP_INSTALLATION_ID:-}
+      GITHUB_APP_PRIVATE_KEY: ${GITHUB_APP_PRIVATE_KEY:-}
+      GITHUB_APP_PRIVATE_KEY_PATH: ${GITHUB_APP_PRIVATE_KEY_PATH:-}
     ports:
       # localhost-only bind -- staging must never be reachable off the laptop.
       - "127.0.0.1:3091:3091"

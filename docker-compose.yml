@@ -62,11 +62,32 @@ services:
       # gitignored) or the host shell env. See docs/operations/container-github-auth.md.
       GITHUB_TOKEN: ${GITHUB_TOKEN:-}
       GH_TOKEN: ${GH_TOKEN:-${GITHUB_TOKEN:-}}
+      # WO-HARNESS-MM-THINMAN-APP-WIRE-01 (#1575): Thinman Overseer GitHub App
+      # credentials for the Merge Manager / overseer real-mode GitHub client.
+      # When all of ID + INSTALLATION_ID + a valid PEM resolve, overseer GitHub
+      # calls mint an installation token (thinman-overseer[bot]) instead of the
+      # admin PAT above; a partial config fails loudly and NEVER downgrades to the
+      # PAT. Wired explicitly here (like GH_TOKEN) -- not only via env_file -- so
+      # the vars are present in the container startup environment and visible to
+      # bash subprocesses, not just the app process. Provide the key by EITHER
+      # GITHUB_APP_PRIVATE_KEY (inline PEM; no mount needed) OR
+      # GITHUB_APP_PRIVATE_KEY_PATH pointing at a mounted file (see optional volume
+      # below). NEVER a literal here: values come from .env (gitignored). See
+      # docs/operations/container-github-app-auth.md.
+      GITHUB_APP_ID: ${GITHUB_APP_ID:-}
+      GITHUB_APP_INSTALLATION_ID: ${GITHUB_APP_INSTALLATION_ID:-}
+      GITHUB_APP_PRIVATE_KEY: ${GITHUB_APP_PRIVATE_KEY:-}
+      GITHUB_APP_PRIVATE_KEY_PATH: ${GITHUB_APP_PRIVATE_KEY_PATH:-}
     ports:
       - "${PORT:-3000}:${PORT:-3000}"
     volumes:
       - ${ARCHON_DATA:-archon_data}:/.archon
       - ${ARCHON_USER_HOME:-archon_user_home}:/home/appuser
+      # Optional (Option A -- mounted PEM). Uncomment and set
+      # GITHUB_APP_PRIVATE_KEY_HOST_PATH in .env to mount the App private key as a
+      # read-only file, then set GITHUB_APP_PRIVATE_KEY_PATH=/run/secrets/thinman-overseer.pem
+      # (keeps the key out of `docker compose config` output and process env).
+      # - ${GITHUB_APP_PRIVATE_KEY_HOST_PATH:-/dev/null}:/run/secrets/thinman-overseer.pem:ro
       # WO-168 Tier 1: host-persistent artifact mount. Load-bearing workflow
       # nodes (bdc-author-wo-batch commit-and-push, etc.) write a git bundle +
       # raw artifacts here BEFORE attempting remote push, so worktree prune /
