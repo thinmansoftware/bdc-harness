@@ -168,6 +168,14 @@ import {
 } from '@archon/core/utils/board-motion-pointer';
 import { assessDispatchMessageBody } from '@archon/core/utils/dispatch-content-guard';
 import { authenticateDispatchWorkerCredential } from '../auth/dispatch-worker-credential';
+import {
+  DispatchNonSystemCapability,
+  DispatchPrincipalAuthError,
+  type DispatchSenderAuthMode,
+} from '../auth/dispatch-principal';
+import { createLogger as createDispatchRouteLogger } from '@archon/paths';
+
+const dispatchSenderAuthLog = createDispatchRouteLogger('dispatch/sender-auth');
 import { getOverseerRuntimeStatus } from '../overseer-runtime';
 import { listOverseerCapabilityStates } from '@archon/core/db/overseer-capabilities';
 import {
@@ -645,6 +653,8 @@ const createDispatchMessageRoute = createRoute({
       description: 'Dispatch message',
     },
     400: jsonError('Bad request'),
+    401: jsonError('Dispatch or board principal rejected'),
+    403: jsonError('Dispatch or board principal forbidden'),
     500: jsonError('Server error'),
   },
 });
@@ -815,6 +825,8 @@ const supersedeDispatchMessageRoute = createRoute({
       content: { 'application/json': { schema: dispatchMessageSchema } },
       description: 'Replacement dispatch message',
     },
+    401: jsonError('Dispatch principal rejected'),
+    403: jsonError('Dispatch principal forbidden'),
     404: jsonError('Not found'),
     409: jsonError('Dispatch message cannot be superseded'),
     500: jsonError('Server error'),
@@ -894,6 +906,8 @@ const createExecutionHandoffRoute = createRoute({
       description: 'Queued execution handoff',
     },
     400: jsonError('Bad request'),
+    401: jsonError('Dispatch principal rejected'),
+    403: jsonError('Dispatch principal forbidden'),
     500: jsonError('Server error'),
   },
 });
@@ -2341,6 +2355,46 @@ export function registerApiRoutes(
     return error instanceof Error && error.message.startsWith('board_principal_auth_');
   }
 
+  function resolveDispatchHttpSenderContext(
+    c: Context,
+    requestedSender: string
+  ): {
+    context: dispatchDb.DispatchSenderContext;
+    mode: DispatchSenderAuthMode;
+  } {
+    const principalId = c.req.header('x-dispatch-principal-id');
+    const principalToken = c.req.header('x-dispatch-principal-token');
+    const result = DispatchNonSystemCapability.fromHttpRequest({
+      principal_id: principalId,
+      token: principalToken,
+      requested_sender: requestedSender,
+    });
+    if (result.warnLegacy) {
+      dispatchSenderAuthLog.warn(
+        {
+          mode: result.mode,
+          path: c.req.path,
+          failureClass: 'legacy_unauthenticated_sender',
+        },
+        'dispatch_sender_auth_legacy_warn'
+      );
+    }
+    return {
+      context: result.capability,
+      mode: result.mode,
+    };
+  }
+
+  function mapDispatchPrincipalAuthError(c: Context, error: unknown): Response | null {
+    if (error instanceof DispatchPrincipalAuthError) {
+      return apiError(c, error.httpStatus, error.code);
+    }
+    if (error instanceof Error && error.message === 'dispatch_sender_auth_mode_invalid') {
+      return apiError(c, 500, 'dispatch_sender_auth_mode_invalid');
+    }
+    return null;
+  }
+
   function boardPrincipalProofFromHeaders(c: Context): boardAuthorityDb.BoardPrincipalProof {
     return { principal_token: c.req.header('x-board-principal-token')?.trim() };
   }
@@ -3690,22 +3744,19 @@ export function registerApiRoutes(
       }
       const canonicalBody = { ...body, recipient: body.recipient.trim().toLowerCase() };
       if (canonicalBody.task_type === 'board_motion') {
-        const principal = await boardAuthorityDb.authenticateBoardPrincipal(
-          boardPrincipalProofFromHeaders(c)
-        );
-        if (!principal.roles.includes('motion_notifier') || principal.seat_id === 'john') {
-          return apiError(c, 403, 'board_motion_notifier_required');
-        }
+        const { capability, principal } = await DispatchNonSystemCapability.fromBoardProof({
+          proof: boardPrincipalProofFromHeaders(c),
+          purpose: 'motion_notification',
+        });
         const pointer = await validateBoardMotionPointer(parseDispatchJsonBody(body.body));
         const canonicalMotionBody = JSON.stringify(pointer.payload);
-        const message = await dispatchDb.createMessage({
+        const message = await dispatchDb.createAuthenticatedMessage(capability, {
           correlation_id: canonicalBody.correlation_id,
           idempotency_key: deriveBoardMotionNotificationKey({
             motion_id: pointer.payload.motion_id,
             motion_revision_sha: pointer.motion_revision_sha,
           }),
           task_type: 'board_motion',
-          sender: principal.principal_id,
           recipient: 'board',
           body: canonicalMotionBody,
           not_before: canonicalBody.not_before ?? null,
@@ -3730,26 +3781,29 @@ export function registerApiRoutes(
         return c.json(message);
       }
       if (canonicalBody.task_type === 'agent_message' && canonicalBody.recipient === 'board') {
-        const principal = await boardAuthorityDb.authenticateBoardPrincipal(
-          boardPrincipalProofFromHeaders(c)
-        );
-        if (!principal.roles.includes('petition_eligible') || principal.seat_id === 'john') {
-          return apiError(c, 403, 'board_petition_principal_required');
-        }
+        const { capability, principal } = await DispatchNonSystemCapability.fromBoardProof({
+          proof: boardPrincipalProofFromHeaders(c),
+          purpose: 'petition',
+        });
         const petitionBody = parseDispatchJsonBody(body.body);
         const petition = await validateBoardPetitionPointer(petitionBody);
-        const message = await dispatchDb.createMessage({
-          ...canonicalBody,
-          sender: principal.principal_id,
+        const message = await dispatchDb.createAuthenticatedMessage(capability, {
+          correlation_id: canonicalBody.correlation_id,
+          idempotency_key: canonicalBody.idempotency_key,
+          task_type: canonicalBody.task_type,
+          recipient: canonicalBody.recipient,
           body: JSON.stringify({
             motion_id: petition.motion_id,
             file_path: petition.file_path,
             requested_action: petition.requested_action,
           }),
           not_before: canonicalBody.not_before ?? null,
+          priority: canonicalBody.priority,
           recipient_alias: 'board',
           motion_id: petition.motion_id,
           motion_revision_sha: petition.motion_revision_sha,
+          subject_key: canonicalBody.subject_key,
+          repeat_reason: canonicalBody.repeat_reason,
         });
         await recordBoardPetitionDelivery({
           actor_principal_id: principal.principal_id,
@@ -3759,13 +3813,30 @@ export function registerApiRoutes(
         });
         return c.json(message);
       }
-      const message = await dispatchDb.createMessage({
-        ...canonicalBody,
+      const { context } = resolveDispatchHttpSenderContext(c, canonicalBody.sender);
+      const message = await dispatchDb.createAuthenticatedMessage(context, {
+        correlation_id: canonicalBody.correlation_id,
+        idempotency_key: canonicalBody.idempotency_key,
+        task_type: canonicalBody.task_type,
+        recipient: canonicalBody.recipient,
+        body: canonicalBody.body,
         not_before: canonicalBody.not_before ?? null,
+        priority: canonicalBody.priority,
+        subject_key: canonicalBody.subject_key,
+        repeat_reason: canonicalBody.repeat_reason,
       });
       return c.json(message);
     } catch (error) {
+      const authMapped = mapDispatchPrincipalAuthError(c, error);
+      if (authMapped) return authMapped;
       if (isBoardPrincipalAuthError(error)) return apiError(c, 401, (error as Error).message);
+      if (
+        error instanceof Error &&
+        (error.message === 'board_motion_notifier_required' ||
+          error.message === 'board_petition_principal_required')
+      ) {
+        return apiError(c, 403, error.message);
+      }
       if (error instanceof Error && error.message.startsWith('dispatch_json_body_invalid')) {
         return apiError(c, 400, error.message);
       }
@@ -3939,14 +4010,27 @@ export function registerApiRoutes(
   registerOpenApiRoute(supersedeDispatchMessageRoute, async c => {
     try {
       const body = getValidatedBody(c, supersedeDispatchMessageBodySchema);
+      const { context } = resolveDispatchHttpSenderContext(c, body.sender);
       const result = await dispatchDb.supersedeMessage({
         id: c.req.param('id') ?? '',
-        sender: body.sender,
-        replacement: body.replacement,
+        sender_context: context,
+        replacement: {
+          correlation_id: body.replacement.correlation_id,
+          idempotency_key: body.replacement.idempotency_key,
+          task_type: body.replacement.task_type,
+          recipient: body.replacement.recipient,
+          body: body.replacement.body,
+          not_before: body.replacement.not_before ?? null,
+          priority: body.replacement.priority,
+          subject_key: body.replacement.subject_key,
+          repeat_reason: body.replacement.repeat_reason,
+        },
       });
       if (!result.ok) return apiError(c, result.reason === 'not_found' ? 404 : 409, result.reason);
       return c.json(result.message);
     } catch (error) {
+      const authMapped = mapDispatchPrincipalAuthError(c, error);
+      if (authMapped) return authMapped;
       if (error instanceof Error && error.message === 'dispatch_supersede_lost_race')
         return apiError(c, 409, 'not_queued');
       getLog().error({ err: error }, 'dispatch_supersede_message_failed');
@@ -4046,16 +4130,24 @@ export function registerApiRoutes(
   registerOpenApiRoute(createExecutionHandoffRoute, async c => {
     try {
       const body = getValidatedBody(c, executionHandoffBodySchema);
-      const message = await dispatchDb.createMessage({
+      const principalId = c.req.header('x-dispatch-principal-id');
+      const principalToken = c.req.header('x-dispatch-principal-token');
+      const capability = DispatchNonSystemCapability.fromAuthenticatedRequest({
+        principal_id: principalId,
+        token: principalToken,
+        requested_sender: 'xo',
+      });
+      const message = await dispatchDb.createAuthenticatedMessage(capability, {
         correlation_id: body.correlation_id,
         idempotency_key: body.idempotency_key,
         task_type: 'run_report',
-        sender: 'xo',
         recipient: body.target,
         body: JSON.stringify({ kind: 'approved_execution_handoff', ...body }),
       });
       return c.json(message);
     } catch (error) {
+      const authMapped = mapDispatchPrincipalAuthError(c, error);
+      if (authMapped) return authMapped;
       if (error instanceof Error && error.message.includes('invalid')) {
         return apiError(c, 400, error.message);
       }

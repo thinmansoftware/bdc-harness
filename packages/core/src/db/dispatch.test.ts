@@ -3,14 +3,25 @@ import { existsSync, mkdtempSync, rmSync, unlinkSync } from 'fs';
 import { tmpdir } from 'os';
 import { join, resolve } from 'path';
 import { pathToFileURL } from 'url';
+import { createHash } from 'crypto';
 import { SqliteAdapter } from './adapters/sqlite';
+import { setBoardPrincipalResolverForTests } from './board-authority';
+import { DispatchNonSystemCapability } from './dispatch-sender-authority';
 
 let db: SqliteAdapter;
 let currentDbPath = '';
 const raceHomes: string[] = [];
+let getDatabaseCalls = 0;
+
+function setSenderAuthMode(mode: 'enforce'): void {
+  process.env.DISPATCH_SENDER_AUTH_MODE = mode;
+}
 
 mock.module('./connection', () => ({
-  getDatabase: () => db,
+  getDatabase: () => {
+    getDatabaseCalls += 1;
+    return db;
+  },
 }));
 
 import {
@@ -19,7 +30,7 @@ import {
   cancelMessage,
   claimDispatchEscalation,
   claimMessage,
-  createMessage,
+  createAuthenticatedMessage,
   evaluateWorkerStaleness,
   ensureXoEscalationHandoffs,
   getMessage,
@@ -29,13 +40,85 @@ import {
   listUnroutableQueuedMessages,
   listWorkers,
   postResult,
+  reconcileDispatchOutcomeNotices,
   registerWorker,
   releaseDispatchEscalationClaim,
   renewMessageLease,
   resolveDispatchRecipient,
   assessDispatchRecipient,
   normalizeDispatchSubjectKey,
+  supersedeMessage,
+  type CreateAuthenticatedMessageData,
+  type DispatchMessage,
 } from './dispatch';
+
+/** Test-local fixture constructor -- production path is createAuthenticatedMessage. */
+async function createMessage(
+  data: CreateAuthenticatedMessageData & { sender: string; sender_principal_id?: string | null }
+): Promise<DispatchMessage> {
+  if (data.sender_principal_id) {
+    return createAuthenticatedMessage(
+      testAuthenticatedCapability(data.sender_principal_id, data.sender),
+      data
+    );
+  }
+  return createAuthenticatedMessage(testLegacyCapability(data.sender), data);
+}
+
+function testAuthenticatedCapability(principalId: string, sender: string) {
+  const token = `test-token-${principalId}-${sender}`;
+  const priorRegistry = process.env.DISPATCH_PRINCIPALS_JSON;
+  const priorMode = process.env.DISPATCH_SENDER_AUTH_MODE;
+  try {
+    setSenderAuthMode('enforce');
+    process.env.DISPATCH_PRINCIPALS_JSON = JSON.stringify([
+      {
+        credential_id: `test-${principalId}-${sender}`,
+        principal_id: principalId,
+        token_sha256: createHash('sha256').update(token).digest('hex'),
+        status: 'active',
+        send_as: [sender],
+        receive_as: [sender],
+        roles: ['send', 'receive'],
+      },
+    ]);
+    return DispatchNonSystemCapability.fromAuthenticatedRequest({
+      principal_id: principalId,
+      token,
+      requested_sender: sender,
+    });
+  } finally {
+    if (priorRegistry === undefined) delete process.env.DISPATCH_PRINCIPALS_JSON;
+    else process.env.DISPATCH_PRINCIPALS_JSON = priorRegistry;
+    if (priorMode === undefined) delete process.env.DISPATCH_SENDER_AUTH_MODE;
+    else process.env.DISPATCH_SENDER_AUTH_MODE = priorMode;
+  }
+}
+
+function testLegacyCapability(sender: string) {
+  const priorRegistry = process.env.DISPATCH_PRINCIPALS_JSON;
+  const priorMode = process.env.DISPATCH_SENDER_AUTH_MODE;
+  try {
+    process.env.DISPATCH_SENDER_AUTH_MODE = 'off';
+    process.env.DISPATCH_PRINCIPALS_JSON = JSON.stringify([
+      {
+        credential_id: 'test-legacy-registry',
+        principal_id: 'test-legacy-principal',
+        token_sha256: '0'.repeat(64),
+        status: 'active',
+        send_as: ['claude'],
+        receive_as: [],
+        roles: ['send'],
+      },
+    ]);
+    return DispatchNonSystemCapability.fromHttpRequest({ requested_sender: sender }).capability;
+  } finally {
+    if (priorRegistry === undefined) delete process.env.DISPATCH_PRINCIPALS_JSON;
+    else process.env.DISPATCH_PRINCIPALS_JSON = priorRegistry;
+    if (priorMode === undefined) delete process.env.DISPATCH_SENDER_AUTH_MODE;
+    else process.env.DISPATCH_SENDER_AUTH_MODE = priorMode;
+  }
+}
 
 function cleanupDb(path: string): void {
   for (const suffix of ['', '-wal', '-shm']) {
@@ -153,6 +236,13 @@ async function makeSeparateProcessMailboxFixture(
 
 describe('dispatch db', () => {
   beforeEach(() => {
+    getDatabaseCalls = 0;
+    process.env.BUN_ENV = 'test';
+    setBoardPrincipalResolverForTests(async () => ({
+      principal_id: 'claude',
+      seat_id: 'xo',
+      roles: ['motion_notifier', 'petition_eligible'],
+    }));
     currentDbPath = join(
       import.meta.dir,
       `.test-dispatch-${Date.now()}-${Math.random().toString(36).slice(2)}.db`
@@ -161,6 +251,8 @@ describe('dispatch db', () => {
   });
 
   afterEach(async () => {
+    setBoardPrincipalResolverForTests(undefined);
+    delete process.env.BUN_ENV;
     await db.close();
     cleanupDb(currentDbPath);
     while (raceHomes.length > 0) {
@@ -194,25 +286,6 @@ describe('dispatch db', () => {
   });
 
   test('deduplicates legacy creates against Phase 1.5 partial indexes', async () => {
-    await db.query(
-      'CREATE TABLE agent_dispatch_messages_phase15 AS SELECT * FROM agent_dispatch_messages WHERE 0'
-    );
-    await db.query(
-      'ALTER TABLE agent_dispatch_messages_phase15 ADD COLUMN sender_principal_id TEXT'
-    );
-    await db.query('DROP TABLE agent_dispatch_messages');
-    await db.query('ALTER TABLE agent_dispatch_messages_phase15 RENAME TO agent_dispatch_messages');
-    await db.query(
-      `CREATE UNIQUE INDEX uq_dispatch_authenticated_fixture
-       ON agent_dispatch_messages(sender_principal_id, idempotency_key)
-       WHERE sender_principal_id IS NOT NULL`
-    );
-    await db.query(
-      `CREATE UNIQUE INDEX uq_dispatch_legacy_fixture
-       ON agent_dispatch_messages(idempotency_key)
-       WHERE sender_principal_id IS NULL`
-    );
-
     await db.query(
       `INSERT INTO agent_dispatch_messages
        (id, correlation_id, idempotency_key, task_type, sender, sender_principal_id,
@@ -1476,6 +1549,7 @@ describe('dispatch db', () => {
       idempotency_key: 'escalation-boundary',
       task_type: 'agent_message',
       sender: 'codex',
+      sender_principal_id: 'codex',
       recipient: 'xo',
       priority: 'blocker',
       body: 'bounded escalation payload',
@@ -1540,6 +1614,38 @@ describe('dispatch db', () => {
     ).toBeNull();
   });
 
+  test('legacy unauthenticated blockers never escalate', async () => {
+    const created = '2026-08-07T00:00:00.000Z';
+    const message = await createMessage({
+      correlation_id: 'corr-legacy-escalation',
+      idempotency_key: 'legacy-escalation',
+      task_type: 'agent_message',
+      sender: 'codex',
+      recipient: 'xo',
+      priority: 'blocker',
+      body: 'legacy escalation payload',
+    });
+    await db.query('UPDATE agent_dispatch_messages SET created_at = $2 WHERE id = $1', [
+      message.id,
+      created,
+    ]);
+    await db.query('UPDATE agent_dispatch_messages SET acknowledged_at = $2 WHERE id = $1', [
+      message.id,
+      '2026-08-07T01:00:00.000Z',
+    ]);
+    expect(message.sender_principal_id).toBeNull();
+    expect((await listEligibleXoEscalations(created)).map(item => item.id)).not.toContain(
+      message.id
+    );
+    expect(
+      await claimDispatchEscalation({
+        id: message.id,
+        leg: 'telegram',
+        now: '2026-08-07T05:00:00.000Z',
+      })
+    ).toBeNull();
+  });
+
   test('addressing suppresses both escalation legs even after acknowledgement', async () => {
     const created = '2026-08-07T00:00:00.000Z';
     const message = await createMessage({
@@ -1547,6 +1653,7 @@ describe('dispatch db', () => {
       idempotency_key: 'addressed-escalation',
       task_type: 'agent_message',
       sender: 'codex',
+      sender_principal_id: 'codex',
       recipient: 'xo',
       priority: 'blocker',
       body: 'addressed escalation payload',
@@ -1583,6 +1690,7 @@ describe('dispatch db', () => {
       idempotency_key: 'handoff-source',
       task_type: 'agent_message',
       sender: 'claude',
+      sender_principal_id: 'claude',
       recipient: 'codex',
       priority: 'blocker',
       body: 'handoff source',
@@ -1613,9 +1721,324 @@ describe('dispatch db', () => {
     const matching = handoffs.filter(item => item.idempotency_key === `xo-handoff:${source.id}`);
     expect(matching).toHaveLength(1);
     expect(matching[0]?.correlation_id).toBe(source.correlation_id);
+    expect(matching[0]?.sender_principal_id).toBe('system:dispatch');
     expect(matching[0]?.body).toBe(
       JSON.stringify({ source_id: source.id, kind: 'xo_escalation_handoff' })
     );
+  });
+
+  test('legacy unauthenticated blockers never create XO escalation handoffs', async () => {
+    const created = '2026-08-07T00:00:00.000Z';
+    const source = await createMessage({
+      correlation_id: 'corr-legacy-handoff',
+      idempotency_key: 'legacy-handoff-source',
+      task_type: 'agent_message',
+      sender: 'claude',
+      recipient: 'codex',
+      priority: 'blocker',
+      body: 'legacy handoff source',
+    });
+    expect(source.sender_principal_id).toBeNull();
+    await db.query(
+      'UPDATE agent_dispatch_messages SET created_at = $2, acknowledged_at = $3 WHERE id = $1',
+      [source.id, created, '2026-08-07T01:00:00.000Z']
+    );
+
+    expect(await ensureXoEscalationHandoffs(created)).toBe(0);
+    const handoffs = await listMessages({ recipient: 'xo', status: 'queued' });
+    expect(
+      handoffs.filter(item => item.idempotency_key === `xo-handoff:${source.id}`)
+    ).toHaveLength(0);
+  });
+
+  test('legacy unauthenticated outcomes never create authenticated blocker notices', async () => {
+    const created = '2026-08-07T00:00:00.000Z';
+    const source = await createMessage({
+      correlation_id: 'corr-legacy-outcome',
+      idempotency_key: 'legacy-outcome-source',
+      task_type: 'agent_message',
+      sender: 'xo',
+      recipient: 'codex',
+      priority: 'normal',
+      body: 'legacy outcome source',
+    });
+    expect(source.sender_principal_id).toBeNull();
+    await db.query(
+      `UPDATE agent_dispatch_messages
+       SET created_at = $2, status = 'failed', task_outcome = 'failed', completed_at = $3
+       WHERE id = $1`,
+      [source.id, created, '2026-08-07T01:00:00.000Z']
+    );
+
+    expect(await reconcileDispatchOutcomeNotices(created)).toBe(0);
+    const notices = await listMessages({ recipient: 'xo', status: 'queued' });
+    expect(
+      notices.filter(item => item.idempotency_key === `outcome-notice:${source.id}`)
+    ).toHaveLength(0);
+  });
+
+  test('sender-scoped idempotency isolates principals and preserves legacy null scope', async () => {
+    const a1 = await createAuthenticatedMessage(testAuthenticatedCapability('alice', 'claude'), {
+      correlation_id: 'c1',
+      idempotency_key: 'shared-key',
+      task_type: 'agent_message',
+      recipient: 'codex',
+      body: 'from alice',
+    });
+    const b1 = await createAuthenticatedMessage(testAuthenticatedCapability('bob', 'fusion'), {
+      correlation_id: 'c2',
+      idempotency_key: 'shared-key',
+      task_type: 'agent_message',
+      recipient: 'codex',
+      body: 'from bob',
+    });
+    expect(a1.id).not.toBe(b1.id);
+    expect(a1.sender_principal_id).toBe('alice');
+    expect(b1.sender_principal_id).toBe('bob');
+    const a2 = await createAuthenticatedMessage(testAuthenticatedCapability('alice', 'claude'), {
+      correlation_id: 'c3',
+      idempotency_key: 'shared-key',
+      task_type: 'agent_message',
+      recipient: 'codex',
+      body: 'retry alice',
+    });
+    expect(a2.id).toBe(a1.id);
+
+    const legacy1 = await createAuthenticatedMessage(testLegacyCapability('claude'), {
+      correlation_id: 'c4',
+      idempotency_key: 'legacy-key',
+      task_type: 'agent_message',
+      recipient: 'codex',
+      body: 'legacy one',
+    });
+    const legacy2 = await createAuthenticatedMessage(testLegacyCapability('fusion'), {
+      correlation_id: 'c5',
+      idempotency_key: 'legacy-key',
+      task_type: 'agent_message',
+      recipient: 'codex',
+      body: 'legacy two',
+    });
+    expect(legacy2.id).toBe(legacy1.id);
+    expect(legacy1.sender_principal_id).toBeNull();
+  });
+
+  test('system writers bind fixed principals and ignore hostile preemption keys', async () => {
+    await createAuthenticatedMessage(testAuthenticatedCapability('hostile', 'claude'), {
+      correlation_id: 'h1',
+      idempotency_key: 'xo-handoff:source-1',
+      task_type: 'agent_message',
+      recipient: 'xo',
+      body: 'hostile',
+      priority: 'blocker',
+    });
+    const system = await createAuthenticatedMessage(
+      { kind: 'system', sender: 'dispatch' },
+      {
+        correlation_id: 's1',
+        idempotency_key: 'xo-handoff:source-1',
+        task_type: 'agent_message',
+        recipient: 'xo',
+        body: 'system',
+        priority: 'blocker',
+      }
+    );
+    expect(system.sender).toBe('dispatch');
+    expect(system.sender_principal_id).toBe('system:dispatch');
+    expect(system.body).toContain('system');
+
+    const boardAuthority = await DispatchNonSystemCapability.fromBoardProof({
+      proof: {},
+      purpose: 'motion_notification',
+    });
+    const board = await createAuthenticatedMessage(boardAuthority.capability, {
+      correlation_id: 'b1',
+      idempotency_key: 'board-key',
+      task_type: 'agent_message',
+      recipient: 'board',
+      body: '{"ok":true}',
+      recipient_alias: 'board',
+    });
+    expect(board.sender_principal_id).toBe('board:claude');
+  });
+
+  test('rejects hand-constructed non-system sender provenance at compile time and runtime', async () => {
+    const data = {
+      correlation_id: 'forged-context',
+      idempotency_key: 'forged-context',
+      task_type: 'agent_message' as const,
+      recipient: 'codex',
+      body: 'must not persist',
+    };
+    const forgedAuthenticated = createAuthenticatedMessage(
+      // @ts-expect-error authenticated provenance must come from the credential issuer.
+      { kind: 'authenticated', principal_id: 'fake', sender: 'xo' },
+      data
+    );
+    const callsBeforeForgedContexts = getDatabaseCalls;
+    await expect(forgedAuthenticated).rejects.toThrow('dispatch_sender_capability_invalid');
+
+    const forgedLegacy = createAuthenticatedMessage(
+      // @ts-expect-error legacy provenance must come from the mode and registry resolver.
+      { kind: 'legacy', sender: 'overseer' },
+      { ...data, idempotency_key: 'forged-legacy-context' }
+    );
+    await expect(forgedLegacy).rejects.toThrow('dispatch_sender_capability_invalid');
+
+    const prototypeForgery = Object.create(
+      DispatchNonSystemCapability.prototype
+    ) as unknown as Parameters<typeof createAuthenticatedMessage>[0];
+    await expect(
+      createAuthenticatedMessage(prototypeForgery, {
+        ...data,
+        idempotency_key: 'forged-prototype-context',
+      })
+    ).rejects.toThrow('dispatch_sender_capability_invalid');
+
+    const proxyForgery = new Proxy(Object.create(DispatchNonSystemCapability.prototype), {
+      get(target, property, receiver) {
+        if (property === 'toBoundSender') {
+          return () => ({ sender: 'xo', sender_principal_id: 'fake' });
+        }
+        return Reflect.get(target, property, receiver);
+      },
+    }) as unknown as Parameters<typeof createAuthenticatedMessage>[0];
+    await expect(
+      createAuthenticatedMessage(proxyForgery, {
+        ...data,
+        idempotency_key: 'forged-proxy-context',
+      })
+    ).rejects.toThrow('dispatch_sender_capability_invalid');
+    expect(getDatabaseCalls).toBe(callsBeforeForgedContexts);
+
+    let senderReads = 0;
+    const changingSystemSender = new Proxy(
+      { kind: 'system' as const, sender: 'dispatch' as const },
+      {
+        get(target, property, receiver) {
+          if (property === 'sender') {
+            senderReads += 1;
+            return senderReads === 1 ? 'dispatch' : 'forged';
+          }
+          return Reflect.get(target, property, receiver);
+        },
+      }
+    );
+    const fixed = await createAuthenticatedMessage(changingSystemSender, {
+      ...data,
+      idempotency_key: 'changing-system-sender',
+    });
+    expect(fixed.sender).toBe('dispatch');
+    expect(fixed.sender_principal_id).toBe('system:dispatch');
+    expect(senderReads).toBe(1);
+  });
+
+  test('supersede replacement uses authenticated sender context', async () => {
+    const original = await createAuthenticatedMessage(
+      testAuthenticatedCapability('alice', 'claude'),
+      {
+        correlation_id: 'sup-1',
+        idempotency_key: 'sup-orig',
+        task_type: 'agent_message',
+        recipient: 'codex',
+        body: 'original',
+      }
+    );
+    const callsBeforeForgedSupersede = getDatabaseCalls;
+    await expect(
+      supersedeMessage({
+        id: original.id,
+        // @ts-expect-error supersede requires issuer-proven sender authority.
+        sender_context: { kind: 'authenticated', principal_id: 'fake', sender: 'claude' },
+        replacement: {
+          correlation_id: 'sup-forged-context',
+          idempotency_key: 'sup-forged-context',
+          task_type: 'agent_message',
+          recipient: 'codex',
+          body: 'must not access the database',
+        },
+      })
+    ).rejects.toThrow('dispatch_sender_capability_invalid');
+    expect(getDatabaseCalls).toBe(callsBeforeForgedSupersede);
+    const result = await supersedeMessage({
+      id: original.id,
+      sender_context: testAuthenticatedCapability('alice', 'claude'),
+      replacement: {
+        correlation_id: 'sup-2',
+        idempotency_key: 'sup-repl',
+        task_type: 'agent_message',
+        recipient: 'codex',
+        body: 'replacement',
+      },
+    });
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.message.sender).toBe('claude');
+      expect(result.message.sender_principal_id).toBe('alice');
+      expect(result.message.supersedes_id).toBe(original.id);
+    }
+  });
+
+  test('ordinary creation cannot forge supersedes metadata outside the guarded path', async () => {
+    const forged = createAuthenticatedMessage(testAuthenticatedCapability('alice', 'claude'), {
+      correlation_id: 'sup-forged',
+      idempotency_key: 'sup-forged',
+      task_type: 'agent_message',
+      recipient: 'codex',
+      body: 'forged replacement',
+      // @ts-expect-error supersedes_id belongs only to supersedeMessage.
+      supersedes_id: 'source-not-owned-by-caller',
+    });
+    await expect(forged).rejects.toThrow('dispatch_supersedes_guarded_path_required');
+    expect(
+      (
+        await db.query('SELECT id FROM agent_dispatch_messages WHERE idempotency_key = $1', [
+          'sup-forged',
+        ])
+      ).rowCount
+    ).toBe(0);
+  });
+
+  test('escalation claim ignores legacy null-principal blockers', async () => {
+    const legacy = await createAuthenticatedMessage(testLegacyCapability('claude'), {
+      correlation_id: 'esc-leg',
+      idempotency_key: 'esc-leg',
+      task_type: 'agent_message',
+      recipient: 'xo',
+      body: 'legacy blocker',
+      priority: 'blocker',
+    });
+    await db.query(`UPDATE agent_dispatch_messages SET created_at = $2 WHERE id = $1`, [
+      legacy.id,
+      new Date(Date.now() - 5 * 60 * 60 * 1000).toISOString(),
+    ]);
+    const claimed = await claimDispatchEscalation({
+      id: legacy.id,
+      leg: 'telegram',
+      now: new Date().toISOString(),
+    });
+    expect(claimed).toBeNull();
+
+    const authed = await createAuthenticatedMessage(
+      testAuthenticatedCapability('alice', 'claude'),
+      {
+        correlation_id: 'esc-auth',
+        idempotency_key: 'esc-auth',
+        task_type: 'agent_message',
+        recipient: 'xo',
+        body: 'auth blocker',
+        priority: 'blocker',
+      }
+    );
+    await db.query(`UPDATE agent_dispatch_messages SET created_at = $2 WHERE id = $1`, [
+      authed.id,
+      new Date(Date.now() - 5 * 60 * 60 * 1000).toISOString(),
+    ]);
+    const claimedAuth = await claimDispatchEscalation({
+      id: authed.id,
+      leg: 'telegram',
+      now: new Date().toISOString(),
+    });
+    expect(claimedAuth?.id).toBe(authed.id);
   });
 });
 

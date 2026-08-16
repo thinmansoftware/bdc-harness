@@ -258,12 +258,70 @@ describe('dispatch-migration-smoke CLI', () => {
 
     expect(result.exitCode).not.toBe(0);
     expect(result.stdout).toBe('');
-    expect(result.stderr).toContain('migration_schema_validation_failed');
+    // Phase 1.5 refuses a malformed priority type fatally during adapter init
+    // before schema snapshot validation can heal or ignore it.
+    expect(result.stderr).toMatch(
+      /migration_initialization_failed|migration_schema_validation_failed/
+    );
   });
 
   test('rejects a pre-existing dispatch index with the right name but wrong definition', async () => {
-    const { dbPath } = await makeLegacyFixture();
+    // Use a Phase 1.5-shaped table (no inline UNIQUE) so rebuild does not heal
+    // a wrong-definition leftover via IF NOT EXISTS.
+    const dir = await mkdtemp(join(tmpdir(), 'dispatch-migration-smoke-test-'));
+    temporaryDirectories.push(dir);
+    const dbPath = join(dir, 'source-copy.db');
     const database = new Database(dbPath);
+    database.run(`
+      CREATE TABLE agent_dispatch_messages (
+        id TEXT PRIMARY KEY,
+        correlation_id TEXT NOT NULL,
+        idempotency_key TEXT NOT NULL,
+        task_type TEXT NOT NULL CHECK (task_type IN ('agent_message', 'run_review', 'draft_spec', 'run_report', 'board_motion')),
+        sender TEXT NOT NULL,
+        sender_principal_id TEXT,
+        recipient TEXT NOT NULL,
+        body TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'queued' CHECK (status IN ('queued', 'claimed', 'done', 'failed', 'cancelled')),
+        result_body TEXT,
+        created_at TEXT NOT NULL,
+        claimed_at TEXT,
+        completed_at TEXT,
+        not_before TEXT,
+        lease_owner TEXT,
+        lease_expires_at TEXT,
+        fencing_token INTEGER NOT NULL DEFAULT 0,
+        recipient_alias TEXT CHECK (recipient_alias IS NULL OR recipient_alias = 'board'),
+        motion_id TEXT,
+        motion_revision_sha TEXT,
+        resolved_recipient TEXT,
+        resolved_xo_lease_id TEXT,
+        resolved_xo_fencing_token INTEGER,
+        resolved_at TEXT,
+        priority TEXT NOT NULL DEFAULT 'normal' CHECK (priority IN ('blocker', 'normal', 'heartbeat')),
+        task_outcome TEXT,
+        acknowledged_at TEXT,
+        acknowledged_by TEXT,
+        addressed_at TEXT,
+        addressed_by TEXT,
+        escalated_tg_at TEXT,
+        escalated_sms_at TEXT,
+        subject_key TEXT,
+        repeat_reason TEXT,
+        route_disposition TEXT,
+        supersedes_id TEXT REFERENCES agent_dispatch_messages(id)
+      );
+    `);
+    database.run(
+      `INSERT INTO agent_dispatch_messages
+       (id, correlation_id, idempotency_key, task_type, sender, recipient, body, status, created_at, priority, fencing_token)
+       VALUES ('r1', 'c1', 'k1', 'run_report', 'overseer', 'operator', 'body', 'queued', '2026-08-05T10:00:00.000Z', 'heartbeat', 0)`
+    );
+    database.run(
+      `INSERT INTO agent_dispatch_messages
+       (id, correlation_id, idempotency_key, task_type, sender, recipient, body, status, created_at, priority, fencing_token)
+       VALUES ('r2', 'c2', 'k2', 'run_report', 'overseer', 'operator', 'body', 'queued', '2026-08-05T10:01:00.000Z', 'heartbeat', 0)`
+    );
     database.run('CREATE INDEX idx_dispatch_board_pending ON agent_dispatch_messages(status)');
     database.close();
 
@@ -382,6 +440,19 @@ describe('dispatch-migration-smoke CLI', () => {
         >("SELECT COUNT(*) AS count FROM sqlite_master WHERE type = 'table' AND name = 'dispatch_principals'")
         .get()?.count
     ).toBe(1);
+    expect(
+      output
+        .query<{ count: number }, []>('SELECT COUNT(*) AS count FROM agent_dispatch_messages')
+        .get()?.count
+    ).toBe(4);
+    expect(
+      output
+        .query<
+          { count: number },
+          []
+        >("SELECT COUNT(*) AS count FROM agent_dispatch_messages WHERE id LIKE 'p15-%'")
+        .get()?.count
+    ).toBe(0);
     output.close();
     const entries = await readdir(dir);
     expect(entries).not.toContain('migrated-report-copy.db-wal');

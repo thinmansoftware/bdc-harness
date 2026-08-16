@@ -215,14 +215,17 @@ function makeDeps(world: FakeWorld, overrides: Partial<TaskmasterDeps> = {}): Ta
     now: () => new Date(world.nowMs),
     db: dal,
     headroom: async () => okHeadroom,
-    createTask: (async (data: { idempotency_key: string; recipient: string; body: string }) => {
+    createTask: (async (
+      _context: unknown,
+      data: { idempotency_key: string; recipient: string; body: string }
+    ) => {
       world.sentMessages.push({
         idempotency_key: data.idempotency_key,
         recipient: data.recipient,
         body: data.body,
         createdAt: new Date(world.nowMs).toISOString(),
       });
-      return { id: `msg-${world.sentMessages.length}`, status: 'queued' };
+      return { id: `msg-${world.sentMessages.length}`, status: 'queued' } as never;
     }) as unknown as TaskmasterDeps['createTask'],
     findEffectByIdempotencyKey: async (key: string) => {
       const found = world.sentMessages.find(m => m.idempotency_key === key);

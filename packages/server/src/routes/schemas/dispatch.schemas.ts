@@ -27,6 +27,7 @@ export const dispatchMessageSchema = z
     idempotency_key: z.string(),
     task_type: dispatchTaskTypeSchema,
     sender: z.string(),
+    sender_principal_id: z.string().nullable(),
     recipient: z.string(),
     body: z.string(),
     status: dispatchMessageStatusSchema,

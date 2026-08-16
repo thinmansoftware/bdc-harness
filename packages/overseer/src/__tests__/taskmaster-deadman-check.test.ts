@@ -54,17 +54,19 @@ function makeDeps(statuses: Array<TaskmasterStatusView | 'unreachable'>): {
         headers: { 'content-type': 'application/json' },
       });
     }) as typeof fetch,
-    createTask: (async (data: {
-      idempotency_key: string;
-      body: string;
-      recipient: string;
-      sender: string;
-    }) => {
+    createTask: (async (
+      context: { kind: string; sender?: string },
+      data: {
+        idempotency_key: string;
+        body: string;
+        recipient: string;
+      }
+    ) => {
       escalations.push({
         idempotency_key: data.idempotency_key,
         body: data.body,
         recipient: data.recipient,
-        sender: data.sender,
+        sender: context.sender ?? 'overseer',
       });
       return { id: `esc-${escalations.length}`, status: 'queued' };
     }) as unknown as DeadmanCheckerDeps['createTask'],
@@ -144,7 +146,7 @@ describe('taskmaster dead-man external checker (SC8)', () => {
     const degraded = statusView({ tick_health: 'degraded' });
     const { deps, escalations } = makeDeps([degraded, degraded]);
     let failFirst = true;
-    const failingCreate = (async (data: { idempotency_key: string }) => {
+    const failingCreate = (async (_context: unknown, data: { idempotency_key: string }) => {
       if (failFirst) {
         failFirst = false;
         throw new Error('dispatch down');

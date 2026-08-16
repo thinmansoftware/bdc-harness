@@ -46,6 +46,10 @@ mock.module('@archon/core/db/dispatch', () => ({
 
 const { tickDispatchEscalationClock } = await import('./escalation-clock');
 
+function setSenderAuthMode(mode: 'enforce'): void {
+  process.env.DISPATCH_SENDER_AUTH_MODE = mode;
+}
+
 describe('dispatch escalation clock', () => {
   beforeEach(() => {
     Object.keys(calls).forEach(key => {
@@ -61,6 +65,7 @@ describe('dispatch escalation clock', () => {
   });
   afterEach(() => {
     delete process.env.DISPATCH_PHASE1_ACTIVATED_AT;
+    delete process.env.DISPATCH_SENDER_AUTH_MODE;
     delete process.env.DISPATCH_TELEGRAM_ENABLED;
     delete process.env.DISPATCH_SMS_ENABLED;
   });
@@ -73,7 +78,7 @@ describe('dispatch escalation clock', () => {
   });
 
   test('delivers Telegram and SMS once at their exact boundaries without releasing successful claims', async () => {
-    process.env.DISPATCH_SENDER_AUTH_MODE = 'enforce';
+    setSenderAuthMode('enforce');
     candidates = [
       { id: 'four-hours', created_at: '2026-08-07T20:00:00.000Z' },
       { id: 'twenty-four-hours', created_at: '2026-08-07T00:00:00.000Z' },
@@ -96,7 +101,7 @@ describe('dispatch escalation clock', () => {
   });
 
   test('suppresses early and addressed messages and releases only a failed delivery', async () => {
-    process.env.DISPATCH_SENDER_AUTH_MODE = 'enforce';
+    setSenderAuthMode('enforce');
     candidates = [
       { id: 'early', created_at: '2026-08-07T20:00:00.001Z' },
       {
@@ -121,7 +126,7 @@ describe('dispatch escalation clock', () => {
   });
 
   test('coalesces concurrent ticks', async () => {
-    process.env.DISPATCH_SENDER_AUTH_MODE = 'enforce';
+    setSenderAuthMode('enforce');
     candidates = [{ id: 'xo-1', created_at: '2026-08-07T00:00:00.000Z' }];
     let unblock!: () => void;
     listBarrier = new Promise(resolve => {
