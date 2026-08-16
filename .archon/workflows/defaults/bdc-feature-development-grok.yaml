@@ -1,8 +1,8 @@
 name: bdc-feature-development-grok
 description: |
   Dedicated tool-capable Grok lane for feature Work Orders. Grok owns planning,
-  implementation, and repair seats through provider grok with x-ai/grok-4.5.
-  Every review and judge seat is explicitly pinned to codex-opr so Grok never
+  implementation, and repair seats through Cursor Desktop Grok 4.5.
+  Every review and judge seat is explicitly pinned to strict native Codex so Grok never
   grades its own output. This lane is directly invokable but is intentionally
   absent from the Smart Cauldron ladder and production router mapping.
 
@@ -15,9 +15,9 @@ run_authority:
     - docs/work-orders/{WO_ID}.md
     - docs/superpowers/specs/{WO_ID}.md
   allow_issue_fallback: true
-# Dedicated Grok execution default. Review nodes override this with codex-opr.
-provider: grok
-model: x-ai/grok-4.5
+# Dedicated desktop Cursor-Grok execution default. Review nodes override with strict Codex.
+provider: cursor-grok-dispatch
+model: cursor-grok-4.5-high
 
 nodes:
   # Pre-flight: fail closed if container lacks GITHUB auth (WO-169, 2026-05-16).
@@ -116,8 +116,10 @@ nodes:
   # the normal build path -- assert-implement-produced-work (Fix A) is the real safety
   # net, this is only an optimization that must never wrongly skip real work.
   - id: check-already-satisfied
-    provider: grok
-    model: x-ai/grok-4.5
+    provider: cursor-grok-dispatch
+    model: cursor-grok-4.5-high
+    execution_mode: read_only
+    artifact_contract: { inputs: [], outputs: [] }
     persona: war-council-architect-opr
     agent: war-council-architect-opr
     depends_on: [read-spec]
@@ -221,8 +223,10 @@ nodes:
       exit 0
 
   - id: plan
-    provider: grok
-    model: x-ai/grok-4.5
+    provider: cursor-grok-dispatch
+    model: cursor-grok-4.5-high
+    execution_mode: read_only
+    artifact_contract: { inputs: [], outputs: [] }
     persona: war-council-architect-opr
     depends_on: [gate-already-satisfied]
     when: "$gate-already-satisfied.output.ALREADY_SATISFIED != 'true'"
@@ -268,12 +272,12 @@ nodes:
   # plan that `implement` consumes. NOT a human gate -- humans are reached only via the
   # async escalation payload, and only at the irreversible-action boundary downstream.
   - id: plan-review
-    provider: codex-opr
+    provider: codex-native-strict
     persona: war-council-architect-opr
     agent: war-council-architect-opr
     # Cross-model boundary: Grok authors the plan; DeepSeek reviews it through
     # the repository-capable codex-opr provider. Grok never grades its own work.
-    model: deepseek/deepseek-chat-v3.1
+    model: gpt-5.6-sol
     depends_on: [plan]
     trigger_rule: all_done
     when: "$gate-already-satisfied.output.ALREADY_SATISFIED != 'true'"
@@ -398,8 +402,10 @@ nodes:
   - id: implement
     # Dedicated Grok builder seat. The provider contract supplies repository write
     # and shell capabilities; downstream codex-opr seats independently review it.
-    provider: grok
-    model: x-ai/grok-4.5
+    provider: cursor-grok-dispatch
+    model: cursor-grok-4.5-high
+    execution_mode: repository_write
+    artifact_contract: { inputs: [], outputs: [implement.env] }
     persona: major-build-opr
     depends_on: [capture-run-scope]
     trigger_rule: all_done
@@ -1066,9 +1072,9 @@ nodes:
       exit 0
   - id: war-council-validator
     # DeepSeek judge through the repository-capable OpenRouter tool loop.
-    provider: codex-opr
+    provider: codex-native-strict
     persona: captain-ci-validator-codex
-    model: deepseek/deepseek-chat-v3.1
+    model: gpt-5.6-sol
     depends_on: [ascii-gate]
     task_class: medium_work
     prompt: |
@@ -1171,7 +1177,7 @@ nodes:
       echo "DIFF_BYTES=$(wc -c < "$OUT" 2>/dev/null || echo 0)"
 
   - id: diff-review
-    provider: codex-opr
+    provider: codex-native-strict
     model: gpt-5.6-sol
     agent: codex-adversarial-reviewer
     depends_on: [capture-diff]
@@ -1227,8 +1233,12 @@ nodes:
       printf '{"verdict":"%s"}\n' "$verdict"
 
   - id: diff-repair
-    provider: grok
-    model: x-ai/grok-4.5
+    provider: cursor-grok-dispatch
+    model: cursor-grok-4.5-high
+    execution_mode: repository_write
+    artifact_contract:
+      inputs: [diff.patch]
+      outputs: [diff-repair-done.flag, diff-repair-escalation.txt]
     persona: major-build-opr
     depends_on: [diff-review, classify-diff-review, resolve-review-base]
     when: "$classify-diff-review.output.verdict == 'needs_revision'"
@@ -1385,7 +1395,7 @@ nodes:
       echo "DIFF_FINAL_BYTES=$(wc -c < "$OUT" 2>/dev/null || echo 0)"
 
   - id: diff-review-final
-    provider: codex-opr
+    provider: codex-native-strict
     model: gpt-5.6-sol
     agent: codex-adversarial-reviewer
     depends_on: [diff-review, classify-diff-review, diff-repair, capture-diff-final]
@@ -1490,8 +1500,10 @@ nodes:
   # bothering a human (autonomy ladder step 2). Read-only-ish: it may edit in-scope files to
   # resolve the block, then signals. If it can't fix, the run proceeds to the human pause.
   - id: opus-repair
-    provider: grok
-    model: x-ai/grok-4.5
+    provider: cursor-grok-dispatch
+    model: cursor-grok-4.5-high
+    execution_mode: repository_write
+    artifact_contract: { inputs: [diff-final.patch], outputs: [] }
     persona: major-build-opr
     depends_on: [block-classify]
     when: "$block-classify.output.status == 'BLOCKED'"
@@ -1551,7 +1563,7 @@ nodes:
   # repaired build can land as a normal feature-branch PR instead of dead-ending at a
   # terminal-BLOCKED on a non-interactive run.
   - id: opus-rereview
-    provider: codex-opr
+    provider: codex-native-strict
     model: gpt-5.6-sol
     agent: codex-adversarial-reviewer
     depends_on: [classify-opus-repair]
@@ -1739,7 +1751,7 @@ nodes:
   # AI node (not bash): plan-review emits unstructured prose; diff-review/-final + opus-repair
   # emit sentinels. Only an AI pass normalizes all of them into the per-row JSON ledger.
   - id: findings-consolidate
-    provider: codex-opr
+    provider: codex-native-strict
     model: gpt-5.6-sol
     persona: xo-opr
     depends_on: [block-reclassify]
@@ -1832,8 +1844,10 @@ nodes:
   # schema migration the self-repair loop deferred -- but ONLY for the authorized_fix_ids.
   # trigger_rule all_done so an APPROVE-AS-IS run (which skips this) does not hang the DAG.
   - id: apply-suggested-fix
-    provider: grok
-    model: x-ai/grok-4.5
+    provider: cursor-grok-dispatch
+    model: cursor-grok-4.5-high
+    execution_mode: repository_write
+    artifact_contract: { inputs: [diff-final.patch], outputs: [] }
     agent: major-build-opr
     effort: xhigh
     context: fresh
@@ -1869,7 +1883,7 @@ nodes:
   # apply-diff-review-final: re-review the fix(es) apply-suggested-fix wrote, BEFORE any commit.
   # Distinct id (diff-review-final already ran upstream). Only meaningful on the APPROVE-WITH-FIX path.
   - id: apply-diff-review-final
-    provider: codex-opr
+    provider: codex-native-strict
     model: gpt-5.6-sol
     agent: codex-adversarial-reviewer
     depends_on: [apply-suggested-fix]
@@ -1918,6 +1932,8 @@ nodes:
 
   - id: decide-push-target
     persona: major-build-opr
+    execution_mode: read_only
+    artifact_contract: { inputs: [], outputs: [] }
     depends_on: [pause-gate, classify-apply-review]
     trigger_rule: all_done
     when: "$pause-gate.output.decision_verb != 'approve_with_fix' || $classify-apply-review.output.verdict == 'satisfied'"

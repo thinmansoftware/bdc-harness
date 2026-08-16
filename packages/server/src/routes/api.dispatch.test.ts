@@ -169,6 +169,31 @@ const VALID_BODY = {
   body: 'Please summarize this.',
 };
 
+const RUN_WORK_BODY = {
+  version: 'v1',
+  correlation_id: 'run-1:plan',
+  idempotency_key: 'run-1:plan:attempt-1',
+  workflow_run_id: 'run-1',
+  node_id: 'plan',
+  provider_attempt_id: 'attempt-1',
+  provider_attempt_number: 1,
+  execution_mode: 'read_only',
+  repository: {
+    remote_url: 'https://github.com/bluedevilcollectibles/bdc-harness.git',
+    branch: 'cauldron/run-1',
+    requested_sha: 'a'.repeat(40),
+  },
+  model: 'cursor-grok-4.5-high',
+  prompt: 'Review the assigned worktree.',
+  artifacts: {
+    source_root: 'C:/server/artifacts/run-1',
+    inputs: [],
+    outputs: [],
+    max_file_bytes: 1_048_576,
+    max_total_bytes: 4_194_304,
+  },
+};
+
 describe('dispatch API', () => {
   beforeEach(() => {
     process.env.BUN_ENV = 'test';
@@ -223,6 +248,68 @@ describe('dispatch API', () => {
     });
     expect(response.status).toBe(400);
     expect(((await response.json()) as { error: string }).error).toContain('task_type');
+  });
+
+  test('keeps run_work off generic create and completes it through dedicated routes', async () => {
+    const app = makeApp('secret-token');
+    const headers = {
+      'Content-Type': 'application/json',
+      'x-archon-operator-token': 'secret-token',
+    };
+    const generic = await app.request('/api/dispatch/messages', {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ ...VALID_BODY, task_type: 'run_work' }),
+    });
+    expect(generic.status).toBe(400);
+
+    const createdResponse = await app.request('/api/dispatch/work-requests', {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(RUN_WORK_BODY),
+    });
+    expect(createdResponse.status).toBe(200);
+    const created = (await createdResponse.json()) as {
+      id: string;
+      task_type: string;
+      recipient: string;
+    };
+    expect(created).toMatchObject({ task_type: 'run_work', recipient: 'grok' });
+
+    const fetched = await app.request(`/api/dispatch/work-requests/${created.id}`, { headers });
+    expect(fetched.status).toBe(200);
+
+    await registerWorker({
+      worker_id: 'cursor-worker-1',
+      host: 'desktop',
+      capabilities: { providers: ['cursor-grok-dispatch'] },
+      max_concurrency: 1,
+    });
+    const claimedResponse = await app.request(`/api/dispatch/messages/${created.id}/claim`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ worker_id: 'cursor-worker-1' }),
+    });
+    expect(claimedResponse.status).toBe(200);
+    const claimed = (await claimedResponse.json()) as { fencing_token: number };
+
+    const completed = await app.request(`/api/dispatch/work-requests/${created.id}/result`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        version: 'v1',
+        worker_id: 'cursor-worker-1',
+        fencing_token: claimed.fencing_token,
+        outcome: 'succeeded',
+        requested_sha: RUN_WORK_BODY.repository.requested_sha,
+        resulting_sha: RUN_WORK_BODY.repository.requested_sha,
+        output: 'Review complete.',
+        model: 'cursor-grok-4.5-high',
+        artifacts: { outputs: [] },
+      }),
+    });
+    expect(completed.status).toBe(200);
+    expect(await completed.json()).toMatchObject({ status: 'done', task_outcome: 'succeeded' });
   });
 
   test('rejects repo-mutating agent_message body before insert', async () => {

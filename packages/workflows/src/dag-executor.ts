@@ -30,6 +30,7 @@ import type {
   ProviderCapabilities,
   TokenUsage,
   MessageChunk,
+  ProviderExecutionContext,
 } from '@archon/providers/types';
 import {
   getProviderCapabilities,
@@ -933,6 +934,29 @@ async function beginProviderAttempt(
     );
   }
   return attempt;
+}
+
+function buildProviderExecutionContext(
+  workflowRun: WorkflowRun,
+  node: CommandNode | PromptNode | LoopNode,
+  attempt: ProviderAttemptRecord,
+  artifactsDir: string
+): ProviderExecutionContext | undefined {
+  if (node.execution_mode === undefined || node.artifact_contract === undefined) return undefined;
+  return {
+    workflowRunId: workflowRun.id,
+    nodeId: node.id,
+    providerAttemptId: attempt.attemptId,
+    providerAttemptNumber: attempt.attemptNumber,
+    executionMode: node.execution_mode,
+    artifactsDir,
+    artifactContract: {
+      inputs: node.artifact_contract.inputs,
+      outputs: node.artifact_contract.outputs,
+      maxFileBytes: node.artifact_contract.max_file_bytes,
+      maxTotalBytes: node.artifact_contract.max_total_bytes,
+    },
+  };
 }
 
 async function finishProviderAttempt(
@@ -1870,11 +1894,21 @@ async function executeNodeInternal(
     nodeOptions?.model,
     declaredModelId
   );
+  const executionContext = buildProviderExecutionContext(
+    workflowRun,
+    node,
+    providerAttempt,
+    artifactsDir
+  );
+  const providerOptions: SendQueryOptions = {
+    ...nodeOptionsWithAbort,
+    ...(executionContext ? { executionContext } : {}),
+  };
   let providerAttemptCompleted = false;
 
   try {
     for await (const msg of withIdleTimeout(
-      aiClient.sendQuery(finalPrompt, cwd, resumeSessionId, nodeOptionsWithAbort),
+      aiClient.sendQuery(finalPrompt, cwd, resumeSessionId, providerOptions),
       effectiveIdleTimeout,
       () => {
         nodeIdleTimedOut = true;
@@ -3912,11 +3946,6 @@ async function executeLoopNode(
         );
         const finalPrompt = substituteNodeOutputRefs(substitutedPrompt, nodeOutputs);
 
-        const iterationOptions: SendQueryOptions | undefined = {
-          ...resolvedOptions,
-          abortSignal: iterationAbortController.signal,
-        };
-
         iterationAttempt = await beginProviderAttempt(
           deps,
           workflowRun,
@@ -3925,6 +3954,17 @@ async function executeLoopNode(
           resolvedOptions.model,
           workflowModel
         );
+        const iterationExecutionContext = buildProviderExecutionContext(
+          workflowRun,
+          node,
+          iterationAttempt,
+          artifactsDir
+        );
+        const iterationOptions: SendQueryOptions = {
+          ...resolvedOptions,
+          abortSignal: iterationAbortController.signal,
+          ...(iterationExecutionContext ? { executionContext: iterationExecutionContext } : {}),
+        };
         const generator = aiClient.sendQuery(finalPrompt, cwd, resumeSessionId, iterationOptions);
         let lastToolStartedAt: { toolName: string; startedAt: number } | null = null;
 

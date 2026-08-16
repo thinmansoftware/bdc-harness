@@ -14,6 +14,7 @@
     "./codex/provider": "./src/codex/provider.ts",
     "./codex/config": "./src/codex/config.ts",
     "./codex/binary-resolver": "./src/codex/binary-resolver.ts",
+    "./cursor-grok-dispatch/provider": "./src/cursor-grok-dispatch/provider.ts",
     "./auth-refresh": "./src/auth-refresh/index.ts",
     "./auth-refresh/dispatch-gate": "./src/auth-refresh/dispatch-gate.ts",
     "./community/pi": "./src/community/pi/index.ts",

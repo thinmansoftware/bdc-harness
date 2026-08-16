@@ -244,6 +244,8 @@ import {
   heartbeatDispatchWorkerBodySchema,
   listDispatchMessagesQuerySchema,
   postDispatchResultBodySchema,
+  runWorkRequestBodySchema,
+  runWorkResultBodySchema,
   renewDispatchLeaseBodySchema,
   registerDispatchWorkerBodySchema,
 } from './schemas/dispatch.schemas';
@@ -680,6 +682,67 @@ const postDispatchResultRoute = createRoute({
       content: { 'application/json': { schema: dispatchMessageSchema } },
       description: 'Completed dispatch message',
     },
+    409: jsonError('Stale fencing token or cancelled message'),
+    500: jsonError('Server error'),
+  },
+});
+
+const createRunWorkRequestRoute = createRoute({
+  method: 'post',
+  path: '/api/dispatch/work-requests',
+  tags: ['Dispatch'],
+  summary: 'Create a fenced Cursor Desktop work request',
+  request: {
+    body: {
+      content: { 'application/json': { schema: runWorkRequestBodySchema } },
+      required: true,
+    },
+  },
+  responses: {
+    200: {
+      content: { 'application/json': { schema: dispatchMessageSchema } },
+      description: 'Queued run_work message',
+    },
+    400: jsonError('Bad request'),
+    500: jsonError('Server error'),
+  },
+});
+
+const getRunWorkRequestRoute = createRoute({
+  method: 'get',
+  path: '/api/dispatch/work-requests/{id}',
+  tags: ['Dispatch'],
+  summary: 'Read one Cursor Desktop work request',
+  request: { params: dispatchMessageIdParamsSchema },
+  responses: {
+    200: {
+      content: { 'application/json': { schema: dispatchMessageSchema } },
+      description: 'run_work message',
+    },
+    404: jsonError('Not found'),
+    500: jsonError('Server error'),
+  },
+});
+
+const postRunWorkResultRoute = createRoute({
+  method: 'post',
+  path: '/api/dispatch/work-requests/{id}/result',
+  tags: ['Dispatch'],
+  summary: 'Complete a fenced Cursor Desktop work request',
+  request: {
+    params: dispatchMessageIdParamsSchema,
+    body: {
+      content: { 'application/json': { schema: runWorkResultBodySchema } },
+      required: true,
+    },
+  },
+  responses: {
+    200: {
+      content: { 'application/json': { schema: dispatchMessageSchema } },
+      description: 'Completed run_work message',
+    },
+    400: jsonError('Bad request'),
+    404: jsonError('Not found'),
     409: jsonError('Stale fencing token or cancelled message'),
     500: jsonError('Server error'),
   },
@@ -3617,6 +3680,94 @@ export function registerApiRoutes(
       }
       getLog().error({ err: error }, 'dispatch_create_message_failed');
       return apiError(c, 500, 'Failed to create dispatch message');
+    }
+  });
+
+  registerOpenApiRoute(createRunWorkRequestRoute, async c => {
+    try {
+      const body = getValidatedBody(c, runWorkRequestBodySchema);
+      const protectedBranch = /^(main|master|dev|staging|production|release(?:\/.*)?)$/i;
+      if (protectedBranch.test(body.repository.branch)) {
+        return apiError(c, 400, 'run_work_protected_branch_rejected');
+      }
+      const message = await dispatchDb.createMessage({
+        correlation_id: body.correlation_id,
+        idempotency_key: body.idempotency_key,
+        task_type: 'run_work',
+        sender: 'cauldron',
+        recipient: 'grok',
+        body: JSON.stringify(body),
+        not_before: null,
+        priority: 'normal',
+      });
+      return c.json(message);
+    } catch (error) {
+      getLog().error({ err: error }, 'dispatch_create_run_work_failed');
+      return apiError(c, 500, 'Failed to create run_work request');
+    }
+  });
+
+  registerOpenApiRoute(getRunWorkRequestRoute, async c => {
+    try {
+      const message = await dispatchDb.getMessage(c.req.param('id') ?? '');
+      if (message?.task_type !== 'run_work') {
+        return apiError(c, 404, 'run_work_not_found');
+      }
+      return c.json(message);
+    } catch (error) {
+      getLog().error({ err: error }, 'dispatch_get_run_work_failed');
+      return apiError(c, 500, 'Failed to read run_work request');
+    }
+  });
+
+  registerOpenApiRoute(postRunWorkResultRoute, async c => {
+    try {
+      const body = getValidatedBody(c, runWorkResultBodySchema);
+      const current = await dispatchDb.getMessage(c.req.param('id') ?? '');
+      if (current?.task_type !== 'run_work') {
+        return apiError(c, 404, 'run_work_not_found');
+      }
+      const request = runWorkRequestBodySchema.parse(JSON.parse(current.body));
+      const outputPaths = new Set(request.artifacts.outputs);
+      const totalBytes = body.artifacts.outputs.reduce((sum, item) => sum + item.size_bytes, 0);
+      if (
+        body.requested_sha !== request.repository.requested_sha ||
+        body.artifacts.outputs.some(
+          item => !outputPaths.has(item.path) || item.size_bytes > request.artifacts.max_file_bytes
+        ) ||
+        totalBytes > request.artifacts.max_total_bytes
+      ) {
+        return apiError(c, 400, 'run_work_result_contract_mismatch');
+      }
+      if (
+        body.outcome === 'succeeded' &&
+        ((request.execution_mode === 'read_only' &&
+          body.resulting_sha !== request.repository.requested_sha) ||
+          (request.execution_mode === 'repository_write' &&
+            (!body.resulting_sha || body.resulting_sha === request.repository.requested_sha)))
+      ) {
+        return apiError(c, 400, 'run_work_result_sha_mismatch');
+      }
+      const failed = body.outcome !== 'succeeded';
+      const message = await dispatchDb.postResult({
+        id: current.id,
+        worker_id: body.worker_id,
+        fencing_token: body.fencing_token,
+        result_body: JSON.stringify(body),
+        status: failed ? 'failed' : 'done',
+        task_outcome:
+          body.outcome === 'succeeded'
+            ? 'succeeded'
+            : body.outcome === 'blocked'
+              ? 'blocked'
+              : 'failed',
+      });
+      if (!message) return apiError(c, 409, 'Stale fencing token or cancelled dispatch message');
+      return c.json(message);
+    } catch (error) {
+      if (error instanceof SyntaxError) return apiError(c, 400, 'run_work_body_invalid');
+      getLog().error({ err: error }, 'dispatch_post_run_work_result_failed');
+      return apiError(c, 500, 'Failed to post run_work result');
     }
   });
 

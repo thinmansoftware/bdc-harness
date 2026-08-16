@@ -13,6 +13,9 @@ export type {
   ProviderInfo,
   MessageChunk,
   TokenUsage,
+  DesktopExecutionMode,
+  ArtifactTransferContract,
+  ProviderExecutionContext,
 } from './types';
 
 // Provider config types (canonical definitions in ./types, re-exported via config modules)
@@ -40,6 +43,7 @@ export * from './probe';
 // Provider classes
 export { ClaudeProvider } from './claude/provider';
 export { CodexProvider } from './codex/provider';
+export { CursorGrokDispatchProvider } from './cursor-grok-dispatch/provider';
 
 // Config parsers
 export { parseClaudeConfig, type ClaudeProviderDefaults } from './claude/config';

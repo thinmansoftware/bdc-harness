@@ -267,6 +267,24 @@ describe('PostgresAdapter', () => {
     });
   });
 
+  describe('run_work dispatch schema', () => {
+    test('upgrade, fresh install, and SQLite bootstrap allow the same task type', () => {
+      const upgrade = readFileSync(
+        resolve(import.meta.dir, '../../../../../migrations', '043_agent_dispatch_run_work.sql'),
+        'utf8'
+      );
+      const fresh = readFileSync(
+        resolve(import.meta.dir, '../../../../../migrations', '000_combined.sql'),
+        'utf8'
+      );
+      const sqlite = readFileSync(resolve(import.meta.dir, 'sqlite.ts'), 'utf8');
+
+      for (const schema of [upgrade, fresh, sqlite]) {
+        expect(schema).toContain("'run_work'");
+      }
+    });
+  });
+
   describe('Board execution claims schema', () => {
     test('numbered migration, combined schema, and SQLite bootstrap define claim tables', () => {
       const migration = readFileSync(

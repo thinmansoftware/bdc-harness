@@ -1,8 +1,7 @@
 name: bdc-feature-development-codex
 description: |
-  Codex-implement variant of bdc-feature-development. Identical DAG; implement +
-  diff-repair use Codex gpt-5.6-sol instead of Claude. Fire when Claude usage is capped.
-  All other nodes (plan, review, validator, manifest, notion) are unchanged.
+  Reciprocal Codex/Cursor-Grok feature-development lane. Codex gpt-5.6-sol owns
+  implementation and repair while Cursor Desktop Grok 4.5 owns review and judgment.
 
 policyFile: harness/policies/agent-behavior.md
 run_authority:
@@ -13,9 +12,8 @@ run_authority:
     - docs/work-orders/{WO_ID}.md
     - docs/superpowers/specs/{WO_ID}.md
   allow_issue_fallback: true
-# Codex build lane: Codex/gpt-5.6-sol is the build default. war-council-validator is
-# pinned to claude/sonnet on the node. WO-HARNESS-SMART-CAULDRON-LANE-ROSTER-AND-RESILIENCE-01.
-provider: codex
+# Strict native Codex build default. Cursor-Grok review nodes are explicitly pinned.
+provider: codex-native-strict
 model: gpt-5.6-sol
 
 nodes:
@@ -154,10 +152,12 @@ nodes:
   # the normal build path -- assert-implement-produced-work (Fix A) is the real safety
   # net, this is only an optimization that must never wrongly skip real work.
   - id: check-already-satisfied
-    persona: war-council-architect
-    agent: war-council-architect
-    provider: claude
-    model: sonnet
+    persona: war-council-architect-opr
+    agent: war-council-architect-opr
+    provider: cursor-grok-dispatch
+    model: cursor-grok-4.5-high
+    execution_mode: read_only
+    artifact_contract: { inputs: [], outputs: [] }
     depends_on: [read-spec]
     task_class: clerical
     prompt: |
@@ -259,16 +259,18 @@ nodes:
       exit 0
 
   - id: plan
-    persona: war-council-architect
+    persona: war-council-architect-opr
     # Provider pin: persona war-council-architect declares model: sonnet; the lane
     # default (provider: codex) must never receive an Anthropic alias. Mirror of #313
     # which pinned the tail nodes but missed plan/plan-review. Anchor: runs 723842fe,
     # 10f6add0, 28e98197 (2026-07-01) all died at plan with the persona fault.
-    provider: claude
-    model: sonnet
+    provider: cursor-grok-dispatch
+    model: cursor-grok-4.5-high
+    execution_mode: read_only
+    artifact_contract: { inputs: [], outputs: [] }
     depends_on: [gate-already-satisfied]
     when: "$gate-already-satisfied.output.ALREADY_SATISFIED != 'true'"
-    agent: war-council-architect
+    agent: war-council-architect-opr
     task_class: medium_work
     prompt: |
       Read the BDC Work Order spec below and produce a concise implementation plan.
@@ -312,14 +314,16 @@ nodes:
   # async escalation payload, and only at the irreversible-action boundary downstream.
   - id: plan-review
     idle_timeout: 600000
-    persona: war-council-architect
+    persona: war-council-architect-opr
     # Provider pin: persona war-council-architect declares model: sonnet; the lane
     # default (provider: codex) must never receive an Anthropic alias. Mirror of #313
     # which pinned the tail nodes but missed plan/plan-review. Anchor: runs 723842fe,
     # 10f6add0, 28e98197 (2026-07-01) all died at plan with the persona fault.
-    provider: claude
-    model: sonnet
-    agent: war-council-architect
+    provider: cursor-grok-dispatch
+    model: cursor-grok-4.5-high
+    agent: war-council-architect-opr
+    execution_mode: read_only
+    artifact_contract: { inputs: [], outputs: [] }
     depends_on: [plan]
     trigger_rule: all_done
     when: "$gate-already-satisfied.output.ALREADY_SATISFIED != 'true'"
@@ -441,7 +445,7 @@ nodes:
 
   - id: implement
     idle_timeout: 600000
-    provider: codex
+    provider: codex-native-strict
     model: gpt-5.6-sol
     depends_on: [capture-run-scope]
     trigger_rule: all_done
@@ -1068,9 +1072,11 @@ nodes:
     # required because persona model WINS over node model on provider claude
     # (persona pin law, wiki doctrine/archon-yaml-authoring 2026-07-02).
     # Superseded by the apex-rung WO (bdc-xo issue #575) when it lands.
-    provider: claude
-    model: claude-opus-5
-    persona: captain-ci-validator-fable
+    provider: cursor-grok-dispatch
+    model: cursor-grok-4.5-high
+    persona: captain-ci-validator-codex
+    execution_mode: read_only
+    artifact_contract: { inputs: [], outputs: [] }
     depends_on: [ascii-gate]
     task_class: medium_work
     prompt: |
@@ -1173,9 +1179,11 @@ nodes:
       echo "DIFF_BYTES=$(wc -c < "$OUT" 2>/dev/null || echo 0)"
 
   - id: diff-review
-    provider: claude
-    model: sonnet
-    agent: claude-adversarial-reviewer
+    provider: cursor-grok-dispatch
+    model: cursor-grok-4.5-high
+    agent: opr-adversarial-reviewer
+    execution_mode: read_only
+    artifact_contract: { inputs: [diff.patch], outputs: [] }
     depends_on: [capture-diff]
     task_class: medium_work
     prompt: |
@@ -1229,7 +1237,7 @@ nodes:
       printf '{"verdict":"%s"}\n' "$verdict"
 
   - id: diff-repair
-    provider: codex
+    provider: codex-native-strict
     model: gpt-5.6-sol
     depends_on: [diff-review, classify-diff-review, resolve-review-base]
     when: "$classify-diff-review.output.verdict == 'needs_revision'"
@@ -1371,9 +1379,11 @@ nodes:
       echo "DIFF_FINAL_BYTES=$(wc -c < "$OUT" 2>/dev/null || echo 0)"
 
   - id: diff-review-final
-    provider: claude
-    model: sonnet
-    agent: claude-adversarial-reviewer
+    provider: cursor-grok-dispatch
+    model: cursor-grok-4.5-high
+    agent: opr-adversarial-reviewer
+    execution_mode: read_only
+    artifact_contract: { inputs: [diff-final.patch], outputs: [] }
     depends_on: [diff-review, classify-diff-review, diff-repair, capture-diff-final]
     trigger_rule: all_done
     task_class: medium_work
@@ -1476,7 +1486,7 @@ nodes:
   # bothering a human (autonomy ladder step 2). Read-only-ish: it may edit in-scope files to
   # resolve the block, then signals. If it can't fix, the run proceeds to the human pause.
   - id: opus-repair
-    provider: codex
+    provider: codex-native-strict
     model: gpt-5.6-sol
     depends_on: [block-classify]
     when: "$block-classify.output.status == 'BLOCKED'"
@@ -1536,9 +1546,11 @@ nodes:
   # repaired build can land as a normal feature-branch PR instead of dead-ending at a
   # terminal-BLOCKED on a non-interactive run.
   - id: opus-rereview
-    provider: claude
-    model: sonnet
-    agent: claude-adversarial-reviewer
+    provider: cursor-grok-dispatch
+    model: cursor-grok-4.5-high
+    agent: opr-adversarial-reviewer
+    execution_mode: read_only
+    artifact_contract: { inputs: [diff-final.patch], outputs: [] }
     depends_on: [classify-opus-repair]
     trigger_rule: all_done
     when: "$classify-opus-repair.output.fixed == 'true'"
@@ -1724,9 +1736,11 @@ nodes:
   # AI node (not bash): plan-review emits unstructured prose; diff-review/-final + opus-repair
   # emit sentinels. Only an AI pass normalizes all of them into the per-row JSON ledger.
   - id: findings-consolidate
-    persona: xo
-    provider: claude
-    model: sonnet
+    persona: xo-opr
+    provider: cursor-grok-dispatch
+    model: cursor-grok-4.5-high
+    execution_mode: read_only
+    artifact_contract: { inputs: [], outputs: [] }
     depends_on: [block-reclassify]
     trigger_rule: all_done
     task_class: clerical
@@ -1816,9 +1830,11 @@ nodes:
   # schema migration the self-repair loop deferred -- but ONLY for the authorized_fix_ids.
   # trigger_rule all_done so an APPROVE-AS-IS run (which skips this) does not hang the DAG.
   - id: apply-suggested-fix
-    agent: overseer-opus
-    provider: claude
-    model: claude-opus-5
+    agent: major-build-opr
+    provider: cursor-grok-dispatch
+    model: cursor-grok-4.5-high
+    execution_mode: repository_write
+    artifact_contract: { inputs: [diff-final.patch], outputs: [] }
     effort: xhigh
     context: fresh
     depends_on: [pause-gate]
@@ -1853,9 +1869,11 @@ nodes:
   # apply-diff-review-final: re-review the fix(es) apply-suggested-fix wrote, BEFORE any commit.
   # Distinct id (diff-review-final already ran upstream). Only meaningful on the APPROVE-WITH-FIX path.
   - id: apply-diff-review-final
-    provider: claude
-    model: sonnet
-    agent: claude-adversarial-reviewer
+    provider: cursor-grok-dispatch
+    model: cursor-grok-4.5-high
+    agent: opr-adversarial-reviewer
+    execution_mode: read_only
+    artifact_contract: { inputs: [diff-final.patch], outputs: [] }
     depends_on: [apply-suggested-fix]
     trigger_rule: all_done
     when: "$pause-gate.output.decision_verb == 'approve_with_fix'"
@@ -1901,9 +1919,11 @@ nodes:
       printf '{"verdict":"%s"}\n' "$verdict"
 
   - id: decide-push-target
-    persona: major-build
-    provider: claude
-    model: opus[1m]
+    persona: major-build-opr
+    provider: cursor-grok-dispatch
+    model: cursor-grok-4.5-high
+    execution_mode: read_only
+    artifact_contract: { inputs: [], outputs: [] }
     depends_on: [pause-gate, classify-apply-review]
     trigger_rule: all_done
     when: "$pause-gate.output.decision_verb != 'approve_with_fix' || $classify-apply-review.output.verdict == 'satisfied'"
@@ -2535,9 +2555,6 @@ nodes:
       fi
 
   - id: build-manifest
-    persona: major-build
-    provider: claude
-    model: opus[1m]
     depends_on: [open-pr-if-needed, block-reclassify, pause-gate]
     trigger_rule: all_done
     task_class: clerical

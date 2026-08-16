@@ -35,6 +35,16 @@ interface NodeDef {
   id: string;
   provider?: string;
   model?: string;
+  persona?: string;
+  agent?: string;
+  prompt?: string;
+  command?: string;
+  loop?: unknown;
+  execution_mode?: 'read_only' | 'repository_write';
+  artifact_contract?: {
+    inputs: string[];
+    outputs: string[];
+  };
 }
 
 interface LaneDef {
@@ -108,6 +118,49 @@ describe('lane cross-model review', () => {
       throw new Error(
         'Self-review violations detected:\n' + violations.map(v => '  ' + v).join('\n')
       );
+    }
+  });
+
+  it('S3: reciprocal Codex and Cursor-Grok lanes have exact provider, model, and mode pins', () => {
+    const expected = new Map([
+      ['bdc-feature-development-grok.yaml', 'cursor-grok-dispatch'],
+      ['bdc-feature-development-codex.yaml', 'codex-native-strict'],
+    ]);
+    const forbiddenPersonas = new Set([
+      'war-council-architect',
+      'captain-ci-validator-fable',
+      'xo',
+      'major-build',
+    ]);
+
+    for (const [file, defaultProvider] of expected) {
+      const lane = loadLane(file);
+      expect(lane.provider).toBe(defaultProvider);
+      expect(lane.model).toBe(
+        defaultProvider === 'codex-native-strict' ? 'gpt-5.6-sol' : 'cursor-grok-4.5-high'
+      );
+
+      const aiNodes = (lane.nodes ?? []).filter(
+        node => node.prompt !== undefined || node.command !== undefined || node.loop !== undefined
+      );
+      expect(aiNodes.length).toBeGreaterThan(0);
+
+      for (const node of aiNodes) {
+        const provider = resolveProvider(node, lane);
+        const model = resolveModel(node, lane);
+        expect(['cursor-grok-dispatch', 'codex-native-strict']).toContain(provider);
+        expect(model).toBe(
+          provider === 'cursor-grok-dispatch' ? 'cursor-grok-4.5-high' : 'gpt-5.6-sol'
+        );
+        expect(forbiddenPersonas.has(node.persona ?? node.agent ?? '')).toBe(false);
+
+        if (provider === 'cursor-grok-dispatch') {
+          expect(['read_only', 'repository_write']).toContain(node.execution_mode);
+          expect(node.artifact_contract).toBeDefined();
+          expect(Array.isArray(node.artifact_contract?.inputs)).toBe(true);
+          expect(Array.isArray(node.artifact_contract?.outputs)).toBe(true);
+        }
+      }
     }
   });
 });

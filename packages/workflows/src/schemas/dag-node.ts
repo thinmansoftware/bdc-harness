@@ -126,6 +126,31 @@ export type AgentDefinition = z.infer<typeof agentDefinitionSchema>;
 // Kebab-case: no leading/trailing/double hyphens (e.g. `brief-gen`, not `-brief`, `brief-`, `brief--gen`).
 const AGENT_ID_REGEX = /^[a-z0-9]+(-[a-z0-9]+)*$/;
 
+export const executionModeSchema = z.enum(['read_only', 'repository_write']);
+export type ExecutionMode = z.infer<typeof executionModeSchema>;
+
+const relativeArtifactPathSchema = z
+  .string()
+  .min(1)
+  .refine(
+    value =>
+      !value.startsWith('/') &&
+      !/^[A-Za-z]:/.test(value) &&
+      !value.includes('\\') &&
+      value.split('/').every(segment => segment.length > 0 && segment !== '.' && segment !== '..'),
+    'artifact paths must be safe relative paths'
+  );
+
+export const artifactContractSchema = z
+  .object({
+    inputs: z.array(relativeArtifactPathSchema).max(64),
+    outputs: z.array(relativeArtifactPathSchema).max(64),
+    max_file_bytes: z.number().int().positive().max(10_000_000).default(1_000_000),
+    max_total_bytes: z.number().int().positive().max(50_000_000).default(5_000_000),
+  })
+  .strict();
+export type ArtifactContract = z.infer<typeof artifactContractSchema>;
+
 // ---------------------------------------------------------------------------
 // DagNodeBase -- common fields shared by all node types
 // ---------------------------------------------------------------------------
@@ -165,6 +190,8 @@ export const dagNodeBaseSchema = z.object({
   fallbackModel: z.string().min(1).optional(),
   betas: z.array(z.string().min(1)).nonempty("'betas' must be a non-empty array").optional(),
   sandbox: sandboxSettingsSchema.optional(),
+  execution_mode: executionModeSchema.optional(),
+  artifact_contract: artifactContractSchema.optional(),
   /**
    * WO-HARNESS-NODE-PROVIDER-FAILOVER-01: node-level AVAILABILITY failover.
    * When the primary provider call fails with an availability-class error
@@ -474,6 +501,8 @@ export const BASH_NODE_AI_FIELDS: readonly string[] = [
   'failover_provider',
   'failover_model',
   'failover_agent',
+  'execution_mode',
+  'artifact_contract',
 ];
 
 /** AI-specific fields that are meaningless on script nodes -- same as bash nodes */
@@ -495,7 +524,9 @@ export const LOOP_NODE_AI_FIELDS: readonly string[] = BASH_NODE_AI_FIELDS.filter
     f !== 'persona' &&
     f !== 'failover_provider' &&
     f !== 'failover_model' &&
-    f !== 'failover_agent'
+    f !== 'failover_agent' &&
+    f !== 'execution_mode' &&
+    f !== 'artifact_contract'
 );
 
 // ---------------------------------------------------------------------------
@@ -745,6 +776,10 @@ export const dagNodeSchema = dagNodeBaseSchema
       ...(data.fallbackModel !== undefined ? { fallbackModel: data.fallbackModel } : {}),
       ...(data.betas !== undefined ? { betas: data.betas } : {}),
       ...(data.sandbox !== undefined ? { sandbox: data.sandbox } : {}),
+      ...(data.execution_mode !== undefined ? { execution_mode: data.execution_mode } : {}),
+      ...(data.artifact_contract !== undefined
+        ? { artifact_contract: data.artifact_contract }
+        : {}),
       // Control-plane failover fields (WO-HARNESS-NODE-PROVIDER-FAILOVER-01).
       // Populated onto the parsed node so the DAG executor can read
       // node.failover_provider/node.failover_model/node.failover_agent. NOT forwarded into

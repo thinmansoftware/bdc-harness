@@ -7,6 +7,13 @@
   "poll_interval_ms": 5000,
   "heartbeat_interval_ms": 30000,
   "lease_duration_ms": 300000,
+  "run_work": {
+    "enabled": false,
+    "cursor_binary": "cursor-agent",
+    "repository_allowlist": ["https://github.com/OWNER/REPOSITORY.git"],
+    "worktree_root": "C:/Users/USERNAME/.config/bdc/cursor-run-work",
+    "wall_clock_ms": 7200000
+  },
   "capabilities": {
     "providers": ["claude", "codex", "grok", "cursor", "fusion"],
     "docker": false,

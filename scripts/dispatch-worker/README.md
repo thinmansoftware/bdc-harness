@@ -26,6 +26,21 @@ Operator-run watcher for `WO-HARNESS-DISPATCH-DROPBOX-V1-01`.
 bun run scripts/dispatch-worker/index.ts --config scripts/dispatch-worker/config.local.json
 ```
 
+### Cursor Desktop `run_work` lane
+
+The Cauldron Cursor/Grok bridge is dark by default. To make a desktop worker eligible, set
+`run_work.enabled` to `true` and list every permitted canonical Git remote in
+`run_work.repository_allowlist`. The worker rejects all other remotes, protected branches, models
+other than `cursor-grok-4.5-high`, malformed hashes, path traversal, symlinked inputs, and payloads
+outside the declared byte limits.
+
+Each accepted request is cloned at its exact requested SHA into an isolated temporary checkout.
+Read-only nodes launch Cursor in `plan` mode and must leave the SHA unchanged. Write nodes launch
+with `--force`, must create a descendant commit with a clean tree, and push only the assigned branch
+using `--force-with-lease=<branch>:<requested-sha>`. Artifact inputs and outputs cross the host
+boundary only through the request's explicit allowlists and SHA-256 checks. This source change does
+not enable the worker, change credentials, or activate the lane.
+
 On Windows, validate the launcher and then register the logon task after this change is merged into
 the canonical checkout:
 
@@ -73,10 +88,11 @@ remove the seat from `capabilities.providers`; its CLI fallback remains configur
 ## Scope
 
 The worker only claims messages addressed to configured local agents.
-It passes the dispatch body as prompt content in an argv array, never through a shell string.
+It passes prompt content through stdin, never through a shell string or process arguments.
 Each spawn runs in a fresh temp directory and writes a local transcript before posting the result.
 
-`agent_message`, `run_review`, `draft_spec`, and `run_report` are supported. The API rejects
+`agent_message`, `run_review`, `draft_spec`, and `run_report` are supported. The dedicated,
+versioned `run_work` routes are available only for the dark Cursor Desktop lane. The API rejects
 arbitrary shell task types and repo-mutating free-form content before a worker can claim it.
 
 `GET /api/dispatch/status` expires stale worker rows before returning them and exposes queue counts,
