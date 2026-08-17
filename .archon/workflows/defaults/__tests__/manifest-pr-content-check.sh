@@ -2,7 +2,7 @@
 # manifest-pr-content-check.sh -- T1 fixture for PR-file vs manifest claim check
 # WO-HARNESS-ZERO-OPEN-IMPLEMENT-MANIFEST-CHECKPOINT-TRUTH-01
 #
-# Scoped to the 6 lanes with manifest-consistency-check.
+# Scoped to the 10 lanes with manifest-consistency-check.
 # Run: bash .archon/workflows/defaults/__tests__/manifest-pr-content-check.sh
 
 set -uo pipefail
@@ -44,6 +44,10 @@ MCC_SISTER=(
   bdc-feature-development-fusion-cx-qwen.yaml
   bdc-feature-development-zero.yaml
   bdc-feature-development-zero-open.yaml
+  bdc-feature-development-grok.yaml
+  bdc-feature-development-zero-claude.yaml
+  bdc-feature-development-fusion-cx-kimi.yaml
+  bdc-feature-development-kimi-k3.yaml
 )
 
 extract_pr_block() {
@@ -54,7 +58,7 @@ extract_pr_block() {
   ' "$1" | sed 's/^      //'
 }
 
-echo "--- Parity: 6 manifest-pr-content-check blocks byte-identical ---"
+echo "--- Parity: 10 manifest-pr-content-check blocks byte-identical ---"
 REF=""
 REF_NAME=""
 for f in "${MCC_SISTER[@]}"; do
@@ -168,6 +172,64 @@ if printf '%s\n' "$OUT" | grep -q '^OK$'; then
 else
   FAIL=$((FAIL + 1))
   echo "FAIL: expected OK"
+  echo "$OUT"
+fi
+
+# Regression: WO-HARNESS-MANIFEST-CONSISTENCY-CHECK-FALSE-DELETE-01
+# A claimed path carrying a trailing free-text annotation the build-manifest
+# persona appended (e.g. "(deleted)") must NOT be reported absent when the
+# clean path genuinely exists in the PR file list. This is the exact
+# false-negative from run 3729d35751c72fe6a3bf9e8f404cfa66.
+echo "--- Test: annotated claimed path present in PR files -> OK (no false delete) ---"
+MANIFEST=$'Files created: none\nFiles modified: staging/src/providers/auth0.ts (deleted)\nPRs: https://github.com/thinmansoftware/comicstoreos-provisioner/pull/15'
+set +e
+OUT=$(run_pr_check "https://github.com/thinmansoftware/comicstoreos-provisioner/pull/15" "$MANIFEST" "staging/src/providers/auth0.ts")
+CODE=$?
+set -e
+assert_eq "annotated path match exit 0" "0" "$CODE"
+if printf '%s\n' "$OUT" | grep -q '^OK$'; then
+  PASS=$((PASS + 1))
+  echo "PASS: OK when annotated path resolves to present file"
+else
+  FAIL=$((FAIL + 1))
+  echo "FAIL: expected OK for annotated present path"
+  echo "$OUT"
+fi
+
+# Regression: prove the fix is general, not parenthesis-specific -- a trailing
+# annotation without parens (e.g. "renamed") must also truncate cleanly.
+echo "--- Test: annotated (no parens) claimed path present -> OK ---"
+MANIFEST=$'Files created: none\nFiles modified: src/lib/api.ts renamed\nPRs: https://github.com/thinmansoftware/bdc-harness/pull/999'
+set +e
+OUT=$(run_pr_check "https://github.com/thinmansoftware/bdc-harness/pull/999" "$MANIFEST" "src/lib/api.ts")
+CODE=$?
+set -e
+assert_eq "no-parens annotation match exit 0" "0" "$CODE"
+if printf '%s\n' "$OUT" | grep -q '^OK$'; then
+  PASS=$((PASS + 1))
+  echo "PASS: OK when no-parens annotated path resolves to present file"
+else
+  FAIL=$((FAIL + 1))
+  echo "FAIL: expected OK for no-parens annotated present path"
+  echo "$OUT"
+fi
+
+# Regression (ordering lock): the exclusion filter must run BEFORE the new
+# leading-path truncation, so multi-word sentinel tokens like "no files" are
+# still fully excluded and do NOT leak through truncated to a bogus "no" path.
+echo "--- Test: 'no files' sentinel still excluded, non-empty PR files -> OK ---"
+MANIFEST=$'Files created: none\nFiles modified: no files\nPRs: https://github.com/thinmansoftware/bdc-harness/pull/999'
+set +e
+OUT=$(run_pr_check "https://github.com/thinmansoftware/bdc-harness/pull/999" "$MANIFEST" "some/real/file.ts")
+CODE=$?
+set -e
+assert_eq "no-files exclusion exit 0" "0" "$CODE"
+if printf '%s\n' "$OUT" | grep -q '^OK$'; then
+  PASS=$((PASS + 1))
+  echo "PASS: 'no files' treated as nothing-claimed (no leaked 'no' path)"
+else
+  FAIL=$((FAIL + 1))
+  echo "FAIL: 'no files' leaked as a claimed path or otherwise tripped the check"
   echo "$OUT"
 fi
 
