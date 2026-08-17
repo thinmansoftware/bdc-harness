@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from 'bun:test';
 import { createHash } from 'crypto';
 import { rmSync } from 'fs';
 import { join } from 'path';
@@ -23,7 +23,7 @@ import {
   runDueOperatorCardDeliveries,
   type OperatorCardChannel,
 } from '../escalation-delivery';
-import { lookupNotionPage, lookupNotionPageId, runEscalation } from '../escalate';
+import { log, lookupNotionPage, lookupNotionPageId, runEscalation } from '../escalate';
 
 const identity: ActionableEventIdentity = {
   identity_version: 'overseer-actionable-event-v1',
@@ -562,10 +562,27 @@ describe('Notion WO lookup', () => {
       return Response.json({ results: [] });
     }) as typeof fetch;
 
-    const result = await lookupNotionPage('test-key', 'db-1', 'WO-1');
-    expect(result.page_id).toBeNull();
-    expect(result.failure_outcome).toBe('permanent_failure');
-    expect(queried).toEqual(['Task', 'WO ID', 'Name', 'Title', 'WO_ID']);
+    // Pin the log-downgrade mechanism itself, not just the return value. A future
+    // edit that reverts the log statement (re-raising the "exhausted" failure
+    // event) while keeping the permanent_failure return must fail this test.
+    const debugSpy = spyOn(log, 'debug');
+    const infoSpy = spyOn(log, 'info');
+    try {
+      const result = await lookupNotionPage('test-key', 'db-1', 'WO-1');
+      expect(result.page_id).toBeNull();
+      expect(result.failure_outcome).toBe('permanent_failure');
+      expect(queried).toEqual(['Task', 'WO ID', 'Name', 'Title', 'WO_ID']);
+
+      // The no-match branch logs at debug with 'overseer.notion_lookup_no_match'.
+      const debugEvents = debugSpy.mock.calls.map(call => call[1]);
+      expect(debugEvents).toContain('overseer.notion_lookup_no_match');
+      // ...and MUST NOT emit the 'overseer.notion_lookup_exhausted' failure event.
+      const infoEvents = infoSpy.mock.calls.map(call => call[1]);
+      expect(infoEvents).not.toContain('overseer.notion_lookup_exhausted');
+    } finally {
+      debugSpy.mockRestore();
+      infoSpy.mockRestore();
+    }
   });
 
   test('classifies a retry-safe transport failure as transient', async () => {

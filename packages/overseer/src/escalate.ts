@@ -26,7 +26,7 @@
  * mechanism that ensures no Cauldron failure ever exits silently again.
  */
 
-import { createLogger } from '@archon/paths';
+import { createLogger, type Logger } from '@archon/paths';
 import { appendOperatorCard, type OperatorCardRecord } from '@archon/core/db/overseer-briefing';
 import {
   buildOperatorCard,
@@ -37,7 +37,10 @@ import {
 import type { DecisionResult } from './decide.ts';
 import type { ErrorClass } from './classify.ts';
 
-const log = createLogger('overseer/escalate');
+// Exported so tests can spyOn the debug/info methods and pin the log-downgrade
+// contract (no-match logs debug 'notion_lookup_no_match' and does NOT emit the
+// info 'notion_lookup_exhausted' event).
+export const log: Logger = createLogger('overseer/escalate');
 
 /**
  * Structured payload accepted by runEscalation. Mirrors the loose shape of
@@ -234,11 +237,14 @@ export async function lookupNotionPage(
       sawRetrySafeFailure = true;
     }
   }
-  // A query that Notion answered successfully but that matched no page is the
-  // EXPECTED, permanent state for any WO created after the 2026-07-01 GitHub-SOR
-  // cutover (those WOs have no Notion row by design). Classify it as a permanent
-  // no-match so escalation-delivery does not retry it, and log at debug WITHOUT
-  // the "exhausted" failure event -- this is not a failure, it is the common case.
+  // A query that Notion answered successfully but that matched no page is a
+  // permanent no-match: an authoritative empty result will not turn into a row
+  // on retry. This branch is deliberately generic -- it fires for ANY successful
+  // query that matches no page, whether that is a GitHub-only WO with no Notion
+  // row, a mistyped woId, or a legitimately deleted page. There is no date or
+  // cutover check here by design. Classify it as permanent so escalation-delivery
+  // does not retry it, and log at debug WITHOUT the "exhausted" failure event --
+  // for the common GitHub-only case this is not a failure at all.
   if (sawSuccessfulQuery && !sawRetrySafeFailure) {
     log.debug({ candidateProps, databaseId, woId }, 'overseer.notion_lookup_no_match');
     return {
