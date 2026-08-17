@@ -145,7 +145,7 @@ describe('lane registration and war-council-validator pin', () => {
       if (file === 'bdc-feature-development-grok.yaml') {
         // Grok builds; a repository-capable non-Grok judge validates.
         expect(wcv.provider).toBe('codex-opr');
-        expect(wcv.model).not.toBe('x-ai/grok-4.5');
+        expect(wcv.model).not.toBe('x-ai/grok-4.6');
         return;
       }
 
@@ -198,12 +198,12 @@ describe('lane registration and war-council-validator pin', () => {
 
       const planReview = node('plan-review');
       expect(planReview?.provider, `${file}:plan-review:provider`).toBe('grok');
-      expect(planReview?.model, `${file}:plan-review:model`).toBe('x-ai/grok-4.5');
+      expect(planReview?.model, `${file}:plan-review:model`).toBe('x-ai/grok-4.6');
 
       for (const id of ['implement', 'diff-repair', 'opus-repair', 'apply-suggested-fix']) {
         const executionNode = node(id);
         expect(executionNode?.provider, `${file}:${id}:provider`).toBe('grok');
-        expect(executionNode?.model, `${file}:${id}:model`).toBe('x-ai/grok-4.5');
+        expect(executionNode?.model, `${file}:${id}:model`).toBe('x-ai/grok-4.6');
       }
 
       expect(node('apply-suggested-fix')?.agent, `${file}:apply-suggested-fix:agent`).toBe(
@@ -230,10 +230,10 @@ describe('lane registration and war-council-validator pin', () => {
       for (const id of deepseekSeats) {
         const reviewNode = node(id) as NodeDef & { agent?: string };
         expect(reviewNode?.provider, `${file}:${id}:provider`).toBe('codex-opr');
-        expect(reviewNode?.model, `${file}:${id}:model`).toBe('deepseek/deepseek-chat-v3.1');
+        expect(reviewNode?.model, `${file}:${id}:model`).toBe('deepseek/deepseek-v4-pro-0813');
         expect(reviewNode?.model, `${file}:${id}:not-gpt`).not.toMatch(/^gpt-/);
         expect(reviewNode?.model, `${file}:${id}:not-claude`).not.toMatch(/claude/i);
-        expect(reviewNode?.model, `${file}:${id}:not-grok`).not.toBe('x-ai/grok-4.5');
+        expect(reviewNode?.model, `${file}:${id}:not-grok`).not.toBe('x-ai/grok-4.6');
       }
 
       // Executable Claude/Anthropic and overseer-opus exclusions.
@@ -267,7 +267,7 @@ describe('lane registration and war-council-validator pin', () => {
     const node = (id: string) => nodes.find(candidate => candidate.id === id);
 
     expect(lane.provider).toBe('grok');
-    expect(lane.model).toBe('x-ai/grok-4.5');
+    expect(lane.model).toBe('x-ai/grok-4.6');
     expect(content).not.toContain('provider: claude');
     expect(content).not.toContain('model: claude');
     expect(content).not.toContain('agent: overseer-opus');
@@ -282,7 +282,7 @@ describe('lane registration and war-council-validator pin', () => {
     ]) {
       const executionNode = node(id);
       expect(executionNode?.provider, `${file}:${id}:provider`).toBe('grok');
-      expect(executionNode?.model, `${file}:${id}:model`).toBe('x-ai/grok-4.5');
+      expect(executionNode?.model, `${file}:${id}:model`).toBe('x-ai/grok-4.6');
       expect(executionNode?.fallbackModel, `${file}:${id}:fallbackModel`).toBeUndefined();
     }
 
@@ -297,7 +297,7 @@ describe('lane registration and war-council-validator pin', () => {
     ]) {
       const reviewNode = node(id);
       expect(reviewNode?.provider, `${file}:${id}:provider`).toBe('codex-opr');
-      expect(reviewNode?.model, `${file}:${id}:model`).not.toBe('x-ai/grok-4.5');
+      expect(reviewNode?.model, `${file}:${id}:model`).not.toBe('x-ai/grok-4.6');
       expect(reviewNode?.fallbackModel, `${file}:${id}:fallbackModel`).toBeUndefined();
     }
   });
