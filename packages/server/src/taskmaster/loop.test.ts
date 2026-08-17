@@ -10,8 +10,14 @@ import {
   defaultListThreads,
   tick,
   resolveTaskmasterIntervalMs,
+  refreshAdoption,
+  canonicalizeThreadRef,
   type TaskmasterDeps,
+  type ListedThread,
+  type GithubIssueEvidence,
+  type AdoptionRefreshResult,
 } from './loop';
+import type { TmAdoptionRow } from '@archon/core/db/taskmaster';
 import type { ThreadSnapshot } from './rules';
 import type {
   TmActionOutcome,
@@ -36,6 +42,14 @@ interface FakeWorld {
   }>;
   nowMs: number;
   recordCalls: number;
+  adoptionRows: TmAdoptionRow[];
+  adoptionMeta: {
+    committed_snapshot_id: string | null;
+    rebuilt_at: string | null;
+    row_count: number | null;
+    source_commit: string | null;
+    complete: number;
+  };
 }
 
 function makeWorld(): FakeWorld {
@@ -52,6 +66,14 @@ function makeWorld(): FakeWorld {
     sentMessages: [],
     nowMs: T0,
     recordCalls: 0,
+    adoptionRows: [],
+    adoptionMeta: {
+      committed_snapshot_id: null,
+      rebuilt_at: null,
+      row_count: null,
+      source_commit: null,
+      complete: 0,
+    },
   };
 }
 
@@ -132,6 +154,41 @@ function makeDeps(world: FakeWorld, overrides: Partial<TaskmasterDeps> = {}): Ta
       }
       return count;
     },
+    beginAdoptionSnapshot: async () => `snap-${world.nowMs}-${world.adoptionRows.length}`,
+    upsertAdoptionRow: async (snapshotId: string, row: Omit<TmAdoptionRow, 'snapshot_id'>) => {
+      const full: TmAdoptionRow = { ...row, snapshot_id: snapshotId };
+      const idx = world.adoptionRows.findIndex(
+        r => r.snapshot_id === snapshotId && r.thread_ref === row.thread_ref
+      );
+      if (idx >= 0) world.adoptionRows[idx] = full;
+      else world.adoptionRows.push(full);
+    },
+    commitAdoptionSnapshot: async (snapshotId: string, sourceCommit?: string | null) => {
+      world.adoptionRows = world.adoptionRows.filter(r => r.snapshot_id === snapshotId);
+      world.adoptionMeta = {
+        committed_snapshot_id: snapshotId,
+        rebuilt_at: new Date(world.nowMs).toISOString(),
+        row_count: world.adoptionRows.length,
+        source_commit: sourceCommit ?? null,
+        complete: 1,
+      };
+    },
+    abandonAdoptionSnapshot: async (snapshotId: string) => {
+      world.adoptionRows = world.adoptionRows.filter(r => r.snapshot_id !== snapshotId);
+    },
+    getAdoption: async () => {
+      const id = world.adoptionMeta.committed_snapshot_id;
+      if (!id) return [];
+      return world.adoptionRows.filter(r => r.snapshot_id === id);
+    },
+    getAdoptionMeta: async () => ({
+      id: 1,
+      committed_snapshot_id: world.adoptionMeta.committed_snapshot_id,
+      rebuilt_at: world.adoptionMeta.rebuilt_at,
+      row_count: world.adoptionMeta.row_count,
+      source_commit: world.adoptionMeta.source_commit,
+      complete: world.adoptionMeta.complete,
+    }),
   };
 
   const okHeadroom: HeadroomReading = {
@@ -161,6 +218,8 @@ function makeDeps(world: FakeWorld, overrides: Partial<TaskmasterDeps> = {}): Ta
     },
     listUndeliveredRulings: async () => [],
     listThreads: async () => [],
+    // Default no-op evidence so adoption refresh never hits the network in unit tests.
+    getGithubIssueEvidence: async () => null,
     ...overrides,
   };
 }
@@ -1209,5 +1268,384 @@ describe('defaultListThreads -- GitHub work-SOR read', () => {
     expect(urls[1]).toContain('/issues/1453/comments');
     expect(urls.some(url => url.includes('/events'))).toBe(false);
     expect(urls.some(url => url.includes('/issues/1454'))).toBe(false);
+  });
+});
+
+
+// ---------------------------------------------------------------------------
+// Adoption projection (WO-HARNESS-TASKMASTER-ADOPTION-PROJECTION-01)
+// Section 11 scenarios -- every test name includes "adoption" or "canonicaliz"
+// ---------------------------------------------------------------------------
+
+function makeListedThread(overrides: Partial<ListedThread> & { ref: string }): ListedThread {
+  return {
+    priority: 'P1',
+    lastActivityAt: new Date(T0).toISOString(),
+    recipient: 'xo',
+    title: 'untitled',
+    ownerLogin: null,
+    labels: ['wo', 'prio:P1'],
+    ...overrides,
+  };
+}
+
+function makeEvidence(overrides: Partial<GithubIssueEvidence> = {}): GithubIssueEvidence {
+  return {
+    state: 'open',
+    updatedAt: new Date(T0).toISOString(),
+    labels: ['wo', 'prio:P1'],
+    assigneeCount: 0,
+    closedAt: null,
+    assignedAt: null,
+    activeStatusAt: null,
+    progressRecordedAt: null,
+    ownerLogin: null,
+    latestMarkerKind: null,
+    latestMarkerText: null,
+    latestMarkerAt: null,
+    lastMovementAt: null,
+    lastMovementKind: null,
+    ...overrides,
+  };
+}
+
+describe('adoption projection', () => {
+  test('adoption: captures charter-minimum state (title owner blocker movement)', async () => {
+    const world = makeWorld();
+    const thread = makeListedThread({
+      ref: 'gh:thinmansoftware/bdc-xo#100',
+      title: 'Fix the thing',
+      ownerLogin: 'major-build',
+      priority: 'P1',
+      labels: ['wo', 'prio:P1'],
+    });
+    const deps = makeDeps(world, {
+      listThreads: async () => [thread],
+      getGithubIssueEvidence: async () =>
+        makeEvidence({
+          ownerLogin: 'major-build',
+          latestMarkerKind: 'BLOCKED',
+          latestMarkerText: '[BLOCKED] waiting on Stripe key rotation',
+          latestMarkerAt: new Date(T0 - 3_600_000).toISOString(),
+          assignedAt: new Date(T0 - 7_200_000).toISOString(),
+          lastMovementAt: new Date(T0 - 7_200_000).toISOString(),
+          lastMovementKind: 'assigned',
+          assigneeCount: 1,
+        }),
+    });
+
+    const result = await refreshAdoption([thread], deps);
+    expect(result.failed).toBe(false);
+    const rows = await deps.db!.getAdoption!();
+    expect(rows).toHaveLength(1);
+    const row = rows[0];
+    expect(row.title).toBe('Fix the thing');
+    expect(row.owner_login).toBe('major-build');
+    expect(row.is_blocked).toBe(1);
+    expect(row.blocked_reason).toContain('Stripe key rotation');
+    expect(row.last_movement_kind).not.toBeNull();
+    expect(row.evidence_observed_at).not.toBeNull();
+  });
+
+  test('adoption: UNKNOWN is preserved, never guessed for owner or next_action', async () => {
+    const world = makeWorld();
+    const thread = makeListedThread({
+      ref: 'gh:thinmansoftware/bdc-xo#101',
+      title: 'No owner yet',
+      ownerLogin: null,
+    });
+    const deps = makeDeps(world, {
+      getGithubIssueEvidence: async () =>
+        makeEvidence({
+          ownerLogin: null,
+          latestMarkerKind: null,
+          latestMarkerText: null,
+        }),
+    });
+    await refreshAdoption([thread], deps);
+    const row = (await deps.db!.getAdoption!())[0];
+    expect(row.owner_login).toBeNull();
+    expect(row.next_action).toBeNull();
+    expect(row.owner_login).not.toBe('');
+    expect(row.next_action).not.toBe('');
+  });
+
+  test('adoption: partial read never overwrites a good snapshot', async () => {
+    const world = makeWorld();
+    // Seed a committed snapshot with 3 rows.
+    const seedId = 'snap-good';
+    for (let i = 1; i <= 3; i++) {
+      world.adoptionRows.push({
+        thread_ref: `gh:thinmansoftware/bdc-xo#${i}`,
+        snapshot_id: seedId,
+        repo: 'thinmansoftware/bdc-xo',
+        issue_number: i,
+        title: `Seed ${i}`,
+        priority: 'P2',
+        labels_json: '[]',
+        owner_login: null,
+        is_blocked: 0,
+        blocked_reason: null,
+        next_action: null,
+        latest_marker_kind: null,
+        latest_marker_at: null,
+        state: 'open',
+        last_movement_at: null,
+        last_movement_kind: null,
+        attempts_24h: 0,
+        attempts_total: 0,
+        evidence_observed_at: new Date(T0).toISOString(),
+        source_updated_at: new Date(T0).toISOString(),
+      });
+    }
+    world.adoptionMeta = {
+      committed_snapshot_id: seedId,
+      rebuilt_at: new Date(T0).toISOString(),
+      row_count: 3,
+      source_commit: null,
+      complete: 1,
+    };
+
+    let evidenceCalls = 0;
+    const threads = [1, 2, 3].map(i =>
+      makeListedThread({ ref: `gh:thinmansoftware/bdc-xo#${i}`, title: `T${i}` })
+    );
+    const deps = makeDeps(world, {
+      getGithubIssueEvidence: async () => {
+        evidenceCalls += 1;
+        if (evidenceCalls === 1) {
+          return makeEvidence({ ownerLogin: 'ok' });
+        }
+        // Simulate assertGithubRateLimit throw after first success.
+        const err = new Error('taskmaster_github_rate_limit_backoff:4');
+        err.name = 'GithubRateLimitBackoffError';
+        throw err;
+      },
+    });
+
+    const result = await refreshAdoption(threads, deps);
+    expect(result.failed).toBe(true);
+    expect(result.error).not.toBeNull();
+    expect(world.adoptionMeta.committed_snapshot_id).toBe(seedId);
+    const rows = await deps.db!.getAdoption!();
+    expect(rows).toHaveLength(3);
+    expect(rows.every(r => r.snapshot_id === seedId)).toBe(true);
+    // No rows remain under the abandoned (non-seed) snapshot.
+    const abandoned = world.adoptionRows.filter(r => r.snapshot_id !== seedId);
+    expect(abandoned).toHaveLength(0);
+  });
+
+  test('adoption: failed refresh suppresses tick heartbeat', async () => {
+    const world = makeWorld();
+    seedDigestSent(world);
+    let evidenceCalls = 0;
+    const thread = makeListedThread({
+      ref: 'gh:thinmansoftware/bdc-xo#200',
+      // Make it healthy so send path has nothing to do besides digest (already seeded).
+      lastActivityAt: new Date(T0).toISOString(),
+      isBlocked: false,
+    });
+    const deps = makeDeps(world, {
+      listThreads: async () => [thread],
+      getGithubIssueEvidence: async () => {
+        evidenceCalls += 1;
+        throw new Error('taskmaster_github_rate_limit_backoff:4');
+      },
+    });
+    const state = createTaskmasterState(60_000);
+    const result = await tick(state, deps);
+    expect(result.successful).toBe(false);
+    expect(state.deadman.lastTickAtMs).toBeNull();
+    // grade/send phase still executed: digest was already seeded so no new send,
+    // but tick completed (ran=true) rather than aborting mid-flow.
+    expect(result.ran).toBe(true);
+    expect(evidenceCalls).toBeGreaterThanOrEqual(1);
+  });
+
+  test('adoption: canonicalizeThreadRef spans org AND repo', async () => {
+    expect(canonicalizeThreadRef('gh:bluedevilcollectibles/bdc-xo#1366')).toBe(
+      'gh:thinmansoftware/bdc-xo#1366'
+    );
+    expect(canonicalizeThreadRef('gh:bluedevilcollectibles/bdc-harness#209')).toBe(
+      'gh:thinmansoftware/bdc-harness#209'
+    );
+    expect(canonicalizeThreadRef('digest:2026-08-17')).toBe('digest:2026-08-17');
+  });
+
+  test('adoption: attempt counts span org eras via canonicalization', async () => {
+    const world = makeWorld();
+    const nowIso = new Date(T0).toISOString();
+    const within24h = new Date(T0 - 3_600_000).toISOString();
+    const older = new Date(T0 - 48 * 3_600_000).toISOString();
+    // 3 sent on old org (1 within 24h), 2 sent on new org (both within 24h)
+    const seed = (
+      ref: string,
+      created_at: string,
+      id: string
+    ): void => {
+      world.journal.push({
+        id,
+        created_at,
+        thread_ref: ref,
+        action_type: 'nudge',
+        proposal_json: '{}',
+        idempotency_key: `tm:nudge:${ref}:${id}`,
+        before_hash: null,
+        proof_predicate: null,
+        proof_deadline_at: null,
+        outcome: 'sent',
+        graded_at: null,
+        grade: null,
+      });
+    };
+    seed('gh:bluedevilcollectibles/bdc-xo#1366', older, 'old-1');
+    seed('gh:bluedevilcollectibles/bdc-xo#1366', older, 'old-2');
+    seed('gh:bluedevilcollectibles/bdc-xo#1366', within24h, 'old-3');
+    seed('gh:thinmansoftware/bdc-xo#1366', within24h, 'new-1');
+    seed('gh:thinmansoftware/bdc-xo#1366', within24h, 'new-2');
+
+    const thread = makeListedThread({
+      ref: 'gh:thinmansoftware/bdc-xo#1366',
+      title: 'Cross-era',
+    });
+    const deps = makeDeps(world, {
+      getGithubIssueEvidence: async () => makeEvidence({ ownerLogin: 'xo' }),
+    });
+    await refreshAdoption([thread], deps);
+    const rows = await deps.db!.getAdoption!();
+    expect(rows).toHaveLength(1);
+    expect(rows[0].thread_ref).toBe('gh:thinmansoftware/bdc-xo#1366');
+    expect(rows[0].attempts_total).toBe(5);
+    expect(rows[0].attempts_24h).toBe(3);
+  });
+
+  test('adoption: evidence budget bounds requests per tick at default 10', async () => {
+    const world = makeWorld();
+    const prior = process.env.TASKMASTER_ADOPTION_EVIDENCE_BUDGET;
+    delete process.env.TASKMASTER_ADOPTION_EVIDENCE_BUDGET;
+    try {
+      const threads = Array.from({ length: 100 }, (_, i) =>
+        makeListedThread({
+          ref: `gh:thinmansoftware/bdc-xo#${1000 + i}`,
+          title: `Issue ${i}`,
+        })
+      );
+      let evidenceCalls = 0;
+      const deps = makeDeps(world, {
+        getGithubIssueEvidence: async () => {
+          evidenceCalls += 1;
+          return makeEvidence();
+        },
+      });
+      await refreshAdoption(threads, deps);
+      expect(evidenceCalls).toBeLessThanOrEqual(10);
+      const rows = await deps.db!.getAdoption!();
+      expect(rows).toHaveLength(100);
+      const unknown = rows.filter(r => r.evidence_observed_at === null);
+      expect(unknown.length).toBeGreaterThanOrEqual(90);
+    } finally {
+      if (prior === undefined) delete process.env.TASKMASTER_ADOPTION_EVIDENCE_BUDGET;
+      else process.env.TASKMASTER_ADOPTION_EVIDENCE_BUDGET = prior;
+    }
+  });
+
+  test('adoption: budget is env-overridable and enriches oldest first', async () => {
+    const world = makeWorld();
+    const prior = process.env.TASKMASTER_ADOPTION_EVIDENCE_BUDGET;
+    process.env.TASKMASTER_ADOPTION_EVIDENCE_BUDGET = '3';
+    try {
+      // Seed prior committed snapshot for all 100 threads with deterministic ages.
+      // Index 0 = NULL (oldest/unknown), then increasing timestamps so
+      // indices 1 and 2 are the next two oldest non-null.
+      const seedId = 'snap-prior';
+      for (let i = 0; i < 100; i++) {
+        const evidenceAt =
+          i === 0 ? null : new Date(T0 - (100 - i) * 1_000).toISOString();
+        world.adoptionRows.push({
+          thread_ref: `gh:thinmansoftware/bdc-xo#${2000 + i}`,
+          snapshot_id: seedId,
+          repo: 'thinmansoftware/bdc-xo',
+          issue_number: 2000 + i,
+          title: `Prior ${i}`,
+          priority: 'P2',
+          labels_json: '[]',
+          owner_login: null,
+          is_blocked: 0,
+          blocked_reason: null,
+          next_action: null,
+          latest_marker_kind: null,
+          latest_marker_at: null,
+          state: 'open',
+          last_movement_at: null,
+          last_movement_kind: null,
+          attempts_24h: 0,
+          attempts_total: 0,
+          evidence_observed_at: evidenceAt,
+          source_updated_at: new Date(T0).toISOString(),
+        });
+      }
+      world.adoptionMeta = {
+        committed_snapshot_id: seedId,
+        rebuilt_at: new Date(T0).toISOString(),
+        row_count: 100,
+        source_commit: null,
+        complete: 1,
+      };
+
+      const threads = Array.from({ length: 100 }, (_, i) =>
+        makeListedThread({
+          ref: `gh:thinmansoftware/bdc-xo#${2000 + i}`,
+          title: `Issue ${i}`,
+        })
+      );
+
+      const enrichedRefs: string[] = [];
+      const deps = makeDeps(world, {
+        getGithubIssueEvidence: async ref => {
+          enrichedRefs.push(ref);
+          return makeEvidence();
+        },
+      });
+      await refreshAdoption(threads, deps);
+      expect(enrichedRefs.length).toBeLessThanOrEqual(3);
+      // Oldest-first: NULL (2000), then 2001 (oldest non-null), then 2002.
+      expect(enrichedRefs[0]).toBe('gh:thinmansoftware/bdc-xo#2000');
+      expect(enrichedRefs[1]).toBe('gh:thinmansoftware/bdc-xo#2001');
+      expect(enrichedRefs[2]).toBe('gh:thinmansoftware/bdc-xo#2002');
+    } finally {
+      if (prior === undefined) delete process.env.TASKMASTER_ADOPTION_EVIDENCE_BUDGET;
+      else process.env.TASKMASTER_ADOPTION_EVIDENCE_BUDGET = prior;
+    }
+  });
+
+  test('adoption: send path untouched regression guard', async () => {
+    // Re-run a classic send scenario to prove the adoption insert did not
+    // change send/grade behavior. Existing suite scenarios remain unmodified.
+    const world = makeWorld();
+    seedDigestSent(world);
+    const deps = makeDeps(world, {
+      listUndeliveredRulings: async () => [
+        {
+          ref: 'dispatch:ruling-42',
+          priority: 'P1',
+          lastActivityAt: new Date(T0 - 3_600_000).toISOString(),
+          undeliveredRulingId: 'ruling-42',
+          recipient: 'xo',
+        },
+      ],
+      listThreads: async () => [],
+    });
+    const state = createTaskmasterState(60_000);
+    const first = await tick(state, deps);
+    expect(first.effects).toBe(1);
+    const second = await tick(state, deps);
+    // Second tick: two-tick confirm already satisfied on first for actsImmediately.
+    // deliver_ruling is actsImmediately; second tick should not double-send.
+    const deliverRows = world.journal.filter(j => j.action_type === 'deliver_ruling');
+    expect(deliverRows.length).toBe(1);
+    expect(world.sentMessages.filter(m => m.idempotency_key.includes('deliver_ruling')).length).toBe(
+      1
+    );
+    expect(second.effects).toBe(0);
   });
 });

@@ -244,6 +244,12 @@ export class SqliteAdapter implements IDatabase {
     this.db.run(
       'CREATE INDEX IF NOT EXISTS idx_tm_usage_provider ON tm_usage_sample(provider, observed_at)'
     );
+    // Taskmaster adoption projection indexes (migration 043) -- after migrateColumns()
+    // per the established pattern.
+    this.db.run(
+      'CREATE INDEX IF NOT EXISTS idx_tm_adoption_snapshot ON tm_adoption(snapshot_id)'
+    );
+    this.db.run('CREATE INDEX IF NOT EXISTS idx_tm_adoption_thread ON tm_adoption(thread_ref)');
   }
 
   /**
@@ -1541,6 +1547,49 @@ export class SqliteAdapter implements IDatabase {
       );
 
       INSERT OR IGNORE INTO tm_control (id, pause_state, epoch) VALUES (1, 'RUNNING', 0);
+
+      -- Taskmaster adoption projection (migration 043,
+      -- WO-HARNESS-TASKMASTER-ADOPTION-PROJECTION-01). Disposable snapshot
+      -- rebuilt from GitHub; additive only.
+      CREATE TABLE IF NOT EXISTS tm_adoption (
+        thread_ref TEXT NOT NULL,
+        snapshot_id TEXT NOT NULL,
+        repo TEXT NOT NULL,
+        issue_number INTEGER NOT NULL,
+        title TEXT,
+        priority TEXT NOT NULL,
+        labels_json TEXT NOT NULL,
+        owner_login TEXT,
+        is_blocked INTEGER NOT NULL DEFAULT 0,
+        blocked_reason TEXT,
+        next_action TEXT,
+        latest_marker_kind TEXT CHECK (
+          latest_marker_kind IS NULL OR latest_marker_kind IN ('PROGRESS', 'BLOCKED')
+        ),
+        latest_marker_at TEXT,
+        state TEXT,
+        last_movement_at TEXT,
+        last_movement_kind TEXT CHECK (
+          last_movement_kind IS NULL
+          OR last_movement_kind IN ('closed', 'assigned', 'status_label', 'progress_comment')
+        ),
+        attempts_24h INTEGER NOT NULL DEFAULT 0,
+        attempts_total INTEGER NOT NULL DEFAULT 0,
+        evidence_observed_at TEXT,
+        source_updated_at TEXT NOT NULL,
+        PRIMARY KEY (snapshot_id, thread_ref)
+      );
+
+      CREATE TABLE IF NOT EXISTS tm_adoption_meta (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        committed_snapshot_id TEXT,
+        rebuilt_at TEXT,
+        row_count INTEGER,
+        source_commit TEXT,
+        complete INTEGER NOT NULL DEFAULT 0
+      );
+
+      INSERT OR IGNORE INTO tm_adoption_meta (id) VALUES (1);
     `);
     getLog().info('db.sqlite_schema_initialized');
   }
