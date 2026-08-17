@@ -128,6 +128,19 @@ export const defaultAgentConfigs: Record<string, AgentConfig> = {
   },
 };
 
+/**
+ * M-131 Phase A: restricts an agent registry to a seat's provider allowlist
+ * so an isolated seat can only advertise and run the providers it honestly
+ * owns (Grok-only for bdc-seat-grok). Unknown allowlist entries are simply
+ * absent from the result; seat preflight reports the typed error.
+ */
+export function restrictAgentsToAllowlist(
+  agents: Record<string, AgentConfig>,
+  allowlist: string[]
+): Record<string, AgentConfig> {
+  return Object.fromEntries(Object.entries(agents).filter(([name]) => allowlist.includes(name)));
+}
+
 export function buildAgentInvocation(
   config: AgentConfig,
   // Retained for call-site/test compatibility; no longer used for argv substitution.
