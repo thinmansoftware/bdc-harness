@@ -6,7 +6,7 @@ description: |
   NOT for: Feature development (use bdc-feature-development.yaml), doctrine updates, infra deploys, or sweeps requiring judgment.
 
 policyFile: harness/policies/agent-behavior.md
-model: claude-sonnet-4-5
+model: sonnet
 
 nodes:
   - id: read-spec

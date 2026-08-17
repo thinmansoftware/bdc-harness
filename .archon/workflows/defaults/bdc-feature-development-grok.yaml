@@ -1,7 +1,7 @@
 name: bdc-feature-development-grok
 description: |
   Dedicated tool-capable Grok lane for feature Work Orders. Grok owns planning,
-  implementation, and repair seats through provider grok with x-ai/grok-4.5.
+  implementation, and repair seats through provider grok with x-ai/grok-4.6.
   Every review and judge seat is explicitly pinned to codex-opr so Grok never
   grades its own output. This lane is directly invokable but is intentionally
   absent from the Smart Cauldron ladder and production router mapping.
@@ -17,7 +17,7 @@ run_authority:
   allow_issue_fallback: true
 # Dedicated Grok execution default. Review nodes override this with codex-opr.
 provider: grok
-model: x-ai/grok-4.5
+model: x-ai/grok-4.6
 
 nodes:
   # Pre-flight: fail closed if container lacks GITHUB auth (WO-169, 2026-05-16).
@@ -117,7 +117,7 @@ nodes:
   # net, this is only an optimization that must never wrongly skip real work.
   - id: check-already-satisfied
     provider: grok
-    model: x-ai/grok-4.5
+    model: x-ai/grok-4.6
     persona: war-council-architect-opr
     agent: war-council-architect-opr
     depends_on: [read-spec]
@@ -222,7 +222,7 @@ nodes:
 
   - id: plan
     provider: grok
-    model: x-ai/grok-4.5
+    model: x-ai/grok-4.6
     persona: war-council-architect-opr
     depends_on: [gate-already-satisfied]
     when: "$gate-already-satisfied.output.ALREADY_SATISFIED != 'true'"
@@ -273,7 +273,7 @@ nodes:
     agent: war-council-architect-opr
     # Cross-model boundary: Grok authors the plan; DeepSeek reviews it through
     # the repository-capable codex-opr provider. Grok never grades its own work.
-    model: deepseek/deepseek-chat-v3.1
+    model: deepseek/deepseek-v4-pro-0813
     depends_on: [plan]
     trigger_rule: all_done
     when: "$gate-already-satisfied.output.ALREADY_SATISFIED != 'true'"
@@ -399,7 +399,7 @@ nodes:
     # Dedicated Grok builder seat. The provider contract supplies repository write
     # and shell capabilities; downstream codex-opr seats independently review it.
     provider: grok
-    model: x-ai/grok-4.5
+    model: x-ai/grok-4.6
     persona: major-build-opr
     depends_on: [capture-run-scope]
     trigger_rule: all_done
@@ -1068,7 +1068,7 @@ nodes:
     # DeepSeek judge through the repository-capable OpenRouter tool loop.
     provider: codex-opr
     persona: captain-ci-validator-codex
-    model: deepseek/deepseek-chat-v3.1
+    model: deepseek/deepseek-v4-pro-0813
     depends_on: [ascii-gate]
     task_class: medium_work
     prompt: |
@@ -1228,7 +1228,7 @@ nodes:
 
   - id: diff-repair
     provider: grok
-    model: x-ai/grok-4.5
+    model: x-ai/grok-4.6
     persona: major-build-opr
     depends_on: [diff-review, classify-diff-review, resolve-review-base]
     when: "$classify-diff-review.output.verdict == 'needs_revision'"
@@ -1491,7 +1491,7 @@ nodes:
   # resolve the block, then signals. If it can't fix, the run proceeds to the human pause.
   - id: opus-repair
     provider: grok
-    model: x-ai/grok-4.5
+    model: x-ai/grok-4.6
     persona: major-build-opr
     depends_on: [block-classify]
     when: "$block-classify.output.status == 'BLOCKED'"
@@ -1833,7 +1833,7 @@ nodes:
   # trigger_rule all_done so an APPROVE-AS-IS run (which skips this) does not hang the DAG.
   - id: apply-suggested-fix
     provider: grok
-    model: x-ai/grok-4.5
+    model: x-ai/grok-4.6
     agent: major-build-opr
     effort: xhigh
     context: fresh

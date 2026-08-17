@@ -10,7 +10,7 @@ description: |
        Every WO using this YAML must declare parallel_ok=false.
 
 policyFile: harness/policies/agent-behavior.md
-model: claude-sonnet-4-5
+model: sonnet
 
 nodes:
   - id: read-spec

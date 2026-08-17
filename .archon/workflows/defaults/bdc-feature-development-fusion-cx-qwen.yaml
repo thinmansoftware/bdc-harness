@@ -16,7 +16,7 @@ run_authority:
     - docs/superpowers/specs/{WO_ID}.md
   allow_issue_fallback: true
 provider: opr  # root: bare AI tails use OpenRouter, not Codex/Claude (Codex exhausted 2026-07-09)
-model: x-ai/grok-4.5  # Grok substitute for prior root gpt-5.5/Codex default
+model: x-ai/grok-4.6  # Grok substitute for prior root gpt-5.5/Codex default
 
 nodes:
   # Pre-flight: fail closed if container lacks GITHUB auth (WO-169, 2026-05-16).
@@ -116,7 +116,7 @@ nodes:
   # net, this is only an optimization that must never wrongly skip real work.
   - id: check-already-satisfied
     provider: grok
-    model: x-ai/grok-4.5
+    model: x-ai/grok-4.6
     persona: war-council-architect-opr
     depends_on: [read-spec]
     task_class: clerical
@@ -220,7 +220,7 @@ nodes:
 
   - id: plan
     provider: opr
-    model: qwen/qwen3-coder
+    model: qwen/qwen3-coder-next
     # WO-HARNESS-NODE-PROVIDER-FAILOVER-01: this builder-side planning node rides
     # OpenRouter (qwen). If OpenRouter throttles/drops (429/timeout/5xx/connection),
     # fall SIDEWAYS to Codex once rather than killing the run. The war-council-
@@ -230,7 +230,7 @@ nodes:
     # diff-review*, war-council-validator) are intentionally NOT wired -- a gate
     # that silently switches models undermines gate integrity (spec doctrine).
     failover_provider: opr
-    failover_model: x-ai/grok-4.5
+    failover_model: x-ai/grok-4.6
     persona: war-council-architect-opr
     depends_on: [gate-already-satisfied]
     when: "$gate-already-satisfied.output.ALREADY_SATISFIED != 'true'"
@@ -278,7 +278,7 @@ nodes:
   # async escalation payload, and only at the irreversible-action boundary downstream.
   - id: plan-review
     provider: codex-opr
-    model: deepseek/deepseek-chat-v3.1  # REVIEWER seat, not builder: qwen (the builder model) is not servable by codex-opr on a ChatGPT account (HTTP 400), and plan-review is a cross-model adversarial REVIEW of qwen's plan -- so it must be a different model anyway (never self-grade). deepseek matches the other review seats (diff-review, opus-rereview). Fixes every fusion-cx-qwen run dying at plan-review 2026-07-11.
+    model: deepseek/deepseek-v4-pro-0813  # REVIEWER seat, not builder: qwen (the builder model) is not servable by codex-opr on a ChatGPT account (HTTP 400), and plan-review is a cross-model adversarial REVIEW of qwen's plan -- so it must be a different model anyway (never self-grade). deepseek matches the other review seats (diff-review, opus-rereview). Fixes every fusion-cx-qwen run dying at plan-review 2026-07-11.
     persona: war-council-architect-opr
     depends_on: [plan]
     trigger_rule: all_done
@@ -401,7 +401,7 @@ nodes:
 
   - id: implement
     provider: grok
-    model: x-ai/grok-4.5
+    model: x-ai/grok-4.6
     persona: major-build-opr
     depends_on: [capture-run-scope]
     trigger_rule: all_done
@@ -1025,7 +1025,7 @@ nodes:
   - id: war-council-validator
     # DeepSeek judge through the repository-capable OpenRouter tool loop.
     provider: codex-opr
-    model: deepseek/deepseek-chat-v3.1
+    model: deepseek/deepseek-v4-pro-0813
     persona: captain-ci-validator-codex
     depends_on: [ascii-gate]
     task_class: medium_work
@@ -1130,7 +1130,7 @@ nodes:
 
   - id: diff-review
     provider: codex-opr
-    model: deepseek/deepseek-chat-v3.1  # cross-model adversarial review, not self-grading (John 2026-07-07: DeepSeek's strong suit is review, not authoring code; never mark its own qwen-authored homework)
+    model: deepseek/deepseek-v4-pro-0813  # cross-model adversarial review, not self-grading (John 2026-07-07: DeepSeek's strong suit is review, not authoring code; never mark its own qwen-authored homework)
     agent: opr-adversarial-reviewer
     depends_on: [capture-diff]
     task_class: medium_work
@@ -1186,7 +1186,7 @@ nodes:
 
   - id: diff-repair
     provider: grok
-    model: x-ai/grok-4.5
+    model: x-ai/grok-4.6
     persona: major-build-opr
     depends_on: [diff-review, classify-diff-review, resolve-review-base]
     when: "$classify-diff-review.output.verdict == 'needs_revision'"
@@ -1329,7 +1329,7 @@ nodes:
 
   - id: diff-review-final
     provider: codex-opr
-    model: deepseek/deepseek-chat-v3.1  # cross-model adversarial review, not self-grading -- see diff-review
+    model: deepseek/deepseek-v4-pro-0813  # cross-model adversarial review, not self-grading -- see diff-review
     agent: opr-adversarial-reviewer
     depends_on: [diff-review, classify-diff-review, diff-repair, capture-diff-final]
     trigger_rule: all_done
@@ -1434,7 +1434,7 @@ nodes:
   # resolve the block, then signals. If it can't fix, the run proceeds to the human pause.
   - id: opus-repair
     provider: grok
-    model: x-ai/grok-4.5
+    model: x-ai/grok-4.6
     persona: major-build-opr
     depends_on: [block-classify]
     when: "$block-classify.output.status == 'BLOCKED'"
@@ -1495,7 +1495,7 @@ nodes:
   # terminal-BLOCKED on a non-interactive run.
   - id: opus-rereview
     provider: codex-opr
-    model: deepseek/deepseek-chat-v3.1  # cross-model adversarial review, not self-grading -- see diff-review
+    model: deepseek/deepseek-v4-pro-0813  # cross-model adversarial review, not self-grading -- see diff-review
     agent: opr-adversarial-reviewer
     depends_on: [classify-opus-repair]
     trigger_rule: all_done
@@ -1684,7 +1684,7 @@ nodes:
   - id: findings-consolidate
     persona: xo-opr
     provider: opr
-    model: deepseek/deepseek-chat-v3.1
+    model: deepseek/deepseek-v4-pro-0813
     depends_on: [block-reclassify]
     trigger_rule: all_done
     task_class: clerical
@@ -1776,7 +1776,7 @@ nodes:
   # trigger_rule all_done so an APPROVE-AS-IS run (which skips this) does not hang the DAG.
   - id: apply-suggested-fix
     provider: grok
-    model: x-ai/grok-4.5
+    model: x-ai/grok-4.6
     agent: overseer-opus
     effort: xhigh
     context: fresh
@@ -1862,7 +1862,7 @@ nodes:
   - id: decide-push-target
     persona: major-build-opr
     provider: opr
-    model: qwen/qwen3-coder
+    model: qwen/qwen3-coder-next
     depends_on: [pause-gate, classify-apply-review]
     trigger_rule: all_done
     when: "$pause-gate.output.decision_verb != 'approve_with_fix' || $classify-apply-review.output.verdict == 'satisfied'"
@@ -2497,7 +2497,7 @@ nodes:
   - id: build-manifest
     persona: major-build-opr
     provider: opr
-    model: qwen/qwen3-coder
+    model: qwen/qwen3-coder-next
     depends_on: [open-pr-if-needed, block-reclassify, pause-gate]
     trigger_rule: all_done
     task_class: clerical
