@@ -36,7 +36,7 @@ run_authority:
 # disposition, not a failure -- a rung-1 run that fails cheaply and hands up
 # has done its job.
 #
-# Model swept qwen/qwen3-coder -> qwen/qwen3-coder-next by M-121. Same 262K
+# Model swept qwen/qwen3-coder-next -> qwen/qwen3-coder-next by M-121. Same 262K
 # context, strictly cheaper ($0.12/$0.80 per 1M vs $0.30/$1.00), and the
 # release specifically targets agentic editing -- the ONE seat Qwen lost here
 # (see the 2026-07-07 implement swap note further down).
@@ -1097,7 +1097,7 @@ nodes:
     # DeepSeek judge through the repository-capable OpenRouter tool loop.
     provider: codex-opr
     persona: captain-ci-validator-codex
-    model: deepseek/deepseek-chat-v3.1
+    model: deepseek/deepseek-v4-pro-0813
     depends_on: [ascii-gate]
     task_class: medium_work
     prompt: |
@@ -1201,7 +1201,7 @@ nodes:
 
   - id: diff-review
     provider: codex-opr
-    model: deepseek/deepseek-chat-v3.1
+    model: deepseek/deepseek-v4-pro-0813
     agent: codex-adversarial-reviewer
     depends_on: [capture-diff]
     task_class: medium_work
@@ -1415,7 +1415,7 @@ nodes:
 
   - id: diff-review-final
     provider: codex-opr
-    model: deepseek/deepseek-chat-v3.1
+    model: deepseek/deepseek-v4-pro-0813
     agent: codex-adversarial-reviewer
     depends_on: [diff-review, classify-diff-review, diff-repair, capture-diff-final]
     trigger_rule: all_done
@@ -1581,7 +1581,7 @@ nodes:
   # terminal-BLOCKED on a non-interactive run.
   - id: opus-rereview
     provider: codex-opr
-    model: deepseek/deepseek-chat-v3.1
+    model: deepseek/deepseek-v4-pro-0813
     agent: codex-adversarial-reviewer
     depends_on: [classify-opus-repair]
     trigger_rule: all_done
@@ -1897,7 +1897,7 @@ nodes:
   # Distinct id (diff-review-final already ran upstream). Only meaningful on the APPROVE-WITH-FIX path.
   - id: apply-diff-review-final
     provider: codex-opr
-    model: deepseek/deepseek-chat-v3.1
+    model: deepseek/deepseek-v4-pro-0813
     agent: codex-adversarial-reviewer
     depends_on: [apply-suggested-fix]
     trigger_rule: all_done
