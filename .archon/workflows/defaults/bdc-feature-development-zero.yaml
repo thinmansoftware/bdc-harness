@@ -8,7 +8,7 @@ description: |
     plan (architect seat)        = Qwen qwen/qwen3-coder-next (root default)
     plan-review (attack seat)    = Grok x-ai/grok-4.6
     implement + repairs (builder)= Grok x-ai/grok-4.6
-    diff reviews (attack seats)  = DeepSeek deepseek-chat-v3.1
+    diff reviews (attack seats)  = DeepSeek deepseek-v4-pro-0813
     war-council-validator (judge)= DeepSeek via OpenRouter (dual-cap; no Codex required)
   No model ever grades its own output; NO node consumes Claude usage. All
   persona-bearing prompt nodes use model-free -opr/-codex persona variants
