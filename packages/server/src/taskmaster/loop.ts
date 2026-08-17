@@ -277,9 +277,7 @@ function assertGithubRateLimit(response: Response, context: string): void {
  * production callers use the tick() default. `fetchImpl` is injectable for
  * tests only.
  */
-export async function defaultListThreads(
-  fetchImpl: typeof fetch = fetch
-): Promise<ListedThread[]> {
+export async function defaultListThreads(fetchImpl: typeof fetch = fetch): Promise<ListedThread[]> {
   const repos = (process.env.TASKMASTER_GH_REPOS ?? 'thinmansoftware/bdc-xo')
     .split(',')
     .map(r => r.trim())
@@ -372,8 +370,7 @@ function githubHeaders(): Record<string, string> {
  */
 function isHumanMarkerComment(comment: GithubIssueComment): boolean {
   const login = comment.user?.login?.toLowerCase() ?? '';
-  const isBot =
-    comment.user?.type === 'Bot' || login.endsWith('[bot]') || login === 'taskmaster';
+  const isBot = comment.user?.type === 'Bot' || login.endsWith('[bot]') || login === 'taskmaster';
   return !isBot && /^\s*\[(?:PROGRESS|BLOCKED)\]\s+\S/i.test(comment.body ?? '');
 }
 
@@ -384,7 +381,10 @@ function markerKindFromBody(body: string | null | undefined): 'PROGRESS' | 'BLOC
   if (open < 0) return null;
   const close = (body ?? '').indexOf(']', open + 1);
   if (close < 0) return null;
-  const kind = (body ?? '').slice(open + 1, close).trim().toUpperCase();
+  const kind = (body ?? '')
+    .slice(open + 1, close)
+    .trim()
+    .toUpperCase();
   if (kind === 'PROGRESS' || kind === 'BLOCKED') return kind;
   return null;
 }
@@ -405,10 +405,10 @@ function computeLastMovement(
   lastMovementAt: string | null;
   lastMovementKind: 'closed' | 'assigned' | 'status_label' | 'progress_comment' | null;
 } {
-  const candidates: Array<{
+  const candidates: {
     at: string;
     kind: 'closed' | 'assigned' | 'status_label' | 'progress_comment';
-  }> = [];
+  }[] = [];
   if (closedAt) candidates.push({ at: closedAt, kind: 'closed' });
   if (assignedAt) candidates.push({ at: assignedAt, kind: 'assigned' });
   if (activeStatusAt) candidates.push({ at: activeStatusAt, kind: 'status_label' });
@@ -462,9 +462,7 @@ export async function defaultGetGithubIssueEvidence(
     .filter(isHumanMarkerComment)
     .sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at));
   const latestMarker = humanMarkers[0] ?? null;
-  const progress = humanMarkers.filter(
-    c => Date.parse(c.created_at) >= Date.parse(sinceIso)
-  )[0];
+  const progress = humanMarkers.find(c => Date.parse(c.created_at) >= Date.parse(sinceIso));
   const postSendEvents = events.filter(
     event => Date.parse(event.created_at) >= Date.parse(sinceIso)
   );
@@ -476,9 +474,8 @@ export async function defaultGetGithubIssueEvidence(
   // the full event/marker history (not only post-since) so a fresh enrichment
   // still surfaces older assignment/close/status/progress movement.
   const allLatestEventAt = (predicate: (event: GithubIssueEvent) => boolean): string | null =>
-    events
-      .filter(predicate)
-      .sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at))[0]?.created_at ?? null;
+    events.filter(predicate).sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at))[0]
+      ?.created_at ?? null;
   const closedAt = latestEventAt(event => event.event === 'closed');
   const assignedAt = latestEventAt(event => event.event === 'assigned');
   const activeStatusAt = latestEventAt(
@@ -817,10 +814,7 @@ export async function refreshAdoption(
       try {
         await dal.abandonAdoptionSnapshot(snapshotId);
       } catch (abandonError) {
-        log.warn(
-          { err: abandonError as Error, snapshotId },
-          'taskmaster.adoption_abandon_failed'
-        );
+        log.warn({ err: abandonError as Error, snapshotId }, 'taskmaster.adoption_abandon_failed');
       }
     }
     log.warn({ err: error as Error }, 'taskmaster.adoption_refresh_failed');

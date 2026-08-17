@@ -392,11 +392,7 @@ export async function recordUsageSample(data: {
 // ---------------------------------------------------------------------------
 
 export type TmAdoptionMarkerKind = 'PROGRESS' | 'BLOCKED';
-export type TmAdoptionMovementKind =
-  | 'closed'
-  | 'assigned'
-  | 'status_label'
-  | 'progress_comment';
+export type TmAdoptionMovementKind = 'closed' | 'assigned' | 'status_label' | 'progress_comment';
 
 export interface TmAdoptionRow {
   thread_ref: string;
@@ -578,7 +574,7 @@ export async function commitAdoptionSnapshot(
         WHERE id = 1`,
       [snapshotId, nowIso, rowCount, sourceCommit ?? null]
     );
-    await query(`DELETE FROM tm_adoption WHERE snapshot_id <> $1`, [snapshotId]);
+    await query('DELETE FROM tm_adoption WHERE snapshot_id <> $1', [snapshotId]);
   });
 }
 
