@@ -220,7 +220,7 @@ nodes:
 
   - id: plan
     provider: opr
-    model: qwen/qwen3-coder
+    model: qwen/qwen3-coder-next
     # WO-HARNESS-NODE-PROVIDER-FAILOVER-01: this builder-side planning node rides
     # OpenRouter (qwen). If OpenRouter throttles/drops (429/timeout/5xx/connection),
     # fall SIDEWAYS to Codex once rather than killing the run. The war-council-
@@ -278,7 +278,7 @@ nodes:
   # async escalation payload, and only at the irreversible-action boundary downstream.
   - id: plan-review
     provider: codex-opr
-    model: deepseek/deepseek-chat-v3.1  # REVIEWER seat, not builder: qwen (the builder model) is not servable by codex-opr on a ChatGPT account (HTTP 400), and plan-review is a cross-model adversarial REVIEW of qwen's plan -- so it must be a different model anyway (never self-grade). deepseek matches the other review seats (diff-review, opus-rereview). Fixes every fusion-cx-qwen run dying at plan-review 2026-07-11.
+    model: deepseek/deepseek-v4-pro-0813  # REVIEWER seat, not builder: qwen (the builder model) is not servable by codex-opr on a ChatGPT account (HTTP 400), and plan-review is a cross-model adversarial REVIEW of qwen's plan -- so it must be a different model anyway (never self-grade). deepseek matches the other review seats (diff-review, opus-rereview). Fixes every fusion-cx-qwen run dying at plan-review 2026-07-11.
     persona: war-council-architect-opr
     depends_on: [plan]
     trigger_rule: all_done
@@ -1025,7 +1025,7 @@ nodes:
   - id: war-council-validator
     # DeepSeek judge through the repository-capable OpenRouter tool loop.
     provider: codex-opr
-    model: deepseek/deepseek-chat-v3.1
+    model: deepseek/deepseek-v4-pro-0813
     persona: captain-ci-validator-codex
     depends_on: [ascii-gate]
     task_class: medium_work
@@ -1130,7 +1130,7 @@ nodes:
 
   - id: diff-review
     provider: codex-opr
-    model: deepseek/deepseek-chat-v3.1  # cross-model adversarial review, not self-grading (John 2026-07-07: DeepSeek's strong suit is review, not authoring code; never mark its own qwen-authored homework)
+    model: deepseek/deepseek-v4-pro-0813  # cross-model adversarial review, not self-grading (John 2026-07-07: DeepSeek's strong suit is review, not authoring code; never mark its own qwen-authored homework)
     agent: opr-adversarial-reviewer
     depends_on: [capture-diff]
     task_class: medium_work
@@ -1329,7 +1329,7 @@ nodes:
 
   - id: diff-review-final
     provider: codex-opr
-    model: deepseek/deepseek-chat-v3.1  # cross-model adversarial review, not self-grading -- see diff-review
+    model: deepseek/deepseek-v4-pro-0813  # cross-model adversarial review, not self-grading -- see diff-review
     agent: opr-adversarial-reviewer
     depends_on: [diff-review, classify-diff-review, diff-repair, capture-diff-final]
     trigger_rule: all_done
@@ -1495,7 +1495,7 @@ nodes:
   # terminal-BLOCKED on a non-interactive run.
   - id: opus-rereview
     provider: codex-opr
-    model: deepseek/deepseek-chat-v3.1  # cross-model adversarial review, not self-grading -- see diff-review
+    model: deepseek/deepseek-v4-pro-0813  # cross-model adversarial review, not self-grading -- see diff-review
     agent: opr-adversarial-reviewer
     depends_on: [classify-opus-repair]
     trigger_rule: all_done
@@ -1684,7 +1684,7 @@ nodes:
   - id: findings-consolidate
     persona: xo-opr
     provider: opr
-    model: deepseek/deepseek-chat-v3.1
+    model: deepseek/deepseek-v4-pro-0813
     depends_on: [block-reclassify]
     trigger_rule: all_done
     task_class: clerical
@@ -1862,7 +1862,7 @@ nodes:
   - id: decide-push-target
     persona: major-build-opr
     provider: opr
-    model: qwen/qwen3-coder
+    model: qwen/qwen3-coder-next
     depends_on: [pause-gate, classify-apply-review]
     trigger_rule: all_done
     when: "$pause-gate.output.decision_verb != 'approve_with_fix' || $classify-apply-review.output.verdict == 'satisfied'"
@@ -2497,7 +2497,7 @@ nodes:
   - id: build-manifest
     persona: major-build-opr
     provider: opr
-    model: qwen/qwen3-coder
+    model: qwen/qwen3-coder-next
     depends_on: [open-pr-if-needed, block-reclassify, pause-gate]
     trigger_rule: all_done
     task_class: clerical
