@@ -38,7 +38,8 @@
     "./m42-slice8b-evidence-packet": "./src/m42-slice8b-evidence-packet.ts",
     "./taskmaster-deadman-check": "./src/taskmaster-deadman-check.ts",
     "./pr-review-ingest": "./src/pr-review-ingest.ts",
-    "./pr-review-submit": "./src/pr-review-submit.ts"
+    "./pr-review-submit": "./src/pr-review-submit.ts",
+    "./pr-review-wiring": "./src/pr-review-wiring.ts"
   },
   "scripts": {
     "test": "bun test src/overseer.test.ts && bun test src/watch.test.ts && bun test tests/ && bun test src/__tests__/",

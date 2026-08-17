@@ -72,6 +72,8 @@ import { observeStartupRecovery, reconcilePendingRunsAtBoot } from './startup-re
 import { startOverseerRuntime, stopOverseerRuntime } from './overseer-runtime';
 import { createMergeManager } from '@archon/overseer/merge-manager';
 import { resolveDefaultDeps } from '@archon/overseer/service';
+import { ingestPullRequestEvent } from '@archon/overseer/pr-review-ingest';
+import { createRealIngestDeps, resolveReviewRouteConfig } from '@archon/overseer/pr-review-wiring';
 import {
   handleMessage,
   pool,
@@ -561,6 +563,65 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
       }
     });
     getLog().info('github_webhook_registered');
+  }
+
+  // Overseer independent-review endpoint (WO-HARNESS-OVERSEER-REVIEW-ROUTE-01,
+  // route registration authorized by XO 2026-08-17).
+  //
+  // Separate from /webhooks/github on purpose: that endpoint belongs to the
+  // conversational GitHub adapter (@mention handling) and its own secret.
+  // This one turns pull_request events into durable independent-review work.
+  //
+  // FAIL CLOSED: the route is only registered when BOTH the webhook secret and
+  // the reviewer identity are configured. An unconfigured deployment has no
+  // endpoint at all rather than an endpoint that accepts unverified input.
+  const reviewRouteConfig = resolveReviewRouteConfig();
+  if (reviewRouteConfig) {
+    const ingestDeps = createRealIngestDeps(reviewRouteConfig);
+    app.post('/webhooks/github/review', async c => {
+      const eventType = c.req.header('x-github-event');
+      const deliveryId = c.req.header('x-github-delivery');
+      try {
+        // CRITICAL: raw body, never a re-serialized object -- the HMAC is
+        // computed over the exact bytes GitHub sent.
+        const rawBody = await c.req.text();
+        const result = await ingestPullRequestEvent(
+          {
+            rawBody,
+            signature: c.req.header('x-hub-signature-256'),
+            eventType,
+            deliveryId,
+          },
+          ingestDeps
+        );
+        getLog().info(
+          {
+            eventType,
+            deliveryId,
+            disposition: result.disposition,
+            reason: result.reason,
+            correlationId: result.correlationId,
+          },
+          'overseer_review_ingest'
+        );
+        return c.json(
+          {
+            disposition: result.disposition,
+            ...(result.reason ? { reason: result.reason } : {}),
+            ...(result.correlationId ? { correlation_id: result.correlationId } : {}),
+          },
+          result.status as 200
+        );
+      } catch (error) {
+        getLog().error({ err: error, eventType, deliveryId }, 'overseer_review_ingest_error');
+        return c.json({ error: 'Internal server error' }, 500);
+      }
+    });
+    getLog().info('overseer_review_route_registered');
+  } else {
+    getLog().info(
+      'overseer_review_route_not_configured: set OVERSEER_REVIEW_WEBHOOK_SECRET and OVERSEER_REVIEW_IDENTITY to enable'
+    );
   }
 
   // Gitea webhook endpoint
