@@ -53,6 +53,13 @@ describe('m131-seat Dockerfile contract', () => {
     expect(dockerfile).toMatch(/^ENV SEAT_BUILD_SHA=\$\{BUILD_SHA\}$/m);
   });
 
+  // REGRESSION (review finding 2026-08-17): BUILD_SHA defaulted to 'unknown',
+  // letting a seat advertise an identity it did not have.
+  test('BUILD_SHA has NO placeholder default and the build fails without it', () => {
+    expect(dockerfile).not.toMatch(/^ARG BUILD_SHA=/m);
+    expect(dockerfile).toMatch(/test -n "\$\{BUILD_SHA\}"/);
+  });
+
   test('healthcheck is the sanitized seat preflight instrument', () => {
     expect(dockerfile).toMatch(/^HEALTHCHECK/m);
     expect(dockerfile).toContain('scripts/dispatch-worker/seat-preflight.ts');
@@ -104,6 +111,13 @@ describe('m131-seat compose contract', () => {
   test('build SHA flows from compose arg to the running environment', () => {
     expect(service.build?.args?.BUILD_SHA).toContain('BUILD_SHA');
     expect(service.environment?.SEAT_BUILD_SHA).toContain('BUILD_SHA');
+  });
+
+  test('compose REQUIRES BUILD_SHA rather than defaulting to a placeholder', () => {
+    // `${BUILD_SHA:?...}` is compose's required-variable form; `:-unknown`
+    // would silently substitute a placeholder.
+    expect(composeRaw).not.toContain('BUILD_SHA:-unknown');
+    expect(composeRaw).toContain('BUILD_SHA:?');
   });
 
   test('healthcheck uses the seat preflight instrument', () => {

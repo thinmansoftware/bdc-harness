@@ -11,15 +11,15 @@ services:
       context: ../..
       dockerfile: deploy/m131-seat/Dockerfile
       args:
-        BUILD_SHA: "${BUILD_SHA:-unknown}"
-    image: bdc-seat-grok:${BUILD_SHA:-unknown}
+        BUILD_SHA: "${BUILD_SHA:?BUILD_SHA is required - pass the exact commit SHA}"
+    image: bdc-seat-grok:${BUILD_SHA:?BUILD_SHA is required - pass the exact commit SHA}
     container_name: bdc-seat-grok
     # Non-root seat user baked into the image; restated here so the contract
     # is visible and testable at the compose layer too.
     user: "10001:10001"
     restart: unless-stopped
     environment:
-      SEAT_BUILD_SHA: "${BUILD_SHA:-unknown}"
+      SEAT_BUILD_SHA: "${BUILD_SHA:?BUILD_SHA is required - pass the exact commit SHA}"
     volumes:
       # Seat config (worker identity, Grok-only allowlist). Read-only.
       - ./config.seat.example.json:/app/config/seat.json:ro

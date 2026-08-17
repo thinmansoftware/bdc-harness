@@ -190,6 +190,16 @@ A "seat" is an isolated, single-provider server instance of this worker
   scripts/dispatch-worker/seat-preflight.ts --config <config.json>` exits 0
   and prints `seat_preflight_ok seat=<id> build_sha=<sha>` when the seat is
   healthy; the m131-seat container healthcheck uses it.
+- **BUILD_SHA is REQUIRED, not defaulted**: build with
+  `docker compose build --build-arg BUILD_SHA=$(git rev-parse HEAD)` (or set
+  `BUILD_SHA` in the environment for compose). The image build fails without
+  it, and preflight additionally rejects placeholder values (`unknown`,
+  `none`, `latest`, `dev`, or anything shorter than an abbreviated SHA). A
+  seat that cannot name its exact commit must not advertise at all.
+- **Profile/state isolation is checked on CANONICAL paths**: the vendor
+  profile and state directories are compared after symlink resolution and
+  normalization, and nesting counts as non-isolated. Two differently-spelled
+  paths that resolve to the same directory are refused.
 
 Packaging lives in `deploy/m131-seat/` (Dockerfile, compose example, seat
 config example, container-contract test).

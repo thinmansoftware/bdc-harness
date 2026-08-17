@@ -26,6 +26,9 @@ function fakeDeps(overrides: Partial<SeatPreflightDeps> = {}): SeatPreflightDeps
     commandAvailable: async () => true,
     isFile: async () => true,
     isDirectory: async () => true,
+    // Default fake canonicalization: strip a trailing slash and './' so the
+    // tests below exercise the real "different string, same directory" cases.
+    canonicalPath: async (path: string) => path.replace(/\/\.\//g, '/').replace(/\/+$/, ''),
     env: { [DEFAULT_BUILD_SHA_ENV]: 'abc123def456' },
     ...overrides,
   };
@@ -92,6 +95,93 @@ describe('runSeatPreflight', () => {
     const seat: SeatConfig = { ...GOOD_SEAT, state_dir: GOOD_SEAT.vendor_profile_dir };
     const result = await runSeatPreflight(seat, COMMANDS, fakeDeps());
     expect(result).toEqual({ ok: false, code: 'seat_state_not_isolated', field: 'state_dir' });
+  });
+
+  // REGRESSION (review finding 2026-08-17): isolation was decided by raw
+  // string equality, so any of these DIFFERENT strings naming the SAME
+  // directory silently passed. Each case must now be refused.
+  test.each([
+    ['trailing slash', '/home/seat/.grok/'],
+    ['dot segment', '/home/seat/./.grok'],
+    ['both', '/home/seat/./.grok/'],
+  ])('rejects same-directory-different-string: %s', async (_label, stateDir) => {
+    const seat: SeatConfig = { ...GOOD_SEAT, state_dir: stateDir };
+    const result = await runSeatPreflight(seat, COMMANDS, fakeDeps());
+    expect(result).toEqual({ ok: false, code: 'seat_state_not_isolated', field: 'state_dir' });
+  });
+
+  test('rejects a symlinked state dir that canonicalizes onto the profile dir', async () => {
+    const seat: SeatConfig = { ...GOOD_SEAT, state_dir: '/var/lib/link-to-profile' };
+    const deps = fakeDeps({
+      canonicalPath: async path =>
+        path === '/var/lib/link-to-profile' ? GOOD_SEAT.vendor_profile_dir : path,
+    });
+    const result = await runSeatPreflight(seat, COMMANDS, deps);
+    expect(result).toEqual({ ok: false, code: 'seat_state_not_isolated', field: 'state_dir' });
+  });
+
+  test('rejects a state dir NESTED inside the vendor profile (not merely equal)', async () => {
+    const seat: SeatConfig = { ...GOOD_SEAT, state_dir: '/home/seat/.grok/state' };
+    const result = await runSeatPreflight(seat, COMMANDS, fakeDeps());
+    expect(result).toEqual({ ok: false, code: 'seat_state_not_isolated', field: 'state_dir' });
+  });
+
+  test('rejects a vendor profile nested inside the state dir (both directions)', async () => {
+    const seat: SeatConfig = {
+      ...GOOD_SEAT,
+      vendor_profile_dir: '/var/lib/bdc-seat-grok/profile',
+      state_dir: '/var/lib/bdc-seat-grok',
+    };
+    const result = await runSeatPreflight(seat, COMMANDS, fakeDeps());
+    expect(result).toEqual({ ok: false, code: 'seat_state_not_isolated', field: 'state_dir' });
+  });
+
+  test('a genuinely distinct sibling directory still passes', async () => {
+    const seat: SeatConfig = { ...GOOD_SEAT, state_dir: '/home/seat/.grok-state' };
+    const result = await runSeatPreflight(seat, COMMANDS, fakeDeps());
+    expect(result.ok).toBe(true);
+  });
+
+  // REGRESSION (review finding 2026-08-17): the Dockerfile defaulted
+  // BUILD_SHA to 'unknown' and preflight accepted any non-empty value, so a
+  // seat could advertise an identity it did not have.
+  test.each(['unknown', 'UNKNOWN', 'none', 'null', 'undefined', 'dev', 'latest'])(
+    'rejects placeholder build SHA: %s',
+    async placeholder => {
+      const result = await runSeatPreflight(
+        GOOD_SEAT,
+        COMMANDS,
+        fakeDeps({ env: { [DEFAULT_BUILD_SHA_ENV]: placeholder } })
+      );
+      expect(result).toEqual({
+        ok: false,
+        code: 'seat_build_sha_placeholder',
+        field: DEFAULT_BUILD_SHA_ENV,
+      });
+    }
+  );
+
+  test('rejects an implausibly short build SHA', async () => {
+    const result = await runSeatPreflight(
+      GOOD_SEAT,
+      COMMANDS,
+      fakeDeps({ env: { [DEFAULT_BUILD_SHA_ENV]: 'abc123' } })
+    );
+    expect(result).toEqual({
+      ok: false,
+      code: 'seat_build_sha_placeholder',
+      field: DEFAULT_BUILD_SHA_ENV,
+    });
+  });
+
+  test('accepts a real abbreviated git SHA', async () => {
+    const result = await runSeatPreflight(
+      GOOD_SEAT,
+      COMMANDS,
+      fakeDeps({ env: { [DEFAULT_BUILD_SHA_ENV]: '36c3166e' } })
+    );
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.buildSha).toBe('36c3166e');
   });
 
   test('rejects a non-Grok provider allowlist', async () => {

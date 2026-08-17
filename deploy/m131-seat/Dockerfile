@@ -11,8 +11,14 @@ FROM oven/bun:1.3-slim
 
 # Build-SHA visibility: the image carries the exact source SHA it was built
 # from, surfaced to preflight/health via SEAT_BUILD_SHA.
-ARG BUILD_SHA=unknown
+#
+# NO DEFAULT ON PURPOSE (review finding 2026-08-17). A default of "unknown"
+# let a seat pass preflight and advertise an identity it did not have. The
+# build now fails if BUILD_SHA is not supplied, and seat-preflight
+# additionally rejects placeholder values at runtime.
+ARG BUILD_SHA
 ENV SEAT_BUILD_SHA=${BUILD_SHA}
+RUN test -n "${BUILD_SHA}" || (echo "BUILD_SHA build-arg is required (pass --build-arg BUILD_SHA=<sha>)" >&2; exit 1)
 
 # Non-root seat user with a real home for the seat-private vendor profile.
 RUN groupadd --gid 10001 seat \

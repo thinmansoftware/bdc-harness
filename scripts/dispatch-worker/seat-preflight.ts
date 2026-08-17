@@ -11,7 +11,8 @@
  * the injected SeatPreflightDeps, so unit tests run hermetically with fakes
  * and never touch a real credential, profile, or provider binary.
  */
-import { stat } from 'fs/promises';
+import { realpath, stat } from 'fs/promises';
+import { resolve } from 'path';
 import { defaultAgentConfigs } from './adapters';
 
 /** Seat block of the worker configuration (config.seat). */
@@ -43,7 +44,42 @@ export interface SeatPreflightDeps {
   isFile(path: string): Promise<boolean>;
   /** True when the path exists and is a directory. */
   isDirectory(path: string): Promise<boolean>;
+  /**
+   * Canonical absolute path with symlinks resolved. Used for the
+   * profile/state isolation check -- string comparison alone is NOT
+   * sufficient, because a trailing slash, a './' segment, a relative form, a
+   * case variant on a case-insensitive filesystem, or a symlink can all name
+   * the SAME directory while comparing unequal. Review finding 2026-08-17.
+   */
+  canonicalPath(path: string): Promise<string>;
   env: Record<string, string | undefined>;
+}
+
+/**
+ * Build SHA values that carry no information. A seat that advertises one of
+ * these is claiming an identity it does not have, which is worse than failing
+ * closed because it looks like an answer. Review finding 2026-08-17: the
+ * Dockerfile defaults BUILD_SHA to 'unknown', and preflight previously
+ * accepted any non-empty string.
+ */
+const PLACEHOLDER_BUILD_SHAS = new Set(['unknown', 'none', 'null', 'undefined', 'dev', 'latest']);
+
+/** Minimum plausible length for an abbreviated git SHA. */
+const MIN_BUILD_SHA_LENGTH = 7;
+
+/**
+ * True when `inner` is the same directory as `outer` or nested inside it.
+ * Nesting matters: a state dir inside the vendor profile is not isolated from
+ * it either, so equality alone is too weak a test.
+ */
+export function isSameOrNested(a: string, b: string): boolean {
+  // Compare with a normalized separator so the check behaves identically on
+  // POSIX and Windows; canonicalPath may return either form.
+  const norm = (value: string): string => value.replace(/[\\/]+/g, '/').replace(/\/+$/, '');
+  const left = norm(a);
+  const right = norm(b);
+  if (left === right) return true;
+  return left.startsWith(right + '/') || right.startsWith(left + '/');
 }
 
 export type SeatPreflightErrorCode =
@@ -54,7 +90,8 @@ export type SeatPreflightErrorCode =
   | 'seat_vendor_profile_dir_invalid'
   | 'seat_state_dir_invalid'
   | 'seat_state_not_isolated'
-  | 'seat_build_sha_missing';
+  | 'seat_build_sha_missing'
+  | 'seat_build_sha_placeholder';
 
 export type SeatPreflightResult =
   | { ok: true; seatId: string; providers: string[]; buildSha: string }
@@ -106,13 +143,33 @@ export async function runSeatPreflight(
   if (!seat.state_dir || !(await deps.isDirectory(seat.state_dir))) {
     return fail('seat_state_dir_invalid', 'state_dir');
   }
-  if (seat.state_dir === seat.vendor_profile_dir) {
+  // Isolation is decided on CANONICAL paths, not raw strings: a trailing
+  // slash, './', a relative form, a case variant, or a symlink can all name
+  // the same directory. Nesting counts as non-isolated too.
+  let canonicalProfile: string;
+  let canonicalState: string;
+  try {
+    canonicalProfile = await deps.canonicalPath(seat.vendor_profile_dir);
+    canonicalState = await deps.canonicalPath(seat.state_dir);
+  } catch {
     return fail('seat_state_not_isolated', 'state_dir');
   }
+  if (isSameOrNested(canonicalProfile, canonicalState)) {
+    return fail('seat_state_not_isolated', 'state_dir');
+  }
+
   const buildShaEnv = seat.build_sha_env ?? DEFAULT_BUILD_SHA_ENV;
   const buildSha = deps.env[buildShaEnv]?.trim();
   if (!buildSha) {
     return fail('seat_build_sha_missing', buildShaEnv);
+  }
+  // A placeholder SHA is not an identity. Refuse it rather than advertising
+  // a seat that cannot be tied back to an exact commit.
+  if (
+    PLACEHOLDER_BUILD_SHAS.has(buildSha.toLowerCase()) ||
+    buildSha.length < MIN_BUILD_SHA_LENGTH
+  ) {
+    return fail('seat_build_sha_placeholder', buildShaEnv);
   }
   return { ok: true, seatId: seat.seat_id, providers: [provider], buildSha };
 }
@@ -135,6 +192,16 @@ export function realSeatPreflightDeps(): SeatPreflightDeps {
         return (await stat(path)).isDirectory();
       } catch {
         return false;
+      }
+    },
+    async canonicalPath(path: string): Promise<string> {
+      // realpath resolves symlinks and normalizes separators/'.'/'..'.
+      // Fall back to resolve() when the path cannot be canonicalized, so an
+      // unresolvable path still gets normalized rather than compared raw.
+      try {
+        return await realpath(resolve(path));
+      } catch {
+        return resolve(path);
       }
     },
     env: process.env,
