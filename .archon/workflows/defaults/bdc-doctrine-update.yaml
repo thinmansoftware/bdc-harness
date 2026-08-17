@@ -6,7 +6,7 @@ description: |
   NOT for: Code-shipping WOs, feature development, infrastructure deploys, or bug-fix WOs with their own workflow.
 
 policyFile: harness/policies/agent-behavior.md
-model: claude-sonnet-4-5
+model: sonnet
 
 nodes:
   - id: read-spec

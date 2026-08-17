@@ -6,7 +6,7 @@ description: |
   NOT for: Features, doctrine-only updates, cleanup sweeps, infrastructure deploys, or P0 incidents requiring emergency hotfixes.
 
 policyFile: harness/policies/agent-behavior.md
-model: claude-sonnet-4-5
+model: sonnet
 
 nodes:
   - id: read-spec

@@ -6,8 +6,8 @@ description: |
   of DIFFERENT open models attacking each other's work -- cross-model
   diversity is the quality mechanism that replaces the always-expensive judge:
     plan (architect seat)        = Qwen qwen/qwen3-coder-next (root default)
-    plan-review (attack seat)    = Grok x-ai/grok-4.5
-    implement + repairs (builder)= Grok x-ai/grok-4.5
+    plan-review (attack seat)    = Grok x-ai/grok-4.6
+    implement + repairs (builder)= Grok x-ai/grok-4.6
     diff reviews (attack seats)  = DeepSeek deepseek-chat-v3.1
     war-council-validator (judge)= DeepSeek via OpenRouter (dual-cap; no Claude execution)
   No model ever grades its own output; NO node consumes the expensive review seat. All
@@ -150,7 +150,7 @@ nodes:
   # net, this is only an optimization that must never wrongly skip real work.
   - id: check-already-satisfied
     provider: grok
-    model: x-ai/grok-4.5
+    model: x-ai/grok-4.6
     persona: war-council-architect-opr
     agent: war-council-architect-opr
     depends_on: [read-spec]
@@ -274,7 +274,7 @@ nodes:
     # Claude-free recovery (WO-HARNESS-CLAUDE-FREE-LANE-RECOVERY-01): Qwen authors
     # the plan; Grok 4.5 holds the blocking plan-review seat. DeepSeek remains the
     # independent post-implementation reviewer. Never self-graded.
-    model: x-ai/grok-4.5
+    model: x-ai/grok-4.6
     depends_on: [plan]
     trigger_rule: all_done
     when: "$gate-already-satisfied.output.ALREADY_SATISFIED != 'true'"
@@ -419,7 +419,7 @@ nodes:
     # A PASS here is weaker evidence than a clean trial; a FAIL is still informative.
     # Builder seats require repository write and shell capabilities.
     provider: grok
-    model: x-ai/grok-4.5
+    model: x-ai/grok-4.6
     persona: major-build-opr
     depends_on: [capture-run-scope]
     trigger_rule: all_done
@@ -1257,7 +1257,7 @@ nodes:
 
   - id: diff-repair
     provider: grok
-    model: x-ai/grok-4.5
+    model: x-ai/grok-4.6
     persona: major-build-opr
     depends_on: [diff-review, classify-diff-review, resolve-review-base]
     when: "$classify-diff-review.output.verdict == 'needs_revision'"
@@ -1520,7 +1520,7 @@ nodes:
   # resolve the block, then signals. If it can't fix, the run proceeds to the human pause.
   - id: opus-repair
     provider: grok
-    model: x-ai/grok-4.5
+    model: x-ai/grok-4.6
     persona: major-build-opr
     depends_on: [block-classify]
     when: "$block-classify.output.status == 'BLOCKED'"
@@ -1860,7 +1860,7 @@ nodes:
   # trigger_rule all_done so an APPROVE-AS-IS run (which skips this) does not hang the DAG.
   - id: apply-suggested-fix
     provider: grok
-    model: x-ai/grok-4.5
+    model: x-ai/grok-4.6
     agent: major-build-opr
     effort: xhigh
     context: fresh

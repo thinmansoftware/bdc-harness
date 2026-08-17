@@ -16,7 +16,7 @@ run_authority:
     - docs/superpowers/specs/{WO_ID}.md
   allow_issue_fallback: true
 provider: opr  # root: bare AI tails use OpenRouter, not Codex/Claude (Codex exhausted 2026-07-09)
-model: x-ai/grok-4.5  # Grok substitute for prior root gpt-5.5/Codex default
+model: x-ai/grok-4.6  # Grok substitute for prior root gpt-5.5/Codex default
 
 nodes:
   # Pre-flight: fail closed if container lacks GITHUB auth (WO-169, 2026-05-16).
@@ -116,7 +116,7 @@ nodes:
   # net, this is only an optimization that must never wrongly skip real work.
   - id: check-already-satisfied
     provider: grok
-    model: x-ai/grok-4.5
+    model: x-ai/grok-4.6
     persona: war-council-architect-opr
     depends_on: [read-spec]
     task_class: clerical
@@ -230,7 +230,7 @@ nodes:
     # diff-review*, war-council-validator) are intentionally NOT wired -- a gate
     # that silently switches models undermines gate integrity (spec doctrine).
     failover_provider: opr
-    failover_model: x-ai/grok-4.5
+    failover_model: x-ai/grok-4.6
     persona: war-council-architect-opr
     depends_on: [gate-already-satisfied]
     when: "$gate-already-satisfied.output.ALREADY_SATISFIED != 'true'"
@@ -401,7 +401,7 @@ nodes:
 
   - id: implement
     provider: grok
-    model: x-ai/grok-4.5
+    model: x-ai/grok-4.6
     persona: major-build-opr
     depends_on: [capture-run-scope]
     trigger_rule: all_done
@@ -1186,7 +1186,7 @@ nodes:
 
   - id: diff-repair
     provider: grok
-    model: x-ai/grok-4.5
+    model: x-ai/grok-4.6
     persona: major-build-opr
     depends_on: [diff-review, classify-diff-review, resolve-review-base]
     when: "$classify-diff-review.output.verdict == 'needs_revision'"
@@ -1434,7 +1434,7 @@ nodes:
   # resolve the block, then signals. If it can't fix, the run proceeds to the human pause.
   - id: opus-repair
     provider: grok
-    model: x-ai/grok-4.5
+    model: x-ai/grok-4.6
     persona: major-build-opr
     depends_on: [block-classify]
     when: "$block-classify.output.status == 'BLOCKED'"
@@ -1776,7 +1776,7 @@ nodes:
   # trigger_rule all_done so an APPROVE-AS-IS run (which skips this) does not hang the DAG.
   - id: apply-suggested-fix
     provider: grok
-    model: x-ai/grok-4.5
+    model: x-ai/grok-4.6
     agent: overseer-opus
     effort: xhigh
     context: fresh

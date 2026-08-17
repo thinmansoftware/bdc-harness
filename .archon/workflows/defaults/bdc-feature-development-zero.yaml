@@ -5,9 +5,9 @@ description: |
   "fusion combines open models AS the war council"). The council is composed
   of DIFFERENT open models attacking each other's work -- cross-model
   diversity is the quality mechanism that replaces the always-Claude judge:
-    plan (architect seat)        = Qwen qwen/qwen3-coder (root default)
-    plan-review (attack seat)    = Grok x-ai/grok-4.5
-    implement + repairs (builder)= Grok x-ai/grok-4.5
+    plan (architect seat)        = Qwen qwen/qwen3-coder-next (root default)
+    plan-review (attack seat)    = Grok x-ai/grok-4.6
+    implement + repairs (builder)= Grok x-ai/grok-4.6
     diff reviews (attack seats)  = DeepSeek deepseek-chat-v3.1
     war-council-validator (judge)= DeepSeek via OpenRouter (dual-cap; no Codex required)
   No model ever grades its own output; NO node consumes Claude usage. All
@@ -31,7 +31,7 @@ run_authority:
 # to fall through to config-default claude with an OpenRouter model ID -- API rejection).
 # war-council-validator: DeepSeek on glm/OpenRouter (dual-cap 2026-07-09).
 provider: glm
-model: qwen/qwen3-coder
+model: qwen/qwen3-coder-next
 
 nodes:
   # Pre-flight: fail closed if container lacks GITHUB auth (WO-169, 2026-05-16).
@@ -131,7 +131,7 @@ nodes:
   # net, this is only an optimization that must never wrongly skip real work.
   - id: check-already-satisfied
     provider: grok
-    model: x-ai/grok-4.5
+    model: x-ai/grok-4.6
     persona: war-council-architect-opr
     agent: war-council-architect-opr
     depends_on: [read-spec]
@@ -260,7 +260,7 @@ nodes:
     # Claude-free recovery (WO-HARNESS-CLAUDE-FREE-LANE-RECOVERY-01): Qwen authors
     # the plan; Grok 4.5 holds the blocking plan-review seat. DeepSeek remains the
     # independent post-implementation reviewer. Never self-graded.
-    model: x-ai/grok-4.5
+    model: x-ai/grok-4.6
     depends_on: [plan]
     trigger_rule: all_done
     when: "$gate-already-satisfied.output.ALREADY_SATISFIED != 'true'"
@@ -410,7 +410,7 @@ nodes:
     # Chat-only opr-zero cannot write files or run tests. Route the builder seat
     # through the proven OpenRouter local-tool-loop provider instead.
     provider: grok
-    model: x-ai/grok-4.5
+    model: x-ai/grok-4.6
     persona: major-build-opr
     # WO-HARNESS-NODE-PROVIDER-FAILOVER-01: builder node on OpenRouter. If
     # OpenRouter throttles/drops (429/timeout/5xx/connection), fall SIDEWAYS to
@@ -1043,7 +1043,7 @@ nodes:
     # DeepSeek judge through the repository-capable OpenRouter tool loop.
     provider: codex-opr
     persona: captain-ci-validator-codex
-    model: deepseek/deepseek-chat-v3.1
+    model: deepseek/deepseek-v4-pro-0813
     depends_on: [ascii-gate]
     task_class: medium_work
     prompt: |
@@ -1147,7 +1147,7 @@ nodes:
 
   - id: diff-review
     provider: codex-opr
-    model: deepseek/deepseek-chat-v3.1
+    model: deepseek/deepseek-v4-pro-0813
     agent: codex-adversarial-reviewer
     depends_on: [capture-diff]
     task_class: medium_work
@@ -1203,7 +1203,7 @@ nodes:
 
   - id: diff-repair
     provider: grok
-    model: x-ai/grok-4.5
+    model: x-ai/grok-4.6
     persona: major-build-opr
     # WO-HARNESS-NODE-PROVIDER-FAILOVER-01: repair-tier builder node on the
     # OpenRouter local-tool-loop provider. Fail sideways to Codex once
@@ -1350,7 +1350,7 @@ nodes:
 
   - id: diff-review-final
     provider: codex-opr
-    model: deepseek/deepseek-chat-v3.1
+    model: deepseek/deepseek-v4-pro-0813
     agent: codex-adversarial-reviewer
     depends_on: [diff-review, classify-diff-review, diff-repair, capture-diff-final]
     trigger_rule: all_done
@@ -1455,7 +1455,7 @@ nodes:
   # resolve the block, then signals. If it can't fix, the run proceeds to the human pause.
   - id: opus-repair
     provider: grok
-    model: x-ai/grok-4.5
+    model: x-ai/grok-4.6
     persona: major-build-opr
     # WO-HARNESS-NODE-PROVIDER-FAILOVER-01: last-chance repair builder on
     # OpenRouter local-tool-loop provider. Same rationale as `implement`/`diff-repair` above.
@@ -1520,7 +1520,7 @@ nodes:
   # terminal-BLOCKED on a non-interactive run.
   - id: opus-rereview
     provider: codex-opr
-    model: deepseek/deepseek-chat-v3.1
+    model: deepseek/deepseek-v4-pro-0813
     agent: codex-adversarial-reviewer
     depends_on: [classify-opus-repair]
     trigger_rule: all_done
@@ -1799,7 +1799,7 @@ nodes:
   # trigger_rule all_done so an APPROVE-AS-IS run (which skips this) does not hang the DAG.
   - id: apply-suggested-fix
     provider: grok
-    model: x-ai/grok-4.5
+    model: x-ai/grok-4.6
     agent: major-build-opr
     effort: xhigh
     context: fresh
@@ -1836,7 +1836,7 @@ nodes:
   # Distinct id (diff-review-final already ran upstream). Only meaningful on the APPROVE-WITH-FIX path.
   - id: apply-diff-review-final
     provider: codex-opr
-    model: deepseek/deepseek-chat-v3.1
+    model: deepseek/deepseek-v4-pro-0813
     agent: codex-adversarial-reviewer
     depends_on: [apply-suggested-fix]
     trigger_rule: all_done
