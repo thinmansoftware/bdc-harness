@@ -234,8 +234,22 @@ export async function lookupNotionPage(
       sawRetrySafeFailure = true;
     }
   }
-  const failureOutcome =
-    sawSuccessfulQuery || sawRetrySafeFailure ? 'transient_failure' : 'permanent_failure';
+  // A query that Notion answered successfully but that matched no page is the
+  // EXPECTED, permanent state for any WO created after the 2026-07-01 GitHub-SOR
+  // cutover (those WOs have no Notion row by design). Classify it as a permanent
+  // no-match so escalation-delivery does not retry it, and log at debug WITHOUT
+  // the "exhausted" failure event -- this is not a failure, it is the common case.
+  if (sawSuccessfulQuery && !sawRetrySafeFailure) {
+    log.debug({ candidateProps, databaseId, woId }, 'overseer.notion_lookup_no_match');
+    return {
+      page_id: null,
+      failure_outcome: 'permanent_failure',
+    };
+  }
+  // Genuine failure path: either no candidate query ever succeeded, or a
+  // retry-safe transport/rate-limit error (429/5xx/network) was seen. Keep the
+  // existing classification and the informational "exhausted" log for this case.
+  const failureOutcome = sawRetrySafeFailure ? 'transient_failure' : 'permanent_failure';
   log.info(
     { candidateProps, databaseId, woId, failureOutcome },
     'overseer.notion_lookup_exhausted'

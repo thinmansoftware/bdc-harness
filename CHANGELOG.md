@@ -23,6 +23,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Overseer: `lookupNotionPage()` no longer misclassifies a successful Notion query that returns no matching page as a transient failure. Since any WO created after the 2026-07-01 GitHub-SOR cutover has no Notion row by design, this had guaranteed 3 pointless retries and 3 `overseer.notion_lookup_exhausted` log events per escalation for every current-era WO. A successful query with no match now returns `permanent_failure` (not retried) and logs at debug via `overseer.notion_lookup_no_match`; genuine transport/rate-limit failures still classify as `transient_failure` and log/retry as before (WO-HARNESS-OVERSEER-NOTION-LOOKUP-DEAD-END-01).
 - Docker: `git config --global --add safe.directory` in the entrypoint now de-duplicates entries before adding, preventing unbounded growth of `~/.gitconfig` now that `/home/appuser` is persisted (#1518).
 - Docker: `setup-auth` now warns at startup when `CODEX_*` env vars are absent but a persisted `~/.codex/auth.json` from a previous run still exists, so operators don't accidentally use stale or revoked credentials (#1518).
 

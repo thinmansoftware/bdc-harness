@@ -23,7 +23,7 @@ import {
   runDueOperatorCardDeliveries,
   type OperatorCardChannel,
 } from '../escalation-delivery';
-import { lookupNotionPageId, runEscalation } from '../escalate';
+import { lookupNotionPage, lookupNotionPageId, runEscalation } from '../escalate';
 
 const identity: ActionableEventIdentity = {
   identity_version: 'overseer-actionable-event-v1',
@@ -549,6 +549,34 @@ describe('Notion WO lookup', () => {
     expect(await lookupNotionPageId('test-key', 'db-1', 'WO-1')).toBeNull();
     expect(queried).toEqual(['Task', 'WO ID', 'Name', 'Title', 'WO_ID']);
   });
+
+  test('classifies a successful query with no matching page as permanent (not transient)', async () => {
+    // Every candidate property returns 200 OK with zero results -- the expected
+    // state for a GitHub-only WO with no Notion row. This must be permanent so
+    // escalation-delivery does not retry it. Regression for
+    // WO-HARNESS-OVERSEER-NOTION-LOOKUP-DEAD-END-01.
+    const queried: string[] = [];
+    globalThis.fetch = mock(async (_url, init) => {
+      const body = JSON.parse(String(init?.body)) as { filter: { property: string } };
+      queried.push(body.filter.property);
+      return Response.json({ results: [] });
+    }) as typeof fetch;
+
+    const result = await lookupNotionPage('test-key', 'db-1', 'WO-1');
+    expect(result.page_id).toBeNull();
+    expect(result.failure_outcome).toBe('permanent_failure');
+    expect(queried).toEqual(['Task', 'WO ID', 'Name', 'Title', 'WO_ID']);
+  });
+
+  test('classifies a retry-safe transport failure as transient', async () => {
+    // A genuine rate-limit/transport error must remain transient so it is retried.
+    globalThis.fetch = mock(
+      async () => new Response('rate limited', { status: 429 })
+    ) as typeof fetch;
+    const result = await lookupNotionPage('test-key', 'db-1', 'WO-1');
+    expect(result.page_id).toBeNull();
+    expect(result.failure_outcome).toBe('transient_failure');
+  });
 });
 
 describe('default informational channel adapters', () => {
@@ -738,6 +766,19 @@ describe('default informational channel adapters', () => {
     const view = await defaultCardView();
     const notion = createDefaultOperatorCardChannels({
       fetch: mock(async () => new Response('unauthorized', { status: 401 })) as typeof fetch,
+      notion_api_key: 'test-notion-key',
+    }).find(channel => channel.channel === 'notion');
+    if (!notion) throw new Error('notion_channel_missing');
+    expect((await notion.deliver(view, 'unused')).outcome).toBe('permanent_failure');
+  });
+
+  test('default Notion adapter treats a 200/no-match lookup as permanent (GitHub-only WO)', async () => {
+    // A WO with no Notion row (every candidate query returns 200/empty results)
+    // must NOT schedule a retry -- outcome must be permanent, not transient.
+    // Regression for WO-HARNESS-OVERSEER-NOTION-LOOKUP-DEAD-END-01.
+    const view = await defaultCardView();
+    const notion = createDefaultOperatorCardChannels({
+      fetch: mock(async () => Response.json({ results: [] })) as typeof fetch,
       notion_api_key: 'test-notion-key',
     }).find(channel => channel.channel === 'notion');
     if (!notion) throw new Error('notion_channel_missing');
