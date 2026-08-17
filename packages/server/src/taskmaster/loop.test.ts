@@ -1271,7 +1271,6 @@ describe('defaultListThreads -- GitHub work-SOR read', () => {
   });
 });
 
-
 // ---------------------------------------------------------------------------
 // Adoption projection (WO-HARNESS-TASKMASTER-ADOPTION-PROJECTION-01)
 // Section 11 scenarios -- every test name includes "adoption" or "canonicaliz"
@@ -1478,11 +1477,7 @@ describe('adoption projection', () => {
     const within24h = new Date(T0 - 3_600_000).toISOString();
     const older = new Date(T0 - 48 * 3_600_000).toISOString();
     // 3 sent on old org (1 within 24h), 2 sent on new org (both within 24h)
-    const seed = (
-      ref: string,
-      created_at: string,
-      id: string
-    ): void => {
+    const seed = (ref: string, created_at: string, id: string): void => {
       world.journal.push({
         id,
         created_at,
@@ -1559,8 +1554,7 @@ describe('adoption projection', () => {
       // indices 1 and 2 are the next two oldest non-null.
       const seedId = 'snap-prior';
       for (let i = 0; i < 100; i++) {
-        const evidenceAt =
-          i === 0 ? null : new Date(T0 - (100 - i) * 1_000).toISOString();
+        const evidenceAt = i === 0 ? null : new Date(T0 - (100 - i) * 1_000).toISOString();
         world.adoptionRows.push({
           thread_ref: `gh:thinmansoftware/bdc-xo#${2000 + i}`,
           snapshot_id: seedId,
@@ -1643,9 +1637,9 @@ describe('adoption projection', () => {
     // deliver_ruling is actsImmediately; second tick should not double-send.
     const deliverRows = world.journal.filter(j => j.action_type === 'deliver_ruling');
     expect(deliverRows.length).toBe(1);
-    expect(world.sentMessages.filter(m => m.idempotency_key.includes('deliver_ruling')).length).toBe(
-      1
-    );
+    expect(
+      world.sentMessages.filter(m => m.idempotency_key.includes('deliver_ruling')).length
+    ).toBe(1);
     expect(second.effects).toBe(0);
   });
 });

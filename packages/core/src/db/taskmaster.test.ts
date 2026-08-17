@@ -281,7 +281,6 @@ describe('tm_usage_sample DAL', () => {
   });
 });
 
-
 function baseAdoptionRow(
   overrides: Partial<Omit<TmAdoptionRow, 'snapshot_id'>> & { thread_ref: string }
 ): Omit<TmAdoptionRow, 'snapshot_id'> {

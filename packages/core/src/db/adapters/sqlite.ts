@@ -246,9 +246,7 @@ export class SqliteAdapter implements IDatabase {
     );
     // Taskmaster adoption projection indexes (migration 043) -- after migrateColumns()
     // per the established pattern.
-    this.db.run(
-      'CREATE INDEX IF NOT EXISTS idx_tm_adoption_snapshot ON tm_adoption(snapshot_id)'
-    );
+    this.db.run('CREATE INDEX IF NOT EXISTS idx_tm_adoption_snapshot ON tm_adoption(snapshot_id)');
     this.db.run('CREATE INDEX IF NOT EXISTS idx_tm_adoption_thread ON tm_adoption(thread_ref)');
   }
 
