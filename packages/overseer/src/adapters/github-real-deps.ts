@@ -77,11 +77,19 @@ export interface RealGitHubOctokitLike {
      * createOctokitMock) that never approve keep type-checking. The real
      * approve path guards for its absence and throws loudly.
      */
+    /**
+     * WO-HARNESS-OVERSEER-REVIEW-ROUTE-01 widened `event` from the
+     * APPROVE-only literal to the two events a real reviewer needs, and added
+     * the optional `body` that REQUEST_CHANGES requires (GitHub rejects a
+     * REQUEST_CHANGES review with no body). APPROVE-only callers are
+     * unaffected: `body` is optional and 'APPROVE' remains assignable.
+     */
     createReview?(input: {
       owner: string;
       repo: string;
       pull_number: number;
-      event: 'APPROVE';
+      event: 'APPROVE' | 'REQUEST_CHANGES';
+      body?: string;
     }): Promise<{ data: { id: number; state: string } }>;
   };
   search: {
@@ -405,24 +413,73 @@ export function createRealMergePullRequest(
 export function createRealApprovePullRequest(
   octokit: RealGitHubOctokitLike
 ): (input: PullRequestRef) => Promise<{ approved: boolean; message?: string }> {
+  const submit = createRealSubmitPullRequestReview(octokit);
   return async (input: PullRequestRef): Promise<{ approved: boolean; message?: string }> => {
+    const result = await submit({ ...input, event: 'APPROVE' });
+    return result.message === undefined
+      ? { approved: result.submitted }
+      : { approved: result.submitted, message: result.message };
+  };
+}
+
+/** Review events the Overseer App may submit. */
+export type OverseerReviewEvent = 'APPROVE' | 'REQUEST_CHANGES';
+
+export interface SubmitPullRequestReviewInput extends PullRequestRef {
+  event: OverseerReviewEvent;
+  /** Evidence body. REQUIRED and non-empty for REQUEST_CHANGES. */
+  body?: string;
+}
+
+export interface SubmitPullRequestReviewResult {
+  submitted: boolean;
+  message?: string;
+}
+
+/**
+ * General review submission for the Overseer App identity
+ * (WO-HARNESS-OVERSEER-REVIEW-ROUTE-01, XO decision 1 of 2026-08-17).
+ *
+ * Supports APPROVE and REQUEST_CHANGES -- both are available to a GitHub App
+ * installation token holding `pull_requests: write`. A reviewer that cannot
+ * reject is not a reviewer, so the non-approving path is a first-class
+ * capability rather than a fail-closed-only stub.
+ *
+ * REQUEST_CHANGES requires a non-empty body: GitHub rejects a changes-requested
+ * review with no explanation, and an empty rejection carries no evidence for
+ * the author. That precondition is enforced locally, before any network call,
+ * and returns the stable code 'github_review_missing_evidence_body'.
+ *
+ * Error classification mirrors createRealMergePullRequest's httpStatus
+ * approach so callers get stable codes instead of raw Octokit errors.
+ */
+export function createRealSubmitPullRequestReview(
+  octokit: RealGitHubOctokitLike
+): (input: SubmitPullRequestReviewInput) => Promise<SubmitPullRequestReviewResult> {
+  return async (input: SubmitPullRequestReviewInput): Promise<SubmitPullRequestReviewResult> => {
     if (!octokit.pulls.createReview) {
       throw new Error('overseer_real_adapter_missing_review_api');
     }
+    const body = input.body?.trim() ?? '';
+    if (input.event === 'REQUEST_CHANGES' && body.length === 0) {
+      return { submitted: false, message: 'github_review_missing_evidence_body' };
+    }
+    const expectedState = input.event === 'APPROVE' ? 'APPROVED' : 'CHANGES_REQUESTED';
     try {
       const response = await octokit.pulls.createReview({
         owner: input.owner,
         repo: input.repo,
         pull_number: input.number,
-        event: 'APPROVE',
+        event: input.event,
+        ...(body.length > 0 ? { body } : {}),
       });
-      if (response.data.state !== 'APPROVED') {
+      if (response.data.state !== expectedState) {
         return {
-          approved: false,
+          submitted: false,
           message: `github_review_unexpected_state_${response.data.state}`,
         };
       }
-      return { approved: true };
+      return { submitted: true };
     } catch (error) {
       const status =
         typeof error === 'object' && error !== null && 'status' in error
@@ -434,12 +491,12 @@ export function createRealApprovePullRequest(
           : undefined;
       const rawMessage = typeof messageValue === 'string' ? messageValue : '';
       if (status === 422 && /own pull request/i.test(rawMessage)) {
-        return { approved: false, message: 'github_review_self_approval_rejected' };
+        return { submitted: false, message: 'github_review_self_approval_rejected' };
       }
       if (status === 422) {
-        return { approved: false, message: 'github_review_unprocessable' };
+        return { submitted: false, message: 'github_review_unprocessable' };
       }
-      return { approved: false, message: 'github_review_transport_ambiguous' };
+      return { submitted: false, message: 'github_review_transport_ambiguous' };
     }
   };
 }

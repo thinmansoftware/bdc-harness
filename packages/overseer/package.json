@@ -36,7 +36,9 @@
     "./m42-slice8b-process-health": "./src/m42-slice8b-process-health.ts",
     "./m42-slice8b-gate1": "./src/m42-slice8b-gate1.ts",
     "./m42-slice8b-evidence-packet": "./src/m42-slice8b-evidence-packet.ts",
-    "./taskmaster-deadman-check": "./src/taskmaster-deadman-check.ts"
+    "./taskmaster-deadman-check": "./src/taskmaster-deadman-check.ts",
+    "./pr-review-ingest": "./src/pr-review-ingest.ts",
+    "./pr-review-submit": "./src/pr-review-submit.ts"
   },
   "scripts": {
     "test": "bun test src/overseer.test.ts && bun test src/watch.test.ts && bun test tests/ && bun test src/__tests__/",
@@ -46,6 +48,7 @@
     "type-check": "bun x --bun tsc --noEmit"
   },
   "dependencies": {
+    "@archon/adapters": "workspace:*",
     "@archon/core": "workspace:*",
     "@archon/fusion": "workspace:*",
     "@archon/workflows": "workspace:*",

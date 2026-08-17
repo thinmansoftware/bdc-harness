@@ -143,6 +143,7 @@
       "name": "@archon/overseer",
       "version": "0.1.0",
       "dependencies": {
+        "@archon/adapters": "workspace:*",
         "@archon/core": "workspace:*",
         "@archon/fusion": "workspace:*",
         "@archon/paths": "workspace:*",
