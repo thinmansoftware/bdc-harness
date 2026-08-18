@@ -3,8 +3,10 @@ import { generateKeyPairSync } from 'node:crypto';
 import { createAppAuth } from '@octokit/auth-app';
 import { createMergeManager } from '../merge-manager.ts';
 import { watchOnce, type WatchHeartbeatLogger } from '../watch.ts';
+import { handleRecord, type MergeReadyCoordinator } from '../service.ts';
 import {
   createRealMergePullRequest,
+  createRealOctokitClient,
   resolveRealOctokitAuthOptions,
   type RealGitHubOctokitLike,
 } from '../adapters/github-real-deps.ts';
@@ -12,11 +14,65 @@ import type { QualifiedMergeEvidence } from '../actions/merge-ready.ts';
 import type {
   GitHubClientDeps,
   GrokDispositionReceipt,
+  OverseerActionsDeps,
   OverseerRunRecord,
   OverseerRunStoreDeps,
   PullRequestEvidence,
   WatchedRunRecord,
 } from '../types.ts';
+
+/**
+ * Structured heartbeat records: the injected logger captures BOTH the object
+ * argument (evaluated/total/eligible counts) and the message, so tests can
+ * assert the observability content, not just that a line was emitted.
+ */
+interface CapturedHeartbeat {
+  obj: Record<string, unknown>;
+  msg: string;
+}
+
+function captureHeartbeats(): { logger: WatchHeartbeatLogger; entries: CapturedHeartbeat[] } {
+  const entries: CapturedHeartbeat[] = [];
+  const logger: WatchHeartbeatLogger = {
+    info: (obj, msg) => {
+      entries.push({ obj, msg });
+    },
+  };
+  return { logger, entries };
+}
+
+function heartbeatFor(entries: CapturedHeartbeat[]): CapturedHeartbeat | undefined {
+  return entries.find(entry => entry.msg.includes('merge-coordinator.heartbeat'));
+}
+
+/**
+ * Drive the REAL service dispatch gate (`handleRecord`) over a batch of records,
+ * with the v1 classifier path forced: OVERSEER_JUDGE_FIRST and
+ * OVERSEER_EMERGENCY_STOP are neutralized (and restored) so the merge-vs-skip
+ * branch under test runs deterministically regardless of ambient env. Using the
+ * real handleRecord -- not an inline copy of its `action === 'merge_ready'` gate --
+ * means drift in service.ts's dispatch condition is caught here.
+ */
+async function dispatchThroughService(
+  records: WatchedRunRecord[],
+  deps: OverseerRunStoreDeps & OverseerActionsDeps & GitHubClientDeps,
+  mergeCoordinator: MergeReadyCoordinator | undefined
+): Promise<void> {
+  const priorJudgeFirst = process.env.OVERSEER_JUDGE_FIRST;
+  const priorStop = process.env.OVERSEER_EMERGENCY_STOP;
+  delete process.env.OVERSEER_JUDGE_FIRST;
+  delete process.env.OVERSEER_EMERGENCY_STOP;
+  try {
+    for (const record of records) {
+      await handleRecord(record, deps, false, 'merge-coordinator-wiring-test', mergeCoordinator);
+    }
+  } finally {
+    if (priorJudgeFirst === undefined) delete process.env.OVERSEER_JUDGE_FIRST;
+    else process.env.OVERSEER_JUDGE_FIRST = priorJudgeFirst;
+    if (priorStop === undefined) delete process.env.OVERSEER_EMERGENCY_STOP;
+    else process.env.OVERSEER_EMERGENCY_STOP = priorStop;
+  }
+}
 
 // WO-HARNESS-MERGE-MANAGER-WIRING-LAND-01 -- the three mandated coordinator scenarios:
 //   1. a green + mergeable + merge_candidate record executes exactly one merge, routed
@@ -146,14 +202,32 @@ describe('merge coordinator wiring (WO-HARNESS-MERGE-MANAGER-WIRING-LAND-01)', (
     process.env.GITHUB_APP_INSTALLATION_ID = '153295654';
     process.env.GITHUB_APP_PRIVATE_KEY = FAKE_PEM;
 
+    // Guard 1: the auth-strategy SELECTOR picks the App path from these env vars.
     const authOptions = resolveRealOctokitAuthOptions();
     expect('authStrategy' in authOptions).toBe(true);
     if ('authStrategy' in authOptions) {
       expect(authOptions.authStrategy).toBe(createAppAuth);
     }
 
-    // The executed merge routes through the REAL mergePullRequest deps -- the same
-    // composition server/index.ts builds from the App-authed octokit -- not a stub.
+    // Guard 2 (the bridge): build the merge actor through the SAME production
+    // composition server/index.ts uses -- createRealOctokitClient(), which is
+    // `new Octokit(resolveRealOctokitAuthOptions())` -- and PROVE that exact client
+    // authenticates as the GitHub App by minting an app JWT locally (no network:
+    // createAppAuth signs the JWT from the RSA key in-process). A PAT-authed client
+    // returns `{ type: 'token' }` here, so a silent PAT downgrade of the merge actor
+    // fails this assertion. The octokit proven App-authed below is the one whose
+    // pulls.merge executes the merge -- identity and merge-actor are now the same
+    // object in code, not bridged by comment narrative.
+    const octokit = createRealOctokitClient();
+    const appAuth = (await (
+      octokit as unknown as {
+        auth: (opts: { type: 'app' }) => Promise<{ type: string }>;
+      }
+    ).auth({ type: 'app' })) as { type: string };
+    expect(appAuth.type).toBe('app');
+
+    // Replace only the network leaves; the App identity established above still owns
+    // the pulls.merge call issued through createRealMergePullRequest(octokit).
     const pullsGet = mock(async () => ({
       data: {
         number: 42,
@@ -163,9 +237,8 @@ describe('merge coordinator wiring (WO-HARNESS-MERGE-MANAGER-WIRING-LAND-01)', (
       },
     }));
     const pullsMerge = mock(async () => ({ data: { merged: true, sha: RUN_HEAD_SHA } }));
-    const octokit = {
-      pulls: { get: pullsGet, merge: pullsMerge },
-    } as unknown as RealGitHubOctokitLike;
+    octokit.pulls.get = pullsGet as unknown as RealGitHubOctokitLike['pulls']['get'];
+    octokit.pulls.merge = pullsMerge as unknown as RealGitHubOctokitLike['pulls']['merge'];
 
     const insertOverseerAction = mock(async () => undefined);
     const judge = mock(async input => approveReceipt(input));
@@ -254,7 +327,8 @@ describe('merge coordinator wiring (WO-HARNESS-MERGE-MANAGER-WIRING-LAND-01)', (
     };
 
     const mergePullRequest = mock(async () => ({ merged: false }));
-    const deps: OverseerRunStoreDeps & GitHubClientDeps = {
+    const insertOverseerAction = mock(async () => undefined);
+    const deps: OverseerRunStoreDeps & OverseerActionsDeps & GitHubClientDeps = {
       listRunsForWatch: async () => runs,
       listRunEvents: async () => [],
       findPullRequest: async input => {
@@ -264,9 +338,11 @@ describe('merge coordinator wiring (WO-HARNESS-MERGE-MANAGER-WIRING-LAND-01)', (
         return evidence;
       },
       mergePullRequest,
+      insertOverseerAction,
     };
 
-    const records = await watchOnce(deps);
+    const { logger, entries } = captureHeartbeats();
+    const records = await watchOnce(deps, { logger });
     expect(records).toHaveLength(3);
 
     // The safety gate: none of the three unsafe PRs is classified merge_ready.
@@ -282,23 +358,28 @@ describe('merge coordinator wiring (WO-HARNESS-MERGE-MANAGER-WIRING-LAND-01)', (
     expect(reasonFor('run-conflict')).toContain('mergeable=false');
     expect(reasonFor('run-noverdict')).toContain('no PR');
 
-    // Zero merge calls: mirror service.ts's dispatch guard (handleRecord only invokes the
-    // coordinator when record.action === 'merge_ready') and confirm it never fires.
+    // Heartbeat counts reflect ACTUAL work, not a hardcoded shape: three terminal
+    // runs evaluated, three total, zero eligible (none merge-ready). Asserting the
+    // logged OBJECT (not just the message) kills a mutation that always logs zeros.
+    const heartbeat = heartbeatFor(entries);
+    expect(heartbeat).toBeDefined();
+    expect(heartbeat?.obj).toEqual({ evaluated: 3, total: 3, eligible: 0 });
+
+    // Zero merge calls -- driven through the REAL service dispatch gate
+    // (handleRecord), not an inline copy of its `action === 'merge_ready'` check.
+    // If that gate ever drifted to dispatch non-merge_ready records to the
+    // coordinator, this fails. All three records are success/ignore, so the
+    // coordinator must never fire and no merge action is recorded.
     const coordinator = mock(async () => undefined);
-    for (const record of records) {
-      if (record.action === 'merge_ready') await coordinator(record);
-    }
+    await dispatchThroughService(records, deps, coordinator);
     expect(coordinator).not.toHaveBeenCalled();
     expect(mergePullRequest).not.toHaveBeenCalled();
+    // No merge/merge_denied action written for any of the safely-skipped records.
+    expect(insertOverseerAction).not.toHaveBeenCalled();
   });
 
-  test('Test 3: an empty watch cycle still emits a merge-coordinator heartbeat line', async () => {
-    const heartbeats: string[] = [];
-    const logger: WatchHeartbeatLogger = {
-      info: (_obj, msg) => {
-        heartbeats.push(msg);
-      },
-    };
+  test('Test 3: an empty watch cycle still emits a merge-coordinator heartbeat with zeroed counts', async () => {
+    const { logger, entries } = captureHeartbeats();
 
     const deps: OverseerRunStoreDeps & GitHubClientDeps = {
       listRunsForWatch: async () => [],
@@ -312,6 +393,104 @@ describe('merge coordinator wiring (WO-HARNESS-MERGE-MANAGER-WIRING-LAND-01)', (
     const records = await watchOnce(deps, { logger });
 
     expect(records).toHaveLength(0);
-    expect(heartbeats.some(msg => msg.includes('merge-coordinator.heartbeat'))).toBe(true);
+    const heartbeat = heartbeatFor(entries);
+    expect(heartbeat).toBeDefined();
+    // Assert the logged OBJECT, not just the message: an empty cycle reports all
+    // zeros. (A hardcoded-zeros mutation is caught by Test 4's non-zero counts.)
+    expect(heartbeat?.obj).toEqual({ evaluated: 0, total: 0, eligible: 0 });
+  });
+
+  test('Test 4: heartbeat counts a merge-ready run as eligible and the real gate dispatches it', async () => {
+    // Mixed batch: one merge-ready terminal run, one non-eligible terminal run, and
+    // one still-running (non-terminal) run. The three counts are deliberately
+    // distinct -- evaluated=2, total=3, eligible=1 -- so a mutation that hardcodes
+    // ANY single count is caught (no two fields share a value with the empty cycle).
+    const runs: OverseerRunRecord[] = [
+      {
+        id: 'run-green',
+        woId: 'WO-GREEN-01',
+        owner: 'thinmansoftware',
+        repo: 'bdc-harness',
+        status: 'completed',
+        headBranch: 'archon/green',
+      },
+      {
+        id: 'run-skip',
+        woId: 'WO-SKIP-01',
+        owner: 'thinmansoftware',
+        repo: 'bdc-harness',
+        status: 'completed',
+        headBranch: 'archon/skip',
+      },
+      {
+        // Non-terminal: counted in `total` but never evaluated (watchOnce filters it
+        // out before assessRun), so total(3) > evaluated(2) is a real distinction.
+        id: 'run-active',
+        woId: 'WO-ACTIVE-01',
+        owner: 'thinmansoftware',
+        repo: 'bdc-harness',
+        status: 'running',
+        headBranch: 'archon/active',
+      },
+    ];
+
+    const evidenceByBranch: Record<string, PullRequestEvidence> = {
+      // Green + open + mergeable -> merge-ready -> eligible.
+      'archon/green': {
+        exists: true,
+        state: 'open',
+        checks: { total: 1, passed: 1, failed: 0, pending: 0 },
+        mergeable: true,
+        pr: { owner: 'thinmansoftware', repo: 'bdc-harness', number: 77 },
+        headSha: RUN_HEAD_SHA,
+      },
+      // Failed check -> not green -> not eligible.
+      'archon/skip': {
+        exists: true,
+        state: 'open',
+        checks: { total: 2, passed: 1, failed: 1, pending: 0 },
+        mergeable: true,
+        pr: { owner: 'thinmansoftware', repo: 'bdc-harness', number: 78 },
+        headSha: RUN_HEAD_SHA,
+      },
+    };
+
+    const mergePullRequest = mock(async () => ({ merged: false }));
+    const insertOverseerAction = mock(async () => undefined);
+    const deps: OverseerRunStoreDeps & OverseerActionsDeps & GitHubClientDeps = {
+      listRunsForWatch: async () => runs,
+      listRunEvents: async () => [],
+      findPullRequest: async input => {
+        const evidence = input.headBranch ? evidenceByBranch[input.headBranch] : undefined;
+        if (!evidence)
+          throw new Error(`unexpected findPullRequest for ${String(input.headBranch)}`);
+        return evidence;
+      },
+      mergePullRequest,
+      insertOverseerAction,
+    };
+
+    const { logger, entries } = captureHeartbeats();
+    const records = await watchOnce(deps, { logger });
+
+    // Only the two terminal runs are assessed.
+    expect(records).toHaveLength(2);
+    const eligibleRecords = records.filter(record => record.action === 'merge_ready');
+    expect(eligibleRecords).toHaveLength(1);
+    expect(eligibleRecords[0]?.runId).toBe('run-green');
+
+    // The observability content is correct, not a fixed shape.
+    const heartbeat = heartbeatFor(entries);
+    expect(heartbeat).toBeDefined();
+    expect(heartbeat?.obj).toEqual({ evaluated: 2, total: 3, eligible: 1 });
+
+    // Positive control for the dispatch gate: the REAL handleRecord routes the one
+    // merge-ready record to the coordinator exactly once (and the skipped one never).
+    const coordinator = mock(async () => undefined);
+    await dispatchThroughService(records, deps, coordinator);
+    expect(coordinator).toHaveBeenCalledTimes(1);
+    expect(coordinator).toHaveBeenCalledWith(
+      expect.objectContaining({ runId: 'run-green', action: 'merge_ready' })
+    );
   });
 });
