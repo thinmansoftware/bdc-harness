@@ -18,9 +18,9 @@ import { mkdtemp, rm } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { runCascade } from '../cascade.js';
-import type { CascadeDeps, RunCascadeOptions } from '../cascade.js';
+import type { CascadeDeps, EscalationCallContext, RunCascadeOptions } from '../cascade.js';
 import { readCascadeRecordById } from '../frontier-approval.js';
-import type { FireResult, PollResult, GateVerdict } from '../types.js';
+import type { ConductorRuleset, FireResult, PollResult, GateVerdict } from '../types.js';
 
 const CODEX_WORKFLOW = 'bdc-feature-development-codex';
 const CLAUDE_WORKFLOW = 'bdc-feature-development';
@@ -188,5 +188,51 @@ describe('frontier-approval gate (Test 1: auto-climb pauses instead of firing)',
     expect(record.frontierApproval).toBeUndefined();
     expect(escalateCalls).toBe(0);
     expect(firedWorkflows).toEqual([CODEX_WORKFLOW, CLAUDE_WORKFLOW]);
+  });
+
+  test('conductor entry directly onto premium (no entryOverride, zero prior attempts) pauses and synthesizes the source event', async () => {
+    const outDir = await makeOutDir();
+    const firedWorkflows: string[] = [];
+    const escalations: EscalationCallContext[] = [];
+
+    // A conductor ruleset that resolves entry directly onto the premium tier --
+    // the design-decision-6 scenario: the gate is reached with ZERO prior
+    // attempts, so emitEscalation has no last attempt to source from and must
+    // synthesize `${cascadeId}:frontier-gate` instead of dropping the notice.
+    const ruleset: ConductorRuleset = { defaultEntry: 'frontier', rules: [] };
+
+    const deps: CascadeDeps = {
+      fire: async opts => {
+        firedWorkflows.push(opts.workflowName);
+        return makeFireOk(`run-${firedWorkflows.length}`);
+      },
+      poll: async () => makePollResult(),
+      judge: () => makeFailVerdict('unused -- premium is never fired'),
+      escalate: async ctx => {
+        escalations.push(ctx);
+      },
+      findWoClaim: async () => null,
+      ruleset,
+    };
+
+    // No entryOverride: the conductor (injected ruleset) selects the premium tier.
+    const record = await runCascade(baseOpts({ deps, outDir, entryOverride: undefined }));
+
+    // Paused at the premium boundary WITHOUT firing anything, and with no attempts.
+    expect(record.status).toBe('pending-frontier-approval');
+    expect(record.attempts.length).toBe(0);
+    expect(firedWorkflows).toEqual([]);
+    expect(firedWorkflows).not.toContain(FABLE_WORKFLOW);
+
+    // Exactly one operator notice, carrying the SYNTHESIZED source event derived
+    // from the cascade identity (no prior attempt existed to source from).
+    expect(escalations.length).toBe(1);
+    expect(escalations[0]?.sourceEventId).toBe(`${record.cascadeId}:frontier-gate`);
+    expect(escalations[0]?.sourceEventCreatedAt).toBe(record.createdAt);
+
+    // Full escalation packet preserved for the operator resolution.
+    expect(record.frontierApproval?.tierName).toBe('frontier');
+    expect(record.frontierApproval?.workflowName).toBe(FABLE_WORKFLOW);
+    expect(record.frontierApproval?.resolution).toBeNull();
   });
 });

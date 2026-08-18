@@ -19,10 +19,12 @@ import type { CascadeDeps, RunCascadeOptions } from '../cascade.js';
 import {
   readCascadeRecordById,
   claimFrontierResolution,
+  releaseFrontierClaim,
   resumeFrontierTier,
   rejectFrontierTier,
 } from '../frontier-approval.js';
 import type { CascadeRunRecord, FireResult, PollResult, GateVerdict } from '../types.js';
+import type { AcquireWoLockResult } from '../wo-lock.js';
 
 const FABLE_WORKFLOW = 'bdc-feature-development-fable';
 
@@ -150,8 +152,13 @@ describe('frontier-approval resume (Test 2: approve fires exactly once)', () => 
     // A distinct resumed cascadeId (not the paused one).
     expect(resumed.cascadeId).not.toBe(paused.cascadeId);
 
-    // Original paused record annotated with the resolution + back-reference.
+    // Original paused record annotated with the resolution + back-reference, and
+    // moved OUT of the terminal-until-approved 'pending-frontier-approval' state
+    // so tooling (CLI statusToExitCode, dashboards) never reads it as still
+    // pending after the resumed cascade fired and won.
     const annotated = await readCascadeRecordById(paused.cascadeId, outDir);
+    expect(annotated?.status).toBe('frontier-approved');
+    expect(annotated?.status).not.toBe('pending-frontier-approval');
     expect(annotated?.frontierApproval?.resolution).toBe('approved');
     expect(annotated?.frontierApproval?.resumeCascadeId).toBe(resumed.cascadeId);
 
@@ -221,5 +228,64 @@ describe('frontier-approval reject + direct-entry bypass (Test 3)', () => {
     expect(record.status).not.toBe('pending-frontier-approval');
     expect(record.frontierApproval).toBeUndefined();
     expect(firedWorkflows).toEqual([FABLE_WORKFLOW]);
+  });
+});
+
+describe('frontier-approval resume dead-end guard (Test 2 failure mode: zero fire -> retryable)', () => {
+  test('approve whose resume is blocked by a duplicate WO lock fires nothing, is rolled back, and stays retryable', async () => {
+    const outDir = await makeOutDir();
+    const paused = await producePausedRecord(outDir, 'WO-FRONTIER-BLOCKED-001');
+
+    // Simulate a duplicate live cascade already holding the WO lock: acquireWoLock
+    // refuses, so runCascade returns status='blocked' WITHOUT firing (cascade.ts).
+    const firedWorkflows: string[] = [];
+    const blockedDeps: CascadeDeps = {
+      fire: async opts => {
+        firedWorkflows.push(opts.workflowName);
+        return makeFireOk(`should-not-fire-${firedWorkflows.length}`);
+      },
+      poll: async () => makePassPoll(),
+      judge: () => makePassVerdict(),
+      escalate: async () => undefined,
+      findWoClaim: async () => null,
+      acquireWoLock: async (woId, project, cascadeId): Promise<AcquireWoLockResult> => ({
+        acquired: false,
+        path: `${outDir}/wo-locks/stub.json`,
+        record: {
+          woId,
+          project,
+          cascadeId: 'other-live-cascade',
+          status: 'running',
+          createdAt: '2026-08-18T00:00:00.000Z',
+          updatedAt: '2026-08-18T00:00:00.000Z',
+        },
+      }),
+    };
+
+    // Operator approves: claim wins, but the resume cannot fire.
+    const claim = await claimFrontierResolution(paused.cascadeId, 'approved', outDir);
+    expect(claim.claimed).toBe(true);
+
+    const resumed = await resumeFrontierTier(paused, {
+      token: 'test-token',
+      outDir,
+      deps: blockedDeps,
+    });
+
+    // Nothing fired; no premium usage spent.
+    expect(resumed.status).toBe('blocked');
+    expect(firedWorkflows).toEqual([]);
+
+    // The paused record was NOT marked approved -- it must stay pending so a retry
+    // can resolve it once the duplicate clears (no permanent 'approved' dead end).
+    const afterResume = await readCascadeRecordById(paused.cascadeId, outDir);
+    expect(afterResume?.status).toBe('pending-frontier-approval');
+    expect(afterResume?.frontierApproval?.resolution).toBeNull();
+
+    // The API handler rolls the claim back on a blocked resume; simulate that and
+    // prove the cascadeId is resolvable again (retry approve OR reject can win).
+    await releaseFrontierClaim(paused.cascadeId, outDir);
+    const retry = await claimFrontierResolution(paused.cascadeId, 'approved', outDir);
+    expect(retry.claimed).toBe(true);
   });
 });

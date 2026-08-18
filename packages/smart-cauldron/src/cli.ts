@@ -40,12 +40,16 @@ import type { CascadeStatus } from './types.js';
  *   pending-frontier-approval -> 7 (auto-climb reached a premium tier; paused for operator
  *                                   approval, NOT fired -- awaits approve/reject)
  *   frontier-rejected         -> 8 (operator rejected the premium climb; terminated needs-human)
+ *   frontier-approved         -> 9 (operator approved the premium climb; the resumed cascade
+ *                                   -- resumeCascadeId -- carries the outcome, so THIS record
+ *                                   itself shipped nothing and must never read as won=0)
  *
  * spec-repair MUST NOT collapse to 0 -- it is a distinct, visible outcome
  * (frontier tier gate-failed) and callers key off the exit code. cancelled
  * likewise MUST NOT collapse to 0 -- an operator's cancel is not a success.
- * pending-frontier-approval and frontier-rejected likewise MUST NOT collapse to
- * 0 -- a paused-for-approval or rejected cascade never shipped code
+ * pending-frontier-approval, frontier-rejected, and frontier-approved likewise
+ * MUST NOT collapse to 0 -- a paused-for-approval, rejected, or approved-and-
+ * handed-off record never itself shipped code
  * (WO-HARNESS-FRONTIER-CLIMB-APPROVAL-GATE-01).
  */
 export function statusToExitCode(status: CascadeStatus): number {
@@ -64,6 +68,8 @@ export function statusToExitCode(status: CascadeStatus): number {
       return 7;
     case 'frontier-rejected':
       return 8;
+    case 'frontier-approved':
+      return 9;
     default:
       return 0;
   }

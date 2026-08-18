@@ -33,6 +33,7 @@ import { runCascade } from '@archon/smart-cauldron/cascade';
 import {
   readCascadeRecordById,
   claimFrontierResolution,
+  releaseFrontierClaim,
   resumeFrontierTier,
   rejectFrontierTier,
 } from '@archon/smart-cauldron/frontier-approval';
@@ -5254,6 +5255,26 @@ export function registerApiRoutes(
       });
       // Race so a synchronous resume failure surfaces as 500 instead of hanging.
       const admitted = await Promise.race([admission, resumePromise]);
+      // A 'blocked' admission means the resumed cascade refused to fire because a
+      // duplicate live cascade already holds the WO lock (smart-cauldron
+      // acquireWoLock): nothing fired, no premium usage was spent, and the paused
+      // record was left untouched by resumeFrontierTier. Roll back the approval
+      // claim so the operator can retry/reject once the duplicate clears -- do NOT
+      // report success, or the cascadeId would be wedged 'approved' forever with
+      // neither a fire nor a path to re-resolve (WO Test 2 fail condition).
+      if (admitted.status === 'blocked') {
+        await releaseFrontierClaim(cascadeId);
+        getLog().warn(
+          { cascadeId, woId: record.woId, resumeCascadeId: admitted.cascadeId },
+          'frontier_approval_resume_blocked'
+        );
+        return apiError(
+          c,
+          409,
+          `Frontier resume for ${record.woId} could not fire: another cascade is already active for this WO. ` +
+            'The approval was rolled back -- retry once it clears.'
+        );
+      }
       return c.json({
         success: true,
         message: `Approved frontier climb for ${record.woId}; resumed cascade ${admitted.cascadeId}`,

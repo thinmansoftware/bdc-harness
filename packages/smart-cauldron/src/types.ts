@@ -55,6 +55,7 @@ export type CascadeStatus =
   | 'infra-alert' // infra-error on a tier (escalate/alert, not climb silently)
   | 'pending-frontier-approval' // auto-climb reached a premium tier; paused for operator approval, not fired
   | 'frontier-rejected' // operator rejected the premium-tier climb; terminated as needs-human, no fire
+  | 'frontier-approved' // operator approved the premium climb; original record handed off to the resumed cascade (resumeCascadeId)
   | 'cancelled'; // an attempt was externally cancelled; cascade stopped
 
 /**

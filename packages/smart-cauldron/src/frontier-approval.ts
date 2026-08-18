@@ -23,7 +23,7 @@
  */
 
 import { createHash, randomUUID } from 'crypto';
-import { mkdir, readFile, writeFile } from 'fs/promises';
+import { mkdir, readFile, unlink, writeFile } from 'fs/promises';
 import { dirname, join } from 'path';
 import { runCascade } from './cascade.js';
 import type { CascadeDeps, RunCascadeOptions } from './cascade.js';
@@ -113,6 +113,32 @@ export async function claimFrontierResolution(
   }
 }
 
+/**
+ * Roll back a previously-won frontier resolution claim by deleting the claim
+ * file, so the cascadeId can be resolved again. This is the ONLY safe path back
+ * from a claimed-but-did-not-fire approve: when resumeFrontierTier's re-run
+ * returns 'blocked' (a duplicate live cascade held the WO lock, cascade.ts
+ * acquireWoLock), nothing fired and no premium usage was spent -- the claim must
+ * be released or the cascadeId is wedged 'approved' forever with neither a fire
+ * nor a way to retry/reject. Idempotent: a missing claim file is a no-op.
+ *
+ * Callers MUST only release a claim they observed claimed=true for AND whose
+ * resume verifiably did not fire; releasing a claim whose premium fire is live
+ * would re-open the exactly-once guard.
+ */
+export async function releaseFrontierClaim(
+  cascadeId: string,
+  outDir: string = DEFAULT_OUT_DIR
+): Promise<void> {
+  const filePath = claimPath(cascadeId, outDir);
+  try {
+    await unlink(filePath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
+    throw error;
+  }
+}
+
 export interface ResumeFrontierOptions {
   /** Operator token for the resumed live fire (secret boundary -- never persisted). */
   token?: string;
@@ -132,6 +158,14 @@ export interface ResumeFrontierOptions {
  * bypassed) and the preserved priorContext replayed in. Fires the premium tier
  * exactly once. The original paused record is annotated with the resolution and
  * a back-reference to the new cascadeId for traceability.
+ *
+ * The original record is marked resolved ONLY when the re-run actually fired.
+ * If runCascade returns 'blocked' (a duplicate live cascade already held the
+ * WO lock -- cascade.ts acquireWoLock), the premium tier never fired and no
+ * premium usage was spent: the paused record is left untouched (status stays
+ * 'pending-frontier-approval', resolution null) so the operator can retry. The
+ * caller MUST roll back its resolution claim (releaseFrontierClaim) in that
+ * case -- this function is claim-agnostic and never writes/deletes the claim.
  *
  * Callers MUST guard this with claimFrontierResolution to guarantee exactly-once
  * semantics across concurrent/duplicate approve calls.
@@ -154,12 +188,10 @@ export async function resumeFrontierTier(
     );
   }
 
-  // Stable id for the resumed cascade so the back-reference can be recorded up
-  // front and the resumed fire is itself idempotent under replay (dispatchId).
+  // Stable id for the resumed cascade so the back-reference is deterministic and
+  // the resumed fire is itself idempotent under replay (dispatchId).
   const resumeCascadeId = randomUUID();
-  await annotateResolution(record, 'approved', outDir, { resumeCascadeId });
-
-  return runCascade({
+  const result = await runCascade({
     woId: packet.woId,
     woClass: packet.woClass ?? undefined,
     tags: packet.tags,
@@ -173,6 +205,16 @@ export async function resumeFrontierTier(
     deps: opts.deps,
     onAdmission: opts.onAdmission,
   });
+
+  // Only record the approval on the original paused record once the premium tier
+  // actually fired. A 'blocked' result means nothing fired (WO lock held by a
+  // live duplicate) -- leaving the record pending lets a retry succeed once the
+  // duplicate clears, instead of stranding it 'approved' with no fire.
+  if (result.status !== 'blocked') {
+    await annotateResolution(record, 'approved', outDir, { resumeCascadeId });
+  }
+
+  return result;
 }
 
 /**
@@ -208,10 +250,16 @@ export async function rejectFrontierTier(
 }
 
 /**
- * Annotate the original paused record with the resolution (and optional
- * back-references) for traceability. Approve keeps the record's status as
- * 'pending-frontier-approval' -- the resumed cascade (resumeCascadeId) carries
- * the actual work; the claim file is the authoritative idempotency guard.
+ * Annotate the original paused record with an approved resolution and the
+ * back-reference to the resumed cascade (resumeCascadeId). Moves the record OUT
+ * of the terminal-until-approved 'pending-frontier-approval' state into
+ * 'frontier-approved' so tooling that reads this record (CLI statusToExitCode,
+ * dashboards) never reports it as still-pending after the operator approved and
+ * the resumed cascade took over the work. The claim file remains the
+ * authoritative idempotency guard; this record is the traceability anchor.
+ *
+ * Only called on the approve path (rejectFrontierTier writes its own terminal
+ * 'frontier-rejected' record inline).
  */
 async function annotateResolution(
   record: CascadeRunRecord,
@@ -227,6 +275,7 @@ async function annotateResolution(
   const resolvedAt = new Date().toISOString();
   const updated: CascadeRunRecord = {
     ...record,
+    status: 'frontier-approved',
     frontierApproval: {
       ...record.frontierApproval,
       resolution,

@@ -38,6 +38,7 @@ import type {
   CascadeRunRecord,
   CascadeAttempt,
   CascadeStatus,
+  ConductorRuleset,
   TierName,
   LadderTier,
   GateVerdict,
@@ -80,6 +81,14 @@ export interface CascadeDeps {
   /** Exclusive active-cascade lock per woId+project. */
   acquireWoLock?: typeof acquireWoLock;
   releaseWoLock?: typeof releaseWoLock;
+  /**
+   * Conductor ruleset override (skips loadRuleset() config read). Used to
+   * exercise entry-tier selection deterministically -- e.g. a ruleset that
+   * resolves directly onto a premium tier so the frontier-approval gate is
+   * reached with zero prior attempts (no entryOverride). Ignored when
+   * entryOverride is set (that already skips the conductor).
+   */
+  ruleset?: ConductorRuleset;
 }
 
 export interface SupervisorFailureContext {
@@ -241,7 +250,7 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
 
   // Load config from files (never from inline constants)
   const tiers = loadLadder();
-  const ruleset = loadRuleset();
+  const ruleset = opts.deps?.ruleset ?? loadRuleset();
   const refusedTiers = loadRefusedTiers();
   const premiumTiers = loadPremiumTiers();
 
