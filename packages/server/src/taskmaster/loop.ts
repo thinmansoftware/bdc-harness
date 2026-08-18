@@ -46,6 +46,20 @@ const log = createLogger('taskmaster/loop');
 /** Ratified Q1 budgets. */
 export const MAX_EFFECTS_PER_TICK = 10;
 
+/**
+ * Pause effect-delivery gate (WO-HARNESS-TASKMASTER-PAUSE-GATE-ENFORCE-01).
+ *
+ * When the control row is paused with scope='effects', ZERO effects leave the
+ * process -- nothing is exempt, including P0 escalations and the digest. A
+ * pause with any non-'effects' scope keeps the legacy watching-never-dark
+ * exemption for escalate_p0 and the digest. Callers must still check
+ * pause_state !== 'RUNNING' before consulting this helper.
+ */
+export function isPauseEffectsExempt(proposalType: string, pauseScope: string | null): boolean {
+  if (pauseScope === 'effects') return false;
+  return proposalType === 'escalate_p0' || proposalType === 'digest';
+}
+
 /** Journal lookback used for dedupe and per-item budgets. */
 const JOURNAL_LOOKBACK_MS = 7 * 24 * 60 * 60 * 1000;
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -1030,15 +1044,18 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
       continue;
     }
 
-    // Mode matrix: PAUSED/HARD_PAUSE stop sends but never watching --
-    // P0 escalation and the digest stay alive.
-    const pauseExempt = proposal.type === 'escalate_p0' || proposal.type === 'digest';
-    if (control.pause_state !== 'RUNNING' && !pauseExempt) {
+    // Mode matrix: a pause with scope='effects' withholds EVERY effect (parked
+    // with reason='paused'); a non-'effects' pause keeps P0 escalation and the
+    // digest alive so watching never goes dark.
+    if (
+      control.pause_state !== 'RUNNING' &&
+      !isPauseEffectsExempt(proposal.type, control.pause_scope)
+    ) {
       result.parked += 1;
       await dal.recordAction({
         thread_ref: proposal.threadRef,
         action_type: proposal.type,
-        proposal_json: JSON.stringify({ ...proposal, parked: true }),
+        proposal_json: JSON.stringify({ ...proposal, parked: true, reason: 'paused' }),
         idempotency_key: proposal.idempotencyKey,
         before_hash: sha256(proposal.body),
         outcome: 'parked',
@@ -1086,9 +1103,14 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
     }
     actionsByKey.set(proposal.idempotencyKey, journalRow);
 
-    // Re-check pause epoch immediately before the effect.
+    // Re-check pause epoch immediately before the effect. Recompute the
+    // effects-exempt test against the FRESH scope so a pause that lands
+    // mid-tick is caught even for escalate_p0/digest.
     const fresh = await dal.getPauseState();
-    if (fresh.epoch !== epoch || (fresh.pause_state !== 'RUNNING' && !pauseExempt)) {
+    if (
+      fresh.epoch !== epoch ||
+      (fresh.pause_state !== 'RUNNING' && !isPauseEffectsExempt(proposal.type, fresh.pause_scope))
+    ) {
       result.expired += 1;
       await dal.updateActionOutcome(journalRow.id, 'expired');
       continue;
@@ -1121,6 +1143,16 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
       tickFailures += 1;
       log.error({ err: error as Error, threadRef: proposal.threadRef }, 'taskmaster.effect_failed');
     }
+  }
+
+  // Paused-with-effects ticks report how many effects were withheld this tick.
+  // result.parked counts only pause-parks (site 1 is the sole parked writer),
+  // so it is the exact withheld count.
+  if (control.pause_state !== 'RUNNING' && control.pause_scope === 'effects') {
+    log.info(
+      { withheld: result.parked, pauseState: control.pause_state, epoch },
+      'taskmaster.tick_paused_withheld'
+    );
   }
 
   result.failed = tickFailures;

@@ -279,11 +279,12 @@ describe('scenario 1: undelivered ruling is delivered exactly once (dedupe prove
   });
 });
 
-describe('scenario 3: pause stops sends, never watching', () => {
-  test('paused: P1 nudge parks, P0 escalation still sends; resume expires the parked proposal', async () => {
+describe('scenario 3: pause scope=effects withholds ALL effects (P0 escalation no longer exempt)', () => {
+  test('paused scope=effects: P1 nudge AND P0 escalation park with reason=paused, zero sends', async () => {
     const world = makeWorld();
     seedDigestSent(world);
     world.control.pause_state = 'PAUSED';
+    world.control.pause_scope = 'effects';
     world.control.pause_actor = 'john';
 
     const staleP1: ThreadSnapshot = {
@@ -302,19 +303,25 @@ describe('scenario 3: pause stops sends, never watching', () => {
     const deps = makeDeps(world, { listThreads: async () => [staleP1, unclaimedP0] });
     const state = createTaskmasterState(60_000);
 
-    // Tick 1 observes; tick 2 confirms the nudge (which then parks).
+    // Tick 1 observes; tick 2 confirms the nudge (which then parks). The P0
+    // escalation acts immediately, so it parks on tick 1.
     await tick(state, deps);
     world.nowMs += 60_000;
     await tick(state, deps);
 
-    // The P0 escalation IS sent (pause-exempt), exactly once across ticks.
+    // NEW BEHAVIOR: the P0 escalation is withheld (parked), NOT sent, because
+    // the pause scope is 'effects'.
     const escalations = world.sentMessages.filter(m =>
       m.idempotency_key.startsWith('tm:escalate_p0:')
     );
-    expect(escalations.length).toBe(1);
-    expect(escalations[0]?.recipient).toBe('operator');
+    expect(escalations.length).toBe(0);
+    const escalationParked = world.journal.filter(
+      j => j.thread_ref === unclaimedP0.ref && j.outcome === 'parked'
+    );
+    expect(escalationParked.length).toBe(1);
+    expect(escalationParked[0]?.proposal_json).toContain('"reason":"paused"');
 
-    // Zero sends for the P1; its journal row exists tagged parked.
+    // Zero sends for the P1; its journal row exists tagged parked with reason.
     const p1Sends = world.sentMessages.filter(m => m.idempotency_key.startsWith('tm:nudge:'));
     expect(p1Sends.length).toBe(0);
     const parked = world.journal.filter(
@@ -322,17 +329,28 @@ describe('scenario 3: pause stops sends, never watching', () => {
     );
     expect(parked.length).toBe(1);
     expect(parked[0]?.proposal_json).toContain('"parked":true');
+    expect(parked[0]?.proposal_json).toContain('"reason":"paused"');
 
-    // Journal rows written for both threads.
-    expect(world.journal.some(j => j.thread_ref === unclaimedP0.ref && j.outcome === 'sent')).toBe(
-      true
-    );
+    // Absolutely zero effects left the process this pause window.
+    expect(world.sentMessages.length).toBe(0);
+    // No journal row was marked sent for either thread.
+    expect(
+      world.journal.some(
+        j =>
+          (j.thread_ref === staleP1.ref || j.thread_ref === unclaimedP0.ref) && j.outcome === 'sent'
+      )
+    ).toBe(false);
 
-    // Resume: epoch increments, parked proposal is EXPIRED, not replayed.
+    // Resume: epoch increments, parked proposals are EXPIRED, not replayed.
     for (const row of world.journal) {
       if (row.outcome === 'parked' || row.outcome === 'pending') row.outcome = 'expired';
     }
-    world.control = { ...world.control, pause_state: 'RUNNING', epoch: world.control.epoch + 1 };
+    world.control = {
+      ...world.control,
+      pause_state: 'RUNNING',
+      pause_scope: null,
+      epoch: world.control.epoch + 1,
+    };
 
     world.nowMs += 60_000;
     await tick(state, deps);
@@ -344,6 +362,180 @@ describe('scenario 3: pause stops sends, never watching', () => {
     expect(
       world.journal.filter(j => j.thread_ref === staleP1.ref && j.outcome === 'expired').length
     ).toBe(1);
+  });
+});
+
+describe('WO pause-gate enforcement (WO-HARNESS-TASKMASTER-PAUSE-GATE-ENFORCE-01)', () => {
+  // Three deliverable-in-one-tick proposals: one deliver_ruling + two
+  // unclaimed-P0 escalations (all actsImmediately, distinct threads).
+  function threeDeliverables(): {
+    rulings: ThreadSnapshot[];
+    threads: ThreadSnapshot[];
+    refs: string[];
+  } {
+    const ruled: ThreadSnapshot = {
+      ref: 'dispatch:ruling-77',
+      priority: 'P1',
+      lastActivityAt: new Date(T0 - 3_600_000).toISOString(),
+      undeliveredRulingId: 'ruling-77',
+      recipient: 'xo',
+    };
+    const p0a: ThreadSnapshot = {
+      ref: 'gh:thinmansoftware/bdc-harness#21',
+      priority: 'P0',
+      lastActivityAt: new Date(T0 - 3_600_000).toISOString(),
+      isUnclaimedP0: true,
+      recipient: 'xo',
+    };
+    const p0b: ThreadSnapshot = {
+      ref: 'gh:thinmansoftware/bdc-harness#22',
+      priority: 'P0',
+      lastActivityAt: new Date(T0 - 3_600_000).toISOString(),
+      isUnclaimedP0: true,
+      recipient: 'xo',
+    };
+    return { rulings: [ruled], threads: [p0a, p0b], refs: [ruled.ref, p0a.ref, p0b.ref] };
+  }
+
+  test('Test 1: paused scope=effects tick withholds all 3 effects, parks each with reason=paused', async () => {
+    const world = makeWorld();
+    seedDigestSent(world);
+    world.control.pause_state = 'PAUSED';
+    world.control.pause_scope = 'effects';
+    world.control.pause_actor = 'john';
+
+    const { rulings, threads, refs } = threeDeliverables();
+    const deps = makeDeps(world, {
+      listUndeliveredRulings: async () => rulings,
+      listThreads: async () => threads,
+    });
+    const state = createTaskmasterState(60_000);
+
+    const result = await tick(state, deps);
+
+    // Zero transport calls.
+    expect(world.sentMessages.length).toBe(0);
+    // Exactly 3 parked rows, one per deliverable, each with reason=paused.
+    expect(result.parked).toBe(3);
+    const parked = world.journal.filter(j => j.outcome === 'parked' && refs.includes(j.thread_ref));
+    expect(parked.length).toBe(3);
+    for (const row of parked) {
+      expect(row.proposal_json).toContain('"reason":"paused"');
+    }
+    // No sent journal rows for this tick.
+    expect(world.journal.some(j => j.outcome === 'sent' && refs.includes(j.thread_ref))).toBe(
+      false
+    );
+  });
+
+  test('Test 2: running (RUNNING) tick delivers all 3 effects (no regression)', async () => {
+    const world = makeWorld();
+    seedDigestSent(world);
+    // pause_state defaults to RUNNING, pause_scope null.
+
+    const { rulings, threads, refs } = threeDeliverables();
+    const deps = makeDeps(world, {
+      listUndeliveredRulings: async () => rulings,
+      listThreads: async () => threads,
+    });
+    const state = createTaskmasterState(60_000);
+
+    const result = await tick(state, deps);
+
+    // All 3 deliver exactly as before the gate WO.
+    expect(result.effects).toBe(3);
+    expect(result.parked).toBe(0);
+    expect(world.sentMessages.length).toBe(3);
+    const sent = world.journal.filter(j => j.outcome === 'sent' && refs.includes(j.thread_ref));
+    expect(sent.length).toBe(3);
+  });
+
+  test('Test 3: no burst on unpause -- previously parked-by-pause rows are not replayed', async () => {
+    const world = makeWorld();
+    seedDigestSent(world);
+    world.control.pause_state = 'PAUSED';
+    world.control.pause_scope = 'effects';
+    world.control.pause_actor = 'john';
+
+    const { rulings, threads, refs } = threeDeliverables();
+    const deps = makeDeps(world, {
+      listUndeliveredRulings: async () => rulings,
+      listThreads: async () => threads,
+    });
+    const state = createTaskmasterState(60_000);
+
+    // Paused tick parks all 3.
+    const paused = await tick(state, deps);
+    expect(paused.parked).toBe(3);
+    expect(world.sentMessages.length).toBe(0);
+
+    // Flip to RUNNING with a fresh epoch (resume pattern).
+    world.control = {
+      ...world.control,
+      pause_state: 'RUNNING',
+      pause_scope: null,
+      epoch: world.control.epoch + 1,
+    };
+
+    // Next tick: the parked rows are NOT replayed (skip-on-parked at the top of
+    // the effect loop guarantees this). The same proposals recompute; because
+    // they still carry outcome='parked' from the prior tick they are skipped,
+    // so no burst of sends fires from the pause backlog.
+    world.nowMs += 60_000;
+    const resumed = await tick(state, deps);
+
+    // The previously-parked rows drive zero replays.
+    expect(world.sentMessages.length).toBe(0);
+    expect(resumed.effects).toBe(0);
+    // The parked rows remain parked (not converted to sent).
+    const stillParked = world.journal.filter(
+      j => j.outcome === 'parked' && refs.includes(j.thread_ref)
+    );
+    expect(stillParked.length).toBe(3);
+  });
+
+  test('mid-tick pause (fresh-epoch re-check) also honors scope=effects for escalate_p0', async () => {
+    const world = makeWorld();
+    seedDigestSent(world);
+    // Start RUNNING so the initial gate lets the escalation through to the
+    // ROW-FIRST write, then a pause lands before the fresh re-check.
+    const p0: ThreadSnapshot = {
+      ref: 'gh:thinmansoftware/bdc-harness#31',
+      priority: 'P0',
+      lastActivityAt: new Date(T0 - 3_600_000).toISOString(),
+      isUnclaimedP0: true,
+      recipient: 'xo',
+    };
+
+    let getCalls = 0;
+    const deps = makeDeps(world, {
+      listThreads: async () => [p0],
+      db: {
+        ...makeDeps(world).db,
+        // First getPauseState (top of tick) sees RUNNING; the fresh re-check
+        // just before the send sees PAUSED scope=effects at the SAME epoch, so
+        // only the scope recompute (not the epoch mismatch) can catch it. Under
+        // the old code escalate_p0 was pause-exempt and would have sent.
+        getPauseState: async () => {
+          getCalls += 1;
+          if (getCalls === 1) return world.control;
+          return {
+            ...world.control,
+            pause_state: 'PAUSED',
+            pause_scope: 'effects',
+          };
+        },
+      },
+    });
+    const state = createTaskmasterState(60_000);
+
+    await tick(state, deps);
+
+    // The escalation reached the ROW-FIRST write but the fresh re-check caught
+    // the mid-tick pause: it is expired, NOT sent.
+    expect(world.sentMessages.length).toBe(0);
+    expect(world.journal.some(j => j.thread_ref === p0.ref && j.outcome === 'sent')).toBe(false);
+    expect(world.journal.some(j => j.thread_ref === p0.ref && j.outcome === 'expired')).toBe(true);
   });
 });
 
