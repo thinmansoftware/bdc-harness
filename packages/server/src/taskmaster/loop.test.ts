@@ -109,9 +109,12 @@ function makeDeps(world: FakeWorld, overrides: Partial<TaskmasterDeps> = {}): Ta
       world.journal.push(row);
       return row;
     },
-    updateActionOutcome: async (id: string, outcome: TmActionOutcome) => {
+    updateActionOutcome: async (id: string, outcome: TmActionOutcome, proposalJson?: string) => {
       const row = world.journal.find(j => j.id === id) ?? null;
-      if (row) row.outcome = outcome;
+      if (row) {
+        row.outcome = outcome;
+        if (proposalJson !== undefined) row.proposal_json = proposalJson;
+      }
       return row;
     },
     gradeAction: async (id: string, grade: TmGrade) => {
@@ -529,13 +532,35 @@ describe('WO pause-gate enforcement (WO-HARNESS-TASKMASTER-PAUSE-GATE-ENFORCE-01
     });
     const state = createTaskmasterState(60_000);
 
-    await tick(state, deps);
+    const result = await tick(state, deps);
 
     // The escalation reached the ROW-FIRST write but the fresh re-check caught
-    // the mid-tick pause: it is expired, NOT sent.
+    // the mid-tick pause: it is withheld (parked), NOT sent.
     expect(world.sentMessages.length).toBe(0);
     expect(world.journal.some(j => j.thread_ref === p0.ref && j.outcome === 'sent')).toBe(false);
-    expect(world.journal.some(j => j.thread_ref === p0.ref && j.outcome === 'expired')).toBe(true);
+
+    // A mid-tick pause is a pause-park, not a stale-epoch/resume expiry: the row
+    // is re-tagged 'parked' (NOT 'expired') so it is indistinguishable from a
+    // site-1 pause-park.
+    const p0Row = world.journal.find(
+      j => j.thread_ref === p0.ref && j.action_type === 'escalate_p0'
+    );
+    expect(p0Row?.outcome).toBe('parked');
+    expect(world.journal.some(j => j.thread_ref === p0.ref && j.outcome === 'expired')).toBe(false);
+
+    // Its proposal_json carries reason='paused' -- the design-required parked
+    // provenance, matching what site 1 writes.
+    const parsed = JSON.parse(p0Row?.proposal_json ?? '{}') as {
+      parked?: boolean;
+      reason?: string;
+    };
+    expect(parsed.parked).toBe(true);
+    expect(parsed.reason).toBe('paused');
+
+    // The withheld effect is counted in result.parked (the exact withheld total
+    // that the tick_paused_withheld log reports) and NOT in result.expired.
+    expect(result.parked).toBe(1);
+    expect(result.expired).toBe(0);
   });
 });
 

@@ -1107,12 +1107,25 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
     // effects-exempt test against the FRESH scope so a pause that lands
     // mid-tick is caught even for escalate_p0/digest.
     const fresh = await dal.getPauseState();
-    if (
-      fresh.epoch !== epoch ||
-      (fresh.pause_state !== 'RUNNING' && !isPauseEffectsExempt(proposal.type, fresh.pause_scope))
-    ) {
-      result.expired += 1;
-      await dal.updateActionOutcome(journalRow.id, 'expired');
+    const freshPauseWithhold =
+      fresh.pause_state !== 'RUNNING' && !isPauseEffectsExempt(proposal.type, fresh.pause_scope);
+    if (fresh.epoch !== epoch || freshPauseWithhold) {
+      // A pause that landed mid-tick (fresh scope withholds this effect) is a
+      // pause-park, not an ordinary stale-epoch/resume expiry: re-tag the
+      // ROW-FIRST row as parked with reason='paused' so it is indistinguishable
+      // from a site-1 pause-park and is counted in result.parked (the withheld
+      // total). A pure epoch mismatch (resume/stale) stays 'expired'.
+      if (freshPauseWithhold) {
+        result.parked += 1;
+        await dal.updateActionOutcome(
+          journalRow.id,
+          'parked',
+          JSON.stringify({ ...proposal, parked: true, reason: 'paused' })
+        );
+      } else {
+        result.expired += 1;
+        await dal.updateActionOutcome(journalRow.id, 'expired');
+      }
       continue;
     }
 
@@ -1145,10 +1158,13 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
     }
   }
 
-  // Paused-with-effects ticks report how many effects were withheld this tick.
-  // result.parked counts only pause-parks (site 1 is the sole parked writer),
-  // so it is the exact withheld count.
-  if (control.pause_state !== 'RUNNING' && control.pause_scope === 'effects') {
+  // Report how many effects a pause withheld this tick. result.parked is
+  // incremented ONLY by the two pause-park sites (site 1 at tick-start scope,
+  // site 2 at the mid-tick fresh re-check), so it is the exact withheld count.
+  // Gate on result.parked (not the tick-start `control`) so a pause that lands
+  // mid-tick -- where `control` was still RUNNING at tick start -- is still
+  // logged instead of going dark.
+  if (result.parked > 0) {
     log.info(
       { withheld: result.parked, pauseState: control.pause_state, epoch },
       'taskmaster.tick_paused_withheld'
