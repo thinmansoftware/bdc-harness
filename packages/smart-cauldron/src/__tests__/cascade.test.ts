@@ -591,19 +591,21 @@ describe('Test 5: FRONTIER gate-fail -> SPEC-REPAIR (not plain blocked)', () => 
       writeRecord: async (record, _dir) => `/tmp/cascade-record-${record.cascadeId}.json`,
     };
 
-    // entryOverride='claude' starts at the second-to-last tier so frontier is
-    // immediately next: exactly 2 fires (claude + frontier), then stop.
+    // entryOverride='frontier' is a human-typed entry that bypasses the
+    // approval gate (WO-HARNESS-FRONTIER-CLIMB-APPROVAL-GATE-01) and fires the
+    // frontier tier directly: exactly 1 fire, gate-fails, spec-repair, stop.
+    // (An AUTOMATIC climb into frontier now pauses instead of firing.)
     const record = await runCascade(
       baseOpts({
         deps,
-        entryOverride: 'claude',
+        entryOverride: 'frontier',
       })
     );
 
     // Recorded outcome is spec-repair, NOT plain blocked.
     expect(record.status).toBe('spec-repair');
     expect(record.status).not.toBe('blocked');
-    expect(fireCount).toBe(2); // claude + frontier only -- no infinite loop
+    expect(fireCount).toBe(1); // frontier only (direct entry) -- no infinite loop
 
     // The spec-repair (issue-comment) path was invoked with real content.
     expect(specRepairCalls.length).toBe(1);
@@ -639,11 +641,13 @@ describe('Test 5: FRONTIER gate-fail -> SPEC-REPAIR (not plain blocked)', () => 
       writeRecord: async (record, _dir) => `/tmp/cascade-record-${record.cascadeId}.json`,
     };
 
-    const record = await runCascade(baseOpts({ deps, entryOverride: 'claude' }));
+    // Direct entry into frontier (human-typed) bypasses the approval gate and
+    // fires it once; an AUTOMATIC climb into frontier would instead pause.
+    const record = await runCascade(baseOpts({ deps, entryOverride: 'frontier' }));
 
     // Still spec-repair (the doctrine outcome), and the escalation was NOT dropped.
     expect(record.status).toBe('spec-repair');
-    expect(fireCount).toBe(2);
+    expect(fireCount).toBe(1);
     expect(escalateCalls.length).toBe(1);
     expect(escalateCalls[0]?.reason).toContain('SPEC-REPAIR');
     // The spec-repair text rides along in the alert payload.

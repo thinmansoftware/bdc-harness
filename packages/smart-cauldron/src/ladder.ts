@@ -23,7 +23,16 @@ interface RawTier {
 interface RawLadderConfig {
   tiers: RawTier[];
   refusedTiers?: string[];
+  premiumTiers?: string[];
 }
+
+/**
+ * Default premium-tier set used when the ladder config does not declare
+ * `premiumTiers`. Premium tiers are never fired by an AUTOMATIC climb; the
+ * cascade pauses for operator approval instead (WO-HARNESS-FRONTIER-CLIMB-
+ * APPROVAL-GATE-01). Default is the frontier (fable) rung.
+ */
+const DEFAULT_PREMIUM_TIERS: readonly string[] = ['frontier'];
 
 function resolveLadderPath(configPath?: string): string {
   return configPath ?? join(import.meta.dir, '..', 'config', 'ladder.config.json');
@@ -106,6 +115,29 @@ export function loadRefusedTiers(configPath?: string): string[] {
     return [];
   }
   return config.refusedTiers.filter(
+    (name): name is string => typeof name === 'string' && name.length > 0
+  );
+}
+
+/**
+ * Load the premium-tier names from the canonical ladder SOR. Premium tiers are
+ * never fired by an AUTOMATIC climb -- the cascade pauses for operator approval
+ * instead (WO-HARNESS-FRONTIER-CLIMB-APPROVAL-GATE-01). An explicit --entry
+ * override onto a premium tier is a human-typed action and bypasses the gate.
+ *
+ * When `premiumTiers` is absent from config, the default (['frontier']) is
+ * returned so the gate protects the apex rung out of the box. An explicit empty
+ * array in config disables the gate entirely (policy choice, honored verbatim).
+ *
+ * @param configPath Optional path override; defaults to config/ladder.config.json
+ *                   relative to this file's directory.
+ */
+export function loadPremiumTiers(configPath?: string): string[] {
+  const config = readLadderConfig(configPath);
+  if (!Array.isArray(config.premiumTiers)) {
+    return [...DEFAULT_PREMIUM_TIERS];
+  }
+  return config.premiumTiers.filter(
     (name): name is string => typeof name === 'string' && name.length > 0
   );
 }

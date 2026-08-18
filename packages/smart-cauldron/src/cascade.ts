@@ -20,7 +20,7 @@
 import { randomUUID } from 'crypto';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
-import { loadLadder, loadRefusedTiers } from './ladder.js';
+import { loadLadder, loadRefusedTiers, loadPremiumTiers } from './ladder.js';
 import { loadRuleset, pickEntryTier } from './conductor.js';
 import { fireTier, buildFireMessage } from './fire.js';
 import { pollForTerminal, TimeoutError } from './poll.js';
@@ -142,6 +142,14 @@ export interface RunCascadeOptions {
   tags?: string[];
   /** Override the entry tier (skips conductor ruleset). */
   entryOverride?: TierName;
+  /**
+   * Seed the informed-climb context of the FIRST attempt. Used only when
+   * resuming an approved frontier-approval pause (WO-HARNESS-FRONTIER-CLIMB-
+   * APPROVAL-GATE-01): the preserved packet's priorContext is replayed in so the
+   * resumed premium fire still carries the informed-climb text it would have had.
+   * Default null (normal fires build priorContext as they climb).
+   */
+  initialPriorContext?: string | null;
   /** Archon API base URL. Defaults to ARCHON_API_BASE_URL env or http://localhost:3090. */
   apiBaseUrl?: string;
   /** Operator token for Archon API auth. Defaults to ARCHON_OPERATOR_TOKEN env in callees. */
@@ -235,6 +243,7 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
   const tiers = loadLadder();
   const ruleset = loadRuleset();
   const refusedTiers = loadRefusedTiers();
+  const premiumTiers = loadPremiumTiers();
 
   // Conductor: pick entry tier (ruleset), or honor explicit --entry override
   const entryTierName = entryOverride ?? pickEntryTier({ woClass, tags }, ruleset);
@@ -379,21 +388,28 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
     const emitEscalation = async (
       context: Omit<EscalationCallContext, 'sourceEventId' | 'sourceEventCreatedAt' | 'repository'>
     ): Promise<void> => {
+      // The last recorded attempt is the natural source event for an escalation.
+      // The frontier-approval gate (WO-HARNESS-FRONTIER-CLIMB-APPROVAL-GATE-01)
+      // can pause with zero prior attempts when the conductor resolves entry
+      // directly onto a premium tier; synthesize a stable source event from the
+      // cascade identity rather than dropping the operator notice.
       const sourceAttempt = attempts.at(-1);
-      if (!sourceAttempt) throw new Error('cascade_escalation_source_event_missing');
       await escalateImpl({
         ...context,
-        sourceEventId: sourceAttempt.sourceEventId,
-        sourceEventCreatedAt: sourceAttempt.sourceEventAt,
+        sourceEventId: sourceAttempt?.sourceEventId ?? `${cascadeId}:frontier-gate`,
+        sourceEventCreatedAt: sourceAttempt?.sourceEventAt ?? createdAt,
         repository: project ?? 'thinmansoftware/bdc-harness',
       });
     };
-    let priorContext: string | null = null;
+    // Normally null; seeded on an approved frontier-approval resume so the
+    // premium fire carries the informed-climb text preserved in the packet.
+    let priorContext: string | null = opts.initialPriorContext ?? null;
     let climbCount = 0;
     let status: CascadeStatus = 'running';
     let winningTier: TierName | null = null;
     let specRepairRecord: CascadeRunRecord['specRepair'];
     let supervisorRecoveryRecord: CascadeRunRecord['supervisorRecovery'];
+    let frontierApprovalRecord: CascadeRunRecord['frontierApproval'];
 
     function buildCurrentRecord(): CascadeRunRecord {
       const entryTier: TierName = attempts[0]?.tier ?? entryTierName;
@@ -421,6 +437,7 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
         },
         ...(specRepairRecord ? { specRepair: specRepairRecord } : {}),
         ...(supervisorRecoveryRecord ? { supervisorRecovery: supervisorRecoveryRecord } : {}),
+        ...(frontierApprovalRecord ? { frontierApproval: frontierApprovalRecord } : {}),
       };
     }
 
@@ -554,6 +571,66 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
     while (currentIndex < tiers.length) {
       const tier = tiers[currentIndex];
       if (!tier) break;
+
+      // ==== Premium-tier approval gate (WO-HARNESS-FRONTIER-CLIMB-APPROVAL-GATE-01) ====
+      // An AUTOMATIC climb into a premium tier (default ['frontier']) must NEVER
+      // auto-fire: "then dont waste my usage if it will fail" (John, 2026-08-18).
+      // Pause with the preserved escalation packet and emit ONE operator notice.
+      // An explicit --entry override onto this tier is human-typed and bypasses
+      // the gate (the operator already chose to spend on it).
+      if (premiumTiers.includes(tier.name) && tier.name !== entryOverride) {
+        const pausedAt = new Date().toISOString();
+        let notifiedAt: string | null = null;
+        try {
+          await emitEscalation({
+            errorClass: 'validator_rejected',
+            woId,
+            reason:
+              'PENDING FRONTIER APPROVAL -- auto-climb reached premium tier ' +
+              `"${tier.name}" (workflow ${tier.workflowName}) for ${woId}. Not fired. ` +
+              'Approve to resume, or reject to send to needs-human. ' +
+              `Approve: POST /api/cascades/${cascadeId}/approve-frontier ; ` +
+              `Reject: POST /api/cascades/${cascadeId}/reject-frontier`,
+            remediation: buildFrontierApprovalRemediation(cascadeId, tier, attempts),
+            runId: attempts.at(-1)?.runId ?? null,
+            overseerPermit: opts.overseerPermit,
+          });
+          notifiedAt = new Date().toISOString();
+        } catch (notifyErr) {
+          // The pause itself must persist even if the notice delivery fails --
+          // an operator can still find the paused record and resolve it. Log
+          // the failure and fall through to persist the paused state.
+          console.log(
+            `[smart-cauldron] Frontier-approval notice failed for woId=${woId}: ` +
+              `${(notifyErr as Error).message} (pause persisted regardless)`
+          );
+        }
+
+        frontierApprovalRecord = {
+          tierName: tier.name,
+          workflowName: tier.workflowName,
+          priorContext,
+          project: project ?? null,
+          woId,
+          woClass: woClass ?? null,
+          tags: [...(tags ?? [])].sort(),
+          apiBaseUrl,
+          pausedAt,
+          notifiedAt,
+          resolution: null,
+          resolvedAt: null,
+          resumeCascadeId: null,
+          rejectReason: null,
+        };
+        status = 'pending-frontier-approval';
+        console.log(
+          '[smart-cauldron] PENDING FRONTIER APPROVAL: auto-climb reached premium ' +
+            `tier=${tier.name} for woId=${woId} -- NOT firing (cascadeId=${cascadeId})`
+        );
+        await checkpoint();
+        break;
+      }
+
       const attemptStartedAt = new Date().toISOString();
       const attempt: CascadeAttempt = {
         sourceEventId: `${cascadeId}:attempt:${attempts.length + 1}`,
@@ -917,6 +994,36 @@ async function defaultEscalate(ctx: EscalationCallContext): Promise<void> {
       eventCreatedAt: ctx.sourceEventCreatedAt,
     }
   );
+}
+
+/**
+ * Build the operator-facing remediation lines for a premium-tier approval pause.
+ * Lists the exact approve/reject commands and the tiers already burned so the
+ * operator can decide whether the premium spend is warranted before it happens.
+ */
+function buildFrontierApprovalRemediation(
+  cascadeId: string,
+  tier: LadderTier,
+  attempts: CascadeAttempt[]
+): string[] {
+  const lines: string[] = [
+    `Premium tier "${tier.name}" (workflow ${tier.workflowName}) was reached by an ` +
+      'automatic climb and was NOT fired -- awaiting operator approval.',
+    `Approve (resume + fire the premium tier): POST /api/cascades/${cascadeId}/approve-frontier`,
+    `Reject (terminate as needs-human, no fire): POST /api/cascades/${cascadeId}/reject-frontier`,
+  ];
+  if (attempts.length > 0) {
+    lines.push('Tiers already attempted (cheapest first):');
+    for (const a of attempts) {
+      const detail = a.gateFailReason ?? a.infraErrorReason ?? '(no detail)';
+      lines.push(`  - ${a.tier} [${a.outcome}]: ${detail}`);
+    }
+  } else {
+    lines.push(
+      'No prior tiers were attempted -- the conductor selected this premium tier directly.'
+    );
+  }
+  return lines;
 }
 
 /**

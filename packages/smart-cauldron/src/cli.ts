@@ -30,17 +30,23 @@ import type { CascadeStatus } from './types.js';
  * Maps a terminal cascade status to a process exit code. Kept as a pure,
  * exported function so the mapping is unit-testable without running a cascade.
  *
- *   won         -> 0 (success; gate passed)
- *   blocked     -> 2 (all tiers exhausted without a frontier; defensive)
- *   infra-alert -> 3 (infra-error on a tier; escalate/alert)
- *   spec-repair -> 4 (frontier gate-failed; WO needs authoring-layer repair)
- *   running     -> 5 (non-terminal; should not be observed as a final status)
- *   cancelled   -> 6 (externally cancelled; distinct from won=0 and from all
- *                     climb-triggering codes)
+ *   won                       -> 0 (success; gate passed)
+ *   blocked                   -> 2 (all tiers exhausted without a frontier; defensive)
+ *   infra-alert               -> 3 (infra-error on a tier; escalate/alert)
+ *   spec-repair               -> 4 (frontier gate-failed; WO needs authoring-layer repair)
+ *   running                   -> 5 (non-terminal; should not be observed as a final status)
+ *   cancelled                 -> 6 (externally cancelled; distinct from won=0 and from all
+ *                                   climb-triggering codes)
+ *   pending-frontier-approval -> 7 (auto-climb reached a premium tier; paused for operator
+ *                                   approval, NOT fired -- awaits approve/reject)
+ *   frontier-rejected         -> 8 (operator rejected the premium climb; terminated needs-human)
  *
  * spec-repair MUST NOT collapse to 0 -- it is a distinct, visible outcome
  * (frontier tier gate-failed) and callers key off the exit code. cancelled
  * likewise MUST NOT collapse to 0 -- an operator's cancel is not a success.
+ * pending-frontier-approval and frontier-rejected likewise MUST NOT collapse to
+ * 0 -- a paused-for-approval or rejected cascade never shipped code
+ * (WO-HARNESS-FRONTIER-CLIMB-APPROVAL-GATE-01).
  */
 export function statusToExitCode(status: CascadeStatus): number {
   switch (status) {
@@ -54,6 +60,10 @@ export function statusToExitCode(status: CascadeStatus): number {
       return 4;
     case 'cancelled':
       return 6;
+    case 'pending-frontier-approval':
+      return 7;
+    case 'frontier-rejected':
+      return 8;
     default:
       return 0;
   }
