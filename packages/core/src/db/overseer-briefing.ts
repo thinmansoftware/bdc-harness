@@ -2,7 +2,7 @@ import { randomUUID } from 'crypto';
 import { getDatabase } from './connection';
 import type { IDatabase } from './adapters/types';
 
-export const OPERATOR_CARD_CHANNELS = ['dispatch', 'builder_monitor', 'notion'] as const;
+export const OPERATOR_CARD_CHANNELS = ['dispatch', 'builder_monitor'] as const;
 export type OperatorCardChannelName = (typeof OPERATOR_CARD_CHANNELS)[number];
 export type DeliveryJobState = 'pending' | 'leased' | 'succeeded' | 'exhausted' | 'indeterminate';
 export type DeliveryOutcome =

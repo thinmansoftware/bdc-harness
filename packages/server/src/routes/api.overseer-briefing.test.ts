@@ -7,7 +7,7 @@ import { mockAllWorkflowModules } from '../test/workflow-mock-factories';
 
 const cardId = 'a'.repeat(64);
 const payloadDigest = 'b'.repeat(64);
-const job = (channel: 'dispatch' | 'builder_monitor' | 'notion') => ({
+const job = (channel: 'dispatch' | 'builder_monitor') => ({
   card_id: cardId,
   channel,
   state: 'pending',
@@ -49,12 +49,11 @@ const view = {
     governance_classification: 'information-only',
     created_at: '2026-07-16T08:00:00.000Z',
   },
-  jobs: [job('builder_monitor'), job('dispatch'), job('notion')],
+  jobs: [job('builder_monitor'), job('dispatch')],
   receipts: [],
   delivery_summary: {
     builder_monitor: job('builder_monitor'),
     dispatch: job('dispatch'),
-    notion: job('notion'),
   },
 };
 

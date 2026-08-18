@@ -1,7 +1,7 @@
 import { z } from '@hono/zod-openapi';
 
 const digestSchema = z.string().regex(/^[0-9a-f]{64}$/);
-const channelSchema = z.enum(['dispatch', 'builder_monitor', 'notion']);
+const channelSchema = z.enum(['dispatch', 'builder_monitor']);
 
 export const operatorCardParamsSchema = z.object({
   card_id: digestSchema.openapi({ param: { name: 'card_id', in: 'path' } }),
