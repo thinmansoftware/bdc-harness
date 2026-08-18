@@ -236,9 +236,26 @@ async function assessRun(
   };
 }
 
+/**
+ * Minimal logger seam for the per-cycle heartbeat. The pino Logger returned by
+ * createLogger satisfies it structurally, so production passes nothing and uses the
+ * module logger; tests inject a spy to assert the heartbeat fired without a
+ * process-global mock.module() (see CLAUDE.md mock-isolation rules).
+ */
+export interface WatchHeartbeatLogger {
+  info(obj: Record<string, unknown>, msg: string): void;
+}
+
+export interface WatchOnceOptions {
+  /** Injected logger for the heartbeat line; defaults to the module logger. */
+  logger?: WatchHeartbeatLogger;
+}
+
 export async function watchOnce(
-  deps: OverseerRunStoreDeps & GitHubClientDeps
+  deps: OverseerRunStoreDeps & GitHubClientDeps,
+  options: WatchOnceOptions = {}
 ): Promise<WatchedRunRecord[]> {
+  const heartbeatLogger: WatchHeartbeatLogger = options.logger ?? log;
   const runs = await deps.listRunsForWatch();
   const terminalRuns = runs.filter(run => isTerminalStatus(run.status));
   const outcomes: WatchedRunRecord[] = [];
@@ -258,6 +275,20 @@ export async function watchOnce(
       );
     }
   }
+  // Merge-coordinator observability heartbeat
+  // (WO-HARNESS-MERGE-MANAGER-WIRING-LAND-01). Fires on EVERY cycle regardless of how
+  // many runs were evaluated -- a silent cycle is exactly what let "zero merge-manager
+  // runtime log lines in 24h" go unnoticed while merge-ready PRs piled up. The
+  // 'merge-coordinator.*' event key makes each evaluation cycle greppable in docker
+  // logs and answers "is the coordinator running?" without needing a single eligible PR.
+  heartbeatLogger.info(
+    {
+      evaluated: terminalRuns.length,
+      total: runs.length,
+      eligible: outcomes.filter(outcome => outcome.action === 'merge_ready').length,
+    },
+    'merge-coordinator.heartbeat_evaluated'
+  );
   return outcomes;
 }
 
