@@ -2839,6 +2839,15 @@ async function executeBashNode(
     ...process.env,
     ARTIFACTS_DIR: artifactsDir,
     LOG_DIR: logDir,
+    // BASE_BRANCH carries the SINGLE base-lane authority
+    // (WO-HARNESS-BASE-LANE-AUTHORITY-01). `baseBranch` is threaded from
+    // executeWorkflow, where -- for run-authority workflows -- it is the WO's
+    // declared base (parsed from the frozen spec), NOT the auto-detected repo
+    // default. Downstream lane nodes consume this exact value: the
+    // capture-run-scope early-fail assertion (sentinel
+    // worktree_not_on_declared_base_lane), derive-run-source-scope's squash
+    // recovery, and resolve-review-base all key off origin/$BASE_BRANCH, so a
+    // lane-correct baseBranch here makes the whole tail lane-correct.
     BASE_BRANCH: baseBranch,
     // WORKFLOW_ID and WORKTREE_PATH as actual env vars (complement the $WORKFLOW_ID template token).
     WORKFLOW_ID: workflowRun.id,

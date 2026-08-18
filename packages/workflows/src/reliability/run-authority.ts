@@ -16,6 +16,41 @@ export interface RunAuthorityDispatch extends FrozenSpecSource {
   readonly dispatchId: string;
 }
 
+/**
+ * Parse the WO's declared "Base branch:" from a frozen spec body.
+ *
+ * This is the SINGLE base-lane authority parser (WO-HARNESS-BASE-LANE-AUTHORITY-01):
+ * both the dispatch path (orchestrator) and the executor resolve the declared base
+ * through this one function so the isolation start-point, the pinned authority triple
+ * (base_branch/base_sha/run_scope_sha), and the BASE_BRANCH env for downstream nodes
+ * all agree on ONE lane by construction.
+ *
+ * The three accepted forms mirror, verbatim, the bash patterns already used by
+ * bdc-feature-development.yaml's resolve-review-base node (declared-base logic from
+ * #676), in priority order:
+ *   1. plain header       "Base branch: <name>"
+ *   2. markdown-bold       "**Base branch:** `<name>`"
+ *   3. YAML field          "base_branch: <name>"
+ * Returns undefined when the spec declares no base branch (caller keeps its default).
+ */
+export function parseDeclaredBaseBranch(
+  spec: string | Uint8Array | undefined | null
+): string | undefined {
+  if (spec === undefined || spec === null) return undefined;
+  const text = typeof spec === 'string' ? spec : Buffer.from(spec).toString('utf8');
+  if (text.length === 0) return undefined;
+  // 1. Plain header (case-sensitive, matching the YAML grep).
+  const plain = /^Base branch:[ \t]*([A-Za-z0-9_./-]+)/m.exec(text);
+  if (plain) return plain[1];
+  // 2. Markdown-bold with backtick-wrapped value.
+  const bold = /\*\*Base branch:\*\*[ \t]*`([A-Za-z0-9_./-]+)`/.exec(text);
+  if (bold) return bold[1];
+  // 3. YAML field.
+  const yaml = /^base_branch:[ \t]*([A-Za-z0-9_./-]+)/m.exec(text);
+  if (yaml) return yaml[1];
+  return undefined;
+}
+
 export interface RunAuthorityInput extends Omit<RunAuthorityRecord, 'specHash'> {
   readonly specBytes: Uint8Array;
 }

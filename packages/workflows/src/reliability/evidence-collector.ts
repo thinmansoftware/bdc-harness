@@ -258,7 +258,25 @@ export async function collectRuntimeEvidence(
   const headSha = await git(['rev-parse', '--verify', 'HEAD^{commit}']);
   const headBranch = await git(['symbolic-ref', '--quiet', '--short', 'HEAD']);
   const originRemote = await git(['remote', 'get-url', 'origin']);
-  const mergeBaseSha = await git(['merge-base', authority.baseSha, headSha]);
+  // Base-lane authority merge-base with squash tolerance
+  // (WO-HARNESS-BASE-LANE-AUTHORITY-01). The pinned authority.baseSha can become
+  // unreachable after the base branch is squash-merged and gc-pruned (a ROUTINE
+  // event that must never fail a run). Fall back to the authority's base BRANCH
+  // lane (origin/<baseBranch>), which shares true history with HEAD, before giving
+  // up. The fallback's own failure (genuinely disjoint lane) still throws.
+  let mergeBaseSha = '';
+  try {
+    mergeBaseSha = await git(['merge-base', authority.baseSha, headSha]);
+  } catch {
+    mergeBaseSha = '';
+  }
+  if (!mergeBaseSha) {
+    mergeBaseSha = await git([
+      'merge-base',
+      `refs/remotes/origin/${authority.baseBranch}`,
+      headSha,
+    ]);
+  }
   const behindRaw = await git([
     'rev-list',
     '--count',

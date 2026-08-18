@@ -19,6 +19,7 @@ import { BUNDLED_POLICIES } from './defaults/bundled-defaults';
 import { resolveEntryLane, DEFAULT_ENGINE_TO_LANE } from './router-dispatcher';
 import { isLaneFullyDark, listDarkEngines } from './engine-availability';
 import {
+  parseDeclaredBaseBranch,
   persistRunAuthority,
   type RunAuthorityDispatch,
   type RunAuthorityInput,
@@ -932,6 +933,21 @@ export async function executeWorkflow(
         effectiveAuthoritySource = { ...frozen, dispatchId: conversationId };
       }
       if (effectiveAuthoritySource) {
+        // Single base-lane authority (WO-HARNESS-BASE-LANE-AUTHORITY-01): the WO's
+        // declared "Base branch:" overrides the auto-detected repo default so the
+        // pinned authority triple (base_branch/base_sha/run_scope_sha) AND the
+        // BASE_BRANCH env threaded to every downstream node describe ONE lane. The
+        // worktree was already allocated from origin/<declared> at dispatch, so the
+        // remote-tracking ref exists locally; captureRunAuthorityInput validates it
+        // when it resolves refs/remotes/origin/<baseBranch>.
+        const declaredBase = parseDeclaredBaseBranch(effectiveAuthoritySource.specBytes);
+        if (declaredBase && declaredBase !== baseBranch) {
+          getLog().info(
+            { runId: workflowRun.id, declaredBase, previousBaseBranch: baseBranch },
+            'workflow.base_branch_authority_override'
+          );
+          baseBranch = declaredBase;
+        }
         const authorityInput = await captureRunAuthorityInput(
           cwd,
           workflow,
@@ -951,6 +967,26 @@ export async function executeWorkflow(
           resolve(existingAuthority.worktreePath) !== resolve(cwd)
         ) {
           throw new Error(`authority_conflict: run ${workflowRun.id}`);
+        }
+        // Resume path (WO-HARNESS-BASE-LANE-AUTHORITY-01): on any resume of a
+        // run-authority-required workflow (workflow resume/approve/reject,
+        // foreground_resume_detected) no authoritySource is passed, so the
+        // fresh-dispatch override above never runs. Rehydrate baseBranch from
+        // the persisted authority so the BASE_BRANCH threaded to every
+        // downstream node describes the SAME single lane the run was pinned to
+        // at dispatch -- not the stale/empty value getDefaultBranch(cwd) or
+        // config.baseBranch produced at load time (empty when cwd is a worktree
+        // whose repo default differs, or not a git repo at all).
+        if (existingAuthority.baseBranch && existingAuthority.baseBranch !== baseBranch) {
+          getLog().info(
+            {
+              runId: workflowRun.id,
+              persistedBaseBranch: existingAuthority.baseBranch,
+              previousBaseBranch: baseBranch,
+            },
+            'workflow.base_branch_authority_rehydrated'
+          );
+          baseBranch = existingAuthority.baseBranch;
         }
       }
     }
