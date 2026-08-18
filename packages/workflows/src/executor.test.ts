@@ -553,7 +553,10 @@ describe('executeWorkflow', () => {
         workflowName: 'test-workflow',
         codebaseId: 'codebase-1',
         canonicalRemote: 'https://github.com/bluedevilcollectibles/example.git',
-        baseBranch: 'main',
+        // Distinct from the globally-mocked getDefaultBranch ('main') so the
+        // assertion below can only pass if the persisted lane was rehydrated on
+        // resume rather than the auto-detected repo default being reused.
+        baseBranch: 'release/2026-q3-lane',
         baseSha: 'b'.repeat(40),
         runScopeSha: 'c'.repeat(40),
         headBranch: 'archon/thread-test',
@@ -599,6 +602,16 @@ describe('executeWorkflow', () => {
       expect(freezeWorkOrderSource).not.toHaveBeenCalled();
       expect(createAuthority).not.toHaveBeenCalled();
       expect(mockExecuteDagWorkflow).toHaveBeenCalledTimes(1);
+      // WO-HARNESS-BASE-LANE-AUTHORITY-01: on resume no authoritySource is
+      // passed, so the fresh-dispatch override cannot run. Without rehydration
+      // baseBranch keeps the auto-detected repo default ('main' here, '' when
+      // cwd is not a git repo) -- a stale/empty BASE_BRANCH silently disables
+      // the capture-run-scope sentinel gated behind [ -n "$BASE_BRANCH" ].
+      // Assert the persisted authority's lane ('release/2026-q3-lane') was
+      // rehydrated and threaded to executeDagWorkflow (baseBranch is arg index
+      // 10) so the whole downstream tail describes the pinned lane.
+      const rehydratedBaseBranch = mockExecuteDagWorkflow.mock.calls[0]?.[10];
+      expect(rehydratedBaseBranch).toBe('release/2026-q3-lane');
     });
   });
 

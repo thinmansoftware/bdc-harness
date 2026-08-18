@@ -968,6 +968,26 @@ export async function executeWorkflow(
         ) {
           throw new Error(`authority_conflict: run ${workflowRun.id}`);
         }
+        // Resume path (WO-HARNESS-BASE-LANE-AUTHORITY-01): on any resume of a
+        // run-authority-required workflow (workflow resume/approve/reject,
+        // foreground_resume_detected) no authoritySource is passed, so the
+        // fresh-dispatch override above never runs. Rehydrate baseBranch from
+        // the persisted authority so the BASE_BRANCH threaded to every
+        // downstream node describes the SAME single lane the run was pinned to
+        // at dispatch -- not the stale/empty value getDefaultBranch(cwd) or
+        // config.baseBranch produced at load time (empty when cwd is a worktree
+        // whose repo default differs, or not a git repo at all).
+        if (existingAuthority.baseBranch && existingAuthority.baseBranch !== baseBranch) {
+          getLog().info(
+            {
+              runId: workflowRun.id,
+              persistedBaseBranch: existingAuthority.baseBranch,
+              previousBaseBranch: baseBranch,
+            },
+            'workflow.base_branch_authority_rehydrated'
+          );
+          baseBranch = existingAuthority.baseBranch;
+        }
       }
     }
 
