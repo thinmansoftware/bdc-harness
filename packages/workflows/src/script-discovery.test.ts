@@ -1,10 +1,24 @@
-import { describe, test, expect, mock, beforeEach } from 'bun:test';
+import { describe, test, expect, mock, beforeEach, afterAll } from 'bun:test';
+
+// WO-HARNESS-CI-BASE-SUITE-RED-01: `mock.module` patches Bun's GLOBAL module
+// registry for the entire test process. These two stubs previously REPLACED
+// `fs/promises` and `@archon/paths` wholesale, so every test file loaded after
+// this one lost every export they did not happen to list -- readFile, access,
+// mkdir, findMarkdownFilesRecursive, getCommandFolderSearchPaths, and
+// getDefaultCommandsPath all became undefined. That accounted for 11 of the
+// 51 base-suite failures.
+//
+// Both stubs now SPREAD the real module and override only what these tests
+// drive, and the registry is restored in afterAll.
+import * as realFsPromises from 'fs/promises';
+import * as realPaths from '@archon/paths';
 
 // Mock fs/promises before importing the module under test
 const mockReaddir = mock(async (_path: string): Promise<string[]> => []);
 const mockStat = mock(async (_path: string) => ({ isDirectory: () => false }));
 
 mock.module('fs/promises', () => ({
+  ...realFsPromises,
   readdir: mockReaddir,
   stat: mockStat,
 }));
@@ -20,9 +34,14 @@ const mockLogger = {
 };
 let mockHomeScriptsPath = '/home/scripts';
 mock.module('@archon/paths', () => ({
+  ...realPaths,
   createLogger: mock(() => mockLogger),
   getHomeScriptsPath: mock(() => mockHomeScriptsPath),
 }));
+
+afterAll(() => {
+  mock.restore();
+});
 
 import { discoverScripts, discoverScriptsForCwd, getDefaultScripts } from './script-discovery';
 
