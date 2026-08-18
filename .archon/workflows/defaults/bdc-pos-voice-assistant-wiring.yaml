@@ -2,8 +2,8 @@
 # Source pattern: bdc-ce-regression-suite.yaml + WO-POS-TERMINAL-SDK-01.yaml
 # Doctrine compliance: 13 hard rules of archon-yaml-authoring
 #
-# Pre-flight: codebases bluedevilcollectibles/shopops + bluedevilcollectibles/lspro-react
-#   registered in Archon. VOICE_BRIDGE is local-machine deploy (G10 box, no CI) —
+# Pre-flight: codebases thinmansoftware/shopops + thinmansoftware/lspro-react
+#   registered in Archon. VOICE_BRIDGE is local-machine deploy (G10 box, no CI) --
 #   VOICE_BRIDGE patches are produced as a diff file in the manifest for John to
 #   apply manually.
 #
@@ -15,7 +15,7 @@
 
 name: bdc-pos-voice-assistant-wiring
 description: |
-  Use when: Executing WO-POS-VOICE-ASSISTANT-WIRING-01 — Voice Bridge wiring for POS.
+  Use when: Executing WO-POS-VOICE-ASSISTANT-WIRING-01 -- Voice Bridge wiring for POS.
   Input: WO_ID = WO-POS-VOICE-ASSISTANT-WIRING-01.
   Does: Reads spec from bdc-xo. Implements shopops-api pos-voice routes (customer-context
         + SSE events + state + log) + pos_voice_log migration + bun tests. Implements
@@ -23,7 +23,7 @@ description: |
         VOICE_BRIDGE patch file (pos-context.ts + prompt composer) as manifest artifact
         for John to apply locally. Rule 19 runtime-verify. Builds MIXED manifest.
         Flips Notion to REVIEW.
-  Repo: bluedevilcollectibles/shopops (primary CWD), bluedevilcollectibles/lspro-react
+  Repo: thinmansoftware/shopops (primary CWD), thinmansoftware/lspro-react
         (sibling clone). VOICE_BRIDGE = manual deploy via patch file.
   parallel_ok: true (pos_voice_log is isolated new table).
 
@@ -38,15 +38,15 @@ nodes:
       WO_ID="${WO_ID:-WO-POS-VOICE-ASSISTANT-WIRING-01}"
       # gh --template uses Go templates (built-in to gh, no external jq dependency)
       SPEC=$(gh api \
-        "repos/bluedevilcollectibles/bdc-xo/contents/docs/work-orders/${WO_ID}.md?ref=main" \
+        "repos/thinmansoftware/bdc-xo/contents/docs/work-orders/${WO_ID}.md?ref=main" \
         --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
       if [ -z "$SPEC" ]; then
         GLOB=$(gh api \
-          "repos/bluedevilcollectibles/bdc-xo/contents/docs/superpowers/specs?ref=main" \
+          "repos/thinmansoftware/bdc-xo/contents/docs/superpowers/specs?ref=main" \
           --template "{{range .}}{{if (or (hasPrefix .name \"${WO_ID}\") (and (hasPrefix .name \"2\") (contains .name \"${WO_ID}\")))}}{{.path}}{{\"\\n\"}}{{end}}{{end}}" \
           2>/dev/null | head -1 || true)
         if [ -n "$GLOB" ]; then
-          SPEC=$(gh api "repos/bluedevilcollectibles/bdc-xo/contents/${GLOB}?ref=main" \
+          SPEC=$(gh api "repos/thinmansoftware/bdc-xo/contents/${GLOB}?ref=main" \
             --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
         fi
       fi
@@ -54,12 +54,12 @@ nodes:
         # Fallback 4: GitHub issue body (WO-HARNESS-READ-SPEC-ISSUE-BODY-FALLBACK-01)
         ISSUE_NUM=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'issue=[0-9]+' | head -n 1 | cut -d= -f2 || true)
         if [ -z "$ISSUE_NUM" ]; then
-          ISSUE_NUM=$(gh issue list --repo bluedevilcollectibles/bdc-xo \
+          ISSUE_NUM=$(gh issue list --repo thinmansoftware/bdc-xo \
             --search "${WO_ID} in:title" --json number,title \
             --jq '.[0].number' 2>/dev/null || true)
         fi
         if [ -n "$ISSUE_NUM" ] && [ "$ISSUE_NUM" != "null" ]; then
-          SPEC=$(gh issue view "$ISSUE_NUM" --repo bluedevilcollectibles/bdc-xo \
+          SPEC=$(gh issue view "$ISSUE_NUM" --repo thinmansoftware/bdc-xo \
             --json body --jq .body 2>/dev/null || true)
           [ -n "$SPEC" ] && SPEC_PATH="issues/${ISSUE_NUM}"
         fi
@@ -154,14 +154,14 @@ nodes:
         $read-spec.output
 
         Rules:
-        1. Migration creates pos_voice_log per WO §7.
-        2. routes/pos-voice.js exports 4 endpoints per WO §7:
+        1. Migration creates pos_voice_log per WO Section 7.
+        2. routes/pos-voice.js exports 4 endpoints per WO Section 7:
            POST /pos/voice/customer-context, GET /pos/voice/events (SSE),
            POST /pos/voice/state, POST /pos/voice/log.
         3. services/voice-events.js manages per-tenant SSE subscribers
            (Map<tenantId, Set<response>>); broadcastState(tenantId, payload).
         4. POST /pos/voice/state requires shared secret VOICE_BRIDGE_TOKEN header.
-        5. tests/test_pos_voice.js — >= 5 bun tests per WO §11.
+        5. tests/test_pos_voice.js -- >= 5 bun tests per WO Section 11.
         6. Mount in index.js.
         7. NO push, NO docker.
 
@@ -177,7 +177,7 @@ nodes:
       prompt: |
         Implement lspro-react half of WO-POS-VOICE-ASSISTANT-WIRING-01.
 
-          git -C /tmp clone --depth=10 https://github.com/bluedevilcollectibles/lspro-react.git lspro-react
+          git -C /tmp clone --depth=10 https://github.com/thinmansoftware/lspro-react.git lspro-react
           cd /tmp/lspro-react
           git checkout -b wo/pos-voice-assistant-wiring-01-ui
 
@@ -186,7 +186,7 @@ nodes:
 
         Rules:
         1. VoiceStateIndicator.tsx subscribes to EventSource('/api/pos/voice/events').
-           Renders mic icon + waveform + caption per WO §6 state matrix.
+           Renders mic icon + waveform + caption per WO Section 6 state matrix.
         2. CustomerTakeoverScreen.tsx listens for SSE event type='customer_arrived',
            fetches POST /api/pos/voice/customer-context, renders overlay.
         3. >= 2 component tests per file (4 total minimum).
@@ -206,7 +206,7 @@ nodes:
         - integration into existing wake-word handler
 
       Save the diff to voice-bridge-patch.diff in the shopops CWD root. This file
-      is a manifest artifact — John applies it manually on G10. Do NOT push.
+      is a manifest artifact -- John applies it manually on G10. Do NOT push.
 
       ## Spec
       $read-spec.output
@@ -264,7 +264,7 @@ nodes:
         echo "No staged changes"
       else
         git -c user.name="John Ranson" -c user.email="admin@bluedevilcollectibles.com" \
-          commit -m "$(printf 'feat(api): WO-POS-VOICE-ASSISTANT-WIRING-01 — pos-voice routes + SSE + voice-bridge patch\n\nAdds routes/pos-voice.js (customer-context, events SSE, state, log).\nAdds services/voice-events.js (SSE multiplexer).\nAdds migration 20260513_pos_voice_log.sql.\nAdds tests/test_pos_voice.js (5+ tests).\nIncludes voice-bridge-patch.diff for John to apply on G10.\n\nCo-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>')"
+          commit -m "$(printf 'feat(api): WO-POS-VOICE-ASSISTANT-WIRING-01 -- pos-voice routes + SSE + voice-bridge patch\n\nAdds routes/pos-voice.js (customer-context, events SSE, state, log).\nAdds services/voice-events.js (SSE multiplexer).\nAdds migration 20260513_pos_voice_log.sql.\nAdds tests/test_pos_voice.js (5+ tests).\nIncludes voice-bridge-patch.diff for John to apply on G10.\n\nCo-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>')"
       fi
       git push -u origin "$BRANCH"
       echo "SHOPOPS_SHA=$(git rev-parse HEAD)"
@@ -277,19 +277,19 @@ nodes:
       BODY=$(mktemp)
       {
         echo "## Summary"
-        echo "Implements WO-POS-VOICE-ASSISTANT-WIRING-01 (shopops half) — POS voice routes + SSE."
+        echo "Implements WO-POS-VOICE-ASSISTANT-WIRING-01 (shopops half) -- POS voice routes + SSE."
         echo ""
         echo "## Files"
         echo "- Created: migrations/20260513_pos_voice_log.sql, routes/pos-voice.js, services/voice-events.js, tests/test_pos_voice.js"
         echo "- Modified: index.js (mount /pos/voice)"
         echo "- Manifest artifact: voice-bridge-patch.diff (apply on G10 manually)"
       } > "$BODY"
-      EXIST=$(gh pr list --repo bluedevilcollectibles/shopops --head "$BRANCH" --state open \
+      EXIST=$(gh pr list --repo thinmansoftware/shopops --head "$BRANCH" --state open \
         --json url --template '{{range .}}{{.url}}{{end}}' 2>/dev/null || true)
       if [ -n "$EXIST" ]; then echo "SHOPOPS_PR=$EXIST"; exit 0; fi
       for i in 1 2 3; do
-        if URL=$(gh pr create --repo bluedevilcollectibles/shopops --base master --head "$BRANCH" \
-            --title "feat(api): WO-POS-VOICE-ASSISTANT-WIRING-01 — pos-voice + SSE" \
+        if URL=$(gh pr create --repo thinmansoftware/shopops --base master --head "$BRANCH" \
+            --title "feat(api): WO-POS-VOICE-ASSISTANT-WIRING-01 -- pos-voice + SSE" \
             --body-file "$BODY" 2>&1); then
           echo "SHOPOPS_PR=$URL"; exit 0
         fi
@@ -308,17 +308,17 @@ nodes:
         echo "No lspro changes"
       else
         git -c user.name="John Ranson" -c user.email="admin@bluedevilcollectibles.com" \
-          commit -m "$(printf 'feat(pos): WO-POS-VOICE-ASSISTANT-WIRING-01 — VoiceStateIndicator + CustomerTakeoverScreen\n\nAdds src/pos/VoiceStateIndicator.tsx (SSE-subscribed mic state).\nAdds src/pos/CustomerTakeoverScreen.tsx (beacon arrival overlay).\n\nCo-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>')"
+          commit -m "$(printf 'feat(pos): WO-POS-VOICE-ASSISTANT-WIRING-01 -- VoiceStateIndicator + CustomerTakeoverScreen\n\nAdds src/pos/VoiceStateIndicator.tsx (SSE-subscribed mic state).\nAdds src/pos/CustomerTakeoverScreen.tsx (beacon arrival overlay).\n\nCo-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>')"
       fi
       git push -u origin "$BRANCH"
       BODY=$(mktemp)
       printf '## Summary\nImplements WO-POS-VOICE-ASSISTANT-WIRING-01 (lspro-react half).\n\nVercel staging: https://staging.livesellerpro.app/pos\n' > "$BODY"
-      EXIST=$(gh pr list --repo bluedevilcollectibles/lspro-react --head "$BRANCH" --state open \
+      EXIST=$(gh pr list --repo thinmansoftware/lspro-react --head "$BRANCH" --state open \
         --json url --template '{{range .}}{{.url}}{{end}}' 2>/dev/null || true)
       if [ -n "$EXIST" ]; then echo "LSPRO_PR=$EXIST"; exit 0; fi
       for i in 1 2 3; do
-        if URL=$(gh pr create --repo bluedevilcollectibles/lspro-react --base main --head "$BRANCH" \
-            --title "feat(pos): WO-POS-VOICE-ASSISTANT-WIRING-01 — voice state UI" \
+        if URL=$(gh pr create --repo thinmansoftware/lspro-react --base main --head "$BRANCH" \
+            --title "feat(pos): WO-POS-VOICE-ASSISTANT-WIRING-01 -- voice state UI" \
             --body-file "$BODY" 2>&1); then
           echo "LSPRO_PR=$URL"; exit 0
         fi
@@ -389,16 +389,43 @@ nodes:
   - id: flip-notion
     depends_on: [build-manifest]
     task_class: clerical
-    prompt: |
-      Flip Notion WO-POS-VOICE-ASSISTANT-WIRING-01 to REVIEW. Manifest in Notes property.
-      Notion database: a6df831c-0b52-449f-8ca4-d77be6b70d0a
-      # OPEN QUESTION: Notion page ID not confirmed. Operator searches by exact WO ID.
+    bash: |
+      set -euo pipefail
 
-      Update: Claude Status -> REVIEW, Status -> Review, Notes -> $build-manifest.output,
-      claimed_by: Codex, claimed_at: today.
+      capture_node_output() {
+        python3 -c 'import shlex, sys; s=sys.stdin.read(); sys.stdout.write((lambda p: p[0] if len(p)==1 else s)(shlex.split(s)) if len(s)>=2 and s[0]=="'"'"'" and s.rstrip("\n").endswith("'"'"'") else s)'
+      }
 
-      If Notion MCP unavailable:
-        XO_TODO: Flip WO-POS-VOICE-ASSISTANT-WIRING-01 to REVIEW; paste manifest into Notes.
-
-      Manifest:
+      MANIFEST=$(capture_node_output <<'BDC_NODE_OUTPUT_MANIFEST'
       $build-manifest.output
+      BDC_NODE_OUTPUT_MANIFEST
+      )
+
+      READ_SPEC_OUT=$(capture_node_output <<'BDC_NODE_OUTPUT_READ_SPEC'
+      $read-spec.output
+      BDC_NODE_OUTPUT_READ_SPEC
+      )
+      ISSUE_REPO="${ISSUE_REPO:-thinmansoftware/bdc-xo}"
+      ISSUE_NUM=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'issue=[0-9]+' | head -1 | cut -d= -f2 || true)
+      if [ -z "$ISSUE_NUM" ]; then
+        ISSUE_NUM=$(printf '%s\n' "$READ_SPEC_OUT" | sed -n 's/^SPEC_PATH=.*issues\/\([0-9][0-9]*\).*/\1/p' | head -1)
+      fi
+      if [ -z "$ISSUE_NUM" ]; then
+        WO_ID_FROM_SPEC=$(printf '%s\n' "$READ_SPEC_OUT" | sed -n 's/^WO_ID=//p' | head -1)
+        if [ -n "$WO_ID_FROM_SPEC" ]; then
+          ISSUE_NUM=$(gh issue list --repo "$ISSUE_REPO" --search "$WO_ID_FROM_SPEC in:title" --json number --jq '.[0].number // empty' 2>/dev/null || true)
+        fi
+      fi
+      if [ -z "$ISSUE_NUM" ]; then
+        echo "flip-notion: no GitHub issue resolved; skipping status:review label + manifest comment."
+        exit 0
+      fi
+
+      gh label create status:review --repo "$ISSUE_REPO" --color 0E8A16 --description "BDC workflow is ready for review" 2>/dev/null || true
+      gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --remove-label status:building 2>/dev/null || true
+      gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --remove-label status:blocked 2>/dev/null || true
+      gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --add-label status:review
+      COMMENT_FILE=$(mktemp)
+      printf '%s\n' "$MANIFEST" > "$COMMENT_FILE"
+      gh issue comment "$ISSUE_NUM" --repo "$ISSUE_REPO" --body-file "$COMMENT_FILE"
+      echo "flip-notion: $ISSUE_REPO#$ISSUE_NUM -> status:review (manifest posted as comment)"

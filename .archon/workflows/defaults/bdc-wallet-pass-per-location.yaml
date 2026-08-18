@@ -2,16 +2,16 @@
 # Source pattern: WO-SHOPOPS-COMMERCE-SPINE-01.yaml (single-repo schema migration)
 # Doctrine compliance: 13 hard rules of archon-yaml-authoring
 #
-# Pre-flight: codebase bluedevilcollectibles/shopops registered in Archon.
+# Pre-flight: codebase thinmansoftware/shopops registered in Archon.
 # Pre-flight (4-block): YAML exists, spec exists, CWD = shopops single-repo, codebase registered.
-# parallel_ok: false — schema migration. Do NOT fire alongside other shopops schema WOs.
+# parallel_ok: false -- schema migration. Do NOT fire alongside other shopops schema WOs.
 #
 # Deploy: BDC_XO/scripts/archon-bridge/sync-workflows.sh WO-WALLET-PASS-PER-LOCATION-01.yaml
-# REVIEW BEFORE DEPLOY — verify wallet_passes existing rows backfill plan with operator.
+# REVIEW BEFORE DEPLOY -- verify wallet_passes existing rows backfill plan with operator.
 
 name: bdc-wallet-pass-per-location
 description: |
-  Use when: Executing WO-WALLET-PASS-PER-LOCATION-01 — per-location wallet pass.
+  Use when: Executing WO-WALLET-PASS-PER-LOCATION-01 -- per-location wallet pass.
   Input: WO_ID = WO-WALLET-PASS-PER-LOCATION-01.
   Does: Reads spec from bdc-xo. Verifies wallet_passes schema. Writes migration
         20260513_wallet_pass_per_location.sql (store_locations table + location_id
@@ -19,7 +19,7 @@ description: |
         services/wallet-google.js + services/wallet-apn.js. Adds services/store-locations.js.
         Adds POST /wallet/pass/sync-all. Bun tests (>= 8). PR + Rule 19 runtime-verify.
         MIXED manifest (CODE + schema). Flips Notion.
-  Repo: bluedevilcollectibles/shopops.
+  Repo: thinmansoftware/shopops.
   parallel_ok: false (schema migration, serial only).
 
 policyFile: harness/policies/agent-behavior.md
@@ -33,15 +33,15 @@ nodes:
       WO_ID="${WO_ID:-WO-WALLET-PASS-PER-LOCATION-01}"
       # Primary path (gh --template, no jq dependency)
       SPEC=$(gh api \
-        "repos/bluedevilcollectibles/bdc-xo/contents/docs/work-orders/${WO_ID}.md?ref=main" \
+        "repos/thinmansoftware/bdc-xo/contents/docs/work-orders/${WO_ID}.md?ref=main" \
         --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
       if [ -z "$SPEC" ]; then
         GLOB=$(gh api \
-          "repos/bluedevilcollectibles/bdc-xo/contents/docs/superpowers/specs?ref=main" \
+          "repos/thinmansoftware/bdc-xo/contents/docs/superpowers/specs?ref=main" \
           --template '{{range .}}{{.path}}{{"\n"}}{{end}}' 2>/dev/null \
           | grep "${WO_ID}.md$" | head -1 || true)
         if [ -n "$GLOB" ]; then
-          SPEC=$(gh api "repos/bluedevilcollectibles/bdc-xo/contents/${GLOB}?ref=main" \
+          SPEC=$(gh api "repos/thinmansoftware/bdc-xo/contents/${GLOB}?ref=main" \
             --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
         fi
       fi
@@ -49,12 +49,12 @@ nodes:
         # Fallback 4: GitHub issue body (WO-HARNESS-READ-SPEC-ISSUE-BODY-FALLBACK-01)
         ISSUE_NUM=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'issue=[0-9]+' | head -n 1 | cut -d= -f2 || true)
         if [ -z "$ISSUE_NUM" ]; then
-          ISSUE_NUM=$(gh issue list --repo bluedevilcollectibles/bdc-xo \
+          ISSUE_NUM=$(gh issue list --repo thinmansoftware/bdc-xo \
             --search "${WO_ID} in:title" --json number,title \
             --jq '.[0].number' 2>/dev/null || true)
         fi
         if [ -n "$ISSUE_NUM" ] && [ "$ISSUE_NUM" != "null" ]; then
-          SPEC=$(gh issue view "$ISSUE_NUM" --repo bluedevilcollectibles/bdc-xo \
+          SPEC=$(gh issue view "$ISSUE_NUM" --repo thinmansoftware/bdc-xo \
             --json body --jq .body 2>/dev/null || true)
           [ -n "$SPEC" ] && SPEC_PATH="issues/${ISSUE_NUM}"
         fi
@@ -143,7 +143,7 @@ nodes:
         $read-spec.output
 
         Rules:
-        1. Migration per WO §7 (store_locations table, location_id column on wallet_passes,
+        1. Migration per WO Section 7 (store_locations table, location_id column on wallet_passes,
            backfill UPDATE, default-location seed for every tenant, UNIQUE INDEX).
         2. services/store-locations.js exports getLocation(tenantId, locationId) +
            getDefaultLocation(tenantId), with 60s in-memory cache.
@@ -152,7 +152,7 @@ nodes:
            Existing PATCH /wallet/pass/:serial unchanged.
         4. services/wallet-google.js buildPassPayload reads from location.
         5. services/wallet-apn.js pushAllForCustomer iterates serials.
-        6. tests/test_wallet_per_location.js — >= 8 bun tests per WO §11.
+        6. tests/test_wallet_per_location.js -- >= 8 bun tests per WO Section 11.
         7. Keep existing /wallet/pass behavior backward compatible (single-location tenants).
         8. NO push, NO docker, NO migration apply.
 
@@ -202,7 +202,7 @@ nodes:
         echo "No staged changes"
       else
         git -c user.name="John Ranson" -c user.email="admin@bluedevilcollectibles.com" \
-          commit -m "$(printf 'feat(api): WO-WALLET-PASS-PER-LOCATION-01 — per-location wallet passes\n\nAdds migration 20260513_wallet_pass_per_location.sql:\n  - CREATE TABLE store_locations (id, tenant_id, name, color_hex, beacon_uuid, ...)\n  - ALTER TABLE wallet_passes ADD COLUMN location_id\n  - Backfill existing rows + seed default location per tenant\n  - UNIQUE INDEX (customer_id, location_id, tenant_id)\n\nAdds services/store-locations.js (getLocation + getDefaultLocation + 60s cache).\nModifies routes/wallet.js: POST /wallet/pass takes location_id; NEW POST /wallet/pass/sync-all.\nModifies services/wallet-google.js to read branding from location.\nModifies services/wallet-apn.js to add pushAllForCustomer helper.\nAdds tests/test_wallet_per_location.js (8+ bun tests).\n\nPATCH /wallet/pass/:serial interface unchanged (backward compat).\n\nCo-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>')"
+          commit -m "$(printf 'feat(api): WO-WALLET-PASS-PER-LOCATION-01 -- per-location wallet passes\n\nAdds migration 20260513_wallet_pass_per_location.sql:\n  - CREATE TABLE store_locations (id, tenant_id, name, color_hex, beacon_uuid, ...)\n  - ALTER TABLE wallet_passes ADD COLUMN location_id\n  - Backfill existing rows + seed default location per tenant\n  - UNIQUE INDEX (customer_id, location_id, tenant_id)\n\nAdds services/store-locations.js (getLocation + getDefaultLocation + 60s cache).\nModifies routes/wallet.js: POST /wallet/pass takes location_id; NEW POST /wallet/pass/sync-all.\nModifies services/wallet-google.js to read branding from location.\nModifies services/wallet-apn.js to add pushAllForCustomer helper.\nAdds tests/test_wallet_per_location.js (8+ bun tests).\n\nPATCH /wallet/pass/:serial interface unchanged (backward compat).\n\nCo-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>')"
       fi
       git push -u origin "$BRANCH"
       echo "SHA=$(git rev-parse HEAD)"
@@ -215,7 +215,7 @@ nodes:
       BODY=$(mktemp)
       {
         echo "## Summary"
-        echo "Implements WO-WALLET-PASS-PER-LOCATION-01 — wallet pass keyed by (customer, location)."
+        echo "Implements WO-WALLET-PASS-PER-LOCATION-01 -- wallet pass keyed by (customer, location)."
         echo ""
         echo "## Migration"
         echo "shopops-api/migrations/20260513_wallet_pass_per_location.sql"
@@ -224,15 +224,15 @@ nodes:
         echo "- Must be applied to staging Supabase before container rebuild"
         echo ""
         echo "## API"
-        echo "- POST /wallet/pass — now takes location_id (auto-resolves for single-location)"
-        echo "- POST /wallet/pass/sync-all — pushes APN update to every pass for a customer"
-        echo "- PATCH /wallet/pass/:serial — UNCHANGED"
+        echo "- POST /wallet/pass -- now takes location_id (auto-resolves for single-location)"
+        echo "- POST /wallet/pass/sync-all -- pushes APN update to every pass for a customer"
+        echo "- PATCH /wallet/pass/:serial -- UNCHANGED"
       } > "$BODY"
-      EXIST=$(gh pr list --repo bluedevilcollectibles/shopops --head "$BRANCH" --state open --json url --template '{{range .}}{{.url}}{{end}}' 2>/dev/null || true)
+      EXIST=$(gh pr list --repo thinmansoftware/shopops --head "$BRANCH" --state open --json url --template '{{range .}}{{.url}}{{end}}' 2>/dev/null || true)
       if [ -n "$EXIST" ]; then echo "PR_URL=$EXIST"; exit 0; fi
       for i in 1 2 3; do
-        if URL=$(gh pr create --repo bluedevilcollectibles/shopops --base master --head "$BRANCH" \
-            --title "feat(api): WO-WALLET-PASS-PER-LOCATION-01 — per-location wallet passes" \
+        if URL=$(gh pr create --repo thinmansoftware/shopops --base master --head "$BRANCH" \
+            --title "feat(api): WO-WALLET-PASS-PER-LOCATION-01 -- per-location wallet passes" \
             --body-file "$BODY" 2>&1); then
           echo "PR_URL=$URL"; exit 0
         fi
@@ -270,7 +270,7 @@ nodes:
       Files modified: shopops-api/routes/wallet.js, services/wallet-google.js,
                        services/wallet-apn.js
       Tests: from $verify-tests.output | bun test shopops-api/tests/test_wallet_per_location.js
-      PRs: from $open-pr.output PR_URL — base: master
+      PRs: from $open-pr.output PR_URL -- base: master
       Merge ancestors: shopops master HEAD from $commit-and-push.output SHA, behind_by: 0
       Grep assertions:
         - grep -q 'store_locations' shopops-api/migrations/20260513_wallet_pass_per_location.sql
@@ -287,7 +287,7 @@ nodes:
           WHERE table_name='wallet_passes' AND column_name='location_id' (expected 1)
         - Backfill verify: SELECT COUNT(*) FROM wallet_passes WHERE location_id IS NULL (expected 0)
         - Seed verify: SELECT COUNT(*) FROM store_locations (expected >= active tenant count)
-      Vercel deployment: N/A — shopops-api is Hetzner Docker
+      Vercel deployment: N/A -- shopops-api is Hetzner Docker
       VALIDATION: PASS (pending migration apply + container rebuild)
 
       Inputs:
@@ -301,16 +301,43 @@ nodes:
   - id: flip-notion
     depends_on: [build-manifest]
     task_class: clerical
-    prompt: |
-      Flip Notion WO-WALLET-PASS-PER-LOCATION-01 to REVIEW. Manifest in Notes property.
-      Notion database: a6df831c-0b52-449f-8ca4-d77be6b70d0a
-      # OPEN QUESTION: Notion page ID not confirmed. Operator searches by exact WO ID.
+    bash: |
+      set -euo pipefail
 
-      Update: Claude Status -> REVIEW, Status -> Review, Notes -> $build-manifest.output,
-      claimed_by: Codex, claimed_at: today.
+      capture_node_output() {
+        python3 -c 'import shlex, sys; s=sys.stdin.read(); sys.stdout.write((lambda p: p[0] if len(p)==1 else s)(shlex.split(s)) if len(s)>=2 and s[0]=="'"'"'" and s.rstrip("\n").endswith("'"'"'") else s)'
+      }
 
-      If Notion MCP unavailable:
-        XO_TODO: Flip WO-WALLET-PASS-PER-LOCATION-01 to REVIEW; paste manifest into Notes.
-
-      Manifest:
+      MANIFEST=$(capture_node_output <<'BDC_NODE_OUTPUT_MANIFEST'
       $build-manifest.output
+      BDC_NODE_OUTPUT_MANIFEST
+      )
+
+      READ_SPEC_OUT=$(capture_node_output <<'BDC_NODE_OUTPUT_READ_SPEC'
+      $read-spec.output
+      BDC_NODE_OUTPUT_READ_SPEC
+      )
+      ISSUE_REPO="${ISSUE_REPO:-thinmansoftware/bdc-xo}"
+      ISSUE_NUM=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'issue=[0-9]+' | head -1 | cut -d= -f2 || true)
+      if [ -z "$ISSUE_NUM" ]; then
+        ISSUE_NUM=$(printf '%s\n' "$READ_SPEC_OUT" | sed -n 's/^SPEC_PATH=.*issues\/\([0-9][0-9]*\).*/\1/p' | head -1)
+      fi
+      if [ -z "$ISSUE_NUM" ]; then
+        WO_ID_FROM_SPEC=$(printf '%s\n' "$READ_SPEC_OUT" | sed -n 's/^WO_ID=//p' | head -1)
+        if [ -n "$WO_ID_FROM_SPEC" ]; then
+          ISSUE_NUM=$(gh issue list --repo "$ISSUE_REPO" --search "$WO_ID_FROM_SPEC in:title" --json number --jq '.[0].number // empty' 2>/dev/null || true)
+        fi
+      fi
+      if [ -z "$ISSUE_NUM" ]; then
+        echo "flip-notion: no GitHub issue resolved; skipping status:review label + manifest comment."
+        exit 0
+      fi
+
+      gh label create status:review --repo "$ISSUE_REPO" --color 0E8A16 --description "BDC workflow is ready for review" 2>/dev/null || true
+      gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --remove-label status:building 2>/dev/null || true
+      gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --remove-label status:blocked 2>/dev/null || true
+      gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --add-label status:review
+      COMMENT_FILE=$(mktemp)
+      printf '%s\n' "$MANIFEST" > "$COMMENT_FILE"
+      gh issue comment "$ISSUE_NUM" --repo "$ISSUE_REPO" --body-file "$COMMENT_FILE"
+      echo "flip-notion: $ISSUE_REPO#$ISSUE_NUM -> status:review (manifest posted as comment)"

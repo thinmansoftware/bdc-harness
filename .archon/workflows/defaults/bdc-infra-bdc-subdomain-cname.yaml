@@ -5,21 +5,21 @@
 # Pre-flight (4-block):
 #   1. YAML exists: this file
 #   2. Spec exists: docs/work-orders/WO-INFRA-BDC-SUBDOMAIN-CNAME-01.md in bdc-xo
-#   3. CWD scope: MIXED — bdc-xo (decision doc) + shopops-storefront (marketing page footer)
-#   4. Codebases registered: bluedevilcollectibles/bdc-xo + bluedevilcollectibles/shopops-storefront
+#   3. CWD scope: MIXED -- bdc-xo (decision doc) + shopops-storefront (marketing page footer)
+#   4. Codebases registered: thinmansoftware/bdc-xo + thinmansoftware/shopops-storefront
 #
 # DEPENDS ON: WO-INFRA-VERCEL-PASSWORD-DECISION-01 (Option C unblocks
 # bluedevilcollectibles.comicstoreos.com if that's the canonical chosen here).
 #
 # Deploy: BDC_XO/scripts/archon-bridge/sync-workflows.sh WO-INFRA-BDC-SUBDOMAIN-CNAME-01.yaml
-# REVIEW BEFORE DEPLOY — operator confirms CLOUDFLARE_API_TOKEN (or CF_API_TOKEN) +
+# REVIEW BEFORE DEPLOY -- operator confirms CLOUDFLARE_API_TOKEN (or CF_API_TOKEN) +
 # CLOUDFLARE_ZONE_ID for comicstoreos.com zone are present (or surface to operator).
 #
-# Polish bar: ROUGH OK — pick ONE canonical subdomain, fix DNS, update marketing copy.
+# Polish bar: ROUGH OK -- pick ONE canonical subdomain, fix DNS, update marketing copy.
 
 name: bdc-infra-bdc-subdomain-cname
 description: |
-  Use when: Executing WO-INFRA-BDC-SUBDOMAIN-CNAME-01 — fix SSL/CNAME for BDC tenant.
+  Use when: Executing WO-INFRA-BDC-SUBDOMAIN-CNAME-01 -- fix SSL/CNAME for BDC tenant.
   Input: WO_ID = WO-INFRA-BDC-SUBDOMAIN-CNAME-01.
   Does:
     - Verifies current state of bdc.comicstoreos.com (expects SSL fail) and
@@ -46,18 +46,18 @@ nodes:
       # Try canonical path first: docs/work-orders/<WO_ID>.md
       # gh --template uses Go templates (built-in to gh, no external jq dependency)
       SPEC_CONTENT=$(gh api \
-        "repos/bluedevilcollectibles/bdc-xo/contents/docs/work-orders/${WO_ID}.md?ref=main" \
+        "repos/thinmansoftware/bdc-xo/contents/docs/work-orders/${WO_ID}.md?ref=main" \
         --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
 
       # Fallback: glob docs/superpowers/specs/*<WO_ID>*.md
       if [ -z "$SPEC_CONTENT" ]; then
         GLOB_PATH=$(gh api \
-          "repos/bluedevilcollectibles/bdc-xo/contents/docs/superpowers/specs?ref=main" \
+          "repos/thinmansoftware/bdc-xo/contents/docs/superpowers/specs?ref=main" \
           --template '{{range .}}{{.path}}{{"\n"}}{{end}}' 2>/dev/null \
           | grep "${WO_ID}.md$" | head -1 || true)
         if [ -n "$GLOB_PATH" ]; then
           SPEC_CONTENT=$(gh api \
-            "repos/bluedevilcollectibles/bdc-xo/contents/${GLOB_PATH}?ref=main" \
+            "repos/thinmansoftware/bdc-xo/contents/${GLOB_PATH}?ref=main" \
             --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
         fi
       fi
@@ -66,12 +66,12 @@ nodes:
         # Fallback 4: GitHub issue body (WO-HARNESS-READ-SPEC-ISSUE-BODY-FALLBACK-01)
         ISSUE_NUM=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'issue=[0-9]+' | head -n 1 | cut -d= -f2 || true)
         if [ -z "$ISSUE_NUM" ]; then
-          ISSUE_NUM=$(gh issue list --repo bluedevilcollectibles/bdc-xo \
+          ISSUE_NUM=$(gh issue list --repo thinmansoftware/bdc-xo \
             --search "${WO_ID} in:title" --json number,title \
             --jq '.[0].number' 2>/dev/null || true)
         fi
         if [ -n "$ISSUE_NUM" ] && [ "$ISSUE_NUM" != "null" ]; then
-          SPEC_CONTENT=$(gh issue view "$ISSUE_NUM" --repo bluedevilcollectibles/bdc-xo \
+          SPEC_CONTENT=$(gh issue view "$ISSUE_NUM" --repo thinmansoftware/bdc-xo \
             --json body --jq .body 2>/dev/null || true)
           [ -n "$SPEC_CONTENT" ] && SPEC_PATH="issues/${ISSUE_NUM}"
         fi
@@ -83,7 +83,7 @@ nodes:
   - id: verify-current-state
     depends_on: [read-spec]
     bash: |
-      # set -e omitted — diagnostics
+      # set -e omitted -- diagnostics
       echo "=== dig ==="
       DIG_BDC=$(dig bdc.comicstoreos.com CNAME +short 2>&1 || true)
       DIG_LONG=$(dig bluedevilcollectibles.comicstoreos.com CNAME +short 2>&1 || true)
@@ -158,15 +158,15 @@ nodes:
         - Context: 2026-05-13 audit found bdc.comicstoreos.com fails SSL; marketing
           links to broken subdomain. Mutant Market HQ 2026-06-15 needs canonical
           pattern locked.
-        - Options table (A long-form / B short-form per WO §6).
-        - Decision: Option A — bluedevilcollectibles.comicstoreos.com is canonical
+        - Options table (A long-form / B short-form per WO Section 6).
+        - Decision: Option A -- bluedevilcollectibles.comicstoreos.com is canonical
           (matches existing Vercel attachment + tenant-slug convention). Default
           recommendation; if spec body indicates John chose Option B, document that.
         - Execution:
           - DNS: wildcard *.comicstoreos.com CNAME already exists; no new explicit record needed for long form.
           - Vercel: bluedevilcollectibles.comicstoreos.com already attached to shopops-storefront project.
           - Marketing copy: update app/page.tsx footer in shopops-storefront to use canonical.
-          - bdc.comicstoreos.com left alone (will continue to fail SSL — harmless dead subdomain).
+          - bdc.comicstoreos.com left alone (will continue to fail SSL -- harmless dead subdomain).
         - Sign-off: "Approved: John Ranson, 2026-05-13"
 
         Output <promise>COMPLETE</promise> when file exists.
@@ -182,7 +182,7 @@ nodes:
         Update shopops-storefront marketing page to use canonical BDC subdomain.
 
         Clone shopops-storefront into sibling path:
-          git -C /tmp clone --depth=10 https://github.com/bluedevilcollectibles/shopops-storefront.git shopops-storefront
+          git -C /tmp clone --depth=10 https://github.com/thinmansoftware/shopops-storefront.git shopops-storefront
           cd /tmp/shopops-storefront
           git checkout -b wo/infra-bdc-subdomain-cname-01-marketing
 
@@ -191,7 +191,7 @@ nodes:
              grep -rn 'bdc.comicstoreos.com\|bluedevilcollectibles.comicstoreos.com' app/
            Most likely in app/page.tsx.
         2. Update the link href to:
-             https://bluedevilcollectibles.comicstoreos.com  (Option A — canonical long form)
+             https://bluedevilcollectibles.comicstoreos.com  (Option A -- canonical long form)
            If the spec indicates Option B was chosen instead, use bdc.comicstoreos.com.
         3. Confirm no other broken-subdomain references remain. Re-grep after edit:
              grep -rn 'bdc.comicstoreos.com' app/  should return 0 lines (Option A)
@@ -208,13 +208,13 @@ nodes:
   - id: cloudflare-dns-action
     depends_on: [verify-current-state]
     bash: |
-      # set -e omitted — best-effort; many setups handle DNS via dashboard
+      # set -e omitted -- best-effort; many setups handle DNS via dashboard
       CF_TOKEN="${CLOUDFLARE_API_TOKEN:-${CF_API_TOKEN:-}}"
       CF_ZONE="${CLOUDFLARE_ZONE_ID:-}"
 
       if [ -z "$CF_TOKEN" ] || [ -z "$CF_ZONE" ]; then
         echo "STATUS=skipped_no_creds"
-        echo "DETAIL=No Cloudflare API creds in harness env. Canonical Option A relies on existing wildcard CNAME — no DNS change required. If Option B was chosen, operator adds explicit bdc.comicstoreos.com CNAME via Cloudflare dashboard."
+        echo "DETAIL=No Cloudflare API creds in harness env. Canonical Option A relies on existing wildcard CNAME -- no DNS change required. If Option B was chosen, operator adds explicit bdc.comicstoreos.com CNAME via Cloudflare dashboard."
         exit 0
       fi
 
@@ -239,7 +239,7 @@ nodes:
   - id: verify-post-state
     depends_on: [update-marketing-storefront, cloudflare-dns-action]
     bash: |
-      # set -e omitted — diagnostics
+      # set -e omitted -- diagnostics
       sleep 5
       LONG=$(curl -s -o /dev/null -w '%{http_code}' -m 10 "https://bluedevilcollectibles.comicstoreos.com" 2>/dev/null || echo "000")
       echo "CANONICAL_POST_CODE=${LONG}"
@@ -268,7 +268,7 @@ nodes:
         echo "No staged changes"
       else
         git -c user.name="John Ranson" -c user.email="admin@bluedevilcollectibles.com" \
-          commit -m "$(printf 'docs(decision): WO-INFRA-BDC-SUBDOMAIN-CNAME-01 — canonical bdc tenant subdomain\n\nPicks canonical: bluedevilcollectibles.comicstoreos.com (Option A, long form).\nDocuments 2 options + rationale. Marketing page footer update lives in a\nseparate shopops-storefront PR.\n\nROUGH-OK polish bar — see WO §13.\n\nCo-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>')"
+          commit -m "$(printf 'docs(decision): WO-INFRA-BDC-SUBDOMAIN-CNAME-01 -- canonical bdc tenant subdomain\n\nPicks canonical: bluedevilcollectibles.comicstoreos.com (Option A, long form).\nDocuments 2 options + rationale. Marketing page footer update lives in a\nseparate shopops-storefront PR.\n\nROUGH-OK polish bar -- see WO Section 13.\n\nCo-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>')"
       fi
       git push -u origin "$BRANCH"
       echo "BDCXO_SHA=$(git rev-parse HEAD)"
@@ -278,13 +278,13 @@ nodes:
     bash: |
       set -euo pipefail
       BRANCH="wo/infra-bdc-subdomain-cname-01"
-      REPO="bluedevilcollectibles/bdc-xo"
+      REPO="thinmansoftware/bdc-xo"
       EXIST=$(gh pr list --repo "$REPO" --head "$BRANCH" --state open \
         --json url --template '{{range .}}{{.url}}{{end}}' 2>/dev/null || true)
       if [ -n "$EXIST" ]; then echo "BDCXO_PR=$EXIST"; exit 0; fi
       for i in 1 2 3; do
         if URL=$(gh pr create --repo "$REPO" --base main --head "$BRANCH" \
-            --title "docs(decision): WO-INFRA-BDC-SUBDOMAIN-CNAME-01 — canonical subdomain" \
+            --title "docs(decision): WO-INFRA-BDC-SUBDOMAIN-CNAME-01 -- canonical subdomain" \
             --body "INFRA WO decision doc. ROUGH-OK polish bar." 2>&1); then
           echo "BDCXO_PR=$URL"; exit 0
         fi
@@ -296,14 +296,14 @@ nodes:
     depends_on: [update-marketing-storefront]
     bash: |
       set -euo pipefail
-      REPO="bluedevilcollectibles/shopops-storefront"
+      REPO="thinmansoftware/shopops-storefront"
       BRANCH="wo/infra-bdc-subdomain-cname-01-marketing"
       EXIST=$(gh pr list --repo "$REPO" --head "$BRANCH" --state open \
         --json url --template '{{range .}}{{.url}}{{end}}' 2>/dev/null || true)
       if [ -n "$EXIST" ]; then echo "STOREFRONT_PR=$EXIST"; exit 0; fi
       for i in 1 2 3; do
         if URL=$(gh pr create --repo "$REPO" --base main --head "$BRANCH" \
-            --title "fix(marketing): WO-INFRA-BDC-SUBDOMAIN-CNAME-01 — canonical BDC subdomain" \
+            --title "fix(marketing): WO-INFRA-BDC-SUBDOMAIN-CNAME-01 -- canonical BDC subdomain" \
             --body "Replaces broken bdc.comicstoreos.com link in marketing footer with canonical bluedevilcollectibles.comicstoreos.com. Companion to bdc-xo decision doc." 2>&1); then
           echo "STOREFRONT_PR=$URL"; exit 0
         fi
@@ -324,7 +324,7 @@ nodes:
        - docs/decisions/2026-05-13-bdc-subdomain-canonical.md
 
       Files modified (shopops-storefront):
-       - app/page.tsx (or the file located by update-marketing-storefront — marketing footer link)
+       - app/page.tsx (or the file located by update-marketing-storefront -- marketing footer link)
 
       Tests: N/A (INFRA; curl runtime verification is authoritative)
 
@@ -340,7 +340,7 @@ nodes:
        - grep -q 'bluedevilcollectibles.comicstoreos.com' docs/decisions/2026-05-13-bdc-subdomain-canonical.md
        - grep -c 'bdc.comicstoreos.com' shopops-storefront/app/ -> 0 (after marketing fix)
 
-      Runtime verification (INFRA — curl evidence required):
+      Runtime verification (INFRA -- curl evidence required):
        - curl -s -o /dev/null -w '%{http_code}' https://bluedevilcollectibles.comicstoreos.com -> [from $verify-post-state.output CANONICAL_POST_CODE]
        - dig bdc.comicstoreos.com CNAME +short -> [from $verify-current-state.output DIG_BDC]
        - dig bluedevilcollectibles.comicstoreos.com CNAME +short -> [from $verify-current-state.output DIG_LONG]
@@ -354,7 +354,7 @@ nodes:
 
       Dependency note: companion WO-INFRA-VERCEL-PASSWORD-DECISION-01 must be at REVIEW
       or DONE for the canonical subdomain to return 200 (Option C unblocks publicly).
-      If canonical still returns 401, that companion WO is incomplete — surface to operator.
+      If canonical still returns 401, that companion WO is incomplete -- surface to operator.
 
       Inputs:
       $read-spec.output
@@ -368,23 +368,43 @@ nodes:
   - id: flip-notion
     depends_on: [build-manifest]
     task_class: clerical
-    prompt: |
-      Flip Notion WO-INFRA-BDC-SUBDOMAIN-CNAME-01 to REVIEW.
-      Manifest goes in Notes (NOT comment).
+    bash: |
+      set -euo pipefail
 
-      # OPEN QUESTION: Notion page ID. Operator filters by exact WO ID equality.
+      capture_node_output() {
+        python3 -c 'import shlex, sys; s=sys.stdin.read(); sys.stdout.write((lambda p: p[0] if len(p)==1 else s)(shlex.split(s)) if len(s)>=2 and s[0]=="'"'"'" and s.rstrip("\n").endswith("'"'"'") else s)'
+      }
 
-      Update:
-       - Claude Status -> REVIEW
-       - Status -> Review
-       - Notes -> $build-manifest.output verbatim
-       - claimed_by: Devils Cauldron
-       - claimed_at: today
-
-      If canonical post-state code is not 200, also note in Notes that companion
-      WO-INFRA-VERCEL-PASSWORD-DECISION-01 may need to complete first.
-
-      If Notion MCP unavailable, output XO_TODO with manifest.
-
-      Manifest:
+      MANIFEST=$(capture_node_output <<'BDC_NODE_OUTPUT_MANIFEST'
       $build-manifest.output
+      BDC_NODE_OUTPUT_MANIFEST
+      )
+
+      READ_SPEC_OUT=$(capture_node_output <<'BDC_NODE_OUTPUT_READ_SPEC'
+      $read-spec.output
+      BDC_NODE_OUTPUT_READ_SPEC
+      )
+      ISSUE_REPO="${ISSUE_REPO:-thinmansoftware/bdc-xo}"
+      ISSUE_NUM=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'issue=[0-9]+' | head -1 | cut -d= -f2 || true)
+      if [ -z "$ISSUE_NUM" ]; then
+        ISSUE_NUM=$(printf '%s\n' "$READ_SPEC_OUT" | sed -n 's/^SPEC_PATH=.*issues\/\([0-9][0-9]*\).*/\1/p' | head -1)
+      fi
+      if [ -z "$ISSUE_NUM" ]; then
+        WO_ID_FROM_SPEC=$(printf '%s\n' "$READ_SPEC_OUT" | sed -n 's/^WO_ID=//p' | head -1)
+        if [ -n "$WO_ID_FROM_SPEC" ]; then
+          ISSUE_NUM=$(gh issue list --repo "$ISSUE_REPO" --search "$WO_ID_FROM_SPEC in:title" --json number --jq '.[0].number // empty' 2>/dev/null || true)
+        fi
+      fi
+      if [ -z "$ISSUE_NUM" ]; then
+        echo "flip-notion: no GitHub issue resolved; skipping status:review label + manifest comment."
+        exit 0
+      fi
+
+      gh label create status:review --repo "$ISSUE_REPO" --color 0E8A16 --description "BDC workflow is ready for review" 2>/dev/null || true
+      gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --remove-label status:building 2>/dev/null || true
+      gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --remove-label status:blocked 2>/dev/null || true
+      gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --add-label status:review
+      COMMENT_FILE=$(mktemp)
+      printf '%s\n' "$MANIFEST" > "$COMMENT_FILE"
+      gh issue comment "$ISSUE_NUM" --repo "$ISSUE_REPO" --body-file "$COMMENT_FILE"
+      echo "flip-notion: $ISSUE_REPO#$ISSUE_NUM -> status:review (manifest posted as comment)"

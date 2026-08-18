@@ -132,10 +132,10 @@ nodes:
           # --- command node (references a .archon/commands/ file) ---
           command: command-name
 
-          # --- script node (TypeScript via bun, or Python via uv — no AI, stdout = $<nodeId>.output) ---
+          # --- script node (TypeScript via bun, or Python via uv -- no AI, stdout = $<nodeId>.output) ---
           # Use for deterministic data transforms the shell would mangle (JSON parsing, etc.)
           script: |
-            // JSON is valid JS expression syntax — assign directly (String.raw breaks on backticks)
+            // JSON is valid JS expression syntax -- assign directly (String.raw breaks on backticks)
             const data = $other-node.output;
             console.log(JSON.stringify({ count: data.items.length }));
           runtime: bun                       # required: 'bun' (.ts/.js) or 'uv' (.py)
@@ -151,7 +151,7 @@ nodes:
             max_iterations: 10
             fresh_context: true  # optional: reset context each iteration
 
-          # --- approval node (human gate — pauses workflow) ---
+          # --- approval node (human gate -- pauses workflow) ---
           approval:
             message: "Review the plan above. Approve to continue."
             # capture_response: true         # store reviewer comment as $<nodeId>.output
@@ -164,11 +164,11 @@ nodes:
       ```
 
       ## Variable Reference
-      - `$ARGUMENTS` — user's input text
-      - `$ARTIFACTS_DIR` — pre-created directory for workflow artifacts
-      - `$<nodeId>.output` — stdout from a bash/script node or AI response from a prompt node
-      - `$<nodeId>.output.field` — JSON field from a node with output_format
-      - `$BASE_BRANCH` — base git branch
+      - `$ARGUMENTS` -- user's input text
+      - `$ARTIFACTS_DIR` -- pre-created directory for workflow artifacts
+      - `$<nodeId>.output` -- stdout from a bash/script node or AI response from a prompt node
+      - `$<nodeId>.output.field` -- JSON field from a node with output_format
+      - `$BASE_BRANCH` -- base git branch
 
       ## Rules
       1. The `name:` field MUST match: $extract-intent.output.workflow_name
@@ -177,14 +177,14 @@ nodes:
       4. Use `depends_on` to define execution order
       5. Use `bash` nodes for deterministic shell operations (file checks, git commands, installs)
       6. Use `script` nodes for typed data transforms (TypeScript JSON parsing, Python with deps)
-         — stdout is captured as output, stderr is forwarded as a warning.
+         -- stdout is captured as output, stderr is forwarded as a warning.
          `$nodeId.output` is NOT shell-quoted in script bodies.
-         - **TypeScript/bun**: assign directly — `const data = $nodeId.output;`
-           (JSON is valid JS expression syntax; avoid String.raw — it breaks on backticks)
-         - **Python/uv**: use json.loads — `import json; data = json.loads("""$nodeId.output""")`
+         - **TypeScript/bun**: assign directly -- `const data = $nodeId.output;`
+           (JSON is valid JS expression syntax; avoid String.raw -- it breaks on backticks)
+         - **Python/uv**: use json.loads -- `import json; data = json.loads("""$nodeId.output""")`
          Never interpolate into shell syntax.
       7. Use `prompt` nodes for AI reasoning tasks
-      8. Use `approval` nodes to pause for human review at risky gates (plan→execute boundary, destructive actions)
+      8. Use `approval` nodes to pause for human review at risky gates (plan->execute boundary, destructive actions)
       9. Use `output_format` on prompt nodes when downstream nodes need structured data
       10. Use `allowed_tools: []` on classification/analysis nodes that don't need tools
       11. Use `denied_tools: [Edit, Bash]` when a node should only use Write (not edit existing files)

@@ -1,6 +1,6 @@
 name: repo-triage
 description: >-
-  Periodic repo maintenance — in parallel, triages open issues (labels +
+  Periodic repo maintenance -- in parallel, triages open issues (labels +
   dedup detection + 3-day auto-close) and cross-references open PRs against
   open issues (conservative: suggests Closes #X only when a PR fully
   addresses an issue, never closes anything itself). State is persisted
@@ -16,7 +16,7 @@ worktree:
 
 nodes:
   # ---------------------------------------------------------------------------
-  # Issue triage — runs concurrently with pr-link (no depends_on between them).
+  # Issue triage -- runs concurrently with pr-link (no depends_on between them).
   # ---------------------------------------------------------------------------
   - id: triage-issues
     model: sonnet
@@ -37,12 +37,12 @@ nodes:
           Fetch the issue:
             gh issue view <N> --json number,title,body,labels,author
 
-          Return ONLY a single JSON object — no fences, no prose:
+          Return ONLY a single JSON object -- no fences, no prose:
 
           {
             "number": <N>,
             "summary": "2-3 sentence neutral summary",
-            "primarySymptom": "one short sentence — the core symptom or ask",
+            "primarySymptom": "one short sentence -- the core symptom or ask",
             "area": "best-guess tag, e.g. backend, frontend, docs, core, isolation, cli, workflows, providers",
             "templateAdherence": {
               "templateType": "bug_report | feature_request | other | none",
@@ -53,7 +53,7 @@ nodes:
           }
 
           Template-adherence rules:
-          - If the caller did NOT include templates → `quality: "no-template-context"`, skip sections.
+          - If the caller did NOT include templates -> `quality: "no-template-context"`, skip sections.
           - `quality: "good"` = most template sections have real content.
           - `quality: "partial"` = headers present but several sections look blank/placeholder.
           - `quality: "empty"` = body has nothing matching the template shape.
@@ -64,7 +64,7 @@ nodes:
           Be terse. If the issue body is empty, set area='unknown' and
           quality='empty'.
 
-          ERROR HANDLING — if the `gh issue view` call fails (auth,
+          ERROR HANDLING -- if the `gh issue view` call fails (auth,
           rate limit, network, or non-zero exit), do NOT emit JSON.
           Instead print exactly one line on stdout:
               ERROR: <one-line reason>
@@ -74,12 +74,12 @@ nodes:
       You are the issue-triage orchestrator for the repository in the
       current working directory.
 
-      # Mode check — READ THIS FIRST
+      # Mode check -- READ THIS FIRST
 
       Run once at the start:
           echo "DRY_RUN=${DRY_RUN:-0}"
 
-      If DRY_RUN=1 — READ-ONLY mode:
+      If DRY_RUN=1 -- READ-ONLY mode:
         - Do all read-only work (gh list/view/api, state file reads, clustering).
         - For every mutation you WOULD have made (label, comment, close,
           state write), print a line prefixed `[DRY] would ...` with the
@@ -92,7 +92,7 @@ nodes:
                issue in any way. Instead print `[DRY] would ...` lines
                describing what you would have done."
         - End with the standard summary table, but prefix the title
-          `## (DRY RUN) Issue triage — <now>`.
+          `## (DRY RUN) Issue triage -- <now>`.
 
       Your job on every (non-dry) run:
         1. Apply labels to any unlabeled open issues (delegate to triage-agent)
@@ -109,7 +109,7 @@ nodes:
 
           mkdir -p .archon/state
 
-      Shape — on first run the file may not exist; treat missing as:
+      Shape -- on first run the file may not exist; treat missing as:
 
           {
             "version": 1,
@@ -123,7 +123,7 @@ nodes:
             e.g. `printf '%s\n%s\n%s' "$T" "$B" "$U" | shasum | cut -c1-12`.
       - `pendingDedupComments[<issueNumber>]`: { canonical, botCommentId, postedAt }
           - `postedAt`: ISO-8601 UTC (`date -u +%FT%TZ`).
-          - `botCommentId`: the comment ID from `gh issue comment` — if you
+          - `botCommentId`: the comment ID from `gh issue comment` -- if you
             can't parse one, keep the full returned URL.
 
       # Step-by-step
@@ -133,15 +133,15 @@ nodes:
       cat .archon/state/triage-state.json 2>/dev/null
       ```
       Parse handling:
-        - ENOENT (file missing) → start from default shape above.
-        - Empty file (zero bytes / whitespace only) → start from default shape.
-        - JSON.parse THROWS (corrupt state) → ABORT the node loudly.
+        - ENOENT (file missing) -> start from default shape above.
+        - Empty file (zero bytes / whitespace only) -> start from default shape.
+        - JSON.parse THROWS (corrupt state) -> ABORT the node loudly.
           Print: `[triage-issues] ABORT: .archon/state/triage-state.json
-          is corrupt — refusing to reset tracked state. Restore from a
+          is corrupt -- refusing to reset tracked state. Restore from a
           backup (check git history if tracked, or a local timestamped
           copy) or delete the file to start fresh.`
           Then stop the node with a non-zero status. Do NOT fall through
-          to default — that would silently reset `pendingDedupComments`
+          to default -- that would silently reset `pendingDedupComments`
           and restart the 3-day auto-close clock indefinitely.
 
       ## 2. Fetch all open issues
@@ -159,15 +159,15 @@ nodes:
         [ -f "$tpl" ] && printf '### %s\n```\n' "$(basename "$tpl")" && cat "$tpl" && printf '\n```\n\n'
       done > "$ARTIFACTS_DIR/issue-templates.md"
       ```
-      If no templates exist, the file will be empty — that's fine.
+      If no templates exist, the file will be empty -- that's fine.
 
       ## 3. Classify work
       For each open issue:
-        - If `labels` is empty → needs LABEL.
+        - If `labels` is empty -> needs LABEL.
         - Compute sha. If no entry in `state.briefs[N]` OR stored sha differs
-          → needs BRIEF. Otherwise reuse the cached brief.
+          -> needs BRIEF. Otherwise reuse the cached brief.
 
-      ## 4. LABEL PASS — parallel fan-out to triage-agent
+      ## 4. LABEL PASS -- parallel fan-out to triage-agent
 
       PREFLIGHT: verify the on-disk sub-agent definition exists before
       attempting any Task call:
@@ -177,11 +177,11 @@ nodes:
       If missing, SKIP the whole label pass (do not attempt Task calls
       that would fail obscurely at runtime). Log:
           "[triage-issues] label pass skipped: .claude/agents/triage-agent.md
-           missing — install the skill-adjacent agent file to enable labeling."
-      Continue to the brief pass — labeling is a nice-to-have, not a blocker.
+           missing -- install the skill-adjacent agent file to enable labeling."
+      Continue to the brief pass -- labeling is a nice-to-have, not a blocker.
 
       Spawn the existing on-disk `triage-agent` sub-agent in PARALLEL (a
-      single assistant turn with multiple Task tool calls — this matters
+      single assistant turn with multiple Task tool calls -- this matters
       for speed). Per-task prompt:
 
           "Triage open issue #<N> in this repository. Fetch it via
@@ -191,7 +191,7 @@ nodes:
 
       Wait for all label tasks to settle before moving on.
 
-      ## 5. BRIEF PASS — parallel fan-out to brief-gen
+      ## 5. BRIEF PASS -- parallel fan-out to brief-gen
       For every issue that needs a brief, spawn the inline `brief-gen`
       sub-agent in PARALLEL (single turn, multiple Task calls).
 
@@ -203,11 +203,11 @@ nodes:
            <file contents>"
 
       If `$ARTIFACTS_DIR/issue-templates.md` is empty, omit the template
-      block — brief-gen will return `quality: "no-template-context"`.
+      block -- brief-gen will return `quality: "no-template-context"`.
 
       Parse each response as JSON. On parse failure OR when the response
       starts with `ERROR:` (sub-agent signalling a gh/auth/rate-limit
-      problem — see brief-gen prompt):
+      problem -- see brief-gen prompt):
         - Log the failed issue number and the first 200 chars of the
           raw response.
         - Track in a `failedBriefs` array for the summary (`failed=N`
@@ -217,23 +217,23 @@ nodes:
       computed sha and `briefedAt = now-iso`. Preserve `templateAdherence`.
 
       If `failedBriefs.length > 0` AND the failures look systemic
-      (≥50% of briefs this run failed), ABORT before the cluster pass
-      — a broken briefing run produces bad clusters. Report the counts.
+      (>=50% of briefs this run failed), ABORT before the cluster pass
+      -- a broken briefing run produces bad clusters. Report the counts.
 
-      ## 6. CLUSTER PASS — detect duplicates
+      ## 6. CLUSTER PASS -- detect duplicates
       Using fresh + cached briefs:
         - Group issues whose `summary` + `primarySymptom` describe the
           same underlying problem. Prefer matches where `area` is the same.
-        - A cluster of size 1 is NOT a duplicate — skip.
+        - A cluster of size 1 is NOT a duplicate -- skip.
         - For each cluster of 2+: the oldest (lowest number) is `canonical`.
         - Members already in `state.pendingDedupComments` are already
-          tracked — SKIP. Everything else is a NEW dedup to act on.
+          tracked -- SKIP. Everything else is a NEW dedup to act on.
 
-      Be CONSERVATIVE. False negatives are fine — this workflow re-runs.
+      Be CONSERVATIVE. False negatives are fine -- this workflow re-runs.
       False positives create noise. If two issues share a surface keyword
       but describe different root causes, do not cluster.
 
-      ## 7. ACT PASS — comment + track
+      ## 7. ACT PASS -- comment + track
       For each NEW dedup candidate #N with canonical #C:
         - Post a comment on #N:
 
@@ -241,7 +241,7 @@ nodes:
               Could you confirm whether it's a duplicate? If there is no
               reply within 3 days this issue will be auto-closed.
 
-          Via: `gh issue comment <N> --body "..."` — capture the comment ID.
+          Via: `gh issue comment <N> --body "..."` -- capture the comment ID.
         - Record in state:
               pendingDedupComments[N] = {
                 canonical: C,
@@ -252,7 +252,7 @@ nodes:
       Post sequentially (not via Task) so you can reliably capture each
       comment ID.
 
-      ## 8. RECONCILE PASS — 3-day auto-close
+      ## 8. RECONCILE PASS -- 3-day auto-close
       Cache the bot's GitHub login once at the top of the run:
           gh api user --jq .login
 
@@ -260,23 +260,23 @@ nodes:
         - Fetch current comments: `gh issue view <N> --json comments`
         - Identify comments created AFTER `postedAt` whose author is NOT
           the cached bot login.
-        - If ANY non-bot reply after `postedAt` → drop entry from state
+        - If ANY non-bot reply after `postedAt` -> drop entry from state
           (humans are engaged).
         - VALIDATE `postedAt` parses as ISO-8601 first. If it doesn't
-          parse (corrupt state), LOG and SKIP this entry — do NOT close
+          parse (corrupt state), LOG and SKIP this entry -- do NOT close
           on a bad timestamp, do NOT skip silently. Leave the entry in
           state for operator review.
         - Else if `now - postedAt >= 3 days`:
             - Post closing comment on #N:
                   "Auto-closing: no reply within 3 days of the duplicate
                    check. Please reopen if this is still relevant."
-            - `gh issue close <N> --reason "not planned"` — capture
+            - `gh issue close <N> --reason "not planned"` -- capture
               exit code. If non-zero (network, rate limit, issue
               already-closed-elsewhere), DO NOT drop state: set
               `closeAttemptFailed: true` on the entry for retry next
               run, and log the failure.
             - ONLY drop entry from state on close success (exit 0).
-        - Else → keep the entry as-is (will be revisited next run).
+        - Else -> keep the entry as-is (will be revisited next run).
 
       ## 9. SAVE
       Set `state.lastRunAt = <now-iso>`. Use the Write tool to persist
@@ -285,7 +285,7 @@ nodes:
       ## 10. Summary output
       Print a single compact block:
 
-          ## Issue triage — <now>
+          ## Issue triage -- <now>
           Labels applied:         <N>
           Briefs: fresh=<N>, cached=<M>, failed=<K>
           New dedup clusters:     <N>
@@ -295,25 +295,25 @@ nodes:
           Template fill (of issues briefed this run):
             good=<N>, partial=<N>, empty=<N>, no-template-context=<N>
             Issues with empty templates (#):
-              <list of up to 10 numbers, rest truncated "… +K more">
+              <list of up to 10 numbers, rest truncated "... +K more">
 
       No other prose.
 
       # Guardrails
 
       - NEVER close an issue that is not tracked in `pendingDedupComments`
-        with `postedAt` ≥ 3 days ago AND no reply after that timestamp.
-      - NEVER label issues yourself — always delegate to `triage-agent`.
+        with `postedAt` >= 3 days ago AND no reply after that timestamp.
+      - NEVER label issues yourself -- always delegate to `triage-agent`.
       - If `gh` returns an auth error or rate limit, stop the run cleanly
         and report in the summary. Do NOT partially mutate state.
-      - State writes are ATOMIC per run — only write the final merged
+      - State writes are ATOMIC per run -- only write the final merged
         state once at step 9. If a pass fails midway, the previous state
         remains.
       - Parallel Task fan-out is strict: ONE assistant turn with MANY
         Task tool calls, not sequential Task calls.
 
   # ---------------------------------------------------------------------------
-  # Closed-dedup check — follow-up to triage-issues. Checks whether any
+  # Closed-dedup check -- follow-up to triage-issues. Checks whether any
   # currently open issue duplicates a recently-closed one (reporter may not
   # have noticed their case is already fixed or declined). Reads open-issue
   # briefs from the state file produced by triage-issues as its context
@@ -341,12 +341,12 @@ nodes:
           that looks like it closed the issue (keywords: closed by, fixed by,
           resolved by, Closes, Fixes, Resolves).
 
-          Return ONLY a single JSON object on stdout — no fences, no prose:
+          Return ONLY a single JSON object on stdout -- no fences, no prose:
 
           {
             "number": <N>,
             "summary": "2-3 sentence summary of what the issue was",
-            "primarySymptom": "one short sentence — the core symptom",
+            "primarySymptom": "one short sentence -- the core symptom",
             "area": "single best-guess area tag (same vocabulary as open briefs)",
             "closedAt": "<ISO timestamp>",
             "stateReason": "completed | not_planned | duplicate | null (normalize gh CLI's UPPERCASE output to lowercase)",
@@ -355,9 +355,9 @@ nodes:
 
           Be terse. If `stateReason` (normalized to lowercase) is
           `not_planned` or `duplicate`, that matters for the match
-          verdict downstream — include it honestly.
+          verdict downstream -- include it honestly.
 
-          ERROR HANDLING — if `gh issue view` fails, print exactly:
+          ERROR HANDLING -- if `gh issue view` fails, print exactly:
               ERROR: <one-line reason>
           on a single stdout line. Do NOT emit partial/fabricated JSON.
     prompt: |
@@ -365,23 +365,23 @@ nodes:
       CLOSED one. A reporter may have filed a bug that was fixed months
       ago under a different number, or one that was already declined.
 
-      # Mode check — READ FIRST
+      # Mode check -- READ FIRST
 
       Run once:
           echo "DRY_RUN=${DRY_RUN:-0} SKIP_CLOSED_DEDUP=${SKIP_CLOSED_DEDUP:-0}"
 
-      If SKIP_CLOSED_DEDUP=1 — print
+      If SKIP_CLOSED_DEDUP=1 -- print
           "Skipping closed-dedup-check per SKIP_CLOSED_DEDUP=1"
       and exit immediately. No gh calls, no state read, no Task fan-out.
 
-      If DRY_RUN=1 — READ-ONLY:
+      If DRY_RUN=1 -- READ-ONLY:
         - Do read-only work (gh list/view, state reads, clustering).
         - For every mutation (comment, close, state write), print `[DRY] would ...`.
         - Do NOT run gh issue comment/close.
         - Do NOT use Write on `.archon/state/*.json`.
         - When spawning closed-brief-gen via Task, prepend to its prompt:
               "DRY_RUN=1 is active. Run only read-only gh commands."
-        - End with a summary prefixed `## (DRY RUN) Closed-dedup check — <now>`.
+        - End with a summary prefixed `## (DRY RUN) Closed-dedup check -- <now>`.
 
       # Context artifact from triage-issues
 
@@ -400,16 +400,16 @@ nodes:
       Distinguish "upstream didn't run / crashed" from "upstream ran
       with nothing to process" via `lastRunAt`:
 
-        - File missing OR JSON.parse throws → treat as upstream-crashed.
+        - File missing OR JSON.parse throws -> treat as upstream-crashed.
           Print: "[closed-dedup-check] SKIP: triage-state.json missing
-          or corrupt — upstream triage-issues node likely failed. Fix
+          or corrupt -- upstream triage-issues node likely failed. Fix
           that run before retrying."
-        - File present with `lastRunAt == null` → same upstream-crashed
+        - File present with `lastRunAt == null` -> same upstream-crashed
           message.
-        - File present with `lastRunAt` set AND `briefs` empty → print
-          "No open-issue briefs to cross-match — nothing to do." and exit.
+        - File present with `lastRunAt` set AND `briefs` empty -> print
+          "No open-issue briefs to cross-match -- nothing to do." and exit.
           (This is a legitimate quiet day.)
-        - Otherwise → proceed.
+        - Otherwise -> proceed.
 
       # State file (this node)
 
@@ -433,9 +433,9 @@ nodes:
       # Step-by-step
 
       ## 1. Read both state files
-      - Read `.archon/state/triage-state.json` — grab `briefs` (open-issue briefs).
+      - Read `.archon/state/triage-state.json` -- grab `briefs` (open-issue briefs).
       - Read `.archon/state/closed-dedup-state.json`:
-          ENOENT / empty → default shape. JSON.parse throw → ABORT loudly
+          ENOENT / empty -> default shape. JSON.parse throw -> ABORT loudly
           (same rule as triage-issues step 1: never silently reset
           tracked state; corrupt file means a backup restore or explicit
           deletion, never a reset).
@@ -450,7 +450,7 @@ nodes:
             --search "closed:>${CUTOFF}" > "$ARTIFACTS_DIR/closed-issues.json"
 
       Filter out any closed issue whose `stateReason` (case-insensitive) matches `duplicate`
-      — those are noise for our matching (they were already dedup'd against canonical).
+      -- those are noise for our matching (they were already dedup'd against canonical).
       Note: `gh issue view --json stateReason` returns UPPERCASE (`COMPLETED`, `NOT_PLANNED`,
       `DUPLICATE`), while the `gh issue close --reason` flag wants lowercase with a space
       (`"completed"`, `"not planned"`). Lowercase-compare downstream.
@@ -458,10 +458,10 @@ nodes:
       ## 3. Classify work
       For each closed issue:
         - Compute sha of `title + "\n" + body + "\n" + closedAt`.
-        - If `state.closedBriefs[N]` exists AND sha matches → reuse.
-        - Else → needs BRIEF.
+        - If `state.closedBriefs[N]` exists AND sha matches -> reuse.
+        - Else -> needs BRIEF.
 
-      ## 4. BRIEF PASS — parallel Task fan-out to closed-brief-gen
+      ## 4. BRIEF PASS -- parallel Task fan-out to closed-brief-gen
       Spawn `closed-brief-gen` in PARALLEL (single assistant turn, multiple
       Task calls) for every closed issue needing a brief. Per-task prompt:
 
@@ -470,9 +470,9 @@ nodes:
       Parse each JSON response. On parse failure OR `ERROR:` sentinel:
       log the issue number + first 200 chars, track in `failedClosedBriefs`,
       skip. Merge successes into `state.closedBriefs`. Abort the cluster
-      pass if ≥50% failed (same rule as triage-issues).
+      pass if >=50% failed (same rule as triage-issues).
 
-      ## 5. CROSS-CLUSTER PASS — match open vs closed
+      ## 5. CROSS-CLUSTER PASS -- match open vs closed
       For each OPEN issue brief (from triage-state.json):
         - Find the best match (if any) among `closedBriefs`. Same
           conservative rules as triage-issues:
@@ -482,12 +482,12 @@ nodes:
         - Pick at most ONE closed match per open issue (the strongest).
 
       A match that is ALREADY recorded in `state.closedMatchComments[<open>]`
-      → SKIP (already acted on).
+      -> SKIP (already acted on).
 
       Everything else is a NEW closed-dedup candidate.
 
-      ## 6. ACT PASS — comment + track
-      For each NEW candidate (open #O → closed #C):
+      ## 6. ACT PASS -- comment + track
+      For each NEW candidate (open #O -> closed #C):
 
         - Fetch the reporter's login (not stored in briefs):
               gh issue view <O> --json author --jq .author.login
@@ -511,14 +511,14 @@ nodes:
 
       Post sequentially (not via Task) so you can capture comment IDs.
 
-      ## 7. RECONCILE PASS — 3-day auto-close
+      ## 7. RECONCILE PASS -- 3-day auto-close
       Cache bot login once at top-of-run: `gh api user --jq .login`.
 
       For each entry `(O, { matchedClosed, botCommentId, postedAt })` in
       `state.closedMatchComments`:
         - Fetch: `gh issue view <O> --json comments`
         - Find comments AFTER `postedAt` whose author is NOT the bot.
-        - If reporter replied → drop entry (engaged).
+        - If reporter replied -> drop entry (engaged).
         - VALIDATE `postedAt` parses as ISO-8601 first. If not: log and
           skip this entry; never close on a bad timestamp.
         - Else if `now - postedAt >= 3 days`:
@@ -526,12 +526,12 @@ nodes:
                   "Auto-closing: no reply within 3 days of the closed-match
                    check. Please reopen if your case is NOT resolved by
                    #<matchedClosed>."
-            - `gh issue close <O> --reason "not planned"` — capture exit
+            - `gh issue close <O> --reason "not planned"` -- capture exit
               code. On non-zero: set `closeAttemptFailed: true` on the
               entry for retry, log the failure, do NOT drop state.
             - Only drop entry on exit 0.
             - Drop entry from state.
-        - Else → keep as-is.
+        - Else -> keep as-is.
 
       ## 8. SAVE
       Set `state.lastRunAt = <now-iso>`. Write
@@ -539,7 +539,7 @@ nodes:
       (2-space JSON).
 
       ## 9. Summary output
-          ## Closed-dedup check — <now>
+          ## Closed-dedup check -- <now>
           Open briefs loaded:          <N>   (from triage-issues)
           Closed issues in window:     <N>   (last 90 days, non-duplicate)
           Closed briefs: fresh=<N>, cached=<M>, failed=<K>
@@ -550,19 +550,19 @@ nodes:
 
       # Guardrails
       - NEVER close an open issue unless it's been tracked in
-        `closedMatchComments` for ≥3 days AND had no non-bot reply.
-      - Be MORE conservative here than triage-issues — false positives
+        `closedMatchComments` for >=3 days AND had no non-bot reply.
+      - Be MORE conservative here than triage-issues -- false positives
         suggest a reporter's bug is already fixed when it isn't, and that
         erodes trust. When in doubt, skip.
       - If `gh` errors (auth, rate limit), abort cleanly and summarise.
-      - State writes are ATOMIC — one Write at step 8.
+      - State writes are ATOMIC -- one Write at step 8.
       - Parallel Task fan-out required for step 4 only. Step 6 is sequential
         to capture comment IDs reliably.
 
   # ---------------------------------------------------------------------------
-  # Closed-PR dedup check — standalone. For each OPEN PR, checks whether a
+  # Closed-PR dedup check -- standalone. For each OPEN PR, checks whether a
   # recently-CLOSED PR covered the same change (superseded, rejected, or
-  # merged variant). Comments only — NEVER closes an open PR (author's work
+  # merged variant). Comments only -- NEVER closes an open PR (author's work
   # is too valuable to discard without consent). Runs in parallel with the
   # other top-level nodes.
   # ---------------------------------------------------------------------------
@@ -584,7 +584,7 @@ nodes:
             gh pr view <N> --json number,title,body,state,headRefName,changedFiles,additions,deletions,mergedAt,closedAt,stateReason
             gh pr diff <N> --color=never | head -c 30000
 
-          Return ONLY a single JSON object — no fences, no prose:
+          Return ONLY a single JSON object -- no fences, no prose:
 
           {
             "number": <N>,
@@ -607,30 +607,30 @@ nodes:
           output so the orchestrator knows to be more conservative about
           `fully-addresses` claims.
 
-          ERROR HANDLING — if `gh pr view` or `gh pr diff` fails, print:
+          ERROR HANDLING -- if `gh pr view` or `gh pr diff` fails, print:
               ERROR: <one-line reason>
           on a single stdout line. Do NOT emit partial/fabricated JSON.
     prompt: |
       You find OPEN PRs that duplicate or supersede a recently-CLOSED PR.
       A contributor may have missed that a similar change was already
-      merged, rejected, or abandoned — flag it so a maintainer can decide.
+      merged, rejected, or abandoned -- flag it so a maintainer can decide.
 
-      # Mode check — READ FIRST
+      # Mode check -- READ FIRST
 
       Run once:
           echo "DRY_RUN=${DRY_RUN:-0} SKIP_CLOSED_PR_DEDUP=${SKIP_CLOSED_PR_DEDUP:-0}"
 
-      If SKIP_CLOSED_PR_DEDUP=1 — print
+      If SKIP_CLOSED_PR_DEDUP=1 -- print
           "Skipping closed-pr-dedup-check per SKIP_CLOSED_PR_DEDUP=1"
       and exit immediately.
 
-      If DRY_RUN=1 — READ-ONLY:
+      If DRY_RUN=1 -- READ-ONLY:
         - All read-only gh calls OK.
         - Do NOT run `gh pr comment`. Do NOT use Write on state files.
         - Print `[DRY] would ...` for every mutation.
         - When spawning pr-brief-gen via Task, prepend:
               "DRY_RUN=1 is active. Run only read-only gh commands."
-        - End with a summary prefixed `## (DRY RUN) Closed-PR dedup — <now>`.
+        - End with a summary prefixed `## (DRY RUN) Closed-PR dedup -- <now>`.
 
       # State file
 
@@ -658,7 +658,7 @@ nodes:
       cat .archon/state/closed-pr-dedup-state.json 2>/dev/null
       ```
       Parse JSON:
-        ENOENT / empty → default shape. JSON.parse throw → ABORT loudly
+        ENOENT / empty -> default shape. JSON.parse throw -> ABORT loudly
         (never silently reset tracked state; corrupt file means a backup
         restore or explicit deletion, never a reset).
 
@@ -683,23 +683,23 @@ nodes:
       For both open and closed PRs:
         - Compute a sha of `title + "\n" + body + "\n" + (mergedAt ?? closedAt ?? headRefName)`.
         - If an entry exists in the corresponding `state.{open,closed}Briefs`
-          and the sha matches → reuse the cached brief.
-        - Else → needs BRIEF.
+          and the sha matches -> reuse the cached brief.
+        - Else -> needs BRIEF.
 
-      ## 4. BRIEF PASS — parallel Task fan-out to pr-brief-gen
+      ## 4. BRIEF PASS -- parallel Task fan-out to pr-brief-gen
       Spawn `pr-brief-gen` in PARALLEL for every PR needing a brief
-      (open AND closed, all in a single assistant turn if possible — the
+      (open AND closed, all in a single assistant turn if possible -- the
       sub-agent handles both via the `state` hint).
 
       Per-task prompt template:
-          "Brief PR #<N> — state=<open|closed>."
+          "Brief PR #<N> -- state=<open|closed>."
 
       Parse each JSON response. On parse failure OR `ERROR:` sentinel:
       log the PR number + first 200 chars, track in `failedBriefs`, skip.
       Merge successes into the appropriate `{open,closed}Briefs` bucket.
-      Abort the cluster pass if ≥50% failed.
+      Abort the cluster pass if >=50% failed.
 
-      ## 5. CROSS-CLUSTER PASS — match open vs closed
+      ## 5. CROSS-CLUSTER PASS -- match open vs closed
       For each OPEN PR brief:
         - Find the strongest match among `closedBriefs`. Match rules (all
           should broadly agree before declaring a duplicate):
@@ -712,26 +712,26 @@ nodes:
       Skip open PRs already in `state.closedMatchComments`.
 
       Be STRICT. PR duplication calls are higher-stakes than issue
-      duplication — suggesting a maintainer's merged change already did
+      duplication -- suggesting a maintainer's merged change already did
       the work of someone's open PR is embarrassing if wrong. When in
       doubt, skip.
 
-      ## 6. ACT PASS — comment + record
-      For each NEW candidate (open PR #O → closed PR #C):
+      ## 6. ACT PASS -- comment + record
+      For each NEW candidate (open PR #O -> closed PR #C):
 
         - Determine the close flavour for the comment text (always tag
           the open PR's author):
-            - If `closedBriefs[C].state == "merged"` →
+            - If `closedBriefs[C].state == "merged"` ->
                 "@<pr-author> this PR looks similar to the already-merged
                  #<C> (merged <date>). Please check whether your change
-                 is still needed — rebase on main and confirm."
-            - Else (closed unmerged) →
+                 is still needed -- rebase on main and confirm."
+            - Else (closed unmerged) ->
                 "@<pr-author> this PR looks similar to #<C>, which was
                  closed on <date> (<stateReason>). You may want to read
                  the discussion there before pushing further."
 
         - Idempotency: fetch `gh pr view <O> --json comments`. If the
-          fetch fails (non-zero exit), SKIP POSTING and log the error —
+          fetch fails (non-zero exit), SKIP POSTING and log the error --
           never fall through to post-anyway (that would double-post on
           every gh hiccup). Only when the fetch succeeds AND no existing
           comment has the same body do we proceed.
@@ -757,7 +757,7 @@ nodes:
       `.archon/state/closed-pr-dedup-state.json` with the Write tool.
 
       ## 8. Summary output
-          ## Closed-PR dedup — <now>
+          ## Closed-PR dedup -- <now>
           Open PRs scanned:             <N>
           Closed PRs in window:         <N>   (last 90 days)
           Briefs: fresh_open=<N>, cached_open=<N>, fresh_closed=<N>, cached_closed=<N>, failed=<N>
@@ -767,15 +767,15 @@ nodes:
 
       # Guardrails
       - NEVER close an open PR. Comment only.
-      - Idempotent comments — always check existing PR comments before
+      - Idempotent comments -- always check existing PR comments before
         posting to avoid noise.
-      - State writes are ATOMIC — one Write at step 7.
+      - State writes are ATOMIC -- one Write at step 7.
       - Parallel Task fan-out for step 4 only. Step 6 sequential.
-      - Strict matching — false positives on PR dedup are a maintainer
+      - Strict matching -- false positives on PR dedup are a maintainer
         trust hit. When ambiguous, skip.
 
   # ---------------------------------------------------------------------------
-  # PR ↔ issue linker — runs concurrently with triage-issues.
+  # PR  issue linker -- runs concurrently with triage-issues.
   # ---------------------------------------------------------------------------
   - id: link-prs
     model: sonnet
@@ -785,7 +785,7 @@ nodes:
         description: >-
           Given one PR (title + body + diff) and a compact list of open
           issues, returns related-issue matches AND a template-adherence
-          check if the caller provided the PR template. Conservative —
+          check if the caller provided the PR template. Conservative --
           prefers "related" over "fully-addresses" when in doubt.
         model: haiku
         tools: [Bash, Read]
@@ -796,7 +796,7 @@ nodes:
 
           Inputs in the caller's prompt:
             - PR number
-            - Compact issue list (one per line: `#<N> <title> — <body excerpt>`)
+            - Compact issue list (one per line: `#<N> <title> -- <body excerpt>`)
             - Optional PR_TEMPLATE section
 
           Your work:
@@ -815,7 +815,7 @@ nodes:
                - Mark each section as filled (non-trivial reporter content)
                  or missing (empty / placeholder / HTML-comment-only).
 
-          Return ONLY a single JSON object — no fences, no prose:
+          Return ONLY a single JSON object -- no fences, no prose:
 
           {
             "prNumber": <N>,
@@ -846,26 +846,26 @@ nodes:
           Default bias: when the PR description doesn't explicitly claim
           to close the issue, mark it `related`, never `fully-addresses`.
 
-          ERROR HANDLING — if `gh pr view` or `gh pr diff` fails, print:
+          ERROR HANDLING -- if `gh pr view` or `gh pr diff` fails, print:
               ERROR: <one-line reason>
           on a single stdout line. Do NOT emit partial/fabricated JSON.
     prompt: |
       You are the PR-to-issue linker for the repository in the current
       working directory.
 
-      # Mode check — READ THIS FIRST
+      # Mode check -- READ THIS FIRST
 
       Run once at the start:
           echo "DRY_RUN=${DRY_RUN:-0} SKIP_PR_LINK=${SKIP_PR_LINK:-0}"
 
-      If SKIP_PR_LINK=1 — print exactly:
-          "Skipping link-prs per SKIP_PR_LINK=1 — no state read, no gh
+      If SKIP_PR_LINK=1 -- print exactly:
+          "Skipping link-prs per SKIP_PR_LINK=1 -- no state read, no gh
            calls, no comments."
       and exit immediately. Do not read state, do not call gh, do not
       use Task. This is the "staged rollout" escape hatch for the first
       live run of the full workflow.
 
-      If DRY_RUN=1 — READ-ONLY mode:
+      If DRY_RUN=1 -- READ-ONLY mode:
         - Do all read-only work (gh list/view/diff, state reads, matching).
         - For every mutation you WOULD have made (PR/issue comment, state
           write), print a line prefixed `[DRY] would ...` with the full
@@ -877,14 +877,14 @@ nodes:
               "DRY_RUN=1 is active. Run only read-only gh commands."
           (pr-issue-matcher is already read-only, so this is belt-and-braces.)
         - End with the standard summary table, but prefix the title
-          `## (DRY RUN) PR-issue linker — <now>`.
+          `## (DRY RUN) PR-issue linker -- <now>`.
 
       Your job on every (non-dry, non-skipped) run:
         1. For every open PR not yet fully processed, identify related
            open issues via the pr-issue-matcher sub-agent.
         2. Add a `Closes #X` SUGGESTION comment on the PR only when the
-           matcher says the PR fully addresses the issue AND you — the
-           orchestrator — agree after re-reading the issue + PR diff.
+           matcher says the PR fully addresses the issue AND you -- the
+           orchestrator -- agree after re-reading the issue + PR diff.
         3. Otherwise post a conservative "related to #X" cross-reference
            comment on the PR, plus a mirror comment on the issue.
         4. Persist state to avoid re-commenting on the same link.
@@ -926,7 +926,7 @@ nodes:
       cat .archon/state/pr-state.json 2>/dev/null
       ```
       Parse JSON:
-        ENOENT / empty → default shape. JSON.parse throw → ABORT loudly
+        ENOENT / empty -> default shape. JSON.parse throw -> ABORT loudly
         (never silently reset tracked state; corrupt file means a backup
         restore or explicit deletion, never a reset).
 
@@ -957,16 +957,16 @@ nodes:
       ## 3. Classify
       For each open PR:
         - Compute sha of `title + "\n" + body + "\n" + headRefName`.
-        - If `state.linkedPrs[N]` exists AND its sha matches → SKIP.
-        - Else → needs MATCHING.
+        - If `state.linkedPrs[N]` exists AND its sha matches -> SKIP.
+        - Else -> needs MATCHING.
 
-      ## 4. MATCH PASS — parallel Task fan-out to pr-issue-matcher
+      ## 4. MATCH PASS -- parallel Task fan-out to pr-issue-matcher
       Spawn `pr-issue-matcher` in PARALLEL for every PR needing matching
       (single turn, multiple Task calls).
 
       Per-task prompt template:
           "Match PR #<N> against the open issues below.
-           <issues list — one per line: `#<num> <title> — <first 120 chars of body>`>
+           <issues list -- one per line: `#<num> <title> -- <first 120 chars of body>`>
 
            <if pr-template.md is non-empty, append:>
            PR_TEMPLATE (for templateAdherence scoring):
@@ -976,10 +976,10 @@ nodes:
       failure OR `ERROR:` sentinel: log the PR number + first 200 chars,
       track in `failedMatches`, skip that PR. Preserve the full
       `templateAdherence` object in `state.linkedPrs[<pr>]` for the
-      digest downstream. Abort the downstream passes if ≥50% of PRs
+      digest downstream. Abort the downstream passes if >=50% of PRs
       failed matching (same half-failure rule as the briefing passes).
 
-      ## 5. VERIFY PASS — confirm any "fully-addresses"
+      ## 5. VERIFY PASS -- confirm any "fully-addresses"
       Haiku is optimistic; Sonnet (you) owns the final judgment. For each
       candidate tagged `fully-addresses`:
         - Read issue body fully: `gh issue view <issue> --json body,title,labels`
@@ -987,17 +987,17 @@ nodes:
                                  `gh pr diff <pr> --color=never`
         - Decide: does the PR's change set plausibly resolve EVERY
           symptom/ask in the issue body? If ANY part is out of scope,
-          ambiguous, or only partially addressed → DOWNGRADE to `related`.
+          ambiguous, or only partially addressed -> DOWNGRADE to `related`.
 
       When in doubt, downgrade.
 
       Additional rule for PR-vs-closed-PR matches (`closed-pr-dedup-check`
       feeds this pattern too): if either side's brief has
-      `diffTruncated: true`, the evidence is partial — downgrade any
+      `diffTruncated: true`, the evidence is partial -- downgrade any
       `fully-addresses`-shaped claim to `related` by default, since we
       can't be confident about unseen diff regions.
 
-      ## 6. ACT PASS — comment + record
+      ## 6. ACT PASS -- comment + record
       Before posting ANY comment, check idempotency: fetch existing
       comments on the target (`gh pr view <pr> --json comments` /
       `gh issue view <issue> --json comments`) and skip if a comment with
@@ -1022,7 +1022,7 @@ nodes:
 
         - `related`:
             - On the PR (tag the PR author):
-                  "@<pr-author> related to #<issue> — overlapping area or partial fix."
+                  "@<pr-author> related to #<issue> -- overlapping area or partial fix."
               Capture ID:
                   state.linkedPrs[<pr>].commentIds.related.pr[<issue>] = "<id>"
             - On the issue (tag the issue reporter):
@@ -1032,11 +1032,11 @@ nodes:
             - Add <issue> to `state.linkedPrs[<pr>].related`.
 
       On idempotent SKIP (existing comment found), do NOT attempt to
-      extract an ID — leave the slot absent.
+      extract an ID -- leave the slot absent.
 
-      Post sequentially — don't Task-fan-out this step.
+      Post sequentially -- don't Task-fan-out this step.
 
-      ## 6b. TEMPLATE NUDGE PASS — auto-comment on low-quality PR fills
+      ## 6b. TEMPLATE NUDGE PASS -- auto-comment on low-quality PR fills
 
       ### First-run grandfather guard
 
@@ -1044,12 +1044,12 @@ nodes:
       Condition: the `state.linkedPrs` object **as read at the start of
       this run** (step 1) was empty.
 
-      If baseline → DO NOT POST any template-nudge comments this run.
+      If baseline -> DO NOT POST any template-nudge comments this run.
       Instead, for every PR that WOULD have been nudged, stamp
       `state.linkedPrs[<pr>].templateNudgedAt = "<first-run-baseline>"`
       so future runs treat them as already handled. Print a single line:
 
-          [grandfather] baseline run — snapshotting N PRs without posting
+          [grandfather] baseline run -- snapshotting N PRs without posting
           nudges. Future runs will only nudge new low-quality PRs.
 
       Skip the entire rest of this step on the baseline run.
@@ -1058,16 +1058,16 @@ nodes:
 
       Only runs if `pr-template.md` is non-empty (i.e. the repo HAS a
       template). For each PR processed this run whose matcher returned
-      `templateAdherence.quality ∈ {"empty", "partial"}` AND whose
+      `templateAdherence.quality  {"empty", "partial"}` AND whose
       `requiredMissing` list is non-empty:
 
         - Skip if `state.linkedPrs[<pr>].templateNudgedAt` already exists
-          (we've nudged before — don't badger the contributor again).
+          (we've nudged before -- don't badger the contributor again).
         - Skip if the PR is marked `draft` (contributors often fill
           templates later on drafts).
         - Build the comment:
 
-              Hi @<pr-author> — thanks for opening this PR.
+              Hi @<pr-author> -- thanks for opening this PR.
 
               This repository uses a PR template at
               `.github/pull_request_template.md` with several required
@@ -1079,13 +1079,13 @@ nodes:
               - ...
 
               Could you fill those out (even briefly)? The template
-              helps reviewers understand scope, risk, and rollback — it
+              helps reviewers understand scope, risk, and rollback -- it
               speeds up review significantly.
 
               If a section genuinely doesn't apply, just write "N/A" in
               it rather than leaving it blank.
 
-        - Idempotency: `gh pr view <pr> --json comments` — skip if an
+        - Idempotency: `gh pr view <pr> --json comments` -- skip if an
           existing comment already mentions "pull_request_template.md"
           or starts with the exact greeting.
         - Post: `gh pr comment <pr> --body "..."`. Capture the comment ID
@@ -1098,7 +1098,7 @@ nodes:
 
       ## 7. SAVE
       For every PR processed this run (success or skip), MERGE into
-      the existing `state.linkedPrs[<pr>]` entry (do NOT replace — that
+      the existing `state.linkedPrs[<pr>]` entry (do NOT replace -- that
       would lose `commentIds` / `templateNudgedAt` / `templateAdherence`
       captured earlier in this run AND the baseline grandfather flag).
 
@@ -1121,7 +1121,7 @@ nodes:
       ONE Write call at the end of the node.
 
       ## 8. Summary
-          ## PR-issue linker — <now>
+          ## PR-issue linker -- <now>
           PRs scanned:                        <N>
           PRs newly processed:                <N>
           Fully-addresses suggestions posted: <N>
@@ -1133,22 +1133,22 @@ nodes:
       # Guardrails
 
       - NEVER close an issue. GitHub closes issues on merge via the
-        `Closes #X` keyword — that is the only closure path this workflow
+        `Closes #X` keyword -- that is the only closure path this workflow
         endorses.
       - NEVER add `Closes #X` to the PR body yourself; only SUGGEST via a
         comment. Maintainers decide.
       - Default to `related`. Only suggest `fully-addresses` when the
         evidence is overwhelming.
       - If `gh` errors out (auth, rate limit), abort cleanly and summarise.
-      - State writes are ATOMIC per run — a single Write at step 7.
+      - State writes are ATOMIC per run -- a single Write at step 7.
       - Parallel Task fan-out is required for the match pass only. Act
         pass is sequential for idempotent comment-ID capture.
       - Template nudge comments happen AT MOST ONCE per PR (tracked via
-        `templateNudgedAt`). Never re-nudge — contributors will ignore us.
+        `templateNudgedAt`). Never re-nudge -- contributors will ignore us.
 
   # ---------------------------------------------------------------------------
-  # Stale nudge — standalone. For issues and PRs untouched for STALE_DAYS
-  # (default 60), post a gentle "still relevant?" comment. No auto-close —
+  # Stale nudge -- standalone. For issues and PRs untouched for STALE_DAYS
+  # (default 60), post a gentle "still relevant?" comment. No auto-close --
   # this is a reminder, not an ultimatum. Tracked in state so we only
   # nudge each item once per quiet period.
   # ---------------------------------------------------------------------------
@@ -1157,18 +1157,18 @@ nodes:
     allowed_tools: [Bash, Read, Write]
     prompt: |
       You post gentle reminders on GitHub issues and PRs that have gone
-      quiet. No auto-close. No Task fan-out needed — this is direct work.
+      quiet. No auto-close. No Task fan-out needed -- this is direct work.
 
-      # Mode check — READ FIRST
+      # Mode check -- READ FIRST
 
       Run once:
           echo "DRY_RUN=${DRY_RUN:-0} SKIP_STALE_NUDGE=${SKIP_STALE_NUDGE:-0} STALE_DAYS=${STALE_DAYS:-60}"
 
-      If SKIP_STALE_NUDGE=1 — print
+      If SKIP_STALE_NUDGE=1 -- print
           "Skipping stale-nudge per SKIP_STALE_NUDGE=1"
       and exit immediately.
 
-      If DRY_RUN=1 — READ-ONLY. Print `[DRY] would ...` for each would-be
+      If DRY_RUN=1 -- READ-ONLY. Print `[DRY] would ...` for each would-be
       comment. Do NOT run `gh issue comment` / `gh pr comment`. Do NOT
       use Write on the state file. End with summary prefixed `## (DRY RUN)`.
 
@@ -1187,8 +1187,8 @@ nodes:
 
       - `nudged["issue/<N>" | "pr/<N>"]`: { nudgedAt, updatedAtAtNudge, botCommentId }
         - Re-nudge allowed only when the item has been updated AFTER
-          `nudgedAt` AND has gone quiet again for ≥ STALE_DAYS. Otherwise
-          skip — don't spam.
+          `nudgedAt` AND has gone quiet again for >= STALE_DAYS. Otherwise
+          skip -- don't spam.
 
       # Step-by-step
 
@@ -1197,7 +1197,7 @@ nodes:
       cat .archon/state/stale-nudge-state.json 2>/dev/null
       ```
       Parse JSON:
-        ENOENT / empty → default shape. JSON.parse throw → ABORT loudly
+        ENOENT / empty -> default shape. JSON.parse throw -> ABORT loudly
         (never silently reset tracked state; corrupt file means a backup
         restore or explicit deletion, never a reset).
 
@@ -1218,13 +1218,13 @@ nodes:
 
       ## 3. Filter
       For each item:
-        - Skip PRs where `isDraft == true` — drafts are often WIP, nudging
+        - Skip PRs where `isDraft == true` -- drafts are often WIP, nudging
           them is rude.
         - Skip any item with a label matching `wontfix`, `blocked`,
           `needs-maintainer`, `pinned`, `keep-open` (common "do not bother"
           signals). Check current labels via the fetched JSON.
         - Skip if `state.nudged["<type>/<N>"]` exists AND the item's
-          `updatedAt` is ≤ `nudgedAt` (nothing has changed since we nudged).
+          `updatedAt` is <= `nudgedAt` (nothing has changed since we nudged).
 
       Everything else is a NEW nudge candidate.
 
@@ -1239,9 +1239,9 @@ nodes:
         PRs:
             @<author> this PR has been quiet for <N> days. Is it still
             active? Happy to help unblock if review feedback or a rebase
-            is needed — just drop a note.
+            is needed -- just drop a note.
 
-      Idempotency: `gh {issue,pr} view <N> --json comments` — skip if any
+      Idempotency: `gh {issue,pr} view <N> --json comments` -- skip if any
       existing comment CONTAINS the substring "has been quiet for" (a
       prefix check fails because the posted body starts with `@<author>`,
       not the phrase). If the fetch itself fails, SKIP POSTING rather
@@ -1261,13 +1261,13 @@ nodes:
       `.archon/state/stale-nudge-state.json`.
 
       ## 6. Summary
-          ## Stale nudge — <now>
+          ## Stale nudge -- <now>
           STALE_DAYS window:             <N>
           Stale issues found:            <N>
           Stale PRs found (non-draft):   <N>
           Filtered out (labels/draft/already-nudged): <N>
-          New nudges posted — issues:    <N>
-          New nudges posted — PRs:       <N>
+          New nudges posted -- issues:    <N>
+          New nudges posted -- PRs:       <N>
 
       # Guardrails
 
@@ -1279,9 +1279,9 @@ nodes:
       - If `gh` errors out, abort cleanly. State stays atomic.
 
   # ---------------------------------------------------------------------------
-  # Digest — runs LAST, after every other node. Reads each prior node's
+  # Digest -- runs LAST, after every other node. Reads each prior node's
   # final assistant output via $<nodeId>.output and synthesises one
-  # maintainer-facing report to $ARTIFACTS_DIR/digest.md. Pure synthesis —
+  # maintainer-facing report to $ARTIFACTS_DIR/digest.md. Pure synthesis --
   # no gh calls, no mutations, no Task fan-out.
   # ---------------------------------------------------------------------------
   - id: digest
@@ -1308,14 +1308,14 @@ nodes:
       - $closed-pr-dedup-check.output
       - $stale-nudge.output
 
-      Some may include `(DRY RUN)` prefix or a "Skipping … per SKIP_X=1"
-      line — pass those through honestly.
+      Some may include `(DRY RUN)` prefix or a "Skipping ... per SKIP_X=1"
+      line -- pass those through honestly.
 
       You may also read the state files under `.archon/state/` for any
-      counts the summaries omitted, but keep it light — this is a digest,
+      counts the summaries omitted, but keep it light -- this is a digest,
       not a re-analysis.
 
-      # Comment-URL index — REQUIRED
+      # Comment-URL index -- REQUIRED
 
       The digest MUST include a direct GitHub URL for every bot comment
       this run posted. Build URLs from state files.
@@ -1330,31 +1330,31 @@ nodes:
              Issue comment: https://github.com/<slug>/issues/<N>#issuecomment-<id>
              PR    comment: https://github.com/<slug>/pull/<N>#issuecomment-<id>
 
-      3. Sources to read (all optional — missing files mean that node
+      3. Sources to read (all optional -- missing files mean that node
          didn't run OR posted nothing):
 
-         a. `.archon/state/triage-state.json` → `pendingDedupComments`
-            Keyed by OPEN ISSUE number → `issues/<N>#issuecomment-<botCommentId>`.
+         a. `.archon/state/triage-state.json` -> `pendingDedupComments`
+            Keyed by OPEN ISSUE number -> `issues/<N>#issuecomment-<botCommentId>`.
 
-         b. `.archon/state/closed-dedup-state.json` → `closedMatchComments`
-            Keyed by OPEN ISSUE number → `issues/<N>#issuecomment-<botCommentId>`.
+         b. `.archon/state/closed-dedup-state.json` -> `closedMatchComments`
+            Keyed by OPEN ISSUE number -> `issues/<N>#issuecomment-<botCommentId>`.
 
-         c. `.archon/state/closed-pr-dedup-state.json` → `closedMatchComments`
-            Keyed by OPEN PR number → `pull/<N>#issuecomment-<botCommentId>`.
+         c. `.archon/state/closed-pr-dedup-state.json` -> `closedMatchComments`
+            Keyed by OPEN PR number -> `pull/<N>#issuecomment-<botCommentId>`.
 
-         d. `.archon/state/pr-state.json` → `linkedPrs[<pr>].commentIds`:
-              - `fullyAddresses[<issue>]` → comment lives ON THE PR:
+         d. `.archon/state/pr-state.json` -> `linkedPrs[<pr>].commentIds`:
+              - `fullyAddresses[<issue>]` -> comment lives ON THE PR:
                     `pull/<pr>#issuecomment-<id>`
-              - `related.pr[<issue>]`     → `pull/<pr>#issuecomment-<id>`
-              - `related.issue[<issue>]`  → `issues/<issue>#issuecomment-<id>`
-              - `templateNudge`           → `pull/<pr>#issuecomment-<id>`
-            Note: entries may be absent (idempotent skip or pre-IDs run) —
+              - `related.pr[<issue>]`     -> `pull/<pr>#issuecomment-<id>`
+              - `related.issue[<issue>]`  -> `issues/<issue>#issuecomment-<id>`
+              - `templateNudge`           -> `pull/<pr>#issuecomment-<id>`
+            Note: entries may be absent (idempotent skip or pre-IDs run) --
             in that case list the action without a URL and suffix
             `(no ID captured)`.
 
-         e. `.archon/state/stale-nudge-state.json` → `nudged`
-            Keys: `"issue/<N>"` → `issues/<N>#issuecomment-<botCommentId>`
-                  `"pr/<N>"`    → `pull/<N>#issuecomment-<botCommentId>`
+         e. `.archon/state/stale-nudge-state.json` -> `nudged`
+            Keys: `"issue/<N>"` -> `issues/<N>#issuecomment-<botCommentId>`
+                  `"pr/<N>"`    -> `pull/<N>#issuecomment-<botCommentId>`
 
       4. Include the URLs BOTH inline in the per-node sections (next to
          the issue/PR number it acted on) AND in a dedicated "Comment
@@ -1362,7 +1362,7 @@ nodes:
 
       5. Only surface comments posted IN THIS RUN. Use the `postedAt` /
          `nudgedAt` timestamps: include entries whose timestamp equals
-         today's run window (≥ this run's start time). Older entries
+         today's run window (>= this run's start time). Older entries
          from prior runs should NOT re-appear in the "just posted" tables
          but DO appear in a separate "carry-forward pending" table so
          maintainers see what's still on the 3-day clock.
@@ -1374,17 +1374,17 @@ nodes:
 
       Template:
 
-          # Repo-triage digest — <now-iso>
+          # Repo-triage digest -- <now-iso>
 
-          _(Dry run)_   ← include this line only if ANY node ran with DRY_RUN=1
+          _(Dry run)_   <- include this line only if ANY node ran with DRY_RUN=1
 
           ## Headline numbers
 
           | Action | Count |
           |---|---|
           | Labels applied | N |
-          | New duplicate clusters (open↔open) | N |
-          | New closed-match candidates (open issue ↔ closed issue) | N |
+          | New duplicate clusters (open<->open) | N |
+          | New closed-match candidates (open issue  closed issue) | N |
           | Issues auto-closed this run | N |
           | PR template nudges posted | N |
           | Stale nudges (issues) | N |
@@ -1416,44 +1416,44 @@ nodes:
           - Issues: good=<N>, partial=<N>, empty=<N>, no-template=<N>
           - PRs:    good=<N>, partial=<N>, empty=<N>, no-template=<N>
 
-          ## Comment index — this run
+          ## Comment index -- this run
 
           Every URL below was posted by this run. Click to jump to the
           comment on GitHub.
 
-          ### Dedup warnings (open ↔ open) — 3-day clock
-          - #<openIssue> → duplicate of #<canonical> — [comment](https://github.com/<slug>/issues/<N>#issuecomment-<id>)
+          ### Dedup warnings (open <-> open) -- 3-day clock
+          - #<openIssue> -> duplicate of #<canonical> -- [comment](https://github.com/<slug>/issues/<N>#issuecomment-<id>)
 
-          ### Closed-issue matches — 3-day clock
-          - #<openIssue> → matched closed #<closedIssue> (<stateReason>) — [comment](URL)
+          ### Closed-issue matches -- 3-day clock
+          - #<openIssue> -> matched closed #<closedIssue> (<stateReason>) -- [comment](URL)
 
           ### Closed-PR duplicates (info only, no clock)
-          - PR #<openPr> → matched #<closedPr> (<merged|closed unmerged>) — [comment](URL)
+          - PR #<openPr> -> matched #<closedPr> (<merged|closed unmerged>) -- [comment](URL)
 
           ### PR `Closes #X` suggestions
-          - PR #<pr> → suggest `Closes #<issue>` — [comment](URL)
+          - PR #<pr> -> suggest `Closes #<issue>` -- [comment](URL)
 
           ### Related cross-refs
-          - PR #<pr> ↔ issue #<issue>
+          - PR #<pr>  issue #<issue>
             - on PR: [comment](URL)
             - on issue: [comment](URL)
 
           ### PR template nudges
-          - PR #<pr> — [comment](URL)
+          - PR #<pr> -- [comment](URL)
 
           ### Stale nudges
-          - Issue #<N> — [comment](URL)
-          - PR #<N> — [comment](URL)
+          - Issue #<N> -- [comment](URL)
+          - PR #<N> -- [comment](URL)
 
           (Omit any section whose list is empty rather than printing a
           header with "none".)
 
-          ## Carry-forward — still on the 3-day clock from prior runs
+          ## Carry-forward -- still on the 3-day clock from prior runs
 
           Items whose `postedAt` is OLDER than this run but still pending
           (no reporter reply yet, not yet auto-closed):
 
-          - #<N> → #<canonical> — posted <ISO>, <days> day(s) elapsed, [comment](URL)
+          - #<N> -> #<canonical> -- posted <ISO>, <days> day(s) elapsed, [comment](URL)
 
           (Omit the whole section if nothing is pending.)
 
@@ -1466,10 +1466,10 @@ nodes:
           ## Next scheduled run considerations
 
           - Any items the human should look at before the next run
-            (ambiguous clusters, PR template edge cases, etc.) — 1-3 bullets
+            (ambiguous clusters, PR template edge cases, etc.) -- 1-3 bullets
             max. Empty section is fine.
 
-      Keep the digest scannable — a maintainer should be able to assess
+      Keep the digest scannable -- a maintainer should be able to assess
       "did anything need my attention?" in under 30 seconds.
 
       # Post to Slack (optional)
@@ -1478,7 +1478,7 @@ nodes:
 
           echo "SLACK_WEBHOOK=${SLACK_WEBHOOK:-<unset>}"
 
-      If `SLACK_WEBHOOK` is unset or empty → print
+      If `SLACK_WEBHOOK` is unset or empty -> print
           "Slack post skipped: SLACK_WEBHOOK not set."
       and finish. This is the normal path when Slack isn't wired.
 
@@ -1496,9 +1496,9 @@ nodes:
       - Bold: `*bold*` (NOT `**bold**`)
       - Italics: `_italic_`
       - Links: `<https://url|text>` (NOT `[text](url)`)
-      - Lists: use `•` or `-` at line start — no numbered lists
-      - No `##` headers — use a `*Bold line*` instead
-      - No tables — convert to bulleted key/value lines
+      - Lists: use `-` or `-` at line start -- no numbered lists
+      - No `##` headers -- use a `*Bold line*` instead
+      - No tables -- convert to bulleted key/value lines
       - Code: single-backtick inline, triple-backtick blocks
 
       ## Payload shape
@@ -1515,36 +1515,36 @@ nodes:
       ## Template for the Slack text
 
       ```
-      *Repo-triage digest — <now-iso>*
-      <if dry run: _(dry run — no mutations)_>
+      *Repo-triage digest -- <now-iso>*
+      <if dry run: _(dry run -- no mutations)_>
 
       *Headline*
-      • Labels applied: <N>
-      • Dedup clusters (open↔open): <N>
-      • Closed-issue matches: <N>
-      • Auto-closed: <N>
-      • PR `Closes #X` suggestions: <N>
-      • Related cross-refs: <N>
-      • Closed-PR duplicates: <N>
-      • PR template nudges: <N>
-      • Stale nudges: <N>
+      - Labels applied: <N>
+      - Dedup clusters (open<->open): <N>
+      - Closed-issue matches: <N>
+      - Auto-closed: <N>
+      - PR `Closes #X` suggestions: <N>
+      - Related cross-refs: <N>
+      - Closed-PR duplicates: <N>
+      - PR template nudges: <N>
+      - Stale nudges: <N>
 
       *Comments posted this run*  (click to jump to GitHub)
-      • #<N> dup of #<canon> → <https://github.com/<slug>/issues/<N>#issuecomment-<id>|comment>
-      • #<N> may be resolved by #<closed> → <URL|comment>
-      • PR #<N> `Closes #<X>` → <URL|comment>
-      • (list every comment — if the total would push past 3,500 chars,
+      - #<N> dup of #<canon> -> <https://github.com/<slug>/issues/<N>#issuecomment-<id>|comment>
+      - #<N> may be resolved by #<closed> -> <URL|comment>
+      - PR #<N> `Closes #<X>` -> <URL|comment>
+      - (list every comment -- if the total would push past 3,500 chars,
          collapse the largest category to a single line:
          "...plus N more related cross-refs")
 
       *Pending* (3-day clock running)
-      • #<N> → #<canonical>, <M>d elapsed
-      • PR #<N> → closed #<X>
+      - #<N> -> #<canonical>, <M>d elapsed
+      - PR #<N> -> closed #<X>
 
       *Full digest:* `$ARTIFACTS_DIR/digest.md`
       ```
 
-      Omit sections whose list is empty — don't print a header followed
+      Omit sections whose list is empty -- don't print a header followed
       by "none".
 
       ## Posting
@@ -1572,7 +1572,7 @@ nodes:
 
       Slack posting is a side channel, not the source of truth. If curl
       fails (non-zero exit, non-`ok` body), log the error to stdout but
-      do NOT fail the node — the digest.md on disk is authoritative.
+      do NOT fail the node -- the digest.md on disk is authoritative.
       Append a line to the node's stdout:
 
           Slack post FAILED: <curl error or Slack response body>
@@ -1582,7 +1582,7 @@ nodes:
       - No gh calls here. No comments. No closes. Synthesis only.
       - If any prior node's output is missing or mangled, note it in the
         corresponding section: "(output unavailable)". Don't invent numbers.
-      - Preserve `(DRY RUN)` markers — readers need to know if counts are
+      - Preserve `(DRY RUN)` markers -- readers need to know if counts are
         hypothetical.
       - Slack posting is best-effort; digest.md on disk is the source
         of truth.

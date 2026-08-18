@@ -4,14 +4,14 @@
 #                 bdc-feature-development.yaml (loop + verify + commit pattern)
 # Doctrine compliance: 13 hard rules of archon-yaml-authoring (verified at draft time)
 #
-# Pre-flight: codebase bluedevilcollectibles/shopops must be registered in Archon.
+# Pre-flight: codebase thinmansoftware/shopops must be registered in Archon.
 #   Verify: sqlite3 /opt/bdc/archon-data/archon.db "SELECT name FROM remote_agent_codebases"
 #   If missing, register via Archon Dashboard or:
 #     curl -X POST https://archon.bluedevilcollectibles.com/api/codebases \
 #       -H "Content-Type: application/json" \
-#       -d '{"name":"bluedevilcollectibles/shopops","repositoryUrl":"https://github.com/bluedevilcollectibles/shopops","defaultBranch":"master","defaultCwd":"/.archon/workspaces/bluedevilcollectibles/shopops/source"}'
+#       -d '{"name":"thinmansoftware/shopops","repositoryUrl":"https://github.com/thinmansoftware/shopops","defaultBranch":"master","defaultCwd":"/.archon/workspaces/thinmansoftware/shopops/source"}'
 #
-# NOTE ON CWD: Archon clones bluedevilcollectibles/shopops into its worktree.
+# NOTE ON CWD: Archon clones thinmansoftware/shopops into its worktree.
 #   CWD = shopops repo root. shopops-api/ is a subdirectory. All paths below are
 #   relative to shopops repo root (e.g., shopops-api/routes/channels.js).
 #   The WO spec lives in bdc-xo, fetched via gh api cross-repo.
@@ -21,12 +21,12 @@
 #
 # Deploy: BDC_XO/scripts/archon-bridge/sync-workflows.sh WO-SHOPOPS-COMMERCE-SPINE-01.yaml
 #
-# REVIEW BEFORE DEPLOY — human verifies Supabase staging FK tables exist,
+# REVIEW BEFORE DEPLOY -- human verifies Supabase staging FK tables exist,
 #   Notion page ID is correct, test thresholds, channel enum is exhaustive for v1.
 
 name: bdc-shopops-commerce-spine
 description: |
-  Use when: Executing WO-SHOPOPS-COMMERCE-SPINE-01 — Commerce Channel Spine.
+  Use when: Executing WO-SHOPOPS-COMMERCE-SPINE-01 -- Commerce Channel Spine.
   Input: WO_ID = WO-SHOPOPS-COMMERCE-SPINE-01.
   Does: Reads spec from bdc-xo (cross-repo via gh api), verifies FK tables exist
         in staging Supabase, writes SQL migration
@@ -36,9 +36,9 @@ description: |
         adds services/channelAvailability.js, runs bun tests (idempotency +
         tenant isolation), commits + opens PR, does docker exec Rule 19 runtime
         verification, builds MIXED manifest, flips Notion to REVIEW.
-  Repo: bluedevilcollectibles/shopops (shopops-api/ subdir).
-        Spec lives in bluedevilcollectibles/bdc-xo.
-  parallel_ok: false — schema migration, serial only.
+  Repo: thinmansoftware/shopops (shopops-api/ subdir).
+        Spec lives in thinmansoftware/bdc-xo.
+  parallel_ok: false -- schema migration, serial only.
   NOT for: any other WO.
 
 policyFile: harness/policies/agent-behavior.md
@@ -47,7 +47,7 @@ model: sonnet
 nodes:
 
   # -------------------------------------------------------------------------
-  # 1. READ SPEC — fetches WO + behavior spec from bdc-xo cross-repo
+  # 1. READ SPEC -- fetches WO + behavior spec from bdc-xo cross-repo
   # -------------------------------------------------------------------------
   - id: read-spec
     bash: |
@@ -57,18 +57,18 @@ nodes:
       # Primary: docs/work-orders/<WO_ID>.md in bdc-xo
       # gh --template uses Go templates (built into gh, no external jq dependency)
       SPEC_CONTENT=$(gh api \
-        "repos/bluedevilcollectibles/bdc-xo/contents/docs/work-orders/${WO_ID}.md?ref=main" \
+        "repos/thinmansoftware/bdc-xo/contents/docs/work-orders/${WO_ID}.md?ref=main" \
         --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
 
       # Fallback: glob docs/superpowers/specs/*<WO_ID>*.md
       if [ -z "$SPEC_CONTENT" ]; then
         GLOB_PATH=$(gh api \
-          "repos/bluedevilcollectibles/bdc-xo/contents/docs/superpowers/specs?ref=main" \
+          "repos/thinmansoftware/bdc-xo/contents/docs/superpowers/specs?ref=main" \
           --template '{{range .}}{{.path}}{{"\n"}}{{end}}' \
           2>/dev/null | grep "${WO_ID}.md$" | head -1 || true)
         if [ -n "$GLOB_PATH" ]; then
           SPEC_CONTENT=$(gh api \
-            "repos/bluedevilcollectibles/bdc-xo/contents/${GLOB_PATH}?ref=main" \
+            "repos/thinmansoftware/bdc-xo/contents/${GLOB_PATH}?ref=main" \
             --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
         fi
       fi
@@ -77,12 +77,12 @@ nodes:
         # Fallback 4: GitHub issue body (WO-HARNESS-READ-SPEC-ISSUE-BODY-FALLBACK-01)
         ISSUE_NUM=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'issue=[0-9]+' | head -n 1 | cut -d= -f2 || true)
         if [ -z "$ISSUE_NUM" ]; then
-          ISSUE_NUM=$(gh issue list --repo bluedevilcollectibles/bdc-xo \
+          ISSUE_NUM=$(gh issue list --repo thinmansoftware/bdc-xo \
             --search "${WO_ID} in:title" --json number,title \
             --jq '.[0].number' 2>/dev/null || true)
         fi
         if [ -n "$ISSUE_NUM" ] && [ "$ISSUE_NUM" != "null" ]; then
-          SPEC_CONTENT=$(gh issue view "$ISSUE_NUM" --repo bluedevilcollectibles/bdc-xo \
+          SPEC_CONTENT=$(gh issue view "$ISSUE_NUM" --repo thinmansoftware/bdc-xo \
             --json body --jq .body 2>/dev/null || true)
           [ -n "$SPEC_CONTENT" ] && SPEC_PATH="issues/${ISSUE_NUM}"
         fi
@@ -91,7 +91,7 @@ nodes:
 
       # Also fetch behavior spec for context
       BEHAVIOR_SPEC=$(gh api \
-        "repos/bluedevilcollectibles/bdc-xo/contents/docs/behavior-specs/COMMERCE_CHANNEL_SPINE_BEHAVIOR.md?ref=main" \
+        "repos/thinmansoftware/bdc-xo/contents/docs/behavior-specs/COMMERCE_CHANNEL_SPINE_BEHAVIOR.md?ref=main" \
         --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
 
       printf 'WO_ID=%s\nSPEC_PATH=bdc-xo:docs/work-orders/%s.md\nWORKFLOW_ID=%s\n\n' \
@@ -100,14 +100,14 @@ nodes:
       printf -- '--- BEHAVIOR SPEC (excerpt) ---\n%s\n' "$BEHAVIOR_SPEC"
 
   # -------------------------------------------------------------------------
-  # 2. SCHEMA-VERIFY — confirm FK tables exist in staging Supabase BEFORE
-  #    writing any migration or query (Rule 17 + WO §9 requirement).
+  # 2. SCHEMA-VERIFY -- confirm FK tables exist in staging Supabase BEFORE
+  #    writing any migration or query (Rule 17 + WO Section 9 requirement).
   #    Best-effort wrapper: Supabase REST can legitimately 401/429/503.
   # -------------------------------------------------------------------------
   - id: schema-verify
     depends_on: [read-spec]
     bash: |
-      # set -e DELIBERATELY OMITTED — best-effort step per doctrine wrapper
+      # set -e DELIBERATELY OMITTED -- best-effort step per doctrine wrapper
       SUPABASE_URL="${SUPABASE_URL:-}"
       SUPABASE_SERVICE_KEY="${SUPABASE_SERVICE_KEY:-}"
 
@@ -154,7 +154,7 @@ nodes:
       exit 0
 
   # -------------------------------------------------------------------------
-  # 3. PLAN — architect the surgical changes
+  # 3. PLAN -- architect the surgical changes
   # -------------------------------------------------------------------------
   - id: plan
     depends_on: [read-spec, schema-verify]
@@ -170,11 +170,11 @@ nodes:
       - SQL migration: exact filename + path (shopops-api/migrations/20260513_commerce_channel_spine.sql)
       - New routes to add in shopops-api/routes/channels.js (or new file if cleaner)
       - New service file: shopops-api/services/channelAvailability.js
-      - CHANNEL_IDS enum: must be exactly ['comicstoreos_portal','shopify','woocommerce','ebay','whatnot','tiktok'] — no additions
+      - CHANNEL_IDS enum: must be exactly ['comicstoreos_portal','shopify','woocommerce','ebay','whatnot','tiktok'] -- no additions
       - Test file to create: shopops-api/tests/test_commerce_channel_spine.js (bun-compatible)
       - Test scenarios (minimum 5 covering idempotency + tenant isolation + invalid channel + table creation)
-      - Verification commands (all using bun, not node/npm — Archon container is bun-only)
-      - Commit message: "feat(api): WO-SHOPOPS-COMMERCE-SPINE-01 — commerce channel spine tables + connections API"
+      - Verification commands (all using bun, not node/npm -- Archon container is bun-only)
+      - Commit message: "feat(api): WO-SHOPOPS-COMMERCE-SPINE-01 -- commerce channel spine tables + connections API"
       - Branch name: wo/shopops-commerce-spine-01
       - PR base: master (shopops repo default branch)
       - Staging gate: required (shopops is in Rule 20 staging-gate list)
@@ -186,7 +186,7 @@ nodes:
       $read-spec.output
 
   # -------------------------------------------------------------------------
-  # 4. IMPLEMENT — write migration + route code + service + tests
+  # 4. IMPLEMENT -- write migration + route code + service + tests
   # -------------------------------------------------------------------------
   - id: implement
     depends_on: [plan]
@@ -207,18 +207,18 @@ nodes:
 
         ## Execution Rules
         1. Create shopops-api/migrations/20260513_commerce_channel_spine.sql with the exact
-           DDL from WO §9: channel_connections, product_channel_map, channel_orders tables
+           DDL from WO Section 9: channel_connections, product_channel_map, channel_orders tables
            + CHECK constraints + seed INSERT from tenant_config. Use CREATE TABLE IF NOT EXISTS
            for idempotency.
 
         2. Extend shopops-api/routes/channels.js:
-           - Keep existing GET /channels/config UNCHANGED (legacy compat — do not touch it)
-           - Add GET /channels/connections — reads channel_connections rows for tenant;
+           - Keep existing GET /channels/config UNCHANGED (legacy compat -- do not touch it)
+           - Add GET /channels/connections -- reads channel_connections rows for tenant;
              coerces legacy tenant_config data into the same shape if row absent
-           - Add PATCH /channels/connections/:channel — upserts connection. Validates
+           - Add PATCH /channels/connections/:channel -- upserts connection. Validates
              channel is in CHANNEL_IDS = ['comicstoreos_portal','shopify','woocommerce',
              'ebay','whatnot','tiktok']. Returns 400 for unknown channel. Idempotent.
-           - Add GET /channels/inventory-availability — returns per-item
+           - Add GET /channels/inventory-availability -- returns per-item
              available_qty = on_hand_qty - reserved_qty - pull_list_allocated (read-only)
            - All three routes require X-Shopops-Tenant header (same auth pattern as existing routes)
 
@@ -226,7 +226,7 @@ nodes:
            - Export computeAvailability(tenantId, itemIds) async function
            - Formula: on_hand_qty - reserved_qty - pull_list_allocated
            - Read inventory_items schema with SELECT column_name FROM information_schema.columns
-             WHERE table_name='inventory_items' BEFORE writing the query (WO §7 Rule 5 note)
+             WHERE table_name='inventory_items' BEFORE writing the query (WO Section 7 Rule 5 note)
            - Do NOT subtract channel-external holds in v1
 
         4. Create shopops-api/tests/test_commerce_channel_spine.js:
@@ -252,7 +252,7 @@ nodes:
           - GET /channels/config is still present unchanged
 
   # -------------------------------------------------------------------------
-  # 5. VERIFY-GREP — structural assertions (multi-line safe per doctrine)
+  # 5. VERIFY-GREP -- structural assertions (multi-line safe per doctrine)
   # -------------------------------------------------------------------------
   - id: verify-grep
     depends_on: [implement]
@@ -277,7 +277,7 @@ nodes:
       grep -q "INSERT INTO channel_connections" shopops-api/migrations/20260513_commerce_channel_spine.sql \
         || (echo "FAIL: seed INSERT missing from migration" >&2; exit 1)
 
-      # Routes exist in channels.js — use separate greps (multi-line safe)
+      # Routes exist in channels.js -- use separate greps (multi-line safe)
       grep -q "channels/connections" shopops-api/routes/channels.js \
         || (echo "FAIL: /channels/connections route missing" >&2; exit 1)
       grep -q "PATCH\|patch\|router\.patch\|app\.patch" shopops-api/routes/channels.js \
@@ -287,7 +287,7 @@ nodes:
 
       # Legacy route preserved
       grep -q "channels/config" shopops-api/routes/channels.js \
-        || (echo "FAIL: legacy GET /channels/config was removed — must be preserved" >&2; exit 1)
+        || (echo "FAIL: legacy GET /channels/config was removed -- must be preserved" >&2; exit 1)
 
       # Service file exists
       ls shopops-api/services/channelAvailability.js
@@ -306,7 +306,7 @@ nodes:
       echo "=== all grep assertions passed ==="
 
   # -------------------------------------------------------------------------
-  # 6. VERIFY-TESTS — run bun test suite (Archon container is bun-only)
+  # 6. VERIFY-TESTS -- run bun test suite (Archon container is bun-only)
   # -------------------------------------------------------------------------
   - id: verify-tests
     depends_on: [implement]
@@ -322,7 +322,7 @@ nodes:
       fi
 
   # -------------------------------------------------------------------------
-  # 7. COMMIT-AND-PUSH — idempotent checkout + commit + push
+  # 7. COMMIT-AND-PUSH -- idempotent checkout + commit + push
   # -------------------------------------------------------------------------
   - id: commit-and-push
     depends_on: [verify-grep, verify-tests]
@@ -335,7 +335,7 @@ nodes:
       if git show-ref --quiet "refs/heads/$BASE_BRANCH"; then
         if git worktree list --porcelain | grep -q "branch refs/heads/$BASE_BRANCH" && \
            [ "$(git rev-parse --abbrev-ref HEAD)" != "$BASE_BRANCH" ]; then
-          # Branch locked to another worktree — use timestamped variant
+          # Branch locked to another worktree -- use timestamped variant
           git checkout -b "$BRANCH"
         else
           BRANCH="$BASE_BRANCH"
@@ -357,7 +357,7 @@ nodes:
         echo "No staged changes; branch already contains requested work"
       else
         git -c user.name="John Ranson" -c user.email="admin@bluedevilcollectibles.com" \
-          commit -m "$(printf 'feat(api): WO-SHOPOPS-COMMERCE-SPINE-01 — commerce channel spine tables + connections API\n\nAdds three shared data tables via Supabase migration:\n  - channel_connections (tenant/channel status + credentials ref)\n  - product_channel_map (inventory item <-> external product mapping)\n  - channel_orders (normalized inbound orders from all channels)\nSeeds existing Shopify connections from tenant_config.\n\nExtends routes/channels.js:\n  - GET  /channels/connections        (read all connections for tenant)\n  - PATCH /channels/connections/:channel (upsert connection status/credentials)\n  - GET  /channels/inventory-availability (on_hand - reserved - pull_list_allocated)\nKeeps GET /channels/config unchanged (legacy compat).\n\nAdds services/channelAvailability.js — computeAvailability(tenantId, itemIds).\nAdds tests/test_commerce_channel_spine.js — 5+ bun tests (idempotency, tenant isolation,\n  invalid channel rejection, connections shape).\n\nBlocks: WO-SHOPOPS-SHOPIFY-ORDER-SYNC-01, WO-SHOPOPS-WOOCOMMERCE-CONNECTOR-01\n\nCo-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>')"
+          commit -m "$(printf 'feat(api): WO-SHOPOPS-COMMERCE-SPINE-01 -- commerce channel spine tables + connections API\n\nAdds three shared data tables via Supabase migration:\n  - channel_connections (tenant/channel status + credentials ref)\n  - product_channel_map (inventory item <-> external product mapping)\n  - channel_orders (normalized inbound orders from all channels)\nSeeds existing Shopify connections from tenant_config.\n\nExtends routes/channels.js:\n  - GET  /channels/connections        (read all connections for tenant)\n  - PATCH /channels/connections/:channel (upsert connection status/credentials)\n  - GET  /channels/inventory-availability (on_hand - reserved - pull_list_allocated)\nKeeps GET /channels/config unchanged (legacy compat).\n\nAdds services/channelAvailability.js -- computeAvailability(tenantId, itemIds).\nAdds tests/test_commerce_channel_spine.js -- 5+ bun tests (idempotency, tenant isolation,\n  invalid channel rejection, connections shape).\n\nBlocks: WO-SHOPOPS-SHOPIFY-ORDER-SYNC-01, WO-SHOPOPS-WOOCOMMERCE-CONNECTOR-01\n\nCo-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>')"
       fi
 
       git push -u origin "$BRANCH"
@@ -365,22 +365,22 @@ nodes:
       echo "BRANCH_SHA=$(git rev-parse HEAD)"
 
   # -------------------------------------------------------------------------
-  # 8. OPEN-PR — idempotent PR against master (shopops default branch)
+  # 8. OPEN-PR -- idempotent PR against master (shopops default branch)
   # -------------------------------------------------------------------------
   - id: open-pr
     depends_on: [commit-and-push]
     bash: |
       set -euo pipefail
-      # Use current HEAD branch (set by commit-and-push — may be timestamped variant)
+      # Use current HEAD branch (set by commit-and-push -- may be timestamped variant)
       BRANCH="$(git rev-parse --abbrev-ref HEAD)"
-      REPO="bluedevilcollectibles/shopops"
+      REPO="thinmansoftware/shopops"
       BASE="master"
-      TITLE="feat(api): WO-SHOPOPS-COMMERCE-SPINE-01 — commerce channel spine"
+      TITLE="feat(api): WO-SHOPOPS-COMMERCE-SPINE-01 -- commerce channel spine"
 
       BODY_FILE=$(mktemp)
       {
         echo "## Summary"
-        echo "Implements **WO-SHOPOPS-COMMERCE-SPINE-01** — Commerce Channel Spine."
+        echo "Implements **WO-SHOPOPS-COMMERCE-SPINE-01** -- Commerce Channel Spine."
         echo ""
         echo "Foundational data layer for all channel integrations (Shopify, WooCommerce, Portal, eBay, Whatnot, TikTok)."
         echo ""
@@ -391,10 +391,10 @@ nodes:
         echo "- **Must be applied to staging Supabase BEFORE container rebuild**"
         echo ""
         echo "## API Changes"
-        echo "- GET  /channels/connections — list all connections for tenant"
-        echo "- PATCH /channels/connections/:channel — upsert (idempotent)"
-        echo "- GET  /channels/inventory-availability — on_hand - reserved - pull_list_allocated"
-        echo "- GET  /channels/config — UNCHANGED (legacy compat)"
+        echo "- GET  /channels/connections -- list all connections for tenant"
+        echo "- PATCH /channels/connections/:channel -- upsert (idempotent)"
+        echo "- GET  /channels/inventory-availability -- on_hand - reserved - pull_list_allocated"
+        echo "- GET  /channels/config -- UNCHANGED (legacy compat)"
         echo ""
         echo "## Files"
         echo "- Created: shopops-api/migrations/20260513_commerce_channel_spine.sql"
@@ -445,7 +445,7 @@ nodes:
       exit 1
 
   # -------------------------------------------------------------------------
-  # 9. RUNTIME-VERIFY — Rule 19: docker exec grep proves source is live in
+  # 9. RUNTIME-VERIFY -- Rule 19: docker exec grep proves source is live in
   #    the running shopops-api container after rebuild.
   #    Best-effort: container may not be rebuilt yet at this pipeline stage.
   #    Operator MUST re-run or verify manually post-deploy.
@@ -453,7 +453,7 @@ nodes:
   - id: runtime-verify
     depends_on: [open-pr]
     bash: |
-      # set -e DELIBERATELY OMITTED — best-effort step (Rule 19 verification)
+      # set -e DELIBERATELY OMITTED -- best-effort step (Rule 19 verification)
       # Container may not have been rebuilt yet (PR is open, not merged/deployed).
       # This node emits evidence commands for the manifest. Operator re-runs post-deploy.
 
@@ -484,7 +484,7 @@ nodes:
       exit 0
 
   # -------------------------------------------------------------------------
-  # 10. BUILD-MANIFEST — MIXED class manifest (CODE + schema migration)
+  # 10. BUILD-MANIFEST -- MIXED class manifest (CODE + schema migration)
   # -------------------------------------------------------------------------
   - id: build-manifest
     depends_on: [runtime-verify]
@@ -504,7 +504,7 @@ nodes:
                      shopops-api/tests/test_commerce_channel_spine.js
       Tests: [count from verify-tests.output] passing / [total] total with command:
              bun test shopops-api/tests/test_commerce_channel_spine.js
-      PRs: [from open-pr.output PR_URL] — base: master
+      PRs: [from open-pr.output PR_URL] -- base: master
       Merge ancestors: shopops master HEAD=[from commit-and-push BRANCH_SHA], manifest commit, behind_by: 0
       Grep assertions:
         grep -n 'channels/connections' shopops-api/routes/channels.js (expected >= 2 lines)
@@ -524,7 +524,7 @@ nodes:
           -- expected: 3 rows
         schema_migrations row: SELECT id FROM schema_migrations WHERE id='20260513_commerce_channel_spine'
           -- expected: 1 row
-      Vercel deployment: N/A — shopops-api is Hetzner Docker, not Vercel
+      Vercel deployment: N/A -- shopops-api is Hetzner Docker, not Vercel
       VALIDATION: PASS (pending migration apply + container rebuild post-merge)
 
       ## Inputs
@@ -538,37 +538,49 @@ nodes:
       $runtime-verify.output
 
   # -------------------------------------------------------------------------
-  # 11. FLIP-NOTION — set Notes + Claude Status = REVIEW
+  # 11. FLIP-NOTION -- set Notes + Claude Status = REVIEW
   #     Notes field, NOT a comment (Captain CI reads Notes)
   # -------------------------------------------------------------------------
   - id: flip-notion
     depends_on: [build-manifest]
     task_class: clerical
-    prompt: |
-      Flip Notion WO-SHOPOPS-COMMERCE-SPINE-01 to REVIEW with the manifest in the Notes property.
+    bash: |
+      set -euo pipefail
 
-      IMPORTANT: The manifest goes in the Notes PROPERTY, not as a page comment.
-      Captain CI reads the Notes property. Comments are invisible to CI.
+      capture_node_output() {
+        python3 -c 'import shlex, sys; s=sys.stdin.read(); sys.stdout.write((lambda p: p[0] if len(p)==1 else s)(shlex.split(s)) if len(s)>=2 and s[0]=="'"'"'" and s.rstrip("\n").endswith("'"'"'") else s)'
+      }
 
-      # OPEN QUESTION: Notion page ID for WO-SHOPOPS-COMMERCE-SPINE-01 is not confirmed in
-      # this draft. Operator must verify the page ID before this workflow fires.
-      # To find it: search Notion database a6df831c-0b52-449f-8ca4-d77be6b70d0a
-      # for title containing "WO-SHOPOPS-COMMERCE-SPINE-01" and copy the page ID.
-      # Then update this prompt with the hardcoded page ID (see regression-suite.yaml pattern).
-      Notion database ID: a6df831c-0b52-449f-8ca4-d77be6b70d0a
-
-      Required Notion changes (single update call):
-      - Claude Status -> REVIEW
-      - Status -> Review
-      - Notes -> set to the manifest text from $build-manifest.output verbatim
-      - claimed_by: Major Build (Archon)
-      - claimed_at: 2026-05-13
-
-      Post-update, log the Notion page URL to run output for audit trail.
-
-      If Notion MCP is unavailable in this runtime, output an XO_TODO line:
-        XO_TODO: Flip WO-SHOPOPS-COMMERCE-SPINE-01 to REVIEW in Notion.
-                 Paste manifest from $build-manifest.output into Notes property.
-
-      ## Manifest
+      MANIFEST=$(capture_node_output <<'BDC_NODE_OUTPUT_MANIFEST'
       $build-manifest.output
+      BDC_NODE_OUTPUT_MANIFEST
+      )
+
+      READ_SPEC_OUT=$(capture_node_output <<'BDC_NODE_OUTPUT_READ_SPEC'
+      $read-spec.output
+      BDC_NODE_OUTPUT_READ_SPEC
+      )
+      ISSUE_REPO="${ISSUE_REPO:-thinmansoftware/bdc-xo}"
+      ISSUE_NUM=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'issue=[0-9]+' | head -1 | cut -d= -f2 || true)
+      if [ -z "$ISSUE_NUM" ]; then
+        ISSUE_NUM=$(printf '%s\n' "$READ_SPEC_OUT" | sed -n 's/^SPEC_PATH=.*issues\/\([0-9][0-9]*\).*/\1/p' | head -1)
+      fi
+      if [ -z "$ISSUE_NUM" ]; then
+        WO_ID_FROM_SPEC=$(printf '%s\n' "$READ_SPEC_OUT" | sed -n 's/^WO_ID=//p' | head -1)
+        if [ -n "$WO_ID_FROM_SPEC" ]; then
+          ISSUE_NUM=$(gh issue list --repo "$ISSUE_REPO" --search "$WO_ID_FROM_SPEC in:title" --json number --jq '.[0].number // empty' 2>/dev/null || true)
+        fi
+      fi
+      if [ -z "$ISSUE_NUM" ]; then
+        echo "flip-notion: no GitHub issue resolved; skipping status:review label + manifest comment."
+        exit 0
+      fi
+
+      gh label create status:review --repo "$ISSUE_REPO" --color 0E8A16 --description "BDC workflow is ready for review" 2>/dev/null || true
+      gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --remove-label status:building 2>/dev/null || true
+      gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --remove-label status:blocked 2>/dev/null || true
+      gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --add-label status:review
+      COMMENT_FILE=$(mktemp)
+      printf '%s\n' "$MANIFEST" > "$COMMENT_FILE"
+      gh issue comment "$ISSUE_NUM" --repo "$ISSUE_REPO" --body-file "$COMMENT_FILE"
+      echo "flip-notion: $ISSUE_REPO#$ISSUE_NUM -> status:review (manifest posted as comment)"

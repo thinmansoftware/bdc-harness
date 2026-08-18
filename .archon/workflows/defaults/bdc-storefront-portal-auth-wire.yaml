@@ -5,16 +5,16 @@
 # Doctrine compliance: 13 hard rules of archon-yaml-authoring (verified at draft time)
 #
 # Pre-flight (OPERATOR MUST VERIFY BEFORE FIRING):
-#   1. bluedevilcollectibles/shopops registered in Archon:
+#   1. thinmansoftware/shopops registered in Archon:
 #      sqlite3 /opt/bdc/archon-data/archon.db "SELECT name FROM remote_agent_codebases"
 #      CWD when fired = shopops repo root (shopops-api/ is a subdir inside it).
-#   2. bluedevilcollectibles/shopops-storefront NOT required to be an Archon codebase —
+#   2. thinmansoftware/shopops-storefront NOT required to be an Archon codebase --
 #      storefront work is done via git clone into /tmp in the shopops worktree context.
 #      GH_TOKEN (GITHUB_TOKEN) must be set in Archon env with push access to both repos.
 #   3. This WO is parallel_ok=NO. Do NOT fire while another shopops-api WO is in-flight.
 #   4. WO spec committed + pushed to bdc-xo main branch:
 #      docs/work-orders/WO-STOREFRONT-PORTAL-AUTH-WIRE-01.md
-#   5. Notion page ID for WO-STOREFRONT-PORTAL-AUTH-WIRE-01 — FILL IN below before firing.
+#   5. Notion page ID for WO-STOREFRONT-PORTAL-AUTH-WIRE-01 -- FILL IN below before firing.
 #      Find via: Notion search on database a6df831c-0b52-449f-8ca4-d77be6b70d0a
 #
 # OPEN QUESTION:
@@ -24,23 +24,23 @@
 #       Builder must inspect lib/storefront-api.ts callsites before implementing.
 #       If client-component calls exist, a split helper (server + client variants) is required.
 #   Q2: The shopops repo default branch is "master" (confirmed from existing YAML).
-#       shopops-storefront default branch assumed "main" — verify before firing.
+#       shopops-storefront default branch assumed "main" -- verify before firing.
 #   Q3: Notion page ID is UNKNOWN in this draft. Operator must fill in
 #       the `35fef4c9-ce00-811d-bf39-c4dc02a5bdc9` value in the flip-notion node prompt before deploying.
 #
 # Deploy: BDC_XO/scripts/archon-bridge/sync-workflows.sh bdc-storefront-portal-auth-wire.yaml
 #   (copy this file to bdc-harness/.archon/workflows/defaults/ first)
 #
-# REVIEW BEFORE DEPLOY — human verifies:
+# REVIEW BEFORE DEPLOY -- human verifies:
 #   - Notion page ID filled in (Q3 above)
 #   - storefront default branch confirmed (Q2 above)
 #   - cookie-forwarding callsite audit done (Q1 above)
-#   - schema column names in WO §9 match actual Supabase schema before first fire
+#   - schema column names in WO Section 9 match actual Supabase schema before first fire
 #   - Rule 19 runtime verification will be PENDING at PR-open time (expected)
 
 name: bdc-storefront-portal-auth-wire
 description: |
-  Use when: Executing WO-STOREFRONT-PORTAL-AUTH-WIRE-01 — Storefront Portal Auth Wire.
+  Use when: Executing WO-STOREFRONT-PORTAL-AUTH-WIRE-01 -- Storefront Portal Auth Wire.
   Input: WO_ID = WO-STOREFRONT-PORTAL-AUTH-WIRE-01.
   Does: Reads WO spec from bdc-xo (cross-repo via gh api). Verifies order_lines +
         shipping_queue + billing_statement_lines schema via Supabase REST (best-effort).
@@ -53,11 +53,11 @@ description: |
         separate PR for shopops-storefront (base: main). Runs Rule 19 docker exec grep
         to prove source is live in shopops-api container. Builds MIXED manifest.
         Flips Notion WO to REVIEW.
-  Repos: bluedevilcollectibles/shopops (primary, Archon CWD = shopops repo root,
-         shopops-api/ is a subdir) + bluedevilcollectibles/shopops-storefront (cloned
+  Repos: thinmansoftware/shopops (primary, Archon CWD = shopops repo root,
+         shopops-api/ is a subdir) + thinmansoftware/shopops-storefront (cloned
          to /tmp/storefront-work in the bash nodes).
-         WO spec lives in bluedevilcollectibles/bdc-xo.
-  parallel_ok: false — touches 2 repos, serial only.
+         WO spec lives in thinmansoftware/bdc-xo.
+  parallel_ok: false -- touches 2 repos, serial only.
   NOT for: any other WO.
 
 policyFile: harness/policies/agent-behavior.md
@@ -66,7 +66,7 @@ model: sonnet
 nodes:
 
   # ---------------------------------------------------------------------------
-  # 1. READ-SPEC — fetch WO spec + behavior spec from bdc-xo (cross-repo)
+  # 1. READ-SPEC -- fetch WO spec + behavior spec from bdc-xo (cross-repo)
   #    Rule 5: tries direct path first, then date-prefix glob fallback.
   # ---------------------------------------------------------------------------
   - id: read-spec
@@ -76,18 +76,18 @@ nodes:
 
       # Primary path: docs/work-orders/<WO_ID>.md (gh --template, no jq dependency)
       SPEC_CONTENT=$(gh api \
-        "repos/bluedevilcollectibles/bdc-xo/contents/docs/work-orders/${WO_ID}.md?ref=main" \
+        "repos/thinmansoftware/bdc-xo/contents/docs/work-orders/${WO_ID}.md?ref=main" \
         --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
 
       # Fallback: glob docs/superpowers/specs/*<WO_ID>*.md (Rule 5)
       if [ -z "$SPEC_CONTENT" ]; then
         GLOB_PATH=$(gh api \
-          "repos/bluedevilcollectibles/bdc-xo/contents/docs/superpowers/specs?ref=main" \
+          "repos/thinmansoftware/bdc-xo/contents/docs/superpowers/specs?ref=main" \
           --template '{{range .}}{{.path}}{{"\n"}}{{end}}' 2>/dev/null \
           | grep "${WO_ID}.md$" | head -1 || true)
         if [ -n "$GLOB_PATH" ]; then
           SPEC_CONTENT=$(gh api \
-            "repos/bluedevilcollectibles/bdc-xo/contents/${GLOB_PATH}?ref=main" \
+            "repos/thinmansoftware/bdc-xo/contents/${GLOB_PATH}?ref=main" \
             --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
         fi
       fi
@@ -96,12 +96,12 @@ nodes:
         # Fallback 4: GitHub issue body (WO-HARNESS-READ-SPEC-ISSUE-BODY-FALLBACK-01)
         ISSUE_NUM=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'issue=[0-9]+' | head -n 1 | cut -d= -f2 || true)
         if [ -z "$ISSUE_NUM" ]; then
-          ISSUE_NUM=$(gh issue list --repo bluedevilcollectibles/bdc-xo \
+          ISSUE_NUM=$(gh issue list --repo thinmansoftware/bdc-xo \
             --search "${WO_ID} in:title" --json number,title \
             --jq '.[0].number' 2>/dev/null || true)
         fi
         if [ -n "$ISSUE_NUM" ] && [ "$ISSUE_NUM" != "null" ]; then
-          SPEC_CONTENT=$(gh issue view "$ISSUE_NUM" --repo bluedevilcollectibles/bdc-xo \
+          SPEC_CONTENT=$(gh issue view "$ISSUE_NUM" --repo thinmansoftware/bdc-xo \
             --json body --jq .body 2>/dev/null || true)
           [ -n "$SPEC_CONTENT" ] && SPEC_PATH="issues/${ISSUE_NUM}"
         fi
@@ -110,30 +110,30 @@ nodes:
 
       # Fetch behavior spec section for status vocab reference
       BEHAVIOR_SPEC=$(gh api \
-        "repos/bluedevilcollectibles/bdc-xo/contents/docs/behavior-specs/COMMERCE_CHANNEL_SPINE_BEHAVIOR.md?ref=main" \
+        "repos/thinmansoftware/bdc-xo/contents/docs/behavior-specs/COMMERCE_CHANNEL_SPINE_BEHAVIOR.md?ref=main" \
         --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
 
       printf 'WO_ID=%s\nSPEC_PATH=bdc-xo:docs/work-orders/%s.md\nWORKFLOW_ID=%s\n\n' \
         "$WO_ID" "$WO_ID" "$WORKFLOW_ID"
       printf -- '--- SPEC ---\n%s\n\n' "$SPEC_CONTENT"
-      printf -- '--- BEHAVIOR SPEC (§6+§7 context) ---\n%s\n' "$BEHAVIOR_SPEC"
+      printf -- '--- BEHAVIOR SPEC (Section 6+Section 7 context) ---\n%s\n' "$BEHAVIOR_SPEC"
 
   # ---------------------------------------------------------------------------
-  # 2. SCHEMA-VERIFY — confirm order_lines + shipping_queue + billing table
-  #    columns via Supabase REST BEFORE writing any query (Rule 17 + WO §9).
+  # 2. SCHEMA-VERIFY -- confirm order_lines + shipping_queue + billing table
+  #    columns via Supabase REST BEFORE writing any query (Rule 17 + WO Section 9).
   #    Best-effort: Supabase can legitimately 401/429/503.
   # ---------------------------------------------------------------------------
   - id: schema-verify
     depends_on: [read-spec]
     bash: |
-      # set -e DELIBERATELY OMITTED — best-effort step per doctrine wrapper
+      # set -e DELIBERATELY OMITTED -- best-effort step per doctrine wrapper
       SUPABASE_URL="${SUPABASE_URL:-}"
       SUPABASE_SERVICE_KEY="${SUPABASE_SERVICE_KEY:-}"
 
       if [ -z "$SUPABASE_URL" ] || [ -z "$SUPABASE_SERVICE_KEY" ]; then
         echo "STATUS=skipped_no_env"
         echo "DETAIL=SUPABASE_URL or SUPABASE_SERVICE_KEY not set in Archon env."
-        echo "Operator must verify schema manually before deploy using WO §9 queries."
+        echo "Operator must verify schema manually before deploy using WO Section 9 queries."
         exit 0
       fi
 
@@ -158,7 +158,7 @@ nodes:
       check_table_columns "billing_statements"
       check_table_columns "billing_statement_lines"
 
-      # Check for DELIVERED column that must NOT be added (WO §7 rule)
+      # Check for DELIVERED column that must NOT be added (WO Section 7 rule)
       DELIVERED_CHECK=$(curl -sf \
         "${SUPABASE_URL}/rest/v1/information_schema.columns?table_name=eq.orders&column_name=eq.delivered&select=column_name" \
         -H "apikey: ${SUPABASE_SERVICE_KEY}" \
@@ -175,7 +175,7 @@ nodes:
       exit 0
 
   # ---------------------------------------------------------------------------
-  # 3. PLAN — architect both sides of the split-repo implementation
+  # 3. PLAN -- architect both sides of the split-repo implementation
   # ---------------------------------------------------------------------------
   - id: plan
     depends_on: [read-spec, schema-verify]
@@ -188,26 +188,26 @@ nodes:
 
       ## Required Output (Markdown, exact headings)
 
-      ### shopops-api (repo: bluedevilcollectibles/shopops, subdir: shopops-api/)
+      ### shopops-api (repo: thinmansoftware/shopops, subdir: shopops-api/)
       - File to modify: shopops-api/routes/storefront-portal-data.js
       - Existing routes NOT to touch: GET /purchases (lines 312-326), GET /statements (lines 77-95), GET /statements/:id (lines 101-126)
       - New routes to add (all behind requirePortalAuth middleware, already applied router-wide):
-        - GET /me/orders — enriched orders list: joins orders + order_lines + shipping_queue
+        - GET /me/orders -- enriched orders list: joins orders + order_lines + shipping_queue
           WHERE customer_id = req.customerId AND tenant_id = req.tenantId.
           Status mapping: SOLD->PENDING, PAID->PROCESSING,
           SHIPPED + shipping_queue.tracking_number IS NOT NULL -> DELIVERED,
           SHIPPED without tracking -> SHIPPED, CANCELLED->CANCELLED, REFUNDED->REFUNDED.
           Response shape: { ok: true, orders: [...], total: N }
-        - GET /me/orders/:id — single order by id, same joins + status mapping.
+        - GET /me/orders/:id -- single order by id, same joins + status mapping.
           Returns 404 if order not found or belongs to different customer/tenant.
           Response shape: { ok: true, order: { ... with order_lines array } }
-        - GET /me/statements — statements list: SELECT from billing_statements
+        - GET /me/statements -- statements list: SELECT from billing_statements
           WHERE customer_id = req.customerId AND tenant_id = req.tenantId.
           VOID rows are filtered out (never returned).
           Status mapping: DRAFT/APPROVED/GENERATED->PENDING, SENT/PARTIAL->OUTSTANDING,
-          PAID->SETTLED. (Read COMMERCE_CHANNEL_SPINE_BEHAVIOR.md §7 for exact mapping.)
+          PAID->SETTLED. (Read COMMERCE_CHANNEL_SPINE_BEHAVIOR.md Section 7 for exact mapping.)
           Response shape: { ok: true, statements: [...], total: N }
-        - GET /me/statements/:id — single statement with line_items array from
+        - GET /me/statements/:id -- single statement with line_items array from
           billing_statement_lines. Returns 404 if not found or wrong customer/tenant.
           Response shape: { ok: true, statement: { ...with line_items array } }
       - Status vocab: SOLD/PAID/DRAFT/APPROVED/GENERATED/SENT/PARTIAL must NOT appear in any
@@ -221,11 +221,11 @@ nodes:
           c. GET /me/statements VOID rows are absent
           d. GET /me/orders/:id DELIVERED derivation: SHIPPED + tracking_number -> DELIVERED
           e. GET /me/statements/:id returns line_items array
-      - Commit message: "feat(api): WO-STOREFRONT-PORTAL-AUTH-WIRE-01 — /me/orders + /me/statements portal routes"
+      - Commit message: "feat(api): WO-STOREFRONT-PORTAL-AUTH-WIRE-01 -- /me/orders + /me/statements portal routes"
       - Branch: wo/storefront-portal-auth-wire-01 (off master)
       - PR base: master
 
-      ### shopops-storefront (repo: bluedevilcollectibles/shopops-storefront)
+      ### shopops-storefront (repo: thinmansoftware/shopops-storefront)
       - File to modify: lib/storefront-api.ts
       - Change: fetchOrders(), fetchOrder(), fetchStatements(), fetchStatement() already call
         the correct /storefront/portal/me/* URLs. Add portal_jwt cookie forwarding so the
@@ -233,14 +233,14 @@ nodes:
       - Pattern: import { cookies } from 'next/headers'. In each function, call
         cookies().get('portal_jwt')?.value and add it as a Cookie header.
         Use conditional: if token exists, add header; if absent, proceed without (seed mode).
-        Do NOT break STOREFRONT_DATA_SOURCE=seed path — seed path must skip the API call entirely.
+        Do NOT break STOREFRONT_DATA_SOURCE=seed path -- seed path must skip the API call entirely.
       - Test file: __tests__/lib/storefront-api.test.ts (or existing test pattern in repo)
         Minimum 4 tests:
           a. fetchOrders() includes Cookie header when portal_jwt cookie is present
           b. fetchOrders() does NOT call SHOPOPS_API_URL when STOREFRONT_DATA_SOURCE=seed
           c. fetchStatements() includes portal_jwt in Cookie header
           d. fetchStatement() returns seed data correctly when seed mode active
-      - Commit message: "feat(storefront): WO-STOREFRONT-PORTAL-AUTH-WIRE-01 — portal_jwt cookie forwarding in storefront-api"
+      - Commit message: "feat(storefront): WO-STOREFRONT-PORTAL-AUTH-WIRE-01 -- portal_jwt cookie forwarding in storefront-api"
       - Branch: wo/storefront-portal-auth-wire-01 (off main)
       - PR base: main (verify storefront default branch before firing)
 
@@ -251,7 +251,7 @@ nodes:
       $read-spec.output
 
   # ---------------------------------------------------------------------------
-  # 4. IMPLEMENT-API — write /me/* routes in shopops-api/routes/storefront-portal-data.js
+  # 4. IMPLEMENT-API -- write /me/* routes in shopops-api/routes/storefront-portal-data.js
   #    CWD is shopops repo root. shopops-api/ is the subdir.
   # ---------------------------------------------------------------------------
   - id: implement-api
@@ -276,7 +276,7 @@ nodes:
         1. Read shopops-api/routes/storefront-portal-data.js in full before making any edits.
            Understand the existing router setup and requirePortalAuth middleware placement.
            Do NOT touch GET /purchases, GET /statements, GET /statements/:id.
-           The router already has requirePortalAuth applied router-wide — new /me/* routes
+           The router already has requirePortalAuth applied router-wide -- new /me/* routes
            inherit it automatically.
 
         2. Read shopops-api/middleware/requirePortalAuth.js to confirm it sets
@@ -284,8 +284,8 @@ nodes:
 
         3. BEFORE writing the SQL queries, output the schema-verify columns for
            order_lines and shipping_queue from the plan context. If schema-verify
-           was skipped (no Supabase env), use the known columns from WO §9 and
-           add a comment "// columns verified manually per WO §9 audit 2026-05-13".
+           was skipped (no Supabase env), use the known columns from WO Section 9 and
+           add a comment "// columns verified manually per WO Section 9 audit 2026-05-13".
 
         4. Add these four routes to shopops-api/routes/storefront-portal-data.js:
 
@@ -298,7 +298,7 @@ nodes:
                 WHERE orders.customer_id = req.customerId
                   AND orders.tenant_id = req.tenantId
                 ORDER BY orders.created_at DESC
-              - Map each row with mapOrderStatus() — implement this helper function
+              - Map each row with mapOrderStatus() -- implement this helper function
               - Return { ok: true, orders: mappedRows, total: mappedRows.length }
 
            b. GET /me/orders/:id
@@ -317,7 +317,7 @@ nodes:
                   AND tenant_id = req.tenantId
                   AND status != 'VOID'
                 ORDER BY period_end DESC
-              - Map each row with mapStatementStatus() — implement this helper
+              - Map each row with mapStatementStatus() -- implement this helper
               - Return { ok: true, statements: mappedRows, total: mappedRows.length }
 
            d. GET /me/statements/:id
@@ -376,7 +376,7 @@ nodes:
             appears in any /me/* response path
 
   # ---------------------------------------------------------------------------
-  # 5a. SETUP-STOREFRONT-CLONE — bash clone of storefront repo.
+  # 5a. SETUP-STOREFRONT-CLONE -- bash clone of storefront repo.
   #     Runs after plan so both impl nodes can start without blocking each other.
   # ---------------------------------------------------------------------------
   - id: setup-storefront-clone
@@ -400,13 +400,13 @@ nodes:
         exit 0
       fi
 
-      git clone "https://github.com/bluedevilcollectibles/shopops-storefront.git" \
+      git clone "https://github.com/thinmansoftware/shopops-storefront.git" \
         "$STOREFRONT_DIR" --depth=50
       echo "STOREFRONT_DIR=${STOREFRONT_DIR}"
       echo "STATUS=fresh_clone"
 
   # ---------------------------------------------------------------------------
-  # 5b. IMPLEMENT-STOREFRONT — wire cookie forwarding in shopops-storefront
+  # 5b. IMPLEMENT-STOREFRONT -- wire cookie forwarding in shopops-storefront
   #     Depends on setup-storefront-clone for the /tmp clone.
   # ---------------------------------------------------------------------------
   - id: implement-storefront
@@ -445,11 +445,11 @@ nodes:
 
         4. The seed guard MUST remain intact. Pattern:
            if (process.env.STOREFRONT_DATA_SOURCE === 'seed') {
-             return loadSeedData(...)  // existing seed path — NO HTTP call
+             return loadSeedData(...)  // existing seed path -- NO HTTP call
            }
            // real API path with cookie forwarding follows
 
-        5. Do NOT change the URL paths. They already call /storefront/portal/me/orders — correct.
+        5. Do NOT change the URL paths. They already call /storefront/portal/me/orders -- correct.
 
         6. Create or update __tests__/lib/storefront-api.test.ts (check if test file
            exists first under /tmp/storefront-work-$WORKFLOW_ID; if the project uses
@@ -472,7 +472,7 @@ nodes:
           - No URL changes to /storefront/portal/me/* paths
 
   # ---------------------------------------------------------------------------
-  # 6. VERIFY-GREP-API — structural assertions on the shopops-api side
+  # 6. VERIFY-GREP-API -- structural assertions on the shopops-api side
   # ---------------------------------------------------------------------------
   - id: verify-grep-api
     depends_on: [implement-api]
@@ -482,13 +482,13 @@ nodes:
 
       ROUTES_FILE="shopops-api/routes/storefront-portal-data.js"
 
-      # New /me/* routes present — separate greps (multi-line safe per doctrine)
+      # New /me/* routes present -- separate greps (multi-line safe per doctrine)
       grep -q "me/orders" "$ROUTES_FILE" \
         || (echo "FAIL: /me/orders route missing from storefront-portal-data.js" >&2; exit 1)
       grep -q "me/statements" "$ROUTES_FILE" \
         || (echo "FAIL: /me/statements route missing from storefront-portal-data.js" >&2; exit 1)
 
-      # Count /me/orders occurrences — expect >= 2 (list + detail)
+      # Count /me/orders occurrences -- expect >= 2 (list + detail)
       ME_ORDERS_COUNT=$(grep -c "me/orders" "$ROUTES_FILE" || echo 0)
       echo "me/orders occurrences: $ME_ORDERS_COUNT"
       if [ "$ME_ORDERS_COUNT" -lt 2 ]; then
@@ -496,7 +496,7 @@ nodes:
         exit 1
       fi
 
-      # Count /me/statements occurrences — expect >= 2 (list + detail)
+      # Count /me/statements occurrences -- expect >= 2 (list + detail)
       ME_STATEMENTS_COUNT=$(grep -c "me/statements" "$ROUTES_FILE" || echo 0)
       echo "me/statements occurrences: $ME_STATEMENTS_COUNT"
       if [ "$ME_STATEMENTS_COUNT" -lt 2 ]; then
@@ -504,7 +504,7 @@ nodes:
         exit 1
       fi
 
-      # Status mapping helpers present — separate greps
+      # Status mapping helpers present -- separate greps
       grep -q "mapOrderStatus" "$ROUTES_FILE" \
         || (echo "FAIL: mapOrderStatus missing from routes file" >&2; exit 1)
       grep -q "mapStatementStatus" "$ROUTES_FILE" \
@@ -518,9 +518,9 @@ nodes:
       grep -q "VOID" "$ROUTES_FILE" \
         || (echo "FAIL: VOID filter reference missing from routes file" >&2; exit 1)
 
-      # Legacy routes preserved — separate greps
+      # Legacy routes preserved -- separate greps
       grep -q "purchases" "$ROUTES_FILE" \
-        || (echo "FAIL: GET /purchases was removed — must be preserved" >&2; exit 1)
+        || (echo "FAIL: GET /purchases was removed -- must be preserved" >&2; exit 1)
 
       # Test file exists with sufficient tests
       TEST_FILE="shopops-api/tests/test_storefront_portal_me_routes.js"
@@ -535,7 +535,7 @@ nodes:
       echo "=== all shopops-api grep assertions passed ==="
 
   # ---------------------------------------------------------------------------
-  # 7. VERIFY-GREP-STOREFRONT — structural assertions on the storefront side
+  # 7. VERIFY-GREP-STOREFRONT -- structural assertions on the storefront side
   # ---------------------------------------------------------------------------
   - id: verify-grep-storefront
     depends_on: [implement-storefront]
@@ -567,7 +567,7 @@ nodes:
       grep -q "STOREFRONT_DATA_SOURCE" "$STOREFRONT_API" \
         || (echo "FAIL: seed path guard missing from storefront-api.ts" >&2; exit 1)
 
-      # Test file exists — check common test paths
+      # Test file exists -- check common test paths
       TEST_FOUND=0
       for TEST_PATH in \
         "$STOREFRONT_DIR/__tests__/lib/storefront-api.test.ts" \
@@ -575,7 +575,7 @@ nodes:
         "$STOREFRONT_DIR/__tests__/storefront-api.test.ts"; do
         if [ -f "$TEST_PATH" ]; then
           TEST_COUNT=$(grep -c "it(\|test(" "$TEST_PATH" || echo 0)
-          echo "Test file: $TEST_PATH — $TEST_COUNT tests"
+          echo "Test file: $TEST_PATH -- $TEST_COUNT tests"
           if [ "$TEST_COUNT" -ge 4 ]; then
             TEST_FOUND=1
             break
@@ -590,7 +590,7 @@ nodes:
       echo "=== all storefront grep assertions passed ==="
 
   # ---------------------------------------------------------------------------
-  # 8. VERIFY-TESTS-API — run bun test suite for shopops-api side
+  # 8. VERIFY-TESTS-API -- run bun test suite for shopops-api side
   # ---------------------------------------------------------------------------
   - id: verify-tests-api
     depends_on: [implement-api]
@@ -607,7 +607,7 @@ nodes:
       fi
 
   # ---------------------------------------------------------------------------
-  # 9. VERIFY-TESTS-STOREFRONT — run bun test suite for storefront side
+  # 9. VERIFY-TESTS-STOREFRONT -- run bun test suite for storefront side
   # ---------------------------------------------------------------------------
   - id: verify-tests-storefront
     depends_on: [implement-storefront]
@@ -627,7 +627,7 @@ nodes:
       fi
 
   # ---------------------------------------------------------------------------
-  # 10. COMMIT-AND-PUSH-API — idempotent checkout + commit + push for shopops
+  # 10. COMMIT-AND-PUSH-API -- idempotent checkout + commit + push for shopops
   # ---------------------------------------------------------------------------
   - id: commit-and-push-api
     depends_on: [verify-grep-api, verify-tests-api]
@@ -651,7 +651,7 @@ nodes:
         echo "No staged changes; branch already contains requested work"
       else
         git -c user.name="John Ranson" -c user.email="admin@bluedevilcollectibles.com" \
-          commit -m "$(printf 'feat(api): WO-STOREFRONT-PORTAL-AUTH-WIRE-01 — /me/orders + /me/statements portal routes\n\nAdds four /me/* routes to routes/storefront-portal-data.js behind existing\nrequirePortalAuth middleware (req.customerId + req.tenantId already set):\n  GET /me/orders          — enriched orders list (joins shipping_queue for DELIVERED derivation)\n  GET /me/orders/:id      — single order with line_items, 404 on wrong customer/tenant\n  GET /me/statements      — statements list (VOID filtered, status vocab mapped)\n  GET /me/statements/:id  — statement with line_items array from billing_statement_lines\n\nStatus vocabulary mapping (backend vocab never leaks to portal):\n  SOLD -> PENDING, PAID -> PROCESSING\n  SHIPPED + tracking_number IS NOT NULL -> DELIVERED, SHIPPED (no tracking) -> SHIPPED\n  DRAFT/APPROVED/GENERATED -> PENDING, SENT/PARTIAL -> OUTSTANDING, PAID -> SETTLED\n  VOID rows filtered at query level\n\nDELIVERED is derived (shipping_queue.status='\''SHIPPED'\'' AND tracking_number IS NOT NULL).\nNo new column added to orders table.\n\nExisting GET /purchases and GET /statements preserved unchanged.\nAdds tests/test_storefront_portal_me_routes.js — 5+ bun tests.\n\nBlocks: WO-STOREFRONT-COMMERCE-SPINE-01\n\nCo-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>')"
+          commit -m "$(printf 'feat(api): WO-STOREFRONT-PORTAL-AUTH-WIRE-01 -- /me/orders + /me/statements portal routes\n\nAdds four /me/* routes to routes/storefront-portal-data.js behind existing\nrequirePortalAuth middleware (req.customerId + req.tenantId already set):\n  GET /me/orders          -- enriched orders list (joins shipping_queue for DELIVERED derivation)\n  GET /me/orders/:id      -- single order with line_items, 404 on wrong customer/tenant\n  GET /me/statements      -- statements list (VOID filtered, status vocab mapped)\n  GET /me/statements/:id  -- statement with line_items array from billing_statement_lines\n\nStatus vocabulary mapping (backend vocab never leaks to portal):\n  SOLD -> PENDING, PAID -> PROCESSING\n  SHIPPED + tracking_number IS NOT NULL -> DELIVERED, SHIPPED (no tracking) -> SHIPPED\n  DRAFT/APPROVED/GENERATED -> PENDING, SENT/PARTIAL -> OUTSTANDING, PAID -> SETTLED\n  VOID rows filtered at query level\n\nDELIVERED is derived (shipping_queue.status='\''SHIPPED'\'' AND tracking_number IS NOT NULL).\nNo new column added to orders table.\n\nExisting GET /purchases and GET /statements preserved unchanged.\nAdds tests/test_storefront_portal_me_routes.js -- 5+ bun tests.\n\nBlocks: WO-STOREFRONT-COMMERCE-SPINE-01\n\nCo-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>')"
       fi
 
       git push -u origin "$BRANCH"
@@ -659,7 +659,7 @@ nodes:
       echo "BRANCH_SHA=$(git rev-parse HEAD)"
 
   # ---------------------------------------------------------------------------
-  # 11. COMMIT-AND-PUSH-STOREFRONT — commit + push inside /tmp/storefront-work
+  # 11. COMMIT-AND-PUSH-STOREFRONT -- commit + push inside /tmp/storefront-work
   # ---------------------------------------------------------------------------
   - id: commit-and-push-storefront
     depends_on: [verify-grep-storefront, verify-tests-storefront]
@@ -691,7 +691,7 @@ nodes:
         echo "No staged changes; branch already contains requested work"
       else
         git -c user.name="John Ranson" -c user.email="admin@bluedevilcollectibles.com" \
-          commit -m "$(printf 'feat(storefront): WO-STOREFRONT-PORTAL-AUTH-WIRE-01 — portal_jwt cookie forwarding\n\nWires portal_jwt cookie forwarding in lib/storefront-api.ts so Next.js server\ncomponents forward the httpOnly portal_jwt cookie when calling shopops-api.\n\nPattern: cookies() from next/headers; conditional Cookie header injection.\nSeed path guard preserved — STOREFRONT_DATA_SOURCE=seed skips API calls entirely.\nURL paths unchanged (already correct: /storefront/portal/me/orders etc).\n\nAdds __tests__/lib/storefront-api.test.ts — 4+ tests covering:\n  cookie forwarding when portal_jwt present, seed bypass, header injection.\n\nCo-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>')"
+          commit -m "$(printf 'feat(storefront): WO-STOREFRONT-PORTAL-AUTH-WIRE-01 -- portal_jwt cookie forwarding\n\nWires portal_jwt cookie forwarding in lib/storefront-api.ts so Next.js server\ncomponents forward the httpOnly portal_jwt cookie when calling shopops-api.\n\nPattern: cookies() from next/headers; conditional Cookie header injection.\nSeed path guard preserved -- STOREFRONT_DATA_SOURCE=seed skips API calls entirely.\nURL paths unchanged (already correct: /storefront/portal/me/orders etc).\n\nAdds __tests__/lib/storefront-api.test.ts -- 4+ tests covering:\n  cookie forwarding when portal_jwt present, seed bypass, header injection.\n\nCo-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>')"
       fi
 
       git push -u origin "$BRANCH"
@@ -699,7 +699,7 @@ nodes:
       echo "STOREFRONT_BRANCH_SHA=$(git rev-parse HEAD)"
 
   # ---------------------------------------------------------------------------
-  # 12. OPEN-PR-API — idempotent PR for shopops-api side (base: master)
+  # 12. OPEN-PR-API -- idempotent PR for shopops-api side (base: master)
   # ---------------------------------------------------------------------------
   - id: open-pr-api
     depends_on: [commit-and-push-api]
@@ -707,9 +707,9 @@ nodes:
       set -euo pipefail
       # Read branch from current HEAD (commit-and-push-api set the unique run-suffixed branch in shopops CWD)
       BRANCH="$(git rev-parse --abbrev-ref HEAD)"
-      REPO="bluedevilcollectibles/shopops"
+      REPO="thinmansoftware/shopops"
       BASE="master"
-      TITLE="feat(api): WO-STOREFRONT-PORTAL-AUTH-WIRE-01 — /me/orders + /me/statements portal routes"
+      TITLE="feat(api): WO-STOREFRONT-PORTAL-AUTH-WIRE-01 -- /me/orders + /me/statements portal routes"
 
       BODY_FILE=$(mktemp)
       {
@@ -720,10 +720,10 @@ nodes:
         echo "so the storefront server components can fetch real customer data."
         echo ""
         echo "## New Routes"
-        echo "- \`GET /me/orders\` — enriched list with DELIVERED derivation"
-        echo "- \`GET /me/orders/:id\` — single order with line_items"
-        echo "- \`GET /me/statements\` — VOID filtered, status vocab mapped"
-        echo "- \`GET /me/statements/:id\` — with billing_statement_lines"
+        echo "- \`GET /me/orders\` -- enriched list with DELIVERED derivation"
+        echo "- \`GET /me/orders/:id\` -- single order with line_items"
+        echo "- \`GET /me/statements\` -- VOID filtered, status vocab mapped"
+        echo "- \`GET /me/statements/:id\` -- with billing_statement_lines"
         echo ""
         echo "## Status Vocab Mapping"
         echo "- SOLD -> PENDING, PAID -> PROCESSING"
@@ -732,9 +732,9 @@ nodes:
         echo "- VOID filtered at query level (never returned)"
         echo ""
         echo "## Preserved"
-        echo "- \`GET /purchases\` — unchanged"
-        echo "- \`GET /statements\` — unchanged"
-        echo "- \`GET /statements/:id\` — unchanged"
+        echo "- \`GET /purchases\` -- unchanged"
+        echo "- \`GET /statements\` -- unchanged"
+        echo "- \`GET /statements/:id\` -- unchanged"
         echo ""
         echo "## Files"
         echo "- Modified: \`shopops-api/routes/storefront-portal-data.js\`"
@@ -782,19 +782,19 @@ nodes:
       exit 1
 
   # ---------------------------------------------------------------------------
-  # 13. OPEN-PR-STOREFRONT — idempotent PR for shopops-storefront (base: main)
+  # 13. OPEN-PR-STOREFRONT -- idempotent PR for shopops-storefront (base: main)
   # ---------------------------------------------------------------------------
   - id: open-pr-storefront
     depends_on: [commit-and-push-storefront]
     bash: |
       set -euo pipefail
-      # The storefront branch lives in the /tmp clone — read from there.
+      # The storefront branch lives in the /tmp clone -- read from there.
       STOREFRONT_DIR="/tmp/storefront-work-$WORKFLOW_ID"
       cd "$STOREFRONT_DIR"
       BRANCH="$(git rev-parse --abbrev-ref HEAD)"
-      REPO="bluedevilcollectibles/shopops-storefront"
+      REPO="thinmansoftware/shopops-storefront"
       BASE="main"
-      TITLE="feat(storefront): WO-STOREFRONT-PORTAL-AUTH-WIRE-01 — portal_jwt cookie forwarding"
+      TITLE="feat(storefront): WO-STOREFRONT-PORTAL-AUTH-WIRE-01 -- portal_jwt cookie forwarding"
 
       BODY_FILE=$(mktemp)
       {
@@ -852,13 +852,13 @@ nodes:
       exit 1
 
   # ---------------------------------------------------------------------------
-  # 14. RUNTIME-VERIFY — Rule 19: docker exec grep proves source live in
-  #     shopops-api container. Best-effort — container not rebuilt at PR-open time.
+  # 14. RUNTIME-VERIFY -- Rule 19: docker exec grep proves source live in
+  #     shopops-api container. Best-effort -- container not rebuilt at PR-open time.
   # ---------------------------------------------------------------------------
   - id: runtime-verify
     depends_on: [open-pr-api, open-pr-storefront]
     bash: |
-      # set -e DELIBERATELY OMITTED — best-effort step (Rule 19)
+      # set -e DELIBERATELY OMITTED -- best-effort step (Rule 19)
       RESULT=$(docker exec shopops-api grep -n "me/orders" /app/routes/storefront-portal-data.js 2>&1)
       EXIT=$?
       if [ $EXIT -eq 0 ]; then
@@ -887,14 +887,14 @@ nodes:
       exit 0
 
   # ---------------------------------------------------------------------------
-  # 15. BUILD-MANIFEST — MIXED class manifest (CODE in 2 repos + Rule 19 infra)
+  # 15. BUILD-MANIFEST -- MIXED class manifest (CODE in 2 repos + Rule 19 infra)
   # ---------------------------------------------------------------------------
   - id: build-manifest
     depends_on: [runtime-verify]
     task_class: clerical
     prompt: |
       Build the Captain CI manifest v2 for WO-STOREFRONT-PORTAL-AUTH-WIRE-01.
-      Class: MIXED — requires CODE evidence (grep assertions, both repos) AND
+      Class: MIXED -- requires CODE evidence (grep assertions, both repos) AND
       INFRA evidence (Rule 19 runtime verification for shopops-api).
 
       ## Required Fields (manifest v2 format)
@@ -936,7 +936,7 @@ nodes:
 
       Runtime verification:
         Rule 19 (shopops-api): docker exec shopops-api grep -n 'me/orders' /app/routes/storefront-portal-data.js
-        [STATUS from runtime-verify.output — if PENDING REBUILD, note that]
+        [STATUS from runtime-verify.output -- if PENDING REBUILD, note that]
 
       Vercel deployment:
         shopops-storefront deploys to Vercel on PR merge.
@@ -961,36 +961,49 @@ nodes:
       $runtime-verify.output
 
   # ---------------------------------------------------------------------------
-  # 16. FLIP-NOTION — set Notes + Claude Status = REVIEW (Rule 7)
+  # 16. FLIP-NOTION -- set Notes + Claude Status = REVIEW (Rule 7)
   #     Notes PROPERTY, not a comment. Captain CI reads Notes.
   # ---------------------------------------------------------------------------
   - id: flip-notion
     depends_on: [build-manifest]
     task_class: clerical
-    prompt: |
-      Flip Notion WO-STOREFRONT-PORTAL-AUTH-WIRE-01 to REVIEW with the manifest
-      in the Notes PROPERTY (not as a page comment — Captain CI reads Notes, not comments).
+    bash: |
+      set -euo pipefail
 
-      # OPEN QUESTION (Q3): Notion page ID is NOT confirmed in this draft.
-      # Operator MUST replace 35fef4c9-ce00-811d-bf39-c4dc02a5bdc9 with the real UUID before firing.
-      # Find it: query Notion database a6df831c-0b52-449f-8ca4-d77be6b70d0a
-      # for title containing "WO-STOREFRONT-PORTAL-AUTH-WIRE-01".
-      Notion database ID: a6df831c-0b52-449f-8ca4-d77be6b70d0a
-      Notion page ID: 35fef4c9-ce00-811d-bf39-c4dc02a5bdc9
+      capture_node_output() {
+        python3 -c 'import shlex, sys; s=sys.stdin.read(); sys.stdout.write((lambda p: p[0] if len(p)==1 else s)(shlex.split(s)) if len(s)>=2 and s[0]=="'"'"'" and s.rstrip("\n").endswith("'"'"'") else s)'
+      }
 
-      Required Notion changes (single update call):
-      - Claude Status -> REVIEW
-      - Status -> Review
-      - Notes -> set to the manifest text from $build-manifest.output verbatim
-      - claimed_by: Major Build (Archon bdc-storefront-portal-auth-wire)
-      - claimed_at: 2026-05-13
-
-      After update, log the Notion page URL to run output for audit trail.
-
-      If Notion MCP is unavailable in this runtime, output:
-        XO_TODO: Flip WO-STOREFRONT-PORTAL-AUTH-WIRE-01 to REVIEW in Notion.
-                 Paste manifest from $build-manifest.output into Notes property.
-                 Set Claude Status = REVIEW, Status = Review.
-
-      ## Manifest
+      MANIFEST=$(capture_node_output <<'BDC_NODE_OUTPUT_MANIFEST'
       $build-manifest.output
+      BDC_NODE_OUTPUT_MANIFEST
+      )
+
+      READ_SPEC_OUT=$(capture_node_output <<'BDC_NODE_OUTPUT_READ_SPEC'
+      $read-spec.output
+      BDC_NODE_OUTPUT_READ_SPEC
+      )
+      ISSUE_REPO="${ISSUE_REPO:-thinmansoftware/bdc-xo}"
+      ISSUE_NUM=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'issue=[0-9]+' | head -1 | cut -d= -f2 || true)
+      if [ -z "$ISSUE_NUM" ]; then
+        ISSUE_NUM=$(printf '%s\n' "$READ_SPEC_OUT" | sed -n 's/^SPEC_PATH=.*issues\/\([0-9][0-9]*\).*/\1/p' | head -1)
+      fi
+      if [ -z "$ISSUE_NUM" ]; then
+        WO_ID_FROM_SPEC=$(printf '%s\n' "$READ_SPEC_OUT" | sed -n 's/^WO_ID=//p' | head -1)
+        if [ -n "$WO_ID_FROM_SPEC" ]; then
+          ISSUE_NUM=$(gh issue list --repo "$ISSUE_REPO" --search "$WO_ID_FROM_SPEC in:title" --json number --jq '.[0].number // empty' 2>/dev/null || true)
+        fi
+      fi
+      if [ -z "$ISSUE_NUM" ]; then
+        echo "flip-notion: no GitHub issue resolved; skipping status:review label + manifest comment."
+        exit 0
+      fi
+
+      gh label create status:review --repo "$ISSUE_REPO" --color 0E8A16 --description "BDC workflow is ready for review" 2>/dev/null || true
+      gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --remove-label status:building 2>/dev/null || true
+      gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --remove-label status:blocked 2>/dev/null || true
+      gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --add-label status:review
+      COMMENT_FILE=$(mktemp)
+      printf '%s\n' "$MANIFEST" > "$COMMENT_FILE"
+      gh issue comment "$ISSUE_NUM" --repo "$ISSUE_REPO" --body-file "$COMMENT_FILE"
+      echo "flip-notion: $ISSUE_REPO#$ISSUE_NUM -> status:review (manifest posted as comment)"

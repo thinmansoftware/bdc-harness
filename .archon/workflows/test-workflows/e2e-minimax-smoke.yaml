@@ -1,4 +1,4 @@
-# E2E smoke test — Minimax M2.7 via the Pi community provider
+# E2E smoke test -- Minimax M2.7 via the Pi community provider
 # Verifies: Pi can resolve and call Minimax M2.7 using the user's local
 #   `pi /login` credentials (api_key entry in ~/.pi/agent/auth.json).
 # Design: mirrors e2e-pi-smoke.yaml structure. Three nodes verify
@@ -13,23 +13,23 @@ description: |
   Triggers: "minimax smoke", "test minimax", "verify minimax", "minimax test".
   Does: Sends three tiny prompts to Minimax M2.7 (math, self-identification,
         structured JSON), asserts non-empty output and basic plausibility.
-  NOT for: Production work — connectivity / capability sanity check only.
+  NOT for: Production work -- connectivity / capability sanity check only.
 
 provider: pi
 model: minimax/MiniMax-M2.7
 
 worktree:
-  enabled: false # Smoke test — no need to isolate
+  enabled: false # Smoke test -- no need to isolate
 
 nodes:
-  # 1. Connectivity — does Pi resolve the model and stream a response?
+  # 1. Connectivity -- does Pi resolve the model and stream a response?
   - id: hello
     prompt: 'What is 2+2? Answer with just the number, nothing else.'
     allowed_tools: []
     effort: low
     idle_timeout: 60000
 
-  # 2. Self-identification — INFORMATIONAL ONLY. Do not assert on the result.
+  # 2. Self-identification -- INFORMATIONAL ONLY. Do not assert on the result.
   #    LLMs are unreliable narrators about their own identity, and Pi's system
   #    prompt mentions OpenAI-codex defaults, which causes Minimax (and likely
   #    other models) to pattern-match and claim that identity. The real proof
@@ -40,7 +40,7 @@ nodes:
     idle_timeout: 60000
     depends_on: [hello]
 
-  # 3. Structured output — exercises Pi's best-effort output_format path
+  # 3. Structured output -- exercises Pi's best-effort output_format path
   #    (schema appended to prompt + JSON extracted from result text).
   #    This is the same machinery the maintainer-standup synthesis relies on.
   - id: json
@@ -60,7 +60,7 @@ nodes:
           type: boolean
       required: [name, ok]
 
-  # 4. Assertions — fail loudly if any node returned empty / unparseable.
+  # 4. Assertions -- fail loudly if any node returned empty / unparseable.
   - id: assert
     depends_on: [hello, identify, json]
     bash: |
@@ -69,27 +69,27 @@ nodes:
       jname="$json.output.name"
       jok="$json.output.ok"
 
-      echo "── results ──"
+      echo "-- results --"
       echo "math      = $math"
       echo "identify  = $ident"
       echo "json.name = $jname"
       echo "json.ok   = $jok"
-      echo "──────────────"
+      echo "--------------"
 
       if [ -z "$math" ] || [ -z "$ident" ]; then
         echo "FAIL: empty output from hello or identify node"
         exit 1
       fi
       if [ -z "$jname" ] || [ -z "$jok" ]; then
-        echo "FAIL: structured-output fields missing — Pi best-effort JSON parse failed"
+        echo "FAIL: structured-output fields missing -- Pi best-effort JSON parse failed"
         exit 1
       fi
 
       # Real proof of routing: Pi writes a session jsonl per call. Find ALL
-      # session jsonls modified in the last 10 minutes (generous window —
+      # session jsonls modified in the last 10 minutes (generous window --
       # smoke's three Pi nodes + assert can collectively take several
       # minutes on a slow network; capped at 10 to avoid matching old runs).
-      # Check each for the minimax routing signal — any one matching is
+      # Check each for the minimax routing signal -- any one matching is
       # sufficient evidence. This avoids:
       #   - brittle path-encoding assumptions about Pi's per-cwd session dir,
       #   - non-deterministic `head -1` over `find` output (find doesn't
@@ -104,7 +104,7 @@ nodes:
 
       matched=""
       while IFS= read -r session; do
-        # Two separate greps for order-independence — JSON field ordering
+        # Two separate greps for order-independence -- JSON field ordering
         # isn't part of Pi's contract, so a single regex with `.*` between
         # the two fields would silently false-FAIL if Pi ever reorders.
         if grep -q '"provider":"minimax"' "$session" \
@@ -118,7 +118,7 @@ nodes:
         echo "PASS: Pi session log confirms provider=minimax, modelId=MiniMax-M2.7"
         echo "      session: $matched"
       else
-        echo "FAIL: no recent Pi session log confirmed minimax routing — possible misroute"
+        echo "FAIL: no recent Pi session log confirmed minimax routing -- possible misroute"
         echo "      checked sessions:"
         echo "$recent_sessions" | sed 's/^/        /'
         exit 1

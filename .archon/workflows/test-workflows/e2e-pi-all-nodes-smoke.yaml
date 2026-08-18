@@ -1,8 +1,8 @@
-# E2E smoke test — Pi provider, every node type
+# E2E smoke test -- Pi provider, every node type
 # Covers: prompt, command, loop (AI node types) + bash, script bun/uv
 #   (deterministic node types) + depends_on / when / trigger_rule / $nodeId.output
 #   (DAG features).
-# Skipped: `approval:` — pauses for human input, incompatible with CI.
+# Skipped: `approval:` -- pauses for human input, incompatible with CI.
 # Auth: ANTHROPIC_API_KEY (CI) or your local `pi /login` OAuth.
 # Expected runtime: ~10s on haiku (3 AI round-trips + deterministic nodes).
 name: e2e-pi-all-nodes-smoke
@@ -11,7 +11,7 @@ provider: pi
 model: anthropic/claude-haiku-4-5
 
 nodes:
-  # ─── AI node types ──────────────────────────────────────────────────────
+  # --- AI node types ------------------------------------------------------
 
   # 1. prompt: inline prompt (simplest AI node)
   - id: prompt-node
@@ -38,7 +38,7 @@ nodes:
     effort: low
     idle_timeout: 60000
 
-  # ─── Deterministic node types (no AI) ───────────────────────────────────
+  # --- Deterministic node types (no AI) -----------------------------------
 
   # 4. bash: shell script with JSON output (enables $nodeId.output.status
   #    dot-access downstream)
@@ -57,7 +57,7 @@ nodes:
     runtime: uv
     timeout: 30000
 
-  # ─── DAG features ───────────────────────────────────────────────────────
+  # --- DAG features -------------------------------------------------------
 
   # 7. depends_on + $nodeId.output substitution
   - id: downstream
@@ -76,7 +76,7 @@ nodes:
     depends_on: [downstream, gated, script-bun-node, script-python-node]
     trigger_rule: all_success
 
-  # ─── Final assertion ────────────────────────────────────────────────────
+  # --- Final assertion ----------------------------------------------------
 
   # 10. Verify every upstream node produced non-empty output.
   - id: assert

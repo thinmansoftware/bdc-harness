@@ -1,6 +1,6 @@
 name: maintainer-standup
 description: |
-  Use when: Maintainer wants their morning briefing — what changed on dev,
+  Use when: Maintainer wants their morning briefing -- what changed on dev,
   what's in the review queue, what to focus on today across PRs and issues.
   Triggers: "morning standup", "maintainer standup", "what's new today",
             "daily brief", "morning brief", "what should i work on today",
@@ -18,10 +18,10 @@ provider: claude
 model: sonnet
 
 worktree:
-  enabled: false   # Live checkout — needs to git pull and read .archon/maintainer-standup/
+  enabled: false   # Live checkout -- needs to git pull and read .archon/maintainer-standup/
 
 nodes:
-  # ── Layer 0: gather facts in parallel ──
+  # -- Layer 0: gather facts in parallel --
 
   - id: git-status
     script: maintainer-standup-git-status
@@ -38,13 +38,13 @@ nodes:
     runtime: bun
     timeout: 10000
 
-  # ── Layer 1: synthesize the brief (plain text + delimited state block) ──
+  # -- Layer 1: synthesize the brief (plain text + delimited state block) --
 
   - id: synthesize
     command: maintainer-standup
     depends_on: [git-status, gh-data, read-context]
 
-  # ── Layer 2: persist state and dated brief ──
+  # -- Layer 2: persist state and dated brief --
   #
   # Bash node so the framework shell-quotes $synthesize.output (raw text
   # containing markdown code fences and prose isn't a valid JS expression

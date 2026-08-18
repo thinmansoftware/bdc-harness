@@ -10,7 +10,7 @@ description: |
             npx skills add remotion-dev/skills
 
 nodes:
-  # ── Layer 0: Check project structure ──────────────────────────────────
+  # -- Layer 0: Check project structure ----------------------------------
   - id: check-project
     bash: |
       if [ ! -f "src/index.ts" ] || [ ! -f "src/Root.tsx" ]; then
@@ -24,7 +24,7 @@ nodes:
       echo "PROJECT_READY"
     timeout: 60000
 
-  # ── Layer 1: Generate composition code ────────────────────────────────
+  # -- Layer 1: Generate composition code --------------------------------
   - id: generate
     prompt: |
       You are working in a Remotion video project. The project root is the current directory.
@@ -56,7 +56,7 @@ nodes:
       - Edit
       - Glob
 
-  # ── Layer 2: Render preview stills ────────────────────────────────────
+  # -- Layer 2: Render preview stills ------------------------------------
   - id: render-preview
     bash: |
       mkdir -p out
@@ -87,7 +87,7 @@ nodes:
     depends_on: [generate]
     timeout: 120000
 
-  # ── Layer 3: Render full video ────────────────────────────────────────
+  # -- Layer 3: Render full video ----------------------------------------
   - id: render-video
     bash: |
       COMP_ID=$(npx remotion compositions src/index.ts 2>&1 | grep -E '^\S' | head -1 | awk '{print $1}')
@@ -105,7 +105,7 @@ nodes:
     depends_on: [render-preview]
     timeout: 300000
 
-  # ── Layer 4: Summary ──────────────────────────────────────────────────
+  # -- Layer 4: Summary --------------------------------------------------
   - id: summary
     prompt: |
       A Remotion video was generated and rendered.

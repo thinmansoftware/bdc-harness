@@ -2,26 +2,26 @@
 # Source pattern: bdc-ce-regression-suite.yaml + WO-POS-TERMINAL-SDK-01.yaml
 # Doctrine compliance: 13 hard rules of archon-yaml-authoring
 #
-# Pre-flight: codebase bluedevilcollectibles/lspro-react must be registered in Archon.
+# Pre-flight: codebase thinmansoftware/lspro-react must be registered in Archon.
 #   Verify: sqlite3 /opt/bdc/archon-data/archon.db "SELECT name FROM remote_agent_codebases"
 #
 # Pre-flight (4-block): YAML exists (this file), spec exists (docs/work-orders/
 #   WO-POS-STAFF-PIN-AUTH-UI-01.md in bdc-xo), CWD scope = CODE single-repo
 #   (lspro-react), codebase registered. Open Question: if store_staff.pin_hash
-#   missing OR /staff/pin-login route missing in shopops-api, WO grows MIXED —
+#   missing OR /staff/pin-login route missing in shopops-api, WO grows MIXED --
 #   operator surfaces to XO before re-firing.
 #
 # Deploy: BDC_XO/scripts/archon-bridge/sync-workflows.sh WO-POS-STAFF-PIN-AUTH-UI-01.yaml
 
 name: bdc-pos-staff-pin-auth-ui
 description: |
-  Use when: Executing WO-POS-STAFF-PIN-AUTH-UI-01 — Staff PIN login UI for POS.
+  Use when: Executing WO-POS-STAFF-PIN-AUTH-UI-01 -- Staff PIN login UI for POS.
   Input: WO_ID = WO-POS-STAFF-PIN-AUTH-UI-01.
   Does: Reads spec from bdc-xo, audits shopops-api for existing /staff/pin-login
         + store_staff.pin_hash (Open Question gate), implements lspro-react
         POSLoginPage + PinPad + PosAuthContext + RoleGate + posApiFetch + tests,
         opens PR, builds CODE manifest, flips Notion.
-  Repo: bluedevilcollectibles/lspro-react.
+  Repo: thinmansoftware/lspro-react.
   parallel_ok: true.
 
 policyFile: harness/policies/agent-behavior.md
@@ -35,15 +35,15 @@ nodes:
       WO_ID="${WO_ID:-WO-POS-STAFF-PIN-AUTH-UI-01}"
       # gh --template uses Go templates (built-in to gh, no external jq dependency)
       SPEC=$(gh api \
-        "repos/bluedevilcollectibles/bdc-xo/contents/docs/work-orders/${WO_ID}.md?ref=main" \
+        "repos/thinmansoftware/bdc-xo/contents/docs/work-orders/${WO_ID}.md?ref=main" \
         --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
       if [ -z "$SPEC" ]; then
         GLOB=$(gh api \
-          "repos/bluedevilcollectibles/bdc-xo/contents/docs/superpowers/specs?ref=main" \
+          "repos/thinmansoftware/bdc-xo/contents/docs/superpowers/specs?ref=main" \
           --template "{{range .}}{{if (or (hasPrefix .name \"${WO_ID}\") (and (hasPrefix .name \"2\") (contains .name \"${WO_ID}\")))}}{{.path}}{{\"\\n\"}}{{end}}{{end}}" \
           2>/dev/null | head -1 || true)
         if [ -n "$GLOB" ]; then
-          SPEC=$(gh api "repos/bluedevilcollectibles/bdc-xo/contents/${GLOB}?ref=main" \
+          SPEC=$(gh api "repos/thinmansoftware/bdc-xo/contents/${GLOB}?ref=main" \
             --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
         fi
       fi
@@ -51,12 +51,12 @@ nodes:
         # Fallback 4: GitHub issue body (WO-HARNESS-READ-SPEC-ISSUE-BODY-FALLBACK-01)
         ISSUE_NUM=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'issue=[0-9]+' | head -n 1 | cut -d= -f2 || true)
         if [ -z "$ISSUE_NUM" ]; then
-          ISSUE_NUM=$(gh issue list --repo bluedevilcollectibles/bdc-xo \
+          ISSUE_NUM=$(gh issue list --repo thinmansoftware/bdc-xo \
             --search "${WO_ID} in:title" --json number,title \
             --jq '.[0].number' 2>/dev/null || true)
         fi
         if [ -n "$ISSUE_NUM" ] && [ "$ISSUE_NUM" != "null" ]; then
-          SPEC=$(gh issue view "$ISSUE_NUM" --repo bluedevilcollectibles/bdc-xo \
+          SPEC=$(gh issue view "$ISSUE_NUM" --repo thinmansoftware/bdc-xo \
             --json body --jq .body 2>/dev/null || true)
           [ -n "$SPEC" ] && SPEC_PATH="issues/${ISSUE_NUM}"
         fi
@@ -96,9 +96,9 @@ nodes:
   - id: audit-backend
     depends_on: [fresh-branch]
     bash: |
-      # best-effort backend audit — surfaces Open Question gate
+      # best-effort backend audit -- surfaces Open Question gate
       EXISTS=$(gh api \
-        "repos/bluedevilcollectibles/shopops/contents/shopops-api/routes/staff.js?ref=master" \
+        "repos/thinmansoftware/shopops/contents/shopops-api/routes/staff.js?ref=master" \
         --template '{{.name}}' 2>/dev/null || true)
       if [ -n "$EXISTS" ]; then
         echo "STATUS=ok"
@@ -150,13 +150,13 @@ nodes:
         $read-spec.output
 
         ## Execution Rules
-        1. Create the 5 source files per WO §7 + 3 test files.
+        1. Create the 5 source files per WO Section 7 + 3 test files.
         2. PIN flow: 4-digit input, auto-submit on 4th digit, POST to /api/staff/pin-login.
         3. PosAuthContext stores JWT in sessionStorage.pos_jwt, exposes { staff, login, logout, token }.
         4. RoleGate: disabled children + overlay when staff.role not in props.roles.
         5. posApiFetch: wraps existing apiFetch, injects Authorization Bearer + X-Shopops-Tenant.
         6. On 401: clear sessionStorage + navigate('/pos/login').
-        7. Tests: >= 7 vitest tests asserting real behavior per WO §11.
+        7. Tests: >= 7 vitest tests asserting real behavior per WO Section 11.
         8. Use existing styling utilities (Tailwind or styled if that is the repo convention).
         9. Do NOT push, do NOT modify auth0 code.
 
@@ -200,7 +200,7 @@ nodes:
         echo "No staged changes"
       else
         git -c user.name="John Ranson" -c user.email="admin@bluedevilcollectibles.com" \
-          commit -m "$(printf 'feat(pos): WO-POS-STAFF-PIN-AUTH-UI-01 — PIN login + RoleGate\n\nAdds src/pos/POSLoginPage.tsx + PinPad.tsx + PosAuthContext.tsx + RoleGate.tsx +\nposApiFetch.ts with 7+ vitest tests.\nGates POS actions by role (clerk/manager/owner) per WO §6 matrix.\n\nCo-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>')"
+          commit -m "$(printf 'feat(pos): WO-POS-STAFF-PIN-AUTH-UI-01 -- PIN login + RoleGate\n\nAdds src/pos/POSLoginPage.tsx + PinPad.tsx + PosAuthContext.tsx + RoleGate.tsx +\nposApiFetch.ts with 7+ vitest tests.\nGates POS actions by role (clerk/manager/owner) per WO Section 6 matrix.\n\nCo-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>')"
       fi
       git push -u origin "$BRANCH"
       echo "SHA=$(git rev-parse HEAD)"
@@ -210,11 +210,11 @@ nodes:
     bash: |
       set -euo pipefail
       BRANCH="wo/pos-staff-pin-auth-ui-01"
-      REPO="bluedevilcollectibles/lspro-react"
+      REPO="thinmansoftware/lspro-react"
       BODY=$(mktemp)
       {
         echo "## Summary"
-        echo "Implements WO-POS-STAFF-PIN-AUTH-UI-01 — Staff PIN login UI for POS."
+        echo "Implements WO-POS-STAFF-PIN-AUTH-UI-01 -- Staff PIN login UI for POS."
         echo ""
         echo "## Files created"
         echo "- src/pos/POSLoginPage.tsx, PinPad.tsx, PosAuthContext.tsx, RoleGate.tsx, posApiFetch.ts"
@@ -227,7 +227,7 @@ nodes:
       if [ -n "$EXIST" ]; then echo "PR_URL=$EXIST"; exit 0; fi
       for i in 1 2 3; do
         if URL=$(gh pr create --repo "$REPO" --base main --head "$BRANCH" \
-            --title "feat(pos): WO-POS-STAFF-PIN-AUTH-UI-01 — PIN login + RoleGate" \
+            --title "feat(pos): WO-POS-STAFF-PIN-AUTH-UI-01 -- PIN login + RoleGate" \
             --body-file "$BODY" 2>&1); then
           echo "PR_URL=$URL"; exit 0
         fi
@@ -247,7 +247,7 @@ nodes:
                      RoleGate.tsx, posApiFetch.ts + 3 test files
       Files modified: src/pos/POSHeader.tsx, src/pos routing
       Tests: [count from $verify-tests.output] passing | bun test src/pos
-      PRs: [from $open-pr.output PR_URL] — base: main
+      PRs: [from $open-pr.output PR_URL] -- base: main
       Merge ancestors: lspro-react main HEAD: [from $commit-and-push.output SHA], behind_by: 0
       Grep assertions:
         - grep -q 'PosAuthContext' src/pos/PosAuthContext.tsx
@@ -269,17 +269,43 @@ nodes:
   - id: flip-notion
     depends_on: [build-manifest]
     task_class: clerical
-    prompt: |
-      Flip Notion WO-POS-STAFF-PIN-AUTH-UI-01 to REVIEW. Manifest in Notes property.
-      Notion database: a6df831c-0b52-449f-8ca4-d77be6b70d0a
-      # OPEN QUESTION: Notion page ID for WO-POS-STAFF-PIN-AUTH-UI-01 not confirmed.
-      # Operator searches database by exact WO ID equality.
+    bash: |
+      set -euo pipefail
 
-      Update: Claude Status -> REVIEW, Status -> Review, Notes -> $build-manifest.output verbatim,
-      claimed_by: Codex, claimed_at: today.
+      capture_node_output() {
+        python3 -c 'import shlex, sys; s=sys.stdin.read(); sys.stdout.write((lambda p: p[0] if len(p)==1 else s)(shlex.split(s)) if len(s)>=2 and s[0]=="'"'"'" and s.rstrip("\n").endswith("'"'"'") else s)'
+      }
 
-      If Notion MCP unavailable, output:
-        XO_TODO: Flip WO-POS-STAFF-PIN-AUTH-UI-01 to REVIEW; paste manifest into Notes property.
-
-      Manifest:
+      MANIFEST=$(capture_node_output <<'BDC_NODE_OUTPUT_MANIFEST'
       $build-manifest.output
+      BDC_NODE_OUTPUT_MANIFEST
+      )
+
+      READ_SPEC_OUT=$(capture_node_output <<'BDC_NODE_OUTPUT_READ_SPEC'
+      $read-spec.output
+      BDC_NODE_OUTPUT_READ_SPEC
+      )
+      ISSUE_REPO="${ISSUE_REPO:-thinmansoftware/bdc-xo}"
+      ISSUE_NUM=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'issue=[0-9]+' | head -1 | cut -d= -f2 || true)
+      if [ -z "$ISSUE_NUM" ]; then
+        ISSUE_NUM=$(printf '%s\n' "$READ_SPEC_OUT" | sed -n 's/^SPEC_PATH=.*issues\/\([0-9][0-9]*\).*/\1/p' | head -1)
+      fi
+      if [ -z "$ISSUE_NUM" ]; then
+        WO_ID_FROM_SPEC=$(printf '%s\n' "$READ_SPEC_OUT" | sed -n 's/^WO_ID=//p' | head -1)
+        if [ -n "$WO_ID_FROM_SPEC" ]; then
+          ISSUE_NUM=$(gh issue list --repo "$ISSUE_REPO" --search "$WO_ID_FROM_SPEC in:title" --json number --jq '.[0].number // empty' 2>/dev/null || true)
+        fi
+      fi
+      if [ -z "$ISSUE_NUM" ]; then
+        echo "flip-notion: no GitHub issue resolved; skipping status:review label + manifest comment."
+        exit 0
+      fi
+
+      gh label create status:review --repo "$ISSUE_REPO" --color 0E8A16 --description "BDC workflow is ready for review" 2>/dev/null || true
+      gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --remove-label status:building 2>/dev/null || true
+      gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --remove-label status:blocked 2>/dev/null || true
+      gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --add-label status:review
+      COMMENT_FILE=$(mktemp)
+      printf '%s\n' "$MANIFEST" > "$COMMENT_FILE"
+      gh issue comment "$ISSUE_NUM" --repo "$ISSUE_REPO" --body-file "$COMMENT_FILE"
+      echo "flip-notion: $ISSUE_REPO#$ISSUE_NUM -> status:review (manifest posted as comment)"
