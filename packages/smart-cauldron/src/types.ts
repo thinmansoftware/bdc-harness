@@ -53,7 +53,51 @@ export type CascadeStatus =
   | 'spec-repair' // frontier (fable) tier gate-failed -> SPEC-REPAIR escalation, not a dead end
   | 'recovery-delegated' // an explicitly injected fenced supervisor accepted recovery ownership
   | 'infra-alert' // infra-error on a tier (escalate/alert, not climb silently)
+  | 'pending-frontier-approval' // auto-climb reached a premium tier; paused for operator approval, not fired
+  | 'frontier-rejected' // operator rejected the premium-tier climb; terminated as needs-human, no fire
+  | 'frontier-approved' // operator approved the premium climb; original record handed off to the resumed cascade (resumeCascadeId)
   | 'cancelled'; // an attempt was externally cancelled; cascade stopped
+
+/**
+ * FrontierApprovalPacket -- the preserved escalation packet stored when an
+ * AUTOMATIC climb reaches a premium tier (default ['frontier']) and the cascade
+ * pauses instead of firing (WO-HARNESS-FRONTIER-CLIMB-APPROVAL-GATE-01).
+ *
+ * "then dont waste my usage if it will fail" (John, 2026-08-18): the premium
+ * (fable) tier is never auto-fired on an unattended escalation. The packet
+ * carries everything the frontier fire WOULD have used so an operator approve
+ * can resume it exactly where it paused, or a reject can terminate it cleanly.
+ *
+ * SECRET BOUNDARY: the operator token is NEVER persisted here (matches the
+ * cascade/cli secret boundary). The resume endpoint re-supplies the token.
+ */
+export interface FrontierApprovalPacket {
+  /** The premium tier the cascade would have fired next (e.g. 'frontier'). */
+  tierName: TierName;
+  /** The workflow lane bound to that premium tier (e.g. 'bdc-feature-development-fable'). */
+  workflowName: string;
+  /** Informed-climb context the frontier fire would have carried (may be null). */
+  priorContext: string | null;
+  /** Frozen codebase authority for the resumed fire. */
+  project: string | null;
+  woId: string;
+  woClass: string | null;
+  tags: string[];
+  /** Archon API base URL captured at pause time (re-used verbatim on resume). */
+  apiBaseUrl: string;
+  /** When the cascade paused at the premium boundary. */
+  pausedAt: string;
+  /** When the single operator notice was emitted (null if notification failed). */
+  notifiedAt: string | null;
+  /** Set once the pause is resolved: 'approved' fires, 'rejected' terminates. */
+  resolution: 'approved' | 'rejected' | null;
+  /** When the resolution was applied. */
+  resolvedAt: string | null;
+  /** cascadeId of the NEW cascade launched by an approve (back-reference). */
+  resumeCascadeId: string | null;
+  /** Operator-supplied reason on a reject (null otherwise). */
+  rejectReason: string | null;
+}
 
 export interface CascadeRunRecord {
   cascadeId: string; // randomUUID
@@ -96,6 +140,14 @@ export interface CascadeRunRecord {
     fencingToken: number;
     evidenceRefs: string[];
   };
+  /**
+   * Populated ONLY when an automatic climb reached a premium tier and the
+   * cascade paused (status === 'pending-frontier-approval') or the pause was
+   * resolved (status resolves via approve/reject). Carries the preserved
+   * escalation packet so an operator can approve (resume + fire) or reject
+   * (terminate as needs-human) later. See FrontierApprovalPacket.
+   */
+  frontierApproval?: FrontierApprovalPacket;
 }
 
 export interface GateVerdict {

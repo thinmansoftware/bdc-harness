@@ -30,6 +30,13 @@ import {
 } from '@archon/core';
 import { createWorkflowDeps } from '@archon/core/workflows';
 import { runCascade } from '@archon/smart-cauldron/cascade';
+import {
+  readCascadeRecordById,
+  claimFrontierResolution,
+  releaseFrontierClaim,
+  resumeFrontierTier,
+  rejectFrontierTier,
+} from '@archon/smart-cauldron/frontier-approval';
 import { removeWorktree, toRepoPath, toWorktreePath } from '@archon/git';
 import {
   createLogger,
@@ -222,6 +229,10 @@ import {
 } from './schemas/config.schemas';
 import { providerListResponseSchema } from './schemas/provider.schemas';
 import { canarySnapshotQuerySchema, canarySnapshotResponseSchema } from './schemas/canary.schemas';
+import {
+  rejectFrontierBodySchema,
+  cascadeFrontierApprovalResponseSchema,
+} from './schemas/cascade.schemas';
 import {
   drainBodySchema,
   drainResponseSchema,
@@ -1646,6 +1657,52 @@ const pauseWorkflowRunRoute = createRoute({
     404: jsonError('Not found'),
     409: jsonError('Already paused'),
     422: jsonError('Cannot pause a terminal run'),
+    500: jsonError('Server error'),
+  },
+});
+
+// Smart Cauldron frontier-approval gate (WO-HARNESS-FRONTIER-CLIMB-APPROVAL-GATE-01).
+// An automatic climb into a premium tier pauses instead of firing; these two
+// endpoints let an operator resolve the pause. Auth is the global /api/*
+// operator-token middleware.
+const approveFrontierRoute = createRoute({
+  method: 'post',
+  path: '/api/cascades/{cascadeId}/approve-frontier',
+  tags: ['Cascades'],
+  summary: 'Approve a paused premium-tier climb (resume + fire exactly once)',
+  request: {
+    params: z.object({ cascadeId: z.string() }),
+  },
+  responses: {
+    200: {
+      content: { 'application/json': { schema: cascadeFrontierApprovalResponseSchema } },
+      description: 'Approved (resumed) or idempotent no-op if already resolved',
+    },
+    404: jsonError('Cascade not found'),
+    422: jsonError('Cascade is not awaiting frontier approval'),
+    500: jsonError('Server error'),
+  },
+});
+
+const rejectFrontierRoute = createRoute({
+  method: 'post',
+  path: '/api/cascades/{cascadeId}/reject-frontier',
+  tags: ['Cascades'],
+  summary: 'Reject a paused premium-tier climb (terminate as needs-human, no fire)',
+  request: {
+    params: z.object({ cascadeId: z.string() }),
+    body: {
+      content: { 'application/json': { schema: rejectFrontierBodySchema } },
+      required: false,
+    },
+  },
+  responses: {
+    200: {
+      content: { 'application/json': { schema: cascadeFrontierApprovalResponseSchema } },
+      description: 'Rejected or idempotent no-op if already resolved',
+    },
+    404: jsonError('Cascade not found'),
+    422: jsonError('Cascade is not awaiting frontier approval'),
     500: jsonError('Server error'),
   },
 });
@@ -5145,6 +5202,129 @@ export function registerApiRoutes(
     } catch (error) {
       getLog().error({ err: error }, 'pause_workflow_run_api_failed');
       return apiError(c, 500, 'Failed to pause workflow run');
+    }
+  });
+
+  // POST /api/cascades/:cascadeId/approve-frontier - Resolve a paused premium
+  // climb by resuming it (WO-HARNESS-FRONTIER-CLIMB-APPROVAL-GATE-01). The gate
+  // paused an AUTOMATIC climb into a premium tier so premium usage is never
+  // burned unattended; an operator approve fires the premium tier exactly once.
+  // The claim file makes this idempotent: a second approve is a no-op.
+  registerOpenApiRoute(approveFrontierRoute, async c => {
+    const cascadeId = c.req.param('cascadeId') ?? '';
+    try {
+      const record = await readCascadeRecordById(cascadeId);
+      if (!record) {
+        return apiError(c, 404, 'Cascade not found');
+      }
+      if (!record.frontierApproval) {
+        return apiError(c, 422, 'Cascade is not awaiting frontier approval');
+      }
+      // Exactly-once guard: the first resolver (approve or reject) wins; any
+      // later call observes the recorded resolution and returns an idempotent
+      // no-op WITHOUT firing again.
+      const claim = await claimFrontierResolution(cascadeId, 'approved');
+      if (!claim.claimed) {
+        return c.json({
+          success: true,
+          message: `Cascade ${cascadeId} already resolved (${claim.resolution})`,
+          cascadeId,
+          resolution: claim.resolution,
+          status: record.status,
+          alreadyResolved: true,
+        });
+      }
+      const token =
+        c.req.header('x-archon-operator-token') ?? process.env.ARCHON_OPERATOR_TOKEN ?? '';
+      // Resume in the background; return once the resumed record is durable so
+      // the HTTP response does not block on the entire premium fire.
+      let resolveAdmission: ((r: Awaited<ReturnType<typeof resumeFrontierTier>>) => void) | null =
+        null;
+      const admission = new Promise<Awaited<ReturnType<typeof resumeFrontierTier>>>(resolve => {
+        resolveAdmission = resolve;
+      });
+      const resumePromise = resumeFrontierTier(record, {
+        token,
+        onAdmission: r => resolveAdmission?.(r),
+      });
+      void resumePromise.catch((error: unknown) => {
+        getLog().error(
+          { err: error, cascadeId, woId: record.woId },
+          'frontier_approval_resume_failed'
+        );
+      });
+      // Race so a synchronous resume failure surfaces as 500 instead of hanging.
+      const admitted = await Promise.race([admission, resumePromise]);
+      // A 'blocked' admission means the resumed cascade refused to fire because a
+      // duplicate live cascade already holds the WO lock (smart-cauldron
+      // acquireWoLock): nothing fired, no premium usage was spent, and the paused
+      // record was left untouched by resumeFrontierTier. Roll back the approval
+      // claim so the operator can retry/reject once the duplicate clears -- do NOT
+      // report success, or the cascadeId would be wedged 'approved' forever with
+      // neither a fire nor a path to re-resolve (WO Test 2 fail condition).
+      if (admitted.status === 'blocked') {
+        await releaseFrontierClaim(cascadeId);
+        getLog().warn(
+          { cascadeId, woId: record.woId, resumeCascadeId: admitted.cascadeId },
+          'frontier_approval_resume_blocked'
+        );
+        return apiError(
+          c,
+          409,
+          `Frontier resume for ${record.woId} could not fire: another cascade is already active for this WO. ` +
+            'The approval was rolled back -- retry once it clears.'
+        );
+      }
+      return c.json({
+        success: true,
+        message: `Approved frontier climb for ${record.woId}; resumed cascade ${admitted.cascadeId}`,
+        cascadeId,
+        resolution: 'approved' as const,
+        status: admitted.status,
+        resumeCascadeId: admitted.cascadeId,
+      });
+    } catch (error) {
+      getLog().error({ err: error, cascadeId }, 'frontier_approval_approve_failed');
+      return apiError(c, 500, 'Failed to approve frontier climb');
+    }
+  });
+
+  // POST /api/cascades/:cascadeId/reject-frontier - Terminate a paused premium
+  // climb as needs-human (no fire). Idempotent via the same claim file.
+  registerOpenApiRoute(rejectFrontierRoute, async c => {
+    const cascadeId = c.req.param('cascadeId') ?? '';
+    try {
+      const record = await readCascadeRecordById(cascadeId);
+      if (!record) {
+        return apiError(c, 404, 'Cascade not found');
+      }
+      if (!record.frontierApproval) {
+        return apiError(c, 422, 'Cascade is not awaiting frontier approval');
+      }
+      const claim = await claimFrontierResolution(cascadeId, 'rejected');
+      if (!claim.claimed) {
+        return c.json({
+          success: true,
+          message: `Cascade ${cascadeId} already resolved (${claim.resolution})`,
+          cascadeId,
+          resolution: claim.resolution,
+          status: record.status,
+          alreadyResolved: true,
+        });
+      }
+      const body = (await c.req.json().catch(() => ({}))) as { reason?: string };
+      const reason = body.reason ?? '';
+      const updated = await rejectFrontierTier(record, reason);
+      return c.json({
+        success: true,
+        message: `Rejected frontier climb for ${record.woId} (needs-human, no fire)`,
+        cascadeId,
+        resolution: 'rejected' as const,
+        status: updated.status,
+      });
+    } catch (error) {
+      getLog().error({ err: error, cascadeId }, 'frontier_approval_reject_failed');
+      return apiError(c, 500, 'Failed to reject frontier climb');
     }
   });
 

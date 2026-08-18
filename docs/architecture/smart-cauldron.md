@@ -109,6 +109,61 @@ flip is a lying gate and is on the section-6 prerequisite list.
 - No live secrets ever reach a model. A secret found in a diff is redacted and
   reported as a finding.
 
+## The frontier-approval gate (operator control -- WO-HARNESS-FRONTIER-CLIMB-APPROVAL-GATE-01)
+
+Premium usage is never burned on an unattended escalation. When an AUTOMATIC
+climb would fire a **premium tier** (config `premiumTiers` in
+`packages/smart-cauldron/config/ladder.config.json`, default `["frontier"]`),
+the cascade does NOT fire it. Instead it PAUSES:
+
+- The cascade record is written with status `pending-frontier-approval` and a
+  preserved escalation packet (the tiers already failed, the informed-climb
+  context the frontier fire would have carried, the WO id, project, and tags --
+  never the operator token).
+- Exactly ONE operator notice is emitted through the existing escalation
+  machinery, naming the WO, the failed tiers, and the two commands below.
+- Nothing else happens until an operator resolves the pause.
+
+Ruling: John, 2026-08-18 -- "then dont waste my usage if it will fail please"
+(after three auto-climbs to the fable tier burned premium usage in one day).
+
+**An explicit `--entry frontier` fire is NOT gated** -- a human typed it, so it
+fires immediately. Only the automatic climb path pauses.
+
+### Resolving a paused cascade (operator)
+
+Both endpoints live under `/api/*` and require the operator token
+(`x-archon-operator-token` header or `Authorization: Bearer`). They are
+idempotent -- a second call is a no-op that reports the recorded resolution, so
+a premium fire happens at most once.
+
+Approve (resume the cascade and fire the premium tier exactly once, replaying
+the preserved climb context):
+
+```bash
+curl -s -X POST "$ARCHON_API_BASE_URL/api/cascades/<cascadeId>/approve-frontier" \
+  -H "x-archon-operator-token: $ARCHON_OPERATOR_TOKEN"
+```
+
+Reject (terminate the cascade as needs-human; no premium fire):
+
+```bash
+curl -s -X POST "$ARCHON_API_BASE_URL/api/cascades/<cascadeId>/reject-frontier" \
+  -H "x-archon-operator-token: $ARCHON_OPERATOR_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"reason":"operator/config task no model can complete"}'
+```
+
+Outcomes: approve -> a NEW resumed cascade fires the premium tier (the original
+paused record keeps a `resumeCascadeId` back-reference). Reject -> the record
+becomes `frontier-rejected` (a distinct terminal state; CLI exit codes 7 and 8
+respectively). The premium tier's own gate-fail path (SPEC-REPAIR) is unchanged
+and applies once the tier actually fires via approve or explicit entry.
+
+(The `Cauldron-Fire` skill referenced by the WO manifest is operator-side and
+not reachable from the build container; these commands are documented here as
+the in-repo source of truth.)
+
 ---
 
 # PART 2 -- You are a node in a lane: your contract
