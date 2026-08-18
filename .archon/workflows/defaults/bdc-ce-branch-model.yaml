@@ -1,12 +1,12 @@
 name: bdc-ce-branch-model
 description: |
-  Use when: Shipping WO-RELEASE-CE-BRANCH-MODEL-01 — create + protect the release/ce branch on lspro-react.
+  Use when: Shipping WO-RELEASE-CE-BRANCH-MODEL-01 -- create + protect the release/ce branch on lspro-react.
   Input: WO_ID = WO-RELEASE-CE-BRANCH-MODEL-01 (or pass via $WORKFLOW_ID env / user message).
   Does: Reads the BDC WO spec from bdc-xo via gh api, creates release/ce from current main HEAD on lspro-react,
         adds GitHub branch protection (PRs required + CE regression check placeholder),
         commits CE governance doc references + PR templates, opens nothing (this is an infra WO),
         flips Notion to REVIEW with manifest.
-  Repo: bluedevilcollectibles/lspro-react (target). Spec lives in bluedevilcollectibles/bdc-xo (cross-repo read).
+  Repo: thinmansoftware/lspro-react (target). Spec lives in thinmansoftware/bdc-xo (cross-repo read).
   NOT for: any other WO. This workflow is bound to WO-RELEASE-CE-BRANCH-MODEL-01.
 
 policyFile: harness/policies/agent-behavior.md
@@ -26,33 +26,33 @@ nodes:
       fi
       # Spec lives in bdc-xo at docs/superpowers/specs/ce-release-branch/work-orders/<WO_ID>.md
       SPEC_PATH="docs/superpowers/specs/ce-release-branch/work-orders/${WO_ID}.md"
-      SPEC_CONTENT=$(gh api "repos/bluedevilcollectibles/bdc-xo/contents/${SPEC_PATH}?ref=main" --jq .content 2>/dev/null | base64 -d 2>/dev/null || true)
+      SPEC_CONTENT=$(gh api "repos/thinmansoftware/bdc-xo/contents/${SPEC_PATH}?ref=main" --jq .content 2>/dev/null | base64 -d 2>/dev/null || true)
       if [ -z "$SPEC_CONTENT" ]; then
         # Fallback: look for date-prefixed file in flat specs dir
-        MATCH=$(gh api "repos/bluedevilcollectibles/bdc-xo/contents/docs/superpowers/specs?ref=main" --jq ".[] | select(.name | endswith(\"${WO_ID}.md\")) | .path" | head -n 1)
+        MATCH=$(gh api "repos/thinmansoftware/bdc-xo/contents/docs/superpowers/specs?ref=main" --jq ".[] | select(.name | endswith(\"${WO_ID}.md\")) | .path" | head -n 1)
         if [ -n "$MATCH" ]; then
           SPEC_PATH="$MATCH"
-          SPEC_CONTENT=$(gh api "repos/bluedevilcollectibles/bdc-xo/contents/${SPEC_PATH}?ref=main" --jq .content 2>/dev/null | base64 -d 2>/dev/null || true)
+          SPEC_CONTENT=$(gh api "repos/thinmansoftware/bdc-xo/contents/${SPEC_PATH}?ref=main" --jq .content 2>/dev/null | base64 -d 2>/dev/null || true)
         fi
       fi
       if [ -z "$SPEC_CONTENT" ]; then
         # Fallback 4: GitHub issue body (WO-HARNESS-READ-SPEC-ISSUE-BODY-FALLBACK-01)
         ISSUE_NUM=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'issue=[0-9]+' | head -n 1 | cut -d= -f2 || true)
         if [ -z "$ISSUE_NUM" ]; then
-          ISSUE_NUM=$(gh issue list --repo bluedevilcollectibles/bdc-xo \
+          ISSUE_NUM=$(gh issue list --repo thinmansoftware/bdc-xo \
             --search "${WO_ID} in:title" --json number,title \
             --jq '.[0].number' 2>/dev/null || true)
         fi
         if [ -n "$ISSUE_NUM" ] && [ "$ISSUE_NUM" != "null" ]; then
-          SPEC_CONTENT=$(gh issue view "$ISSUE_NUM" --repo bluedevilcollectibles/bdc-xo \
+          SPEC_CONTENT=$(gh issue view "$ISSUE_NUM" --repo thinmansoftware/bdc-xo \
             --json body --jq .body 2>/dev/null || true)
           [ -n "$SPEC_CONTENT" ] && SPEC_PATH="issues/${ISSUE_NUM}"
         fi
       fi
       if [ -z "$SPEC_CONTENT" ]; then echo "Spec not found (tried docs/work-orders/, docs/superpowers/specs/ direct, date-prefix glob, and GitHub issue search)" >&2; exit 1; fi
       # Also fetch the architecture + governance docs (single source of truth for branch policy)
-      ARCH_CONTENT=$(gh api "repos/bluedevilcollectibles/bdc-xo/contents/docs/superpowers/specs/ce-release-branch/docs/CE-RELEASE-BRANCH-ARCHITECTURE-v1.md?ref=main" --jq .content 2>/dev/null | base64 -d 2>/dev/null || true)
-      GOV_CONTENT=$(gh api "repos/bluedevilcollectibles/bdc-xo/contents/docs/superpowers/specs/ce-release-branch/docs/CE-BRANCH-GOVERNANCE.md?ref=main" --jq .content 2>/dev/null | base64 -d 2>/dev/null || true)
+      ARCH_CONTENT=$(gh api "repos/thinmansoftware/bdc-xo/contents/docs/superpowers/specs/ce-release-branch/docs/CE-RELEASE-BRANCH-ARCHITECTURE-v1.md?ref=main" --jq .content 2>/dev/null | base64 -d 2>/dev/null || true)
+      GOV_CONTENT=$(gh api "repos/thinmansoftware/bdc-xo/contents/docs/superpowers/specs/ce-release-branch/docs/CE-BRANCH-GOVERNANCE.md?ref=main" --jq .content 2>/dev/null | base64 -d 2>/dev/null || true)
       printf 'WO_ID=%s\nSPEC_PATH=bdc-xo:%s\nWORKFLOW_ID=%s\n\n' "$WO_ID" "$SPEC_PATH" "$WORKFLOW_ID"
       printf -- '--- SPEC ---\n%s\n\n' "$SPEC_CONTENT"
       printf -- '--- ARCHITECTURE v1 ---\n%s\n\n' "$ARCH_CONTENT"
@@ -73,7 +73,7 @@ nodes:
       # Sanity check: current commit message + author
       git log -1 --pretty=format:'%h %s%n%an %ad' --date=short
       # Get the canonical lspro-react repo info from gh
-      gh repo view bluedevilcollectibles/lspro-react --json defaultBranchRef,sshUrl --jq '"defaultBranch=\(.defaultBranchRef.name)"'
+      gh repo view thinmansoftware/lspro-react --json defaultBranchRef,sshUrl --jq '"defaultBranch=\(.defaultBranchRef.name)"'
 
   - id: create-release-ce-branch
     depends_on: [verify-baseline-commit]
@@ -85,12 +85,12 @@ nodes:
         exit 1
       fi
       # Check if release/ce already exists (idempotency)
-      if gh api "repos/bluedevilcollectibles/lspro-react/branches/release/ce" --jq .name 2>/dev/null | grep -q "release/ce"; then
+      if gh api "repos/thinmansoftware/lspro-react/branches/release/ce" --jq .name 2>/dev/null | grep -q "release/ce"; then
         echo "release/ce already exists. Will verify protections, not recreate."
-        gh api "repos/bluedevilcollectibles/lspro-react/branches/release/ce" --jq '"existing_sha=\(.commit.sha)"'
+        gh api "repos/thinmansoftware/lspro-react/branches/release/ce" --jq '"existing_sha=\(.commit.sha)"'
       else
         # Create release/ce from main HEAD via GitHub Git Refs API
-        gh api -X POST "repos/bluedevilcollectibles/lspro-react/git/refs" \
+        gh api -X POST "repos/thinmansoftware/lspro-react/git/refs" \
           -f ref="refs/heads/release/ce" \
           -f sha="${MAIN_HEAD}"
         echo "Created release/ce at ${MAIN_HEAD}"
@@ -99,12 +99,12 @@ nodes:
   - id: add-branch-protection
     depends_on: [create-release-ce-branch]
     bash: |
-      # set -e DELIBERATELY OMITTED — protection is best-effort.
+      # set -e DELIBERATELY OMITTED -- protection is best-effort.
       # GitHub branch protection on private repos requires Pro/Team. On free plans
       # the API returns 403 and we record PROTECTION_STATUS=skipped_free_plan so the
       # rest of the workflow can proceed. CE regression check (WO #2) + promotion gate
       # (WO #8) provide CI-level enforcement that's plan-independent.
-      PROTECTION_RESULT=$(gh api -X PUT "repos/bluedevilcollectibles/lspro-react/branches/release/ce/protection" \
+      PROTECTION_RESULT=$(gh api -X PUT "repos/thinmansoftware/lspro-react/branches/release/ce/protection" \
         -H "Accept: application/vnd.github+json" \
         --input - 2>&1 <<'PROT_EOF'
       {
@@ -144,8 +144,8 @@ nodes:
       # Add CE-specific PR templates to lspro-react .github/ from bdc-xo source
       mkdir -p .github/PULL_REQUEST_TEMPLATE
       # Copy promotion + hotfix PR templates from bdc-xo via gh api (cross-repo content fetch)
-      gh api "repos/bluedevilcollectibles/bdc-xo/contents/docs/superpowers/specs/ce-release-branch/templates/ce-promotion-pr-template.md?ref=main" --jq .content | base64 -d > .github/PULL_REQUEST_TEMPLATE/ce-promotion.md
-      gh api "repos/bluedevilcollectibles/bdc-xo/contents/docs/superpowers/specs/ce-release-branch/templates/ce-hotfix-pr-template.md?ref=main" --jq .content | base64 -d > .github/PULL_REQUEST_TEMPLATE/ce-hotfix.md
+      gh api "repos/thinmansoftware/bdc-xo/contents/docs/superpowers/specs/ce-release-branch/templates/ce-promotion-pr-template.md?ref=main" --jq .content | base64 -d > .github/PULL_REQUEST_TEMPLATE/ce-promotion.md
+      gh api "repos/thinmansoftware/bdc-xo/contents/docs/superpowers/specs/ce-release-branch/templates/ce-hotfix-pr-template.md?ref=main" --jq .content | base64 -d > .github/PULL_REQUEST_TEMPLATE/ce-hotfix.md
       # Add a CE branch policy reference doc inline (one-pager pointing back to bdc-xo wiki)
       mkdir -p docs
       cat > docs/CE-BRANCH-POLICY.md <<'POLICY_EOF'
@@ -165,8 +165,8 @@ nodes:
 
       ## Quick rules (full doctrine in bdc-xo)
 
-      - No direct pushes — PR required.
-      - PR template: choose `ce-promotion.md` (main → release/ce) or `ce-hotfix.md` (hotfix/ce/* → release/ce).
+      - No direct pushes -- PR required.
+      - PR template: choose `ce-promotion.md` (main -> release/ce) or `ce-hotfix.md` (hotfix/ce/* -> release/ce).
       - CE regression must pass (WO-CI-CE-REGRESSION-SUITE-01 implements the check).
       - Every CE hotfix requires a backport PR to main (WO-RELEASE-CE-BACKPORT-POLICY-01 enforces this).
       - John approval required for production deploy from release/ce (WO-RELEASE-CE-DEPLOY-LANE-01 wires the deploy gate).
@@ -175,16 +175,16 @@ nodes:
 
       ```
       main (active development)
-          ↓ promotion/ce/<slug> PR
+          v promotion/ce/<slug> PR
       release/ce (stable customer-facing)
-          ↓ deploy (John approval required)
+          v deploy (John approval required)
       production CE customers
       ```
 
       Hotfix flow:
 
       ```
-      hotfix/ce/<slug> → release/ce → main (backport)
+      hotfix/ce/<slug> -> release/ce -> main (backport)
       ```
       POLICY_EOF
       # Sanity-check files exist before staging (defensive; the cat above + gh api copy above should have created all three)
@@ -205,7 +205,7 @@ nodes:
       set -euo pipefail
       # Commit governance refs to a feature branch (NOT main directly per Rule 20 staging-gate)
       BRANCH="wo/release-ce-branch-model-01"
-      # Idempotent branch checkout — handles re-runs where worktree branch already exists
+      # Idempotent branch checkout -- handles re-runs where worktree branch already exists
       if git show-ref --quiet "refs/heads/$BRANCH"; then
         git checkout "$BRANCH"
       else
@@ -216,7 +216,7 @@ nodes:
         echo "No staged changes; branch already contains requested work"
       else
         git -c user.name="John Ranson" -c user.email="admin@bluedevilcollectibles.com" \
-          commit -m "feat(ce): WO-RELEASE-CE-BRANCH-MODEL-01 — add CE branch policy doc + PR templates
+          commit -m "feat(ce): WO-RELEASE-CE-BRANCH-MODEL-01 -- add CE branch policy doc + PR templates
 
         Adds .github/PULL_REQUEST_TEMPLATE/ce-promotion.md + ce-hotfix.md (copied verbatim
         from bdc-xo canonical templates).
@@ -239,7 +239,7 @@ nodes:
     depends_on: [commit-and-push-main]
     bash: |
       set -euo pipefail
-      # Hardcoded — must match commit-and-push-main BRANCH literal. See WO-HARNESS-OPEN-PR-BRANCH-INTERPOLATION-FIX-01.
+      # Hardcoded -- must match commit-and-push-main BRANCH literal. See WO-HARNESS-OPEN-PR-BRANCH-INTERPOLATION-FIX-01.
       # Archon shell-quote-wraps node output (dag-executor.ts L300), corrupting bash parsing.
       BRANCH="wo/release-ce-branch-model-01"
       PROTECTION_STATUS="unknown"
@@ -248,13 +248,13 @@ nodes:
         PROTECTION_LINE="- Applied GitHub branch protection: PR required, 1 review, no force-push, no deletion, conversation resolution required"
         PROTECTION_CHECK="- [x] Branch protection active (no direct pushes, PR required)"
       else
-        PROTECTION_LINE="- Branch protection: \`${PROTECTION_STATUS}\` — ${PROTECTION_DETAIL}"
+        PROTECTION_LINE="- Branch protection: \`${PROTECTION_STATUS}\` -- ${PROTECTION_DETAIL}"
         PROTECTION_CHECK="- [ ] Branch protection: \`${PROTECTION_STATUS}\` (governance enforced via CI gates from WO #2 + WO #8)"
       fi
       BODY_FILE=$(mktemp)
       {
         echo "## Summary"
-        echo "Implements **WO-RELEASE-CE-BRANCH-MODEL-01** — CE Release Branch Plan WO #1 (foundation)."
+        echo "Implements **WO-RELEASE-CE-BRANCH-MODEL-01** -- CE Release Branch Plan WO #1 (foundation)."
         echo ""
         echo "## Changes"
         echo "- Created \`release/ce\` branch at current \`main\` HEAD"
@@ -278,11 +278,11 @@ nodes:
         echo "## Captain CI Manifest"
         echo "Will be built by build-manifest node and written to Notion Notes."
         echo ""
-        echo "🤖 Generated with [Claude Code](https://claude.com/claude-code)"
+        echo " Generated with [Claude Code](https://claude.com/claude-code)"
       } > "$BODY_FILE"
-      REPO="bluedevilcollectibles/lspro-react"
+      REPO="thinmansoftware/lspro-react"
       BASE="main"
-      TITLE="feat(ce): WO-RELEASE-CE-BRANCH-MODEL-01 — release/ce branch + PR templates"
+      TITLE="feat(ce): WO-RELEASE-CE-BRANCH-MODEL-01 -- release/ce branch + PR templates"
       # Idempotent PR creation. See WO-HARNESS-OPEN-PR-GRAPHQL-NO-COMMITS-FIX-01.
       existing_pr_url() {
         gh pr list --repo "$REPO" --head "$BRANCH" --state open --json url --jq '.[0].url // empty' 2>/dev/null
@@ -328,8 +328,8 @@ nodes:
       - PR opened: <feature-branch PR URL>
       - Merge ancestors: lspro-react main HEAD = <SHA>, behind_by: 0
       - Grep assertions (rerun-able):
-        - gh api repos/bluedevilcollectibles/lspro-react/branches/release/ce --jq .name returns release/ce
-        - gh api repos/bluedevilcollectibles/lspro-react/branches/release/ce/protection returns 200
+        - gh api repos/thinmansoftware/lspro-react/branches/release/ce --jq .name returns release/ce
+        - gh api repos/thinmansoftware/lspro-react/branches/release/ce/protection returns 200
       - Runtime verification: branch + protection visible in GitHub UI
       - Vercel deployment: N/A (release/ce deploys covered by WO-RELEASE-CE-DEPLOY-LANE-01)
       - VALIDATION: PASS
@@ -350,23 +350,43 @@ nodes:
   - id: flip-notion
     depends_on: [build-manifest]
     task_class: clerical
-    prompt: |
-      Update the Notion Work Order page for WO-RELEASE-CE-BRANCH-MODEL-01.
+    bash: |
+      set -euo pipefail
 
-      Per Rule 7 of Archon-YAML-Authoring doctrine + Captain CI manifest contract,
-      the manifest MUST be written to the Notion `Notes` PROPERTY (not a page comment),
-      and `Claude Status` MUST flip to `REVIEW` in the same update.
+      capture_node_output() {
+        python3 -c 'import shlex, sys; s=sys.stdin.read(); sys.stdout.write((lambda p: p[0] if len(p)==1 else s)(shlex.split(s)) if len(s)>=2 and s[0]=="'"'"'" and s.rstrip("\n").endswith("'"'"'") else s)'
+      }
 
-      ## Required Notion Changes
-      - Property: Claude Status -> REVIEW
-      - Property: Status -> Review
-      - Property: Notes -> set to the manifest below
-      - claimed_by: Codex (via bdc-harness)
-      - claimed_at: today's date
-
-      ## Manifest (write this to the Notes property verbatim)
+      MANIFEST=$(capture_node_output <<'BDC_NODE_OUTPUT_MANIFEST'
       $build-manifest.output
+      BDC_NODE_OUTPUT_MANIFEST
+      )
 
-      If Notion MCP is not available inside the container, do NOT invent a workaround.
-      Output a TODO line `XO_TODO: flip Notion manually for WO-RELEASE-CE-BRANCH-MODEL-01 with manifest above`
-      so XO sees it in the run log and patches Notion by hand.
+      READ_SPEC_OUT=$(capture_node_output <<'BDC_NODE_OUTPUT_READ_SPEC'
+      $read-spec.output
+      BDC_NODE_OUTPUT_READ_SPEC
+      )
+      ISSUE_REPO="${ISSUE_REPO:-thinmansoftware/bdc-xo}"
+      ISSUE_NUM=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'issue=[0-9]+' | head -1 | cut -d= -f2 || true)
+      if [ -z "$ISSUE_NUM" ]; then
+        ISSUE_NUM=$(printf '%s\n' "$READ_SPEC_OUT" | sed -n 's/^SPEC_PATH=.*issues\/\([0-9][0-9]*\).*/\1/p' | head -1)
+      fi
+      if [ -z "$ISSUE_NUM" ]; then
+        WO_ID_FROM_SPEC=$(printf '%s\n' "$READ_SPEC_OUT" | sed -n 's/^WO_ID=//p' | head -1)
+        if [ -n "$WO_ID_FROM_SPEC" ]; then
+          ISSUE_NUM=$(gh issue list --repo "$ISSUE_REPO" --search "$WO_ID_FROM_SPEC in:title" --json number --jq '.[0].number // empty' 2>/dev/null || true)
+        fi
+      fi
+      if [ -z "$ISSUE_NUM" ]; then
+        echo "flip-notion: no GitHub issue resolved; skipping status:review label + manifest comment."
+        exit 0
+      fi
+
+      gh label create status:review --repo "$ISSUE_REPO" --color 0E8A16 --description "BDC workflow is ready for review" 2>/dev/null || true
+      gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --remove-label status:building 2>/dev/null || true
+      gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --remove-label status:blocked 2>/dev/null || true
+      gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --add-label status:review
+      COMMENT_FILE=$(mktemp)
+      printf '%s\n' "$MANIFEST" > "$COMMENT_FILE"
+      gh issue comment "$ISSUE_NUM" --repo "$ISSUE_REPO" --body-file "$COMMENT_FILE"
+      echo "flip-notion: $ISSUE_REPO#$ISSUE_NUM -> status:review (manifest posted as comment)"

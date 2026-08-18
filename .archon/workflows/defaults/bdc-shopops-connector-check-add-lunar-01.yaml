@@ -1,0 +1,414 @@
+# Authored by yaml-author for WO-SHOPOPS-CONNECTOR-CHECK-ADD-LUNAR-01 on 2026-06-14
+# Source pattern: bdc-template-shopops-api.yaml (shopops-api WO -- Node.js + Rule 19 docker exec)
+# Reference: wo-shopops-billing-statement-v2-01.yaml (proven shopops-api child pattern)
+#
+# Rule compliance checklist:
+#  [x] Rule 1:  model: sonnet at workflow root
+#  [x] Rule 2:  bash blocks use date +%Y%m%d%H%M%S for branch suffix
+#  [x] Rule 3:  implement loop has fresh_context: true
+#  [x] Rule 4:  all paths relative to repo root (no BDC_XO/ prefix)
+#  [x] Rule 5:  spec lookup tries docs/work-orders/ then date-prefix glob then GitHub issue fallback
+#  [x] Rule 6:  policyFile: harness/policies/agent-behavior.md (no prefix)
+#  [x] Rule 7:  flip-notion final node; manifest in Notes property
+#  [x] Rule 10: implement loop declares ALL FOUR siblings: prompt, until, max_iterations, fresh_context
+#  [x] Rule 11: NO n8n webhook calls
+#  [x] Rule 19: shopops-api docker exec grep assertions in manifest and flip-notion
+#  [x] Rule 20: staging-gate repo -- PR base = staging, branch from staging HEAD
+
+name: bdc-shopops-connector-check-add-lunar-01
+description: |
+  Use when: Executing WO-SHOPOPS-CONNECTOR-CHECK-ADD-LUNAR-01 -- add 'lunar' as a
+  first-class connector so Lunar Distribution can write identity_connector_accounts rows.
+  Input: WO_ID = WO-SHOPOPS-CONNECTOR-CHECK-ADD-LUNAR-01.
+  Does:
+    - Reads spec from bdc-xo docs/work-orders/.
+    - Creates shopops-api/migrations/20260614_identity_connector_accounts_add_lunar.sql
+      (idempotent CHECK constraint extension adding 'lunar' to the nine-value set).
+    - Creates shopops-api/migrations/20260614_identity_connector_accounts_add_lunar_rollback.sql
+      (rollback: restores nine-value set, removes only 'lunar', keeps 'locg').
+    - Edits shopops-api/migrations/ci-staging-migrations.txt or apply-ci-staging-migrations.js
+      to apply the migration on staging by the same mechanism the locg migration uses.
+    - Edits shopops-api/routes/identity/connectors.js: adds 'lunar' to KNOWN_CONNECTORS
+      and DEFAULT_CAPABILITIES (reads providers/lunar.js to determine correct capabilities).
+    - Runs: node tests/run_all.js (all tests pass).
+    - Commits, pushes feature branch, opens PR to staging.
+    - Provides Rule 19 docker exec grep evidence in manifest.
+    - Flips Notion WO-SHOPOPS-CONNECTOR-CHECK-ADD-LUNAR-01 to REVIEW with manifest in Notes.
+  Repo: thinmansoftware/shopops (staging branch -- Rule 20 staging-gate repo).
+  WO class: CODE (single-repo, schema migration + code edit).
+  parallel_ok: false
+
+policyFile: harness/policies/agent-behavior.md
+provider: claude
+model: sonnet
+
+inputs:
+  WO_ID:
+    default: "WO-SHOPOPS-CONNECTOR-CHECK-ADD-LUNAR-01"
+
+nodes:
+
+  - id: preflight-github-auth
+    load_bearing: true
+    bash: |
+      set -euo pipefail
+      if ! git push --dry-run origin "HEAD:refs/heads/preflight-auth-probe-$(date +%s)" 2>&1; then
+        echo "ERROR: GITHUB auth check failed -- container cannot push to thinmansoftware/shopops." >&2
+        exit 1
+      fi
+      echo "preflight-github-auth PASS"
+      echo "TARGET_REPO=thinmansoftware/shopops"
+      echo "TARGET_BRANCH=staging"
+
+  - id: read-spec
+    depends_on: [preflight-github-auth]
+    bash: |
+      set -euo pipefail
+      WO_ID="${WO_ID:-WO-SHOPOPS-CONNECTOR-CHECK-ADD-LUNAR-01}"
+      SPEC_CONTENT=$(gh api \
+        "repos/thinmansoftware/bdc-xo/contents/docs/work-orders/${WO_ID}.md?ref=main" \
+        --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
+      SPEC_PATH="docs/work-orders/${WO_ID}.md"
+      if [ -z "$SPEC_CONTENT" ]; then
+        SPEC_PATH="docs/superpowers/specs/${WO_ID}.md"
+        SPEC_CONTENT=$(gh api \
+          "repos/thinmansoftware/bdc-xo/contents/${SPEC_PATH}?ref=main" \
+          --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
+      fi
+      if [ -z "$SPEC_CONTENT" ]; then
+        GLOB_PATH=$(gh api \
+          "repos/thinmansoftware/bdc-xo/contents/docs/superpowers/specs?ref=main" \
+          --template '{{range .}}{{.path}}{{"\n"}}{{end}}' 2>/dev/null \
+          | grep "${WO_ID}.md$" | head -1 || true)
+        if [ -n "$GLOB_PATH" ]; then
+          SPEC_PATH="$GLOB_PATH"
+          SPEC_CONTENT=$(gh api \
+            "repos/thinmansoftware/bdc-xo/contents/${SPEC_PATH}?ref=main" \
+            --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
+        fi
+      fi
+      if [ -z "$SPEC_CONTENT" ]; then
+        ISSUE_NUM=$(gh issue list --repo thinmansoftware/bdc-xo \
+          --search "${WO_ID} in:title" --json number,title \
+          --jq '.[0].number' 2>/dev/null || true)
+        if [ -n "$ISSUE_NUM" ] && [ "$ISSUE_NUM" != "null" ]; then
+          SPEC_CONTENT=$(gh issue view "$ISSUE_NUM" --repo thinmansoftware/bdc-xo \
+            --json body --jq .body 2>/dev/null || true)
+          [ -n "$SPEC_CONTENT" ] && SPEC_PATH="issues/${ISSUE_NUM}"
+        fi
+      fi
+      if [ -z "$SPEC_CONTENT" ]; then
+        echo "Spec not found for ${WO_ID}" >&2; exit 1
+      fi
+      printf 'WO_ID=%s\nSPEC_PATH=bdc-xo:%s\n\n' "$WO_ID" "$SPEC_PATH"
+      printf -- '--- SPEC ---\n%s\n' "$SPEC_CONTENT"
+
+  - id: fresh-branch
+    depends_on: [read-spec]
+    bash: |
+      set -euo pipefail
+      git fetch origin staging --depth=50 || true
+      git checkout staging 2>/dev/null || echo "staging branch held by worktree; staying on current HEAD"
+      git reset --hard origin/staging 2>/dev/null || true
+      BRANCH="wo/shopops-connector-check-add-lunar-01-run-$(date +%Y%m%d%H%M%S)"
+      git checkout -b "$BRANCH"
+      echo "BRANCH=${BRANCH}"
+      echo "BASE=staging"
+      echo "REPO=thinmansoftware/shopops"
+
+  - id: implement
+    depends_on: [fresh-branch]
+    loop:
+      fresh_context: true
+      until: COMPLETE
+      max_iterations: 5
+      prompt: |
+        Implement WO-SHOPOPS-CONNECTOR-CHECK-ADD-LUNAR-01 in the shopops repo.
+        CWD = shopops repo root. This is a COMPLETION of half-done work -- the locg
+        migration is the exact template, mirror it for lunar. All three changes must land.
+
+        ## Spec
+        $read-spec.output
+
+        ## Branch
+        $fresh-branch.output
+
+        ## STEP 0 -- Read provider and apply-script FIRST (Rule 17)
+        Before writing anything:
+        1. Read shopops-api/services/connect/providers/lunar.js to determine capabilities.
+        2. Read shopops-api/scripts/apply-ci-staging-migrations.js end-to-end to confirm
+           how the locg migration is applied on staging. Apply lunar by the SAME mechanism.
+        3. Read shopops-api/routes/identity/connectors.js (full file) to understand
+           KNOWN_CONNECTORS, DEFAULT_CAPABILITIES, and any credentialsExist block.
+
+        ## STEP 1 -- Migration (CREATE NEW)
+        Create shopops-api/migrations/20260614_identity_connector_accounts_add_lunar.sql.
+        Mirror the locg migration EXACTLY: idempotent, pg_class-guarded, DO block,
+        BEGIN/DO/COMMIT, ASCII-only, no emojis. New CHECK set: existing nine plus 'lunar'.
+        Header: companion to WO-CONNECT-LUNAR-ADAPTER-01; STAGING ONLY; idempotent.
+        Reference failing tests: test_connect_lunar.js, test_connect_capture.js,
+        test_connect_agent_contract.js.
+
+        Also create shopops-api/migrations/20260614_identity_connector_accounts_add_lunar_rollback.sql.
+        Rollback restores nine-value set (removes only 'lunar', keeps 'locg').
+
+        ## STEP 2 -- Apply mechanism (match locg)
+        Apply the lunar migration by whichever mechanism the locg migration uses (discovered
+        in STEP 0 -- may be manifest-txt entry or apply-script special-case).
+        Do NOT add rollback files to any manifest.
+
+        ## STEP 3 -- KNOWN_CONNECTORS + DEFAULT_CAPABILITIES (EDIT connectors.js)
+        Add 'lunar' to KNOWN_CONNECTORS (after 'locg').
+        Add lunar: entry to DEFAULT_CAPABILITIES using actual capabilities from
+        providers/lunar.js (discovered in STEP 0).
+        If there is a credentialsExist/secret-field block for 'locg', add a parallel
+        block for 'lunar' matching the provider's actual secret shape.
+
+        ## Tests
+        cd shopops-api && node tests/run_all.js
+        test_connect_lunar.js, test_connect_capture.js, test_connect_agent_contract.js must pass.
+
+        ## Commit
+        git -c user.name="John Ranson" -c user.email="admin@bluedevilcollectibles.com" \
+          commit -m "feat(shopops-api): WO-SHOPOPS-CONNECTOR-CHECK-ADD-LUNAR-01 -- register lunar connector
+
+        - migrations/20260614_identity_connector_accounts_add_lunar.sql: extend CHECK
+          constraint to add 'lunar' (nine-value set + lunar, idempotent, locg preserved)
+        - migrations/20260614_identity_connector_accounts_add_lunar_rollback.sql: rollback
+        - ci-staging-migrations.txt or apply-ci-staging-migrations.js: lunar applied by
+          same mechanism as locg migration
+        - routes/identity/connectors.js: 'lunar' added to KNOWN_CONNECTORS and
+          DEFAULT_CAPABILITIES
+
+        Co-Authored-By: Claude Sonnet (Cauldron bdc-shopops-connector-check-add-lunar-01) <noreply@anthropic.com>"
+        git push -u origin "$(git rev-parse --abbrev-ref HEAD)" 2>&1 || echo "WARN: push failed; backstop will retry"
+
+        ## Required output
+        RULE19_FILE=routes/identity/connectors.js
+        RULE19_GREP='lunar'
+        LUNAR_CAPABILITY=<capability string(s) from providers/lunar.js>
+        APPLY_MECHANISM=<manifest-txt OR apply-script-special-case>
+        COMPLETE
+
+  - id: business-risk-gate
+    load_bearing: true
+    depends_on: [implement]
+    bash: |
+      set -euo pipefail
+      BUSINESS_RISK_INVARIANT="The migration must extend the CHECK constraint by adding only 'lunar' to the existing nine-value set -- it must never drop or alter the 'locg' entry or any prior connector value, or existing connector rows and tests will break."
+      echo "=== business-risk-gate: verifying BUSINESS_RISK_INVARIANT ==="
+      echo "Invariant: $BUSINESS_RISK_INVARIANT"
+      MIGRATION="shopops-api/migrations/20260614_identity_connector_accounts_add_lunar.sql"
+      if [ ! -f "$MIGRATION" ]; then
+        echo "ERROR: migration file not found: $MIGRATION" >&2
+        echo "BUSINESS_RISK_INVARIANT=violated"; exit 1
+      fi
+      if ! grep -q "'locg'" "$MIGRATION"; then
+        echo "ERROR: 'locg' not found in migration -- locg was dropped." >&2
+        echo "BUSINESS_RISK_INVARIANT=violated"; exit 1
+      fi
+      if ! grep -q "'lunar'" "$MIGRATION"; then
+        echo "ERROR: 'lunar' not found in migration -- extension not applied." >&2
+        echo "BUSINESS_RISK_INVARIANT=violated"; exit 1
+      fi
+      for CONN in shopify ebay whatnot tiktok woocommerce pos facebook instagram; do
+        if ! grep -q "'$CONN'" "$MIGRATION"; then
+          echo "ERROR: connector '$CONN' missing from migration -- prior value dropped." >&2
+          echo "BUSINESS_RISK_INVARIANT=violated"; exit 1
+        fi
+      done
+      CONNECTORS_JS="shopops-api/routes/identity/connectors.js"
+      if ! grep -q "'lunar'" "$CONNECTORS_JS"; then
+        echo "ERROR: 'lunar' not found in connectors.js" >&2
+        echo "BUSINESS_RISK_INVARIANT=violated"; exit 1
+      fi
+      if ! grep -q "'locg'" "$CONNECTORS_JS"; then
+        echo "ERROR: 'locg' missing from connectors.js -- prior connector removed." >&2
+        echo "BUSINESS_RISK_INVARIANT=violated"; exit 1
+      fi
+      echo "BUSINESS_RISK_INVARIANT=satisfied"
+      echo "business-risk-gate PASS"
+
+  - id: decide-push-target
+    depends_on: [business-risk-gate]
+    bash: |
+      set -euo pipefail
+      echo "PUSH_TARGET=staging"
+      echo "BASE_BRANCH=staging"
+      echo "RULE20=true"
+
+  - id: verify-grep
+    depends_on: [decide-push-target]
+    bash: |
+      set -euo pipefail
+      echo "=== WO-SHOPOPS-CONNECTOR-CHECK-ADD-LUNAR-01 grep assertions ==="
+      LUNAR_COUNT=$(grep -c "'lunar'" shopops-api/routes/identity/connectors.js)
+      [ "$LUNAR_COUNT" -ge 2 ] || { echo "FAIL: 'lunar' < 2 in connectors.js" >&2; exit 1; }
+      echo "grep -c \"'lunar'\" shopops-api/routes/identity/connectors.js -> $LUNAR_COUNT PASS"
+      LOCG_COUNT=$(grep -c "'locg'" shopops-api/routes/identity/connectors.js)
+      [ "$LOCG_COUNT" -ge 1 ] || { echo "FAIL: 'locg' missing from connectors.js" >&2; exit 1; }
+      echo "grep -c \"'locg'\" shopops-api/routes/identity/connectors.js -> $LOCG_COUNT PASS"
+      MIGRATION_LUNAR=$(grep -c "'lunar'" shopops-api/migrations/20260614_identity_connector_accounts_add_lunar.sql)
+      [ "$MIGRATION_LUNAR" -ge 1 ] || { echo "FAIL: 'lunar' not in migration" >&2; exit 1; }
+      echo "grep -c \"'lunar'\" ...add_lunar.sql -> $MIGRATION_LUNAR PASS"
+      MIGRATION_LOCG=$(grep -c "'locg'" shopops-api/migrations/20260614_identity_connector_accounts_add_lunar.sql)
+      [ "$MIGRATION_LOCG" -ge 1 ] || { echo "FAIL: 'locg' not in migration -- prior value dropped" >&2; exit 1; }
+      echo "grep -c \"'locg'\" ...add_lunar.sql -> $MIGRATION_LOCG PASS"
+      echo "=== All grep assertions PASS ==="
+
+  - id: verify-tests
+    depends_on: [implement]
+    bash: |
+      set -euo pipefail
+      cd shopops-api
+      node tests/run_all.js
+      echo "node tests/run_all.js PASS"
+
+  - id: commit-and-push
+    depends_on: [verify-grep, verify-tests]
+    load_bearing: true
+    bash: |
+      set -euo pipefail
+      BRANCH="$(git rev-parse --abbrev-ref HEAD)"
+      git add -A
+      if git diff --cached --quiet; then
+        echo "No staged changes; implement loop already committed."
+      else
+        git -c user.name="John Ranson" -c user.email="admin@bluedevilcollectibles.com" \
+          commit -m "chore: backstop commit WO-SHOPOPS-CONNECTOR-CHECK-ADD-LUNAR-01"
+      fi
+      PUSH_OK=false
+      for attempt in 1 2 3; do
+        if git push -u origin "$BRANCH" 2>&1; then
+          PUSH_OK=true; break
+        fi
+        sleep $((attempt * 5))
+      done
+      [ "$PUSH_OK" = "true" ] || { echo "ERROR: git push failed after 3 attempts." >&2; exit 1; }
+      echo "BRANCH=${BRANCH}"
+      echo "SHA=$(git rev-parse HEAD)"
+
+  - id: open-pr-if-needed
+    depends_on: [commit-and-push]
+    load_bearing: true
+    bash: |
+      set -euo pipefail
+      WO_ID="WO-SHOPOPS-CONNECTOR-CHECK-ADD-LUNAR-01"
+      REPO="thinmansoftware/shopops"
+      BRANCH="$(git rev-parse --abbrev-ref HEAD)"
+      BASE="staging"
+      TITLE="feat(shopops-api): WO-SHOPOPS-CONNECTOR-CHECK-ADD-LUNAR-01 -- register lunar connector"
+      EXIST=$(gh pr list --repo "$REPO" --head "$BRANCH" --state open \
+        --json url --jq '.[0].url // empty' 2>/dev/null || true)
+      if [ -n "$EXIST" ]; then echo "PR_URL=$EXIST"; exit 0; fi
+      BODY_FILE=$(mktemp)
+      printf 'Implements %s.\nSpec: bdc-xo docs/work-orders/%s.md.\n\nThree coordinated changes:\n1. migrations/20260614_identity_connector_accounts_add_lunar.sql\n2. ci-staging-migrations.txt or apply-ci-staging-migrations.js\n3. routes/identity/connectors.js -- lunar added\n\nRule 19 (COPY . /app): after merge+rebuild:\n  docker exec shopops-api grep -n lunar /app/routes/identity/connectors.js\n  Expected: >= 2 matches\n' "$WO_ID" "$WO_ID" > "$BODY_FILE"
+      for attempt in 1 2 3 4 5; do
+        if PR_OUT=$(gh pr create --repo "$REPO" --base "$BASE" --head "$BRANCH" \
+            --title "$TITLE" --body-file "$BODY_FILE" 2>&1); then
+          echo "PR_URL=$PR_OUT"; exit 0
+        fi
+        EXIST=$(gh pr list --repo "$REPO" --head "$BRANCH" --state open \
+          --json url --jq '.[0].url // empty' 2>/dev/null || true)
+        if [ -n "$EXIST" ]; then echo "PR_URL=$EXIST"; exit 0; fi
+        sleep $((attempt * 5))
+      done
+      echo "ERROR: gh pr create failed after 5 attempts." >&2; exit 1
+
+  - id: build-manifest
+    depends_on: [open-pr-if-needed]
+    task_class: clerical
+    prompt: |
+      Build the Captain CI completion manifest v2 for WO-SHOPOPS-CONNECTOR-CHECK-ADD-LUNAR-01.
+
+      WO: WO-SHOPOPS-CONNECTOR-CHECK-ADD-LUNAR-01
+      Builder: Devils Cauldron (Archon bdc-shopops-connector-check-add-lunar-01)
+
+      Files created:
+       - shopops-api/migrations/20260614_identity_connector_accounts_add_lunar.sql
+       - shopops-api/migrations/20260614_identity_connector_accounts_add_lunar_rollback.sql
+
+      Files modified:
+       - shopops-api/migrations/ci-staging-migrations.txt or scripts/apply-ci-staging-migrations.js
+         (APPLY_MECHANISM from implement output)
+       - shopops-api/routes/identity/connectors.js (+lunar KNOWN_CONNECTORS + DEFAULT_CAPABILITIES)
+
+      Tests: $verify-tests.output
+
+      PRs: $open-pr-if-needed.output
+
+      Merge ancestors:
+       - shopops staging HEAD: SHA from $commit-and-push.output | behind_by: 0
+
+      Grep assertions:
+       - shopops: grep -c "'lunar'" shopops-api/routes/identity/connectors.js -> >= 2
+       - shopops: grep -c "'locg'" shopops-api/routes/identity/connectors.js -> >= 1 (locg preserved)
+       - shopops: grep -c "'lunar'" shopops-api/migrations/20260614_identity_connector_accounts_add_lunar.sql -> >= 1
+       - shopops: grep -c "'locg'" shopops-api/migrations/20260614_identity_connector_accounts_add_lunar.sql -> >= 1
+
+      Runtime verification (Rule 19 -- shopops-api uses COPY . /app, rebuild required after merge):
+       PENDING -- rebuild + restart shopops-api container after John promotes the staged PR.
+       After rebuild:
+         docker exec shopops-api grep -n "'lunar'" /app/routes/identity/connectors.js
+           -> Expected: >= 2 matches (KNOWN_CONNECTORS + DEFAULT_CAPABILITIES)
+         docker exec shopops-api grep -n "'locg'" /app/routes/identity/connectors.js
+           -> Expected: >= 1 match (locg preserved)
+       Staging schema (query staging Supabase directly):
+         SELECT pg_get_constraintdef(oid) FROM pg_constraint
+           WHERE conname = 'identity_connector_accounts_connector_check';
+         -> Expected: contains both 'lunar' and 'locg'
+
+      Vercel deployment: N/A (shopops-api is Docker on Hetzner, not Vercel)
+
+      VALIDATION: PASS (runtime verify pending post-deploy; all pre-deploy assertions verified above)
+
+      Inputs:
+      Implement: $implement.output
+      Business-risk-gate: $business-risk-gate.output
+      Grep: $verify-grep.output
+      Tests: $verify-tests.output
+      PR: $open-pr-if-needed.output
+
+  - id: flip-notion
+    depends_on: [build-manifest]
+    task_class: clerical
+    bash: |
+      set -euo pipefail
+
+      capture_node_output() {
+        python3 -c 'import shlex, sys; s=sys.stdin.read(); sys.stdout.write((lambda p: p[0] if len(p)==1 else s)(shlex.split(s)) if len(s)>=2 and s[0]=="'"'"'" and s.rstrip("\n").endswith("'"'"'") else s)'
+      }
+
+      MANIFEST=$(capture_node_output <<'BDC_NODE_OUTPUT_MANIFEST'
+      $build-manifest.output
+      BDC_NODE_OUTPUT_MANIFEST
+      )
+
+      READ_SPEC_OUT=$(capture_node_output <<'BDC_NODE_OUTPUT_READ_SPEC'
+      $read-spec.output
+      BDC_NODE_OUTPUT_READ_SPEC
+      )
+      ISSUE_REPO="${ISSUE_REPO:-thinmansoftware/bdc-xo}"
+      ISSUE_NUM=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'issue=[0-9]+' | head -1 | cut -d= -f2 || true)
+      if [ -z "$ISSUE_NUM" ]; then
+        ISSUE_NUM=$(printf '%s\n' "$READ_SPEC_OUT" | sed -n 's/^SPEC_PATH=.*issues\/\([0-9][0-9]*\).*/\1/p' | head -1)
+      fi
+      if [ -z "$ISSUE_NUM" ]; then
+        WO_ID_FROM_SPEC=$(printf '%s\n' "$READ_SPEC_OUT" | sed -n 's/^WO_ID=//p' | head -1)
+        if [ -n "$WO_ID_FROM_SPEC" ]; then
+          ISSUE_NUM=$(gh issue list --repo "$ISSUE_REPO" --search "$WO_ID_FROM_SPEC in:title" --json number --jq '.[0].number // empty' 2>/dev/null || true)
+        fi
+      fi
+      if [ -z "$ISSUE_NUM" ]; then
+        echo "flip-notion: no GitHub issue resolved; skipping status:review label + manifest comment."
+        exit 0
+      fi
+
+      gh label create status:review --repo "$ISSUE_REPO" --color 0E8A16 --description "BDC workflow is ready for review" 2>/dev/null || true
+      gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --remove-label status:building 2>/dev/null || true
+      gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --remove-label status:blocked 2>/dev/null || true
+      gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --add-label status:review
+      COMMENT_FILE=$(mktemp)
+      printf '%s\n' "$MANIFEST" > "$COMMENT_FILE"
+      gh issue comment "$ISSUE_NUM" --repo "$ISSUE_REPO" --body-file "$COMMENT_FILE"
+      echo "flip-notion: $ISSUE_REPO#$ISSUE_NUM -> status:review (manifest posted as comment)"

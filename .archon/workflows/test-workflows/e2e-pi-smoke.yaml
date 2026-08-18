@@ -1,4 +1,4 @@
-# E2E smoke test — Pi community provider
+# E2E smoke test -- Pi community provider
 # Verifies: Pi connectivity, $nodeId.output refs, async-queue bridge,
 #   and v2 wiring (thinkingLevel, allowed_tools).
 # Design: mirrors e2e-claude-smoke.yaml structure. The `allowed_tools: []`
@@ -13,7 +13,7 @@ provider: pi
 model: anthropic/claude-haiku-4-5
 
 nodes:
-  # 1. Simple prompt — verifies Pi harness starts, AsyncQueue bridge yields
+  # 1. Simple prompt -- verifies Pi harness starts, AsyncQueue bridge yields
   #    assistant chunks, and agent_end produces a result chunk. v2 wiring:
   #    allowed_tools: [] disables all Pi tools (LLM-only); effort: low is
   #    translated to Pi's thinkingLevel by options-translator.ts.
@@ -23,7 +23,7 @@ nodes:
     effort: low
     idle_timeout: 30000
 
-  # 2. Assert non-empty output — fails CI if Pi returned nothing
+  # 2. Assert non-empty output -- fails CI if Pi returned nothing
   - id: assert
     bash: |
       output="$simple.output"

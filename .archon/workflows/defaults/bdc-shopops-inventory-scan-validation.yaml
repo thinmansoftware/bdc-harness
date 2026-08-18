@@ -5,8 +5,8 @@
 # Pre-flight (4-block):
 #   1. YAML exists.
 #   2. Spec: bdc-xo:docs/work-orders/WO-SHOPOPS-INVENTORY-SCAN-VALIDATION-01.md
-#   3. CWD scope = shopops repo (subdir shopops-api/) — single-repo MIXED, no UI.
-#   4. Codebase bluedevilcollectibles/shopops registered.
+#   3. CWD scope = shopops repo (subdir shopops-api/) -- single-repo MIXED, no UI.
+#   4. Codebase thinmansoftware/shopops registered.
 #
 # parallel_ok: YES (new table only; no shared-table writes; no FK to multi-location migration).
 # Polish bar: ROUGH OK (P1; detection-only v1; manual SQL resolution acceptable).
@@ -15,7 +15,7 @@
 
 name: bdc-shopops-inventory-scan-validation
 description: |
-  Use when: Executing WO-SHOPOPS-INVENTORY-SCAN-VALIDATION-01 — duplicate/qty/unexpected
+  Use when: Executing WO-SHOPOPS-INVENTORY-SCAN-VALIDATION-01 -- duplicate/qty/unexpected
             detection on shipment ingest.
   Input: WO_ID = WO-SHOPOPS-INVENTORY-SCAN-VALIDATION-01.
   Does: Adds shipment_exceptions table (migration 20260515). Adds
@@ -24,9 +24,9 @@ description: |
         validateShipmentLines orchestrator. Extends shipments.js ingest path
         to call validator and emit exceptions array in response. 6+ bun tests.
         Commits, opens PR, Rule 19 docker exec verify, MIXED manifest, flip-notion REVIEW.
-  Repo: bluedevilcollectibles/shopops (single-repo, no UI).
-  parallel_ok: true — new table only.
-  Polish bar: ROUGH OK — detection-only v1; no auto-resolution; no UI; manual SQL fix
+  Repo: thinmansoftware/shopops (single-repo, no UI).
+  parallel_ok: true -- new table only.
+  Polish bar: ROUGH OK -- detection-only v1; no auto-resolution; no UI; manual SQL fix
               by staff is acceptable.
 
 policyFile: harness/policies/agent-behavior.md
@@ -41,17 +41,17 @@ nodes:
 
       # gh --template uses Go templates (built into gh, no external jq dependency)
       SPEC_CONTENT=$(gh api \
-        "repos/bluedevilcollectibles/bdc-xo/contents/docs/work-orders/${WO_ID}.md?ref=main" \
+        "repos/thinmansoftware/bdc-xo/contents/docs/work-orders/${WO_ID}.md?ref=main" \
         --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
 
       if [ -z "$SPEC_CONTENT" ]; then
         GLOB_PATH=$(gh api \
-          "repos/bluedevilcollectibles/bdc-xo/contents/docs/superpowers/specs?ref=main" \
+          "repos/thinmansoftware/bdc-xo/contents/docs/superpowers/specs?ref=main" \
           --template '{{range .}}{{.path}}{{"\n"}}{{end}}' \
           2>/dev/null | grep "${WO_ID}.md$" | head -1 || true)
         if [ -n "$GLOB_PATH" ]; then
           SPEC_CONTENT=$(gh api \
-            "repos/bluedevilcollectibles/bdc-xo/contents/${GLOB_PATH}?ref=main" \
+            "repos/thinmansoftware/bdc-xo/contents/${GLOB_PATH}?ref=main" \
             --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
         fi
       fi
@@ -60,12 +60,12 @@ nodes:
         # Fallback 4: GitHub issue body (WO-HARNESS-READ-SPEC-ISSUE-BODY-FALLBACK-01)
         ISSUE_NUM=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'issue=[0-9]+' | head -n 1 | cut -d= -f2 || true)
         if [ -z "$ISSUE_NUM" ]; then
-          ISSUE_NUM=$(gh issue list --repo bluedevilcollectibles/bdc-xo \
+          ISSUE_NUM=$(gh issue list --repo thinmansoftware/bdc-xo \
             --search "${WO_ID} in:title" --json number,title \
             --jq '.[0].number' 2>/dev/null || true)
         fi
         if [ -n "$ISSUE_NUM" ] && [ "$ISSUE_NUM" != "null" ]; then
-          SPEC_CONTENT=$(gh issue view "$ISSUE_NUM" --repo bluedevilcollectibles/bdc-xo \
+          SPEC_CONTENT=$(gh issue view "$ISSUE_NUM" --repo thinmansoftware/bdc-xo \
             --json body --jq .body 2>/dev/null || true)
           [ -n "$SPEC_CONTENT" ] && SPEC_PATH="issues/${ISSUE_NUM}"
         fi
@@ -143,12 +143,12 @@ nodes:
       Backend (shopops-api):
       - migrations/20260515_shipment_exceptions.sql (single new table + 2 indexes)
       - services/shipmentValidator.js:
-          * detectDuplicateUpcs(lines) — pure
-          * detectQtyMismatches(lines, distributorOrderLines) — pure
-          * detectUnexpectedItems(lines, distributorOrderLines) — pure
-          * validateShipmentLines(shipmentId) — orchestrator + DB writes
-      - Modify routes/shipments.js — invoke validateShipmentLines after commit; add exceptions to response
-      - tests/test_shipment_validator.js — 6 unit tests (one per scenario A-F in WO spec)
+          * detectDuplicateUpcs(lines) -- pure
+          * detectQtyMismatches(lines, distributorOrderLines) -- pure
+          * detectUnexpectedItems(lines, distributorOrderLines) -- pure
+          * validateShipmentLines(shipmentId) -- orchestrator + DB writes
+      - Modify routes/shipments.js -- invoke validateShipmentLines after commit; add exceptions to response
+      - tests/test_shipment_validator.js -- 6 unit tests (one per scenario A-F in WO spec)
 
       v1 NOT in scope: auto-resolution, exception management UI, alerts, batch resolve endpoints.
 
@@ -183,7 +183,7 @@ nodes:
            CREATE INDEX IF NOT EXISTS shipment_exceptions_shipment_idx ON shipment_exceptions(shipment_id);
            CREATE INDEX IF NOT EXISTS shipment_exceptions_open_idx ON shipment_exceptions(tenant_id) WHERE resolved_at IS NULL;
 
-        2. shopops-api/services/shipmentValidator.js — three pure detectors + orchestrator:
+        2. shopops-api/services/shipmentValidator.js -- three pure detectors + orchestrator:
            - detectDuplicateUpcs(lines): returns [{ upc, line_ids: [...] }]
            - detectQtyMismatches(lines, distributorOrderLines): [{ line_id, scanned, expected }]
            - detectUnexpectedItems(lines, distributorOrderLines): [{ line_id, upc }]
@@ -197,7 +197,7 @@ nodes:
            After existing ingest commits lines (do NOT change commit logic):
              const exceptions = await validateShipmentLines(shipmentId);
              res.json({ ...existing_body, exceptions });
-           Do NOT block ingest on exceptions — informational only in v1.
+           Do NOT block ingest on exceptions -- informational only in v1.
 
         4. shopops-api/tests/test_shipment_validator.js (bun, >= 6 tests):
            - duplicate_upc detected (scenario A)
@@ -245,7 +245,7 @@ nodes:
     depends_on: [verify-grep, verify-tests]
     bash: |
       set -euo pipefail
-      # Use current HEAD branch (set by fresh-branch — may be timestamped variant)
+      # Use current HEAD branch (set by fresh-branch -- may be timestamped variant)
       BRANCH="$(git rev-parse --abbrev-ref HEAD)"
       git add \
         shopops-api/migrations/20260515_shipment_exceptions.sql \
@@ -256,7 +256,7 @@ nodes:
         echo "No staged changes"
       else
         git -c user.name="John Ranson" -c user.email="admin@bluedevilcollectibles.com" \
-          commit -m "$(printf 'feat(api): WO-SHOPOPS-INVENTORY-SCAN-VALIDATION-01 — shipment exception detection\n\nAdds shipment_exceptions table (migration 20260515).\nAdds services/shipmentValidator.js with three pure detectors\n(detectDuplicateUpcs, detectQtyMismatches, detectUnexpectedItems) +\nvalidateShipmentLines orchestrator.\n\nExtends routes/shipments.js ingest path: calls validator after line commit,\nemits exceptions array in response body. Does NOT block ingest (informational v1).\n\n6+ bun tests (one per detection scenario + clean shipment + response shape).\n\nPlan: A (P1 extension for Mutant Market 2026-06-15)\nPolish bar: ROUGH OK — v1 detection-only. No auto-resolution, no UI.\n            Staff resolves via SQL until v1.1 exception management UI ships.\n\nCo-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>')"
+          commit -m "$(printf 'feat(api): WO-SHOPOPS-INVENTORY-SCAN-VALIDATION-01 -- shipment exception detection\n\nAdds shipment_exceptions table (migration 20260515).\nAdds services/shipmentValidator.js with three pure detectors\n(detectDuplicateUpcs, detectQtyMismatches, detectUnexpectedItems) +\nvalidateShipmentLines orchestrator.\n\nExtends routes/shipments.js ingest path: calls validator after line commit,\nemits exceptions array in response body. Does NOT block ingest (informational v1).\n\n6+ bun tests (one per detection scenario + clean shipment + response shape).\n\nPlan: A (P1 extension for Mutant Market 2026-06-15)\nPolish bar: ROUGH OK -- v1 detection-only. No auto-resolution, no UI.\n            Staff resolves via SQL until v1.1 exception management UI ships.\n\nCo-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>')"
       fi
       git push -u origin "$BRANCH"
       echo "BRANCH=${BRANCH}"
@@ -267,11 +267,11 @@ nodes:
     bash: |
       set -euo pipefail
       BRANCH="$(git rev-parse --abbrev-ref HEAD)"
-      REPO="bluedevilcollectibles/shopops"
+      REPO="thinmansoftware/shopops"
       BASE="master"
-      TITLE="feat(api): WO-SHOPOPS-INVENTORY-SCAN-VALIDATION-01 — shipment exception detection"
+      TITLE="feat(api): WO-SHOPOPS-INVENTORY-SCAN-VALIDATION-01 -- shipment exception detection"
       BODY_FILE=$(mktemp)
-      printf '## Summary\nImplements WO-SHOPOPS-INVENTORY-SCAN-VALIDATION-01 — detection-only v1.\n\n## Plan: A (P1)\n## Polish bar: ROUGH OK — staff resolves via SQL in v1.\nv1 NOT in scope: auto-resolution, resolve endpoints, exception management UI, alerts.\n\n## Apply migration 20260515_shipment_exceptions.sql to staging Supabase BEFORE merging.\n' > "$BODY_FILE"
+      printf '## Summary\nImplements WO-SHOPOPS-INVENTORY-SCAN-VALIDATION-01 -- detection-only v1.\n\n## Plan: A (P1)\n## Polish bar: ROUGH OK -- staff resolves via SQL in v1.\nv1 NOT in scope: auto-resolution, resolve endpoints, exception management UI, alerts.\n\n## Apply migration 20260515_shipment_exceptions.sql to staging Supabase BEFORE merging.\n' > "$BODY_FILE"
       existing_pr_url() { gh pr list --repo "$REPO" --head "$BRANCH" --state open --json url --template '{{range .}}{{.url}}{{end}}' 2>/dev/null; }
       PR_URL="$(existing_pr_url)"
       if [ -n "$PR_URL" ]; then echo "PR_URL=$PR_URL"; exit 0; fi
@@ -326,7 +326,7 @@ nodes:
         docker exec shopops-api node -e "<count shipment_exceptions>"
       Schema migration: apply 20260515 to staging Supabase before container rebuild.
         Post-apply: SELECT table_name FROM information_schema.tables WHERE table_name='shipment_exceptions' -- expect 1
-      Vercel deployment: N/A — Hetzner Docker
+      Vercel deployment: N/A -- Hetzner Docker
       v1 limitations explicit:
         - detection only; no auto-resolution
         - no exception management UI
@@ -343,13 +343,43 @@ nodes:
   - id: flip-notion
     depends_on: [build-manifest]
     task_class: clerical
-    prompt: |
-      Flip Notion WO-SHOPOPS-INVENTORY-SCAN-VALIDATION-01 to REVIEW with manifest in Notes property.
-      Database: a6df831c-0b52-449f-8ca4-d77be6b70d0a
-      # OPEN QUESTION: operator confirms Notion page ID before deploy.
+    bash: |
+      set -euo pipefail
 
-      Claude Status=REVIEW + Status=Review + Notes=manifest verbatim + claimed_by=Devils Cauldron + plan=A.
-      If Notion MCP unavailable, emit XO_TODO line.
+      capture_node_output() {
+        python3 -c 'import shlex, sys; s=sys.stdin.read(); sys.stdout.write((lambda p: p[0] if len(p)==1 else s)(shlex.split(s)) if len(s)>=2 and s[0]=="'"'"'" and s.rstrip("\n").endswith("'"'"'") else s)'
+      }
 
-      ## Manifest
+      MANIFEST=$(capture_node_output <<'BDC_NODE_OUTPUT_MANIFEST'
       $build-manifest.output
+      BDC_NODE_OUTPUT_MANIFEST
+      )
+
+      READ_SPEC_OUT=$(capture_node_output <<'BDC_NODE_OUTPUT_READ_SPEC'
+      $read-spec.output
+      BDC_NODE_OUTPUT_READ_SPEC
+      )
+      ISSUE_REPO="${ISSUE_REPO:-thinmansoftware/bdc-xo}"
+      ISSUE_NUM=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'issue=[0-9]+' | head -1 | cut -d= -f2 || true)
+      if [ -z "$ISSUE_NUM" ]; then
+        ISSUE_NUM=$(printf '%s\n' "$READ_SPEC_OUT" | sed -n 's/^SPEC_PATH=.*issues\/\([0-9][0-9]*\).*/\1/p' | head -1)
+      fi
+      if [ -z "$ISSUE_NUM" ]; then
+        WO_ID_FROM_SPEC=$(printf '%s\n' "$READ_SPEC_OUT" | sed -n 's/^WO_ID=//p' | head -1)
+        if [ -n "$WO_ID_FROM_SPEC" ]; then
+          ISSUE_NUM=$(gh issue list --repo "$ISSUE_REPO" --search "$WO_ID_FROM_SPEC in:title" --json number --jq '.[0].number // empty' 2>/dev/null || true)
+        fi
+      fi
+      if [ -z "$ISSUE_NUM" ]; then
+        echo "flip-notion: no GitHub issue resolved; skipping status:review label + manifest comment."
+        exit 0
+      fi
+
+      gh label create status:review --repo "$ISSUE_REPO" --color 0E8A16 --description "BDC workflow is ready for review" 2>/dev/null || true
+      gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --remove-label status:building 2>/dev/null || true
+      gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --remove-label status:blocked 2>/dev/null || true
+      gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --add-label status:review
+      COMMENT_FILE=$(mktemp)
+      printf '%s\n' "$MANIFEST" > "$COMMENT_FILE"
+      gh issue comment "$ISSUE_NUM" --repo "$ISSUE_REPO" --body-file "$COMMENT_FILE"
+      echo "flip-notion: $ISSUE_REPO#$ISSUE_NUM -> status:review (manifest posted as comment)"

@@ -6,7 +6,7 @@ description: |
   NOT for: Features, doctrine-only updates, cleanup sweeps, infrastructure deploys, or P0 incidents requiring emergency hotfixes.
 
 policyFile: harness/policies/agent-behavior.md
-model: claude-sonnet-4-5
+model: sonnet
 
 nodes:
   - id: read-spec
@@ -22,7 +22,7 @@ nodes:
         exit 1
       fi
       # Try direct path first, then date-prefixed glob (specs are commonly named YYYY-MM-DD-WO-...md)
-      # CWD is the bdc-xo repo root (Archon worktree), so paths are relative — no BDC_XO/ prefix.
+      # CWD is the bdc-xo repo root (Archon worktree), so paths are relative -- no BDC_XO/ prefix.
       SPEC_PATH="docs/superpowers/specs/${WO_ID}.md"
       if [ ! -f "$SPEC_PATH" ]; then
         SPEC_PATH=$(ls docs/superpowers/specs/*${WO_ID}.md 2>/dev/null | head -n 1 || true)
@@ -31,13 +31,13 @@ nodes:
         # Fallback 3: GitHub issue body (WO-HARNESS-READ-SPEC-ISSUE-BODY-FALLBACK-01)
         ISSUE_NUM=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'issue=[0-9]+' | head -n 1 | cut -d= -f2 || true)
         if [ -z "$ISSUE_NUM" ]; then
-          ISSUE_NUM=$(gh issue list --repo bluedevilcollectibles/bdc-xo \
+          ISSUE_NUM=$(gh issue list --repo thinmansoftware/bdc-xo \
             --search "${WO_ID} in:title" --json number,title \
             --jq '.[0].number' 2>/dev/null || true)
         fi
         SPEC_CONTENT=""
         if [ -n "$ISSUE_NUM" ] && [ "$ISSUE_NUM" != "null" ]; then
-          SPEC_CONTENT=$(gh issue view "$ISSUE_NUM" --repo bluedevilcollectibles/bdc-xo \
+          SPEC_CONTENT=$(gh issue view "$ISSUE_NUM" --repo thinmansoftware/bdc-xo \
             --json body --jq .body 2>/dev/null || true)
         fi
         if [ -z "$SPEC_CONTENT" ]; then
@@ -136,9 +136,9 @@ nodes:
 
       ## BDC Push Policy
       Hardcoded Rule 20 staging-gate repos:
-      - bluedevilcollectibles/lspro-react
-      - bluedevilcollectibles/shopops-storefront
-      - bluedevilcollectibles/shopops/
+      - thinmansoftware/lspro-react
+      - thinmansoftware/shopops-storefront
+      - thinmansoftware/shopops
 
       For those repos, use a feature branch plus PR and require the staging gate.
       For other code repos, use feature branch plus PR without staging gate.
@@ -186,6 +186,133 @@ nodes:
       max_iterations: 5
       fresh_context: true
 
+  # ascii-gate (Rule 13 mechanical enforcement -- WO-HARNESS-CAULDRON-ASCII-ENFORCEMENT).
+  # Fails the build (load_bearing, exit 1) if any source file changed by this run contains
+  # a non-ASCII byte. The ASCII-only-source rule is carried in the policyFile every node
+  # loads, but Claude/Opus leaks non-ASCII even when told not to, so enforce it mechanically
+  # AFTER the fix and BEFORE the validator/commit/PR chain (war-council-validator also
+  # depends_on ascii-gate, so a violation blocks the whole downstream chain). Scope = source
+  # files changed since the branch base.
+  - id: ascii-gate
+    persona: major-build
+    depends_on: [implement-fix]
+    load_bearing: true
+    bash: |
+      set -uo pipefail
+      WT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
+      cd "$WT"
+      BASE_REF="origin/${BASE_BRANCH:-main}"
+      BASE=$(git merge-base HEAD "$BASE_REF" 2>/dev/null || git rev-parse HEAD~1 2>/dev/null || echo "")
+      SRC_RE='\.(js|jsx|ts|tsx|mjs|cjs|html|sh|bash|gs|yaml|yml)$'
+      if [ -n "$BASE" ] && git rev-parse --verify "$BASE" >/dev/null 2>&1; then
+        CHANGED=$( { git diff --name-only "$BASE"..HEAD 2>/dev/null; git diff --name-only HEAD 2>/dev/null; git ls-files --others --exclude-standard 2>/dev/null; } | sort -u | grep -E "$SRC_RE" || true )
+      else
+        CHANGED=$( { git diff --name-only HEAD 2>/dev/null; git ls-files --others --exclude-standard 2>/dev/null; } | sort -u | grep -E "$SRC_RE" || true )
+      fi
+      if [ -z "$CHANGED" ]; then
+        echo "ascii-gate PASS (no changed source files to scan)"
+        exit 0
+      fi
+      GREP_P_OK=0
+      if printf 'a\xe2\x80\x94b\n' | grep -qP "[^\x00-\x7F]" 2>/dev/null; then GREP_P_OK=1; fi
+      detect() {
+        f="$1"
+        if [ "$GREP_P_OK" = "1" ]; then
+          grep -lP "[^\x00-\x7F]" "$f" >/dev/null 2>&1 && return 1
+        elif command -v perl >/dev/null 2>&1; then
+          perl -ne 'exit 1 if /[^\x00-\x7F]/' "$f" || return 1
+        else
+          # Locale-independent: any byte >= 0x80 is non-ASCII. od is in coreutils everywhere
+          # (LC_ALL=C grep -P errors out: "-P supports only unibyte and UTF-8 locales").
+          od -An -tu1 "$f" 2>/dev/null | tr ' ' '\n' | grep -qE '^(12[89]|1[3-9][0-9]|2[0-4][0-9]|25[0-5])$' && return 1
+        fi
+        return 0
+      }
+      detect_text() {
+        text="$1"
+        if [ "$GREP_P_OK" = "1" ]; then
+          printf '%s\n' "$text" | grep -qP "[^\x00-\x7F]" 2>/dev/null && return 1
+        elif command -v perl >/dev/null 2>&1; then
+          printf '%s\n' "$text" | perl -ne 'exit 1 if /[^\x00-\x7F]/' || return 1
+        else
+          printf '%s\n' "$text" | od -An -tu1 2>/dev/null | tr ' ' '\n' | grep -qE '^(12[89]|1[3-9][0-9]|2[0-4][0-9]|25[0-5])$' && return 1
+        fi
+        return 0
+      }
+      report_whole_file() {
+        f="$1"
+        if [ "$GREP_P_OK" = "1" ]; then
+          grep -nP "[^\x00-\x7F]" "$f" 2>/dev/null | head -5 | sed "s|^|${f}:|" >> "$DETAILFILE"
+        elif command -v perl >/dev/null 2>&1; then
+          perl -ne 'print "'"$f"':$.: $_" if /[^\x00-\x7F]/' "$f" 2>/dev/null | head -5 >> "$DETAILFILE"
+        fi
+      }
+      scan_added_lines() {
+        f="$1"
+        base="$2"
+        current_file=''
+        new_line=0
+        git -c core.pager=cat diff -U0 --no-color --find-renames "$base" -- 2>/dev/null | while IFS= read -r line; do
+          case "$line" in
+            @@*)
+              if [ "$current_file" = "$f" ]; then
+                parsed=$(printf '%s\n' "$line" | sed -n 's/^@@ [^+]*+\([0-9][0-9]*\)\(,[0-9][0-9]*\)\? @@.*/\1/p')
+                case "$parsed" in
+                  ''|*[!0-9]*) new_line=0 ;;
+                  *) new_line=$parsed ;;
+                esac
+              else
+                new_line=0
+              fi
+              ;;
+            '+++'*)
+              current_file=${line#+++ }
+              current_file=${current_file#b/}
+              [ "$current_file" = "/dev/null" ] && current_file=''
+              ;;
+            +*)
+              [ "$current_file" = "$f" ] || continue
+              text=${line#+}
+              if ! detect_text "$text"; then
+                printf '%s\n' "$f" >> "$HITFILE"
+                printf '%s:%s:%s\n' "$f" "$new_line" "$text" >> "$DETAILFILE"
+              fi
+              if [ "$new_line" -gt 0 ] 2>/dev/null; then new_line=$((new_line + 1)); fi
+              ;;
+          esac
+        done
+      }
+      HITFILE=$(mktemp)
+      DETAILFILE=$(mktemp)
+      trap 'rm -f "$HITFILE" "$DETAILFILE"' EXIT
+      printf '%s\n' "$CHANGED" | while IFS= read -r f; do
+        [ -z "$f" ] && continue
+        [ -f "$f" ] || continue
+        if git ls-files --others --exclude-standard -- "$f" | grep -Fxq "$f"; then
+          if ! detect "$f"; then
+            printf '%s\n' "$f" >> "$HITFILE"
+            report_whole_file "$f"
+          fi
+        elif [ -n "$BASE" ]; then
+          scan_added_lines "$f" "$BASE"
+        elif ! detect "$f"; then
+          printf '%s\n' "$f" >> "$HITFILE"
+          report_whole_file "$f"
+        fi
+      done
+      if [ -s "$HITFILE" ]; then
+        echo "ASCII GATE FAILED -- non-ASCII bytes in changed source file(s):" >&2
+        LC_ALL=C sort -u "$HITFILE" >&2
+        if [ -s "$DETAILFILE" ]; then
+          echo "--- offending lines (first 5 per file) ---" >&2
+          awk -F: '!seen[$1]++ { count[$1]=0 } count[$1] < 5 { print; count[$1]++ }' "$DETAILFILE" >&2
+        fi
+        echo "Fix: em-dash/en-dash -> --, smart quotes -> ' and \", ellipsis -> ..., middot -> | or -, nbsp -> space, Unicode minus -> -. No emojis in source." >&2
+        echo "See harness/policies/agent-behavior.md (Code Standards / Rule 13). This gate is load_bearing: the build fails until every changed source file is pure ASCII." >&2
+        exit 1
+      fi
+      echo "ascii-gate PASS (scanned $(printf '%s\n' "$CHANGED" | grep -c .) changed source file(s), all ASCII)"
+      exit 0
   - id: verify-test-passes
     persona: major-build
     depends_on: [implement-fix]
@@ -252,7 +379,7 @@ nodes:
 
   - id: war-council-validator
     persona: captain-ci-validator
-    depends_on: [verify-test-passes, verify-build, verify-types, verify-other-tests]
+    depends_on: [verify-test-passes, verify-build, verify-types, verify-other-tests, ascii-gate]
     task_class: medium_work
     prompt: |
       Invoke or emulate the war-council-validator review for this Work Order.
@@ -315,12 +442,12 @@ nodes:
       3. `Target repo: <owner>/<repo>` (plain header)
       4. `**Target Repo:** \`<owner>/<repo>\`` (Markdown bold, capital R)
 
-      The target repo is where the PR must be opened (NOT the worktree's git origin — Rule 29).
+      The target repo is where the PR must be opened (NOT the worktree's git origin -- Rule 29).
 
       Match the extracted repo against this hardcoded staging-gate list:
-      - bluedevilcollectibles/lspro-react
-      - bluedevilcollectibles/shopops-storefront
-      - bluedevilcollectibles/shopops/
+      - thinmansoftware/lspro-react
+      - thinmansoftware/shopops-storefront
+      - thinmansoftware/shopops
 
       If the repo matches one of those entries, output:
       push_target: feature-branch:<spec-derived-branch-name>
@@ -352,15 +479,74 @@ nodes:
         echo "Out of scope for bdc-bug-fix; failing closed." >&2
         exit 1
       fi
-      BRANCH=$(printf '%s\n' "$decide-push-target.output" | sed -n 's/^push_target: feature-branch://p' | head -n 1)
+      # WO-HARNESS-PUSH-TARGET-EXTRACTION-HARDENING-01: tolerant multi-strategy
+      # push_target extraction. The old line-anchored sed broke a 2nd time
+      # (run e5110df1, fable tier, 2026-08-01) after PR #165's first whitespace
+      # patch -- the ^...$ anchor requires the WHOLE line to be exactly
+      # "push_target: feature-branch: <token>", so any markdown fence, list
+      # bullet, blockquote, backtick, or trailing prose a model tier adds makes
+      # BRANCH come back empty and the node exit 1 with a message that lied
+      # ("absent" when the field was present but merely styled differently).
+      # Fix: pre-strip backticks, then (1) fast path -- the exact
+      # whitespace-tolerant anchor (unchanged behavior for well-formed output,
+      # zero regression); (2) fallback -- scan ANYWHERE for
+      # "push_target: feature-branch: <token>", stopping at the first whitespace
+      # so trailing prose is tolerated. Failure now distinguishes "field absent"
+      # from "field present but unparseable". Extraction is a pure read of the
+      # decide output (no state mutation), so re-running the node is
+      # side-effect-free. BRANCH_PATTERN validation below is unchanged and still
+      # runs after extraction.
+      DECIDE_OUTPUT_CLEAN=$(printf '%s\n' "$decide-push-target.output" | tr -d '`')
+      BRANCH=$(printf '%s\n' "$DECIDE_OUTPUT_CLEAN" | sed -n 's/^[[:space:]]*push_target:[[:space:]]*feature-branch:[[:space:]]*\([^[:space:]]*\)[[:space:]]*$/\1/p' | head -n 1)
       if [ -z "$BRANCH" ]; then
-        echo "No feature branch target found in decide-push-target output." >&2
+        BRANCH=$(printf '%s\n' "$DECIDE_OUTPUT_CLEAN" \
+          | { grep -oE 'push_target:[[:space:]]*feature-branch:[[:space:]]*[^[:space:]]+' || true; } \
+          | head -n 1 \
+          | sed -E 's/^.*feature-branch:[[:space:]]*//')
+      fi
+      if [ -z "$BRANCH" ]; then
+        # Bare-form fallback (anchor run ce394492, zero-open tier, 2026-08-07):
+        # open-tier models emit "push_target: feat/<name>" WITHOUT the
+        # feature-branch: prefix. Accept the bare form LAST. Safe: the extracted
+        # token still must pass BRANCH_PATTERN below, so this admits nothing the
+        # strict form would not.
+        BRANCH=$(printf '%s\n' "$DECIDE_OUTPUT_CLEAN" | { grep -oE 'push_target:[[:space:]]*(feat|fix|wip)/[A-Za-z0-9_-]+' || true; } | head -n 1 | sed -E 's/^push_target:[[:space:]]*//')
+      fi
+      if [ -z "$BRANCH" ]; then
+        if printf '%s\n' "$DECIDE_OUTPUT_CLEAN" | grep -q 'push_target'; then
+          PUSH_TARGET_EXCERPT=$(printf '%s\n' "$DECIDE_OUTPUT_CLEAN" | grep 'push_target' | head -n 1 | cut -c1-200)
+          echo "push_target field present but unparseable: ${PUSH_TARGET_EXCERPT}" >&2
+        else
+          echo "push_target field absent from decide-push-target output." >&2
+        fi
         exit 1
       fi
       # WO-HARNESS-YAML-USE-THREAD-BRANCH-NOT-FEATURE-BRANCH-01
       # Engine already provides a unique archon/thread-<hash> branch per run.
       # Derive a unique remote push target from it instead of clobbering a shared name.
-      THREAD_ID=$(git rev-parse --abbrev-ref HEAD | sed 's|archon/thread-||')
+      # DEFECT FIX 2026-07-27 (anchor: WO-CRM-SUPABASE-CONVERGENCE-01, run d982e84e).
+      # The old line was:
+      #   THREAD_ID=$(git rev-parse --abbrev-ref HEAD | sed 's|archon/thread-||')
+      # That sed only strips a PREFIX. When HEAD is NOT archon/thread-<hash> -- e.g. a run
+      # resumed on an existing feature branch, as happens when a WO converges an existing
+      # PR -- nothing is stripped and THREAD_ID becomes the ENTIRE branch name, producing
+      # a nested double-suffix ref like:
+      #   feat/wo-crm-supabase-convergence-01-thread-feat/wo-xo-crm-minimum-complete-journey-01
+      # which then opened a SECOND, spurious PR. BRANCH is validated; THREAD_ID never was.
+      CURRENT_REF=$(git rev-parse --abbrev-ref HEAD)
+      case "$CURRENT_REF" in
+        archon/thread-*)
+          THREAD_ID=${CURRENT_REF#archon/thread-}
+          ;;
+        *)
+          THREAD_ID=$(git rev-parse --short=8 HEAD 2>/dev/null || echo "nohead")
+          echo "commit-and-push: HEAD is '${CURRENT_REF}' (not archon/thread-*); using commit-derived THREAD_ID=${THREAD_ID}" >&2
+          ;;
+      esac
+      if ! printf '%s\n' "$THREAD_ID" | grep -Eq '^[A-Za-z0-9_-]+$'; then
+        echo "ERROR: refusing to push -- derived THREAD_ID '${THREAD_ID}' is not a bare [A-Za-z0-9_-] token (would create a malformed branch)." >&2
+        exit 1
+      fi
       UNIQUE_BRANCH="${BRANCH}-thread-${THREAD_ID}"
       git status --short
       DIRTY=$(git status --porcelain)
@@ -536,20 +722,47 @@ nodes:
         -H "Content-Type: application/json" \
         -d "{\"action\":\"completed\",\"wo_id\":\"${WO_ID}\",\"builder\":\"Builder-4\",\"detail\":${DETAIL}}"
 
-  - id: flip-notion
+  - id: review-issue
     persona: xo
     depends_on: [post-completed]
     task_class: clerical
-    prompt: |
-      Update the Notion Work Order page if Notion MCP is available in this runtime.
+    bash: |
+      set -euo pipefail
 
-      ## Required Notion Changes
-      - Claude Status: REVIEW
-      - Status: Review
-      - Add the Captain CI manifest as a page comment
+      capture_node_output() {
+        python3 -c 'import shlex, sys; s=sys.stdin.read(); sys.stdout.write((lambda p: p[0] if len(p)==1 else s)(shlex.split(s)) if len(s)>=2 and s[0]=="'"'"'" and s.rstrip("\n").endswith("'"'"'") else s)'
+      }
 
-      ## Manifest
-      $build-manifest.output
+      MANIFEST=$(capture_node_output <<'BDC_NODE_OUTPUT_MANIFEST'
+      $post-completed.output
+      BDC_NODE_OUTPUT_MANIFEST
+      )
 
-      If Notion MCP is not available inside the container, do not invent a workaround.
-      Output a TODO for XO to flip Notion manually with the manifest above.
+      READ_SPEC_OUT=$(capture_node_output <<'BDC_NODE_OUTPUT_READ_SPEC'
+      $read-spec.output
+      BDC_NODE_OUTPUT_READ_SPEC
+      )
+      ISSUE_REPO="${ISSUE_REPO:-thinmansoftware/bdc-xo}"
+      ISSUE_NUM=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'issue=[0-9]+' | head -1 | cut -d= -f2 || true)
+      if [ -z "$ISSUE_NUM" ]; then
+        ISSUE_NUM=$(printf '%s\n' "$READ_SPEC_OUT" | sed -n 's/^SPEC_PATH=.*issues\/\([0-9][0-9]*\).*/\1/p' | head -1)
+      fi
+      if [ -z "$ISSUE_NUM" ]; then
+        WO_ID_FROM_SPEC=$(printf '%s\n' "$READ_SPEC_OUT" | sed -n 's/^WO_ID=//p' | head -1)
+        if [ -n "$WO_ID_FROM_SPEC" ]; then
+          ISSUE_NUM=$(gh issue list --repo "$ISSUE_REPO" --search "$WO_ID_FROM_SPEC in:title" --json number --jq '.[0].number // empty' 2>/dev/null || true)
+        fi
+      fi
+      if [ -z "$ISSUE_NUM" ]; then
+        echo "review-issue: no GitHub issue resolved; skipping status:review label."
+        exit 0
+      fi
+
+      gh label create status:review --repo "$ISSUE_REPO" --color 0E8A16 --description "BDC workflow is ready for review" 2>/dev/null || true
+      gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --remove-label status:building 2>/dev/null || true
+      gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --remove-label status:blocked 2>/dev/null || true
+      gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --add-label status:review
+      COMMENT_FILE=$(mktemp)
+      printf '%s\n' "$MANIFEST" > "$COMMENT_FILE"
+      gh issue comment "$ISSUE_NUM" --repo "$ISSUE_REPO" --body-file "$COMMENT_FILE"
+      echo "review-issue: $ISSUE_REPO#$ISSUE_NUM -> status:review (manifest posted as comment)"

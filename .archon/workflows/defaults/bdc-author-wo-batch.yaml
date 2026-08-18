@@ -5,7 +5,7 @@
 #   1. YAML exists: this file
 #   2. Spec exists: BDC_XO/docs/work-orders/WO-HARNESS-AUTHOR-WO-BATCH-META-01.md
 #   3. CWD scope: bdc-xo (WO specs + YAMLs live there -- select bdc-xo when firing)
-#   4. Codebase registered: bluedevilcollectibles/bdc-xo (verify in Archon DB)
+#   4. Codebase registered: thinmansoftware/bdc-xo (verify in Archon DB)
 #
 # Deploy: BDC_XO/scripts/archon-bridge/sync-workflows.sh bdc-author-wo-batch.yaml
 #
@@ -30,28 +30,29 @@ description: |
     DRY_RUN: 'true' = write files + skip Notion filing and PR
   Does: For each WO concept, adversarially reviews spec+YAML via WO-Lifecycle:Validate 12-check gate,
         iterates up to 8 times, commits passing WOs to bdc-xo, files to Notion, fails shut on exhaustion.
-  Repo: bluedevilcollectibles/bdc-xo (operator selects bdc-xo codebase when firing).
+  Repo: thinmansoftware/bdc-xo (operator selects bdc-xo codebase when firing).
   parallel_ok: true
 
 policyFile: harness/policies/agent-behavior.md
+provider: claude
 model: sonnet
-target_repo: bluedevilcollectibles/bdc-xo
+target_repo: thinmansoftware/bdc-xo
 
-# 2026-05-16 fix v2: Cauldron API ONLY accepts conversationId + message — the
+# 2026-05-16 fix v2: Cauldron API ONLY accepts conversationId + message -- the
 # `inputs` field in API payloads is silently dropped. Engine injects only the
 # DEFAULTS from this block as $INPUT_<NAME> env vars. To run a different batch,
 # either (a) edit the WO_CONCEPTS_FILE default and re-fire, or (b) pass the path
 # in the API `message` and have bash parse it (mirrors bdc-feature-development's
 # WO_ID-from-USER_MESSAGE pattern).
 #
-# Per-batch default below = Phase 4 backend cross-cutting sortie 2026-05-17.
-# 5 WOs that fill backend gaps the LSPRO UI rebuild (promotion/v2) surfaces.
-# Change to next batch path when re-firing.
+# Per-batch default below = storefront first-class wave 1, 2026-07-03.
+# 7 WOs: 6 storefront parity gaps vs the Shopify theme + 1 shopops API
+# prerequisite (releases-this-week). Change to next batch path when re-firing.
 inputs:
   WO_CONCEPTS_FILE:
-    default: "docs/plans/2026-05-17-phase4-backend-cross-cutting-concepts.json"
+    default: "docs/work-orders/concepts/2026-07-03-storefront-wave1.json"
   PLAN_DOC_PATH:
-    default: "docs/superpowers/specs/2026-05-17-lspro-shopops-hq-rebuild-PLAN-v2.md"
+    default: "docs/plans/2026-07-03-storefront-first-class-plan.md"
   CALIBRATION_DOC:
     default: ""
   NOTION_DB_ID:
@@ -105,7 +106,7 @@ nodes:
         PLAN_CONTENT=$(cat "$PLAN_DOC_PATH")
       else
         PLAN_CONTENT=$(gh api \
-          "repos/bluedevilcollectibles/bdc-xo/contents/${PLAN_DOC_PATH}?ref=main" \
+          "repos/thinmansoftware/bdc-xo/contents/${PLAN_DOC_PATH}?ref=main" \
           --jq .content 2>/dev/null | base64 -d 2>/dev/null || true)
       fi
       [ -z "$PLAN_CONTENT" ] && { echo "ERROR: Plan doc not found at $PLAN_DOC_PATH" >&2; exit 1; }
@@ -116,7 +117,7 @@ nodes:
         WO_CONCEPTS=$(cat "$WO_CONCEPTS_FILE")
       else
         WO_CONCEPTS=$(gh api \
-          "repos/bluedevilcollectibles/bdc-xo/contents/${WO_CONCEPTS_FILE}?ref=main" \
+          "repos/thinmansoftware/bdc-xo/contents/${WO_CONCEPTS_FILE}?ref=main" \
           --jq .content 2>/dev/null | base64 -d 2>/dev/null || true)
       fi
       [ -z "$WO_CONCEPTS" ] && { echo "ERROR: WO_CONCEPTS_FILE not found: $WO_CONCEPTS_FILE" >&2; exit 1; }
@@ -138,7 +139,7 @@ nodes:
           CALIBRATION=$(cat "$CALIBRATION_DOC")
         else
           CALIBRATION=$(gh api \
-            "repos/bluedevilcollectibles/bdc-xo/contents/${CALIBRATION_DOC}?ref=main" \
+            "repos/thinmansoftware/bdc-xo/contents/${CALIBRATION_DOC}?ref=main" \
             --jq .content 2>/dev/null | base64 -d 2>/dev/null || echo "(calibration not found)")
         fi
       fi
@@ -154,7 +155,7 @@ nodes:
       printf '=== WO CONCEPTS JSON ===\n%s\n\n' "$WO_CONCEPTS"
       printf '=== PLAN DOC (%s) ===\n%s\n\n' "$PLAN_DOC_PATH" "$PLAN_CONTENT"
       printf '=== CALIBRATION ===\n%s\n\n' "$CALIBRATION"
-      # 2026-05-16: don't use `[ ] && cmd` as terminal line under `set -e` —
+      # 2026-05-16: don't use `[ ] && cmd` as terminal line under `set -e` --
       # if the test is false (ARCHON_DOCTRINE empty), [ exits 1, becomes the
       # script's exit code, and the whole node dies silently with no stderr.
       # Anchor: Codex diagnosis of post-#77 fast-die-no-stderr symptom.
@@ -181,12 +182,12 @@ nodes:
 
         ---
 
-        ## PHASE 1 — AUTHOR
+        ## PHASE 1 -- AUTHOR
 
         For each WO concept in the JSON array:
 
         **1a. Resume check**: Does `docs/work-orders/<wo_id>.md` AND `yaml-drafts/<wo_id>.yaml` already
-        exist on disk? If both exist, SKIP this WO — it passed review in a prior iteration.
+        exist on disk? If both exist, SKIP this WO -- it passed review in a prior iteration.
 
         **1b. Draft the WO spec** (12-section wo-recipe.md template):
         ```
@@ -216,7 +217,7 @@ nodes:
         - `policyFile: harness/policies/agent-behavior.md` at root
         - All file paths RELATIVE TO REPO ROOT (no repo-name prefix)
         - Every `loop:` node declares ALL FOUR fields: `prompt:`, `until:`, `max_iterations:`, `fresh_context:`
-        - Final node MUST be `flip-notion` (Archon does not auto-update Notion)
+        - Final node MUST be `review-issue` (Archon records completion on the GitHub WO issue)
         - NO `curl` to n8n.bluedevilcollectibles.com in bash nodes (hangs in executor subprocess)
         - Bash: use `$WORKFLOW_ID` NOT `${run.id}` (token substituted at YAML-parse time)
         - Bash: NO `set -u` if block references `$WORKFLOW_ID` inline (it's not a runtime env var)
@@ -224,7 +225,7 @@ nodes:
 
         ---
 
-        ## PHASE 2 — ADVERSARIAL REVIEW (you are now a blocking reviewer — no approvals without evidence)
+        ## PHASE 2 -- ADVERSARIAL REVIEW (you are now a blocking reviewer -- no approvals without evidence)
 
         For EACH drafted spec+YAML pair, apply all 12 checks:
 
@@ -232,34 +233,34 @@ nodes:
           ## 1. Objective, ## 2. Behavior Source of Truth, ## 3. Prior Art Check,
           ## 7. Backend Function Inventory, ## 8. Data Flow, ## 10. Deploy Target,
           ## 11. Test Scenarios, ## 12. Stop Point
-          → BLOCK if any missing.
+          -> BLOCK if any missing.
 
         **Check 2**: Body contains the substring `wo-recipe.md`.
-          → BLOCK if absent.
+          -> BLOCK if absent.
 
-        **Check 3**: §2 references at least one concrete artifact (file path or WO ID).
-          → BLOCK if §2 contains only TBD, "see body", or empty text.
+        **Check 3**: Section 2 references at least one concrete artifact (file path or WO ID).
+          -> BLOCK if Section 2 contains only TBD, "see body", or empty text.
 
         **Check 4**: WO ID matches `WO-[A-Z][A-Z0-9-]*-[0-9]+`; consistent across filename, H1, Notion title.
-          → BLOCK if inconsistent.
+          -> BLOCK if inconsistent.
 
-        **Check 5**: §2 cites a real path (e.g. `docs/plans/foo.md`, `research/bar.md`, `WO-XYZ-01`).
-          → BLOCK if §2 is vague without a concrete locator.
+        **Check 5**: Section 2 cites a real path (e.g. `docs/plans/foo.md`, `research/bar.md`, `WO-XYZ-01`).
+          -> BLOCK if Section 2 is vague without a concrete locator.
 
-        **Check 6**: Every function/route/script in §7 labeled `EXISTING (file:line)` or `NEW`.
-          → BLOCK if any name appears without a label.
+        **Check 6**: Every function/route/script in Section 7 labeled `EXISTING (file:line)` or `NEW`.
+          -> BLOCK if any name appears without a label.
 
-        **Check 7**: §9 column/table claims cite `information_schema` query result or migration file.
-          → BLOCK if §9 makes a column claim without citing source.
+        **Check 7**: Section 9 column/table claims cite `information_schema` query result or migration file.
+          -> BLOCK if Section 9 makes a column claim without citing source.
 
-        **Check 8**: §11 has >= 3 test scenarios each with Given/When/Then structure.
-          → BLOCK if fewer than 3, or any test is purely descriptive.
+        **Check 8**: Section 11 has >= 3 test scenarios each with Given/When/Then structure.
+          -> BLOCK if fewer than 3, or any test is purely descriptive.
 
-        **Check 8A**: If WO's files span 2+ repos → must have `Grep assertions` block with grep command per repo.
-          → BLOCK if split-repo WO lacks grep assertions.
+        **Check 8A**: If WO's files span 2+ repos -> must have `Grep assertions` block with grep command per repo.
+          -> BLOCK if split-repo WO lacks grep assertions.
 
-        **Check 9**: §12 stop conditions are CI-executable commands (Given/When/Then).
-          → BLOCK if any stop condition is vague ("staging accessible", "CI validates").
+        **Check 9**: Section 12 stop conditions are CI-executable commands (Given/When/Then).
+          -> BLOCK if any stop condition is vague ("staging accessible", "CI validates").
 
         **Check 10**: 8 required questions addressed somewhere in body:
           1. What behavior exists AFTER this WO?
@@ -270,23 +271,23 @@ nodes:
           6. What MUST NEVER break? (invariants)
           7. How does CI prove it works?
           8. What happens if it runs twice? (idempotency)
-          → BLOCK if any unanswered.
+          -> BLOCK if any unanswered.
 
-        **Check 11** (HARDEST — anti-guess hardening): Every component name, table name, column name,
+        **Check 11** (HARDEST -- anti-guess hardening): Every component name, table name, column name,
         route path in the spec traces to a source file. No invented names.
-          → BLOCK if any specific claim is not anchored to a real source.
+          -> BLOCK if any specific claim is not anchored to a real source.
 
-        **Check 12**: §4 lists dependencies OR explicitly says "standalone".
-          → BLOCK if §4 is empty and WO touches more than one subsystem.
+        **Check 12**: Section 4 lists dependencies OR explicitly says "standalone".
+          -> BLOCK if Section 4 is empty and WO touches more than one subsystem.
 
-        Output per WO: `VALIDATE: PASS` (all 12) or `VALIDATE: FAIL — Check N: <gap>` for each failure.
+        Output per WO: `VALIDATE: PASS` (all 12) or `VALIDATE: FAIL -- Check N: <gap>` for each failure.
 
         ---
 
-        ## PHASE 3 — FIX OR COMMIT
+        ## PHASE 3 -- FIX OR COMMIT
 
         - **FAIL**: Revise spec + YAML to address each listed gap. Re-run all 12 checks on the revision.
-          If revised passes → write files; if still fails → flag for next iteration.
+          If revised passes -> write files; if still fails -> flag for next iteration.
         - **PASS**: Write both files to disk:
           - `docs/work-orders/<wo_id>.md`
           - `yaml-drafts/<wo_id>.yaml`
@@ -313,7 +314,7 @@ nodes:
     depends_on: [author-wo]
     bash: |
       set -euo pipefail
-      # 2026-05-16: mirror read-inputs dual-path pattern — engine injects
+      # 2026-05-16: mirror read-inputs dual-path pattern -- engine injects
       # INPUT_<NAME> from YAML defaults; fall back to bare env for legacy.
       WO_CONCEPTS_FILE="${INPUT_WO_CONCEPTS_FILE:-${WO_CONCEPTS_FILE:-}}"
       [ -z "$WO_CONCEPTS_FILE" ] && { echo "ERROR: WO_CONCEPTS_FILE not set" >&2; exit 1; }
@@ -327,7 +328,7 @@ nodes:
       ")
       else
         CONCEPTS_JSON=$(gh api \
-          "repos/bluedevilcollectibles/bdc-xo/contents/${WO_CONCEPTS_FILE}?ref=main" \
+          "repos/thinmansoftware/bdc-xo/contents/${WO_CONCEPTS_FILE}?ref=main" \
           --jq .content 2>/dev/null | base64 -d 2>/dev/null || echo "[]")
         WO_IDS=$(echo "$CONCEPTS_JSON" | python3 -c "
       import json, sys
@@ -487,7 +488,7 @@ nodes:
         exit 1
       fi
 
-      REPO="bluedevilcollectibles/bdc-xo"
+      REPO="thinmansoftware/bdc-xo"
       EXIST=$(gh pr list --repo "$REPO" --head "$BRANCH" --state open \
         --json url --jq '.[0].url // empty' 2>/dev/null || true)
       if [ -n "$EXIST" ]; then
@@ -548,7 +549,7 @@ nodes:
 
       ## NOTION FILING (when DRY_RUN=false)
       For each WO_ID listed as PASS in $verify-files.output:
-      1. Read the spec file `docs/work-orders/<WO_ID>.md` to extract the Objective (§1) as the Notes summary.
+      1. Read the spec file `docs/work-orders/<WO_ID>.md` to extract the Objective (Section 1) as the Notes summary.
       2. Extract builder, priority from the WO concepts JSON (in $read-inputs.output).
       3. Create Notion page in database `a6df831c-0b52-449f-8ca4-d77be6b70d0a` with:
          - Task: <WO_ID>
@@ -559,7 +560,7 @@ nodes:
          - Builder: <from concept, default Major Build>
          - Execution State: ACTIVE
          - Project: <from concept, default Infrastructure>
-         - Notes: first 300 chars of §1 Objective + " WO file: BDC_XO/docs/work-orders/<WO_ID>.md"
+         - Notes: first 300 chars of Section 1 Objective + " WO file: BDC_XO/docs/work-orders/<WO_ID>.md"
       4. Use the Notion MCP notion-create-pages tool.
       5. Output: NOTION_URL=<url> for each created page.
 
@@ -611,22 +612,37 @@ nodes:
       $open-pr.output
       $file-notion.output
 
-  - id: flip-notion-meta
+  - id: review-issue
     depends_on: [build-manifest]
     task_class: clerical
-    prompt: |
-      Flip Notion WO-HARNESS-AUTHOR-WO-BATCH-META-01 to REVIEW with manifest in Notes property.
+    bash: |
+      set -euo pipefail
 
-      Notion page ID: 35fef4c9-ce00-81f1-aaaa-ded673d03082
-      Required changes:
-      - Claude Status -> REVIEW
-      - Status -> Review
-      - Notes -> $build-manifest.output verbatim
-      - claimed_by: Major Build (bdc-author-wo-batch)
-      - claimed_at: 2026-05-13
+      capture_node_output() {
+        python3 -c 'import shlex, sys; s=sys.stdin.read(); sys.stdout.write((lambda p: p[0] if len(p)==1 else s)(shlex.split(s)) if len(s)>=2 and s[0]=="'"'"'" and s.rstrip("\n").endswith("'"'"'") else s)'
+      }
 
-      If Notion MCP unavailable, output:
-        XO_TODO: Flip WO-HARNESS-AUTHOR-WO-BATCH-META-01 to REVIEW; paste manifest into Notes property.
-
-      Manifest:
+      MANIFEST=$(capture_node_output <<'BDC_NODE_OUTPUT_MANIFEST'
       $build-manifest.output
+      BDC_NODE_OUTPUT_MANIFEST
+      )
+
+      ISSUE_REPO="${ISSUE_REPO:-thinmansoftware/bdc-xo}"
+      WO_ID="WO-HARNESS-AUTHOR-WO-BATCH-META-01"
+      ISSUE_NUM=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'issue=[0-9]+' | head -1 | cut -d= -f2 || true)
+      if [ -z "$ISSUE_NUM" ]; then
+        ISSUE_NUM=$(gh issue list --repo "$ISSUE_REPO" --search "$WO_ID in:title" --json number --jq '.[0].number // empty' 2>/dev/null || true)
+      fi
+      if [ -z "$ISSUE_NUM" ]; then
+        echo "review-issue: no GitHub issue resolved for $WO_ID; skipping status:review label."
+        exit 0
+      fi
+
+      gh label create status:review --repo "$ISSUE_REPO" --color 0E8A16 --description "BDC workflow is ready for review" 2>/dev/null || true
+      gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --remove-label status:building 2>/dev/null || true
+      gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --remove-label status:blocked 2>/dev/null || true
+      gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --add-label status:review
+      COMMENT_FILE=$(mktemp)
+      printf '%s\n' "$MANIFEST" > "$COMMENT_FILE"
+      gh issue comment "$ISSUE_NUM" --repo "$ISSUE_REPO" --body-file "$COMMENT_FILE"
+      echo "review-issue: $ISSUE_REPO#$ISSUE_NUM -> status:review (manifest posted as comment)"

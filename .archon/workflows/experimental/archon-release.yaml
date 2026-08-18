@@ -27,12 +27,12 @@ model: sonnet
 interactive: true                       # required: has approval gates
 
 worktree:
-  enabled: false                        # operates on the live dev branch — never use a worktree
+  enabled: false                        # operates on the live dev branch -- never use a worktree
 
 nodes:
-  # ═══════════════════════════════════════════════════════════════════
-  # PHASE 1 — Parse args and validate preconditions (always run)
-  # ═══════════════════════════════════════════════════════════════════
+  # -------------------------------------------------------------------
+  # PHASE 1 -- Parse args and validate preconditions (always run)
+  # -------------------------------------------------------------------
 
   - id: parse-args
     script: |
@@ -80,12 +80,12 @@ nodes:
     timeout: 60000
     depends_on: [parse-args]
 
-  # ═══════════════════════════════════════════════════════════════════
-  # PHASE 2 — Pre-flight compiled-binary smoke test (always run)
-  # ───────────────────────────────────────────────────────────────────
+  # -------------------------------------------------------------------
+  # PHASE 2 -- Pre-flight compiled-binary smoke test (always run)
+  # -------------------------------------------------------------------
   # Mirrors release skill Step 1.5. Catches bundler regressions before
   # the tag is pushed. If this fails, abort immediately.
-  # ═══════════════════════════════════════════════════════════════════
+  # -------------------------------------------------------------------
 
   - id: preflight-smoke
     script: |
@@ -98,7 +98,7 @@ nodes:
 
       if (!existsSync("scripts/build-binaries.sh") || !existsSync("packages/cli/src/cli.ts")) {
         result.skipped = "true";
-        result.reason = "Not a Bun CLI project — pre-flight smoke skipped.";
+        result.reason = "Not a Bun CLI project -- pre-flight smoke skipped.";
         console.log(JSON.stringify(result));
         process.exit(0);
       }
@@ -161,13 +161,13 @@ nodes:
         - A new package shipping CJS with an unusual wrapper shape
 
       Fix the underlying issue on a feature branch, merge to dev, then re-run /release.
-      The smoke test output is in the run log — check the preflight-smoke node.
+      The smoke test output is in the run log -- check the preflight-smoke node.
     when: "$preflight-smoke.output.passed == 'false'"
     depends_on: [preflight-smoke]
 
-  # ═══════════════════════════════════════════════════════════════════
-  # PHASE 3 — Detect stack, compute next version, collect commits
-  # ═══════════════════════════════════════════════════════════════════
+  # -------------------------------------------------------------------
+  # PHASE 3 -- Detect stack, compute next version, collect commits
+  # -------------------------------------------------------------------
 
   - id: detect-stack
     script: |
@@ -243,7 +243,7 @@ nodes:
     depends_on: [validate-state]
 
   - id: abort-if-no-commits
-    cancel: "Nothing to release — dev has no commits ahead of main."
+    cancel: "Nothing to release -- dev has no commits ahead of main."
     when: "$collect-commits.output == 'NO_COMMITS'"
     depends_on: [collect-commits]
 
@@ -253,9 +253,9 @@ nodes:
     timeout: 15000
     depends_on: [validate-state]
 
-  # ═══════════════════════════════════════════════════════════════════
-  # PHASE 4 — AI drafts the changelog from commits + diff (always runs)
-  # ═══════════════════════════════════════════════════════════════════
+  # -------------------------------------------------------------------
+  # PHASE 4 -- AI drafts the changelog from commits + diff (always runs)
+  # -------------------------------------------------------------------
 
   - id: draft-changelog
     prompt: |
@@ -337,7 +337,7 @@ nodes:
       import { join } from "node:path";
 
       const artifactsDir = String.raw`$ARTIFACTS_DIR`;
-      // Read AI output from disk (file bridge) — see save-draft-json
+      // Read AI output from disk (file bridge) -- see save-draft-json
       // for why we don't use String.raw on $draft-changelog.output directly.
       const cl = JSON.parse(readFileSync(join(artifactsDir, "draft-changelog.json"), "utf-8"));
       // bump-version and parse-args produce safe deterministic JSON; substitution OK.
@@ -382,14 +382,14 @@ nodes:
     timeout: 10000
     depends_on: [save-draft-json, draft-changelog, bump-version, parse-args]
 
-  # ═══════════════════════════════════════════════════════════════════
-  # PHASE 5 — Human approval gate (always runs)
-  # ───────────────────────────────────────────────────────────────────
+  # -------------------------------------------------------------------
+  # PHASE 5 -- Human approval gate (always runs)
+  # -------------------------------------------------------------------
   # In dry-run mode the workflow stops here cleanly; in full mode it
   # proceeds to write files and create the PR.
-  # ═══════════════════════════════════════════════════════════════════
+  # -------------------------------------------------------------------
 
-  # ── Pre-approval summary ──
+  # -- Pre-approval summary --
   # Approval messages don't get variable substitution today, so we emit
   # the dynamic summary as a Haiku prompt-node output (which DOES get
   # substituted and streams to chat). Cheap pass-through, ~200 tokens.
@@ -398,23 +398,23 @@ nodes:
       Reply to the user with EXACTLY this text, verbatim, no elaboration,
       no markdown-rendering, no commentary, no questions. Just print it.
 
-      ══════════════════════════════════════════════════════════════════
+      ------------------------------------------------------------------
       RELEASE REVIEW
-      ══════════════════════════════════════════════════════════════════
+      ------------------------------------------------------------------
 
-      Version : $bump-version.output.oldVersion  →  $bump-version.output.newVersion
+      Version : $bump-version.output.oldVersion  ->  $bump-version.output.newVersion
       Bump    : $bump-version.output.bump
       Dry run : $parse-args.output.dryRun
 
-      ── Proposed CHANGELOG ───────────────────────────────────────────
+      -- Proposed CHANGELOG -------------------------------------------
 
       $format-changelog.output.rendered
 
-      ── Commits being shipped ────────────────────────────────────────
+      -- Commits being shipped ----------------------------------------
 
       $collect-commits.output
 
-      ══════════════════════════════════════════════════════════════════
+      ------------------------------------------------------------------
 
       Reply with `/workflow approve <run-id>` to continue, or
       `/workflow reject <run-id> <reason>` to abort.
@@ -429,12 +429,12 @@ nodes:
 
         - In dry-run mode the workflow ends here without modifying any files.
         - In full mode approval triggers: write files, commit + push to dev,
-          open a PR dev → main, then pause again before tag/release.
+          open a PR dev -> main, then pause again before tag/release.
     depends_on: [review-summary]
 
-  # ═══════════════════════════════════════════════════════════════════
-  # PHASE 6 — Apply local file changes (skipped in --dry-run)
-  # ═══════════════════════════════════════════════════════════════════
+  # -------------------------------------------------------------------
+  # PHASE 6 -- Apply local file changes (skipped in --dry-run)
+  # -------------------------------------------------------------------
 
   - id: write-files
     script: |
@@ -445,7 +445,7 @@ nodes:
       // bump-version is safe to substitute (deterministic JSON, no backticks).
       const ver = JSON.parse(String.raw`$bump-version.output`);
       // format-changelog.output.rendered contains AI-authored markdown with
-      // backticks → unsafe via String.raw. Read the .md file from disk instead.
+      // backticks -> unsafe via String.raw. Read the .md file from disk instead.
       const artifactsDir = String.raw`$ARTIFACTS_DIR`;
       const renderedMd = readFileSync(join(artifactsDir, "changelog-section.md"), "utf-8");
       const fmt = { rendered: renderedMd };
@@ -498,7 +498,7 @@ nodes:
         if (lockFile && existsSync(lockFile)) written.push(lockFile);
       }
 
-      // 4. Update CHANGELOG.md — prepend the new section under [Unreleased]
+      // 4. Update CHANGELOG.md -- prepend the new section under [Unreleased]
       const changelogPath = "CHANGELOG.md";
       let changelog = existsSync(changelogPath)
         ? readFileSync(changelogPath, "utf-8")
@@ -510,7 +510,7 @@ nodes:
         const insertAt = unreleasedMatch.index + unreleasedMatch[0].length;
         changelog = changelog.slice(0, insertAt) + fmt.rendered + "\n" + changelog.slice(insertAt);
       } else {
-        // No [Unreleased] header — prepend at the top below the title
+        // No [Unreleased] header -- prepend at the top below the title
         const titleMatch = changelog.match(/^# .+\n+/);
         const insertAt = titleMatch ? titleMatch[0].length : 0;
         changelog = changelog.slice(0, insertAt) + "## [Unreleased]\n\n" + fmt.rendered + "\n" + changelog.slice(insertAt);
@@ -563,22 +563,22 @@ nodes:
     depends_on: [commit-and-push, format-changelog, bump-version]
     when: "$parse-args.output.dryRun == 'false'"
 
-  # ═══════════════════════════════════════════════════════════════════
-  # PHASE 7 — Wait for the PR to merge (skipped in --dry-run)
-  # ───────────────────────────────────────────────────────────────────
+  # -------------------------------------------------------------------
+  # PHASE 7 -- Wait for the PR to merge (skipped in --dry-run)
+  # -------------------------------------------------------------------
   # The user (or a reviewer) merges the PR however they prefer:
   #   gh pr merge --squash --delete-branch=false
-  # then approves here. We don't auto-merge — keeps reviewer in control.
-  # ═══════════════════════════════════════════════════════════════════
+  # then approves here. We don't auto-merge -- keeps reviewer in control.
+  # -------------------------------------------------------------------
 
   # Pre-merge-gate summary (same pass-through pattern as review-summary)
   - id: merge-summary
     prompt: |
       Reply to the user with EXACTLY this text, verbatim, no elaboration:
 
-      ══════════════════════════════════════════════════════════════════
-      PR OPENED — waiting for merge
-      ══════════════════════════════════════════════════════════════════
+      ------------------------------------------------------------------
+      PR OPENED -- waiting for merge
+      ------------------------------------------------------------------
 
       $create-pr.output
 
@@ -597,13 +597,13 @@ nodes:
     approval:
       message: |
         Approve once the PR above has been merged into main.
-        Reject to stop — the PR will remain open and reviewable.
+        Reject to stop -- the PR will remain open and reviewable.
     depends_on: [merge-summary]
     when: "$parse-args.output.dryRun == 'false'"
 
-  # ═══════════════════════════════════════════════════════════════════
-  # PHASE 8 — Tag, GitHub release, sync dev with main
-  # ═══════════════════════════════════════════════════════════════════
+  # -------------------------------------------------------------------
+  # PHASE 8 -- Tag, GitHub release, sync dev with main
+  # -------------------------------------------------------------------
 
   - id: tag-and-release
     bash: |
@@ -656,13 +656,13 @@ nodes:
     depends_on: [tag-and-release]
     when: "$parse-args.output.dryRun == 'false'"
 
-  # ═══════════════════════════════════════════════════════════════════
-  # PHASE 9 — Wait for release CI to finish building binaries
-  # ───────────────────────────────────────────────────────────────────
+  # -------------------------------------------------------------------
+  # PHASE 9 -- Wait for release CI to finish building binaries
+  # -------------------------------------------------------------------
   # Poll the release until all 7 expected assets exist (5 binaries +
   # archon-web.tar.gz + checksums.txt). Bail out early if the release
-  # workflow fails — no point waiting if CI is broken.
-  # ═══════════════════════════════════════════════════════════════════
+  # workflow fails -- no point waiting if CI is broken.
+  # -------------------------------------------------------------------
 
   - id: check-homebrew
     bash: |
@@ -694,27 +694,27 @@ nodes:
         # Short-circuit: if the release workflow itself failed, stop waiting.
         workflow_status=$(gh run list --workflow release.yml --event push --limit 1 --json conclusion,status --jq '.[0] | "\(.status)|\(.conclusion)"' 2>/dev/null || echo "unknown|unknown")
         if [ "$workflow_status" = "completed|failure" ]; then
-          echo "Release workflow FAILED — see: gh run view --log-failed"
+          echo "Release workflow FAILED -- see: gh run view --log-failed"
           exit 1
         fi
 
-        echo "  Assets so far: $asset_count/7 — waiting 30s (attempt $i/30)..."
+        echo "  Assets so far: $asset_count/7 -- waiting 30s (attempt $i/30)..."
         sleep 30
       done
 
       echo "Timed out waiting for binaries after 15 minutes"
       exit 1
-    timeout: 1000000              # 16 minutes — outer bound on the polling loop
+    timeout: 1000000              # 16 minutes -- outer bound on the polling loop
     depends_on: [sync-dev-with-main, check-homebrew, bump-version]
     when: "$parse-args.output.dryRun == 'false' && $check-homebrew.output == 'true'"
 
-  # ═══════════════════════════════════════════════════════════════════
-  # PHASE 10 — Update Homebrew formula and sync the tap repo
-  # ───────────────────────────────────────────────────────────────────
+  # -------------------------------------------------------------------
+  # PHASE 10 -- Update Homebrew formula and sync the tap repo
+  # -------------------------------------------------------------------
   # Only runs if homebrew/archon.rb exists in the repo. The formula
   # version and SHAs MUST move atomically (per the release skill's
-  # critical warning) — we regenerate the entire file from a template.
-  # ═══════════════════════════════════════════════════════════════════
+  # critical warning) -- we regenerate the entire file from a template.
+  # -------------------------------------------------------------------
 
   - id: fetch-and-update-formula
     script: |
@@ -755,7 +755,7 @@ nodes:
         };
 
         // Regenerate the entire formula from the canonical template.
-        // Editing in place is forbidden — version + SHAs MUST move atomically.
+        // Editing in place is forbidden -- version + SHAs MUST move atomically.
         // Built as a line array so the YAML block scalar's indentation rules don't fight us.
         const formula = [
           "# Homebrew formula for Archon CLI",
@@ -832,8 +832,8 @@ nodes:
 
       # fetch-and-update-formula left the formula change uncommitted on dev.
       # `git checkout main` refuses while ANY tracked file is dirty (not just
-      # the formula — e.g. an in-progress workflow-yaml edit during recovery
-      # would block too), so stash everything → checkout → pop carries the
+      # the formula -- e.g. an in-progress workflow-yaml edit during recovery
+      # would block too), so stash everything -> checkout -> pop carries the
       # change across. Then commit only the formula (any other restored dirt
       # stays uncommitted) and push on main.
       git stash push -m "release-commit-formula-pending"
@@ -881,7 +881,7 @@ nodes:
 
         const diff = spawnSync("git", ["-C", dir, "diff", "--quiet"], { encoding: "utf-8" });
         if (diff.status === 0) {
-          console.log("Tap formula already in sync — no changes needed");
+          console.log("Tap formula already in sync -- no changes needed");
           process.exit(0);
         }
 
@@ -906,12 +906,12 @@ nodes:
     depends_on: [commit-formula, bump-version]
     when: "$parse-args.output.dryRun == 'false' && $check-homebrew.output == 'true'"
 
-  # ═══════════════════════════════════════════════════════════════════
-  # PHASE 11 — Final summary (always runs in both modes)
-  # ───────────────────────────────────────────────────────────────────
+  # -------------------------------------------------------------------
+  # PHASE 11 -- Final summary (always runs in both modes)
+  # -------------------------------------------------------------------
   # `trigger_rule: all_done` lets this run regardless of which downstream
   # nodes were skipped (dry-run path or no-homebrew path).
-  # ═══════════════════════════════════════════════════════════════════
+  # -------------------------------------------------------------------
 
   - id: final-summary
     script: |
@@ -928,22 +928,22 @@ nodes:
       const ver = safeJson(String.raw`$bump-version.output`);
 
       const lines = [];
-      lines.push("══════════════════════════════════════════════════════════════════");
+      lines.push("------------------------------------------------------------------");
 
       if (!args || !ver) {
-        lines.push("WORKFLOW ENDED EARLY — see prior node failures or skips.");
+        lines.push("WORKFLOW ENDED EARLY -- see prior node failures or skips.");
         lines.push("");
         lines.push(`parse-args  : ${args ? "ok" : "missing/skipped"}`);
         lines.push(`bump-version: ${ver  ? "ok" : "missing/skipped"}`);
         lines.push("");
         lines.push("Check the run log for the first failed node and address it.");
       } else if (args.dryRun === "true") {
-        lines.push(`DRY RUN COMPLETE — would have released v${ver.newVersion} (from v${ver.oldVersion})`);
+        lines.push(`DRY RUN COMPLETE -- would have released v${ver.newVersion} (from v${ver.oldVersion})`);
         lines.push("");
         lines.push("No files were written. No commits were made. No PR was created.");
         lines.push("Re-run without --dry-run to actually cut the release.");
       } else {
-        lines.push(`RELEASE COMPLETE — v${ver.newVersion} (from v${ver.oldVersion}, ${ver.bump})`);
+        lines.push(`RELEASE COMPLETE -- v${ver.newVersion} (from v${ver.oldVersion}, ${ver.bump})`);
         lines.push("");
         lines.push("Verify the release end-to-end with the test-release skill:");
         lines.push(`  /test-release brew ${ver.newVersion}`);
@@ -952,7 +952,7 @@ nodes:
         lines.push("If verification fails, file a hotfix and cut the next patch.");
         lines.push("DO NOT announce the release until /test-release passes.");
       }
-      lines.push("══════════════════════════════════════════════════════════════════");
+      lines.push("------------------------------------------------------------------");
       console.log(lines.join("\n"));
     runtime: bun
     timeout: 5000

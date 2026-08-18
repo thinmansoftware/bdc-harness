@@ -1,0 +1,774 @@
+# Drafted by yaml-author subagent for WO-HARNESS-TOKEN-ATTRIBUTION-01 on 2026-06-03
+# Source pattern: bdc-xo-cauldron-hotreload-registration.yaml (proven linear single-repo
+#   BDC backbone: preflight -> read-spec -> fresh-branch -> implement-loop -> verify ->
+#   commit-push -> open-pr -> build-manifest -> flip-notion) PLUS the two self-repair
+#   review loops (plan-review + diff-review) lifted from bdc-feature-development.yaml.
+#   Exactly TWO loops, no new councils -- per project_feature-dev-in-run-review-nodes hard lines.
+# Doctrine compliance: 13 hard rules of archon-yaml-authoring (verified at draft time),
+#   plus live-article Rule 15 (target_repo authoritative).
+#
+# CODEBASE BINDING (Rule 15 -- target_repo is authoritative):
+#   target_repo: thinmansoftware/bdc-harness is declared at root and binds the worktree.
+#   The name prefix bdc-harness- ALSO maps to bdc-harness (WORKFLOW_CODEBASE_PREFIXES), so
+#   prefix and target_repo agree -- no Rule 28 mismatch. This is a SELF-TARGETING workflow
+#   (the harness builds the harness). The worktree IS the bdc-harness clone; CWD = repo root;
+#   packages/workflows and packages/server are relative to it (Rule 4).
+#
+# Pre-flight (operator verifies BEFORE fire):
+#   1. Codebase thinmansoftware/bdc-harness registered in Archon:
+#      ssh hetzner-prod "sqlite3 /opt/bdc/archon-data/archon.db \"SELECT name FROM remote_agent_codebases;\""
+#   2. WO spec committed + pushed to bdc-xo main BEFORE fire (read-spec fetches via gh api ?ref=main).
+#      Spec lives at docs/work-orders/WO-HARNESS-TOKEN-ATTRIBUTION-01.md -- verified on disk 2026-06-03;
+#      confirm it is on origin/main, not just local, before firing.
+#   3. NOTION_PAGE_ID below is the literal placeholder REPLACE_WITH_NOTION_PAGE_ID. XO is creating
+#      the Notion row in parallel -- set this input to the real page id (or pass --input NOTION_PAGE_ID=...)
+#      BEFORE fire. flip-notion needs it to write the manifest into Notes. If left as placeholder,
+#      flip-notion fails OPEN and emits an XO_ACTION line asking for a manual flip.
+#   4. bdc-harness INTEGRATION branch is dev (NOT main). fresh-branch + open-pr use dev as base.
+#   5. This is a CODE WO (server-side TypeScript). NO migration, NO web/UI changes. The implement
+#      loop and diff-review are instructed to fail if packages/web is touched or provider.ts is modified.
+#
+# Deploy: BDC_XO/scripts/archon-bridge/sync-workflows.sh WO-HARNESS-TOKEN-ATTRIBUTION-01.yaml
+#   (Place this file in bdc-harness .archon/workflows/defaults/ first. sync-workflows.sh reads
+#    name: from the YAML; the file may keep the WO-ID filename. Rule 9: defaults/ flat.)
+#
+# REVIEW BEFORE DEPLOY -- human verifies: the grep-assertion thresholds (Section 12 of spec),
+#   the dev-branch base, target_repo binding, the provider.ts-untouched guard, and that the
+#   8 test scenarios are reflected in the implement-loop instructions.
+
+name: bdc-harness-token-attribution
+description: |
+  Use when: Executing WO-HARNESS-TOKEN-ATTRIBUTION-01 -- persist real per-node + per-run
+  token usage (the Claude Agent SDK already returns it) into the existing JSONB columns and
+  expose it via the runs/events API, with a derived Max-20x quota-window line.
+  Input: WO_ID = WO-HARNESS-TOKEN-ATTRIBUTION-01 (+ optional NOTION_PAGE_ID).
+  Does:
+    - Reads the WO spec from bdc-xo docs/work-orders/ on main.
+    - Plans + self-reviews the plan (plan-review loop), then implements in
+      packages/workflows (dag-executor.ts) + packages/server (runs API).
+    - Mirrors the EXISTING cost-persistence path for TOKENS in BOTH executors
+      (executeAiNode AND executeLoopNode); extends NodeExecutionResult with tokens?: TokenUsage.
+    - Verifies: bun x tsc --noEmit clean + bun test (8 new scenarios + the two existing
+      regression suites: dag-executor.test.ts, api.workflow-runs.test.ts).
+    - Cross-model diff-review (Codex) before the irreversible commit.
+    - Commits, pushes a feature branch, opens a PR to bdc-harness dev.
+    - Flips Notion to REVIEW (NEVER DONE) with the v2 manifest in Notes.
+  Repo: thinmansoftware/bdc-harness (binds via target_repo + bdc-harness- name prefix).
+  WO Class: CODE. NO migration. NO web/UI. provider.ts MUST stay untouched.
+  parallel_ok: false (touches the shared execution layer of the harness itself).
+
+policyFile: harness/policies/agent-behavior.md
+provider: claude
+model: sonnet
+target_repo: thinmansoftware/bdc-harness
+
+inputs:
+  WO_ID:
+    default: "WO-HARNESS-TOKEN-ATTRIBUTION-01"
+  NOTION_PAGE_ID:
+    default: "374ef4c9-ce00-81e8-8d45-c6c46f944e4e"
+
+nodes:
+
+  # Pre-flight: fail closed if the container cannot push to origin (anchor WO-169).
+  - id: preflight-github-auth
+    load_bearing: true
+    bash: |
+      set -euo pipefail
+      if ! git push --dry-run origin "HEAD:refs/heads/preflight-auth-probe-$(date +%s)" 2>&1; then
+        echo "ERROR: GITHUB auth check failed -- container cannot push to origin." >&2
+        echo "Likely cause: GITHUB_TOKEN missing in executor env, or token lacks repo scope." >&2
+        exit 1
+      fi
+      echo "preflight-github-auth PASS"
+
+  - id: read-spec
+    depends_on: [preflight-github-auth]
+    bash: |
+      set -euo pipefail
+      WO_ID="${WO_ID:-WO-HARNESS-TOKEN-ATTRIBUTION-01}"
+      # Specs live in bdc-xo on main (NOT the worktree, which is bdc-harness). Cross-repo via gh api.
+      # Rule 5: try docs/work-orders/ direct, then date-prefix glob in docs/superpowers/specs/.
+      SPEC_CONTENT=$(gh api \
+        "repos/thinmansoftware/bdc-xo/contents/docs/work-orders/${WO_ID}.md?ref=main" \
+        --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
+      if [ -z "$SPEC_CONTENT" ]; then
+        SPEC_CONTENT=$(gh api \
+          "repos/thinmansoftware/bdc-xo/contents/docs/superpowers/specs/${WO_ID}.md?ref=main" \
+          --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
+      fi
+      if [ -z "$SPEC_CONTENT" ]; then
+        GLOB_PATH=$(gh api \
+          "repos/thinmansoftware/bdc-xo/contents/docs/superpowers/specs?ref=main" \
+          --template '{{range .}}{{.path}}{{"\n"}}{{end}}' 2>/dev/null \
+          | grep "${WO_ID}.md$" | head -1 || true)
+        if [ -n "$GLOB_PATH" ]; then
+          SPEC_CONTENT=$(gh api \
+            "repos/thinmansoftware/bdc-xo/contents/${GLOB_PATH}?ref=main" \
+            --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
+        fi
+      fi
+      if [ -z "$SPEC_CONTENT" ]; then
+        ISSUE_NUM=$(gh issue list --repo thinmansoftware/bdc-xo \
+          --search "${WO_ID} in:title" --json number --jq '.[0].number' 2>/dev/null || true)
+        if [ -n "$ISSUE_NUM" ] && [ "$ISSUE_NUM" != "null" ]; then
+          SPEC_CONTENT=$(gh issue view "$ISSUE_NUM" --repo thinmansoftware/bdc-xo \
+            --json body --jq .body 2>/dev/null || true)
+        fi
+      fi
+      if [ -z "$SPEC_CONTENT" ]; then
+        echo "Spec not found for ${WO_ID} (tried docs/work-orders/, docs/superpowers/specs/ direct + glob, and GitHub issue search). Spec must be on bdc-xo main before fire." >&2
+        exit 1
+      fi
+      printf 'WO_ID=%s\n\n--- SPEC ---\n%s\n' "$WO_ID" "$SPEC_CONTENT"
+
+  - id: fresh-branch
+    depends_on: [read-spec]
+    bash: |
+      set -euo pipefail
+      # bdc-harness INTEGRATION branch is dev, NOT main. Pin the base to dev so the
+      # worktree starts from the integration head and the PR targets dev.
+      BASE_BRANCH="dev"
+      git fetch origin "$BASE_BRANCH" --depth=50 || true
+      git checkout "$BASE_BRANCH" 2>/dev/null || echo "branch held; staying on current HEAD"
+      git reset --hard "origin/$BASE_BRANCH" 2>/dev/null || true
+      BRANCH="wo/token-attribution-01-run-$(date +%Y%m%d%H%M%S)"
+      git checkout -b "$BRANCH"
+      echo "BASE_BRANCH=${BASE_BRANCH}"
+      echo "BRANCH=${BRANCH}"
+
+  - id: plan
+    persona: war-council-architect
+    agent: war-council-architect
+    depends_on: [fresh-branch]
+    task_class: medium_work
+    prompt: |
+      Read the BDC Work Order spec below and produce a concise, surgical implementation plan.
+      You are READ-ONLY (no file writes). This is a CODE WO that EXTENDS an existing path --
+      it is NOT a rewrite. The single biggest risk is scope creep and touching forbidden files.
+
+      ## What this WO does (one sentence)
+      Mirror the EXISTING cost-persistence path for TOKENS: per-node tokens into
+      remote_agent_workflow_events.data.tokens and a per-run total into
+      remote_agent_workflow_runs.metadata.total_tokens, then expose both via the runs/events
+      API with a derived Max-20x quota-window line. No migration, no web/UI.
+
+      ## HARD scope boundaries (the plan MUST encode all of these)
+      - IN SCOPE: packages/workflows/src/dag-executor.ts AND packages/server (runs/events API +
+        the small derived quota-window summary). Test files for both packages.
+      - OUT OF SCOPE -- the plan MUST list these explicitly as out-of-scope:
+        * packages/providers/src/claude/provider.ts -- DO NOT MODIFY (it already emits tokens;
+          it is the read-only contract this WO consumes). The stop condition greps that
+          git diff --name-only origin/dev -- packages/providers/src/claude/provider.ts returns nothing.
+        * packages/web -- NO UI. Display is WO-MC-NEGAN-DIAGNOSTIC-GRAPH-01, a separate WO.
+        * Any new DB table or migration -- both target columns are EXISTING JSONB.
+
+      ## The exact edit sites (from spec Section 7 -- architect-verified line anchors; the
+      ## numbers may have drifted, so locate by the named symbol, not the literal line)
+      1. TYPE FIRST (blocking, or tsc fails): dag-executor.ts ~:185 extend
+           type NodeExecutionResult = NodeOutput & { costUsd?: number }
+         to
+           type NodeExecutionResult = NodeOutput & { costUsd?: number; tokens?: TokenUsage }
+         TokenUsage is already imported (~:22) -- no new import.
+      2. AI-node (executeAiNode) -- mirror cost in FOUR places:
+         a. The node_completed createWorkflowEvent data block (~:1219-1230, next to cost_usd
+            at ~:1226 and model_usage at ~:1229): add ...(nodeTokens ? { tokens: nodeTokens } : {}).
+         b. The THREE return objects that already carry costUsd: completed return (~:1254),
+            user-cancel return (~:1270), catch return (~:1303): add ...(nodeTokens ? { tokens: nodeTokens } : {}).
+         NOTE: ~:1245 emitter.emit spread is OPTIONAL (helps live SSE) and is NOT a required persist site.
+      3. LOOP-node (executeLoopNode) -- the SAME gap, FIVE sites (loop nodes are the highest-token
+         consumers -- the diff-repair heavy node this WO exists for):
+         a. declare let loopTotalTokens: TokenUsage | undefined next to loopTotalCostUsd (~:1962).
+         b. accumulate where msg.cost is accumulated (~:2135) -- sum input/output, total when present.
+         c. add ...(loopTotalTokens ? { tokens: loopTotalTokens } : {}) to the loop node_completed
+            event data block (~:2421, next to its cost_usd).
+         d. add the same spread to the loop returns at ~:2442-2447, ~:2502, ~:2513-2517.
+      4. RUN AGGREGATE trio: dag-executor.ts ~:2777 declare let totalTokens = 0 next to totalCostUsd;
+         ~:3222 add (guarded) totalTokens += output.tokens.total ?? (input+output); ~:3385 add
+         ...(totalTokens > 0 ? { total_tokens: totalTokens } : {}) to completeWorkflowRun alongside total_cost_usd.
+      5. SERVER API: packages/server runs/events read path -- spec Section 7 says GET /api/workflows/runs/:runId
+         spreads the full row (metadata passes through) so JSONB tokens flow with NO change; the
+         builder CONFIRMS this with the integration test rather than assuming. The NEW work is a small
+         DERIVED quotaWindow summary { windowTokens, windowBudget, windowResetAt } on the runs API,
+         using config/env constants MAX20X_WINDOW_TOKENS / MAX20X_WINDOW_HOURS with a clearly-labelled
+         DEFAULT and a comment that this is an ESTIMATE of the Max-20x rate-limit window, not a billed
+         quota. If the window budget is not defensible, ship windowBudget: null (raw-first fallback).
+
+      ## INVARIANTS THAT MUST NOT BREAK (spec Q6)
+      - The cost path: per-node cost_usd persistence + total_cost_usd aggregate MUST still work and
+        total_cost_usd values MUST be byte-identical to pre-change (test scenario 3 + 8 assert this).
+      - Absent-usage nodes OMIT tokens (never write 0, never {}). Mirror the cost omit-when-undefined behavior.
+      - Resume semantics: a resumed run counts ONLY resumed-portion tokens (mirror the :2776 cost comment);
+        do NOT fabricate pre-resume tokens.
+
+      ## Required Output (structured Markdown)
+      - WO ID
+      - Files to modify  (list each exact path)
+      - Files to create  (test files)
+      - Files explicitly OUT OF SCOPE (provider.ts, packages/web, any migration)
+      - Verification commands  (bun x tsc --noEmit; bun test for both packages; the grep assertions)
+      - Commit message
+      - Push policy  (feature branch + PR to dev; bdc-harness is not a Rule-20 customer repo, no staging gate)
+
+      ## Spec
+      $read-spec.output
+
+  # plan-review: in-run self-repair loop (LOOP 1 of 2 -- hard line: no more than 2 loops).
+  # war-council-architect adversarially re-reviews and REVISES its own plan until clean or
+  # 2 repair attempts, then escalates. READ-ONLY persona => STDOUT-only loop.
+  - id: plan-review
+    persona: war-council-architect
+    agent: war-council-architect
+    depends_on: [plan]
+    task_class: medium_work
+    loop:
+      fresh_context: true
+      until: PLAN_REVIEW_APPROVED
+      max_iterations: 3
+      prompt: |
+        You are the War Council Architect doing an adversarial self-review of the
+        implementation plan, then REVISING it in place. One initial pass + up to 2 repair
+        attempts. You are READ-ONLY (no file writes, no shell) -- output goes to STDOUT.
+
+        ## Prior iteration (read FIRST)
+        $LOOP_PREV_OUTPUT
+        If it contains findings (PLAN_REVIEW_PASS=false), resolve every one in the revised plan
+        this iteration. If a finding repeats and you cannot resolve it, escalate (below).
+
+        ## Inputs
+        Original plan: $plan.output
+        Spec: $read-spec.output
+
+        ## Attack the plan on these dimensions (token-attribution specific)
+        1. Scope creep -- any file not justified by the spec. ESPECIALLY: does the plan touch
+           packages/providers/src/claude/provider.ts? If so it is WRONG (must be untouched).
+           Does it touch packages/web? If so it is WRONG (no UI in this WO).
+        2. Missing edit sites -- does the plan cover BOTH executors? executeAiNode AND
+           executeLoopNode each have the gap. A plan that only does executeAiNode is INCOMPLETE
+           and the motivating loop-node case (diff-repair heavy node) goes unmet -- FAIL it.
+        3. Type extension first -- does the plan extend NodeExecutionResult with tokens?: TokenUsage
+           BEFORE accessing output.tokens in the aggregate loop? If not, tsc fails -- FAIL it.
+        4. Migration -- does the plan propose any new table or migration? It must NOT (both targets
+           are EXISTING JSONB). If it does, FAIL it.
+        5. No-regression -- does the plan keep the cost path intact and require the two existing
+           test files (dag-executor.test.ts, api.workflow-runs.test.ts) to still pass?
+        6. Omit-when-absent + resume semantics encoded (never write 0; resumed-portion only).
+        7. Out-of-scope list present and correct.
+
+        ## Self-repair (the point -- do not just report)
+        If you find issues AND they are plan-level fixable, REVISE the plan to resolve them and
+        emit the corrected plan in full. Do not halt for a human on anything you can fix here.
+
+        ## Required STDOUT format (emit EXACTLY this shape; fenced so downstream consumes ONLY the plan)
+          PLAN_REVIEW_PASS=<true|false>
+          PLAN_REVIEW_RISK=<LOW|MEDIUM|HIGH>
+
+          === APPROVED_PLAN_BEGIN ===
+          <the FINAL revised plan in full -- this and ONLY this is what implement uses>
+          === APPROVED_PLAN_END ===
+
+          === PLAN_REVIEW_FINDINGS_BEGIN ===
+          <your findings / what you changed and why, or "(none)">
+          === PLAN_REVIEW_FINDINGS_END ===
+
+        The APPROVED_PLAN block must always contain a complete, usable plan (even on a passing
+        first iteration where you changed nothing -- echo the plan there). Keep ALL critique inside
+        the FINDINGS block; never let critique leak into the APPROVED_PLAN block.
+
+        ## Completion sentinel (success ONLY)
+        If and ONLY if PLAN_REVIEW_PASS=true, emit on its OWN LINE as the LAST line:
+          PLAN_REVIEW_APPROVED
+        On a failing iteration emit instead (never the approved token):
+          PLAN_REVIEW_NEEDS_REVISION
+
+        ## Escalation (emit instead of approving; never the approved sentinel)
+        If the spec is ambiguous/contradictory, the fix needs ungranted scope, or the same finding
+        survived a prior attempt -- set PLAN_REVIEW_PASS=false, emit PLAN_REVIEW_NEEDS_REVISION, and
+        put this inside the FINDINGS block:
+          ESCALATION_REQUIRED=true
+          ESCALATION_REASON=<ambiguous-spec|new-side-effect-class|loop-exhausted>
+          WO_ID=WO-HARNESS-TOKEN-ATTRIBUTION-01
+          NODE=plan-review
+          ATTEMPTS=<n>/3
+          WHAT_FAILED=<one paragraph>
+          WHAT_WAS_TRIED=<3-6 bullets>
+          LAST_REVIEW_FINDINGS=<exact bullets>
+          SINGLE_DECISION_NEEDED=<one sentence John can answer>
+          SAFE_STATE=<nothing committed/pushed; plan stage only>
+
+  - id: implement
+    persona: major-build
+    agent: major-build
+    depends_on: [plan-review]
+    task_class: medium_work
+    loop:
+      fresh_context: true
+      until: COMPLETE
+      max_iterations: 5
+      prompt: |
+        Implement WO-HARNESS-TOKEN-ATTRIBUTION-01 in thinmansoftware/bdc-harness.
+        CWD = repo root (the bdc-harness worktree). This is a CODE WO that EXTENDS the existing
+        cost-persistence path to ALSO persist TOKENS. It is NOT a rewrite.
+
+        ## Spec
+        $read-spec.output
+
+        ## Plan (approved by plan-review)
+        Use ONLY the text between === APPROVED_PLAN_BEGIN === and === APPROVED_PLAN_END === below.
+        IGNORE everything outside those markers (verdict headers, FINDINGS block, sentinels).
+        $plan-review.output
+
+        ## Branch
+        $fresh-branch.output
+
+        ## Files in scope (the ONLY files you may modify)
+        - packages/workflows/src/dag-executor.ts
+        - packages/server/...  (the runs/events API + the small derived quota-window summary; locate
+          the actual route + db read files by following the spec Section 7 references)
+        - the test files for both packages (dag-executor.test.ts and api.workflow-runs.test.ts, plus
+          any new test file you add for the new scenarios)
+
+        ## Files you MUST NOT touch (FAIL if you find yourself editing these)
+        - packages/providers/src/claude/provider.ts  -- it already emits tokens; read-only contract.
+        - anything under packages/web  -- no UI in this WO.
+        - any db migration  -- both target columns (events.data, runs.metadata) are EXISTING JSONB.
+
+        ## STEP 0 -- field-availability check FIRST (spec Section 7 requires this)
+        Confirm msg.tokens is the field carried from the provider into dag-executor.ts where
+        nodeTokens is set (~:966 nodeTokens = msg.tokens). The JSONL logNodeComplete path ALREADY
+        logs tokens -- that proves the data is live in memory before you touch persistence. Do NOT
+        modify provider.ts to "make tokens appear"; they already arrive.
+
+        ## STEP 1 -- TYPE extension (blocking; do this before the aggregate edit or tsc fails)
+        Extend, at dag-executor.ts ~:185 (locate by symbol NodeExecutionResult):
+          type NodeExecutionResult = NodeOutput & { costUsd?: number; tokens?: TokenUsage }
+        TokenUsage is already imported (~:22). Do NOT add a new import.
+
+        ## STEP 2 -- executeAiNode (mirror cost in 4 sites)
+        - node_completed createWorkflowEvent data block (next to cost_usd / model_usage):
+            ...(nodeTokens ? { tokens: nodeTokens } : {})
+        - the THREE return objects that carry costUsd (completed, user-cancel, catch): same spread.
+
+        ## STEP 3 -- executeLoopNode (the SAME gap; 5 sites -- DO NOT SKIP, this is the
+        ## highest-token consumer and the motivating case for the whole WO)
+        - declare:  let loopTotalTokens: TokenUsage | undefined   (next to loopTotalCostUsd)
+        - accumulate where msg.cost is accumulated:
+            if (msg.tokens) {
+              const t = msg.tokens;
+              if (!loopTotalTokens) loopTotalTokens = { input: 0, output: 0 };
+              loopTotalTokens.input += t.input;
+              loopTotalTokens.output += t.output;
+              if (t.total !== undefined) loopTotalTokens.total = (loopTotalTokens.total ?? 0) + t.total;
+            }
+        - loop node_completed event data block: ...(loopTotalTokens ? { tokens: loopTotalTokens } : {})
+        - the loop return objects that carry costUsd: same spread (each currently returns costUsd: loopTotalCostUsd).
+
+        ## STEP 4 -- run aggregate trio
+        - declare let totalTokens = 0 next to totalCostUsd (~:2777).
+        - at the cost-accumulate site (~:3222), guarded:
+            if (output.tokens) totalTokens += (output.tokens.total ?? ((output.tokens.input ?? 0) + (output.tokens.output ?? 0)));
+        - at completeWorkflowRun (~:3385), alongside total_cost_usd:
+            ...(totalTokens > 0 ? { total_tokens: totalTokens } : {})
+
+        ## STEP 5 -- server quota-window summary (the only NEW surface)
+        - Add a derived quotaWindow { windowTokens, windowBudget, windowResetAt } to the runs API.
+        - windowBudget + window length come from config/env constants MAX20X_WINDOW_TOKENS /
+          MAX20X_WINDOW_HOURS with a clearly-labelled DEFAULT and a code comment that this is an
+          ESTIMATE of the Max-20x rate-limit window, NOT a billed quota.
+        - windowTokens = sum of total_tokens across runs whose activity is in the current window.
+        - If the budget is not defensible, ship windowBudget: null and still emit windowTokens
+          (raw-first fallback). Do NOT fabricate a precise budget.
+        - Confirm (do not assume) the existing GET /api/workflows/runs/:runId already passes metadata
+          through unchanged; if it strips unknown JSONB keys, that is an API-serializer fix (still no migration).
+
+        ## INVARIANTS (Q6 -- assert these in tests, do not just claim them)
+        - The cost path still works; total_cost_usd is byte-identical to pre-change.
+        - Absent-usage nodes OMIT tokens (never 0, never {}).
+        - Resumed runs count only resumed-portion tokens (mirror :2776 cost semantics).
+
+        ## TESTS -- write the 8 scenarios from spec Section 11 (real-behavior asserts, not
+        ## "did not throw"; mirror the existing cost-test mock style in dag-executor.test.ts):
+        1. Per-node token persistence: data.tokens == {input:1000, output:500, total:1500}.
+        2. Omit when absent: data.tokens ABSENT (not 0, not {}).
+        3. Per-run aggregate: nodes 1500/800/0(absent) -> metadata.total_tokens === 2300 AND
+           total_cost_usd unchanged from current (assert BOTH -- proves no cost regression).
+        4. API exposes tokens: runs/events API response includes data.tokens per event and
+           metadata.total_tokens per run (integration test extending api.workflow-runs.test.ts).
+        5. Quota window line: configured budget -> {windowTokens:N, windowBudget:W, windowResetAt};
+           unconfigured -> windowBudget:null with windowTokens still present.
+        6. Resume semantics: resumed run's total_tokens excludes pre-resume node tokens.
+        7. Loop-node token persistence: executeLoopNode iterations totaling input:2000/output:900 ->
+           data.tokens reflects summed loopTotalTokens.
+        8. No regression: dag-executor.test.ts + api.workflow-runs.test.ts still PASS.
+
+        ## Self-verify BEFORE you finish (run from repo root; all must succeed)
+        - bun x tsc --noEmit        (in packages/workflows AND packages/server -- must exit 0)
+        - bun test                  (affected packages -- 8 new scenarios pass; the two existing suites pass)
+        - grep assertions (spec Section 12):
+            [ $(grep -c "tokens: nodeTokens" packages/workflows/src/dag-executor.ts) -ge 2 ]
+            [ $(grep -c "loopTotalTokens" packages/workflows/src/dag-executor.ts) -ge 3 ]
+            [ $(grep -c "total_tokens" packages/workflows/src/dag-executor.ts) -ge 1 ]
+            [ $(grep -c "totalTokens" packages/workflows/src/dag-executor.ts) -ge 2 ]
+            grep -nE "NodeExecutionResult = NodeOutput &.*tokens\?: TokenUsage" packages/workflows/src/dag-executor.ts
+            [ -z "$(git diff --name-only origin/dev -- packages/providers/src/claude/provider.ts)" ]
+
+        ## Execution rules
+        - Modify only the in-scope files. Prefer existing repo patterns/helpers.
+        - Do not reformat unrelated code. Do not deploy. Do not bypass gates.
+        - ASCII only. No emojis, no em-dashes, no smart quotes -- use the ASCII hyphen.
+        - Use bun (bun x / bun test), NEVER npm/npx/pnpm/yarn.
+        - Do NOT use git commit --allow-empty or any verify-only commit to simulate completion.
+        - Stop and report a blocker if the spec is ambiguous or a needed source of truth is missing.
+
+        ## Commit + push BEFORE exit (durability)
+        BRANCH=$(git rev-parse --abbrev-ref HEAD)
+        git add -A
+        git diff --cached --quiet || git -c user.name="John Ranson" \
+          -c user.email="admin@bluedevilcollectibles.com" \
+          commit -m "feat(workflows,server): WO-HARNESS-TOKEN-ATTRIBUTION-01 -- persist per-node + per-run token usage + quota-window API"
+        git push -u origin "$BRANCH" 2>&1 || echo "WARN: push failed -- backstop node will retry"
+
+        Output COMPLETE on its own line when tsc is clean, the 8 scenarios pass, the two existing
+        suites still pass, and all grep assertions pass.
+
+  - id: verify-tsc-and-greps
+    depends_on: [implement]
+    load_bearing: true
+    bash: |
+      set -euo pipefail
+      F="packages/workflows/src/dag-executor.ts"
+      if [ ! -f "$F" ]; then
+        echo "ERROR: $F not found in worktree" >&2
+        exit 1
+      fi
+      # Spec Section 12 grep assertions (BASH-EXECUTABLE).
+      [ "$(grep -c 'tokens: nodeTokens' "$F")" -ge 2 ] || {
+        echo "ERROR: 'tokens: nodeTokens' found < 2 times in $F (AI-node persist incomplete; need event data block + >=1 return)" >&2
+        exit 1
+      }
+      [ "$(grep -c 'loopTotalTokens' "$F")" -ge 3 ] || {
+        echo "ERROR: 'loopTotalTokens' found < 3 times in $F (loop-node persist incomplete; need declare + accumulate + >=1 persist/return)" >&2
+        exit 1
+      }
+      [ "$(grep -c 'total_tokens' "$F")" -ge 1 ] || {
+        echo "ERROR: 'total_tokens' not found in $F (run-aggregate metadata key missing)" >&2
+        exit 1
+      }
+      [ "$(grep -c 'totalTokens' "$F")" -ge 2 ] || {
+        echo "ERROR: 'totalTokens' found < 2 times in $F (need declare + accumulate)" >&2
+        exit 1
+      }
+      grep -nE 'NodeExecutionResult = NodeOutput &.*tokens\?: TokenUsage' "$F" || {
+        echo "ERROR: NodeExecutionResult was not extended with 'tokens?: TokenUsage' (tsc would fail on output.tokens)" >&2
+        exit 1
+      }
+      # provider.ts MUST be untouched (spec Q6 + Section 12).
+      if [ -n "$(git diff --name-only origin/dev -- packages/providers/src/claude/provider.ts 2>/dev/null)" ]; then
+        echo "ERROR: packages/providers/src/claude/provider.ts was modified -- it MUST stay untouched (spec invariant)." >&2
+        exit 1
+      fi
+      # No web/UI changes (spec Section 5).
+      if [ -n "$(git diff --name-only origin/dev -- packages/web 2>/dev/null)" ]; then
+        echo "ERROR: packages/web was modified -- this WO has NO UI (display is WO-MC-NEGAN-DIAGNOSTIC-GRAPH-01)." >&2
+        exit 1
+      fi
+      # No migration (spec Section 9).
+      if git diff --name-only origin/dev 2>/dev/null | grep -Eq 'migrations?/.*\.(sql|ts)$'; then
+        echo "ERROR: a migration file was added/modified -- this WO needs NO migration (both targets are EXISTING JSONB)." >&2
+        exit 1
+      fi
+      # tsc (best-effort scoped: run in each package if the package dir exists).
+      if [ -d packages/workflows ]; then
+        ( cd packages/workflows && bun x tsc --noEmit ) || { echo "ERROR: tsc --noEmit failed in packages/workflows" >&2; exit 1; }
+      fi
+      if [ -d packages/server ]; then
+        ( cd packages/server && bun x tsc --noEmit ) || { echo "ERROR: tsc --noEmit failed in packages/server" >&2; exit 1; }
+      fi
+      echo "verify-tsc-and-greps PASS: type extended, both executors persist tokens, run aggregate present, provider.ts/web/migrations untouched, tsc clean"
+
+  # capture-diff: the Codex reviewer persona is read-only (no Bash), so capture the feature
+  # diff to an artifact it can Read. (Pattern lifted verbatim from bdc-feature-development.)
+  - id: capture-diff
+    depends_on: [verify-tsc-and-greps]
+    bash: |
+      set -uo pipefail
+      mkdir -p "$ARTIFACTS_DIR"
+      OUT="$ARTIFACTS_DIR/diff.patch"
+      BASE_REF="origin/dev"
+      EMPTY_TREE=$(git hash-object -t tree /dev/null 2>/dev/null || echo 4b825dc642cb6eb9a060e54bf8d69288fbee4904)
+      MB=$(git merge-base HEAD "$BASE_REF" 2>/dev/null || git rev-parse HEAD~1 2>/dev/null || echo "$EMPTY_TREE")
+      [ -n "$MB" ] || MB="$EMPTY_TREE"
+      {
+        echo "### git diff --stat ($MB..HEAD)"
+        git diff --stat "$MB"..HEAD 2>/dev/null || true
+        echo
+        echo "### git diff --name-only ($MB..HEAD)"
+        git diff --name-only "$MB"..HEAD 2>/dev/null || true
+        echo
+        echo "### committed diff ($MB..HEAD)"
+        git diff "$MB"..HEAD 2>/dev/null || true
+        echo
+        echo "### unstaged working-tree diff (HEAD..worktree)"
+        git diff HEAD 2>/dev/null || true
+      } > "$OUT"
+      echo "DIFF_BASE=$MB"
+      echo "DIFF_ARTIFACT=$OUT"
+      echo "DIFF_BYTES=$(wc -c < "$OUT" 2>/dev/null || echo 0)"
+
+  - id: diff-review
+    provider: codex
+    model: gpt-5.6-sol
+    agent: codex-adversarial-reviewer
+    depends_on: [capture-diff]
+    task_class: medium_work
+    prompt: |
+      You are the Codex adversarial diff reviewer. Cross-model review of the diff major-build
+      produced, BEFORE it is committed to a PR. You are READ-ONLY: inspect and report, no edits,
+      no state-mutating commands.
+
+      ## Inputs
+      Spec: $read-spec.output
+      Verify gate: $verify-tsc-and-greps.output
+      Diff provenance: $capture-diff.output
+      READ the captured diff at the DIFF_ARTIFACT path ($ARTIFACTS_DIR/diff.patch). You have no
+      Bash tool -- do not run git. Use Read/Grep/Glob on the changed files for context.
+
+      ## Attack what tests + the gate can miss (token-attribution specific)
+      1. provider.ts untouched -- confirm packages/providers/src/claude/provider.ts is NOT in the diff.
+      2. BOTH executors -- confirm executeLoopNode (not just executeAiNode) persists tokens. The
+         loop node is the motivating heavy-token case; if only the AI node was patched, FLAG it.
+      3. Omit-when-absent -- confirm the code writes tokens ONLY when present (never 0, never {}),
+         exactly mirroring cost_usd's omit-when-undefined behavior.
+      4. Cost-path regression -- confirm total_cost_usd accumulation/persistence is unchanged and
+         a test asserts byte-identical cost values (scenario 3 / 8).
+      5. Type extension -- confirm NodeExecutionResult gained tokens?: TokenUsage (not `any`, not a
+         duplicate import).
+      6. Resume semantics -- confirm the aggregate does not fabricate pre-resume tokens.
+      7. Quota window -- confirm the budget constant is clearly labelled an ESTIMATE and the
+         raw-first (windowBudget: null) fallback exists; no fabricated precise quota.
+      8. Missing tests -- any in-scope behavior with no test asserting real output.
+
+      ## Output (STDOUT only)
+        DIFF_REVIEW=<satisfied|needs_revision>
+        FINDINGS:
+        - <file:line> <one specific, fixable finding>   (repeat; or "(none)")
+        SEMANTIC_RISK=<LOW|MEDIUM|HIGH>
+      Every finding cites a file and the exact problem. Only flag what must change before commit.
+
+  - id: diff-repair
+    persona: major-build
+    agent: major-build
+    depends_on: [diff-review]
+    task_class: medium_work
+    loop:
+      fresh_context: true
+      # LOOP 2 of 2 (hard line: no more than 2 loops). until_bash is the SOLE real authority;
+      # until: is a sentinel the agent is told to NEVER emit, so only the done.flag + clean
+      # mechanical check completes the loop (pattern from bdc-feature-development diff-repair).
+      until: __NEVER_EMIT_USE_UNTIL_BASH__
+      max_iterations: 3
+      until_bash: |
+        set -uo pipefail
+        DONE="$ARTIFACTS_DIR/diff-repair-done.flag"
+        [ -f "$DONE" ] || { echo "repair not signalled done"; exit 1; }
+        BASE_REF="origin/dev"
+        EMPTY_TREE=$(git hash-object -t tree /dev/null 2>/dev/null || echo 4b825dc642cb6eb9a060e54bf8d69288fbee4904)
+        MB=$(git merge-base HEAD "$BASE_REF" 2>/dev/null || git rev-parse HEAD~1 2>/dev/null || echo "$EMPTY_TREE")
+        [ -n "$MB" ] || MB="$EMPTY_TREE"
+        DEBUG_RE='console\.log\(|debugger;'
+        if { git diff --unified=0 "$MB"..HEAD 2>/dev/null; git diff --unified=0 HEAD 2>/dev/null; } \
+             | grep -E '^\+' | grep -Eq "$DEBUG_RE"; then
+          echo "debug statement present in feature diff"; exit 1
+        fi
+        # provider.ts must STILL be untouched after repair.
+        if [ -n "$(git diff --name-only origin/dev -- packages/providers/src/claude/provider.ts 2>/dev/null)" ]; then
+          echo "repair touched provider.ts -- forbidden"; exit 1
+        fi
+        exit 0
+      prompt: |
+        You are major-build. The Codex diff reviewer raised findings on your diff. Fix every
+        fixable finding in place. You are the BUILDER; Codex does not edit.
+
+        ## Codex review verdict (read directly)
+        $diff-review.output
+
+        ## Prior repair iteration (if any)
+        $LOOP_PREV_OUTPUT
+
+        ## What to do
+        - If DIFF_REVIEW=satisfied with no findings: make no changes; just signal done.
+        - Otherwise: resolve each FINDINGS line. Add the missing test, fix the omit-when-absent
+          logic, add the executeLoopNode persist if it was missed, etc. Modify only in-scope files.
+          Do NOT touch provider.ts or packages/web. Do not reformat unrelated code. Do not deploy.
+
+        ## NEVER FABRICATE A DIFF
+        Do NOT regenerate $ARTIFACTS_DIR/diff.patch from already-merged commits, origin/dev, or
+        another branch. The diff artifact must reflect ONLY real changes from THIS run.
+
+        ## Escalation (write to $ARTIFACTS_DIR/diff-repair-escalation.txt and STOP) if:
+        - a finding needs ungranted scope / a new side-effect class
+        - the spec is ambiguous about the correct fix
+        - the same finding survived a prior attempt and you cannot resolve it
+        Escalation block keys:
+          ESCALATION_REQUIRED=true
+          ESCALATION_REASON=<new-side-effect-class|ambiguous-spec|loop-exhausted>
+          WO_ID=WO-HARNESS-TOKEN-ATTRIBUTION-01
+          NODE=diff-repair
+          ATTEMPTS=<n>/3
+          WHAT_FAILED=<one paragraph>
+          WHAT_WAS_TRIED=<3-6 bullets>
+          LAST_REVIEW_FINDINGS=<exact Codex findings>
+          SINGLE_DECISION_NEEDED=<one sentence John can answer>
+          SAFE_STATE=<work is local in the worktree; nothing merged>
+
+        ## Signal done (the FLAG is the only completion gate -- there is NO text sentinel)
+        When you have addressed every fixable finding (or there were none) AND introduced no debug
+        prints AND provider.ts is still untouched:
+          - Write an empty file at $ARTIFACTS_DIR/diff-repair-done.flag   (the ONLY signal)
+        If you escalated, do NOT write the flag.
+
+  - id: commit-and-push
+    persona: overseer
+    depends_on: [diff-repair]
+    load_bearing: true
+    bash: |
+      set -euo pipefail
+      BRANCH="$(git rev-parse --abbrev-ref HEAD)"
+      git add -A
+      if ! git diff --cached --quiet; then
+        git -c user.name="John Ranson" -c user.email="admin@bluedevilcollectibles.com" \
+          commit -m "chore: backstop commit WO-HARNESS-TOKEN-ATTRIBUTION-01"
+      fi
+      # WO-169: real push retry, fail closed (load_bearing node).
+      PUSH_OK=false
+      for attempt in 1 2 3; do
+        if git push -u origin "$BRANCH" 2>&1; then PUSH_OK=true; break; fi
+        echo "WARN: push attempt $attempt failed; retrying after $((attempt * 5))s..." >&2
+        sleep $((attempt * 5))
+      done
+      if [ "$PUSH_OK" = "false" ]; then
+        echo "ERROR: git push failed after 3 attempts -- aborting (load_bearing)." >&2
+        exit 1
+      fi
+      REMOTE_HEAD="$(git ls-remote origin "refs/heads/${BRANCH}" 2>/dev/null | awk '{print $1}')"
+      LOCAL_HEAD="$(git rev-parse HEAD)"
+      if [ "$REMOTE_HEAD" != "$LOCAL_HEAD" ]; then
+        echo "FATAL: branch ${BRANCH} not durably pushed (origin=${REMOTE_HEAD:-<absent>} local=${LOCAL_HEAD})" >&2
+        exit 1
+      fi
+      echo "VERIFIED: origin/${BRANCH} == local HEAD (${LOCAL_HEAD})"
+      echo "SHA=${LOCAL_HEAD}"
+      echo "BRANCH=${BRANCH}"
+
+  - id: open-pr
+    depends_on: [commit-and-push]
+    load_bearing: true
+    bash: |
+      set -euo pipefail
+      WO_ID="${WO_ID:-WO-HARNESS-TOKEN-ATTRIBUTION-01}"
+      REPO="thinmansoftware/bdc-harness"
+      BRANCH="$(git rev-parse --abbrev-ref HEAD)"
+      # bdc-harness INTEGRATION branch is dev (NOT main). PR base = dev.
+      BASE="dev"
+      EXIST=$(gh pr list --repo "$REPO" --head "$BRANCH" --state open \
+        --json url --jq '.[0].url // empty' 2>/dev/null || true)
+      if [ -n "$EXIST" ]; then echo "PR_URL=$EXIST"; exit 0; fi
+      for attempt in 1 2 3; do
+        if URL=$(gh pr create --repo "$REPO" --base "$BASE" --head "$BRANCH" \
+            --title "feat(workflows,server): ${WO_ID} -- persist per-node + per-run token usage" \
+            --body "Implements ${WO_ID}. Mirrors the existing cost-persistence path for TOKENS in BOTH executors (executeAiNode + executeLoopNode), extends NodeExecutionResult with tokens?: TokenUsage, aggregates total_tokens into runs.metadata, and adds a derived Max-20x quota-window summary to the runs API. NO migration (events.data + runs.metadata are existing JSONB). provider.ts untouched; no web/UI. Spec: bdc-xo docs/work-orders/${WO_ID}.md" 2>&1); then
+          echo "PR_URL=$URL"; exit 0
+        fi
+        echo "WARN: gh pr create attempt $attempt failed; retrying after $((attempt * 5))s..." >&2
+        sleep $((attempt * 5))
+      done
+      echo "ERROR: gh pr create failed after 3 attempts" >&2; exit 1
+
+  - id: build-manifest
+    depends_on: [open-pr]
+    task_class: clerical
+    prompt: |
+      Construct the Captain CI v2 completion manifest for WO-HARNESS-TOKEN-ATTRIBUTION-01.
+      CODE class, single repo (bdc-harness), server-side TypeScript.
+
+      ## Inputs
+      Plan (approved -- use the APPROVED_PLAN block): $plan-review.output
+      Implement output: $implement.output
+      Verify gate (tsc + grep assertions): $verify-tsc-and-greps.output
+      Diff review (Codex initial): $diff-review.output
+      Diff repair: $diff-repair.output
+      Commit + push: $commit-and-push.output
+      PR: $open-pr.output
+
+      ## Required manifest fields (verbatim shape -- single fenced block so flip-notion pastes it
+      ## into the Notion Notes property exactly)
+      WO: WO-HARNESS-TOKEN-ATTRIBUTION-01
+      Builder: Devils Cauldron (Archon bdc-harness-token-attribution)
+      Files modified: packages/workflows/src/dag-executor.ts; packages/server/<runs-events-route + db read path> (from implement output)
+      Files created: <new test file(s) from implement output>
+      Tests: bun x tsc --noEmit PASS (packages/workflows + packages/server); bun test -- 8 new
+        scenarios PASS; existing dag-executor.test.ts + api.workflow-runs.test.ts PASS (no cost regression)
+      PRs: <PR_URL from open-pr>, behind_by: 0
+      Merge ancestors: bdc-harness dev HEAD, manifest commit, behind_by: 0
+      Grep assertions (BASH-EXECUTABLE -- re-runnable from repo root):
+        [ $(grep -c 'tokens: nodeTokens' packages/workflows/src/dag-executor.ts) -ge 2 ]
+        [ $(grep -c 'loopTotalTokens' packages/workflows/src/dag-executor.ts) -ge 3 ]
+        [ $(grep -c 'total_tokens' packages/workflows/src/dag-executor.ts) -ge 1 ]
+        [ $(grep -c 'totalTokens' packages/workflows/src/dag-executor.ts) -ge 2 ]
+        grep -nE 'NodeExecutionResult = NodeOutput &.*tokens\?: TokenUsage' packages/workflows/src/dag-executor.ts
+        [ -z "$(git diff --name-only origin/dev -- packages/providers/src/claude/provider.ts)" ]
+      Runtime verification: fire a tiny workflow on dev, query the events API for that run, confirm
+        data.tokens present on a node_completed event and metadata.total_tokens on the run (curl + jq
+        evidence). This is an OPERATOR / Captain-CI step at PR-review -- if the executor could not
+        perform it, state that plainly; do NOT claim a runtime proof that did not happen.
+      Vercel deployment: N/A (bdc-harness is server tooling, not a Vercel app)
+      In-run review evidence: plan-review verdict (PLAN_REVIEW_PASS + RISK); diff-review-final
+        verdict from $diff-review.output / $diff-repair.output; cross-model reviewer = codex gpt-5.6-sol.
+      VALIDATION: PASS
+
+      If any in-run review ended needs_revision or was skipped, VALIDATION cannot be PASS -- say so.
+
+  - id: flip-notion
+    persona: xo
+    depends_on: [build-manifest]
+    task_class: clerical
+    bash: |
+      set -euo pipefail
+
+      capture_node_output() {
+        python3 -c 'import shlex, sys; s=sys.stdin.read(); sys.stdout.write((lambda p: p[0] if len(p)==1 else s)(shlex.split(s)) if len(s)>=2 and s[0]=="'"'"'" and s.rstrip("\n").endswith("'"'"'") else s)'
+      }
+
+      MANIFEST=$(capture_node_output <<'BDC_NODE_OUTPUT_MANIFEST'
+      $build-manifest.output
+      BDC_NODE_OUTPUT_MANIFEST
+      )
+
+      READ_SPEC_OUT=$(capture_node_output <<'BDC_NODE_OUTPUT_READ_SPEC'
+      $read-spec.output
+      BDC_NODE_OUTPUT_READ_SPEC
+      )
+      ISSUE_REPO="${ISSUE_REPO:-thinmansoftware/bdc-xo}"
+      ISSUE_NUM=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'issue=[0-9]+' | head -1 | cut -d= -f2 || true)
+      if [ -z "$ISSUE_NUM" ]; then
+        ISSUE_NUM=$(printf '%s\n' "$READ_SPEC_OUT" | sed -n 's/^SPEC_PATH=.*issues\/\([0-9][0-9]*\).*/\1/p' | head -1)
+      fi
+      if [ -z "$ISSUE_NUM" ]; then
+        WO_ID_FROM_SPEC=$(printf '%s\n' "$READ_SPEC_OUT" | sed -n 's/^WO_ID=//p' | head -1)
+        if [ -n "$WO_ID_FROM_SPEC" ]; then
+          ISSUE_NUM=$(gh issue list --repo "$ISSUE_REPO" --search "$WO_ID_FROM_SPEC in:title" --json number --jq '.[0].number // empty' 2>/dev/null || true)
+        fi
+      fi
+      if [ -z "$ISSUE_NUM" ]; then
+        echo "flip-notion: no GitHub issue resolved; skipping status:review label + manifest comment."
+        exit 0
+      fi
+
+      gh label create status:review --repo "$ISSUE_REPO" --color 0E8A16 --description "BDC workflow is ready for review" 2>/dev/null || true
+      gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --remove-label status:building 2>/dev/null || true
+      gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --remove-label status:blocked 2>/dev/null || true
+      gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --add-label status:review
+      COMMENT_FILE=$(mktemp)
+      printf '%s\n' "$MANIFEST" > "$COMMENT_FILE"
+      gh issue comment "$ISSUE_NUM" --repo "$ISSUE_REPO" --body-file "$COMMENT_FILE"
+      echo "flip-notion: $ISSUE_REPO#$ISSUE_NUM -> status:review (manifest posted as comment)"

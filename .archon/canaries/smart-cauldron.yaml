@@ -1,0 +1,47 @@
+schema_version: 1
+environment:
+  id: hetzner-production
+  project: bdc-harness
+  canonical_remote: thinmansoftware/bdc-harness
+  base_branch: dev
+artifact_root: harness-artifacts/canaries
+lanes:
+  - name: bdc-feature-development-zero-open
+    order: 1
+  - name: bdc-feature-development-zero
+    order: 2
+  - name: bdc-feature-development-fusion-cx-qwen
+    order: 3
+  - name: bdc-feature-development-grok
+    order: 4
+  - name: bdc-feature-development-codex-only
+    order: 5
+  - name: bdc-feature-development-codex
+    order: 6
+  - name: bdc-feature-development
+    order: 7
+  - name: bdc-feature-development-fable
+    order: 8
+  - name: bdc-multi-stage-development
+    order: 9
+conductor_probes:
+  - id: mechanical-code
+    wo_class: CODE
+    tags: [mechanical]
+    expected_tier: zero
+    expected_workflow: bdc-feature-development-zero-open
+  - id: generic-code
+    wo_class: CODE
+    tags: []
+    expected_tier: codex
+    expected_workflow: bdc-feature-development-codex
+  - id: security-code
+    wo_class: CODE
+    tags: [security]
+    expected_tier: claude
+    expected_workflow: bdc-feature-development
+  - id: infra
+    wo_class: INFRA
+    tags: []
+    expected_tier: claude
+    expected_workflow: bdc-feature-development

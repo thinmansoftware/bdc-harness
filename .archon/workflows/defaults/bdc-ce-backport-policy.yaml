@@ -1,12 +1,12 @@
 name: bdc-ce-backport-policy
 description: |
-  Use when: Shipping WO-RELEASE-CE-BACKPORT-POLICY-01 — Captain CI enforces every CE hotfix
+  Use when: Shipping WO-RELEASE-CE-BACKPORT-POLICY-01 -- Captain CI enforces every CE hotfix
   has a backport PR to main.
   Input: WO_ID = WO-RELEASE-CE-BACKPORT-POLICY-01.
   Does: Implements a Captain CI check in lspro-react `.github/workflows/ce-backport-check.yml`
-        that runs when a PR merges into release/ce from a hotfix/ce/* branch — verifies a
+        that runs when a PR merges into release/ce from a hotfix/ce/* branch -- verifies a
         backport PR to main exists or a waiver is recorded. Opens PR.
-  Repo: bluedevilcollectibles/lspro-react. Cross-repo spec from bdc-xo.
+  Repo: thinmansoftware/lspro-react. Cross-repo spec from bdc-xo.
 
 policyFile: harness/policies/agent-behavior.md
 model: sonnet
@@ -17,17 +17,17 @@ nodes:
       set -euo pipefail
       WO_ID="${WO_ID:-WO-RELEASE-CE-BACKPORT-POLICY-01}"
       SPEC_PATH="docs/superpowers/specs/ce-release-branch/work-orders/${WO_ID}.md"
-      SPEC=$(gh api "repos/bluedevilcollectibles/bdc-xo/contents/${SPEC_PATH}?ref=main" --jq .content 2>/dev/null | base64 -d 2>/dev/null || true)
+      SPEC=$(gh api "repos/thinmansoftware/bdc-xo/contents/${SPEC_PATH}?ref=main" --jq .content 2>/dev/null | base64 -d 2>/dev/null || true)
       if [ -z "$SPEC" ]; then
         # Fallback 4: GitHub issue body (WO-HARNESS-READ-SPEC-ISSUE-BODY-FALLBACK-01)
         ISSUE_NUM=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'issue=[0-9]+' | head -n 1 | cut -d= -f2 || true)
         if [ -z "$ISSUE_NUM" ]; then
-          ISSUE_NUM=$(gh issue list --repo bluedevilcollectibles/bdc-xo \
+          ISSUE_NUM=$(gh issue list --repo thinmansoftware/bdc-xo \
             --search "${WO_ID} in:title" --json number,title \
             --jq '.[0].number' 2>/dev/null || true)
         fi
         if [ -n "$ISSUE_NUM" ] && [ "$ISSUE_NUM" != "null" ]; then
-          SPEC=$(gh issue view "$ISSUE_NUM" --repo bluedevilcollectibles/bdc-xo \
+          SPEC=$(gh issue view "$ISSUE_NUM" --repo thinmansoftware/bdc-xo \
             --json body --jq .body 2>/dev/null || true)
           [ -n "$SPEC" ] && SPEC_PATH="issues/${ISSUE_NUM}"
         fi
@@ -63,11 +63,11 @@ nodes:
             3. If none found AND no `ce-backport-waiver` label on the original PR, fail the check + comment on the merged PR with instructions
             4. If found, post comment with backport PR URL + pass
           - Required permissions: `pull-requests: write`, `contents: read`
-        - `docs/CE-BACKPORT-POLICY.md` — short policy doc pointing to bdc-xo governance
+        - `docs/CE-BACKPORT-POLICY.md` -- short policy doc pointing to bdc-xo governance
 
         ## Rules
         - Use only `gh` CLI (preinstalled in GitHub-hosted runners) + standard bash.
-        - The check is INFORMATIONAL (not blocking) for now — comment-only; if we want hard-block later, separate WO.
+        - The check is INFORMATIONAL (not blocking) for now -- comment-only; if we want hard-block later, separate WO.
         - Do NOT modify any other workflow files.
 
         Output <promise>COMPLETE</promise> when both files exist + `yamllint .github/workflows/ce-backport-check.yml` passes (or skipped if yamllint not present).
@@ -103,7 +103,7 @@ nodes:
         echo "No staged changes; branch already contains requested work"
       else
         git -c user.name="John Ranson" -c user.email="admin@bluedevilcollectibles.com" \
-          commit -m "feat(ci): WO-RELEASE-CE-BACKPORT-POLICY-01 — CE hotfix backport policy check
+          commit -m "feat(ci): WO-RELEASE-CE-BACKPORT-POLICY-01 -- CE hotfix backport policy check
 
         Adds .github/workflows/ce-backport-check.yml. Runs when a PR is merged into release/ce
         from a hotfix/ce/* branch. Checks for a backport PR to main, comments instructions if missing.
@@ -118,14 +118,14 @@ nodes:
     depends_on: [commit-and-push]
     bash: |
       set -euo pipefail
-      # Hardcoded — must match commit-and-push BRANCH literal. See WO-HARNESS-OPEN-PR-BRANCH-INTERPOLATION-FIX-01.
+      # Hardcoded -- must match commit-and-push BRANCH literal. See WO-HARNESS-OPEN-PR-BRANCH-INTERPOLATION-FIX-01.
       BRANCH="wo/release-ce-backport-policy-01"
-      REPO="bluedevilcollectibles/lspro-react"
+      REPO="thinmansoftware/lspro-react"
       BASE="main"
-      TITLE="feat(ci): WO-RELEASE-CE-BACKPORT-POLICY-01 — CE hotfix backport check"
-      BODY="Implements WO-RELEASE-CE-BACKPORT-POLICY-01. CE hotfixes that merge to release/ce without a backport PR to main now get a CI comment with instructions. 🤖 Generated with Claude Code"
+      TITLE="feat(ci): WO-RELEASE-CE-BACKPORT-POLICY-01 -- CE hotfix backport check"
+      BODY="Implements WO-RELEASE-CE-BACKPORT-POLICY-01. CE hotfixes that merge to release/ce without a backport PR to main now get a CI comment with instructions.  Generated with Claude Code"
       # Idempotent PR creation: check first, then create with retries, re-check after each failed attempt.
-      # See WO-HARNESS-OPEN-PR-GRAPHQL-NO-COMMITS-FIX-01 — gh pr create can server-side-succeed even when client returns error,
+      # See WO-HARNESS-OPEN-PR-GRAPHQL-NO-COMMITS-FIX-01 -- gh pr create can server-side-succeed even when client returns error,
       # and the GitHub PR API needs multi-minute window to resolve newly-pushed refs.
       existing_pr_url() {
         gh pr list --repo "$REPO" --head "$BRANCH" --state open --json url --jq '.[0].url // empty' 2>/dev/null
@@ -167,8 +167,43 @@ nodes:
   - id: flip-notion
     depends_on: [build-manifest]
     task_class: clerical
-    prompt: |
-      Flip Notion WO-RELEASE-CE-BACKPORT-POLICY-01 to REVIEW.
-      Page ID: 35def4c9-ce00-81c8-b94e-c2795e439fe7
-      Notes = $build-manifest.output. Claude Status -> REVIEW. Status -> Review.
-      If MCP unavailable: XO_TODO line.
+    bash: |
+      set -euo pipefail
+
+      capture_node_output() {
+        python3 -c 'import shlex, sys; s=sys.stdin.read(); sys.stdout.write((lambda p: p[0] if len(p)==1 else s)(shlex.split(s)) if len(s)>=2 and s[0]=="'"'"'" and s.rstrip("\n").endswith("'"'"'") else s)'
+      }
+
+      MANIFEST=$(capture_node_output <<'BDC_NODE_OUTPUT_MANIFEST'
+      $build-manifest.output
+      BDC_NODE_OUTPUT_MANIFEST
+      )
+
+      READ_SPEC_OUT=$(capture_node_output <<'BDC_NODE_OUTPUT_READ_SPEC'
+      $read-spec.output
+      BDC_NODE_OUTPUT_READ_SPEC
+      )
+      ISSUE_REPO="${ISSUE_REPO:-thinmansoftware/bdc-xo}"
+      ISSUE_NUM=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'issue=[0-9]+' | head -1 | cut -d= -f2 || true)
+      if [ -z "$ISSUE_NUM" ]; then
+        ISSUE_NUM=$(printf '%s\n' "$READ_SPEC_OUT" | sed -n 's/^SPEC_PATH=.*issues\/\([0-9][0-9]*\).*/\1/p' | head -1)
+      fi
+      if [ -z "$ISSUE_NUM" ]; then
+        WO_ID_FROM_SPEC=$(printf '%s\n' "$READ_SPEC_OUT" | sed -n 's/^WO_ID=//p' | head -1)
+        if [ -n "$WO_ID_FROM_SPEC" ]; then
+          ISSUE_NUM=$(gh issue list --repo "$ISSUE_REPO" --search "$WO_ID_FROM_SPEC in:title" --json number --jq '.[0].number // empty' 2>/dev/null || true)
+        fi
+      fi
+      if [ -z "$ISSUE_NUM" ]; then
+        echo "flip-notion: no GitHub issue resolved; skipping status:review label + manifest comment."
+        exit 0
+      fi
+
+      gh label create status:review --repo "$ISSUE_REPO" --color 0E8A16 --description "BDC workflow is ready for review" 2>/dev/null || true
+      gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --remove-label status:building 2>/dev/null || true
+      gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --remove-label status:blocked 2>/dev/null || true
+      gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --add-label status:review
+      COMMENT_FILE=$(mktemp)
+      printf '%s\n' "$MANIFEST" > "$COMMENT_FILE"
+      gh issue comment "$ISSUE_NUM" --repo "$ISSUE_REPO" --body-file "$COMMENT_FILE"
+      echo "flip-notion: $ISSUE_REPO#$ISSUE_NUM -> status:review (manifest posted as comment)"
