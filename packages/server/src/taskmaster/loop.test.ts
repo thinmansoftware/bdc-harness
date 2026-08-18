@@ -8,6 +8,7 @@ import { readFileSync } from 'fs';
 import { join } from 'path';
 import {
   createTaskmasterState,
+  defaultFindEffectByIdempotencyKey,
   defaultGetGithubIssueEvidence,
   defaultListThreads,
   tick,
@@ -995,6 +996,58 @@ describe('scenario 4: restart produces no double effect', () => {
     await tick(state, deps);
     expect(world.journal.find(j => j.id === 'journal-orphan')?.outcome).toBe('expired');
     expect(world.sentMessages.length).toBe(0);
+  });
+
+  test('legacy null-principal taskmaster effect reconciles pending journal to sent', async () => {
+    const world = makeWorld();
+    seedDigestSent(world);
+    const key = 'tm:nudge:gh:thinmansoftware/bdc-xo#129:1';
+    world.journal.push({
+      id: 'journal-legacy-taskmaster-effect',
+      created_at: new Date(T0 - 60_000).toISOString(),
+      thread_ref: 'gh:thinmansoftware/bdc-xo#129',
+      action_type: 'nudge',
+      proposal_json: '{}',
+      idempotency_key: key,
+      before_hash: null,
+      proof_predicate: null,
+      proof_deadline_at: null,
+      outcome: 'pending',
+      graded_at: null,
+      grade: null,
+    });
+    const queries: string[] = [];
+    const findLegacyEffect = (effectKey: string) =>
+      defaultFindEffectByIdempotencyKey(effectKey, async (sql, params) => {
+        queries.push(sql);
+        if (params[0] !== key) return { rows: [] };
+        return {
+          rows: [
+            {
+              id: 'legacy-taskmaster-dispatch',
+              status: 'queued',
+              created_at: new Date(T0 - 30_000).toISOString(),
+            },
+          ],
+        };
+      });
+    const state = createTaskmasterState(60_000);
+
+    await tick(
+      state,
+      makeDeps(world, {
+        findEffectByIdempotencyKey: findLegacyEffect,
+        getDispatchMessageById: async () => null,
+        getGithubIssueEvidence: async () => null,
+        listThreads: async () => [],
+      })
+    );
+
+    expect(world.journal.find(row => row.id === 'journal-legacy-taskmaster-effect')?.outcome).toBe(
+      'sent'
+    );
+    expect(queries[0]).toContain('sender_principal_id IS NULL');
+    expect(queries[0]).toContain("LOWER(TRIM(sender)) = 'taskmaster'");
   });
 });
 

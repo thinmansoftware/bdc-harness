@@ -356,14 +356,7 @@ async function createAuthenticatedMessageWithQuery(
   const senderPrincipalId = bound.sender_principal_id;
   const sender = bound.sender;
 
-  const existing = await query<CompatibleDispatchMessageRow>(
-    senderPrincipalId === null
-      ? `SELECT * FROM agent_dispatch_messages
-         WHERE idempotency_key = $1 AND sender_principal_id IS NULL`
-      : `SELECT * FROM agent_dispatch_messages
-         WHERE idempotency_key = $1 AND sender_principal_id = $2`,
-    senderPrincipalId === null ? [data.idempotency_key] : [data.idempotency_key, senderPrincipalId]
-  );
+  const existing = await findIdempotentMessage(query, data.idempotency_key, bound);
   const existingRow = existing.rows[0];
   if (existingRow) return normalizeMessage(existingRow);
 
@@ -419,17 +412,42 @@ async function createAuthenticatedMessageWithQuery(
   const row = result.rows[0];
   if (row) return normalizeMessage(row);
 
-  const conflict = await query<CompatibleDispatchMessageRow>(
-    senderPrincipalId === null
+  const conflict = await findIdempotentMessage(query, data.idempotency_key, bound);
+  const conflictRow = conflict.rows[0];
+  if (!conflictRow) throw new Error('dispatch_idempotency_namespace_conflict');
+  return normalizeMessage(conflictRow);
+}
+
+async function findIdempotentMessage(
+  query: DispatchQueryExecutor,
+  idempotencyKey: string,
+  bound: { sender: string; sender_principal_id: string | null }
+): Promise<QueryResult<CompatibleDispatchMessageRow>> {
+  const fixedSystemPrincipal = `system:${bound.sender}`;
+  if (
+    bound.sender_principal_id === fixedSystemPrincipal &&
+    (bound.sender === 'dispatch' || bound.sender === 'overseer' || bound.sender === 'taskmaster')
+  ) {
+    return query<CompatibleDispatchMessageRow>(
+      `SELECT * FROM agent_dispatch_messages
+       WHERE idempotency_key = $1
+         AND (sender_principal_id = $2
+           OR (sender_principal_id IS NULL AND LOWER(TRIM(sender)) = $3))
+       ORDER BY CASE WHEN sender_principal_id = $2 THEN 0 ELSE 1 END
+       LIMIT 1`,
+      [idempotencyKey, fixedSystemPrincipal, bound.sender]
+    );
+  }
+  return query<CompatibleDispatchMessageRow>(
+    bound.sender_principal_id === null
       ? `SELECT * FROM agent_dispatch_messages
          WHERE idempotency_key = $1 AND sender_principal_id IS NULL`
       : `SELECT * FROM agent_dispatch_messages
          WHERE idempotency_key = $1 AND sender_principal_id = $2`,
-    senderPrincipalId === null ? [data.idempotency_key] : [data.idempotency_key, senderPrincipalId]
+    bound.sender_principal_id === null
+      ? [idempotencyKey]
+      : [idempotencyKey, bound.sender_principal_id]
   );
-  const conflictRow = conflict.rows[0];
-  if (!conflictRow) throw new Error('dispatch_idempotency_namespace_conflict');
-  return normalizeMessage(conflictRow);
 }
 
 export async function getMessage(id: string): Promise<DispatchMessage | null> {
@@ -1145,8 +1163,12 @@ export async function supersedeMessage(data: {
     );
     if (!found.rows[0]) return { ok: false, reason: 'not_found' };
     const source = normalizeMessage(found.rows[0]);
-    if (canonicalizePrincipal(source.sender) !== canonicalizePrincipal(bound.sender))
+    if (source.sender_principal_id !== null) {
+      if (source.sender_principal_id !== bound.sender_principal_id)
+        return { ok: false, reason: 'actor_mismatch' };
+    } else if (canonicalizePrincipal(source.sender) !== canonicalizePrincipal(bound.sender)) {
       return { ok: false, reason: 'actor_mismatch' };
+    }
     if (source.status !== 'queued' || source.claimed_at || source.acknowledged_at)
       return { ok: false, reason: 'not_queued' };
     const existingReplacement = await query<DispatchMessageRow>(

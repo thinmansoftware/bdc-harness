@@ -1861,6 +1861,39 @@ describe('dispatch db', () => {
     expect(board.sender_principal_id).toBe('board:claude');
   });
 
+  test('fixed system writers reuse matching pre-upgrade null-principal rows', async () => {
+    const legacyId = '00000000-0000-4000-8000-000000000129';
+    const key = 'xo-handoff:legacy-fixed-system-source';
+    await db.query(
+      `INSERT INTO agent_dispatch_messages
+       (id, correlation_id, idempotency_key, task_type, sender, sender_principal_id,
+        recipient, body, status, created_at, fencing_token)
+       VALUES ($1, $2, $3, 'agent_message', 'dispatch', NULL,
+        'xo', 'legacy system effect', 'queued', $4, 0)`,
+      [legacyId, 'legacy-system-correlation', key, '2026-08-07T00:00:00.000Z']
+    );
+
+    const retried = await createAuthenticatedMessage(
+      { kind: 'system', sender: 'dispatch' },
+      {
+        correlation_id: 'retry-system-correlation',
+        idempotency_key: key,
+        task_type: 'agent_message',
+        recipient: 'xo',
+        body: 'must not duplicate legacy effect',
+      }
+    );
+
+    expect(retried.id).toBe(legacyId);
+    expect(retried.sender_principal_id).toBeNull();
+    expect(retried.body).toBe('legacy system effect');
+    const count = await db.query<{ count: number }>(
+      'SELECT COUNT(*) AS count FROM agent_dispatch_messages WHERE idempotency_key = $1',
+      [key]
+    );
+    expect(Number(count.rows[0]?.count)).toBe(1);
+  });
+
   test('rejects hand-constructed non-system sender provenance at compile time and runtime', async () => {
     const data = {
       correlation_id: 'forged-context',
@@ -1959,6 +1992,23 @@ describe('dispatch db', () => {
       })
     ).rejects.toThrow('dispatch_sender_capability_invalid');
     expect(getDatabaseCalls).toBe(callsBeforeForgedSupersede);
+    const wrongPrincipal = await supersedeMessage({
+      id: original.id,
+      sender_context: testAuthenticatedCapability('bob', 'claude'),
+      replacement: {
+        correlation_id: 'sup-wrong-principal',
+        idempotency_key: 'sup-wrong-principal',
+        task_type: 'agent_message',
+        recipient: 'codex',
+        body: 'must not supersede another principal',
+      },
+    });
+    expect(wrongPrincipal).toEqual({ ok: false, reason: 'actor_mismatch' });
+    const wrongRows = await db.query(
+      'SELECT id FROM agent_dispatch_messages WHERE idempotency_key = $1',
+      ['sup-wrong-principal']
+    );
+    expect(wrongRows.rows).toHaveLength(0);
     const result = await supersedeMessage({
       id: original.id,
       sender_context: testAuthenticatedCapability('alice', 'claude'),

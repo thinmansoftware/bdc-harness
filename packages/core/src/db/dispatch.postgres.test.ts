@@ -242,4 +242,36 @@ describe('dispatch Phase 1.5 PostgreSQL integration', () => {
     );
     expect(count.rows[0]?.count).toBe('2');
   });
+
+  test('fixed system retry reuses a pre-upgrade null-principal row', async () => {
+    const id = randomUUID();
+    const key = `legacy-system-${randomUUID()}`;
+    await db.query(
+      `INSERT INTO agent_dispatch_messages
+       (id, correlation_id, idempotency_key, task_type, sender, sender_principal_id,
+        recipient, body, status)
+       VALUES ($1, $2, $3, 'agent_message', 'taskmaster', NULL,
+        'xo', 'legacy taskmaster effect', 'queued')`,
+      [id, randomUUID(), key]
+    );
+
+    const retried = await createAuthenticatedMessage(
+      { kind: 'system', sender: 'taskmaster' },
+      {
+        correlation_id: randomUUID(),
+        idempotency_key: key,
+        task_type: 'agent_message',
+        recipient: 'xo',
+        body: 'must not duplicate legacy taskmaster effect',
+      }
+    );
+
+    expect(retried.id).toBe(id);
+    expect(retried.sender_principal_id).toBeNull();
+    const count = await db.query<{ count: string }>(
+      'SELECT count(*)::text AS count FROM agent_dispatch_messages WHERE idempotency_key = $1',
+      [key]
+    );
+    expect(count.rows[0]?.count).toBe('1');
+  });
 });

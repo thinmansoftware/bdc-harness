@@ -186,16 +186,28 @@ function sha256(text: string): string {
   return createHash('sha256').update(text).digest('hex');
 }
 
-async function defaultFindEffectByIdempotencyKey(
-  key: string
+interface TaskmasterEffectRow {
+  id: string;
+  status: string;
+  created_at: string;
+}
+type TaskmasterEffectQuery = (
+  sql: string,
+  params: unknown[]
+) => Promise<{ rows: readonly TaskmasterEffectRow[] }>;
+
+export async function defaultFindEffectByIdempotencyKey(
+  key: string,
+  query: TaskmasterEffectQuery = (sql, params) =>
+    getDatabase().query<TaskmasterEffectRow>(sql, params)
 ): Promise<{ id: string; status: string; createdAt: string } | null> {
-  const result = await getDatabase().query<{
-    id: string;
-    status: string;
-    created_at: string;
-  }>(
+  const result = await query(
     `SELECT id, status, created_at FROM agent_dispatch_messages
-     WHERE idempotency_key = $1 AND sender_principal_id = 'system:taskmaster'`,
+     WHERE idempotency_key = $1
+       AND (sender_principal_id = 'system:taskmaster'
+         OR (sender_principal_id IS NULL AND LOWER(TRIM(sender)) = 'taskmaster'))
+     ORDER BY CASE WHEN sender_principal_id = 'system:taskmaster' THEN 0 ELSE 1 END
+     LIMIT 1`,
     [key]
   );
   const row = result.rows[0];
