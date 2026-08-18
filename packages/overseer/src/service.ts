@@ -162,7 +162,14 @@ const defaultVerdictStore: OverseerVerdictStoreDeps = {
   finalizeVerdict: finalizeOverseerVerdict,
 };
 
-async function handleRecord(
+/**
+ * Dispatch a single watched record to its action (merge / escalate / skip).
+ *
+ * Exported so wiring tests can drive the REAL merge-vs-skip gate
+ * (`record.action === 'merge_ready'`) instead of re-implementing it inline: a
+ * test that copies this condition cannot detect drift if the gate here changes.
+ */
+export async function handleRecord(
   record: WatchedRunRecord,
   deps: OverseerRunStoreDeps & OverseerActionsDeps & GitHubClientDeps,
   dryRun: boolean,
