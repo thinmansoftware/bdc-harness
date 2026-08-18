@@ -253,6 +253,49 @@ export async function deliverOperatorCard(input: {
   });
 }
 
+/**
+ * Retire a claimed job whose channel is no longer in the active channel registry.
+ *
+ * A job can be claimed for an unregistered channel only when a legacy row was
+ * written by an older build (e.g. a `channel='notion'` job queued before Notion
+ * delivery was removed) and is still claimable at deploy time. We must NOT throw
+ * here: an uncaught throw propagates out of the delivery scheduler poll loop and
+ * terminates delivery for every other card behind it, starving the live channels
+ * (dispatch, builder_monitor). Instead we retire the orphaned job permanently
+ * (state -> 'exhausted') with an auditable terminal receipt so it is never
+ * re-claimed, then let the loop continue with the remaining live jobs.
+ */
+async function retireUnregisteredChannelJob(input: {
+  job: DeliveryJobRecord;
+  owner: string;
+  now: string;
+  store: DeliveryStore;
+}): Promise<DeliveryJobRecord> {
+  const { job, owner, now, store } = input;
+  await store.appendDeliveryReceipt({
+    card_id: job.card_id,
+    channel: job.channel,
+    attempt_number: job.attempts_started,
+    phase: 'terminal',
+    started_at: now,
+    completed_at: now,
+    outcome: 'permanent_failure',
+    sanitized_status: 'channel_no_longer_registered',
+    error_class: 'unregistered_channel',
+    next_attempt_at: null,
+    fencing_token: job.fencing_token,
+    lease_owner: owner,
+  });
+  return store.completeDeliveryJob({
+    card_id: job.card_id,
+    channel: job.channel,
+    owner,
+    fencing_token: job.fencing_token,
+    outcome: 'permanent_failure',
+    now,
+  });
+}
+
 export async function runDueOperatorCardDeliveries(input: {
   channels: OperatorCardChannel[];
   owner: string;
@@ -268,7 +311,13 @@ export async function runDueOperatorCardDeliveries(input: {
     const job = await store.claimDueDeliveryJob({ owner: input.owner, now });
     if (!job) break;
     const channel = channels.get(job.channel);
-    if (!channel) throw new Error(`operator_card_channel_missing:${job.channel}`);
+    if (!channel) {
+      // Legacy job for a channel that is no longer registered (e.g. pre-removal
+      // 'notion' rows). Retire it instead of throwing so one orphaned job cannot
+      // crash the scheduler and starve live-channel deliveries.
+      completed.push(await retireUnregisteredChannelJob({ job, owner: input.owner, now, store }));
+      continue;
+    }
     completed.push(await deliverOperatorCard({ job, channel, owner: input.owner, now, store }));
   }
   return completed;

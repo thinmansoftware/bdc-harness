@@ -304,16 +304,26 @@ export async function appendOperatorCard(input: AppendOperatorCardInput): Promis
   });
 }
 
+const REGISTERED_CHANNELS = new Set<string>(OPERATOR_CARD_CHANNELS);
+
 export async function getOperatorCard(cardId: string): Promise<OperatorCardView | null> {
   const db = getDatabase();
   const card = await selectCard(db.query.bind(db), cardId);
   if (!card) return null;
-  const jobs = await selectJobs(db.query.bind(db), cardId);
+  // Filter to the active channel registry so legacy rows for retired channels
+  // (e.g. pre-removal 'notion' jobs/receipts still persisted in the DB) never
+  // surface in the view and drift from the narrowed OpenAPI channel enum.
+  const jobs = (await selectJobs(db.query.bind(db), cardId)).filter(job =>
+    REGISTERED_CHANNELS.has(job.channel)
+  );
   const receiptRows = await db.query<DeliveryReceiptRow>(
     `SELECT * FROM overseer_operator_card_delivery_receipts
      WHERE card_id = $1 ORDER BY channel, attempt_number, phase`,
     [cardId]
   );
+  const receipts = receiptRows.rows
+    .map(normalizeReceipt)
+    .filter(receipt => REGISTERED_CHANNELS.has(receipt.channel));
   const summary = Object.fromEntries(jobs.map(job => [job.channel, job])) as Record<
     OperatorCardChannelName,
     DeliveryJobRecord
@@ -321,7 +331,7 @@ export async function getOperatorCard(cardId: string): Promise<OperatorCardView 
   return {
     card,
     jobs,
-    receipts: receiptRows.rows.map(normalizeReceipt),
+    receipts,
     delivery_summary: summary,
   };
 }

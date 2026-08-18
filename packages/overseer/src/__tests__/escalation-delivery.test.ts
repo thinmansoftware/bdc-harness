@@ -8,6 +8,7 @@ import {
   claimDueDeliveryJob,
   closeDatabase,
   completeDeliveryJob,
+  getDatabase,
   getOperatorCard,
   listMessages,
   resetDatabase,
@@ -201,6 +202,63 @@ describe('durable operator-card delivery', () => {
     expect(
       view?.receipts.map(receipt => receipt.phase).filter(phase => phase === 'started')
     ).toHaveLength(4);
+  });
+
+  test('retires a legacy notion job without throwing or starving live channels', async () => {
+    // Seed a legacy channel='notion' delivery job directly, simulating a row
+    // written by pre-removal escalation code that is still pending/claimable at
+    // deploy time. appendOperatorCard no longer seeds notion, so we bypass it.
+    const cardId = await persistCard();
+    const db = getDatabase();
+    await db.query(
+      `INSERT INTO overseer_operator_card_delivery_jobs (
+        card_id, channel, state, attempts_started, next_attempt_at, fencing_token, updated_at
+      ) VALUES ($1, 'notion', 'pending', 0, $2, 0, $2)`,
+      [cardId, identity.event_created_at]
+    );
+
+    const channels: OperatorCardChannel[] = ['builder_monitor', 'dispatch'].map(channel => ({
+      channel: channel as OperatorCardChannel['channel'],
+      deliver: async () => ({ outcome: 'succeeded' as const, sanitized_status: 'delivered' }),
+      reconcile: async () => ({ outcome: 'indeterminate' as const, sanitized_status: 'unknown' }),
+    }));
+
+    // Must NOT throw: an uncaught throw here would terminate the scheduler and
+    // starve dispatch/builder_monitor deliveries for every card behind this one.
+    const completed = await runDueOperatorCardDeliveries({
+      channels,
+      owner: 'worker-legacy',
+      now: '2026-07-16T08:05:00.000Z',
+      max_jobs: 10,
+    });
+
+    expect(completed).toHaveLength(3);
+    const retired = completed.find(record => (record.channel as string) === 'notion');
+    expect(retired?.state).toBe('exhausted');
+
+    // The legacy notion row is retired permanently (exhausted -> not re-claimable)
+    // with an auditable terminal receipt persisted in the DB.
+    const notionJob = await db.query<{ state: string }>(
+      `SELECT state FROM overseer_operator_card_delivery_jobs WHERE card_id = $1 AND channel = 'notion'`,
+      [cardId]
+    );
+    expect(notionJob.rows[0]?.state).toBe('exhausted');
+    const notionReceipts = await db.query(
+      `SELECT 1 FROM overseer_operator_card_delivery_receipts WHERE card_id = $1 AND channel = 'notion'`,
+      [cardId]
+    );
+    expect(notionReceipts.rowCount).toBe(1);
+
+    // Live channels still delivered successfully alongside the retirement.
+    const view = await getOperatorCard(cardId);
+    expect(view?.delivery_summary.dispatch.state).toBe('succeeded');
+    expect(view?.delivery_summary.builder_monitor.state).toBe('succeeded');
+
+    // Contract: the legacy notion job/receipt must NOT surface in the view, so
+    // the response stays within the narrowed OpenAPI channel enum.
+    expect(view?.jobs.map(job => job.channel).sort()).toEqual(['builder_monitor', 'dispatch']);
+    expect((view?.delivery_summary as Record<string, unknown>).notion).toBeUndefined();
+    expect(view?.receipts.some(receipt => (receipt.channel as string) === 'notion')).toBe(false);
   });
 
   test('reconciles an expired STARTED attempt to indeterminate without blind delivery', async () => {
