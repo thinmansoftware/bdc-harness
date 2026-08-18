@@ -216,7 +216,6 @@ export async function runIndeterminateOperatorCardReconciliation(input: {
   });
   let dispatchJob = makeJob('dispatch', 'leased');
   const builderJob = makeJob('builder_monitor', 'pending');
-  const notionJob = makeJob('notion', 'pending');
   const receipts: DeliveryReceiptRecord[] = [
     {
       receipt_id: 'receipt-started-indeterminate-1',
@@ -246,12 +245,11 @@ export async function runIndeterminateOperatorCardReconciliation(input: {
   };
   const view = (): OperatorCardView => ({
     card: cardRecord,
-    jobs: [dispatchJob, builderJob, notionJob],
+    jobs: [dispatchJob, builderJob],
     receipts: [...receipts],
     delivery_summary: {
       dispatch: dispatchJob,
       builder_monitor: builderJob,
-      notion: notionJob,
     },
   });
   const store: DeliveryStore = {

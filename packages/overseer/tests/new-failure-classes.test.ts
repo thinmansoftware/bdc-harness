@@ -181,7 +181,7 @@ describe('runEscalation: durable operator card', () => {
     await rm(tmpHome, { recursive: true, force: true });
   });
 
-  test('runEscalation preserves diagnostics and queues all three channel jobs', async () => {
+  test('runEscalation preserves diagnostics and queues both channel jobs', async () => {
     const runId = 'test-run-123';
     const context: EscalationContext = {
       errorClass: 'validator_feedback_not_applied',
@@ -209,36 +209,7 @@ describe('runEscalation: durable operator card', () => {
     expect(view?.card.run_id).toBe(runId);
     expect(view?.card.wo_id).toBe('WO-FOO-01');
     expect(view?.card.mechanical_evidence.validator_output).toContain('lspro_token');
-    expect(view?.jobs.map(job => job.channel).sort()).toEqual([
-      'builder_monitor',
-      'dispatch',
-      'notion',
-    ]);
-    expect(fetchSpy).toHaveBeenCalledTimes(0);
-  }, 15000);
-
-  test('runEscalation queues Notion without contacting it when credentials are absent', async () => {
-    delete process.env.NOTION_API_KEY;
-    const runId = 'test-run-no-notion';
-    const context: EscalationContext = {
-      errorClass: 'implement_loop_no_output',
-      nodeId: 'commit-and-push',
-      woId: 'WO-FOO-02',
-    };
-    const card = await runEscalation(
-      runId,
-      { decision: 'escalate', reason: 'no work produced', escalationContext: context },
-      context,
-      {
-        sourceEventId: 'event-test-run-no-notion',
-        eventType: 'node_failed',
-        stepName: 'commit-and-push',
-        eventCreatedAt: '2026-07-16T08:01:00.000Z',
-      }
-    );
-    const view = await getOperatorCard(card.card_id);
-    expect(view?.card.canonical_event_identity.error_class).toBe('implement_loop_no_output');
-    expect(view?.delivery_summary.notion.state).toBe('pending');
+    expect(view?.jobs.map(job => job.channel).sort()).toEqual(['builder_monitor', 'dispatch']);
     expect(fetchSpy).toHaveBeenCalledTimes(0);
   }, 15000);
 });
@@ -329,7 +300,7 @@ describe('end-to-end: WO-AUTH-SINGLE-PATH-E2E-04 incident replay', () => {
       "Add lspro_token to scenario 6b's addInitScript (currently causes redirect to /login)",
       'PR body must include the local run command per stop condition 5',
     ]);
-    expect(view?.jobs).toHaveLength(3);
+    expect(view?.jobs).toHaveLength(2);
     expect(fetchSpy).toHaveBeenCalledTimes(0);
   }, 15000);
 });

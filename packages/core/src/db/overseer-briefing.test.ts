@@ -180,17 +180,17 @@ describe('overseer briefing persistence', () => {
     expect(sqlite).toContain('trg_overseer_operator_card_delivery_receipts_no_update');
   });
 
-  test('inserts one immutable card plus exactly three jobs and deduplicates identical input', async () => {
+  test('inserts one immutable card plus exactly two jobs and deduplicates identical input', async () => {
     const first = await appendOperatorCard(cardInput());
     const second = await appendOperatorCard(cardInput());
 
     expect(second.card.card_id).toBe(first.card.card_id);
-    expect(first.jobs.map(job => job.channel)).toEqual(['builder_monitor', 'dispatch', 'notion']);
+    expect(first.jobs.map(job => job.channel)).toEqual(['builder_monitor', 'dispatch']);
     expect(first.jobs.every(job => job.state === 'pending' && job.attempts_started === 0)).toBe(
       true
     );
     expect((await db.query('SELECT 1 FROM overseer_operator_cards')).rowCount).toBe(1);
-    expect((await db.query('SELECT 1 FROM overseer_operator_card_delivery_jobs')).rowCount).toBe(3);
+    expect((await db.query('SELECT 1 FROM overseer_operator_card_delivery_jobs')).rowCount).toBe(2);
 
     await expect(appendOperatorCard(cardInput({ payload_digest: 'd'.repeat(64) }))).rejects.toThrow(
       'operator_card_digest_conflict'
@@ -292,7 +292,7 @@ describe('overseer briefing persistence', () => {
   test('recovers an expired lease with a monotonic fence and exposes cards with receipts', async () => {
     await appendOperatorCard(cardInput());
     const first = await claimDueDeliveryJob({
-      channel: 'notion',
+      channel: 'builder_monitor',
       owner: 'worker-a',
       now: CREATED_AT,
       lease_duration_ms: 1_000,
@@ -300,7 +300,7 @@ describe('overseer briefing persistence', () => {
     await appendDeliveryReceipt({
       receipt_id: 'receipt-restart-start',
       card_id: CARD_ID,
-      channel: 'notion',
+      channel: 'builder_monitor',
       attempt_number: 1,
       phase: 'started',
       started_at: CREATED_AT,
@@ -312,7 +312,7 @@ describe('overseer briefing persistence', () => {
     resetDatabase();
     db = getDatabase();
     const recovered = await claimDueDeliveryJob({
-      channel: 'notion',
+      channel: 'builder_monitor',
       owner: 'worker-b',
       now: '2026-07-16T08:00:02.000Z',
     });
@@ -322,7 +322,7 @@ describe('overseer briefing persistence', () => {
     await appendDeliveryReceipt({
       receipt_id: 'receipt-restart-terminal',
       card_id: CARD_ID,
-      channel: 'notion',
+      channel: 'builder_monitor',
       attempt_number: 1,
       phase: 'terminal',
       started_at: CREATED_AT,
@@ -335,7 +335,7 @@ describe('overseer briefing persistence', () => {
     });
     await completeDeliveryJob({
       card_id: CARD_ID,
-      channel: 'notion',
+      channel: 'builder_monitor',
       owner: 'worker-b',
       fencing_token: recovered?.fencing_token ?? 0,
       outcome: 'indeterminate',
@@ -343,7 +343,7 @@ describe('overseer briefing persistence', () => {
     });
 
     const visible = await getOperatorCard(CARD_ID);
-    expect(visible?.delivery_summary.notion.state).toBe('indeterminate');
+    expect(visible?.delivery_summary.builder_monitor.state).toBe('indeterminate');
     expect(visible?.receipts).toHaveLength(2);
     expect((await listOperatorCards({ limit: 10 })).items).toHaveLength(1);
     await expect(

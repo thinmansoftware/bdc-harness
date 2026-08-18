@@ -23,7 +23,7 @@ import {
   runDueOperatorCardDeliveries,
   type OperatorCardChannel,
 } from '../escalation-delivery';
-import { lookupNotionPageId, runEscalation } from '../escalate';
+import { runEscalation } from '../escalate';
 
 const identity: ActionableEventIdentity = {
   identity_version: 'overseer-actionable-event-v1',
@@ -156,22 +156,20 @@ describe('durable operator-card delivery', () => {
   test('survives restart and succeeds only on the fixed third attempt', async () => {
     const cardId = await persistCard();
     const calls: string[] = [];
-    const channels: OperatorCardChannel[] = ['builder_monitor', 'dispatch', 'notion'].map(
-      channel => ({
-        channel: channel as OperatorCardChannel['channel'],
-        deliver: async (_card, key) => {
-          calls.push(`${channel}:${key}`);
-          if (
-            channel === 'dispatch' &&
-            calls.filter(value => value.startsWith('dispatch:')).length < 3
-          ) {
-            return { outcome: 'transient_failure' as const, sanitized_status: 'retryable' };
-          }
-          return { outcome: 'succeeded' as const, sanitized_status: 'delivered' };
-        },
-        reconcile: async () => ({ outcome: 'indeterminate', sanitized_status: 'unknown' }),
-      })
-    );
+    const channels: OperatorCardChannel[] = ['builder_monitor', 'dispatch'].map(channel => ({
+      channel: channel as OperatorCardChannel['channel'],
+      deliver: async (_card, key) => {
+        calls.push(`${channel}:${key}`);
+        if (
+          channel === 'dispatch' &&
+          calls.filter(value => value.startsWith('dispatch:')).length < 3
+        ) {
+          return { outcome: 'transient_failure' as const, sanitized_status: 'retryable' };
+        }
+        return { outcome: 'succeeded' as const, sanitized_status: 'delivered' };
+      },
+      reconcile: async () => ({ outcome: 'indeterminate', sanitized_status: 'unknown' }),
+    }));
 
     await runDueOperatorCardDeliveries({
       channels,
@@ -202,7 +200,7 @@ describe('durable operator-card delivery', () => {
     expect(view?.receipts.filter(receipt => receipt.channel === 'dispatch')).toHaveLength(6);
     expect(
       view?.receipts.map(receipt => receipt.phase).filter(phase => phase === 'started')
-    ).toHaveLength(5);
+    ).toHaveLength(4);
   });
 
   test('reconciles an expired STARTED attempt to indeterminate without blind delivery', async () => {
@@ -501,56 +499,6 @@ describe('durable operator-card delivery', () => {
   });
 });
 
-describe('Notion WO lookup', () => {
-  const originalFetch = globalThis.fetch;
-
-  afterEach(() => {
-    globalThis.fetch = originalFetch;
-  });
-
-  test('queries separate candidates in frozen order and returns first success', async () => {
-    const queried: string[] = [];
-    globalThis.fetch = mock(async (_url, init) => {
-      const body = JSON.parse(String(init?.body)) as { filter: { property: string } };
-      queried.push(body.filter.property);
-      if (body.filter.property === 'Name') {
-        return Response.json({ results: [{ id: 'page-1' }] });
-      }
-      return new Response('unknown property', { status: 400 });
-    }) as typeof fetch;
-
-    expect(await lookupNotionPageId('test-key', 'db-1', 'WO-1')).toBe('page-1');
-    expect(queried).toEqual(['Task', 'WO ID', 'Name']);
-  });
-
-  test('resolves on the "Task" title property as the first candidate', async () => {
-    const queried: string[] = [];
-    globalThis.fetch = mock(async (_url, init) => {
-      const body = JSON.parse(String(init?.body)) as { filter: { property: string } };
-      queried.push(body.filter.property);
-      if (body.filter.property === 'Task') {
-        return Response.json({ results: [{ id: 'task-page' }] });
-      }
-      return new Response('unknown property', { status: 400 });
-    }) as typeof fetch;
-
-    expect(await lookupNotionPageId('test-key', 'db-1', 'WO-1')).toBe('task-page');
-    expect(queried).toEqual(['Task']);
-  });
-
-  test('fails soft after all candidate queries fail', async () => {
-    const queried: string[] = [];
-    globalThis.fetch = mock(async (_url, init) => {
-      const body = JSON.parse(String(init?.body)) as { filter: { property: string } };
-      queried.push(body.filter.property);
-      return new Response('unknown property', { status: 400 });
-    }) as typeof fetch;
-
-    expect(await lookupNotionPageId('test-key', 'db-1', 'WO-1')).toBeNull();
-    expect(queried).toEqual(['Task', 'WO ID', 'Name', 'Title', 'WO_ID']);
-  });
-});
-
 describe('default informational channel adapters', () => {
   let home = '';
   const oldHome = process.env.ARCHON_HOME;
@@ -686,61 +634,5 @@ describe('default informational channel adapters', () => {
       if (!builder) throw new Error('builder_channel_missing');
       expect((await builder.deliver(view, 'unused')).outcome).toBe(outcome);
     }
-  });
-
-  test('default Notion adapter uses injected fetch for lookup and comment', async () => {
-    const view = await defaultCardView();
-    const calls: Array<{ url: string; body: Record<string, unknown> }> = [];
-    const injected = mock(async (input: string | URL | Request, init?: RequestInit) => {
-      const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
-      calls.push({ url: String(input), body });
-      return String(input).includes('/query')
-        ? Response.json({ results: [{ id: 'notion-page-1' }] })
-        : new Response('ok', { status: 200 });
-    }) as typeof fetch;
-    const notion = createDefaultOperatorCardChannels({
-      fetch: injected,
-      notion_api_key: 'test-notion-key',
-      notion_database_id: 'notion-db-1',
-    }).find(channel => channel.channel === 'notion');
-    if (!notion) throw new Error('notion_channel_missing');
-    const result = await notion.deliver(view, 'unused');
-    expect(result.outcome).toBe('succeeded');
-    expect(calls).toHaveLength(2);
-    expect(calls[0]?.body).toMatchObject({ filter: { property: 'Task' } });
-    expect(calls[1]?.body).toMatchObject({ parent: { page_id: 'notion-page-1' } });
-  });
-
-  test('default Notion adapter retries only 429 and treats comment 5xx as indeterminate', async () => {
-    const view = await defaultCardView();
-    for (const [status, outcome] of [
-      [401, 'permanent_failure'],
-      [422, 'permanent_failure'],
-      [429, 'transient_failure'],
-      [500, 'indeterminate'],
-      [503, 'indeterminate'],
-    ] as const) {
-      const injected = mock(async (input: string | URL | Request) =>
-        String(input).includes('/query')
-          ? Response.json({ results: [{ id: 'notion-page-1' }] })
-          : new Response('failure', { status })
-      ) as typeof fetch;
-      const notion = createDefaultOperatorCardChannels({
-        fetch: injected,
-        notion_api_key: 'test-notion-key',
-      }).find(channel => channel.channel === 'notion');
-      if (!notion) throw new Error('notion_channel_missing');
-      expect((await notion.deliver(view, 'unused')).outcome).toBe(outcome);
-    }
-  });
-
-  test('default Notion adapter treats exhausted 4xx lookup responses as permanent', async () => {
-    const view = await defaultCardView();
-    const notion = createDefaultOperatorCardChannels({
-      fetch: mock(async () => new Response('unauthorized', { status: 401 })) as typeof fetch,
-      notion_api_key: 'test-notion-key',
-    }).find(channel => channel.channel === 'notion');
-    if (!notion) throw new Error('notion_channel_missing');
-    expect((await notion.deliver(view, 'unused')).outcome).toBe('permanent_failure');
   });
 });
