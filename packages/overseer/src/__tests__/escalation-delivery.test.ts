@@ -11,6 +11,10 @@ import {
   getOperatorCard,
   listMessages,
   resetDatabase,
+  type DeliveryJobRecord,
+  type DeliveryOutcome,
+  type OperatorCardChannelName,
+  type OperatorCardView,
 } from '@archon/core/db';
 import {
   buildOperatorCard,
@@ -21,6 +25,7 @@ import {
 import {
   createDefaultOperatorCardChannels,
   runDueOperatorCardDeliveries,
+  type DeliveryStore,
   type OperatorCardChannel,
 } from '../escalation-delivery';
 import { runEscalation } from '../escalate';
@@ -496,6 +501,62 @@ describe('durable operator-card delivery', () => {
       now: plus(120_000),
     });
     expect(attempt3?.attempts_started).toBe(3);
+  });
+
+  test('drains a due job on a retired channel with no adapter instead of throwing', async () => {
+    // Simulate a pre-cutover 'notion' delivery job still leased in the DB after
+    // that channel was retired. runDueOperatorCardDeliveries is only given the
+    // live channels, so job.channel has no registered adapter. It MUST NOT throw
+    // (which would abort the batch and, because the job is already leased, poison
+    // the scheduler on every subsequent lease-expiry) -- it must terminally drain
+    // the job as a permanent failure so it never becomes due again.
+    const retiredChannel = 'notion' as OperatorCardChannelName;
+    const leasedJob: DeliveryJobRecord = {
+      card_id: 'c'.repeat(64),
+      channel: retiredChannel,
+      state: 'leased',
+      attempts_started: 1,
+      next_attempt_at: '2026-07-16T08:00:00.000Z',
+      lease_owner: 'scheduler-a',
+      lease_expires_at: '2026-07-16T08:01:00.000Z',
+      fencing_token: 7,
+      updated_at: '2026-07-16T08:00:00.000Z',
+    };
+    const cardView = {
+      card: { card_id: leasedJob.card_id, created_at: '2026-07-16T08:00:00.000Z' },
+      jobs: [leasedJob],
+      receipts: [],
+      delivery_summary: {},
+    } as unknown as OperatorCardView;
+
+    let claims = 0;
+    const receiptOutcomes: (DeliveryOutcome | null | undefined)[] = [];
+    let completedWith: DeliveryOutcome | null = null;
+    const store: DeliveryStore = {
+      claimDueDeliveryJob: async () => (claims++ === 0 ? leasedJob : null),
+      getOperatorCard: async () => cardView,
+      appendDeliveryReceipt: async input => {
+        receiptOutcomes.push(input.outcome);
+        return { ...input, receipt_id: 'r', completed_at: null } as never;
+      },
+      completeDeliveryJob: async input => {
+        completedWith = input.outcome;
+        return { ...leasedJob, state: 'exhausted' };
+      },
+    };
+
+    const drained = await runDueOperatorCardDeliveries({
+      channels: [], // no live adapter matches 'notion'
+      owner: 'scheduler-a',
+      now: '2026-07-16T08:02:00.000Z',
+      store,
+    });
+
+    // The batch completed without throwing and drained the poison job terminally.
+    expect(drained).toHaveLength(1);
+    expect(drained[0]?.state).toBe('exhausted');
+    expect(completedWith).toBe('permanent_failure');
+    expect(receiptOutcomes).toContain('permanent_failure');
   });
 });
 

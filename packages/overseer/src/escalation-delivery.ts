@@ -253,6 +253,31 @@ export async function deliverOperatorCard(input: {
   });
 }
 
+/**
+ * Synthetic terminal adapter for a claimed delivery job whose channel has no
+ * registered live adapter (e.g. a pre-cutover 'notion' job still sitting in the
+ * DB after that channel was retired). Delivery can never succeed for such a job,
+ * so both deliver and reconcile resolve to permanent_failure -> the job is
+ * completed as 'exhausted' and never becomes due again.
+ *
+ * This exists so runDueOperatorCardDeliveries NEVER throws on an unknown channel.
+ * Throwing would abort the whole batch, and because the offending job is already
+ * leased it would become due again after its lease expired -- a permanent poison
+ * loop that also starves the live dispatch/builder_monitor jobs sorted after it.
+ */
+function retiredChannelAdapter(channel: OperatorCardChannelName): OperatorCardChannel {
+  const terminal: ChannelDeliveryResult = {
+    outcome: 'permanent_failure',
+    sanitized_status: 'channel_retired',
+    error_class: 'channel_retired',
+  };
+  return {
+    channel,
+    deliver: async () => terminal,
+    reconcile: async () => terminal,
+  };
+}
+
 export async function runDueOperatorCardDeliveries(input: {
   channels: OperatorCardChannel[];
   owner: string;
@@ -267,8 +292,7 @@ export async function runDueOperatorCardDeliveries(input: {
   for (let count = 0; count < (input.max_jobs ?? 100); count += 1) {
     const job = await store.claimDueDeliveryJob({ owner: input.owner, now });
     if (!job) break;
-    const channel = channels.get(job.channel);
-    if (!channel) throw new Error(`operator_card_channel_missing:${job.channel}`);
+    const channel = channels.get(job.channel) ?? retiredChannelAdapter(job.channel);
     completed.push(await deliverOperatorCard({ job, channel, owner: input.owner, now, store }));
   }
   return completed;
