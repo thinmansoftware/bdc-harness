@@ -79,6 +79,12 @@ type TaskmasterDal = Pick<
   | 'expireParkedActions'
   | 'gradeAction'
   | 'getActionByIdempotencyKey'
+  | 'beginAdoptionSnapshot'
+  | 'upsertAdoptionRow'
+  | 'commitAdoptionSnapshot'
+  | 'abandonAdoptionSnapshot'
+  | 'getAdoption'
+  | 'getAdoptionMeta'
 >;
 
 export interface GithubIssueEvidence {
@@ -90,6 +96,14 @@ export interface GithubIssueEvidence {
   assignedAt: string | null;
   activeStatusAt: string | null;
   progressRecordedAt: string | null;
+  /** First assignee login; null when unassigned (UNKNOWN -- never guessed). */
+  ownerLogin: string | null;
+  latestMarkerKind: 'PROGRESS' | 'BLOCKED' | null;
+  /** Marker comment body, trimmed, capped at 500 chars. */
+  latestMarkerText: string | null;
+  latestMarkerAt: string | null;
+  lastMovementAt: string | null;
+  lastMovementKind: 'closed' | 'assigned' | 'status_label' | 'progress_comment' | null;
 }
 
 export interface TaskmasterDeps {
@@ -174,6 +188,7 @@ function priorityFromLabels(labels: string[]): ThreadPriority {
 
 interface GithubIssue {
   number: number;
+  title?: string;
   updated_at: string;
   labels: ({ name?: string } | string)[];
   assignees?: { login?: string }[];
@@ -188,6 +203,60 @@ interface GithubIssue {
  */
 const WORK_LABELS = ['wo', 'project', 'arc'] as const;
 const GITHUB_RATE_LIMIT_FLOOR = 5;
+
+/**
+ * Default max evidence enrichments per adoption refresh tick.
+ * Rate-limit math (authenticated REST = 5,000 req/hour rolling):
+ *   each evidence fetch = 3 requests; listThreads ~= 3/label/repo.
+ *   budget 10 => 3 + 30 = 33 req/tick * 60 ticks/hr ~= 1,980/hr (fits under 5k).
+ *   budget 30 would be ~5,580/hr and would stall against the floor.
+ * Overridable at runtime via TASKMASTER_ADOPTION_EVIDENCE_BUDGET
+ * (see resolveAdoptionEvidenceBudgetPerTick).
+ */
+export const ADOPTION_EVIDENCE_BUDGET_PER_TICK = 10;
+
+export function resolveAdoptionEvidenceBudgetPerTick(
+  raw: string | undefined = process.env.TASKMASTER_ADOPTION_EVIDENCE_BUDGET
+): number {
+  const parsed = Number.parseInt(raw ?? '', 10);
+  if (Number.isInteger(parsed) && parsed >= 0) return parsed;
+  return ADOPTION_EVIDENCE_BUDGET_PER_TICK;
+}
+
+/** Historical org rename (M-141, 2026-08-14): pre-rename journal rows still exist. */
+const THREAD_REF_ORG_ALIASES: Record<string, string> = {
+  bluedevilcollectibles: 'thinmansoftware',
+};
+
+/**
+ * Canonicalize a thread ref so pre- and post-rename org eras collapse.
+ * Non-gh refs (digest:, dispatch:) return byte-identical.
+ */
+export function canonicalizeThreadRef(ref: string): string {
+  const match = /^gh:([^/]+)\/([^#]+)#(\d+)$/.exec(ref);
+  if (!match) return ref;
+  const org = match[1];
+  const repo = match[2];
+  const num = match[3];
+  const canonicalOrg = THREAD_REF_ORG_ALIASES[org] ?? org;
+  return `gh:${canonicalOrg}/${repo}#${num}`;
+}
+
+/** Listed work-SOR thread with optional adoption fields carried from the issue payload. */
+export interface ListedThread extends ThreadSnapshot {
+  title?: string | null;
+  ownerLogin?: string | null;
+  labels?: string[];
+}
+
+export interface AdoptionRefreshResult {
+  ran: boolean;
+  failed: boolean;
+  error: string | null;
+  snapshotId: string | null;
+  rowCount: number;
+  enrichedCount: number;
+}
 
 class GithubRateLimitBackoffError extends Error {}
 
@@ -208,15 +277,13 @@ function assertGithubRateLimit(response: Response, context: string): void {
  * production callers use the tick() default. `fetchImpl` is injectable for
  * tests only.
  */
-export async function defaultListThreads(
-  fetchImpl: typeof fetch = fetch
-): Promise<ThreadSnapshot[]> {
+export async function defaultListThreads(fetchImpl: typeof fetch = fetch): Promise<ListedThread[]> {
   const repos = (process.env.TASKMASTER_GH_REPOS ?? 'thinmansoftware/bdc-xo')
     .split(',')
     .map(r => r.trim())
     .filter(Boolean);
   const token = process.env.GITHUB_TOKEN ?? process.env.GH_TOKEN;
-  const threads: ThreadSnapshot[] = [];
+  const threads: ListedThread[] = [];
   for (const repo of repos) {
     const seen = new Set<number>();
     for (const label of WORK_LABELS) {
@@ -246,8 +313,9 @@ export async function defaultListThreads(
           const hasClaimStatus = normalizedLabels.some(label =>
             ['status:building', 'status:review'].includes(label)
           );
+          const ownerLogin = issue.assignees?.[0]?.login ?? null;
           threads.push({
-            ref: `gh:${repo}#${issue.number}`,
+            ref: canonicalizeThreadRef(`gh:${repo}#${issue.number}`),
             priority,
             isCustomerFacing: labels.some(l => l.toLowerCase() === 'customer'),
             lastActivityAt: issue.updated_at,
@@ -257,6 +325,9 @@ export async function defaultListThreads(
             isUnclaimedP0:
               priority === 'P0' && (issue.assignees ?? []).length === 0 && !hasClaimStatus,
             recipient: 'xo',
+            title: issue.title ?? null,
+            ownerLogin,
+            labels,
           });
         }
       } catch (error) {
@@ -293,6 +364,60 @@ function githubHeaders(): Record<string, string> {
   };
 }
 
+/**
+ * Human (non-bot) comment that starts with [PROGRESS] or [BLOCKED] plus
+ * non-whitespace. Regex and bot-check appear exactly once in this file.
+ */
+function isHumanMarkerComment(comment: GithubIssueComment): boolean {
+  const login = comment.user?.login?.toLowerCase() ?? '';
+  const isBot = comment.user?.type === 'Bot' || login.endsWith('[bot]') || login === 'taskmaster';
+  return !isBot && /^\s*\[(?:PROGRESS|BLOCKED)\]\s+\S/i.test(comment.body ?? '');
+}
+
+function markerKindFromBody(body: string | null | undefined): 'PROGRESS' | 'BLOCKED' | null {
+  // Kind is derived from a body already accepted by isHumanMarkerComment;
+  // the marker regex must remain a single occurrence in this file.
+  const open = (body ?? '').indexOf('[');
+  if (open < 0) return null;
+  const close = (body ?? '').indexOf(']', open + 1);
+  if (close < 0) return null;
+  const kind = (body ?? '')
+    .slice(open + 1, close)
+    .trim()
+    .toUpperCase();
+  if (kind === 'PROGRESS' || kind === 'BLOCKED') return kind;
+  return null;
+}
+
+function truncateMarkerText(body: string | null | undefined): string | null {
+  if (body === null || body === undefined) return null;
+  const trimmed = body.trim();
+  if (!trimmed) return null;
+  return trimmed.length > 500 ? trimmed.slice(0, 500) : trimmed;
+}
+
+function computeLastMovement(
+  closedAt: string | null,
+  assignedAt: string | null,
+  activeStatusAt: string | null,
+  progressRecordedAt: string | null
+): {
+  lastMovementAt: string | null;
+  lastMovementKind: 'closed' | 'assigned' | 'status_label' | 'progress_comment' | null;
+} {
+  const candidates: {
+    at: string;
+    kind: 'closed' | 'assigned' | 'status_label' | 'progress_comment';
+  }[] = [];
+  if (closedAt) candidates.push({ at: closedAt, kind: 'closed' });
+  if (assignedAt) candidates.push({ at: assignedAt, kind: 'assigned' });
+  if (activeStatusAt) candidates.push({ at: activeStatusAt, kind: 'status_label' });
+  if (progressRecordedAt) candidates.push({ at: progressRecordedAt, kind: 'progress_comment' });
+  if (candidates.length === 0) return { lastMovementAt: null, lastMovementKind: null };
+  candidates.sort((a, b) => Date.parse(b.at) - Date.parse(a.at));
+  return { lastMovementAt: candidates[0].at, lastMovementKind: candidates[0].kind };
+}
+
 export async function defaultGetGithubIssueEvidence(
   threadRef: string,
   sinceIso: string,
@@ -311,8 +436,10 @@ export async function defaultGetGithubIssueEvidence(
     throw new Error(`taskmaster_github_issue_evidence_read_failed:${issueResponse.status}`);
   }
   const issue = (await issueResponse.json()) as GithubIssueDetail;
+  // Fetch full comment list (no since=). Grading still filters post-since in
+  // memory; adoption needs the latest marker regardless of age.
   const commentsResponse = await fetchImpl(
-    `https://api.github.com/repos/${repo}/issues/${issueNumber}/comments?since=${encodeURIComponent(sinceIso)}&per_page=100`,
+    `https://api.github.com/repos/${repo}/issues/${issueNumber}/comments?per_page=100`,
     { headers: githubHeaders() }
   );
   assertGithubRateLimit(commentsResponse, `evidence:comments:${repo}#${issueNumber}`);
@@ -331,18 +458,11 @@ export async function defaultGetGithubIssueEvidence(
     throw new Error(`taskmaster_github_issue_evidence_read_failed:events:${eventsResponse.status}`);
   }
   const events = (await eventsResponse.json()) as GithubIssueEvent[];
-  const progress = comments
-    .filter(comment => {
-      const login = comment.user?.login?.toLowerCase() ?? '';
-      const isBot =
-        comment.user?.type === 'Bot' || login.endsWith('[bot]') || login === 'taskmaster';
-      return (
-        !isBot &&
-        /^\s*\[(?:PROGRESS|BLOCKED)\]\s+\S/i.test(comment.body ?? '') &&
-        Date.parse(comment.created_at) >= Date.parse(sinceIso)
-      );
-    })
-    .sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at))[0];
+  const humanMarkers = comments
+    .filter(isHumanMarkerComment)
+    .sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at));
+  const latestMarker = humanMarkers[0] ?? null;
+  const progress = humanMarkers.find(c => Date.parse(c.created_at) >= Date.parse(sinceIso));
   const postSendEvents = events.filter(
     event => Date.parse(event.created_at) >= Date.parse(sinceIso)
   );
@@ -350,19 +470,49 @@ export async function defaultGetGithubIssueEvidence(
     postSendEvents
       .filter(predicate)
       .sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at))[0]?.created_at ?? null;
+  // Adoption last-movement uses the same four evidence fields, computed over
+  // the full event/marker history (not only post-since) so a fresh enrichment
+  // still surfaces older assignment/close/status/progress movement.
+  const allLatestEventAt = (predicate: (event: GithubIssueEvent) => boolean): string | null =>
+    events.filter(predicate).sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at))[0]
+      ?.created_at ?? null;
+  const closedAt = latestEventAt(event => event.event === 'closed');
+  const assignedAt = latestEventAt(event => event.event === 'assigned');
+  const activeStatusAt = latestEventAt(
+    event =>
+      event.event === 'labeled' &&
+      ['status:building', 'status:review'].includes(event.label?.name?.trim().toLowerCase() ?? '')
+  );
+  const progressRecordedAt = progress?.created_at ?? null;
+  const adoptionClosedAt = allLatestEventAt(event => event.event === 'closed');
+  const adoptionAssignedAt = allLatestEventAt(event => event.event === 'assigned');
+  const adoptionActiveStatusAt = allLatestEventAt(
+    event =>
+      event.event === 'labeled' &&
+      ['status:building', 'status:review'].includes(event.label?.name?.trim().toLowerCase() ?? '')
+  );
+  const adoptionProgressAt = latestMarker?.created_at ?? null;
+  const movement = computeLastMovement(
+    adoptionClosedAt,
+    adoptionAssignedAt,
+    adoptionActiveStatusAt,
+    adoptionProgressAt
+  );
   return {
     state: issue.state,
     updatedAt: issue.updated_at,
     labels: issue.labels.map(label => (typeof label === 'string' ? label : (label.name ?? ''))),
     assigneeCount: issue.assignees?.length ?? 0,
-    closedAt: latestEventAt(event => event.event === 'closed'),
-    assignedAt: latestEventAt(event => event.event === 'assigned'),
-    activeStatusAt: latestEventAt(
-      event =>
-        event.event === 'labeled' &&
-        ['status:building', 'status:review'].includes(event.label?.name?.trim().toLowerCase() ?? '')
-    ),
-    progressRecordedAt: progress?.created_at ?? null,
+    closedAt,
+    assignedAt,
+    activeStatusAt,
+    progressRecordedAt,
+    ownerLogin: issue.assignees?.[0]?.login ?? null,
+    latestMarkerKind: latestMarker ? markerKindFromBody(latestMarker.body) : null,
+    latestMarkerText: latestMarker ? truncateMarkerText(latestMarker.body) : null,
+    latestMarkerAt: latestMarker?.created_at ?? null,
+    lastMovementAt: movement.lastMovementAt,
+    lastMovementKind: movement.lastMovementKind,
   };
 }
 
@@ -521,6 +671,164 @@ function proofPredicate(proposal: ActionProposal): string {
   return 'digest delivery only; never qualifies as an SC7 useful action';
 }
 
+function parseGhRef(ref: string): { repo: string; issueNumber: number } | null {
+  const match = /^gh:([^#]+)#(\d+)$/.exec(ref);
+  if (!match) return null;
+  return { repo: match[1], issueNumber: Number(match[2]) };
+}
+
+/**
+ * Rebuild the adoption projection for the current open-work set.
+ * Takes the already-fetched thread list -- must NOT call defaultListThreads.
+ * On any failure: abandon the in-flight snapshot, log, report failed, return
+ * normally (never rethrow past tick()).
+ */
+export async function refreshAdoption(
+  threads: ListedThread[],
+  deps: TaskmasterDeps = {}
+): Promise<AdoptionRefreshResult> {
+  const dal = deps.db ?? taskmasterDb;
+  const getIssueEvidence = deps.getGithubIssueEvidence ?? defaultGetGithubIssueEvidence;
+  const now = deps.now ?? ((): Date => new Date());
+  const nowMs = now().getTime();
+  const nowIso = new Date(nowMs).toISOString();
+
+  let snapshotId: string | null = null;
+  try {
+    snapshotId = await dal.beginAdoptionSnapshot();
+
+    // Prior committed evidence ages for staleness ordering (NULL first).
+    const priorRows = (await dal.getAdoption()) ?? [];
+    const priorEvidenceAt = new Map<string, string | null>();
+    for (const row of priorRows) {
+      priorEvidenceAt.set(row.thread_ref, row.evidence_observed_at);
+    }
+
+    // Attempt counts: read journal without threadRef filter, group by canonical ref.
+    const journalSince = new Date(0).toISOString();
+    const allActions = await dal.getActionsSince(journalSince);
+    const attemptsTotal = new Map<string, number>();
+    const attempts24h = new Map<string, number>();
+    const since24h = nowMs - DAY_MS;
+    for (const action of allActions) {
+      if (action.outcome !== 'sent') continue;
+      const key = canonicalizeThreadRef(action.thread_ref);
+      attemptsTotal.set(key, (attemptsTotal.get(key) ?? 0) + 1);
+      if (Date.parse(action.created_at) >= since24h) {
+        attempts24h.set(key, (attempts24h.get(key) ?? 0) + 1);
+      }
+    }
+
+    // Staleness order: oldest evidence_observed_at first, NULL first.
+    const ordered = [...threads].sort((a, b) => {
+      const aRef = canonicalizeThreadRef(a.ref);
+      const bRef = canonicalizeThreadRef(b.ref);
+      const aAt = priorEvidenceAt.get(aRef) ?? null;
+      const bAt = priorEvidenceAt.get(bRef) ?? null;
+      if (aAt === null && bAt === null) return 0;
+      if (aAt === null) return -1;
+      if (bAt === null) return 1;
+      return Date.parse(aAt) - Date.parse(bAt);
+    });
+
+    const budget = resolveAdoptionEvidenceBudgetPerTick();
+    const enrichSet = new Set(ordered.slice(0, budget).map(t => canonicalizeThreadRef(t.ref)));
+    let enrichedCount = 0;
+    let rowCount = 0;
+
+    // Epoch sinceIso so evidence fields cover full history for adoption.
+    const adoptionSinceIso = new Date(0).toISOString();
+
+    for (const thread of ordered) {
+      const ref = canonicalizeThreadRef(thread.ref);
+      const parsed = parseGhRef(ref);
+      if (!parsed) continue;
+
+      const base = {
+        thread_ref: ref,
+        repo: parsed.repo,
+        issue_number: parsed.issueNumber,
+        title: thread.title ?? null,
+        priority: thread.priority,
+        labels_json: JSON.stringify(thread.labels ?? []),
+        owner_login: thread.ownerLogin ?? null,
+        is_blocked: thread.isBlocked ? 1 : 0,
+        blocked_reason: null as string | null,
+        next_action: null as string | null,
+        latest_marker_kind: null as 'PROGRESS' | 'BLOCKED' | null,
+        latest_marker_at: null as string | null,
+        state: null as string | null,
+        last_movement_at: null as string | null,
+        last_movement_kind: null as
+          | 'closed'
+          | 'assigned'
+          | 'status_label'
+          | 'progress_comment'
+          | null,
+        attempts_24h: attempts24h.get(ref) ?? 0,
+        attempts_total: attemptsTotal.get(ref) ?? 0,
+        evidence_observed_at: null as string | null,
+        source_updated_at: thread.lastActivityAt,
+      };
+
+      if (enrichSet.has(ref)) {
+        const evidence = await getIssueEvidence(ref, adoptionSinceIso);
+        if (evidence) {
+          base.owner_login = evidence.ownerLogin;
+          base.state = evidence.state;
+          base.labels_json = JSON.stringify(evidence.labels ?? thread.labels ?? []);
+          base.source_updated_at = evidence.updatedAt || thread.lastActivityAt;
+          base.latest_marker_kind = evidence.latestMarkerKind;
+          base.latest_marker_at = evidence.latestMarkerAt;
+          base.last_movement_at = evidence.lastMovementAt;
+          base.last_movement_kind = evidence.lastMovementKind;
+          base.evidence_observed_at = nowIso;
+          if (evidence.latestMarkerKind === 'BLOCKED') {
+            base.is_blocked = 1;
+            base.blocked_reason = evidence.latestMarkerText;
+            base.next_action = null;
+          } else if (evidence.latestMarkerKind === 'PROGRESS') {
+            base.next_action = evidence.latestMarkerText;
+            // keep list-level isBlocked for label-based blocked; marker text goes next_action
+          }
+          // Prefer list title; evidence path does not re-fetch title separately.
+          enrichedCount += 1;
+        }
+      }
+
+      await dal.upsertAdoptionRow(snapshotId, base);
+      rowCount += 1;
+    }
+
+    await dal.commitAdoptionSnapshot(snapshotId);
+    return {
+      ran: true,
+      failed: false,
+      error: null,
+      snapshotId,
+      rowCount,
+      enrichedCount,
+    };
+  } catch (error) {
+    if (snapshotId) {
+      try {
+        await dal.abandonAdoptionSnapshot(snapshotId);
+      } catch (abandonError) {
+        log.warn({ err: abandonError as Error, snapshotId }, 'taskmaster.adoption_abandon_failed');
+      }
+    }
+    log.warn({ err: error as Error }, 'taskmaster.adoption_refresh_failed');
+    return {
+      ran: true,
+      failed: true,
+      error: error instanceof Error ? error.message : String(error),
+      snapshotId,
+      rowCount: 0,
+      enrichedCount: 0,
+    };
+  }
+}
+
 export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): Promise<TickResult> {
   const now = deps.now ?? ((): Date => new Date());
   const dal = deps.db ?? taskmasterDb;
@@ -628,6 +936,14 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
   } catch (error) {
     tickFailures += 1;
     log.warn({ err: error as Error }, 'taskmaster.threads_read_failed');
+  }
+
+  // Adoption projection refresh (M-155 WO 1). Uses the already-fetched
+  // thread list; must not re-list. Failures suppress heartbeat via
+  // tickFailures but never abort the send/grade phase.
+  {
+    const adoptionResult = await refreshAdoption(threads, deps);
+    if (adoptionResult.failed) tickFailures += 1;
   }
 
   const proposals: ActionProposal[] = [];

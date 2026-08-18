@@ -384,3 +384,224 @@ export async function recordUsageSample(data: {
   if (!row) throw new Error('Failed to record taskmaster usage sample');
   return { ...row, observed_at: toIso(row.observed_at), is_unknown: row.is_unknown };
 }
+
+// ---------------------------------------------------------------------------
+// Adoption projection (WO-HARNESS-TASKMASTER-ADOPTION-PROJECTION-01, M-155 WO 1)
+// Disposable snapshot rebuilt from GitHub. Commit flips meta + retires prior
+// snapshot rows atomically via withTransaction.
+// ---------------------------------------------------------------------------
+
+export type TmAdoptionMarkerKind = 'PROGRESS' | 'BLOCKED';
+export type TmAdoptionMovementKind = 'closed' | 'assigned' | 'status_label' | 'progress_comment';
+
+export interface TmAdoptionRow {
+  thread_ref: string;
+  snapshot_id: string;
+  repo: string;
+  issue_number: number;
+  title: string | null;
+  priority: string;
+  labels_json: string;
+  owner_login: string | null;
+  is_blocked: number;
+  blocked_reason: string | null;
+  next_action: string | null;
+  latest_marker_kind: TmAdoptionMarkerKind | null;
+  latest_marker_at: string | null;
+  state: string | null;
+  last_movement_at: string | null;
+  last_movement_kind: TmAdoptionMovementKind | null;
+  attempts_24h: number;
+  attempts_total: number;
+  evidence_observed_at: string | null;
+  source_updated_at: string;
+}
+
+export interface TmAdoptionMeta {
+  id: number;
+  committed_snapshot_id: string | null;
+  rebuilt_at: string | null;
+  row_count: number | null;
+  source_commit: string | null;
+  complete: number;
+}
+
+interface TmAdoptionDbRow extends Omit<
+  TmAdoptionRow,
+  'issue_number' | 'is_blocked' | 'attempts_24h' | 'attempts_total'
+> {
+  issue_number: number | string;
+  is_blocked: number | string;
+  attempts_24h: number | string;
+  attempts_total: number | string;
+}
+
+interface TmAdoptionMetaDbRow extends Omit<TmAdoptionMeta, 'id' | 'row_count' | 'complete'> {
+  id: number | string;
+  row_count: number | string | null;
+  complete: number | string;
+}
+
+function normalizeAdoption(row: TmAdoptionDbRow): TmAdoptionRow {
+  return {
+    thread_ref: row.thread_ref,
+    snapshot_id: row.snapshot_id,
+    repo: row.repo,
+    issue_number: Number(row.issue_number),
+    title: row.title,
+    priority: row.priority,
+    labels_json: row.labels_json,
+    owner_login: row.owner_login,
+    is_blocked: Number(row.is_blocked),
+    blocked_reason: row.blocked_reason,
+    next_action: row.next_action,
+    latest_marker_kind: row.latest_marker_kind,
+    latest_marker_at: row.latest_marker_at,
+    state: row.state,
+    last_movement_at: row.last_movement_at,
+    last_movement_kind: row.last_movement_kind,
+    attempts_24h: Number(row.attempts_24h),
+    attempts_total: Number(row.attempts_total),
+    evidence_observed_at: row.evidence_observed_at,
+    source_updated_at: row.source_updated_at,
+  };
+}
+
+function normalizeAdoptionMeta(row: TmAdoptionMetaDbRow): TmAdoptionMeta {
+  return {
+    id: Number(row.id),
+    committed_snapshot_id: row.committed_snapshot_id,
+    rebuilt_at: row.rebuilt_at,
+    row_count: row.row_count === null || row.row_count === undefined ? null : Number(row.row_count),
+    source_commit: row.source_commit,
+    complete: Number(row.complete),
+  };
+}
+
+/** Open a fresh adoption snapshot. Returns the new snapshot_id. */
+export async function beginAdoptionSnapshot(): Promise<string> {
+  // Ensure the singleton meta row exists on a fresh database.
+  await getDatabase().query(
+    `INSERT INTO tm_adoption_meta (id) VALUES (1)
+     ON CONFLICT (id) DO NOTHING`
+  );
+  return randomUUID();
+}
+
+/** Upsert one adoption row under an in-flight snapshot_id. */
+export async function upsertAdoptionRow(
+  snapshotId: string,
+  row: Omit<TmAdoptionRow, 'snapshot_id'>
+): Promise<void> {
+  await getDatabase().query(
+    `INSERT INTO tm_adoption (
+       thread_ref, snapshot_id, repo, issue_number, title, priority, labels_json,
+       owner_login, is_blocked, blocked_reason, next_action, latest_marker_kind,
+       latest_marker_at, state, last_movement_at, last_movement_kind,
+       attempts_24h, attempts_total, evidence_observed_at, source_updated_at
+     ) VALUES (
+       $1, $2, $3, $4, $5, $6, $7,
+       $8, $9, $10, $11, $12,
+       $13, $14, $15, $16,
+       $17, $18, $19, $20
+     )
+     ON CONFLICT (snapshot_id, thread_ref) DO UPDATE SET
+       repo = EXCLUDED.repo,
+       issue_number = EXCLUDED.issue_number,
+       title = EXCLUDED.title,
+       priority = EXCLUDED.priority,
+       labels_json = EXCLUDED.labels_json,
+       owner_login = EXCLUDED.owner_login,
+       is_blocked = EXCLUDED.is_blocked,
+       blocked_reason = EXCLUDED.blocked_reason,
+       next_action = EXCLUDED.next_action,
+       latest_marker_kind = EXCLUDED.latest_marker_kind,
+       latest_marker_at = EXCLUDED.latest_marker_at,
+       state = EXCLUDED.state,
+       last_movement_at = EXCLUDED.last_movement_at,
+       last_movement_kind = EXCLUDED.last_movement_kind,
+       attempts_24h = EXCLUDED.attempts_24h,
+       attempts_total = EXCLUDED.attempts_total,
+       evidence_observed_at = EXCLUDED.evidence_observed_at,
+       source_updated_at = EXCLUDED.source_updated_at`,
+    [
+      row.thread_ref,
+      snapshotId,
+      row.repo,
+      row.issue_number,
+      row.title,
+      row.priority,
+      row.labels_json,
+      row.owner_login,
+      row.is_blocked,
+      row.blocked_reason,
+      row.next_action,
+      row.latest_marker_kind,
+      row.latest_marker_at,
+      row.state,
+      row.last_movement_at,
+      row.last_movement_kind,
+      row.attempts_24h,
+      row.attempts_total,
+      row.evidence_observed_at,
+      row.source_updated_at,
+    ]
+  );
+}
+
+/**
+ * Atomically flip the committed snapshot pointer and retire prior-snapshot
+ * rows. Uses the adapter withTransaction helper -- two unwrapped sequential
+ * queries are NOT atomic on pooled Postgres.
+ */
+export async function commitAdoptionSnapshot(
+  snapshotId: string,
+  sourceCommit?: string | null
+): Promise<void> {
+  const db = getDatabase();
+  const countResult = await db.query<{ cnt: number | string }>(
+    'SELECT COUNT(*) AS cnt FROM tm_adoption WHERE snapshot_id = $1',
+    [snapshotId]
+  );
+  const rowCount = Number(countResult.rows[0]?.cnt ?? 0);
+  const nowIso = new Date().toISOString();
+
+  await db.withTransaction(async query => {
+    await query(
+      `UPDATE tm_adoption_meta
+          SET committed_snapshot_id = $1, rebuilt_at = $2, row_count = $3,
+              source_commit = $4, complete = 1
+        WHERE id = 1`,
+      [snapshotId, nowIso, rowCount, sourceCommit ?? null]
+    );
+    await query('DELETE FROM tm_adoption WHERE snapshot_id <> $1', [snapshotId]);
+  });
+}
+
+/** Drop partial rows for an abandoned in-flight snapshot. */
+export async function abandonAdoptionSnapshot(snapshotId: string): Promise<void> {
+  await getDatabase().query('DELETE FROM tm_adoption WHERE snapshot_id = $1', [snapshotId]);
+}
+
+/** Read rows from the currently committed snapshot only. */
+export async function getAdoption(_filter?: {
+  priority?: string;
+  owner_login?: string | null;
+}): Promise<TmAdoptionRow[]> {
+  const meta = await getAdoptionMeta();
+  if (!meta?.committed_snapshot_id) return [];
+  const result = await getDatabase().query<TmAdoptionDbRow>(
+    'SELECT * FROM tm_adoption WHERE snapshot_id = $1 ORDER BY thread_ref ASC',
+    [meta.committed_snapshot_id]
+  );
+  return result.rows.map(normalizeAdoption);
+}
+
+/** Read the singleton adoption meta row, or null if absent. */
+export async function getAdoptionMeta(): Promise<TmAdoptionMeta | null> {
+  const result = await getDatabase().query<TmAdoptionMetaDbRow>(
+    'SELECT * FROM tm_adoption_meta WHERE id = 1'
+  );
+  const row = result.rows[0];
+  return row ? normalizeAdoptionMeta(row) : null;
+}
