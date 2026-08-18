@@ -49,7 +49,10 @@ import { createIsolationStore } from '../db/isolation-environments';
 import { toError } from '../utils/error';
 import { getCodebase } from '../db/codebases';
 import { executeWorkflow } from '@archon/workflows/executor';
+import { parseDeclaredBaseBranch } from '@archon/workflows/reliability/run-authority';
 import type { WorkflowDefinition } from '@archon/workflows/schemas/workflow';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import { createWorkflowDeps } from '../workflows/store-adapter';
 import { freezeWorkOrderSource } from '../workflows/work-order-source';
 import {
@@ -249,6 +252,26 @@ export interface WorkflowRoutingContext {
   readonly isolationHints?: IsolationHints;
 }
 
+const execFileAsync = promisify(execFile);
+
+/**
+ * Verify a branch exists on origin (WO-HARNESS-BASE-LANE-AUTHORITY-01).
+ * Mirrors resolve-review-base's `git ls-remote --exit-code origin refs/heads/<branch>`
+ * so the declared base is validated BEFORE worktree allocation.
+ */
+async function originBranchExists(repoPath: string, branch: string): Promise<boolean> {
+  try {
+    await execFileAsync(
+      'git',
+      ['-C', repoPath, 'ls-remote', '--exit-code', 'origin', `refs/heads/${branch}`],
+      { timeout: 15000 }
+    );
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Dispatch a workflow to run in a background worker conversation (web platform only).
  * Creates a hidden worker conversation, sets up event bridging from worker to parent,
@@ -266,6 +289,13 @@ export async function dispatchBackgroundWorkflow(
 ): Promise<void> {
   const frozenSpecSource = workflow.run_authority?.required
     ? await freezeWorkOrderSource(workflow.run_authority, ctx.originalMessage)
+    : undefined;
+
+  // Single base-lane authority (WO-HARNESS-BASE-LANE-AUTHORITY-01): resolve the WO's
+  // declared "Base branch:" from the frozen spec BEFORE isolation is allocated so the
+  // worker worktree is cut from origin/<declared> instead of the repo default.
+  const declaredBaseBranch = frozenSpecSource
+    ? parseDeclaredBaseBranch(frozenSpecSource.specBytes)
     : undefined;
 
   // 1. Generate worker conversation ID
@@ -292,20 +322,43 @@ export async function dispatchBackgroundWorkflow(
         `Cannot dispatch workflow "${workflow.name}": codebase ${ctx.codebaseId} not found`
       );
     }
-    // Preserve an explicit task/from-branch request from the parent dispatch so
-    // the worker worktree starts from the requested branch. The worker always
-    // gets its own unique workflowId (workerPlatformId); only the start-point
-    // intent (workflowType: 'task' + fromBranch) is inherited. Absent or
-    // non-task hints fall back to today's thread isolation exactly.
+    // Base-lane authority takes precedence over inherited parent hints. When the
+    // frozen WO spec declares a Base branch, resolve+pin it here so the worktree is
+    // cut from origin/<declared> and the downstream authority triple is lane-correct
+    // by construction. A declared-but-missing base is a spec error -- fail fast rather
+    // than silently allocating from the repo default (the original tail-node
+    // scope-failure bug, WO-HARNESS-BASE-LANE-AUTHORITY-01). When no base is declared,
+    // fall back to today's behavior: inherit an explicit parent task/from-branch
+    // request, else plain thread isolation.
     const parentHints = ctx.isolationHints;
-    const workerHints: IsolationHints =
-      parentHints?.workflowType === 'task'
-        ? {
-            workflowType: 'task',
-            workflowId: workerPlatformId,
-            fromBranch: parentHints.fromBranch,
-          }
-        : { workflowType: 'thread', workflowId: workerPlatformId };
+    let workerHints: IsolationHints;
+    if (declaredBaseBranch) {
+      if (!(await originBranchExists(codebase.default_cwd, declaredBaseBranch))) {
+        throw new Error(
+          `declared_base_branch_not_found: workflow "${workflow.name}" declares Base branch ` +
+            `"${declaredBaseBranch}" but origin has no refs/heads/${declaredBaseBranch}`
+        );
+      }
+      workerHints = {
+        workflowType: 'task',
+        workflowId: workerPlatformId,
+        // Branded BranchName; the worktree provider consumes the `origin/<branch>`
+        // remote start-ref form (see createNewBranch in @archon/isolation).
+        fromBranch: `origin/${declaredBaseBranch}` as IsolationHints['fromBranch'],
+      };
+      getLog().info(
+        { workerPlatformId, declaredBaseBranch, workflowName: workflow.name },
+        'orchestrator.declared_base_lane_resolved'
+      );
+    } else if (parentHints?.workflowType === 'task') {
+      workerHints = {
+        workflowType: 'task',
+        workflowId: workerPlatformId,
+        fromBranch: parentHints.fromBranch,
+      };
+    } else {
+      workerHints = { workflowType: 'thread', workflowId: workerPlatformId };
+    }
     const result = await validateAndResolveIsolation(
       workerConv,
       codebase,

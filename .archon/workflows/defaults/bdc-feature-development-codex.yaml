@@ -431,6 +431,18 @@ nodes:
         printf '%s\n' "$DIRTY" >&2
         exit 1
       fi
+      # Base-lane authority early-fail (WO-HARNESS-BASE-LANE-AUTHORITY-01): the
+      # worktree MUST share history with the declared base lane. BASE_BRANCH is the
+      # single authority (the WO's declared Base branch for run-authority workflows,
+      # pinned at allocation). When origin/$BASE_BRANCH exists locally, a missing
+      # merge-base means this worktree was cut from a disjoint lane -- fail HERE,
+      # before implement, instead of at a tail node after a PR was already opened.
+      if [ -n "${BASE_BRANCH:-}" ] && git rev-parse --verify "refs/remotes/origin/${BASE_BRANCH}^{commit}" >/dev/null 2>&1; then
+        if ! git merge-base "refs/remotes/origin/${BASE_BRANCH}" HEAD >/dev/null 2>&1; then
+          echo "worktree_not_on_declared_base_lane: HEAD shares no history with origin/${BASE_BRANCH}" >&2
+          exit 1
+        fi
+      fi
       RUN_SCOPE_SHA=$(git rev-parse --verify 'HEAD^{commit}') || {
         echo "scope_authority_missing: HEAD is not a commit" >&2
         exit 1

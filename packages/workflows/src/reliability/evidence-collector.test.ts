@@ -3,8 +3,11 @@ import { describe, expect, it } from 'bun:test';
 import type { RunAuthorityRecord } from './types';
 import {
   collectMechanicalEvidence,
+  collectRuntimeEvidence,
   renderManifestV2,
+  type EvidenceCommandResult,
   type MechanicalEvidenceInput,
+  type RuntimeEvidenceRequest,
 } from './evidence-collector';
 
 const authority: RunAuthorityRecord = {
@@ -128,6 +131,90 @@ describe('collectMechanicalEvidence', () => {
 
     expect(wrongBranch.scopeValid).toBe(false);
     expect(wrongRemote.scopeValid).toBe(false);
+  });
+});
+
+// WO-HARNESS-BASE-LANE-AUTHORITY-01 -- Test 2 (squash-unreachable recovery).
+// When the pinned authority.baseSha is unreachable (base branch squash-merged and
+// gc-pruned -- a ROUTINE event), the merge-base against baseSha fails. The runtime
+// collector must NOT die; it falls back to merge-base(origin/<baseBranch>, HEAD).
+describe('collectRuntimeEvidence merge-base squash fallback', () => {
+  const headSha = '7'.repeat(40);
+  const baseShaMergeBase = 'b'.repeat(40);
+  const originMergeBase = 'a'.repeat(40);
+
+  function makeRunner(opts: { baseShaReachable: boolean }): {
+    run: (command: string, args: readonly string[], cwd: string) => Promise<EvidenceCommandResult>;
+    mergeBaseCalls: string[];
+  } {
+    const mergeBaseCalls: string[] = [];
+    const run = async (
+      command: string,
+      args: readonly string[]
+    ): Promise<EvidenceCommandResult> => {
+      if (command === 'gh') throw new Error('no pr view'); // pullRequest -> null
+      const sub = args[2];
+      switch (sub) {
+        case 'rev-parse':
+          return { stdout: `${headSha}\n` };
+        case 'symbolic-ref':
+          return { stdout: `${authority.headBranch}\n` };
+        case 'remote':
+          return { stdout: `${authority.canonicalRemote}\n` };
+        case 'merge-base': {
+          const operand = args[3];
+          mergeBaseCalls.push(operand);
+          if (operand === authority.baseSha) {
+            if (!opts.baseShaReachable) {
+              throw new Error('fatal: Not a valid object name');
+            }
+            return { stdout: `${baseShaMergeBase}\n` };
+          }
+          // Fallback: merge-base(refs/remotes/origin/<baseBranch>, HEAD)
+          return { stdout: `${originMergeBase}\n` };
+        }
+        case 'rev-list':
+          return { stdout: '0\n' };
+        case 'diff':
+          return { stdout: '' };
+        default:
+          throw new Error(`unexpected git subcommand: ${String(sub)}`);
+      }
+    };
+    return { run, mergeBaseCalls };
+  }
+
+  const store = {
+    getRunAuthority: async () => authority,
+    listWorkflowEvents: async () => [],
+  };
+  const request: RuntimeEvidenceRequest = {
+    runId: authority.runId,
+    cwd: authority.worktreePath,
+    executionState: 'running',
+    recoveryState: 'not_needed',
+    routeState: 'current',
+    requiredGateIds: [],
+  };
+
+  it('falls back to origin/<baseBranch> when baseSha is unreachable (squash-pruned)', async () => {
+    const { run, mergeBaseCalls } = makeRunner({ baseShaReachable: false });
+
+    const evidence = await collectRuntimeEvidence(store, run, request);
+
+    // It did NOT throw, and the fallback merge-base was invoked with the origin ref.
+    expect(mergeBaseCalls[0]).toBe(authority.baseSha);
+    expect(mergeBaseCalls[1]).toBe(`refs/remotes/origin/${authority.baseBranch}`);
+    expect(evidence.git.mergeBaseSha).toBe(originMergeBase);
+  });
+
+  it('uses the pinned baseSha merge-base directly when it is reachable', async () => {
+    const { run, mergeBaseCalls } = makeRunner({ baseShaReachable: true });
+
+    const evidence = await collectRuntimeEvidence(store, run, request);
+
+    expect(mergeBaseCalls).toEqual([authority.baseSha]);
+    expect(evidence.git.mergeBaseSha).toBe(baseShaMergeBase);
   });
 });
 
