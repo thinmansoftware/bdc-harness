@@ -186,14 +186,28 @@ export async function getActionByIdempotencyKey(key: string): Promise<TmJournalE
   return row ? normalizeJournal(row) : null;
 }
 
-/** Update the outcome of a previously recorded action (post-effect). */
+/**
+ * Update the outcome of a previously recorded action (post-effect). When
+ * `proposalJson` is supplied it is rewritten atomically alongside the outcome
+ * -- used when a mid-tick pause re-tags a ROW-FIRST row as parked/reason=paused
+ * so the parked provenance survives, not just the outcome flip.
+ */
 export async function updateActionOutcome(
   id: string,
-  outcome: TmActionOutcome
+  outcome: TmActionOutcome,
+  proposalJson?: string
 ): Promise<TmJournalEntry | null> {
   // The sqlite adapter rejects UPDATE ... RETURNING; mutate then re-read.
   const db = getDatabase();
-  await db.query('UPDATE tm_journal SET outcome = $1 WHERE id = $2', [outcome, id]);
+  if (proposalJson === undefined) {
+    await db.query('UPDATE tm_journal SET outcome = $1 WHERE id = $2', [outcome, id]);
+  } else {
+    await db.query('UPDATE tm_journal SET outcome = $1, proposal_json = $2 WHERE id = $3', [
+      outcome,
+      proposalJson,
+      id,
+    ]);
+  }
   const result = await db.query<TmJournalRow>('SELECT * FROM tm_journal WHERE id = $1', [id]);
   const row = result.rows[0];
   return row ? normalizeJournal(row) : null;
