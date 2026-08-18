@@ -5,17 +5,17 @@
 #
 # Pre-flight:
 #   1. lspro-react + shopops both registered in Archon
-#   2. WO-CHEERS-DASHBOARD-01 MUST be DONE — this WO consumes /api/customers/intelligence
-#      Verify via: gh pr list --repo bluedevilcollectibles/lspro-react --search 'WO-CHEERS-DASHBOARD-01' --state merged
+#   2. WO-CHEERS-DASHBOARD-01 MUST be DONE -- this WO consumes /api/customers/intelligence
+#      Verify via: gh pr list --repo thinmansoftware/lspro-react --search 'WO-CHEERS-DASHBOARD-01' --state merged
 #   3. Spec at bdc-xo:docs/work-orders/WO-CHEERS-CAMPAIGNS-01.md
-#   4. Notion page ID — fill in 35fef4c9-ce00-81ac-b633-fc72d336123b before firing
-#   5. Migration is part of this WO — verify schema_migrations table exists in staging Supabase
-#   6. A2P 10DLC status — confirm with John before firing (see Q1 below)
+#   4. Notion page ID -- fill in 35fef4c9-ce00-81ac-b633-fc72d336123b before firing
+#   5. Migration is part of this WO -- verify schema_migrations table exists in staging Supabase
+#   6. A2P 10DLC status -- confirm with John before firing (see Q1 below)
 #
 # OPEN QUESTIONS:
-#   Q1: A2P 10DLC — block SMS at send-time when unregistered, or proceed with warning?
+#   Q1: A2P 10DLC -- block SMS at send-time when unregistered, or proceed with warning?
 #       Default in draft: env CAMPAIGNS_SMS_BLOCKED_IF_NO_A2P=true blocks SMS.
-#   Q2: Email provider — Gmail API or SendGrid? Builder must grep shopops-api to determine
+#   Q2: Email provider -- Gmail API or SendGrid? Builder must grep shopops-api to determine
 #       which is live and use that one.
 #
 # Deploy: BDC_XO/scripts/archon-bridge/sync-workflows.sh bdc-cheers-campaigns.yaml
@@ -23,15 +23,15 @@
 
 name: bdc-cheers-campaigns
 description: |
-  Use when: Executing WO-CHEERS-CAMPAIGNS-01 — Cheers campaign builder + send infra.
+  Use when: Executing WO-CHEERS-CAMPAIGNS-01 -- Cheers campaign builder + send infra.
   Does: Migration for communication_log + campaigns tables. Adds shopops-api routes
         for campaign CRUD + preview + send. Adds lspro-react CampaignsPage +
         CampaignBuilderPage (5-step wizard). Wires SMS via Twilio + email via existing
         provider. UI screenshot loop N=3. Migration applied to staging in this run
         (gated step). Manifest v2 + Notion flip.
-  Repos: bluedevilcollectibles/lspro-react (Archon CWD) + bluedevilcollectibles/shopops
+  Repos: thinmansoftware/lspro-react (Archon CWD) + thinmansoftware/shopops
          (cloned to /tmp).
-  Depends on: WO-CHEERS-DASHBOARD-01 (must be merged — consumes its intelligence API).
+  Depends on: WO-CHEERS-DASHBOARD-01 (must be merged -- consumes its intelligence API).
   parallel_ok: false
 
 policyFile: harness/policies/agent-behavior.md
@@ -43,13 +43,13 @@ nodes:
     bash: |
       set -euo pipefail
       WO_ID="${WO_ID:-WO-CHEERS-CAMPAIGNS-01}"
-      SPEC=$(gh api "repos/bluedevilcollectibles/bdc-xo/contents/docs/work-orders/${WO_ID}.md?ref=main" \
+      SPEC=$(gh api "repos/thinmansoftware/bdc-xo/contents/docs/work-orders/${WO_ID}.md?ref=main" \
         --jq .content 2>/dev/null | base64 -d 2>/dev/null || true)
       if [ -z "$SPEC" ]; then
-        GLOB=$(gh api "repos/bluedevilcollectibles/bdc-xo/contents/docs/superpowers/specs?ref=main" \
+        GLOB=$(gh api "repos/thinmansoftware/bdc-xo/contents/docs/superpowers/specs?ref=main" \
           --jq '[.[] | select(.name | test("'"${WO_ID}"'")) | .path] | .[0]' 2>/dev/null || true)
         if [ -n "$GLOB" ] && [ "$GLOB" != "null" ]; then
-          SPEC=$(gh api "repos/bluedevilcollectibles/bdc-xo/contents/${GLOB}?ref=main" \
+          SPEC=$(gh api "repos/thinmansoftware/bdc-xo/contents/${GLOB}?ref=main" \
             --jq .content 2>/dev/null | base64 -d 2>/dev/null || true)
         fi
       fi
@@ -57,12 +57,12 @@ nodes:
         # Fallback 4: GitHub issue body (WO-HARNESS-READ-SPEC-ISSUE-BODY-FALLBACK-01)
         ISSUE_NUM=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'issue=[0-9]+' | head -n 1 | cut -d= -f2 || true)
         if [ -z "$ISSUE_NUM" ]; then
-          ISSUE_NUM=$(gh issue list --repo bluedevilcollectibles/bdc-xo \
+          ISSUE_NUM=$(gh issue list --repo thinmansoftware/bdc-xo \
             --search "${WO_ID} in:title" --json number,title \
             --jq '.[0].number' 2>/dev/null || true)
         fi
         if [ -n "$ISSUE_NUM" ] && [ "$ISSUE_NUM" != "null" ]; then
-          SPEC=$(gh issue view "$ISSUE_NUM" --repo bluedevilcollectibles/bdc-xo \
+          SPEC=$(gh issue view "$ISSUE_NUM" --repo thinmansoftware/bdc-xo \
             --json body --jq .body 2>/dev/null || true)
           [ -n "$SPEC" ] && SPEC_PATH="issues/${ISSUE_NUM}"
         fi
@@ -73,8 +73,8 @@ nodes:
   - id: verify-dependency
     depends_on: [read-spec]
     bash: |
-      # set -e DELIBERATELY OMITTED — best-effort
-      DASHBOARD_PR=$(gh pr list --repo bluedevilcollectibles/lspro-react \
+      # set -e DELIBERATELY OMITTED -- best-effort
+      DASHBOARD_PR=$(gh pr list --repo thinmansoftware/lspro-react \
         --search "WO-CHEERS-DASHBOARD-01" --state merged --json url --jq '.[0].url // empty' 2>&1)
       if [ -n "$DASHBOARD_PR" ] && [ "$DASHBOARD_PR" != "empty" ]; then
         echo "STATUS=ok"
@@ -97,7 +97,7 @@ nodes:
         git checkout "$DEFAULT_BRANCH" 2>/dev/null || git checkout "$DEFAULT_BRANCH"
         git reset --hard "origin/$DEFAULT_BRANCH" 2>/dev/null || git reset --hard "origin/$DEFAULT_BRANCH"
       else
-        git clone "https://github.com/bluedevilcollectibles/shopops.git" "$DIR" --depth=50
+        git clone "https://github.com/thinmansoftware/shopops.git" "$DIR" --depth=50
       fi
       echo "SHOPOPS_DIR=$DIR"
 
@@ -106,7 +106,7 @@ nodes:
     bash: |
       set -euo pipefail
       grep -n "Route path" src/App.tsx | head -30
-      ls -la src/pages/cheers/ 2>/dev/null || echo "cheers/ dir absent — created by WO-CHEERS-DASHBOARD-01"
+      ls -la src/pages/cheers/ 2>/dev/null || echo "cheers/ dir absent -- created by WO-CHEERS-DASHBOARD-01"
       grep -n "meetsTier\|HQ\|hq" src/lib/tiers.ts | head -10
 
   - id: audit-shopops-providers
@@ -140,14 +140,14 @@ nodes:
 
       ### shopops side (CWD /tmp/shopops-work-$WORKFLOW_ID)
       - Migration: shopops-api/migrations/2026-05-13_add_communication_log_and_campaigns.sql
-        Tables per WO §9: communication_log + campaigns + indexes
-      - shopops-api/routes/campaigns.js — POST /api/campaigns, GET /api/campaigns,
+        Tables per WO Section 9: communication_log + campaigns + indexes
+      - shopops-api/routes/campaigns.js -- POST /api/campaigns, GET /api/campaigns,
         GET /api/campaigns/:id, POST /api/campaigns/:id/preview, POST /api/campaigns/:id/send
-      - shopops-api/lib/template-render.js — pure variable substitution {{customer.first_name}} etc
-      - shopops-api/lib/campaign-channels/sms-channel.js — Twilio adapter
-      - shopops-api/lib/campaign-channels/email-channel.js — uses whichever provider audit found
-      - shopops-api/tests/test_campaigns.js — 8 bun tests
-      - shopops-api/index.js — mount /api/campaigns
+      - shopops-api/lib/template-render.js -- pure variable substitution {{customer.first_name}} etc
+      - shopops-api/lib/campaign-channels/sms-channel.js -- Twilio adapter
+      - shopops-api/lib/campaign-channels/email-channel.js -- uses whichever provider audit found
+      - shopops-api/tests/test_campaigns.js -- 8 bun tests
+      - shopops-api/index.js -- mount /api/campaigns
       - Branch: wo/cheers-campaigns-01, base master
 
       ### lspro-react side (CWD = repo root)
@@ -155,8 +155,8 @@ nodes:
       - src/pages/cheers/CampaignBuilderPage.tsx (route /cheers/campaigns/new, 5-step wizard)
       - src/pages/cheers/components/TemplateEditor.tsx
       - src/pages/cheers/components/CampaignPreview.tsx
-      - src/tests/cheers-campaigns.test.tsx — 6 Vitest tests
-      - src/App.tsx — wire both routes behind meetsTier('hq')
+      - src/tests/cheers-campaigns.test.tsx -- 6 Vitest tests
+      - src/App.tsx -- wire both routes behind meetsTier('hq')
       - Branch: wo/cheers-campaigns-01, base main
 
       ### A2P handling
@@ -165,8 +165,8 @@ nodes:
       - Email proceeds regardless
 
       ### Test counts
-      - test_campaigns.js: 8 tests per WO §7
-      - cheers-campaigns.test.tsx: 6 tests per WO §7
+      - test_campaigns.js: 8 tests per WO Section 7
+      - cheers-campaigns.test.tsx: 6 tests per WO Section 7
 
   - id: implement-migration
     depends_on: [plan]
@@ -180,7 +180,7 @@ nodes:
 
         Path: /tmp/shopops-work-$WORKFLOW_ID/shopops-api/migrations/2026-05-13_add_communication_log_and_campaigns.sql
 
-        Content per WO §9:
+        Content per WO Section 9:
         - CREATE TABLE communication_log (full DDL per spec)
         - CREATE TABLE campaigns (full DDL per spec)
         - CREATE INDEX statements
@@ -191,7 +191,7 @@ nodes:
         - Also write rollback file: 2026-05-13_add_communication_log_and_campaigns_rollback.sql
           containing DROP TABLE statements in reverse dependency order
 
-        DO NOT apply the migration in this node — that happens in a gated step.
+        DO NOT apply the migration in this node -- that happens in a gated step.
         DO NOT push.
 
         Output <promise>COMPLETE</promise> when both files exist.
@@ -215,19 +215,19 @@ nodes:
 
         ## Execution Rules
         1. Read shopops-api/index.js to find route mount pattern.
-        2. Create routes/campaigns.js with all 5 endpoints per WO §6.
+        2. Create routes/campaigns.js with all 5 endpoints per WO Section 6.
            Each multi-tenant: filter by tenant_id from auth context.
         3. Create lib/template-render.js with pure renderTemplate(body, customer, store) helper.
-        4. Create lib/campaign-channels/sms-channel.js — exports send(customerId, body) using Twilio.
+        4. Create lib/campaign-channels/sms-channel.js -- exports send(customerId, body) using Twilio.
            Check env CAMPAIGNS_SMS_BLOCKED_IF_NO_A2P; when set + TWILIO_A2P_REGISTERED!=true,
            return { ok: false, status: 'blocked_a2p' } instead of calling Twilio.
-        5. Create lib/campaign-channels/email-channel.js — use the provider audit found.
+        5. Create lib/campaign-channels/email-channel.js -- use the provider audit found.
            If neither sendgrid nor gmail is wired yet, stub the send() to write
            communication_log with status='pending_provider' and return ok.
            Builder must document the provider chosen in the manifest.
         6. Mount /api/campaigns in shopops-api/index.js.
         7. Create tests/test_campaigns.js with bun:test imports:
-           - 8 tests per WO §7: CRUD, multi-tenant isolation, preview rendering,
+           - 8 tests per WO Section 7: CRUD, multi-tenant isolation, preview rendering,
              send writes communication_log, idempotent re-send, A2P warning
            - Real assertions, not "did not throw"
         8. Send fan-out: serial loop with 250ms throttle (no parallel firehose to Twilio).
@@ -256,9 +256,9 @@ nodes:
         ## Execution Rules
         1. Read src/pages/cheers/CheersDashboardPage.tsx (created by WO-CHEERS-DASHBOARD-01)
            to match the inline-CSS style pattern. Do NOT invent a new design.
-        2. Create src/pages/cheers/CampaignsPage.tsx — list view, fetches /api/campaigns,
+        2. Create src/pages/cheers/CampaignsPage.tsx -- list view, fetches /api/campaigns,
            renders table with name/segment/channel/status/delivery-rate, "New Campaign" button.
-        3. Create src/pages/cheers/CampaignBuilderPage.tsx — 5-step wizard:
+        3. Create src/pages/cheers/CampaignBuilderPage.tsx -- 5-step wizard:
            Step1 SelectSegment (fetches /api/customers/intelligence segments)
            Step2 SelectChannel (sms | email radio)
            Step3 TemplateEditor (textarea + variable insert buttons)
@@ -266,7 +266,7 @@ nodes:
            Step5 ScheduleOrSend (date picker OR Send Now button calling POST /:id/send)
         4. Create components/TemplateEditor.tsx + components/CampaignPreview.tsx.
         5. Add routes /cheers/campaigns + /cheers/campaigns/new in App.tsx behind meetsTier('hq').
-        6. Create src/tests/cheers-campaigns.test.tsx — 6 Vitest tests per WO §7.
+        6. Create src/tests/cheers-campaigns.test.tsx -- 6 Vitest tests per WO Section 7.
            Use vi.mock('@/lib/api') for apiFetch.
         7. Use apiFetch from @/lib/api. Returns Promise<Response>. Call .json() on the result.
         8. Do NOT add new package dependencies.
@@ -277,7 +277,7 @@ nodes:
   - id: apply-migration-staging
     depends_on: [implement-migration]
     bash: |
-      # set -e DELIBERATELY OMITTED — best-effort (staging may be down, env may be missing)
+      # set -e DELIBERATELY OMITTED -- best-effort (staging may be down, env may be missing)
       STAGING_DB_URL="${STAGING_DATABASE_URL:-${SUPABASE_STAGING_URL:-}}"
       MIG_FILE="/tmp/shopops-work-$WORKFLOW_ID/shopops-api/migrations/2026-05-13_add_communication_log_and_campaigns.sql"
 
@@ -376,8 +376,8 @@ nodes:
       max_iterations: 3
       prompt: |
         Verify 3 UI screenshots for WO-CHEERS-CAMPAIGNS-01:
-          SHOT_1: /cheers/campaigns — campaign list table populated
-          SHOT_2: /cheers/campaigns/new — Step 3 template editor visible with variable picker
+          SHOT_1: /cheers/campaigns -- campaign list table populated
+          SHOT_2: /cheers/campaigns/new -- Step 3 template editor visible with variable picker
           SHOT_3: Step 5 "Send Now" button click -> confirm modal visible
 
         Inspect src/pages/cheers/CampaignsPage.tsx + CampaignBuilderPage.tsx + components.
@@ -410,7 +410,7 @@ nodes:
         echo "No staged changes"
       else
         git -c user.name="John Ranson" -c user.email="admin@bluedevilcollectibles.com" \
-          commit -m "$(printf 'feat(cheers): WO-CHEERS-CAMPAIGNS-01 — campaign builder + send (UI)\n\nCampaignsPage list view + CampaignBuilderPage 5-step wizard at /cheers/campaigns.\nTier-gated to HQ. Consumes WO-CHEERS-DASHBOARD-01 segments.\n\nTests: cheers-campaigns.test.tsx (6 Vitest tests).\n\nCompanion PR: shopops master wo/cheers-campaigns-01 (routes + migration).\n\nCo-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>')"
+          commit -m "$(printf 'feat(cheers): WO-CHEERS-CAMPAIGNS-01 -- campaign builder + send (UI)\n\nCampaignsPage list view + CampaignBuilderPage 5-step wizard at /cheers/campaigns.\nTier-gated to HQ. Consumes WO-CHEERS-DASHBOARD-01 segments.\n\nTests: cheers-campaigns.test.tsx (6 Vitest tests).\n\nCompanion PR: shopops master wo/cheers-campaigns-01 (routes + migration).\n\nCo-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>')"
       fi
       git push -u origin "$BRANCH"
       echo "UI_BRANCH=$BRANCH"
@@ -441,7 +441,7 @@ nodes:
         echo "No staged changes"
       else
         git -c user.name="John Ranson" -c user.email="admin@bluedevilcollectibles.com" \
-          commit -m "$(printf 'feat(api): WO-CHEERS-CAMPAIGNS-01 — campaign send infra\n\nNew tables: communication_log + campaigns (migration + rollback paired).\nNew routes: POST /api/campaigns, GET, /:id, /:id/preview, /:id/send.\nSMS via Twilio (A2P-blocked when env flag set). Email via existing provider.\nTemplate render with {{customer.first_name}} variable substitution.\nSend fan-out serial 250ms throttle. Idempotent re-send.\n\nTests: test_campaigns.js (8 bun tests).\n\nCo-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>')"
+          commit -m "$(printf 'feat(api): WO-CHEERS-CAMPAIGNS-01 -- campaign send infra\n\nNew tables: communication_log + campaigns (migration + rollback paired).\nNew routes: POST /api/campaigns, GET, /:id, /:id/preview, /:id/send.\nSMS via Twilio (A2P-blocked when env flag set). Email via existing provider.\nTemplate render with {{customer.first_name}} variable substitution.\nSend fan-out serial 250ms throttle. Idempotent re-send.\n\nTests: test_campaigns.js (8 bun tests).\n\nCo-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>')"
       fi
       git push -u origin "$BRANCH"
       echo "API_BRANCH=$BRANCH"
@@ -452,11 +452,11 @@ nodes:
     bash: |
       set -euo pipefail
       BRANCH="wo/cheers-campaigns-01"
-      REPO="bluedevilcollectibles/lspro-react"
+      REPO="thinmansoftware/lspro-react"
       BODY=$(mktemp)
       {
         echo "## Summary"
-        echo "WO-CHEERS-CAMPAIGNS-01 lspro-react side — campaign builder UI."
+        echo "WO-CHEERS-CAMPAIGNS-01 lspro-react side -- campaign builder UI."
         echo ""
         echo "## Files"
         echo "- src/pages/cheers/CampaignsPage.tsx (list)"
@@ -474,7 +474,7 @@ nodes:
 
       for attempt in 1 2 3; do
         if PR_OUT=$(gh pr create --repo "$REPO" --base main --head "$BRANCH" \
-            --title "feat(cheers): WO-CHEERS-CAMPAIGNS-01 — campaign builder (UI)" \
+            --title "feat(cheers): WO-CHEERS-CAMPAIGNS-01 -- campaign builder (UI)" \
             --body-file "$BODY" 2>&1); then
           echo "UI_PR_URL=$PR_OUT"; exit 0
         fi
@@ -488,11 +488,11 @@ nodes:
       set -euo pipefail
       cd /tmp/shopops-work-$WORKFLOW_ID
       BRANCH="wo/cheers-campaigns-01"
-      REPO="bluedevilcollectibles/shopops"
+      REPO="thinmansoftware/shopops"
       BODY=$(mktemp)
       {
         echo "## Summary"
-        echo "WO-CHEERS-CAMPAIGNS-01 shopops side — migration + campaign send infra."
+        echo "WO-CHEERS-CAMPAIGNS-01 shopops side -- migration + campaign send infra."
         echo ""
         echo "## Migration"
         echo "shopops-api/migrations/2026-05-13_add_communication_log_and_campaigns.sql"
@@ -511,7 +511,7 @@ nodes:
 
       for attempt in 1 2 3; do
         if PR_OUT=$(gh pr create --repo "$REPO" --base master --head "$BRANCH" \
-            --title "feat(api): WO-CHEERS-CAMPAIGNS-01 — campaign send infra + migration" \
+            --title "feat(api): WO-CHEERS-CAMPAIGNS-01 -- campaign send infra + migration" \
             --body-file "$BODY" 2>&1); then
           echo "API_PR_URL=$PR_OUT"; exit 0
         fi
@@ -522,7 +522,7 @@ nodes:
   - id: runtime-verify
     depends_on: [open-pr-api, open-pr-ui]
     bash: |
-      # set -e DELIBERATELY OMITTED — Rule 19 best-effort
+      # set -e DELIBERATELY OMITTED -- Rule 19 best-effort
       RESULT=$(docker exec shopops-api grep -n "api/campaigns" /app/routes/campaigns.js 2>&1)
       EXIT=$?
       if [ $EXIT -eq 0 ]; then
@@ -540,7 +540,7 @@ nodes:
     depends_on: [open-pr-ui]
     bash: |
       sleep 30
-      RESULT=$(gh pr list --repo bluedevilcollectibles/lspro-react --head wo/cheers-campaigns-01 --state open --json url 2>&1)
+      RESULT=$(gh pr list --repo thinmansoftware/lspro-react --head wo/cheers-campaigns-01 --state open --json url 2>&1)
       if echo "$RESULT" | grep -q "url"; then
         echo "STATUS=pr_open_preview_pending"
       else
@@ -618,20 +618,43 @@ nodes:
   - id: flip-notion
     depends_on: [build-manifest]
     task_class: clerical
-    prompt: |
-      Flip Notion WO-CHEERS-CAMPAIGNS-01 to REVIEW with manifest in Notes property.
+    bash: |
+      set -euo pipefail
 
-      # OPERATOR: Replace 35fef4c9-ce00-81ac-b633-fc72d336123b before firing.
-      Notion database: a6df831c-0b52-449f-8ca4-d77be6b70d0a
-      Notion page ID: 35fef4c9-ce00-81ac-b633-fc72d336123b
+      capture_node_output() {
+        python3 -c 'import shlex, sys; s=sys.stdin.read(); sys.stdout.write((lambda p: p[0] if len(p)==1 else s)(shlex.split(s)) if len(s)>=2 and s[0]=="'"'"'" and s.rstrip("\n").endswith("'"'"'") else s)'
+      }
 
-      Updates:
-      - Claude Status -> REVIEW
-      - Status -> Review
-      - Notes -> $build-manifest.output verbatim
-
-      If Notion MCP unavailable:
-        XO_TODO: Flip WO-CHEERS-CAMPAIGNS-01 to REVIEW, paste manifest into Notes.
-
-      ## Manifest
+      MANIFEST=$(capture_node_output <<'BDC_NODE_OUTPUT_MANIFEST'
       $build-manifest.output
+      BDC_NODE_OUTPUT_MANIFEST
+      )
+
+      READ_SPEC_OUT=$(capture_node_output <<'BDC_NODE_OUTPUT_READ_SPEC'
+      $read-spec.output
+      BDC_NODE_OUTPUT_READ_SPEC
+      )
+      ISSUE_REPO="${ISSUE_REPO:-thinmansoftware/bdc-xo}"
+      ISSUE_NUM=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'issue=[0-9]+' | head -1 | cut -d= -f2 || true)
+      if [ -z "$ISSUE_NUM" ]; then
+        ISSUE_NUM=$(printf '%s\n' "$READ_SPEC_OUT" | sed -n 's/^SPEC_PATH=.*issues\/\([0-9][0-9]*\).*/\1/p' | head -1)
+      fi
+      if [ -z "$ISSUE_NUM" ]; then
+        WO_ID_FROM_SPEC=$(printf '%s\n' "$READ_SPEC_OUT" | sed -n 's/^WO_ID=//p' | head -1)
+        if [ -n "$WO_ID_FROM_SPEC" ]; then
+          ISSUE_NUM=$(gh issue list --repo "$ISSUE_REPO" --search "$WO_ID_FROM_SPEC in:title" --json number --jq '.[0].number // empty' 2>/dev/null || true)
+        fi
+      fi
+      if [ -z "$ISSUE_NUM" ]; then
+        echo "flip-notion: no GitHub issue resolved; skipping status:review label + manifest comment."
+        exit 0
+      fi
+
+      gh label create status:review --repo "$ISSUE_REPO" --color 0E8A16 --description "BDC workflow is ready for review" 2>/dev/null || true
+      gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --remove-label status:building 2>/dev/null || true
+      gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --remove-label status:blocked 2>/dev/null || true
+      gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --add-label status:review
+      COMMENT_FILE=$(mktemp)
+      printf '%s\n' "$MANIFEST" > "$COMMENT_FILE"
+      gh issue comment "$ISSUE_NUM" --repo "$ISSUE_REPO" --body-file "$COMMENT_FILE"
+      echo "flip-notion: $ISSUE_REPO#$ISSUE_NUM -> status:review (manifest posted as comment)"

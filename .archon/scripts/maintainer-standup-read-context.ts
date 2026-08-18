@@ -45,7 +45,7 @@ if (existsSync(briefsDir)) {
   }
 }
 
-// Deterministic clock — emit today's local date + a precomputed 3-day-out
+// Deterministic clock -- emit today's local date + a precomputed 3-day-out
 // deadline so downstream prompts don't have to do calendar arithmetic
 // (LLMs are unreliable at it) and don't anchor to stale prior_state.last_run_at
 // (which can produce past deadlines on long gaps between runs).
@@ -57,7 +57,7 @@ const deadline_3d = deadlineDate.toLocaleDateString('sv-SE');
 
 // Cross-workflow memory: which PRs has maintainer-review-pr already triaged?
 // Written by maintainer-review-pr's `record-review` node; surfaced here so
-// the standup synthesizer can mark "✓ reviewed Nd ago" next to P1-P4 entries
+// the standup synthesizer can mark "[x] reviewed Nd ago" next to P1-P4 entries
 // and flag staleness when the contributor pushes after a prior review.
 const reviewedPrsPath = resolve(baseDir, 'reviewed-prs.json');
 let reviewedPrs: unknown = {};

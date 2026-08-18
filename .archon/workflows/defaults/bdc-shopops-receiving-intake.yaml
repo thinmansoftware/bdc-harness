@@ -9,16 +9,16 @@
 #   4. Both codebases registered:
 #      sqlite3 /opt/bdc/archon-data/archon.db "SELECT name FROM remote_agent_codebases"
 #
-# parallel_ok: NO — schema migration on receiving_sessions/receiving_session_lines (new tables,
+# parallel_ok: NO -- schema migration on receiving_sessions/receiving_session_lines (new tables,
 #   but depends_on WO-SHOPOPS-MULTI-LOCATION-SCOPE-01 must already be merged for location_id FK).
 #
 # Deploy: BDC_XO/scripts/archon-bridge/sync-workflows.sh WO-SHOPOPS-RECEIVING-INTAKE-01.yaml
-# REVIEW BEFORE DEPLOY — verify WO-SHOPOPS-MULTI-LOCATION-SCOPE-01 is merged + applied
+# REVIEW BEFORE DEPLOY -- verify WO-SHOPOPS-MULTI-LOCATION-SCOPE-01 is merged + applied
 #   in staging before firing this workflow (location_id FK needed).
 
 name: bdc-shopops-receiving-intake
 description: |
-  Use when: Executing WO-SHOPOPS-RECEIVING-INTAKE-01 — Receiving Intake (scan/verify).
+  Use when: Executing WO-SHOPOPS-RECEIVING-INTAKE-01 -- Receiving Intake (scan/verify).
   Input: WO_ID = WO-SHOPOPS-RECEIVING-INTAKE-01.
   Does: Reads spec from bdc-xo. Adds receiving_sessions + receiving_session_lines tables
         via migration. Adds shopops-api/routes/receiving-sessions.js (POST create, POST scan,
@@ -27,9 +27,9 @@ description: |
         with scan input + reconciliation grid + discrepancy panel. 7+ bun tests +
         Playwright UI test. Commits both repos, opens 2 PRs, runs Rule 19 docker exec
         verify, builds MIXED manifest, flips Notion REVIEW.
-  Repo: bluedevilcollectibles/shopops (PRIMARY CWD), bluedevilcollectibles/lspro-react
+  Repo: thinmansoftware/shopops (PRIMARY CWD), thinmansoftware/lspro-react
         (sibling via /tmp clone).
-  parallel_ok: false — schema migration AND depends on multi-location-scope migration first.
+  parallel_ok: false -- schema migration AND depends on multi-location-scope migration first.
   Polish bar: HIGH (warehouse staff use daily).
 
 policyFile: harness/policies/agent-behavior.md
@@ -44,17 +44,17 @@ nodes:
 
       # gh --template uses Go templates (built into gh, no external jq dependency)
       SPEC_CONTENT=$(gh api \
-        "repos/bluedevilcollectibles/bdc-xo/contents/docs/work-orders/${WO_ID}.md?ref=main" \
+        "repos/thinmansoftware/bdc-xo/contents/docs/work-orders/${WO_ID}.md?ref=main" \
         --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
 
       if [ -z "$SPEC_CONTENT" ]; then
         GLOB_PATH=$(gh api \
-          "repos/bluedevilcollectibles/bdc-xo/contents/docs/superpowers/specs?ref=main" \
+          "repos/thinmansoftware/bdc-xo/contents/docs/superpowers/specs?ref=main" \
           --template '{{range .}}{{.path}}{{"\n"}}{{end}}' \
           2>/dev/null | grep "${WO_ID}.md$" | head -1 || true)
         if [ -n "$GLOB_PATH" ]; then
           SPEC_CONTENT=$(gh api \
-            "repos/bluedevilcollectibles/bdc-xo/contents/${GLOB_PATH}?ref=main" \
+            "repos/thinmansoftware/bdc-xo/contents/${GLOB_PATH}?ref=main" \
             --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
         fi
       fi
@@ -63,12 +63,12 @@ nodes:
         # Fallback 4: GitHub issue body (WO-HARNESS-READ-SPEC-ISSUE-BODY-FALLBACK-01)
         ISSUE_NUM=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'issue=[0-9]+' | head -n 1 | cut -d= -f2 || true)
         if [ -z "$ISSUE_NUM" ]; then
-          ISSUE_NUM=$(gh issue list --repo bluedevilcollectibles/bdc-xo \
+          ISSUE_NUM=$(gh issue list --repo thinmansoftware/bdc-xo \
             --search "${WO_ID} in:title" --json number,title \
             --jq '.[0].number' 2>/dev/null || true)
         fi
         if [ -n "$ISSUE_NUM" ] && [ "$ISSUE_NUM" != "null" ]; then
-          SPEC_CONTENT=$(gh issue view "$ISSUE_NUM" --repo bluedevilcollectibles/bdc-xo \
+          SPEC_CONTENT=$(gh issue view "$ISSUE_NUM" --repo thinmansoftware/bdc-xo \
             --json body --jq .body 2>/dev/null || true)
           [ -n "$SPEC_CONTENT" ] && SPEC_PATH="issues/${ISSUE_NUM}"
         fi
@@ -160,7 +160,7 @@ nodes:
       - services/receivingSession.js (matchScan pure function, reconcileSession)
       - tests/test_receiving_session.js (>=7 tests)
 
-      ## UI (lspro-react) — sibling worktree at /tmp/lspro-react-receiving-<WORKFLOW_ID>
+      ## UI (lspro-react) -- sibling worktree at /tmp/lspro-react-receiving-<WORKFLOW_ID>
       - src/pages/Receiving/ReceivingIntakePage.tsx
       - src/components/Receiving/ScanInput.tsx
       - src/components/Receiving/ExpectedItemsGrid.tsx
@@ -192,16 +192,16 @@ nodes:
            - Indexes
 
         2. shopops-api/routes/receiving-sessions.js:
-           - POST /receiving-sessions — creates session, copies distributor_order_lines into expected_lines
-           - POST /receiving-sessions/:id/scan { upc, qty } — calls matchScan, updates scanned_qty
-           - POST /receiving-sessions/:id/submit { force } — 409 if discrepancy + force=false;
+           - POST /receiving-sessions -- creates session, copies distributor_order_lines into expected_lines
+           - POST /receiving-sessions/:id/scan { upc, qty } -- calls matchScan, updates scanned_qty
+           - POST /receiving-sessions/:id/submit { force } -- 409 if discrepancy + force=false;
              else writes inventory movements + flips distributor_orders.status=received
-           - POST /receiving-sessions/:id/cancel — soft-delete (status=cancelled)
-           - GET /receiving-sessions/:id — returns current session state
+           - POST /receiving-sessions/:id/cancel -- soft-delete (status=cancelled)
+           - GET /receiving-sessions/:id -- returns current session state
 
         3. shopops-api/services/receivingSession.js:
-           - matchScan(session, upc) pure function → returns action: 'increment'|'over'|'unexpected'
-           - reconcileSession(sessionId) → per-line status rollup
+           - matchScan(session, upc) pure function -> returns action: 'increment'|'over'|'unexpected'
+           - reconcileSession(sessionId) -> per-line status rollup
 
         4. shopops-api/tests/test_receiving_session.js:
            - import { describe, it, expect } from 'bun:test'
@@ -256,7 +256,7 @@ nodes:
 
         Steps:
         1. Clone lspro-react into /tmp/lspro-react-receiving-$WORKFLOW_ID:
-             git clone --depth=20 https://github.com/bluedevilcollectibles/lspro-react.git \
+             git clone --depth=20 https://github.com/thinmansoftware/lspro-react.git \
                /tmp/lspro-react-receiving-$WORKFLOW_ID
              cd /tmp/lspro-react-receiving-$WORKFLOW_ID
              git checkout staging
@@ -265,13 +265,13 @@ nodes:
            (Use staging per Rule 20.)
 
         2. Create files:
-           - src/pages/Receiving/ReceivingIntakePage.tsx — page-level component, fetches
+           - src/pages/Receiving/ReceivingIntakePage.tsx -- page-level component, fetches
              open distributor orders, holds session state, calls API
-           - src/components/Receiving/ScanInput.tsx — autofocus input, Enter submits
-           - src/components/Receiving/ExpectedItemsGrid.tsx — grid with row tint by status
-           - src/components/Receiving/DiscrepancyPanel.tsx — counts + "show only discrepancies" toggle
+           - src/components/Receiving/ScanInput.tsx -- autofocus input, Enter submits
+           - src/components/Receiving/ExpectedItemsGrid.tsx -- grid with row tint by status
+           - src/components/Receiving/DiscrepancyPanel.tsx -- counts + "show only discrepancies" toggle
 
-        3. Wire the route in the router (App.tsx or routes file — verify by reading repo first)
+        3. Wire the route in the router (App.tsx or routes file -- verify by reading repo first)
            and ensure `/receiving` resolves to ReceivingIntakePage.
 
         4. Add Playwright test stub: tests/receiving-intake.spec.ts (1 test minimum)
@@ -281,13 +281,13 @@ nodes:
              git add src/pages/Receiving/ src/components/Receiving/ tests/receiving-intake.spec.ts \
                      <any router file modified>
              git -c user.name="John Ranson" -c user.email="admin@bluedevilcollectibles.com" \
-               commit -m "$(printf 'feat(ui): WO-SHOPOPS-RECEIVING-INTAKE-01 — ReceivingIntakePage + scan/grid/discrepancy\n\nAdds ReceivingIntakePage with scan input, ExpectedItemsGrid (row-tint by status),\nDiscrepancyPanel. Routes /receiving. Wires to shopops-api receiving-sessions endpoints.\n\nCo-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>')"
+               commit -m "$(printf 'feat(ui): WO-SHOPOPS-RECEIVING-INTAKE-01 -- ReceivingIntakePage + scan/grid/discrepancy\n\nAdds ReceivingIntakePage with scan input, ExpectedItemsGrid (row-tint by status),\nDiscrepancyPanel. Routes /receiving. Wires to shopops-api receiving-sessions endpoints.\n\nCo-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>')"
              git push -u origin wo/shopops-receiving-intake-01-ui
 
         6. Open PR on lspro-react against staging (Rule 20):
-             gh pr create --repo bluedevilcollectibles/lspro-react --base staging \
+             gh pr create --repo thinmansoftware/lspro-react --base staging \
                --head wo/shopops-receiving-intake-01-ui \
-               --title "feat(ui): WO-SHOPOPS-RECEIVING-INTAKE-01 — ReceivingIntakePage" \
+               --title "feat(ui): WO-SHOPOPS-RECEIVING-INTAKE-01 -- ReceivingIntakePage" \
                --body "Implements UI side of WO-SHOPOPS-RECEIVING-INTAKE-01. Wires to shopops-api receiving-sessions endpoints. Plan: B."
 
         Output <promise>COMPLETE</promise> with the lspro-react PR URL.
@@ -296,7 +296,7 @@ nodes:
     depends_on: [verify-backend-grep, verify-backend-tests]
     bash: |
       set -euo pipefail
-      # Use current HEAD branch (set by fresh-branch — may be timestamped variant)
+      # Use current HEAD branch (set by fresh-branch -- may be timestamped variant)
       BRANCH="$(git rev-parse --abbrev-ref HEAD)"
       git add \
         shopops-api/migrations/20260514_receiving_sessions.sql \
@@ -316,7 +316,7 @@ nodes:
         echo "No staged changes"
       else
         git -c user.name="John Ranson" -c user.email="admin@bluedevilcollectibles.com" \
-          commit -m "$(printf 'feat(api): WO-SHOPOPS-RECEIVING-INTAKE-01 — receiving session backend\n\nAdds receiving_sessions + receiving_session_lines tables (migration 20260514).\nAdds routes/receiving-sessions.js: POST create, POST scan, POST submit, POST cancel, GET.\nAdds services/receivingSession.js: matchScan + reconcileSession.\n7+ bun tests covering scan, over, unexpected, submit/force flow.\n\nPlan: B (P0 floor, Mutant Market 2026-06-15)\nUI side: bluedevilcollectibles/lspro-react PR\n\nCo-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>')"
+          commit -m "$(printf 'feat(api): WO-SHOPOPS-RECEIVING-INTAKE-01 -- receiving session backend\n\nAdds receiving_sessions + receiving_session_lines tables (migration 20260514).\nAdds routes/receiving-sessions.js: POST create, POST scan, POST submit, POST cancel, GET.\nAdds services/receivingSession.js: matchScan + reconcileSession.\n7+ bun tests covering scan, over, unexpected, submit/force flow.\n\nPlan: B (P0 floor, Mutant Market 2026-06-15)\nUI side: thinmansoftware/lspro-react PR\n\nCo-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>')"
       fi
       git push -u origin "$BRANCH"
       echo "BRANCH=${BRANCH}"
@@ -327,11 +327,11 @@ nodes:
     bash: |
       set -euo pipefail
       BRANCH="$(git rev-parse --abbrev-ref HEAD)"
-      REPO="bluedevilcollectibles/shopops"
+      REPO="thinmansoftware/shopops"
       BASE="master"
-      TITLE="feat(api): WO-SHOPOPS-RECEIVING-INTAKE-01 — receiving session backend"
+      TITLE="feat(api): WO-SHOPOPS-RECEIVING-INTAKE-01 -- receiving session backend"
       BODY_FILE=$(mktemp)
-      printf '## Summary\nImplements WO-SHOPOPS-RECEIVING-INTAKE-01 backend (receiving_sessions tables + 5 routes + matchScan/reconcileSession services).\n\n## Plan: B (P0 floor, Mutant Market 2026-06-15)\n\nUI side: bluedevilcollectibles/lspro-react companion PR.\nApply migration to staging Supabase BEFORE merging.\n' > "$BODY_FILE"
+      printf '## Summary\nImplements WO-SHOPOPS-RECEIVING-INTAKE-01 backend (receiving_sessions tables + 5 routes + matchScan/reconcileSession services).\n\n## Plan: B (P0 floor, Mutant Market 2026-06-15)\n\nUI side: thinmansoftware/lspro-react companion PR.\nApply migration to staging Supabase BEFORE merging.\n' > "$BODY_FILE"
       existing_pr_url() { gh pr list --repo "$REPO" --head "$BRANCH" --state open --json url --template '{{range .}}{{.url}}{{end}}' 2>/dev/null; }
       PR_URL="$(existing_pr_url)"
       if [ -n "$PR_URL" ]; then echo "PR_URL=$PR_URL"; exit 0; fi
@@ -411,16 +411,43 @@ nodes:
   - id: flip-notion
     depends_on: [build-manifest]
     task_class: clerical
-    prompt: |
-      Flip Notion WO-SHOPOPS-RECEIVING-INTAKE-01 to REVIEW with manifest in Notes property.
-      Database: a6df831c-0b52-449f-8ca4-d77be6b70d0a
-      # OPEN QUESTION: operator confirms Notion page ID before deploy.
+    bash: |
+      set -euo pipefail
 
-      Set Claude Status=REVIEW + Status=Review + Notes=manifest from $build-manifest.output verbatim
-      + claimed_by=Devils Cauldron + plan=B.
+      capture_node_output() {
+        python3 -c 'import shlex, sys; s=sys.stdin.read(); sys.stdout.write((lambda p: p[0] if len(p)==1 else s)(shlex.split(s)) if len(s)>=2 and s[0]=="'"'"'" and s.rstrip("\n").endswith("'"'"'") else s)'
+      }
 
-      If Notion MCP unavailable in runtime, emit:
-        XO_TODO: Flip WO-SHOPOPS-RECEIVING-INTAKE-01 to REVIEW; paste manifest into Notes.
-
-      ## Manifest
+      MANIFEST=$(capture_node_output <<'BDC_NODE_OUTPUT_MANIFEST'
       $build-manifest.output
+      BDC_NODE_OUTPUT_MANIFEST
+      )
+
+      READ_SPEC_OUT=$(capture_node_output <<'BDC_NODE_OUTPUT_READ_SPEC'
+      $read-spec.output
+      BDC_NODE_OUTPUT_READ_SPEC
+      )
+      ISSUE_REPO="${ISSUE_REPO:-thinmansoftware/bdc-xo}"
+      ISSUE_NUM=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'issue=[0-9]+' | head -1 | cut -d= -f2 || true)
+      if [ -z "$ISSUE_NUM" ]; then
+        ISSUE_NUM=$(printf '%s\n' "$READ_SPEC_OUT" | sed -n 's/^SPEC_PATH=.*issues\/\([0-9][0-9]*\).*/\1/p' | head -1)
+      fi
+      if [ -z "$ISSUE_NUM" ]; then
+        WO_ID_FROM_SPEC=$(printf '%s\n' "$READ_SPEC_OUT" | sed -n 's/^WO_ID=//p' | head -1)
+        if [ -n "$WO_ID_FROM_SPEC" ]; then
+          ISSUE_NUM=$(gh issue list --repo "$ISSUE_REPO" --search "$WO_ID_FROM_SPEC in:title" --json number --jq '.[0].number // empty' 2>/dev/null || true)
+        fi
+      fi
+      if [ -z "$ISSUE_NUM" ]; then
+        echo "flip-notion: no GitHub issue resolved; skipping status:review label + manifest comment."
+        exit 0
+      fi
+
+      gh label create status:review --repo "$ISSUE_REPO" --color 0E8A16 --description "BDC workflow is ready for review" 2>/dev/null || true
+      gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --remove-label status:building 2>/dev/null || true
+      gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --remove-label status:blocked 2>/dev/null || true
+      gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --add-label status:review
+      COMMENT_FILE=$(mktemp)
+      printf '%s\n' "$MANIFEST" > "$COMMENT_FILE"
+      gh issue comment "$ISSUE_NUM" --repo "$ISSUE_REPO" --body-file "$COMMENT_FILE"
+      echo "flip-notion: $ISSUE_REPO#$ISSUE_NUM -> status:review (manifest posted as comment)"

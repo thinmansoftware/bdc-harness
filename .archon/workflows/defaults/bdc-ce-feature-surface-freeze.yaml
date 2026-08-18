@@ -1,12 +1,12 @@
 name: bdc-ce-feature-surface-freeze
 description: |
-  Use when: Shipping WO-CE-FEATURE-SURFACE-FREEZE-01 — audit + freeze CE-visible feature surface.
+  Use when: Shipping WO-CE-FEATURE-SURFACE-FREEZE-01 -- audit + freeze CE-visible feature surface.
   Input: WO_ID = WO-CE-FEATURE-SURFACE-FREEZE-01.
   Does: Audits all routes/components in lspro-react that CE plan users can see, ensures higher-tier
         features (PRO/HQ/multi-category) are gated, produces audit report + ensures entitlement
         registry blocks the disallowed surfaces, opens PR.
-  Repo: bluedevilcollectibles/lspro-react. Cross-repo spec from bdc-xo.
-  parallel_ok: true (independent from #1/#2/#3 — surface audit is read-mostly with config edits).
+  Repo: thinmansoftware/lspro-react. Cross-repo spec from bdc-xo.
+  parallel_ok: true (independent from #1/#2/#3 -- surface audit is read-mostly with config edits).
 
 policyFile: harness/policies/agent-behavior.md
 model: sonnet
@@ -17,17 +17,17 @@ nodes:
       set -euo pipefail
       WO_ID="${WO_ID:-WO-CE-FEATURE-SURFACE-FREEZE-01}"
       SPEC_PATH="docs/superpowers/specs/ce-release-branch/work-orders/${WO_ID}.md"
-      SPEC=$(gh api "repos/bluedevilcollectibles/bdc-xo/contents/${SPEC_PATH}?ref=main" --jq .content 2>/dev/null | base64 -d 2>/dev/null || true)
+      SPEC=$(gh api "repos/thinmansoftware/bdc-xo/contents/${SPEC_PATH}?ref=main" --jq .content 2>/dev/null | base64 -d 2>/dev/null || true)
       if [ -z "$SPEC" ]; then
         # Fallback 4: GitHub issue body (WO-HARNESS-READ-SPEC-ISSUE-BODY-FALLBACK-01)
         ISSUE_NUM=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'issue=[0-9]+' | head -n 1 | cut -d= -f2 || true)
         if [ -z "$ISSUE_NUM" ]; then
-          ISSUE_NUM=$(gh issue list --repo bluedevilcollectibles/bdc-xo \
+          ISSUE_NUM=$(gh issue list --repo thinmansoftware/bdc-xo \
             --search "${WO_ID} in:title" --json number,title \
             --jq '.[0].number' 2>/dev/null || true)
         fi
         if [ -n "$ISSUE_NUM" ] && [ "$ISSUE_NUM" != "null" ]; then
-          SPEC=$(gh issue view "$ISSUE_NUM" --repo bluedevilcollectibles/bdc-xo \
+          SPEC=$(gh issue view "$ISSUE_NUM" --repo thinmansoftware/bdc-xo \
             --json body --jq .body 2>/dev/null || true)
           [ -n "$SPEC" ] && SPEC_PATH="issues/${ISSUE_NUM}"
         fi
@@ -61,13 +61,13 @@ nodes:
         - Visible to CE plan: yes / no
         - Source of gating: `tiers.ts`, `<plan>` prop check, route guard, or NONE (leak risk)
         - Required action: keep, gate, or add explicit hide
-      - Component sweep: `src/components/` — flag any TopNav/Sidebar items that show higher-tier features without a tier guard
+      - Component sweep: `src/components/` -- flag any TopNav/Sidebar items that show higher-tier features without a tier guard
       - Entitlement registry (src/lib/tiers.ts or similar): list current CE allowlist; identify any of the "allowed" list that's missing from CE
       - Required code changes:
         - Add tier guards where leak detected
         - Update entitlement registry if needed
       - Verification: `grep -rE "plan ===? 'ce'\\|plan ===? 'pro'\\|plan ===? 'hq'" src/ | wc -l` (audit count)
-      - Commit msg: `feat(ce): WO-CE-FEATURE-SURFACE-FREEZE-01 — audit + close higher-tier UI leaks for CE plan`
+      - Commit msg: `feat(ce): WO-CE-FEATURE-SURFACE-FREEZE-01 -- audit + close higher-tier UI leaks for CE plan`
       - Push: `wo/ce-feature-surface-freeze-01` -> PR against main
 
       ## Spec
@@ -126,7 +126,7 @@ nodes:
         echo "No staged changes; branch already contains requested work"
       else
         git -c user.name="John Ranson" -c user.email="admin@bluedevilcollectibles.com" \
-          commit -m "feat(ce): WO-CE-FEATURE-SURFACE-FREEZE-01 — audit + close higher-tier UI leaks for CE plan
+          commit -m "feat(ce): WO-CE-FEATURE-SURFACE-FREEZE-01 -- audit + close higher-tier UI leaks for CE plan
 
         Adds docs/CE-FEATURE-SURFACE-AUDIT.md.
         Applies minimal tier guards to close confirmed leaks where PRO/HQ surfaces would be visible to CE plan.
@@ -140,14 +140,14 @@ nodes:
     depends_on: [commit-and-push]
     bash: |
       set -euo pipefail
-      # Hardcoded — must match commit-and-push BRANCH literal. Parsing $commit-and-push.output
+      # Hardcoded -- must match commit-and-push BRANCH literal. Parsing $commit-and-push.output
       # via printf+sed broke because Archon shell-quote-wraps node output (dag-executor.ts L300),
       # so the trailing `'` gets concatenated to the branch name. See WO-HARNESS-OPEN-PR-BRANCH-INTERPOLATION-FIX-01.
       BRANCH="wo/ce-feature-surface-freeze-01"
-      REPO="bluedevilcollectibles/lspro-react"
+      REPO="thinmansoftware/lspro-react"
       BASE="main"
-      TITLE="feat(ce): WO-CE-FEATURE-SURFACE-FREEZE-01 — audit + freeze CE surface"
-      BODY="Implements WO-CE-FEATURE-SURFACE-FREEZE-01. Audit report at docs/CE-FEATURE-SURFACE-AUDIT.md. Tier guards added where leaks confirmed. 🤖 Generated with Claude Code"
+      TITLE="feat(ce): WO-CE-FEATURE-SURFACE-FREEZE-01 -- audit + freeze CE surface"
+      BODY="Implements WO-CE-FEATURE-SURFACE-FREEZE-01. Audit report at docs/CE-FEATURE-SURFACE-AUDIT.md. Tier guards added where leaks confirmed.  Generated with Claude Code"
       # Idempotent PR creation. See WO-HARNESS-OPEN-PR-GRAPHQL-NO-COMMITS-FIX-01.
       existing_pr_url() {
         gh pr list --repo "$REPO" --head "$BRANCH" --state open --json url --jq '.[0].url // empty' 2>/dev/null
@@ -190,8 +190,43 @@ nodes:
   - id: flip-notion
     depends_on: [build-manifest]
     task_class: clerical
-    prompt: |
-      Flip Notion WO-CE-FEATURE-SURFACE-FREEZE-01 to REVIEW.
-      Page ID: 35eef4c9-ce00-818f-8e7a-d3ec9fcfd0ee
-      Notes = $build-manifest.output. Claude Status -> REVIEW, Status -> Review.
-      If MCP unavailable: XO_TODO line.
+    bash: |
+      set -euo pipefail
+
+      capture_node_output() {
+        python3 -c 'import shlex, sys; s=sys.stdin.read(); sys.stdout.write((lambda p: p[0] if len(p)==1 else s)(shlex.split(s)) if len(s)>=2 and s[0]=="'"'"'" and s.rstrip("\n").endswith("'"'"'") else s)'
+      }
+
+      MANIFEST=$(capture_node_output <<'BDC_NODE_OUTPUT_MANIFEST'
+      $build-manifest.output
+      BDC_NODE_OUTPUT_MANIFEST
+      )
+
+      READ_SPEC_OUT=$(capture_node_output <<'BDC_NODE_OUTPUT_READ_SPEC'
+      $read-spec.output
+      BDC_NODE_OUTPUT_READ_SPEC
+      )
+      ISSUE_REPO="${ISSUE_REPO:-thinmansoftware/bdc-xo}"
+      ISSUE_NUM=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'issue=[0-9]+' | head -1 | cut -d= -f2 || true)
+      if [ -z "$ISSUE_NUM" ]; then
+        ISSUE_NUM=$(printf '%s\n' "$READ_SPEC_OUT" | sed -n 's/^SPEC_PATH=.*issues\/\([0-9][0-9]*\).*/\1/p' | head -1)
+      fi
+      if [ -z "$ISSUE_NUM" ]; then
+        WO_ID_FROM_SPEC=$(printf '%s\n' "$READ_SPEC_OUT" | sed -n 's/^WO_ID=//p' | head -1)
+        if [ -n "$WO_ID_FROM_SPEC" ]; then
+          ISSUE_NUM=$(gh issue list --repo "$ISSUE_REPO" --search "$WO_ID_FROM_SPEC in:title" --json number --jq '.[0].number // empty' 2>/dev/null || true)
+        fi
+      fi
+      if [ -z "$ISSUE_NUM" ]; then
+        echo "flip-notion: no GitHub issue resolved; skipping status:review label + manifest comment."
+        exit 0
+      fi
+
+      gh label create status:review --repo "$ISSUE_REPO" --color 0E8A16 --description "BDC workflow is ready for review" 2>/dev/null || true
+      gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --remove-label status:building 2>/dev/null || true
+      gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --remove-label status:blocked 2>/dev/null || true
+      gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --add-label status:review
+      COMMENT_FILE=$(mktemp)
+      printf '%s\n' "$MANIFEST" > "$COMMENT_FILE"
+      gh issue comment "$ISSUE_NUM" --repo "$ISSUE_REPO" --body-file "$COMMENT_FILE"
+      echo "flip-notion: $ISSUE_REPO#$ISSUE_NUM -> status:review (manifest posted as comment)"

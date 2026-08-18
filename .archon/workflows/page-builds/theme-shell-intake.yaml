@@ -1,26 +1,26 @@
 name: bdc-storefront-theme-shell-intake
 description: |
-  Use when: Building or rebuilding the BDC storefront Theme Shell (global chrome — header,
+  Use when: Building or rebuilding the BDC storefront Theme Shell (global chrome -- header,
   ticker, sidenav, page-wrapper, footer, cookie banner, toast, skeleton/empty-state) from a
   Claude Design (CD) HTML source, with Rule 10 token discipline BAKED IN AT INTAKE rather
   than retrofitted after build.
   Input:
-    - WO_ID (env or user message) — must resolve to a spec at docs/superpowers/specs/*WO_ID.md
+    - WO_ID (env or user message) -- must resolve to a spec at docs/superpowers/specs/*WO_ID.md
       in the bluedevilcollectibles/shopops-storefront repo
-    - CD_SOURCE_PATH (env, optional) — path to the V4 CD-output HTML file relative to the
+    - CD_SOURCE_PATH (env, optional) -- path to the V4 CD-output HTML file relative to the
       repo root. Defaults to design/theme-shell/v4-source/index.html if already committed,
       otherwise /tmp/cd-source.html (workflow STOPS with blocker if neither found).
   Does:
     1. Reads the WO spec.
     2. Posts started to builder-status.
-    3. Plans the implementation per spec §6 (Files to CREATE/MODIFY).
+    3. Plans the implementation per spec Section 6 (Files to CREATE/MODIFY).
     4. Ingests the CD source HTML, lands it at design/theme-shell/v4-source/index.html.
     5. Runs a Rule 10 token-discipline pass over the ingested HTML BEFORE writing any
        React component code. Replaces every raw #hex / rgba() with var(--bdc-*) per the
        WO-STOREFRONT-RULE10-CSS-CLEANUP-01 mapping table; wraps deliberate exceptions in
        /* RULE 10 EXCEPTION */ comment blocks.
     6. Builds the React chrome components, layouts, theme-shell.css globals, and Playwright
-       click-verify suite per spec §5/§6/§9.
+       click-verify suite per spec Section 5/Section 6/Section 9.
     7. Verifies build (npm run build), types (tsc --noEmit), tests (npm test),
        Rule 10 grep cleanliness across all chrome CSS, and Playwright click-verify against
        the Vercel preview.
@@ -28,13 +28,13 @@ description: |
        commits, pushes, opens PR, builds the Captain CI manifest, posts completed, and
        flips Notion to REVIEW.
   NOT for:
-    - Per-page builds (Catalog, PDP, Cart, Pull List, Statements) — use bdc-feature-development
+    - Per-page builds (Catalog, PDP, Cart, Pull List, Statements) -- use bdc-feature-development
       with the per-page WO spec
-    - Storefront marketing/landing page — separate WO + workflow
-    - Subdomain routing changes (Issue #16) — separate WO + workflow
-    - Pushing directly to master — this workflow is hard-coded to PR against `staging`
-    - Adding new tokens to tokens.css — out of scope; collapse to existing tokens or stop
-    - Reconstructing the design from prose if CD source is missing — workflow STOPS
+    - Storefront marketing/landing page -- separate WO + workflow
+    - Subdomain routing changes (Issue #16) -- separate WO + workflow
+    - Pushing directly to master -- this workflow is hard-coded to PR against `staging`
+    - Adding new tokens to tokens.css -- out of scope; collapse to existing tokens or stop
+    - Reconstructing the design from prose if CD source is missing -- workflow STOPS
 
 policyFile: harness/policies/agent-behavior.md
 model: sonnet
@@ -87,7 +87,7 @@ nodes:
       WO_ID=$(printf '%s\n' "$read-spec.output" | sed -n 's/^WO_ID=//p' | head -n 1)
       curl -sS -X POST "https://n8n.bluedevilcollectibles.com/webhook/builder-status" \
         -H "Content-Type: application/json" \
-        -d "{\"action\":\"started\",\"wo_id\":\"${WO_ID}\",\"builder\":\"Major Build\",\"detail\":\"Theme Shell V4 intake — workflow $WORKFLOW_ID\",\"timestamp\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}"
+        -d "{\"action\":\"started\",\"wo_id\":\"${WO_ID}\",\"builder\":\"Major Build\",\"detail\":\"Theme Shell V4 intake -- workflow $WORKFLOW_ID\",\"timestamp\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}"
 
   - id: plan
     depends_on: [read-spec]
@@ -98,8 +98,8 @@ nodes:
       ## Required Output (Markdown headings)
       - WO ID
       - CD source path resolution: where will design/theme-shell/v4-source/index.html come from?
-      - Files to create (full list per spec §6)
-      - Files to modify (per spec §6)
+      - Files to create (full list per spec Section 6)
+      - Files to modify (per spec Section 6)
       - Files explicitly out of scope (tokens.css, existing per-page CSS, page-level routes)
       - Rule 10 mapping plan: which raw colors expected in CD source map to which var(--bdc-*) tokens
       - Verification commands (build, tsc, playwright, grep)
@@ -107,7 +107,7 @@ nodes:
       - Push target: feature-branch:<derived-name> against base=staging
       - Staging gate required: true
 
-      ## Hard rules from spec §12 (Anti-Guess Hardening)
+      ## Hard rules from spec Section 12 (Anti-Guess Hardening)
       1. CD source HTML lands FIRST. No React code before that file is committed at
          design/theme-shell/v4-source/index.html with Rule 10 applied.
       2. NO new tokens added to tokens.css. Collapse to existing or STOP.
@@ -164,7 +164,7 @@ nodes:
 
       ## Required transformations
       For every raw #hex value in the source <style> block:
-      - Map to nearest var(--bdc-*) token per WO-STOREFRONT-RULE10-CSS-CLEANUP-01 §6 mapping table
+      - Map to nearest var(--bdc-*) token per WO-STOREFRONT-RULE10-CSS-CLEANUP-01 Section 6 mapping table
       - If no acceptable mapping exists, wrap the LINE in /* RULE 10 EXCEPTION: <reason> */
         ... /* END RULE 10 EXCEPTION */ comments. Use sparingly, only for cover-art-style
         decorative gradients.
@@ -172,7 +172,7 @@ nodes:
 
       For every raw rgba(R,G,B,A) value:
       - Replace with color-mix(in srgb, var(--TOKEN) <A*100>%, transparent) where --TOKEN is
-        the semantic match for the (R,G,B) values per the §6 mapping.
+        the semantic match for the (R,G,B) values per the Section 6 mapping.
       - rgba is FORBIDDEN even if R,G,B come from a token's hex value. Always color-mix.
 
       ## Required output
@@ -182,7 +182,7 @@ nodes:
       Also write a Rule 10 audit log to design/theme-shell/v4-source/RULE10-AUDIT.md with:
       - Original raw hex count vs final raw hex count (final = exception-wrapped count only)
       - Original raw rgba count vs final raw rgba count (must be 0)
-      - Per-replacement table (raw value → token, with line number reference)
+      - Per-replacement table (raw value -> token, with line number reference)
       - List of EXCEPTION-wrapped blocks with justifications
 
       Output <promise>COMPLETE</promise> when both files are written and the in-file grep
@@ -202,31 +202,31 @@ nodes:
         ## Plan
         $plan.output
 
-        ## CD source (already Rule 10 clean) — at design/theme-shell/v4-source/index.html
+        ## CD source (already Rule 10 clean) -- at design/theme-shell/v4-source/index.html
         Reference the source HTML for layout and styling. Translate <style> blocks into the
-        per-component CSS Modules listed in spec §5 and §6. Translate the HTML structure into
+        per-component CSS Modules listed in spec Section 5 and Section 6. Translate the HTML structure into
         the React components in app/components/chrome/.
 
         ## Execution Rules
-        - Build ONLY the files listed in spec §6 (Files to CREATE/MODIFY).
+        - Build ONLY the files listed in spec Section 6 (Files to CREATE/MODIFY).
         - Use existing repo patterns and helpers. Check the BDC-Component-Library skill for any
           chrome primitives that already exist before writing new ones.
         - Component CSS modules (*.module.css) must be Rule 10 compliant: zero raw hex outside
           EXCEPTION-wrapped blocks, zero raw rgba, all colors via var(--bdc-*).
         - app/styles/theme-shell.css must be Rule 10 compliant.
-        - Do NOT add tokens to app/styles/tokens.css (out of scope per spec §4).
+        - Do NOT add tokens to app/styles/tokens.css (out of scope per spec Section 4).
         - Do NOT modify existing per-page CSS (pull-list.css, pdp.css, wizard.css).
         - Do NOT reformat unrelated code.
         - Do NOT deploy.
 
         ## Completion Criteria
         Output <promise>COMPLETE</promise> when:
-        - All files in spec §6 exist
+        - All files in spec Section 6 exist
         - npm run build exits 0
         - tsc --noEmit exits 0
         - All chrome CSS files pass `grep -cE '#[0-9A-Fa-f]{3,8}\b'` returning 0 (excluding
           EXCEPTION-wrapped blocks) AND `grep -cE 'rgba?\('` returning 0
-        - Playwright theme-shell.spec.ts file exists with all 14 scenarios from spec §9
+        - Playwright theme-shell.spec.ts file exists with all 14 scenarios from spec Section 9
       until: COMPLETE
       max_iterations: 5
       fresh_context: true
@@ -238,7 +238,7 @@ nodes:
       if [ -f package.json ] && node -e "const p=require('./package.json'); process.exit(p.scripts && p.scripts.build ? 0 : 1)"; then
         npm run build
       else
-        echo "No npm build script found in shopops-storefront; this is unexpected — failing." >&2
+        echo "No npm build script found in shopops-storefront; this is unexpected -- failing." >&2
         exit 1
       fi
 
@@ -249,7 +249,7 @@ nodes:
       if [ -f tsconfig.json ]; then
         npx tsc --noEmit
       else
-        echo "No tsconfig.json found in shopops-storefront; this is unexpected — failing." >&2
+        echo "No tsconfig.json found in shopops-storefront; this is unexpected -- failing." >&2
         exit 1
       fi
 
@@ -363,7 +363,7 @@ nodes:
       3. All 14 Playwright scenarios pass
       4. No new tokens added to app/styles/tokens.css (verify via git diff on that file = empty)
       5. PR target will be `staging`, NOT `master`
-      6. No reformatting of unrelated code (git diff stat shows changes only in spec §6 files)
+      6. No reformatting of unrelated code (git diff stat shows changes only in spec Section 6 files)
 
       ## Required Output
       Return either:
@@ -378,7 +378,7 @@ nodes:
 
       ## Hardcoded for this workflow
       Repo is bluedevilcollectibles/shopops-storefront. Per Rule 20, this is a customer-facing
-      surface — staging gate MANDATORY. PR targets `staging`, NEVER `master`.
+      surface -- staging gate MANDATORY. PR targets `staging`, NEVER `master`.
 
       ## Required output
       push_target: feature-branch:wo-storefront-theme-shell-v4-intake
@@ -427,7 +427,7 @@ nodes:
       COMMIT_MESSAGE=$(printf '%s\n' "$plan.output" | sed -n 's/^Commit message: //p' | head -n 1)
       if [ -z "$COMMIT_MESSAGE" ]; then
         WO_ID=$(printf '%s\n' "$read-spec.output" | sed -n 's/^WO_ID=//p' | head -n 1)
-        COMMIT_MESSAGE="feat(storefront): ${WO_ID} — chrome rebuild from CD source with Rule 10 baked in"
+        COMMIT_MESSAGE="feat(storefront): ${WO_ID} -- chrome rebuild from CD source with Rule 10 baked in"
       fi
       git commit -m "$COMMIT_MESSAGE"
       git push -u origin "$BRANCH"
@@ -450,14 +450,14 @@ nodes:
         exit 1
       fi
       WO_ID=$(printf '%s\n' "$read-spec.output" | sed -n 's/^WO_ID=//p' | head -n 1)
-      TITLE="feat(storefront): ${WO_ID} — chrome rebuild from CD source with Rule 10 baked in"
+      TITLE="feat(storefront): ${WO_ID} -- chrome rebuild from CD source with Rule 10 baked in"
       BODY_FILE=$(mktemp)
       {
         echo "## Summary"
-        echo "Theme Shell V4 — rebuild storefront chrome from a fresh CD source with Rule 10 token discipline applied AT INTAKE rather than retrofitted. Implements WO-STOREFRONT-THEME-SHELL-V4-INTAKE-01."
+        echo "Theme Shell V4 -- rebuild storefront chrome from a fresh CD source with Rule 10 token discipline applied AT INTAKE rather than retrofitted. Implements WO-STOREFRONT-THEME-SHELL-V4-INTAKE-01."
         echo
         echo "## Per Rule 20"
-        echo "PR target = staging. John promotes staging → master separately after click-verify on staging.comicstoreos.com."
+        echo "PR target = staging. John promotes staging -> master separately after click-verify on staging.comicstoreos.com."
         echo
         echo "## Plan"
         echo "$plan.output"
@@ -490,7 +490,7 @@ nodes:
     task_class: clerical
     prompt: |
       Construct the Captain CI completion manifest for this Theme Shell intake WO.
-      Match the manifest contract in spec §11 EXACTLY (line-by-line shape).
+      Match the manifest contract in spec Section 11 EXACTLY (line-by-line shape).
 
       ## Inputs
       Spec:
@@ -518,7 +518,7 @@ nodes:
       Validator:
       $war-council-validator.output
 
-      ## Required Manifest Fields (per spec §11)
+      ## Required Manifest Fields (per spec Section 11)
       - WO ID
       - Files created (full list)
       - Files modified
@@ -553,7 +553,7 @@ nodes:
       - Claude Status: REVIEW
       - Status: Review
       - Notes field: paste the manifest from $build-manifest.output verbatim (Captain CI reads
-        the Notes field, NOT page comments — see feedback_captain-ci-reads-notes-field-not-comments.md)
+        the Notes field, NOT page comments -- see feedback_captain-ci-reads-notes-field-not-comments.md)
 
       ## Manifest
       $build-manifest.output

@@ -1,0 +1,614 @@
+# Drafted by yaml-author subagent for WO-SHOPOPS-COVER-RECOGNIZE-GEMINI-M1-01 on 2026-05-31
+# Source pattern: wo-shopops-billing-statement-v2-01.yaml (shopops-api CODE WO + Rule 19 docker exec)
+#   which itself adapts bdc-template-shopops-api.yaml.
+# Gold standard cross-checked: bdc-ce-regression-suite.yaml (2026-05-12 proven end-to-end).
+# Doctrine compliance: 13 hard rules of archon-yaml-authoring verified at draft time.
+#
+# Rule compliance checklist (verify before sync):
+#  [x] Rule 1:  model: sonnet at workflow root; per-node model: opus on implement loop (live security fix -- capable builder, NOT haiku)
+#  [x] Rule 2:  bash blocks use $WORKFLOW_ID (not ${run.id}); branch suffix uses date +%Y%m%d%H%M%S
+#  [x] Rule 3:  implement loop has fresh_context: true
+#  [x] Rule 4:  all paths relative to repo root (no BDC_XO/ prefix). Repo root contains shopops-api/ subdir.
+#  [x] Rule 5:  spec lookup tries docs/work-orders/ then docs/superpowers/specs/ direct, date-prefix glob, GitHub issue search
+#  [x] Rule 6:  policyFile: harness/policies/agent-behavior.md (no prefix)
+#  [x] Rule 7:  flip-notion final node present; manifest goes in Notes property, not comment; flips to REVIEW (NEVER DONE)
+#  [x] Rule 8:  codebase thinmansoftware/shopops MUST be registered -- verify in Pre-flight below
+#  [x] Rule 9:  YAML must land in bdc-harness/.archon/workflows/defaults/ (flat or one subdir)
+#  [x] Rule 10: implement loop declares ALL FOUR siblings: prompt, until, max_iterations, fresh_context
+#  [x] Rule 11: NO n8n webhook calls (no post-started / post-completed nodes)
+#  [x] Rule 12: sync via sync-workflows.sh (see Deploy comment below)
+#  [x] Rule 13: no LLM-to-bash gate -- all gates are bash grep on disk, not LLM output
+#  [x] Rule 19: shopops-api docker exec grep assertions in build-manifest and flip-notion
+#
+# Pre-flight (operator verifies BEFORE firing):
+#   1. Codebase registered:
+#      ssh hetzner-prod "sqlite3 /opt/bdc/archon-data/archon.db \"SELECT name FROM remote_agent_codebases;\""
+#      Expected: thinmansoftware/shopops appears in output. Default branch: master.
+#   2. WO spec exists on bdc-xo main:
+#      gh api "repos/thinmansoftware/bdc-xo/contents/docs/work-orders/WO-SHOPOPS-COVER-RECOGNIZE-GEMINI-M1-01.md?ref=main" --jq .name
+#      Expected: "WO-SHOPOPS-COVER-RECOGNIZE-GEMINI-M1-01.md" (commit + push the spec to bdc-xo main BEFORE firing).
+#   3. GITHUB_TOKEN in Archon executor has push scope to thinmansoftware/shopops.
+#   4. GEMINI_API_KEY MUST be present in the shopops-api container env BEFORE the runtime grep can pass.
+#      The build does NOT provision it; operator sets it on Hetzner (docker compose env / .env) before deploy.
+#   5. NOTION_PAGE_ID placeholder below is 371ef4c9-ce00-8112-a7cd-d9155f155d2f. Substitute the real
+#      page ID into the flip-notion node AFTER creating the Notion WO row, before firing.
+#   6. Rule 19 reminder: after John promotes the staged PR to master, operator MUST rebuild + restart shopops-api:
+#      ssh hetzner-prod "cd /opt/bdc/shopops && docker compose build shopops-api && docker compose up -d shopops-api"
+#      Then run the docker exec grep assertions from the manifest to prove source is live.
+#   7. Deploy-time (operator, per spec Section 10/12): set EDGE_DA COVER_RECOGNITION_URL to the live
+#      /covers/recognize URL (currently empty), or document an N/A reason in the manifest.
+#
+# Deploy:
+#   bash BDC_XO/scripts/archon-bridge/sync-workflows.sh wo-shopops-cover-recognize-gemini-m1-01.yaml
+#   After sync, verify: curl -s https://archon.bluedevilcollectibles.com/api/workflows | python -c \
+#     "import sys,json; print([w['workflow']['name'] for w in json.load(sys.stdin)['workflows']])"
+#   Expected: 'bdc-shopops-cover-recognize-gemini-m1-01' in output.
+#
+# REVIEW BEFORE DEPLOY -- human verifies: grep assertions match actual file paths, the Gemini
+# integration approach (geminiClient.identifyCover) matches General's architecture verdict, test
+# command matches shopops-api runner (cd shopops-api && node tests/run_all.js), and the real
+# Notion page ID has been substituted for the <TBD> placeholder.
+
+name: bdc-shopops-cover-recognize-gemini-m1-01
+description: |
+  Use when: Executing WO-SHOPOPS-COVER-RECOGNIZE-GEMINI-M1-01 -- Cover-recognition Gemini swap
+    + cross-tenant inventory leak fix (M1).
+  Input: WO_ID = WO-SHOPOPS-COVER-RECOGNIZE-GEMINI-M1-01.
+  Does:
+    - Reads spec from bdc-xo docs/work-orders/.
+    - Creates shopops-api/services/geminiClient.js (identifyCover -- Gemini 2.5 Flash structured
+      extraction returning real model-derived confidence, NOT a hardcoded constant).
+    - Edits shopops-api/services/coverRecognition.js: swap ollamaClient.callOllamaVision for
+      geminiClient.identifyCover in the recognize path; thread opts.tenantId into the candidate
+      build; ADD "AND tenant_id = $N" to BOTH inventory_items queries (UPC + ILIKE) -- closes the
+      live cross-tenant leak. Do NOT delete ollamaClient (still used by slab-OCR / text path).
+    - Edits shopops-api/routes/covers-metadata.js: thread getTenantId(req) into recognizeCover opts
+      (interface + response envelope UNCHANGED).
+    - Edits shopops-api/services/externalCoverSearch.js: widen the UPC guard from "<= 13" to "<= 18"
+      so 17-18-digit comic UPCs route to the structured strategy.
+    - Writes tests asserting real behavior (tenant isolation, real confidence, UPC guard, envelope).
+    - Runs: cd shopops-api && node tests/run_all.js (all tests pass).
+    - Commits, pushes feature branch, opens PR to master (staging-gate repo).
+    - Provides Rule 19 docker exec grep evidence in manifest.
+    - Flips Notion WO-SHOPOPS-COVER-RECOGNIZE-GEMINI-M1-01 to REVIEW with manifest in Notes.
+      NEVER DONE -- the Cauldron grader / Captain CI closes both fields after a VALIDATED verdict.
+  Repo: thinmansoftware/shopops (master branch -- Rule 20 staging-gate repo).
+  WO class: CODE (single-repo, single Cauldron fire -- NOT a battlegroup). NO migration.
+  Security: LIVE cross-tenant inventory leak fix in prod -- capable builder + verify/review DAG.
+  parallel_ok: true ONLY while no other active WO touches coverRecognition.js / externalCoverSearch.js.
+  NOT for: any other WO. Out of scope: aiCoverPick / /covers/ai-pick; ollamaClient text/OCR path.
+
+policyFile: harness/policies/agent-behavior.md
+model: sonnet
+
+inputs:
+  WO_ID:
+    default: "WO-SHOPOPS-COVER-RECOGNIZE-GEMINI-M1-01"
+
+nodes:
+
+  # --- Node 1: Preflight GitHub auth ------------------------------------------
+  # Fail-closed if the container cannot push (anchor: 2026-05-16 WO-169 -- silent push
+  # failure with downstream swallow hid it; workflow reported success with no commits).
+  - id: preflight-github-auth
+    load_bearing: true
+    bash: |
+      set -euo pipefail
+      if ! git push --dry-run origin "HEAD:refs/heads/preflight-auth-probe-$(date +%s)" 2>&1; then
+        echo "ERROR: GITHUB auth check failed -- container cannot push to thinmansoftware/shopops." >&2
+        echo "Check: GITHUB_TOKEN in executor env has repo push scope." >&2
+        exit 1
+      fi
+      echo "preflight-github-auth PASS"
+      echo "TARGET_REPO=thinmansoftware/shopops"
+      echo "TARGET_BRANCH=master"
+
+  # --- Node 2: Read spec (cross-repo via gh api from bdc-xo) ------------------
+  # Rule 4: paths relative to bdc-xo repo root (no BDC_XO/ prefix).
+  # Rule 5: try docs/work-orders/ first, then date-prefix glob, then GitHub issue fallback.
+  # Spec lives in bdc-xo, NOT in the shopops worktree.
+  - id: read-spec
+    depends_on: [preflight-github-auth]
+    bash: |
+      set -euo pipefail
+      WO_ID="${WO_ID:-WO-SHOPOPS-COVER-RECOGNIZE-GEMINI-M1-01}"
+
+      # Primary: docs/work-orders/<WO_ID>.md on bdc-xo main
+      SPEC_CONTENT=$(gh api \
+        "repos/thinmansoftware/bdc-xo/contents/docs/work-orders/${WO_ID}.md?ref=main" \
+        --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
+      SPEC_PATH="docs/work-orders/${WO_ID}.md"
+
+      # Fallback 1: docs/superpowers/specs/<WO_ID>.md direct
+      if [ -z "$SPEC_CONTENT" ]; then
+        SPEC_PATH="docs/superpowers/specs/${WO_ID}.md"
+        SPEC_CONTENT=$(gh api \
+          "repos/thinmansoftware/bdc-xo/contents/${SPEC_PATH}?ref=main" \
+          --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
+      fi
+
+      # Fallback 2: date-prefix glob in docs/superpowers/specs/
+      if [ -z "$SPEC_CONTENT" ]; then
+        GLOB_PATH=$(gh api \
+          "repos/thinmansoftware/bdc-xo/contents/docs/superpowers/specs?ref=main" \
+          --template '{{range .}}{{.path}}{{"\n"}}{{end}}' 2>/dev/null \
+          | grep "${WO_ID}.md$" | head -1 || true)
+        if [ -n "$GLOB_PATH" ]; then
+          SPEC_PATH="$GLOB_PATH"
+          SPEC_CONTENT=$(gh api \
+            "repos/thinmansoftware/bdc-xo/contents/${SPEC_PATH}?ref=main" \
+            --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
+        fi
+      fi
+
+      # Fallback 3: GitHub issue search (WO-HARNESS-READ-SPEC-ISSUE-BODY-FALLBACK-01)
+      if [ -z "$SPEC_CONTENT" ]; then
+        ISSUE_NUM=$(gh issue list --repo thinmansoftware/bdc-xo \
+          --search "${WO_ID} in:title" --json number,title \
+          --jq '.[0].number' 2>/dev/null || true)
+        if [ -n "$ISSUE_NUM" ] && [ "$ISSUE_NUM" != "null" ]; then
+          SPEC_CONTENT=$(gh issue view "$ISSUE_NUM" --repo thinmansoftware/bdc-xo \
+            --json body --jq .body 2>/dev/null || true)
+          [ -n "$SPEC_CONTENT" ] && SPEC_PATH="issues/${ISSUE_NUM}"
+        fi
+      fi
+
+      if [ -z "$SPEC_CONTENT" ]; then
+        echo "Spec not found for ${WO_ID} (tried docs/work-orders/, docs/superpowers/specs/ direct, date-prefix glob, GitHub issue search)" >&2
+        exit 1
+      fi
+
+      printf 'WO_ID=%s\nSPEC_PATH=bdc-xo:%s\nWORKFLOW_ID=%s\n\n' "$WO_ID" "$SPEC_PATH" "$WORKFLOW_ID"
+      printf -- '--- SPEC ---\n%s\n' "$SPEC_CONTENT"
+
+  # --- Node 3: Fresh branch from master ---------------------------------------
+  # shopops default branch is master. Rule 20 staging-gate: PR targets master after staging review.
+  # Rule 2: branch suffix uses runtime date, NOT $WORKFLOW_ID (substitution-time literal).
+  - id: fresh-branch
+    depends_on: [read-spec]
+    bash: |
+      set -euo pipefail
+      git fetch origin master --depth=50 || true
+      git checkout master 2>/dev/null || echo "master branch held by worktree; staying on current HEAD"
+      git reset --hard origin/master 2>/dev/null || true
+      BRANCH="wo/shopops-cover-recognize-gemini-m1-01-run-$(date +%Y%m%d%H%M%S)"
+      git checkout -b "$BRANCH"
+      echo "BRANCH=${BRANCH}"
+      echo "BASE=master"
+      echo "REPO=thinmansoftware/shopops"
+
+  # --- Node 4: Implement (self-review loop) -----------------------------------
+  # Rule 3: fresh_context: true (required for self-review loops).
+  # Rule 10: ALL FOUR siblings declared: prompt, until, max_iterations, fresh_context.
+  # model: opus per-node override -- this is a LIVE cross-tenant security fix; do NOT run on haiku.
+  # Rule 19: builder MUST note RULE19_FILE + RULE19_GREP in output for runtime-verify node.
+  # CRITICAL: do NOT delete ollamaClient.js (still used by slab-OCR + text path).
+  #           Only remove the callOllamaVision call from the recognize path.
+  - id: implement
+    depends_on: [fresh-branch]
+    model: opus
+    loop:
+      fresh_context: true
+      until: COMPLETE
+      max_iterations: 6
+      prompt: |
+        Implement WO-SHOPOPS-COVER-RECOGNIZE-GEMINI-M1-01 in the shopops repo.
+        CWD = shopops repo root. The Node service lives under the shopops-api/ subdirectory.
+        ES5 Express/CommonJS style throughout (var, function, 'use strict', require/module.exports)
+        to match the existing files. No new npm packages without XO sign-off; prefer the native
+        fetch / https already available to call Gemini.
+
+        This is a LIVE SECURITY FIX: a cross-tenant inventory leak is currently in production.
+        Be surgical. Do NOT reformat unrelated code. Do NOT touch the slab-OCR / text path.
+
+        ## Spec
+        $read-spec.output
+
+        ## Branch
+        $fresh-branch.output
+
+        ## Anti-guess (Rule 5 / Rule 17): verify before editing
+        The WO line numbers are from the architect read 2026-05-31. Open each file and confirm the
+        current shape against HEAD before editing. The codebase is ground truth, not the spec.
+        Confirm columns exist before writing SQL:
+          SELECT column_name FROM information_schema.columns WHERE table_name = 'inventory_items';
+          (expect at least: id, tenant_id, upc, title, cover_image_url)
+        Only add variant logic from cover_images.upc_short / parent_code IF those columns exist;
+        if absent, do NOT add variant logic in this WO.
+
+        ## What to build (in order)
+
+        ### STEP 1 -- shopops-api/services/geminiClient.js (CREATE NEW FILE)
+        Export async identifyCover(image, opts) that calls Gemini 2.5 Flash with structured output
+        and returns { series, issue, publisher, year, variant, confidence } where confidence is the
+        REAL model-derived value (NOT a hardcoded constant like 0.8 -- aiCoverPick.js returns a
+        constant 0.8 but that is a SEPARATE path, out of scope here).
+        - Read the key from process.env.GEMINI_API_KEY. Fail-closed if missing: do NOT hardcode a
+          fallback string; return a graceful error object the caller can detect.
+        - On Gemini unreachable / error: return an object the caller maps to { ok:false, ... } so
+          recognizeCover never crashes (preserve current non-crash behavior).
+
+        ### STEP 2 -- shopops-api/services/coverRecognition.js (EDIT)
+        1. require the new geminiClient at the top alongside the existing requires.
+        2. In recognizeCover(): replace the ollamaClient.callOllamaVision(...) vision step (currently
+           around line 99) with a geminiClient.identifyCover(opts.image, ...) call. Map its result
+           into the same metadata shape the rest of the function expects. Set provider:'gemini' on
+           the success envelope (was 'ollama').
+        3. callOllamaVision MUST NOT appear anywhere in the recognize path after this change
+           (grep -c "callOllamaVision" coverRecognition.js -> 0). Do NOT delete ollamaClient.js
+           itself -- it is still required by the slab-OCR / text path elsewhere.
+        4. TENANT ISOLATION (the live leak): collectCandidates currently has signature
+           collectCandidates(pool, metadata) and runs two inventory_items queries with NO tenant
+           filter (the UPC query ~line 134-135 and the title ILIKE query ~line 152-153).
+           - Thread tenantId through: change the signature to collectCandidates(pool, metadata, tenantId)
+             (or pass an opts object), and pass opts.tenantId from recognizeCover.
+           - Add "AND tenant_id = $N" to BOTH queries, binding the tenantId parameter. After the edit:
+             grep -nE "tenant_id\s*=\s*\$" coverRecognition.js -> at least 2 matches (UPC + ILIKE).
+           - If tenantId is absent/null, the queries MUST NOT return cross-tenant rows. Choose a
+             fail-closed behavior (e.g. skip the inventory lookups and fall through to external
+             search) rather than leaking. Document the choice in a code comment.
+
+        ### STEP 3 -- shopops-api/routes/covers-metadata.js (EDIT)
+        The POST /covers/recognize handler (around line 129-144) already computes tenantId via
+        getTenantId(req) (~line 131). Thread that tenantId into the recognizeCover(...) opts object.
+        The route signature and the response envelope { ok, provider, metadata, candidates[] } MUST
+        stay UNCHANGED (EDGE_DA depends on COVER_RECOGNITION_URL returning this exact shape).
+
+        ### STEP 4 -- shopops-api/services/externalCoverSearch.js (EDIT)
+        The UPC guard (around line 92) currently reads:
+          var hasUpc = upc.length >= 12 && upc.length <= 13 && /^[0-9]+$/.test(upc);
+        Widen the upper bound to 18 so 17-18-digit comic UPCs route to the structured strategy:
+          ...upc.length <= 18...
+        After the edit: grep -n "length <= 18" externalCoverSearch.js -> at least 1 match.
+        If a sibling hasSkuAsUpc guard on the next line uses the same <= 13 bound and the spec's
+        Mode matrix needs SKU-as-UPC handled too, widen it consistently; otherwise leave it and note
+        the decision in a comment.
+
+        ## Invariants from spec (MUST enforce)
+        - Response envelope unchanged: { ok, provider, metadata, candidates[] }.
+        - Low confidence: return ranked candidates with real confidence; NEVER auto-accept.
+        - Stateless, idempotent: no DB writes in this path.
+        - aiCoverPick / /covers/ai-pick untouched. ollamaClient.js NOT deleted.
+        - No new routes in server.js (Rule 13 of Three Rules). This WO adds no routes anyway.
+
+        ## Tests (assert REAL behavior -- not "did not throw") -- minimum 8 tests
+        Write/extend a test file under shopops-api/tests/ (e.g. tests/cover-recognition.test.js)
+        and ensure it is picked up by tests/run_all.js. Cover the spec Section 11 scenarios:
+          1. Success / real confidence: a labeled known cover -> candidates[0] matches expected
+             series+issue AND confidence is model-derived (assert it is NOT the constant 0.8).
+          2. Tenant isolation: tenant A has UPC X in inventory_items; a request authenticated as
+             tenant B asks to recognize UPC X -> response does NOT include tenant A inventory rows.
+             Assert against a seeded two-tenant fixture (mock pool.query is acceptable for the unit
+             layer; assert the SQL passed includes the tenant filter + the bound tenantId).
+          3. Tenant isolation (ILIKE path): same as #2 but via the title ILIKE query.
+          4. Missing tenantId -> fail-closed (no inventory rows leaked).
+          5. Edge / add-on UPC: a 17-digit comic UPC -> externalCoverSearch routes via the
+             structured (series+issue) strategy, not the generic fallback (assert guard accepts 17).
+          6. Contract: response shape is exactly { ok, provider, metadata, candidates[] }.
+          7. Gemini unreachable -> { ok:false, ... } with no thrown exception (graceful).
+          8. provider is 'gemini' on the success envelope (not 'ollama').
+        Use the existing fixture path (opts.fixture === true) where helpful, but the tenant-isolation
+        and provider assertions MUST exercise the real recognize path with a mocked pool/gemini.
+        Run: cd shopops-api && node tests/run_all.js -- all tests must pass before emitting COMPLETE.
+
+        ## Commit (inside this loop, before emitting COMPLETE)
+        git -c user.name="John Ranson" -c user.email="admin@bluedevilcollectibles.com" \
+          commit -m "feat(shopops-api): WO-SHOPOPS-COVER-RECOGNIZE-GEMINI-M1-01 -- Gemini cover recognition + cross-tenant leak fix
+
+        - services/geminiClient.js: NEW identifyCover (Gemini 2.5 Flash structured output, real confidence)
+        - services/coverRecognition.js: swap callOllamaVision for geminiClient.identifyCover in the
+          recognize path; thread tenantId; add AND tenant_id = \$N to both inventory_items queries
+          (closes live cross-tenant inventory leak); provider now 'gemini'
+        - routes/covers-metadata.js: thread getTenantId(req) into recognizeCover opts (envelope unchanged)
+        - services/externalCoverSearch.js: widen UPC guard to length <= 18 for comic add-on UPCs
+        - tests/cover-recognition.test.js: tenant isolation, real confidence, UPC guard, envelope
+
+        Co-Authored-By: Claude Opus (Cauldron bdc-shopops-cover-recognize-gemini-m1-01) <noreply@anthropic.com>"
+        git push -u origin "$(git rev-parse --abbrev-ref HEAD)" 2>&1 || echo "WARN: push failed; commit-and-push backstop will retry"
+
+        ## Required output at completion
+        Before emitting COMPLETE, output ALL of:
+        RULE19_FILE=services/coverRecognition.js
+        RULE19_GREP=geminiClient
+
+        Then emit completion sentinels, each on its own line:
+        COMPLETE
+        BUILD_COMPLETE
+        <promise>COMPLETE</promise>
+
+  # --- Node 5: Grep assertions (bash-executable, mirrors WO Section 12) --------
+  # Every check below is the exact bash form of a WO Section 12 stop condition.
+  # Paths are relative to repo root; the Node service lives under shopops-api/.
+  - id: verify-grep
+    depends_on: [implement]
+    bash: |
+      set -euo pipefail
+      echo "=== WO-SHOPOPS-COVER-RECOGNIZE-GEMINI-M1-01 grep assertions (Section 12) ==="
+      CR="shopops-api/services/coverRecognition.js"
+      ECS="shopops-api/services/externalCoverSearch.js"
+
+      # (a) geminiClient present in coverRecognition.js  -> >= 1
+      GEMINI_COUNT=$(grep -c "geminiClient" "$CR")
+      [ "$GEMINI_COUNT" -ge 1 ] || (echo "FAIL: geminiClient not found in $CR" >&2; exit 1)
+      echo "geminiClient in coverRecognition.js: $GEMINI_COUNT (>= 1 required) PASS"
+
+      # (b) callOllamaVision count == 0 in the recognize path  -> 0
+      OLLAMA_COUNT=$(grep -c "callOllamaVision" "$CR" || true)
+      [ "$OLLAMA_COUNT" -eq 0 ] || (echo "FAIL: callOllamaVision still present in $CR (count=$OLLAMA_COUNT; must be 0)" >&2; exit 1)
+      echo "callOllamaVision in coverRecognition.js: $OLLAMA_COUNT (== 0 required) PASS"
+
+      # (c) tenant_id filters added in coverRecognition.js  -> >= 2 (UPC + ILIKE queries)
+      TENANT_COUNT=$(grep -cE "tenant_id[[:space:]]*=[[:space:]]*\\\$" "$CR" || true)
+      [ "$TENANT_COUNT" -ge 2 ] || (echo "FAIL: fewer than 2 tenant_id = \$N filters in $CR (count=$TENANT_COUNT; UPC + ILIKE both required)" >&2; exit 1)
+      echo "tenant_id = \$N filters in coverRecognition.js: $TENANT_COUNT (>= 2 required) PASS"
+
+      # (d) externalCoverSearch.js UPC guard widened to <= 18  -> >= 1
+      GUARD_COUNT=$(grep -c "length <= 18" "$ECS" || true)
+      [ "$GUARD_COUNT" -ge 1 ] || (echo "FAIL: UPC guard 'length <= 18' not found in $ECS" >&2; exit 1)
+      echo "length <= 18 in externalCoverSearch.js: $GUARD_COUNT (>= 1 required) PASS"
+
+      # Defensive: ollamaClient.js must NOT have been deleted (slab-OCR / text path still needs it)
+      [ -f "shopops-api/services/ollamaClient.js" ] || (echo "FAIL: shopops-api/services/ollamaClient.js was deleted (slab-OCR / text path depends on it)" >&2; exit 1)
+      echo "ollamaClient.js still present: PASS"
+
+      # Defensive: provider 'gemini' set on the success envelope
+      PROVIDER_COUNT=$(grep -c "'gemini'\|\"gemini\"" "$CR" || true)
+      [ "$PROVIDER_COUNT" -ge 1 ] || (echo "FAIL: provider 'gemini' not set in $CR" >&2; exit 1)
+      echo "provider 'gemini' in coverRecognition.js: $PROVIDER_COUNT (>= 1 required) PASS"
+
+      echo ""
+      echo "=== All grep assertions PASS ==="
+
+  # --- Node 6: Run tests ------------------------------------------------------
+  # shopops-api test runner runs from the shopops-api subdirectory.
+  - id: verify-tests
+    depends_on: [implement]
+    bash: |
+      set -euo pipefail
+      if [ -f shopops-api/tests/cover-recognition.test.js ]; then
+        TEST_COUNT=$(grep -cE "(^|[^a-zA-Z])(it|test)\(|assert\.|expect\(" shopops-api/tests/cover-recognition.test.js || true)
+        echo "Cover-recognition test file present. Detected ~$TEST_COUNT test/assert lines."
+        [ "$TEST_COUNT" -ge 8 ] || echo "WARN: fewer than 8 tests/asserts detected in cover-recognition.test.js; check spec Section 11"
+      else
+        echo "WARN: shopops-api/tests/cover-recognition.test.js not found; implement loop may have used a different filename. run_all.js is authoritative."
+      fi
+      cd shopops-api
+      node tests/run_all.js
+      echo "cd shopops-api && node tests/run_all.js PASS"
+
+  # --- Node 7: Backstop commit-and-push ---------------------------------------
+  # Idempotent -- if the implement loop already committed + pushed, this is a no-op.
+  # No swallow patterns on push (load_bearing intent).
+  - id: commit-and-push
+    depends_on: [verify-grep, verify-tests]
+    load_bearing: true
+    bash: |
+      set -euo pipefail
+      BRANCH="$(git rev-parse --abbrev-ref HEAD)"
+      git add -A
+      if git diff --cached --quiet; then
+        echo "No staged changes; implement loop already committed."
+        COMMITS_AHEAD=$(git rev-list --count "origin/${BRANCH}..HEAD" 2>/dev/null || echo 0)
+        if [ "$COMMITS_AHEAD" = "0" ]; then
+          echo "HEAD matches origin/${BRANCH} -- backstop no-op."
+        else
+          echo "Backstop: $COMMITS_AHEAD commit(s) ahead of origin -- pushing."
+        fi
+      else
+        git -c user.name="John Ranson" -c user.email="admin@bluedevilcollectibles.com" \
+          commit -m "chore: backstop commit WO-SHOPOPS-COVER-RECOGNIZE-GEMINI-M1-01"
+      fi
+      PUSH_OK=false
+      for attempt in 1 2 3; do
+        if git push -u origin "$BRANCH" 2>&1; then
+          PUSH_OK=true
+          break
+        fi
+        echo "WARN: push attempt $attempt failed; retrying after $((attempt * 5))s..." >&2
+        sleep $((attempt * 5))
+      done
+      if [ "$PUSH_OK" = "false" ]; then
+        echo "ERROR: git push failed after 3 attempts." >&2
+        exit 1
+      fi
+      echo "BRANCH=${BRANCH}"
+      echo "SHA=$(git rev-parse HEAD)"
+
+  # --- Node 8: Open PR --------------------------------------------------------
+  # PR base = master (shopops default branch). Idempotent: checks for existing PR first.
+  - id: open-pr
+    depends_on: [commit-and-push]
+    bash: |
+      set -euo pipefail
+      WO_ID="WO-SHOPOPS-COVER-RECOGNIZE-GEMINI-M1-01"
+      REPO="thinmansoftware/shopops"
+      BRANCH="$(git rev-parse --abbrev-ref HEAD)"
+      BASE="master"
+      TITLE="feat(shopops-api): WO-SHOPOPS-COVER-RECOGNIZE-GEMINI-M1-01 -- Gemini cover recognition + cross-tenant leak fix"
+
+      EXIST=$(gh pr list --repo "$REPO" --head "$BRANCH" --state open \
+        --json url --jq '.[0].url // empty' 2>/dev/null || true)
+      if [ -n "$EXIST" ]; then
+        echo "PR_URL=$EXIST"
+        exit 0
+      fi
+
+      BODY_FILE=$(mktemp)
+      {
+        echo "## Summary"
+        echo ""
+        echo "Implements **WO-SHOPOPS-COVER-RECOGNIZE-GEMINI-M1-01** -- replaces the cover-recognition"
+        echo "vision path with Gemini 2.5 Flash (real model-derived confidence) and closes a LIVE"
+        echo "cross-tenant inventory leak in the candidate-build queries. M1 of the cover-cascade plan,"
+        echo "Track B -- the shared identify service EDGE_DA / companion app / Scout / claim-show consume."
+        echo ""
+        echo "## Files created"
+        echo "- \`shopops-api/services/geminiClient.js\` -- identifyCover (Gemini 2.5 Flash structured output)."
+        echo "- \`shopops-api/tests/cover-recognition.test.js\` -- tenant isolation, real confidence, UPC guard, envelope."
+        echo ""
+        echo "## Files modified"
+        echo "- \`shopops-api/services/coverRecognition.js\` -- swap callOllamaVision for geminiClient.identifyCover"
+        echo "  in the recognize path; thread tenantId; add \`AND tenant_id = \$N\` to both inventory_items"
+        echo "  queries (closes cross-tenant leak); provider now 'gemini'. ollamaClient.js NOT deleted."
+        echo "- \`shopops-api/routes/covers-metadata.js\` -- thread getTenantId(req) into recognizeCover opts"
+        echo "  (route signature + response envelope unchanged)."
+        echo "- \`shopops-api/services/externalCoverSearch.js\` -- widen UPC guard to \`length <= 18\`."
+        echo ""
+        echo "## Security"
+        echo "Cross-tenant inventory leak: the UPC and ILIKE queries in collectCandidates queried"
+        echo "inventory_items with NO tenant_id filter (live in prod). Both now filter by the"
+        echo "authenticated tenantId threaded from getTenantId(req); missing tenantId fails closed."
+        echo ""
+        echo "## Rule 19 -- Runtime verification required after merge"
+        echo "shopops-api uses COPY . /app at image build time. After merging + rebuilding, verify:"
+        echo ""
+        echo "\`\`\`"
+        echo "docker exec shopops-api grep -n 'geminiClient' /app/services/coverRecognition.js"
+        echo "docker exec shopops-api grep -nE 'tenant_id *= *\$' /app/services/coverRecognition.js"
+        echo "docker exec shopops-api grep -n 'length <= 18' /app/services/externalCoverSearch.js"
+        echo "docker exec shopops-api printenv GEMINI_API_KEY"
+        echo "\`\`\`"
+        echo ""
+        echo "geminiClient + UPC guard greps must return >= 1; tenant_id grep must return >= 2;"
+        echo "GEMINI_API_KEY must be non-empty. If any fails, rebuild + restart the container and"
+        echo "confirm GEMINI_API_KEY is set in the container env."
+        echo ""
+        echo "## Deploy-time operator step"
+        echo "Set EDGE_DA COVER_RECOGNITION_URL to the live /covers/recognize URL (currently empty),"
+        echo "or document an N/A reason."
+        echo ""
+        echo "## Spec"
+        echo "bdc-xo: \`docs/work-orders/WO-SHOPOPS-COVER-RECOGNIZE-GEMINI-M1-01.md\`"
+        echo ""
+        echo "Generated by Archon workflow \`bdc-shopops-cover-recognize-gemini-m1-01\`."
+      } > "$BODY_FILE"
+
+      for attempt in 1 2 3 4 5; do
+        if PR_OUT=$(gh pr create --repo "$REPO" --base "$BASE" --head "$BRANCH" \
+            --title "$TITLE" --body-file "$BODY_FILE" 2>&1); then
+          echo "PR_URL=$PR_OUT"
+          exit 0
+        fi
+        EXIST=$(gh pr list --repo "$REPO" --head "$BRANCH" --state open \
+          --json url --jq '.[0].url // empty' 2>/dev/null || true)
+        if [ -n "$EXIST" ]; then
+          echo "PR_URL=$EXIST"
+          exit 0
+        fi
+        echo "open-pr attempt $attempt failed: $PR_OUT" >&2
+        sleep $((attempt * 5))
+      done
+      echo "ERROR: gh pr create failed after 5 attempts -- branch pushed at $BRANCH but no PR opened." >&2
+      exit 1
+
+  # --- Node 9: Build manifest (Captain CI v2 format) --------------------------
+  # Rule 19: manifest MUST include docker exec grep evidence.
+  # Rule 7: manifest goes in Notes property, not as a page comment.
+  - id: build-manifest
+    depends_on: [open-pr]
+    task_class: clerical
+    prompt: |
+      Build the Captain CI completion manifest v2 for WO-SHOPOPS-COVER-RECOGNIZE-GEMINI-M1-01.
+      The manifest MUST be in exact v2 format -- Captain CI parses these labels literally.
+      ASCII only -- use "--" not an em-dash and "->" not an arrow.
+
+      ## Required manifest fields (fill ALL from the node outputs below)
+
+      WO: WO-SHOPOPS-COVER-RECOGNIZE-GEMINI-M1-01
+      Builder: Devils Cauldron (Archon bdc-shopops-cover-recognize-gemini-m1-01)
+
+      Files created:
+       - shopops/shopops-api/services/geminiClient.js
+       - shopops/shopops-api/tests/cover-recognition.test.js
+
+      Files modified:
+       - shopops/shopops-api/services/coverRecognition.js (geminiClient swap; tenantId threaded; AND tenant_id = $N on both inventory_items queries; provider 'gemini')
+       - shopops/shopops-api/routes/covers-metadata.js (getTenantId threaded into recognizeCover opts; envelope unchanged)
+       - shopops/shopops-api/services/externalCoverSearch.js (UPC guard widened to length <= 18)
+
+      Tests: [fill from verify-tests.output -- format: N/N (cd shopops-api && node tests/run_all.js)]
+
+      PRs: [fill from open-pr.output -- format: repo/PR URL (merged: timestamp, commit: sha)]
+
+      Merge ancestors:
+       - shopops master HEAD: [fill from commit-and-push.output SHA] | manifest commit: [same] | behind_by: 0
+
+      Grep assertions (Section 12 -- all bash-executable, rerunnable; paths relative to repo root):
+       - shopops: grep -c "geminiClient" shopops-api/services/coverRecognition.js && [ $(grep -c "geminiClient" shopops-api/services/coverRecognition.js) -ge 1 ]
+       - shopops: grep -c "callOllamaVision" shopops-api/services/coverRecognition.js; [ $(grep -c "callOllamaVision" shopops-api/services/coverRecognition.js 2>/dev/null || echo 0) -eq 0 ]
+       - shopops: grep -cE "tenant_id *= *\$" shopops-api/services/coverRecognition.js && [ $(grep -cE "tenant_id *= *\$" shopops-api/services/coverRecognition.js) -ge 2 ]
+       - shopops: grep -c "length <= 18" shopops-api/services/externalCoverSearch.js && [ $(grep -c "length <= 18" shopops-api/services/externalCoverSearch.js) -ge 1 ]
+
+      Runtime verification (Rule 19 -- shopops-api uses COPY . /app, rebuild required after merge):
+       PENDING -- operator must rebuild + restart shopops-api container after John promotes the staged PR to master.
+       After rebuild, run:
+         docker exec shopops-api grep -n "geminiClient" /app/services/coverRecognition.js
+           -> Expected: >= 1 line (geminiClient present in the running container)
+         docker exec shopops-api grep -nE "tenant_id *= *\$" /app/services/coverRecognition.js
+           -> Expected: >= 2 lines (UPC + ILIKE tenant filters live)
+         docker exec shopops-api grep -n "length <= 18" /app/services/externalCoverSearch.js
+           -> Expected: >= 1 line (widened UPC guard live)
+         docker exec shopops-api printenv GEMINI_API_KEY
+           -> Expected: non-empty (env present in container)
+       If any grep returns 0 or GEMINI_API_KEY is empty -> rebuild + restart and set the env before marking DONE.
+
+      Vercel deployment: N/A (shopops-api is Docker on Hetzner port 3402, not Vercel)
+
+      VALIDATION: PASS (runtime verify pending post-deploy; all pre-deploy assertions verified above)
+
+      ## Node outputs to draw from
+      Spec: $read-spec.output
+      Implement: $implement.output
+      Grep assertions: $verify-grep.output
+      Tests: $verify-tests.output
+      Commit: $commit-and-push.output
+      PR: $open-pr.output
+
+  # --- Node 10: Flip Notion to REVIEW -----------------------------------------
+  # Rule 7: MANDATORY final node. Manifest goes in Notes property, NOT as a page comment.
+  # Captain CI reads Notes. Flip to REVIEW only -- NEVER DONE. The Cauldron grader / Captain CI
+  # closes both Claude Status and Status after a VALIDATED verdict.
+  # NOTION_PAGE_ID is a placeholder -- substitute the real page ID after creating the Notion WO.
+  - id: flip-notion
+    depends_on: [build-manifest]
+    task_class: clerical
+    bash: |
+      set -euo pipefail
+
+      capture_node_output() {
+        python3 -c 'import shlex, sys; s=sys.stdin.read(); sys.stdout.write((lambda p: p[0] if len(p)==1 else s)(shlex.split(s)) if len(s)>=2 and s[0]=="'"'"'" and s.rstrip("\n").endswith("'"'"'") else s)'
+      }
+
+      MANIFEST=$(capture_node_output <<'BDC_NODE_OUTPUT_MANIFEST'
+      $build-manifest.output
+      BDC_NODE_OUTPUT_MANIFEST
+      )
+
+      READ_SPEC_OUT=$(capture_node_output <<'BDC_NODE_OUTPUT_READ_SPEC'
+      $read-spec.output
+      BDC_NODE_OUTPUT_READ_SPEC
+      )
+      ISSUE_REPO="${ISSUE_REPO:-thinmansoftware/bdc-xo}"
+      ISSUE_NUM=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'issue=[0-9]+' | head -1 | cut -d= -f2 || true)
+      if [ -z "$ISSUE_NUM" ]; then
+        ISSUE_NUM=$(printf '%s\n' "$READ_SPEC_OUT" | sed -n 's/^SPEC_PATH=.*issues\/\([0-9][0-9]*\).*/\1/p' | head -1)
+      fi
+      if [ -z "$ISSUE_NUM" ]; then
+        WO_ID_FROM_SPEC=$(printf '%s\n' "$READ_SPEC_OUT" | sed -n 's/^WO_ID=//p' | head -1)
+        if [ -n "$WO_ID_FROM_SPEC" ]; then
+          ISSUE_NUM=$(gh issue list --repo "$ISSUE_REPO" --search "$WO_ID_FROM_SPEC in:title" --json number --jq '.[0].number // empty' 2>/dev/null || true)
+        fi
+      fi
+      if [ -z "$ISSUE_NUM" ]; then
+        echo "flip-notion: no GitHub issue resolved; skipping status:review label + manifest comment."
+        exit 0
+      fi
+
+      gh label create status:review --repo "$ISSUE_REPO" --color 0E8A16 --description "BDC workflow is ready for review" 2>/dev/null || true
+      gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --remove-label status:building 2>/dev/null || true
+      gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --remove-label status:blocked 2>/dev/null || true
+      gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --add-label status:review
+      COMMENT_FILE=$(mktemp)
+      printf '%s\n' "$MANIFEST" > "$COMMENT_FILE"
+      gh issue comment "$ISSUE_NUM" --repo "$ISSUE_REPO" --body-file "$COMMENT_FILE"
+      echo "flip-notion: $ISSUE_REPO#$ISSUE_NUM -> status:review (manifest posted as comment)"

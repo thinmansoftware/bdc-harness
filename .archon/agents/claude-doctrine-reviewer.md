@@ -12,13 +12,13 @@ Your job: validate the implementation against BDC doctrine, architecture pattern
 ## Your Mandate
 
 1. Read CLAUDE.md and the applicable doctrine sections.
-2. Check every architectural decision against existing patterns — are new patterns justified?
+2. Check every architectural decision against existing patterns -- are new patterns justified?
 3. Verify that Rule 1-22 from ai-engineering-instructions.md are honored.
 4. Check that no GAS code was added (GAS is deprecated 2026-04-24).
 5. Check that no secrets are in git (Rule 6).
 6. Check that no routes were added to server.js (Rule 13).
 7. Check that the manifest is complete and matches reality (Rules 2, 12, 14).
-8. Check for backwards-compatibility regressions — does existing code still work?
+8. Check for backwards-compatibility regressions -- does existing code still work?
 9. Check that error handling fails closed (never silently swallows errors).
 
 ## You Do NOT

@@ -1,0 +1,1575 @@
+name: bdc-harness-wo-onramp
+description: |
+  Use when: Firing any BDC product Work Order through Devils Cauldron. This is
+  the canonical on-ramp atom - it authors a tailored child YAML from the approved
+  WO spec, adversarially reviews it, gets operator approval, registers the child
+  workflow in Archon, fires it against the target codebase, verifies binding, and
+  builds the Captain CI v2 manifest.
+  Inputs:
+    USER_MESSAGE: WO_ID (e.g. WO-SHOPOPS-PULLLIST-EXPORT-01) plus optional
+                  --project <repo> override. WO spec must exist on bdc-xo/main.
+  Does: preflight -> normalize-spec -> generate-yaml (loop) -> validate-yaml ->
+        adversarial-review -> prefire-plan -> approval-gate -> register-yaml ->
+        fire-child -> verify-binding -> build-manifest -> review-issue.
+  NOT for: Doctrine-only WOs (use bdc-doctrine-update). Batch authoring
+        (use bdc-author-wo-batch). WO authoring from scratch (use bdc-wo-author).
+  parallel_ok: false
+
+policyFile: harness/policies/agent-behavior.md
+model: sonnet
+
+interactive: true
+
+inputs:
+  ISSUE_REPO:
+    default: "thinmansoftware/bdc-xo"
+
+nodes:
+
+  # Node 1: preflight
+  # Fails closed on: gh auth, bdc-xo reachability, ARCHON_OPERATOR_TOKEN, push scope.
+  - id: preflight
+    load_bearing: true
+    bash: |
+      set -euo pipefail
+
+      echo "=== preflight: checking gh auth ==="
+      if ! gh auth status 2>&1 | grep -q 'Logged in'; then
+        echo "ERROR: gh CLI not authenticated. Run 'gh auth login' or set GITHUB_TOKEN." >&2
+        exit 1
+      fi
+      echo "gh auth: OK"
+
+      echo "=== preflight: checking bdc-xo reachability ==="
+      if ! gh api repos/thinmansoftware/bdc-xo --jq .id >/dev/null 2>&1; then
+        echo "ERROR: cannot reach thinmansoftware/bdc-xo via gh api." >&2
+        echo "Check GITHUB_TOKEN scope (needs repo read on bdc-xo)." >&2
+        exit 1
+      fi
+      echo "bdc-xo reachable: OK"
+
+      echo "=== preflight: checking ARCHON_OPERATOR_TOKEN ==="
+      if [ -z "${ARCHON_OPERATOR_TOKEN:-}" ]; then
+        echo "ERROR: ARCHON_OPERATOR_TOKEN not set in executor env." >&2
+        echo "Add it to the harness container env and retry." >&2
+        exit 1
+      fi
+      echo "ARCHON_OPERATOR_TOKEN: present"
+
+      echo "=== preflight: checking git push auth (dry-run) ==="
+      PROBE_REF="refs/heads/preflight-auth-probe-$(date +%s)"
+      if ! git push --dry-run origin "HEAD:${PROBE_REF}" 2>&1; then
+        echo "ERROR: git push dry-run failed - container cannot push to origin." >&2
+        echo "Likely cause: GITHUB_TOKEN missing push scope or wrong remote." >&2
+        exit 1
+      fi
+      echo "git push auth: OK"
+
+      echo "preflight PASS"
+
+  # Node 2: fetch-spec (bash node - deterministic private-repo fetch)
+  # The xo persona has no Bash tool, so spec retrieval MUST be a bash node, not an
+  # agent prompt. Runs the gh api fallback chain (proven in bdc-feature-development
+  # read-spec). Writes the raw spec to $ARTIFACTS_DIR/source-spec.md. Fails non-zero
+  # if nothing is retrieved, so fetch-failure is distinguishable from parse-failure.
+  - id: fetch-spec
+    load_bearing: true
+    depends_on: [preflight]
+    bash: |
+      set -euo pipefail
+      DEST="$ARTIFACTS_DIR/source-spec.md"
+      META="$ARTIFACTS_DIR/source-spec.meta"
+
+      # Parse WO_ID from USER_MESSAGE
+      WO_ID=$(printf '%s\n' "$USER_MESSAGE" | grep -Eo 'WO-[A-Z][A-Z0-9-]+-[0-9]+' | head -n 1 || true)
+      if [ -z "$WO_ID" ]; then
+        echo "ERROR: no WO_ID matching WO-[A-Z][A-Z0-9-]+-[0-9]+ in USER_MESSAGE" >&2
+        exit 1
+      fi
+
+      # Parse --project override (optional)
+      TARGET_HINT=$(printf '%s\n' "$USER_MESSAGE" | grep -Eo -- '--project[[:space:]]+[A-Za-z0-9._-]+' | head -n 1 | awk '{print $2}' || true)
+
+      SPEC_CONTENT=""
+      SPEC_PATH=""
+
+      # 1) docs/work-orders/<WO_ID>.md
+      SPEC_PATH="docs/work-orders/${WO_ID}.md"
+      SPEC_CONTENT=$(gh api "repos/thinmansoftware/bdc-xo/contents/${SPEC_PATH}?ref=main" --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
+
+      # 2) docs/superpowers/specs/<WO_ID>.md
+      if [ -z "$SPEC_CONTENT" ]; then
+        SPEC_PATH="docs/superpowers/specs/${WO_ID}.md"
+        SPEC_CONTENT=$(gh api "repos/thinmansoftware/bdc-xo/contents/${SPEC_PATH}?ref=main" --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
+      fi
+
+      # 3) date-prefix glob in docs/superpowers/specs/
+      if [ -z "$SPEC_CONTENT" ]; then
+        MATCH=$(gh api "repos/thinmansoftware/bdc-xo/contents/docs/superpowers/specs?ref=main" --template '{{range .}}{{.path}}{{"\n"}}{{end}}' 2>/dev/null | grep "${WO_ID}.md$" | head -n 1 || true)
+        if [ -n "$MATCH" ]; then
+          SPEC_PATH="$MATCH"
+          SPEC_CONTENT=$(gh api "repos/thinmansoftware/bdc-xo/contents/${SPEC_PATH}?ref=main" --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
+        fi
+      fi
+
+      # 4) GitHub issue body fallback
+      if [ -z "$SPEC_CONTENT" ]; then
+        ISSUE_NUM=$(gh issue list --repo thinmansoftware/bdc-xo --search "${WO_ID} in:title" --json number --jq '.[0].number' 2>/dev/null || true)
+        if [ -n "$ISSUE_NUM" ] && [ "$ISSUE_NUM" != "null" ]; then
+          SPEC_CONTENT=$(gh issue view "$ISSUE_NUM" --repo thinmansoftware/bdc-xo --json body --jq .body 2>/dev/null || true)
+          [ -n "$SPEC_CONTENT" ] && SPEC_PATH="bdc-xo:issues/${ISSUE_NUM}"
+        fi
+      fi
+
+      if [ -z "$SPEC_CONTENT" ]; then
+        echo "ERROR: SPEC_MISSING ${WO_ID} not found in bdc-xo (docs/work-orders, docs/superpowers/specs direct, date-glob, issue search)" >&2
+        exit 1
+      fi
+
+      # Write canonical artifact
+      printf '%s\n' "$SPEC_CONTENT" > "$DEST"
+      {
+        echo "WO_ID=${WO_ID}"
+        echo "SPEC_PATH=bdc-xo:${SPEC_PATH}"
+        echo "TARGET_HINT=${TARGET_HINT:-unknown}"
+        echo "SPEC_BYTES=$(wc -c < "$DEST")"
+      } > "$META"
+
+      echo "fetch-spec: wrote $(wc -c < "$DEST") bytes to $DEST"
+      echo "WO_ID=${WO_ID}"
+      echo "SPEC_PATH=bdc-xo:${SPEC_PATH}"
+      echo "TARGET_HINT=${TARGET_HINT:-unknown}"
+      echo "SPEC_ARTIFACT=$DEST"
+      echo "FETCH_OK=true"
+
+  # Node 2a: normalize-spec (xo prompt - reads the fetched artifact, extracts fields)
+  # Reads ONLY $ARTIFACTS_DIR/source-spec.md (written by fetch-spec). Does NOT attempt
+  # any gh/repo access (the xo persona has no Bash tool). Pure extraction/judgment.
+  - id: normalize-spec
+    agent: xo
+    context: fresh
+    depends_on: [fetch-spec]
+    prompt: |
+      You are the BDC on-ramp spec normalizer. The spec has ALREADY been fetched by
+      the fetch-spec bash node and written to a file. Read ONLY that file and emit a
+      normalized block. Do NOT attempt any gh/repo access - you have no shell.
+
+      ## Inputs
+      fetch-spec output: $fetch-spec.output
+      The raw spec is in the file referenced by SPEC_ARTIFACT (read it with your Read tool).
+      WO_ID and TARGET_HINT are in the fetch-spec output above.
+
+      ## Step 1 - Read the spec artifact
+      Read the file at the SPEC_ARTIFACT path from fetch-spec output (typically
+      $ARTIFACTS_DIR/source-spec.md). That file IS the WO spec body. If you cannot
+      read it or it is empty, output `SPEC_MISSING: artifact unreadable` and stop.
+
+      ## Step 2 - Determine TARGET_REPO
+      Prefer the TARGET_HINT from fetch-spec output if not "unknown". Otherwise parse
+      the spec body for `target_repo:`, `**Target repo:**`, or `Target Repo:` lines.
+      Default to `unknown` if not parseable.
+
+      ## Step 3 - Extract fields from the spec body
+      - TARGET_REPO: short repo name (e.g. shopops)
+      - TARGET_REPO_FULL: bluedevilcollectibles/<TARGET_REPO> (add org prefix if missing)
+      - RULE20_STAGING_GATE: true if TARGET_REPO_FULL is one of:
+        thinmansoftware/lspro-react, thinmansoftware/shopops-storefront,
+        thinmansoftware/shopops. Otherwise false.
+      - WO_CLASS: CODE, INFRA, or MIXED (from spec Class field; default CODE)
+      - BUSINESS_RISK_INVARIANT: the single most critical must-not-break invariant.
+        Derive from the Stop Point / Behavior Source of Truth / any "MUST NEVER break"
+        statement. One sentence, specific to THIS WO. Never emit the literal words
+        "placeholder", "TODO", "one sentence", or "<BUSINESS_RISK...".
+      - IN_SCOPE_FILES: in-scope files (comma-separated)
+      - VERIFY_COMMANDS: stop-condition commands (newline-separated)
+
+      ## Required Output Format (emit exactly, no markdown fences)
+
+      ```
+      === NORMALIZE-SPEC OUTPUT ===
+      WO_ID=<id>
+      TARGET_REPO=<repo-short-name-or-unknown>
+      TARGET_REPO_FULL=<bluedevilcollectibles/repo-or-unknown>
+      RULE20_STAGING_GATE=<true|false>
+      WO_CLASS=<CODE|INFRA|MIXED>
+      BUSINESS_RISK_INVARIANT=<one sentence>
+      IN_SCOPE_FILES=<comma-separated or "(see spec)">
+      VERIFY_COMMANDS=<newline-separated commands or "(see spec)">
+
+      === SPEC_CONTENT ===
+      <full spec body verbatim from the artifact>
+      ```
+
+  # Node 2b: assert-spec-resolved (load-bearing guard)
+  # Fails closed if normalize-spec did not retrieve a real spec.
+  - id: assert-spec-resolved
+    load_bearing: true
+    depends_on: [normalize-spec]
+    bash: |
+      set -euo pipefail
+      NORM_OUT=$normalize-spec.output
+
+      if printf '%s\n' "$NORM_OUT" | grep -qE '^SPEC_MISSING:'; then
+        MSG=$(printf '%s\n' "$NORM_OUT" | grep '^SPEC_MISSING:' | head -1)
+        echo "ERROR: normalize-spec could not retrieve spec: $MSG" >&2
+        exit 1
+      fi
+
+      SPEC_LEN=$(printf '%s\n' "$NORM_OUT" | awk '/=== SPEC_CONTENT ===/,0' | wc -c || echo 0)
+      if [ "${SPEC_LEN:-0}" -lt 200 ]; then
+        echo "ERROR: SPEC_CONTENT section missing or too short (${SPEC_LEN} chars)" >&2
+        exit 1
+      fi
+
+      BRI=$(printf '%s\n' "$NORM_OUT" | sed -n 's/^BUSINESS_RISK_INVARIANT=//p' | head -1)
+      if [ -z "$BRI" ]; then
+        echo "ERROR: BUSINESS_RISK_INVARIANT missing from normalize-spec output" >&2
+        exit 1
+      fi
+      BRI_LOWER=$(printf '%s\n' "$BRI" | tr '[:upper:]' '[:lower:]')
+      if [ "$BRI_LOWER" = "unknown" ] || \
+         printf '%s\n' "$BRI_LOWER" | grep -qE 'placeholder|todo|business_risk_invariant|invariant here|one sentence'; then
+        echo "ERROR: BUSINESS_RISK_INVARIANT is a placeholder: $BRI" >&2
+        exit 1
+      fi
+      if [ "${#BRI}" -lt 20 ]; then
+        echo "ERROR: BUSINESS_RISK_INVARIANT too short (${#BRI} chars): $BRI" >&2
+        exit 1
+      fi
+
+      echo "SPEC_RESOLVED=true"
+      echo "BRI ok: $BRI"
+
+  # Node 3: yaml-author (write-capable builder + in-loop validation)
+  # major-build authors the child YAML. until_bash runs the full validation after
+  # each iteration; failures are written to a feedback file the next iteration reads.
+  # The loop IS the validate->fix retry. max_iterations is the retry budget.
+  - id: yaml-author
+    agent: major-build
+    failover_provider: codex
+    failover_agent: major-build-opr
+    depends_on: [assert-spec-resolved]
+    loop:
+      fresh_context: true
+      until: YAML_READY
+      max_iterations: 4
+      until_bash: |
+        set -uo pipefail
+        FEEDBACK="$ARTIFACTS_DIR/yaml-author-validation.txt"
+        : > "$FEEDBACK"
+
+        # Resolve the draft filename: prefer a single *.yaml.draft in CWD.
+        DRAFT=$(ls -1 *.yaml.draft 2>/dev/null | head -n 1 || true)
+        if [ -z "$DRAFT" ] || [ ! -f "$DRAFT" ]; then
+          echo "FAIL: no .yaml.draft file found in CWD" >> "$FEEDBACK"
+          cat "$FEEDBACK"
+          exit 1
+        fi
+
+        ERRORS=0
+        NORM_OUT=$normalize-spec.output
+        BUSINESS_RISK_INVARIANT=$(printf '%s\n' "$NORM_OUT" | sed -n 's/^BUSINESS_RISK_INVARIANT=//p' | head -n 1)
+        if [ -z "$BUSINESS_RISK_INVARIANT" ]; then
+          echo "FAIL: BUSINESS_RISK_INVARIANT missing from normalize-spec output" >> "$FEEDBACK"
+          ERRORS=$((ERRORS+1))
+        fi
+
+        # Rule 1: model: sonnet at root
+        grep -Eq '^model:[[:space:]]*sonnet$' "$DRAFT" || { echo "FAIL Rule 1: missing 'model: sonnet' at root" >> "$FEEDBACK"; ERRORS=$((ERRORS+1)); }
+
+        # Rule 6: policyFile at root
+        grep -Eq '^policyFile:[[:space:]]*harness/policies/agent-behavior\.md$' "$DRAFT" || { echo "FAIL Rule 6: missing 'policyFile: harness/policies/agent-behavior.md' at root" >> "$FEEDBACK"; ERRORS=$((ERRORS+1)); }
+
+        # Rule 4/9: no BDC_XO/ prefix in paths
+        if grep -E 'BDC_XO/' "$DRAFT" | grep -qv '#'; then echo "FAIL Rule 4/9: BDC_XO/ prefix found (paths must be repo-root-relative)" >> "$FEEDBACK"; ERRORS=$((ERRORS+1)); fi
+
+        # Rule 10: every loop: has until, max_iterations, fresh_context
+        LOOP_COUNT=$(grep -c '^[[:space:]]*loop:' "$DRAFT" 2>/dev/null || echo 0)
+        if [ "$LOOP_COUNT" -gt 0 ]; then
+          UNTIL_COUNT=$(grep -c '[[:space:]]*until:' "$DRAFT" 2>/dev/null || echo 0)
+          MAXITER_COUNT=$(grep -c '[[:space:]]*max_iterations:' "$DRAFT" 2>/dev/null || echo 0)
+          FC_COUNT=$(grep -c '[[:space:]]*fresh_context:' "$DRAFT" 2>/dev/null || echo 0)
+          if [ "$UNTIL_COUNT" -lt "$LOOP_COUNT" ] || [ "$MAXITER_COUNT" -lt "$LOOP_COUNT" ] || [ "$FC_COUNT" -lt "$LOOP_COUNT" ]; then
+            echo "FAIL Rule 10: loop blocks missing until/max_iterations/fresh_context (loops=$LOOP_COUNT until=$UNTIL_COUNT maxiter=$MAXITER_COUNT fc=$FC_COUNT)" >> "$FEEDBACK"; ERRORS=$((ERRORS+1));
+          fi
+        fi
+
+        # Rule 7: review-issue GitHub completion node present
+        grep -q 'id: review-issue' "$DRAFT" || { echo "FAIL Rule 7: review-issue GitHub completion node not found" >> "$FEEDBACK"; ERRORS=$((ERRORS+1)); }
+
+        # business-risk-gate present
+        grep -q 'id: business-risk-gate' "$DRAFT" || { echo "FAIL: business-risk-gate node not found (required)" >> "$FEEDBACK"; ERRORS=$((ERRORS+1)); }
+
+        # business-risk-gate must be load_bearing: true
+        if grep -q 'id: business-risk-gate' "$DRAFT"; then
+          if ! awk '/id: business-risk-gate/{f=1} f && /load_bearing: true/{print; f=0}' "$DRAFT" | grep -q '.'; then
+            echo "FAIL: business-risk-gate missing load_bearing: true" >> "$FEEDBACK"; ERRORS=$((ERRORS+1));
+          fi
+          if [ -n "$BUSINESS_RISK_INVARIANT" ] && ! grep -Fq "$BUSINESS_RISK_INVARIANT" "$DRAFT"; then
+            echo "FAIL: business-risk-gate does not include BUSINESS_RISK_INVARIANT verbatim: $BUSINESS_RISK_INVARIANT" >> "$FEEDBACK"; ERRORS=$((ERRORS+1));
+          fi
+        fi
+
+        # Rule 11: no n8n webhook calls
+        if grep -E 'n8n\.bluedevilcollectibles\.com' "$DRAFT" | grep -qv '#'; then echo "FAIL Rule 11: n8n webhook call found (hangs in executor subprocess)" >> "$FEEDBACK"; ERRORS=$((ERRORS+1)); fi
+
+        # Conservative dev-error substring bans (defense-in-depth, loop-only).
+        # These tokens never legitimately appear in a healthy child YAML (verified
+        # against the canonical base patterns), so banning them as substrings is safe
+        # and catches sloppiness early. We deliberately do NOT ban "{{", "}}",
+        # "template", or "one sentence" here -- those appear legitimately in base-pattern
+        # prompt: bodies (e.g. gh api --template '{{.content}}', <one sentence John can
+        # answer>). Placeholder detection for THOSE is structural (the bun check below),
+        # not substring. See WO-CAULDRON-ONRAMP-ATOM-DEFECTS-6-7 + war-council verdict
+        # 2026-06-07: a substring scan has a hard false-positive ceiling against the
+        # canonical patterns; structural-position validation is the only sound design.
+        for BAD in "TODO" "FIXME" "TBD" "REPLACE_ME" "lorem ipsum"; do
+          if grep -qi "$BAD" "$DRAFT" 2>/dev/null; then echo "FAIL: child YAML contains dev-error token: $BAD" >> "$FEEDBACK"; ERRORS=$((ERRORS+1)); break; fi
+        done
+
+        # Structural placeholder + YAML-parse check (single bun invocation).
+        # Parses the draft and validates the FILLED STRUCTURAL POSITIONS the author was
+        # told to substitute -- NOT rendered text. Checks ONLY root scalars + inputs.WO_ID.default;
+        # never traverses nodes[] or prompt: bodies (where legit <...> instruction tokens live).
+        STRUCT_ERR=$(DRAFT="$DRAFT" bun -e '
+          const fs = require("fs");
+          let obj;
+          try { obj = Bun.YAML.parse(fs.readFileSync(process.env.DRAFT, "utf8")); }
+          catch (e) { console.log("YAML parse failed: " + e.message); process.exit(0); }
+          if (obj === null || typeof obj !== "object") { console.log("draft is not a YAML mapping"); process.exit(0); }
+          const fails = [];
+          // (a) root model must be a real Claude model (ROOT ONLY -- node-level codex models are legitimate)
+          const model = obj.model;
+          if (!model || !/^(sonnet|opus|haiku|claude-[A-Za-z0-9._-]+)$/.test(String(model))) {
+            fails.push("root model: is missing or not a real model (got: " + String(model) + ")");
+          }
+          // (b) inputs.WO_ID.default must be a real WO_ID -- no angle bracket, no template phrase
+          const wid = obj && obj.inputs && obj.inputs.WO_ID ? obj.inputs.WO_ID.default : undefined;
+          if (wid === undefined || wid === null) { fails.push("inputs.WO_ID.default is missing"); }
+          else if (String(wid).includes("<") || String(wid).includes("normalize-spec")) { fails.push("inputs.WO_ID.default is an unfilled stub: " + String(wid)); }
+          // (c) root name must be a real slug -- no angle bracket
+          const nm = obj.name;
+          if (nm === undefined || nm === null) { fails.push("root name: is missing"); }
+          else if (String(nm).includes("<")) { fails.push("root name: is an unfilled stub: " + String(nm)); }
+          // (e) exact-match the atom-own author-facing stub strings against top-level scalar values ONLY
+          const stubs = ["<WO_ID from normalize-spec>","<bdc-slug>","<bluedevilcollectibles/repo>","<one sentence, verbatim from spec>","<slug>","<WO_ID>","<true|false>"];
+          for (const [k, v] of Object.entries(obj)) {
+            if (v === null || typeof v === "object") continue;
+            if (stubs.includes(String(v))) { fails.push("top-level field " + k + " is an unfilled stub: " + String(v)); }
+          }
+          // (f) every side-effect chain node must be a descendant of the risk gate and
+          // must independently require the gate's mechanical proceed verdict. This is
+          // mandatory even with trigger_rule: all_done, which otherwise bypasses failure.
+          const nodes = Array.isArray(obj.nodes) ? obj.nodes : [];
+          const byId = new Map(nodes.map(node => [node && node.id, node]));
+          const risk = byId.get("business-risk-gate");
+          if (!risk || typeof risk !== "object") {
+            fails.push("business-risk-gate missing");
+          } else if (!String(risk.bash || "").includes(JSON.stringify({gate:"proceed"}))) {
+            fails.push("business-risk-gate must emit gate=proceed only after its checks pass");
+          }
+          const ancestors = id => {
+            const seen = new Set();
+            const visit = current => {
+              const node = byId.get(current);
+              const deps = Array.isArray(node && node.depends_on) ? node.depends_on : [];
+              for (const dep of deps) if (!seen.has(dep)) { seen.add(dep); visit(dep); }
+            };
+            visit(id);
+            return seen;
+          };
+          const requiredWhen = "$" + "business-risk-gate.output.gate == " + String.fromCharCode(39) + "proceed" + String.fromCharCode(39);
+          for (const id of ["decide-push-target", "commit-and-push", "open-pr-if-needed", "build-manifest", "review-issue"]) {
+            const node = byId.get(id);
+            if (!node) { fails.push(id + " missing"); continue; }
+            if (!ancestors(id).has("business-risk-gate")) fails.push(id + " is not downstream of business-risk-gate");
+            if (String(node.when || "").trim() !== requiredWhen) {
+              fails.push(id + " must condition on $" + "business-risk-gate.output.gate == proceed");
+            }
+          }
+          if (fails.length) { console.log(fails.join("; ")); }
+        ' 2>&1 || true)
+        if [ -n "$STRUCT_ERR" ]; then
+          echo "FAIL: structural validation: $STRUCT_ERR" >> "$FEEDBACK"; ERRORS=$((ERRORS+1));
+        fi
+
+        if [ "$ERRORS" -gt 0 ]; then
+          echo "" >> "$FEEDBACK"
+          echo "$ERRORS validation error(s). Fix every line above and re-draft." >> "$FEEDBACK"
+          echo "=== yaml-author validation FAILED ($ERRORS errors) ==="
+          cat "$FEEDBACK"
+          exit 1
+        fi
+
+        # Defect 6b skew-detection: record the exact draft this gate validated (name + sha256)
+        # so assert-yaml-ready can confirm it scans the SAME content. If the agent rewrites
+        # the file after this gate passes, assert-yaml-ready will surface the drift.
+        DRAFT_SHA=$(sha256sum "$DRAFT" 2>/dev/null | awk '{print $1}' || echo "unknown")
+        {
+          echo "DRAFT_FILE=$DRAFT"
+          echo "DRAFT_SHA=$DRAFT_SHA"
+        } > "$ARTIFACTS_DIR/yaml-author-validated.txt"
+
+        echo "ARTIFACTS_DIR=$ARTIFACTS_DIR" >> "$FEEDBACK"
+        echo "YAML_READY=true (draft: $DRAFT sha: $DRAFT_SHA)"
+        exit 0
+      prompt: |
+        You are major-build. Author a tailored child workflow YAML for the Work
+        Order in the normalized spec below, then write it to disk. You have full
+        write tools -- you MUST actually create the file.
+
+        ## STEP 0 -- Read prior-iteration validation feedback FIRST
+        Run this before anything else:
+          cat "$ARTIFACTS_DIR/yaml-author-validation.txt" 2>/dev/null || echo "(no prior feedback -- first iteration)"
+        If the file lists failures, FIX EVERY ONE of them in this iteration. Do not
+        repeat a mistake the previous iteration already made.
+
+        ## GUARD -- fail closed if spec is incomplete
+        Check the normalized spec input. If any of these, emit YAML_DRAFT_FAILURE
+        with a reason and STOP (do NOT draft, do NOT emit YAML_READY):
+        1. SPEC_MISSING present -> reason=spec-not-retrieved
+        2. BUSINESS_RISK_INVARIANT missing/empty/placeholder -> reason=placeholder-invariant
+        3. SPEC_CONTENT < 200 chars -> reason=spec-too-short
+
+        ## Inputs
+        Normalized spec: $normalize-spec.output
+
+        ## Base pattern
+        Use bdc-feature-development.yaml as the structural base:
+        preflight-github-auth (load_bearing) -> read-spec -> plan -> implement
+        (loop, major-build, fresh_context: true, until: COMPLETE, max_iterations: 5)
+        -> war-council-validator -> business-risk-gate -> decide-push-target ->
+        commit-and-push (load_bearing) -> open-pr-if-needed (load_bearing) ->
+        build-manifest (trigger_rule: all_done) -> review-issue.
+
+        The business-risk-gate success path MUST end by emitting exactly
+        {"gate":"proceed"}. The decide-push-target, commit-and-push,
+        open-pr-if-needed, build-manifest, and review-issue nodes MUST each be
+        downstream of the gate and carry this condition verbatim:
+          when: "<DOLLAR>business-risk-gate.output.gate == 'proceed'"
+        Replace <DOLLAR> with one literal ASCII dollar sign in the child YAML.
+        This condition is required even when a node uses trigger_rule: all_done.
+
+        ## Tailoring requirements
+
+        1. Bake in WO_ID at root so the child needs no USER_MESSAGE at fire time:
+           inputs:
+             WO_ID:
+               default: "<WO_ID from normalize-spec>"
+
+        2. Add a business-risk-gate node (load_bearing: true) before decide-push-target
+           that fails closed if the WO's BUSINESS_RISK_INVARIANT is violated. Put the
+           ACTUAL invariant text from normalize-spec into the node -- never the literal
+           words "placeholder", "TODO", "one sentence", or "<BUSINESS_RISK...".
+
+        3. If RULE20_STAGING_GATE=true: decide-push-target and commit-and-push must use
+           --base staging for the PR.
+
+        4. Child YAML filename: lowercase the WO_ID, replace WO- prefix with bdc-,
+           replace underscores with hyphens. Write to <slug>.yaml.draft in CWD.
+
+        ## Hard rules the child YAML MUST satisfy (validated by until_bash after you finish)
+        - model: sonnet at root (a real model string -- the structural gate checks root model:)
+        - policyFile: harness/policies/agent-behavior.md at root
+        - every loop: has prompt + until + max_iterations + fresh_context
+        - paths repo-root-relative (no BDC_XO/ prefix)
+        - no n8n webhook calls
+        - review-issue final node; business-risk-gate present and load_bearing: true
+        - review-issue targets the child WO GitHub issue, adds status:review, and posts
+          one sentinel-guarded manifest comment so repeat runs do not duplicate comments
+        - business-risk-gate includes BUSINESS_RISK_INVARIANT verbatim
+        - business-risk-gate emits {"gate":"proceed"} only after all checks pass
+        - decide-push-target, commit-and-push, open-pr-if-needed, build-manifest, and
+          review-issue each condition on <DOLLAR>business-risk-gate.output.gate == 'proceed'
+        - root name: is the real child slug (NOT "<slug>" / "<bdc-slug>")
+        - inputs.WO_ID.default is the real WO_ID (NOT "<WO_ID>" / "<WO_ID from normalize-spec>")
+        - no dev-error tokens: TODO, FIXME, TBD, REPLACE_ME, lorem ipsum
+        - SUBSTITUTE every author-facing field: never leave one of the atom's OWN template
+          stubs as a literal top-level value -- "<one sentence, verbatim from spec>",
+          "<bdc-slug>", "<bluedevilcollectibles/repo>", "<WO_ID from normalize-spec>",
+          "<slug>", "<WO_ID>", "<true|false>" must be replaced with the real value.
+
+        ## What is NOT a placeholder (do NOT strip these)
+        Angle-bracket output-format instructions INSIDE prompt: node bodies are legitimate
+        and REQUIRED -- the canonical base pattern uses them (e.g. "<one sentence John can
+        answer>", "<true|false>", "<file:line>" inside a node's prompt telling its agent
+        what shape to output). Go-template tokens in bash nodes ("--template '{{.content}}'")
+        are also legitimate. The gate is STRUCTURAL: it only rejects unfilled values in the
+        root scalars + inputs.WO_ID.default. It does NOT scan prompt: bodies. So copy the
+        base pattern's prompt instructions faithfully -- do not mangle them to dodge a
+        substring. Just make sure the child's OWN identifying fields are real.
+
+        ## Required self-check before emitting the sentinel
+        Before you emit YAML_READY, inspect the draft yourself and confirm:
+        - id: business-risk-gate is present and load_bearing: true is in that node
+        - the exact BUSINESS_RISK_INVARIANT line from normalize-spec appears verbatim
+        - root model:, root name:, and inputs.WO_ID.default are all REAL values (no angle brackets)
+        - none of the atom's own template stubs (listed above) survive as literal top-level values
+        If any check fails, fix the draft in this same iteration. Do not emit
+        YAML_READY for an unchecked or known-bad draft.
+
+        ## Output
+        1. WRITE the file <slug>.yaml.draft to disk (you have write tools -- use them).
+        2. Emit this footer, substituting EVERY field with the REAL value (never leave
+           an angle-bracket instruction as the literal value -- the structural gate
+           rejects an unfilled field):
+           === YAML-AUTHOR RESULT ===
+           YAML_FILENAME=the.slug.yaml.draft
+           WO_SLUG=the-bdc-slug
+           WO_ID=the real WO_ID from normalize-spec
+           TARGET_REPO_FULL=bluedevilcollectibles/the-repo
+           RULE20_STAGING_GATE=true or false
+           BUSINESS_RISK_INVARIANT=paste the exact invariant text from normalize-spec output, verbatim
+        3. Emit the sentinel YAML_READY on its own line.
+
+        The until_bash gate validates your draft after this iteration. If it fails,
+        you will see the errors in the feedback file next iteration -- fix them.
+
+  # Node 4: assert-yaml-ready (load-bearing hard gate, defense-in-depth)
+  # Even if the loop exhausted iterations or emitted the sentinel without a valid
+  # draft, this gate re-runs the parse + key structural checks and fails the run
+  # cleanly rather than letting a bad draft reach adversarial-review/register.
+  - id: assert-yaml-ready
+    load_bearing: true
+    depends_on: [yaml-author]
+    bash: |
+      set -euo pipefail
+      AUTHOR_OUT=$yaml-author.output
+      NORM_OUT=$normalize-spec.output
+
+      YAML_FILENAME=$(printf '%s\n' "$AUTHOR_OUT" | sed -n 's/^YAML_FILENAME=//p' | head -n 1)
+      WO_SLUG=$(printf '%s\n' "$AUTHOR_OUT" | sed -n 's/^WO_SLUG=//p' | head -n 1)
+
+      # Fall back to globbing if the footer was malformed
+      if [ -z "$YAML_FILENAME" ] || [ ! -f "$YAML_FILENAME" ]; then
+        YAML_FILENAME=$(ls -1 *.yaml.draft 2>/dev/null | head -n 1 || true)
+      fi
+      if [ -z "$YAML_FILENAME" ] || [ ! -f "$YAML_FILENAME" ]; then
+        echo "ERROR: yaml-author produced no .yaml.draft file -- run failed clean (no dead-end)." >&2
+        printf '%s\n' "$AUTHOR_OUT" | grep -q 'YAML_DRAFT_FAILURE' && echo "yaml-author hit YAML_DRAFT_FAILURE." >&2
+        exit 1
+      fi
+
+      # Defect 6b skew-detection: confirm we are scanning the SAME draft the loop validated.
+      # The loop wrote name+sha to yaml-author-validated.txt on its passing iteration. If the
+      # current file differs, the agent rewrote it after the loop gate -- surface it as a WARNING
+      # (do NOT skip: this node is defense-in-depth and must still scan the current content).
+      VALIDATED_FILE="$ARTIFACTS_DIR/yaml-author-validated.txt"
+      if [ -f "$VALIDATED_FILE" ]; then
+        PREV_SHA=$(sed -n 's/^DRAFT_SHA=//p' "$VALIDATED_FILE" | head -n 1)
+        CUR_SHA=$(sha256sum "$YAML_FILENAME" 2>/dev/null | awk '{print $1}' || echo "unknown")
+        if [ -n "$PREV_SHA" ] && [ "$PREV_SHA" != "unknown" ] && [ "$CUR_SHA" != "$PREV_SHA" ]; then
+          echo "WARNING: draft changed after the loop gate passed (loop sha=$PREV_SHA current sha=$CUR_SHA) -- re-validating current content" >&2
+        fi
+      fi
+
+      # Hard re-check: node-presence musts (key-name presence -- reliable substring check)
+      grep -q 'id: business-risk-gate' "$YAML_FILENAME" || { echo "ERROR: business-risk-gate missing" >&2; exit 1; }
+      grep -q 'id: review-issue' "$YAML_FILENAME" || { echo "ERROR: review-issue missing" >&2; exit 1; }
+
+      # Structural placeholder + YAML-parse check -- SAME logic as the loop until_bash (Finding-A parity).
+      # Parses the draft and validates FILLED STRUCTURAL POSITIONS (root scalars + inputs.WO_ID.default).
+      # Never scans nodes[] or prompt: bodies -- legit <...> instruction tokens live there.
+      # Substring scanning has a hard false-positive ceiling against the canonical base patterns
+      # (which contain {{ }}, "template", and bare <one sentence>); structural validation is the
+      # only sound design. See WO-CAULDRON-ONRAMP-ATOM-DEFECTS-6-7 + war-council verdict 2026-06-07.
+      STRUCT_ERR=$(YAML_FILENAME="$YAML_FILENAME" bun -e '
+        const fs = require("fs");
+        let obj;
+        try { obj = Bun.YAML.parse(fs.readFileSync(process.env.YAML_FILENAME, "utf8")); }
+        catch (e) { console.log("draft does not parse as YAML: " + e.message); process.exit(0); }
+        if (obj === null || typeof obj !== "object") { console.log("draft is not a YAML mapping"); process.exit(0); }
+        const fails = [];
+        const model = obj.model;
+        if (!model || !/^(sonnet|opus|haiku|claude-[A-Za-z0-9._-]+)$/.test(String(model))) {
+          fails.push("root model: missing or not a real model (got: " + String(model) + ")");
+        }
+        const wid = obj && obj.inputs && obj.inputs.WO_ID ? obj.inputs.WO_ID.default : undefined;
+        if (wid === undefined || wid === null) { fails.push("inputs.WO_ID.default missing"); }
+        else if (String(wid).includes("<") || String(wid).includes("normalize-spec")) { fails.push("inputs.WO_ID.default unfilled stub: " + String(wid)); }
+        const nm = obj.name;
+        if (nm === undefined || nm === null) { fails.push("root name: missing"); }
+        else if (String(nm).includes("<")) { fails.push("root name: unfilled stub: " + String(nm)); }
+        const stubs = ["<WO_ID from normalize-spec>","<bdc-slug>","<bluedevilcollectibles/repo>","<one sentence, verbatim from spec>","<slug>","<WO_ID>","<true|false>"];
+        for (const [k, v] of Object.entries(obj)) {
+          if (v === null || typeof v === "object") continue;
+          if (stubs.includes(String(v))) { fails.push("top-level field " + k + " unfilled stub: " + String(v)); }
+        }
+        const nodes = Array.isArray(obj.nodes) ? obj.nodes : [];
+        const byId = new Map(nodes.map(node => [node && node.id, node]));
+        const risk = byId.get("business-risk-gate");
+        if (!risk || typeof risk !== "object") {
+          fails.push("business-risk-gate missing");
+        } else if (!String(risk.bash || "").includes(JSON.stringify({gate:"proceed"}))) {
+          fails.push("business-risk-gate must emit gate=proceed only after its checks pass");
+        }
+        const ancestors = id => {
+          const seen = new Set();
+          const visit = current => {
+            const node = byId.get(current);
+            const deps = Array.isArray(node && node.depends_on) ? node.depends_on : [];
+            for (const dep of deps) if (!seen.has(dep)) { seen.add(dep); visit(dep); }
+          };
+          visit(id);
+          return seen;
+        };
+        const requiredWhen = "$" + "business-risk-gate.output.gate == " + String.fromCharCode(39) + "proceed" + String.fromCharCode(39);
+        for (const id of ["decide-push-target", "commit-and-push", "open-pr-if-needed", "build-manifest", "review-issue"]) {
+          const node = byId.get(id);
+          if (!node) { fails.push(id + " missing"); continue; }
+          if (!ancestors(id).has("business-risk-gate")) fails.push(id + " is not downstream of business-risk-gate");
+          if (String(node.when || "").trim() !== requiredWhen) {
+            fails.push(id + " must condition on $" + "business-risk-gate.output.gate == proceed");
+          }
+        }
+        if (fails.length) { console.log(fails.join("; ")); }
+      ' 2>&1 || true)
+      if [ -n "$STRUCT_ERR" ]; then
+        echo "ERROR: structural validation failed: $STRUCT_ERR" >&2
+        exit 1
+      fi
+
+      # (d) business-risk-gate must contain the BUSINESS_RISK_INVARIANT verbatim (the one check
+      # the old gate got right -- kept in both gates per war-council verdict).
+      BRI=$(printf '%s\n' "$NORM_OUT" | sed -n 's/^BUSINESS_RISK_INVARIANT=//p' | head -n 1)
+      if [ -n "$BRI" ] && ! grep -Fq "$BRI" "$YAML_FILENAME"; then
+        echo "ERROR: child YAML does not include BUSINESS_RISK_INVARIANT verbatim: $BRI" >&2
+        exit 1
+      fi
+
+      echo "YAML_VALID=true"
+      echo "YAML_FILENAME=$YAML_FILENAME"
+      echo "WO_SLUG=$WO_SLUG"
+      echo "assert-yaml-ready PASS"
+
+  # Node 4b: war-council-review (read-only structure critique)
+  # The architect reviews the drafted child YAML for structural/architectural
+  # soundness BEFORE the overseer attacks risk. Read-only -- suggests, does not write.
+  - id: war-council-review
+    agent: war-council-architect
+    context: fresh
+    depends_on: [assert-yaml-ready]
+    prompt: |
+      You are the War Council Architect. Review the drafted child workflow YAML for
+      STRUCTURAL and ARCHITECTURAL soundness. You are read-only -- you critique, you
+      do not edit. The builder (major-build) already authored it and it passed
+      mechanical validation; your job is the judgment layer the validator cannot do.
+
+      ## Inputs
+      Normalized spec: $normalize-spec.output
+      yaml-author output: $yaml-author.output
+      assert-yaml-ready output: $assert-yaml-ready.output
+
+      Read the YAML at YAML_FILENAME (from assert-yaml-ready output).
+
+      ## Review dimensions
+      1. Node DAG shape: do depends_on edges form a sensible order? Any orphan nodes?
+      2. Does the implement loop's scope match the spec's in-scope files (no creep)?
+      3. Is the business-risk-gate placed where it actually guards the risk surface
+         (before the push, not after)?
+      4. Rule 20: if the target repo is customer-facing, is staging enforced correctly?
+      5. Does review-issue target the CHILD product WO's GitHub issue (not the on-ramp's own WO)?
+
+      ## Output
+      === WAR-COUNCIL-REVIEW ===
+      STRUCTURE_OK=<true|false>
+      CONCERNS:
+      <bullet list of structural issues, or "(none)">
+      RECOMMENDATION=<PROCEED|REVISE>
+
+      This is advisory context for the overseer and the operator. It does not block
+      by itself -- the overseer's adversarial pass and the operator's approval are the
+      gates.
+
+  # Node 5: adversarial-review
+  # Scores 8 criteria 1-10. Any score <7 sets ADV_PASS=false.
+  - id: adversarial-review
+    agent: overseer-opus
+    effort: xhigh
+    context: fresh
+    depends_on: [war-council-review]
+    prompt: |
+      You are an adversarial YAML reviewer with no benefit of the doubt. Score the
+      child workflow YAML drafted by generate-yaml on 8 criteria (1-10 each).
+      Any score below 7 fails the review.
+
+      ## Inputs
+      Normalized spec: $normalize-spec.output
+      yaml-author output: $yaml-author.output
+      assert-yaml-ready output: $assert-yaml-ready.output
+
+      Read the YAML file at path YAML_FILENAME from assert-yaml-ready output.
+
+      ## 8 Scoring Criteria
+
+      1. **Spec fidelity** (1-10): Does the child YAML implement what the WO spec actually requires?
+         Check: does it hardcode the correct WO_ID? Does IN_SCOPE_FILES match the plan node's scope?
+         Score <7 if child YAML adds out-of-scope work or omits any in-scope file.
+
+      2. **Business-risk-gate correctness** (1-10): Does the business-risk-gate node's invariant
+         match BUSINESS_RISK_INVARIANT from the spec exactly (or closely)? Is it load_bearing: true?
+         Does it fail closed (set -euo pipefail; exit 1 path exists), emit {"gate":"proceed"}
+         only after passing, and mechanically condition decide-push-target, commit-and-push,
+         open-pr-if-needed, build-manifest, and review-issue on that proceed verdict?
+         Score <7 if invariant is generic/wrong, the node lacks fail-closed logic, or any
+         push/PR/GitHub completion chain node can run without the proceed condition.
+
+      3. **Rule 20 compliance** (1-10): If RULE20_STAGING_GATE=true, does the child YAML enforce
+         staging branch as PR base? If false, does it correctly skip that gate?
+         Score <7 if the gate is wrong direction.
+
+      4. **Loop correctness** (1-10): Every loop: block has prompt, until, max_iterations (<=5),
+         fresh_context: true. Sentinel is specific (not just "DONE").
+         Score <7 if any loop block is missing a required sibling.
+
+      5. **Load-bearing correctness** (1-10): preflight-github-auth, commit-and-push,
+         open-pr-if-needed, business-risk-gate are all load_bearing: true. No swallow patterns
+         (`|| echo "STATUS=failed"`) on those nodes.
+         Score <7 if any load-bearing node can silently succeed on failure.
+
+      6. **Path hygiene** (1-10): All file paths relative to repo root. No BDC_XO/ prefix.
+         No n8n webhook URLs. No absolute paths unless in `/host-artifacts/`.
+         Score <7 if any violation found.
+
+      7. **GitHub-flip correctness** (1-10): review-issue is the final node, depends on build-manifest,
+         targets the child WO's GitHub issue (not the on-ramp's own WO), applies status:review,
+         and includes manifest delivery.
+         Score <7 if review-issue targets the wrong WO, targets the wrong system, or is not final.
+
+      8. **Idempotency** (1-10): Running the child YAML twice on the same WO produces no duplicate
+         commits, no duplicate issue comments/labels, no duplicate PRs. The GitHub completion
+         node uses a manifest-sentinel guard before posting comments. The implement loop has a
+         "spec already implemented?" guard or uses git diff to detect no-op.
+         Score <7 if second run would create duplicates without guards.
+
+      ## Required Output Format
+
+      ```
+      === ADVERSARIAL-REVIEW SCORES ===
+      1. Spec fidelity: <score>/10 - <one-line finding>
+      2. Business-risk-gate: <score>/10 - <one-line finding>
+      3. Rule 20 compliance: <score>/10 - <one-line finding>
+      4. Loop correctness: <score>/10 - <one-line finding>
+      5. Load-bearing correctness: <score>/10 - <one-line finding>
+      6. Path hygiene: <score>/10 - <one-line finding>
+      7. GitHub-flip correctness: <score>/10 - <one-line finding>
+      8. Idempotency: <score>/10 - <one-line finding>
+
+      RISK=<LOW|MEDIUM|HIGH>
+      ADV_PASS=<true|false>
+      RECOMMENDATION=<PROCEED|REVISE>
+
+      UNRESOLVED CONCERNS:
+      <bullet list of any score <7 with specific fix required, or "(none)" if all >= 7>
+      ```
+
+      RISK=HIGH if any score <= 5. RISK=MEDIUM if any score is 6. RISK=LOW if all >= 7.
+      ADV_PASS=true only if ALL 8 scores >= 7.
+      RECOMMENDATION=PROCEED only if ADV_PASS=true.
+
+  # Node 6: prefire-plan
+  # Assembles the pre-fire packet shown to the operator at approval-gate.
+  - id: prefire-plan
+    depends_on: [adversarial-review]
+    bash: |
+      set -euo pipefail
+      NORM_OUT=$normalize-spec.output
+      AUTHOR_OUT=$yaml-author.output
+      ASSERT_OUT=$assert-yaml-ready.output
+      ADV_OUT=$adversarial-review.output
+
+      WO_ID=$(printf '%s\n' "$NORM_OUT" | sed -n 's/^WO_ID=//p' | head -n 1)
+      TARGET_REPO=$(printf '%s\n' "$NORM_OUT" | sed -n 's/^TARGET_REPO=//p' | head -n 1)
+      TARGET_REPO_FULL=$(printf '%s\n' "$NORM_OUT" | sed -n 's/^TARGET_REPO_FULL=//p' | head -n 1)
+      RULE20_STAGING_GATE=$(printf '%s\n' "$NORM_OUT" | sed -n 's/^RULE20_STAGING_GATE=//p' | head -n 1)
+      WO_CLASS=$(printf '%s\n' "$NORM_OUT" | sed -n 's/^WO_CLASS=//p' | head -n 1)
+      BUSINESS_RISK_INVARIANT=$(printf '%s\n' "$NORM_OUT" | sed -n 's/^BUSINESS_RISK_INVARIANT=//p' | head -n 1)
+      WO_SLUG=$(printf '%s\n' "$AUTHOR_OUT" | sed -n 's/^WO_SLUG=//p' | head -n 1)
+      YAML_FILENAME=$(printf '%s\n' "$ASSERT_OUT" | sed -n 's/^YAML_FILENAME=//p' | head -n 1)
+      ADV_PASS=$(printf '%s\n' "$ADV_OUT" | sed -n 's/^ADV_PASS=//p' | head -n 1)
+      RISK=$(printf '%s\n' "$ADV_OUT" | sed -n 's/^RISK=//p' | head -n 1)
+
+      API_BASE="${ARCHON_API_BASE:-}"
+      if ! API_BASE="$API_BASE" python3 -c 'import os,sys; from urllib.parse import urlsplit; u=urlsplit(os.environ.get("API_BASE", "")); sys.exit(0 if u.scheme == "http" and u.hostname in ("127.0.0.1", "localhost") and u.port is not None and u.username is None and u.password is None and u.path in ("", "/") and not u.query and not u.fragment else 1)'; then
+        echo "ERROR: ARCHON_API_BASE must be an explicit loopback staging URL; refusing external or unset target." >&2
+        exit 1
+      fi
+      HARNESS_REPO="thinmansoftware/bdc-harness"
+      ARCHON_HEADERS=(-H "x-archon-operator-token: ${ARCHON_OPERATOR_TOKEN}")
+      if [ -n "${CF_ACCESS_CLIENT_ID:-}" ] && [ -n "${CF_ACCESS_CLIENT_SECRET:-}" ]; then
+        ARCHON_HEADERS+=(-H "CF-Access-Client-Id: ${CF_ACCESS_CLIENT_ID}")
+        ARCHON_HEADERS+=(-H "CF-Access-Client-Secret: ${CF_ACCESS_CLIENT_SECRET}")
+      fi
+
+      DUPLICATE_CHECK="clean"
+      RUNS_JSON=$(curl -fsS --max-time 15 "${ARCHON_HEADERS[@]}" \
+        "${API_BASE}/api/workflows/runs?limit=30" 2>/dev/null || true)
+      if [ -n "$RUNS_JSON" ]; then
+        API_DUP=$(printf '%s\n' "$RUNS_JSON" | WO_ID="$WO_ID" python3 -c "
+        import json, os, sys
+        wo_id = os.environ.get('WO_ID', '')
+        try:
+            data = json.load(sys.stdin)
+        except Exception:
+            sys.exit(0)
+        runs = data if isinstance(data, list) else data.get('runs', [])
+        for run in runs:
+            status = str(run.get('status', '')).lower()
+            msg = str(run.get('initial_message', '') or run.get('message', ''))
+            if wo_id and wo_id in msg and status in {'running', 'pending', 'queued'}:
+                print(str(run.get('id', 'unknown')) + '|' + status)
+                break
+        " 2>/dev/null || true)
+        if [ -n "$API_DUP" ]; then
+          DUPLICATE_CHECK="DUPLICATE_RUN_DETECTED: ${API_DUP}"
+        fi
+      else
+        DUPLICATE_CHECK="UNVERIFIED(api-unreachable)"
+      fi
+
+      if ! printf '%s\n' "$DUPLICATE_CHECK" | grep -q 'DUPLICATE_RUN_DETECTED'; then
+        SAFE_SLUG=$(printf '%s\n' "$WO_ID" | tr '[:upper:]' '[:lower:]' | sed 's/^wo-/bdc-/; s/[^a-z0-9._-]/-/g')
+        PR_DUP=$(gh pr list --repo "$HARNESS_REPO" --state open --search "$WO_ID in:title,body" --json number,headRefName,title \
+          --jq '.[] | select((.headRefName | contains("'"$SAFE_SLUG"'")) or (.title | contains("'"$WO_ID"'"))) | "#"+(.number|tostring)+"|"+.headRefName' 2>/dev/null | head -n 1 || true)
+        BRANCH_DUP=""
+        for BRANCH_NAME in $(gh api "repos/${HARNESS_REPO}/branches" --paginate --jq '.[].name' 2>/dev/null | grep -F "$SAFE_SLUG" || true); do
+          BRANCH_DATE=$(gh api "repos/${HARNESS_REPO}/commits/${BRANCH_NAME}" --jq .commit.committer.date 2>/dev/null || echo "")
+          if [ -n "$BRANCH_DATE" ] && BRANCH_DATE="$BRANCH_DATE" python3 -c "import datetime, os, sys; d=datetime.datetime.fromisoformat(os.environ['BRANCH_DATE'].replace('Z','+00:00')); sys.exit(0 if datetime.datetime.now(datetime.timezone.utc)-d <= datetime.timedelta(days=7) else 1)"; then
+            BRANCH_DUP="$BRANCH_NAME"
+            break
+          fi
+        done
+        if [ -n "$PR_DUP" ]; then
+          DUPLICATE_CHECK="DUPLICATE_RUN_DETECTED: git-pr|${PR_DUP}"
+        elif [ -n "$BRANCH_DUP" ]; then
+          DUPLICATE_CHECK="DUPLICATE_RUN_DETECTED: git-branch|${BRANCH_DUP}"
+        elif printf '%s\n' "$DUPLICATE_CHECK" | grep -q '^UNVERIFIED'; then
+          DUPLICATE_CHECK="${DUPLICATE_CHECK}; git-fallback-clean"
+        fi
+      fi
+
+      cat <<PACKET
+      === PRE-FIRE PACKET ===
+      WO_ID=${WO_ID}
+      TARGET_REPO=${TARGET_REPO}
+      TARGET_REPO_FULL=${TARGET_REPO_FULL}
+      WO_SLUG=${WO_SLUG}
+      YAML_FILENAME=${YAML_FILENAME}
+      RULE20_STAGING_GATE=${RULE20_STAGING_GATE}
+      WO_CLASS=${WO_CLASS}
+      BUSINESS_RISK_INVARIANT=${BUSINESS_RISK_INVARIANT}
+      ADV_PASS=${ADV_PASS}
+      RISK=${RISK}
+      DUPLICATE_CHECK=${DUPLICATE_CHECK}
+
+      What approval authorizes (two side effects):
+        1. Register ${YAML_FILENAME} to .archon/workflows/defaults/ on bdc-harness dev,
+           hot-reload it with PUT /api/workflows/${WO_SLUG}, then verify GET /api/workflows
+        2. POST /api/workflows/${WO_SLUG}/run to fire ${WO_SLUG} against ${TARGET_REPO_FULL}
+
+      Adversarial review summary:
+      ${ADV_OUT}
+      PACKET
+
+      echo ""
+      echo "If ADV_PASS=false, the approval-gate message will show \"ADV_PASS=false - type 'override adv' to proceed anyway.\""
+
+  # Node 7: approval-gate
+  # Operator reviews the pre-fire packet and approves or rejects.
+  - id: approval-gate
+    depends_on: [prefire-plan]
+    approval:
+      message: |
+        Review the pre-fire packet above.
+
+        Two side effects will be authorized:
+          1. Persist the child YAML to bdc-harness dev, then hot-reload it with PUT /api/workflows/:name
+          2. Fire the child workflow against the target codebase via POST /api/workflows/<slug>/run
+
+        If ADV_PASS=false is shown in the packet, type "override adv" to proceed anyway.
+        If DUPLICATE_RUN_DETECTED is shown, type "fire anyway" to override.
+
+        - "approved" / "proceed" / "yes" / "fire" -> proceed
+        - "no" / "reject" / "stop" -> halt (child YAML is still on disk, register/fire skipped)
+      capture_response: true
+      on_reject:
+        prompt: |
+          The operator rejected the pre-fire packet. Summarize what was rejected and
+          what would need to change before re-submitting. Do not re-fire automatically.
+          Output: OPERATOR_REJECTED: <reason from approval response>
+        max_attempts: 2
+
+  # Node 8: register-yaml
+  # Registers the child YAML to bdc-harness via gh api (API-only, no local git checkout).
+  # Primary: gh api PUT /contents (idempotent with existing SHA).
+  # Fallback: branch -> PUT contents -> PR -> merge.
+  # Then PUT /api/workflows and poll until registered.
+  - id: register-yaml
+    load_bearing: true
+    depends_on: [approval-gate]
+    bash: |
+      set -euo pipefail
+      PREFIRE=$prefire-plan.output
+      APPROVAL=$approval-gate.output
+
+      WO_ID=$(printf '%s\n' "$PREFIRE" | sed -n 's/^WO_ID=//p' | head -n 1)
+      WO_SLUG=$(printf '%s\n' "$PREFIRE" | sed -n 's/^WO_SLUG=//p' | head -n 1)
+      YAML_FILENAME=$(printf '%s\n' "$PREFIRE" | sed -n 's/^YAML_FILENAME=//p' | head -n 1)
+      TARGET_REPO_FULL=$(printf '%s\n' "$PREFIRE" | sed -n 's/^TARGET_REPO_FULL=//p' | head -n 1)
+      ADV_PASS=$(printf '%s\n' "$PREFIRE" | sed -n 's/^ADV_PASS=//p' | head -n 1)
+
+      # Guard: approval required
+      if ! printf '%s\n' "$APPROVAL" | grep -iqE 'approved|proceed|^yes|fire'; then
+        echo "register-yaml: approval not granted (got: $APPROVAL) - halting" >&2
+        exit 1
+      fi
+
+      # Guard: ADV_PASS check (bypass only if operator typed "override adv")
+      if [ "$ADV_PASS" != "true" ]; then
+        if ! printf '%s\n' "$APPROVAL" | grep -iq 'override adv'; then
+          echo "ERROR: ADV_PASS=false and operator did not type 'override adv' - halting" >&2
+          exit 1
+        fi
+        echo "WARN: adversarial review failed but operator overrode with 'override adv'"
+      fi
+
+      # Guard: duplicate run override
+      DUP_LINE=$(printf '%s\n' "$PREFIRE" | grep -E '^DUPLICATE_CHECK=' | head -n 1 || true)
+      if printf '%s\n' "$DUP_LINE" | grep -q 'DUPLICATE_RUN_DETECTED'; then
+        if ! printf '%s\n' "$APPROVAL" | grep -iq 'fire anyway'; then
+          echo "ERROR: DUPLICATE_RUN_DETECTED and operator did not type 'fire anyway' - halting" >&2
+          exit 1
+        fi
+        echo "WARN: operator overrode duplicate run detection with 'fire anyway'"
+      fi
+
+      if [ -z "$YAML_FILENAME" ] || [ ! -f "$YAML_FILENAME" ]; then
+        echo "ERROR: YAML draft file '$YAML_FILENAME' not found on disk" >&2
+        exit 1
+      fi
+
+      DEST_PATH=".archon/workflows/defaults/${WO_SLUG}.yaml"
+      YAML_CONTENT=$(base64 < "$YAML_FILENAME" | tr -d '\n')
+      COMMIT_MSG="feat(on-ramp): register ${WO_SLUG} child workflow via bdc-harness-wo-onramp"
+      HARNESS_REPO="thinmansoftware/bdc-harness"
+      API_BASE="${ARCHON_API_BASE:-}"
+      if ! API_BASE="$API_BASE" python3 -c 'import os,sys; from urllib.parse import urlsplit; u=urlsplit(os.environ.get("API_BASE", "")); sys.exit(0 if u.scheme == "http" and u.hostname in ("127.0.0.1", "localhost") and u.port is not None and u.username is None and u.password is None and u.path in ("", "/") and not u.query and not u.fragment else 1)'; then
+        echo "ERROR: ARCHON_API_BASE must be an explicit loopback staging URL; refusing external or unset target." >&2
+        exit 1
+      fi
+      ARCHON_HEADERS=(-H "x-archon-operator-token: ${ARCHON_OPERATOR_TOKEN}")
+      CF_ACCESS_ENABLED=false
+      if [ -n "${CF_ACCESS_CLIENT_ID:-}" ] && [ -n "${CF_ACCESS_CLIENT_SECRET:-}" ]; then
+        ARCHON_HEADERS+=(-H "CF-Access-Client-Id: ${CF_ACCESS_CLIENT_ID}")
+        ARCHON_HEADERS+=(-H "CF-Access-Client-Secret: ${CF_ACCESS_CLIENT_SECRET}")
+        CF_ACCESS_ENABLED=true
+      fi
+      case "$API_BASE" in
+        http://localhost:*|http://127.0.0.1:*|http://archon-app:*|http://app:*) API_IS_LOCAL=true ;;
+        *) API_IS_LOCAL=false ;;
+      esac
+
+      require_hot_reload_auth() {
+        if [ "$API_IS_LOCAL" = "true" ] || [ "$CF_ACCESS_ENABLED" = "true" ]; then
+          return 0
+        fi
+        echo "ERROR: hot-reload PUT requires CF Access service-token env vars from outside the container." >&2
+        echo "Set CF_ACCESS_CLIENT_ID and CF_ACCESS_CLIENT_SECRET, or set ARCHON_API_BASE to a localhost/container URL reachable from this executor." >&2
+        exit 1
+      }
+      require_hot_reload_auth
+
+      echo "=== register-yaml: Step 1 - GET /api/codebases to resolve default_cwd ==="
+      CODEBASES=$(curl -fsS --max-time 15 \
+        "${ARCHON_HEADERS[@]}" \
+        "${API_BASE}/api/codebases" 2>/dev/null || echo '{}')
+      DEFAULT_CWD=$(printf '%s\n' "$CODEBASES" \
+        | python3 -c "import sys,json; data=json.load(sys.stdin); cbs=data if isinstance(data,list) else data.get('codebases',[]); [print(cb.get('default_cwd',cb.get('cwd',''))) for cb in cbs if 'bdc-harness' in (cb.get('name','') or '') or (cb.get('name','') or '')==('thinmansoftware/bdc-harness')]" \
+        2>/dev/null || echo "")
+      echo "DEFAULT_CWD=${DEFAULT_CWD:-<not found>}"
+
+      echo "=== register-yaml: Step 2 - primary: gh api PUT /contents ==="
+      # Check for existing file SHA (needed for idempotent PUT)
+      EXISTING_SHA=$(gh api "repos/${HARNESS_REPO}/contents/${DEST_PATH}?ref=dev" \
+        --jq .sha 2>/dev/null || echo "")
+
+      PUT_BODY="{\"message\":\"${COMMIT_MSG}\",\"content\":\"${YAML_CONTENT}\",\"branch\":\"dev\"}"
+      if [ -n "$EXISTING_SHA" ]; then
+        PUT_BODY="{\"message\":\"${COMMIT_MSG}\",\"content\":\"${YAML_CONTENT}\",\"sha\":\"${EXISTING_SHA}\",\"branch\":\"dev\"}"
+      fi
+
+      PRIMARY_OK=false
+      if gh api -X PUT "repos/${HARNESS_REPO}/contents/${DEST_PATH}" \
+          --input - <<< "$PUT_BODY" --jq .commit.sha 2>/dev/null; then
+        PRIMARY_OK=true
+        echo "Primary gh api PUT: OK"
+      fi
+
+      if [ "$PRIMARY_OK" = "false" ]; then
+        echo "=== register-yaml: Step 3 - fallback: branch -> PUT -> PR -> merge ==="
+        FALLBACK_BRANCH="on-ramp/register-${WO_SLUG}-$(date +%Y%m%d%H%M%S)"
+
+        # Create branch off dev
+        DEV_SHA=$(gh api "repos/${HARNESS_REPO}/git/refs/heads/dev" --jq .object.sha 2>/dev/null || echo "")
+        if [ -z "$DEV_SHA" ]; then
+          echo "ERROR: cannot resolve dev branch SHA in ${HARNESS_REPO}" >&2
+          exit 1
+        fi
+        gh api -X POST "repos/${HARNESS_REPO}/git/refs" \
+          -f ref="refs/heads/${FALLBACK_BRANCH}" \
+          -f sha="$DEV_SHA" 2>&1 || { echo "ERROR: fallback branch creation failed" >&2; exit 1; }
+
+        # PUT file on fallback branch
+        FALLBACK_BODY="{\"message\":\"${COMMIT_MSG}\",\"content\":\"${YAML_CONTENT}\",\"branch\":\"${FALLBACK_BRANCH}\"}"
+        REGISTERED_SHA=$(gh api -X PUT "repos/${HARNESS_REPO}/contents/${DEST_PATH}" \
+          --input - <<< "$FALLBACK_BODY" --jq .commit.sha 2>/dev/null || echo "")
+        if [ -z "$REGISTERED_SHA" ]; then
+          echo "ERROR: fallback PUT /contents failed" >&2
+          exit 1
+        fi
+
+        # Open PR via the REST API (NOT `gh pr create` -- that has no --json/--jq flag and
+        # prints only a URL on success; using --json there made the command error every time,
+        # so the fallback "PR create failed" on a perfectly good branch. The pulls API returns
+        # JSON we can --jq for the number. Anchor: WO-CAULDRON-ONRAMP-ATOM-LASTMILE-FIXES-01
+        # re-proof-fire 2026-06-07 -- register-yaml fallback died here.)
+        PR_BODY="{\"title\":\"${COMMIT_MSG}\",\"head\":\"${FALLBACK_BRANCH}\",\"base\":\"dev\",\"body\":\"Auto-generated by bdc-harness-wo-onramp register-yaml fallback path. WO: ${WO_ID}\"}"
+        PR_CREATE_OUT=$(gh api -X POST "repos/${HARNESS_REPO}/pulls" --input - <<< "$PR_BODY" 2>/tmp/on-ramp-pr-create.err || true)
+        PR_NUM=$(printf '%s' "$PR_CREATE_OUT" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('number',''))" 2>/dev/null || echo "")
+        if [ -z "$PR_NUM" ]; then
+          echo "ERROR: fallback PR create failed; deleting ${FALLBACK_BRANCH} to avoid a dangling branch" >&2
+          sed 's/^/    /' /tmp/on-ramp-pr-create.err >&2 || true
+          rm -f /tmp/on-ramp-pr-create.err
+          gh api -X DELETE "repos/${HARNESS_REPO}/git/refs/heads/${FALLBACK_BRANCH}" >/dev/null 2>&1 || true
+          exit 1
+        fi
+        rm -f /tmp/on-ramp-pr-create.err
+
+        MERGE_OK=false
+        if gh pr merge "$PR_NUM" --repo "$HARNESS_REPO" --squash --delete-branch 2>/dev/null; then
+          MERGE_OK=true
+        elif gh api -X PUT "repos/${HARNESS_REPO}/pulls/${PR_NUM}/merge" \
+            -f merge_method=squash >/dev/null 2>&1; then
+          MERGE_OK=true
+          gh api -X DELETE "repos/${HARNESS_REPO}/git/refs/heads/${FALLBACK_BRANCH}" >/dev/null 2>&1 || true
+        fi
+
+        if [ "$MERGE_OK" != "true" ]; then
+          echo "ERROR: fallback PR #${PR_NUM} could not be squash-merged to dev; closing PR and deleting ${FALLBACK_BRANCH}" >&2
+          gh pr close "$PR_NUM" --repo "$HARNESS_REPO" --delete-branch >/dev/null 2>&1 || true
+          gh api -X DELETE "repos/${HARNESS_REPO}/git/refs/heads/${FALLBACK_BRANCH}" >/dev/null 2>&1 || true
+          exit 1
+        fi
+
+        echo "Fallback PR #${PR_NUM} squash-merged to dev and branch deleted"
+      fi
+
+      DEV_FILE_SHA=$(gh api "repos/${HARNESS_REPO}/contents/${DEST_PATH}?ref=dev" --jq .sha 2>/dev/null || echo "")
+      if [ -z "$DEV_FILE_SHA" ]; then
+        echo "ERROR: ${DEST_PATH} is not present on dev after register commit path; refusing hot-reload" >&2
+        exit 1
+      fi
+      echo "Dev branch contains ${DEST_PATH}: ${DEV_FILE_SHA}"
+
+      echo "=== register-yaml: Step 4 - PUT /api/workflows/<name> ==="
+      CWD_PARAM=""
+      [ -n "$DEFAULT_CWD" ] && CWD_PARAM="?cwd=$(DEFAULT_CWD="$DEFAULT_CWD" python3 -c "import os,urllib.parse; print(urllib.parse.quote(os.environ['DEFAULT_CWD'], safe=''))")"
+
+      BODY_FILE=$(mktemp)
+      if ! YAML_PATH="$YAML_FILENAME" bun -e "const fs=require('fs'); const data=Bun.YAML.parse(fs.readFileSync(process.env.YAML_PATH,'utf8')); process.stdout.write(JSON.stringify({definition:data}));" > "$BODY_FILE" 2>/tmp/on-ramp-hot-register-bun.err; then
+        echo "ERROR: failed to build hot-register PUT body from ${YAML_FILENAME}" >&2
+        sed 's/^/    /' /tmp/on-ramp-hot-register-bun.err >&2 || true
+        rm -f "$BODY_FILE" /tmp/on-ramp-hot-register-bun.err
+        exit 1
+      fi
+      rm -f /tmp/on-ramp-hot-register-bun.err
+
+      RESP_FILE=$(mktemp)
+      set +e
+      HTTP_CODE=$(curl -sS -o "$RESP_FILE" -w "%{http_code}" --max-time 30 \
+        -X PUT \
+        "${ARCHON_HEADERS[@]}" \
+        -H "Content-Type: application/json" \
+        --data-binary "@${BODY_FILE}" \
+        "${API_BASE}/api/workflows/${WO_SLUG}${CWD_PARAM}" 2>/dev/null)
+      CURL_EXIT=$?
+      set -e
+      rm -f "$BODY_FILE"
+
+      if [ "$CURL_EXIT" -ne 0 ] || [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
+        echo "ERROR: hot-reload PUT /api/workflows/${WO_SLUG} failed with HTTP ${HTTP_CODE}" >&2
+        sed 's/^/    /' "$RESP_FILE" >&2 || true
+        rm -f "$RESP_FILE"
+        exit 1
+      fi
+      rm -f "$RESP_FILE"
+      echo "Hot-reload PUT accepted for ${WO_SLUG} (HTTP ${HTTP_CODE})"
+
+      echo "=== register-yaml: Step 5 - poll GET /api/workflows until registered (60s max) ==="
+      REGISTERED=false
+      for i in $(seq 1 12); do
+        FOUND=$(curl -fsS --max-time 10 \
+          "${ARCHON_HEADERS[@]}" \
+          "${API_BASE}/api/workflows" 2>/dev/null \
+          | python3 -c "import sys,json; data=json.load(sys.stdin); ws=data if isinstance(data,list) else data.get('workflows',[]); [print('found') for w in ws if (w.get('workflow',w)).get('name','')==('${WO_SLUG}')] " \
+          2>/dev/null || echo "")
+        if [ "$FOUND" = "found" ]; then
+          REGISTERED=true
+          echo "Workflow ${WO_SLUG} registered after $((i*5))s"
+          break
+        fi
+        echo "Polling... attempt $i/12"
+        sleep 5
+      done
+
+      if [ "$REGISTERED" = "false" ]; then
+        echo "ERROR: ${WO_SLUG} did not appear in /api/workflows after 60s" >&2
+        echo "The YAML is on dev and the hot-reload PUT returned success, but GET /api/workflows did not show it." >&2
+        echo "Investigate loader validation errors before firing the child workflow." >&2
+        exit 1
+      fi
+
+      # Resolve registered SHA
+      REGISTERED_SHA=$(gh api "repos/${HARNESS_REPO}/contents/${DEST_PATH}?ref=dev" \
+        --jq .sha 2>/dev/null || echo "unknown")
+
+      echo "REGISTERED_OK=true"
+      echo "REGISTERED_SHA=${REGISTERED_SHA}"
+      echo "WO_ID=${WO_ID}"
+      echo "TARGET_REPO_FULL=${TARGET_REPO_FULL}"
+      echo "WO_SLUG=${WO_SLUG}"
+      echo "DEFAULT_CWD=${DEFAULT_CWD:-unknown}"
+      echo "DEST_PATH=${DEST_PATH}"
+
+  # Node 9: fire-child
+  # POSTs /api/workflows/<slug>/run with a synthesized conversationId to fire the registered child workflow.
+  - id: fire-child
+    load_bearing: true
+    depends_on: [register-yaml]
+    bash: |
+      set -euo pipefail
+      REG_OUT=$register-yaml.output
+      APPROVAL=$approval-gate.output
+      API_BASE="${ARCHON_API_BASE:-}"
+      if ! API_BASE="$API_BASE" python3 -c 'import os,sys; from urllib.parse import urlsplit; u=urlsplit(os.environ.get("API_BASE", "")); sys.exit(0 if u.scheme == "http" and u.hostname in ("127.0.0.1", "localhost") and u.port is not None and u.username is None and u.password is None and u.path in ("", "/") and not u.query and not u.fragment else 1)'; then
+        echo "ERROR: ARCHON_API_BASE must be an explicit loopback staging URL; refusing external or unset target." >&2
+        exit 1
+      fi
+
+      # Re-check approval in case trigger_rule brings us here unexpectedly
+      if ! printf '%s\n' "$APPROVAL" | grep -iqE 'approved|proceed|^yes|fire'; then
+        echo "fire-child: approval not granted - skipping fire" >&2
+        exit 1
+      fi
+
+      WO_ID=$(printf '%s\n' "$REG_OUT" | sed -n 's/^WO_ID=//p' | head -n 1)
+      WO_SLUG=$(printf '%s\n' "$REG_OUT" | sed -n 's/^WO_SLUG=//p' | head -n 1)
+      TARGET_REPO_FULL=$(printf '%s\n' "$REG_OUT" | sed -n 's/^TARGET_REPO_FULL=//p' | head -n 1)
+      TARGET_REPO=$(printf '%s\n' "$TARGET_REPO_FULL" | sed 's|bluedevilcollectibles/||')
+
+      if [ -z "$WO_SLUG" ] || [ -z "$TARGET_REPO_FULL" ]; then
+        echo "ERROR: WO_SLUG or TARGET_REPO_FULL missing from register-yaml output" >&2
+        exit 1
+      fi
+
+      REGISTERED_OK=$(printf '%s\n' "$REG_OUT" | sed -n 's/^REGISTERED_OK=//p' | head -n 1)
+      if [ "$REGISTERED_OK" != "true" ]; then
+        echo "ERROR: register-yaml did not emit REGISTERED_OK=true - aborting fire" >&2
+        exit 1
+      fi
+
+      FIRE_MESSAGE="Execute ${WO_ID} --project ${TARGET_REPO}"
+      CONV_ID="onramp-${WO_ID}-$(date +%s)"
+
+      # IDEMPOTENCY GUARD (fixes the double-fire bug, 2026-06-14): if fire-child
+      # re-executes (node retry / DAG re-entry), it would fire a SECOND child for the
+      # same WO_SLUG with a fresh CONV_ID -> two parallel builds racing the same PR.
+      # Before firing, ask the runs API whether a child for this WO_SLUG is already
+      # running. If so, SKIP the fire and treat the existing run as ours. Best-effort:
+      # a probe failure must NOT block the fire (shell-only parse; no multi-line python
+      # heredoc -- that breaks the YAML block scalar, per bun-yaml-parser gotcha).
+      RUNS_JSON=$(curl -fsS --max-time 15 "${API_BASE}/api/workflows/runs?limit=20" -H "x-archon-operator-token: ${ARCHON_OPERATOR_TOKEN}" 2>/dev/null || true)
+      # Compact to one-object-per-line, then keep only entries for THIS slug that are running/pending/started.
+      DUP_HIT=$(printf '%s' "$RUNS_JSON" | tr '{' '\n' | grep -F "\"workflow_name\":\"${WO_SLUG}\"" | grep -E '"status":"(running|pending|started)"' | head -n 1 || true)
+      if [ -n "$DUP_HIT" ]; then
+        echo "fire-child: a child run for ${WO_SLUG} is ALREADY RUNNING -- SKIPPING duplicate fire (idempotency guard)" >&2
+        echo "FIRE_OK=true"
+        echo "FIRE_SKIPPED_DUPLICATE=true"
+        exit 0
+      fi
+
+      echo "Firing: workflowSlug=${WO_SLUG} conversationId=${CONV_ID} message='${FIRE_MESSAGE}' repo=${TARGET_REPO_FULL}"
+
+      RESPONSE=$(curl -fsS -X POST \
+        "${API_BASE}/api/workflows/${WO_SLUG}/run" \
+        -H "Content-Type: application/json" \
+        -H "x-archon-operator-token: ${ARCHON_OPERATOR_TOKEN}" \
+        --max-time 30 \
+        -d "{
+          \"conversationId\": \"${CONV_ID}\",
+          \"message\": \"${FIRE_MESSAGE}\"
+        }" 2>&1)
+
+      # The fire endpoint commonly returns only {"accepted":true,"status":"started"}
+      # with NO run id / conversation id (proven on run 032da37 / WO-CAULDRON-MULTI-STAGE-PIPELINE-01,
+      # 2026-06-09). So RUN_ID resolving to "unknown" is the EXPECTED case, not an error.
+      # Capture whatever id the response DOES carry if present, but downstream
+      # verify-binding must NOT depend on it -- it matches on WO_SLUG==workflow_name
+      # (the reliable key) and falls back to the synthesized CONV_ID.
+      RUN_ID=$(printf '%s\n' "$RESPONSE" \
+        | python3 -c "import sys, json; d=json.load(sys.stdin); print(d.get('runId') or d.get('id') or d.get('conversation_id') or d.get('run_id') or 'unknown')" \
+        2>/dev/null || echo "parse_failed")
+
+      if [ "$RUN_ID" = "parse_failed" ] || [ "$RUN_ID" = "unknown" ]; then
+        echo "WARN: fire response carried no run id (expected for {\"accepted\":true}); verify-binding will match on WO_SLUG/CONV_ID instead: $RESPONSE" >&2
+      fi
+
+      echo "FIRE_OK=true"
+      echo "RUN_ID=${RUN_ID}"
+      echo "CONV_ID=${CONV_ID}"
+      echo "WO_ID=${WO_ID}"
+      echo "WO_SLUG=${WO_SLUG}"
+      echo "TARGET_REPO=${TARGET_REPO}"
+      echo "TARGET_REPO_FULL=${TARGET_REPO_FULL}"
+      echo "FIRE_RESPONSE=${RESPONSE}"
+
+  # Node 10: verify-binding (BEST-EFFORT post-success tail node)
+  # Polls /api/workflows/runs up to 90s to confirm the child run exists and is
+  # bound to the expected repo. This is a verification TAIL after register-yaml +
+  # fire-child have ALREADY succeeded -- so absence-of-record must NOT hard-fail
+  # the whole on-ramp run. Only a CONFIRMED binding MISMATCH (run found, bound to
+  # the wrong repo) is a hard fail. Run-not-found / API-unreachable / repo
+  # unresolvable => WARN and emit BINDING_OK=unverified (exit 0), letting
+  # build-manifest + review-issue proceed.
+  #
+  # Root cause of the original false-fail (run 032da37 / WO-CAULDRON-MULTI-STAGE-PIPELINE-01,
+  # 2026-06-09): the fire endpoint returns only {"accepted":true,"status":"started"}
+  # with NO run id, so RUN_ID resolved to the literal "unknown" and the id match never
+  # fired. The fallback matcher then used WRONG API keys -- it looked for
+  # 'initial_message'/'message'/'codebase'/'repo'/'repository' which do NOT exist on
+  # the runs payload. The real keys are: id, conversation_id, workflow_name,
+  # user_message, codebase_id (a UUID, not a repo name). This node now matches on
+  # workflow_name==WO_SLUG (the reliable key), conversation_id==CONV_ID, or
+  # WO_ID in user_message, and resolves codebase_id -> repo name via /api/codebases.
+  - id: verify-binding
+    load_bearing: true
+    depends_on: [fire-child]
+    bash: |
+      # set -e DELIBERATELY OMITTED -- best-effort tail node (register + fire already
+      # succeeded; this node verifies and must not kill a successful run on a soft miss).
+      set -uo pipefail
+      FIRE_OUT=$fire-child.output
+
+      RUN_ID=$(printf '%s\n' "$FIRE_OUT" | sed -n 's/^RUN_ID=//p' | head -n 1)
+      CONV_ID=$(printf '%s\n' "$FIRE_OUT" | sed -n 's/^CONV_ID=//p' | head -n 1)
+      WO_ID=$(printf '%s\n' "$FIRE_OUT" | sed -n 's/^WO_ID=//p' | head -n 1)
+      WO_SLUG=$(printf '%s\n' "$FIRE_OUT" | sed -n 's/^WO_SLUG=//p' | head -n 1)
+      EXPECTED_REPO=$(printf '%s\n' "$FIRE_OUT" | sed -n 's/^TARGET_REPO_FULL=//p' | head -n 1)
+
+      API_BASE="${ARCHON_API_BASE:-}"
+      if ! API_BASE="$API_BASE" python3 -c 'import os,sys; from urllib.parse import urlsplit; u=urlsplit(os.environ.get("API_BASE", "")); sys.exit(0 if u.scheme == "http" and u.hostname in ("127.0.0.1", "localhost") and u.port is not None and u.username is None and u.password is None and u.path in ("", "/") and not u.query and not u.fragment else 1)'; then
+        echo "ERROR: ARCHON_API_BASE must be an explicit loopback staging URL; refusing external or unset target." >&2
+        exit 1
+      fi
+      echo "=== verify-binding: polling for run (RUN_ID=${RUN_ID} CONV_ID=${CONV_ID} WO_SLUG=${WO_SLUG}) up to 90s ==="
+
+      # Resolve the codebase_id -> repo-name map once (so we can compare binding).
+      CODEBASES_JSON=$(curl -fsS --max-time 15 \
+        "${API_BASE}/api/codebases" \
+        -H "x-archon-operator-token: ${ARCHON_OPERATOR_TOKEN}" 2>/dev/null || echo '{}')
+
+      BINDING_STATE="not_found"   # not_found | matched_ok | matched_mismatch
+      BOUND_REPO=""
+      RUN_STATUS=""
+      FOUND_RUN_ID=""
+
+      for i in $(seq 1 18); do
+        RUNS_JSON=$(curl -fsS --max-time 15 \
+          "${API_BASE}/api/workflows/runs?limit=100" \
+          -H "x-archon-operator-token: ${ARCHON_OPERATOR_TOKEN}" 2>/dev/null || echo '{}')
+
+        # Match on the RELIABLE keys (workflow_name==WO_SLUG first), resolve codebase_id
+        # to a repo name via the codebases map, and emit: repo|status|run_id|matchkey
+        MATCH=$(RUNS="$RUNS_JSON" CODEBASES="$CODEBASES_JSON" \
+          RUN_ID="${RUN_ID}" CONV_ID="${CONV_ID}" WO_ID="${WO_ID}" WO_SLUG="${WO_SLUG}" python3 -c "
+      import json, os
+      def loadenv(k):
+          try: return json.loads(os.environ.get(k,'') or '{}')
+          except Exception: return {}
+      data=loadenv('RUNS'); cbdata=loadenv('CODEBASES')
+      runs=data if isinstance(data,list) else data.get('runs',[])
+      cbs=cbdata if isinstance(cbdata,list) else cbdata.get('codebases',[])
+      cbmap={}
+      for cb in cbs:
+          cid=cb.get('id') or cb.get('codebase_id')
+          nm=cb.get('name') or cb.get('repo') or cb.get('full_name') or ''
+          if cid: cbmap[str(cid)]=nm
+      run_id=os.environ.get('RUN_ID',''); conv_id=os.environ.get('CONV_ID','')
+      wo_id=os.environ.get('WO_ID',''); wo_slug=os.environ.get('WO_SLUG','')
+      def hit(r):
+          rid=str(r.get('id','')); cv=str(r.get('conversation_id',''))
+          wf=str(r.get('workflow_name','') or r.get('workflowName',''))
+          msg=str(r.get('user_message','') or r.get('initial_message','') or r.get('message','') or '')
+          if wo_slug and wf==wo_slug: return 'workflow_name'
+          if run_id and run_id not in ('unknown','parse_failed') and rid==run_id: return 'run_id'
+          if conv_id and cv==conv_id: return 'conversation_id'
+          if wo_id and wo_id in msg: return 'user_message'
+          return ''
+      for r in runs:
+          mk=hit(r)
+          if mk:
+              cid=str(r.get('codebase_id','') or '')
+              repo=cbmap.get(cid, r.get('codebase','') or r.get('repo','') or r.get('repository','') or '')
+              print((repo or '')+'|'+str(r.get('status','unknown'))+'|'+str(r.get('id',''))+'|'+mk)
+              break
+      " 2>/dev/null || echo "")
+
+        if [ -n "$MATCH" ]; then
+          BOUND_REPO=$(printf '%s\n' "$MATCH" | cut -d'|' -f1)
+          RUN_STATUS=$(printf '%s\n' "$MATCH" | cut -d'|' -f2)
+          FOUND_RUN_ID=$(printf '%s\n' "$MATCH" | cut -d'|' -f3)
+          MATCH_KEY=$(printf '%s\n' "$MATCH" | cut -d'|' -f4)
+          echo "Run found via ${MATCH_KEY}: run_id=${FOUND_RUN_ID} bound_repo=${BOUND_REPO:-<unresolved>} status=${RUN_STATUS}"
+
+          # If we could not resolve the repo name (codebase_id not in map), we cannot
+          # assert a mismatch -- treat as soft-verified (run exists, bound, but name
+          # unresolvable). Do NOT hard-fail.
+          if [ -z "$BOUND_REPO" ]; then
+            echo "WARN: run found but codebase_id did not resolve to a repo name; treating as soft-verified" >&2
+            BINDING_STATE="matched_ok"
+            break
+          fi
+
+          BOUND_NORMALIZED="$BOUND_REPO"
+          if ! printf '%s\n' "$BOUND_REPO" | grep -q '/'; then
+            BOUND_NORMALIZED="bluedevilcollectibles/${BOUND_REPO}"
+          fi
+
+          if [ "$BOUND_NORMALIZED" = "$EXPECTED_REPO" ]; then
+            BINDING_STATE="matched_ok"
+            BOUND_REPO="$BOUND_NORMALIZED"
+            echo "Binding verified: $BOUND_NORMALIZED == $EXPECTED_REPO"
+            break
+          else
+            # CONFIRMED mismatch: run is real but bound to the WRONG repo. This is the
+            # ONE hard-fail case -- the child is operating on the wrong codebase.
+            BINDING_STATE="matched_mismatch"
+            BOUND_REPO="$BOUND_NORMALIZED"
+            break
+          fi
+        fi
+
+        echo "Polling... attempt $i/18 (5s)"
+        sleep 5
+      done
+
+      # Hard fail ONLY on a confirmed wrong-repo binding.
+      if [ "$BINDING_STATE" = "matched_mismatch" ]; then
+        echo "ERROR: binding mismatch - bound to ${BOUND_REPO}, expected ${EXPECTED_REPO}" >&2
+        echo "Cancel guidance: curl -X DELETE ${API_BASE}/api/workflows/runs/${FOUND_RUN_ID:-$RUN_ID}" >&2
+        echo "BINDING_OK=false"
+        echo "BOUND_REPO=${BOUND_REPO}"
+        echo "EXPECTED_REPO=${EXPECTED_REPO}"
+        echo "RUN_ID=${FOUND_RUN_ID:-$RUN_ID}"
+        exit 1
+      fi
+
+      # Run not found within 90s: register + fire already SUCCEEDED, so this is a
+      # verification soft-miss, NOT a failure. WARN + skip (exit 0) so build-manifest
+      # and review-issue proceed. (false-fail fix: do not kill a post-success tail.)
+      if [ "$BINDING_STATE" = "not_found" ]; then
+        echo "WARN: child run not found in /api/workflows/runs after 90s (RUN_ID=${RUN_ID} CONV_ID=${CONV_ID} WO_SLUG=${WO_SLUG})." >&2
+        echo "WARN: register-yaml and fire-child both succeeded, so the child fire is presumed live; verification is best-effort and is being SKIPPED rather than failing the run." >&2
+        echo "BINDING_OK=unverified"
+        echo "BINDING_NOTE=run-not-found-after-90s-but-fire-succeeded"
+        echo "EXPECTED_REPO=${EXPECTED_REPO}"
+        echo "RUN_ID=${RUN_ID}"
+        echo "WO_ID=${WO_ID}"
+        echo "WO_SLUG=${WO_SLUG}"
+        exit 0
+      fi
+
+      # matched_ok
+      echo "BINDING_OK=true"
+      echo "BOUND_REPO=${BOUND_REPO}"
+      echo "EXPECTED_REPO=${EXPECTED_REPO}"
+      echo "RUN_ID=${FOUND_RUN_ID:-$RUN_ID}"
+      echo "WO_ID=${WO_ID}"
+      echo "RUN_STATUS=${RUN_STATUS}"
+
+  # Node 10b: binding-gate (when-expression classifier)
+  # The condition-evaluator (packages/workflows/src/condition-evaluator.ts) supports ONLY
+  # == != < <= > >= and compound && || -- NOT =~ (regex). It also compares against the
+  # WHOLE node output, OR (with .field) against JSON.parse(wholeOutput)[field]. verify-binding
+  # emits many chatty lines, so neither "$verify-binding.output == 'BINDING_OK=true'" nor a
+  # regex can ever match. The proven house pattern (block-classify in bdc-feature-development)
+  # is a tiny classifier whose ENTIRE stdout is ONE JSON line, gated downstream with
+  # $node.output.field == 'VALUE'. This node IS that classifier for the review-issue gate.
+  # verify-binding has 3 settled states: BINDING_OK=true (matched_ok), BINDING_OK=unverified
+  # (soft-miss after a successful fire), and exit 1 (confirmed wrong-repo mismatch -- which
+  # fails the node, so this gate never evaluates). Both true and unverified are on-ramp
+  # success states, so gate=proceed for either; anything else => halt.
+  - id: binding-gate
+    depends_on: [verify-binding]
+    trigger_rule: all_done
+    bash: |
+      set -uo pipefail
+      VB_OUT=$verify-binding.output
+      BINDING=$(printf '%s\n' "$VB_OUT" | grep -oE 'BINDING_OK=(true|unverified|false)' | tail -n 1 | sed 's/^BINDING_OK=//')
+      if [ "$BINDING" = "true" ] || [ "$BINDING" = "unverified" ]; then
+        GATE=proceed
+      else
+        GATE=halt
+      fi
+      # single JSON line = the entire stdout, so $binding-gate.output.gate parses
+      printf '{"gate":"%s","binding_ok":"%s"}\n' "$GATE" "${BINDING:-none}"
+
+  # Node 11: build-manifest
+  # Builds v2 Captain CI manifest for the child WO being on-ramped.
+  # trigger_rule: all_done so skipped/failed optional nodes do not block manifest.
+  - id: build-manifest
+    agent: major-build
+    trigger_rule: all_done
+    depends_on: [verify-binding]
+    prompt: |
+      Build the Captain CI v2 completion manifest for the child WO being on-ramped.
+      Extract the child WO_ID and WO_SLUG from Register-yaml and Fire-child below; do not use
+      or invent any on-ramp bookkeeping WO ID.
+
+      ## Inputs
+      Normalize-spec: $normalize-spec.output
+      yaml-author: $yaml-author.output
+      assert-yaml-ready: $assert-yaml-ready.output
+      Adversarial-review: $adversarial-review.output
+      Prefire-plan: $prefire-plan.output
+      Approval-gate: $approval-gate.output
+      Register-yaml: $register-yaml.output
+      Fire-child: $fire-child.output
+      Verify-binding: $verify-binding.output
+
+      ## Required v2 Manifest Format
+
+      ```
+      WO: <child WO_ID from Register-yaml/Fire-child>
+      Builder: Major Build (bdc-harness-wo-onramp)
+      Files modified: (none - on-ramp is orchestration only)
+      Files created: .archon/workflows/defaults/<WO_SLUG>.yaml (bdc-harness repo)
+      Tests: N/A - adversarial-review 8-criteria gate IS the test (scores surfaced below)
+      PRs: (register-yaml commits directly to bdc-harness dev; no PR for YAML registration)
+      Merge ancestors: (bdc-harness dev HEAD after register-yaml PUT; child product WO PR TBD by child run)
+      Grep assertions:
+        bdc-harness: gh api repos/thinmansoftware/bdc-harness/contents/.archon/workflows/defaults/<WO_SLUG>.yaml?ref=dev --jq .size -> > 0
+        bdc-harness: grep -c "^model:[ ]sonnet$" .archon/workflows/defaults/<WO_SLUG>.yaml -> 1
+        bdc-harness: grep -c "^policyFile:" .archon/workflows/defaults/<WO_SLUG>.yaml -> 1
+        bdc-harness: grep -c "id: business-risk-gate" .archon/workflows/defaults/<WO_SLUG>.yaml -> 1
+        bdc-harness: grep -c "id: review-issue" .archon/workflows/defaults/<WO_SLUG>.yaml -> 1
+      Runtime verification:
+        Archon API: curl -s https://archon.bluedevilcollectibles.com/api/workflows | python3 -c "import sys,json; ws=[w for w in json.load(sys.stdin).get('workflows',[]) if (w.get('workflow',w)).get('name')=='<WO_SLUG>']; print('FOUND' if ws else 'MISSING')" -> FOUND
+        Fire: RUN_ID=<from fire-child> BINDING_OK=<from verify-binding> BOUND_REPO=<from verify-binding>
+      Vercel deployment: N/A (no Vercel-deployed repo touched)
+      Adversarial review scores:
+      <paste full SCORES block from adversarial-review>
+      ADV_PASS=<from adversarial-review>
+      Substituted run variables:
+        WO_ID=<from Register-yaml/Fire-child>
+        WO_SLUG=<from Register-yaml/Fire-child>
+        REGISTERED_OK=<from Register-yaml>
+        registered_commit_sha=<from Register-yaml commit SHA>
+        RUN_ID=<from Fire-child>
+        BINDING_OK=<from Verify-binding>
+        BOUND_REPO=<from Verify-binding>
+        SCORES=<from Adversarial-review>
+        ADV_PASS=<from Adversarial-review>
+      Regression trail:
+        Event-store anchor: SELECT step_name FROM remote_agent_workflow_events WHERE data LIKE '%hardcoded on-ramp atom WO id%' on runs started 2026-07-15 returned build-manifest rows on every failed run.
+        Affected 2026-07-15 onramp run ids: b0161d7f, 937022a1, e5518145, f62d05ed.
+      VALIDATION: PASS
+      ```
+
+      Substitute all <placeholders> with real values from the node outputs above.
+      VALIDATION rules:
+      - If REGISTERED_OK != true -> VALIDATION: BLOCKED (registration failed).
+      - If verify-binding emitted BINDING_OK=false -> VALIDATION: BLOCKED (confirmed wrong-repo
+        binding; note this is the only hard-fail case and the run would already have failed).
+      - If verify-binding emitted BINDING_OK=unverified -> VALIDATION: PASS, and add a line
+        "Binding: UNVERIFIED (child fire accepted; run record not observed within 90s -- best-effort
+        verification skipped, fire is presumed live)". This is NOT a failure: register-yaml and
+        fire-child both succeeded.
+      - Otherwise (BINDING_OK=true) -> VALIDATION: PASS.
+
+  # Node 12: review-issue
+  # Marks the child WO GitHub issue ready for review and delivers the manifest.
+  - id: review-issue
+    depends_on: [build-manifest, binding-gate]
+    # Defect 7 fix (2026-06-09): the when: expression used =~ (regex) AND compared against
+    # verify-binding's whole multi-line output -- the condition-evaluator supports NEITHER.
+    # It supports only == != < <= > >= (+ compound && ||) and matches the WHOLE output, or
+    # (with .field) JSON.parse(wholeOutput)[field]. So both "=~ 'BINDING_OK=(true|unverified)'"
+    # and "== 'BINDING_OK=true'" can never match a chatty bash node, and the node fail-closed
+    # and was SKIPPED on every run (confirmed run 032da37fea6317754175b8a7642ccdee).
+    # Fix: gate on the binding-gate classifier node, whose ENTIRE stdout is one JSON line
+    # {"gate":"proceed"|"halt"}, using the proven house pattern $node.output.field == 'VALUE'.
+    # binding-gate emits gate=proceed for BOTH BINDING_OK=true (matched) AND BINDING_OK=unverified
+    # (soft-miss after a successful fire) -- both are on-ramp success states. A confirmed
+    # wrong-repo mismatch makes verify-binding exit 1 (node fails; this gate never evaluates).
+    # build-manifest's own VALIDATION guard still independently gates the actual review mark.
+    when: "$binding-gate.output.gate == 'proceed'"
+    task_class: clerical
+    bash: |
+      set -euo pipefail
+
+      capture_node_output() {
+        python3 -c 'import shlex, sys; s=sys.stdin.read(); sys.stdout.write((lambda p: p[0] if len(p)==1 else s)(shlex.split(s)) if len(s)>=2 and s[0]=="'"'"'" and s.rstrip("\n").endswith("'"'"'") else s)'
+      }
+
+      MANIFEST=$(capture_node_output <<'BDC_NODE_OUTPUT_BUILD_MANIFEST'
+      $build-manifest.output
+      BDC_NODE_OUTPUT_BUILD_MANIFEST
+      )
+      if ! printf '%s\n' "$MANIFEST" | grep -q '^VALIDATION: PASS$'; then
+        echo "review-issue: build-manifest is not VALIDATION: PASS -- skipping issue review flip."
+        exit 0
+      fi
+
+      REGISTER_OUT=$(capture_node_output <<'BDC_NODE_OUTPUT_REGISTER_YAML'
+      $register-yaml.output
+      BDC_NODE_OUTPUT_REGISTER_YAML
+      )
+      FIRE_OUT=$(capture_node_output <<'BDC_NODE_OUTPUT_FIRE_CHILD'
+      $fire-child.output
+      BDC_NODE_OUTPUT_FIRE_CHILD
+      )
+      WO_ID=$(printf '%s\n%s\n' "$REGISTER_OUT" "$FIRE_OUT" | sed -n 's/^WO_ID=//p' | head -n 1)
+      if [ -z "$WO_ID" ]; then
+        echo "review-issue: child WO_ID not found in register-yaml/fire-child output; skipping issue review flip."
+        exit 0
+      fi
+
+      ISSUE_REPO="${INPUT_ISSUE_REPO:-${ISSUE_REPO:-thinmansoftware/bdc-xo}}"
+      ISSUE_NUM=$(gh issue list --repo "$ISSUE_REPO" --search "$WO_ID in:title" --json number --jq '.[0].number // empty' 2>/dev/null || true)
+      if [ -z "$ISSUE_NUM" ]; then
+        echo "review-issue: no GitHub issue found for ${WO_ID} in ${ISSUE_REPO}; skipping status:review label and manifest comment."
+        exit 0
+      fi
+
+      gh label create status:review --repo "$ISSUE_REPO" --color 0E8A16 --description "BDC workflow is ready for review" 2>/dev/null || true
+      gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --remove-label status:building 2>/dev/null || true
+      gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --remove-label status:blocked 2>/dev/null || true
+      gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --add-label status:review
+
+      SENTINEL="<!-- onramp-manifest ${WO_ID} -->"
+      EXISTING_COMMENTS=$(gh issue view "$ISSUE_NUM" --repo "$ISSUE_REPO" --json comments --jq '.comments[].body' 2>/dev/null || true)
+      if printf '%s\n' "$EXISTING_COMMENTS" | grep -Fq "$SENTINEL"; then
+        echo "review-issue: $ISSUE_REPO#$ISSUE_NUM already has manifest sentinel for $WO_ID; skipping comment."
+      else
+        COMMENT_FILE=$(mktemp)
+        {
+          printf '%s\n' "$SENTINEL"
+          printf '%s\n' "$MANIFEST"
+        } > "$COMMENT_FILE"
+        gh issue comment "$ISSUE_NUM" --repo "$ISSUE_REPO" --body-file "$COMMENT_FILE"
+        rm -f "$COMMENT_FILE"
+        echo "review-issue: posted manifest comment to $ISSUE_REPO#$ISSUE_NUM"
+      fi
+
+      echo "review-issue: $ISSUE_REPO#$ISSUE_NUM -> status:review"

@@ -1,7 +1,7 @@
 name: bdc-lspro-pulllist-scout-locg-import
 description: |
   Use when: Executing WO-LSPRO-PULLLIST-SCOUT-LOCG-IMPORT-01.
-  Repo: bluedevilcollectibles/lspro-react (branch: promotion/v2)
+  Repo: thinmansoftware/lspro-react (branch: promotion/v2)
   Does: Wires Scout-first LOCG import for pull list subscribers in
   PullListCommandCenter.tsx SubscribersTab. Reads source files before planning
   to ensure correct component tree hierarchy. Commits, pushes, opens a PR
@@ -33,20 +33,20 @@ nodes:
       set -euo pipefail
       WO_ID="WO-LSPRO-PULLLIST-SCOUT-LOCG-IMPORT-01"
       SPEC_PATH="docs/work-orders/${WO_ID}.md"
-      SPEC_CONTENT=$(gh api "repos/bluedevilcollectibles/bdc-xo/contents/${SPEC_PATH}?ref=main" --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
+      SPEC_CONTENT=$(gh api "repos/thinmansoftware/bdc-xo/contents/${SPEC_PATH}?ref=main" --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
       if [ -z "$SPEC_CONTENT" ]; then
-        MATCH=$(gh api "repos/bluedevilcollectibles/bdc-xo/contents/docs/superpowers/specs?ref=main" --template '{{range .}}{{.path}}{{"\n"}}{{end}}' 2>/dev/null | grep "${WO_ID}.md$" | head -n 1)
+        MATCH=$(gh api "repos/thinmansoftware/bdc-xo/contents/docs/superpowers/specs?ref=main" --template '{{range .}}{{.path}}{{"\n"}}{{end}}' 2>/dev/null | grep "${WO_ID}.md$" | head -n 1)
         if [ -n "$MATCH" ]; then
           SPEC_PATH="$MATCH"
-          SPEC_CONTENT=$(gh api "repos/bluedevilcollectibles/bdc-xo/contents/${SPEC_PATH}?ref=main" --template '{{.content}}' | tr -d '\n' | base64 -d || true)
+          SPEC_CONTENT=$(gh api "repos/thinmansoftware/bdc-xo/contents/${SPEC_PATH}?ref=main" --template '{{.content}}' | tr -d '\n' | base64 -d || true)
         fi
       fi
       if [ -z "$SPEC_CONTENT" ]; then
-        ISSUE_NUM=$(gh issue list --repo bluedevilcollectibles/bdc-xo \
+        ISSUE_NUM=$(gh issue list --repo thinmansoftware/bdc-xo \
           --search "${WO_ID} in:title" --json number,title \
           --jq '.[0].number' 2>/dev/null || true)
         if [ -n "$ISSUE_NUM" ] && [ "$ISSUE_NUM" != "null" ]; then
-          SPEC_CONTENT=$(gh issue view "$ISSUE_NUM" --repo bluedevilcollectibles/bdc-xo \
+          SPEC_CONTENT=$(gh issue view "$ISSUE_NUM" --repo thinmansoftware/bdc-xo \
             --json body --jq .body 2>/dev/null || true)
           [ -n "$SPEC_CONTENT" ] && SPEC_PATH="issues/${ISSUE_NUM}"
         fi
@@ -64,7 +64,7 @@ nodes:
     task_class: medium_work
     prompt: |
       Read the source files relevant to WO-LSPRO-PULLLIST-SCOUT-LOCG-IMPORT-01 before planning.
-      This WO is in the bluedevilcollectibles/lspro-react repo. CWD is the lspro-react worktree root.
+      This WO is in the thinmansoftware/lspro-react repo. CWD is the lspro-react worktree root.
 
       ## Files to read (find exact paths first)
       Run these discovery commands:
@@ -224,14 +224,14 @@ nodes:
       The branch MUST NOT start with archon/thread- or contain -thread- anywhere.
 
       ## Repo Policy
-      Target repo: bluedevilcollectibles/lspro-react
+      Target repo: thinmansoftware/lspro-react
       This repo is in the Rule 20 staging-gate list.
 
       Output:
       push_target: feature-branch:feat/wo-lspro-pulllist-scout-locg-import-01
       pr_required: true
       staging_gate_required: true
-      repo: bluedevilcollectibles/lspro-react
+      repo: thinmansoftware/lspro-react
 
       CRITICAL: emit a `repo:` line in every output case.
 
@@ -248,9 +248,46 @@ nodes:
         echo "Out of scope for bdc-lspro-pulllist-scout-locg-import; failing closed." >&2
         exit 1
       fi
-      BRANCH=$(printf '%s\n' "$DECIDE_OUTPUT" | sed -n 's/^push_target: feature-branch://p' | head -n 1)
+      # WO-HARNESS-PUSH-TARGET-EXTRACTION-HARDENING-01: tolerant multi-strategy
+      # push_target extraction. The old line-anchored sed broke a 2nd time
+      # (run e5110df1, fable tier, 2026-08-01) after PR #165's first whitespace
+      # patch -- the ^...$ anchor requires the WHOLE line to be exactly
+      # "push_target: feature-branch: <token>", so any markdown fence, list
+      # bullet, blockquote, backtick, or trailing prose a model tier adds makes
+      # BRANCH come back empty and the node exit 1 with a message that lied
+      # ("absent" when the field was present but merely styled differently).
+      # Fix: pre-strip backticks, then (1) fast path -- the exact
+      # whitespace-tolerant anchor (unchanged behavior for well-formed output,
+      # zero regression); (2) fallback -- scan ANYWHERE for
+      # "push_target: feature-branch: <token>", stopping at the first whitespace
+      # so trailing prose is tolerated. Failure now distinguishes "field absent"
+      # from "field present but unparseable". Extraction is a pure read of the
+      # decide output (no state mutation), so re-running the node is
+      # side-effect-free. BRANCH_PATTERN validation below is unchanged and still
+      # runs after extraction.
+      DECIDE_OUTPUT_CLEAN=$(printf '%s\n' "$DECIDE_OUTPUT" | tr -d '`')
+      BRANCH=$(printf '%s\n' "$DECIDE_OUTPUT_CLEAN" | sed -n 's/^[[:space:]]*push_target:[[:space:]]*feature-branch:[[:space:]]*\([^[:space:]]*\)[[:space:]]*$/\1/p' | head -n 1)
       if [ -z "$BRANCH" ]; then
-        echo "No feature branch target found in decide-push-target output." >&2
+        BRANCH=$(printf '%s\n' "$DECIDE_OUTPUT_CLEAN" \
+          | { grep -oE 'push_target:[[:space:]]*feature-branch:[[:space:]]*[^[:space:]]+' || true; } \
+          | head -n 1 \
+          | sed -E 's/^.*feature-branch:[[:space:]]*//')
+      fi
+      if [ -z "$BRANCH" ]; then
+        # Bare-form fallback (anchor run ce394492, zero-open tier, 2026-08-07):
+        # open-tier models emit "push_target: feat/<name>" WITHOUT the
+        # feature-branch: prefix. Accept the bare form LAST. Safe: the extracted
+        # token still must pass BRANCH_PATTERN below, so this admits nothing the
+        # strict form would not.
+        BRANCH=$(printf '%s\n' "$DECIDE_OUTPUT_CLEAN" | { grep -oE 'push_target:[[:space:]]*(feat|fix|wip)/[A-Za-z0-9_-]+' || true; } | head -n 1 | sed -E 's/^push_target:[[:space:]]*//')
+      fi
+      if [ -z "$BRANCH" ]; then
+        if printf '%s\n' "$DECIDE_OUTPUT_CLEAN" | grep -q 'push_target'; then
+          PUSH_TARGET_EXCERPT=$(printf '%s\n' "$DECIDE_OUTPUT_CLEAN" | grep 'push_target' | head -n 1 | cut -c1-200)
+          echo "push_target field present but unparseable: ${PUSH_TARGET_EXCERPT}" >&2
+        else
+          echo "push_target field absent from decide-push-target output." >&2
+        fi
         exit 1
       fi
       BRANCH_PATTERN='^(feat/[A-Za-z0-9_-]+|fix/[A-Za-z0-9_-]+|wip/[A-Za-z0-9_-]+)$'
@@ -258,7 +295,29 @@ nodes:
         echo "Malformed branch name: $BRANCH does not match required pattern feat/|fix/|wip/" >&2
         exit 1
       fi
-      THREAD_ID=$(git rev-parse --abbrev-ref HEAD | sed 's|archon/thread-||')
+      # DEFECT FIX 2026-07-27 (anchor: WO-CRM-SUPABASE-CONVERGENCE-01, run d982e84e).
+      # The old line was:
+      #   THREAD_ID=$(git rev-parse --abbrev-ref HEAD | sed 's|archon/thread-||')
+      # That sed only strips a PREFIX. When HEAD is NOT archon/thread-<hash> -- e.g. a run
+      # resumed on an existing feature branch, as happens when a WO converges an existing
+      # PR -- nothing is stripped and THREAD_ID becomes the ENTIRE branch name, producing
+      # a nested double-suffix ref like:
+      #   feat/wo-crm-supabase-convergence-01-thread-feat/wo-xo-crm-minimum-complete-journey-01
+      # which then opened a SECOND, spurious PR. BRANCH is validated; THREAD_ID never was.
+      CURRENT_REF=$(git rev-parse --abbrev-ref HEAD)
+      case "$CURRENT_REF" in
+        archon/thread-*)
+          THREAD_ID=${CURRENT_REF#archon/thread-}
+          ;;
+        *)
+          THREAD_ID=$(git rev-parse --short=8 HEAD 2>/dev/null || echo "nohead")
+          echo "commit-and-push: HEAD is '${CURRENT_REF}' (not archon/thread-*); using commit-derived THREAD_ID=${THREAD_ID}" >&2
+          ;;
+      esac
+      if ! printf '%s\n' "$THREAD_ID" | grep -Eq '^[A-Za-z0-9_-]+$'; then
+        echo "ERROR: refusing to push -- derived THREAD_ID '${THREAD_ID}' is not a bare [A-Za-z0-9_-] token (would create a malformed branch)." >&2
+        exit 1
+      fi
       UNIQUE_BRANCH="${BRANCH}-thread-${THREAD_ID}"
       git status --short
       DIRTY=$(git status --porcelain)
@@ -281,7 +340,18 @@ nodes:
             | head -1)
           if [ -n "$RECOVERED" ]; then
             echo "Recovered push target from remote: $RECOVERED"
-            UNIQUE_BRANCH="$RECOVERED"
+            # DEFECT FIX 2026-07-27 (anchor: bdc-crm PR #4, run f8ef4b92).
+            # This recovery block adopts ANY remote ref whose HEAD SHA matches local HEAD.
+            # If a PRIOR run pushed a malformed branch name, this block finds it, adopts it,
+            # and pushes to it again -- propagating the corruption forward and opening a new
+            # spurious PR each time. The bug feeds on its own output. Observed names:
+            #   feat/wo-crm-supabase-convergence-01-thread-wo-crm-supabase-convergence-01'
+            # (note the nested WO id AND the trailing quote). Validate before adopting.
+            if printf '%s\n' "$RECOVERED" | grep -Eq '^(feat|fix|wip)/[A-Za-z0-9_-]+-thread-[A-Za-z0-9_-]+$'; then
+              UNIQUE_BRANCH="$RECOVERED"
+            else
+              echo "WARN: recovered remote ref '${RECOVERED}' is malformed -- refusing to adopt it; keeping ${UNIQUE_BRANCH}" >&2
+            fi
           else
             echo "No changed files and no commits ahead of origin/${UNIQUE_BRANCH} -- implement loop did not produce work" >&2
             exit 1
@@ -442,16 +512,43 @@ nodes:
     persona: xo
     depends_on: [build-manifest]
     task_class: clerical
-    prompt: |
-      Update the Notion Work Order page if Notion MCP is available in this runtime.
+    bash: |
+      set -euo pipefail
 
-      ## Required Notion Changes
-      - Claude Status: REVIEW
-      - Status: Review
-      - Add the Captain CI manifest as a page comment
+      capture_node_output() {
+        python3 -c 'import shlex, sys; s=sys.stdin.read(); sys.stdout.write((lambda p: p[0] if len(p)==1 else s)(shlex.split(s)) if len(s)>=2 and s[0]=="'"'"'" and s.rstrip("\n").endswith("'"'"'") else s)'
+      }
 
-      ## Manifest
+      MANIFEST=$(capture_node_output <<'BDC_NODE_OUTPUT_MANIFEST'
       $build-manifest.output
+      BDC_NODE_OUTPUT_MANIFEST
+      )
 
-      If Notion MCP is not available inside the container, do not invent a workaround.
-      Output a TODO for XO to flip Notion manually with the manifest above.
+      READ_SPEC_OUT=$(capture_node_output <<'BDC_NODE_OUTPUT_READ_SPEC'
+      $read-spec.output
+      BDC_NODE_OUTPUT_READ_SPEC
+      )
+      ISSUE_REPO="${ISSUE_REPO:-thinmansoftware/bdc-xo}"
+      ISSUE_NUM=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'issue=[0-9]+' | head -1 | cut -d= -f2 || true)
+      if [ -z "$ISSUE_NUM" ]; then
+        ISSUE_NUM=$(printf '%s\n' "$READ_SPEC_OUT" | sed -n 's/^SPEC_PATH=.*issues\/\([0-9][0-9]*\).*/\1/p' | head -1)
+      fi
+      if [ -z "$ISSUE_NUM" ]; then
+        WO_ID_FROM_SPEC=$(printf '%s\n' "$READ_SPEC_OUT" | sed -n 's/^WO_ID=//p' | head -1)
+        if [ -n "$WO_ID_FROM_SPEC" ]; then
+          ISSUE_NUM=$(gh issue list --repo "$ISSUE_REPO" --search "$WO_ID_FROM_SPEC in:title" --json number --jq '.[0].number // empty' 2>/dev/null || true)
+        fi
+      fi
+      if [ -z "$ISSUE_NUM" ]; then
+        echo "flip-notion: no GitHub issue resolved; skipping status:review label + manifest comment."
+        exit 0
+      fi
+
+      gh label create status:review --repo "$ISSUE_REPO" --color 0E8A16 --description "BDC workflow is ready for review" 2>/dev/null || true
+      gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --remove-label status:building 2>/dev/null || true
+      gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --remove-label status:blocked 2>/dev/null || true
+      gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --add-label status:review
+      COMMENT_FILE=$(mktemp)
+      printf '%s\n' "$MANIFEST" > "$COMMENT_FILE"
+      gh issue comment "$ISSUE_NUM" --repo "$ISSUE_REPO" --body-file "$COMMENT_FILE"
+      echo "flip-notion: $ISSUE_REPO#$ISSUE_NUM -> status:review (manifest posted as comment)"

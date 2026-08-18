@@ -6,11 +6,11 @@ description: |
         collects Rule 14 INFRA evidence (docker inspect, docker logs, curl), commits source if changed, opens PR, builds manifest.
   NOT for: Code-only features (use bdc-feature-development), doctrine updates, database migrations.
 
-  ⚠️  SERIAL ONLY: parallel_ok=false. Multiple infra deploys against the same Hetzner host create race conditions.
+  !  SERIAL ONLY: parallel_ok=false. Multiple infra deploys against the same Hetzner host create race conditions.
        Every WO using this YAML must declare parallel_ok=false.
 
 policyFile: harness/policies/agent-behavior.md
-model: claude-sonnet-4-5
+model: sonnet
 
 nodes:
   - id: read-spec
@@ -25,7 +25,7 @@ nodes:
         exit 1
       fi
       # Try direct path first, then date-prefixed glob (specs are commonly named YYYY-MM-DD-WO-...md)
-      # CWD is the bdc-xo repo root (Archon worktree), so paths are relative — no BDC_XO/ prefix.
+      # CWD is the bdc-xo repo root (Archon worktree), so paths are relative -- no BDC_XO/ prefix.
       SPEC_PATH="docs/superpowers/specs/${WO_ID}.md"
       if [ ! -f "$SPEC_PATH" ]; then
         SPEC_PATH=$(ls docs/superpowers/specs/*${WO_ID}.md 2>/dev/null | head -n 1 || true)
@@ -34,13 +34,13 @@ nodes:
         # Fallback 3: GitHub issue body (WO-HARNESS-READ-SPEC-ISSUE-BODY-FALLBACK-01)
         ISSUE_NUM=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'issue=[0-9]+' | head -n 1 | cut -d= -f2 || true)
         if [ -z "$ISSUE_NUM" ]; then
-          ISSUE_NUM=$(gh issue list --repo bluedevilcollectibles/bdc-xo \
+          ISSUE_NUM=$(gh issue list --repo thinmansoftware/bdc-xo \
             --search "${WO_ID} in:title" --json number,title \
             --jq '.[0].number' 2>/dev/null || true)
         fi
         SPEC_CONTENT=""
         if [ -n "$ISSUE_NUM" ] && [ "$ISSUE_NUM" != "null" ]; then
-          SPEC_CONTENT=$(gh issue view "$ISSUE_NUM" --repo bluedevilcollectibles/bdc-xo \
+          SPEC_CONTENT=$(gh issue view "$ISSUE_NUM" --repo thinmansoftware/bdc-xo \
             --json body --jq .body 2>/dev/null || true)
         fi
         if [ -z "$SPEC_CONTENT" ]; then
@@ -70,7 +70,7 @@ nodes:
       ARTIFACT_DIR="${ARTIFACTS_DIR:-.}"
       mkdir -p "$ARTIFACT_DIR/pre-state"
 
-      # Generic Docker inspection — caller specifies which container via spec
+      # Generic Docker inspection -- caller specifies which container via spec
       CONTAINER_NAME="${CONTAINER_NAME:-overlord}"
 
       echo "=== Capturing pre-state for container: $CONTAINER_NAME ===" | tee "$ARTIFACT_DIR/pre-state/capture.log"
@@ -183,7 +183,7 @@ nodes:
         exit 1
       }
 
-      echo "✓ Container $CONTAINER_NAME is running"
+      echo "[x] Container $CONTAINER_NAME is running"
 
       # Check for health status
       HEALTH=$(docker inspect "$CONTAINER_NAME" --format='{{.State.Health.Status}}' 2>/dev/null || echo "unknown")
@@ -192,7 +192,7 @@ nodes:
       # Save post-state docker inspect
       docker inspect "$CONTAINER_NAME" > "$ARTIFACT_DIR/post-state/docker-inspect.json"
       docker ps --filter "name=$CONTAINER_NAME" > "$ARTIFACT_DIR/post-state/docker-ps.txt"
-      echo "✓ Post-state docker inspect saved"
+      echo "[x] Post-state docker inspect saved"
 
   - id: verify-source-live
     depends_on: [verify-container-healthy]
@@ -212,7 +212,7 @@ nodes:
             echo "Source verification failed: line not found in /app/$SOURCE_FILE" >&2
             exit 1
           }
-          echo "✓ Rule 19: Source line verified live in container"
+          echo "[x] Rule 19: Source line verified live in container"
         else
           echo "SOURCE_LINE not set; skipping Rule 19 grep (not a source change deploy)"
         fi
@@ -239,15 +239,15 @@ nodes:
             continue
           fi
           if docker exec "$CONTAINER_NAME" printenv | grep -q "^${var}="; then
-            echo "✓ $var is set"
+            echo "[x] $var is set"
           else
-            echo "✗ $var is NOT set" >&2
+            echo "[ ] $var is NOT set" >&2
             exit 1
           fi
         done <<EOF
         $ENV_VARS
         EOF
-        echo "✓ All env vars verified"
+        echo "[x] All env vars verified"
       else
         echo "ENV_VARS not set; skipping env var verification"
       fi
@@ -262,7 +262,7 @@ nodes:
 
       echo "Running smoke test: $SMOKE_CMD"
       eval "$SMOKE_CMD" > "$ARTIFACT_DIR/post-state/smoke-test.txt" 2>&1 || true
-      echo "✓ Smoke test complete (evidence saved)"
+      echo "[x] Smoke test complete (evidence saved)"
 
   - id: decide-push-target
     depends_on: [runtime-smoke-test]
@@ -281,8 +281,8 @@ nodes:
 
       ## Analysis
       Check if the apply-change node modified any source files (check git status).
-      If only config/docker-compose/env changes → no_push_needed.
-      If source files changed → feature branch + PR.
+      If only config/docker-compose/env changes -> no_push_needed.
+      If source files changed -> feature branch + PR.
 
   - id: commit-and-push
     depends_on: [decide-push-target]
@@ -302,7 +302,29 @@ nodes:
       # WO-HARNESS-YAML-USE-THREAD-BRANCH-NOT-FEATURE-BRANCH-01
       # Engine already provides a unique archon/thread-<hash> branch per run.
       # Derive a unique remote push target from it instead of clobbering a shared name.
-      THREAD_ID=$(git rev-parse --abbrev-ref HEAD | sed 's|archon/thread-||')
+      # DEFECT FIX 2026-07-27 (anchor: WO-CRM-SUPABASE-CONVERGENCE-01, run d982e84e).
+      # The old line was:
+      #   THREAD_ID=$(git rev-parse --abbrev-ref HEAD | sed 's|archon/thread-||')
+      # That sed only strips a PREFIX. When HEAD is NOT archon/thread-<hash> -- e.g. a run
+      # resumed on an existing feature branch, as happens when a WO converges an existing
+      # PR -- nothing is stripped and THREAD_ID becomes the ENTIRE branch name, producing
+      # a nested double-suffix ref like:
+      #   feat/wo-crm-supabase-convergence-01-thread-feat/wo-xo-crm-minimum-complete-journey-01
+      # which then opened a SECOND, spurious PR. BRANCH is validated; THREAD_ID never was.
+      CURRENT_REF=$(git rev-parse --abbrev-ref HEAD)
+      case "$CURRENT_REF" in
+        archon/thread-*)
+          THREAD_ID=${CURRENT_REF#archon/thread-}
+          ;;
+        *)
+          THREAD_ID=$(git rev-parse --short=8 HEAD 2>/dev/null || echo "nohead")
+          echo "commit-and-push: HEAD is '${CURRENT_REF}' (not archon/thread-*); using commit-derived THREAD_ID=${THREAD_ID}" >&2
+          ;;
+      esac
+      if ! printf '%s\n' "$THREAD_ID" | grep -Eq '^[A-Za-z0-9_-]+$'; then
+        echo "ERROR: refusing to push -- derived THREAD_ID '${THREAD_ID}' is not a bare [A-Za-z0-9_-] token (would create a malformed branch)." >&2
+        exit 1
+      fi
       UNIQUE_BRANCH="${BRANCH}-thread-${THREAD_ID}"
       git status --short
       CHANGED_FILES=$(git status --porcelain | awk '{print substr($0,4)}')
@@ -358,7 +380,7 @@ nodes:
       BODY="Infra deployment WO. See manifest in Notion for evidence."
 
       # Rule 29: infra-deploy PRs always target bdc-harness (source file changes only).
-      gh pr create --repo bluedevilcollectibles/bdc-harness --title "$TITLE" --body "$BODY" --head "$UNIQUE_BRANCH" || true
+      gh pr create --repo thinmansoftware/bdc-harness --title "$TITLE" --body "$BODY" --head "$UNIQUE_BRANCH" || true
 
   - id: build-manifest
     depends_on: [open-pr-if-needed]
@@ -404,16 +426,43 @@ nodes:
   - id: flip-notion
     depends_on: [post-completed]
     task_class: clerical
-    prompt: |
-      Update the Notion Work Order page to reflect completion.
+    bash: |
+      set -euo pipefail
 
-      ## Required Notion Changes
-      - Claude Status: REVIEW
-      - Status: Review
-      - Add the Rule 14 INFRA manifest as a page comment
-      - Include backup location and rollback procedure
+      capture_node_output() {
+        python3 -c 'import shlex, sys; s=sys.stdin.read(); sys.stdout.write((lambda p: p[0] if len(p)==1 else s)(shlex.split(s)) if len(s)>=2 and s[0]=="'"'"'" and s.rstrip("\n").endswith("'"'"'") else s)'
+      }
 
-      ## Manifest
-      $build-manifest.output
+      MANIFEST=$(capture_node_output <<'BDC_NODE_OUTPUT_MANIFEST'
+      $post-completed.output
+      BDC_NODE_OUTPUT_MANIFEST
+      )
 
-      If Notion MCP is not available, output a TODO for XO to flip Notion manually.
+      READ_SPEC_OUT=$(capture_node_output <<'BDC_NODE_OUTPUT_READ_SPEC'
+      $read-spec.output
+      BDC_NODE_OUTPUT_READ_SPEC
+      )
+      ISSUE_REPO="${ISSUE_REPO:-thinmansoftware/bdc-xo}"
+      ISSUE_NUM=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'issue=[0-9]+' | head -1 | cut -d= -f2 || true)
+      if [ -z "$ISSUE_NUM" ]; then
+        ISSUE_NUM=$(printf '%s\n' "$READ_SPEC_OUT" | sed -n 's/^SPEC_PATH=.*issues\/\([0-9][0-9]*\).*/\1/p' | head -1)
+      fi
+      if [ -z "$ISSUE_NUM" ]; then
+        WO_ID_FROM_SPEC=$(printf '%s\n' "$READ_SPEC_OUT" | sed -n 's/^WO_ID=//p' | head -1)
+        if [ -n "$WO_ID_FROM_SPEC" ]; then
+          ISSUE_NUM=$(gh issue list --repo "$ISSUE_REPO" --search "$WO_ID_FROM_SPEC in:title" --json number --jq '.[0].number // empty' 2>/dev/null || true)
+        fi
+      fi
+      if [ -z "$ISSUE_NUM" ]; then
+        echo "flip-notion: no GitHub issue resolved; skipping status:review label + manifest comment."
+        exit 0
+      fi
+
+      gh label create status:review --repo "$ISSUE_REPO" --color 0E8A16 --description "BDC workflow is ready for review" 2>/dev/null || true
+      gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --remove-label status:building 2>/dev/null || true
+      gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --remove-label status:blocked 2>/dev/null || true
+      gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --add-label status:review
+      COMMENT_FILE=$(mktemp)
+      printf '%s\n' "$MANIFEST" > "$COMMENT_FILE"
+      gh issue comment "$ISSUE_NUM" --repo "$ISSUE_REPO" --body-file "$COMMENT_FILE"
+      echo "flip-notion: $ISSUE_REPO#$ISSUE_NUM -> status:review (manifest posted as comment)"

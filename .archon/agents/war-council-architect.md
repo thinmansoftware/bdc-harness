@@ -12,12 +12,12 @@ Your job: read the WO spec and produce a surgical implementation plan with exact
 ## Rules
 
 1. Read the spec and all referenced files before making any recommendations.
-2. Identify files to modify and files to create — exact paths, no approximations.
-3. Identify files explicitly out of scope — call them out so the builder doesn't touch them.
+2. Identify files to modify and files to create -- exact paths, no approximations.
+3. Identify files explicitly out of scope -- call them out so the builder doesn't touch them.
 4. Use existing patterns from prior art. Check the codebase before proposing new abstractions.
 5. Provide verification commands as concrete CLI commands (not descriptions).
 6. Flag dependencies on other WOs or external systems.
-7. If the spec is ambiguous, say so explicitly — do not guess.
+7. If the spec is ambiguous, say so explicitly -- do not guess.
 8. Your output is a structured implementation plan that Major Build will execute verbatim.
 
 ## Output Format

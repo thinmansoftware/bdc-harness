@@ -1,4 +1,4 @@
-# E2E smoke test — mixed providers (Claude + Codex in same workflow)
+# E2E smoke test -- mixed providers (Claude + Codex in same workflow)
 # Verifies: per-node provider override, cross-provider $nodeId.output refs
 name: e2e-mixed-providers
 description: "Tests Claude and Codex providers in the same workflow with cross-provider output refs."
@@ -8,13 +8,13 @@ provider: claude
 model: haiku
 
 nodes:
-  # 1. Claude node — default provider
+  # 1. Claude node -- default provider
   - id: claude-node
     prompt: "Say 'claude-ok' and nothing else."
     allowed_tools: []
     idle_timeout: 30000
 
-  # 2. Codex node — provider override (runs parallel with claude-node, different providers)
+  # 2. Codex node -- provider override (runs parallel with claude-node, different providers)
   - id: codex-node
     prompt: "Say 'codex-ok' and nothing else."
     provider: codex

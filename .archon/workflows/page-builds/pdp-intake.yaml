@@ -64,7 +64,7 @@ nodes:
       WO_ID=$(printf '%s\n' "$read-spec.output" | sed -n 's/^WO_ID=//p' | head -n 1)
       curl -sS -X POST "https://n8n.bluedevilcollectibles.com/webhook/builder-status" \
         -H "Content-Type: application/json" \
-        -d "{\"action\":\"started\",\"wo_id\":\"${WO_ID}\",\"builder\":\"Major Build\",\"detail\":\"PDP v2 intake — CD source rebuild + Rule 10 at intake\",\"timestamp\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}"
+        -d "{\"action\":\"started\",\"wo_id\":\"${WO_ID}\",\"builder\":\"Major Build\",\"detail\":\"PDP v2 intake -- CD source rebuild + Rule 10 at intake\",\"timestamp\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}"
 
   - id: ingest-cd-source
     depends_on: [read-spec]
@@ -75,13 +75,13 @@ nodes:
       DEST="design/pdp/v2-source"
       mkdir -p "$DEST"
       if [ ! -f "$CD_SRC/index.html" ]; then
-        echo "CD source not found at $CD_SRC/index.html — caller must mount Downloads dir" >&2
+        echo "CD source not found at $CD_SRC/index.html -- caller must mount Downloads dir" >&2
         exit 1
       fi
-      # Canonical version assertion: fetch-11 is 57710 bytes (per spec §2)
+      # Canonical version assertion: fetch-11 is 57710 bytes (per spec Section 2)
       SIZE=$(stat -c %s "$CD_SRC/index.html")
       if [ "$SIZE" -ne 57710 ]; then
-        echo "CD source size mismatch: expected 57710, got $SIZE — refusing to ingest non-canonical version" >&2
+        echo "CD source size mismatch: expected 57710, got $SIZE -- refusing to ingest non-canonical version" >&2
         exit 1
       fi
       cp "$CD_SRC/index.html" "$DEST/index.html"
@@ -108,14 +108,14 @@ nodes:
       - Files explicitly out of scope (legacy /catalog/[id], tokens.css, theme-shell)
       - Component partition: which CD source <section> maps to which .tsx file
       - Color audit: list every raw hex/rgba value found in design/pdp/v2-source/*.css and the
-        token replacement decision per RULE10 §6 mappings (cited in the spec).
+        token replacement decision per RULE10 Section 6 mappings (cited in the spec).
       - Verification commands (build, types, playwright Pre-FOC, playwright Released, grep gate)
-      - Commit message: `feat(storefront): WO-STOREFRONT-PDP-V2-INTAKE-01 — rebuild PDP from CD source with Rule 10 baked in`
+      - Commit message: `feat(storefront): WO-STOREFRONT-PDP-V2-INTAKE-01 -- rebuild PDP from CD source with Rule 10 baked in`
       - Push policy: feature branch -> PR to **staging** (Rule 20; NOT master)
       - Staging gate required: TRUE
 
       ## Hard rules
-      - If a CD source color has NO mapping in spec §RULE10-CSS-CLEANUP §6, list it under
+      - If a CD source color has NO mapping in spec Section RULE10-CSS-CLEANUP Section 6, list it under
         "BLOCKERS" and STOP. Do NOT invent token names.
       - Do not propose ANY tokens.css change.
       - Do not propose ANY theme-shell or globals.css change.
@@ -141,20 +141,20 @@ nodes:
 
         ## Rule 10 at intake (NOT retrofit)
         - app/styles/pdp.css ships ZERO raw hex / rgba on the FIRST commit.
-        - For every color encountered in CD source, replace per RULE10 §6 mappings BEFORE
+        - For every color encountered in CD source, replace per RULE10 Section 6 mappings BEFORE
           writing the line. Do not write a raw color first then patch later.
-        - For tinted overlays, use color-mix(in srgb, var(--TOKEN) N%, transparent) — never raw rgba().
+        - For tinted overlays, use color-mix(in srgb, var(--TOKEN) N%, transparent) -- never raw rgba().
         - Inline TSX style={{}} colors are forbidden. Use CSS classes only.
-        - If any CD source color has no §6 mapping, STOP and emit BLOCKER.
+        - If any CD source color has no Section 6 mapping, STOP and emit BLOCKER.
 
         ## Mock data
-        Create app/data/mock-products.json with the two fixtures per spec §4. Real cover
+        Create app/data/mock-products.json with the two fixtures per spec Section 4. Real cover
         images go in public/mock-covers/ (8 files). If you can't find real cover art on
         the host, use any 600x900 webp placeholder that is NOT a gray box and NOT a 404.
 
         ## Playwright tests
         Author tests/playwright/pdp-pre-foc.spec.ts and pdp-released.spec.ts per spec
-        §10 — every assertion in §10 must be present.
+        Section 10 -- every assertion in Section 10 must be present.
 
         ## Execution Rules
         - Modify only files listed in the plan as in-scope.
@@ -162,7 +162,7 @@ nodes:
         - Do not deploy.
         - Do not push to master directly. Push to feat/wo-storefront-pdp-v2-intake-01 branch
           and open PR to staging.
-        - Stop and report BLOCKER if a needed CD-source color has no §6 mapping or if
+        - Stop and report BLOCKER if a needed CD-source color has no Section 6 mapping or if
           theme-shell predecessor isn't on staging.
 
         ## Completion Criteria
@@ -170,7 +170,7 @@ nodes:
         - All 15 components written
         - app/styles/pdp.css authored Rule 10 clean
         - mock-products.json + 8 cover images in place
-        - Both Playwright spec files written with every §10 assertion
+        - Both Playwright spec files written with every Section 10 assertion
         - `grep -cE '#[0-9A-Fa-f]{3,8}\b|rgba?\(' app/styles/pdp.css` returns 0 (verify in your last iteration)
       until: COMPLETE
       max_iterations: 6
@@ -210,7 +210,7 @@ nodes:
     depends_on: [verify-build, verify-types]
     bash: |
       set -euo pipefail
-      # Click-verify hard stop per spec §11.12 — both states must pass
+      # Click-verify hard stop per spec Section 11.12 -- both states must pass
       npm run test:pdp -- --grep="pre-foc"
       npm run test:pdp -- --grep="released"
 
@@ -238,7 +238,7 @@ nodes:
       ## Required Output
       Return one of:
       - satisfied: with explicit confirmation that (a) CD source ingested at design/pdp/v2-source/,
-        (b) pdp.css raw color count is 0, (c) both Playwright suites passed all §10 assertions,
+        (b) pdp.css raw color count is 0, (c) both Playwright suites passed all Section 10 assertions,
         (d) no inline TSX colors, (e) no tokens.css changes
       - needs_revision: with exact file/line/behavior findings
 
@@ -285,7 +285,7 @@ nodes:
         echo "No changes staged." >&2
         exit 1
       fi
-      git commit -m "feat(storefront): WO-STOREFRONT-PDP-V2-INTAKE-01 — rebuild PDP from CD source with Rule 10 baked in"
+      git commit -m "feat(storefront): WO-STOREFRONT-PDP-V2-INTAKE-01 -- rebuild PDP from CD source with Rule 10 baked in"
       git push -u origin "$BRANCH"
 
   - id: open-pr
@@ -300,7 +300,7 @@ nodes:
         echo "Replaces v1 PDP. Both Pre-FOC + Released states. Click-verify Playwright suites included."
         echo
         echo "## Spec"
-        echo "WO-STOREFRONT-PDP-V2-INTAKE-01 — docs/superpowers/specs/2026-05-10-WO-STOREFRONT-PDP-V2-INTAKE-01.md"
+        echo "WO-STOREFRONT-PDP-V2-INTAKE-01 -- docs/superpowers/specs/2026-05-10-WO-STOREFRONT-PDP-V2-INTAKE-01.md"
         echo
         echo "## Plan"
         echo "$plan.output"
@@ -318,14 +318,14 @@ nodes:
         echo "Target: staging branch. John promotes staging->master after eyeball check on staging.comicstoreos.com."
       } > "$BODY"
       gh pr create --base staging --head "feat/wo-storefront-pdp-v2-intake-01" \
-        --title "feat(storefront): WO-STOREFRONT-PDP-V2-INTAKE-01 — rebuild PDP from CD source with Rule 10 baked in" \
+        --title "feat(storefront): WO-STOREFRONT-PDP-V2-INTAKE-01 -- rebuild PDP from CD source with Rule 10 baked in" \
         --body-file "$BODY"
 
   - id: build-manifest
     depends_on: [open-pr]
     task_class: clerical
     prompt: |
-      Construct the Captain CI manifest per spec §12.
+      Construct the Captain CI manifest per spec Section 12.
 
       ## Inputs
       Spec: $read-spec.output
@@ -337,7 +337,7 @@ nodes:
       Playwright: $verify-playwright.output
       Validator: $war-council-validator.output
 
-      ## Required fields (per spec §12)
+      ## Required fields (per spec Section 12)
       WO, Branch, Files created, Files modified, Routes added, Migrations,
       Tests (build + types + Playwright Pre-FOC + Playwright Released),
       GREP VERIFICATION (paste actual output), CLICK-VERIFY EVIDENCE
@@ -362,7 +362,7 @@ nodes:
       - Claude Status: REVIEW
       - Status: Review
       - Notes field: paste the Captain CI manifest below VERBATIM
-        (Captain CI reads Notes, NOT comments — per Rule 7 + memory:feedback_captain-ci-reads-notes-field-not-comments.md)
+        (Captain CI reads Notes, NOT comments -- per Rule 7 + memory:feedback_captain-ci-reads-notes-field-not-comments.md)
 
       ## Manifest
       $build-manifest.output

@@ -1,6 +1,6 @@
 name: archon-fix-github-issue-experimental
 description: |
-  EXPERIMENTAL: Path A variant of archon-fix-github-issue. Same DAG shape — same nodes,
+  EXPERIMENTAL: Path A variant of archon-fix-github-issue. Same DAG shape -- same nodes,
   same dependencies, same command files. Additions:
     - Two extra classifier fields: `scope` (small/medium/large) and `needs_external_research`.
     - A new `smoke-validate` node that checks the issue's concrete claims (file paths,
@@ -12,11 +12,11 @@ description: |
       behavior is identical to the full workflow.
 
   Skip gates (all overridden when smoke-validate flags the issue as inaccurate):
-    - web-research       → runs when needs_external_research=='true' OR smoke=='false'
-    - error-handling     → runs when review-classify says yes AND (scope!='small' OR smoke=='false')
-    - test-coverage      → same as error-handling
-    - comment-quality    → same as error-handling
-    - docs-impact        → same as error-handling
+    - web-research       -> runs when needs_external_research=='true' OR smoke=='false'
+    - error-handling     -> runs when review-classify says yes AND (scope!='small' OR smoke=='false')
+    - test-coverage      -> same as error-handling
+    - comment-quality    -> same as error-handling
+    - docs-impact        -> same as error-handling
 
   Always runs (same as full): classify, smoke-validate, investigate/plan, bridge-artifacts,
   implement, validate, create-pr, review-scope, review-classify, code-review, synthesize,
@@ -43,9 +43,9 @@ provider: claude
 model: sonnet
 
 nodes:
-  # ═══════════════════════════════════════════════════════════════
+  # ---------------------------------------------------------------
   # PHASE 1: FETCH & CLASSIFY
-  # ═══════════════════════════════════════════════════════════════
+  # ---------------------------------------------------------------
 
   - id: extract-issue-number
     prompt: |
@@ -93,7 +93,7 @@ nodes:
       ## Scope
 
       Estimate how much code the fix is likely to touch. The issue body is your best
-      signal — reporter-pointed file paths, length of the reproducer, how specific the
+      signal -- reporter-pointed file paths, length of the reproducer, how specific the
       request is. When uncertain, round UP (pick the larger scope).
 
       | Scope | Indicators |
@@ -108,7 +108,7 @@ nodes:
       the fix depends on specifics of an external library, API, protocol, or standard
       that are NOT already apparent from the codebase. Internal plumbing, refactoring,
       obvious bug fixes, and issues where the reporter already cited the relevant docs
-      → "false".
+      -> "false".
 
       Provide reasoning that covers all three decisions.
     depends_on: [fetch-issue]
@@ -132,13 +132,13 @@ nodes:
           type: string
       required: [issue_type, title, scope, needs_external_research, reasoning]
 
-  # ═══════════════════════════════════════════════════════════════
+  # ---------------------------------------------------------------
   # PHASE 1.5: SMOKE-VALIDATE
   # Verifies that the issue's concrete claims (file paths, line numbers,
   # symbols, repro commands) match the current codebase. Its `claims_accurate`
-  # verdict gates every skip decision downstream — if the issue body is
+  # verdict gates every skip decision downstream -- if the issue body is
   # inaccurate, the workflow falls back to the full pipeline.
-  # ═══════════════════════════════════════════════════════════════
+  # ---------------------------------------------------------------
 
   - id: smoke-validate
     prompt: |
@@ -161,7 +161,7 @@ nodes:
       - Function, class, type, or symbol names referenced
       - Reproduction commands (e.g. "run bun test X")
 
-      Then verify each concrete claim against the current codebase — TARGETED checks,
+      Then verify each concrete claim against the current codebase -- TARGETED checks,
       no Explore sub-agent:
       - Use the Read tool on cited file paths. Confirm the file exists.
       - If a line or region is cited, Read it and check the described code is there.
@@ -171,12 +171,12 @@ nodes:
 
       ## Budget
 
-      Spend at most ~30 seconds on this. Check the 2-3 most concrete claims — the
+      Spend at most ~30 seconds on this. Check the 2-3 most concrete claims -- the
       ones the fix most likely hinges on. Don't exhaustively verify every mention.
       Prefer false-negative safety (flag inaccurate when uncertain) over
       false-positive (risking a skip on shaky evidence).
 
-      If the issue has NO concrete claims (purely descriptive — "feature X is broken",
+      If the issue has NO concrete claims (purely descriptive -- "feature X is broken",
       no file paths, no line numbers, no symbols), default to `claims_accurate: "false"`.
       Vibes aren't a reliable foundation for skipping work.
 
@@ -184,8 +184,8 @@ nodes:
 
       Set `claims_accurate`:
       - "true": The concrete claims you checked match the current code. The issue body
-        is a reliable spec — downstream gates can trust the classifier's skip verdict.
-      - "false": One or more claims don't match reality — cited file doesn't exist, the
+        is a reliable spec -- downstream gates can trust the classifier's skip verdict.
+      - "false": One or more claims don't match reality -- cited file doesn't exist, the
         line doesn't contain the described code, the symbol was renamed/removed, the
         repro command doesn't fit the project. The issue body is NOT a reliable
         foundation for skipping. Downstream gates will fall back to the full pipeline
@@ -204,9 +204,9 @@ nodes:
           type: string
       required: [claims_accurate, reasoning]
 
-  # ═══════════════════════════════════════════════════════════════
+  # ---------------------------------------------------------------
   # PHASE 2: RESEARCH (parallel with PR template fetch)
-  # ═══════════════════════════════════════════════════════════════
+  # ---------------------------------------------------------------
 
   - id: web-research
     command: archon-web-research
@@ -215,9 +215,9 @@ nodes:
     when: "$classify.output.needs_external_research == 'true' || $smoke-validate.output.claims_accurate == 'false'"
     context: fresh
 
-  # ═══════════════════════════════════════════════════════════════
+  # ---------------------------------------------------------------
   # PHASE 3: INVESTIGATE (bugs) / PLAN (features)
-  # ═══════════════════════════════════════════════════════════════
+  # ---------------------------------------------------------------
 
   - id: investigate
     command: archon-investigate-issue
@@ -238,7 +238,7 @@ nodes:
   # Bridge: ensure investigation.md exists for the implement step
   # archon-fix-issue reads from $ARTIFACTS_DIR/investigation.md
   # archon-create-plan writes to $ARTIFACTS_DIR/plan.md
-  # This node copies plan.md → investigation.md when the plan path was taken
+  # This node copies plan.md -> investigation.md when the plan path was taken
   - id: bridge-artifacts
     bash: |
       if [ -f "$ARTIFACTS_DIR/plan.md" ] && [ ! -f "$ARTIFACTS_DIR/investigation.md" ]; then
@@ -247,14 +247,14 @@ nodes:
       elif [ -f "$ARTIFACTS_DIR/investigation.md" ]; then
         echo "investigation.md exists from investigate step"
       else
-        echo "WARNING: No investigation.md or plan.md found — implement may fail"
+        echo "WARNING: No investigation.md or plan.md found -- implement may fail"
       fi
     depends_on: [investigate, plan]
     trigger_rule: one_success
 
-  # ═══════════════════════════════════════════════════════════════
+  # ---------------------------------------------------------------
   # PHASE 4: IMPLEMENT
-  # ═══════════════════════════════════════════════════════════════
+  # ---------------------------------------------------------------
 
   - id: implement
     command: archon-fix-issue
@@ -262,18 +262,18 @@ nodes:
     context: fresh
     model: opus[1m]
 
-  # ═══════════════════════════════════════════════════════════════
+  # ---------------------------------------------------------------
   # PHASE 5: VALIDATE
-  # ═══════════════════════════════════════════════════════════════
+  # ---------------------------------------------------------------
 
   - id: validate
     command: archon-validate
     depends_on: [implement]
     context: fresh
 
-  # ═══════════════════════════════════════════════════════════════
+  # ---------------------------------------------------------------
   # PHASE 6: CREATE DRAFT PR
-  # ═══════════════════════════════════════════════════════════════
+  # ---------------------------------------------------------------
 
   - id: create-pr
     prompt: |
@@ -288,7 +288,7 @@ nodes:
       ## Instructions
 
       1. Check git status. If uncommitted changes exist, stage and commit ONLY source files that are part of the fix:
-         - List them by name with `git add <path1> <path2> ...` — never `git add -A`, `git add .`, or `git add -u`
+         - List them by name with `git add <path1> <path2> ...` -- never `git add -A`, `git add .`, or `git add -u`
          - **Never commit** scratch / review / PR-body artifacts, even if they appear in `git status`:
            - `.pr-body.md`, `pr-body.md`, `*.scratch.md`, `*.tmp.md` at any path
            - `review/`, `*-report.md` at the repo root
@@ -306,7 +306,7 @@ nodes:
       6. Create a DRAFT PR: `gh pr create --draft --base $BASE_BRANCH`
          - Title: concise, imperative mood, under 70 chars
          - Body: if a PR template was found, fill in **every section** with details from the artifacts. Don't skip sections or leave placeholders. If no template, write a body with summary, changes, validation evidence, and `Fixes #...`.
-         - **PR body file location**: if you write the body to a file (e.g. for `--body-file`), the file MUST live at `$ARTIFACTS_DIR/pr-body.md` or under `/tmp/` — NEVER inside the worktree. Files like `.pr-body.md` at the repo root will be picked up by later commits.
+         - **PR body file location**: if you write the body to a file (e.g. for `--body-file`), the file MUST live at `$ARTIFACTS_DIR/pr-body.md` or under `/tmp/` -- NEVER inside the worktree. Files like `.pr-body.md` at the repo root will be picked up by later commits.
          - Link to issue: include `Fixes #...` or `Closes #...`
       7. Capture PR identifiers:
          ```bash
@@ -318,9 +318,9 @@ nodes:
     depends_on: [validate]
     context: fresh
 
-  # ═══════════════════════════════════════════════════════════════
+  # ---------------------------------------------------------------
   # PHASE 7: REVIEW
-  # ═══════════════════════════════════════════════════════════════
+  # ---------------------------------------------------------------
 
   - id: review-scope
     command: archon-pr-review-scope
@@ -381,7 +381,7 @@ nodes:
         - run_docs_impact
         - reasoning
 
-  # Code review always runs — mandatory
+  # Code review always runs -- mandatory
   - id: code-review
     command: archon-code-review-agent
     depends_on: [review-classify]
@@ -414,9 +414,9 @@ nodes:
     when: "$review-classify.output.run_docs_impact == 'true' && $classify.output.scope != 'small' || $review-classify.output.run_docs_impact == 'true' && $smoke-validate.output.claims_accurate == 'false'"
     context: fresh
 
-  # ═══════════════════════════════════════════════════════════════
+  # ---------------------------------------------------------------
   # PHASE 8: SYNTHESIZE + SELF-FIX
-  # ═══════════════════════════════════════════════════════════════
+  # ---------------------------------------------------------------
 
   - id: synthesize
     command: archon-synthesize-review
@@ -429,18 +429,18 @@ nodes:
     depends_on: [synthesize]
     context: fresh
 
-  # ═══════════════════════════════════════════════════════════════
+  # ---------------------------------------------------------------
   # PHASE 9: SIMPLIFY
-  # ═══════════════════════════════════════════════════════════════
+  # ---------------------------------------------------------------
 
   - id: simplify
     command: archon-simplify-changes
     depends_on: [self-fix]
     context: fresh
 
-  # ═══════════════════════════════════════════════════════════════
+  # ---------------------------------------------------------------
   # PHASE 10: REPORT
-  # ═══════════════════════════════════════════════════════════════
+  # ---------------------------------------------------------------
 
   - id: report
     command: archon-issue-completion-report
