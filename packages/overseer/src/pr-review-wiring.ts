@@ -84,9 +84,16 @@ export function parseReviewWorkBody(body: string): ReviewWorkBody | null {
  * Subject key for a PR's review work. Head-independent on purpose: it groups
  * every review attempt for one pull request so stale-head lookup can find
  * prior attempts regardless of which commit they were bound to.
+ *
+ * MUST match the shape createMessage/listMessages enforce via
+ * normalizeDispatchSubjectKey: 'wo:WO-XXX' or 'gh:owner/repo#123' -- any
+ * other shape throws dispatch_subject_key_invalid:shape and every enqueue
+ * fails. Integration-test finding (2026-08-19): the original
+ * 'pr-review:owner/repo#N' prefix was never a valid shape; 'gh:' is the
+ * correct form for a GitHub PR/issue reference and is used verbatim.
  */
 export function reviewSubjectKey(owner: string, repo: string, prNumber: number): string {
-  return `pr-review:${owner}/${repo}#${prNumber}`;
+  return `gh:${owner.toLowerCase()}/${repo.toLowerCase()}#${prNumber}`;
 }
 
 /**

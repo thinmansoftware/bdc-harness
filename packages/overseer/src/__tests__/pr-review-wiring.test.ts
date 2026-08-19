@@ -63,7 +63,7 @@ describe('resolveReviewRouteConfig -- fail closed', () => {
 describe('reviewSubjectKey', () => {
   test('is head-INDEPENDENT so every attempt for one PR groups together', () => {
     expect(reviewSubjectKey('thinmansoftware', 'bdc-harness', 673)).toBe(
-      'pr-review:thinmansoftware/bdc-harness#673'
+      'gh:thinmansoftware/bdc-harness#673'
     );
   });
 

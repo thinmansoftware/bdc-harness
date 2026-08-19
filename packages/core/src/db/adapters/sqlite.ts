@@ -438,7 +438,12 @@ export class SqliteAdapter implements IDatabase {
         ('overseer', 'Overseer', 'notify_only', 1),
         ('cauldron', 'Cauldron', 'notify_only', 1),
         ('john', 'John', 'notify_only', 0),
-        ('merge-manager', 'Merge Manager', 'notify_only', 0)
+        ('merge-manager', 'Merge Manager', 'notify_only', 0),
+        -- WO-HARNESS-OVERSEER-REVIEW-ROUTE-01 (migration 043 parity): keep the
+        -- SQLite seed in sync with 000_combined.sql -- this INSERT block is a
+        -- hand-maintained mirror, not derived from the migration files.
+        ('overseer-reviewer', 'Overseer PR Reviewer', 'worker_poll', 1),
+        ('overseer-review-route', 'Overseer Review Route', 'notify_only', 1)
       ON CONFLICT (principal_id) DO NOTHING
     `);
     this.db.run(`

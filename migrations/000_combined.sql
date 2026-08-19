@@ -596,7 +596,12 @@ VALUES
   ('overseer', 'Overseer', 'notify_only', TRUE),
   ('cauldron', 'Cauldron', 'notify_only', TRUE),
   ('john', 'John', 'notify_only', FALSE),
-  ('merge-manager', 'Merge Manager', 'notify_only', FALSE)
+  ('merge-manager', 'Merge Manager', 'notify_only', FALSE),
+  -- WO-HARNESS-OVERSEER-REVIEW-ROUTE-01 (migration 043): the PR-event review
+  -- route's sender and worker-poll recipient. Without these rows every
+  -- review enqueue is rejected as missing_principal.
+  ('overseer-reviewer', 'Overseer PR Reviewer', 'worker_poll', TRUE),
+  ('overseer-review-route', 'Overseer Review Route', 'notify_only', TRUE)
 ON CONFLICT (principal_id) DO NOTHING;
 
 INSERT INTO dispatch_principals (principal_id, display_name, delivery_mode, active)
