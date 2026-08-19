@@ -1,5 +1,6 @@
 import { describe, test, expect, mock, spyOn } from 'bun:test';
 import { OpenAPIHono } from '@hono/zod-openapi';
+import { handleUncaughtException } from './index';
 
 type RunStatus = 'running' | 'completed' | 'failed';
 
@@ -78,6 +79,31 @@ describe('WO-HARNESS-CODEX-PROVIDER-CRASH-ISOLATION-01 server liveness', () => {
       expect(unhandledRejection).not.toHaveBeenCalled();
     } finally {
       process.off('unhandledRejection', unhandledRejection);
+      exitSpy.mockRestore();
+    }
+  });
+});
+
+describe('loop wall-timeout process containment', () => {
+  test('absorbs only the child-process abort race signature', () => {
+    const exitSpy = spyOn(process, 'exit').mockImplementation((() => undefined) as never);
+    const error = new Error('The operation was aborted');
+    error.stack =
+      'AbortError: The operation was aborted\n    at abortChildProcess (node:child_process:939:27)';
+    try {
+      handleUncaughtException(error);
+      expect(exitSpy).not.toHaveBeenCalled();
+    } finally {
+      exitSpy.mockRestore();
+    }
+  });
+
+  test('fails closed for unrelated uncaught exceptions', () => {
+    const exitSpy = spyOn(process, 'exit').mockImplementation((() => undefined) as never);
+    try {
+      handleUncaughtException(new Error('unrelated failure'));
+      expect(exitSpy).toHaveBeenCalledWith(1);
+    } finally {
       exitSpy.mockRestore();
     }
   });

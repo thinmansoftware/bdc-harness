@@ -6,6 +6,7 @@ import {
   claimAndResumeInterruptedRun,
   reconcileExpiredWorkflowLeases,
   reconcilePendingWorkflowRunsAtBoot,
+  reconcileRunningWorkflowRunsAtBoot,
 } from './recovery';
 
 const authority: RunAuthorityRecord = {
@@ -65,6 +66,7 @@ const pendingRun: WorkflowRun = {
   archived_by: null,
   archive_reason: null,
 };
+const runningRun: WorkflowRun = { ...pendingRun, id: 'run-running-1', status: 'running' };
 
 describe('startup lease reconciliation', () => {
   test('observe mode verifies authority and worktree without mutating state', async () => {
@@ -256,5 +258,48 @@ describe('boot pending reconciliation', () => {
     await reconcilePendingWorkflowRunsAtBoot(store, { now: '2026-07-13T17:53:00.000Z' });
     expect(store.listPendingWorkflowRunsBefore).toHaveBeenCalledWith('2026-07-13T17:53:00.000Z');
     expect(store.orphanPendingWorkflowRun).not.toHaveBeenCalled();
+  });
+});
+
+describe('boot running reconciliation', () => {
+  test.each(['no lease', 'expired lease'])(
+    'fails a stale running row with %s immediately',
+    async () => {
+      const store = recoveryStore({
+        listStaleRunningWorkflowRunsBefore: mock(async () => [runningRun]),
+        failStaleRunningWorkflowRun: mock(async () => true),
+        createWorkflowEvent: mock(async () => {}),
+      });
+      const now = '2026-07-13T17:53:00.000Z';
+
+      const report = await reconcileRunningWorkflowRunsAtBoot(store, { now });
+
+      expect(report).toMatchObject({ observed: 1, orphaned: 1, raced: 0 });
+      expect(store.listStaleRunningWorkflowRunsBefore).toHaveBeenCalledWith(now);
+      expect(store.failStaleRunningWorkflowRun).toHaveBeenCalledWith({
+        runId: runningRun.id,
+        reason: 'server_restart_orphaned',
+        failedAt: now,
+      });
+      expect(store.createWorkflowEvent).toHaveBeenCalledWith({
+        workflow_run_id: runningRun.id,
+        event_type: 'workflow_orphaned',
+        data: { reason: 'server_restart_orphaned', orphaned_at: now, previous_status: 'running' },
+      });
+    }
+  );
+
+  test('leaves a running row with a fresh lease untouched', async () => {
+    const store = recoveryStore({
+      listStaleRunningWorkflowRunsBefore: mock(async () => []),
+      failStaleRunningWorkflowRun: mock(async () => true),
+      createWorkflowEvent: mock(async () => {}),
+    });
+
+    await expect(
+      reconcileRunningWorkflowRunsAtBoot(store, { now: '2026-07-13T17:53:00.000Z' })
+    ).resolves.toMatchObject({ observed: 0, orphaned: 0 });
+    expect(store.failStaleRunningWorkflowRun).not.toHaveBeenCalled();
+    expect(store.createWorkflowEvent).not.toHaveBeenCalled();
   });
 });

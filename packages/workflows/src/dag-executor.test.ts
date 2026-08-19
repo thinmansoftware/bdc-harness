@@ -738,6 +738,7 @@ describe('executeDagWorkflow -- plan-review terminal safety', () => {
                 max_iterations: 1,
               },
             },
+            { id: 'sibling', bash: 'echo sibling-ok' },
           ],
         },
         workflowRun,
@@ -778,6 +779,10 @@ describe('executeDagWorkflow -- plan-review terminal safety', () => {
       );
       expect(started).toHaveLength(1);
       expect(started[0]?.data?.iteration).toBe(1);
+      const siblingCompleted = events.find(
+        e => e.event_type === 'node_completed' && e.step_name === 'sibling'
+      );
+      expect(siblingCompleted).toBeDefined();
     } finally {
       if (prevWall === undefined) delete process.env.ARCHON_LOOP_ITERATION_WALL_MS;
       else process.env.ARCHON_LOOP_ITERATION_WALL_MS = prevWall;

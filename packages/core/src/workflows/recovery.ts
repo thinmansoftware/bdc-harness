@@ -154,6 +154,48 @@ export async function reconcilePendingWorkflowRunsAtBoot(
   return report;
 }
 
+export async function reconcileRunningWorkflowRunsAtBoot(
+  store: IWorkflowStore,
+  options: { now: string }
+): Promise<PendingReconcileReport> {
+  const candidates = await store.listStaleRunningWorkflowRunsBefore(options.now);
+  const report: PendingReconcileReport = {
+    observed: candidates.length,
+    orphaned: 0,
+    raced: 0,
+    entries: [],
+  };
+  const reason = 'server_restart_orphaned';
+
+  for (const candidate of candidates) {
+    const failed = await store.failStaleRunningWorkflowRun({
+      runId: candidate.id,
+      reason,
+      failedAt: options.now,
+    });
+    if (!failed) {
+      report.raced += 1;
+      report.entries.push({ runId: candidate.id, disposition: 'cas_race_lost' });
+      continue;
+    }
+
+    report.orphaned += 1;
+    report.entries.push({ runId: candidate.id, disposition: 'orphaned' });
+    await store.createWorkflowEvent({
+      workflow_run_id: candidate.id,
+      event_type: 'workflow_orphaned',
+      data: {
+        reason,
+        orphaned_at: options.now,
+        previous_status: 'running',
+      },
+    });
+  }
+
+  log.info(report, 'orchestrator_boot_running_reconcile');
+  return report;
+}
+
 /** Claim a released/expired lease before using the existing resume transition. */
 export async function claimAndResumeInterruptedRun(
   store: IWorkflowStore,
