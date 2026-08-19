@@ -875,10 +875,10 @@ export function createRealMergePullRequest(
   octokit: RealGitHubOctokitLike
 ): (
   input: GitHubPullRequestMergeInput
-) => Promise<{ merged: boolean; message?: string; sha?: string }> {
+) => Promise<{ merged: boolean; message?: string; sha?: string; mergeSha?: string }> {
   return async (
     input: GitHubPullRequestMergeInput
-  ): Promise<{ merged: boolean; message?: string; sha?: string }> => {
+  ): Promise<{ merged: boolean; message?: string; sha?: string; mergeSha?: string }> => {
     const pr = await octokit.pulls.get({
       owner: input.owner,
       repo: input.repo,

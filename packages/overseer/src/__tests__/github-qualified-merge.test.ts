@@ -255,6 +255,7 @@ describe('real GitHub deps', () => {
       merged: true,
       message: 'Overseer merge WO-42',
       sha: 'a'.repeat(40),
+      mergeSha: 'a'.repeat(40),
     });
   });
 
