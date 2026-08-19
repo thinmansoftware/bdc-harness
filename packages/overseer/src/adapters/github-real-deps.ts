@@ -64,13 +64,19 @@ export interface RealGitHubOctokitLike {
         html_url: string;
         changed_files?: number;
         head: { sha: string };
+        base?: { ref: string };
+        mergeable_state?: string;
       };
+    }>;
+    listFiles?(input: Record<string, unknown>): Promise<{
+      data: { filename: string }[];
     }>;
     merge(input: {
       owner: string;
       repo: string;
       pull_number: number;
       sha: string;
+      merge_method?: 'merge' | 'squash' | 'rebase';
     }): Promise<{ data: { merged: boolean; sha?: string | null } }>;
     /**
      * Optional so unrelated mocks (e.g. github-qualified-merge.test.ts's
@@ -315,6 +321,26 @@ export function createRealFindPullRequest(
         per_page: 100,
       });
       const checks = summarizeChecks(checkRunsResp.data.check_runs);
+      let changedFilePaths: string[] | undefined;
+      if (input.includeChangedFiles) {
+        if (!octokit.pulls.listFiles) throw new Error('overseer_real_adapter_missing_list_files');
+        changedFilePaths = [];
+        for (let page = 1; page <= 3; page += 1) {
+          const files = await octokit.pulls.listFiles({
+            owner: input.owner,
+            repo: input.repo,
+            pull_number: prNumber,
+            per_page: 100,
+            page,
+          });
+          changedFilePaths.push(...files.data.map(file => file.filename));
+          if (page === 3 && files.data.length === 100) {
+            changedFilePaths = undefined;
+            break;
+          }
+          if (files.data.length < 100) break;
+        }
+      }
 
       const state = pr.data.merged ? 'merged' : pr.data.state;
 
@@ -329,6 +355,9 @@ export function createRealFindPullRequest(
         htmlUrl: pr.data.html_url,
         // Provenance anchor: GitHub's own view of the PR head, not run metadata.
         headSha: pr.data.head.sha,
+        baseBranch: pr.data.base?.ref,
+        mergeableState: pr.data.mergeable_state,
+        changedFilePaths,
       };
     } catch (error) {
       log.error({ err: error, input }, 'overseer.github_real_deps.find_pull_request_failed');
@@ -354,28 +383,40 @@ export function createRealFindPullRequest(
  * rejected, other transport errors = ambiguous) directly against the plain
  * PR-ref input merge-manager.ts already provides.
  */
-export function createRealMergePullRequest(
-  octokit: RealGitHubOctokitLike
-): (input: GitHubPullRequestMergeInput) => Promise<{ merged: boolean; message?: string }> {
+export function createRealMergePullRequest(octokit: RealGitHubOctokitLike): (
+  input: GitHubPullRequestMergeInput
+) => Promise<{
+  merged: boolean;
+  message?: string;
+  mergeSha?: string;
+}> {
   return async (
     input: GitHubPullRequestMergeInput
-  ): Promise<{ merged: boolean; message?: string }> => {
+  ): Promise<{ merged: boolean; message?: string; mergeSha?: string }> => {
     const pr = await octokit.pulls.get({
       owner: input.owner,
       repo: input.repo,
       pull_number: input.number,
     });
     try {
-      const response = await octokit.pulls.merge({
+      const mergeInput = {
         owner: input.owner,
         repo: input.repo,
         pull_number: input.number,
         sha: pr.data.head.sha,
-      });
+        ...(input.mergeMethod ? { merge_method: input.mergeMethod } : {}),
+      };
+      const response = await octokit.pulls.merge(mergeInput);
       if (!response.data.merged) {
         return { merged: false, message: 'github_merge_not_merged' };
       }
-      return { merged: true, message: input.commitTitle };
+      return input.mergeMethod
+        ? {
+            merged: true,
+            message: input.commitTitle,
+            mergeSha: response.data.sha ?? undefined,
+          }
+        : { merged: true, message: input.commitTitle };
     } catch (error) {
       const status =
         typeof error === 'object' && error !== null && 'status' in error

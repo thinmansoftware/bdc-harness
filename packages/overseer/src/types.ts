@@ -60,6 +60,9 @@ export interface PullRequestEvidence {
    * merge provenance compares this against the run's own worktree tip.
    */
   headSha?: string;
+  baseBranch?: string;
+  mergeableState?: string;
+  changedFilePaths?: readonly string[];
   /**
    * True when the lookup itself failed, so `exists: false` means "unknown", not
    * "no PR". Never widens the merge gate (both cases stay `exists: false`); it
@@ -148,17 +151,19 @@ export interface GitHubPullRequestSearchInput {
   repo: string;
   headBranch?: string;
   woId?: string;
+  includeChangedFiles?: boolean;
 }
 
 export interface GitHubPullRequestMergeInput extends PullRequestRef {
   commitTitle?: string;
+  mergeMethod?: 'merge' | 'squash' | 'rebase';
 }
 
 export interface GitHubClientDeps {
   findPullRequest(input: GitHubPullRequestSearchInput): Promise<PullRequestEvidence>;
   mergePullRequest(
     input: GitHubPullRequestMergeInput
-  ): Promise<{ merged: boolean; message?: string }>;
+  ): Promise<{ merged: boolean; message?: string; mergeSha?: string }>;
   /**
    * Tier 0 comment_findings channel (judge-first path). Optional: when absent
    * the pipeline records a loud 'comment_channel_unavailable' receipt rather

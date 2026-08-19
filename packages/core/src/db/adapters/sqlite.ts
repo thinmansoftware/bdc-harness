@@ -257,6 +257,31 @@ export class SqliteAdapter implements IDatabase {
    * the columns were added to createSchema().
    */
   private migrateColumns(): void {
+    // Verdict merge-execution bookkeeping (migration 044).
+    try {
+      const verdictCols = this.pragmaAll("PRAGMA table_info('overseer_verdicts')") as {
+        name: string;
+      }[];
+      const verdictColNames = new Set(verdictCols.map(column => column.name));
+      const additions: [string, string][] = [
+        ['actioned_at', 'TEXT'],
+        ['mutation_sent', 'INTEGER'],
+        ['mutation_reason', 'TEXT'],
+        ['merge_sha', 'TEXT'],
+        ['pr_url', 'TEXT'],
+      ];
+      for (const [name, definition] of additions) {
+        if (!verdictColNames.has(name)) {
+          this.db.run(`ALTER TABLE overseer_verdicts ADD COLUMN ${name} ${definition}`);
+        }
+      }
+      this.db.run(
+        'CREATE INDEX IF NOT EXISTS idx_overseer_verdicts_merge_action ON overseer_verdicts(proposed_action, actioned_at)'
+      );
+    } catch (e: unknown) {
+      getLog().warn({ err: e as Error }, 'db.sqlite_migration_overseer_verdict_columns_failed');
+    }
+
     // Conversations columns
     try {
       const cols = this.pragmaAll("PRAGMA table_info('remote_agent_conversations')") as {
@@ -1424,6 +1449,11 @@ export class SqliteAdapter implements IDatabase {
         reason TEXT,
         evidence TEXT,
         retry_count INTEGER NOT NULL DEFAULT 0,
+        actioned_at TEXT,
+        mutation_sent INTEGER,
+        mutation_reason TEXT,
+        merge_sha TEXT,
+        pr_url TEXT,
         created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
         updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
       );
@@ -1431,6 +1461,7 @@ export class SqliteAdapter implements IDatabase {
       -- Indexes
       CREATE UNIQUE INDEX IF NOT EXISTS uq_overseer_verdicts_run_head ON overseer_verdicts(run_id, head_sha);
       CREATE INDEX IF NOT EXISTS idx_overseer_verdicts_status ON overseer_verdicts(status, created_at);
+      CREATE INDEX IF NOT EXISTS idx_overseer_verdicts_merge_action ON overseer_verdicts(proposed_action, actioned_at);
       CREATE INDEX IF NOT EXISTS idx_codebase_env_vars_codebase_id ON remote_agent_codebase_env_vars(codebase_id);
       CREATE INDEX IF NOT EXISTS idx_conversations_platform ON remote_agent_conversations(platform_type, platform_conversation_id);
       CREATE INDEX IF NOT EXISTS idx_sessions_conversation ON remote_agent_sessions(conversation_id);
