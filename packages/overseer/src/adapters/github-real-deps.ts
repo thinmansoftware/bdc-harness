@@ -110,7 +110,11 @@ export interface RealGitHubOctokitLike {
         changed_files?: number;
         head: { sha: string };
         base?: { sha: string; ref?: string };
+        mergeable_state?: string;
       };
+    }>;
+    listFiles?(input: Record<string, unknown>): Promise<{
+      data: { filename: string }[];
     }>;
     merge(input: {
       owner: string;
@@ -757,6 +761,26 @@ export function createRealFindPullRequest(
         per_page: 100,
       });
       const checks = summarizeChecks(checkRunsResp.data.check_runs);
+      let changedFilePaths: string[] | undefined;
+      if (input.includeChangedFiles) {
+        if (!octokit.pulls.listFiles) throw new Error('overseer_real_adapter_missing_list_files');
+        changedFilePaths = [];
+        for (let page = 1; page <= 3; page += 1) {
+          const files = await octokit.pulls.listFiles({
+            owner: input.owner,
+            repo: input.repo,
+            pull_number: prNumber,
+            per_page: 100,
+            page,
+          });
+          changedFilePaths.push(...files.data.map(file => file.filename));
+          if (page === 3 && files.data.length === 100) {
+            changedFilePaths = undefined;
+            break;
+          }
+          if (files.data.length < 100) break;
+        }
+      }
 
       const state = pr.data.merged ? 'merged' : pr.data.state;
 
@@ -785,6 +809,9 @@ export function createRealFindPullRequest(
         htmlUrl: pr.data.html_url,
         // Provenance anchor: GitHub's own view of the PR head, not run metadata.
         headSha: pr.data.head.sha,
+        baseBranch: pr.data.base?.ref,
+        mergeableState: pr.data.mergeable_state,
+        changedFilePaths,
       };
       rateLimitBackoffUntil = 0;
       rateLimitLastLoggedAt = 0;
@@ -858,20 +885,21 @@ export function createRealMergePullRequest(
       pull_number: input.number,
     });
     try {
-      const response = await octokit.pulls.merge({
+      const mergeInput = {
         owner: input.owner,
         repo: input.repo,
         pull_number: input.number,
         sha: pr.data.head.sha,
         merge_method: 'squash',
-      });
+      };
+      const response = await octokit.pulls.merge(mergeInput);
       if (!response.data.merged) {
         return { merged: false, message: 'github_merge_not_merged' };
       }
       return {
         merged: true,
         message: input.commitTitle,
-        ...(response.data.sha ? { sha: response.data.sha } : {}),
+        ...(response.data.sha ? { sha: response.data.sha, mergeSha: response.data.sha } : {}),
       };
     } catch (error) {
       const status =

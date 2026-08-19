@@ -37,7 +37,10 @@ interface OverseerRuntimeStatusDeps {
 
 interface OverseerRuntimeDeps {
   readonly runService?: typeof runOverseerService;
-  readonly serviceOptions?: Pick<OverseerServiceOptions, 'deps' | 'mergeCoordinator'>;
+  readonly serviceOptions?: Pick<
+    OverseerServiceOptions,
+    'deps' | 'mergeCoordinator' | 'mergeBridgeEnabled'
+  >;
 }
 
 let watcherTask: Promise<void> | null = null;

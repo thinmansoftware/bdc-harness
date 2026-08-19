@@ -60,6 +60,9 @@ export interface PullRequestEvidence {
    * merge provenance compares this against the run's own worktree tip.
    */
   headSha?: string;
+  baseBranch?: string;
+  mergeableState?: string;
+  changedFilePaths?: readonly string[];
   /**
    * True when the lookup itself failed, so `exists: false` means "unknown", not
    * "no PR". Never widens the merge gate (both cases stay `exists: false`); it
@@ -157,10 +160,12 @@ export interface GitHubPullRequestSearchInput {
    * binds to the PR they asked about regardless.
    */
   prNumber?: number;
+  includeChangedFiles?: boolean;
 }
 
 export interface GitHubPullRequestMergeInput extends PullRequestRef {
   commitTitle?: string;
+  mergeMethod?: 'merge' | 'squash' | 'rebase';
 }
 
 /**
@@ -233,7 +238,7 @@ export interface GitHubClientDeps {
   findPullRequest(input: GitHubPullRequestSearchInput): Promise<PullRequestEvidence>;
   mergePullRequest(
     input: GitHubPullRequestMergeInput
-  ): Promise<{ merged: boolean; message?: string; sha?: string }>;
+  ): Promise<{ merged: boolean; message?: string; sha?: string; mergeSha?: string }>;
   /** Reviews used by the Merge Manager's distinct Review Gate approval check. */
   listPullRequestReviews?(
     input: PullRequestRef
