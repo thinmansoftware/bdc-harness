@@ -179,6 +179,7 @@ import {
   nodeEventsQuerySchema,
   nodeEventsResponseSchema,
   workflowRunByWorkerResponseSchema,
+  workflowRunByDispatchTokenResponseSchema,
   cancelWorkflowRunBodySchema,
   cancelWorkflowRunResponseSchema,
   cancelStaleRunsResponseSchema,
@@ -1520,6 +1521,22 @@ const getWorkflowRunByWorkerRoute = createRoute({
   responses: {
     200: {
       content: { 'application/json': { schema: workflowRunByWorkerResponseSchema } },
+      description: 'Workflow run',
+    },
+    404: jsonError('Not found'),
+    500: jsonError('Server error'),
+  },
+});
+
+const getWorkflowRunByDispatchTokenRoute = createRoute({
+  method: 'get',
+  path: '/api/workflows/runs/by-dispatch-token/{token}',
+  tags: ['Workflows'],
+  summary: 'Look up a workflow run by its deterministic dispatch token',
+  request: { params: z.object({ token: z.string() }) },
+  responses: {
+    200: {
+      content: { 'application/json': { schema: workflowRunByDispatchTokenResponseSchema } },
       description: 'Workflow run',
     },
     404: jsonError('Not found'),
@@ -5861,6 +5878,22 @@ export function registerApiRoutes(
       return c.json({ run: { ...run, outcome: await workflowDb.getRunOutcome(run.id) } });
     } catch (error) {
       getLog().error({ err: error }, 'workflow_run_by_worker_lookup_failed');
+      return apiError(c, 500, 'Failed to look up workflow run');
+    }
+  });
+
+  // GET /api/workflows/runs/by-dispatch-token/:token - Race-free run lookup by token
+  // Must be registered before :runId to avoid "by-dispatch-token" matching as a runId
+  registerOpenApiRoute(getWorkflowRunByDispatchTokenRoute, async c => {
+    try {
+      const token = c.req.param('token') ?? '';
+      const run = await workflowDb.getWorkflowRunByDispatchToken(token);
+      if (!run) {
+        return apiError(c, 404, 'No workflow run found for this dispatch token');
+      }
+      return c.json({ run: { ...run, outcome: await workflowDb.getRunOutcome(run.id) } });
+    } catch (error) {
+      getLog().error({ err: error }, 'workflow_run_by_dispatch_token_lookup_failed');
       return apiError(c, 500, 'Failed to look up workflow run');
     }
   });

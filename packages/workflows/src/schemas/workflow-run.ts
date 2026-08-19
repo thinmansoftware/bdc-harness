@@ -166,6 +166,7 @@ export const workflowRunSchema = z.object({
   archived_at: z.date().nullable(),
   archived_by: z.string().nullable(),
   archive_reason: z.string().nullable(),
+  dispatch_token: z.string().nullable(),
 });
 
 export type WorkflowRun = z.infer<typeof workflowRunSchema>;

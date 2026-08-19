@@ -450,6 +450,13 @@ export async function dispatchBackgroundWorkflow(
     // Non-fatal: proceed with original message
   }
 
+  // Extract the deterministic dispatch token (if any) threaded by the cascade
+  // fire as a `--dispatch-token <token>` flag. Persisting it on the run row lets
+  // discovery resolve this exact run via a direct token lookup, eliminating the
+  // co-fire race in the parent-conversation-id scan. Absent for non-cascade runs.
+  const dispatchTokenMatch = /--dispatch-token\s+(\S+)/.exec(effectiveUserMessage);
+  const dispatchToken = dispatchTokenMatch?.[1];
+
   // 8. Pre-create workflow run row so the UI can fetch it immediately.
   // Without this, navigating to the execution page before executeWorkflow's
   // async setup completes would 404 (row doesn't exist yet for 1-5 seconds).
@@ -463,6 +470,7 @@ export async function dispatchBackgroundWorkflow(
       working_path: workerCwd,
       metadata: ctx.issueContext ? { github_context: ctx.issueContext } : {},
       parent_conversation_id: ctx.conversationDbId,
+      ...(dispatchToken ? { dispatch_token: dispatchToken } : {}),
     });
   } catch (error) {
     const err = error as Error;
