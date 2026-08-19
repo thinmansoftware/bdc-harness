@@ -410,13 +410,11 @@ export function createRealMergePullRequest(octokit: RealGitHubOctokitLike): (
       if (!response.data.merged) {
         return { merged: false, message: 'github_merge_not_merged' };
       }
-      return input.mergeMethod
-        ? {
-            merged: true,
-            message: input.commitTitle,
-            mergeSha: response.data.sha ?? undefined,
-          }
-        : { merged: true, message: input.commitTitle };
+      return {
+        merged: true,
+        message: input.commitTitle,
+        mergeSha: response.data.sha ?? undefined,
+      };
     } catch (error) {
       const status =
         typeof error === 'object' && error !== null && 'status' in error

@@ -304,11 +304,15 @@ export async function countRecentOverseerVerdictMerges(since: string): Promise<n
 }
 
 export async function claimVerdictForMergeExecution(verdictId: string): Promise<boolean> {
+  const now = new Date();
+  const staleBefore = new Date(now.getTime() - 5 * 60 * 1000).toISOString();
   const result = await getDatabase().query(
     `UPDATE overseer_verdicts
-     SET actioned_at = $2, mutation_sent = false, mutation_reason = 'processing', updated_at = $2
-     WHERE id = $1 AND actioned_at IS NULL`,
-    [verdictId, new Date().toISOString()]
+     SET mutation_sent = false, mutation_reason = 'processing', updated_at = $2
+     WHERE id = $1 AND actioned_at IS NULL
+       AND (mutation_reason IS NULL
+         OR (mutation_reason = 'processing' AND updated_at < $3))`,
+    [verdictId, now.toISOString(), staleBefore]
   );
   return result.rowCount === 1;
 }

@@ -92,12 +92,25 @@ export async function runMergeExecutionBridgeOnce(
       woId: run.woId,
       includeChangedFiles: true,
     });
-    if (!pr.exists || pr.state !== 'open' || !pr.pr) {
+    if (!pr.exists || !pr.pr) {
       await skip(pr.lookupFailed ? 'pr_lookup_failed' : 'open_pr_not_found', pr.htmlUrl);
       continue;
     }
     if (pr.headSha !== verdict.head_sha) {
       await skip('verdict_stale_head', pr.htmlUrl);
+      continue;
+    }
+    if (pr.state === 'merged' && verdict.mutation_reason === 'processing') {
+      await options.store.recordOutcome({
+        verdictId: verdict.id,
+        mutationSent: true,
+        reason: 'merge_executed',
+        prUrl: pr.htmlUrl,
+      });
+      continue;
+    }
+    if (pr.state !== 'open') {
+      await skip('open_pr_not_found', pr.htmlUrl);
       continue;
     }
     if (pr.checks.total === 0 || pr.checks.failed > 0 || pr.checks.pending > 0) {
@@ -108,7 +121,11 @@ export async function runMergeExecutionBridgeOnce(
       await skip('mergeable_state_not_clean', pr.htmlUrl);
       continue;
     }
-    if (!pr.changedFilePaths || !containsCode(pr.changedFilePaths)) {
+    if (!pr.changedFilePaths) {
+      await skip('changed_files_unresolved', pr.htmlUrl);
+      continue;
+    }
+    if (!containsCode(pr.changedFilePaths)) {
       await skip('spec_only', pr.htmlUrl);
       continue;
     }
