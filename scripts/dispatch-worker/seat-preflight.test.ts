@@ -26,9 +26,20 @@ function fakeDeps(overrides: Partial<SeatPreflightDeps> = {}): SeatPreflightDeps
     commandAvailable: async () => true,
     isFile: async () => true,
     isDirectory: async () => true,
-    // Default fake canonicalization: strip a trailing slash and './' so the
-    // tests below exercise the real "different string, same directory" cases.
-    canonicalPath: async (path: string) => path.replace(/\/\.\//g, '/').replace(/\/+$/, ''),
+    // Default fake canonicalization mirrors what real realpath+resolve does for
+    // the aliasing forms these tests assert on: strips a trailing slash,
+    // collapses './' segments, resolves a leading '../<base>/' relative
+    // climb-back-in, and lowercases (case-insensitive filesystem, e.g. default
+    // Windows/macOS). It intentionally does NOT resolve arbitrary symlinks --
+    // that path is exercised directly via a canonicalPath override below.
+    canonicalPath: async (path: string) => {
+      let normalized = path.replace(/\/\.\//g, '/').replace(/\/+$/, '');
+      // Collapse one 'X/../' pair repeatedly, matching resolve()'s behavior.
+      while (/[^/]+\/\.\.\//.test(normalized)) {
+        normalized = normalized.replace(/[^/]+\/\.\.\//, '');
+      }
+      return normalized.toLowerCase();
+    },
     env: { [DEFAULT_BUILD_SHA_ENV]: 'abc123def456' },
     ...overrides,
   };
@@ -104,6 +115,11 @@ describe('runSeatPreflight', () => {
     ['trailing slash', '/home/seat/.grok/'],
     ['dot segment', '/home/seat/./.grok'],
     ['both', '/home/seat/./.grok/'],
+    // review finding 2026-08-19: relative-path and case-variant aliases were
+    // asserted as fixed but had no dedicated regression coverage.
+    ['relative climb-back-in', '/home/seat/other/../.grok'],
+    ['case variant (case-insensitive filesystem)', '/home/seat/.GROK'],
+    ['case variant with trailing slash', '/HOME/SEAT/.grok/'],
   ])('rejects same-directory-different-string: %s', async (_label, stateDir) => {
     const seat: SeatConfig = { ...GOOD_SEAT, state_dir: stateDir };
     const result = await runSeatPreflight(seat, COMMANDS, fakeDeps());
