@@ -68,7 +68,11 @@ import {
   startDispatchEscalationClock,
   stopDispatchEscalationClock,
 } from './dispatch/escalation-clock';
-import { observeStartupRecovery, reconcilePendingRunsAtBoot } from './startup-reconciliation';
+import {
+  observeStartupRecovery,
+  reconcilePendingRunsAtBoot,
+  reconcileRunningRunsAtBoot,
+} from './startup-reconciliation';
 import { startOverseerRuntime, stopOverseerRuntime } from './overseer-runtime';
 import { createMergeManager } from '@archon/overseer/merge-manager';
 import { resolveDefaultDeps } from '@archon/overseer/service';
@@ -139,6 +143,23 @@ export function handleUnhandledRejection(reason: unknown): void {
   // All other unhandled rejections are unexpected -- crash loudly so they are
   // not silently swallowed (CLAUDE.md: "Fail Fast + Explicit Errors").
   getLog().fatal({ reason }, 'unhandled_rejection.fatal');
+  process.exit(1);
+}
+
+/** Contain the narrowly identified child-process abort race from loop wall timeouts. */
+export function handleUncaughtException(error: unknown): void {
+  const message =
+    error instanceof Error ? error.message.toLowerCase() : String(error).toLowerCase();
+  const stack = error instanceof Error ? (error.stack ?? '') : '';
+  const isChildProcessAbortRace =
+    (message.includes('operation aborted') || message.includes('operation was aborted')) &&
+    stack.includes('abortChildProcess') &&
+    stack.includes('node:child_process');
+  if (isChildProcessAbortRace) {
+    getLog().error({ err: error }, 'uncaught_exception.child_process_abort_race');
+    return;
+  }
+  getLog().fatal({ err: error }, 'uncaught_exception.fatal');
   process.exit(1);
 }
 
@@ -249,6 +270,14 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     getLog().info(pendingReconcile, 'startup_pending_reconciliation_completed');
   } catch (error) {
     getLog().fatal({ err: error }, 'startup_pending_reconciliation_failed');
+    process.exit(1);
+  }
+
+  try {
+    const runningReconcile = await reconcileRunningRunsAtBoot(undefined, startupReconciliationAt);
+    getLog().info(runningReconcile, 'startup_running_reconciliation_completed');
+  } catch (error) {
+    getLog().fatal({ err: error }, 'startup_running_reconciliation_failed');
     process.exit(1);
   }
 
@@ -791,6 +820,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
   // because it occurs AFTER the for-await generator loop exits (and thus outside
   // the try/catch in claude.ts). These are SDK cleanup races, not fatal app errors.
   process.on('unhandledRejection', handleUnhandledRejection);
+  process.on('uncaughtException', handleUncaughtException);
 
   getLog().info({ activePlatforms, port }, 'server_ready');
 

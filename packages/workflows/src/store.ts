@@ -117,10 +117,16 @@ export interface IWorkflowStore {
   findResumableRun(workflowName: string, workingPath: string): Promise<WorkflowRun | null>;
   failOrphanedRuns(): Promise<{ count: number }>;
   listPendingWorkflowRunsBefore(cutoff: string): Promise<WorkflowRun[]>;
+  listStaleRunningWorkflowRunsBefore(cutoff: string): Promise<WorkflowRun[]>;
   orphanPendingWorkflowRun(data: {
     runId: string;
     reason: string;
     orphanedAt: string;
+  }): Promise<boolean>;
+  failStaleRunningWorkflowRun(data: {
+    runId: string;
+    reason: string;
+    failedAt: string;
   }): Promise<boolean>;
   resumeWorkflowRun(id: string): Promise<WorkflowRun>;
   updateWorkflowRun(

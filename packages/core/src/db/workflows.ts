@@ -1027,6 +1027,20 @@ export async function listPendingWorkflowRunsBefore(cutoff: string): Promise<Wor
   return result.rows.map(normalizeWorkflowRun);
 }
 
+export async function listStaleRunningWorkflowRunsBefore(cutoff: string): Promise<WorkflowRun[]> {
+  const result = await pool.query<WorkflowRun>(
+    `SELECT r.*
+     FROM remote_agent_workflow_runs r
+     LEFT JOIN remote_agent_run_leases l
+       ON l.run_id = r.id AND l.released_at IS NULL
+     WHERE r.status = 'running'
+       AND (l.run_id IS NULL OR l.expires_at <= $1)
+     ORDER BY r.started_at ASC`,
+    [cutoff]
+  );
+  return result.rows.map(normalizeWorkflowRun);
+}
+
 export async function orphanPendingWorkflowRun(data: {
   runId: string;
   reason: string;
@@ -1052,6 +1066,41 @@ export async function orphanPendingWorkflowRun(data: {
         JSON.stringify({
           orphaned_reason: data.reason,
           orphaned_at: data.orphanedAt,
+        }),
+        data.runId,
+      ]
+    );
+    return update.rowCount === 1;
+  });
+}
+
+export async function failStaleRunningWorkflowRun(data: {
+  runId: string;
+  reason: string;
+  failedAt: string;
+}): Promise<boolean> {
+  const db = getDatabase();
+  return db.withTransaction(async query => {
+    const lockSuffix = db.dialect === 'postgres' ? ' FOR UPDATE' : '';
+    const candidate = await query<{ status: string }>(
+      `SELECT status
+       FROM remote_agent_workflow_runs
+       WHERE id = $1 AND status = 'running'${lockSuffix}`,
+      [data.runId]
+    );
+    if (!candidate.rows[0]) return false;
+
+    const update = await query(
+      `UPDATE remote_agent_workflow_runs
+       SET status = 'failed',
+           completed_at = $1,
+           metadata = ${db.sql.jsonMerge('metadata', 2)}
+       WHERE id = $3 AND status = 'running'`,
+      [
+        data.failedAt,
+        JSON.stringify({
+          failure_reason: data.reason,
+          failed_at: data.failedAt,
         }),
         data.runId,
       ]

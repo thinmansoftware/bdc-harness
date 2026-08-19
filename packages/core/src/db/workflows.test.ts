@@ -65,6 +65,8 @@ import {
   interruptExpiredRunLease,
   listPendingWorkflowRunsBefore,
   orphanPendingWorkflowRun,
+  listStaleRunningWorkflowRunsBefore,
+  failStaleRunningWorkflowRun,
   createProviderAttempt,
   completeProviderAttempt,
   listProviderAttempts,
@@ -1587,6 +1589,33 @@ describe('Smart Cauldron reliability persistence', () => {
     expect(mockTransactionQuery.mock.calls[1]?.[0]).toContain("status = 'orphaned'");
     expect(mockTransactionQuery.mock.calls[1]?.[0]).toContain(
       "WHERE id = $2 AND status = 'pending'"
+    );
+  });
+
+  test('lists running rows with no lease or an expired lease, excluding fresh leases', async () => {
+    mockQuery.mockResolvedValueOnce(createQueryResult([]));
+    await listStaleRunningWorkflowRunsBefore('2026-07-13T17:53:00.000Z');
+    const [query, params] = mockQuery.mock.calls[0] as [string, unknown[]];
+    expect(query).toContain('LEFT JOIN remote_agent_run_leases');
+    expect(query).toContain("r.status = 'running'");
+    expect(query).toContain('l.run_id IS NULL OR l.expires_at <= $1');
+    expect(params).toEqual(['2026-07-13T17:53:00.000Z']);
+  });
+
+  test('fails a stale running workflow run with a guarded CAS update', async () => {
+    mockTransactionQuery
+      .mockResolvedValueOnce(createQueryResult([{ status: 'running' }], 1))
+      .mockResolvedValueOnce(createQueryResult([], 1));
+    await expect(
+      failStaleRunningWorkflowRun({
+        runId: 'run-running-1',
+        reason: 'server_restart_orphaned',
+        failedAt: '2026-07-13T17:53:00.000Z',
+      })
+    ).resolves.toBe(true);
+    expect(mockTransactionQuery.mock.calls[1]?.[0]).toContain("SET status = 'failed'");
+    expect(mockTransactionQuery.mock.calls[1]?.[0]).toContain(
+      "WHERE id = $3 AND status = 'running'"
     );
   });
 

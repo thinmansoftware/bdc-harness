@@ -60,6 +60,7 @@ export {
   claimAndResumeInterruptedRun,
   reconcileExpiredWorkflowLeases,
   reconcilePendingWorkflowRunsAtBoot,
+  reconcileRunningWorkflowRunsAtBoot,
   type PendingReconcileReport,
   type StartupRecoveryReport,
 } from './workflows/recovery';

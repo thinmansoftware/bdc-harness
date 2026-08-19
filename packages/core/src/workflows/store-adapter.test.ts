@@ -6,6 +6,8 @@ const mockCreateWorkflowRun = mock(() => Promise.resolve({ id: 'run-1' }));
 const mockGetWorkflowRun = mock(() => Promise.resolve(null));
 const mockGetActiveWorkflowRunByPath = mock(() => Promise.resolve(null));
 const mockFailOrphanedRuns = mock(() => Promise.resolve({ count: 0 }));
+const mockListStaleRunningWorkflowRunsBefore = mock(() => Promise.resolve([]));
+const mockFailStaleRunningWorkflowRun = mock(() => Promise.resolve(false));
 const mockFindResumableRun = mock(() => Promise.resolve(null));
 const mockResumeWorkflowRun = mock(() => Promise.resolve({ id: 'run-1' }));
 const mockUpdateWorkflowRun = mock(() => Promise.resolve());
@@ -47,6 +49,8 @@ mock.module('../db/workflows', () => ({
   getWorkflowRun: mockGetWorkflowRun,
   getActiveWorkflowRunByPath: mockGetActiveWorkflowRunByPath,
   failOrphanedRuns: mockFailOrphanedRuns,
+  listStaleRunningWorkflowRunsBefore: mockListStaleRunningWorkflowRunsBefore,
+  failStaleRunningWorkflowRun: mockFailStaleRunningWorkflowRun,
   findResumableRun: mockFindResumableRun,
   resumeWorkflowRun: mockResumeWorkflowRun,
   updateWorkflowRun: mockUpdateWorkflowRun,
@@ -127,6 +131,8 @@ describe('createWorkflowStore', () => {
       'getWorkflowRun',
       'getActiveWorkflowRunByPath',
       'failOrphanedRuns',
+      'listStaleRunningWorkflowRunsBefore',
+      'failStaleRunningWorkflowRun',
       'findResumableRun',
       'resumeWorkflowRun',
       'updateWorkflowRun',

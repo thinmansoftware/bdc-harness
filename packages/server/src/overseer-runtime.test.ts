@@ -444,9 +444,11 @@ describe('overseer-runtime', () => {
     const calls: string[] = [];
     calls.push('observeStartupRecovery');
     calls.push('reconcilePendingRunsAtBoot');
+    calls.push('reconcileRunningRunsAtBoot');
     calls.push('startOverseerRuntime');
     expect(calls[0]).toBe('observeStartupRecovery');
     expect(calls[1]).toBe('reconcilePendingRunsAtBoot');
-    expect(calls[2]).toBe('startOverseerRuntime');
+    expect(calls[2]).toBe('reconcileRunningRunsAtBoot');
+    expect(calls[3]).toBe('startOverseerRuntime');
   });
 });
