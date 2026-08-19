@@ -396,8 +396,14 @@ describe('fireTier deterministic dispatch-token discovery', () => {
     expect(scanCalls).toHaveLength(1);
   });
 
-  // Test 3 (fire-side): an unknown workflow yields dispatched:false, so fireTier
-  // reports a loud infra failure -- never a fabricated success.
+  // Test 3 (fire-side half): given the server's unknown-workflow response
+  // (accepted:false, dispatched:false, 400), fireTier surfaces a loud infra
+  // failure and never fabricates success or attempts discovery. The SERVER half
+  // of this contract -- that POST /api/conversations actually returns that error
+  // for a nonexistent lane (never dispatched:true) -- is proven against the real
+  // route in packages/server/src/routes/api.conversations.test.ts
+  // ('unknown workflow carrying a --dispatch-token still fails loudly'). Together
+  // they close task_ac4d1148 end to end without either half mocking the other's job.
   test('unknown workflow dispatch fails loudly (no dispatched:true, runId null)', async () => {
     globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
       const url = String(input);
