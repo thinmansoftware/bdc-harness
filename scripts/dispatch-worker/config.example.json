@@ -19,6 +19,7 @@
     "cursor": 1,
     "fusion": 1
   },
+  "seat": null,
   "board_delivery": {
     "enabled": false,
     "credential_id": "example-board-worker",

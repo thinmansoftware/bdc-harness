@@ -13,11 +13,13 @@ import {
   buildAgentInvocation,
   defaultAgentConfigs,
   parseFusionReviewBody,
+  restrictAgentsToAllowlist,
   type AgentConfig,
 } from './adapters';
 import { createCancelController, runAcpAgent, type AcpRunResult } from './acp/session';
 import { createMcpCancelController, runMcpAgent, type McpRunResult } from './mcp/session';
 import { resolveOperatorToken } from './credentials';
+import { realSeatPreflightDeps, runSeatPreflight, type SeatConfig } from './seat-preflight';
 import { acquireInstanceLock, type InstanceLockHandle } from './instance-lock';
 import { createWorkerLog, type WorkerLog } from './worker-log';
 import { enumerateProcessTree, killProcessTree, waitForTreeDeath } from './acp/kill-tree';
@@ -120,14 +122,21 @@ interface WorkerConfig {
     allowed_principals?: string[];
   };
   agents?: Record<string, AgentConfig>;
+  /**
+   * M-131 Phase A: when present, this worker is an isolated single-provider
+   * server seat. Advertisement, polling, and claiming are gated on seat
+   * preflight, and the agent registry is restricted to the allowlist.
+   */
+  seat?: SeatConfig | null;
 }
 
 type NormalizedWorkerConfig = Required<
-  Omit<WorkerConfig, 'board_delivery' | 'operator_token_file' | 'agents'>
+  Omit<WorkerConfig, 'board_delivery' | 'operator_token_file' | 'agents' | 'seat'>
 > & {
   operator_token_file: string;
   agents: Record<string, AgentConfig>;
   board_delivery: BoardDeliveryConfig;
+  seat: SeatConfig | null;
 };
 
 interface WorkerState {
@@ -155,7 +164,15 @@ async function readConfig(path: string): Promise<NormalizedWorkerConfig> {
   const raw = await Bun.file(path).text();
   const parsed = JSON.parse(raw) as WorkerConfig;
   if (!parsed.server_url) throw new Error('config.server_url is required');
-  const agents = { ...defaultAgentConfigs, ...(parsed.agents ?? {}) };
+  let agents = { ...defaultAgentConfigs, ...(parsed.agents ?? {}) };
+  let capabilities = parsed.capabilities ?? { providers: Object.keys(agents) };
+  if (parsed.seat) {
+    // A seat worker is single-provider: restrict the registry to the
+    // allowlist and advertise only what the seat can honestly run.
+    const allowlist = parsed.seat.provider_allowlist ?? [];
+    agents = restrictAgentsToAllowlist(agents, allowlist);
+    capabilities = { providers: allowlist, seat_id: parsed.seat.seat_id };
+  }
 
   return {
     worker_id: parsed.worker_id ?? `dispatch-worker-${hostname()}`,
@@ -171,7 +188,7 @@ async function readConfig(path: string): Promise<NormalizedWorkerConfig> {
     // to react before the lease actually lapses.
     lease_renew_interval_ms:
       parsed.lease_renew_interval_ms ?? Math.max(10_000, (parsed.lease_duration_ms ?? 300_000) / 3),
-    capabilities: parsed.capabilities ?? { providers: Object.keys(agents) },
+    capabilities,
     max_concurrency: parsed.max_concurrency ?? {},
     board_delivery: {
       enabled: parsed.board_delivery?.enabled ?? false,
@@ -180,6 +197,7 @@ async function readConfig(path: string): Promise<NormalizedWorkerConfig> {
       allowed_principals: parsed.board_delivery?.allowed_principals ?? [],
     },
     agents,
+    seat: parsed.seat ?? null,
   };
 }
 
@@ -729,6 +747,34 @@ async function main(): Promise<void> {
     return;
   }
   await log.info(`startup: acquired instance lock for worker_id=${config.worker_id}`);
+
+  // M-131 Phase A: a seat worker must pass deterministic preflight before it
+  // advertises, polls, or claims. Failure is typed and sanitized (code +
+  // field only, never a path value or credential) and the worker exits
+  // without registering.
+  if (config.seat) {
+    const commands = Object.fromEntries(
+      Object.entries(config.agents).map(([name, agent]) => [name, agent.command])
+    );
+    const preflight = await runSeatPreflight(config.seat, commands, realSeatPreflightDeps());
+    if (!preflight.ok) {
+      const detail = `seat preflight failed: ${preflight.code} field=${preflight.field}`;
+      await log.error(detail, new Error(preflight.code));
+      console.error(detail);
+      await lock.release();
+      process.exit(1);
+      return;
+    }
+    config.capabilities = {
+      ...config.capabilities,
+      seat_id: preflight.seatId,
+      providers: preflight.providers,
+      build_sha: preflight.buildSha,
+    };
+    await log.info(
+      `seat preflight ok: seat_id=${preflight.seatId} providers=${preflight.providers.join(',')} build_sha=${preflight.buildSha}`
+    );
+  }
 
   const token = await resolveOperatorToken({
     envName: config.operator_token_env,

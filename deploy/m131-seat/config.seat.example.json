@@ -1,0 +1,21 @@
+{
+  "worker_id": "bdc-seat-grok",
+  "host": "bdc-seat-grok",
+  "server_url": "http://archon-app-1:3090",
+  "operator_token_env": "ARCHON_OPERATOR_TOKEN",
+  "operator_token_file": "/run/m131/operator-token/archon-operator-token",
+  "poll_interval_ms": 5000,
+  "heartbeat_interval_ms": 30000,
+  "lease_duration_ms": 300000,
+  "max_concurrency": {
+    "grok-acp": 1
+  },
+  "seat": {
+    "seat_id": "bdc-seat-grok",
+    "provider_allowlist": ["grok-acp"],
+    "secret_ingress_file": "/run/m131/secret-ingress/grok-credential.json",
+    "vendor_profile_dir": "/home/seat/.grok",
+    "state_dir": "/var/lib/bdc-seat",
+    "build_sha_env": "SEAT_BUILD_SHA"
+  }
+}

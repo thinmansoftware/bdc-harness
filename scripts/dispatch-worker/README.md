@@ -158,3 +158,54 @@ Run focused proof with:
 ```sh
 bun test ./scripts/dispatch-worker/stdin-prompt.test.ts ./scripts/dispatch-worker/acp/kill-tree.test.ts ./scripts/dispatch-worker/acp/session.test.ts ./scripts/dispatch-worker/mcp/session.test.ts ./scripts/dispatch-worker/outcome-transcript.test.ts
 ```
+
+# M-131 server seats (Phase A: bdc-seat-grok)
+
+A "seat" is an isolated, single-provider server instance of this worker
+(M-131 board compute plane). Setting `"seat"` in the worker config (default
+`"seat": null` = not a seat) turns on the seat contract:
+
+- **Identity + concurrency one**: `seat.seat_id` names the seat (e.g.
+  `bdc-seat-grok`). A seat has exactly one provider in
+  `seat.provider_allowlist` (Phase A: a Grok adapter, `grok-acp` preferred).
+  The agent registry is restricted to that allowlist and advertised
+  capabilities list only those providers plus `seat_id` and `build_sha`.
+- **Preflight gates advertisement**: before registering, polling, or
+  claiming, the worker runs `seat-preflight.ts` (provider command available,
+  secret-ingress file present, vendor-profile and state directories present
+  and distinct, build SHA visible). On failure the worker logs a typed,
+  sanitized error (code + field name only -- never a path value, file
+  contents, or credential) and exits non-zero without advertising.
+- **Credential-file placeholder**: `seat.secret_ingress_file` points at the
+  read-only #1327 secret-ingress file (e.g.
+  `/run/m131/secret-ingress/grok-credential.json`). Preflight checks
+  presence only; credential bytes never enter Dispatch payloads, logs,
+  health output, manifests, argv, or git. Placing a real credential there is
+  a separately gated, John-authorized action -- never part of a source PR.
+- **Non-secret state**: `seat.vendor_profile_dir` is the seat-private
+  writable vendor profile (exactly one active refresh writer -- the
+  provider process in this seat). `seat.state_dir` is separate non-secret
+  state. The two must be distinct and are never shared across seats.
+- **Health / build SHA instrument**: `bun run
+  scripts/dispatch-worker/seat-preflight.ts --config <config.json>` exits 0
+  and prints `seat_preflight_ok seat=<id> build_sha=<sha>` when the seat is
+  healthy; the m131-seat container healthcheck uses it.
+- **BUILD_SHA is REQUIRED, not defaulted**: build with
+  `docker compose build --build-arg BUILD_SHA=$(git rev-parse HEAD)` (or set
+  `BUILD_SHA` in the environment for compose). The image build fails without
+  it, and preflight additionally rejects placeholder values (`unknown`,
+  `none`, `latest`, `dev`, or anything shorter than an abbreviated SHA). A
+  seat that cannot name its exact commit must not advertise at all.
+- **Profile/state isolation is checked on CANONICAL paths**: the vendor
+  profile and state directories are compared after symlink resolution and
+  normalization, and nesting counts as non-isolated. Two differently-spelled
+  paths that resolve to the same directory are refused.
+
+Packaging lives in `deploy/m131-seat/` (Dockerfile, compose example, seat
+config example, container-contract test).
+
+**Rollback**: a seat is rollback-safe by construction -- stop the seat
+container (or set `"seat": null` and restart for a non-container worker) and
+Dispatch simply stops seeing the seat advertise; queued messages stay queued
+or lease-expire for a new fenced attempt. No schema, server, or router
+change ships with a seat, so rollback never touches the drop-box server.
