@@ -57,42 +57,48 @@ async function main(): Promise<void> {
   }
 
   const nowIso = new Date().toISOString();
-  await db.query(
-    `UPDATE agent_dispatch_messages
-        SET addressed_at = $1, addressed_by = $2
-      WHERE ${MATCH_WHERE}`,
-    [nowIso, ADDRESSED_BY]
-  );
-
-  // Journal note citing M-155 (idempotent: skipped when the note already
-  // exists from a prior run). action_type/outcome use existing tm_journal
-  // CHECK values; the citation lives in proposal_json.
-  const existingNote = await db.query<{ id: string }>(
-    'SELECT id FROM tm_journal WHERE idempotency_key = $1',
-    [JOURNAL_IDEMPOTENCY_KEY]
-  );
-  if (existingNote.rows.length === 0) {
-    await db.query(
-      `INSERT INTO tm_journal
-         (id, created_at, thread_ref, action_type, proposal_json, idempotency_key, outcome)
-       VALUES ($1, $2, $3, 'digest', $4, $5, 'expired')`,
-      [
-        randomUUID(),
-        nowIso,
-        'm155:deadletter-expiry',
-        JSON.stringify({
-          note:
-            `M-155 dead-letter expiry: marked ${matching} queued, never-addressed ` +
-            "recipient='xo' taskmaster messages as addressed. Authority: " +
-            'M-20260817-155 (docs/board/motions/M-20260817-155-taskmaster-course-correction.md), ' +
-            'DoD D-4. One-shot operator action at Deploy 2; never run by the loop.',
-          expired_count: matching,
-          addressed_by: ADDRESSED_BY,
-        }),
-        JOURNAL_IDEMPOTENCY_KEY,
-      ]
+  // Single transaction: the message update and the M-155 journal note commit
+  // together or not at all. Without this, a failed journal insert after a
+  // committed update would leave the expiry permanently unjournaled -- a
+  // rerun sees 0 matching rows and exits before ever reaching the insert.
+  await db.withTransaction(async query => {
+    await query(
+      `UPDATE agent_dispatch_messages
+          SET addressed_at = $1, addressed_by = $2
+        WHERE ${MATCH_WHERE}`,
+      [nowIso, ADDRESSED_BY]
     );
-  }
+
+    // Journal note citing M-155 (idempotent: skipped when the note already
+    // exists from a prior completed run). action_type/outcome use existing
+    // tm_journal CHECK values; the citation lives in proposal_json.
+    const existingNote = await query<{ id: string }>(
+      'SELECT id FROM tm_journal WHERE idempotency_key = $1',
+      [JOURNAL_IDEMPOTENCY_KEY]
+    );
+    if (existingNote.rows.length === 0) {
+      await query(
+        `INSERT INTO tm_journal
+           (id, created_at, thread_ref, action_type, proposal_json, idempotency_key, outcome)
+         VALUES ($1, $2, $3, 'digest', $4, $5, 'expired')`,
+        [
+          randomUUID(),
+          nowIso,
+          'm155:deadletter-expiry',
+          JSON.stringify({
+            note:
+              `M-155 dead-letter expiry: marked ${matching} queued, never-addressed ` +
+              "recipient='xo' taskmaster messages as addressed. Authority: " +
+              'M-20260817-155 (docs/board/motions/M-20260817-155-taskmaster-course-correction.md), ' +
+              'DoD D-4. One-shot operator action at Deploy 2; never run by the loop.',
+            expired_count: matching,
+            addressed_by: ADDRESSED_BY,
+          }),
+          JOURNAL_IDEMPOTENCY_KEY,
+        ]
+      );
+    }
+  });
 
   console.log(
     `Marked ${matching} taskmaster dead-letter messages addressed (addressed_by=${ADDRESSED_BY}) ` +

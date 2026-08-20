@@ -298,20 +298,35 @@ describe('scenario 3: pause scope=effects withholds ALL effects (P0 escalation n
     world.control.pause_scope = 'effects';
     world.control.pause_actor = 'john';
 
-    const staleP1: ThreadSnapshot = {
+    const staleP1 = makeListedThread({
       ref: 'gh:thinmansoftware/bdc-harness#11',
       priority: 'P1',
       lastActivityAt: new Date(T0 - 5 * 3_600_000).toISOString(),
       recipient: 'xo',
-    };
-    const unclaimedP0: ThreadSnapshot = {
+      title: 'Stale P1 item',
+    });
+    const unclaimedP0 = makeListedThread({
       ref: 'gh:thinmansoftware/bdc-harness#12',
       priority: 'P0',
       lastActivityAt: new Date(T0 - 3_600_000).toISOString(),
       isUnclaimedP0: true,
       recipient: 'xo',
-    };
-    const deps = makeDeps(world, { listThreads: async () => [staleP1, unclaimedP0] });
+      title: 'Unclaimed P0 item',
+    });
+    const deps = makeDeps(world, {
+      listThreads: async () => [staleP1, unclaimedP0],
+      // Content-complete adoption (PROGRESS marker -> next_action) so the
+      // ordinary nudge is composed; this test is about the pause parking it.
+      getGithubIssueEvidence: async () =>
+        makeEvidence({
+          ownerLogin: 'major-build',
+          latestMarkerKind: 'PROGRESS',
+          latestMarkerText: 'waiting on review feedback',
+          latestMarkerAt: new Date(T0 - 3 * 3_600_000).toISOString(),
+          lastMovementAt: new Date(T0 - 3 * 3_600_000).toISOString(),
+          lastMovementKind: 'progress_comment',
+        }),
+    });
     const state = createTaskmasterState(60_000);
 
     // Tick 1 observes; tick 2 confirms the nudge (which then parks). The P0
@@ -720,12 +735,13 @@ describe('failed effect reuse and successful-tick health', () => {
   test('a deferred row is reused when the next tick has budget', async () => {
     const world = makeWorld();
     seedDigestSent(world);
-    const staleThread: ThreadSnapshot = {
+    const staleThread = makeListedThread({
       ref: 'gh:thinmansoftware/bdc-xo#1500',
       priority: 'P1',
       lastActivityAt: new Date(T0 - 5 * 3_600_000).toISOString(),
       recipient: 'xo',
-    };
+      title: 'Deferred stale item',
+    });
     world.journal.push({
       id: 'deferred-nudge',
       created_at: new Date(T0 - 60_000).toISOString(),
@@ -743,7 +759,18 @@ describe('failed effect reuse and successful-tick health', () => {
 
     const result = await tick(
       createTaskmasterState(60_000),
-      makeDeps(world, { listThreads: async () => [staleThread] })
+      makeDeps(world, {
+        listThreads: async () => [staleThread],
+        getGithubIssueEvidence: async () =>
+          makeEvidence({
+            ownerLogin: 'major-build',
+            latestMarkerKind: 'PROGRESS',
+            latestMarkerText: 'waiting on review feedback',
+            latestMarkerAt: new Date(T0 - 3 * 3_600_000).toISOString(),
+            lastMovementAt: new Date(T0 - 3 * 3_600_000).toISOString(),
+            lastMovementKind: 'progress_comment',
+          }),
+      })
     );
 
     expect(result.effects).toBe(1);
@@ -754,12 +781,13 @@ describe('failed effect reuse and successful-tick health', () => {
   test('an expired deferred row is terminal and is not sent', async () => {
     const world = makeWorld();
     seedDigestSent(world);
-    const staleThread: ThreadSnapshot = {
+    const staleThread = makeListedThread({
       ref: 'gh:thinmansoftware/bdc-xo#1501',
       priority: 'P1',
       lastActivityAt: new Date(T0 - 5 * 3_600_000).toISOString(),
       recipient: 'xo',
-    };
+      title: 'Expired deferred item',
+    });
     world.journal.push({
       id: 'expired-deferred-nudge',
       created_at: new Date(T0 - 60_000).toISOString(),
@@ -777,7 +805,18 @@ describe('failed effect reuse and successful-tick health', () => {
 
     const result = await tick(
       createTaskmasterState(60_000),
-      makeDeps(world, { listThreads: async () => [staleThread] })
+      makeDeps(world, {
+        listThreads: async () => [staleThread],
+        getGithubIssueEvidence: async () =>
+          makeEvidence({
+            ownerLogin: 'major-build',
+            latestMarkerKind: 'PROGRESS',
+            latestMarkerText: 'waiting on review feedback',
+            latestMarkerAt: new Date(T0 - 3 * 3_600_000).toISOString(),
+            lastMovementAt: new Date(T0 - 3 * 3_600_000).toISOString(),
+            lastMovementKind: 'progress_comment',
+          }),
+      })
     );
 
     expect(result.effects).toBe(0);
@@ -1171,18 +1210,43 @@ describe('scenario 5: budget ceiling holds', () => {
   test('25 eligible stale threads: at most 10 effects, 1 per item, remainder journaled deferred', async () => {
     const world = makeWorld();
     seedDigestSent(world);
-    const threads: ThreadSnapshot[] = Array.from({ length: 25 }, (_, i) => ({
-      ref: `gh:thinmansoftware/bdc-harness#${100 + i}`,
-      priority: 'P1' as const,
-      lastActivityAt: new Date(T0 - 6 * 3_600_000).toISOString(),
-      recipient: 'xo',
-    }));
-    const deps = makeDeps(world, { listThreads: async () => threads });
+    const threads = Array.from({ length: 25 }, (_, i) =>
+      makeListedThread({
+        ref: `gh:thinmansoftware/bdc-harness#${100 + i}`,
+        priority: 'P1',
+        lastActivityAt: new Date(T0 - 6 * 3_600_000).toISOString(),
+        recipient: 'xo',
+        title: `Stale item ${100 + i}`,
+      })
+    );
+    const deps = makeDeps(world, {
+      listThreads: async () => threads,
+      // Content-complete adoption for every thread so all 25 nudges compose;
+      // this test is about the EFFECT budget (10/tick), so the adoption
+      // evidence budget is raised to cover the full set in one tick.
+      getGithubIssueEvidence: async () =>
+        makeEvidence({
+          ownerLogin: 'major-build',
+          latestMarkerKind: 'PROGRESS',
+          latestMarkerText: 'waiting on review feedback',
+          latestMarkerAt: new Date(T0 - 3 * 3_600_000).toISOString(),
+          lastMovementAt: new Date(T0 - 3 * 3_600_000).toISOString(),
+          lastMovementKind: 'progress_comment',
+        }),
+    });
     const state = createTaskmasterState(60_000);
 
-    await tick(state, deps); // observation tick
-    world.nowMs += 60_000;
-    const result = await tick(state, deps); // confirming tick
+    const priorBudget = process.env.TASKMASTER_ADOPTION_EVIDENCE_BUDGET;
+    process.env.TASKMASTER_ADOPTION_EVIDENCE_BUDGET = '25';
+    let result;
+    try {
+      await tick(state, deps); // observation tick
+      world.nowMs += 60_000;
+      result = await tick(state, deps); // confirming tick
+    } finally {
+      if (priorBudget === undefined) delete process.env.TASKMASTER_ADOPTION_EVIDENCE_BUDGET;
+      else process.env.TASKMASTER_ADOPTION_EVIDENCE_BUDGET = priorBudget;
+    }
 
     expect(result.effects).toBe(10);
     expect(world.sentMessages.length).toBe(10);

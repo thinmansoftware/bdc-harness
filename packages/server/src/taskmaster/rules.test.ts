@@ -114,6 +114,7 @@ describe('computeNextAction', () => {
     const proposal = computeNextAction(thread(), 'stale', {
       interventionsLast24h: 0,
       nowMs: NOW_MS,
+      adoption: makeAdoption({ title: 'Stale item', next_action: 'rerun the failing suite' }),
     });
     expect(proposal?.type).toBe('nudge');
     expect(proposal?.actsImmediately).toBe(false);
@@ -121,10 +122,16 @@ describe('computeNextAction', () => {
   });
 
   test('nudge idempotency key is stable within a clock bucket', () => {
-    const a = computeNextAction(thread(), 'stale', { interventionsLast24h: 0, nowMs: NOW_MS });
+    const adoption = makeAdoption({ title: 'Stale item', next_action: 'rerun the failing suite' });
+    const a = computeNextAction(thread(), 'stale', {
+      interventionsLast24h: 0,
+      nowMs: NOW_MS,
+      adoption,
+    });
     const b = computeNextAction(thread(), 'stale', {
       interventionsLast24h: 0,
       nowMs: NOW_MS + 60_000,
+      adoption,
     });
     expect(a?.idempotencyKey).toBe(b?.idempotencyKey ?? '');
   });
@@ -202,6 +209,19 @@ describe('M-155 exception push (rules)', () => {
     expect(proposal).toBeNull();
     // The composer itself declares the row ineligible.
     expect(composeNudgeBody(thread(), adoption, NOW_MS)).toBeNull();
+  });
+
+  test('push: a stale thread with NO adoption row does NOT nudge (no generic fallback)', () => {
+    // Missing adoption content means content policy cannot be evaluated;
+    // ordinary nudges require full content, so no proposal is produced --
+    // the item stays visible on the register instead of sending a
+    // contentless reminder.
+    const proposal = computeNextAction(thread(), 'stale', {
+      interventionsLast24h: 0,
+      nowMs: NOW_MS,
+    });
+    expect(proposal).toBeNull();
+    expect(composeNudgeBody(thread(), undefined, NOW_MS)).toBeNull();
   });
 
   test('push: replaying the audited chronic corpus produces no sends', () => {

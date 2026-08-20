@@ -38,6 +38,24 @@ export type TmAllowedRecipient = (typeof TM_ALLOWED_RECIPIENTS)[number];
 const SPEND_SEND_DEPLOY_RE =
   /\b(charge|bill|invoice(?:d)?|refund|pay(?:ment|out)?|wire|transfer\s+funds|withdraw|deposit|purchase|buy(?:\s+now)?|discount(?:ed)?(?:\s+\w+){0,3}?\s+(?:\d+\s*%|\d+\s*percent|percent)|discount(?:ed)?\s+\d|price\s+match|comp(?:\s+the\s+order)?|send\s+(?:the\s+)?(?:email|sms|text|message|dm|invoice|listing)|email\s+the\s+customer|text\s+the\s+customer|post\s+to\s+(?:whatnot|instagram|facebook|discord)|publish\s+the\s+listing|go\s+live|deploy|merge\s+(?:to|into)\s+(?:main|master|prod|production)|push\s+to\s+prod(?:uction)?|activate\s+the\s+listing|mark\s+(?:it\s+)?send-ready)\b/i;
 
+/**
+ * Structural content contract for ordinary nudges (M-155 WO 3). A
+ * content-complete nudge body (composeNudgeBody) always carries:
+ *   - a quoted item title,
+ *   - an explicit owner slot ("owner: <login-or-UNKNOWN>"),
+ *   - a blocker or next-action clause ("Blocked: ..." / "Next action: ...").
+ * The guard verifies these parts mechanically instead of trusting callers to
+ * self-report via `contentIncomplete` -- a nudge body missing any part is
+ * rejected content_incomplete no matter how it was constructed.
+ */
+const NUDGE_TITLE_RE = /"[^"]+"/;
+const NUDGE_OWNER_RE = /\bowner:\s*\S+/i;
+const NUDGE_WHY_RE = /\b(?:Blocked|Next action):\s*\S+/i;
+
+export function isContentCompleteNudgeBody(body: string): boolean {
+  return NUDGE_TITLE_RE.test(body) && NUDGE_OWNER_RE.test(body) && NUDGE_WHY_RE.test(body);
+}
+
 export interface GuardResult {
   allowed: boolean;
   reason?: string;
@@ -110,6 +128,19 @@ export function validateProposal(proposal: ActionProposal): GuardResult {
     return {
       allowed: false,
       reason: `spend_send_deploy_verb_rejected: body contains forbidden verb '${match[0]}'. The Taskmaster has zero spend/send/deploy authority (M-15 tier wall).`,
+    };
+  }
+
+  // M-155 WO 3: ordinary nudges must be content-complete. Verified
+  // structurally here (title + owner + blocker/next-action parts), not by
+  // trusting the contentIncomplete flag -- an ORDINARY reject, never a
+  // HARD_PAUSE circuit.
+  if (proposal.type.trim().toLowerCase() === 'nudge' && !isContentCompleteNudgeBody(normalized)) {
+    return {
+      allowed: false,
+      reason:
+        'content_incomplete: the nudge body lacks the required item content ' +
+        '(quoted title, owner, and blocker or next action); the item stays on the register.',
     };
   }
 

@@ -309,26 +309,13 @@ export function computeNextAction(
     }
     const clock = nudgeClockMs(thread);
     const bucket = Math.floor(context.nowMs / clock);
-    let body: string | null;
-    if (adoption) {
-      body = composeNudgeBody(thread, adoption, context.nowMs);
-      // Section 6 rows 4-5: no content-complete body -> NO proposal. The item
-      // stays visible on the register (WO 2); nothing is sent or journaled.
-      if (body === null) return null;
-    } else {
-      // No content-bearing adoption row exists for this thread (the
-      // projection knows nothing beyond the ref -- e.g. a degraded adoption
-      // read or a thread outside the projection). Content policy cannot be
-      // evaluated; keep a reworded M-133 reminder so watching never goes
-      // dark. Every projection row built from the GitHub list API carries a
-      // title, so in production this branch is a degraded-mode fallback only.
-      body =
-        `Nudge: ${thread.ref} (${thread.priority}) looks idle past its ` +
-        `${Math.round(clock / MINUTE_MS)}min clock and the adoption projection has ` +
-        'no content for it. Please post a status update, progress the item, or ' +
-        'mark it blocked with a reason. Begin the update with [PROGRESS] or ' +
-        '[BLOCKED] so the source-of-truth change can be verified.';
-    }
+    // Section 6 rows 4-5: no content-complete body -> NO proposal. This
+    // includes a missing adoption row entirely (composeNudgeBody returns null
+    // for it): content policy cannot be evaluated without content, so nothing
+    // is sent or journaled -- the item stays visible on the register (WO 2)
+    // instead of triggering a contentless reminder.
+    const body = composeNudgeBody(thread, adoption, context.nowMs);
+    if (body === null) return null;
     return {
       type: 'nudge',
       threadRef: thread.ref,
