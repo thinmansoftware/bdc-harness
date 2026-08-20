@@ -7,7 +7,7 @@
  * stale-head invalidation mid-review, reviewer failure, submission failure,
  * and receipt creation. Hermetic -- fake deps only.
  */
-import { describe, expect, test } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import {
   buildReviewBody,
   runAndSubmitReview,
@@ -65,6 +65,13 @@ describe('approve path', () => {
     expect(rec.receipts[0]?.disposition).toBe('approved');
   });
 
+  test('the submitted review binds to the exact head the reviewer evaluated (commitId)', async () => {
+    const { deps, rec } = makeDeps();
+    await runAndSubmitReview(WORK, deps);
+    expect(rec.submitted[0]?.commitId).toBe(HEAD);
+    expect(rec.submitted[0]?.commitId).toBe(WORK.headSha);
+  });
+
   test('the review body states the exact reviewed head', async () => {
     const { deps, rec } = makeDeps();
     await runAndSubmitReview(WORK, deps);
@@ -116,6 +123,63 @@ describe('custody conflict', () => {
       },
     });
     await runAndSubmitReview({ ...WORK, author: REVIEWER }, deps);
+    expect(reviewerRan).toBe(false);
+  });
+});
+
+describe('merge-custody conflict (M-153, tabled)', () => {
+  const MODE_ENV = 'OVERSEER_MERGE_MANAGER_MODE';
+  let priorMode: string | undefined;
+
+  beforeEach(() => {
+    priorMode = process.env[MODE_ENV];
+  });
+
+  afterEach(() => {
+    if (priorMode === undefined) delete process.env[MODE_ENV];
+    else process.env[MODE_ENV] = priorMode;
+  });
+
+  test('refuses to submit while the merge manager is armed to execute', async () => {
+    process.env[MODE_ENV] = 'execute';
+    const { deps, rec } = makeDeps();
+    const outcome = await runAndSubmitReview(WORK, deps);
+    expect(outcome.disposition).toBe('merge_custody_conflict');
+    expect(rec.submitted).toHaveLength(0);
+    expect(rec.receipts[0]?.disposition).toBe('merge_custody_conflict');
+  });
+
+  test('proceeds normally when the merge manager is parked in hold-canary', async () => {
+    process.env[MODE_ENV] = 'hold-canary';
+    const { deps } = makeDeps();
+    const outcome = await runAndSubmitReview(WORK, deps);
+    expect(outcome.disposition).toBe('approved');
+  });
+
+  test('proceeds normally when the merge manager is in comment_findings', async () => {
+    process.env[MODE_ENV] = 'comment_findings';
+    const { deps } = makeDeps();
+    const outcome = await runAndSubmitReview(WORK, deps);
+    expect(outcome.disposition).toBe('approved');
+  });
+
+  test('fails closed (blocks review) on an unset mode -- default is hold-canary, not execute', async () => {
+    delete process.env[MODE_ENV];
+    const { deps } = makeDeps();
+    const outcome = await runAndSubmitReview(WORK, deps);
+    expect(outcome.disposition).toBe('approved');
+  });
+
+  test('the merge-custody check runs BEFORE the reviewer (no wasted invocation)', async () => {
+    process.env[MODE_ENV] = 'execute';
+    let reviewerRan = false;
+    const { deps } = makeDeps({
+      runReviewer: async () => {
+        reviewerRan = true;
+        return { approved: true, summary: 'x', reviewedHeadSha: HEAD };
+      },
+    });
+    await runAndSubmitReview(WORK, deps);
     expect(reviewerRan).toBe(false);
   });
 });

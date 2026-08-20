@@ -83,6 +83,12 @@ export interface RealGitHubOctokitLike {
      * the optional `body` that REQUEST_CHANGES requires (GitHub rejects a
      * REQUEST_CHANGES review with no body). APPROVE-only callers are
      * unaffected: `body` is optional and 'APPROVE' remains assignable.
+     *
+     * `commit_id` REQUIRED (WO-HARNESS-OVERSEER-PR-REVIEW-ROUTE-01 stop
+     * condition 4, review finding 2026-08-18): without it GitHub binds the
+     * review to whatever the head is AT API-CALL TIME, not the exact commit
+     * the reviewer evaluated. A push between review-start and submission
+     * would silently land an approval on unreviewed code.
      */
     createReview?(input: {
       owner: string;
@@ -90,6 +96,7 @@ export interface RealGitHubOctokitLike {
       pull_number: number;
       event: 'APPROVE' | 'REQUEST_CHANGES';
       body?: string;
+      commit_id: string;
     }): Promise<{ data: { id: number; state: string } }>;
   };
   search: {
@@ -415,7 +422,22 @@ export function createRealApprovePullRequest(
 ): (input: PullRequestRef) => Promise<{ approved: boolean; message?: string }> {
   const submit = createRealSubmitPullRequestReview(octokit);
   return async (input: PullRequestRef): Promise<{ approved: boolean; message?: string }> => {
-    const result = await submit({ ...input, event: 'APPROVE' });
+    // PullRequestRef carries no head SHA, and commit_id is now required
+    // (stop condition 4): fetch the live head immediately before approving
+    // so the review still binds to a real, current commit rather than
+    // whatever GitHub would pick if commit_id were omitted.
+    let commitId: string;
+    try {
+      const pr = await octokit.pulls.get({
+        owner: input.owner,
+        repo: input.repo,
+        pull_number: input.number,
+      });
+      commitId = pr.data.head.sha;
+    } catch {
+      return { approved: false, message: 'github_review_head_lookup_failed' };
+    }
+    const result = await submit({ ...input, event: 'APPROVE', commitId });
     return result.message === undefined
       ? { approved: result.submitted }
       : { approved: result.submitted, message: result.message };
@@ -429,6 +451,12 @@ export interface SubmitPullRequestReviewInput extends PullRequestRef {
   event: OverseerReviewEvent;
   /** Evidence body. REQUIRED and non-empty for REQUEST_CHANGES. */
   body?: string;
+  /**
+   * REQUIRED. The exact commit the reviewer evaluated. Passed through to
+   * GitHub as `commit_id` so the review binds to that commit specifically,
+   * not to the PR's head at the moment the API call happens to run.
+   */
+  commitId: string;
 }
 
 export interface SubmitPullRequestReviewResult {
@@ -471,6 +499,7 @@ export function createRealSubmitPullRequestReview(
         repo: input.repo,
         pull_number: input.number,
         event: input.event,
+        commit_id: input.commitId,
         ...(body.length > 0 ? { body } : {}),
       });
       if (response.data.state !== expectedState) {

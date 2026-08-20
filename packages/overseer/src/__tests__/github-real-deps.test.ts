@@ -228,6 +228,9 @@ describe('createRealApprovePullRequest', () => {
       repo: 'lspro-react',
       pull_number: 42,
       event: 'APPROVE',
+      // The wrapper fetches the live head via pulls.get and binds the review
+      // to it -- octokitWithReview's get() returns 'a'.repeat(40) as the head.
+      commit_id: 'a'.repeat(40),
     });
     expect(result).toEqual({ approved: true });
   });

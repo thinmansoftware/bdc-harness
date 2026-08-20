@@ -21,6 +21,7 @@ import type {
   SubmitPullRequestReviewInput,
   SubmitPullRequestReviewResult,
 } from './adapters/github-real-deps.ts';
+import { resolveMergeManagerMode } from './merge-manager';
 
 /** What the governed reviewer returns. */
 export interface ReviewerVerdict {
@@ -47,6 +48,7 @@ export type SubmitDisposition =
   | 'approved'
   | 'changes_requested'
   | 'custody_conflict'
+  | 'merge_custody_conflict'
   | 'stale_head'
   | 'reviewer_failed'
   | 'submission_failed';
@@ -116,6 +118,24 @@ export async function runAndSubmitReview(
     });
   }
 
+  // MERGE-CUSTODY: this reviewer identity and the Overseer merge manager are
+  // the SAME GitHub App (thinman-overseer[bot]) -- M-153 (tabled, 2026-08-17)
+  // flagged that one identity holding both review and merge authority over
+  // the same PR would let it approve and then merge its own approval with no
+  // second party in the loop. Until the board rules on which separation
+  // model applies (M-153 Options A-D), this refuses to submit a review while
+  // the merge manager is armed to actually write to GitHub (`execute` mode).
+  // FAILS CLOSED: any mode other than the two known-safe modes blocks review
+  // submission rather than assuming safety. hold-canary and comment_findings
+  // perform zero GitHub writes, so review-then-merge cannot occur under them.
+  const mergeMode = resolveMergeManagerMode();
+  if (mergeMode === 'execute') {
+    return finish(deps, work, work.headSha, {
+      disposition: 'merge_custody_conflict',
+      reason: `merge_manager_mode_${mergeMode}_review_blocked_pending_m153`,
+    });
+  }
+
   let verdict: ReviewerVerdict;
   try {
     verdict = await deps.runReviewer(work);
@@ -176,6 +196,11 @@ export async function runAndSubmitReview(
       number: work.prNumber,
       event,
       body,
+      // The exact head this work item is bound to -- the SAME sha the
+      // reviewer verdict was already checked against above. Never the
+      // live/current head; a push during review is caught by the
+      // stale-head check before this call is ever reached.
+      commitId: work.headSha,
     });
   } catch (error) {
     return finish(deps, work, work.headSha, {

@@ -15,12 +15,21 @@ import {
   type RealGitHubOctokitLike,
 } from '../adapters/github-real-deps.ts';
 
-const REF = { owner: 'thinmansoftware', repo: 'bdc-harness', number: 673 };
+const HEAD_SHA = 'a'.repeat(40);
+const REF = { owner: 'thinmansoftware', repo: 'bdc-harness', number: 673, commitId: HEAD_SHA };
 
 function fakeOctokit(
   createReview: NonNullable<RealGitHubOctokitLike['pulls']['createReview']>
 ): RealGitHubOctokitLike {
-  return { pulls: { createReview } } as unknown as RealGitHubOctokitLike;
+  return {
+    pulls: {
+      createReview,
+      // The compatibility wrapper (createRealApprovePullRequest) fetches the
+      // live head via pulls.get before approving, since PullRequestRef alone
+      // carries no head SHA and commit_id is now required.
+      get: async () => ({ data: { head: { sha: HEAD_SHA } } }),
+    },
+  } as unknown as RealGitHubOctokitLike;
 }
 
 function httpError(status: number, message: string): Error & { status: number } {
@@ -37,7 +46,7 @@ describe('createRealSubmitPullRequestReview', () => {
       })
     );
     expect(await submit({ ...REF, event: 'APPROVE' })).toEqual({ submitted: true });
-    expect(calls[0]).toMatchObject({ event: 'APPROVE', pull_number: 673 });
+    expect(calls[0]).toMatchObject({ event: 'APPROVE', pull_number: 673, commit_id: HEAD_SHA });
   });
 
   test('submits REQUEST_CHANGES with the evidence body', async () => {
@@ -56,6 +65,21 @@ describe('createRealSubmitPullRequestReview', () => {
     expect(result).toEqual({ submitted: true });
     expect(calls[0]?.event).toBe('REQUEST_CHANGES');
     expect(calls[0]?.body).toBe('Stop condition 3 fails.');
+    expect((calls[0] as unknown as { commit_id?: string })?.commit_id).toBe(HEAD_SHA);
+  });
+
+  test('a review always binds to the exact head evaluated, not the live head', async () => {
+    const calls: { commit_id?: string }[] = [];
+    const submit = createRealSubmitPullRequestReview(
+      fakeOctokit(async input => {
+        calls.push(input as { commit_id?: string });
+        return { data: { id: 99, state: 'APPROVED' } };
+      })
+    );
+    const OTHER_HEAD = 'b'.repeat(40);
+    await submit({ ...REF, event: 'APPROVE', commitId: OTHER_HEAD });
+    expect(calls[0]?.commit_id).toBe(OTHER_HEAD);
+    expect(calls[0]?.commit_id).not.toBe(HEAD_SHA);
   });
 
   test('refuses REQUEST_CHANGES with an empty body BEFORE calling GitHub', async () => {
