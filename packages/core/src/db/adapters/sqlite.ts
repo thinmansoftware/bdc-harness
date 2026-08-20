@@ -1588,6 +1588,17 @@ export class SqliteAdapter implements IDatabase {
       );
 
       INSERT OR IGNORE INTO tm_adoption_meta (id) VALUES (1);
+
+      -- Taskmaster noise suppression (migration 044,
+      -- WO-HARNESS-TASKMASTER-EXCEPTION-PUSH-01). Durable standalone table --
+      -- deliberately NOT a column on the disposable tm_adoption projection,
+      -- which commitAdoptionSnapshot wipes every refresh. Additive only.
+      CREATE TABLE IF NOT EXISTS tm_suppression (
+        thread_ref TEXT PRIMARY KEY,
+        suppressed_until_hash TEXT NOT NULL,
+        suppressed_at TEXT NOT NULL,
+        noise_grade_count INTEGER NOT NULL DEFAULT 2
+      );
     `);
     getLog().info('db.sqlite_schema_initialized');
   }

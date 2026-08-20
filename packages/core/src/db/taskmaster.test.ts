@@ -22,10 +22,13 @@ import {
   getAdoptionMeta,
   getHealthSample,
   getPauseState,
+  getSuppression,
   gradeAction,
+  clearSuppression,
   recordAction,
   recordUsageSample,
   setPauseState,
+  setSuppression,
   updateActionOutcome,
   upsertAdoptionRow,
   upsertHealthSample,
@@ -456,5 +459,52 @@ describe('tm_adoption DAL', () => {
     }
     // snapshot_id differs by construction
     expect(second[0].snapshot_id).not.toBe(first[0].snapshot_id);
+  });
+});
+
+describe('tm_suppression DAL (M-155 WO 3)', () => {
+  test('push: setSuppression + getSuppression round-trips a suppression row', async () => {
+    await setSuppression('gh:thinmansoftware/bdc-xo#1', 'hash-abc');
+    const map = await getSuppression();
+    const row = map.get('gh:thinmansoftware/bdc-xo#1');
+    expect(row?.suppressed_until_hash).toBe('hash-abc');
+    expect(row?.noise_grade_count).toBe(2);
+
+    // Upsert overwrites the hash for the same canonical ref.
+    await setSuppression('gh:thinmansoftware/bdc-xo#1', 'hash-def');
+    const map2 = await getSuppression();
+    expect(map2.get('gh:thinmansoftware/bdc-xo#1')?.suppressed_until_hash).toBe('hash-def');
+    expect(map2.size).toBe(1);
+  });
+
+  test('push: clearSuppression removes the row', async () => {
+    await setSuppression('gh:thinmansoftware/bdc-xo#2', 'hash-xyz');
+    expect((await getSuppression()).has('gh:thinmansoftware/bdc-xo#2')).toBe(true);
+    await clearSuppression('gh:thinmansoftware/bdc-xo#2');
+    expect((await getSuppression()).has('gh:thinmansoftware/bdc-xo#2')).toBe(false);
+  });
+
+  test('push: suppression survives an adoption snapshot refresh', async () => {
+    // Suppress a thread, then run a FULL adoption refresh that commits a new
+    // snapshot -- which executes `DELETE FROM tm_adoption WHERE snapshot_id <> $1`.
+    await setSuppression('gh:thinmansoftware/bdc-xo#3', 'hash-persist');
+
+    const first = await beginAdoptionSnapshot();
+    await upsertAdoptionRow(
+      first,
+      baseAdoptionRow({ thread_ref: 'gh:thinmansoftware/bdc-xo#3', title: 'First' })
+    );
+    await commitAdoptionSnapshot(first);
+
+    const second = await beginAdoptionSnapshot();
+    await upsertAdoptionRow(
+      second,
+      baseAdoptionRow({ thread_ref: 'gh:thinmansoftware/bdc-xo#3', title: 'Second' })
+    );
+    await commitAdoptionSnapshot(second); // wipes prior tm_adoption rows
+
+    // tm_suppression is a SEPARATE durable table -- untouched by the wipe.
+    const map = await getSuppression();
+    expect(map.get('gh:thinmansoftware/bdc-xo#3')?.suppressed_until_hash).toBe('hash-persist');
   });
 });

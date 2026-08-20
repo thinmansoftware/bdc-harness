@@ -26,6 +26,9 @@ import * as taskmasterDb from '@archon/core/db/taskmaster';
 import {
   classifyThread,
   computeNextAction,
+  composeNudgeBody,
+  isSuppressedByNoise,
+  adoptionContentHash,
   type ActionProposal,
   type ThreadSnapshot,
   type ThreadPriority,
@@ -99,6 +102,9 @@ type TaskmasterDal = Pick<
   | 'abandonAdoptionSnapshot'
   | 'getAdoption'
   | 'getAdoptionMeta'
+  | 'getSuppression'
+  | 'setSuppression'
+  | 'clearSuppression'
 >;
 
 export interface GithubIssueEvidence {
@@ -155,6 +161,26 @@ export interface TickResult {
 
 function sha256(text: string): string {
   return createHash('sha256').update(text).digest('hex');
+}
+
+/**
+ * Literal repeat_reason per verb, passed unconditionally on every send so a
+ * prior handled/addressed row for the same subject_key never trips the
+ * 'repeat_reason_required' throw in createMessage (dispatch.ts L320-328).
+ */
+function repeatReasonForVerb(type: ActionProposal['type']): string {
+  switch (type) {
+    case 'nudge':
+      return 'tm:nudge:follow-up';
+    case 'escalate_p0':
+      return 'tm:escalate_p0:repeated';
+    case 'deliver_ruling':
+      return 'tm:deliver_ruling:repeated';
+    case 'digest':
+      return 'tm:digest:repeated';
+    default:
+      return 'tm:repeated';
+  }
 }
 
 async function defaultFindEffectByIdempotencyKey(
@@ -960,13 +986,54 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
     if (adoptionResult.failed) tickFailures += 1;
   }
 
+  // Exception-push inputs (M-155 WO 3): one adoption read + one suppression
+  // read per tick; grades regrouped from the lookback already in hand. No
+  // re-list, no re-query of the journal.
+  const adoptionByRef = new Map<string, taskmasterDb.TmAdoptionRow>();
+  for (const row of await dal.getAdoption()) {
+    adoptionByRef.set(canonicalizeThreadRef(row.thread_ref), row);
+  }
+  const suppressionMap = await dal.getSuppression();
+  const gradesByRef = new Map<string, taskmasterDb.TmJournalEntry[]>();
+  for (const action of lookback) {
+    const canon = canonicalizeThreadRef(action.thread_ref);
+    const list = gradesByRef.get(canon) ?? [];
+    // Re-stamp thread_ref to canonical so isSuppressedByNoise (pure, exact
+    // match) collapses the pre/post M-141 org-rename eras onto one key.
+    list.push({ ...action, thread_ref: canon });
+    gradesByRef.set(canon, list);
+  }
+
   const proposals: ActionProposal[] = [];
   for (const item of [...rulings, ...threads]) {
+    const canonRef = canonicalizeThreadRef(item.ref);
+    const adoption = adoptionByRef.get(canonRef);
+    const grades = gradesByRef.get(canonRef) ?? [];
+    const suppression = suppressionMap.get(canonRef);
     const classification = classifyThread(item, nowMs);
     const proposal = computeNextAction(item, classification, {
       interventionsLast24h: interventions24hByThread.get(item.ref) ?? 0,
       nowMs,
+      adoption,
+      grades,
+      suppression,
     });
+
+    // Persist suppression state transitions -- the side effects the pure
+    // computeNextAction cannot perform. Only meaningful for content-complete
+    // nudge candidates (exempt verbs and bare-staleness rows are never
+    // suppressed by content hash).
+    if (adoption && composeNudgeBody(item, adoption) !== null) {
+      const currentHash = adoptionContentHash(adoption);
+      const noisy = isSuppressedByNoise(canonRef, grades, adoption);
+      if (noisy && !suppression) {
+        await dal.setSuppression(canonRef, currentHash);
+      } else if (suppression && suppression.suppressed_until_hash !== currentHash) {
+        // Content moved -> suppression lifts.
+        await dal.clearSuppression(canonRef);
+      }
+    }
+
     if (proposal) proposals.push(proposal);
   }
 
@@ -1137,6 +1204,15 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
         sender: 'taskmaster',
         recipient: proposal.recipient,
         body: proposal.body,
+        // Thread-scoped subject so repeat sends collapse onto one conversation.
+        subject_key: canonicalizeThreadRef(proposal.threadRef),
+        // Supplied UNCONDITIONALLY per verb: when a prior row for this subject
+        // is already handled/addressed, createMessage throws unless a
+        // repeat_reason is present (dispatch.ts). A conditional here would
+        // surface its edge case as a 'failed' journal outcome rather than a
+        // clean send -- and it matters the moment the dead-letter script sets
+        // addressed_at on ~920 'xo' rows (Section 8).
+        repeat_reason: repeatReasonForVerb(proposal.type),
       });
       await dal.updateActionOutcome(journalRow.id, 'sent');
       journalRow.outcome = 'sent';
