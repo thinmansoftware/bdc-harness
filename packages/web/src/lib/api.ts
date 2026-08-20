@@ -59,6 +59,70 @@ export interface HealthResponse {
   activePlatforms?: string[];
 }
 
+export interface TaskmasterRegisterRow {
+  thread_ref: string;
+  snapshot_id: string;
+  repo: string;
+  issue_number: number;
+  title: string | null;
+  priority: string;
+  labels_json: string;
+  owner_login: string | null;
+  is_blocked: number;
+  blocked_reason: string | null;
+  next_action: string | null;
+  latest_marker_kind: 'PROGRESS' | 'BLOCKED' | null;
+  latest_marker_at: string | null;
+  state: string | null;
+  last_movement_at: string | null;
+  last_movement_kind: 'closed' | 'assigned' | 'status_label' | 'progress_comment' | null;
+  attempts_24h: number;
+  attempts_total: number;
+  evidence_observed_at: string | null;
+  source_updated_at: string;
+}
+
+export interface TaskmasterRegisterListResponse {
+  rows: TaskmasterRegisterRow[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
+export interface TaskmasterRegisterMetaResponse {
+  freshness: Array<'FRESH' | 'STALE' | 'PARTIAL' | 'UNAVAILABLE'>;
+  rebuilt_at: string | null;
+  row_count: number;
+  partial_count: number;
+  pause_state: 'RUNNING' | 'PAUSED' | 'HARD_PAUSE';
+  unaddressed_xo: number;
+}
+
+export interface TaskmasterRegisterFilters {
+  priority?: string;
+  owner?: string;
+  blocked?: boolean;
+  limit?: number;
+  offset?: number;
+}
+
+export async function getTaskmasterRegister(
+  filters: TaskmasterRegisterFilters = {}
+): Promise<TaskmasterRegisterListResponse> {
+  const params = new URLSearchParams();
+  if (filters.priority !== undefined) params.set('priority', filters.priority);
+  if (filters.owner !== undefined) params.set('owner', filters.owner);
+  if (filters.blocked !== undefined) params.set('blocked', String(filters.blocked));
+  if (filters.limit !== undefined) params.set('limit', String(filters.limit));
+  if (filters.offset !== undefined) params.set('offset', String(filters.offset));
+  const query = params.toString();
+  return fetchJSON(`/api/taskmaster/register${query ? `?${query}` : ''}`);
+}
+
+export async function getTaskmasterRegisterMeta(): Promise<TaskmasterRegisterMetaResponse> {
+  return fetchJSON('/api/taskmaster/register/meta');
+}
+
 async function fetchJSON<T>(url: string, options?: RequestInit): Promise<T> {
   const res = await fetch(url, options);
   if (!res.ok) {

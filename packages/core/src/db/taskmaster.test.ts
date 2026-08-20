@@ -19,7 +19,9 @@ import {
   getActionByIdempotencyKey,
   getActionsSince,
   getAdoption,
+  getAdoptionCount,
   getAdoptionMeta,
+  getAdoptionPartialCount,
   getHealthSample,
   getPauseState,
   gradeAction,
@@ -308,6 +310,89 @@ function baseAdoptionRow(
 }
 
 describe('tm_adoption DAL', () => {
+  test('register: filters priority blocked and named owner while preserving no-filter reads', async () => {
+    const snap = await beginAdoptionSnapshot();
+    const rows = [
+      {
+        thread_ref: 'gh:thinmansoftware/bdc-xo#101',
+        priority: 'P1',
+        owner_login: 'alice',
+        is_blocked: 1,
+      },
+      {
+        thread_ref: 'gh:thinmansoftware/bdc-xo#102',
+        priority: 'P1',
+        owner_login: 'bob',
+        is_blocked: 0,
+      },
+      {
+        thread_ref: 'gh:thinmansoftware/bdc-xo#103',
+        priority: 'P2',
+        owner_login: 'alice',
+        is_blocked: 0,
+      },
+      {
+        thread_ref: 'gh:thinmansoftware/bdc-xo#104',
+        priority: 'P2',
+        owner_login: null,
+        is_blocked: 0,
+      },
+    ];
+    for (const row of rows) await upsertAdoptionRow(snap, baseAdoptionRow(row));
+    await commitAdoptionSnapshot(snap);
+
+    expect(await getAdoption()).toHaveLength(4);
+    expect(await getAdoption({ priority: 'P1' })).toHaveLength(2);
+    expect(await getAdoption({ blocked: true })).toHaveLength(1);
+    expect(await getAdoption({ blocked: false })).toHaveLength(3);
+    expect(await getAdoption({ owner_login: 'alice' })).toHaveLength(2);
+  });
+
+  test('register: explicit null owner returns UNKNOWN-only rows', async () => {
+    const snap = await beginAdoptionSnapshot();
+    await upsertAdoptionRow(
+      snap,
+      baseAdoptionRow({ thread_ref: 'gh:thinmansoftware/bdc-xo#105', owner_login: null })
+    );
+    await upsertAdoptionRow(
+      snap,
+      baseAdoptionRow({ thread_ref: 'gh:thinmansoftware/bdc-xo#106', owner_login: 'alice' })
+    );
+    await commitAdoptionSnapshot(snap);
+
+    const rows = await getAdoption({ owner_login: null });
+    expect(rows).toHaveLength(1);
+    expect(rows[0].owner_login).toBeNull();
+  });
+
+  test('register: filtered total uses the same predicates as rows', async () => {
+    const snap = await beginAdoptionSnapshot();
+    await upsertAdoptionRow(
+      snap,
+      baseAdoptionRow({ thread_ref: 'gh:thinmansoftware/bdc-xo#107', priority: 'P0' })
+    );
+    await upsertAdoptionRow(
+      snap,
+      baseAdoptionRow({ thread_ref: 'gh:thinmansoftware/bdc-xo#108', priority: 'P3' })
+    );
+    await commitAdoptionSnapshot(snap);
+
+    expect(await getAdoptionCount()).toBe(2);
+    expect(await getAdoptionCount({ priority: 'P0' })).toBe(1);
+  });
+
+  test('register: partial count reports missing evidence and zero before rebuild', async () => {
+    expect(await getAdoptionPartialCount()).toBe(0);
+    const snap = await beginAdoptionSnapshot();
+    await upsertAdoptionRow(
+      snap,
+      baseAdoptionRow({ thread_ref: 'gh:thinmansoftware/bdc-xo#109', evidence_observed_at: null })
+    );
+    await upsertAdoptionRow(snap, baseAdoptionRow({ thread_ref: 'gh:thinmansoftware/bdc-xo#110' }));
+    await commitAdoptionSnapshot(snap);
+    expect(await getAdoptionPartialCount()).toBe(1);
+  });
+
   test('adoption: begin upsert commit exposes rows via getAdoption', async () => {
     const snap = await beginAdoptionSnapshot();
     await upsertAdoptionRow(

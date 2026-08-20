@@ -6,6 +6,7 @@ import { Layout } from '@/components/layout/Layout';
 import { ProjectProvider } from '@/contexts/ProjectContext';
 import { queryClient } from '@/lib/query-client';
 import { DashboardPage } from '@/routes/DashboardPage';
+import { RegisterPage } from '@/routes/RegisterPage';
 import { ChatPage } from '@/routes/ChatPage';
 import { WorkflowsPage } from '@/routes/WorkflowsPage';
 import { WorkflowExecutionPage } from '@/routes/WorkflowExecutionPage';
@@ -81,6 +82,7 @@ export function App(): React.ReactElement {
                   <Route path="/chat" element={<ChatPage />} />
                   <Route path="/chat/*" element={<ChatPage />} />
                   <Route path="/dashboard" element={<DashboardPage />} />
+                  <Route path="/register" element={<RegisterPage />} />
                   <Route path="/workflows" element={<WorkflowsPage />} />
                   <Route path="/workflows/builder" element={<WorkflowBuilderPage />} />
                   <Route path="/workflows/runs/:runId" element={<WorkflowExecutionPage />} />
