@@ -24,13 +24,16 @@ import {
 } from '@archon/core/db/dispatch';
 import * as taskmasterDb from '@archon/core/db/taskmaster';
 import {
+  adoptionContentHash,
   classifyThread,
   computeNextAction,
+  isSuppressedByNoise,
   type ActionProposal,
   type ThreadSnapshot,
   type ThreadPriority,
+  type TmActionType,
 } from './rules';
-import { validateProposal } from './guard';
+import { validateProposal, type TmAllowedRecipient } from './guard';
 import { currentHeadroom, type HeadroomReading } from './ledger';
 import {
   createDeadmanState,
@@ -99,7 +102,11 @@ type TaskmasterDal = Pick<
   | 'abandonAdoptionSnapshot'
   | 'getAdoption'
   | 'getAdoptionMeta'
->;
+> &
+  // Suppression accessors (M-155 WO 3) are optional on injected DALs so
+  // pre-WO3 test doubles keep compiling; when absent, durable suppression
+  // writes are inert (the pure grade-based check still applies).
+  Partial<Pick<typeof taskmasterDb, 'getSuppression' | 'setSuppression' | 'clearSuppression'>>;
 
 export interface GithubIssueEvidence {
   state: 'open' | 'closed';
@@ -256,6 +263,47 @@ export function canonicalizeThreadRef(ref: string): string {
   return `gh:${canonicalOrg}/${repo}#${num}`;
 }
 
+/**
+ * Owner-login -> dispatch mailbox routing (M-155 WO 3). Named and testable,
+ * but every entry deliberately resolves to 'xo' in this WO: of the allowlisted
+ * recipients only 'xo' (XO's session-start reflex) and 'operator' (John) have
+ * a consumer that drains the mailbox. Routing nudges to 'major-build' or
+ * 'captain-ci' would manufacture a second dead-letter box -- exactly the
+ * failure M-155 exists to end (920 unread 'xo' messages).
+ *
+ * PRECONDITION FOR WIDENING: a documented drain path for the target mailbox
+ * (who reads it, on what cadence, verified). Widening is then a data change
+ * here plus a follow-on WO -- never a silent edit.
+ */
+export const OWNER_RECIPIENT_MAP: Record<string, TmAllowedRecipient> = {
+  xo: 'xo',
+  'major-build': 'xo',
+  'captain-ci': 'xo',
+  operator: 'xo',
+};
+
+/** Resolve an issue owner login to the dispatch mailbox for ordinary nudges. */
+export function resolveRecipient(ownerLogin: string | null | undefined): TmAllowedRecipient {
+  const key = (ownerLogin ?? '').trim().toLowerCase();
+  return OWNER_RECIPIENT_MAP[key] ?? 'xo';
+}
+
+/**
+ * Same-subject repeat reasons, passed UNCONDITIONALLY per verb (M-155 WO 3).
+ * dispatch.ts throws 'repeat_reason_required' when a prior row with the same
+ * subject_key is terminal/handled and no repeat_reason was supplied; passing
+ * the literal unconditionally is safe (stored only when a prior row matches)
+ * and avoids a conditional whose edge case would surface as a journal outcome
+ * of 'failed' rather than 'rejected' -- which matters immediately after the
+ * WO 3 dead-letter script sets addressed_at on ~920 'xo' rows.
+ */
+export const TM_REPEAT_REASON_BY_TYPE: Record<TmActionType, string> = {
+  nudge: 'tm:nudge:follow-up',
+  escalate_p0: 'tm:escalate_p0:repeated',
+  deliver_ruling: 'tm:deliver_ruling:repeated',
+  digest: 'tm:digest:repeated',
+};
+
 /** Listed work-SOR thread with optional adoption fields carried from the issue payload. */
 export interface ListedThread extends ThreadSnapshot {
   title?: string | null;
@@ -338,7 +386,7 @@ export async function defaultListThreads(fetchImpl: typeof fetch = fetch): Promi
             ),
             isUnclaimedP0:
               priority === 'P0' && (issue.assignees ?? []).length === 0 && !hasClaimStatus,
-            recipient: 'xo',
+            recipient: resolveRecipient(ownerLogin),
             title: issue.title ?? null,
             ownerLogin,
             labels,
@@ -960,12 +1008,69 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
     if (adoptionResult.failed) tickFailures += 1;
   }
 
+  // M-155 WO 3: adoption content index + durable noise-suppression state
+  // (one read each per tick), plus a fresh grade grouping taken AFTER
+  // gradeSentActions so grades written this tick count.
+  const adoptionByRef = new Map<string, taskmasterDb.TmAdoptionRow>();
+  for (const row of await dal.getAdoption()) {
+    adoptionByRef.set(canonicalizeThreadRef(row.thread_ref), row);
+  }
+  const suppressionByRef: Map<string, taskmasterDb.TmSuppressionRow> = dal.getSuppression
+    ? await dal.getSuppression()
+    : new Map<string, taskmasterDb.TmSuppressionRow>();
+  const gradesByRef = new Map<string, taskmasterDb.TmJournalEntry[]>();
+  {
+    const journalForGrades = await dal.getActionsSince(
+      new Date(nowMs - JOURNAL_LOOKBACK_MS).toISOString()
+    );
+    for (const action of journalForGrades) {
+      const key = canonicalizeThreadRef(action.thread_ref);
+      const list = gradesByRef.get(key);
+      if (list) list.push(action);
+      else gradesByRef.set(key, [action]);
+    }
+  }
+
+  // Suppression maintenance. tm_suppression is durable -- NEVER touched by
+  // the adoption snapshot cycle (Section 9). Lift (delete) when the content
+  // hash moved; create after two consecutive graded 'noise' sends.
+  for (const [ref, adoptionRow] of adoptionByRef) {
+    const liveHash = adoptionContentHash(adoptionRow);
+    const existing = suppressionByRef.get(ref);
+    if (existing) {
+      if (existing.suppressed_until_hash !== liveHash) {
+        // The work moved: suppression lifts. Chosen behavior: delete the row.
+        if (dal.clearSuppression) await dal.clearSuppression(ref);
+        suppressionByRef.delete(ref);
+      }
+      continue;
+    }
+    if (isSuppressedByNoise(ref, gradesByRef.get(ref) ?? [], adoptionRow) && dal.setSuppression) {
+      await dal.setSuppression(ref, liveHash);
+      suppressionByRef.set(ref, {
+        thread_ref: ref,
+        suppressed_until_hash: liveHash,
+        suppressed_at: new Date(nowMs).toISOString(),
+        noise_grade_count: 2,
+      });
+    }
+  }
+
   const proposals: ActionProposal[] = [];
   for (const item of [...rulings, ...threads]) {
+    const canonRef = canonicalizeThreadRef(item.ref);
+    const adoptionRow = adoptionByRef.get(canonRef);
     const classification = classifyThread(item, nowMs);
     const proposal = computeNextAction(item, classification, {
       interventionsLast24h: interventions24hByThread.get(item.ref) ?? 0,
       nowMs,
+      // Content policy gates on what the projection KNOWS. A titleless row is
+      // a ref-only skeleton (the list read carries titles for every real
+      // issue), so it is handed over as "no adoption content" rather than as
+      // a content-bearing row.
+      adoption: adoptionRow?.title ? adoptionRow : undefined,
+      grades: gradesByRef.get(canonRef),
+      suppression: suppressionByRef.get(canonRef),
     });
     if (proposal) proposals.push(proposal);
   }
@@ -1137,6 +1242,10 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
         sender: 'taskmaster',
         recipient: proposal.recipient,
         body: proposal.body,
+        // Same-subject grouping + unconditional per-verb repeat reason
+        // (M-155 WO 3): see TM_REPEAT_REASON_BY_TYPE for why unconditional.
+        subject_key: canonicalizeThreadRef(proposal.threadRef),
+        repeat_reason: TM_REPEAT_REASON_BY_TYPE[proposal.type],
       });
       await dal.updateActionOutcome(journalRow.id, 'sent');
       journalRow.outcome = 'sent';

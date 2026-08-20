@@ -79,6 +79,20 @@ export function validateProposal(proposal: ActionProposal): GuardResult {
     };
   }
 
+  // M-155 WO 3: a proposal whose body is null/absent or that is flagged
+  // content-incomplete is an ORDINARY rejection (journal-only skip), NOT a
+  // forbiddenEffect -- the auto HARD_PAUSE circuit is reserved for
+  // unauthorized effects, and an incomplete message is a normal skip, not a
+  // safety breach.
+  if (proposal.contentIncomplete === true || typeof proposal.body !== 'string') {
+    return {
+      allowed: false,
+      reason:
+        'content_incomplete: the message lacks the item content (title, owner, ' +
+        'blocker or next action) required for a send; the item stays on the register.',
+    };
+  }
+
   if (!proposal.idempotencyKey || proposal.idempotencyKey.trim().length === 0) {
     return {
       allowed: false,
