@@ -1023,7 +1023,7 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
     // computeNextAction cannot perform. Only meaningful for content-complete
     // nudge candidates (exempt verbs and bare-staleness rows are never
     // suppressed by content hash).
-    if (adoption && composeNudgeBody(item, adoption) !== null) {
+    if (adoption && composeNudgeBody(item, adoption, nowMs) !== null) {
       const currentHash = adoptionContentHash(adoption);
       const noisy = isSuppressedByNoise(canonRef, grades, adoption);
       if (noisy && !suppression) {
@@ -1052,6 +1052,17 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
       actionsByKey.get(proposal.idempotencyKey) ??
       (await dal.getActionByIdempotencyKey(proposal.idempotencyKey));
     if (existingAction) actionsByKey.set(proposal.idempotencyKey, existingAction);
+
+    // Journal before_hash. For a NUDGE, record the adoption CONTENT hash (not
+    // the body hash) so a later noise grade lets isSuppressedByNoise prove the
+    // content is unchanged since it was graded. The body hash is unusable for
+    // that: it now embeds an elapsed-time phrase that changes every tick. Other
+    // verbs are never content-suppressed, so their body hash is fine.
+    const nudgeAdoption =
+      proposal.type === 'nudge'
+        ? adoptionByRef.get(canonicalizeThreadRef(proposal.threadRef))
+        : undefined;
+    const beforeHash = nudgeAdoption ? adoptionContentHash(nudgeAdoption) : sha256(proposal.body);
 
     if (
       existingAction &&
@@ -1096,7 +1107,7 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
         action_type: proposal.type,
         proposal_json: JSON.stringify({ ...proposal, guardReason: guardResult.reason }),
         idempotency_key: proposal.idempotencyKey,
-        before_hash: sha256(proposal.body),
+        before_hash: beforeHash,
         outcome: 'rejected',
       });
       if (guardResult.forbiddenEffect && control.pause_state === 'RUNNING') {
@@ -1124,7 +1135,7 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
         action_type: proposal.type,
         proposal_json: JSON.stringify({ ...proposal, parked: true, reason: 'paused' }),
         idempotency_key: proposal.idempotencyKey,
-        before_hash: sha256(proposal.body),
+        before_hash: beforeHash,
         outcome: 'parked',
       });
       continue;
@@ -1140,7 +1151,7 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
           action_type: proposal.type,
           proposal_json: JSON.stringify({ ...proposal, deferred: true }),
           idempotency_key: proposal.idempotencyKey,
-          before_hash: sha256(proposal.body),
+          before_hash: beforeHash,
           proof_predicate: proofPredicate(proposal),
           proof_deadline_at: new Date(nowMs + PROOF_DEADLINE_MS).toISOString(),
           outcome: 'deferred',
@@ -1162,7 +1173,7 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
         action_type: proposal.type,
         proposal_json: JSON.stringify(proposal),
         idempotency_key: proposal.idempotencyKey,
-        before_hash: sha256(proposal.body),
+        before_hash: beforeHash,
         proof_predicate: proofPredicate(proposal),
         proof_deadline_at: new Date(nowMs + PROOF_DEADLINE_MS).toISOString(),
         outcome: 'pending',

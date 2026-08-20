@@ -6,6 +6,7 @@ import {
   isSuppressedByNoise,
   adoptionContentHash,
   resolveRecipient,
+  blockerNamesSeat,
   nudgeClockMs,
   CUSTOMER_CLOCK_MS,
   MAX_INTERVENTIONS_PER_ITEM_24H,
@@ -182,8 +183,168 @@ describe('exception-push composer (M-155 WO 3)', () => {
   });
 
   test('composeNudgeBody returns null when title is missing', () => {
-    expect(composeNudgeBody(thread(), adoption({ title: null }))).toBeNull();
-    expect(composeNudgeBody(thread(), undefined)).toBeNull();
+    expect(composeNudgeBody(thread(), adoption({ title: null }), NOW_MS)).toBeNull();
+    expect(composeNudgeBody(thread(), undefined, NOW_MS)).toBeNull();
+  });
+
+  test('push: the nudge body reports elapsed time since real movement, not a raw timestamp', () => {
+    // last_movement_at exactly 3 days 4 hours before NOW.
+    const movedAt = new Date(NOW_MS - (3 * 24 + 4) * 3_600_000).toISOString();
+    const a = adoption({ last_movement_at: movedAt });
+    const body = composeNudgeBody(thread({ ref: a.thread_ref }), a, NOW_MS);
+    expect(body).toContain('Last real movement was 3d 4h ago');
+    // The raw ISO timestamp must NOT leak into the message.
+    expect(body).not.toContain(movedAt);
+  });
+
+  test('push: a missing adoption row on a stale item does NOT send (no contentless fallback)', () => {
+    const proposal = computeNextAction(thread(), 'stale', {
+      interventionsLast24h: 0,
+      nowMs: NOW_MS,
+      // adoption intentionally undefined -- refresh has not enriched this thread.
+    });
+    expect(proposal).toBeNull();
+  });
+
+  test('push: a blocked item whose blocker NAMES A SEAT nudges with real content', () => {
+    const a = adoption({
+      is_blocked: 1,
+      blocked_reason: 'blocked on major-build for the infra key',
+      next_action: null,
+    });
+    const proposal = computeNextAction(thread({ ref: a.thread_ref, isBlocked: true }), 'blocked', {
+      interventionsLast24h: 0,
+      nowMs: NOW_MS,
+      adoption: a,
+    });
+    expect(proposal?.type).toBe('nudge');
+    expect(proposal?.body).toContain('Blocked: blocked on major-build for the infra key');
+  });
+
+  test('push: a blocked item whose blocker names NO seat does NOT send', () => {
+    // "waiting on infra key" says the item is stuck without saying who unsticks
+    // it -- not actionable content, so it is held back to the register.
+    const a = adoption({
+      is_blocked: 1,
+      blocked_reason: 'waiting on infra key',
+      next_action: null,
+    });
+    const proposal = computeNextAction(thread({ ref: a.thread_ref, isBlocked: true }), 'blocked', {
+      interventionsLast24h: 0,
+      nowMs: NOW_MS,
+      adoption: a,
+    });
+    expect(proposal).toBeNull();
+    expect(composeNudgeBody(thread({ ref: a.thread_ref }), a, NOW_MS)).toBeNull();
+  });
+
+  test('push: a seatless blocker still sends when a next action carries the content', () => {
+    const a = adoption({
+      is_blocked: 1,
+      blocked_reason: 'waiting on infra key',
+      next_action: 'rotate the key and re-run the migration',
+    });
+    const body = composeNudgeBody(thread({ ref: a.thread_ref }), a, NOW_MS);
+    // The seatless blocker is discarded; the body reports the next action.
+    expect(body).toContain('Next action: rotate the key and re-run the migration');
+    expect(body).not.toContain('waiting on infra key');
+  });
+
+  test('push: blockerNamesSeat matches whole tokens only, across seat aliases', () => {
+    expect(blockerNamesSeat('blocked on XO to drain the mailbox')).toBe('xo');
+    expect(blockerNamesSeat('needs Major Build to land the fix')).toBe('major-build');
+    expect(blockerNamesSeat('waiting for captain-ci to go green')).toBe('captain-ci');
+    expect(blockerNamesSeat('John has to approve the deploy')).toBe('operator');
+    // No seat named.
+    expect(blockerNamesSeat('waiting on the vendor')).toBeNull();
+    expect(blockerNamesSeat('')).toBeNull();
+    expect(blockerNamesSeat(null)).toBeNull();
+    // Substrings inside unrelated words must NOT count as a seat.
+    expect(blockerNamesSeat('toxoplasmosis screening pending')).toBeNull();
+    expect(blockerNamesSeat('Johnson the vendor has not replied')).toBeNull();
+  });
+
+  test('push: a ruling on a blocked thread still delivers (exempt verb, precedence first)', () => {
+    // classifyThread returns "blocked" when isBlocked is set; the exempt verb
+    // must still act rather than being swallowed by the classification gate.
+    const proposal = computeNextAction(
+      thread({ isBlocked: true, undeliveredRulingId: 'ruling-42' }),
+      'blocked',
+      { interventionsLast24h: 0, nowMs: NOW_MS }
+    );
+    expect(proposal?.type).toBe('deliver_ruling');
+  });
+
+  test('push: exempt verbs gain adoption content when available', () => {
+    const a = adoption({ title: 'Rotate the Stripe key', owner_login: 'major-build' });
+    const ruling = computeNextAction(
+      thread({ ref: a.thread_ref, undeliveredRulingId: 'ruling-7' }),
+      'ready',
+      { interventionsLast24h: 0, nowMs: NOW_MS, adoption: a }
+    );
+    expect(ruling?.type).toBe('deliver_ruling');
+    expect(ruling?.body).toContain('Rotate the Stripe key');
+    expect(ruling?.body).toContain('major-build');
+
+    const p0 = computeNextAction(
+      thread({ ref: a.thread_ref, priority: 'P0', isUnclaimedP0: true }),
+      'ready',
+      { interventionsLast24h: 0, nowMs: NOW_MS, adoption: a }
+    );
+    expect(p0?.type).toBe('escalate_p0');
+    expect(p0?.body).toContain('Rotate the Stripe key');
+  });
+
+  test('push: isSuppressedByNoise requires the content hash to be unchanged since the noise grade', () => {
+    const a = adoption();
+    const stampedHash = adoptionContentHash(a);
+    // Two noise grades whose before_hash captured the CURRENT content -> suppress.
+    const unchanged = [
+      gradeRow({
+        id: 'g1',
+        before_hash: stampedHash,
+        graded_at: new Date(NOW_MS - 2 * 3_600_000).toISOString(),
+      }),
+      gradeRow({
+        id: 'g2',
+        before_hash: stampedHash,
+        graded_at: new Date(NOW_MS - 1 * 3_600_000).toISOString(),
+      }),
+    ];
+    expect(isSuppressedByNoise(a.thread_ref, unchanged, a)).toBe(true);
+
+    // Same grades, but the live content has since moved -> the later grade's
+    // hash no longer matches, so suppression must NOT apply.
+    const moved = adoption({ next_action: 'unblocked, ready for review' });
+    expect(isSuppressedByNoise(a.thread_ref, unchanged, moved)).toBe(false);
+  });
+
+  test('push: newly-changed content is not suppressed immediately (no suppression record yet)', () => {
+    const oldRow = adoption();
+    const oldHash = adoptionContentHash(oldRow);
+    // Grades recorded against the OLD content hash...
+    const grades = [
+      gradeRow({
+        id: 'g1',
+        before_hash: oldHash,
+        graded_at: new Date(NOW_MS - 2 * 3_600_000).toISOString(),
+      }),
+      gradeRow({
+        id: 'g2',
+        before_hash: oldHash,
+        graded_at: new Date(NOW_MS - 1 * 3_600_000).toISOString(),
+      }),
+    ];
+    // ...but the item has since moved and there is no persisted suppression row.
+    const moved = adoption({ next_action: 'unblocked, ready for review' });
+    const proposal = computeNextAction(thread({ ref: moved.thread_ref }), 'stale', {
+      interventionsLast24h: 0,
+      nowMs: NOW_MS,
+      adoption: moved,
+      grades,
+      // suppression intentionally omitted -- record not yet written.
+    });
+    expect(proposal?.type).toBe('nudge');
   });
 });
 
@@ -272,9 +433,12 @@ describe('computeNextAction', () => {
   });
 
   test('stale thread nudges without immediacy (two-tick confirmation required)', () => {
-    const proposal = computeNextAction(thread(), 'stale', {
+    // Exception-push: a nudge now requires a content-complete adoption row.
+    const a = adoption();
+    const proposal = computeNextAction(thread({ ref: a.thread_ref }), 'stale', {
       interventionsLast24h: 0,
       nowMs: NOW_MS,
+      adoption: a,
     });
     expect(proposal?.type).toBe('nudge');
     expect(proposal?.actsImmediately).toBe(false);
@@ -282,10 +446,16 @@ describe('computeNextAction', () => {
   });
 
   test('nudge idempotency key is stable within a clock bucket', () => {
-    const a = computeNextAction(thread(), 'stale', { interventionsLast24h: 0, nowMs: NOW_MS });
-    const b = computeNextAction(thread(), 'stale', {
+    const row = adoption();
+    const a = computeNextAction(thread({ ref: row.thread_ref }), 'stale', {
+      interventionsLast24h: 0,
+      nowMs: NOW_MS,
+      adoption: row,
+    });
+    const b = computeNextAction(thread({ ref: row.thread_ref }), 'stale', {
       interventionsLast24h: 0,
       nowMs: NOW_MS + 60_000,
+      adoption: row,
     });
     expect(a?.idempotencyKey).toBe(b?.idempotencyKey ?? '');
   });
