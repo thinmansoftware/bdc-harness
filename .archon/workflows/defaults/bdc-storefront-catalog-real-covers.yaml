@@ -46,7 +46,7 @@ description: |
         to render <img src={item.cover_url}> with onError fallback to existing palette.
         Adds __tests__/lib/catalog-cover-fallback.test.ts with >= 4 bun tests.
         Runs backfill script, commits JSON + page + tests, opens PR against master.
-        Verifies Vercel preview deployment READY. Builds CODE manifest. Flips Notion to REVIEW.
+        Verifies Vercel preview deployment READY. Builds CODE manifest. flips WO to REVIEW (GitHub issue comment + status:review label -- Notion is free-plan read-only archive).
   Repo: thinmansoftware/shopops-storefront (single repo).
   parallel_ok: true -- single repo, no shared file conflicts.
   Polish bar: ROUGH OK (Mutant Market is beta tester, not paying).

@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# RETIRED 2026-08-20 (BDC-wide Notion caller sweep) -- see below.
+#
 # Poll Notion for Work Orders at REVIEW and fire the bdc-wo-grader workflow.
 #
 # Intended systemd timer:
@@ -17,6 +19,23 @@
 #   DRY_RUN                         default false
 
 set -euo pipefail
+
+# --- RETIRED 2026-08-20 ---------------------------------------------------
+# John downgraded the Notion workspace to the free plan; it is now a
+# read-only legacy archive (pre-2026-07-01 WO rows only, last WO-DB write
+# 2026-07-17, verified dead). GitHub has been the WO system of record since
+# 2026-07-01 (Doctrine v1.4 #2). This script polls a Notion database that no
+# current-era WO is ever filed to, so it would either find nothing forever
+# or -- worse -- try to write back to Notion via bdc-wo-grader's flip-notion
+# node, which now fails outright on the free plan. No-op'd here rather than
+# deleted so a stale systemd timer on Hetzner still calling this script
+# exits clean instead of erroring in a loop. See bdc-xo doctrine article
+# xo-wiki/wiki/doctrine/archon-yaml-authoring/_index.md Rule 7 for the
+# GitHub-issue-native replacement pattern; a real grader against GitHub
+# issue REVIEW state would be a fresh WO, not a revival of this script.
+echo "trigger-wo-grader.sh: RETIRED 2026-08-20 -- Notion is free-plan read-only archive, not the WO system of record. No-op." >&2
+exit 0
+# --- end retired -----------------------------------------------------------
 
 NOTION_DB_ID="${NOTION_DB_ID:-a6df831c-0b52-449f-8ca4-d77be6b70d0a}"
 ARCHON_DIR="${ARCHON_DIR:-/opt/bdc/archon}"

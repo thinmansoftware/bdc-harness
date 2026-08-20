@@ -54,7 +54,7 @@ description: |
         validates WOOCOMMERCE_WEBHOOK_SECRET env var (fail-closed),
         writes min 5 bun tests in tests/woocommerce.test.js,
         commits to fresh branch wo/shopops-woocommerce-connector-01, opens PR against master,
-        provides Rule 19 runtime verification evidence, builds manifest, flips Notion to REVIEW.
+        provides Rule 19 runtime verification evidence, builds manifest, flips WO to REVIEW (GitHub issue comment + status:review label -- Notion is free-plan read-only archive).
   Repo: thinmansoftware/shopops (shopops-api/ subdir).
         Spec lives in thinmansoftware/bdc-xo.
   Depends on: WO-SHOPOPS-COMMERCE-SPINE-01 (channel_connections + product_channel_map + channel_orders).

@@ -33,7 +33,7 @@ description: |
   surfaces (FailureReason, LoopArc side-rail fix, FleetStrip+CoFire, LucilleHint+Kill, then
   NodePeek/CostBurnMeter/RunHistorySparkline/Replay/HealthTell), verifies tsc/eslint/prettier
   + the 8 scenario tests + the two no-regression suites, Codex-reviews the diff, commits,
-  opens a PR --base dev, builds a Captain CI manifest, flips Notion to REVIEW.
+  opens a PR --base dev, builds a Captain CI manifest, flips WO to REVIEW (GitHub issue comment + status:review label -- Notion is free-plan read-only archive).
   NOT for: backend-only WOs, doctrine updates, infra deploys, customer-facing repos.
 
 policyFile: harness/policies/agent-behavior.md

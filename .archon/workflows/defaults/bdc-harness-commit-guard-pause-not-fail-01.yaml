@@ -43,7 +43,7 @@ description: |
   pause path instead of exit 1; keep the happy-path zero-prompt; keep the
   drift detection message), Codex-reviews the diff, business-risk-gates the
   happy-path invariant, opens a PR --base dev against bdc-harness, builds the
-  Captain CI manifest, flips Notion to REVIEW.
+  Captain CI manifest, flips WO to REVIEW (GitHub issue comment + status:review label -- Notion is free-plan read-only archive).
   NOT for: deleting the guard entirely, rebuilding the pause machinery, or
   touching any other workflow YAML.
 

@@ -5,7 +5,7 @@ description: |
   Does: Reads spec from bdc-xo via gh api (cross-repo), implements `bun run test:ce-regression`
         on lspro-react covering CE matrix (auth, license, import paths, AutoFix, cover lookup,
         WhatNot export, no PRO/HQ UI), adds .github/workflows/ce-regression.yml that runs on
-        PRs targeting release/ce, opens PR against main, flips Notion to REVIEW.
+        PRs targeting release/ce, opens PR against main, flips WO to REVIEW (GitHub issue comment + status:review label -- Notion is free-plan read-only archive).
   Repo: thinmansoftware/lspro-react. Spec lives in thinmansoftware/bdc-xo.
   parallel_ok: true (independent from WO-RELEASE-CE-BRANCH-MODEL-01 -- runs in parallel)
   NOT for: any other WO.

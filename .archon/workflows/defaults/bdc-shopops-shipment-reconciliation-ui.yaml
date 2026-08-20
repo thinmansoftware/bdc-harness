@@ -23,7 +23,7 @@ description: |
     - Adds shopops-api/routes/distributor-reconcile.js (thin compare endpoint).
     - Adds lspro-react admin page with CSV upload + discrepancy table.
     - Runs 4-test minimum (3 backend + 1 frontend). Skips exhaustive edge-case tests.
-    - Builds MIXED manifest and flips Notion to REVIEW.
+    - Builds MIXED manifest and flips WO to REVIEW (GitHub issue comment + status:review label -- Notion is free-plan read-only archive).
   Repo: shopops (primary CWD), lspro-react (sibling /tmp clone).
   parallel_ok: true.
 

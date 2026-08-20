@@ -564,7 +564,7 @@ nodes:
       Commit: $commit-and-push.output
       PR: $open-pr.output
 
-  # --- Node 10: Flip Notion to REVIEW -----------------------------------------
+  # --- Node 10: Flip WO to REVIEW (GitHub issue comment + status:review label) -----------------------------------------
   # Rule 7: MANDATORY final node. Manifest goes in Notes property, NOT as a page comment.
   # Captain CI reads Notes. Flip to REVIEW only -- NEVER DONE. The Cauldron grader / Captain CI
   # closes both Claude Status and Status after a VALIDATED verdict.

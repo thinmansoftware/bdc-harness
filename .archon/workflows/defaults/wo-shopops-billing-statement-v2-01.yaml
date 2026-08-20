@@ -586,7 +586,7 @@ nodes:
       Commit: $commit-and-push.output
       PR: $open-pr.output
 
-  # --- Node 10: Flip Notion to REVIEW -----------------------------------------
+  # --- Node 10: Flip WO to REVIEW (GitHub issue comment + status:review label) -----------------------------------------
   # Rule 7: MANDATORY final node. Manifest goes in Notes property, NOT as page comment.
   # Captain CI reads Notes. Never mark DONE -- only REVIEW.
   # Notion page ID: 369ef4c9-ce00-8186-aa2a-e8fd13a5d438

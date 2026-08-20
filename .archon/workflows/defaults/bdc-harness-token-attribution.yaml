@@ -52,7 +52,7 @@ description: |
       regression suites: dag-executor.test.ts, api.workflow-runs.test.ts).
     - Cross-model diff-review (Codex) before the irreversible commit.
     - Commits, pushes a feature branch, opens a PR to bdc-harness dev.
-    - Flips Notion to REVIEW (NEVER DONE) with the v2 manifest in Notes.
+    - flips WO to REVIEW (GitHub issue comment + status:review label -- Notion is free-plan read-only archive) (NEVER DONE) with the v2 manifest in Notes.
   Repo: thinmansoftware/bdc-harness (binds via target_repo + bdc-harness- name prefix).
   WO Class: CODE. NO migration. NO web/UI. provider.ts MUST stay untouched.
   parallel_ok: false (touches the shared execution layer of the harness itself).

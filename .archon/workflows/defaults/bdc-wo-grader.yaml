@@ -1,15 +1,32 @@
+# RETIRED 2026-08-20 (BDC-wide Notion caller sweep). John downgraded the
+# Notion workspace to the free plan; it is now a read-only legacy archive
+# (pre-2026-07-01 WO rows only, last WO-DB write 2026-07-17, verified dead).
+# GitHub has been the WO system of record since 2026-07-01 (Doctrine v1.4 #2).
+# This workflow's entire purpose -- query a Notion row for REVIEW, grade its
+# Notes-field manifest, PATCH the row back to DONE/IN_PROGRESS -- has no
+# current-era WOs to act on and would fail outright on NOTION_API_KEY absence
+# even if it did. The read-wo node below now no-ops instead of attempting a
+# live Notion query. Its cron trigger (scripts/trigger-wo-grader.sh) is
+# retired the same way. A GitHub-issue-native grader (query REVIEW-labeled
+# issues, grade the manifest comment, apply status:review/done labels) is a
+# fresh WO, not a revival of this workflow -- see bdc-xo#1649
+# (WO-HARNESS-OVERSEER-NOTION-LOOKUP-DEAD-END-01) for the related Overseer
+# Notion lookup dead-end and archon-yaml-authoring doctrine Rule 7.
+#
 # Drafted for WO-HARNESS-WO-GRADER-WORKFLOW-01.
 # Purpose: close the autonomous WO lifecycle by grading REVIEW WOs against
 # their Notes-field manifest and flipping them to DONE or back to IN_PROGRESS.
 #
-# Fire manually:
+# Fire manually (historical -- see RETIRED note above):
 #   WO_PAGE_ID=<notion-page-id> WO_ID=<wo-id> bun run cli workflow run bdc-wo-grader --no-worktree "grade WO"
 #
-# Fire by cron:
+# Fire by cron (historical -- see RETIRED note above):
 #   scripts/trigger-wo-grader.sh
 
 name: bdc-wo-grader
 description: |
+  RETIRED 2026-08-20 -- Notion is a free-plan read-only archive; this workflow's
+  Notion-row grading loop has no current-era WOs to act on. See RETIRED header.
   Use when: A Blue Devil Work Order is at REVIEW and needs Captain-CI-style closeout.
   Inputs:
     WO_PAGE_ID: Notion page id for the Work Order. Preferred.
@@ -28,15 +45,8 @@ nodes:
   - id: read-wo
     bash: |
       set -euo pipefail
-      NOTION_DB_ID="${NOTION_DB_ID:-a6df831c-0b52-449f-8ca4-d77be6b70d0a}"
-      WO_PAGE_ID="${WO_PAGE_ID:-}"
-      WO_ID="${WO_ID:-}"
-      DRY_RUN="${DRY_RUN:-false}"
-
-      if [ -z "${NOTION_API_KEY:-}" ]; then
-        echo "ERROR: NOTION_API_KEY is required for bdc-wo-grader" >&2
-        exit 1
-      fi
+      echo "bdc-wo-grader: RETIRED 2026-08-20 -- Notion is free-plan read-only archive, not the WO system of record. No-op." >&2
+      exit 1
 
       mkdir -p .archon-wo-grader
 

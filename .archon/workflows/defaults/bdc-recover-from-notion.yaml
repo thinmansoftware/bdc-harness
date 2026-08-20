@@ -1,3 +1,11 @@
+# ARCHIVE-ONLY as of 2026-08-20 (BDC-wide Notion caller sweep): this is the
+# one workflow in the sweep that legitimately keeps its live Notion API
+# calls. Notion was downgraded to the free plan and is now a read-only
+# legacy archive (pre-2026-07-01 WO rows only) -- but READS still work on
+# the free plan, and rescuing pre-cutover pages is exactly what this
+# workflow is for. Do not extend it to write to Notion, and do not use it
+# for current-era WOs (they are never filed to Notion in the first place).
+#
 # Drafted for WO-HARNESS-RECOVER-FROM-NOTION-WORKFLOW-01 (bdc-xo#172).
 # Purpose: rescue WO spec content from Notion entries when the originating
 # author/build workflow filed the Notion pages but lost the local MD files

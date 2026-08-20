@@ -20,7 +20,7 @@ description: |
     - Locates the footer component via grep on Catalog + Pull List + Live Shows + About strings.
     - Adds spacing (Tailwind gap-X or visible divider) between nav items.
     - Verifies no TypeScript regressions.
-    - Builds CODE manifest and flips Notion to REVIEW.
+    - Builds CODE manifest and flips WO to REVIEW (GitHub issue comment + status:review label -- Notion is free-plan read-only archive).
   Repo: thinmansoftware/shopops-storefront.
   parallel_ok: true.
 

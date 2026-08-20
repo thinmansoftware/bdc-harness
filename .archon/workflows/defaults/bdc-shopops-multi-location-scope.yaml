@@ -28,7 +28,7 @@ description: |
         distributor-orders.js + channel-orders.js (if exists) with location_id filter.
         Adds bun tests covering cross-location query, HQ aggregate, invalid uuid,
         POST require, tenant isolation. Commits, opens PR, runs Rule 19 docker exec
-        runtime-verify, builds MIXED manifest, flips Notion to REVIEW.
+        runtime-verify, builds MIXED manifest, flips WO to REVIEW (GitHub issue comment + status:review label -- Notion is free-plan read-only archive).
   Repo: thinmansoftware/shopops (shopops-api/ subdir).
   parallel_ok: false -- schema migration, serial only.
   Polish bar: HIGH (P0 Plan B floor for Mutant Market install).
