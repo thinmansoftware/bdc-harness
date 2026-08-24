@@ -16,7 +16,7 @@ import type { QueryResult } from './adapters/types';
 
 const log = createLogger('db/taskmaster');
 
-export type TmActionType = 'deliver_ruling' | 'nudge' | 'escalate_p0' | 'digest';
+export type TmActionType = 'deliver_ruling' | 'nudge' | 'escalate_p0' | 'digest' | 'fire_cauldron';
 export type TmActionOutcome =
   | 'pending'
   | 'sent'

@@ -27,7 +27,15 @@ import type { TmAdoptionRow } from '@archon/core/db/taskmaster';
 
 export type ThreadPriority = 'P0' | 'P1' | 'P2' | 'P3';
 export type ThreadClass = 'ready' | 'stale' | 'blocked' | 'healthy';
-export type TmActionType = 'deliver_ruling' | 'nudge' | 'escalate_p0' | 'digest';
+export type TmActionType = 'deliver_ruling' | 'nudge' | 'escalate_p0' | 'digest' | 'fire_cauldron';
+
+export interface FireEvidence {
+  woId: string;
+  targetRepo: string;
+  project: string;
+  specVerifiedAt: string;
+  noOpenOrMergedPr: true;
+}
 
 export interface ThreadSnapshot {
   /** Stable reference, e.g. "gh:owner/repo#123" or "dispatch:<message-id>" */
@@ -62,6 +70,8 @@ export interface ActionProposal {
    * any flagged proposal with the ORDINARY 'content_incomplete' reason.
    */
   contentIncomplete?: boolean;
+  /** Mechanical evidence required before the non-message fire effect is admitted. */
+  fireEvidence?: FireEvidence;
 }
 
 const MINUTE_MS = 60_000;
@@ -161,6 +171,9 @@ export interface NextActionContext {
   grades?: readonly GradedActionLike[];
   /** Durable tm_suppression row for this thread's canonical ref, if any. */
   suppression?: SuppressionLike;
+  fireEligible?: boolean;
+  fireBudgetAvailable?: boolean;
+  fireEvidence?: FireEvidence;
 }
 
 /**
@@ -326,6 +339,17 @@ export function computeNextAction(
       adoption?.last_movement_at ?? thread.lastActivityAt,
       context.nowMs
     );
+    if (context.fireEligible && context.fireBudgetAvailable && context.fireEvidence) {
+      return {
+        type: 'fire_cauldron',
+        threadRef: thread.ref,
+        recipient: 'operator',
+        body: `Start governed Cauldron work for ${context.fireEvidence.woId}.`,
+        idempotencyKey: `tm:fire:${thread.ref}:${bucket}`,
+        actsImmediately: true,
+        fireEvidence: context.fireEvidence,
+      };
+    }
     return {
       type: 'escalate_p0',
       threadRef: thread.ref,
