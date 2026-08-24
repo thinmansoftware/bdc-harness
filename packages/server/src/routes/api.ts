@@ -3242,7 +3242,7 @@ export function registerApiRoutes(
       ]);
       const unavailable = meta?.committed_snapshot_id == null;
       const complete = meta?.complete === 1;
-      const freshness: Array<'FRESH' | 'STALE' | 'PARTIAL' | 'UNAVAILABLE'> = unavailable
+      const freshness: ('FRESH' | 'STALE' | 'PARTIAL' | 'UNAVAILABLE')[] = unavailable
         ? ['UNAVAILABLE']
         : [
             complete &&

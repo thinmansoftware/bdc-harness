@@ -90,7 +90,7 @@ export interface TaskmasterRegisterListResponse {
 }
 
 export interface TaskmasterRegisterMetaResponse {
-  freshness: Array<'FRESH' | 'STALE' | 'PARTIAL' | 'UNAVAILABLE'>;
+  freshness: ('FRESH' | 'STALE' | 'PARTIAL' | 'UNAVAILABLE')[];
   rebuilt_at: string | null;
   row_count: number;
   partial_count: number;
