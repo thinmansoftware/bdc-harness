@@ -3237,7 +3237,7 @@ export function registerApiRoutes(
         taskmasterDb.getAdoptionMeta(),
         taskmasterDb.getPauseState(),
         taskmasterDb.getAdoptionPartialCount(),
-        // DAL uses LOWER(BTRIM(sender)) and LOWER(BTRIM(recipient)); raw matching undercounts.
+        // DAL uses LOWER(TRIM(sender)) and LOWER(TRIM(recipient)); raw matching undercounts.
         taskmasterDb.getUnaddressedXoCount(),
       ]);
       const unavailable = meta?.committed_snapshot_id == null;
