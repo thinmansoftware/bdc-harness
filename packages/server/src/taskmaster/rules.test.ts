@@ -32,7 +32,7 @@ function thread(overrides: Partial<ThreadSnapshot> = {}): ThreadSnapshot {
 describe('nudgeClockMs', () => {
   test('ratified Q1 clocks: 30min P0, 4h P1, 24h P2/P3', () => {
     expect(NUDGE_CLOCK_MS.P0).toBe(30 * 60_000);
-    expect(NUDGE_CLOCK_MS.P1).toBe(4 * 3_600_000);
+    expect(NUDGE_CLOCK_MS.P1).toBe(2 * 3_600_000); // 2026-08-24 cadence ruling
     expect(NUDGE_CLOCK_MS.P2).toBe(24 * 3_600_000);
     expect(NUDGE_CLOCK_MS.P3).toBe(24 * 3_600_000);
   });
@@ -56,9 +56,9 @@ describe('classifyThread', () => {
 
   test('idle past clock is stale; within clock is healthy', () => {
     const idle5h = new Date(NOW_MS - 5 * 3_600_000).toISOString();
-    const idle3h = new Date(NOW_MS - 3 * 3_600_000).toISOString();
+    const idle1h = new Date(NOW_MS - 1 * 3_600_000).toISOString();
     expect(classifyThread(thread({ lastActivityAt: idle5h }), NOW_MS)).toBe('stale');
-    expect(classifyThread(thread({ lastActivityAt: idle3h }), NOW_MS)).toBe('healthy');
+    expect(classifyThread(thread({ lastActivityAt: idle1h }), NOW_MS)).toBe('healthy');
   });
 
   test('customer-facing P2 stales on the 30min clock', () => {
