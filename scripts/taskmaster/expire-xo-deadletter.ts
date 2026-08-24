@@ -12,9 +12,9 @@
  *
  * - Dry-run by default: prints the matching row count and exits. Requires an
  *   explicit --confirm flag to mutate anything.
- * - Recipient is matched NORMALIZED -- LOWER(BTRIM(recipient)) = 'xo' -- the
+ * - Recipient is matched NORMALIZED -- LOWER(TRIM(recipient)) = 'xo' -- the
  *   same normalization migration 040 uses to seed dispatch_principals.
- *   (BTRIM is Postgres; this one-shot targets the production Postgres DB.)
+ *   (TRIM is standard SQL -- the deployed archon DB is SQLite, not Postgres.)
  * - NEVER invoked by the loop. Run once at Deploy 2 (M-155 gates G9/G10),
  *   operator-side, per the PR runbook section.
  */
@@ -23,7 +23,7 @@ import { closeDatabase, getDatabase } from '../../packages/core/src/db/connectio
 
 const MATCH_WHERE = `
   sender = 'taskmaster'
-  AND LOWER(BTRIM(recipient)) = 'xo'
+  AND LOWER(TRIM(recipient)) = 'xo'
   AND status = 'queued'
   AND addressed_at IS NULL
 `;

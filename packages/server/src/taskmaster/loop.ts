@@ -32,6 +32,7 @@ import {
   type ThreadSnapshot,
   type ThreadPriority,
   type TmActionType,
+  usefulRateFloorBreached,
 } from './rules';
 import { validateProposal, type TmAllowedRecipient } from './guard';
 import { currentHeadroom, type HeadroomReading } from './ledger';
@@ -968,6 +969,42 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
     getIssueEvidence,
     nowMs
   );
+
+  // M-155 Q3: useful-rate floor with auto-PAUSE. Counted AFTER
+  // gradeSentActions so grades written this tick are included. Writing
+  // PAUSED here is sufficient to withhold THIS tick's effects too: the
+  // send loop re-reads pause state fresh immediately before every effect
+  // and pause-parks on the fresh scope.
+  if (control.pause_state === 'RUNNING') {
+    try {
+      const gradedWindow = await dal.getActionsSince(
+        new Date(nowMs - JOURNAL_LOOKBACK_MS).toISOString()
+      );
+      let usefulCount = 0;
+      let noiseCount = 0;
+      for (const a of gradedWindow) {
+        if (a.grade === 'useful') usefulCount += 1;
+        else if (a.grade === 'noise') noiseCount += 1;
+      }
+      if (usefulRateFloorBreached(usefulCount, noiseCount)) {
+        const graded = usefulCount + noiseCount;
+        await dal.setPauseState({
+          pause_state: 'PAUSED',
+          pause_scope: 'effects',
+          pause_reason:
+            `M-155 useful-rate floor auto-pause: ${usefulCount} useful of ` +
+            `${graded} graded (${Math.round((usefulCount / graded) * 100)}%) in the ` +
+            '7-day lookback is below the ratified 40% floor. Resume requires an ' +
+            'operator decision, not a timer.',
+          pause_actor: 'taskmaster:useful-rate-floor',
+        });
+        log.warn({ usefulCount, noiseCount }, 'taskmaster.useful_rate_floor_auto_paused');
+      }
+    } catch (error) {
+      tickFailures += 1;
+      log.warn({ err: error as Error }, 'taskmaster.useful_rate_floor_check_failed');
+    }
+  }
 
   // 5. Reads -> classify -> propose.
   const result: TickResult = {
