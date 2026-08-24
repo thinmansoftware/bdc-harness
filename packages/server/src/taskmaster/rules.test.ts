@@ -294,6 +294,30 @@ describe('M-155 exception push (rules)', () => {
     expect(recovered?.body).toContain('waiting on John decision');
   });
 
+  test('push: legacy/case-variant thread_refs still suppress (canonical grouping)', () => {
+    // REGRESSION (Codex seat review, PR #693): grades arrive ALREADY grouped
+    // under the canonical ref by loop.ts, but each row keeps its ORIGINAL
+    // thread_ref. isSuppressedByNoise used to re-filter on the raw value,
+    // silently discarding every legacy/case-variant row -- so repeated noise
+    // was never suppressed. These two rows are the same thread, spelled two
+    // different ways, and MUST suppress.
+    const canonRef = 'gh:thinmansoftware/bdc-harness#1';
+    const adoption = makeAdoption({ title: 'Noisy item', next_action: 'do the next step' });
+    const grades: GradedActionLike[] = [
+      {
+        thread_ref: 'gh:thinmansoftware/BDC-Harness#1', // case variant
+        grade: 'noise',
+        graded_at: new Date(NOW_MS - 60_000).toISOString(),
+      },
+      {
+        thread_ref: 'thinmansoftware/bdc-harness#1', // legacy short form
+        grade: 'noise',
+        graded_at: new Date(NOW_MS - 120_000).toISOString(),
+      },
+    ];
+    expect(isSuppressedByNoise(canonRef, grades, adoption)).toBe(true);
+  });
+
   test('push: ungraded sends never trigger suppression', () => {
     const ref = 'gh:thinmansoftware/bdc-harness#1';
     const adoption = makeAdoption({ title: 'Ungraded item', next_action: 'do the next step' });

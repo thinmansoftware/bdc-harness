@@ -164,7 +164,7 @@ export function adoptionContentHash(adoption: TmAdoptionRow): string {
  * Pure: the caller supplies the grade rows and the suppression row.
  */
 export function isSuppressedByNoise(
-  threadRef: string,
+  _threadRef: string,
   grades: readonly GradedActionLike[],
   adoption: TmAdoptionRow | undefined,
   suppression?: SuppressionLike
@@ -172,8 +172,13 @@ export function isSuppressedByNoise(
   if (!adoption) return false;
   const liveHash = adoptionContentHash(adoption);
   if (suppression) return suppression.suppressed_until_hash === liveHash;
+  // NOTE: `grades` is ALREADY scoped to this thread's canonical ref by both
+  // call sites (loop.ts groups journal rows via canonicalizeThreadRef before
+  // passing them in). Re-filtering on the raw g.thread_ref here silently
+  // discarded every legacy/case-variant reference for the same thread, so
+  // canonical grouping never actually suppressed repeated noise.
   const graded = grades
-    .filter(g => g.thread_ref === threadRef && g.grade !== null && g.graded_at !== null)
+    .filter(g => g.grade !== null && g.graded_at !== null)
     .sort((a, b) => Date.parse(b.graded_at ?? '') - Date.parse(a.graded_at ?? ''));
   if (graded.length < 2) return false;
   if (graded[0].grade !== 'noise' || graded[1].grade !== 'noise') return false;
