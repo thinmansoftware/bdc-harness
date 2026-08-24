@@ -67,10 +67,16 @@ export interface ActionProposal {
 const MINUTE_MS = 60_000;
 const HOUR_MS = 60 * MINUTE_MS;
 
-/** Ratified Q1 nudge clocks. */
+/**
+ * Ratified Q1 nudge clocks. P1 tightened 4h -> 2h by John's cadence ruling
+ * 2026-08-24 ("these need to be frequent, and I know we might have to
+ * adjust") -- paired with TASKMASTER_INTERVAL_MS 3600000 -> 900000 on the
+ * host. The 40% useful-rate floor is the guardrail: faster-and-noisy trips
+ * it sooner, so frequency cannot silently become flood.
+ */
 export const NUDGE_CLOCK_MS: Record<ThreadPriority, number> = {
   P0: 30 * MINUTE_MS,
-  P1: 4 * HOUR_MS,
+  P1: 2 * HOUR_MS,
   P2: 24 * HOUR_MS,
   P3: 24 * HOUR_MS,
 };

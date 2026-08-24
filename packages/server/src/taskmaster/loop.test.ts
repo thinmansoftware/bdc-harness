@@ -24,7 +24,7 @@ import {
   type AdoptionRefreshResult,
 } from './loop';
 import { validateProposal, TM_ALLOWED_ACTION_TYPES, TM_ALLOWED_RECIPIENTS } from './guard';
-import { MAX_INTERVENTIONS_PER_ITEM_24H, type ActionProposal } from './rules';
+import { MAX_INTERVENTIONS_PER_ITEM_24H, type ActionProposal, NUDGE_CLOCK_MS } from './rules';
 import type { TmAdoptionRow, TmSuppressionRow } from '@archon/core/db/taskmaster';
 import type { ThreadSnapshot } from './rules';
 import type {
@@ -748,7 +748,7 @@ describe('failed effect reuse and successful-tick health', () => {
       thread_ref: staleThread.ref,
       action_type: 'nudge',
       proposal_json: '{}',
-      idempotency_key: `tm:nudge:${staleThread.ref}:${Math.floor(T0 / (4 * 3_600_000))}`,
+      idempotency_key: `tm:nudge:${staleThread.ref}:${Math.floor(T0 / NUDGE_CLOCK_MS.P1)}`,
       before_hash: null,
       proof_predicate: 'source issue progress after send',
       proof_deadline_at: new Date(T0 + 60_000).toISOString(),
@@ -794,7 +794,7 @@ describe('failed effect reuse and successful-tick health', () => {
       thread_ref: staleThread.ref,
       action_type: 'nudge',
       proposal_json: '{}',
-      idempotency_key: `tm:nudge:${staleThread.ref}:${Math.floor(T0 / (4 * 3_600_000))}`,
+      idempotency_key: `tm:nudge:${staleThread.ref}:${Math.floor(T0 / NUDGE_CLOCK_MS.P1)}`,
       before_hash: null,
       proof_predicate: 'source issue progress after send',
       proof_deadline_at: new Date(T0 - 1).toISOString(),
