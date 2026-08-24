@@ -11,6 +11,9 @@ import {
   NUDGE_CLOCK_MS,
   type GradedActionLike,
   type ThreadSnapshot,
+  usefulRateFloorBreached,
+  USEFUL_RATE_FLOOR,
+  USEFUL_RATE_MIN_GRADED,
 } from './rules';
 import type { TmAdoptionRow } from '@archon/core/db/taskmaster';
 
@@ -292,6 +295,23 @@ describe('M-155 exception push (rules)', () => {
     });
     expect(recovered?.type).toBe('nudge');
     expect(recovered?.body).toContain('waiting on John decision');
+  });
+
+  test('M-155 Q3: useful-rate floor boundaries', () => {
+    // Below the minimum graded sample: never breaches, even at 0% useful.
+    expect(usefulRateFloorBreached(0, USEFUL_RATE_MIN_GRADED - 1)).toBe(false);
+    // At the minimum sample and 0% useful: breaches.
+    expect(usefulRateFloorBreached(0, USEFUL_RATE_MIN_GRADED)).toBe(true);
+    // Exactly 40% (2 useful / 5 graded): does NOT breach -- floor is strict-below.
+    expect(usefulRateFloorBreached(2, 3)).toBe(false);
+    // Just under 40% (39 useful / 100 graded): breaches.
+    expect(usefulRateFloorBreached(39, 61)).toBe(true);
+    // Healthy: all useful never breaches.
+    expect(usefulRateFloorBreached(10, 0)).toBe(false);
+    // The audit's real numbers (61 useful / 508 noise = 10.7%): breaches.
+    expect(usefulRateFloorBreached(61, 508)).toBe(true);
+    // Sanity on the exported constant so a silent edit fails a test.
+    expect(USEFUL_RATE_FLOOR).toBe(0.4);
   });
 
   test('push: legacy/case-variant thread_refs still suppress (canonical grouping)', () => {

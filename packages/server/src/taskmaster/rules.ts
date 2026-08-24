@@ -77,6 +77,34 @@ export const NUDGE_CLOCK_MS: Record<ThreadPriority, number> = {
 
 export const CUSTOMER_CLOCK_MS = 30 * MINUTE_MS;
 
+/**
+ * M-155 ruling, open item Q3: "the proposed 40%-of-graded floor with
+ * auto-PAUSE stands as the working number". When the useful rate over graded
+ * actions in the journal lookback window falls below this floor, the loop
+ * pauses ITSELF (scope='effects') instead of continuing to emit noise. The
+ * floor was slated for WO-RUNTIME-RESTORE-01 and verified ABSENT from the
+ * shipped code on 2026-08-24 -- this implements the ratified working number.
+ */
+export const USEFUL_RATE_FLOOR = 0.4;
+
+/**
+ * Minimum graded sample before the floor can trip. Prevents a single early
+ * noise grade (1 noise / 0 useful = 0%) from pausing a freshly-resumed loop
+ * before it has produced enough graded evidence to judge.
+ */
+export const USEFUL_RATE_MIN_GRADED = 5;
+
+/**
+ * Pure floor test: true when the graded sample is large enough AND the
+ * useful share of graded actions is strictly below USEFUL_RATE_FLOOR.
+ * Exactly 40% does not breach (the ruling says "floor", not "must exceed").
+ */
+export function usefulRateFloorBreached(usefulCount: number, noiseCount: number): boolean {
+  const graded = usefulCount + noiseCount;
+  if (graded < USEFUL_RATE_MIN_GRADED) return false;
+  return usefulCount / graded < USEFUL_RATE_FLOOR;
+}
+
 /** Max automated interventions per item per 24h (ratified budget). */
 export const MAX_INTERVENTIONS_PER_ITEM_24H = 3;
 
