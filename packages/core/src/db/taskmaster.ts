@@ -669,8 +669,8 @@ export async function getUnaddressedXoCount(): Promise<number> {
   // No normalized covering index exists; accept the growing-table scan for correctness.
   const result = await getDatabase().query<{ cnt: number | string }>(
     `SELECT COUNT(*) AS cnt FROM agent_dispatch_messages
-      WHERE LOWER(BTRIM(sender)) = 'taskmaster'
-        AND LOWER(BTRIM(recipient)) = 'xo'
+      WHERE LOWER(TRIM(sender)) = 'taskmaster'
+        AND LOWER(TRIM(recipient)) = 'xo'
         AND addressed_at IS NULL`
   );
   return Number(result.rows[0]?.cnt ?? 0);
