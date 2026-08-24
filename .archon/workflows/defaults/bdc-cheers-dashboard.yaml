@@ -30,7 +30,7 @@ description: |
         cheers-scoring.ts helper + tests in lspro-react. Runs Vitest + bun tests.
         Opens 2 PRs (lspro-react main + shopops master). UI build-time verification
         loop N=3. Rule 19 runtime grep against shopops-api container. Builds MIXED
-        manifest. Flips Notion to REVIEW.
+        manifest. flips WO to REVIEW (GitHub issue comment + status:review label -- Notion is free-plan read-only archive).
   Repos: thinmansoftware/lspro-react (Archon CWD) + thinmansoftware/shopops
          (cloned to /tmp). WO spec in thinmansoftware/bdc-xo.
   parallel_ok: false -- touches 2 repos.

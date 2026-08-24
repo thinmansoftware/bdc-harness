@@ -33,7 +33,7 @@ description: |
     - Reads spec from bdc-xo docs/work-orders/.
     - Implements [what] in the [PACKAGE_NAME] Python package.
     - Self-verifies with python3 -m pytest inside the implement loop.
-    - Commits, pushes, opens PR, flips Notion to REVIEW.
+    - Commits, pushes, opens PR, flips WO to REVIEW (GitHub issue comment + status:review label -- Notion is free-plan read-only archive).
   Repo: bluedevilcollectibles/[TARGET_REPO].
   parallel_ok: true.
 

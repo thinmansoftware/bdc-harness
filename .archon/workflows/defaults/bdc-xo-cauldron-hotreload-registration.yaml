@@ -41,7 +41,7 @@ description: |
     - Best-effort live-runtime verification (Rule 19 INFRA): StartedAt unchanged across a
       --hot sync + GET /api/workflows lists the hot-registered workflow.
     - Commits, pushes a feature branch, opens a PR to bdc-xo main.
-    - Flips Notion to REVIEW (NEVER DONE) with the manifest in Notes.
+    - flips WO to REVIEW (GitHub issue comment + status:review label -- Notion is free-plan read-only archive) (NEVER DONE) with the manifest in Notes.
   Repo: thinmansoftware/bdc-xo (binds via bdc-xo- name prefix).
   WO Class: INFRA. parallel_ok: false (touches the deploy script for the shared container).
 

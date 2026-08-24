@@ -5,7 +5,7 @@ description: |
   Does: Reads the BDC WO spec from bdc-xo via gh api, creates release/ce from current main HEAD on lspro-react,
         adds GitHub branch protection (PRs required + CE regression check placeholder),
         commits CE governance doc references + PR templates, opens nothing (this is an infra WO),
-        flips Notion to REVIEW with manifest.
+        flips WO to REVIEW (GitHub issue comment + status:review label -- Notion is free-plan read-only archive) with manifest.
   Repo: thinmansoftware/lspro-react (target). Spec lives in thinmansoftware/bdc-xo (cross-repo read).
   NOT for: any other WO. This workflow is bound to WO-RELEASE-CE-BRANCH-MODEL-01.
 

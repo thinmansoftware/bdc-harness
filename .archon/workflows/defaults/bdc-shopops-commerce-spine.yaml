@@ -35,7 +35,7 @@ description: |
         PATCH /channels/connections/:channel + GET /channels/inventory-availability,
         adds services/channelAvailability.js, runs bun tests (idempotency +
         tenant isolation), commits + opens PR, does docker exec Rule 19 runtime
-        verification, builds MIXED manifest, flips Notion to REVIEW.
+        verification, builds MIXED manifest, flips WO to REVIEW (GitHub issue comment + status:review label -- Notion is free-plan read-only archive).
   Repo: thinmansoftware/shopops (shopops-api/ subdir).
         Spec lives in thinmansoftware/bdc-xo.
   parallel_ok: false -- schema migration, serial only.

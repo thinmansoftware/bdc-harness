@@ -20,7 +20,7 @@ description: |
     - Verifies: node tests/run_all.js passes.
     - Commits, pushes, opens PR to staging.
     - Provides docker exec grep evidence per Rule 19.
-    - Flips Notion to REVIEW.
+    - flips WO to REVIEW (GitHub issue comment + status:review label -- Notion is free-plan read-only archive).
   Repo: thinmansoftware/shopops.
   parallel_ok: false.  # shopops-api routes: serialize to prevent merge conflicts
 

@@ -31,7 +31,7 @@ description: |
         verifies channel_orders table exists (SPINE WO dependency), implements
         routes/shopify-webhooks.js + services/shopifyWebhookAuth.js + registers route in index.js,
         writes 5+ bun tests, opens PR against main (shopops staging gate), builds manifest
-        with Rule 19 runtime verification, flips Notion to REVIEW.
+        with Rule 19 runtime verification, flips WO to REVIEW (GitHub issue comment + status:review label -- Notion is free-plan read-only archive).
   Repo: thinmansoftware/shopops (working path: shopops-api/ subdirectory).
   Depends on: WO-SHOPOPS-COMMERCE-SPINE-01 (channel_orders table prerequisite).
   parallel_ok: true (single repo, no schema migration, independent from other SHOPOPS WOs).

@@ -17,7 +17,7 @@ description: |
     - Plans + implements in [TARGET_REPO].
     - Verifies: bunx tsc --noEmit + bun test.
     - Commits, pushes feature branch, opens PR to staging.
-    - Flips Notion to REVIEW.
+    - flips WO to REVIEW (GitHub issue comment + status:review label -- Notion is free-plan read-only archive).
   Repo: bluedevilcollectibles/[TARGET_REPO].
   parallel_ok: true.
 

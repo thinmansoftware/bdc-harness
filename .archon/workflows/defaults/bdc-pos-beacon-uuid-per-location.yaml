@@ -33,7 +33,7 @@ description: |
     - Modifies shopops-api/index.js to mount the new router.
     - Adds shopops-api/tests/test_location_beacons.js (>= 7 bun tests).
     - Runs Rule 19 runtime-verify against shopops-api container.
-    - Builds CODE manifest and flips Notion to REVIEW.
+    - Builds CODE manifest and flips WO to REVIEW (GitHub issue comment + status:review label -- Notion is free-plan read-only archive).
   Repo: thinmansoftware/shopops (primary + only CWD).
   parallel_ok: true (POS-arrival lane; no schema overlap with other lanes today).
 

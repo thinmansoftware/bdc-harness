@@ -61,7 +61,7 @@ description: |
         (9) Rule 19 runtime grep inside shopops-api container (PRH_UPC_PREFIXES present in /app);
         (10) curls /api/covers/resolve to confirm cascade returns real cover for test UPC;
         (11) builds MIXED-class manifest (CODE + schema migration);
-        (12) flips Notion to REVIEW (NEVER DONE -- Cauldron grader closes both fields).
+        (12) flips WO to REVIEW (GitHub issue comment + status:review label -- Notion is free-plan read-only archive) (NEVER DONE -- Cauldron grader closes both fields).
   Repo: thinmansoftware/shopops (master branch). shopops-api/ subdir.
         Spec lives in thinmansoftware/bdc-xo (docs/work-orders/).
   parallel_ok: false -- production view DDL, serial only.

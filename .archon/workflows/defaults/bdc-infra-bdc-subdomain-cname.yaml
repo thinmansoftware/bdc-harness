@@ -29,7 +29,7 @@ description: |
     - Updates shopops-storefront marketing-page footer to use canonical only.
     - Surfaces Cloudflare DNS action if needed (best-effort API; operator follow-up
       if token absent).
-    - Builds INFRA manifest with curl evidence + flips Notion to REVIEW.
+    - Builds INFRA manifest with curl evidence + flips WO to REVIEW (GitHub issue comment + status:review label -- Notion is free-plan read-only archive).
   Repos: bdc-xo (decision doc) + shopops-storefront (marketing copy).
   parallel_ok: true (no overlap with other lanes).
 

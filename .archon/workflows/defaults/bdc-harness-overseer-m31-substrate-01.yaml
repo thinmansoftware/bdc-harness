@@ -6,7 +6,7 @@ description: |
   Input: WO_ID is baked in at root; no user message required at fire time.
   Does: Reads the WO spec, plans a surgical implementation, implements + self-verifies,
   runs war-council validation, enforces the M-31 business-risk invariant (load_bearing),
-  commits, pushes, opens a PR, builds a Captain CI manifest, and flips Notion to Review.
+  commits, pushes, opens a PR, builds a Captain CI manifest, and flips WO to REVIEW (GitHub issue comment + status:review label -- Notion is free-plan read-only archive).
   NOT for: Deploys, activation, provider mutation, doctrine-only edits, or other WOs.
 
 policyFile: harness/policies/agent-behavior.md

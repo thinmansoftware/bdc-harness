@@ -19,7 +19,7 @@ description: |
     - Plans + implements in bdc-harness packages/web (ReactFlow run-detail view - EXTEND, no new layout system).
     - Verifies: bun run build (web) + bunx tsc --noEmit, both zero errors.
     - Commits, pushes feature branch off dev, opens PR to dev.
-    - Flips Notion to REVIEW (NOT DONE - the grader closes both fields after VALIDATED).
+    - flips WO to REVIEW (GitHub issue comment + status:review label -- Notion is free-plan read-only archive) (NOT DONE - the grader closes both fields after VALIDATED).
   Repo: thinmansoftware/bdc-harness (branch off origin/dev - integration branch, NOT main).
   WO Class: CODE (frontend React/ReactFlow, read-only rendering of existing events; no backend, no schema, no migration).
   parallel_ok: true.
