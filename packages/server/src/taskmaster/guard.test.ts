@@ -54,6 +54,14 @@ describe('validateProposal', () => {
     expect(validateProposal({ ...valid, fireEvidence: undefined }).reason).toContain(
       'fire_evidence_invalid'
     );
+    const missingProject = {
+      ...valid,
+      fireEvidence: { ...valid.fireEvidence, project: undefined },
+    } as unknown as ActionProposal;
+    expect(validateProposal(missingProject)).toMatchObject({
+      allowed: false,
+      reason: expect.stringContaining('fire_evidence_invalid'),
+    });
   });
 
   test('broadcast/board/invented recipients are forbidden effects', () => {

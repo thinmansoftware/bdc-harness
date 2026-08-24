@@ -125,6 +125,7 @@ export function validateProposal(proposal: ActionProposal): GuardResult {
       !evidence ||
       !/^WO-[A-Z][A-Z0-9-]*-\d+$/.test(evidence.woId) ||
       !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(evidence.targetRepo) ||
+      typeof evidence.project !== 'string' ||
       !evidence.project.trim() ||
       !Number.isFinite(Date.parse(evidence.specVerifiedAt)) ||
       !evidence.noOpenOrMergedPr

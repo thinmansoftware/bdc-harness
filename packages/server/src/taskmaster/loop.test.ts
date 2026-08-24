@@ -445,6 +445,91 @@ describe('fire_cauldron loop', () => {
       else process.env.TASKMASTER_FIRE_VERB_ENABLED = prior;
     }
   });
+
+  test('pause scope=effects parks an eligible fire without admitting a cascade', async () => {
+    const prior = process.env.TASKMASTER_FIRE_VERB_ENABLED;
+    process.env.TASKMASTER_FIRE_VERB_ENABLED = 'true';
+    try {
+      const world = makeWorld();
+      seedDigestSent(world);
+      world.control.pause_state = 'PAUSED';
+      world.control.pause_scope = 'effects';
+      const item = makeListedThread({
+        ref: 'gh:thinmansoftware/bdc-harness#502',
+        priority: 'P0',
+        isUnclaimedP0: true,
+        title: 'WO-HARNESS-EXAMPLE-01 urgent build',
+      });
+      let admissions = 0;
+      await tick(
+        createTaskmasterState(60_000),
+        makeDeps(world, {
+          listThreads: async () => [item],
+          checkFireEligibility: async () => ({
+            eligible: true,
+            evidence: {
+              woId: 'WO-HARNESS-EXAMPLE-01',
+              targetRepo: 'thinmansoftware/bdc-harness',
+              project: 'bdc-harness',
+              specVerifiedAt: new Date(T0).toISOString(),
+              noOpenOrMergedPr: true,
+            },
+          }),
+          runCascade: (async () => {
+            admissions += 1;
+            throw new Error('paused fire must not run');
+          }) as NonNullable<TaskmasterDeps['runCascade']>,
+        })
+      );
+      expect(admissions).toBe(0);
+      const fire = world.journal.find(row => row.action_type === 'fire_cauldron');
+      expect(fire?.outcome).toBe('parked');
+      expect(fire?.proposal_json).toContain('"reason":"paused"');
+    } finally {
+      if (prior === undefined) delete process.env.TASKMASTER_FIRE_VERB_ENABLED;
+      else process.env.TASKMASTER_FIRE_VERB_ENABLED = prior;
+    }
+  });
+
+  test('grades completed fire useful and overdue running fire noise', async () => {
+    for (const testCase of [
+      { id: 'completed-fire', status: 'completed', deadline: T0 + 60_000, grade: 'useful' },
+      { id: 'overdue-running-fire', status: 'running', deadline: T0 - 1, grade: 'noise' },
+    ] as const) {
+      const world = makeWorld();
+      seedDigestSent(world);
+      world.journal.push({
+        id: testCase.id,
+        created_at: new Date(T0 - 60_000).toISOString(),
+        thread_ref: 'gh:thinmansoftware/bdc-harness#503',
+        action_type: 'fire_cauldron',
+        proposal_json: JSON.stringify({
+          type: 'fire_cauldron',
+          cascadeId: `cascade-${testCase.id}`,
+          fireEvidence: { woId: 'WO-HARNESS-EXAMPLE-01' },
+        }),
+        idempotency_key: `tm:fire:${testCase.id}`,
+        before_hash: null,
+        proof_predicate: 'cascade completes, opens a PR, or issue enters BUILDING',
+        proof_deadline_at: new Date(testCase.deadline).toISOString(),
+        outcome: 'sent',
+        graded_at: null,
+        grade: null,
+      });
+      let evidenceCalls = 0;
+      await tick(
+        createTaskmasterState(60_000),
+        makeDeps(world, {
+          getFireRunEvidence: async () => {
+            evidenceCalls += 1;
+            return { status: testCase.status, prOpened: false };
+          },
+        })
+      );
+      expect(evidenceCalls).toBe(1);
+      expect(world.journal.find(row => row.id === testCase.id)?.grade).toBe(testCase.grade);
+    }
+  });
 });
 
 describe('WO pause-gate enforcement (WO-HARNESS-TASKMASTER-PAUSE-GATE-ENFORCE-01)', () => {

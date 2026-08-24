@@ -683,8 +683,7 @@ async function gradeSentActions(
           await dal.gradeAction(action.id, 'useful');
         } else if (
           Number.isFinite(deadlineMs) &&
-          nowMs >= deadlineMs &&
-          (!run || ['failed', 'cancelled', 'escalated'].includes(run.status))
+          nowMs >= deadlineMs
         ) {
           await dal.gradeAction(action.id, 'noise');
         }

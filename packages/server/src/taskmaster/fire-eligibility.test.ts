@@ -51,6 +51,27 @@ describe('checkFireEligibility', () => {
     ).toBe('pr_exists');
   });
 
+  test('fails closed when target repo is absent or is not a registered project', async () => {
+    expect((await checkFireEligibility(TITLE, deps('cauldron_compatible: true'))).reason).toBe(
+      'target_repo_missing'
+    );
+    const unregistered = deps();
+    unregistered.codebases = async () => [];
+    expect((await checkFireEligibility(TITLE, unregistered)).reason).toBe(
+      'project_not_registered'
+    );
+  });
+
+  test('does not treat adjacent or prefix WO tokens as the requested WO', async () => {
+    for (const title of ['WO-HARNESS-EXAMPLE-010', 'WO-HARNESS-EXAMPLE-1']) {
+      const result = await checkFireEligibility(
+        TITLE,
+        deps(SPEC, [{ title, state: 'open', pull_request: {} }])
+      );
+      expect(result.eligible).toBe(true);
+    }
+  });
+
   test('backs off at the shared GitHub rate-limit floor', async () => {
     const limited = deps();
     limited.fetchImpl = async () => response({}, 200, '4');
