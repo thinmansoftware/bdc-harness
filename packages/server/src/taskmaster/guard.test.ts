@@ -58,6 +58,15 @@ describe('validateProposal', () => {
     expect(result.reason).toContain('body_empty');
   });
 
+  test('push: content_incomplete is an ordinary reject, never a HARD_PAUSE', () => {
+    const result = validateProposal(proposal({ body: null as unknown as string }));
+    expect(result.allowed).toBe(false);
+    expect(result.reason).toContain('content_incomplete');
+    // Ordinary skip -- the auto-circuit (HARD_PAUSE) is reserved for forbidden
+    // EFFECTS (bad action type / recipient), not incomplete content.
+    expect(result.forbiddenEffect).not.toBe(true);
+  });
+
   test('spend/send/deploy verbs in the body are rejected (ported DO guard)', () => {
     const bodies = [
       'Please refund the customer for order 123.',

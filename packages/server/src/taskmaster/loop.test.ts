@@ -12,12 +12,15 @@ import {
   resolveTaskmasterIntervalMs,
   refreshAdoption,
   canonicalizeThreadRef,
+  MAX_EFFECTS_PER_TICK,
   type TaskmasterDeps,
   type ListedThread,
   type GithubIssueEvidence,
   type AdoptionRefreshResult,
 } from './loop';
-import type { TmAdoptionRow } from '@archon/core/db/taskmaster';
+import { MAX_INTERVENTIONS_PER_ITEM_24H } from './rules';
+import { TM_ALLOWED_ACTION_TYPES, TM_ALLOWED_RECIPIENTS } from './guard';
+import type { TmAdoptionRow, TmSuppressionRow } from '@archon/core/db/taskmaster';
 import type { ThreadSnapshot } from './rules';
 import type {
   TmActionOutcome,
@@ -50,6 +53,7 @@ interface FakeWorld {
     source_commit: string | null;
     complete: number;
   };
+  suppression: TmSuppressionRow[];
 }
 
 function makeWorld(): FakeWorld {
@@ -74,6 +78,7 @@ function makeWorld(): FakeWorld {
       source_commit: null,
       complete: 0,
     },
+    suppression: [],
   };
 }
 
@@ -192,6 +197,25 @@ function makeDeps(world: FakeWorld, overrides: Partial<TaskmasterDeps> = {}): Ta
       source_commit: world.adoptionMeta.source_commit,
       complete: world.adoptionMeta.complete,
     }),
+    getSuppression: async () => new Map(world.suppression.map(r => [r.thread_ref, r])),
+    setSuppression: async (threadRef: string, hash: string) => {
+      const existing = world.suppression.find(r => r.thread_ref === threadRef);
+      if (existing) {
+        existing.suppressed_until_hash = hash;
+        existing.suppressed_at = new Date(world.nowMs).toISOString();
+        existing.noise_grade_count = 2;
+      } else {
+        world.suppression.push({
+          thread_ref: threadRef,
+          suppressed_until_hash: hash,
+          suppressed_at: new Date(world.nowMs).toISOString(),
+          noise_grade_count: 2,
+        });
+      }
+    },
+    clearSuppression: async (threadRef: string) => {
+      world.suppression = world.suppression.filter(r => r.thread_ref !== threadRef);
+    },
   };
 
   const okHeadroom: HeadroomReading = {
@@ -256,6 +280,34 @@ function ruling(overrides: Partial<ThreadSnapshot> = {}): ThreadSnapshot {
   };
 }
 
+/**
+ * Exception-push (M-155 WO 3) content-gates nudges: a stale thread only nudges
+ * when the adoption row carries a title AND a next_action/blocked_reason. Bare
+ * staleness (title but no marker) is suppressed to the register. Loop tests that
+ * exercise the SEND path (pause-park, budget ceiling, deferred reuse) therefore
+ * must give their threads a title AND a PROGRESS marker via evidence -- otherwise
+ * the composer correctly refuses to send. This helper supplies that evidence.
+ */
+function progressEvidence(overrides: Partial<GithubIssueEvidence> = {}): GithubIssueEvidence {
+  return {
+    state: 'open',
+    updatedAt: new Date(T0 - 30_000).toISOString(),
+    labels: ['wo', 'prio:P1'],
+    assigneeCount: 1,
+    closedAt: null,
+    assignedAt: new Date(T0 - 3_600_000).toISOString(),
+    activeStatusAt: null,
+    progressRecordedAt: new Date(T0 - 3_600_000).toISOString(),
+    ownerLogin: 'xo',
+    latestMarkerKind: 'PROGRESS',
+    latestMarkerText: 'next action: finish the migration',
+    latestMarkerAt: new Date(T0 - 3_600_000).toISOString(),
+    lastMovementAt: new Date(T0 - 3_600_000).toISOString(),
+    lastMovementKind: 'progress_comment',
+    ...overrides,
+  };
+}
+
 describe('scenario 1: undelivered ruling is delivered exactly once (dedupe proven)', () => {
   test('two ticks produce one deliver_ruling row and one send; a third tick adds nothing', async () => {
     const world = makeWorld();
@@ -290,11 +342,15 @@ describe('scenario 3: pause scope=effects withholds ALL effects (P0 escalation n
     world.control.pause_scope = 'effects';
     world.control.pause_actor = 'john';
 
-    const staleP1: ThreadSnapshot = {
+    // Content-complete so the composer produces a nudge (which then parks);
+    // exception-push suppresses bare-stale threads, so this test needs a title
+    // + a PROGRESS marker to exercise the pause-park path at all.
+    const staleP1: ListedThread = {
       ref: 'gh:thinmansoftware/bdc-harness#11',
       priority: 'P1',
       lastActivityAt: new Date(T0 - 5 * 3_600_000).toISOString(),
       recipient: 'xo',
+      title: 'Stale P1 needing a nudge',
     };
     const unclaimedP0: ThreadSnapshot = {
       ref: 'gh:thinmansoftware/bdc-harness#12',
@@ -303,7 +359,10 @@ describe('scenario 3: pause scope=effects withholds ALL effects (P0 escalation n
       isUnclaimedP0: true,
       recipient: 'xo',
     };
-    const deps = makeDeps(world, { listThreads: async () => [staleP1, unclaimedP0] });
+    const deps = makeDeps(world, {
+      listThreads: async () => [staleP1, unclaimedP0],
+      getGithubIssueEvidence: async () => progressEvidence(),
+    });
     const state = createTaskmasterState(60_000);
 
     // Tick 1 observes; tick 2 confirms the nudge (which then parks). The P0
@@ -712,11 +771,12 @@ describe('failed effect reuse and successful-tick health', () => {
   test('a deferred row is reused when the next tick has budget', async () => {
     const world = makeWorld();
     seedDigestSent(world);
-    const staleThread: ThreadSnapshot = {
+    const staleThread: ListedThread = {
       ref: 'gh:thinmansoftware/bdc-xo#1500',
       priority: 'P1',
       lastActivityAt: new Date(T0 - 5 * 3_600_000).toISOString(),
       recipient: 'xo',
+      title: 'Deferred nudge item',
     };
     world.journal.push({
       id: 'deferred-nudge',
@@ -735,7 +795,10 @@ describe('failed effect reuse and successful-tick health', () => {
 
     const result = await tick(
       createTaskmasterState(60_000),
-      makeDeps(world, { listThreads: async () => [staleThread] })
+      makeDeps(world, {
+        listThreads: async () => [staleThread],
+        getGithubIssueEvidence: async () => progressEvidence(),
+      })
     );
 
     expect(result.effects).toBe(1);
@@ -746,11 +809,12 @@ describe('failed effect reuse and successful-tick health', () => {
   test('an expired deferred row is terminal and is not sent', async () => {
     const world = makeWorld();
     seedDigestSent(world);
-    const staleThread: ThreadSnapshot = {
+    const staleThread: ListedThread = {
       ref: 'gh:thinmansoftware/bdc-xo#1501',
       priority: 'P1',
       lastActivityAt: new Date(T0 - 5 * 3_600_000).toISOString(),
       recipient: 'xo',
+      title: 'Expired deferred nudge item',
     };
     world.journal.push({
       id: 'expired-deferred-nudge',
@@ -769,7 +833,10 @@ describe('failed effect reuse and successful-tick health', () => {
 
     const result = await tick(
       createTaskmasterState(60_000),
-      makeDeps(world, { listThreads: async () => [staleThread] })
+      makeDeps(world, {
+        listThreads: async () => [staleThread],
+        getGithubIssueEvidence: async () => progressEvidence(),
+      })
     );
 
     expect(result.effects).toBe(0);
@@ -1163,18 +1230,31 @@ describe('scenario 5: budget ceiling holds', () => {
   test('25 eligible stale threads: at most 10 effects, 1 per item, remainder journaled deferred', async () => {
     const world = makeWorld();
     seedDigestSent(world);
-    const threads: ThreadSnapshot[] = Array.from({ length: 25 }, (_, i) => ({
+    // Content-complete (title + PROGRESS marker) so the composer sends -- the
+    // budget-ceiling concern is about eligible SENDS, so every thread must be
+    // eligible. Raise the adoption evidence budget so all 25 are enriched in
+    // one tick (default is 10).
+    const priorEvidenceBudget = process.env.TASKMASTER_ADOPTION_EVIDENCE_BUDGET;
+    process.env.TASKMASTER_ADOPTION_EVIDENCE_BUDGET = '30';
+    const threads: ListedThread[] = Array.from({ length: 25 }, (_, i) => ({
       ref: `gh:thinmansoftware/bdc-harness#${100 + i}`,
       priority: 'P1' as const,
       lastActivityAt: new Date(T0 - 6 * 3_600_000).toISOString(),
       recipient: 'xo',
+      title: `Budget-ceiling item ${100 + i}`,
     }));
-    const deps = makeDeps(world, { listThreads: async () => threads });
+    const deps = makeDeps(world, {
+      listThreads: async () => threads,
+      getGithubIssueEvidence: async () => progressEvidence(),
+    });
     const state = createTaskmasterState(60_000);
 
     await tick(state, deps); // observation tick
     world.nowMs += 60_000;
     const result = await tick(state, deps); // confirming tick
+
+    if (priorEvidenceBudget === undefined) delete process.env.TASKMASTER_ADOPTION_EVIDENCE_BUDGET;
+    else process.env.TASKMASTER_ADOPTION_EVIDENCE_BUDGET = priorEvidenceBudget;
 
     expect(result.effects).toBe(10);
     expect(world.sentMessages.length).toBe(10);
@@ -1858,5 +1938,77 @@ describe('adoption projection', () => {
       world.sentMessages.filter(m => m.idempotency_key.includes('deliver_ruling')).length
     ).toBe(1);
     expect(second.effects).toBe(0);
+  });
+});
+
+describe('exception-push loop integration (M-155 WO 3)', () => {
+  // Content-complete (title + PROGRESS marker via progressEvidence) so the
+  // composer actually sends; bare-stale threads are suppressed to the register.
+  const staleThread: ListedThread = {
+    ref: 'gh:thinmansoftware/bdc-harness#77',
+    priority: 'P1',
+    lastActivityAt: new Date(T0 - 6 * 3_600_000).toISOString(),
+    recipient: 'xo',
+    title: 'Exception-push integration item',
+  };
+
+  test('push: subject_key + repeat_reason satisfy the dispatch contract', async () => {
+    const world = makeWorld();
+    seedDigestSent(world);
+    const captured: Array<{ subject_key?: string | null; repeat_reason?: string | null }> = [];
+    const deps = makeDeps(world, {
+      listThreads: async () => [staleThread],
+      getGithubIssueEvidence: async () => progressEvidence(),
+      createTask: (async (data: {
+        idempotency_key: string;
+        recipient: string;
+        body: string;
+        subject_key?: string | null;
+        repeat_reason?: string | null;
+      }) => {
+        world.sentMessages.push({
+          idempotency_key: data.idempotency_key,
+          recipient: data.recipient,
+          body: data.body,
+          createdAt: new Date(world.nowMs).toISOString(),
+        });
+        captured.push({ subject_key: data.subject_key, repeat_reason: data.repeat_reason });
+        return { id: `msg-${world.sentMessages.length}`, status: 'queued' };
+      }) as unknown as TaskmasterDeps['createTask'],
+    });
+    const state = createTaskmasterState(60_000);
+    await tick(state, deps); // observe
+    world.nowMs += 60_000;
+    await tick(state, deps); // confirm + send
+
+    // The loop supplies repeat_reason unconditionally, so a repeat subject send
+    // never trips createMessage's 'repeat_reason_required' throw (dispatch.ts).
+    const nudge = captured.find(c => c.repeat_reason === 'tm:nudge:follow-up');
+    expect(nudge).toBeDefined();
+    expect(nudge?.subject_key).toBe(canonicalizeThreadRef('gh:thinmansoftware/bdc-harness#77'));
+  });
+
+  test('push: the four-verb allowlist and the budgets are untouched', () => {
+    expect(MAX_EFFECTS_PER_TICK).toBe(10);
+    expect(MAX_INTERVENTIONS_PER_ITEM_24H).toBe(3);
+    expect(TM_ALLOWED_ACTION_TYPES).toHaveLength(4);
+    expect(TM_ALLOWED_RECIPIENTS).toHaveLength(4);
+  });
+
+  test('push: the loop never resumes itself', async () => {
+    const world = makeWorld();
+    world.control = { ...world.control, pause_state: 'PAUSED', pause_scope: 'effects' };
+    seedDigestSent(world);
+    const deps = makeDeps(world, {
+      listThreads: async () => [staleThread],
+      getGithubIssueEvidence: async () => progressEvidence(),
+    });
+    const state = createTaskmasterState(60_000);
+    await tick(state, deps);
+    world.nowMs += 60_000;
+    await tick(state, deps);
+    // Un-pause is an operator action (gate G11); the loop must never write RUNNING.
+    expect(world.control.pause_state).toBe('PAUSED');
+    expect(world.sentMessages.length).toBe(0);
   });
 });

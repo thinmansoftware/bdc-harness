@@ -86,7 +86,21 @@ export function validateProposal(proposal: ActionProposal): GuardResult {
     };
   }
 
-  const normalized = proposal.body.replace(/\s+/g, ' ').trim();
+  // A composer that could not build an actionable message returns a null body
+  // (WO-HARNESS-TASKMASTER-EXCEPTION-PUSH-01). This is an ORDINARY skip -- an
+  // incomplete message is not a safety breach, so forbiddenEffect stays false
+  // and the auto-circuit (reserved for unauthorized effects) never trips.
+  const rawBody: string | null | undefined = proposal.body;
+  if (rawBody === null || rawBody === undefined) {
+    return {
+      allowed: false,
+      forbiddenEffect: false,
+      reason:
+        'content_incomplete: proposal body is null -- the composer had no title/owner/next-action to send.',
+    };
+  }
+
+  const normalized = rawBody.replace(/\s+/g, ' ').trim();
   if (normalized.length === 0) {
     return { allowed: false, reason: 'body_empty: refusing to send an empty message.' };
   }
