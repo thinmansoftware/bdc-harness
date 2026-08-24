@@ -597,18 +597,83 @@ export async function abandonAdoptionSnapshot(snapshotId: string): Promise<void>
   await getDatabase().query('DELETE FROM tm_adoption WHERE snapshot_id = $1', [snapshotId]);
 }
 
-/** Read rows from the currently committed snapshot only. */
-export async function getAdoption(_filter?: {
+export interface TmAdoptionFilter {
   priority?: string;
   owner_login?: string | null;
-}): Promise<TmAdoptionRow[]> {
+  blocked?: boolean;
+}
+
+function buildAdoptionPredicates(
+  snapshotId: string,
+  filter?: TmAdoptionFilter
+): { where: string; params: unknown[] } {
+  const predicates = ['snapshot_id = $1'];
+  const params: unknown[] = [snapshotId];
+  if (filter?.priority !== undefined) {
+    params.push(filter.priority);
+    predicates.push(`priority = $${String(params.length)}`);
+  }
+  if (filter && 'owner_login' in filter) {
+    if (filter.owner_login === null) {
+      predicates.push('owner_login IS NULL');
+    } else if (filter.owner_login !== undefined) {
+      params.push(filter.owner_login);
+      predicates.push(`owner_login = $${String(params.length)}`);
+    }
+  }
+  if (filter?.blocked !== undefined) {
+    params.push(filter.blocked ? 1 : 0);
+    predicates.push(`is_blocked = $${String(params.length)}`);
+  }
+  return { where: predicates.join(' AND '), params };
+}
+
+/** Read rows from the currently committed snapshot only. */
+export async function getAdoption(filter?: TmAdoptionFilter): Promise<TmAdoptionRow[]> {
   const meta = await getAdoptionMeta();
   if (!meta?.committed_snapshot_id) return [];
+  const { where, params } = buildAdoptionPredicates(meta.committed_snapshot_id, filter);
   const result = await getDatabase().query<TmAdoptionDbRow>(
-    'SELECT * FROM tm_adoption WHERE snapshot_id = $1 ORDER BY thread_ref ASC',
-    [meta.committed_snapshot_id]
+    `SELECT * FROM tm_adoption WHERE ${where} ORDER BY thread_ref ASC`,
+    params
   );
   return result.rows.map(normalizeAdoption);
+}
+
+/** Count rows in the committed snapshot using the same predicates as getAdoption. */
+export async function getAdoptionCount(filter?: TmAdoptionFilter): Promise<number> {
+  const meta = await getAdoptionMeta();
+  if (!meta?.committed_snapshot_id) return 0;
+  const { where, params } = buildAdoptionPredicates(meta.committed_snapshot_id, filter);
+  const result = await getDatabase().query<{ cnt: number | string }>(
+    `SELECT COUNT(*) AS cnt FROM tm_adoption WHERE ${where}`,
+    params
+  );
+  return Number(result.rows[0]?.cnt ?? 0);
+}
+
+/** Count committed rows whose GitHub evidence has not been observed yet. */
+export async function getAdoptionPartialCount(): Promise<number> {
+  const meta = await getAdoptionMeta();
+  if (!meta?.committed_snapshot_id) return 0;
+  const result = await getDatabase().query<{ cnt: number | string }>(
+    `SELECT COUNT(*) AS cnt FROM tm_adoption
+      WHERE snapshot_id = $1 AND evidence_observed_at IS NULL`,
+    [meta.committed_snapshot_id]
+  );
+  return Number(result.rows[0]?.cnt ?? 0);
+}
+
+/** Count unaddressed Taskmaster messages for XO; normalized matching intentionally scans. */
+export async function getUnaddressedXoCount(): Promise<number> {
+  // No normalized covering index exists; accept the growing-table scan for correctness.
+  const result = await getDatabase().query<{ cnt: number | string }>(
+    `SELECT COUNT(*) AS cnt FROM agent_dispatch_messages
+      WHERE LOWER(BTRIM(sender)) = 'taskmaster'
+        AND LOWER(BTRIM(recipient)) = 'xo'
+        AND addressed_at IS NULL`
+  );
+  return Number(result.rows[0]?.cnt ?? 0);
 }
 
 /** Read the singleton adoption meta row, or null if absent. */

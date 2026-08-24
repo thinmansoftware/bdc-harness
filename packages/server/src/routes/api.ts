@@ -80,7 +80,19 @@ import {
   taskmasterPauseBodySchema,
   taskmasterResumeBodySchema,
   taskmasterControlResponseSchema,
+  registerListQuerySchema,
+  registerListResponseSchema,
+  registerMetaResponseSchema,
 } from './schemas/taskmaster.schemas';
+
+const parsedRegisterStaleAfterMs = Number.parseInt(
+  process.env.TASKMASTER_REGISTER_STALE_AFTER_MS ?? '',
+  10
+);
+export const REGISTER_STALE_AFTER_MS =
+  Number.isInteger(parsedRegisterStaleAfterMs) && parsedRegisterStaleAfterMs >= 0
+    ? parsedRegisterStaleAfterMs
+    : 120_000;
 
 let providerWaitSchedulerTimer: ReturnType<typeof setInterval> | undefined;
 
@@ -2233,6 +2245,37 @@ const getTaskmasterStatusRoute = createRoute({
   },
 });
 
+const getTaskmasterRegisterRoute = createRoute({
+  method: 'get',
+  path: '/api/taskmaster/register',
+  tags: ['Taskmaster'],
+  summary: 'Read the committed Taskmaster adoption register',
+  request: { query: registerListQuerySchema },
+  responses: {
+    200: {
+      content: { 'application/json': { schema: registerListResponseSchema } },
+      description: 'Paged and filtered rows from the committed adoption snapshot',
+    },
+    401: jsonError('Missing or invalid operator token'),
+    500: jsonError('Server error'),
+  },
+});
+
+const getTaskmasterRegisterMetaRoute = createRoute({
+  method: 'get',
+  path: '/api/taskmaster/register/meta',
+  tags: ['Taskmaster'],
+  summary: 'Read Taskmaster register freshness and operator state',
+  responses: {
+    200: {
+      content: { 'application/json': { schema: registerMetaResponseSchema } },
+      description: 'Register freshness, completeness, pause state, and XO backlog',
+    },
+    401: jsonError('Missing or invalid operator token'),
+    500: jsonError('Server error'),
+  },
+});
+
 const postTaskmasterPauseRoute = createRoute({
   method: 'post',
   path: '/api/taskmaster/pause',
@@ -3157,6 +3200,69 @@ export function registerApiRoutes(
     } catch (error) {
       getLog().error({ err: error }, 'taskmaster_status_failed');
       return apiError(c, 500, 'Failed to read taskmaster status');
+    }
+  });
+
+  // GET /api/taskmaster/register - read-only adoption projection.
+  registerOpenApiRoute(getTaskmasterRegisterRoute, async c => {
+    try {
+      const query = getValidatedQuery(c, registerListQuerySchema);
+      const filter: taskmasterDb.TmAdoptionFilter = {};
+      if (query.priority !== undefined) filter.priority = query.priority;
+      if (query.owner !== undefined) {
+        filter.owner_login = query.owner === 'UNKNOWN' ? null : query.owner;
+      }
+      if (query.blocked !== undefined) filter.blocked = query.blocked === 'true';
+
+      const [allRows, total] = await Promise.all([
+        taskmasterDb.getAdoption(filter),
+        taskmasterDb.getAdoptionCount(filter),
+      ]);
+      return c.json({
+        rows: allRows.slice(query.offset, query.offset + query.limit),
+        total,
+        limit: query.limit,
+        offset: query.offset,
+      });
+    } catch (error) {
+      getLog().error({ err: error }, 'taskmaster_register_list_failed');
+      return apiError(c, 500, 'Failed to read taskmaster register');
+    }
+  });
+
+  // GET /api/taskmaster/register/meta - read-only register health.
+  registerOpenApiRoute(getTaskmasterRegisterMetaRoute, async c => {
+    try {
+      const [meta, control, partialCount, unaddressedXo] = await Promise.all([
+        taskmasterDb.getAdoptionMeta(),
+        taskmasterDb.getPauseState(),
+        taskmasterDb.getAdoptionPartialCount(),
+        // DAL uses LOWER(BTRIM(sender)) and LOWER(BTRIM(recipient)); raw matching undercounts.
+        taskmasterDb.getUnaddressedXoCount(),
+      ]);
+      const unavailable = meta?.committed_snapshot_id == null;
+      const complete = meta?.complete === 1;
+      const freshness: ('FRESH' | 'STALE' | 'PARTIAL' | 'UNAVAILABLE')[] = unavailable
+        ? ['UNAVAILABLE']
+        : [
+            complete &&
+            meta.rebuilt_at !== null &&
+            Date.now() - new Date(meta.rebuilt_at).getTime() <= REGISTER_STALE_AFTER_MS
+              ? 'FRESH'
+              : 'STALE',
+            ...(complete && partialCount > 0 ? (['PARTIAL'] as const) : []),
+          ];
+      return c.json({
+        freshness,
+        rebuilt_at: meta?.rebuilt_at ?? null,
+        row_count: meta?.row_count ?? 0,
+        partial_count: partialCount,
+        pause_state: control.pause_state,
+        unaddressed_xo: unaddressedXo,
+      });
+    } catch (error) {
+      getLog().error({ err: error }, 'taskmaster_register_meta_failed');
+      return apiError(c, 500, 'Failed to read taskmaster register metadata');
     }
   });
 
@@ -4793,6 +4899,10 @@ export function registerApiRoutes(
    */
   function getValidatedBody<T>(c: Context, _schema: z.ZodType<T, z.ZodTypeDef, unknown>): T {
     return (c.req as unknown as { valid(k: 'json'): T }).valid('json');
+  }
+
+  function getValidatedQuery<T>(c: Context, _schema: z.ZodType<T, z.ZodTypeDef, unknown>): T {
+    return (c.req as unknown as { valid(k: 'query'): T }).valid('query');
   }
 
   // Serve OpenAPI spec
