@@ -684,3 +684,56 @@ export async function getAdoptionMeta(): Promise<TmAdoptionMeta | null> {
   const row = result.rows[0];
   return row ? normalizeAdoptionMeta(row) : null;
 }
+
+// ---------------------------------------------------------------------------
+// Noise suppression (WO-HARNESS-TASKMASTER-EXCEPTION-PUSH-01, M-155 WO 3)
+// Durable standalone table -- NEVER touched by the adoption refresh cycle.
+// Storing this on tm_adoption would not work: commitAdoptionSnapshot deletes
+// every prior-snapshot row on each refresh, so the state would reset per tick.
+// ---------------------------------------------------------------------------
+
+export interface TmSuppressionRow {
+  /** Canonical thread ref (post canonicalizeThreadRef). */
+  thread_ref: string;
+  /** adoptionContentHash at the moment suppression was recorded. */
+  suppressed_until_hash: string;
+  suppressed_at: string;
+  noise_grade_count: number;
+}
+
+interface TmSuppressionDbRow extends Omit<TmSuppressionRow, 'suppressed_at' | 'noise_grade_count'> {
+  suppressed_at: string | Date;
+  noise_grade_count: number | string;
+}
+
+/** Read all suppression rows, keyed by canonical thread_ref. One read per tick. */
+export async function getSuppression(): Promise<Map<string, TmSuppressionRow>> {
+  const result = await getDatabase().query<TmSuppressionDbRow>('SELECT * FROM tm_suppression');
+  const byRef = new Map<string, TmSuppressionRow>();
+  for (const row of result.rows) {
+    byRef.set(row.thread_ref, {
+      thread_ref: row.thread_ref,
+      suppressed_until_hash: row.suppressed_until_hash,
+      suppressed_at: toIso(row.suppressed_at),
+      noise_grade_count: Number(row.noise_grade_count),
+    });
+  }
+  return byRef;
+}
+
+/** Upsert a suppression row for a canonical thread ref. */
+export async function setSuppression(threadRef: string, hash: string): Promise<void> {
+  await getDatabase().query(
+    `INSERT INTO tm_suppression (thread_ref, suppressed_until_hash, suppressed_at, noise_grade_count)
+     VALUES ($1, $2, $3, 2)
+     ON CONFLICT (thread_ref) DO UPDATE SET
+       suppressed_until_hash = EXCLUDED.suppressed_until_hash,
+       suppressed_at = EXCLUDED.suppressed_at`,
+    [threadRef, hash, new Date().toISOString()]
+  );
+}
+
+/** Delete a suppression row (suppression lift: the work moved). */
+export async function clearSuppression(threadRef: string): Promise<void> {
+  await getDatabase().query('DELETE FROM tm_suppression WHERE thread_ref = $1', [threadRef]);
+}

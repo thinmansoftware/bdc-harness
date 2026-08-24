@@ -4,6 +4,8 @@
  * fake dispatch); no mock.module.
  */
 import { afterAll, describe, expect, test } from 'bun:test';
+import { readFileSync } from 'fs';
+import { join } from 'path';
 import {
   createTaskmasterState,
   defaultGetGithubIssueEvidence,
@@ -12,12 +14,18 @@ import {
   resolveTaskmasterIntervalMs,
   refreshAdoption,
   canonicalizeThreadRef,
+  resolveRecipient,
+  MAX_EFFECTS_PER_TICK,
+  OWNER_RECIPIENT_MAP,
+  TM_REPEAT_REASON_BY_TYPE,
   type TaskmasterDeps,
   type ListedThread,
   type GithubIssueEvidence,
   type AdoptionRefreshResult,
 } from './loop';
-import type { TmAdoptionRow } from '@archon/core/db/taskmaster';
+import { validateProposal, TM_ALLOWED_ACTION_TYPES, TM_ALLOWED_RECIPIENTS } from './guard';
+import { MAX_INTERVENTIONS_PER_ITEM_24H, type ActionProposal } from './rules';
+import type { TmAdoptionRow, TmSuppressionRow } from '@archon/core/db/taskmaster';
 import type { ThreadSnapshot } from './rules';
 import type {
   TmActionOutcome,
@@ -290,20 +298,35 @@ describe('scenario 3: pause scope=effects withholds ALL effects (P0 escalation n
     world.control.pause_scope = 'effects';
     world.control.pause_actor = 'john';
 
-    const staleP1: ThreadSnapshot = {
+    const staleP1 = makeListedThread({
       ref: 'gh:thinmansoftware/bdc-harness#11',
       priority: 'P1',
       lastActivityAt: new Date(T0 - 5 * 3_600_000).toISOString(),
       recipient: 'xo',
-    };
-    const unclaimedP0: ThreadSnapshot = {
+      title: 'Stale P1 item',
+    });
+    const unclaimedP0 = makeListedThread({
       ref: 'gh:thinmansoftware/bdc-harness#12',
       priority: 'P0',
       lastActivityAt: new Date(T0 - 3_600_000).toISOString(),
       isUnclaimedP0: true,
       recipient: 'xo',
-    };
-    const deps = makeDeps(world, { listThreads: async () => [staleP1, unclaimedP0] });
+      title: 'Unclaimed P0 item',
+    });
+    const deps = makeDeps(world, {
+      listThreads: async () => [staleP1, unclaimedP0],
+      // Content-complete adoption (PROGRESS marker -> next_action) so the
+      // ordinary nudge is composed; this test is about the pause parking it.
+      getGithubIssueEvidence: async () =>
+        makeEvidence({
+          ownerLogin: 'major-build',
+          latestMarkerKind: 'PROGRESS',
+          latestMarkerText: 'waiting on review feedback',
+          latestMarkerAt: new Date(T0 - 3 * 3_600_000).toISOString(),
+          lastMovementAt: new Date(T0 - 3 * 3_600_000).toISOString(),
+          lastMovementKind: 'progress_comment',
+        }),
+    });
     const state = createTaskmasterState(60_000);
 
     // Tick 1 observes; tick 2 confirms the nudge (which then parks). The P0
@@ -712,12 +735,13 @@ describe('failed effect reuse and successful-tick health', () => {
   test('a deferred row is reused when the next tick has budget', async () => {
     const world = makeWorld();
     seedDigestSent(world);
-    const staleThread: ThreadSnapshot = {
+    const staleThread = makeListedThread({
       ref: 'gh:thinmansoftware/bdc-xo#1500',
       priority: 'P1',
       lastActivityAt: new Date(T0 - 5 * 3_600_000).toISOString(),
       recipient: 'xo',
-    };
+      title: 'Deferred stale item',
+    });
     world.journal.push({
       id: 'deferred-nudge',
       created_at: new Date(T0 - 60_000).toISOString(),
@@ -735,7 +759,18 @@ describe('failed effect reuse and successful-tick health', () => {
 
     const result = await tick(
       createTaskmasterState(60_000),
-      makeDeps(world, { listThreads: async () => [staleThread] })
+      makeDeps(world, {
+        listThreads: async () => [staleThread],
+        getGithubIssueEvidence: async () =>
+          makeEvidence({
+            ownerLogin: 'major-build',
+            latestMarkerKind: 'PROGRESS',
+            latestMarkerText: 'waiting on review feedback',
+            latestMarkerAt: new Date(T0 - 3 * 3_600_000).toISOString(),
+            lastMovementAt: new Date(T0 - 3 * 3_600_000).toISOString(),
+            lastMovementKind: 'progress_comment',
+          }),
+      })
     );
 
     expect(result.effects).toBe(1);
@@ -746,12 +781,13 @@ describe('failed effect reuse and successful-tick health', () => {
   test('an expired deferred row is terminal and is not sent', async () => {
     const world = makeWorld();
     seedDigestSent(world);
-    const staleThread: ThreadSnapshot = {
+    const staleThread = makeListedThread({
       ref: 'gh:thinmansoftware/bdc-xo#1501',
       priority: 'P1',
       lastActivityAt: new Date(T0 - 5 * 3_600_000).toISOString(),
       recipient: 'xo',
-    };
+      title: 'Expired deferred item',
+    });
     world.journal.push({
       id: 'expired-deferred-nudge',
       created_at: new Date(T0 - 60_000).toISOString(),
@@ -769,7 +805,18 @@ describe('failed effect reuse and successful-tick health', () => {
 
     const result = await tick(
       createTaskmasterState(60_000),
-      makeDeps(world, { listThreads: async () => [staleThread] })
+      makeDeps(world, {
+        listThreads: async () => [staleThread],
+        getGithubIssueEvidence: async () =>
+          makeEvidence({
+            ownerLogin: 'major-build',
+            latestMarkerKind: 'PROGRESS',
+            latestMarkerText: 'waiting on review feedback',
+            latestMarkerAt: new Date(T0 - 3 * 3_600_000).toISOString(),
+            lastMovementAt: new Date(T0 - 3 * 3_600_000).toISOString(),
+            lastMovementKind: 'progress_comment',
+          }),
+      })
     );
 
     expect(result.effects).toBe(0);
@@ -1163,18 +1210,43 @@ describe('scenario 5: budget ceiling holds', () => {
   test('25 eligible stale threads: at most 10 effects, 1 per item, remainder journaled deferred', async () => {
     const world = makeWorld();
     seedDigestSent(world);
-    const threads: ThreadSnapshot[] = Array.from({ length: 25 }, (_, i) => ({
-      ref: `gh:thinmansoftware/bdc-harness#${100 + i}`,
-      priority: 'P1' as const,
-      lastActivityAt: new Date(T0 - 6 * 3_600_000).toISOString(),
-      recipient: 'xo',
-    }));
-    const deps = makeDeps(world, { listThreads: async () => threads });
+    const threads = Array.from({ length: 25 }, (_, i) =>
+      makeListedThread({
+        ref: `gh:thinmansoftware/bdc-harness#${100 + i}`,
+        priority: 'P1',
+        lastActivityAt: new Date(T0 - 6 * 3_600_000).toISOString(),
+        recipient: 'xo',
+        title: `Stale item ${100 + i}`,
+      })
+    );
+    const deps = makeDeps(world, {
+      listThreads: async () => threads,
+      // Content-complete adoption for every thread so all 25 nudges compose;
+      // this test is about the EFFECT budget (10/tick), so the adoption
+      // evidence budget is raised to cover the full set in one tick.
+      getGithubIssueEvidence: async () =>
+        makeEvidence({
+          ownerLogin: 'major-build',
+          latestMarkerKind: 'PROGRESS',
+          latestMarkerText: 'waiting on review feedback',
+          latestMarkerAt: new Date(T0 - 3 * 3_600_000).toISOString(),
+          lastMovementAt: new Date(T0 - 3 * 3_600_000).toISOString(),
+          lastMovementKind: 'progress_comment',
+        }),
+    });
     const state = createTaskmasterState(60_000);
 
-    await tick(state, deps); // observation tick
-    world.nowMs += 60_000;
-    const result = await tick(state, deps); // confirming tick
+    const priorBudget = process.env.TASKMASTER_ADOPTION_EVIDENCE_BUDGET;
+    process.env.TASKMASTER_ADOPTION_EVIDENCE_BUDGET = '25';
+    let result;
+    try {
+      await tick(state, deps); // observation tick
+      world.nowMs += 60_000;
+      result = await tick(state, deps); // confirming tick
+    } finally {
+      if (priorBudget === undefined) delete process.env.TASKMASTER_ADOPTION_EVIDENCE_BUDGET;
+      else process.env.TASKMASTER_ADOPTION_EVIDENCE_BUDGET = priorBudget;
+    }
 
     expect(result.effects).toBe(10);
     expect(world.sentMessages.length).toBe(10);
@@ -1858,5 +1930,254 @@ describe('adoption projection', () => {
       world.sentMessages.filter(m => m.idempotency_key.includes('deliver_ruling')).length
     ).toBe(1);
     expect(second.effects).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// M-155 WO 3 (WO-HARNESS-TASKMASTER-EXCEPTION-PUSH-01) -- exception push:
+// recipient routing stub, noise-suppression wiring, dispatch metadata,
+// safety-spine regression. Every test name carries the literal 'push:'.
+// ---------------------------------------------------------------------------
+
+describe('M-155 exception push (loop)', () => {
+  /** Content-complete evidence: PROGRESS marker becomes next_action in adoption. */
+  function contentEvidence(markerText: string, movedAtMs: number): GithubIssueEvidence {
+    return makeEvidence({
+      ownerLogin: 'major-build',
+      latestMarkerKind: 'PROGRESS',
+      latestMarkerText: markerText,
+      latestMarkerAt: new Date(movedAtMs).toISOString(),
+      lastMovementAt: new Date(movedAtMs).toISOString(),
+      lastMovementKind: 'progress_comment',
+      progressRecordedAt: null,
+    });
+  }
+
+  function suppressionDb(
+    world: FakeWorld,
+    store: Map<string, TmSuppressionRow>
+  ): TaskmasterDeps['db'] {
+    const base = makeDeps(world).db;
+    return {
+      ...base,
+      getSuppression: async (): Promise<Map<string, TmSuppressionRow>> => new Map(store),
+      setSuppression: async (threadRef: string, hash: string): Promise<void> => {
+        store.set(threadRef, {
+          thread_ref: threadRef,
+          suppressed_until_hash: hash,
+          suppressed_at: new Date(world.nowMs).toISOString(),
+          noise_grade_count: 2,
+        });
+      },
+      clearSuppression: async (threadRef: string): Promise<void> => {
+        store.delete(threadRef);
+      },
+    } as TaskmasterDeps['db'];
+  }
+
+  test('push: every owner resolves to xo in THIS WO (routing stub validation)', () => {
+    // Only 'xo' (XO session-start reflex) and 'operator' (John) have a
+    // documented drainer; routing to any other mailbox would manufacture a
+    // second dead-letter box -- the failure this WO exists to end.
+    for (const owner of ['major-build', 'captain-ci', 'unmapped-login', null]) {
+      const resolved = resolveRecipient(owner);
+      expect(resolved).toBe('xo');
+      expect(TM_ALLOWED_RECIPIENTS).toContain(resolved);
+    }
+    // The map structure exists and every entry points at 'xo', so widening it
+    // later is a data change rather than a code change.
+    expect(Object.keys(OWNER_RECIPIENT_MAP).length).toBeGreaterThan(0);
+    for (const target of Object.values(OWNER_RECIPIENT_MAP)) {
+      expect(target).toBe('xo');
+    }
+  });
+
+  test('push: content_incomplete is an ordinary reject, never a HARD_PAUSE', async () => {
+    // Guard half: a proposal flagged content-incomplete (or with a null body)
+    // is rejected with the ORDINARY content_incomplete reason -- forbiddenEffect
+    // stays falsy, so the auto-circuit cannot trip.
+    const base: ActionProposal = {
+      type: 'nudge',
+      threadRef: 'gh:thinmansoftware/bdc-xo#930',
+      recipient: 'xo',
+      body: 'placeholder',
+      idempotencyKey: 'tm:nudge:gh:thinmansoftware/bdc-xo#930:1',
+      actsImmediately: false,
+    };
+    const flagged = validateProposal({ ...base, contentIncomplete: true });
+    expect(flagged.allowed).toBe(false);
+    expect(flagged.reason).toContain('content_incomplete');
+    expect(flagged.forbiddenEffect).toBeFalsy();
+    const nullBody = validateProposal({ ...base, body: null as unknown as string });
+    expect(nullBody.allowed).toBe(false);
+    expect(nullBody.reason).toContain('content_incomplete');
+    expect(nullBody.forbiddenEffect).toBeFalsy();
+
+    // Loop half: an ordinary (non-forbiddenEffect) guard rejection flowing
+    // through a real tick is journaled 'rejected' and leaves tm_control
+    // untouched -- no auto-circuit, no HARD_PAUSE.
+    const world = makeWorld();
+    seedDigestSent(world);
+    const ref = 'gh:thinmansoftware/bdc-xo#931';
+    const thread = makeListedThread({
+      ref,
+      title: 'Content-rejected item',
+      lastActivityAt: new Date(T0 - 6 * 3_600_000).toISOString(),
+    });
+    const deps = makeDeps(world, {
+      listThreads: async () => [thread],
+      // The composed next action carries a forbidden verb, so the guard
+      // rejects the content (ordinary reject path, same as content_incomplete).
+      getGithubIssueEvidence: async () =>
+        contentEvidence('[PROGRESS] deploy to production now', T0 - 3 * 3_600_000),
+    });
+    const state = createTaskmasterState(60_000);
+    await tick(state, deps); // observation tick
+    world.nowMs += 60_000;
+    const result = await tick(state, deps); // confirming tick -> guard reject
+
+    expect(result.rejected).toBe(1);
+    const rejected = world.journal.filter(j => j.thread_ref === ref && j.outcome === 'rejected');
+    expect(rejected.length).toBe(1);
+    expect(rejected[0]?.proposal_json).toContain('spend_send_deploy_verb_rejected');
+    expect(world.sentMessages.filter(m => m.idempotency_key.startsWith('tm:nudge:'))).toHaveLength(
+      0
+    );
+    // The pause matrix is untouched: still RUNNING, no auto-circuit actor.
+    expect(world.control.pause_state).toBe('RUNNING');
+    expect(world.control.pause_actor).toBeNull();
+  });
+
+  test('push: subject_key + repeat_reason satisfy the dispatch contract (loop side)', async () => {
+    const world = makeWorld();
+    seedDigestSent(world);
+    // Old-org ref proves the subject_key is CANONICALIZED before dispatch.
+    const rawRef = 'gh:bluedevilcollectibles/bdc-xo#911';
+    const canonRef = canonicalizeThreadRef(rawRef);
+    const thread = makeListedThread({
+      ref: rawRef,
+      title: 'Cross-era subject',
+      lastActivityAt: new Date(T0 - 6 * 3_600_000).toISOString(),
+    });
+    const captured: Array<Record<string, unknown>> = [];
+    const deps = makeDeps(world, {
+      listThreads: async () => [thread],
+      getGithubIssueEvidence: async () =>
+        contentEvidence('[PROGRESS] waiting on review feedback', T0 - 3 * 3_600_000),
+      createTask: (async (data: Record<string, unknown>) => {
+        captured.push(data);
+        world.sentMessages.push({
+          idempotency_key: String(data.idempotency_key),
+          recipient: String(data.recipient),
+          body: String(data.body),
+          createdAt: new Date(world.nowMs).toISOString(),
+        });
+        return { id: `msg-${captured.length}`, status: 'queued' };
+      }) as unknown as TaskmasterDeps['createTask'],
+    });
+    const state = createTaskmasterState(60_000);
+    await tick(state, deps); // observation
+    world.nowMs += 60_000;
+    await tick(state, deps); // confirm + send
+
+    const nudgeCall = captured.find(c => String(c.idempotency_key).startsWith('tm:nudge:'));
+    expect(nudgeCall).toBeDefined();
+    // Loop supplies subject_key (canonical) + the per-verb repeat_reason
+    // literal UNCONDITIONALLY, so the migration-042 repeat_reason_required
+    // throw can never fire on the real send path (DB-level throw behavior is
+    // proven in packages/core/src/db/taskmaster.test.ts push: coverage).
+    expect(nudgeCall?.subject_key).toBe(canonRef);
+    expect(nudgeCall?.repeat_reason).toBe('tm:nudge:follow-up');
+    expect(TM_REPEAT_REASON_BY_TYPE.escalate_p0).toBe('tm:escalate_p0:repeated');
+    expect(TM_REPEAT_REASON_BY_TYPE.deliver_ruling).toBe('tm:deliver_ruling:repeated');
+    expect(String(nudgeCall?.body)).toContain('Cross-era subject');
+  });
+
+  test('push: two consecutive noise grades suppress until content changes (loop wiring)', async () => {
+    const world = makeWorld();
+    seedDigestSent(world);
+    const ref = 'gh:thinmansoftware/bdc-xo#910';
+    // Two prior sends, both GRADED noise (created within 24h; budget 3 not hit).
+    for (const [idx, gradedAt] of [T0 - 2 * 3_600_000, T0 - 3_600_000].entries()) {
+      world.journal.push({
+        id: `noise-${idx}`,
+        created_at: new Date(T0 - 12 * 3_600_000).toISOString(),
+        thread_ref: ref,
+        action_type: 'nudge',
+        proposal_json: '{}',
+        idempotency_key: `tm:nudge:${ref}:old${idx}`,
+        before_hash: null,
+        proof_predicate: null,
+        proof_deadline_at: null,
+        outcome: 'sent',
+        graded_at: new Date(gradedAt).toISOString(),
+        grade: 'noise',
+      });
+    }
+    const thread = makeListedThread({
+      ref,
+      title: 'Chronic but titled',
+      lastActivityAt: new Date(T0 - 6 * 3_600_000).toISOString(),
+    });
+    // Movement OLDER than the later noise grade: content unchanged since.
+    let evidence = contentEvidence('[PROGRESS] waiting on review', T0 - 3 * 24 * 3_600_000);
+    const suppStore = new Map<string, TmSuppressionRow>();
+    const deps = makeDeps(world, {
+      listThreads: async () => [thread],
+      getGithubIssueEvidence: async () => evidence,
+    });
+    deps.db = suppressionDb(world, suppStore);
+    const state = createTaskmasterState(60_000);
+
+    await tick(state, deps);
+    world.nowMs += 60_000;
+    await tick(state, deps);
+
+    // A durable tm_suppression row was written and no nudge left the process.
+    expect(suppStore.has(ref)).toBe(true);
+    expect(world.sentMessages.filter(m => m.idempotency_key.startsWith('tm:nudge:'))).toHaveLength(
+      0
+    );
+
+    // The work moves: next_action + last_movement_at change -> hash differs ->
+    // suppression lifts (row deleted) and the nudge sends after re-confirm.
+    evidence = contentEvidence('[PROGRESS] waiting on John decision', T0 - 30 * 60_000);
+    world.nowMs += 60_000;
+    await tick(state, deps); // lift + observation
+    expect(suppStore.has(ref)).toBe(false);
+    world.nowMs += 60_000;
+    await tick(state, deps); // confirm + send
+
+    const nudges = world.sentMessages.filter(m => m.idempotency_key.startsWith('tm:nudge:'));
+    expect(nudges).toHaveLength(1);
+    expect(nudges[0]?.body).toContain('waiting on John decision');
+    expect(nudges[0]?.body).toContain('Chronic but titled');
+  });
+
+  test('push: the four-verb allowlist and the budgets are untouched (regression)', () => {
+    expect(MAX_INTERVENTIONS_PER_ITEM_24H).toBe(3);
+    expect(MAX_EFFECTS_PER_TICK).toBe(10);
+    expect([...TM_ALLOWED_ACTION_TYPES]).toEqual([
+      'deliver_ruling',
+      'nudge',
+      'escalate_p0',
+      'digest',
+    ]);
+    expect([...TM_ALLOWED_RECIPIENTS]).toEqual(['xo', 'major-build', 'captain-ci', 'operator']);
+  });
+
+  test('push: the loop never resumes itself -- no setPauseState RUNNING write', () => {
+    // Source assertion: every setPauseState call site in the taskmaster server
+    // source writes a pause, never 'RUNNING'. Un-pause is an operator action
+    // at M-155 gate G11, never a code path. Reads/comparisons of 'RUNNING'
+    // are legitimate and remain.
+    for (const file of ['loop.ts', 'rules.ts', 'guard.ts']) {
+      const source = readFileSync(join(import.meta.dir, file), 'utf8');
+      const callSites = source.split('setPauseState(').slice(1);
+      for (const site of callSites) {
+        expect(site.slice(0, 300)).not.toContain("'RUNNING'");
+      }
+      expect(/pause_state:\s*'RUNNING'/.test(source)).toBe(false);
+    }
   });
 });

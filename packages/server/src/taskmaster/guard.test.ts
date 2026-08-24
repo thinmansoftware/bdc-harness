@@ -7,7 +7,13 @@ function proposal(overrides: Partial<ActionProposal> = {}): ActionProposal {
     type: 'nudge',
     threadRef: 'gh:thinmansoftware/bdc-harness#7',
     recipient: 'xo',
-    body: 'Nudge: please post a status update on this thread.',
+    // Content-complete per the M-155 WO 3 structural contract: quoted title,
+    // owner slot, next-action clause (what composeNudgeBody produces).
+    body:
+      'Nudge (P1): "Fix the export mapper" -- owner: major-build. ' +
+      'Next action: rerun the failing export suite. Last movement 5h ago. ' +
+      'https://github.com/thinmansoftware/bdc-harness/issues/7 Reply on the issue ' +
+      'starting with [PROGRESS] or [BLOCKED] so the source-of-truth change can be verified.',
     idempotencyKey: 'tm:nudge:gh:thinmansoftware/bdc-harness#7:100',
     actsImmediately: false,
     ...overrides,
@@ -56,6 +62,34 @@ describe('validateProposal', () => {
     const result = validateProposal(proposal({ body: '   ' }));
     expect(result.allowed).toBe(false);
     expect(result.reason).toContain('body_empty');
+  });
+
+  test('push: a nudge body missing title, owner, or blocker/next-action is content_incomplete', () => {
+    const incompleteBodies = [
+      // The old contentless-reminder shape: no quoted title, no owner, no why.
+      'Nudge: gh:thinmansoftware/bdc-harness#7 (P1) looks idle past its 240min clock. Please post a status update.',
+      // Title but no owner slot and no blocker/next-action clause.
+      'Nudge (P1): "Fix the export mapper" looks idle. Please post a status update.',
+      // Title + owner but no blocker/next-action clause.
+      'Nudge (P1): "Fix the export mapper" -- owner: major-build. Please post a status update.',
+      // Owner + why but no quoted title.
+      'Nudge (P1): item -- owner: major-build. Next action: rerun the failing export suite.',
+    ];
+    for (const body of incompleteBodies) {
+      const result = validateProposal(proposal({ body }));
+      expect(result.allowed).toBe(false);
+      expect(result.reason).toContain('content_incomplete');
+      // Ordinary reject: never trips the HARD_PAUSE circuit.
+      expect(result.forbiddenEffect).toBeUndefined();
+    }
+    // The structural check applies to nudges only: content-exempt verbs
+    // (deliver_ruling, escalate_p0, digest) pass with a plain body.
+    for (const type of ['deliver_ruling', 'escalate_p0', 'digest'] as const) {
+      expect(
+        validateProposal(proposal({ type, body: 'Governance fact: ruling-42 is undelivered.' }))
+          .allowed
+      ).toBe(true);
+    }
   });
 
   test('spend/send/deploy verbs in the body are rejected (ported DO guard)', () => {

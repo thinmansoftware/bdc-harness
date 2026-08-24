@@ -11,11 +11,15 @@ mock.module('./connection', () => ({
   getDatabase: () => db,
 }));
 
+import { createMessage } from './dispatch';
 import {
   abandonAdoptionSnapshot,
   beginAdoptionSnapshot,
+  clearSuppression,
   commitAdoptionSnapshot,
   expireParkedActions,
+  getSuppression,
+  setSuppression,
   getActionByIdempotencyKey,
   getActionsSince,
   getAdoption,
@@ -541,5 +545,87 @@ describe('tm_adoption DAL', () => {
     }
     // snapshot_id differs by construction
     expect(second[0].snapshot_id).not.toBe(first[0].snapshot_id);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// M-155 WO 3 (WO-HARNESS-TASKMASTER-EXCEPTION-PUSH-01) -- durable noise
+// suppression + dispatch same-subject contract, against the REAL SQLite
+// schema (fresh DB per test). Test names carry the literal 'push:'.
+// ---------------------------------------------------------------------------
+
+describe('tm_suppression DAL (M-155 exception push)', () => {
+  test('push: suppression survives an adoption snapshot refresh', async () => {
+    const ref = 'gh:thinmansoftware/bdc-xo#77';
+    await setSuppression(ref, 'hash-a');
+
+    // Full adoption refresh cycle #1.
+    const first = await beginAdoptionSnapshot();
+    await upsertAdoptionRow(first, baseAdoptionRow({ thread_ref: ref, title: 'Chronic' }));
+    await commitAdoptionSnapshot(first);
+
+    // Full adoption refresh cycle #2: executes
+    // `DELETE FROM tm_adoption WHERE snapshot_id <> $1` -- the exact statement
+    // that would have erased a suppression column stored on tm_adoption.
+    const second = await beginAdoptionSnapshot();
+    await upsertAdoptionRow(second, baseAdoptionRow({ thread_ref: ref, title: 'Chronic' }));
+    await commitAdoptionSnapshot(second);
+
+    // The durable tm_suppression row still exists and still applies.
+    const suppression = await getSuppression();
+    expect(suppression.get(ref)?.suppressed_until_hash).toBe('hash-a');
+    expect(suppression.get(ref)?.noise_grade_count).toBe(2);
+
+    // Upsert overwrites the hash; clear deletes the row (suppression lift).
+    await setSuppression(ref, 'hash-b');
+    expect((await getSuppression()).get(ref)?.suppressed_until_hash).toBe('hash-b');
+    await clearSuppression(ref);
+    expect((await getSuppression()).size).toBe(0);
+  });
+
+  test('push: subject_key + repeat_reason satisfy the dispatch contract', async () => {
+    const subject = 'gh:thinmansoftware/bdc-xo#88';
+    const first = await createMessage({
+      correlation_id: 'tm-push-1',
+      idempotency_key: 'tm:nudge:gh:thinmansoftware/bdc-xo#88:1',
+      task_type: 'agent_message',
+      sender: 'taskmaster',
+      recipient: 'xo',
+      body: 'first nudge on the subject',
+      subject_key: subject,
+    });
+    // A prior message on the subject becomes handled (addressed).
+    await db.query(
+      'UPDATE agent_dispatch_messages SET addressed_at = $1, addressed_by = $2 WHERE id = $3',
+      [new Date().toISOString(), 'xo', first.id]
+    );
+
+    // migration 042 behavior: a repeat on a handled subject WITHOUT a
+    // repeat_reason throws.
+    await expect(
+      createMessage({
+        correlation_id: 'tm-push-2',
+        idempotency_key: 'tm:nudge:gh:thinmansoftware/bdc-xo#88:2',
+        task_type: 'agent_message',
+        sender: 'taskmaster',
+        recipient: 'xo',
+        body: 'repeat without a reason',
+        subject_key: subject,
+      })
+    ).rejects.toThrow('repeat_reason_required');
+
+    // The loop supplies the per-verb literal unconditionally, so the real
+    // send path does NOT throw (loop-side proof in loop.test.ts push: tests).
+    const repeat = await createMessage({
+      correlation_id: 'tm-push-3',
+      idempotency_key: 'tm:nudge:gh:thinmansoftware/bdc-xo#88:3',
+      task_type: 'agent_message',
+      sender: 'taskmaster',
+      recipient: 'xo',
+      body: 'repeat with the taskmaster follow-up reason',
+      subject_key: subject,
+      repeat_reason: 'tm:nudge:follow-up',
+    });
+    expect(repeat.repeat_reason).toBe('tm:nudge:follow-up');
   });
 });
