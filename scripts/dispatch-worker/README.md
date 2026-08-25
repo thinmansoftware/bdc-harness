@@ -159,15 +159,16 @@ Run focused proof with:
 bun test ./scripts/dispatch-worker/stdin-prompt.test.ts ./scripts/dispatch-worker/acp/kill-tree.test.ts ./scripts/dispatch-worker/acp/session.test.ts ./scripts/dispatch-worker/mcp/session.test.ts ./scripts/dispatch-worker/outcome-transcript.test.ts
 ```
 
-# M-131 server seats (Phase A: bdc-seat-grok)
+# M-131 server seats (Phase A/B)
 
 A "seat" is an isolated, single-provider server instance of this worker
 (M-131 board compute plane). Setting `"seat"` in the worker config (default
 `"seat": null` = not a seat) turns on the seat contract:
 
 - **Identity + concurrency one**: `seat.seat_id` names the seat (e.g.
-  `bdc-seat-grok`). A seat has exactly one provider in
-  `seat.provider_allowlist` (Phase A: a Grok adapter, `grok-acp` preferred).
+  `bdc-seat-grok`). `seat.model_family` selects `grok`, `codex`, or `claude`
+  (omitting it preserves the Phase A Grok behavior). A seat has exactly one
+  provider in `seat.provider_allowlist`, and that provider must match its family.
   The agent registry is restricted to that allowlist and advertised
   capabilities list only those providers plus `seat_id` and `build_sha`.
 - **Preflight gates advertisement**: before registering, polling, or
@@ -203,6 +204,19 @@ A "seat" is an isolated, single-provider server instance of this worker
 
 Packaging lives in `deploy/m131-seat/` (Dockerfile, compose example, seat
 config example, container-contract test).
+
+The packaged seats and their required read-only credential ingress are:
+
+- `bdc-seat-grok`: Grok adapter; `/run/m131/secret-ingress/grok-credential.json`.
+- `bdc-seat-codex`: CLI `codex` adapter; `/run/m131/secret-ingress/codex-credential.json`.
+- `bdc-seat-claude`: CLI `claude` adapter; `/run/m131/secret-ingress/claude-credential.json`.
+
+Each seat runs the same preflight command: `bun run
+scripts/dispatch-worker/seat-preflight.ts --config /app/config/seat.json`.
+Codex MCP and Claude ACP remain dark and subject to the separate conformance
+promotion gate above; Phase B packages only the plain CLI adapters. The host
+source paths supplying these credential ingress files must be verified during
+the separately gated deployment and are not established by these examples.
 
 **Rollback**: a seat is rollback-safe by construction -- stop the seat
 container (or set `"seat": null` and restart for a non-container worker) and

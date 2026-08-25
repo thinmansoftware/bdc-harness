@@ -1,0 +1,22 @@
+{
+  "worker_id": "bdc-seat-codex",
+  "host": "bdc-seat-codex",
+  "server_url": "http://archon-app-1:3090",
+  "operator_token_env": "ARCHON_OPERATOR_TOKEN",
+  "operator_token_file": "/run/m131/operator-token/archon-operator-token",
+  "poll_interval_ms": 5000,
+  "heartbeat_interval_ms": 30000,
+  "lease_duration_ms": 300000,
+  "max_concurrency": {
+    "codex": 1
+  },
+  "seat": {
+    "seat_id": "bdc-seat-codex",
+    "model_family": "codex",
+    "provider_allowlist": ["codex"],
+    "secret_ingress_file": "/run/m131/secret-ingress/codex-credential.json",
+    "vendor_profile_dir": "/home/seat/.codex",
+    "state_dir": "/var/lib/bdc-seat",
+    "build_sha_env": "SEAT_BUILD_SHA"
+  }
+}
