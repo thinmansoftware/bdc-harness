@@ -334,18 +334,33 @@ describe('createRealFindPullRequest rate-limit load profile', () => {
   });
 
   test('403 rate limit starts a process-wide backoff and logs only once in the window', async () => {
+    let limited = true;
     const list = mock(async () => {
-      throw Object.assign(new Error('API rate limit exceeded for installation'), {
-        status: 403,
-        response: { headers: { 'x-ratelimit-remaining': '0' } },
-      });
+      if (limited) {
+        throw Object.assign(new Error('API rate limit exceeded for installation'), {
+          status: 403,
+          response: { headers: { 'x-ratelimit-remaining': '0' } },
+        });
+      }
+      return {
+        data: [
+          {
+            number: 42,
+            title: 'WO-RATE-LIMIT-01',
+            state: 'open',
+            html_url: 'https://github.test/pull/42',
+            head: { sha: 'a'.repeat(40) },
+          },
+        ],
+      };
     });
     const octokit = octokitWithReview(async () => ({ data: { id: 1, state: 'APPROVED' } }));
     octokit.pulls.list = list;
     const warnings: string[] = [];
     const errors: string[] = [];
+    let now = 1_000;
     const find = createRealFindPullRequest(octokit, {
-      now: () => 1_000,
+      now: () => now,
       logger: {
         warn: (_obj, msg) => warnings.push(msg),
         error: (_obj, msg) => errors.push(msg),
@@ -366,5 +381,90 @@ describe('createRealFindPullRequest rate-limit load profile', () => {
     expect(list).toHaveBeenCalledTimes(1);
     expect(warnings).toEqual(['overseer.github_real_deps.rate_limit_backoff']);
     expect(errors).toEqual([]);
+
+    // Once the window expires, a successful lookup clears the process-wide
+    // state. Moving the injected clock back inside the old window proves the
+    // next call is no longer suppressed by stale backoff state.
+    now = 61_000;
+    limited = false;
+    expect((await find(input)).exists).toBe(true);
+    now = 1_001;
+    expect((await find(input)).exists).toBe(true);
+    expect(list).toHaveBeenCalledTimes(3);
+  });
+
+  test('message-only 403 is classified as a rate limit', async () => {
+    const octokit = octokitWithReview(async () => ({ data: { id: 1, state: 'APPROVED' } }));
+    octokit.pulls.list = mock(async () => {
+      throw Object.assign(new Error('secondary rate limit exceeded'), { status: 403 });
+    });
+    const warnings: string[] = [];
+    const errors: string[] = [];
+
+    const result = await createRealFindPullRequest(octokit, {
+      now: () => 100_000,
+      logger: {
+        warn: (_obj, msg) => warnings.push(msg),
+        error: (_obj, msg) => errors.push(msg),
+      },
+    })({ owner: 'thinmansoftware', repo: 'bdc-harness', headBranch: 'fix/message-only' });
+
+    expect(result.lookupFailed).toBe(true);
+    expect(warnings).toEqual(['overseer.github_real_deps.rate_limit_backoff']);
+    expect(errors).toEqual([]);
+  });
+
+  test('non-rate-limit 403 logs an error and does not enter backoff', async () => {
+    const list = mock(async () => {
+      throw Object.assign(new Error('Resource not accessible by integration'), { status: 403 });
+    });
+    const octokit = octokitWithReview(async () => ({ data: { id: 1, state: 'APPROVED' } }));
+    octokit.pulls.list = list;
+    const warnings: string[] = [];
+    const errors: string[] = [];
+    const find = createRealFindPullRequest(octokit, {
+      now: () => 200_000,
+      logger: {
+        warn: (_obj, msg) => warnings.push(msg),
+        error: (_obj, msg) => errors.push(msg),
+      },
+    });
+    const input = { owner: 'thinmansoftware', repo: 'bdc-harness', headBranch: 'fix/forbidden' };
+
+    await find(input);
+    await find(input);
+
+    expect(list).toHaveBeenCalledTimes(2);
+    expect(warnings).toEqual([]);
+    expect(errors).toEqual([
+      'overseer.github_real_deps.find_pull_request_failed',
+      'overseer.github_real_deps.find_pull_request_failed',
+    ]);
+  });
+
+  test('a successful missing result clears expired rate-limit backoff state', async () => {
+    let limited = true;
+    let now = 300_000;
+    const list = mock(async () => {
+      if (limited) {
+        throw Object.assign(new Error('rate limit exceeded'), { status: 403 });
+      }
+      return { data: [] };
+    });
+    const octokit = octokitWithReview(async () => ({ data: { id: 1, state: 'APPROVED' } }));
+    octokit.pulls.list = list;
+    const find = createRealFindPullRequest(octokit, {
+      now: () => now,
+      logger: { warn: () => {}, error: () => {} },
+    });
+    const input = { owner: 'thinmansoftware', repo: 'bdc-harness', headBranch: 'fix/missing' };
+
+    expect((await find(input)).lookupFailed).toBe(true);
+    now = 360_000;
+    limited = false;
+    expect((await find(input)).state).toBe('missing');
+    now = 300_001;
+    expect((await find(input)).state).toBe('missing');
+    expect(list).toHaveBeenCalledTimes(3);
   });
 });

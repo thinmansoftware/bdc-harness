@@ -1,5 +1,9 @@
 import { describe, expect, test } from 'bun:test';
-import { watchOnce } from '../watch.ts';
+import {
+  DEFAULT_WATCH_MAX_RUNS_PER_TICK,
+  resolveWatchMaxRunsPerTick,
+  watchOnce,
+} from '../watch.ts';
 import type { GitHubClientDeps, OverseerRunStoreDeps, PullRequestEvidence } from '../types.ts';
 
 const greenPr: PullRequestEvidence = {
@@ -36,6 +40,17 @@ function deps(evidence: PullRequestEvidence): OverseerRunStoreDeps & GitHubClien
 }
 
 describe('watch', () => {
+  test.each([undefined, '', '   ', '0', '-1', '1.5', 'nope'])(
+    'invalid max-runs value %p falls back to the production default',
+    raw => {
+      expect(resolveWatchMaxRunsPerTick(raw)).toBe(DEFAULT_WATCH_MAX_RUNS_PER_TICK);
+    }
+  );
+
+  test('positive safe integer max-runs value is accepted', () => {
+    expect(resolveWatchMaxRunsPerTick('37')).toBe(37);
+  });
+
   test('tail-node false-fail is classified as merge_ready by PR evidence', async () => {
     const [record] = await watchOnce(deps(greenPr));
     expect(record.action).toBe('merge_ready');
@@ -87,6 +102,10 @@ describe('watch', () => {
 
     expect(outcomes.map(outcome => outcome.runId)).toEqual(['oldest', 'middle']);
     expect(visited).toEqual(['fix/oldest', 'fix/middle']);
+
+    const nextOutcomes = await watchOnce(boundedDeps, { maxRunsPerTick: 2 });
+    expect(nextOutcomes.map(outcome => outcome.runId)).toEqual(['newest']);
+    expect(visited).toEqual(['fix/oldest', 'fix/middle', 'fix/newest']);
   });
 });
 
