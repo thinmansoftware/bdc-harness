@@ -112,6 +112,12 @@ describe('merge manager', () => {
     const mergePullRequest = mock(async () => ({ merged: false }));
     const manager = createMergeManager({
       mode: 'execute',
+      mutationsEnabled: true,
+      allowedBases: ['dev', 'staging'],
+      reviewGateLogin: 'thinman-review-gate[bot]',
+      listPullRequestReviews: async () => [
+        { login: 'thinman-review-gate[bot]', state: 'APPROVED', commitId: RUN_HEAD_SHA },
+      ],
       assembleEvidence: async () => ({ evidence: assembled, evidenceDigest: 'c'.repeat(64) }),
       judge,
       execute,
@@ -128,7 +134,10 @@ describe('merge manager', () => {
     expect(execute).toHaveBeenCalledWith(assembled);
     expect(mergePullRequest).not.toHaveBeenCalled();
     expect(insertOverseerAction).toHaveBeenCalledWith(
-      expect.objectContaining({ action: 'merged', result: 'fake_merge_accepted' })
+      expect.objectContaining({
+        action: 'merged',
+        result: expect.stringContaining('fake_merge_accepted'),
+      })
     );
   });
 
@@ -368,6 +377,12 @@ describe('merge manager', () => {
     const execute = mock(async () => ({ merged: true }));
     const manager = createMergeManager({
       mode: 'execute',
+      mutationsEnabled: true,
+      allowedBases: ['dev', 'staging'],
+      reviewGateLogin: 'thinman-review-gate[bot]',
+      listPullRequestReviews: async () => [
+        { login: 'thinman-review-gate[bot]', state: 'APPROVED', commitId: RUN_HEAD_SHA },
+      ],
       judge,
       execute,
       insertOverseerAction,
@@ -406,6 +421,12 @@ describe('merge manager', () => {
     const execute = mock(async () => ({ merged: true, message: 'other_repo_merged' }));
     const manager = createMergeManager({
       mode: 'execute',
+      mutationsEnabled: true,
+      allowedBases: ['dev', 'staging'],
+      reviewGateLogin: 'thinman-review-gate[bot]',
+      listPullRequestReviews: async () => [
+        { login: 'thinman-review-gate[bot]', state: 'APPROVED', commitId: RUN_HEAD_SHA },
+      ],
       assembleEvidence: async () => ({
         evidence: evidence({
           record: otherRecord,
@@ -428,8 +449,117 @@ describe('merge manager', () => {
     expect(result.status).toBe('executed');
     expect(execute).toHaveBeenCalledTimes(1);
     expect(insertOverseerAction).toHaveBeenCalledWith(
-      expect.objectContaining({ action: 'merged', result: 'other_repo_merged' })
+      expect.objectContaining({
+        action: 'merged',
+        result: expect.stringContaining('other_repo_merged'),
+      })
     );
+  });
+
+  describe('mutation activation preconditions', () => {
+    function activatedManager(
+      options: {
+        assembled?: QualifiedMergeEvidence;
+        reviews?: { login: string; state: string; commitId: string }[];
+        mutationsEnabled?: boolean;
+      } = {}
+    ) {
+      const assembled = options.assembled ?? evidence({ resulting_deployment_effect: 'none' });
+      const insertOverseerAction = mock(async () => undefined);
+      const mergePullRequest = mock(async () => ({
+        merged: true,
+        message: 'github_merge_accepted',
+        sha: 'd'.repeat(40),
+      }));
+      const manager = createMergeManager({
+        mode: 'execute',
+        mutationsEnabled: options.mutationsEnabled ?? true,
+        allowedBases: ['dev', 'staging'],
+        reviewGateLogin: 'thinman-review-gate[bot]',
+        assembleEvidence: async () => ({ evidence: assembled, evidenceDigest: '9'.repeat(64) }),
+        judge: async input => approveReceipt(input),
+        insertOverseerAction,
+        findPullRequest: async () => record.prEvidence,
+        mergePullRequest,
+        listPullRequestReviews: async () =>
+          options.reviews ?? [
+            { login: 'thinman-review-gate[bot]', state: 'APPROVED', commitId: RUN_HEAD_SHA },
+          ],
+        readWorktreeHeadSha,
+      });
+      return { manager, mergePullRequest, insertOverseerAction };
+    }
+
+    test('merges once and truthfully journals mutation and merged SHA', async () => {
+      const { manager, mergePullRequest, insertOverseerAction } = activatedManager();
+      const result = await manager(record);
+
+      expect(result.status).toBe('executed');
+      expect(mergePullRequest).toHaveBeenCalledTimes(1);
+      const mergedAction = insertOverseerAction.mock.calls.find(
+        call => call[0].action === 'merged'
+      );
+      expect(mergedAction).toBeDefined();
+      expect(JSON.parse(mergedAction![0].result)).toMatchObject({
+        mutation_sent: true,
+        merged_sha: 'd'.repeat(40),
+      });
+    });
+
+    test('denies when Review Gate approval is absent', async () => {
+      const { manager, mergePullRequest, insertOverseerAction } = activatedManager({ reviews: [] });
+      const result = await manager(record);
+
+      expect(result).toMatchObject({
+        status: 'held',
+        reason: 'review_gate_approval_missing_for_head',
+      });
+      expect(mergePullRequest).not.toHaveBeenCalled();
+      expect(insertOverseerAction).toHaveBeenCalledWith(
+        expect.objectContaining({
+          action: 'merge_denied',
+          result: expect.stringContaining('review_gate_approval_missing_for_head'),
+        })
+      );
+    });
+
+    test('denies a stale approval bound to an older head SHA', async () => {
+      const { manager, mergePullRequest } = activatedManager({
+        reviews: [
+          { login: 'thinman-review-gate[bot]', state: 'APPROVED', commitId: '0'.repeat(40) },
+        ],
+      });
+      const result = await manager(record);
+
+      expect(result).toMatchObject({
+        status: 'held',
+        reason: 'review_gate_approval_missing_for_head',
+      });
+      expect(mergePullRequest).not.toHaveBeenCalled();
+    });
+
+    test('denies production base even when checks and approval are green', async () => {
+      const { manager, mergePullRequest } = activatedManager({
+        assembled: evidence({ base_branch: 'master', resulting_deployment_effect: 'none' }),
+      });
+      const result = await manager(record);
+
+      expect(result).toMatchObject({ status: 'held', reason: 'base_branch_not_allowed' });
+      expect(mergePullRequest).not.toHaveBeenCalled();
+    });
+
+    test('flag off preserves verdict-only behavior without a mutation', async () => {
+      const { manager, mergePullRequest, insertOverseerAction } = activatedManager({
+        mutationsEnabled: false,
+      });
+      const result = await manager(record);
+
+      expect(result).toMatchObject({ status: 'held', reason: 'mutations_disabled' });
+      expect(mergePullRequest).not.toHaveBeenCalled();
+      expect(insertOverseerAction).not.toHaveBeenCalledWith(
+        expect.objectContaining({ action: 'merged' })
+      );
+    });
   });
 
   test('provenance hold short-circuits before comment/merge in all modes', async () => {
