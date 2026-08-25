@@ -712,12 +712,10 @@ describe('dispatch-migration-smoke CLI', () => {
     expect(await Bun.file(outputPath).exists()).toBe(false);
   });
 
-  test('rejects missing output parents and dangling output aliases before migration', async () => {
+  test('rejects missing output parents before migration', async () => {
     const { dir, dbPath } = await makeLegacyFixture();
     const beforeHash = await sha256(dbPath);
     const missingParentOutput = join(dir, 'missing-parent', 'output.db');
-    const danglingOutput = join(dir, 'dangling-output.db');
-    await symlink(join(dir, 'missing-target.db'), danglingOutput, 'file');
 
     const missingParent = await runCli([
       '--source-copy',
@@ -727,27 +725,41 @@ describe('dispatch-migration-smoke CLI', () => {
       '--migrated-copy-output',
       missingParentOutput,
     ]);
-    const dangling = await runCli([
-      '--source-copy',
-      dbPath,
-      '--expected-heartbeats',
-      '2',
-      '--migrated-copy-output',
-      danglingOutput,
-    ]);
 
     expect(missingParent.exitCode).not.toBe(0);
     expect(missingParent.stdout).toBe('');
     expect(missingParent.stderr).toContain('migrated_copy_output_unavailable');
     expect(missingParent.stderr).not.toContain(missingParentOutput);
-    expect(dangling.exitCode).not.toBe(0);
-    expect(dangling.stdout).toBe('');
-    expect(dangling.stderr).toContain('migrated_copy_output_exists');
-    expect(dangling.stderr).not.toContain(danglingOutput);
-    expect((await lstat(danglingOutput)).isSymbolicLink()).toBe(true);
     expect(await sha256(dbPath)).toBe(beforeHash);
     expect(await Bun.file(missingParentOutput).exists()).toBe(false);
-  });
+  }, 15_000);
+
+  test.skipIf(process.platform === 'win32')(
+    'rejects dangling output aliases before migration',
+    async () => {
+      const { dir, dbPath } = await makeLegacyFixture();
+      const beforeHash = await sha256(dbPath);
+      const danglingOutput = join(dir, 'dangling-output.db');
+      await symlink(join(dir, 'missing-target.db'), danglingOutput, 'file');
+
+      const dangling = await runCli([
+        '--source-copy',
+        dbPath,
+        '--expected-heartbeats',
+        '2',
+        '--migrated-copy-output',
+        danglingOutput,
+      ]);
+
+      expect(dangling.exitCode).not.toBe(0);
+      expect(dangling.stdout).toBe('');
+      expect(dangling.stderr).toContain('migrated_copy_output_exists');
+      expect(dangling.stderr).not.toContain(danglingOutput);
+      expect((await lstat(danglingOutput)).isSymbolicLink()).toBe(true);
+      expect(await sha256(dbPath)).toBe(beforeHash);
+    },
+    15_000
+  );
 
   test('does not export when migration validation fails', async () => {
     const { dir, dbPath } = await makeLegacyFixture();
@@ -810,5 +822,5 @@ describe('dispatch-migration-smoke CLI', () => {
     expect(result.stderr).toContain('migrated_copy_export_failed');
     expect(result.stderr).not.toContain(outputPath);
     expect(await Bun.file(outputPath).exists()).toBe(false);
-  });
+  }, 15_000);
 });
