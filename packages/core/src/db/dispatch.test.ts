@@ -34,6 +34,7 @@ import {
   renewMessageLease,
   resolveDispatchRecipient,
   assessDispatchRecipient,
+  normalizeDispatchSubjectKey,
 } from './dispatch';
 
 function cleanupDb(path: string): void {
@@ -1614,6 +1615,39 @@ describe('dispatch db', () => {
     expect(matching[0]?.correlation_id).toBe(source.correlation_id);
     expect(matching[0]?.body).toBe(
       JSON.stringify({ source_id: source.id, kind: 'xo_escalation_handoff' })
+    );
+  });
+});
+
+describe('normalizeDispatchSubjectKey', () => {
+  test('accepts and canonicalizes gh refs', () => {
+    expect(normalizeDispatchSubjectKey('gh:ThinmanSoftware/BDC-XO#1745')).toBe(
+      'gh:thinmansoftware/bdc-xo#1745'
+    );
+  });
+
+  test('accepts wo refs', () => {
+    expect(normalizeDispatchSubjectKey('wo:WO-HARNESS-TASKMASTER-FIRE-VERB-01')).toBe(
+      'wo:WO-HARNESS-TASKMASTER-FIRE-VERB-01'
+    );
+  });
+
+  test('REGRESSION: accepts taskmaster daily digest refs', () => {
+    // The M-129-era shape hardening forgot digest threads; every digest send
+    // failed from 2026-08-25T00:00 (one failed effect per tick, health
+    // DEGRADED). digest:YYYY-MM-DD is a first-class shape.
+    expect(normalizeDispatchSubjectKey('digest:2026-08-25')).toBe('digest:2026-08-25');
+  });
+
+  test('rejects malformed digest and garbage shapes', () => {
+    expect(() => normalizeDispatchSubjectKey('digest:2026-8-25')).toThrow(
+      'dispatch_subject_key_invalid:shape'
+    );
+    expect(() => normalizeDispatchSubjectKey('digest:tomorrow')).toThrow(
+      'dispatch_subject_key_invalid:shape'
+    );
+    expect(() => normalizeDispatchSubjectKey('random:thing')).toThrow(
+      'dispatch_subject_key_invalid:shape'
     );
   });
 });

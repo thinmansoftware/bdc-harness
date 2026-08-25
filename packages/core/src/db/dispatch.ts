@@ -174,6 +174,12 @@ export function normalizeDispatchSubjectKey(value: string): string {
   if (value !== value.trim()) throw new Error('dispatch_subject_key_invalid:whitespace');
   const wo = /^wo:(WO-[A-Z0-9]+(?:-[A-Z0-9]+)*)$/.exec(value);
   if (wo) return `wo:${wo[1]}`;
+  // Taskmaster daily digest threads are dated, not GitHub-backed. The shape
+  // hardening (M-129 era) forgot them, which silently killed every digest
+  // send from 2026-08-25T00:00 onward -- one failed effect per tick, tick
+  // health pinned DEGRADED. Bounded shape: digest:YYYY-MM-DD only.
+  const digest = /^digest:(\d{4}-\d{2}-\d{2})$/.exec(value);
+  if (digest) return `digest:${digest[1]}`;
   const gh =
     /^gh:([A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?)\/([A-Za-z0-9_.-]+)#([1-9][0-9]*)$/.exec(value);
   const owner = gh?.[1];
