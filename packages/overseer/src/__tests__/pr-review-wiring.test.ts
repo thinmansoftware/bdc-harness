@@ -27,14 +27,44 @@ describe('resolveReviewRouteConfig -- fail closed', () => {
     });
   });
 
+  test('uses explicit values from the app env when provided', () => {
+    const config = resolveReviewRouteConfig({
+      [REVIEW_WEBHOOK_SECRET_ENV]: 'secret-value',
+      [REVIEW_REVIEWER_IDENTITY_ENV]: 'thinman-overseer[bot]',
+      MERGE_MANAGER_REVIEW_GATE_LOGIN: 'alt-reviewer-bot',
+      WEBHOOK_SECRET: 'fallback-secret',
+    });
+    expect(config).toEqual({
+      webhookSecret: 'secret-value',
+      reviewerIdentity: 'thinman-overseer[bot]',
+    });
+  });
+
+  test('falls back to WEBHOOK_SECRET and MERGE_MANAGER_REVIEW_GATE_LOGIN when review vars are absent', () => {
+    const config = resolveReviewRouteConfig({
+      WEBHOOK_SECRET: 'webhook-fallback',
+      MERGE_MANAGER_REVIEW_GATE_LOGIN: 'merge-gate-reviewer',
+    });
+    expect(config).toEqual({
+      webhookSecret: 'webhook-fallback',
+      reviewerIdentity: 'merge-gate-reviewer',
+    });
+  });
+
+  test('falls back to thinman-overseer[bot] when only webhook secret is present', () => {
+    const config = resolveReviewRouteConfig({
+      [REVIEW_WEBHOOK_SECRET_ENV]: 'secret-value',
+    });
+    expect(config).toEqual({
+      webhookSecret: 'secret-value',
+      reviewerIdentity: 'thinman-overseer[bot]',
+    });
+  });
+
   test('returns null when the webhook secret is absent', () => {
     expect(
       resolveReviewRouteConfig({ [REVIEW_REVIEWER_IDENTITY_ENV]: 'thinman-overseer[bot]' })
     ).toBeNull();
-  });
-
-  test('returns null when the reviewer identity is absent', () => {
-    expect(resolveReviewRouteConfig({ [REVIEW_WEBHOOK_SECRET_ENV]: 'secret-value' })).toBeNull();
   });
 
   test('returns null on an empty environment (default is OFF, not open)', () => {

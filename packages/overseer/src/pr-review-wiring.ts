@@ -22,6 +22,9 @@ import type { IngestDeps, PriorReviewWork } from './pr-review-ingest.ts';
 export const REVIEW_WEBHOOK_SECRET_ENV = 'OVERSEER_REVIEW_WEBHOOK_SECRET';
 /** Env var naming the reviewer bot identity, e.g. 'thinman-overseer[bot]'. */
 export const REVIEW_REVIEWER_IDENTITY_ENV = 'OVERSEER_REVIEW_IDENTITY';
+const REVIEW_WEBHOOK_SECRET_FALLBACK_ENV = 'WEBHOOK_SECRET';
+const REVIEW_REVIEWER_IDENTITY_FALLBACK_ENV = 'MERGE_MANAGER_REVIEW_GATE_LOGIN';
+const REVIEW_REVIEWER_IDENTITY_DEFAULT = 'thinman-overseer[bot]';
 
 /** Dispatch principal that owns queued review work. */
 export const REVIEW_SENDER = 'overseer-review-route';
@@ -40,8 +43,12 @@ export interface ReviewRouteConfig {
 export function resolveReviewRouteConfig(
   env: Record<string, string | undefined> = process.env
 ): ReviewRouteConfig | null {
-  const webhookSecret = env[REVIEW_WEBHOOK_SECRET_ENV]?.trim() ?? '';
-  const reviewerIdentity = env[REVIEW_REVIEWER_IDENTITY_ENV]?.trim() ?? '';
+  const webhookSecret =
+    env[REVIEW_WEBHOOK_SECRET_ENV]?.trim() ?? env[REVIEW_WEBHOOK_SECRET_FALLBACK_ENV]?.trim() ?? '';
+  const reviewerIdentity =
+    env[REVIEW_REVIEWER_IDENTITY_ENV]?.trim() ??
+    env[REVIEW_REVIEWER_IDENTITY_FALLBACK_ENV]?.trim() ??
+    REVIEW_REVIEWER_IDENTITY_DEFAULT;
   if (!webhookSecret || !reviewerIdentity) return null;
   return { webhookSecret, reviewerIdentity };
 }
