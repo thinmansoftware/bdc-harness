@@ -1,6 +1,6 @@
 /**
  * Seat preflight -- deterministic, injectable validation for an isolated
- * server seat (M-131 Phase A, WO-HARNESS-M131-PHASE-A-GROK-SEAT-PROOF-01).
+ * server seat (M-131 Phase A/B).
  *
  * A seat-configured worker MUST pass this preflight before it advertises,
  * polls, or claims any Dispatch work. Every failure is a typed, sanitized
@@ -19,9 +19,11 @@ import { defaultAgentConfigs } from './adapters';
 export interface SeatConfig {
   /** Stable seat identity, e.g. 'bdc-seat-grok'. */
   seat_id: string;
+  /** Model family served by this seat. Omitted Phase A configs default to Grok. */
+  model_family?: 'grok' | 'codex' | 'claude';
   /**
-   * Providers this seat may advertise and run. Phase A seats are
-   * single-provider: exactly one entry, and it must be a Grok adapter.
+   * Providers this seat may advertise and run. Seats are single-provider:
+   * exactly one entry, and it must match the configured model family.
    */
   provider_allowlist: string[];
   /**
@@ -85,6 +87,8 @@ export function isSameOrNested(a: string, b: string): boolean {
 export type SeatPreflightErrorCode =
   | 'seat_config_invalid'
   | 'seat_provider_not_grok'
+  | 'seat_provider_not_codex'
+  | 'seat_provider_not_claude'
   | 'seat_provider_command_unavailable'
   | 'seat_secret_ingress_missing'
   | 'seat_vendor_profile_dir_invalid'
@@ -99,15 +103,26 @@ export type SeatPreflightResult =
 
 export const DEFAULT_BUILD_SHA_ENV = 'SEAT_BUILD_SHA';
 
-/** Adapter names this Phase A seat accepts (Grok only, ACP preferred). */
-const GROK_ADAPTERS = new Set(['grok-acp', 'grok']);
+type ModelFamily = NonNullable<SeatConfig['model_family']>;
+
+const FAMILY_ADAPTERS: Record<ModelFamily, ReadonlySet<string>> = {
+  grok: new Set(['grok-acp', 'grok']),
+  codex: new Set(['codex']),
+  claude: new Set(['claude']),
+};
+
+const FAMILY_ERROR_CODE: Record<ModelFamily, SeatPreflightErrorCode> = {
+  grok: 'seat_provider_not_grok',
+  codex: 'seat_provider_not_codex',
+  claude: 'seat_provider_not_claude',
+};
 
 function fail(code: SeatPreflightErrorCode, field: string): SeatPreflightResult {
   return { ok: false, code, field };
 }
 
 /**
- * Validates seat identity, Grok-only provider restriction, provider command
+ * Validates seat identity, model-family provider restriction, provider command
  * availability, secret-ingress presence, profile/state isolation, and build
  * SHA visibility. Returns a typed result; never throws for validation
  * failures and never includes path values or file contents in the result.
@@ -123,9 +138,13 @@ export async function runSeatPreflight(
   if (!Array.isArray(seat.provider_allowlist) || seat.provider_allowlist.length !== 1) {
     return fail('seat_config_invalid', 'provider_allowlist');
   }
+  const modelFamily = seat.model_family ?? 'grok';
+  if (!Object.hasOwn(FAMILY_ADAPTERS, modelFamily)) {
+    return fail('seat_config_invalid', 'model_family');
+  }
   const provider = seat.provider_allowlist[0];
-  if (provider === undefined || !GROK_ADAPTERS.has(provider)) {
-    return fail('seat_provider_not_grok', 'provider_allowlist');
+  if (provider === undefined || !FAMILY_ADAPTERS[modelFamily].has(provider)) {
+    return fail(FAMILY_ERROR_CODE[modelFamily], 'provider_allowlist');
   }
   const command = agentCommands[provider];
   if (!command) {

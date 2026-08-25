@@ -19,7 +19,25 @@ const GOOD_SEAT: SeatConfig = {
   state_dir: '/var/lib/bdc-seat-grok',
 };
 
-const COMMANDS = { 'grok-acp': 'grok', grok: 'grok', claude: 'claude' };
+const GOOD_SEAT_CODEX: SeatConfig = {
+  seat_id: 'bdc-seat-codex',
+  model_family: 'codex',
+  provider_allowlist: ['codex'],
+  secret_ingress_file: '/run/m131/secret-ingress/codex-credential.json',
+  vendor_profile_dir: '/home/seat/.codex',
+  state_dir: '/var/lib/bdc-seat-codex',
+};
+
+const GOOD_SEAT_CLAUDE: SeatConfig = {
+  seat_id: 'bdc-seat-claude',
+  model_family: 'claude',
+  provider_allowlist: ['claude'],
+  secret_ingress_file: '/run/m131/secret-ingress/claude-credential.json',
+  vendor_profile_dir: '/home/seat/.claude',
+  state_dir: '/var/lib/bdc-seat-claude',
+};
+
+const COMMANDS = { 'grok-acp': 'grok', grok: 'grok', codex: 'codex', claude: 'claude' };
 
 function fakeDeps(overrides: Partial<SeatPreflightDeps> = {}): SeatPreflightDeps {
   return {
@@ -259,4 +277,73 @@ describe('runSeatPreflight', () => {
       expect(serialized).not.toContain('credential');
     }
   });
+});
+
+describe('runSeatPreflight model families', () => {
+  test.each([
+    [GOOD_SEAT_CODEX, 'bdc-seat-codex', 'codex'],
+    [GOOD_SEAT_CLAUDE, 'bdc-seat-claude', 'claude'],
+  ] as const)('passes the configured family for %s', async (seat, seatId, provider) => {
+    const result = await runSeatPreflight(seat, COMMANDS, fakeDeps());
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.seatId).toBe(seatId);
+      expect(result.providers).toEqual([provider]);
+    }
+  });
+
+  test.each([
+    [GOOD_SEAT_CODEX, 'claude', 'seat_provider_not_codex'],
+    [GOOD_SEAT_CLAUDE, 'codex', 'seat_provider_not_claude'],
+  ] as const)('rejects a cross-family provider for %s', async (seat, provider, code) => {
+    const result = await runSeatPreflight(
+      { ...seat, provider_allowlist: [provider] },
+      COMMANDS,
+      fakeDeps()
+    );
+    expect(result).toEqual({ ok: false, code, field: 'provider_allowlist' });
+  });
+
+  test('defaults an omitted model_family to Grok for Phase A compatibility', async () => {
+    const result = await runSeatPreflight(
+      { ...GOOD_SEAT, provider_allowlist: ['claude'] },
+      COMMANDS,
+      fakeDeps()
+    );
+    expect(result).toEqual({
+      ok: false,
+      code: 'seat_provider_not_grok',
+      field: 'provider_allowlist',
+    });
+  });
+
+  test('rejects an unknown model_family as invalid configuration', async () => {
+    const seat = { ...GOOD_SEAT, model_family: 'other' } as unknown as SeatConfig;
+    const result = await runSeatPreflight(seat, COMMANDS, fakeDeps());
+    expect(result).toEqual({ ok: false, code: 'seat_config_invalid', field: 'model_family' });
+  });
+
+  test.each([GOOD_SEAT_CODEX, GOOD_SEAT_CLAUDE])(
+    'fails closed before execution when auth is missing for %s',
+    async seat => {
+      let commandChecked = false;
+      const result = await runSeatPreflight(
+        seat,
+        COMMANDS,
+        fakeDeps({
+          commandAvailable: async () => {
+            commandChecked = true;
+            return true;
+          },
+          isFile: async () => false,
+        })
+      );
+      expect(commandChecked).toBe(true);
+      expect(result).toEqual({
+        ok: false,
+        code: 'seat_secret_ingress_missing',
+        field: 'secret_ingress_file',
+      });
+    }
+  );
 });
