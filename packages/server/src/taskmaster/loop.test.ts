@@ -998,7 +998,7 @@ describe('scenario 4: restart produces no double effect', () => {
     expect(world.sentMessages.length).toBe(0);
   });
 
-  test('legacy null-principal taskmaster effect reconciles pending journal to sent', async () => {
+  test('legacy null-principal taskmaster effect cannot reconcile a pending journal', async () => {
     const world = makeWorld();
     seedDigestSent(world);
     const key = 'tm:nudge:gh:thinmansoftware/bdc-xo#129:1';
@@ -1021,15 +1021,17 @@ describe('scenario 4: restart produces no double effect', () => {
       defaultFindEffectByIdempotencyKey(effectKey, async (sql, params) => {
         queries.push(sql);
         if (params[0] !== key) return { rows: [] };
-        return {
-          rows: [
-            {
-              id: 'legacy-taskmaster-dispatch',
-              status: 'queued',
-              created_at: new Date(T0 - 30_000).toISOString(),
-            },
-          ],
-        };
+        return sql.includes('sender_principal_id IS NULL')
+          ? {
+              rows: [
+                {
+                  id: 'legacy-taskmaster-dispatch',
+                  status: 'queued',
+                  created_at: new Date(T0 - 30_000).toISOString(),
+                },
+              ],
+            }
+          : { rows: [] };
       });
     const state = createTaskmasterState(60_000);
 
@@ -1044,10 +1046,10 @@ describe('scenario 4: restart produces no double effect', () => {
     );
 
     expect(world.journal.find(row => row.id === 'journal-legacy-taskmaster-effect')?.outcome).toBe(
-      'sent'
+      'expired'
     );
-    expect(queries[0]).toContain('sender_principal_id IS NULL');
-    expect(queries[0]).toContain("LOWER(TRIM(sender)) = 'taskmaster'");
+    expect(queries[0]).toContain("sender_principal_id = 'system:taskmaster'");
+    expect(queries[0]).not.toContain('sender_principal_id IS NULL');
   });
 });
 

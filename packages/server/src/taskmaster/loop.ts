@@ -204,9 +204,7 @@ export async function defaultFindEffectByIdempotencyKey(
   const result = await query(
     `SELECT id, status, created_at FROM agent_dispatch_messages
      WHERE idempotency_key = $1
-       AND (sender_principal_id = 'system:taskmaster'
-         OR (sender_principal_id IS NULL AND LOWER(TRIM(sender)) = 'taskmaster'))
-     ORDER BY CASE WHEN sender_principal_id = 'system:taskmaster' THEN 0 ELSE 1 END
+       AND sender_principal_id = 'system:taskmaster'
      LIMIT 1`,
     [key]
   );

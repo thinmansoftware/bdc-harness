@@ -46,7 +46,7 @@ mock.module('@archon/core/db/dispatch', () => ({
 
 const { tickDispatchEscalationClock } = await import('./escalation-clock');
 
-function setSenderAuthMode(mode: 'enforce'): void {
+function setSenderAuthMode(mode: 'off' | 'warn' | 'enforce'): void {
   process.env.DISPATCH_SENDER_AUTH_MODE = mode;
 }
 
@@ -70,10 +70,23 @@ describe('dispatch escalation clock', () => {
     delete process.env.DISPATCH_SMS_ENABLED;
   });
 
-  test('reconciles and creates internal handoffs while John-facing legs stay dark', async () => {
+  test.each(['off', 'warn'] as const)(
+    'is a complete no-op while sender auth mode is %s',
+    async mode => {
+      setSenderAuthMode(mode);
+      await tickDispatchEscalationClock();
+      expect(calls.notices).toBe(0);
+      expect(calls.handoffs).toBe(0);
+      expect(calls.list).toBe(0);
+      expect(calls.claim).toBe(0);
+    }
+  );
+
+  test('is a complete no-op when sender auth mode is unset', async () => {
     await tickDispatchEscalationClock();
-    expect(calls.notices).toBe(1);
-    expect(calls.handoffs).toBe(1);
+    expect(calls.notices).toBe(0);
+    expect(calls.handoffs).toBe(0);
+    expect(calls.list).toBe(0);
     expect(calls.claim).toBe(0);
   });
 

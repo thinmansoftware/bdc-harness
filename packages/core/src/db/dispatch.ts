@@ -423,21 +423,6 @@ async function findIdempotentMessage(
   idempotencyKey: string,
   bound: { sender: string; sender_principal_id: string | null }
 ): Promise<QueryResult<CompatibleDispatchMessageRow>> {
-  const fixedSystemPrincipal = `system:${bound.sender}`;
-  if (
-    bound.sender_principal_id === fixedSystemPrincipal &&
-    (bound.sender === 'dispatch' || bound.sender === 'overseer' || bound.sender === 'taskmaster')
-  ) {
-    return query<CompatibleDispatchMessageRow>(
-      `SELECT * FROM agent_dispatch_messages
-       WHERE idempotency_key = $1
-         AND (sender_principal_id = $2
-           OR (sender_principal_id IS NULL AND LOWER(TRIM(sender)) = $3))
-       ORDER BY CASE WHEN sender_principal_id = $2 THEN 0 ELSE 1 END
-       LIMIT 1`,
-      [idempotencyKey, fixedSystemPrincipal, bound.sender]
-    );
-  }
   return query<CompatibleDispatchMessageRow>(
     bound.sender_principal_id === null
       ? `SELECT * FROM agent_dispatch_messages

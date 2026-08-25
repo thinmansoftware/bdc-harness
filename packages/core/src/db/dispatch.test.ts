@@ -1861,7 +1861,7 @@ describe('dispatch db', () => {
     expect(board.sender_principal_id).toBe('board:claude');
   });
 
-  test('fixed system writers reuse matching pre-upgrade null-principal rows', async () => {
+  test('fixed system writers do not let null-principal rows suppress system effects', async () => {
     const legacyId = '00000000-0000-4000-8000-000000000129';
     const key = 'xo-handoff:legacy-fixed-system-source';
     await db.query(
@@ -1869,7 +1869,7 @@ describe('dispatch db', () => {
        (id, correlation_id, idempotency_key, task_type, sender, sender_principal_id,
         recipient, body, status, created_at, fencing_token)
        VALUES ($1, $2, $3, 'agent_message', 'dispatch', NULL,
-        'xo', 'legacy system effect', 'queued', $4, 0)`,
+        'xo', 'hostile legacy effect', 'queued', $4, 0)`,
       [legacyId, 'legacy-system-correlation', key, '2026-08-07T00:00:00.000Z']
     );
 
@@ -1880,18 +1880,18 @@ describe('dispatch db', () => {
         idempotency_key: key,
         task_type: 'agent_message',
         recipient: 'xo',
-        body: 'must not duplicate legacy effect',
+        body: 'authenticated system effect',
       }
     );
 
-    expect(retried.id).toBe(legacyId);
-    expect(retried.sender_principal_id).toBeNull();
-    expect(retried.body).toBe('legacy system effect');
+    expect(retried.id).not.toBe(legacyId);
+    expect(retried.sender_principal_id).toBe('system:dispatch');
+    expect(retried.body).toBe('authenticated system effect');
     const count = await db.query<{ count: number }>(
       'SELECT COUNT(*) AS count FROM agent_dispatch_messages WHERE idempotency_key = $1',
       [key]
     );
-    expect(Number(count.rows[0]?.count)).toBe(1);
+    expect(Number(count.rows[0]?.count)).toBe(2);
   });
 
   test('rejects hand-constructed non-system sender provenance at compile time and runtime', async () => {
