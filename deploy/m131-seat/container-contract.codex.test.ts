@@ -63,7 +63,7 @@ describe('m131 Codex seat container contract', () => {
 
   test('no literal secret in Codex seat packaging', () => {
     const content = [dockerfile, composeRaw, JSON.stringify(seatConfig)].join('\n');
-    expect(content).not.toMatch(/xai-[A-Za-z0-9]{10,}|sk-[A-Za-z0-9]{10,}|AKIA[0-9A-Z]{16}/);
+    expect(content).not.toMatch(/xai-[A-Za-z0-9]{10,}|sk-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}/);
     expect(content).not.toMatch(/-----BEGIN [A-Z ]*PRIVATE KEY-----/);
   });
 });
