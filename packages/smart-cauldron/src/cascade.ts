@@ -255,16 +255,36 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
   const premiumTiers = loadPremiumTiers();
 
   // Conductor: pick entry tier (ruleset), or honor explicit --entry override
-  const entryTierName = entryOverride ?? pickEntryTier({ woClass, tags }, ruleset);
+  let entryTierName = entryOverride ?? pickEntryTier({ woClass, tags }, ruleset);
 
-  // Dark/retired lanes are never live entry points (even under --entry).
+  // Dark/retired lanes are never live entry points. An explicit --entry onto a
+  // refused tier is an operator error and throws; a RULESET pick that lands on a
+  // refused tier promotes up the ladder to the first non-refused tier (the entry
+  // floor -- John 2026-08-25: OpenRouter rungs defunded, codex is the floor).
   if (refusedTiers.includes(entryTierName)) {
-    throw new Error(
-      `[smart-cauldron/cascade] Refused dark/retired entry tier "${entryTierName}". ` +
-        'This lane is listed in refusedTiers and cannot be selected as a live entry point. ' +
-        `Canonical ladder: ${tiers.map(t => t.name).join(' -> ')}. ` +
-        `Refused: ${refusedTiers.join(', ')}`
+    if (entryOverride) {
+      throw new Error(
+        `[smart-cauldron/cascade] Refused dark/retired entry tier "${entryTierName}". ` +
+          'This lane is listed in refusedTiers and cannot be selected as a live entry point. ' +
+          `Canonical ladder: ${tiers.map(t => t.name).join(' -> ')}. ` +
+          `Refused: ${refusedTiers.join(', ')}`
+      );
+    }
+    const pickedIndex = tiers.findIndex(t => t.name === entryTierName);
+    const promoted = tiers
+      .slice(pickedIndex === -1 ? 0 : pickedIndex)
+      .find(t => !refusedTiers.includes(t.name));
+    if (!promoted) {
+      throw new Error(
+        `[smart-cauldron/cascade] Ruleset picked refused tier "${entryTierName}" and no ` +
+          `non-refused tier exists above it. Refused: ${refusedTiers.join(', ')}`
+      );
+    }
+    console.log(
+      `[smart-cauldron] Entry tier "${entryTierName}" is refused; promoting entry to ` +
+        `"${promoted.name}" (entry floor)`
     );
+    entryTierName = promoted.name;
   }
 
   let currentIndex = tiers.findIndex(t => t.name === entryTierName);
@@ -559,8 +579,14 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
         return true;
       }
 
-      // Climb to next tier
+      // Climb to next tier, skipping refused (dark/retired) rungs
       currentIndex++;
+      while (currentIndex < tiers.length && refusedTiers.includes(tiers[currentIndex].name)) {
+        console.log(
+          `[smart-cauldron] Skipping refused tier "${tiers[currentIndex].name}" during climb`
+        );
+        currentIndex++;
+      }
       climbCount++;
 
       if (currentIndex >= tiers.length) {
