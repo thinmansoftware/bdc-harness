@@ -220,6 +220,16 @@ describe('PostgresAdapter', () => {
         ['john', 'John', 'notify_only', 'FALSE'],
         ['merge-manager', 'Merge Manager', 'notify_only', 'FALSE'],
       ] as const;
+      // WO-HARNESS-OVERSEER-REVIEW-ROUTE-01 (migration 043): principals added
+      // by a LATER migration than 040. 000_combined.sql is cumulative across
+      // all migrations, so it legitimately carries these in addition to the
+      // Phase 0 set; migration 040 itself must not, or this migration's own
+      // history would be rewritten. Checked only against `combined` below,
+      // never against `migration` (040).
+      const laterMigrationPrincipals = [
+        ['overseer-reviewer', 'Overseer PR Reviewer', 'worker_poll', 'TRUE'],
+        ['overseer-review-route', 'Overseer Review Route', 'notify_only', 'TRUE'],
+      ] as const;
 
       for (const schema of [migration, combined]) {
         const normalizedSchema = schema.replace(/\s+/g, ' ');
@@ -233,7 +243,21 @@ describe('PostgresAdapter', () => {
         const actualKnownPrincipals = [
           ...(knownSeedBlock?.matchAll(/\('([^']+)', '([^']+)', '([^']+)', (TRUE|FALSE)\)/g) ?? []),
         ].map(match => match.slice(1));
-        expect(actualKnownPrincipals).toEqual(knownPrincipals.map(principal => [...principal]));
+        // `combined` is cumulative across every migration and legitimately
+        // carries principals seeded after 040; strip them before comparing
+        // against the Phase-0-era expected list.
+        const laterKeys = new Set(laterMigrationPrincipals.map(row => row[0]));
+        const phase0OnlyPrincipals = actualKnownPrincipals.filter(row => !laterKeys.has(row[0]));
+        expect(phase0OnlyPrincipals).toEqual(knownPrincipals.map(principal => [...principal]));
+        if (schema === combined) {
+          for (const row of laterMigrationPrincipals) {
+            expect(actualKnownPrincipals).toContainEqual([...row]);
+          }
+        } else {
+          for (const row of laterMigrationPrincipals) {
+            expect(actualKnownPrincipals).not.toContainEqual([...row]);
+          }
+        }
         expect(normalizedSchema).toContain(
           "INSERT INTO dispatch_principals (principal_id, display_name, delivery_mode, active) SELECT DISTINCT LOWER(BTRIM(recipient)), LOWER(BTRIM(recipient)), 'drain_on_start', TRUE FROM agent_dispatch_messages WHERE BTRIM(recipient) <> '' ON CONFLICT (principal_id) DO NOTHING;"
         );
