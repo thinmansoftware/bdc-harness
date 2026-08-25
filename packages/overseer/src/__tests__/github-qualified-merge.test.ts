@@ -250,7 +250,11 @@ describe('real GitHub deps', () => {
       pull_number: 42,
       sha: 'a'.repeat(40),
     });
-    expect(result).toEqual({ merged: true, message: 'Overseer merge WO-42' });
+    expect(result).toEqual({
+      merged: true,
+      message: 'Overseer merge WO-42',
+      mergeSha: 'a'.repeat(40),
+    });
   });
 
   test('maps 409 and 422 merge rejections', async () => {

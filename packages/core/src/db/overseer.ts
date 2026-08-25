@@ -161,6 +161,16 @@ export async function listRunsForOverseerWatch(): Promise<OverseerWatchRun[]> {
   return result.rows.map(normalizeRun);
 }
 
+export async function getOverseerWatchRunById(runId: string): Promise<OverseerWatchRun | null> {
+  const result = await getDatabase().query<WorkflowRunRow>(
+    `SELECT id, status, metadata, user_message, working_path
+     FROM remote_agent_workflow_runs
+     WHERE id = $1`,
+    [runId]
+  );
+  return result.rows[0] ? normalizeRun(result.rows[0]) : null;
+}
+
 interface OverseerEffectTimestampRow {
   last_effect_at: string | null;
 }
@@ -268,6 +278,74 @@ export interface OverseerVerdictRow {
   retry_count: number;
   created_at: string;
   updated_at: string;
+  actioned_at: string | null;
+  mutation_sent: boolean | number | null;
+  mutation_reason: string | null;
+  merge_sha: string | null;
+  pr_url: string | null;
+}
+
+export async function listUnactionedFlagMergeReadyVerdicts(): Promise<OverseerVerdictRow[]> {
+  const result = await getDatabase().query<OverseerVerdictRow>(
+    `SELECT * FROM overseer_verdicts
+     WHERE proposed_action = 'flag_merge_ready' AND actioned_at IS NULL
+     ORDER BY created_at ASC`
+  );
+  return [...result.rows];
+}
+
+export async function countRecentOverseerVerdictMerges(since: string): Promise<number> {
+  const result = await getDatabase().query<{ merge_count: number | string }>(
+    `SELECT COUNT(*) AS merge_count FROM overseer_verdicts
+     WHERE mutation_sent = true AND actioned_at >= $1`,
+    [since]
+  );
+  return Number(result.rows[0]?.merge_count ?? 0);
+}
+
+export async function claimVerdictForMergeExecution(verdictId: string): Promise<boolean> {
+  const now = new Date();
+  const staleBefore = new Date(now.getTime() - 5 * 60 * 1000).toISOString();
+  const result = await getDatabase().query(
+    `UPDATE overseer_verdicts
+     SET mutation_sent = false, mutation_reason = 'processing', updated_at = $2
+     WHERE id = $1 AND actioned_at IS NULL
+       AND (mutation_reason IS NULL
+         OR (mutation_reason = 'processing' AND updated_at < $3))`,
+    [verdictId, now.toISOString(), staleBefore]
+  );
+  return result.rowCount === 1;
+}
+
+export async function recordVerdictMergeOutcome(input: {
+  verdictId: string;
+  mutationSent: boolean;
+  reason: string;
+  mergeSha?: string;
+  prUrl?: string;
+}): Promise<OverseerVerdictRow> {
+  const db = getDatabase();
+  await db.query(
+    `UPDATE overseer_verdicts
+     SET actioned_at = $2, mutation_sent = $3, mutation_reason = $4,
+         merge_sha = $5, pr_url = $6, updated_at = $2
+     WHERE id = $1`,
+    [
+      input.verdictId,
+      new Date().toISOString(),
+      input.mutationSent,
+      input.reason,
+      input.mergeSha ?? null,
+      input.prUrl ?? null,
+    ]
+  );
+  const result = await db.query<OverseerVerdictRow>(
+    'SELECT * FROM overseer_verdicts WHERE id = $1',
+    [input.verdictId]
+  );
+  const row = result.rows[0];
+  if (!row) throw new Error(`overseer_verdict_merge_outcome_missing_row:${input.verdictId}`);
+  return row;
 }
 
 export interface OverseerVerdictClaim {

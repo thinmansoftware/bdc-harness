@@ -189,7 +189,9 @@ function startOverseerRuntimeWithRealMergeManager(): void {
   }
   const deps = resolveDefaultDeps();
   const mergeManager = createMergeManager(deps);
-  startOverseerRuntime({ serviceOptions: { deps, mergeCoordinator: mergeManager } });
+  startOverseerRuntime({
+    serviceOptions: { deps, mergeCoordinator: mergeManager, mergeBridgeEnabled: true },
+  });
 }
 
 export async function startServer(opts: ServerOptions = {}): Promise<void> {

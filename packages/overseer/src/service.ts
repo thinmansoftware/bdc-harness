@@ -1,10 +1,15 @@
 import { createLogger } from '@archon/paths';
 import {
   claimOverseerVerdict,
+  claimVerdictForMergeExecution,
+  countRecentOverseerVerdictMerges,
   finalizeOverseerVerdict,
+  getOverseerWatchRunById,
   insertOverseerAction,
   listRunEventsForOverseer,
   listRunsForOverseerWatch,
+  listUnactionedFlagMergeReadyVerdicts,
+  recordVerdictMergeOutcome,
 } from '@archon/core/db/overseer';
 import { handleRecordJudgeFirst } from './judge-first-pipeline';
 import type { OverseerVerdictStoreDeps } from './types.ts';
@@ -33,6 +38,7 @@ import { assessLifecycleCandidate } from './actions/lifecycle';
 import { assessQualifiedMerge } from './actions/merge-ready';
 import { assertOverseerDefaultOff } from './integration-scenarios';
 import { createRealGitHubClientDeps } from './adapters/github-real-deps';
+import { runMergeExecutionBridgeOnce } from './merge-execution-bridge';
 
 /**
  * Integrated S4-S7 assessment surface for Slice 8 wiring.
@@ -75,6 +81,9 @@ export interface OverseerServiceOptions {
   deliveryDrain?: () => Promise<unknown>;
   reconcileIntervalMs?: number;
   reconcileRun?: () => Promise<unknown>;
+  mergeBridgeIntervalMs?: number;
+  mergeBridgeRun?: () => Promise<unknown>;
+  mergeBridgeEnabled?: boolean;
 }
 
 export async function runOperatorCardDeliveryScheduler(input: {
@@ -113,6 +122,24 @@ export async function runReconcileScheduler(input: {
       await reconcile();
     } catch (error) {
       log.error({ err: error as Error }, 'overseer.reconcile.iteration_failed_isolated');
+    }
+    if (input.once || input.signal?.aborted) return;
+    await waitForDeliveryInterval(input.intervalMs ?? 30_000, input.signal);
+  }
+}
+
+export async function runMergeBridgeScheduler(input: {
+  signal?: AbortSignal;
+  intervalMs?: number;
+  once?: boolean;
+  run: () => Promise<unknown>;
+}): Promise<void> {
+  for (;;) {
+    if (input.signal?.aborted) return;
+    try {
+      await input.run();
+    } catch (error) {
+      log.error({ err: error as Error }, 'overseer.merge_bridge.iteration_failed_isolated');
     }
     if (input.once || input.signal?.aborted) return;
     await waitForDeliveryInterval(input.intervalMs ?? 30_000, input.signal);
@@ -357,6 +384,29 @@ export async function runOverseerService(options: OverseerServiceOptions = {}): 
     }
   );
   const tasks: Promise<void>[] = [watcher];
+  if (options.mergeBridgeEnabled) {
+    const mergeBridgeRun =
+      options.mergeBridgeRun ??
+      (() =>
+        runMergeExecutionBridgeOnce({
+          github: deps,
+          store: {
+            listUnactionedVerdicts: listUnactionedFlagMergeReadyVerdicts,
+            claimVerdict: claimVerdictForMergeExecution,
+            getRunById: getOverseerWatchRunById,
+            countRecentMerges: countRecentOverseerVerdictMerges,
+            recordOutcome: recordVerdictMergeOutcome,
+          },
+        }));
+    tasks.push(
+      runMergeBridgeScheduler({
+        signal: coupledAbort.signal,
+        intervalMs: options.mergeBridgeIntervalMs,
+        once: options.once,
+        run: mergeBridgeRun,
+      })
+    );
+  }
   if (options.deliveryEnabled) {
     const delivery = runOperatorCardDeliveryScheduler({
       signal: coupledAbort.signal,
