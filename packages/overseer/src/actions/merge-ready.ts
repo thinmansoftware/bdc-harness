@@ -231,7 +231,7 @@ export type QualifiedMergeAssessment =
       readonly disposition: MergeExclusionDisposition;
     };
 
-const SUCCESS_CONCLUSIONS = new Set(['success', 'passed', 'neutral_ok']);
+export const SUCCESS_CONCLUSIONS = new Set(['success', 'passed', 'neutral_ok']);
 
 function deny(
   stage: string,

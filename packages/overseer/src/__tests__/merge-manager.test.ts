@@ -506,6 +506,22 @@ describe('merge manager', () => {
       });
     });
 
+    test('accepts every green required-check conclusion used by merge-ready', async () => {
+      for (const conclusion of ['passed', 'neutral_ok']) {
+        const { manager, mergePullRequest } = activatedManager({
+          assembled: evidence({
+            resulting_deployment_effect: 'none',
+            required_checks: [{ name: 'ci', conclusion, head_sha: RUN_HEAD_SHA }],
+          }),
+        });
+
+        const result = await manager(record);
+
+        expect(result.status).toBe('executed');
+        expect(mergePullRequest).toHaveBeenCalledTimes(1);
+      }
+    });
+
     test('denies when Review Gate approval is absent', async () => {
       const { manager, mergePullRequest, insertOverseerAction } = activatedManager({ reviews: [] });
       const result = await manager(record);
@@ -521,6 +537,36 @@ describe('merge manager', () => {
           result: expect.stringContaining('review_gate_approval_missing_for_head'),
         })
       );
+    });
+
+    test('fails closed when Review Gate login is unconfigured', async () => {
+      const assembled = evidence({ resulting_deployment_effect: 'none' });
+      const mergePullRequest = mock(async () => ({ merged: true }));
+      const listPullRequestReviews = mock(async () => [
+        { login: 'thinman-review-gate[bot]', state: 'APPROVED', commitId: RUN_HEAD_SHA },
+      ]);
+      const manager = createMergeManager({
+        mode: 'execute',
+        mutationsEnabled: true,
+        allowedBases: ['dev', 'staging'],
+        reviewGateLogin: '',
+        assembleEvidence: async () => ({ evidence: assembled, evidenceDigest: '9'.repeat(64) }),
+        judge: async input => approveReceipt(input),
+        insertOverseerAction: async () => undefined,
+        findPullRequest: async () => record.prEvidence,
+        mergePullRequest,
+        listPullRequestReviews,
+        readWorktreeHeadSha,
+      });
+
+      const result = await manager(record);
+
+      expect(result).toMatchObject({
+        status: 'held',
+        reason: 'review_gate_login_unconfigured',
+      });
+      expect(listPullRequestReviews).not.toHaveBeenCalled();
+      expect(mergePullRequest).not.toHaveBeenCalled();
     });
 
     test('denies a stale approval bound to an older head SHA', async () => {

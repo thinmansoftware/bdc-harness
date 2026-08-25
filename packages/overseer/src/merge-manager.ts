@@ -10,7 +10,10 @@ import {
   verifyMergeProvenance,
   type MergeProvenanceResult,
 } from './merge-provenance';
-import type { QualifiedMergeEvidence } from './actions/merge-ready';
+import {
+  SUCCESS_CONCLUSIONS,
+  type QualifiedMergeEvidence,
+} from './actions/merge-ready';
 import type { OverseerDeploymentEffect } from './policy-registry';
 import type {
   GitHubClientDeps,
@@ -380,7 +383,7 @@ async function mergePreconditionMiss(
   const checks = evidence.required_checks;
   if (
     checks.length === 0 ||
-    checks.some(check => check.conclusion !== 'success' || check.head_sha !== headSha)
+    checks.some(check => !SUCCESS_CONCLUSIONS.has(check.conclusion) || check.head_sha !== headSha)
   ) {
     return 'required_checks_not_green_on_head';
   }
