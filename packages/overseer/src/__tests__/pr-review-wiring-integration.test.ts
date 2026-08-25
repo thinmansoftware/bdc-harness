@@ -19,16 +19,31 @@
  * this test fails with the exact real-world symptom instead of passing
  * vacuously against a fake.
  */
-import { afterEach, beforeEach, describe, expect, test, mock } from 'bun:test';
+import { afterAll, afterEach, beforeEach, describe, expect, test, mock } from 'bun:test';
 import { unlinkSync } from 'fs';
 import { join } from 'path';
 
 let db: import('@archon/core/db/adapters/sqlite').SqliteAdapter;
 let currentDbPath = '';
 
+// Bug found + fixed 2026-08-25 (same disease class as the CI-stabilization
+// WO this test's sibling PR fixed): mock.module() patches the PROCESS-GLOBAL
+// module registry, so replacing '@archon/core/db/connection' with an object
+// carrying ONLY getDatabase silently dropped every other export of that
+// module (getDialect, pool, etc.) for every LATER-loaded test file that
+// imports from it -- crashing them at import time with "Export named
+// 'getDialect' not found". Spreading the real module and restoring in
+// afterAll keeps the blast radius inside this file.
+import * as realConnection from '@archon/core/db/connection';
+
 mock.module('@archon/core/db/connection', () => ({
+  ...realConnection,
   getDatabase: () => db,
 }));
+
+afterAll(() => {
+  mock.restore();
+});
 
 const { SqliteAdapter } = await import('@archon/core/db/adapters/sqlite');
 const { createRealIngestDeps, REVIEW_RECIPIENT, REVIEW_SENDER } =

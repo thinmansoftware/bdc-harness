@@ -42,7 +42,7 @@
     "./pr-review-wiring": "./src/pr-review-wiring.ts"
   },
   "scripts": {
-    "test": "bun test src/overseer.test.ts && bun test src/watch.test.ts && bun test tests/ && bun test src/__tests__/",
+    "test": "bun test src/overseer.test.ts && bun test src/watch.test.ts && bun test tests/ && bun test --isolate src/__tests__/",
     "overseer:serve": "bun src/service.ts",
     "verify-github-app": "bun src/scripts/verify-github-app-token.ts",
     "m42-slice8b:canary-run": "bun src/m42-slice8b-canary-runner.ts",
