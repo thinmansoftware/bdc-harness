@@ -52,6 +52,11 @@ interface WorkflowRunRow {
   // Engine-written (see workflows.ts createRun). Unlike `metadata`, an agent cannot
   // author this -- which is why merge provenance binds to it and not to metadata.
   working_path: string | null;
+  // Engine-written FK to remote_agent_codebases, set on every insert from the
+  // resolved codebase binding (--project / prefix / target_repo). Joined to its
+  // codebase name below because it is the AUTHORITATIVE repo identity: metadata
+  // is agent-authorable and, in practice, never carries a repo key at all.
+  codebase_name: string | null;
 }
 
 interface WorkflowEventRow {
@@ -113,18 +118,42 @@ function parseWoId(metadata: Record<string, unknown>, userMessage: string): stri
  * A bare (slashless) value is still treated as a repo under the BDC org, which is the
  * one place a default is safe: the value was explicitly written by the run.
  */
-function parseRepo(metadata: Record<string, unknown>): { owner?: string; repo?: string } {
-  const target = stringField(metadata, ['targetRepo', 'target_repo', 'repository', 'repo'])?.trim();
-  if (!target) return {};
-  if (!target.includes('/')) return { owner: 'bluedevilcollectibles', repo: target };
-  const [owner, repo] = target.split('/').slice(-2);
+function parseRepoIdentifier(target: string | undefined): { owner?: string; repo?: string } {
+  const value = target?.trim();
+  if (!value) return {};
+  if (!value.includes('/')) return { owner: 'bluedevilcollectibles', repo: value };
+  const [owner, repo] = value.split('/').slice(-2);
   if (!owner || !repo) return {};
   return { owner, repo };
 }
 
+/**
+ * Resolve repo identity, preferring the engine-written codebase FK over
+ * agent-authorable metadata.
+ *
+ * Anchor: 2026-08-25 E2E merge canary (bdc-harness PR #705). Every terminal run
+ * resolved to `unresolvableEvidence` in judgePullRequest -- which hard-requires
+ * owner+repo -- so Overseer's PR lookup never ran, and the Merge Manager's
+ * heartbeat reported eligible:0 on a PR that was CLEAN, APPROVED and MERGEABLE.
+ * The cause was not missing identity: the canary's own run row carried
+ * codebase_id -> 'thinmansoftware/bdc-harness' correctly the whole time. This
+ * query simply never selected it, and fell back to a metadata key that (per the
+ * note above) no run has ever written.
+ */
+function parseRepo(
+  metadata: Record<string, unknown>,
+  codebaseName: string | null
+): { owner?: string; repo?: string } {
+  const fromCodebase = parseRepoIdentifier(codebaseName ?? undefined);
+  if (fromCodebase.owner && fromCodebase.repo) return fromCodebase;
+  return parseRepoIdentifier(
+    stringField(metadata, ['targetRepo', 'target_repo', 'repository', 'repo'])
+  );
+}
+
 function normalizeRun(row: WorkflowRunRow): OverseerWatchRun {
   const metadata = parseObject(row.metadata);
-  const repo = parseRepo(metadata);
+  const repo = parseRepo(metadata, row.codebase_name ?? null);
   return {
     id: row.id,
     woId: parseWoId(metadata, row.user_message),
@@ -170,15 +199,17 @@ const TERMINAL_OVERSEER_ACTIONS = ['merged'] as const;
 export async function listRunsForOverseerWatch(): Promise<OverseerWatchRun[]> {
   const placeholders = TERMINAL_OVERSEER_ACTIONS.map(() => '?').join(', ');
   const result = await getDatabase().query<WorkflowRunRow>(
-    `SELECT id, status, metadata, user_message, working_path
-     FROM remote_agent_workflow_runs
-     WHERE status IN ('completed', 'failed', 'escalated', 'cancelled')
+    `SELECT r.id, r.status, r.metadata, r.user_message, r.working_path,
+            c.name AS codebase_name
+     FROM remote_agent_workflow_runs r
+     LEFT JOIN remote_agent_codebases c ON c.id = r.codebase_id
+     WHERE r.status IN ('completed', 'failed', 'escalated', 'cancelled')
        AND NOT EXISTS (
          SELECT 1 FROM overseer_actions oa
-         WHERE oa.run_id = remote_agent_workflow_runs.id
+         WHERE oa.run_id = r.id
            AND oa.action IN (${placeholders})
        )
-     ORDER BY COALESCE(completed_at, last_activity_at, started_at) ASC`,
+     ORDER BY COALESCE(r.completed_at, r.last_activity_at, r.started_at) ASC`,
     [...TERMINAL_OVERSEER_ACTIONS]
   );
   return result.rows.map(normalizeRun);

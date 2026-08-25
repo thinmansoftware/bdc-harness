@@ -121,6 +121,40 @@ describe('overseer db', () => {
     expect(await listRunsForOverseerWatch()).toHaveLength(0);
   });
 
+  test('resolves repo identity from the engine-written codebase FK when metadata has none', async () => {
+    // REAL-WORLD metadata shape: telemetry only, no repo key. Per parseRepo's own
+    // note, zero of 563 live terminal runs carried one. Every other test in this
+    // file seeds targetRepo into metadata -- a shape production never produces --
+    // which is why this defect survived: the tests validated fiction.
+    // Anchor: 2026-08-25 E2E merge canary (bdc-harness PR #705).
+    await db.query(
+      `INSERT INTO remote_agent_codebases (id, name, default_cwd)
+       VALUES ('cb-real', 'thinmansoftware/bdc-harness', '/tmp/cb-real')`
+    );
+    await db.query(
+      `INSERT INTO remote_agent_conversations (id, platform_type, platform_conversation_id, title)
+       VALUES ('conv-fk', 'test', 'conv-fk', 'Test')`
+    );
+    await db.query(
+      `INSERT INTO remote_agent_workflow_runs
+       (id, conversation_id, codebase_id, workflow_name, user_message, status, metadata)
+       VALUES ('run-fk', 'conv-fk', 'cb-real', 'bdc-feature-development', $1, 'completed', $2)`,
+      [
+        'WO_ID=WO-HARNESS-E2E-MERGE-CANARY-01 --project bdc-harness',
+        JSON.stringify({ node_counts: { completed: 39 }, total_cost_usd: 7.63 }),
+      ]
+    );
+
+    const runs = await listRunsForOverseerWatch();
+    const run = runs.find(candidate => candidate.id === 'run-fk');
+    expect(run).toBeDefined();
+    // Without the FK join these are undefined, and judgePullRequest returns
+    // unresolvableEvidence -- the PR lookup never runs and nothing is merge_ready.
+    expect(run?.owner).toBe('thinmansoftware');
+    expect(run?.repo).toBe('bdc-harness');
+    expect(run?.woId).toBe('WO-HARNESS-E2E-MERGE-CANARY-01');
+  });
+
   test('reads latest action/verdict effect timestamps and pending judgment count', async () => {
     await seedRun('run-effect-old');
     await seedRun('run-effect-new');
