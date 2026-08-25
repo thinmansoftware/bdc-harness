@@ -105,10 +105,19 @@ export const DEFAULT_BUILD_SHA_ENV = 'SEAT_BUILD_SHA';
 
 type ModelFamily = NonNullable<SeatConfig['model_family']>;
 
+// WO-HARNESS-M131-PHASE-B-CODEX-CLAUDE-SEATS-01: PHASE-B-SEAT-PACKAGING-01
+// (bdc-harness#703, merged) added codex/claude packaging using the PLAIN CLI
+// adapters only, explicitly to stay clear of the separate ACP/MCP operator-
+// host promotion gate. This WO's own spec calls for the ACP/MCP legs
+// specifically (EXISTING mcp/session.ts runMcpAgent, EXISTING
+// claude-acp/adapter.ts, preserving the M-126 lifecycle), so codex-mcp and
+// claude-acp are added here alongside the plain names -- a seat MAY run
+// either transport for its family; preflight still enforces exactly one
+// PROVIDER (not one transport) per the existing single-entry allowlist rule.
 const FAMILY_ADAPTERS: Record<ModelFamily, ReadonlySet<string>> = {
   grok: new Set(['grok-acp', 'grok']),
-  codex: new Set(['codex']),
-  claude: new Set(['claude']),
+  codex: new Set(['codex', 'codex-mcp']),
+  claude: new Set(['claude', 'claude-acp']),
 };
 
 const FAMILY_ERROR_CODE: Record<ModelFamily, SeatPreflightErrorCode> = {

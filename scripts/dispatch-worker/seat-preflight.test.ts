@@ -304,6 +304,37 @@ describe('runSeatPreflight model families', () => {
     expect(result).toEqual({ ok: false, code, field: 'provider_allowlist' });
   });
 
+  test.each([
+    [GOOD_SEAT_CODEX, 'codex-mcp'],
+    [GOOD_SEAT_CLAUDE, 'claude-acp'],
+  ] as const)(
+    'accepts the ACP/MCP transport leg %s alongside the plain CLI provider',
+    async (seat, provider) => {
+      const result = await runSeatPreflight(
+        { ...seat, provider_allowlist: [provider] },
+        { ...COMMANDS, 'codex-mcp': 'codex', 'claude-acp': 'claude' },
+        fakeDeps()
+      );
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        expect(result.providers).toEqual([provider]);
+      }
+    }
+  );
+
+  test('still rejects cross-family ACP/MCP providers', async () => {
+    const result = await runSeatPreflight(
+      { ...GOOD_SEAT_CODEX, provider_allowlist: ['claude-acp'] },
+      { ...COMMANDS, 'claude-acp': 'claude' },
+      fakeDeps()
+    );
+    expect(result).toEqual({
+      ok: false,
+      code: 'seat_provider_not_codex',
+      field: 'provider_allowlist',
+    });
+  });
+
   test('defaults an omitted model_family to Grok for Phase A compatibility', async () => {
     const result = await runSeatPreflight(
       { ...GOOD_SEAT, provider_allowlist: ['claude'] },
