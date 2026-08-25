@@ -57,9 +57,7 @@ describe('checkFireEligibility', () => {
     );
     const unregistered = deps();
     unregistered.codebases = async () => [];
-    expect((await checkFireEligibility(TITLE, unregistered)).reason).toBe(
-      'project_not_registered'
-    );
+    expect((await checkFireEligibility(TITLE, unregistered)).reason).toBe('project_not_registered');
   });
 
   test('does not treat adjacent or prefix WO tokens as the requested WO', async () => {

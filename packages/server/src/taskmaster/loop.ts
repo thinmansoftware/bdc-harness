@@ -681,10 +681,7 @@ async function gradeSentActions(
             (!Number.isFinite(deadlineMs) || buildingAtMs <= deadlineMs))
         ) {
           await dal.gradeAction(action.id, 'useful');
-        } else if (
-          Number.isFinite(deadlineMs) &&
-          nowMs >= deadlineMs
-        ) {
+        } else if (Number.isFinite(deadlineMs) && nowMs >= deadlineMs) {
           await dal.gradeAction(action.id, 'noise');
         }
         continue;
