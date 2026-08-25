@@ -16,6 +16,15 @@ import type {
 const log = createLogger('overseer/watch');
 
 export const DEFAULT_WATCH_INTERVAL_MS = 60_000;
+export const DEFAULT_WATCH_MAX_RUNS_PER_TICK = 25;
+
+export function resolveWatchMaxRunsPerTick(
+  raw = process.env.OVERSEER_WATCH_MAX_RUNS_PER_TICK
+): number {
+  if (raw === undefined || raw.trim() === '') return DEFAULT_WATCH_MAX_RUNS_PER_TICK;
+  const value = Number(raw);
+  return Number.isSafeInteger(value) && value > 0 ? value : DEFAULT_WATCH_MAX_RUNS_PER_TICK;
+}
 
 /**
  * M-42 Slice 8 integration marker: single-watcher ownership for the
@@ -249,6 +258,8 @@ export interface WatchHeartbeatLogger {
 export interface WatchOnceOptions {
   /** Injected logger for the heartbeat line; defaults to the module logger. */
   logger?: WatchHeartbeatLogger;
+  /** Oldest-first per-tick cap; defaults to OVERSEER_WATCH_MAX_RUNS_PER_TICK (25). */
+  maxRunsPerTick?: number;
 }
 
 export async function watchOnce(
@@ -257,7 +268,10 @@ export async function watchOnce(
 ): Promise<WatchedRunRecord[]> {
   const heartbeatLogger: WatchHeartbeatLogger = options.logger ?? log;
   const runs = await deps.listRunsForWatch();
-  const terminalRuns = runs.filter(run => isTerminalStatus(run.status));
+  // listRunsForWatch is oldest-first. Slice only after terminal filtering so a batch
+  // cannot be consumed by non-terminal rows and older terminal work never starves.
+  const maxRunsPerTick = options.maxRunsPerTick ?? resolveWatchMaxRunsPerTick();
+  const terminalRuns = runs.filter(run => isTerminalStatus(run.status)).slice(0, maxRunsPerTick);
   const outcomes: WatchedRunRecord[] = [];
   for (const run of terminalRuns) {
     // Per-run isolation (bdc-xo#1366): assessRun calls out to GitHub (judgePullRequest)

@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import { createAppAuth } from '@octokit/auth-app';
 import {
   createRealApprovePullRequest,
+  createRealFindPullRequest,
   resolveGitHubAppAuth,
   resolveRealOctokitAuthOptions,
   type RealGitHubOctokitLike,
@@ -299,5 +300,71 @@ describe('createRealApprovePullRequest', () => {
     await expect(createRealApprovePullRequest(octokit)(approveInput())).rejects.toThrow(
       /overseer_real_adapter_missing_review_api/
     );
+  });
+});
+
+describe('createRealFindPullRequest rate-limit load profile', () => {
+  test('head branch uses pulls.list without consuming the search endpoint', async () => {
+    const list = mock(async () => ({
+      data: [
+        {
+          number: 42,
+          title: 'WO-CHEAP-PATH-01',
+          state: 'open',
+          html_url: 'https://github.test/pull/42',
+          head: { sha: 'a'.repeat(40) },
+        },
+      ],
+    }));
+    const search = mock(async () => ({ data: { items: [] } }));
+    const octokit = octokitWithReview(async () => ({ data: { id: 1, state: 'APPROVED' } }));
+    octokit.pulls.list = list;
+    octokit.search.issuesAndPullRequests = search;
+
+    const result = await createRealFindPullRequest(octokit)({
+      owner: 'thinmansoftware',
+      repo: 'bdc-harness',
+      headBranch: 'fix/cheap-path',
+      woId: 'WO-CHEAP-PATH-01',
+    });
+
+    expect(result.exists).toBe(true);
+    expect(list).toHaveBeenCalledTimes(1);
+    expect(search).not.toHaveBeenCalled();
+  });
+
+  test('403 rate limit starts a process-wide backoff and logs only once in the window', async () => {
+    const list = mock(async () => {
+      throw Object.assign(new Error('API rate limit exceeded for installation'), {
+        status: 403,
+        response: { headers: { 'x-ratelimit-remaining': '0' } },
+      });
+    });
+    const octokit = octokitWithReview(async () => ({ data: { id: 1, state: 'APPROVED' } }));
+    octokit.pulls.list = list;
+    const warnings: string[] = [];
+    const errors: string[] = [];
+    const find = createRealFindPullRequest(octokit, {
+      now: () => 1_000,
+      logger: {
+        warn: (_obj, msg) => warnings.push(msg),
+        error: (_obj, msg) => errors.push(msg),
+      },
+    });
+    const input = {
+      owner: 'thinmansoftware',
+      repo: 'bdc-harness',
+      headBranch: 'fix/rate-limited',
+      woId: 'WO-RATE-LIMIT-01',
+    };
+
+    const first = await find(input);
+    const second = await find(input);
+
+    expect(first.lookupFailed).toBe(true);
+    expect(second.lookupFailed).toBe(true);
+    expect(list).toHaveBeenCalledTimes(1);
+    expect(warnings).toEqual(['overseer.github_real_deps.rate_limit_backoff']);
+    expect(errors).toEqual([]);
   });
 });

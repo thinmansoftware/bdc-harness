@@ -14,6 +14,35 @@ import type {
 
 const log = createLogger('overseer/github-real-deps');
 
+const RATE_LIMIT_BACKOFF_MS = 60_000;
+let rateLimitBackoffUntil = 0;
+let rateLimitLastLoggedAt = 0;
+
+interface FindPullRequestLogger {
+  error(obj: Record<string, unknown>, msg: string): void;
+  warn(obj: Record<string, unknown>, msg: string): void;
+}
+
+export interface FindPullRequestOptions {
+  logger?: FindPullRequestLogger;
+  now?: () => number;
+}
+
+function isGitHubRateLimitError(error: unknown): boolean {
+  if (!error || typeof error !== 'object') return false;
+  const candidate = error as {
+    status?: unknown;
+    message?: unknown;
+    response?: { headers?: Record<string, unknown> };
+  };
+  if (candidate.status !== 403) return false;
+  const remaining = candidate.response?.headers?.['x-ratelimit-remaining'];
+  return (
+    String(remaining) === '0' ||
+    (typeof candidate.message === 'string' && /rate limit/i.test(candidate.message))
+  );
+}
+
 /** The lookup ran and found nothing. A genuine "this PR does not exist". */
 const MISSING_EVIDENCE: PullRequestEvidence = {
   exists: false,
@@ -320,9 +349,13 @@ function summarizeChecks(
  * live API data -- no invented defaults beyond the documented "missing" shape.
  */
 export function createRealFindPullRequest(
-  octokit: RealGitHubOctokitLike
+  octokit: RealGitHubOctokitLike,
+  options: FindPullRequestOptions = {}
 ): (input: GitHubPullRequestSearchInput) => Promise<PullRequestEvidence> {
+  const logger = options.logger ?? log;
+  const now = options.now ?? Date.now;
   return async (input: GitHubPullRequestSearchInput): Promise<PullRequestEvidence> => {
+    if (now() < rateLimitBackoffUntil) return LOOKUP_FAILED_EVIDENCE;
     try {
       let prNumber: number | null = null;
 
@@ -346,7 +379,11 @@ export function createRealFindPullRequest(
         prNumber = match?.number ?? null;
       }
 
-      if (prNumber === null) return MISSING_EVIDENCE;
+      if (prNumber === null) {
+        rateLimitBackoffUntil = 0;
+        rateLimitLastLoggedAt = 0;
+        return MISSING_EVIDENCE;
+      }
 
       const pr = await octokit.pulls.get({
         owner: input.owner,
@@ -364,7 +401,7 @@ export function createRealFindPullRequest(
 
       const state = pr.data.merged ? 'merged' : pr.data.state;
 
-      return {
+      const evidence: PullRequestEvidence = {
         exists: true,
         state,
         checks,
@@ -376,8 +413,26 @@ export function createRealFindPullRequest(
         // Provenance anchor: GitHub's own view of the PR head, not run metadata.
         headSha: pr.data.head.sha,
       };
+      rateLimitBackoffUntil = 0;
+      rateLimitLastLoggedAt = 0;
+      return evidence;
     } catch (error) {
-      log.error({ err: error, input }, 'overseer.github_real_deps.find_pull_request_failed');
+      const timestamp = now();
+      if (isGitHubRateLimitError(error)) {
+        rateLimitBackoffUntil = timestamp + RATE_LIMIT_BACKOFF_MS;
+        if (
+          timestamp - rateLimitLastLoggedAt >= RATE_LIMIT_BACKOFF_MS ||
+          rateLimitLastLoggedAt === 0
+        ) {
+          rateLimitLastLoggedAt = timestamp;
+          logger.warn(
+            { err: error, input, backoffMs: RATE_LIMIT_BACKOFF_MS },
+            'overseer.github_real_deps.rate_limit_backoff'
+          );
+        }
+        return LOOKUP_FAILED_EVIDENCE;
+      }
+      logger.error({ err: error, input }, 'overseer.github_real_deps.find_pull_request_failed');
       return LOOKUP_FAILED_EVIDENCE;
     }
   };

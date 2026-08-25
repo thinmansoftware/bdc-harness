@@ -62,6 +62,32 @@ describe('watch', () => {
     expect(record.action).toBe('escalate');
     expect(record.errorClass).toBe('unknown');
   });
+
+  test('caps each tick while preserving the store oldest-first ordering', async () => {
+    const visited: string[] = [];
+    const boundedDeps: OverseerRunStoreDeps & GitHubClientDeps = {
+      listRunsForWatch: async () =>
+        ['oldest', 'middle', 'newest'].map(id => ({
+          id,
+          woId: `WO-${id.toUpperCase()}`,
+          owner: 'thinmansoftware',
+          repo: 'bdc-harness',
+          status: 'completed',
+          headBranch: `fix/${id}`,
+        })),
+      listRunEvents: async () => [],
+      findPullRequest: async input => {
+        visited.push(input.headBranch ?? 'missing');
+        return { ...greenPr, state: 'merged' };
+      },
+      mergePullRequest: async () => ({ merged: true }),
+    };
+
+    const outcomes = await watchOnce(boundedDeps, { maxRunsPerTick: 2 });
+
+    expect(outcomes.map(outcome => outcome.runId)).toEqual(['oldest', 'middle']);
+    expect(visited).toEqual(['fix/oldest', 'fix/middle']);
+  });
 });
 
 /**
