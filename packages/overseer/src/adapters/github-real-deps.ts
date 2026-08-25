@@ -252,6 +252,28 @@ export function createRealOctokitClient(): RealGitHubOctokitLike {
   return new Octokit(resolveRealOctokitAuthOptions()) as unknown as RealGitHubOctokitLike;
 }
 
+/**
+ * M-153 identity separation seam: the MERGE mutation must not run as the
+ * Review Gate identity ("review and merge are separate actors", John
+ * 2026-08-24). When MERGE_MANAGER_GH_TOKEN is set, merges are executed with
+ * that PAT identity while reviews keep the App identity. When it is unset,
+ * the merge octokit falls back to the shared resolution -- callers that
+ * enforce M-153 must treat that as the single-identity condition and hold.
+ */
+export const MERGE_MANAGER_GH_TOKEN_ENV = 'MERGE_MANAGER_GH_TOKEN' as const;
+
+export function hasDistinctMergeIdentity(): boolean {
+  return Boolean(process.env[MERGE_MANAGER_GH_TOKEN_ENV]);
+}
+
+export function createRealMergeOctokitClient(): RealGitHubOctokitLike {
+  const mergeToken = process.env[MERGE_MANAGER_GH_TOKEN_ENV];
+  if (mergeToken) {
+    return new Octokit({ auth: mergeToken }) as unknown as RealGitHubOctokitLike;
+  }
+  return createRealOctokitClient();
+}
+
 function summarizeChecks(
   checkRuns: { status: string; conclusion: string | null }[]
 ): PullRequestCheckSummary {
@@ -470,7 +492,9 @@ export function createRealGitHubClientDeps(
 ): GitHubClientDeps {
   return {
     findPullRequest: createRealFindPullRequest(octokit),
-    mergePullRequest: createRealMergePullRequest(octokit),
+    // Merge mutations go through the distinct merge identity when configured
+    // (M-153: the merger is never the reviewer).
+    mergePullRequest: createRealMergePullRequest(createRealMergeOctokitClient()),
     listPullRequestReviews: async (
       input
     ): Promise<{ login: string; state: string; commitId: string }[]> => {
