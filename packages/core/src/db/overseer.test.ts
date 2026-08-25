@@ -90,16 +90,34 @@ describe('overseer db', () => {
     expect(events[0].step_name).toBe('commit-and-push');
     expect(events[0].data.error).toBe('exit 1');
 
+    // A PROVISIONAL action (e.g. a verdict written before CI/review finished)
+    // must NOT exclude the run forever -- it should still show up so a later
+    // heartbeat can re-evaluate it once state changes. Anchor: 2026-08-25 E2E
+    // merge canary (bdc-harness PR #705) sat eligible:0 for 30+ minutes after
+    // going green+approved because a pre-CI verdict_write row had already
+    // permanently excluded it under the old NOT EXISTS(any row) predicate.
     await insertOverseerAction({
       runId: 'run-overseer',
       woId: 'WO-TEST-OVERSEER-01',
       class: 'tail_node_false_fail',
-      action: 'merge_ready',
-      result: 'merged',
+      action: 'verdict_write',
+      result: 'merge_candidate:confidence:0.85',
     });
     const actions = await getOverseerActionsForRun('run-overseer');
     expect(actions).toHaveLength(1);
-    expect(actions[0].action).toBe('merge_ready');
+    expect(actions[0].action).toBe('verdict_write');
+    expect(await listRunsForOverseerWatch()).toHaveLength(1);
+
+    // Only the real merge-manager success write (action: 'merged', per
+    // merge-manager.ts's recordManagerAction on execution.merged) is terminal
+    // and permanently excludes the run.
+    await insertOverseerAction({
+      runId: 'run-overseer',
+      woId: 'WO-TEST-OVERSEER-01',
+      class: 'none',
+      action: 'merged',
+      result: JSON.stringify({ mutation_sent: true, merged_sha: 'deadbeef' }),
+    });
     expect(await listRunsForOverseerWatch()).toHaveLength(0);
   });
 
