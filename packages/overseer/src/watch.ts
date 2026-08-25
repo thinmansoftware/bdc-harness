@@ -16,6 +16,20 @@ import type {
 const log = createLogger('overseer/watch');
 
 export const DEFAULT_WATCH_INTERVAL_MS = 60_000;
+export const DEFAULT_WATCH_MAX_RUNS_PER_TICK = 25;
+
+// The store retains every non-merged action, so an oldest-first slice would
+// retry the same rows forever. A single watcher evaluates every terminal row
+// once before beginning another pass.
+const evaluatedRunIdsThisPass = new Set<string>();
+
+export function resolveWatchMaxRunsPerTick(
+  raw = process.env.OVERSEER_WATCH_MAX_RUNS_PER_TICK
+): number {
+  if (raw === undefined || raw.trim() === '') return DEFAULT_WATCH_MAX_RUNS_PER_TICK;
+  const value = Number(raw);
+  return Number.isSafeInteger(value) && value > 0 ? value : DEFAULT_WATCH_MAX_RUNS_PER_TICK;
+}
 
 /**
  * M-42 Slice 8 integration marker: single-watcher ownership for the
@@ -249,6 +263,8 @@ export interface WatchHeartbeatLogger {
 export interface WatchOnceOptions {
   /** Injected logger for the heartbeat line; defaults to the module logger. */
   logger?: WatchHeartbeatLogger;
+  /** Oldest-first per-tick cap; defaults to OVERSEER_WATCH_MAX_RUNS_PER_TICK (25). */
+  maxRunsPerTick?: number;
 }
 
 export async function watchOnce(
@@ -257,7 +273,17 @@ export async function watchOnce(
 ): Promise<WatchedRunRecord[]> {
   const heartbeatLogger: WatchHeartbeatLogger = options.logger ?? log;
   const runs = await deps.listRunsForWatch();
-  const terminalRuns = runs.filter(run => isTerminalStatus(run.status));
+  // listRunsForWatch is oldest-first. Filter non-terminal rows, then continue the
+  // current fair pass so permanently unmerged old rows cannot hide later work.
+  const maxRunsPerTick = options.maxRunsPerTick ?? resolveWatchMaxRunsPerTick();
+  const allTerminalRuns = runs.filter(run => isTerminalStatus(run.status));
+  let unevaluatedRuns = allTerminalRuns.filter(run => !evaluatedRunIdsThisPass.has(run.id));
+  if (unevaluatedRuns.length === 0 && allTerminalRuns.length > 0) {
+    evaluatedRunIdsThisPass.clear();
+    unevaluatedRuns = allTerminalRuns;
+  }
+  const terminalRuns = unevaluatedRuns.slice(0, maxRunsPerTick);
+  for (const run of terminalRuns) evaluatedRunIdsThisPass.add(run.id);
   const outcomes: WatchedRunRecord[] = [];
   for (const run of terminalRuns) {
     // Per-run isolation (bdc-xo#1366): assessRun calls out to GitHub (judgePullRequest)
