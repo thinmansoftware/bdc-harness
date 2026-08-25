@@ -194,7 +194,14 @@ function normalizeEvent(row: WorkflowEventRow): OverseerWorkflowEventRow {
  * and the PR was approved. The Merge Manager's own heartbeat stayed
  * eligible:0 for 30+ minutes on a fully mergeable PR.
  */
-const TERMINAL_OVERSEER_ACTIONS = ['merged'] as const;
+const TERMINAL_OVERSEER_ACTIONS = [
+  'merged', // merge manager executed -- permanently done
+  'watch_closed', // judged with a resolved lookup and nothing actionable -- done
+  'escalate_with_evidence', // escalation posted once -- human owns it now
+  'escalation_denied',
+  'tier_refused',
+  'comment_findings',
+] as const;
 
 export async function listRunsForOverseerWatch(): Promise<OverseerWatchRun[]> {
   const placeholders = TERMINAL_OVERSEER_ACTIONS.map(() => '?').join(', ');

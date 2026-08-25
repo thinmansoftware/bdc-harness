@@ -108,9 +108,9 @@ describe('overseer db', () => {
     expect(actions[0].action).toBe('verdict_write');
     expect(await listRunsForOverseerWatch()).toHaveLength(1);
 
-    // Only the real merge-manager success write (action: 'merged', per
-    // merge-manager.ts's recordManagerAction on execution.merged) is terminal
-    // and permanently excludes the run.
+    // Terminal actions permanently exclude the run: the merge-manager success
+    // write ('merged'), a resolved-judgment close ('watch_closed'), and the
+    // once-and-done escalation family.
     await insertOverseerAction({
       runId: 'run-overseer',
       woId: 'WO-TEST-OVERSEER-01',
@@ -119,6 +119,31 @@ describe('overseer db', () => {
       result: JSON.stringify({ mutation_sent: true, merged_sha: 'deadbeef' }),
     });
     expect(await listRunsForOverseerWatch()).toHaveLength(0);
+  });
+
+  test('watch_closed is terminal; provisional merge_denied is not (window drain, 5th canary defect)', async () => {
+    await seedRun('run-drain-a');
+    await seedRun('run-drain-b');
+    // Provisional: a precondition-miss denial must NOT exclude -- state can change.
+    await insertOverseerAction({
+      runId: 'run-drain-a',
+      woId: 'WO-TEST-OVERSEER-01',
+      class: 'none',
+      action: 'merge_denied',
+      result: 'no_review_gate_approval',
+    });
+    // Terminal: judged with a resolved lookup, nothing actionable.
+    await insertOverseerAction({
+      runId: 'run-drain-b',
+      woId: 'WO-TEST-OVERSEER-01',
+      class: 'none',
+      action: 'watch_closed',
+      result: 'completed run; PR not merge-ready (merged)',
+    });
+    const runs = await listRunsForOverseerWatch();
+    const ids = runs.map(r => r.id);
+    expect(ids).toContain('run-drain-a');
+    expect(ids).not.toContain('run-drain-b');
   });
 
   test('resolves repo identity from the engine-written codebase FK when metadata has none', async () => {
