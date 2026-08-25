@@ -78,11 +78,26 @@ export interface RealGitHubOctokitLike {
      * createOctokitMock) that never approve keep type-checking. The real
      * approve path guards for its absence and throws loudly.
      */
+    /**
+     * WO-HARNESS-OVERSEER-REVIEW-ROUTE-01 widened `event` from the
+     * APPROVE-only literal to the two events a real reviewer needs, and added
+     * the optional `body` that REQUEST_CHANGES requires (GitHub rejects a
+     * REQUEST_CHANGES review with no body). APPROVE-only callers are
+     * unaffected: `body` is optional and 'APPROVE' remains assignable.
+     *
+     * `commit_id` REQUIRED (WO-HARNESS-OVERSEER-PR-REVIEW-ROUTE-01 stop
+     * condition 4, review finding 2026-08-18): without it GitHub binds the
+     * review to whatever the head is AT API-CALL TIME, not the exact commit
+     * the reviewer evaluated. A push between review-start and submission
+     * would silently land an approval on unreviewed code.
+     */
     createReview?(input: {
       owner: string;
       repo: string;
       pull_number: number;
-      event: 'APPROVE';
+      event: 'APPROVE' | 'REQUEST_CHANGES';
+      body?: string;
+      commit_id: string;
     }): Promise<{ data: { id: number; state: string } }>;
     listReviews?(input: {
       owner: string;
@@ -443,24 +458,95 @@ export function createRealMergePullRequest(
 export function createRealApprovePullRequest(
   octokit: RealGitHubOctokitLike
 ): (input: PullRequestRef) => Promise<{ approved: boolean; message?: string }> {
+  const submit = createRealSubmitPullRequestReview(octokit);
   return async (input: PullRequestRef): Promise<{ approved: boolean; message?: string }> => {
+    // PullRequestRef carries no head SHA, and commit_id is now required
+    // (stop condition 4): fetch the live head immediately before approving
+    // so the review still binds to a real, current commit rather than
+    // whatever GitHub would pick if commit_id were omitted.
+    let commitId: string;
+    try {
+      const pr = await octokit.pulls.get({
+        owner: input.owner,
+        repo: input.repo,
+        pull_number: input.number,
+      });
+      commitId = pr.data.head.sha;
+    } catch {
+      return { approved: false, message: 'github_review_head_lookup_failed' };
+    }
+    const result = await submit({ ...input, event: 'APPROVE', commitId });
+    return result.message === undefined
+      ? { approved: result.submitted }
+      : { approved: result.submitted, message: result.message };
+  };
+}
+
+/** Review events the Overseer App may submit. */
+export type OverseerReviewEvent = 'APPROVE' | 'REQUEST_CHANGES';
+
+export interface SubmitPullRequestReviewInput extends PullRequestRef {
+  event: OverseerReviewEvent;
+  /** Evidence body. REQUIRED and non-empty for REQUEST_CHANGES. */
+  body?: string;
+  /**
+   * REQUIRED. The exact commit the reviewer evaluated. Passed through to
+   * GitHub as `commit_id` so the review binds to that commit specifically,
+   * not to the PR's head at the moment the API call happens to run.
+   */
+  commitId: string;
+}
+
+export interface SubmitPullRequestReviewResult {
+  submitted: boolean;
+  message?: string;
+}
+
+/**
+ * General review submission for the Overseer App identity
+ * (WO-HARNESS-OVERSEER-REVIEW-ROUTE-01, XO decision 1 of 2026-08-17).
+ *
+ * Supports APPROVE and REQUEST_CHANGES -- both are available to a GitHub App
+ * installation token holding `pull_requests: write`. A reviewer that cannot
+ * reject is not a reviewer, so the non-approving path is a first-class
+ * capability rather than a fail-closed-only stub.
+ *
+ * REQUEST_CHANGES requires a non-empty body: GitHub rejects a changes-requested
+ * review with no explanation, and an empty rejection carries no evidence for
+ * the author. That precondition is enforced locally, before any network call,
+ * and returns the stable code 'github_review_missing_evidence_body'.
+ *
+ * Error classification mirrors createRealMergePullRequest's httpStatus
+ * approach so callers get stable codes instead of raw Octokit errors.
+ */
+export function createRealSubmitPullRequestReview(
+  octokit: RealGitHubOctokitLike
+): (input: SubmitPullRequestReviewInput) => Promise<SubmitPullRequestReviewResult> {
+  return async (input: SubmitPullRequestReviewInput): Promise<SubmitPullRequestReviewResult> => {
     if (!octokit.pulls.createReview) {
       throw new Error('overseer_real_adapter_missing_review_api');
     }
+    const body = input.body?.trim() ?? '';
+    if (input.event === 'REQUEST_CHANGES' && body.length === 0) {
+      return { submitted: false, message: 'github_review_missing_evidence_body' };
+    }
+    const expectedState = input.event === 'APPROVE' ? 'APPROVED' : 'CHANGES_REQUESTED';
     try {
       const response = await octokit.pulls.createReview({
         owner: input.owner,
         repo: input.repo,
         pull_number: input.number,
-        event: 'APPROVE',
+        event: input.event,
+        commit_id: input.commitId,
+        ...(body.length > 0 ? { body } : {}),
       });
-      if (response.data.state !== 'APPROVED') {
+      if (response.data.state !== expectedState) {
         return {
-          approved: false,
+          submitted: false,
           message: `github_review_unexpected_state_${response.data.state}`,
         };
       }
-      return { approved: true };
+      return { submitted: true };
     } catch (error) {
       const status =
         typeof error === 'object' && error !== null && 'status' in error
@@ -472,12 +558,12 @@ export function createRealApprovePullRequest(
           : undefined;
       const rawMessage = typeof messageValue === 'string' ? messageValue : '';
       if (status === 422 && /own pull request/i.test(rawMessage)) {
-        return { approved: false, message: 'github_review_self_approval_rejected' };
+        return { submitted: false, message: 'github_review_self_approval_rejected' };
       }
       if (status === 422) {
-        return { approved: false, message: 'github_review_unprocessable' };
+        return { submitted: false, message: 'github_review_unprocessable' };
       }
-      return { approved: false, message: 'github_review_transport_ambiguous' };
+      return { submitted: false, message: 'github_review_transport_ambiguous' };
     }
   };
 }

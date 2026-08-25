@@ -1,0 +1,254 @@
+/**
+ * Governed reviewer -> GitHub review submission
+ * (WO-HARNESS-OVERSEER-REVIEW-ROUTE-01, XO authorization 2026-08-17).
+ *
+ * The second half of the review route. `pr-review-ingest.ts` turns a verified
+ * pull_request event into durable work bound to an exact head; this module
+ * takes one claimed work item, runs the governed reviewer, and submits the
+ * resulting verdict through the EXISTING Overseer App adapter.
+ *
+ * XO decision 1 (2026-08-17): a non-approving verdict MUST submit
+ * REQUEST_CHANGES -- approve-only is not a reviewer. If submission fails, we
+ * fail closed and record the blocker rather than silently degrading to "no
+ * review", which would leave the PR indistinguishable from never-reviewed.
+ *
+ * The reviewer itself is injected. This module owns custody enforcement,
+ * exact-head binding, verdict-to-event mapping, evidence-body construction,
+ * and receipt writing -- not the review judgment.
+ */
+import type {
+  OverseerReviewEvent,
+  SubmitPullRequestReviewInput,
+  SubmitPullRequestReviewResult,
+} from './adapters/github-real-deps.ts';
+import { resolveMergeManagerMode } from './merge-manager';
+
+/** What the governed reviewer returns. */
+export interface ReviewerVerdict {
+  /** true -> APPROVE; false -> REQUEST_CHANGES. */
+  approved: boolean;
+  /** Evidence. REQUIRED (non-empty) when approved === false. */
+  summary: string;
+  /** The head the reviewer actually examined. Must match the work item. */
+  reviewedHeadSha: string;
+}
+
+export interface ReviewWorkItem {
+  correlationId: string;
+  messageId: string;
+  owner: string;
+  repo: string;
+  prNumber: number;
+  /** The exact head this work item is bound to. */
+  headSha: string;
+  author: string;
+}
+
+export type SubmitDisposition =
+  | 'approved'
+  | 'changes_requested'
+  | 'custody_conflict'
+  | 'merge_custody_conflict'
+  | 'stale_head'
+  | 'reviewer_failed'
+  | 'submission_failed';
+
+export interface SubmitOutcome {
+  disposition: SubmitDisposition;
+  reason?: string;
+  event?: OverseerReviewEvent;
+}
+
+export interface SubmitDeps {
+  reviewerIdentity: string;
+  /** Runs the governed reviewer against an exact head. */
+  runReviewer(work: ReviewWorkItem): Promise<ReviewerVerdict>;
+  /** The existing Overseer App adapter's general review submission. */
+  submitReview(input: SubmitPullRequestReviewInput): Promise<SubmitPullRequestReviewResult>;
+  /**
+   * Current head of the PR, re-read immediately before submission. A review
+   * must never land on a head the reviewer did not examine.
+   */
+  currentHeadSha(input: { owner: string; repo: string; prNumber: number }): Promise<string>;
+  recordReceipt(input: {
+    correlationId: string;
+    messageId: string;
+    owner: string;
+    repo: string;
+    prNumber: number;
+    headSha: string;
+    disposition: SubmitDisposition;
+    event?: OverseerReviewEvent;
+    reason?: string;
+  }): Promise<void>;
+}
+
+/** Bounds the evidence body so a runaway reviewer cannot post an essay. */
+const MAX_EVIDENCE_BODY = 60_000;
+
+/**
+ * Builds the review body. Always states the exact head so the review is
+ * self-evidencing about what was examined.
+ */
+export function buildReviewBody(work: ReviewWorkItem, verdict: ReviewerVerdict): string {
+  const header = `Independent review by the Overseer App at head \`${work.headSha}\`.`;
+  const summary = verdict.summary.trim();
+  const body = summary.length > 0 ? `${header}\n\n${summary}` : header;
+  return body.length > MAX_EVIDENCE_BODY ? body.slice(0, MAX_EVIDENCE_BODY) : body;
+}
+
+/**
+ * Run the governed reviewer for one claimed work item and submit its verdict.
+ *
+ * Order is deliberate: custody first (never review our own PR), then the
+ * reviewer, then a head re-read (a push during review invalidates the result),
+ * then submission. Every terminal branch writes a receipt.
+ */
+export async function runAndSubmitReview(
+  work: ReviewWorkItem,
+  deps: SubmitDeps
+): Promise<SubmitOutcome> {
+  // CUSTODY: enforced here as well as at ingest, because a work item can be
+  // claimed long after it was queued and this is the last point before a real
+  // review lands.
+  if (work.author?.toLowerCase() === deps.reviewerIdentity.toLowerCase()) {
+    return finish(deps, work, work.headSha, {
+      disposition: 'custody_conflict',
+      reason: 'reviewer_is_pull_request_author',
+    });
+  }
+
+  // MERGE-CUSTODY: this reviewer identity and the Overseer merge manager are
+  // the SAME GitHub App (thinman-overseer[bot]) -- M-153 (tabled, 2026-08-17)
+  // flagged that one identity holding both review and merge authority over
+  // the same PR would let it approve and then merge its own approval with no
+  // second party in the loop. Until the board rules on which separation
+  // model applies (M-153 Options A-D), this refuses to submit a review while
+  // the merge manager is armed to actually write to GitHub (`execute` mode).
+  // FAILS CLOSED: any mode other than the two known-safe modes blocks review
+  // submission rather than assuming safety. hold-canary and comment_findings
+  // perform zero GitHub writes, so review-then-merge cannot occur under them.
+  const mergeMode = resolveMergeManagerMode();
+  if (mergeMode === 'execute') {
+    return finish(deps, work, work.headSha, {
+      disposition: 'merge_custody_conflict',
+      reason: `merge_manager_mode_${mergeMode}_review_blocked_pending_m153`,
+    });
+  }
+
+  let verdict: ReviewerVerdict;
+  try {
+    verdict = await deps.runReviewer(work);
+  } catch (error) {
+    return finish(deps, work, work.headSha, {
+      disposition: 'reviewer_failed',
+      reason: `reviewer_error:${errorCode(error)}`,
+    });
+  }
+
+  // EXACT-HEAD BINDING: the reviewer must have examined the bound head.
+  if (verdict.reviewedHeadSha !== work.headSha) {
+    return finish(deps, work, work.headSha, {
+      disposition: 'stale_head',
+      reason: 'reviewer_examined_different_head',
+    });
+  }
+
+  // A push during review invalidates the verdict; do not land it on a head
+  // nobody reviewed.
+  let liveHead: string;
+  try {
+    liveHead = await deps.currentHeadSha({
+      owner: work.owner,
+      repo: work.repo,
+      prNumber: work.prNumber,
+    });
+  } catch (error) {
+    return finish(deps, work, work.headSha, {
+      disposition: 'submission_failed',
+      reason: `head_recheck_failed:${errorCode(error)}`,
+    });
+  }
+  if (liveHead !== work.headSha) {
+    return finish(deps, work, work.headSha, {
+      disposition: 'stale_head',
+      reason: 'head_advanced_during_review',
+    });
+  }
+
+  const event: OverseerReviewEvent = verdict.approved ? 'APPROVE' : 'REQUEST_CHANGES';
+  const body = buildReviewBody(work, verdict);
+
+  // A rejection with no evidence is not actionable; refuse before the call.
+  if (!verdict.approved && verdict.summary.trim().length === 0) {
+    return finish(deps, work, work.headSha, {
+      disposition: 'submission_failed',
+      reason: 'request_changes_missing_evidence',
+      event,
+    });
+  }
+
+  let submission: SubmitPullRequestReviewResult;
+  try {
+    submission = await deps.submitReview({
+      owner: work.owner,
+      repo: work.repo,
+      number: work.prNumber,
+      event,
+      body,
+      // The exact head this work item is bound to -- the SAME sha the
+      // reviewer verdict was already checked against above. Never the
+      // live/current head; a push during review is caught by the
+      // stale-head check before this call is ever reached.
+      commitId: work.headSha,
+    });
+  } catch (error) {
+    return finish(deps, work, work.headSha, {
+      disposition: 'submission_failed',
+      reason: `submit_threw:${errorCode(error)}`,
+      event,
+    });
+  }
+
+  if (!submission.submitted) {
+    return finish(deps, work, work.headSha, {
+      disposition: 'submission_failed',
+      reason: submission.message ?? 'submit_rejected',
+      event,
+    });
+  }
+
+  return finish(deps, work, work.headSha, {
+    disposition: verdict.approved ? 'approved' : 'changes_requested',
+    event,
+  });
+}
+
+function errorCode(error: unknown): string {
+  if (error instanceof Error && error.message) return error.message.slice(0, 120);
+  return 'unknown_error';
+}
+
+async function finish(
+  deps: SubmitDeps,
+  work: ReviewWorkItem,
+  headSha: string,
+  outcome: SubmitOutcome
+): Promise<SubmitOutcome> {
+  try {
+    await deps.recordReceipt({
+      correlationId: work.correlationId,
+      messageId: work.messageId,
+      owner: work.owner,
+      repo: work.repo,
+      prNumber: work.prNumber,
+      headSha,
+      disposition: outcome.disposition,
+      ...(outcome.event ? { event: outcome.event } : {}),
+      ...(outcome.reason ? { reason: outcome.reason } : {}),
+    });
+  } catch {
+    // Receipt failure never converts a classified outcome into a throw.
+  }
+  return outcome;
+}

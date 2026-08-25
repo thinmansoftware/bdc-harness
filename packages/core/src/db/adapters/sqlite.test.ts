@@ -145,6 +145,10 @@ describe('SqliteAdapter', () => {
         { principal_id: 'merge-manager', delivery_mode: 'notify_only', active: 0 },
         { principal_id: 'operator', delivery_mode: 'drain_on_start', active: 1 },
         { principal_id: 'overseer', delivery_mode: 'notify_only', active: 1 },
+        // WO-HARNESS-OVERSEER-REVIEW-ROUTE-01 (migration 043): sorted
+        // alphabetically by principal_id, same as the query's ORDER BY.
+        { principal_id: 'overseer-review-route', delivery_mode: 'notify_only', active: 1 },
+        { principal_id: 'overseer-reviewer', delivery_mode: 'worker_poll', active: 1 },
         { principal_id: 'xo', delivery_mode: 'drain_on_start', active: 1 },
       ]);
     });

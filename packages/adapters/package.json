@@ -7,6 +7,7 @@
   "exports": {
     ".": "./src/index.ts",
     "./*": "./src/*",
+    "./forge/github/webhook-signature": "./src/forge/github/webhook-signature.ts",
     "./community/forge/gitea": "./src/community/forge/gitea/index.ts",
     "./community/forge/gitlab": "./src/community/forge/gitlab/index.ts"
   },

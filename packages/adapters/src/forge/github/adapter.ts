@@ -3,7 +3,7 @@
  * Handles issue and PR comments with @mention detection
  */
 import { Octokit } from '@octokit/rest';
-import { createHmac, timingSafeEqual } from 'crypto';
+import { checkGitHubWebhookSignature } from './webhook-signature';
 import { readdir, access } from 'fs/promises';
 import { join } from 'path';
 import type { IPlatformAdapter, MessageMetadata } from '@archon/core';
@@ -260,39 +260,33 @@ export class GitHubAdapter implements IPlatformAdapter {
    * Verify webhook signature using HMAC SHA-256
    */
   private verifySignature(payload: string, signature: string): boolean {
-    try {
-      const hmac = createHmac('sha256', this.webhookSecret);
-      const digest = 'sha256=' + hmac.update(payload).digest('hex');
-
-      const digestBuffer = Buffer.from(digest);
-      const signatureBuffer = Buffer.from(signature);
-
-      if (digestBuffer.length !== signatureBuffer.length) {
-        getLog().error(
-          { receivedLength: signatureBuffer.length, computedLength: digestBuffer.length },
-          'github.signature_length_mismatch'
-        );
-        return false;
-      }
-
-      const isValid = timingSafeEqual(digestBuffer, signatureBuffer);
-
-      if (!isValid) {
-        getLog().error(
-          {
-            receivedPrefix: signature.substring(0, 15) + '...',
-            computedPrefix: digest.substring(0, 15) + '...',
-          },
-          'github.signature_mismatch'
-        );
-      }
-
-      return isValid;
-    } catch (error) {
-      const err = error as Error;
-      getLog().error({ err }, 'github.signature_verification_error');
+    // WO-HARNESS-OVERSEER-REVIEW-ROUTE-01: the HMAC-SHA256 + constant-time
+    // comparison now lives in ./webhook-signature.ts so the review-ingestion
+    // route reuses this exact proven implementation instead of a second one.
+    // Log lines below are unchanged from the original inline version.
+    const result = checkGitHubWebhookSignature(payload, signature, this.webhookSecret);
+    if (result.reason === 'length_mismatch') {
+      getLog().error(
+        {
+          receivedLength: Buffer.from(signature).length,
+          computedLength: Buffer.from(result.computedPrefix ?? '').length,
+        },
+        'github.signature_length_mismatch'
+      );
       return false;
     }
+    if (result.reason === 'digest_mismatch') {
+      getLog().error(
+        { receivedPrefix: result.receivedPrefix, computedPrefix: result.computedPrefix },
+        'github.signature_mismatch'
+      );
+      return false;
+    }
+    if (result.reason === 'verification_error' || result.reason === 'missing_signature') {
+      getLog().error({ reason: result.reason }, 'github.signature_verification_error');
+      return false;
+    }
+    return result.valid;
   }
 
   /**
