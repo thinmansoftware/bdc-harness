@@ -148,15 +148,38 @@ function normalizeEvent(row: WorkflowEventRow): OverseerWorkflowEventRow {
   };
 }
 
+/**
+ * A run is excluded from future watch cycles only once it has a TERMINAL
+ * overseer_actions row -- one that reflects a permanent, unchangeable
+ * disposition (a completed merge). Every other recorded action
+ * (verdict_write, merge_denied, merge_failed, tier_refused,
+ * escalation_denied, escalate_with_evidence, comment_findings) describes a
+ * snapshot of state that can change afterward -- CI can finish, a review
+ * can post, a retry can succeed -- and must not permanently lock the run
+ * out of re-evaluation.
+ *
+ * Anchor: 2026-08-25 E2E merge canary (WO-HARNESS-E2E-MERGE-CANARY-01,
+ * bdc-harness PR #705). The judge wrote a provisional `verdict_write` before
+ * CI had finished; the old `NOT EXISTS (... any row ...)` predicate excluded
+ * the run forever, so it never got picked up again even after CI went green
+ * and the PR was approved. The Merge Manager's own heartbeat stayed
+ * eligible:0 for 30+ minutes on a fully mergeable PR.
+ */
+const TERMINAL_OVERSEER_ACTIONS = ['merged'] as const;
+
 export async function listRunsForOverseerWatch(): Promise<OverseerWatchRun[]> {
+  const placeholders = TERMINAL_OVERSEER_ACTIONS.map(() => '?').join(', ');
   const result = await getDatabase().query<WorkflowRunRow>(
     `SELECT id, status, metadata, user_message, working_path
      FROM remote_agent_workflow_runs
      WHERE status IN ('completed', 'failed', 'escalated', 'cancelled')
        AND NOT EXISTS (
-         SELECT 1 FROM overseer_actions oa WHERE oa.run_id = remote_agent_workflow_runs.id
+         SELECT 1 FROM overseer_actions oa
+         WHERE oa.run_id = remote_agent_workflow_runs.id
+           AND oa.action IN (${placeholders})
        )
-     ORDER BY COALESCE(completed_at, last_activity_at, started_at) ASC`
+     ORDER BY COALESCE(completed_at, last_activity_at, started_at) ASC`,
+    [...TERMINAL_OVERSEER_ACTIONS]
   );
   return result.rows.map(normalizeRun);
 }
