@@ -1,7 +1,8 @@
-import { afterEach, beforeEach, describe, expect, it, mock, type Mock } from 'bun:test';
+import { afterAll, afterEach, beforeEach, describe, expect, it, mock, type Mock } from 'bun:test';
 import { mkdir, readFile, rm } from 'fs/promises';
 import { join } from 'path';
 import { tmpdir } from 'os';
+import * as realPaths from '@archon/paths';
 
 const mockLogFn = mock(() => {});
 const mockLogger = {
@@ -14,7 +15,14 @@ const mockLogger = {
   child: mock(() => mockLogger),
 };
 
+// WO-HARNESS-CI-BASE-SUITE-RED-01: `mock.module` patches Bun's GLOBAL module
+// registry for the whole test process. This stub previously replaced
+// `@archon/paths` wholesale and was never restored, so later-loaded files that
+// assert a REAL logger emitted a warning instead observed this shared
+// mockLogger -- 3 of the 51 base-suite failures. Spread the real module and
+// restore afterwards.
 mock.module('@archon/paths', () => ({
+  ...realPaths,
   createLogger: mock(() => mockLogger),
   getCommandFolderSearchPaths: (folder?: string) => {
     const paths = ['.archon/commands'];
@@ -23,6 +31,10 @@ mock.module('@archon/paths', () => ({
   },
   getDefaultCommandsPath: () => '/nonexistent/defaults',
 }));
+
+afterAll(() => {
+  mock.restore();
+});
 
 import { clearRegistry, registerBuiltinProviders } from '@archon/providers';
 import { executeDagWorkflow } from './dag-executor';
