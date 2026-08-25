@@ -19,7 +19,15 @@ import { join } from 'path';
 import { runCascade } from '../cascade.js';
 import type { CascadeDeps, RunCascadeOptions } from '../cascade.js';
 import type { FireResult, PollResult, GateVerdict, CascadeRunRecord } from '../types.js';
-import { loadLadder } from '../ladder.js';
+import { loadLadder, loadRefusedTiers } from '../ladder.js';
+
+/** Live ladder = canonical ladder minus refused (dark/retired) tiers.
+ *  Ruleset entry picks promote onto this ladder (entry floor semantics,
+ *  2026-08-25 OpenRouter defunding). */
+function loadLiveTiers() {
+  const refused = loadRefusedTiers();
+  return loadLadder().filter(t => !refused.includes(t.name));
+}
 import { loadRuleset } from '../conductor.js';
 import { TimeoutError } from '../poll.js';
 
@@ -224,7 +232,7 @@ describe('Test 2: CLIMB-ON-GATE-FAIL', () => {
     expect(record.telemetry.wonCheap).toBe(false);
 
     // Second fire used the next tier's workflowName
-    const tiers = loadLadder();
+    const tiers = loadLiveTiers();
     const entryTier = tiers[0];
     const nextTier = tiers[1];
     expect(fireCalls[0]).toBe(entryTier?.workflowName);
@@ -289,7 +297,7 @@ describe('Test: PROGRESS-TIMEOUT climbs (does not stop as infra-error)', () => {
     expect(record.telemetry.climbCount).toBe(1);
 
     // Second fire used the next tier's workflowName (same climb semantics as gate-fail)
-    const tiers = loadLadder();
+    const tiers = loadLiveTiers();
     const entryTier = tiers[0];
     const nextTier = tiers[1];
     expect(fireCalls[0]).toBe(entryTier?.workflowName);
@@ -449,7 +457,7 @@ describe('Test 3: WIN-CHEAP', () => {
     expect(record.telemetry.wonCheap).toBe(true);
     expect(record.telemetry.climbed).toBe(false);
     expect(record.telemetry.climbCount).toBe(0);
-    expect(record.winningTier).toBe('zero'); // exhaustion/mechanical tier since 2026-07-07
+    expect(record.winningTier).toBe(loadLiveTiers()[0]!.name); // entry floor (refused tiers promoted past)
     expect(record.attempts.length).toBe(1);
     expect(record.attempts[0]?.outcome).toBe('won');
   });
@@ -869,7 +877,7 @@ describe('Test: cancelled stops the cascade (real gate)', () => {
 
       // Only the entry (non-frontier) tier fired -- no climb.
       expect(fireCalls.length).toBe(1);
-      const tiers = loadLadder();
+      const tiers = loadLiveTiers();
       expect(fireCalls[0]).toBe(tiers[0]?.workflowName);
       expect(tiers[0]?.isFrontier).toBe(false);
 
