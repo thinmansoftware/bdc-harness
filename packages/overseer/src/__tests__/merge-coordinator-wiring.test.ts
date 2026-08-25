@@ -245,6 +245,12 @@ describe('merge coordinator wiring (WO-HARNESS-MERGE-MANAGER-WIRING-LAND-01)', (
 
     const manager = createMergeManager({
       mode: 'execute',
+      mutationsEnabled: true,
+      allowedBases: ['dev', 'staging'],
+      reviewGateLogin: 'thinman-review-gate[bot]',
+      listPullRequestReviews: async () => [
+        { login: 'thinman-review-gate[bot]', state: 'APPROVED', commitId: RUN_HEAD_SHA },
+      ],
       assembleEvidence: async () => ({
         evidence: mergeCandidateEvidence(),
         evidenceDigest: 'c'.repeat(64),

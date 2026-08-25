@@ -158,7 +158,11 @@ export interface GitHubClientDeps {
   findPullRequest(input: GitHubPullRequestSearchInput): Promise<PullRequestEvidence>;
   mergePullRequest(
     input: GitHubPullRequestMergeInput
-  ): Promise<{ merged: boolean; message?: string }>;
+  ): Promise<{ merged: boolean; message?: string; sha?: string }>;
+  /** Reviews used by the Merge Manager's distinct Review Gate approval check. */
+  listPullRequestReviews?(
+    input: PullRequestRef
+  ): Promise<{ login: string; state: string; commitId: string }[]>;
   /**
    * Tier 0 comment_findings channel (judge-first path). Optional: when absent
    * the pipeline records a loud 'comment_channel_unavailable' receipt rather

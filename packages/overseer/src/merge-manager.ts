@@ -24,6 +24,9 @@ import type {
 export const MERGE_MANAGER_IDENTITY = 'overseer-merge-manager-v1';
 export const PRODUCTION_EFFECT_HOLD_REASON = 'production_effect_held_for_john' as const;
 export const MERGE_MANAGER_MODE_ENV = 'OVERSEER_MERGE_MANAGER_MODE' as const;
+export const MERGE_MANAGER_MUTATIONS_ENABLED_ENV = 'MERGE_MANAGER_MUTATIONS_ENABLED' as const;
+export const MERGE_MANAGER_ALLOWED_BASES_ENV = 'MERGE_MANAGER_ALLOWED_BASES' as const;
+export const MERGE_MANAGER_REVIEW_GATE_LOGIN_ENV = 'MERGE_MANAGER_REVIEW_GATE_LOGIN' as const;
 export const MERGE_MANAGER_MODES = ['hold-canary', 'comment_findings', 'execute'] as const;
 export type MergeManagerMode = (typeof MERGE_MANAGER_MODES)[number];
 export const DEFAULT_MERGE_MANAGER_MODE: MergeManagerMode = 'hold-canary';
@@ -48,7 +51,7 @@ export interface MergeManagerDeps extends OverseerActionsDeps, GitHubClientDeps 
   readonly readWorktreeHeadSha?: (workingPath: string) => Promise<string | null>;
   readonly execute?: (
     evidence: QualifiedMergeEvidence
-  ) => Promise<{ readonly merged: boolean; readonly message?: string }>;
+  ) => Promise<{ readonly merged: boolean; readonly message?: string; readonly sha?: string }>;
   readonly operator?: MergeOperatorIdentity;
   /**
    * Explicit Merge Manager mode. When set, overrides OVERSEER_MERGE_MANAGER_MODE.
@@ -56,13 +59,21 @@ export interface MergeManagerDeps extends OverseerActionsDeps, GitHubClientDeps 
    */
   /** Explicit mode override for tests/DI. Unknown values fail closed via resolveMergeManagerMode. */
   readonly mode?: string;
+  /** Explicit activation/configuration overrides for tests and dependency injection. */
+  readonly mutationsEnabled?: boolean;
+  readonly allowedBases?: readonly string[];
+  readonly reviewGateLogin?: string;
 }
 
 export type MergeManagerResult =
   | {
       readonly status: 'executed';
       readonly receipt: GrokDispositionReceipt;
-      readonly execution: { readonly merged: boolean; readonly message?: string };
+      readonly execution: {
+        readonly merged: boolean;
+        readonly message?: string;
+        readonly sha?: string;
+      };
     }
   | {
       readonly status: 'held';
@@ -339,13 +350,68 @@ async function recordManagerAction(
 async function defaultExecute(
   deps: MergeManagerDeps,
   evidence: QualifiedMergeEvidence
-): Promise<{ readonly merged: boolean; readonly message?: string }> {
+): Promise<{ readonly merged: boolean; readonly message?: string; readonly sha?: string }> {
   return deps.mergePullRequest({
     owner: evidence.owner,
     repo: evidence.repository,
     number: evidence.pr_number,
     commitTitle: `Overseer merge ${evidence.record.woId}`,
   });
+}
+
+function envFlagEnabled(raw: string | undefined): boolean {
+  return raw?.trim().toLowerCase() === 'true';
+}
+
+function allowedBasesFromEnv(raw: string | undefined): readonly string[] {
+  return (raw ?? 'dev,staging')
+    .split(',')
+    .map(value => value.trim().toLowerCase())
+    .filter(Boolean);
+}
+
+async function mergePreconditionMiss(
+  deps: MergeManagerDeps,
+  evidence: QualifiedMergeEvidence,
+  allowedBases: readonly string[],
+  reviewGateLogin: string
+): Promise<string | null> {
+  const headSha = evidence.head_sha;
+  const checks = evidence.required_checks;
+  if (
+    checks.length === 0 ||
+    checks.some(check => check.conclusion !== 'success' || check.head_sha !== headSha)
+  ) {
+    return 'required_checks_not_green_on_head';
+  }
+  if (!allowedBases.includes(evidence.base_branch.trim().toLowerCase())) {
+    return 'base_branch_not_allowed';
+  }
+  if (evidence.record.prEvidence.mergeable !== true) {
+    return 'pull_request_not_mergeable';
+  }
+  if (!reviewGateLogin) return 'review_gate_login_unconfigured';
+  if (!deps.listPullRequestReviews) return 'review_gate_reviews_unavailable';
+
+  let reviews: Awaited<ReturnType<NonNullable<GitHubClientDeps['listPullRequestReviews']>>>;
+  try {
+    reviews = await deps.listPullRequestReviews({
+      owner: evidence.owner,
+      repo: evidence.repository,
+      number: evidence.pr_number,
+    });
+  } catch {
+    return 'review_gate_reviews_lookup_failed';
+  }
+  const normalizedLogin = reviewGateLogin.toLowerCase();
+  return reviews.some(
+    review =>
+      review.login.toLowerCase() === normalizedLogin &&
+      review.state.toUpperCase() === 'APPROVED' &&
+      review.commitId === headSha
+  )
+    ? null
+    : 'review_gate_approval_missing_for_head';
 }
 
 /**
@@ -366,12 +432,21 @@ export function createMergeManager(
     deps.execute ??
     ((
       evidence: QualifiedMergeEvidence
-    ): Promise<{ readonly merged: boolean; readonly message?: string }> =>
+    ): Promise<{ readonly merged: boolean; readonly message?: string; readonly sha?: string }> =>
       defaultExecute(deps, evidence));
   // deps.mode wins for tests/DI; else env; else hold-canary (fail closed).
   const mode = resolveMergeManagerMode(
     deps.mode !== undefined ? deps.mode : process.env[MERGE_MANAGER_MODE_ENV]
   );
+  const mutationsEnabled =
+    deps.mutationsEnabled ?? envFlagEnabled(process.env[MERGE_MANAGER_MUTATIONS_ENABLED_ENV]);
+  const allowedBases =
+    deps.allowedBases ?? allowedBasesFromEnv(process.env[MERGE_MANAGER_ALLOWED_BASES_ENV]);
+  const reviewGateLogin = (
+    deps.reviewGateLogin ??
+    process.env[MERGE_MANAGER_REVIEW_GATE_LOGIN_ENV] ??
+    ''
+  ).trim();
 
   return async (record: WatchedRunRecord): Promise<MergeManagerResult> => {
     const assembled = await assembleEvidence(record);
@@ -529,13 +604,52 @@ export function createMergeManager(
       };
     }
 
-    // execute: explicit opt-in only. Still subject to production-effect + provenance above.
+    // execute: both legacy mode and the mutation flag are explicit opt-ins.
+    if (!mutationsEnabled) {
+      return {
+        status: 'held',
+        receipt,
+        execution: null,
+        reason: 'mutations_disabled',
+        mode,
+      };
+    }
+
+    const preconditionMiss = await mergePreconditionMiss(
+      deps,
+      evidence,
+      allowedBases,
+      reviewGateLogin
+    );
+    if (preconditionMiss) {
+      await recordManagerAction(
+        deps,
+        record,
+        'merge_denied',
+        JSON.stringify({ ...association, precondition_miss_reason: preconditionMiss })
+      );
+      return {
+        status: 'held',
+        receipt,
+        execution: null,
+        reason: preconditionMiss,
+        mode,
+      };
+    }
+
     const execution = await execute(evidence);
     await recordManagerAction(
       deps,
       record,
       execution.merged ? 'merged' : 'merge_failed',
-      execution.message ?? (execution.merged ? 'merge_manager_executed' : 'merge_manager_failed')
+      JSON.stringify({
+        ...association,
+        message:
+          execution.message ??
+          (execution.merged ? 'merge_manager_executed' : 'merge_manager_failed'),
+        mutation_sent: execution.merged,
+        merged_sha: execution.merged ? (execution.sha ?? null) : null,
+      })
     );
     return { status: 'executed', receipt, execution };
   };

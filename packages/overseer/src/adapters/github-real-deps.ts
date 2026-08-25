@@ -71,6 +71,7 @@ export interface RealGitHubOctokitLike {
       repo: string;
       pull_number: number;
       sha: string;
+      merge_method: 'squash';
     }): Promise<{ data: { merged: boolean; sha?: string | null } }>;
     /**
      * Optional so unrelated mocks (e.g. github-qualified-merge.test.ts's
@@ -83,6 +84,14 @@ export interface RealGitHubOctokitLike {
       pull_number: number;
       event: 'APPROVE';
     }): Promise<{ data: { id: number; state: string } }>;
+    listReviews?(input: {
+      owner: string;
+      repo: string;
+      pull_number: number;
+      per_page: number;
+    }): Promise<{
+      data: { user: { login?: string | null } | null; state: string; commit_id: string }[];
+    }>;
   };
   search: {
     issuesAndPullRequests(input: Record<string, unknown>): Promise<{
@@ -356,10 +365,12 @@ export function createRealFindPullRequest(
  */
 export function createRealMergePullRequest(
   octokit: RealGitHubOctokitLike
-): (input: GitHubPullRequestMergeInput) => Promise<{ merged: boolean; message?: string }> {
+): (
+  input: GitHubPullRequestMergeInput
+) => Promise<{ merged: boolean; message?: string; sha?: string }> {
   return async (
     input: GitHubPullRequestMergeInput
-  ): Promise<{ merged: boolean; message?: string }> => {
+  ): Promise<{ merged: boolean; message?: string; sha?: string }> => {
     const pr = await octokit.pulls.get({
       owner: input.owner,
       repo: input.repo,
@@ -371,11 +382,16 @@ export function createRealMergePullRequest(
         repo: input.repo,
         pull_number: input.number,
         sha: pr.data.head.sha,
+        merge_method: 'squash',
       });
       if (!response.data.merged) {
         return { merged: false, message: 'github_merge_not_merged' };
       }
-      return { merged: true, message: input.commitTitle };
+      return {
+        merged: true,
+        message: input.commitTitle,
+        ...(response.data.sha ? { sha: response.data.sha } : {}),
+      };
     } catch (error) {
       const status =
         typeof error === 'object' && error !== null && 'status' in error
@@ -455,6 +471,24 @@ export function createRealGitHubClientDeps(
   return {
     findPullRequest: createRealFindPullRequest(octokit),
     mergePullRequest: createRealMergePullRequest(octokit),
+    listPullRequestReviews: async (
+      input
+    ): Promise<{ login: string; state: string; commitId: string }[]> => {
+      if (!octokit.pulls.listReviews) {
+        throw new Error('overseer_real_adapter_missing_list_reviews_api');
+      }
+      const response = await octokit.pulls.listReviews({
+        owner: input.owner,
+        repo: input.repo,
+        pull_number: input.number,
+        per_page: 100,
+      });
+      return response.data.map(review => ({
+        login: review.user?.login ?? '',
+        state: review.state,
+        commitId: review.commit_id,
+      }));
+    },
     commentOnPullRequest: async (input): Promise<{ commented: boolean; url?: string }> => {
       if (!octokit.issues) {
         throw new Error('overseer_real_adapter_missing_issues_api');
