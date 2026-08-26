@@ -141,11 +141,19 @@ async function spawnGrok(prompt: string, timeoutMs: number): Promise<GrokSpawnRe
   });
 
   const processResult = (async (): Promise<GrokSpawnResult> => {
-    const [exitCode, stdout] = await Promise.all([
+    // Capture BOTH streams. 15th canary defect (2026-08-26): with no TTY,
+    // `bunx @openai/codex exec` writes its ENTIRE output -- verdict included
+    // -- to stderr; stdout arrives empty with exit 0, so every judgment
+    // parsed as HOLD. (Shell repros hid this behind 2>&1.) stdout wins when
+    // non-empty; stderr is the fallback payload, run through the same
+    // normalizer + strict parser, so fail-closed semantics are unchanged.
+    const [exitCode, stdout, stderr] = await Promise.all([
       subprocess.exited,
       new Response(subprocess.stdout).text(),
+      new Response(subprocess.stderr).text(),
     ]);
-    return { exitCode, stdout: normalizeWrapperStdout(binary, stdout), timedOut: false };
+    const payload = stdout.trim().length > 0 ? stdout : stderr;
+    return { exitCode, stdout: normalizeWrapperStdout(binary, payload), timedOut: false };
   })();
 
   const result = await Promise.race([processResult, timeoutResult]);
