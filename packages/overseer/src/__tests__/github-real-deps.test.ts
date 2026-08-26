@@ -468,3 +468,59 @@ describe('createRealFindPullRequest rate-limit load profile', () => {
     expect(list).toHaveBeenCalledTimes(3);
   });
 });
+
+// 7th canary defect (2026-08-25): permanent unsearchability must not cycle as transient.
+import { describe as describe422, test as test422, expect as expect422 } from 'bun:test';
+import { createRealFindPullRequest as mkFind422 } from '../adapters/github-real-deps.js';
+
+describe422('findPullRequest permanent 422 handling', () => {
+  test422(
+    '422 search error returns missing (permanent), not lookup_failed (transient)',
+    async () => {
+      const octokit = {
+        pulls: {
+          list: async () => ({ data: [] }),
+          get: async () => {
+            throw new Error('unreachable');
+          },
+        },
+        search: {
+          issuesAndPullRequests: async () => {
+            const e = new Error('Validation Failed: cannot be searched') as Error & {
+              status: number;
+            };
+            e.status = 422;
+            throw e;
+          },
+        },
+        checks: { listForRef: async () => ({ data: { check_runs: [] } }) },
+      };
+      const find = mkFind422(octokit as never, {
+        logger: { warn: () => undefined, error: () => undefined } as never,
+      });
+      const evidence = await find({ owner: 'o', repo: 'ungranted-repo', woId: 'WO-X-01' });
+      expect422(evidence.lookupFailed ?? false).toBe(false);
+      expect422(evidence.exists).toBe(false);
+    }
+  );
+
+  test422("woId 'unknown' never reaches the search endpoint", async () => {
+    let searched = false;
+    const octokit = {
+      pulls: { list: async () => ({ data: [] }), get: async () => ({ data: {} }) },
+      search: {
+        issuesAndPullRequests: async () => {
+          searched = true;
+          return { data: { items: [] } };
+        },
+      },
+      checks: { listForRef: async () => ({ data: { check_runs: [] } }) },
+    };
+    const find = mkFind422(octokit as never, {
+      logger: { warn: () => undefined, error: () => undefined } as never,
+    });
+    const evidence = await find({ owner: 'o', repo: 'r', woId: 'unknown' });
+    expect422(searched).toBe(false);
+    expect422(evidence.exists).toBe(false);
+  });
+});

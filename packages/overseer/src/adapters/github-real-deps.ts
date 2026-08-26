@@ -370,7 +370,9 @@ export function createRealFindPullRequest(
         prNumber = list.data[0]?.number ?? null;
       }
 
-      if (prNumber === null && input.woId) {
+      // 'unknown' is parseWoId's could-not-parse fallback, not a WO id --
+      // searching for the literal word would return garbage matches.
+      if (prNumber === null && input.woId && input.woId !== 'unknown') {
         const search = await octokit.search.issuesAndPullRequests({
           q: `repo:${input.owner}/${input.repo} is:pr ${input.woId} in:title`,
           per_page: 5,
@@ -431,6 +433,22 @@ export function createRealFindPullRequest(
           );
         }
         return LOOKUP_FAILED_EVIDENCE;
+      }
+      // 422 'cannot be searched' = the repo does not exist or this credential
+      // (the App installation) has no access to it. PERMANENT for us: a repo
+      // the App cannot read is a repo the Merge Manager could never act on.
+      // 7th canary defect (2026-08-25): 102 legacy runs pointing at repos
+      // outside the App's grant cycled forever as 'transient' failures.
+      const status =
+        typeof error === 'object' && error !== null && 'status' in error
+          ? (error as { status?: number }).status
+          : undefined;
+      if (status === 422) {
+        logger.warn(
+          { owner: input.owner, repo: input.repo, woId: input.woId },
+          'overseer.github_real_deps.repo_unsearchable_permanent'
+        );
+        return MISSING_EVIDENCE;
       }
       logger.error({ err: error, input }, 'overseer.github_real_deps.find_pull_request_failed');
       return LOOKUP_FAILED_EVIDENCE;
