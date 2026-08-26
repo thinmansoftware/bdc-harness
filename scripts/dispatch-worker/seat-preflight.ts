@@ -20,7 +20,7 @@ export interface SeatConfig {
   /** Stable seat identity, e.g. 'bdc-seat-grok'. */
   seat_id: string;
   /** Model family served by this seat. Omitted Phase A configs default to Grok. */
-  model_family?: 'grok' | 'codex' | 'claude';
+  model_family?: 'grok' | 'codex' | 'claude' | 'cursor';
   /**
    * Providers this seat may advertise and run. Seats are single-provider:
    * exactly one entry, and it must match the configured model family.
@@ -89,6 +89,7 @@ export type SeatPreflightErrorCode =
   | 'seat_provider_not_grok'
   | 'seat_provider_not_codex'
   | 'seat_provider_not_claude'
+  | 'seat_provider_not_cursor'
   | 'seat_provider_command_unavailable'
   | 'seat_secret_ingress_missing'
   | 'seat_vendor_profile_dir_invalid'
@@ -118,13 +119,34 @@ const FAMILY_ADAPTERS: Record<ModelFamily, ReadonlySet<string>> = {
   grok: new Set(['grok-acp', 'grok']),
   codex: new Set(['codex', 'codex-mcp']),
   claude: new Set(['claude', 'claude-acp']),
+  // WO-HARNESS-CURSOR-BUILD-SEAT-01: the cursor seat is a BUILD seat, so only
+  // the build-capable leg is allowed. The read-only `cursor` adapter
+  // (--mode ask) is deliberately NOT in this set: a build seat that silently
+  // cannot write files would burn a rung and report success.
+  cursor: new Set(['cursor-build']),
 };
 
 const FAMILY_ERROR_CODE: Record<ModelFamily, SeatPreflightErrorCode> = {
   grok: 'seat_provider_not_grok',
   codex: 'seat_provider_not_codex',
   claude: 'seat_provider_not_claude',
+  cursor: 'seat_provider_not_cursor',
 };
+
+/**
+ * WO-HARNESS-CURSOR-BUILD-SEAT-01 -- empty-output guard.
+ *
+ * cursor-agent exits 0 with NO output when workspace trust is not granted
+ * (verified live on the target host, 2026-08-26: the CLI prints a Workspace
+ * Trust notice and returns rc 0). A zero exit code is therefore NOT sufficient
+ * evidence that the seat did any work. Callers MUST treat an empty result as
+ * a failed attempt rather than a silent success.
+ *
+ * Same rule as the Board-Secretary 0-byte-output prior art.
+ */
+export function cursorBuildResultIsEmpty(stdout: string): boolean {
+  return stdout.trim().length === 0;
+}
 
 function fail(code: SeatPreflightErrorCode, field: string): SeatPreflightResult {
   return { ok: false, code, field };

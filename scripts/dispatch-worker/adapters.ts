@@ -91,6 +91,27 @@ export const defaultAgentConfigs: Record<string, AgentConfig> = {
     command: 'cursor-agent',
     args: ['--print', '--mode', 'ask', '--trust'],
   },
+  /**
+   * WO-HARNESS-CURSOR-BUILD-SEAT-01: build-capable cursor leg for the M-131
+   * cursor seat. Distinct from the read-only `cursor` entry above, which
+   * passes `--mode ask` and therefore CANNOT write files -- correct for a
+   * judge/Q&A call, useless for a build seat.
+   *
+   * Flags verified live against cursor-agent 2026.08.11-e8db854 on the target
+   * host (`cursor-agent --help`, 2026-08-26):
+   *  - `--print` is the non-interactive mode and per its own help text "Has
+   *    access to all tools, including write and shell". No `--mode` is passed:
+   *    the only two choices are `plan` and `ask` and BOTH are read-only.
+   *  - `--force` is required for the agent to run commands without prompting.
+   *  - `--trust` suppresses the Workspace Trust prompt. Without it the CLI
+   *    prints the trust notice and exits 0 with EMPTY output -- a silent
+   *    no-op that reads as success. Verified live: the seat MUST also treat
+   *    empty output as failure (see cursorBuildResultIsEmpty).
+   */
+  'cursor-build': {
+    command: 'cursor-agent',
+    args: ['--print', '--force', '--trust'],
+  },
   fusion: {
     kind: 'fusion',
     command: 'bun',
