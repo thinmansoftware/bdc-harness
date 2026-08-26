@@ -12,6 +12,7 @@ import {
   type SeatConfig,
   type SeatPreflightDeps,
 } from './seat-preflight';
+import { CURSOR_GROK_MODEL, defaultAgentConfigs } from './adapters';
 import ladderConfig from '../../packages/smart-cauldron/config/ladder.config.json';
 
 const GOOD_SEAT_CURSOR: SeatConfig = {
@@ -88,6 +89,75 @@ describe('cursor seat preflight', () => {
     expect(result.ok).toBe(false);
     if (result.ok) return;
     expect(result.code).toBe('seat_provider_command_unavailable');
+  });
+});
+
+describe('grok-via-cursor transport', () => {
+  // The transport half: a GROK seat whose container-side pipe is cursor-agent.
+  // The seat stays the grok seat -- only the transport differs -- so this must
+  // pass under model_family 'grok', not a cursor family.
+  const GROK_OVER_CURSOR: SeatConfig = {
+    seat_id: 'bdc-seat-grok',
+    model_family: 'grok',
+    provider_allowlist: ['grok-via-cursor'],
+    secret_ingress_file: '/run/m131/secret-ingress/cursor-credential.json',
+    vendor_profile_dir: '/home/seat/.cursor',
+    state_dir: '/var/lib/bdc-seat-grok',
+  };
+
+  const GROK_COMMANDS = {
+    'grok-via-cursor': 'cursor-agent',
+    grok: 'grok',
+    'grok-acp': 'grok',
+  };
+
+  test('a grok seat may run over the cursor transport', async () => {
+    const result = await runSeatPreflight(GROK_OVER_CURSOR, GROK_COMMANDS, fakeDeps());
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.seatId).toBe('bdc-seat-grok');
+    expect(result.providers).toEqual(['grok-via-cursor']);
+  });
+
+  test('the transport is refused for a non-grok family', async () => {
+    const result = await runSeatPreflight(
+      { ...GROK_OVER_CURSOR, model_family: 'codex' },
+      GROK_COMMANDS,
+      fakeDeps()
+    );
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.code).toBe('seat_provider_not_codex');
+  });
+
+  test('fails closed when cursor-agent is absent on a grok transport seat', async () => {
+    const result = await runSeatPreflight(
+      GROK_OVER_CURSOR,
+      GROK_COMMANDS,
+      fakeDeps({ commandAvailable: async () => false })
+    );
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.code).toBe('seat_provider_command_unavailable');
+  });
+});
+
+describe('cursor grok model id', () => {
+  // The id must be a named, overridable constant -- Cursor's roster moved
+  // 4.3 -> 4.5 -> 4.6 inside two months, so a moved id is a config change.
+  test('defaults to the live-verified id and is env-overridable', () => {
+    expect(CURSOR_GROK_MODEL).toBeTruthy();
+    expect(defaultAgentConfigs['grok-via-cursor']?.args).toContain(CURSOR_GROK_MODEL);
+  });
+
+  test('the transport passes no --mode flag (both choices are read-only)', () => {
+    expect(defaultAgentConfigs['grok-via-cursor']?.args).not.toContain('--mode');
+  });
+
+  test('the transport passes --force and --trust', () => {
+    const args = defaultAgentConfigs['grok-via-cursor']?.args ?? [];
+    expect(args).toContain('--force');
+    expect(args).toContain('--trust');
   });
 });
 

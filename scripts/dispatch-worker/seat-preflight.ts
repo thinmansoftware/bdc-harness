@@ -116,7 +116,12 @@ type ModelFamily = NonNullable<SeatConfig['model_family']>;
 // either transport for its family; preflight still enforces exactly one
 // PROVIDER (not one transport) per the existing single-entry allowlist rule.
 const FAMILY_ADAPTERS: Record<ModelFamily, ReadonlySet<string>> = {
-  grok: new Set(['grok-acp', 'grok']),
+  // 'grok-via-cursor' is the container-side transport added by
+  // WO-HARNESS-CURSOR-BUILD-SEAT-01: the xAI API is defunded, so a grok seat
+  // running inside a container reaches Grok THROUGH cursor-agent. It is a
+  // transport for the grok family, not a separate family -- the seat is still
+  // the grok seat, only the pipe differs.
+  grok: new Set(['grok-acp', 'grok', 'grok-via-cursor']),
   codex: new Set(['codex', 'codex-mcp']),
   claude: new Set(['claude', 'claude-acp']),
   // WO-HARNESS-CURSOR-BUILD-SEAT-01: the cursor seat is a BUILD seat, so only

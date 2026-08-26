@@ -62,6 +62,15 @@ export interface FusionReviewRequest {
   ci?: boolean;
 }
 
+/**
+ * Grok model id as exposed by Cursor. Verified live 2026-08-26 against
+ * `cursor-agent --list-models` on the target host. Overridable by env because
+ * Cursor's roster moves (Grok 4.3 -> 4.5 -> 4.6 inside two months); a moved id
+ * must be a config change, not a code change.
+ */
+export const CURSOR_GROK_MODEL =
+  process.env.CURSOR_GROK_MODEL ?? 'cursor-grok-4.6-high-fast';
+
 export const defaultAgentConfigs: Record<string, AgentConfig> = {
   claude: {
     command: 'claude',
@@ -111,6 +120,32 @@ export const defaultAgentConfigs: Record<string, AgentConfig> = {
   'cursor-build': {
     command: 'cursor-agent',
     args: ['--print', '--force', '--trust'],
+  },
+  /**
+   * WO-HARNESS-CURSOR-BUILD-SEAT-01 (transport half): reach the GROK seat
+   * container-side THROUGH cursor-agent.
+   *
+   * Why this exists: the xAI API is defunded (John, 2026-08-26 -- no credits,
+   * no top-up), so the plain `grok` adapter above has no funded backend from
+   * inside a container. The desktop grok CLI still works but is machine-bound
+   * and cannot serve archon-app-1. Cursor fronts Grok on the existing Ultra
+   * subscription, which makes this the ONLY container-side path back to the
+   * grok seat. This is an outage workaround, not an enhancement.
+   *
+   * Model id verified live 2026-08-26 via `cursor-agent --list-models` on the
+   * target host, then proven end-to-end in a scratch container:
+   *   cursor-agent -f -p --model cursor-grok-4.6-high-fast "..." -> rc 0,
+   *   non-empty response. The 2026-07-22 feasibility doc had listed the exact
+   *   Grok model-id string as UNCONFIRMED; this resolves it.
+   *
+   * Same three CLI traps as cursor-build apply (no --mode: both choices are
+   * read-only; --force to run commands; --trust or the CLI exits 0 with EMPTY
+   * output). Empty output MUST be treated as failure -- see
+   * cursorBuildResultIsEmpty in seat-preflight.ts.
+   */
+  'grok-via-cursor': {
+    command: 'cursor-agent',
+    args: ['--print', '--force', '--trust', '--model', CURSOR_GROK_MODEL],
   },
   fusion: {
     kind: 'fusion',
