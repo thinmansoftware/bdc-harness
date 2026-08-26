@@ -16,7 +16,18 @@
  * subscription remains a separate, external step.
  */
 import * as dispatch from '@archon/core/db/dispatch';
+import {
+  createRealFetchExactHeadPullRequestEvidence,
+  createRealOctokitClient,
+  createRealSubmitPullRequestReview,
+} from './adapters/github-real-deps';
 import type { IngestDeps, PriorReviewWork } from './pr-review-ingest.ts';
+import {
+  configuredReviewIdentity,
+  evaluatePullRequest,
+  invokeConfiguredReviewModel,
+} from './pr-review-evaluator';
+import type { ReviewerVerdict, SubmitDeps } from './pr-review-submit.ts';
 
 /** Env var carrying the shared GitHub webhook secret for the review route. */
 export const REVIEW_WEBHOOK_SECRET_ENV = 'OVERSEER_REVIEW_WEBHOOK_SECRET';
@@ -211,6 +222,71 @@ export function createRealIngestDeps(config: ReviewRouteConfig): IngestDeps {
           reason: input.reason ?? null,
           messageId: input.messageId ?? null,
         }),
+      });
+    },
+  };
+}
+
+/** Bind WO-2's evaluator into WO-1's injected submit-side reviewer seam. */
+export function createRealSubmitDeps(
+  reviewerIdentity = REVIEW_REVIEWER_IDENTITY_DEFAULT
+): SubmitDeps {
+  const octokit = createRealOctokitClient();
+  const fetchEvidence = createRealFetchExactHeadPullRequestEvidence(octokit);
+  return {
+    reviewerIdentity,
+    async runReviewer(work): Promise<ReviewerVerdict> {
+      const result = await evaluatePullRequest(
+        {
+          owner: work.owner,
+          repo: work.repo,
+          pr_number: work.prNumber,
+          head_sha: work.headSha,
+        },
+        {
+          reviewer: configuredReviewIdentity(),
+          fetchEvidence: request =>
+            fetchEvidence({
+              owner: request.owner,
+              repo: request.repo,
+              prNumber: request.pr_number,
+              headSha: request.head_sha,
+            }),
+          // No authorized runtime WO-spec source exists in this repository.
+          // Missing criteria is an explicit, recorded degrade path.
+          fetchAcceptanceCriteria: async () => null,
+          invokeModel: invokeConfiguredReviewModel,
+        }
+      );
+      const summary =
+        result.findings.length > 0
+          ? result.findings
+              .map(finding => `[${finding.severity}] ${finding.scope}: ${finding.summary}`)
+              .join('\n')
+          : (result.error ?? 'No blocking findings.');
+      return {
+        approved: result.verdict === 'APPROVE',
+        summary,
+        reviewedHeadSha: result.reviewed_head_sha,
+      };
+    },
+    submitReview: createRealSubmitPullRequestReview(octokit),
+    async currentHeadSha(input): Promise<string> {
+      const pr = await octokit.pulls.get({
+        owner: input.owner,
+        repo: input.repo,
+        pull_number: input.prNumber,
+      });
+      return pr.data.head.sha;
+    },
+    async recordReceipt(input): Promise<void> {
+      await dispatch.createMessage({
+        correlation_id: input.correlationId,
+        idempotency_key: `pr-review-submit-receipt:${input.messageId}:${input.disposition}`,
+        task_type: 'run_report',
+        sender: REVIEW_SENDER,
+        recipient: 'operator',
+        body: JSON.stringify({ kind: 'pr_review_submit_receipt', ...input }),
       });
     },
   };
