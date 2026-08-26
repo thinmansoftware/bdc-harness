@@ -79,8 +79,29 @@ function buildGrokPrompt(evidence: GrokJudgeEvidence): string {
   ].join('\n');
 }
 
+/**
+ * Binary selection mirrors the primary judge ladder's env knob
+ * (OVERSEER_JUDGE_LADDER, judge-first.ts) rather than duplicating a second
+ * independent config surface. 13th canary defect (2026-08-26): this
+ * second-opinion gate is a SEPARATE spawn site from the primary judge and
+ * stayed hardcoded to 'grok' after #716 gave the primary judge a codex
+ * fallback -- CANARY-02 got a real merge_candidate verdict from the primary
+ * judge, then died here on grok's exit 1 (xAI credits exhausted) with no
+ * fallback. Reads the SAME env var so one flip recovers both sites.
+ */
+function secondOpinionBinary(): string {
+  const raw = process.env.OVERSEER_JUDGE_LADDER ?? 'grok';
+  const first = raw.split(',')[0]?.trim();
+  return first && first.length > 0 ? first : 'grok';
+}
+
 async function spawnGrok(prompt: string, timeoutMs: number): Promise<GrokSpawnResult> {
-  const subprocess = Bun.spawn(['grok', '-p', prompt], {
+  const binary = secondOpinionBinary();
+  const argv =
+    binary === 'codex'
+      ? ['bunx', '@openai/codex', 'exec', '--skip-git-repo-check', prompt]
+      : [binary, '-p', prompt];
+  const subprocess = Bun.spawn(argv, {
     stdout: 'pipe',
     stderr: 'pipe',
   });
