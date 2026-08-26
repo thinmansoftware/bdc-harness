@@ -179,7 +179,7 @@ describe('real GitHub deps', () => {
     });
 
     expect(search).toHaveBeenCalledWith({
-      q: 'repo:thinmansoftware/bdc-harness is:pr WO-FALLBACK-77 in:title',
+      q: 'repo:thinmansoftware/bdc-harness is:pr "WO-FALLBACK-77"',
       per_page: 5,
     });
     expect(get).toHaveBeenCalledWith({
