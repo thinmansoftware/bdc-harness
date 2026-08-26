@@ -418,6 +418,56 @@ describe('handleRecordJudgeFirst: pipeline (continued)', () => {
       escalate: fakeEscalate,
     });
     expect(judgeCalls).toBe(0);
+    // Replay of a non-actionable (ignore) record now writes exactly ONE
+    // terminal watch_closed disposition (judge-first window drain, 8th canary
+    // defect 2026-08-25) -- and nothing else: no merge, no escalation, no
+    // model call, no finalize.
+    expect(actions).toHaveLength(1);
+    expect(actions[0]?.action).toBe('watch_closed');
+    expect(state.finalized).toHaveLength(0);
+  });
+
+  test('Test 3b: lost claim on a merge_ready record writes NOTHING (stays live)', async () => {
+    const state: FakeStoreState = { claims: [], finalized: [] };
+    const { actions, deps } = makeDeps();
+    await handleRecordJudgeFirst(
+      makeRecord({ action: 'merge_ready', reason: 'green mergeable PR' }),
+      deps,
+      {
+        dryRun: false,
+        actor: 'test',
+        verdictStore: makeVerdictStore({ claimed: false }, state),
+        judge: async () => verdictOutcome(),
+        escalate: fakeEscalate,
+      }
+    );
+    expect(actions).toHaveLength(0);
+    expect(state.finalized).toHaveLength(0);
+  });
+
+  test('Test 3c: lost claim with a TRANSIENT lookup failure stays open (no close)', async () => {
+    const state: FakeStoreState = { claims: [], finalized: [] };
+    const { actions, deps } = makeDeps();
+    await handleRecordJudgeFirst(
+      makeRecord({
+        action: 'ignore',
+        prEvidence: {
+          exists: false,
+          state: 'lookup_failed',
+          checks: { total: 0, passed: 0, failed: 0, pending: 0 },
+          mergeable: null,
+          lookupFailed: true,
+        },
+      }),
+      deps,
+      {
+        dryRun: false,
+        actor: 'test',
+        verdictStore: makeVerdictStore({ claimed: false }, state),
+        judge: async () => verdictOutcome(),
+        escalate: fakeEscalate,
+      }
+    );
     expect(actions).toHaveLength(0);
     expect(state.finalized).toHaveLength(0);
   });

@@ -297,6 +297,38 @@ export async function handleRecordJudgeFirst(
   if (!claim.claimed || !claim.verdictId) {
     // Replay of already-judged (or in-flight) evidence: never re-bill, never re-act.
     log.debug({ runId: record.runId, headSha }, 'overseer.judge_first.claim_not_won');
+    // Window drain, judge-first edition (8th canary defect, 2026-08-25): the
+    // service-layer watch_closed drain lives in the LEGACY branch, but
+    // production runs OVERSEER_JUDGE_FIRST=1 -- so already-judged runs hit
+    // this replay gate every tick, write nothing, and re-occupy the bounded
+    // oldest-first window forever (102 fossils, heartbeat static). An
+    // already-judged run whose CURRENT evidence is non-actionable closes
+    // terminally here; merge_ready/escalate records stay live. Transient
+    // lookup failures (identity present, API errored) also stay open.
+    const identityAbsent = !record.owner || !record.repo;
+    if (
+      (record.action === 'success' || record.action === 'ignore') &&
+      (!record.prEvidence?.lookupFailed || identityAbsent)
+    ) {
+      try {
+        await deps.insertOverseerAction({
+          runId: record.runId,
+          woId: record.woId,
+          class: record.errorClass ?? 'none',
+          action: 'watch_closed',
+          result: `judge_first_replay: ${record.reason}`,
+        });
+        log.info(
+          { runId: record.runId, woId: record.woId, action: record.action },
+          'overseer.judge_first.watch_closed'
+        );
+      } catch (error) {
+        log.error(
+          { err: error as Error, runId: record.runId, woId: record.woId },
+          'overseer.judge_first.watch_closed_write_failed'
+        );
+      }
+    }
     return;
   }
 
