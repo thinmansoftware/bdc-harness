@@ -1,4 +1,4 @@
-import { describe, expect, test } from 'bun:test';
+import { describe, expect, test, afterEach } from 'bun:test';
 import { judgeWithGrok, parseGrokVerdict } from '../judge-second-opinion.ts';
 import type { GrokJudgeEvidence } from '../types.ts';
 
@@ -93,5 +93,28 @@ describe('grok second-opinion judge', () => {
     expect(prompt).toContain(`Evidence digest: ${evidence.evidenceDigest}`);
     expect(prompt).toContain('APPROVE advances the candidate to deterministic gates');
     expect(prompt).not.toContain('WO-HARNESS-OVERSEER-V1B-GROK-MERGE-JUDGE-01');
+  });
+});
+
+// 13th canary defect (2026-08-26): this gate stayed hardcoded to grok while
+// the primary judge (judge-first.ts) got a codex fallback in #716.
+describe('judgeWithGrok: env-driven binary (13th canary defect)', () => {
+  const ORIGINAL = process.env.OVERSEER_JUDGE_LADDER;
+  afterEach(() => {
+    if (ORIGINAL === undefined) delete process.env.OVERSEER_JUDGE_LADDER;
+    else process.env.OVERSEER_JUDGE_LADDER = ORIGINAL;
+  });
+
+  test('reads OVERSEER_JUDGE_LADDER first entry via the injected spawn seam', async () => {
+    process.env.OVERSEER_JUDGE_LADDER = 'codex,grok';
+    let sawApprove = false;
+    const receipt = await judgeWithGrok(evidence, {
+      spawn: async () => {
+        sawApprove = true;
+        return { exitCode: 0, stdout: 'VERDICT: APPROVE', timedOut: false };
+      },
+    });
+    expect(sawApprove).toBe(true);
+    expect(receipt.disposition).toBe('approve');
   });
 });
