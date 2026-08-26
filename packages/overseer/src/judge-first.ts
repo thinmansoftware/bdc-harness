@@ -277,7 +277,19 @@ async function spawnJudgeBinary(
   prompt: string,
   timeoutMs: number
 ): Promise<JudgeSpawnResult> {
-  const subprocess = Bun.spawn([binary, '-p', prompt], {
+  // Per-binary invocation: grok takes -p <prompt>; codex uses its exec
+  // subcommand (M-48 fallback rung, John 2026-08-26: "Give it to codex" --
+  // added when the xAI team ran out of credits and the single-rung ladder
+  // left the judge with no path to a verdict). parseJudgeOutput scans for
+  // the first JSON object, so codex's surrounding chatter is tolerated.
+  // 'codex' is not a container binary -- the CLI runs via bunx with the
+  // mounted /root/.codex/auth.json (live-verified 2026-08-26: returns clean
+  // JSON through `bunx @openai/codex exec`).
+  const argv =
+    binary === 'codex'
+      ? ['bunx', '@openai/codex', 'exec', '--skip-git-repo-check', prompt]
+      : [binary, '-p', prompt];
+  const subprocess = Bun.spawn(argv, {
     stdout: 'pipe',
     stderr: 'pipe',
   });

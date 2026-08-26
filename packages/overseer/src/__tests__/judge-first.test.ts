@@ -653,3 +653,37 @@ describe('evidence envelope: bounded by construction', () => {
     expect(envelope.hint.action).toBe('ignore');
   });
 });
+
+// Codex fallback rung (John 2026-08-26: "Give it to codex" -- xAI credits dry).
+import { describe as dCx, test as tCx, expect as eCx, mock as mCx } from 'bun:test';
+import { judgeTerminalRun as judgeCx } from '../judge-first.js';
+
+dCx('codex judge rung invocation', () => {
+  tCx('codex rung judges when grok is unavailable', async () => {
+    const spawns: string[][] = [];
+    const outcome = await judgeCx(
+      {
+        runId: 'run-cx',
+        woId: 'WO-CX-01',
+        status: 'completed',
+        reason: 'r',
+        events: [],
+      } as never,
+      {
+        ladder: ['grok', 'codex'],
+        spawn: async (binary: string, _prompt: string) => {
+          spawns.push([binary]);
+          if (binary === 'grok') return { exitCode: 1, stdout: '', timedOut: false };
+          return {
+            exitCode: 0,
+            stdout:
+              'chatter\n{"verdict":"observe","confidence":0.8,"proposed_action":"none","reason":"ok"}',
+            timedOut: false,
+          };
+        },
+      }
+    );
+    eCx(spawns.map(s => s[0])).toEqual(['grok', 'codex']);
+    eCx(outcome.kind).toBe('verdict');
+  });
+});
