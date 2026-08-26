@@ -62,10 +62,25 @@ function receipt(
 }
 
 function buildGrokPrompt(evidence: GrokJudgeEvidence): string {
+  // 16th canary defect (2026-08-26): the original prompt gave the judge NO
+  // criteria -- just APPROVE-or-HOLD with 'HOLD means an operator should
+  // review'. A reasoning model at temperature answered that invitation
+  // non-deterministically: identical evidence flipped between APPROVE and
+  // HOLD across calls, and the merge gate coin-flipped closed. The judge's
+  // only unique duty is the SMELL TEST -- every hard rule (green checks,
+  // approval on the exact head, base wall, mergeability) is enforced by the
+  // deterministic gates around it. So the prompt now states the contract:
+  // approve unless a NAMED red flag is present.
   return [
-    'You are the Grok merge disposition operator for the BDC Overseer.',
+    'You are the merge disposition judge for the BDC Overseer.',
     'Return exactly one verdict line: VERDICT: APPROVE or VERDICT: HOLD.',
-    'APPROVE advances the candidate to deterministic gates; it never authorizes or performs a merge. HOLD means an operator should review.',
+    'Your APPROVE only advances the candidate to deterministic gates that independently verify green checks, review approval on the exact head SHA, and branch rules; it never performs a merge itself.',
+    'Default to APPROVE. Return HOLD only if a specific red flag is present in the evidence below, and only these count as red flags:',
+    '- any failed or pending check',
+    '- zero files changed',
+    '- the PR title clearly unrelated to the WO id',
+    '- a diff scale wildly inconsistent with the WO (e.g. thousands of files for a docs WO)',
+    'Absence of optional detail (empty diff stat, unknown conclusion) is NOT a red flag -- the deterministic gates own completeness.',
     '',
     `WO: ${evidence.woId}`,
     `PR: #${evidence.prNumber} ${evidence.prTitle}`,

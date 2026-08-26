@@ -90,6 +90,8 @@ export interface RealGitHubOctokitLike {
         state: string;
         merged?: boolean;
         mergeable?: boolean | null;
+        additions?: number;
+        deletions?: number;
         html_url: string;
         changed_files?: number;
         head: { sha: string };
@@ -432,6 +434,20 @@ export function createRealFindPullRequest(
         pr: { owner: input.owner, repo: input.repo, number: pr.data.number },
         prTitle: pr.data.title,
         filesChangedCount: pr.data.changed_files,
+        // 16th canary defect (2026-08-26): diffStat was never populated
+        // anywhere, so the second-opinion judge saw 'Diff stat:' blank and
+        // -- reasonably -- HELD every merge as under-evidenced. GitHub's
+        // pulls.get already returns the numbers; render the conventional
+        // shortstat line.
+        diffStat:
+          typeof pr.data.changed_files === 'number'
+            ? pr.data.changed_files +
+              ' file(s) changed, ' +
+              (pr.data.additions ?? 0) +
+              ' insertion(s), ' +
+              (pr.data.deletions ?? 0) +
+              ' deletion(s)'
+            : undefined,
         htmlUrl: pr.data.html_url,
         // Provenance anchor: GitHub's own view of the PR head, not run metadata.
         headSha: pr.data.head.sha,
