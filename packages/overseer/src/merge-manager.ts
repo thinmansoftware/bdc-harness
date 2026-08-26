@@ -225,7 +225,13 @@ async function defaultAssembleEvidence(
     woId: record.woId,
   });
   const pr = prEvidence.pr ?? record.prEvidence.pr;
-  const headSha = metadataString(record, ['head_sha', 'headSha']) ?? '';
+  // 17th canary defect (2026-08-26): run metadata never carries head_sha
+  // (the same metadata that carried no repo and no branch -- defects 2-3),
+  // so this resolved to '' and the exact-head approval precondition compared
+  // reviews against an empty string: review_gate_approval_missing_for_head,
+  // forever, structurally. GitHub's own view of the head -- fetched two lines
+  // up and explicitly documented as the provenance anchor -- is the truth.
+  const headSha = metadataString(record, ['head_sha', 'headSha']) ?? prEvidence.headSha ?? '';
   const baseSha = metadataString(record, ['base_sha', 'baseSha']) ?? '';
   const baseBranch = metadataString(record, ['base_branch', 'baseBranch']) ?? 'dev';
   const changedFiles = metadataString(record, ['changed_files', 'changedFiles'])
