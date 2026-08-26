@@ -19,6 +19,7 @@ export const TM_ALLOWED_ACTION_TYPES = [
   'nudge',
   'escalate_p0',
   'digest',
+  'fire_cauldron',
 ] as const;
 export type TmAllowedActionType = (typeof TM_ALLOWED_ACTION_TYPES)[number];
 
@@ -116,6 +117,25 @@ export function validateProposal(proposal: ActionProposal): GuardResult {
       allowed: false,
       reason: 'idempotency_key_missing: every Taskmaster effect must carry an idempotency key.',
     };
+  }
+
+  if (proposal.type === 'fire_cauldron') {
+    const evidence = proposal.fireEvidence;
+    if (
+      !evidence ||
+      !/^WO-[A-Z][A-Z0-9-]*-\d+$/.test(evidence.woId) ||
+      !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(evidence.targetRepo) ||
+      typeof evidence.project !== 'string' ||
+      !evidence.project.trim() ||
+      !Number.isFinite(Date.parse(evidence.specVerifiedAt)) ||
+      !evidence.noOpenOrMergedPr
+    ) {
+      return {
+        allowed: false,
+        reason:
+          'fire_evidence_invalid: fire_cauldron requires a valid WO id, target repo, project, spec verification timestamp, and no-PR proof.',
+      };
+    }
   }
 
   const normalized = proposal.body.replace(/\s+/g, ' ').trim();

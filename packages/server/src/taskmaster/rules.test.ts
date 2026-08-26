@@ -113,6 +113,36 @@ describe('computeNextAction', () => {
     expect(proposal?.actsImmediately).toBe(true);
   });
 
+  test('qualified unclaimed P0 fires in the P0 bucket when budget is available', () => {
+    const evidence = {
+      woId: 'WO-HARNESS-EXAMPLE-01',
+      targetRepo: 'thinmansoftware/bdc-harness',
+      project: 'bdc-harness',
+      specVerifiedAt: new Date(NOW_MS).toISOString(),
+      noOpenOrMergedPr: true as const,
+    };
+    const proposal = computeNextAction(thread({ priority: 'P0', isUnclaimedP0: true }), 'ready', {
+      interventionsLast24h: 0,
+      nowMs: NOW_MS,
+      fireEligible: true,
+      fireBudgetAvailable: true,
+      fireEvidence: evidence,
+    });
+    expect(proposal?.type).toBe('fire_cauldron');
+    expect(proposal?.idempotencyKey).toBe(
+      `tm:fire:gh:thinmansoftware/bdc-harness#1:${Math.floor(NOW_MS / NUDGE_CLOCK_MS.P0)}`
+    );
+    expect(
+      computeNextAction(thread({ priority: 'P0', isUnclaimedP0: true }), 'ready', {
+        interventionsLast24h: 0,
+        nowMs: NOW_MS,
+        fireEligible: true,
+        fireBudgetAvailable: false,
+        fireEvidence: evidence,
+      })?.type
+    ).toBe('escalate_p0');
+  });
+
   test('stale thread nudges without immediacy (two-tick confirmation required)', () => {
     const proposal = computeNextAction(thread(), 'stale', {
       interventionsLast24h: 0,

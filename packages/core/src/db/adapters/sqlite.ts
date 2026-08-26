@@ -257,6 +257,39 @@ export class SqliteAdapter implements IDatabase {
    * the columns were added to createSchema().
    */
   private migrateColumns(): void {
+    // Migration 045: SQLite cannot alter CHECK constraints. Rebuild existing
+    // four-verb journals transactionally before any fire_cauldron insert.
+    const journalSchema = this.db
+      .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'tm_journal'")
+      .get() as { sql?: string } | undefined;
+    if (journalSchema?.sql && !journalSchema.sql.includes('fire_cauldron')) {
+      this.db.run('BEGIN');
+      try {
+        this.db.run(`
+          CREATE TABLE tm_journal_new (
+            id TEXT PRIMARY KEY,
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+            thread_ref TEXT NOT NULL,
+            action_type TEXT NOT NULL CHECK (action_type IN ('deliver_ruling', 'nudge', 'escalate_p0', 'digest', 'fire_cauldron')),
+            proposal_json TEXT NOT NULL,
+            idempotency_key TEXT,
+            before_hash TEXT,
+            proof_predicate TEXT,
+            proof_deadline_at TEXT,
+            outcome TEXT NOT NULL CHECK (outcome IN ('pending', 'sent', 'parked', 'deferred', 'rejected', 'expired', 'failed')),
+            graded_at TEXT,
+            grade TEXT CHECK (grade IS NULL OR grade IN ('useful', 'noise', 'harmful'))
+          );
+          INSERT INTO tm_journal_new SELECT * FROM tm_journal;
+          DROP TABLE tm_journal;
+          ALTER TABLE tm_journal_new RENAME TO tm_journal;
+        `);
+        this.db.run('COMMIT');
+      } catch (error: unknown) {
+        this.db.run('ROLLBACK');
+        throw error;
+      }
+    }
     // Conversations columns
     try {
       const cols = this.pragmaAll("PRAGMA table_info('remote_agent_conversations')") as {
@@ -1504,7 +1537,7 @@ export class SqliteAdapter implements IDatabase {
         created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
         thread_ref TEXT NOT NULL,
         action_type TEXT NOT NULL CHECK (
-          action_type IN ('deliver_ruling', 'nudge', 'escalate_p0', 'digest')
+          action_type IN ('deliver_ruling', 'nudge', 'escalate_p0', 'digest', 'fire_cauldron')
         ),
         proposal_json TEXT NOT NULL,
         idempotency_key TEXT,

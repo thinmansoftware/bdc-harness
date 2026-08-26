@@ -3,6 +3,7 @@ import { unlinkSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { SqliteAdapter } from './adapters/sqlite';
+import { Database } from 'bun:sqlite';
 
 let db: SqliteAdapter;
 let currentDbPath = '';
@@ -59,6 +60,44 @@ afterEach(async () => {
 });
 
 describe('tm_journal DAL', () => {
+  test('fire_cauldron is accepted by the fresh SQLite CHECK', async () => {
+    const row = await recordAction({
+      thread_ref: 'gh:thinmansoftware/bdc-harness#99',
+      action_type: 'fire_cauldron',
+      proposal_json: '{"type":"fire_cauldron"}',
+      idempotency_key: 'tm:fire:gh:thinmansoftware/bdc-harness#99:1',
+      outcome: 'pending',
+    });
+    expect(row.action_type).toBe('fire_cauldron');
+  });
+
+  test('existing four-verb SQLite journal is rebuilt in place', async () => {
+    await db.close();
+    cleanupDb(currentDbPath);
+    const old = new Database(currentDbPath);
+    old.run(`CREATE TABLE tm_journal (
+      id TEXT PRIMARY KEY, created_at TEXT NOT NULL, thread_ref TEXT NOT NULL,
+      action_type TEXT NOT NULL CHECK (action_type IN ('deliver_ruling','nudge','escalate_p0','digest')),
+      proposal_json TEXT NOT NULL, idempotency_key TEXT, before_hash TEXT,
+      proof_predicate TEXT, proof_deadline_at TEXT,
+      outcome TEXT NOT NULL CHECK (outcome IN ('pending','sent','parked','deferred','rejected','expired','failed')),
+      graded_at TEXT, grade TEXT CHECK (grade IS NULL OR grade IN ('useful','noise','harmful'))
+    )`);
+    old.run(
+      "INSERT INTO tm_journal (id,created_at,thread_ref,action_type,proposal_json,outcome) VALUES ('old','2026-08-24T00:00:00Z','gh:x/y#1','digest','{}','sent')"
+    );
+    old.close();
+    db = new SqliteAdapter(currentDbPath);
+    await db.query(
+      'INSERT INTO tm_journal (id,created_at,thread_ref,action_type,proposal_json,outcome) VALUES ($1,$2,$3,$4,$5,$6)',
+      ['fire', '2026-08-24T01:00:00Z', 'gh:x/y#2', 'fire_cauldron', '{}', 'sent']
+    );
+    const rows = await db.query<{ action_type: string }>(
+      'SELECT action_type FROM tm_journal ORDER BY created_at'
+    );
+    expect(rows.rows.map(row => row.action_type)).toEqual(['digest', 'fire_cauldron']);
+  });
+
   test('recordAction writes a row-first pending entry and updateActionOutcome flips it', async () => {
     const row = await recordAction({
       thread_ref: 'gh:thinmansoftware/bdc-harness#1',

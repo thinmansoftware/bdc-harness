@@ -16,6 +16,7 @@
 import { createHash } from 'crypto';
 import { createLogger } from '@archon/paths';
 import { getDatabase } from '@archon/core';
+import { runCascade } from '@archon/smart-cauldron/cascade';
 import {
   createMessage,
   getMessage,
@@ -35,6 +36,7 @@ import {
   usefulRateFloorBreached,
 } from './rules';
 import { validateProposal, type TmAllowedRecipient } from './guard';
+import { checkFireEligibility, type FireEligibilityResult } from './fire-eligibility';
 import { currentHeadroom, type HeadroomReading } from './ledger';
 import {
   createDeadmanState,
@@ -144,6 +146,12 @@ export interface TaskmasterDeps {
     threadRef: string,
     sinceIso: string
   ) => Promise<GithubIssueEvidence | null>;
+  checkFireEligibility?: (issueTitle: string) => Promise<FireEligibilityResult>;
+  runCascade?: typeof runCascade;
+  getFireRunEvidence?: (
+    woId: string,
+    cascadeId: string
+  ) => Promise<{ status: string; prOpened?: boolean } | null>;
 }
 
 export interface TickResult {
@@ -303,6 +311,7 @@ export const TM_REPEAT_REASON_BY_TYPE: Record<TmActionType, string> = {
   escalate_p0: 'tm:escalate_p0:repeated',
   deliver_ruling: 'tm:deliver_ruling:repeated',
   digest: 'tm:digest:repeated',
+  fire_cauldron: 'tm:fire_cauldron:repeated',
 };
 
 /** Listed work-SOR thread with optional adoption fields carried from the issue payload. */
@@ -646,12 +655,37 @@ async function gradeSentActions(
   findEffect: NonNullable<TaskmasterDeps['findEffectByIdempotencyKey']>,
   getDispatchById: NonNullable<TaskmasterDeps['getDispatchMessageById']>,
   getIssueEvidence: NonNullable<TaskmasterDeps['getGithubIssueEvidence']>,
-  nowMs: number
+  nowMs: number,
+  getFireRunEvidence: NonNullable<TaskmasterDeps['getFireRunEvidence']>
 ): Promise<number> {
   let failures = 0;
   for (const action of actions) {
     if (action.outcome !== 'sent' || action.grade !== null || !action.idempotency_key) continue;
     try {
+      if (action.action_type === 'fire_cauldron') {
+        const proposal = JSON.parse(action.proposal_json) as ActionProposal & {
+          cascadeId?: string;
+        };
+        const woId = proposal.fireEvidence?.woId;
+        const cascadeId = proposal.cascadeId;
+        if (!woId || !cascadeId) continue;
+        const run = await getFireRunEvidence(woId, cascadeId);
+        const issue = await getIssueEvidence(action.thread_ref, action.created_at);
+        const buildingAtMs = issue?.activeStatusAt ? Date.parse(issue.activeStatusAt) : NaN;
+        const deadlineMs = action.proof_deadline_at ? Date.parse(action.proof_deadline_at) : NaN;
+        if (
+          run?.status === 'completed' ||
+          run?.prOpened === true ||
+          (Number.isFinite(buildingAtMs) &&
+            buildingAtMs >= Date.parse(action.created_at) &&
+            (!Number.isFinite(deadlineMs) || buildingAtMs <= deadlineMs))
+        ) {
+          await dal.gradeAction(action.id, 'useful');
+        } else if (Number.isFinite(deadlineMs) && nowMs >= deadlineMs) {
+          await dal.gradeAction(action.id, 'noise');
+        }
+        continue;
+      }
       const effect = await findEffect(action.idempotency_key);
       if (!effect) continue;
       if (effect.status === 'cancelled') {
@@ -730,6 +764,9 @@ function proofPredicate(proposal: ActionProposal): string {
   }
   if (proposal.type === 'escalate_p0') {
     return 'source issue closes, gains an assignee or active status, or records post-send progress';
+  }
+  if (proposal.type === 'fire_cauldron') {
+    return 'created Cauldron run completes or opens a PR, or the source issue gains status:building before the proof deadline';
   }
   return 'digest delivery only; never qualifies as an SC7 useful action';
 }
@@ -899,6 +936,27 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
   const findEffect = deps.findEffectByIdempotencyKey ?? defaultFindEffectByIdempotencyKey;
   const getDispatchById = deps.getDispatchMessageById ?? getMessage;
   const getIssueEvidence = deps.getGithubIssueEvidence ?? defaultGetGithubIssueEvidence;
+  const eligibilityCheck = deps.checkFireEligibility ?? checkFireEligibility;
+  const executeCascade = deps.runCascade ?? runCascade;
+  const getFireRunEvidence =
+    deps.getFireRunEvidence ??
+    (async (woId: string): Promise<{ status: string; prOpened?: boolean } | null> => {
+      const result = await getDatabase().query<{ status: string; metadata: string | null }>(
+        `SELECT status, metadata FROM remote_agent_workflow_runs
+         WHERE user_message LIKE $1 ORDER BY started_at DESC LIMIT 1`,
+        [`%${woId}%`]
+      );
+      const row = result.rows[0];
+      if (!row) return null;
+      let prOpened = false;
+      try {
+        const metadata = JSON.parse(row.metadata ?? '{}') as Record<string, unknown>;
+        prOpened = Boolean(metadata.prUrl ?? metadata.pr_url ?? metadata.pullRequestUrl);
+      } catch {
+        // Malformed metadata is no proof; status and issue evidence remain usable.
+      }
+      return { status: row.status, prOpened };
+    });
   const nowMs = now().getTime();
 
   state.tickIndex += 1;
@@ -959,6 +1017,14 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
     }
   }
   const actions24h = lookback.filter(a => Date.parse(a.created_at) >= since24h);
+  const utcMidnight = Date.parse(new Date(nowMs).toISOString().slice(0, 10) + 'T00:00:00.000Z');
+  const firesToday = lookback.filter(
+    a =>
+      a.action_type === 'fire_cauldron' &&
+      a.outcome === 'sent' &&
+      Date.parse(a.created_at) >= utcMidnight
+  ).length;
+  let fireSlotsRemaining = Math.max(0, resolveFireMaxPerDay() - firesToday);
 
   // Grade previously sent actions against the external SOR.
   tickFailures += await gradeSentActions(
@@ -967,7 +1033,8 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
     findEffect,
     getDispatchById,
     getIssueEvidence,
-    nowMs
+    nowMs,
+    getFireRunEvidence
   );
 
   // M-155 Q3: useful-rate floor with auto-PAUSE. Counted AFTER
@@ -1098,6 +1165,23 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
     const canonRef = canonicalizeThreadRef(item.ref);
     const adoptionRow = adoptionByRef.get(canonRef);
     const classification = classifyThread(item, nowMs);
+    let fireResult: FireEligibilityResult = { eligible: false };
+    if (
+      resolveFireVerbEnabled() &&
+      fireSlotsRemaining > 0 &&
+      item.isUnclaimedP0 &&
+      typeof (item as ListedThread).title === 'string'
+    ) {
+      try {
+        fireResult = await eligibilityCheck((item as ListedThread).title ?? '');
+      } catch (error) {
+        tickFailures += 1;
+        log.warn(
+          { err: error as Error, threadRef: item.ref },
+          'taskmaster.fire_eligibility_failed'
+        );
+      }
+    }
     const proposal = computeNextAction(item, classification, {
       interventionsLast24h: interventions24hByThread.get(item.ref) ?? 0,
       nowMs,
@@ -1108,8 +1192,16 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
       adoption: adoptionRow?.title ? adoptionRow : undefined,
       grades: gradesByRef.get(canonRef),
       suppression: suppressionByRef.get(canonRef),
+      fireEligible: fireResult.eligible,
+      fireBudgetAvailable: fireSlotsRemaining > 0,
+      fireEvidence: fireResult.evidence,
     });
-    if (proposal) proposals.push(proposal);
+    if (proposal) {
+      proposals.push(proposal);
+      // Reserve the daily slot within this tick so a batch of qualified P0s
+      // cannot all observe the same pre-tick count and exceed the cap.
+      if (proposal.type === 'fire_cauldron') fireSlotsRemaining -= 1;
+    }
   }
 
   // Daily digest: one summary message per UTC day through the same path.
@@ -1272,19 +1364,49 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
     }
 
     try {
-      await createTask({
-        correlation_id: `tm-${journalRow.id}`,
-        idempotency_key: proposal.idempotencyKey,
-        task_type: 'agent_message',
-        sender: 'taskmaster',
-        recipient: proposal.recipient,
-        body: proposal.body,
-        // Same-subject grouping + unconditional per-verb repeat reason
-        // (M-155 WO 3): see TM_REPEAT_REASON_BY_TYPE for why unconditional.
-        subject_key: canonicalizeThreadRef(proposal.threadRef),
-        repeat_reason: TM_REPEAT_REASON_BY_TYPE[proposal.type],
-      });
-      await dal.updateActionOutcome(journalRow.id, 'sent');
+      if (proposal.type === 'fire_cauldron' && proposal.fireEvidence) {
+        let resolveAdmission: ((record: Awaited<ReturnType<typeof runCascade>>) => void) | null =
+          null;
+        let rejectAdmission: ((error: unknown) => void) | null = null;
+        const admission = new Promise<Awaited<ReturnType<typeof runCascade>>>((resolve, reject) => {
+          resolveAdmission = resolve;
+          rejectAdmission = reject;
+        });
+        const cascadePromise = executeCascade({
+          woId: proposal.fireEvidence.woId,
+          project: proposal.fireEvidence.project,
+          dispatchId: proposal.idempotencyKey,
+          token: process.env.ARCHON_OPERATOR_TOKEN ?? '',
+          onAdmission: record => resolveAdmission?.(record),
+        });
+        void cascadePromise.catch((error: unknown) => {
+          rejectAdmission?.(error);
+          log.error(
+            { err: error, woId: proposal.fireEvidence?.woId },
+            'taskmaster.fire_cascade_failed'
+          );
+        });
+        const admitted = await admission;
+        await dal.updateActionOutcome(
+          journalRow.id,
+          'sent',
+          JSON.stringify({ ...proposal, cascadeId: admitted.cascadeId, runId: admitted.cascadeId })
+        );
+      } else {
+        await createTask({
+          correlation_id: `tm-${journalRow.id}`,
+          idempotency_key: proposal.idempotencyKey,
+          task_type: 'agent_message',
+          sender: 'taskmaster',
+          recipient: proposal.recipient,
+          body: proposal.body,
+          // Same-subject grouping + unconditional per-verb repeat reason
+          // (M-155 WO 3): see TM_REPEAT_REASON_BY_TYPE for why unconditional.
+          subject_key: canonicalizeThreadRef(proposal.threadRef),
+          repeat_reason: TM_REPEAT_REASON_BY_TYPE[proposal.type],
+        });
+        await dal.updateActionOutcome(journalRow.id, 'sent');
+      }
       journalRow.outcome = 'sent';
       touchedThisTick.add(proposal.threadRef);
       result.effects += 1;
@@ -1361,6 +1483,19 @@ export function resolveTaskmasterIntervalMs(raw: string | undefined): number {
   const parsed = Number.parseInt(raw ?? '', 10);
   if (Number.isInteger(parsed) && parsed >= 0) return parsed;
   return 60_000;
+}
+
+export function resolveFireVerbEnabled(
+  raw: string | undefined = process.env.TASKMASTER_FIRE_VERB_ENABLED
+): boolean {
+  return raw?.trim().toLowerCase() === 'true' || raw?.trim() === '1';
+}
+
+export function resolveFireMaxPerDay(
+  raw: string | undefined = process.env.TASKMASTER_FIRE_MAX_PER_DAY
+): number {
+  const parsed = Number.parseInt(raw ?? '', 10);
+  return Number.isInteger(parsed) && parsed >= 0 ? parsed : 2;
 }
 
 /**

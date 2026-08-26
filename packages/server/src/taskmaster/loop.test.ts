@@ -12,6 +12,8 @@ import {
   defaultListThreads,
   tick,
   resolveTaskmasterIntervalMs,
+  resolveFireVerbEnabled,
+  resolveFireMaxPerDay,
   refreshAdoption,
   canonicalizeThreadRef,
   resolveRecipient,
@@ -388,6 +390,145 @@ describe('scenario 3: pause scope=effects withholds ALL effects (P0 escalation n
     expect(
       world.journal.filter(j => j.thread_ref === staleP1.ref && j.outcome === 'expired').length
     ).toBe(1);
+  });
+});
+
+describe('fire_cauldron loop', () => {
+  test('qualified unclaimed P0 admits exactly one cascade and journals its run id', async () => {
+    const prior = process.env.TASKMASTER_FIRE_VERB_ENABLED;
+    process.env.TASKMASTER_FIRE_VERB_ENABLED = 'true';
+    try {
+      const world = makeWorld();
+      seedDigestSent(world);
+      const item: ListedThread = {
+        ref: 'gh:thinmansoftware/bdc-harness#501',
+        priority: 'P0',
+        lastActivityAt: new Date(T0 - 3_600_000).toISOString(),
+        isUnclaimedP0: true,
+        recipient: 'xo',
+        title: 'WO-HARNESS-EXAMPLE-01 urgent build',
+      };
+      let admissions = 0;
+      const record = { cascadeId: 'cascade-501', status: 'running' } as unknown as Awaited<
+        ReturnType<NonNullable<TaskmasterDeps['runCascade']>>
+      >;
+      const deps = makeDeps(world, {
+        listUndeliveredRulings: async () => [],
+        listThreads: async () => [item],
+        checkFireEligibility: async () => ({
+          eligible: true,
+          evidence: {
+            woId: 'WO-HARNESS-EXAMPLE-01',
+            targetRepo: 'thinmansoftware/bdc-harness',
+            project: 'bdc-harness',
+            specVerifiedAt: new Date(T0).toISOString(),
+            noOpenOrMergedPr: true,
+          },
+        }),
+        runCascade: (async options => {
+          admissions += 1;
+          options.onAdmission?.(record, true);
+          return record;
+        }) as NonNullable<TaskmasterDeps['runCascade']>,
+      });
+      const state = createTaskmasterState(60_000);
+      await tick(state, deps);
+      await tick(state, deps);
+      expect(admissions).toBe(1);
+      const fires = world.journal.filter(row => row.action_type === 'fire_cauldron');
+      expect(fires).toHaveLength(1);
+      expect(fires[0]?.outcome).toBe('sent');
+      expect(fires[0]?.proposal_json).toContain('cascade-501');
+      expect(world.sentMessages.some(message => message.body.includes('Unclaimed P0'))).toBe(false);
+    } finally {
+      if (prior === undefined) delete process.env.TASKMASTER_FIRE_VERB_ENABLED;
+      else process.env.TASKMASTER_FIRE_VERB_ENABLED = prior;
+    }
+  });
+
+  test('pause scope=effects parks an eligible fire without admitting a cascade', async () => {
+    const prior = process.env.TASKMASTER_FIRE_VERB_ENABLED;
+    process.env.TASKMASTER_FIRE_VERB_ENABLED = 'true';
+    try {
+      const world = makeWorld();
+      seedDigestSent(world);
+      world.control.pause_state = 'PAUSED';
+      world.control.pause_scope = 'effects';
+      const item = makeListedThread({
+        ref: 'gh:thinmansoftware/bdc-harness#502',
+        priority: 'P0',
+        isUnclaimedP0: true,
+        title: 'WO-HARNESS-EXAMPLE-01 urgent build',
+      });
+      let admissions = 0;
+      await tick(
+        createTaskmasterState(60_000),
+        makeDeps(world, {
+          listThreads: async () => [item],
+          checkFireEligibility: async () => ({
+            eligible: true,
+            evidence: {
+              woId: 'WO-HARNESS-EXAMPLE-01',
+              targetRepo: 'thinmansoftware/bdc-harness',
+              project: 'bdc-harness',
+              specVerifiedAt: new Date(T0).toISOString(),
+              noOpenOrMergedPr: true,
+            },
+          }),
+          runCascade: (async () => {
+            admissions += 1;
+            throw new Error('paused fire must not run');
+          }) as NonNullable<TaskmasterDeps['runCascade']>,
+        })
+      );
+      expect(admissions).toBe(0);
+      const fire = world.journal.find(row => row.action_type === 'fire_cauldron');
+      expect(fire?.outcome).toBe('parked');
+      expect(fire?.proposal_json).toContain('"reason":"paused"');
+    } finally {
+      if (prior === undefined) delete process.env.TASKMASTER_FIRE_VERB_ENABLED;
+      else process.env.TASKMASTER_FIRE_VERB_ENABLED = prior;
+    }
+  });
+
+  test('grades completed fire useful and overdue running fire noise', async () => {
+    for (const testCase of [
+      { id: 'completed-fire', status: 'completed', deadline: T0 + 60_000, grade: 'useful' },
+      { id: 'overdue-running-fire', status: 'running', deadline: T0 - 1, grade: 'noise' },
+    ] as const) {
+      const world = makeWorld();
+      seedDigestSent(world);
+      world.journal.push({
+        id: testCase.id,
+        created_at: new Date(T0 - 60_000).toISOString(),
+        thread_ref: 'gh:thinmansoftware/bdc-harness#503',
+        action_type: 'fire_cauldron',
+        proposal_json: JSON.stringify({
+          type: 'fire_cauldron',
+          cascadeId: `cascade-${testCase.id}`,
+          fireEvidence: { woId: 'WO-HARNESS-EXAMPLE-01' },
+        }),
+        idempotency_key: `tm:fire:${testCase.id}`,
+        before_hash: null,
+        proof_predicate: 'cascade completes, opens a PR, or issue enters BUILDING',
+        proof_deadline_at: new Date(testCase.deadline).toISOString(),
+        outcome: 'sent',
+        graded_at: null,
+        grade: null,
+      });
+      let evidenceCalls = 0;
+      await tick(
+        createTaskmasterState(60_000),
+        makeDeps(world, {
+          getFireRunEvidence: async () => {
+            evidenceCalls += 1;
+            return { status: testCase.status, prOpened: false };
+          },
+        })
+      );
+      expect(evidenceCalls).toBe(1);
+      expect(world.journal.find(row => row.id === testCase.id)?.grade).toBe(testCase.grade);
+    }
   });
 });
 
@@ -2154,7 +2295,7 @@ describe('M-155 exception push (loop)', () => {
     expect(nudges[0]?.body).toContain('Chronic but titled');
   });
 
-  test('push: the four-verb allowlist and the budgets are untouched (regression)', () => {
+  test('push: the five-verb allowlist and the budgets are explicit (regression)', () => {
     expect(MAX_INTERVENTIONS_PER_ITEM_24H).toBe(3);
     expect(MAX_EFFECTS_PER_TICK).toBe(10);
     expect([...TM_ALLOWED_ACTION_TYPES]).toEqual([
@@ -2162,8 +2303,17 @@ describe('M-155 exception push (loop)', () => {
       'nudge',
       'escalate_p0',
       'digest',
+      'fire_cauldron',
     ]);
     expect([...TM_ALLOWED_RECIPIENTS]).toEqual(['xo', 'major-build', 'captain-ci', 'operator']);
+  });
+
+  test('fire verb environment defaults OFF with a two-per-day budget', () => {
+    expect(resolveFireVerbEnabled(undefined)).toBe(false);
+    expect(resolveFireVerbEnabled('true')).toBe(true);
+    expect(resolveFireMaxPerDay(undefined)).toBe(2);
+    expect(resolveFireMaxPerDay('0')).toBe(0);
+    expect(resolveFireMaxPerDay('invalid')).toBe(2);
   });
 
   test('push: the loop never resumes itself -- no setPauseState RUNNING write', () => {

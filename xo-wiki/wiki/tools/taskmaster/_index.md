@@ -17,12 +17,24 @@ merge, assignment, or WO-authoring authority (Slice 1 exclusions, ratified).
 
 ## Environment
 
-| Variable                    | Meaning                                                                                                             |
-| --------------------------- | ------------------------------------------------------------------------------------------------------------------- |
-| `TASKMASTER_INTERVAL_MS`    | Tick interval. `60000` in production compose. `0` = KILLED (loop off, zero effects) -- this is the rollback switch. |
-| `TASKMASTER_GH_REPOS`       | Comma-separated GitHub repos read as the work SOR (default `bluedevilcollectibles/bdc-xo`).                         |
-| `TASKMASTER_USAGE_ARTIFACT` | Optional path to a local usage-anchor JSON (`{"tokensRemaining": N, "observedAt": ISO}`).                           |
-| `TASKMASTER_CLI_ANCHOR_CMD` | Optional shell probe printing tokens-remaining; failure reads as UNKNOWN, never 0.                                  |
+| Variable                       | Meaning                                                                                                             |
+| ------------------------------ | ------------------------------------------------------------------------------------------------------------------- |
+| `TASKMASTER_INTERVAL_MS`       | Tick interval. `60000` in production compose. `0` = KILLED (loop off, zero effects) -- this is the rollback switch. |
+| `TASKMASTER_GH_REPOS`          | Comma-separated GitHub repos read as the work SOR (default `bluedevilcollectibles/bdc-xo`).                         |
+| `TASKMASTER_USAGE_ARTIFACT`    | Optional path to a local usage-anchor JSON (`{"tokensRemaining": N, "observedAt": ISO}`).                           |
+| `TASKMASTER_CLI_ANCHOR_CMD`    | Optional shell probe printing tokens-remaining; failure reads as UNKNOWN, never 0.                                  |
+| `TASKMASTER_FIRE_VERB_ENABLED` | Enables mechanically-qualified unclaimed-P0 Cauldron fires. Default `false`; leave off through deploy.              |
+| `TASKMASTER_FIRE_MAX_PER_DAY`  | Maximum successful automatic fires per UTC day. Default `2`.                                                        |
+
+### Enable the fire verb
+
+After the updated container and migration are verified, John can set
+`TASKMASTER_FIRE_VERB_ENABLED=true` and optionally tune
+`TASKMASTER_FIRE_MAX_PER_DAY`, then force-recreate the container so its env file
+is re-read. Observe the first fires in `tm_journal`; every `fire_cauldron` sent
+row must contain a `cascadeId`/`runId` in `proposal_json`. Set the enable flag
+back to `false` and force-recreate to stop new fire proposals. The normal
+Taskmaster pause with `pause_scope='effects'` also parks every fire effect.
 
 ## Status
 
@@ -92,7 +104,16 @@ This count is necessary but not sufficient for SC7. Each qualifying row must
 also be correlated to action-specific evidence in the source SOR after the send:
 a delivered ruling was addressed by its recipient, a nudge produced a source
 issue close or marker, or a P0 escalation produced a close, assignee, active
-status, or marker. Digests never qualify as useful SC7 actions.
+status, or marker. A `fire_cauldron` row qualifies when its admitted run
+completes/opens a PR or the source issue gains `status:building` before the
+deadline. Digests never qualify as useful SC7 actions.
+
+Recent automatic fires:
+
+```bash
+sqlite3 /opt/bdc/archon-data/archon.db \
+  "SELECT id, created_at, outcome, grade, proposal_json FROM tm_journal WHERE action_type='fire_cauldron' ORDER BY created_at DESC LIMIT 5"
+```
 
 Recent actions:
 

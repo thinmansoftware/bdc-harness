@@ -26,16 +26,42 @@ describe('validateProposal', () => {
   });
 
   test('every Slice 1 verb passes the action-type allowlist', () => {
+    expect(TM_ALLOWED_ACTION_TYPES).toHaveLength(5);
     for (const type of TM_ALLOWED_ACTION_TYPES) {
-      expect(validateProposal(proposal({ type })).allowed).toBe(true);
+      if (type !== 'fire_cauldron') expect(validateProposal(proposal({ type })).allowed).toBe(true);
     }
   });
 
   test('unauthorized action type is a forbidden effect', () => {
-    const result = validateProposal(proposal({ type: 'fire_cauldron' as ActionProposal['type'] }));
+    const result = validateProposal(proposal({ type: 'unknown_verb' as ActionProposal['type'] }));
     expect(result.allowed).toBe(false);
     expect(result.forbiddenEffect).toBe(true);
     expect(result.reason).toContain('action_type_not_allowlisted');
+  });
+
+  test('allows fire_cauldron only with typed mechanical evidence', () => {
+    const valid = proposal({
+      type: 'fire_cauldron',
+      fireEvidence: {
+        woId: 'WO-HARNESS-EXAMPLE-01',
+        targetRepo: 'thinmansoftware/bdc-harness',
+        project: 'bdc-harness',
+        specVerifiedAt: '2026-08-24T00:00:00.000Z',
+        noOpenOrMergedPr: true,
+      },
+    });
+    expect(validateProposal(valid).allowed).toBe(true);
+    expect(validateProposal({ ...valid, fireEvidence: undefined }).reason).toContain(
+      'fire_evidence_invalid'
+    );
+    const missingProject = {
+      ...valid,
+      fireEvidence: { ...valid.fireEvidence, project: undefined },
+    } as unknown as ActionProposal;
+    expect(validateProposal(missingProject)).toMatchObject({
+      allowed: false,
+      reason: expect.stringContaining('fire_evidence_invalid'),
+    });
   });
 
   test('broadcast/board/invented recipients are forbidden effects', () => {
