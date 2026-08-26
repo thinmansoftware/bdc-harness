@@ -374,7 +374,11 @@ export function createRealFindPullRequest(
       // searching for the literal word would return garbage matches.
       if (prNumber === null && input.woId && input.woId !== 'unknown') {
         const search = await octokit.search.issuesAndPullRequests({
-          q: `repo:${input.owner}/${input.repo} is:pr ${input.woId} in:title`,
+          // Title AND body: lanes title PRs freely (anchor: canary PR #705,
+          // 'docs(canary): add e2e merge canary marker' -- WO id only in the
+          // body; in:title returned nothing and the run was wrongly closed as
+          // 'no PR'. 9th canary defect, 2026-08-26).
+          q: `repo:${input.owner}/${input.repo} is:pr "${input.woId}"`,
           per_page: 5,
         });
         const match = search.data.items.find(item => item.pull_request);
