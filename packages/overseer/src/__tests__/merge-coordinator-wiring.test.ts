@@ -380,8 +380,13 @@ describe('merge coordinator wiring (WO-HARNESS-MERGE-MANAGER-WIRING-LAND-01)', (
     await dispatchThroughService(records, deps, coordinator);
     expect(coordinator).not.toHaveBeenCalled();
     expect(mergePullRequest).not.toHaveBeenCalled();
-    // No merge/merge_denied action written for any of the safely-skipped records.
-    expect(insertOverseerAction).not.toHaveBeenCalled();
+    // No merge/merge_denied action written for any of the safely-skipped
+    // records. Skipped records DO write terminal watch_closed dispositions
+    // (window drain, 5th canary defect 2026-08-25) -- assert those are the
+    // ONLY writes.
+    for (const call of insertOverseerAction.mock.calls as unknown as [{ action: string }][]) {
+      expect(call[0].action).toBe('watch_closed');
+    }
   });
 
   test('Test 3: an empty watch cycle still emits a merge-coordinator heartbeat with zeroed counts', async () => {

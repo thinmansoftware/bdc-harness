@@ -212,6 +212,30 @@ export async function handleRecord(
       },
       'overseer.decision_completed'
     );
+    // Window drain (5th canary defect, 2026-08-25): with the terminal-action
+    // exclusion narrowed (PR #707) and the per-tick evaluation bound (PR #710),
+    // a judged run that records NOTHING re-enters the oldest-first window every
+    // tick -- the same 25 fossils occupy it forever and newer runs starve
+    // (heartbeat: evaluated 25/847, eligible 0, static). A resolved judgment
+    // with nothing actionable now writes a terminal watch_closed disposition so
+    // the window advances. lookupFailed judgments stay open -- a transient
+    // GitHub error must never permanently close a run.
+    if (!record.prEvidence?.lookupFailed) {
+      try {
+        await deps.insertOverseerAction({
+          runId: record.runId,
+          woId: record.woId,
+          class: record.errorClass ?? 'none',
+          action: 'watch_closed',
+          result: record.reason,
+        });
+      } catch (error) {
+        log.error(
+          { err: error as Error, runId: record.runId, woId: record.woId },
+          'overseer.watch_closed_write_failed'
+        );
+      }
+    }
     return;
   }
 
