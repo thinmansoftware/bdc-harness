@@ -306,8 +306,15 @@ export async function handleRecordJudgeFirst(
     // terminally here; merge_ready/escalate records stay live. Transient
     // lookup failures (identity present, API errored) also stay open.
     const identityAbsent = !record.owner || !record.repo;
+    // An OPEN PR is a come-back-later state, never a close-now state: CI may
+    // still be pending or a review may land later. 11th canary defect
+    // (2026-08-26): CANARY-02's run was terminally closed 2 minutes after
+    // its PR opened, while checks were still running -- the loop then never
+    // re-examined it. Close only when the PR is merged/closed/missing.
+    const prStillOpen = record.prEvidence?.state === 'open';
     if (
       (record.action === 'success' || record.action === 'ignore') &&
+      !prStillOpen &&
       (!record.prEvidence?.lookupFailed || identityAbsent)
     ) {
       try {

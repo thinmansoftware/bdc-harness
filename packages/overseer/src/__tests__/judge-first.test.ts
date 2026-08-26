@@ -445,6 +445,33 @@ describe('handleRecordJudgeFirst: pipeline (continued)', () => {
     expect(state.finalized).toHaveLength(0);
   });
 
+  test('Test 3d: lost claim with a still-OPEN PR stays open -- CI may be pending (11th defect)', async () => {
+    const state: FakeStoreState = { claims: [], finalized: [] };
+    const { actions, deps } = makeDeps();
+    await handleRecordJudgeFirst(
+      makeRecord({
+        action: 'ignore',
+        reason: 'completed run; PR not merge-ready (checks pending)',
+        prEvidence: {
+          exists: true,
+          state: 'open',
+          checks: { total: 3, passed: 1, failed: 0, pending: 2 },
+          mergeable: true,
+        },
+      }),
+      deps,
+      {
+        dryRun: false,
+        actor: 'test',
+        verdictStore: makeVerdictStore({ claimed: false }, state),
+        judge: async () => verdictOutcome(),
+        escalate: fakeEscalate,
+      }
+    );
+    expect(actions).toHaveLength(0);
+    expect(state.finalized).toHaveLength(0);
+  });
+
   test('Test 3c: lost claim with a TRANSIENT lookup failure stays open (no close)', async () => {
     const state: FakeStoreState = { claims: [], finalized: [] };
     const { actions, deps } = makeDeps();

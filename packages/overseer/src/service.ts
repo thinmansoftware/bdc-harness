@@ -226,7 +226,11 @@ export async function handleRecord(
     // and re-occupied the bounded window forever. Close them too; a TRANSIENT
     // lookup failure (identity present, API errored) still stays open.
     const identityAbsent = !record.owner || !record.repo;
-    if (!record.prEvidence?.lookupFailed || identityAbsent) {
+    // An OPEN PR is a come-back-later state, never a close-now state (11th
+    // canary defect, 2026-08-26 -- CANARY-02's run was closed 2 minutes after
+    // its PR opened, mid-CI, and never re-examined).
+    const prStillOpen = record.prEvidence?.state === 'open';
+    if (!prStillOpen && (!record.prEvidence?.lookupFailed || identityAbsent)) {
       try {
         await deps.insertOverseerAction({
           runId: record.runId,
