@@ -220,7 +220,13 @@ export async function handleRecord(
     // with nothing actionable now writes a terminal watch_closed disposition so
     // the window advances. lookupFailed judgments stay open -- a transient
     // GitHub error must never permanently close a run.
-    if (!record.prEvidence?.lookupFailed) {
+    // Identity-absent runs (no owner/repo -- pre-repo-identity legacy rows)
+    // can NEVER resolve: their lookupFailed is permanent, not transient. 102
+    // such fossils survived the first drain (2026-08-25, 847 -> 102 -> stall)
+    // and re-occupied the bounded window forever. Close them too; a TRANSIENT
+    // lookup failure (identity present, API errored) still stays open.
+    const identityAbsent = !record.owner || !record.repo;
+    if (!record.prEvidence?.lookupFailed || identityAbsent) {
       try {
         await deps.insertOverseerAction({
           runId: record.runId,
