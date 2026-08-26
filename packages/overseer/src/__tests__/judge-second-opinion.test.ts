@@ -95,7 +95,11 @@ describe('grok second-opinion judge', () => {
     expect(prompt).toContain(`Head SHA: ${evidence.headSha}`);
     expect(prompt).toContain(`Base SHA: ${evidence.baseSha}`);
     expect(prompt).toContain(`Evidence digest: ${evidence.evidenceDigest}`);
-    expect(prompt).toContain('APPROVE advances the candidate to deterministic gates');
+    expect(prompt).toContain('advances the candidate to deterministic gates');
+    // Criteria-based contract (16th canary defect): the judge defaults to
+    // APPROVE and holds only on named red flags.
+    expect(prompt).toContain('Default to APPROVE');
+    expect(prompt).toContain('NOT a red flag');
     expect(prompt).not.toContain('WO-HARNESS-OVERSEER-V1B-GROK-MERGE-JUDGE-01');
   });
 });
