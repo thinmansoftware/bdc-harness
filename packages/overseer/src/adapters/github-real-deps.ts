@@ -391,11 +391,28 @@ export function createRealFindPullRequest(
         return MISSING_EVIDENCE;
       }
 
-      const pr = await octokit.pulls.get({
+      let pr = await octokit.pulls.get({
         owner: input.owner,
         repo: input.repo,
         pull_number: prNumber,
       });
+
+      // GitHub computes mergeable ASYNCHRONOUSLY: null means "still computing,
+      // check back shortly" (per GitHub's own docs), NOT "unmergeable" -- that's
+      // `false`. 12th canary defect (2026-08-26): CANARY-02's judge read
+      // mergeable:null moments after checks went green and correctly verdicted
+      // `observe` (refusing to guess) -- but nothing ever re-asked, so the PR
+      // sat merge-ready-looking forever with no automatic recheck. Poll a few
+      // times with short backoff before handing evidence to the judge, so the
+      // judge sees GitHub's real answer instead of a transient "don't know yet".
+      for (let attempt = 0; pr.data.mergeable === null && attempt < 3; attempt += 1) {
+        await new Promise(resolve => setTimeout(resolve, 2000));
+        pr = await octokit.pulls.get({
+          owner: input.owner,
+          repo: input.repo,
+          pull_number: prNumber,
+        });
+      }
 
       const checkRunsResp = await octokit.checks.listForRef({
         owner: input.owner,
