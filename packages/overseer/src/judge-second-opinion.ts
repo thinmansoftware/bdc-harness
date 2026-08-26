@@ -95,6 +95,32 @@ function secondOpinionBinary(): string {
   return first && first.length > 0 ? first : 'grok';
 }
 
+/**
+ * Reduce a CLI wrapper's stdout to the model's own answer before parsing.
+ *
+ * 14th canary defect (2026-08-26): `bunx @openai/codex exec` wraps the answer
+ * in echoed prompt text, a bubblewrap warning, and trailing token accounting.
+ * parseGrokVerdict deliberately demands the WHOLE output be a bare verdict
+ * line -- that strictness is a prompt-injection guard (an APPROVE followed by
+ * trailing instructions must yield HOLD) and must NOT be loosened. So the
+ * wrapper framing is stripped HERE, where we know the exact shape we invoked,
+ * and the parser keeps judging a clean payload as strictly as ever.
+ *
+ * codex exec emits the answer after a lone `codex` marker line and stops at
+ * `tokens used`. Anything unexpected falls through unchanged, so an
+ * unrecognized shape still fails closed at the parser.
+ */
+export function normalizeWrapperStdout(binary: string, stdout: string): string {
+  if (binary !== 'codex') return stdout;
+  const lines = stdout.split(/\r?\n/);
+  const start = lines.lastIndexOf('codex');
+  if (start === -1) return stdout;
+  const rest = lines.slice(start + 1);
+  const end = rest.findIndex(line => /^tokens used/i.test(line.trim()));
+  const body = end === -1 ? rest : rest.slice(0, end);
+  return body.join('\n').trim();
+}
+
 async function spawnGrok(prompt: string, timeoutMs: number): Promise<GrokSpawnResult> {
   const binary = secondOpinionBinary();
   const argv =
@@ -119,7 +145,7 @@ async function spawnGrok(prompt: string, timeoutMs: number): Promise<GrokSpawnRe
       subprocess.exited,
       new Response(subprocess.stdout).text(),
     ]);
-    return { exitCode, stdout, timedOut: false };
+    return { exitCode, stdout: normalizeWrapperStdout(binary, stdout), timedOut: false };
   })();
 
   const result = await Promise.race([processResult, timeoutResult]);
