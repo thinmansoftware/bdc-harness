@@ -7,5 +7,11 @@
     "sourceMap": false,
     "types": ["bun-types"]
   },
-  "include": ["*.ts", "dispatch-worker/**/*.ts", "staging/**/*.ts", "taskmaster/**/*.ts"]
+  "include": [
+    "*.ts",
+    "dispatch-worker/**/*.ts",
+    "staging/**/*.ts",
+    "taskmaster/**/*.ts",
+    "mta/**/*.ts"
+  ]
 }
