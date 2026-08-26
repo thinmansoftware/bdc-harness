@@ -95,6 +95,7 @@ export interface RealGitHubOctokitLike {
         html_url: string;
         changed_files?: number;
         head: { sha: string };
+        base?: { sha: string };
       };
     }>;
     merge(input: {
@@ -155,9 +156,72 @@ export interface RealGitHubOctokitLike {
   checks: {
     listForRef(input: Record<string, unknown>): Promise<{
       data: {
-        check_runs: { status: string; conclusion: string | null }[];
+        check_runs: { name?: string; status: string; conclusion: string | null }[];
       };
     }>;
+  };
+  repos?: {
+    compareCommits(input: {
+      owner: string;
+      repo: string;
+      base: string;
+      head: string;
+    }): Promise<{ data: { files?: { filename: string; patch?: string }[] } }>;
+  };
+}
+
+export interface ExactHeadPullRequestEvidence {
+  diff: string;
+  checks: { name: string; status: string; conclusion: string | null }[];
+}
+
+/** Read review evidence with every ref-addressable call pinned to headSha. */
+export function createRealFetchExactHeadPullRequestEvidence(
+  octokit: RealGitHubOctokitLike
+): (input: {
+  owner: string;
+  repo: string;
+  prNumber: number;
+  headSha: string;
+}) => Promise<ExactHeadPullRequestEvidence> {
+  return async input => {
+    const pr = await octokit.pulls.get({
+      owner: input.owner,
+      repo: input.repo,
+      pull_number: input.prNumber,
+      head_sha: input.headSha,
+    });
+    if (pr.data.head.sha !== input.headSha) {
+      throw new Error('pr_review_head_moved');
+    }
+    const baseSha = pr.data.base?.sha;
+    if (!baseSha || !octokit.repos) {
+      throw new Error('pr_review_diff_api_unavailable');
+    }
+    const [comparison, checkRuns] = await Promise.all([
+      octokit.repos.compareCommits({
+        owner: input.owner,
+        repo: input.repo,
+        base: baseSha,
+        head: input.headSha,
+      }),
+      octokit.checks.listForRef({
+        owner: input.owner,
+        repo: input.repo,
+        ref: input.headSha,
+        per_page: 100,
+      }),
+    ]);
+    return {
+      diff: (comparison.data.files ?? [])
+        .map(file => `--- ${file.filename}\n${file.patch ?? '[binary or patch unavailable]'}`)
+        .join('\n'),
+      checks: checkRuns.data.check_runs.map((run, index) => ({
+        name: run.name?.trim() || `check-${index + 1}`,
+        status: run.status,
+        conclusion: run.conclusion,
+      })),
+    };
   };
 }
 

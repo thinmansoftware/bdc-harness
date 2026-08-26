@@ -8,12 +8,103 @@
  */
 import { describe, expect, test } from 'bun:test';
 import {
+  createRealSubmitDeps,
   REVIEW_REVIEWER_IDENTITY_ENV,
   REVIEW_WEBHOOK_SECRET_ENV,
   parseReviewWorkBody,
   resolveReviewRouteConfig,
   reviewSubjectKey,
 } from '../pr-review-wiring.ts';
+import type { RealGitHubOctokitLike } from '../adapters/github-real-deps.ts';
+import type { PrReviewResult } from '../pr-review-evaluator.ts';
+
+const HEAD = 'a'.repeat(40);
+
+function submitOctokit(): RealGitHubOctokitLike {
+  return {
+    pulls: {
+      get: async () => ({ data: { head: { sha: HEAD } } }),
+      createReview: async () => ({ data: { id: 1, state: 'APPROVED' } }),
+    },
+    checks: { listForRef: async () => ({ data: { check_runs: [] } }) },
+  } as unknown as RealGitHubOctokitLike;
+}
+
+function reviewResult(overrides: Partial<PrReviewResult> = {}): PrReviewResult {
+  return {
+    verdict: 'APPROVE',
+    findings: [],
+    reviewed_head_sha: HEAD,
+    reviewer: { provider: 'test-cli', model: 'test-model' },
+    acceptance_criteria_available: false,
+    ...overrides,
+  };
+}
+
+const work = {
+  correlationId: 'correlation-1',
+  messageId: 'message-1',
+  owner: 'thinmansoftware',
+  repo: 'bdc-harness',
+  prNumber: 42,
+  headSha: HEAD,
+  author: 'contributor',
+};
+
+describe('createRealSubmitDeps -- evaluator binding', () => {
+  test.each([
+    ['APPROVE', true],
+    ['REQUEST_CHANGES', false],
+    ['INDETERMINATE', false],
+  ] as const)('maps %s to approved=%s', async (verdict, approved) => {
+    const deps = createRealSubmitDeps('review-app[bot]', {
+      octokit: submitOctokit(),
+      evaluate: async () =>
+        reviewResult({
+          verdict,
+          findings:
+            verdict === 'REQUEST_CHANGES'
+              ? [{ scope: 'unsafe.ts', severity: 'major', summary: 'Unsafe change' }]
+              : [],
+        }),
+    });
+
+    expect((await deps.runReviewer(work)).approved).toBe(approved);
+  });
+
+  test('does not expose internal INDETERMINATE errors in the GitHub summary', async () => {
+    const secretError = 'model_error:token=super-secret-provider-detail';
+    const deps = createRealSubmitDeps('review-app[bot]', {
+      octokit: submitOctokit(),
+      evaluate: async () => reviewResult({ verdict: 'INDETERMINATE', error: secretError }),
+    });
+
+    const verdict = await deps.runReviewer(work);
+    expect(verdict.approved).toBe(false);
+    expect(verdict.summary).toContain('could not reach a determinate verdict');
+    expect(verdict.summary).not.toContain(secretError);
+    expect(verdict.summary).not.toContain('super-secret');
+  });
+
+  test('keeps the model-correlation identity separate from the GitHub custody identity', async () => {
+    let observedReviewer: unknown;
+    const deps = createRealSubmitDeps('review-app[bot]', {
+      octokit: submitOctokit(),
+      reviewerModel: 'review-model',
+      evaluate: async (_input, evaluatorDeps) => {
+        observedReviewer = evaluatorDeps.reviewer;
+        return reviewResult({ reviewer: evaluatorDeps.reviewer });
+      },
+    });
+
+    await deps.runReviewer(work);
+    expect(deps.reviewerIdentity).toBe('review-app[bot]');
+    expect(observedReviewer).toEqual({ provider: 'cli', model: 'review-model' });
+    expect(observedReviewer).not.toEqual(
+      expect.objectContaining({ provider: deps.reviewerIdentity })
+    );
+  });
+});
 
 describe('resolveReviewRouteConfig -- fail closed', () => {
   test('returns config when both values are present', () => {
