@@ -524,3 +524,80 @@ describe422('findPullRequest permanent 422 handling', () => {
     expect422(evidence.exists).toBe(false);
   });
 });
+
+// 12th canary defect (2026-08-26): mergeable:null is transient, retry before returning.
+import { describe as dNull, test as tNull, expect as eNull } from 'bun:test';
+import { createRealFindPullRequest as mkFindNull } from '../adapters/github-real-deps.js';
+
+dNull('mergeable:null retry', () => {
+  tNull(
+    'retries pulls.get when mergeable is null, uses the resolved value',
+    async () => {
+      let getCalls = 0;
+      const octokit = {
+        pulls: {
+          list: async () => ({ data: [{ number: 1 }] }),
+          get: async () => {
+            getCalls += 1;
+            const mergeable = getCalls < 3 ? null : true;
+            return {
+              data: {
+                number: 1,
+                state: 'open',
+                merged: false,
+                mergeable,
+                head: { sha: 'abc' },
+                title: 't',
+              },
+            };
+          },
+        },
+        checks: { listForRef: async () => ({ data: { check_runs: [] } }) },
+        search: { issuesAndPullRequests: async () => ({ data: { items: [] } }) },
+      };
+      const find = mkFindNull(octokit as never, {
+        logger: { warn: () => undefined, error: () => undefined, error2: () => undefined } as never,
+        now: () => 0,
+      });
+      const evidence = await find({ owner: 'o', repo: 'r', headBranch: 'b', woId: 'WO-X-01' });
+      eNull(getCalls).toBe(3);
+      eNull(evidence.mergeable).toBe(true);
+    },
+    15000
+  );
+
+  tNull(
+    'gives up after 3 retries and returns null (judge stays conservative)',
+    async () => {
+      let getCalls = 0;
+      const octokit = {
+        pulls: {
+          list: async () => ({ data: [{ number: 1 }] }),
+          get: async () => {
+            getCalls += 1;
+            return {
+              data: {
+                number: 1,
+                state: 'open',
+                merged: false,
+                mergeable: null,
+                head: { sha: 'abc' },
+                title: 't',
+              },
+            };
+          },
+        },
+        checks: { listForRef: async () => ({ data: { check_runs: [] } }) },
+        search: { issuesAndPullRequests: async () => ({ data: { items: [] } }) },
+      };
+      const find = mkFindNull(octokit as never, {
+        logger: { warn: () => undefined, error: () => undefined } as never,
+        now: () => 0,
+      });
+      const evidence = await find({ owner: 'o', repo: 'r', headBranch: 'b', woId: 'WO-X-01' });
+      eNull(getCalls).toBe(4);
+      eNull(evidence.mergeable).toBeNull();
+    },
+    15000
+  );
+});
