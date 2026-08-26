@@ -27,6 +27,7 @@ import {
   evaluatePullRequest,
   invokeConfiguredReviewModel,
 } from './pr-review-evaluator';
+import type { PrReviewDeps, PrReviewInput, PrReviewResult } from './pr-review-evaluator';
 import type { ReviewerVerdict, SubmitDeps } from './pr-review-submit.ts';
 
 /** Env var carrying the shared GitHub webhook secret for the review route. */
@@ -227,16 +228,37 @@ export function createRealIngestDeps(config: ReviewRouteConfig): IngestDeps {
   };
 }
 
-/** Bind WO-2's evaluator into WO-1's injected submit-side reviewer seam. */
+interface RealSubmitWiringOverrides {
+  octokit?: ReturnType<typeof createRealOctokitClient>;
+  reviewerModel?: string;
+  evaluate?: (input: PrReviewInput, deps: PrReviewDeps) => Promise<PrReviewResult>;
+  invokeModel?: PrReviewDeps['invokeModel'];
+}
+
+const INDETERMINATE_REVIEW_SUMMARY =
+  'The independent review could not reach a determinate verdict. No approval was issued.';
+
+/**
+ * Bind WO-2's evaluator into WO-1's injected submit-side reviewer seam.
+ * `reviewerIdentity` is specifically the GitHub actor used for custody checks;
+ * the model identity is captured separately from the configured model ladder.
+ */
 export function createRealSubmitDeps(
-  reviewerIdentity = REVIEW_REVIEWER_IDENTITY_DEFAULT
+  reviewerIdentity = REVIEW_REVIEWER_IDENTITY_DEFAULT,
+  overrides: RealSubmitWiringOverrides = {}
 ): SubmitDeps {
-  const octokit = createRealOctokitClient();
+  const octokit = overrides.octokit ?? createRealOctokitClient();
   const fetchEvidence = createRealFetchExactHeadPullRequestEvidence(octokit);
+  const configuredModelReviewer = configuredReviewIdentity();
+  const modelReviewer = {
+    provider: configuredModelReviewer.provider,
+    model: overrides.reviewerModel ?? configuredModelReviewer.model,
+  };
+  const runEvaluation = overrides.evaluate ?? evaluatePullRequest;
   return {
     reviewerIdentity,
     async runReviewer(work): Promise<ReviewerVerdict> {
-      const result = await evaluatePullRequest(
+      const result = await runEvaluation(
         {
           owner: work.owner,
           repo: work.repo,
@@ -244,7 +266,7 @@ export function createRealSubmitDeps(
           head_sha: work.headSha,
         },
         {
-          reviewer: configuredReviewIdentity(),
+          reviewer: modelReviewer,
           fetchEvidence: request =>
             fetchEvidence({
               owner: request.owner,
@@ -255,7 +277,7 @@ export function createRealSubmitDeps(
           // No authorized runtime WO-spec source exists in this repository.
           // Missing criteria is an explicit, recorded degrade path.
           fetchAcceptanceCriteria: async () => null,
-          invokeModel: invokeConfiguredReviewModel,
+          invokeModel: overrides.invokeModel ?? invokeConfiguredReviewModel,
         }
       );
       const summary =
@@ -263,7 +285,9 @@ export function createRealSubmitDeps(
           ? result.findings
               .map(finding => `[${finding.severity}] ${finding.scope}: ${finding.summary}`)
               .join('\n')
-          : (result.error ?? 'No blocking findings.');
+          : result.verdict === 'INDETERMINATE'
+            ? INDETERMINATE_REVIEW_SUMMARY
+            : 'No blocking findings.';
       return {
         approved: result.verdict === 'APPROVE',
         summary,

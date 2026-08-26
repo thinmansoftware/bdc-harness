@@ -122,6 +122,33 @@ describe('governed PR-code reviewer', () => {
     expect(calls[2]?.ref).toBe(HEAD_A);
   });
 
+  test('5b evidence collection rejects when the live PR head has moved', async () => {
+    const octokit = {
+      pulls: {
+        get: async () => ({ data: { head: { sha: HEAD_B }, base: { sha: HEAD_A } } }),
+      },
+      repos: {
+        compareCommits: async () => {
+          throw new Error('comparison must not run for a stale head');
+        },
+      },
+      checks: {
+        listForRef: async () => {
+          throw new Error('checks must not run for a stale head');
+        },
+      },
+    } as unknown as RealGitHubOctokitLike;
+
+    await expect(
+      createRealFetchExactHeadPullRequestEvidence(octokit)({
+        owner: input.owner,
+        repo: input.repo,
+        prNumber: input.pr_number,
+        headSha: HEAD_A,
+      })
+    ).rejects.toThrow('pr_review_head_moved');
+  });
+
   test('6 returned head mismatch is INDETERMINATE', async () => {
     const result = await evaluatePullRequest(
       input,
