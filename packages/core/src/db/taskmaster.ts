@@ -399,6 +399,28 @@ export async function recordUsageSample(data: {
   return { ...row, observed_at: toIso(row.observed_at), is_unknown: row.is_unknown };
 }
 
+/** Read the newest usage observations for one provider/window. */
+export async function getRecentUsageSamples(
+  provider: string,
+  windowKind: string,
+  limit: number
+): Promise<TmUsageSample[]> {
+  const boundedLimit = Math.max(0, Math.floor(limit));
+  if (boundedLimit === 0) return [];
+  const result = await getDatabase().query<TmUsageSample>(
+    `SELECT * FROM tm_usage_sample
+     WHERE provider = $1 AND window_kind = $2
+     ORDER BY observed_at DESC
+     LIMIT $3`,
+    [provider, windowKind, boundedLimit]
+  );
+  return result.rows.map(row => ({
+    ...row,
+    observed_at: toIso(row.observed_at),
+    is_unknown: row.is_unknown,
+  }));
+}
+
 // ---------------------------------------------------------------------------
 // Adoption projection (WO-HARNESS-TASKMASTER-ADOPTION-PROJECTION-01, M-155 WO 1)
 // Disposable snapshot rebuilt from GitHub. Commit flips meta + retires prior

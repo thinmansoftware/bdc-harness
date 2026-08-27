@@ -76,11 +76,21 @@ describe('grok second-opinion judge', () => {
   });
 
   test('treats non-zero grok exit as hold', async () => {
+    const recorded: unknown[] = [];
     await expect(
       judgeWithGrok(evidence, {
         spawn: async () => ({ exitCode: 1, stdout: 'VERDICT: APPROVE\n', timedOut: false }),
+        recordOutcome: async (...args) => {
+          recorded.push(args);
+          return {} as never;
+        },
       })
     ).resolves.toMatchObject({ disposition: 'hold', reason: 'judge_exit_nonzero' });
+    expect(recorded).toHaveLength(1);
+    const call = recorded[0] as [string, { exitCode: number; timedOut: boolean }, string];
+    expect(call[0]).toBe((process.env.OVERSEER_JUDGE_LADDER ?? 'grok').split(',')[0]);
+    expect(call[1]).toMatchObject({ exitCode: 1, timedOut: false });
+    expect(call[2]).toBe('judge-second-opinion');
   });
 
   test('prompt uses the actual WO and exact-head evidence instead of a hardcoded WO', async () => {

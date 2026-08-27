@@ -688,6 +688,7 @@ import { judgeTerminalRun as judgeCx } from '../judge-first.js';
 dCx('codex judge rung invocation', () => {
   tCx('codex rung judges when grok is unavailable', async () => {
     const spawns: string[][] = [];
+    const recorded: string[] = [];
     const outcome = await judgeCx(
       {
         runId: 'run-cx',
@@ -708,9 +709,14 @@ dCx('codex judge rung invocation', () => {
             timedOut: false,
           };
         },
+        recordOutcome: async binary => {
+          recorded.push(binary);
+          return {} as never;
+        },
       }
     );
     eCx(spawns.map(s => s[0])).toEqual(['grok', 'codex']);
+    eCx(recorded).toEqual(['grok', 'codex']);
     eCx(outcome.kind).toBe('verdict');
   });
 });

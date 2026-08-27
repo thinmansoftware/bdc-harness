@@ -19,6 +19,7 @@
 import { createHash } from 'crypto';
 import { createLogger } from '@archon/paths';
 import type { OverseerWorkflowEvent, PullRequestEvidence, WatchedRunRecord } from './types.ts';
+import { recordSpawnOutcome } from './model-resource-health.js';
 
 const log = createLogger('overseer/judge-first');
 
@@ -92,6 +93,7 @@ export interface JudgeFirstOptions {
   ladder?: string[];
   timeoutMs?: number;
   spawn?: (binary: string, prompt: string) => Promise<JudgeSpawnResult>;
+  recordOutcome?: typeof recordSpawnOutcome;
 }
 
 export function defaultJudgeLadder(): string[] {
@@ -339,8 +341,15 @@ export async function judgeTerminalRun(
     if (!binary) continue;
     lastModel = binary;
     lastRung = rung;
+    let spawnReturned = false;
     try {
       const result = await spawn(binary, prompt);
+      spawnReturned = true;
+      try {
+        await (options.recordOutcome ?? recordSpawnOutcome)(binary, result, 'judge-first');
+      } catch (error) {
+        log.error({ binary, error }, 'overseer.judge_first.resource_health_record_failed');
+      }
       if (result.timedOut || result.exitCode !== 0) {
         log.error(
           {
@@ -374,6 +383,20 @@ export async function judgeTerminalRun(
         modelRung: rung,
       };
     } catch (error) {
+      if (!spawnReturned) {
+        try {
+          await (options.recordOutcome ?? recordSpawnOutcome)(
+            binary,
+            { exitCode: -1, timedOut: false },
+            'judge-first'
+          );
+        } catch (recordError) {
+          log.error(
+            { binary, error: recordError },
+            'overseer.judge_first.resource_health_record_failed'
+          );
+        }
+      }
       log.error(
         { err: error as Error, runId: envelope.runId, rung, binary },
         'overseer.judge_first.rung_spawn_failed'
