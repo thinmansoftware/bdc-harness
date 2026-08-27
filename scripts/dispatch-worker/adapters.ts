@@ -68,8 +68,7 @@ export interface FusionReviewRequest {
  * Cursor's roster moves (Grok 4.3 -> 4.5 -> 4.6 inside two months); a moved id
  * must be a config change, not a code change.
  */
-export const CURSOR_GROK_MODEL =
-  process.env.CURSOR_GROK_MODEL ?? 'cursor-grok-4.6-high-fast';
+export const CURSOR_GROK_MODEL = process.env.CURSOR_GROK_MODEL ?? 'cursor-grok-4.6-high-fast';
 
 export const defaultAgentConfigs: Record<string, AgentConfig> = {
   claude: {

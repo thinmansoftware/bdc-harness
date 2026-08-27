@@ -179,7 +179,7 @@ describe('cursor ladder tier ships dark', () => {
   // Scenario 4 (edge -- ladder dark): asserted against the REAL config file,
   // not a fixture, so the shipped artifact is what is under test.
   test('cursor tier exists and is bound to its own workflow', () => {
-    const tier = ladderConfig.tiers.find((t) => t.name === 'cursor');
+    const tier = ladderConfig.tiers.find(t => t.name === 'cursor');
     expect(tier).toBeDefined();
     expect(tier?.workflowName).toBe('bdc-feature-development-cursor');
     expect(tier?.isFrontier).toBe(false);
@@ -190,16 +190,14 @@ describe('cursor ladder tier ships dark', () => {
   });
 
   test('cursor sits below codex in the ladder order', () => {
-    const names = ladderConfig.tiers.map((t) => t.name);
+    const names = ladderConfig.tiers.map(t => t.name);
     expect(names.indexOf('cursor')).toBeLessThan(names.indexOf('codex'));
   });
 
   // The pre-existing entry floor must not regress: codex remains the first
   // non-refused tier while cursor is dark.
   test('entry floor remains codex while cursor is refused', () => {
-    const firstLive = ladderConfig.tiers.find(
-      (t) => !ladderConfig.refusedTiers.includes(t.name)
-    );
+    const firstLive = ladderConfig.tiers.find(t => !ladderConfig.refusedTiers.includes(t.name));
     expect(firstLive?.name).toBe('codex');
   });
 });
