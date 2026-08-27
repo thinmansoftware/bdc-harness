@@ -1,5 +1,8 @@
 import type { GrokDispositionReceipt, GrokJudgeEvidence } from './types.ts';
 import { recordSpawnOutcome } from './model-resource-health.js';
+import { createLogger } from '@archon/paths';
+
+const log = createLogger('overseer/judge-second-opinion');
 
 const DEFAULT_TIMEOUT_MS = 60_000;
 
@@ -37,8 +40,8 @@ export async function judgeWithGrok(
     spawnReturned = true;
     try {
       await (options.recordOutcome ?? recordSpawnOutcome)(binary, result, 'judge-second-opinion');
-    } catch {
-      // Resource observability must never alter the merge disposition path.
+    } catch (error) {
+      log.error({ binary, error }, 'overseer.judge_second_opinion.resource_health_record_failed');
     }
     if (result.timedOut) return receipt(evidence, 'hold', 'judge_timeout');
     if (result.exitCode !== 0) return receipt(evidence, 'hold', 'judge_exit_nonzero');
@@ -48,7 +51,7 @@ export async function judgeWithGrok(
       return receipt(evidence, 'hold', 'judge_hold');
     }
     return receipt(evidence, 'hold', 'judge_output_invalid');
-  } catch {
+  } catch (error) {
     if (!spawnReturned) {
       try {
         await (options.recordOutcome ?? recordSpawnOutcome)(
@@ -56,10 +59,14 @@ export async function judgeWithGrok(
           { exitCode: -1, timedOut: false },
           'judge-second-opinion'
         );
-      } catch {
-        // Resource observability must never alter the merge disposition path.
+      } catch (recordError) {
+        log.error(
+          { binary, error: recordError },
+          'overseer.judge_second_opinion.resource_health_record_failed'
+        );
       }
     }
+    log.error({ binary, error }, 'overseer.judge_second_opinion.spawn_failed');
     return receipt(evidence, 'hold', 'judge_error');
   }
 }

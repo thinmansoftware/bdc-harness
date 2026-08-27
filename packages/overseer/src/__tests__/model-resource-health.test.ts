@@ -1,5 +1,9 @@
 import { describe, expect, test } from 'bun:test';
-import { getModelResourceHealth, type ModelResourceHealthDeps } from '../model-resource-health.ts';
+import {
+  getModelResourceHealth,
+  recordSpawnOutcome,
+  type ModelResourceHealthDeps,
+} from '../model-resource-health.ts';
 import type { TmUsageSample } from '@archon/core/db/taskmaster';
 
 function sample(id: string, outcome: 'success' | 'failure', observedAt: string): TmUsageSample {
@@ -64,16 +68,97 @@ describe('model resource health', () => {
     expect(health.consecutiveFailures).toBe(0);
   });
 
-  test('repeated degraded reads resolve to one idempotent episode signal', async () => {
+  test('health reads do not write health or emit signals', async () => {
     const signals: string[] = [];
+    let healthWrites = 0;
     const samples = [
       sample('f3', 'failure', '2026-08-27T11:03:00.000Z'),
       sample('f2', 'failure', '2026-08-27T11:02:00.000Z'),
       sample('f1', 'failure', '2026-08-27T11:01:00.000Z'),
     ];
-    const deps = depsFor(samples, signals);
+    const deps = {
+      ...depsFor(samples, signals),
+      upsertHealth: async () => {
+        healthWrites += 1;
+        return {} as never;
+      },
+    };
     await getModelResourceHealth('xai', deps);
     await getModelResourceHealth('xai', deps);
+    expect(healthWrites).toBe(0);
+    expect(signals).toEqual([]);
+  });
+
+  test('recording a third failure writes degraded health and emits the episode signal', async () => {
+    const signals: string[] = [];
+    const healthStates: string[] = [];
+    const samples = [
+      sample('f2', 'failure', '2026-08-27T11:02:00.000Z'),
+      sample('f1', 'failure', '2026-08-27T11:01:00.000Z'),
+    ];
+    const deps: ModelResourceHealthDeps = {
+      ...depsFor(samples, signals),
+      recordSample: async data => {
+        samples.unshift({
+          ...sample('f3', 'failure', '2026-08-27T11:03:00.000Z'),
+          provider: data.provider,
+          source: data.source,
+          value_json: data.value_json,
+        });
+        return samples[0]!;
+      },
+      upsertHealth: async data => {
+        healthStates.push(data.state);
+        return {} as never;
+      },
+    };
+    const health = await recordSpawnOutcome(
+      'grok',
+      { exitCode: 1, timedOut: false },
+      'judge-first',
+      deps
+    );
+    expect(health.state).toBe('degraded');
+    expect(healthStates).toEqual(['degraded']);
     expect(signals).toEqual(['model-resource-degraded:xai:f1']);
+  });
+
+  test('repeated failures in one degraded episode reuse the signal idempotency key', async () => {
+    const signalKeys: string[] = [];
+    const samples = [
+      sample('f2', 'failure', '2026-08-27T11:02:00.000Z'),
+      sample('f1', 'failure', '2026-08-27T11:01:00.000Z'),
+    ];
+    let nextFailure = 3;
+    const deps: ModelResourceHealthDeps = {
+      ...depsFor(samples),
+      recordSample: async data => {
+        const failure = sample(
+          `f${nextFailure}`,
+          'failure',
+          `2026-08-27T11:0${nextFailure}:00.000Z`
+        );
+        nextFailure += 1;
+        samples.unshift({
+          ...failure,
+          provider: data.provider,
+          source: data.source,
+          value_json: data.value_json,
+        });
+        return samples[0]!;
+      },
+      sendSignal: async data => {
+        signalKeys.push(data.idempotency_key);
+        return {} as never;
+      },
+    };
+
+    await recordSpawnOutcome('grok', { exitCode: 1, timedOut: false }, 'judge-first', deps);
+    await recordSpawnOutcome('grok', { exitCode: 1, timedOut: false }, 'judge-first', deps);
+
+    expect(signalKeys).toEqual([
+      'model-resource-degraded:xai:f1',
+      'model-resource-degraded:xai:f1',
+    ]);
   });
 });

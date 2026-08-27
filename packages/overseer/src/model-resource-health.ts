@@ -83,31 +83,6 @@ export async function getModelResourceHealth(
     lastSuccessAt,
     sampleCount: known.length,
   };
-  const currentTime =
-    deps.now ??
-    function currentTime(): Date {
-      return new Date();
-    };
-  const now = currentTime();
-  await (deps.upsertHealth ?? upsertHealthSample)({
-    provider,
-    state,
-    expires_at: new Date(now.getTime() + HEALTH_TTL_MS).toISOString(),
-    evidence: JSON.stringify(health),
-  });
-
-  if (state === 'degraded') {
-    const episode = known.slice(0, consecutiveFailures).at(-1)?.sample.id ?? 'unknown';
-    await (deps.sendSignal ?? createMessage)({
-      correlation_id: `model-resource:${provider}:${episode}`,
-      idempotency_key: `model-resource-degraded:${provider}:${episode}`,
-      task_type: 'agent_message',
-      sender: 'taskmaster',
-      recipient: 'operator',
-      priority: 'blocker',
-      body: `Model resource ${provider} is degraded after ${consecutiveFailures} consecutive judge spawn failures; last success: ${lastSuccessAt ?? 'none recorded'}.`,
-    });
-  }
   return health;
 }
 
@@ -127,5 +102,33 @@ export async function recordSpawnOutcome(
     confidence: 'high',
     is_unknown: false,
   });
-  return getModelResourceHealth(provider, deps);
+  const health = await getModelResourceHealth(provider, deps);
+  const now = (deps.now ?? (() => new Date()))();
+  await (deps.upsertHealth ?? upsertHealthSample)({
+    provider,
+    state: health.state,
+    expires_at: new Date(now.getTime() + HEALTH_TTL_MS).toISOString(),
+    evidence: JSON.stringify(health),
+  });
+  if (health.state === 'degraded') {
+    const samples = await (deps.getSamples ?? getRecentUsageSamples)(
+      provider,
+      WINDOW_KIND,
+      SAMPLE_LIMIT
+    );
+    const known = samples
+      .map(sample => ({ sample, outcome: outcomeOf(sample) }))
+      .filter(item => item.outcome !== null);
+    const episode = known.slice(0, health.consecutiveFailures).at(-1)?.sample.id ?? 'unknown';
+    await (deps.sendSignal ?? createMessage)({
+      correlation_id: `model-resource:${provider}:${episode}`,
+      idempotency_key: `model-resource-degraded:${provider}:${episode}`,
+      task_type: 'agent_message',
+      sender: 'taskmaster',
+      recipient: 'operator',
+      priority: 'blocker',
+      body: `Model resource ${provider} is degraded after ${health.consecutiveFailures} consecutive judge spawn failures; last success: ${health.lastSuccessAt ?? 'none recorded'}.`,
+    });
+  }
+  return health;
 }

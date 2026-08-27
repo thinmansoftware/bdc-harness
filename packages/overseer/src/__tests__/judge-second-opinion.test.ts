@@ -23,11 +23,14 @@ const evidence: GrokJudgeEvidence = {
   diffStat: '+120 -8',
 };
 
+const ignoreOutcome = async (): Promise<never> => ({}) as never;
+
 describe('grok second-opinion judge', () => {
   test('parses VERDICT: APPROVE as approve', async () => {
     await expect(
       judgeWithGrok(evidence, {
         spawn: async () => ({ exitCode: 0, stdout: 'VERDICT: APPROVE\n', timedOut: false }),
+        recordOutcome: ignoreOutcome,
       })
     ).resolves.toMatchObject({
       schemaVersion: 'overseer-grok-merge-disposition-v1',
@@ -45,6 +48,7 @@ describe('grok second-opinion judge', () => {
     await expect(
       judgeWithGrok(evidence, {
         spawn: async () => ({ exitCode: 0, stdout: 'VERDICT: HOLD\n', timedOut: false }),
+        recordOutcome: ignoreOutcome,
       })
     ).resolves.toMatchObject({ disposition: 'hold', reason: 'judge_hold' });
   });
@@ -57,13 +61,24 @@ describe('grok second-opinion judge', () => {
   });
 
   test('treats missing grok CLI as hold without throwing', async () => {
+    const recorded: unknown[] = [];
     await expect(
       judgeWithGrok(evidence, {
         spawn: async () => {
           throw new Error('ENOENT');
         },
+        recordOutcome: async (...args) => {
+          recorded.push(args);
+          return {} as never;
+        },
       })
     ).resolves.toMatchObject({ disposition: 'hold', reason: 'judge_error' });
+    expect(recorded).toHaveLength(1);
+    expect(recorded[0]).toEqual([
+      (process.env.OVERSEER_JUDGE_LADDER ?? 'grok').split(',')[0],
+      { exitCode: -1, timedOut: false },
+      'judge-second-opinion',
+    ]);
   });
 
   test('treats grok timeout as hold', async () => {
@@ -71,6 +86,7 @@ describe('grok second-opinion judge', () => {
       judgeWithGrok(evidence, {
         timeoutMs: 1,
         spawn: async () => ({ exitCode: 124, stdout: '', timedOut: true }),
+        recordOutcome: ignoreOutcome,
       })
     ).resolves.toMatchObject({ disposition: 'hold', reason: 'judge_timeout' });
   });
@@ -100,6 +116,7 @@ describe('grok second-opinion judge', () => {
         prompt = input;
         return { exitCode: 0, stdout: 'VERDICT: HOLD\n', timedOut: false };
       },
+      recordOutcome: ignoreOutcome,
     });
     expect(prompt).toContain('WO: WO-TEST-01');
     expect(prompt).toContain(`Head SHA: ${evidence.headSha}`);
@@ -131,6 +148,7 @@ describe('judgeWithGrok: env-driven binary (13th canary defect)', () => {
         sawApprove = true;
         return { exitCode: 0, stdout: 'VERDICT: APPROVE', timedOut: false };
       },
+      recordOutcome: ignoreOutcome,
     });
     expect(sawApprove).toBe(true);
     expect(receipt.disposition).toBe('approve');

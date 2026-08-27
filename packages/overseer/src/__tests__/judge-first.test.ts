@@ -236,11 +236,13 @@ describe('parseJudgeOutput: strict structured parsing', () => {
 
 describe('judgeTerminalRun: model ladder + fail-loud health', () => {
   const envelope = buildEvidenceEnvelope(makeRecord(), []);
+  const ignoreOutcome = async (): Promise<never> => ({}) as never;
 
   test('ladder exhaustion by spawn failure is judge_unavailable, never a verdict', async () => {
     const outcome = await judgeTerminalRun(envelope, {
       ladder: ['dead-a', 'dead-b'],
       spawn: async () => ({ exitCode: 1, stdout: '', timedOut: false }),
+      recordOutcome: ignoreOutcome,
     });
     expect(outcome.kind).toBe('judge_unavailable');
   });
@@ -249,6 +251,7 @@ describe('judgeTerminalRun: model ladder + fail-loud health', () => {
     const outcome = await judgeTerminalRun(envelope, {
       ladder: ['chatty'],
       spawn: async () => ({ exitCode: 0, stdout: 'I feel great about this run!', timedOut: false }),
+      recordOutcome: ignoreOutcome,
     });
     expect(outcome.kind).toBe('judge_invalid_output');
   });
@@ -263,12 +266,34 @@ describe('judgeTerminalRun: model ladder + fail-loud health', () => {
               '{"verdict":"observe","confidence":0.7,"proposed_action":"none","proposed_tier":0,"reason":"ok"}',
             timedOut: false,
           };
-    const outcome = await judgeTerminalRun(envelope, { ladder: ['cheap', 'strong'], spawn });
+    const outcome = await judgeTerminalRun(envelope, {
+      ladder: ['cheap', 'strong'],
+      spawn,
+      recordOutcome: ignoreOutcome,
+    });
     expect(outcome.kind).toBe('verdict');
     if (outcome.kind === 'verdict') {
       expect(outcome.model).toBe('strong');
       expect(outcome.modelRung).toBe(1);
     }
+  });
+
+  test('records an unavailable outcome when spawning throws', async () => {
+    const recorded: unknown[] = [];
+    const outcome = await judgeTerminalRun(envelope, {
+      ladder: ['missing'],
+      spawn: async () => {
+        throw new Error('ENOENT');
+      },
+      recordOutcome: async (...args) => {
+        recorded.push(args);
+        return {} as never;
+      },
+    });
+    expect(outcome.kind).toBe('judge_unavailable');
+    expect(recorded).toEqual([
+      ['missing', { exitCode: -1, timedOut: false }, 'judge-first'],
+    ]);
   });
 });
 
