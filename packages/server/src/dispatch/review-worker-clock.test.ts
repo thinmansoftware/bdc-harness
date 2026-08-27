@@ -147,6 +147,29 @@ describe('review worker clock', () => {
     );
   });
 
+  test.each([
+    ['changes_requested', 'done', 'succeeded'],
+    ['custody_conflict', 'failed', 'blocked'],
+    ['merge_custody_conflict', 'failed', 'blocked'],
+    ['reviewer_failed', 'failed', 'failed'],
+    ['submission_failed', 'failed', 'failed'],
+  ] as const)(
+    'maps %s submissions to %s with a %s task outcome',
+    async (disposition, status, taskOutcome) => {
+      const deps = fakeDeps([message(disposition)], () => ({ disposition }));
+
+      await tickReviewWorkerClock(CONFIG, deps);
+
+      expect(deps.postResult).toHaveBeenCalledWith(
+        expect.objectContaining({
+          id: disposition,
+          status,
+          task_outcome: taskOutcome,
+        })
+      );
+    }
+  );
+
   test('isolates a failed item and continues through the batch', async () => {
     const deps = fakeDeps([message('bad'), message('good')]);
     const originalClaim = deps.claimMessage;
@@ -161,13 +184,41 @@ describe('review worker clock', () => {
     expect(deps.postResult).toHaveBeenCalledWith(expect.objectContaining({ id: 'good' }));
   });
 
+  test('isolates an invalid review body without posting a result and continues the batch', async () => {
+    const invalid = { ...message('invalid'), body: JSON.stringify({ owner: 'thinmansoftware' }) };
+    const deps = fakeDeps([invalid, message('valid')]);
+
+    await expect(tickReviewWorkerClock(CONFIG, deps)).resolves.toBeUndefined();
+
+    expect(deps.runAndSubmitReview).toHaveBeenCalledTimes(1);
+    expect(deps.runAndSubmitReview).toHaveBeenCalledWith(
+      expect.objectContaining({ messageId: 'valid' }),
+      expect.anything()
+    );
+    expect(deps.postResult).toHaveBeenCalledTimes(1);
+    expect(deps.postResult).toHaveBeenCalledWith(expect.objectContaining({ id: 'valid' }));
+    expect(deps.postResult).not.toHaveBeenCalledWith(expect.objectContaining({ id: 'invalid' }));
+  });
+
   test('does not start when review route configuration is absent', async () => {
     const deps = fakeDeps([message('never')]);
+    const originalNodeEnv = process.env.NODE_ENV;
 
-    startReviewWorkerClock(null, deps);
-    startReviewWorkerClock(undefined, deps);
-    await Bun.sleep(5);
+    process.env.NODE_ENV = 'production';
+    try {
+      startReviewWorkerClock(null, deps);
+      startReviewWorkerClock(undefined, deps);
+      await Bun.sleep(5);
 
-    expect(deps.registerWorker).not.toHaveBeenCalled();
+      expect(deps.registerWorker).not.toHaveBeenCalled();
+
+      startReviewWorkerClock(CONFIG, deps);
+      await Bun.sleep(5);
+      expect(deps.registerWorker).toHaveBeenCalledTimes(1);
+    } finally {
+      stopReviewWorkerClock();
+      if (originalNodeEnv === undefined) delete process.env.NODE_ENV;
+      else process.env.NODE_ENV = originalNodeEnv;
+    }
   });
 });
