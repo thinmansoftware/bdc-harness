@@ -125,12 +125,17 @@ export const defaultAgentConfigs: Record<string, AgentConfig> = {
    * WO-HARNESS-CURSOR-BUILD-SEAT-01 (transport half): reach the GROK seat
    * container-side THROUGH cursor-agent.
    *
-   * Why this exists: the xAI API is defunded (John, 2026-08-26 -- no credits,
-   * no top-up), so the plain `grok` adapter above has no funded backend from
-   * inside a container. The desktop grok CLI still works but is machine-bound
-   * and cannot serve archon-app-1. Cursor fronts Grok on the existing Ultra
-   * subscription, which makes this the ONLY container-side path back to the
-   * grok seat. This is an outage workaround, not an enhancement.
+   * Why this exists (rationale corrected 2026-08-27): originally built as an
+   * outage workaround when the xAI API was defunded (2026-08-26), which made
+   * Cursor the only container-side path to the grok seat. John confirmed
+   * 2026-08-27 that Grok usage is BACK, so that premise no longer holds.
+   *
+   * What it is now: a funded ALTERNATIVE route to the grok seat -- it runs on
+   * the Cursor Ultra subscription rather than xAI credits (cost lever), and it
+   * is a second path if xAI goes dark again (failover). The `grok` and
+   * `grok-acp` adapters above still cover the direct paths; all three are
+   * admitted under the grok family, so a separately-installed Grok builder
+   * slots in alongside these without changing this entry.
    *
    * Model id verified live 2026-08-26 via `cursor-agent --list-models` on the
    * target host, then proven end-to-end in a scratch container:
