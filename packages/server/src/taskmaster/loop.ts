@@ -158,6 +158,8 @@ export interface TaskmasterDeps {
     cascadeId: string
   ) => Promise<{ status: string; prOpened?: boolean } | null>;
   getHealthSample?: typeof taskmasterDb.getHealthSample;
+  /** Test/monitor observer invoked whenever the periodic budget-hold warning is emitted. */
+  onFireBudgetHolding?: (tickIndex: number, reason: string) => void;
 }
 
 export interface TickResult {
@@ -1180,13 +1182,6 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
       state.deadman.intervalMs,
       nowMs
     );
-    if (item.isUnclaimedP0 && backoff.kind === 'backoff') continue;
-    const priorFireFailures = lookback.filter(
-      row =>
-        row.thread_ref === item.ref &&
-        row.action_type === 'fire_cauldron' &&
-        row.outcome === 'failed'
-    ).length;
     if (
       resolveFireVerbEnabled() &&
       backoff.kind === 'ready' &&
@@ -1217,7 +1212,6 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
       fireLane: laneDecision.lane,
       fireHolding: laneDecision.holding,
       fireEscalate: backoff.kind === 'escalate',
-      fireAttempt: priorFireFailures,
       customerP0Exempt:
         item.priority === 'P0' &&
         (item.isCustomerFacing === true ||
@@ -1247,6 +1241,7 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
       { tickIndex: state.tickIndex, reason: laneDecision.reason },
       'taskmaster.fire_budget_holding'
     );
+    deps.onFireBudgetHolding?.(state.tickIndex, laneDecision.reason);
   }
 
   // Daily digest: one summary message per UTC day through the same path.

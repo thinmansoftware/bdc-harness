@@ -175,7 +175,6 @@ export interface NextActionContext {
   fireLane?: 'claude' | 'codex' | 'xai' | null;
   fireHolding?: boolean;
   fireEscalate?: boolean;
-  fireAttempt?: number;
   customerP0Exempt?: boolean;
   fireEvidence?: FireEvidence;
 }
@@ -355,7 +354,7 @@ export function computeNextAction(
         threadRef: thread.ref,
         recipient: 'operator',
         body: `Start governed Cauldron work for ${context.fireEvidence.woId} on ${lane} lane.`,
-        idempotencyKey: `tm:fire:${thread.ref}:${bucket}:attempt-${context.fireAttempt ?? 0}`,
+        idempotencyKey: `tm:fire:${thread.ref}:${bucket}`,
         actsImmediately: true,
         fireEvidence: context.fireEvidence,
       };
