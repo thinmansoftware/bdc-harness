@@ -125,7 +125,7 @@ describe('computeNextAction', () => {
       interventionsLast24h: 0,
       nowMs: NOW_MS,
       fireEligible: true,
-      fireBudgetAvailable: true,
+      fireLane: 'codex',
       fireEvidence: evidence,
     });
     expect(proposal?.type).toBe('fire_cauldron');
@@ -137,10 +137,64 @@ describe('computeNextAction', () => {
         interventionsLast24h: 0,
         nowMs: NOW_MS,
         fireEligible: true,
-        fireBudgetAvailable: false,
+        fireLane: null,
         fireEvidence: evidence,
       })?.type
     ).toBe('escalate_p0');
+  });
+
+  test('fire identity stays stable when the observed failure count changes', () => {
+    const evidence = {
+      woId: 'WO-HARNESS-EXAMPLE-01',
+      targetRepo: 'thinmansoftware/bdc-harness',
+      project: 'bdc-harness',
+      specVerifiedAt: new Date(NOW_MS).toISOString(),
+      noOpenOrMergedPr: true as const,
+    };
+    const base = {
+      interventionsLast24h: 0,
+      nowMs: NOW_MS,
+      fireEligible: true,
+      fireLane: 'codex' as const,
+      fireEvidence: evidence,
+    };
+    const before = computeNextAction(
+      thread({ priority: 'P0', isUnclaimedP0: true }),
+      'ready',
+      base
+    );
+    const after = computeNextAction(thread({ priority: 'P0', isUnclaimedP0: true }), 'ready', {
+      ...base,
+      interventionsLast24h: 1,
+    });
+    expect(after?.idempotencyKey).toBe(before?.idempotencyKey);
+  });
+
+  test('budget hold queues ordinary work while customer P0 fires on cheapest lane', () => {
+    const evidence = {
+      woId: 'WO-HARNESS-EXAMPLE-01',
+      targetRepo: 'thinmansoftware/bdc-harness',
+      project: 'bdc-harness',
+      specVerifiedAt: new Date(NOW_MS).toISOString(),
+      noOpenOrMergedPr: true as const,
+    };
+    const context = {
+      interventionsLast24h: 0,
+      nowMs: NOW_MS,
+      fireEligible: true,
+      fireLane: null,
+      fireHolding: true,
+      fireEvidence: evidence,
+    };
+    expect(
+      computeNextAction(thread({ priority: 'P0', isUnclaimedP0: true }), 'ready', context)
+    ).toBeNull();
+    expect(
+      computeNextAction(thread({ priority: 'P0', isUnclaimedP0: true }), 'ready', {
+        ...context,
+        customerP0Exempt: true,
+      })?.type
+    ).toBe('fire_cauldron');
   });
 
   test('stale thread nudges without immediacy (two-tick confirmation required)', () => {

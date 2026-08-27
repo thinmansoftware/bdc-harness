@@ -38,6 +38,8 @@ import {
 import { validateProposal, type TmAllowedRecipient } from './guard';
 import { checkFireEligibility, type FireEligibilityResult } from './fire-eligibility';
 import { currentHeadroom, type HeadroomReading } from './ledger';
+import { decideFireLane } from './lane-budget';
+import { fireBackoffDecision } from './backoff';
 import {
   createDeadmanState,
   recordTickAttempt,
@@ -78,6 +80,8 @@ export interface TaskmasterState {
   pendingConfirm: Map<string, { tickIndex: number; epoch: number }>;
   /** Restart reconciliation runs once per process. */
   reconciled: boolean;
+  /** Last tick on which a budget hold was made visible. */
+  lastHoldMonitorTick: number | null;
 }
 
 export function createTaskmasterState(intervalMs: number): TaskmasterState {
@@ -86,6 +90,7 @@ export function createTaskmasterState(intervalMs: number): TaskmasterState {
     tickIndex: 0,
     pendingConfirm: new Map(),
     reconciled: false,
+    lastHoldMonitorTick: null,
   };
 }
 
@@ -152,6 +157,9 @@ export interface TaskmasterDeps {
     woId: string,
     cascadeId: string
   ) => Promise<{ status: string; prOpened?: boolean } | null>;
+  getHealthSample?: typeof taskmasterDb.getHealthSample;
+  /** Test/monitor observer invoked whenever the periodic budget-hold warning is emitted. */
+  onFireBudgetHolding?: (tickIndex: number, reason: string) => void;
 }
 
 export interface TickResult {
@@ -1017,14 +1025,15 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
     }
   }
   const actions24h = lookback.filter(a => Date.parse(a.created_at) >= since24h);
-  const utcMidnight = Date.parse(new Date(nowMs).toISOString().slice(0, 10) + 'T00:00:00.000Z');
-  const firesToday = lookback.filter(
-    a =>
-      a.action_type === 'fire_cauldron' &&
-      a.outcome === 'sent' &&
-      Date.parse(a.created_at) >= utcMidnight
-  ).length;
-  let fireSlotsRemaining = Math.max(0, resolveFireMaxPerDay() - firesToday);
+  const readHealth = deps.getHealthSample ?? taskmasterDb.getHealthSample;
+  let codexHealth: taskmasterDb.TmHealthSample | null = null;
+  let xaiHealth: taskmasterDb.TmHealthSample | null = null;
+  try {
+    [codexHealth, xaiHealth] = await Promise.all([readHealth('codex'), readHealth('xai')]);
+  } catch (error) {
+    log.warn({ err: error as Error }, 'taskmaster.lane_health_read_failed');
+  }
+  const laneDecision = decideFireLane(headroom, { codex: codexHealth, xai: xaiHealth });
 
   // Grade previously sent actions against the external SOR.
   tickFailures += await gradeSentActions(
@@ -1166,9 +1175,16 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
     const adoptionRow = adoptionByRef.get(canonRef);
     const classification = classifyThread(item, nowMs);
     let fireResult: FireEligibilityResult = { eligible: false };
+    const backoff = fireBackoffDecision(
+      lookback,
+      item.ref,
+      state.tickIndex,
+      state.deadman.intervalMs,
+      nowMs
+    );
     if (
       resolveFireVerbEnabled() &&
-      fireSlotsRemaining > 0 &&
+      backoff.kind === 'ready' &&
       item.isUnclaimedP0 &&
       typeof (item as ListedThread).title === 'string'
     ) {
@@ -1193,15 +1209,39 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
       grades: gradesByRef.get(canonRef),
       suppression: suppressionByRef.get(canonRef),
       fireEligible: fireResult.eligible,
-      fireBudgetAvailable: fireSlotsRemaining > 0,
+      fireLane: laneDecision.lane,
+      fireHolding: laneDecision.holding,
+      fireEscalate: backoff.kind === 'escalate',
+      customerP0Exempt:
+        item.priority === 'P0' &&
+        (item.isCustomerFacing === true ||
+          ((item as ListedThread).labels ?? []).some(label =>
+            [
+              'customer-facing',
+              'customer',
+              'security',
+              'data-loss',
+              'prod-recovery',
+              'production-recovery',
+            ].includes(label.toLowerCase())
+          )),
       fireEvidence: fireResult.evidence,
     });
     if (proposal) {
       proposals.push(proposal);
-      // Reserve the daily slot within this tick so a batch of qualified P0s
-      // cannot all observe the same pre-tick count and exceed the cap.
-      if (proposal.type === 'fire_cauldron') fireSlotsRemaining -= 1;
     }
+  }
+
+  if (
+    laneDecision.holding &&
+    (state.lastHoldMonitorTick === null || state.tickIndex - state.lastHoldMonitorTick >= 96)
+  ) {
+    state.lastHoldMonitorTick = state.tickIndex;
+    log.warn(
+      { tickIndex: state.tickIndex, reason: laneDecision.reason },
+      'taskmaster.fire_budget_holding'
+    );
+    deps.onFireBudgetHolding?.(state.tickIndex, laneDecision.reason);
   }
 
   // Daily digest: one summary message per UTC day through the same path.
@@ -1489,13 +1529,6 @@ export function resolveFireVerbEnabled(
   raw: string | undefined = process.env.TASKMASTER_FIRE_VERB_ENABLED
 ): boolean {
   return raw?.trim().toLowerCase() === 'true' || raw?.trim() === '1';
-}
-
-export function resolveFireMaxPerDay(
-  raw: string | undefined = process.env.TASKMASTER_FIRE_MAX_PER_DAY
-): number {
-  const parsed = Number.parseInt(raw ?? '', 10);
-  return Number.isInteger(parsed) && parsed >= 0 ? parsed : 2;
 }
 
 /**

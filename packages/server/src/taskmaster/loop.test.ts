@@ -13,7 +13,6 @@ import {
   tick,
   resolveTaskmasterIntervalMs,
   resolveFireVerbEnabled,
-  resolveFireMaxPerDay,
   refreshAdoption,
   canonicalizeThreadRef,
   resolveRecipient,
@@ -394,6 +393,33 @@ describe('scenario 3: pause scope=effects withholds ALL effects (P0 escalation n
 });
 
 describe('fire_cauldron loop', () => {
+  test('fire backoff still delivers an outstanding ruling for the P0', async () => {
+    const world = makeWorld();
+    seedDigestSent(world);
+    const item = makeListedThread({
+      ref: 'gh:thinmansoftware/bdc-harness#500',
+      priority: 'P0',
+      isUnclaimedP0: true,
+      undeliveredRulingId: 'ruling-during-fire-backoff',
+    });
+    world.journal.push({
+      id: 'failed-fire-500',
+      created_at: new Date(T0).toISOString(),
+      thread_ref: item.ref,
+      action_type: 'fire_cauldron',
+      proposal_json: '{}',
+      idempotency_key: 'old-fire-500',
+      before_hash: null,
+      proof_predicate: null,
+      proof_deadline_at: null,
+      outcome: 'failed',
+      graded_at: null,
+      grade: null,
+    });
+    await tick(createTaskmasterState(60_000), makeDeps(world, { listThreads: async () => [item] }));
+    expect(world.journal.some(row => row.action_type === 'deliver_ruling')).toBe(true);
+  });
+
   test('qualified unclaimed P0 admits exactly one cascade and journals its run id', async () => {
     const prior = process.env.TASKMASTER_FIRE_VERB_ENABLED;
     process.env.TASKMASTER_FIRE_VERB_ENABLED = 'true';
@@ -444,6 +470,180 @@ describe('fire_cauldron loop', () => {
       if (prior === undefined) delete process.env.TASKMASTER_FIRE_VERB_ENABLED;
       else process.env.TASKMASTER_FIRE_VERB_ENABLED = prior;
     }
+  });
+
+  test('prior same-day sent fires do not impose a daily fire ceiling', async () => {
+    const prior = process.env.TASKMASTER_FIRE_VERB_ENABLED;
+    process.env.TASKMASTER_FIRE_VERB_ENABLED = 'true';
+    try {
+      const world = makeWorld();
+      seedDigestSent(world);
+      const item = makeListedThread({
+        ref: 'gh:thinmansoftware/bdc-harness#504',
+        priority: 'P0',
+        isUnclaimedP0: true,
+        title: 'WO-HARNESS-EXAMPLE-01 urgent build',
+      });
+      for (const n of [1, 2]) {
+        world.journal.push({
+          id: `same-day-fire-${n}`,
+          created_at: new Date(T0 - n * 60_000).toISOString(),
+          thread_ref: item.ref,
+          action_type: 'fire_cauldron',
+          proposal_json: JSON.stringify({
+            type: 'fire_cauldron',
+            cascadeId: `old-cascade-${n}`,
+            fireEvidence: { woId: 'WO-HARNESS-EXAMPLE-01' },
+          }),
+          idempotency_key: `old-fire-${n}`,
+          before_hash: null,
+          proof_predicate: null,
+          proof_deadline_at: new Date(T0 + 60_000).toISOString(),
+          outcome: 'sent',
+          graded_at: null,
+          grade: null,
+        });
+      }
+      let admissions = 0;
+      await tick(
+        createTaskmasterState(60_000),
+        makeDeps(world, {
+          listThreads: async () => [item],
+          getFireRunEvidence: async () => ({ status: 'completed', prOpened: false }),
+          checkFireEligibility: async () => ({
+            eligible: true,
+            evidence: {
+              woId: 'WO-HARNESS-EXAMPLE-01',
+              targetRepo: 'thinmansoftware/bdc-harness',
+              project: 'bdc-harness',
+              specVerifiedAt: new Date(T0).toISOString(),
+              noOpenOrMergedPr: true,
+            },
+          }),
+          runCascade: (async options => {
+            admissions += 1;
+            const record = { cascadeId: 'new-cascade', status: 'running' } as never;
+            options.onAdmission?.(record, true);
+            return record;
+          }) as NonNullable<TaskmasterDeps['runCascade']>,
+        })
+      );
+      expect(admissions).toBe(1);
+      expect(world.journal.filter(row => row.action_type === 'fire_cauldron')).toHaveLength(3);
+    } finally {
+      if (prior === undefined) delete process.env.TASKMASTER_FIRE_VERB_ENABLED;
+      else process.env.TASKMASTER_FIRE_VERB_ENABLED = prior;
+    }
+  });
+
+  test('tick derives case-insensitive customer P0 exemption while holding all lanes', async () => {
+    const prior = process.env.TASKMASTER_FIRE_VERB_ENABLED;
+    process.env.TASKMASTER_FIRE_VERB_ENABLED = 'true';
+    try {
+      const world = makeWorld();
+      seedDigestSent(world);
+      const threads = [
+        makeListedThread({
+          ref: 'gh:thinmansoftware/bdc-harness#505',
+          priority: 'P0',
+          isUnclaimedP0: true,
+          labels: ['wo', 'CuStOmEr-FaCiNg'],
+          title: 'WO-HARNESS-EXAMPLE-01 customer outage',
+        }),
+        makeListedThread({
+          ref: 'gh:thinmansoftware/bdc-harness#506',
+          priority: 'P1',
+          isUnclaimedP0: true,
+          labels: ['CUSTOMER'],
+          title: 'WO-HARNESS-EXAMPLE-02 mislabeled priority',
+        }),
+      ];
+      const healthProviders: string[] = [];
+      let admissions = 0;
+      await tick(
+        createTaskmasterState(60_000),
+        makeDeps(world, {
+          listThreads: async () => threads,
+          headroom: async () => ({
+            state: 'LOW',
+            tokensRemaining: 0,
+            isUnknown: false,
+            source: 'test',
+            observedAt: new Date(T0).toISOString(),
+          }),
+          getHealthSample: async provider => {
+            healthProviders.push(provider);
+            return {
+              provider,
+              state: 'degraded',
+              sampled_at: new Date(T0).toISOString(),
+              expires_at: new Date(T0 + 60_000).toISOString(),
+              evidence: null,
+            };
+          },
+          checkFireEligibility: async title => ({
+            eligible: true,
+            evidence: {
+              woId: title.includes('EXAMPLE-01')
+                ? 'WO-HARNESS-EXAMPLE-01'
+                : 'WO-HARNESS-EXAMPLE-02',
+              targetRepo: 'thinmansoftware/bdc-harness',
+              project: 'bdc-harness',
+              specVerifiedAt: new Date(T0).toISOString(),
+              noOpenOrMergedPr: true,
+            },
+          }),
+          runCascade: (async options => {
+            admissions += 1;
+            const record = { cascadeId: 'customer-cascade', status: 'running' } as never;
+            options.onAdmission?.(record, true);
+            return record;
+          }) as NonNullable<TaskmasterDeps['runCascade']>,
+        })
+      );
+      expect(healthProviders.sort()).toEqual(['codex', 'xai']);
+      expect(admissions).toBe(1);
+      expect(
+        world.journal.filter(row => row.action_type === 'fire_cauldron').map(row => row.thread_ref)
+      ).toEqual([threads[0]!.ref]);
+    } finally {
+      if (prior === undefined) delete process.env.TASKMASTER_FIRE_VERB_ENABLED;
+      else process.env.TASKMASTER_FIRE_VERB_ENABLED = prior;
+    }
+  });
+
+  test('budget hold monitor is visible once per 96 ticks and health is read each tick', async () => {
+    const world = makeWorld();
+    seedDigestSent(world);
+    const monitorTicks: number[] = [];
+    let healthReads = 0;
+    const deps = makeDeps(world, {
+      headroom: async () => ({
+        state: 'LOW',
+        tokensRemaining: 0,
+        isUnknown: false,
+        source: 'test',
+        observedAt: new Date(world.nowMs).toISOString(),
+      }),
+      getHealthSample: async provider => {
+        healthReads += 1;
+        return {
+          provider,
+          state: 'degraded',
+          sampled_at: new Date(world.nowMs).toISOString(),
+          expires_at: new Date(world.nowMs + 60_000).toISOString(),
+          evidence: null,
+        };
+      },
+      onFireBudgetHolding: tickIndex => monitorTicks.push(tickIndex),
+    });
+    const state = createTaskmasterState(60_000);
+    for (let n = 0; n < 97; n += 1) {
+      await tick(state, deps);
+      world.nowMs += 60_000;
+    }
+    expect(monitorTicks).toEqual([1, 97]);
+    expect(healthReads).toBe(97 * 2);
   });
 
   test('pause scope=effects parks an eligible fire without admitting a cascade', async () => {
@@ -2308,12 +2508,9 @@ describe('M-155 exception push (loop)', () => {
     expect([...TM_ALLOWED_RECIPIENTS]).toEqual(['xo', 'major-build', 'captain-ci', 'operator']);
   });
 
-  test('fire verb environment defaults OFF with a two-per-day budget', () => {
+  test('fire verb environment defaults OFF without a calendar budget', () => {
     expect(resolveFireVerbEnabled(undefined)).toBe(false);
     expect(resolveFireVerbEnabled('true')).toBe(true);
-    expect(resolveFireMaxPerDay(undefined)).toBe(2);
-    expect(resolveFireMaxPerDay('0')).toBe(0);
-    expect(resolveFireMaxPerDay('invalid')).toBe(2);
   });
 
   test('push: the loop never resumes itself -- no setPauseState RUNNING write', () => {
