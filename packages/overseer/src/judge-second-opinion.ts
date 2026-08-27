@@ -1,4 +1,8 @@
 import type { GrokDispositionReceipt, GrokJudgeEvidence } from './types.ts';
+import { recordSpawnOutcome } from './model-resource-health.js';
+import { createLogger } from '@archon/paths';
+
+const log = createLogger('overseer/judge-second-opinion');
 
 const DEFAULT_TIMEOUT_MS = 60_000;
 
@@ -11,6 +15,7 @@ interface GrokSpawnResult {
 interface JudgeWithGrokOptions {
   timeoutMs?: number;
   spawn?: (prompt: string) => Promise<GrokSpawnResult>;
+  recordOutcome?: typeof recordSpawnOutcome;
 }
 
 export function parseGrokVerdict(stdout: string): 'approve' | 'hold' {
@@ -27,9 +32,17 @@ export async function judgeWithGrok(
     options.spawn ??
     ((input: string): Promise<GrokSpawnResult> =>
       spawnGrok(input, options.timeoutMs ?? DEFAULT_TIMEOUT_MS));
+  const binary = secondOpinionBinary();
+  let spawnReturned = false;
 
   try {
     const result = await spawn(prompt);
+    spawnReturned = true;
+    try {
+      await (options.recordOutcome ?? recordSpawnOutcome)(binary, result, 'judge-second-opinion');
+    } catch (error) {
+      log.error({ binary, error }, 'overseer.judge_second_opinion.resource_health_record_failed');
+    }
     if (result.timedOut) return receipt(evidence, 'hold', 'judge_timeout');
     if (result.exitCode !== 0) return receipt(evidence, 'hold', 'judge_exit_nonzero');
     const verdict = parseGrokVerdict(result.stdout);
@@ -38,7 +51,22 @@ export async function judgeWithGrok(
       return receipt(evidence, 'hold', 'judge_hold');
     }
     return receipt(evidence, 'hold', 'judge_output_invalid');
-  } catch {
+  } catch (error) {
+    if (!spawnReturned) {
+      try {
+        await (options.recordOutcome ?? recordSpawnOutcome)(
+          binary,
+          { exitCode: -1, timedOut: false },
+          'judge-second-opinion'
+        );
+      } catch (recordError) {
+        log.error(
+          { binary, error: recordError },
+          'overseer.judge_second_opinion.resource_health_record_failed'
+        );
+      }
+    }
+    log.error({ binary, error }, 'overseer.judge_second_opinion.spawn_failed');
     return receipt(evidence, 'hold', 'judge_error');
   }
 }

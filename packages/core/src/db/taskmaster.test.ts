@@ -28,6 +28,7 @@ import {
   getAdoptionMeta,
   getAdoptionPartialCount,
   getHealthSample,
+  getRecentUsageSamples,
   getPauseState,
   gradeAction,
   recordAction,
@@ -323,6 +324,31 @@ describe('tm_usage_sample DAL', () => {
     });
     expect(sample.is_unknown).toBe(0);
     expect(sample.value_json).toContain('123456');
+  });
+
+  test('recent samples are filtered and returned newest-first with a limit', async () => {
+    for (const [provider, windowKind, value] of [
+      ['xai', 'judge_spawn_outcome', 'first'],
+      ['codex', 'judge_spawn_outcome', 'other-provider'],
+      ['xai', 'rolling', 'other-window'],
+      ['xai', 'judge_spawn_outcome', 'second'],
+      ['xai', 'judge_spawn_outcome', 'third'],
+    ] as const) {
+      await recordUsageSample({
+        provider,
+        window_kind: windowKind,
+        source: 'test',
+        value_json: JSON.stringify({ value }),
+        is_unknown: false,
+      });
+      await new Promise(resolve => setTimeout(resolve, 2));
+    }
+    const samples = await getRecentUsageSamples('xai', 'judge_spawn_outcome', 2);
+    expect(samples).toHaveLength(2);
+    expect(samples.map(sample => JSON.parse(sample.value_json ?? '{}').value)).toEqual([
+      'third',
+      'second',
+    ]);
   });
 });
 
