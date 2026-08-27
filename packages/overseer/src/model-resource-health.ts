@@ -103,7 +103,7 @@ export async function recordSpawnOutcome(
     is_unknown: false,
   });
   const health = await getModelResourceHealth(provider, deps);
-  const now = (deps.now ?? (() => new Date()))();
+  const now = (deps.now ?? ((): Date => new Date()))();
   await (deps.upsertHealth ?? upsertHealthSample)({
     provider,
     state: health.state,
