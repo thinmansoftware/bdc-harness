@@ -291,9 +291,7 @@ describe('judgeTerminalRun: model ladder + fail-loud health', () => {
       },
     });
     expect(outcome.kind).toBe('judge_unavailable');
-    expect(recorded).toEqual([
-      ['missing', { exitCode: -1, timedOut: false }, 'judge-first'],
-    ]);
+    expect(recorded).toEqual([['missing', { exitCode: -1, timedOut: false }, 'judge-first']]);
   });
 });
 
