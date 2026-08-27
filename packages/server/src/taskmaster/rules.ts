@@ -172,7 +172,11 @@ export interface NextActionContext {
   /** Durable tm_suppression row for this thread's canonical ref, if any. */
   suppression?: SuppressionLike;
   fireEligible?: boolean;
-  fireBudgetAvailable?: boolean;
+  fireLane?: 'claude' | 'codex' | 'xai' | null;
+  fireHolding?: boolean;
+  fireEscalate?: boolean;
+  fireAttempt?: number;
+  customerP0Exempt?: boolean;
   fireEvidence?: FireEvidence;
 }
 
@@ -339,17 +343,24 @@ export function computeNextAction(
       adoption?.last_movement_at ?? thread.lastActivityAt,
       context.nowMs
     );
-    if (context.fireEligible && context.fireBudgetAvailable && context.fireEvidence) {
+    if (
+      context.fireEligible &&
+      context.fireEvidence &&
+      !context.fireEscalate &&
+      (context.fireLane || context.customerP0Exempt)
+    ) {
+      const lane = context.fireLane ?? 'claude';
       return {
         type: 'fire_cauldron',
         threadRef: thread.ref,
         recipient: 'operator',
-        body: `Start governed Cauldron work for ${context.fireEvidence.woId}.`,
-        idempotencyKey: `tm:fire:${thread.ref}:${bucket}`,
+        body: `Start governed Cauldron work for ${context.fireEvidence.woId} on ${lane} lane.`,
+        idempotencyKey: `tm:fire:${thread.ref}:${bucket}:attempt-${context.fireAttempt ?? 0}`,
         actsImmediately: true,
         fireEvidence: context.fireEvidence,
       };
     }
+    if (context.fireEligible && context.fireEvidence && context.fireHolding) return null;
     return {
       type: 'escalate_p0',
       threadRef: thread.ref,

@@ -125,22 +125,49 @@ describe('computeNextAction', () => {
       interventionsLast24h: 0,
       nowMs: NOW_MS,
       fireEligible: true,
-      fireBudgetAvailable: true,
+      fireLane: 'codex',
       fireEvidence: evidence,
     });
     expect(proposal?.type).toBe('fire_cauldron');
     expect(proposal?.idempotencyKey).toBe(
-      `tm:fire:gh:thinmansoftware/bdc-harness#1:${Math.floor(NOW_MS / NUDGE_CLOCK_MS.P0)}`
+      `tm:fire:gh:thinmansoftware/bdc-harness#1:${Math.floor(NOW_MS / NUDGE_CLOCK_MS.P0)}:attempt-0`
     );
     expect(
       computeNextAction(thread({ priority: 'P0', isUnclaimedP0: true }), 'ready', {
         interventionsLast24h: 0,
         nowMs: NOW_MS,
         fireEligible: true,
-        fireBudgetAvailable: false,
+        fireLane: null,
         fireEvidence: evidence,
       })?.type
     ).toBe('escalate_p0');
+  });
+
+  test('budget hold queues ordinary work while customer P0 fires on cheapest lane', () => {
+    const evidence = {
+      woId: 'WO-HARNESS-EXAMPLE-01',
+      targetRepo: 'thinmansoftware/bdc-harness',
+      project: 'bdc-harness',
+      specVerifiedAt: new Date(NOW_MS).toISOString(),
+      noOpenOrMergedPr: true as const,
+    };
+    const context = {
+      interventionsLast24h: 0,
+      nowMs: NOW_MS,
+      fireEligible: true,
+      fireLane: null,
+      fireHolding: true,
+      fireEvidence: evidence,
+    };
+    expect(
+      computeNextAction(thread({ priority: 'P0', isUnclaimedP0: true }), 'ready', context)
+    ).toBeNull();
+    expect(
+      computeNextAction(thread({ priority: 'P0', isUnclaimedP0: true }), 'ready', {
+        ...context,
+        customerP0Exempt: true,
+      })?.type
+    ).toBe('fire_cauldron');
   });
 
   test('stale thread nudges without immediacy (two-tick confirmation required)', () => {

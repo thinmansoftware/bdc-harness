@@ -13,7 +13,6 @@ import {
   tick,
   resolveTaskmasterIntervalMs,
   resolveFireVerbEnabled,
-  resolveFireMaxPerDay,
   refreshAdoption,
   canonicalizeThreadRef,
   resolveRecipient,
@@ -2308,12 +2307,9 @@ describe('M-155 exception push (loop)', () => {
     expect([...TM_ALLOWED_RECIPIENTS]).toEqual(['xo', 'major-build', 'captain-ci', 'operator']);
   });
 
-  test('fire verb environment defaults OFF with a two-per-day budget', () => {
+  test('fire verb environment defaults OFF without a calendar budget', () => {
     expect(resolveFireVerbEnabled(undefined)).toBe(false);
     expect(resolveFireVerbEnabled('true')).toBe(true);
-    expect(resolveFireMaxPerDay(undefined)).toBe(2);
-    expect(resolveFireMaxPerDay('0')).toBe(0);
-    expect(resolveFireMaxPerDay('invalid')).toBe(2);
   });
 
   test('push: the loop never resumes itself -- no setPauseState RUNNING write', () => {
