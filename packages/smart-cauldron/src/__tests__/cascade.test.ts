@@ -11,8 +11,8 @@
  * Test 6: WRAPPER -- cascade does not touch DAG/workflow internals
  */
 
-import { describe, test, expect } from 'bun:test';
-import { createHash } from 'crypto';
+import { describe, test, expect, afterAll } from 'bun:test';
+import { createHash, randomUUID } from 'crypto';
 import { mkdtemp, readFile, rm } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join } from 'path';
@@ -81,13 +81,34 @@ function makeFailVerdict(reason: string): GateVerdict {
   };
 }
 
-/** Build base options pointing to the real config (entry defaults to codex). */
+/** Windows CI runners are slow enough that the first cascade test in the file
+ *  (which pays module + config cold-start plus real wo-lock file IO) crosses
+ *  Bun's 5000ms default (~5016ms observed on windows-latest, 2026-08-25: PRs
+ *  #701/#703/#705/#710). Known timeout class: reference_windows-ci-timeout-class-bun-5000.
+ *  Ubuntu is always green -- this is runner speed, not product code. */
+const SLOW_TEST_TIMEOUT_MS = 30_000;
+
+/** Root for this test run's outDirs -- removed after the suite. */
+const testOutRoot = join(tmpdir(), `smart-cauldron-test-runs-${randomUUID()}`);
+afterAll(async () => {
+  await rm(testOutRoot, { recursive: true, force: true });
+});
+
+/** Build base options pointing to the real config (entry defaults to codex).
+ *
+ *  outDir is UNIQUE PER CALL. Most tests here omit deps.acquireWoLock, so the
+ *  REAL wo-lock runs against outDir keyed on the shared woId 'WO-TEST-001'.
+ *  With a shared outDir, one test dying mid-cascade (e.g. a Windows timeout)
+ *  leaves its lock file behind and every later cascade test fails with
+ *  "REFUSING duplicate cascade" -- one flake poisoned the whole suite
+ *  (2026-08-25 windows-latest). A per-test outDir makes each cascade's lock
+ *  namespace disposable, so no test can contaminate another. */
 function baseOpts(partial: Partial<RunCascadeOptions> = {}): RunCascadeOptions {
   return {
     woId: 'WO-TEST-001',
     woClass: 'CODE',
     tags: ['mechanical'],
-    outDir: '/tmp/smart-cauldron-test-runs',
+    outDir: join(testOutRoot, randomUUID()),
     token: 'test-token',
     project: 'test-project',
     ...partial,
@@ -99,27 +120,31 @@ function baseOpts(partial: Partial<RunCascadeOptions> = {}): RunCascadeOptions {
 // ---------------------------------------------------------------------------
 
 describe('auth/project binding guards', () => {
-  test('lane preflight failure is recorded and prevents provider fire', async () => {
-    let fireCalled = false;
-    const deps: CascadeDeps = {
-      preflight: async tier => {
-        throw new Error(`workflow ${tier.workflowName} is unavailable`);
-      },
-      fire: async () => {
-        fireCalled = true;
-        return makeFireOk('should-not-fire');
-      },
-      escalate: async () => undefined,
-      writeRecord: async (record, _dir) => `/tmp/cascade-record-${record.cascadeId}.json`,
-    };
+  test(
+    'lane preflight failure is recorded and prevents provider fire',
+    async () => {
+      let fireCalled = false;
+      const deps: CascadeDeps = {
+        preflight: async tier => {
+          throw new Error(`workflow ${tier.workflowName} is unavailable`);
+        },
+        fire: async () => {
+          fireCalled = true;
+          return makeFireOk('should-not-fire');
+        },
+        escalate: async () => undefined,
+        writeRecord: async (record, _dir) => `/tmp/cascade-record-${record.cascadeId}.json`,
+      };
 
-    const result = await runCascade(baseOpts({ deps }));
+      const result = await runCascade(baseOpts({ deps }));
 
-    expect(fireCalled).toBe(false);
-    expect(result.status).toBe('infra-alert');
-    expect(result.attempts[0]?.outcome).toBe('infra-error');
-    expect(result.attempts[0]?.infraErrorReason).toContain('is unavailable');
-  });
+      expect(fireCalled).toBe(false);
+      expect(result.status).toBe('infra-alert');
+      expect(result.attempts[0]?.outcome).toBe('infra-error');
+      expect(result.attempts[0]?.infraErrorReason).toContain('is unavailable');
+    },
+    SLOW_TEST_TIMEOUT_MS
+  );
 
   test('missing project throws before firing', async () => {
     let fireCalled = false;
