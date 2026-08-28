@@ -29,6 +29,12 @@ import {
 } from './pr-review-evaluator';
 import type { PrReviewDeps, PrReviewInput, PrReviewResult } from './pr-review-evaluator';
 import type { ReviewerVerdict, SubmitDeps } from './pr-review-submit.ts';
+import {
+  countPriorRemediationAttempts,
+  remediationIdempotencyKey,
+  REMEDIATION_RECIPIENT,
+  REMEDIATION_SENDER,
+} from './remediation-candidate';
 
 /** Env var carrying the shared GitHub webhook secret for the review route. */
 export const REVIEW_WEBHOOK_SECRET_ENV = 'OVERSEER_REVIEW_WEBHOOK_SECRET';
@@ -292,6 +298,10 @@ export function createRealSubmitDeps(
         approved: result.verdict === 'APPROVE',
         summary,
         reviewedHeadSha: result.reviewed_head_sha,
+        // Structured findings ride alongside the flattened summary so
+        // remediation classification can read severity per finding. The
+        // summary string has already lost that.
+        findings: result.findings,
       };
     },
     submitReview: createRealSubmitPullRequestReview(octokit),
@@ -311,6 +321,49 @@ export function createRealSubmitDeps(
         sender: REVIEW_SENDER,
         recipient: 'operator',
         body: JSON.stringify({ kind: 'pr_review_submit_receipt', ...input }),
+      });
+    },
+
+    /**
+     * Attempts are derived from the durable dispatch rows themselves rather
+     * than from a separate counter table: every prior candidate IS a row under
+     * this PR's subject key, so the count cannot drift out of agreement with
+     * the queue it is supposed to bound.
+     */
+    async countPriorRemediationAttempts(input): Promise<number> {
+      const messages = await dispatch.listMessages({
+        recipient: REMEDIATION_RECIPIENT,
+        subject_key: reviewSubjectKey(input.owner, input.repo, input.prNumber),
+      });
+      return countPriorRemediationAttempts(messages, input);
+    },
+
+    /**
+     * Writes the proposal onto the seam Taskmaster already reads.
+     *
+     * `createMessage` is idempotent on idempotency_key at the DATABASE level,
+     * so a re-delivered verdict computing the same (PR, head, attempt) key
+     * returns the existing row instead of enqueuing a second candidate.
+     */
+    async emitRemediationCandidate(body): Promise<void> {
+      await dispatch.createMessage({
+        correlation_id: `overseer-remediation:${body.owner}/${body.repo}#${body.prNumber}`,
+        idempotency_key: remediationIdempotencyKey({
+          owner: body.owner,
+          repo: body.repo,
+          prNumber: body.prNumber,
+          headSha: body.headSha,
+          attempt: body.attempt,
+        }),
+        // Reuses the existing run_review task type: this is queued review-loop
+        // work, and adding a task_type would require a DB CHECK-constraint
+        // migration for no behavioral gain. The `kind` discriminator in the
+        // body is what identifies a remediation candidate.
+        task_type: 'run_review',
+        sender: REMEDIATION_SENDER,
+        recipient: REMEDIATION_RECIPIENT,
+        body: JSON.stringify(body),
+        subject_key: reviewSubjectKey(body.owner, body.repo, body.prNumber),
       });
     },
   };
