@@ -58,7 +58,7 @@ export const REVIEW_RECEIPTS_LOG = 'review-receipts-log';
  * receipts go to the receipts log; 'operator_decision_required' receipts go to
  * the operator inbox.
  */
-export type ReceiptGovernanceClassification = 'information-only' | 'operator_decision_required';
+export type ReceiptGovernanceClassification = dispatch.DispatchGovernanceClassification;
 
 /**
  * Classify an INGEST receipt. A receipt is operator-actionable only when ingest
@@ -120,11 +120,33 @@ export function submitReceiptGovernanceClassification(
 }
 
 /**
- * Route a classified receipt to its mailbox: routine receipts to the audit log,
- * operator-actionable receipts to the human inbox.
+ * Maps a receipt's governance classification to its mailbox. Every review-route
+ * producer (ingest AND submit) routes through here, so an 'information-only'
+ * receipt is written to the audit log (`REVIEW_RECEIPTS_LOG`) and never to
+ * `recipient='operator'`. Exhaustive-by-construction: a new classification is a
+ * COMPILE error here, so it can never silently fall through to the operator
+ * inbox.
+ *
+ * This function is the review route's routing POLICY, not the system-wide
+ * guarantee. Routing correctness for every OTHER producer is enforced one layer
+ * down, in `createMessage`, which rejects any message declared
+ * 'information-only' and addressed to the canonical 'operator' principal
+ * (`DISPATCH_INFORMATION_ONLY_TO_OPERATOR_ERROR`). Callers here pass
+ * `governance_classification` so that backstop applies to review receipts too:
+ * if this mapping ever regressed, the write path would throw rather than
+ * silently refill the operator mailbox.
  */
-function receiptRecipient(classification: ReceiptGovernanceClassification): string {
-  return classification === 'information-only' ? REVIEW_RECEIPTS_LOG : 'operator';
+export function receiptRecipient(classification: ReceiptGovernanceClassification): string {
+  switch (classification) {
+    case 'information-only':
+      return REVIEW_RECEIPTS_LOG;
+    case 'operator_decision_required':
+      return 'operator';
+    default: {
+      const exhaustive: never = classification;
+      return exhaustive;
+    }
+  }
 }
 
 export interface ReviewRouteConfig {
@@ -301,6 +323,7 @@ export function createRealIngestDeps(config: ReviewRouteConfig): IngestDeps {
         task_type: 'run_report',
         sender: REVIEW_SENDER,
         recipient: receiptRecipient(governanceClassification),
+        governance_classification: governanceClassification,
         body: JSON.stringify({
           kind: 'pr_review_ingest_receipt',
           governanceClassification,
@@ -404,6 +427,7 @@ export function createRealSubmitDeps(
         task_type: 'run_report',
         sender: REVIEW_SENDER,
         recipient: receiptRecipient(governanceClassification),
+        governance_classification: governanceClassification,
         body: JSON.stringify({
           kind: 'pr_review_submit_receipt',
           governanceClassification,

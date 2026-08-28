@@ -64,6 +64,11 @@ export interface DispatchMessage {
   // NULL is the terminal, non-draining marker (distinct from 'cancelled').
   inbox_watermark_at: string | null;
   retired_at: string | null;
+  // Durable retirement audit trail. `retired_at` is the ACTIVE marker and is
+  // cleared by restoration; these two are written alongside each transition and
+  // are NEVER cleared, so a restored row still proves both events occurred.
+  last_retired_at: string | null;
+  last_restored_at: string | null;
 }
 
 export interface DispatchWorker {
@@ -170,6 +175,8 @@ function normalizeMessage(row: DispatchMessageRow): DispatchMessage {
     escalated_sms_at: normalizeNullableTimestamp(row.escalated_sms_at),
     inbox_watermark_at: normalizeNullableTimestamp(row.inbox_watermark_at),
     retired_at: normalizeNullableTimestamp(row.retired_at),
+    last_retired_at: normalizeNullableTimestamp(row.last_retired_at),
+    last_restored_at: normalizeNullableTimestamp(row.last_restored_at),
   };
 }
 
@@ -292,6 +299,42 @@ function staleCutoffIso(staleAfterMs: number): string {
   return new Date(Date.now() - staleAfterMs).toISOString();
 }
 
+/**
+ * Governance classification of a dispatch message: does it carry something the
+ * human operator must act on, or is it a routine audit record?
+ *
+ * WO-HARNESS-OPERATOR-INBOX-BACKPRESSURE-01 invariant: an 'information-only'
+ * message may NEVER be written to the human operator mailbox. That mailbox is
+ * drained by a human; filling it with bookkeeping is what produced the backlog
+ * this WO exists to bound. Routine records belong in a notify_only audit
+ * principal (e.g. 'review-receipts-log'), which is durable and queryable via
+ * listMessages but is never drained.
+ */
+export type DispatchGovernanceClassification = 'information-only' | 'operator_decision_required';
+
+/** Thrown when a producer tries to route a routine record to the operator. */
+export const DISPATCH_INFORMATION_ONLY_TO_OPERATOR_ERROR =
+  'dispatch_recipient_rejected:information_only_to_operator';
+
+/**
+ * Enforce the mailbox invariant at the single write path.
+ *
+ * This is deliberately checked against the CANONICAL principal (post-alias
+ * resolution), not the caller-supplied string, so no producer can slip past it
+ * with different casing or an alias. Callers that omit `governance_classification`
+ * are unaffected -- the guard only fires on an explicit 'information-only'
+ * classification, so this is additive rather than a behavior change for existing
+ * producers.
+ */
+function assertGovernanceRoutingAllowed(
+  classification: DispatchGovernanceClassification | undefined,
+  canonicalRecipient: string
+): void {
+  if (classification === 'information-only' && canonicalRecipient === OPERATOR_INBOX_RECIPIENT) {
+    throw new Error(DISPATCH_INFORMATION_ONLY_TO_OPERATOR_ERROR);
+  }
+}
+
 export async function createMessage(data: {
   correlation_id: string;
   idempotency_key: string;
@@ -307,6 +350,12 @@ export async function createMessage(data: {
   subject_key?: string | null;
   repeat_reason?: string | null;
   supersedes_id?: string | null;
+  /**
+   * Governance classification of this message. When 'information-only', writing
+   * to recipient='operator' is rejected at the write path (see
+   * assertGovernanceRoutingAllowed).
+   */
+  governance_classification?: DispatchGovernanceClassification;
 }): Promise<DispatchMessage> {
   const db = getDatabase();
   return createMessageWithQuery((sql, params) => db.query(sql, params), data);
@@ -347,6 +396,13 @@ async function createMessageWithQuery(
   if (recipientAssessment.canonical_principal === 'board' && data.recipient_alias !== 'board') {
     throw new Error('dispatch_recipient_rejected:board_alias_metadata_required');
   }
+  // Mailbox governance invariant, enforced for EVERY producer at the single
+  // write path -- not just the review route -- and against the canonical
+  // principal so aliases/casing cannot route around it.
+  assertGovernanceRoutingAllowed(
+    data.governance_classification,
+    recipientAssessment.canonical_principal
+  );
 
   const now = nowIso();
   const result = await query<CompatibleDispatchMessageRow>(
@@ -530,10 +586,12 @@ export async function markOperatorInboxWatermark(id: string): Promise<boolean> {
 
 /**
  * Retire operator rows older than the retention window that were never
- * addressed. Retirement is monotonic (retired_at set once), reversible (the row
- * and its history are preserved), and terminal-but-non-draining: status stays
- * 'queued' and is NEVER set to 'cancelled'. Bounded by `limit` per sweep.
- * Returns the ids retired by this call.
+ * addressed. Retirement is monotonic (retired_at set once) and
+ * terminal-but-non-draining: status stays 'queued' and is NEVER set to
+ * 'cancelled'. It is also REVERSIBLE -- because retirement is a nullable column
+ * (never a delete and never a status change), it can be cleared by
+ * `restoreRetiredOperatorInboxMessage`, which returns the row to the drain.
+ * Bounded by `limit` per sweep. Returns the ids retired by this call.
  */
 export async function retireStaleOperatorInboxMessages(
   retentionMs: number,
@@ -560,15 +618,48 @@ export async function retireStaleOperatorInboxMessages(
   const ids = candidates.rows.map(row => row.id);
   if (ids.length === 0) return [];
   const placeholders = ids.map((_, index) => `$${index + 2}`).join(', ');
+  const retiredAt = nowIso();
   const update = await db.query(
     `UPDATE agent_dispatch_messages
-        SET retired_at = $1
+        SET retired_at = $1, last_retired_at = $1
       WHERE retired_at IS NULL
         AND id IN (${placeholders})`,
-    [nowIso(), ...ids]
+    [retiredAt, ...ids]
   );
   // rowCount reflects rows actually transitioned this call (guards double-retire).
   return update.rowCount === ids.length ? ids : ids.slice(0, update.rowCount);
+}
+
+/**
+ * Reverse a retirement: clear `retired_at` on a single operator row so it
+ * returns to the bounded drain. This is the operation that makes retirement
+ * genuinely reversible (not merely "the row is preserved") -- retirement never
+ * deletes and never changes status, so restoration is a pure column reset with
+ * no data reconstruction.
+ *
+ * AUDITABLE: clearing `retired_at` alone would erase the only evidence the row
+ * was ever retired, leaving a restored row indistinguishable from one that was
+ * never retired. So the durable audit columns carry the history instead --
+ * `last_retired_at` (stamped at retirement) is left intact and `last_restored_at`
+ * is stamped here. Neither is ever cleared, so after restoration the row still
+ * proves both transitions occurred and when. Only `retired_at`, the active
+ * drain-eligibility marker, is reset.
+ *
+ * Guarded on `retired_at IS NOT NULL` so it is idempotent and only ever acts on a
+ * genuinely retired row. Returns true when a retirement was cleared, false when
+ * the row was not a retired operator row (already active, wrong recipient, or
+ * missing).
+ */
+export async function restoreRetiredOperatorInboxMessage(id: string): Promise<boolean> {
+  const result = await getDatabase().query(
+    `UPDATE agent_dispatch_messages
+        SET retired_at = NULL, last_restored_at = $3
+      WHERE id = $1
+        AND recipient = $2
+        AND retired_at IS NOT NULL`,
+    [id, OPERATOR_INBOX_RECIPIENT, nowIso()]
+  );
+  return result.rowCount > 0;
 }
 
 /**

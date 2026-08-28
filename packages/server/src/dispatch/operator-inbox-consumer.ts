@@ -11,7 +11,7 @@
  * startTaskmaster (singleton timer, inFlight guard, env interval, 0 = off)
  * and the api.ts NODE_ENV !== 'test' gate at the call site.
  */
-import { appendFile, mkdir } from 'fs/promises';
+import { appendFile, mkdir, readFile, writeFile } from 'fs/promises';
 import { join } from 'path';
 import {
   acknowledgeMessage,
@@ -130,6 +130,15 @@ export interface OperatorInboxDeps {
   getBacklogStatus?: () => Promise<OperatorInboxBacklogStatus>;
   /** One deduped alarm per episode. Default: structured log only (no notifiers). */
   emitAlarm?: (alarm: OperatorInboxAlarm) => void;
+  /**
+   * Read the durable "an alarm episode is currently active" latch. Default:
+   * a JSON file under ARCHON_HOME so a process RESTART while the backlog is
+   * still above threshold does NOT re-emit the alarm for the same episode.
+   * Injectable for hermetic tests.
+   */
+  loadAlarmEpisodeActive?: () => Promise<boolean>;
+  /** Persist the alarm-episode latch durably. Default: the same JSON file. */
+  saveAlarmEpisodeActive?: (active: boolean) => Promise<void>;
   /** Batch cap for the bounded read. Default DEFAULT_OPERATOR_INBOX_BATCH_CAP. */
   batchCap?: number;
   /** Retention window. Default DEFAULT_OPERATOR_INBOX_RETENTION_MS. */
@@ -357,6 +366,27 @@ async function guardedCommentOnIssue(
   }
 }
 
+/**
+ * A row failed at the DURABLE-SURFACE step -- the human-facing record was never
+ * written. This is the ONE failure the drain must NOT watermark: watermarking it
+ * would strand the message forever (no durable record AND excluded from every
+ * future read). Every OTHER failure (ack/address) happens AFTER the durable
+ * surface exists, so watermarking those is safe and is what breaks the
+ * reprocessing loop (per WO-HARNESS-OPERATOR-INBOX-BACKPRESSURE-01). A
+ * surface-failed row is re-read next pass (bounded by the batch cap) and, unlike
+ * the incident loop, never reaches an external GitHub call because surfacing
+ * precedes the comment hook.
+ */
+export class OperatorInboxSurfaceError extends Error {
+  constructor(
+    readonly messageId: string,
+    readonly cause: Error
+  ) {
+    super(`surface_failed:${cause.message}:${messageId}`);
+    this.name = 'OperatorInboxSurfaceError';
+  }
+}
+
 async function processOne(
   message: OperatorInboxMessage,
   deps: Required<
@@ -386,7 +416,12 @@ async function processOne(
       issueRef: classification.issueRef,
       surfacedAt,
     };
-    await deps.surface(entry);
+    try {
+      await deps.surface(entry);
+    } catch (error) {
+      // Do NOT watermark on a surface failure -- see OperatorInboxSurfaceError.
+      throw new OperatorInboxSurfaceError(message.id, error as Error);
+    }
 
     if (
       classification.kind === 'code_actionable' &&
@@ -466,7 +501,46 @@ export function resolveOperatorInboxAlarmThreshold(raw: string | undefined): num
 // Episode-dedupe state: the alarm fires ONCE when the backlog crosses the
 // threshold and stays silent every subsequent pass until the backlog drops back
 // under the threshold (which re-arms it). Not one alarm per tick.
-let alarmEpisodeActive = false;
+//
+// The latch is DURABLE (a JSON file under ARCHON_HOME) so a process restart
+// while the backlog is still above threshold does not re-emit the alarm for the
+// same episode -- an in-memory boolean alone would re-fire on every restart. The
+// in-process value below is a per-process cache of that durable state; it is
+// undefined until seeded from the file on the first drain of a process (which is
+// how a restart re-reads the durable latch).
+let alarmEpisodeActiveCache: boolean | undefined;
+
+function defaultAlarmEpisodeStatePath(): string {
+  return join(getArchonHome(), 'operator-inbox', 'alarm-episode.json');
+}
+
+/** Durable read of the alarm-episode latch (cold start reads the file). */
+async function defaultLoadAlarmEpisodeActive(): Promise<boolean> {
+  if (alarmEpisodeActiveCache !== undefined) return alarmEpisodeActiveCache;
+  try {
+    const raw = await readFile(defaultAlarmEpisodeStatePath(), 'utf8');
+    const parsed = JSON.parse(raw) as { active?: unknown };
+    alarmEpisodeActiveCache = parsed.active === true;
+  } catch {
+    // Missing / unreadable file = no active episode. Fail toward re-arming
+    // (worst case one extra alarm) rather than silently suppressing forever.
+    alarmEpisodeActiveCache = false;
+  }
+  return alarmEpisodeActiveCache;
+}
+
+/** Durable write of the alarm-episode latch. */
+async function defaultSaveAlarmEpisodeActive(active: boolean): Promise<void> {
+  alarmEpisodeActiveCache = active;
+  try {
+    await mkdir(join(getArchonHome(), 'operator-inbox'), { recursive: true });
+    await writeFile(defaultAlarmEpisodeStatePath(), JSON.stringify({ active }), 'utf8');
+  } catch (error) {
+    // A persistence failure must not crash the drain; the in-process cache still
+    // dedupes within this process, only cross-restart dedupe is degraded.
+    log.warn({ err: error as Error }, 'operator_inbox.alarm_episode_persist_failed');
+  }
+}
 
 /** Default alarm sink: a structured log event ONLY. Never wires notifiers.ts. */
 function defaultEmitAlarm(alarm: OperatorInboxAlarm): void {
@@ -483,9 +557,13 @@ function defaultEmitAlarm(alarm: OperatorInboxAlarm): void {
   );
 }
 
-/** Reset the alarm episode latch (used by stopOperatorInboxConsumer + tests). */
+/**
+ * Reset the in-process alarm-episode cache so the next drain re-seeds from the
+ * durable latch (used by stopOperatorInboxConsumer + tests). Does NOT clear the
+ * durable file: a restart must still honor an active episode.
+ */
 export function resetOperatorInboxAlarmEpisode(): void {
-  alarmEpisodeActive = false;
+  alarmEpisodeActiveCache = undefined;
 }
 
 /**
@@ -510,6 +588,8 @@ export async function drainOperatorInbox(deps: OperatorInboxDeps = {}): Promise<
   const retireStale = deps.retireStale ?? retireStaleOperatorInboxMessages;
   const getBacklogStatus = deps.getBacklogStatus ?? getOperatorInboxBacklogStatus;
   const emitAlarm = deps.emitAlarm ?? defaultEmitAlarm;
+  const loadAlarmEpisode = deps.loadAlarmEpisodeActive ?? defaultLoadAlarmEpisodeActive;
+  const saveAlarmEpisode = deps.saveAlarmEpisodeActive ?? defaultSaveAlarmEpisodeActive;
   const ack =
     deps.acknowledgeMessage ??
     ((data: { id: string; principal_id: string }): Promise<DispatchMailboxResult> =>
@@ -554,6 +634,13 @@ export async function drainOperatorInbox(deps: OperatorInboxDeps = {}): Promise<
     // keep the guard for injected/stale views.
     if (message.addressed_at !== null) continue;
 
+    // Watermark UNLESS the durable surface write itself failed. A surface
+    // failure means the human record was never written, so watermarking would
+    // strand the row permanently; every other failure (ack/address) happens
+    // after a successful surface, so watermarking those is what breaks the
+    // reprocessing loop. Defaults to true so digest_only rows (no surface) and
+    // fully-successful rows are always watermarked.
+    let durableSurfaceOk = true;
     try {
       const { classification, externalCallMade } = await processOne(message, {
         acknowledgeMessage: ack,
@@ -570,18 +657,27 @@ export async function drainOperatorInbox(deps: OperatorInboxDeps = {}): Promise<
       else result.needsHuman += 1;
     } catch (error) {
       const err = error as Error;
+      if (error instanceof OperatorInboxSurfaceError) durableSurfaceOk = false;
       result.failed += 1;
       result.errors.push(`${message.id}:${err.message}`);
       log.error({ err, messageId: message.id }, 'operator_inbox.message_process_failed');
     } finally {
-      // ALWAYS watermark -- this is what breaks the reprocessing loop even when
-      // ack/address keep failing. A watermarked row is excluded from the next
-      // bounded read, so it is never re-classified and never makes another
-      // external call.
-      try {
-        await markWatermark(message.id);
-      } catch (error) {
-        log.warn({ err: error as Error, messageId: message.id }, 'operator_inbox.watermark_failed');
+      if (durableSurfaceOk) {
+        // Watermark: a watermarked row is excluded from the next bounded read,
+        // so it is never re-classified and never makes another external call.
+        try {
+          await markWatermark(message.id);
+        } catch (error) {
+          log.warn(
+            { err: error as Error, messageId: message.id },
+            'operator_inbox.watermark_failed'
+          );
+        }
+      } else {
+        // Deliberately NOT watermarked: the durable surface never landed, so the
+        // row must be retried on a later pass (bounded by the batch cap, and
+        // never reaching an external call before it surfaces).
+        log.warn({ messageId: message.id }, 'operator_inbox.watermark_skipped_surface_failed');
       }
     }
   }
@@ -604,13 +700,15 @@ export async function drainOperatorInbox(deps: OperatorInboxDeps = {}): Promise<
     log.warn({ err: error as Error }, 'operator_inbox.retirement_sweep_failed');
   }
 
-  // Backlog status read + episode-deduped alarm.
+  // Backlog status read + episode-deduped alarm. The latch is loaded from (and
+  // saved to) durable state so a restart mid-episode does not re-emit.
   try {
     const backlog = await getBacklogStatus();
     result.backlog = backlog;
+    const episodeActive = await loadAlarmEpisode();
     if (backlog.count >= alarmThreshold) {
-      if (!alarmEpisodeActive) {
-        alarmEpisodeActive = true;
+      if (!episodeActive) {
+        await saveAlarmEpisode(true);
         const top = backlog.topSenders[0] ?? null;
         const oldestAgeMs = backlog.oldestCreatedAt
           ? Math.max(0, now().getTime() - new Date(backlog.oldestCreatedAt).getTime())
@@ -625,9 +723,9 @@ export async function drainOperatorInbox(deps: OperatorInboxDeps = {}): Promise<
         });
         result.alarmEmitted = true;
       }
-    } else {
+    } else if (episodeActive) {
       // Backlog dropped back under threshold -- re-arm for the next episode.
-      alarmEpisodeActive = false;
+      await saveAlarmEpisode(false);
     }
   } catch (error) {
     log.warn({ err: error as Error }, 'operator_inbox.backlog_status_failed');

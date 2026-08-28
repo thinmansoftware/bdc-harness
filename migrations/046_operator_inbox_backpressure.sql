@@ -14,6 +14,18 @@
 ALTER TABLE agent_dispatch_messages ADD COLUMN IF NOT EXISTS inbox_watermark_at TIMESTAMPTZ;
 ALTER TABLE agent_dispatch_messages ADD COLUMN IF NOT EXISTS retired_at TIMESTAMPTZ;
 
+-- Retirement audit trail. `retired_at` is the ACTIVE marker and is cleared when a
+-- retirement is reversed, which on its own would erase every trace that the row
+-- was ever retired. These two columns are the durable record: each is written
+-- alongside its transition and is NEVER cleared, so a restored row still proves
+-- both events occurred and when.
+--   last_retired_at:  instant of the most recent retirement (never cleared).
+--   last_restored_at: instant of the most recent restoration (never cleared).
+-- Keeping the audit fields separate from `retired_at` is deliberate: the hot
+-- drain predicate stays the simple, index-friendly `retired_at IS NULL`.
+ALTER TABLE agent_dispatch_messages ADD COLUMN IF NOT EXISTS last_retired_at TIMESTAMPTZ;
+ALTER TABLE agent_dispatch_messages ADD COLUMN IF NOT EXISTS last_restored_at TIMESTAMPTZ;
+
 -- Supporting index for the bounded drain query: recipient + status + age, with
 -- the exact predicate the drain uses (not watermarked, not retired, not
 -- addressed). Keeps the oldest-first bounded read cheap even under a large

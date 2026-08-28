@@ -48,7 +48,18 @@ NOT re-read env** -- a change requires a pull + rebuild + `--force-recreate`.
   window that were never addressed are retired. Retirement is monotonic,
   reversible, and terminal-but-non-draining: the row keeps `status='queued'` and
   is preserved (never deleted, never reused as `cancelled`). `retired_at IS NOT
-NULL` alone is the terminal marker.
+NULL` alone is the terminal marker. Reversal is a real operation, not just
+  "the row is preserved": `restoreRetiredOperatorInboxMessage(id)` clears
+  `retired_at` and returns the row to the bounded drain (guarded so it only ever
+  acts on a genuinely retired operator row, and idempotent).
+- **Retirement is auditable, not just reversible.** Clearing `retired_at` on its
+  own would erase the only evidence the row had ever been retired, making a
+  restored row indistinguishable from one that was never retired. Two durable
+  columns carry that history instead: `last_retired_at` (stamped at retirement)
+  and `last_restored_at` (stamped at restoration). Neither is ever cleared, so
+  after a reversal the row still proves both transitions occurred and when. They
+  are deliberately kept out of the drain predicate, which stays the simple,
+  index-friendly `retired_at IS NULL`.
 - **Backlog alarm**: when the unaddressed backlog crosses the threshold, ONE
   alarm is emitted per episode (deduped, not per tick). It re-arms only after the
   backlog drops back under the threshold. The default alarm sink is a structured
@@ -99,11 +110,29 @@ dispatch principal (`notify_only`, never drained) and remain queryable via
 `listMessages({ recipient: 'review-receipts-log' })`. Only operator-actionable
 receipts reach `recipient=operator`.
 
+### Enforcement is system-wide, not review-route-only
+
+The classification above is the review route's routing _policy_. The _guarantee_
+lives one layer down, in `createMessage` -- the single write path every dispatch
+producer uses. A message declared `governance_classification: 'information-only'`
+and addressed to the canonical `operator` principal is rejected with
+`dispatch_recipient_rejected:information_only_to_operator`.
+
+This matters because the operator mailbox can be written by any producer, not
+just the review route (escalation delivery, API handlers, future callers). The
+check runs against the **canonical** principal, after alias/casing resolution, so
+`'  OPERATOR  '` is refused exactly like `'operator'`. It is fail-closed: the
+rejected write persists nothing. Producers that omit `governance_classification`
+are unaffected, so the guard is additive -- it constrains callers that have
+declared a classification rather than silently changing existing behavior.
+
 ## Schema
 
-Migration `046_operator_inbox_backpressure.sql` adds two nullable columns to
-`agent_dispatch_messages` (`inbox_watermark_at`, `retired_at`), a partial index
-for the bounded drain read, and the `review-receipts-log` principal. The SQLite
+Migration `046_operator_inbox_backpressure.sql` adds four nullable columns to
+`agent_dispatch_messages` -- `inbox_watermark_at` and `retired_at` (drain state),
+plus `last_retired_at` and `last_restored_at` (durable retirement audit trail) --
+a partial index for the bounded drain read, and the `review-receipts-log`
+principal. The SQLite
 adapter mirrors all of this (hand-maintained parity, not derived from migrations).
 No status-vocabulary change was made -- retirement is a column, not a new status.
 

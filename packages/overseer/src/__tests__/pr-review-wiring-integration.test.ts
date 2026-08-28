@@ -46,6 +46,9 @@ afterAll(() => {
 });
 
 const { SqliteAdapter } = await import('@archon/core/db/adapters/sqlite');
+// Imported dynamically, AFTER the mock.module above, so it binds the mocked
+// getDatabase and exercises the real write path against this file's SqliteAdapter.
+const dispatch = await import('@archon/core/db/dispatch');
 const {
   createRealIngestDeps,
   createRealSubmitDeps,
@@ -278,6 +281,28 @@ describe('pr-review-wiring against a real SqliteAdapter', () => {
     // Both blockers reach the operator inbox; neither pollutes the audit log.
     expect(await countRows('operator')).toBe(2);
     expect(await countRows(REVIEW_RECEIPTS_LOG)).toBe(0);
+  });
+
+  test('scenario 9b: the write path refuses an information-only receipt aimed at the operator, whatever the producer', async () => {
+    // The review route routes its own receipts correctly (scenario 8). This
+    // asserts the SYSTEM-WIDE backstop underneath it: the invariant lives in
+    // createMessage, so ANY producer -- review route, escalation delivery, an
+    // API handler, or something written next year -- is refused when it declares
+    // a message information-only and addresses it to the human operator mailbox.
+    await expect(
+      dispatch.createMessage({
+        correlation_id: 'corr-arbitrary-producer',
+        idempotency_key: 'idem-arbitrary-producer',
+        task_type: 'run_report',
+        sender: REVIEW_SENDER,
+        recipient: 'operator',
+        body: JSON.stringify({ kind: 'some_other_routine_receipt' }),
+        governance_classification: 'information-only',
+      })
+    ).rejects.toThrow('information_only_to_operator');
+
+    // Fail-closed: the rejected write left no row behind.
+    expect(await countRows('operator')).toBe(0);
   });
 
   test('scenario 10: a simulated day of review-route receipts creates at most a tiny operator-inbox bound', async () => {

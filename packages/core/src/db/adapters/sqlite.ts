@@ -410,6 +410,10 @@ export class SqliteAdapter implements IDatabase {
         // for bounded-drain watermarking + retention retirement.
         ['inbox_watermark_at', 'TEXT'],
         ['retired_at', 'TEXT'],
+        // Durable retirement audit trail: written alongside each transition and
+        // never cleared, so a restored row still proves it was retired.
+        ['last_retired_at', 'TEXT'],
+        ['last_restored_at', 'TEXT'],
       ];
       const boardDispatchCols = this.db
         .prepare("PRAGMA table_info('agent_dispatch_messages')")
@@ -856,7 +860,12 @@ export class SqliteAdapter implements IDatabase {
         -- retention retirement. retired_at IS NOT NULL is terminal + non-draining
         -- while status stays 'queued' (distinct from 'cancelled').
         inbox_watermark_at TEXT,
-        retired_at TEXT
+        retired_at TEXT,
+        -- Durable retirement audit trail. retired_at is the ACTIVE marker and is
+        -- cleared on restoration; these two are never cleared, so a restored row
+        -- still proves both retirement and restoration occurred.
+        last_retired_at TEXT,
+        last_restored_at TEXT
       );
 
       CREATE TABLE IF NOT EXISTS dispatch_principals (

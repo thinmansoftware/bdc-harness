@@ -558,7 +558,12 @@ CREATE TABLE IF NOT EXISTS agent_dispatch_messages (
   -- retired_at IS NOT NULL is the terminal, non-draining marker (distinct from
   -- 'cancelled', which Scope OUT forbids reusing).
   inbox_watermark_at TIMESTAMPTZ,
-  retired_at TIMESTAMPTZ
+  retired_at TIMESTAMPTZ,
+  -- Durable retirement audit trail. `retired_at` is the ACTIVE marker and is
+  -- cleared on restoration; these two are written alongside each transition and
+  -- are NEVER cleared, so a restored row still proves both events occurred.
+  last_retired_at TIMESTAMPTZ,
+  last_restored_at TIMESTAMPTZ
 );
 
 CREATE INDEX IF NOT EXISTS idx_agent_dispatch_messages_recipient_status

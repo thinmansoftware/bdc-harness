@@ -72,6 +72,9 @@ interface FakeWorld {
   watermarkCalls: string[];
   commentCalls: string[];
   alarms: OperatorInboxAlarm[];
+  // Durable alarm-episode latch, shared across drains of this world. A separate
+  // world with a shared reference to THIS object models a process restart.
+  alarmEpisode: { active: boolean };
 }
 
 function makeWorld(seed: OperatorInboxMessage[] = []): FakeWorld {
@@ -83,6 +86,7 @@ function makeWorld(seed: OperatorInboxMessage[] = []): FakeWorld {
     watermarkCalls: [],
     commentCalls: [],
     alarms: [],
+    alarmEpisode: { active: false },
   };
 }
 
@@ -149,6 +153,12 @@ function makeDeps(world: FakeWorld, overrides: Partial<OperatorInboxDeps> = {}):
     },
     emitAlarm: alarm => {
       world.alarms.push(alarm);
+    },
+    // In-memory durable latch: keeps every consumer test off the real
+    // ARCHON_HOME file while still exercising the durable-latch code path.
+    loadAlarmEpisodeActive: async () => world.alarmEpisode.active,
+    saveAlarmEpisodeActive: async active => {
+      world.alarmEpisode.active = active;
     },
     acknowledgeMessage: async data => {
       world.ackCalls.push(data.id);
@@ -386,6 +396,73 @@ describe('operator inbox consumer', () => {
     await drainOperatorInbox(deps); // 5 -> fire again
 
     expect(world.alarms).toHaveLength(2);
+  });
+
+  test('alarm dedupe survives a process restart while the backlog stays above threshold', async () => {
+    // Shared durable latch models the on-disk alarm-episode file that persists
+    // across restarts. Two "processes" (fresh worlds, own alarm sinks) share it.
+    const durable = { active: false };
+    const backlog = {
+      count: 5,
+      oldestCreatedAt: T0,
+      topSenders: [{ sender: 'overseer', count: 5 }],
+    };
+    const depsFor = (world: FakeWorld): OperatorInboxDeps =>
+      makeDeps(world, {
+        alarmThreshold: 3,
+        getBacklogStatus: async () => backlog,
+        loadAlarmEpisodeActive: async () => durable.active,
+        saveAlarmEpisodeActive: async active => {
+          durable.active = active;
+        },
+      });
+
+    // Process 1: backlog crosses threshold, one alarm, latch persisted.
+    const world1 = makeWorld();
+    await drainOperatorInbox(depsFor(world1));
+    expect(world1.alarms).toHaveLength(1);
+    expect(durable.active).toBe(true);
+
+    // Process 2 (a RESTART): backlog is still above threshold. With an in-memory
+    // boolean this would re-fire; the durable latch keeps it silent.
+    const world2 = makeWorld();
+    await drainOperatorInbox(depsFor(world2));
+    expect(world2.alarms).toHaveLength(0);
+  });
+
+  test('a durable-surface failure is NOT watermarked so the row is retried next pass', async () => {
+    const world = makeWorld([
+      makeMessage({
+        id: 'surf-fail-1',
+        body: JSON.stringify({ kind: 'overseer_run_report', blocker: 'novel unknown blocker' }),
+      }),
+    ]);
+    let surfaceAttempts = 0;
+    const deps = makeDeps(world, {
+      // Retention effectively off so the ONLY thing that could remove the row
+      // between passes is a watermark -- which a surface failure must NOT set.
+      retentionMs: 10 * 365 * 24 * 60 * 60 * 1000,
+      // Fail the durable surface on the first pass, succeed on the second.
+      surface: async entry => {
+        surfaceAttempts += 1;
+        if (surfaceAttempts === 1) throw new Error('disk_full_simulated');
+        world.surfaces.push(entry);
+      },
+    });
+
+    const first = await drainOperatorInbox(deps);
+    expect(first.failed).toBe(1);
+    expect(first.errors.some(e => e.includes('surface_failed'))).toBe(true);
+    // The row was NOT watermarked -- a surface failure must be retryable.
+    expect(world.watermarkCalls).not.toContain('surf-fail-1');
+    expect(world.surfaces).toHaveLength(0);
+
+    // Next pass: the row is still readable (not watermarked) and now surfaces.
+    const second = await drainOperatorInbox(deps);
+    expect(second.found).toBe(1);
+    expect(second.processed).toBe(1);
+    expect(world.surfaces.map(s => s.messageId)).toEqual(['surf-fail-1']);
+    expect(world.watermarkCalls).toContain('surf-fail-1'); // watermarked after success
   });
 
   test('unrecognized blocker surfaces with full original text intact', async () => {
