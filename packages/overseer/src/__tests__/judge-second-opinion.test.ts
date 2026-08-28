@@ -1,4 +1,5 @@
 import { describe, expect, test, afterEach } from 'bun:test';
+import { rootLogger } from '@archon/paths';
 import {
   judgeWithGrok,
   parseGrokVerdict,
@@ -24,19 +25,29 @@ const evidence: GrokJudgeEvidence = {
 };
 
 const ignoreOutcome = async (): Promise<never> => ({}) as never;
-const originalStdoutWrite = process.stdout.write.bind(process.stdout);
+interface LogDestination {
+  write(chunk: string): unknown;
+}
 
-function captureStdout(): string[] {
+const loggerStreamSymbol = Object.getOwnPropertySymbols(rootLogger).find(
+  symbol => String(symbol) === 'Symbol(pino.stream)'
+)!;
+const loggerDestination = (rootLogger as unknown as Record<symbol, LogDestination>)[
+  loggerStreamSymbol
+];
+const originalLogWrite = loggerDestination.write.bind(loggerDestination);
+
+function captureLogOutput(): string[] {
   const chunks: string[] = [];
-  process.stdout.write = ((chunk: string | Uint8Array): boolean => {
-    chunks.push(typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf8'));
+  loggerDestination.write = (chunk: string): boolean => {
+    chunks.push(chunk);
     return true;
-  }) as typeof process.stdout.write;
+  };
   return chunks;
 }
 
 afterEach(() => {
-  process.stdout.write = originalStdoutWrite;
+  loggerDestination.write = originalLogWrite;
 });
 
 describe('grok second-opinion judge', () => {
@@ -124,7 +135,7 @@ describe('grok second-opinion judge', () => {
   });
 
   test('logs a health-write failure with serialized error details without crashing', async () => {
-    const output = captureStdout();
+    const output = captureLogOutput();
     await expect(
       judgeWithGrok(evidence, {
         spawn: async () => ({ exitCode: 0, stdout: 'VERDICT: APPROVE\n', timedOut: false }),
@@ -133,8 +144,6 @@ describe('grok second-opinion judge', () => {
         },
       })
     ).resolves.toMatchObject({ disposition: 'approve' });
-    await Bun.sleep(10);
-
     const entry = output
       .flatMap(chunk => chunk.trim().split('\n'))
       .map(line => JSON.parse(line) as Record<string, unknown>)
@@ -145,7 +154,7 @@ describe('grok second-opinion judge', () => {
   });
 
   test('logs a spawn failure with serialized error details without crashing', async () => {
-    const output = captureStdout();
+    const output = captureLogOutput();
     await expect(
       judgeWithGrok(evidence, {
         spawn: async () => {
@@ -154,8 +163,6 @@ describe('grok second-opinion judge', () => {
         recordOutcome: ignoreOutcome,
       })
     ).resolves.toMatchObject({ disposition: 'hold', reason: 'judge_error' });
-    await Bun.sleep(10);
-
     const entry = output
       .flatMap(chunk => chunk.trim().split('\n'))
       .map(line => JSON.parse(line) as Record<string, unknown>)

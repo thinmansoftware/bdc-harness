@@ -8,6 +8,7 @@
  */
 
 import { afterEach, describe, expect, test } from 'bun:test';
+import { rootLogger } from '@archon/paths';
 import {
   buildEvidenceEnvelope,
   buildJudgePrompt,
@@ -30,18 +31,28 @@ import type {
   WatchedRunRecord,
 } from '../types.ts';
 
-const originalStdoutWrite = process.stdout.write.bind(process.stdout);
+interface LogDestination {
+  write(chunk: string): unknown;
+}
+
+const loggerStreamSymbol = Object.getOwnPropertySymbols(rootLogger).find(
+  symbol => String(symbol) === 'Symbol(pino.stream)'
+)!;
+const loggerDestination = (rootLogger as unknown as Record<symbol, LogDestination>)[
+  loggerStreamSymbol
+];
+const originalLogWrite = loggerDestination.write.bind(loggerDestination);
 
 afterEach(() => {
-  process.stdout.write = originalStdoutWrite;
+  loggerDestination.write = originalLogWrite;
 });
 
-function captureStdout(): string[] {
+function captureLogOutput(): string[] {
   const chunks: string[] = [];
-  process.stdout.write = ((chunk: string | Uint8Array): boolean => {
-    chunks.push(typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf8'));
+  loggerDestination.write = (chunk: string): boolean => {
+    chunks.push(chunk);
     return true;
-  }) as typeof process.stdout.write;
+  };
   return chunks;
 }
 
@@ -310,7 +321,7 @@ describe('judgeTerminalRun: model ladder + fail-loud health', () => {
   });
 
   test('logs a health-write failure with serialized error details without crashing', async () => {
-    const output = captureStdout();
+    const output = captureLogOutput();
     await expect(
       judgeTerminalRun(envelope, {
         ladder: ['healthy-spawn'],
@@ -325,8 +336,6 @@ describe('judgeTerminalRun: model ladder + fail-loud health', () => {
         },
       })
     ).resolves.toMatchObject({ kind: 'verdict' });
-    await Bun.sleep(10);
-
     const entry = output
       .flatMap(chunk => chunk.trim().split('\n'))
       .map(line => JSON.parse(line) as Record<string, unknown>)
