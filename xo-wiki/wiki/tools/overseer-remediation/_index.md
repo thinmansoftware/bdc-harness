@@ -79,6 +79,24 @@ Written to `agent_dispatch_messages` with `task_type: 'run_review'`, recipient
 one would require a DB CHECK-constraint migration for no behavioral gain, and
 the `kind` discriminator already identifies a remediation candidate.
 
+### Two dispatch rules this path must satisfy (both were live defects)
+
+Both were caught by the real-DB integration test in
+`pr-review-wiring-integration.test.ts` on 2026-08-28. A mocked emitter passes
+happily while production fails on first use, which is why that file exists.
+
+1. **`taskmaster` must be a seeded dispatch principal.** `createMessage` calls
+   `assessDispatchRecipientWithQuery` and rejects any recipient with no row in
+   `dispatch_principals` (`missing_principal`). Seeded by **migration 046**,
+   plus `000_combined.sql` and the SQLite adapter's `seedDispatchPrincipals()`
+   mirror -- **that mirror is hand-maintained and NOT derived from the
+   migrations**, so a new principal must be added in all three places.
+2. **Attempt 2+ must carry a `repeat_reason`.** Once any earlier message under
+   the PR's subject key is terminal, `createMessage` throws
+   `repeat_reason_required` -- the dispatch layer refuses to silently re-open a
+   settled subject. The emitter supplies one naming the attempt and head.
+   Without it the cap of 2 would silently have been a cap of 1.
+
 ## The auto-fixable class list
 
 A finding is handed back only if its class is on this list. **Adding a class is

@@ -370,6 +370,13 @@ export function createRealSubmitDeps(
         recipient: REMEDIATION_RECIPIENT,
         body: serialized,
         subject_key: reviewSubjectKey(body.owner, body.repo, body.prNumber),
+        // REQUIRED for attempt 2+. Once any earlier message under this PR's
+        // subject key reaches a terminal state, createMessage throws
+        // `repeat_reason_required` unless a reason is supplied -- the dispatch
+        // layer refuses to silently re-open a settled subject. Attempt 2 is
+        // exactly that case, so without this every second remediation would be
+        // rejected at enqueue and the cap of 2 would effectively be a cap of 1.
+        repeat_reason: `remediation attempt ${body.attempt} of ${body.maxAttempts} for head ${body.headSha}`,
       });
       // createMessage returns the EXISTING row on conflict rather than
       // throwing, so the stored body is what distinguishes "I claimed this

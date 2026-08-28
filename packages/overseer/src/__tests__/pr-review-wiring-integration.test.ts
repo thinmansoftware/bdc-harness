@@ -46,9 +46,12 @@ afterAll(() => {
 });
 
 const { SqliteAdapter } = await import('@archon/core/db/adapters/sqlite');
-const { createRealIngestDeps, REVIEW_RECIPIENT, REVIEW_SENDER } =
+const { createRealIngestDeps, createRealSubmitDeps, REVIEW_RECIPIENT, REVIEW_SENDER } =
   await import('../pr-review-wiring.ts');
+const { REMEDIATION_RECIPIENT, REMEDIATION_SENDER, MAX_REMEDIATION_ATTEMPTS } =
+  await import('../remediation-candidate.ts');
 const { ingestPullRequestEvent } = await import('../pr-review-ingest.ts');
+const { createRealOctokitClient } = await import('../adapters/github-real-deps.ts');
 const { createHmac } = await import('crypto');
 
 function cleanupDb(path: string): void {
@@ -174,5 +177,128 @@ describe('pr-review-wiring against a real SqliteAdapter', () => {
       [REVIEW_RECIPIENT]
     );
     expect(Number(count.rows[0]?.n ?? 0)).toBe(1);
+  });
+});
+
+/**
+ * Remediation hand-back against the REAL dispatch DAL
+ * (WO-HARNESS-OVERSEER-VERDICT-TO-TASKMASTER-REMEDIATION-01).
+ *
+ * Same lesson as this file's header, one layer up. A fake emitter proves
+ * nothing about whether `createMessage` will actually ACCEPT the row, and two
+ * real rejection rules sit on that path:
+ *
+ *   1. `assessDispatchRecipientWithQuery` rejects any recipient absent from
+ *      `dispatch_principals` -- so `taskmaster` must be seeded.
+ *   2. `repeat_reason_required` -- once ANY earlier message under this PR's
+ *      subject key is terminal, a further message is refused unless it carries
+ *      a `repeat_reason`. Attempt 2 is exactly that case.
+ *
+ * Rule 2 was a live defect found on this WO's own PR #740 (2026-08-28): the
+ * review route hit `enqueue_failed:repeat_reason_required` on its second push,
+ * which is the same disease in the sibling code path. Without the test below,
+ * the cap of 2 would silently have been a cap of 1.
+ */
+/**
+ * The remediation emitter never touches GitHub -- it writes to dispatch. But
+ * createRealSubmitDeps builds an Octokit eagerly, which throws without a token.
+ * Injecting a stub keeps these tests on the REAL dispatch DAL (the thing under
+ * test) without requiring credentials in CI.
+ */
+function stubOctokit() {
+  return {
+    pulls: { get: async () => ({ data: { head: { sha: '0'.repeat(40) } } }) },
+  } as unknown as ReturnType<typeof createRealOctokitClient>;
+}
+
+describe('remediation hand-back against a real SqliteAdapter', () => {
+  beforeEach(() => {
+    currentDbPath = join(
+      import.meta.dir,
+      `.test-remediation-wiring-${Date.now()}-${Math.random().toString(36).slice(2)}.db`
+    );
+    db = new SqliteAdapter(currentDbPath);
+  });
+
+  afterEach(async () => {
+    await db.close();
+    cleanupDb(currentDbPath);
+  });
+
+  test('taskmaster is a seeded dispatch principal', async () => {
+    const rows = await db.query<{ principal_id: string; active: number }>(
+      'SELECT principal_id, active FROM dispatch_principals WHERE principal_id IN ($1, $2)',
+      [REMEDIATION_RECIPIENT, REMEDIATION_SENDER]
+    );
+    const found = new Set(rows.rows.map(row => row.principal_id));
+    expect(found.has(REMEDIATION_RECIPIENT)).toBe(true);
+    expect(found.has(REMEDIATION_SENDER)).toBe(true);
+  });
+
+  test('attempt 1 and attempt 2 BOTH enqueue for the same PR (repeat_reason honored)', async () => {
+    const deps = createRealSubmitDeps('thinman-overseer[bot]', { octokit: stubOctokit() });
+    const emit = deps.emitRemediationCandidate;
+    const count = deps.countPriorRemediationAttempts;
+    if (!emit || !count) throw new Error('remediation deps must be wired');
+
+    const pr = { owner: 'thinmansoftware', repo: 'shopops', prNumber: 650 };
+    const candidate = (attempt: number, headSha: string) => ({
+      kind: 'overseer_remediation_candidate' as const,
+      ...pr,
+      headSha,
+      attempt,
+      maxAttempts: MAX_REMEDIATION_ATTEMPTS,
+      findingClasses: ['migration_ordering'],
+      verdictBody: `verdict at ${headSha}`,
+      woId: null,
+      owningLane: 'cauldron-lane-a',
+    });
+
+    expect(await count(pr)).toBe(0);
+
+    const first = await emit(candidate(1, 'a'.repeat(40)));
+    expect(first.claimed).toBe(true);
+    expect(await count(pr)).toBe(1);
+
+    // Drive the first row terminal -- this is what arms the repeat_reason rule
+    // and is exactly the real-world state after Taskmaster consumes attempt 1.
+    await db.query("UPDATE agent_dispatch_messages SET status = 'done' WHERE recipient = $1", [
+      REMEDIATION_RECIPIENT,
+    ]);
+
+    // Attempt 2 after a fix push. Before repeat_reason was supplied this threw
+    // `repeat_reason_required` and the second remediation was impossible.
+    const second = await emit(candidate(2, 'b'.repeat(40)));
+    expect(second.claimed).toBe(true);
+    expect(await count(pr)).toBe(2);
+  });
+
+  test('two heads racing for the SAME attempt yield exactly ONE durable row', async () => {
+    const deps = createRealSubmitDeps('thinman-overseer[bot]', { octokit: stubOctokit() });
+    const emit = deps.emitRemediationCandidate;
+    const count = deps.countPriorRemediationAttempts;
+    if (!emit || !count) throw new Error('remediation deps must be wired');
+
+    const pr = { owner: 'thinmansoftware', repo: 'shopops', prNumber: 651 };
+    const candidate = (headSha: string) => ({
+      kind: 'overseer_remediation_candidate' as const,
+      ...pr,
+      headSha,
+      attempt: 1,
+      maxAttempts: MAX_REMEDIATION_ATTEMPTS,
+      findingClasses: ['migration_ordering'],
+      verdictBody: `verdict at ${headSha}`,
+      woId: null,
+      owningLane: 'cauldron-lane-a',
+    });
+
+    // The race the Overseer gate caught: both read prior count 0, both compute
+    // attempt 1, different heads. The UNIQUE attempt slot must arbitrate.
+    const winner = await emit(candidate('c'.repeat(40)));
+    const loser = await emit(candidate('d'.repeat(40)));
+
+    expect(winner.claimed).toBe(true);
+    expect(loser.claimed).toBe(false);
+    expect(await count(pr)).toBe(1);
   });
 });
