@@ -111,11 +111,25 @@ credential" is non-auto).
    wildcard and no default-auto branch.
 3. **Mixed verdicts go to the human.** One blocking judgment-call finding among
    otherwise fixable ones refuses the whole verdict.
-4. **Idempotent per (PR, head SHA, attempt).** The key is
-   `overseer-remediation:owner/repo#N:sha:attempt`, and `createMessage` is
-   idempotent on it at the DATABASE level -- a re-delivered verdict returns the
-   existing row instead of enqueuing a second candidate. A new head SHA yields
-   a new key, which is what permits attempt 2 after a fix push.
+4. **Idempotent per (PR, attempt), and that is what makes the cap ATOMIC.** The
+   key is `overseer-remediation:owner/repo#N:attempt-K`. `idempotency_key` is
+   UNIQUE and `createMessage` inserts with `ON CONFLICT DO NOTHING`, so the
+   attempt slot itself is the unique resource and the database arbitrates.
+
+   **The head SHA is deliberately NOT in the key.** It was, and that was a real
+   defect -- caught by this very review gate on this WO's own PR (#740,
+   2026-08-28). Counting prior attempts and then inserting is a read-then-write
+   race: two rejected reviews for DIFFERENT heads could each read the same prior
+   count, compute the same attempt number, and both insert because their keys
+   differed by SHA. That exceeded the cap and defeated the bounded-loop
+   guarantee. With the SHA excluded, concurrent racers collide on one key and
+   exactly one wins.
+
+   The loser gets `claimed: false` and the receipt records
+   `attempt_slot_already_claimed` -- it is never reported as a queued fix. A
+   legitimate attempt 2 after a fix push still works: it is a different attempt
+   NUMBER, and the head being remediated travels in the body (`headSha`).
+
 5. **Taskmaster still decides.** Budget, pause, backoff, and eligibility all
    still apply.
 6. **A hand-back failure never un-lands a review.** If the counter or the emit
@@ -130,6 +144,11 @@ candidate IS a durable row under that PR's subject key, so
 where a separate counter and the queue disagree. Rows count regardless of
 status: a candidate Taskmaster refused still consumed an attempt -- that is the
 point of the cap.
+
+The count is an **optimization, not the enforcement mechanism**. It short-
+circuits the common case cheaply, but it is a read and therefore racy on its
+own. The cap is actually enforced by the UNIQUE constraint on the attempt slot
+(safety rule 4). Do not "improve" this by trusting the count alone.
 
 ## Known scope limit (deliberate)
 

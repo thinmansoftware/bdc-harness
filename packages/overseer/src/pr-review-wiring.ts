@@ -341,20 +341,26 @@ export function createRealSubmitDeps(
     /**
      * Writes the proposal onto the seam Taskmaster already reads.
      *
-     * `createMessage` is idempotent on idempotency_key at the DATABASE level,
-     * so a re-delivered verdict computing the same (PR, head, attempt) key
-     * returns the existing row instead of enqueuing a second candidate.
+     * THE CAP IS ENFORCED HERE, BY THE DATABASE. `idempotency_key` is keyed on
+     * (PR, attempt) and is UNIQUE, and `createMessage` inserts with ON CONFLICT
+     * DO NOTHING. Two concurrent rejected reviews that both read the same prior
+     * count therefore race for ONE row and exactly one wins -- the read-then-
+     * write sequence can no longer produce more than MAX_REMEDIATION_ATTEMPTS
+     * candidates. The loser is reported, not silently swallowed: returning
+     * `claimed: false` lets the caller record that this verdict did not create
+     * work, so an operator is not told a fix was queued when it was not.
      */
-    async emitRemediationCandidate(body): Promise<void> {
-      await dispatch.createMessage({
+    async emitRemediationCandidate(body): Promise<{ claimed: boolean }> {
+      const idempotencyKey = remediationIdempotencyKey({
+        owner: body.owner,
+        repo: body.repo,
+        prNumber: body.prNumber,
+        attempt: body.attempt,
+      });
+      const serialized = JSON.stringify(body);
+      const message = await dispatch.createMessage({
         correlation_id: `overseer-remediation:${body.owner}/${body.repo}#${body.prNumber}`,
-        idempotency_key: remediationIdempotencyKey({
-          owner: body.owner,
-          repo: body.repo,
-          prNumber: body.prNumber,
-          headSha: body.headSha,
-          attempt: body.attempt,
-        }),
+        idempotency_key: idempotencyKey,
         // Reuses the existing run_review task type: this is queued review-loop
         // work, and adding a task_type would require a DB CHECK-constraint
         // migration for no behavioral gain. The `kind` discriminator in the
@@ -362,9 +368,14 @@ export function createRealSubmitDeps(
         task_type: 'run_review',
         sender: REMEDIATION_SENDER,
         recipient: REMEDIATION_RECIPIENT,
-        body: JSON.stringify(body),
+        body: serialized,
         subject_key: reviewSubjectKey(body.owner, body.repo, body.prNumber),
       });
+      // createMessage returns the EXISTING row on conflict rather than
+      // throwing, so the stored body is what distinguishes "I claimed this
+      // attempt slot" from "someone else already had it". Comparing bodies is
+      // exact here because both sides serialize the same interface.
+      return { claimed: message.body === serialized };
     },
   };
 }

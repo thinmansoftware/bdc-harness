@@ -322,26 +322,40 @@ export function decideRemediation(input: RemediationCandidateInput): Remediation
 }
 
 /**
- * Idempotency key for one remediation candidate.
+ * Idempotency key for one remediation candidate: (PR, attempt).
  *
- * Keyed on (PR, head SHA, attempt) exactly as the spec requires. Re-delivery of
- * the same verdict computes the same key, and `createMessage` is idempotent on
- * it at the DATABASE level -- returning the existing row instead of inserting a
- * second candidate. Dedupe is therefore enforced by a UNIQUE constraint, not by
- * application logic that could race two concurrent deliveries.
+ * THE HEAD SHA IS DELIBERATELY NOT IN THIS KEY. That is what makes the attempt
+ * cap atomic, and it was a real defect before (found by the Overseer review
+ * gate on this WO's own PR, 2026-08-28 -- fittingly, the very loop this WO
+ * builds).
  *
- * A new head SHA produces a different key, which is what permits a legitimate
- * second attempt after a fix push.
+ * The bug: counting prior attempts and then inserting is a read-then-write
+ * race. Two rejected reviews for DIFFERENT head SHAs could each read the same
+ * prior count, each compute the same attempt number, and -- because their keys
+ * differed by SHA -- each insert successfully. That yields more than
+ * MAX_REMEDIATION_ATTEMPTS durable candidates and defeats the bounded-loop
+ * guarantee, which is the single most important safety property here.
+ *
+ * Keying on (PR, attempt) makes the DATABASE the arbiter: `idempotency_key` is
+ * UNIQUE and `createMessage` inserts with ON CONFLICT DO NOTHING, returning the
+ * existing row. Two concurrent emitters racing for attempt 2 therefore collide
+ * on the constraint and exactly one row exists. The cap cannot be exceeded no
+ * matter how the reads interleave, because the slot itself is the unique
+ * resource.
+ *
+ * A legitimate second attempt after a fix push still works: it is a different
+ * ATTEMPT NUMBER, not a different SHA. The head being remediated is carried in
+ * the body (`headSha`), so the candidate still names exactly what was reviewed.
+ * Re-delivery of the same verdict computes the same key and is still a no-op.
  */
 export function remediationIdempotencyKey(input: {
   owner: string;
   repo: string;
   prNumber: number;
-  headSha: string;
   attempt: number;
 }): string {
   const slug = `${input.owner.toLowerCase()}/${input.repo.toLowerCase()}#${input.prNumber}`;
-  return `overseer-remediation:${slug}:${input.headSha}:${input.attempt}`;
+  return `overseer-remediation:${slug}:attempt-${input.attempt}`;
 }
 
 /**

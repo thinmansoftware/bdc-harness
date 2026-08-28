@@ -139,7 +139,6 @@ describe('scenario 4: idempotency', () => {
         owner: body.owner,
         repo: body.repo,
         prNumber: body.prNumber,
-        headSha: body.headSha,
         attempt: body.attempt,
       });
 
@@ -147,6 +146,37 @@ describe('scenario 4: idempotency', () => {
     // createMessage is idempotent on this key at the DB level, so an identical
     // key is exactly what makes a re-delivery a no-op instead of a second row.
     expect(keyOf(first.body)).toContain('thinmansoftware/shopops#650');
+  });
+
+  /**
+   * REGRESSION -- the defect the Overseer review gate found on this WO's own
+   * PR (740, head bc30cae8, 2026-08-28).
+   *
+   * The key previously included the head SHA. Counting attempts and then
+   * inserting is a read-then-write race, so two rejected reviews for DIFFERENT
+   * heads could each read the same prior count, compute the SAME attempt
+   * number, and -- because their keys differed by SHA -- BOTH insert. That
+   * exceeded MAX_REMEDIATION_ATTEMPTS and defeated the bounded-loop guarantee.
+   *
+   * Excluding the SHA makes the attempt slot itself the unique resource, so the
+   * UNIQUE constraint arbitrates and only one of the racers can win.
+   */
+  test('two different heads racing for the SAME attempt collide on one key', () => {
+    const raceA = decideRemediation(baseInput({ priorAttempts: 1 }));
+    const raceB = decideRemediation(
+      baseInput({ priorAttempts: 1, headSha: 'bbbb22220000000000000000000000000000cccc' })
+    );
+    if (!raceA.emit || !raceB.emit) throw new Error('expected both to emit');
+
+    // Both computed attempt 2 from the same stale count -- that is the race.
+    expect(raceA.body.attempt).toBe(2);
+    expect(raceB.body.attempt).toBe(2);
+
+    // The DB sees ONE key, so exactly one row can exist. The cap holds.
+    expect(remediationIdempotencyKey({ ...raceA.body })).toBe(
+      remediationIdempotencyKey({ ...raceB.body })
+    );
+    expect(remediationIdempotencyKey({ ...raceA.body })).not.toContain(raceA.body.headSha);
   });
 });
 
@@ -162,9 +192,12 @@ describe('scenario 5: a new head SHA permits a second attempt', () => {
     if (!first.emit || !second.emit) throw new Error('expected both to emit');
 
     expect(second.body.attempt).toBe(2);
+    // Distinct because the ATTEMPT differs, not because the SHA does. The head
+    // being remediated still travels in the body.
     const firstKey = remediationIdempotencyKey({ ...first.body });
     const secondKey = remediationIdempotencyKey({ ...second.body });
     expect(secondKey).not.toBe(firstKey);
+    expect(second.body.headSha).toBe('aaaa11110000000000000000000000000000bbbb');
   });
 
   test('the counter reflects prior candidates derived from durable rows', () => {
@@ -342,6 +375,7 @@ describe('submit path hands a rejected verdict back to Taskmaster', () => {
       countPriorRemediationAttempts: async () => 0,
       emitRemediationCandidate: async body => {
         emitted.push(body);
+        return { claimed: true };
       },
       ...overrides,
     };
@@ -414,6 +448,20 @@ describe('submit path hands a rejected verdict back to Taskmaster', () => {
     expect(outcome.disposition).toBe('changes_requested');
     expect(outcome.remediation?.emitted).toBe(false);
     expect(outcome.remediation?.reason).toBe('emit_failed');
+  });
+
+  test('losing the attempt-slot race reports honestly instead of claiming success', async () => {
+    // The DB unique constraint on (PR, attempt) rejected this emitter because a
+    // concurrent rejected review already claimed the slot. The cap held, and
+    // the receipt must not tell an operator a fix was queued.
+    const { deps: d } = deps({
+      emitRemediationCandidate: async () => ({ claimed: false }),
+    });
+    const outcome = await runAndSubmitReview(work(), d);
+
+    expect(outcome.disposition).toBe('changes_requested');
+    expect(outcome.remediation?.emitted).toBe(false);
+    expect(outcome.remediation?.reason).toBe('attempt_slot_already_claimed');
   });
 
   test('the candidate defaults its owning lane to the lane that built the PR', async () => {

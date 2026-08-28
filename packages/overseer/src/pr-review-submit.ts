@@ -135,8 +135,14 @@ export interface SubmitDeps {
    * Writes the remediation candidate onto the existing dispatch seam. Never
    * fires a builder: Taskmaster's budget, backoff, pause state, and
    * fire-eligibility still decide whether the proposal becomes work.
+   *
+   * Returns `claimed: false` when this attempt slot was already taken -- the
+   * durable per-PR cap is enforced by a UNIQUE constraint on the attempt slot,
+   * so a concurrent emitter can lose the race. Losing is a correct outcome, but
+   * it must be REPORTED rather than reported as success, or an operator would
+   * be told a fix was queued when this verdict queued nothing.
    */
-  emitRemediationCandidate?(body: RemediationCandidateBody): Promise<void>;
+  emitRemediationCandidate?(body: RemediationCandidateBody): Promise<{ claimed: boolean }>;
 }
 
 /** What the remediation hand-back did, recorded on the receipt. */
@@ -145,7 +151,11 @@ export interface RemediationOutcome {
   /** Present when emitted; identifies the attempt for audit. */
   readonly attempt?: number;
   /** Present when NOT emitted, so a human sees why it stopped with them. */
-  readonly reason?: RemediationRefusalReason | 'remediation_not_configured' | 'emit_failed';
+  readonly reason?:
+    | RemediationRefusalReason
+    | 'remediation_not_configured'
+    | 'emit_failed'
+    | 'attempt_slot_already_claimed';
 }
 
 /** Bounds the evidence body so a runaway reviewer cannot post an essay. */
@@ -351,10 +361,17 @@ async function handBackToTaskmaster(
 
   if (!decision.emit) return { emitted: false, reason: decision.reason };
 
+  let result: { claimed: boolean };
   try {
-    await deps.emitRemediationCandidate(decision.body);
+    result = await deps.emitRemediationCandidate(decision.body);
   } catch {
     return { emitted: false, reason: 'emit_failed' };
+  }
+  // Losing the race for an attempt slot means another rejected review already
+  // queued this attempt. The cap held; this verdict simply created no work, and
+  // saying so keeps the receipt honest.
+  if (!result.claimed) {
+    return { emitted: false, reason: 'attempt_slot_already_claimed' };
   }
   return { emitted: true, attempt: decision.body.attempt };
 }
