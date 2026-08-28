@@ -319,6 +319,47 @@ describe('dispatch API', () => {
     });
   });
 
+  test('GET /api/dispatch/operator-inbox/status reports backlog count, oldest age, and top senders', async () => {
+    // Seed operator-inbox rows from two senders.
+    await createMessage({
+      correlation_id: 'op-1',
+      idempotency_key: 'op-1',
+      task_type: 'run_report',
+      sender: 'overseer',
+      recipient: 'operator',
+      body: 'oldest',
+    });
+    await createMessage({
+      correlation_id: 'op-2',
+      idempotency_key: 'op-2',
+      task_type: 'run_report',
+      sender: 'overseer',
+      recipient: 'operator',
+      body: 'second',
+    });
+    await createMessage({
+      correlation_id: 'op-3',
+      idempotency_key: 'op-3',
+      task_type: 'run_report',
+      sender: 'taskmaster',
+      recipient: 'operator',
+      body: 'third',
+    });
+
+    const response = await makeApp().request('/api/dispatch/operator-inbox/status');
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as {
+      count: number;
+      oldest_created_at: string | null;
+      oldest_age_ms: number | null;
+      top_senders: { sender: string; count: number }[];
+    };
+    expect(body.count).toBe(3);
+    expect(body.oldest_created_at).not.toBeNull();
+    expect(body.oldest_age_ms).not.toBeNull();
+    expect(body.top_senders[0]).toEqual({ sender: 'overseer', count: 2 });
+  });
+
   test('rejects an absent recipient with a named error before insert', async () => {
     const response = await makeApp('secret-token').request('/api/dispatch/messages', {
       method: 'POST',

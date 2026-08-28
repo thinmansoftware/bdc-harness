@@ -21,14 +21,14 @@ import {
   createRealOctokitClient,
   createRealSubmitPullRequestReview,
 } from './adapters/github-real-deps';
-import type { IngestDeps, PriorReviewWork } from './pr-review-ingest.ts';
+import type { IngestDeps, IngestDisposition, PriorReviewWork } from './pr-review-ingest.ts';
 import {
   configuredReviewIdentity,
   evaluatePullRequest,
   invokeConfiguredReviewModel,
 } from './pr-review-evaluator';
 import type { PrReviewDeps, PrReviewInput, PrReviewResult } from './pr-review-evaluator';
-import type { ReviewerVerdict, SubmitDeps } from './pr-review-submit.ts';
+import type { ReviewerVerdict, SubmitDeps, SubmitDisposition } from './pr-review-submit.ts';
 
 /** Env var carrying the shared GitHub webhook secret for the review route. */
 export const REVIEW_WEBHOOK_SECRET_ENV = 'OVERSEER_REVIEW_WEBHOOK_SECRET';
@@ -41,6 +41,91 @@ const REVIEW_REVIEWER_IDENTITY_DEFAULT = 'thinman-overseer[bot]';
 /** Dispatch principal that owns queued review work. */
 export const REVIEW_SENDER = 'overseer-review-route';
 export const REVIEW_RECIPIENT = 'overseer-reviewer';
+
+/**
+ * WO-HARNESS-OPERATOR-INBOX-BACKPRESSURE-01: audit home for routine review-route
+ * receipts. Routine receipts (a webhook arrived, a review was submitted) are
+ * bookkeeping -- they belong here, NOT in the human operator mailbox that nobody
+ * drains. They remain durable + queryable via listMessages({recipient:
+ * REVIEW_RECEIPTS_LOG}). Only a receipt carrying a genuine operator DECISION or
+ * BLOCKER is delivered to recipient='operator'.
+ */
+export const REVIEW_RECEIPTS_LOG = 'review-receipts-log';
+
+/**
+ * Governance classification for a receipt: does it carry information the human
+ * operator must act on, or is it a routine audit record? 'information-only'
+ * receipts go to the receipts log; 'operator_decision_required' receipts go to
+ * the operator inbox.
+ */
+export type ReceiptGovernanceClassification = 'information-only' | 'operator_decision_required';
+
+/**
+ * Classify an INGEST receipt. A receipt is operator-actionable only when ingest
+ * REFUSED the event for a reason a human must resolve (a blocked ingest, a
+ * custody conflict, a rejected signature = a misconfigured/spoofed webhook).
+ * Everything else -- normal enqueue, duplicate delivery, a newer head
+ * superseding an older one, an ignored non-actionable event or draft -- is
+ * routine bookkeeping.
+ *
+ * Exhaustive by construction: IngestDisposition is a closed union and every
+ * arm is handled, so adding a new disposition is a COMPILE error here (never a
+ * silent misroute to the wrong mailbox).
+ */
+export function ingestReceiptGovernanceClassification(
+  disposition: IngestDisposition
+): ReceiptGovernanceClassification {
+  switch (disposition) {
+    case 'queued':
+    case 'duplicate_delivery':
+    case 'superseded_head':
+    case 'ignored_event':
+    case 'ignored_draft':
+      return 'information-only';
+    case 'blocked':
+    case 'custody_conflict':
+    case 'rejected_signature':
+      return 'operator_decision_required';
+    default: {
+      const exhaustive: never = disposition;
+      return exhaustive;
+    }
+  }
+}
+
+/**
+ * Classify a SUBMIT receipt. A submitted review outcome (approved, changes
+ * requested) and a stale-head no-op are routine. A custody conflict, a merge
+ * custody conflict, a reviewer failure, or a submission failure is a blocker a
+ * human must look at. Exhaustive by construction (see above).
+ */
+export function submitReceiptGovernanceClassification(
+  disposition: SubmitDisposition
+): ReceiptGovernanceClassification {
+  switch (disposition) {
+    case 'approved':
+    case 'changes_requested':
+    case 'stale_head':
+      return 'information-only';
+    case 'custody_conflict':
+    case 'merge_custody_conflict':
+    case 'reviewer_failed':
+    case 'submission_failed':
+      return 'operator_decision_required';
+    default: {
+      const exhaustive: never = disposition;
+      return exhaustive;
+    }
+  }
+}
+
+/**
+ * Route a classified receipt to its mailbox: routine receipts to the audit log,
+ * operator-actionable receipts to the human inbox.
+ */
+function receiptRecipient(classification: ReceiptGovernanceClassification): string {
+  return classification === 'information-only' ? REVIEW_RECEIPTS_LOG : 'operator';
+}
 
 export interface ReviewRouteConfig {
   webhookSecret: string;
@@ -206,14 +291,19 @@ export function createRealIngestDeps(config: ReviewRouteConfig): IngestDeps {
       // Receipts ride the same durable store as the work itself. A receipt is
       // never allowed to fail the ingest path (the caller wraps this), but it
       // must be attempted for every terminal disposition.
+      //
+      // WO-HARNESS-OPERATOR-INBOX-BACKPRESSURE-01: route routine receipts to the
+      // audit log; only operator-actionable dispositions reach the human inbox.
+      const governanceClassification = ingestReceiptGovernanceClassification(input.disposition);
       await dispatch.createMessage({
         correlation_id: input.correlationId || `pr-review-receipt:${input.deliveryId}`,
         idempotency_key: `pr-review-receipt:${input.deliveryId}:${input.disposition}`,
         task_type: 'run_report',
         sender: REVIEW_SENDER,
-        recipient: 'operator',
+        recipient: receiptRecipient(governanceClassification),
         body: JSON.stringify({
           kind: 'pr_review_ingest_receipt',
+          governanceClassification,
           deliveryId: input.deliveryId,
           owner: input.owner,
           repo: input.repo,
@@ -304,13 +394,21 @@ export function createRealSubmitDeps(
       return pr.data.head.sha;
     },
     async recordReceipt(input): Promise<void> {
+      // WO-HARNESS-OPERATOR-INBOX-BACKPRESSURE-01: routine submit outcomes
+      // (approved / changes_requested / stale_head) are audit records; only a
+      // custody/reviewer/submission failure reaches the operator inbox.
+      const governanceClassification = submitReceiptGovernanceClassification(input.disposition);
       await dispatch.createMessage({
         correlation_id: input.correlationId,
         idempotency_key: `pr-review-submit-receipt:${input.messageId}:${input.disposition}`,
         task_type: 'run_report',
         sender: REVIEW_SENDER,
-        recipient: 'operator',
-        body: JSON.stringify({ kind: 'pr_review_submit_receipt', ...input }),
+        recipient: receiptRecipient(governanceClassification),
+        body: JSON.stringify({
+          kind: 'pr_review_submit_receipt',
+          governanceClassification,
+          ...input,
+        }),
       });
     },
   };

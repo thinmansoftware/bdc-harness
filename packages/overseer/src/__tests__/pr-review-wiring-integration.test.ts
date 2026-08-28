@@ -46,10 +46,28 @@ afterAll(() => {
 });
 
 const { SqliteAdapter } = await import('@archon/core/db/adapters/sqlite');
-const { createRealIngestDeps, REVIEW_RECIPIENT, REVIEW_SENDER } =
-  await import('../pr-review-wiring.ts');
+const {
+  createRealIngestDeps,
+  createRealSubmitDeps,
+  REVIEW_RECIPIENT,
+  REVIEW_SENDER,
+  REVIEW_RECEIPTS_LOG,
+} = await import('../pr-review-wiring.ts');
 const { ingestPullRequestEvent } = await import('../pr-review-ingest.ts');
 const { createHmac } = await import('crypto');
+
+// recordReceipt never touches octokit; a fake avoids App-credential creation.
+const fakeSubmitOctokit = {
+  pulls: { get: async () => ({ data: { head: { sha: 'a'.repeat(40) } } }) },
+} as never;
+
+async function countRows(recipient: string): Promise<number> {
+  const rows = await db.query<{ n: number }>(
+    'SELECT COUNT(*) AS n FROM agent_dispatch_messages WHERE recipient = $1',
+    [recipient]
+  );
+  return Number(rows.rows[0]?.n ?? 0);
+}
 
 function cleanupDb(path: string): void {
   for (const suffix of ['', '-wal', '-shm']) {
@@ -174,5 +192,130 @@ describe('pr-review-wiring against a real SqliteAdapter', () => {
       [REVIEW_RECIPIENT]
     );
     expect(Number(count.rows[0]?.n ?? 0)).toBe(1);
+  });
+
+  // WO-HARNESS-OPERATOR-INBOX-BACKPRESSURE-01: receipt suppression against a REAL
+  // SqliteAdapter. Proves the review-receipts-log principal is seeded (closing
+  // the same migration/hand-mirror gap 043 warned about) and that routing lands
+  // rows where governance says, not on the operator inbox.
+  test('the review-receipts-log principal is seeded (migration + SQLite mirror parity)', async () => {
+    const rows = await db.query<{ principal_id: string; active: number; delivery_mode: string }>(
+      'SELECT principal_id, active, delivery_mode FROM dispatch_principals WHERE principal_id = $1',
+      [REVIEW_RECEIPTS_LOG]
+    );
+    expect(rows.rows[0]?.principal_id).toBe(REVIEW_RECEIPTS_LOG);
+    expect(rows.rows[0]?.active).toBe(1);
+    expect(rows.rows[0]?.delivery_mode).toBe('notify_only');
+  });
+
+  test('scenario 8: routine ingest + submit receipts land in the audit log, NOT the operator inbox, and stay retrievable', async () => {
+    const ingestDeps = createRealIngestDeps({
+      webhookSecret: 'integration-test-secret',
+      reviewerIdentity: 'thinman-overseer[bot]',
+    });
+    // A routine ingest receipt (a webhook arrived and was queued).
+    await ingestDeps.recordReceipt({
+      correlationId: 'corr-ingest',
+      deliveryId: 'delivery-routine-ingest',
+      owner: 'thinmansoftware',
+      repo: 'bdc-harness',
+      prNumber: 42,
+      headSha: 'a'.repeat(40),
+      disposition: 'queued',
+    });
+
+    // A routine submit receipt (a review was submitted / approved).
+    const submitDeps = createRealSubmitDeps('thinman-overseer[bot]', {
+      octokit: fakeSubmitOctokit,
+    });
+    await submitDeps.recordReceipt({
+      correlationId: 'corr-submit',
+      messageId: 'message-approved-1',
+      owner: 'thinmansoftware',
+      repo: 'bdc-harness',
+      prNumber: 42,
+      headSha: 'a'.repeat(40),
+      disposition: 'approved',
+    });
+
+    // NEITHER created an operator-inbox row...
+    expect(await countRows('operator')).toBe(0);
+    // ...and BOTH are retrievable from their audit home.
+    expect(await countRows(REVIEW_RECEIPTS_LOG)).toBe(2);
+  });
+
+  test('scenario 9: a receipt carrying a blocker/decision IS delivered to the operator inbox', async () => {
+    const ingestDeps = createRealIngestDeps({
+      webhookSecret: 'integration-test-secret',
+      reviewerIdentity: 'thinman-overseer[bot]',
+    });
+    // A custody conflict is a genuine operator decision.
+    await ingestDeps.recordReceipt({
+      correlationId: 'corr-blocker',
+      deliveryId: 'delivery-custody-conflict',
+      owner: 'thinmansoftware',
+      repo: 'bdc-harness',
+      prNumber: 7,
+      headSha: 'b'.repeat(40),
+      disposition: 'custody_conflict',
+      reason: 'reviewer identity clashes with author custody',
+    });
+
+    const submitDeps = createRealSubmitDeps('thinman-overseer[bot]', {
+      octokit: fakeSubmitOctokit,
+    });
+    await submitDeps.recordReceipt({
+      correlationId: 'corr-submit-fail',
+      messageId: 'message-submission-failed-1',
+      owner: 'thinmansoftware',
+      repo: 'bdc-harness',
+      prNumber: 7,
+      headSha: 'b'.repeat(40),
+      disposition: 'submission_failed',
+      reason: 'github rejected the review submission',
+    });
+
+    // Both blockers reach the operator inbox; neither pollutes the audit log.
+    expect(await countRows('operator')).toBe(2);
+    expect(await countRows(REVIEW_RECEIPTS_LOG)).toBe(0);
+  });
+
+  test('scenario 10: a simulated day of review-route receipts creates at most a tiny operator-inbox bound', async () => {
+    const ingestDeps = createRealIngestDeps({
+      webhookSecret: 'integration-test-secret',
+      reviewerIdentity: 'thinman-overseer[bot]',
+    });
+    // Observed 2026-08-27 volume/mix: 107 ingest_receipt + 48 submit_receipt =
+    // 155 routine receipts, all information-only.
+    for (let i = 0; i < 107; i += 1) {
+      await ingestDeps.recordReceipt({
+        correlationId: `corr-ingest-${i}`,
+        deliveryId: `delivery-ingest-${i}`,
+        owner: 'thinmansoftware',
+        repo: 'bdc-harness',
+        prNumber: i,
+        headSha: 'a'.repeat(40),
+        disposition: i % 2 === 0 ? 'queued' : 'duplicate_delivery',
+      });
+    }
+    const submitDeps = createRealSubmitDeps('thinman-overseer[bot]', {
+      octokit: fakeSubmitOctokit,
+    });
+    for (let i = 0; i < 48; i += 1) {
+      await submitDeps.recordReceipt({
+        correlationId: `corr-submit-${i}`,
+        messageId: `message-submit-${i}`,
+        owner: 'thinmansoftware',
+        repo: 'bdc-harness',
+        prNumber: i,
+        headSha: 'a'.repeat(40),
+        disposition: i % 2 === 0 ? 'approved' : 'changes_requested',
+      });
+    }
+
+    // On the untouched tree this would be 155 operator rows. Here: ZERO -- every
+    // routine receipt is information-only. The stated small bound is 0.
+    expect(await countRows('operator')).toBe(0);
+    expect(await countRows(REVIEW_RECEIPTS_LOG)).toBe(155);
   });
 });

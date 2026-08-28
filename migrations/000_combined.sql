@@ -552,7 +552,13 @@ CREATE TABLE IF NOT EXISTS agent_dispatch_messages (
   subject_key TEXT,
   repeat_reason TEXT,
   route_disposition TEXT CHECK (route_disposition IS NULL OR route_disposition IN ('unroutable', 'superseded')),
-  supersedes_id UUID REFERENCES agent_dispatch_messages(id)
+  supersedes_id UUID REFERENCES agent_dispatch_messages(id),
+  -- WO-HARNESS-OPERATOR-INBOX-BACKPRESSURE-01 (migration 046): bounded-drain
+  -- watermark + retention retirement. A retired row keeps status='queued';
+  -- retired_at IS NOT NULL is the terminal, non-draining marker (distinct from
+  -- 'cancelled', which Scope OUT forbids reusing).
+  inbox_watermark_at TIMESTAMPTZ,
+  retired_at TIMESTAMPTZ
 );
 
 CREATE INDEX IF NOT EXISTS idx_agent_dispatch_messages_recipient_status
@@ -568,6 +574,12 @@ CREATE INDEX IF NOT EXISTS idx_agent_dispatch_messages_subject_history
 
 CREATE INDEX IF NOT EXISTS idx_dispatch_board_pending
   ON agent_dispatch_messages(recipient_alias, status, created_at);
+
+-- WO-HARNESS-OPERATOR-INBOX-BACKPRESSURE-01 (migration 046): bounded operator
+-- drain read (oldest-first, excluding watermarked / retired / addressed rows).
+CREATE INDEX IF NOT EXISTS idx_agent_dispatch_messages_operator_backlog
+  ON agent_dispatch_messages(recipient, status, created_at)
+  WHERE addressed_at IS NULL AND inbox_watermark_at IS NULL AND retired_at IS NULL;
 
 CREATE TABLE IF NOT EXISTS dispatch_principals (
   principal_id TEXT PRIMARY KEY,
@@ -601,7 +613,10 @@ VALUES
   -- route's sender and worker-poll recipient. Without these rows every
   -- review enqueue is rejected as missing_principal.
   ('overseer-reviewer', 'Overseer PR Reviewer', 'worker_poll', TRUE),
-  ('overseer-review-route', 'Overseer Review Route', 'notify_only', TRUE)
+  ('overseer-review-route', 'Overseer Review Route', 'notify_only', TRUE),
+  -- WO-HARNESS-OPERATOR-INBOX-BACKPRESSURE-01 (migration 046): audit home for
+  -- routine review-route receipts so they stop reaching recipient='operator'.
+  ('review-receipts-log', 'Review Receipts Log', 'notify_only', TRUE)
 ON CONFLICT (principal_id) DO NOTHING;
 
 INSERT INTO dispatch_principals (principal_id, display_name, delivery_mode, active)

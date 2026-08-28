@@ -59,6 +59,11 @@ export interface DispatchMessage {
   route_disposition: DispatchRouteDisposition | null;
   supersedes_id: string | null;
   repeat_reason: string | null;
+  // WO-HARNESS-OPERATOR-INBOX-BACKPRESSURE-01: bounded-drain watermark +
+  // retention retirement. A retired row keeps status='queued'; retired_at IS NOT
+  // NULL is the terminal, non-draining marker (distinct from 'cancelled').
+  inbox_watermark_at: string | null;
+  retired_at: string | null;
 }
 
 export interface DispatchWorker {
@@ -163,6 +168,8 @@ function normalizeMessage(row: DispatchMessageRow): DispatchMessage {
     addressed_at: normalizeNullableTimestamp(row.addressed_at),
     escalated_tg_at: normalizeNullableTimestamp(row.escalated_tg_at),
     escalated_sms_at: normalizeNullableTimestamp(row.escalated_sms_at),
+    inbox_watermark_at: normalizeNullableTimestamp(row.inbox_watermark_at),
+    retired_at: normalizeNullableTimestamp(row.retired_at),
   };
 }
 
@@ -447,6 +454,161 @@ export async function listMessages(filters: {
     params
   );
   return result.rows.map(normalizeMessage);
+}
+
+// ---------------------------------------------------------------------------
+// Operator-inbox backpressure (WO-HARNESS-OPERATOR-INBOX-BACKPRESSURE-01)
+//
+// READ-side backpressure + retention retirement for recipient='operator'. The
+// write-side idempotency dedupe in createMessageWithQuery is unchanged; these
+// functions bound how much of an accumulated backlog a single drain pass reads
+// and re-processes, and retire rows that aged past a retention window without
+// deleting them or reusing status='cancelled'.
+// ---------------------------------------------------------------------------
+
+/** The mailbox principal these backpressure helpers operate on. */
+export const OPERATOR_INBOX_RECIPIENT = 'operator';
+
+export interface OperatorInboxSenderCount {
+  sender: string;
+  count: number;
+}
+
+export interface OperatorInboxBacklogStatus {
+  /** Queued, unaddressed, un-retired rows for recipient='operator'. */
+  count: number;
+  /** Oldest created_at among those rows, or null when the backlog is empty. */
+  oldestCreatedAt: string | null;
+  /** Highest-volume senders in the backlog, most first (top 5). */
+  topSenders: OperatorInboxSenderCount[];
+}
+
+/**
+ * Bounded, oldest-first (by severity) read of the operator backlog for a single
+ * drain pass. Excludes rows already watermarked, retired, or addressed so a
+ * large stale backlog is never re-read in full every pass. `limit` is the batch
+ * cap; it is clamped to a sane range.
+ */
+export async function listUnwatermarkedOperatorInboxMessages(
+  limit: number
+): Promise<DispatchMessage[]> {
+  const cappedLimit = Math.max(1, Math.min(Math.trunc(limit) || 1, 500));
+  const result = await getDatabase().query<DispatchMessageRow>(
+    `SELECT * FROM agent_dispatch_messages
+     WHERE recipient = $1
+       AND status = 'queued'
+       AND addressed_at IS NULL
+       AND inbox_watermark_at IS NULL
+       AND retired_at IS NULL
+       AND (not_before IS NULL OR not_before <= $2)
+     ORDER BY CASE priority WHEN 'blocker' THEN 0 WHEN 'normal' THEN 1 ELSE 2 END,
+              created_at ASC
+     LIMIT $3`,
+    [OPERATOR_INBOX_RECIPIENT, nowIso(), cappedLimit]
+  );
+  return result.rows.map(normalizeMessage);
+}
+
+/**
+ * Record that the drain has processed this operator row once. Idempotent via
+ * COALESCE: repeat calls never overwrite the first watermark and never throw.
+ * This is what breaks the reprocessing loop even when ack/address keep failing.
+ * Returns true when a fresh watermark was written, false when one already
+ * existed (or the row is not an eligible operator row).
+ */
+export async function markOperatorInboxWatermark(id: string): Promise<boolean> {
+  const result = await getDatabase().query(
+    `UPDATE agent_dispatch_messages
+        SET inbox_watermark_at = COALESCE(inbox_watermark_at, $2)
+      WHERE id = $1
+        AND recipient = $3
+        AND inbox_watermark_at IS NULL`,
+    [id, nowIso(), OPERATOR_INBOX_RECIPIENT]
+  );
+  return result.rowCount > 0;
+}
+
+/**
+ * Retire operator rows older than the retention window that were never
+ * addressed. Retirement is monotonic (retired_at set once), reversible (the row
+ * and its history are preserved), and terminal-but-non-draining: status stays
+ * 'queued' and is NEVER set to 'cancelled'. Bounded by `limit` per sweep.
+ * Returns the ids retired by this call.
+ */
+export async function retireStaleOperatorInboxMessages(
+  retentionMs: number,
+  limit: number
+): Promise<string[]> {
+  const cappedLimit = Math.max(1, Math.min(Math.trunc(limit) || 1, 500));
+  const cutoffIso = new Date(Date.now() - Math.max(0, retentionMs)).toISOString();
+  const db = getDatabase();
+  // Select-then-update: the SQLite adapter rejects RETURNING on UPDATE, so we
+  // pick the bounded eligible set first, then retire exactly those ids. The
+  // drain loop is the single writer, and the retired_at IS NULL guard on the
+  // UPDATE keeps a concurrent sweep idempotent.
+  const candidates = await db.query<{ id: string }>(
+    `SELECT id FROM agent_dispatch_messages
+      WHERE recipient = $1
+        AND status = 'queued'
+        AND addressed_at IS NULL
+        AND retired_at IS NULL
+        AND created_at < $2
+      ORDER BY created_at ASC
+      LIMIT $3`,
+    [OPERATOR_INBOX_RECIPIENT, cutoffIso, cappedLimit]
+  );
+  const ids = candidates.rows.map(row => row.id);
+  if (ids.length === 0) return [];
+  const placeholders = ids.map((_, index) => `$${index + 2}`).join(', ');
+  const update = await db.query(
+    `UPDATE agent_dispatch_messages
+        SET retired_at = $1
+      WHERE retired_at IS NULL
+        AND id IN (${placeholders})`,
+    [nowIso(), ...ids]
+  );
+  // rowCount reflects rows actually transitioned this call (guards double-retire).
+  return update.rowCount === ids.length ? ids : ids.slice(0, update.rowCount);
+}
+
+/**
+ * Queryable backlog status for the operator inbox: total unaddressed queued
+ * rows (excluding retired), the oldest such row's age, and the top senders.
+ * Feeds both the drain-pass alarm and the surfacing API read so an operator can
+ * see pressure building before it becomes an outage.
+ */
+export async function getOperatorInboxBacklogStatus(): Promise<OperatorInboxBacklogStatus> {
+  const db = getDatabase();
+  const summary = await db.query<{ count: number | string; oldest: unknown }>(
+    `SELECT COUNT(*) AS count, MIN(created_at) AS oldest
+       FROM agent_dispatch_messages
+      WHERE recipient = $1
+        AND status = 'queued'
+        AND addressed_at IS NULL
+        AND retired_at IS NULL`,
+    [OPERATOR_INBOX_RECIPIENT]
+  );
+  const senders = await db.query<{ sender: string; count: number | string }>(
+    `SELECT sender, COUNT(*) AS count
+       FROM agent_dispatch_messages
+      WHERE recipient = $1
+        AND status = 'queued'
+        AND addressed_at IS NULL
+        AND retired_at IS NULL
+      GROUP BY sender
+      ORDER BY count DESC, sender ASC
+      LIMIT 5`,
+    [OPERATOR_INBOX_RECIPIENT]
+  );
+  const summaryRow = summary.rows[0];
+  return {
+    count: summaryRow ? Number(summaryRow.count) : 0,
+    oldestCreatedAt:
+      summaryRow?.oldest !== null && summaryRow?.oldest !== undefined
+        ? normalizeTimestamp(summaryRow.oldest)
+        : null,
+    topSenders: senders.rows.map(row => ({ sender: row.sender, count: Number(row.count) })),
+  };
 }
 
 export async function resolveDispatchRecipient(recipient: string): Promise<

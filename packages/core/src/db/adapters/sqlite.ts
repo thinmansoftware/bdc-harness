@@ -234,6 +234,17 @@ export class SqliteAdapter implements IDatabase {
         'CREATE INDEX IF NOT EXISTS idx_agent_dispatch_messages_subject_history ON agent_dispatch_messages(subject_key, created_at DESC, id DESC) WHERE subject_key IS NOT NULL'
       );
     }
+    // WO-HARNESS-OPERATOR-INBOX-BACKPRESSURE-01 (migration 046 parity): bounded
+    // operator-drain read index. Guarded on the new columns existing so a
+    // pre-migration table does not throw on the partial-index predicate.
+    if (
+      dispatchColumns.some(column => column.name === 'inbox_watermark_at') &&
+      dispatchColumns.some(column => column.name === 'retired_at')
+    ) {
+      this.db.run(
+        'CREATE INDEX IF NOT EXISTS idx_agent_dispatch_messages_operator_backlog ON agent_dispatch_messages(recipient, status, created_at) WHERE addressed_at IS NULL AND inbox_watermark_at IS NULL AND retired_at IS NULL'
+      );
+    }
     // Taskmaster Slice 1 indexes (migration 041) -- after migrateColumns()
     // per the established pattern.
     this.db.run(
@@ -395,6 +406,10 @@ export class SqliteAdapter implements IDatabase {
           "TEXT CHECK (route_disposition IS NULL OR route_disposition IN ('unroutable', 'superseded'))",
         ],
         ['supersedes_id', 'TEXT REFERENCES agent_dispatch_messages(id)'],
+        // WO-HARNESS-OPERATOR-INBOX-BACKPRESSURE-01: additive nullable timestamps
+        // for bounded-drain watermarking + retention retirement.
+        ['inbox_watermark_at', 'TEXT'],
+        ['retired_at', 'TEXT'],
       ];
       const boardDispatchCols = this.db
         .prepare("PRAGMA table_info('agent_dispatch_messages')")
@@ -480,7 +495,11 @@ export class SqliteAdapter implements IDatabase {
         -- SQLite seed in sync with 000_combined.sql -- this INSERT block is a
         -- hand-maintained mirror, not derived from the migration files.
         ('overseer-reviewer', 'Overseer PR Reviewer', 'worker_poll', 1),
-        ('overseer-review-route', 'Overseer Review Route', 'notify_only', 1)
+        ('overseer-review-route', 'Overseer Review Route', 'notify_only', 1),
+        -- WO-HARNESS-OPERATOR-INBOX-BACKPRESSURE-01 (migration 046 parity): audit
+        -- home for routine review-route receipts so they stop reaching
+        -- recipient='operator'. Hand-maintained mirror of the migration files.
+        ('review-receipts-log', 'Review Receipts Log', 'notify_only', 1)
       ON CONFLICT (principal_id) DO NOTHING
     `);
     this.db.run(`
@@ -832,7 +851,12 @@ export class SqliteAdapter implements IDatabase {
         subject_key TEXT,
         repeat_reason TEXT,
         route_disposition TEXT CHECK (route_disposition IS NULL OR route_disposition IN ('unroutable', 'superseded')),
-        supersedes_id TEXT REFERENCES agent_dispatch_messages(id)
+        supersedes_id TEXT REFERENCES agent_dispatch_messages(id),
+        -- WO-HARNESS-OPERATOR-INBOX-BACKPRESSURE-01: bounded-drain watermark +
+        -- retention retirement. retired_at IS NOT NULL is terminal + non-draining
+        -- while status stays 'queued' (distinct from 'cancelled').
+        inbox_watermark_at TEXT,
+        retired_at TEXT
       );
 
       CREATE TABLE IF NOT EXISTS dispatch_principals (

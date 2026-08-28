@@ -9,12 +9,17 @@
 import { describe, expect, test } from 'bun:test';
 import {
   createRealSubmitDeps,
+  ingestReceiptGovernanceClassification,
+  submitReceiptGovernanceClassification,
+  REVIEW_RECEIPTS_LOG,
   REVIEW_REVIEWER_IDENTITY_ENV,
   REVIEW_WEBHOOK_SECRET_ENV,
   parseReviewWorkBody,
   resolveReviewRouteConfig,
   reviewSubjectKey,
 } from '../pr-review-wiring.ts';
+import type { IngestDisposition } from '../pr-review-ingest.ts';
+import type { SubmitDisposition } from '../pr-review-submit.ts';
 import type { RealGitHubOctokitLike } from '../adapters/github-real-deps.ts';
 import type { PrReviewResult } from '../pr-review-evaluator.ts';
 
@@ -223,5 +228,56 @@ describe('parseReviewWorkBody', () => {
     const parsed = parseReviewWorkBody(JSON.stringify(minimal));
     expect(parsed?.baseRef).toBe('');
     expect(parsed?.author).toBe('');
+  });
+});
+
+// WO-HARNESS-OPERATOR-INBOX-BACKPRESSURE-01, Section 11 scenario 9: the receipt
+// governance predicate. Routine outcomes are information-only (audit log);
+// genuine decisions/blockers are operator-actionable (human inbox). Both sides,
+// same test. The switches are exhaustive-by-construction, so every disposition
+// value is asserted here -- a new one would fail to compile in the source.
+describe('receipt governance classification', () => {
+  test('ingest: routine dispositions are information-only', () => {
+    const informational: IngestDisposition[] = [
+      'queued',
+      'duplicate_delivery',
+      'superseded_head',
+      'ignored_event',
+      'ignored_draft',
+    ];
+    for (const d of informational) {
+      expect(ingestReceiptGovernanceClassification(d)).toBe('information-only');
+    }
+  });
+
+  test('ingest: refusals a human must resolve are operator_decision_required', () => {
+    const actionable: IngestDisposition[] = ['blocked', 'custody_conflict', 'rejected_signature'];
+    for (const d of actionable) {
+      expect(ingestReceiptGovernanceClassification(d)).toBe('operator_decision_required');
+    }
+  });
+
+  test('submit: routine outcomes are information-only', () => {
+    const informational: SubmitDisposition[] = ['approved', 'changes_requested', 'stale_head'];
+    for (const d of informational) {
+      expect(submitReceiptGovernanceClassification(d)).toBe('information-only');
+    }
+  });
+
+  test('submit: custody/reviewer/submission failures are operator_decision_required', () => {
+    const actionable: SubmitDisposition[] = [
+      'custody_conflict',
+      'merge_custody_conflict',
+      'reviewer_failed',
+      'submission_failed',
+    ];
+    for (const d of actionable) {
+      expect(submitReceiptGovernanceClassification(d)).toBe('operator_decision_required');
+    }
+  });
+
+  test('the receipts-log principal is a distinct, non-operator audit home', () => {
+    expect(REVIEW_RECEIPTS_LOG).toBe('review-receipts-log');
+    expect(REVIEW_RECEIPTS_LOG).not.toBe('operator');
   });
 });

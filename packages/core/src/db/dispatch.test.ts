@@ -23,9 +23,13 @@ import {
   evaluateWorkerStaleness,
   ensureXoEscalationHandoffs,
   getMessage,
+  getOperatorInboxBacklogStatus,
   heartbeatWorker,
   listEligibleXoEscalations,
   listMessages,
+  listUnwatermarkedOperatorInboxMessages,
+  markOperatorInboxWatermark,
+  retireStaleOperatorInboxMessages,
   listUnroutableQueuedMessages,
   listWorkers,
   postResult,
@@ -1649,5 +1653,119 @@ describe('normalizeDispatchSubjectKey', () => {
     expect(() => normalizeDispatchSubjectKey('random:thing')).toThrow(
       'dispatch_subject_key_invalid:shape'
     );
+  });
+});
+
+// WO-HARNESS-OPERATOR-INBOX-BACKPRESSURE-01: read-side backpressure DAL against
+// a REAL SqliteAdapter -- bounded read, watermark, retention retirement, and
+// backlog status. Same adapter class production uses; no mocking of the DAL.
+describe('operator-inbox backpressure DAL', () => {
+  let bpDbPath = '';
+
+  beforeEach(() => {
+    bpDbPath = join(
+      import.meta.dir,
+      `.test-inbox-bp-${Date.now()}-${Math.random().toString(36).slice(2)}.db`
+    );
+    db = new SqliteAdapter(bpDbPath);
+  });
+
+  afterEach(async () => {
+    await db.close();
+    cleanupDb(bpDbPath);
+  });
+
+  async function seedOperator(id: string, sender = 'overseer'): Promise<string> {
+    const message = await createMessage({
+      correlation_id: `corr-${id}`,
+      idempotency_key: `idem-${id}`,
+      task_type: 'run_report',
+      sender,
+      recipient: 'operator',
+      body: `body-${id}`,
+    });
+    return message.id;
+  }
+
+  async function backdateCreatedAt(id: string, iso: string): Promise<void> {
+    await db.query('UPDATE agent_dispatch_messages SET created_at = $1 WHERE id = $2', [iso, id]);
+  }
+
+  test('listUnwatermarkedOperatorInboxMessages is bounded and oldest-first', async () => {
+    const older = await seedOperator('older');
+    await backdateCreatedAt(older, '2026-07-01T00:00:00.000Z');
+    const newer = await seedOperator('newer');
+    await backdateCreatedAt(newer, '2026-08-01T00:00:00.000Z');
+    const newest = await seedOperator('newest');
+    await backdateCreatedAt(newest, '2026-08-20T00:00:00.000Z');
+
+    const bounded = await listUnwatermarkedOperatorInboxMessages(2);
+    expect(bounded.map(m => m.id)).toEqual([older, newer]); // oldest-first, capped at 2
+
+    const all = await listUnwatermarkedOperatorInboxMessages(100);
+    expect(all.map(m => m.id)).toEqual([older, newer, newest]);
+  });
+
+  test('markOperatorInboxWatermark is idempotent and excludes the row from future reads', async () => {
+    const id = await seedOperator('wm-1');
+    expect(await markOperatorInboxWatermark(id)).toBe(true);
+    // Idempotent: a repeat call does not re-write and reports no-op.
+    expect(await markOperatorInboxWatermark(id)).toBe(false);
+
+    const remaining = await listUnwatermarkedOperatorInboxMessages(100);
+    expect(remaining.map(m => m.id)).not.toContain(id);
+
+    // Watermark does NOT change status or terminal state -- the row is intact.
+    const row = await getMessage(id);
+    expect(row?.status).toBe('queued');
+    expect(row?.inbox_watermark_at).not.toBeNull();
+    expect(row?.retired_at).toBeNull();
+  });
+
+  test('retireStaleOperatorInboxMessages preserves the row, is non-cancelled, and stops draining it', async () => {
+    const stale = await seedOperator('stale');
+    await backdateCreatedAt(stale, '2026-06-01T00:00:00.000Z'); // well past any window
+    const fresh = await seedOperator('fresh'); // created just now
+
+    const retentionMs = 24 * 60 * 60 * 1000; // 1 day
+    const retired = await retireStaleOperatorInboxMessages(retentionMs, 100);
+    expect(retired).toEqual([stale]); // only the aged row
+
+    const row = await getMessage(stale);
+    expect(row).not.toBeNull(); // NOT deleted -- row + history preserved
+    expect(row?.status).toBe('queued'); // NOT reused as 'cancelled'
+    expect(row?.status).not.toBe('cancelled');
+    expect(row?.retired_at).not.toBeNull(); // terminal, non-draining marker
+
+    // Retired row no longer appears in drain reads; the fresh one still does.
+    const drainable = await listUnwatermarkedOperatorInboxMessages(100);
+    expect(drainable.map(m => m.id)).toEqual([fresh]);
+
+    // Monotonic: a second sweep retires nothing new.
+    expect(await retireStaleOperatorInboxMessages(retentionMs, 100)).toEqual([]);
+  });
+
+  test('getOperatorInboxBacklogStatus reports count, oldest, and top senders', async () => {
+    const a1 = await seedOperator('a1', 'overseer');
+    await backdateCreatedAt(a1, '2026-07-10T00:00:00.000Z');
+    await seedOperator('a2', 'overseer');
+    await seedOperator('a3', 'overseer');
+    await seedOperator('b1', 'taskmaster');
+
+    const status = await getOperatorInboxBacklogStatus();
+    expect(status.count).toBe(4);
+    expect(status.oldestCreatedAt).toBe('2026-07-10T00:00:00.000Z');
+    expect(status.topSenders[0]).toEqual({ sender: 'overseer', count: 3 });
+    expect(status.topSenders.find(s => s.sender === 'taskmaster')?.count).toBe(1);
+
+    // Retired + watermarked rows drop out of the backlog count.
+    await markOperatorInboxWatermark(a1); // watermarked rows are still backlog...
+    const afterWatermark = await getOperatorInboxBacklogStatus();
+    expect(afterWatermark.count).toBe(4); // ...watermark alone does not reduce backlog
+
+    await backdateCreatedAt(a1, '2026-01-01T00:00:00.000Z');
+    await retireStaleOperatorInboxMessages(24 * 60 * 60 * 1000, 100);
+    const afterRetire = await getOperatorInboxBacklogStatus();
+    expect(afterRetire.count).toBe(3); // retiring the aged row reduces the backlog
   });
 });

@@ -23,6 +23,7 @@
     "./escalation-delivery": "./src/escalation-delivery.ts",
     "./adapters/fake-github": "./src/adapters/fake-github.ts",
     "./adapters/github-qualified-merge": "./src/adapters/github-qualified-merge.ts",
+    "./adapters/github-rate-limit-classifier": "./src/adapters/github-rate-limit-classifier.ts",
     "./integration-manifest": "./src/integration-manifest.ts",
     "./independent-review-evidence": "./src/independent-review-evidence.ts",
     "./external-finalization": "./src/external-finalization.ts",
