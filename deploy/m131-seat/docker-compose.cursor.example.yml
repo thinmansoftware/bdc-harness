@@ -1,0 +1,44 @@
+# M-131 cursor seat compose example (WO-HARNESS-CURSOR-BUILD-SEAT-01).
+#
+# DELIBERATE DEVIATION from the codex/claude seat compose files: this seat is
+# NOT given the Archon operator token. M-129 Phase 1.5 binds the cursor seat
+# out of operator-token possession, so there is no operator_token_env,
+# operator_token_file, or token bind-mount here. Do not "restore" them for
+# symmetry with the other seats.
+#
+# The Cursor credential is delivered by the M-1327 read-only secret-ingress
+# mount. The key itself lives in AWS Secrets Manager (bdc/cursor-api-key,
+# KMS-encrypted) and on the host env file; it is NEVER baked into the image
+# and NEVER committed (Rule 6).
+services:
+  bdc-seat-cursor:
+    build:
+      context: ../..
+      dockerfile: deploy/m131-seat/Dockerfile
+      args:
+        BUILD_SHA: "${BUILD_SHA:?BUILD_SHA is required - pass the exact commit SHA}"
+    image: bdc-seat-cursor:${BUILD_SHA:?BUILD_SHA is required - pass the exact commit SHA}
+    container_name: bdc-seat-cursor
+    user: "10001:10001"
+    restart: unless-stopped
+    environment:
+      SEAT_BUILD_SHA: "${BUILD_SHA:?BUILD_SHA is required - pass the exact commit SHA}"
+      # Headless cursor-agent reads its credential from this env var.
+      CURSOR_API_KEY: "${CURSOR_API_KEY:?CURSOR_API_KEY is required - see AWS Secrets Manager bdc/cursor-api-key}"
+      # Per-day fire cap for the cursor lane. Ultra quota is large but not
+      # unmetered; the seat refuses further fires once this is reached.
+      CURSOR_SEAT_DAILY_FIRE_CAP: "${CURSOR_SEAT_DAILY_FIRE_CAP:-10}"
+    volumes:
+      - ./config.seat.cursor.example.json:/app/config/seat.json:ro
+      - ${M131_CURSOR_SECRET_INGRESS:-./placeholder/cursor-credential.json}:/run/m131/secret-ingress/cursor-credential.json:ro
+      - m131-cursor-vendor-profile:/home/seat/.cursor
+      - m131-cursor-state:/var/lib/bdc-seat
+    healthcheck:
+      test: ["CMD", "bun", "run", "scripts/dispatch-worker/seat-preflight.ts", "--config", "/app/config/seat.json"]
+      interval: 60s
+      timeout: 15s
+      retries: 3
+
+volumes:
+  m131-cursor-vendor-profile:
+  m131-cursor-state:

@@ -62,6 +62,14 @@ export interface FusionReviewRequest {
   ci?: boolean;
 }
 
+/**
+ * Grok model id as exposed by Cursor. Verified live 2026-08-26 against
+ * `cursor-agent --list-models` on the target host. Overridable by env because
+ * Cursor's roster moves (Grok 4.3 -> 4.5 -> 4.6 inside two months); a moved id
+ * must be a config change, not a code change.
+ */
+export const CURSOR_GROK_MODEL = process.env.CURSOR_GROK_MODEL ?? 'cursor-grok-4.6-high-fast';
+
 export const defaultAgentConfigs: Record<string, AgentConfig> = {
   claude: {
     command: 'claude',
@@ -90,6 +98,58 @@ export const defaultAgentConfigs: Record<string, AgentConfig> = {
   cursor: {
     command: 'cursor-agent',
     args: ['--print', '--mode', 'ask', '--trust'],
+  },
+  /**
+   * WO-HARNESS-CURSOR-BUILD-SEAT-01: build-capable cursor leg for the M-131
+   * cursor seat. Distinct from the read-only `cursor` entry above, which
+   * passes `--mode ask` and therefore CANNOT write files -- correct for a
+   * judge/Q&A call, useless for a build seat.
+   *
+   * Flags verified live against cursor-agent 2026.08.11-e8db854 on the target
+   * host (`cursor-agent --help`, 2026-08-26):
+   *  - `--print` is the non-interactive mode and per its own help text "Has
+   *    access to all tools, including write and shell". No `--mode` is passed:
+   *    the only two choices are `plan` and `ask` and BOTH are read-only.
+   *  - `--force` is required for the agent to run commands without prompting.
+   *  - `--trust` suppresses the Workspace Trust prompt. Without it the CLI
+   *    prints the trust notice and exits 0 with EMPTY output -- a silent
+   *    no-op that reads as success. Verified live: the seat MUST also treat
+   *    empty output as failure (see cursorBuildResultIsEmpty).
+   */
+  'cursor-build': {
+    command: 'cursor-agent',
+    args: ['--print', '--force', '--trust'],
+  },
+  /**
+   * WO-HARNESS-CURSOR-BUILD-SEAT-01 (transport half): reach the GROK seat
+   * container-side THROUGH cursor-agent.
+   *
+   * Why this exists (rationale corrected 2026-08-27): originally built as an
+   * outage workaround when the xAI API was defunded (2026-08-26), which made
+   * Cursor the only container-side path to the grok seat. John confirmed
+   * 2026-08-27 that Grok usage is BACK, so that premise no longer holds.
+   *
+   * What it is now: a funded ALTERNATIVE route to the grok seat -- it runs on
+   * the Cursor Ultra subscription rather than xAI credits (cost lever), and it
+   * is a second path if xAI goes dark again (failover). The `grok` and
+   * `grok-acp` adapters above still cover the direct paths; all three are
+   * admitted under the grok family, so a separately-installed Grok builder
+   * slots in alongside these without changing this entry.
+   *
+   * Model id verified live 2026-08-26 via `cursor-agent --list-models` on the
+   * target host, then proven end-to-end in a scratch container:
+   *   cursor-agent -f -p --model cursor-grok-4.6-high-fast "..." -> rc 0,
+   *   non-empty response. The 2026-07-22 feasibility doc had listed the exact
+   *   Grok model-id string as UNCONFIRMED; this resolves it.
+   *
+   * Same three CLI traps as cursor-build apply (no --mode: both choices are
+   * read-only; --force to run commands; --trust or the CLI exits 0 with EMPTY
+   * output). Empty output MUST be treated as failure -- see
+   * cursorBuildResultIsEmpty in seat-preflight.ts.
+   */
+  'grok-via-cursor': {
+    command: 'cursor-agent',
+    args: ['--print', '--force', '--trust', '--model', CURSOR_GROK_MODEL],
   },
   fusion: {
     kind: 'fusion',

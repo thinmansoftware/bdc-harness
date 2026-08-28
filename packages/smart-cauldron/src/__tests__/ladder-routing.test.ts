@@ -18,15 +18,27 @@ import { runCascade } from '../cascade.js';
 import type { CascadeDeps } from '../cascade.js';
 
 describe('live ladder SOR', () => {
-  test('canonical ladder name order is zero -> qwen -> codex -> claude -> frontier', () => {
+  // 'cursor' inserted below codex by WO-HARNESS-CURSOR-BUILD-SEAT-01. It ships
+  // in refusedTiers (see below), so it is present in the ladder but dark --
+  // live cascade behavior is unchanged.
+  test('canonical ladder name order is zero -> qwen -> cursor -> codex -> claude -> frontier', () => {
     const names = loadLadder().map(t => t.name);
-    expect(names).toEqual(['zero', 'qwen', 'codex', 'claude', 'frontier']);
+    expect(names).toEqual(['zero', 'qwen', 'cursor', 'codex', 'claude', 'frontier']);
   });
 
   test('refusedTiers includes glm (dark lane)', () => {
     const refused = loadRefusedTiers();
     expect(Array.isArray(refused)).toBe(true);
     expect(refused).toContain('glm');
+  });
+
+  // The entry floor is what actually governs live routing, and it must NOT
+  // move because a dark tier was inserted ahead of codex in the ordering.
+  test('cursor ships dark, so the first non-refused tier is still codex', () => {
+    const refused = loadRefusedTiers();
+    expect(refused).toContain('cursor');
+    const firstLive = loadLadder().find(t => !refused.includes(t.name));
+    expect(firstLive?.name).toBe('codex');
   });
 });
 
