@@ -127,26 +127,53 @@ describe('custody conflict', () => {
   });
 });
 
-describe('merge-custody conflict (M-153, tabled)', () => {
+describe('merge-custody conflict (M-153, RULED 2026-08-24)', () => {
   const MODE_ENV = 'OVERSEER_MERGE_MANAGER_MODE';
+  const MERGE_TOKEN_ENV = 'MERGE_MANAGER_GH_TOKEN';
   let priorMode: string | undefined;
+  let priorToken: string | undefined;
 
   beforeEach(() => {
     priorMode = process.env[MODE_ENV];
+    priorToken = process.env[MERGE_TOKEN_ENV];
+    // Default to the single-identity condition so each test states its own.
+    delete process.env[MERGE_TOKEN_ENV];
   });
 
   afterEach(() => {
     if (priorMode === undefined) delete process.env[MODE_ENV];
     else process.env[MODE_ENV] = priorMode;
+    if (priorToken === undefined) delete process.env[MERGE_TOKEN_ENV];
+    else process.env[MERGE_TOKEN_ENV] = priorToken;
   });
 
-  test('refuses to submit while the merge manager is armed to execute', async () => {
+  test('refuses to submit when the armed merge manager shares this identity', async () => {
     process.env[MODE_ENV] = 'execute';
+    delete process.env[MERGE_TOKEN_ENV];
     const { deps, rec } = makeDeps();
     const outcome = await runAndSubmitReview(WORK, deps);
     expect(outcome.disposition).toBe('merge_custody_conflict');
+    expect(outcome.reason).toBe('merge_manager_shares_reviewer_identity_m153');
     expect(rec.submitted).toHaveLength(0);
     expect(rec.receipts[0]?.disposition).toBe('merge_custody_conflict');
+  });
+
+  // THE DEADLOCK REGRESSION. Production ran mode=execute with a distinct merge
+  // PAT configured; the old mode-only gate still refused every review, so no
+  // approval was ever posted and the merge manager denied every PR for
+  // `review_gate_approval_missing_for_head`. 50 review work items failed with
+  // `merge_manager_mode_execute_review_blocked_pending_m153` and the machine
+  // merged nothing. This test fails on the pre-fix gate.
+  test('submits an APPROVE at the exact head when merge runs as a distinct identity', async () => {
+    process.env[MODE_ENV] = 'execute';
+    process.env[MERGE_TOKEN_ENV] = 'ghp_distinct_merge_identity';
+    const { deps, rec } = makeDeps();
+    const outcome = await runAndSubmitReview(WORK, deps);
+    expect(outcome.disposition).toBe('approved');
+    expect(rec.submitted).toHaveLength(1);
+    expect(rec.submitted[0]?.event).toBe('APPROVE');
+    // Head-SHA pinning is what makes the approval satisfy the merge gate.
+    expect(rec.submitted[0]?.commitId).toBe(HEAD);
   });
 
   test('proceeds normally when the merge manager is parked in hold-canary', async () => {

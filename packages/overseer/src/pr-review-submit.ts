@@ -21,6 +21,7 @@ import type {
   SubmitPullRequestReviewInput,
   SubmitPullRequestReviewResult,
 } from './adapters/github-real-deps.ts';
+import { hasDistinctMergeIdentity } from './adapters/github-real-deps';
 import { resolveMergeManagerMode } from './merge-manager';
 
 /** What the governed reviewer returns. */
@@ -118,21 +119,29 @@ export async function runAndSubmitReview(
     });
   }
 
-  // MERGE-CUSTODY: this reviewer identity and the Overseer merge manager are
-  // the SAME GitHub App (thinman-overseer[bot]) -- M-153 (tabled, 2026-08-17)
-  // flagged that one identity holding both review and merge authority over
-  // the same PR would let it approve and then merge its own approval with no
-  // second party in the loop. Until the board rules on which separation
-  // model applies (M-153 Options A-D), this refuses to submit a review while
-  // the merge manager is armed to actually write to GitHub (`execute` mode).
-  // FAILS CLOSED: any mode other than the two known-safe modes blocks review
-  // submission rather than assuming safety. hold-canary and comment_findings
-  // perform zero GitHub writes, so review-then-merge cannot occur under them.
+  // MERGE-CUSTODY (M-153, RULED by John 2026-08-24: "the Review Gate reviews;
+  // the Merge Manager merges" -- one identity never does both on the same PR).
+  //
+  // The question this gate answers is IDENTITY SEPARATION, not merge mode. A
+  // review is safe to submit whenever the merge mutation will run as a
+  // DIFFERENT GitHub identity than this reviewer, because then approving here
+  // cannot let the same actor execute its own approval.
+  //
+  // Before the ruling this gate blocked on `mode === 'execute'` as a
+  // conservative stand-in while M-153 was tabled. That stand-in outlived the
+  // question: with the merge manager armed (the only mode that ever merges)
+  // no review could be submitted, so no approval ever existed, so the merge
+  // manager denied every PR for `review_gate_approval_missing_for_head`. The
+  // two halves deadlocked and the machine merged nothing.
+  //
+  // STILL FAILS CLOSED: when no distinct merge identity is configured, the
+  // merge octokit falls back to this same App, so review submission is
+  // refused exactly as before.
   const mergeMode = resolveMergeManagerMode();
-  if (mergeMode === 'execute') {
+  if (mergeMode === 'execute' && !hasDistinctMergeIdentity()) {
     return finish(deps, work, work.headSha, {
       disposition: 'merge_custody_conflict',
-      reason: `merge_manager_mode_${mergeMode}_review_blocked_pending_m153`,
+      reason: 'merge_manager_shares_reviewer_identity_m153',
     });
   }
 
