@@ -1,4 +1,6 @@
-import { describe, expect, test } from 'bun:test';
+import { afterEach, describe, expect, mock, spyOn, test } from 'bun:test';
+import * as dispatchDb from '@archon/core/db/dispatch';
+import * as overseerDb from '@archon/core/db/overseer';
 import { handleRecordJudgeFirst } from '../judge-first-pipeline';
 import type { JudgeOutcome } from '../judge-first';
 import type { OverseerWorkflowEvent, WatchedRunRecord } from '../types';
@@ -87,6 +89,10 @@ function harness(attempts: number, reason: string, verdict = 'needs_human') {
 }
 
 describe('judge-first remediation handoff', () => {
+  afterEach(() => {
+    mock.restore();
+  });
+
   test('emits one complete candidate for a fixable review', async () => {
     const h = harness(0, '[high] migration-ordering: update child rows before parent');
     await handleRecordJudgeFirst(record(), h.deps, h.options);
@@ -123,5 +129,26 @@ describe('judge-first remediation handoff', () => {
     await handleRecordJudgeFirst(record('head-1', false), noPr.deps, noPr.options);
     expect(noPr.emitted).toHaveLength(0);
     expect(noPr.actions.at(-1)?.action).toBe('escalate_with_evidence');
+  });
+
+  test('production defaults read persisted attempts and dispatch the candidate', async () => {
+    const h = harness(0, '[high] test: fix regression');
+    const countAttempts = spyOn(overseerDb, 'countRemediationAttemptsForPr').mockResolvedValue(1);
+    const createMessage = spyOn(dispatchDb, 'createMessage').mockResolvedValue({ id: 'message-1' } as never);
+    const { remediation: _injectedRemediation, ...productionOptions } = h.options;
+
+    await handleRecordJudgeFirst(record('head-default'), h.deps, productionOptions);
+
+    expect(countAttempts).toHaveBeenCalledWith('gh:thinmansoftware/bdc-harness#650');
+    expect(createMessage).toHaveBeenCalledTimes(1);
+    expect(createMessage.mock.calls[0]?.[0]).toMatchObject({
+      recipient: 'taskmaster',
+      subject_key: 'gh:thinmansoftware/bdc-harness#650',
+    });
+    expect(JSON.parse(String(createMessage.mock.calls[0]?.[0].body))).toMatchObject({
+      headSha: 'head-default',
+      attempt: 2,
+    });
+    expect(h.actions.some(a => a.action === 'remediation_candidate_emitted')).toBe(true);
   });
 });

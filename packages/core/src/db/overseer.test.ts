@@ -125,9 +125,12 @@ describe('overseer db', () => {
   test('counts persisted remediation attempts per PR only', async () => {
     await seedRun('run-remediation-a');
     await seedRun('run-remediation-b');
+    await seedRun('run-remediation-c');
     for (const [runId, prRef] of [
-      ['run-remediation-a', 'gh:thinmansoftware/bdc-harness#650'],
-      ['run-remediation-b', 'gh:thinmansoftware/bdc-harness#651'],
+      ['run-remediation-a', 'gh:thinmansoftware/bdc_harness#650'],
+      ['run-remediation-a', 'gh:thinmansoftware/bdc_harness#650'],
+      ['run-remediation-b', 'gh:thinmansoftware/bdcXharness#650'],
+      ['run-remediation-c', 'gh:thinmansoftware/bdc%harness#650'],
     ]) {
       await insertOverseerAction({
         runId,
@@ -137,7 +140,9 @@ describe('overseer db', () => {
         result: `pr_ref:${prRef};head_sha:abc;attempt:1`,
       });
     }
-    expect(await countRemediationAttemptsForPr('gh:thinmansoftware/bdc-harness#650')).toBe(1);
+    expect(await countRemediationAttemptsForPr('gh:thinmansoftware/bdc_harness#650')).toBe(2);
+    expect(await countRemediationAttemptsForPr('gh:thinmansoftware/bdcXharness#650')).toBe(1);
+    expect(await countRemediationAttemptsForPr('gh:thinmansoftware/bdc%harness#650')).toBe(1);
     expect(await countRemediationAttemptsForPr('gh:thinmansoftware/bdc-harness#999')).toBe(0);
   });
 
