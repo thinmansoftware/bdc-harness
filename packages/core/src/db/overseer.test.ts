@@ -12,6 +12,7 @@ mock.module('./connection', () => ({
 
 import {
   claimOverseerVerdict,
+  countRemediationAttemptsForPr,
   countRunsPendingOverseerJudgment,
   finalizeOverseerVerdict,
   getOverseerActionsForRun,
@@ -119,6 +120,25 @@ describe('overseer db', () => {
       result: JSON.stringify({ mutation_sent: true, merged_sha: 'deadbeef' }),
     });
     expect(await listRunsForOverseerWatch()).toHaveLength(0);
+  });
+
+  test('counts persisted remediation attempts per PR only', async () => {
+    await seedRun('run-remediation-a');
+    await seedRun('run-remediation-b');
+    for (const [runId, prRef] of [
+      ['run-remediation-a', 'gh:thinmansoftware/bdc-harness#650'],
+      ['run-remediation-b', 'gh:thinmansoftware/bdc-harness#651'],
+    ]) {
+      await insertOverseerAction({
+        runId,
+        woId: 'WO-TEST-OVERSEER-01',
+        class: 'none',
+        action: 'remediation_candidate_emitted',
+        result: `pr_ref:${prRef};head_sha:abc;attempt:1`,
+      });
+    }
+    expect(await countRemediationAttemptsForPr('gh:thinmansoftware/bdc-harness#650')).toBe(1);
+    expect(await countRemediationAttemptsForPr('gh:thinmansoftware/bdc-harness#999')).toBe(0);
   });
 
   test('watch_closed is terminal; provisional merge_denied is not (window drain, 5th canary defect)', async () => {

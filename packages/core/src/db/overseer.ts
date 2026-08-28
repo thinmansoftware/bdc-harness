@@ -287,6 +287,17 @@ export async function insertOverseerAction(record: {
   return row;
 }
 
+export async function countRemediationAttemptsForPr(prRef: string): Promise<number> {
+  const result = await getDatabase().query<{ attempt_count: number | string }>(
+    `SELECT COUNT(*) AS attempt_count
+     FROM overseer_actions
+     WHERE action = 'remediation_candidate_emitted'
+       AND result LIKE $1`,
+    [`pr_ref:${prRef};%`]
+  );
+  return Number(result.rows[0]?.attempt_count ?? 0);
+}
+
 export async function getOverseerActionsForRun(runId: string): Promise<OverseerAction[]> {
   const result = await getDatabase().query<OverseerAction>(
     'SELECT * FROM overseer_actions WHERE run_id = $1 ORDER BY created_at ASC',

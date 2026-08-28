@@ -480,7 +480,10 @@ export class SqliteAdapter implements IDatabase {
         -- SQLite seed in sync with 000_combined.sql -- this INSERT block is a
         -- hand-maintained mirror, not derived from the migration files.
         ('overseer-reviewer', 'Overseer PR Reviewer', 'worker_poll', 1),
-        ('overseer-review-route', 'Overseer Review Route', 'notify_only', 1)
+        ('overseer-review-route', 'Overseer Review Route', 'notify_only', 1),
+        -- WO-HARNESS-OVERSEER-VERDICT-TO-TASKMASTER-REMEDIATION-01
+        -- (migration 046 parity): mailbox registration only; consumer deferred.
+        ('taskmaster', 'Taskmaster', 'drain_on_start', 1)
       ON CONFLICT (principal_id) DO NOTHING
     `);
     this.db.run(`
