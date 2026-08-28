@@ -24,6 +24,20 @@ const evidence: GrokJudgeEvidence = {
 };
 
 const ignoreOutcome = async (): Promise<never> => ({}) as never;
+const originalStdoutWrite = process.stdout.write.bind(process.stdout);
+
+function captureStdout(): string[] {
+  const chunks: string[] = [];
+  process.stdout.write = ((chunk: string | Uint8Array): boolean => {
+    chunks.push(typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf8'));
+    return true;
+  }) as typeof process.stdout.write;
+  return chunks;
+}
+
+afterEach(() => {
+  process.stdout.write = originalStdoutWrite;
+});
 
 describe('grok second-opinion judge', () => {
   test('parses VERDICT: APPROVE as approve', async () => {
@@ -107,6 +121,48 @@ describe('grok second-opinion judge', () => {
     expect(call[0]).toBe((process.env.OVERSEER_JUDGE_LADDER ?? 'grok').split(',')[0]);
     expect(call[1]).toMatchObject({ exitCode: 1, timedOut: false });
     expect(call[2]).toBe('judge-second-opinion');
+  });
+
+  test('logs a health-write failure with serialized error details without crashing', async () => {
+    const output = captureStdout();
+    await expect(
+      judgeWithGrok(evidence, {
+        spawn: async () => ({ exitCode: 0, stdout: 'VERDICT: APPROVE\n', timedOut: false }),
+        recordOutcome: async () => {
+          throw new Error('health write failed');
+        },
+      })
+    ).resolves.toMatchObject({ disposition: 'approve' });
+    await Bun.sleep(10);
+
+    const entry = output
+      .flatMap(chunk => chunk.trim().split('\n'))
+      .map(line => JSON.parse(line) as Record<string, unknown>)
+      .find(line => line.msg === 'overseer.judge_second_opinion.resource_health_record_failed');
+    expect(entry?.level).toBe(50);
+    expect(entry?.err).toMatchObject({ message: 'health write failed' });
+    expect((entry?.err as { stack?: string } | undefined)?.stack).toContain('health write failed');
+  });
+
+  test('logs a spawn failure with serialized error details without crashing', async () => {
+    const output = captureStdout();
+    await expect(
+      judgeWithGrok(evidence, {
+        spawn: async () => {
+          throw new Error('spawn failed');
+        },
+        recordOutcome: ignoreOutcome,
+      })
+    ).resolves.toMatchObject({ disposition: 'hold', reason: 'judge_error' });
+    await Bun.sleep(10);
+
+    const entry = output
+      .flatMap(chunk => chunk.trim().split('\n'))
+      .map(line => JSON.parse(line) as Record<string, unknown>)
+      .find(line => line.msg === 'overseer.judge_second_opinion.spawn_failed');
+    expect(entry?.level).toBe(50);
+    expect(entry?.err).toMatchObject({ message: 'spawn failed' });
+    expect((entry?.err as { stack?: string } | undefined)?.stack).toContain('spawn failed');
   });
 
   test('prompt uses the actual WO and exact-head evidence instead of a hardcoded WO', async () => {

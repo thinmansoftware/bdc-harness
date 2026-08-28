@@ -7,7 +7,7 @@
  * stricter-of-two tier law, and permit-free Tier 0 escalation.
  */
 
-import { describe, expect, test } from 'bun:test';
+import { afterEach, describe, expect, test } from 'bun:test';
 import {
   buildEvidenceEnvelope,
   buildJudgePrompt,
@@ -29,6 +29,21 @@ import type {
   OverseerWorkflowEvent,
   WatchedRunRecord,
 } from '../types.ts';
+
+const originalStdoutWrite = process.stdout.write.bind(process.stdout);
+
+afterEach(() => {
+  process.stdout.write = originalStdoutWrite;
+});
+
+function captureStdout(): string[] {
+  const chunks: string[] = [];
+  process.stdout.write = ((chunk: string | Uint8Array): boolean => {
+    chunks.push(typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf8'));
+    return true;
+  }) as typeof process.stdout.write;
+  return chunks;
+}
 
 function makeRecord(overrides: Partial<WatchedRunRecord> = {}): WatchedRunRecord {
   return {
@@ -292,6 +307,33 @@ describe('judgeTerminalRun: model ladder + fail-loud health', () => {
     });
     expect(outcome.kind).toBe('judge_unavailable');
     expect(recorded).toEqual([['missing', { exitCode: -1, timedOut: false }, 'judge-first']]);
+  });
+
+  test('logs a health-write failure with serialized error details without crashing', async () => {
+    const output = captureStdout();
+    await expect(
+      judgeTerminalRun(envelope, {
+        ladder: ['healthy-spawn'],
+        spawn: async () => ({
+          exitCode: 0,
+          stdout:
+            '{"verdict":"observe","confidence":0.7,"proposed_action":"none","proposed_tier":0,"reason":"ok"}',
+          timedOut: false,
+        }),
+        recordOutcome: async () => {
+          throw new Error('health write failed');
+        },
+      })
+    ).resolves.toMatchObject({ kind: 'verdict' });
+    await Bun.sleep(10);
+
+    const entry = output
+      .flatMap(chunk => chunk.trim().split('\n'))
+      .map(line => JSON.parse(line) as Record<string, unknown>)
+      .find(line => line.msg === 'overseer.judge_first.resource_health_record_failed');
+    expect(entry?.level).toBe(50);
+    expect(entry?.err).toMatchObject({ message: 'health write failed' });
+    expect((entry?.err as { stack?: string } | undefined)?.stack).toContain('health write failed');
   });
 });
 
