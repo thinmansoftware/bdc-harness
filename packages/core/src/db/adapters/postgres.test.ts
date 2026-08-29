@@ -635,6 +635,9 @@ describe('Phase 1.5 sender-auth migration shape', () => {
     expect(migration).toContain(
       'DROP CONSTRAINT IF EXISTS agent_dispatch_messages_idempotency_key_key'
     );
+    const executableMigration = migration.replace(/^\s*--.*$/gm, '').trim();
+    expect(executableMigration).toStartWith('BEGIN;');
+    expect(executableMigration).toEndWith('COMMIT;');
     const dispatchCreate = combined.slice(
       combined.indexOf('CREATE TABLE IF NOT EXISTS agent_dispatch_messages'),
       combined.indexOf('CREATE TABLE IF NOT EXISTS dispatch_principals')

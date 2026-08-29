@@ -50,6 +50,8 @@ const KNOWN_PRINCIPALS = [
   ['merge-manager', 'Merge Manager', 'notify_only', 0],
   ['operator', 'Operator', 'drain_on_start', 1],
   ['overseer', 'Overseer', 'notify_only', 1],
+  ['overseer-review-route', 'Overseer Review Route', 'notify_only', 1],
+  ['overseer-reviewer', 'Overseer PR Reviewer', 'worker_poll', 1],
   ['xo', 'XO', 'drain_on_start', 1],
 ] as const;
 

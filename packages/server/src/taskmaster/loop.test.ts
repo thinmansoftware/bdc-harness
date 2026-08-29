@@ -2463,7 +2463,7 @@ describe('M-155 exception push (loop)', () => {
       listThreads: async () => [thread],
       getGithubIssueEvidence: async () =>
         contentEvidence('[PROGRESS] waiting on review feedback', T0 - 3 * 3_600_000),
-      createTask: (async (data: Record<string, unknown>) => {
+      createTask: (async (_context: unknown, data: Record<string, unknown>) => {
         captured.push(data);
         world.sentMessages.push({
           idempotency_key: String(data.idempotency_key),

@@ -29,7 +29,7 @@ function depsFor(samples: TmUsageSample[], signals: string[] = []): ModelResourc
       expires_at: data.expires_at,
       evidence: data.evidence ?? null,
     }),
-    sendSignal: async data => {
+    sendSignal: async (_context, data) => {
       if (!signals.includes(data.idempotency_key)) signals.push(data.idempotency_key);
       return {} as never;
     },
@@ -125,6 +125,7 @@ describe('model resource health', () => {
 
   test('repeated failures in one degraded episode reuse the signal idempotency key', async () => {
     const signalKeys: string[] = [];
+    const signalContexts: unknown[] = [];
     const samples = [
       sample('f2', 'failure', '2026-08-27T11:02:00.000Z'),
       sample('f1', 'failure', '2026-08-27T11:01:00.000Z'),
@@ -147,8 +148,9 @@ describe('model resource health', () => {
         });
         return samples[0]!;
       },
-      sendSignal: async data => {
-        signalKeys.push(data.idempotency_key);
+      sendSignal: async (...args: unknown[]) => {
+        signalContexts.push(args[0]);
+        signalKeys.push((args[1] as Record<string, string>).idempotency_key);
         return {} as never;
       },
     };
@@ -159,6 +161,10 @@ describe('model resource health', () => {
     expect(signalKeys).toEqual([
       'model-resource-degraded:xai:f1',
       'model-resource-degraded:xai:f1',
+    ]);
+    expect(signalContexts).toEqual([
+      { kind: 'system', sender: 'taskmaster' },
+      { kind: 'system', sender: 'taskmaster' },
     ]);
   });
 });

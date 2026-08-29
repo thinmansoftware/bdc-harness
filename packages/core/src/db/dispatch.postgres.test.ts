@@ -200,6 +200,70 @@ describe('dispatch Phase 1.5 PostgreSQL integration', () => {
     );
   });
 
+  test('migration 043 rolls back the complete schema change after a late failure', async () => {
+    const rollbackSchema = `phase15_rollback_${randomUUID().replace(/-/g, '').slice(0, 12)}`;
+    await adminDb.query(`CREATE SCHEMA ${rollbackSchema}`);
+    let failingDb: PostgresAdapter | undefined;
+    let inspectDb: PostgresAdapter | undefined;
+    try {
+      const url = requireLoopbackUrl(process.env.DISPATCH_POSTGRES_PHASE15_TEST_URL);
+      failingDb = new PostgresAdapter(withSchemaSearchPath(url, rollbackSchema));
+      await failingDb.query(`
+        CREATE TABLE agent_dispatch_messages (
+          id UUID PRIMARY KEY,
+          idempotency_key TEXT NOT NULL UNIQUE
+        )
+      `);
+      const migration = readFileSync(
+        resolve(import.meta.dir, '../../../../migrations/043_agent_messaging_phase15.sql'),
+        'utf8'
+      );
+      const failingMigration = migration.replace(
+        /COMMIT;\s*$/,
+        'SELECT phase15_intentional_late_failure();\nCOMMIT;'
+      );
+      expect(failingMigration).not.toBe(migration);
+      await expect(failingDb.query(failingMigration)).rejects.toThrow();
+      await failingDb.close();
+      failingDb = undefined;
+
+      inspectDb = new PostgresAdapter(withSchemaSearchPath(url, rollbackSchema));
+      const columns = await inspectDb.query<{ column_name: string }>(
+        `SELECT column_name FROM information_schema.columns
+         WHERE table_schema = $1 AND table_name = 'agent_dispatch_messages'`,
+        [rollbackSchema]
+      );
+      expect(columns.rows.map(row => row.column_name)).not.toContain('sender_principal_id');
+      const constraints = await inspectDb.query<{ conname: string }>(
+        `SELECT c.conname
+           FROM pg_constraint c
+           JOIN pg_class t ON t.oid = c.conrelid
+           JOIN pg_namespace n ON n.oid = t.relnamespace
+          WHERE n.nspname = $1
+            AND t.relname = 'agent_dispatch_messages'
+            AND c.contype = 'u'`,
+        [rollbackSchema]
+      );
+      expect(constraints.rows.map(row => row.conname)).toContain(
+        'agent_dispatch_messages_idempotency_key_key'
+      );
+      const partialIndexes = await inspectDb.query<{ count: string }>(
+        `SELECT count(*)::text AS count FROM pg_indexes
+         WHERE schemaname = $1
+           AND indexname IN (
+             'uq_agent_dispatch_messages_sender_idempotency_authenticated',
+             'uq_agent_dispatch_messages_idempotency_legacy'
+           )`,
+        [rollbackSchema]
+      );
+      expect(partialIndexes.rows[0]?.count).toBe('0');
+    } finally {
+      await failingDb?.close();
+      await inspectDb?.close();
+      await adminDb.query(`DROP SCHEMA IF EXISTS ${rollbackSchema} CASCADE`);
+    }
+  });
+
   test('same-principal concurrent retries return one row; different principals share keys', async () => {
     const key = `race-${randomUUID()}`;
     const mk = (principal: string, sender: string, body: string) =>

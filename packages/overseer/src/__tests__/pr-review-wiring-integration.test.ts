@@ -5,13 +5,14 @@
  * Review finding (Codex, third-pass review, 2026-08-19): the unit tests for
  * pr-review-wiring.ts never exercised createRealIngestDeps against the real
  * dispatch DAL. That gap hid a real defect -- enqueueReviewWork sends to
- * recipient overseer-reviewer, but createMessage's
+ * recipient overseer-reviewer, but Dispatch recipient validation
  * assessDispatchRecipientWithQuery REJECTS any recipient absent from
- * dispatch_principals with reason missing_principal. Neither
- * overseer-reviewer (recipient) nor overseer-review-route (sender) was
+ * dispatch_principals with reason missing_principal. The recipient was not
  * seeded anywhere, so every real enqueue attempt would have failed on first
  * use. Fixed by migration 043 (+ the SQLite adapter's seed mirror, which is
- * hand-maintained and NOT derived from the migration files).
+ * hand-maintained and NOT derived from the migration files). M-129 Phase 1.5
+ * additionally binds the internal writer to the code-fixed system:overseer
+ * principal instead of accepting an unguarded sender string.
  *
  * This test proves the fix by running createRealIngestDeps against a real
  * SqliteAdapter -- the same adapter class production code uses -- with NO
@@ -22,6 +23,7 @@
 import { afterAll, afterEach, beforeEach, describe, expect, test, mock } from 'bun:test';
 import { unlinkSync } from 'fs';
 import { join } from 'path';
+import type { RealGitHubOctokitLike } from '../adapters/github-real-deps.ts';
 
 let db: import('@archon/core/db/adapters/sqlite').SqliteAdapter;
 let currentDbPath = '';
@@ -46,7 +48,7 @@ afterAll(() => {
 });
 
 const { SqliteAdapter } = await import('@archon/core/db/adapters/sqlite');
-const { createRealIngestDeps, REVIEW_RECIPIENT, REVIEW_SENDER } =
+const { createRealIngestDeps, createRealSubmitDeps, REVIEW_RECIPIENT, REVIEW_SENDER } =
   await import('../pr-review-wiring.ts');
 const { ingestPullRequestEvent } = await import('../pr-review-ingest.ts');
 const { createHmac } = await import('crypto');
@@ -65,6 +67,16 @@ function sign(payload: string, secret: string): string {
   return 'sha256=' + createHmac('sha256', secret).update(payload).digest('hex');
 }
 
+function submitOctokit(): RealGitHubOctokitLike {
+  return {
+    pulls: {
+      get: async () => ({ data: { head: { sha: 'a'.repeat(40) } } }),
+      createReview: async () => ({ data: { id: 1, state: 'APPROVED' } }),
+    },
+    checks: { listForRef: async () => ({ data: { check_runs: [] } }) },
+  } as unknown as RealGitHubOctokitLike;
+}
+
 describe('pr-review-wiring against a real SqliteAdapter', () => {
   beforeEach(() => {
     currentDbPath = join(
@@ -79,7 +91,7 @@ describe('pr-review-wiring against a real SqliteAdapter', () => {
     cleanupDb(currentDbPath);
   });
 
-  test('overseer-reviewer and overseer-review-route are seeded principals', async () => {
+  test('overseer-reviewer and the code-fixed Overseer sender are seeded principals', async () => {
     const rows = await db.query<{ principal_id: string; active: number }>(
       'SELECT principal_id, active FROM dispatch_principals WHERE principal_id IN ($1, $2)',
       [REVIEW_RECIPIENT, REVIEW_SENDER]
@@ -124,13 +136,54 @@ describe('pr-review-wiring against a real SqliteAdapter', () => {
     expect(result.disposition).toBe('queued');
     expect(result.messageId).toBeDefined();
 
-    const row = await db.query<{ recipient: string; sender: string; task_type: string }>(
-      'SELECT recipient, sender, task_type FROM agent_dispatch_messages WHERE id = $1',
+    const row = await db.query<{
+      recipient: string;
+      sender: string;
+      sender_principal_id: string | null;
+      task_type: string;
+    }>(
+      `SELECT recipient, sender, sender_principal_id, task_type
+       FROM agent_dispatch_messages WHERE id = $1`,
       [result.messageId]
     );
     expect(row.rows[0]?.recipient).toBe(REVIEW_RECIPIENT);
     expect(row.rows[0]?.sender).toBe(REVIEW_SENDER);
+    expect(row.rows[0]?.sender_principal_id).toBe('system:overseer');
     expect(row.rows[0]?.task_type).toBe('run_review');
+  });
+
+  test('a real review submission receipt binds the code-fixed Overseer system principal', async () => {
+    const deps = createRealSubmitDeps('thinman-overseer[bot]', {
+      octokit: submitOctokit(),
+    });
+
+    await deps.recordReceipt({
+      correlationId: 'submit-correlation-1',
+      messageId: 'submit-message-1',
+      owner: 'thinmansoftware',
+      repo: 'bdc-harness',
+      prNumber: 669,
+      headSha: 'b'.repeat(40),
+      disposition: 'approved',
+      event: 'APPROVE',
+    });
+
+    const row = await db.query<{
+      recipient: string;
+      sender: string;
+      sender_principal_id: string | null;
+      task_type: string;
+    }>(
+      `SELECT recipient, sender, sender_principal_id, task_type
+       FROM agent_dispatch_messages
+       WHERE idempotency_key = $1`,
+      ['pr-review-submit-receipt:submit-message-1:approved']
+    );
+    expect(row.rows).toHaveLength(1);
+    expect(row.rows[0]?.recipient).toBe('operator');
+    expect(row.rows[0]?.sender).toBe(REVIEW_SENDER);
+    expect(row.rows[0]?.sender_principal_id).toBe('system:overseer');
+    expect(row.rows[0]?.task_type).toBe('run_report');
   });
 
   test('a second delivery of the same head is a genuine no-op duplicate (DB-enforced)', async () => {
