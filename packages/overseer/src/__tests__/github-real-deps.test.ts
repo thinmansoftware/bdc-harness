@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createAppAuth } from '@octokit/auth-app';
 import {
+  resetRateLimitBackoffForTests,
   createRealApprovePullRequest,
   createRealFindPullRequest,
   resolveGitHubAppAuth,
@@ -304,6 +305,10 @@ describe('createRealApprovePullRequest', () => {
 });
 
 describe('createRealFindPullRequest rate-limit load profile', () => {
+  // Reset the module-scope backoff state between cases so a rate-limit case that
+  // never reaches a success cannot leak accumulated hit state into the next.
+  beforeEach(() => resetRateLimitBackoffForTests());
+
   test('head branch uses pulls.list without consuming the search endpoint', async () => {
     const list = mock(async () => ({
       data: [
@@ -600,4 +605,58 @@ dNull('mergeable:null retry', () => {
     },
     15000
   );
+});
+
+// WO-HARNESS-OPERATOR-INBOX-BACKPRESSURE-01, Section 11 scenario 4: the live
+// find-pull-request path now classifies SECONDARY vs PRIMARY_EXHAUSTED and logs
+// it explicitly. These assert the LOGGED classification (the structured payload
+// distinguishes them), not just that a backoff happened.
+describe('createRealFindPullRequest -- explicit rate-limit classification', () => {
+  beforeEach(() => resetRateLimitBackoffForTests());
+
+  test('the 2026-08-27 signature (403, secondary body, buckets full) logs class=secondary', async () => {
+    const octokit = octokitWithReview(async () => ({ data: { id: 1, state: 'APPROVED' } }));
+    octokit.pulls.list = mock(async () => {
+      throw Object.assign(new Error('You have exceeded a secondary rate limit'), {
+        status: 403,
+        // The trap: /rate_limit-style header reads FULL, not depleted.
+        response: { headers: { 'x-ratelimit-remaining': '4999' } },
+      });
+    });
+    const payloads: Record<string, unknown>[] = [];
+    const result = await createRealFindPullRequest(octokit, {
+      // Large clock so any leftover module-scope backoff window is already past.
+      now: () => 10_000_000,
+      logger: {
+        warn: obj => payloads.push(obj),
+        error: () => {},
+      },
+    })({ owner: 'thinmansoftware', repo: 'bdc-harness', headBranch: 'fix/secondary' });
+
+    expect(result.lookupFailed).toBe(true);
+    expect(payloads).toHaveLength(1);
+    expect(payloads[0]!.rateLimitClass).toBe('secondary');
+  });
+
+  test('REGRESSION: 403 with x-ratelimit-remaining:0 logs class=primary_exhausted', async () => {
+    const octokit = octokitWithReview(async () => ({ data: { id: 1, state: 'APPROVED' } }));
+    octokit.pulls.list = mock(async () => {
+      throw Object.assign(new Error('API rate limit exceeded for installation'), {
+        status: 403,
+        response: { headers: { 'x-ratelimit-remaining': '0' } },
+      });
+    });
+    const payloads: Record<string, unknown>[] = [];
+    const result = await createRealFindPullRequest(octokit, {
+      now: () => 20_000_000,
+      logger: {
+        warn: obj => payloads.push(obj),
+        error: () => {},
+      },
+    })({ owner: 'thinmansoftware', repo: 'bdc-harness', headBranch: 'fix/primary' });
+
+    expect(result.lookupFailed).toBe(true);
+    expect(payloads).toHaveLength(1);
+    expect(payloads[0]!.rateLimitClass).toBe('primary_exhausted');
+  });
 });

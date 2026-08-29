@@ -12,11 +12,34 @@ import type {
   PullRequestRef,
 } from '../types.ts';
 
+import {
+  advanceRateLimitBackoff,
+  classifyGitHubRateLimit,
+  createRateLimitBackoffState,
+  DEFAULT_RATE_LIMIT_BASE_MS,
+  resetRateLimitBackoff,
+} from './github-rate-limit-classifier';
+
 const log = createLogger('overseer/github-real-deps');
 
-const RATE_LIMIT_BACKOFF_MS = 60_000;
-let rateLimitBackoffUntil = 0;
+// WO-HARNESS-OPERATOR-INBOX-BACKPRESSURE-01: the flat 60s backoff is now the
+// BASE of an increasing backoff, and the catch classifies SECONDARY vs
+// PRIMARY_EXHAUSTED explicitly (never conflated as generic "rate limit"). This
+// is the live, shared-token path reached by both the reviewer and the merge
+// manager -- the code path that actually made the GitHub calls during the
+// 2026-08-27 outage (the operator-inbox drain itself makes none as wired).
+const rateLimitBackoffState = createRateLimitBackoffState();
 let rateLimitLastLoggedAt = 0;
+
+/**
+ * Test-only: reset the module-scope backoff state so a rate-limit case that
+ * never reaches a success (and therefore never resets) cannot leak accumulated
+ * consecutive-hit state into the next test.
+ */
+export function resetRateLimitBackoffForTests(): void {
+  resetRateLimitBackoff(rateLimitBackoffState);
+  rateLimitLastLoggedAt = 0;
+}
 
 interface FindPullRequestLogger {
   error(obj: Record<string, unknown>, msg: string): void;
@@ -26,21 +49,6 @@ interface FindPullRequestLogger {
 export interface FindPullRequestOptions {
   logger?: FindPullRequestLogger;
   now?: () => number;
-}
-
-function isGitHubRateLimitError(error: unknown): boolean {
-  if (!error || typeof error !== 'object') return false;
-  const candidate = error as {
-    status?: unknown;
-    message?: unknown;
-    response?: { headers?: Record<string, unknown> };
-  };
-  if (candidate.status !== 403) return false;
-  const remaining = candidate.response?.headers?.['x-ratelimit-remaining'];
-  return (
-    String(remaining) === '0' ||
-    (typeof candidate.message === 'string' && /rate limit/i.test(candidate.message))
-  );
 }
 
 /** The lookup ran and found nothing. A genuine "this PR does not exist". */
@@ -421,7 +429,7 @@ export function createRealFindPullRequest(
   const logger = options.logger ?? log;
   const now = options.now ?? Date.now;
   return async (input: GitHubPullRequestSearchInput): Promise<PullRequestEvidence> => {
-    if (now() < rateLimitBackoffUntil) return LOOKUP_FAILED_EVIDENCE;
+    if (now() < rateLimitBackoffState.backoffUntil) return LOOKUP_FAILED_EVIDENCE;
     try {
       let prNumber: number | null = null;
 
@@ -452,7 +460,7 @@ export function createRealFindPullRequest(
       }
 
       if (prNumber === null) {
-        rateLimitBackoffUntil = 0;
+        resetRateLimitBackoff(rateLimitBackoffState);
         rateLimitLastLoggedAt = 0;
         return MISSING_EVIDENCE;
       }
@@ -516,20 +524,29 @@ export function createRealFindPullRequest(
         // Provenance anchor: GitHub's own view of the PR head, not run metadata.
         headSha: pr.data.head.sha,
       };
-      rateLimitBackoffUntil = 0;
+      resetRateLimitBackoff(rateLimitBackoffState);
       rateLimitLastLoggedAt = 0;
       return evidence;
     } catch (error) {
       const timestamp = now();
-      if (isGitHubRateLimitError(error)) {
-        rateLimitBackoffUntil = timestamp + RATE_LIMIT_BACKOFF_MS;
+      const rateLimitClass = classifyGitHubRateLimit(error);
+      if (rateLimitClass !== 'not_rate_limited') {
+        const { backoffMs } = advanceRateLimitBackoff(rateLimitBackoffState, timestamp);
         if (
-          timestamp - rateLimitLastLoggedAt >= RATE_LIMIT_BACKOFF_MS ||
+          timestamp - rateLimitLastLoggedAt >= DEFAULT_RATE_LIMIT_BASE_MS ||
           rateLimitLastLoggedAt === 0
         ) {
           rateLimitLastLoggedAt = timestamp;
           logger.warn(
-            { err: error, input, backoffMs: RATE_LIMIT_BACKOFF_MS },
+            {
+              err: error,
+              input,
+              backoffMs,
+              // Explicit classification: SECONDARY limiting reads /rate_limit as
+              // FULL (2026-08-27), so never report it as quota exhaustion.
+              rateLimitClass,
+              consecutiveHits: rateLimitBackoffState.consecutiveHits,
+            },
             'overseer.github_real_deps.rate_limit_backoff'
           );
         }

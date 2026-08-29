@@ -263,6 +263,7 @@ import {
   dispatchWorkerSchema,
   dispatchStatusQuerySchema,
   dispatchStatusResponseSchema,
+  operatorInboxBacklogStatusResponseSchema,
   executionHandoffBodySchema,
   heartbeatDispatchWorkerBodySchema,
   listDispatchMessagesQuerySchema,
@@ -872,6 +873,20 @@ const getDispatchStatusRoute = createRoute({
     200: {
       content: { 'application/json': { schema: dispatchStatusResponseSchema } },
       description: 'Dispatch status',
+    },
+    500: jsonError('Server error'),
+  },
+});
+
+const getOperatorInboxStatusRoute = createRoute({
+  method: 'get',
+  path: '/api/dispatch/operator-inbox/status',
+  tags: ['Dispatch'],
+  summary: 'Get operator-inbox backlog count, oldest age, and top senders',
+  responses: {
+    200: {
+      content: { 'application/json': { schema: operatorInboxBacklogStatusResponseSchema } },
+      description: 'Operator inbox backlog status',
     },
     500: jsonError('Server error'),
   },
@@ -4040,6 +4055,25 @@ export function registerApiRoutes(
     } catch (error) {
       getLog().error({ err: error }, 'dispatch_status_failed');
       return apiError(c, 500, 'Failed to get dispatch status');
+    }
+  });
+
+  registerOpenApiRoute(getOperatorInboxStatusRoute, async c => {
+    try {
+      const backlog = await dispatchDb.getOperatorInboxBacklogStatus();
+      const oldestAgeMs = backlog.oldestCreatedAt
+        ? Math.max(0, Date.now() - new Date(backlog.oldestCreatedAt).getTime())
+        : null;
+      return c.json({
+        generated_at: new Date().toISOString(),
+        count: backlog.count,
+        oldest_created_at: backlog.oldestCreatedAt,
+        oldest_age_ms: oldestAgeMs,
+        top_senders: backlog.topSenders,
+      });
+    } catch (error) {
+      getLog().error({ err: error }, 'operator_inbox_status_failed');
+      return apiError(c, 500, 'Failed to get operator inbox status');
     }
   });
 

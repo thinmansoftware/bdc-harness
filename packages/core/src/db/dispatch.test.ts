@@ -17,15 +17,21 @@ import {
   acknowledgeMessage,
   addressMessage,
   cancelMessage,
+  DISPATCH_INFORMATION_ONLY_TO_OPERATOR_ERROR,
   claimDispatchEscalation,
   claimMessage,
   createMessage,
   evaluateWorkerStaleness,
   ensureXoEscalationHandoffs,
   getMessage,
+  getOperatorInboxBacklogStatus,
   heartbeatWorker,
   listEligibleXoEscalations,
   listMessages,
+  listUnwatermarkedOperatorInboxMessages,
+  markOperatorInboxWatermark,
+  restoreRetiredOperatorInboxMessage,
+  retireStaleOperatorInboxMessages,
   listUnroutableQueuedMessages,
   listWorkers,
   postResult,
@@ -1649,5 +1655,239 @@ describe('normalizeDispatchSubjectKey', () => {
     expect(() => normalizeDispatchSubjectKey('random:thing')).toThrow(
       'dispatch_subject_key_invalid:shape'
     );
+  });
+});
+
+// WO-HARNESS-OPERATOR-INBOX-BACKPRESSURE-01: read-side backpressure DAL against
+// a REAL SqliteAdapter -- bounded read, watermark, retention retirement, and
+// backlog status. Same adapter class production uses; no mocking of the DAL.
+describe('operator-inbox backpressure DAL', () => {
+  let bpDbPath = '';
+
+  beforeEach(() => {
+    bpDbPath = join(
+      import.meta.dir,
+      `.test-inbox-bp-${Date.now()}-${Math.random().toString(36).slice(2)}.db`
+    );
+    db = new SqliteAdapter(bpDbPath);
+  });
+
+  afterEach(async () => {
+    await db.close();
+    cleanupDb(bpDbPath);
+  });
+
+  async function seedOperator(id: string, sender = 'overseer'): Promise<string> {
+    const message = await createMessage({
+      correlation_id: `corr-${id}`,
+      idempotency_key: `idem-${id}`,
+      task_type: 'run_report',
+      sender,
+      recipient: 'operator',
+      body: `body-${id}`,
+    });
+    return message.id;
+  }
+
+  async function backdateCreatedAt(id: string, iso: string): Promise<void> {
+    await db.query('UPDATE agent_dispatch_messages SET created_at = $1 WHERE id = $2', [iso, id]);
+  }
+
+  test('listUnwatermarkedOperatorInboxMessages is bounded and oldest-first', async () => {
+    const older = await seedOperator('older');
+    await backdateCreatedAt(older, '2026-07-01T00:00:00.000Z');
+    const newer = await seedOperator('newer');
+    await backdateCreatedAt(newer, '2026-08-01T00:00:00.000Z');
+    const newest = await seedOperator('newest');
+    await backdateCreatedAt(newest, '2026-08-20T00:00:00.000Z');
+
+    const bounded = await listUnwatermarkedOperatorInboxMessages(2);
+    expect(bounded.map(m => m.id)).toEqual([older, newer]); // oldest-first, capped at 2
+
+    const all = await listUnwatermarkedOperatorInboxMessages(100);
+    expect(all.map(m => m.id)).toEqual([older, newer, newest]);
+  });
+
+  test('markOperatorInboxWatermark is idempotent and excludes the row from future reads', async () => {
+    const id = await seedOperator('wm-1');
+    expect(await markOperatorInboxWatermark(id)).toBe(true);
+    // Idempotent: a repeat call does not re-write and reports no-op.
+    expect(await markOperatorInboxWatermark(id)).toBe(false);
+
+    const remaining = await listUnwatermarkedOperatorInboxMessages(100);
+    expect(remaining.map(m => m.id)).not.toContain(id);
+
+    // Watermark does NOT change status or terminal state -- the row is intact.
+    const row = await getMessage(id);
+    expect(row?.status).toBe('queued');
+    expect(row?.inbox_watermark_at).not.toBeNull();
+    expect(row?.retired_at).toBeNull();
+  });
+
+  test('retireStaleOperatorInboxMessages preserves the row, is non-cancelled, and stops draining it', async () => {
+    const stale = await seedOperator('stale');
+    await backdateCreatedAt(stale, '2026-06-01T00:00:00.000Z'); // well past any window
+    const fresh = await seedOperator('fresh'); // created just now
+
+    const retentionMs = 24 * 60 * 60 * 1000; // 1 day
+    const retired = await retireStaleOperatorInboxMessages(retentionMs, 100);
+    expect(retired).toEqual([stale]); // only the aged row
+
+    const row = await getMessage(stale);
+    expect(row).not.toBeNull(); // NOT deleted -- row + history preserved
+    expect(row?.status).toBe('queued'); // NOT reused as 'cancelled'
+    expect(row?.status).not.toBe('cancelled');
+    expect(row?.retired_at).not.toBeNull(); // terminal, non-draining marker
+
+    // Retired row no longer appears in drain reads; the fresh one still does.
+    const drainable = await listUnwatermarkedOperatorInboxMessages(100);
+    expect(drainable.map(m => m.id)).toEqual([fresh]);
+
+    // Monotonic: a second sweep retires nothing new.
+    expect(await retireStaleOperatorInboxMessages(retentionMs, 100)).toEqual([]);
+  });
+
+  test('restoreRetiredOperatorInboxMessage reverses retirement and returns the row to the drain', async () => {
+    const stale = await seedOperator('restore-me');
+    await backdateCreatedAt(stale, '2026-06-01T00:00:00.000Z');
+
+    const retentionMs = 24 * 60 * 60 * 1000; // 1 day
+    expect(await retireStaleOperatorInboxMessages(retentionMs, 100)).toEqual([stale]);
+    // While retired it does not drain.
+    expect((await listUnwatermarkedOperatorInboxMessages(100)).map(m => m.id)).not.toContain(stale);
+
+    // Reversal clears retired_at and reports success exactly once (idempotent).
+    expect(await restoreRetiredOperatorInboxMessage(stale)).toBe(true);
+    expect(await restoreRetiredOperatorInboxMessage(stale)).toBe(false); // already active
+
+    const row = await getMessage(stale);
+    expect(row?.retired_at).toBeNull(); // retirement cleared
+    expect(row?.status).toBe('queued'); // history/status untouched by restore
+    expect(row?.body).toBe('body-restore-me'); // row itself is intact
+
+    // The restored row is drainable again (still backdated, so it re-appears).
+    expect((await listUnwatermarkedOperatorInboxMessages(100)).map(m => m.id)).toContain(stale);
+  });
+
+  test('retirement and restoration leave a durable audit trail that survives the reversal', async () => {
+    const stale = await seedOperator('audit-me');
+    await backdateCreatedAt(stale, '2026-06-01T00:00:00.000Z');
+
+    // Before any retirement there is no audit history at all.
+    const fresh = await getMessage(stale);
+    expect(fresh?.last_retired_at).toBeNull();
+    expect(fresh?.last_restored_at).toBeNull();
+
+    const retentionMs = 24 * 60 * 60 * 1000;
+    expect(await retireStaleOperatorInboxMessages(retentionMs, 100)).toEqual([stale]);
+
+    // Retirement stamps BOTH the active marker and the durable audit column.
+    const retired = await getMessage(stale);
+    expect(retired?.retired_at).not.toBeNull();
+    expect(retired?.last_retired_at).toBe(retired?.retired_at ?? null);
+    expect(retired?.last_restored_at).toBeNull(); // not restored yet
+
+    expect(await restoreRetiredOperatorInboxMessage(stale)).toBe(true);
+
+    // The reversal clears ONLY the active marker. Evidence that the row was
+    // retired -- and that it was restored -- must both survive, otherwise a
+    // restored row would be indistinguishable from one never retired.
+    const restored = await getMessage(stale);
+    expect(restored?.retired_at).toBeNull();
+    expect(restored?.last_retired_at).toBe(retired?.last_retired_at ?? null);
+    expect(restored?.last_restored_at).not.toBeNull();
+  });
+
+  test('restoreRetiredOperatorInboxMessage is a no-op for a non-retired or unknown row', async () => {
+    const active = await seedOperator('never-retired');
+    // A queued-but-not-retired row cannot be "restored" (nothing to reverse).
+    expect(await restoreRetiredOperatorInboxMessage(active)).toBe(false);
+    // An unknown id is a safe no-op, not an error.
+    expect(await restoreRetiredOperatorInboxMessage('does-not-exist')).toBe(false);
+  });
+
+  test('createMessage rejects an information-only message addressed to the operator', async () => {
+    // The invariant is enforced at the WRITE PATH, so it binds every producer --
+    // not just the review route that happens to classify its own receipts.
+    await expect(
+      createMessage({
+        correlation_id: 'corr-info-only',
+        idempotency_key: 'idem-info-only',
+        task_type: 'run_report',
+        sender: 'overseer',
+        recipient: 'operator',
+        body: 'routine bookkeeping',
+        governance_classification: 'information-only',
+      })
+    ).rejects.toThrow(DISPATCH_INFORMATION_ONLY_TO_OPERATOR_ERROR);
+
+    // Nothing was persisted -- the guard is fail-closed, not best-effort.
+    expect(await listMessages({ recipient: 'operator' })).toEqual([]);
+  });
+
+  test('createMessage allows information-only to a non-operator audit mailbox', async () => {
+    const message = await createMessage({
+      correlation_id: 'corr-info-audit',
+      idempotency_key: 'idem-info-audit',
+      task_type: 'run_report',
+      sender: 'overseer',
+      recipient: 'review-receipts-log',
+      body: 'routine bookkeeping',
+      governance_classification: 'information-only',
+    });
+    expect(message.recipient).toBe('review-receipts-log');
+  });
+
+  test('createMessage allows an operator-decision message to reach the operator', async () => {
+    const message = await createMessage({
+      correlation_id: 'corr-decision',
+      idempotency_key: 'idem-decision',
+      task_type: 'run_report',
+      sender: 'overseer',
+      recipient: 'operator',
+      body: 'a human must decide',
+      governance_classification: 'operator_decision_required',
+    });
+    expect(message.recipient).toBe('operator');
+  });
+
+  test('the information-only guard is applied to the canonical principal, not the raw string', async () => {
+    // Casing/whitespace must not be a bypass: the guard runs after principal
+    // canonicalization, so 'OPERATOR' is rejected exactly like 'operator'.
+    await expect(
+      createMessage({
+        correlation_id: 'corr-info-canon',
+        idempotency_key: 'idem-info-canon',
+        task_type: 'run_report',
+        sender: 'overseer',
+        recipient: '  OPERATOR  ',
+        body: 'routine bookkeeping',
+        governance_classification: 'information-only',
+      })
+    ).rejects.toThrow(DISPATCH_INFORMATION_ONLY_TO_OPERATOR_ERROR);
+  });
+
+  test('getOperatorInboxBacklogStatus reports count, oldest, and top senders', async () => {
+    const a1 = await seedOperator('a1', 'overseer');
+    await backdateCreatedAt(a1, '2026-07-10T00:00:00.000Z');
+    await seedOperator('a2', 'overseer');
+    await seedOperator('a3', 'overseer');
+    await seedOperator('b1', 'taskmaster');
+
+    const status = await getOperatorInboxBacklogStatus();
+    expect(status.count).toBe(4);
+    expect(status.oldestCreatedAt).toBe('2026-07-10T00:00:00.000Z');
+    expect(status.topSenders[0]).toEqual({ sender: 'overseer', count: 3 });
+    expect(status.topSenders.find(s => s.sender === 'taskmaster')?.count).toBe(1);
+
+    // Retired + watermarked rows drop out of the backlog count.
+    await markOperatorInboxWatermark(a1); // watermarked rows are still backlog...
+    const afterWatermark = await getOperatorInboxBacklogStatus();
+    expect(afterWatermark.count).toBe(4); // ...watermark alone does not reduce backlog
+
+    await backdateCreatedAt(a1, '2026-01-01T00:00:00.000Z');
+    await retireStaleOperatorInboxMessages(24 * 60 * 60 * 1000, 100);
+    const afterRetire = await getOperatorInboxBacklogStatus();
+    expect(afterRetire.count).toBe(3); // retiring the aged row reduces the backlog
   });
 });

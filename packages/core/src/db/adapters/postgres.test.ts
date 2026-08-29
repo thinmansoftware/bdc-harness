@@ -229,6 +229,10 @@ describe('PostgresAdapter', () => {
       const laterMigrationPrincipals = [
         ['overseer-reviewer', 'Overseer PR Reviewer', 'worker_poll', 'TRUE'],
         ['overseer-review-route', 'Overseer Review Route', 'notify_only', 'TRUE'],
+        // WO-HARNESS-OPERATOR-INBOX-BACKPRESSURE-01 (migration 046): audit home
+        // for routine review-route receipts. Cumulative in 000_combined.sql,
+        // absent from migration 040 (Phase 0 predates it).
+        ['review-receipts-log', 'Review Receipts Log', 'notify_only', 'TRUE'],
       ] as const;
 
       for (const schema of [migration, combined]) {

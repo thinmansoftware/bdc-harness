@@ -58,6 +58,8 @@ function message(id: string, headSha = `head-${id}`): DispatchMessage {
     route_disposition: null,
     supersedes_id: null,
     repeat_reason: null,
+    inbox_watermark_at: null,
+    retired_at: null,
   };
 }
 

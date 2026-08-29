@@ -9,12 +9,19 @@
 import { describe, expect, test } from 'bun:test';
 import {
   createRealSubmitDeps,
+  ingestReceiptGovernanceClassification,
+  submitReceiptGovernanceClassification,
+  receiptRecipient,
+  REVIEW_RECEIPTS_LOG,
   REVIEW_REVIEWER_IDENTITY_ENV,
   REVIEW_WEBHOOK_SECRET_ENV,
   parseReviewWorkBody,
   resolveReviewRouteConfig,
   reviewSubjectKey,
 } from '../pr-review-wiring.ts';
+import type { ReceiptGovernanceClassification } from '../pr-review-wiring.ts';
+import type { IngestDisposition } from '../pr-review-ingest.ts';
+import type { SubmitDisposition } from '../pr-review-submit.ts';
 import type { RealGitHubOctokitLike } from '../adapters/github-real-deps.ts';
 import type { PrReviewResult } from '../pr-review-evaluator.ts';
 
@@ -223,5 +230,137 @@ describe('parseReviewWorkBody', () => {
     const parsed = parseReviewWorkBody(JSON.stringify(minimal));
     expect(parsed?.baseRef).toBe('');
     expect(parsed?.author).toBe('');
+  });
+});
+
+// WO-HARNESS-OPERATOR-INBOX-BACKPRESSURE-01, Section 11 scenario 9: the receipt
+// governance predicate. Routine outcomes are information-only (audit log);
+// genuine decisions/blockers are operator-actionable (human inbox). Both sides,
+// same test. The switches are exhaustive-by-construction, so every disposition
+// value is asserted here -- a new one would fail to compile in the source.
+describe('receipt governance classification', () => {
+  test('ingest: routine dispositions are information-only', () => {
+    const informational: IngestDisposition[] = [
+      'queued',
+      'duplicate_delivery',
+      'superseded_head',
+      'ignored_event',
+      'ignored_draft',
+    ];
+    for (const d of informational) {
+      expect(ingestReceiptGovernanceClassification(d)).toBe('information-only');
+    }
+  });
+
+  test('ingest: refusals a human must resolve are operator_decision_required', () => {
+    const actionable: IngestDisposition[] = ['blocked', 'custody_conflict', 'rejected_signature'];
+    for (const d of actionable) {
+      expect(ingestReceiptGovernanceClassification(d)).toBe('operator_decision_required');
+    }
+  });
+
+  test('submit: routine outcomes are information-only', () => {
+    const informational: SubmitDisposition[] = ['approved', 'changes_requested', 'stale_head'];
+    for (const d of informational) {
+      expect(submitReceiptGovernanceClassification(d)).toBe('information-only');
+    }
+  });
+
+  test('submit: custody/reviewer/submission failures are operator_decision_required', () => {
+    const actionable: SubmitDisposition[] = [
+      'custody_conflict',
+      'merge_custody_conflict',
+      'reviewer_failed',
+      'submission_failed',
+    ];
+    for (const d of actionable) {
+      expect(submitReceiptGovernanceClassification(d)).toBe('operator_decision_required');
+    }
+  });
+
+  test('the receipts-log principal is a distinct, non-operator audit home', () => {
+    expect(REVIEW_RECEIPTS_LOG).toBe('review-receipts-log');
+    expect(REVIEW_RECEIPTS_LOG).not.toBe('operator');
+  });
+});
+
+// WO-HARNESS-OPERATOR-INBOX-BACKPRESSURE-01: the ROUTING invariant the WO
+// requires -- a receipt classified 'information-only' can never be written with
+// recipient='operator'. receiptRecipient is the single choke point BOTH the
+// ingest and submit producers route through, so proving it here proves the
+// invariant for every producer in this module. Driving each disposition through
+// classification -> recipient (not just the classifier in isolation) closes the
+// gap Codex flagged: enforcement is now covered end-to-end, per producer.
+describe('receipt routing enforcement (information-only never reaches operator)', () => {
+  const ingestDispositions: IngestDisposition[] = [
+    'queued',
+    'duplicate_delivery',
+    'superseded_head',
+    'ignored_event',
+    'ignored_draft',
+    'blocked',
+    'custody_conflict',
+    'rejected_signature',
+  ];
+  const submitDispositions: SubmitDisposition[] = [
+    'approved',
+    'changes_requested',
+    'stale_head',
+    'custody_conflict',
+    'merge_custody_conflict',
+    'reviewer_failed',
+    'submission_failed',
+  ];
+
+  test('receiptRecipient hard-constrains information-only to the audit log', () => {
+    expect(receiptRecipient('information-only')).toBe(REVIEW_RECEIPTS_LOG);
+    expect(receiptRecipient('information-only')).not.toBe('operator');
+    expect(receiptRecipient('operator_decision_required')).toBe('operator');
+  });
+
+  test('EVERY ingest disposition routes information-only away from the operator inbox', () => {
+    for (const disposition of ingestDispositions) {
+      const classification: ReceiptGovernanceClassification =
+        ingestReceiptGovernanceClassification(disposition);
+      const recipient = receiptRecipient(classification);
+      if (classification === 'information-only') {
+        expect(recipient).toBe(REVIEW_RECEIPTS_LOG);
+        expect(recipient).not.toBe('operator');
+      } else {
+        expect(recipient).toBe('operator');
+      }
+    }
+  });
+
+  test('EVERY submit disposition routes information-only away from the operator inbox', () => {
+    for (const disposition of submitDispositions) {
+      const classification: ReceiptGovernanceClassification =
+        submitReceiptGovernanceClassification(disposition);
+      const recipient = receiptRecipient(classification);
+      if (classification === 'information-only') {
+        expect(recipient).toBe(REVIEW_RECEIPTS_LOG);
+        expect(recipient).not.toBe('operator');
+      } else {
+        expect(recipient).toBe('operator');
+      }
+    }
+  });
+
+  test('no information-only disposition anywhere in the module resolves to operator', () => {
+    const allInformationOnly = [
+      ...ingestDispositions.filter(
+        d => ingestReceiptGovernanceClassification(d) === 'information-only'
+      ),
+      ...submitDispositions.filter(
+        d => submitReceiptGovernanceClassification(d) === 'information-only'
+      ),
+    ];
+    // Guardrail: the fixture must actually contain the routine dispositions the
+    // 2026-08-27 flood was made of, or this test would pass vacuously.
+    expect(allInformationOnly).toContain('queued');
+    expect(allInformationOnly).toContain('approved');
+    expect(allInformationOnly.map(() => receiptRecipient('information-only'))).not.toContain(
+      'operator'
+    );
   });
 });

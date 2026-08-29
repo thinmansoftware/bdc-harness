@@ -57,6 +57,8 @@ export const dispatchMessageSchema = z
     route_disposition: dispatchRouteDispositionSchema.nullable(),
     supersedes_id: z.string().nullable(),
     repeat_reason: z.string().nullable(),
+    inbox_watermark_at: z.string().nullable(),
+    retired_at: z.string().nullable(),
   })
   .openapi('DispatchMessage');
 
@@ -194,6 +196,18 @@ export const dispatchStatusResponseSchema = z
     execution_handoffs: z.array(dispatchStatusItemSchema),
   })
   .openapi('DispatchStatusResponse');
+
+// WO-HARNESS-OPERATOR-INBOX-BACKPRESSURE-01: queryable operator-inbox backlog
+// status so an operator can see pressure building before it becomes an outage.
+export const operatorInboxBacklogStatusResponseSchema = z
+  .object({
+    generated_at: z.string(),
+    count: z.number(),
+    oldest_created_at: z.string().nullable(),
+    oldest_age_ms: z.number().nullable(),
+    top_senders: z.array(z.object({ sender: z.string(), count: z.number() })),
+  })
+  .openapi('OperatorInboxBacklogStatusResponse');
 
 export const executionHandoffBodySchema = z
   .object({
