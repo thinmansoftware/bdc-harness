@@ -175,4 +175,70 @@ describe('pr-review-wiring against a real SqliteAdapter', () => {
     );
     expect(Number(count.rows[0]?.n ?? 0)).toBe(1);
   });
+
+  test('a new head enqueues after the prior review reaches a terminal state', async () => {
+    const config = {
+      webhookSecret: 'integration-test-secret',
+      reviewerIdentity: 'thinman-overseer[bot]',
+    };
+    const deps = createRealIngestDeps(config);
+
+    const payloadFor = (action: 'opened' | 'synchronize', headSha: string): string =>
+      JSON.stringify({
+        action,
+        number: 148,
+        pull_request: {
+          number: 148,
+          draft: false,
+          head: { sha: headSha, ref: 'feature-branch' },
+          base: { ref: 'dev', sha: 'f'.repeat(40) },
+          user: { login: 'bluedevilcollectibles' },
+        },
+        repository: { name: 'bdc-harness', owner: { login: 'thinmansoftware' } },
+      });
+
+    const firstPayload = payloadFor('opened', '1'.repeat(40));
+    const first = await ingestPullRequestEvent(
+      {
+        rawBody: firstPayload,
+        signature: sign(firstPayload, config.webhookSecret),
+        eventType: 'pull_request',
+        deliveryId: 'integration-delivery-terminal-head-1',
+      },
+      deps
+    );
+    expect(first.disposition).toBe('queued');
+
+    await db.query(
+      `UPDATE agent_dispatch_messages
+       SET status = 'done', completed_at = CURRENT_TIMESTAMP
+       WHERE id = $1`,
+      [first.messageId]
+    );
+
+    const secondHeadSha = '2'.repeat(40);
+    const secondPayload = payloadFor('synchronize', secondHeadSha);
+    const second = await ingestPullRequestEvent(
+      {
+        rawBody: secondPayload,
+        signature: sign(secondPayload, config.webhookSecret),
+        eventType: 'pull_request',
+        deliveryId: 'integration-delivery-terminal-head-2',
+      },
+      deps
+    );
+
+    expect(second.disposition).toBe('queued');
+    expect(second.messageId).not.toBe(first.messageId);
+
+    const rows = await db.query<{ repeat_reason: string | null; body: string }>(
+      `SELECT repeat_reason, body
+       FROM agent_dispatch_messages
+       WHERE id = $1`,
+      [second.messageId]
+    );
+    expect(rows.rows).toHaveLength(1);
+    expect(rows.rows[0]?.repeat_reason).toBe(`review_exact_head:${secondHeadSha}`);
+    expect(JSON.parse(rows.rows[0]?.body ?? '{}').headSha).toBe(secondHeadSha);
+  });
 });
