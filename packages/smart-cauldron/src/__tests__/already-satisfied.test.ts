@@ -78,18 +78,10 @@ describe('textClaimsWoId', () => {
   });
 
   test('recognizes "not in scope" and "explicitly excluded" heading variants', () => {
-    expect(
-      textClaimsWoId(
-        '## Not in scope\n- WO-FOO-BAR-01 (deferred)',
-        'WO-FOO-BAR-01'
-      )
-    ).toBe(false);
-    expect(
-      textClaimsWoId(
-        '### Explicitly Excluded\n- WO-FOO-BAR-01',
-        'WO-FOO-BAR-01'
-      )
-    ).toBe(false);
+    expect(textClaimsWoId('## Not in scope\n- WO-FOO-BAR-01 (deferred)', 'WO-FOO-BAR-01')).toBe(
+      false
+    );
+    expect(textClaimsWoId('### Explicitly Excluded\n- WO-FOO-BAR-01', 'WO-FOO-BAR-01')).toBe(false);
   });
 });
 
