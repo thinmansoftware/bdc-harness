@@ -6,6 +6,7 @@ export interface FireEligibilityEvidence {
   project: string;
   specVerifiedAt: string;
   noOpenOrMergedPr: true;
+  specSource: 'repo-path' | 'date-glob' | 'issue-body';
 }
 
 export interface FireEligibilityResult {
@@ -47,6 +48,74 @@ function normalizeRepo(value: string): string {
     .toLowerCase();
 }
 
+function decodeContent(payload: { content?: string; encoding?: string }): string {
+  return payload.encoding === 'base64' && payload.content
+    ? Buffer.from(payload.content.replace(/\s/g, ''), 'base64').toString('utf8')
+    : '';
+}
+
+async function resolveSpec(
+  woId: string,
+  fetchImpl: typeof fetch
+): Promise<{ body: string; source: FireEligibilityEvidence['specSource'] } | null> {
+  const direct = await fetchImpl(
+    `https://api.github.com/repos/thinmansoftware/bdc-xo/contents/docs/superpowers/specs/${woId}.md?ref=main`,
+    { headers: headers() }
+  );
+  assertRateLimit(direct);
+  if (direct.ok)
+    return {
+      body: decodeContent(
+        (await direct.json()) as { content?: string; encoding?: string }
+      ),
+      source: 'repo-path',
+    };
+  if (direct.status !== 404) throw new Error(`taskmaster_fire_spec_read_failed:${direct.status}`);
+
+  const directory = await fetchImpl(
+    'https://api.github.com/repos/thinmansoftware/bdc-xo/contents/docs/superpowers/specs?ref=main',
+    { headers: headers() }
+  );
+  assertRateLimit(directory);
+  if (!directory.ok && directory.status !== 404)
+    throw new Error(`taskmaster_fire_spec_list_failed:${directory.status}`);
+  if (directory.ok) {
+    const entries = (await directory.json()) as { name?: string; url?: string }[];
+    const match = entries.find(entry => entry.name?.endsWith(`${woId}.md`));
+    if (match?.url) {
+      const matched = await fetchImpl(match.url, { headers: headers() });
+      assertRateLimit(matched);
+      if (!matched.ok) throw new Error(`taskmaster_fire_spec_read_failed:${matched.status}`);
+      return {
+        body: decodeContent(
+          (await matched.json()) as { content?: string; encoding?: string }
+        ),
+        source: 'date-glob',
+      };
+    }
+  }
+
+  const search = await fetchImpl(
+    `https://api.github.com/search/issues?q=${encodeURIComponent(`${woId} repo:thinmansoftware/bdc-xo in:title is:issue`)}`,
+    { headers: headers() }
+  );
+  assertRateLimit(search);
+  if (!search.ok) throw new Error(`taskmaster_fire_spec_issue_search_failed:${search.status}`);
+  const items = (await search.json()) as { items?: { number?: number; title?: string }[] };
+  const escaped = woId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const exactWo = new RegExp(`(?:^|[^A-Za-z0-9-])${escaped}(?:[^A-Za-z0-9-]|$)`);
+  const number = items.items?.find(item => exactWo.test(item.title ?? ''))?.number;
+  if (!number) return null;
+  const issue = await fetchImpl(
+    `https://api.github.com/repos/thinmansoftware/bdc-xo/issues/${number}`,
+    { headers: headers() }
+  );
+  assertRateLimit(issue);
+  if (!issue.ok) throw new Error(`taskmaster_fire_spec_issue_read_failed:${issue.status}`);
+  const body = ((await issue.json()) as { body?: string | null }).body ?? '';
+  return body ? { body, source: 'issue-body' } : null;
+}
+
 export async function checkFireEligibility(
   issueTitle: string,
   deps: FireEligibilityDeps = {}
@@ -54,18 +123,9 @@ export async function checkFireEligibility(
   const woId = WO_ID_RE.exec(issueTitle)?.[1];
   if (!woId) return { eligible: false, reason: 'wo_id_missing' };
   const fetchImpl = deps.fetchImpl ?? fetch;
-  const specResponse = await fetchImpl(
-    `https://api.github.com/repos/thinmansoftware/bdc-xo/contents/docs/work-orders/${woId}.md?ref=main`,
-    { headers: headers() }
-  );
-  assertRateLimit(specResponse);
-  if (specResponse.status === 404) return { eligible: false, reason: 'spec_missing' };
-  if (!specResponse.ok) throw new Error(`taskmaster_fire_spec_read_failed:${specResponse.status}`);
-  const payload = (await specResponse.json()) as { content?: string; encoding?: string };
-  const body =
-    payload.encoding === 'base64' && payload.content
-      ? Buffer.from(payload.content.replace(/\s/g, ''), 'base64').toString('utf8')
-      : '';
+  const spec = await resolveSpec(woId, fetchImpl);
+  if (!spec) return { eligible: false, reason: 'spec_missing' };
+  const { body, source: specSource } = spec;
   if (!/^cauldron_compatible:\s*true\s*$/im.test(body)) {
     return { eligible: false, reason: 'cauldron_incompatible' };
   }
@@ -115,6 +175,7 @@ export async function checkFireEligibility(
       project,
       specVerifiedAt: (deps.now ?? ((): Date => new Date()))().toISOString(),
       noOpenOrMergedPr: true,
+      specSource,
     },
   };
 }

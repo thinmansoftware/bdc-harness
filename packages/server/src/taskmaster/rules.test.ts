@@ -143,6 +143,41 @@ describe('computeNextAction', () => {
     ).toBe('escalate_p0');
   });
 
+  test('fresh unclaimed P1, P2, and P3 fire while claimed work does not', () => {
+    const evidence = {
+      woId: 'WO-HARNESS-EXAMPLE-01',
+      targetRepo: 'thinmansoftware/bdc-harness',
+      project: 'bdc-harness',
+      specVerifiedAt: new Date(NOW_MS).toISOString(),
+      noOpenOrMergedPr: true as const,
+      specSource: 'issue-body' as const,
+    };
+    for (const priority of ['P1', 'P2', 'P3'] as const) {
+      const proposal = computeNextAction(
+        thread({ priority, isUnclaimed: true }),
+        'healthy',
+        {
+          interventionsLast24h: 0,
+          nowMs: NOW_MS,
+          fireEligible: true,
+          fireLane: 'codex',
+          fireEvidence: evidence,
+        }
+      );
+      expect(proposal?.type).toBe('fire_cauldron');
+      expect(proposal?.fireEvidence?.specSource).toBe('issue-body');
+    }
+    expect(
+      computeNextAction(thread({ priority: 'P1', isUnclaimed: false }), 'healthy', {
+        interventionsLast24h: 0,
+        nowMs: NOW_MS,
+        fireEligible: true,
+        fireLane: 'codex',
+        fireEvidence: evidence,
+      })
+    ).toBeNull();
+  });
+
   test('fire identity stays stable when the observed failure count changes', () => {
     const evidence = {
       woId: 'WO-HARNESS-EXAMPLE-01',

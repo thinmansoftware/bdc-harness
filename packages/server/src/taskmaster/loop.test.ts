@@ -424,7 +424,7 @@ describe('fire_cauldron loop', () => {
     expect(world.journal.some(row => row.action_type === 'deliver_ruling')).toBe(true);
   });
 
-  test('qualified unclaimed P0 admits exactly one cascade and journals its run id', async () => {
+  test('qualified fresh unclaimed P1 admits exactly one cascade and journals its run id', async () => {
     const prior = process.env.TASKMASTER_FIRE_VERB_ENABLED;
     process.env.TASKMASTER_FIRE_VERB_ENABLED = 'true';
     try {
@@ -432,9 +432,9 @@ describe('fire_cauldron loop', () => {
       seedDigestSent(world);
       const item: ListedThread = {
         ref: 'gh:thinmansoftware/bdc-harness#501',
-        priority: 'P0',
+        priority: 'P1',
         lastActivityAt: new Date(T0 - 3_600_000).toISOString(),
-        isUnclaimedP0: true,
+        isUnclaimed: true,
         recipient: 'xo',
         title: 'WO-HARNESS-EXAMPLE-01 urgent build',
       };
@@ -470,6 +470,73 @@ describe('fire_cauldron loop', () => {
       expect(fires[0]?.outcome).toBe('sent');
       expect(fires[0]?.proposal_json).toContain('cascade-501');
       expect(world.sentMessages.some(message => message.body.includes('Unclaimed P0'))).toBe(false);
+    } finally {
+      if (prior === undefined) delete process.env.TASKMASTER_FIRE_VERB_ENABLED;
+      else process.env.TASKMASTER_FIRE_VERB_ENABLED = prior;
+    }
+  });
+
+  test('fire cap dispatches P0 through P2 first and defers overflow for the next tick', async () => {
+    const prior = process.env.TASKMASTER_FIRE_VERB_ENABLED;
+    process.env.TASKMASTER_FIRE_VERB_ENABLED = 'true';
+    try {
+      const world = makeWorld();
+      seedDigestSent(world);
+      const threads = [
+        ['P3', 513],
+        ['P2', 512],
+        ['P0', 510],
+        ['P3', 514],
+        ['P1', 511],
+      ].map(([priority, number]) =>
+        makeListedThread({
+          ref: `gh:thinmansoftware/bdc-harness#${number}`,
+          priority: priority as ThreadSnapshot['priority'],
+          isUnclaimed: true,
+          isUnclaimedP0: priority === 'P0',
+          title: `WO-HARNESS-EXAMPLE-${number} build`,
+          lastActivityAt: new Date(T0).toISOString(),
+        })
+      );
+      const admitted: string[] = [];
+      const deps = makeDeps(world, {
+        listThreads: async () => threads,
+        checkFireEligibility: async title => {
+          const woId = title.split(' ')[0]!;
+          return {
+            eligible: true,
+            evidence: {
+              woId,
+              targetRepo: 'thinmansoftware/bdc-harness',
+              project: 'bdc-harness',
+              specVerifiedAt: new Date(T0).toISOString(),
+              noOpenOrMergedPr: true,
+              specSource: 'repo-path',
+            },
+          };
+        },
+        runCascade: (async options => {
+          admitted.push(options.woId);
+          const record = { cascadeId: `cascade-${options.woId}`, status: 'running' } as never;
+          options.onAdmission?.(record, true);
+          return record;
+        }) as NonNullable<TaskmasterDeps['runCascade']>,
+      });
+      const state = createTaskmasterState(60_000);
+      await tick(state, deps);
+      expect(admitted).toEqual([
+        'WO-HARNESS-EXAMPLE-510',
+        'WO-HARNESS-EXAMPLE-511',
+        'WO-HARNESS-EXAMPLE-512',
+      ]);
+      expect(world.journal.filter(row => row.outcome === 'deferred')).toHaveLength(2);
+
+      world.nowMs += 60_000;
+      await tick(state, deps);
+      expect(admitted.slice(3).sort()).toEqual([
+        'WO-HARNESS-EXAMPLE-513',
+        'WO-HARNESS-EXAMPLE-514',
+      ]);
     } finally {
       if (prior === undefined) delete process.env.TASKMASTER_FIRE_VERB_ENABLED;
       else process.env.TASKMASTER_FIRE_VERB_ENABLED = prior;
@@ -1769,6 +1836,7 @@ describe('defaultListThreads -- GitHub work-SOR read', () => {
     ]);
     const p0 = threads.find(t => t.ref.endsWith('#3'));
     expect(p0?.priority).toBe('P0');
+    expect(p0?.isUnclaimed).toBe(true);
     expect(p0?.isUnclaimedP0).toBe(true);
   });
 
@@ -1782,6 +1850,8 @@ describe('defaultListThreads -- GitHub work-SOR read', () => {
         ghIssue(14, ['wo', 'priority-ish:p1']),
         ghIssue(15, ['wo', 'P0', 'status:blocked']),
         ghIssue(16, ['wo', 'P0', 'status:review']),
+        ghIssue(17, ['wo', 'P2', 'status:hold']),
+        ghIssue(18, ['wo', 'P3', 'status:building']),
       ],
     });
 
@@ -1792,6 +1862,8 @@ describe('defaultListThreads -- GitHub work-SOR read', () => {
     expect(byNumber.get(14)?.priority).toBe('P2');
     expect(byNumber.get(15)?.isBlocked).toBe(true);
     expect(byNumber.get(16)?.isUnclaimedP0).toBe(false);
+    expect(byNumber.get(17)?.isBlocked).toBe(true);
+    expect(byNumber.get(18)?.isUnclaimed).toBe(false);
   });
 
   test('defaults to bdc-xo when TASKMASTER_GH_REPOS is unset', async () => {

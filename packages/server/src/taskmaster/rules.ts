@@ -35,6 +35,7 @@ export interface FireEvidence {
   project: string;
   specVerifiedAt: string;
   noOpenOrMergedPr: true;
+  specSource: 'repo-path' | 'date-glob' | 'issue-body';
 }
 
 export interface ThreadSnapshot {
@@ -51,6 +52,8 @@ export interface ThreadSnapshot {
   undeliveredRulingId?: string;
   /** P0 with no assignee/claim. */
   isUnclaimedP0?: boolean;
+  /** No assignee and no claim status, at any priority. */
+  isUnclaimed?: boolean;
   /** Recipient seat for any message about this thread. */
   recipient: string;
 }
@@ -316,7 +319,6 @@ export function computeNextAction(
   // Section 6 row 3: a blocked item is watched, never nudged -- unless its
   // blocked_reason names a seat that can unblock it (full content required).
   const blockedSeatNudge = classification === 'blocked' && blockedReasonNamesSeat(adoption);
-  if (classification === 'healthy') return null;
   if (classification === 'blocked' && !blockedSeatNudge) return null;
   if (context.interventionsLast24h >= MAX_INTERVENTIONS_PER_ITEM_24H) return null;
 
@@ -335,13 +337,8 @@ export function computeNextAction(
     };
   }
 
-  if (thread.isUnclaimedP0) {
+  if (thread.isUnclaimed ?? thread.isUnclaimedP0) {
     const bucket = Math.floor(context.nowMs / NUDGE_CLOCK_MS.P0);
-    const titleNote = adoption?.title ? `"${adoption.title}" (${thread.ref})` : thread.ref;
-    const age = describeMovement(
-      adoption?.last_movement_at ?? thread.lastActivityAt,
-      context.nowMs
-    );
     if (
       context.fireEligible &&
       context.fireEvidence &&
@@ -360,6 +357,17 @@ export function computeNextAction(
       };
     }
     if (context.fireEligible && context.fireEvidence && context.fireHolding) return null;
+  }
+
+  if (classification === 'healthy') return null;
+
+  if (thread.isUnclaimedP0) {
+    const bucket = Math.floor(context.nowMs / NUDGE_CLOCK_MS.P0);
+    const titleNote = adoption?.title ? `"${adoption.title}" (${thread.ref})` : thread.ref;
+    const age = describeMovement(
+      adoption?.last_movement_at ?? thread.lastActivityAt,
+      context.nowMs
+    );
     return {
       type: 'escalate_p0',
       threadRef: thread.ref,

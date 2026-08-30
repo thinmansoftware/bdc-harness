@@ -55,6 +55,8 @@ const log = createLogger('taskmaster/loop');
 
 /** Ratified Q1 budgets. */
 export const MAX_EFFECTS_PER_TICK = 10;
+/** Conservative faucet bound for newly eligible work, within the shared cap. */
+export const MAX_FIRES_PER_TICK = 3;
 
 /**
  * Pause effect-delivery gate (WO-HARNESS-TASKMASTER-PAUSE-GATE-ENFORCE-01).
@@ -409,16 +411,17 @@ export async function defaultListThreads(fetchImpl: typeof fetch = fetch): Promi
             ['status:building', 'status:review'].includes(label)
           );
           const ownerLogin = issue.assignees?.[0]?.login ?? null;
+          const isUnclaimed = (issue.assignees ?? []).length === 0 && !hasClaimStatus;
           threads.push({
             ref: canonicalizeThreadRef(`gh:${repo}#${issue.number}`),
             priority,
             isCustomerFacing: labels.some(l => l.toLowerCase() === 'customer'),
             lastActivityAt: issue.updated_at,
             isBlocked: normalizedLabels.some(label =>
-              ['blocked', 'status:blocked'].includes(label)
+              ['blocked', 'status:blocked', 'hold', 'status:hold'].includes(label)
             ),
-            isUnclaimedP0:
-              priority === 'P0' && (issue.assignees ?? []).length === 0 && !hasClaimStatus,
+            isUnclaimed,
+            isUnclaimedP0: priority === 'P0' && isUnclaimed,
             recipient: resolveRecipient(ownerLogin),
             title: issue.title ?? null,
             ownerLogin,
@@ -1200,7 +1203,7 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
     if (
       resolveFireVerbEnabled() &&
       backoff.kind === 'ready' &&
-      item.isUnclaimedP0 &&
+      (item.isUnclaimed ?? item.isUnclaimedP0) &&
       typeof (item as ListedThread).title === 'string'
     ) {
       try {
@@ -1264,10 +1267,21 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
   proposals.push(digest);
 
   // Exceptions first so the per-tick budget can never starve them.
-  proposals.sort((a, b) => Number(b.actsImmediately) - Number(a.actsImmediately));
+  const priorityByRef = new Map([...rulings, ...threads].map(item => [item.ref, item.priority]));
+  const priorityRank: Record<ThreadPriority, number> = { P0: 0, P1: 1, P2: 2, P3: 3 };
+  proposals.sort((a, b) => {
+    const immediate = Number(b.actsImmediately) - Number(a.actsImmediately);
+    if (immediate !== 0) return immediate;
+    if (a.type !== 'fire_cauldron' || b.type !== 'fire_cauldron') return 0;
+    return (
+      priorityRank[priorityByRef.get(a.threadRef) ?? 'P3'] -
+      priorityRank[priorityByRef.get(b.threadRef) ?? 'P3']
+    );
+  });
   result.proposals = proposals.length;
 
   const touchedThisTick = new Set<string>();
+  let firesThisTick = 0;
 
   for (const proposal of proposals) {
     let existingAction =
@@ -1354,7 +1368,11 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
 
     // Budgets: max 10 effects/tick, 1 effect/item/tick. Overflow is
     // journaled as deferred, not dropped.
-    if (result.effects >= MAX_EFFECTS_PER_TICK || touchedThisTick.has(proposal.threadRef)) {
+    if (
+      result.effects >= MAX_EFFECTS_PER_TICK ||
+      (proposal.type === 'fire_cauldron' && firesThisTick >= MAX_FIRES_PER_TICK) ||
+      touchedThisTick.has(proposal.threadRef)
+    ) {
       result.deferred += 1;
       if (!existingAction) {
         existingAction = await dal.recordAction({
@@ -1467,6 +1485,7 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
       journalRow.outcome = 'sent';
       touchedThisTick.add(proposal.threadRef);
       result.effects += 1;
+      if (proposal.type === 'fire_cauldron') firesThisTick += 1;
       log.info(
         {
           actionType: proposal.type,
