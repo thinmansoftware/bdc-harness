@@ -199,6 +199,7 @@ export function createRealIngestDeps(config: ReviewRouteConfig): IngestDeps {
           recipient: REVIEW_RECIPIENT,
           body: JSON.stringify(body),
           subject_key: subjectKey,
+          repeat_reason: `review_exact_head:${input.headSha}`,
         }
       );
       return { messageId: message.id, alreadyExisted };
