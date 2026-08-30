@@ -1269,14 +1269,19 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
   // Exceptions first so the per-tick budget can never starve them.
   const priorityByRef = new Map([...rulings, ...threads].map(item => [item.ref, item.priority]));
   const priorityRank: Record<ThreadPriority, number> = { P0: 0, P1: 1, P2: 2, P3: 3 };
+  const proposalRank = (proposal: ActionProposal): number => {
+    if (proposal.type === 'deliver_ruling') return 0;
+    if (proposal.type === 'escalate_p0') return 1;
+    if (proposal.type === 'fire_cauldron') {
+      return 2 + priorityRank[priorityByRef.get(proposal.threadRef) ?? 'P3'];
+    }
+    if (proposal.type === 'nudge') return 6;
+    return 7;
+  };
   proposals.sort((a, b) => {
     const immediate = Number(b.actsImmediately) - Number(a.actsImmediately);
     if (immediate !== 0) return immediate;
-    if (a.type !== 'fire_cauldron' || b.type !== 'fire_cauldron') return 0;
-    return (
-      priorityRank[priorityByRef.get(a.threadRef) ?? 'P3'] -
-      priorityRank[priorityByRef.get(b.threadRef) ?? 'P3']
-    );
+    return proposalRank(a) - proposalRank(b);
   });
   result.proposals = proposals.length;
 

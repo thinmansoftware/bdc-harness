@@ -178,6 +178,27 @@ describe('computeNextAction', () => {
     ).toBeNull();
   });
 
+  test('blocked unclaimed work never fires even when its blocker names a seat', () => {
+    const evidence = {
+      woId: 'WO-HARNESS-EXAMPLE-01',
+      targetRepo: 'thinmansoftware/bdc-harness',
+      project: 'bdc-harness',
+      specVerifiedAt: new Date(NOW_MS).toISOString(),
+      noOpenOrMergedPr: true as const,
+      specSource: 'issue-body' as const,
+    };
+    expect(
+      computeNextAction(thread({ isBlocked: true, isUnclaimed: true }), 'blocked', {
+        interventionsLast24h: 0,
+        nowMs: NOW_MS,
+        adoption: makeAdoption({ blocked_reason: 'major-build must resolve the hold' }),
+        fireEligible: true,
+        fireLane: 'codex',
+        fireEvidence: evidence,
+      })?.type
+    ).not.toBe('fire_cauldron');
+  });
+
   test('fire identity stays stable when the observed failure count changes', () => {
     const evidence = {
       woId: 'WO-HARNESS-EXAMPLE-01',
@@ -230,6 +251,25 @@ describe('computeNextAction', () => {
         customerP0Exempt: true,
       })?.type
     ).toBe('fire_cauldron');
+  });
+
+  test('budget hold lets stale non-P0 work fall through to its nudge path', () => {
+    const proposal = computeNextAction(thread({ isUnclaimed: true }), 'stale', {
+      interventionsLast24h: 0,
+      nowMs: NOW_MS,
+      adoption: makeAdoption({ title: 'Stale P1', next_action: 'rerun the failing suite' }),
+      fireEligible: true,
+      fireHolding: true,
+      fireEvidence: {
+        woId: 'WO-HARNESS-EXAMPLE-01',
+        targetRepo: 'thinmansoftware/bdc-harness',
+        project: 'bdc-harness',
+        specVerifiedAt: new Date(NOW_MS).toISOString(),
+        noOpenOrMergedPr: true,
+        specSource: 'issue-body',
+      },
+    });
+    expect(proposal?.type).toBe('nudge');
   });
 
   test('stale thread nudges without immediacy (two-tick confirmation required)', () => {

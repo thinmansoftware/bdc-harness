@@ -24,19 +24,13 @@
  */
 import { createHash } from 'crypto';
 import type { TmAdoptionRow } from '@archon/core/db/taskmaster';
+import type { FireEligibilityEvidence } from './fire-eligibility';
 
 export type ThreadPriority = 'P0' | 'P1' | 'P2' | 'P3';
 export type ThreadClass = 'ready' | 'stale' | 'blocked' | 'healthy';
 export type TmActionType = 'deliver_ruling' | 'nudge' | 'escalate_p0' | 'digest' | 'fire_cauldron';
 
-export interface FireEvidence {
-  woId: string;
-  targetRepo: string;
-  project: string;
-  specVerifiedAt: string;
-  noOpenOrMergedPr: true;
-  specSource: 'repo-path' | 'date-glob' | 'issue-body';
-}
+export type FireEvidence = FireEligibilityEvidence;
 
 export interface ThreadSnapshot {
   /** Stable reference, e.g. "gh:owner/repo#123" or "dispatch:<message-id>" */
@@ -337,7 +331,7 @@ export function computeNextAction(
     };
   }
 
-  if (thread.isUnclaimed ?? thread.isUnclaimedP0) {
+  if ((thread.isUnclaimed ?? thread.isUnclaimedP0) && classification !== 'blocked') {
     const bucket = Math.floor(context.nowMs / NUDGE_CLOCK_MS.P0);
     if (
       context.fireEligible &&
@@ -356,7 +350,14 @@ export function computeNextAction(
         fireEvidence: context.fireEvidence,
       };
     }
-    if (context.fireEligible && context.fireEvidence && context.fireHolding) return null;
+    if (
+      thread.isUnclaimedP0 &&
+      context.fireEligible &&
+      context.fireEvidence &&
+      context.fireHolding
+    ) {
+      return null;
+    }
   }
 
   if (classification === 'healthy') return null;
