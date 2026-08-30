@@ -12,7 +12,7 @@ import {
   type TmHealthState,
   type TmUsageSample,
 } from '@archon/core/db/taskmaster';
-import { createMessage } from '@archon/core/db/dispatch';
+import { createAuthenticatedMessage } from '@archon/core/db/dispatch';
 
 export const BINARY_TO_PROVIDER = { grok: 'xai', codex: 'codex' } as const;
 export const MODEL_RESOURCE_FAILURE_THRESHOLD = 3;
@@ -33,7 +33,7 @@ export interface ModelResourceHealthDeps {
   getSamples?: typeof getRecentUsageSamples;
   recordSample?: typeof recordUsageSample;
   upsertHealth?: typeof upsertHealthSample;
-  sendSignal?: typeof createMessage;
+  sendSignal?: typeof createAuthenticatedMessage;
   now?: () => Date;
 }
 
@@ -120,15 +120,17 @@ export async function recordSpawnOutcome(
       .map(sample => ({ sample, outcome: outcomeOf(sample) }))
       .filter(item => item.outcome !== null);
     const episode = known.slice(0, health.consecutiveFailures).at(-1)?.sample.id ?? 'unknown';
-    await (deps.sendSignal ?? createMessage)({
-      correlation_id: `model-resource:${provider}:${episode}`,
-      idempotency_key: `model-resource-degraded:${provider}:${episode}`,
-      task_type: 'agent_message',
-      sender: 'taskmaster',
-      recipient: 'operator',
-      priority: 'blocker',
-      body: `Model resource ${provider} is degraded after ${health.consecutiveFailures} consecutive judge spawn failures; last success: ${health.lastSuccessAt ?? 'none recorded'}.`,
-    });
+    await (deps.sendSignal ?? createAuthenticatedMessage)(
+      { kind: 'system', sender: 'taskmaster' },
+      {
+        correlation_id: `model-resource:${provider}:${episode}`,
+        idempotency_key: `model-resource-degraded:${provider}:${episode}`,
+        task_type: 'agent_message',
+        recipient: 'operator',
+        priority: 'blocker',
+        body: `Model resource ${provider} is degraded after ${health.consecutiveFailures} consecutive judge spawn failures; last success: ${health.lastSuccessAt ?? 'none recorded'}.`,
+      }
+    );
   }
   return health;
 }

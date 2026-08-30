@@ -3,6 +3,11 @@ import { createLogger } from '@archon/paths';
 import { getDatabase } from './connection';
 import { appendBoardAuditEvent, resolveBoardRecipient } from './board-authority';
 import type { QueryResult } from './adapters/types';
+import {
+  DispatchNonSystemCapability,
+  resolveDispatchSenderCapability,
+  type DispatchCreationAuthority,
+} from './dispatch-sender-authority';
 
 const log = createLogger('db/dispatch');
 
@@ -29,6 +34,7 @@ export interface DispatchMessage {
   idempotency_key: string;
   task_type: DispatchTaskType;
   sender: string;
+  sender_principal_id: string | null;
   recipient: string;
   body: string;
   status: DispatchMessageStatus;
@@ -148,6 +154,7 @@ function normalizeNullableTimestamp(value: unknown): string | null {
 function normalizeMessage(row: DispatchMessageRow): DispatchMessage {
   return {
     ...row,
+    sender_principal_id: row.sender_principal_id === undefined ? null : row.sender_principal_id,
     created_at: normalizeTimestamp(row.created_at),
     claimed_at: normalizeNullableTimestamp(row.claimed_at),
     completed_at: normalizeNullableTimestamp(row.completed_at),
@@ -285,11 +292,13 @@ function staleCutoffIso(staleAfterMs: number): string {
   return new Date(Date.now() - staleAfterMs).toISOString();
 }
 
-export async function createMessage(data: {
+export type DispatchSenderContext = DispatchCreationAuthority;
+export type { FixedDispatchSystemSender } from './dispatch-sender-authority';
+
+export interface CreateAuthenticatedMessageData {
   correlation_id: string;
   idempotency_key: string;
   task_type: DispatchTaskType;
-  sender: string;
   recipient: string;
   body: string;
   not_before?: string | null;
@@ -299,25 +308,56 @@ export async function createMessage(data: {
   motion_revision_sha?: string | null;
   subject_key?: string | null;
   repeat_reason?: string | null;
-  supersedes_id?: string | null;
-}): Promise<DispatchMessage> {
-  const db = getDatabase();
-  return createMessageWithQuery((sql, params) => db.query(sql, params), data);
 }
 
-type CreateDispatchMessageData = Parameters<typeof createMessage>[0];
+function bindSenderContext(context: DispatchSenderContext): {
+  sender: string;
+  sender_principal_id: string | null;
+} {
+  if ('kind' in context && context.kind === 'system') {
+    const sender = context.sender;
+    if (sender !== 'dispatch' && sender !== 'overseer' && sender !== 'taskmaster') {
+      throw new Error('dispatch_internal_sender_invalid');
+    }
+    return {
+      sender,
+      sender_principal_id: `system:${sender}`,
+    };
+  }
+  if (!(context instanceof DispatchNonSystemCapability)) {
+    throw new Error('dispatch_sender_capability_invalid');
+  }
+  return resolveDispatchSenderCapability(context);
+}
 
-async function createMessageWithQuery(
-  query: DispatchQueryExecutor,
-  data: CreateDispatchMessageData
+export async function createAuthenticatedMessage(
+  context: DispatchSenderContext,
+  data: CreateAuthenticatedMessageData
 ): Promise<DispatchMessage> {
-  const existing = await query<CompatibleDispatchMessageRow>(
-    'SELECT * FROM agent_dispatch_messages WHERE idempotency_key = $1',
-    [data.idempotency_key]
-  );
-  const existingRow = existing.rows.find(
-    row => row.sender_principal_id === undefined || row.sender_principal_id === null
-  );
+  if ('supersedes_id' in data) throw new Error('dispatch_supersedes_guarded_path_required');
+  const bound = bindSenderContext(context);
+  const db = getDatabase();
+  return createAuthenticatedMessageWithQuery((sql, params) => db.query(sql, params), {
+    bound,
+    data,
+  });
+}
+
+async function createAuthenticatedMessageWithQuery(
+  query: DispatchQueryExecutor,
+  input: {
+    bound: { sender: string; sender_principal_id: string | null };
+    data: CreateAuthenticatedMessageData;
+  },
+  supersedesId: string | null = null
+): Promise<DispatchMessage> {
+  const data = input.data;
+  const bound = input.bound;
+  const senderPrincipalId = bound.sender_principal_id;
+  const sender = bound.sender;
+
+  const existing = await findIdempotentMessage(query, data.idempotency_key, bound);
+  const existingRow = existing.rows[0];
   if (existingRow) return normalizeMessage(existingRow);
 
   const subjectKey =
@@ -344,9 +384,9 @@ async function createMessageWithQuery(
   const now = nowIso();
   const result = await query<CompatibleDispatchMessageRow>(
     `INSERT INTO agent_dispatch_messages
-     (id, correlation_id, idempotency_key, task_type, sender, recipient, body, status, created_at, not_before, priority, fencing_token,
+     (id, correlation_id, idempotency_key, task_type, sender, sender_principal_id, recipient, body, status, created_at, not_before, priority, fencing_token,
       recipient_alias, motion_id, motion_revision_sha, subject_key, repeat_reason, supersedes_id)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, 'queued', $8, $9, $10, 0, $11, $12, $13, $14, $15, $16)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'queued', $9, $10, $11, 0, $12, $13, $14, $15, $16, $17)
      ON CONFLICT DO NOTHING
      RETURNING *`,
     [
@@ -354,7 +394,8 @@ async function createMessageWithQuery(
       data.correlation_id,
       data.idempotency_key,
       data.task_type,
-      data.sender,
+      sender,
+      senderPrincipalId,
       recipientAssessment.canonical_principal,
       data.body,
       now,
@@ -365,22 +406,33 @@ async function createMessageWithQuery(
       data.motion_revision_sha ?? null,
       subjectKey,
       repeatReason,
-      data.supersedes_id ?? null,
+      supersedesId,
     ]
   );
   const row = result.rows[0];
   if (row) return normalizeMessage(row);
 
-  const conflict = await query<CompatibleDispatchMessageRow>(
-    'SELECT * FROM agent_dispatch_messages WHERE idempotency_key = $1',
-    [data.idempotency_key]
+  const conflict = await findIdempotentMessage(query, data.idempotency_key, bound);
+  const conflictRow = conflict.rows[0];
+  if (!conflictRow) throw new Error('dispatch_idempotency_namespace_conflict');
+  return normalizeMessage(conflictRow);
+}
+
+async function findIdempotentMessage(
+  query: DispatchQueryExecutor,
+  idempotencyKey: string,
+  bound: { sender: string; sender_principal_id: string | null }
+): Promise<QueryResult<CompatibleDispatchMessageRow>> {
+  return query<CompatibleDispatchMessageRow>(
+    bound.sender_principal_id === null
+      ? `SELECT * FROM agent_dispatch_messages
+         WHERE idempotency_key = $1 AND sender_principal_id IS NULL`
+      : `SELECT * FROM agent_dispatch_messages
+         WHERE idempotency_key = $1 AND sender_principal_id = $2`,
+    bound.sender_principal_id === null
+      ? [idempotencyKey]
+      : [idempotencyKey, bound.sender_principal_id]
   );
-  const legacyConflict = conflict.rows.find(
-    candidate =>
-      candidate.sender_principal_id === undefined || candidate.sender_principal_id === null
-  );
-  if (!legacyConflict) throw new Error('dispatch_idempotency_namespace_conflict');
-  return normalizeMessage(legacyConflict);
 }
 
 export async function getMessage(id: string): Promise<DispatchMessage | null> {
@@ -1083,9 +1135,10 @@ export async function cancelMessage(data: {
 
 export async function supersedeMessage(data: {
   id: string;
-  sender: string;
-  replacement: Omit<Parameters<typeof createMessage>[0], 'sender' | 'supersedes_id'>;
+  sender_context: DispatchSenderContext;
+  replacement: CreateAuthenticatedMessageData;
 }): Promise<DispatchMutationResult> {
+  const bound = bindSenderContext(data.sender_context);
   const db = getDatabase();
   return db.withTransaction(async query => {
     const lock = db.dialect === 'postgres' ? ' FOR UPDATE' : '';
@@ -1095,8 +1148,12 @@ export async function supersedeMessage(data: {
     );
     if (!found.rows[0]) return { ok: false, reason: 'not_found' };
     const source = normalizeMessage(found.rows[0]);
-    if (canonicalizePrincipal(source.sender) !== canonicalizePrincipal(data.sender))
+    if (source.sender_principal_id !== null) {
+      if (source.sender_principal_id !== bound.sender_principal_id)
+        return { ok: false, reason: 'actor_mismatch' };
+    } else if (canonicalizePrincipal(source.sender) !== canonicalizePrincipal(bound.sender)) {
       return { ok: false, reason: 'actor_mismatch' };
+    }
     if (source.status !== 'queued' || source.claimed_at || source.acknowledged_at)
       return { ok: false, reason: 'not_queued' };
     const existingReplacement = await query<DispatchMessageRow>(
@@ -1105,11 +1162,14 @@ export async function supersedeMessage(data: {
     );
     if (existingReplacement.rows[0])
       return { ok: true, message: normalizeMessage(existingReplacement.rows[0]) };
-    const replacement = await createMessageWithQuery(query, {
-      ...data.replacement,
-      sender: data.sender,
-      supersedes_id: data.id,
-    });
+    const replacement = await createAuthenticatedMessageWithQuery(
+      query,
+      {
+        bound,
+        data: data.replacement,
+      },
+      data.id
+    );
     const update = await query(
       `UPDATE agent_dispatch_messages SET status = 'cancelled', route_disposition = 'superseded',
       completed_at = $2 WHERE id = $1 AND status = 'queued'`,
@@ -1136,6 +1196,7 @@ export async function claimDispatchEscalation(data: {
      AND priority = 'blocker' AND COALESCE(resolved_recipient, recipient) = 'xo'
      AND addressed_at IS NULL AND status <> 'cancelled'
      AND (route_disposition IS NULL OR route_disposition <> 'superseded')
+     AND sender_principal_id IS NOT NULL
      AND created_at <= $3`,
     [data.id, now, cutoff]
   );
@@ -1160,29 +1221,33 @@ export async function ensureXoEscalationHandoffs(activatedAt: string): Promise<n
   const rows = await getDatabase().query<DispatchMessageRow>(
     `SELECT source.* FROM agent_dispatch_messages source
      WHERE source.created_at >= $1 AND source.priority = 'blocker'
+       AND source.sender_principal_id IS NOT NULL
        AND LOWER(TRIM(COALESCE(source.resolved_recipient, source.recipient))) <> 'xo'
        AND source.addressed_at IS NULL
        AND source.status <> 'cancelled'
        AND (source.route_disposition IS NULL OR source.route_disposition <> 'superseded')
        AND NOT EXISTS (SELECT 1 FROM agent_dispatch_messages handoff
-         WHERE handoff.idempotency_key = 'xo-handoff:' || source.id) LIMIT 100`,
+         WHERE handoff.idempotency_key = 'xo-handoff:' || source.id
+           AND handoff.sender_principal_id = 'system:dispatch') LIMIT 100`,
     [activatedAt]
   );
   let created = 0;
   for (const row of rows.rows) {
     const source = normalizeMessage(row);
     try {
-      await createMessage({
-        correlation_id: source.correlation_id,
-        idempotency_key: `xo-handoff:${source.id}`,
-        task_type: 'agent_message',
-        sender: 'dispatch',
-        recipient: 'xo',
-        priority: 'blocker',
-        subject_key: source.subject_key,
-        repeat_reason: source.subject_key ? 'system XO escalation handoff' : null,
-        body: JSON.stringify({ source_id: source.id, kind: 'xo_escalation_handoff' }),
-      });
+      await createAuthenticatedMessage(
+        { kind: 'system', sender: 'dispatch' },
+        {
+          correlation_id: source.correlation_id,
+          idempotency_key: `xo-handoff:${source.id}`,
+          task_type: 'agent_message',
+          recipient: 'xo',
+          priority: 'blocker',
+          subject_key: source.subject_key,
+          repeat_reason: source.subject_key ? 'system XO escalation handoff' : null,
+          body: JSON.stringify({ source_id: source.id, kind: 'xo_escalation_handoff' }),
+        }
+      );
       created++;
     } catch {
       log.warn(
@@ -1201,6 +1266,7 @@ export async function listEligibleXoEscalations(activatedAt: string): Promise<Di
        AND LOWER(TRIM(COALESCE(resolved_recipient, recipient))) = 'xo'
        AND addressed_at IS NULL AND status <> 'cancelled'
        AND (route_disposition IS NULL OR route_disposition <> 'superseded')
+       AND sender_principal_id IS NOT NULL
      ORDER BY created_at ASC LIMIT 100`,
     [activatedAt]
   );
@@ -1217,26 +1283,29 @@ async function attemptDispatchOutcomeNotice(
     !Number.isFinite(Date.parse(activatedAt)) ||
     source.created_at < new Date(activatedAt).toISOString() ||
     source.sender === 'dispatch' ||
+    source.sender_principal_id == null ||
     !(['done', 'failed'] as DispatchMessageStatus[]).includes(source.status) ||
     source.task_outcome === 'succeeded'
   )
     return false;
   try {
-    await createMessage({
-      correlation_id: source.correlation_id,
-      idempotency_key: `outcome-notice:${source.id}`,
-      task_type: 'agent_message',
-      sender: 'dispatch',
-      recipient: source.sender,
-      priority: 'blocker',
-      subject_key: source.subject_key,
-      repeat_reason: source.subject_key ? 'system outcome notice' : null,
-      body: JSON.stringify({
-        source_id: source.id,
-        status: source.status,
-        task_outcome: source.task_outcome,
-      }),
-    });
+    await createAuthenticatedMessage(
+      { kind: 'system', sender: 'dispatch' },
+      {
+        correlation_id: source.correlation_id,
+        idempotency_key: `outcome-notice:${source.id}`,
+        task_type: 'agent_message',
+        recipient: source.sender,
+        priority: 'blocker',
+        subject_key: source.subject_key,
+        repeat_reason: source.subject_key ? 'system outcome notice' : null,
+        body: JSON.stringify({
+          source_id: source.id,
+          status: source.status,
+          task_outcome: source.task_outcome,
+        }),
+      }
+    );
     return true;
   } catch {
     log.warn(
@@ -1251,10 +1320,13 @@ export async function reconcileDispatchOutcomeNotices(activatedAt: string): Prom
   if (!Number.isFinite(Date.parse(activatedAt))) return 0;
   const candidates = await getDatabase().query<DispatchMessageRow>(
     `SELECT source.* FROM agent_dispatch_messages source WHERE source.created_at >= $1
-     AND source.sender <> 'dispatch' AND source.status IN ('done', 'failed')
+     AND source.sender <> 'dispatch'
+     AND source.sender_principal_id IS NOT NULL
+     AND source.status IN ('done', 'failed')
      AND (source.task_outcome IS NULL OR source.task_outcome IN ('failed', 'blocked'))
      AND NOT EXISTS (SELECT 1 FROM agent_dispatch_messages notice
-       WHERE notice.idempotency_key = 'outcome-notice:' || source.id) LIMIT 100`,
+       WHERE notice.idempotency_key = 'outcome-notice:' || source.id
+         AND notice.sender_principal_id = 'system:dispatch') LIMIT 100`,
     [activatedAt]
   );
   let created = 0;

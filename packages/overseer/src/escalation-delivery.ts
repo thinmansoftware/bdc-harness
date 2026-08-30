@@ -8,7 +8,7 @@ import {
   type OperatorCardChannelName,
   type OperatorCardView,
 } from '@archon/core/db/overseer-briefing';
-import { createMessage } from '@archon/core/db/dispatch';
+import { createAuthenticatedMessage } from '@archon/core/db/dispatch';
 import { assessDispatchMessageBody } from '@archon/core/utils/dispatch-content-guard';
 import { buildDispatchRunReportBody, lookupNotionPage } from './escalate';
 import { resolveWoBoardSeatOwner } from './owner-resolution';
@@ -94,14 +94,16 @@ export function createDefaultOperatorCardChannels(
           error_class: assessment.reason ?? 'content_guard_rejected',
         };
       }
-      const message = await createMessage({
-        correlation_id: card.card.run_id,
-        idempotency_key: idempotencyKey,
-        task_type: 'run_report',
-        sender: 'overseer',
-        recipient: (await deps.resolve_owner(card.card.wo_id)) ?? 'operator',
-        body,
-      });
+      const message = await createAuthenticatedMessage(
+        { kind: 'system', sender: 'overseer' },
+        {
+          correlation_id: card.card.run_id,
+          idempotency_key: idempotencyKey,
+          task_type: 'run_report',
+          recipient: (await deps.resolve_owner(card.card.wo_id)) ?? 'operator',
+          body,
+        }
+      );
       return {
         outcome: 'succeeded',
         sanitized_status: 'dispatch_queued',
