@@ -285,6 +285,19 @@ export function createRealSubmitDeps(
           invokeModel: overrides.invokeModel ?? invokeConfiguredReviewModel,
         }
       );
+      // CHECKS_PENDING is a non-terminal defer, NOT a verdict. Surface it as a
+      // distinct signal so the submit path can release-and-retry rather than
+      // fall through to the summary/`approved` mapping below, which would
+      // otherwise emit `approved: false` -- a de facto REQUEST_CHANGES on
+      // checks-pending grounds (the exact bug this WO fixes).
+      if (result.verdict === 'CHECKS_PENDING') {
+        return {
+          approved: false,
+          summary: '',
+          reviewedHeadSha: result.reviewed_head_sha,
+          checksPending: true,
+        };
+      }
       const summary =
         result.findings.length > 0
           ? result.findings

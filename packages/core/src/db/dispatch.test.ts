@@ -43,6 +43,7 @@ import {
   reconcileDispatchOutcomeNotices,
   registerWorker,
   releaseDispatchEscalationClaim,
+  releaseMessage,
   renewMessageLease,
   resolveDispatchRecipient,
   assessDispatchRecipient,
@@ -1355,6 +1356,128 @@ describe('dispatch db', () => {
     await cancelMessage({ id: message.id, sender: message.sender });
     expect(
       await renewMessageLease({ id: message.id, worker_id: 'worker-a', fencing_token: 1 })
+    ).toBeNull();
+  });
+
+  test('releaseMessage returns a claimed item to queued and it is immediately reclaimable', async () => {
+    // WO-HARNESS-OVERSEER-REVIEW-WAITS-FOR-CHECKS-01: the review worker releases
+    // a checks-pending item instead of posting a terminal result.
+    await registerWorker({
+      worker_id: 'worker-a',
+      host: 'host-a',
+      capabilities: { providers: ['grok'] },
+      max_concurrency: 1,
+    });
+    await registerWorker({
+      worker_id: 'worker-b',
+      host: 'host-b',
+      capabilities: { providers: ['grok'] },
+      max_concurrency: 1,
+    });
+    const message = await createMessage({
+      correlation_id: 'corr-release',
+      idempotency_key: 'idem-release',
+      task_type: 'agent_message',
+      sender: 'xo',
+      recipient: 'grok',
+      body: 'Defer me.',
+    });
+
+    const claim = await claimMessage({ id: message.id, worker_id: 'worker-a' });
+    expect(claim?.status).toBe('claimed');
+    expect(claim?.fencing_token).toBe(1);
+
+    const released = await releaseMessage({
+      id: message.id,
+      worker_id: 'worker-a',
+      fencing_token: claim?.fencing_token ?? 0,
+    });
+    expect(released?.status).toBe('queued');
+    expect(released?.lease_owner).toBeNull();
+    expect(released?.lease_expires_at).toBeNull();
+    // Not bumped on release; the next claim bumps it.
+    expect(released?.fencing_token).toBe(1);
+
+    // Immediately reclaimable (no not_before) by any worker.
+    const reclaim = await claimMessage({ id: message.id, worker_id: 'worker-b' });
+    expect(reclaim?.status).toBe('claimed');
+    expect(reclaim?.fencing_token).toBe(2);
+  });
+
+  test('releaseMessage with a future not_before defers reclaim and queued visibility', async () => {
+    await registerWorker({
+      worker_id: 'worker-a',
+      host: 'host-a',
+      capabilities: { providers: ['grok'] },
+      max_concurrency: 1,
+    });
+    const message = await createMessage({
+      correlation_id: 'corr-release-backoff',
+      idempotency_key: 'idem-release-backoff',
+      task_type: 'agent_message',
+      sender: 'xo',
+      recipient: 'grok',
+      body: 'Backoff me.',
+    });
+
+    const claim = await claimMessage({ id: message.id, worker_id: 'worker-a' });
+    expect(claim?.status).toBe('claimed');
+
+    const future = new Date(Date.now() + 60_000).toISOString();
+    const released = await releaseMessage({
+      id: message.id,
+      worker_id: 'worker-a',
+      fencing_token: claim?.fencing_token ?? 0,
+      not_before: future,
+    });
+    expect(released?.status).toBe('queued');
+    expect(released?.not_before).toBe(future);
+
+    // Not visible to the queued worker query while backed off...
+    const queued = await listMessages({ recipient: 'grok', status: 'queued' });
+    expect(queued.map(item => item.id)).not.toContain(message.id);
+
+    // ...nor claimable until not_before passes.
+    expect(await claimMessage({ id: message.id, worker_id: 'worker-a' })).toBeNull();
+  });
+
+  test('releaseMessage rejects non-owner, stale token, and unclaimed messages', async () => {
+    await registerWorker({
+      worker_id: 'worker-a',
+      host: 'host-a',
+      capabilities: { providers: ['grok'] },
+      max_concurrency: 1,
+    });
+    const message = await createMessage({
+      correlation_id: 'corr-release-guard',
+      idempotency_key: 'idem-release-guard',
+      task_type: 'agent_message',
+      sender: 'xo',
+      recipient: 'grok',
+      body: 'Guarded release.',
+    });
+
+    // Not claimed yet -> nothing to release.
+    expect(
+      await releaseMessage({ id: message.id, worker_id: 'worker-a', fencing_token: 1 })
+    ).toBeNull();
+
+    const claim = await claimMessage({ id: message.id, worker_id: 'worker-a' });
+    expect(claim?.status).toBe('claimed');
+
+    // Wrong owner.
+    expect(
+      await releaseMessage({ id: message.id, worker_id: 'worker-b', fencing_token: 1 })
+    ).toBeNull();
+    // Stale token.
+    expect(
+      await releaseMessage({ id: message.id, worker_id: 'worker-a', fencing_token: 99 })
+    ).toBeNull();
+
+    // Cancelled message is no longer releasable.
+    await cancelMessage({ id: message.id, sender: message.sender });
+    expect(
+      await releaseMessage({ id: message.id, worker_id: 'worker-a', fencing_token: 1 })
     ).toBeNull();
   });
 

@@ -4,6 +4,7 @@ import {
   listMessages,
   postResult,
   registerWorker,
+  releaseMessage,
   type DispatchTaskOutcome,
 } from '@archon/core/db/dispatch';
 import { createLogger } from '@archon/paths';
@@ -23,6 +24,12 @@ import {
 const log = createLogger('dispatch/review-worker-clock');
 const REVIEW_WORKER_ID = 'overseer-review-worker';
 const REVIEW_TASK_TYPE = 'run_review';
+// How long a checks-pending review item is held back before it becomes
+// re-claimable, so the worker does not re-poll the checks API every tick.
+const CHECKS_PENDING_BACKOFF_MS = Math.max(
+  1_000,
+  Number(process.env.OVERSEER_REVIEW_CHECKS_PENDING_BACKOFF_MS) || 60_000
+);
 let timer: ReturnType<typeof setInterval> | null = null;
 let inFlight = false;
 
@@ -32,6 +39,7 @@ export interface ReviewWorkerDeps {
   listMessages: typeof listMessages;
   claimMessage: typeof claimMessage;
   postResult: typeof postResult;
+  releaseMessage: typeof releaseMessage;
   runAndSubmitReview: typeof runAndSubmitReview;
   createSubmitDeps: (reviewerIdentity: string) => ReturnType<typeof createRealSubmitDeps>;
 }
@@ -41,7 +49,9 @@ interface ResultMapping {
   task_outcome: DispatchTaskOutcome;
 }
 
-function mapSubmitOutcome(disposition: SubmitDisposition): ResultMapping {
+function mapSubmitOutcome(
+  disposition: Exclude<SubmitDisposition, 'checks_pending'>
+): ResultMapping {
   switch (disposition) {
     case 'approved':
     case 'changes_requested':
@@ -67,6 +77,7 @@ export function createRealReviewWorkerDeps(): ReviewWorkerDeps {
     listMessages,
     claimMessage,
     postResult,
+    releaseMessage,
     runAndSubmitReview,
     createSubmitDeps: createRealSubmitDeps,
   };
@@ -112,6 +123,18 @@ export async function tickReviewWorkerClock(
           work,
           deps.createSubmitDeps(config.reviewerIdentity)
         );
+        // CHECKS PENDING is non-terminal: release the claim (not postResult) with
+        // a backoff so the item is retried on a later tick once CI concludes,
+        // rather than orphaned or re-polled every tick.
+        if (outcome.disposition === 'checks_pending') {
+          await deps.releaseMessage({
+            id: claimed.id,
+            worker_id: REVIEW_WORKER_ID,
+            fencing_token: claimed.fencing_token,
+            not_before: new Date(Date.now() + CHECKS_PENDING_BACKOFF_MS).toISOString(),
+          });
+          continue;
+        }
         const result = mapSubmitOutcome(outcome.disposition);
         await deps.postResult({
           id: claimed.id,

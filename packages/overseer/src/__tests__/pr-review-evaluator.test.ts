@@ -5,6 +5,7 @@ import {
 } from '../adapters/github-real-deps.ts';
 import {
   buildReviewPrompt,
+  checksAreTerminal,
   evaluatePullRequest,
   parseReviewVerdict,
   type PrReviewDeps,
@@ -213,5 +214,74 @@ describe('governed PR-code reviewer', () => {
     expect(prompt).toContain('code diff');
     expect(prompt).toContain('acceptance criteria');
     expect(prompt).toContain('REQUEST_CHANGES');
+  });
+
+  // WO-HARNESS-OVERSEER-REVIEW-WAITS-FOR-CHECKS-01, stop condition 1: a PR whose
+  // checks are still non-terminal must never produce a REQUEST_CHANGES on
+  // checks-pending grounds. Instead it defers (CHECKS_PENDING) WITHOUT invoking
+  // the model.
+  test('11 a non-terminal check defers to CHECKS_PENDING and never invokes the model', async () => {
+    let modelInvoked = false;
+    const result = await evaluatePullRequest(
+      input,
+      deps({
+        fetchEvidence: async () => ({
+          diff: '+ change',
+          checks: [{ name: 'test', status: 'queued', conclusion: null }],
+        }),
+        invokeModel: async () => {
+          modelInvoked = true;
+          return { exitCode: 0, timedOut: false, stdout: output('APPROVE') };
+        },
+      })
+    );
+    expect(result.verdict).toBe('CHECKS_PENDING');
+    expect(result.reviewed_head_sha).toBe(HEAD_A);
+    expect(result.error).toBe('checks_pending');
+    expect(modelInvoked).toBe(false);
+  });
+
+  test('12 an empty checks array (no CI reported yet) also defers to CHECKS_PENDING', async () => {
+    let modelInvoked = false;
+    const result = await evaluatePullRequest(
+      input,
+      deps({
+        fetchEvidence: async () => ({ diff: '+ change', checks: [] }),
+        invokeModel: async () => {
+          modelInvoked = true;
+          return { exitCode: 0, timedOut: false, stdout: output('APPROVE') };
+        },
+      })
+    );
+    expect(result.verdict).toBe('CHECKS_PENDING');
+    expect(modelInvoked).toBe(false);
+  });
+
+  test('13 all-completed checks still flow to the model (regression)', async () => {
+    let modelInvoked = false;
+    const result = await evaluatePullRequest(
+      input,
+      deps({
+        invokeModel: async () => {
+          modelInvoked = true;
+          return { exitCode: 0, timedOut: false, stdout: output('APPROVE') };
+        },
+      })
+    );
+    expect(modelInvoked).toBe(true);
+    expect(result.verdict).toBe('APPROVE');
+  });
+
+  test('14 checksAreTerminal is true only when every reported check is completed', () => {
+    expect(checksAreTerminal([])).toBe(false);
+    expect(checksAreTerminal([{ name: 'a', status: 'completed', conclusion: 'success' }])).toBe(
+      true
+    );
+    expect(
+      checksAreTerminal([
+        { name: 'a', status: 'completed', conclusion: 'success' },
+        { name: 'b', status: 'in_progress', conclusion: null },
+      ])
+    ).toBe(false);
   });
 });

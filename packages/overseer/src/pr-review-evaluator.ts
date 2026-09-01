@@ -1,7 +1,7 @@
 import type { IndependentReviewFinding, ReviewAgentIdentity } from './independent-review-evidence';
 import { assertCandidateIsCurrentHead } from './independent-review-evidence';
 
-export type PrReviewVerdict = 'APPROVE' | 'REQUEST_CHANGES' | 'INDETERMINATE';
+export type PrReviewVerdict = 'APPROVE' | 'REQUEST_CHANGES' | 'INDETERMINATE' | 'CHECKS_PENDING';
 
 export interface PrReviewInput {
   owner: string;
@@ -41,7 +41,7 @@ export interface PrReviewDeps {
 }
 
 interface ParsedReviewVerdict {
-  verdict: Exclude<PrReviewVerdict, 'INDETERMINATE'>;
+  verdict: Exclude<PrReviewVerdict, 'INDETERMINATE' | 'CHECKS_PENDING'>;
   findings: IndependentReviewFinding[];
   reviewed_head_sha: string;
 }
@@ -140,6 +140,31 @@ function indeterminate(
   };
 }
 
+/**
+ * True only when at least one check is reported AND every check has concluded
+ * (status 'completed'). The reviewer must not judge "did the tests pass" while
+ * checks are still queued/in_progress -- that is the bug this WO fixes.
+ *
+ * Known limitation (WO-HARNESS-OVERSEER-REVIEW-WAITS-FOR-CHECKS-01): a repo
+ * with zero CI checks configured would report an empty `checks` array forever
+ * and thus defer forever. Every repo in scope has CI, so this is not exercised
+ * today; no give-up/retry-limit is added (no stop condition requires one).
+ */
+export function checksAreTerminal(checks: PrReviewCheck[]): boolean {
+  return checks.length > 0 && checks.every(check => check.status === 'completed');
+}
+
+function checksPending(input: PrReviewInput, deps: PrReviewDeps): PrReviewResult {
+  return {
+    verdict: 'CHECKS_PENDING',
+    findings: [],
+    reviewed_head_sha: input.head_sha,
+    reviewer: deps.reviewer,
+    acceptance_criteria_available: false,
+    error: 'checks_pending',
+  };
+}
+
 export async function evaluatePullRequest(
   input: PrReviewInput,
   deps: PrReviewDeps
@@ -153,6 +178,12 @@ export async function evaluatePullRequest(
     evidence = await deps.fetchEvidence(input);
   } catch (error) {
     return indeterminate(input, deps, false, `evidence_error:${errorMessage(error)}`);
+  }
+
+  // Defer (never REQUEST_CHANGES) until CI checks on the exact head are
+  // terminal. The model is not invoked in this branch.
+  if (!checksAreTerminal(evidence.checks)) {
+    return checksPending(input, deps);
   }
 
   let acceptanceCriteria: string | null = null;
