@@ -1086,6 +1086,69 @@ export async function renewMessageLease(data: {
   return getMessage(data.id);
 }
 
+/**
+ * Returns a claimed message to the queued state so it can be reviewed again on
+ * a later worker tick.
+ *
+ * WO-HARNESS-OVERSEER-REVIEW-WAITS-FOR-CHECKS-01 (Option B): the PR-review
+ * worker defers review until CI checks on the bound head are terminal. When
+ * checks are still pending it must release its claim rather than post a
+ * terminal result -- otherwise the item is either orphaned (never rediscovered
+ * by the queued-only worker query) or collapsed into a REQUEST_CHANGES.
+ *
+ * Guards are identical in shape to renewMessageLease/postResult: only the
+ * current lease owner, holding the current fencing token, on a message still in
+ * 'claimed', may release it. The fencing token is NOT bumped -- the next
+ * claimMessage bumps it itself. Only lease_owner/lease_expires_at are cleared,
+ * matching cancelMessage's precedent; claimed_at is left as-is (claimMessage
+ * unconditionally overwrites it on the next successful claim).
+ *
+ * `not_before` schedules a backoff: a released item is not reclaimable (nor
+ * visible to listMessages with status 'queued') until that time passes, which
+ * is how the review worker avoids hammering the checks API every tick.
+ */
+export async function releaseMessage(data: {
+  id: string;
+  worker_id: string;
+  fencing_token: number;
+  not_before?: string | null;
+}): Promise<DispatchMessage | null> {
+  const db = getDatabase();
+  const notBefore = data.not_before ?? null;
+  if (db.dialect === 'postgres') {
+    const result = await db.query<DispatchMessageRow>(
+      `UPDATE agent_dispatch_messages
+       SET status = 'queued',
+           lease_owner = NULL,
+           lease_expires_at = NULL,
+           not_before = $4
+       WHERE id = $1
+         AND lease_owner = $2
+         AND fencing_token = $3
+         AND status = 'claimed'
+       RETURNING *`,
+      [data.id, data.worker_id, data.fencing_token, notBefore]
+    );
+    const row = result.rows[0];
+    return row ? normalizeMessage(row) : null;
+  }
+
+  const result = await db.query(
+    `UPDATE agent_dispatch_messages
+     SET status = 'queued',
+         lease_owner = NULL,
+         lease_expires_at = NULL,
+         not_before = $4
+     WHERE id = $1
+       AND lease_owner = $2
+       AND fencing_token = $3
+       AND status = 'claimed'`,
+    [data.id, data.worker_id, data.fencing_token, notBefore]
+  );
+  if (result.rowCount !== 1) return null;
+  return getMessage(data.id);
+}
+
 export type DispatchMutationResult =
   | { ok: true; message: DispatchMessage }
   | {

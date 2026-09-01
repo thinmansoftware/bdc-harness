@@ -95,7 +95,7 @@ export interface RealGitHubOctokitLike {
         html_url: string;
         changed_files?: number;
         head: { sha: string };
-        base?: { sha: string };
+        base?: { sha: string; ref?: string };
       };
     }>;
     merge(input: {
@@ -167,12 +167,39 @@ export interface RealGitHubOctokitLike {
       base: string;
       head: string;
     }): Promise<{ data: { files?: { filename: string; patch?: string }[] } }>;
+    /**
+     * Optional: branch-protection required status-check contexts for a branch.
+     * Present on the real Octokit client; omitted by narrow test mocks. Returns
+     * the enforced context names. GitHub answers 404 BOTH when the branch is
+     * unprotected AND when the token cannot see protection (it masks 403 as 404
+     * on admin-scoped endpoints), so a failure is never authoritative evidence
+     * that no required contexts exist -- callers must treat it as "unknown".
+     */
+    getAllStatusCheckContexts?(input: {
+      owner: string;
+      repo: string;
+      branch: string;
+    }): Promise<{ data: string[] }>;
   };
 }
 
 export interface ExactHeadPullRequestEvidence {
   diff: string;
   checks: { name: string; status: string; conclusion: string | null }[];
+  /**
+   * Required status-check contexts enforced on the PR's base branch.
+   *
+   * Tri-state, and the distinction is load-bearing:
+   * - `string[]` (possibly empty) -- an AUTHORITATIVE answer. Empty means the
+   *   base branch genuinely enforces no required contexts.
+   * - `null` -- UNKNOWN. The authoritative set could not be obtained (missing
+   *   permission, transient API error, unsupported/unreadable protection
+   *   config, or an API surface that cannot answer). The reviewer defers on
+   *   `null`; it must never be collapsed into "no required contexts", which
+   *   would let one fast completed check trigger review before the rest of the
+   *   required suite registers.
+   */
+  requiredContexts: string[] | null;
 }
 
 /** Read review evidence with every ref-addressable call pinned to headSha. */
@@ -212,6 +239,53 @@ export function createRealFetchExactHeadPullRequestEvidence(
         per_page: 100,
       }),
     ]);
+    // Required status-check contexts on the base branch are the authoritative
+    // complete-suite signal: without them, one fast check completing before the
+    // rest of CI registers could trigger review prematurely.
+    //
+    // This lookup FAILS CLOSED. Any inability to obtain the authoritative set
+    // -- unreadable/absent branch protection (GitHub returns 404 both when a
+    // branch is unprotected and when the token lacks admin scope, so 404 is not
+    // distinguishable and is NOT evidence of "no required checks"), a transient
+    // API error, an API surface that cannot answer, or a non-array payload --
+    // yields `null` (UNKNOWN), and the reviewer defers rather than falling back
+    // to the weaker reported-checks heuristic. Deferral is retried with backoff
+    // by the review worker, so an unknown state re-resolves as soon as the
+    // lookup succeeds; it is never silently downgraded to an approval path.
+    const baseRef = pr.data.base?.ref;
+    let requiredContexts: string[] | null = null;
+    if (!baseRef || !octokit.repos.getAllStatusCheckContexts) {
+      log.warn(
+        {
+          owner: input.owner,
+          repo: input.repo,
+          baseRef: baseRef ?? null,
+          reason: !baseRef ? 'base_ref_unavailable' : 'protection_api_unavailable',
+        },
+        'overseer.github_real_deps.required_contexts_unknown_deferring_review'
+      );
+    } else {
+      try {
+        const contexts = await octokit.repos.getAllStatusCheckContexts({
+          owner: input.owner,
+          repo: input.repo,
+          branch: baseRef,
+        });
+        if (Array.isArray(contexts.data)) {
+          requiredContexts = contexts.data.map(context => context.trim()).filter(Boolean);
+        } else {
+          log.warn(
+            { owner: input.owner, repo: input.repo, baseRef, reason: 'non_array_payload' },
+            'overseer.github_real_deps.required_contexts_unknown_deferring_review'
+          );
+        }
+      } catch (error) {
+        log.warn(
+          { err: error, owner: input.owner, repo: input.repo, baseRef, reason: 'lookup_failed' },
+          'overseer.github_real_deps.required_contexts_unknown_deferring_review'
+        );
+      }
+    }
     return {
       diff: (comparison.data.files ?? [])
         .map(file => `--- ${file.filename}\n${file.patch ?? '[binary or patch unavailable]'}`)
@@ -221,6 +295,7 @@ export function createRealFetchExactHeadPullRequestEvidence(
         status: run.status,
         conclusion: run.conclusion,
       })),
+      requiredContexts,
     };
   };
 }
