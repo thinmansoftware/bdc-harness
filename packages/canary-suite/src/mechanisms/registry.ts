@@ -8,11 +8,18 @@ import { probeReviewGate } from './probes/review-gate';
 import { probeTaskmaster } from './probes/taskmaster';
 import { probeXoLease } from './probes/xo-lease';
 import type { MechanismDefinition, MechanismProbeResult } from './types';
+import {
+  deploySignals,
+  dispatchTransports,
+  knowledgeSignals,
+  ledgerAdapter,
+  operatorInboxAdapter,
+  reviewCoverageAdapter,
+  xoLeaseSignal,
+} from './live-adapters';
 
 const unavailable = (reason: string): Promise<MechanismProbeResult> =>
   Promise.resolve({ verdict: 'failed', reasonCodes: [reason], evidenceRefs: [] });
-const blocked = (reason: string): Promise<MechanismProbeResult> =>
-  Promise.resolve({ verdict: 'blocked', reasonCodes: [reason], evidenceRefs: [] });
 
 export const mechanismRegistry: readonly MechanismDefinition[] = [
   {
@@ -37,19 +44,19 @@ export const mechanismRegistry: readonly MechanismDefinition[] = [
     id: 'review-gate',
     description: 'Open PR repositories have recent review ingests',
     level: 0,
-    probe: () => probeReviewGate(async () => []),
+    probe: ({ env }) => probeReviewGate(reviewCoverageAdapter(env)),
   },
   {
     id: 'dispatch-transport',
     description: 'Providers return readable round-trip replies',
     level: 1,
-    probe: () => probeDispatchTransport([]),
+    probe: ({ env }) => probeDispatchTransport(dispatchTransports(env)),
   },
   {
     id: 'xo-lease',
     description: 'XO lease heartbeat is fresh and scheduled',
     level: 0,
-    probe: () => Promise.resolve(probeXoLease(null)),
+    probe: async ({ env }) => probeXoLease(await xoLeaseSignal(env)),
   },
   {
     id: 'taskmaster',
@@ -70,41 +77,24 @@ export const mechanismRegistry: readonly MechanismDefinition[] = [
     id: 'ledger-writes',
     description: 'tm_health write is readable',
     level: 1,
-    probe: () => blocked('tm_health_live_adapter_not_configured'),
+    probe: () => probeLedgerWrites(ledgerAdapter()),
   },
   {
     id: 'operator-inbox',
     description: 'Message can be posted, retrieved, and acknowledged',
     level: 1,
-    probe: () => blocked('operator_inbox_live_adapter_not_configured'),
+    probe: () => probeOperatorInbox(operatorInboxAdapter()),
   },
   {
     id: 'knowledge-layer',
     description: 'Wiki index and Oracle seeded document resolve',
     level: 0,
-    probe: () => probeKnowledgeLayer({ oracle: async () => null, wikiIndex: async () => false }),
+    probe: ({ env }) => probeKnowledgeLayer(knowledgeSignals(env)),
   },
   {
     id: 'deploy-pipeline',
     description: 'Deployed revision matches expected branch HEAD',
     level: 0,
-    probe: ({ env }) =>
-      Promise.resolve(
-        probeDeployPipeline(
-          env.EXPECTED_HEAD && env.DEPLOYED_REVISION
-            ? [
-                {
-                  surface: 'bdc-harness',
-                  expectedHead: env.EXPECTED_HEAD,
-                  deployedRevision: env.DEPLOYED_REVISION,
-                },
-              ]
-            : []
-        )
-      ),
+    probe: async ({ env }) => probeDeployPipeline(await deploySignals(env)),
   },
 ];
-
-// Imports above intentionally keep every concrete probe reachable from this data-only registry.
-void probeLedgerWrites;
-void probeOperatorInbox;

@@ -46,3 +46,23 @@ test('no writes and level 1 excluded by default', async () => {
   expect(writes).toBe(0);
   expect(result.report.mechanisms.map(item => item.id)).toEqual(['review-gate']);
 });
+
+test('a throwing live adapter is recorded and artifacts are still written', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'mechanism-canary-'));
+  const result = await runMechanisms({
+    outputRoot: root,
+    registry: [
+      {
+        id: 'knowledge-layer',
+        description: 'throws',
+        level: 0,
+        probe: async () => {
+          throw new Error('network down');
+        },
+      },
+    ],
+  });
+  expect(result.report.verdict).toBe('failed');
+  expect(result.report.reasonCodes).toEqual(['mechanism_probe_threw:knowledge-layer']);
+  expect(result.artifactPaths.length).toBeGreaterThan(0);
+});

@@ -58,12 +58,26 @@ export async function runMechanisms(
   const suiteRunId = `mechanisms-${generatedAt.replace(/[^0-9]/g, '').slice(0, 14)}-${randomUUID().slice(0, 8)}`;
   const selected = (options.registry ?? mechanismRegistry).filter(item => item.level <= level);
   const mechanisms = await Promise.all(
-    selected.map(async definition => ({
-      id: definition.id,
-      ...evaluateMechanismResult(
-        await definition.probe({ env: options.env ?? process.env, outputRoot: options.outputRoot })
-      ),
-    }))
+    selected.map(async definition => {
+      try {
+        return {
+          id: definition.id,
+          ...evaluateMechanismResult(
+            await definition.probe({
+              env: options.env ?? process.env,
+              outputRoot: options.outputRoot,
+            })
+          ),
+        };
+      } catch (error) {
+        return {
+          id: definition.id,
+          verdict: 'failed' as const,
+          reasonCodes: [`mechanism_probe_threw:${definition.id}`],
+          evidenceRefs: [`error=${(error as Error).message}`],
+        };
+      }
+    })
   );
   const verdict = mechanisms.some(item => item.verdict === 'failed')
     ? 'failed'
