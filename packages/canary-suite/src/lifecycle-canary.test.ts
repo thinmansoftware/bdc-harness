@@ -1,0 +1,692 @@
+import { describe, expect, test } from 'bun:test';
+import {
+  checkInvariantDiffScope,
+  checkLeg1TaskmasterFires,
+  checkLeg2CodexLaneOpensPr,
+  checkLeg3OverseerCatchesDefect,
+  checkLeg4RemediationReachesPr,
+  checkLeg5OverseerReapproves,
+  checkLeg6AutonomousMerge,
+  checkLeg7ReconcileClosesIssue,
+  checkLeg8DispatchReadableReply,
+  checkLeg9DutyOfficerReports,
+  checkLeg10CanaryReverts,
+  runLifecycleCanarySuite,
+  type LegPollConfig,
+  type LifecycleArtifactSource,
+  type LifecycleClock,
+  type LifecycleFireResult,
+} from './lifecycle-canary';
+
+function fakeClock(startMs = 0): LifecycleClock {
+  let t = startMs;
+  return {
+    now: () => t,
+    sleep: async (ms: number) => {
+      t += ms;
+    },
+  };
+}
+
+function poll(): LegPollConfig {
+  return { clock: fakeClock(), timeoutMs: 1_000, intervalMs: 100 };
+}
+
+const RUN_START = '2026-09-02T00:00:00.000Z';
+
+// A source that throws on every method; tests override only what they exercise.
+function stubSource(overrides: Partial<LifecycleArtifactSource>): LifecycleArtifactSource {
+  const reject = (name: string) => async () => {
+    throw new Error(`unexpected call to ${name}`);
+  };
+  return {
+    queryTmJournalFireCauldron: reject('queryTmJournalFireCauldron'),
+    listPrsForBranch: reject('listPrsForBranch'),
+    viewPr: reject('viewPr'),
+    listPrReviews: reject('listPrReviews'),
+    countDiffMatches: reject('countDiffMatches'),
+    queryRunReview: reject('queryRunReview'),
+    mergedActorLogin: reject('mergedActorLogin'),
+    viewIssue: reject('viewIssue'),
+    dispatchResultBody: reject('dispatchResultBody'),
+    readDutyOfficerReport: reject('readDutyOfficerReport'),
+    scratchResidueDiff: reject('scratchResidueDiff'),
+    countRevertCommits: reject('countRevertCommits'),
+    listPrChangedFiles: reject('listPrChangedFiles'),
+    ...overrides,
+  } as LifecycleArtifactSource;
+}
+
+describe('Leg 1 -- Taskmaster fires', () => {
+  test('passes when a fire_cauldron row exists', async () => {
+    const source = {
+      queryTmJournalFireCauldron: async () => [
+        {
+          id: 1,
+          proposal_type: 'fire_cauldron',
+          target: 'bdc-harness#4321',
+          created_at: RUN_START,
+        },
+      ],
+    };
+    const report = await checkLeg1TaskmasterFires({
+      source,
+      sinceIso: RUN_START,
+      targetIssue: 4321,
+      fallbackUsed: false,
+      poll: poll(),
+    });
+    expect(report.verdict).toBe('passed');
+    expect(report.evidenceRefs).toContain('tm_journal.target=bdc-harness#4321');
+  });
+
+  test('blocks with fallback gap when Taskmaster never fires', async () => {
+    const report = await checkLeg1TaskmasterFires({
+      source: { queryTmJournalFireCauldron: async () => [] },
+      sinceIso: RUN_START,
+      fallbackUsed: true,
+      poll: poll(),
+    });
+    expect(report.verdict).toBe('blocked');
+    expect(report.reasonCodes).toContain('taskmaster_never_fires');
+    expect(report.gap).toBe('taskmaster-never-fired, fallback: fire.ps1 used');
+  });
+});
+
+describe('Leg 2 -- codex lane opens PR', () => {
+  test('passes and returns the PR number for exactly one PR on base', async () => {
+    const result = await checkLeg2CodexLaneOpensPr({
+      source: {
+        listPrsForBranch: async () => [
+          { number: 991, headRefName: 'canary/lifecycle-x', baseRefName: 'dev', state: 'OPEN' },
+        ],
+      },
+      headBranch: 'canary/lifecycle-x',
+      baseBranch: 'dev',
+      poll: poll(),
+    });
+    expect(result.report.verdict).toBe('passed');
+    expect(result.prNumber).toBe(991);
+  });
+
+  test('fails with codex_lane_no_pr when no PR is opened', async () => {
+    const result = await checkLeg2CodexLaneOpensPr({
+      source: { listPrsForBranch: async () => [] },
+      headBranch: 'canary/lifecycle-x',
+      baseBranch: 'dev',
+      poll: poll(),
+    });
+    expect(result.report.verdict).toBe('failed');
+    expect(result.report.reasonCodes).toContain('codex_lane_no_pr');
+    expect(result.prNumber).toBeUndefined();
+  });
+});
+
+describe('Leg 3 -- Overseer catches the planted defect', () => {
+  test('passes when a CHANGES_REQUESTED review names the defect literal', async () => {
+    const report = await checkLeg3OverseerCatchesDefect({
+      source: {
+        listPrReviews: async () => [
+          {
+            state: 'CHANGES_REQUESTED',
+            body: 'canary-marker.ts:1 uses WRONG_VALUE instead of the run id',
+            submittedAt: RUN_START,
+            authorLogin: 'overseer-bot',
+          },
+        ],
+      },
+      prNumber: 991,
+      defectSignature: 'WRONG_VALUE',
+      poll: poll(),
+    });
+    expect(report.verdict).toBe('passed');
+  });
+
+  test('fails when the review approves without naming the defect', async () => {
+    const report = await checkLeg3OverseerCatchesDefect({
+      source: {
+        listPrReviews: async () => [
+          {
+            state: 'APPROVED',
+            body: 'looks good',
+            submittedAt: RUN_START,
+            authorLogin: 'overseer-bot',
+          },
+        ],
+      },
+      prNumber: 991,
+      defectSignature: 'WRONG_VALUE',
+      poll: poll(),
+    });
+    expect(report.verdict).toBe('failed');
+    expect(report.reasonCodes).toContain('overseer_missed_planted_defect');
+  });
+});
+
+describe('Leg 4 -- remediation reaches PR', () => {
+  test('passes when the literal is gone and records the auto-remediation gap', async () => {
+    const report = await checkLeg4RemediationReachesPr({
+      source: { countDiffMatches: async () => 0 },
+      prNumber: 991,
+      literal: 'WRONG_VALUE',
+      autoRemediationAvailable: false,
+      poll: poll(),
+    });
+    expect(report.verdict).toBe('passed');
+    expect(report.gap).toContain('#1835');
+  });
+
+  test('fails when the literal remains after the timeout', async () => {
+    const report = await checkLeg4RemediationReachesPr({
+      source: { countDiffMatches: async () => 1 },
+      prNumber: 991,
+      literal: 'WRONG_VALUE',
+      autoRemediationAvailable: true,
+      poll: poll(),
+    });
+    expect(report.verdict).toBe('failed');
+    expect(report.reasonCodes).toContain('remediation_not_applied');
+  });
+});
+
+describe('Leg 5 -- Overseer re-approves on push', () => {
+  const remediationSha = 'abc123';
+  const remediationIso = '2026-09-02T01:00:00.000Z';
+
+  test('passes when the synchronize trigger fired and a later review approved', async () => {
+    const report = await checkLeg5OverseerReapproves({
+      source: {
+        queryRunReview: async () => [
+          {
+            head_sha: remediationSha,
+            action: 'synchronize',
+            created_at: '2026-09-02T01:01:00.000Z',
+          },
+        ],
+        listPrReviews: async () => [
+          {
+            state: 'APPROVED',
+            body: 'ok now',
+            submittedAt: '2026-09-02T01:02:00.000Z',
+            authorLogin: 'overseer-bot',
+          },
+        ],
+      },
+      prNumber: 991,
+      remediationSha,
+      remediationCommitIso: remediationIso,
+      poll: poll(),
+    });
+    expect(report.verdict).toBe('passed');
+  });
+
+  test('fails with resync_trigger_not_firing when no run_review row exists', async () => {
+    const report = await checkLeg5OverseerReapproves({
+      source: {
+        queryRunReview: async () => [],
+        listPrReviews: async () => [
+          {
+            state: 'APPROVED',
+            body: 'ok',
+            submittedAt: '2026-09-02T01:02:00.000Z',
+            authorLogin: 'overseer-bot',
+          },
+        ],
+      },
+      prNumber: 991,
+      remediationSha,
+      remediationCommitIso: remediationIso,
+      poll: poll(),
+    });
+    expect(report.verdict).toBe('failed');
+    expect(report.reasonCodes).toContain('overseer_resync_trigger_not_firing');
+  });
+
+  test('fails with no_reapproval when trigger fired but no later approval', async () => {
+    const report = await checkLeg5OverseerReapproves({
+      source: {
+        queryRunReview: async () => [
+          {
+            head_sha: remediationSha,
+            action: 'synchronize',
+            created_at: '2026-09-02T01:01:00.000Z',
+          },
+        ],
+        listPrReviews: async () => [
+          {
+            state: 'CHANGES_REQUESTED',
+            body: 'still bad',
+            submittedAt: '2026-09-02T01:02:00.000Z',
+            authorLogin: 'overseer-bot',
+          },
+        ],
+      },
+      prNumber: 991,
+      remediationSha,
+      remediationCommitIso: remediationIso,
+      poll: poll(),
+    });
+    expect(report.verdict).toBe('failed');
+    expect(report.reasonCodes).toContain('overseer_no_reapproval');
+  });
+});
+
+describe('Leg 6 -- autonomous merge', () => {
+  test('passes when the bot identity merged', async () => {
+    const report = await checkLeg6AutonomousMerge({
+      source: {
+        viewPr: async () => ({
+          number: 991,
+          state: 'MERGED',
+          mergedByLogin: 'bluedevilcollectibles',
+          commitCount: 2,
+          mergeCommitOid: 'def456',
+        }),
+        mergedActorLogin: async () => 'bluedevilcollectibles',
+      },
+      prNumber: 991,
+      mergeIdentity: 'bluedevilcollectibles',
+      humanLogins: ['jranson'],
+      poll: poll(),
+    });
+    expect(report.verdict).toBe('passed');
+  });
+
+  test('fails with human_merged_not_autonomous when a human merged', async () => {
+    const report = await checkLeg6AutonomousMerge({
+      source: {
+        viewPr: async () => ({
+          number: 991,
+          state: 'MERGED',
+          mergedByLogin: 'jranson',
+          commitCount: 2,
+          mergeCommitOid: 'def456',
+        }),
+        mergedActorLogin: async () => 'jranson',
+      },
+      prNumber: 991,
+      mergeIdentity: 'bluedevilcollectibles',
+      humanLogins: ['jranson'],
+      poll: poll(),
+    });
+    expect(report.verdict).toBe('failed');
+    expect(report.reasonCodes).toContain('human_merged_not_autonomous');
+  });
+
+  test('fails with merge_manager_did_not_merge when still open', async () => {
+    const report = await checkLeg6AutonomousMerge({
+      source: {
+        viewPr: async () => ({
+          number: 991,
+          state: 'OPEN',
+          mergedByLogin: null,
+          commitCount: 2,
+          mergeCommitOid: null,
+        }),
+        mergedActorLogin: async () => null,
+      },
+      prNumber: 991,
+      mergeIdentity: 'bluedevilcollectibles',
+      humanLogins: ['jranson'],
+      poll: poll(),
+    });
+    expect(report.verdict).toBe('failed');
+    expect(report.reasonCodes).toContain('merge_manager_did_not_merge');
+  });
+});
+
+describe('Leg 7 -- reconcile closes the issue', () => {
+  test('passes when the issue is CLOSED', async () => {
+    const report = await checkLeg7ReconcileClosesIssue({
+      source: {
+        viewIssue: async () => ({ number: 4321, state: 'CLOSED', stateReason: 'completed' }),
+      },
+      issueNumber: 4321,
+      poll: poll(),
+    });
+    expect(report.verdict).toBe('passed');
+  });
+
+  test('fails when the issue is still OPEN', async () => {
+    const report = await checkLeg7ReconcileClosesIssue({
+      source: { viewIssue: async () => ({ number: 4321, state: 'OPEN', stateReason: null }) },
+      issueNumber: 4321,
+      poll: poll(),
+    });
+    expect(report.verdict).toBe('failed');
+    expect(report.reasonCodes).toContain('reconcile_did_not_close');
+  });
+});
+
+describe('Leg 8 -- dispatch readable reply', () => {
+  test('passes when the reply body contains readable text', async () => {
+    const report = await checkLeg8DispatchReadableReply({
+      source: {
+        dispatchResultBody: async () => 'canary run lifecycle-x reached Leg 8 -- all good',
+      },
+      messageId: 'msg-1',
+      expectedSubstring: 'lifecycle-x',
+      poll: poll(),
+    });
+    expect(report.verdict).toBe('passed');
+  });
+
+  test('fails when the reply body is only a bare sha256 placeholder', async () => {
+    const report = await checkLeg8DispatchReadableReply({
+      source: { dispatchResultBody: async () => `sha256:${'a'.repeat(64)} bytes=5321` },
+      messageId: 'msg-1',
+      expectedSubstring: 'lifecycle-x',
+      poll: poll(),
+    });
+    expect(report.verdict).toBe('failed');
+    expect(report.reasonCodes).toContain('dispatch_reply_unreadable');
+    expect(report.evidenceRefs).toContain('result_body_is_bare_sha256=true');
+  });
+});
+
+describe('Leg 9 -- Duty Officer reports the run', () => {
+  test('passes when the DO report mentions the run and flags nothing stale', async () => {
+    const report = await checkLeg9DutyOfficerReports({
+      source: { readDutyOfficerReport: async () => 'DO pass: lifecycle-x progressing normally' },
+      runId: 'lifecycle-x',
+      staleFlagMarkers: ['lifecycle-x stale', 'lifecycle-x idle'],
+      poll: poll(),
+    });
+    expect(report.verdict).toBe('passed');
+  });
+
+  test('fails when the DO never saw the run', async () => {
+    const report = await checkLeg9DutyOfficerReports({
+      source: { readDutyOfficerReport: async () => 'DO pass: nothing to report' },
+      runId: 'lifecycle-x',
+      staleFlagMarkers: [],
+      poll: poll(),
+    });
+    expect(report.verdict).toBe('failed');
+    expect(report.reasonCodes).toContain('do_did_not_see_run');
+  });
+
+  test('fails when the DO flagged the canary as stale', async () => {
+    const report = await checkLeg9DutyOfficerReports({
+      source: { readDutyOfficerReport: async () => 'DO pass: lifecycle-x stale -- nudging owner' },
+      runId: 'lifecycle-x',
+      staleFlagMarkers: ['lifecycle-x stale'],
+      poll: poll(),
+    });
+    expect(report.verdict).toBe('failed');
+    expect(report.reasonCodes).toContain('do_flagged_canary_stale');
+  });
+});
+
+describe('Leg 10 -- canary reverts (residue detection has teeth)', () => {
+  test('passes when the scratch diff against base is empty', async () => {
+    const report = await checkLeg10CanaryReverts({
+      source: { scratchResidueDiff: async () => '', countRevertCommits: async () => 1 },
+      baseBranch: 'dev',
+      runId: 'lifecycle-x',
+      poll: poll(),
+    });
+    expect(report.verdict).toBe('passed');
+  });
+
+  test('fails with canary_left_residue_on_dev when residue remains (negative test)', async () => {
+    const report = await checkLeg10CanaryReverts({
+      source: {
+        scratchResidueDiff: async () =>
+          'diff --git a/.archon/canaries/lifecycle-scratch/canary-marker-x.ts b/...\n+leftover',
+        countRevertCommits: async () => 0,
+      },
+      baseBranch: 'dev',
+      runId: 'lifecycle-x',
+      poll: poll(),
+    });
+    expect(report.verdict).toBe('failed');
+    expect(report.reasonCodes).toContain('canary_left_residue_on_dev');
+  });
+});
+
+describe('Invariant 2 -- diff scope', () => {
+  test('no violation when all changed files are under the scratch dir', async () => {
+    const result = await checkInvariantDiffScope({
+      source: {
+        listPrChangedFiles: async () => ['.archon/canaries/lifecycle-scratch/canary-marker-x.ts'],
+      },
+      prNumber: 991,
+      scratchDir: '.archon/canaries/lifecycle-scratch',
+    });
+    expect(result.violated).toBe(false);
+  });
+
+  test('violation when a file outside the scratch dir is touched', async () => {
+    const result = await checkInvariantDiffScope({
+      source: {
+        listPrChangedFiles: async () => [
+          '.archon/canaries/lifecycle-scratch/canary-marker-x.ts',
+          'packages/server/src/index.ts',
+        ],
+      },
+      prNumber: 991,
+      scratchDir: '.archon/canaries/lifecycle-scratch',
+    });
+    expect(result.violated).toBe(true);
+    expect(result.offendingFiles).toContain('packages/server/src/index.ts');
+  });
+});
+
+describe('runLifecycleCanarySuite (Section 10 named scenarios)', () => {
+  const baseFire: LifecycleFireResult = {
+    issueNumber: 4321,
+    prNumber: 991,
+    headBranch: 'canary/lifecycle-x',
+    fallbackUsed: true,
+    remediationSha: 'abc123',
+    remediationCommitIso: '2026-09-02T01:00:00.000Z',
+    dispatchMessageId: 'msg-1',
+  };
+
+  function fullPassSource(): LifecycleArtifactSource {
+    return stubSource({
+      queryTmJournalFireCauldron: async () => [],
+      listPrsForBranch: async () => [
+        { number: 991, headRefName: 'canary/lifecycle-x', baseRefName: 'dev', state: 'MERGED' },
+      ],
+      listPrReviews: async () => [
+        {
+          state: 'CHANGES_REQUESTED',
+          body: 'WRONG_VALUE at marker:1',
+          submittedAt: '2026-09-02T00:30:00.000Z',
+          authorLogin: 'overseer-bot',
+        },
+        {
+          state: 'APPROVED',
+          body: 'ok',
+          submittedAt: '2026-09-02T01:02:00.000Z',
+          authorLogin: 'overseer-bot',
+        },
+      ],
+      countDiffMatches: async () => 0,
+      queryRunReview: async () => [
+        { head_sha: 'abc123', action: 'synchronize', created_at: '2026-09-02T01:01:00.000Z' },
+      ],
+      viewPr: async () => ({
+        number: 991,
+        state: 'MERGED',
+        mergedByLogin: 'bluedevilcollectibles',
+        commitCount: 3,
+        mergeCommitOid: 'def456',
+      }),
+      mergedActorLogin: async () => 'bluedevilcollectibles',
+      viewIssue: async () => ({ number: 4321, state: 'CLOSED', stateReason: 'completed' }),
+      dispatchResultBody: async () => 'canary run lifecycle-x reached Leg 8 -- readable',
+      readDutyOfficerReport: async () => 'DO pass: lifecycle-x progressing',
+      scratchResidueDiff: async () => '',
+      countRevertCommits: async () => 1,
+      listPrChangedFiles: async () => ['.archon/canaries/lifecycle-scratch/canary-marker-x.ts'],
+    });
+  }
+
+  test('Taskmaster-never-fires gap: Leg 1 blocked, remaining legs still execute and pass', async () => {
+    const report = await runLifecycleCanarySuite({
+      runId: 'lifecycle-x',
+      githubRepo: 'thinmansoftware/bdc-harness',
+      baseBranch: 'dev',
+      source: fullPassSource(),
+      fire: async () => baseFire,
+      clock: fakeClock(),
+      pollIntervalMs: 100,
+      timeouts: {
+        leg1Ms: 500,
+        leg2Ms: 500,
+        leg3Ms: 500,
+        leg4Ms: 500,
+        leg5Ms: 500,
+        leg6Ms: 500,
+        leg7Ms: 500,
+        leg8Ms: 500,
+        leg9Ms: 500,
+        leg10Ms: 500,
+      },
+      runStartIso: RUN_START,
+      mergeIdentity: 'bluedevilcollectibles',
+      autoRemediationAvailable: false,
+      dispatchExpectedSubstring: 'lifecycle-x',
+    });
+    const leg1 = report.legs.find(l => l.legId === 'taskmaster-fire')!;
+    expect(leg1.verdict).toBe('blocked');
+    expect(leg1.reasonCodes).toContain('taskmaster_never_fires');
+    // Every OTHER leg still ran and passed -- the whole run does not abort on Leg 1.
+    const others = report.legs.filter(l => l.legId !== 'taskmaster-fire');
+    expect(others.every(l => l.verdict === 'passed')).toBe(true);
+    expect(report.legs).toHaveLength(10);
+    // Overall verdict is blocked (a blocked leg, no failures/violations).
+    expect(report.verdict).toBe('blocked');
+    expect(report.invariantViolations).toHaveLength(0);
+  });
+
+  test('canary residue detection: deliberately-dirty cleanup fails Leg 10', async () => {
+    const source = fullPassSource();
+    const dirty: LifecycleArtifactSource = {
+      ...source,
+      scratchResidueDiff: async () =>
+        'diff --git a/.archon/canaries/lifecycle-scratch/x.ts b/...\n+residue',
+      countRevertCommits: async () => 0,
+    };
+    const report = await runLifecycleCanarySuite({
+      runId: 'lifecycle-x',
+      githubRepo: 'thinmansoftware/bdc-harness',
+      baseBranch: 'dev',
+      source: dirty,
+      fire: async () => baseFire,
+      clock: fakeClock(),
+      pollIntervalMs: 100,
+      timeouts: {
+        leg1Ms: 500,
+        leg2Ms: 500,
+        leg3Ms: 500,
+        leg4Ms: 500,
+        leg5Ms: 500,
+        leg6Ms: 500,
+        leg7Ms: 500,
+        leg8Ms: 500,
+        leg9Ms: 500,
+        leg10Ms: 500,
+      },
+      runStartIso: RUN_START,
+      mergeIdentity: 'bluedevilcollectibles',
+      dispatchExpectedSubstring: 'lifecycle-x',
+    });
+    const leg10 = report.legs.find(l => l.legId === 'canary-reverts')!;
+    expect(leg10.verdict).toBe('failed');
+    expect(leg10.reasonCodes).toContain('canary_left_residue_on_dev');
+    expect(report.verdict).toBe('failed');
+  });
+
+  test('invariant diff-scope violation forces failed verdict even if legs pass', async () => {
+    const source = fullPassSource();
+    const scopeViolating: LifecycleArtifactSource = {
+      ...source,
+      listPrChangedFiles: async () => [
+        '.archon/canaries/lifecycle-scratch/canary-marker-x.ts',
+        'packages/server/src/secret.ts',
+      ],
+    };
+    const report = await runLifecycleCanarySuite({
+      runId: 'lifecycle-x',
+      githubRepo: 'thinmansoftware/bdc-harness',
+      baseBranch: 'dev',
+      source: scopeViolating,
+      fire: async () => baseFire,
+      clock: fakeClock(),
+      pollIntervalMs: 100,
+      timeouts: {
+        leg1Ms: 500,
+        leg2Ms: 500,
+        leg3Ms: 500,
+        leg4Ms: 500,
+        leg5Ms: 500,
+        leg6Ms: 500,
+        leg7Ms: 500,
+        leg8Ms: 500,
+        leg9Ms: 500,
+        leg10Ms: 500,
+      },
+      runStartIso: RUN_START,
+      mergeIdentity: 'bluedevilcollectibles',
+      dispatchExpectedSubstring: 'lifecycle-x',
+    });
+    expect(report.invariantViolations.length).toBeGreaterThan(0);
+    expect(report.invariantViolations[0]).toContain('canary_diff_scope_violation');
+    expect(report.verdict).toBe('failed');
+  });
+
+  test('no PR: downstream legs blocked (never false pass), Leg 10 still runs', async () => {
+    const source = stubSource({
+      queryTmJournalFireCauldron: async () => [
+        {
+          id: 1,
+          proposal_type: 'fire_cauldron',
+          target: 'bdc-harness#4321',
+          created_at: RUN_START,
+        },
+      ],
+      listPrsForBranch: async () => [],
+      dispatchResultBody: async () => 'canary run lifecycle-x reached Leg 8',
+      readDutyOfficerReport: async () => 'DO pass: lifecycle-x progressing',
+      scratchResidueDiff: async () => '',
+      countRevertCommits: async () => 1,
+    });
+    const report = await runLifecycleCanarySuite({
+      runId: 'lifecycle-x',
+      githubRepo: 'thinmansoftware/bdc-harness',
+      baseBranch: 'dev',
+      source,
+      fire: async () => ({
+        headBranch: 'canary/lifecycle-x',
+        fallbackUsed: false,
+        dispatchMessageId: 'msg-1',
+      }),
+      clock: fakeClock(),
+      pollIntervalMs: 100,
+      timeouts: {
+        leg1Ms: 500,
+        leg2Ms: 500,
+        leg3Ms: 500,
+        leg4Ms: 500,
+        leg5Ms: 500,
+        leg6Ms: 500,
+        leg7Ms: 500,
+        leg8Ms: 500,
+        leg9Ms: 500,
+        leg10Ms: 500,
+      },
+      runStartIso: RUN_START,
+      mergeIdentity: 'bluedevilcollectibles',
+      dispatchExpectedSubstring: 'lifecycle-x',
+    });
+    expect(report.legs).toHaveLength(10);
+    expect(report.legs.find(l => l.legId === 'overseer-catch-defect')!.verdict).toBe('blocked');
+    expect(report.legs.find(l => l.legId === 'autonomous-merge')!.verdict).toBe('blocked');
+    // Leg 10 still executed independently.
+    expect(report.legs.find(l => l.legId === 'canary-reverts')!.verdict).toBe('passed');
+  });
+});

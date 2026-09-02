@@ -1,12 +1,14 @@
 import { readFile } from 'fs/promises';
 import { runCanary, type RunCanaryOptions } from './runner';
-import type { RunCanaryResult } from './types';
+import type { LifecycleCanaryReport, RunCanaryResult } from './types';
 import {
   runTaskmasterCanarySuite,
   writeTaskmasterCanaryArtifacts,
   type TaskmasterCanaryDeps,
   type TaskmasterCanaryResult,
 } from './taskmaster-canary';
+import { runLifecycleCanarySuite, type LifecycleCanaryDeps } from './lifecycle-canary';
+import { writeLifecycleCanaryArtifacts } from './lifecycle-report';
 
 interface CanaryCliDeps {
   readonly runner: (options: RunCanaryOptions) => Promise<RunCanaryResult>;
@@ -17,6 +19,29 @@ interface CanaryCliDeps {
     outputRoot: string,
     report: TaskmasterCanaryResult
   ) => Promise<readonly string[]>;
+  readonly lifecycleRunner?: (deps: LifecycleCanaryDeps) => Promise<LifecycleCanaryReport>;
+  readonly lifecycleArtifactWriter?: (
+    outputRoot: string,
+    report: LifecycleCanaryReport
+  ) => Promise<readonly string[]>;
+  // Builds the live LifecycleCanaryDeps (default source + fire hook) from CLI
+  // flags. Injected so unit tests never touch the production-adjacent firing
+  // path; the operator-approved live phase supplies the real implementation.
+  readonly lifecycleDepsFactory?: (options: LifecycleCliOptions) => LifecycleCanaryDeps;
+}
+
+export interface LifecycleCliOptions {
+  readonly runId: string;
+  readonly outputRoot: string;
+  readonly dbPath: string;
+  readonly githubRepo: string;
+  readonly baseBranch: string;
+  readonly repoDir: string;
+  readonly apiBase?: string;
+  readonly codebaseId?: string;
+  readonly dutyOfficerReportPath?: string;
+  readonly mergeIdentity: string;
+  readonly operatorToken?: string;
 }
 
 function flag(args: readonly string[], name: string): string | undefined {
@@ -80,9 +105,56 @@ export async function runCanaryCli(
     deps.stdout(JSON.stringify(report, null, 2));
     return exitFor(report.verdict);
   }
+  if (command === 'lifecycle') {
+    const runId = flag(args, '--run-id');
+    const outputRoot = flag(args, '--output-root');
+    const dbPath = flag(args, '--db-path');
+    const githubRepo = flag(args, '--github-repo');
+    const baseBranch = flag(args, '--base-branch') ?? 'dev';
+    const repoDir = flag(args, '--repo-dir') ?? process.cwd();
+    const mergeIdentity = flag(args, '--merge-identity') ?? 'bluedevilcollectibles';
+    if (!runId || !outputRoot || !dbPath || !githubRepo) {
+      deps.stderr('lifecycle_canary_missing_or_invalid_required_argument');
+      return 3;
+    }
+    if (!deps.lifecycleDepsFactory) {
+      // Firing the wheel is production-adjacent (opens a real PR, may merge on
+      // dev). The default CLI does NOT wire a firing implementation -- the
+      // operator-approved live phase must supply one. Fail closed rather than
+      // silently no-op.
+      deps.stderr(
+        'lifecycle_fire_not_configured: supply an operator-approved firing implementation'
+      );
+      return 3;
+    }
+    const options: LifecycleCliOptions = {
+      runId,
+      outputRoot,
+      dbPath,
+      githubRepo,
+      baseBranch,
+      repoDir,
+      apiBase: flag(args, '--api-base'),
+      codebaseId: flag(args, '--codebase-id'),
+      dutyOfficerReportPath: flag(args, '--duty-officer-report'),
+      mergeIdentity,
+      operatorToken: env.ARCHON_OPERATOR_TOKEN,
+    };
+    try {
+      const report = await (deps.lifecycleRunner ?? runLifecycleCanarySuite)(
+        deps.lifecycleDepsFactory(options)
+      );
+      await (deps.lifecycleArtifactWriter ?? writeLifecycleCanaryArtifacts)(outputRoot, report);
+      deps.stdout(JSON.stringify(report, null, 2));
+      return exitFor(report.verdict);
+    } catch (error) {
+      deps.stderr((error as Error).message);
+      return 4;
+    }
+  }
   const level = command === 'check' ? 0 : command === 'plan' ? 1 : null;
   if (level === null) {
-    deps.stderr('Usage: archon-canary <check|plan|taskmaster> [options]');
+    deps.stderr('Usage: archon-canary <check|plan|taskmaster|lifecycle> [options]');
     return 3;
   }
   const manifestPath = flag(args, '--manifest');

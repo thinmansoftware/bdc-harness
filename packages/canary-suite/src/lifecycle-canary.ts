@@ -1,0 +1,1022 @@
+import { Database, type SQLQueryBindings } from 'bun:sqlite';
+import type {
+  CanaryVerdict,
+  LifecycleCanaryReport,
+  LifecycleLegId,
+  LifecycleLegReport,
+} from './types';
+import { LIFECYCLE_LEGS } from './types';
+
+// Canary scratch-path convention. Single source of truth shared by the probe,
+// the live-run tooling, and the operator. See
+// .archon/canaries/lifecycle-scratch/README.md for the full contract.
+export const LIFECYCLE_SCRATCH_DIR = '.archon/canaries/lifecycle-scratch';
+// The planted defect is an unambiguous, greppable wrong-constant. Leg 3 asserts
+// Overseer names this literal; Leg 4 asserts remediation removes it.
+export const LIFECYCLE_PLANTED_DEFECT_LITERAL = 'WRONG_VALUE';
+
+// A bare content-addressed placeholder (no readable text). Leg 8 fails if a
+// dispatch reply body is only this shape instead of real text.
+const BARE_SHA256_PLACEHOLDER = /^sha256:[0-9a-f]{64}(\s+bytes=\d+)?$/i;
+
+// ---------------------------------------------------------------------------
+// Clock + polling (injectable so tests run deterministically with no real waits)
+// ---------------------------------------------------------------------------
+
+export interface LifecycleClock {
+  now(): number;
+  sleep(ms: number): Promise<void>;
+}
+
+export const realClock: LifecycleClock = {
+  now: () => Date.now(),
+  sleep: (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms)),
+};
+
+interface PollResult<T> {
+  readonly satisfied: boolean;
+  readonly value: T;
+  readonly attempts: number;
+}
+
+async function pollUntil<T>(
+  clock: LifecycleClock,
+  timeoutMs: number,
+  intervalMs: number,
+  attempt: () => Promise<{ satisfied: boolean; value: T }>
+): Promise<PollResult<T>> {
+  const start = clock.now();
+  // Attempt cap is a safety backstop against a non-advancing clock; the
+  // time-based deadline is the primary exit condition.
+  const maxAttempts = intervalMs > 0 ? Math.ceil(timeoutMs / intervalMs) + 2 : 1;
+  let attempts = 1;
+  let last = await attempt();
+  while (!last.satisfied && clock.now() - start < timeoutMs && attempts < maxAttempts) {
+    await clock.sleep(intervalMs);
+    attempts += 1;
+    last = await attempt();
+  }
+  return { satisfied: last.satisfied, value: last.value, attempts };
+}
+
+// ---------------------------------------------------------------------------
+// Artifact shapes (subset of gh/git/sqlite output the legs assert against)
+// ---------------------------------------------------------------------------
+
+export interface TmJournalFireRow {
+  readonly id: number | string;
+  readonly proposal_type: string;
+  readonly target: string;
+  readonly created_at: string;
+}
+
+export interface PrSummary {
+  readonly number: number;
+  readonly headRefName: string;
+  readonly baseRefName: string;
+  readonly state: string;
+}
+
+export interface PrReview {
+  readonly state: string; // APPROVED | CHANGES_REQUESTED | COMMENTED | ...
+  readonly body: string;
+  readonly submittedAt: string; // ISO
+  readonly authorLogin: string;
+}
+
+export interface PrView {
+  readonly number: number;
+  readonly state: string; // OPEN | MERGED | CLOSED
+  readonly mergedByLogin: string | null;
+  readonly commitCount: number;
+  readonly mergeCommitOid: string | null;
+}
+
+export interface RunReviewRow {
+  readonly head_sha: string;
+  readonly action: string;
+  readonly created_at: string;
+}
+
+export interface IssueView {
+  readonly number: number;
+  readonly state: string; // OPEN | CLOSED
+  readonly stateReason: string | null;
+}
+
+// The single artifact-access concern for the whole wheel. Every method reads a
+// pipeline artifact (event-store row, gh field, git state) and performs no
+// mutation. Fully mockable for unit tests; the default implementation shells
+// out (bun:sqlite for the event store, gh/git for GitHub + repo state).
+export interface LifecycleArtifactSource {
+  // Leg 1
+  queryTmJournalFireCauldron(sinceIso: string): Promise<readonly TmJournalFireRow[]>;
+  // Leg 2
+  listPrsForBranch(headBranch: string): Promise<readonly PrSummary[]>;
+  // Legs 2/4/6
+  viewPr(prNumber: number): Promise<PrView>;
+  // Legs 3/5
+  listPrReviews(prNumber: number): Promise<readonly PrReview[]>;
+  // Leg 4
+  countDiffMatches(prNumber: number, literal: string): Promise<number>;
+  // Leg 5 (a) trigger evidence
+  queryRunReview(headSha: string): Promise<readonly RunReviewRow[]>;
+  // Leg 6 merge actor (from issue timeline)
+  mergedActorLogin(prNumber: number): Promise<string | null>;
+  // Leg 7
+  viewIssue(issueNumber: number): Promise<IssueView>;
+  // Leg 8
+  dispatchResultBody(messageId: string): Promise<string | null>;
+  // Leg 9
+  readDutyOfficerReport(): Promise<string>;
+  // Leg 10 residue: content diff of the scratch path vs base
+  scratchResidueDiff(baseBranch: string): Promise<string>;
+  countRevertCommits(runId: string): Promise<number>;
+  // Invariant 2 diff-scope
+  listPrChangedFiles(prNumber: number): Promise<readonly string[]>;
+}
+
+// ---------------------------------------------------------------------------
+// Report helpers
+// ---------------------------------------------------------------------------
+
+function titleFor(legId: LifecycleLegId): string {
+  return LIFECYCLE_LEGS.find(leg => leg.id === legId)?.title ?? legId;
+}
+
+function leg(
+  legId: LifecycleLegId,
+  verdict: CanaryVerdict,
+  reasonCodes: readonly string[],
+  evidenceRefs: readonly string[],
+  gap?: string
+): LifecycleLegReport {
+  return { legId, title: titleFor(legId), verdict, reasonCodes, evidenceRefs, gap };
+}
+
+// A leg whose upstream prerequisite (e.g. a PR number) was never produced.
+// Reported blocked (not failed) so a Leg-2 no-PR does not masquerade as a
+// downstream defect, and never as a false pass.
+function upstreamBlocked(legId: LifecycleLegId, reason: string): LifecycleLegReport {
+  return leg(legId, 'blocked', [reason], [`upstream_missing=${reason}`]);
+}
+
+// ---------------------------------------------------------------------------
+// Leg checks (each is an independently testable graded assertion)
+// ---------------------------------------------------------------------------
+
+export interface LegPollConfig {
+  readonly clock: LifecycleClock;
+  readonly timeoutMs: number;
+  readonly intervalMs: number;
+}
+
+export async function checkLeg1TaskmasterFires(input: {
+  readonly source: Pick<LifecycleArtifactSource, 'queryTmJournalFireCauldron'>;
+  readonly sinceIso: string;
+  readonly targetIssue?: number;
+  readonly fallbackUsed: boolean;
+  readonly poll: LegPollConfig;
+}): Promise<LifecycleLegReport> {
+  const { clock, timeoutMs, intervalMs } = input.poll;
+  const result = await pollUntil(clock, timeoutMs, intervalMs, async () => {
+    const rows = await input.source.queryTmJournalFireCauldron(input.sinceIso);
+    const match = rows.find(
+      row =>
+        row.proposal_type === 'fire_cauldron' &&
+        (input.targetIssue === undefined || row.target.includes(String(input.targetIssue)))
+    );
+    return { satisfied: match !== undefined, value: match };
+  });
+  if (result.satisfied && result.value) {
+    return leg(
+      'taskmaster-fire',
+      'passed',
+      [],
+      ['tm_journal.proposal_type=fire_cauldron', `tm_journal.target=${result.value.target}`]
+    );
+  }
+  // Absence of a fire is a documented gap (bdc-xo#1843), not a false pass.
+  return leg(
+    'taskmaster-fire',
+    'blocked',
+    ['taskmaster_never_fires'],
+    ['tm_journal.fire_cauldron_rows=0', `polled_attempts=${result.attempts}`],
+    input.fallbackUsed
+      ? 'taskmaster-never-fired, fallback: fire.ps1 used'
+      : 'taskmaster-never-fired'
+  );
+}
+
+export async function checkLeg2CodexLaneOpensPr(input: {
+  readonly source: Pick<LifecycleArtifactSource, 'listPrsForBranch'>;
+  readonly headBranch: string;
+  readonly baseBranch: string;
+  readonly poll: LegPollConfig;
+}): Promise<{ report: LifecycleLegReport; prNumber?: number }> {
+  const { clock, timeoutMs, intervalMs } = input.poll;
+  const result = await pollUntil(clock, timeoutMs, intervalMs, async () => {
+    const prs = await input.source.listPrsForBranch(input.headBranch);
+    const onBase = prs.filter(pr => pr.baseRefName === input.baseBranch);
+    return { satisfied: onBase.length >= 1, value: onBase };
+  });
+  const onBase = result.value ?? [];
+  if (onBase.length === 1) {
+    const pr = onBase[0];
+    return {
+      report: leg(
+        'codex-lane-build-pr',
+        'passed',
+        [],
+        [`pr=${pr.number}`, `base=${pr.baseRefName}`]
+      ),
+      prNumber: pr.number,
+    };
+  }
+  if (onBase.length > 1) {
+    return {
+      report: leg(
+        'codex-lane-build-pr',
+        'failed',
+        ['codex_lane_multiple_prs'],
+        [`pr_count=${onBase.length}`, `branch=${input.headBranch}`]
+      ),
+    };
+  }
+  return {
+    report: leg(
+      'codex-lane-build-pr',
+      'failed',
+      ['codex_lane_no_pr'],
+      ['pr_count=0', `branch=${input.headBranch}`, `polled_attempts=${result.attempts}`]
+    ),
+  };
+}
+
+export async function checkLeg3OverseerCatchesDefect(input: {
+  readonly source: Pick<LifecycleArtifactSource, 'listPrReviews'>;
+  readonly prNumber: number;
+  readonly defectSignature: string;
+  readonly poll: LegPollConfig;
+}): Promise<LifecycleLegReport> {
+  const { clock, timeoutMs, intervalMs } = input.poll;
+  const result = await pollUntil(clock, timeoutMs, intervalMs, async () => {
+    const reviews = await input.source.listPrReviews(input.prNumber);
+    const naming = reviews.find(
+      review => review.state === 'CHANGES_REQUESTED' && review.body.includes(input.defectSignature)
+    );
+    return { satisfied: naming !== undefined, value: { reviews, naming } };
+  });
+  if (result.satisfied && result.value?.naming) {
+    return leg(
+      'overseer-catch-defect',
+      'passed',
+      [],
+      ['review.state=CHANGES_REQUESTED', `defect_named=${input.defectSignature}`]
+    );
+  }
+  return leg(
+    'overseer-catch-defect',
+    'failed',
+    ['overseer_missed_planted_defect'],
+    [
+      `reviews_seen=${result.value?.reviews.length ?? 0}`,
+      `defect_signature=${input.defectSignature}`,
+    ]
+  );
+}
+
+export async function checkLeg4RemediationReachesPr(input: {
+  readonly source: Pick<LifecycleArtifactSource, 'countDiffMatches'>;
+  readonly prNumber: number;
+  readonly literal: string;
+  readonly autoRemediationAvailable: boolean;
+  readonly poll: LegPollConfig;
+}): Promise<LifecycleLegReport> {
+  const { clock, timeoutMs, intervalMs } = input.poll;
+  const result = await pollUntil(clock, timeoutMs, intervalMs, async () => {
+    const count = await input.source.countDiffMatches(input.prNumber, input.literal);
+    return { satisfied: count === 0, value: count };
+  });
+  // The auto-remediation path (Overseer verdict -> Taskmaster candidate) does
+  // not yet exist (bdc-xo#1835). Record the manual/subagent path as a gap even
+  // when the defect is successfully removed.
+  const gap = input.autoRemediationAvailable
+    ? undefined
+    : 'auto-remediation-missing-#1835, manual/subagent path used';
+  if (result.satisfied) {
+    return leg(
+      'remediation-reaches-pr',
+      'passed',
+      [],
+      ['diff_matches_after=0', `literal=${input.literal}`],
+      gap
+    );
+  }
+  return leg(
+    'remediation-reaches-pr',
+    'failed',
+    ['remediation_not_applied'],
+    [`diff_matches_after=${result.value ?? 'unknown'}`, `literal=${input.literal}`],
+    gap
+  );
+}
+
+export async function checkLeg5OverseerReapproves(input: {
+  readonly source: Pick<LifecycleArtifactSource, 'queryRunReview' | 'listPrReviews'>;
+  readonly prNumber: number;
+  readonly remediationSha: string;
+  readonly remediationCommitIso: string;
+  readonly poll: LegPollConfig;
+}): Promise<LifecycleLegReport> {
+  const { clock, timeoutMs, intervalMs } = input.poll;
+  const remediationMs = Date.parse(input.remediationCommitIso);
+  const result = await pollUntil(clock, timeoutMs, intervalMs, async () => {
+    // (a) trigger fired: a run_review row for the synchronize event.
+    const rows = await input.source.queryRunReview(input.remediationSha);
+    const triggered = rows.some(
+      row => row.action === 'synchronize' && row.head_sha === input.remediationSha
+    );
+    // (b) verdict correct: latest Overseer review APPROVED after remediation.
+    const reviews = await input.source.listPrReviews(input.prNumber);
+    const approvedAfter = reviews
+      .filter(review => review.state === 'APPROVED')
+      .some(review => {
+        const submitted = Date.parse(review.submittedAt);
+        return (
+          Number.isFinite(submitted) &&
+          (!Number.isFinite(remediationMs) || submitted > remediationMs)
+        );
+      });
+    return { satisfied: triggered && approvedAfter, value: { triggered, approvedAfter } };
+  });
+  const { triggered, approvedAfter } = result.value ?? {};
+  if (triggered && approvedAfter) {
+    return leg(
+      'overseer-reapprove',
+      'passed',
+      [],
+      [
+        'run_review.action=synchronize',
+        `run_review.head_sha=${input.remediationSha}`,
+        'review.state=APPROVED',
+      ]
+    );
+  }
+  if (!triggered) {
+    return leg(
+      'overseer-reapprove',
+      'failed',
+      ['overseer_resync_trigger_not_firing'],
+      ['run_review.synchronize_rows=0', `head_sha=${input.remediationSha}`]
+    );
+  }
+  return leg(
+    'overseer-reapprove',
+    'failed',
+    ['overseer_no_reapproval'],
+    ['run_review.action=synchronize', 'approved_after_remediation=false']
+  );
+}
+
+export async function checkLeg6AutonomousMerge(input: {
+  readonly source: Pick<LifecycleArtifactSource, 'viewPr' | 'mergedActorLogin'>;
+  readonly prNumber: number;
+  readonly mergeIdentity: string;
+  readonly humanLogins: readonly string[];
+  readonly poll: LegPollConfig;
+}): Promise<LifecycleLegReport> {
+  const { clock, timeoutMs, intervalMs } = input.poll;
+  const result = await pollUntil(clock, timeoutMs, intervalMs, async () => {
+    const view = await input.source.viewPr(input.prNumber);
+    return { satisfied: view.state === 'MERGED', value: view };
+  });
+  const view = result.value;
+  if (view?.state !== 'MERGED') {
+    return leg(
+      'autonomous-merge',
+      'failed',
+      ['merge_manager_did_not_merge'],
+      [`pr.state=${view?.state ?? 'unknown'}`]
+    );
+  }
+  const actor = (await input.source.mergedActorLogin(input.prNumber)) ?? view.mergedByLogin;
+  if (actor && input.humanLogins.includes(actor)) {
+    return leg(
+      'autonomous-merge',
+      'failed',
+      ['human_merged_not_autonomous'],
+      [`merged_by=${actor}`]
+    );
+  }
+  if (actor !== input.mergeIdentity) {
+    return leg(
+      'autonomous-merge',
+      'failed',
+      ['merge_manager_did_not_merge'],
+      [`merged_by=${actor ?? 'unknown'}`, `expected=${input.mergeIdentity}`]
+    );
+  }
+  return leg(
+    'autonomous-merge',
+    'passed',
+    [],
+    ['pr.state=MERGED', `merged_by=${actor}`, `merge_commit=${view.mergeCommitOid ?? 'unknown'}`]
+  );
+}
+
+export async function checkLeg7ReconcileClosesIssue(input: {
+  readonly source: Pick<LifecycleArtifactSource, 'viewIssue'>;
+  readonly issueNumber: number;
+  readonly poll: LegPollConfig;
+}): Promise<LifecycleLegReport> {
+  const { clock, timeoutMs, intervalMs } = input.poll;
+  const result = await pollUntil(clock, timeoutMs, intervalMs, async () => {
+    const view = await input.source.viewIssue(input.issueNumber);
+    return { satisfied: view.state === 'CLOSED', value: view };
+  });
+  const view = result.value;
+  if (view?.state === 'CLOSED') {
+    return leg(
+      'reconcile-closes-issue',
+      'passed',
+      [],
+      [
+        `issue=${input.issueNumber}`,
+        'issue.state=CLOSED',
+        `state_reason=${view.stateReason ?? '-'}`,
+      ]
+    );
+  }
+  return leg(
+    'reconcile-closes-issue',
+    'failed',
+    ['reconcile_did_not_close'],
+    [`issue=${input.issueNumber}`, `issue.state=${view?.state ?? 'unknown'}`]
+  );
+}
+
+export async function checkLeg8DispatchReadableReply(input: {
+  readonly source: Pick<LifecycleArtifactSource, 'dispatchResultBody'>;
+  readonly messageId: string;
+  readonly expectedSubstring: string;
+  readonly poll: LegPollConfig;
+}): Promise<LifecycleLegReport> {
+  const { clock, timeoutMs, intervalMs } = input.poll;
+  const result = await pollUntil(clock, timeoutMs, intervalMs, async () => {
+    const body = await input.source.dispatchResultBody(input.messageId);
+    const readable =
+      body !== null &&
+      body.trim().length > 0 &&
+      !BARE_SHA256_PLACEHOLDER.test(body.trim()) &&
+      body.includes(input.expectedSubstring);
+    return { satisfied: readable, value: body };
+  });
+  if (result.satisfied) {
+    return leg(
+      'dispatch-readable-reply',
+      'passed',
+      [],
+      [`message=${input.messageId}`, 'result_body_readable=true']
+    );
+  }
+  const body = result.value;
+  const bare = body !== null && BARE_SHA256_PLACEHOLDER.test(body.trim());
+  return leg(
+    'dispatch-readable-reply',
+    'failed',
+    ['dispatch_reply_unreadable'],
+    [
+      `message=${input.messageId}`,
+      body === null ? 'result_body=null' : `result_body_is_bare_sha256=${bare}`,
+    ]
+  );
+}
+
+export async function checkLeg9DutyOfficerReports(input: {
+  readonly source: Pick<LifecycleArtifactSource, 'readDutyOfficerReport'>;
+  readonly runId: string;
+  readonly staleFlagMarkers: readonly string[];
+  readonly poll: LegPollConfig;
+}): Promise<LifecycleLegReport> {
+  const { clock, timeoutMs, intervalMs } = input.poll;
+  const result = await pollUntil(clock, timeoutMs, intervalMs, async () => {
+    const report = await input.source.readDutyOfficerReport();
+    const sawRun = report.includes(input.runId);
+    return { satisfied: sawRun, value: report };
+  });
+  const report = result.value ?? '';
+  if (!report.includes(input.runId)) {
+    return leg(
+      'duty-officer-reports',
+      'failed',
+      ['do_did_not_see_run'],
+      [`run_id=${input.runId}`, 'report_mentions_run=false']
+    );
+  }
+  // A false-positive stale nudge on the canary's own arc is itself a defect.
+  const flaggedStale = input.staleFlagMarkers.some(marker => report.includes(marker));
+  if (flaggedStale) {
+    return leg(
+      'duty-officer-reports',
+      'failed',
+      ['do_flagged_canary_stale'],
+      [`run_id=${input.runId}`, 'flagged_stale=true']
+    );
+  }
+  return leg(
+    'duty-officer-reports',
+    'passed',
+    [],
+    [`run_id=${input.runId}`, 'report_mentions_run=true', 'flagged_stale=false']
+  );
+}
+
+export async function checkLeg10CanaryReverts(input: {
+  readonly source: Pick<LifecycleArtifactSource, 'scratchResidueDiff' | 'countRevertCommits'>;
+  readonly baseBranch: string;
+  readonly runId: string;
+  readonly poll: LegPollConfig;
+}): Promise<LifecycleLegReport> {
+  const { clock, timeoutMs, intervalMs } = input.poll;
+  const result = await pollUntil(clock, timeoutMs, intervalMs, async () => {
+    const diff = await input.source.scratchResidueDiff(input.baseBranch);
+    const reverts = await input.source.countRevertCommits(input.runId);
+    // Clean when there is no residual scratch diff on base, OR a revert commit
+    // is present that returns the scratch content to its pre-run state.
+    const clean = diff.trim().length === 0;
+    return { satisfied: clean, value: { diff, reverts } };
+  });
+  const { diff, reverts } = result.value ?? {};
+  if (diff.trim().length === 0) {
+    return leg(
+      'canary-reverts',
+      'passed',
+      [],
+      ['scratch_residue_diff=empty', `revert_commits=${reverts}`]
+    );
+  }
+  // Highest-severity class: the canary polluted the shared base branch.
+  return leg(
+    'canary-reverts',
+    'failed',
+    ['canary_left_residue_on_dev'],
+    [`scratch_residue_diff_bytes=${diff.trim().length}`, `revert_commits=${reverts}`]
+  );
+}
+
+// Invariant 2: the merged PR diff must touch ONLY the canary scratch path.
+export async function checkInvariantDiffScope(input: {
+  readonly source: Pick<LifecycleArtifactSource, 'listPrChangedFiles'>;
+  readonly prNumber: number;
+  readonly scratchDir: string;
+}): Promise<{ violated: boolean; offendingFiles: readonly string[] }> {
+  const files = await input.source.listPrChangedFiles(input.prNumber);
+  const offending = files.filter(file => !file.startsWith(input.scratchDir));
+  return { violated: offending.length > 0, offendingFiles: offending };
+}
+
+// ---------------------------------------------------------------------------
+// Suite orchestration
+// ---------------------------------------------------------------------------
+
+export interface LifecycleFireResult {
+  readonly issueNumber?: number;
+  readonly prNumber?: number;
+  readonly headBranch: string;
+  readonly fallbackUsed: boolean;
+  // Remediation commit metadata, populated by the run harness once the
+  // remediation lands (auto or manual/subagent path).
+  readonly remediationSha?: string;
+  readonly remediationCommitIso?: string;
+  // Dispatch message id sent during the run for Leg 8.
+  readonly dispatchMessageId?: string;
+}
+
+export interface LifecycleTimeouts {
+  readonly leg1Ms: number;
+  readonly leg2Ms: number;
+  readonly leg3Ms: number;
+  readonly leg4Ms: number;
+  readonly leg5Ms: number;
+  readonly leg6Ms: number;
+  readonly leg7Ms: number;
+  readonly leg8Ms: number;
+  readonly leg9Ms: number;
+  readonly leg10Ms: number;
+}
+
+export const DEFAULT_LIFECYCLE_TIMEOUTS: LifecycleTimeouts = {
+  leg1Ms: 10 * 60_000,
+  leg2Ms: 20 * 60_000,
+  leg3Ms: 15 * 60_000,
+  leg4Ms: 15 * 60_000,
+  leg5Ms: 15 * 60_000,
+  leg6Ms: 10 * 60_000,
+  leg7Ms: 5 * 60_000,
+  leg8Ms: 5 * 60_000,
+  leg9Ms: 30 * 60_000,
+  leg10Ms: 15 * 60_000,
+};
+
+export interface LifecycleCanaryDeps {
+  readonly runId: string;
+  readonly githubRepo: string;
+  readonly baseBranch: string;
+  readonly source: LifecycleArtifactSource;
+  // Fires the run (Taskmaster propose, or documented fire.ps1 fallback) and
+  // returns the discovered issue/PR/remediation coordinates. Injected so the
+  // production-adjacent firing side effect only runs in the operator-approved
+  // live phase; unit tests provide a fake.
+  readonly fire: () => Promise<LifecycleFireResult>;
+  readonly clock?: LifecycleClock;
+  readonly timeouts?: LifecycleTimeouts;
+  readonly pollIntervalMs?: number;
+  readonly runStartIso: string;
+  readonly mergeIdentity: string;
+  readonly humanLogins?: readonly string[];
+  readonly autoRemediationAvailable?: boolean;
+  readonly defectSignature?: string;
+  readonly plantedLiteral?: string;
+  readonly scratchDir?: string;
+  readonly dispatchExpectedSubstring?: string;
+  readonly staleFlagMarkers?: readonly string[];
+}
+
+function overallVerdict(
+  legs: readonly LifecycleLegReport[],
+  invariantViolations: readonly string[]
+): CanaryVerdict {
+  if (invariantViolations.length > 0) return 'failed';
+  if (legs.some(l => l.verdict === 'failed')) return 'failed';
+  if (legs.some(l => l.verdict === 'blocked')) return 'blocked';
+  return 'passed';
+}
+
+export async function runLifecycleCanarySuite(
+  deps: LifecycleCanaryDeps
+): Promise<LifecycleCanaryReport> {
+  const clock = deps.clock ?? realClock;
+  const timeouts = deps.timeouts ?? DEFAULT_LIFECYCLE_TIMEOUTS;
+  const intervalMs = deps.pollIntervalMs ?? 30_000;
+  const scratchDir = deps.scratchDir ?? LIFECYCLE_SCRATCH_DIR;
+  const plantedLiteral = deps.plantedLiteral ?? LIFECYCLE_PLANTED_DEFECT_LITERAL;
+  const defectSignature = deps.defectSignature ?? plantedLiteral;
+  const source = deps.source;
+  const poll = (timeoutMs: number): LegPollConfig => ({ clock, timeoutMs, intervalMs });
+
+  const legs: LifecycleLegReport[] = [];
+  const invariantViolations: string[] = [];
+
+  const fired = await deps.fire();
+
+  // Leg 1
+  legs.push(
+    await checkLeg1TaskmasterFires({
+      source,
+      sinceIso: deps.runStartIso,
+      targetIssue: fired.issueNumber,
+      fallbackUsed: fired.fallbackUsed,
+      poll: poll(timeouts.leg1Ms),
+    })
+  );
+
+  // Leg 2
+  const leg2 = await checkLeg2CodexLaneOpensPr({
+    source,
+    headBranch: fired.headBranch,
+    baseBranch: deps.baseBranch,
+    poll: poll(timeouts.leg2Ms),
+  });
+  legs.push(leg2.report);
+  const prNumber = leg2.prNumber ?? fired.prNumber;
+
+  if (prNumber === undefined) {
+    // No PR: legs 3-9 cannot proceed against a real PR. Report them blocked
+    // (honest, never a false pass), then still run Leg 10 cleanup independently.
+    legs.push(upstreamBlocked('overseer-catch-defect', 'no_pr'));
+    legs.push(upstreamBlocked('remediation-reaches-pr', 'no_pr'));
+    legs.push(upstreamBlocked('overseer-reapprove', 'no_pr'));
+    legs.push(upstreamBlocked('autonomous-merge', 'no_pr'));
+    legs.push(upstreamBlocked('reconcile-closes-issue', 'no_pr'));
+  } else {
+    // Leg 3
+    legs.push(
+      await checkLeg3OverseerCatchesDefect({
+        source,
+        prNumber,
+        defectSignature,
+        poll: poll(timeouts.leg3Ms),
+      })
+    );
+
+    // Leg 4
+    legs.push(
+      await checkLeg4RemediationReachesPr({
+        source,
+        prNumber,
+        literal: plantedLiteral,
+        autoRemediationAvailable: deps.autoRemediationAvailable ?? false,
+        poll: poll(timeouts.leg4Ms),
+      })
+    );
+
+    // Leg 5
+    if (fired.remediationSha && fired.remediationCommitIso) {
+      legs.push(
+        await checkLeg5OverseerReapproves({
+          source,
+          prNumber,
+          remediationSha: fired.remediationSha,
+          remediationCommitIso: fired.remediationCommitIso,
+          poll: poll(timeouts.leg5Ms),
+        })
+      );
+    } else {
+      legs.push(upstreamBlocked('overseer-reapprove', 'no_remediation_commit'));
+    }
+
+    // Invariant 2 (diff scope) gates merge acceptance.
+    const scope = await checkInvariantDiffScope({ source, prNumber, scratchDir });
+    if (scope.violated) {
+      invariantViolations.push(`canary_diff_scope_violation: ${scope.offendingFiles.join(', ')}`);
+    }
+
+    // Leg 6
+    legs.push(
+      await checkLeg6AutonomousMerge({
+        source,
+        prNumber,
+        mergeIdentity: deps.mergeIdentity,
+        humanLogins: deps.humanLogins ?? [],
+        poll: poll(timeouts.leg6Ms),
+      })
+    );
+
+    // Leg 7
+    if (fired.issueNumber !== undefined) {
+      legs.push(
+        await checkLeg7ReconcileClosesIssue({
+          source,
+          issueNumber: fired.issueNumber,
+          poll: poll(timeouts.leg7Ms),
+        })
+      );
+    } else {
+      legs.push(upstreamBlocked('reconcile-closes-issue', 'no_issue'));
+    }
+  }
+
+  // Leg 8
+  if (fired.dispatchMessageId) {
+    legs.push(
+      await checkLeg8DispatchReadableReply({
+        source,
+        messageId: fired.dispatchMessageId,
+        expectedSubstring: deps.dispatchExpectedSubstring ?? deps.runId,
+        poll: poll(timeouts.leg8Ms),
+      })
+    );
+  } else {
+    legs.push(upstreamBlocked('dispatch-readable-reply', 'no_dispatch_message'));
+  }
+
+  // Leg 9
+  legs.push(
+    await checkLeg9DutyOfficerReports({
+      source,
+      runId: deps.runId,
+      staleFlagMarkers: deps.staleFlagMarkers ?? [],
+      poll: poll(timeouts.leg9Ms),
+    })
+  );
+
+  // Leg 10 -- cleanup, independent timeout, runs regardless of upstream results
+  // (Invariant 3). Always the final leg.
+  legs.push(
+    await checkLeg10CanaryReverts({
+      source,
+      baseBranch: deps.baseBranch,
+      runId: deps.runId,
+      poll: poll(timeouts.leg10Ms),
+    })
+  );
+
+  // Order legs canonically for the report.
+  const ordered = LIFECYCLE_LEGS.map(
+    def => legs.find(l => l.legId === def.id) ?? upstreamBlocked(def.id, 'not_run')
+  );
+
+  return {
+    schemaVersion: 1,
+    suiteRunId: deps.runId,
+    generatedAt: deps.runStartIso,
+    verdict: overallVerdict(ordered, invariantViolations),
+    reasonCodes: [...new Set(ordered.flatMap(l => l.reasonCodes))],
+    invariantViolations,
+    legs: ordered,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Default artifact source (shells out; runs only in the live phase)
+// ---------------------------------------------------------------------------
+
+async function runCommand(
+  command: string,
+  args: readonly string[],
+  cwd?: string
+): Promise<{ stdout: string; stderr: string; exitCode: number }> {
+  const proc = Bun.spawn([command, ...args], {
+    cwd,
+    stdout: 'pipe',
+    stderr: 'pipe',
+  });
+  const [stdout, stderr] = await Promise.all([
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
+  ]);
+  const exitCode = await proc.exited;
+  return { stdout, stderr, exitCode };
+}
+
+export interface DefaultArtifactSourceConfig {
+  readonly dbPath: string;
+  readonly githubRepo: string;
+  readonly repoDir: string;
+  readonly scratchDir: string;
+  readonly dutyOfficerReportPath: string | null;
+}
+
+function queryRows<T>(dbPath: string, sql: string, params: readonly SQLQueryBindings[]): T[] {
+  const db = new Database(dbPath, { readonly: true });
+  try {
+    return db.query(sql).all(...params) as T[];
+  } finally {
+    db.close();
+  }
+}
+
+export function createDefaultArtifactSource(
+  config: DefaultArtifactSourceConfig
+): LifecycleArtifactSource {
+  const repo = config.githubRepo;
+  // Arrow-function properties in a contextually-typed object literal so each
+  // method inherits its signature from LifecycleArtifactSource.
+  return {
+    queryTmJournalFireCauldron: async sinceIso =>
+      queryRows<TmJournalFireRow>(
+        config.dbPath,
+        "SELECT id, proposal_type, target, created_at FROM tm_journal WHERE proposal_type = 'fire_cauldron' AND created_at > ? ORDER BY id DESC LIMIT 10",
+        [sinceIso]
+      ),
+    listPrsForBranch: async (headBranch): Promise<PrSummary[]> => {
+      const { stdout } = await runCommand('gh', [
+        'pr',
+        'list',
+        '--repo',
+        repo,
+        '--head',
+        headBranch,
+        '--state',
+        'all',
+        '--json',
+        'number,headRefName,baseRefName,state',
+      ]);
+      return JSON.parse(stdout || '[]') as PrSummary[];
+    },
+    viewPr: async (prNumber): Promise<PrView> => {
+      const { stdout } = await runCommand('gh', [
+        'pr',
+        'view',
+        String(prNumber),
+        '--repo',
+        repo,
+        '--json',
+        'number,state,mergedBy,commits,mergeCommit',
+      ]);
+      const raw = JSON.parse(stdout || '{}') as {
+        number?: number;
+        state?: string;
+        mergedBy?: { login?: string } | null;
+        commits?: unknown[];
+        mergeCommit?: { oid?: string } | null;
+      };
+      return {
+        number: raw.number ?? prNumber,
+        state: raw.state ?? 'UNKNOWN',
+        mergedByLogin: raw.mergedBy?.login ?? null,
+        commitCount: Array.isArray(raw.commits) ? raw.commits.length : 0,
+        mergeCommitOid: raw.mergeCommit?.oid ?? null,
+      };
+    },
+    listPrReviews: async (prNumber): Promise<PrReview[]> => {
+      const { stdout } = await runCommand('gh', ['api', `repos/${repo}/pulls/${prNumber}/reviews`]);
+      const raw = JSON.parse(stdout || '[]') as {
+        state?: string;
+        body?: string;
+        submitted_at?: string;
+        user?: { login?: string };
+      }[];
+      return raw.map(review => ({
+        state: review.state ?? 'UNKNOWN',
+        body: review.body ?? '',
+        submittedAt: review.submitted_at ?? '',
+        authorLogin: review.user?.login ?? '',
+      }));
+    },
+    countDiffMatches: async (prNumber, literal): Promise<number> => {
+      const { stdout } = await runCommand('gh', ['pr', 'diff', String(prNumber), '--repo', repo]);
+      // Count only added lines that still contain the literal.
+      return stdout
+        .split('\n')
+        .filter(line => line.startsWith('+') && !line.startsWith('+++') && line.includes(literal))
+        .length;
+    },
+    queryRunReview: async headSha =>
+      queryRows<RunReviewRow>(
+        config.dbPath,
+        'SELECT head_sha, action, created_at FROM run_review WHERE head_sha = ? ORDER BY created_at DESC LIMIT 10',
+        [headSha]
+      ),
+    mergedActorLogin: async (prNumber): Promise<string | null> => {
+      const { stdout } = await runCommand('gh', [
+        'api',
+        `repos/${repo}/issues/${prNumber}/timeline`,
+      ]);
+      const events = JSON.parse(stdout || '[]') as {
+        event?: string;
+        actor?: { login?: string };
+      }[];
+      const merged = events.find(event => event.event === 'merged');
+      return merged?.actor?.login ?? null;
+    },
+    viewIssue: async (issueNumber): Promise<IssueView> => {
+      const { stdout } = await runCommand('gh', [
+        'issue',
+        'view',
+        String(issueNumber),
+        '--repo',
+        repo,
+        '--json',
+        'number,state,stateReason',
+      ]);
+      const raw = JSON.parse(stdout || '{}') as {
+        number?: number;
+        state?: string;
+        stateReason?: string | null;
+      };
+      return {
+        number: raw.number ?? issueNumber,
+        // gh returns state as OPEN/CLOSED (uppercase) for --json state.
+        state: (raw.state ?? 'UNKNOWN').toUpperCase(),
+        stateReason: raw.stateReason ?? null,
+      };
+    },
+    dispatchResultBody: async (messageId): Promise<string | null> => {
+      const rows = queryRows<{ result_body: string | null }>(
+        config.dbPath,
+        'SELECT result_body FROM agent_dispatch_messages WHERE id = ? LIMIT 1',
+        [messageId]
+      );
+      return rows[0]?.result_body ?? null;
+    },
+    readDutyOfficerReport: async (): Promise<string> => {
+      if (!config.dutyOfficerReportPath) return '';
+      try {
+        return await Bun.file(config.dutyOfficerReportPath).text();
+      } catch {
+        return '';
+      }
+    },
+    scratchResidueDiff: async (baseBranch): Promise<string> => {
+      const { stdout } = await runCommand(
+        'git',
+        ['diff', `origin/${baseBranch}`, '--', config.scratchDir],
+        config.repoDir
+      );
+      return stdout;
+    },
+    countRevertCommits: async (runId): Promise<number> => {
+      const { stdout } = await runCommand(
+        'git',
+        ['log', '--oneline', `--grep=canary/lifecycle-${runId} revert`],
+        config.repoDir
+      );
+      return stdout.split('\n').filter(line => line.trim().length > 0).length;
+    },
+    listPrChangedFiles: async (prNumber): Promise<string[]> => {
+      const { stdout } = await runCommand('gh', [
+        'pr',
+        'view',
+        String(prNumber),
+        '--repo',
+        repo,
+        '--json',
+        'files',
+      ]);
+      const raw = JSON.parse(stdout || '{}') as { files?: { path?: string }[] };
+      return (raw.files ?? []).map(file => file.path ?? '').filter(path => path.length > 0);
+    },
+  };
+}
