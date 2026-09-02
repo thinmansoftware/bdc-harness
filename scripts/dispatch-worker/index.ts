@@ -67,13 +67,16 @@ export function classifyDispatchOutcome(
   return { resultBody, status: 'done', taskOutcome: resultBody ? 'succeeded' : null };
 }
 
+function encodeForHash(value: unknown): string {
+  return typeof value === 'string' ? value : (JSON.stringify(value) ?? String(value));
+}
+
 export function summarizeTranscriptPayload(value: unknown): {
   sha256: string;
   utf8Bytes: number;
   preview: string;
 } {
-  const encoded = typeof value === 'string' ? value : JSON.stringify(value);
-  const text = encoded ?? String(value);
+  const text = encodeForHash(value);
   const bytes = Buffer.from(text, 'utf8');
   return {
     sha256: createHash('sha256').update(bytes).digest('hex'),
@@ -95,7 +98,7 @@ export function summarizePersistedOutcome(
 ): string {
   const summary = summarizeTranscriptPayload(value);
   if (options.persistText) {
-    const encoded = typeof value === 'string' ? value : (JSON.stringify(value) ?? String(value));
+    const encoded = encodeForHash(value);
     if (summary.utf8Bytes <= (options.cap ?? REPLY_TEXT_CAP_BYTES)) {
       return JSON.stringify({
         classification,

@@ -127,6 +127,24 @@ describe('dispatch outcome and transcript contract', () => {
     expect(JSON.stringify(persisted.message.body)).not.toContain('message-secret');
   });
 
+  test('omits stdout_text from non-agent-message transcripts', async () => {
+    const path = await writeTranscript({
+      message: {
+        id: 'review-transcript',
+        task_type: 'run_review',
+        sender: 'test',
+        recipient: 'seat',
+        body: 'review body',
+        status: 'claimed',
+        fencing_token: 1,
+      },
+      stdout: 'diff output',
+      stdoutText: undefined,
+    });
+    const raw = await readFile(path, 'utf8');
+    expect(raw).not.toContain('stdout_text');
+  });
+
   test('normalizes persist_reply_text false for config-only rollback', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'dispatch-worker-config-'));
     const path = join(dir, 'config.json');
