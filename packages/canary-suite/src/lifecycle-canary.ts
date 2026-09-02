@@ -120,6 +120,10 @@ export interface PrReview {
   readonly body: string;
   readonly submittedAt: string; // ISO
   readonly authorLogin: string;
+  // The head commit SHA the review was submitted against. Required to prove a
+  // review is pinned to the post-remediation head, not merely timestamped
+  // after it (a review can be re-requested/backdated against a stale head).
+  readonly commitId: string;
 }
 
 export interface PrView {
@@ -378,17 +382,25 @@ export async function checkLeg5OverseerReapproves(input: {
     const triggered = rows.some(
       row => row.action === 'synchronize' && row.head_sha === input.remediationSha
     );
-    // (b) verdict correct: latest Overseer review APPROVED after remediation.
+    // (b) verdict correct: the LATEST review must be APPROVED and pinned to
+    // the post-remediation head sha. Filtering "any APPROVED review after the
+    // remediation timestamp" is not sufficient -- it lets a stale APPROVED
+    // review (submitted late but against an older head) satisfy the leg even
+    // when the current, correct verdict is a CHANGES_REQUESTED against the
+    // remediation head. Require commit_id == remediationSha, then take the
+    // most recently submitted review among those pinned to that head and
+    // check its state.
     const reviews = await input.source.listPrReviews(input.prNumber);
-    const approvedAfter = reviews
-      .filter(review => review.state === 'APPROVED')
-      .some(review => {
-        const submitted = Date.parse(review.submittedAt);
-        return (
-          Number.isFinite(submitted) &&
-          (!Number.isFinite(remediationMs) || submitted > remediationMs)
-        );
-      });
+    const reviewsOnRemediationHead = reviews
+      .filter(review => review.commitId === input.remediationSha)
+      .filter(review => Number.isFinite(Date.parse(review.submittedAt)));
+    const latestOnHead = [...reviewsOnRemediationHead].sort(
+      (a, b) => Date.parse(b.submittedAt) - Date.parse(a.submittedAt)
+    )[0];
+    const approvedAfter =
+      latestOnHead !== undefined &&
+      latestOnHead.state === 'APPROVED' &&
+      (!Number.isFinite(remediationMs) || Date.parse(latestOnHead.submittedAt) >= remediationMs);
     return { satisfied: triggered && approvedAfter, value: { triggered, approvedAfter } };
   });
   const { triggered, approvedAfter } = result.value ?? {};
@@ -1147,12 +1159,14 @@ export function createDefaultArtifactSource(
         body?: string;
         submitted_at?: string;
         user?: { login?: string };
+        commit_id?: string;
       }[];
       return raw.map(review => ({
         state: review.state ?? 'UNKNOWN',
         body: review.body ?? '',
         submittedAt: review.submitted_at ?? '',
         authorLogin: review.user?.login ?? '',
+        commitId: review.commit_id ?? '',
       }));
     },
     countDiffMatches: async (prNumber, literal): Promise<number> => {
@@ -1221,13 +1235,32 @@ export function createDefaultArtifactSource(
     },
     scratchResidueDiff: async (baseBranch, preRunRevision): Promise<string> => {
       // Refresh the remote ref so the comparison sees the post-run base tip.
-      await runCommand('git', ['fetch', 'origin', baseBranch], config.repoDir);
-      const { stdout } = await runCommand(
+      // A missing remote, auth failure, or other git error here must fail the
+      // check CLOSED (throw), never fall through to an empty-stdout "clean"
+      // read -- Leg 10 is the safety-critical guard against residue on the
+      // shared base branch.
+      const fetchResult = await runCommand('git', ['fetch', 'origin', baseBranch], config.repoDir);
+      if (fetchResult.exitCode !== 0) {
+        throw new Error(
+          `lifecycle_canary_scratch_residue_fetch_failed: exitCode=${fetchResult.exitCode} stderr=${fetchResult.stderr.trim()}`
+        );
+      }
+      const diffResult = await runCommand(
         'git',
         ['diff', preRunRevision, `origin/${baseBranch}`, '--', config.scratchDir],
         config.repoDir
       );
-      return stdout;
+      if (diffResult.exitCode !== 0) {
+        throw new Error(
+          `lifecycle_canary_scratch_residue_diff_failed: exitCode=${diffResult.exitCode} stderr=${diffResult.stderr.trim()}`
+        );
+      }
+      if (diffResult.stderr.trim().length > 0) {
+        throw new Error(
+          `lifecycle_canary_scratch_residue_diff_stderr: ${diffResult.stderr.trim()}`
+        );
+      }
+      return diffResult.stdout;
     },
     countRevertCommits: async (runId): Promise<number> => {
       const { stdout } = await runCommand(

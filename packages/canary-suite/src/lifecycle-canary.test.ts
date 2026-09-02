@@ -13,6 +13,7 @@ import {
   checkLeg10CanaryReverts,
   runLifecycleCanarySuite,
   isValidLifecycleRunId,
+  createDefaultArtifactSource,
   type LegPollConfig,
   type LifecycleArtifactSource,
   type LifecycleClock,
@@ -20,7 +21,7 @@ import {
 } from './lifecycle-canary';
 import { writeLifecycleCanaryArtifacts } from './lifecycle-report';
 import type { LifecycleCanaryReport } from './types';
-import { rm } from 'fs/promises';
+import { rm, mkdtemp } from 'fs/promises';
 import { join } from 'path';
 import { tmpdir } from 'os';
 
@@ -215,6 +216,7 @@ describe('Leg 5 -- Overseer re-approves on push', () => {
             body: 'ok now',
             submittedAt: '2026-09-02T01:02:00.000Z',
             authorLogin: 'overseer-bot',
+            commitId: remediationSha,
           },
         ],
       },
@@ -236,6 +238,7 @@ describe('Leg 5 -- Overseer re-approves on push', () => {
             body: 'ok',
             submittedAt: '2026-09-02T01:02:00.000Z',
             authorLogin: 'overseer-bot',
+            commitId: remediationSha,
           },
         ],
       },
@@ -264,6 +267,7 @@ describe('Leg 5 -- Overseer re-approves on push', () => {
             body: 'still bad',
             submittedAt: '2026-09-02T01:02:00.000Z',
             authorLogin: 'overseer-bot',
+            commitId: remediationSha,
           },
         ],
       },
@@ -274,6 +278,112 @@ describe('Leg 5 -- Overseer re-approves on push', () => {
     });
     expect(report.verdict).toBe('failed');
     expect(report.reasonCodes).toContain('overseer_no_reapproval');
+  });
+
+  test('fails when a stale APPROVED review (older head) is the only one after the timestamp', async () => {
+    // Regression for the Overseer [major] finding: an APPROVED review that is
+    // NOT pinned to the remediation head must not satisfy the leg, even if
+    // its submittedAt is after the remediation commit.
+    const report = await checkLeg5OverseerReapproves({
+      source: {
+        queryRunReview: async () => [
+          {
+            head_sha: remediationSha,
+            action: 'synchronize',
+            created_at: '2026-09-02T01:01:00.000Z',
+          },
+        ],
+        listPrReviews: async () => [
+          {
+            state: 'APPROVED',
+            body: 'approved an old head',
+            submittedAt: '2026-09-02T01:02:00.000Z',
+            authorLogin: 'overseer-bot',
+            commitId: 'stale-sha-before-remediation',
+          },
+        ],
+      },
+      prNumber: 991,
+      remediationSha,
+      remediationCommitIso: remediationIso,
+      poll: poll(),
+    });
+    expect(report.verdict).toBe('failed');
+    expect(report.reasonCodes).toContain('overseer_no_reapproval');
+  });
+
+  test('fails when the latest review on the remediation head is CHANGES_REQUESTED, even though an earlier APPROVED exists on that head', async () => {
+    // Regression: "any APPROVED review after remediation" previously passed
+    // even when a LATER CHANGES_REQUESTED review on the same head rejected
+    // the PR. The current verdict must win.
+    const report = await checkLeg5OverseerReapproves({
+      source: {
+        queryRunReview: async () => [
+          {
+            head_sha: remediationSha,
+            action: 'synchronize',
+            created_at: '2026-09-02T01:01:00.000Z',
+          },
+        ],
+        listPrReviews: async () => [
+          {
+            state: 'APPROVED',
+            body: 'looked ok at first',
+            submittedAt: '2026-09-02T01:02:00.000Z',
+            authorLogin: 'overseer-bot',
+            commitId: remediationSha,
+          },
+          {
+            state: 'CHANGES_REQUESTED',
+            body: 'found a new issue on re-review',
+            submittedAt: '2026-09-02T01:05:00.000Z',
+            authorLogin: 'overseer-bot',
+            commitId: remediationSha,
+          },
+        ],
+      },
+      prNumber: 991,
+      remediationSha,
+      remediationCommitIso: remediationIso,
+      poll: poll(),
+    });
+    expect(report.verdict).toBe('failed');
+    expect(report.reasonCodes).toContain('overseer_no_reapproval');
+  });
+
+  test('passes when an earlier CHANGES_REQUESTED on the remediation head is superseded by a later APPROVED', async () => {
+    const report = await checkLeg5OverseerReapproves({
+      source: {
+        queryRunReview: async () => [
+          {
+            head_sha: remediationSha,
+            action: 'synchronize',
+            created_at: '2026-09-02T01:01:00.000Z',
+          },
+        ],
+        listPrReviews: async () => [
+          {
+            state: 'CHANGES_REQUESTED',
+            body: 'first pass',
+            submittedAt: '2026-09-02T01:02:00.000Z',
+            authorLogin: 'overseer-bot',
+            commitId: remediationSha,
+          },
+          {
+            state: 'APPROVED',
+            body: 'fixed, approving now',
+            submittedAt: '2026-09-02T01:05:00.000Z',
+            authorLogin: 'overseer-bot',
+            commitId: remediationSha,
+          },
+        ],
+      },
+      prNumber: 991,
+      remediationSha,
+      remediationCommitIso: remediationIso,
+      poll: poll(),
+    });
+    expect(report.verdict).toBe('passed');
   });
 });
 
@@ -504,12 +614,14 @@ describe('runLifecycleCanarySuite (Section 10 named scenarios)', () => {
           body: 'WRONG_VALUE at marker:1',
           submittedAt: '2026-09-02T00:30:00.000Z',
           authorLogin: 'overseer-bot',
+          commitId: 'pre-remediation-sha',
         },
         {
           state: 'APPROVED',
           body: 'ok',
           submittedAt: '2026-09-02T01:02:00.000Z',
           authorLogin: 'overseer-bot',
+          commitId: 'abc123',
         },
       ],
       countDiffMatches: async () => 0,
@@ -1091,5 +1203,103 @@ describe('bounded legs + always-run cleanup (Overseer Finding 1)', () => {
     expect(report.verdict).toBe('failed');
     expect(report.reasonCodes).toContain('canary_cleanup_failed');
     expect(report.evidenceRefs.some(ref => ref.includes('timeout_after_10ms'))).toBe(true);
+  });
+});
+
+describe('createDefaultArtifactSource.scratchResidueDiff -- fails closed on git errors', () => {
+  // Regression for the Overseer [major] finding: a missing remote, auth
+  // failure, or invalid revision must THROW (fail Leg 10 closed via the
+  // existing checkLeg10CanaryReverts try/catch -> canary_cleanup_threw),
+  // never return empty stdout that Leg 10 reads as "clean".
+
+  async function initGitRepo(): Promise<string> {
+    const dir = await mkdtemp(join(tmpdir(), 'lifecycle-canary-residue-'));
+    const run = async (args: string[]) => {
+      const proc = Bun.spawn(['git', ...args], { cwd: dir, stdout: 'pipe', stderr: 'pipe' });
+      await proc.exited;
+    };
+    await run(['init', '-q']);
+    await run(['config', 'user.email', 'test@example.com']);
+    await run(['config', 'user.name', 'test']);
+    return dir;
+  }
+
+  test('throws when git fetch fails (no such remote / origin never configured)', async () => {
+    const repoDir = await initGitRepo();
+    try {
+      const source = createDefaultArtifactSource({
+        dbPath: ':memory:does-not-matter-for-this-test',
+        githubRepo: 'thinmansoftware/bdc-harness',
+        repoDir,
+        scratchDir: '.archon/canaries/lifecycle-scratch',
+        dutyOfficerReportPath: null,
+      });
+      // No 'origin' remote exists in the fresh repo -> git fetch origin <branch> fails.
+      await expect(source.scratchResidueDiff('dev', 'HEAD')).rejects.toThrow(
+        /lifecycle_canary_scratch_residue_fetch_failed/
+      );
+    } finally {
+      await rm(repoDir, { recursive: true, force: true });
+    }
+  });
+
+  test('throws when git diff fails (invalid preRunRevision)', async () => {
+    const repoDir = await initGitRepo();
+    try {
+      // Create an initial commit and a fake 'origin' remote pointing at the
+      // repo itself so `git fetch origin <branch>` succeeds, isolating the
+      // failure to the diff step with a bogus revision.
+      const write = async (args: string[]) => {
+        const proc = Bun.spawn(['git', ...args], { cwd: repoDir, stdout: 'pipe', stderr: 'pipe' });
+        await proc.exited;
+      };
+      await Bun.write(join(repoDir, 'README.md'), 'hello');
+      await write(['add', '.']);
+      await write(['commit', '-q', '-m', 'init']);
+      await write(['branch', '-M', 'dev']);
+      await write(['remote', 'add', 'origin', repoDir]);
+      await write(['fetch', '-q', 'origin']);
+
+      const source = createDefaultArtifactSource({
+        dbPath: ':memory:does-not-matter-for-this-test',
+        githubRepo: 'thinmansoftware/bdc-harness',
+        repoDir,
+        scratchDir: '.archon/canaries/lifecycle-scratch',
+        dutyOfficerReportPath: null,
+      });
+      await expect(
+        source.scratchResidueDiff('dev', 'not-a-real-revision-000000')
+      ).rejects.toThrow(/lifecycle_canary_scratch_residue_diff_failed/);
+    } finally {
+      await rm(repoDir, { recursive: true, force: true });
+    }
+  });
+
+  test('returns the real diff (does not throw) on a clean, valid comparison', async () => {
+    const repoDir = await initGitRepo();
+    try {
+      const write = async (args: string[]) => {
+        const proc = Bun.spawn(['git', ...args], { cwd: repoDir, stdout: 'pipe', stderr: 'pipe' });
+        await proc.exited;
+      };
+      await Bun.write(join(repoDir, 'README.md'), 'hello');
+      await write(['add', '.']);
+      await write(['commit', '-q', '-m', 'init']);
+      await write(['branch', '-M', 'dev']);
+      await write(['remote', 'add', 'origin', repoDir]);
+      await write(['fetch', '-q', 'origin']);
+
+      const source = createDefaultArtifactSource({
+        dbPath: ':memory:does-not-matter-for-this-test',
+        githubRepo: 'thinmansoftware/bdc-harness',
+        repoDir,
+        scratchDir: '.archon/canaries/lifecycle-scratch',
+        dutyOfficerReportPath: null,
+      });
+      const diff = await source.scratchResidueDiff('dev', 'HEAD');
+      expect(diff.trim().length).toBe(0);
+    } finally {
+      await rm(repoDir, { recursive: true, force: true });
+    }
   });
 });
