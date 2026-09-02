@@ -63,7 +63,9 @@ export class TimeoutError extends Error {
 export function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
   if (!(ms > 0)) return promise;
   return new Promise<T>((resolve, reject) => {
-    const timer = setTimeout(() => reject(new TimeoutError(label, ms)), ms);
+    const timer = setTimeout(() => {
+      reject(new TimeoutError(label, ms));
+    }, ms);
     promise.then(
       value => {
         clearTimeout(timer);
@@ -71,7 +73,7 @@ export function withTimeout<T>(promise: Promise<T>, ms: number, label: string): 
       },
       error => {
         clearTimeout(timer);
-        reject(error);
+        reject(error instanceof Error ? error : new Error(String(error)));
       }
     );
   });
@@ -403,8 +405,7 @@ export async function checkLeg5OverseerReapproves(input: {
       (a, b) => Date.parse(b.submittedAt) - Date.parse(a.submittedAt)
     )[0];
     const approvedAfter =
-      latestOnHead !== undefined &&
-      latestOnHead.state === 'APPROVED' &&
+      latestOnHead?.state === 'APPROVED' &&
       (!Number.isFinite(remediationMs) || Date.parse(latestOnHead.submittedAt) >= remediationMs);
     return { satisfied: triggered && approvedAfter, value: { triggered, approvedAfter } };
   });
@@ -619,9 +620,12 @@ export async function checkLeg10CanaryReverts(input: {
 
   const { clock, timeoutMs, intervalMs } = input.poll;
   const attemptTimeoutMs = input.attemptTimeoutMs ?? timeoutMs;
-  const result = await pollUntil(clock, timeoutMs, intervalMs, () =>
+  const result = await pollUntil(clock, timeoutMs, intervalMs, (): Promise<{
+    satisfied: boolean;
+    value: { diff: string; reverts: number };
+  }> =>
     withTimeout(
-      (async () => {
+      (async (): Promise<{ satisfied: boolean; value: { diff: string; reverts: number } }> => {
         const diff = await input.source.scratchResidueDiff(input.baseBranch, input.preRunRevision);
         const reverts = await input.source.countRevertCommits(input.runId);
         // Clean when the base branch's scratch path is byte-identical to its
@@ -1019,9 +1023,12 @@ export async function runLifecycleCanarySuite(
         baseBranch: deps.baseBranch,
         runId: deps.runId,
         preRunRevision: deps.preRunRevision,
-        cleanup: deps.cleanup
-          ? () => withTimeout(deps.cleanup!(), cleanupTimeoutMs, 'leg10-cleanup')
-          : undefined,
+        cleanup: ((): (() => Promise<void>) | undefined => {
+          const cleanupFn = deps.cleanup;
+          return cleanupFn
+            ? (): Promise<void> => withTimeout(cleanupFn(), cleanupTimeoutMs, 'leg10-cleanup')
+            : undefined;
+        })(),
         poll: poll(timeouts.leg10Ms),
         attemptTimeoutMs: legWallClockMs,
       })
