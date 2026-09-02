@@ -7,6 +7,12 @@ import {
   type TaskmasterCanaryDeps,
   type TaskmasterCanaryResult,
 } from './taskmaster-canary';
+import {
+  runLifecycleCanarySuite,
+  writeLifecycleCanaryArtifacts,
+  type LifecycleCanaryDeps,
+  type LifecycleCanaryResult,
+} from './lifecycle-canary';
 
 interface CanaryCliDeps {
   readonly runner: (options: RunCanaryOptions) => Promise<RunCanaryResult>;
@@ -16,6 +22,11 @@ interface CanaryCliDeps {
   readonly taskmasterArtifactWriter?: (
     outputRoot: string,
     report: TaskmasterCanaryResult
+  ) => Promise<readonly string[]>;
+  readonly lifecycleRunner?: (options: LifecycleCanaryDeps) => Promise<LifecycleCanaryResult>;
+  readonly lifecycleArtifactWriter?: (
+    outputRoot: string,
+    report: LifecycleCanaryResult
   ) => Promise<readonly string[]>;
 }
 
@@ -47,6 +58,58 @@ export async function runCanaryCli(
   }
 ): Promise<number> {
   const command = args[0];
+  if (command === 'lifecycle') {
+    const apiBase = flag(args, '--api-base');
+    const codebaseId = flag(args, '--codebase-id');
+    const runId = flag(args, '--run-id');
+    const outputRoot = flag(args, '--output-root');
+    const dbPath = flag(args, '--db-path');
+    const githubRepo = flag(args, '--github-repo') ?? 'thinmansoftware/bdc-harness';
+    const issueValue = flag(args, '--github-issue');
+    const githubIssue = issueValue === undefined ? NaN : Number(issueValue);
+    const tokenFile = flag(args, '--token-file');
+    if (
+      !apiBase ||
+      !codebaseId ||
+      !runId ||
+      !outputRoot ||
+      !dbPath ||
+      !Number.isSafeInteger(githubIssue) ||
+      githubIssue <= 0
+    ) {
+      deps.stderr('lifecycle_canary_missing_or_invalid_required_argument');
+      return 3;
+    }
+    const token = tokenFile
+      ? (await readFile(tokenFile, 'utf8')).trim()
+      : env.ARCHON_OPERATOR_TOKEN;
+    if (!token) {
+      deps.stderr('ARCHON_OPERATOR_TOKEN is required (or use --token-file)');
+      return 3;
+    }
+    try {
+      const report = await (deps.lifecycleRunner ?? runLifecycleCanarySuite)({
+        runId,
+        apiBase,
+        codebaseId,
+        dbPath,
+        githubRepo,
+        githubIssue,
+        operatorToken: token,
+        dispatchMessageId: flag(args, '--dispatch-message-id'),
+        dutyOfficerArtifact: flag(args, '--duty-officer-artifact'),
+        prNumber: Number(flag(args, '--pr-number')) || undefined,
+        remediationSha: flag(args, '--remediation-sha'),
+        remediationCommittedAt: flag(args, '--remediation-committed-at'),
+      });
+      await (deps.lifecycleArtifactWriter ?? writeLifecycleCanaryArtifacts)(outputRoot, report);
+      deps.stdout(JSON.stringify(report, null, 2));
+      return exitFor(report.verdict);
+    } catch (error) {
+      deps.stderr((error as Error).message.replaceAll(token, '[REDACTED]'));
+      return 4;
+    }
+  }
   if (command === 'taskmaster') {
     const dbPath = flag(args, '--db-path');
     const statusUrl = flag(args, '--status-url');
@@ -82,7 +145,7 @@ export async function runCanaryCli(
   }
   const level = command === 'check' ? 0 : command === 'plan' ? 1 : null;
   if (level === null) {
-    deps.stderr('Usage: archon-canary <check|plan|taskmaster> [options]');
+    deps.stderr('Usage: archon-canary <check|plan|taskmaster|lifecycle> [options]');
     return 3;
   }
   const manifestPath = flag(args, '--manifest');

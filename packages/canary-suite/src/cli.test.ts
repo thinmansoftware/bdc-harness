@@ -2,6 +2,7 @@ import { expect, mock, test } from 'bun:test';
 import { runCanaryCli } from './cli';
 import type { CanaryReport, RunCanaryResult } from './types';
 import type { TaskmasterCanaryResult } from './taskmaster-canary';
+import type { LifecycleCanaryResult } from './lifecycle-canary';
 
 const baseReport: CanaryReport = {
   schemaVersion: 1,
@@ -160,3 +161,72 @@ test('taskmaster maps a failed report to exit 2 after writing its artifact', asy
   expect(await runCanaryCli([...taskmasterArgs, '--interval-ms', '60000'], {}, deps)).toBe(2);
   expect(deps.taskmasterArtifactWriter).toHaveBeenCalledWith('artifacts', failedReport);
 });
+
+const lifecycleArgs = [
+  'lifecycle',
+  '--api-base',
+  'http://127.0.0.1:3090',
+  '--codebase-id',
+  'codebase-1',
+  '--run-id',
+  'run-1',
+  '--output-root',
+  'artifacts',
+  '--db-path',
+  'archon.db',
+  '--github-issue',
+  '42',
+];
+const lifecycleReport: LifecycleCanaryResult = {
+  schemaVersion: 1,
+  runId: 'run-1',
+  startedAt: '2026-09-02T00:00:00Z',
+  generatedAt: '2026-09-02T00:01:00Z',
+  verdict: 'passed',
+  reasonCodes: [],
+  evidenceRefs: [],
+  legs: [],
+};
+
+function lifecycleDeps(report: LifecycleCanaryResult = lifecycleReport) {
+  return {
+    runner: mock(async () => ({}) as RunCanaryResult),
+    lifecycleRunner: mock(async () => report),
+    lifecycleArtifactWriter: mock(async () => ['artifacts/run-1/summary.md']),
+    stdout: mock(() => {}),
+    stderr: mock(() => {}),
+  };
+}
+
+test.each([
+  '--api-base',
+  '--codebase-id',
+  '--run-id',
+  '--output-root',
+  '--db-path',
+  '--github-issue',
+] as const)('lifecycle rejects missing %s before network or DB access', async name => {
+  const deps = lifecycleDeps();
+  const index = lifecycleArgs.indexOf(name);
+  const invocation = lifecycleArgs.filter((_, item) => item !== index && item !== index + 1);
+  expect(await runCanaryCli(invocation, { ARCHON_OPERATOR_TOKEN: 'token' }, deps)).toBe(3);
+  expect(deps.lifecycleRunner).not.toHaveBeenCalled();
+});
+
+test.each([
+  ['passed', 0],
+  ['failed', 2],
+  ['blocked', 3],
+  ['aborted', 4],
+] as const)(
+  'lifecycle maps %s to exit %d and never prints its token',
+  async (verdict, expected) => {
+    const token = 'lifecycle-secret';
+    const deps = lifecycleDeps({ ...lifecycleReport, verdict });
+    expect(await runCanaryCli(lifecycleArgs, { ARCHON_OPERATOR_TOKEN: token }, deps)).toBe(
+      expected
+    );
+    expect(JSON.stringify(deps.stdout.mock.calls)).not.toContain(token);
+    expect(deps.lifecycleArtifactWriter).toHaveBeenCalled();
+  }
+);
