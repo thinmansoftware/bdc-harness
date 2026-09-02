@@ -718,7 +718,11 @@ describe('runLifecycleCanarySuite (Section 10 named scenarios)', () => {
         },
       ],
       queryRunReview: async () => [
-        { head_sha: 'live-head-sha', action: 'synchronize', created_at: '2026-09-02T01:05:30.000Z' },
+        {
+          head_sha: 'live-head-sha',
+          action: 'synchronize',
+          created_at: '2026-09-02T01:05:30.000Z',
+        },
       ],
     };
     const report = await runLifecycleCanarySuite({
@@ -1266,7 +1270,12 @@ describe('bounded legs + always-run cleanup (Overseer Finding 1)', () => {
       preRunRevision: 'base-sha-pre',
       source: stubSource({
         queryTmJournalFireCauldron: async () => [
-          { id: 1, proposal_type: 'fire_cauldron', target: 'bdc-harness#4321', created_at: RUN_START },
+          {
+            id: 1,
+            proposal_type: 'fire_cauldron',
+            target: 'bdc-harness#4321',
+            created_at: RUN_START,
+          },
         ],
         listPrsForBranch: async () => [],
         dispatchResultBody: async () => 'canary run lifecycle-x reached Leg 8',
@@ -1383,9 +1392,9 @@ describe('createDefaultArtifactSource.scratchResidueDiff -- fails closed on git 
         scratchDir: '.archon/canaries/lifecycle-scratch',
         dutyOfficerReportPath: null,
       });
-      await expect(
-        source.scratchResidueDiff('dev', 'not-a-real-revision-000000')
-      ).rejects.toThrow(/lifecycle_canary_scratch_residue_diff_failed/);
+      await expect(source.scratchResidueDiff('dev', 'not-a-real-revision-000000')).rejects.toThrow(
+        /lifecycle_canary_scratch_residue_diff_failed/
+      );
     } finally {
       await rm(repoDir, { recursive: true, force: true });
     }

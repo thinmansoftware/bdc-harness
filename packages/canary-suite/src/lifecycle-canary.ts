@@ -620,22 +620,29 @@ export async function checkLeg10CanaryReverts(input: {
 
   const { clock, timeoutMs, intervalMs } = input.poll;
   const attemptTimeoutMs = input.attemptTimeoutMs ?? timeoutMs;
-  const result = await pollUntil(clock, timeoutMs, intervalMs, (): Promise<{
-    satisfied: boolean;
-    value: { diff: string; reverts: number };
-  }> =>
-    withTimeout(
-      (async (): Promise<{ satisfied: boolean; value: { diff: string; reverts: number } }> => {
-        const diff = await input.source.scratchResidueDiff(input.baseBranch, input.preRunRevision);
-        const reverts = await input.source.countRevertCommits(input.runId);
-        // Clean when the base branch's scratch path is byte-identical to its
-        // pre-run revision.
-        const clean = diff.trim().length === 0;
-        return { satisfied: clean, value: { diff, reverts } };
-      })(),
-      attemptTimeoutMs,
-      'leg10-residue-check'
-    )
+  const result = await pollUntil(
+    clock,
+    timeoutMs,
+    intervalMs,
+    (): Promise<{
+      satisfied: boolean;
+      value: { diff: string; reverts: number };
+    }> =>
+      withTimeout(
+        (async (): Promise<{ satisfied: boolean; value: { diff: string; reverts: number } }> => {
+          const diff = await input.source.scratchResidueDiff(
+            input.baseBranch,
+            input.preRunRevision
+          );
+          const reverts = await input.source.countRevertCommits(input.runId);
+          // Clean when the base branch's scratch path is byte-identical to its
+          // pre-run revision.
+          const clean = diff.trim().length === 0;
+          return { satisfied: clean, value: { diff, reverts } };
+        })(),
+        attemptTimeoutMs,
+        'leg10-residue-check'
+      )
   );
   const { diff, reverts } = result.value;
 
@@ -1317,7 +1324,9 @@ export function createDefaultArtifactSource(
         `repos/${repo}/pulls/${prNumber}`,
       ]);
       if (exitCode !== 0) {
-        throw new Error(`lifecycle_canary_get_pr_head_failed: exitCode=${exitCode} stderr=${stderr.trim()}`);
+        throw new Error(
+          `lifecycle_canary_get_pr_head_failed: exitCode=${exitCode} stderr=${stderr.trim()}`
+        );
       }
       const raw = JSON.parse(stdout || '{}') as {
         head?: { sha?: string };
@@ -1329,8 +1338,11 @@ export function createDefaultArtifactSource(
       // The head commit's own author/committer date, not the PR's updated_at,
       // so Leg 5's Date.parse comparison anchors to the commit that actually
       // carries the remediation.
-      const { stdout: commitStdout, exitCode: commitExitCode, stderr: commitStderr } =
-        await runCommand('gh', ['api', `repos/${repo}/commits/${sha}`]);
+      const {
+        stdout: commitStdout,
+        exitCode: commitExitCode,
+        stderr: commitStderr,
+      } = await runCommand('gh', ['api', `repos/${repo}/commits/${sha}`]);
       if (commitExitCode !== 0) {
         throw new Error(
           `lifecycle_canary_get_pr_head_commit_failed: exitCode=${commitExitCode} stderr=${commitStderr.trim()}`
