@@ -179,6 +179,11 @@ export interface LifecycleArtifactSource {
   countRevertCommits(runId: string): Promise<number>;
   // Invariant 2 diff-scope
   listPrChangedFiles(prNumber: number): Promise<readonly string[]>;
+  // Leg 5 head refresh: the live PR head sha + its commit timestamp, read AFTER
+  // Leg 4 observes remediation on the PR. Leg 5 must validate against this real
+  // post-remediation head, not the sha captured at initiation (which predates
+  // Legs 2-4 and is stale by the time remediation lands).
+  getPrHead(prNumber: number): Promise<{ readonly sha: string; readonly committedAtIso: string }>;
 }
 
 // ---------------------------------------------------------------------------
@@ -882,18 +887,34 @@ export async function runLifecycleCanarySuite(
       );
 
       // Leg 4
-      legs.push(
-        await bounded(
-          'leg4-remediation-reaches-pr',
-          checkLeg4RemediationReachesPr({
-            source,
-            prNumber,
-            literal: plantedLiteral,
-            autoRemediationAvailable: deps.autoRemediationAvailable ?? false,
-            poll: poll(timeouts.leg4Ms),
-          })
-        )
+      const leg4 = await bounded(
+        'leg4-remediation-reaches-pr',
+        checkLeg4RemediationReachesPr({
+          source,
+          prNumber,
+          literal: plantedLiteral,
+          autoRemediationAvailable: deps.autoRemediationAvailable ?? false,
+          poll: poll(timeouts.leg4Ms),
+        })
       );
+      legs.push(leg4);
+
+      // Leg 5 needs the REAL post-remediation head, not the sha captured at
+      // initiation (or by the Leg-1 fallback) -- both predate Legs 2-4, so by
+      // the time remediation lands on the PR those values are stale and Leg 5
+      // would otherwise report a false "no_remediation_commit" block on every
+      // live run. Once Leg 4 confirms remediation reached the PR, refresh the
+      // head sha + its commit timestamp from the live PR and use THAT for Leg 5.
+      if (leg4.verdict === 'passed') {
+        try {
+          const head = await bounded('leg4-refresh-pr-head', source.getPrHead(prNumber));
+          fired = { ...fired, remediationSha: head.sha, remediationCommitIso: head.committedAtIso };
+        } catch {
+          // Refresh failed: fall through to whatever fired.remediationSha/
+          // remediationCommitIso already holds (initiate/fallback value, if
+          // any) rather than aborting the whole suite over a read failure.
+        }
+      }
 
       // Leg 5
       if (fired.remediationSha && fired.remediationCommitIso) {
@@ -1282,6 +1303,41 @@ export function createDefaultArtifactSource(
       ]);
       const raw = JSON.parse(stdout || '{}') as { files?: { path?: string }[] };
       return (raw.files ?? []).map(file => file.path ?? '').filter(path => path.length > 0);
+    },
+    getPrHead: async (prNumber): Promise<{ sha: string; committedAtIso: string }> => {
+      const { stdout, exitCode, stderr } = await runCommand('gh', [
+        'api',
+        `repos/${repo}/pulls/${prNumber}`,
+      ]);
+      if (exitCode !== 0) {
+        throw new Error(`lifecycle_canary_get_pr_head_failed: exitCode=${exitCode} stderr=${stderr.trim()}`);
+      }
+      const raw = JSON.parse(stdout || '{}') as {
+        head?: { sha?: string };
+      };
+      const sha = raw.head?.sha;
+      if (!sha) {
+        throw new Error('lifecycle_canary_get_pr_head_no_sha');
+      }
+      // The head commit's own author/committer date, not the PR's updated_at,
+      // so Leg 5's Date.parse comparison anchors to the commit that actually
+      // carries the remediation.
+      const { stdout: commitStdout, exitCode: commitExitCode, stderr: commitStderr } =
+        await runCommand('gh', ['api', `repos/${repo}/commits/${sha}`]);
+      if (commitExitCode !== 0) {
+        throw new Error(
+          `lifecycle_canary_get_pr_head_commit_failed: exitCode=${commitExitCode} stderr=${commitStderr.trim()}`
+        );
+      }
+      const commitRaw = JSON.parse(commitStdout || '{}') as {
+        commit?: { committer?: { date?: string }; author?: { date?: string } };
+      };
+      const committedAtIso =
+        commitRaw.commit?.committer?.date ?? commitRaw.commit?.author?.date ?? '';
+      if (!committedAtIso) {
+        throw new Error('lifecycle_canary_get_pr_head_no_commit_date');
+      }
+      return { sha, committedAtIso };
     },
   };
 }

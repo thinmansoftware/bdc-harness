@@ -60,6 +60,7 @@ function stubSource(overrides: Partial<LifecycleArtifactSource>): LifecycleArtif
     scratchResidueDiff: reject('scratchResidueDiff'),
     countRevertCommits: reject('countRevertCommits'),
     listPrChangedFiles: reject('listPrChangedFiles'),
+    getPrHead: reject('getPrHead'),
     ...overrides,
   } as LifecycleArtifactSource;
 }
@@ -642,6 +643,11 @@ describe('runLifecycleCanarySuite (Section 10 named scenarios)', () => {
       scratchResidueDiff: async () => '',
       countRevertCommits: async () => 1,
       listPrChangedFiles: async () => ['.archon/canaries/lifecycle-scratch/canary-marker-x.ts'],
+      // Live post-Leg-4 head matches the sha the fixture's Leg 5 reviews/
+      // run_review rows are pinned to ('abc123'), same as baseFire.remediationSha
+      // here -- a SEPARATE test below asserts Leg 5 uses THIS refreshed value
+      // even when it differs from baseFire.remediationSha.
+      getPrHead: async () => ({ sha: 'abc123', committedAtIso: '2026-09-02T01:00:00.000Z' }),
     });
   }
 
@@ -682,6 +688,116 @@ describe('runLifecycleCanarySuite (Section 10 named scenarios)', () => {
     // Overall verdict is blocked (a blocked leg, no failures/violations).
     expect(report.verdict).toBe('blocked');
     expect(report.invariantViolations).toHaveLength(0);
+  });
+
+  test('Leg 5 validates against the post-Leg-4 refreshed head, not the initiation sha', async () => {
+    const source = fullPassSource();
+    // Deliberately make baseFire's initiation sha ('abc123') wrong/stale: no
+    // reviews or run_review rows are pinned to it. Only the LIVE post-Leg-4
+    // head ('live-head-sha', supplied by getPrHead) has the matching review +
+    // trigger row. If Leg 5 used fired.remediationSha from initiation instead
+    // of the refreshed head, it would fail to find a match and report failed/
+    // blocked; passing here proves it used the refreshed value.
+    const refreshed: LifecycleArtifactSource = {
+      ...source,
+      getPrHead: async () => ({ sha: 'live-head-sha', committedAtIso: '2026-09-02T01:05:00.000Z' }),
+      listPrReviews: async () => [
+        {
+          state: 'CHANGES_REQUESTED',
+          body: 'WRONG_VALUE at marker:1',
+          submittedAt: '2026-09-02T00:30:00.000Z',
+          authorLogin: 'overseer-bot',
+          commitId: 'pre-remediation-sha',
+        },
+        {
+          state: 'APPROVED',
+          body: 'ok',
+          submittedAt: '2026-09-02T01:06:00.000Z',
+          authorLogin: 'overseer-bot',
+          commitId: 'live-head-sha',
+        },
+      ],
+      queryRunReview: async () => [
+        { head_sha: 'live-head-sha', action: 'synchronize', created_at: '2026-09-02T01:05:30.000Z' },
+      ],
+    };
+    const report = await runLifecycleCanarySuite({
+      runId: 'lifecycle-x',
+      githubRepo: 'thinmansoftware/bdc-harness',
+      baseBranch: 'dev',
+      source: refreshed,
+      initiate: async () => baseFire,
+      preRunRevision: 'base-sha-pre',
+      clock: fakeClock(),
+      pollIntervalMs: 100,
+      timeouts: {
+        leg1Ms: 500,
+        leg2Ms: 500,
+        leg3Ms: 500,
+        leg4Ms: 500,
+        leg5Ms: 500,
+        leg6Ms: 500,
+        leg7Ms: 500,
+        leg8Ms: 500,
+        leg9Ms: 500,
+        leg10Ms: 500,
+      },
+      runStartIso: RUN_START,
+      mergeIdentity: 'bluedevilcollectibles',
+      dispatchExpectedSubstring: 'lifecycle-x',
+    });
+    const leg5 = report.legs.find(l => l.legId === 'overseer-reapprove')!;
+    expect(leg5.verdict).toBe('passed');
+    expect(leg5.evidenceRefs).toContain('run_review.head_sha=live-head-sha');
+  });
+
+  test('Leg 5 blocked with a clear reason when Leg 4 never produced a head', async () => {
+    const source = fullPassSource();
+    // Leg 4 fails (defect literal still present) and getPrHead is never
+    // expected to be called -- the refresh only runs after Leg 4 passes.
+    const noRemediation: LifecycleArtifactSource = {
+      ...source,
+      countDiffMatches: async () => 2,
+      getPrHead: async () => {
+        throw new Error('getPrHead should not be called when Leg 4 does not pass');
+      },
+    };
+    const report = await runLifecycleCanarySuite({
+      runId: 'lifecycle-x',
+      githubRepo: 'thinmansoftware/bdc-harness',
+      baseBranch: 'dev',
+      source: noRemediation,
+      // No remediation metadata from initiation either, so with Leg 4 failing
+      // and no successful refresh, Leg 5 has nothing to validate against.
+      initiate: async () => ({
+        ...baseFire,
+        remediationSha: undefined,
+        remediationCommitIso: undefined,
+      }),
+      preRunRevision: 'base-sha-pre',
+      clock: fakeClock(),
+      pollIntervalMs: 100,
+      timeouts: {
+        leg1Ms: 500,
+        leg2Ms: 500,
+        leg3Ms: 500,
+        leg4Ms: 500,
+        leg5Ms: 500,
+        leg6Ms: 500,
+        leg7Ms: 500,
+        leg8Ms: 500,
+        leg9Ms: 500,
+        leg10Ms: 500,
+      },
+      runStartIso: RUN_START,
+      mergeIdentity: 'bluedevilcollectibles',
+      dispatchExpectedSubstring: 'lifecycle-x',
+    });
+    const leg4 = report.legs.find(l => l.legId === 'remediation-reaches-pr')!;
+    expect(leg4.verdict).toBe('failed');
+    const leg5 = report.legs.find(l => l.legId === 'overseer-reapprove')!;
+    expect(leg5.verdict).toBe('blocked');
+    expect(leg5.reasonCodes).toContain('no_remediation_commit');
   });
 
   test('canary residue detection: deliberately-dirty cleanup fails Leg 10', async () => {
