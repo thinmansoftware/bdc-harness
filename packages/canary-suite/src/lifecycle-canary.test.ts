@@ -12,11 +12,17 @@ import {
   checkLeg9DutyOfficerReports,
   checkLeg10CanaryReverts,
   runLifecycleCanarySuite,
+  isValidLifecycleRunId,
   type LegPollConfig,
   type LifecycleArtifactSource,
   type LifecycleClock,
   type LifecycleFireResult,
 } from './lifecycle-canary';
+import { writeLifecycleCanaryArtifacts } from './lifecycle-report';
+import type { LifecycleCanaryReport } from './types';
+import { rm } from 'fs/promises';
+import { join } from 'path';
+import { tmpdir } from 'os';
 
 function fakeClock(startMs = 0): LifecycleClock {
   let t = startMs;
@@ -913,5 +919,177 @@ describe('post-review hardening regressions', () => {
       mergeIdentity: 'bluedevilcollectibles',
     });
     expect(fallbackCalls).toBe(0);
+  });
+});
+
+describe('path-traversal runId rejection (Overseer Finding 2)', () => {
+  test('CLI-level: isValidLifecycleRunId rejects a traversal runId', () => {
+    expect(isValidLifecycleRunId('../../etc/passwd')).toBe(false);
+    expect(isValidLifecycleRunId('foo/../../bar')).toBe(false);
+    expect(isValidLifecycleRunId('lifecycle-x')).toBe(true);
+    expect(isValidLifecycleRunId('lifecycle_x-1')).toBe(true);
+  });
+
+  test('artifact-writer level: writeLifecycleCanaryArtifacts rejects a traversal runId even if a caller skipped CLI validation', async () => {
+    const outputRoot = join(tmpdir(), `lifecycle-canary-test-${Date.now()}`);
+    const report: LifecycleCanaryReport = {
+      schemaVersion: 1,
+      suiteRunId: '../../etc/passwd',
+      generatedAt: '2026-09-02T00:00:00.000Z',
+      verdict: 'passed',
+      reasonCodes: [],
+      invariantViolations: [],
+      legs: [],
+    };
+    await expect(writeLifecycleCanaryArtifacts(outputRoot, report)).rejects.toThrow(
+      /lifecycle_canary_invalid_run_id/
+    );
+    await rm(outputRoot, { recursive: true, force: true });
+    await rm(join(outputRoot, '..', 'docs'), { recursive: true, force: true }).catch(() => {});
+  });
+
+  test('artifact-writer level: the runId-derived directory resolves and stays inside the artifact root', async () => {
+    // The regex already rejects '/' and '..', so this exercises the second,
+    // independent layer (path.resolve + containment assertion): a valid runId
+    // must produce paths that are all still under outputRoot after resolution.
+    const outputRoot = join(tmpdir(), `lifecycle-canary-test-contain-${Date.now()}`);
+    const report: LifecycleCanaryReport = {
+      schemaVersion: 1,
+      suiteRunId: 'valid-run-id',
+      generatedAt: '2026-09-02T00:00:00.000Z',
+      verdict: 'passed',
+      reasonCodes: [],
+      invariantViolations: [],
+      legs: [],
+    };
+    const paths = await writeLifecycleCanaryArtifacts(outputRoot, report);
+    const runDirPaths = paths.filter(path => !path.includes('docs'));
+    expect(runDirPaths.length).toBeGreaterThan(0);
+    expect(runDirPaths.every(path => path.startsWith(outputRoot))).toBe(true);
+    await rm(outputRoot, { recursive: true, force: true });
+    await rm(join(outputRoot, '..', 'docs'), { recursive: true, force: true }).catch(() => {});
+  });
+});
+
+describe('bounded legs + always-run cleanup (Overseer Finding 1)', () => {
+  const fastTimeouts = {
+    leg1Ms: 300,
+    leg2Ms: 300,
+    leg3Ms: 300,
+    leg4Ms: 300,
+    leg5Ms: 300,
+    leg6Ms: 300,
+    leg7Ms: 300,
+    leg8Ms: 300,
+    leg9Ms: 300,
+    leg10Ms: 300,
+  };
+
+  test('cleanup runs after a leg times out (a hanging leg does not skip Leg 10)', async () => {
+    let cleaned = false;
+    const report = await runLifecycleCanarySuite({
+      runId: 'lifecycle-x',
+      githubRepo: 'thinmansoftware/bdc-harness',
+      baseBranch: 'dev',
+      preRunRevision: 'base-sha-pre',
+      // A never-resolving promise simulates a wedged subprocess/API call. The
+      // per-leg wall-clock ceiling (legWallClockTimeoutMs) must reject this
+      // rather than hang the suite forever.
+      source: stubSource({
+        queryTmJournalFireCauldron: () => new Promise(() => {}),
+        scratchResidueDiff: async () => '',
+        countRevertCommits: async () => 1,
+      }),
+      initiate: async () => ({
+        issueNumber: 4321,
+        headBranch: 'canary/lifecycle-x',
+        fallbackUsed: false,
+      }),
+      cleanup: async () => {
+        cleaned = true;
+      },
+      clock: fakeClock(),
+      pollIntervalMs: 100,
+      timeouts: fastTimeouts,
+      runStartIso: RUN_START,
+      mergeIdentity: 'bluedevilcollectibles',
+      // Small wall-clock ceiling so the test resolves quickly instead of
+      // waiting out a real 20-minute default.
+      legWallClockTimeoutMs: 25,
+    });
+    expect(cleaned).toBe(true);
+    expect(report.legs.find(l => l.legId === 'canary-reverts')!.verdict).toBe('passed');
+    expect(report.invariantViolations.some(v => v.startsWith('canary_orchestration_error'))).toBe(
+      true
+    );
+    expect(report.verdict).toBe('failed');
+  });
+
+  test('an artifact-write timeout does not skip cleanup: cleanup runs as part of the suite regardless of what the CLI does with the report afterward', async () => {
+    // Cleanup is invoked inside runLifecycleCanarySuite itself (Leg 10), before
+    // the CLI ever attempts to write artifacts, so a hang in the downstream
+    // artifact-write step (bounded separately by --artifact-write-timeout-ms in
+    // cli.ts) cannot prevent cleanup from having already run.
+    let cleaned = false;
+    const report = await runLifecycleCanarySuite({
+      runId: 'lifecycle-x',
+      githubRepo: 'thinmansoftware/bdc-harness',
+      baseBranch: 'dev',
+      preRunRevision: 'base-sha-pre',
+      source: stubSource({
+        queryTmJournalFireCauldron: async () => [
+          { id: 1, proposal_type: 'fire_cauldron', target: 'bdc-harness#4321', created_at: RUN_START },
+        ],
+        listPrsForBranch: async () => [],
+        dispatchResultBody: async () => 'canary run lifecycle-x reached Leg 8',
+        readDutyOfficerReport: async () => 'DO pass: lifecycle-x progressing',
+        scratchResidueDiff: async () => '',
+        countRevertCommits: async () => 1,
+      }),
+      initiate: async () => ({
+        headBranch: 'canary/lifecycle-x',
+        fallbackUsed: false,
+        dispatchMessageId: 'msg-1',
+      }),
+      cleanup: async () => {
+        cleaned = true;
+      },
+      clock: fakeClock(),
+      pollIntervalMs: 100,
+      timeouts: fastTimeouts,
+      runStartIso: RUN_START,
+      mergeIdentity: 'bluedevilcollectibles',
+      dispatchExpectedSubstring: 'lifecycle-x',
+    });
+    expect(cleaned).toBe(true);
+    expect(report.legs.find(l => l.legId === 'canary-reverts')!.verdict).toBe('passed');
+    // Then simulate the artifact-write step hanging past its own timeout
+    // (mirrors cli.ts's withTimeout wrapper around writeLifecycleCanaryArtifacts)
+    // and confirm it rejects without touching cleanup state -- cleaned stays true.
+    const hangingWriter = () => new Promise<string[]>(() => {});
+    const { withTimeout } = await import('./lifecycle-canary');
+    await expect(withTimeout(hangingWriter(), 25, 'artifact-write-test')).rejects.toThrow(
+      /timeout_after_25ms/
+    );
+    expect(cleaned).toBe(true);
+  });
+
+  test('cleanup itself is bounded: a hanging cleanup() fails Leg 10 as canary_cleanup_failed rather than hanging the process', async () => {
+    const report = await checkLeg10CanaryReverts({
+      source: { scratchResidueDiff: async () => '', countRevertCommits: async () => 1 },
+      baseBranch: 'dev',
+      runId: 'lifecycle-x',
+      preRunRevision: 'base-sha-pre',
+      // Simulates the CLI wrapping cleanup in withTimeout(..., cleanupTimeoutMs, ...)
+      // the way runLifecycleCanarySuite does internally.
+      cleanup: () =>
+        new Promise<void>((_, reject) => {
+          setTimeout(() => reject(new Error('timeout_after_10ms: leg10-cleanup')), 10);
+        }),
+      poll: poll(),
+    });
+    expect(report.verdict).toBe('failed');
+    expect(report.reasonCodes).toContain('canary_cleanup_failed');
+    expect(report.evidenceRefs.some(ref => ref.includes('timeout_after_10ms'))).toBe(true);
   });
 });

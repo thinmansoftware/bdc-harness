@@ -11,6 +11,15 @@ import { LIFECYCLE_LEGS } from './types';
 // the live-run tooling, and the operator. See
 // .archon/canaries/lifecycle-scratch/README.md for the full contract.
 export const LIFECYCLE_SCRATCH_DIR = '.archon/canaries/lifecycle-scratch';
+// A CLI-controlled runId is joined into an artifact filesystem path
+// (writeLifecycleCanaryArtifacts). Validated at BOTH CLI-parse time (cli.ts)
+// and again inside the artifact writer (defense in depth -- never trust the
+// caller) against this strict allowlist pattern to prevent path traversal.
+export const LIFECYCLE_RUN_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
+
+export function isValidLifecycleRunId(runId: string): boolean {
+  return LIFECYCLE_RUN_ID_PATTERN.test(runId);
+}
 // The planted defect is an unambiguous, greppable wrong-constant. Leg 3 asserts
 // Overseer names this literal; Leg 4 asserts remediation removes it.
 export const LIFECYCLE_PLANTED_DEFECT_LITERAL = 'WRONG_VALUE';
@@ -37,6 +46,35 @@ interface PollResult<T> {
   readonly satisfied: boolean;
   readonly value: T;
   readonly attempts: number;
+}
+
+// Races a promise against a real wall-clock timeout so a single hanging
+// artifact-source call (e.g. a wedged `gh`/`git` subprocess) cannot block the
+// suite forever, regardless of the injected LifecycleClock used for polling
+// cadence. Uses real setTimeout deliberately -- this is a genuine process-level
+// deadline, not simulated time.
+export class TimeoutError extends Error {
+  constructor(label: string, ms: number) {
+    super(`timeout_after_${ms}ms: ${label}`);
+    this.name = 'TimeoutError';
+  }
+}
+
+export function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  if (!(ms > 0)) return promise;
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new TimeoutError(label, ms)), ms);
+    promise.then(
+      value => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      error => {
+        clearTimeout(timer);
+        reject(error);
+      }
+    );
+  });
 }
 
 async function pollUntil<T>(
@@ -545,6 +583,10 @@ export async function checkLeg10CanaryReverts(input: {
   // Performs the actual revert. Invoked here -- not merely observed -- so Leg 10
   // grades the outcome of a real cleanup operation (Invariant 3).
   readonly cleanup?: () => Promise<void>;
+  // Bounds each residue-check attempt so a single hung artifact-source call
+  // (scratchResidueDiff/countRevertCommits) cannot hang Leg 10 indefinitely.
+  // Defaults to the leg's own poll timeoutMs.
+  readonly attemptTimeoutMs?: number;
 }): Promise<LifecycleLegReport> {
   let cleanupError: string | undefined;
   if (input.cleanup) {
@@ -559,14 +601,21 @@ export async function checkLeg10CanaryReverts(input: {
     : `cleanup=${input.cleanup ? 'ran' : 'not_configured'}`;
 
   const { clock, timeoutMs, intervalMs } = input.poll;
-  const result = await pollUntil(clock, timeoutMs, intervalMs, async () => {
-    const diff = await input.source.scratchResidueDiff(input.baseBranch, input.preRunRevision);
-    const reverts = await input.source.countRevertCommits(input.runId);
-    // Clean when the base branch's scratch path is byte-identical to its
-    // pre-run revision.
-    const clean = diff.trim().length === 0;
-    return { satisfied: clean, value: { diff, reverts } };
-  });
+  const attemptTimeoutMs = input.attemptTimeoutMs ?? timeoutMs;
+  const result = await pollUntil(clock, timeoutMs, intervalMs, () =>
+    withTimeout(
+      (async () => {
+        const diff = await input.source.scratchResidueDiff(input.baseBranch, input.preRunRevision);
+        const reverts = await input.source.countRevertCommits(input.runId);
+        // Clean when the base branch's scratch path is byte-identical to its
+        // pre-run revision.
+        const clean = diff.trim().length === 0;
+        return { satisfied: clean, value: { diff, reverts } };
+      })(),
+      attemptTimeoutMs,
+      'leg10-residue-check'
+    )
+  );
   const { diff, reverts } = result.value;
 
   if (cleanupError) {
@@ -700,7 +749,24 @@ export interface LifecycleCanaryDeps {
   readonly scratchDir?: string;
   readonly dispatchExpectedSubstring?: string;
   readonly staleFlagMarkers?: readonly string[];
+  // Wall-clock ceiling on each leg's execution (independent of that leg's own
+  // poll timeoutMs -- this bounds the whole leg, including a hung
+  // artifact-source call inside the poll loop). Defaults to
+  // DEFAULT_LEG_WALL_CLOCK_TIMEOUT_MS.
+  readonly legWallClockTimeoutMs?: number;
+  // Wall-clock ceiling on cleanup() inside Leg 10, so a hanging revert cannot
+  // hang the whole process. Defaults to DEFAULT_CLEANUP_TIMEOUT_MS.
+  readonly cleanupTimeoutMs?: number;
 }
+
+// A leg's own poll timeoutMs governs how long it waits for a condition to
+// become true; this is the OUTER ceiling on the leg's entire execution
+// (including a single hung underlying call), corresponding to
+// --leg-timeout-ms on the CLI. Default: 20 minutes.
+export const DEFAULT_LEG_WALL_CLOCK_TIMEOUT_MS = 20 * 60_000;
+// Ceiling on the Leg 10 cleanup() call, corresponding to --cleanup-timeout-ms
+// on the CLI. Default: 5 minutes.
+export const DEFAULT_CLEANUP_TIMEOUT_MS = 5 * 60_000;
 
 function overallVerdict(
   legs: readonly LifecycleLegReport[],
@@ -723,6 +789,13 @@ export async function runLifecycleCanarySuite(
   const defectSignature = deps.defectSignature ?? plantedLiteral;
   const source = deps.source;
   const poll = (timeoutMs: number): LegPollConfig => ({ clock, timeoutMs, intervalMs });
+  const legWallClockMs = deps.legWallClockTimeoutMs ?? DEFAULT_LEG_WALL_CLOCK_TIMEOUT_MS;
+  const cleanupTimeoutMs = deps.cleanupTimeoutMs ?? DEFAULT_CLEANUP_TIMEOUT_MS;
+  // Bounds every leg step (including deps.initiate/fireFallback) by the outer
+  // per-leg wall-clock ceiling so a single hung underlying call cannot hang
+  // the whole suite, regardless of that step's own poll timeoutMs.
+  const bounded = <T>(label: string, promise: Promise<T>): Promise<T> =>
+    withTimeout(promise, legWallClockMs, label);
 
   const legs: LifecycleLegReport[] = [];
   const invariantViolations: string[] = [];
@@ -731,19 +804,22 @@ export async function runLifecycleCanarySuite(
   let orchestrationError: Error | undefined;
 
   try {
-    fired = await deps.initiate();
+    fired = await bounded('initiate', deps.initiate());
 
     // Leg 1 -- wait out the Taskmaster window FIRST; escalate to the documented
     // fire.ps1 fallback only after it elapses with no fire_cauldron row.
-    let leg1 = await checkLeg1TaskmasterFires({
-      source,
-      sinceIso: deps.runStartIso,
-      targetIssue: fired.issueNumber,
-      fallbackUsed: false,
-      poll: poll(timeouts.leg1Ms),
-    });
+    let leg1 = await bounded(
+      'leg1-taskmaster-fire',
+      checkLeg1TaskmasterFires({
+        source,
+        sinceIso: deps.runStartIso,
+        targetIssue: fired.issueNumber,
+        fallbackUsed: false,
+        poll: poll(timeouts.leg1Ms),
+      })
+    );
     if (leg1.verdict !== 'passed' && deps.fireFallback) {
-      const fallback = await deps.fireFallback();
+      const fallback = await bounded('leg1-fire-fallback', deps.fireFallback());
       fired = {
         ...fired,
         issueNumber: fallback.issueNumber ?? fired.issueNumber,
@@ -759,12 +835,15 @@ export async function runLifecycleCanarySuite(
     legs.push(leg1);
 
     // Leg 2
-    const leg2 = await checkLeg2CodexLaneOpensPr({
-      source,
-      headBranch: fired.headBranch,
-      baseBranch: deps.baseBranch,
-      poll: poll(timeouts.leg2Ms),
-    });
+    const leg2 = await bounded(
+      'leg2-codex-lane-build-pr',
+      checkLeg2CodexLaneOpensPr({
+        source,
+        headBranch: fired.headBranch,
+        baseBranch: deps.baseBranch,
+        poll: poll(timeouts.leg2Ms),
+      })
+    );
     legs.push(leg2.report);
     const prNumber = leg2.prNumber ?? fired.prNumber;
 
@@ -779,65 +858,83 @@ export async function runLifecycleCanarySuite(
     } else {
       // Leg 3
       legs.push(
-        await checkLeg3OverseerCatchesDefect({
-          source,
-          prNumber,
-          defectSignature,
-          poll: poll(timeouts.leg3Ms),
-        })
+        await bounded(
+          'leg3-overseer-catch-defect',
+          checkLeg3OverseerCatchesDefect({
+            source,
+            prNumber,
+            defectSignature,
+            poll: poll(timeouts.leg3Ms),
+          })
+        )
       );
 
       // Leg 4
       legs.push(
-        await checkLeg4RemediationReachesPr({
-          source,
-          prNumber,
-          literal: plantedLiteral,
-          autoRemediationAvailable: deps.autoRemediationAvailable ?? false,
-          poll: poll(timeouts.leg4Ms),
-        })
+        await bounded(
+          'leg4-remediation-reaches-pr',
+          checkLeg4RemediationReachesPr({
+            source,
+            prNumber,
+            literal: plantedLiteral,
+            autoRemediationAvailable: deps.autoRemediationAvailable ?? false,
+            poll: poll(timeouts.leg4Ms),
+          })
+        )
       );
 
       // Leg 5
       if (fired.remediationSha && fired.remediationCommitIso) {
         legs.push(
-          await checkLeg5OverseerReapproves({
-            source,
-            prNumber,
-            remediationSha: fired.remediationSha,
-            remediationCommitIso: fired.remediationCommitIso,
-            poll: poll(timeouts.leg5Ms),
-          })
+          await bounded(
+            'leg5-overseer-reapprove',
+            checkLeg5OverseerReapproves({
+              source,
+              prNumber,
+              remediationSha: fired.remediationSha,
+              remediationCommitIso: fired.remediationCommitIso,
+              poll: poll(timeouts.leg5Ms),
+            })
+          )
         );
       } else {
         legs.push(upstreamBlocked('overseer-reapprove', 'no_remediation_commit'));
       }
 
       // Invariant 2 (diff scope) gates merge acceptance.
-      const scope = await checkInvariantDiffScope({ source, prNumber, scratchDir });
+      const scope = await bounded(
+        'invariant-diff-scope',
+        checkInvariantDiffScope({ source, prNumber, scratchDir })
+      );
       if (scope.violated) {
         invariantViolations.push(`canary_diff_scope_violation: ${scope.offendingFiles.join(', ')}`);
       }
 
       // Leg 6
       legs.push(
-        await checkLeg6AutonomousMerge({
-          source,
-          prNumber,
-          mergeIdentity: deps.mergeIdentity,
-          humanLogins: deps.humanLogins ?? [],
-          poll: poll(timeouts.leg6Ms),
-        })
+        await bounded(
+          'leg6-autonomous-merge',
+          checkLeg6AutonomousMerge({
+            source,
+            prNumber,
+            mergeIdentity: deps.mergeIdentity,
+            humanLogins: deps.humanLogins ?? [],
+            poll: poll(timeouts.leg6Ms),
+          })
+        )
       );
 
       // Leg 7
       if (fired.issueNumber !== undefined) {
         legs.push(
-          await checkLeg7ReconcileClosesIssue({
-            source,
-            issueNumber: fired.issueNumber,
-            poll: poll(timeouts.leg7Ms),
-          })
+          await bounded(
+            'leg7-reconcile-closes-issue',
+            checkLeg7ReconcileClosesIssue({
+              source,
+              issueNumber: fired.issueNumber,
+              poll: poll(timeouts.leg7Ms),
+            })
+          )
         );
       } else {
         legs.push(upstreamBlocked('reconcile-closes-issue', 'no_issue'));
@@ -847,12 +944,15 @@ export async function runLifecycleCanarySuite(
     // Leg 8
     if (fired.dispatchMessageId) {
       legs.push(
-        await checkLeg8DispatchReadableReply({
-          source,
-          messageId: fired.dispatchMessageId,
-          expectedSubstring: deps.dispatchExpectedSubstring ?? deps.runId,
-          poll: poll(timeouts.leg8Ms),
-        })
+        await bounded(
+          'leg8-dispatch-readable-reply',
+          checkLeg8DispatchReadableReply({
+            source,
+            messageId: fired.dispatchMessageId,
+            expectedSubstring: deps.dispatchExpectedSubstring ?? deps.runId,
+            poll: poll(timeouts.leg8Ms),
+          })
+        )
       );
     } else {
       legs.push(upstreamBlocked('dispatch-readable-reply', 'no_dispatch_message'));
@@ -860,19 +960,25 @@ export async function runLifecycleCanarySuite(
 
     // Leg 9
     legs.push(
-      await checkLeg9DutyOfficerReports({
-        source,
-        runId: deps.runId,
-        staleFlagMarkers: deps.staleFlagMarkers ?? [],
-        poll: poll(timeouts.leg9Ms),
-      })
+      await bounded(
+        'leg9-duty-officer-reports',
+        checkLeg9DutyOfficerReports({
+          source,
+          runId: deps.runId,
+          staleFlagMarkers: deps.staleFlagMarkers ?? [],
+          poll: poll(timeouts.leg9Ms),
+        })
+      )
     );
   } catch (error) {
     orchestrationError = error as Error;
   }
 
-  // Leg 10 -- cleanup on an independent timeout. ALWAYS runs, including after
-  // an upstream exception, so the canary never leaves residue (Invariant 3).
+  // Leg 10 -- cleanup on an independent, bounded timeout. ALWAYS runs, including
+  // after an upstream exception or a leg timeout, so the canary never leaves
+  // residue (Invariant 3). The cleanup call itself is wrapped so a hanging
+  // revert cannot hang the whole process; whatever it could not accomplish is
+  // reported as a failed Leg 10 rather than swallowed or left hanging.
   try {
     legs.push(
       await checkLeg10CanaryReverts({
@@ -880,8 +986,11 @@ export async function runLifecycleCanarySuite(
         baseBranch: deps.baseBranch,
         runId: deps.runId,
         preRunRevision: deps.preRunRevision,
-        cleanup: deps.cleanup,
+        cleanup: deps.cleanup
+          ? () => withTimeout(deps.cleanup!(), cleanupTimeoutMs, 'leg10-cleanup')
+          : undefined,
         poll: poll(timeouts.leg10Ms),
+        attemptTimeoutMs: legWallClockMs,
       })
     );
   } catch (error) {

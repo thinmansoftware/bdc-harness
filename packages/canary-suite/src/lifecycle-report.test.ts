@@ -50,15 +50,26 @@ test('renders invariant violations when present', () => {
   expect(markdown).toContain('VIOLATED: canary_diff_scope_violation');
 });
 
-test('writes summary.json and summary.md atomically and idempotently', async () => {
+// The evidence file (docs/evidence/lifecycle-canary-<date>.md) is written
+// relative to outputRoot's PARENT, not inside outputRoot itself, so cleanup
+// must remove that sibling directory too -- otherwise runs sharing the same
+// OS tmp parent (mkdtemp always shares one) leak evidence files across tests.
+async function cleanupEvidenceSibling(root: string): Promise<void> {
+  await rm(join(root, '..', 'docs'), { recursive: true, force: true });
+}
+
+test('writes summary.json, summary.md, and the evidence file atomically and idempotently', async () => {
   const root = await mkdtemp(join(tmpdir(), 'lifecycle-report-'));
   try {
     const paths = await writeLifecycleCanaryArtifacts(root, report());
-    expect(paths.map(path => path.replaceAll('\\', '/').slice(root.length + 1))).toEqual([
-      'lifecycle-fixture-001/summary.json',
-      'lifecycle-fixture-001/summary.md',
-    ]);
+    const relative = paths.map(path => path.replaceAll('\\', '/'));
+    expect(relative[0]!.endsWith('lifecycle-fixture-001/summary.json')).toBe(true);
+    expect(relative[1]!.endsWith('lifecycle-fixture-001/summary.md')).toBe(true);
+    expect(relative[2]!.endsWith('docs/evidence/lifecycle-canary-2026-09-02.md')).toBe(true);
     expect(JSON.parse(await readFile(paths[0]!, 'utf8')).suiteRunId).toBe('lifecycle-fixture-001');
+    const evidence = await readFile(paths[2]!, 'utf8');
+    expect(evidence).toContain('lifecycle-fixture-001');
+    expect(evidence).toContain('cleanup=');
     // Idempotent second write returns the same paths.
     await expect(writeLifecycleCanaryArtifacts(root, report())).resolves.toEqual(paths);
     expect((await readdir(join(root, 'lifecycle-fixture-001'))).sort()).toEqual([
@@ -67,6 +78,7 @@ test('writes summary.json and summary.md atomically and idempotently', async () 
     ]);
   } finally {
     await rm(root, { recursive: true, force: true });
+    await cleanupEvidenceSibling(root);
   }
 });
 
@@ -79,5 +91,18 @@ test('rejects conflicting bytes for an existing run id', async () => {
     ).rejects.toThrow('lifecycle_canary_artifact_conflict');
   } finally {
     await rm(root, { recursive: true, force: true });
+    await cleanupEvidenceSibling(root);
+  }
+});
+
+test('rejects an invalid runId at the artifact-writer level (path-traversal defense in depth)', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'lifecycle-report-invalid-runid-'));
+  try {
+    await expect(
+      writeLifecycleCanaryArtifacts(root, report({ suiteRunId: '../../etc/passwd' }))
+    ).rejects.toThrow('lifecycle_canary_invalid_run_id');
+  } finally {
+    await rm(root, { recursive: true, force: true });
+    await cleanupEvidenceSibling(root);
   }
 });

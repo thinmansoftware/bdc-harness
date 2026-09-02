@@ -11,11 +11,20 @@ import {
   createDefaultArtifactSource,
   resolveBaseRevision,
   runLifecycleCanarySuite,
+  withTimeout,
+  isValidLifecycleRunId,
+  DEFAULT_LEG_WALL_CLOCK_TIMEOUT_MS,
+  DEFAULT_CLEANUP_TIMEOUT_MS,
   LIFECYCLE_SCRATCH_DIR,
   type LifecycleCanaryDeps,
   type LifecycleMutationHooks,
 } from './lifecycle-canary';
 import { writeLifecycleCanaryArtifacts } from './lifecycle-report';
+
+// Default ceiling on the artifact-write step (summary.json/summary.md/evidence
+// file), matching the --leg-timeout-ms / --cleanup-timeout-ms style. Default:
+// 5 minutes.
+const DEFAULT_ARTIFACT_WRITE_TIMEOUT_MS = 5 * 60_000;
 
 interface CanaryCliDeps {
   readonly runner: (options: RunCanaryOptions) => Promise<RunCanaryResult>;
@@ -55,6 +64,12 @@ export interface LifecycleCliOptions {
   readonly operatorToken?: string;
   // Base-branch revision captured before the run. Resolved from git when unset.
   readonly preRunRevision?: string;
+  // Wall-clock ceiling on each leg's execution. Defaults to
+  // DEFAULT_LEG_WALL_CLOCK_TIMEOUT_MS (20 minutes).
+  readonly legTimeoutMs?: number;
+  // Wall-clock ceiling on the Leg 10 cleanup() call. Defaults to
+  // DEFAULT_CLEANUP_TIMEOUT_MS (5 minutes).
+  readonly cleanupTimeoutMs?: number;
 }
 
 // Wires the read-only artifact source plus the pre-run residue anchor around an
@@ -84,6 +99,8 @@ async function buildDefaultLifecycleDeps(
     cleanup: hooks.cleanup,
     runStartIso: new Date().toISOString(),
     mergeIdentity: options.mergeIdentity,
+    legWallClockTimeoutMs: options.legTimeoutMs ?? DEFAULT_LEG_WALL_CLOCK_TIMEOUT_MS,
+    cleanupTimeoutMs: options.cleanupTimeoutMs ?? DEFAULT_CLEANUP_TIMEOUT_MS,
   };
 }
 
@@ -156,9 +173,39 @@ export async function runCanaryCli(
     const baseBranch = flag(args, '--base-branch') ?? 'dev';
     const repoDir = flag(args, '--repo-dir') ?? process.cwd();
     const mergeIdentity = flag(args, '--merge-identity') ?? 'bluedevilcollectibles';
-    if (!runId || !outputRoot || !dbPath || !githubRepo) {
+    const legTimeoutValue = flag(args, '--leg-timeout-ms');
+    const cleanupTimeoutValue = flag(args, '--cleanup-timeout-ms');
+    const artifactWriteTimeoutValue = flag(args, '--artifact-write-timeout-ms');
+    const legTimeoutMs =
+      legTimeoutValue === undefined ? DEFAULT_LEG_WALL_CLOCK_TIMEOUT_MS : Number(legTimeoutValue);
+    const cleanupTimeoutMs =
+      cleanupTimeoutValue === undefined ? DEFAULT_CLEANUP_TIMEOUT_MS : Number(cleanupTimeoutValue);
+    const artifactWriteTimeoutMs =
+      artifactWriteTimeoutValue === undefined
+        ? DEFAULT_ARTIFACT_WRITE_TIMEOUT_MS
+        : Number(artifactWriteTimeoutValue);
+    if (
+      !runId ||
+      !outputRoot ||
+      !dbPath ||
+      !githubRepo ||
+      !Number.isFinite(legTimeoutMs) ||
+      legTimeoutMs <= 0 ||
+      !Number.isFinite(cleanupTimeoutMs) ||
+      cleanupTimeoutMs <= 0 ||
+      !Number.isFinite(artifactWriteTimeoutMs) ||
+      artifactWriteTimeoutMs <= 0
+    ) {
       deps.stderr('lifecycle_canary_missing_or_invalid_required_argument');
       return 3;
+    }
+    // Defense in depth (first check): runId is joined into a filesystem path
+    // by writeLifecycleCanaryArtifacts. Reject anything outside the strict
+    // allowlist pattern here at parse time; the artifact writer re-validates
+    // independently since it must never trust its caller.
+    if (!isValidLifecycleRunId(runId)) {
+      deps.stderr(`lifecycle_canary_invalid_run_id: ${runId}`);
+      return 2;
     }
     const depsFactory = deps.lifecycleDepsFactory;
     const hooksFactory = deps.lifecycleMutationHooks;
@@ -187,6 +234,8 @@ export async function runCanaryCli(
       mergeIdentity,
       operatorToken: env.ARCHON_OPERATOR_TOKEN,
       preRunRevision: flag(args, '--pre-run-revision'),
+      legTimeoutMs,
+      cleanupTimeoutMs,
     };
     try {
       let lifecycleDeps: LifecycleCanaryDeps;
@@ -200,7 +249,14 @@ export async function runCanaryCli(
         return 3;
       }
       const report = await (deps.lifecycleRunner ?? runLifecycleCanarySuite)(lifecycleDeps);
-      await (deps.lifecycleArtifactWriter ?? writeLifecycleCanaryArtifacts)(outputRoot, report);
+      // Bounded so a hung filesystem write (e.g. a wedged link/mkdir on a
+      // stalled mount) cannot hang the process after the suite has already
+      // produced a verdict.
+      await withTimeout(
+        (deps.lifecycleArtifactWriter ?? writeLifecycleCanaryArtifacts)(outputRoot, report),
+        artifactWriteTimeoutMs,
+        'lifecycle-artifact-write'
+      );
       deps.stdout(JSON.stringify(report, null, 2));
       return exitFor(report.verdict);
     } catch (error) {
