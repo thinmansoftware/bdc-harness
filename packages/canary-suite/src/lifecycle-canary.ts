@@ -19,6 +19,10 @@ export interface CommandResult {
   readonly stderr?: string;
 }
 
+export interface CommandOptions {
+  readonly env?: Readonly<Record<string, string>>;
+}
+
 export interface LifecycleLegResult {
   readonly leg: number;
   readonly name: string;
@@ -48,12 +52,17 @@ export interface LifecycleCanaryDeps {
   readonly githubIssue: number;
   readonly operatorToken?: string;
   readonly now?: () => number;
-  readonly command?: (file: string, args: readonly string[]) => Promise<CommandResult>;
+  readonly command?: (
+    file: string,
+    args: readonly string[],
+    options?: CommandOptions
+  ) => Promise<CommandResult>;
   readonly dispatchMessageId?: string;
   readonly dutyOfficerArtifact?: string;
   readonly preRunBlob?: string;
   readonly remediationSha?: string;
   readonly remediationCommittedAt?: string;
+  readonly preRemediationCommitCount?: number;
   readonly prNumber?: number;
   readonly skipTaskmasterWait?: boolean;
 }
@@ -100,14 +109,27 @@ function blocked(
 
 function command(
   deps: LifecycleCanaryDeps
-): (file: string, args: readonly string[]) => Promise<CommandResult> {
+): (file: string, args: readonly string[], options?: CommandOptions) => Promise<CommandResult> {
   return (
     deps.command ??
-    (async (file: string, args: readonly string[]): Promise<CommandResult> => {
-      const value = await execFile(file, [...args], { maxBuffer: 10 * 1024 * 1024 });
+    (async (
+      file: string,
+      args: readonly string[],
+      options?: CommandOptions
+    ): Promise<CommandResult> => {
+      const value = await execFile(file, [...args], {
+        maxBuffer: 10 * 1024 * 1024,
+        env: options?.env ? { ...process.env, ...options.env } : process.env,
+      });
       return { stdout: value.stdout, stderr: value.stderr };
     })
   );
+}
+
+function githubCommand(deps: LifecycleCanaryDeps, args: readonly string[]): Promise<CommandResult> {
+  return command(deps)('gh', args, {
+    env: deps.operatorToken ? { GH_TOKEN: deps.operatorToken } : undefined,
+  });
 }
 
 function database(deps: LifecycleCanaryDeps): { db: LifecycleCanaryDatabase; close: () => void } {
@@ -123,7 +145,7 @@ function database(deps: LifecycleCanaryDeps): { db: LifecycleCanaryDatabase; clo
 }
 
 async function ghJson<T>(deps: LifecycleCanaryDeps, args: readonly string[]): Promise<T> {
-  return JSON.parse((await command(deps)('gh', args)).stdout) as T;
+  return JSON.parse((await githubCommand(deps, args)).stdout) as T;
 }
 
 async function fileTriageIssue(
@@ -132,7 +154,7 @@ async function fileTriageIssue(
   body: string
 ): Promise<string> {
   try {
-    const response = await command(deps)('gh', [
+    const response = await githubCommand(deps, [
       'issue',
       'create',
       '--repo',
@@ -275,6 +297,11 @@ export async function runLeg3OverseerDefectReview(
 
 export async function runLeg4Remediation(deps: LifecycleCanaryDeps): Promise<LifecycleLegResult> {
   const name = 'remediation reaches PR';
+  if (deps.preRemediationCommitCount === undefined)
+    return blocked(4, name, 'manual_remediation_required', [
+      'pre_remediation_commit_count=missing',
+      'gap=bdc-xo#1835',
+    ]);
   try {
     const view = await ghJson<{ commits: { oid?: string }[] }>(deps, [
       'pr',
@@ -286,16 +313,26 @@ export async function runLeg4Remediation(deps: LifecycleCanaryDeps): Promise<Lif
       'commits',
     ]);
     const diff = (
-      await command(deps)('gh', ['pr', 'diff', String(deps.prNumber), '--repo', deps.githubRepo])
+      await githubCommand(deps, ['pr', 'diff', String(deps.prNumber), '--repo', deps.githubRepo])
     ).stdout;
-    if (diff.includes(PLANTED_DEFECT_LITERAL))
+    const signaturePresent = diff
+      .split('\n')
+      .some(
+        line =>
+          line.startsWith('+') && !line.startsWith('+++') && line.includes(PLANTED_DEFECT_LITERAL)
+      );
+    if (signaturePresent || view.commits.length <= deps.preRemediationCommitCount)
       return blocked(4, name, 'manual_remediation_required', [
+        `pre_remediation_commit_count=${deps.preRemediationCommitCount}`,
         `commit_count=${view.commits.length}`,
-        'signature_present=true',
+        `commit_count_increased=${view.commits.length > deps.preRemediationCommitCount}`,
+        `signature_present=${signaturePresent}`,
         'gap=bdc-xo#1835',
       ]);
     return passed(4, name, [
+      `pre_remediation_commit_count=${deps.preRemediationCommitCount}`,
       `commit_count=${view.commits.length}`,
+      'commit_count_increased=true',
       'signature_present=false',
       'fallback=assigned_owner',
     ]);
@@ -326,7 +363,7 @@ export async function runLeg5OverseerReapproval(
       .query<{
         id: string;
       }>(
-        "SELECT id FROM agent_dispatch_messages WHERE task_type='run_review' AND payload_json LIKE ? ORDER BY created_at DESC LIMIT 1"
+        "SELECT id FROM agent_dispatch_messages WHERE task_type='run_review' AND body LIKE ? ORDER BY created_at DESC LIMIT 1"
       )
       .get(`%${deps.remediationSha}%`);
     if (!trigger)
@@ -487,14 +524,20 @@ export async function runLeg10Revert(deps: LifecycleCanaryDeps): Promise<Lifecyc
     ).stdout.trim();
     const current =
       deps.preRunBlob === undefined
-        ? ''
+        ? undefined
         : (await command(deps)('git', ['show', `origin/dev:${path}`])).stdout;
     if (tracked || (deps.preRunBlob !== undefined && current !== deps.preRunBlob))
       return failed(10, name, 'canary_left_residue_on_dev', [
         `tracked=${tracked || 'none'}`,
-        `pre_run_blob_match=${current === deps.preRunBlob}`,
+        `pre_run_blob_match=${current !== undefined && current === deps.preRunBlob}`,
       ]);
-    return passed(10, name, [`path=${path}`, 'tracked=false', 'pre_run_blob_match=true']);
+    return passed(10, name, [
+      `path=${path}`,
+      'tracked=false',
+      deps.preRunBlob === undefined
+        ? 'pre_run_blob_check=not_applicable'
+        : 'pre_run_blob_match=true',
+    ]);
   } catch (error) {
     return failed(10, name, 'canary_left_residue_on_dev', [`error=${(error as Error).message}`]);
   }
@@ -505,44 +548,43 @@ export async function runLifecycleCanarySuite(
 ): Promise<LifecycleCanaryResult> {
   const startedAt = new Date((deps.now ?? Date.now)()).toISOString();
   const first = await runLeg1TaskmasterFire(deps, startedAt);
-  let legs: LifecycleLegResult[];
-  if (first.verdict === 'blocked') {
-    legs = [
-      first,
-      ...Array.from({ length: 9 }, (_, index) =>
-        blocked(
-          index + 2,
-          [
-            'codex lane builds and opens PR',
-            'Overseer catches planted defect',
-            'remediation reaches PR',
-            'Overseer re-approves on push',
-            'Merge Manager merges autonomously',
-            'reconcile closes issue',
-            'Dispatch delivers readable reply',
-            'Duty Officer reports run',
-            'canary reverts itself',
-          ][index],
-          'fallback_requires_operator',
-          ['fallback=fire.ps1 not executed by build container']
-        )
-      ),
-    ];
-  } else {
-    legs = [first];
-    const runners = [
-      runLeg2CodexLaneBuild,
-      runLeg3OverseerDefectReview,
-      runLeg4Remediation,
-      runLeg5OverseerReapproval,
-      runLeg6AutonomousMerge,
-      runLeg7Reconcile,
-      runLeg8DispatchReply,
-      runLeg9DutyOfficer,
-      runLeg10Revert,
-    ];
-    for (const runner of runners) legs.push(await runner(deps));
+  const legs: LifecycleLegResult[] = [first];
+  const second = await runLeg2CodexLaneBuild(deps);
+  legs.push(second);
+  const discoveredPrNumber = Number(
+    second.evidenceRefs.find(item => item.startsWith('pr.number='))?.slice('pr.number='.length)
+  );
+  let chainedDeps: LifecycleCanaryDeps = {
+    ...deps,
+    prNumber: Number.isSafeInteger(discoveredPrNumber) ? discoveredPrNumber : deps.prNumber,
+  };
+  if (chainedDeps.preRemediationCommitCount === undefined && chainedDeps.prNumber !== undefined) {
+    try {
+      const baseline = await ghJson<{ commits: unknown[] }>(chainedDeps, [
+        'pr',
+        'view',
+        String(chainedDeps.prNumber),
+        '--repo',
+        chainedDeps.githubRepo,
+        '--json',
+        'commits',
+      ]);
+      chainedDeps = { ...chainedDeps, preRemediationCommitCount: baseline.commits.length };
+    } catch {
+      // Leg 4 reports the missing baseline as blocked evidence.
+    }
   }
+  const runners = [
+    runLeg3OverseerDefectReview,
+    runLeg4Remediation,
+    runLeg5OverseerReapproval,
+    runLeg6AutonomousMerge,
+    runLeg7Reconcile,
+    runLeg8DispatchReply,
+    runLeg9DutyOfficer,
+    runLeg10Revert,
+  ];
+  for (const runner of runners) legs.push(await runner(chainedDeps));
   const reasonCodes = legs.flatMap(leg => leg.reasonCodes);
   const verdict: CanaryVerdict = legs.some(leg => leg.verdict === 'failed')
     ? 'failed'

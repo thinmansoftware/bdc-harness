@@ -3,6 +3,8 @@ import {
   PLANTED_DEFECT_LITERAL,
   createPlantedDefect,
   runLeg10Revert,
+  runLeg4Remediation,
+  runLeg5OverseerReapproval,
   runLeg6AutonomousMerge,
   runLeg8DispatchReply,
   runLifecycleCanarySuite,
@@ -25,6 +27,7 @@ const base: LifecycleCanaryDeps = {
   prNumber: 99,
   remediationSha: 'fixed-sha',
   remediationCommittedAt: '2026-09-02T00:01:00Z',
+  preRemediationCommitCount: 1,
   dispatchMessageId: 'dispatch-1',
   command: async (file, args) => {
     const key = `${file} ${args.join(' ')}`;
@@ -77,13 +80,14 @@ test('planted defect is literal, greppable, and run-specific', () => {
   expect(source).toContain(`"${PLANTED_DEFECT_LITERAL}"`);
 });
 
-test('Taskmaster no-fire is blocked and every remaining leg is explicitly reported', async () => {
+test('Taskmaster no-fire does not prevent the remaining legs from executing', async () => {
   const report = await runLifecycleCanarySuite({ ...base, db: db([]) });
   expect(report.legs).toHaveLength(10);
   expect(report.legs[0]?.reasonCodes).toEqual(['taskmaster_never_fires']);
   expect(
-    report.legs.slice(1).every(leg => leg.reasonCodes[0] === 'fallback_requires_operator')
+    report.legs.slice(1).every(leg => !leg.reasonCodes.includes('fallback_requires_operator'))
   ).toBe(true);
+  expect(report.legs[1]?.evidenceRefs).toContain('pr.number=99');
 });
 
 test('full orchestration reports all ten legs with injected artifact evidence', async () => {
@@ -101,8 +105,84 @@ test('full orchestration reports all ten legs with injected artifact evidence', 
     ]),
   });
   expect(report.legs).toHaveLength(10);
+  expect(report.legs.map(leg => leg.verdict)).toEqual(Array(10).fill('passed'));
   expect(report.legs.every(leg => leg.evidenceRefs.length > 0)).toBe(true);
   expect(report.legs.map(leg => leg.leg)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+});
+
+test('Leg 2 discovered PR number is chained into later legs', async () => {
+  const reviewPaths: string[] = [];
+  await runLifecycleCanarySuite({
+    ...base,
+    prNumber: undefined,
+    command: async (file, args) => {
+      const key = `${file} ${args.join(' ')}`;
+      if (key.includes('pr list'))
+        return {
+          stdout: JSON.stringify([
+            {
+              number: 123,
+              headRefName: 'canary/lifecycle-lifecycle-fixture',
+              baseRefName: 'dev',
+              state: 'OPEN',
+            },
+          ]),
+        };
+      if (key.includes('/reviews')) {
+        reviewPaths.push(key);
+        return { stdout: '[]' };
+      }
+      if (key.includes('pr view') && key.includes('commits'))
+        return { stdout: JSON.stringify({ commits: [{ oid: 'a' }, { oid: 'b' }] }) };
+      if (key.includes('pr view')) return { stdout: '{}' };
+      return { stdout: '' };
+    },
+  });
+  expect(reviewPaths.every(path => path.includes('/pulls/123/reviews'))).toBe(true);
+  expect(reviewPaths.length).toBeGreaterThan(0);
+});
+
+test('GitHub commands receive the supplied operator token', async () => {
+  const observed: Array<Readonly<Record<string, string>> | undefined> = [];
+  await runLifecycleCanarySuite({
+    ...base,
+    operatorToken: 'operator-token',
+    command: async (_file, args, options) => {
+      observed.push(options?.env);
+      if (args.includes('list')) return { stdout: '[]' };
+      if (args.includes('ls-tree')) return { stdout: '' };
+      return { stdout: '[]' };
+    },
+  });
+  expect(observed.some(env => env?.GH_TOKEN === 'operator-token')).toBe(true);
+});
+
+test('remediation requires the commit count to increase from its baseline', async () => {
+  const leg = await runLeg4Remediation({
+    ...base,
+    command: async (_file, args) =>
+      args.includes('view')
+        ? { stdout: JSON.stringify({ commits: [{ oid: 'unchanged' }] }) }
+        : { stdout: 'fixed content' },
+  });
+  expect(leg.verdict).toBe('blocked');
+  expect(leg.evidenceRefs).toContain('commit_count_increased=false');
+});
+
+test('review trigger query uses the proven dispatch body column', async () => {
+  const queries: string[] = [];
+  await runLeg5OverseerReapproval({
+    ...base,
+    db: {
+      query: sql => {
+        queries.push(sql);
+        return { all: () => [], get: () => null };
+      },
+    },
+  });
+  expect(queries[0]).toContain("task_type='run_review'");
+  expect(queries[0]).toContain('body LIKE ?');
+  expect(queries[0]).not.toContain('payload_json');
 });
 
 test('scope invariant fails closed before accepting a merge', async () => {
@@ -137,4 +217,11 @@ test('negative cleanup scenario detects residue on dev', async () => {
   });
   expect(leg.verdict).toBe('failed');
   expect(leg.reasonCodes).toEqual(['canary_left_residue_on_dev']);
+});
+
+test('cleanup does not claim a pre-run blob comparison when none was supplied', async () => {
+  const leg = await runLeg10Revert({ ...base, preRunBlob: undefined });
+  expect(leg.verdict).toBe('passed');
+  expect(leg.evidenceRefs).toContain('pre_run_blob_check=not_applicable');
+  expect(leg.evidenceRefs).not.toContain('pre_run_blob_match=true');
 });

@@ -101,6 +101,8 @@ export async function runCanaryCli(
         prNumber: Number(flag(args, '--pr-number')) || undefined,
         remediationSha: flag(args, '--remediation-sha'),
         remediationCommittedAt: flag(args, '--remediation-committed-at'),
+        preRemediationCommitCount:
+          Number(flag(args, '--pre-remediation-commit-count')) || undefined,
       });
       await (deps.lifecycleArtifactWriter ?? writeLifecycleCanaryArtifacts)(outputRoot, report);
       deps.stdout(JSON.stringify(report, null, 2));
