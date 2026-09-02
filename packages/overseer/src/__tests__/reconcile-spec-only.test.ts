@@ -115,8 +115,8 @@ describe('reconcile -- spec-only guard', () => {
         mergedPr({
           repo: 'bdc-xo',
           number: 1278,
-          title: `WO: ${stem}`,
-          body: `Lands the spec for ${stem}.`,
+          title: `${stem}: land spec`,
+          body: `Lands the spec for ${stem}.\n\nWO: ${stem}`,
         }),
       ],
     });

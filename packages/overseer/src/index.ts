@@ -71,6 +71,13 @@ export {
   RECONCILE_ACTION,
   runReconcileOnce,
 } from './reconcile';
+export {
+  classifyWoEvidence,
+  extractReconcileSkipStems,
+  isReconcileSkipped,
+  prClaimsWoId,
+} from './wo-evidence';
+export type { WoEvidence, WoEvidenceSource } from './wo-evidence';
 export type {
   ReconcileActionRecord,
   ReconcileDeps,

@@ -1,3 +1,7 @@
+import { classifyWoEvidence, extractReconcileSkipStems } from './wo-evidence';
+
+export { extractReconcileSkipStems } from './wo-evidence';
+
 const log: ReconcileLogger = {
   warn(fields, message) {
     console.warn('[overseer/reconcile]', message, fields);
@@ -10,7 +14,6 @@ const log: ReconcileLogger = {
 export const RECONCILE_ACTION = 'reconcile_close';
 export const RECONCILE_SKIP_ACTION = 'reconcile_skip_noted';
 export const WO_STEM_PATTERN = /\bWO-[A-Z0-9]+(?:-[A-Z0-9]+)*-[0-9]{2}\b/g;
-export const RECONCILE_SKIP_PATTERN = /^Reconcile-Skip: (WO-[A-Z0-9]+(?:-[A-Z0-9]+)*-[0-9]{2})$/gm;
 const DEFAULT_ORG = 'thinmansoftware';
 const DEFAULT_TRACKER_REPO = 'bdc-xo';
 const DEFAULT_LOOKBACK_DAYS = 14;
@@ -131,6 +134,7 @@ export async function runReconcileOnce(input: RunReconcileInput = {}): Promise<R
   const deps = input.deps ?? createDefaultReconcileDeps();
   const logger = deps.log ?? log;
   const org = input.org ?? DEFAULT_ORG;
+  const trackerRepo = input.trackerRepo ?? DEFAULT_TRACKER_REPO;
   const since = await resolveSearchSince(input, deps);
 
   let pullRequests: ReconcileMergedPullRequest[];
@@ -206,10 +210,31 @@ export async function runReconcileOnce(input: RunReconcileInput = {}): Promise<R
         continue;
       }
 
+      // EVIDENCE-STRENGTH GUARD (2026-09-02, bdc-xo #1889). A PR that merely
+      // MENTIONS the WO id -- in a "builds on top of" note, a depends_on line,
+      // an Overseer finding reply -- is not evidence the WO shipped. shopops #662
+      // (the WO this one depended on) named WO-LSPRO-M157-STREAM-STAYS-OPEN-UI-01
+      // in a finding reply and reconcile closed the UI tracker on it, with the
+      // WO's stop-condition greps at 0 on staging. A PR claims a WO only when
+      // its title starts with the id or its manifest block carries `WO: <id>`.
+      // Same classifier as the Smart Cauldron satisfied guard (wo-evidence.ts).
+      if (classifyWoEvidence({ title: pr.title, body: pr.body }, stem) !== 'claim') {
+        logger.warn({ prRef, stem }, 'overseer.reconcile.bare_mention_tracker_left_open');
+        continue;
+      }
+
       // SPEC-ONLY GUARD. author-wo.sh lands the WO spec document via its own PR,
       // which mentions the WO stem -- so without this, a WO is closed as done by
       // the very PR that CREATED it. See isSpecOnlyChangeSet for the anchor.
       const listFiles = deps.listPullRequestFiles;
+      if (!listFiles && pr.repo === trackerRepo) {
+        // A PR in the tracker repo is where docs/work-orders/<WO-ID>.md lives.
+        // Without a file list we cannot tell a spec amendment from a build, and
+        // the rule is that a spec-only merge NEVER closes its tracker -- so fail
+        // open (leave it) rather than guess. Other repos keep the legacy path.
+        logger.warn({ prRef, stem }, 'overseer.reconcile.tracker_repo_files_unverified_left_open');
+        continue;
+      }
       if (listFiles) {
         let changedPaths: string[] | null = null;
         try {
@@ -292,15 +317,6 @@ export function isSpecOnlyChangeSet(paths: readonly string[]): boolean {
 export function extractWoStems(input: string): string[] {
   const matches = input.match(WO_STEM_PATTERN) ?? [];
   return [...new Set(matches)];
-}
-
-export function extractReconcileSkipStems(input: string): Set<string> {
-  const stems = new Set<string>();
-  for (const match of input.matchAll(RECONCILE_SKIP_PATTERN)) {
-    const stem = match[1];
-    if (stem) stems.add(stem);
-  }
-  return stems;
 }
 
 export function buildEvidenceComment(input: {

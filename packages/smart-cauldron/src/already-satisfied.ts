@@ -11,6 +11,7 @@
 
 import { execFile } from 'child_process';
 import { promisify } from 'util';
+import { classifyWoEvidence } from '@archon/overseer/wo-evidence';
 
 const execFileAsync = promisify(execFile);
 
@@ -53,6 +54,9 @@ export function resolveGithubRepo(project: string): string {
  * True when text contains the exact WO_ID as a token (not a longer sibling id).
  * "WO-FOO-01" must not match "WO-FOO-010". Branch suffixes like "-thread-abc"
  * after the id are allowed (hyphen is a boundary). Case-insensitive.
+ *
+ * LOOSE matcher. Since 2026-09-02 a token match is a MENTION, not satisfaction
+ * -- see selectWoClaims. Kept exported for callers that want the loose test.
  */
 export function textClaimsWoId(text: string, woId: string): boolean {
   if (!woId || !text) return false;
@@ -73,13 +77,51 @@ export function textClaimsWoId(text: string, woId: string): boolean {
   return false;
 }
 
-interface GhPrRow {
+export interface GhPrRow {
   number?: number;
   state?: string;
   title?: string;
   url?: string;
   headRefName?: string;
   body?: string;
+}
+
+/**
+ * Reduce `gh pr list` rows to the PRs that CLAIM the WO. Pure; the gh call is
+ * in ghPrSearchDefault so this can be tested against real PR bodies.
+ *
+ * A PR claims a WO only when its title starts with the id, its body carries
+ * the manifest label line `WO: <id>`, or its head branch is named after the id
+ * (the Cauldron's own feat/wo-...-thread-<hash> branches). A bare mention
+ * anywhere else is NOT satisfaction, and a `Reconcile-Skip: <id>` line excludes
+ * the PR for that id outright.
+ *
+ * Anchor (2026-09-02, bdc-xo #1889): lspro-react #568, a merged pre-step whose
+ * body said "#1889 ... builds on top of this" and carried Reconcile-Skip for
+ * the id, made the conductor log ALREADY SATISFIED and skip the cascade
+ * (status won, attempts 0) while the WO's greps were 0 on staging.
+ */
+export function selectWoClaims(rows: readonly GhPrRow[], woId: string, repo: string): WoClaim[] {
+  const out: WoClaim[] = [];
+  for (const row of rows) {
+    const stateRaw = (row.state ?? '').toUpperCase();
+    if (stateRaw !== 'OPEN' && stateRaw !== 'MERGED') continue;
+    const number = typeof row.number === 'number' ? row.number : NaN;
+    if (!Number.isFinite(number)) continue;
+    const evidence = classifyWoEvidence(
+      { title: row.title ?? '', body: row.body ?? '', headRef: row.headRefName ?? '' },
+      woId
+    );
+    if (evidence !== 'claim') continue;
+    out.push({
+      number,
+      state: stateRaw as WoClaimState,
+      title: row.title ?? '',
+      url: row.url ?? '',
+      repo,
+    });
+  }
+  return out;
 }
 
 async function ghPrSearchDefault(repo: string, woId: string): Promise<WoClaim[]> {
@@ -104,32 +146,7 @@ async function ghPrSearchDefault(repo: string, woId: string): Promise<WoClaim[]>
     );
     const rows = JSON.parse(stdout || '[]') as GhPrRow[];
     if (!Array.isArray(rows)) return [];
-    const out: WoClaim[] = [];
-    for (const row of rows) {
-      const stateRaw = (row.state ?? '').toUpperCase();
-      if (stateRaw !== 'OPEN' && stateRaw !== 'MERGED') continue;
-      const number = typeof row.number === 'number' ? row.number : NaN;
-      if (!Number.isFinite(number)) continue;
-      const title = row.title ?? '';
-      const body = row.body ?? '';
-      const head = row.headRefName ?? '';
-      const url = row.url ?? '';
-      if (
-        !textClaimsWoId(title, woId) &&
-        !textClaimsWoId(body, woId) &&
-        !textClaimsWoId(head, woId)
-      ) {
-        continue;
-      }
-      out.push({
-        number,
-        state: stateRaw as WoClaimState,
-        title,
-        url,
-        repo,
-      });
-    }
-    return out;
+    return selectWoClaims(rows, woId, repo);
   } catch {
     // Fail open on gh outage -- cascade must not die because GitHub search blipped.
     // Callers treat null/empty as "unknown, proceed" and rely on other gates.

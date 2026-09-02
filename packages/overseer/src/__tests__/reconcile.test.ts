@@ -17,7 +17,13 @@ export function mergedPr(
     repo: 'bdc-harness',
     number: 404,
     title: 'BDC feature Work Order implementation',
-    body: `Implements ${stem}.`,
+    // A Cauldron PR: generic title, manifest v2 block in the body. The `WO:`
+    // label line is what makes it a CLAIM (wo-evidence.ts); a bare mention of
+    // the stem no longer closes a tracker (2026-09-02, bdc-xo #1889).
+    body: `Implements ${stem}.
+
+WO: ${stem}
+VALIDATION: PASS`,
     htmlUrl: 'https://github.com/thinmansoftware/bdc-harness/pull/404',
     state: 'closed',
     merged: true,
