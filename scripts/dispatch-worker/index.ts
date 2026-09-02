@@ -82,11 +82,36 @@ export function summarizeTranscriptPayload(value: unknown): {
   };
 }
 
+export const REPLY_TEXT_CAP_BYTES = 65_536;
+
 export function summarizePersistedOutcome(
   classification: DispatchTaskOutcome | null,
-  value: unknown
+  value: unknown,
+  options: {
+    persistText?: boolean;
+    cap?: number;
+    localTranscriptPath?: string;
+  } = {}
 ): string {
   const summary = summarizeTranscriptPayload(value);
+  if (options.persistText) {
+    const encoded = typeof value === 'string' ? value : (JSON.stringify(value) ?? String(value));
+    if (summary.utf8Bytes <= (options.cap ?? REPLY_TEXT_CAP_BYTES)) {
+      return JSON.stringify({
+        classification,
+        sha256: summary.sha256,
+        utf8Bytes: summary.utf8Bytes,
+        text: encoded,
+      });
+    }
+    return JSON.stringify({
+      classification,
+      sha256: summary.sha256,
+      utf8Bytes: summary.utf8Bytes,
+      text: null,
+      local_transcript_path: options.localTranscriptPath ?? null,
+    });
+  }
   return JSON.stringify({
     classification,
     sha256: summary.sha256,
@@ -113,6 +138,7 @@ interface WorkerConfig {
   lease_duration_ms?: number;
   /** How often to extend the lease while an agent leg is running. */
   lease_renew_interval_ms?: number;
+  persist_reply_text?: boolean;
   capabilities?: Record<string, unknown>;
   max_concurrency?: Record<string, number>;
   board_delivery?: {
@@ -160,7 +186,7 @@ function parseArgs(): string {
   return process.argv[index + 1];
 }
 
-async function readConfig(path: string): Promise<NormalizedWorkerConfig> {
+export async function readConfig(path: string): Promise<NormalizedWorkerConfig> {
   const raw = await Bun.file(path).text();
   const parsed = JSON.parse(raw) as WorkerConfig;
   if (!parsed.server_url) throw new Error('config.server_url is required');
@@ -188,6 +214,7 @@ async function readConfig(path: string): Promise<NormalizedWorkerConfig> {
     // to react before the lease actually lapses.
     lease_renew_interval_ms:
       parsed.lease_renew_interval_ms ?? Math.max(10_000, (parsed.lease_duration_ms ?? 300_000) / 3),
+    persist_reply_text: parsed.persist_reply_text ?? true,
     capabilities,
     max_concurrency: parsed.max_concurrency ?? {},
     board_delivery: {
@@ -298,6 +325,7 @@ export async function writeTranscript(data: Record<string, unknown>): Promise<st
             ],
           },
         ];
+      if (key === 'stdoutText') return ['stdout_text', value];
       if (
         [
           'transport',
@@ -330,7 +358,9 @@ export async function writeTranscript(data: Record<string, unknown>): Promise<st
 async function runAcpLeg(
   agentConfig: AgentConfig,
   message: DispatchMessage,
-  cancel: ReturnType<typeof createCancelController>
+  cancel: ReturnType<typeof createCancelController>,
+  persistReplyText = false,
+  replyTextCapBytes = REPLY_TEXT_CAP_BYTES
 ): Promise<{
   resultBody: string;
   status: 'done' | 'failed';
@@ -354,7 +384,7 @@ async function runAcpLeg(
     cancel
   );
 
-  await writeTranscript({
+  const transcriptPath = await writeTranscript({
     message,
     transport: 'acp',
     command: agentConfig.command,
@@ -370,6 +400,8 @@ async function runAcpLeg(
     durationMs: run.durationMs,
     error: run.error ?? null,
     finalText: run.finalText,
+    stdoutText:
+      message.task_type === 'agent_message' && persistReplyText ? run.finalText : undefined,
     updates: run.updates,
   });
 
@@ -396,7 +428,11 @@ async function runAcpLeg(
     refusal
   );
   return {
-    resultBody: summarizePersistedOutcome(classified.taskOutcome, classified.resultBody),
+    resultBody: summarizePersistedOutcome(classified.taskOutcome, classified.resultBody, {
+      persistText: message.task_type === 'agent_message' && persistReplyText,
+      cap: replyTextCapBytes,
+      localTranscriptPath: transcriptPath,
+    }),
     status: classified.status,
     taskOutcome: classified.taskOutcome,
     run,
@@ -406,7 +442,9 @@ async function runAcpLeg(
 async function runMcpLeg(
   agentConfig: AgentConfig,
   message: DispatchMessage,
-  cancel: ReturnType<typeof createMcpCancelController>
+  cancel: ReturnType<typeof createMcpCancelController>,
+  persistReplyText = false,
+  replyTextCapBytes = REPLY_TEXT_CAP_BYTES
 ): Promise<{
   resultBody: string;
   status: 'done' | 'failed';
@@ -427,7 +465,7 @@ async function runMcpLeg(
     promptFor(message),
     cancel
   );
-  await writeTranscript({
+  const transcriptPath = await writeTranscript({
     message,
     transport: 'mcp',
     command: agentConfig.command,
@@ -443,6 +481,8 @@ async function runMcpLeg(
     durationMs: run.durationMs,
     error: run.error ?? null,
     finalText: run.finalText,
+    stdoutText:
+      message.task_type === 'agent_message' && persistReplyText ? run.finalText : undefined,
     updates: run.updates,
   });
   const summary = run.ok
@@ -466,7 +506,11 @@ async function runMcpLeg(
     refusal
   );
   return {
-    resultBody: summarizePersistedOutcome(classified.taskOutcome, classified.resultBody),
+    resultBody: summarizePersistedOutcome(classified.taskOutcome, classified.resultBody, {
+      persistText: message.task_type === 'agent_message' && persistReplyText,
+      cap: replyTextCapBytes,
+      localTranscriptPath: transcriptPath,
+    }),
     status: classified.status,
     taskOutcome: classified.taskOutcome,
     run,
@@ -476,7 +520,9 @@ async function runMcpLeg(
 export async function runAgent(
   config: AgentConfig,
   message: DispatchMessage,
-  cancel?: ReturnType<typeof createCancelController>
+  cancel?: ReturnType<typeof createCancelController>,
+  persistReplyText = false,
+  replyTextCapBytes = REPLY_TEXT_CAP_BYTES
 ): Promise<{
   resultBody: string;
   status: 'done' | 'failed';
@@ -578,12 +624,13 @@ export async function runAgent(
   // classifying or posting a result.
   if (cancel?.cancelled) await beginCancellation();
   else if (cancellationPromise) await cancellationPromise;
-  await writeTranscript({
+  const transcriptPath = await writeTranscript({
     message,
     command,
     args,
     cwd,
     stdout,
+    stdoutText: message.task_type === 'agent_message' && persistReplyText ? stdout : undefined,
     stderr,
     exitCode,
     cancelled: cancellationStarted,
@@ -598,7 +645,11 @@ export async function runAgent(
       }
     : classifyDispatchOutcome(exitCode, stdout.trim() || stderr.trim());
   return {
-    resultBody: summarizePersistedOutcome(classified.taskOutcome, classified.resultBody),
+    resultBody: summarizePersistedOutcome(classified.taskOutcome, classified.resultBody, {
+      persistText: message.task_type === 'agent_message' && persistReplyText,
+      cap: replyTextCapBytes,
+      localTranscriptPath: transcriptPath,
+    }),
     status: classified.status,
     taskOutcome: classified.taskOutcome,
   };
@@ -665,10 +716,28 @@ async function processMessage(
     try {
       result =
         agentConfig.kind === 'acp'
-          ? await runAcpLeg(agentConfig, claimed, cancel)
+          ? await runAcpLeg(
+              agentConfig,
+              claimed,
+              cancel,
+              config.persist_reply_text,
+              REPLY_TEXT_CAP_BYTES
+            )
           : agentConfig.kind === 'mcp'
-            ? await runMcpLeg(agentConfig, claimed, cancel)
-            : await runAgent(agentConfig, claimed, cancel);
+            ? await runMcpLeg(
+                agentConfig,
+                claimed,
+                cancel,
+                config.persist_reply_text,
+                REPLY_TEXT_CAP_BYTES
+              )
+            : await runAgent(
+                agentConfig,
+                claimed,
+                cancel,
+                config.persist_reply_text,
+                REPLY_TEXT_CAP_BYTES
+              );
     } finally {
       clearInterval(renewTimer);
     }

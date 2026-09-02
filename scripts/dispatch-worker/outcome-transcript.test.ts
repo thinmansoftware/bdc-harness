@@ -1,8 +1,12 @@
 import { describe, expect, test } from 'bun:test';
-import { readFile } from 'fs/promises';
+import { mkdtemp, readFile, writeFile } from 'fs/promises';
+import { tmpdir } from 'os';
+import { join } from 'path';
+import { createHash } from 'crypto';
 import { spawn } from 'node:child_process';
 import {
   classifyDispatchOutcome,
+  readConfig,
   runAgent,
   summarizePersistedOutcome,
   summarizeTranscriptPayload,
@@ -70,6 +74,69 @@ describe('dispatch outcome and transcript contract', () => {
       preview: '[redacted]',
     });
     expect(JSON.parse(persisted).sha256).toHaveLength(64);
+  });
+
+  test('persists agent message text with a matching sha256', () => {
+    const reply = 'M-174 vote: YES';
+    const persisted = summarizePersistedOutcome('succeeded', reply, {
+      persistText: true,
+      cap: 65_536,
+    });
+    expect(JSON.parse(persisted)).toEqual({
+      classification: 'succeeded',
+      sha256: createHash('sha256').update(Buffer.from(reply, 'utf8')).digest('hex'),
+      utf8Bytes: Buffer.byteLength(reply),
+      text: reply,
+    });
+  });
+
+  test('omits oversized reply text and retains the local transcript pointer', () => {
+    const reply = 'x'.repeat(70_000);
+    const persisted = summarizePersistedOutcome('succeeded', reply, {
+      persistText: true,
+      cap: 65_536,
+      localTranscriptPath: '/tmp/fake-path.json',
+    });
+    expect(JSON.parse(persisted)).toEqual({
+      classification: 'succeeded',
+      sha256: createHash('sha256').update(Buffer.from(reply, 'utf8')).digest('hex'),
+      utf8Bytes: 70_000,
+      text: null,
+      local_transcript_path: '/tmp/fake-path.json',
+    });
+  });
+
+  test('writes raw stdout_text while keeping stdout and message body summarized', async () => {
+    const path = await writeTranscript({
+      message: {
+        id: 'reply-transcript',
+        task_type: 'agent_message',
+        sender: 'test',
+        recipient: 'seat',
+        body: 'message-secret',
+        status: 'claimed',
+        fencing_token: 1,
+      },
+      stdout: 'reply text',
+      stdoutText: 'reply text',
+    });
+    const persisted = JSON.parse(await readFile(path, 'utf8'));
+    expect(persisted.stdout_text).toBe('reply text');
+    expect(persisted.stdout).toMatchObject({ preview: '[redacted]' });
+    expect(persisted.message.body).toMatchObject({ preview: '[redacted]' });
+    expect(JSON.stringify(persisted.message.body)).not.toContain('message-secret');
+  });
+
+  test('normalizes persist_reply_text false for config-only rollback', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'dispatch-worker-config-'));
+    const path = join(dir, 'config.json');
+    await writeFile(
+      path,
+      JSON.stringify({ server_url: 'http://localhost:3000', persist_reply_text: false }),
+      'utf8'
+    );
+    const config = await readConfig(path);
+    expect(config.persist_reply_text).toBe(false);
   });
 
   test('kills a real CLI descendant tree and proves death', async () => {
