@@ -7,7 +7,14 @@ import {
   type TaskmasterCanaryDeps,
   type TaskmasterCanaryResult,
 } from './taskmaster-canary';
-import { runLifecycleCanarySuite, type LifecycleCanaryDeps } from './lifecycle-canary';
+import {
+  createDefaultArtifactSource,
+  resolveBaseRevision,
+  runLifecycleCanarySuite,
+  LIFECYCLE_SCRATCH_DIR,
+  type LifecycleCanaryDeps,
+  type LifecycleMutationHooks,
+} from './lifecycle-canary';
 import { writeLifecycleCanaryArtifacts } from './lifecycle-report';
 
 interface CanaryCliDeps {
@@ -28,6 +35,10 @@ interface CanaryCliDeps {
   // flags. Injected so unit tests never touch the production-adjacent firing
   // path; the operator-approved live phase supplies the real implementation.
   readonly lifecycleDepsFactory?: (options: LifecycleCliOptions) => LifecycleCanaryDeps;
+  // Supplies ONLY the mutating hooks (initiate / fireFallback / cleanup). The
+  // read-only artifact source and the pre-run residue anchor are wired by
+  // default, so an operator enabling a live run supplies just the side effects.
+  readonly lifecycleMutationHooks?: (options: LifecycleCliOptions) => LifecycleMutationHooks;
 }
 
 export interface LifecycleCliOptions {
@@ -42,6 +53,38 @@ export interface LifecycleCliOptions {
   readonly dutyOfficerReportPath?: string;
   readonly mergeIdentity: string;
   readonly operatorToken?: string;
+  // Base-branch revision captured before the run. Resolved from git when unset.
+  readonly preRunRevision?: string;
+}
+
+// Wires the read-only artifact source plus the pre-run residue anchor around an
+// operator-supplied set of mutating hooks.
+async function buildDefaultLifecycleDeps(
+  options: LifecycleCliOptions,
+  hooks: LifecycleMutationHooks
+): Promise<LifecycleCanaryDeps> {
+  // Captured BEFORE any hook runs: Leg 10 compares the post-run base tip
+  // against this revision, so it must predate every canary mutation.
+  const preRunRevision =
+    options.preRunRevision ?? (await resolveBaseRevision(options.repoDir, options.baseBranch));
+  return {
+    runId: options.runId,
+    githubRepo: options.githubRepo,
+    baseBranch: options.baseBranch,
+    source: createDefaultArtifactSource({
+      dbPath: options.dbPath,
+      githubRepo: options.githubRepo,
+      repoDir: options.repoDir,
+      scratchDir: LIFECYCLE_SCRATCH_DIR,
+      dutyOfficerReportPath: options.dutyOfficerReportPath ?? null,
+    }),
+    preRunRevision,
+    initiate: hooks.initiate,
+    fireFallback: hooks.fireFallback,
+    cleanup: hooks.cleanup,
+    runStartIso: new Date().toISOString(),
+    mergeIdentity: options.mergeIdentity,
+  };
 }
 
 function flag(args: readonly string[], name: string): string | undefined {
@@ -117,13 +160,17 @@ export async function runCanaryCli(
       deps.stderr('lifecycle_canary_missing_or_invalid_required_argument');
       return 3;
     }
-    if (!deps.lifecycleDepsFactory) {
-      // Firing the wheel is production-adjacent (opens a real PR, may merge on
-      // dev). The default CLI does NOT wire a firing implementation -- the
-      // operator-approved live phase must supply one. Fail closed rather than
-      // silently no-op.
+    const depsFactory = deps.lifecycleDepsFactory;
+    const hooksFactory = deps.lifecycleMutationHooks;
+    if (!depsFactory && !hooksFactory) {
+      // Read-only artifact access is wired by default, but firing the wheel is
+      // production-adjacent (opens a real issue/PR against the base branch and
+      // may merge on dev). The default CLI does NOT wire the mutating hooks --
+      // the operator-approved live phase must supply them. Fail closed rather
+      // than silently no-op.
       deps.stderr(
-        'lifecycle_fire_not_configured: supply an operator-approved firing implementation'
+        'lifecycle_fire_not_configured: the lifecycle canary opens a real issue/PR against ' +
+          `origin/${baseBranch}; supply an operator-approved mutation-hook implementation`
       );
       return 3;
     }
@@ -139,11 +186,20 @@ export async function runCanaryCli(
       dutyOfficerReportPath: flag(args, '--duty-officer-report'),
       mergeIdentity,
       operatorToken: env.ARCHON_OPERATOR_TOKEN,
+      preRunRevision: flag(args, '--pre-run-revision'),
     };
     try {
-      const report = await (deps.lifecycleRunner ?? runLifecycleCanarySuite)(
-        deps.lifecycleDepsFactory(options)
-      );
+      let lifecycleDeps: LifecycleCanaryDeps;
+      if (depsFactory) {
+        lifecycleDeps = depsFactory(options);
+      } else if (hooksFactory) {
+        lifecycleDeps = await buildDefaultLifecycleDeps(options, hooksFactory(options));
+      } else {
+        // Unreachable: both factories were rejected by the guard above.
+        deps.stderr('lifecycle_fire_not_configured');
+        return 3;
+      }
+      const report = await (deps.lifecycleRunner ?? runLifecycleCanarySuite)(lifecycleDeps);
       await (deps.lifecycleArtifactWriter ?? writeLifecycleCanaryArtifacts)(outputRoot, report);
       deps.stdout(JSON.stringify(report, null, 2));
       return exitFor(report.verdict);

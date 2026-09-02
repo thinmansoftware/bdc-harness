@@ -424,6 +424,7 @@ describe('Leg 10 -- canary reverts (residue detection has teeth)', () => {
       source: { scratchResidueDiff: async () => '', countRevertCommits: async () => 1 },
       baseBranch: 'dev',
       runId: 'lifecycle-x',
+      preRunRevision: 'base-sha-pre',
       poll: poll(),
     });
     expect(report.verdict).toBe('passed');
@@ -438,6 +439,7 @@ describe('Leg 10 -- canary reverts (residue detection has teeth)', () => {
       },
       baseBranch: 'dev',
       runId: 'lifecycle-x',
+      preRunRevision: 'base-sha-pre',
       poll: poll(),
     });
     expect(report.verdict).toBe('failed');
@@ -531,7 +533,8 @@ describe('runLifecycleCanarySuite (Section 10 named scenarios)', () => {
       githubRepo: 'thinmansoftware/bdc-harness',
       baseBranch: 'dev',
       source: fullPassSource(),
-      fire: async () => baseFire,
+      initiate: async () => baseFire,
+      preRunRevision: 'base-sha-pre',
       clock: fakeClock(),
       pollIntervalMs: 100,
       timeouts: {
@@ -576,7 +579,8 @@ describe('runLifecycleCanarySuite (Section 10 named scenarios)', () => {
       githubRepo: 'thinmansoftware/bdc-harness',
       baseBranch: 'dev',
       source: dirty,
-      fire: async () => baseFire,
+      initiate: async () => baseFire,
+      preRunRevision: 'base-sha-pre',
       clock: fakeClock(),
       pollIntervalMs: 100,
       timeouts: {
@@ -615,7 +619,8 @@ describe('runLifecycleCanarySuite (Section 10 named scenarios)', () => {
       githubRepo: 'thinmansoftware/bdc-harness',
       baseBranch: 'dev',
       source: scopeViolating,
-      fire: async () => baseFire,
+      initiate: async () => baseFire,
+      preRunRevision: 'base-sha-pre',
       clock: fakeClock(),
       pollIntervalMs: 100,
       timeouts: {
@@ -660,7 +665,8 @@ describe('runLifecycleCanarySuite (Section 10 named scenarios)', () => {
       githubRepo: 'thinmansoftware/bdc-harness',
       baseBranch: 'dev',
       source,
-      fire: async () => ({
+      preRunRevision: 'base-sha-pre',
+      initiate: async () => ({
         headBranch: 'canary/lifecycle-x',
         fallbackUsed: false,
         dispatchMessageId: 'msg-1',
@@ -688,5 +694,224 @@ describe('runLifecycleCanarySuite (Section 10 named scenarios)', () => {
     expect(report.legs.find(l => l.legId === 'autonomous-merge')!.verdict).toBe('blocked');
     // Leg 10 still executed independently.
     expect(report.legs.find(l => l.legId === 'canary-reverts')!.verdict).toBe('passed');
+  });
+});
+
+describe('post-review hardening regressions', () => {
+  const fastTimeouts = {
+    leg1Ms: 300,
+    leg2Ms: 300,
+    leg3Ms: 300,
+    leg4Ms: 300,
+    leg5Ms: 300,
+    leg6Ms: 300,
+    leg7Ms: 300,
+    leg8Ms: 300,
+    leg9Ms: 300,
+    leg10Ms: 300,
+  };
+
+  test('Invariant 2: a sibling dir sharing the scratch prefix is a violation', async () => {
+    const result = await checkInvariantDiffScope({
+      source: {
+        listPrChangedFiles: async () => ['.archon/canaries/lifecycle-scratch-evil/payload.ts'],
+      },
+      prNumber: 991,
+      scratchDir: '.archon/canaries/lifecycle-scratch',
+    });
+    expect(result.violated).toBe(true);
+    expect(result.offendingFiles).toContain('.archon/canaries/lifecycle-scratch-evil/payload.ts');
+  });
+
+  test('Invariant 2: a traversal segment escaping the scratch dir is a violation', async () => {
+    const result = await checkInvariantDiffScope({
+      source: {
+        listPrChangedFiles: async () => [
+          '.archon/canaries/lifecycle-scratch/../../../packages/server/src/index.ts',
+        ],
+      },
+      prNumber: 991,
+      scratchDir: '.archon/canaries/lifecycle-scratch',
+    });
+    expect(result.violated).toBe(true);
+  });
+
+  test('Leg 10 anchors residue detection to the captured pre-run revision', async () => {
+    const seen: string[][] = [];
+    await checkLeg10CanaryReverts({
+      source: {
+        scratchResidueDiff: async (baseBranch: string, preRunRevision: string) => {
+          seen.push([baseBranch, preRunRevision]);
+          return '';
+        },
+        countRevertCommits: async () => 1,
+      },
+      baseBranch: 'dev',
+      runId: 'lifecycle-x',
+      preRunRevision: 'base-sha-pre',
+      poll: poll(),
+    });
+    expect(seen[0]).toEqual(['dev', 'base-sha-pre']);
+  });
+
+  test('Leg 10 performs the cleanup operation before grading residue', async () => {
+    const order: string[] = [];
+    const report = await checkLeg10CanaryReverts({
+      source: {
+        scratchResidueDiff: async () => {
+          order.push('measure');
+          return '';
+        },
+        countRevertCommits: async () => 1,
+      },
+      baseBranch: 'dev',
+      runId: 'lifecycle-x',
+      preRunRevision: 'base-sha-pre',
+      cleanup: async () => {
+        order.push('cleanup');
+      },
+      poll: poll(),
+    });
+    expect(order[0]).toBe('cleanup');
+    expect(order).toContain('measure');
+    expect(report.verdict).toBe('passed');
+  });
+
+  test('Leg 10 fails closed when cleanup errors even if residue reads clean', async () => {
+    const report = await checkLeg10CanaryReverts({
+      source: { scratchResidueDiff: async () => '', countRevertCommits: async () => 1 },
+      baseBranch: 'dev',
+      runId: 'lifecycle-x',
+      preRunRevision: 'base-sha-pre',
+      cleanup: async () => {
+        throw new Error('revert push rejected');
+      },
+      poll: poll(),
+    });
+    expect(report.verdict).toBe('failed');
+    expect(report.reasonCodes).toContain('canary_cleanup_failed');
+  });
+
+  test('Leg 10 still runs and cleans up when an upstream leg throws', async () => {
+    let cleaned = false;
+    const report = await runLifecycleCanarySuite({
+      runId: 'lifecycle-x',
+      githubRepo: 'thinmansoftware/bdc-harness',
+      baseBranch: 'dev',
+      preRunRevision: 'base-sha-pre',
+      source: stubSource({
+        queryTmJournalFireCauldron: async () => [
+          {
+            id: 1,
+            proposal_type: 'fire_cauldron',
+            target: 'bdc-harness#4321',
+            created_at: RUN_START,
+          },
+        ],
+        listPrsForBranch: async () => {
+          throw new Error('gh exploded');
+        },
+        scratchResidueDiff: async () => '',
+        countRevertCommits: async () => 1,
+      }),
+      initiate: async () => ({
+        issueNumber: 4321,
+        headBranch: 'canary/lifecycle-x',
+        fallbackUsed: false,
+      }),
+      cleanup: async () => {
+        cleaned = true;
+      },
+      clock: fakeClock(),
+      pollIntervalMs: 100,
+      timeouts: fastTimeouts,
+      runStartIso: RUN_START,
+      mergeIdentity: 'bluedevilcollectibles',
+    });
+    expect(cleaned).toBe(true);
+    expect(report.legs.find(l => l.legId === 'canary-reverts')!.verdict).toBe('passed');
+    expect(report.invariantViolations.some(v => v.startsWith('canary_orchestration_error'))).toBe(
+      true
+    );
+    expect(report.verdict).toBe('failed');
+  });
+
+  test('the fire.ps1 fallback is only invoked after the Taskmaster window elapses', async () => {
+    const order: string[] = [];
+    await runLifecycleCanarySuite({
+      runId: 'lifecycle-x',
+      githubRepo: 'thinmansoftware/bdc-harness',
+      baseBranch: 'dev',
+      preRunRevision: 'base-sha-pre',
+      source: stubSource({
+        queryTmJournalFireCauldron: async () => {
+          order.push('poll-taskmaster');
+          return [];
+        },
+        listPrsForBranch: async () => {
+          throw new Error('stop here');
+        },
+        scratchResidueDiff: async () => '',
+        countRevertCommits: async () => 1,
+      }),
+      initiate: async () => {
+        order.push('initiate');
+        return { headBranch: 'canary/lifecycle-x', fallbackUsed: false };
+      },
+      fireFallback: async () => {
+        order.push('fallback');
+        return { issueNumber: 4321 };
+      },
+      cleanup: async () => {},
+      clock: fakeClock(),
+      pollIntervalMs: 100,
+      timeouts: fastTimeouts,
+      runStartIso: RUN_START,
+      mergeIdentity: 'bluedevilcollectibles',
+    });
+    expect(order[0]).toBe('initiate');
+    expect(order[1]).toBe('poll-taskmaster');
+    expect(order.indexOf('fallback')).toBeGreaterThan(order.lastIndexOf('poll-taskmaster'));
+  });
+
+  test('the fallback is NOT invoked when Taskmaster fires on its own', async () => {
+    let fallbackCalls = 0;
+    await runLifecycleCanarySuite({
+      runId: 'lifecycle-x',
+      githubRepo: 'thinmansoftware/bdc-harness',
+      baseBranch: 'dev',
+      preRunRevision: 'base-sha-pre',
+      source: stubSource({
+        queryTmJournalFireCauldron: async () => [
+          {
+            id: 1,
+            proposal_type: 'fire_cauldron',
+            target: 'bdc-harness#4321',
+            created_at: RUN_START,
+          },
+        ],
+        listPrsForBranch: async () => {
+          throw new Error('stop here');
+        },
+        scratchResidueDiff: async () => '',
+        countRevertCommits: async () => 1,
+      }),
+      initiate: async () => ({
+        issueNumber: 4321,
+        headBranch: 'canary/lifecycle-x',
+        fallbackUsed: false,
+      }),
+      fireFallback: async () => {
+        fallbackCalls += 1;
+        return {};
+      },
+      cleanup: async () => {},
+      clock: fakeClock(),
+      pollIntervalMs: 100,
+      timeouts: fastTimeouts,
+      runStartIso: RUN_START,
+      mergeIdentity: 'bluedevilcollectibles',
+    });
+    expect(fallbackCalls).toBe(0);
   });
 });

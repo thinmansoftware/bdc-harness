@@ -129,8 +129,11 @@ export interface LifecycleArtifactSource {
   dispatchResultBody(messageId: string): Promise<string | null>;
   // Leg 9
   readDutyOfficerReport(): Promise<string>;
-  // Leg 10 residue: content diff of the scratch path vs base
-  scratchResidueDiff(baseBranch: string): Promise<string>;
+  // Leg 10 residue: content diff of the scratch path ON THE BASE BRANCH between
+  // the revision captured before the run started and the post-run base tip.
+  // Diffing the worktree against the current base tip would report clean once a
+  // canary marker is merged into both, so the pre-run revision is the anchor.
+  scratchResidueDiff(baseBranch: string, preRunRevision: string): Promise<string>;
   countRevertCommits(runId: string): Promise<number>;
   // Invariant 2 diff-scope
   listPrChangedFiles(prNumber: number): Promise<readonly string[]>;
@@ -536,24 +539,56 @@ export async function checkLeg10CanaryReverts(input: {
   readonly source: Pick<LifecycleArtifactSource, 'scratchResidueDiff' | 'countRevertCommits'>;
   readonly baseBranch: string;
   readonly runId: string;
+  // Base-branch revision captured BEFORE the run mutated anything.
+  readonly preRunRevision: string;
   readonly poll: LegPollConfig;
+  // Performs the actual revert. Invoked here -- not merely observed -- so Leg 10
+  // grades the outcome of a real cleanup operation (Invariant 3).
+  readonly cleanup?: () => Promise<void>;
 }): Promise<LifecycleLegReport> {
+  let cleanupError: string | undefined;
+  if (input.cleanup) {
+    try {
+      await input.cleanup();
+    } catch (error) {
+      cleanupError = (error as Error).message;
+    }
+  }
+  const cleanupEvidence = cleanupError
+    ? `cleanup=failed:${cleanupError}`
+    : `cleanup=${input.cleanup ? 'ran' : 'not_configured'}`;
+
   const { clock, timeoutMs, intervalMs } = input.poll;
   const result = await pollUntil(clock, timeoutMs, intervalMs, async () => {
-    const diff = await input.source.scratchResidueDiff(input.baseBranch);
+    const diff = await input.source.scratchResidueDiff(input.baseBranch, input.preRunRevision);
     const reverts = await input.source.countRevertCommits(input.runId);
-    // Clean when there is no residual scratch diff on base, OR a revert commit
-    // is present that returns the scratch content to its pre-run state.
+    // Clean when the base branch's scratch path is byte-identical to its
+    // pre-run revision.
     const clean = diff.trim().length === 0;
     return { satisfied: clean, value: { diff, reverts } };
   });
-  const { diff, reverts } = result.value ?? {};
+  const { diff, reverts } = result.value;
+
+  if (cleanupError) {
+    // The revert operation itself errored: fail closed even if residue reads
+    // clean, because the cleanup path is unproven.
+    return leg(
+      'canary-reverts',
+      'failed',
+      ['canary_cleanup_failed'],
+      [
+        cleanupEvidence,
+        `scratch_residue_diff_bytes=${diff.trim().length}`,
+        `revert_commits=${reverts}`,
+      ]
+    );
+  }
   if (diff.trim().length === 0) {
     return leg(
       'canary-reverts',
       'passed',
       [],
-      ['scratch_residue_diff=empty', `revert_commits=${reverts}`]
+      ['scratch_residue_diff=empty', `revert_commits=${reverts}`, cleanupEvidence]
     );
   }
   // Highest-severity class: the canary polluted the shared base branch.
@@ -561,7 +596,11 @@ export async function checkLeg10CanaryReverts(input: {
     'canary-reverts',
     'failed',
     ['canary_left_residue_on_dev'],
-    [`scratch_residue_diff_bytes=${diff.trim().length}`, `revert_commits=${reverts}`]
+    [
+      `scratch_residue_diff_bytes=${diff.trim().length}`,
+      `revert_commits=${reverts}`,
+      cleanupEvidence,
+    ]
   );
 }
 
@@ -572,7 +611,19 @@ export async function checkInvariantDiffScope(input: {
   readonly scratchDir: string;
 }): Promise<{ violated: boolean; offendingFiles: readonly string[] }> {
   const files = await input.source.listPrChangedFiles(input.prNumber);
-  const offending = files.filter(file => !file.startsWith(input.scratchDir));
+  const root = input.scratchDir.replace(/\/+$/, '');
+  const prefix = `${root}/`;
+  const offending = files.filter(file => {
+    const normalized = file.replaceAll('\\', '/');
+    // A bare prefix test would accept sibling paths such as "<root>-evil/x.ts",
+    // so require the "/" boundary separator explicitly.
+    if (!normalized.startsWith(prefix)) return true;
+    // Reject any traversal segment that could escape the scratch directory.
+    return normalized
+      .slice(prefix.length)
+      .split('/')
+      .some(segment => segment === '..');
+  });
   return { violated: offending.length > 0, offendingFiles: offending };
 }
 
@@ -624,11 +675,19 @@ export interface LifecycleCanaryDeps {
   readonly githubRepo: string;
   readonly baseBranch: string;
   readonly source: LifecycleArtifactSource;
-  // Fires the run (Taskmaster propose, or documented fire.ps1 fallback) and
-  // returns the discovered issue/PR/remediation coordinates. Injected so the
-  // production-adjacent firing side effect only runs in the operator-approved
-  // live phase; unit tests provide a fake.
-  readonly fire: () => Promise<LifecycleFireResult>;
+  // Creates the canary issue/branch and returns the initial coordinates. MUST
+  // NOT invoke the fire.ps1 fallback -- the suite waits out the Leg 1
+  // Taskmaster window itself and only then escalates via fireFallback.
+  readonly initiate: () => Promise<LifecycleFireResult>;
+  // Invoked ONLY after the Leg 1 Taskmaster window elapses with no
+  // fire_cauldron row. Returns any coordinates the fallback path discovered.
+  readonly fireFallback?: () => Promise<Partial<LifecycleFireResult>>;
+  // Reverts the canary's scratch changes. Always invoked before Leg 10 grades
+  // residue, including after an upstream exception (Invariant 3).
+  readonly cleanup?: () => Promise<void>;
+  // Base-branch revision captured BEFORE the run mutated anything. Leg 10
+  // anchors residue detection to this rather than the moving base tip.
+  readonly preRunRevision: string;
   readonly clock?: LifecycleClock;
   readonly timeouts?: LifecycleTimeouts;
   readonly pollIntervalMs?: number;
@@ -668,139 +727,177 @@ export async function runLifecycleCanarySuite(
   const legs: LifecycleLegReport[] = [];
   const invariantViolations: string[] = [];
 
-  const fired = await deps.fire();
+  let fired: LifecycleFireResult = { headBranch: '', fallbackUsed: false };
+  let orchestrationError: Error | undefined;
 
-  // Leg 1
-  legs.push(
-    await checkLeg1TaskmasterFires({
+  try {
+    fired = await deps.initiate();
+
+    // Leg 1 -- wait out the Taskmaster window FIRST; escalate to the documented
+    // fire.ps1 fallback only after it elapses with no fire_cauldron row.
+    let leg1 = await checkLeg1TaskmasterFires({
       source,
       sinceIso: deps.runStartIso,
       targetIssue: fired.issueNumber,
-      fallbackUsed: fired.fallbackUsed,
+      fallbackUsed: false,
       poll: poll(timeouts.leg1Ms),
-    })
-  );
+    });
+    if (leg1.verdict !== 'passed' && deps.fireFallback) {
+      const fallback = await deps.fireFallback();
+      fired = {
+        ...fired,
+        issueNumber: fallback.issueNumber ?? fired.issueNumber,
+        prNumber: fallback.prNumber ?? fired.prNumber,
+        headBranch: fallback.headBranch ?? fired.headBranch,
+        remediationSha: fallback.remediationSha ?? fired.remediationSha,
+        remediationCommitIso: fallback.remediationCommitIso ?? fired.remediationCommitIso,
+        dispatchMessageId: fallback.dispatchMessageId ?? fired.dispatchMessageId,
+        fallbackUsed: true,
+      };
+      leg1 = { ...leg1, gap: 'taskmaster-never-fired, fallback: fire.ps1 used' };
+    }
+    legs.push(leg1);
 
-  // Leg 2
-  const leg2 = await checkLeg2CodexLaneOpensPr({
-    source,
-    headBranch: fired.headBranch,
-    baseBranch: deps.baseBranch,
-    poll: poll(timeouts.leg2Ms),
-  });
-  legs.push(leg2.report);
-  const prNumber = leg2.prNumber ?? fired.prNumber;
+    // Leg 2
+    const leg2 = await checkLeg2CodexLaneOpensPr({
+      source,
+      headBranch: fired.headBranch,
+      baseBranch: deps.baseBranch,
+      poll: poll(timeouts.leg2Ms),
+    });
+    legs.push(leg2.report);
+    const prNumber = leg2.prNumber ?? fired.prNumber;
 
-  if (prNumber === undefined) {
-    // No PR: legs 3-9 cannot proceed against a real PR. Report them blocked
-    // (honest, never a false pass), then still run Leg 10 cleanup independently.
-    legs.push(upstreamBlocked('overseer-catch-defect', 'no_pr'));
-    legs.push(upstreamBlocked('remediation-reaches-pr', 'no_pr'));
-    legs.push(upstreamBlocked('overseer-reapprove', 'no_pr'));
-    legs.push(upstreamBlocked('autonomous-merge', 'no_pr'));
-    legs.push(upstreamBlocked('reconcile-closes-issue', 'no_pr'));
-  } else {
-    // Leg 3
-    legs.push(
-      await checkLeg3OverseerCatchesDefect({
-        source,
-        prNumber,
-        defectSignature,
-        poll: poll(timeouts.leg3Ms),
-      })
-    );
-
-    // Leg 4
-    legs.push(
-      await checkLeg4RemediationReachesPr({
-        source,
-        prNumber,
-        literal: plantedLiteral,
-        autoRemediationAvailable: deps.autoRemediationAvailable ?? false,
-        poll: poll(timeouts.leg4Ms),
-      })
-    );
-
-    // Leg 5
-    if (fired.remediationSha && fired.remediationCommitIso) {
+    if (prNumber === undefined) {
+      // No PR: legs 3-9 cannot proceed against a real PR. Report them blocked
+      // (honest, never a false pass), then still run Leg 10 cleanup independently.
+      legs.push(upstreamBlocked('overseer-catch-defect', 'no_pr'));
+      legs.push(upstreamBlocked('remediation-reaches-pr', 'no_pr'));
+      legs.push(upstreamBlocked('overseer-reapprove', 'no_pr'));
+      legs.push(upstreamBlocked('autonomous-merge', 'no_pr'));
+      legs.push(upstreamBlocked('reconcile-closes-issue', 'no_pr'));
+    } else {
+      // Leg 3
       legs.push(
-        await checkLeg5OverseerReapproves({
+        await checkLeg3OverseerCatchesDefect({
           source,
           prNumber,
-          remediationSha: fired.remediationSha,
-          remediationCommitIso: fired.remediationCommitIso,
-          poll: poll(timeouts.leg5Ms),
+          defectSignature,
+          poll: poll(timeouts.leg3Ms),
         })
       );
-    } else {
-      legs.push(upstreamBlocked('overseer-reapprove', 'no_remediation_commit'));
-    }
 
-    // Invariant 2 (diff scope) gates merge acceptance.
-    const scope = await checkInvariantDiffScope({ source, prNumber, scratchDir });
-    if (scope.violated) {
-      invariantViolations.push(`canary_diff_scope_violation: ${scope.offendingFiles.join(', ')}`);
-    }
-
-    // Leg 6
-    legs.push(
-      await checkLeg6AutonomousMerge({
-        source,
-        prNumber,
-        mergeIdentity: deps.mergeIdentity,
-        humanLogins: deps.humanLogins ?? [],
-        poll: poll(timeouts.leg6Ms),
-      })
-    );
-
-    // Leg 7
-    if (fired.issueNumber !== undefined) {
+      // Leg 4
       legs.push(
-        await checkLeg7ReconcileClosesIssue({
+        await checkLeg4RemediationReachesPr({
           source,
-          issueNumber: fired.issueNumber,
-          poll: poll(timeouts.leg7Ms),
+          prNumber,
+          literal: plantedLiteral,
+          autoRemediationAvailable: deps.autoRemediationAvailable ?? false,
+          poll: poll(timeouts.leg4Ms),
+        })
+      );
+
+      // Leg 5
+      if (fired.remediationSha && fired.remediationCommitIso) {
+        legs.push(
+          await checkLeg5OverseerReapproves({
+            source,
+            prNumber,
+            remediationSha: fired.remediationSha,
+            remediationCommitIso: fired.remediationCommitIso,
+            poll: poll(timeouts.leg5Ms),
+          })
+        );
+      } else {
+        legs.push(upstreamBlocked('overseer-reapprove', 'no_remediation_commit'));
+      }
+
+      // Invariant 2 (diff scope) gates merge acceptance.
+      const scope = await checkInvariantDiffScope({ source, prNumber, scratchDir });
+      if (scope.violated) {
+        invariantViolations.push(`canary_diff_scope_violation: ${scope.offendingFiles.join(', ')}`);
+      }
+
+      // Leg 6
+      legs.push(
+        await checkLeg6AutonomousMerge({
+          source,
+          prNumber,
+          mergeIdentity: deps.mergeIdentity,
+          humanLogins: deps.humanLogins ?? [],
+          poll: poll(timeouts.leg6Ms),
+        })
+      );
+
+      // Leg 7
+      if (fired.issueNumber !== undefined) {
+        legs.push(
+          await checkLeg7ReconcileClosesIssue({
+            source,
+            issueNumber: fired.issueNumber,
+            poll: poll(timeouts.leg7Ms),
+          })
+        );
+      } else {
+        legs.push(upstreamBlocked('reconcile-closes-issue', 'no_issue'));
+      }
+    }
+
+    // Leg 8
+    if (fired.dispatchMessageId) {
+      legs.push(
+        await checkLeg8DispatchReadableReply({
+          source,
+          messageId: fired.dispatchMessageId,
+          expectedSubstring: deps.dispatchExpectedSubstring ?? deps.runId,
+          poll: poll(timeouts.leg8Ms),
         })
       );
     } else {
-      legs.push(upstreamBlocked('reconcile-closes-issue', 'no_issue'));
+      legs.push(upstreamBlocked('dispatch-readable-reply', 'no_dispatch_message'));
     }
-  }
 
-  // Leg 8
-  if (fired.dispatchMessageId) {
+    // Leg 9
     legs.push(
-      await checkLeg8DispatchReadableReply({
+      await checkLeg9DutyOfficerReports({
         source,
-        messageId: fired.dispatchMessageId,
-        expectedSubstring: deps.dispatchExpectedSubstring ?? deps.runId,
-        poll: poll(timeouts.leg8Ms),
+        runId: deps.runId,
+        staleFlagMarkers: deps.staleFlagMarkers ?? [],
+        poll: poll(timeouts.leg9Ms),
       })
     );
-  } else {
-    legs.push(upstreamBlocked('dispatch-readable-reply', 'no_dispatch_message'));
+  } catch (error) {
+    orchestrationError = error as Error;
   }
 
-  // Leg 9
-  legs.push(
-    await checkLeg9DutyOfficerReports({
-      source,
-      runId: deps.runId,
-      staleFlagMarkers: deps.staleFlagMarkers ?? [],
-      poll: poll(timeouts.leg9Ms),
-    })
-  );
+  // Leg 10 -- cleanup on an independent timeout. ALWAYS runs, including after
+  // an upstream exception, so the canary never leaves residue (Invariant 3).
+  try {
+    legs.push(
+      await checkLeg10CanaryReverts({
+        source,
+        baseBranch: deps.baseBranch,
+        runId: deps.runId,
+        preRunRevision: deps.preRunRevision,
+        cleanup: deps.cleanup,
+        poll: poll(timeouts.leg10Ms),
+      })
+    );
+  } catch (error) {
+    legs.push(
+      leg(
+        'canary-reverts',
+        'failed',
+        ['canary_cleanup_threw'],
+        [`error=${(error as Error).message}`]
+      )
+    );
+  }
 
-  // Leg 10 -- cleanup, independent timeout, runs regardless of upstream results
-  // (Invariant 3). Always the final leg.
-  legs.push(
-    await checkLeg10CanaryReverts({
-      source,
-      baseBranch: deps.baseBranch,
-      runId: deps.runId,
-      poll: poll(timeouts.leg10Ms),
-    })
-  );
+  if (orchestrationError) {
+    invariantViolations.push(`canary_orchestration_error: ${orchestrationError.message}`);
+  }
 
   // Order legs canonically for the report.
   const ordered = LIFECYCLE_LEGS.map(
@@ -838,6 +935,30 @@ async function runCommand(
   ]);
   const exitCode = await proc.exited;
   return { stdout, stderr, exitCode };
+}
+
+// Captures the base-branch tip. Read-only: it must be called BEFORE any canary
+// mutation so Leg 10 has a trustworthy residue anchor.
+export async function resolveBaseRevision(repoDir: string, baseBranch: string): Promise<string> {
+  await runCommand('git', ['fetch', 'origin', baseBranch], repoDir);
+  const { stdout, exitCode } = await runCommand(
+    'git',
+    ['rev-parse', `origin/${baseBranch}`],
+    repoDir
+  );
+  if (exitCode !== 0 || stdout.trim().length === 0) {
+    throw new Error(`lifecycle_canary_cannot_resolve_base_revision: origin/${baseBranch}`);
+  }
+  return stdout.trim();
+}
+
+// The mutating side of a live run, kept separate from the read-only artifact
+// source. Supplying these is what makes a run production-adjacent (it opens a
+// real issue/PR against the base branch), so the CLI never defaults them.
+export interface LifecycleMutationHooks {
+  readonly initiate: LifecycleCanaryDeps['initiate'];
+  readonly fireFallback?: LifecycleCanaryDeps['fireFallback'];
+  readonly cleanup?: LifecycleCanaryDeps['cleanup'];
 }
 
 export interface DefaultArtifactSourceConfig {
@@ -989,10 +1110,12 @@ export function createDefaultArtifactSource(
         return '';
       }
     },
-    scratchResidueDiff: async (baseBranch): Promise<string> => {
+    scratchResidueDiff: async (baseBranch, preRunRevision): Promise<string> => {
+      // Refresh the remote ref so the comparison sees the post-run base tip.
+      await runCommand('git', ['fetch', 'origin', baseBranch], config.repoDir);
       const { stdout } = await runCommand(
         'git',
-        ['diff', `origin/${baseBranch}`, '--', config.scratchDir],
+        ['diff', preRunRevision, `origin/${baseBranch}`, '--', config.scratchDir],
         config.repoDir
       );
       return stdout;
