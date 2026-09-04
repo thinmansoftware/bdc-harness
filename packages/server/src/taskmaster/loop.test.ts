@@ -8,6 +8,7 @@ import { readFileSync } from 'fs';
 import { join } from 'path';
 import {
   createTaskmasterState,
+  defaultFindEffectByIdempotencyKey,
   defaultGetGithubIssueEvidence,
   defaultListThreads,
   tick,
@@ -215,14 +216,17 @@ function makeDeps(world: FakeWorld, overrides: Partial<TaskmasterDeps> = {}): Ta
     now: () => new Date(world.nowMs),
     db: dal,
     headroom: async () => okHeadroom,
-    createTask: (async (data: { idempotency_key: string; recipient: string; body: string }) => {
+    createTask: (async (
+      _context: unknown,
+      data: { idempotency_key: string; recipient: string; body: string }
+    ) => {
       world.sentMessages.push({
         idempotency_key: data.idempotency_key,
         recipient: data.recipient,
         body: data.body,
         createdAt: new Date(world.nowMs).toISOString(),
       });
-      return { id: `msg-${world.sentMessages.length}`, status: 'queued' };
+      return { id: `msg-${world.sentMessages.length}`, status: 'queued' } as never;
     }) as unknown as TaskmasterDeps['createTask'],
     findEffectByIdempotencyKey: async (key: string) => {
       const found = world.sentMessages.find(m => m.idempotency_key === key);
@@ -992,6 +996,60 @@ describe('scenario 4: restart produces no double effect', () => {
     await tick(state, deps);
     expect(world.journal.find(j => j.id === 'journal-orphan')?.outcome).toBe('expired');
     expect(world.sentMessages.length).toBe(0);
+  });
+
+  test('legacy null-principal taskmaster effect cannot reconcile a pending journal', async () => {
+    const world = makeWorld();
+    seedDigestSent(world);
+    const key = 'tm:nudge:gh:thinmansoftware/bdc-xo#129:1';
+    world.journal.push({
+      id: 'journal-legacy-taskmaster-effect',
+      created_at: new Date(T0 - 60_000).toISOString(),
+      thread_ref: 'gh:thinmansoftware/bdc-xo#129',
+      action_type: 'nudge',
+      proposal_json: '{}',
+      idempotency_key: key,
+      before_hash: null,
+      proof_predicate: null,
+      proof_deadline_at: null,
+      outcome: 'pending',
+      graded_at: null,
+      grade: null,
+    });
+    const queries: string[] = [];
+    const findLegacyEffect = (effectKey: string) =>
+      defaultFindEffectByIdempotencyKey(effectKey, async (sql, params) => {
+        queries.push(sql);
+        if (params[0] !== key) return { rows: [] };
+        return sql.includes('sender_principal_id IS NULL')
+          ? {
+              rows: [
+                {
+                  id: 'legacy-taskmaster-dispatch',
+                  status: 'queued',
+                  created_at: new Date(T0 - 30_000).toISOString(),
+                },
+              ],
+            }
+          : { rows: [] };
+      });
+    const state = createTaskmasterState(60_000);
+
+    await tick(
+      state,
+      makeDeps(world, {
+        findEffectByIdempotencyKey: findLegacyEffect,
+        getDispatchMessageById: async () => null,
+        getGithubIssueEvidence: async () => null,
+        listThreads: async () => [],
+      })
+    );
+
+    expect(world.journal.find(row => row.id === 'journal-legacy-taskmaster-effect')?.outcome).toBe(
+      'expired'
+    );
+    expect(queries[0]).toContain("sender_principal_id = 'system:taskmaster'");
+    expect(queries[0]).not.toContain('sender_principal_id IS NULL');
   });
 });
 
@@ -2405,7 +2463,7 @@ describe('M-155 exception push (loop)', () => {
       listThreads: async () => [thread],
       getGithubIssueEvidence: async () =>
         contentEvidence('[PROGRESS] waiting on review feedback', T0 - 3 * 3_600_000),
-      createTask: (async (data: Record<string, unknown>) => {
+      createTask: (async (_context: unknown, data: Record<string, unknown>) => {
         captured.push(data);
         world.sentMessages.push({
           idempotency_key: String(data.idempotency_key),

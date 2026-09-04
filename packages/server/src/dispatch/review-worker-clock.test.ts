@@ -102,6 +102,7 @@ function fakeDeps(
           }
         : null;
     }),
+    releaseMessage: mock(async () => null),
     runAndSubmitReview: mock(async work => outcomeFor(work.messageId)),
     createSubmitDeps: mock(() => ({ reviewerIdentity: CONFIG.reviewerIdentity }) as SubmitDeps),
   };
@@ -169,6 +170,55 @@ describe('review worker clock', () => {
       );
     }
   );
+
+  // WO-HARNESS-OVERSEER-REVIEW-WAITS-FOR-CHECKS-01: a checks-pending item is
+  // released (not posted as a result) with a future not_before, and is retried
+  // until it reaches a terminal disposition.
+  test('releases (never posts) a checks-pending item with a future not_before', async () => {
+    const deps = fakeDeps([message('pending', 'exact-head')], () => ({
+      disposition: 'checks_pending',
+      reason: 'checks_not_terminal',
+    }));
+
+    const before = Date.now();
+    await tickReviewWorkerClock(CONFIG, deps);
+
+    expect(deps.releaseMessage).toHaveBeenCalledTimes(1);
+    const releaseArg = (deps.releaseMessage as ReturnType<typeof mock>).mock.calls[0]?.[0] as {
+      id: string;
+      fencing_token: number;
+      not_before: string;
+    };
+    expect(releaseArg.id).toBe('pending');
+    expect(releaseArg.fencing_token).toBe(1);
+    expect(new Date(releaseArg.not_before).getTime()).toBeGreaterThan(before);
+    // A defer is not a terminal result.
+    expect(deps.postResult).not.toHaveBeenCalled();
+  });
+
+  test('retries a released item on a later tick until it reaches a terminal disposition', async () => {
+    let disposition: SubmitOutcome['disposition'] = 'checks_pending';
+    const deps = fakeDeps(
+      [message('retry', 'exact-head')],
+      () => ({ disposition }) as SubmitOutcome
+    );
+
+    // Tick 1: checks still pending -> release, no result.
+    await tickReviewWorkerClock(CONFIG, deps);
+    expect(deps.releaseMessage).toHaveBeenCalledTimes(1);
+    expect(deps.postResult).not.toHaveBeenCalled();
+
+    // Checks conclude; tick 2 picks up the same message and completes it.
+    disposition = 'approved';
+    await tickReviewWorkerClock(CONFIG, deps);
+
+    expect(deps.runAndSubmitReview).toHaveBeenCalledTimes(2);
+    expect(deps.releaseMessage).toHaveBeenCalledTimes(1);
+    expect(deps.postResult).toHaveBeenCalledTimes(1);
+    expect(deps.postResult).toHaveBeenCalledWith(
+      expect.objectContaining({ id: 'retry', status: 'done', task_outcome: 'succeeded' })
+    );
+  });
 
   test('isolates a failed item and continues through the batch', async () => {
     const deps = fakeDeps([message('bad'), message('good')]);

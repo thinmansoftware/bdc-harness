@@ -84,7 +84,10 @@ export class SqliteAdapter implements IDatabase {
     try {
       // Determine if this is a SELECT or mutation
       const trimmedSql = sql.trim().toUpperCase();
-      const isSelect = trimmedSql.startsWith('SELECT') || trimmedSql.startsWith('WITH');
+      const isSelect =
+        trimmedSql.startsWith('SELECT') ||
+        trimmedSql.startsWith('WITH') ||
+        trimmedSql.startsWith('PRAGMA');
 
       // Cast params to SQLite's expected type
       const sqliteParams = reorderedParams as SQLQueryBindings[];
@@ -223,6 +226,22 @@ export class SqliteAdapter implements IDatabase {
     this.createSchema();
     this.migrateColumns();
     this.seedDispatchPrincipals();
+    // Phase 1.5 partial unique indexes must run only after sender_principal_id exists.
+    const postMigrateCols = this.pragmaAll("PRAGMA table_info('agent_dispatch_messages')") as {
+      name: string;
+    }[];
+    if (postMigrateCols.some(column => column.name === 'sender_principal_id')) {
+      this.db.run(
+        `CREATE UNIQUE INDEX IF NOT EXISTS uq_agent_dispatch_messages_sender_idempotency_authenticated
+         ON agent_dispatch_messages(sender_principal_id, idempotency_key)
+         WHERE sender_principal_id IS NOT NULL`
+      );
+      this.db.run(
+        `CREATE UNIQUE INDEX IF NOT EXISTS uq_agent_dispatch_messages_idempotency_legacy
+         ON agent_dispatch_messages(idempotency_key)
+         WHERE sender_principal_id IS NULL`
+      );
+    }
     this.db.run(
       'CREATE INDEX IF NOT EXISTS idx_dispatch_board_pending ON agent_dispatch_messages(recipient_alias, status, created_at)'
     );
@@ -439,6 +458,8 @@ export class SqliteAdapter implements IDatabase {
       getLog().warn({ err: e as Error }, 'db.sqlite_migration_dispatch_columns_failed');
     }
 
+    this.migrateDispatchSenderPrincipalIdempotency();
+
     try {
       const actionCols = this.db
         .prepare("PRAGMA table_info('remote_agent_supervisor_actions')")
@@ -454,6 +475,223 @@ export class SqliteAdapter implements IDatabase {
       }
     } catch (e: unknown) {
       getLog().warn({ err: e as Error }, 'db.sqlite_migration_supervisor_action_columns_failed');
+    }
+  }
+
+  /**
+   * Phase 1.5: add nullable sender_principal_id and replace the global UNIQUE
+   * idempotency constraint with two partial unique indexes. Rebuild is fatal on
+   * failure -- it must not be swallowed by the best-effort migration warn path.
+   */
+  private migrateDispatchSenderPrincipalIdempotency(): void {
+    const tableExists = this.db
+      .prepare(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'agent_dispatch_messages'"
+      )
+      .get() as { name?: string } | null;
+    if (!tableExists?.name) return;
+
+    const cols = this.db.prepare("PRAGMA table_info('agent_dispatch_messages')").all() as {
+      name: string;
+      type: string;
+      notnull: number;
+      dflt_value: string | null;
+    }[];
+    const colNames = new Set(cols.map(c => c.name));
+    // Phase 0 must land first. Rebuilding before priority/subject_key exist would
+    // bypass the Phase 0 transactional backfill contract on failed opens.
+    if (!colNames.has('priority') || !colNames.has('subject_key')) {
+      return;
+    }
+    const priorityCol = cols.find(c => c.name === 'priority');
+    // Refuse malformed Phase 0 priority definitions rather than silently healing them.
+    if (priorityCol?.type.toUpperCase() !== 'TEXT' || priorityCol.notnull !== 1) {
+      throw new Error('dispatch_phase15_priority_definition_invalid');
+    }
+    if (!colNames.has('sender_principal_id')) {
+      this.db.run('ALTER TABLE agent_dispatch_messages ADD COLUMN sender_principal_id TEXT');
+    }
+
+    const indexRows = this.db
+      .prepare(
+        "SELECT name, sql FROM sqlite_master WHERE type = 'index' AND tbl_name = 'agent_dispatch_messages'"
+      )
+      .all() as { name: string; sql: string | null }[];
+    const hasAuth = indexRows.some(
+      row => row.name === 'uq_agent_dispatch_messages_sender_idempotency_authenticated'
+    );
+    const hasLegacy = indexRows.some(
+      row => row.name === 'uq_agent_dispatch_messages_idempotency_legacy'
+    );
+    const tableSqlRow = this.db
+      .prepare(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'agent_dispatch_messages'"
+      )
+      .get() as { sql: string } | null;
+    const tableSql = tableSqlRow?.sql ?? '';
+    const hasInlineUnique =
+      /idempotency_key\s+TEXT\s+NOT\s+NULL\s+UNIQUE/i.test(tableSql) ||
+      /UNIQUE\s*\(\s*idempotency_key\s*\)/i.test(tableSql);
+
+    if (!hasInlineUnique) {
+      // Column present and no inline UNIQUE -- only ensure partial indexes.
+      // Do not recreate or redefine non-unique helper indexes here; smoke validation
+      // catches wrong-definition leftovers on already-migrated schemas.
+      if (!hasAuth) {
+        this.db.run(
+          `CREATE UNIQUE INDEX IF NOT EXISTS uq_agent_dispatch_messages_sender_idempotency_authenticated
+           ON agent_dispatch_messages(sender_principal_id, idempotency_key)
+           WHERE sender_principal_id IS NOT NULL`
+        );
+      }
+      if (!hasLegacy) {
+        this.db.run(
+          `CREATE UNIQUE INDEX IF NOT EXISTS uq_agent_dispatch_messages_idempotency_legacy
+           ON agent_dispatch_messages(idempotency_key)
+           WHERE sender_principal_id IS NULL`
+        );
+      }
+      return;
+    }
+
+    // Disable FKs outside the rebuild transaction so the setting sticks.
+    this.db.run('PRAGMA foreign_keys = OFF');
+    try {
+      this.db.run('BEGIN');
+      try {
+        this.db.run(`
+          CREATE TABLE agent_dispatch_messages__phase15 (
+            id TEXT PRIMARY KEY,
+            correlation_id TEXT NOT NULL,
+            idempotency_key TEXT NOT NULL,
+            task_type TEXT NOT NULL CHECK (task_type IN ('agent_message', 'run_review', 'draft_spec', 'run_report', 'board_motion')),
+            sender TEXT NOT NULL,
+            sender_principal_id TEXT,
+            recipient TEXT NOT NULL,
+            body TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'queued' CHECK (status IN ('queued', 'claimed', 'done', 'failed', 'cancelled')),
+            result_body TEXT,
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+            claimed_at TEXT,
+            completed_at TEXT,
+            not_before TEXT,
+            lease_owner TEXT,
+            lease_expires_at TEXT,
+            fencing_token INTEGER NOT NULL DEFAULT 0 CHECK (fencing_token >= 0),
+            recipient_alias TEXT CHECK (recipient_alias IS NULL OR recipient_alias = 'board'),
+            motion_id TEXT,
+            motion_revision_sha TEXT CHECK (motion_revision_sha IS NULL OR motion_revision_sha GLOB '[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]'),
+            resolved_recipient TEXT,
+            resolved_xo_lease_id TEXT,
+            resolved_xo_fencing_token INTEGER CHECK (resolved_xo_fencing_token IS NULL OR resolved_xo_fencing_token > 0),
+            resolved_at TEXT,
+            priority TEXT NOT NULL DEFAULT 'normal' CHECK (priority IN ('blocker', 'normal', 'heartbeat')),
+            task_outcome TEXT CHECK (task_outcome IS NULL OR task_outcome IN ('succeeded', 'failed', 'blocked')),
+            acknowledged_at TEXT,
+            acknowledged_by TEXT,
+            addressed_at TEXT,
+            addressed_by TEXT,
+            escalated_tg_at TEXT,
+            escalated_sms_at TEXT,
+            subject_key TEXT,
+            repeat_reason TEXT,
+            route_disposition TEXT CHECK (route_disposition IS NULL OR route_disposition IN ('unroutable', 'superseded')),
+            supersedes_id TEXT REFERENCES agent_dispatch_messages__phase15(id)
+          )
+        `);
+
+        const sourceCols = this.db
+          .prepare("PRAGMA table_info('agent_dispatch_messages')")
+          .all() as { name: string }[];
+        const sourceNames = new Set(sourceCols.map(c => c.name));
+        const targetCols = [
+          'id',
+          'correlation_id',
+          'idempotency_key',
+          'task_type',
+          'sender',
+          'sender_principal_id',
+          'recipient',
+          'body',
+          'status',
+          'result_body',
+          'created_at',
+          'claimed_at',
+          'completed_at',
+          'not_before',
+          'lease_owner',
+          'lease_expires_at',
+          'fencing_token',
+          'recipient_alias',
+          'motion_id',
+          'motion_revision_sha',
+          'resolved_recipient',
+          'resolved_xo_lease_id',
+          'resolved_xo_fencing_token',
+          'resolved_at',
+          'priority',
+          'task_outcome',
+          'acknowledged_at',
+          'acknowledged_by',
+          'addressed_at',
+          'addressed_by',
+          'escalated_tg_at',
+          'escalated_sms_at',
+          'subject_key',
+          'repeat_reason',
+          'route_disposition',
+          'supersedes_id',
+        ];
+        const selectExprs = targetCols.map(name =>
+          sourceNames.has(name) ? name : 'NULL AS ' + name
+        );
+        this.db.run(
+          `INSERT INTO agent_dispatch_messages__phase15 (${targetCols.join(', ')})
+           SELECT ${selectExprs.join(', ')} FROM agent_dispatch_messages`
+        );
+        this.db.run('DROP TABLE agent_dispatch_messages');
+        this.db.run(
+          'ALTER TABLE agent_dispatch_messages__phase15 RENAME TO agent_dispatch_messages'
+        );
+
+        this.db.run(
+          'CREATE INDEX IF NOT EXISTS idx_agent_dispatch_messages_recipient_status ON agent_dispatch_messages(recipient, status)'
+        );
+        this.db.run(
+          "CREATE INDEX IF NOT EXISTS idx_agent_dispatch_messages_lease_expiry ON agent_dispatch_messages(lease_expires_at) WHERE status = 'claimed'"
+        );
+        this.db.run(
+          'CREATE INDEX IF NOT EXISTS idx_agent_dispatch_messages_subject_history ON agent_dispatch_messages(subject_key, created_at DESC, id DESC) WHERE subject_key IS NOT NULL'
+        );
+        this.db.run(
+          'CREATE INDEX IF NOT EXISTS idx_dispatch_board_pending ON agent_dispatch_messages(recipient_alias, status, created_at)'
+        );
+        this.db.run(
+          `CREATE UNIQUE INDEX IF NOT EXISTS uq_agent_dispatch_messages_sender_idempotency_authenticated
+           ON agent_dispatch_messages(sender_principal_id, idempotency_key)
+           WHERE sender_principal_id IS NOT NULL`
+        );
+        this.db.run(
+          `CREATE UNIQUE INDEX IF NOT EXISTS uq_agent_dispatch_messages_idempotency_legacy
+           ON agent_dispatch_messages(idempotency_key)
+           WHERE sender_principal_id IS NULL`
+        );
+        this.db.run('COMMIT');
+      } catch (error: unknown) {
+        try {
+          this.db.run('ROLLBACK');
+        } catch {
+          /* ignore rollback failure; surface original */
+        }
+        throw error;
+      }
+
+      const fkCheck = this.db.prepare('PRAGMA foreign_key_check').all();
+      if (fkCheck.length > 0) {
+        throw new Error('dispatch_phase15_foreign_key_check_failed');
+      }
+    } finally {
+      this.db.run('PRAGMA foreign_keys = ON');
     }
   }
 
@@ -805,9 +1043,10 @@ export class SqliteAdapter implements IDatabase {
       CREATE TABLE IF NOT EXISTS agent_dispatch_messages (
         id TEXT PRIMARY KEY,
         correlation_id TEXT NOT NULL,
-        idempotency_key TEXT NOT NULL UNIQUE,
+        idempotency_key TEXT NOT NULL,
         task_type TEXT NOT NULL CHECK (task_type IN ('agent_message', 'run_review', 'draft_spec', 'run_report', 'board_motion')),
         sender TEXT NOT NULL,
+        sender_principal_id TEXT,
         recipient TEXT NOT NULL,
         body TEXT NOT NULL,
         status TEXT NOT NULL DEFAULT 'queued' CHECK (status IN ('queued', 'claimed', 'done', 'failed', 'cancelled')),

@@ -7,12 +7,13 @@ import { Database } from 'bun:sqlite';
 
 let db: SqliteAdapter;
 let currentDbPath = '';
+const SQLITE_HOOK_TIMEOUT_MS = 30_000;
 
 mock.module('./connection', () => ({
   getDatabase: () => db,
 }));
 
-import { createMessage } from './dispatch';
+import { createAuthenticatedMessage } from './dispatch';
 import {
   abandonAdoptionSnapshot,
   beginAdoptionSnapshot,
@@ -53,12 +54,12 @@ function cleanupDb(path: string): void {
 beforeEach(() => {
   currentDbPath = join(tmpdir(), `taskmaster-test-${Date.now()}-${Math.random()}.db`);
   db = new SqliteAdapter(currentDbPath);
-});
+}, SQLITE_HOOK_TIMEOUT_MS);
 
 afterEach(async () => {
   await db.close();
   cleanupDb(currentDbPath);
-});
+}, SQLITE_HOOK_TIMEOUT_MS);
 
 describe('tm_journal DAL', () => {
   test('fire_cauldron is accepted by the fresh SQLite CHECK', async () => {
@@ -650,15 +651,17 @@ describe('tm_suppression DAL (M-155 exception push)', () => {
 
   test('push: subject_key + repeat_reason satisfy the dispatch contract', async () => {
     const subject = 'gh:thinmansoftware/bdc-xo#88';
-    const first = await createMessage({
-      correlation_id: 'tm-push-1',
-      idempotency_key: 'tm:nudge:gh:thinmansoftware/bdc-xo#88:1',
-      task_type: 'agent_message',
-      sender: 'taskmaster',
-      recipient: 'xo',
-      body: 'first nudge on the subject',
-      subject_key: subject,
-    });
+    const first = await createAuthenticatedMessage(
+      { kind: 'system', sender: 'taskmaster' },
+      {
+        correlation_id: 'tm-push-1',
+        idempotency_key: 'tm:nudge:gh:thinmansoftware/bdc-xo#88:1',
+        task_type: 'agent_message',
+        recipient: 'xo',
+        body: 'first nudge on the subject',
+        subject_key: subject,
+      }
+    );
     // A prior message on the subject becomes handled (addressed).
     await db.query(
       'UPDATE agent_dispatch_messages SET addressed_at = $1, addressed_by = $2 WHERE id = $3',
@@ -668,29 +671,33 @@ describe('tm_suppression DAL (M-155 exception push)', () => {
     // migration 042 behavior: a repeat on a handled subject WITHOUT a
     // repeat_reason throws.
     await expect(
-      createMessage({
-        correlation_id: 'tm-push-2',
-        idempotency_key: 'tm:nudge:gh:thinmansoftware/bdc-xo#88:2',
-        task_type: 'agent_message',
-        sender: 'taskmaster',
-        recipient: 'xo',
-        body: 'repeat without a reason',
-        subject_key: subject,
-      })
+      createAuthenticatedMessage(
+        { kind: 'system', sender: 'taskmaster' },
+        {
+          correlation_id: 'tm-push-2',
+          idempotency_key: 'tm:nudge:gh:thinmansoftware/bdc-xo#88:2',
+          task_type: 'agent_message',
+          recipient: 'xo',
+          body: 'repeat without a reason',
+          subject_key: subject,
+        }
+      )
     ).rejects.toThrow('repeat_reason_required');
 
     // The loop supplies the per-verb literal unconditionally, so the real
     // send path does NOT throw (loop-side proof in loop.test.ts push: tests).
-    const repeat = await createMessage({
-      correlation_id: 'tm-push-3',
-      idempotency_key: 'tm:nudge:gh:thinmansoftware/bdc-xo#88:3',
-      task_type: 'agent_message',
-      sender: 'taskmaster',
-      recipient: 'xo',
-      body: 'repeat with the taskmaster follow-up reason',
-      subject_key: subject,
-      repeat_reason: 'tm:nudge:follow-up',
-    });
+    const repeat = await createAuthenticatedMessage(
+      { kind: 'system', sender: 'taskmaster' },
+      {
+        correlation_id: 'tm-push-3',
+        idempotency_key: 'tm:nudge:gh:thinmansoftware/bdc-xo#88:3',
+        task_type: 'agent_message',
+        recipient: 'xo',
+        body: 'repeat with the taskmaster follow-up reason',
+        subject_key: subject,
+        repeat_reason: 'tm:nudge:follow-up',
+      }
+    );
     expect(repeat.repeat_reason).toBe('tm:nudge:follow-up');
   });
 });

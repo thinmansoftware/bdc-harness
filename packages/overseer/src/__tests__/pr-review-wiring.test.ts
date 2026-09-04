@@ -72,6 +72,21 @@ describe('createRealSubmitDeps -- evaluator binding', () => {
     expect((await deps.runReviewer(work)).approved).toBe(approved);
   });
 
+  test('maps CHECKS_PENDING to a distinct checksPending signal, not approved=false', async () => {
+    const deps = createRealSubmitDeps('review-app[bot]', {
+      octokit: submitOctokit(),
+      evaluate: async () => reviewResult({ verdict: 'CHECKS_PENDING', error: 'checks_pending' }),
+    });
+
+    const verdict = await deps.runReviewer(work);
+    expect(verdict.checksPending).toBe(true);
+    expect(verdict.approved).toBe(false);
+    // Distinct from INDETERMINATE/REQUEST_CHANGES: no summary is fabricated, so
+    // it cannot be conflated into a REQUEST_CHANGES-producing approved=false.
+    expect(verdict.summary).toBe('');
+    expect(verdict.reviewedHeadSha).toBe(HEAD);
+  });
+
   test('does not expose internal INDETERMINATE errors in the GitHub summary', async () => {
     const secretError = 'model_error:token=super-secret-provider-detail';
     const deps = createRealSubmitDeps('review-app[bot]', {

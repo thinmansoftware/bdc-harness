@@ -48,6 +48,14 @@ export interface ReviewerVerdict {
    * which is the fail-closed direction.
    */
   findings?: readonly IndependentReviewFinding[];
+  /**
+   * True when CI checks on the bound head are not yet terminal, so no verdict
+   * was formed. A non-terminal disposition -- MUST NOT be collapsed into
+   * `approved: false` (that would be a REQUEST_CHANGES on checks-pending
+   * grounds, the exact bug WO-HARNESS-OVERSEER-REVIEW-WAITS-FOR-CHECKS-01
+   * fixes). The worker releases and retries the item on a later tick.
+   */
+  checksPending?: boolean;
 }
 
 export interface ReviewWorkItem {
@@ -68,7 +76,8 @@ export type SubmitDisposition =
   | 'merge_custody_conflict'
   | 'stale_head'
   | 'reviewer_failed'
-  | 'submission_failed';
+  | 'submission_failed'
+  | 'checks_pending';
 
 export interface SubmitOutcome {
   disposition: SubmitDisposition;
@@ -226,6 +235,16 @@ export async function runAndSubmitReview(
     return finish(deps, work, work.headSha, {
       disposition: 'reviewer_failed',
       reason: `reviewer_error:${errorCode(error)}`,
+    });
+  }
+
+  // CHECKS PENDING: CI on the bound head is not terminal yet, so no verdict was
+  // formed. This is NOT a rejection -- submit nothing and let the worker release
+  // and retry later. Nothing was evaluated, so there is no head to re-read/bind.
+  if (verdict.checksPending) {
+    return finish(deps, work, work.headSha, {
+      disposition: 'checks_pending',
+      reason: 'checks_not_terminal',
     });
   }
 

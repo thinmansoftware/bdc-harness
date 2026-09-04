@@ -6,7 +6,7 @@
  * samples with expiry, and usage observations where a failed meter is
  * recorded as is_unknown=1 -- never as zero available capacity.
  *
- * All sends still go through the dispatch DAL (createMessage in
+ * All sends still go through the dispatch DAL (createAuthenticatedMessage in
  * ./dispatch.ts). This module never writes agent_dispatch_messages.
  */
 import { randomUUID } from 'crypto';

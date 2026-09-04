@@ -1,7 +1,7 @@
 import type { IndependentReviewFinding, ReviewAgentIdentity } from './independent-review-evidence';
 import { assertCandidateIsCurrentHead } from './independent-review-evidence';
 
-export type PrReviewVerdict = 'APPROVE' | 'REQUEST_CHANGES' | 'INDETERMINATE';
+export type PrReviewVerdict = 'APPROVE' | 'REQUEST_CHANGES' | 'INDETERMINATE' | 'CHECKS_PENDING';
 
 export interface PrReviewInput {
   owner: string;
@@ -34,14 +34,39 @@ export interface PrReviewModelResult {
 
 export interface PrReviewDeps {
   reviewer: ReviewAgentIdentity;
-  fetchEvidence(input: PrReviewInput): Promise<{ diff: string; checks: PrReviewCheck[] }>;
+  /**
+   * `requiredContexts` is the set of required status-check contexts the
+   * repository enforces on the PR's base branch (branch-protection
+   * `required_status_checks.contexts`). It is the authoritative complete-suite
+   * signal: the reviewer must wait until every required context has actually
+   * reported AND completed, not merely until the check runs that happen to
+   * exist so far are done.
+   *
+   * Three distinct states -- do NOT conflate them:
+   * - non-empty `string[]`: authoritative set; wait for all of it.
+   * - empty `string[]`: authoritative "this branch enforces nothing"; the
+   *   reported-checks heuristic is then the only signal available.
+   * - `null`: UNKNOWN -- the evidence source tried and could not obtain the
+   *   authoritative set (permission, transient error, unreadable protection).
+   *   The reviewer DEFERS. Failing open here would let one fast completed check
+   *   trigger review before the remaining required CI registers.
+   *
+   * Omitting the field entirely is reserved for evidence sources that do not
+   * model required contexts at all (unit-test doubles, non-GitHub sources); it
+   * is a static property of the source, not a runtime failure, and falls back
+   * to the reported-checks heuristic. The real GitHub adapter always sets it
+   * explicitly to `string[] | null`.
+   */
+  fetchEvidence(
+    input: PrReviewInput
+  ): Promise<{ diff: string; checks: PrReviewCheck[]; requiredContexts?: string[] | null }>;
   fetchAcceptanceCriteria(woId: string): Promise<string | null>;
   invokeModel(binary: string, prompt: string): Promise<PrReviewModelResult>;
   ladder?: readonly string[];
 }
 
 interface ParsedReviewVerdict {
-  verdict: Exclude<PrReviewVerdict, 'INDETERMINATE'>;
+  verdict: Exclude<PrReviewVerdict, 'INDETERMINATE' | 'CHECKS_PENDING'>;
   findings: IndependentReviewFinding[];
   reviewed_head_sha: string;
 }
@@ -140,6 +165,65 @@ function indeterminate(
   };
 }
 
+/**
+ * Terminality of a PR's check suite for review purposes.
+ *
+ * The reviewer must not judge "did the tests pass" while checks are still
+ * queued/in_progress -- that is the bug this WO fixes. But a subtler race also
+ * has to be closed: GitHub's `checks.listForRef` only returns check runs that
+ * have ALREADY been created. Early in a push the required suite may not have
+ * registered yet, so one fast-completing check would make "every reported check
+ * is completed" true and trigger review before the rest of CI even appears.
+ *
+ * When `requiredContexts` is a known set (branch-protection required status
+ * checks on the base branch) it is the authoritative complete-suite signal:
+ * terminal only when EVERY required context has reported a check run AND every
+ * reported check has completed. A required context that has not shown up yet
+ * (or one that is present but still in_progress) keeps the suite non-terminal.
+ *
+ * `null` means the authoritative set could NOT be obtained. That is never
+ * terminal: we defer rather than fall back to the reported-checks heuristic,
+ * because a missing permission, a transient API error, or an unreadable
+ * protection config would otherwise let one fast completed check trigger review
+ * before the remaining required CI registers -- reintroducing the exact
+ * early-review bug this WO closes. Deferral is retried with backoff by the
+ * review worker, so an unknown state resolves as soon as the lookup succeeds.
+ *
+ * An empty set, or an omitted argument from an evidence source that does not
+ * model required contexts, falls back to the weaker heuristic (at least one
+ * check reported and all reported checks completed) -- the only signal
+ * available when nothing is enforced. Every repo in scope has enforced required
+ * checks, so the fallback is not exercised in production today.
+ */
+export function checksAreTerminal(
+  checks: PrReviewCheck[],
+  requiredContexts?: readonly string[] | null
+): boolean {
+  // UNKNOWN required set -- fail closed. Must be checked before any heuristic.
+  if (requiredContexts === null) return false;
+  // A reported check that is still queued/in_progress means the suite is mid
+  // flight regardless of what is required -- never terminal.
+  const allReportedCompleted = checks.every(check => check.status === 'completed');
+  if (requiredContexts !== undefined && requiredContexts.length > 0) {
+    const completedNames = new Set(
+      checks.filter(check => check.status === 'completed').map(check => check.name)
+    );
+    return allReportedCompleted && requiredContexts.every(context => completedNames.has(context));
+  }
+  return checks.length > 0 && allReportedCompleted;
+}
+
+function checksPending(input: PrReviewInput, deps: PrReviewDeps): PrReviewResult {
+  return {
+    verdict: 'CHECKS_PENDING',
+    findings: [],
+    reviewed_head_sha: input.head_sha,
+    reviewer: deps.reviewer,
+    acceptance_criteria_available: false,
+    error: 'checks_pending',
+  };
+}
+
 export async function evaluatePullRequest(
   input: PrReviewInput,
   deps: PrReviewDeps
@@ -148,11 +232,22 @@ export async function evaluatePullRequest(
     return indeterminate(input, deps, false, 'reviewer_identity_missing');
   }
 
-  let evidence: { diff: string; checks: PrReviewCheck[] };
+  let evidence: { diff: string; checks: PrReviewCheck[]; requiredContexts?: string[] | null };
   try {
     evidence = await deps.fetchEvidence(input);
   } catch (error) {
     return indeterminate(input, deps, false, `evidence_error:${errorMessage(error)}`);
+  }
+
+  // Defer (never REQUEST_CHANGES) until CI checks on the exact head are
+  // terminal. Terminality is judged against the repo's required status-check
+  // contexts when known, so a fast single check cannot trigger review before
+  // the rest of the required suite has registered; when that set is UNKNOWN
+  // (`null`) we defer too. `requiredContexts` is passed through verbatim -- it
+  // must NOT be coalesced (e.g. `?? []`), which would erase the unknown state
+  // and silently fail open. The model is not invoked in this branch.
+  if (!checksAreTerminal(evidence.checks, evidence.requiredContexts)) {
+    return checksPending(input, deps);
   }
 
   let acceptanceCriteria: string | null = null;

@@ -7,9 +7,87 @@ import type { ConversationLockManager } from '@archon/core';
 import type { WebAdapter } from '../adapters/web';
 import { SqliteAdapter } from '@archon/core/db/adapters/sqlite';
 import { setBoardPrincipalResolverForTests } from '@archon/core/db/board-authority';
-import { createMessage, registerWorker } from '@archon/core/db/dispatch';
+import {
+  createAuthenticatedMessage,
+  registerWorker,
+  type CreateAuthenticatedMessageData,
+  type DispatchMessage,
+} from '@archon/core/db/dispatch';
 import { validationErrorHook } from './openapi-defaults';
 import { mockAllWorkflowModules } from '../test/workflow-mock-factories';
+import { DispatchNonSystemCapability } from '../auth/dispatch-principal';
+
+function setSenderAuthMode(mode: 'enforce'): void {
+  process.env.DISPATCH_SENDER_AUTH_MODE = mode;
+}
+
+/** Test-local fixture constructor -- production path is createAuthenticatedMessage. */
+async function createMessage(
+  data: CreateAuthenticatedMessageData & { sender: string; sender_principal_id?: string | null }
+): Promise<DispatchMessage> {
+  if (data.sender_principal_id) {
+    return createAuthenticatedMessage(
+      testAuthenticatedCapability(data.sender_principal_id, data.sender),
+      data
+    );
+  }
+  return createAuthenticatedMessage(testLegacyCapability(data.sender), data);
+}
+
+function testAuthenticatedCapability(principalId: string, sender: string) {
+  const token = `test-token-${principalId}-${sender}`;
+  const priorRegistry = process.env.DISPATCH_PRINCIPALS_JSON;
+  const priorMode = process.env.DISPATCH_SENDER_AUTH_MODE;
+  try {
+    setSenderAuthMode('enforce');
+    process.env.DISPATCH_PRINCIPALS_JSON = JSON.stringify([
+      {
+        credential_id: `test-${principalId}-${sender}`,
+        principal_id: principalId,
+        token_sha256: createHash('sha256').update(token).digest('hex'),
+        status: 'active',
+        send_as: [sender],
+        receive_as: [sender],
+        roles: ['send', 'receive'],
+      },
+    ]);
+    return DispatchNonSystemCapability.fromAuthenticatedRequest({
+      principal_id: principalId,
+      token,
+      requested_sender: sender,
+    });
+  } finally {
+    if (priorRegistry === undefined) delete process.env.DISPATCH_PRINCIPALS_JSON;
+    else process.env.DISPATCH_PRINCIPALS_JSON = priorRegistry;
+    if (priorMode === undefined) delete process.env.DISPATCH_SENDER_AUTH_MODE;
+    else process.env.DISPATCH_SENDER_AUTH_MODE = priorMode;
+  }
+}
+
+function testLegacyCapability(sender: string) {
+  const priorRegistry = process.env.DISPATCH_PRINCIPALS_JSON;
+  const priorMode = process.env.DISPATCH_SENDER_AUTH_MODE;
+  try {
+    process.env.DISPATCH_SENDER_AUTH_MODE = 'off';
+    process.env.DISPATCH_PRINCIPALS_JSON = JSON.stringify([
+      {
+        credential_id: 'test-legacy-registry',
+        principal_id: 'test-legacy-principal',
+        token_sha256: '0'.repeat(64),
+        status: 'active',
+        send_as: ['claude'],
+        receive_as: [],
+        roles: ['send'],
+      },
+    ]);
+    return DispatchNonSystemCapability.fromHttpRequest({ requested_sender: sender }).capability;
+  } finally {
+    if (priorRegistry === undefined) delete process.env.DISPATCH_PRINCIPALS_JSON;
+    else process.env.DISPATCH_PRINCIPALS_JSON = priorRegistry;
+    if (priorMode === undefined) delete process.env.DISPATCH_SENDER_AUTH_MODE;
+    else process.env.DISPATCH_SENDER_AUTH_MODE = priorMode;
+  }
+}
 
 let db: SqliteAdapter;
 let currentDbPath = '';
@@ -183,6 +261,27 @@ describe('dispatch API', () => {
         status: 'active',
       },
     ]);
+    // Headerless off/warn create paths still require a parseable registry.
+    process.env.DISPATCH_PRINCIPALS_JSON = JSON.stringify([
+      {
+        credential_id: 'default-claude',
+        principal_id: 'claude-principal',
+        token_sha256: sha('claude-secret'),
+        status: 'active',
+        send_as: ['claude'],
+        receive_as: ['claude'],
+        roles: ['send', 'receive'],
+      },
+      {
+        credential_id: 'default-xo',
+        principal_id: 'xo-principal',
+        token_sha256: sha('xo-secret'),
+        status: 'active',
+        send_as: ['xo'],
+        receive_as: ['xo'],
+        roles: ['send'],
+      },
+    ]);
     principal = {
       principal_id: 'claude',
       seat_id: 'xo',
@@ -211,6 +310,8 @@ describe('dispatch API', () => {
     delete process.env.ARCHON_OPERATOR_TOKEN;
     delete process.env.GITHUB_TOKEN;
     delete process.env.DISPATCH_WORKER_CREDENTIALS_JSON;
+    delete process.env.DISPATCH_PRINCIPALS_JSON;
+    delete process.env.DISPATCH_SENDER_AUTH_MODE;
     await db.close();
     cleanupDb(currentDbPath);
   });
@@ -758,6 +859,18 @@ describe('dispatch API', () => {
   });
 
   test('accepts only approved structured non-production execution handoffs', async () => {
+    const digest = (token: string) => createHash('sha256').update(token).digest('hex');
+    process.env.DISPATCH_PRINCIPALS_JSON = JSON.stringify([
+      {
+        credential_id: 'xo-active',
+        principal_id: 'xo-principal',
+        token_sha256: digest('xo-secret'),
+        status: 'active',
+        send_as: ['xo'],
+        receive_as: ['xo'],
+        roles: ['send'],
+      },
+    ]);
     const app = makeApp('secret-token');
     const valid = {
       correlation_id: 'handoff-correlation',
@@ -773,12 +886,15 @@ describe('dispatch API', () => {
       objective: 'Run the approved staging-only verification workflow.',
       constraints: ['no production deploy', 'no customer sends'],
     };
+    const principalHeaders = {
+      'Content-Type': 'application/json',
+      'x-archon-operator-token': 'secret-token',
+      'x-dispatch-principal-id': 'xo-principal',
+      'x-dispatch-principal-token': 'xo-secret',
+    } as const;
     const accepted = await app.request('/api/dispatch/execution-handoffs', {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-archon-operator-token': 'secret-token',
-      },
+      headers: { ...principalHeaders },
       body: JSON.stringify(valid),
     });
     expect(accepted.status).toBe(200);
@@ -786,9 +902,13 @@ describe('dispatch API', () => {
       task_type: string;
       recipient: string;
       body: string;
+      sender: string;
+      sender_principal_id: string | null;
     };
     expect(message.task_type).toBe('run_report');
     expect(message.recipient).toBe('cauldron');
+    expect(message.sender).toBe('xo');
+    expect(message.sender_principal_id).toBe('xo-principal');
     expect(JSON.parse(message.body)).toEqual(
       expect.objectContaining({
         kind: 'approved_execution_handoff',
@@ -799,10 +919,7 @@ describe('dispatch API', () => {
 
     const overseer = await app.request('/api/dispatch/execution-handoffs', {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-archon-operator-token': 'secret-token',
-      },
+      headers: { ...principalHeaders },
       body: JSON.stringify({
         ...valid,
         correlation_id: 'handoff-overseer-correlation',
@@ -847,5 +964,338 @@ describe('dispatch API', () => {
     expect(((await response.json()) as { error: string }).error).toBe(
       'repo_mutating_dispatch_body_rejected'
     );
+  });
+
+  describe('Phase 1.5 sender authentication HTTP modes', () => {
+    const digest = (token: string) => createHash('sha256').update(token).digest('hex');
+    const principalsJson = () =>
+      JSON.stringify([
+        {
+          credential_id: 'claude-active',
+          principal_id: 'claude-principal',
+          token_sha256: digest('claude-secret'),
+          status: 'active',
+          send_as: ['claude'],
+          receive_as: ['claude'],
+          roles: ['send', 'receive'],
+        },
+        {
+          credential_id: 'xo-active',
+          principal_id: 'xo-principal',
+          token_sha256: digest('xo-secret'),
+          status: 'active',
+          send_as: ['xo'],
+          receive_as: ['xo'],
+          roles: ['send'],
+        },
+        {
+          credential_id: 'disabled',
+          principal_id: 'disabled-principal',
+          token_sha256: digest('disabled-secret'),
+          status: 'disabled',
+          send_as: ['claude'],
+          receive_as: [],
+          roles: ['send'],
+        },
+      ]);
+
+    function applySenderAuthMode(mode: string): void {
+      process.env.DISPATCH_SENDER_AUTH_MODE = mode;
+    }
+
+    beforeEach(() => {
+      process.env.DISPATCH_PRINCIPALS_JSON = principalsJson();
+      delete process.env.DISPATCH_SENDER_AUTH_MODE;
+    });
+
+    afterEach(() => {
+      delete process.env.DISPATCH_PRINCIPALS_JSON;
+      delete process.env.DISPATCH_SENDER_AUTH_MODE;
+    });
+
+    test('off admits legacy silence; warn admits with null principal; enforce rejects missing', async () => {
+      applySenderAuthMode('off');
+      let response = await makeApp('secret-token').request('/api/dispatch/messages', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-archon-operator-token': 'secret-token' },
+        body: JSON.stringify({
+          ...VALID_BODY,
+          sender: 'Legacy.Agent',
+          idempotency_key: 'legacy-off',
+        }),
+      });
+      expect(response.status).toBe(200);
+      expect(
+        ((await response.json()) as { sender_principal_id: string | null }).sender_principal_id
+      ).toBeNull();
+
+      applySenderAuthMode('warn');
+      response = await makeApp('secret-token').request('/api/dispatch/messages', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-archon-operator-token': 'secret-token' },
+        body: JSON.stringify({
+          ...VALID_BODY,
+          sender: 'Legacy.Agent',
+          idempotency_key: 'legacy-warn',
+        }),
+      });
+      expect(response.status).toBe(200);
+      expect(
+        ((await response.json()) as { sender_principal_id: string | null }).sender_principal_id
+      ).toBeNull();
+
+      applySenderAuthMode('enforce');
+      response = await makeApp('secret-token').request('/api/dispatch/messages', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-archon-operator-token': 'secret-token' },
+        body: JSON.stringify({ ...VALID_BODY, idempotency_key: 'legacy-enforce' }),
+      });
+      expect(response.status).toBe(401);
+      expect(
+        (
+          await db.query('SELECT id FROM agent_dispatch_messages WHERE idempotency_key = $1', [
+            'legacy-enforce',
+          ])
+        ).rowCount
+      ).toBe(0);
+    });
+
+    test('execution handoff rejects an invalid sender auth mode without mutation', async () => {
+      applySenderAuthMode('invalid-mode');
+      const response = await makeApp('secret-token').request('/api/dispatch/execution-handoffs', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-archon-operator-token': 'secret-token',
+          'x-dispatch-principal-id': 'xo-principal',
+          'x-dispatch-principal-token': 'xo-secret',
+        },
+        body: JSON.stringify({
+          correlation_id: 'invalid-mode-handoff-correlation',
+          idempotency_key: 'invalid-mode-handoff',
+          target: 'overseer',
+          work_order_id: 'WO-TEST-INVALID-MODE',
+          environment: 'local',
+          target_repo: 'thinmansoftware/bdc-harness',
+          target_ref: 'a'.repeat(40),
+          approved: true,
+          approved_by: 'xo',
+          approval_ref: 'test-invalid-mode',
+          objective: 'prove invalid sender auth mode fails closed',
+          constraints: [],
+        }),
+      });
+      expect(response.status).toBe(500);
+      expect(((await response.json()) as { error: string }).error).toBe(
+        'dispatch_sender_auth_mode_invalid'
+      );
+      expect(
+        (
+          await db.query('SELECT id FROM agent_dispatch_messages WHERE idempotency_key = $1', [
+            'invalid-mode-handoff',
+          ])
+        ).rowCount
+      ).toBe(0);
+    });
+
+    test('partial and invalid credentials fail closed in every mode without mutation', async () => {
+      for (const mode of ['off', 'warn', 'enforce'] as const) {
+        applySenderAuthMode(mode);
+        const before = (await db.query('SELECT id FROM agent_dispatch_messages')).rowCount;
+        let response = await makeApp('secret-token').request('/api/dispatch/messages', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-archon-operator-token': 'secret-token',
+            'x-dispatch-principal-id': 'claude-principal',
+          },
+          body: JSON.stringify({ ...VALID_BODY, idempotency_key: `partial-${mode}` }),
+        });
+        expect(response.status).toBe(401);
+
+        response = await makeApp('secret-token').request('/api/dispatch/messages', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-archon-operator-token': 'secret-token',
+            'x-dispatch-principal-id': 'claude-principal',
+            'x-dispatch-principal-token': 'wrong',
+          },
+          body: JSON.stringify({ ...VALID_BODY, idempotency_key: `invalid-${mode}` }),
+        });
+        expect(response.status).toBe(401);
+
+        response = await makeApp('secret-token').request('/api/dispatch/messages', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-archon-operator-token': 'secret-token',
+            'x-dispatch-principal-id': 'disabled-principal',
+            'x-dispatch-principal-token': 'disabled-secret',
+          },
+          body: JSON.stringify({ ...VALID_BODY, idempotency_key: `disabled-${mode}` }),
+        });
+        expect(response.status).toBe(401);
+        expect((await db.query('SELECT id FROM agent_dispatch_messages')).rowCount).toBe(before);
+      }
+    });
+
+    test('valid principal binds sender and rejects forged selector', async () => {
+      applySenderAuthMode('enforce');
+      let response = await makeApp('secret-token').request('/api/dispatch/messages', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-archon-operator-token': 'secret-token',
+          'x-dispatch-principal-id': 'claude-principal',
+          'x-dispatch-principal-token': 'claude-secret',
+        },
+        body: JSON.stringify({ ...VALID_BODY, idempotency_key: 'auth-ok', sender: 'claude' }),
+      });
+      expect(response.status).toBe(200);
+      const message = (await response.json()) as {
+        sender: string;
+        sender_principal_id: string;
+      };
+      expect(message.sender).toBe('claude');
+      expect(message.sender_principal_id).toBe('claude-principal');
+
+      response = await makeApp('secret-token').request('/api/dispatch/messages', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-archon-operator-token': 'secret-token',
+          'x-dispatch-principal-id': 'claude-principal',
+          'x-dispatch-principal-token': 'claude-secret',
+        },
+        body: JSON.stringify({ ...VALID_BODY, idempotency_key: 'auth-forge', sender: 'xo' }),
+      });
+      expect(response.status).toBe(403);
+      expect(
+        (
+          await db.query('SELECT id FROM agent_dispatch_messages WHERE idempotency_key = $1', [
+            'auth-forge',
+          ])
+        ).rowCount
+      ).toBe(0);
+    });
+
+    test('board path namespaces principal and execution handoff requires xo send_as', async () => {
+      applySenderAuthMode('enforce');
+      let response = await makeApp().request('/api/dispatch/messages', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-board-principal-token': 'board-token' },
+        body: JSON.stringify({
+          ...VALID_BODY,
+          task_type: 'board_motion',
+          sender: 'spoof',
+          recipient: 'board',
+          body: JSON.stringify({
+            motion_id: 'M-27',
+            title: 'Board Motion Dispatch',
+            file_path: 'docs/board/motions/M-27.md',
+          }),
+        }),
+      });
+      expect(response.status).toBe(200);
+      expect(((await response.json()) as { sender_principal_id: string }).sender_principal_id).toBe(
+        'board:claude'
+      );
+
+      response = await makeApp('secret-token').request('/api/dispatch/execution-handoffs', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-archon-operator-token': 'secret-token',
+          'x-dispatch-principal-id': 'xo-principal',
+          'x-dispatch-principal-token': 'xo-secret',
+        },
+        body: JSON.stringify({
+          correlation_id: 'corr-handoff',
+          idempotency_key: 'handoff-1',
+          target: 'overseer',
+          work_order_id: 'WO-TEST-1',
+          environment: 'local',
+          target_repo: 'thinmansoftware/bdc-harness',
+          target_ref: 'a'.repeat(40),
+          approved: true,
+          approved_by: 'xo',
+          approval_ref: 'ref-1',
+          objective: 'ship phase15',
+          constraints: [],
+        }),
+      });
+      expect(response.status).toBe(200);
+      const handoff = (await response.json()) as { sender: string; sender_principal_id: string };
+      expect(handoff.sender).toBe('xo');
+      expect(handoff.sender_principal_id).toBe('xo-principal');
+    });
+
+    test('malformed registry fails closed and never becomes legacy traffic', async () => {
+      applySenderAuthMode('warn');
+      process.env.DISPATCH_PRINCIPALS_JSON = '{';
+      let response = await makeApp('secret-token').request('/api/dispatch/messages', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-archon-operator-token': 'secret-token',
+          'x-dispatch-principal-id': 'claude-principal',
+          'x-dispatch-principal-token': 'claude-secret',
+        },
+        body: JSON.stringify({ ...VALID_BODY, idempotency_key: 'bad-registry' }),
+      });
+      expect(response.status).toBe(500);
+      expect(
+        (
+          await db.query('SELECT id FROM agent_dispatch_messages WHERE idempotency_key = $1', [
+            'bad-registry',
+          ])
+        ).rowCount
+      ).toBe(0);
+
+      // Headerless off/warn must also parse the registry; never silently downgrade.
+      for (const mode of ['off', 'warn'] as const) {
+        applySenderAuthMode(mode);
+        process.env.DISPATCH_PRINCIPALS_JSON = '{';
+        response = await makeApp('secret-token').request('/api/dispatch/messages', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-archon-operator-token': 'secret-token',
+          },
+          body: JSON.stringify({
+            ...VALID_BODY,
+            idempotency_key: `bad-registry-headerless-${mode}`,
+          }),
+        });
+        expect(response.status).toBe(500);
+        expect(
+          (
+            await db.query('SELECT id FROM agent_dispatch_messages WHERE idempotency_key = $1', [
+              `bad-registry-headerless-${mode}`,
+            ])
+          ).rowCount
+        ).toBe(0);
+      }
+
+      applySenderAuthMode('off');
+      delete process.env.DISPATCH_PRINCIPALS_JSON;
+      response = await makeApp('secret-token').request('/api/dispatch/messages', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-archon-operator-token': 'secret-token',
+        },
+        body: JSON.stringify({ ...VALID_BODY, idempotency_key: 'missing-registry-headerless' }),
+      });
+      expect(response.status).toBe(500);
+      expect(
+        (
+          await db.query('SELECT id FROM agent_dispatch_messages WHERE idempotency_key = $1', [
+            'missing-registry-headerless',
+          ])
+        ).rowCount
+      ).toBe(0);
+    });
   });
 });
