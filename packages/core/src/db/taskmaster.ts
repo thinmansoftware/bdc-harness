@@ -199,30 +199,94 @@ export async function recordResetAudit(data: {
   });
 }
 
-/** Execute the resume endpoint's idempotent reset sequence. */
+/**
+ * Execute the resume endpoint's reset sequence atomically.
+ *
+ * The PAUSED -> RUNNING transition, the epoch increment, the expiry of stale
+ * proposals, and the audit row are ALL written inside one transaction with a
+ * CONDITIONAL state update (WHERE pause_state <> 'RUNNING'), so exactly one
+ * concurrent caller owns the transition. A losing caller sees transitioned =
+ * false, does not increment the epoch a second time, and still records its own
+ * audit row -- every invocation is audited, only one resets. Any failure rolls
+ * the whole sequence back rather than leaving a half-applied reset without its
+ * audit row.
+ */
 export async function resetTaskmaster(data: { actor: string; reason: string | null }): Promise<{
   control: TmControlState;
   expiredProposals: number;
   audit: TmJournalEntry;
+  transitioned: boolean;
 }> {
-  const previous = await getPauseState();
-  const expiredProposals = await expireParkedActions();
-  const transitioned = previous.pause_state !== 'RUNNING';
-  const control = await setPauseState({
-    pause_state: 'RUNNING',
-    pause_scope: null,
-    pause_reason: null,
-    pause_actor: data.actor,
-    incrementEpoch: transitioned,
+  await getPauseState(); // ensure the singleton exists before the transaction
+  const db = getDatabase();
+  return db.withTransaction(async query => {
+    const before = await query<TmControlRow>('SELECT * FROM tm_control WHERE id = 1');
+    const previous = before.rows[0];
+    if (!previous) throw new Error('tm_control singleton missing during reset');
+    const previousEpoch = Number(previous.epoch);
+
+    // Conditional transition: only the caller whose UPDATE actually matches a
+    // non-RUNNING row wins, so the epoch can never be incremented twice.
+    const transition = await query(
+      `UPDATE tm_control
+       SET pause_state = 'RUNNING',
+           pause_scope = NULL,
+           pause_reason = NULL,
+           pause_actor = $1,
+           epoch = epoch + 1,
+           updated_at = $2
+       WHERE id = 1 AND pause_state <> 'RUNNING'`,
+      [data.actor, new Date().toISOString()]
+    );
+    const transitioned = transition.rowCount > 0;
+
+    // Stale proposals are expired only by the winner; a loser has nothing to
+    // expire because the winner already did it in this same serialized window.
+    let expiredProposals = 0;
+    if (transitioned) {
+      const pending = await query<{ id: string }>(
+        "SELECT id FROM tm_journal WHERE outcome IN ('parked', 'pending')"
+      );
+      if (pending.rows.length > 0) {
+        await query(
+          "UPDATE tm_journal SET outcome = 'expired' WHERE outcome IN ('parked', 'pending')"
+        );
+        expiredProposals = pending.rows.length;
+      }
+    }
+
+    const after = await query<TmControlRow>('SELECT * FROM tm_control WHERE id = 1');
+    const currentRow = after.rows[0];
+    if (!currentRow) throw new Error('tm_control singleton missing after reset');
+    const control = normalizeControl(currentRow);
+
+    const auditResult = await query<TmJournalRow>(
+      `INSERT INTO tm_journal
+       (id, created_at, thread_ref, action_type, proposal_json, outcome)
+       VALUES ($1, $2, 'taskmaster:reset', 'digest', $3, 'sent')
+       RETURNING *`,
+      [
+        randomUUID(),
+        new Date().toISOString(),
+        JSON.stringify({
+          audit_type: 'taskmaster_reset',
+          actor: data.actor,
+          reason: data.reason,
+          previous_epoch: previousEpoch,
+          new_epoch: control.epoch,
+          transitioned,
+        }),
+      ]
+    );
+    const auditRow = auditResult.rows[0];
+    if (!auditRow) throw new Error('Failed to record taskmaster reset audit');
+
+    log.info(
+      { pauseState: control.pause_state, epoch: control.epoch, actor: data.actor, transitioned },
+      'taskmaster.reset'
+    );
+    return { control, expiredProposals, audit: normalizeJournal(auditRow), transitioned };
   });
-  const audit = await recordResetAudit({
-    actor: data.actor,
-    reason: data.reason,
-    previousEpoch: previous.epoch,
-    newEpoch: control.epoch,
-    transitioned,
-  });
-  return { control, expiredProposals, audit };
 }
 
 /** Read one logical action by stable idempotency key without a time window. */

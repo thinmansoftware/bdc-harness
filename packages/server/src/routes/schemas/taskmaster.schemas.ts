@@ -45,6 +45,8 @@ export const taskmasterControlResponseSchema = z
     epoch: z.number(),
     expired_proposals: z.number().optional(),
     audit_id: z.string().optional(),
+    /** False when a concurrent reset already owned the PAUSED -> RUNNING transition. */
+    transitioned: z.boolean().optional(),
   })
   .openapi('TaskmasterControlResponse');
 
