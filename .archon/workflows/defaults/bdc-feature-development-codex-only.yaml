@@ -1109,10 +1109,12 @@ nodes:
         esac
       }
       # rst_command_looks_runnable <cmd>   (rc 0 when the line names a known test runner
-      #   and is not a dependency-install step)
+      #   FOLLOWED BY AN ARGUMENT -- a bare "node" or "bun" mentioned in prose is not a
+      #   command (live false positive, run f4dabd76) -- and is not a dependency-install
+      #   step)
       rst_command_looks_runnable() {
         case "$1" in *'{{'*) return 1 ;; esac
-        printf '%s\n' "$1" | grep -qE '(^|[ /&|;(])(node|bun|bunx|npm|npm\.cmd|npx|pnpm|yarn|vitest|jest|mocha|pytest|python3?|go|cargo|bash|sh|make|deno|dotnet|mvn|gradle|tap)([ ]|$)' || return 1
+        printf '%s\n' "$1" | grep -qE '(^|[ /&|;(])(node|bun|bunx|npm|npm\.cmd|npx|pnpm|yarn|vitest|jest|mocha|pytest|python3?|go|cargo|bash|sh|make|deno|dotnet|mvn|gradle|tap)[ ]+[^ &|;)]' || return 1
         if printf '%s\n' "$1" | grep -qE '(^|[ &;|])(npm|npm\.cmd|pnpm|yarn|bun)[ ]+(ci|install|i|add)([ ]|$)'; then
           return 1
         fi
@@ -1330,28 +1332,47 @@ nodes:
       done <<EOF_CMDS
       $(printf '%s\n' "$SPEC" | rst_extract_commands)
       EOF_CMDS
-      if [ -s "$CMDS" ]; then
-        SOURCE="spec_declared"
-      else
-        RUN_START_SHA="$(cat "${ARTIFACTS_DIR:-.}/run-start-sha.txt" 2>/dev/null || true)"
-        if [ -n "$RUN_START_SHA" ] && git rev-parse --verify -q "$RUN_START_SHA" >/dev/null 2>&1; then
-          rst_tests_in_diff "$RUN_START_SHA" > "$CMDS"
-          [ -s "$CMDS" ] && SOURCE="tests_in_diff"
-        fi
-        if [ ! -s "$CMDS" ]; then
-          rst_repo_test_script > "$CMDS"
-          [ -s "$CMDS" ] && SOURCE="repo_test_script"
-        fi
-      fi
+      [ -s "$CMDS" ] && SOURCE="spec_declared"
       EXIT_CODE=0
       COUNTS=""
       CMD_JOINED=""
-      if [ -s "$CMDS" ] && [ "$CLASS" != "DOCUMENTATION" ] && [ "$CLASS" != "OPERATOR" ]; then
+      # rst_try <source-label>: run whatever is in $CMDS; rc 0 when counts were parsed.
+      rst_try() {
+        [ -s "$CMDS" ] || return 1
         CMD_JOINED="$(grep -v '^$' "$CMDS" | paste -sd ';' - | sed 's/;/; /g')"
         RESULT="$(rst_run_commands "$CMDS" "$LOG")"
         EXIT_CODE="${RESULT%% *}"
         COUNTS="${RESULT#* }"
         COUNTS="$(printf '%s' "$COUNTS" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+        SOURCE="$1"
+        [ -n "$COUNTS" ]
+      }
+      if [ "$CLASS" != "DOCUMENTATION" ] && [ "$CLASS" != "OPERATOR" ]; then
+        # Ladder: spec-declared -> test files in this run's diff -> the repo's own test
+        # script. A rung whose command(s) produced no parseable counts (a prose mention
+        # that looked like a command, a runner that printed nothing) falls through to
+        # the next rung; the earlier attempt stays in the log and in TESTS_SOURCE.
+        TRIED=""
+        if ! rst_try "spec_declared"; then
+          [ -s "$CMDS" ] && TRIED="spec_declared command(s) gave no parseable counts: $CMD_JOINED"
+          : > "$CMDS"
+          RUN_START_SHA="$(cat "${ARTIFACTS_DIR:-.}/run-start-sha.txt" 2>/dev/null || true)"
+          if [ -n "$RUN_START_SHA" ] && git rev-parse --verify -q "$RUN_START_SHA" >/dev/null 2>&1; then
+            rst_tests_in_diff "$RUN_START_SHA" > "$CMDS"
+          fi
+          if ! rst_try "tests_in_diff"; then
+            [ -s "$CMDS" ] && TRIED="${TRIED:+$TRIED; }tests_in_diff command(s) gave no parseable counts: $CMD_JOINED"
+            : > "$CMDS"
+            rst_repo_test_script > "$CMDS"
+            rst_try "repo_test_script" || true
+          fi
+        fi
+        if [ -z "$COUNTS" ] && [ -z "$CMD_JOINED" ] && [ -n "$TRIED" ]; then
+          # every rung was empty after the first; keep the first attempt's command so
+          # the N/A line names what was actually run
+          CMD_JOINED="${TRIED##*: }"
+        fi
+        [ -n "$TRIED" ] && SOURCE="$SOURCE (after: $TRIED)"
       fi
       echo "TESTS_CLASS=$CLASS"
       echo "TESTS_SOURCE=$SOURCE"
