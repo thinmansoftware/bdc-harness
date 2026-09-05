@@ -347,6 +347,8 @@ export async function createWorkflowRun(data: {
   metadata?: Record<string, unknown>;
   working_path?: string;
   parent_conversation_id?: string;
+  /** Deterministic per-fire dispatch token for race-free run discovery. */
+  dispatch_token?: string;
 }): Promise<WorkflowRun> {
   // Serialize metadata with validation to catch circular references early
   let metadataJson: string;
@@ -381,8 +383,8 @@ export async function createWorkflowRun(data: {
   try {
     const result = await pool.query<WorkflowRun>(
       `INSERT INTO remote_agent_workflow_runs
-       (workflow_name, conversation_id, codebase_id, user_message, metadata, working_path, parent_conversation_id)
-       VALUES ($1, $2, $3, $4, $5, $6, $7)
+       (workflow_name, conversation_id, codebase_id, user_message, metadata, working_path, parent_conversation_id, dispatch_token)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
        RETURNING *`,
       [
         data.workflow_name,
@@ -392,6 +394,7 @@ export async function createWorkflowRun(data: {
         metadataJson,
         data.working_path ?? null,
         data.parent_conversation_id ?? null,
+        data.dispatch_token ?? null,
       ]
     );
     const row = result.rows[0];
@@ -1803,6 +1806,33 @@ export async function getWorkflowRunByWorkerPlatformId(
     const err = error as Error;
     getLog().error({ err }, 'db.workflow_run_get_by_worker_platform_id_failed');
     throw new Error(`Failed to get workflow run by worker platform ID: ${err.message}`);
+  }
+}
+
+/**
+ * Find the workflow run created by a specific cascade fire, keyed on its
+ * deterministic dispatch token. This is the race-free replacement for the
+ * parent-conversation-id + timing scan: a token uniquely identifies one fire's
+ * run, so concurrent co-fires can never cross-link. Returns the most recent
+ * match (tokens are unique in practice; ORDER BY guards against any accidental
+ * reuse across refires).
+ */
+export async function getWorkflowRunByDispatchToken(
+  dispatchToken: string
+): Promise<WorkflowRun | null> {
+  try {
+    const result = await pool.query<WorkflowRun>(
+      `SELECT r.* FROM remote_agent_workflow_runs r
+       WHERE r.dispatch_token = $1
+       ORDER BY r.started_at DESC LIMIT 1`,
+      [dispatchToken]
+    );
+    const row = result.rows[0];
+    return row ? normalizeWorkflowRun(row) : null;
+  } catch (error) {
+    const err = error as Error;
+    getLog().error({ err }, 'db.workflow_run_get_by_dispatch_token_failed');
+    throw new Error(`Failed to get workflow run by dispatch token: ${err.message}`);
   }
 }
 

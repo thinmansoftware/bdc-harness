@@ -92,6 +92,8 @@ export interface IWorkflowStore {
     metadata?: Record<string, unknown>;
     working_path?: string;
     parent_conversation_id?: string;
+    /** Deterministic per-fire dispatch token for race-free run discovery. */
+    dispatch_token?: string;
   }): Promise<WorkflowRun>;
   getWorkflowRun(id: string): Promise<WorkflowRun | null>;
   /**

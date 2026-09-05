@@ -729,14 +729,21 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
         }
       }
 
-      // Fire the WO on this tier
+      // Fire the WO on this tier. The per-attempt sourceEventId is the
+      // deterministic dispatch token: it is unique per fire (distinct from the
+      // per-cascade cascadeId, which would collide across tier climbs), rides
+      // through the fire message as --dispatch-token, is persisted server-side
+      // as the run row's dispatch_token column, and is queried back directly
+      // during discovery -- so concurrent co-fires can never cross-link runs.
+      const dispatchToken = attempt.sourceEventId;
       const fireResult: FireResult = await fireImpl({
         workflowName: tier.workflowName,
         woId,
         project,
-        message: buildFireMessage(woId, project, priorContext ?? undefined),
+        message: buildFireMessage(woId, project, priorContext ?? undefined, dispatchToken),
         apiBaseUrl,
         token,
+        dispatchToken,
       });
       attempt.runId = fireResult.runId;
 

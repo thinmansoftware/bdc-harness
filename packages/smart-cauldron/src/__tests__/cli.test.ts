@@ -75,6 +75,18 @@ describe('statusToExitCode', () => {
     expect(code).not.toBe(statusToExitCode('running'));
   });
 
+  // Test 3 (CLI-side): an unknown/unroutable workflow drives the cascade to
+  // infra-alert (fireTier returns ok:false when dispatched != true), and the
+  // CLI must surface that as a non-zero exit -- never a silent success. This
+  // pins the loud-failure contract (task_ac4d1148 class) at the exit-code
+  // boundary; the fire-side assertion lives in fire.test.ts.
+  test('unknown-workflow infra-alert surfaces a non-zero CLI exit code', () => {
+    const code = statusToExitCode('infra-alert');
+    expect(Number.isInteger(code)).toBe(true);
+    expect(code).not.toBe(0);
+    expect(code).not.toBe(statusToExitCode('won'));
+  });
+
   test('every CascadeStatus maps to an integer exit code', () => {
     const statuses: CascadeStatus[] = [
       'planned',

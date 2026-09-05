@@ -266,6 +266,11 @@ export const workflowRunByWorkerResponseSchema = z
   .object({ run: workflowRunSchema })
   .openapi('WorkflowRunByWorkerResponse');
 
+/** GET /api/workflows/runs/by-dispatch-token/:token response. */
+export const workflowRunByDispatchTokenResponseSchema = z
+  .object({ run: workflowRunSchema })
+  .openapi('WorkflowRunByDispatchTokenResponse');
+
 /** POST /api/workflows/runs/:runId/cancel request body. */
 export const cancelWorkflowRunBodySchema = z
   .object({ reason: z.string().optional() })

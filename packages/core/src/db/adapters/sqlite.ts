@@ -267,6 +267,12 @@ export class SqliteAdapter implements IDatabase {
     // per the established pattern.
     this.db.run('CREATE INDEX IF NOT EXISTS idx_tm_adoption_snapshot ON tm_adoption(snapshot_id)');
     this.db.run('CREATE INDEX IF NOT EXISTS idx_tm_adoption_thread ON tm_adoption(thread_ref)');
+    // Dispatch-token lookup index (migration 044) -- after migrateColumns() so the
+    // ALTER TABLE ADD COLUMN dispatch_token has run on pre-existing databases
+    // before we index it (mirrors the taskmaster indexes above).
+    this.db.run(
+      'CREATE INDEX IF NOT EXISTS idx_workflow_runs_dispatch_token ON remote_agent_workflow_runs(dispatch_token)'
+    );
   }
 
   /**
@@ -356,6 +362,10 @@ export class SqliteAdapter implements IDatabase {
 
       if (!wfColNames.has('archive_reason')) {
         this.db.run('ALTER TABLE remote_agent_workflow_runs ADD COLUMN archive_reason TEXT');
+      }
+
+      if (!wfColNames.has('dispatch_token')) {
+        this.db.run('ALTER TABLE remote_agent_workflow_runs ADD COLUMN dispatch_token TEXT');
       }
     } catch (e: unknown) {
       getLog().warn({ err: e as Error }, 'db.sqlite_migration_workflow_runs_columns_failed');
@@ -842,7 +852,8 @@ export class SqliteAdapter implements IDatabase {
         working_path TEXT,
         archived_at TEXT,
         archived_by TEXT,
-        archive_reason TEXT
+        archive_reason TEXT,
+        dispatch_token TEXT
       );
 
       -- Workflow events table
