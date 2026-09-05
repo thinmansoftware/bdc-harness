@@ -1054,40 +1054,108 @@ nodes:
           *) printf 'CODE' ;;
         esac
       }
-      # rst_extract_command   (spec on stdin -> the declared test command, or empty)
-      #   Primary: the first "Stop N (test suite|tests|unit tests|suite ...)" header; the
-      #   command is the following non-empty, non-fence line(s) up to "Expected:" (a
-      #   trailing backslash joins continuation lines). Fallback: the Section 9
-      #   "Tests: <n>/<n> (<command>)" line's first parenthesised group. Template
-      #   placeholders ({{...}}) are rejected.
-      rst_extract_command() {
-        local spec cmd
-        spec="$(cat)"
-        cmd="$(printf '%s\n' "$spec" | awk '
+      # rst_command_looks_runnable <cmd>   (rc 0 when the line names a known test runner
+      #   and is not a dependency-install step)
+      rst_command_looks_runnable() {
+        case "$1" in *'{{'*) return 1 ;; esac
+        printf '%s\n' "$1" | grep -qE '(^|[ /&|;(])(node|bun|bunx|npm|npm\.cmd|npx|pnpm|yarn|vitest|jest|mocha|pytest|python3?|go|cargo|bash|sh|make|deno|dotnet|mvn|gradle|tap)([ ]|$)' || return 1
+        if printf '%s\n' "$1" | grep -qE '(^|[ &;|])(npm|npm\.cmd|pnpm|yarn|bun)[ ]+(ci|install|i|add)([ ]|$)'; then
+          return 1
+        fi
+        return 0
+      }
+      # rst_extract_commands   (spec on stdin -> one declared test command per line, deduped,
+      #   first 8). Ladder, in document order:
+      #     A. the template "Stop N (test suite|tests|unit tests|suite ...)" block(s): the
+      #        command line(s) up to "Expected:" (backslash joins continuation lines)
+      #     B. any backticked runner command inside a "Stop conditions" / "Stop Point" /
+      #        "Test scenarios" / "Verification" section, or on any "When:" line
+      #     C. the Section 9 "Tests: <n>/<n> (<command>)" parenthesised group(s)
+      #   Callers filter with rst_command_looks_runnable (drops prose, placeholders,
+      #   install steps).
+      rst_extract_commands() {
+        awk -v RUNNER='(^|[ /&|;(])(node|bun|bunx|npm|npm[.]cmd|npx|pnpm|yarn|vitest|jest|mocha|pytest|python3?|go|cargo|bash|sh|make|deno|dotnet|mvn|gradle|tap)( |$)' '
           function clean(s) { sub(/^[ \t]+/, "", s); sub(/[ \t]+$/, "", s); gsub(/`/, "", s); sub(/^\$ /, "", s); return s }
-          state == 1 {
+          function emit(c) { c = clean(c); if (c != "" && !(c in seen)) { seen[c] = 1; print c } }
+          tstate == 1 {
             if ($0 ~ /^[ \t]*```/) next
             line = clean($0)
             if (line == "") next
-            if (line ~ /^[Ee]xpected:/) { state = 2; next }
-            if (line ~ /^[*]*[Ss]top [0-9A-Za-z.]+/) { state = 2; next }
-            cmd = (cmd == "" ? line : cmd " " line)
-            if (line !~ /\\$/) { state = 2; next }
-            sub(/[ \t]*\\$/, "", cmd)
-            next
+            if (line ~ /^[Ee]xpected:/) { if (tcmd != "") emit(tcmd); tcmd = ""; tstate = 0; next }
+            if (line ~ /^[*]*[Ss]top [0-9A-Za-z.]+/) { if (tcmd != "") emit(tcmd); tcmd = ""; tstate = 0 }
+            else { tcmd = (tcmd == "" ? line : tcmd " " line); sub(/[ \t]*\\$/, "", tcmd); next }
           }
-          state == 0 && /^[ \t]*[*]*[Ss]top [0-9A-Za-z.]+[ \t]*\(([Tt]est|[Uu]nit|[Ss]uite)/ { state = 1; next }
-          END { print cmd }
-        ')"
-        if [ -z "$cmd" ]; then
-          cmd="$(printf '%s\n' "$spec" | grep -m1 -E '^[[:space:]]*Tests:[[:space:]]*[^(]*\(' | sed -E 's/^[[:space:]]*Tests:[[:space:]]*[^(]*\(([^)]*)\).*$/\1/' || true)"
-        fi
-        case "$cmd" in *'{{'*) cmd="" ;; esac
-        printf '%s' "$cmd"
+          tstate == 0 && /^[ \t]*[*]*[Ss]top [0-9A-Za-z.]+[ \t]*\(([Tt]est|[Uu]nit|[Ss]uite)/ { tstate = 1; tcmd = ""; next }
+          /^#+ / { insec = ($0 ~ /[Ss]top [Cc]ondition|[Ss]top [Pp]oint|[Tt]est [Ss]cenario|[Tt]est [Pp]lan|[Vv]erification/) ? 1 : 0 }
+          insec || $0 ~ /^[ \t]*-?[ \t]*[*]*[Ww]hen[*]*:/ {
+            s = $0
+            while (match(s, /`[^`]+`/)) {
+              g = substr(s, RSTART + 1, RLENGTH - 2); s = substr(s, RSTART + RLENGTH)
+              if (g ~ RUNNER) emit(g)
+            }
+          }
+          /^[ \t]*Tests:[ \t]/ {
+            s = $0
+            while (match(s, /\([^)]*\)/)) {
+              g = substr(s, RSTART + 1, RLENGTH - 2); s = substr(s, RSTART + RLENGTH)
+              if (g ~ RUNNER) emit(g)
+            }
+          }
+          END { if (tstate == 1 && tcmd != "") emit(tcmd) }
+        ' | head -n 8
       }
-      # rst_command_looks_runnable <cmd>   (rc 0 when the line names a known test runner)
-      rst_command_looks_runnable() {
-        printf '%s\n' "$1" | grep -qE '(^|[ /&|;(])(node|bun|bunx|npm|npm\.cmd|npx|pnpm|yarn|vitest|jest|mocha|pytest|python3?|go|cargo|bash|sh|make|deno|dotnet|mvn|gradle|tap)([ ]|$)'
+      # rst_rescue_subdir <cmd>   (-> cmd, or "cd <dir> && <cmd>" when the command's first
+      #   relative path does not exist at the worktree root but exists in exactly one
+      #   depth-1 directory -- shopops specs write "node tests/x.js" meaning shopops-api/)
+      rst_rescue_subdir() {
+        local cmd="$1" tok p="" d hit="" n=0
+        case "$cmd" in cd\ *|*'&& cd '*) printf '%s' "$cmd"; return 0 ;; esac
+        for tok in $cmd; do
+          case "$tok" in
+            -*|*://*|*'='*) continue ;;
+            */*) p="${tok#./}"; break ;;
+          esac
+        done
+        if [ -z "$p" ] || [ -e "$p" ]; then printf '%s' "$cmd"; return 0; fi
+        for d in */; do
+          d="${d%/}"
+          case "$d" in node_modules|.git|dist|build) continue ;; esac
+          if [ -e "$d/$p" ]; then hit="$d"; n=$((n + 1)); fi
+        done
+        if [ "$n" -eq 1 ]; then printf 'cd %s && %s' "$hit" "$cmd"; else printf '%s' "$cmd"; fi
+      }
+      # rst_tests_in_diff <base-sha>   (-> one test command per line derived from the test
+      #   files this run created or modified since <base-sha>, plus untracked test files;
+      #   empty when the diff touched no test files). Runner choice: *.test.* / *.spec.* /
+      #   __tests__/ -> vitest if the root package.json declares vitest, jest if jest, else
+      #   bun test; <dir>/tests/test_*.js -> "cd <dir> && node tests/<file>"; *.py -> pytest.
+      #   Fixtures, helpers, run_all.js, snapshots and data files are excluded.
+      rst_tests_in_diff() {
+        local base="$1" files f js_runner="" bun_files="" py_files=""
+        files="$( { git diff --name-only "$base" -- 2>/dev/null; git ls-files --others --exclude-standard 2>/dev/null; } | sort -u \
+          | grep -E '(^|/)(tests?|__tests__|spec)/|\.(test|spec)\.[cm]?[jt]sx?$|(^|/)test_[^/]*\.(js|mjs|cjs|py)$' \
+          | grep -vE '(^|/)(fixtures?|helpers?|__snapshots__|__mocks__|setup)/|(^|/)(run_all|_[^/]*|setup[^/]*|conftest)\.[a-z]+$|\.(json|md|txt|csv|snap|sql|yaml|yml|html)$' || true)"
+        [ -n "$files" ] || return 0
+        if [ -f package.json ]; then
+          if grep -q '"vitest"' package.json; then js_runner="npx vitest run"
+          elif grep -q '"jest"' package.json; then js_runner="npx jest"
+          fi
+        fi
+        [ -n "$js_runner" ] || js_runner="bun test"
+        while IFS= read -r f; do
+          [ -z "$f" ] && continue
+          [ -e "$f" ] || continue
+          case "$f" in
+            *.py) py_files="${py_files:+$py_files }$f" ;;
+            *.test.*|*.spec.*|*__tests__/*) bun_files="${bun_files:+$bun_files }$f" ;;
+            */tests/test_*.js|*/tests/test_*.mjs|*/tests/test_*.cjs) printf 'cd %s && node tests/%s\n' "${f%%/tests/*}" "${f##*/tests/}" ;;
+            tests/test_*.js|tests/test_*.mjs|tests/test_*.cjs) printf 'node %s\n' "$f" ;;
+            *) ;;
+          esac
+        done <<<"$files"
+        [ -n "$bun_files" ] && printf '%s %s\n' "$js_runner" "$bun_files"
+        [ -n "$py_files" ] && printf 'pytest %s\n' "$py_files"
+        return 0
       }
       # rst_parse_counts   (test-runner output on stdin -> "<passed> <total>", or empty)
       #   Sums every recognised summary line (a chained "a && b && c" command prints
@@ -1126,16 +1194,38 @@ nodes:
         fi
         printf '%s' "$counts"
       }
+      # rst_run_commands <commands-file> <log>   (runs each command line in the CWD under a
+      #   1500 s budget, appends every command's output to <log> under a "### run-stop-tests:"
+      #   header, and prints "<exit> <passed> <total>" -- exit is the first nonzero exit,
+      #   counts are summed across commands; "<exit>  " (empty counts) when nothing parsed)
+      rst_run_commands() {
+        local cmds="$1" log="$2" cmd seg rc exit_code=0 p=0 t=0 hit=0 c
+        seg="$(mktemp)"
+        while IFS= read -r cmd; do
+          [ -z "$cmd" ] && continue
+          printf '### run-stop-tests: %s\n' "$cmd" >> "$log"
+          timeout 1500 bash -o pipefail -c "$cmd" > "$seg" 2>&1 < /dev/null
+          rc=$?
+          cat "$seg" >> "$log"
+          printf '### exit %s\n' "$rc" >> "$log"
+          [ "$rc" -ne 0 ] && [ "$exit_code" -eq 0 ] && exit_code="$rc"
+          c="$(rst_parse_counts < "$seg")"
+          if [ -n "$c" ]; then p=$((p + ${c%% *})); t=$((t + ${c##* })); hit=1; fi
+        done < "$cmds"
+        rm -f "$seg"
+        if [ "$hit" -eq 1 ]; then printf '%s %s %s' "$exit_code" "$p" "$t"; else printf '%s  ' "$exit_code"; fi
+      }
       # rst_report <class> <cmd> <exit> <counts>   (-> TESTS_STATUS / TESTS_LINE lines)
       #   Status law: passed only when the command exited 0 AND passed == total > 0.
       #   Any nonzero exit, any failing test, or 0 tests ran is "failed". Unparseable
       #   output is "counts_unparsed" (fail-closed downstream on CODE/MIXED). A CODE or
-      #   MIXED spec with no runnable test command is "no_command_declared" (spec defect).
+      #   MIXED spec with no runnable test command AND no test files in the diff is
+      #   "no_command_declared" (spec + build defect).
       rst_report() {
         local class="$1" cmd="$2" exit_code="$3" counts="$4" status line p t
         if [ -z "$cmd" ]; then
           case "$class" in
-            CODE|MIXED) status="no_command_declared"; line="N/A ($class spec declares no executable test command -- spec defect, Rule 10)" ;;
+            CODE|MIXED) status="no_command_declared"; line="N/A ($class spec declares no executable test command and the diff touched no test files -- Rule 10 defect)" ;;
             *) status="not_required"; line="N/A ($class class, no test command declared)" ;;
           esac
         elif [ -z "$counts" ]; then
@@ -1160,36 +1250,52 @@ nodes:
       BDC_NODE_OUTPUT_READ_SPEC
       )
       CLASS="$(printf '%s\n' "$SPEC" | rst_class)"
-      CMD="$(printf '%s\n' "$SPEC" | rst_extract_command)"
-      if [ -n "$CMD" ] && ! rst_command_looks_runnable "$CMD"; then
-        echo "run-stop-tests: declared test line is not a runnable command, ignoring: $CMD" >&2
-        CMD=""
-      fi
       EVIDENCE_DIR="${ARTIFACTS_DIR:-.}/evidence"
       mkdir -p "$EVIDENCE_DIR" 2>/dev/null || true
       LOG="$EVIDENCE_DIR/stop-tests.log"
+      CMDS="$EVIDENCE_DIR/stop-tests.commands"
+      : > "$LOG"; : > "$CMDS"
+      SOURCE="none"
+      while IFS= read -r c; do
+        [ -z "$c" ] && continue
+        if rst_command_looks_runnable "$c"; then
+          rst_rescue_subdir "$c" >> "$CMDS"; printf '\n' >> "$CMDS"
+        else
+          echo "run-stop-tests: declared line is not a runnable test command, ignoring: $c" >&2
+        fi
+      done <<EOF_CMDS
+      $(printf '%s\n' "$SPEC" | rst_extract_commands)
+      EOF_CMDS
+      if [ -s "$CMDS" ]; then
+        SOURCE="spec_declared"
+      else
+        RUN_START_SHA="$(cat "${ARTIFACTS_DIR:-.}/run-start-sha.txt" 2>/dev/null || true)"
+        if [ -n "$RUN_START_SHA" ] && git rev-parse --verify -q "$RUN_START_SHA" >/dev/null 2>&1; then
+          rst_tests_in_diff "$RUN_START_SHA" > "$CMDS"
+          [ -s "$CMDS" ] && SOURCE="tests_in_diff"
+        fi
+      fi
       EXIT_CODE=0
       COUNTS=""
-      if [ -n "$CMD" ] && [ "$CLASS" != "DOCUMENTATION" ] && [ "$CLASS" != "OPERATOR" ]; then
-        # 1500s command budget inside the 1800s node timeout so a hung suite still
-        # reports (exit 124) instead of the node dying with no output.
-        timeout 1500 bash -o pipefail -c "$CMD" > "$LOG" 2>&1
-        EXIT_CODE=$?
-        COUNTS="$(rst_parse_counts < "$LOG")"
-      elif [ -n "$CMD" ]; then
-        # DOCUMENTATION / OPERATOR class: a declared command is informational only.
-        CMD=""
+      CMD_JOINED=""
+      if [ -s "$CMDS" ] && [ "$CLASS" != "DOCUMENTATION" ] && [ "$CLASS" != "OPERATOR" ]; then
+        CMD_JOINED="$(grep -v '^$' "$CMDS" | paste -sd ';' - | sed 's/;/; /g')"
+        RESULT="$(rst_run_commands "$CMDS" "$LOG")"
+        EXIT_CODE="${RESULT%% *}"
+        COUNTS="${RESULT#* }"
+        COUNTS="$(printf '%s' "$COUNTS" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
       fi
       echo "TESTS_CLASS=$CLASS"
-      echo "TESTS_COMMAND=${CMD:-(none)}"
+      echo "TESTS_SOURCE=$SOURCE"
+      echo "TESTS_COMMAND=${CMD_JOINED:-(none)}"
       echo "TESTS_EXIT=$EXIT_CODE"
       echo "TESTS_PASSED=${COUNTS%% *}"
       echo "TESTS_TOTAL=${COUNTS##* }"
-      rst_report "$CLASS" "$CMD" "$EXIT_CODE" "$COUNTS"
+      rst_report "$CLASS" "$CMD_JOINED" "$EXIT_CODE" "$COUNTS"
       echo "TESTS_LOG=$LOG"
       if [ -s "$LOG" ]; then
-        echo "--- last 60 lines of test output ---"
-        tail -n 60 "$LOG"
+        echo "--- last 80 lines of test output ---"
+        tail -n 80 "$LOG"
       fi
       exit 0
 
@@ -1216,24 +1322,33 @@ nodes:
       # ---- BEGIN rsg core (byte-identical across lanes; extracted by unit test) ----
       # POSIX awk only (mawk in the container).
       # rsg_extract   (spec on stdin -> one "<command>\t<op>\t<n>" line per grep stop)
-      #   op is eq (default), ge ("at least", ">=", "or more"), le ("at most", "<=").
-      #   "no output" / "none" / "empty" mean eq 0. A block without a parseable
-      #   Expected: line is skipped (counted in GREP_DECLARED, not executed).
+      #   Two shapes: (A) the template "Stop N (grep assertion ...)" header, command
+      #   line, "Expected: ..." line; (B) inside a "Stop conditions" section, a line
+      #   carrying a backticked read-only command (grep/rg/find/wc/test/cat/head/tail,
+      #   optional LC_ALL=C prefix) followed by its expectation in prose ("returns 2 or
+      #   greater", "=> 1", "returns nothing"). op is eq (default), ge ("at least", ">=",
+      #   "or more", "or greater"), le ("at most", "<="). "no output" / "nothing" /
+      #   "none" / "empty" mean eq 0. A declared assertion without a parseable
+      #   expectation is counted in GREP_DECLARED but not executed.
       rsg_extract() {
         awk '
           function clean(s) { sub(/^[ \t]+/, "", s); sub(/[ \t]+$/, "", s); gsub(/`/, "", s); sub(/^\$ /, "", s); return s }
+          function expect(ex,   low, op, n) {
+            low = tolower(ex); op = "eq"; n = ""
+            if (low ~ /at least|>=|or more|or greater|minimum|no fewer/) op = "ge"
+            else if (low ~ /at most|<=|or fewer|or less|maximum|no more/) op = "le"
+            if (low ~ /no output|nothing|none|empty|no match/) n = "0"
+            else if (match(ex, /[0-9]+/)) n = substr(ex, RSTART, RLENGTH)
+            if (n == "") return ""
+            return op "\t" n
+          }
           state == 1 {
             if ($0 ~ /^[ \t]*```/) next
             line = clean($0)
             if (line == "") next
             if (line ~ /^[Ee]xpected:/) {
-              ex = line; sub(/^[Ee]xpected:[ \t]*/, "", ex); low = tolower(ex)
-              op = "eq"; n = ""
-              if (low ~ /at least|>=|or more|minimum|no fewer/) op = "ge"
-              else if (low ~ /at most|<=|or fewer|maximum|no more/) op = "le"
-              if (low ~ /no output|none|empty|nothing/) n = "0"
-              else if (match(ex, /[0-9]+/)) n = substr(ex, RSTART, RLENGTH)
-              if (cmd != "" && n != "") print cmd "\t" op "\t" n
+              ex = line; sub(/^[Ee]xpected:[ \t]*/, "", ex); e = expect(ex)
+              if (cmd != "" && e != "") print cmd "\t" e
               state = 0; cmd = ""; next
             }
             if (line ~ /^[*]*[Ss]top [0-9A-Za-z.]+/) { state = 0; cmd = "" }
@@ -1244,6 +1359,16 @@ nodes:
             }
           }
           /^[ \t]*[*]*[Ss]top [0-9A-Za-z.]+[ \t]*\(([Gg]rep|[Aa]ssert)/ { state = 1; cmd = ""; declared++; next }
+          /^#+ / { insec = ($0 ~ /[Ss]top [Cc]ondition/) ? 1 : 0; next }
+          insec && /`(LC_ALL=C |LANG=C )?(grep|egrep|fgrep|rg|find|wc|test|cat|head|tail)( |`)/ {
+            s = $0
+            if (match(s, /`(LC_ALL=C |LANG=C )?(grep|egrep|fgrep|rg|find|wc|test|cat|head|tail)[^`]*`/)) {
+              g = substr(s, RSTART + 1, RLENGTH - 2); rest = substr(s, RSTART + RLENGTH)
+              declared++
+              e = expect(rest)
+              if (e != "") print g "\t" e
+            }
+          }
           END { print "DECLARED\t" (declared + 0) }
         '
       }
@@ -1271,7 +1396,7 @@ nodes:
       # rsg_observe <command>   (-> observed count, or "ERR" on a hard command failure)
       rsg_observe() {
         local raw rawtrim rc
-        raw="$(bash -c "$1" 2>/dev/null)"; rc=$?
+        raw="$(bash -c "$1" 2>/dev/null < /dev/null)"; rc=$?
         rawtrim="$(printf '%s' "$raw" | tr -d '[:space:]')"
         if printf '%s' "$rawtrim" | grep -qE '^[0-9]+$'; then
           printf '%s' "$rawtrim"

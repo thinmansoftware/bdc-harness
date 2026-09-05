@@ -179,6 +179,43 @@ assert_contains "LC_ALL prefixed command kept verbatim in GREP_LINE" 'GREP_LINE=
 cd "$HERE"
 rm -rf "$TMP"
 
+echo "--- rsg_extract: bullet-style Stop conditions section (real shape on bdc-xo main) ---"
+SPEC_GCD='# WO-SHOPOPS-GCD-METADATA-TO-LISTING-01
+
+WO Class: CODE
+
+## 9. Stop conditions (CI-executable)
+
+- `node tests/test_cover_resolver.js` exits 0 if that suite exists.
+- `grep -c "gcd" shopops-api/routes/store.js` returns 1 or greater.
+- `grep -c "skip_gcd_enrichment" shopops-api/services/coverResolver.js` returns
+  2 or greater (the guard survives the move).
+- `LC_ALL=C grep -n "[^ -~]" shopops-api/routes/store.js` returns nothing.
+- `rg -c "gcd" shopops-api/routes/store.js` => 3
+- `grep -c "x" y.js` (no expectation on this line)
+
+## 10. Manifest requirements
+
+- `grep -c "not in a stop section" z.js` returns 1
+'
+OUT="$(printf '%s\n' "$SPEC_GCD" | rsg_extract)"
+assert_contains "'returns 1 or greater' -> ge 1" "grep -c \"gcd\" shopops-api/routes/store.js${TAB}ge${TAB}1" "$OUT"
+assert_eq "wrapped expectation (number on the next line) is not emitted" "0" "$(printf '%s\n' "$OUT" | grep -c 'skip_gcd_enrichment' || true)"
+assert_contains "'returns nothing' -> eq 0 with LC_ALL prefix kept" "LC_ALL=C grep -n \"[^ -~]\" shopops-api/routes/store.js${TAB}eq${TAB}0" "$OUT"
+assert_contains "'=> 3' -> eq 3 (rg)" "rg -c \"gcd\" shopops-api/routes/store.js${TAB}eq${TAB}3" "$OUT"
+assert_eq "no-expectation bullet not emitted" "0" "$(printf '%s\n' "$OUT" | grep -c '"x" y.js' || true)"
+assert_eq "bullets outside a Stop conditions section ignored" "0" "$(printf '%s\n' "$OUT" | grep -c 'not in a stop section' || true)"
+assert_eq "runner commands are not grep assertions" "0" "$(printf '%s\n' "$OUT" | grep -c 'node tests' || true)"
+assert_contains "DECLARED counts every backticked read-only command in the section (5), not the runner" "DECLARED${TAB}5" "$OUT"
+
+echo "--- rsg_run on bullet-style spec in a fixture worktree ---"
+TMP2="$(mktemp -d)"
+mkdir -p "$TMP2/shopops-api/routes" "$TMP2/shopops-api/services"
+printf 'gcd\ngcd\ngcd\n' > "$TMP2/shopops-api/routes/store.js"
+printf 'skip_gcd_enrichment\nskip_gcd_enrichment\n' > "$TMP2/shopops-api/services/coverResolver.js"
+( cd "$TMP2" && OUT="$(printf '%s\n' "$SPEC_GCD" | rsg_extract | rsg_run)" && assert_contains "ge 1 holds with observed 3" 'OK: grep -c "gcd" shopops-api/routes/store.js => 3 (expected ge 1)' "$OUT" && assert_contains "ASCII absence holds" 'OK: LC_ALL=C grep -n "[^ -~]" shopops-api/routes/store.js => 0 (expected eq 0)' "$OUT" && assert_contains "GREP_STATUS=passed" "GREP_STATUS=passed" "$OUT" )
+rm -rf "$TMP2"
+
 echo
 echo "run-stop-greps.sh: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]
