@@ -143,7 +143,11 @@ export function validateProposal(proposal: ActionProposal): GuardResult {
     return { allowed: false, reason: 'body_empty: refusing to send an empty message.' };
   }
 
-  const match = SPEND_SEND_DEPLOY_RE.exec(normalized);
+  // Ignore balanced double-quoted spans such as WO titles when checking for
+  // forbidden verbs. An unclosed quote is left in the scan target so it cannot
+  // hide spend/send/deploy instructions in the remaining prose.
+  const scanTarget = normalized.replace(/"[^"]*"/g, ' ');
+  const match = SPEND_SEND_DEPLOY_RE.exec(scanTarget);
   if (match) {
     return {
       allowed: false,

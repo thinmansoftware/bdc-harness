@@ -133,4 +133,68 @@ describe('validateProposal', () => {
       expect(result.forbiddenEffect).toBeUndefined();
     }
   });
+
+  test('allows WIRE in a quoted WO title', () => {
+    const result = validateProposal(
+      proposal({
+        type: 'escalate_p0',
+        body:
+          'Unclaimed P0: "WO-SOCIAL-WIRE-ALL-META-PAGES-01" ' +
+          '(gh:thinmansoftware/bdc-harness#208) [P0] has no owner. Last movement 85 days ago.',
+      })
+    );
+
+    expect(result.allowed).toBe(true);
+  });
+
+  test('allows PAYMENT in a quoted WO title', () => {
+    const result = validateProposal(
+      proposal({
+        type: 'escalate_p0',
+        body:
+          'Unclaimed P0: "WO-CSOS-SLICE1-PAYMENT-PROVISIONING-01: ' +
+          'confirmed charge -> store_tenants -> hostname" ' +
+          '(gh:thinmansoftware/bdc-xo#1873) [P0] has no owner.',
+      })
+    );
+
+    expect(result.allowed).toBe(true);
+  });
+
+  test('still rejects an unquoted wire instruction', () => {
+    const result = validateProposal(
+      proposal({ type: 'escalate_p0', body: 'Please wire $500 to the vendor' })
+    );
+
+    expect(result.allowed).toBe(false);
+    expect(result.reason?.toLowerCase()).toContain('spend_send_deploy_verb_rejected');
+    expect(result.reason?.toLowerCase()).toContain("'wire'");
+  });
+
+  test('still rejects an unquoted deploy instruction', () => {
+    const result = validateProposal(
+      proposal({ type: 'escalate_p0', body: 'Deploy this to production now' })
+    );
+
+    expect(result.allowed).toBe(false);
+    expect(result.reason).toContain('spend_send_deploy_verb_rejected');
+  });
+
+  test('still rejects a forbidden verb after a quoted title', () => {
+    const result = validateProposal(
+      proposal({ type: 'escalate_p0', body: '"WO-FOO-01" -- send the invoice' })
+    );
+
+    expect(result.allowed).toBe(false);
+    expect(result.reason?.toLowerCase()).toContain("'send the invoice'");
+  });
+
+  test('does not hide a forbidden verb after an unclosed quote', () => {
+    const result = validateProposal(
+      proposal({ type: 'escalate_p0', body: '"WO-BAR-01 has no owner -- send the invoice' })
+    );
+
+    expect(result.allowed).toBe(false);
+    expect(result.reason?.toLowerCase()).toContain("'send the invoice'");
+  });
 });
