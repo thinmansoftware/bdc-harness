@@ -71,7 +71,7 @@ if [ -z "$RST_CORE" ]; then
   echo "FATAL: could not extract rst core from $CANONICAL_YAML"; exit 1
 fi
 eval "$RST_CORE"
-for fn in rst_class rst_extract_command rst_command_looks_runnable rst_parse_counts rst_report; do
+for fn in rst_class rst_extract_commands rst_command_looks_runnable rst_rescue_subdir rst_tests_in_diff rst_parse_counts rst_run_commands rst_report; do
   if ! declare -F "$fn" >/dev/null; then echo "FATAL: $fn not defined after eval"; exit 1; fi
 done
 
@@ -117,28 +117,28 @@ assert_eq "'Rung classification:' is not a class line" "CODE" "$(printf 'Rung cl
 echo "--- rst_extract_command ---"
 assert_eq "Stop 2 (test suite) command wins" \
   "cd shopops-api && node tests/test_cgc_dealer_api.js && node tests/run_all.js --suite=m157" \
-  "$(printf '%s\n' "$SPEC_M157" | rst_extract_command)"
+  "$(printf '%s\n' "$SPEC_M157" | rst_extract_commands | head -1)"
 assert_eq "grep stop with 'tests' in its label is not a test block" \
   "bun test packages/x" \
-  "$(printf 'Stop 1 (grep assertion, no secret in tests/fixtures):\n  grep -c x y\n  Expected: 0\n\nStop 2 (tests):\n  bun test packages/x\n  Expected: 3 passing\n' | rst_extract_command)"
+  "$(printf 'Stop 1 (grep assertion, no secret in tests/fixtures):\n  grep -c x y\n  Expected: 0\n\nStop 2 (tests):\n  bun test packages/x\n  Expected: 3 passing\n' | rst_extract_commands | head -1)"
 assert_eq "backslash continuation joins" \
   "cd apps/x && npm.cmd test -- --run a.test.ts b.test.ts" \
-  "$(printf 'Stop 6 (unit tests):\n  cd apps/x && npm.cmd test -- --run \\\n    a.test.ts b.test.ts\n  Expected: 2 passing\n' | rst_extract_command)"
+  "$(printf 'Stop 6 (unit tests):\n  cd apps/x && npm.cmd test -- --run \\\n    a.test.ts b.test.ts\n  Expected: 2 passing\n' | rst_extract_commands | head -1)"
 assert_eq "fenced + backticked command line cleaned" \
   "bun test scripts/boardctl/" \
-  "$(printf 'Stop 2 (test suite):\n```bash\n  `bun test scripts/boardctl/`\n```\n  Expected: green\n' | rst_extract_command)"
+  "$(printf 'Stop 2 (test suite):\n```bash\n  `bun test scripts/boardctl/`\n```\n  Expected: green\n' | rst_extract_commands | head -1)"
 assert_eq "bold header tolerated" \
   "pytest -q" \
-  "$(printf '**Stop 2 (test suite):**\n  pytest -q\n  Expected: all pass\n' | rst_extract_command)"
+  "$(printf '**Stop 2 (test suite):**\n  pytest -q\n  Expected: all pass\n' | rst_extract_commands | head -1)"
 assert_eq "fallback: Section 9 Tests: line" \
   "bun test packages/foo" \
-  "$(printf '## 9. Manifest\nTests: 5/5 (bun test packages/foo)\nPRs: x\n' | rst_extract_command)"
-assert_eq "template placeholder rejected" "" \
-  "$(printf 'Stop 2 (test suite):\n  {{TEST_COMMAND}}\n  Expected: {{N}}\n' | rst_extract_command)"
-assert_eq "no test block, no Tests line -> empty" "" "$(printf 'Stop 1 (grep assertion):\n  grep -c a b\n  Expected: 1\n' | rst_extract_command)"
+  "$(printf '## 9. Manifest\nTests: 5/5 (bun test packages/foo)\nPRs: x\n' | rst_extract_commands | head -1)"
+assert_eq "template placeholder is extracted verbatim (rst_command_looks_runnable filters it)" "{{TEST_COMMAND}}" \
+  "$(printf 'Stop 2 (test suite):\n  {{TEST_COMMAND}}\n  Expected: {{N}}\n' | rst_extract_commands | head -1)"
+assert_eq "no test block, no Tests line -> empty" "" "$(printf 'Stop 1 (grep assertion):\n  grep -c a b\n  Expected: 1\n' | rst_extract_commands | head -1)"
 assert_eq "next Stop header without Expected terminates the block" \
   "node tests/run_all.js" \
-  "$(printf 'Stop 2 (test suite):\n  node tests/run_all.js\nStop 3 (ASCII scan):\n  LC_ALL=C grep -n x y\n' | rst_extract_command)"
+  "$(printf 'Stop 2 (test suite):\n  node tests/run_all.js\nStop 3 (ASCII scan):\n  LC_ALL=C grep -n x y\n' | rst_extract_commands | head -1)"
 
 echo "--- rst_command_looks_runnable ---"
 for c in "cd shopops-api && node tests/x.js" "bun test packages/x" "npm.cmd test -- --run" "npx vitest run" "pytest -q" "bash scripts/t.sh" "LC_ALL=C node t.js"; do
@@ -189,7 +189,7 @@ echo "Tests: 3/3"
 exit 0
 EOF
 SPEC_TMP="$(printf 'WO Class: CODE\n\nStop 2 (test suite):\n  bash ./fake-tests.sh\n  Expected: 3 passing / 3 total\n')"
-CMD="$(printf '%s\n' "$SPEC_TMP" | rst_extract_command)"
+CMD="$(printf '%s\n' "$SPEC_TMP" | rst_extract_commands | head -1)"
 assert_eq "integration: command extracted" "bash ./fake-tests.sh" "$CMD"
 ( cd "$TMP" && timeout 60 bash -o pipefail -c "$CMD" > "$TMP/log" 2>&1 ); RC=$?
 COUNTS="$(rst_parse_counts < "$TMP/log")"
@@ -204,6 +204,149 @@ exit 1
 EOF
 ( cd "$TMP" && timeout 60 bash -o pipefail -c "$CMD" > "$TMP/log" 2>&1 ); RC=$?
 assert_eq "integration: red suite reports failed with real numbers" "$(printf 'TESTS_STATUS=failed\nTESTS_LINE=1/2 (bash ./fake-tests.sh) -- FAILED, exit 1')" "$(rst_report CODE "$CMD" "$RC" "$(rst_parse_counts < "$TMP/log")")"
+rm -rf "$TMP"
+
+echo "--- rst_extract_commands: real spec shapes on bdc-xo main (2026-09-05 survey) ---"
+SPEC_GCD='# WO-SHOPOPS-GCD-METADATA-TO-LISTING-01
+
+WO Class: CODE
+
+## 9. Stop conditions (CI-executable)
+
+- `node tests/test_cover_resolver.js` exits 0 if that suite exists; otherwise
+  state N/A and add a new suite that does.
+- A new suite exists and exits 0: `node tests/test_gcd_metadata_passthrough.js`
+- `grep -c "gcd" shopops-api/routes/store.js` returns 1 or greater.
+- These pre-existing suites still exit 0: `node tests/test_cert_lookup.js`,
+  `node tests/test_scan_to_list_cgc.js`.
+- ASCII check on every touched file: `grep -nP "[^\x00-\x7F]"` returns nothing.
+
+## 10. Manifest requirements
+
+Manifest v2 in the PR body per global Rule 2.
+'
+OUT="$(printf '%s\n' "$SPEC_GCD" | rst_extract_commands)"
+assert_eq "bullet-style stop section: four runner commands in document order" \
+  "$(printf 'node tests/test_cover_resolver.js\nnode tests/test_gcd_metadata_passthrough.js\nnode tests/test_cert_lookup.js\nnode tests/test_scan_to_list_cgc.js')" "$OUT"
+
+SPEC_GWT='# WO-SHOPOPS-CE-AUTH-CONTEXT-01
+
+WO Class: CODE
+
+## 7. Test scenarios
+
+Test: /admin audit line
+Given: alpha token, header bravo
+When: GET /admin/ce-session -> 403
+Then: one console line
+
+## 12. Stop Point
+
+Test: focused suite green
+Given: fresh checkout of the PR head, `cd shopops-api && npm ci`
+When: `node tests/test_auth_tenant_context.js`
+Then: exit 0, summary line `Passed: N  Failed: 0` with N >= 60
+
+Test: runner wiring
+When: `node tests/run_all.js --suite=test_auth_tenant_context`
+Then: exit 0 and the suite is listed (1 suite)
+
+Test: legacy structural suite still green
+When: `node tests/test_auth0_direct.js`
+Then: exit 0
+
+Test: consumers no longer read the raw header first
+When: `grep -c "req.headers" shopops-api/routes/admin.js`
+Then: 0
+'
+OUT="$(printf '%s\n' "$SPEC_GWT" | rst_extract_commands)"
+assert_eq "Given/When/Then Stop Point: the three runner commands, npm ci and grep excluded" \
+  "$(printf 'cd shopops-api && npm ci\nnode tests/test_auth_tenant_context.js\nnode tests/run_all.js --suite=test_auth_tenant_context\nnode tests/test_auth0_direct.js')" "$OUT"
+if rst_command_looks_runnable "cd shopops-api && npm ci"; then FAIL=$((FAIL+1)); echo "FAIL: npm ci must not be runnable"; else PASS=$((PASS+1)); echo "PASS: npm ci is filtered as an install step"; fi
+if rst_command_looks_runnable "bun install --frozen-lockfile"; then FAIL=$((FAIL+1)); echo "FAIL: bun install must not be runnable"; else PASS=$((PASS+1)); echo "PASS: bun install is filtered as an install step"; fi
+if rst_command_looks_runnable "{{TEST_COMMAND}}"; then FAIL=$((FAIL+1)); echo "FAIL: placeholder must not be runnable"; else PASS=$((PASS+1)); echo "PASS: template placeholder is filtered"; fi
+
+SPEC_PROSE='# WO-HARNESS-AUTO-REREVIEW-REPEAT-REASON-01
+
+WO Class: CODE
+
+## Stop conditions
+Baseline on untouched tree: scenario 1 FAILS.
+1. Given PR head, greps show the reason builder and its call site.
+2. Test command exits 0 with scenarios 1-8 asserting values.
+3. Runtime (Rule 19, after container rebuild under M-09).
+
+## 12. Stop Point
+Stops 1-3 evidenced; status:review; Captain CI closes.
+'
+assert_eq "prose-only stop section declares no command" "" "$(printf '%s\n' "$SPEC_PROSE" | rst_extract_commands)"
+assert_eq "template block first, Section 9 duplicate deduped" \
+  "$(printf 'bun test packages/foo\nbun test packages/bar')" \
+  "$(printf 'Stop 2 (test suite):\n  bun test packages/foo\n  Expected: 3 passing\n\n## Stop conditions\n- `bun test packages/bar` exits 0\n\nTests: 3/3 (bun test packages/foo)\n' | rst_extract_commands)"
+assert_eq "cap at 8 commands" "8" "$(for i in 1 2 3 4 5 6 7 8 9 10; do printf -- '## Stop conditions\n- `node tests/t%s.js` exits 0\n' "$i"; done | rst_extract_commands | grep -c .)"
+
+echo "--- rst_rescue_subdir ---"
+TMP="$(mktemp -d)"
+mkdir -p "$TMP/shopops-api/tests" "$TMP/docs" "$TMP/node_modules/x/tests"
+printf 'x' > "$TMP/shopops-api/tests/test_x.js"
+printf 'x' > "$TMP/node_modules/x/tests/test_x.js"
+( cd "$TMP" && assert_eq "node tests/x.js rescued into the only depth-1 dir that has it" "cd shopops-api && node tests/test_x.js" "$(rst_rescue_subdir 'node tests/test_x.js')" )
+( cd "$TMP" && assert_eq "already cd-prefixed command untouched" "cd shopops-api && node tests/test_x.js" "$(rst_rescue_subdir 'cd shopops-api && node tests/test_x.js')" )
+( cd "$TMP" && assert_eq "path that exists at root untouched" "bun test shopops-api/tests/test_x.js" "$(rst_rescue_subdir 'bun test shopops-api/tests/test_x.js')" )
+( cd "$TMP" && assert_eq "path found nowhere untouched" "node tests/nope.js" "$(rst_rescue_subdir 'node tests/nope.js')" )
+mkdir -p "$TMP/other/tests" && printf 'x' > "$TMP/other/tests/test_x.js"
+( cd "$TMP" && assert_eq "ambiguous (two candidate dirs) untouched" "node tests/test_x.js" "$(rst_rescue_subdir 'node tests/test_x.js')" )
+rm -rf "$TMP"
+
+echo "--- rst_tests_in_diff (temp git repo) ---"
+TMP="$(mktemp -d)"
+(
+  cd "$TMP" && git init -q . && git config user.email t@t && git config user.name t
+  mkdir -p src shopops-api/tests/fixtures shopops-api/tests/helpers packages/x/src tests/helpers
+  printf 'base\n' > src/a.ts && printf '{}\n' > bun.lock && printf '{"name":"x"}\n' > package.json
+  git add -A && git commit -qm base
+  BASE="$(git rev-parse HEAD)"
+  printf 'changed\n' > src/a.ts
+  printf 't\n' > packages/x/src/a.test.ts
+  printf 't\n' > shopops-api/tests/test_b.js
+  printf '{}\n' > shopops-api/tests/fixtures/f.json
+  printf 'h\n' > shopops-api/tests/helpers/h.js
+  printf 'h\n' > tests/helpers/h.js
+  printf 'r\n' > shopops-api/tests/run_all.js
+  printf 'u\n' > shopops-api/tests/_harness.js
+  git add -A && git commit -qm change
+  mkdir -p packages/y && printf 'u\n' > packages/y/z.spec.ts
+  OUT="$(rst_tests_in_diff "$BASE")"
+  assert_eq "bun runner groups committed + untracked test files; fixtures/helpers/run_all/_harness/src excluded" \
+    "$(printf 'cd shopops-api && node tests/test_b.js\nbun test packages/x/src/a.test.ts packages/y/z.spec.ts')" "$OUT"
+  printf '{"name":"x","devDependencies":{"vitest":"^2"}}\n' > package.json
+  OUT="$(rst_tests_in_diff "$BASE")"
+  assert_contains "vitest declared in package.json -> npx vitest run" "npx vitest run packages/x/src/a.test.ts packages/y/z.spec.ts" "$OUT"
+  git checkout -q -- . 2>/dev/null; rm -f packages/y/z.spec.ts
+  assert_eq "no test files in diff -> empty" "" "$(rst_tests_in_diff HEAD)"
+)
+rm -rf "$TMP"
+
+echo "--- rst_run_commands: two commands, counts summed, first nonzero exit kept ---"
+TMP="$(mktemp -d)"
+cat > "$TMP/ok.sh" <<'EOF'
+#!/usr/bin/env bash
+echo "Tests: 3/3"
+EOF
+cat > "$TMP/red.sh" <<'EOF'
+#!/usr/bin/env bash
+echo " 4 pass"
+echo " 1 fail"
+exit 1
+EOF
+printf 'bash ./ok.sh\nbash ./red.sh\n' > "$TMP/cmds"
+( cd "$TMP" && assert_eq "exit 1, 7 passed of 8" "1 7 8" "$(rst_run_commands ./cmds ./log)" )
+assert_contains "log carries per-command headers" "### run-stop-tests: bash ./red.sh" "$(cat "$TMP/log")"
+assert_contains "log carries per-command exit" "### exit 1" "$(cat "$TMP/log")"
+printf 'bash ./ok.sh\n' > "$TMP/cmds"
+( cd "$TMP" && assert_eq "single green command" "0 3 3" "$(rst_run_commands ./cmds ./log2)" )
+printf 'true\n' > "$TMP/cmds"
+( cd "$TMP" && assert_eq "no counts parsed -> exit only" "0  " "$(rst_run_commands ./cmds ./log3)" )
 rm -rf "$TMP"
 
 echo
