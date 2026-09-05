@@ -3344,23 +3344,27 @@ export function registerApiRoutes(
   // stale proposals are EXPIRED, never replayed.
   registerOpenApiRoute(postTaskmasterResumeRoute, async c => {
     try {
-      const body: { actor: string } = (getValidatedBody(c, taskmasterResumeBodySchema) as
-        | { actor: string }
-        | undefined) ?? {
-        actor: 'john',
-      };
-      const expired = await taskmasterDb.expireParkedActions();
-      const control = await taskmasterDb.setPauseState({
-        pause_state: 'RUNNING',
-        pause_scope: null,
-        pause_reason: null,
-        pause_actor: body.actor,
-        incrementEpoch: true,
-      });
+      // Hoisted rather than cast inline: `(x as T | undefined) ?? { ... }` on one
+      // line crashes tsc 5.9 (Debug Failure, SyntaxKind 2128) once Prettier
+      // collapses it, so keep the cast and the default as separate statements.
+      const validatedBody = getValidatedBody(c, taskmasterResumeBodySchema) as
+        | { actor: string; reason?: string }
+        | undefined;
+      const body: { actor: string; reason?: string } = validatedBody ?? { actor: 'john' };
+      const { control, expiredProposals, audit, transitioned } = await taskmasterDb.resetTaskmaster(
+        {
+          actor: body.actor,
+          reason: body.reason ?? null,
+        }
+      );
       return c.json({
         pause_state: control.pause_state,
         epoch: control.epoch,
-        expired_proposals: expired,
+        expired_proposals: expiredProposals,
+        audit_id: audit.id,
+        // false when a concurrent reset already owned the PAUSED -> RUNNING
+        // transition: this call was a no-op, not a second unpause.
+        transitioned,
       });
     } catch (error) {
       getLog().error({ err: error }, 'taskmaster_resume_failed');

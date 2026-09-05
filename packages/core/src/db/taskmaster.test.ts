@@ -33,6 +33,8 @@ import {
   getPauseState,
   gradeAction,
   recordAction,
+  recordResetAudit,
+  resetTaskmaster,
   recordUsageSample,
   setPauseState,
   updateActionOutcome,
@@ -62,6 +64,159 @@ afterEach(async () => {
 }, SQLITE_HOOK_TIMEOUT_MS);
 
 describe('tm_journal DAL', () => {
+  test('records one distinct reset audit row per invocation', async () => {
+    const first = await recordResetAudit({
+      actor: 'operator',
+      reason: 'recover Taskmaster',
+      previousEpoch: 1,
+      newEpoch: 2,
+      transitioned: true,
+    });
+    const second = await recordResetAudit({
+      actor: 'operator',
+      reason: 'recover Taskmaster',
+      previousEpoch: 2,
+      newEpoch: 2,
+      transitioned: false,
+    });
+    expect(first.id).not.toBe(second.id);
+    const audits = await db.query<{ proposal_json: string }>(
+      "SELECT proposal_json FROM tm_journal WHERE thread_ref = 'taskmaster:reset'"
+    );
+    expect(audits.rows).toHaveLength(2);
+    expect(JSON.parse(audits.rows[1]!.proposal_json).transitioned).toBe(false);
+  });
+
+  test('reset is safe twice: expires once, increments once, and audits both calls', async () => {
+    await setPauseState({
+      pause_state: 'PAUSED',
+      pause_scope: 'effects',
+      pause_reason: 'floor',
+      pause_actor: 'taskmaster:useful-rate-floor',
+    });
+    const before = await getPauseState();
+    await recordAction({
+      thread_ref: 'gh:test/repo#1',
+      action_type: 'nudge',
+      proposal_json: '{}',
+      outcome: 'parked',
+    });
+
+    const first = await resetTaskmaster({ actor: 'operator', reason: 'recover' });
+    const second = await resetTaskmaster({ actor: 'operator', reason: 'recover' });
+
+    expect(first.control.pause_state).toBe('RUNNING');
+    expect(first.control.epoch).toBe(before.epoch + 1);
+    expect(first.expiredProposals).toBe(1);
+    expect(second.control.epoch).toBe(first.control.epoch);
+    expect(second.expiredProposals).toBe(0);
+    expect(first.audit.id).not.toBe(second.audit.id);
+    const audits = await db.query<{ cnt: number | string }>(
+      "SELECT COUNT(*) AS cnt FROM tm_journal WHERE thread_ref = 'taskmaster:reset'"
+    );
+    expect(Number(audits.rows[0]?.cnt)).toBe(2);
+  });
+
+  test('overlapping resets increment the epoch exactly once and expire exactly once', async () => {
+    // Both callers read PAUSED before either transitions -- the pre-fix race.
+    // The conditional UPDATE (WHERE pause_state <> 'RUNNING') must let only one win.
+    await setPauseState({
+      pause_state: 'PAUSED',
+      pause_scope: 'effects',
+      pause_reason: 'floor',
+      pause_actor: 'taskmaster:useful-rate-floor',
+    });
+    const before = await getPauseState();
+    for (const ref of ['gh:test/repo#10', 'gh:test/repo#11', 'gh:test/repo#12']) {
+      await recordAction({
+        thread_ref: ref,
+        action_type: 'nudge',
+        proposal_json: '{}',
+        outcome: 'parked',
+      });
+    }
+    const observedBoth = await Promise.all([getPauseState(), getPauseState()]);
+    expect(observedBoth.map(state => state.pause_state)).toEqual(['PAUSED', 'PAUSED']);
+
+    const results = [
+      await resetTaskmaster({ actor: 'operator-a', reason: 'recover' }),
+      await resetTaskmaster({ actor: 'operator-b', reason: 'recover' }),
+    ];
+
+    // Exactly one caller owned the PAUSED -> RUNNING transition.
+    expect(results.filter(result => result.transitioned)).toHaveLength(1);
+
+    // Exactly ONE epoch increment across both invocations.
+    const after = await getPauseState();
+    expect(after.pause_state).toBe('RUNNING');
+    expect(after.epoch).toBe(before.epoch + 1);
+    expect(results.map(result => result.control.epoch)).toEqual([
+      before.epoch + 1,
+      before.epoch + 1,
+    ]);
+
+    // Exactly ONE expiry pass: three parked rows expired once, none re-expired.
+    expect(results.map(result => result.expiredProposals)).toEqual([3, 0]);
+    const stillOpen = await db.query<{ cnt: number | string }>(
+      "SELECT COUNT(*) AS cnt FROM tm_journal WHERE outcome IN ('parked','pending')"
+    );
+    expect(Number(stillOpen.rows[0]?.cnt)).toBe(0);
+
+    // Every invocation is audited, and the loser's audit says it did not transition.
+    const audits = await db.query<{ proposal_json: string }>(
+      "SELECT proposal_json FROM tm_journal WHERE thread_ref = 'taskmaster:reset' ORDER BY created_at ASC"
+    );
+    expect(audits.rows).toHaveLength(2);
+    const flags = audits.rows.map(row => JSON.parse(row.proposal_json).transitioned as boolean);
+    expect(flags.filter(Boolean)).toHaveLength(1);
+    const winnerAudit = audits.rows
+      .map(row => JSON.parse(row.proposal_json) as Record<string, unknown>)
+      .find(entry => entry.transitioned === true);
+    expect(winnerAudit?.previous_epoch).toBe(before.epoch);
+    expect(winnerAudit?.new_epoch).toBe(before.epoch + 1);
+  });
+
+  test('a reset that fails mid-sequence leaves no epoch bump and no audit row', async () => {
+    // Atomicity: the transition, the expiry and the audit insert roll back together.
+    await setPauseState({
+      pause_state: 'PAUSED',
+      pause_scope: 'effects',
+      pause_reason: 'floor',
+      pause_actor: 'taskmaster:useful-rate-floor',
+    });
+    const before = await getPauseState();
+    await recordAction({
+      thread_ref: 'gh:test/repo#20',
+      action_type: 'nudge',
+      proposal_json: '{}',
+      outcome: 'parked',
+    });
+
+    // Break the audit insert only: the transition and expiry happen first, so a
+    // non-atomic implementation would leave RUNNING at a bumped epoch with no audit.
+    await db.query('ALTER TABLE tm_journal RENAME TO tm_journal_stash');
+    let threw = false;
+    try {
+      await resetTaskmaster({ actor: 'operator', reason: 'recover' });
+    } catch {
+      threw = true;
+    }
+    await db.query('ALTER TABLE tm_journal_stash RENAME TO tm_journal');
+    expect(threw).toBe(true);
+
+    const after = await getPauseState();
+    expect(after.pause_state).toBe('PAUSED');
+    expect(after.epoch).toBe(before.epoch);
+    const audits = await db.query<{ cnt: number | string }>(
+      "SELECT COUNT(*) AS cnt FROM tm_journal WHERE thread_ref = 'taskmaster:reset'"
+    );
+    expect(Number(audits.rows[0]?.cnt)).toBe(0);
+    const stillParked = await db.query<{ cnt: number | string }>(
+      "SELECT COUNT(*) AS cnt FROM tm_journal WHERE outcome = 'parked'"
+    );
+    expect(Number(stillParked.rows[0]?.cnt)).toBe(1);
+  });
+
   test('fire_cauldron is accepted by the fresh SQLite CHECK', async () => {
     const row = await recordAction({
       thread_ref: 'gh:thinmansoftware/bdc-harness#99',
