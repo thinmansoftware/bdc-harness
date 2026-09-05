@@ -71,7 +71,7 @@ if [ -z "$RST_CORE" ]; then
   echo "FATAL: could not extract rst core from $CANONICAL_YAML"; exit 1
 fi
 eval "$RST_CORE"
-for fn in rst_class rst_extract_commands rst_command_looks_runnable rst_rescue_subdir rst_tests_in_diff rst_parse_counts rst_run_commands rst_report; do
+for fn in rst_class rst_extract_commands rst_command_looks_runnable rst_rescue_subdir rst_tests_in_diff rst_repo_test_script rst_parse_counts rst_run_commands rst_report; do
   if ! declare -F "$fn" >/dev/null; then echo "FATAL: $fn not defined after eval"; exit 1; fi
 done
 
@@ -325,6 +325,17 @@ TMP="$(mktemp -d)"
   git checkout -q -- . 2>/dev/null; rm -f packages/y/z.spec.ts
   assert_eq "no test files in diff -> empty" "" "$(rst_tests_in_diff HEAD)"
 )
+rm -rf "$TMP"
+
+echo "--- rst_repo_test_script (last rung) ---"
+TMP="$(mktemp -d)"
+( cd "$TMP" && assert_eq "no package.json -> empty" "" "$(rst_repo_test_script)" )
+printf '{"name":"x","scripts":{"build":"tsc"}}\n' > "$TMP/package.json"
+( cd "$TMP" && assert_eq "package.json without a test script -> empty" "" "$(rst_repo_test_script)" )
+printf '{"name":"x","scripts":{"test":"vitest run"}}\n' > "$TMP/package.json"
+( cd "$TMP" && assert_eq "test script, no bun lockfile -> npm test" "npm test" "$(rst_repo_test_script)" )
+printf '{}\n' > "$TMP/bun.lock"
+( cd "$TMP" && assert_eq "test script + bun.lock -> bun run test" "bun run test" "$(rst_repo_test_script)" )
 rm -rf "$TMP"
 
 echo "--- rst_run_commands: two commands, counts summed, first nonzero exit kept ---"

@@ -1229,6 +1229,16 @@ nodes:
         [ -n "$py_files" ] && printf 'pytest %s\n' "$py_files"
         return 0
       }
+      # rst_repo_test_script   (-> the repo's own canonical test command when the root
+      #   package.json declares a "test" script: "bun run test" when a bun lockfile is
+      #   present, else "npm test"; empty otherwise). Last rung of the ladder: a CODE WO
+      #   whose spec names no command and whose diff touched no test file still gets
+      #   real numbers from the repo's suite instead of N/A.
+      rst_repo_test_script() {
+        [ -f package.json ] || return 0
+        python3 -c 'import json,sys; d=json.load(open("package.json")); s=d.get("scripts",{}); sys.exit(0 if isinstance(s,dict) and s.get("test") else 1)' 2>/dev/null || return 0
+        if [ -f bun.lock ] || [ -f bun.lockb ]; then printf 'bun run test\n'; else printf 'npm test\n'; fi
+      }
       # rst_parse_counts   (test-runner output on stdin -> "<passed> <total>", or empty)
       #   Sums every recognised summary line (a chained "a && b && c" command prints
       #   several). Recognised: shopops run_all "Passed: N  Failed: M  Total: T" and
@@ -1345,6 +1355,10 @@ nodes:
         if [ -n "$RUN_START_SHA" ] && git rev-parse --verify -q "$RUN_START_SHA" >/dev/null 2>&1; then
           rst_tests_in_diff "$RUN_START_SHA" > "$CMDS"
           [ -s "$CMDS" ] && SOURCE="tests_in_diff"
+        fi
+        if [ ! -s "$CMDS" ]; then
+          rst_repo_test_script > "$CMDS"
+          [ -s "$CMDS" ] && SOURCE="repo_test_script"
         fi
       fi
       EXIT_CODE=0
