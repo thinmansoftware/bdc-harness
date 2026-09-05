@@ -136,6 +136,39 @@ export function createRealIngestDeps(config: ReviewRouteConfig): IngestDeps {
         recipient: REVIEW_RECIPIENT,
         subject_key: subjectKey,
       });
+      const receipts = await dispatch.listMessages({
+        recipient: 'operator',
+        subject_key: subjectKey,
+      });
+      const verdictByMessageId = new Map<
+        string,
+        { verdict: PriorReviewWork['verdict']; verdictId: string }
+      >();
+      for (const receipt of receipts) {
+        try {
+          const body = JSON.parse(receipt.body) as {
+            kind?: string;
+            messageId?: string;
+            disposition?: string;
+          };
+          if (body.kind !== 'pr_review_submit_receipt' || !body.messageId) continue;
+          // listMessages returns newest-first. Keep the first receipt for a
+          // message so an older failed attempt cannot overwrite a later,
+          // authoritative submission verdict.
+          if (verdictByMessageId.has(body.messageId)) continue;
+          verdictByMessageId.set(body.messageId, {
+            verdict:
+              body.disposition === 'approved'
+                ? 'approved'
+                : body.disposition === 'changes_requested'
+                  ? 'changes_requested'
+                  : 'other',
+            verdictId: receipt.id,
+          });
+        } catch {
+          // Malformed and unrelated reports are not verdict evidence.
+        }
+      }
       return messages
         .map(message => {
           const body = parseReviewWorkBody(message.body);
@@ -143,6 +176,9 @@ export function createRealIngestDeps(config: ReviewRouteConfig): IngestDeps {
             messageId: message.id,
             headSha: body?.headSha ?? '',
             status: message.status,
+            verdict: verdictByMessageId.get(message.id)?.verdict ?? null,
+            verdictId: verdictByMessageId.get(message.id)?.verdictId ?? null,
+            isAutoRereview: message.repeat_reason !== null,
           };
         })
         .filter((work): work is PriorReviewWork => work.headSha !== '');
@@ -199,7 +235,7 @@ export function createRealIngestDeps(config: ReviewRouteConfig): IngestDeps {
           recipient: REVIEW_RECIPIENT,
           body: JSON.stringify(body),
           subject_key: subjectKey,
-          repeat_reason: `review_exact_head:${input.headSha}`,
+          repeat_reason: input.repeatReason,
         }
       );
       return { messageId: message.id, alreadyExisted };
@@ -329,6 +365,8 @@ export function createRealSubmitDeps(
           idempotency_key: `pr-review-submit-receipt:${input.messageId}:${input.disposition}`,
           task_type: 'run_report',
           recipient: 'operator',
+          subject_key: reviewSubjectKey(input.owner, input.repo, input.prNumber),
+          repeat_reason: `review_verdict_receipt:${input.messageId}:${input.disposition}`,
           body: JSON.stringify({ kind: 'pr_review_submit_receipt', ...input }),
         }
       );
