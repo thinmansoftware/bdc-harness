@@ -1,3 +1,9 @@
+# Provider lanes gate on secret presence; presence does not validate credentials.
+# BDC policy: no metered provider API calls in CI. Set the repository variable
+# E2E_PROVIDER_SMOKE=off to explicitly opt out, including for exhausted credentials.
+# To re-enable an eligible lane, add its missing secret or set E2E_PROVIDER_SMOKE=on
+# to remove the opt-out; the corresponding secret must still be present.
+# e2e-deterministic is the always-on baseline, independent of provider preflight.
 name: E2E Smoke Tests
 
 on:
@@ -9,6 +15,49 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  credentials-preflight:
+    runs-on: ubuntu-latest
+    env:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      E2E_PROVIDER_SMOKE: ${{ vars.E2E_PROVIDER_SMOKE }}
+    outputs:
+      has_openai: ${{ steps.credentials.outputs.has_openai }}
+      has_anthropic: ${{ steps.credentials.outputs.has_anthropic }}
+    steps:
+      - name: Detect provider credentials and opt-out
+        id: credentials
+        shell: bash
+        run: |
+          if [ "$E2E_PROVIDER_SMOKE" = "off" ]; then
+            echo "has_openai=false" >> "$GITHUB_OUTPUT"
+            echo "has_anthropic=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_openai=$([ -n "$OPENAI_API_KEY" ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+            echo "has_anthropic=$([ -n "$ANTHROPIC_API_KEY" ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Summarize provider lane eligibility
+        shell: bash
+        env:
+          HAS_OPENAI: ${{ steps.credentials.outputs.has_openai }}
+          HAS_ANTHROPIC: ${{ steps.credentials.outputs.has_anthropic }}
+        run: |
+          codex="skipped (no credential: OPENAI_API_KEY)"
+          claude="skipped (no credential: ANTHROPIC_API_KEY)"
+          if [ "$E2E_PROVIDER_SMOKE" = "off" ]; then
+            codex="skipped (opt-out: E2E_PROVIDER_SMOKE=off)"
+            claude="skipped (opt-out: E2E_PROVIDER_SMOKE=off)"
+          else
+            if [ "$HAS_OPENAI" = "true" ]; then codex="will run (credential present)"; fi
+            if [ "$HAS_ANTHROPIC" = "true" ]; then claude="will run (credential present)"; fi
+          fi
+          mixed="skipped (provider prerequisite skipped: no credential or opt-out, as above)"
+          if [ "$HAS_OPENAI" = "true" ] && [ "$HAS_ANTHROPIC" = "true" ]; then
+            mixed="will run if both provider lanes succeed"
+          fi
+          echo "Provider lanes: e2e-codex: $codex; e2e-claude: $claude; e2e-mixed: $mixed." >> "$GITHUB_STEP_SUMMARY"
+
   # --- Tier 1: Deterministic (no API keys needed) ------------------------
   e2e-deterministic:
     runs-on: ubuntu-latest
@@ -32,9 +81,8 @@ jobs:
 
   # --- Tier 2a: Claude provider ------------------------------------------
   e2e-claude:
-    # Disabled while CI's ANTHROPIC_API_KEY reports an exhausted credit balance.
-    # Re-enable by removing this condition after a credential-backed smoke run succeeds.
-    if: ${{ false }}
+    needs: credentials-preflight
+    if: needs.credentials-preflight.outputs.has_anthropic == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -65,9 +113,8 @@ jobs:
 
   # --- Tier 2b: Codex provider -------------------------------------------
   e2e-codex:
-    # Disabled while CI's OPENAI_API_KEY is unavailable (provider returns HTTP 401).
-    # Re-enable by removing this condition after a credential-backed smoke run succeeds.
-    if: ${{ false }}
+    needs: credentials-preflight
+    if: needs.credentials-preflight.outputs.has_openai == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
