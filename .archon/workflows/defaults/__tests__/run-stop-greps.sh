@@ -208,6 +208,31 @@ assert_eq "bullets outside a Stop conditions section ignored" "0" "$(printf '%s\
 assert_eq "runner commands are not grep assertions" "0" "$(printf '%s\n' "$OUT" | grep -c 'node tests' || true)"
 assert_contains "DECLARED counts every backticked read-only command in the section (5), not the runner" "DECLARED${TAB}5" "$OUT"
 
+echo "--- baseline statements are not stop conditions (live false mismatch, run 3b8aea39, WO-HARNESS-AUTO-REREVIEW-REPEAT-REASON-01) ---"
+SPEC_BASELINE='# WO-HARNESS-AUTO-REREVIEW-REPEAT-REASON-01
+
+WO Class: CODE
+
+## Stop conditions
+Baseline on untouched tree: scenario 1 FAILS (enqueue blocked with
+`repeat_reason_required`) -- the test must demonstrate the live defect before
+the fix. `grep -rn "buildRereviewReason"` returns nothing.
+1. Given PR head, greps show the reason builder and its call site, before/after
+   counts in the PR body.
+2. Test command exits 0 with scenarios 1-8 asserting values.
+3. `grep -c "buildRereviewReason" packages/overseer/src/pr-review-ingest.ts` returns 1 or greater.
+
+## Manifest requirements
+Manifest v2: greps (stop 1), tests (stop 2).
+'
+OUT="$(printf '%s\n' "$SPEC_BASELINE" | rsg_extract)"
+assert_eq "the baseline paragraph grep is skipped" "0" "$(printf '%s\n' "$OUT" | grep -c 'grep -rn "buildRereviewReason"' || true)"
+assert_contains "the numbered post-fix assertion is kept (ge 1)" "grep -c \"buildRereviewReason\" packages/overseer/src/pr-review-ingest.ts${TAB}ge${TAB}1" "$OUT"
+assert_contains "DECLARED counts only the real stop condition" "DECLARED${TAB}1" "$OUT"
+OUT="$(printf '## Stop conditions\n- Baseline: `grep -c x y` returns 0 before this WO.\n- `grep -c x y` returns 2 or greater\n' | rsg_extract)"
+assert_contains "single-line baseline bullet skipped, real bullet kept" "grep -c x y${TAB}ge${TAB}2" "$OUT"
+assert_contains "single-line baseline bullet not counted" "DECLARED${TAB}1" "$OUT"
+
 echo "--- rsg_run on bullet-style spec in a fixture worktree ---"
 TMP2="$(mktemp -d)"
 mkdir -p "$TMP2/shopops-api/routes" "$TMP2/shopops-api/services"
