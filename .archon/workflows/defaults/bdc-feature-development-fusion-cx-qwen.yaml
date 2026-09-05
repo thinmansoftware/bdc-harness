@@ -1375,8 +1375,11 @@ nodes:
             }
           }
           /^[ \t]*[*]*[Ss]top [0-9A-Za-z.]+[ \t]*\(([Gg]rep|[Aa]ssert)/ { state = 1; cmd = ""; declared++; next }
-          /^#+ / { insec = ($0 ~ /[Ss]top [Cc]ondition/) ? 1 : 0; next }
-          insec && /`(LC_ALL=C |LANG=C )?(grep|egrep|fgrep|rg|find|wc|test|cat|head|tail)( |`)/ {
+          /^#+ / { insec = ($0 ~ /[Ss]top [Cc]ondition/) ? 1 : 0; bl = 0; next }
+          insec && /^[ \t]*[*_]*[Bb]aseline/ { bl = 1 }
+          insec && bl && (/^[ \t]*$/ || /^[ \t]*([0-9]+[.)]|[-*])[ \t]/) { bl = 0 }
+          insec && !bl && /`(LC_ALL=C |LANG=C )?(grep|egrep|fgrep|rg|find|wc|test|cat|head|tail)( |`)/ {
+            if (tolower($0) ~ /baseline|untouched tree|before the fix|before this wo/) next
             s = $0
             if (match(s, /`(LC_ALL=C |LANG=C )?(grep|egrep|fgrep|rg|find|wc|test|cat|head|tail)[^`]*`/)) {
               g = substr(s, RSTART + 1, RLENGTH - 2); rest = substr(s, RSTART + RLENGTH)
