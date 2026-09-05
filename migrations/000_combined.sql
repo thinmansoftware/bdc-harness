@@ -610,7 +610,10 @@ VALUES
   -- route's sender and worker-poll recipient. Without these rows every
   -- review enqueue is rejected as missing_principal.
   ('overseer-reviewer', 'Overseer PR Reviewer', 'worker_poll', TRUE),
-  ('overseer-review-route', 'Overseer Review Route', 'notify_only', TRUE)
+  ('overseer-review-route', 'Overseer Review Route', 'notify_only', TRUE),
+  -- WO-HARNESS-OVERSEER-VERDICT-TO-TASKMASTER-REMEDIATION-01 (migration 046):
+  -- mailbox registration only; the Taskmaster consumer is deferred for PR #669.
+  ('taskmaster', 'Taskmaster', 'drain_on_start', TRUE)
 ON CONFLICT (principal_id) DO NOTHING;
 
 INSERT INTO dispatch_principals (principal_id, display_name, delivery_mode, active)

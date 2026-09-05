@@ -24,6 +24,12 @@ import {
 import { ruleOnAction, type TierRuling } from './tier-map';
 import { runEscalation } from './escalate';
 import { isPrMergeReady } from './judge-pr';
+import { classifyFindings } from './classify-findings';
+import {
+  DEFAULT_MAX_REMEDIATION_ATTEMPTS,
+  emitRemediationCandidate,
+  type RemediationCandidateInput,
+} from './remediation-candidate';
 import type {
   GitHubClientDeps,
   OverseerActionsDeps,
@@ -130,6 +136,12 @@ export interface JudgeFirstPipelineOptions {
   maxRetries?: number;
   /** Injectable escalation executor; defaults to runEscalation (operator card rail). */
   escalate?: typeof runEscalation;
+  /** Injectable remediation seam for tests; production uses persisted actions + dispatch. */
+  remediation?: {
+    countAttempts(prRef: string): Promise<number>;
+    emit(input: RemediationCandidateInput): Promise<unknown>;
+    maxAttempts?: number;
+  };
 }
 
 function actionClass(record: WatchedRunRecord): string {
@@ -472,6 +484,55 @@ export async function handleRecordJudgeFirst(
     outcome.verdict === 'failed_genuine' ||
     outcome.proposedAction === 'escalate_with_evidence'
   ) {
+    const pr = record.prEvidence?.pr;
+    const reviewedHeadSha = record.prEvidence?.headSha;
+    if (outcome.verdict === 'needs_human' && pr && reviewedHeadSha) {
+      const classification = classifyFindings(outcome.reason);
+      if (classification.autoFixable) {
+        const prRef = `gh:${pr.owner.toLowerCase()}/${pr.repo.toLowerCase()}#${pr.number}`;
+        const remediation: NonNullable<JudgeFirstPipelineOptions['remediation']> =
+          options.remediation ?? {
+            countAttempts: async (ref: string) =>
+              (await import('@archon/core/db/overseer')).countRemediationAttemptsForPr(ref),
+            emit: emitRemediationCandidate,
+          };
+        const attempts = await remediation.countAttempts(prRef);
+        const maxAttempts = remediation.maxAttempts ?? DEFAULT_MAX_REMEDIATION_ATTEMPTS;
+        if (attempts < maxAttempts) {
+          const attempt = attempts + 1;
+          await remediation.emit({
+            woId: record.woId,
+            owner: pr.owner,
+            repo: pr.repo,
+            prNumber: pr.number,
+            headSha: reviewedHeadSha,
+            attempt,
+            verdictId: claim.verdictId,
+            verdictBody: outcome.reason,
+          });
+          await deps.insertOverseerAction({
+            runId: record.runId,
+            woId: record.woId,
+            class: actionClass(record),
+            action: 'remediation_candidate_emitted',
+            result: `pr_ref:${prRef};head_sha:${reviewedHeadSha};attempt:${attempt};verdict:${claim.verdictId}`,
+          });
+          return;
+        }
+        await escalateWithEvidence(
+          record,
+          deps,
+          events,
+          {
+            verdictId: claim.verdictId,
+            reason: 'remediation_attempts_exhausted',
+            blocker: `Remediation attempts exhausted for ${prRef} (max ${maxAttempts}): ${outcome.reason}`,
+          },
+          options.escalate
+        );
+        return;
+      }
+    }
     await escalateWithEvidence(
       record,
       deps,
