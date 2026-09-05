@@ -143,11 +143,12 @@ export function validateProposal(proposal: ActionProposal): GuardResult {
     return { allowed: false, reason: 'body_empty: refusing to send an empty message.' };
   }
 
-  // Exclude only double-quoted WO titles: a WO-[A-Z0-9]+(-[A-Z0-9]+)* id,
-  // optionally followed by ': ' and free text inside the same quotes.
-  // Keep all other quoted text in the scan so quoting a prohibited instruction
-  // cannot bypass spend/send/deploy enforcement (Overseer finding on #764).
-  const scanTarget = normalized.replace(/"WO-[A-Z0-9]+(?:-[A-Z0-9]+)*(?:: [^"]*)?"/g, ' ');
+  // Exclude only structured WO-[A-Z0-9]+(?:-[A-Z0-9]+)* identifier tokens
+  // wherever they appear, quoted or not: the id itself is never an instruction.
+  // Leave every other character, including any title suffix after ': ', in the
+  // scan so prohibited instructions remain visible (thinman-overseer [major]
+  // quoted WO-title exclusion finding, round 2 on #764).
+  const scanTarget = normalized.replace(/WO-[A-Z0-9]+(?:-[A-Z0-9]+)*/g, '');
   const match = SPEND_SEND_DEPLOY_RE.exec(scanTarget);
   if (match) {
     return {

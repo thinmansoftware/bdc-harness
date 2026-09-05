@@ -147,7 +147,7 @@ describe('validateProposal', () => {
     expect(result.allowed).toBe(true);
   });
 
-  test('allows PAYMENT in a quoted WO title', () => {
+  test('rejects charge in the title suffix after a PAYMENT WO identifier', () => {
     const result = validateProposal(
       proposal({
         type: 'escalate_p0',
@@ -158,7 +158,8 @@ describe('validateProposal', () => {
       })
     );
 
-    expect(result.allowed).toBe(true);
+    expect(result.allowed).toBe(false);
+    expect(result.reason).toContain("forbidden verb 'charge'");
   });
 
   test('rejects a wire instruction entirely inside quotes', () => {
@@ -168,6 +169,26 @@ describe('validateProposal', () => {
 
     expect(result.allowed).toBe(false);
     expect(result.reason).toContain('spend_send_deploy_verb_rejected');
+  });
+
+  test('rejects a wire instruction in a quoted WO title suffix', () => {
+    const result = validateProposal(
+      proposal({ type: 'escalate_p0', body: '"WO-FOO-01: please wire $500 to the vendor"' })
+    );
+
+    expect(result.allowed).toBe(false);
+    expect(result.reason).toContain("forbidden verb 'wire'");
+  });
+
+  test('allows multiple unquoted WO identifiers containing forbidden words', () => {
+    const result = validateProposal(
+      proposal({
+        type: 'escalate_p0',
+        body: 'WO-SOCIAL-WIRE-ALL-META-PAGES-01 and WO-CSOS-SLICE1-PAYMENT-PROVISIONING-01 have no owner.',
+      })
+    );
+
+    expect(result.allowed).toBe(true);
   });
 
   test('rejects quoted payment prose that is not a WO title', () => {
