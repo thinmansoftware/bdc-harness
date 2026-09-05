@@ -143,10 +143,11 @@ export function validateProposal(proposal: ActionProposal): GuardResult {
     return { allowed: false, reason: 'body_empty: refusing to send an empty message.' };
   }
 
-  // Ignore balanced double-quoted spans such as WO titles when checking for
-  // forbidden verbs. An unclosed quote is left in the scan target so it cannot
-  // hide spend/send/deploy instructions in the remaining prose.
-  const scanTarget = normalized.replace(/"[^"]*"/g, ' ');
+  // Exclude only double-quoted WO titles: a WO-[A-Z0-9]+(-[A-Z0-9]+)* id,
+  // optionally followed by ': ' and free text inside the same quotes.
+  // Keep all other quoted text in the scan so quoting a prohibited instruction
+  // cannot bypass spend/send/deploy enforcement (Overseer finding on #764).
+  const scanTarget = normalized.replace(/"WO-[A-Z0-9]+(?:-[A-Z0-9]+)*(?:: [^"]*)?"/g, ' ');
   const match = SPEND_SEND_DEPLOY_RE.exec(scanTarget);
   if (match) {
     return {

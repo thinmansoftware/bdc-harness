@@ -161,6 +161,27 @@ describe('validateProposal', () => {
     expect(result.allowed).toBe(true);
   });
 
+  test('rejects a wire instruction entirely inside quotes', () => {
+    const result = validateProposal(
+      proposal({ type: 'escalate_p0', body: '"Please wire $500 to the vendor"' })
+    );
+
+    expect(result.allowed).toBe(false);
+    expect(result.reason).toContain('spend_send_deploy_verb_rejected');
+  });
+
+  test('rejects quoted payment prose that is not a WO title', () => {
+    const result = validateProposal(
+      proposal({
+        type: 'escalate_p0',
+        body: 'Unclaimed P0: "Send the payment now" has no owner',
+      })
+    );
+
+    expect(result.allowed).toBe(false);
+    expect(result.reason).toContain('spend_send_deploy_verb_rejected');
+  });
+
   test('still rejects an unquoted wire instruction', () => {
     const result = validateProposal(
       proposal({ type: 'escalate_p0', body: 'Please wire $500 to the vendor' })
