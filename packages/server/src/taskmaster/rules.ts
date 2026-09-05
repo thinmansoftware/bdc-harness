@@ -337,7 +337,8 @@ export function computeNextAction(
 
   if (thread.isUnclaimedP0) {
     const bucket = Math.floor(context.nowMs / NUDGE_CLOCK_MS.P0);
-    const titleNote = adoption?.title ? `"${adoption.title}" (${thread.ref})` : thread.ref;
+    const title = adoption?.title?.match(/^WO-[A-Z0-9]+(?:-[A-Z0-9]+)*/)?.[0] ?? adoption?.title;
+    const titleNote = title ? `"${title}" (${thread.ref})` : thread.ref;
     const age = describeMovement(
       adoption?.last_movement_at ?? thread.lastActivityAt,
       context.nowMs
