@@ -144,7 +144,7 @@ echo "--- rst_command_looks_runnable ---"
 for c in "cd shopops-api && node tests/x.js" "bun test packages/x" "npm.cmd test -- --run" "npx vitest run" "pytest -q" "bash scripts/t.sh" "LC_ALL=C node t.js"; do
   if rst_command_looks_runnable "$c"; then PASS=$((PASS+1)); echo "PASS: runnable: $c"; else FAIL=$((FAIL+1)); echo "FAIL: runnable expected: $c"; fi
 done
-for c in "all passing / 0 failing" "see Section 7" "green"; do
+for c in "all passing / 0 failing" "see Section 7" "green" "node" "bun" "cd shopops-api && node" "npm"; do
   if rst_command_looks_runnable "$c"; then FAIL=$((FAIL+1)); echo "FAIL: not runnable expected: $c"; else PASS=$((PASS+1)); echo "PASS: not runnable: $c"; fi
 done
 
