@@ -207,13 +207,14 @@ async function runGate(file: string, checkOutput: string) {
 }
 
 describe('gate-already-satisfied disposition (behavioral)', () => {
-  it('executes exactly the 11 JSON-gate feature-development lanes', () => {
+  it('executes exactly the 12 JSON-gate feature-development lanes', () => {
     // The two Kimi canary lanes appear here only because they now carry the MODERN
     // gate node. They were cloned from fusion-cx-qwen before both the M-85 base-ref
     // fix AND the heredoc-to-shellQuote gate fix landed, so on arrival they had the
     // old broken gate and were correctly excluded by the filter above. Their
     // presence in this list is the evidence that both ports took.
     expect(JSON_GATE_FEATURE_LANES).toEqual([
+      'bdc-feature-development-astra.yaml',
       'bdc-feature-development-codex-only.yaml',
       'bdc-feature-development-codex.yaml',
       'bdc-feature-development-fable.yaml',
