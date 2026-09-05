@@ -24,6 +24,7 @@
  */
 import { createHash } from 'crypto';
 import type { TmAdoptionRow } from '@archon/core/db/taskmaster';
+import { WO_ID_RE } from './guard';
 
 export type ThreadPriority = 'P0' | 'P1' | 'P2' | 'P3';
 export type ThreadClass = 'ready' | 'stale' | 'blocked' | 'healthy';
@@ -337,7 +338,8 @@ export function computeNextAction(
 
   if (thread.isUnclaimedP0) {
     const bucket = Math.floor(context.nowMs / NUDGE_CLOCK_MS.P0);
-    const title = adoption?.title?.match(/^WO-[A-Z0-9]+(?:-[A-Z0-9]+)*/)?.[0] ?? adoption?.title;
+    const woId = adoption?.title?.match(WO_ID_RE);
+    const title = woId?.index === 0 ? woId[0] : adoption?.title;
     const titleNote = title ? `"${title}" (${thread.ref})` : thread.ref;
     const age = describeMovement(
       adoption?.last_movement_at ?? thread.lastActivityAt,

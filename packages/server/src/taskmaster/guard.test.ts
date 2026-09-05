@@ -1,5 +1,10 @@
 import { describe, expect, test } from 'bun:test';
-import { validateProposal, TM_ALLOWED_ACTION_TYPES, TM_ALLOWED_RECIPIENTS } from './guard';
+import {
+  validateProposal,
+  TM_ALLOWED_ACTION_TYPES,
+  TM_ALLOWED_RECIPIENTS,
+  WO_ID_RE,
+} from './guard';
 import type { ActionProposal } from './rules';
 
 function proposal(overrides: Partial<ActionProposal> = {}): ActionProposal {
@@ -19,6 +24,32 @@ function proposal(overrides: Partial<ActionProposal> = {}): ActionProposal {
     ...overrides,
   };
 }
+
+describe('WO_ID_RE', () => {
+  test.each([
+    'WO-WIRE',
+    'WO-DEPLOY',
+    'WO-WIRE-',
+    'WO-wire-01',
+    'XWO-FOO-01',
+    'WO-FOO-1',
+    'WO-FOO-01X',
+    'WO-FOO--01',
+    'WO-FOO-01-extra',
+    'X-WO-FOO-01',
+  ])('does not match an incomplete or embedded identifier: %s', id => {
+    expect(WO_ID_RE.test(id)).toBe(false);
+  });
+
+  test.each([
+    'WO-SOCIAL-WIRE-ALL-META-PAGES-01',
+    'WO-CSOS-SLICE1-PAYMENT-PROVISIONING-01',
+    'WO-HARNESS-TASKMASTER-VERB-GUARD-TITLE-FALSE-POSITIVE-01',
+    'WO-1-ABC2-123',
+  ])('matches the complete identifier in clean prose: %s', id => {
+    expect(`Unclaimed P0: "${id}" has no owner`.match(WO_ID_RE)?.[0]).toBe(id);
+  });
+});
 
 describe('validateProposal', () => {
   test('allows a well-formed nudge', () => {
@@ -131,6 +162,36 @@ describe('validateProposal', () => {
       expect(result.reason).toContain('spend_send_deploy_verb_rejected');
       // Content rejections are journal-only, NOT hard-pause circuits.
       expect(result.forbiddenEffect).toBeUndefined();
+    }
+  });
+
+  test.each([
+    'Please WO-WIRE $500 to the vendor',
+    'WO-DEPLOY production now',
+    'WO-WIRE- has no owner',
+    'WO-wire-01 has no owner',
+    'XWO-WIRE-01 has no owner',
+    'WO-WIRE-1 has no owner',
+    'WO-WIRE-01X has no owner',
+    'WO-WIRE--01 has no owner',
+    'WO-WIRE-01-extra has no owner',
+    'X-WO-WIRE-01 has no owner',
+  ])('rejects forbidden verbs in invalid WO tokens: %s', body => {
+    const result = validateProposal(proposal({ type: 'escalate_p0', body }));
+    expect(result.allowed).toBe(false);
+    expect(result.reason).toContain('spend_send_deploy_verb_rejected');
+  });
+
+  test.each([
+    'WO-WIRE-01',
+    'WO-SOCIAL-WIRE-ALL-META-PAGES-01',
+    'WO-CSOS-SLICE1-PAYMENT-PROVISIONING-01',
+    'WO-HARNESS-TASKMASTER-VERB-GUARD-TITLE-FALSE-POSITIVE-01',
+  ])('allows a complete WO identifier quoted or unquoted: %s', id => {
+    for (const title of [id, `"${id}"`]) {
+      expect(
+        validateProposal(proposal({ type: 'escalate_p0', body: `${title} has no owner` }))
+      ).toEqual({ allowed: true });
     }
   });
 

@@ -116,21 +116,43 @@ describe('computeNextAction', () => {
 
   test('unclaimed P0 quotes only the leading WO id and passes the guard', () => {
     const ref = 'gh:thinmansoftware/bdc-xo#1873';
-    const proposal = computeNextAction(thread({ ref, priority: 'P0', isUnclaimedP0: true }), 'ready', {
-      interventionsLast24h: 0,
-      nowMs: NOW_MS,
-      adoption: makeAdoption({
-        thread_ref: ref,
-        repo: 'thinmansoftware/bdc-xo',
-        issue_number: 1873,
-        title: 'WO-CSOS-SLICE1-PAYMENT-PROVISIONING-01: confirmed charge -> store_tenants -> hostname',
-      }),
-    });
+    const proposal = computeNextAction(
+      thread({ ref, priority: 'P0', isUnclaimedP0: true }),
+      'ready',
+      {
+        interventionsLast24h: 0,
+        nowMs: NOW_MS,
+        adoption: makeAdoption({
+          thread_ref: ref,
+          repo: 'thinmansoftware/bdc-xo',
+          issue_number: 1873,
+          title:
+            'WO-CSOS-SLICE1-PAYMENT-PROVISIONING-01: confirmed charge -> store_tenants -> hostname',
+        }),
+      }
+    );
     expect(proposal?.type).toBe('escalate_p0');
     expect(proposal?.body).toContain('"WO-CSOS-SLICE1-PAYMENT-PROVISIONING-01"');
     expect(proposal?.body).not.toContain('confirmed charge');
     expect(proposal?.body).toContain('https://github.com/thinmansoftware/bdc-xo/issues/1873');
     expect(validateProposal(proposal!)).toEqual({ allowed: true });
+  });
+
+  test.each([
+    'WO-WIRE: please wire $500 to the vendor',
+    'WO-DEPLOY production now',
+    'WO-WIRE-1: please wire $500 to the vendor',
+    'WO-WIRE-01X: please wire $500 to the vendor',
+    'WO-WIRE-01-extra: please wire $500 to the vendor',
+    'Please wire $500 for WO-FOO-01',
+  ])('unclaimed P0 preserves invalid or non-leading WO title for the guard: %s', title => {
+    const proposal = computeNextAction(thread({ priority: 'P0', isUnclaimedP0: true }), 'ready', {
+      interventionsLast24h: 0,
+      nowMs: NOW_MS,
+      adoption: makeAdoption({ title }),
+    });
+    expect(proposal?.body).toContain(`"${title}"`);
+    expect(validateProposal(proposal!).allowed).toBe(false);
   });
 
   test('unclaimed P0 preserves the complete non-WO title and body', () => {

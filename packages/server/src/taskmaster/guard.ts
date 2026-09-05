@@ -13,6 +13,9 @@
  */
 import type { ActionProposal } from './rules';
 
+/** Complete WO tokens: uppercase alphanumeric segments and a 2+ digit ordinal. */
+export const WO_ID_RE = /\b(?<!-)WO-(?:[A-Z0-9]+-)+\d{2,}\b(?!-)/;
+
 /** The complete Slice 1 effect allowlist. Anything else is unauthorized. */
 export const TM_ALLOWED_ACTION_TYPES = [
   'deliver_ruling',
@@ -143,12 +146,10 @@ export function validateProposal(proposal: ActionProposal): GuardResult {
     return { allowed: false, reason: 'body_empty: refusing to send an empty message.' };
   }
 
-  // Exclude only structured WO-[A-Z0-9]+(?:-[A-Z0-9]+)* identifier tokens
-  // wherever they appear, quoted or not: the id itself is never an instruction.
-  // Leave every other character, including any title suffix after ': ', in the
-  // scan so prohibited instructions remain visible (thinman-overseer [major]
-  // quoted WO-title exclusion finding, round 2 on #764).
-  const scanTarget = normalized.replace(/WO-[A-Z0-9]+(?:-[A-Z0-9]+)*/g, '');
+  // Exclude only complete WO identifiers, quoted or not. Word boundaries and
+  // hyphen checks prevent matching part of a longer token. Keep all other
+  // content, including title suffixes, visible to the verb scan (#764 round 4).
+  const scanTarget = normalized.replace(new RegExp(WO_ID_RE.source, 'g'), '');
   const match = SPEND_SEND_DEPLOY_RE.exec(scanTarget);
   if (match) {
     return {
