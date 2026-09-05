@@ -23,6 +23,7 @@ import { promisify } from 'util';
 import { loadLadder, loadRefusedTiers, loadPremiumTiers } from './ladder.js';
 import { loadRuleset, pickEntryTier } from './conductor.js';
 import { fireTier, buildFireMessage } from './fire.js';
+import { cascadeDispatchQueue } from './dispatch-queue.js';
 import { pollForTerminal, TimeoutError } from './poll.js';
 import { judgeGate, classifyAttemptOutcome } from './judge.js';
 import { createRecord, writeRecord } from './recorder.js';
@@ -729,15 +730,33 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
         }
       }
 
-      // Fire the WO on this tier
-      const fireResult: FireResult = await fireImpl({
-        workflowName: tier.workflowName,
-        woId,
-        project,
-        message: buildFireMessage(woId, project, priorContext ?? undefined),
-        apiBaseUrl,
-        token,
-      });
+      // Fire the WO on this tier. The per-attempt sourceEventId is the
+      // deterministic dispatch token: it is unique per fire (distinct from the
+      // per-cascade cascadeId, which would collide across tier climbs), rides
+      // through the fire message as --dispatch-token, is persisted server-side
+      // as the run row's dispatch_token column, and is queried back directly
+      // during discovery -- so concurrent co-fires can never cross-link runs.
+      const dispatchToken = attempt.sourceEventId;
+      // Serialize the dispatch+discovery critical section through the process-wide
+      // FIFO queue (John, 2026-08-18: "shouldnt it go to a queue that spaces them
+      // out"). One fire resolves its run (or honestly fails) before the next
+      // begins, with a small inter-fire spacing under contention and queue-depth
+      // logging when >1 -- defense-in-depth on top of the dispatch token so a
+      // co-fire burst can never stampede the Archon API. FIFO preserves priority
+      // order; nothing is silently reordered.
+      const fireResult: FireResult = await cascadeDispatchQueue.enqueue(
+        `${woId}@${tier.name}`,
+        () =>
+          fireImpl({
+            workflowName: tier.workflowName,
+            woId,
+            project,
+            message: buildFireMessage(woId, project, priorContext ?? undefined, dispatchToken),
+            apiBaseUrl,
+            token,
+            dispatchToken,
+          })
+      );
       attempt.runId = fireResult.runId;
 
       // Infra error: alert + stop (do NOT count as "too hard")

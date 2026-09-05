@@ -494,6 +494,54 @@ describe('POST /api/conversations with message (atomic create+send)', () => {
       });
       expect(response.status).toBe(200);
     });
+
+    // WO-HARNESS-CASCADE-RUN-DISCOVERY-DETERMINISTIC-01 (Scope item 5, Test 3):
+    // the fire-verification contract must hold on the REAL server route -- an
+    // unknown/unroutable workflow fails loudly EVEN WHEN a cascade dispatch token
+    // rides along. This drives POST /api/conversations -> validateWorkflowRunTarget
+    // through the actual registerApiRoutes app (not a mocked 400), so a future
+    // regression to dispatched:true for a nonexistent lane is caught here, and no
+    // run row is ever created for the bogus dispatch token (closing task_ac4d1148).
+    test('unknown workflow carrying a --dispatch-token still fails loudly (no dispatch)', async () => {
+      // Discovery returns a known lane that is NOT the requested one -> no resolve.
+      mockDiscoverWorkflowsWithConfig.mockImplementationOnce(async () => ({
+        workflows: [
+          { workflow: makeWorkflow('bdc-feature-development'), source: 'project' as const },
+        ],
+        errors: [],
+      }));
+      const acquireLock = mock(async (_convId: string, fn: () => Promise<void>) => {
+        await fn();
+        return { status: 'started' as const };
+      });
+      const app = new OpenAPIHono({ defaultHook: validationErrorHook });
+      registerApiRoutes(app, mockWebAdapter, {
+        acquireLock,
+      } as unknown as ConversationLockManager);
+
+      const response = await app.request('/api/conversations', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          message:
+            '/workflow run does-not-exist WO_ID=WO-UNKNOWN-01 --project bdc-harness ' +
+            '--dispatch-token cascade-x:attempt:1',
+        }),
+      });
+
+      expect(response.status).toBe(400);
+      const body = (await response.json()) as {
+        accepted: boolean;
+        dispatched: boolean;
+        error: string;
+      };
+      expect(body.accepted).toBe(false);
+      expect(body.dispatched).toBe(false);
+      expect(body.error).toContain('does-not-exist');
+      // The orchestrator (and therefore run-row + dispatch_token creation) is
+      // never reached for a rejected dispatch.
+      expect(acquireLock.mock.calls.length).toBe(0);
+    });
   });
 
   // WO-HARNESS-ATOMIC-FIRE-FROM-BRANCH-01: atomic --from origin/<branch> override.

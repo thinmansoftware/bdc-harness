@@ -40,6 +40,7 @@ mock.module('./connection', () => ({
 import {
   createWorkflowRun,
   getWorkflowRun,
+  getWorkflowRunByDispatchToken,
   getWorkflowRunStatus,
   getActiveWorkflowRun,
   getActiveWorkflowRunByPath,
@@ -141,6 +142,7 @@ describe('workflows database', () => {
           '{}',
           null,
           null,
+          null,
         ]
       );
     });
@@ -171,6 +173,7 @@ describe('workflows database', () => {
           JSON.stringify({ github_context: 'Issue #42 context' }),
           null,
           null,
+          null,
         ]
       );
     });
@@ -188,8 +191,31 @@ describe('workflows database', () => {
       expect(result.codebase_id).toBeNull();
       expect(mockQuery).toHaveBeenCalledWith(
         expect.stringContaining('INSERT INTO remote_agent_workflow_runs'),
-        ['feature-development', 'conv-456', null, 'Add dark mode support', '{}', null, null]
+        ['feature-development', 'conv-456', null, 'Add dark mode support', '{}', null, null, null]
       );
+    });
+  });
+
+  describe('getWorkflowRunByDispatchToken', () => {
+    test('resolves a run by its deterministic dispatch token', async () => {
+      const tokenedRun = { ...mockWorkflowRun, dispatch_token: 'cascade-x:attempt:1' };
+      mockQuery.mockResolvedValueOnce(createQueryResult([tokenedRun]));
+
+      const result = await getWorkflowRunByDispatchToken('cascade-x:attempt:1');
+
+      expect(result?.id).toBe('workflow-run-123');
+      expect(mockQuery).toHaveBeenCalledWith(
+        expect.stringContaining('WHERE r.dispatch_token = $1'),
+        ['cascade-x:attempt:1']
+      );
+    });
+
+    test('returns null when no run carries the token', async () => {
+      mockQuery.mockResolvedValueOnce(createQueryResult([]));
+
+      const result = await getWorkflowRunByDispatchToken('cascade-x:attempt:99');
+
+      expect(result).toBeNull();
     });
   });
 
