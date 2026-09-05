@@ -16,17 +16,7 @@
  *   5. end-to-end: WO-AUTH-SINGLE-PATH-E2E-04 incident replay through decide+escalate
  */
 
-import {
-  describe,
-  test,
-  expect,
-  beforeAll,
-  afterAll,
-  beforeEach,
-  afterEach,
-  spyOn,
-  mock,
-} from 'bun:test';
+import { describe, test, expect, beforeEach, afterEach, spyOn, mock } from 'bun:test';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -160,8 +150,10 @@ describe('runEscalation: durable operator card', () => {
   const originalArchonDocker = process.env.ARCHON_DOCKER;
   const originalHome = process.env.HOME;
   let fetchSpy: ReturnType<typeof spyOn>;
+  let sqliteFixtureInitializations = 0;
 
-  beforeAll(async () => {
+  beforeEach(async () => {
+    sqliteFixtureInitializations += 1;
     tmpHome = await mkdtemp(join(tmpdir(), 'overseer-escalate-'));
     process.env.ARCHON_HOME = tmpHome;
     // Force getArchonHome to take the ARCHON_HOME branch (not the Docker branch)
@@ -175,7 +167,7 @@ describe('runEscalation: durable operator card', () => {
     );
   });
 
-  afterAll(async () => {
+  afterEach(async () => {
     if (originalArchonHome === undefined) delete process.env.ARCHON_HOME;
     else process.env.ARCHON_HOME = originalArchonHome;
     if (originalNotionKey === undefined) delete process.env.NOTION_API_KEY;
@@ -191,49 +183,19 @@ describe('runEscalation: durable operator card', () => {
     await rm(tmpHome, { recursive: true, force: true });
   });
 
-  test('runEscalation preserves diagnostics and queues all three channel jobs', async () => {
-    const runId = 'test-run-123';
-    const context: EscalationContext = {
-      errorClass: 'validator_feedback_not_applied',
-      nodeId: 'commit-and-push',
-      woId: 'WO-FOO-01',
-      validatorOutput: 'Add lspro_token to scenario 6b',
-      remediation: ['Add lspro_token to scenario 6b'],
-    };
-    const card = await runEscalation(
-      runId,
-      {
-        decision: 'escalate',
-        reason: 'test reason',
-        escalationContext: context,
-      },
-      context,
-      {
-        sourceEventId: 'event-test-run-123',
-        eventType: 'node_failed',
-        stepName: 'commit-and-push',
-        eventCreatedAt: '2026-07-16T08:00:00.000Z',
-      }
-    );
-    const view = await getOperatorCard(card.card_id);
-    expect(view?.card.run_id).toBe(runId);
-    expect(view?.card.wo_id).toBe('WO-FOO-01');
-    expect(view?.card.mechanical_evidence.validator_output).toContain('lspro_token');
-    expect(view?.jobs.map(job => job.channel).sort()).toEqual([
-      'builder_monitor',
-      'dispatch',
-      'notion',
-    ]);
-    expect(fetchSpy).toHaveBeenCalledTimes(0);
-  }, 15000);
-
   test('runEscalation queues Notion without contacting it when credentials are absent', async () => {
+    // This describe used to repeat costly SQLite creation for two overlapping
+    // integration cases. Keep the complete durable-card contract in one isolated
+    // case so Windows CI performs exactly one database initialization here.
+    expect(sqliteFixtureInitializations).toBe(1);
     delete process.env.NOTION_API_KEY;
     const runId = 'test-run-no-notion';
     const context: EscalationContext = {
       errorClass: 'implement_loop_no_output',
       nodeId: 'commit-and-push',
       woId: 'WO-FOO-02',
+      validatorOutput: 'No files changed after implementation',
+      remediation: ['Produce an in-scope change before committing'],
     };
     const card = await runEscalation(
       runId,
@@ -247,7 +209,15 @@ describe('runEscalation: durable operator card', () => {
       }
     );
     const view = await getOperatorCard(card.card_id);
+    expect(view?.card.run_id).toBe(runId);
+    expect(view?.card.wo_id).toBe('WO-FOO-02');
     expect(view?.card.canonical_event_identity.error_class).toBe('implement_loop_no_output');
+    expect(view?.card.mechanical_evidence.validator_output).toContain('No files changed');
+    expect(view?.jobs.map(job => job.channel).sort()).toEqual([
+      'builder_monitor',
+      'dispatch',
+      'notion',
+    ]);
     expect(view?.delivery_summary.notion.state).toBe('pending');
     expect(fetchSpy).toHaveBeenCalledTimes(0);
   }, 15000);

@@ -192,10 +192,10 @@ function stubObserver(
       return probeResult ?? { conflicted: false, conflict_paths: [], conflict_signal: 'none' };
     },
     async applyRefresh() {
-      throw new Error('adapter must not run');
+      throw new Error('adapter must not run on live_state_mismatch');
     },
     async applyRebase() {
-      throw new Error('adapter must not run');
+      throw new Error('adapter must not run on live_state_mismatch');
     },
     async readTreeSha() {
       return 'tree';
@@ -984,6 +984,7 @@ describe('refresh-rebase gate order', () => {
     expect(order.slice(0, 4)).toEqual(['prepare', 'authorize', 'reserve', 'adapter']);
 
     // Denied case: authorization denial makes zero adapter calls, reserve never runs.
+    const tempDirCountBeforeDeniedCase = tempDirs.length;
     // Authorization denial occurs before mutation, so a real Git repository is
     // unnecessary here. Keeping this path in-memory also prevents Windows Git
     // startup time from obscuring the gate-order contract under CI load.
@@ -1030,6 +1031,7 @@ describe('refresh-rebase gate order', () => {
     expect(denied.outcome).toBe('denied');
     expect(denyPerformSpy).toHaveBeenCalledTimes(0);
     expect(denyOrder).toEqual(['prepare', 'authorize']);
+    expect(tempDirs).toHaveLength(tempDirCountBeforeDeniedCase);
   });
 });
 
