@@ -609,6 +609,10 @@ VALUES
   -- WO-HARNESS-OVERSEER-REVIEW-ROUTE-01 (migration 043): the PR-event review
   -- route's sender and worker-poll recipient. Without these rows every
   -- review enqueue is rejected as missing_principal.
+  -- WO-HARNESS-OVERSEER-VERDICT-TO-TASKMASTER-REMEDIATION-01 (migration 046):
+  -- recipient of Overseer's remediation candidates. worker_poll -- the
+  -- Taskmaster loop claims its own work on its tick.
+  ('taskmaster', 'Taskmaster', 'worker_poll', TRUE),
   ('overseer-reviewer', 'Overseer PR Reviewer', 'worker_poll', TRUE),
   ('overseer-review-route', 'Overseer Review Route', 'notify_only', TRUE)
 ON CONFLICT (principal_id) DO NOTHING;

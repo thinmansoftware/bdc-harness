@@ -23,6 +23,12 @@ import type {
 } from './adapters/github-real-deps.ts';
 import { hasDistinctMergeIdentity } from './adapters/github-real-deps';
 import { resolveMergeManagerMode } from './merge-manager';
+import type { IndependentReviewFinding } from './independent-review-evidence.ts';
+import {
+  decideRemediation,
+  type RemediationCandidateBody,
+  type RemediationRefusalReason,
+} from './remediation-candidate';
 
 /** What the governed reviewer returns. */
 export interface ReviewerVerdict {
@@ -32,6 +38,16 @@ export interface ReviewerVerdict {
   summary: string;
   /** The head the reviewer actually examined. Must match the work item. */
   reviewedHeadSha: string;
+  /**
+   * The structured findings behind the verdict.
+   *
+   * Carried alongside `summary` because remediation classification must read
+   * SEVERITY and per-finding text, which the flattened summary string has
+   * already lost. Optional so existing reviewers that only produce a summary
+   * keep working -- absent findings simply yield no remediation candidate,
+   * which is the fail-closed direction.
+   */
+  findings?: readonly IndependentReviewFinding[];
   /**
    * True when CI checks on the bound head are not yet terminal, so no verdict
    * was formed. A non-terminal disposition -- MUST NOT be collapsed into
@@ -67,6 +83,12 @@ export interface SubmitOutcome {
   disposition: SubmitDisposition;
   reason?: string;
   event?: OverseerReviewEvent;
+  /**
+   * Present only on a changes_requested disposition. Reports whether the
+   * verdict was handed back to Taskmaster and, when it was not, why it stopped
+   * with a human instead.
+   */
+  remediation?: RemediationOutcome;
 }
 
 export interface SubmitDeps {
@@ -90,7 +112,59 @@ export interface SubmitDeps {
     disposition: SubmitDisposition;
     event?: OverseerReviewEvent;
     reason?: string;
+    /**
+     * Carried onto the operator card so a human reading the escalation can
+     * tell "handed back to Taskmaster, attempt 1" from "stopped here because a
+     * blocking finding needs your judgment".
+     */
+    remediation?: RemediationOutcome;
   }): Promise<void>;
+
+  /**
+   * Hands a CHANGES_REQUESTED verdict back to Taskmaster as a remediation
+   * PROPOSAL (WO-...-VERDICT-TO-TASKMASTER-REMEDIATION-01).
+   *
+   * OPTIONAL BY DESIGN. When absent, this module behaves exactly as it did
+   * before: the review is submitted and the operator-card path is unchanged.
+   * That keeps the existing escalation regression-safe and makes the hand-back
+   * an additive capability rather than a rewrite of the review route.
+   *
+   * The implementation must return the attempts ALREADY made for this PR so
+   * the cap can be enforced against durable state rather than a value this
+   * module guesses. Returning nothing signals the counter was unavailable, and
+   * the caller then declines to emit -- fail-closed.
+   */
+  countPriorRemediationAttempts?(input: {
+    owner: string;
+    repo: string;
+    prNumber: number;
+  }): Promise<number>;
+
+  /**
+   * Writes the remediation candidate onto the existing dispatch seam. Never
+   * fires a builder: Taskmaster's budget, backoff, pause state, and
+   * fire-eligibility still decide whether the proposal becomes work.
+   *
+   * Returns `claimed: false` when this attempt slot was already taken -- the
+   * durable per-PR cap is enforced by a UNIQUE constraint on the attempt slot,
+   * so a concurrent emitter can lose the race. Losing is a correct outcome, but
+   * it must be REPORTED rather than reported as success, or an operator would
+   * be told a fix was queued when this verdict queued nothing.
+   */
+  emitRemediationCandidate?(body: RemediationCandidateBody): Promise<{ claimed: boolean }>;
+}
+
+/** What the remediation hand-back did, recorded on the receipt. */
+export interface RemediationOutcome {
+  readonly emitted: boolean;
+  /** Present when emitted; identifies the attempt for audit. */
+  readonly attempt?: number;
+  /** Present when NOT emitted, so a human sees why it stopped with them. */
+  readonly reason?:
+    | RemediationRefusalReason
+    | 'remediation_not_configured'
+    | 'emit_failed'
+    | 'attempt_slot_already_claimed';
 }
 
 /** Bounds the evidence body so a runaway reviewer cannot post an essay. */
@@ -246,10 +320,79 @@ export async function runAndSubmitReview(
     });
   }
 
+  if (verdict.approved) {
+    return finish(deps, work, work.headSha, { disposition: 'approved', event });
+  }
+
+  // THE MISSING ARROW. The review has landed as REQUEST_CHANGES; without this
+  // the loop ended here and the finding waited on a human mailbox. Hand it
+  // back to Taskmaster, which decides whether it actually becomes work.
+  const remediation = await handBackToTaskmaster(work, verdict, deps);
   return finish(deps, work, work.headSha, {
-    disposition: verdict.approved ? 'approved' : 'changes_requested',
+    disposition: 'changes_requested',
     event,
+    remediation,
   });
+}
+
+/**
+ * Turn a rejected verdict into a remediation proposal for Taskmaster.
+ *
+ * NEVER THROWS. A failure to hand back must not convert a successfully
+ * submitted review into a failed submission -- the review is already on the PR
+ * and that fact must survive. Every failure path degrades to "not emitted" with
+ * a stated reason, which routes the finding to a human: the same place it went
+ * before this capability existed.
+ */
+async function handBackToTaskmaster(
+  work: ReviewWorkItem,
+  verdict: ReviewerVerdict,
+  deps: SubmitDeps
+): Promise<RemediationOutcome> {
+  if (!deps.emitRemediationCandidate || !deps.countPriorRemediationAttempts) {
+    return { emitted: false, reason: 'remediation_not_configured' };
+  }
+
+  let priorAttempts: number;
+  try {
+    priorAttempts = await deps.countPriorRemediationAttempts({
+      owner: work.owner,
+      repo: work.repo,
+      prNumber: work.prNumber,
+    });
+  } catch {
+    // Cannot prove we are under the cap -> must not emit. An unbounded
+    // reviewer-fix-reviewer loop is the exact failure this WO must not create.
+    return { emitted: false, reason: 'emit_failed' };
+  }
+
+  const decision = decideRemediation({
+    owner: work.owner,
+    repo: work.repo,
+    prNumber: work.prNumber,
+    headSha: work.headSha,
+    verdict: 'CHANGES_REQUESTED',
+    findings: verdict.findings ?? [],
+    verdictBody: buildReviewBody(work, verdict),
+    priorAttempts,
+    owningLane: work.author || null,
+  });
+
+  if (!decision.emit) return { emitted: false, reason: decision.reason };
+
+  let result: { claimed: boolean };
+  try {
+    result = await deps.emitRemediationCandidate(decision.body);
+  } catch {
+    return { emitted: false, reason: 'emit_failed' };
+  }
+  // Losing the race for an attempt slot means another rejected review already
+  // queued this attempt. The cap held; this verdict simply created no work, and
+  // saying so keeps the receipt honest.
+  if (!result.claimed) {
+    return { emitted: false, reason: 'attempt_slot_already_claimed' };
+  }
+  return { emitted: true, attempt: decision.body.attempt };
 }
 
 function errorCode(error: unknown): string {
@@ -274,6 +417,7 @@ async function finish(
       disposition: outcome.disposition,
       ...(outcome.event ? { event: outcome.event } : {}),
       ...(outcome.reason ? { reason: outcome.reason } : {}),
+      ...(outcome.remediation ? { remediation: outcome.remediation } : {}),
     });
   } catch {
     // Receipt failure never converts a classified outcome into a throw.

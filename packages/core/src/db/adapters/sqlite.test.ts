@@ -168,6 +168,9 @@ describe('SqliteAdapter', () => {
         // alphabetically by principal_id, same as the query's ORDER BY.
         { principal_id: 'overseer-review-route', delivery_mode: 'notify_only', active: 1 },
         { principal_id: 'overseer-reviewer', delivery_mode: 'worker_poll', active: 1 },
+        // WO-HARNESS-OVERSEER-VERDICT-TO-TASKMASTER-REMEDIATION-01
+        // (migration 046): recipient of Overseer's remediation candidates.
+        { principal_id: 'taskmaster', delivery_mode: 'worker_poll', active: 1 },
         { principal_id: 'xo', delivery_mode: 'drain_on_start', active: 1 },
       ]);
     });

@@ -29,6 +29,11 @@ import {
 } from './pr-review-evaluator';
 import type { PrReviewDeps, PrReviewInput, PrReviewResult } from './pr-review-evaluator';
 import type { ReviewerVerdict, SubmitDeps } from './pr-review-submit.ts';
+import {
+  countPriorRemediationAttempts,
+  remediationIdempotencyKey,
+  REMEDIATION_RECIPIENT,
+} from './remediation-candidate';
 
 /** Env var carrying the shared GitHub webhook secret for the review route. */
 export const REVIEW_WEBHOOK_SECRET_ENV = 'OVERSEER_REVIEW_WEBHOOK_SECRET';
@@ -310,6 +315,10 @@ export function createRealSubmitDeps(
         approved: result.verdict === 'APPROVE',
         summary,
         reviewedHeadSha: result.reviewed_head_sha,
+        // Structured findings ride alongside the flattened summary so
+        // remediation classification can read severity per finding. The
+        // summary string has already lost that.
+        findings: result.findings,
       };
     },
     submitReview: createRealSubmitPullRequestReview(octokit),
@@ -332,6 +341,76 @@ export function createRealSubmitDeps(
           body: JSON.stringify({ kind: 'pr_review_submit_receipt', ...input }),
         }
       );
+    },
+
+    /**
+     * Attempts are derived from the durable dispatch rows themselves rather
+     * than from a separate counter table: every prior candidate IS a row under
+     * this PR's subject key, so the count cannot drift out of agreement with
+     * the queue it is supposed to bound.
+     */
+    async countPriorRemediationAttempts(input): Promise<number> {
+      const messages = await dispatch.listMessages({
+        recipient: REMEDIATION_RECIPIENT,
+        subject_key: reviewSubjectKey(input.owner, input.repo, input.prNumber),
+      });
+      return countPriorRemediationAttempts(messages, input);
+    },
+
+    /**
+     * Writes the proposal onto the seam Taskmaster already reads.
+     *
+     * THE CAP IS ENFORCED HERE, BY THE DATABASE. `idempotency_key` is keyed on
+     * (PR, attempt) and is UNIQUE, and `createAuthenticatedMessage` inserts with ON CONFLICT
+     * DO NOTHING. Two concurrent rejected reviews that both read the same prior
+     * count therefore race for ONE row and exactly one wins -- the read-then-
+     * write sequence can no longer produce more than MAX_REMEDIATION_ATTEMPTS
+     * candidates. The loser is reported, not silently swallowed: returning
+     * `claimed: false` lets the caller record that this verdict did not create
+     * work, so an operator is not told a fix was queued when it was not.
+     */
+    async emitRemediationCandidate(body): Promise<{ claimed: boolean }> {
+      const idempotencyKey = remediationIdempotencyKey({
+        owner: body.owner,
+        repo: body.repo,
+        prNumber: body.prNumber,
+        attempt: body.attempt,
+      });
+      const serialized = JSON.stringify(body);
+      // Sender authentication (PR #669) replaced the unauthenticated
+      // createMessage with createAuthenticatedMessage, which binds an explicit
+      // sender context. bindSenderContext admits exactly three system senders
+      // -- 'dispatch', 'overseer', 'taskmaster' -- so REVIEW_SENDER ('overseer')
+      // is used here, matching every other emit on this route. The seeded
+      // 'overseer-review-route' principal remains the recipient-side identity
+      // recorded in the body, not the authenticated sender.
+      const message = await dispatch.createAuthenticatedMessage(
+        { kind: 'system', sender: REVIEW_SENDER },
+        {
+          correlation_id: `overseer-remediation:${body.owner}/${body.repo}#${body.prNumber}`,
+          idempotency_key: idempotencyKey,
+          // Reuses the existing run_review task type: this is queued review-loop
+          // work, and adding a task_type would require a DB CHECK-constraint
+          // migration for no behavioral gain. The `kind` discriminator in the
+          // body is what identifies a remediation candidate.
+          task_type: 'run_review',
+          recipient: REMEDIATION_RECIPIENT,
+          body: serialized,
+          subject_key: reviewSubjectKey(body.owner, body.repo, body.prNumber),
+          // REQUIRED for attempt 2+. Once any earlier message under this PR's
+          // subject key reaches a terminal state, createAuthenticatedMessage throws
+          // `repeat_reason_required` unless a reason is supplied -- the dispatch
+          // layer refuses to silently re-open a settled subject. Attempt 2 is
+          // exactly that case, so without this every second remediation would be
+          // rejected at enqueue and the cap of 2 would effectively be a cap of 1.
+          repeat_reason: `remediation attempt ${body.attempt} of ${body.maxAttempts} for head ${body.headSha}`,
+        }
+      );
+      // createAuthenticatedMessage returns the EXISTING row on conflict rather than
+      // throwing, so the stored body is what distinguishes "I claimed this
+      // attempt slot" from "someone else already had it". Comparing bodies is
+      // exact here because both sides serialize the same interface.
+      return { claimed: message.body === serialized };
     },
   };
 }
