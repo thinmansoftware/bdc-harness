@@ -15,6 +15,8 @@
  *   --token <token>            Operator token (default: ARCHON_OPERATOR_TOKEN env)
  *   --project <shortname>      Required codebase shortname for explicit binding
  *   --poll-timeout-ms <ms>     Per-attempt poll timeout override (default: 1800000 / 30 min)
+ *   --allow-satisfied          Fire even if an open/merged PR already claims the WO
+ *                              (operator override; plumbed from fire.ps1 -AllowSatisfied)
  *
  * Secret boundary: API URL and token come from env/flags. Never log token values.
  * ASCII only. No emojis.
@@ -91,6 +93,7 @@ interface CliArgs {
   token?: string;
   project?: string;
   pollTimeoutMs?: number;
+  allowSatisfied: boolean;
 }
 
 function printHelp(): void {
@@ -113,6 +116,8 @@ Options:
   --token <token>    Operator token (default: ARCHON_OPERATOR_TOKEN env)
   --project <name>   Required codebase shortname for explicit binding
   --poll-timeout-ms <ms>  Per-attempt poll timeout override (default: 1800000 / 30 min)
+  --allow-satisfied  Fire even if an open/merged PR already claims the WO. Operator
+                     override (fire.ps1 -AllowSatisfied); the ignored PR is logged.
   --help, -h         Show this help
 
 Examples:
@@ -122,10 +127,11 @@ Examples:
   smart-cauldron fire WO-HARNESS-001 --dry-run
   smart-cauldron fire WO-HARNESS-001 --project harness --entry claude --api-url http://localhost:3090
   smart-cauldron fire WO-HARNESS-001 --project harness --poll-timeout-ms 900000
+  smart-cauldron fire WO-HARNESS-001 --project harness --allow-satisfied
 `);
 }
 
-function parseArgs(argv: string[]): CliArgs {
+export function parseArgs(argv: string[]): CliArgs {
   const args = argv.slice(2); // remove 'bun' and script path
 
   if (args.length === 0 || args[0] === '--help' || args[0] === '-h') {
@@ -138,6 +144,7 @@ function parseArgs(argv: string[]): CliArgs {
     command,
     outDir: './cascade-runs',
     dryRun: false,
+    allowSatisfied: false,
   };
 
   const positional: string[] = [];
@@ -161,6 +168,9 @@ function parseArgs(argv: string[]): CliArgs {
       i += 2;
     } else if (arg === '--dry-run') {
       result.dryRun = true;
+      i++;
+    } else if (arg === '--allow-satisfied') {
+      result.allowSatisfied = true;
       i++;
     } else if (arg === '--api-url' && i + 1 < args.length) {
       result.apiUrl = args[i + 1];
@@ -261,6 +271,10 @@ async function main(): Promise<void> {
   if (args.dryRun) console.log('[smart-cauldron]   DRY RUN mode');
   if (args.pollTimeoutMs !== undefined)
     console.log(`[smart-cauldron]   poll timeout override=${args.pollTimeoutMs}ms`);
+  if (args.allowSatisfied)
+    console.log(
+      '[smart-cauldron]   allow-satisfied=true (operator override of the satisfied guard)'
+    );
 
   const { runCascade } = await import('./cascade.js');
   const record = await runCascade({
@@ -274,6 +288,7 @@ async function main(): Promise<void> {
     token: fireAuth?.token,
     project: fireAuth?.project,
     pollTimeoutMs: args.pollTimeoutMs,
+    allowSatisfied: args.allowSatisfied,
   });
 
   console.log('');

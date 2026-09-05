@@ -169,6 +169,15 @@ export interface RunCascadeOptions {
   outDir?: string;
   /** Dry-run: print which tier would be picked, do not fire. */
   dryRun?: boolean;
+  /**
+   * Operator override of the already-satisfied guard. Plumbed from
+   * `fire.ps1 -AllowSatisfied` -> `cli.ts fire --allow-satisfied`. When true
+   * the cascade fires even though an open/merged PR claims the WO; the
+   * overridden claim is logged so the cascade log shows what was ignored.
+   * Before 2026-09-02 the flag stopped at fire.ps1's own gh check and never
+   * reached the conductor, which then refused the fire on its own check.
+   */
+  allowSatisfied?: boolean;
   /** M-31 permit required before default escalation side effects can run. */
   overseerPermit?: M31ActionPermit;
   /** Dependency injection (for testing). */
@@ -206,6 +215,7 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
     tags,
     entryOverride,
     dryRun = false,
+    allowSatisfied = false,
     outDir = './cascade-runs',
     pollTimeoutMs = 14_400_000,
     pollStallTimeoutMs = 1_200_000,
@@ -245,6 +255,7 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
   const acquireWoLockImpl = opts.deps?.acquireWoLock ?? acquireWoLock;
   const releaseWoLockImpl = opts.deps?.releaseWoLock ?? releaseWoLock;
   const allowClaimed =
+    allowSatisfied ||
     process.env.SMART_CAULDRON_ALLOW_CLAIMED === '1' ||
     process.env.SMART_CAULDRON_ALLOW_CLAIMED === 'true';
 
@@ -408,6 +419,21 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
       onAdmission?.(admissionEarly.record, admissionEarly.created);
       await releaseWoLockImpl(woId, project, cascadeId, outDir);
       return admissionEarly.record;
+    }
+  } else if (allowSatisfied) {
+    // Explicit operator override: still look, so the cascade log records what
+    // was overridden, but never stop on it.
+    const overriddenClaim = await findWoClaimImpl(woId, project);
+    if (overriddenClaim) {
+      console.log(
+        `[smart-cauldron] ALLOW-SATISFIED override: PR #${overriddenClaim.number} ` +
+          `[${overriddenClaim.state}] ${overriddenClaim.url} claims woId=${woId} -- ` +
+          'firing anyway (operator-owned; fire.ps1 -AllowSatisfied)'
+      );
+    } else {
+      console.log(
+        `[smart-cauldron] ALLOW-SATISFIED set but no PR claims woId=${woId} -- flag had no effect`
+      );
     }
   }
 
