@@ -16,7 +16,17 @@
  *   5. end-to-end: WO-AUTH-SINGLE-PATH-E2E-04 incident replay through decide+escalate
  */
 
-import { describe, test, expect, beforeEach, afterEach, spyOn, mock } from 'bun:test';
+import {
+  describe,
+  test,
+  expect,
+  beforeAll,
+  afterAll,
+  beforeEach,
+  afterEach,
+  spyOn,
+  mock,
+} from 'bun:test';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -151,7 +161,7 @@ describe('runEscalation: durable operator card', () => {
   const originalHome = process.env.HOME;
   let fetchSpy: ReturnType<typeof spyOn>;
 
-  beforeEach(async () => {
+  beforeAll(async () => {
     tmpHome = await mkdtemp(join(tmpdir(), 'overseer-escalate-'));
     process.env.ARCHON_HOME = tmpHome;
     // Force getArchonHome to take the ARCHON_HOME branch (not the Docker branch)
@@ -165,7 +175,7 @@ describe('runEscalation: durable operator card', () => {
     );
   });
 
-  afterEach(async () => {
+  afterAll(async () => {
     if (originalArchonHome === undefined) delete process.env.ARCHON_HOME;
     else process.env.ARCHON_HOME = originalArchonHome;
     if (originalNotionKey === undefined) delete process.env.NOTION_API_KEY;
