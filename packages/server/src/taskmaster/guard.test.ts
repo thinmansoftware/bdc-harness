@@ -197,4 +197,28 @@ describe('validateProposal', () => {
     expect(result.allowed).toBe(false);
     expect(result.reason?.toLowerCase()).toContain("'send the invoice'");
   });
+
+  test('fails closed when two quoted spans make the title delimiter ambiguous', () => {
+    const result = validateProposal(
+      proposal({
+        type: 'escalate_p0',
+        body: 'Unclaimed P0: "WO-WIRE-VENDOR-01" (gh:org/repo#1) reason "needs triage".',
+      })
+    );
+
+    expect(result.allowed).toBe(false);
+    expect(result.reason?.toLowerCase()).toContain("'wire'");
+  });
+
+  test('fails closed when an untrusted title contains an embedded quote', () => {
+    const result = validateProposal(
+      proposal({
+        type: 'escalate_p0',
+        body: 'Unclaimed P0: "X wire $500 "Y" Z" (gh:org/repo#1) [P0] has no owner.',
+      })
+    );
+
+    expect(result.allowed).toBe(false);
+    expect(result.reason?.toLowerCase()).toContain("'wire'");
+  });
 });

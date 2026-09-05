@@ -143,10 +143,18 @@ export function validateProposal(proposal: ActionProposal): GuardResult {
     return { allowed: false, reason: 'body_empty: refusing to send an empty message.' };
   }
 
-  // Ignore balanced double-quoted spans such as WO titles when checking for
-  // forbidden verbs. An unclosed quote is left in the scan target so it cannot
-  // hide spend/send/deploy instructions in the remaining prose.
-  const scanTarget = normalized.replace(/"[^"]*"/g, ' ');
+  // The outbound templates contain exactly one pair of double quotes: the
+  // delimiters around the untrusted tracker title. Exempt that span only when
+  // it is the body's sole clean quote pair. Extra or unclosed quotes make the
+  // delimiter ambiguous, so fail closed by scanning the entire body; otherwise
+  // an embedded quote in a title could re-pair with a later quote and hide
+  // Taskmaster-authored prose.
+  //
+  // Residual risk accepted by the Slice 1 contract: forbidden words in a clean
+  // quoted title are exempt, so operators must continue to treat tracker titles
+  // as untrusted labels, never as instructions or authority to act.
+  const quoteCount = normalized.split('"').length - 1;
+  const scanTarget = quoteCount === 2 ? normalized.replace(/"[^"]*"/, ' ') : normalized;
   const match = SPEND_SEND_DEPLOY_RE.exec(scanTarget);
   if (match) {
     return {
