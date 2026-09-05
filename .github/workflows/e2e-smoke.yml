@@ -32,6 +32,9 @@ jobs:
 
   # --- Tier 2a: Claude provider ------------------------------------------
   e2e-claude:
+    # Disabled while CI's ANTHROPIC_API_KEY reports an exhausted credit balance.
+    # Re-enable by removing this condition after a credential-backed smoke run succeeds.
+    if: ${{ false }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -62,6 +65,9 @@ jobs:
 
   # --- Tier 2b: Codex provider -------------------------------------------
   e2e-codex:
+    # Disabled while CI's OPENAI_API_KEY is unavailable (provider returns HTTP 401).
+    # Re-enable by removing this condition after a credential-backed smoke run succeeds.
+    if: ${{ false }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -91,6 +97,7 @@ jobs:
 
   # --- Tier 3: Mixed providers -------------------------------------------
   e2e-mixed:
+    # GitHub skips this job while either credential-backed prerequisite above is skipped.
     runs-on: ubuntu-latest
     timeout-minutes: 5
     needs: [e2e-claude, e2e-codex]
