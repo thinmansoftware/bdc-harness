@@ -1132,7 +1132,7 @@ nodes:
       rst_tests_in_diff() {
         local base="$1" files f js_runner="" bun_files="" py_files=""
         files="$( { git diff --name-only "$base" -- 2>/dev/null; git ls-files --others --exclude-standard 2>/dev/null; } | sort -u \
-          | grep -E '(^|/)(tests?|__tests__|spec)/|\.(test|spec)\.[cm]?[jt]sx?$|(^|/)test_[^/]*\.(js|mjs|cjs|py)$' \
+          | grep -E '(^|/)(tests?|__tests__|spec)/|\.(test|spec)\.[cm]?[jt]sx?$|(^|/)test_[^/]*\.(js|mjs|cjs|py|sh)$' \
           | grep -vE '(^|/)(fixtures?|helpers?|__snapshots__|__mocks__|setup)/|(^|/)(run_all|_[^/]*|setup[^/]*|conftest)\.[a-z]+$|\.(json|md|txt|csv|snap|sql|yaml|yml|html)$' || true)"
         [ -n "$files" ] || return 0
         if [ -f package.json ]; then
@@ -1149,6 +1149,8 @@ nodes:
             *.test.*|*.spec.*|*__tests__/*) bun_files="${bun_files:+$bun_files }$f" ;;
             */tests/test_*.js|*/tests/test_*.mjs|*/tests/test_*.cjs) printf 'cd %s && node tests/%s\n' "${f%%/tests/*}" "${f##*/tests/}" ;;
             tests/test_*.js|tests/test_*.mjs|tests/test_*.cjs) printf 'node %s\n' "$f" ;;
+            */tests/test_*.sh) printf 'cd %s && bash tests/%s\n' "${f%%/tests/*}" "${f##*/tests/}" ;;
+            tests/test_*.sh|tests/*.test.sh|tests/*_test.sh) printf 'bash %s\n' "$f" ;;
             *) ;;
           esac
         done <<<"$files"

@@ -314,11 +314,12 @@ TMP="$(mktemp -d)"
   printf 'h\n' > tests/helpers/h.js
   printf 'r\n' > shopops-api/tests/run_all.js
   printf 'u\n' > shopops-api/tests/_harness.js
+  printf 's\n' > tests/test_validate_prior_art_evidence.sh
   git add -A && git commit -qm change
   mkdir -p packages/y && printf 'u\n' > packages/y/z.spec.ts
   OUT="$(rst_tests_in_diff "$BASE")"
-  assert_eq "bun runner groups committed + untracked test files; fixtures/helpers/run_all/_harness/src excluded" \
-    "$(printf 'cd shopops-api && node tests/test_b.js\nbun test packages/x/src/a.test.ts packages/y/z.spec.ts')" "$OUT"
+  assert_eq "bun runner groups committed + untracked test files; bash test at root; fixtures/helpers/run_all/_harness/src excluded" \
+    "$(printf 'cd shopops-api && node tests/test_b.js\nbash tests/test_validate_prior_art_evidence.sh\nbun test packages/x/src/a.test.ts packages/y/z.spec.ts')" "$OUT"
   printf '{"name":"x","devDependencies":{"vitest":"^2"}}\n' > package.json
   OUT="$(rst_tests_in_diff "$BASE")"
   assert_contains "vitest declared in package.json -> npx vitest run" "npx vitest run packages/x/src/a.test.ts packages/y/z.spec.ts" "$OUT"
