@@ -23,7 +23,7 @@ registerCommunityProviders();
 const REPO_ROOT = join(import.meta.dir, '..', '..', '..');
 const LANES_DIR = join(REPO_ROOT, '.archon/workflows/defaults');
 
-// The 12 lanes that carry the check-already-satisfied precheck node (spec Section 5).
+// The 15 lanes that carry the check-already-satisfied precheck node (spec Section 5).
 // Hardcoded on purpose: this is the tripwire that forces a NEW lane to be given the
 // base-ref precheck rather than silently inheriting the old worktree-only prompt.
 // Kimi canary lanes added here 2026-07-25 -- they were cloned from fusion-cx-qwen
@@ -31,6 +31,7 @@ const LANES_DIR = join(REPO_ROOT, '.archon/workflows/defaults');
 // "Do NOT consult origin/main" instruction and no BASE_CHECK. This test caught that
 // before merge; the fix was ported into both.
 const EXPECTED_PRECHECK_LANES = [
+  'bdc-feature-development-astra.yaml',
   'bdc-feature-development-codex-only.yaml',
   'bdc-feature-development-codex.yaml',
   'bdc-feature-development-fable.yaml',
@@ -71,7 +72,7 @@ function precheckPrompt(file: string): string {
 }
 
 describe('already-satisfied base-ref visibility (WO-HARNESS-PRECHECK-BASE-REF-VISIBILITY-01)', () => {
-  it('discovers exactly the 14 expected precheck lanes', () => {
+  it('discovers exactly the 15 expected precheck lanes', () => {
     expect(PRECHECK_LANE_FILES).toEqual(EXPECTED_PRECHECK_LANES);
   });
 
