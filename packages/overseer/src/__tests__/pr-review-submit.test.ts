@@ -211,6 +211,44 @@ describe('merge-custody conflict (M-153, RULED 2026-08-24)', () => {
   });
 });
 
+describe('checks pending (WO-HARNESS-OVERSEER-REVIEW-WAITS-FOR-CHECKS-01)', () => {
+  test('a checks-pending verdict submits nothing and records a checks_pending receipt', async () => {
+    const { deps, rec } = makeDeps({
+      runReviewer: async () => ({
+        approved: false,
+        summary: '',
+        reviewedHeadSha: HEAD,
+        checksPending: true,
+      }),
+    });
+    const outcome = await runAndSubmitReview(WORK, deps);
+    expect(outcome.disposition).toBe('checks_pending');
+    expect(outcome.reason).toBe('checks_not_terminal');
+    // No REQUEST_CHANGES (or any review) is submitted on checks-pending grounds.
+    expect(rec.submitted).toHaveLength(0);
+    // A receipt is still recorded so the defer is observable.
+    expect(rec.receipts).toHaveLength(1);
+    expect(rec.receipts[0]?.disposition).toBe('checks_pending');
+    expect(rec.receipts[0]?.headSha).toBe(HEAD);
+  });
+
+  test('custody and merge-custody are still enforced before the checks-pending branch', async () => {
+    // Custody runs before runReviewer is even called, so a reviewer-authored PR
+    // is a custody_conflict regardless of checksPending.
+    const { deps, rec } = makeDeps({
+      runReviewer: async () => ({
+        approved: false,
+        summary: '',
+        reviewedHeadSha: HEAD,
+        checksPending: true,
+      }),
+    });
+    const outcome = await runAndSubmitReview({ ...WORK, author: REVIEWER }, deps);
+    expect(outcome.disposition).toBe('custody_conflict');
+    expect(rec.submitted).toHaveLength(0);
+  });
+});
+
 describe('exact-head binding', () => {
   test('refuses to submit when the reviewer examined a different head', async () => {
     const { deps, rec } = makeDeps({

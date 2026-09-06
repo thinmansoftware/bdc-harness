@@ -294,4 +294,158 @@ describe('pr-review-wiring against a real SqliteAdapter', () => {
     expect(rows.rows[0]?.repeat_reason).toBe(`review_exact_head:${secondHeadSha}`);
     expect(JSON.parse(rows.rows[0]?.body ?? '{}').headSha).toBe(secondHeadSha);
   });
+
+  /**
+   * Real-world reproduction (2026-09-02): a `synchronize` push arrives while
+   * the FIRST review for that PR is still 'queued' (not yet claimed or
+   * terminal) -- the common case, since re-review usually beats the reviewer
+   * to the mailbox. Prior coverage only proved the terminal-state case
+   * (review already 'done'); this proves the non-terminal case end-to-end
+   * against the real dispatch DAL, including that ingest's own stale-head
+   * cancellation runs BEFORE the second enqueue rather than racing it.
+   */
+  test('a synchronize event enqueues a fresh review while the prior review for an older head is still queued', async () => {
+    const config = {
+      webhookSecret: 'integration-test-secret',
+      reviewerIdentity: 'thinman-overseer[bot]',
+    };
+    const deps = createRealIngestDeps(config);
+
+    const payloadFor = (action: 'opened' | 'synchronize', headSha: string): string =>
+      JSON.stringify({
+        action,
+        number: 117,
+        pull_request: {
+          number: 117,
+          draft: false,
+          head: { sha: headSha, ref: 'feature-branch' },
+          base: { ref: 'dev', sha: 'f'.repeat(40) },
+          user: { login: 'bluedevilcollectibles' },
+        },
+        repository: { name: 'shopops-comic-theme', owner: { login: 'thinmansoftware' } },
+      });
+
+    const firstHeadSha = '3'.repeat(40);
+    const firstPayload = payloadFor('opened', firstHeadSha);
+    const first = await ingestPullRequestEvent(
+      {
+        rawBody: firstPayload,
+        signature: sign(firstPayload, config.webhookSecret),
+        eventType: 'pull_request',
+        deliveryId: 'integration-delivery-nonterminal-1',
+      },
+      deps
+    );
+    expect(first.disposition).toBe('queued');
+
+    // Deliberately left 'queued' -- do NOT mark it done/claimed. This is the
+    // gap the terminal-state test above does not exercise.
+    const priorStatus = await db.query<{ status: string }>(
+      `SELECT status FROM agent_dispatch_messages WHERE id = $1`,
+      [first.messageId]
+    );
+    expect(priorStatus.rows[0]?.status).toBe('queued');
+
+    const secondHeadSha = '4'.repeat(40);
+    const secondPayload = payloadFor('synchronize', secondHeadSha);
+    const second = await ingestPullRequestEvent(
+      {
+        rawBody: secondPayload,
+        signature: sign(secondPayload, config.webhookSecret),
+        eventType: 'pull_request',
+        deliveryId: 'integration-delivery-nonterminal-2',
+      },
+      deps
+    );
+
+    expect(second.disposition).toBe('superseded_head');
+    expect(second.messageId).toBeDefined();
+    expect(second.messageId).not.toBe(first.messageId);
+    expect(second.invalidatedMessageIds).toContain(first.messageId);
+
+    const rows = await db.query<{
+      status: string;
+      repeat_reason: string | null;
+      body: string;
+    }>(`SELECT status, repeat_reason, body FROM agent_dispatch_messages WHERE id = $1`, [
+      second.messageId,
+    ]);
+    expect(rows.rows).toHaveLength(1);
+    expect(rows.rows[0]?.status).toBe('queued');
+    expect(rows.rows[0]?.repeat_reason).toBe(`review_exact_head:${secondHeadSha}`);
+    expect(JSON.parse(rows.rows[0]?.body ?? '{}').headSha).toBe(secondHeadSha);
+
+    // The original (older-head) queued row was cancelled, not left dangling.
+    const cancelledPriorStatus = await db.query<{ status: string }>(
+      `SELECT status FROM agent_dispatch_messages WHERE id = $1`,
+      [first.messageId]
+    );
+    expect(cancelledPriorStatus.rows[0]?.status).toBe('cancelled');
+  });
+
+  test('a same-head redelivery while the review is still queued is a duplicate, not a new enqueue', async () => {
+    const config = {
+      webhookSecret: 'integration-test-secret',
+      reviewerIdentity: 'thinman-overseer[bot]',
+    };
+    const deps = createRealIngestDeps(config);
+    const headSha = '5'.repeat(40);
+    const payload = JSON.stringify({
+      action: 'opened',
+      number: 200,
+      pull_request: {
+        number: 200,
+        draft: false,
+        head: { sha: headSha, ref: 'feature-branch' },
+        base: { ref: 'dev', sha: 'f'.repeat(40) },
+        user: { login: 'bluedevilcollectibles' },
+      },
+      repository: { name: 'shopops-comic-theme', owner: { login: 'thinmansoftware' } },
+    });
+
+    const first = await ingestPullRequestEvent(
+      {
+        rawBody: payload,
+        signature: sign(payload, config.webhookSecret),
+        eventType: 'pull_request',
+        deliveryId: 'integration-delivery-samehead-1',
+      },
+      deps
+    );
+    expect(first.disposition).toBe('queued');
+
+    // Same head re-delivered via `synchronize` (e.g. a force-push landing
+    // back on the same sha, or a redundant webhook retry with a fresh
+    // delivery id) while the first review is still queued.
+    const secondPayload = JSON.stringify({
+      action: 'synchronize',
+      number: 200,
+      pull_request: {
+        number: 200,
+        draft: false,
+        head: { sha: headSha, ref: 'feature-branch' },
+        base: { ref: 'dev', sha: 'f'.repeat(40) },
+        user: { login: 'bluedevilcollectibles' },
+      },
+      repository: { name: 'shopops-comic-theme', owner: { login: 'thinmansoftware' } },
+    });
+    const second = await ingestPullRequestEvent(
+      {
+        rawBody: secondPayload,
+        signature: sign(secondPayload, config.webhookSecret),
+        eventType: 'pull_request',
+        deliveryId: 'integration-delivery-samehead-2',
+      },
+      deps
+    );
+
+    expect(second.disposition).toBe('duplicate_delivery');
+    expect(second.messageId).toBe(first.messageId);
+
+    const count = await db.query<{ n: number }>(
+      'SELECT COUNT(*) AS n FROM agent_dispatch_messages WHERE recipient = $1 AND body LIKE $2',
+      [REVIEW_RECIPIENT, `%${headSha}%`]
+    );
+    expect(Number(count.rows[0]?.n ?? 0)).toBe(1);
+  });
 });
