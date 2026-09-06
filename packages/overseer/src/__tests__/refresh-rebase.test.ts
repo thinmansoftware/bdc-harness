@@ -174,6 +174,35 @@ function makeGitMutationDeps(repo: string): BranchMutationDepsV1 {
   };
 }
 
+function stubObserver(
+  heads: string[],
+  probeResult: RebaseConflictProbeV1 | null
+): BranchMutationDepsV1 {
+  let call = 0;
+  return {
+    async observeWorktree({ branch }) {
+      const head = heads[Math.min(call, heads.length - 1)];
+      call += 1;
+      return { clean: true, current_branch: branch, head_sha: head, factory_owned: true };
+    },
+    async countUniqueCommits() {
+      return probeResult ? 1 : 0;
+    },
+    async probeRebase() {
+      return probeResult ?? { conflicted: false, conflict_paths: [], conflict_signal: 'none' };
+    },
+    async applyRefresh() {
+      throw new Error('adapter must not run');
+    },
+    async applyRebase() {
+      throw new Error('adapter must not run');
+    },
+    async readTreeSha() {
+      return 'tree';
+    },
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Fake M-31 gate + policy seams.
 // ---------------------------------------------------------------------------
@@ -699,35 +728,6 @@ describe('refresh-rebase Test 4 unowned or dirty branch', () => {
 // ---------------------------------------------------------------------------
 
 describe('refresh-rebase Test 5 concurrent head or policy change', () => {
-  function stubObserver(
-    heads: string[],
-    probeResult: RebaseConflictProbeV1 | null
-  ): BranchMutationDepsV1 {
-    let call = 0;
-    return {
-      async observeWorktree({ branch }) {
-        const head = heads[Math.min(call, heads.length - 1)];
-        call += 1;
-        return { clean: true, current_branch: branch, head_sha: head, factory_owned: true };
-      },
-      async countUniqueCommits() {
-        return probeResult ? 1 : 0;
-      },
-      async probeRebase() {
-        return probeResult ?? { conflicted: false, conflict_paths: [], conflict_signal: 'none' };
-      },
-      async applyRefresh() {
-        throw new Error('adapter must not run on live_state_mismatch');
-      },
-      async applyRebase() {
-        throw new Error('adapter must not run on live_state_mismatch');
-      },
-      async readTreeSha() {
-        return 'tree';
-      },
-    };
-  }
-
   test('head drift after proposal returns live_state_mismatch with no Git operation', async () => {
     const observer = stubObserver(['head-A', 'head-B'], null); // observe A first, drift to B
     const performSpy = mock(async (req: Parameters<BranchMutationAdapterV1['perform']>[0]) =>
@@ -984,15 +984,12 @@ describe('refresh-rebase gate order', () => {
     expect(order.slice(0, 4)).toEqual(['prepare', 'authorize', 'reserve', 'adapter']);
 
     // Denied case: authorization denial makes zero adapter calls, reserve never runs.
-    const denyRepo = initRepo();
-    writeAndCommit(denyRepo, 'a.txt', 'a\n', 'A');
-    git(denyRepo, ['checkout', '-b', 'wo/order-deny']);
-    const denyBranchHead = git(denyRepo, ['rev-parse', 'HEAD']);
-    git(denyRepo, ['checkout', 'main']);
-    const denyBaseHead = writeAndCommit(denyRepo, 'b.txt', 'b\n', 'B');
-    git(denyRepo, ['checkout', 'wo/order-deny']);
-
-    const denyObserver = makeGitMutationDeps(denyRepo);
+    // Authorization denial occurs before mutation, so a real Git repository is
+    // unnecessary here. Keeping this path in-memory also prevents Windows Git
+    // startup time from obscuring the gate-order contract under CI load.
+    const denyBranchHead = 'deny-head';
+    const denyBaseHead = 'deny-base';
+    const denyObserver = stubObserver([denyBranchHead], null);
     const denyOrder: string[] = [];
     const denyPerformSpy = mock(async (req: Parameters<BranchMutationAdapterV1['perform']>[0]) =>
       createBranchMutationAdapter(denyObserver).perform(req)
@@ -1002,7 +999,7 @@ describe('refresh-rebase gate order', () => {
       {
         candidate: baseCandidate({
           branch: 'wo/order-deny',
-          worktree_path: denyRepo,
+          worktree_path: '/fixture',
           run_authority: {
             run_id: 'run-deny',
             head_sha: denyBranchHead,

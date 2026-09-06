@@ -4,11 +4,11 @@
  * Always-on deterministic loop that moves stalled work forward by sending
  * messages: delivering undelivered ratified rulings, nudging idle threads,
  * and escalating unclaimed P0s. All sends go through the dispatch DAL
- * (createMessage) -- there is no second messaging path.
+ * (createAuthenticatedMessage) -- there is no second messaging path.
  *
  * Tick order (spec Section 8): pause state + epoch -> headroom -> reads ->
  * classify -> propose -> two-tick confirm -> guard -> journal ROW FIRST ->
- * epoch re-check -> createMessage -> journal outcome + proof deadline.
+ * epoch re-check -> createAuthenticatedMessage -> journal outcome + proof deadline.
  *
  * Budgets (ratified Q1): max 10 effects/tick, 1 effect/item/tick, max 3
  * automated interventions per item per 24h.
@@ -18,10 +18,12 @@ import { createLogger } from '@archon/paths';
 import { getDatabase } from '@archon/core';
 import { runCascade } from '@archon/smart-cauldron/cascade';
 import {
-  createMessage,
+  createAuthenticatedMessage,
   getMessage,
   listMessages,
+  type CreateAuthenticatedMessageData,
   type DispatchMessage,
+  type DispatchSenderContext,
 } from '@archon/core/db/dispatch';
 import * as taskmasterDb from '@archon/core/db/taskmaster';
 import {
@@ -138,7 +140,10 @@ export interface GithubIssueEvidence {
 export interface TaskmasterDeps {
   now?: () => Date;
   db?: TaskmasterDal;
-  createTask?: typeof createMessage;
+  createTask?: (
+    context: DispatchSenderContext,
+    data: CreateAuthenticatedMessageData
+  ) => ReturnType<typeof createAuthenticatedMessage>;
   listUndeliveredRulings?: () => Promise<ThreadSnapshot[]>;
   listThreads?: () => Promise<ThreadSnapshot[]>;
   headroom?: () => Promise<HeadroomReading>;
@@ -181,19 +186,29 @@ function sha256(text: string): string {
   return createHash('sha256').update(text).digest('hex');
 }
 
-async function defaultFindEffectByIdempotencyKey(
-  key: string
+interface TaskmasterEffectRow {
+  id: string;
+  status: string;
+  created_at: string;
+}
+type TaskmasterEffectQuery = (
+  sql: string,
+  params: unknown[]
+) => Promise<{ rows: readonly TaskmasterEffectRow[] }>;
+
+export async function defaultFindEffectByIdempotencyKey(
+  key: string,
+  query: TaskmasterEffectQuery = (sql, params) =>
+    getDatabase().query<TaskmasterEffectRow>(sql, params)
 ): Promise<{ id: string; status: string; createdAt: string } | null> {
-  const result = await getDatabase().query<{
-    id: string;
-    status: string;
-    created_at: string;
-    sender_principal_id?: string | null;
-  }>('SELECT * FROM agent_dispatch_messages WHERE idempotency_key = $1', [key]);
-  const row = result.rows.find(
-    candidate =>
-      candidate.sender_principal_id === undefined || candidate.sender_principal_id === null
+  const result = await query(
+    `SELECT id, status, created_at FROM agent_dispatch_messages
+     WHERE idempotency_key = $1
+       AND sender_principal_id = 'system:taskmaster'
+     LIMIT 1`,
+    [key]
   );
+  const row = result.rows[0];
   return row ? { id: row.id, status: row.status, createdAt: row.created_at } : null;
 }
 
@@ -623,7 +638,7 @@ function digestProposal(actions24h: taskmasterDb.TmJournalEntry[], nowMs: number
  * Restart reconciliation (Section 11 test 4): a journal row left 'pending'
  * (in-flight marker) is resolved against the external SOR. If the dispatch
  * row exists, the effect happened -- mark 'sent' WITHOUT a second
- * createMessage. If it does not, expire the row so a future tick may
+ * createAuthenticatedMessage. If it does not, expire the row so a future tick may
  * re-propose fresh. No key is ever re-sent from reconciliation.
  */
 async function reconcilePendingActions(
@@ -940,7 +955,7 @@ export async function refreshAdoption(
 export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): Promise<TickResult> {
   const now = deps.now ?? ((): Date => new Date());
   const dal = deps.db ?? taskmasterDb;
-  const createTask = deps.createTask ?? createMessage;
+  const createTask = deps.createTask ?? createAuthenticatedMessage;
   const findEffect = deps.findEffectByIdempotencyKey ?? defaultFindEffectByIdempotencyKey;
   const getDispatchById = deps.getDispatchMessageById ?? getMessage;
   const getIssueEvidence = deps.getGithubIssueEvidence ?? defaultGetGithubIssueEvidence;
@@ -1433,18 +1448,20 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
           JSON.stringify({ ...proposal, cascadeId: admitted.cascadeId, runId: admitted.cascadeId })
         );
       } else {
-        await createTask({
-          correlation_id: `tm-${journalRow.id}`,
-          idempotency_key: proposal.idempotencyKey,
-          task_type: 'agent_message',
-          sender: 'taskmaster',
-          recipient: proposal.recipient,
-          body: proposal.body,
-          // Same-subject grouping + unconditional per-verb repeat reason
-          // (M-155 WO 3): see TM_REPEAT_REASON_BY_TYPE for why unconditional.
-          subject_key: canonicalizeThreadRef(proposal.threadRef),
-          repeat_reason: TM_REPEAT_REASON_BY_TYPE[proposal.type],
-        });
+        await createTask(
+          { kind: 'system', sender: 'taskmaster' },
+          {
+            correlation_id: `tm-${journalRow.id}`,
+            idempotency_key: proposal.idempotencyKey,
+            task_type: 'agent_message',
+            recipient: proposal.recipient,
+            body: proposal.body,
+            // Same-subject grouping + unconditional per-verb repeat reason
+            // (M-155 WO 3): see TM_REPEAT_REASON_BY_TYPE for why unconditional.
+            subject_key: canonicalizeThreadRef(proposal.threadRef),
+            repeat_reason: TM_REPEAT_REASON_BY_TYPE[proposal.type],
+          }
+        );
         await dal.updateActionOutcome(journalRow.id, 'sent');
       }
       journalRow.outcome = 'sent';

@@ -335,7 +335,7 @@ describe('cascade outcome CLI', () => {
     expect(args.write).toBe(false);
 
     const proc = Bun.spawn({
-      cmd: ['bun', CLI_PATH, '--out', outPath],
+      cmd: [process.execPath, CLI_PATH, '--out', outPath],
       cwd: REPO_ROOT,
       env: {
         ...process.env,

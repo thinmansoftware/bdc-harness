@@ -7,11 +7,15 @@
  * polls GET /api/taskmaster/status and, when tick_health flips to
  * 'degraded', emits exactly ONE escalation for that degradation episode via
  * the existing Overseer escalation path (the dispatch channel used by
- * escalation-delivery.ts: createMessage with sender 'overseer'). A second
+ * escalation-delivery.ts: createAuthenticatedMessage with fixed overseer principal). A second
  * poll while still degraded emits nothing. Recovery re-arms the checker so
  * a later degradation escalates again.
  */
-import { createMessage } from '@archon/core/db/dispatch';
+import {
+  createAuthenticatedMessage,
+  type CreateAuthenticatedMessageData,
+  type DispatchSenderContext,
+} from '@archon/core/db/dispatch';
 import { createLogger } from '@archon/paths';
 
 const log = createLogger('overseer/taskmaster-deadman');
@@ -28,7 +32,10 @@ export interface TaskmasterStatusView {
 
 export interface DeadmanCheckerDeps {
   fetch?: typeof fetch;
-  createTask?: typeof createMessage;
+  createTask?: (
+    context: DispatchSenderContext,
+    data: CreateAuthenticatedMessageData
+  ) => Promise<unknown>;
   now?: () => Date;
   statusUrl?: string;
   operatorToken?: string;
@@ -66,7 +73,7 @@ export async function pollTaskmasterDeadman(
   deps: DeadmanCheckerDeps = {}
 ): Promise<DeadmanPollResult> {
   const doFetch = deps.fetch ?? globalThis.fetch;
-  const createTask = deps.createTask ?? createMessage;
+  const createTask = deps.createTask ?? createAuthenticatedMessage;
   const now = deps.now ?? ((): Date => new Date());
   const statusUrl = deps.statusUrl ?? defaultStatusUrl();
   const operatorToken = deps.operatorToken ?? process.env.ARCHON_OPERATOR_TOKEN;
@@ -107,19 +114,21 @@ export async function pollTaskmasterDeadman(
 
   const nowIso = now().toISOString();
   try {
-    await createTask({
-      correlation_id: episodeKey,
-      idempotency_key: `overseer:${episodeKey}`,
-      task_type: 'agent_message',
-      sender: 'overseer',
-      recipient: 'operator',
-      body:
-        `Taskmaster dead-man alarm (${nowIso}): tick_health=degraded -- the taskmaster ` +
-        `loop has missed 3+ intervals (last_tick_at=${status.last_tick_at ?? 'never'}, ` +
-        `interval_ms=${status.interval_ms}, pause_state=${status.pause_state}). ` +
-        'A monitor that silently stops is worse than no monitor. Check the archon-app-1 ' +
-        'container and GET /api/taskmaster/status.',
-    });
+    await createTask(
+      { kind: 'system', sender: 'overseer' },
+      {
+        correlation_id: episodeKey,
+        idempotency_key: `overseer:${episodeKey}`,
+        task_type: 'agent_message',
+        recipient: 'operator',
+        body:
+          `Taskmaster dead-man alarm (${nowIso}): tick_health=degraded -- the taskmaster ` +
+          `loop has missed 3+ intervals (last_tick_at=${status.last_tick_at ?? 'never'}, ` +
+          `interval_ms=${status.interval_ms}, pause_state=${status.pause_state}). ` +
+          'A monitor that silently stops is worse than no monitor. Check the archon-app-1 ' +
+          'container and GET /api/taskmaster/status.',
+      }
+    );
     state.escalated = true;
     state.episodeKey = episodeKey;
     log.info({ episodeKey }, 'overseer.taskmaster_deadman_escalated');

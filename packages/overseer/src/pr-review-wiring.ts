@@ -38,8 +38,8 @@ const REVIEW_WEBHOOK_SECRET_FALLBACK_ENV = 'WEBHOOK_SECRET';
 const REVIEW_REVIEWER_IDENTITY_FALLBACK_ENV = 'MERGE_MANAGER_REVIEW_GATE_LOGIN';
 const REVIEW_REVIEWER_IDENTITY_DEFAULT = 'thinman-overseer[bot]';
 
-/** Dispatch principal that owns queued review work. */
-export const REVIEW_SENDER = 'overseer-review-route';
+/** Code-fixed Overseer sender that owns queued review work. */
+export const REVIEW_SENDER = 'overseer';
 export const REVIEW_RECIPIENT = 'overseer-reviewer';
 
 export interface ReviewRouteConfig {
@@ -104,7 +104,7 @@ export function parseReviewWorkBody(body: string): ReviewWorkBody | null {
  * every review attempt for one pull request so stale-head lookup can find
  * prior attempts regardless of which commit they were bound to.
  *
- * MUST match the shape createMessage/listMessages enforce via
+ * MUST match the shape createAuthenticatedMessage/listMessages enforce via
  * normalizeDispatchSubjectKey: 'wo:WO-XXX' or 'gh:owner/repo#123' -- any
  * other shape throws dispatch_subject_key_invalid:shape and every enqueue
  * fails. Integration-test finding (2026-08-19): the original
@@ -179,7 +179,7 @@ export function createRealIngestDeps(config: ReviewRouteConfig): IngestDeps {
         author: input.author,
       };
       const subjectKey = reviewSubjectKey(input.owner, input.repo, input.prNumber);
-      // createMessage is idempotent on idempotency_key: it returns the
+      // createAuthenticatedMessage is idempotent on idempotency_key: it returns the
       // EXISTING row rather than inserting a duplicate. To report the replay
       // honestly we look for a prior row bound to this exact head BEFORE
       // creating, rather than inferring it after the fact.
@@ -190,15 +190,18 @@ export function createRealIngestDeps(config: ReviewRouteConfig): IngestDeps {
       const alreadyExisted = prior.some(
         message => parseReviewWorkBody(message.body)?.headSha === input.headSha
       );
-      const message = await dispatch.createMessage({
-        correlation_id: input.correlationId,
-        idempotency_key: input.idempotencyKey,
-        task_type: 'run_review',
-        sender: REVIEW_SENDER,
-        recipient: REVIEW_RECIPIENT,
-        body: JSON.stringify(body),
-        subject_key: subjectKey,
-      });
+      const message = await dispatch.createAuthenticatedMessage(
+        { kind: 'system', sender: REVIEW_SENDER },
+        {
+          correlation_id: input.correlationId,
+          idempotency_key: input.idempotencyKey,
+          task_type: 'run_review',
+          recipient: REVIEW_RECIPIENT,
+          body: JSON.stringify(body),
+          subject_key: subjectKey,
+          repeat_reason: `review_exact_head:${input.headSha}`,
+        }
+      );
       return { messageId: message.id, alreadyExisted };
     },
 
@@ -206,24 +209,26 @@ export function createRealIngestDeps(config: ReviewRouteConfig): IngestDeps {
       // Receipts ride the same durable store as the work itself. A receipt is
       // never allowed to fail the ingest path (the caller wraps this), but it
       // must be attempted for every terminal disposition.
-      await dispatch.createMessage({
-        correlation_id: input.correlationId || `pr-review-receipt:${input.deliveryId}`,
-        idempotency_key: `pr-review-receipt:${input.deliveryId}:${input.disposition}`,
-        task_type: 'run_report',
-        sender: REVIEW_SENDER,
-        recipient: 'operator',
-        body: JSON.stringify({
-          kind: 'pr_review_ingest_receipt',
-          deliveryId: input.deliveryId,
-          owner: input.owner,
-          repo: input.repo,
-          prNumber: input.prNumber,
-          headSha: input.headSha,
-          disposition: input.disposition,
-          reason: input.reason ?? null,
-          messageId: input.messageId ?? null,
-        }),
-      });
+      await dispatch.createAuthenticatedMessage(
+        { kind: 'system', sender: REVIEW_SENDER },
+        {
+          correlation_id: input.correlationId || `pr-review-receipt:${input.deliveryId}`,
+          idempotency_key: `pr-review-receipt:${input.deliveryId}:${input.disposition}`,
+          task_type: 'run_report',
+          recipient: 'operator',
+          body: JSON.stringify({
+            kind: 'pr_review_ingest_receipt',
+            deliveryId: input.deliveryId,
+            owner: input.owner,
+            repo: input.repo,
+            prNumber: input.prNumber,
+            headSha: input.headSha,
+            disposition: input.disposition,
+            reason: input.reason ?? null,
+            messageId: input.messageId ?? null,
+          }),
+        }
+      );
     },
   };
 }
@@ -280,6 +285,19 @@ export function createRealSubmitDeps(
           invokeModel: overrides.invokeModel ?? invokeConfiguredReviewModel,
         }
       );
+      // CHECKS_PENDING is a non-terminal defer, NOT a verdict. Surface it as a
+      // distinct signal so the submit path can release-and-retry rather than
+      // fall through to the summary/`approved` mapping below, which would
+      // otherwise emit `approved: false` -- a de facto REQUEST_CHANGES on
+      // checks-pending grounds (the exact bug this WO fixes).
+      if (result.verdict === 'CHECKS_PENDING') {
+        return {
+          approved: false,
+          summary: '',
+          reviewedHeadSha: result.reviewed_head_sha,
+          checksPending: true,
+        };
+      }
       const summary =
         result.findings.length > 0
           ? result.findings
@@ -304,14 +322,16 @@ export function createRealSubmitDeps(
       return pr.data.head.sha;
     },
     async recordReceipt(input): Promise<void> {
-      await dispatch.createMessage({
-        correlation_id: input.correlationId,
-        idempotency_key: `pr-review-submit-receipt:${input.messageId}:${input.disposition}`,
-        task_type: 'run_report',
-        sender: REVIEW_SENDER,
-        recipient: 'operator',
-        body: JSON.stringify({ kind: 'pr_review_submit_receipt', ...input }),
-      });
+      await dispatch.createAuthenticatedMessage(
+        { kind: 'system', sender: REVIEW_SENDER },
+        {
+          correlation_id: input.correlationId,
+          idempotency_key: `pr-review-submit-receipt:${input.messageId}:${input.disposition}`,
+          task_type: 'run_report',
+          recipient: 'operator',
+          body: JSON.stringify({ kind: 'pr_review_submit_receipt', ...input }),
+        }
+      );
     },
   };
 }

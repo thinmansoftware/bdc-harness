@@ -615,6 +615,38 @@ describe('PostgresAdapter', () => {
   });
 });
 
+describe('Phase 1.5 sender-auth migration shape', () => {
+  test('migration 043 and combined schema define sender-scoped partial unique indexes', () => {
+    const migration = readFileSync(
+      resolve(import.meta.dir, '../../../../../migrations', '043_agent_messaging_phase15.sql'),
+      'utf8'
+    );
+    const combined = readFileSync(
+      resolve(import.meta.dir, '../../../../../migrations', '000_combined.sql'),
+      'utf8'
+    );
+    for (const schema of [migration, combined]) {
+      expect(schema).toContain('sender_principal_id');
+      expect(schema).toContain('uq_agent_dispatch_messages_sender_idempotency_authenticated');
+      expect(schema).toContain('uq_agent_dispatch_messages_idempotency_legacy');
+      expect(schema).toContain('WHERE sender_principal_id IS NOT NULL');
+      expect(schema).toContain('WHERE sender_principal_id IS NULL');
+    }
+    expect(migration).toContain(
+      'DROP CONSTRAINT IF EXISTS agent_dispatch_messages_idempotency_key_key'
+    );
+    const executableMigration = migration.replace(/^\s*--.*$/gm, '').trim();
+    expect(executableMigration).toStartWith('BEGIN;');
+    expect(executableMigration).toEndWith('COMMIT;');
+    const dispatchCreate = combined.slice(
+      combined.indexOf('CREATE TABLE IF NOT EXISTS agent_dispatch_messages'),
+      combined.indexOf('CREATE TABLE IF NOT EXISTS dispatch_principals')
+    );
+    expect(dispatchCreate).not.toMatch(/idempotency_key TEXT NOT NULL UNIQUE/);
+    expect(dispatchCreate).toContain('sender_principal_id TEXT');
+  });
+});
+
 // ---------------------------------------------------------------------------
 
 describe('postgresDialect', () => {

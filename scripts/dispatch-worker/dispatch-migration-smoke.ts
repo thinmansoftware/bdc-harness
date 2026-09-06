@@ -50,6 +50,8 @@ const KNOWN_PRINCIPALS = [
   ['merge-manager', 'Merge Manager', 'notify_only', 0],
   ['operator', 'Operator', 'drain_on_start', 1],
   ['overseer', 'Overseer', 'notify_only', 1],
+  ['overseer-review-route', 'Overseer Review Route', 'notify_only', 1],
+  ['overseer-reviewer', 'Overseer PR Reviewer', 'worker_poll', 1],
   ['xo', 'XO', 'drain_on_start', 1],
 ] as const;
 
@@ -599,7 +601,7 @@ function normalizedDefault(value: string | number | null): string | null {
 }
 
 function normalizedSql(value: string | null): string {
-  return (value ?? '').toLowerCase().replace(/\s+/g, ' ').trim();
+  return (value ?? '').toLowerCase().replace(/"/g, '').replace(/\s+/g, ' ').trim();
 }
 
 function requireColumn(
@@ -654,6 +656,7 @@ function validateMessageSchema(table: TableSnapshot): void {
   for (const name of PHASE_0_NULLABLE_COLUMNS) {
     requireColumn(table.columns, name, 'TEXT', 0, null, 0);
   }
+  requireColumn(table.columns, 'sender_principal_id', 'TEXT', 0, null, 0);
   const supersedesForeignKey = table.foreignKeys.find(row => row.from === 'supersedes_id');
   if (
     supersedesForeignKey?.table !== 'agent_dispatch_messages' ||
@@ -667,11 +670,15 @@ function validateMessageSchema(table: TableSnapshot): void {
     table.master.find(row => row.type === 'table' && row.name === 'agent_dispatch_messages')?.sql ??
       null
   );
+  if (/idempotency_key\s+text\s+not\s+null\s+unique/i.test(tableSql)) {
+    throw new SmokeFailure('migration_schema_validation_failed');
+  }
   assertSqlContains(tableSql, [
     "check (priority in ('blocker', 'normal', 'heartbeat'))",
     "check (task_outcome is null or task_outcome in ('succeeded', 'failed', 'blocked'))",
     "check (route_disposition is null or route_disposition in ('unroutable', 'superseded'))",
     'supersedes_id text references agent_dispatch_messages(id)',
+    'sender_principal_id',
   ]);
   requireIndex(
     table,
@@ -696,6 +703,22 @@ function validateMessageSchema(table: TableSnapshot): void {
     0,
     0,
     'on agent_dispatch_messages(recipient_alias, status, created_at)'
+  );
+  requireIndex(
+    table,
+    'uq_agent_dispatch_messages_sender_idempotency_authenticated',
+    ['sender_principal_id', 'idempotency_key'],
+    1,
+    1,
+    'where sender_principal_id is not null'
+  );
+  requireIndex(
+    table,
+    'uq_agent_dispatch_messages_idempotency_legacy',
+    ['idempotency_key'],
+    1,
+    1,
+    'where sender_principal_id is null'
   );
 }
 
@@ -781,6 +804,66 @@ function assertFirstMigration(
   }
   if (after.missingLivePrincipalRows !== 0) {
     throw new SmokeFailure('migration_live_principal_missing');
+  }
+}
+
+async function proveSenderScopedIdempotency(path: string): Promise<void> {
+  const database = new Database(path);
+  try {
+    database.run('BEGIN IMMEDIATE');
+    try {
+      const key = 'phase15-smoke-shared-key';
+      const now = new Date().toISOString();
+      database.run(
+        `INSERT INTO agent_dispatch_messages
+        (id, correlation_id, idempotency_key, task_type, sender, sender_principal_id, recipient, body, status, created_at, priority, fencing_token)
+       VALUES (?, ?, ?, 'agent_message', 'claude', 'alice', 'codex', 'a', 'queued', ?, 'normal', 0)`,
+        ['p15-alice', 'c-a', key, now]
+      );
+      database.run(
+        `INSERT INTO agent_dispatch_messages
+        (id, correlation_id, idempotency_key, task_type, sender, sender_principal_id, recipient, body, status, created_at, priority, fencing_token)
+       VALUES (?, ?, ?, 'agent_message', 'fusion', 'bob', 'codex', 'b', 'queued', ?, 'normal', 0)`,
+        ['p15-bob', 'c-b', key, now]
+      );
+      const scoped = database
+        .query<
+          CountRow,
+          [string]
+        >('SELECT COUNT(*) AS count FROM agent_dispatch_messages WHERE idempotency_key = ?')
+        .get(key);
+      if (scoped?.count !== 2) throw new SmokeFailure('migration_sender_scope_validation_failed');
+
+      let dupFailed = false;
+      try {
+        database.run(
+          `INSERT INTO agent_dispatch_messages
+          (id, correlation_id, idempotency_key, task_type, sender, sender_principal_id, recipient, body, status, created_at, priority, fencing_token)
+         VALUES (?, ?, ?, 'agent_message', 'claude', 'alice', 'codex', 'a2', 'queued', ?, 'normal', 0)`,
+          ['p15-alice-dup', 'c-a2', key, now]
+        );
+      } catch {
+        dupFailed = true;
+      }
+      if (!dupFailed) throw new SmokeFailure('migration_sender_scope_validation_failed');
+
+      const historical = database
+        .query<CountRow, []>(
+          `SELECT COUNT(*) AS count FROM agent_dispatch_messages
+         WHERE id NOT LIKE 'p15-%' AND sender_principal_id IS NOT NULL`
+        )
+        .get();
+      if ((historical?.count ?? -1) !== 0) {
+        throw new SmokeFailure('migration_sender_scope_validation_failed');
+      }
+    } finally {
+      database.run('ROLLBACK');
+    }
+  } catch (error: unknown) {
+    if (error instanceof SmokeFailure) throw error;
+    throw new SmokeFailure('migration_sender_scope_validation_failed');
+  } finally {
+    database.close();
   }
 }
 
@@ -970,6 +1053,13 @@ export async function runDispatchMigrationSmoke(args: string[]): Promise<string>
         : publicFailure(error);
     }
     assertFirstMigration(before, first, options.expectedHeartbeats);
+    const reportedRowsAfter = first.rows;
+    const reportedHeartbeats = first.heartbeatRows;
+    await proveSenderScopedIdempotency(tempPath);
+    const afterProof = inspectAfterMigration(tempPath, before);
+    if (canonicalDigest(afterProof) !== canonicalDigest(first)) {
+      throw new SmokeFailure('migration_sender_scope_validation_failed');
+    }
 
     induceTestDrift(tempPath);
     await runRealMigration(tempPath);
@@ -992,8 +1082,8 @@ export async function runDispatchMigrationSmoke(args: string[]): Promise<string>
       await exportMigratedCopy(tempPath, migratedCopyOutput);
     }
     output =
-      `PASS rows_before=${before.rows} rows_after=${first.rows} ` +
-      `heartbeat_rows=${first.heartbeatRows} source_unchanged=true second_run_idempotent=true` +
+      `PASS rows_before=${before.rows} rows_after=${reportedRowsAfter} ` +
+      `heartbeat_rows=${reportedHeartbeats} source_unchanged=true second_run_idempotent=true` +
       (migratedCopyOutput ? ' migrated_copy_ready=true' : '');
   } catch (error: unknown) {
     primaryError = publicFailure(error);

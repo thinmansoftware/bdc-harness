@@ -159,11 +159,69 @@ Run focused proof with:
 bun test ./scripts/dispatch-worker/stdin-prompt.test.ts ./scripts/dispatch-worker/acp/kill-tree.test.ts ./scripts/dispatch-worker/acp/session.test.ts ./scripts/dispatch-worker/mcp/session.test.ts ./scripts/dispatch-worker/outcome-transcript.test.ts
 ```
 
-# M-131 server seats (Phase A/B)
+## Phase 1.5 sender authentication (capability shipped dark)
 
-A "seat" is an isolated, single-provider server instance of this worker
-(M-131 board compute plane). Setting `"seat"` in the worker config (default
-`"seat": null` = not a seat) turns on the seat contract:
+Phase 1.5 binds every newly created Dispatch message to an authenticated or
+code-fixed sender principal. Runtime enablement is a later deploy motion.
+
+### Registry: `DISPATCH_PRINCIPALS_JSON`
+
+JSON array of credential records:
+
+- `credential_id` (unique)
+- `principal_id` (canonical; not `system:` or `board:` reserved namespaces)
+- `token_sha256` (64 lowercase hex SHA-256 of the raw token)
+- `status`: `active` | `retiring` | `disabled`
+- `send_as`: unique lowercase stable addresses the principal may select
+- `receive_as`: empty or unique lowercase stable addresses (validated; not
+  enforced for claim path in Phase 1.5)
+- `roles`: includes `send` for creation
+
+Multiple credentials may share one `principal_id` so active and retiring digests
+can overlap during rotation. All records for one principal must carry identical
+`send_as`, `receive_as`, and `roles`.
+
+Raw tokens are never stored. Callers present:
+
+- header `x-dispatch-principal-id`
+- header `x-dispatch-principal-token`
+
+Tokens must be loaded from token files inside the client process only. Never put
+raw tokens in argv, logs, receipts, or fixtures.
+
+### Mode: `DISPATCH_SENDER_AUTH_MODE`
+
+Accepts only `off`, `warn`, or `enforce`. Unset means `off` (dark shipping). An
+invalid value is a configuration error.
+
+Recommended activation sequence (deploy motion; not this WO):
+
+`off -> warn -> enforce`
+
+- `off`: missing principal headers admit legacy rows with null
+  `sender_principal_id` silently.
+- `warn`: missing headers admit legacy rows and emit one sanitized structured
+  warning (no body/token material). Observable warn criteria: one warning per
+  uncredentialed create, zero 401 for total absence, zero forged-sender accepts
+  when headers are present but invalid.
+- `enforce`: missing headers return 401 before idempotency lookup or insert.
+
+Partial, malformed, disabled, missing-send-role, or unauthorized `send_as`
+requests fail closed in every mode and never downgrade to legacy.
+
+Rollback: set `DISPATCH_SENDER_AUTH_MODE=off` (or unset). Do not reverse
+migration 043 in production without a separate owner-approved plan.
+
+### Runtime / deploy separation
+
+This repository change ships capability and proof only. It does not:
+
+- enable warn/enforce in any runtime
+- provision real tokens
+- apply migration 043 to a live database
+- enable Telegram/SMS or `decision_needed`
+
+# M-131 server seats (Phase A/B)
 
 - **Identity + concurrency one**: `seat.seat_id` names the seat (e.g.
   `bdc-seat-grok`). `seat.model_family` selects `grok`, `codex`, or `claude`
@@ -201,9 +259,6 @@ A "seat" is an isolated, single-provider server instance of this worker
   profile and state directories are compared after symlink resolution and
   normalization, and nesting counts as non-isolated. Two differently-spelled
   paths that resolve to the same directory are refused.
-
-Packaging lives in `deploy/m131-seat/` (Dockerfile, compose example, seat
-config example, container-contract test).
 
 The packaged seats and their required read-only credential ingress are:
 

@@ -1,5 +1,10 @@
 import { describe, test, expect, afterEach } from 'bun:test';
 import { SqliteAdapter } from './sqlite';
+
+// Bun 1.3.x silently drops a root test path when a mixed invocation begins with
+// workspace-package paths. Register the migration suite through the SQLite
+// package so both the pinned Phase 1.5 command and ordinary package CI grade it.
+await import('../../../../../scripts/dispatch-worker/dispatch-migration-smoke.test');
 import { Database } from 'bun:sqlite';
 import { unlinkSync } from 'fs';
 import { join } from 'path';
@@ -114,12 +119,26 @@ describe('SqliteAdapter', () => {
       for (const column of phase0Columns) {
         expect(columnNames.has(column)).toBe(true);
       }
+      expect(columnNames.has('sender_principal_id')).toBe(true);
       const phase1Index = await db.query<{ sql: string }>(
         `SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_agent_dispatch_messages_subject_history'`
       );
       expect(phase1Index.rows[0]?.sql).toContain(
         'ON agent_dispatch_messages(subject_key, created_at DESC, id DESC) WHERE subject_key IS NOT NULL'
       );
+      const authIdx = await db.query<{ sql: string }>(
+        `SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'uq_agent_dispatch_messages_sender_idempotency_authenticated'`
+      );
+      expect(authIdx.rows[0]?.sql).toContain('sender_principal_id');
+      expect(authIdx.rows[0]?.sql).toContain('WHERE sender_principal_id IS NOT NULL');
+      const legacyIdx = await db.query<{ sql: string }>(
+        `SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'uq_agent_dispatch_messages_idempotency_legacy'`
+      );
+      expect(legacyIdx.rows[0]?.sql).toContain('WHERE sender_principal_id IS NULL');
+      const tableSql = await db.query<{ sql: string }>(
+        `SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'agent_dispatch_messages'`
+      );
+      expect(tableSql.rows[0]?.sql ?? '').not.toMatch(/idempotency_key TEXT NOT NULL UNIQUE/i);
 
       const principals = await db.query<{
         principal_id: string;
@@ -196,10 +215,23 @@ describe('SqliteAdapter', () => {
       for (const column of phase0Columns) {
         expect(columnNames.has(column)).toBe(true);
       }
+      expect(columnNames.has('sender_principal_id')).toBe(true);
       const phase1Index = await db.query<{ sql: string }>(
         `SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_agent_dispatch_messages_subject_history'`
       );
       expect(phase1Index.rows[0]?.sql).toContain('WHERE subject_key IS NOT NULL');
+      const authIdx = await db.query<{ sql: string }>(
+        `SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'uq_agent_dispatch_messages_sender_idempotency_authenticated'`
+      );
+      expect(authIdx.rows[0]?.sql).toContain('WHERE sender_principal_id IS NOT NULL');
+      const legacyIdx = await db.query<{ sql: string }>(
+        `SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'uq_agent_dispatch_messages_idempotency_legacy'`
+      );
+      expect(legacyIdx.rows[0]?.sql).toContain('WHERE sender_principal_id IS NULL');
+      const principalsNull = await db.query<{ sender_principal_id: string | null }>(
+        `SELECT sender_principal_id FROM agent_dispatch_messages`
+      );
+      expect(principalsNull.rows.every(row => row.sender_principal_id == null)).toBe(true);
 
       const priorities = await db.query<{ id: string; priority: string }>(
         `SELECT id, priority FROM agent_dispatch_messages ORDER BY id`
@@ -511,6 +543,92 @@ describe('SqliteAdapter', () => {
         ['2026-04-14T10:00:00.000Z']
       );
       expect(result.rows[0].equal).toBe(1);
+    });
+  });
+
+  describe('agent messaging Phase 1.5 sender principal rebuild', () => {
+    test('rebuild is idempotent and preserves rows', async () => {
+      currentDbPath = join(
+        import.meta.dir,
+        `.test-sqlite-adapter-${Date.now()}-${Math.random().toString(36).slice(2)}.db`
+      );
+      const legacy = new Database(currentDbPath);
+      legacy.run(`
+        CREATE TABLE agent_dispatch_messages (
+          id TEXT PRIMARY KEY,
+          correlation_id TEXT NOT NULL,
+          idempotency_key TEXT NOT NULL UNIQUE,
+          task_type TEXT NOT NULL,
+          sender TEXT NOT NULL,
+          recipient TEXT NOT NULL,
+          body TEXT NOT NULL,
+          status TEXT NOT NULL DEFAULT 'queued',
+          result_body TEXT,
+          created_at TEXT NOT NULL,
+          claimed_at TEXT,
+          completed_at TEXT,
+          not_before TEXT,
+          lease_owner TEXT,
+          lease_expires_at TEXT,
+          fencing_token INTEGER NOT NULL DEFAULT 0,
+          priority TEXT NOT NULL DEFAULT 'normal',
+          task_outcome TEXT,
+          acknowledged_at TEXT,
+          acknowledged_by TEXT,
+          addressed_at TEXT,
+          addressed_by TEXT,
+          escalated_tg_at TEXT,
+          escalated_sms_at TEXT,
+          subject_key TEXT,
+          repeat_reason TEXT,
+          route_disposition TEXT,
+          supersedes_id TEXT REFERENCES agent_dispatch_messages(id)
+        )
+      `);
+      legacy.run(`
+        INSERT INTO agent_dispatch_messages
+          (id, correlation_id, idempotency_key, task_type, sender, recipient, body, status, created_at, priority)
+        VALUES
+          ('p15-1', 'c1', 'k1', 'agent_message', 'claude', 'codex', 'hello', 'queued', '2026-08-05T00:00:00.000Z', 'normal'),
+          ('p15-2', 'c2', 'k2', 'agent_message', 'fusion', 'codex', 'world', 'done', '2026-08-05T00:00:01.000Z', 'normal')
+      `);
+      legacy.close();
+
+      db = new SqliteAdapter(currentDbPath);
+      const first = await db.query<{ id: string; sender_principal_id: string | null }>(
+        `SELECT id, sender_principal_id FROM agent_dispatch_messages ORDER BY id`
+      );
+      expect(first.rows).toEqual([
+        { id: 'p15-1', sender_principal_id: null },
+        { id: 'p15-2', sender_principal_id: null },
+      ]);
+      await db.close();
+
+      db = new SqliteAdapter(currentDbPath);
+      const second = await db.query<{ count: number }>(
+        `SELECT COUNT(*) as count FROM agent_dispatch_messages`
+      );
+      expect(second.rows[0]?.count).toBe(2);
+      const indexes = await db.query<{ name: string }>(
+        `SELECT name FROM sqlite_master WHERE type = 'index' AND name LIKE 'uq_agent_dispatch_messages_%' ORDER BY name`
+      );
+      expect(indexes.rows.map(r => r.name)).toEqual([
+        'uq_agent_dispatch_messages_idempotency_legacy',
+        'uq_agent_dispatch_messages_sender_idempotency_authenticated',
+      ]);
+    });
+
+    test('phase15 rebuild path is outside the best-effort warn block', async () => {
+      // The method is invoked after the warn-wrapped phase0 column migration.
+      // A successful rebuild leaves foreign_keys enabled and both partial indexes present.
+      db = createTestDb();
+      const fk = await db.query<{ foreign_keys: number }>('PRAGMA foreign_keys');
+      expect(Number(fk.rows[0]?.foreign_keys ?? 0)).toBe(1);
+      const tableSql = await db.query<{ sql: string }>(
+        `SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'agent_dispatch_messages'`
+      );
+      expect(tableSql.rows[0]?.sql ?? '').toContain('sender_principal_id');
+      expect(tableSql.rows[0]?.sql ?? '').not.toMatch(/idempotency_key TEXT NOT NULL UNIQUE/i);
     });
   });
 });

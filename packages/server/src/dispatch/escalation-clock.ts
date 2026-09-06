@@ -25,11 +25,11 @@ export async function tickDispatchEscalationClock(
   if (inFlight) return;
   inFlight = true;
   try {
+    if (process.env.DISPATCH_SENDER_AUTH_MODE !== 'enforce') return;
     const activatedAt = process.env.DISPATCH_PHASE1_ACTIVATED_AT;
     if (!activatedAt || !Number.isFinite(Date.parse(activatedAt))) return;
     await reconcileDispatchOutcomeNotices(activatedAt);
     await ensureXoEscalationHandoffs(activatedAt);
-    if (process.env.DISPATCH_SENDER_AUTH_MODE !== 'enforce') return;
     const now = (dependencies.now ?? ((): Date => new Date()))().toISOString();
     const candidates = await listEligibleXoEscalations(activatedAt);
     const legs: [DispatchEscalationLeg, boolean, (id: string) => Promise<void>][] = [
