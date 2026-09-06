@@ -309,6 +309,50 @@ export class SqliteAdapter implements IDatabase {
         throw error;
       }
     }
+    // Migration 046: older on-disk databases used a composite primary key for
+    // tm_health. That makes the DAL's ON CONFLICT (provider) invalid, so rebuild
+    // the table and retain only the newest sample for each provider.
+    const healthSchema = this.db
+      .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'tm_health'")
+      .get() as { sql?: string } | undefined;
+    const healthColumns = this.pragmaAll("PRAGMA table_info('tm_health')") as {
+      name: string;
+      pk: number;
+    }[];
+    const healthPrimaryKey = healthColumns
+      .filter(column => column.pk > 0)
+      .sort((left, right) => left.pk - right.pk)
+      .map(column => column.name);
+    if (healthSchema?.sql && healthPrimaryKey.join(',') !== 'provider') {
+      this.db.run('BEGIN');
+      try {
+        this.db.run(`
+          CREATE TABLE tm_health_new (
+            provider TEXT PRIMARY KEY,
+            state TEXT NOT NULL,
+            sampled_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            evidence TEXT
+          );
+          INSERT INTO tm_health_new (provider, state, sampled_at, expires_at, evidence)
+          SELECT provider, state, sampled_at, COALESCE(expires_at, sampled_at), evidence
+          FROM tm_health AS sample
+          WHERE sample.rowid = (
+            SELECT candidate.rowid
+            FROM tm_health AS candidate
+            WHERE candidate.provider = sample.provider
+            ORDER BY candidate.sampled_at DESC, candidate.rowid DESC
+            LIMIT 1
+          );
+          DROP TABLE tm_health;
+          ALTER TABLE tm_health_new RENAME TO tm_health;
+        `);
+        this.db.run('COMMIT');
+      } catch (error: unknown) {
+        this.db.run('ROLLBACK');
+        throw error;
+      }
+    }
     // Conversations columns
     try {
       const cols = this.pragmaAll("PRAGMA table_info('remote_agent_conversations')") as {

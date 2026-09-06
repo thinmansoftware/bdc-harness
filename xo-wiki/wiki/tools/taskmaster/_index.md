@@ -128,6 +128,15 @@ Pause state:
 sqlite3 /opt/bdc/archon-data/archon.db "SELECT * FROM tm_control WHERE id=1"
 ```
 
+## Known issues
+
+WO-HARNESS-TM-HEALTH-UPSERT-CONFLICT-FIX-01 repairs legacy on-disk `tm_health`
+tables whose composite `PRIMARY KEY (provider, sampled_at)` made every
+provider health upsert fail. On connection, `migrateColumns()` now rebuilds
+that table with `PRIMARY KEY (provider)` and retains the latest sample per
+provider, allowing `/api/taskmaster/status` headroom to reflect recorded
+spawn evidence.
+
 ## Kill / rollback
 
 Set `TASKMASTER_INTERVAL_MS=0` in compose and restart the container. The
