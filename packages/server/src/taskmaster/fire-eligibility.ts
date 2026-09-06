@@ -1,4 +1,9 @@
 import { listCodebases } from '@archon/core/db/codebases';
+import { createHash } from 'crypto';
+import {
+  freezeWorkOrderSource,
+  type ExpectedSpecIdentity,
+} from '@archon/core/workflows/work-order-source';
 
 export interface FireEligibilityEvidence {
   woId: string;
@@ -6,6 +11,10 @@ export interface FireEligibilityEvidence {
   project: string;
   specVerifiedAt: string;
   noOpenOrMergedPr: true;
+  /** Legacy source category; repo-path covers either exact committed path.
+   * expectedSpec.specSource carries the full canonical path. */
+  specSource?: 'repo-path' | 'date-glob' | 'issue-body';
+  expectedSpec?: ExpectedSpecIdentity;
 }
 
 export interface FireEligibilityResult {
@@ -54,18 +63,42 @@ export async function checkFireEligibility(
   const woId = WO_ID_RE.exec(issueTitle)?.[1];
   if (!woId) return { eligible: false, reason: 'wo_id_missing' };
   const fetchImpl = deps.fetchImpl ?? fetch;
-  const specResponse = await fetchImpl(
-    `https://api.github.com/repos/thinmansoftware/bdc-xo/contents/docs/work-orders/${woId}.md?ref=main`,
-    { headers: headers() }
-  );
-  assertRateLimit(specResponse);
-  if (specResponse.status === 404) return { eligible: false, reason: 'spec_missing' };
-  if (!specResponse.ok) throw new Error(`taskmaster_fire_spec_read_failed:${specResponse.status}`);
-  const payload = (await specResponse.json()) as { content?: string; encoding?: string };
-  const body =
-    payload.encoding === 'base64' && payload.content
-      ? Buffer.from(payload.content.replace(/\s/g, ''), 'base64').toString('utf8')
-      : '';
+  let frozen;
+  try {
+    // Restrictive subset of the current lane authority policy. The runtime
+    // resolves its own policy and must match this identity before worker creation.
+    // XO1843 permits rejecting issue-only specs; issue content is not a grant.
+    frozen = await freezeWorkOrderSource(
+      {
+        required: true,
+        spec_repository: 'thinmansoftware/bdc-xo',
+        spec_revision: 'main',
+        spec_paths: ['docs/work-orders/{WO_ID}.md', 'docs/superpowers/specs/{WO_ID}.md'],
+        allow_issue_fallback: false,
+      },
+      woId,
+      {
+        fetcher: (async (input, init) => {
+          const response = await fetchImpl(input, init);
+          assertRateLimit(response);
+          if (!response.ok && response.status !== 404)
+            throw new Error(`taskmaster_fire_spec_read_failed:${response.status}`);
+          return response;
+        }) as typeof fetch,
+      }
+    );
+  } catch (error) {
+    if (error instanceof Error && error.message.startsWith('scope_authority_missing:')) {
+      return { eligible: false, reason: 'spec_missing' };
+    }
+    throw error;
+  }
+  const body = Buffer.from(frozen.specBytes).toString('utf8');
+  const expectedSpec: ExpectedSpecIdentity = {
+    specSource: frozen.specSource,
+    specRevision: frozen.specRevision,
+    specHash: `sha256:${createHash('sha256').update(frozen.specBytes).digest('hex')}`,
+  };
   if (!/^cauldron_compatible:\s*true\s*$/im.test(body)) {
     return { eligible: false, reason: 'cauldron_incompatible' };
   }
@@ -115,6 +148,8 @@ export async function checkFireEligibility(
       project,
       specVerifiedAt: (deps.now ?? ((): Date => new Date()))().toISOString(),
       noOpenOrMergedPr: true,
+      specSource: 'repo-path',
+      expectedSpec,
     },
   };
 }
