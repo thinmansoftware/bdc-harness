@@ -78,6 +78,34 @@ describe('classifyThread', () => {
 });
 
 describe('computeNextAction', () => {
+  test('held threads cannot fire but retain their existing stale nudge behavior', () => {
+    const item = thread({
+      isUnclaimed: true,
+      isHeld: true,
+      lastActivityAt: new Date(NOW_MS - 5 * 3_600_000).toISOString(),
+    });
+    const classification = classifyThread(item, NOW_MS);
+    expect(classification).toBe('stale');
+    expect(
+      computeNextAction(item, classification, {
+        nowMs: NOW_MS,
+        interventionsLast24h: 0,
+        adoption: makeAdoption({
+          title: 'Held work',
+          next_action: 'confirm release with operator',
+        }),
+        fireEligible: true,
+        fireLane: 'codex',
+        fireEvidence: {
+          woId: 'WO-HARNESS-EXAMPLE-01',
+          targetRepo: 'thinmansoftware/bdc-harness',
+          project: 'bdc-harness',
+          specVerifiedAt: new Date(NOW_MS).toISOString(),
+          noOpenOrMergedPr: true,
+        },
+      })?.type
+    ).toBe('nudge');
+  });
   test('blocked and healthy threads produce no action', () => {
     const t = thread();
     expect(computeNextAction(t, 'blocked', { interventionsLast24h: 0, nowMs: NOW_MS })).toBeNull();

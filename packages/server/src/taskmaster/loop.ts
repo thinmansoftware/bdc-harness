@@ -418,8 +418,9 @@ export async function defaultListThreads(fetchImpl: typeof fetch = fetch): Promi
             isCustomerFacing: labels.some(l => l.toLowerCase() === 'customer'),
             lastActivityAt: issue.updated_at,
             isBlocked: normalizedLabels.some(label =>
-              ['blocked', 'status:blocked', 'hold', 'status:hold'].includes(label)
+              ['blocked', 'status:blocked'].includes(label)
             ),
+            isHeld: normalizedLabels.some(label => ['hold', 'status:hold'].includes(label)),
             isUnclaimed,
             isUnclaimedP0: priority === 'P0' && isUnclaimed,
             recipient: resolveRecipient(ownerLogin),
@@ -1204,6 +1205,8 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
       resolveFireVerbEnabled() &&
       backoff.kind === 'ready' &&
       (item.isUnclaimed ?? item.isUnclaimedP0) &&
+      !item.isBlocked &&
+      !item.isHeld &&
       typeof (item as ListedThread).title === 'string'
     ) {
       try {
@@ -1226,7 +1229,7 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
       adoption: adoptionRow?.title ? adoptionRow : undefined,
       grades: gradesByRef.get(canonRef),
       suppression: suppressionByRef.get(canonRef),
-      fireEligible: fireResult.eligible,
+      fireEligible: fireResult.eligible && Boolean(fireResult.evidence?.expectedSpec),
       fireLane: laneDecision.lane,
       fireHolding: laneDecision.holding,
       fireEscalate: backoff.kind === 'escalate',
@@ -1452,6 +1455,7 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
         });
         const cascadePromise = executeCascade({
           woId: proposal.fireEvidence.woId,
+          expectedSpec: proposal.fireEvidence.expectedSpec,
           project: proposal.fireEvidence.project,
           dispatchId: proposal.idempotencyKey,
           token: process.env.ARCHON_OPERATOR_TOKEN ?? '',

@@ -396,7 +396,52 @@ describe('scenario 3: pause scope=effects withholds ALL effects (P0 escalation n
   });
 });
 
+const EXPECTED_SPEC = {
+  specSource: 'github:thinmansoftware/bdc-xo:docs/work-orders/WO-HARNESS-EXAMPLE-01.md',
+  specRevision: 'a'.repeat(40),
+  specHash: `sha256:${'b'.repeat(64)}`,
+};
 describe('fire_cauldron loop', () => {
+  test('legacy eligibility without immutable identity never dispatches a cascade', async () => {
+    const prior = process.env.TASKMASTER_FIRE_VERB_ENABLED;
+    process.env.TASKMASTER_FIRE_VERB_ENABLED = 'true';
+    try {
+      const world = makeWorld();
+      seedDigestSent(world);
+      let admissions = 0;
+      await tick(
+        createTaskmasterState(60_000),
+        makeDeps(world, {
+          listThreads: async () => [
+            makeListedThread({ isUnclaimed: true, title: 'WO-HARNESS-EXAMPLE-01', priority: 'P1' }),
+          ],
+          checkFireEligibility: async () => ({
+            eligible: true,
+            evidence: {
+              woId: 'WO-HARNESS-EXAMPLE-01',
+              targetRepo: 'thinmansoftware/bdc-harness',
+              project: 'bdc-harness',
+              noOpenOrMergedPr: true,
+              specVerifiedAt: new Date(T0).toISOString(),
+            },
+          }),
+          runCascade: async options => {
+            admissions++;
+            const record = { cascadeId: 'bad', status: 'running' } as never;
+            options.onAdmission?.(record, true);
+            return record;
+          },
+        })
+      );
+      expect(admissions).toBe(0);
+      expect(
+        world.journal.some(row => row.action_type === 'fire_cauldron' && row.outcome === 'sent')
+      ).toBe(false);
+    } finally {
+      if (prior === undefined) delete process.env.TASKMASTER_FIRE_VERB_ENABLED;
+      else process.env.TASKMASTER_FIRE_VERB_ENABLED = prior;
+    }
+  });
   test('fire backoff still delivers an outstanding ruling for the P0', async () => {
     const world = makeWorld();
     seedDigestSent(world);
@@ -453,10 +498,12 @@ describe('fire_cauldron loop', () => {
             project: 'bdc-harness',
             specVerifiedAt: new Date(T0).toISOString(),
             noOpenOrMergedPr: true,
+            expectedSpec: EXPECTED_SPEC,
           },
         }),
         runCascade: (async options => {
           admissions += 1;
+          expect(options.expectedSpec).toEqual(EXPECTED_SPEC);
           options.onAdmission?.(record, true);
           return record;
         }) as NonNullable<TaskmasterDeps['runCascade']>,
@@ -508,6 +555,7 @@ describe('fire_cauldron loop', () => {
               project: 'bdc-harness',
               specVerifiedAt: new Date(T0).toISOString(),
               noOpenOrMergedPr: true,
+              expectedSpec: EXPECTED_SPEC,
               specSource: 'issue-body',
             },
           }),
@@ -567,6 +615,7 @@ describe('fire_cauldron loop', () => {
               project: 'bdc-harness',
               specVerifiedAt: new Date(T0).toISOString(),
               noOpenOrMergedPr: true,
+              expectedSpec: EXPECTED_SPEC,
               specSource: 'repo-path',
             },
           };
@@ -630,6 +679,7 @@ describe('fire_cauldron loop', () => {
               project: 'bdc-harness',
               specVerifiedAt: new Date(T0).toISOString(),
               noOpenOrMergedPr: true,
+              expectedSpec: EXPECTED_SPEC,
               specSource: 'repo-path',
             },
           };
@@ -708,6 +758,7 @@ describe('fire_cauldron loop', () => {
               project: 'bdc-harness',
               specVerifiedAt: new Date(T0).toISOString(),
               noOpenOrMergedPr: true,
+              expectedSpec: EXPECTED_SPEC,
             },
           }),
           runCascade: (async options => {
@@ -781,6 +832,7 @@ describe('fire_cauldron loop', () => {
               project: 'bdc-harness',
               specVerifiedAt: new Date(T0).toISOString(),
               noOpenOrMergedPr: true,
+              expectedSpec: EXPECTED_SPEC,
             },
           }),
           runCascade: (async options => {
@@ -863,6 +915,7 @@ describe('fire_cauldron loop', () => {
               project: 'bdc-harness',
               specVerifiedAt: new Date(T0).toISOString(),
               noOpenOrMergedPr: true,
+              expectedSpec: EXPECTED_SPEC,
             },
           }),
           runCascade: (async () => {
@@ -1981,7 +2034,8 @@ describe('defaultListThreads -- GitHub work-SOR read', () => {
     expect(byNumber.get(14)?.priority).toBe('P2');
     expect(byNumber.get(15)?.isBlocked).toBe(true);
     expect(byNumber.get(16)?.isUnclaimedP0).toBe(false);
-    expect(byNumber.get(17)?.isBlocked).toBe(true);
+    expect(byNumber.get(17)?.isBlocked).toBe(false);
+    expect(byNumber.get(17)?.isHeld).toBe(true);
     expect(byNumber.get(18)?.isUnclaimed).toBe(false);
   });
 

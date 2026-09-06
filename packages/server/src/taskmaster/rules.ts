@@ -43,6 +43,8 @@ export interface ThreadSnapshot {
   lastActivityAt: string;
   /** Blocked threads are watched, never nudged (John's decision surface). */
   isBlocked?: boolean;
+  /** Hold labels withhold fire without changing ordinary nudge classification. */
+  isHeld?: boolean;
   /** Ratified ruling sitting undelivered for this thread's seat. */
   undeliveredRulingId?: string;
   /** P0 with no assignee/claim. */
@@ -332,7 +334,11 @@ export function computeNextAction(
     };
   }
 
-  if ((thread.isUnclaimed ?? thread.isUnclaimedP0) && classification !== 'blocked') {
+  if (
+    (thread.isUnclaimed ?? thread.isUnclaimedP0) &&
+    classification !== 'blocked' &&
+    !thread.isHeld
+  ) {
     const bucket = Math.floor(context.nowMs / NUDGE_CLOCK_MS.P0);
     if (
       context.fireEligible &&
