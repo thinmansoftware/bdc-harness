@@ -32,12 +32,19 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
-  if (db) await db.close();
-  if (adminDb) {
-    if (schemaName) await adminDb.query(`DROP SCHEMA ${schemaName} CASCADE`);
-    await adminDb.close();
-    adminDb = undefined;
-    schemaName = undefined;
+  try {
+    if (db) await db.close();
+  } finally {
+    try {
+      if (adminDb && schemaName) await adminDb.query(`DROP SCHEMA ${schemaName} CASCADE`);
+    } finally {
+      try {
+        if (adminDb) await adminDb.close();
+      } finally {
+        adminDb = undefined;
+        schemaName = undefined;
+      }
+    }
   }
 });
 
