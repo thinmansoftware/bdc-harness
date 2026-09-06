@@ -1,11 +1,11 @@
 import { useMemo } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { useNavigate } from 'react-router';
+import { formatDuration, workflowRunDetailPath } from '@/lib/format';
 import { listConversations, listWorkflowRuns, getCodebaseEnvironments } from '@/lib/api';
 import type { WorkflowRunResponse, IsolationEnvironment } from '@/lib/api';
 import { ConversationItem } from '@/components/conversations/ConversationItem';
 import { WorkflowInvoker } from '@/components/sidebar/WorkflowInvoker';
-import { formatDuration } from '@/lib/format';
 import { cn } from '@/lib/utils';
 
 interface ProjectDetailProps {
@@ -83,7 +83,7 @@ export function ProjectDetail({
   };
 
   const handleRunClick = (run: WorkflowRunResponse): void => {
-    navigate(`/workflows/runs/${run.id}`);
+    navigate(workflowRunDetailPath(run.id));
   };
 
   // Filter conversations by search

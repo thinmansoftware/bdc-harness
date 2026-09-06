@@ -5,6 +5,9 @@ import {
   formatDurationMs,
   formatIterLabel,
   formatStarted,
+  shortRunId,
+  workflowRunApiPath,
+  workflowRunDetailPath,
 } from './format';
 
 describe('ensureUtc', () => {
@@ -192,5 +195,52 @@ describe('formatIterLabel', () => {
 
   test('failed loop shows iter X/MAX (failed)', () => {
     expect(formatIterLabel(3, 25, 'failed')).toBe('iter 3/25 (failed)');
+  });
+});
+
+describe('shortRunId (display-only)', () => {
+  test('truncates long ids to 8 chars for readability', () => {
+    expect(shortRunId('eff9d1e8582a29e2748d4886c85c0218')).toBe('eff9d1e8');
+  });
+
+  test('returns short ids unchanged', () => {
+    expect(shortRunId('abcd1234')).toBe('abcd1234');
+  });
+
+  test('returns empty string for empty input', () => {
+    expect(shortRunId('')).toBe('');
+  });
+});
+
+describe('workflowRunDetailPath (full id required)', () => {
+  const FULL = 'eff9d1e8582a29e2748d4886c85c0218';
+
+  test('builds detail route with the full run id (not a truncated display token)', () => {
+    expect(workflowRunDetailPath(FULL)).toBe(`/workflows/runs/${FULL}`);
+  });
+
+  test('rejects an 8-char truncated display id so graph never calls API with a short id', () => {
+    expect(() => workflowRunDetailPath('eff9d1e8')).toThrow(/truncated display id/);
+  });
+
+  test('rejects empty id', () => {
+    expect(() => workflowRunDetailPath('')).toThrow(/non-empty/);
+  });
+});
+
+describe('workflowRunApiPath (full id required)', () => {
+  const FULL = 'eff9d1e8582a29e2748d4886c85c0218';
+
+  test('builds GET detail path with full id', () => {
+    expect(workflowRunApiPath(FULL)).toBe(`/api/workflows/runs/${FULL}`);
+  });
+
+  test('appends action suffix while keeping full id', () => {
+    expect(workflowRunApiPath(FULL, '/cancel')).toBe(`/api/workflows/runs/${FULL}/cancel`);
+    expect(workflowRunApiPath(FULL, 'approve')).toBe(`/api/workflows/runs/${FULL}/approve`);
+  });
+
+  test('rejects truncated display id (would 404 at API)', () => {
+    expect(() => workflowRunApiPath('eff9d1e8')).toThrow(/truncated display id/);
   });
 });

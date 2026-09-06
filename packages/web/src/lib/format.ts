@@ -47,3 +47,52 @@ export function formatIterLabel(
   if (status === 'failed') return `${base} (failed)`;
   return base;
 }
+
+/**
+ * Short display form of a workflow run id (first 8 chars).
+ * DISPLAY ONLY -- never pass the return value to navigation or API calls.
+ * GET /api/workflows/runs/<id> requires the full 32-char id; a short prefix 404s.
+ */
+export function shortRunId(runId: string): string {
+  if (!runId) return '';
+  return runId.length > 8 ? runId.slice(0, 8) : runId;
+}
+
+/**
+ * Build the client route for a workflow run detail page.
+ * Always uses the full run id so graph hydration / GET /api/workflows/runs/:id works.
+ */
+export function workflowRunDetailPath(runId: string): string {
+  const id = (runId ?? '').trim();
+  if (!id) {
+    throw new Error('workflowRunDetailPath requires a non-empty full run id');
+  }
+  // Guard against accidental short-id wiring: known sqlite/pg ids are 32 hex chars
+  // (no dashes). If someone passes an 8-char display token, fail closed instead of
+  // navigating to a permanently-spinning "Loading graph..." detail page.
+  if (/^[0-9a-f]{8}$/i.test(id)) {
+    throw new Error(
+      `workflowRunDetailPath received truncated display id "${id}"; pass the full run id`
+    );
+  }
+  return `/workflows/runs/${encodeURIComponent(id)}`;
+}
+
+/**
+ * Build the REST path used by getWorkflowRun / cancel / approve / etc.
+ * Same full-id requirement as workflowRunDetailPath.
+ */
+export function workflowRunApiPath(runId: string, suffix = ''): string {
+  const id = (runId ?? '').trim();
+  if (!id) {
+    throw new Error('workflowRunApiPath requires a non-empty full run id');
+  }
+  if (/^[0-9a-f]{8}$/i.test(id)) {
+    throw new Error(
+      `workflowRunApiPath received truncated display id "${id}"; pass the full run id`
+    );
+  }
+  const base = `/api/workflows/runs/${encodeURIComponent(id)}`;
+  if (!suffix) return base;
+  return suffix.startsWith('/') ? `${base}${suffix}` : `${base}/${suffix}`;
+}

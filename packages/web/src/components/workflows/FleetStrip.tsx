@@ -21,7 +21,7 @@ import { AlertTriangle, Flame } from 'lucide-react';
 
 import type { DashboardRunResponse } from '@/lib/api';
 import { listDashboardRuns } from '@/lib/api';
-import { ensureUtc, formatDurationMs } from '@/lib/format';
+import { ensureUtc, formatDurationMs, workflowRunDetailPath } from '@/lib/format';
 import { formatCostUsd, costColorClass } from '@/lib/cost-utils';
 import {
   computeCostBurnRate,
@@ -74,7 +74,7 @@ function RunChip({
     <button
       type="button"
       onClick={(): void => {
-        navigate(`/workflows/runs/${run.id}`);
+        navigate(workflowRunDetailPath(run.id));
       }}
       className={cn(
         'flex items-center gap-2 rounded-full border px-2 py-0.5 text-[10px] transition-colors shrink-0',

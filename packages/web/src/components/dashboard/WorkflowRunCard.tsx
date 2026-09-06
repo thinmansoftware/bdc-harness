@@ -21,7 +21,7 @@ import {
 } from 'lucide-react';
 import type { DashboardRunResponse } from '@/lib/api';
 import { cn } from '@/lib/utils';
-import { formatDuration } from '@/lib/format';
+import { formatDuration, shortRunId, workflowRunDetailPath } from '@/lib/format';
 import { useWorkflowStore } from '@/stores/workflow-store';
 import type { WorkflowState } from '@/lib/types';
 import { ConfirmRunActionDialog } from './ConfirmRunActionDialog';
@@ -292,11 +292,26 @@ export function WorkflowRunCard({
         </p>
       )}
 
+      {/* Full run id is copyable; short form is display-only. Navigation uses run.id. */}
+      <button
+        type="button"
+        onClick={(): void => {
+          void navigator.clipboard.writeText(run.id);
+        }}
+        className="inline-flex items-center gap-1 text-[11px] font-mono text-text-tertiary hover:text-text-secondary transition-colors"
+        title={`Full run id: ${run.id} (click to copy)`}
+        data-testid="dashboard-run-id"
+        data-full-run-id={run.id}
+      >
+        <span>id {shortRunId(run.id)}</span>
+      </button>
+
       {/* Actions */}
       <div className="flex flex-wrap items-center gap-2 pt-1">
         <button
           onClick={(): void => {
-            navigate(`/workflows/runs/${run.id}`);
+            // Always route with the FULL run.id (not short display token).
+            navigate(workflowRunDetailPath(run.id));
           }}
           className="flex items-center gap-1 rounded-md px-2 py-1 text-xs text-text-secondary hover:bg-surface-elevated hover:text-text-primary transition-colors"
         >

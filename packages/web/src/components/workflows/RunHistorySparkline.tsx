@@ -16,7 +16,7 @@ import { useNavigate } from 'react-router';
 
 import type { DashboardRunResponse } from '@/lib/api';
 import { listDashboardRuns } from '@/lib/api';
-import { ensureUtc, formatDurationMs } from '@/lib/format';
+import { ensureUtc, formatDurationMs, workflowRunDetailPath } from '@/lib/format';
 import { cn } from '@/lib/utils';
 
 const SPARKLINE_LIMIT = 10;
@@ -90,7 +90,7 @@ export function RunHistorySparkline({
             key={run.id}
             type="button"
             onClick={(): void => {
-              navigate(`/workflows/runs/${run.id}`);
+              navigate(workflowRunDetailPath(run.id));
             }}
             className={cn(
               'h-2.5 w-2.5 rounded-full shrink-0 cursor-pointer transition-transform hover:scale-150',

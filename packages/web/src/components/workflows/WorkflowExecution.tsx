@@ -14,7 +14,7 @@ import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { ResizablePanelGroup, ResizablePanel, ResizableHandle } from '@/components/ui/resizable';
 import { useWorkflowStore } from '@/stores/workflow-store';
 import { getWorkflowRun, getWorkflowRunByWorker, getCodebase, getWorkflow } from '@/lib/api';
-import { ensureUtc, formatDurationMs } from '@/lib/format';
+import { ensureUtc, formatDurationMs, shortRunId, workflowRunDetailPath } from '@/lib/format';
 import { formatCostUsd, costColorClass } from '@/lib/cost-utils';
 import { selectInitialNode } from '@/lib/select-initial-node';
 import type {
@@ -866,7 +866,7 @@ export function WorkflowExecution({ runId }: WorkflowExecutionProps): React.Reac
           {workerRunId && (
             <button
               onClick={(): void => {
-                navigate(`/workflows/runs/${workerRunId}`);
+                navigate(workflowRunDetailPath(workerRunId));
               }}
               className="flex items-center gap-1 text-xs text-primary hover:text-accent-bright transition-colors"
               title="View workflow run details"
@@ -874,6 +874,18 @@ export function WorkflowExecution({ runId }: WorkflowExecutionProps): React.Reac
               <span>Run Details</span>
             </button>
           )}
+          <button
+            type="button"
+            onClick={(): void => {
+              void navigator.clipboard.writeText(runId);
+            }}
+            className="text-xs font-mono text-text-tertiary hover:text-text-secondary transition-colors"
+            title={`Full run id: ${runId} (click to copy)`}
+            data-testid="execution-run-id"
+            data-full-run-id={runId}
+          >
+            {shortRunId(runId)}
+          </button>
           <span className="text-xs text-text-secondary">{formatDurationMs(elapsed)}</span>
           <RunCostBadge usd={runTotalCostUsd} />
         </div>

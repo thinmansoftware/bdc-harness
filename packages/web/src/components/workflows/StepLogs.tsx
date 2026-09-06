@@ -1,10 +1,44 @@
-import { useRef } from 'react';
+import { useRef, useState } from 'react';
 import { useVirtualizer } from '@tanstack/react-virtual';
+import { Check, Copy } from 'lucide-react';
 import { useAutoScroll } from '@/hooks/useAutoScroll';
+import { shortRunId } from '@/lib/format';
 
 interface StepLogsProps {
   runId: string;
   lines?: string[];
+}
+
+function RunIdLabel({ runId }: { runId: string }): React.ReactElement {
+  const [copied, setCopied] = useState(false);
+  const display = shortRunId(runId);
+
+  const copyFullId = (): void => {
+    void navigator.clipboard.writeText(runId).then(() => {
+      setCopied(true);
+      setTimeout(() => {
+        setCopied(false);
+      }, 1500);
+    });
+  };
+
+  return (
+    <button
+      type="button"
+      onClick={copyFullId}
+      className="inline-flex items-center gap-1 font-mono hover:text-text-primary transition-colors"
+      title={`Full run id: ${runId} (click to copy)`}
+      data-testid="run-id-copy"
+      data-full-run-id={runId}
+    >
+      <span>Run {display}</span>
+      {copied ? (
+        <Check className="h-3 w-3 text-success" />
+      ) : (
+        <Copy className="h-3 w-3 opacity-60" />
+      )}
+    </button>
+  );
 }
 
 export function StepLogs({ runId, lines = [] }: StepLogsProps): React.ReactElement {
@@ -22,7 +56,7 @@ export function StepLogs({ runId, lines = [] }: StepLogsProps): React.ReactEleme
     return (
       <div className="flex-1 overflow-auto p-4 font-mono text-sm bg-surface-inset">
         <div className="text-text-secondary text-xs mb-2">
-          Node logs &middot; Run {runId.slice(0, 8)}
+          Node logs &middot; <RunIdLabel runId={runId} />
         </div>
         <div className="text-text-secondary italic">
           Live log output will appear here during workflow execution.
@@ -34,7 +68,7 @@ export function StepLogs({ runId, lines = [] }: StepLogsProps): React.ReactEleme
   return (
     <div className="flex-1 flex flex-col bg-surface-inset relative">
       <div className="text-text-secondary text-xs px-4 pt-3 pb-1">
-        Node logs &middot; Run {runId.slice(0, 8)} &middot; {String(lines.length)} lines
+        Node logs &middot; <RunIdLabel runId={runId} /> &middot; {String(lines.length)} lines
       </div>
       <div ref={containerRef} className="flex-1 overflow-auto px-4 pb-4 font-mono text-sm">
         <div

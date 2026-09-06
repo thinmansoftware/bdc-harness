@@ -1,5 +1,6 @@
 import { memo, useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate } from 'react-router';
+import { workflowRunDetailPath } from '@/lib/format';
 import ReactMarkdown, { type Components } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { useQuery } from '@tanstack/react-query';
@@ -222,7 +223,7 @@ function WorkflowResultCard({
           )}
           <button
             onClick={(): void => {
-              navigate(`/workflows/runs/${runId}`);
+              navigate(workflowRunDetailPath(runId));
             }}
             className="text-[10px] text-primary hover:text-accent-bright transition-colors shrink-0"
           >
