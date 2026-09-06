@@ -342,7 +342,7 @@ export function computeNextAction(
     const bucket = Math.floor(context.nowMs / NUDGE_CLOCK_MS.P0);
     if (
       context.fireEligible &&
-      context.fireEvidence &&
+      context.fireEvidence?.expectedSpec &&
       !context.fireEscalate &&
       (context.fireLane || context.customerP0Exempt)
     ) {

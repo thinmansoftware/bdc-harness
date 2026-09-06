@@ -45,6 +45,7 @@ describe('checkFireEligibility', () => {
       String(url).includes('/contents/docs/work-orders/') ? response({}, 404) : original(url, init);
     const result = await checkFireEligibility(TITLE, configured);
     expect(result.eligible).toBe(true);
+    expect(result.evidence?.specSource).toBe('repo-path');
     expect(result.evidence?.expectedSpec?.specSource).toEndWith(
       'docs/superpowers/specs/WO-HARNESS-EXAMPLE-01.md'
     );

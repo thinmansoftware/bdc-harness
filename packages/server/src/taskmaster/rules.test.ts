@@ -18,6 +18,12 @@ import {
 import type { TmAdoptionRow } from '@archon/core/db/taskmaster';
 import { validateProposal } from './guard';
 
+const EXPECTED_SPEC = {
+  specSource: 'github:thinmansoftware/bdc-xo:docs/work-orders/WO-HARNESS-EXAMPLE-01.md',
+  specRevision: 'a'.repeat(40),
+  specHash: `sha256:${'b'.repeat(64)}`,
+};
+
 const NOW_MS = Date.parse('2026-08-07T12:00:00.000Z');
 
 function thread(overrides: Partial<ThreadSnapshot> = {}): ThreadSnapshot {
@@ -78,6 +84,35 @@ describe('classifyThread', () => {
 });
 
 describe('computeNextAction', () => {
+  test('direct callers cannot fire eligible work without expected spec identity', () => {
+    const proposal = computeNextAction(thread({ isUnclaimed: true }), 'healthy', {
+      nowMs: NOW_MS,
+      interventionsLast24h: 0,
+      fireEligible: true,
+      fireLane: 'codex',
+      fireEvidence: {
+        woId: 'WO-HARNESS-EXAMPLE-01',
+        targetRepo: 'thinmansoftware/bdc-harness',
+        project: 'bdc-harness',
+        specVerifiedAt: new Date(NOW_MS).toISOString(),
+        noOpenOrMergedPr: true,
+      },
+    });
+    expect(proposal).toBeNull();
+  });
+
+  test('an undelivered ruling still wins if a caller supplies healthy classification', () => {
+    const item = thread({ undeliveredRulingId: 'ruling-healthy' });
+    // Normal classification is ready. Preserve the existing direct-caller
+    // behavior too: governance delivery is independent of an idle clock.
+    expect(classifyThread(item, NOW_MS)).toBe('ready');
+    expect(
+      computeNextAction(item, 'healthy', {
+        nowMs: NOW_MS,
+        interventionsLast24h: 0,
+      })?.type
+    ).toBe('deliver_ruling');
+  });
   test('held threads cannot fire but retain their existing stale nudge behavior', () => {
     const item = thread({
       isUnclaimed: true,
@@ -207,6 +242,7 @@ describe('computeNextAction', () => {
       project: 'bdc-harness',
       specVerifiedAt: new Date(NOW_MS).toISOString(),
       noOpenOrMergedPr: true as const,
+      expectedSpec: EXPECTED_SPEC,
     };
     const proposal = computeNextAction(thread({ priority: 'P0', isUnclaimedP0: true }), 'ready', {
       interventionsLast24h: 0,
@@ -237,7 +273,8 @@ describe('computeNextAction', () => {
       project: 'bdc-harness',
       specVerifiedAt: new Date(NOW_MS).toISOString(),
       noOpenOrMergedPr: true as const,
-      specSource: 'issue-body' as const,
+      expectedSpec: EXPECTED_SPEC,
+      specSource: 'repo-path' as const,
     };
     for (const priority of ['P1', 'P2', 'P3'] as const) {
       const proposal = computeNextAction(thread({ priority, isUnclaimed: true }), 'healthy', {
@@ -248,7 +285,7 @@ describe('computeNextAction', () => {
         fireEvidence: evidence,
       });
       expect(proposal?.type).toBe('fire_cauldron');
-      expect(proposal?.fireEvidence?.specSource).toBe('issue-body');
+      expect(proposal?.fireEvidence?.specSource).toBe('repo-path');
     }
     expect(
       computeNextAction(thread({ priority: 'P1', isUnclaimed: false }), 'healthy', {
@@ -268,7 +305,8 @@ describe('computeNextAction', () => {
       project: 'bdc-harness',
       specVerifiedAt: new Date(NOW_MS).toISOString(),
       noOpenOrMergedPr: true as const,
-      specSource: 'issue-body' as const,
+      expectedSpec: EXPECTED_SPEC,
+      specSource: 'repo-path' as const,
     };
     expect(
       computeNextAction(thread({ isBlocked: true, isUnclaimed: true }), 'blocked', {
@@ -289,6 +327,7 @@ describe('computeNextAction', () => {
       project: 'bdc-harness',
       specVerifiedAt: new Date(NOW_MS).toISOString(),
       noOpenOrMergedPr: true as const,
+      expectedSpec: EXPECTED_SPEC,
     };
     const base = {
       interventionsLast24h: 0,
@@ -316,6 +355,7 @@ describe('computeNextAction', () => {
       project: 'bdc-harness',
       specVerifiedAt: new Date(NOW_MS).toISOString(),
       noOpenOrMergedPr: true as const,
+      expectedSpec: EXPECTED_SPEC,
     };
     const context = {
       interventionsLast24h: 0,
@@ -349,7 +389,7 @@ describe('computeNextAction', () => {
         project: 'bdc-harness',
         specVerifiedAt: new Date(NOW_MS).toISOString(),
         noOpenOrMergedPr: true,
-        specSource: 'issue-body',
+        specSource: 'repo-path',
       },
     });
     expect(proposal?.type).toBe('nudge');

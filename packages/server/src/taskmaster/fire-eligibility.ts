@@ -11,6 +11,8 @@ export interface FireEligibilityEvidence {
   project: string;
   specVerifiedAt: string;
   noOpenOrMergedPr: true;
+  /** Legacy source category; repo-path covers either exact committed path.
+   * expectedSpec.specSource carries the full canonical path. */
   specSource?: 'repo-path' | 'date-glob' | 'issue-body';
   expectedSpec?: ExpectedSpecIdentity;
 }
