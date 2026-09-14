@@ -223,7 +223,8 @@ function checkAttemptIsNewer(candidate: CheckRunLike, current: CheckRunLike): bo
  * GitHub's `checks.listForRef` retains older rerun attempts. A failed first
  * try sitting next to a later success is not current suite state: grouping
  * by name and evaluating the newest attempt is what makes `allChecksGreen`
- * mean "the head is green now", not "every historical attempt passed".
+ * mean "the blocking checks are green now", not "every historical attempt
+ * passed".
  */
 export function latestAttemptPerCheck(runs: CheckRunLike[]): CheckRunLike[] {
   const latest = new Map<string, CheckRunLike>();
@@ -235,27 +236,64 @@ export function latestAttemptPerCheck(runs: CheckRunLike[]): CheckRunLike[] {
   return [...latest.values()];
 }
 
+function runMatchesBlockingName(run: CheckRunLike, named: string): boolean {
+  const runName = (run.name ?? '').trim().toLowerCase();
+  const want = named.trim().toLowerCase();
+  if (runName.length === 0 || want.length === 0) return false;
+  if (runName === want) return true;
+  const runBare = runName.replace(/\s*\([^)]*\)\s*$/, '').trim();
+  const wantBare = want.replace(/\s*\([^)]*\)\s*$/, '').trim();
+  // Verdict named the bare context ("test") or GitHub reported the matrix
+  // job ("test (windows-latest)"). Do not equate two different matrix cells.
+  if (runBare.length >= 3 && runBare === want) return true;
+  if (wantBare.length >= 3 && wantBare === runName) return true;
+  return false;
+}
+
+function latestAttemptIsBlocking(
+  run: CheckRunLike,
+  blockingCheckNames: readonly string[]
+): boolean {
+  if (blockingCheckNames.length === 0) return true;
+  return blockingCheckNames.some(name => runMatchesBlockingName(run, name));
+}
+
+function blockingNamesAllHaveAttempts(
+  current: CheckRunLike[],
+  blockingCheckNames: readonly string[]
+): boolean {
+  if (blockingCheckNames.length === 0) return true;
+  return blockingCheckNames.every(name => current.some(run => runMatchesBlockingName(run, name)));
+}
+
 /**
  * The most recently COMPLETED check run at a head, or null.
  *
  * Check runs pinned to the exact head. A run with no `completed_at` cannot be
  * compared against a verdict timestamp and is skipped rather than guessed at.
  */
-export function selectLatestCompletion(runs: CheckRunLike[]): LatestCheckCompletion | null {
+export function selectLatestCompletion(
+  runs: CheckRunLike[],
+  blockingCheckNames: readonly string[] = []
+): LatestCheckCompletion | null {
   const current = latestAttemptPerCheck(runs);
+  const blocking = blockingCheckNames.map(name => name.trim()).filter(name => name.length > 0);
   let latest: LatestCheckCompletion | null = null;
   let latestMs = Number.NEGATIVE_INFINITY;
-  // WHOLE-SUITE HEALTH (#786 review @18df6323). Computed from the SAME list the
-  // latest-completion scan walks, so the stricter "has the evidence actually
-  // improved" test costs no additional GitHub read. Any run that is not
-  // completed, or completed in a non-passing state, disqualifies the head.
-  // Older rerun attempts are ignored: listForRef retains them, and a later
-  // success must not stay blocked by the failed first try.
+  // BLOCKING-SET HEALTH (#786 review round 4). Same listForRef payload as
+  // before -- no extra GitHub read. When the caller names the checks the
+  // standing verdict rejected for, only those latest attempts decide
+  // allChecksGreen; an optional / non-required job that is red or still
+  // running must not stall the lost-webhook backstop. Empty names keep the
+  // prior every-latest-attempt rule (we do not know which checks matter).
   let allChecksGreen = true;
   let sawAnyRun = false;
   for (const run of current) {
     sawAnyRun = true;
-    if (run.status !== 'completed' || !conclusionIsPassing(run.conclusion)) {
+    if (
+      latestAttemptIsBlocking(run, blocking) &&
+      (run.status !== 'completed' || !conclusionIsPassing(run.conclusion))
+    ) {
       allChecksGreen = false;
     }
     if (run.status !== 'completed') continue;
@@ -275,20 +313,25 @@ export function selectLatestCompletion(runs: CheckRunLike[]): LatestCheckComplet
   if (!latest) return null;
   // A head with NO runs at all is not "green" -- there is no passing evidence,
   // so it must not clear a rejection. Unreachable while `latest` is set, but
-  // stated so the fail-closed intent survives a future refactor.
-  return { ...latest, allChecksGreen: sawAnyRun && allChecksGreen };
+  // stated so the fail-closed intent survives a future refactor. A named
+  // blocking check with no attempt yet is also not green.
+  return {
+    ...latest,
+    allChecksGreen: sawAnyRun && allChecksGreen && blockingNamesAllHaveAttempts(current, blocking),
+  };
 }
 
 export async function readLatestCheckCompletion(
   octokit: CheckRunsForRefClient,
-  candidate: Pick<SweepCandidate, 'owner' | 'repo' | 'headSha'>
+  candidate: Pick<SweepCandidate, 'owner' | 'repo' | 'headSha'>,
+  blockingCheckNames: readonly string[] = []
 ): Promise<LatestCheckCompletion | null> {
   const { runs, complete } = await fetchAllCheckRunsForRef(octokit, {
     owner: candidate.owner,
     repo: candidate.repo,
     ref: candidate.headSha,
   });
-  const latest = selectLatestCompletion(runs);
+  const latest = selectLatestCompletion(runs, blockingCheckNames);
   if (!latest || complete) return latest;
   // A capped or failed page walk is partial evidence and therefore cannot
   // establish that every check at the exact head is green.
@@ -304,7 +347,8 @@ export function createRealStaleVerdictSweepDeps(config: ReviewRouteConfig): Stal
   return {
     listCandidates: (limit, afterSeq) => listRealSweepCandidates(limit, afterSeq),
     readStandingVerdict: candidate => recheckDeps.readStandingVerdict(candidate),
-    readLatestCheckCompletion: candidate => readLatestCheckCompletion(octokit, candidate),
+    readLatestCheckCompletion: (candidate, blockingCheckNames) =>
+      readLatestCheckCompletion(octokit, candidate, blockingCheckNames),
     enqueueRecheckWork: input => recheckDeps.enqueueRecheckWork(input),
   };
 }

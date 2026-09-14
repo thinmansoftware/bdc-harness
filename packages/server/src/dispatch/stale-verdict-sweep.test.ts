@@ -8,6 +8,7 @@ import { describe, expect, mock, test } from 'bun:test';
 import type { StandingVerdict } from '@archon/overseer/pr-review-check-ingest';
 import {
   DEFAULT_STALE_SWEEP_MAX,
+  blockingCheckNamesFromVerdict,
   createMemorySweepCursor,
   resolveStaleSweepMax,
   runStaleVerdictSweep,
@@ -512,6 +513,41 @@ describe('cursor: the sweep window advances across heartbeats', () => {
     expect(result.skippedNotGreen).toBe(1);
   });
 
+  test('a named required check that is green still sweeps while optional lint is red', async () => {
+    const octokit = {
+      checks: {
+        listForRef: mock(async () => ({
+          data: {
+            check_runs: [
+              {
+                id: 1,
+                name: 'lint',
+                status: 'completed',
+                conclusion: 'failure',
+                completed_at: '2026-09-07T10:00:00Z',
+              },
+              {
+                id: 555,
+                name: 'test (windows-latest)',
+                status: 'completed',
+                conclusion: 'success',
+                completed_at: '2026-09-07T16:15:00Z',
+              },
+            ],
+          },
+        })),
+      },
+    };
+    const recorded: Recorded = { enqueued: [], githubReads: 0 };
+    const deps = makeDeps([candidate()], recorded, {
+      readLatestCheckCompletion: (input, names) => readLatestCheckCompletion(octokit, input, names),
+    });
+    const result = await runStaleVerdictSweep(deps, 3);
+    expect(result.enqueued).toBe(1);
+    expect(result.skippedNotGreen).toBe(0);
+    expect(recorded.enqueued).toHaveLength(1);
+  });
+
   test('a completion with no allChecksGreen field fails CLOSED', async () => {
     const recorded: Recorded = { enqueued: [], githubReads: 0 };
     const deps = makeDeps([candidate()], recorded, {
@@ -849,6 +885,119 @@ describe('selectLatestCompletion', () => {
       ])
     ).toBeNull();
   });
+
+  test('named blocking check green ignores an optional lint failure', () => {
+    expect(blockingCheckNamesFromVerdict(STALE_VERDICT.summary)).toEqual(['test (windows-latest)']);
+    expect(
+      blockingCheckNamesFromVerdict(
+        '[major] checks/test (windows-latest): required check failed at this head'
+      )
+    ).toEqual(['test (windows-latest)']);
+    const latest = selectLatestCompletion(
+      [
+        {
+          id: 1,
+          name: 'lint',
+          status: 'completed',
+          conclusion: 'failure',
+          completed_at: '2026-09-07T10:00:00Z',
+        },
+        {
+          id: 2,
+          name: 'test (windows-latest)',
+          status: 'completed',
+          conclusion: 'success',
+          completed_at: '2026-09-07T16:15:00Z',
+        },
+      ],
+      ['test (windows-latest)']
+    );
+    expect(latest?.checkName).toBe('test (windows-latest)');
+    expect(latest?.allChecksGreen).toBe(true);
+  });
+
+  test('named blocking check still in progress is not green', () => {
+    const latest = selectLatestCompletion(
+      [
+        {
+          id: 1,
+          name: 'lint',
+          status: 'completed',
+          conclusion: 'failure',
+          completed_at: '2026-09-07T10:00:00Z',
+        },
+        {
+          id: 2,
+          name: 'test (windows-latest)',
+          status: 'in_progress',
+          conclusion: null,
+          completed_at: null,
+        },
+      ],
+      ['test (windows-latest)']
+    );
+    expect(latest?.checkName).toBe('lint');
+    expect(latest?.allChecksGreen).toBe(false);
+  });
+
+  test('empty blocking names keep every-latest-attempt behaviour', () => {
+    expect(blockingCheckNamesFromVerdict('the required check did not pass')).toEqual([]);
+    const latest = selectLatestCompletion(
+      [
+        {
+          id: 1,
+          name: 'lint',
+          status: 'completed',
+          conclusion: 'failure',
+          completed_at: '2026-09-07T10:00:00Z',
+        },
+        {
+          id: 2,
+          name: 'test (windows-latest)',
+          status: 'completed',
+          conclusion: 'success',
+          completed_at: '2026-09-07T16:15:00Z',
+        },
+      ],
+      []
+    );
+    expect(latest?.conclusion).toBe('success');
+    expect(latest?.allChecksGreen).toBe(false);
+  });
+
+  test('named check latest attempt ignores an older failed try', () => {
+    const latest = selectLatestCompletion(
+      [
+        {
+          id: 1,
+          name: 'test (windows-latest)',
+          status: 'completed',
+          conclusion: 'failure',
+          started_at: '2026-09-07T10:00:00Z',
+          completed_at: '2026-09-07T10:05:00Z',
+        },
+        {
+          id: 2,
+          name: 'test (windows-latest)',
+          status: 'completed',
+          conclusion: 'success',
+          started_at: '2026-09-07T16:00:00Z',
+          completed_at: '2026-09-07T16:15:00Z',
+        },
+        {
+          id: 3,
+          name: 'lint',
+          status: 'completed',
+          conclusion: 'failure',
+          completed_at: '2026-09-07T16:20:00Z',
+        },
+      ],
+      ['test (windows-latest)']
+    );
+    expect(latest?.checkId).toBe('check_run:3');
+    expect(latest?.conclusion).toBe('failure');
+    expect(latest?.allChecksGreen).toBe(true);
+  });
 });
 
 describe('paginated check runs in the stale-verdict sweep', () => {
@@ -876,7 +1025,7 @@ describe('paginated check runs in the stale-verdict sweep', () => {
 
     const recorded: Recorded = { enqueued: [], githubReads: 0 };
     const deps = makeDeps([candidate()], recorded, {
-      readLatestCheckCompletion: input => readLatestCheckCompletion(octokit, input),
+      readLatestCheckCompletion: (input, names) => readLatestCheckCompletion(octokit, input, names),
     });
     const result = await runStaleVerdictSweep(deps, 1);
 
@@ -907,7 +1056,7 @@ describe('paginated check runs in the stale-verdict sweep', () => {
     };
     const recorded: Recorded = { enqueued: [], githubReads: 0 };
     const deps = makeDeps([candidate()], recorded, {
-      readLatestCheckCompletion: input => readLatestCheckCompletion(octokit, input),
+      readLatestCheckCompletion: (input, names) => readLatestCheckCompletion(octokit, input, names),
     });
 
     const completion = await deps.readLatestCheckCompletion(candidate());

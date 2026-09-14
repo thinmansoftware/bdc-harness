@@ -168,20 +168,21 @@ export interface LatestCheckCompletion {
   /** When it completed (ISO-8601). */
   completedAt: string;
   /**
-   * Whether EVERY check run at this head has now concluded in a passing state
-   * (`success`, `neutral` or `skipped`), with none still running.
+   * Whether every BLOCKING check at this head has now concluded passing
+   * (`success`, `neutral` or `skipped`), with none of those still running.
    *
-   * WHY THE WHOLE SUITE, NOT JUST THE LATEST (#786 review @18df6323): the sweep
-   * used to enqueue whenever the latest completion was newer than the verdict,
-   * whatever it concluded. A job that failed again, or an unrelated job going
-   * green while the named one stayed red, therefore re-ran the reviewer against
+   * Blocking names come from the standing verdict's `checks/` findings (see
+   * `blockingCheckNamesFromVerdict`). Optional jobs are ignored. When the
+   * verdict names no check, this falls back to every latest attempt -- the
+   * prior whole-suite rule -- because we cannot tell which checks matter.
+   *
+   * WHY NOT JUST THE LATEST (#786 review @18df6323): the sweep used to enqueue
+   * whenever the latest completion was newer than the verdict, whatever it
+   * concluded. A job that failed again therefore re-ran the reviewer against
    * an unchanged head and could churn a valid CHANGES_REQUESTED.
    *
-   * The sweep already pays one `checks.listForRef` per candidate, so the whole
-   * suite is already in hand -- this is a stricter test computed from data the
-   * read returns anyway, at no additional rate-budget cost. Optional so an
-   * older test double may omit it; absent is treated as NOT green, which is the
-   * fail-closed direction.
+   * Optional so an older test double may omit it; absent is treated as NOT
+   * green, which is the fail-closed direction.
    */
   allChecksGreen?: boolean;
 }
@@ -209,7 +210,10 @@ export interface StaleVerdictSweepDeps {
    * per-heartbeat budget is spent before it is ever called -- and why a
    * candidate that reaches this line keeps its slot whatever the answer is.
    */
-  readLatestCheckCompletion(candidate: SweepCandidate): Promise<LatestCheckCompletion | null>;
+  readLatestCheckCompletion(
+    candidate: SweepCandidate,
+    blockingCheckNames?: readonly string[]
+  ): Promise<LatestCheckCompletion | null>;
   /** Same enqueue seam the webhook ingest uses; same idempotency contract. */
   enqueueRecheckWork(input: {
     correlationId: string;
@@ -256,6 +260,47 @@ export interface StaleVerdictSweepResult {
    * declining to churn rejections whose evidence has not actually improved.
    */
   skippedNotGreen: number;
+}
+
+const FINDING_LINE_RE = /^\[(blocker|major|minor|note)\]\s+(.+)$/i;
+const CHECKS_SCOPE_PREFIX = 'checks/';
+
+/**
+ * Check names the standing verdict actually rejected for, from `checks/`
+ * finding lines. Used by the stale sweep so allChecksGreen is the blocking
+ * set, not every optional job at the head.
+ *
+ * Unstructured prose (no finding lines) returns empty: the caller then falls
+ * back to every latest attempt. Do not GitHub-read required contexts here;
+ * that set is not in the sweep deps and a per-PR protection lookup would
+ * spend the rate budget this backstop exists to bound.
+ */
+export function blockingCheckNamesFromVerdict(summary: string | null | undefined): string[] {
+  if (typeof summary !== 'string' || summary.length === 0) return [];
+  const names: string[] = [];
+  const seen = new Set<string>();
+  for (const raw of summary.split(/\r?\n/)) {
+    const line = raw.trim();
+    const match = FINDING_LINE_RE.exec(line);
+    if (!match) continue;
+    const rest = match[2] ?? '';
+    const colon = rest.indexOf(':');
+    const scope = (colon === -1 ? rest : rest.slice(0, colon)).trim();
+    if (!scope.toLowerCase().startsWith(CHECKS_SCOPE_PREFIX)) continue;
+    // Live summaries sometimes omit the colon: `[major] checks/test
+    // (windows-latest) failed`. Strip that trailing prose so the remainder
+    // matches the GitHub check name.
+    const name = scope
+      .slice(CHECKS_SCOPE_PREFIX.length)
+      .trim()
+      .replace(/\s+failed\b.*$/i, '')
+      .trim();
+    const key = name.toLowerCase();
+    if (name.length === 0 || seen.has(key)) continue;
+    seen.add(key);
+    names.push(name);
+  }
+  return names;
 }
 
 /**
@@ -406,19 +451,21 @@ export async function runStaleVerdictSweep(
 
       // Past this point a GitHub read has been issued, so the slot stays spent
       // no matter how the candidate turns out.
-      const completion = await deps.readLatestCheckCompletion(candidate);
+      const completion = await deps.readLatestCheckCompletion(
+        candidate,
+        blockingCheckNamesFromVerdict(verdict.summary)
+      );
       if (!completion) continue;
       if (!verdictIsStale(verdict, completion)) continue;
 
-      // THE EVIDENCE MUST ACTUALLY HAVE IMPROVED (#786 review @18df6323).
-      // Staleness alone only says "something completed after the reviewer
-      // spoke" -- it does not say the thing that completed was good news. A
-      // re-run that failed again, a cancelled job, or an unrelated check going
-      // green all satisfy the timestamp test while leaving the rejection
-      // exactly as valid as it was. Requiring the WHOLE suite to be green is
-      // the strict form of "the checks that blocked this verdict are no longer
-      // blocking", and it costs nothing extra: the suite came back with the
-      // read already spent above.
+      // THE EVIDENCE MUST ACTUALLY HAVE IMPROVED (#786 review @18df6323,
+      // round 4). Staleness alone only says "something completed after the
+      // reviewer spoke" -- it does not say the thing that completed was good
+      // news. Requiring the BLOCKING checks (verdict-named `checks/` findings)
+      // to be green is "the checks that blocked this verdict are no longer
+      // blocking". Optional jobs are ignored. Empty names keep the every-
+      // latest-attempt fallback. The suite came back with the read already
+      // spent above; no extra GitHub call.
       if (!completion.allChecksGreen) {
         result.skippedNotGreen += 1;
         log.info(
