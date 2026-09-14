@@ -641,6 +641,9 @@ describe('Plan-review repair targets and operator-recorded stops', () => {
       );
       expect(yaml).toContain('repair_target_rejected:fork');
       expect(yaml).toContain('repair_target_malformed');
+      expect(yaml).toContain('repair_target_unauthorized');
+      expect(yaml).toContain('s/^[[:space:]]*Repair target:[[:space:]]*PR #');
+      expect(yaml).toContain('BDC_FEATURE_DEV_SPEC_TEXT_READ_SPEC_20260914_020');
       expect(yaml).toContain('UNIQUE_BRANCH="$REPAIR_TARGET_BRANCH"');
     }
   });
@@ -667,6 +670,9 @@ describe('Plan-review repair targets and operator-recorded stops', () => {
       );
       expect(yaml).toContain('repair_target_rejected:fork');
       expect(yaml).toContain('repair_target_malformed');
+      expect(yaml).toContain('repair_target_unauthorized');
+      expect(yaml).toContain('s/^[[:space:]]*Repair target:[[:space:]]*PR #');
+      expect(yaml).toContain('BDC_FEATURE_DEV_SPEC_TEXT_READ_SPEC_20260914_020');
       expect(yaml).toContain('UNIQUE_BRANCH="$REPAIR_TARGET_BRANCH"');
     }
   });
@@ -707,10 +713,17 @@ printf '{"state":"%s","headRefName":"%s","isCrossRepository":%s,"headRepositoryO
       'repo: thinmansoftware/bdc-harness',
     ].join('\n');
 
+  const authorizedDecideOutput = (branch: string) =>
+    [decideOutput(branch), 'repair_target_authorized_by_spec: #826'].join('\n');
+
+  const matchingSpec = (branch: string) =>
+    ['WO: WO-TEST', `Repair target: PR #826 (branch ${branch})`].join('\n');
+
   it('re-verifies an open matching PR before selecting its branch', () => {
     const branch = 'feat/wo-repair-target-01';
     const result = bash(REPAIR_TARGET_SELECTION, worktreeDir, {
-      DECIDE_OUTPUT: decideOutput(branch),
+      DECIDE_OUTPUT: authorizedDecideOutput(branch),
+      SPEC_TEXT: matchingSpec(branch),
       PATH: fakeGhPath('OPEN', branch),
     });
     expect(result.exitCode).toBe(0);
@@ -720,7 +733,8 @@ printf '{"state":"%s","headRefName":"%s","isCrossRepository":%s,"headRepositoryO
   it('fails closed when the repair-target PR has closed', () => {
     const branch = 'feat/wo-repair-target-01';
     const result = bash(REPAIR_TARGET_SELECTION, worktreeDir, {
-      DECIDE_OUTPUT: decideOutput(branch),
+      DECIDE_OUTPUT: authorizedDecideOutput(branch),
+      SPEC_TEXT: matchingSpec(branch),
       PATH: fakeGhPath('CLOSED', branch),
     });
     expect(result.exitCode).toBe(1);
@@ -730,7 +744,8 @@ printf '{"state":"%s","headRefName":"%s","isCrossRepository":%s,"headRepositoryO
   it('fails closed when the live repair-target branch differs', () => {
     const branch = 'feat/wo-repair-target-01';
     const result = bash(REPAIR_TARGET_SELECTION, worktreeDir, {
-      DECIDE_OUTPUT: decideOutput(branch),
+      DECIDE_OUTPUT: authorizedDecideOutput(branch),
+      SPEC_TEXT: matchingSpec(branch),
       PATH: fakeGhPath('OPEN', 'feat/a-different-branch'),
     });
     expect(result.exitCode).toBe(1);
@@ -740,13 +755,82 @@ printf '{"state":"%s","headRefName":"%s","isCrossRepository":%s,"headRepositoryO
   it('fails closed when the repair-target PR is cross-repository', () => {
     const branch = 'feat/wo-repair-target-01';
     const result = bash(REPAIR_TARGET_SELECTION, worktreeDir, {
-      DECIDE_OUTPUT: decideOutput(branch),
+      DECIDE_OUTPUT: authorizedDecideOutput(branch),
+      SPEC_TEXT: matchingSpec(branch),
       PATH: fakeGhPath('OPEN', branch, { cross: true, owner: 'someone-else', repo: 'bdc-harness' }),
     });
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toContain('repair_target_rejected:fork');
     expect(result.stdout).toContain('repair_target_rejected:fork');
     expect(result.stdout).not.toContain(`UNIQUE_BRANCH=${branch}`);
+  });
+
+  it('fails closed when repair_target_authorized_by_spec is missing', () => {
+    const branch = 'feat/wo-repair-target-01';
+    const result = bash(REPAIR_TARGET_SELECTION, worktreeDir, {
+      BRANCH: 'feat/should-not-mint',
+      DECIDE_OUTPUT: decideOutput(branch),
+      SPEC_TEXT: matchingSpec(branch),
+    });
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain('repair_target_unauthorized');
+    expect(result.stdout).toContain('repair_target_unauthorized');
+    expect(result.stdout).not.toContain(`UNIQUE_BRANCH=${branch}`);
+    expect(result.stdout).not.toContain('UNIQUE_BRANCH=feat/should-not-mint-thread-test');
+  });
+
+  it('fails closed when repair_target_authorized_by_spec names a different PR', () => {
+    const branch = 'feat/wo-repair-target-01';
+    const result = bash(REPAIR_TARGET_SELECTION, worktreeDir, {
+      BRANCH: 'feat/should-not-mint',
+      DECIDE_OUTPUT: [decideOutput(branch), 'repair_target_authorized_by_spec: #999'].join('\n'),
+      SPEC_TEXT: matchingSpec(branch),
+    });
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain('repair_target_unauthorized');
+    expect(result.stdout).not.toContain(`UNIQUE_BRANCH=${branch}`);
+    expect(result.stdout).not.toContain('UNIQUE_BRANCH=feat/should-not-mint-thread-test');
+  });
+
+  it('fails closed when the spec declares a different PR', () => {
+    const branch = 'feat/wo-repair-target-01';
+    const result = bash(REPAIR_TARGET_SELECTION, worktreeDir, {
+      BRANCH: 'feat/should-not-mint',
+      DECIDE_OUTPUT: authorizedDecideOutput(branch),
+      SPEC_TEXT: ['WO: WO-TEST', 'Repair target: PR #999 (branch feat/wo-repair-target-01)'].join(
+        '\n'
+      ),
+    });
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain('repair_target_unauthorized');
+    expect(result.stdout).not.toContain(`UNIQUE_BRANCH=${branch}`);
+    expect(result.stdout).not.toContain('UNIQUE_BRANCH=feat/should-not-mint-thread-test');
+  });
+
+  it('fails closed when the spec declares a different branch', () => {
+    const branch = 'feat/wo-repair-target-01';
+    const result = bash(REPAIR_TARGET_SELECTION, worktreeDir, {
+      BRANCH: 'feat/should-not-mint',
+      DECIDE_OUTPUT: authorizedDecideOutput(branch),
+      SPEC_TEXT: ['WO: WO-TEST', 'Repair target: PR #826 (branch feat/other-branch)'].join('\n'),
+    });
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain('repair_target_unauthorized');
+    expect(result.stdout).not.toContain(`UNIQUE_BRANCH=${branch}`);
+    expect(result.stdout).not.toContain('UNIQUE_BRANCH=feat/should-not-mint-thread-test');
+  });
+
+  it('fails closed when the spec declares no repair target', () => {
+    const branch = 'feat/wo-repair-target-01';
+    const result = bash(REPAIR_TARGET_SELECTION, worktreeDir, {
+      BRANCH: 'feat/should-not-mint',
+      DECIDE_OUTPUT: authorizedDecideOutput(branch),
+      SPEC_TEXT: 'WO: WO-TEST\nObjective: no repair target',
+    });
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain('repair_target_unauthorized');
+    expect(result.stdout).not.toContain(`UNIQUE_BRANCH=${branch}`);
+    expect(result.stdout).not.toContain('UNIQUE_BRANCH=feat/should-not-mint-thread-test');
   });
 
   it('fails closed when repair_target_pr is present without repair_target_branch', () => {

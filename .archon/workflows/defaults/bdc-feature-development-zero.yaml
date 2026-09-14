@@ -3126,6 +3126,10 @@ nodes:
         echo "ERROR: refusing to push -- derived THREAD_ID '${THREAD_ID}' is not a bare [A-Za-z0-9_-] token (would create a malformed branch)." >&2
         exit 1
       fi
+      SPEC_TEXT=$(cat <<'BDC_FEATURE_DEV_SPEC_TEXT_READ_SPEC_20260914_020'
+      $read-spec.output
+      BDC_FEATURE_DEV_SPEC_TEXT_READ_SPEC_20260914_020
+      )
       REPAIR_TARGET_BRANCH=$(printf '%s\n' "$DECIDE_OUTPUT_CLEAN" | sed -n 's/^[[:space:]]*repair_target_branch:[[:space:]]*\([^[:space:]]*\)[[:space:]]*$/\1/p' | head -n 1)
       REPAIR_TARGET_PR=$(printf '%s\n' "$DECIDE_OUTPUT_CLEAN" | sed -n 's/^[[:space:]]*repair_target_pr:[[:space:]]*#\{0,1\}\([0-9][0-9]*\)[[:space:]]*$/\1/p' | head -n 1)
       REPAIR_TARGET_PR_PRESENT=false
@@ -3147,6 +3151,14 @@ nodes:
         fi
         if ! git check-ref-format --branch "$REPAIR_TARGET_BRANCH" >/dev/null 2>&1 || ! printf '%s\n' "$REPAIR_TARGET_BRANCH" | grep -Eq "$BRANCH_PATTERN"; then
           echo "ERROR: invalid repair_target_branch '${REPAIR_TARGET_BRANCH}'" >&2
+          exit 1
+        fi
+        REPAIR_TARGET_AUTHORIZED=$(printf '%s\n' "$DECIDE_OUTPUT_CLEAN" | sed -n 's/^[[:space:]]*repair_target_authorized_by_spec:[[:space:]]*\(#[0-9][0-9]*\)[[:space:]]*$/\1/p' | head -n 1)
+        SPEC_REPAIR_PR=$(printf '%s\n' "${SPEC_TEXT-}" | sed -n 's/^[[:space:]]*Repair target:[[:space:]]*PR #\([0-9][0-9]*\)[[:space:]]*(branch \([^[:space:]]*\))[[:space:]]*$/\1/p' | head -n 1)
+        SPEC_REPAIR_BRANCH=$(printf '%s\n' "${SPEC_TEXT-}" | sed -n 's/^[[:space:]]*Repair target:[[:space:]]*PR #[0-9][0-9]*[[:space:]]*(branch \([^[:space:]]*\))[[:space:]]*$/\1/p' | head -n 1)
+        if [ "$REPAIR_TARGET_AUTHORIZED_PRESENT" != true ] || [ "$REPAIR_TARGET_AUTHORIZED" != "#${REPAIR_TARGET_PR}" ] || [ "$SPEC_REPAIR_PR" != "$REPAIR_TARGET_PR" ] || [ "$SPEC_REPAIR_BRANCH" != "$REPAIR_TARGET_BRANCH" ]; then
+          echo "repair_target_unauthorized"
+          echo "ERROR: repair_target_unauthorized: refusing to select an existing branch without a spec-bound authorization matching PR #${REPAIR_TARGET_PR} branch ${REPAIR_TARGET_BRANCH}" >&2
           exit 1
         fi
         REPO_FOR_CHECK=$(printf '%s\n' "$DECIDE_OUTPUT_CLEAN" | sed -n 's/^[[:space:]]*repo:[[:space:]]*\([^[:space:]]*\)[[:space:]]*$/\1/p' | head -n 1)
