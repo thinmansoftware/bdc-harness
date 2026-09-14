@@ -160,7 +160,6 @@ else
 fi
 `;
 
-
 // Anchor on import.meta.dir, not CWD: turbo runs package tests with cwd at the
 // package dir, so bare repo-root-relative paths ENOENT in CI.
 const DEFAULTS_DIR = join(import.meta.dir, '..', '..', '..', '.archon', 'workflows', 'defaults');
@@ -663,9 +662,11 @@ printf '{"state":"%s","headRefName":"%s"}\\n' "$FAKE_GH_STATE" "$FAKE_GH_BRANCH"
   }
 
   const decideOutput = (branch: string) =>
-    [`repair_target_pr: #826`, `repair_target_branch: ${branch}`, 'repo: thinmansoftware/bdc-harness'].join(
-      '\n'
-    );
+    [
+      `repair_target_pr: #826`,
+      `repair_target_branch: ${branch}`,
+      'repo: thinmansoftware/bdc-harness',
+    ].join('\n');
 
   it('re-verifies an open matching PR before selecting its branch', () => {
     const branch = 'feat/wo-repair-target-01';
