@@ -39,11 +39,11 @@ const greenPr = (overrides: Partial<PullRequestEvidence> = {}): PullRequestEvide
   ...overrides,
 });
 
-function policy(merge = true, emergencyStop = false) {
+function policy(merge = true, emergencyStop = false, serviceEnabled = true, legacyDryRun = false) {
   return {
-    service_enabled: true,
+    service_enabled: serviceEnabled,
     emergency_stop: emergencyStop,
-    legacy_dry_run: false,
+    legacy_dry_run: legacyDryRun,
     capability_flags: {
       escalation: false,
       repair: false,
@@ -335,16 +335,21 @@ describe('merge execution bridge', () => {
   });
 
   test.each([
-    [false, false, 'merge_actions_disabled'],
-    [true, true, 'emergency_stop'],
-  ])('gates execution from live policy', async (merge, stop, reason) => {
-    const h = harness([verdict(reason)]);
-    await runMergeExecutionBridgeOnce({
-      store: h.store,
-      github: h.github,
-      readPolicy: () => policy(merge, stop),
-    });
-    expect(h.merges).toBe(0);
-    expect(h.outcomes[0]?.reason).toBe(reason);
-  });
+    [false, false, true, false, 'merge_actions_disabled'],
+    [true, true, true, false, 'emergency_stop'],
+    [true, false, false, false, 'service_disabled'],
+    [true, false, true, true, 'legacy_dry_run'],
+  ])(
+    'gates execution from live policy',
+    async (merge, stop, serviceEnabled, legacyDryRun, reason) => {
+      const h = harness([verdict(reason)]);
+      await runMergeExecutionBridgeOnce({
+        store: h.store,
+        github: h.github,
+        readPolicy: () => policy(merge, stop, serviceEnabled, legacyDryRun),
+      });
+      expect(h.merges).toBe(0);
+      expect(h.outcomes[0]?.reason).toBe(reason);
+    }
+  );
 });

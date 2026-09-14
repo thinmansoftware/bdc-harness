@@ -129,8 +129,16 @@ export async function runMergeExecutionBridgeOnce(
     };
 
     const policy = (options.readPolicy ?? readOverseerActionPolicyFromEnv)();
+    if (!policy.service_enabled) {
+      await skip('service_disabled');
+      continue;
+    }
     if (policy.emergency_stop) {
       await skip('emergency_stop');
+      continue;
+    }
+    if (policy.legacy_dry_run) {
+      await skip('legacy_dry_run');
       continue;
     }
     if (!policy.capability_flags.merge) {
