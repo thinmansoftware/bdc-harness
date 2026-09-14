@@ -252,7 +252,10 @@ TMP2="$(mktemp -d)"
 mkdir -p "$TMP2/shopops-api/routes" "$TMP2/shopops-api/services"
 printf 'gcd\ngcd\ngcd\n' > "$TMP2/shopops-api/routes/store.js"
 printf 'skip_gcd_enrichment\nskip_gcd_enrichment\n' > "$TMP2/shopops-api/services/coverResolver.js"
-( cd "$TMP2" && OUT="$(printf '%s\n' "$SPEC_GCD" | rsg_extract | rsg_run)" && assert_contains "ge 1 holds with observed 3" 'OK: grep -c "gcd" shopops-api/routes/store.js => 3 (expected ge 1)' "$OUT" && assert_contains "ASCII absence holds" 'OK: LC_ALL=C grep -n "[^ -~]" shopops-api/routes/store.js => 0 (expected eq 0)' "$OUT" && assert_contains "unparsed bullet assertions make evidence incomplete" "GREP_STATUS=incomplete" "$OUT" )
+OUT="$(cd "$TMP2" && printf '%s\n' "$SPEC_GCD" | rsg_extract | rsg_run)"
+assert_contains "ge 1 holds with observed 3" 'OK: grep -c "gcd" shopops-api/routes/store.js => 3 (expected ge 1)' "$OUT"
+assert_contains "ASCII absence holds" 'OK: LC_ALL=C grep -n "[^ -~]" shopops-api/routes/store.js => 0 (expected eq 0)' "$OUT"
+assert_contains "unparsed bullet assertions make evidence incomplete" "GREP_STATUS=incomplete" "$OUT"
 rm -rf "$TMP2"
 
 echo
