@@ -2,6 +2,7 @@ import { describe, expect, mock, test } from 'bun:test';
 import {
   createMergeManager,
   parseBaseEffectOverrides,
+  resolveMaxMergesPerHour,
   resolveMergeManagerMode,
   DEFAULT_MERGE_MANAGER_MODE,
 } from '../merge-manager.ts';
@@ -101,6 +102,15 @@ describe('merge manager mode resolution', () => {
     expect(resolveMergeManagerMode('comment-findings')).toBe('comment_findings');
     expect(resolveMergeManagerMode('execute')).toBe('execute');
     expect(resolveMergeManagerMode('EXECUTE')).toBe('execute');
+  });
+});
+
+describe('merge manager rate ceiling resolution', () => {
+  test('uses the documented default for malformed configuration', () => {
+    expect(resolveMaxMergesPerHour('typo')).toBe(4);
+    expect(resolveMaxMergesPerHour('4merges')).toBe(4);
+    expect(resolveMaxMergesPerHour('-1')).toBe(4);
+    expect(resolveMaxMergesPerHour(undefined)).toBe(4);
   });
 });
 
@@ -601,6 +611,22 @@ describe('merge manager', () => {
       expect(mergePullRequest).not.toHaveBeenCalled();
     });
 
+    test('denies when the verdict run no longer has an open pull request', async () => {
+      const closedRecord: WatchedRunRecord = {
+        ...record,
+        prEvidence: { ...record.prEvidence, state: 'closed' },
+      };
+      const { manager, mergePullRequest } = activatedManager({
+        assembled: evidence({ record: closedRecord }),
+      });
+
+      expect(await manager(record)).toMatchObject({
+        status: 'held',
+        reason: 'pull_request_not_open',
+      });
+      expect(mergePullRequest).not.toHaveBeenCalled();
+    });
+
     test('enforces the per-repository integration branch', async () => {
       const { manager, mergePullRequest } = activatedManager({
         assembled: evidence({ base_branch: 'staging' }),
@@ -610,6 +636,16 @@ describe('merge manager', () => {
         reason: 'repo_base_branch_not_allowed',
       });
       expect(mergePullRequest).not.toHaveBeenCalled();
+    });
+
+    test('per-repository base permits a branch absent from the legacy flat list', async () => {
+      const { manager, mergePullRequest } = activatedManager({
+        assembled: evidence({ base_branch: 'main' }),
+        repoBases: new Map([['thinmansoftware/bdc-harness', 'main']]),
+      });
+
+      expect((await manager(record)).status).toBe('executed');
+      expect(mergePullRequest).toHaveBeenCalledTimes(1);
     });
 
     test('limits successful merges within a sliding hour', async () => {

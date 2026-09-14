@@ -69,8 +69,15 @@ export interface MergeManagerDeps extends OverseerActionsDeps, GitHubClientDeps 
   /** Explicit activation/configuration overrides for tests and dependency injection. */
   readonly mutationsEnabled?: boolean;
   readonly mergeActionsEnabled?: boolean;
+  /**
+   * Legacy flat base list retained for dependency-injection compatibility. Execution uses
+   * repoBases as the authoritative repo+branch allowlist; this value does not further
+   * restrict a correctly configured per-repository base.
+   */
   readonly allowedBases?: readonly string[];
+  /** Repositories eligible for execution, as lowercased `owner/repo` keys. */
   readonly allowedRepos?: readonly string[];
+  /** Authoritative integration branch for each allowed `owner/repo`. */
   readonly repoBases?: ReadonlyMap<string, string>;
   readonly maxMergesPerHour?: number;
   readonly now?: () => number;
@@ -543,17 +550,21 @@ function repoBasesFromEnv(raw: string | undefined): ReadonlyMap<string, string> 
   return result;
 }
 
-function allowedBasesFromEnv(raw: string | undefined): readonly string[] {
-  return (raw ?? 'dev,staging')
-    .split(',')
-    .map(value => value.trim().toLowerCase())
-    .filter(Boolean);
+export function resolveMaxMergesPerHour(raw: string | undefined): number {
+  if (raw === undefined || raw.trim() === '') return 4;
+  const normalized = raw.trim();
+  const parsed = Number.parseInt(normalized, 10);
+  if (/^\d+$/.test(normalized) && Number.isSafeInteger(parsed)) return parsed;
+  log.warn(
+    { env: MERGE_MANAGER_MAX_MERGES_PER_HOUR_ENV, value: raw, fallback: 4 },
+    'merge_manager.max_merges_per_hour_invalid -- using default'
+  );
+  return 4;
 }
 
 async function mergePreconditionMiss(
   deps: MergeManagerDeps,
   evidence: QualifiedMergeEvidence,
-  allowedBases: readonly string[],
   reviewGateLogin: string
 ): Promise<string | null> {
   const headSha = evidence.head_sha;
@@ -567,9 +578,6 @@ async function mergePreconditionMiss(
     checks.some(check => check.conclusion !== 'success' || check.head_sha !== headSha)
   ) {
     return 'required_checks_not_green_on_head';
-  }
-  if (!allowedBases.includes(evidence.base_branch.trim().toLowerCase())) {
-    return 'base_branch_not_allowed';
   }
   if (evidence.record.prEvidence.mergeable !== true) {
     return 'pull_request_not_mergeable';
@@ -642,8 +650,6 @@ export function createMergeManager(
   );
   const mutationsEnabled =
     deps.mutationsEnabled ?? envFlagEnabled(process.env[MERGE_MANAGER_MUTATIONS_ENABLED_ENV]);
-  const allowedBases =
-    deps.allowedBases ?? allowedBasesFromEnv(process.env[MERGE_MANAGER_ALLOWED_BASES_ENV]);
   const mergeActionsEnabled =
     deps.mergeActionsEnabled ??
     capabilityFlagEnabled(process.env[OVERSEER_MERGE_ACTIONS_ENABLED_ENV]);
@@ -656,10 +662,7 @@ export function createMergeManager(
   const repoBases = deps.repoBases ?? repoBasesFromEnv(process.env[MERGE_MANAGER_REPO_BASES_ENV]);
   const maxMergesPerHour =
     deps.maxMergesPerHour ??
-    Math.max(
-      0,
-      Number.parseInt(process.env[MERGE_MANAGER_MAX_MERGES_PER_HOUR_ENV] ?? '4', 10) || 0
-    );
+    resolveMaxMergesPerHour(process.env[MERGE_MANAGER_MAX_MERGES_PER_HOUR_ENV]);
   const now = deps.now ?? Date.now;
   const mergeTimestamps: number[] = [];
   const reviewGateLogin = (
@@ -903,12 +906,7 @@ export function createMergeManager(
       return { status: 'held', receipt, execution: null, reason: 'rate_ceiling_exceeded', mode };
     }
 
-    const preconditionMiss = await mergePreconditionMiss(
-      deps,
-      evidence,
-      allowedBases,
-      reviewGateLogin
-    );
+    const preconditionMiss = await mergePreconditionMiss(deps, evidence, reviewGateLogin);
     if (preconditionMiss) {
       await recordManagerAction(
         deps,
