@@ -147,6 +147,92 @@ describe('C2 repeat-send canary', () => {
     expect(result.evidenceRefs).toContain('mode=observe');
   });
 
+  test('--c2-live-enqueue fails when the returned row is queued at a different head', async () => {
+    const db = fixture();
+    insert(db, {
+      id: 'queued-live',
+      headSha: HEAD_A,
+      status: 'queued',
+      repeatReason: 'operator_request:earlier',
+      createdAt: '2026-09-14T12:00:01.000Z',
+    });
+    const fetcher = mock(
+      async () => new Response('{"ok":true,"messageId":"queued-live"}', { status: 200 })
+    );
+    const result = await runRepeatSendCanary({
+      db,
+      c2LiveEnqueue: true,
+      subjectKey: SUBJECT,
+      requestUrl: 'http://localhost:3090/api/overseer/pr-review/request',
+      operatorToken: 'operator-token',
+      owner: 'thinmansoftware',
+      repo: 'bdc-harness',
+      prNumber: 806,
+      headSha: HEAD_B,
+      fetcher: fetcher as unknown as typeof fetch,
+    });
+    expect(result.verdict).toBe('failed');
+    expect(result.evidenceRefs).toContain('enqueued_row_head_mismatch');
+    expect(result.evidenceRefs).toContain(`row_head=${HEAD_A}`);
+  });
+
+  test('--c2-live-enqueue without every POST input is blocked, never a silent no-op', async () => {
+    const db = fixture();
+    insert(db, {
+      id: 'queued-stale',
+      headSha: HEAD_B,
+      status: 'queued',
+      repeatReason: 'operator_request:earlier',
+      createdAt: '2026-09-14T12:00:01.000Z',
+    });
+    const fetcher = mock(async () => new Response('{}', { status: 200 }));
+    const result = await runRepeatSendCanary({
+      db,
+      c2LiveEnqueue: true,
+      subjectKey: SUBJECT,
+      operatorToken: 'operator-token',
+      owner: 'thinmansoftware',
+      repo: 'bdc-harness',
+      prNumber: 806,
+      headSha: HEAD_B,
+      fetcher: fetcher as unknown as typeof fetch,
+    });
+    expect(fetcher).not.toHaveBeenCalled();
+    expect(result.verdict).toBe('blocked');
+    expect(result.reasonCodes).toEqual(['c2_live_enqueue_prerequisites_missing']);
+    expect(result.evidenceRefs).toContain('missing=requestUrl');
+  });
+
+  test('--c2-live-enqueue fails when the returned messageId is not a queued row at the head', async () => {
+    const db = fixture();
+    insert(db, {
+      id: 'queued-stale',
+      headSha: HEAD_A,
+      status: 'queued',
+      repeatReason: 'operator_request:earlier',
+      createdAt: '2026-09-14T12:00:01.000Z',
+    });
+    const fetcher = mock(
+      async () => new Response('{"ok":true,"messageId":"ghost"}', { status: 200 })
+    );
+    const result = await runRepeatSendCanary({
+      db,
+      c2LiveEnqueue: true,
+      subjectKey: SUBJECT,
+      requestUrl: 'http://localhost:3090/api/overseer/pr-review/request',
+      operatorToken: 'operator-token',
+      owner: 'thinmansoftware',
+      repo: 'bdc-harness',
+      prNumber: 806,
+      headSha: HEAD_B,
+      fetcher: fetcher as unknown as typeof fetch,
+    });
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    expect(result.verdict).toBe('failed');
+    expect(result.reasonCodes).toContain('c2_repeat_send_refused');
+    expect(result.evidenceRefs).toContain('enqueued_row_missing');
+  });
+
   test('--c2-live-enqueue POSTs the request with the operator token', async () => {
     const db = fixture();
     const fetcher = mock(async (_url: string, init?: RequestInit) => {
@@ -158,7 +244,7 @@ describe('C2 repeat-send canary', () => {
         repeatReason: 'operator_request:canary_repeat_send',
         createdAt: '2026-09-14T12:00:02.000Z',
       });
-      return new Response('{"ok":true}', { status: 200 });
+      return new Response('{"ok":true,"messageId":"queued-live"}', { status: 200 });
     });
     const result = await runRepeatSendCanary({
       db,
@@ -180,6 +266,7 @@ describe('C2 repeat-send canary', () => {
     );
     expect(result.verdict).toBe('passed');
     expect(result.evidenceRefs).toContain('mode=enqueue');
+    expect(result.evidenceRefs).toContain('message_id=queued-live');
   });
 
   test('RED: stripping repeat_reason refuses the enqueue', async () => {

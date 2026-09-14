@@ -41,6 +41,34 @@ interface ReceiptRow {
   readonly id: string;
   readonly subject_key: string | null;
   readonly body: string;
+  readonly created_at: string;
+}
+
+interface ExhaustedReceipt {
+  readonly headSha: string | null;
+  readonly createdAt: string;
+}
+
+/**
+ * An `rereview_attempts_exhausted` ingest receipt is evidence about ONE head at ONE
+ * moment. It only counts against the subject when it names the current head and no
+ * non-automatic review (a hand nudge, an operator request, the initial review) has
+ * been queued since it was written -- such a review re-arms the consecutive budget
+ * (countConsecutiveAutoRereviews), so the receipt is stale history after it.
+ * Review finding, PR #840 round 6.
+ */
+export function isExhaustedForCurrentHead(
+  receipts: readonly ExhaustedReceipt[],
+  currentHead: string,
+  rows: readonly { readonly created_at: string; readonly repeat_reason: string | null }[]
+): boolean {
+  return receipts.some(receipt => {
+    if (receipt.headSha !== currentHead) return false;
+    const rearmedLater = rows.some(
+      row => row.created_at > receipt.createdAt && !isAutoRereviewReason(row.repeat_reason)
+    );
+    return !rearmedLater;
+  });
 }
 
 function isJudged(verdict: PriorReviewWork['verdict']): boolean {
@@ -82,7 +110,7 @@ function loadSubjectsFromDb(db: OutcomeCanaryDatabase): ConvergingPrSubject[] {
     .all();
   const receipts = db
     .query<ReceiptRow>(
-      `SELECT id, subject_key, body
+      `SELECT id, subject_key, body, created_at
        FROM agent_dispatch_messages
        WHERE task_type = 'run_report' AND recipient = 'operator'`
     )
@@ -91,7 +119,7 @@ function loadSubjectsFromDb(db: OutcomeCanaryDatabase): ConvergingPrSubject[] {
     string,
     { verdict: PriorReviewWork['verdict']; verdictId: string }
   >();
-  const exhaustedSubjects = new Set<string>();
+  const exhaustedBySubject = new Map<string, ExhaustedReceipt[]>();
   for (const receipt of receipts) {
     try {
       const body = JSON.parse(receipt.body) as {
@@ -99,6 +127,7 @@ function loadSubjectsFromDb(db: OutcomeCanaryDatabase): ConvergingPrSubject[] {
         messageId?: string;
         disposition?: string;
         reason?: string | null;
+        headSha?: unknown;
       };
       if (
         body.kind === 'pr_review_submit_receipt' &&
@@ -116,7 +145,12 @@ function loadSubjectsFromDb(db: OutcomeCanaryDatabase): ConvergingPrSubject[] {
         body.reason.includes('rereview_attempts_exhausted') &&
         receipt.subject_key
       ) {
-        exhaustedSubjects.add(receipt.subject_key);
+        const list = exhaustedBySubject.get(receipt.subject_key) ?? [];
+        list.push({
+          headSha: typeof body.headSha === 'string' ? body.headSha : null,
+          createdAt: receipt.created_at,
+        });
+        exhaustedBySubject.set(receipt.subject_key, list);
       }
     } catch {
       // Unrelated operator reports are not verdict evidence.
@@ -149,12 +183,17 @@ function loadSubjectsFromDb(db: OutcomeCanaryDatabase): ConvergingPrSubject[] {
         };
       })
       .filter(work => work.headSha !== '');
+    const currentHead = prior[0]?.headSha ?? '';
     return {
       id: group.id,
       prior,
-      currentHead: prior[0]?.headSha ?? '',
+      currentHead,
       currentHeadCiGreen: prior[0]?.headCiGreen ?? false,
-      exhaustedReceipt: exhaustedSubjects.has(group.id),
+      exhaustedReceipt: isExhaustedForCurrentHead(
+        exhaustedBySubject.get(group.id) ?? [],
+        currentHead,
+        group.rows
+      ),
     };
   });
 }
