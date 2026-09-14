@@ -182,6 +182,10 @@ export function createRealRecheckIngestDeps(config: ReviewRouteConfig): RecheckI
         headSha: input.headSha,
         baseRef: '',
         author: '',
+        // Same-head re-review after a check completion: whether the WHOLE head is
+        // green is judged by the ingest path at claim time (isHeadCiGreen), not
+        // asserted here. The #809 budget reset only fires on a NEW head anyway.
+        headCiGreen: false,
       };
       const message = await dispatch.createAuthenticatedMessage(
         { kind: 'system', sender: REVIEW_SENDER },
