@@ -67,7 +67,7 @@ if [ -z "$RSG_CORE" ]; then
   echo "FATAL: could not extract rsg core from $CANONICAL_YAML"; exit 1
 fi
 eval "$RSG_CORE"
-for fn in rsg_extract rsg_allow_cmd rsg_observe rsg_compare rsg_run; do
+for fn in rsg_extract rsg_tokens_safe rsg_argv_looks_readonly rsg_allow_cmd rsg_exec_pipeline rsg_observe rsg_compare rsg_run; do
   if ! declare -F "$fn" >/dev/null; then echo "FATAL: $fn not defined after eval"; exit 1; fi
 done
 
@@ -89,23 +89,23 @@ WO Class: CODE
 ## 8. Stop conditions (CI-executable)
 
 Stop 1a (grep assertion, exact):
-  grep -c "alpha" fixture.txt
+  grep -c alpha fixture.txt
   Expected: 2
 
 Stop 1b (grep assertion, at least):
-  grep -c "beta" fixture.txt
+  grep -c beta fixture.txt
   Expected: at least 1 (two lines mention beta)
 
 Stop 1c (grep assertion, absence):
-  grep -n "delta" fixture.txt
+  grep -n delta fixture.txt
   Expected: no output
 
 Stop 1d (grep assertion, not executable under the read-only allowlist):
-  grep -rciE "password" src 2>/dev/null | awk -F: "{s+=$2} END {print s+0}"
+  grep -rciE password src 2>/dev/null | awk -F: "{s+=$2} END {print s+0}"
   Expected: 0
 
 Stop 1e (grep assertion, header without an Expected line):
-  grep -c "gamma" fixture.txt
+  grep -c gamma fixture.txt
 
 Stop 2 (test suite):
   bun test x
@@ -118,33 +118,37 @@ Stop 3 (ASCII scan):
 
 echo "--- rsg_extract ---"
 EXTRACTED="$(printf '%s\n' "$SPEC" | rsg_extract)"
-assert_contains "eq assertion extracted" "grep -c \"alpha\" fixture.txt${TAB}eq${TAB}2" "$EXTRACTED"
-assert_contains "ge assertion extracted" "grep -c \"beta\" fixture.txt${TAB}ge${TAB}1" "$EXTRACTED"
-assert_contains "'no output' becomes eq 0" "grep -n \"delta\" fixture.txt${TAB}eq${TAB}0" "$EXTRACTED"
+assert_contains "eq assertion extracted" "grep -c alpha fixture.txt${TAB}eq${TAB}2" "$EXTRACTED"
+assert_contains "ge assertion extracted" "grep -c beta fixture.txt${TAB}ge${TAB}1" "$EXTRACTED"
+assert_contains "'no output' becomes eq 0" "grep -n delta fixture.txt${TAB}eq${TAB}0" "$EXTRACTED"
 assert_contains "awk assertion still extracted (dropped later, not here)" "| awk -F: \"{s+=\$2} END {print s+0}\"${TAB}eq${TAB}0" "$EXTRACTED"
 assert_contains "DECLARED counts every grep header including the one without Expected" "DECLARED${TAB}5" "$EXTRACTED"
 assert_eq "test-suite and ASCII stops are not grep assertions" "0" "$(printf '%s\n' "$EXTRACTED" | grep -c 'bun test\|LC_ALL' || true)"
 assert_eq "header without Expected: emits no executable assertion line" "0" "$(printf '%s\n' "$EXTRACTED" | grep -c "gamma.*${TAB}eq${TAB}" || true)"
-assert_contains "header without Expected is named as unparsed" 'UNPARSED	1	grep -c "gamma" fixture.txt' "$EXTRACTED"
+assert_contains "header without Expected is named as unparsed" 'UNPARSED	1	grep -c gamma fixture.txt' "$EXTRACTED"
 assert_eq "no grep stops -> zero unparsed and declared" "UNPARSED${TAB}0
 DECLARED${TAB}0" "$(printf 'Stop 2 (test suite):\n  bun test\n  Expected: ok\n' | rsg_extract)"
 assert_contains "'at most' becomes le" "${TAB}le${TAB}3" "$(printf 'Stop 1 (grep assertion):\n  grep -c a b\n  Expected: at most 3\n' | rsg_extract)"
 assert_contains "backslash continuation joins the command" "grep -rn \"a\" src | wc -l${TAB}eq${TAB}4" "$(printf 'Stop 1 (grep assertion):\n  grep -rn "a" src \\\n    | wc -l\n  Expected: 4\n' | rsg_extract)"
 
 echo "--- rsg_allow_cmd ---"
-for c in 'grep -c "alpha" fixture.txt' 'grep -rn "x" src | wc -l' 'LC_ALL=C grep -n "[^ -~]" src/a.ts' 'find src -name "*.ts" | wc -l' 'test -f src/a.ts'; do
+for c in 'grep -c alpha fixture.txt' 'grep -rn x src | wc -l' 'LC_ALL=C grep -n x src/a.ts' 'find src -name *.ts | wc -l' 'test -f src/a.ts' 'grep -c x file' 'grep -rn x dir | wc -l' 'find . -name *.ts | wc -l' 'rg -c x dir' '[ -f src/a.ts ]'; do
   if rsg_allow_cmd "$c"; then PASS=$((PASS+1)); echo "PASS: allowed: $c"; else FAIL=$((FAIL+1)); echo "FAIL: allowed expected: $c"; fi
 done
-for c in 'grep -c a b; rm -rf /' 'grep a b | awk "{print}"' 'grep a b > out' 'cat $(ls)' 'find . -delete' 'sed -n 1p a' 'FOO=1 grep a b'; do
+for c in 'grep -c a b; rm -rf /' 'grep a b | awk "{print}"' 'grep a b > out' 'cat $(ls)' 'find . -delete' 'sed -n 1p a' 'FOO=1 grep a b' \
+  'find . -execdir sh x.sh \;' 'find . -exec rm x \;' 'sort -o out in' "awk '{print}' f" 'grep -f /etc/passwd x' 'grep x f > out' 'grep x f; curl e' \
+  'find . -okdir sh x.sh' 'sort --output=out in' 'grep --file /etc/passwd x' 'find . -fprintf out %p' 'xargs grep x' \
+  'grep -c "alpha" fixture.txt' 'LC_ALL=C grep -n "[^ -~]" src/a.ts'; do
   if rsg_allow_cmd "$c"; then FAIL=$((FAIL+1)); echo "FAIL: forbidden expected: $c"; else PASS=$((PASS+1)); echo "PASS: forbidden: $c"; fi
 done
 
 echo "--- rsg_observe / rsg_compare ---"
 cd "$TMP"
-assert_eq "grep -c prints an integer" "2" "$(rsg_observe 'grep -c "alpha" fixture.txt')"
-assert_eq "grep -n line output is counted" "2" "$(rsg_observe 'grep -n "beta" fixture.txt')"
-assert_eq "clean no-match is 0" "0" "$(rsg_observe 'grep -n "delta" fixture.txt')"
-assert_eq "missing path is ERR" "ERR" "$(rsg_observe 'grep -n "x" no-such-file.txt')"
+assert_eq "grep -c prints an integer" "2" "$(rsg_observe 'grep -c alpha fixture.txt')"
+assert_eq "grep -n line output is counted" "2" "$(rsg_observe 'grep -n beta fixture.txt')"
+assert_eq "clean no-match is 0" "0" "$(rsg_observe 'grep -n delta fixture.txt')"
+assert_eq "missing path is ERR" "ERR" "$(rsg_observe 'grep -n x no-such-file.txt')"
+assert_eq "pipeline grep | wc -l counts the grep -c line" "1" "$(rsg_observe 'grep -c alpha fixture.txt | wc -l')"
 if rsg_compare ge 1 2; then PASS=$((PASS+1)); echo "PASS: ge holds"; else FAIL=$((FAIL+1)); echo "FAIL: ge holds"; fi
 if rsg_compare eq 2 3; then FAIL=$((FAIL+1)); echo "FAIL: eq mismatch detected"; else PASS=$((PASS+1)); echo "PASS: eq mismatch detected"; fi
 if rsg_compare le 3 3; then PASS=$((PASS+1)); echo "PASS: le holds"; else FAIL=$((FAIL+1)); echo "FAIL: le holds"; fi
@@ -157,15 +161,15 @@ assert_contains "GREP_DROPPED=1 (the awk one)" "GREP_DROPPED=1" "$OUT"
 assert_contains "GREP_UNPARSED=1 (the missing expectation)" "GREP_UNPARSED=1" "$OUT"
 assert_contains "GREP_MISMATCH=0" "GREP_MISMATCH=0" "$OUT"
 assert_contains "partial execution is incomplete" "GREP_STATUS=incomplete" "$OUT"
-assert_contains "manifest line names the dropped assertion" 'UNVERIFIED (dropped): grep -rciE "password" src 2>/dev/null | awk' "$OUT"
-assert_contains "manifest line names the unparsed assertion" 'UNVERIFIED (unparsed): grep -c "gamma" fixture.txt' "$OUT"
-assert_contains "GREP_LINE carries observed counts in manifest v2 form" 'GREP_LINE=grep -c "alpha" fixture.txt => 2; grep -c "beta" fixture.txt => 2; grep -n "delta" fixture.txt => 0' "$OUT"
-assert_contains "dropped assertion is named in detail" 'DROPPED (not on read-only allowlist; not executed): grep -rciE "password" src 2>/dev/null | awk' "$OUT"
+assert_contains "manifest line names the dropped assertion" 'UNVERIFIED (dropped): grep -rciE password src 2>/dev/null | awk' "$OUT"
+assert_contains "manifest line names the unparsed assertion" 'UNVERIFIED (unparsed): grep -c gamma fixture.txt' "$OUT"
+assert_contains "GREP_LINE carries observed counts in manifest v2 form" 'GREP_LINE=grep -c alpha fixture.txt => 2; grep -c beta fixture.txt => 2; grep -n delta fixture.txt => 0' "$OUT"
+assert_contains "dropped assertion is named in detail" 'DROPPED (not on read-only allowlist; not executed): grep -rciE password src 2>/dev/null | awk' "$OUT"
 
-OUT="$(printf 'grep -c "alpha" fixture.txt\teq\t2\nUNPARSED\t0\nDECLARED\t2\n' | rsg_run)"
+OUT="$(printf 'grep -c alpha fixture.txt\teq\t2\nUNPARSED\t0\nDECLARED\t2\n' | rsg_run)"
 assert_contains "executed below declared with no unparsed is incomplete" "GREP_STATUS=incomplete" "$OUT"
 
-OUT="$(printf 'grep -c "alpha" fixture.txt\teq\t2\nUNPARSED\t1\nDECLARED\t1\n' | rsg_run)"
+OUT="$(printf 'grep -c alpha fixture.txt\teq\t2\nUNPARSED\t1\nDECLARED\t1\n' | rsg_run)"
 assert_contains "unparsed is incomplete even when executed equals declared" "GREP_STATUS=incomplete" "$OUT"
 assert_contains "unnamed legacy unparsed input is identified" "UNVERIFIED (unparsed): 1 unnamed assertion(s)" "$OUT"
 
@@ -173,8 +177,8 @@ printf 'alpha\n' > "$TMP/fixture.txt"
 OUT="$(printf '%s\n' "$SPEC" | rsg_extract | rsg_run)"
 assert_contains "mismatch detected when the file changes (alpha eq 2 and beta ge 1 both fail)" "GREP_MISMATCH=2" "$OUT"
 assert_contains "GREP_STATUS=mismatch" "GREP_STATUS=mismatch" "$OUT"
-assert_contains "MISMATCH detail names expected and observed" 'MISMATCH: grep -c "alpha" fixture.txt => 1 (expected eq 2)' "$OUT"
-assert_contains "GREP_LINE still carries the OBSERVED (not expected) count" 'grep -c "alpha" fixture.txt => 1;' "$OUT"
+assert_contains "MISMATCH detail names expected and observed" 'MISMATCH: grep -c alpha fixture.txt => 1 (expected eq 2)' "$OUT"
+assert_contains "GREP_LINE still carries the OBSERVED (not expected) count" 'grep -c alpha fixture.txt => 1;' "$OUT"
 
 OUT="$(printf 'Stop 2 (test suite):\n  bun test\n  Expected: ok\n' | rsg_extract | rsg_run)"
 assert_contains "none declared -> none_declared" "GREP_STATUS=none_declared" "$OUT"
@@ -184,9 +188,20 @@ OUT="$(printf 'Stop 1 (grep assertion):\n  grep a b | awk "{print}"\n  Expected:
 assert_contains "all dropped -> all_dropped" "GREP_STATUS=all_dropped" "$OUT"
 assert_contains "all dropped -> N/A line names the count" "GREP_LINE=N/A (1 declared grep stop condition(s) but none executable under the read-only allowlist)" "$OUT"
 
-OUT="$(printf 'Stop 1 (grep assertion):\n  LC_ALL=C grep -c "alpha" fixture.txt\n  Expected: 1\n' | rsg_extract | rsg_run)"
+OUT="$(printf 'Stop 1 (grep assertion):\n  LC_ALL=C grep -c alpha fixture.txt\n  Expected: 1\n' | rsg_extract | rsg_run)"
 assert_contains "LC_ALL prefix passes the gate and executes" "GREP_EXECUTED=1" "$OUT"
-assert_contains "LC_ALL prefixed command kept verbatim in GREP_LINE" 'GREP_LINE=LC_ALL=C grep -c "alpha" fixture.txt => 1' "$OUT"
+assert_contains "LC_ALL prefixed command kept verbatim in GREP_LINE" 'GREP_LINE=LC_ALL=C grep -c alpha fixture.txt => 1' "$OUT"
+
+echo "--- rsg_run: find -execdir is dropped and never executed ---"
+printf 'touch pwned-rsg-execdir.txt\n' > "$TMP/evil.sh"
+OUT="$(printf 'Stop 1 (grep assertion):\n  find . -execdir sh evil.sh \\;\n  Expected: 0\n' | rsg_extract | rsg_run)"
+assert_contains "execdir declared then dropped" "GREP_DROPPED=1" "$OUT"
+assert_contains "execdir allowlist message" "not on read-only allowlist; not executed" "$OUT"
+assert_contains "execdir never counts as executed" "GREP_EXECUTED=0" "$OUT"
+assert_contains "execdir is all_dropped" "GREP_STATUS=all_dropped" "$OUT"
+assert_eq "execdir did not write pwned-rsg-execdir.txt" "0" "$(test -e pwned-rsg-execdir.txt && echo 1 || echo 0)"
+assert_eq "observe execdir is ERR and does not run" "ERR" "$(rsg_observe 'find . -execdir sh evil.sh \;')"
+assert_eq "observe still did not write pwned-rsg-execdir.txt" "0" "$(test -e pwned-rsg-execdir.txt && echo 1 || echo 0)"
 
 cd "$HERE"
 rm -rf "$TMP"
@@ -199,25 +214,25 @@ WO Class: CODE
 ## 9. Stop conditions (CI-executable)
 
 - `node tests/test_cover_resolver.js` exits 0 if that suite exists.
-- `grep -c "gcd" shopops-api/routes/store.js` returns 1 or greater.
-- `grep -c "skip_gcd_enrichment" shopops-api/services/coverResolver.js` returns
+- `grep -c gcd shopops-api/routes/store.js` returns 1 or greater.
+- `grep -c skip_gcd_enrichment shopops-api/services/coverResolver.js` returns
   2 or greater (the guard survives the move).
-- `LC_ALL=C grep -n "[^ -~]" shopops-api/routes/store.js` returns nothing.
-- `rg -c "gcd" shopops-api/routes/store.js` => 3
-- `grep -c "x" y.js` (no expectation on this line)
+- `LC_ALL=C grep -n NonAscii shopops-api/routes/store.js` returns nothing.
+- `rg -c gcd shopops-api/routes/store.js` => 3
+- `grep -c x y.js` (no expectation on this line)
 
 ## 10. Manifest requirements
 
 - `grep -c "not in a stop section" z.js` returns 1
 '
 OUT="$(printf '%s\n' "$SPEC_GCD" | rsg_extract)"
-assert_contains "'returns 1 or greater' -> ge 1" "grep -c \"gcd\" shopops-api/routes/store.js${TAB}ge${TAB}1" "$OUT"
+assert_contains "'returns 1 or greater' -> ge 1" "grep -c gcd shopops-api/routes/store.js${TAB}ge${TAB}1" "$OUT"
 assert_eq "wrapped expectation is not emitted as executable" "0" "$(printf '%s\n' "$OUT" | grep -c "skip_gcd_enrichment.*${TAB}ge${TAB}" || true)"
-assert_contains "wrapped expectation assertion is named as unparsed" 'grep -c "skip_gcd_enrichment" shopops-api/services/coverResolver.js' "$OUT"
-assert_contains "'returns nothing' -> eq 0 with LC_ALL prefix kept" "LC_ALL=C grep -n \"[^ -~]\" shopops-api/routes/store.js${TAB}eq${TAB}0" "$OUT"
-assert_contains "'=> 3' -> eq 3 (rg)" "rg -c \"gcd\" shopops-api/routes/store.js${TAB}eq${TAB}3" "$OUT"
-assert_eq "no-expectation bullet not emitted as executable" "0" "$(printf '%s\n' "$OUT" | grep -c '"x" y.js.*\teq\t' || true)"
-assert_contains "no-expectation bullet is named as unparsed" 'grep -c "x" y.js' "$OUT"
+assert_contains "wrapped expectation assertion is named as unparsed" 'grep -c skip_gcd_enrichment shopops-api/services/coverResolver.js' "$OUT"
+assert_contains "'returns nothing' -> eq 0 with LC_ALL prefix kept" "LC_ALL=C grep -n NonAscii shopops-api/routes/store.js${TAB}eq${TAB}0" "$OUT"
+assert_contains "'=> 3' -> eq 3 (rg)" "rg -c gcd shopops-api/routes/store.js${TAB}eq${TAB}3" "$OUT"
+assert_eq "no-expectation bullet not emitted as executable" "0" "$(printf '%s\n' "$OUT" | grep -c 'x y.js.*\teq\t' || true)"
+assert_contains "no-expectation bullet is named as unparsed" 'grep -c x y.js' "$OUT"
 assert_eq "bullets outside a Stop conditions section ignored" "0" "$(printf '%s\n' "$OUT" | grep -c 'not in a stop section' || true)"
 assert_eq "runner commands are not grep assertions" "0" "$(printf '%s\n' "$OUT" | grep -c 'node tests' || true)"
 assert_contains "DECLARED counts every backticked read-only command in the section (5), not the runner" "DECLARED${TAB}5" "$OUT"
@@ -253,8 +268,8 @@ mkdir -p "$TMP2/shopops-api/routes" "$TMP2/shopops-api/services"
 printf 'gcd\ngcd\ngcd\n' > "$TMP2/shopops-api/routes/store.js"
 printf 'skip_gcd_enrichment\nskip_gcd_enrichment\n' > "$TMP2/shopops-api/services/coverResolver.js"
 OUT="$(cd "$TMP2" && printf '%s\n' "$SPEC_GCD" | rsg_extract | rsg_run)"
-assert_contains "ge 1 holds with observed 3" 'OK: grep -c "gcd" shopops-api/routes/store.js => 3 (expected ge 1)' "$OUT"
-assert_contains "ASCII absence holds" 'OK: LC_ALL=C grep -n "[^ -~]" shopops-api/routes/store.js => 0 (expected eq 0)' "$OUT"
+assert_contains "ge 1 holds with observed 3" 'OK: grep -c gcd shopops-api/routes/store.js => 3 (expected ge 1)' "$OUT"
+assert_contains "ASCII absence holds" 'OK: LC_ALL=C grep -n NonAscii shopops-api/routes/store.js => 0 (expected eq 0)' "$OUT"
 assert_contains "unparsed bullet assertions make evidence incomplete" "GREP_STATUS=incomplete" "$OUT"
 rm -rf "$TMP2"
 

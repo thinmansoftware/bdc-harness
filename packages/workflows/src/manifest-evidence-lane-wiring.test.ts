@@ -1,5 +1,13 @@
 import { describe, expect, it } from 'bun:test';
-import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'fs';
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  writeFileSync,
+} from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { parseWorkflow } from './loader';
@@ -117,6 +125,17 @@ describe('manifest evidence lane wiring (bdc-xo #1940)', () => {
         );
         expect(n.bash).toContain('timeout 1500 "$@"');
         expect(n.bash).toContain('[ -n "$CMD_JOINED" ] && [ "$EXIT_CODE" -ne 0 ]');
+      });
+
+      it('run-stop-greps tokenizes argv pipelines and rejects find -execdir', () => {
+        const n = node(nodes, 'run-stop-greps', file);
+        expect(n.depends_on).toEqual(['ascii-gate']);
+        expect(n.timeout).toBe(600000);
+        expect(n.bash).toContain('rsg_tokens_safe');
+        expect(n.bash).toContain('rsg_exec_pipeline');
+        expect(n.bash).toContain('-execdir');
+        expect(n.bash).toContain('^[A-Za-z0-9@%+=:,./_*?-]+$');
+        expect(n.bash).not.toContain('bash -c "$1"');
       });
 
       it('war-council-validator depends on both evidence nodes and carries the executed-command contract', () => {
@@ -319,5 +338,72 @@ describe.skipIf(process.platform === 'win32')('run-stop-tests ladder (behavioral
     expect(log).not.toContain('python -c');
     expect(log).not.toContain('### run-stop-tests: python');
     expect(log).toContain('### run-stop-tests: bun run test');
+  });
+});
+
+function rsgField(stdout: string, key: string): string {
+  const line = stdout.split('\n').find(row => row.startsWith(`${key}=`));
+  if (!line) {
+    throw new Error(`missing ${key} in:\n${stdout}`);
+  }
+  return line.slice(key.length + 1);
+}
+
+function runStopGrepsNode(opts: {
+  readonly spec: string;
+  readonly files?: Readonly<Record<string, string>>;
+}): { readonly stdout: string; readonly pwned: boolean } {
+  const cwd = mkdtempSync(join(tmpdir(), 'rsg-allow-'));
+  try {
+    for (const [rel, body] of Object.entries(opts.files ?? {})) {
+      writeFileSync(join(cwd, rel), body);
+    }
+    const bash = node(
+      laneNodes('bdc-feature-development-codex.yaml'),
+      'run-stop-greps',
+      'canonical'
+    ).bash;
+    if (!bash) throw new Error('run-stop-greps has no bash');
+    const rendered = substituteNodeOutputRefs(
+      bash,
+      new Map([['read-spec', { state: 'completed' as const, output: opts.spec }]]),
+      true
+    );
+    const proc = Bun.spawnSync(['bash', '-c', rendered], {
+      cwd,
+      env: { ...process.env },
+      stdout: 'pipe',
+      stderr: 'pipe',
+    });
+    const stdout = proc.stdout.toString();
+    if (proc.exitCode !== 0) {
+      throw new Error(
+        `run-stop-greps exited ${proc.exitCode}: ${stdout}\n${proc.stderr.toString()}`
+      );
+    }
+    return { stdout, pwned: existsSync(join(cwd, 'pwned-rsg-execdir.txt')) };
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+}
+
+describe.skipIf(process.platform === 'win32')('run-stop-greps allowlist (behavioral)', () => {
+  it('a spec-declared find -execdir line is dropped and never executed', () => {
+    const { stdout, pwned } = runStopGrepsNode({
+      spec: [
+        'WO Class: CODE',
+        '',
+        'Stop 1 (grep assertion):',
+        '  find . -execdir sh evil.sh \\;',
+        '  Expected: 0',
+      ].join('\n'),
+      files: { 'evil.sh': 'touch pwned-rsg-execdir.txt\n' },
+    });
+    expect(rsgField(stdout, 'GREP_STATUS')).toBe('all_dropped');
+    expect(rsgField(stdout, 'GREP_DROPPED')).toBe('1');
+    expect(rsgField(stdout, 'GREP_EXECUTED')).toBe('0');
+    expect(stdout).toContain('not on read-only allowlist; not executed');
+    expect(stdout).toContain('find . -execdir sh evil.sh');
+    expect(pwned).toBe(false);
   });
 });

@@ -1584,31 +1584,167 @@ nodes:
           }
         '
       }
-      # rsg_allow_cmd <command>   (same fail-closed read-only allowlist as the vma core)
-      rsg_allow_cmd() {
-        local c="$1" seg first
-        c="$(printf '%s' "$c" | sed -E 's/^(LC_ALL|LANG)=[A-Za-z0-9_.@-]+[[:space:]]+//')"
-        case "$c" in
-          *';'*|*'&'*|*'`'*|*'$('*|*'>'*|*'<'*|*$'\n'*) return 1 ;;
-          *' -delete'*|*' -exec'*|*' -ok'*|*' -fprint'*|*' -fls'*) return 1 ;;
-        esac
-        local IFS='|'
-        local -a segs
-        read -ra segs <<<"$c"
-        for seg in "${segs[@]}"; do
-          seg="$(printf '%s' "$seg" | sed 's/^[[:space:]]*//')"
-          first="${seg%%[[:space:]]*}"
-          case "$first" in
-            grep|egrep|fgrep|rg|wc|find|cat|head|tail|sort|uniq|test) ;;
-            *) return 1 ;;
-          esac
+      # rsg_tokens_safe <tokens...>   (rc 0 when every token is in the argv charset.
+      #   [ and ] are allowed so the test builtin can run. * and ? are literal --
+      #   callers must set -f before splitting. Same shape as rst_tokens_safe.)
+      rsg_tokens_safe() {
+        local t
+        for t in "$@"; do
+          case "$t" in '['|']') continue ;; esac
+          printf '%s' "$t" | grep -qE '^[A-Za-z0-9@%+=:,./_*?-]+$' || return 1
         done
         return 0
       }
-      # rsg_observe <command>   (-> observed count, or "ERR" on a hard command failure)
+      rsg_has_grep_flag() {
+        local t
+        for t in "$@"; do
+          case "$t" in
+            --pre|--preprocessor|-f|--file|--pre=*|--preprocessor=*|-f=*|--file=*|-f*) return 0 ;;
+          esac
+        done
+        return 1
+      }
+      rsg_has_find_flag() {
+        local t
+        for t in "$@"; do
+          case "$t" in
+            -exec|-execdir|-ok|-okdir|-delete|-fprint|-fprint0|-fprintf|-fls|-fprint*|-fls*) return 0 ;;
+          esac
+        done
+        return 1
+      }
+      rsg_has_sort_flag() {
+        local t
+        for t in "$@"; do
+          case "$t" in
+            -o|--output|-o=*|--output=*|-o*|--compress-program|--compress-program=*) return 0 ;;
+          esac
+        done
+        return 1
+      }
+      # rsg_argv_looks_readonly <segment>   (rc 0 when the segment tokenizes --
+      #   whitespace split, noglob -- to an allowlisted read-only runner with no
+      #   write/exec options. Leading LC_ALL=* / LANG=* tokens are skipped.)
+      rsg_argv_looks_readonly() {
+        local runner segment="$1"
+        set -f
+        set -- $segment
+        set +f
+        while [ $# -ge 1 ]; do
+          case "$1" in
+            LC_ALL=*|LANG=*) shift ;;
+            *) break ;;
+          esac
+        done
+        [ $# -ge 1 ] || return 1
+        runner="$1"
+        shift
+        rsg_tokens_safe "$runner" "$@" || return 1
+        case "$runner" in
+          grep|egrep|fgrep|rg)
+            rsg_has_grep_flag "$@" && return 1
+            return 0
+            ;;
+          find)
+            rsg_has_find_flag "$@" && return 1
+            return 0
+            ;;
+          sort)
+            rsg_has_sort_flag "$@" && return 1
+            return 0
+            ;;
+          wc|head|tail|cut|tr|uniq|cat|ls|test|'[')
+            return 0
+            ;;
+        esac
+        return 1
+      }
+      # rsg_allow_cmd <command>   (fail-closed read-only allowlist: reject shell
+      #   operators except |, split on | only, whitespace-tokenize each segment,
+      #   reject write/exec options as whole tokens. awk/sed/xargs and anything
+      #   not listed are rejected.)
+      rsg_allow_cmd() {
+        local c="$1" work segment
+        case "$c" in
+          *';'*|*'&'*|*'`'*|*'$('*|*'>'*|*'<'*|*$'\n'*|*'"'*|*"'"*|*'\\'*|*'||'*) return 1 ;;
+        esac
+        work="$c"
+        while :; do
+          case "$work" in
+            *'|'*) segment="${work%%|*}"; work="${work#*|}" ;;
+            *) segment="$work"; work='' ;;
+          esac
+          rsg_argv_looks_readonly "$segment" || return 1
+          [ -z "$work" ] && break
+        done
+        return 0
+      }
+      # rsg_exec_pipeline <command>   (prints stdout of the last | segment; rc of
+      #   the last segment. Intermediate segments are connected with temp files,
+      #   not a shell pipe. Tokenized argv; never a shell -c of the spec string.
+      #   Intermediate nonzero exits do not abort -- matches bash -c without
+      #   pipefail, so grep-no-match | wc -l still yields a count.)
+      rsg_exec_pipeline() {
+        local cmd="$1" work segment tmpdir_p="" tmp_in="/dev/null" tmp_out raw="" rc=0
+        local env_lc env_lang
+        if ! rsg_allow_cmd "$cmd"; then
+          return 127
+        fi
+        work="$cmd"
+        while :; do
+          case "$work" in
+            *'|'*) segment="${work%%|*}"; work="${work#*|}" ;;
+            *) segment="$work"; work='' ;;
+          esac
+          set -f
+          set -- $segment
+          set +f
+          env_lc=""; env_lang=""
+          while [ $# -ge 1 ]; do
+            case "$1" in
+              LC_ALL=*) env_lc="${1#LC_ALL=}"; shift ;;
+              LANG=*) env_lang="${1#LANG=}"; shift ;;
+              *) break ;;
+            esac
+          done
+          if [ $# -eq 0 ]; then
+            rc=127
+            break
+          fi
+          if [ -n "$work" ]; then
+            [ -n "$tmpdir_p" ] || tmpdir_p="$(mktemp -d)"
+            tmp_out="$tmpdir_p/out"
+            (
+              [ -n "$env_lc" ] && export LC_ALL="$env_lc"
+              [ -n "$env_lang" ] && export LANG="$env_lang"
+              "$@" < "$tmp_in" > "$tmp_out" 2>/dev/null
+            )
+            rc=$?
+            tmp_in="$tmpdir_p/in"
+            mv "$tmp_out" "$tmp_in"
+          else
+            raw="$(
+              [ -n "$env_lc" ] && export LC_ALL="$env_lc"
+              [ -n "$env_lang" ] && export LANG="$env_lang"
+              "$@" < "$tmp_in" 2>/dev/null
+            )"
+            rc=$?
+          fi
+          [ -z "$work" ] && break
+        done
+        [ -n "$tmpdir_p" ] && rm -rf "$tmpdir_p"
+        printf '%s' "$raw"
+        return "$rc"
+      }
+      # rsg_observe <command>   (-> observed count, or "ERR" on a hard command failure
+      #   or a non-allowlisted line). Tokenized argv via rsg_exec_pipeline.
       rsg_observe() {
         local raw rawtrim rc
-        raw="$(bash -c "$1" 2>/dev/null < /dev/null)"; rc=$?
+        if ! rsg_allow_cmd "$1"; then
+          printf 'ERR'
+          return 0
+        fi
+        raw="$(rsg_exec_pipeline "$1")"; rc=$?
         rawtrim="$(printf '%s' "$raw" | tr -d '[:space:]')"
         if printf '%s' "$rawtrim" | grep -qE '^[0-9]+$'; then
           printf '%s' "$rawtrim"
