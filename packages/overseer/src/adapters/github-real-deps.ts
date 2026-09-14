@@ -121,7 +121,7 @@ export interface RealGitHubOctokitLike {
       repo: string;
       pull_number: number;
       sha: string;
-      merge_method: 'squash';
+      merge_method: 'merge' | 'squash' | 'rebase';
     }): Promise<{ data: { merged: boolean; sha?: string | null } }>;
     /**
      * Optional so unrelated mocks (e.g. github-qualified-merge.test.ts's
@@ -890,7 +890,7 @@ export function createRealMergePullRequest(
         repo: input.repo,
         pull_number: input.number,
         sha: pr.data.head.sha,
-        merge_method: 'squash' as const,
+        merge_method: input.mergeMethod ?? 'squash',
       };
       const response = await octokit.pulls.merge(mergeInput);
       if (!response.data.merged) {

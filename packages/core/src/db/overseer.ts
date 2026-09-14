@@ -356,6 +356,8 @@ export async function listUnactionedFlagMergeReadyVerdicts(): Promise<OverseerVe
 }
 
 export async function countRecentOverseerVerdictMerges(since: string): Promise<number> {
+  // Deliberately global across all allowlisted repositories: this is a service-wide
+  // emergency throttle, not a per-repository throughput quota.
   const result = await getDatabase().query<{ merge_count: number | string }>(
     `SELECT COUNT(*) AS merge_count FROM overseer_verdicts
      WHERE mutation_sent = true AND actioned_at >= $1`,

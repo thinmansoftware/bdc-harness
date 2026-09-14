@@ -8,6 +8,7 @@ import { listOverseerCapabilityEvents } from '@archon/core/db/overseer-capabilit
 import { listOperatorCards } from '@archon/core/db/overseer-briefing';
 import {
   resolveDefaultDeps,
+  runMergeBridgeScheduler,
   runOperatorCardDeliveryScheduler,
   runOverseerService,
 } from '../service.ts';
@@ -26,6 +27,7 @@ const ENV_KEYS = [
   'OVERSEER_BRANCH_ACTIONS_ENABLED',
   'OVERSEER_LIFECYCLE_ACTIONS_ENABLED',
   'OVERSEER_MERGE_ACTIONS_ENABLED',
+  'OVERSEER_MERGE_MANAGER_MODE',
   'GITHUB_TOKEN',
   'GH_TOKEN',
 ] as const;
@@ -281,6 +283,50 @@ describe('service', () => {
       },
     });
     expect(listRunsForWatch).not.toHaveBeenCalled();
+  });
+
+  test('merge bridge scheduler runs once and isolates an iteration failure', async () => {
+    const run = mock(async () => {
+      throw new Error('bridge failure');
+    });
+    await expect(runMergeBridgeScheduler({ once: true, run })).resolves.toBeUndefined();
+    expect(run).toHaveBeenCalledTimes(1);
+  });
+
+  test('wires the merge bridge only when its service switch is enabled', async () => {
+    const mergeBridgeRun = mock(async () => undefined);
+    const deps = {
+      listRunsForWatch: async () => [],
+      listRunEvents: async () => [],
+      findPullRequest: async () => ({
+        exists: false as const,
+        state: 'missing' as const,
+        checks: { total: 0, passed: 0, failed: 0, pending: 0 },
+        mergeable: null,
+      }),
+      mergePullRequest: async () => ({ merged: false }),
+      insertOverseerAction: async () => undefined,
+    };
+
+    await runOverseerService({
+      once: true,
+      enabled: true,
+      adapterKind: 'fake',
+      deps,
+      mergeBridgeEnabled: false,
+      mergeBridgeRun,
+    });
+    expect(mergeBridgeRun).not.toHaveBeenCalled();
+
+    await runOverseerService({
+      once: true,
+      enabled: true,
+      adapterKind: 'fake',
+      deps,
+      mergeBridgeEnabled: true,
+      mergeBridgeRun,
+    });
+    expect(mergeBridgeRun).toHaveBeenCalledTimes(1);
   });
 
   test('OVERSEER_DRY_RUN logs decision and makes zero side-effect calls', async () => {

@@ -190,6 +190,43 @@ describe('real GitHub deps', () => {
     expect(result.pr?.number).toBe(77);
   });
 
+  test('fails closed when changed-file pagination exceeds 300 files', async () => {
+    const listFiles = mock(async (input: Record<string, unknown>) => ({
+      data: Array.from({ length: 100 }, (_, index) => ({
+        filename: `page-${String(input.page)}-${index}.ts`,
+      })),
+    }));
+    const octokit = createOctokitMock({
+      pulls: {
+        ...createOctokitMock().pulls,
+        list: async () => ({
+          data: [
+            {
+              number: 42,
+              title: 'WO-LARGE',
+              state: 'open',
+              html_url: 'https://github.test/pull/42',
+              head: { sha: 'a'.repeat(40) },
+            },
+          ],
+        }),
+        listFiles,
+      },
+    });
+
+    const result = await createRealFindPullRequest(octokit)({
+      owner: 'thinmansoftware',
+      repo: 'bdc-harness',
+      headBranch: 'fix/large-change',
+      woId: 'WO-LARGE',
+      includeChangedFiles: true,
+    });
+
+    expect(listFiles).toHaveBeenCalledTimes(3);
+    expect(listFiles.mock.calls.map(call => call[0]?.page)).toEqual([1, 2, 3]);
+    expect(result.changedFilePaths).toBeUndefined();
+  });
+
   test('returns missing evidence when no pull request matches', async () => {
     const result = await createRealFindPullRequest(createOctokitMock())({
       owner: 'thinmansoftware',
@@ -257,6 +294,14 @@ describe('real GitHub deps', () => {
       sha: 'a'.repeat(40),
       mergeSha: 'a'.repeat(40),
     });
+  });
+
+  test('passes the caller-selected merge strategy to GitHub', async () => {
+    const merge = mock(async () => ({ data: { merged: true, sha: 'a'.repeat(40) } }));
+    await createRealMergePullRequest(
+      createOctokitMock({ pulls: { ...createOctokitMock().pulls, merge } })
+    )({ owner: 'thinmansoftware', repo: 'bdc-harness', number: 42, mergeMethod: 'rebase' });
+    expect(merge.mock.calls[0]?.[0].merge_method).toBe('rebase');
   });
 
   test('maps 409 and 422 merge rejections', async () => {

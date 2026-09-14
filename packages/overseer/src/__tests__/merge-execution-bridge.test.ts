@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import type { OverseerVerdictRow, OverseerWatchRun } from '@archon/core/db/overseer';
 import {
   runMergeExecutionBridgeOnce,
@@ -95,7 +95,14 @@ function harness(rows: OverseerVerdictRow[], evidence = greenPr(), recentMerges 
   };
 }
 
-afterEach(() => delete process.env.OVERSEER_MAX_MERGES_PER_HOUR);
+beforeEach(() => {
+  process.env.OVERSEER_MERGE_MANAGER_MODE = 'execute';
+});
+
+afterEach(() => {
+  delete process.env.OVERSEER_MAX_MERGES_PER_HOUR;
+  delete process.env.OVERSEER_MERGE_MANAGER_MODE;
+});
 
 describe('merge execution bridge', () => {
   test('merges an eligible verdict exactly once across two cycles', async () => {
@@ -226,5 +233,17 @@ describe('merge execution bridge', () => {
     });
     expect(h.merges).toBe(0);
     expect(h.outcomes[0]?.reason).toBe(reason);
+  });
+
+  test('fails closed unless the merge manager master switch is execute', async () => {
+    const h = harness([verdict('held')]);
+    await runMergeExecutionBridgeOnce({
+      store: h.store,
+      github: h.github,
+      readPolicy: () => policy(),
+      readMergeManagerMode: () => 'hold-canary',
+    });
+    expect(h.merges).toBe(0);
+    expect(h.outcomes[0]?.reason).toBe('merge_manager_not_execute');
   });
 });

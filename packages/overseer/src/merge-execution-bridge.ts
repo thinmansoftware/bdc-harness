@@ -1,6 +1,7 @@
 import { createLogger } from '@archon/paths';
 import type { OverseerVerdictRow, OverseerWatchRun } from '@archon/core/db/overseer';
 import { readOverseerActionPolicyFromEnv, type OverseerActionPolicy } from './action-policy';
+import { resolveMergeManagerMode, type MergeManagerMode } from './merge-manager';
 import { isSpecOnlyChangeSet } from './reconcile';
 import type { GitHubClientDeps } from './types.ts';
 
@@ -31,6 +32,7 @@ export interface MergeExecutionBridgeOptions {
   store: MergeExecutionBridgeStore;
   github: GitHubClientDeps;
   readPolicy?: () => OverseerActionPolicy;
+  readMergeManagerMode?: () => MergeManagerMode;
   now?: () => Date;
   maxMergesPerHour?: number;
 }
@@ -76,6 +78,10 @@ export async function runMergeExecutionBridgeOnce(
     }
     if (!policy.capability_flags.merge) {
       await skip('merge_actions_disabled');
+      continue;
+    }
+    if ((options.readMergeManagerMode ?? resolveMergeManagerMode)() !== 'execute') {
+      await skip('merge_manager_not_execute');
       continue;
     }
 

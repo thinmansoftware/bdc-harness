@@ -11,6 +11,8 @@ mock.module('./connection', () => ({
 }));
 
 import {
+  claimVerdictForMergeExecution,
+  countRecentOverseerVerdictMerges,
   claimOverseerVerdict,
   countRunsPendingOverseerJudgment,
   finalizeOverseerVerdict,
@@ -18,11 +20,14 @@ import {
   getOverseerLastActionAt,
   getOverseerLastVerdictAt,
   getOverseerVerdictsForRun,
+  getOverseerWatchRunById,
   hasReconcileActionForPr,
   insertOverseerAction,
   insertReconcileAction,
   listRunEventsForOverseer,
   listRunsForOverseerWatch,
+  listUnactionedFlagMergeReadyVerdicts,
+  recordVerdictMergeOutcome,
 } from './overseer';
 
 function cleanupDb(path: string): void {
@@ -35,7 +40,7 @@ function cleanupDb(path: string): void {
   }
 }
 
-async function seedRun(id: string, status = 'failed'): Promise<void> {
+async function seedRun(id: string, status = 'failed', repo = 'bdc-harness'): Promise<void> {
   await db.query(
     `INSERT INTO remote_agent_conversations (id, platform_type, platform_conversation_id, title)
      VALUES ($1, 'test', $1, 'Test')`,
@@ -52,7 +57,7 @@ async function seedRun(id: string, status = 'failed'): Promise<void> {
       status,
       JSON.stringify({
         woId: 'WO-TEST-OVERSEER-01',
-        targetRepo: 'thinmansoftware/bdc-harness',
+        targetRepo: `thinmansoftware/${repo}`,
         headBranch: 'wo/test',
       }),
     ]
@@ -206,6 +211,54 @@ describe('overseer db', () => {
     expect(await getOverseerLastActionAt()).toBeNull();
     expect(await getOverseerLastVerdictAt()).toBeNull();
     expect(await countRunsPendingOverseerJudgment()).toBe(0);
+  });
+
+  test('executes the merge-verdict claim and outcome lifecycle atomically in SQLite', async () => {
+    await seedRun('run-merge-verdict', 'completed');
+    await db.query(
+      `INSERT INTO overseer_verdicts
+       (id, run_id, wo_id, head_sha, proposed_action, created_at, updated_at)
+       VALUES ('verdict-merge', 'run-merge-verdict', 'WO-TEST-OVERSEER-01', 'head-1',
+         'flag_merge_ready', $1, $1)`,
+      ['2026-08-07T11:00:00.000Z']
+    );
+
+    const run = await getOverseerWatchRunById('run-merge-verdict');
+    expect(run).toMatchObject({ id: 'run-merge-verdict', repo: 'bdc-harness' });
+    expect((await listUnactionedFlagMergeReadyVerdicts()).map(row => row.id)).toEqual([
+      'verdict-merge',
+    ]);
+
+    expect(await claimVerdictForMergeExecution('verdict-merge')).toBe(true);
+    expect(await claimVerdictForMergeExecution('verdict-merge')).toBe(false);
+
+    const recorded = await recordVerdictMergeOutcome({
+      verdictId: 'verdict-merge',
+      mutationSent: true,
+      reason: 'merge_executed',
+      mergeSha: 'merge-sha',
+      prUrl: 'https://github.test/pull/1',
+    });
+    expect(recorded).toMatchObject({
+      mutation_reason: 'merge_executed',
+      merge_sha: 'merge-sha',
+      pr_url: 'https://github.test/pull/1',
+    });
+    expect(await listUnactionedFlagMergeReadyVerdicts()).toEqual([]);
+    expect(await countRecentOverseerVerdictMerges('2026-08-07T10:00:00.000Z')).toBe(1);
+  });
+
+  test('applies the recent-merge safety ceiling globally across repositories', async () => {
+    await seedRun('run-global-one', 'completed');
+    await seedRun('run-global-two', 'completed', 'shopops');
+    await db.query(
+      `INSERT INTO overseer_verdicts
+       (id, run_id, wo_id, head_sha, proposed_action, actioned_at, mutation_sent)
+       VALUES ('global-one', 'run-global-one', 'WO-ONE', 'head-1', 'flag_merge_ready', $1, true),
+              ('global-two', 'run-global-two', 'WO-TWO', 'head-2', 'flag_merge_ready', $1, true)`,
+      ['2026-08-07T11:00:00.000Z']
+    );
+    expect(await countRecentOverseerVerdictMerges('2026-08-07T10:00:00.000Z')).toBe(2);
   });
 
   test('effect and backlog read failures propagate', async () => {
