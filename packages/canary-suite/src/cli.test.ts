@@ -185,6 +185,8 @@ test.each([
   ['--output-root', ''],
   ['--pr-number', '0'],
   ['--pr-number', 'not-a-number'],
+  ['--window', '0'],
+  ['--window', 'not-a-number'],
 ] as const)('pr-review rejects invalid %s before running checks', async (name, value) => {
   const deps = prReviewDeps();
   const index = prReviewArgs.indexOf(name);
@@ -250,4 +252,60 @@ test('pr-review maps a failed report to exit 2 after writing its artifact', asyn
 
   expect(await runCanaryCli(prReviewArgs, {}, deps)).toBe(2);
   expect(deps.prReviewArtifactWriter).toHaveBeenCalledWith('artifacts', failedReport);
+});
+
+test('pr-review omits github when App env is absent and reports C6 blocked', async () => {
+  const blockedC6: OutcomeCanaryResult = {
+    verdict: 'blocked',
+    reasonCodes: ['c6_github_client_unavailable'],
+    evidenceRefs: [],
+    checks: [
+      { id: 'C1', verdict: 'passed', reasonCodes: [], evidenceRefs: [] },
+      { id: 'C2', verdict: 'passed', reasonCodes: [], evidenceRefs: [] },
+      { id: 'C3', verdict: 'passed', reasonCodes: [], evidenceRefs: [] },
+      { id: 'C4', verdict: 'passed', reasonCodes: [], evidenceRefs: [] },
+      { id: 'C5', verdict: 'passed', reasonCodes: [], evidenceRefs: [] },
+      {
+        id: 'C6',
+        verdict: 'blocked',
+        reasonCodes: ['c6_github_client_unavailable'],
+        evidenceRefs: [],
+      },
+    ],
+  };
+  const deps = prReviewDeps(blockedC6);
+  expect(await runCanaryCli(prReviewArgs, { ARCHON_OPERATOR_TOKEN: 'operator-token' }, deps)).toBe(
+    3
+  );
+  expect(deps.prReviewRunner).toHaveBeenCalledWith({
+    dbPath: 'archon.db',
+    operatorToken: 'operator-token',
+    statusUrl: undefined,
+    requestUrl: undefined,
+    queueUrl: undefined,
+    owner: undefined,
+    repo: undefined,
+    branch: undefined,
+    headSha: undefined,
+    prNumber: undefined,
+  });
+  expect(deps.stderr).toHaveBeenCalledWith('blocked canaries: C6:c6_github_client_unavailable');
+});
+
+test('pr-review forwards --c3-synthetic-escalation', async () => {
+  const deps = prReviewDeps();
+  expect(await runCanaryCli([...prReviewArgs, '--c3-synthetic-escalation'], {}, deps)).toBe(0);
+  expect(deps.prReviewRunner).toHaveBeenCalledWith({
+    dbPath: 'archon.db',
+    operatorToken: undefined,
+    statusUrl: undefined,
+    requestUrl: undefined,
+    queueUrl: undefined,
+    owner: undefined,
+    repo: undefined,
+    branch: undefined,
+    headSha: undefined,
+    prNumber: undefined,
+    c3SyntheticEscalation: true,
+  });
 });

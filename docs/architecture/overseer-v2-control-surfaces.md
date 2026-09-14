@@ -53,3 +53,22 @@ merge-steward path, where fail-closed remains correct.
 
 One primary verdict per `(run_id, head_sha)` (unique index, claim-before-call in
 `claimOverseerVerdict`). Replay never re-bills a model call and never re-acts.
+
+## Part B PR-review canary CLI
+
+`archon-canary pr-review --db-path <sqlite> --output-root <dir>` runs C1-C6 against a
+readonly dispatch store. Extra flags:
+
+- `--window <hours>`: unscoped C4 lookback (default 24). Named `--owner/--repo/--pr-number`
+  still selects the newest ingest whose correlation id starts with
+  `pr-review:<owner>/<repo>#<N>@`.
+- `--c3-synthetic-escalation`: opt in to C3. Without it C3 is `blocked` with
+  `c3_synthetic_escalation_not_enabled`. When set, C3 switches the core DB singleton
+  onto a temp `ARCHON_HOME` sqlite via `closeDatabase`/`resetDatabase` and refuses with
+  `c3_refused_production_store` if `DATABASE_URL` is set.
+
+C6 uses `createRealOctokitClient()` only when GitHub App env is complete
+(`GITHUB_APP_ID`, `GITHUB_APP_INSTALLATION_ID`, and `GITHUB_APP_PRIVATE_KEY` or
+`GITHUB_APP_PRIVATE_KEY_PATH`). Absent/unusable App credentials omit the client and C6
+is `blocked` with `c6_github_client_unavailable` (not `failed`). The CLI prints
+`blocked canaries: ...` on stderr. Composed verdict: `failed` outranks `blocked`.

@@ -160,6 +160,7 @@ describe.serial('PR review outcome canary suite', () => {
         },
       ],
       deliver: deliverNeedsHumanToOperator,
+      c3SyntheticEscalation: true,
       github: {
         getAllStatusCheckContexts: async () => ({ data: ['docker-build'] }),
         listCheckRunsForRef: async () => ({
@@ -175,6 +176,92 @@ describe.serial('PR review outcome canary suite', () => {
     });
     expect(result.verdict).toBe('passed');
     expect(result.checks).toHaveLength(6);
+  });
+
+  test('without a github client only C6 is blocked when C3 is enabled', async () => {
+    const db = fixture();
+    db.run(
+      `INSERT INTO agent_dispatch_messages
+       (id, correlation_id, idempotency_key, task_type, recipient, body, status, created_at, subject_key, repeat_reason)
+       VALUES ('done-1', 'pr-review:thinmansoftware/bdc-harness#806@${HEAD_A}', 'done-1', 'run_review', 'overseer-reviewer', ?, 'done', '2026-09-14T11:00:00.000Z', ?, NULL)`,
+      [
+        JSON.stringify({
+          owner: 'thinmansoftware',
+          repo: 'bdc-harness',
+          prNumber: 806,
+          headSha: HEAD_A,
+        }),
+        SUBJECT,
+      ]
+    );
+    db.run(
+      `INSERT INTO agent_dispatch_messages
+       (id, correlation_id, idempotency_key, task_type, recipient, body, status, created_at, subject_key, repeat_reason)
+       VALUES ('queued-1', 'pr-review:thinmansoftware/bdc-harness#806@${HEAD_B}', 'queued-1', 'run_review', 'overseer-reviewer', ?, 'queued', '2026-09-14T11:59:55.000Z', ?, 'operator_request:canary')`,
+      [
+        JSON.stringify({
+          owner: 'thinmansoftware',
+          repo: 'bdc-harness',
+          prNumber: 806,
+          headSha: HEAD_B,
+        }),
+        SUBJECT,
+      ]
+    );
+    db.run(
+      `INSERT INTO agent_dispatch_messages
+       (id, correlation_id, idempotency_key, task_type, recipient, body, status, created_at, subject_key, repeat_reason)
+       VALUES ('ingest-1', 'pr-review:thinmansoftware/bdc-harness#806@${HEAD_B}', 'ingest-1', 'run_report', 'operator', ?, 'done', '2026-09-14T11:59:50.000Z', ?, NULL)`,
+      [
+        JSON.stringify({
+          kind: 'pr_review_ingest_receipt',
+          disposition: 'queued',
+          reason: null,
+          headSha: HEAD_B,
+        }),
+        SUBJECT,
+      ]
+    );
+    const result = await runPrReviewCanarySuite({
+      db,
+      now: () => NOW,
+      env: {},
+      fetcher: async () => new Response('{}', { status: 200 }),
+      subjectKey: SUBJECT,
+      subjects: [
+        {
+          id: SUBJECT,
+          prior: [
+            work({
+              messageId: 'auto-2',
+              headSha: HEAD_C,
+              isAutoRereview: true,
+              headCiGreen: true,
+            }),
+            work({
+              messageId: 'auto-1',
+              headSha: HEAD_B,
+              isAutoRereview: true,
+              headCiGreen: true,
+            }),
+            work({ messageId: 'initial' }),
+          ],
+          currentHead: HEAD_C,
+          currentHeadCiGreen: true,
+        },
+      ],
+      deliver: deliverNeedsHumanToOperator,
+      c3SyntheticEscalation: true,
+      owner: 'thinmansoftware',
+      repo: 'bdc-harness',
+      branch: 'dev',
+      headSha: HEAD_C,
+    });
+    expect(result.verdict).toBe('blocked');
+    expect(result.reasonCodes).toEqual(['c6_github_client_unavailable']);
+    expect(
+      result.checks?.filter(check => check.verdict === 'blocked').map(check => check.id)
+    ).toEqual(['C6']);
   });
 
   test('writes the suite report beneath the canary artifact root', async () => {

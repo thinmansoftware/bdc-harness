@@ -2,7 +2,9 @@ import {
   resolveRequiredContexts,
   resetRequiredContextsAttemptCounters,
 } from '@archon/overseer/adapters/required-contexts';
+import type { RealGitHubOctokitLike } from '@archon/overseer/adapters/github-real-deps';
 import {
+  blockedResult,
   failResult,
   passResult,
   type OutcomeCanaryDeps,
@@ -30,6 +32,69 @@ export interface GateNotDeadGitHub {
   }) => Promise<{ data: unknown[] }>;
 }
 
+/** Map the App-authenticated octokit onto the narrow shape C6 reads. */
+export function createGateNotDeadGitHubAdapter(octokit: RealGitHubOctokitLike): GateNotDeadGitHub {
+  const repos = octokit.repos;
+  const hasBranch = typeof repos?.getBranch === 'function';
+  const hasRules = typeof repos?.getBranchRules === 'function';
+  const branchFn = hasBranch
+    ? async (input: {
+        owner: string;
+        repo: string;
+        branch: string;
+      }): Promise<{ data: { protected?: boolean; commit?: { sha?: string } } }> => {
+        if (!repos?.getBranch) throw new Error('github_getBranch_unavailable');
+        const result = await repos.getBranch(input);
+        // The runtime octokit branch payload carries commit.sha; the narrow type omits it.
+        const commit = (result.data as { commit?: { sha?: string } }).commit;
+        const sha = typeof commit?.sha === 'string' && commit.sha !== '' ? commit.sha : undefined;
+        return {
+          data: {
+            protected: result.data.protected,
+            ...(sha ? { commit: { sha } } : {}),
+          },
+        };
+      }
+    : undefined;
+  const rulesFn = hasRules
+    ? async (input: {
+        owner: string;
+        repo: string;
+        branch: string;
+      }): Promise<{ data: unknown[] }> => {
+        if (!repos?.getBranchRules) throw new Error('github_getBranchRules_unavailable');
+        return await repos.getBranchRules(input);
+      }
+    : undefined;
+  return {
+    getAllStatusCheckContexts: async (input: {
+      owner: string;
+      repo: string;
+      branch: string;
+    }): Promise<{ data: string[] }> => {
+      if (!repos?.getAllStatusCheckContexts) {
+        throw new Error('github_getAllStatusCheckContexts_unavailable');
+      }
+      return await repos.getAllStatusCheckContexts(input);
+    },
+    listCheckRunsForRef: (input: {
+      owner: string;
+      repo: string;
+      ref: string;
+    }): Promise<{
+      data: { check_runs: { name?: string; status: string; conclusion: string | null }[] };
+    }> =>
+      octokit.checks.listForRef({
+        owner: input.owner,
+        repo: input.repo,
+        ref: input.ref,
+        per_page: 100,
+      }),
+    ...(branchFn ? { getBranch: branchFn } : {}),
+    ...(rulesFn ? { getBranchRules: rulesFn } : {}),
+  };
+}
+
 export interface GateNotDeadCanaryDeps extends OutcomeCanaryDeps {
   readonly owner?: string;
   readonly repo?: string;
@@ -48,9 +113,7 @@ export async function runGateNotDeadCanary(
 ): Promise<OutcomeCanaryResult> {
   const github = deps.github;
   if (!github) {
-    return failResult('c6_required_check_red_on_head:github_client_missing', [
-      'github_client=missing',
-    ]);
+    return blockedResult('c6_github_client_unavailable', ['github_client=unavailable']);
   }
   const owner = deps.owner ?? 'thinmansoftware';
   const repo = deps.repo ?? 'bdc-harness';

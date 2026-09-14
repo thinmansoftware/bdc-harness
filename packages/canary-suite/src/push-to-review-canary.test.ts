@@ -181,4 +181,113 @@ describe('C4 push-to-review canary', () => {
     expect(result.reasonCodes[0]?.startsWith('c4_review_not_queued:')).toBe(true);
     expect(result.evidenceRefs.some(value => value.startsWith('why_no_review='))).toBe(true);
   });
+
+  test('named PR ignores a newer ingest on an unrelated PR', async () => {
+    const db = fixture();
+    insert(db, {
+      id: 'ingest-1',
+      taskType: 'run_report',
+      recipient: 'operator',
+      status: 'done',
+      createdAt: '2026-09-14T11:59:50.000Z',
+      body: JSON.stringify({
+        kind: 'pr_review_ingest_receipt',
+        disposition: 'queued',
+        reason: null,
+        headSha: HEAD,
+      }),
+    });
+    insert(db, {
+      id: 'review-1',
+      taskType: 'run_review',
+      recipient: 'overseer-reviewer',
+      status: 'queued',
+      createdAt: '2026-09-14T11:59:55.000Z',
+      body: JSON.stringify({
+        owner: 'thinmansoftware',
+        repo: 'bdc-harness',
+        prNumber: 806,
+        headSha: HEAD,
+      }),
+    });
+    insert(db, {
+      id: 'ingest-999',
+      taskType: 'run_report',
+      recipient: 'operator',
+      status: 'done',
+      createdAt: '2026-09-14T11:59:59.000Z',
+      correlationId: `pr-review:thinmansoftware/bdc-harness#999@${HEAD}`,
+      body: JSON.stringify({
+        kind: 'pr_review_ingest_receipt',
+        disposition: 'queued',
+        reason: null,
+        headSha: HEAD,
+        owner: 'thinmansoftware',
+        repo: 'bdc-harness',
+        prNumber: 999,
+      }),
+    });
+    const result = await runPushToReviewCanary({
+      db,
+      now: () => NOW,
+      owner: 'thinmansoftware',
+      repo: 'bdc-harness',
+      prNumber: 806,
+    });
+    expect(result.verdict).toBe('passed');
+    expect(result.reasonCodes).toEqual([]);
+  });
+
+  test('unscoped mode fails with the offending owner/repo#N', async () => {
+    const db = fixture();
+    insert(db, {
+      id: 'ingest-1',
+      taskType: 'run_report',
+      recipient: 'operator',
+      status: 'done',
+      createdAt: '2026-09-14T11:59:50.000Z',
+      body: JSON.stringify({
+        kind: 'pr_review_ingest_receipt',
+        disposition: 'queued',
+        reason: null,
+        headSha: HEAD,
+      }),
+    });
+    insert(db, {
+      id: 'review-1',
+      taskType: 'run_review',
+      recipient: 'overseer-reviewer',
+      status: 'queued',
+      createdAt: '2026-09-14T11:59:55.000Z',
+      body: JSON.stringify({
+        owner: 'thinmansoftware',
+        repo: 'bdc-harness',
+        prNumber: 806,
+        headSha: HEAD,
+      }),
+    });
+    insert(db, {
+      id: 'ingest-999',
+      taskType: 'run_report',
+      recipient: 'operator',
+      status: 'done',
+      createdAt: '2026-09-14T11:59:59.000Z',
+      correlationId: `pr-review:thinmansoftware/bdc-harness#999@${HEAD}`,
+      body: JSON.stringify({
+        kind: 'pr_review_ingest_receipt',
+        disposition: 'queued',
+        reason: null,
+        headSha: HEAD,
+        owner: 'thinmansoftware',
+        repo: 'bdc-harness',
+        prNumber: 999,
+      }),
+    });
+    const result = await runPushToReviewCanary({ db, now: () => NOW });
+    expect(result.verdict).toBe('failed');
+    expect(result.reasonCodes[0]).toBe(
+      'c4_review_not_queued:thinmansoftware/bdc-harness#999:no pull_request event received since ' +
+        HEAD
+    );
+  });
 });

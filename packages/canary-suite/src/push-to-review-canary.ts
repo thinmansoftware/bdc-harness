@@ -7,12 +7,15 @@ import {
 } from './outcome-canary';
 
 export const PUSH_TO_REVIEW_WINDOW_MS = 120_000;
+export const PUSH_TO_REVIEW_LOOKBACK_MS = 24 * 60 * 60 * 1000;
 
 export interface PushToReviewCanaryDeps extends OutcomeCanaryDeps {
   readonly owner?: string;
   readonly repo?: string;
   readonly prNumber?: number;
   readonly pushToReviewWindowMs?: number;
+  /** Unscoped mode: only ingest receipts newer than now - lookback are evaluated. */
+  readonly ingestLookbackMs?: number;
 }
 
 interface MessageRow {
@@ -27,9 +30,13 @@ interface StatusBody {
   readonly why_no_review?: unknown;
 }
 
-function parseIngest(
-  body: string
-): { disposition: string; reason: string | null; headSha: string | null } | null {
+interface IngestReceipt {
+  readonly disposition: string;
+  readonly reason: string | null;
+  readonly headSha: string | null;
+}
+
+function parseIngest(body: string): IngestReceipt | null {
   try {
     const value = JSON.parse(body) as {
       kind?: unknown;
@@ -112,6 +119,15 @@ function samePr(left: PrReviewRef, right: PrReviewRef): boolean {
   return left.owner === right.owner && left.repo === right.repo && left.prNumber === right.prNumber;
 }
 
+function prLabel(ref: PrReviewRef): string {
+  return `${ref.owner}/${ref.repo}#${ref.prNumber}`;
+}
+
+function namedCorrelationPrefix(deps: PushToReviewCanaryDeps): string | null {
+  if (!deps.owner || !deps.repo || deps.prNumber === undefined) return null;
+  return `pr-review:${deps.owner}/${deps.repo}#${deps.prNumber}@`;
+}
+
 function whyNoReview(input: {
   pendingId: string | null;
   blockedReason: string | null;
@@ -123,20 +139,20 @@ function whyNoReview(input: {
   return 'no pull_request event received';
 }
 
-async function fetchWhyNoReview(deps: PushToReviewCanaryDeps): Promise<string | null> {
-  if (
-    !deps.statusUrl ||
-    !deps.operatorToken ||
-    !deps.owner ||
-    !deps.repo ||
-    deps.prNumber === undefined
-  ) {
+async function fetchWhyNoReview(
+  deps: PushToReviewCanaryDeps,
+  ref: PrReviewRef | null
+): Promise<string | null> {
+  const owner = ref?.owner ?? deps.owner;
+  const repo = ref?.repo ?? deps.repo;
+  const prNumber = ref?.prNumber ?? deps.prNumber;
+  if (!deps.statusUrl || !deps.operatorToken || !owner || !repo || prNumber === undefined) {
     return null;
   }
   const url = new URL(deps.statusUrl);
-  url.searchParams.set('owner', deps.owner);
-  url.searchParams.set('repo', deps.repo);
-  url.searchParams.set('prNumber', String(deps.prNumber));
+  url.searchParams.set('owner', owner);
+  url.searchParams.set('repo', repo);
+  url.searchParams.set('prNumber', String(prNumber));
   try {
     const response = await (deps.fetcher ?? fetch)(url, {
       headers: { 'x-archon-operator-token': deps.operatorToken },
@@ -150,6 +166,97 @@ async function fetchWhyNoReview(deps: PushToReviewCanaryDeps): Promise<string | 
   }
 }
 
+/**
+ * The round-3 rule for ONE ingest receipt: the matching run_review row must carry the
+ * same owner/repo/PR and head, and must have been created at or after the receipt.
+ * `unscopedPr` labels the failure when several PRs are evaluated in one pass.
+ */
+async function evaluateReceipt(
+  deps: PushToReviewCanaryDeps,
+  newestRow: MessageRow,
+  ingest: IngestReceipt,
+  reviews: readonly MessageRow[],
+  unscopedPr: string | null
+): Promise<OutcomeCanaryResult> {
+  if (
+    ingest.disposition === 'ignored_event' ||
+    ingest.disposition === 'ignored_draft' ||
+    ingest.disposition === 'rejected_signature'
+  ) {
+    return passResult([`disposition=${ingest.disposition}`]);
+  }
+  const headSha = ingest.headSha ?? headFromCorrelation(newestRow.correlation_id);
+  const ingestAt = Date.parse(newestRow.created_at);
+  const ingestRef = resolvePrReviewRef(newestRow);
+  const match = reviews.find(row => {
+    const reviewRef = resolvePrReviewRef(row);
+    const workHead = parseWorkHead(row.body) ?? headFromCorrelation(row.correlation_id);
+    const queuedAt = Date.parse(row.created_at);
+    return (
+      ingestRef !== null &&
+      reviewRef !== null &&
+      samePr(ingestRef, reviewRef) &&
+      headSha !== null &&
+      workHead === headSha &&
+      Number.isFinite(queuedAt) &&
+      Number.isFinite(ingestAt) &&
+      queuedAt >= ingestAt
+    );
+  });
+  const windowMs = deps.pushToReviewWindowMs ?? PUSH_TO_REVIEW_WINDOW_MS;
+  const nowMs = (deps.now ?? Date.now)();
+  const pending = reviews.find(row => {
+    const reviewRef = resolvePrReviewRef(row);
+    return (
+      ingestRef !== null &&
+      reviewRef !== null &&
+      samePr(ingestRef, reviewRef) &&
+      (row.status === 'queued' || row.status === 'claimed')
+    );
+  });
+  const blockedReason = ingest.disposition === 'blocked' ? (ingest.reason ?? 'blocked') : null;
+  const localWhy = whyNoReview({
+    pendingId: pending?.id ?? null,
+    blockedReason,
+    currentHead: headSha,
+  });
+  const failCode = (why: string): string =>
+    unscopedPr ? `c4_review_not_queued:${unscopedPr}:${why}` : `c4_review_not_queued:${why}`;
+  if (!match) {
+    const why = (await fetchWhyNoReview(deps, ingestRef)) ?? localWhy;
+    return failResult(failCode(why), [
+      `ingest_id=${newestRow.id}`,
+      `head_sha=${headSha ?? 'null'}`,
+      `why_no_review=${why}`,
+    ]);
+  }
+  const queuedAt = Date.parse(match.created_at);
+  const delayMs =
+    Number.isFinite(ingestAt) && Number.isFinite(queuedAt) ? queuedAt - ingestAt : nowMs - ingestAt;
+  if (delayMs < 0) {
+    const why = (await fetchWhyNoReview(deps, ingestRef)) ?? localWhy;
+    return failResult(failCode(why), [
+      `ingest_id=${newestRow.id}`,
+      `head_sha=${headSha ?? 'null'}`,
+      `why_no_review=${why}`,
+    ]);
+  }
+  if (delayMs > windowMs) {
+    const why = (await fetchWhyNoReview(deps, ingestRef)) ?? localWhy;
+    return failResult(failCode(why), [
+      `ingest_id=${newestRow.id}`,
+      `run_review_id=${match.id}`,
+      `delay_ms=${delayMs}`,
+      `window_ms=${windowMs}`,
+    ]);
+  }
+  return passResult([
+    `ingest_id=${newestRow.id}`,
+    `run_review_id=${match.id}`,
+    `delay_ms=${delayMs}`,
+  ]);
+}
+
 export async function runPushToReviewCanary(
   deps: PushToReviewCanaryDeps
 ): Promise<OutcomeCanaryResult> {
@@ -160,6 +267,7 @@ export async function runPushToReviewCanary(
     return failResult('c4_review_not_queued:db_unreachable', [`error=${(error as Error).message}`]);
   }
   try {
+    const nowMs = (deps.now ?? Date.now)();
     const receipts = opened.db
       .query<MessageRow>(
         `SELECT id, correlation_id, body, created_at, status
@@ -168,22 +276,6 @@ export async function runPushToReviewCanary(
          ORDER BY created_at DESC`
       )
       .all();
-    const newest = receipts
-      .map(row => ({ row, ingest: parseIngest(row.body) }))
-      .find(item => item.ingest !== null);
-    if (!newest?.ingest) {
-      return passResult(['ingest_receipts=0']);
-    }
-    if (
-      newest.ingest.disposition === 'ignored_event' ||
-      newest.ingest.disposition === 'ignored_draft' ||
-      newest.ingest.disposition === 'rejected_signature'
-    ) {
-      return passResult([`disposition=${newest.ingest.disposition}`]);
-    }
-    const headSha = newest.ingest.headSha ?? headFromCorrelation(newest.row.correlation_id);
-    const ingestAt = Date.parse(newest.row.created_at);
-    const ingestRef = resolvePrReviewRef(newest.row);
     const reviews = opened.db
       .query<MessageRow>(
         `SELECT id, correlation_id, body, created_at, status
@@ -192,66 +284,40 @@ export async function runPushToReviewCanary(
          ORDER BY created_at DESC`
       )
       .all();
-    const match = reviews.find(row => {
-      const reviewRef = resolvePrReviewRef(row);
-      const workHead = parseWorkHead(row.body) ?? headFromCorrelation(row.correlation_id);
-      const queuedAt = Date.parse(row.created_at);
-      return (
-        ingestRef !== null &&
-        reviewRef !== null &&
-        samePr(ingestRef, reviewRef) &&
-        headSha !== null &&
-        workHead === headSha &&
-        Number.isFinite(queuedAt) &&
-        Number.isFinite(ingestAt) &&
-        queuedAt >= ingestAt
-      );
-    });
-    const windowMs = deps.pushToReviewWindowMs ?? PUSH_TO_REVIEW_WINDOW_MS;
-    const nowMs = (deps.now ?? Date.now)();
-    const pending = reviews.find(row => row.status === 'queued' || row.status === 'claimed');
-    const blockedReason =
-      newest.ingest.disposition === 'blocked' ? (newest.ingest.reason ?? 'blocked') : null;
-    const localWhy = whyNoReview({
-      pendingId: pending?.id ?? null,
-      blockedReason,
-      currentHead: headSha,
-    });
-    if (!match) {
-      const why = (await fetchWhyNoReview(deps)) ?? localWhy;
-      return failResult(`c4_review_not_queued:${why}`, [
-        `ingest_id=${newest.row.id}`,
-        `head_sha=${headSha ?? 'null'}`,
-        `why_no_review=${why}`,
-      ]);
+    // Named PR: only that PR's receipts can decide the result.
+    const prefix = namedCorrelationPrefix(deps);
+    if (prefix) {
+      const newest = receipts
+        .filter(row => row.correlation_id.startsWith(prefix))
+        .map(row => ({ row, ingest: parseIngest(row.body) }))
+        .find(item => item.ingest !== null);
+      if (!newest?.ingest) return passResult(['ingest_receipts=0']);
+      return await evaluateReceipt(deps, newest.row, newest.ingest, reviews, null);
     }
-    const queuedAt = Date.parse(match.created_at);
-    const delayMs =
-      Number.isFinite(ingestAt) && Number.isFinite(queuedAt)
-        ? queuedAt - ingestAt
-        : nowMs - ingestAt;
-    if (delayMs < 0) {
-      const why = (await fetchWhyNoReview(deps)) ?? localWhy;
-      return failResult(`c4_review_not_queued:${why}`, [
-        `ingest_id=${newest.row.id}`,
-        `head_sha=${headSha ?? 'null'}`,
-        `why_no_review=${why}`,
-      ]);
+    // Unscoped: every PR with a receipt inside the lookback, newest receipt per PR.
+    const lookbackMs = deps.ingestLookbackMs ?? PUSH_TO_REVIEW_LOOKBACK_MS;
+    const cutoff = nowMs - lookbackMs;
+    const newestByPr = new Map<
+      string,
+      { row: MessageRow; ingest: IngestReceipt; ref: PrReviewRef }
+    >();
+    for (const row of receipts) {
+      const ingest = parseIngest(row.body);
+      if (!ingest) continue;
+      const created = Date.parse(row.created_at);
+      if (!Number.isFinite(created) || created < cutoff) continue;
+      const ref = resolvePrReviewRef(row);
+      if (!ref) continue;
+      const key = prLabel(ref);
+      if (newestByPr.has(key)) continue;
+      newestByPr.set(key, { row, ingest, ref });
     }
-    if (delayMs > windowMs) {
-      const why = (await fetchWhyNoReview(deps)) ?? localWhy;
-      return failResult(`c4_review_not_queued:${why}`, [
-        `ingest_id=${newest.row.id}`,
-        `run_review_id=${match.id}`,
-        `delay_ms=${delayMs}`,
-        `window_ms=${windowMs}`,
-      ]);
+    if (newestByPr.size === 0) return passResult(['ingest_receipts=0']);
+    for (const item of newestByPr.values()) {
+      const result = await evaluateReceipt(deps, item.row, item.ingest, reviews, prLabel(item.ref));
+      if (result.verdict === 'failed') return result;
     }
-    return passResult([
-      `ingest_id=${newest.row.id}`,
-      `run_review_id=${match.id}`,
-      `delay_ms=${delayMs}`,
-    ]);
+    return passResult([`prs_evaluated=${newestByPr.size}`]);
   } finally {
     opened.close();
   }

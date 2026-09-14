@@ -8,10 +8,15 @@ import {
   type TaskmasterCanaryResult,
 } from './taskmaster-canary';
 import {
+  createRealOctokitClient,
+  type RealGitHubOctokitLike,
+} from '@archon/overseer/adapters/github-real-deps';
+import {
   runPrReviewCanarySuite,
   writePrReviewCanaryArtifacts,
   type PrReviewCanaryDeps,
 } from './pr-review-canary';
+import { createGateNotDeadGitHubAdapter, type GateNotDeadGitHub } from './gate-not-dead-canary';
 import type { OutcomeCanaryResult } from './outcome-canary';
 
 interface CanaryCliDeps {
@@ -33,6 +38,46 @@ interface CanaryCliDeps {
 function flag(args: readonly string[], name: string): string | undefined {
   const index = args.indexOf(name);
   return index >= 0 ? args[index + 1] : undefined;
+}
+
+function hasFlag(args: readonly string[], name: string): boolean {
+  return args.includes(name);
+}
+
+/** C6 needs the App-authenticated client; a PAT is never a fallback. */
+function githubAppConfigured(env: Readonly<Record<string, string | undefined>>): boolean {
+  const appId = (env.GITHUB_APP_ID ?? '').trim();
+  const installationId = (env.GITHUB_APP_INSTALLATION_ID ?? '').trim();
+  const privateKey = (env.GITHUB_APP_PRIVATE_KEY ?? '').trim();
+  const privateKeyPath = (env.GITHUB_APP_PRIVATE_KEY_PATH ?? '').trim();
+  return appId !== '' && installationId !== '' && (privateKey !== '' || privateKeyPath !== '');
+}
+
+function tryCreatePrReviewGithub(
+  env: Readonly<Record<string, string | undefined>>
+): GateNotDeadGitHub | undefined {
+  if (!githubAppConfigured(env)) return undefined;
+  try {
+    const octokit: RealGitHubOctokitLike = createRealOctokitClient();
+    return createGateNotDeadGitHubAdapter(octokit);
+  } catch {
+    return undefined;
+  }
+}
+
+function printBlockedCanaries(report: OutcomeCanaryResult, stderr: (value: string) => void): void {
+  const blocked = (report.checks ?? []).filter(check => check.verdict === 'blocked');
+  if (blocked.length > 0) {
+    stderr(
+      `blocked canaries: ${blocked
+        .map(check => `${check.id ?? 'check'}:${check.reasonCodes.join(',')}`)
+        .join(' ')}`
+    );
+    return;
+  }
+  if (report.verdict === 'blocked') {
+    stderr(`blocked canaries: ${report.reasonCodes.join(' ')}`);
+  }
 }
 
 function exitFor(verdict: RunCanaryResult['report']['verdict']): number {
@@ -101,15 +146,19 @@ export async function runCanaryCli(
     const headSha = flag(args, '--head-sha');
     const prValue = flag(args, '--pr-number');
     const prNumber = prValue === undefined ? undefined : Number(prValue);
+    const windowValue = flag(args, '--window');
+    const windowHours = windowValue === undefined ? undefined : Number(windowValue);
     if (
       !dbPath ||
       !outputRoot ||
-      (prValue !== undefined && (!Number.isSafeInteger(prNumber) || (prNumber ?? 0) <= 0))
+      (prValue !== undefined && (!Number.isSafeInteger(prNumber) || (prNumber ?? 0) <= 0)) ||
+      (windowValue !== undefined && (!Number.isFinite(windowHours) || (windowHours ?? 0) <= 0))
     ) {
       deps.stderr('pr_review_canary_missing_or_invalid_required_argument');
       return 3;
     }
     const token = env.ARCHON_OPERATOR_TOKEN;
+    const github = tryCreatePrReviewGithub(env);
     const report = await (deps.prReviewRunner ?? runPrReviewCanarySuite)({
       dbPath,
       operatorToken: token,
@@ -125,14 +174,22 @@ export async function runCanaryCli(
       branch,
       headSha,
       prNumber,
+      ...(windowHours === undefined ? {} : { ingestLookbackMs: windowHours * 60 * 60 * 1000 }),
+      ...(hasFlag(args, '--c3-synthetic-escalation') ? { c3SyntheticEscalation: true } : {}),
+      ...(github ? { github } : {}),
     });
     await (deps.prReviewArtifactWriter ?? writePrReviewCanaryArtifacts)(outputRoot, report);
     deps.stdout(JSON.stringify(report, null, 2));
+    printBlockedCanaries(report, deps.stderr);
     return exitFor(report.verdict);
   }
   const level = command === 'check' ? 0 : command === 'plan' ? 1 : null;
   if (level === null) {
-    deps.stderr('Usage: archon-canary <check|plan|taskmaster|pr-review> [options]');
+    deps.stderr(
+      'Usage: archon-canary <check|plan|taskmaster|pr-review> [options]\n' +
+        'pr-review: --db-path --output-root [--owner --repo --pr-number] [--window hours] [--c3-synthetic-escalation]\n' +
+        'blocked reasons: c6_github_client_unavailable, c3_synthetic_escalation_not_enabled, c3_refused_production_store'
+    );
     return 3;
   }
   const manifestPath = flag(args, '--manifest');

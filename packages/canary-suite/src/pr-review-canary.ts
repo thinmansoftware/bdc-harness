@@ -26,6 +26,7 @@ export type PrReviewCanaryDeps = ConvergingPrCanaryDeps &
 export async function runPrReviewCanarySuite(
   deps: PrReviewCanaryDeps
 ): Promise<OutcomeCanaryResult> {
+  const checkIds = ['C1', 'C2', 'C3', 'C4', 'C5', 'C6'] as const;
   const checks = await Promise.all([
     runConvergingPrCanary(deps),
     runRepeatSendCanary(deps),
@@ -34,7 +35,7 @@ export async function runPrReviewCanarySuite(
     runOrphanedRecipientCanary(deps),
     runGateNotDeadCanary(deps),
   ]);
-  return combineOutcomeChecks(checks);
+  return combineOutcomeChecks(checks.map((check, index) => ({ ...check, id: checkIds[index] })));
 }
 
 export async function writePrReviewCanaryArtifacts(

@@ -14,6 +14,8 @@ export interface OutcomeCanaryDatabase {
 }
 
 export interface OutcomeCanaryResult {
+  /** Canary id (C1..C6) when part of a composed suite. */
+  readonly id?: string;
   readonly verdict: CanaryVerdict;
   readonly reasonCodes: readonly string[];
   readonly evidenceRefs: readonly string[];
@@ -49,6 +51,14 @@ export function failResult(
   evidenceRefs: readonly string[]
 ): OutcomeCanaryResult {
   return { verdict: 'failed', reasonCodes: [reasonCode], evidenceRefs };
+}
+
+/** A canary that could not run for a stated, expected reason (missing client, opt-in absent). */
+export function blockedResult(
+  reasonCode: string,
+  evidenceRefs: readonly string[]
+): OutcomeCanaryResult {
+  return { verdict: 'blocked', reasonCodes: [reasonCode], evidenceRefs };
 }
 
 export function passResult(evidenceRefs: readonly string[]): OutcomeCanaryResult {

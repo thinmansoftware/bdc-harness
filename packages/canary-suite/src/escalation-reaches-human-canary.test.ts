@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
+import { Database } from 'bun:sqlite';
 import { join } from 'path';
-import { closeDatabase, resetDatabase } from '@archon/core/db';
+import { closeDatabase, getDatabase, resetDatabase } from '@archon/core/db';
 import { removeTempDirWithRetry } from '@archon/core/test/temp-dir';
 import {
   deliverNeedsHumanToOperator,
@@ -42,6 +43,7 @@ describe.serial('C3 escalation-reaches-human canary', () => {
       return new Response('{}', { status: 200 });
     };
     const result = await runEscalationReachesHumanCanary({
+      c3SyntheticEscalation: true,
       fetcher,
       deliver: deliverNeedsHumanToOperator,
     });
@@ -59,10 +61,57 @@ describe.serial('C3 escalation-reaches-human canary', () => {
       return new Response('{}', { status: 200 });
     };
     const result = await runEscalationReachesHumanCanary({
+      c3SyntheticEscalation: true,
       fetcher,
       deliver: deliverNeedsHumanViaNotion,
     });
     expect(result.verdict).toBe('failed');
     expect(result.reasonCodes).toContain('c3_escalation_notion_write_attempted');
+  });
+
+  test('without c3SyntheticEscalation the canary is blocked and does not deliver', async () => {
+    const result = await runEscalationReachesHumanCanary({
+      deliver: async () => {
+        throw new Error('deliver_must_not_run');
+      },
+    });
+    expect(result.verdict).toBe('blocked');
+    expect(result.reasonCodes).toContain('c3_synthetic_escalation_not_enabled');
+  });
+
+  test('refuses when DATABASE_URL points at postgres', async () => {
+    process.env.DATABASE_URL = 'postgresql://postgres:postgres@localhost:5432/remote_coding_agent';
+    const result = await runEscalationReachesHumanCanary({
+      c3SyntheticEscalation: true,
+      deliver: async () => {
+        throw new Error('deliver_must_not_run');
+      },
+    });
+    expect(result.verdict).toBe('blocked');
+    expect(result.reasonCodes).toContain('c3_refused_production_store');
+  });
+
+  test('WO-C3-CANARY rows do not land in the caller sqlite', async () => {
+    getDatabase();
+    await closeDatabase();
+    resetDatabase();
+    const fetcher: typeof fetch = async () => new Response('{}', { status: 200 });
+    const result = await runEscalationReachesHumanCanary({
+      c3SyntheticEscalation: true,
+      fetcher,
+      deliver: deliverNeedsHumanToOperator,
+    });
+    expect(result.verdict).toBe('passed');
+    await closeDatabase();
+    resetDatabase();
+    const caller = new Database(join(home, 'archon.db'), { readonly: true });
+    const rows = caller
+      .query<
+        { wo_id: string },
+        [string]
+      >('SELECT wo_id FROM overseer_operator_cards WHERE wo_id = ?')
+      .all('WO-C3-CANARY');
+    expect(rows).toEqual([]);
+    caller.close();
   });
 });

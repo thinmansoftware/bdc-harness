@@ -7,7 +7,13 @@ import {
   type OperatorCardChannel,
   type OperatorCardChannelDeps,
 } from '@archon/overseer/escalation-delivery';
+import { mkdtemp } from 'fs/promises';
+import { tmpdir } from 'os';
+import { join } from 'path';
+import { closeDatabase, getDatabaseType, resetDatabase } from '@archon/core/db/connection';
+import { removeTempDirWithRetry } from '@archon/core/test/temp-dir';
 import {
+  blockedResult,
   failResult,
   passResult,
   type OutcomeCanaryDeps,
@@ -25,6 +31,8 @@ export interface EscalationReachesHumanCanaryDeps extends OutcomeCanaryDeps {
   readonly deliver?: (fetcher: typeof fetch) => Promise<readonly HumanArtifact[]>;
   readonly artifacts?: readonly HumanArtifact[];
   readonly fetchLog?: readonly string[];
+  /** Opt-in: the real escalation path persists an operator card and a dispatch row. */
+  readonly c3SyntheticEscalation?: boolean;
 }
 
 function urlOf(input: Parameters<typeof fetch>[0]): string {
@@ -113,9 +121,49 @@ export async function deliverNeedsHumanViaNotion(
   });
 }
 
+/**
+ * Switch the @archon/core DB singleton onto a throwaway sqlite file for the duration of
+ * one delivery. Refuses when DATABASE_URL is set (getDatabase() would open Postgres);
+ * closeDatabase()+resetDatabase() drop any live singleton; ARCHON_HOME points at a temp
+ * dir so the next getDatabase() opens <temp>/archon.db; env and singleton are restored
+ * afterwards and the temp dir removed. Proof of isolation before running: DATABASE_URL
+ * still unset, getDatabaseType() === 'sqlite', ARCHON_HOME === the temp dir.
+ */
+async function withIsolatedSqliteStore<T>(
+  run: () => Promise<T>
+): Promise<{ ok: true; value: T } | { ok: false; reason: 'c3_refused_production_store' }> {
+  if ((process.env.DATABASE_URL ?? '').trim() !== '') {
+    return { ok: false, reason: 'c3_refused_production_store' };
+  }
+  const previousHome = process.env.ARCHON_HOME;
+  const isolatedHome = await mkdtemp(join(tmpdir(), 'c3-canary-'));
+  await closeDatabase();
+  resetDatabase();
+  process.env.ARCHON_HOME = isolatedHome;
+  try {
+    if ((process.env.DATABASE_URL ?? '').trim() !== '' || getDatabaseType() !== 'sqlite') {
+      return { ok: false, reason: 'c3_refused_production_store' };
+    }
+    if (process.env.ARCHON_HOME !== isolatedHome) {
+      return { ok: false, reason: 'c3_refused_production_store' };
+    }
+    const value = await run();
+    return { ok: true, value };
+  } finally {
+    await closeDatabase();
+    resetDatabase();
+    if (previousHome === undefined) delete process.env.ARCHON_HOME;
+    else process.env.ARCHON_HOME = previousHome;
+    removeTempDirWithRetry(isolatedHome);
+  }
+}
+
 export async function runEscalationReachesHumanCanary(
   deps: EscalationReachesHumanCanaryDeps
 ): Promise<OutcomeCanaryResult> {
+  if (!deps.c3SyntheticEscalation) {
+    return blockedResult('c3_synthetic_escalation_not_enabled', ['flag=--c3-synthetic-escalation']);
+  }
   const fetchLog: string[] = [...(deps.fetchLog ?? [])];
   const artifacts: HumanArtifact[] = [...(deps.artifacts ?? [])];
   const inner = deps.fetcher ?? fetch;
@@ -127,7 +175,11 @@ export async function runEscalationReachesHumanCanary(
     return inner(input, init);
   }) as typeof fetch;
   const deliver = deps.deliver ?? deliverNeedsHumanToOperator;
-  artifacts.push(...(await deliver(spy)));
+  const isolated = await withIsolatedSqliteStore(async () => deliver(spy));
+  if (!isolated.ok) {
+    return blockedResult(isolated.reason, ['store=production_or_unproven']);
+  }
+  artifacts.push(...isolated.value);
   const notionHit = fetchLog.find(url => url.includes('api.notion.com'));
   if (notionHit) {
     return failResult('c3_escalation_notion_write_attempted', [`url=${notionHit}`]);
