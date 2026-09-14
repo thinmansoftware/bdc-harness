@@ -12,7 +12,7 @@ import {
   resolveMaxTotalRereviews,
   reviewCorrelationId,
 } from './pr-review-ingest';
-import type { IngestDisposition, PriorReviewWork } from './pr-review-ingest';
+import type { PriorReviewWork } from './pr-review-ingest';
 import {
   createRealIngestDeps,
   parseReviewWorkBody,
@@ -62,7 +62,8 @@ export interface PrReviewLastReview {
 }
 
 export interface PrReviewLatestIngest {
-  disposition: IngestDisposition | string;
+  /** An IngestDisposition when the receipt was written by this code; kept open for older receipts. */
+  disposition: string;
   reason: string | null;
   headSha: string | null;
 }
