@@ -890,7 +890,7 @@ export function createRealMergePullRequest(
         repo: input.repo,
         pull_number: input.number,
         sha: pr.data.head.sha,
-        merge_method: 'squash',
+        merge_method: 'squash' as const,
       };
       const response = await octokit.pulls.merge(mergeInput);
       if (!response.data.merged) {

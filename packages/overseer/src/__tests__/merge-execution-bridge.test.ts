@@ -125,7 +125,12 @@ describe('merge execution bridge', () => {
     ['docs', greenPr({ changedFilePaths: ['docs/work-orders/WO.md'] }), 0, 'spec_only'],
     ['truncated', greenPr({ changedFilePaths: undefined }), 0, 'changed_files_unresolved'],
     ['wrong-base', greenPr({ baseBranch: 'main' }), 0, 'integration_base_mismatch'],
-    ['missing-pr', greenPr({ exists: false, state: 'missing', pr: undefined }), 0, 'open_pr_not_found'],
+    [
+      'missing-pr',
+      greenPr({ exists: false, state: 'missing', pr: undefined }),
+      0,
+      'open_pr_not_found',
+    ],
     [
       'lookup-failed',
       greenPr({ exists: false, state: 'lookup_failed', pr: undefined, lookupFailed: true }),

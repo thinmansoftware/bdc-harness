@@ -1,6 +1,7 @@
 import { createLogger } from '@archon/paths';
 import type { OverseerVerdictRow, OverseerWatchRun } from '@archon/core/db/overseer';
 import { readOverseerActionPolicyFromEnv, type OverseerActionPolicy } from './action-policy';
+import { isSpecOnlyChangeSet } from './reconcile';
 import type { GitHubClientDeps } from './types.ts';
 
 const log = createLogger('overseer/merge-coordinator');
@@ -40,8 +41,12 @@ function configuredLimit(override?: number): number {
   return Number.isInteger(parsed) && parsed >= 0 ? parsed : DEFAULT_MAX_MERGES_PER_HOUR;
 }
 
-function containsCode(paths: readonly string[]): boolean {
-  return paths.some(path => !path.startsWith('docs/') && !path.toLowerCase().endsWith('.md'));
+function isDocumentationOnly(paths: readonly string[]): boolean {
+  return (
+    paths.length === 0 ||
+    isSpecOnlyChangeSet(paths) ||
+    paths.every(path => path.startsWith('docs/') || path.toLowerCase().endsWith('.md'))
+  );
 }
 
 export async function runMergeExecutionBridgeOnce(
@@ -125,7 +130,7 @@ export async function runMergeExecutionBridgeOnce(
       await skip('changed_files_unresolved', pr.htmlUrl);
       continue;
     }
-    if (!containsCode(pr.changedFilePaths)) {
+    if (isDocumentationOnly(pr.changedFilePaths)) {
       await skip('spec_only', pr.htmlUrl);
       continue;
     }
@@ -134,7 +139,7 @@ export async function runMergeExecutionBridgeOnce(
       continue;
     }
 
-    const now = (options.now ?? (() => new Date()))();
+    const now = (options.now ?? ((): Date => new Date()))();
     const since = new Date(now.getTime() - 60 * 60 * 1000).toISOString();
     if (
       (await options.store.countRecentMerges(since)) >= configuredLimit(options.maxMergesPerHour)

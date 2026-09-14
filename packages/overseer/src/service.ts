@@ -421,7 +421,7 @@ export async function runOverseerService(options: OverseerServiceOptions = {}): 
   if (options.mergeBridgeEnabled) {
     const mergeBridgeRun =
       options.mergeBridgeRun ??
-      (() =>
+      ((): Promise<void> =>
         runMergeExecutionBridgeOnce({
           github: deps,
           store: {
