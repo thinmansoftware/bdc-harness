@@ -341,7 +341,7 @@ export interface OverseerVerdictRow {
   updated_at: string;
   actioned_at: string | null;
   mutation_sent: boolean | number | null;
-  mutation_reason: string | null;
+  action_reason: string | null;
   merge_sha: string | null;
   pr_url: string | null;
 }
@@ -365,15 +365,12 @@ export async function countRecentOverseerVerdictMerges(since: string): Promise<n
 }
 
 export async function claimVerdictForMergeExecution(verdictId: string): Promise<boolean> {
-  const now = new Date();
-  const staleBefore = new Date(now.getTime() - 5 * 60 * 1000).toISOString();
+  const now = new Date().toISOString();
   const result = await getDatabase().query(
     `UPDATE overseer_verdicts
-     SET mutation_sent = false, mutation_reason = 'processing', updated_at = $2
-     WHERE id = $1 AND actioned_at IS NULL
-       AND (mutation_reason IS NULL
-         OR (mutation_reason = 'processing' AND updated_at < $3))`,
-    [verdictId, now.toISOString(), staleBefore]
+     SET actioned_at = $2, mutation_sent = false, action_reason = 'processing', updated_at = $2
+     WHERE id = $1 AND actioned_at IS NULL`,
+    [verdictId, now]
   );
   return result.rowCount === 1;
 }
@@ -388,16 +385,16 @@ export async function recordVerdictMergeOutcome(input: {
   const db = getDatabase();
   await db.query(
     `UPDATE overseer_verdicts
-     SET actioned_at = $2, mutation_sent = $3, mutation_reason = $4,
-         merge_sha = $5, pr_url = $6, updated_at = $2
-     WHERE id = $1`,
+     SET mutation_sent = $2, action_reason = $3,
+         merge_sha = $4, pr_url = $5, updated_at = $6
+     WHERE id = $1 AND actioned_at IS NOT NULL AND action_reason = 'processing'`,
     [
       input.verdictId,
-      new Date().toISOString(),
       input.mutationSent,
       input.reason,
       input.mergeSha ?? null,
       input.prUrl ?? null,
+      new Date().toISOString(),
     ]
   );
   const result = await db.query<OverseerVerdictRow>(

@@ -138,6 +138,7 @@ describe('merge execution bridge', () => {
       'pr_lookup_failed',
     ],
     ['limited', greenPr(), 4, 'rate_ceiling_exceeded'],
+    ['closed', greenPr({ state: 'closed' }), 0, 'pr_not_open'],
   ])('records honest skip for %s', async (id, evidence, recent, reason) => {
     const h = harness([verdict(id)], evidence, recent);
     await runMergeExecutionBridgeOnce({
@@ -196,21 +197,6 @@ describe('merge execution bridge', () => {
     });
     expect(h.outcomes[0]).toEqual(
       expect.objectContaining({ mutationSent: false, reason: 'github rejected' })
-    );
-  });
-
-  test('reconciles a merge after a crash before outcome persistence', async () => {
-    const recovering = verdict('recovering');
-    recovering.mutation_reason = 'processing';
-    const h = harness([recovering], greenPr({ state: 'merged' }));
-    await runMergeExecutionBridgeOnce({
-      store: h.store,
-      github: h.github,
-      readPolicy: () => policy(),
-    });
-    expect(h.merges).toBe(0);
-    expect(h.outcomes[0]).toEqual(
-      expect.objectContaining({ mutationSent: true, reason: 'merge_executed' })
     );
   });
 

@@ -519,7 +519,7 @@ export class SqliteAdapter implements IDatabase {
       const additions: [string, string][] = [
         ['actioned_at', 'TEXT'],
         ['mutation_sent', 'INTEGER'],
-        ['mutation_reason', 'TEXT'],
+        ['action_reason', 'TEXT'],
         ['merge_sha', 'TEXT'],
         ['pr_url', 'TEXT'],
       ];
@@ -529,7 +529,7 @@ export class SqliteAdapter implements IDatabase {
         }
       }
       this.db.run(
-        'CREATE INDEX IF NOT EXISTS idx_overseer_verdicts_merge_action ON overseer_verdicts(proposed_action, actioned_at)'
+        "CREATE INDEX IF NOT EXISTS idx_overseer_verdicts_merge_action ON overseer_verdicts(created_at) WHERE proposed_action = 'flag_merge_ready' AND actioned_at IS NULL"
       );
     } catch (e: unknown) {
       getLog().warn({ err: e as Error }, 'db.sqlite_migration_overseer_verdict_columns_failed');
@@ -2002,7 +2002,7 @@ export class SqliteAdapter implements IDatabase {
         retry_count INTEGER NOT NULL DEFAULT 0,
         actioned_at TEXT,
         mutation_sent INTEGER,
-        mutation_reason TEXT,
+        action_reason TEXT,
         merge_sha TEXT,
         pr_url TEXT,
         created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
@@ -2037,7 +2037,8 @@ export class SqliteAdapter implements IDatabase {
         ON overseer_required_contexts_attempts(touched_at);
       CREATE UNIQUE INDEX IF NOT EXISTS uq_overseer_verdicts_run_head ON overseer_verdicts(run_id, head_sha);
       CREATE INDEX IF NOT EXISTS idx_overseer_verdicts_status ON overseer_verdicts(status, created_at);
-      CREATE INDEX IF NOT EXISTS idx_overseer_verdicts_merge_action ON overseer_verdicts(proposed_action, actioned_at);
+      CREATE INDEX IF NOT EXISTS idx_overseer_verdicts_merge_action ON overseer_verdicts(created_at)
+        WHERE proposed_action = 'flag_merge_ready' AND actioned_at IS NULL;
       CREATE INDEX IF NOT EXISTS idx_codebase_env_vars_codebase_id ON remote_agent_codebase_env_vars(codebase_id);
       CREATE INDEX IF NOT EXISTS idx_conversations_platform ON remote_agent_conversations(platform_type, platform_conversation_id);
       CREATE INDEX IF NOT EXISTS idx_sessions_conversation ON remote_agent_sessions(conversation_id);

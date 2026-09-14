@@ -105,17 +105,8 @@ export async function runMergeExecutionBridgeOnce(
       await skip('verdict_stale_head', pr.htmlUrl);
       continue;
     }
-    if (pr.state === 'merged' && verdict.mutation_reason === 'processing') {
-      await options.store.recordOutcome({
-        verdictId: verdict.id,
-        mutationSent: true,
-        reason: 'merge_executed',
-        prUrl: pr.htmlUrl,
-      });
-      continue;
-    }
     if (pr.state !== 'open') {
-      await skip('open_pr_not_found', pr.htmlUrl);
+      await skip('pr_not_open', pr.htmlUrl);
       continue;
     }
     if (pr.checks.total === 0 || pr.checks.failed > 0 || pr.checks.pending > 0) {
