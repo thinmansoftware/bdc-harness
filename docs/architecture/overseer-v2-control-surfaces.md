@@ -17,12 +17,16 @@ opens. Nothing on this list is flipped autonomously, ever.
 | `OVERSEER_WATCH_MAX_RUNS_PER_TICK` | env (load bound) | `25` | Maximum oldest-first terminal runs evaluated per 60-second watcher tick. Invalid or non-positive values fall back to 25, keeping worst-case search lookups below GitHub's 30/minute search limit. |
 | `OVERSEER_MAX_REREVIEW_ATTEMPTS` | env (config) | `3` | Maximum CONSECUTIVE automatic re-reviews of one PR after a `changes_requested` verdict; the initial review is not an attempt. Counted since the last NON-automatic review that actually produced a verdict, so a hand-requested review (Dispatch nudge) re-arms the budget and a converging PR is not locked out forever. Invalid, zero or negative values fall back to 3 -- the guard never disables itself on a typo. When the budget is exhausted the push is blocked and ONE comment is posted on the PR per head (idempotent via an HTML-comment marker). Effective value is logged at boot as `overseer.pr_review.rereview_budget_configured`. (#797) |
 | `OVERSEER_MAX_TOTAL_REREVIEWS` | env (config) | `10` | Lifetime hard ceiling on judged automatic re-reviews for one PR. Green fixed pushes and human reviews can re-arm the consecutive budget but never this ceiling. Invalid, zero, or negative values fall back to 10. At the ceiling ingest blocks with `rereview_total_ceiling_reached`; the receipt and PR comment report both lifetime and consecutive counts. (#797 item 4) |
+| `GET /api/overseer/pr-review/status` | HTTP (read) | n/a | Operator token (`x-archon-operator-token`). Store-only diagnostic for one PR: current ingested head, last verdict-bearing review and the head it judged, `head_moved`, consecutive/total auto-re-review counts vs the `OVERSEER_MAX_*` budgets, latest ingest receipt, and one `why_no_review` line. Does not call GitHub. |
+| `POST /api/overseer/pr-review/request` | HTTP (enqueue) | n/a | Operator token. Body `{owner,repo,prNumber,headSha,reason}`. `headSha` is a full 40-hex exact head (never "latest"). The route resolves the PR's current head via GitHub `pulls.get` (same lookup as the reviewer). If lookup fails: HTTP 502 `{ok:false, error:head_lookup_failed}` and nothing is enqueued. If `headSha` is not that current head: HTTP 409 `{ok:false, error:head_not_current, currentHead}` and nothing is enqueued. On match, enqueues through existing `enqueueReviewWork` with `repeat_reason` `operator_request:<reason>`, `headCiGreen: false`, `baseRef`/`author` from that lookup, and an idempotency key per (owner, repo, prNumber, headSha, operator_request). A second request at the verified same head returns the same id. Does not cancel, merge, approve, or dismiss. |
+| `GET /api/overseer/pr-review/queue` | HTTP (read) | n/a | Operator token. `run_review` rows for `overseer-reviewer` in queued/claimed/failed, with `age_seconds` and owner/repo/prNumber/headSha parsed from the correlation id. `orphaned` lists any recipient with queued rows older than 24h and no live worker: `status === available` AND `last_heartbeat_at` within `DEFAULT_WORKER_STALE_AFTER_MS`, evaluated in the operator (not via `listWorkers` status mutation). The 53 dead `overseer-review-route` rows are the anchor. Does not purge. |
 | `OVERSEER_MERGE_MANAGER_MODE` | env (Merge Manager mode) | `hold-canary` | Fail-closed default. `hold-canary` logs `would_comment` / `would_merge` with association proof (run/WO/PR/SHA) and performs **no GitHub write**. `comment_findings` may post one PR review comment via `commentOnPullRequest`; **merge stays hard-off**. `execute` is explicit opt-in only (still subject to production-effect hold + provenance gate). Unknown/empty values resolve to `hold-canary`. Soft-merge / production merge authority are NOT opened by this surface. |
 | `overseer_capability_state.merge.action_enabled` | DB row | `0` (writer `migration-034`) | JOHN ONLY, on the Arc B evidence package ((a)+(b) proven separately). The judge-first path never reads or writes it; the steward path keeps all its guards. |
 | `overseer_capability_state.{escalation,repair,branch,lifecycle}` | DB rows | per migration-034 | Legacy v1 capability rows. Preserved read-only for history; the judge-first path does not consult them. Tier >= 1 execution tickets are a later M-99 slice. |
 | M-31 permit tables (`overseer_m31_*`) | DB tables | append-only | DEAD as a gate (scope ruling 2026-07-28 on #1315). Preserved read-only for history. The permit primitive returns only as a short-lived execution ticket for Tier >= 1 mutations in a later slice. |
 
-## Authority model (one law)
+## Live HTTP inventory (operator PR-review routes plus routes verified 2026-09-11)
+
 
 M-15 tiers, implemented in `packages/overseer/src/tier-map.ts`:
 
@@ -49,3 +53,42 @@ merge-steward path, where fail-closed remains correct.
 
 One primary verdict per `(run_id, head_sha)` (unique index, claim-before-call in
 `claimOverseerVerdict`). Replay never re-bills a model call and never re-acts.
+
+## Part B PR-review canary CLI
+
+`archon-canary pr-review --db-path <sqlite> --output-root <dir>` runs C1-C6 against a
+readonly dispatch store. Extra flags:
+
+- `--window <hours>`: unscoped C4 lookback (default 24). Named `--owner/--repo/--pr-number`
+  still selects the newest ingest whose correlation id starts with
+  `pr-review:<owner>/<repo>#<N>@`.
+- `--c2-live-enqueue`: opt in to C2's mutation. Without it C2 never POSTs to
+  `/api/overseer/pr-review/request`; it observes an already-queued `run_review` row for
+  the subject (pass when the row carries `repeat_reason`, `blocked` with
+  `c2_live_enqueue_not_enabled` when there is none). An API base and operator token
+  alone never imply the enqueue: it creates a real review and model usage. With the flag,
+  every input the POST needs (`--api-base`, token, `--owner/--repo/--pr-number`,
+  `--head-sha`) must be present or C2 is `blocked` with
+  `c2_live_enqueue_prerequisites_missing`; after the POST, C2 passes only if the
+  `messageId` the route returned is a queued `run_review` row whose correlation id ends
+  with the requested exact head (`enqueued_row_missing` / `enqueued_row_head_mismatch`
+  otherwise). Observe mode is exact-head as well: with `--head-sha` only a queued row
+  whose correlation id ends with that head counts (`row_head=` names it); a row queued
+  for another head is stale work and leaves C2 `blocked`.
+- C1 counts an `rereview_attempts_exhausted` ingest receipt only when it names the
+  subject's current head and no non-automatic review row was queued after it; a
+  receipt for an older head, or one followed by a hand/operator review, is history.
+  The current head is the newest ingest receipt's head when that receipt is newer
+  than the newest review row (a push refused at ingest never gets a review row).
+- `--c3-synthetic-escalation`: opt in to C3. Without it C3 is `blocked` with
+  `c3_synthetic_escalation_not_enabled`. When set, C3 switches the core DB singleton
+  onto a temp `ARCHON_HOME` sqlite via `closeDatabase`/`resetDatabase` and refuses with
+  `c3_refused_production_store` if `DATABASE_URL` is set.
+
+C6 uses `createRealOctokitClient()` only when GitHub App env is complete
+(`GITHUB_APP_ID`, `GITHUB_APP_INSTALLATION_ID`, and `GITHUB_APP_PRIVATE_KEY` or
+`GITHUB_APP_PRIVATE_KEY_PATH`). Absent/unusable App credentials omit the client and C6
+is `blocked` with `c6_github_client_unavailable` (not `failed`). A base whose required
+contexts resolve to an empty list is `failed` with `c6_no_required_checks_on_base`: an
+unenforced gate is the dead gate the canary exists to catch. The CLI prints
+`blocked canaries: ...` on stderr. Composed verdict: `failed` outranks `blocked`.

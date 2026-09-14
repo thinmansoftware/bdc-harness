@@ -7,6 +7,17 @@ import {
   type TaskmasterCanaryDeps,
   type TaskmasterCanaryResult,
 } from './taskmaster-canary';
+import {
+  createRealOctokitClient,
+  type RealGitHubOctokitLike,
+} from '@archon/overseer/adapters/github-real-deps';
+import {
+  runPrReviewCanarySuite,
+  writePrReviewCanaryArtifacts,
+  type PrReviewCanaryDeps,
+} from './pr-review-canary';
+import { createGateNotDeadGitHubAdapter, type GateNotDeadGitHub } from './gate-not-dead-canary';
+import type { OutcomeCanaryResult } from './outcome-canary';
 
 interface CanaryCliDeps {
   readonly runner: (options: RunCanaryOptions) => Promise<RunCanaryResult>;
@@ -17,11 +28,56 @@ interface CanaryCliDeps {
     outputRoot: string,
     report: TaskmasterCanaryResult
   ) => Promise<readonly string[]>;
+  readonly prReviewRunner?: (options: PrReviewCanaryDeps) => Promise<OutcomeCanaryResult>;
+  readonly prReviewArtifactWriter?: (
+    outputRoot: string,
+    report: OutcomeCanaryResult
+  ) => Promise<readonly string[]>;
 }
 
 function flag(args: readonly string[], name: string): string | undefined {
   const index = args.indexOf(name);
   return index >= 0 ? args[index + 1] : undefined;
+}
+
+function hasFlag(args: readonly string[], name: string): boolean {
+  return args.includes(name);
+}
+
+/** C6 needs the App-authenticated client; a PAT is never a fallback. */
+function githubAppConfigured(env: Readonly<Record<string, string | undefined>>): boolean {
+  const appId = (env.GITHUB_APP_ID ?? '').trim();
+  const installationId = (env.GITHUB_APP_INSTALLATION_ID ?? '').trim();
+  const privateKey = (env.GITHUB_APP_PRIVATE_KEY ?? '').trim();
+  const privateKeyPath = (env.GITHUB_APP_PRIVATE_KEY_PATH ?? '').trim();
+  return appId !== '' && installationId !== '' && (privateKey !== '' || privateKeyPath !== '');
+}
+
+function tryCreatePrReviewGithub(
+  env: Readonly<Record<string, string | undefined>>
+): GateNotDeadGitHub | undefined {
+  if (!githubAppConfigured(env)) return undefined;
+  try {
+    const octokit: RealGitHubOctokitLike = createRealOctokitClient();
+    return createGateNotDeadGitHubAdapter(octokit);
+  } catch {
+    return undefined;
+  }
+}
+
+function printBlockedCanaries(report: OutcomeCanaryResult, stderr: (value: string) => void): void {
+  const blocked = (report.checks ?? []).filter(check => check.verdict === 'blocked');
+  if (blocked.length > 0) {
+    stderr(
+      `blocked canaries: ${blocked
+        .map(check => `${check.id ?? 'check'}:${check.reasonCodes.join(',')}`)
+        .join(' ')}`
+    );
+    return;
+  }
+  if (report.verdict === 'blocked') {
+    stderr(`blocked canaries: ${report.reasonCodes.join(' ')}`);
+  }
 }
 
 function exitFor(verdict: RunCanaryResult['report']['verdict']): number {
@@ -80,9 +136,62 @@ export async function runCanaryCli(
     deps.stdout(JSON.stringify(report, null, 2));
     return exitFor(report.verdict);
   }
+  if (command === 'pr-review') {
+    const dbPath = flag(args, '--db-path');
+    const outputRoot = flag(args, '--output-root');
+    const apiBase = flag(args, '--api-base');
+    const owner = flag(args, '--owner');
+    const repo = flag(args, '--repo');
+    const branch = flag(args, '--branch');
+    const headSha = flag(args, '--head-sha');
+    const prValue = flag(args, '--pr-number');
+    const prNumber = prValue === undefined ? undefined : Number(prValue);
+    const windowValue = flag(args, '--window');
+    const windowHours = windowValue === undefined ? undefined : Number(windowValue);
+    if (
+      !dbPath ||
+      !outputRoot ||
+      (prValue !== undefined && (!Number.isSafeInteger(prNumber) || (prNumber ?? 0) <= 0)) ||
+      (windowValue !== undefined && (!Number.isFinite(windowHours) || (windowHours ?? 0) <= 0))
+    ) {
+      deps.stderr('pr_review_canary_missing_or_invalid_required_argument');
+      return 3;
+    }
+    const token = env.ARCHON_OPERATOR_TOKEN;
+    const github = tryCreatePrReviewGithub(env);
+    const report = await (deps.prReviewRunner ?? runPrReviewCanarySuite)({
+      dbPath,
+      operatorToken: token,
+      statusUrl: apiBase
+        ? `${apiBase.replace(/\/$/, '')}/api/overseer/pr-review/status`
+        : undefined,
+      requestUrl: apiBase
+        ? `${apiBase.replace(/\/$/, '')}/api/overseer/pr-review/request`
+        : undefined,
+      queueUrl: apiBase ? `${apiBase.replace(/\/$/, '')}/api/overseer/pr-review/queue` : undefined,
+      owner,
+      repo,
+      branch,
+      headSha,
+      prNumber,
+      ...(windowHours === undefined ? {} : { ingestLookbackMs: windowHours * 60 * 60 * 1000 }),
+      ...(hasFlag(args, '--c2-live-enqueue') ? { c2LiveEnqueue: true } : {}),
+      ...(hasFlag(args, '--c3-synthetic-escalation') ? { c3SyntheticEscalation: true } : {}),
+      ...(github ? { github } : {}),
+    });
+    await (deps.prReviewArtifactWriter ?? writePrReviewCanaryArtifacts)(outputRoot, report);
+    deps.stdout(JSON.stringify(report, null, 2));
+    printBlockedCanaries(report, deps.stderr);
+    return exitFor(report.verdict);
+  }
   const level = command === 'check' ? 0 : command === 'plan' ? 1 : null;
   if (level === null) {
-    deps.stderr('Usage: archon-canary <check|plan|taskmaster> [options]');
+    deps.stderr(
+      'Usage: archon-canary <check|plan|taskmaster|pr-review> [options]\n' +
+        'pr-review: --db-path --output-root [--owner --repo --pr-number] [--window hours] [--c2-live-enqueue] [--c3-synthetic-escalation]\n' +
+        'mutation opt-ins (never implied): --c2-live-enqueue POSTs a real review request; --c3-synthetic-escalation runs the escalation path on an isolated store\n' +
+        'blocked reasons: c6_github_client_unavailable, c2_live_enqueue_not_enabled, c2_live_enqueue_prerequisites_missing, c3_synthetic_escalation_not_enabled, c3_refused_production_store'
+    );
     return 3;
   }
   const manifestPath = flag(args, '--manifest');

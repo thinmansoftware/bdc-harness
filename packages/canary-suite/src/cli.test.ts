@@ -2,6 +2,7 @@ import { expect, mock, test } from 'bun:test';
 import { runCanaryCli } from './cli';
 import type { CanaryReport, RunCanaryResult } from './types';
 import type { TaskmasterCanaryResult } from './taskmaster-canary';
+import type { OutcomeCanaryResult } from './outcome-canary';
 
 const baseReport: CanaryReport = {
   schemaVersion: 1,
@@ -159,4 +160,185 @@ test('taskmaster maps a failed report to exit 2 after writing its artifact', asy
 
   expect(await runCanaryCli([...taskmasterArgs, '--interval-ms', '60000'], {}, deps)).toBe(2);
   expect(deps.taskmasterArtifactWriter).toHaveBeenCalledWith('artifacts', failedReport);
+});
+
+const prReviewArgs = ['pr-review', '--db-path', 'archon.db', '--output-root', 'artifacts'];
+
+const prReviewReport: OutcomeCanaryResult = {
+  verdict: 'passed',
+  reasonCodes: [],
+  evidenceRefs: ['fixture'],
+};
+
+function prReviewDeps(report: OutcomeCanaryResult = prReviewReport) {
+  return {
+    runner: mock(async () => ({}) as RunCanaryResult),
+    prReviewRunner: mock(async () => report),
+    prReviewArtifactWriter: mock(async () => ['artifacts/pr-review-fixture/summary.json']),
+    stdout: mock(() => {}),
+    stderr: mock(() => {}),
+  };
+}
+
+test.each([
+  ['--db-path', ''],
+  ['--output-root', ''],
+  ['--pr-number', '0'],
+  ['--pr-number', 'not-a-number'],
+  ['--window', '0'],
+  ['--window', 'not-a-number'],
+] as const)('pr-review rejects invalid %s before running checks', async (name, value) => {
+  const deps = prReviewDeps();
+  const index = prReviewArgs.indexOf(name);
+  const invocation =
+    index >= 0
+      ? prReviewArgs.map((argument, argumentIndex) =>
+          argumentIndex === index + 1 ? value : argument
+        )
+      : [...prReviewArgs, name, value];
+
+  expect(await runCanaryCli(invocation, {}, deps)).toBe(3);
+  expect(deps.prReviewRunner).not.toHaveBeenCalled();
+  expect(deps.prReviewArtifactWriter).not.toHaveBeenCalled();
+  expect(deps.stderr).toHaveBeenCalledWith('pr_review_canary_missing_or_invalid_required_argument');
+});
+
+test('pr-review wires token, api-base, and artifacts', async () => {
+  const deps = prReviewDeps();
+  const exit = await runCanaryCli(
+    [
+      ...prReviewArgs,
+      '--api-base',
+      'http://127.0.0.1:3090',
+      '--owner',
+      'thinmansoftware',
+      '--repo',
+      'bdc-harness',
+      '--pr-number',
+      '806',
+      '--head-sha',
+      'a'.repeat(40),
+      '--branch',
+      'dev',
+    ],
+    { ARCHON_OPERATOR_TOKEN: 'operator-token' },
+    deps
+  );
+
+  expect(exit).toBe(0);
+  expect(deps.prReviewRunner).toHaveBeenCalledWith({
+    dbPath: 'archon.db',
+    operatorToken: 'operator-token',
+    statusUrl: 'http://127.0.0.1:3090/api/overseer/pr-review/status',
+    requestUrl: 'http://127.0.0.1:3090/api/overseer/pr-review/request',
+    queueUrl: 'http://127.0.0.1:3090/api/overseer/pr-review/queue',
+    owner: 'thinmansoftware',
+    repo: 'bdc-harness',
+    branch: 'dev',
+    headSha: 'a'.repeat(40),
+    prNumber: 806,
+  });
+  expect(deps.prReviewArtifactWriter).toHaveBeenCalledWith('artifacts', prReviewReport);
+  expect(deps.stdout).toHaveBeenCalledWith(JSON.stringify(prReviewReport, null, 2));
+});
+
+test('pr-review maps a failed report to exit 2 after writing its artifact', async () => {
+  const failedReport: OutcomeCanaryResult = {
+    verdict: 'failed',
+    reasonCodes: ['c1_budget_exhausted_on_converging_pr'],
+    evidenceRefs: [],
+  };
+  const deps = prReviewDeps(failedReport);
+
+  expect(await runCanaryCli(prReviewArgs, {}, deps)).toBe(2);
+  expect(deps.prReviewArtifactWriter).toHaveBeenCalledWith('artifacts', failedReport);
+});
+
+test('pr-review omits github when App env is absent and reports C6 blocked', async () => {
+  const blockedC6: OutcomeCanaryResult = {
+    verdict: 'blocked',
+    reasonCodes: ['c6_github_client_unavailable'],
+    evidenceRefs: [],
+    checks: [
+      { id: 'C1', verdict: 'passed', reasonCodes: [], evidenceRefs: [] },
+      { id: 'C2', verdict: 'passed', reasonCodes: [], evidenceRefs: [] },
+      { id: 'C3', verdict: 'passed', reasonCodes: [], evidenceRefs: [] },
+      { id: 'C4', verdict: 'passed', reasonCodes: [], evidenceRefs: [] },
+      { id: 'C5', verdict: 'passed', reasonCodes: [], evidenceRefs: [] },
+      {
+        id: 'C6',
+        verdict: 'blocked',
+        reasonCodes: ['c6_github_client_unavailable'],
+        evidenceRefs: [],
+      },
+    ],
+  };
+  const deps = prReviewDeps(blockedC6);
+  expect(await runCanaryCli(prReviewArgs, { ARCHON_OPERATOR_TOKEN: 'operator-token' }, deps)).toBe(
+    3
+  );
+  expect(deps.prReviewRunner).toHaveBeenCalledWith({
+    dbPath: 'archon.db',
+    operatorToken: 'operator-token',
+    statusUrl: undefined,
+    requestUrl: undefined,
+    queueUrl: undefined,
+    owner: undefined,
+    repo: undefined,
+    branch: undefined,
+    headSha: undefined,
+    prNumber: undefined,
+  });
+  expect(deps.stderr).toHaveBeenCalledWith('blocked canaries: C6:c6_github_client_unavailable');
+});
+
+test('pr-review forwards --c2-live-enqueue and never implies it from an API base', async () => {
+  const deps = prReviewDeps();
+  expect(
+    await runCanaryCli(
+      [...prReviewArgs, '--api-base', 'http://localhost:3090'],
+      { ARCHON_OPERATOR_TOKEN: 'operator-token' },
+      deps
+    )
+  ).toBe(0);
+  const implied = (deps.prReviewRunner as ReturnType<typeof mock>).mock.calls[0]?.[0] as Record<
+    string,
+    unknown
+  >;
+  expect(implied.requestUrl).toBe('http://localhost:3090/api/overseer/pr-review/request');
+  expect(implied.c2LiveEnqueue).toBeUndefined();
+
+  const optIn = prReviewDeps();
+  expect(await runCanaryCli([...prReviewArgs, '--c2-live-enqueue'], {}, optIn)).toBe(0);
+  expect(optIn.prReviewRunner).toHaveBeenCalledWith({
+    dbPath: 'archon.db',
+    operatorToken: undefined,
+    statusUrl: undefined,
+    requestUrl: undefined,
+    queueUrl: undefined,
+    owner: undefined,
+    repo: undefined,
+    branch: undefined,
+    headSha: undefined,
+    prNumber: undefined,
+    c2LiveEnqueue: true,
+  });
+});
+
+test('pr-review forwards --c3-synthetic-escalation', async () => {
+  const deps = prReviewDeps();
+  expect(await runCanaryCli([...prReviewArgs, '--c3-synthetic-escalation'], {}, deps)).toBe(0);
+  expect(deps.prReviewRunner).toHaveBeenCalledWith({
+    dbPath: 'archon.db',
+    operatorToken: undefined,
+    statusUrl: undefined,
+    requestUrl: undefined,
+    queueUrl: undefined,
+    owner: undefined,
+    repo: undefined,
+    branch: undefined,
+    headSha: undefined,
+    prNumber: undefined,
+    c3SyntheticEscalation: true,
+  });
 });

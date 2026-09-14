@@ -50,6 +50,8 @@
         "archon-canary": "./src/cli.ts",
       },
       "dependencies": {
+        "@archon/core": "workspace:*",
+        "@archon/overseer": "workspace:*",
         "@archon/providers": "workspace:*",
         "@archon/smart-cauldron": "workspace:*",
         "@archon/workflows": "workspace:*",

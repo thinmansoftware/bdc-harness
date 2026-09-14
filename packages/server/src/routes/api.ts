@@ -350,6 +350,21 @@ import {
   operatorCardResponseSchema,
 } from './schemas/overseer-briefing.schemas';
 import {
+  prReviewQueueQuerySchema,
+  prReviewQueueResponseSchema,
+  prReviewRequestBodySchema,
+  prReviewRequestHeadLookupFailedSchema,
+  prReviewRequestHeadNotCurrentSchema,
+  prReviewRequestResponseSchema,
+  prReviewStatusQuerySchema,
+  prReviewStatusResponseSchema,
+} from './schemas/overseer-pr-review.schemas';
+import {
+  getPrReviewStatus,
+  listPrReviewQueue,
+  requestPrReview,
+} from '@archon/overseer/pr-review-operator';
+import {
   providerAttemptsQuerySchema,
   providerAttemptsResponseSchema,
 } from './schemas/provider-attempts.schemas';
@@ -1392,6 +1407,70 @@ const getOperatorCardRoute = createRoute({
     },
     401: jsonError('Board principal rejected'),
     404: jsonError('Operator card not found'),
+    500: jsonError('Server error'),
+  },
+});
+
+const getPrReviewStatusRoute = createRoute({
+  method: 'get',
+  path: '/api/overseer/pr-review/status',
+  tags: ['Overseer PR Review'],
+  summary: 'Read store-only PR review status, budget, and why_no_review',
+  request: { query: prReviewStatusQuerySchema },
+  responses: {
+    200: {
+      content: { 'application/json': { schema: prReviewStatusResponseSchema } },
+      description: 'PR review status',
+    },
+    400: jsonError('Bad request'),
+    401: jsonError('Missing or invalid operator token'),
+    500: jsonError('Server error'),
+  },
+});
+
+const postPrReviewRequestRoute = createRoute({
+  method: 'post',
+  path: '/api/overseer/pr-review/request',
+  tags: ['Overseer PR Review'],
+  summary: 'Enqueue an operator review of an exact PR head',
+  request: {
+    body: {
+      content: { 'application/json': { schema: prReviewRequestBodySchema } },
+      required: true,
+    },
+  },
+  responses: {
+    200: {
+      content: { 'application/json': { schema: prReviewRequestResponseSchema } },
+      description: 'Review work enqueued or replayed',
+    },
+    400: jsonError('Bad request'),
+    401: jsonError('Missing or invalid operator token'),
+    409: {
+      content: { 'application/json': { schema: prReviewRequestHeadNotCurrentSchema } },
+      description: 'headSha is not the PR current head; nothing enqueued',
+    },
+    502: {
+      content: { 'application/json': { schema: prReviewRequestHeadLookupFailedSchema } },
+      description: 'GitHub current-head lookup failed; nothing enqueued',
+    },
+    500: jsonError('Server error'),
+  },
+});
+
+const getPrReviewQueueRoute = createRoute({
+  method: 'get',
+  path: '/api/overseer/pr-review/queue',
+  tags: ['Overseer PR Review'],
+  summary: 'List queued, claimed, or failed review work and orphaned recipients',
+  request: { query: prReviewQueueQuerySchema },
+  responses: {
+    200: {
+      content: { 'application/json': { schema: prReviewQueueResponseSchema } },
+      description: 'Review queue',
+    },
+    400: jsonError('Bad request'),
+    401: jsonError('Missing or invalid operator token'),
     500: jsonError('Server error'),
   },
 });
@@ -4946,6 +5025,43 @@ export function registerApiRoutes(
       if (isBoardPrincipalAuthError(error)) return apiError(c, 401, (error as Error).message);
       getLog().error({ err: error }, 'operator_card_get_failed');
       return apiError(c, 500, 'Failed to read operator card');
+    }
+  });
+
+  registerOpenApiRoute(getPrReviewStatusRoute, async c => {
+    try {
+      const query = getValidatedQuery(c, prReviewStatusQuerySchema);
+      return c.json(await getPrReviewStatus(query));
+    } catch (error) {
+      getLog().error({ err: error }, 'pr_review.status_failed');
+      return apiError(c, 500, 'Failed to read PR review status');
+    }
+  });
+
+  registerOpenApiRoute(postPrReviewRequestRoute, async c => {
+    try {
+      const body = getValidatedBody(c, prReviewRequestBodySchema);
+      const result = await requestPrReview(body);
+      if (!result.ok) {
+        if (result.error === 'head_lookup_failed') {
+          return c.json(result, 502);
+        }
+        return c.json(result, 409);
+      }
+      return c.json(result);
+    } catch (error) {
+      getLog().error({ err: error }, 'pr_review.request_failed');
+      return apiError(c, 500, 'Failed to enqueue PR review');
+    }
+  });
+
+  registerOpenApiRoute(getPrReviewQueueRoute, async c => {
+    try {
+      const query = getValidatedQuery(c, prReviewQueueQuerySchema);
+      return c.json(await listPrReviewQueue({ status: query.status }));
+    } catch (error) {
+      getLog().error({ err: error }, 'pr_review.queue_failed');
+      return apiError(c, 500, 'Failed to list PR review queue');
     }
   });
 
