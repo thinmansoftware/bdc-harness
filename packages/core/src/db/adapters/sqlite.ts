@@ -2099,8 +2099,9 @@ export class SqliteAdapter implements IDatabase {
         ON overseer_required_contexts_attempts(touched_at);
       CREATE UNIQUE INDEX IF NOT EXISTS uq_overseer_verdicts_run_head ON overseer_verdicts(run_id, head_sha);
       CREATE INDEX IF NOT EXISTS idx_overseer_verdicts_status ON overseer_verdicts(status, created_at);
-      CREATE INDEX IF NOT EXISTS idx_overseer_verdicts_merge_action ON overseer_verdicts(created_at)
-        WHERE proposed_action = 'flag_merge_ready' AND actioned_at IS NULL;
+      -- idx_overseer_verdicts_merge_action is created by the additive "migration 052" block
+      -- AFTER actioned_at exists on a pre-existing table. Creating it here broke every
+      -- upgrade of a database that predates that column (bdc-harness #842, rebuild 11).
       CREATE INDEX IF NOT EXISTS idx_overseer_merge_slot_reservations_window
         ON overseer_merge_slot_reservations(reserved_at);
       CREATE INDEX IF NOT EXISTS idx_codebase_env_vars_codebase_id ON remote_agent_codebase_env_vars(codebase_id);
