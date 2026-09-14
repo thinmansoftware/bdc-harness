@@ -1141,15 +1141,109 @@ nodes:
           *) printf 'CODE' ;;
         esac
       }
-      # rst_command_looks_runnable <cmd>   (rc 0 when the line names a known test runner
-      #   FOLLOWED BY AN ARGUMENT -- a bare "node" or "bun" mentioned in prose is not a
-      #   command (live false positive, run f4dabd76) -- and is not a dependency-install
-      #   step)
+      # inline-flag rejection: -c -e --eval -p --print -r --require -i -m
+      rst_has_inline_flag() {
+        local t
+        for t in "$@"; do
+          case "$t" in
+            -c|-e|--eval|-p|--print|-r|--require|-i|-m|-c=*|-e=*|--eval=*|-p=*|--print=*|-r=*|--require=*|-i=*|-m=*) return 0 ;;
+          esac
+        done
+        return 1
+      }
+      rst_tokens_safe() {
+        local t
+        for t in "$@"; do
+          printf '%s' "$t" | grep -qE '^[A-Za-z0-9@%+=:,./_-]+$' || return 1
+        done
+        return 0
+      }
+      rst_is_repo_script() {
+        local p="$1" oldifs seg
+        case "$p" in /*|-*) return 1 ;; esac
+        case "$p" in *.js|*.mjs|*.cjs|*.ts|*.tsx|*.py|*.sh) ;; *) return 1 ;; esac
+        oldifs="$IFS"; IFS=/; set -f; set -- $p; set +f; IFS="$oldifs"
+        for seg in "$@"; do
+          [ "$seg" = ".." ] && return 1
+        done
+        return 0
+      }
+      rst_argv_looks_runnable() {
+        local runner segment="$1"
+        set -f
+        set -- $segment
+        set +f
+        [ $# -ge 2 ] || return 1
+        runner="$1"
+        shift
+        rst_tokens_safe "$runner" "$@" || return 1
+        case "$runner" in
+          node|npm|npx|bun|bunx|pytest|python|python3|go|cargo|bash|sh|make) ;;
+          *) return 1 ;;
+        esac
+        case "$runner" in
+          python|python3)
+            if [ "$1" = "-m" ] && { [ "${2:-}" = "pytest" ] || [ "${2:-}" = "unittest" ]; }; then
+              shift 2
+              rst_has_inline_flag "$@" && return 1
+              return 0
+            fi
+            rst_is_repo_script "$1" || return 1
+            rst_has_inline_flag "$@" && return 1
+            return 0
+            ;;
+          node|bash|sh)
+            rst_is_repo_script "$1" || return 1
+            rst_has_inline_flag "$@" && return 1
+            return 0
+            ;;
+          bun)
+            if [ "$1" = "test" ] || [ "$1" = "run" ]; then
+              if [ "$1" = "run" ]; then
+                [ -n "${2:-}" ] || return 1
+                printf '%s' "$2" | grep -qE '^[A-Za-z0-9:_.-]+$' || return 1
+              fi
+              rst_has_inline_flag "$@" && return 1
+              return 0
+            fi
+            rst_is_repo_script "$1" || return 1
+            rst_has_inline_flag "$@" && return 1
+            return 0
+            ;;
+          npm)
+            [ "$1" = "test" ] || [ "$1" = "run" ] || return 1
+            if [ "$1" = "run" ]; then
+              [ -n "${2:-}" ] || return 1
+              printf '%s' "$2" | grep -qE '^[A-Za-z0-9:_.-]+$' || return 1
+            fi
+            rst_has_inline_flag "$@" && return 1
+            return 0
+            ;;
+          npx|bunx)
+            printf '%s' "$1" | grep -qE '^[A-Za-z0-9@/._-]+$' || return 1
+            rst_has_inline_flag "$@" && return 1
+            return 0
+            ;;
+          pytest|go|cargo|make)
+            rst_has_inline_flag "$@" && return 1
+            return 0
+            ;;
+        esac
+        return 1
+      }
+      # rst_command_looks_runnable <cmd>   (rc 0 when the line tokenizes -- whitespace
+      #   split, no shell -- to an allowlisted runner FOLLOWED BY AN ARGUMENT -- a bare
+      #   "node" or "bun" mentioned in prose is not a command (live false positive, run
+      #   f4dabd76) -- with no inline interpreter modes, and is not a dependency-install
+      #   step). Interpreters (node|bun|python|python3|bash|sh) must take a relative
+      #   repo script path (.js .mjs .cjs .ts .tsx .py .sh), not -c/-e/--eval. python -m
+      #   pytest|unittest is the only -m exception. Round-4 metacharacter rejection
+      #   still applies.
       rst_command_looks_runnable() {
         local cmd="$1"
         case "$cmd" in *'{{'*|*';'*|*'`'*|*'$('*|*'>'*|*'<'*|*'|'*) return 1 ;; esac
         # Preserve an optional "cd safe/subdir &&" prefix and declared chains of
-        # test runners. Every remaining && segment must itself name a known runner.
+        # test runners. Every remaining && segment must itself be argv-runnable.
         if printf '%s\n' "$cmd" | grep -qE '^[ ]*cd[ ]+[A-Za-z0-9_./-]+[ ]+&&[ ]+'; then
           cmd="$(printf '%s\n' "$cmd" | sed -E 's/^[ ]*cd[ ]+[A-Za-z0-9_.\/-]+[ ]+&&[ ]+//')"
         fi
@@ -1160,10 +1254,10 @@ nodes:
             *'&&'*) segment="${cmd%%&&*}"; cmd="${cmd#*&&}" ;;
             *) segment="$cmd"; cmd='' ;;
           esac
-          printf '%s\n' "$segment" | grep -qE '(^|[ /;(])(node|bun|bunx|npm|npm\.cmd|npx|pnpm|yarn|vitest|jest|mocha|pytest|python3?|go|cargo|bash|sh|make|deno|dotnet|mvn|gradle|tap)[ ]+[^ ;)]' || return 1
           if printf '%s\n' "$segment" | grep -qE '(^|[ ;])(npm|npm\.cmd|pnpm|yarn|bun)[ ]+(ci|install|i|add)([ ]|$)'; then
             return 1
           fi
+          rst_argv_looks_runnable "$segment" || return 1
           [ -z "$cmd" ] && break
         done
         return 0
@@ -1311,23 +1405,60 @@ nodes:
         printf '%s' "$counts"
       }
       # rst_run_commands <commands-file> <log>   (runs each command line in the CWD under a
-      #   1500 s budget, appends every command's output to <log> under a "### run-stop-tests:"
-      #   header, and prints "<exit> <passed> <total>" -- exit is the first nonzero exit,
-      #   counts are summed across commands; "<exit>  " (empty counts) when nothing parsed)
+      #   1500 s budget as tokenized argv -- no bash -c -- appends every command's output
+      #   to <log> under a "### run-stop-tests:" header, and prints "<exit> <passed>
+      #   <total>" -- exit is the first nonzero exit, counts are summed across commands;
+      #   "<exit>  " (empty counts) when nothing parsed). Optional "cd <dir> &&" is
+      #   performed in-process; remaining && segments run sequentially. pipefail is
+      #   unused (pipes are already rejected).
       rst_run_commands() {
         local cmds="$1" log="$2" cmd seg rc exit_code=0 p=0 t=0 hit=0 c
+        local saved_pwd work segment d
+        saved_pwd="$(pwd)"
         seg="$(mktemp)"
         while IFS= read -r cmd; do
           [ -z "$cmd" ] && continue
           printf '### run-stop-tests: %s\n' "$cmd" >> "$log"
-          timeout 1500 bash -o pipefail -c "$cmd" > "$seg" 2>&1 < /dev/null
-          rc=$?
+          cd "$saved_pwd" || continue
+          : > "$seg"
+          rc=0
+          if ! rst_command_looks_runnable "$cmd"; then
+            printf 'rst_run_commands: refusing non-runnable command\n' > "$seg"
+            rc=1
+          else
+            work="$cmd"
+            if printf '%s\n' "$work" | grep -qE '^[ ]*cd[ ]+[A-Za-z0-9_./-]+[ ]+&&[ ]+'; then
+              d="$(printf '%s\n' "$work" | sed -E 's/^[ ]*cd[ ]+([A-Za-z0-9_.\/-]+)[ ]+&&[ ]+.*$/\1/')"
+              work="$(printf '%s\n' "$work" | sed -E 's/^[ ]*cd[ ]+[A-Za-z0-9_.\/-]+[ ]+&&[ ]+//')"
+              if ! cd "$d"; then
+                printf 'rst_run_commands: cd %s failed\n' "$d" > "$seg"
+                rc=1
+              fi
+            fi
+            if [ "$rc" -eq 0 ]; then
+              while :; do
+                case "$work" in
+                  *'&&'*) segment="${work%%&&*}"; work="${work#*&&}" ;;
+                  *) segment="$work"; work='' ;;
+                esac
+                set -f
+                set -- $segment
+                set +f
+                if [ $# -eq 0 ]; then rc=1; break; fi
+                timeout 1500 "$@" >> "$seg" 2>&1 < /dev/null
+                rc=$?
+                [ "$rc" -ne 0 ] && break
+                [ -z "$work" ] && break
+              done
+            fi
+          fi
           cat "$seg" >> "$log"
           printf '### exit %s\n' "$rc" >> "$log"
           [ "$rc" -ne 0 ] && [ "$exit_code" -eq 0 ] && exit_code="$rc"
           c="$(rst_parse_counts < "$seg")"
           if [ -n "$c" ]; then p=$((p + ${c%% *})); t=$((t + ${c##* })); hit=1; fi
         done < "$cmds"
+        cd "$saved_pwd" || true
         rm -f "$seg"
         if [ "$hit" -eq 1 ]; then printf '%s %s %s' "$exit_code" "$p" "$t"; else printf '%s  ' "$exit_code"; fi
       }

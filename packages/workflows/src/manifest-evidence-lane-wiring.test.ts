@@ -112,6 +112,10 @@ describe('manifest evidence lane wiring (bdc-xo #1940)', () => {
         expect(n.bash).toContain(
           "case \"$cmd\" in *'{{'*|*';'*|*'`'*|*'$('*|*'>'*|*'<'*|*'|'*) return 1"
         );
+        expect(n.bash).toContain(
+          'inline-flag rejection: -c -e --eval -p --print -r --require -i -m'
+        );
+        expect(n.bash).toContain('timeout 1500 "$@"');
         expect(n.bash).toContain('[ -n "$CMD_JOINED" ] && [ "$EXIT_CODE" -ne 0 ]');
       });
 
@@ -302,5 +306,18 @@ describe.skipIf(process.platform === 'win32')('run-stop-tests ladder (behavioral
     expect(rstField(stdout, 'TESTS_SOURCE')).toBe('spec_declared');
     expect(rstField(stdout, 'TESTS_LINE')).toBe('1/2 (bash ./red.sh) -- FAILED, exit 1');
     expect(log).not.toContain('### run-stop-tests: bun run test');
+  });
+
+  it('a spec-declared python -c line is not runnable and is never executed', () => {
+    const { stdout, log } = runStopTestsNode({
+      spec: rstSpec("python -c 'print(1)'"),
+    });
+    expect(rstField(stdout, 'TESTS_STATUS')).toBe('passed');
+    expect(rstField(stdout, 'TESTS_SOURCE')).toContain('repo_test_script');
+    expect(rstField(stdout, 'TESTS_LINE')).toBe('1/1 (bun run test)');
+    expect(stdout).not.toContain('python -c');
+    expect(log).not.toContain('python -c');
+    expect(log).not.toContain('### run-stop-tests: python');
+    expect(log).toContain('### run-stop-tests: bun run test');
   });
 });

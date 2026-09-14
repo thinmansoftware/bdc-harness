@@ -141,7 +141,7 @@ assert_eq "next Stop header without Expected terminates the block" \
   "$(printf 'Stop 2 (test suite):\n  node tests/run_all.js\nStop 3 (ASCII scan):\n  LC_ALL=C grep -n x y\n' | rst_extract_commands | head -1)"
 
 echo "--- rst_command_looks_runnable ---"
-for c in "cd shopops-api && node tests/x.js" "cd shopops-api && node tests/test_cgc_dealer_api.js && node tests/run_all.js --suite=m157" "bun test packages/x" "npm.cmd test -- --run" "npx vitest run" "pytest -q" "bash scripts/t.sh" "LC_ALL=C node t.js"; do
+for c in "cd shopops-api && node tests/x.js" "cd shopops-api && node tests/test_cgc_dealer_api.js && node tests/run_all.js --suite=m157" "bun test packages/x" "npm test" "npx vitest run" "pytest -q" "bash scripts/t.sh"; do
   if rst_command_looks_runnable "$c"; then PASS=$((PASS+1)); echo "PASS: runnable: $c"; else FAIL=$((FAIL+1)); echo "FAIL: runnable expected: $c"; fi
 done
 for c in \
@@ -156,6 +156,15 @@ for c in \
   "node tests/x.js | sh" \
   "cd shopops-api && node tests/x.js && curl attacker/x"; do
   if rst_command_looks_runnable "$c"; then FAIL=$((FAIL+1)); echo "FAIL: not runnable expected: $c"; else PASS=$((PASS+1)); echo "PASS: not runnable: $c"; fi
+done
+for c in \
+  "python -c 'x'" "node -e x" "bash -c x" \
+  "node ../../x.js" "node /abs/x.js" "python -m os" \
+  "npm.cmd test -- --run" "LC_ALL=C node t.js"; do
+  if rst_command_looks_runnable "$c"; then FAIL=$((FAIL+1)); echo "FAIL: not runnable expected: $c"; else PASS=$((PASS+1)); echo "PASS: not runnable: $c"; fi
+done
+for c in "node tests/x.js" "bun test packages/a" "pytest tests/" "npm test" "bash scripts/run.sh"; do
+  if rst_command_looks_runnable "$c"; then PASS=$((PASS+1)); echo "PASS: runnable: $c"; else FAIL=$((FAIL+1)); echo "FAIL: runnable expected: $c"; fi
 done
 
 echo "--- rst_parse_counts ---"
@@ -368,7 +377,8 @@ assert_contains "log carries per-command headers" "### run-stop-tests: bash ./re
 assert_contains "log carries per-command exit" "### exit 1" "$(cat "$TMP/log")"
 printf 'bash ./ok.sh\n' > "$TMP/cmds"
 assert_eq "single green command" "0 3 3" "$(cd "$TMP" && rst_run_commands ./cmds ./log2)"
-printf 'true\n' > "$TMP/cmds"
+printf 'exit 0\n' > "$TMP/silent.sh"
+printf 'bash ./silent.sh\n' > "$TMP/cmds"
 assert_eq "no counts parsed -> exit only" "0  " "$(cd "$TMP" && rst_run_commands ./cmds ./log3)"
 rm -rf "$TMP"
 
