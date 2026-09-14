@@ -107,6 +107,9 @@ describe('manifest evidence lane wiring (bdc-xo #1940)', () => {
         const n = node(nodes, 'run-stop-tests', file);
         expect(n.depends_on).toEqual(['ascii-gate']);
         expect(n.timeout).toBe(1800000);
+        expect(n.bash).toContain(
+          "case \"$cmd\" in *'{{'*|*';'*|*'`'*|*'$('*|*'>'*|*'<'*|*'|'*) return 1"
+        );
       });
 
       it('war-council-validator depends on both evidence nodes and carries the executed-command contract', () => {

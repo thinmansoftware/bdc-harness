@@ -1075,11 +1075,26 @@ nodes:
       #   command (live false positive, run f4dabd76) -- and is not a dependency-install
       #   step)
       rst_command_looks_runnable() {
-        case "$1" in *'{{'*) return 1 ;; esac
-        printf '%s\n' "$1" | grep -qE '(^|[ /&|;(])(node|bun|bunx|npm|npm\.cmd|npx|pnpm|yarn|vitest|jest|mocha|pytest|python3?|go|cargo|bash|sh|make|deno|dotnet|mvn|gradle|tap)[ ]+[^ &|;)]' || return 1
-        if printf '%s\n' "$1" | grep -qE '(^|[ &;|])(npm|npm\.cmd|pnpm|yarn|bun)[ ]+(ci|install|i|add)([ ]|$)'; then
-          return 1
+        local cmd="$1"
+        case "$cmd" in *'{{'*|*';'*|*'`'*|*'$('*|*'>'*|*'<'*|*'|'*) return 1 ;; esac
+        # Preserve an optional "cd safe/subdir &&" prefix and declared chains of
+        # test runners. Every remaining && segment must itself name a known runner.
+        if printf '%s\n' "$cmd" | grep -qE '^[ ]*cd[ ]+[A-Za-z0-9_./-]+[ ]+&&[ ]+'; then
+          cmd="$(printf '%s\n' "$cmd" | sed -E 's/^[ ]*cd[ ]+[A-Za-z0-9_.\/-]+[ ]+&&[ ]+//')"
         fi
+        case "${cmd//&&/}" in *'&'*) return 1 ;; esac
+        while :; do
+          local segment
+          case "$cmd" in
+            *'&&'*) segment="${cmd%%&&*}"; cmd="${cmd#*&&}" ;;
+            *) segment="$cmd"; cmd='' ;;
+          esac
+          printf '%s\n' "$segment" | grep -qE '(^|[ /;(])(node|bun|bunx|npm|npm\.cmd|npx|pnpm|yarn|vitest|jest|mocha|pytest|python3?|go|cargo|bash|sh|make|deno|dotnet|mvn|gradle|tap)[ ]+[^ ;)]' || return 1
+          if printf '%s\n' "$segment" | grep -qE '(^|[ ;])(npm|npm\.cmd|pnpm|yarn|bun)[ ]+(ci|install|i|add)([ ]|$)'; then
+            return 1
+          fi
+          [ -z "$cmd" ] && break
+        done
         return 0
       }
       # rst_extract_commands   (spec on stdin -> one declared test command per line, deduped,
